@@ -1,5 +1,5 @@
 """
-ZPNet Main Scheduler Daemon Second Test
+ZPNet Main Scheduler Daemon
 
 This module provides the scheduler loop and helpers.
 It is launched via `python3 -m zpnet` which delegates through `__main__.py`.
