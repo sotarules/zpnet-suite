@@ -1,0 +1,14 @@
+# PyCharm / JetBrains
+.idea/
+*.iml
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+.env/
+
+# System
+.DS_Store
+Thumbs.db
