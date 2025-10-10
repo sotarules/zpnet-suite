@@ -1,11 +1,12 @@
 import serial, json, time, logging
 from zpnet.shared.events import create_event
+from zpnet.shared.logger import setup_logging
 
 SERIAL_PORT = "/dev/ttyACM0"
 BAUDRATE = 115200
 HEARTBEAT_TIMEOUT = 120
 
-def listen():
+def run():
     logging.info("🔌 ZPNet Teensy Listener started")
     ser = serial.Serial(SERIAL_PORT, BAUDRATE, timeout=1)
     last_heartbeat = time.time()
@@ -32,3 +33,7 @@ def listen():
 
         if event_type == "HEARTBEAT":
             last_heartbeat = time.time()
+
+def bootstrap():
+    setup_logging()
+    run()

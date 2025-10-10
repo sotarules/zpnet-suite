@@ -1,7 +1,10 @@
-from .listener import listen
+"""
+Run the ZPNet Teensy Monitor directly:
 
-def main():
-    listen()
+    python3 -m zpnet.modules.teensy_listener
+"""
+
+from . import bootstrap
 
 if __name__ == "__main__":
-    main()
+    bootstrap()

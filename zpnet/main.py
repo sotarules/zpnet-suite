@@ -1,12 +1,15 @@
 """
 ZPNet Main Scheduler Daemon
 
+
 This module provides the scheduler loop and helpers.
 It is launched via `python3 -m zpnet` which delegates through `__main__.py`.
 """
 
+import os
 import signal
 import sys
+import pydevd_pycharm
 import time
 import sqlite3
 import importlib
@@ -20,7 +23,6 @@ from zpnet.shared.events import create_event  # <-- NEW
 DB_PATH = "/home/mule/zpnet/zpnet.db"
 MODULES_PATH = "zpnet.modules"
 TICK_INTERVAL = 0.1  # 100ms
-
 
 # --------------------------
 # Signal handler
@@ -143,13 +145,48 @@ def scheduler_loop() -> None:
 
 
 # --------------------------
-# Bootstrap helper (optional)
+# Bootstrap helper (conditional debug attach)
 # --------------------------
 def bootstrap() -> None:
     """Configure logging, signals, and start the scheduler."""
     setup_logging()
     signal.signal(signal.SIGTERM, handle_sigterm)
     signal.signal(signal.SIGINT, handle_sigterm)
+
+    # --- Conditional PyCharm attach ---
+    try:
+        env_host = None
+        env_path = "/etc/zpnet.env"
+        if os.path.exists(env_path):
+            with open(env_path, "r") as f:
+                for line in f:
+                    if line.startswith("ZPNET_REMOTE_HOST="):
+                        env_host = line.strip().split("=", 1)[1]
+                        break
+
+        # Only attach if explicitly enabled *and* host is 192.168.1.105
+        if env_host == "192.168.1.105":
+            try:
+                import pydevd_pycharm
+                pydevd_pycharm.settrace(
+                    host=env_host,
+                    port=5678,
+                    stdout_to_server=True,
+                    stderr_to_server=True,
+                    suspend=False
+                )
+                logging.info(f"[ZPNET] Debugger attached (env_host={env_host})")
+            except Exception as e:
+                logging.exception(f"[ZPNET] Debugger attach failed: {e}")
+        else:
+            logging.info(
+                f"[ZPNET] Debug attach skipped (env_host={env_host}, "
+                f"ZPNET_DEBUG_ATTACH={os.environ.get('ZPNET_DEBUG_ATTACH')})"
+            )
+    except Exception as e:
+        logging.warning(f"[ZPNET] Could not evaluate debug attach condition: {e}")
+
+    # --- Main scheduler loop ---
     try:
         scheduler_loop()
     except Exception as e:
