@@ -19,7 +19,6 @@ import requests
 
 from zpnet.shared.events import create_event
 from zpnet.shared.logger import setup_logging
-from zpnet.shared.recovery import invoke_choosenet
 
 # ----------------------
 # Constants / Config
@@ -31,6 +30,7 @@ RECOVERY_MIN_INTERVAL_SEC = 600  # 10 minutes between choosenet attempts
 TEST_TIMEOUT_SEC = 5
 ZPNET_TEST_PATH = "/api/test"
 
+
 # ----------------------
 # Helpers
 # ----------------------
@@ -41,6 +41,7 @@ def get_server_host() -> str:
         lines = f.readlines()
     kv = dict(line.strip().split("=", 1) for line in lines if "=" in line)
     return kv.get("ZPNET_REMOTE_HOST")
+
 
 def zpnet_test(server_host) -> bool:
     """
@@ -58,6 +59,7 @@ def zpnet_test(server_host) -> bool:
     except requests.RequestException:
         return False
 
+
 def get_local_ip() -> str:
     """
     Get best-effort local IP address.
@@ -69,6 +71,7 @@ def get_local_ip() -> str:
     ip = s.getsockname()[0]
     s.close()
     return ip
+
 
 def ping_latency():
     """
@@ -91,6 +94,7 @@ def ping_latency():
         times.append((end - start) * 1000.0)
     return round(mean(times), 2)
 
+
 def get_isp():
     """
     Get ISP info from ipinfo.io (free, rate-limited).
@@ -100,6 +104,7 @@ def get_isp():
     r = requests.get("https://ipinfo.io/json", timeout=5)
     data = r.json()
     return data.get("org")
+
 
 def get_interface_stats():
     """
@@ -117,6 +122,7 @@ def get_interface_stats():
         }
         for iface, s in stats.items()
     }
+
 
 def download_test():
     """
@@ -139,6 +145,7 @@ def download_test():
         return round(mbps, 2)
     return 0
 
+
 def upload_test(server_host):
     """
     Measure upload throughput using iperf3. Requires iperf3 server running at `server_host`.
@@ -159,6 +166,7 @@ def upload_test(server_host):
     data = json.loads(result.stdout.decode())
     bps = data.get("end", {}).get("sum_sent", {}).get("bits_per_second", 0)
     return round(bps / 1e6, 2)
+
 
 # ----------------------
 # Main routine
@@ -194,6 +202,7 @@ def run():
 
     finally:
         create_event(event_type="NETWORK_STATUS", payload=payload)
+
 
 def bootstrap():
     setup_logging()
