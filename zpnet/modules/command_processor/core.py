@@ -6,14 +6,15 @@ Each command includes a `payload.funktion` and `args`.
 """
 
 import logging
-import requests
 import subprocess
-import json
 import traceback
+from pathlib import Path
+
+import requests
+
 from zpnet.shared.events import create_event
 from zpnet.shared.logger import setup_logging
-from datetime import datetime
-from pathlib import Path
+from zpnet.shared.recovery import invoke_choosenet
 
 # --------------------------
 # Configuration
@@ -65,14 +66,19 @@ def executeScript(script: str, timeout: int = 30):
         return {"error": str(e), "returncode": -2}
 
 
+def chooseNetwork():
+    """Invoke the choosenet.sh script to re-evaluate network choice."""
+    invoke_choosenet()
+    return
+
 # --------------------------
 # Function Dispatcher
 # --------------------------
 HANDLER_MAP = {
     "createEvent": createEvent,
-    "executeScript": executeScript
+    "executeScript": executeScript,
+    "chooseNetwork": chooseNetwork
 }
-
 
 # --------------------------
 # Main Task
@@ -124,6 +130,7 @@ def run():
             "exception": str(e),
             "traceback": traceback.format_exc()
         })
+
 
 def bootstrap():
     setup_logging()

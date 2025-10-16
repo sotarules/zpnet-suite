@@ -1,24 +1,20 @@
 """
 ZPNet Main Scheduler Daemon
 
-
 This module provides the scheduler loop and helpers.
-It is launched via `python3 -m zpnet` which delegates through `__main__.py`.
 """
 
-import os
-import signal
-import sys
-import pydevd_pycharm
-import time
-import sqlite3
 import importlib
 import logging
-import traceback
+import os
+import signal
+import sqlite3
+import sys
+import time
 from datetime import datetime, timedelta
 
 from zpnet.shared.logger import setup_logging
-from zpnet.shared.events import create_event  # <-- NEW
+from zpnet.shared.recovery import invoke_choosenet
 
 DB_PATH = "/home/mule/zpnet/zpnet.db"
 MODULES_PATH = "zpnet.modules"
@@ -27,14 +23,8 @@ TICK_INTERVAL = 0.1  # 100ms
 # --------------------------
 # Signal handler
 # --------------------------
-def handle_sigterm(signum, frame):
-    msg = "SIGTERM received, shutting down..."
-    logging.info(msg)
-    create_event("SYSTEM_INFO", {
-        "component": "scheduler",
-        "signal": signum,
-        "message": msg
-    })
+def handle_sigterm(signum, frame) -> None:
+    logging.info("🛑 SIGTERM received, shutting down...")
     sys.exit(0)
 
 # --------------------------
@@ -42,56 +32,26 @@ def handle_sigterm(signum, frame):
 # --------------------------
 def run_module(module_name: str) -> None:
     """Dynamically import and run a module, log results to run_history."""
-    try:
-        start_ts = datetime.utcnow()
-        start = time.monotonic()
+    start_ts = datetime.utcnow()
+    start = time.monotonic()
 
-        module = importlib.import_module(f"{MODULES_PATH}.{module_name}")
-        module.run()
+    module = importlib.import_module(f"{MODULES_PATH}.{module_name}")
+    module.run()
 
-        end_ts = datetime.utcnow()
-        end = time.monotonic()
-        duration_ms = int((end - start) * 1000)
+    end_ts = datetime.utcnow()
+    end = time.monotonic()
+    duration_ms = int((end - start) * 1000)
 
-        with sqlite3.connect(DB_PATH) as conn:
-            cur = conn.cursor()
-            cur.execute(
-                """
-                INSERT INTO run_history (module_name, start_ts, end_ts, duration_ms, status)
-                VALUES (?, ?, ?, ?, ?)
-                """,
-                (module_name, start_ts.isoformat(), end_ts.isoformat(), duration_ms, "OK"),
-            )
-            conn.commit()
-
-    except Exception as e:
-        err_msg = f"⚠️ Error running {module_name}: {e}"
-        logging.exception(err_msg)
-        create_event(
-            "SYSTEM_ERROR",
-            {
-                "component": module_name,
-                "exception": str(e),
-                "traceback": traceback.format_exc(),
-            },
+    with sqlite3.connect(DB_PATH) as conn:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            INSERT INTO run_history (module_name, start_ts, end_ts, duration_ms, status)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (module_name, start_ts.isoformat(), end_ts.isoformat(), duration_ms, "OK"),
         )
-        with sqlite3.connect(DB_PATH) as conn:
-            cur = conn.cursor()
-            cur.execute(
-                """
-                INSERT INTO run_history (module_name, start_ts, end_ts, duration_ms, status)
-                VALUES (?, ?, ?, ?, ?)
-                """,
-                (
-                    module_name,
-                    start_ts.isoformat() if "start_ts" in locals() else None,
-                    datetime.utcnow().isoformat(),
-                    0,
-                    f"ERROR: {e}",
-                ),
-            )
-            conn.commit()
-
+        conn.commit()
 
 # --------------------------
 # Main scheduler loop
@@ -99,50 +59,36 @@ def run_module(module_name: str) -> None:
 def scheduler_loop() -> None:
     """Main loop that checks schedule table and executes due jobs."""
     logging.info("📅 ZPNet Scheduler Started")
-    try:
-        while True:
-            now = datetime.utcnow().isoformat()
-            with sqlite3.connect(DB_PATH) as conn:
-                cur = conn.cursor()
+    while True:
+        now = datetime.utcnow().isoformat()
+        with sqlite3.connect(DB_PATH) as conn:
+            cur = conn.cursor()
+            cur.execute(
+                """
+                SELECT id, module_name, frequency_sec FROM schedule
+                WHERE next_run_ts IS NULL OR next_run_ts <= ?
+                """,
+                (now,),
+            )
+            due_jobs = cur.fetchall()
+
+            for job_id, module_name, freq in due_jobs:
+                run_module(module_name)
+
+                now_ts = datetime.utcnow()
+                next_run = now_ts + timedelta(seconds=freq)
+
                 cur.execute(
                     """
-                    SELECT id, module_name, frequency_sec FROM schedule
-                    WHERE next_run_ts IS NULL OR next_run_ts <= ?
+                    UPDATE schedule
+                    SET last_run_ts = ?, next_run_ts = ?
+                    WHERE id = ?
                     """,
-                    (now,),
+                    (now_ts.isoformat(), next_run.isoformat(), job_id),
                 )
-                due_jobs = cur.fetchall()
+                conn.commit()
 
-                for job_id, module_name, freq in due_jobs:
-                    run_module(module_name)
-
-                    now_ts = datetime.utcnow()
-                    next_run = now_ts + timedelta(seconds=freq)
-
-                    cur.execute(
-                        """
-                        UPDATE schedule
-                        SET last_run_ts = ?, next_run_ts = ?
-                        WHERE id = ?
-                        """,
-                        (now_ts.isoformat(), next_run.isoformat(), job_id),
-                    )
-                    conn.commit()
-
-            time.sleep(TICK_INTERVAL)
-    except Exception as e:
-        err_msg = f"💥 Scheduler loop crashed: {e}"
-        logging.exception(err_msg)
-        create_event(
-            "SYSTEM_ERROR",
-            {
-                "component": "scheduler_loop",
-                "exception": str(e),
-                "traceback": traceback.format_exc(),
-            },
-        )
-        raise  # bubble up so systemd can restart if configured
-
+        time.sleep(TICK_INTERVAL)
 
 # --------------------------
 # Bootstrap helper (conditional debug attach)
@@ -153,7 +99,6 @@ def bootstrap() -> None:
     signal.signal(signal.SIGTERM, handle_sigterm)
     signal.signal(signal.SIGINT, handle_sigterm)
 
-    # --- Conditional PyCharm attach ---
     try:
         env_host = None
         env_path = "/etc/zpnet.env"
@@ -166,38 +111,20 @@ def bootstrap() -> None:
 
         # Only attach if explicitly enabled *and* host is 192.168.1.105
         if env_host == "192.168.1.105":
-            try:
-                import pydevd_pycharm
-                pydevd_pycharm.settrace(
-                    host=env_host,
-                    port=5678,
-                    stdout_to_server=True,
-                    stderr_to_server=True,
-                    suspend=False
-                )
-                logging.info(f"[ZPNET] Debugger attached (env_host={env_host})")
-            except Exception as e:
-                logging.exception(f"[ZPNET] Debugger attach failed: {e}")
-        else:
-            logging.info(
-                f"[ZPNET] Debug attach skipped (env_host={env_host}, "
-                f"ZPNET_DEBUG_ATTACH={os.environ.get('ZPNET_DEBUG_ATTACH')})"
+            import pydevd_pycharm
+            pydevd_pycharm.settrace(
+                host=env_host,
+                port=5678,
+                stdout_to_server=True,
+                stderr_to_server=True,
+                suspend=False
             )
-    except Exception as e:
-        logging.warning(f"[ZPNET] Could not evaluate debug attach condition: {e}")
+            logging.info(f"🐞 Debugger attached env_host={env_host}")
+        else:
+            logging.info(f"🐞 Debug attach skipped env_host={env_host}")
 
-    # --- Main scheduler loop ---
-    try:
         scheduler_loop()
     except Exception as e:
-        err_msg = f"Fatal error in bootstrap: {e}"
-        logging.exception(err_msg)
-        create_event(
-            "SYSTEM_ERROR",
-            {
-                "component": "bootstrap",
-                "exception": str(e),
-                "traceback": traceback.format_exc(),
-            },
-        )
+        logging.exception(f"⏰ [scheduler] unexpected exception: {e}")
+        invoke_choosenet()
         sys.exit(1)

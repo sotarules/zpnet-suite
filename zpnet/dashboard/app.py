@@ -54,7 +54,7 @@ def fetch_aggregate(name):
 # Header (Locked) Definitions
 # ------------------------------
 def header_readout():
-    """Locked header lines: datetime (PST/PDT), host, battery %, ISP, down/up speeds."""
+    """Locked header lines: datetime (PST/PDT), host, battery %, ISP, network status."""
     now = datetime.now(ZoneInfo("America/Los_Angeles")).strftime("%Y-%m-%d %H:%M:%S")
     host = fetch_aggregate("NETWORK_STATUS").get("server_host", "UNKNOWN")
     batt = fetch_aggregate("BATTERY_STATE_OF_CHARGE").get("remaining_pct", None)
@@ -64,13 +64,9 @@ def header_readout():
 
     ag_net = fetch_aggregate("NETWORK_STATUS")
     isp = ag_net.get("isp", "UNKNOWN")
-    dl = ag_net.get("download_mbps")
-    ul = ag_net.get("upload_mbps")
+    netstat = ag_net.get("network_status", "UNKNOWN")
 
-    dl_str = f"DOWN {dl:.2f}" if dl is not None else "DOWN N/A"
-    ul_str = f"UP {ul:.2f}" if ul is not None else "UP N/A"
-
-    yield f"{isp}  {dl_str}  {ul_str}"
+    yield f"{isp}  {netstat}"
 
 # ------------------------------
 # Error Lines Definitions
@@ -116,8 +112,6 @@ def sensor_scan_readout():
             and k not in ("Raspberry Pi", "teensy_status", "i2c_count", "i2c_devices")
         ):
             yield f"{k.upper()}: {v.upper()}"
-
-    # (I2C info omitted for now, as requested)
 
 def battery_status_readout():
     ag = fetch_aggregate("BATTERY_STATE_OF_CHARGE")

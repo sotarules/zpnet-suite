@@ -5,45 +5,30 @@ Fetches unsent events from SQLite and POSTs them to the remote endpoint.
 Intended to be scheduled by the main scheduler loop.
 """
 
-import sqlite3
-import requests
 import json
 import logging
+import sqlite3
 from datetime import datetime
 from pathlib import Path
 
-from zpnet.shared.logger import setup_logging
+import requests
 
+from zpnet.shared.logger import setup_logging
+from zpnet.shared.recovery import invoke_choosenet
 
 # --------------------------
 # Configuration
 # --------------------------
 DB_PATH = Path("/home/mule/zpnet/zpnet.db")
 ENV_PATH = Path("/etc/zpnet.env")
-BATCH_SIZE = 50    # max events per batch
-TIMEOUT = 5        # seconds for HTTP POST timeout
-
-# Default host
-ZPNET_REMOTE_HOST = "localhost"
-
-# Attempt to load from env file
-try:
-    with open(ENV_PATH, "r") as f:
-        for line in f:
-            if line.startswith("ZPNET_REMOTE_HOST="):
-                ZPNET_REMOTE_HOST = line.strip().split("=", 1)[1]
-except Exception as e:
-    logging.warning(f"Could not read {ENV_PATH}: {e}")
-
-ENDPOINT = f"http://{ZPNET_REMOTE_HOST}/api"
-logging.info(f"📡 Despooling to endpoint: {ENDPOINT}")
-
+BATCH_SIZE = 50       # max events per batch
+TIMEOUT = 5           # HTTP POST timeout (seconds)
 
 # --------------------------
-# Database operations
+# Core database operations
 # --------------------------
+
 def fetch_unsent_events(limit: int):
-    """Fetch up to `limit` unsent events (despooled IS NULL)."""
     with sqlite3.connect(DB_PATH) as conn:
         conn.row_factory = sqlite3.Row
         cur = conn.cursor()
@@ -59,11 +44,7 @@ def fetch_unsent_events(limit: int):
         )
         return [dict(row) for row in cur.fetchall()]
 
-
 def mark_despooled(ids):
-    """Mark events as successfully despooled with current UTC timestamp."""
-    if not ids:
-        return
     now = datetime.utcnow().isoformat()
     with sqlite3.connect(DB_PATH) as conn:
         cur = conn.cursor()
@@ -77,38 +58,55 @@ def mark_despooled(ids):
         )
         conn.commit()
 
+def zpnet_host_from_env():
+    with open(ENV_PATH, "r") as f:
+        for line in f:
+            if line.startswith("ZPNET_REMOTE_HOST="):
+                return line.strip().split("=", 1)[1]
+    raise RuntimeError("ZPNET_REMOTE_HOST not found in env")
 
 # --------------------------
-# Main task
+# Main execution routine
 # --------------------------
+
 def run():
-    """Fetch a batch of events and POST them to the API."""
-    events = fetch_unsent_events(BATCH_SIZE)
-    if not events:
-        return
-
+    """
+    Attempt to POST a batch of unsent events to the remote endpoint.
+    """
     try:
+
+        host = zpnet_host_from_env()
+        endpoint = f"http://{host}/api"
+
+        events = fetch_unsent_events(BATCH_SIZE)
+
+        if not events:
+            return
+
         response = requests.post(
-            ENDPOINT,
+            endpoint,
             headers={"Content-Type": "application/json"},
             data=json.dumps(events),
             timeout=TIMEOUT,
         )
-        if response.status_code == 200:
-            ids = [e["id"] for e in events]
-            mark_despooled(ids)
-            logging.debug(f"✅ Despooled {len(ids)} events")
-        else:
-            logging.warning(f"⚠️ API returned {response.status_code}: {response.text}")
 
-    except Exception:
-        logging.exception("❌ Despooler POST failed")
+        if response.status_code != 200:
+            raise RuntimeError(f"[event_despooler] unexpected HTTP response: {response.status_code} {response.text}")
 
+        ids = [e["id"] for e in events]
+        mark_despooled(ids)
+
+    except requests.exceptions.RequestException as e:
+        logging.warning("📡 [event_despooler] remote host unreachable; triggering network recovery")
+        invoke_choosenet()
+
+    except Exception as e:
+        logging.warning(f"❌ [event_despooler] unexpected: {e}")
 
 # --------------------------
-# Bootstrap for standalone use
+# Optional entrypoint
 # --------------------------
+
 def bootstrap():
-    """Setup logging and run once (for debugging)."""
     setup_logging()
     run()
