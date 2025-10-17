@@ -129,9 +129,17 @@ def battery_status_readout() -> Generator[str, None, None]:
     if not ag:
         yield "BATTERY DATA UNAVAILABLE."
         return
-    tte = int(ag.get("tte_minutes", 0))
-    h, m = divmod(tte, 60)
-    yield f"TIME-TO-EMPTY: {h}H {m}M."
+
+    tte_val = ag.get("tte_minutes", 0)
+
+    # Handle infinity gracefully
+    if isinstance(tte_val, float) and (tte_val == float("inf") or tte_val > 1e8):
+        yield "TIME-TO-EMPTY: ∞ (BATTERY FULL)"
+    else:
+        tte = int(tte_val)
+        h, m = divmod(tte, 60)
+        yield f"TIME-TO-EMPTY: {h}H {m}M."
+
     yield f"REMAINING PERCENT: {ag.get('remaining_pct', 0):.1f}%"
     yield f"WH USED SINCE RECHARGE: {ag.get('wh_used_since_recharge', 0):.2f}"
     yield f"WH REMAINING EST: {ag.get('wh_remaining_estimate', 0):.2f}"
