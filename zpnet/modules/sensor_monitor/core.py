@@ -1,45 +1,58 @@
 """
-ZPNet Sensor Monitor
+ZPNet Sensor Monitor  —  Stellar-Compliant Revision
 
-Scan critical devices and emit SENSOR_SCAN events.
+Scans I²C devices (INA260 sensors) for presence and responsiveness.
+Emits SENSOR_SCAN events summarizing which devices are nominal or offline.
+
+Author: The Mule
 """
 
 import logging
-import json
 from smbus2 import SMBus
 from zpnet.shared.logger import setup_logging
 from zpnet.shared.events import create_event
 
-# I2C addresses for INA260 sensors
+# ---------------------------------------------------------------------
+# INA260 I²C addresses
+# ---------------------------------------------------------------------
 INA260_ADDRS = {
     0x40: "INA260 0x40 (Battery)",
-    0x41: "INA260 0x41 (3v Rail)",
-    0x44: "INA260 0x44 (5v Rail)",
+    0x41: "INA260 0x41 (3v3 Rail)",
+    0x44: "INA260 0x44 (5v0 Rail)",
 }
 
-def check_raspberry_pi():
-    """Always nominal if code is running."""
+
+# ---------------------------------------------------------------------
+# Individual device checks
+# ---------------------------------------------------------------------
+def check_raspberry_pi() -> str:
+    """Always returns NOMINAL if code is running on the Pi."""
     return "NOMINAL"
 
-def check_ina260_devices():
+
+def check_ina260_devices() -> dict:
     """
     Attempt to read voltage register on each INA260.
-    If success, mark NOMINAL. If IOError, mark OFFLINE.
+    If success → NOMINAL, else → OFFLINE.
+
+    Returns:
+        dict[str, str]: device label → status string
     """
     results = {}
+    bus = None
     try:
         bus = SMBus(1)
         for addr, label in INA260_ADDRS.items():
             try:
                 # Read voltage register (0x02)
-                raw = bus.read_word_data(addr, 0x02)
+                _ = bus.read_word_data(addr, 0x02)
                 results[label] = "NOMINAL"
             except Exception as e:
                 logging.warning(f"{label} offline: {e}")
                 results[label] = "OFFLINE"
     except Exception as e:
-        logging.error(f"I2C bus unavailable: {e}")
-        for addr, label in INA260_ADDRS.items():
+        logging.error(f"I²C bus unavailable: {e}")
+        for label in INA260_ADDRS.values():
             results[label] = "OFFLINE"
     finally:
         try:
@@ -48,15 +61,26 @@ def check_ina260_devices():
             pass
     return results
 
+
+# ---------------------------------------------------------------------
+# Main routine
+# ---------------------------------------------------------------------
 def run():
-    """Perform sensor scan and emit SENSOR_SCAN event."""
+    """
+    Perform sensor scan and emit SENSOR_SCAN event.
+
+    Emits:
+        SENSOR_SCAN: contains status of Raspberry Pi and all INA260 sensors.
+    """
     payload = {
-        "Raspberry Pi": check_raspberry_pi(),
+        "raspberry_pi": check_raspberry_pi(),
     }
     payload.update(check_ina260_devices())
 
-    create_event(event_type="SENSOR_SCAN", payload=payload)
+    create_event("SENSOR_SCAN", payload)
+
 
 def bootstrap():
+    """Setup logging and execute run() once."""
     setup_logging()
     run()

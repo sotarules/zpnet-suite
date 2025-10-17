@@ -1,3 +1,10 @@
+"""
+ZPNet Dashboard — Health-Color Revision (Linter-Clean)
+
+Displays real-time system aggregates with color-coded subsystem
+and overall health indicators.
+"""
+
 import json
 import sqlite3
 import pygame
@@ -7,42 +14,56 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 import signal
 import sys
+from collections.abc import Generator
 
-# ------------------------------
-# Signal Handling for Safe Exit
-# ------------------------------
-def handle_exit(signum=None, frame=None):
+# ---------------------------------------------------------------------
+# Signal Handling
+# ---------------------------------------------------------------------
+def handle_exit(signum: int | None = None, frame: object | None = None) -> None:
+    """Terminate dashboard cleanly on SIGINT/SIGTERM."""
     pygame.quit()
     sys.exit(0)
 
 signal.signal(signal.SIGINT, handle_exit)
 signal.signal(signal.SIGTERM, handle_exit)
 
-# ------------------------------
-# Config Constants
-# ------------------------------
+# ---------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------
 DB_PATH = Path("/home/mule/zpnet/zpnet.db")
 SCREEN_WIDTH, SCREEN_HEIGHT = 800, 480
 FONT_NAME = "IBM 3270"
 FONT_SIZE = 24
-SCROLL_SPEED = 56600  # characters per second
-READOUT_PADDING = 2  # blank lines between readouts
-TEXT_COLOR = (0, 255, 0)
-HEADER_COLOR = (255, 255, 255)
-ERROR_COLOR = (255, 0, 0)  # red for errors
+READOUT_PADDING = 2
 BG_COLOR = (0, 0, 0)
+HEADER_COLOR = (255, 255, 255)
+TEXT_COLOR = (0, 255, 0)
+SCROLL_SPEED = 56600
 LINE_DELAY = 0.05
 READOUT_DELAY = 10
-LOCKED_LINES = 2  # number of lines reserved at top
-
-# System error display parameters
+ERROR_COLOR = (255, 0, 0)
 MAX_ERRORS_DISPLAYED = 3
-ERROR_DISPLAY_WINDOW = 3600  # seconds (1 hour)
+ERROR_DISPLAY_WINDOW = 3600  # seconds
 
-# ------------------------------
-# Utility: Database Access
-# ------------------------------
-def fetch_aggregate(name):
+# ---------------------------------------------------------------------
+# Color Map
+# ---------------------------------------------------------------------
+def health_color(state: str) -> tuple[int, int, int]:
+    """Return RGB color for NOMINAL/HOLD/DOWN states."""
+    match state:
+        case "NOMINAL":
+            return (0, 255, 0)
+        case "HOLD":
+            return (255, 255, 0)
+        case "DOWN":
+            return (255, 0, 0)
+        case _:
+            return (180, 180, 180)
+
+# ---------------------------------------------------------------------
+# Database Access
+# ---------------------------------------------------------------------
+def fetch_aggregate(name: str) -> dict:
     with sqlite3.connect(DB_PATH) as conn:
         conn.row_factory = sqlite3.Row
         cur = conn.cursor()
@@ -50,169 +71,154 @@ def fetch_aggregate(name):
         row = cur.fetchone()
         return json.loads(row["payload"]) if row else {}
 
-# ------------------------------
-# Header (Locked) Definitions
-# ------------------------------
-def header_readout():
-    """Locked header lines: datetime (PST/PDT), host, battery %, ISP, network status."""
-    now = datetime.now(ZoneInfo("America/Los_Angeles")).strftime("%Y-%m-%d %H:%M:%S")
-    host = fetch_aggregate("NETWORK_STATUS").get("server_host", "UNKNOWN")
-    batt = fetch_aggregate("BATTERY_STATE_OF_CHARGE").get("remaining_pct", None)
-    batt_str = f"{batt:.1f}%" if batt is not None else "N/A"
+# ---------------------------------------------------------------------
+# Overall Health
+# ---------------------------------------------------------------------
+def combine_health(states: list[str]) -> str:
+    """Combine multiple health states into a single overall value."""
+    if not states:
+        return "DOWN"
+    if all(s == "NOMINAL" for s in states):
+        return "NOMINAL"
+    if any(s == "DOWN" for s in states):
+        return "DOWN"
+    return "HOLD"
 
-    yield f"{now}  {host}  {batt_str}"
+# ---------------------------------------------------------------------
+# Header
+# ---------------------------------------------------------------------
+def header_readout() -> Generator[str, None, None]:
+    """Top header: datetime, host, battery %, and SYS overall health."""
+    now = datetime.now(ZoneInfo("America/Los_Angeles")).strftime("%Y-%m-%d %H:%M:%S")
 
     ag_net = fetch_aggregate("NETWORK_STATUS")
-    isp = ag_net.get("isp", "UNKNOWN")
-    netstat = ag_net.get("network_status", "UNKNOWN")
+    ag_bat = fetch_aggregate("BATTERY_STATE_OF_CHARGE")
+    ag_sen = fetch_aggregate("SENSOR_SCAN")
+    ag_tee = fetch_aggregate("TEENSY_STATUS")
 
-    yield f"{isp}  {netstat}"
+    host = ag_net.get("server_host", "UNKNOWN")
+    batt = ag_bat.get("remaining_pct")
+    batt_str = f"{batt:.1f}%" if batt is not None else "N/A"
 
-# ------------------------------
-# Error Lines Definitions
-# ------------------------------
-def system_error_lines():
-    ag = fetch_aggregate("SYSTEM_ERROR")
-    if not ag:
-        return []
+    healths = [
+        ag_net.get("health_state"),
+        ag_bat.get("health_state"),
+        ag_sen.get("health_state"),
+        ag_tee.get("health_state"),
+    ]
+    overall = combine_health([h for h in healths if h])
 
-    events = []
-    now = datetime.utcnow()
-    for ev in ag.get("events", []):
-        ts = datetime.fromisoformat(ev["timestamp"].replace("Z", "+00:00"))
-        age = (now - ts).total_seconds()
-        if age <= ERROR_DISPLAY_WINDOW:
-            component = ev.get("context", {}).get("component", "UNKNOWN")
-            msg = ev.get("message", "UNKNOWN ERROR")
-            events.append(f"[{component.upper()}] {msg}")
-    return events[:MAX_ERRORS_DISPLAYED]
+    yield f"{now}  {host}  {batt_str}   SYS: {overall}"
+    yield f"{ag_net.get('isp', 'UNKNOWN')}  {ag_net.get('network_status', 'UNKNOWN')}"
 
-# ------------------------------
-# Readout Definitions
-# ------------------------------
-def sensor_scan_readout():
-    yield "SENSOR SCAN INITIALIZATION SEQUENCE."
+# ---------------------------------------------------------------------
+# Readouts
+# ---------------------------------------------------------------------
+def sensor_scan_readout() -> Generator[str, None, None]:
     ag = fetch_aggregate("SENSOR_SCAN")
-    if not ag:
-        yield "SENSOR SCAN STATUS UNAVAILABLE."
-        return
-
-    # 1. Raspberry Pi (always show first if present)
-    if "Raspberry Pi" in ag:
-        yield f"RASPBERRY PI: {ag['Raspberry Pi'].upper()}"
-
-    # 2. Teensy Controller
-    if "teensy_status" in ag:
-        yield f"TEENSY CONTROLLER: {ag['teensy_status'].upper()}"
-
-    # 3. INA260 sensor lines (all other str fields except known ones)
+    health = ag.get("health_state", "DOWN")
+    yield f"SENSOR SCAN: {health}"
     for k, v in ag.items():
-        if (
-            isinstance(v, str)
-            and k not in ("Raspberry Pi", "teensy_status", "i2c_count", "i2c_devices")
-        ):
+        if isinstance(v, str) and k != "health_state":
             yield f"{k.upper()}: {v.upper()}"
 
-def battery_status_readout():
+def battery_status_readout() -> Generator[str, None, None]:
     ag = fetch_aggregate("BATTERY_STATE_OF_CHARGE")
+    health = ag.get("health_state", "DOWN")
+    yield f"BATTERY STATUS: {health}"
     if not ag:
-        yield "BATTERY STATUS UNAVAILABLE."
+        yield "BATTERY DATA UNAVAILABLE."
         return
+    tte = int(ag.get("tte_minutes", 0))
+    h, m = divmod(tte, 60)
+    yield f"TIME-TO-EMPTY: {h}H {m}M."
+    yield f"REMAINING PERCENT: {ag.get('remaining_pct', 0):.1f}%"
+    yield f"WH USED SINCE RECHARGE: {ag.get('wh_used_since_recharge', 0):.2f}"
+    yield f"WH REMAINING EST: {ag.get('wh_remaining_estimate', 0):.2f}"
 
-    yield "BATTERY STATUS."
-    tte = int(ag['tte_minutes'])
-    hours, minutes = divmod(tte, 60)
-    yield f"TIME-TO-EMPTY: {hours}H {minutes}M."
-    yield f"REMAINING PERCENTAGE: {ag['remaining_pct']:.1f}%"
-    yield f"WATT-HOURS USED SINCE LAST RECHARGE: {ag['wh_used_since_recharge']:.2f}"
-    yield f"WATT-HOURS REMAINING ESTIMATE: {ag['wh_remaining_estimate']:.2f}"
-
-def network_status_readout():
+def network_status_readout() -> Generator[str, None, None]:
     ag = fetch_aggregate("NETWORK_STATUS")
+    health = ag.get("health_state", "DOWN")
+    yield f"NETWORK STATUS: {health}"
     if not ag:
-        yield "NETWORK STATUS UNAVAILABLE."
+        yield "NETWORK DATA UNAVAILABLE."
         return
-
-    yield "NETWORK STATUS."
     yield f"SERVER HOST: {ag.get('server_host', 'UNKNOWN')}"
     yield f"LOCAL IP: {ag.get('local_ip', '0.0.0.0')}"
     yield f"ISP: {ag.get('isp', 'UNKNOWN')}"
+    yield f"PING: {ag.get('ping_ms', 0):.1f} MS"
+    yield f"DOWNLOAD: {ag.get('download_mbps', 0):.2f} MBPS"
+    yield f"UPLOAD: {ag.get('upload_mbps', 0):.2f} MBPS"
 
-    dl = ag.get("download_mbps")
-    ul = ag.get("upload_mbps")
-    ping = ag.get("ping_ms")
-    if dl is not None:
-        yield f"DOWNLOAD: {dl:.2f} MBPS"
-    if ul is not None:
-        yield f"UPLOAD: {ul:.2f} MBPS"
-    if ping is not None:
-        yield f"PING: {ping:.2f} MS"
-
-    interfaces = ag.get("interfaces", {})
-    for iface, stats in interfaces.items():
-        sent_mb = stats.get("bytes_sent", 0) / 1e6
-        recv_mb = stats.get("bytes_recv", 0) / 1e6
-        yield f"IFACE {iface.upper()}: SENT={sent_mb:.2f} MB RECV={recv_mb:.2f} MB"
+def teensy_status_readout() -> Generator[str, None, None]:
+    ag = fetch_aggregate("TEENSY_STATUS")
+    health = ag.get("health_state", "DOWN")
+    yield f"TEENSY STATUS: {health}"
+    if not ag:
+        yield "TEENSY DATA UNAVAILABLE."
+        return
+    yield f"FW: {ag.get('fw_version', 'UNKNOWN')}"
+    yield f"CPU TEMP: {ag.get('cpu_temp_c', 0):.1f} °C"
+    yield f"VCC: {ag.get('vcc_v', 0):.2f} V"
+    yield f"FREE HEAP: {ag.get('free_heap_bytes', 0) / 1024:.1f} KB"
 
 READOUTS = [
     sensor_scan_readout,
     battery_status_readout,
     network_status_readout,
+    teensy_status_readout,
 ]
 
-# ------------------------------
-# Text Rendering
-# ------------------------------
-def render_locked_lines(screen, font, lines):
+# ---------------------------------------------------------------------
+# Rendering
+# ---------------------------------------------------------------------
+def render_locked_lines(screen, font, lines: list[str]) -> int:
     screen.fill(BG_COLOR)
     y = 20
-    line_height = FONT_SIZE + READOUT_PADDING * 2
+    line_h = FONT_SIZE + READOUT_PADDING * 2
     for line in lines:
         surf = font.render(line.upper(), True, HEADER_COLOR)
         screen.blit(surf, (20, y))
-        y += line_height
+        y += line_h
     pygame.display.flip()
     return y
 
-def clear_scroll_area(screen, baseline):
+def clear_scroll_area(screen, baseline: int) -> None:
     rect = pygame.Rect(0, baseline, SCREEN_WIDTH, SCREEN_HEIGHT - baseline)
     pygame.draw.rect(screen, BG_COLOR, rect)
     pygame.display.update(rect)
 
-def scroll_text(screen, font, lines, start_y, clock):
-    """Render scrolling lines starting below locked header or errors."""
-    line_height = FONT_SIZE + READOUT_PADDING * 2
+def scroll_text(screen, font, lines: list[str], start_y: int, clock) -> None:
+    line_h = FONT_SIZE + READOUT_PADDING * 2
     y = start_y
     for line in lines:
+        state = next((k for k in ("NOMINAL", "HOLD", "DOWN") if k in line), None)
+        color = health_color(state) if state else TEXT_COLOR
+
         text_so_far = ""
         for char in line.upper():
-            # process quit / key events every frame
             for event in pygame.event.get():
                 if event.type == pygame.QUIT:
                     handle_exit()
                 elif event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
                     handle_exit()
-
             text_so_far += char
             clear_rect = pygame.Rect(20, y, SCREEN_WIDTH - 40, FONT_SIZE + READOUT_PADDING * 2)
             pygame.draw.rect(screen, BG_COLOR, clear_rect)
-            surf = font.render(text_so_far, True, TEXT_COLOR)
+            surf = font.render(text_so_far, True, color)
             screen.blit(surf, (20, y))
             pygame.display.flip()
-
-            # use clock.tick instead of time.sleep so events still flow
             clock.tick(SCROLL_SPEED)
-
-        y += line_height
-        if y + line_height > SCREEN_HEIGHT:
-            screen.scroll(dy=-line_height)
-            y -= line_height
+        y += line_h
+        if y + line_h > SCREEN_HEIGHT:
+            screen.scroll(dy=-line_h)
+            y -= line_h
         time.sleep(LINE_DELAY)
 
-# ------------------------------
+# ---------------------------------------------------------------------
 # Main Loop
-# ------------------------------
-def main():
+# ---------------------------------------------------------------------
+def main() -> None:
     pygame.init()
     screen = pygame.display.set_mode((SCREEN_WIDTH, SCREEN_HEIGHT))
     pygame.display.set_caption("ZPNET TERMINAL DASHBOARD")
@@ -221,9 +227,9 @@ def main():
 
     while True:
         for event in pygame.event.get():
-            if event.type == pygame.QUIT:
-                handle_exit()
-            elif event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
+            if event.type == pygame.QUIT or (
+                event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE
+            ):
                 handle_exit()
 
         header_lines = list(header_readout())
@@ -234,12 +240,11 @@ def main():
             clear_scroll_area(screen, baseline)
             lines = list(readout_fn())
             scroll_text(screen, font, lines, baseline, clock)
-            # during the delay, also stay responsive
-            for i in range(int(READOUT_DELAY * 10)):
+            for _ in range(int(READOUT_DELAY * 10)):
                 for event in pygame.event.get():
-                    if event.type == pygame.QUIT:
-                        handle_exit()
-                    elif event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
+                    if event.type == pygame.QUIT or (
+                        event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE
+                    ):
                         handle_exit()
                 clock.tick(10)
 

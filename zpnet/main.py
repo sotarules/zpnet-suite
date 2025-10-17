@@ -1,8 +1,11 @@
 """
-ZPNet Main Scheduler Daemon
+ZPNet Main Scheduler Daemon  —  Stellar-Compliant Revision
 
-This module provides the main scheduler loop that dynamically executes
-modules based on the polling schedule defined in the SQLite database.
+Dynamically executes modules according to the polling schedule defined
+in the local SQLite database. Each module run is logged into run_history.
+All timestamps are UTC-aware.
+
+Author: The Mule
 """
 
 import importlib
@@ -11,28 +14,36 @@ import signal
 import sqlite3
 import sys
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from zpnet.shared.logger import setup_logging
 
 DB_PATH = "/home/mule/zpnet/zpnet.db"
 MODULES_PATH = "zpnet.modules"
-TICK_INTERVAL = 0.1  # 100ms scheduler loop
+TICK_INTERVAL_S = 0.1  # 100 ms scheduler loop
 
-# --------------------------
-# Signal handler
-# --------------------------
+
+# ---------------------------------------------------------------------
+# Signal Handlers
+# ---------------------------------------------------------------------
 def handle_sigterm(signum, frame) -> None:
+    """Graceful shutdown on SIGTERM or SIGINT."""
     logging.info("🛑 SIGTERM received, shutting down...")
     sys.exit(0)
 
-# --------------------------
-# Module runner
-# --------------------------
+
+# ---------------------------------------------------------------------
+# Module Runner
+# ---------------------------------------------------------------------
 def run_module(module_name: str) -> None:
-    """Dynamically import and run a module, log results to run_history."""
-    start_ts = datetime.utcnow()
-    start = time.monotonic()
+    """
+    Dynamically import and execute a module's run() function.
+
+    Emits:
+        run_history entry containing module_name, timestamps, duration, and status.
+    """
+    start_ts = datetime.now(timezone.utc)
+    start_monotonic = time.monotonic()
     status = "OK"
 
     try:
@@ -42,9 +53,8 @@ def run_module(module_name: str) -> None:
         logging.exception(f"💥 [runner] module {module_name} failed: {e}")
         status = "FAIL"
 
-    end_ts = datetime.utcnow()
-    end = time.monotonic()
-    duration_ms = int((end - start) * 1000)
+    end_ts = datetime.now(timezone.utc)
+    duration_ms = int((time.monotonic() - start_monotonic) * 1000)
 
     try:
         with sqlite3.connect(DB_PATH) as conn:
@@ -54,58 +64,74 @@ def run_module(module_name: str) -> None:
                 INSERT INTO run_history (module_name, start_ts, end_ts, duration_ms, status)
                 VALUES (?, ?, ?, ?, ?)
                 """,
-                (module_name, start_ts.isoformat(), end_ts.isoformat(), duration_ms, status),
+                (
+                    module_name,
+                    start_ts.isoformat().replace("+00:00", "Z"),
+                    end_ts.isoformat().replace("+00:00", "Z"),
+                    duration_ms,
+                    status,
+                ),
             )
             conn.commit()
     except Exception as e:
         logging.warning(f"⚠️ [runner] failed to log run_history for {module_name}: {e}")
 
-# --------------------------
-# Main scheduler loop
-# --------------------------
+
+# ---------------------------------------------------------------------
+# Scheduler Loop
+# ---------------------------------------------------------------------
 def scheduler_loop() -> None:
-    """Main loop that checks schedule table and executes due jobs."""
-    logging.info("📅 ZPNet Scheduler Started")
+    """
+    Main loop that checks the schedule table for due jobs and executes them.
+    """
+    logging.info("📅 ZPNet Scheduler started")
 
     while True:
-        now = datetime.utcnow().isoformat()
+        now_ts = datetime.now(timezone.utc)
+        now_iso = now_ts.isoformat().replace("+00:00", "Z")
 
         try:
             with sqlite3.connect(DB_PATH) as conn:
                 cur = conn.cursor()
                 cur.execute(
                     """
-                    SELECT id, module_name, frequency_sec FROM schedule
+                    SELECT id, module_name, frequency_sec
+                    FROM schedule
                     WHERE next_run_ts IS NULL OR next_run_ts <= ?
                     """,
-                    (now,),
+                    (now_iso,),
                 )
                 due_jobs = cur.fetchall()
 
-                for job_id, module_name, freq in due_jobs:
+                for job_id, module_name, freq_s in due_jobs:
                     run_module(module_name)
 
-                    next_run = datetime.utcnow() + timedelta(seconds=freq)
+                    next_run = datetime.now(timezone.utc) + timedelta(seconds=freq_s)
                     cur.execute(
                         """
                         UPDATE schedule
                         SET last_run_ts = ?, next_run_ts = ?
                         WHERE id = ?
                         """,
-                        (now, next_run.isoformat(), job_id),
+                        (
+                            now_iso,
+                            next_run.isoformat().replace("+00:00", "Z"),
+                            job_id,
+                        ),
                     )
                     conn.commit()
 
         except Exception as e:
             logging.warning(f"⚠️ [scheduler] database poll failed: {e}")
 
-        time.sleep(TICK_INTERVAL)
+        time.sleep(TICK_INTERVAL_S)
 
-# --------------------------
-# Bootstrap entry point
-# --------------------------
+
+# ---------------------------------------------------------------------
+# Bootstrap Entry Point
+# ---------------------------------------------------------------------
 def bootstrap() -> None:
-    """Configure logging, signals, and start the scheduler."""
+    """Configure logging, signal handlers, and start the scheduler."""
     setup_logging()
     signal.signal(signal.SIGTERM, handle_sigterm)
     signal.signal(signal.SIGINT, handle_sigterm)
@@ -116,8 +142,9 @@ def bootstrap() -> None:
         logging.exception(f"⏰ [scheduler] unexpected exception: {e}")
         sys.exit(1)
 
-# --------------------------
-# Direct run guard
-# --------------------------
+
+# ---------------------------------------------------------------------
+# Direct Run Guard
+# ---------------------------------------------------------------------
 if __name__ == "__main__":
     bootstrap()

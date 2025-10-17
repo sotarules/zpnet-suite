@@ -1,8 +1,12 @@
 """
-ZPNet Aggregator
+ZPNet Aggregator (Unified Health Revision)
 
-Computes summary aggregates from zpnet_events (event history)
-and stores results in the aggregates table.
+Computes summary aggregates from zpnet_events and stores them in the
+aggregates table. Each subsystem (Battery, Network, Sensor, Teensy)
+publishes its health_state using the NASA-style vocabulary:
+NOMINAL, HOLD, or DOWN.
+
+Author: The Mule
 """
 
 import json
@@ -24,11 +28,31 @@ MAX_ERRORS_AGGREGATED = 5
 ERROR_WINDOW_SEC = 3600  # 1 hour
 
 
-# --------------------------
-# Helper: upsert aggregate
-# --------------------------
+# ---------------------------------------------------------------------
+# Helper: Health classification
+# ---------------------------------------------------------------------
+def classify_health(states: list[str]) -> str:
+    """
+    Determine aggregate health from constituent subsystem states.
+    Rules:
+      - all NOMINAL → NOMINAL
+      - any DOWN → DOWN
+      - otherwise HOLD
+    """
+    if not states:
+        return "DOWN"
+    if all(s == "NOMINAL" for s in states):
+        return "NOMINAL"
+    if any(s == "DOWN" for s in states):
+        return "DOWN"
+    return "HOLD"
+
+
+# ---------------------------------------------------------------------
+# Helper: Upsert aggregate
+# ---------------------------------------------------------------------
 def create_or_update_aggregate(aggregate_type: str, payload: dict):
-    ts = datetime.utcnow().isoformat()
+    ts = datetime.now(timezone.utc).isoformat()
     payload_json = json.dumps(payload or {})
 
     try:
@@ -48,90 +72,72 @@ def create_or_update_aggregate(aggregate_type: str, payload: dict):
         logging.debug(f"✅ Aggregate updated: {aggregate_type}")
     except Exception as e:
         logging.exception(f"⚠️ Failed to update aggregate {aggregate_type}: {e}")
+        raise
 
 
-# --------------------------
+# ---------------------------------------------------------------------
 # Battery SoC Estimator
-# --------------------------
+# ---------------------------------------------------------------------
 def aggregate_battery_state_of_charge():
     with sqlite3.connect(DB_PATH) as conn:
         conn.row_factory = sqlite3.Row
         cur = conn.cursor()
 
         cur.execute(
-            "SELECT timestamp FROM zpnet_events WHERE event_type = 'SWAP_BATTERY' ORDER BY timestamp DESC LIMIT 1"
+            "SELECT timestamp FROM zpnet_events WHERE event_type='SWAP_BATTERY' "
+            "ORDER BY timestamp DESC LIMIT 1"
         )
         swap_row = cur.fetchone()
         if not swap_row:
-            logging.warning("⚠️ No SWAP_BATTERY event found; skipping SoC")
-            return
+            raise RuntimeError("No SWAP_BATTERY event found")
 
         swap_point = swap_row["timestamp"]
-        swap_voltage = None
 
         cur.execute(
-            """
-            SELECT payload FROM zpnet_events
-            WHERE event_type = 'POWER_STATUS' AND timestamp >= ?
-            ORDER BY timestamp ASC LIMIT 1
-            """,
+            "SELECT timestamp, payload FROM zpnet_events "
+            "WHERE event_type='POWER_STATUS' AND timestamp>=? ORDER BY timestamp ASC",
             (swap_point,),
         )
-        first_power_row = cur.fetchone()
-        if first_power_row:
-            try:
-                sensors = json.loads(first_power_row["payload"]).get("sensors", [])
-                battery = next((s for s in sensors if s["address"] == BATTERY_ADDR), None)
-                if battery:
-                    swap_voltage = battery.get("voltage")
-            except Exception:
-                pass
-
-        cur.execute(
-            """
-            SELECT timestamp, payload FROM zpnet_events
-            WHERE event_type = 'POWER_STATUS' AND timestamp >= ?
-            ORDER BY timestamp ASC
-            """,
-            (swap_point,),
-        )
-        forward_rows = cur.fetchall()
-        if len(forward_rows) < 2:
-            logging.warning("⚠️ Not enough POWER_STATUS events after swap")
-            return
+        power_rows = cur.fetchall()
+        if len(power_rows) < 2:
+            raise RuntimeError("Insufficient POWER_STATUS samples")
 
     total_wh = 0.0
     last_ts = None
     last_power = None
     samples_used = 0
 
-    for i in range(0, len(forward_rows), POWER_SAMPLE_STEP):
-        row = forward_rows[i]
-        try:
-            payload = json.loads(row["payload"])
-            sensors = payload.get("sensors", [])
-            battery = next((s for s in sensors if s["address"] == BATTERY_ADDR), None)
-            if not battery or "power" not in battery:
-                continue
-
-            ts = datetime.fromisoformat(row["timestamp"])
-            power_W = battery["power"]
-
-            if last_ts is not None and last_power is not None:
-                dt_sec = (ts - last_ts).total_seconds()
-                avg_power = (power_W + last_power) / 2.0
-                wh = avg_power * dt_sec / 3600.0
-                total_wh += abs(wh)
-                samples_used += 1
-
-            last_ts = ts
-            last_power = power_W
-        except Exception:
+    for i in range(0, len(power_rows), POWER_SAMPLE_STEP):
+        row = power_rows[i]
+        payload = json.loads(row["payload"])
+        sensors = payload.get("sensors", [])
+        battery = next((s for s in sensors if s["address"] == BATTERY_ADDR), None)
+        if not battery or "power" not in battery:
             continue
+
+        ts = datetime.fromisoformat(row["timestamp"])
+        power_w = battery["power"]
+
+        if last_ts and last_power:
+            dt = (ts - last_ts).total_seconds()
+            avg_power = (power_w + last_power) / 2.0
+            total_wh += abs(avg_power * dt / 3600.0)
+            samples_used += 1
+
+        last_ts, last_power = ts, power_w
 
     remaining_wh = max(0.0, BATTERY_CAPACITY_WH - total_wh)
     remaining_pct = round(100.0 * remaining_wh / BATTERY_CAPACITY_WH, 1)
-    tte_minutes = round(remaining_wh / last_power * 60.0, 1) if last_power and last_power > 1.0 else float("inf")
+    tte_minutes = (
+        round(remaining_wh / last_power * 60.0, 1)
+        if last_power and last_power > 1.0
+        else float("inf")
+    )
+
+    # Health determination
+    health_state = "NOMINAL" if remaining_pct > 10 else "HOLD"
+    if remaining_pct <= 3:
+        health_state = "DOWN"
 
     create_or_update_aggregate(
         "BATTERY_STATE_OF_CHARGE",
@@ -143,67 +149,94 @@ def aggregate_battery_state_of_charge():
             "samples_used": samples_used,
             "sample_step": POWER_SAMPLE_STEP,
             "battery_capacity_wh": BATTERY_CAPACITY_WH,
-            "swap_time": swap_point,
-            "swap_voltage": swap_voltage,
+            "health_state": health_state,
         },
     )
 
 
-# --------------------------
+# ---------------------------------------------------------------------
 # Network Status
-# --------------------------
+# ---------------------------------------------------------------------
 def aggregate_network_status():
     with sqlite3.connect(DB_PATH) as conn:
         conn.row_factory = sqlite3.Row
         cur = conn.cursor()
         cur.execute(
-            """
-            SELECT payload FROM zpnet_events
-            WHERE event_type = 'NETWORK_STATUS'
-            ORDER BY timestamp DESC LIMIT 1
-            """
+            "SELECT payload FROM zpnet_events WHERE event_type='NETWORK_STATUS' "
+            "ORDER BY timestamp DESC LIMIT 1"
         )
         row = cur.fetchone()
         if not row:
-            logging.warning("⚠️ No NETWORK_STATUS events found")
-            return
+            raise RuntimeError("No NETWORK_STATUS events found")
 
-        payload = json.loads(row["payload"])
-        create_or_update_aggregate("NETWORK_STATUS", payload)
+    payload = json.loads(row["payload"])
+    net_state = payload.get("network_status", "UNKNOWN")
+
+    health_state = "NOMINAL" if net_state == "NOMINAL" else "HOLD"
+    if net_state == "DOWN":
+        health_state = "DOWN"
+
+    payload["health_state"] = health_state
+    create_or_update_aggregate("NETWORK_STATUS", payload)
 
 
-# --------------------------
+# ---------------------------------------------------------------------
 # Sensor Scan
-# --------------------------
+# ---------------------------------------------------------------------
 def aggregate_sensor_scan():
     with sqlite3.connect(DB_PATH) as conn:
         conn.row_factory = sqlite3.Row
         cur = conn.cursor()
 
         cur.execute(
-            "SELECT payload FROM zpnet_events WHERE event_type = 'SENSOR_SCAN' ORDER BY timestamp DESC LIMIT 1"
+            "SELECT payload FROM zpnet_events WHERE event_type='SENSOR_SCAN' "
+            "ORDER BY timestamp DESC LIMIT 1"
         )
         row_scan = cur.fetchone()
 
+        if not row_scan:
+            raise RuntimeError("Missing SENSOR_SCAN event")
+
+    scan = json.loads(row_scan["payload"])
+    states = [v for v in scan.values() if isinstance(v, str)]
+    scan["health_state"] = classify_health(states)
+    create_or_update_aggregate("SENSOR_SCAN", scan)
+
+
+# ---------------------------------------------------------------------
+# Teensy Status (singleton)
+# ---------------------------------------------------------------------
+def aggregate_teensy_status():
+    """
+    Create a TEENSY_STATUS aggregate from the most recent TEENSY_STATUS event.
+    The aggregator does not query the device directly; it uses the event log.
+    """
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        cur = conn.cursor()
         cur.execute(
-            "SELECT payload FROM zpnet_events WHERE event_type = 'HEARTBEAT' ORDER BY timestamp DESC LIMIT 1"
+            "SELECT payload FROM zpnet_events WHERE event_type='TEENSY_STATUS' "
+            "ORDER BY timestamp DESC LIMIT 1"
         )
-        row_hb = cur.fetchone()
+        row = cur.fetchone()
+        if not row:
+            raise RuntimeError("No TEENSY_STATUS events found")
 
-    if not (row_scan and row_hb):
-        logging.warning("⚠️ No SENSOR_SCAN or HEARTBEAT found")
-        return
+    payload = json.loads(row["payload"])
+    status = payload.get("status", "UNKNOWN")
 
-    payload = json.loads(row_scan["payload"]) if row_scan else {}
-    hb = json.loads(row_hb["payload"]) if row_hb else {}
-    payload["teensy_status"] = hb.get("status", "UNKNOWN")
+    # Determine health
+    health_state = "NOMINAL" if status == "NOMINAL" else "HOLD"
+    if status == "DOWN":
+        health_state = "DOWN"
 
-    create_or_update_aggregate("SENSOR_SCAN", payload)
+    payload["health_state"] = health_state
+    create_or_update_aggregate("TEENSY_STATUS", payload)
 
 
-# --------------------------
-# System Error Consolidation
-# --------------------------
+# ---------------------------------------------------------------------
+# System Errors
+# ---------------------------------------------------------------------
 def aggregate_system_errors():
     cutoff = datetime.now(timezone.utc) - timedelta(seconds=ERROR_WINDOW_SEC)
 
@@ -213,7 +246,7 @@ def aggregate_system_errors():
         cur.execute(
             """
             SELECT timestamp, payload FROM zpnet_events
-            WHERE event_type = 'SYSTEM_ERROR' AND timestamp >= ?
+            WHERE event_type='SYSTEM_ERROR' AND timestamp >= ?
             ORDER BY timestamp DESC LIMIT ?
             """,
             (cutoff.isoformat(), MAX_ERRORS_AGGREGATED),
@@ -222,10 +255,7 @@ def aggregate_system_errors():
 
     events = []
     for row in rows:
-        try:
-            payload = json.loads(row["payload"])
-        except Exception:
-            payload = {"raw": row["payload"]}
+        payload = json.loads(row["payload"])
         events.append({
             "timestamp": row["timestamp"],
             "message": payload.get("exception") or payload.get("message") or "SYSTEM ERROR",
@@ -235,19 +265,29 @@ def aggregate_system_errors():
     create_or_update_aggregate("SYSTEM_ERROR", {"events": events})
 
 
-# --------------------------
-# Main dispatcher
-# --------------------------
+# ---------------------------------------------------------------------
+# Main Dispatcher
+# ---------------------------------------------------------------------
 def run():
+    """
+    Execute all aggregation pipelines sequentially.
+
+    Emits:
+        Updates aggregates table with BATTERY_STATE_OF_CHARGE,
+        NETWORK_STATUS, SENSOR_SCAN, TEENSY_STATUS, SYSTEM_ERROR.
+    """
     try:
         aggregate_battery_state_of_charge()
         aggregate_network_status()
         aggregate_sensor_scan()
+        aggregate_teensy_status()
         aggregate_system_errors()
     except Exception as e:
         logging.exception(f"🔥 Aggregator loop failed: {e}")
+        raise
 
 
 def bootstrap():
+    """Setup logging and execute run() once."""
     setup_logging()
     run()

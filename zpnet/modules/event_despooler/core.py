@@ -1,14 +1,17 @@
 """
-ZPNet Event Despooler
+ZPNet Event Despooler  —  Stellar-Compliant Revision
 
-Fetches unsent events from SQLite and POSTs them to the remote endpoint.
-Intended to be scheduled by the main scheduler loop.
+Fetches unsent events from the local SQLite database and POSTs them to
+the remote ZPNet endpoint.  Marks events as despooled upon success.
+Triggers network recovery if the host is unreachable.
+
+Author: The Mule
 """
 
 import json
 import logging
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 import requests
@@ -16,19 +19,20 @@ import requests
 from zpnet.shared.logger import setup_logging
 from zpnet.shared.recovery import invoke_choosenet
 
-# --------------------------
+# ---------------------------------------------------------------------
 # Configuration
-# --------------------------
+# ---------------------------------------------------------------------
 DB_PATH = Path("/home/mule/zpnet/zpnet.db")
 ENV_PATH = Path("/etc/zpnet.env")
-BATCH_SIZE = 50       # max events per batch
-TIMEOUT = 5           # HTTP POST timeout (seconds)
+BATCH_SIZE = 50           # max events per batch
+HTTP_TIMEOUT_S = 5         # POST timeout (seconds)
 
-# --------------------------
-# Core database operations
-# --------------------------
 
-def fetch_unsent_events(limit: int):
+# ---------------------------------------------------------------------
+# Database Operations
+# ---------------------------------------------------------------------
+def fetch_unsent_events(limit: int) -> list[dict]:
+    """Return up to `limit` unsent events from zpnet_events."""
     with sqlite3.connect(DB_PATH) as conn:
         conn.row_factory = sqlite3.Row
         cur = conn.cursor()
@@ -44,8 +48,10 @@ def fetch_unsent_events(limit: int):
         )
         return [dict(row) for row in cur.fetchall()]
 
-def mark_despooled(ids):
-    now = datetime.utcnow().isoformat()
+
+def mark_despooled(ids: list[int]) -> None:
+    """Mark given event IDs as successfully despooled."""
+    ts = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
     with sqlite3.connect(DB_PATH) as conn:
         cur = conn.cursor()
         cur.executemany(
@@ -54,59 +60,64 @@ def mark_despooled(ids):
             SET despooled = ?
             WHERE id = ?
             """,
-            [(now, event_id) for event_id in ids],
+            [(ts, event_id) for event_id in ids],
         )
         conn.commit()
 
-def zpnet_host_from_env():
-    with open(ENV_PATH, "r") as f:
+
+def zpnet_host_from_env() -> str:
+    """Read ZPNET_REMOTE_HOST from /etc/zpnet.env."""
+    with ENV_PATH.open() as f:
         for line in f:
             if line.startswith("ZPNET_REMOTE_HOST="):
                 return line.strip().split("=", 1)[1]
     raise RuntimeError("ZPNET_REMOTE_HOST not found in env")
 
-# --------------------------
-# Main execution routine
-# --------------------------
 
+# ---------------------------------------------------------------------
+# Main Routine
+# ---------------------------------------------------------------------
 def run():
     """
     Attempt to POST a batch of unsent events to the remote endpoint.
+
+    Emits:
+        NETWORK recovery if remote host is unreachable.
     """
     try:
-
         host = zpnet_host_from_env()
         endpoint = f"http://{host}/api"
-
         events = fetch_unsent_events(BATCH_SIZE)
 
         if not events:
             return
 
+        logging.info(f"📤 Despooling {len(events)} events → {endpoint}")
         response = requests.post(
             endpoint,
             headers={"Content-Type": "application/json"},
-            data=json.dumps(events),
-            timeout=TIMEOUT,
+            data=json.dumps(events, separators=(",", ":")),
+            timeout=HTTP_TIMEOUT_S,
         )
 
         if response.status_code != 200:
-            raise RuntimeError(f"[event_despooler] unexpected HTTP response: {response.status_code} {response.text}")
+            raise RuntimeError(
+                f"[event_despooler] HTTP {response.status_code}: {response.text}"
+            )
 
         ids = [e["id"] for e in events]
         mark_despooled(ids)
+        logging.info(f"✅ Successfully despooled {len(ids)} events")
 
-    except requests.exceptions.RequestException as e:
-        logging.warning("📡 [event_despooler] remote host unreachable; triggering network recovery")
+    except requests.exceptions.RequestException:
+        logging.warning("📡 [event_despooler] remote host unreachable; triggering recovery")
         invoke_choosenet()
 
     except Exception as e:
-        logging.warning(f"❌ [event_despooler] unexpected: {e}")
+        logging.exception(f"💥 [event_despooler] unexpected: {e}")
 
-# --------------------------
-# Optional entrypoint
-# --------------------------
 
 def bootstrap():
+    """Setup logging and execute run() once."""
     setup_logging()
     run()
