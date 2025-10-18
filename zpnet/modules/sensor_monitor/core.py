@@ -1,8 +1,12 @@
 """
-ZPNet Sensor Monitor  —  Stellar-Compliant Revision
+ZPNet Sensor Monitor — Stellar-Compliant Revision (Pi-logic removed)
 
 Scans I²C devices (INA260 sensors) for presence and responsiveness.
 Emits SENSOR_SCAN events summarizing which devices are nominal or offline.
+
+Note:
+    The Raspberry Pi is no longer included here; it now has its own
+    RASPBERRY_PI_STATUS event and aggregate handled by the pi_monitor module.
 
 Author: The Mule
 """
@@ -21,15 +25,9 @@ INA260_ADDRS = {
     0x44: "INA260 0x44 (5v0 Rail)",
 }
 
-
 # ---------------------------------------------------------------------
 # Individual device checks
 # ---------------------------------------------------------------------
-def check_raspberry_pi() -> str:
-    """Always returns NOMINAL if code is running on the Pi."""
-    return "NOMINAL"
-
-
 def check_ina260_devices() -> dict:
     """
     Attempt to read voltage register on each INA260.
@@ -61,26 +59,20 @@ def check_ina260_devices() -> dict:
             pass
     return results
 
-
 # ---------------------------------------------------------------------
 # Main routine
 # ---------------------------------------------------------------------
-def run():
+def run() -> None:
     """
     Perform sensor scan and emit SENSOR_SCAN event.
 
     Emits:
-        SENSOR_SCAN: contains status of Raspberry Pi and all INA260 sensors.
+        SENSOR_SCAN: contains status of all INA260 sensors.
     """
-    payload = {
-        "raspberry_pi": check_raspberry_pi(),
-    }
-    payload.update(check_ina260_devices())
-
+    payload = check_ina260_devices()
     create_event("SENSOR_SCAN", payload)
 
-
-def bootstrap():
+def bootstrap() -> None:
     """Setup logging and execute run() once."""
     setup_logging()
     run()

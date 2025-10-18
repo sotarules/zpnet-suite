@@ -1,5 +1,5 @@
 """
-ZPNet Dashboard — Health-Color Revision (Linter-Clean)
+ZPNet Dashboard — Health-Color Revision (with Raspberry Pi Support)
 
 Displays real-time system aggregates with color-coded subsystem
 and overall health indicators.
@@ -95,6 +95,7 @@ def header_readout() -> Generator[str, None, None]:
     ag_bat = fetch_aggregate("BATTERY_STATE_OF_CHARGE")
     ag_sen = fetch_aggregate("SENSOR_SCAN")
     ag_tee = fetch_aggregate("TEENSY_STATUS")
+    ag_pi  = fetch_aggregate("RASPBERRY_PI_STATUS")
 
     host = ag_net.get("server_host", "UNKNOWN")
     batt = ag_bat.get("remaining_pct")
@@ -105,6 +106,7 @@ def header_readout() -> Generator[str, None, None]:
         ag_bat.get("health_state"),
         ag_sen.get("health_state"),
         ag_tee.get("health_state"),
+        ag_pi.get("health_state"),
     ]
     overall = combine_health([h for h in healths if h])
 
@@ -170,11 +172,29 @@ def teensy_status_readout() -> Generator[str, None, None]:
     yield f"VCC: {ag.get('vcc_v', 0):.2f} V"
     yield f"FREE HEAP: {ag.get('free_heap_bytes', 0) / 1024:.1f} KB"
 
+def raspberry_pi_status_readout() -> Generator[str, None, None]:
+    ag = fetch_aggregate("RASPBERRY_PI_STATUS")
+    health = ag.get("health_state", "DOWN")
+    yield f"RASPBERRY PI STATUS: {health}"
+    if not ag:
+        yield "RASPBERRY PI DATA UNAVAILABLE."
+        return
+
+    yield f"DEVICE: {ag.get('device_name', 'UNKNOWN')}"
+    yield f"CPU TEMP: {ag.get('cpu_temp_c', 0):.1f} °C"
+    yield f"LOAD (1/5/15): {ag.get('load_1m', 0):.2f} / {ag.get('load_5m', 0):.2f} / {ag.get('load_15m', 0):.2f}"
+    yield f"UPTIME: {ag.get('uptime_s', 0)/3600:.2f} H"
+    mem = ag.get("memory", {})
+    yield f"MEM USED: {mem.get('used_mb', 0):.0f} / {mem.get('total_mb', 0):.0f} MB ({mem.get('percent', 0):.1f}%)"
+    disk = ag.get("disk", {})
+    yield f"DISK USED: {disk.get('used_gb', 0):.2f} / {disk.get('total_gb', 0):.2f} GB ({disk.get('percent', 0):.1f}%)"
+
 READOUTS = [
     sensor_scan_readout,
     battery_status_readout,
     network_status_readout,
     teensy_status_readout,
+    raspberry_pi_status_readout,
 ]
 
 # ---------------------------------------------------------------------

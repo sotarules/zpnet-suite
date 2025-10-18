@@ -112,11 +112,11 @@ def aggregate_battery_state_of_charge():
         payload = json.loads(row["payload"])
         sensors = payload.get("sensors", [])
         battery = next((s for s in sensors if s["address"] == BATTERY_ADDR), None)
-        if not battery or "power" not in battery:
+        if not battery or "power_w" not in battery:
             continue
 
         ts = datetime.fromisoformat(row["timestamp"])
-        power_w = battery["power"]
+        power_w = battery["power_w"]
 
         if last_ts and last_power:
             dt = (ts - last_ts).total_seconds()
@@ -233,6 +233,28 @@ def aggregate_teensy_status():
     payload["health_state"] = health_state
     create_or_update_aggregate("TEENSY_STATUS", payload)
 
+# ---------------------------------------------------------------------
+# Raspberry Pi Status (singleton)
+# ---------------------------------------------------------------------
+def aggregate_raspberry_pi_status():
+    """
+    Create a RASPBERRY_PI_STATUS aggregate from the most recent event.
+    Mirrors the Teensy aggregate pattern for host-level telemetry.
+    """
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT payload FROM zpnet_events WHERE event_type='RASPBERRY_PI_STATUS' "
+            "ORDER BY timestamp DESC LIMIT 1"
+        )
+        row = cur.fetchone()
+        if not row:
+            raise RuntimeError("No RASPBERRY_PI_STATUS events found")
+
+    payload = json.loads(row["payload"])
+    health_state = payload.get("health_state", "UNKNOWN")
+    create_or_update_aggregate("RASPBERRY_PI_STATUS", payload)
 
 # ---------------------------------------------------------------------
 # System Errors
@@ -277,15 +299,15 @@ def run():
         NETWORK_STATUS, SENSOR_SCAN, TEENSY_STATUS, SYSTEM_ERROR.
     """
     try:
+        aggregate_raspberry_pi_status()
+        aggregate_teensy_status()
         aggregate_battery_state_of_charge()
         aggregate_network_status()
         aggregate_sensor_scan()
-        aggregate_teensy_status()
         aggregate_system_errors()
     except Exception as e:
         logging.exception(f"🔥 Aggregator loop failed: {e}")
         raise
-
 
 def bootstrap():
     """Setup logging and execute run() once."""
