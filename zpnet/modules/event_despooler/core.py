@@ -3,7 +3,7 @@ ZPNet Event Despooler  —  Stellar-Compliant Revision
 
 Fetches unsent events from the local SQLite database and POSTs them to
 the remote ZPNet endpoint.  Marks events as despooled upon success.
-Triggers network recovery if the host is unreachable.
+Logs info if remote host is unreachable.
 
 Author: The Mule
 """
@@ -17,14 +17,13 @@ from pathlib import Path
 import requests
 
 from zpnet.shared.logger import setup_logging
-from zpnet.shared.recovery import invoke_choosenet
 
 # ---------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------
+ZPNET_REMOTE_HOST = "sota.ddns.net"
 DB_PATH = Path("/home/mule/zpnet/zpnet.db")
-ENV_PATH = Path("/etc/zpnet.env")
-BATCH_SIZE = 50           # max events per batch
+BATCH_SIZE = 50            # max events per batch
 HTTP_TIMEOUT_S = 5         # POST timeout (seconds)
 
 
@@ -65,34 +64,21 @@ def mark_despooled(ids: list[int]) -> None:
         conn.commit()
 
 
-def zpnet_host_from_env() -> str:
-    """Read ZPNET_REMOTE_HOST from /etc/zpnet.env."""
-    with ENV_PATH.open() as f:
-        for line in f:
-            if line.startswith("ZPNET_REMOTE_HOST="):
-                return line.strip().split("=", 1)[1]
-    raise RuntimeError("ZPNET_REMOTE_HOST not found in env")
-
-
 # ---------------------------------------------------------------------
 # Main Routine
 # ---------------------------------------------------------------------
 def run():
     """
     Attempt to POST a batch of unsent events to the remote endpoint.
-
-    Emits:
-        NETWORK recovery if remote host is unreachable.
     """
     try:
-        host = zpnet_host_from_env()
-        endpoint = f"http://{host}/api"
+        endpoint = f"http://{ZPNET_REMOTE_HOST}/api"
         events = fetch_unsent_events(BATCH_SIZE)
 
         if not events:
             return
 
-        logging.info(f"📤 Despooling {len(events)} events → {endpoint}")
+        logging.info(f"📤 [event_despooler] despooling {len(events)} events → {endpoint}")
         response = requests.post(
             endpoint,
             headers={"Content-Type": "application/json"},
@@ -107,11 +93,10 @@ def run():
 
         ids = [e["id"] for e in events]
         mark_despooled(ids)
-        logging.info(f"✅ Successfully despooled {len(ids)} events")
+        logging.info(f"✅ [event_despooler] successfully despooled {len(ids)} events")
 
     except requests.exceptions.RequestException:
-        logging.warning("📡 [event_despooler] remote host unreachable; triggering recovery")
-        invoke_choosenet()
+        logging.info("📡 [event_despooler] remote host unreachable - waiting")
 
     except Exception as e:
         logging.exception(f"💥 [event_despooler] unexpected: {e}")

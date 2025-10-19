@@ -1,8 +1,8 @@
 """
-ZPNet Dashboard — Health-Color Revision (with Raspberry Pi Support)
+ZPNet Dashboard — Simplified (Clean Header, No Health Coloring)
 
-Displays real-time system aggregates with color-coded subsystem
-and overall health indicators.
+Displays real-time system aggregates with a minimalist header
+showing only datetime, battery percentage, and overall system status.
 """
 
 import json
@@ -41,24 +41,6 @@ TEXT_COLOR = (0, 255, 0)
 SCROLL_SPEED = 56600
 LINE_DELAY = 0.05
 READOUT_DELAY = 10
-ERROR_COLOR = (255, 0, 0)
-MAX_ERRORS_DISPLAYED = 3
-ERROR_DISPLAY_WINDOW = 3600  # seconds
-
-# ---------------------------------------------------------------------
-# Color Map
-# ---------------------------------------------------------------------
-def health_color(state: str) -> tuple[int, int, int]:
-    """Return RGB color for NOMINAL/HOLD/DOWN states."""
-    match state:
-        case "NOMINAL":
-            return (0, 255, 0)
-        case "HOLD":
-            return (255, 255, 0)
-        case "DOWN":
-            return (255, 0, 0)
-        case _:
-            return (180, 180, 180)
 
 # ---------------------------------------------------------------------
 # Database Access
@@ -72,7 +54,7 @@ def fetch_aggregate(name: str) -> dict:
         return json.loads(row["payload"]) if row else {}
 
 # ---------------------------------------------------------------------
-# Overall Health
+# Overall Health (retained for textual display)
 # ---------------------------------------------------------------------
 def combine_health(states: list[str]) -> str:
     """Combine multiple health states into a single overall value."""
@@ -88,7 +70,7 @@ def combine_health(states: list[str]) -> str:
 # Header
 # ---------------------------------------------------------------------
 def header_readout() -> Generator[str, None, None]:
-    """Top header: datetime, host, battery %, and SYS overall health."""
+    """Top header: datetime, battery %, and SYS overall health."""
     now = datetime.now(ZoneInfo("America/Los_Angeles")).strftime("%Y-%m-%d %H:%M:%S")
 
     ag_net = fetch_aggregate("NETWORK_STATUS")
@@ -97,7 +79,6 @@ def header_readout() -> Generator[str, None, None]:
     ag_tee = fetch_aggregate("TEENSY_STATUS")
     ag_pi  = fetch_aggregate("RASPBERRY_PI_STATUS")
 
-    host = ag_net.get("server_host", "UNKNOWN")
     batt = ag_bat.get("remaining_pct")
     batt_str = f"{batt:.1f}%" if batt is not None else "N/A"
 
@@ -110,8 +91,10 @@ def header_readout() -> Generator[str, None, None]:
     ]
     overall = combine_health([h for h in healths if h])
 
-    yield f"{now}  {host}  {batt_str}   SYS: {overall}"
-    yield f"{ag_net.get('isp', 'UNKNOWN')}  {ag_net.get('network_status', 'UNKNOWN')}"
+    # First line: concise status
+    yield f"{now}   BATTERY: {batt_str}   SYS: {overall}"
+    # Second line intentionally left blank for aesthetics
+    yield ""
 
 # ---------------------------------------------------------------------
 # Readouts
@@ -133,8 +116,6 @@ def battery_status_readout() -> Generator[str, None, None]:
         return
 
     tte_val = ag.get("tte_minutes", 0)
-
-    # Handle infinity gracefully
     if isinstance(tte_val, float) and (tte_val == float("inf") or tte_val > 1e8):
         yield "TIME-TO-EMPTY: ∞ (BATTERY FULL)"
     else:
@@ -153,7 +134,7 @@ def network_status_readout() -> Generator[str, None, None]:
     if not ag:
         yield "NETWORK DATA UNAVAILABLE."
         return
-    yield f"SERVER HOST: {ag.get('server_host', 'UNKNOWN')}"
+    yield f"SERVER HOST: sota.ddns.net"
     yield f"LOCAL IP: {ag.get('local_ip', '0.0.0.0')}"
     yield f"ISP: {ag.get('isp', 'UNKNOWN')}"
     yield f"PING: {ag.get('ping_ms', 0):.1f} MS"
@@ -217,11 +198,11 @@ def clear_scroll_area(screen, baseline: int) -> None:
     pygame.display.update(rect)
 
 def scroll_text(screen, font, lines: list[str], start_y: int, clock) -> None:
+    """Render scrolling lines with a fixed color (no semantic coloring)."""
     line_h = FONT_SIZE + READOUT_PADDING * 2
     y = start_y
     for line in lines:
-        state = next((k for k in ("NOMINAL", "HOLD", "DOWN") if k in line), None)
-        color = health_color(state) if state else TEXT_COLOR
+        color = TEXT_COLOR  # single consistent color
 
         text_so_far = ""
         for char in line.upper():

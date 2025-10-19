@@ -3,7 +3,6 @@ ZPNet Network Monitor  —  Stellar-Compliant Revision
 
 Collects network stats and emits NETWORK_STATUS events.
 Performs a definitive connectivity test to the remote ZPNet host.
-If the test fails, invokes choosenet.sh (throttled) for recovery.
 
 Author: The Mule
 """
@@ -21,35 +20,35 @@ import requests
 
 from zpnet.shared.events import create_event
 from zpnet.shared.logger import setup_logging
-from zpnet.shared.recovery import invoke_choosenet
 
 # ---------------------------------------------------------------------
 # Constants / Config
 # ---------------------------------------------------------------------
-ENV_PATH = Path("/etc/zpnet.env")
-CHOOSENET_PATH = Path("/usr/local/bin/choosenet.sh")
-RECOVERY_STAMP = Path("/home/mule/.cache/zpnet/zpnet_choosenet.last")
-
-RECOVERY_MIN_INTERVAL_SEC = 600  # 10 minutes between choosenet attempts
-TEST_TIMEOUT_SEC = 5
+ZPNET_REMOTE_HOST = "sota.ddns.net"
 ZPNET_TEST_PATH = "/api/test"
-
+TEST_TIMEOUT_SEC = 5
 
 # ---------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------
-def get_server_host() -> str:
-    """Read current ZPNet remote host from env config."""
-    with ENV_PATH.open() as f:
-        lines = f.readlines()
-    kv = dict(line.strip().split("=", 1) for line in lines if "=" in line)
-    return kv.get("ZPNET_REMOTE_HOST", "localhost")
+def get_ssid() -> str:
+    """Returns the currently associated Wi-Fi SSID, or empty string if none."""
+    try:
+        result = subprocess.run(
+            ["iwgetid", "-r"],
+            capture_output=True,
+            check=True,
+            text=True,
+        )
+        return result.stdout.strip()
+    except subprocess.CalledProcessError:
+        return ""
 
 
-def zpnet_test(server_host: str) -> bool:
+def zpnet_test() -> bool:
     """Definitive connectivity test."""
     try:
-        url = f"http://{server_host}{ZPNET_TEST_PATH}"
+        url = f"http://{ZPNET_REMOTE_HOST}{ZPNET_TEST_PATH}"
         resp = requests.get(url, timeout=TEST_TIMEOUT_SEC)
         return resp.status_code == 200 and "ZPNet OK" in resp.text
     except requests.RequestException:
@@ -125,13 +124,13 @@ def download_test_mbps() -> float:
     return 0.0
 
 
-def upload_test_mbps(server_host: str) -> float:
+def upload_test_mbps() -> float:
     """Measure upload throughput using iperf3 (requires server)."""
     duration_s = 5
     timeout_s = 15
     try:
         result = subprocess.run(
-            ["iperf3", "-c", server_host, "-t", str(duration_s), "-f", "m", "--json"],
+            ["iperf3", "-c", ZPNET_REMOTE_HOST, "-t", str(duration_s), "-f", "m", "--json"],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             timeout=timeout_s,
@@ -154,16 +153,13 @@ def run():
     """
     payload = {}
     try:
-        server_host = get_server_host()
-        payload["server_host"] = server_host
+        payload["ssid"] = get_ssid()
 
         # definitive test
-        test_ok = zpnet_test(server_host)
+        test_ok = zpnet_test()
         payload["network_status"] = "NOMINAL" if test_ok else "DOWN"
 
         if not test_ok:
-            invoke_choosenet()
-            create_event("NETWORK_STATUS", payload)
             return
 
         # Normal metrics
@@ -172,7 +168,7 @@ def run():
         payload["isp"] = get_isp()
         payload["ping_ms"] = ping_latency_ms()
         payload["download_mbps"] = download_test_mbps()
-        payload["upload_mbps"] = upload_test_mbps(server_host)
+        payload["upload_mbps"] = upload_test_mbps()
 
     except Exception as e:
         logging.exception(f"❌ [network_monitor] unexpected exception: {e}")

@@ -19,9 +19,9 @@ from zpnet.shared.logger import setup_logging
 DB_PATH = "/home/mule/zpnet/zpnet.db"
 
 BATTERY_ADDR = "0x40"
-BATTERY_CAPACITY_WH = 128.0
+BATTERY_CAPACITY_WH = 110.0
 V_BATTERY_FULL = 13.384
-V_BATTERY_EMPTY = 9.706
+V_BATTERY_EMPTY = 11.00
 
 POWER_SAMPLE_STEP = 50
 MAX_ERRORS_AGGREGATED = 5

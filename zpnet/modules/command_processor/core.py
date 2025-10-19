@@ -3,40 +3,28 @@ ZPNet Command Processor  —  Stellar-Compliant Revision
 
 Polls the ZPNet server for pending commands and executes them immediately.
 Each command includes a payload with `funktion` and optional `args`.
-Supported actions include emitting events, running shell scripts,
-and triggering network recovery via choosenet.sh.
+
+Supported functions:
+  - createEvent: emit a local ZPNet event
+  - executeScript: run a shell script (passive utility only)
+
+Healing, routing, or environment regeneration is no longer handled here.
 
 Author: The Mule
 """
 
 import logging
 import subprocess
-import traceback
-from pathlib import Path
-
 import requests
-
 from zpnet.shared.events import create_event
 from zpnet.shared.logger import setup_logging
-from zpnet.shared.recovery import invoke_choosenet
 
 # ---------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------
-ENV_PATH = Path("/etc/zpnet.env")
-ZPNET_REMOTE_HOST = "localhost"
+ZPNET_REMOTE_HOST = "sota.ddns.net"
 COMMAND_TIMEOUT_S = 5
-
-try:
-    with ENV_PATH.open("r") as f:
-        for line in f:
-            if line.startswith("ZPNET_REMOTE_HOST="):
-                ZPNET_REMOTE_HOST = line.strip().split("=", 1)[1]
-except Exception as e:
-    logging.warning(f"⚠️ Could not read {ENV_PATH}: {e}")
-
 COMMAND_ENDPOINT = f"http://{ZPNET_REMOTE_HOST}/api"
-logging.info(f"📡 Command endpoint: {COMMAND_ENDPOINT}")
 
 # ---------------------------------------------------------------------
 # Command Handlers
@@ -67,36 +55,30 @@ def execute_script(script: str, timeout_s: int = 30) -> dict:
     except Exception as e:
         return {"error": str(e), "returncode": -2}
 
-
-def choose_network() -> dict:
-    """Invoke the choosenet.sh recovery script via systemd-run."""
-    invoked = invoke_choosenet()
-    return {"invoked": invoked}
-
-
 # ---------------------------------------------------------------------
-# Function Dispatcher
+# Function Dispatch Map
 # ---------------------------------------------------------------------
 HANDLER_MAP = {
     "createEvent": create_event_cmd,
     "executeScript": execute_script,
-    "chooseNetwork": choose_network,
+    # Healing is no longer supported here
 }
 
 # ---------------------------------------------------------------------
-# Main Routine
+# Main Logic
 # ---------------------------------------------------------------------
 def run():
     """
     Fetch and execute commands from the ZPNet server.
 
     Emits:
-        COMMAND_EXECUTED: after successful execution.
-        COMMAND_FAILED: on error or invalid command.
-        SYSTEM_ERROR: if command polling fails catastrophically.
+        COMMAND_EXECUTED (with result) for success
+        COMMAND_FAILED (with traceback) for error
     """
     try:
+        logging.info(f"📡 Polling ZPNet command endpoint: {COMMAND_ENDPOINT}")
         response = requests.get(COMMAND_ENDPOINT, timeout=COMMAND_TIMEOUT_S)
+
         if response.status_code != 200:
             logging.warning(f"⚠️ Command poll HTTP {response.status_code}: {response.text}")
             return
@@ -127,30 +109,15 @@ def run():
                 )
 
             except Exception as e:
-                logging.exception("Command execution failed")
-                create_event(
-                    "COMMAND_FAILED",
-                    {
-                        "command_type": cmd.get("command_type", "unknown"),
-                        "funktion": cmd.get("payload", {}).get("funktion"),
-                        "args": cmd.get("payload", {}).get("args", {}),
-                        "error": str(e),
-                        "traceback": traceback.format_exc(),
-                    },
-                )
+                logging.exception("💥 Command execution failed")
+                create_event("COMMAND_FAILED", {"error": str(e)})
 
     except Exception as e:
         logging.warning(f"❌ Failed to poll or execute commands: {e}")
-        create_event(
-            "SYSTEM_ERROR",
-            {
-                "component": "command_processor",
-                "exception": str(e),
-                "traceback": traceback.format_exc(),
-            },
-        )
 
-
+# ---------------------------------------------------------------------
+# Bootstrap Entry
+# ---------------------------------------------------------------------
 def bootstrap():
     """Initialize logging and execute run() once."""
     setup_logging()
