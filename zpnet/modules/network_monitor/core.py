@@ -12,7 +12,6 @@ import logging
 import socket
 import subprocess
 import time
-from pathlib import Path
 from statistics import mean
 
 import psutil
