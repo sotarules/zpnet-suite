@@ -1,19 +1,21 @@
 """
-ZPNet Choosenet Network Healer  —  Stellar-Compliant Daemon
+ZPNet Choosenet Network Healer — Success Telemetry Revision (v2025-10-19c)
 
 Performs definitive network test (ZPNet REST API at sota.ddns.net).
 If test fails, invokes choosenet.sh healing script and retries until success.
-Never gives up. Logs everything.
+When choosenet.sh reports success, emits CHOOSENET_SUCCESS event containing
+the previous and new SSIDs.
 
 Author: The Mule
 """
+
 import logging
 import subprocess
 import time
-
 import requests
 
 from zpnet.shared.logger import setup_logging
+from zpnet.shared.events import create_event
 
 # ---------------------------------------------------------------------
 # Configuration
@@ -23,10 +25,23 @@ EXPECTED_STRING = "ZPNet OK"
 RETRY_INTERVAL_SEC = 120
 CHOOSENET_PATH = "/usr/local/bin/choosenet.sh"
 
-
 # ---------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------
+def get_ssid() -> str:
+    """Return the currently associated Wi-Fi SSID, or empty string if none."""
+    try:
+        result = subprocess.run(
+            ["iwgetid", "-r"],
+            capture_output=True,
+            check=True,
+            text=True,
+        )
+        return result.stdout.strip()
+    except subprocess.CalledProcessError:
+        return ""
+
+
 def zpnet_definitive_test() -> bool:
     """Check ZPNet API endpoint for definitive OK response."""
     try:
@@ -41,11 +56,17 @@ def run_choosenet() -> tuple[bool, str]:
     """Run choosenet.sh and return (success, stdout)."""
     try:
         result = subprocess.run(
-            [CHOOSENET_PATH], capture_output=True, text=True, timeout=30
+            [CHOOSENET_PATH],
+            capture_output=True,
+            text=True,
+            timeout=30,
         )
-        logging.info(f"[choosenet] script stdout: {result.stdout.strip()}")
-        logging.info(f"[choosenet] script stderr: {result.stderr.strip()}")
-        return result.returncode == 0, result.stdout.strip()
+        stdout = result.stdout.strip()
+        stderr = result.stderr.strip()
+        logging.info(f"[choosenet] script stdout: {stdout}")
+        if stderr:
+            logging.info(f"[choosenet] script stderr: {stderr}")
+        return result.returncode == 0, stdout
     except Exception as e:
         logging.error(f"[choosenet] failed to invoke choosenet.sh: {e}")
         return False, str(e)
@@ -58,20 +79,45 @@ def run() -> None:
     """
     Main daemon loop for the ZPNet choosenet module.
     Never exits. Logs all retries, delays, and script invocations.
+
+    Emits:
+        CHOOSENET_SUCCESS when choosenet.sh repairs connectivity.
     """
     logging.info("🚀 ZPNet Choosenet Network Healer started")
 
+    previous_ssid = get_ssid()
+
     while True:
+        # Step 1 — definitive test
         if zpnet_definitive_test():
-            logging.info("✅ ZPNet definitive test passed. Network is healthy.")
+            logging.info(f"✅ ZPNet definitive test passed. SSID {previous_ssid} is healthy.")
+            previous_ssid = get_ssid()
             time.sleep(RETRY_INTERVAL_SEC)
             continue
 
-        logging.warning("🚨 ZPNet definitive test FAILED. Attempting recovery...")
+        logging.warning(f"🚨 ZPNet definitive test FAILED for SSID {previous_ssid}. Attempting recovery...")
+
+        # Step 2 — attempt healing
         success, output = run_choosenet()
 
+        # Step 3 — post-healing evaluation
         if success:
-            logging.info("🛠️  choosenet.sh ran without error — rechecking after delay")
+            new_ssid = get_ssid()
+            logging.info(f"🛠️ choosenet.sh reported success — SSID now '{new_ssid}'")
+
+            # Emit CHOOSENET_SUCCESS event
+            payload = {
+                "previous_ssid": previous_ssid or "UNKNOWN",
+                "new_ssid": new_ssid or "UNKNOWN",
+                "script_output": output or "",
+            }
+            try:
+                create_event("CHOOSENET_SUCCESS", payload)
+                logging.info("📡 CHOOSENET_SUCCESS event emitted.")
+            except Exception as e:
+                logging.warning(f"⚠️ Failed to emit CHOOSENET_SUCCESS: {e}")
+
+            previous_ssid = new_ssid
         else:
             logging.warning("💥 choosenet.sh failed — will retry regardless")
 

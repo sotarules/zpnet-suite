@@ -1,8 +1,9 @@
 """
-ZPNet Network Monitor  —  Stellar-Compliant Revision
+ZPNet Network Monitor — VPN-Aware Revision (v2025-10-19b)
 
-Collects network stats and emits NETWORK_STATUS events.
-Performs a definitive connectivity test to the remote ZPNet host.
+Collects network statistics and emits NETWORK_STATUS events.
+This version removes the ISP field, as VPN tunneling via AirVPN
+renders external IP-based ISP lookups meaningless.
 
 Author: The Mule
 """
@@ -83,15 +84,6 @@ def ping_latency_ms() -> float:
     return round(mean(times), 2)
 
 
-def get_isp() -> str:
-    """Return ISP string via ipinfo.io (rate-limited)."""
-    try:
-        r = requests.get("https://ipinfo.io/json", timeout=5)
-        return r.json().get("org", "UNKNOWN")
-    except requests.RequestException:
-        return "UNKNOWN"
-
-
 def get_interface_stats() -> dict:
     """Return RX/TX bytes per interface."""
     stats = psutil.net_io_counters(pernic=True)
@@ -147,7 +139,7 @@ def upload_test_mbps() -> float:
 # ---------------------------------------------------------------------
 def run():
     """
-    Collect network info, perform definitive test, self-heal if needed,
+    Collect network info, perform definitive test,
     and emit NETWORK_STATUS event.
     """
     payload = {}
@@ -164,7 +156,6 @@ def run():
         # Normal metrics
         payload["local_ip"] = get_local_ip()
         payload["interfaces"] = get_interface_stats()
-        payload["isp"] = get_isp()
         payload["ping_ms"] = ping_latency_ms()
         payload["download_mbps"] = download_test_mbps()
         payload["upload_mbps"] = upload_test_mbps()

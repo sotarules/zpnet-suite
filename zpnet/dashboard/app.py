@@ -1,8 +1,14 @@
 """
-ZPNet Dashboard — Simplified (Clean Header, No Health Coloring)
+ZPNet Dashboard — VPN-Aware Header Revision (v2025-10-19b)
 
 Displays real-time system aggregates with a minimalist header
-showing only datetime, battery percentage, and overall system status.
+showing the current Wi-Fi network (SSID), battery percentage,
+and overall system status.
+
+This version removes the ISP field from both the network readout
+and the NETWORK_STATUS event to reflect VPN normalization.
+
+Author: The Mule
 """
 
 import json
@@ -46,6 +52,7 @@ READOUT_DELAY = 10
 # Database Access
 # ---------------------------------------------------------------------
 def fetch_aggregate(name: str) -> dict:
+    """Return the most recent aggregate payload as a dict."""
     with sqlite3.connect(DB_PATH) as conn:
         conn.row_factory = sqlite3.Row
         cur = conn.cursor()
@@ -54,7 +61,7 @@ def fetch_aggregate(name: str) -> dict:
         return json.loads(row["payload"]) if row else {}
 
 # ---------------------------------------------------------------------
-# Overall Health (retained for textual display)
+# Health Combiner
 # ---------------------------------------------------------------------
 def combine_health(states: list[str]) -> str:
     """Combine multiple health states into a single overall value."""
@@ -70,14 +77,14 @@ def combine_health(states: list[str]) -> str:
 # Header
 # ---------------------------------------------------------------------
 def header_readout() -> Generator[str, None, None]:
-    """Top header: datetime, battery %, and SYS overall health."""
-    now = datetime.now(ZoneInfo("America/Los_Angeles")).strftime("%Y-%m-%d %H:%M:%S")
-
+    """Top header: network SSID, battery %, and SYS overall health."""
     ag_net = fetch_aggregate("NETWORK_STATUS")
+    ssid = ag_net.get("ssid", "UNKNOWN")
+
     ag_bat = fetch_aggregate("BATTERY_STATE_OF_CHARGE")
     ag_sen = fetch_aggregate("SENSOR_SCAN")
     ag_tee = fetch_aggregate("TEENSY_STATUS")
-    ag_pi  = fetch_aggregate("RASPBERRY_PI_STATUS")
+    ag_pi = fetch_aggregate("RASPBERRY_PI_STATUS")
 
     batt = ag_bat.get("remaining_pct")
     batt_str = f"{batt:.1f}%" if batt is not None else "N/A"
@@ -91,9 +98,7 @@ def header_readout() -> Generator[str, None, None]:
     ]
     overall = combine_health([h for h in healths if h])
 
-    # First line: concise status
-    yield f"{now}   BATTERY: {batt_str}   SYS: {overall}"
-    # Second line intentionally left blank for aesthetics
+    yield f"NET: {ssid}   BATTERY: {batt_str}   SYS: {overall}"
     yield ""
 
 # ---------------------------------------------------------------------
@@ -136,7 +141,7 @@ def network_status_readout() -> Generator[str, None, None]:
         return
     yield f"SERVER HOST: sota.ddns.net"
     yield f"LOCAL IP: {ag.get('local_ip', '0.0.0.0')}"
-    yield f"ISP: {ag.get('isp', 'UNKNOWN')}"
+    yield f"SSID: {ag.get('ssid', 'UNKNOWN')}"
     yield f"PING: {ag.get('ping_ms', 0):.1f} MS"
     yield f"DOWNLOAD: {ag.get('download_mbps', 0):.2f} MBPS"
     yield f"UPLOAD: {ag.get('upload_mbps', 0):.2f} MBPS"
@@ -160,7 +165,6 @@ def raspberry_pi_status_readout() -> Generator[str, None, None]:
     if not ag:
         yield "RASPBERRY PI DATA UNAVAILABLE."
         return
-
     yield f"DEVICE: {ag.get('device_name', 'UNKNOWN')}"
     yield f"CPU TEMP: {ag.get('cpu_temp_c', 0):.1f} °C"
     yield f"LOAD (1/5/15): {ag.get('load_1m', 0):.2f} / {ag.get('load_5m', 0):.2f} / {ag.get('load_15m', 0):.2f}"
@@ -179,7 +183,7 @@ READOUTS = [
 ]
 
 # ---------------------------------------------------------------------
-# Rendering
+# Rendering and Main Loop
 # ---------------------------------------------------------------------
 def render_locked_lines(screen, font, lines: list[str]) -> int:
     screen.fill(BG_COLOR)
@@ -198,12 +202,10 @@ def clear_scroll_area(screen, baseline: int) -> None:
     pygame.display.update(rect)
 
 def scroll_text(screen, font, lines: list[str], start_y: int, clock) -> None:
-    """Render scrolling lines with a fixed color (no semantic coloring)."""
     line_h = FONT_SIZE + READOUT_PADDING * 2
     y = start_y
     for line in lines:
-        color = TEXT_COLOR  # single consistent color
-
+        color = TEXT_COLOR
         text_so_far = ""
         for char in line.upper():
             for event in pygame.event.get():
@@ -224,9 +226,6 @@ def scroll_text(screen, font, lines: list[str], start_y: int, clock) -> None:
             y -= line_h
         time.sleep(LINE_DELAY)
 
-# ---------------------------------------------------------------------
-# Main Loop
-# ---------------------------------------------------------------------
 def main() -> None:
     pygame.init()
     screen = pygame.display.set_mode((SCREEN_WIDTH, SCREEN_HEIGHT))
