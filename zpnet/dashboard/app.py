@@ -1,26 +1,33 @@
 """
-ZPNet Dashboard — VPN-Aware Header Revision (v2025-10-19b)
+ZPNet Dashboard — DASHBOARD_READOUT Emission Revision (v2025-10-20a)
 
 Displays real-time system aggregates with a minimalist header
 showing the current Wi-Fi network (SSID), battery percentage,
 and overall system status.
 
-This version removes the ISP field from both the network readout
-and the NETWORK_STATUS event to reflect VPN normalization.
+NEW:
+    • Emits DASHBOARD_READOUT events after each readout render.
+      Payload structure:
+          {
+              "header": "<header line>",
+              "body": [ "<body line 1>", "<body line 2>", ... ]
+          }
 
 Author: The Mule
 """
 
 import json
-import sqlite3
-import pygame
-import time
-from pathlib import Path
-from datetime import datetime
-from zoneinfo import ZoneInfo
 import signal
+import sqlite3
 import sys
+import time
 from collections.abc import Generator
+from pathlib import Path
+
+import pygame
+
+from zpnet.shared.events import create_event
+
 
 # ---------------------------------------------------------------------
 # Signal Handling
@@ -183,7 +190,7 @@ READOUTS = [
 ]
 
 # ---------------------------------------------------------------------
-# Rendering and Main Loop
+# Rendering Utilities
 # ---------------------------------------------------------------------
 def render_locked_lines(screen, font, lines: list[str]) -> int:
     screen.fill(BG_COLOR)
@@ -226,6 +233,9 @@ def scroll_text(screen, font, lines: list[str], start_y: int, clock) -> None:
             y -= line_h
         time.sleep(LINE_DELAY)
 
+# ---------------------------------------------------------------------
+# Main Loop
+# ---------------------------------------------------------------------
 def main() -> None:
     pygame.init()
     screen = pygame.display.set_mode((SCREEN_WIDTH, SCREEN_HEIGHT))
@@ -240,14 +250,27 @@ def main() -> None:
             ):
                 handle_exit()
 
+        # header (always 2 lines)
         header_lines = list(header_readout())
         baseline = render_locked_lines(screen, font, header_lines)
         clear_scroll_area(screen, baseline)
 
+        # render each subsystem readout
         for readout_fn in READOUTS:
             clear_scroll_area(screen, baseline)
             lines = list(readout_fn())
             scroll_text(screen, font, lines, baseline, clock)
+
+            # -----------------------------------------------------------------
+            # Emit DASHBOARD_READOUT event (header + body)
+            # -----------------------------------------------------------------
+            payload = {
+                "header": header_lines[0],
+                "body": lines,
+            }
+            create_event("DASHBOARD_READOUT", payload)
+
+            # hold readout for visibility
             for _ in range(int(READOUT_DELAY * 10)):
                 for event in pygame.event.get():
                     if event.type == pygame.QUIT or (
