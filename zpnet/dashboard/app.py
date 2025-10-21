@@ -265,8 +265,8 @@ def main() -> None:
             # Emit DASHBOARD_READOUT event (header + body)
             # -----------------------------------------------------------------
             payload = {
-                "header": header_lines[0],
-                "body": lines,
+                "header": header_lines[0].upper(),
+                "body": [line.upper() for line in lines],
             }
             create_event("DASHBOARD_READOUT", payload)
 
