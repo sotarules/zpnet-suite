@@ -116,21 +116,31 @@ def download_test_mbps() -> float:
 
 
 def upload_test_mbps() -> float:
-    """Measure upload throughput using iperf3 (requires server)."""
-    duration_s = 5
-    timeout_s = 15
+    """
+    Estimate upload throughput using HTTP POST (VPN-safe).
+
+    Performs a short data upload (~0.5 MB) to the remote ZPNet Server
+    endpoint /api/upload_test and measures elapsed time.
+
+    Returns:
+        float: approximate upload speed in megabits per second (Mbps).
+    """
+    import requests
+    import time
+
+    data = b"x" * 500000  # 0.5 MB payload
+    url = f"http://{ZPNET_REMOTE_HOST}/api/upload_test"
+
     try:
-        result = subprocess.run(
-            ["iperf3", "-c", ZPNET_REMOTE_HOST, "-t", str(duration_s), "-f", "m", "--json"],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            timeout=timeout_s,
-            check=True,
-        )
-        data = json.loads(result.stdout.decode())
-        bps = data.get("end", {}).get("sum_sent", {}).get("bits_per_second", 0)
-        return round(bps / 1e6, 2)
-    except Exception:
+        start = time.time()
+        resp = requests.post(url, data=data, timeout=10)
+        resp.raise_for_status()
+        elapsed = time.time() - start
+        if elapsed <= 0:
+            return 0.0
+        return round((len(data) * 8 / 1e6) / elapsed, 2)
+    except Exception as e:
+        logging.warning(f"⚠️ [network_monitor] upload test failed: {e}")
         return 0.0
 
 

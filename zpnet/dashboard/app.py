@@ -46,7 +46,7 @@ signal.signal(signal.SIGTERM, handle_exit)
 DB_PATH = Path("/home/mule/zpnet/zpnet.db")
 SCREEN_WIDTH, SCREEN_HEIGHT = 800, 480
 FONT_NAME = "IBM 3270"
-FONT_SIZE = 24
+FONT_SIZE = 30
 READOUT_PADDING = 2
 BG_COLOR = (0, 0, 0)
 HEADER_COLOR = (255, 255, 255)
@@ -105,7 +105,7 @@ def header_readout() -> Generator[str, None, None]:
     ]
     overall = combine_health([h for h in healths if h])
 
-    yield f"NET: {ssid}   BATTERY: {batt_str}   SYS: {overall}"
+    yield f"NET: {ssid}  BAT: {batt_str}  SYS: {overall}"
     yield ""
 
 # ---------------------------------------------------------------------
