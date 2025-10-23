@@ -40,8 +40,8 @@ def create_event(event_type: str, payload: dict | None = None) -> None:
                 (ts, event_type, payload_json),
             )
             conn.commit()
-        logging.debug(f"🪶 Event created: {event_type}")
+        logging.debug(f"[events] event created: {event_type}")
     except Exception as e:
         # Fail loudly — no silent data loss
-        logging.exception(f"⚠️ Failed to create event {event_type}: {e}")
+        logging.exception(f"⚠️ [events] Failed to create event {event_type}: {e}")
         raise

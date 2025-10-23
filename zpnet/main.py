@@ -1,5 +1,5 @@
 """
-ZPNet Main Scheduler Daemon  —  Stellar-Compliant Revision
+ZPNet Main Scheduler Daemon
 
 Dynamically executes modules according to the polling schedule defined
 in the local SQLite database. Each module run is logged into run_history.
@@ -28,7 +28,7 @@ TICK_INTERVAL_S = 0.1  # 100 ms scheduler loop
 # ---------------------------------------------------------------------
 def handle_sigterm(signum, frame) -> None:
     """Graceful shutdown on SIGTERM or SIGINT."""
-    logging.info("🛑 SIGTERM received, shutting down...")
+    logging.info("🛑 main.py SIGTERM received, shutting down...")
     sys.exit(0)
 
 
@@ -50,7 +50,7 @@ def run_module(module_name: str) -> None:
         module = importlib.import_module(f"{MODULES_PATH}.{module_name}")
         module.run()
     except Exception as e:
-        logging.exception(f"💥 [runner] module {module_name} failed: {e}")
+        logging.exception(f"💥 [main] module {module_name} failed: {e}")
         status = "FAIL"
 
     end_ts = datetime.now(timezone.utc)
@@ -74,7 +74,30 @@ def run_module(module_name: str) -> None:
             )
             conn.commit()
     except Exception as e:
-        logging.warning(f"⚠️ [runner] failed to log run_history for {module_name}: {e}")
+        logging.warning(f"⚠️ [main] failed to log run_history for {module_name}: {e}")
+
+
+# ---------------------------------------------------------------------
+# Run all modules
+# ---------------------------------------------------------------------
+def run_all() -> None:
+    """
+    Run all modules unconditionally.
+    """
+    logging.info("📅 [main] unconditionally running all modules")
+
+    with sqlite3.connect(DB_PATH) as conn:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT id, module_name
+            FROM schedule
+            """
+        )
+        jobs = cur.fetchall()
+
+        for job_id, module_name in jobs:
+            run_module(module_name)
 
 
 # ---------------------------------------------------------------------
@@ -84,7 +107,7 @@ def scheduler_loop() -> None:
     """
     Main loop that checks the schedule table for due jobs and executes them.
     """
-    logging.info("📅 ZPNet Scheduler started")
+    logging.info("📅 [main] scheduler started")
 
     while True:
         now_ts = datetime.now(timezone.utc)
@@ -122,7 +145,7 @@ def scheduler_loop() -> None:
                     conn.commit()
 
         except Exception as e:
-            logging.warning(f"⚠️ [scheduler] database poll failed: {e}")
+            logging.warning(f"⚠️ main.py database poll failed: {e}")
 
         time.sleep(TICK_INTERVAL_S)
 
@@ -137,9 +160,10 @@ def bootstrap() -> None:
     signal.signal(signal.SIGINT, handle_sigterm)
 
     try:
+        run_all()
         scheduler_loop()
     except Exception as e:
-        logging.exception(f"⏰ [scheduler] unexpected exception: {e}")
+        logging.exception(f"⏰ [main] unexpected exception: {e}")
         sys.exit(1)
 
 

@@ -39,7 +39,7 @@ def run():
     Emits:
         TEENSY_STATUS, ZPNET_BOOT, or any valid event emitted by the Teensy.
     """
-    logging.info(f"🔌 ZPNet Teensy Listener started on {SERIAL_PORT} @ {BAUDRATE} baud")
+    logging.info(f"🔌 [teensy_listener] started on {SERIAL_PORT} @ {BAUDRATE} baud")
 
     ser = None
 
@@ -48,9 +48,9 @@ def run():
         if ser is None or not ser.is_open:
             try:
                 ser = serial.Serial(SERIAL_PORT, BAUDRATE, timeout=READ_TIMEOUT_S)
-                logging.info("✅ Serial connection to Teensy established")
+                logging.info("✅ [teensy_listener] serial connection to Teensy established")
             except serial.SerialException as e:
-                logging.warning(f"🛑 Could not open serial port: {e}")
+                logging.warning(f"🛑 [teensy_listener] could not open serial port: {e}")
                 time.sleep(RECONNECT_DELAY_S)
                 continue
 
@@ -62,15 +62,15 @@ def run():
             try:
                 evt = json.loads(line)
             except json.JSONDecodeError:
-                logging.warning(f"⚠️ Invalid JSON from Teensy: {line}")
+                logging.warning(f"⚠️ [teensy_listener] invalid JSON from Teensy: {line}")
                 continue
 
             event_type = evt.pop("event_type", "UNKNOWN")
             create_event(event_type, evt)
-            logging.debug(f"📡 Event received: {event_type}")
+            logging.debug(f"📡 [teensy_listener] event received: {event_type}")
 
         except serial.SerialException as e:
-            logging.warning(f"💥 Serial error: {e} — reconnecting")
+            logging.warning(f"💥 [teensy_listener] serial error: {e} — reconnecting")
             try:
                 ser.close()
             except Exception:
@@ -79,7 +79,7 @@ def run():
             time.sleep(RECONNECT_DELAY_S)
 
         except Exception as e:
-            logging.exception(f"🔥 Unexpected error in listener loop: {e}")
+            logging.exception(f"🔥 [teensy_listener] unexpected error in listener loop: {e}")
             time.sleep(2)
 
 

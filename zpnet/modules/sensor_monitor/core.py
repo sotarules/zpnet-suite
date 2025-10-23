@@ -1,12 +1,8 @@
 """
-ZPNet Sensor Monitor — Stellar-Compliant Revision (Pi-logic removed)
+ZPNet Sensor Monitor.
 
 Scans I²C devices (INA260 sensors) for presence and responsiveness.
 Emits SENSOR_SCAN events summarizing which devices are nominal or offline.
-
-Note:
-    The Raspberry Pi is no longer included here; it now has its own
-    RASPBERRY_PI_STATUS event and aggregate handled by the pi_monitor module.
 
 Author: The Mule
 """
@@ -49,7 +45,7 @@ def check_ina260_devices() -> dict:
                 logging.warning(f"{label} offline: {e}")
                 results[label] = "OFFLINE"
     except Exception as e:
-        logging.error(f"I²C bus unavailable: {e}")
+        logging.error(f"[sensor_monitor] I²C bus unavailable: {e}")
         for label in INA260_ADDRS.values():
             results[label] = "OFFLINE"
     finally:

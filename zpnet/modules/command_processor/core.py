@@ -76,11 +76,11 @@ def run():
         COMMAND_FAILED (with traceback) for error
     """
     try:
-        logging.info(f"📡 Polling ZPNet command endpoint: {COMMAND_ENDPOINT}")
+        logging.info(f"📡 [command_processor] polling ZPNet command endpoint: {COMMAND_ENDPOINT}")
         response = requests.get(COMMAND_ENDPOINT, timeout=COMMAND_TIMEOUT_S)
 
         if response.status_code != 200:
-            logging.warning(f"⚠️ Command poll HTTP {response.status_code}: {response.text}")
+            logging.warning(f"⚠️ [command_processor] command poll HTTP {response.status_code}: {response.text}")
             return
 
         commands = response.json()
@@ -94,7 +94,7 @@ def run():
                 args = payload.get("args", {}) or {}
 
                 if funktion not in HANDLER_MAP:
-                    raise ValueError(f"Unknown function: {funktion}")
+                    raise ValueError(f"⚠️ [command_processor] unknown function: {funktion}")
 
                 result = HANDLER_MAP[funktion](**args)
 
@@ -109,11 +109,11 @@ def run():
                 )
 
             except Exception as e:
-                logging.exception("💥 Command execution failed")
+                logging.exception("💥 [command_processor] Command execution failed")
                 create_event("COMMAND_FAILED", {"error": str(e)})
 
     except Exception as e:
-        logging.warning(f"❌ Failed to poll or execute commands: {e}")
+        logging.warning(f"❌ [command_processor] Failed to poll or execute commands: {e}")
 
 # ---------------------------------------------------------------------
 # Bootstrap Entry

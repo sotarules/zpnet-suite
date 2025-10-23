@@ -103,7 +103,7 @@ def run():
                     })
 
             except Exception as e:
-                logging.error(f"I²C read failure at 0x{addr:02X}: {e}")
+                logging.error(f"[power_monitor] I²C read failure at 0x{addr:02X}: {e}")
                 continue
 
     finally:

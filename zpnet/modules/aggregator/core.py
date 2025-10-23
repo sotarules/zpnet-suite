@@ -69,9 +69,9 @@ def create_or_update_aggregate(aggregate_type: str, payload: dict):
                 (aggregate_type, ts, payload_json),
             )
             conn.commit()
-        logging.debug(f"✅ Aggregate updated: {aggregate_type}")
+        logging.debug(f"✅ [aggregator] Aggregate updated: {aggregate_type}")
     except Exception as e:
-        logging.exception(f"⚠️ Failed to update aggregate {aggregate_type}: {e}")
+        logging.exception(f"⚠️ [aggregator] failed to update aggregate {aggregate_type}: {e}")
         raise
 
 
@@ -89,7 +89,7 @@ def aggregate_battery_state_of_charge():
         )
         swap_row = cur.fetchone()
         if not swap_row:
-            raise RuntimeError("No SWAP_BATTERY event found")
+            raise RuntimeError("[aggregator] no SWAP_BATTERY event found")
 
         swap_point = swap_row["timestamp"]
 
@@ -100,7 +100,7 @@ def aggregate_battery_state_of_charge():
         )
         power_rows = cur.fetchall()
         if len(power_rows) < 2:
-            raise RuntimeError("Insufficient POWER_STATUS samples")
+            raise RuntimeError("[aggregator] insufficient POWER_STATUS samples")
 
     total_wh = 0.0
     last_ts = None
@@ -167,7 +167,7 @@ def aggregate_network_status():
         )
         row = cur.fetchone()
         if not row:
-            raise RuntimeError("No NETWORK_STATUS events found")
+            raise RuntimeError("[aggregator] no NETWORK_STATUS events found")
 
     payload = json.loads(row["payload"])
     net_state = payload.get("network_status", "UNKNOWN")
@@ -195,7 +195,7 @@ def aggregate_sensor_scan():
         row_scan = cur.fetchone()
 
         if not row_scan:
-            raise RuntimeError("Missing SENSOR_SCAN event")
+            raise RuntimeError("[aggregator] missing SENSOR_SCAN event")
 
     scan = json.loads(row_scan["payload"])
     states = [v for v in scan.values() if isinstance(v, str)]
@@ -220,7 +220,7 @@ def aggregate_teensy_status():
         )
         row = cur.fetchone()
         if not row:
-            raise RuntimeError("No TEENSY_STATUS events found")
+            raise RuntimeError("[aggregator] no TEENSY_STATUS events found")
 
     payload = json.loads(row["payload"])
     status = payload.get("status", "UNKNOWN")
@@ -250,7 +250,7 @@ def aggregate_raspberry_pi_status():
         )
         row = cur.fetchone()
         if not row:
-            raise RuntimeError("No RASPBERRY_PI_STATUS events found")
+            raise RuntimeError("[aggregator] no RASPBERRY_PI_STATUS events found")
 
     payload = json.loads(row["payload"])
     health_state = payload.get("health_state", "UNKNOWN")
@@ -306,7 +306,7 @@ def run():
         aggregate_sensor_scan()
         aggregate_system_errors()
     except Exception as e:
-        logging.exception(f"🔥 Aggregator loop failed: {e}")
+        logging.exception(f"🔥 [aggregator] aggregator loop failed: {e}")
         raise
 
 def bootstrap():
