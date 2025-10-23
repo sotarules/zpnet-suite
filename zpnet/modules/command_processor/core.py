@@ -76,7 +76,6 @@ def run():
         COMMAND_FAILED (with traceback) for error
     """
     try:
-        logging.info(f"📡 [command_processor] polling ZPNet command endpoint: {COMMAND_ENDPOINT}")
         response = requests.get(COMMAND_ENDPOINT, timeout=COMMAND_TIMEOUT_S)
 
         if response.status_code != 200:
@@ -95,6 +94,8 @@ def run():
 
                 if funktion not in HANDLER_MAP:
                     raise ValueError(f"⚠️ [command_processor] unknown function: {funktion}")
+
+                logging.info(f"📡 [command_processor] *invoke* {funktion}")
 
                 result = HANDLER_MAP[funktion](**args)
 

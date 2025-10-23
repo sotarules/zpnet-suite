@@ -78,7 +78,6 @@ def run():
         if not events:
             return
 
-        logging.info(f"📤 [event_despooler] despooling {len(events)} events → {endpoint}")
         response = requests.post(
             endpoint,
             headers={"Content-Type": "application/json"},
@@ -93,7 +92,6 @@ def run():
 
         ids = [e["id"] for e in events]
         mark_despooled(ids)
-        logging.info(f"✅ [event_despooler] successfully despooled {len(ids)} events")
 
     except requests.exceptions.RequestException:
         logging.info("📡 [event_despooler] remote host unreachable - waiting")
