@@ -20,14 +20,13 @@ import json
 import signal
 import sqlite3
 import sys
+import random
 import time
-from collections.abc import Generator
-from pathlib import Path
-
 import pygame
 
+from collections.abc import Generator
+from pathlib import Path
 from zpnet.shared.events import create_event
-
 
 # ---------------------------------------------------------------------
 # Signal Handling
@@ -51,7 +50,7 @@ READOUT_PADDING = 2
 BG_COLOR = (0, 0, 0)
 HEADER_COLOR = (255, 255, 255)
 TEXT_COLOR = (0, 255, 0)
-SCROLL_SPEED = 56600
+SCROLL_SPEED = 30
 LINE_DELAY = 0.05
 READOUT_DELAY = 10
 
@@ -215,18 +214,30 @@ def scroll_text(screen, font, lines: list[str], start_y: int, clock) -> None:
         color = TEXT_COLOR
         text_so_far = ""
         for char in line.upper():
+            # Handle quit / escape
             for event in pygame.event.get():
-                if event.type == pygame.QUIT:
+                if event.type == pygame.QUIT or (
+                    event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE
+                ):
                     handle_exit()
-                elif event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
-                    handle_exit()
+
             text_so_far += char
             clear_rect = pygame.Rect(20, y, SCREEN_WIDTH - 40, FONT_SIZE + READOUT_PADDING * 2)
             pygame.draw.rect(screen, BG_COLOR, clear_rect)
             surf = font.render(text_so_far, True, color)
             screen.blit(surf, (20, y))
             pygame.display.flip()
-            clock.tick(SCROLL_SPEED)
+
+            # --- variable “thinking” delay ---
+            # base speed ≈ 30 cps (300 baud)
+            # random jitter ±40% plus occasional longer pause
+            base_rate = 1 / 30.0
+            jitter = random.uniform(-0.4, 0.4) * base_rate
+            delay = base_rate + jitter
+            # 1 in 50 chars, add a tiny contemplative pause
+            if random.random() < 0.02:
+                delay *= random.uniform(2.0, 4.0)
+            time.sleep(max(0, delay))
         y += line_h
         if y + line_h > SCREEN_HEIGHT:
             screen.scroll(dy=-line_h)
