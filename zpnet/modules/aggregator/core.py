@@ -100,7 +100,8 @@ def aggregate_battery_state_of_charge():
         )
         power_rows = cur.fetchall()
         if len(power_rows) < 2:
-            raise RuntimeError("[aggregator] insufficient POWER_STATUS samples")
+            logging.info("[aggregator] waiting for more POWER_STATUS samples")
+            return
 
     total_wh = 0.0
     last_ts = None
