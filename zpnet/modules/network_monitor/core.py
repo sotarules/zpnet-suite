@@ -102,8 +102,12 @@ def get_interface_stats() -> dict:
 def download_test_mbps() -> float:
     """Estimate download throughput by fetching a 1MB payload from ZPNet server."""
     url = f"http://{ZPNET_REMOTE_HOST}/api/download_test"
+    headers = {
+        "Connection": "close",
+        "Accept-Encoding": "identity"  # explicitly request no compression
+    }
     start = time.time()
-    r = requests.get(url, headers={"Connection": "close"})
+    r = requests.get(url, headers=headers)
     text = r.text
     elapsed = time.time() - start
     bits = len(text) * 8
@@ -111,12 +115,14 @@ def download_test_mbps() -> float:
 
 def upload_test_mbps() -> float:
     """Estimate upload throughput by POSTing a 1MB ASCII payload to ZPNet Server."""
-    import random, string
     url = f"http://{ZPNET_REMOTE_HOST}/api/upload_test"
+    headers = {
+        "Connection": "close",
+        "Accept-Encoding": "identity"  # request server not to gzip response
+    }
     payload = ''.join(random.choice(string.ascii_uppercase) for _ in range(1024 * 1024))
     start = time.time()
-    r = requests.post(url, data=payload.encode('utf-8'),
-                      headers={"Connection": "close"})
+    r = requests.post(url, data=payload.encode('utf-8'), headers=headers)
     elapsed = time.time() - start
     bits = len(payload) * 8
     return round((bits / 1e6) / elapsed, 2)
