@@ -23,8 +23,9 @@ from zpnet.shared.logger import setup_logging
 # Configuration
 # ---------------------------------------------------------------------
 ZPNET_REMOTE_HOST = "sota.ddns.net"
-COMMAND_TIMEOUT_S = 5
+COMMAND_TIMEOUT_S = 20
 COMMAND_ENDPOINT = f"http://{ZPNET_REMOTE_HOST}/api"
+HEADERS = {"Connection": "close"}  # ensure clean socket lifecycle
 
 # ---------------------------------------------------------------------
 # Command Handlers
@@ -76,10 +77,16 @@ def run():
         COMMAND_FAILED (with traceback) for error
     """
     try:
-        response = requests.get(COMMAND_ENDPOINT, timeout=COMMAND_TIMEOUT_S)
+        response = requests.get(
+            COMMAND_ENDPOINT,
+            headers=HEADERS,
+            timeout=COMMAND_TIMEOUT_S,
+        )
 
         if response.status_code != 200:
-            logging.warning(f"⚠️ [command_processor] command poll HTTP {response.status_code}: {response.text}")
+            logging.warning(
+                f"⚠️ [command_processor] command poll HTTP {response.status_code}: {response.text}"
+            )
             return
 
         commands = response.json()
@@ -88,7 +95,7 @@ def run():
 
         for cmd in commands:
             try:
-                payload = cmd.get("payload", {})
+                payload = cmd.get("payload", {}) or {}
                 funktion = payload.get("funktion")
                 args = payload.get("args", {}) or {}
 

@@ -24,7 +24,7 @@ from zpnet.shared.logger import setup_logging
 ZPNET_REMOTE_HOST = "sota.ddns.net"
 DB_PATH = Path("/home/mule/zpnet/zpnet.db")
 BATCH_SIZE = 50            # max events per batch
-HTTP_TIMEOUT_S = 5         # POST timeout (seconds)
+HTTP_TIMEOUT_S = 20         # POST timeout (seconds)
 
 
 # ---------------------------------------------------------------------
@@ -80,7 +80,7 @@ def run():
 
         response = requests.post(
             endpoint,
-            headers={"Content-Type": "application/json"},
+            headers={"Content-Type": "application/json", "Connection": "close"},
             data=json.dumps(events, separators=(",", ":")),
             timeout=HTTP_TIMEOUT_S,
         )

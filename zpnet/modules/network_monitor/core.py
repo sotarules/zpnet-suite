@@ -13,10 +13,12 @@ import logging
 import socket
 import subprocess
 import time
-from statistics import mean
-
-import psutil
 import requests
+import random
+import string
+import psutil
+
+from statistics import mean
 
 from zpnet.shared.events import create_event
 from zpnet.shared.logger import setup_logging
@@ -97,52 +99,27 @@ def get_interface_stats() -> dict:
         for iface, s in stats.items()
     }
 
-
 def download_test_mbps() -> float:
-    """Estimate download throughput by fetching ~0.5 MB and timing it."""
-    url = "http://speedtest.tele2.net/1MB.zip"
-    timeout_s = 10
+    """Estimate download throughput by fetching a 1MB payload from ZPNet server."""
+    url = f"http://{ZPNET_REMOTE_HOST}/api/download_test"
     start = time.time()
-    r = requests.get(url, stream=True, timeout=timeout_s)
-    total_bytes = 0
-    for chunk in r.iter_content(10240):  # 10 KB chunks
-        total_bytes += len(chunk)
-        if total_bytes >= 500000:  # stop after ~0.5 MB
-            break
+    r = requests.get(url, headers={"Connection": "close"})
+    text = r.text
     elapsed = time.time() - start
-    if elapsed > 0:
-        return round((total_bytes * 8 / 1e6) / elapsed, 2)
-    return 0.0
-
+    bits = len(text) * 8
+    return round((bits / 1e6) / elapsed, 2)
 
 def upload_test_mbps() -> float:
-    """
-    Estimate upload throughput using HTTP POST (VPN-safe).
-
-    Performs a short data upload (~0.5 MB) to the remote ZPNet Server
-    endpoint /api/upload_test and measures elapsed time.
-
-    Returns:
-        float: approximate upload speed in megabits per second (Mbps).
-    """
-    import requests
-    import time
-
-    data = b"x" * 500000  # 0.5 MB payload
+    """Estimate upload throughput by POSTing a 1MB ASCII payload to ZPNet Server."""
+    import random, string
     url = f"http://{ZPNET_REMOTE_HOST}/api/upload_test"
-
-    try:
-        start = time.time()
-        resp = requests.post(url, data=data, timeout=10)
-        resp.raise_for_status()
-        elapsed = time.time() - start
-        if elapsed <= 0:
-            return 0.0
-        return round((len(data) * 8 / 1e6) / elapsed, 2)
-    except Exception as e:
-        logging.warning(f"⚠️ [network_monitor] upload test failed: {e}")
-        return 0.0
-
+    payload = ''.join(random.choice(string.ascii_uppercase) for _ in range(1024 * 1024))
+    start = time.time()
+    r = requests.post(url, data=payload.encode('utf-8'),
+                      headers={"Connection": "close"})
+    elapsed = time.time() - start
+    bits = len(payload) * 8
+    return round((bits / 1e6) / elapsed, 2)
 
 # ---------------------------------------------------------------------
 # Main Routine
