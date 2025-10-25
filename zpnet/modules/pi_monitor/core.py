@@ -12,6 +12,7 @@ Author: The Mule
 import logging
 import os
 import platform
+import subprocess
 import time
 from pathlib import Path
 from typing import Tuple
@@ -40,7 +41,6 @@ def get_cpu_temp_c() -> float | None:
             if path.exists():
                 val = float(path.read_text().strip()) / 1000.0
                 return round(val, 1)
-        # psutil fallback (may return None on some boards)
         temps = psutil.sensors_temperatures()
         if temps:
             for entries in temps.values():
@@ -56,6 +56,7 @@ def get_uptime_seconds() -> float:
     """Return system uptime in seconds."""
     return time.time() - psutil.boot_time()
 
+
 def get_load_average() -> Tuple[float, float, float]:
     """Return (1 min, 5 min, 15 min) load averages."""
     try:
@@ -63,6 +64,7 @@ def get_load_average() -> Tuple[float, float, float]:
         return (round(one, 2), round(five, 2), round(fifteen, 2))
     except Exception:
         return (0.0, 0.0, 0.0)
+
 
 def get_memory_stats() -> dict:
     """Return memory usage metrics in MB."""
@@ -97,6 +99,34 @@ def get_network_bytes() -> dict:
     }
 
 
+def get_undervoltage_flags() -> dict:
+    """
+    Query `vcgencmd get_throttled` and decode undervoltage condition flags.
+    Requires the vcgencmd binary to be available (normally present on RPi).
+    """
+    try:
+        result = subprocess.run(["vcgencmd", "get_throttled"], capture_output=True, text=True)
+        if result.returncode != 0:
+            raise RuntimeError("vcgencmd failed")
+        line = result.stdout.strip()
+        if not line.startswith("throttled="):
+            raise ValueError("unexpected vcgencmd output")
+
+        raw_hex = line.split("=")[-1]
+        flags = int(raw_hex, 16)
+
+        return {
+            "raw_hex": raw_hex,
+            "currently_undervolted": bool(flags & (1 << 0)),
+            "previously_undervolted": bool(flags & (1 << 16)),
+        }
+    except Exception:
+        return {
+            "raw_hex": "unavailable",
+            "currently_undervolted": None,
+            "previously_undervolted": None,
+        }
+
 # ---------------------------------------------------------------------
 # Main Routine
 # ---------------------------------------------------------------------
@@ -119,6 +149,7 @@ def run() -> None:
             "memory": get_memory_stats(),
             "disk": get_disk_stats(),
             "network": get_network_bytes(),
+            "undervoltage_flags": get_undervoltage_flags(),
         }
 
         # Health classification (simple heuristic)

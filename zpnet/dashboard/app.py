@@ -168,17 +168,35 @@ def raspberry_pi_status_readout() -> Generator[str, None, None]:
     ag = fetch_aggregate("RASPBERRY_PI_STATUS")
     health = ag.get("health_state", "DOWN")
     yield f"RASPBERRY PI STATUS: {health}"
+
     if not ag:
         yield "RASPBERRY PI DATA UNAVAILABLE."
         return
+
     yield f"DEVICE: {ag.get('device_name', 'UNKNOWN')}"
     yield f"CPU TEMP: {ag.get('cpu_temp_c', 0):.1f} °C"
     yield f"LOAD (1/5/15): {ag.get('load_1m', 0):.2f} / {ag.get('load_5m', 0):.2f} / {ag.get('load_15m', 0):.2f}"
-    yield f"UPTIME: {ag.get('uptime_s', 0)/3600:.2f} H"
+    yield f"UPTIME: {ag.get('uptime_s', 0) / 3600:.2f} H"
+
     mem = ag.get("memory", {})
     yield f"MEM USED: {mem.get('used_mb', 0):.0f} / {mem.get('total_mb', 0):.0f} MB ({mem.get('percent', 0):.1f}%)"
+
     disk = ag.get("disk", {})
     yield f"DISK USED: {disk.get('used_gb', 0):.2f} / {disk.get('total_gb', 0):.2f} GB ({disk.get('percent', 0):.1f}%)"
+
+    # Undervoltage status
+    uv = ag.get("undervoltage_flags", {})
+    uv_now = uv.get("currently_undervolted")
+    uv_past = uv.get("previously_undervolted")
+
+    if uv_now is True:
+        yield "⚠️ UNDERVOLTAGE: ACTIVE"
+    elif uv_past is True:
+        yield "⚠️ UNDERVOLTAGE: RECOVERED (previous event)"
+    elif uv_now is False and uv_past is False:
+        yield "UNDERVOLTAGE: None detected"
+    else:
+        yield "UNDERVOLTAGE: Unknown"
 
 READOUTS = [
     sensor_scan_readout,
