@@ -1,8 +1,8 @@
 """
-ZPNet Aggregator (Unified Health Revision)
+ZPNet Aggregator (Unified Health + Power Status Revision)
 
 Computes summary aggregates from zpnet_events and stores them in the
-aggregates table. Each subsystem (Battery, Network, Sensor, Teensy)
+aggregates table. Each subsystem (Battery, Network, Sensor, Teensy, Pi, Power)
 publishes its health_state using the NASA-style vocabulary:
 NOMINAL, HOLD, or DOWN.
 
@@ -135,7 +135,6 @@ def aggregate_battery_state_of_charge():
         else float("inf")
     )
 
-    # Health determination
     health_state = "NOMINAL" if remaining_pct > 10 else "HOLD"
     if remaining_pct <= 3:
         health_state = "DOWN"
@@ -153,6 +152,56 @@ def aggregate_battery_state_of_charge():
             "health_state": health_state,
         },
     )
+
+
+# ---------------------------------------------------------------------
+# Power Status (new singleton)
+# ---------------------------------------------------------------------
+def aggregate_power_status():
+    """
+    Create a POWER_STATUS aggregate from the most recent POWER_STATUS event.
+    Evaluates all INA260 sensors for nominal operation and assigns a
+    subsystem health_state accordingly.
+
+    Emits:
+        POWER_STATUS aggregate with per-sensor metrics and health classification.
+    """
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT payload FROM zpnet_events WHERE event_type='POWER_STATUS' "
+                "ORDER BY timestamp DESC LIMIT 1"
+            )
+            row = cur.fetchone()
+            if not row:
+                raise RuntimeError("[aggregator] no POWER_STATUS events found")
+
+        payload = json.loads(row["payload"])
+        sensors = payload.get("sensors", [])
+
+        # classify per-sensor health quickly
+        sensor_states = []
+        for s in sensors:
+            v = s.get("voltage_v", 0.0)
+            label = s.get("label", "UNKNOWN")
+            if v <= 0:
+                sensor_states.append("DOWN")
+                logging.warning(f"[aggregator] {label} reports nonpositive voltage {v}V")
+            elif v < 1.0:
+                sensor_states.append("HOLD")
+            else:
+                sensor_states.append("NOMINAL")
+
+        overall_health = classify_health(sensor_states)
+        payload["health_state"] = overall_health
+
+        create_or_update_aggregate("POWER_STATUS", payload)
+
+    except Exception as e:
+        logging.exception(f"⚠️ [aggregator] failed to aggregate POWER_STATUS: {e}")
+        raise
 
 
 # ---------------------------------------------------------------------
@@ -208,10 +257,6 @@ def aggregate_sensor_scan():
 # Teensy Status (singleton)
 # ---------------------------------------------------------------------
 def aggregate_teensy_status():
-    """
-    Create a TEENSY_STATUS aggregate from the most recent TEENSY_STATUS event.
-    The aggregator does not query the device directly; it uses the event log.
-    """
     with sqlite3.connect(DB_PATH) as conn:
         conn.row_factory = sqlite3.Row
         cur = conn.cursor()
@@ -226,7 +271,6 @@ def aggregate_teensy_status():
     payload = json.loads(row["payload"])
     status = payload.get("status", "UNKNOWN")
 
-    # Determine health
     health_state = "NOMINAL" if status == "NOMINAL" else "HOLD"
     if status == "DOWN":
         health_state = "DOWN"
@@ -234,14 +278,11 @@ def aggregate_teensy_status():
     payload["health_state"] = health_state
     create_or_update_aggregate("TEENSY_STATUS", payload)
 
+
 # ---------------------------------------------------------------------
 # Raspberry Pi Status (singleton)
 # ---------------------------------------------------------------------
 def aggregate_raspberry_pi_status():
-    """
-    Create a RASPBERRY_PI_STATUS aggregate from the most recent event.
-    Mirrors the Teensy aggregate pattern for host-level telemetry.
-    """
     with sqlite3.connect(DB_PATH) as conn:
         conn.row_factory = sqlite3.Row
         cur = conn.cursor()
@@ -256,6 +297,7 @@ def aggregate_raspberry_pi_status():
     payload = json.loads(row["payload"])
     health_state = payload.get("health_state", "UNKNOWN")
     create_or_update_aggregate("RASPBERRY_PI_STATUS", payload)
+
 
 # ---------------------------------------------------------------------
 # System Errors
@@ -297,18 +339,21 @@ def run():
 
     Emits:
         Updates aggregates table with BATTERY_STATE_OF_CHARGE,
-        NETWORK_STATUS, SENSOR_SCAN, TEENSY_STATUS, SYSTEM_ERROR.
+        POWER_STATUS, NETWORK_STATUS, SENSOR_SCAN, TEENSY_STATUS,
+        RASPBERRY_PI_STATUS, and SYSTEM_ERROR.
     """
     try:
         aggregate_raspberry_pi_status()
         aggregate_teensy_status()
         aggregate_battery_state_of_charge()
+        aggregate_power_status()
         aggregate_network_status()
         aggregate_sensor_scan()
         aggregate_system_errors()
     except Exception as e:
         logging.exception(f"🔥 [aggregator] aggregator loop failed: {e}")
         raise
+
 
 def bootstrap():
     """Setup logging and execute run() once."""

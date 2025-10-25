@@ -1,17 +1,13 @@
 """
-ZPNet Dashboard — DASHBOARD_READOUT Emission Revision (v2025-10-20a)
+ZPNet Dashboard — POWER_STATUS Efficiency Revision (v2025-10-25c)
 
 Displays real-time system aggregates with a minimalist header
 showing the current Wi-Fi network (SSID), battery percentage,
 and overall system status.
 
 NEW:
-    • Emits DASHBOARD_READOUT events after each readout render.
-      Payload structure:
-          {
-              "header": "<header line>",
-              "body": [ "<body line 1>", "<body line 2>", ... ]
-          }
+    • Added EFFICIENCY line to POWER_STATUS readout.
+      Computed as (TOTAL LOAD POWER / BATTERY POWER) × 100.
 
 Author: The Mule
 """
@@ -37,8 +33,10 @@ def handle_exit(signum: int | None = None, frame: object | None = None) -> None:
     pygame.quit()
     sys.exit(0)
 
+
 signal.signal(signal.SIGINT, handle_exit)
 signal.signal(signal.SIGTERM, handle_exit)
+
 
 # ---------------------------------------------------------------------
 # Config
@@ -55,6 +53,7 @@ SCROLL_SPEED = 120
 LINE_DELAY = 0.05
 READOUT_DELAY = 10
 
+
 # ---------------------------------------------------------------------
 # Database Access
 # ---------------------------------------------------------------------
@@ -66,6 +65,7 @@ def fetch_aggregate(name: str) -> dict:
         cur.execute("SELECT payload FROM aggregates WHERE aggregate_type=?", (name,))
         row = cur.fetchone()
         return json.loads(row["payload"]) if row else {}
+
 
 # ---------------------------------------------------------------------
 # Health Combiner
@@ -80,6 +80,7 @@ def combine_health(states: list[str]) -> str:
         return "DOWN"
     return "HOLD"
 
+
 # ---------------------------------------------------------------------
 # Header
 # ---------------------------------------------------------------------
@@ -90,6 +91,7 @@ def header_readout() -> Generator[str, None, None]:
 
     ag_bat = fetch_aggregate("BATTERY_STATE_OF_CHARGE")
     ag_sen = fetch_aggregate("SENSOR_SCAN")
+    ag_pow = fetch_aggregate("POWER_STATUS")
     ag_tee = fetch_aggregate("TEENSY_STATUS")
     ag_pi = fetch_aggregate("RASPBERRY_PI_STATUS")
 
@@ -99,6 +101,7 @@ def header_readout() -> Generator[str, None, None]:
     healths = [
         ag_net.get("health_state"),
         ag_bat.get("health_state"),
+        ag_pow.get("health_state"),
         ag_sen.get("health_state"),
         ag_tee.get("health_state"),
         ag_pi.get("health_state"),
@@ -107,6 +110,7 @@ def header_readout() -> Generator[str, None, None]:
 
     yield f"NET: {ssid}  BAT: {batt_str}  SYS: {overall}"
     yield ""
+
 
 # ---------------------------------------------------------------------
 # Readouts
@@ -118,6 +122,7 @@ def sensor_scan_readout() -> Generator[str, None, None]:
     for k, v in ag.items():
         if isinstance(v, str) and k != "health_state":
             yield f"{k.upper()}: {v.upper()}"
+
 
 def battery_status_readout() -> Generator[str, None, None]:
     ag = fetch_aggregate("BATTERY_STATE_OF_CHARGE")
@@ -139,6 +144,40 @@ def battery_status_readout() -> Generator[str, None, None]:
     yield f"WH USED SINCE RECHARGE: {ag.get('wh_used_since_recharge', 0):.2f}"
     yield f"WH REMAINING EST: {ag.get('wh_remaining_estimate', 0):.2f}"
 
+
+def power_status_readout() -> Generator[str, None, None]:
+    """
+    POWER STATUS readout showing each INA260 device’s voltage, current, and power.
+    Computes TOTAL LOAD POWER as sum of all rails excluding the Battery.
+    Also displays converter efficiency (load / battery × 100) if calculable.
+    """
+    ag = fetch_aggregate("POWER_STATUS")
+    health = ag.get("health_state", "DOWN")
+    yield f"POWER STATUS: {health}"
+    if not ag or "sensors" not in ag:
+        yield "POWER DATA UNAVAILABLE."
+        return
+
+    load_total_w = 0.0
+    battery_power_w = None
+    for s in ag["sensors"]:
+        label = s.get("label", "UNKNOWN")
+        v = s.get("voltage_v", 0.0)
+        i = s.get("current_ma", 0.0)
+        p = s.get("power_w", 0.0)
+        yield f"{label.upper():<14}  {v:>6.3f} V  {i:>7.1f} mA  {p:>6.3f} W"
+        if label.lower() == "battery":
+            battery_power_w = p
+        else:
+            load_total_w += p
+
+    yield f"TOTAL LOAD POWER: {load_total_w:.3f} W"
+
+    if battery_power_w and battery_power_w > 0:
+        efficiency = (load_total_w / battery_power_w) * 100.0
+        yield f"EFFICIENCY: {efficiency:.1f} %"
+
+
 def network_status_readout() -> Generator[str, None, None]:
     ag = fetch_aggregate("NETWORK_STATUS")
     health = ag.get("health_state", "DOWN")
@@ -153,6 +192,7 @@ def network_status_readout() -> Generator[str, None, None]:
     yield f"DOWNLOAD: {ag.get('download_mbps', 0):.2f} MBPS"
     yield f"UPLOAD: {ag.get('upload_mbps', 0):.2f} MBPS"
 
+
 def teensy_status_readout() -> Generator[str, None, None]:
     ag = fetch_aggregate("TEENSY_STATUS")
     health = ag.get("health_state", "DOWN")
@@ -164,6 +204,7 @@ def teensy_status_readout() -> Generator[str, None, None]:
     yield f"CPU TEMP: {ag.get('cpu_temp_c', 0):.1f} °C"
     yield f"VCC: {ag.get('vcc_v', 0):.2f} V"
     yield f"FREE HEAP: {ag.get('free_heap_bytes', 0) / 1024:.1f} KB"
+
 
 def raspberry_pi_status_readout() -> Generator[str, None, None]:
     ag = fetch_aggregate("RASPBERRY_PI_STATUS")
@@ -185,7 +226,6 @@ def raspberry_pi_status_readout() -> Generator[str, None, None]:
     disk = ag.get("disk", {})
     yield f"DISK USED: {disk.get('used_gb', 0):.2f} / {disk.get('total_gb', 0):.2f} GB ({disk.get('percent', 0):.1f}%)"
 
-    # Undervoltage status
     uv = ag.get("undervoltage_flags", {})
     uv_now = uv.get("currently_undervolted")
     uv_past = uv.get("previously_undervolted")
@@ -199,13 +239,19 @@ def raspberry_pi_status_readout() -> Generator[str, None, None]:
     else:
         yield "UNDERVOLTAGE: Unknown"
 
+
+# ---------------------------------------------------------------------
+# Readout Registry
+# ---------------------------------------------------------------------
 READOUTS = [
     sensor_scan_readout,
     battery_status_readout,
+    power_status_readout,
     network_status_readout,
     teensy_status_readout,
     raspberry_pi_status_readout,
 ]
+
 
 # ---------------------------------------------------------------------
 # Rendering Utilities
@@ -221,10 +267,12 @@ def render_locked_lines(screen, font, lines: list[str]) -> int:
     pygame.display.flip()
     return y
 
+
 def clear_scroll_area(screen, baseline: int) -> None:
     rect = pygame.Rect(0, baseline, SCREEN_WIDTH, SCREEN_HEIGHT - baseline)
     pygame.draw.rect(screen, BG_COLOR, rect)
     pygame.display.update(rect)
+
 
 def scroll_text(screen, font, lines: list[str], start_y: int, clock) -> None:
     line_h = FONT_SIZE + READOUT_PADDING * 2
@@ -251,6 +299,7 @@ def scroll_text(screen, font, lines: list[str], start_y: int, clock) -> None:
             y -= line_h
         time.sleep(LINE_DELAY)
 
+
 # ---------------------------------------------------------------------
 # Main Loop
 # ---------------------------------------------------------------------
@@ -268,27 +317,21 @@ def main() -> None:
             ):
                 handle_exit()
 
-        # header (always 2 lines)
         header_lines = list(header_readout())
         baseline = render_locked_lines(screen, font, header_lines)
         clear_scroll_area(screen, baseline)
 
-        # render each subsystem readout
         for readout_fn in READOUTS:
             clear_scroll_area(screen, baseline)
             lines = list(readout_fn())
             scroll_text(screen, font, lines, baseline, clock)
 
-            # -----------------------------------------------------------------
-            # Emit DASHBOARD_READOUT event (header + body)
-            # -----------------------------------------------------------------
             payload = {
                 "header": header_lines[0].upper(),
                 "body": [line.upper() for line in lines],
             }
             create_event("DASHBOARD_READOUT", payload)
 
-            # hold readout for visibility
             for _ in range(int(READOUT_DELAY * 10)):
                 for event in pygame.event.get():
                     if event.type == pygame.QUIT or (
@@ -296,6 +339,7 @@ def main() -> None:
                     ):
                         handle_exit()
                 clock.tick(10)
+
 
 if __name__ == "__main__":
     main()
