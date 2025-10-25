@@ -20,13 +20,14 @@ import json
 import signal
 import sqlite3
 import sys
-import random
 import time
-import pygame
-
 from collections.abc import Generator
 from pathlib import Path
+
+import pygame
+
 from zpnet.shared.events import create_event
+
 
 # ---------------------------------------------------------------------
 # Signal Handling
