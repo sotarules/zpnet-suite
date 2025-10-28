@@ -101,7 +101,6 @@ def run() -> None:
 
         ids = [e["id"] for e in events]
         mark_despooled(ids)
-        logging.info(f"📤 [event_despooler] despooled {len(ids)} events successfully.")
 
     except requests.RequestException as e:
         logging.warning(f"📡 [event_despooler] network issue: {e} — will retry later")

@@ -1,10 +1,15 @@
 """
-ZPNet Network Monitor — VPN-Aware + Timeout-Hardened Revision (v2025-10-28b)
+ZPNet Network Monitor — VPN-Aware + Timeout-Hardened Revision (v2025-10-28c)
 
 Collects network statistics and emits NETWORK_STATUS events.
 This version adds explicit HTTP timeouts for all REST calls using
 shared constants from zpnet.shared.constants, preventing blocking
 during WAN or DNS outages.
+
+Change (v2025-10-28c):
+    • Caught requests.ConnectionError and related transient errors in run()
+      to avoid full stack traces.  These now produce a single-line warning
+      instead of an exception traceback.
 
 Author: The Mule
 """
@@ -17,8 +22,8 @@ import requests
 import random
 import string
 import psutil
-
 from statistics import mean
+
 from zpnet.shared.events import create_event
 from zpnet.shared.logger import setup_logging
 from zpnet.shared.constants import (
@@ -108,11 +113,7 @@ def get_interface_stats() -> dict:
 def download_test_mbps() -> float:
     """Estimate download throughput by fetching a 1MB payload from ZPNet server."""
     url = f"http://{ZPNET_REMOTE_HOST}/api/download_test"
-    headers = {
-        "Connection": "close",
-        "Accept-Encoding": "identity",  # explicitly request no compression
-    }
-
+    headers = {"Connection": "close", "Accept-Encoding": "identity"}
     start = time.time()
     r = requests.get(url, headers=headers, timeout=HTTP_TIMEOUT)
     text = r.text
@@ -124,10 +125,7 @@ def download_test_mbps() -> float:
 def upload_test_mbps() -> float:
     """Estimate upload throughput by POSTing a 1MB ASCII payload to ZPNet server."""
     url = f"http://{ZPNET_REMOTE_HOST}/api/upload_test"
-    headers = {
-        "Connection": "close",
-        "Accept-Encoding": "identity",  # request server not to gzip response
-    }
+    headers = {"Connection": "close", "Accept-Encoding": "identity"}
     payload = "".join(random.choice(string.ascii_uppercase) for _ in range(1024 * 1024))
     start = time.time()
     r = requests.post(url, data=payload.encode("utf-8"), headers=headers, timeout=HTTP_TIMEOUT)
@@ -159,11 +157,19 @@ def run() -> None:
         payload["local_ip"] = get_local_ip()
         payload["interfaces"] = get_interface_stats()
         payload["ping_ms"] = ping_latency_ms()
-        payload["download_mbps"] = download_test_mbps()
-        payload["upload_mbps"] = upload_test_mbps()
+
+        # handle transient HTTP faults gently
+        try:
+            payload["download_mbps"] = download_test_mbps()
+            payload["upload_mbps"] = upload_test_mbps()
+        except requests.RequestException as e:
+            logging.warning(f"⚠️ [network_monitor] transient HTTP error during throughput test: {e}")
+        except Exception as e:
+            logging.warning(f"⚠️ [network_monitor] unexpected error during throughput test: {e}")
 
     except Exception as e:
-        logging.exception(f"❌ [network_monitor] unexpected exception: {e}")
+        # this is now only for truly unexpected cases
+        logging.warning(f"❌ [network_monitor] unexpected network_monitor failure: {e}")
     finally:
         create_event("NETWORK_STATUS", payload)
 
