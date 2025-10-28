@@ -1,5 +1,5 @@
 """
-ZPNet Command Processor  —  Stellar-Compliant Revision
+ZPNet Command Processor  —  Stellar-Compliant + Timeout-Hardened Revision (v2025-10-28b)
 
 Polls the ZPNet server for pending commands and executes them immediately.
 Each command includes a payload with `funktion` and optional `args`.
@@ -8,7 +8,8 @@ Supported functions:
   - createEvent: emit a local ZPNet event
   - executeScript: run a shell script (passive utility only)
 
-Healing, routing, or environment regeneration is no longer handled here.
+This revision imports HTTP timeout policy and remote host info from
+zpnet.shared.constants, ensuring consistent network behavior across all modules.
 
 Author: The Mule
 """
@@ -16,14 +17,19 @@ Author: The Mule
 import logging
 import subprocess
 import requests
+
 from zpnet.shared.events import create_event
 from zpnet.shared.logger import setup_logging
+from zpnet.shared.constants import (
+    ZPNET_REMOTE_HOST,
+    HTTP_TIMEOUT,
+    HTTP_RETRY_TOTAL,
+    HTTP_RETRY_BACKOFF,
+)
 
 # ---------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------
-ZPNET_REMOTE_HOST = "sota.ddns.net"
-COMMAND_TIMEOUT_S = 20
 COMMAND_ENDPOINT = f"http://{ZPNET_REMOTE_HOST}/api"
 HEADERS = {"Connection": "close"}  # ensure clean socket lifecycle
 
@@ -56,6 +62,7 @@ def execute_script(script: str, timeout_s: int = 30) -> dict:
     except Exception as e:
         return {"error": str(e), "returncode": -2}
 
+
 # ---------------------------------------------------------------------
 # Function Dispatch Map
 # ---------------------------------------------------------------------
@@ -68,7 +75,7 @@ HANDLER_MAP = {
 # ---------------------------------------------------------------------
 # Main Logic
 # ---------------------------------------------------------------------
-def run():
+def run() -> None:
     """
     Fetch and execute commands from the ZPNet server.
 
@@ -80,7 +87,7 @@ def run():
         response = requests.get(
             COMMAND_ENDPOINT,
             headers=HEADERS,
-            timeout=COMMAND_TIMEOUT_S,
+            timeout=HTTP_TIMEOUT,
         )
 
         if response.status_code != 200:
@@ -120,13 +127,17 @@ def run():
                 logging.exception("💥 [command_processor] Command execution failed")
                 create_event("COMMAND_FAILED", {"error": str(e)})
 
+    except requests.RequestException as e:
+        logging.warning(f"❌ [command_processor] network error during poll: {e}")
+
     except Exception as e:
-        logging.warning(f"❌ [command_processor] Failed to poll or execute commands: {e}")
+        logging.warning(f"❌ [command_processor] unexpected failure: {e}")
+
 
 # ---------------------------------------------------------------------
 # Bootstrap Entry
 # ---------------------------------------------------------------------
-def bootstrap():
+def bootstrap() -> None:
     """Initialize logging and execute run() once."""
     setup_logging()
     run()

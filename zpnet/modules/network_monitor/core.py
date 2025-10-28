@@ -1,14 +1,14 @@
 """
-ZPNet Network Monitor — VPN-Aware Revision (v2025-10-19b)
+ZPNet Network Monitor — VPN-Aware + Timeout-Hardened Revision (v2025-10-28b)
 
 Collects network statistics and emits NETWORK_STATUS events.
-This version removes the ISP field, as VPN tunneling via AirVPN
-renders external IP-based ISP lookups meaningless.
+This version adds explicit HTTP timeouts for all REST calls using
+shared constants from zpnet.shared.constants, preventing blocking
+during WAN or DNS outages.
 
 Author: The Mule
 """
 
-import json
 import logging
 import socket
 import subprocess
@@ -19,16 +19,14 @@ import string
 import psutil
 
 from statistics import mean
-
 from zpnet.shared.events import create_event
 from zpnet.shared.logger import setup_logging
-
-# ---------------------------------------------------------------------
-# Constants / Config
-# ---------------------------------------------------------------------
-ZPNET_REMOTE_HOST = "sota.ddns.net"
-ZPNET_TEST_PATH = "/api/test"
-TEST_TIMEOUT_SEC = 5
+from zpnet.shared.constants import (
+    ZPNET_REMOTE_HOST,
+    ZPNET_TEST_PATH,
+    EXPECTED_TEST_STRING,
+    HTTP_TIMEOUT,
+)
 
 # ---------------------------------------------------------------------
 # Helpers
@@ -48,21 +46,24 @@ def get_ssid() -> str:
 
 
 def zpnet_test() -> bool:
-    """Definitive connectivity test."""
+    """Definitive connectivity test against ZPNet API endpoint."""
     try:
         url = f"http://{ZPNET_REMOTE_HOST}{ZPNET_TEST_PATH}"
-        resp = requests.get(url, timeout=TEST_TIMEOUT_SEC)
-        return resp.status_code == 200 and "ZPNet OK" in resp.text
-    except requests.RequestException:
+        resp = requests.get(url, timeout=HTTP_TIMEOUT)
+        return resp.status_code == 200 and EXPECTED_TEST_STRING in resp.text
+    except requests.RequestException as e:
+        logging.warning(f"[network_monitor] definitive test failed: {e}")
         return False
 
 
 def get_local_ip() -> str:
     """Get best-effort local IP address."""
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    s.connect(("8.8.8.8", 80))
-    ip = s.getsockname()[0]
-    s.close()
+    try:
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+    finally:
+        s.close()
     return ip
 
 
@@ -77,13 +78,17 @@ def ping_latency_ms() -> float:
     for _ in range(attempts):
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         s.settimeout(timeout_s)
-        start = time.time()
-        s.connect((host, port))
-        end = time.time()
-        s.close()
-        times.append((end - start) * 1000.0)
+        try:
+            start = time.time()
+            s.connect((host, port))
+            end = time.time()
+            times.append((end - start) * 1000.0)
+        except Exception:
+            continue
+        finally:
+            s.close()
 
-    return round(mean(times), 2)
+    return round(mean(times), 2) if times else 0.0
 
 
 def get_interface_stats() -> dict:
@@ -99,38 +104,42 @@ def get_interface_stats() -> dict:
         for iface, s in stats.items()
     }
 
+
 def download_test_mbps() -> float:
     """Estimate download throughput by fetching a 1MB payload from ZPNet server."""
     url = f"http://{ZPNET_REMOTE_HOST}/api/download_test"
     headers = {
         "Connection": "close",
-        "Accept-Encoding": "identity"  # explicitly request no compression
+        "Accept-Encoding": "identity",  # explicitly request no compression
     }
+
     start = time.time()
-    r = requests.get(url, headers=headers)
+    r = requests.get(url, headers=headers, timeout=HTTP_TIMEOUT)
     text = r.text
     elapsed = time.time() - start
     bits = len(text) * 8
-    return round((bits / 1e6) / elapsed, 2)
+    return round((bits / 1e6) / elapsed, 2) if elapsed > 0 else 0.0
+
 
 def upload_test_mbps() -> float:
-    """Estimate upload throughput by POSTing a 1MB ASCII payload to ZPNet Server."""
+    """Estimate upload throughput by POSTing a 1MB ASCII payload to ZPNet server."""
     url = f"http://{ZPNET_REMOTE_HOST}/api/upload_test"
     headers = {
         "Connection": "close",
-        "Accept-Encoding": "identity"  # request server not to gzip response
+        "Accept-Encoding": "identity",  # request server not to gzip response
     }
-    payload = ''.join(random.choice(string.ascii_uppercase) for _ in range(1024 * 1024))
+    payload = "".join(random.choice(string.ascii_uppercase) for _ in range(1024 * 1024))
     start = time.time()
-    r = requests.post(url, data=payload.encode('utf-8'), headers=headers)
+    r = requests.post(url, data=payload.encode("utf-8"), headers=headers, timeout=HTTP_TIMEOUT)
     elapsed = time.time() - start
     bits = len(payload) * 8
-    return round((bits / 1e6) / elapsed, 2)
+    return round((bits / 1e6) / elapsed, 2) if elapsed > 0 else 0.0
+
 
 # ---------------------------------------------------------------------
 # Main Routine
 # ---------------------------------------------------------------------
-def run():
+def run() -> None:
     """
     Collect network info, perform definitive test,
     and emit NETWORK_STATUS event.
@@ -159,7 +168,10 @@ def run():
         create_event("NETWORK_STATUS", payload)
 
 
-def bootstrap():
+# ---------------------------------------------------------------------
+# Bootstrap
+# ---------------------------------------------------------------------
+def bootstrap() -> None:
     """Setup logging and run once (for debugging or scheduled use)."""
     setup_logging()
     run()

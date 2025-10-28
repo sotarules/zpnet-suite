@@ -1,10 +1,13 @@
 """
-ZPNet Choosenet Network Healer — Success Telemetry Revision (v2025-10-19c)
+ZPNet Choosenet Network Healer — Timeout-Hardened Revision (v2025-10-28b)
 
 Performs definitive network test (ZPNet REST API at sota.ddns.net).
 If test fails, invokes choosenet.sh healing script and retries until success.
 When choosenet.sh reports success, emits CHOOSENET_SUCCESS event containing
 the previous and new SSIDs.
+
+This revision imports timeout and host policy from zpnet.shared.constants,
+ensuring that all HTTP operations are bounded and never block the daemon.
 
 Author: The Mule
 """
@@ -16,12 +19,16 @@ import requests
 
 from zpnet.shared.logger import setup_logging
 from zpnet.shared.events import create_event
+from zpnet.shared.constants import (
+    ZPNET_REMOTE_HOST,
+    ZPNET_TEST_PATH,
+    EXPECTED_TEST_STRING,
+    HTTP_TIMEOUT,
+)
 
 # ---------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------
-ZPNET_TEST_URL = "http://sota.ddns.net/api/test"
-EXPECTED_STRING = "ZPNet OK"
 RETRY_INTERVAL_SEC = 120
 CHOOSENET_PATH = "/usr/local/bin/choosenet.sh"
 
@@ -45,8 +52,9 @@ def get_ssid() -> str:
 def zpnet_definitive_test() -> bool:
     """Check ZPNet API endpoint for definitive OK response."""
     try:
-        response = requests.get(ZPNET_TEST_URL, timeout=3)
-        return response.status_code == 200 and EXPECTED_STRING in response.text
+        url = f"http://{ZPNET_REMOTE_HOST}{ZPNET_TEST_PATH}"
+        response = requests.get(url, timeout=HTTP_TIMEOUT)
+        return response.status_code == 200 and EXPECTED_TEST_STRING in response.text
     except requests.RequestException as e:
         logging.warning(f"[choosenet] connectivity test failed: {e}")
         return False

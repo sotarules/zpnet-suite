@@ -1,9 +1,10 @@
 """
-ZPNet Event Despooler  —  Stellar-Compliant Revision
+ZPNet Event Despooler  —  Stellar-Compliant + Timeout-Hardened Revision (v2025-10-28b)
 
 Fetches unsent events from the local SQLite database and POSTs them to
 the remote ZPNet endpoint.  Marks events as despooled upon success.
-Logs info if remote host is unreachable.
+This revision imports HTTP timeout policy and host configuration from
+zpnet.shared.constants to ensure consistent, bounded network behavior.
 
 Author: The Mule
 """
@@ -12,20 +13,20 @@ import json
 import logging
 import sqlite3
 from datetime import datetime, timezone
-from pathlib import Path
 
 import requests
 
 from zpnet.shared.logger import setup_logging
+from zpnet.shared.constants import (
+    ZPNET_REMOTE_HOST,
+    DB_PATH,
+    HTTP_TIMEOUT,
+)
 
 # ---------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------
-ZPNET_REMOTE_HOST = "sota.ddns.net"
-DB_PATH = Path("/home/mule/zpnet/zpnet.db")
-BATCH_SIZE = 50            # max events per batch
-HTTP_TIMEOUT_S = 20         # POST timeout (seconds)
-
+BATCH_SIZE = 50  # max events per batch
 
 # ---------------------------------------------------------------------
 # Database Operations
@@ -50,6 +51,9 @@ def fetch_unsent_events(limit: int) -> list[dict]:
 
 def mark_despooled(ids: list[int]) -> None:
     """Mark given event IDs as successfully despooled."""
+    if not ids:
+        return
+
     ts = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
     with sqlite3.connect(DB_PATH) as conn:
         cur = conn.cursor()
@@ -67,9 +71,11 @@ def mark_despooled(ids: list[int]) -> None:
 # ---------------------------------------------------------------------
 # Main Routine
 # ---------------------------------------------------------------------
-def run():
+def run() -> None:
     """
     Attempt to POST a batch of unsent events to the remote endpoint.
+    Each batch POST operation has a strict network timeout
+    (connect, read) from shared constants.
     """
     try:
         endpoint = f"http://{ZPNET_REMOTE_HOST}/api"
@@ -80,9 +86,12 @@ def run():
 
         response = requests.post(
             endpoint,
-            headers={"Content-Type": "application/json", "Connection": "close"},
+            headers={
+                "Content-Type": "application/json",
+                "Connection": "close",
+            },
             data=json.dumps(events, separators=(",", ":")),
-            timeout=HTTP_TIMEOUT_S,
+            timeout=HTTP_TIMEOUT,
         )
 
         if response.status_code != 200:
@@ -92,15 +101,19 @@ def run():
 
         ids = [e["id"] for e in events]
         mark_despooled(ids)
+        logging.info(f"📤 [event_despooler] despooled {len(ids)} events successfully.")
 
-    except requests.exceptions.RequestException:
-        logging.info("📡 [event_despooler] remote host unreachable - waiting")
+    except requests.RequestException as e:
+        logging.warning(f"📡 [event_despooler] network issue: {e} — will retry later")
 
     except Exception as e:
-        logging.exception(f"💥 [event_despooler] unexpected: {e}")
+        logging.exception(f"💥 [event_despooler] unexpected failure: {e}")
 
 
-def bootstrap():
+# ---------------------------------------------------------------------
+# Bootstrap
+# ---------------------------------------------------------------------
+def bootstrap() -> None:
     """Setup logging and execute run() once."""
     setup_logging()
     run()
