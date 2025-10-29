@@ -5,7 +5,7 @@ Run with:
     python3 -m zpnet.dashboard
 """
 
-from .app import main
+from .core import main
 
 if __name__ == "__main__":
     main()

@@ -1,16 +1,21 @@
 """
-ZPNet Sensor Monitor.
+ZPNet Sensor Monitor — Stellar-Compliant + Constants-Integrated Revision (v2025-10-28c)
 
 Scans I²C devices (INA260 sensors) for presence and responsiveness.
 Emits SENSOR_SCAN events summarizing which devices are nominal or offline.
+
+Now imports shared constants (DB_PATH, etc.) from zpnet.shared.constants
+for consistency with the rest of the ZPNet codebase.
 
 Author: The Mule
 """
 
 import logging
 from smbus2 import SMBus
+
 from zpnet.shared.logger import setup_logging
 from zpnet.shared.events import create_event
+from zpnet.shared.constants import DB_PATH  # ← NEW (for consistency / future use)
 
 # ---------------------------------------------------------------------
 # INA260 I²C addresses
@@ -56,6 +61,7 @@ def check_ina260_devices() -> dict:
             pass
     return results
 
+
 # ---------------------------------------------------------------------
 # Main routine
 # ---------------------------------------------------------------------
@@ -68,6 +74,7 @@ def run() -> None:
     """
     payload = check_ina260_devices()
     create_event("SENSOR_SCAN", payload)
+
 
 def bootstrap() -> None:
     """Setup logging and execute run() once."""

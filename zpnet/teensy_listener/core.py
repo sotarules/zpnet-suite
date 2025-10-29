@@ -1,32 +1,30 @@
 """
-ZPNet Teensy Listener  —  Stellar-Compliant Revision
+ZPNet Teensy Listener — Stellar-Compliant + Constants-Integrated Revision (v2025-10-28c)
 
 Reads newline-delimited JSON telemetry from the Teensy (USB serial).
 Each message is expected to be a valid JSON object containing an
 event_type (e.g., TEENSY_STATUS) and payload fields.
 
-All higher-level interpretation (e.g., health inference, aggregation)
-is handled by the Aggregator.
+Now imports serial configuration and timing constants from
+zpnet.shared.constants for unified parameter control across systems.
 
 Author: The Mule
 """
 
-import os
 import serial
 import json
 import logging
 import time
+
 from zpnet.shared.logger import setup_logging
 from zpnet.shared.events import create_event
-
-# ---------------------------------------------------------------------
-# Configuration
-# ---------------------------------------------------------------------
-SERIAL_PORT = os.environ.get("ZPNET_TEENSY_PORT", "/dev/ttyACM0")
-BAUDRATE = 115200
-RECONNECT_DELAY_S = 5     # seconds between reconnection attempts
-READ_TIMEOUT_S = 1        # serial read timeout
-
+from zpnet.shared.constants import (
+    DB_PATH,
+    TEENSY_SERIAL_PORT,
+    TEENSY_BAUDRATE,
+    TEENSY_RECONNECT_DELAY_S,
+    TEENSY_READ_TIMEOUT_S,
+)
 
 # ---------------------------------------------------------------------
 # Core Routine
@@ -39,7 +37,7 @@ def run():
     Emits:
         TEENSY_STATUS, ZPNET_BOOT, or any valid event emitted by the Teensy.
     """
-    logging.info(f"🔌 [teensy_listener] started on {SERIAL_PORT} @ {BAUDRATE} baud")
+    logging.info(f"🔌 [teensy_listener] started on {TEENSY_SERIAL_PORT} @ {TEENSY_BAUDRATE} baud")
 
     ser = None
 
@@ -47,11 +45,11 @@ def run():
         # Ensure an open serial connection
         if ser is None or not ser.is_open:
             try:
-                ser = serial.Serial(SERIAL_PORT, BAUDRATE, timeout=READ_TIMEOUT_S)
+                ser = serial.Serial(TEENSY_SERIAL_PORT, TEENSY_BAUDRATE, timeout=TEENSY_READ_TIMEOUT_S)
                 logging.info("✅ [teensy_listener] serial connection to Teensy established")
             except serial.SerialException as e:
                 logging.warning(f"🛑 [teensy_listener] could not open serial port: {e}")
-                time.sleep(RECONNECT_DELAY_S)
+                time.sleep(TEENSY_RECONNECT_DELAY_S)
                 continue
 
         try:
@@ -76,7 +74,7 @@ def run():
             except Exception:
                 pass
             ser = None
-            time.sleep(RECONNECT_DELAY_S)
+            time.sleep(TEENSY_RECONNECT_DELAY_S)
 
         except Exception as e:
             logging.exception(f"🔥 [teensy_listener] unexpected error in listener loop: {e}")

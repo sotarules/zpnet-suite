@@ -1,13 +1,13 @@
 """
-ZPNet Choosenet Network Healer — Timeout-Hardened Revision (v2025-10-28b)
+ZPNet Choosenet Network Healer — Stellar-Compliant + Constants-Integrated Revision (v2025-10-28c)
 
 Performs definitive network test (ZPNet REST API at sota.ddns.net).
 If test fails, invokes choosenet.sh healing script and retries until success.
 When choosenet.sh reports success, emits CHOOSENET_SUCCESS event containing
 the previous and new SSIDs.
 
-This revision imports timeout and host policy from zpnet.shared.constants,
-ensuring that all HTTP operations are bounded and never block the daemon.
+Now imports path and retry parameters from zpnet.shared.constants, ensuring
+all timing and network behavior are managed centrally.
 
 Author: The Mule
 """
@@ -20,17 +20,14 @@ import requests
 from zpnet.shared.logger import setup_logging
 from zpnet.shared.events import create_event
 from zpnet.shared.constants import (
+    DB_PATH,
     ZPNET_REMOTE_HOST,
     ZPNET_TEST_PATH,
     EXPECTED_TEST_STRING,
     HTTP_TIMEOUT,
+    CHOOSENET_PATH,
+    CHOOSENET_RETRY_INTERVAL_S,
 )
-
-# ---------------------------------------------------------------------
-# Configuration
-# ---------------------------------------------------------------------
-RETRY_INTERVAL_SEC = 120
-CHOOSENET_PATH = "/usr/local/bin/choosenet.sh"
 
 # ---------------------------------------------------------------------
 # Helpers
@@ -100,7 +97,7 @@ def run() -> None:
         if zpnet_definitive_test():
             logging.info(f"✅ ZPNet definitive test passed. SSID {previous_ssid} is healthy.")
             previous_ssid = get_ssid()
-            time.sleep(RETRY_INTERVAL_SEC)
+            time.sleep(CHOOSENET_RETRY_INTERVAL_S)
             continue
 
         logging.warning(f"🚨 ZPNet definitive test FAILED for SSID {previous_ssid}. Attempting recovery...")
@@ -129,7 +126,7 @@ def run() -> None:
         else:
             logging.warning("💥 choosenet.sh failed — will retry regardless")
 
-        time.sleep(RETRY_INTERVAL_SEC)
+        time.sleep(CHOOSENET_RETRY_INTERVAL_S)
 
 
 # ---------------------------------------------------------------------

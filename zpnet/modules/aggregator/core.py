@@ -15,8 +15,7 @@ import sqlite3
 from datetime import datetime, timedelta, timezone
 
 from zpnet.shared.logger import setup_logging
-
-DB_PATH = "/home/mule/zpnet/zpnet.db"
+from zpnet.shared.constants import DB_PATH  # ← NEW import
 
 BATTERY_ADDR = "0x40"
 BATTERY_CAPACITY_WH = 110.0
@@ -237,7 +236,6 @@ def aggregate_sensor_scan():
     with sqlite3.connect(DB_PATH) as conn:
         conn.row_factory = sqlite3.Row
         cur = conn.cursor()
-
         cur.execute(
             "SELECT payload FROM zpnet_events WHERE event_type='SENSOR_SCAN' "
             "ORDER BY timestamp DESC LIMIT 1"

@@ -17,10 +17,9 @@ import time
 from datetime import datetime, timedelta, timezone
 
 from zpnet.shared.logger import setup_logging
+from zpnet.shared.constants import DB_PATH, TICK_INTERVAL_S  # ← NEW
 
-DB_PATH = "/home/mule/zpnet/zpnet.db"
 MODULES_PATH = "zpnet.modules"
-TICK_INTERVAL_S = 0.1  # 100 ms scheduler loop
 
 
 # ---------------------------------------------------------------------
@@ -81,19 +80,12 @@ def run_module(module_name: str) -> None:
 # Run all modules
 # ---------------------------------------------------------------------
 def run_all() -> None:
-    """
-    Run all modules unconditionally.
-    """
+    """Run all modules unconditionally."""
     logging.info("📅 [main] unconditionally running all modules")
 
     with sqlite3.connect(DB_PATH) as conn:
         cur = conn.cursor()
-        cur.execute(
-            """
-            SELECT id, module_name
-            FROM schedule
-            """
-        )
+        cur.execute("SELECT id, module_name FROM schedule")
         jobs = cur.fetchall()
 
         for job_id, module_name in jobs:
@@ -104,9 +96,7 @@ def run_all() -> None:
 # Scheduler Loop
 # ---------------------------------------------------------------------
 def scheduler_loop() -> None:
-    """
-    Main loop that checks the schedule table for due jobs and executes them.
-    """
+    """Main loop that checks the schedule table for due jobs and executes them."""
     logging.info("📅 [main] scheduler started")
 
     while True:
@@ -128,7 +118,6 @@ def scheduler_loop() -> None:
 
                 for job_id, module_name, freq_s in due_jobs:
                     run_module(module_name)
-
                     next_run = datetime.now(timezone.utc) + timedelta(seconds=freq_s)
                     cur.execute(
                         """

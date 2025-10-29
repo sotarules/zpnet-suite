@@ -7,7 +7,7 @@ retry policies, key paths, or version metadata).
 
 Author: The Mule
 """
-
+import os
 from pathlib import Path
 
 # ---------------------------------------------------------------------
@@ -64,6 +64,20 @@ EMOJI = {
     "recovery": "🛠️",
     "heartbeat": "💓",
 }
+
+# ---------------------------------------------------------------------
+# Teensy Serial Configuration
+# ---------------------------------------------------------------------
+TEENSY_SERIAL_PORT = os.environ.get("ZPNET_TEENSY_PORT", "/dev/ttyACM0")
+TEENSY_BAUDRATE = 115200
+TEENSY_RECONNECT_DELAY_S = 5     # seconds between reconnection attempts
+TEENSY_READ_TIMEOUT_S = 1        # serial read timeout (seconds)
+
+# ---------------------------------------------------------------------
+# Choosenet Network Healer
+# ---------------------------------------------------------------------
+CHOOSENET_PATH = "/usr/local/bin/choosenet.sh"
+CHOOSENET_RETRY_INTERVAL_S = 120  # seconds between connectivity checks
 
 # ---------------------------------------------------------------------
 # Utility Helpers

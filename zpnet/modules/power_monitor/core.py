@@ -1,17 +1,22 @@
 """
-ZPNet Power Monitor  —  Stellar-Compliant Revision
+ZPNet Power Monitor — Stellar-Compliant + Constants-Integrated Revision (v2025-10-28c)
 
 Polls INA260 sensors over I²C and emits POWER_STATUS events.
 Also emits POWER_EXCEPTION events when any rail voltage drifts
 outside its expected tolerance.
+
+Now imports shared constants (DB_PATH, etc.) from zpnet.shared.constants
+for structural consistency with other ZPNet modules.
 
 Author: The Mule
 """
 
 import logging
 from smbus2 import SMBus
+
 from zpnet.shared.logger import setup_logging
 from zpnet.shared.events import create_event
+from zpnet.shared.constants import DB_PATH  # ← NEW (for consistency / future use)
 
 # ---------------------------------------------------------------------
 # INA260 device configuration
