@@ -163,7 +163,7 @@ def run() -> None:
             payload["download_mbps"] = download_test_mbps()
             payload["upload_mbps"] = upload_test_mbps()
         except requests.RequestException as e:
-            logging.warning(f"⚠️ [network_monitor] transient HTTP error during throughput test: {e}")
+            pass
         except Exception as e:
             logging.warning(f"⚠️ [network_monitor] unexpected error during throughput test: {e}")
 
