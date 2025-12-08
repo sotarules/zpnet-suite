@@ -1,15 +1,12 @@
 """
-ZPNet Dashboard — POWER_STATUS Efficiency Revision (v2025-10-25c)
+ZPNet Dashboard — X-Safe Event-Pump Hardened Revision (v2025-12-02a)
 
-Displays real-time system aggregates with a minimalist header
-showing the current Wi-Fi network (SSID), battery percentage,
-and overall system status.
+This version fixes the rare but fatal condition where Xorg terminates the
+entire X session due to the dashboard not pumping X events during long-render
+animations or sleeps. All time.sleep() calls have been replaced with
+event-pumped waits that keep the SDL/X11 connection alive.
 
-NEW:
-    • Added EFFICIENCY line to POWER_STATUS readout.
-      Computed as (TOTAL LOAD POWER / BATTERY POWER) × 100.
-
-Author: The Mule
+Author: The Mule + GPT6-Preview
 """
 
 import json
@@ -24,19 +21,16 @@ import pygame
 
 from zpnet.shared.events import create_event
 
-
 # ---------------------------------------------------------------------
 # Signal Handling
 # ---------------------------------------------------------------------
 def handle_exit(signum: int | None = None, frame: object | None = None) -> None:
-    """Terminate dashboard cleanly on SIGINT/SIGTERM."""
     pygame.quit()
     sys.exit(0)
 
 
 signal.signal(signal.SIGINT, handle_exit)
 signal.signal(signal.SIGTERM, handle_exit)
-
 
 # ---------------------------------------------------------------------
 # Config
@@ -53,12 +47,29 @@ SCROLL_SPEED = 120
 LINE_DELAY = 0.05
 READOUT_DELAY = 10
 
+# ---------------------------------------------------------------------
+# Event Pump Helpers
+# ---------------------------------------------------------------------
+def pump_events():
+    """Keep SDL/X11 connection alive."""
+    for event in pygame.event.get():
+        if event.type == pygame.QUIT:
+            handle_exit()
+        if event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
+            handle_exit()
+
+
+def wait_with_pumping(seconds: float, clock: pygame.time.Clock, fps: int = 60):
+    """Replace time.sleep with a responsive wait."""
+    end = time.time() + seconds
+    while time.time() < end:
+        pump_events()
+        clock.tick(fps)
 
 # ---------------------------------------------------------------------
 # Database Access
 # ---------------------------------------------------------------------
 def fetch_aggregate(name: str) -> dict:
-    """Return the most recent aggregate payload as a dict."""
     with sqlite3.connect(DB_PATH) as conn:
         conn.row_factory = sqlite3.Row
         cur = conn.cursor()
@@ -66,12 +77,10 @@ def fetch_aggregate(name: str) -> dict:
         row = cur.fetchone()
         return json.loads(row["payload"]) if row else {}
 
-
 # ---------------------------------------------------------------------
 # Health Combiner
 # ---------------------------------------------------------------------
 def combine_health(states: list[str]) -> str:
-    """Combine multiple health states into a single overall value."""
     if not states:
         return "DOWN"
     if all(s == "NOMINAL" for s in states):
@@ -80,12 +89,10 @@ def combine_health(states: list[str]) -> str:
         return "DOWN"
     return "HOLD"
 
-
 # ---------------------------------------------------------------------
 # Header
 # ---------------------------------------------------------------------
 def header_readout() -> Generator[str, None, None]:
-    """Top header: network SSID, battery %, and SYS overall health."""
     ag_net = fetch_aggregate("NETWORK_STATUS")
     ssid = ag_net.get("ssid", "UNKNOWN")
 
@@ -111,14 +118,12 @@ def header_readout() -> Generator[str, None, None]:
     yield f"NET: {ssid}  BAT: {batt_str}  SYS: {overall}"
     yield ""
 
-
 # ---------------------------------------------------------------------
 # Readouts
 # ---------------------------------------------------------------------
 def sensor_scan_readout() -> Generator[str, None, None]:
     ag = fetch_aggregate("SENSOR_SCAN")
-    health = ag.get("health_state", "DOWN")
-    yield f"SENSOR SCAN: {health}"
+    yield f"SENSOR SCAN: {ag.get('health_state', 'DOWN')}"
     for k, v in ag.items():
         if isinstance(v, str) and k != "health_state":
             yield f"{k.upper()}: {v.upper()}"
@@ -126,8 +131,7 @@ def sensor_scan_readout() -> Generator[str, None, None]:
 
 def battery_status_readout() -> Generator[str, None, None]:
     ag = fetch_aggregate("BATTERY_STATE_OF_CHARGE")
-    health = ag.get("health_state", "DOWN")
-    yield f"BATTERY STATUS: {health}"
+    yield f"BATTERY STATUS: {ag.get('health_state', 'DOWN')}"
     if not ag:
         yield "BATTERY DATA UNAVAILABLE."
         return
@@ -146,14 +150,8 @@ def battery_status_readout() -> Generator[str, None, None]:
 
 
 def power_status_readout() -> Generator[str, None, None]:
-    """
-    POWER STATUS readout showing each INA260 device’s voltage, current, and power.
-    Computes TOTAL LOAD POWER as sum of all rails excluding the Battery.
-    Also displays converter efficiency (load / battery × 100) if calculable.
-    """
     ag = fetch_aggregate("POWER_STATUS")
-    health = ag.get("health_state", "DOWN")
-    yield f"POWER STATUS: {health}"
+    yield f"POWER STATUS: {ag.get('health_state', 'DOWN')}"
     if not ag or "sensors" not in ag:
         yield "POWER DATA UNAVAILABLE."
         return
@@ -180,8 +178,7 @@ def power_status_readout() -> Generator[str, None, None]:
 
 def network_status_readout() -> Generator[str, None, None]:
     ag = fetch_aggregate("NETWORK_STATUS")
-    health = ag.get("health_state", "DOWN")
-    yield f"NETWORK STATUS: {health}"
+    yield f"NETWORK STATUS: {ag.get('health_state', 'DOWN')}"
     if not ag:
         yield "NETWORK DATA UNAVAILABLE."
         return
@@ -195,8 +192,7 @@ def network_status_readout() -> Generator[str, None, None]:
 
 def teensy_status_readout() -> Generator[str, None, None]:
     ag = fetch_aggregate("TEENSY_STATUS")
-    health = ag.get("health_state", "DOWN")
-    yield f"TEENSY STATUS: {health}"
+    yield f"TEENSY STATUS: {ag.get('health_state', 'DOWN')}"
     if not ag:
         yield "TEENSY DATA UNAVAILABLE."
         return
@@ -208,8 +204,7 @@ def teensy_status_readout() -> Generator[str, None, None]:
 
 def raspberry_pi_status_readout() -> Generator[str, None, None]:
     ag = fetch_aggregate("RASPBERRY_PI_STATUS")
-    health = ag.get("health_state", "DOWN")
-    yield f"RASPBERRY PI STATUS: {health}"
+    yield f"RASPBERRY PI STATUS: {ag.get('health_state', 'DOWN')}"
 
     if not ag:
         yield "RASPBERRY PI DATA UNAVAILABLE."
@@ -227,18 +222,17 @@ def raspberry_pi_status_readout() -> Generator[str, None, None]:
     yield f"DISK USED: {disk.get('used_gb', 0):.2f} / {disk.get('total_gb', 0):.2f} GB ({disk.get('percent', 0):.1f}%)"
 
     uv = ag.get("undervoltage_flags", {})
-    uv_now = uv.get("currently_undervolted")
-    uv_past = uv.get("previously_undervolted")
+    now_uv = uv.get("currently_undervolted")
+    past_uv = uv.get("previously_undervolted")
 
-    if uv_now is True:
+    if now_uv is True:
         yield "⚠️ UNDERVOLTAGE: ACTIVE"
-    elif uv_past is True:
-        yield "⚠️ UNDERVOLTAGE: RECOVERED (previous event)"
-    elif uv_now is False and uv_past is False:
+    elif past_uv is True:
+        yield "⚠️ UNDERVOLTAGE: RECOVERED"
+    elif now_uv is False and past_uv is False:
         yield "UNDERVOLTAGE: None detected"
     else:
         yield "UNDERVOLTAGE: Unknown"
-
 
 # ---------------------------------------------------------------------
 # Readout Registry
@@ -252,9 +246,8 @@ READOUTS = [
     raspberry_pi_status_readout,
 ]
 
-
 # ---------------------------------------------------------------------
-# Rendering Utilities
+# Rendering
 # ---------------------------------------------------------------------
 def render_locked_lines(screen, font, lines: list[str]) -> int:
     screen.fill(BG_COLOR)
@@ -267,38 +260,32 @@ def render_locked_lines(screen, font, lines: list[str]) -> int:
     pygame.display.flip()
     return y
 
-
 def clear_scroll_area(screen, baseline: int) -> None:
     rect = pygame.Rect(0, baseline, SCREEN_WIDTH, SCREEN_HEIGHT - baseline)
     pygame.draw.rect(screen, BG_COLOR, rect)
     pygame.display.update(rect)
 
-
 def scroll_text(screen, font, lines: list[str], start_y: int, clock) -> None:
     line_h = FONT_SIZE + READOUT_PADDING * 2
     y = start_y
     for line in lines:
-        color = TEXT_COLOR
         text_so_far = ""
         for char in line.upper():
-            for event in pygame.event.get():
-                if event.type == pygame.QUIT:
-                    handle_exit()
-                elif event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
-                    handle_exit()
+            pump_events()
             text_so_far += char
             clear_rect = pygame.Rect(20, y, SCREEN_WIDTH - 40, FONT_SIZE + READOUT_PADDING * 2)
             pygame.draw.rect(screen, BG_COLOR, clear_rect)
-            surf = font.render(text_so_far, True, color)
+            surf = font.render(text_so_far, True, TEXT_COLOR)
             screen.blit(surf, (20, y))
             pygame.display.flip()
             clock.tick(SCROLL_SPEED)
+
         y += line_h
         if y + line_h > SCREEN_HEIGHT:
             screen.scroll(dy=-line_h)
             y -= line_h
-        time.sleep(LINE_DELAY)
 
+        wait_with_pumping(LINE_DELAY, clock)
 
 # ---------------------------------------------------------------------
 # Main Loop
@@ -311,18 +298,16 @@ def main() -> None:
     clock = pygame.time.Clock()
 
     while True:
-        for event in pygame.event.get():
-            if event.type == pygame.QUIT or (
-                event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE
-            ):
-                handle_exit()
+        pump_events()
 
         header_lines = list(header_readout())
         baseline = render_locked_lines(screen, font, header_lines)
         clear_scroll_area(screen, baseline)
 
         for readout_fn in READOUTS:
+            pump_events()
             clear_scroll_area(screen, baseline)
+
             lines = list(readout_fn())
             scroll_text(screen, font, lines, baseline, clock)
 
@@ -332,13 +317,8 @@ def main() -> None:
             }
             create_event("DASHBOARD_READOUT", payload)
 
-            for _ in range(int(READOUT_DELAY * 10)):
-                for event in pygame.event.get():
-                    if event.type == pygame.QUIT or (
-                        event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE
-                    ):
-                        handle_exit()
-                clock.tick(10)
+            # Hardened delay
+            wait_with_pumping(READOUT_DELAY, clock)
 
 
 if __name__ == "__main__":
