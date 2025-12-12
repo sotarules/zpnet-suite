@@ -1,9 +1,9 @@
 """
-ZPNet Aggregator (Unified Health + Power Status Revision)
+ZPNet Aggregator (Unified Health + Power Status + Environment Revision)
 
 Computes summary aggregates from zpnet_events and stores them in the
-aggregates table. Each subsystem (Battery, Network, Sensor, Teensy, Pi, Power)
-publishes its health_state using the NASA-style vocabulary:
+aggregates table. Each subsystem (Battery, Network, Sensor, Teensy, Pi,
+Power, Environment) publishes its health_state using the NASA-style vocabulary:
 NOMINAL, HOLD, or DOWN.
 
 Author: The Mule
@@ -15,7 +15,7 @@ import sqlite3
 from datetime import datetime, timedelta, timezone
 
 from zpnet.shared.logger import setup_logging
-from zpnet.shared.constants import DB_PATH  # ← NEW import
+from zpnet.shared.constants import DB_PATH
 
 BATTERY_ADDR = "0x40"
 BATTERY_CAPACITY_WH = 110.0
@@ -154,53 +154,35 @@ def aggregate_battery_state_of_charge():
 
 
 # ---------------------------------------------------------------------
-# Power Status (new singleton)
+# Power Status
 # ---------------------------------------------------------------------
 def aggregate_power_status():
-    """
-    Create a POWER_STATUS aggregate from the most recent POWER_STATUS event.
-    Evaluates all INA260 sensors for nominal operation and assigns a
-    subsystem health_state accordingly.
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT payload FROM zpnet_events WHERE event_type='POWER_STATUS' "
+            "ORDER BY timestamp DESC LIMIT 1"
+        )
+        row = cur.fetchone()
+        if not row:
+            raise RuntimeError("[aggregator] no POWER_STATUS events found")
 
-    Emits:
-        POWER_STATUS aggregate with per-sensor metrics and health classification.
-    """
-    try:
-        with sqlite3.connect(DB_PATH) as conn:
-            conn.row_factory = sqlite3.Row
-            cur = conn.cursor()
-            cur.execute(
-                "SELECT payload FROM zpnet_events WHERE event_type='POWER_STATUS' "
-                "ORDER BY timestamp DESC LIMIT 1"
-            )
-            row = cur.fetchone()
-            if not row:
-                raise RuntimeError("[aggregator] no POWER_STATUS events found")
+    payload = json.loads(row["payload"])
+    sensors = payload.get("sensors", [])
 
-        payload = json.loads(row["payload"])
-        sensors = payload.get("sensors", [])
+    sensor_states = []
+    for s in sensors:
+        v = s.get("voltage_v", 0.0)
+        if v <= 0:
+            sensor_states.append("DOWN")
+        elif v < 1.0:
+            sensor_states.append("HOLD")
+        else:
+            sensor_states.append("NOMINAL")
 
-        # classify per-sensor health quickly
-        sensor_states = []
-        for s in sensors:
-            v = s.get("voltage_v", 0.0)
-            label = s.get("label", "UNKNOWN")
-            if v <= 0:
-                sensor_states.append("DOWN")
-                logging.warning(f"[aggregator] {label} reports nonpositive voltage {v}V")
-            elif v < 1.0:
-                sensor_states.append("HOLD")
-            else:
-                sensor_states.append("NOMINAL")
-
-        overall_health = classify_health(sensor_states)
-        payload["health_state"] = overall_health
-
-        create_or_update_aggregate("POWER_STATUS", payload)
-
-    except Exception as e:
-        logging.exception(f"⚠️ [aggregator] failed to aggregate POWER_STATUS: {e}")
-        raise
+    payload["health_state"] = classify_health(sensor_states)
+    create_or_update_aggregate("POWER_STATUS", payload)
 
 
 # ---------------------------------------------------------------------
@@ -221,18 +203,23 @@ def aggregate_network_status():
     payload = json.loads(row["payload"])
     net_state = payload.get("network_status", "UNKNOWN")
 
-    health_state = "NOMINAL" if net_state == "NOMINAL" else "HOLD"
-    if net_state == "DOWN":
-        health_state = "DOWN"
+    if net_state == "NOMINAL":
+        payload["health_state"] = "NOMINAL"
+    elif net_state == "DOWN":
+        payload["health_state"] = "DOWN"
+    else:
+        payload["health_state"] = "HOLD"
 
-    payload["health_state"] = health_state
     create_or_update_aggregate("NETWORK_STATUS", payload)
 
 
 # ---------------------------------------------------------------------
-# Sensor Scan
+# Sensor Scan (UPDATED)
 # ---------------------------------------------------------------------
 def aggregate_sensor_scan():
+    """
+    Aggregate SENSOR_SCAN with explicit OFFLINE → DOWN normalization.
+    """
     with sqlite3.connect(DB_PATH) as conn:
         conn.row_factory = sqlite3.Row
         cur = conn.cursor()
@@ -240,19 +227,27 @@ def aggregate_sensor_scan():
             "SELECT payload FROM zpnet_events WHERE event_type='SENSOR_SCAN' "
             "ORDER BY timestamp DESC LIMIT 1"
         )
-        row_scan = cur.fetchone()
-
-        if not row_scan:
+        row = cur.fetchone()
+        if not row:
             raise RuntimeError("[aggregator] missing SENSOR_SCAN event")
 
-    scan = json.loads(row_scan["payload"])
-    states = [v for v in scan.values() if isinstance(v, str)]
-    scan["health_state"] = classify_health(states)
+    scan = json.loads(row["payload"])
+
+    normalized_states = []
+    for v in scan.values():
+        if not isinstance(v, str):
+            continue
+        if v == "OFFLINE":
+            normalized_states.append("DOWN")
+        else:
+            normalized_states.append(v)
+
+    scan["health_state"] = classify_health(normalized_states)
     create_or_update_aggregate("SENSOR_SCAN", scan)
 
 
 # ---------------------------------------------------------------------
-# Teensy Status (singleton)
+# Teensy Status
 # ---------------------------------------------------------------------
 def aggregate_teensy_status():
     with sqlite3.connect(DB_PATH) as conn:
@@ -269,16 +264,18 @@ def aggregate_teensy_status():
     payload = json.loads(row["payload"])
     status = payload.get("status", "UNKNOWN")
 
-    health_state = "NOMINAL" if status == "NOMINAL" else "HOLD"
-    if status == "DOWN":
-        health_state = "DOWN"
+    if status == "NOMINAL":
+        payload["health_state"] = "NOMINAL"
+    elif status == "DOWN":
+        payload["health_state"] = "DOWN"
+    else:
+        payload["health_state"] = "HOLD"
 
-    payload["health_state"] = health_state
     create_or_update_aggregate("TEENSY_STATUS", payload)
 
 
 # ---------------------------------------------------------------------
-# Raspberry Pi Status (singleton)
+# Raspberry Pi Status
 # ---------------------------------------------------------------------
 def aggregate_raspberry_pi_status():
     with sqlite3.connect(DB_PATH) as conn:
@@ -293,8 +290,27 @@ def aggregate_raspberry_pi_status():
             raise RuntimeError("[aggregator] no RASPBERRY_PI_STATUS events found")
 
     payload = json.loads(row["payload"])
-    health_state = payload.get("health_state", "UNKNOWN")
     create_or_update_aggregate("RASPBERRY_PI_STATUS", payload)
+
+
+# ---------------------------------------------------------------------
+# Environment Status
+# ---------------------------------------------------------------------
+def aggregate_environment_status():
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT payload FROM zpnet_events WHERE event_type='ENVIRONMENT_STATUS' "
+            "ORDER BY timestamp DESC LIMIT 1"
+        )
+        row = cur.fetchone()
+        if not row:
+            raise RuntimeError("[aggregator] no ENVIRONMENT_STATUS events found")
+
+    payload = json.loads(row["payload"])
+    payload.setdefault("health_state", "DOWN")
+    create_or_update_aggregate("ENVIRONMENT_STATUS", payload)
 
 
 # ---------------------------------------------------------------------
@@ -319,11 +335,15 @@ def aggregate_system_errors():
     events = []
     for row in rows:
         payload = json.loads(row["payload"])
-        events.append({
-            "timestamp": row["timestamp"],
-            "message": payload.get("exception") or payload.get("message") or "SYSTEM ERROR",
-            "context": payload,
-        })
+        events.append(
+            {
+                "timestamp": row["timestamp"],
+                "message": payload.get("exception")
+                or payload.get("message")
+                or "SYSTEM ERROR",
+                "context": payload,
+            }
+        )
 
     create_or_update_aggregate("SYSTEM_ERROR", {"events": events})
 
@@ -334,15 +354,11 @@ def aggregate_system_errors():
 def run():
     """
     Execute all aggregation pipelines sequentially.
-
-    Emits:
-        Updates aggregates table with BATTERY_STATE_OF_CHARGE,
-        POWER_STATUS, NETWORK_STATUS, SENSOR_SCAN, TEENSY_STATUS,
-        RASPBERRY_PI_STATUS, and SYSTEM_ERROR.
     """
     try:
         aggregate_raspberry_pi_status()
         aggregate_teensy_status()
+        aggregate_environment_status()
         aggregate_battery_state_of_charge()
         aggregate_power_status()
         aggregate_network_status()
@@ -354,6 +370,5 @@ def run():
 
 
 def bootstrap():
-    """Setup logging and execute run() once."""
     setup_logging()
     run()

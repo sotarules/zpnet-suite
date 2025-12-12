@@ -1,12 +1,11 @@
 """
-ZPNet Dashboard — X-Safe Event-Pump Hardened Revision (v2025-12-02a)
+ZPNet Dashboard — X-Safe Event-Pump Hardened Revision (v2025-12-12b)
 
-This version fixes the rare but fatal condition where Xorg terminates the
-entire X session due to the dashboard not pumping X events during long-render
-animations or sleeps. All time.sleep() calls have been replaced with
-event-pumped waits that keep the SDL/X11 connection alive.
+Displays real-time system aggregates in a minimalist terminal-style UI.
+This revision adds ENVIRONMENT_STATUS readout support for the BME280
+environmental sensor.
 
-Author: The Mule + GPT6-Preview
+Author: The Mule + GPT
 """
 
 import json
@@ -73,7 +72,10 @@ def fetch_aggregate(name: str) -> dict:
     with sqlite3.connect(DB_PATH) as conn:
         conn.row_factory = sqlite3.Row
         cur = conn.cursor()
-        cur.execute("SELECT payload FROM aggregates WHERE aggregate_type=?", (name,))
+        cur.execute(
+            "SELECT payload FROM aggregates WHERE aggregate_type=?",
+            (name,),
+        )
         row = cur.fetchone()
         return json.loads(row["payload"]) if row else {}
 
@@ -97,6 +99,7 @@ def header_readout() -> Generator[str, None, None]:
     ssid = ag_net.get("ssid", "UNKNOWN")
 
     ag_bat = fetch_aggregate("BATTERY_STATE_OF_CHARGE")
+    ag_env = fetch_aggregate("ENVIRONMENT_STATUS")
     ag_sen = fetch_aggregate("SENSOR_SCAN")
     ag_pow = fetch_aggregate("POWER_STATUS")
     ag_tee = fetch_aggregate("TEENSY_STATUS")
@@ -108,11 +111,13 @@ def header_readout() -> Generator[str, None, None]:
     healths = [
         ag_net.get("health_state"),
         ag_bat.get("health_state"),
+        ag_env.get("health_state"),
         ag_pow.get("health_state"),
         ag_sen.get("health_state"),
         ag_tee.get("health_state"),
         ag_pi.get("health_state"),
     ]
+
     overall = combine_health([h for h in healths if h])
 
     yield f"NET: {ssid}  BAT: {batt_str}  SYS: {overall}"
@@ -176,6 +181,20 @@ def power_status_readout() -> Generator[str, None, None]:
         yield f"EFFICIENCY: {efficiency:.1f} %"
 
 
+def environment_status_readout() -> Generator[str, None, None]:
+    ag = fetch_aggregate("ENVIRONMENT_STATUS")
+    yield f"ENVIRONMENT: {ag.get('health_state', 'DOWN')}"
+
+    if not ag or not ag.get("sensor_present"):
+        yield "ENV SENSOR UNAVAILABLE."
+        return
+
+    yield f"TEMPERATURE: {ag.get('temperature_c', 0):.2f} C"
+    yield f"HUMIDITY: {ag.get('humidity_pct', 0):.2f} %"
+    yield f"PRESSURE: {ag.get('pressure_hpa', 0):.2f} HPA"
+    yield f"ALTITUDE: {ag.get('altitude_m', 0):.1f} M"
+
+
 def network_status_readout() -> Generator[str, None, None]:
     ag = fetch_aggregate("NETWORK_STATUS")
     yield f"NETWORK STATUS: {ag.get('health_state', 'DOWN')}"
@@ -197,7 +216,7 @@ def teensy_status_readout() -> Generator[str, None, None]:
         yield "TEENSY DATA UNAVAILABLE."
         return
     yield f"FW: {ag.get('fw_version', 'UNKNOWN')}"
-    yield f"CPU TEMP: {ag.get('cpu_temp_c', 0):.1f} °C"
+    yield f"CPU TEMP: {ag.get('cpu_temp_c', 0):.1f} C"
     yield f"VCC: {ag.get('vcc_v', 0):.2f} V"
     yield f"FREE HEAP: {ag.get('free_heap_bytes', 0) / 1024:.1f} KB"
 
@@ -205,14 +224,18 @@ def teensy_status_readout() -> Generator[str, None, None]:
 def raspberry_pi_status_readout() -> Generator[str, None, None]:
     ag = fetch_aggregate("RASPBERRY_PI_STATUS")
     yield f"RASPBERRY PI STATUS: {ag.get('health_state', 'DOWN')}"
-
     if not ag:
         yield "RASPBERRY PI DATA UNAVAILABLE."
         return
 
     yield f"DEVICE: {ag.get('device_name', 'UNKNOWN')}"
-    yield f"CPU TEMP: {ag.get('cpu_temp_c', 0):.1f} °C"
-    yield f"LOAD (1/5/15): {ag.get('load_1m', 0):.2f} / {ag.get('load_5m', 0):.2f} / {ag.get('load_15m', 0):.2f}"
+    yield f"CPU TEMP: {ag.get('cpu_temp_c', 0):.1f} C"
+    yield (
+        f"LOAD (1/5/15): "
+        f"{ag.get('load_1m', 0):.2f} / "
+        f"{ag.get('load_5m', 0):.2f} / "
+        f"{ag.get('load_15m', 0):.2f}"
+    )
     yield f"UPTIME: {ag.get('uptime_s', 0) / 3600:.2f} H"
 
     mem = ag.get("memory", {})
@@ -226,18 +249,19 @@ def raspberry_pi_status_readout() -> Generator[str, None, None]:
     past_uv = uv.get("previously_undervolted")
 
     if now_uv is True:
-        yield "⚠️ UNDERVOLTAGE: ACTIVE"
+        yield "UNDERVOLTAGE: ACTIVE"
     elif past_uv is True:
-        yield "⚠️ UNDERVOLTAGE: RECOVERED"
+        yield "UNDERVOLTAGE: RECOVERED"
     elif now_uv is False and past_uv is False:
-        yield "UNDERVOLTAGE: None detected"
+        yield "UNDERVOLTAGE: NONE"
     else:
-        yield "UNDERVOLTAGE: Unknown"
+        yield "UNDERVOLTAGE: UNKNOWN"
 
 # ---------------------------------------------------------------------
 # Readout Registry
 # ---------------------------------------------------------------------
 READOUTS = [
+    environment_status_readout,     # ← NEW
     sensor_scan_readout,
     battery_status_readout,
     power_status_readout,
@@ -260,10 +284,12 @@ def render_locked_lines(screen, font, lines: list[str]) -> int:
     pygame.display.flip()
     return y
 
+
 def clear_scroll_area(screen, baseline: int) -> None:
     rect = pygame.Rect(0, baseline, SCREEN_WIDTH, SCREEN_HEIGHT - baseline)
     pygame.draw.rect(screen, BG_COLOR, rect)
     pygame.display.update(rect)
+
 
 def scroll_text(screen, font, lines: list[str], start_y: int, clock) -> None:
     line_h = FONT_SIZE + READOUT_PADDING * 2
@@ -317,7 +343,6 @@ def main() -> None:
             }
             create_event("DASHBOARD_READOUT", payload)
 
-            # Hardened delay
             wait_with_pumping(READOUT_DELAY, clock)
 
 

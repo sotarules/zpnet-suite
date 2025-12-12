@@ -1,64 +1,81 @@
 """
-ZPNet Sensor Monitor — Stellar-Compliant + Constants-Integrated Revision (v2025-10-28c)
+ZPNet Sensor Monitor — Stellar-Compliant + Constants-Integrated Revision (v2025-12-12a)
 
-Scans I²C devices (INA260 sensors) for presence and responsiveness.
+Scans I²C devices for presence and responsiveness.
+Includes INA260 power sensors and the BME280 environmental sensor.
+
 Emits SENSOR_SCAN events summarizing which devices are nominal or offline.
-
-Now imports shared constants (DB_PATH, etc.) from zpnet.shared.constants
-for consistency with the rest of the ZPNet codebase.
 
 Author: The Mule
 """
 
 import logging
+
 from smbus2 import SMBus
 
-from zpnet.shared.logger import setup_logging
 from zpnet.shared.events import create_event
-from zpnet.shared.constants import DB_PATH  # ← NEW (for consistency / future use)
+from zpnet.shared.logger import setup_logging
 
 # ---------------------------------------------------------------------
-# INA260 I²C addresses
+# I²C Device Map
 # ---------------------------------------------------------------------
-INA260_ADDRS = {
+I2C_DEVICES = {
     0x40: "INA260 0x40 (Battery)",
     0x41: "INA260 0x41 (3v3 Rail)",
     0x44: "INA260 0x44 (5v0 Rail)",
     0x45: "INA260 0x45 (24v Spur)",
+    0x76: "BME280 0x76 (Environment)",
 }
+
+# BME280 specifics
+BME280_ID_REG = 0xD0
+BME280_EXPECTED_ID = 0x60
 
 # ---------------------------------------------------------------------
 # Individual device checks
 # ---------------------------------------------------------------------
-def check_ina260_devices() -> dict:
+def check_i2c_devices() -> dict:
     """
-    Attempt to read voltage register on each INA260.
-    If success → NOMINAL, else → OFFLINE.
+    Attempt to verify presence of known I²C devices.
 
     Returns:
-        dict[str, str]: device label → status string
+        dict[str, str]: device label → status string (NOMINAL | OFFLINE)
     """
     results = {}
     bus = None
+
     try:
         bus = SMBus(1)
-        for addr, label in INA260_ADDRS.items():
+
+        for addr, label in I2C_DEVICES.items():
             try:
-                # Read voltage register (0x02)
-                _ = bus.read_word_data(addr, 0x02)
+                if "BME280" in label:
+                    chip_id = bus.read_byte_data(addr, BME280_ID_REG)
+                    if chip_id != BME280_EXPECTED_ID:
+                        raise RuntimeError(
+                            f"unexpected BME280 chip ID 0x{chip_id:02X}"
+                        )
+                else:
+                    # Generic probe for INA260 (voltage register)
+                    _ = bus.read_word_data(addr, 0x02)
+
                 results[label] = "NOMINAL"
+
             except Exception as e:
                 logging.warning(f"{label} offline: {e}")
                 results[label] = "OFFLINE"
+
     except Exception as e:
         logging.error(f"[sensor_monitor] I²C bus unavailable: {e}")
-        for label in INA260_ADDRS.values():
+        for label in I2C_DEVICES.values():
             results[label] = "OFFLINE"
+
     finally:
         try:
             bus.close()
         except Exception:
             pass
+
     return results
 
 
@@ -70,9 +87,9 @@ def run() -> None:
     Perform sensor scan and emit SENSOR_SCAN event.
 
     Emits:
-        SENSOR_SCAN: contains status of all INA260 sensors.
+        SENSOR_SCAN: contains status of all known I²C sensors.
     """
-    payload = check_ina260_devices()
+    payload = check_i2c_devices()
     create_event("SENSOR_SCAN", payload)
 
 
