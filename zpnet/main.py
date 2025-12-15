@@ -18,6 +18,7 @@ from datetime import datetime, timedelta, timezone
 
 from zpnet.shared.logger import setup_logging
 from zpnet.shared.constants import DB_PATH, TICK_INTERVAL_S  # ← NEW
+from zpnet.shared.startup import run_startup
 
 MODULES_PATH = "zpnet.modules"
 
@@ -149,6 +150,7 @@ def bootstrap() -> None:
     signal.signal(signal.SIGINT, handle_sigterm)
 
     try:
+        run_startup()
         run_all()
         scheduler_loop()
     except Exception as e:

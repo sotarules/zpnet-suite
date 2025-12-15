@@ -1,8 +1,9 @@
 """
-ZPNet Sensor Monitor — Stellar-Compliant + Constants-Integrated Revision (v2025-12-12a)
+ZPNet Sensor Monitor — Stellar-Compliant + Constants-Integrated Revision (v2025-12-14b)
 
 Scans I²C devices for presence and responsiveness.
-Includes INA260 power sensors and the BME280 environmental sensor.
+Includes INA260 power sensors, the BME280 environmental sensor,
+and the EV5491 laser controller.
 
 Emits SENSOR_SCAN events summarizing which devices are nominal or offline.
 
@@ -25,6 +26,7 @@ I2C_DEVICES = {
     0x44: "INA260 0x44 (5v0 Rail)",
     0x45: "INA260 0x45 (24v Spur)",
     0x76: "BME280 0x76 (Environment)",
+    0x66: "EV5491 0x66 (Laser Controller)",
 }
 
 # BME280 specifics
@@ -55,9 +57,13 @@ def check_i2c_devices() -> dict:
                         raise RuntimeError(
                             f"unexpected BME280 chip ID 0x{chip_id:02X}"
                         )
+
                 else:
-                    # Generic probe for INA260 (voltage register)
-                    _ = bus.read_word_data(addr, 0x02)
+                    # Generic probe:
+                    # Read a single byte from register 0x00.
+                    # This is safe for INA260 and EV5491 and
+                    # does not alter device state.
+                    _ = bus.read_byte_data(addr, 0x00)
 
                 results[label] = "NOMINAL"
 

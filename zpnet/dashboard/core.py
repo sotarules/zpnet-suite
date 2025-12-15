@@ -1,9 +1,8 @@
 """
-ZPNet Dashboard — X-Safe Event-Pump Hardened Revision (v2025-12-12b)
+ZPNet Dashboard — X-Safe Event-Pump Hardened Revision (v2025-12-14c)
 
 Displays real-time system aggregates in a minimalist terminal-style UI.
-This revision adds ENVIRONMENT_STATUS readout support for the BME280
-environmental sensor.
+This revision adds LASER_STATUS readout support for the EV5491 laser controller.
 
 Author: The Mule + GPT
 """
@@ -100,6 +99,7 @@ def header_readout() -> Generator[str, None, None]:
 
     ag_bat = fetch_aggregate("BATTERY_STATE_OF_CHARGE")
     ag_env = fetch_aggregate("ENVIRONMENT_STATUS")
+    ag_laser = fetch_aggregate("LASER_STATUS")
     ag_sen = fetch_aggregate("SENSOR_SCAN")
     ag_pow = fetch_aggregate("POWER_STATUS")
     ag_tee = fetch_aggregate("TEENSY_STATUS")
@@ -112,6 +112,7 @@ def header_readout() -> Generator[str, None, None]:
         ag_net.get("health_state"),
         ag_bat.get("health_state"),
         ag_env.get("health_state"),
+        ag_laser.get("health_state"),
         ag_pow.get("health_state"),
         ag_sen.get("health_state"),
         ag_tee.get("health_state"),
@@ -126,6 +127,35 @@ def header_readout() -> Generator[str, None, None]:
 # ---------------------------------------------------------------------
 # Readouts
 # ---------------------------------------------------------------------
+def laser_status_readout() -> Generator[str, None, None]:
+    ag = fetch_aggregate("LASER_STATUS")
+    yield f"LASER STATUS: {ag.get('health_state', 'DOWN')}"
+
+    if not ag or not ag.get("device_present"):
+        yield "LASER CONTROLLER UNAVAILABLE."
+        return
+
+    yield f"I2C ADDRESS: {ag.get('i2c_address', 'UNKNOWN')}"
+    yield f"SYSTEM ENABLED: {'YES' if ag.get('sys_enabled') else 'NO'}"
+    yield f"ID1 ENABLED: {'YES' if ag.get('id1_enabled') else 'NO'}"
+    yield f"MODE: {ag.get('id1_mode', 'UNKNOWN')}"
+    yield f"CURRENT CODE: {ag.get('id1_current_code', 0)}"
+
+
+def environment_status_readout() -> Generator[str, None, None]:
+    ag = fetch_aggregate("ENVIRONMENT_STATUS")
+    yield f"ENVIRONMENT: {ag.get('health_state', 'DOWN')}"
+
+    if not ag or not ag.get("sensor_present"):
+        yield "ENV SENSOR UNAVAILABLE."
+        return
+
+    yield f"TEMPERATURE: {ag.get('temperature_c', 0):.2f} C"
+    yield f"HUMIDITY: {ag.get('humidity_pct', 0):.2f} %"
+    yield f"PRESSURE: {ag.get('pressure_hpa', 0):.2f} HPA"
+    yield f"ALTITUDE: {ag.get('altitude_m', 0):.1f} M"
+
+
 def sensor_scan_readout() -> Generator[str, None, None]:
     ag = fetch_aggregate("SENSOR_SCAN")
     yield f"SENSOR SCAN: {ag.get('health_state', 'DOWN')}"
@@ -181,20 +211,6 @@ def power_status_readout() -> Generator[str, None, None]:
         yield f"EFFICIENCY: {efficiency:.1f} %"
 
 
-def environment_status_readout() -> Generator[str, None, None]:
-    ag = fetch_aggregate("ENVIRONMENT_STATUS")
-    yield f"ENVIRONMENT: {ag.get('health_state', 'DOWN')}"
-
-    if not ag or not ag.get("sensor_present"):
-        yield "ENV SENSOR UNAVAILABLE."
-        return
-
-    yield f"TEMPERATURE: {ag.get('temperature_c', 0):.2f} C"
-    yield f"HUMIDITY: {ag.get('humidity_pct', 0):.2f} %"
-    yield f"PRESSURE: {ag.get('pressure_hpa', 0):.2f} HPA"
-    yield f"ALTITUDE: {ag.get('altitude_m', 0):.1f} M"
-
-
 def network_status_readout() -> Generator[str, None, None]:
     ag = fetch_aggregate("NETWORK_STATUS")
     yield f"NETWORK STATUS: {ag.get('health_state', 'DOWN')}"
@@ -239,10 +255,18 @@ def raspberry_pi_status_readout() -> Generator[str, None, None]:
     yield f"UPTIME: {ag.get('uptime_s', 0) / 3600:.2f} H"
 
     mem = ag.get("memory", {})
-    yield f"MEM USED: {mem.get('used_mb', 0):.0f} / {mem.get('total_mb', 0):.0f} MB ({mem.get('percent', 0):.1f}%)"
+    yield (
+        f"MEM USED: {mem.get('used_mb', 0):.0f} / "
+        f"{mem.get('total_mb', 0):.0f} MB "
+        f"({mem.get('percent', 0):.1f}%)"
+    )
 
     disk = ag.get("disk", {})
-    yield f"DISK USED: {disk.get('used_gb', 0):.2f} / {disk.get('total_gb', 0):.2f} GB ({disk.get('percent', 0):.1f}%)"
+    yield (
+        f"DISK USED: {disk.get('used_gb', 0):.2f} / "
+        f"{disk.get('total_gb', 0):.2f} GB "
+        f"({disk.get('percent', 0):.1f}%)"
+    )
 
     uv = ag.get("undervoltage_flags", {})
     now_uv = uv.get("currently_undervolted")
@@ -261,7 +285,8 @@ def raspberry_pi_status_readout() -> Generator[str, None, None]:
 # Readout Registry
 # ---------------------------------------------------------------------
 READOUTS = [
-    environment_status_readout,     # ← NEW
+    laser_status_readout,          # ← NEW
+    environment_status_readout,
     sensor_scan_readout,
     battery_status_readout,
     power_status_readout,
@@ -299,7 +324,9 @@ def scroll_text(screen, font, lines: list[str], start_y: int, clock) -> None:
         for char in line.upper():
             pump_events()
             text_so_far += char
-            clear_rect = pygame.Rect(20, y, SCREEN_WIDTH - 40, FONT_SIZE + READOUT_PADDING * 2)
+            clear_rect = pygame.Rect(
+                20, y, SCREEN_WIDTH - 40, FONT_SIZE + READOUT_PADDING * 2
+            )
             pygame.draw.rect(screen, BG_COLOR, clear_rect)
             surf = font.render(text_so_far, True, TEXT_COLOR)
             screen.blit(surf, (20, y))
