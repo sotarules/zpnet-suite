@@ -1,15 +1,15 @@
 """
-ZPNet Dashboard — X-Safe Event-Pump Hardened Revision (v2025-12-14c)
+ZPNet Dashboard — X-Safe Event-Pump Hardened Revision (v2025-12-15a)
 
 Displays real-time system aggregates in a minimalist terminal-style UI.
-This revision adds LASER_STATUS readout support for the EV5491 laser controller.
+This revision updates the LASER_STATUS readout to include the commanded
+laser_enabled state merged by the aggregator.
 
 Author: The Mule + GPT
 """
 
 import json
 import signal
-import sqlite3
 import sys
 import time
 from collections.abc import Generator
@@ -17,7 +17,9 @@ from pathlib import Path
 
 import pygame
 
+from zpnet.shared.db import open_db
 from zpnet.shared.events import create_event
+
 
 # ---------------------------------------------------------------------
 # Signal Handling
@@ -68,15 +70,18 @@ def wait_with_pumping(seconds: float, clock: pygame.time.Clock, fps: int = 60):
 # Database Access
 # ---------------------------------------------------------------------
 def fetch_aggregate(name: str) -> dict:
-    with sqlite3.connect(DB_PATH) as conn:
-        conn.row_factory = sqlite3.Row
-        cur = conn.cursor()
-        cur.execute(
-            "SELECT payload FROM aggregates WHERE aggregate_type=?",
-            (name,),
-        )
-        row = cur.fetchone()
-        return json.loads(row["payload"]) if row else {}
+    try:
+        with open_db(read_only=True) as conn:
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT payload FROM aggregates WHERE aggregate_type=?",
+                (name,),
+            )
+            row = cur.fetchone()
+            return json.loads(row["payload"]) if row else {}
+    except Exception:
+        # Dashboard must never die due to transient DB contention
+        return {}
 
 # ---------------------------------------------------------------------
 # Health Combiner
@@ -140,6 +145,12 @@ def laser_status_readout() -> Generator[str, None, None]:
     yield f"ID1 ENABLED: {'YES' if ag.get('id1_enabled') else 'NO'}"
     yield f"MODE: {ag.get('id1_mode', 'UNKNOWN')}"
     yield f"CURRENT CODE: {ag.get('id1_current_code', 0)}"
+
+    # --- NEW: commanded laser state (from LASER_STATE merge) ---
+    if "laser_enabled" in ag:
+        yield f"LASER ENABLED: {'YES' if ag.get('laser_enabled') else 'NO'}"
+    else:
+        yield "LASER ENABLED: UNKNOWN"
 
 
 def environment_status_readout() -> Generator[str, None, None]:
@@ -281,11 +292,12 @@ def raspberry_pi_status_readout() -> Generator[str, None, None]:
     else:
         yield "UNDERVOLTAGE: UNKNOWN"
 
+
 # ---------------------------------------------------------------------
 # Readout Registry
 # ---------------------------------------------------------------------
 READOUTS = [
-    laser_status_readout,          # ← NEW
+    laser_status_readout,
     environment_status_readout,
     sensor_scan_readout,
     battery_status_readout,

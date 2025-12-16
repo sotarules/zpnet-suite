@@ -1,11 +1,10 @@
 """
-ZPNet Aggregator (Unified Health + Power + Environment + Laser Revision)
+ZPNet Aggregator (Unified Health + Power Status + Environment + Laser Status Revision)
 
 Computes summary aggregates from zpnet_events and stores them in the
-aggregates table. Each subsystem publishes its health_state using the
-NASA-style vocabulary: NOMINAL, HOLD, or DOWN.
-
-This revision adds LASER_STATUS as a first-class aggregate.
+aggregates table. Each subsystem (Battery, Network, Sensor, Teensy, Pi,
+Power, Environment, Laser) publishes its health_state using the NASA-style
+vocabulary: NOMINAL, HOLD, or DOWN.
 
 Author: The Mule
 """
@@ -26,6 +25,7 @@ V_BATTERY_EMPTY = 11.00
 POWER_SAMPLE_STEP = 50
 MAX_ERRORS_AGGREGATED = 5
 ERROR_WINDOW_SEC = 3600  # 1 hour
+
 
 # ---------------------------------------------------------------------
 # Helper: Health classification
@@ -70,14 +70,12 @@ def create_or_update_aggregate(aggregate_type: str, payload: dict):
             conn.commit()
         logging.debug(f"✅ [aggregator] Aggregate updated: {aggregate_type}")
     except Exception as e:
-        logging.exception(
-            f"⚠️ [aggregator] failed to update aggregate {aggregate_type}: {e}"
-        )
+        logging.exception(f"⚠️ [aggregator] failed to update aggregate {aggregate_type}: {e}")
         raise
 
 
 # ---------------------------------------------------------------------
-# Battery State of Charge
+# Battery SoC Estimator
 # ---------------------------------------------------------------------
 def aggregate_battery_state_of_charge():
     with sqlite3.connect(DB_PATH) as conn:
@@ -113,9 +111,7 @@ def aggregate_battery_state_of_charge():
         row = power_rows[i]
         payload = json.loads(row["payload"])
         sensors = payload.get("sensors", [])
-        battery = next(
-            (s for s in sensors if s["address"] == BATTERY_ADDR), None
-        )
+        battery = next((s for s in sensors if s["address"] == BATTERY_ADDR), None)
         if not battery or "power_w" not in battery:
             continue
 
@@ -218,9 +214,12 @@ def aggregate_network_status():
 
 
 # ---------------------------------------------------------------------
-# Sensor Scan
+# Sensor Scan (OFFLINE → DOWN normalization)
 # ---------------------------------------------------------------------
 def aggregate_sensor_scan():
+    """
+    Aggregate SENSOR_SCAN with explicit OFFLINE → DOWN normalization.
+    """
     with sqlite3.connect(DB_PATH) as conn:
         conn.row_factory = sqlite3.Row
         cur = conn.cursor()
@@ -319,22 +318,55 @@ def aggregate_environment_status():
 # ---------------------------------------------------------------------
 def aggregate_laser_status():
     """
-    Aggregate LASER_STATUS as a singleton.
-    No reinterpretation beyond health_state preservation.
+    Aggregate LASER_STATUS and merge in the most recent LASER_STATE.enabled.
+
+    The EV5491 driver truth (LASER_STATUS) and the commanded truth (LASER_STATE)
+    are orthogonal: one describes what the driver knows; the other describes what
+    the operator commanded. The aggregate carries both.
+
+    Emits:
+        LASER_STATUS aggregate payload with an additional key:
+            laser_enabled: bool  (only if LASER_STATE exists)
     """
+    # Pull latest LASER_STATUS (hardware truth)
     with sqlite3.connect(DB_PATH) as conn:
         conn.row_factory = sqlite3.Row
         cur = conn.cursor()
+
         cur.execute(
             "SELECT payload FROM zpnet_events WHERE event_type='LASER_STATUS' "
             "ORDER BY timestamp DESC LIMIT 1"
         )
-        row = cur.fetchone()
-        if not row:
-            raise RuntimeError("[aggregator] no LASER_STATUS events found")
+        status_row = cur.fetchone()
 
-    payload = json.loads(row["payload"])
-    payload.setdefault("health_state", "DOWN")
+        cur.execute(
+            "SELECT payload FROM zpnet_events WHERE event_type='LASER_STATE' "
+            "ORDER BY timestamp DESC LIMIT 1"
+        )
+        state_row = cur.fetchone()
+
+    # If LASER_STATUS is missing, still publish a truthful aggregate
+    # (driver unknown / absent) but include laser_enabled if we have it.
+    if not status_row:
+        payload: dict = {"health_state": "DOWN"}
+        if state_row:
+            state = json.loads(state_row["payload"])
+            if isinstance(state.get("enabled"), bool):
+                payload["laser_enabled"] = state["enabled"]
+        create_or_update_aggregate("LASER_STATUS", payload)
+        return
+
+    payload = json.loads(status_row["payload"])
+
+    # Merge commanded enabled state (if present)
+    if state_row:
+        state = json.loads(state_row["payload"])
+        if isinstance(state.get("enabled"), bool):
+            payload["laser_enabled"] = state["enabled"]
+
+    # If LASER_STATUS didn't include a health_state for some reason, preserve truth
+    payload.setdefault("health_state", "HOLD")
+
     create_or_update_aggregate("LASER_STATUS", payload)
 
 
@@ -384,11 +416,11 @@ def run():
         aggregate_raspberry_pi_status()
         aggregate_teensy_status()
         aggregate_environment_status()
-        aggregate_laser_status()        # ← NEW
         aggregate_battery_state_of_charge()
         aggregate_power_status()
         aggregate_network_status()
         aggregate_sensor_scan()
+        aggregate_laser_status()     # ← NEW
         aggregate_system_errors()
     except Exception as e:
         logging.exception(f"🔥 [aggregator] aggregator loop failed: {e}")
