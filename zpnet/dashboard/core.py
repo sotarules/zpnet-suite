@@ -1,9 +1,9 @@
 """
-ZPNet Dashboard — X-Safe Event-Pump Hardened Revision (v2025-12-15a)
+ZPNet Dashboard — X-Safe Event-Pump Hardened Revision (v2025-12-17b)
 
 Displays real-time system aggregates in a minimalist terminal-style UI.
-This revision updates the LASER_STATUS readout to include the commanded
-laser_enabled state merged by the aggregator.
+This revision replaces GNSS_STATUS aggregation with a GNSS_DATA readout
+for authoritative clock truth.
 
 Author: The Mule + GPT
 """
@@ -104,6 +104,7 @@ def header_readout() -> Generator[str, None, None]:
 
     ag_bat = fetch_aggregate("BATTERY_STATE_OF_CHARGE")
     ag_env = fetch_aggregate("ENVIRONMENT_STATUS")
+    ag_gnss = fetch_aggregate("GNSS_DATA")            # GNSS now authoritative via GNSS_DATA
     ag_laser = fetch_aggregate("LASER_STATUS")
     ag_sen = fetch_aggregate("SENSOR_SCAN")
     ag_pow = fetch_aggregate("POWER_STATUS")
@@ -117,6 +118,7 @@ def header_readout() -> Generator[str, None, None]:
         ag_net.get("health_state"),
         ag_bat.get("health_state"),
         ag_env.get("health_state"),
+        ag_gnss.get("health_state"),
         ag_laser.get("health_state"),
         ag_pow.get("health_state"),
         ag_sen.get("health_state"),
@@ -132,6 +134,77 @@ def header_readout() -> Generator[str, None, None]:
 # ---------------------------------------------------------------------
 # Readouts
 # ---------------------------------------------------------------------
+def gnss_data_readout() -> Generator[str, None, None]:
+    """
+    GNSS data readout (GF-8802 authoritative snapshot).
+
+    This readout reflects the GNSS_DATA aggregate only.
+    GNSS_STATUS is intentionally not aggregated.
+    """
+    ag = fetch_aggregate("GNSS_DATA")
+    yield f"GNSS DATA: {ag.get('health_state', 'DOWN')}"
+
+    if not ag:
+        yield "GNSS DATA UNAVAILABLE."
+        return
+
+    # Canonical time truth
+    if "utc_datetime" in ag:
+        yield f"UTC: {ag.get('utc_datetime')}"
+    if "time_status" in ag:
+        yield f"TIME STATUS: {ag.get('time_status')}"
+    if "leap_seconds" in ag:
+        yield f"LEAP SECONDS: {ag.get('leap_seconds')}"
+    if "freq_mode" in ag:
+        yield f"FREQ MODE: {ag.get('freq_mode')}"
+
+    # Timing quality
+    if "pps_accuracy_ns" in ag:
+        try:
+            yield f"PPS ACCURACY: {float(ag.get('pps_accuracy_ns')):.2f} NS"
+        except Exception:
+            yield f"PPS ACCURACY: {ag.get('pps_accuracy_ns')} NS"
+
+    if "pps_timing_error_ns" in ag:
+        try:
+            yield f"PPS ERROR: {int(ag.get('pps_timing_error_ns'))} NS"
+        except Exception:
+            yield f"PPS ERROR: {ag.get('pps_timing_error_ns')} NS"
+
+    if "clock_drift_ppb" in ag:
+        try:
+            yield f"CLOCK DRIFT: {float(ag.get('clock_drift_ppb')):.3f} PPB"
+        except Exception:
+            yield f"CLOCK DRIFT: {ag.get('clock_drift_ppb')} PPB"
+
+    if "temperature_c" in ag:
+        try:
+            yield f"OSC TEMP: {float(ag.get('temperature_c')):.2f} C"
+        except Exception:
+            yield f"OSC TEMP: {ag.get('temperature_c')} C"
+
+    # Location is contextual (not primary truth for timing)
+    if "latitude_deg" in ag and "longitude_deg" in ag:
+        try:
+            lat = float(ag.get("latitude_deg"))
+            lon = float(ag.get("longitude_deg"))
+            yield f"LAT/LON: {lat:.6f}, {lon:.6f}"
+        except Exception:
+            yield f"LAT/LON: {ag.get('latitude_deg')}, {ag.get('longitude_deg')}"
+
+    # Raw sentences (short, for audit/debug)
+    if "raw_zda" in ag:
+        yield f"RAW ZDA: {str(ag.get('raw_zda'))[:64]}"
+    if "raw_rmc" in ag:
+        yield f"RAW RMC: {str(ag.get('raw_rmc'))[:64]}"
+    if "raw_crw" in ag:
+        yield f"RAW CRW: {str(ag.get('raw_crw'))[:64]}"
+    if "raw_crx" in ag:
+        yield f"RAW CRX: {str(ag.get('raw_crx'))[:64]}"
+    if "raw_crz" in ag:
+        yield f"RAW CRZ: {str(ag.get('raw_crz'))[:64]}"
+
+
 def laser_status_readout() -> Generator[str, None, None]:
     ag = fetch_aggregate("LASER_STATUS")
     yield f"LASER STATUS: {ag.get('health_state', 'DOWN')}"
@@ -146,7 +219,6 @@ def laser_status_readout() -> Generator[str, None, None]:
     yield f"MODE: {ag.get('id1_mode', 'UNKNOWN')}"
     yield f"CURRENT CODE: {ag.get('id1_current_code', 0)}"
 
-    # --- NEW: commanded laser state (from LASER_STATE merge) ---
     if "laser_enabled" in ag:
         yield f"LASER ENABLED: {'YES' if ag.get('laser_enabled') else 'NO'}"
     else:
@@ -297,6 +369,7 @@ def raspberry_pi_status_readout() -> Generator[str, None, None]:
 # Readout Registry
 # ---------------------------------------------------------------------
 READOUTS = [
+    gnss_data_readout,
     laser_status_readout,
     environment_status_readout,
     sensor_scan_readout,

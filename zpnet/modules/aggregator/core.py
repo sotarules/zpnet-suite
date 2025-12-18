@@ -314,7 +314,7 @@ def aggregate_environment_status():
 
 
 # ---------------------------------------------------------------------
-# Laser Status (NEW)
+# Laser Status
 # ---------------------------------------------------------------------
 def aggregate_laser_status():
     """
@@ -328,7 +328,6 @@ def aggregate_laser_status():
         LASER_STATUS aggregate payload with an additional key:
             laser_enabled: bool  (only if LASER_STATE exists)
     """
-    # Pull latest LASER_STATUS (hardware truth)
     with sqlite3.connect(DB_PATH) as conn:
         conn.row_factory = sqlite3.Row
         cur = conn.cursor()
@@ -345,8 +344,6 @@ def aggregate_laser_status():
         )
         state_row = cur.fetchone()
 
-    # If LASER_STATUS is missing, still publish a truthful aggregate
-    # (driver unknown / absent) but include laser_enabled if we have it.
     if not status_row:
         payload: dict = {"health_state": "DOWN"}
         if state_row:
@@ -358,16 +355,51 @@ def aggregate_laser_status():
 
     payload = json.loads(status_row["payload"])
 
-    # Merge commanded enabled state (if present)
     if state_row:
         state = json.loads(state_row["payload"])
         if isinstance(state.get("enabled"), bool):
             payload["laser_enabled"] = state["enabled"]
 
-    # If LASER_STATUS didn't include a health_state for some reason, preserve truth
+    payload.setdefault("health_state", "HOLD")
+    create_or_update_aggregate("LASER_STATUS", payload)
+
+# ---------------------------------------------------------------------
+# GNSS Data (NEW)
+# ---------------------------------------------------------------------
+def aggregate_gnss_data():
+    """
+    Aggregate GNSS_DATA as a singleton authoritative snapshot.
+
+    Behavior:
+      - Mirrors the most recent GNSS_DATA event verbatim.
+      - If missing, publishes a truthful DOWN aggregate.
+      - Does not reinterpret, smooth, or infer.
+
+    Emits:
+      GNSS_DATA aggregate payload
+    """
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT payload FROM zpnet_events WHERE event_type='GNSS_DATA' "
+            "ORDER BY timestamp DESC LIMIT 1"
+        )
+        row = cur.fetchone()
+
+    if not row:
+        create_or_update_aggregate(
+            "GNSS_DATA",
+            {"health_state": "DOWN"}
+        )
+        return
+
+    payload = json.loads(row["payload"])
+
+    # Ensure health_state is always present
     payload.setdefault("health_state", "HOLD")
 
-    create_or_update_aggregate("LASER_STATUS", payload)
+    create_or_update_aggregate("GNSS_DATA", payload)
 
 
 # ---------------------------------------------------------------------
@@ -416,16 +448,16 @@ def run():
         aggregate_raspberry_pi_status()
         aggregate_teensy_status()
         aggregate_environment_status()
+        aggregate_gnss_data()          # ← NEW
         aggregate_battery_state_of_charge()
         aggregate_power_status()
         aggregate_network_status()
         aggregate_sensor_scan()
-        aggregate_laser_status()     # ← NEW
+        aggregate_laser_status()
         aggregate_system_errors()
     except Exception as e:
         logging.exception(f"🔥 [aggregator] aggregator loop failed: {e}")
         raise
-
 
 def bootstrap():
     setup_logging()
