@@ -397,7 +397,7 @@ def aggregate_gnss_data():
     payload = json.loads(row["payload"])
 
     # Ensure health_state is always present
-    payload.setdefault("health_state", "HOLD")
+    payload.setdefault("health_state", "NOMINAL")
 
     create_or_update_aggregate("GNSS_DATA", payload)
 

@@ -194,15 +194,15 @@ def gnss_data_readout() -> Generator[str, None, None]:
 
     # Raw sentences (short, for audit/debug)
     if "raw_zda" in ag:
-        yield f"RAW ZDA: {str(ag.get('raw_zda'))[:64]}"
+        yield f"{str(ag.get('raw_zda'))[:48]}"
     if "raw_rmc" in ag:
-        yield f"RAW RMC: {str(ag.get('raw_rmc'))[:64]}"
+        yield f"{str(ag.get('raw_rmc'))[:48]}"
     if "raw_crw" in ag:
-        yield f"RAW CRW: {str(ag.get('raw_crw'))[:64]}"
+        yield f"{str(ag.get('raw_crw'))[:48]}"
     if "raw_crx" in ag:
-        yield f"RAW CRX: {str(ag.get('raw_crx'))[:64]}"
+        yield f"{str(ag.get('raw_crx'))[:48]}"
     if "raw_crz" in ag:
-        yield f"RAW CRZ: {str(ag.get('raw_crz'))[:64]}"
+        yield f"{str(ag.get('raw_crz'))[:48]}"
 
 
 def laser_status_readout() -> Generator[str, None, None]:
