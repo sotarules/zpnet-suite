@@ -4,7 +4,8 @@
   Invariants:
     • Teensy emits NOTHING unless explicitly commanded.
     • ACTION commands return ACK/ERR only; truth is delivered via EventBus.
-    • QUERY commands return an immediate snapshot (memory-only; never interrogate hardware).
+    • QUERY commands (with ?) return immediate snapshots.
+    • Routine status commands enqueue events and return ACK.
     • Device ingestion is eager; queries are cheap; events are rare.
 
   Author: The Mule + GPT
@@ -16,9 +17,9 @@
 #include <string.h>
 
 // --------------------------------------------------------------
-// Version
+// Version (identity only; surfaced via TEENSY_STATUS)
 // --------------------------------------------------------------
-static const char* FW_VERSION = "teensy-telemetry-4.0.1";
+static const char* FW_VERSION = "teensy-telemetry-4.2.0";
 
 // --------------------------------------------------------------
 // GNSS serial config
@@ -33,7 +34,6 @@ static const unsigned long GNSS_SILENCE_FLUSH_MS = 50;
 static const int EN_PIN    = 20;
 static const int LD_ON_PIN = 21;
 
-static bool enEnabled = false;
 static bool ldOn = false;
 
 // --------------------------------------------------------------
@@ -52,13 +52,9 @@ static char last_zda[GNSS_LINE_MAX] = "";
 static char last_rmc[GNSS_LINE_MAX] = "";
 static char last_gga[GNSS_LINE_MAX] = "";
 
-// Parsed authoritative fields (future use)
-static int   fix_quality __attribute__((unused)) = -1;
-static int   num_sats    __attribute__((unused)) = -1;
-
+// Parsed authoritative fields
 static float latitude_deg  = NAN;
 static float longitude_deg = NAN;
-static float altitude_m    = NAN;
 
 // --------------------------------------------------------------
 // Utilities
@@ -76,7 +72,6 @@ static inline uint32_t freeHeapBytes() {
   return (uint32_t)mi.fordblks;
 }
 
-// Safe bounded copy (no strncpy, no warnings)
 static inline void safeCopy(char* dst, size_t dst_sz, const char* src) {
   if (!dst || dst_sz == 0) return;
   if (!src) {
@@ -121,7 +116,6 @@ static inline void emitAck(const char* cmd) {
   String b;
   b += "\"cmd\":\""; b += cmd; b += "\"";
   b += ",\"ok\":true";
-  b += ",\"fw_version\":\""; b += FW_VERSION; b += "\"";
   b += ",\"millis\":"; b += millis();
   emitJson("ACK", b);
 }
@@ -130,7 +124,6 @@ static inline void emitErr(const char* cmd, const char* msg) {
   String b;
   b += "\"cmd\":\""; b += cmd; b += "\"";
   b += ",\"ok\":false";
-  b += ",\"fw_version\":\""; b += FW_VERSION; b += "\"";
   b += ",\"millis\":"; b += millis();
   if (msg) {
     b += ",\"error\":\""; b += jsonEscape(msg); b += "\"";
@@ -139,8 +132,12 @@ static inline void emitErr(const char* cmd, const char* msg) {
 }
 
 // --------------------------------------------------------------
-// Minimal NMEA helpers
+// GNSS helpers
 // --------------------------------------------------------------
+static inline bool startsWith(const char* s, const char* p) {
+  return strncmp(s, p, strlen(p)) == 0;
+}
+
 static float nmeaLatLonToDeg(const char* ddmm, const char* hemi) {
   if (!ddmm || !hemi) return NAN;
   double v = atof(ddmm);
@@ -166,10 +163,6 @@ static void parseRMC(const char* l) {
 // --------------------------------------------------------------
 static char lineBuf[GNSS_LINE_MAX];
 static size_t lineLen = 0;
-
-static inline bool startsWith(const char* s, const char* p) {
-  return strncmp(s, p, strlen(p)) == 0;
-}
 
 static void ingestGnssLine(const char* line) {
   if (!line || !*line) return;
@@ -220,7 +213,7 @@ static void pollGnssSerial() {
 // --------------------------------------------------------------
 static const size_t EVT_MAX = 32;
 static const size_t EVT_TYPE_MAX = 32;
-static const size_t EVT_BODY_MAX = 240;
+static const size_t EVT_BODY_MAX = 512;
 
 struct EventItem {
   uint32_t ms;
@@ -234,8 +227,7 @@ static size_t evt_tail = 0;
 static size_t evt_count = 0;
 static uint32_t evt_dropped = 0;
 
-static void enqueueEvent(const char* type, const char* body_kv) {
-  if (!type || !*type) return;
+static void enqueueEvent(const char* type, const String& body) {
   if (evt_count >= EVT_MAX) {
     evt_dropped++;
     return;
@@ -243,7 +235,7 @@ static void enqueueEvent(const char* type, const char* body_kv) {
   EventItem& e = evtq[evt_head];
   e.ms = millis();
   safeCopy(e.type, sizeof(e.type), type);
-  safeCopy(e.body, sizeof(e.body), body_kv ? body_kv : "");
+  safeCopy(e.body, sizeof(e.body), body.c_str());
   evt_head = (evt_head + 1) % EVT_MAX;
   evt_count++;
 }
@@ -276,35 +268,53 @@ static void drainEventsNow() {
 }
 
 // --------------------------------------------------------------
-// QUERY responses (memory only)
+// Status builders
 // --------------------------------------------------------------
-static void emitGnssStatusNow() {
+static String buildTeensyStatusBody() {
+  String b;
+  b += "\"fw_version\":\""; b += FW_VERSION; b += "\"";
+  b += ",\"millis\":"; b += millis();
+  b += ",\"cpu_temp_c\":"; b += cpuTempC();
+  b += ",\"free_heap_bytes\":"; b += freeHeapBytes();
+  b += ",\"laser_enabled\":"; b += (ldOn ? "true" : "false");
+  return b;
+}
+
+static String buildGnssStatusBody() {
   String b;
   b += "\"millis\":"; b += millis();
   if (last_sentence[0]) {
-    b += ",\"raw_sentence\":\"";
-    b += jsonEscape(last_sentence);
-    b += "\"";
+    b += ",\"raw_sentence\":\""; b += jsonEscape(last_sentence); b += "\"";
   }
-  emitJson("GNSS_STATUS", b);
+  return b;
 }
 
-static void emitGnssDataNow() {
+static String buildGnssDataBody() {
   String b;
+  b += "\"millis\":"; b += millis();
+
   if (!isnan(latitude_deg) && !isnan(longitude_deg)) {
-    b += "\"latitude_deg\":"; b += latitude_deg;
+    b += ",\"latitude_deg\":"; b += latitude_deg;
     b += ",\"longitude_deg\":"; b += longitude_deg;
   }
-  emitJson("GNSS_DATA", b);
+
+  // Time anchor (compact, useful)
+  if (last_zda[0]) {
+    b += ",\"raw_zda\":\"";
+    b += jsonEscape(last_zda);
+    b += "\"";
+  }
+
+  // Optional: position validity / course / speed
+  if (last_rmc[0]) {
+    b += ",\"raw_rmc\":\"";
+    b += jsonEscape(last_rmc);
+    b += "\"";
+  }
+
+  return b;
 }
 
-static void emitTeensyStatusNow() {
-  String b;
-  b += "\"cpu_temp_c\":"; b += cpuTempC();
-  b += ",\"free_heap_bytes\":"; b += freeHeapBytes();
-  b += ",\"laser_enabled\":"; b += (ldOn ? "true" : "false");
-  emitJson("TEENSY_STATUS", b);
-}
 
 // --------------------------------------------------------------
 // Command parsing and execution
@@ -334,11 +344,38 @@ static void execCommand(const char* line) {
     return;
   }
 
-  if (strcmp(cmd, "GNSS.STATUS?") == 0) { emitGnssStatusNow(); return; }
-  if (strcmp(cmd, "GNSS.DATA?")   == 0) { emitGnssDataNow();   return; }
-  if (strcmp(cmd, "TEENSY.STATUS?")== 0) { emitTeensyStatusNow(); return; }
-  if (strcmp(cmd, "EVENTS.GET")    == 0) { drainEventsNow();   return; }
+  // -------- Immediate QUERY responses --------
+  if (strcmp(cmd, "TEENSY.STATUS?") == 0) {
+    emitJson("TEENSY_STATUS", buildTeensyStatusBody());
+    return;
+  }
+  if (strcmp(cmd, "GNSS.STATUS?") == 0) {
+    emitJson("GNSS_STATUS", buildGnssStatusBody());
+    return;
+  }
+  if (strcmp(cmd, "GNSS.DATA?") == 0) {
+    emitJson("GNSS_DATA", buildGnssDataBody());
+    return;
+  }
 
+  // -------- Event-generating commands --------
+  if (strcmp(cmd, "TEENSY.STATUS") == 0) {
+    enqueueEvent("TEENSY_STATUS", buildTeensyStatusBody());
+    emitAck(cmd);
+    return;
+  }
+  if (strcmp(cmd, "GNSS.STATUS") == 0) {
+    enqueueEvent("GNSS_STATUS", buildGnssStatusBody());
+    emitAck(cmd);
+    return;
+  }
+  if (strcmp(cmd, "GNSS.DATA") == 0) {
+    enqueueEvent("GNSS_DATA", buildGnssDataBody());
+    emitAck(cmd);
+    return;
+  }
+
+  // -------- Laser actions --------
   if (strcmp(cmd, "LASER.ON") == 0) {
     digitalWrite(EN_PIN, HIGH);
     digitalWrite(LD_ON_PIN, HIGH);
@@ -353,6 +390,11 @@ static void execCommand(const char* line) {
     ldOn = false;
     enqueueEvent("LASER_STATE", "\"enabled\":false");
     emitAck(cmd);
+    return;
+  }
+
+  if (strcmp(cmd, "EVENTS.GET") == 0) {
+    drainEventsNow();
     return;
   }
 

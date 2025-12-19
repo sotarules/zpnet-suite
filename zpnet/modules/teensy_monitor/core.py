@@ -1,21 +1,24 @@
 """
-ZPNet GNSS Data Monitor — Authoritative Clock Snapshot Publisher
+ZPNet Teensy Monitor — Health Snapshot Publisher
 
 Responsibilities:
-  • Issue a GNSS.DATA command to the Teensy
-  • Cause a GNSS_DATA event to be enqueued on the Teensy
-  • Perform NO interpretation, parsing, or cadence logic
+  • Issue a TEENSY.STATUS command to the Teensy
+  • Cause a TEENSY_STATUS event to be enqueued on the Teensy
+  • Perform NO interpretation, inference, or aggregation
   • Emit NOTHING directly
   • Remain stateless and scheduler-driven
 
-GNSS_DATA represents canonical clock truth.
-This module requests its publication; it does not own it.
+TEENSY_STATUS represents Teensy-local health truth:
+  • CPU temperature
+  • Free heap
+  • Firmware version
+  • Laser enable flag
+  • Monotonic millis
 
 Delivery semantics:
   • Command returns ACK only
-  • Actual GNSS_DATA flows through the EVENT queue
+  • Actual status flows through the EVENT queue
   • Ingested via teensy_listener during normal despool
-  • Aggregated downstream
 
 Author: The Mule + GPT
 """
@@ -25,7 +28,7 @@ import logging
 from zpnet.shared.logger import setup_logging
 from zpnet.shared.serial import (
     send_teensy_command,
-    cmd_gnss_data,   # ← event-generating command (no ?)
+    cmd_teensy_status,   # ← event-generating command (no ?)
 )
 
 # ---------------------------------------------------------------------
@@ -33,19 +36,19 @@ from zpnet.shared.serial import (
 # ---------------------------------------------------------------------
 def run() -> None:
     """
-    Request that the Teensy publish its current authoritative GNSS data.
+    Request that the Teensy publish its current health status.
 
     Semantics:
-      • Imperative command (GNSS.DATA)
-      • Causes GNSS_DATA to be enqueued as an EVENT
+      • Imperative command (TEENSY.STATUS)
+      • Causes TEENSY_STATUS to be enqueued as an EVENT
       • No immediate response data is expected
       • Durable, framed delivery via EVENTS.GET
 
     Emits (indirectly, via Teensy event queue):
-        GNSS_DATA
+        TEENSY_STATUS
     """
-    logging.debug("[gnss_data_monitor] requesting GNSS_DATA publication")
-    send_teensy_command(cmd_gnss_data())
+    logging.debug("[teensy_monitor] requesting TEENSY_STATUS publication")
+    send_teensy_command(cmd_teensy_status())
 
 
 # ---------------------------------------------------------------------

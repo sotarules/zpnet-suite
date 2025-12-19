@@ -1,10 +1,16 @@
 """
-ZPNet Laser Monitor — EV5491 Observer (v2025-12-14a)
+ZPNet Laser Monitor — EV5491 Ground-Truth Observer
 
-Observes EV5491 laser controller over I²C (0x66) and emits LASER_STATUS
-events containing only ground-truth register state.
+Responsibilities:
+  • Observe EV5491 laser controller register state over I²C
+  • Emit only ground-truth hardware facts
+  • Perform NO control operations
+  • Perform NO inference about operator intent
 
-No control operations are performed.
+Important:
+  • Commanded laser state (LASER_STATE) is emitted by the Teensy
+  • Observed driver state (LASER_STATUS) is emitted here
+  • Aggregation merges the two truths explicitly
 
 Author: The Mule + GPT
 """
@@ -16,7 +22,7 @@ from zpnet.shared.logger import setup_logging
 from zpnet.shared.events import create_event
 
 # ---------------------------------------------------------------------
-# EV5491 Registers (observed subset)
+# EV5491 Registers (observed subset only)
 # ---------------------------------------------------------------------
 I2C_ADDR = 0x66
 
@@ -41,6 +47,12 @@ MODE_MAP = {
 def run() -> None:
     """
     Read EV5491 registers and emit LASER_STATUS event.
+
+    Semantics:
+      • Observation only
+      • No writes
+      • No assumptions about commanded state
+      • No health inference beyond presence/readability
 
     Emits:
         LASER_STATUS
@@ -91,6 +103,9 @@ def run() -> None:
         create_event("LASER_STATUS", payload)
 
 
+# ---------------------------------------------------------------------
+# Bootstrap
+# ---------------------------------------------------------------------
 def bootstrap() -> None:
     """Setup logging and execute run() once."""
     setup_logging()
