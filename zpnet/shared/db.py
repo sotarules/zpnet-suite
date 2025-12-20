@@ -28,12 +28,28 @@ SYNCHRONOUS_MODE = "NORMAL"     # balance durability vs performance
 # ---------------------------------------------------------------------
 def initialize_database() -> None:
     """
-    Apply persistent SQLite settings.
+    Apply persistent SQLite settings and ensure core tables exist.
     Safe to call multiple times.
     """
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute("PRAGMA journal_mode = WAL;")
         conn.execute("PRAGMA synchronous = NORMAL;")
+
+        # -----------------------------------------------------------------
+        # Config table (for remote-controllable UI / runtime behavior)
+        #
+        # Keyed by config_key (e.g., "DASHBOARD") and stores JSON payload.
+        # Timestamp is UTC ISO8601 with trailing "Z".
+        # -----------------------------------------------------------------
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS config (
+                config_key TEXT PRIMARY KEY,
+                timestamp  TEXT NOT NULL,
+                payload    TEXT NOT NULL
+            )
+            """
+        )
 
 
 # ---------------------------------------------------------------------

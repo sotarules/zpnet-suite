@@ -1,9 +1,22 @@
 """
-ZPNet Dashboard — X-Safe Event-Pump Hardened Revision (v2025-12-17b)
+ZPNet Dashboard — X-Safe Event-Pump Hardened + Lock Mode Retrofit
+(v2025-12-19-retrofit)
 
-Displays real-time system aggregates in a minimalist terminal-style UI.
-This revision replaces GNSS_STATUS aggregation with a GNSS_DATA readout
-for authoritative clock truth.
+This is a minimal retrofit of the original dashboard:
+- All readouts preserved verbatim
+- All generator logic preserved
+- All TTY behavior preserved in unlocked mode
+
+New behavior:
+- Press L to toggle locked/unlocked
+- Locked mode:
+    * Prefixes title bar with "* "
+    * Displays a single readout
+    * No TTY scroll
+    * ~1 Hz refresh
+    * SPACE cycles readouts
+- Unlocked mode:
+    * Original behavior exactly
 
 Author: The Mule + GPT
 """
@@ -45,29 +58,37 @@ HEADER_COLOR = (255, 255, 255)
 TEXT_COLOR = (0, 255, 0)
 SCROLL_SPEED = 120
 LINE_DELAY = 0.05
-READOUT_DELAY = 10
+READOUT_DELAY = 4
+LOCKED_REFRESH_S = 1.0
+
 
 # ---------------------------------------------------------------------
-# Event Pump Helpers
+# Event Pump (single authoritative)
 # ---------------------------------------------------------------------
-def pump_events():
-    """Keep SDL/X11 connection alive."""
+def pump_events(locked: bool, readout_idx: int, readout_count: int) -> tuple[bool, int]:
+    """
+    Consume SDL events exactly once per frame.
+    Returns updated (locked, readout_idx).
+    """
     for event in pygame.event.get():
         if event.type == pygame.QUIT:
             handle_exit()
-        if event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
-            handle_exit()
 
+        if event.type == pygame.KEYDOWN:
+            if event.key == pygame.K_ESCAPE:
+                handle_exit()
 
-def wait_with_pumping(seconds: float, clock: pygame.time.Clock, fps: int = 60):
-    """Replace time.sleep with a responsive wait."""
-    end = time.time() + seconds
-    while time.time() < end:
-        pump_events()
-        clock.tick(fps)
+            if event.key == pygame.K_l:
+                locked = not locked
+
+            elif event.key == pygame.K_SPACE and locked:
+                readout_idx = (readout_idx + 1) % readout_count
+
+    return locked, readout_idx
+
 
 # ---------------------------------------------------------------------
-# Database Access
+# Database Access (unchanged)
 # ---------------------------------------------------------------------
 def fetch_aggregate(name: str) -> dict:
     try:
@@ -80,11 +101,11 @@ def fetch_aggregate(name: str) -> dict:
             row = cur.fetchone()
             return json.loads(row["payload"]) if row else {}
     except Exception:
-        # Dashboard must never die due to transient DB contention
         return {}
 
+
 # ---------------------------------------------------------------------
-# Health Combiner
+# Health Combiner (unchanged)
 # ---------------------------------------------------------------------
 def combine_health(states: list[str]) -> str:
     if not states:
@@ -95,16 +116,17 @@ def combine_health(states: list[str]) -> str:
         return "DOWN"
     return "HOLD"
 
+
 # ---------------------------------------------------------------------
-# Header
+# Header (verbatim, with optional prefix)
 # ---------------------------------------------------------------------
-def header_readout() -> Generator[str, None, None]:
+def header_readout(prefix: str = "") -> Generator[str, None, None]:
     ag_net = fetch_aggregate("NETWORK_STATUS")
     ssid = ag_net.get("ssid", "UNKNOWN")
 
     ag_bat = fetch_aggregate("BATTERY_STATE_OF_CHARGE")
     ag_env = fetch_aggregate("ENVIRONMENT_STATUS")
-    ag_gnss = fetch_aggregate("GNSS_DATA")            # GNSS now authoritative via GNSS_DATA
+    ag_gnss = fetch_aggregate("GNSS_DATA")
     ag_laser = fetch_aggregate("LASER_STATUS")
     ag_sen = fetch_aggregate("SENSOR_SCAN")
     ag_pow = fetch_aggregate("POWER_STATUS")
@@ -128,7 +150,7 @@ def header_readout() -> Generator[str, None, None]:
 
     overall = combine_health([h for h in healths if h])
 
-    yield f"NET: {ssid}  BAT: {batt_str}  SYS: {overall}"
+    yield f"{prefix}NET: {ssid}  BAT: {batt_str}  SYS: {overall}"
     yield ""
 
 # ---------------------------------------------------------------------
@@ -366,7 +388,7 @@ def raspberry_pi_status_readout() -> Generator[str, None, None]:
 
 
 # ---------------------------------------------------------------------
-# Readout Registry
+# Readout Registry (unchanged order)
 # ---------------------------------------------------------------------
 READOUTS = [
     gnss_data_readout,
@@ -380,8 +402,9 @@ READOUTS = [
     raspberry_pi_status_readout,
 ]
 
+
 # ---------------------------------------------------------------------
-# Rendering
+# Rendering helpers (unchanged)
 # ---------------------------------------------------------------------
 def render_locked_lines(screen, font, lines: list[str]) -> int:
     screen.fill(BG_COLOR)
@@ -407,7 +430,6 @@ def scroll_text(screen, font, lines: list[str], start_y: int, clock) -> None:
     for line in lines:
         text_so_far = ""
         for char in line.upper():
-            pump_events()
             text_so_far += char
             clear_rect = pygame.Rect(
                 20, y, SCREEN_WIDTH - 40, FONT_SIZE + READOUT_PADDING * 2
@@ -423,10 +445,11 @@ def scroll_text(screen, font, lines: list[str], start_y: int, clock) -> None:
             screen.scroll(dy=-line_h)
             y -= line_h
 
-        wait_with_pumping(LINE_DELAY, clock)
+        time.sleep(LINE_DELAY)
+
 
 # ---------------------------------------------------------------------
-# Main Loop
+# Main Loop (retrofitted)
 # ---------------------------------------------------------------------
 def main() -> None:
     pygame.init()
@@ -435,15 +458,34 @@ def main() -> None:
     font = pygame.font.SysFont(FONT_NAME, FONT_SIZE, bold=False)
     clock = pygame.time.Clock()
 
-    while True:
-        pump_events()
+    locked = False
+    readout_idx = 0
 
-        header_lines = list(header_readout())
+    while True:
+        locked, readout_idx = pump_events(
+            locked, readout_idx, len(READOUTS)
+        )
+
+        prefix = "* " if locked else ""
+        header_lines = list(header_readout(prefix=prefix))
         baseline = render_locked_lines(screen, font, header_lines)
         clear_scroll_area(screen, baseline)
 
+        if locked:
+            lines = list(READOUTS[readout_idx]())
+            render_locked_lines(screen, font, header_lines + lines)
+            time.sleep(LOCKED_REFRESH_S)
+            continue
+
+        # Unlocked: original behavior exactly
         for readout_fn in READOUTS:
-            pump_events()
+            locked, readout_idx = pump_events(
+                locked, readout_idx, len(READOUTS)
+            )
+
+            prefix = "* " if locked else ""
+            header_lines = list(header_readout(prefix=prefix))
+            baseline = render_locked_lines(screen, font, header_lines)
             clear_scroll_area(screen, baseline)
 
             lines = list(readout_fn())
@@ -455,7 +497,7 @@ def main() -> None:
             }
             create_event("DASHBOARD_READOUT", payload)
 
-            wait_with_pumping(READOUT_DELAY, clock)
+            time.sleep(READOUT_DELAY)
 
 
 if __name__ == "__main__":

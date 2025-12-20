@@ -11,13 +11,13 @@ Author: The Mule
 import importlib
 import logging
 import signal
-import sqlite3
 import sys
 import time
 from datetime import datetime, timedelta, timezone
 
+from zpnet.shared.db import initialize_database, open_db
 from zpnet.shared.logger import setup_logging
-from zpnet.shared.constants import DB_PATH, TICK_INTERVAL_S  # ← NEW
+from zpnet.shared.constants import TICK_INTERVAL_S
 from zpnet.shared.startup import run_startup
 
 MODULES_PATH = "zpnet.modules"
@@ -57,7 +57,7 @@ def run_module(module_name: str) -> None:
     duration_ms = int((time.monotonic() - start_monotonic) * 1000)
 
     try:
-        with sqlite3.connect(DB_PATH) as conn:
+        with open_db(read_only=False) as conn:
             cur = conn.cursor()
             cur.execute(
                 """
@@ -84,13 +84,13 @@ def run_all() -> None:
     """Run all modules unconditionally."""
     logging.info("📅 [main] unconditionally running all modules")
 
-    with sqlite3.connect(DB_PATH) as conn:
+    with open_db(read_only=False) as conn:
         cur = conn.cursor()
         cur.execute("SELECT id, module_name FROM schedule")
         jobs = cur.fetchall()
 
-        for job_id, module_name in jobs:
-            run_module(module_name)
+    for job_id, module_name in jobs:
+        run_module(module_name)
 
 
 # ---------------------------------------------------------------------
@@ -105,7 +105,7 @@ def scheduler_loop() -> None:
         now_iso = now_ts.isoformat().replace("+00:00", "Z")
 
         try:
-            with sqlite3.connect(DB_PATH) as conn:
+            with open_db(read_only=False) as conn:
                 cur = conn.cursor()
                 cur.execute(
                     """
@@ -119,6 +119,7 @@ def scheduler_loop() -> None:
 
                 for job_id, module_name, freq_s in due_jobs:
                     run_module(module_name)
+
                     next_run = datetime.now(timezone.utc) + timedelta(seconds=freq_s)
                     cur.execute(
                         """
@@ -132,7 +133,8 @@ def scheduler_loop() -> None:
                             job_id,
                         ),
                     )
-                    conn.commit()
+
+                conn.commit()
 
         except Exception as e:
             logging.warning(f"⚠️ main.py database poll failed: {e}")
@@ -144,12 +146,15 @@ def scheduler_loop() -> None:
 # Bootstrap Entry Point
 # ---------------------------------------------------------------------
 def bootstrap() -> None:
-    """Configure logging, signal handlers, and start the scheduler."""
+    """Configure logging, signal handlers, initialize DB policy, and start the scheduler."""
     setup_logging()
     signal.signal(signal.SIGTERM, handle_sigterm)
     signal.signal(signal.SIGINT, handle_sigterm)
 
     try:
+        # Ensure persistent SQLite policy is applied (WAL + synchronous)
+        initialize_database()
+
         run_startup()
         run_all()
         scheduler_loop()
