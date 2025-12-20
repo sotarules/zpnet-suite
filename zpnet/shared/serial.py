@@ -71,6 +71,27 @@ def cmd_gnss_data() -> dict:
     return {"cmd": "GNSS.DATA"}
 
 
+# ===== Laser control commands (event-generating) =====
+
+def cmd_laser_on() -> dict:
+    """
+    Command Teensy to enable laser output.
+
+    Causes:
+        • LASER_STATE { enabled: true } to be enqueued
+    """
+    return {"cmd": "LASER.ON"}
+
+def cmd_laser_off() -> dict:
+    """
+    Command Teensy to disable laser output.
+
+    Causes:
+        • LASER_STATE { enabled: false } to be enqueued
+    """
+    return {"cmd": "LASER.OFF"}
+
+
 # ===== Immediate query commands (interactive / future use) =====
 
 def cmd_teensy_status_query() -> dict:
