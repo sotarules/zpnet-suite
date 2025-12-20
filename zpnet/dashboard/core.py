@@ -3,10 +3,13 @@ ZPNet Dashboard — PostgreSQL-Compliant Edition (v2025-12-19-psql)
 
 Terminal-style real-time dashboard using pygame with dynamic readouts.
 
-Features:
-  • Locked/unlocked mode (L to toggle, SPACE to cycle in locked)
-  • Displays full system status from aggregated Postgres records
-  • Emits DASHBOARD_READOUT events for telemetry auditing
+Modes:
+  • UNLOCKED — TTY-style animated readouts (hacker chic)
+  • LOCKED   — Instrument panel with React-style reconciliation
+
+Live observable surface:
+  • WebSocket server on ws://zpnet.local:8765
+  • Broadcasts dashboard readout when rendered output changes
 
 Author: The Mule + GPT
 """
@@ -15,13 +18,15 @@ import json
 import signal
 import sys
 import time
+import threading
+import asyncio
 from collections.abc import Generator
 from typing import Callable
 
 import pygame
+import websockets
 
 from zpnet.shared.db import open_db
-from zpnet.shared.events import create_event
 
 
 # ---------------------------------------------------------------------
@@ -46,10 +51,12 @@ READOUT_PADDING = 2
 BG_COLOR = (0, 0, 0)
 HEADER_COLOR = (255, 255, 255)
 TEXT_COLOR = (0, 255, 0)
-SCROLL_SPEED = 120
-LINE_DELAY = 0.05
-READOUT_DELAY = 4
-LOCKED_REFRESH_S = 1.0
+
+READOUT_DELAY = 2
+LOCKED_REFRESH_S = 0.5
+
+WS_HOST = "0.0.0.0"
+WS_PORT = 8765
 
 
 # ---------------------------------------------------------------------
@@ -78,9 +85,7 @@ def fetch_aggregate(name: str) -> dict:
 
         return {}
 
-    except Exception as e:
-        # Optional: log once while stabilizing
-        # logging.debug(f"[dashboard] fetch_aggregate({name}) failed: {e}")
+    except Exception:
         return {}
 
 
@@ -98,9 +103,9 @@ def combine_health(states: list[str]) -> str:
 
 
 # ---------------------------------------------------------------------
-# Header (with optional prefix for LOCKED mode)
+# Header
 # ---------------------------------------------------------------------
-def header_readout(prefix: str = "") -> Generator[str, None, None]:
+def header_readout(prefix: str = "") -> list[str]:
     ag_net = fetch_aggregate("NETWORK_STATUS")
     ag_bat = fetch_aggregate("BATTERY_STATE_OF_CHARGE")
     ag_env = fetch_aggregate("ENVIRONMENT_STATUS")
@@ -128,8 +133,7 @@ def header_readout(prefix: str = "") -> Generator[str, None, None]:
     ]
 
     overall = combine_health([h for h in healths if h])
-    yield f"{prefix}NET: {ssid}  BAT: {batt_str}  SYS: {overall}"
-    yield ""
+    return [f"{prefix}NET: {ssid}  BAT: {batt_str}  SYS: {overall}", ""]
 
 
 # ---------------------------------------------------------------------
@@ -139,7 +143,7 @@ Readout = Generator[str, None, None]
 
 
 # ---------------------------------------------------------------------
-# Import your individual readouts here
+# Readout imports
 # ---------------------------------------------------------------------
 from zpnet.dashboard.readout_blocks import (
     gnss_data_readout,
@@ -154,9 +158,6 @@ from zpnet.dashboard.readout_blocks import (
 )
 
 
-# ---------------------------------------------------------------------
-# Registry (order defines display sequence)
-# ---------------------------------------------------------------------
 READOUTS: list[Callable[[], Readout]] = [
     gnss_data_readout,
     laser_status_readout,
@@ -169,10 +170,11 @@ READOUTS: list[Callable[[], Readout]] = [
     raspberry_pi_status_readout,
 ]
 
+
 # ---------------------------------------------------------------------
-# SDL Event Pump
+# Event Pump
 # ---------------------------------------------------------------------
-def pump_events(locked: bool, readout_idx: int, readout_count: int) -> tuple[bool, int]:
+def pump_events(locked: bool, idx: int, count: int) -> tuple[bool, int]:
     for event in pygame.event.get():
         if event.type == pygame.QUIT:
             handle_exit()
@@ -182,49 +184,96 @@ def pump_events(locked: bool, readout_idx: int, readout_count: int) -> tuple[boo
             elif event.key == pygame.K_l:
                 locked = not locked
             elif event.key == pygame.K_SPACE and locked:
-                readout_idx = (readout_idx + 1) % readout_count
-    return locked, readout_idx
+                idx = (idx + 1) % count
+    return locked, idx
 
 
 # ---------------------------------------------------------------------
-# Rendering Helpers
+# Renderers
 # ---------------------------------------------------------------------
-def render_locked_lines(screen, font, lines: list[str]) -> int:
+def render_tty(screen, font, header: list[str], body: list[str], clock) -> None:
     screen.fill(BG_COLOR)
     y = 20
     line_h = FONT_SIZE + READOUT_PADDING * 2
-    for line in lines:
+
+    for line in header:
         surf = font.render(line.upper(), True, HEADER_COLOR)
         screen.blit(surf, (20, y))
         y += line_h
+
     pygame.display.flip()
-    return y
 
+    for line in body:
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                handle_exit()
+            elif event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
+                handle_exit()
 
-def clear_scroll_area(screen, baseline: int) -> None:
-    rect = pygame.Rect(0, baseline, SCREEN_WIDTH, SCREEN_HEIGHT - baseline)
-    pygame.draw.rect(screen, BG_COLOR, rect)
-    pygame.display.update(rect)
-
-
-def scroll_text(screen, font, lines: list[str], start_y: int, clock) -> None:
-    line_h = FONT_SIZE + READOUT_PADDING * 2
-    y = start_y
-    for line in lines:
-        text_so_far = ""
-        for char in line.upper():
-            text_so_far += char
-            clear_rect = pygame.Rect(20, y, SCREEN_WIDTH - 40, FONT_SIZE + READOUT_PADDING * 2)
-            pygame.draw.rect(screen, BG_COLOR, clear_rect)
-            surf = font.render(text_so_far, True, TEXT_COLOR)
-            screen.blit(surf, (20, y))
-            pygame.display.flip()
-            clock.tick(SCROLL_SPEED)
+        surf = font.render(line.upper(), True, TEXT_COLOR)
+        screen.blit(surf, (20, y))
         y += line_h
-        if y + line_h > SCREEN_HEIGHT:
-            screen.scroll(dy=-line_h)
-            y -= line_h
-        time.sleep(LINE_DELAY)
+
+        pygame.display.flip()
+        clock.tick(15)
+
+
+def render_panel(screen, font, header: list[str], body: list[str]) -> None:
+    screen.fill(BG_COLOR)
+    y = 20
+    line_h = FONT_SIZE + READOUT_PADDING * 2
+
+    for line in header:
+        surf = font.render(line.upper(), True, HEADER_COLOR)
+        screen.blit(surf, (20, y))
+        y += line_h
+
+    for line in body:
+        surf = font.render(line.upper(), True, TEXT_COLOR)
+        screen.blit(surf, (20, y))
+        y += line_h
+
+    pygame.display.flip()
+
+
+# ---------------------------------------------------------------------
+# WebSocket Observable Surface
+# ---------------------------------------------------------------------
+_ws_clients: set = set()
+_ws_loop: asyncio.AbstractEventLoop | None = None
+
+
+async def _ws_handler(ws):
+    _ws_clients.add(ws)
+    try:
+        await ws.wait_closed()
+    finally:
+        _ws_clients.discard(ws)
+
+
+async def _ws_server():
+    async with websockets.serve(_ws_handler, WS_HOST, WS_PORT):
+        await asyncio.Future()  # run forever
+
+
+def start_ws_server():
+    global _ws_loop
+    _ws_loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(_ws_loop)
+    _ws_loop.run_until_complete(_ws_server())
+
+
+def ws_broadcast(payload: dict):
+    if not _ws_clients or _ws_loop is None:
+        return
+
+    msg = json.dumps(payload, separators=(",", ":"))
+
+    def _send():
+        for ws in list(_ws_clients):
+            asyncio.create_task(ws.send(msg))
+
+    _ws_loop.call_soon_threadsafe(_send)
 
 
 # ---------------------------------------------------------------------
@@ -239,36 +288,37 @@ def main() -> None:
 
     locked = False
     readout_idx = 0
+    last_rendered: list[str] | None = None
+
+    # Start WebSocket server inside dashboard
+    threading.Thread(target=start_ws_server, daemon=True).start()
 
     while True:
         locked, readout_idx = pump_events(locked, readout_idx, len(READOUTS))
         prefix = "* " if locked else ""
-        header_lines = list(header_readout(prefix=prefix))
-        baseline = render_locked_lines(screen, font, header_lines)
-        clear_scroll_area(screen, baseline)
+
+        header = header_readout(prefix=prefix)
+        body = list(READOUTS[readout_idx]())
+        combined = header + body
+
+        payload = {
+            "header": header[0].upper(),
+            "body": [line.upper() for line in body],
+        }
 
         if locked:
-            lines = list(READOUTS[readout_idx]())
-            render_locked_lines(screen, font, header_lines + lines)
+            if combined != last_rendered:
+                render_panel(screen, font, header, body)
+                ws_broadcast(payload)
+                last_rendered = combined
             time.sleep(LOCKED_REFRESH_S)
             continue
 
-        for readout_fn in READOUTS:
-            locked, readout_idx = pump_events(locked, readout_idx, len(READOUTS))
-            prefix = "* " if locked else ""
-            header_lines = list(header_readout(prefix=prefix))
-            baseline = render_locked_lines(screen, font, header_lines)
-            clear_scroll_area(screen, baseline)
+        render_tty(screen, font, header, body, clock)
+        ws_broadcast(payload)
 
-            lines = list(readout_fn())
-            scroll_text(screen, font, lines, baseline, clock)
-
-            payload = {
-                "header": header_lines[0].upper(),
-                "body": [line.upper() for line in lines],
-            }
-            create_event("DASHBOARD_READOUT", payload)
-            time.sleep(READOUT_DELAY)
+        time.sleep(READOUT_DELAY)
+        readout_idx = (readout_idx + 1) % len(READOUTS)
 
 
 # ---------------------------------------------------------------------

@@ -45,7 +45,7 @@ def gnss_data_readout() -> Generator[str, None, None]:
 
     for key in ["raw_zda", "raw_rmc", "raw_crw", "raw_crx", "raw_crz"]:
         if key in ag:
-            yield f"{key.upper()}: {str(ag[key])[:48]}"
+            yield f"{key.upper()}: {str(ag[key])[:38]}"
 
 
 # ---------------------------------------------------------------------
