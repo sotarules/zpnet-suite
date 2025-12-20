@@ -1,22 +1,12 @@
 """
-ZPNet Dashboard — X-Safe Event-Pump Hardened + Lock Mode Retrofit
-(v2025-12-19-retrofit)
+ZPNet Dashboard — PostgreSQL-Compliant Edition (v2025-12-19-psql)
 
-This is a minimal retrofit of the original dashboard:
-- All readouts preserved verbatim
-- All generator logic preserved
-- All TTY behavior preserved in unlocked mode
+Terminal-style real-time dashboard using pygame with dynamic readouts.
 
-New behavior:
-- Press L to toggle locked/unlocked
-- Locked mode:
-    * Prefixes title bar with "* "
-    * Displays a single readout
-    * No TTY scroll
-    * ~1 Hz refresh
-    * SPACE cycles readouts
-- Unlocked mode:
-    * Original behavior exactly
+Features:
+  • Locked/unlocked mode (L to toggle, SPACE to cycle in locked)
+  • Displays full system status from aggregated Postgres records
+  • Emits DASHBOARD_READOUT events for telemetry auditing
 
 Author: The Mule + GPT
 """
@@ -26,7 +16,7 @@ import signal
 import sys
 import time
 from collections.abc import Generator
-from pathlib import Path
+from typing import Callable
 
 import pygame
 
@@ -45,10 +35,10 @@ def handle_exit(signum: int | None = None, frame: object | None = None) -> None:
 signal.signal(signal.SIGINT, handle_exit)
 signal.signal(signal.SIGTERM, handle_exit)
 
+
 # ---------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------
-DB_PATH = Path("/home/mule/zpnet/zpnet.db")
 SCREEN_WIDTH, SCREEN_HEIGHT = 800, 480
 FONT_NAME = "IBM 3270"
 FONT_SIZE = 30
@@ -63,49 +53,39 @@ LOCKED_REFRESH_S = 1.0
 
 
 # ---------------------------------------------------------------------
-# Event Pump (single authoritative)
-# ---------------------------------------------------------------------
-def pump_events(locked: bool, readout_idx: int, readout_count: int) -> tuple[bool, int]:
-    """
-    Consume SDL events exactly once per frame.
-    Returns updated (locked, readout_idx).
-    """
-    for event in pygame.event.get():
-        if event.type == pygame.QUIT:
-            handle_exit()
-
-        if event.type == pygame.KEYDOWN:
-            if event.key == pygame.K_ESCAPE:
-                handle_exit()
-
-            if event.key == pygame.K_l:
-                locked = not locked
-
-            elif event.key == pygame.K_SPACE and locked:
-                readout_idx = (readout_idx + 1) % readout_count
-
-    return locked, readout_idx
-
-
-# ---------------------------------------------------------------------
-# Database Access (unchanged)
+# DB Helper
 # ---------------------------------------------------------------------
 def fetch_aggregate(name: str) -> dict:
     try:
-        with open_db(read_only=True) as conn:
+        with open_db(row_dict=True) as conn:
             cur = conn.cursor()
             cur.execute(
-                "SELECT payload FROM aggregates WHERE aggregate_type=?",
+                "SELECT payload FROM aggregates WHERE aggregate_type = %s",
                 (name,),
             )
             row = cur.fetchone()
-            return json.loads(row["payload"]) if row else {}
-    except Exception:
+
+        if not row or row["payload"] is None:
+            return {}
+
+        payload = row["payload"]
+
+        if isinstance(payload, dict):
+            return payload
+
+        if isinstance(payload, (str, bytes, bytearray)):
+            return json.loads(payload)
+
+        return {}
+
+    except Exception as e:
+        # Optional: log once while stabilizing
+        # logging.debug(f"[dashboard] fetch_aggregate({name}) failed: {e}")
         return {}
 
 
 # ---------------------------------------------------------------------
-# Health Combiner (unchanged)
+# Health Combiner
 # ---------------------------------------------------------------------
 def combine_health(states: list[str]) -> str:
     if not states:
@@ -118,21 +98,20 @@ def combine_health(states: list[str]) -> str:
 
 
 # ---------------------------------------------------------------------
-# Header (verbatim, with optional prefix)
+# Header (with optional prefix for LOCKED mode)
 # ---------------------------------------------------------------------
 def header_readout(prefix: str = "") -> Generator[str, None, None]:
     ag_net = fetch_aggregate("NETWORK_STATUS")
-    ssid = ag_net.get("ssid", "UNKNOWN")
-
     ag_bat = fetch_aggregate("BATTERY_STATE_OF_CHARGE")
     ag_env = fetch_aggregate("ENVIRONMENT_STATUS")
     ag_gnss = fetch_aggregate("GNSS_DATA")
-    ag_laser = fetch_aggregate("LASER_STATUS")
-    ag_sen = fetch_aggregate("SENSOR_SCAN")
+    ag_las = fetch_aggregate("LASER_STATUS")
     ag_pow = fetch_aggregate("POWER_STATUS")
+    ag_sen = fetch_aggregate("SENSOR_SCAN")
     ag_tee = fetch_aggregate("TEENSY_STATUS")
-    ag_pi = fetch_aggregate("RASPBERRY_PI_STATUS")
+    ag_pi  = fetch_aggregate("RASPBERRY_PI_STATUS")
 
+    ssid = ag_net.get("ssid", "UNKNOWN")
     batt = ag_bat.get("remaining_pct")
     batt_str = f"{batt:.1f}%" if batt is not None else "N/A"
 
@@ -141,7 +120,7 @@ def header_readout(prefix: str = "") -> Generator[str, None, None]:
         ag_bat.get("health_state"),
         ag_env.get("health_state"),
         ag_gnss.get("health_state"),
-        ag_laser.get("health_state"),
+        ag_las.get("health_state"),
         ag_pow.get("health_state"),
         ag_sen.get("health_state"),
         ag_tee.get("health_state"),
@@ -149,248 +128,36 @@ def header_readout(prefix: str = "") -> Generator[str, None, None]:
     ]
 
     overall = combine_health([h for h in healths if h])
-
     yield f"{prefix}NET: {ssid}  BAT: {batt_str}  SYS: {overall}"
     yield ""
 
+
 # ---------------------------------------------------------------------
-# Readouts
+# Typing
 # ---------------------------------------------------------------------
-def gnss_data_readout() -> Generator[str, None, None]:
-    """
-    GNSS data readout (GF-8802 authoritative snapshot).
-
-    This readout reflects the GNSS_DATA aggregate only.
-    GNSS_STATUS is intentionally not aggregated.
-    """
-    ag = fetch_aggregate("GNSS_DATA")
-    yield f"GNSS DATA: {ag.get('health_state', 'DOWN')}"
-
-    if not ag:
-        yield "GNSS DATA UNAVAILABLE."
-        return
-
-    # Canonical time truth
-    if "utc_datetime" in ag:
-        yield f"UTC: {ag.get('utc_datetime')}"
-    if "time_status" in ag:
-        yield f"TIME STATUS: {ag.get('time_status')}"
-    if "leap_seconds" in ag:
-        yield f"LEAP SECONDS: {ag.get('leap_seconds')}"
-    if "freq_mode" in ag:
-        yield f"FREQ MODE: {ag.get('freq_mode')}"
-
-    # Timing quality
-    if "pps_accuracy_ns" in ag:
-        try:
-            yield f"PPS ACCURACY: {float(ag.get('pps_accuracy_ns')):.2f} NS"
-        except Exception:
-            yield f"PPS ACCURACY: {ag.get('pps_accuracy_ns')} NS"
-
-    if "pps_timing_error_ns" in ag:
-        try:
-            yield f"PPS ERROR: {int(ag.get('pps_timing_error_ns'))} NS"
-        except Exception:
-            yield f"PPS ERROR: {ag.get('pps_timing_error_ns')} NS"
-
-    if "clock_drift_ppb" in ag:
-        try:
-            yield f"CLOCK DRIFT: {float(ag.get('clock_drift_ppb')):.3f} PPB"
-        except Exception:
-            yield f"CLOCK DRIFT: {ag.get('clock_drift_ppb')} PPB"
-
-    if "temperature_c" in ag:
-        try:
-            yield f"OSC TEMP: {float(ag.get('temperature_c')):.2f} C"
-        except Exception:
-            yield f"OSC TEMP: {ag.get('temperature_c')} C"
-
-    # Location is contextual (not primary truth for timing)
-    if "latitude_deg" in ag and "longitude_deg" in ag:
-        try:
-            lat = float(ag.get("latitude_deg"))
-            lon = float(ag.get("longitude_deg"))
-            yield f"LAT/LON: {lat:.6f}, {lon:.6f}"
-        except Exception:
-            yield f"LAT/LON: {ag.get('latitude_deg')}, {ag.get('longitude_deg')}"
-
-    # Raw sentences (short, for audit/debug)
-    if "raw_zda" in ag:
-        yield f"{str(ag.get('raw_zda'))[:48]}"
-    if "raw_rmc" in ag:
-        yield f"{str(ag.get('raw_rmc'))[:48]}"
-    if "raw_crw" in ag:
-        yield f"{str(ag.get('raw_crw'))[:48]}"
-    if "raw_crx" in ag:
-        yield f"{str(ag.get('raw_crx'))[:48]}"
-    if "raw_crz" in ag:
-        yield f"{str(ag.get('raw_crz'))[:48]}"
-
-
-def laser_status_readout() -> Generator[str, None, None]:
-    ag = fetch_aggregate("LASER_STATUS")
-    yield f"LASER STATUS: {ag.get('health_state', 'DOWN')}"
-
-    if not ag or not ag.get("device_present"):
-        yield "LASER CONTROLLER UNAVAILABLE."
-        return
-
-    yield f"I2C ADDRESS: {ag.get('i2c_address', 'UNKNOWN')}"
-    yield f"SYSTEM ENABLED: {'YES' if ag.get('sys_enabled') else 'NO'}"
-    yield f"ID1 ENABLED: {'YES' if ag.get('id1_enabled') else 'NO'}"
-    yield f"MODE: {ag.get('id1_mode', 'UNKNOWN')}"
-    yield f"CURRENT CODE: {ag.get('id1_current_code', 0)}"
-
-    if "laser_enabled" in ag:
-        yield f"LASER ENABLED: {'YES' if ag.get('laser_enabled') else 'NO'}"
-    else:
-        yield "LASER ENABLED: UNKNOWN"
-
-
-def environment_status_readout() -> Generator[str, None, None]:
-    ag = fetch_aggregate("ENVIRONMENT_STATUS")
-    yield f"ENVIRONMENT: {ag.get('health_state', 'DOWN')}"
-
-    if not ag or not ag.get("sensor_present"):
-        yield "ENV SENSOR UNAVAILABLE."
-        return
-
-    yield f"TEMPERATURE: {ag.get('temperature_c', 0):.2f} C"
-    yield f"HUMIDITY: {ag.get('humidity_pct', 0):.2f} %"
-    yield f"PRESSURE: {ag.get('pressure_hpa', 0):.2f} HPA"
-    yield f"ALTITUDE: {ag.get('altitude_m', 0):.1f} M"
-
-
-def sensor_scan_readout() -> Generator[str, None, None]:
-    ag = fetch_aggregate("SENSOR_SCAN")
-    yield f"SENSOR SCAN: {ag.get('health_state', 'DOWN')}"
-    for k, v in ag.items():
-        if isinstance(v, str) and k != "health_state":
-            yield f"{k.upper()}: {v.upper()}"
-
-
-def battery_status_readout() -> Generator[str, None, None]:
-    ag = fetch_aggregate("BATTERY_STATE_OF_CHARGE")
-    yield f"BATTERY STATUS: {ag.get('health_state', 'DOWN')}"
-    if not ag:
-        yield "BATTERY DATA UNAVAILABLE."
-        return
-
-    tte_val = ag.get("tte_minutes", 0)
-    if isinstance(tte_val, float) and (tte_val == float("inf") or tte_val > 1e8):
-        yield "TIME-TO-EMPTY: ∞ (BATTERY FULL)"
-    else:
-        tte = int(tte_val)
-        h, m = divmod(tte, 60)
-        yield f"TIME-TO-EMPTY: {h}H {m}M."
-
-    yield f"REMAINING PERCENT: {ag.get('remaining_pct', 0):.1f}%"
-    yield f"WH USED SINCE RECHARGE: {ag.get('wh_used_since_recharge', 0):.2f}"
-    yield f"WH REMAINING EST: {ag.get('wh_remaining_estimate', 0):.2f}"
-
-
-def power_status_readout() -> Generator[str, None, None]:
-    ag = fetch_aggregate("POWER_STATUS")
-    yield f"POWER STATUS: {ag.get('health_state', 'DOWN')}"
-    if not ag or "sensors" not in ag:
-        yield "POWER DATA UNAVAILABLE."
-        return
-
-    load_total_w = 0.0
-    battery_power_w = None
-    for s in ag["sensors"]:
-        label = s.get("label", "UNKNOWN")
-        v = s.get("voltage_v", 0.0)
-        i = s.get("current_ma", 0.0)
-        p = s.get("power_w", 0.0)
-        yield f"{label.upper():<14}  {v:>6.3f} V  {i:>7.1f} mA  {p:>6.3f} W"
-        if label.lower() == "battery":
-            battery_power_w = p
-        else:
-            load_total_w += p
-
-    yield f"TOTAL LOAD POWER: {load_total_w:.3f} W"
-
-    if battery_power_w and battery_power_w > 0:
-        efficiency = (load_total_w / battery_power_w) * 100.0
-        yield f"EFFICIENCY: {efficiency:.1f} %"
-
-
-def network_status_readout() -> Generator[str, None, None]:
-    ag = fetch_aggregate("NETWORK_STATUS")
-    yield f"NETWORK STATUS: {ag.get('health_state', 'DOWN')}"
-    if not ag:
-        yield "NETWORK DATA UNAVAILABLE."
-        return
-    yield f"SERVER HOST: sota.ddns.net"
-    yield f"LOCAL IP: {ag.get('local_ip', '0.0.0.0')}"
-    yield f"SSID: {ag.get('ssid', 'UNKNOWN')}"
-    yield f"PING: {ag.get('ping_ms', 0):.1f} MS"
-    yield f"DOWNLOAD: {ag.get('download_mbps', 0):.2f} MBPS"
-    yield f"UPLOAD: {ag.get('upload_mbps', 0):.2f} MBPS"
-
-
-def teensy_status_readout() -> Generator[str, None, None]:
-    ag = fetch_aggregate("TEENSY_STATUS")
-    yield f"TEENSY STATUS: {ag.get('health_state', 'DOWN')}"
-    if not ag:
-        yield "TEENSY DATA UNAVAILABLE."
-        return
-    yield f"FW: {ag.get('fw_version', 'UNKNOWN')}"
-    yield f"CPU TEMP: {ag.get('cpu_temp_c', 0):.1f} C"
-    yield f"VCC: {ag.get('vcc_v', 0):.2f} V"
-    yield f"FREE HEAP: {ag.get('free_heap_bytes', 0) / 1024:.1f} KB"
-
-
-def raspberry_pi_status_readout() -> Generator[str, None, None]:
-    ag = fetch_aggregate("RASPBERRY_PI_STATUS")
-    yield f"RASPBERRY PI STATUS: {ag.get('health_state', 'DOWN')}"
-    if not ag:
-        yield "RASPBERRY PI DATA UNAVAILABLE."
-        return
-
-    yield f"DEVICE: {ag.get('device_name', 'UNKNOWN')}"
-    yield f"CPU TEMP: {ag.get('cpu_temp_c', 0):.1f} C"
-    yield (
-        f"LOAD (1/5/15): "
-        f"{ag.get('load_1m', 0):.2f} / "
-        f"{ag.get('load_5m', 0):.2f} / "
-        f"{ag.get('load_15m', 0):.2f}"
-    )
-    yield f"UPTIME: {ag.get('uptime_s', 0) / 3600:.2f} H"
-
-    mem = ag.get("memory", {})
-    yield (
-        f"MEM USED: {mem.get('used_mb', 0):.0f} / "
-        f"{mem.get('total_mb', 0):.0f} MB "
-        f"({mem.get('percent', 0):.1f}%)"
-    )
-
-    disk = ag.get("disk", {})
-    yield (
-        f"DISK USED: {disk.get('used_gb', 0):.2f} / "
-        f"{disk.get('total_gb', 0):.2f} GB "
-        f"({disk.get('percent', 0):.1f}%)"
-    )
-
-    uv = ag.get("undervoltage_flags", {})
-    now_uv = uv.get("currently_undervolted")
-    past_uv = uv.get("previously_undervolted")
-
-    if now_uv is True:
-        yield "UNDERVOLTAGE: ACTIVE"
-    elif past_uv is True:
-        yield "UNDERVOLTAGE: RECOVERED"
-    elif now_uv is False and past_uv is False:
-        yield "UNDERVOLTAGE: NONE"
-    else:
-        yield "UNDERVOLTAGE: UNKNOWN"
+Readout = Generator[str, None, None]
 
 
 # ---------------------------------------------------------------------
-# Readout Registry (unchanged order)
+# Import your individual readouts here
 # ---------------------------------------------------------------------
-READOUTS = [
+from zpnet.dashboard.readout_blocks import (
+    gnss_data_readout,
+    laser_status_readout,
+    environment_status_readout,
+    sensor_scan_readout,
+    battery_status_readout,
+    power_status_readout,
+    network_status_readout,
+    teensy_status_readout,
+    raspberry_pi_status_readout,
+)
+
+
+# ---------------------------------------------------------------------
+# Registry (order defines display sequence)
+# ---------------------------------------------------------------------
+READOUTS: list[Callable[[], Readout]] = [
     gnss_data_readout,
     laser_status_readout,
     environment_status_readout,
@@ -402,9 +169,25 @@ READOUTS = [
     raspberry_pi_status_readout,
 ]
 
+# ---------------------------------------------------------------------
+# SDL Event Pump
+# ---------------------------------------------------------------------
+def pump_events(locked: bool, readout_idx: int, readout_count: int) -> tuple[bool, int]:
+    for event in pygame.event.get():
+        if event.type == pygame.QUIT:
+            handle_exit()
+        if event.type == pygame.KEYDOWN:
+            if event.key == pygame.K_ESCAPE:
+                handle_exit()
+            elif event.key == pygame.K_l:
+                locked = not locked
+            elif event.key == pygame.K_SPACE and locked:
+                readout_idx = (readout_idx + 1) % readout_count
+    return locked, readout_idx
+
 
 # ---------------------------------------------------------------------
-# Rendering helpers (unchanged)
+# Rendering Helpers
 # ---------------------------------------------------------------------
 def render_locked_lines(screen, font, lines: list[str]) -> int:
     screen.fill(BG_COLOR)
@@ -431,25 +214,21 @@ def scroll_text(screen, font, lines: list[str], start_y: int, clock) -> None:
         text_so_far = ""
         for char in line.upper():
             text_so_far += char
-            clear_rect = pygame.Rect(
-                20, y, SCREEN_WIDTH - 40, FONT_SIZE + READOUT_PADDING * 2
-            )
+            clear_rect = pygame.Rect(20, y, SCREEN_WIDTH - 40, FONT_SIZE + READOUT_PADDING * 2)
             pygame.draw.rect(screen, BG_COLOR, clear_rect)
             surf = font.render(text_so_far, True, TEXT_COLOR)
             screen.blit(surf, (20, y))
             pygame.display.flip()
             clock.tick(SCROLL_SPEED)
-
         y += line_h
         if y + line_h > SCREEN_HEIGHT:
             screen.scroll(dy=-line_h)
             y -= line_h
-
         time.sleep(LINE_DELAY)
 
 
 # ---------------------------------------------------------------------
-# Main Loop (retrofitted)
+# Main Loop
 # ---------------------------------------------------------------------
 def main() -> None:
     pygame.init()
@@ -462,10 +241,7 @@ def main() -> None:
     readout_idx = 0
 
     while True:
-        locked, readout_idx = pump_events(
-            locked, readout_idx, len(READOUTS)
-        )
-
+        locked, readout_idx = pump_events(locked, readout_idx, len(READOUTS))
         prefix = "* " if locked else ""
         header_lines = list(header_readout(prefix=prefix))
         baseline = render_locked_lines(screen, font, header_lines)
@@ -477,12 +253,8 @@ def main() -> None:
             time.sleep(LOCKED_REFRESH_S)
             continue
 
-        # Unlocked: original behavior exactly
         for readout_fn in READOUTS:
-            locked, readout_idx = pump_events(
-                locked, readout_idx, len(READOUTS)
-            )
-
+            locked, readout_idx = pump_events(locked, readout_idx, len(READOUTS))
             prefix = "* " if locked else ""
             header_lines = list(header_readout(prefix=prefix))
             baseline = render_locked_lines(screen, font, header_lines)
@@ -496,9 +268,11 @@ def main() -> None:
                 "body": [line.upper() for line in lines],
             }
             create_event("DASHBOARD_READOUT", payload)
-
             time.sleep(READOUT_DELAY)
 
 
+# ---------------------------------------------------------------------
+# Entrypoint
+# ---------------------------------------------------------------------
 if __name__ == "__main__":
     main()

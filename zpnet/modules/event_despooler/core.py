@@ -1,71 +1,89 @@
 """
-ZPNet Event Despooler  —  Stellar-Compliant + Timeout-Hardened Revision (v2025-10-28b)
+ZPNet Event Despooler  —  Stellar-Compliant + Timeout-Hardened Revision
+(v2025-12-19-psql-fixed)
 
-Fetches unsent events from the local SQLite database and POSTs them to
-the remote ZPNet endpoint.  Marks events as despooled upon success.
-This revision imports HTTP timeout policy and host configuration from
-zpnet.shared.constants to ensure consistent, bounded network behavior.
+Fetches unsent events from PostgreSQL and POSTs them to the remote ZPNet endpoint.
+Marks events as despooled upon success.
 
-Author: The Mule
+Author: The Mule + GPT
 """
 
 import json
 import logging
-import sqlite3
 from datetime import datetime, timezone
 
 import requests
 
-from zpnet.shared.logger import setup_logging
 from zpnet.shared.constants import (
     ZPNET_REMOTE_HOST,
-    DB_PATH,
     HTTP_TIMEOUT,
 )
+from zpnet.shared.db import open_db
+
 
 # ---------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------
 BATCH_SIZE = 50  # max events per batch
 
+
+# ---------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------
+def serialize_event(row: dict) -> dict:
+    """
+    Convert a DB row into JSON-safe wire format.
+    """
+    return {
+        "id": row["id"],
+        "ts": row["ts"].isoformat().replace("+00:00", "Z")
+              if isinstance(row.get("ts"), datetime)
+              else row.get("ts"),
+        "event_type": row["event_type"],
+        "payload": row["payload"],
+    }
+
+
 # ---------------------------------------------------------------------
 # Database Operations
 # ---------------------------------------------------------------------
 def fetch_unsent_events(limit: int) -> list[dict]:
     """Return up to `limit` unsent events from zpnet_events."""
-    with sqlite3.connect(DB_PATH) as conn:
-        conn.row_factory = sqlite3.Row
+    with open_db(row_dict=True) as conn:
         cur = conn.cursor()
         cur.execute(
             """
-            SELECT id, timestamp, event_type, payload
+            SELECT id, ts, event_type, payload
             FROM zpnet_events
             WHERE despooled IS NULL
-            ORDER BY timestamp ASC
-            LIMIT ?
+            ORDER BY ts ASC
+            LIMIT %s
             """,
             (limit,),
         )
-        return [dict(row) for row in cur.fetchall()]
+        rows = cur.fetchall()
+
+    # Explicitly serialize rows for JSON transport
+    return [serialize_event(row) for row in rows]
 
 
 def mark_despooled(ids: list[int]) -> None:
-    """Mark given event IDs as successfully despooled."""
+    """Mark the given event IDs as successfully despooled."""
     if not ids:
         return
 
     ts = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
-    with sqlite3.connect(DB_PATH) as conn:
+
+    with open_db() as conn:
         cur = conn.cursor()
         cur.executemany(
             """
             UPDATE zpnet_events
-            SET despooled = ?
-            WHERE id = ?
+            SET despooled = %s
+            WHERE id = %s
             """,
             [(ts, event_id) for event_id in ids],
         )
-        conn.commit()
 
 
 # ---------------------------------------------------------------------
@@ -73,9 +91,7 @@ def mark_despooled(ids: list[int]) -> None:
 # ---------------------------------------------------------------------
 def run() -> None:
     """
-    Attempt to POST a batch of unsent events to the remote endpoint.
-    Each batch POST operation has a strict network timeout
-    (connect, read) from shared constants.
+    POST a batch of unsent events to the remote endpoint.
     """
     try:
         endpoint = f"http://{ZPNET_REMOTE_HOST}/api"
@@ -113,6 +129,6 @@ def run() -> None:
 # Bootstrap
 # ---------------------------------------------------------------------
 def bootstrap() -> None:
-    """Setup logging and execute run() once."""
+    from zpnet.shared.logger import setup_logging
     setup_logging()
     run()

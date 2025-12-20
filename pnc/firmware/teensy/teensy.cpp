@@ -15,6 +15,7 @@
 #include <Wire.h>
 #include <malloc.h>
 #include <string.h>
+#include <ADC.h>
 
 // --------------------------------------------------------------
 // Version (identity only; surfaced via TEENSY_STATUS)
@@ -65,6 +66,27 @@ static inline float cpuTempC() {
 #else
   return 0.0f;
 #endif
+}
+
+static ADC* adc = new ADC();
+
+static inline float readVrefVolts() {
+  // Configure ADC0 (Teensy 4.x)
+  adc->adc0->setAveraging(16);
+  adc->adc0->setResolution(12);
+
+  // Read internal 1.2V reference (VREF Sense High)
+  uint16_t raw = adc->adc0->analogRead(ADC_INTERNAL_SOURCE::VREFSH);
+
+  if (raw == 0) {
+    return 0.0f;
+  }
+
+  const float VREF_INTERNAL = 1.2f;   // volts (nominal)
+  const float ADC_MAX = 4095.0f;       // 12-bit ADC
+
+  float vref = VREF_INTERNAL / (raw / ADC_MAX);
+  return vref;
 }
 
 static inline uint32_t freeHeapBytes() {
@@ -275,6 +297,7 @@ static String buildTeensyStatusBody() {
   b += "\"fw_version\":\""; b += FW_VERSION; b += "\"";
   b += ",\"millis\":"; b += millis();
   b += ",\"cpu_temp_c\":"; b += cpuTempC();
+  b += ",\"vref_v\":"; b += readVrefVolts();
   b += ",\"free_heap_bytes\":"; b += freeHeapBytes();
   b += ",\"laser_enabled\":"; b += (ldOn ? "true" : "false");
   return b;
@@ -282,39 +305,38 @@ static String buildTeensyStatusBody() {
 
 static String buildGnssStatusBody() {
   String b;
-  b += "\"millis\":"; b += millis();
   if (last_sentence[0]) {
-    b += ",\"raw_sentence\":\""; b += jsonEscape(last_sentence); b += "\"";
+    b += "\"raw_sentence\":\"";
+    b += jsonEscape(last_sentence);
+    b += "\"";
   }
   return b;
 }
 
 static String buildGnssDataBody() {
   String b;
-  b += "\"millis\":"; b += millis();
 
   if (!isnan(latitude_deg) && !isnan(longitude_deg)) {
-    b += ",\"latitude_deg\":"; b += latitude_deg;
+    b += "\"latitude_deg\":"; b += latitude_deg;
     b += ",\"longitude_deg\":"; b += longitude_deg;
   }
 
-  // Time anchor (compact, useful)
   if (last_zda[0]) {
-    b += ",\"raw_zda\":\"";
+    if (b.length()) b += ",";
+    b += "\"raw_zda\":\"";
     b += jsonEscape(last_zda);
     b += "\"";
   }
 
-  // Optional: position validity / course / speed
   if (last_rmc[0]) {
-    b += ",\"raw_rmc\":\"";
+    if (b.length()) b += ",";
+    b += "\"raw_rmc\":\"";
     b += jsonEscape(last_rmc);
     b += "\"";
   }
 
   return b;
 }
-
 
 // --------------------------------------------------------------
 // Command parsing and execution

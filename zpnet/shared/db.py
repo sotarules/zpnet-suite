@@ -1,89 +1,67 @@
 """
-ZPNet Shared SQLite Helper
+ZPNet Shared Database Helper — PostgreSQL Backend (psycopg v3)
 
-Provides a centralized, policy-driven SQLite connection factory.
-Ensures:
-  • WAL mode enabled (persistent)
-  • Busy timeout applied (per-connection)
-  • Consistent row_factory
-  • Dashboard-safe read behavior
+This module centralizes all database access policy for ZPNet.
+
+Design principles:
+  • Short-lived connections
+  • Explicit transaction boundaries
+  • Multi-writer safe (PostgreSQL)
+  • No global locks
+  • No retry loops
+  • Fail fast, fail loud
+
+Payload semantics:
+  • JSON payloads are stored as TEXT
+  • Interpretation happens at higher layers
 
 Author: The Mule + GPT
 """
 
-import sqlite3
+from contextlib import contextmanager
+import os
 
-from zpnet.shared.constants import DB_PATH
-
-# ---------------------------------------------------------------------
-# Configuration (tuned for ZPNet workload)
-# ---------------------------------------------------------------------
-BUSY_TIMEOUT_MS = 5000          # wait up to 5s for writers
-CONNECT_TIMEOUT_S = 5.0         # Python-level timeout
-SYNCHRONOUS_MODE = "NORMAL"     # balance durability vs performance
+import psycopg
+from psycopg.rows import dict_row
 
 
 # ---------------------------------------------------------------------
-# One-time database initialization
+# Connection configuration
 # ---------------------------------------------------------------------
-def initialize_database() -> None:
+
+# Prefer environment override, fall back to local defaults.
+PG_DSN = os.environ.get(
+    "ZPNET_PG_DSN",
+    "host=127.0.0.1 dbname=zpnet user=zpnet password=mule",
+)
+
+
+# ---------------------------------------------------------------------
+# Connection helper
+# ---------------------------------------------------------------------
+
+@contextmanager
+def open_db(*, row_dict: bool = False):
     """
-    Apply persistent SQLite settings and ensure core tables exist.
-    Safe to call multiple times.
-    """
-    with sqlite3.connect(DB_PATH) as conn:
-        conn.execute("PRAGMA journal_mode = WAL;")
-        conn.execute("PRAGMA synchronous = NORMAL;")
-
-        # -----------------------------------------------------------------
-        # Config table (for remote-controllable UI / runtime behavior)
-        #
-        # Keyed by config_key (e.g., "DASHBOARD") and stores JSON payload.
-        # Timestamp is UTC ISO8601 with trailing "Z".
-        # -----------------------------------------------------------------
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS config (
-                config_key TEXT PRIMARY KEY,
-                timestamp  TEXT NOT NULL,
-                payload    TEXT NOT NULL
-            )
-            """
-        )
-
-
-# ---------------------------------------------------------------------
-# Connection factory
-# ---------------------------------------------------------------------
-def open_db(*, read_only: bool = False) -> sqlite3.Connection:
-    """
-    Open a SQLite connection with ZPNet policy applied.
+    Open a PostgreSQL connection with ZPNet policy.
 
     Args:
-        read_only (bool): If True, open in read-only mode.
-                          (Best for dashboards.)
+        row_dict (bool): If True, rows are returned as dicts
+                         (similar to sqlite3.Row).
 
-    Returns:
-        sqlite3.Connection
+    Yields:
+        psycopg.Connection
     """
-    if read_only:
-        uri = f"file:{DB_PATH}?mode=ro"
-        conn = sqlite3.connect(
-            uri,
-            uri=True,
-            timeout=CONNECT_TIMEOUT_S,
-            isolation_level=None,   # autocommit
-        )
-    else:
-        conn = sqlite3.connect(
-            DB_PATH,
-            timeout=CONNECT_TIMEOUT_S,
-        )
+    conn = psycopg.connect(
+        PG_DSN,
+        row_factory=dict_row if row_dict else None,
+    )
 
-    conn.row_factory = sqlite3.Row
-
-    # Per-connection pragmas (NOT persistent)
-    conn.execute(f"PRAGMA busy_timeout = {BUSY_TIMEOUT_MS};")
-    conn.execute(f"PRAGMA synchronous = {SYNCHRONOUS_MODE};")
-
-    return conn
+    try:
+        yield conn
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()

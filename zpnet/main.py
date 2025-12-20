@@ -1,8 +1,8 @@
 """
-ZPNet Main Scheduler Daemon
+ZPNet Main Scheduler Daemon — PostgreSQL Edition
 
 Dynamically executes modules according to the polling schedule defined
-in the local SQLite database. Each module run is logged into run_history.
+in the local PostgreSQL database. Each module run is logged into run_history.
 All timestamps are UTC-aware.
 
 Author: The Mule
@@ -15,7 +15,7 @@ import sys
 import time
 from datetime import datetime, timedelta, timezone
 
-from zpnet.shared.db import initialize_database, open_db
+from zpnet.shared.db import open_db
 from zpnet.shared.logger import setup_logging
 from zpnet.shared.constants import TICK_INTERVAL_S
 from zpnet.shared.startup import run_startup
@@ -57,12 +57,12 @@ def run_module(module_name: str) -> None:
     duration_ms = int((time.monotonic() - start_monotonic) * 1000)
 
     try:
-        with open_db(read_only=False) as conn:
+        with open_db() as conn:
             cur = conn.cursor()
             cur.execute(
                 """
                 INSERT INTO run_history (module_name, start_ts, end_ts, duration_ms, status)
-                VALUES (?, ?, ?, ?, ?)
+                VALUES (%s, %s, %s, %s, %s)
                 """,
                 (
                     module_name,
@@ -72,7 +72,6 @@ def run_module(module_name: str) -> None:
                     status,
                 ),
             )
-            conn.commit()
     except Exception as e:
         logging.warning(f"⚠️ [main] failed to log run_history for {module_name}: {e}")
 
@@ -84,7 +83,7 @@ def run_all() -> None:
     """Run all modules unconditionally."""
     logging.info("📅 [main] unconditionally running all modules")
 
-    with open_db(read_only=False) as conn:
+    with open_db() as conn:
         cur = conn.cursor()
         cur.execute("SELECT id, module_name FROM schedule")
         jobs = cur.fetchall()
@@ -105,13 +104,13 @@ def scheduler_loop() -> None:
         now_iso = now_ts.isoformat().replace("+00:00", "Z")
 
         try:
-            with open_db(read_only=False) as conn:
+            with open_db() as conn:
                 cur = conn.cursor()
                 cur.execute(
                     """
                     SELECT id, module_name, frequency_sec
                     FROM schedule
-                    WHERE next_run_ts IS NULL OR next_run_ts <= ?
+                    WHERE next_run_ts IS NULL OR next_run_ts <= %s
                     """,
                     (now_iso,),
                 )
@@ -124,8 +123,8 @@ def scheduler_loop() -> None:
                     cur.execute(
                         """
                         UPDATE schedule
-                        SET last_run_ts = ?, next_run_ts = ?
-                        WHERE id = ?
+                        SET last_run_ts = %s, next_run_ts = %s
+                        WHERE id = %s
                         """,
                         (
                             now_iso,
@@ -134,10 +133,8 @@ def scheduler_loop() -> None:
                         ),
                     )
 
-                conn.commit()
-
         except Exception as e:
-            logging.warning(f"⚠️ main.py database poll failed: {e}")
+            logging.warning(f"⚠️ [main] database poll failed: {e}")
 
         time.sleep(TICK_INTERVAL_S)
 
@@ -152,9 +149,6 @@ def bootstrap() -> None:
     signal.signal(signal.SIGINT, handle_sigterm)
 
     try:
-        # Ensure persistent SQLite policy is applied (WAL + synchronous)
-        initialize_database()
-
         run_startup()
         run_all()
         scheduler_loop()
