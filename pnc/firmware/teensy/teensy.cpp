@@ -1,12 +1,12 @@
 /*
   ZPNet Teensy Telemetry Firmware — Slave Command Appliance + Event Bus
+  Event-only edition (no imperative replies)
 
   Invariants:
     • Teensy emits NOTHING unless explicitly commanded.
-    • ACTION commands return ACK/ERR only; truth is delivered via EventBus.
-    • QUERY commands (with ?) return immediate snapshots.
-    • Routine status commands enqueue events and return ACK.
-    • Device ingestion is eager; queries are cheap; events are rare.
+    • Commands enqueue events; ACK confirms receipt only.
+    • All truth leaves via the event queue.
+    • Exactly one serial consumer is assumed.
 
   Author: The Mule + GPT
 */
@@ -18,9 +18,9 @@
 #include <ADC.h>
 
 // --------------------------------------------------------------
-// Version (identity only; surfaced via TEENSY_STATUS)
+// Version
 // --------------------------------------------------------------
-static const char* FW_VERSION = "teensy-telemetry-4.2.0";
+static const char* FW_VERSION = "teensy-telemetry-4.3.0";
 
 // --------------------------------------------------------------
 // GNSS serial config
@@ -34,8 +34,12 @@ static const unsigned long GNSS_SILENCE_FLUSH_MS = 50;
 // --------------------------------------------------------------
 static const int EN_PIN    = 20;
 static const int LD_ON_PIN = 21;
-
 static bool ldOn = false;
+
+// --------------------------------------------------------------
+// Photodiode (LMH7220 OUT Q)
+// --------------------------------------------------------------
+static const int PHOTODIODE_PIN = 14;
 
 // --------------------------------------------------------------
 // GNSS rolling state
@@ -71,22 +75,13 @@ static inline float cpuTempC() {
 static ADC* adc = new ADC();
 
 static inline float readVrefVolts() {
-  // Configure ADC0 (Teensy 4.x)
   adc->adc0->setAveraging(16);
   adc->adc0->setResolution(12);
-
-  // Read internal 1.2V reference (VREF Sense High)
   uint16_t raw = adc->adc0->analogRead(ADC_INTERNAL_SOURCE::VREFSH);
-
-  if (raw == 0) {
-    return 0.0f;
-  }
-
-  const float VREF_INTERNAL = 1.2f;   // volts (nominal)
-  const float ADC_MAX = 4095.0f;       // 12-bit ADC
-
-  float vref = VREF_INTERNAL / (raw / ADC_MAX);
-  return vref;
+  if (raw == 0) return 0.0f;
+  const float VREF_INTERNAL = 1.2f;
+  const float ADC_MAX = 4095.0f;
+  return VREF_INTERNAL / (raw / ADC_MAX);
 }
 
 static inline uint32_t freeHeapBytes() {
@@ -96,10 +91,7 @@ static inline uint32_t freeHeapBytes() {
 
 static inline void safeCopy(char* dst, size_t dst_sz, const char* src) {
   if (!dst || dst_sz == 0) return;
-  if (!src) {
-    dst[0] = '\0';
-    return;
-  }
+  if (!src) { dst[0] = '\0'; return; }
   size_t n = strnlen(src, dst_sz - 1);
   memcpy(dst, src, n);
   dst[n] = '\0';
@@ -181,7 +173,7 @@ static void parseRMC(const char* l) {
 }
 
 // --------------------------------------------------------------
-// GNSS ingestion (eager, silent)
+// GNSS ingestion
 // --------------------------------------------------------------
 static char lineBuf[GNSS_LINE_MAX];
 static size_t lineLen = 0;
@@ -231,7 +223,7 @@ static void pollGnssSerial() {
 }
 
 // --------------------------------------------------------------
-// Event Bus (bounded ring buffer)
+// Event Bus
 // --------------------------------------------------------------
 static const size_t EVT_MAX = 32;
 static const size_t EVT_TYPE_MAX = 32;
@@ -250,10 +242,7 @@ static size_t evt_count = 0;
 static uint32_t evt_dropped = 0;
 
 static void enqueueEvent(const char* type, const String& body) {
-  if (evt_count >= EVT_MAX) {
-    evt_dropped++;
-    return;
-  }
+  if (evt_count >= EVT_MAX) { evt_dropped++; return; }
   EventItem& e = evtq[evt_head];
   e.ms = millis();
   safeCopy(e.type, sizeof(e.type), type);
@@ -338,8 +327,16 @@ static String buildGnssDataBody() {
   return b;
 }
 
+static String buildPhotodiodeStatusBody() {
+  int level = digitalRead(PHOTODIODE_PIN);
+  String b;
+  b += "\"level\":"; b += level;
+  b += ",\"millis\":"; b += millis();
+  return b;
+}
+
 // --------------------------------------------------------------
-// Command parsing and execution
+// Command parsing and execution (event-only)
 // --------------------------------------------------------------
 static bool extractCmd(const char* line, char* out, size_t out_sz) {
   const char* p = strstr(line, "\"cmd\"");
@@ -366,38 +363,30 @@ static void execCommand(const char* line) {
     return;
   }
 
-  // -------- Immediate QUERY responses --------
-  if (strcmp(cmd, "TEENSY.STATUS?") == 0) {
-    emitJson("TEENSY_STATUS", buildTeensyStatusBody());
-    return;
-  }
-  if (strcmp(cmd, "GNSS.STATUS?") == 0) {
-    emitJson("GNSS_STATUS", buildGnssStatusBody());
-    return;
-  }
-  if (strcmp(cmd, "GNSS.DATA?") == 0) {
-    emitJson("GNSS_DATA", buildGnssDataBody());
-    return;
-  }
-
-  // -------- Event-generating commands --------
   if (strcmp(cmd, "TEENSY.STATUS") == 0) {
     enqueueEvent("TEENSY_STATUS", buildTeensyStatusBody());
     emitAck(cmd);
     return;
   }
+
   if (strcmp(cmd, "GNSS.STATUS") == 0) {
     enqueueEvent("GNSS_STATUS", buildGnssStatusBody());
     emitAck(cmd);
     return;
   }
+
   if (strcmp(cmd, "GNSS.DATA") == 0) {
     enqueueEvent("GNSS_DATA", buildGnssDataBody());
     emitAck(cmd);
     return;
   }
 
-  // -------- Laser actions --------
+  if (strcmp(cmd, "PHOTODIODE.STATUS") == 0) {
+    enqueueEvent("PHOTODIODE_STATUS", buildPhotodiodeStatusBody());
+    emitAck(cmd);
+    return;
+  }
+
   if (strcmp(cmd, "LASER.ON") == 0) {
     digitalWrite(EN_PIN, HIGH);
     digitalWrite(LD_ON_PIN, HIGH);
@@ -436,6 +425,8 @@ void setup() {
   pinMode(LD_ON_PIN, OUTPUT);
   digitalWrite(EN_PIN, LOW);
   digitalWrite(LD_ON_PIN, LOW);
+
+  pinMode(PHOTODIODE_PIN, INPUT);
 
   enqueueEvent("BOOT", "\"status\":\"READY\"");
 }
