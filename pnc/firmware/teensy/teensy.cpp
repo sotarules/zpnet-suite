@@ -4,7 +4,9 @@
 
   Invariants:
     • Teensy emits NOTHING unless explicitly commanded.
-    • Commands enqueue events; ACK confirms receipt only.
+    • Serial output occurs ONLY during EVENTS.GET (explicit drain).
+    • Routine query commands enqueue data events only (no ACK noise).
+    • State-changing commands enqueue ACK events via the event queue.
     • All truth leaves via the event queue.
     • Exactly one serial consumer is assumed.
 
@@ -20,7 +22,7 @@
 // --------------------------------------------------------------
 // Version
 // --------------------------------------------------------------
-static const char* FW_VERSION = "teensy-telemetry-4.3.0";
+static const char* FW_VERSION = "teensy-telemetry-4.3.2";
 
 // --------------------------------------------------------------
 // GNSS serial config
@@ -122,7 +124,12 @@ static String jsonEscape(const char* s) {
 }
 
 // --------------------------------------------------------------
-// JSON emit helpers
+// Forward declarations
+// --------------------------------------------------------------
+static void enqueueEvent(const char* type, const String& body);
+
+// --------------------------------------------------------------
+// JSON emit helper (ONLY used during explicit queue drain)
 // --------------------------------------------------------------
 static inline void emitJson(const char* type, const String& body) {
   Serial.print("{\"event_type\":\"");
@@ -135,15 +142,18 @@ static inline void emitJson(const char* type, const String& body) {
   Serial.println("}");
 }
 
-static inline void emitAck(const char* cmd) {
+// --------------------------------------------------------------
+// ACK/ERR are now EVENT-QUEUE ONLY (no direct Serial output)
+// --------------------------------------------------------------
+static inline void enqueueAckEvent(const char* cmd) {
   String b;
   b += "\"cmd\":\""; b += cmd; b += "\"";
   b += ",\"ok\":true";
   b += ",\"millis\":"; b += millis();
-  emitJson("ACK", b);
+  enqueueEvent("ACK", b);
 }
 
-static inline void emitErr(const char* cmd, const char* msg) {
+static inline void enqueueErrEvent(const char* cmd, const char* msg) {
   String b;
   b += "\"cmd\":\""; b += cmd; b += "\"";
   b += ",\"ok\":false";
@@ -151,7 +161,7 @@ static inline void emitErr(const char* cmd, const char* msg) {
   if (msg) {
     b += ",\"error\":\""; b += jsonEscape(msg); b += "\"";
   }
-  emitJson("ERR", b);
+  enqueueEvent("ERR", b);
 }
 
 // --------------------------------------------------------------
@@ -357,6 +367,17 @@ static String buildPhotodiodeCountBody() {
 }
 
 // --------------------------------------------------------------
+// Command classification
+// --------------------------------------------------------------
+static inline bool isStateChangingCommand(const char* cmd) {
+  return (
+    strcmp(cmd, "PHOTODIODE.CLEAR") == 0 ||
+    strcmp(cmd, "LASER.ON") == 0 ||
+    strcmp(cmd, "LASER.OFF") == 0
+  );
+}
+
+// --------------------------------------------------------------
 // Command parsing and execution (event-only)
 // --------------------------------------------------------------
 static bool extractCmd(const char* line, char* out, size_t out_sz) {
@@ -380,37 +401,33 @@ static bool extractCmd(const char* line, char* out, size_t out_sz) {
 static void execCommand(const char* line) {
   char cmd[64];
   if (!extractCmd(line, cmd, sizeof(cmd))) {
-    emitErr("UNKNOWN", "missing cmd");
+    // No serial output; queue error for visibility.
+    enqueueErrEvent("UNKNOWN", "missing cmd");
     return;
   }
 
   if (strcmp(cmd, "TEENSY.STATUS") == 0) {
     enqueueEvent("TEENSY_STATUS", buildTeensyStatusBody());
-    emitAck(cmd);
     return;
   }
 
   if (strcmp(cmd, "GNSS.STATUS") == 0) {
     enqueueEvent("GNSS_STATUS", buildGnssStatusBody());
-    emitAck(cmd);
     return;
   }
 
   if (strcmp(cmd, "GNSS.DATA") == 0) {
     enqueueEvent("GNSS_DATA", buildGnssDataBody());
-    emitAck(cmd);
     return;
   }
 
   if (strcmp(cmd, "PHOTODIODE.STATUS") == 0) {
     enqueueEvent("PHOTODIODE_STATUS", buildPhotodiodeStatusBody());
-    emitAck(cmd);
     return;
   }
 
   if (strcmp(cmd, "PHOTODIODE.COUNT") == 0) {
     enqueueEvent("PHOTODIODE_COUNT", buildPhotodiodeCountBody());
-    emitAck(cmd);
     return;
   }
 
@@ -418,7 +435,9 @@ static void execCommand(const char* line) {
     noInterrupts();
     photodiode_pulse_count = 0;
     interrupts();
-    emitAck(cmd);
+
+    // State-changing: queue ACK.
+    enqueueAckEvent(cmd);
     return;
   }
 
@@ -426,25 +445,29 @@ static void execCommand(const char* line) {
     digitalWrite(EN_PIN, HIGH);
     digitalWrite(LD_ON_PIN, HIGH);
     ldOn = true;
+
     enqueueEvent("LASER_STATE", "\"enabled\":true");
-    emitAck(cmd);
+    enqueueAckEvent(cmd); // State-changing: queue ACK.
     return;
   }
 
   if (strcmp(cmd, "LASER.OFF") == 0) {
     digitalWrite(LD_ON_PIN, LOW);
     ldOn = false;
+
     enqueueEvent("LASER_STATE", "\"enabled\":false");
-    emitAck(cmd);
+    enqueueAckEvent(cmd); // State-changing: queue ACK.
     return;
   }
 
   if (strcmp(cmd, "EVENTS.GET") == 0) {
+    // Explicit drain is the only time we talk on Serial.
     drainEventsNow();
     return;
   }
 
-  emitErr(cmd, "unknown command");
+  // Unknown command: queue error for visibility.
+  enqueueErrEvent(cmd, "unknown command");
 }
 
 // --------------------------------------------------------------
