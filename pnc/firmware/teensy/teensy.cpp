@@ -42,6 +42,15 @@ static bool ldOn = false;
 static const int PHOTODIODE_PIN = 14;
 
 // --------------------------------------------------------------
+// Photodiode interrupt counter (LMH7220 OUT Q)
+// --------------------------------------------------------------
+static volatile uint32_t photodiode_pulse_count = 0;
+
+void photodiodeISR() {
+  photodiode_pulse_count++;
+}
+
+// --------------------------------------------------------------
 // GNSS rolling state
 // --------------------------------------------------------------
 static unsigned long lastGnssByteMs = 0;
@@ -335,6 +344,19 @@ static String buildPhotodiodeStatusBody() {
   return b;
 }
 
+static String buildPhotodiodeCountBody() {
+  uint32_t count;
+  noInterrupts();
+  count = photodiode_pulse_count;
+  interrupts();
+
+  String b;
+  b += "\"count\":"; b += count;
+  b += ",\"millis\":"; b += millis();
+  return b;
+}
+
+
 // --------------------------------------------------------------
 // Command parsing and execution (event-only)
 // --------------------------------------------------------------
@@ -387,6 +409,20 @@ static void execCommand(const char* line) {
     return;
   }
 
+  if (strcmp(cmd, "PHOTODIODE.COUNT") == 0) {
+    enqueueEvent("PHOTODIODE_COUNT", buildPhotodiodeCountBody());
+    emitAck(cmd);
+    return;
+  }
+
+  if (strcmp(cmd, "PHOTODIODE.CLEAR") == 0) {
+    noInterrupts();
+    photodiode_pulse_count = 0;
+    interrupts();
+    emitAck(cmd);
+    return;
+  }
+
   if (strcmp(cmd, "LASER.ON") == 0) {
     digitalWrite(EN_PIN, HIGH);
     digitalWrite(LD_ON_PIN, HIGH);
@@ -426,7 +462,12 @@ void setup() {
   digitalWrite(EN_PIN, LOW);
   digitalWrite(LD_ON_PIN, LOW);
 
-  pinMode(PHOTODIODE_PIN, INPUT);
+  pinMode(PHOTODIODE_PIN, INPUT_PULLUP);
+  attachInterrupt(
+    digitalPinToInterrupt(PHOTODIODE_PIN),
+    photodiodeISR,
+    FALLING
+  );
 
   enqueueEvent("BOOT", "\"status\":\"READY\"");
 }
