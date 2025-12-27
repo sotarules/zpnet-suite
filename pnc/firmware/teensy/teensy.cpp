@@ -356,7 +356,6 @@ static String buildPhotodiodeCountBody() {
   return b;
 }
 
-
 // --------------------------------------------------------------
 // Command parsing and execution (event-only)
 // --------------------------------------------------------------
@@ -462,11 +461,15 @@ void setup() {
   digitalWrite(EN_PIN, LOW);
   digitalWrite(LD_ON_PIN, LOW);
 
-  pinMode(PHOTODIODE_PIN, INPUT_PULLUP);
+  // LMH7220 OUT Q drives this pin through external resistor.
+  // Do NOT enable internal pullups here.
+  pinMode(PHOTODIODE_PIN, INPUT);
+
+  // Use CHANGE to maximize chance of catching fast pulses.
   attachInterrupt(
     digitalPinToInterrupt(PHOTODIODE_PIN),
     photodiodeISR,
-    FALLING
+    CHANGE
   );
 
   enqueueEvent("BOOT", "\"status\":\"READY\"");
