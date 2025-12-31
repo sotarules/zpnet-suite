@@ -1,13 +1,15 @@
 """
-ZPNet Choosenet Network Healer — Stellar-Compliant + Constants-Integrated Revision (v2025-10-28c)
+ZPNet Choosenet Network Healer — Stellar-Compliant + Constants-Integrated Revision
+(v2025-12-29-gzip-aligned)
 
 Performs definitive network test (ZPNet REST API at sota.ddns.net).
 If test fails, invokes choosenet.sh healing script and retries until success.
 When choosenet.sh reports success, emits CHOOSENET_SUCCESS event containing
 the previous and new SSIDs.
 
-Now imports path and retry parameters from zpnet.shared.constants, ensuring
-all timing and network behavior are managed centrally.
+Note:
+  • Server-side gzip enforcement applies to requests with bodies (POST/PUT).
+  • This module uses a bodyless GET for its definitive test and remains unchanged.
 
 Author: The Mule
 """
@@ -20,7 +22,6 @@ import requests
 from zpnet.shared.logger import setup_logging
 from zpnet.shared.events import create_event
 from zpnet.shared.constants import (
-    DB_PATH,
     ZPNET_REMOTE_HOST,
     ZPNET_TEST_PATH,
     EXPECTED_TEST_STRING,
@@ -47,7 +48,12 @@ def get_ssid() -> str:
 
 
 def zpnet_definitive_test() -> bool:
-    """Check ZPNet API endpoint for definitive OK response."""
+    """
+    Check ZPNet API endpoint for definitive OK response.
+
+    This is a bodyless GET request and is not subject to gzip
+    request-body policy.
+    """
     try:
         url = f"http://{ZPNET_REMOTE_HOST}{ZPNET_TEST_PATH}"
         response = requests.get(url, timeout=HTTP_TIMEOUT)
@@ -66,12 +72,15 @@ def run_choosenet() -> tuple[bool, str]:
             text=True,
             timeout=30,
         )
-        stdout = result.stdout.strip()
-        stderr = result.stderr.strip()
+        stdout = (result.stdout or "").strip()
+        stderr = (result.stderr or "").strip()
+
         logging.info(f"[choosenet] script stdout: {stdout}")
         if stderr:
             logging.info(f"[choosenet] script stderr: {stderr}")
+
         return result.returncode == 0, stdout
+
     except Exception as e:
         logging.error(f"[choosenet] failed to invoke choosenet.sh: {e}")
         return False, str(e)
@@ -95,12 +104,16 @@ def run() -> None:
     while True:
         # Step 1 — definitive test
         if zpnet_definitive_test():
-            logging.info(f"✅ ZPNet definitive test passed. SSID {previous_ssid} is healthy.")
+            logging.info(
+                f"✅ ZPNet definitive test passed. SSID {previous_ssid} is healthy."
+            )
             previous_ssid = get_ssid()
             time.sleep(CHOOSENET_RETRY_INTERVAL_S)
             continue
 
-        logging.warning(f"🚨 ZPNet definitive test FAILED for SSID {previous_ssid}. Attempting recovery...")
+        logging.warning(
+            f"🚨 ZPNet definitive test FAILED for SSID {previous_ssid}. Attempting recovery..."
+        )
 
         # Step 2 — attempt healing
         success, output = run_choosenet()
@@ -110,12 +123,12 @@ def run() -> None:
             new_ssid = get_ssid()
             logging.info(f"🛠️ choosenet.sh reported success — SSID now '{new_ssid}'")
 
-            # Emit CHOOSENET_SUCCESS event
             payload = {
                 "previous_ssid": previous_ssid or "UNKNOWN",
                 "new_ssid": new_ssid or "UNKNOWN",
                 "script_output": output or "",
             }
+
             try:
                 create_event("CHOOSENET_SUCCESS", payload)
                 logging.info("📡 CHOOSENET_SUCCESS event emitted.")
@@ -123,6 +136,7 @@ def run() -> None:
                 logging.warning(f"⚠️ Failed to emit CHOOSENET_SUCCESS: {e}")
 
             previous_ssid = new_ssid
+
         else:
             logging.warning("💥 choosenet.sh failed — will retry regardless")
 

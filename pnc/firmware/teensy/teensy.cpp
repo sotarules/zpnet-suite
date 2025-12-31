@@ -1,5 +1,5 @@
 /*
-  ZPNet Teensy Telemetry Firmware — Slave Command Appliance + Event Bus
+  ZPNet Teensy Telemetry Firmware --- Slave Command Appliance + Event Bus
   Event-only edition (no imperative replies)
 
   Invariants:
@@ -9,6 +9,28 @@
     • State-changing commands enqueue ACK events via the event queue.
     • All truth leaves via the event queue.
     • Exactly one serial consumer is assumed.
+
+  Photodiode/TDM integration notes (2025-12-28):
+    The new UK photodiode path is a Tiny Device Module (TDM) that presents
+    two distinct signals to the Teensy:
+
+      1) Pin 14 --- fast digital edge suitable for interrupts (pulse counting)
+      2) Pin 15 --- analog voltage that remains present while the laser is on
+
+    The existing interrupt counter remains valuable and stays in place.
+
+    This revision adds:
+      • A dedicated analog pin (15) for photodiode amplitude / presence signal
+      • PHOTODIODE.STATUS payload now includes:
+          - edge_level (digital read of pin 14, best-effort snapshot)
+          - edge_pulse_count (latched, monotonic until cleared)
+          - analog_raw (ADC counts from pin 15)
+          - analog_v (derived voltage estimate using 3.3 V assumption)
+          - millis
+
+    Out of scope on purpose:
+      • Any inference of laser state from pin 15.
+        That belongs in later aggregation logic (LASER_STATUS / health layers).
 
   Author: The Mule + GPT
 */
@@ -22,7 +44,7 @@
 // --------------------------------------------------------------
 // Version
 // --------------------------------------------------------------
-static const char* FW_VERSION = "teensy-telemetry-4.3.2";
+static const char* FW_VERSION = "teensy-telemetry-4.3.4";
 
 // --------------------------------------------------------------
 // GNSS serial config
@@ -39,12 +61,17 @@ static const int LD_ON_PIN = 21;
 static bool ldOn = false;
 
 // --------------------------------------------------------------
-// Photodiode (LMH7220 OUT Q)
+// Photodiode pins (TDM: edge + analog)
 // --------------------------------------------------------------
-static const int PHOTODIODE_PIN = 14;
+//
+// Pin 14: fast digital edge (interrupt-capable). This is the pulse counter path.
+// Pin 15: analog voltage. This is the continuous ``laser present'' amplitude path.
+//
+static const int PHOTODIODE_EDGE_PIN   = 14;
+static const int PHOTODIODE_ANALOG_PIN = 15;
 
 // --------------------------------------------------------------
-// Photodiode interrupt counter (LMH7220 OUT Q)
+// Photodiode interrupt counter (edge path)
 // --------------------------------------------------------------
 static volatile uint32_t photodiode_pulse_count = 0;
 
@@ -121,6 +148,17 @@ static String jsonEscape(const char* s) {
     else out += c;
   }
   return out;
+}
+
+static inline void appendFloatKV(
+    String& b,
+    const char* key,
+    float value,
+    int decimals = 5
+) {
+    char buf[48];
+    snprintf(buf, sizeof(buf), "\"%s\":%.*f", key, decimals, value);
+    b += buf;
 }
 
 // --------------------------------------------------------------
@@ -347,9 +385,57 @@ static String buildGnssDataBody() {
 }
 
 static String buildPhotodiodeStatusBody() {
-  int level = digitalRead(PHOTODIODE_PIN);
+  // ------------------------------------------------------------------
+  // This payload is meant to be raw and non-judgmental.
+  // No laser inference occurs here.
+  //
+  // edge_level:
+  //   A best-effort snapshot of the digital state on the edge pin.
+  //   Useful for wiring sanity checks and basic liveness inspection.
+  //
+  // edge_pulse_count:
+  //   Monotonic count since last PHOTODIODE.CLEAR.
+  //
+  // analog_raw:
+  //   ADC counts for the continuous analog channel.
+  //
+  // analog_v:
+  //   A derived voltage using 12-bit scaling and a 3.3 V reference.
+  //   This is a convenience field; downstream can prefer analog_raw.
+  // ------------------------------------------------------------------
+  int edge_level = digitalRead(PHOTODIODE_EDGE_PIN);
+
+  // Latch the ISR-updated counter atomically.
+  uint32_t count;
+  noInterrupts();
+  count = photodiode_pulse_count;
+  interrupts();
+
+  // Read analog channel.
+  // Note: Teensy analogRead returns 0..4095 when resolution is 12 bits.
+  // The default resolution on Teensy is often 10 bits unless changed.
+  // For determinism, enforce 12-bit resolution here for the read.
+  analogReadResolution(12);
+  int analog_raw = analogRead(PHOTODIODE_ANALOG_PIN);
+
+  // Convert to volts using a simple 3.3 V full-scale assumption.
+  // This is not a promise of absolute accuracy, only a friendly scale.
+  const float ADC_FS_COUNTS = 4095.0f;
+  const float ADC_FS_VOLTS  = 3.3f;
+  float analog_v = ((float)analog_raw / ADC_FS_COUNTS) * ADC_FS_VOLTS;
+
   String b;
-  b += "\"level\":"; b += level;
+  b += "\"edge_level\":"; b += edge_level;
+  b += ",\"edge_pulse_count\":"; b += count;
+  b += ",\"analog_raw\":"; b += analog_raw;
+  b += ",\"analog_v\":";
+  {
+    // Keep float formatting stable and compact.
+    // 5 decimals is consistent with other telemetry float fields.
+    char buf[32];
+    snprintf(buf, sizeof(buf), "%.5f", analog_v);
+    b += buf;
+  }
   b += ",\"millis\":"; b += millis();
   return b;
 }
@@ -367,14 +453,37 @@ static String buildPhotodiodeCountBody() {
 }
 
 // --------------------------------------------------------------
-// Command classification
+// IMON averaging helper
 // --------------------------------------------------------------
-static inline bool isStateChangingCommand(const char* cmd) {
-  return (
-    strcmp(cmd, "PHOTODIODE.CLEAR") == 0 ||
-    strcmp(cmd, "LASER.ON") == 0 ||
-    strcmp(cmd, "LASER.OFF") == 0
-  );
+//
+// This helper historically sampled PHOTODIODE_PIN for long-duration
+// averaging. With the TDM split-pin design, the intended analog path
+// is pin 15. The averaging helper is kept for the existing LASER.VOLTAGES
+// command, but migrated to the dedicated analog pin.
+//
+// This avoids overloading the edge pin with analog sampling semantics.
+//
+static float averageImonSeconds(uint32_t seconds) {
+  const uint32_t duration_ms = seconds * 1000UL;
+  uint32_t start = millis();
+  uint64_t sum = 0;
+  uint32_t count = 0;
+
+  // Force a stable resolution for averaging.
+  analogReadResolution(12);
+
+  // Use default Arduino analogRead (Teensy ADC).
+  // Sampling cadence is intentionally modest; the intent is a 10s mean.
+  while (millis() - start < duration_ms) {
+    sum += (uint16_t)analogRead(PHOTODIODE_ANALOG_PIN);
+    count++;
+    delay(1);  // ~1 kHz sample cadence (adequate for long averaging)
+  }
+
+  if (count == 0) return 0.0f;
+
+  float adc_avg = (float)sum / (float)count;
+  return (adc_avg / 4095.0f) * 3.3f;
 }
 
 // --------------------------------------------------------------
@@ -401,7 +510,6 @@ static bool extractCmd(const char* line, char* out, size_t out_sz) {
 static void execCommand(const char* line) {
   char cmd[64];
   if (!extractCmd(line, cmd, sizeof(cmd))) {
-    // No serial output; queue error for visibility.
     enqueueErrEvent("UNKNOWN", "missing cmd");
     return;
   }
@@ -422,6 +530,8 @@ static void execCommand(const char* line) {
   }
 
   if (strcmp(cmd, "PHOTODIODE.STATUS") == 0) {
+    // PHOTODIODE_STATUS is now richer:
+    //   edge_level, edge_pulse_count, analog_raw, analog_v, millis
     enqueueEvent("PHOTODIODE_STATUS", buildPhotodiodeStatusBody());
     return;
   }
@@ -435,8 +545,6 @@ static void execCommand(const char* line) {
     noInterrupts();
     photodiode_pulse_count = 0;
     interrupts();
-
-    // State-changing: queue ACK.
     enqueueAckEvent(cmd);
     return;
   }
@@ -447,7 +555,7 @@ static void execCommand(const char* line) {
     ldOn = true;
 
     enqueueEvent("LASER_STATE", "\"enabled\":true");
-    enqueueAckEvent(cmd); // State-changing: queue ACK.
+    enqueueAckEvent(cmd);
     return;
   }
 
@@ -456,17 +564,58 @@ static void execCommand(const char* line) {
     ldOn = false;
 
     enqueueEvent("LASER_STATE", "\"enabled\":false");
-    enqueueAckEvent(cmd); // State-changing: queue ACK.
+    enqueueAckEvent(cmd);
+    return;
+  }
+
+  // ----------------------------------------------------------
+  // LASER.VOLTAGES
+  // ----------------------------------------------------------
+  //
+  // Historical diagnostic:
+  //   Measure long-duration averaged analog voltage with laser off/on.
+  //
+  // With the TDM split-pin design, the averaging now samples the
+  // dedicated analog channel (pin 15).
+  //
+  if (strcmp(cmd, "LASER.VOLTAGES") == 0) {
+    // (1) Laser OFF
+    digitalWrite(LD_ON_PIN, LOW);
+    ldOn = false;
+    delay(50);
+
+    float off_v = averageImonSeconds(10);
+
+    // (2) Laser ON
+    digitalWrite(EN_PIN, HIGH);
+    digitalWrite(LD_ON_PIN, HIGH);
+    ldOn = true;
+    delay(50);
+
+    float on_v = averageImonSeconds(10);
+
+    // (3) Laser OFF again (leave EN as-is; only turn off LD_ON)
+    digitalWrite(LD_ON_PIN, LOW);
+    ldOn = false;
+
+    String b;
+    appendFloatKV(b, "off_v", off_v, 5);
+    b += ",";
+    appendFloatKV(b, "on_v", on_v, 5);
+    b += ",";
+    b += "\"millis\":";
+    b += millis();
+
+    enqueueEvent("LASER_VOLTAGES", b);
+    enqueueAckEvent(cmd); // state-changing
     return;
   }
 
   if (strcmp(cmd, "EVENTS.GET") == 0) {
-    // Explicit drain is the only time we talk on Serial.
     drainEventsNow();
     return;
   }
 
-  // Unknown command: queue error for visibility.
   enqueueErrEvent(cmd, "unknown command");
 }
 
@@ -484,13 +633,25 @@ void setup() {
   digitalWrite(EN_PIN, LOW);
   digitalWrite(LD_ON_PIN, LOW);
 
-  // LMH7220 OUT Q drives this pin through external resistor.
-  // Do NOT enable internal pullups here.
-  pinMode(PHOTODIODE_PIN, INPUT);
+  // ------------------------------------------------------------
+  // Photodiode pin configuration
+  // ------------------------------------------------------------
+  //
+  // Edge pin (14):
+  //   Treated as a digital input for interrupt pulse counting.
+  //   No internal pullups enabled. The TDM should drive this line.
+  //
+  // Analog pin (15):
+  //   Treated as ADC input. No pullups. The TDM should drive a
+  //   stable analog level during laser-on.
+  //
+  pinMode(PHOTODIODE_EDGE_PIN, INPUT);
+  pinMode(PHOTODIODE_ANALOG_PIN, INPUT);
 
-  // Use CHANGE to maximize chance of catching fast pulses.
+  // Attach interrupt to edge pin. Mode CHANGE counts both edges,
+  // maximizing visibility into pulse activity without interpretation.
   attachInterrupt(
-    digitalPinToInterrupt(PHOTODIODE_PIN),
+    digitalPinToInterrupt(PHOTODIODE_EDGE_PIN),
     photodiodeISR,
     CHANGE
   );

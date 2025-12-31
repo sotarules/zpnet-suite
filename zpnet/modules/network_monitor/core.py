@@ -1,15 +1,10 @@
 """
-ZPNet Network Monitor — VPN-Aware + Timeout-Hardened Revision (v2025-10-28c)
+ZPNet Network Monitor — VPN-Aware + Timeout-Hardened Revision
+(v2025-12-29-gzip)
 
 Collects network statistics and emits NETWORK_STATUS events.
-This version adds explicit HTTP timeouts for all REST calls using
-shared constants from zpnet.shared.constants, preventing blocking
-during WAN or DNS outages.
-
-Change (v2025-10-28c):
-    • Caught requests.ConnectionError and related transient errors in run()
-      to avoid full stack traces.  These now produce a single-line warning
-      instead of an exception traceback.
+All POST requests now comply with the global ZPNet policy requiring
+gzip-compressed request bodies.
 
 Author: The Mule
 """
@@ -32,6 +27,8 @@ from zpnet.shared.constants import (
     EXPECTED_TEST_STRING,
     HTTP_TIMEOUT,
 )
+from zpnet.shared.http import gzip_text
+
 
 # ---------------------------------------------------------------------
 # Helpers
@@ -123,13 +120,28 @@ def download_test_mbps() -> float:
 
 
 def upload_test_mbps() -> float:
-    """Estimate upload throughput by POSTing a 1MB ASCII payload to ZPNet server."""
+    """
+    Estimate upload throughput by POSTing a 1MB ASCII payload
+    using gzip-compressed request bodies.
+    """
     url = f"http://{ZPNET_REMOTE_HOST}/api/upload_test"
-    headers = {"Connection": "close", "Accept-Encoding": "identity"}
-    payload = "".join(random.choice(string.ascii_uppercase) for _ in range(1024 * 1024))
+
+    payload = "".join(
+        random.choice(string.ascii_uppercase)
+        for _ in range(1024 * 1024)
+    )
+
+    body, headers = gzip_text(payload)
+
     start = time.time()
-    r = requests.post(url, data=payload.encode("utf-8"), headers=headers, timeout=HTTP_TIMEOUT)
+    r = requests.post(
+        url,
+        data=body,
+        headers=headers,
+        timeout=HTTP_TIMEOUT,
+    )
     elapsed = time.time() - start
+
     bits = len(payload) * 8
     return round((bits / 1e6) / elapsed, 2) if elapsed > 0 else 0.0
 
@@ -143,6 +155,7 @@ def run() -> None:
     and emit NETWORK_STATUS event.
     """
     payload = {}
+
     try:
         payload["ssid"] = get_ssid()
 
@@ -158,18 +171,23 @@ def run() -> None:
         payload["interfaces"] = get_interface_stats()
         payload["ping_ms"] = ping_latency_ms()
 
-        # handle transient HTTP faults gently
+        # Handle transient HTTP faults gently
         try:
             payload["download_mbps"] = download_test_mbps()
             payload["upload_mbps"] = upload_test_mbps()
-        except requests.RequestException as e:
+        except requests.RequestException:
             pass
         except Exception as e:
-            logging.warning(f"⚠️ [network_monitor] unexpected error during throughput test: {e}")
+            logging.warning(
+                f"⚠️ [network_monitor] unexpected error during throughput test: {e}"
+            )
 
     except Exception as e:
-        # this is now only for truly unexpected cases
-        logging.warning(f"❌ [network_monitor] unexpected network_monitor failure: {e}")
+        # Only truly unexpected cases reach here
+        logging.warning(
+            f"❌ [network_monitor] unexpected network_monitor failure: {e}"
+        )
+
     finally:
         create_event("NETWORK_STATUS", payload)
 

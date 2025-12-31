@@ -1,14 +1,13 @@
 """
 ZPNet Event Despooler  —  Stellar-Compliant + Timeout-Hardened Revision
-(v2025-12-19-psql-fixed)
+(v2025-12-29-gzip)
 
-Fetches unsent events from PostgreSQL and POSTs them to the remote ZPNet endpoint.
-Marks events as despooled upon success.
+Fetches unsent events from PostgreSQL and POSTs them to the remote ZPNet endpoint
+using gzip-compressed JSON payloads. Marks events as despooled upon success.
 
 Author: The Mule + GPT
 """
 
-import json
 import logging
 from datetime import datetime, timezone
 
@@ -19,12 +18,13 @@ from zpnet.shared.constants import (
     HTTP_TIMEOUT,
 )
 from zpnet.shared.db import open_db
+from zpnet.shared.http import gzip_json
 
 
 # ---------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------
-BATCH_SIZE = 50  # max events per batch
+BATCH_SIZE = 50  # max events per batch (count-based; bytes handled by gzip)
 
 
 # ---------------------------------------------------------------------
@@ -36,9 +36,11 @@ def serialize_event(row: dict) -> dict:
     """
     return {
         "id": row["id"],
-        "ts": row["ts"].isoformat().replace("+00:00", "Z")
-              if isinstance(row.get("ts"), datetime)
-              else row.get("ts"),
+        "ts": (
+            row["ts"].isoformat().replace("+00:00", "Z")
+            if isinstance(row.get("ts"), datetime)
+            else row.get("ts")
+        ),
         "event_type": row["event_type"],
         "payload": row["payload"],
     }
@@ -91,7 +93,7 @@ def mark_despooled(ids: list[int]) -> None:
 # ---------------------------------------------------------------------
 def run() -> None:
     """
-    POST a batch of unsent events to the remote endpoint.
+    POST a batch of unsent events to the remote endpoint using gzip-compressed JSON.
     """
     try:
         endpoint = f"http://{ZPNET_REMOTE_HOST}/api"
@@ -100,13 +102,12 @@ def run() -> None:
         if not events:
             return
 
+        body, headers = gzip_json(events)
+
         response = requests.post(
             endpoint,
-            headers={
-                "Content-Type": "application/json",
-                "Connection": "close",
-            },
-            data=json.dumps(events, separators=(",", ":")),
+            data=body,
+            headers=headers,
             timeout=HTTP_TIMEOUT,
         )
 
@@ -119,10 +120,14 @@ def run() -> None:
         mark_despooled(ids)
 
     except requests.RequestException as e:
-        logging.warning(f"📡 [event_despooler] network issue: {e} — will retry later")
+        logging.warning(
+            f"📡 [event_despooler] network issue: {e} — will retry later"
+        )
 
     except Exception as e:
-        logging.exception(f"💥 [event_despooler] unexpected failure: {e}")
+        logging.exception(
+            f"💥 [event_despooler] unexpected failure: {e}"
+        )
 
 
 # ---------------------------------------------------------------------
