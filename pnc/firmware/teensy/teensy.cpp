@@ -181,6 +181,24 @@ static inline void emitJson(const char* type, const String& body) {
 }
 
 // --------------------------------------------------------------
+// Immediate JSON emit helper (QUERY plane only)
+// --------------------------------------------------------------
+//
+// Used ONLY for non-destructive CMD? queries.
+// This bypasses the event queue entirely.
+//
+static inline void emitImmediateJson(const char* type, const String& body) {
+  Serial.print("{\"type\":\"");
+  Serial.print(type);
+  Serial.print("\"");
+  if (body.length()) {
+    Serial.print(",");
+    Serial.print(body);
+  }
+  Serial.println("}");
+}
+
+// --------------------------------------------------------------
 // ACK/ERR are now EVENT-QUEUE ONLY (no direct Serial output)
 // --------------------------------------------------------------
 static inline void enqueueAckEvent(const char* cmd) {
@@ -254,30 +272,41 @@ static void ingestGnssLine(const char* line) {
 }
 
 static void pollGnssSerial() {
-  unsigned long now = millis();
+  const unsigned long start_ms = millis();
+
+  // Budget: process GNSS for at most this many milliseconds per loop().
+  // This ensures USB CDC commands remain responsive even if GNSS is chatty.
+  const unsigned long BUDGET_MS = 2;
+
+  // Optional additional cap (belt-and-suspenders)
+  const uint32_t MAX_BYTES = 512;
+  uint32_t bytes = 0;
 
   while (Serial1.available()) {
     char c = Serial1.read();
-    lastGnssByteMs = now;
+    lastGnssByteMs = millis();  // update with real time, not a stale snapshot
 
     if (c == '\n') {
       lineBuf[lineLen] = '\0';
       if (lineLen) ingestGnssLine(lineBuf);
       lineLen = 0;
-      continue;
-    }
-
-    if (c != '\r' && lineLen < GNSS_LINE_MAX - 1) {
+    } else if (c != '\r' && lineLen < GNSS_LINE_MAX - 1) {
       lineBuf[lineLen++] = c;
     }
+
+    bytes++;
+    if (bytes >= MAX_BYTES) break;
+    if (millis() - start_ms >= BUDGET_MS) break;
   }
 
-  if (lineLen && (now - lastGnssByteMs) > GNSS_SILENCE_FLUSH_MS) {
+  // Flush partial line only when we have been silent long enough.
+  if (lineLen && (millis() - lastGnssByteMs) > GNSS_SILENCE_FLUSH_MS) {
     lineBuf[lineLen] = '\0';
     ingestGnssLine(lineBuf);
     lineLen = 0;
   }
 }
+
 
 // --------------------------------------------------------------
 // Event Bus
@@ -507,6 +536,9 @@ static bool extractCmd(const char* line, char* out, size_t out_sz) {
   return true;
 }
 
+// Command semantics:
+//   CMD        → enqueue durable event
+//   CMD?       → immediate reply, no queue interaction
 static void execCommand(const char* line) {
   char cmd[64];
   if (!extractCmd(line, cmd, sizeof(cmd))) {
@@ -526,6 +558,17 @@ static void execCommand(const char* line) {
 
   if (strcmp(cmd, "GNSS.DATA") == 0) {
     enqueueEvent("GNSS_DATA", buildGnssDataBody());
+    return;
+  }
+
+  // --------------------------------------------------------------
+  // QUERY COMMANDS (NON-DESTRUCTIVE, IMMEDIATE REPLY)
+  // --------------------------------------------------------------
+  if (strcmp(cmd, "PHOTODIODE.STATUS?") == 0) {
+    emitImmediateJson(
+      "PHOTODIODE_STATUS",
+      buildPhotodiodeStatusBody()
+    );
     return;
   }
 
@@ -660,19 +703,26 @@ void setup() {
 }
 
 void loop() {
-  pollGnssSerial();
-
+  // ------------------------------------------------------------
+  // PRIORITY: USB CDC commands (queries, control)
+  // ------------------------------------------------------------
   static char buf[256];
   static size_t len = 0;
 
   while (Serial.available()) {
     char c = Serial.read();
-    if (c == '\n') {
+    if (c == '\n' || c == '\r') {
       buf[len] = '\0';
       if (len) execCommand(buf);
       len = 0;
-    } else if (c != '\r' && len < sizeof(buf) - 1) {
+    } else if (len < sizeof(buf) - 1) {
       buf[len++] = c;
     }
   }
+
+  // ------------------------------------------------------------
+  // BACKGROUND: GNSS ingestion (opportunistic)
+  // ------------------------------------------------------------
+  pollGnssSerial();
 }
+

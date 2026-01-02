@@ -20,6 +20,7 @@ import sys
 import time
 import threading
 import asyncio
+import socket
 from collections.abc import Generator
 from typing import Callable
 
@@ -57,6 +58,55 @@ LOCKED_REFRESH_S = 0.5
 
 WS_HOST = "0.0.0.0"
 WS_PORT = 8765
+
+# ---------------------------------------------------------------------
+# Real-time Teensy query plane (IPC via teensy_listener)
+# ---------------------------------------------------------------------
+TEENSY_RT_SOCKET_PATH = "/tmp/zpnet_teensy_rt.sock"
+TEENSY_RT_DEFAULT_TIMEOUT_S = 1.0
+TEENSY_RT_RECV_MAX_BYTES = 16384
+
+
+def teensy_realtime_query(cmd: dict, timeout_s: float = TEENSY_RT_DEFAULT_TIMEOUT_S) -> list[dict] | None:
+    """
+    Synchronously query Teensy via teensy_listener's real-time IPC socket.
+
+    Args:
+        cmd (dict): Teensy command dict, e.g. {"cmd":"PHOTODIODE.STATUS"}
+        timeout_s (float): socket timeout budget
+
+    Returns:
+        list[dict] | None: list of returned events on success, None on failure.
+
+    Contract:
+        • Dashboard never touches /dev/ttyACM0
+        • teensy_listener remains the sole serial owner
+        • Returned events are ephemeral (not persisted here)
+    """
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+            s.settimeout(timeout_s)
+            s.connect(TEENSY_RT_SOCKET_PATH)
+
+            req = {"cmd": cmd, "timeout_s": timeout_s}
+            s.sendall(json.dumps(req, separators=(",", ":")).encode("utf-8"))
+
+            raw = s.recv(TEENSY_RT_RECV_MAX_BYTES)
+            if not raw:
+                return None
+
+            resp = json.loads(raw.decode("utf-8"))
+            if not isinstance(resp, dict):
+                return None
+
+            if resp.get("ok") is True:
+                events = resp.get("events", [])
+                return events if isinstance(events, list) else []
+
+            return None
+
+    except Exception:
+        return None
 
 
 # ---------------------------------------------------------------------
@@ -155,6 +205,7 @@ from zpnet.dashboard.readout_blocks import (
     network_status_readout,
     teensy_status_readout,
     raspberry_pi_status_readout,
+    photodiode_status_readout,  # NEW
 )
 
 
@@ -167,6 +218,7 @@ READOUTS: list[Callable[[], Readout]] = [
     power_status_readout,
     network_status_readout,
     teensy_status_readout,
+    photodiode_status_readout,  # NEW
     raspberry_pi_status_readout,
 ]
 
@@ -298,7 +350,20 @@ def main() -> None:
         prefix = "* " if locked else ""
 
         header = header_readout(prefix=prefix)
-        body = list(READOUTS[readout_idx]())
+
+        # --------------------------------------------------------------
+        # Readout execution
+        # --------------------------------------------------------------
+        #
+        # All readouts remain simple generators.
+        # Some may optionally accept a `locked=` kwarg for cadence-sensitive behavior.
+        #
+        readout_fn = READOUTS[readout_idx]
+        try:
+            body = list(readout_fn(locked=locked))  # type: ignore[misc]
+        except TypeError:
+            body = list(readout_fn())
+
         combined = header + body
 
         payload = {

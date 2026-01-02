@@ -8,7 +8,11 @@ Author: The Mule + GPT
 """
 
 from collections.abc import Generator
-from zpnet.dashboard.core import fetch_aggregate
+
+from zpnet.dashboard.core import (
+    fetch_aggregate,
+    teensy_realtime_query,
+)
 
 
 # ---------------------------------------------------------------------
@@ -186,6 +190,43 @@ def teensy_status_readout() -> Generator[str, None, None]:
     yield f"CPU TEMP: {ag.get('cpu_temp_c', 0):.1f} C"
     yield f"VREF: {ag.get('vref_v', 0):.2f} V"
     yield f"FREE HEAP: {ag.get('free_heap_bytes', 0) / 1024:.1f} KB"
+
+
+# ---------------------------------------------------------------------
+# PHOTODIODE (REAL-TIME INSTRUMENT)
+# ---------------------------------------------------------------------
+def photodiode_status_readout(locked: bool = False) -> Generator[str, None, None]:
+    """
+    Real-time photodiode instrument readout.
+
+    Semantics:
+      • Snapshot read when unlocked
+      • Continuous 1 Hz updates when locked (cadence handled by core)
+      • No aggregation
+      • No persistence
+      • Ground-truth only
+    """
+    events = teensy_realtime_query({"cmd": "PHOTODIODE.STATUS?"})
+
+    if not events:
+        yield "PHOTODIODE STATUS: DOWN"
+        yield "NO REAL-TIME DATA"
+        return
+
+    payload = events[0].get("payload", {})
+
+    edge_level = payload.get("edge_level", 0)
+    edge_count = payload.get("edge_pulse_count", 0)
+    analog_raw = payload.get("analog_raw", 0)
+    analog_v = payload.get("analog_v", 0.0)
+
+    health = "NOMINAL" if (edge_count > 0 or analog_v > 0.0) else "DOWN"
+
+    yield f"PHOTODIODE STATUS: {health}"
+    yield f"EDGE LEVEL (PIN 14): {edge_level}"
+    yield f"EDGE PULSE COUNT: {edge_count}"
+    yield f"ANALOG RAW (PIN 15): {analog_raw}"
+    yield f"ANALOG VOLTAGE (PIN 15): {analog_v:.5f} V"
 
 
 # ---------------------------------------------------------------------
