@@ -80,6 +80,12 @@ CHOOSENET_PATH = "/usr/local/bin/choosenet.sh"
 CHOOSENET_RETRY_INTERVAL_S = 120  # seconds between connectivity checks
 
 # ---------------------------------------------------------------------
+# Laser / Photodiode Semantics
+# ---------------------------------------------------------------------
+
+LASER_PHOTODIODE_ON_THRESHOLD_V = 0.05
+
+# ---------------------------------------------------------------------
 # Utility Helpers
 # ---------------------------------------------------------------------
 def http_endpoint(path: str) -> str:

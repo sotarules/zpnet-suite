@@ -357,16 +357,52 @@ def aggregate_environment_status():
 
 
 def aggregate_laser_status():
-    status_ev = latest_event("LASER_STATUS")
-    state_ev  = latest_event("LASER_STATE")
+    """
+    Derive LASER_STATUS from direct physical observation.
 
+    Semantics:
+      • Driver presence comes from LASER_STATUS (I²C observation)
+      • Emission state comes from imperative PHOTODIODE.STATUS? query
+      • No dependence on LASER.ON / LASER.OFF event history
+      • Ground truth is photonic, not intentional
+    """
+    status_ev = latest_event("LASER_STATUS")
     payload = status_ev["payload"] if status_ev else {}
 
-    if state_ev and isinstance(state_ev["payload"].get("enabled"), bool):
-        payload["laser_enabled"] = state_ev["payload"]["enabled"]
+    # Default: assume laser is not emitting
+    laser_on = False
 
-    payload.setdefault("health_state", "HOLD")
+    # ------------------------------------------------------------------
+    # Imperative photodiode query (safe IPC path)
+    # ------------------------------------------------------------------
+    try:
+        from zpnet.dashboard.core import teensy_realtime_query
+        from zpnet.shared.constants import LASER_PHOTODIODE_ON_THRESHOLD_V
+
+        events = teensy_realtime_query({"cmd": "PHOTODIODE.STATUS?"})
+        if events:
+            pd = events[0].get("payload", {})
+            analog_v = pd.get("analog_v")
+
+            if isinstance(analog_v, (int, float)):
+                laser_on = analog_v >= LASER_PHOTODIODE_ON_THRESHOLD_V
+
+    except Exception:
+        # Imperative query failure must NEVER kill aggregation
+        laser_on = False
+
+    payload["laser_enabled"] = laser_on
+
+    # ------------------------------------------------------------------
+    # Health semantics
+    # ------------------------------------------------------------------
+    if payload.get("device_present") is True:
+        payload["health_state"] = "NOMINAL"
+    else:
+        payload["health_state"] = "HOLD"
+
     create_or_update_aggregate("LASER_STATUS", payload)
+
 
 
 def aggregate_gnss_data():
