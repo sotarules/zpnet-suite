@@ -23,7 +23,7 @@
       • A dedicated analog pin (15) for photodiode amplitude / presence signal
       • PHOTODIODE.STATUS payload now includes:
           - edge_level (digital read of pin 14, best-effort snapshot)
-          - edge_pulse_count (latched, monotonic until cleared)
+          - edge_pulse_count Monotonic count of light-present episodes since last PHOTODIODE.CLEAR.
           - analog_raw (ADC counts from pin 15)
           - analog_v (derived voltage estimate using 3.3 V assumption)
           - millis
@@ -44,7 +44,7 @@
 // --------------------------------------------------------------
 // Version
 // --------------------------------------------------------------
-static const char* FW_VERSION = "teensy-telemetry-4.3.4";
+static const char* FW_VERSION = "teensy-telemetry-4.3.5";
 
 // --------------------------------------------------------------
 // GNSS serial config
@@ -71,12 +71,17 @@ static const int PHOTODIODE_EDGE_PIN   = 14;
 static const int PHOTODIODE_ANALOG_PIN = 15;
 
 // --------------------------------------------------------------
-// Photodiode interrupt counter (edge path)
+// Photodiode episode latch (state-driven)
 // --------------------------------------------------------------
-static volatile uint32_t photodiode_pulse_count = 0;
+static volatile bool photodiode_edge_seen = false;
+static volatile bool photodiode_episode_latched = false;
+static volatile uint32_t photodiode_episode_count = 0;
+
+// Analog authority threshold (volts)
+static const float PHOTODIODE_ON_THRESHOLD_V = 0.05f;
 
 void photodiodeISR() {
-  photodiode_pulse_count++;
+  photodiode_edge_seen = true;
 }
 
 // --------------------------------------------------------------
@@ -437,7 +442,7 @@ static String buildPhotodiodeStatusBody() {
   // Latch the ISR-updated counter atomically.
   uint32_t count;
   noInterrupts();
-  count = photodiode_pulse_count;
+  count = photodiode_episode_count;
   interrupts();
 
   // Read analog channel.
@@ -472,7 +477,7 @@ static String buildPhotodiodeStatusBody() {
 static String buildPhotodiodeCountBody() {
   uint32_t count;
   noInterrupts();
-  count = photodiode_pulse_count;
+  count = photodiode_episode_count;
   interrupts();
 
   String b;
@@ -513,6 +518,34 @@ static float averageImonSeconds(uint32_t seconds) {
 
   float adc_avg = (float)sum / (float)count;
   return (adc_avg / 4095.0f) * 3.3f;
+}
+
+// --------------------------------------------------------------
+// Photodiode episode state machine
+// --------------------------------------------------------------
+static void updatePhotodiodeEpisodeLatch() {
+  // Authoritative signal: analog voltage on pin 15
+  analogReadResolution(12);
+  int analog_raw = analogRead(PHOTODIODE_ANALOG_PIN);
+  float analog_v = (analog_raw / 4095.0f) * 3.3f;
+
+  bool light_present = (analog_v >= PHOTODIODE_ON_THRESHOLD_V);
+
+  noInterrupts();
+
+  // First edge during light-present interval → count one episode
+  if (light_present && photodiode_edge_seen && !photodiode_episode_latched) {
+    photodiode_episode_latched = true;
+    photodiode_episode_count++;
+  }
+
+  // Light absent → reset latch for next episode
+  if (!light_present) {
+    photodiode_episode_latched = false;
+  }
+
+  photodiode_edge_seen = false;
+  interrupts();
 }
 
 // --------------------------------------------------------------
@@ -586,7 +619,9 @@ static void execCommand(const char* line) {
 
   if (strcmp(cmd, "PHOTODIODE.CLEAR") == 0) {
     noInterrupts();
-    photodiode_pulse_count = 0;
+    photodiode_episode_count = 0;
+    photodiode_episode_latched = false;
+    photodiode_edge_seen = false;
     interrupts();
     enqueueAckEvent(cmd);
     return;
@@ -708,6 +743,9 @@ void loop() {
   // ------------------------------------------------------------
   static char buf[256];
   static size_t len = 0;
+
+  // Maintain photodiode episode latch (state-driven)
+  updatePhotodiodeEpisodeLatch();
 
   while (Serial.available()) {
     char c = Serial.read();
