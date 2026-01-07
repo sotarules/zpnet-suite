@@ -47,6 +47,11 @@
 static const char* FW_VERSION = "teensy-telemetry-4.3.5";
 
 // --------------------------------------------------------------
+// System state
+// --------------------------------------------------------------
+static bool system_shutdown = false;
+
+// --------------------------------------------------------------
 // GNSS serial config
 // --------------------------------------------------------------
 static const unsigned long GNSSDO_BAUD = 38400;
@@ -84,6 +89,7 @@ static const float PHOTODIODE_ON_THRESHOLD_V  = 0.20f;  // rising threshold
 static const float PHOTODIODE_OFF_THRESHOLD_V = 0.05f;  // falling threshold
 
 static const uint32_t PHOTODIODE_OFF_STABLE_MS = 20;
+
 
 void photodiodeISR() {
   photodiode_edge_seen = true;
@@ -228,6 +234,22 @@ static inline void enqueueErrEvent(const char* cmd, const char* msg) {
     b += ",\"error\":\""; b += jsonEscape(msg); b += "\"";
   }
   enqueueEvent("ERR", b);
+}
+
+// --------------------------------------------------------------
+// Terminal quiescence (no return)
+// --------------------------------------------------------------
+static void enterPermanentQuiescence() {
+  // Laser outputs must already be disabled by caller.
+  // This function never returns.
+
+  // Optional: detach interrupts to reduce noise
+  detachInterrupt(digitalPinToInterrupt(PHOTODIODE_EDGE_PIN));
+
+  // Enter an inert loop
+  while (true) {
+    delay(1000);
+  }
 }
 
 // --------------------------------------------------------------
@@ -606,6 +628,7 @@ static bool extractCmd(const char* line, char* out, size_t out_sz) {
 // Command semantics:
 //   CMD        → enqueue durable event
 //   CMD?       → immediate reply, no queue interaction
+//   TERMINAL   → irreversible state change, no return (e.g. SYSTEM.SHUTDOWN)
 static void execCommand(const char* line) {
   char cmd[64];
   if (!extractCmd(line, cmd, sizeof(cmd))) {
@@ -678,6 +701,19 @@ static void execCommand(const char* line) {
     enqueueEvent("LASER_STATE", "\"enabled\":false");
     enqueueAckEvent(cmd);
     return;
+  }
+
+  // --------------------------------------------------------------
+  // SYSTEM.SHUTDOWN (terminal command)
+  // --------------------------------------------------------------
+  if (strcmp(cmd, "SYSTEM.SHUTDOWN") == 0) {
+    digitalWrite(LD_ON_PIN, LOW);
+    digitalWrite(EN_PIN, LOW);
+    ldOn = false;
+
+    system_shutdown = true;
+    enqueueAckEvent(cmd);
+    enterPermanentQuiescence();
   }
 
   // ----------------------------------------------------------
@@ -777,6 +813,10 @@ void loop() {
   // ------------------------------------------------------------
   static char buf[256];
   static size_t len = 0;
+
+  if (system_shutdown) {
+    enterPermanentQuiescence();
+  }
 
   // Maintain photodiode episode latch (state-driven)
   updatePhotodiodeEpisodeLatch();

@@ -1,23 +1,26 @@
 """
-ZPNet Power Monitor — Protective Shutdown Revision (v2026-01-07)
+ZPNet Power Monitor — Protective Shutdown + Teensy Quiescence Revision (v2026-01-07b)
 
 Polls INA260 sensors over I²C and emits POWER_STATUS events.
 
-If any rail voltage drifts outside its expected tolerance, the system
-is immediately shut down to protect hardware integrity.
+If any rail voltage drifts outside its expected tolerance:
+  1) The Teensy is instructed to enter SYSTEM.SHUTDOWN (best-effort).
+  2) The host system immediately powers off.
 
-POWER_EXCEPTION events are intentionally retired.
-Out-of-tolerance is no longer a reportable condition; it is terminal.
+POWER_EXCEPTION events are retired.
+Out-of-tolerance is a terminal safety violation.
 
 Author: The Mule
 """
 
 import logging
 import subprocess
+import time
 from smbus2 import SMBus
 
 from zpnet.shared.logger import setup_logging
 from zpnet.shared.events import create_event
+from zpnet.shared.serial import send_teensy_command
 from zpnet.shared.constants import DB_PATH  # retained for structural symmetry
 
 
@@ -75,24 +78,38 @@ def read_ina260(bus: SMBus, addr: int) -> dict:
 
 
 # ---------------------------------------------------------------------
-# Protective shutdown
+# Protective shutdown sequence
 # ---------------------------------------------------------------------
 def shutdown_system(reason: str) -> None:
     """
     Immediately shut down the system due to a power safety violation.
 
+    Sequence:
+      1) Best-effort SYSTEM.SHUTDOWN to Teensy
+      2) Short pause for USB delivery
+      3) Host poweroff (non-blocking)
+
     This function does not return.
     """
     logging.critical(f"🛑 [power_monitor] SYSTEM SHUTDOWN — {reason}")
 
+    # Step 1 — instruct Teensy to quiesce (best-effort)
     try:
-        subprocess.run(
-            ["systemctl", "poweroff", "--no-block"],
-            check=False,
-        )
-    finally:
-        # Absolute last resort: ensure this process does not continue.
-        raise SystemExit(1)
+        send_teensy_command({"cmd": "SYSTEM.SHUTDOWN"})
+    except Exception:
+        # Silence is acceptable; Teensy may already be unreachable
+        pass
+
+    # Step 2 — brief grace period for command delivery
+    time.sleep(0.2)
+
+    # Step 3 — power off host
+    subprocess.run(
+        ["sudo", "systemctl", "poweroff", "--no-block"],
+        check=False,
+    )
+
+    raise SystemExit(1)
 
 
 # ---------------------------------------------------------------------
@@ -102,8 +119,8 @@ def run():
     """
     Poll INA260 rails and emit POWER_STATUS.
 
-    If any rail voltage exceeds its allowed tolerance, immediately
-    shut down the system.
+    If any rail voltage exceeds its allowed tolerance,
+    perform an immediate coordinated shutdown.
     """
     sensors = []
     bus = None
@@ -141,7 +158,7 @@ def run():
         except Exception:
             pass
 
-    # Emit raw sensor snapshot (only reached if system is safe)
+    # Emit raw sensor snapshot (only reached if power is safe)
     if sensors:
         create_event("POWER_STATUS", {"sensors": sensors})
 
