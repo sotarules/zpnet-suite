@@ -1,0 +1,9 @@
+# Default settings (optional)
+[*]
+indent_style = space
+indent_size = 4
+
+# Teensy firmware (C/C++)
+[teensy.cpp]
+indent_style = space
+indent_size = 2

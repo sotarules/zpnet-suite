@@ -77,8 +77,13 @@ static volatile bool photodiode_edge_seen = false;
 static volatile bool photodiode_episode_latched = false;
 static volatile uint32_t photodiode_episode_count = 0;
 
+static const uint8_t PHOTODIODE_OFF_CONFIRM_SAMPLES = 5;
+
 // Analog authority threshold (volts)
-static const float PHOTODIODE_ON_THRESHOLD_V = 0.05f;
+static const float PHOTODIODE_ON_THRESHOLD_V  = 0.20f;  // rising threshold
+static const float PHOTODIODE_OFF_THRESHOLD_V = 0.05f;  // falling threshold
+
+static const uint32_t PHOTODIODE_OFF_STABLE_MS = 20;
 
 void photodiodeISR() {
   photodiode_edge_seen = true;
@@ -521,32 +526,61 @@ static float averageImonSeconds(uint32_t seconds) {
 }
 
 // --------------------------------------------------------------
-// Photodiode episode state machine
+// Photodiode episode state machine (with temporal off-stability)
 // --------------------------------------------------------------
 static void updatePhotodiodeEpisodeLatch() {
-  // Authoritative signal: analog voltage on pin 15
+  // Sample analog channel (authoritative)
   analogReadResolution(12);
   int analog_raw = analogRead(PHOTODIODE_ANALOG_PIN);
   float analog_v = (analog_raw / 4095.0f) * 3.3f;
 
-  bool light_present = (analog_v >= PHOTODIODE_ON_THRESHOLD_V);
+  // Hysteresis thresholds
+  static const float PHOTODIODE_ON_THRESHOLD_V  = 0.20f;
+  static const float PHOTODIODE_OFF_THRESHOLD_V = 0.05f;
+
+  // Temporal off-stability
+  static uint32_t photodiode_dark_since_ms = 0;
+  static const uint32_t PHOTODIODE_OFF_STABLE_MS = 20;
+
+  static bool light_present = false;
+  uint32_t now = millis();
+
+  // --- Hysteresis-based light state ---
+  if (!light_present) {
+    if (analog_v >= PHOTODIODE_ON_THRESHOLD_V) {
+      light_present = true;
+    }
+  } else {
+    if (analog_v <= PHOTODIODE_OFF_THRESHOLD_V) {
+      light_present = false;
+    }
+  }
 
   noInterrupts();
 
-  // First edge during light-present interval → count one episode
-  if (light_present && photodiode_edge_seen && !photodiode_episode_latched) {
-    photodiode_episode_latched = true;
-    photodiode_episode_count++;
-  }
-
-  // Light absent → reset latch for next episode
+  // --- Dark tracking / latch reset ---
   if (!light_present) {
-    photodiode_episode_latched = false;
+    if (photodiode_dark_since_ms == 0) {
+      photodiode_dark_since_ms = now;
+    }
+
+    if (now - photodiode_dark_since_ms >= PHOTODIODE_OFF_STABLE_MS) {
+      photodiode_episode_latched = false;
+    }
+  } else {
+    photodiode_dark_since_ms = 0;
+
+    // --- Episode detection ---
+    if (photodiode_edge_seen && !photodiode_episode_latched) {
+      photodiode_episode_latched = true;
+      photodiode_episode_count++;
+    }
   }
 
   photodiode_edge_seen = false;
   interrupts();
 }
+
 
 // --------------------------------------------------------------
 // Command parsing and execution (event-only)
