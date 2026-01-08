@@ -77,33 +77,38 @@ def read_ina260(bus: SMBus, addr: int) -> dict:
     }
 
 
-# ---------------------------------------------------------------------
-# Protective shutdown sequence
-# ---------------------------------------------------------------------
 def shutdown_system(reason: str) -> None:
     """
     Immediately shut down the system due to a power safety violation.
 
     Sequence:
-      1) Best-effort SYSTEM.SHUTDOWN to Teensy
-      2) Short pause for USB delivery
-      3) Host poweroff (non-blocking)
-
-    This function does not return.
+      1) Emit SHUTDOWN_INITIATED event (best-effort)
+      2) Best-effort SYSTEM.SHUTDOWN to Teensy
+      3) Grace period
+      4) Host poweroff (non-blocking)
     """
     logging.critical(f"🛑 [power_monitor] SYSTEM SHUTDOWN — {reason}")
 
-    # Step 1 — instruct Teensy to quiesce (best-effort)
+    # Step 1 — persist shutdown reason
+    try:
+        from datetime import datetime
+        create_event("SHUTDOWN_INITIATED", {
+            "reason": reason,
+            "timestamp": datetime.utcnow().isoformat() + "Z"
+        })
+    except Exception as e:
+        logging.warning(f"⚠️ Could not persist SHUTDOWN_INITIATED: {e}")
+
+    # Step 2 — instruct Teensy to quiesce (best-effort)
     try:
         send_teensy_command({"cmd": "SYSTEM.SHUTDOWN"})
     except Exception:
-        # Silence is acceptable; Teensy may already be unreachable
         pass
 
-    # Step 2 — brief grace period for command delivery
+    # Step 3 — brief grace period
     time.sleep(0.2)
 
-    # Step 3 — power off host
+    # Step 4 — power off host
     subprocess.run(
         ["sudo", "systemctl", "poweroff", "--no-block"],
         check=False,

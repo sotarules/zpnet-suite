@@ -90,7 +90,6 @@ static const float PHOTODIODE_OFF_THRESHOLD_V = 0.05f;  // falling threshold
 
 static const uint32_t PHOTODIODE_OFF_STABLE_MS = 20;
 
-
 void photodiodeISR() {
   photodiode_edge_seen = true;
 }
@@ -114,6 +113,30 @@ static char last_gga[GNSS_LINE_MAX] = "";
 // Parsed authoritative fields
 static float latitude_deg  = NAN;
 static float longitude_deg = NAN;
+
+// --------------------------------------------------------------
+// GNSS PPS (Teensy pin 33)
+// --------------------------------------------------------------
+static const int GNSS_PPS_PIN = 33;
+
+// --------------------------------------------------------------
+// GNSS VCLOCK (10 MHz) — Teensy pin 9
+// --------------------------------------------------------------
+static const int GNSS_VCLK_PIN = 9;
+
+// PPS capture state (ISR writes, loop reads)
+static volatile bool     pps_seen = false;
+static volatile uint32_t pps_cycles = 0;
+static volatile uint32_t pps_count = 0;
+
+// Optional: allow PPS telemetry to be toggled (e.g., via command)
+static bool pps_telemetry_enabled = true;
+
+// --------------------------------------------------------------
+// PPS telemetry rate limiting
+// --------------------------------------------------------------
+static const uint32_t PPS_EMIT_INTERVAL_MS = 10000; // 10 seconds
+static uint32_t last_pps_emit_ms = 0;
 
 // --------------------------------------------------------------
 // Utilities
@@ -442,6 +465,25 @@ static String buildGnssDataBody() {
     b += "\"";
   }
 
+  return b;
+}
+
+static String buildGnssPpsBody(
+    uint32_t cycles,
+    uint32_t count,
+    uint32_t vclk_cycles,
+    int vclk_level
+) {
+  String b;
+  b += "\"millis\":"; b += millis();
+  b += ",\"pps_count\":"; b += count;
+  b += ",\"cycles\":"; b += cycles;
+
+  // VCLOCK instrumentation
+  b += ",\"vclk_cycles\":"; b += vclk_cycles;
+  b += ",\"vclk_level\":"; b += vclk_level;
+
+  b += ",\"emit_interval_ms\":"; b += PPS_EMIT_INTERVAL_MS;
   return b;
 }
 
@@ -776,6 +818,33 @@ void setup() {
 
   Serial1.begin(GNSSDO_BAUD);
 
+  // ------------------------------------------------------------
+  // Enable ARM DWT cycle counter (Teensy 4.1)
+  // ------------------------------------------------------------
+  ARM_DEMCR |= ARM_DEMCR_TRCENA;
+  ARM_DWT_CTRL |= ARM_DWT_CTRL_CYCCNTENA;
+  ARM_DWT_CYCCNT = 0;
+
+  // ------------------------------------------------------------
+  // GNSS PPS pin setup
+  // ------------------------------------------------------------
+  pinMode(GNSS_PPS_PIN, INPUT);
+
+  // --------------------------------------------------------------
+  // GNSS VCLOCK (10 MHz) — Teensy pin 9
+  // --------------------------------------------------------------
+  static const int GNSS_VCLK_PIN = 9;
+
+  attachInterrupt(
+    digitalPinToInterrupt(GNSS_PPS_PIN),
+    []() {
+      pps_cycles = ARM_DWT_CYCCNT;
+      pps_count++;
+      pps_seen = true;
+    },
+    RISING
+  );
+
   pinMode(EN_PIN, OUTPUT);
   pinMode(LD_ON_PIN, OUTPUT);
   digitalWrite(EN_PIN, LOW);
@@ -820,6 +889,48 @@ void loop() {
 
   // Maintain photodiode episode latch (state-driven)
   updatePhotodiodeEpisodeLatch();
+
+  // ------------------------------------------------------------
+  // GNSS PPS capture → rate-limited GNSS_PPS event
+  // ------------------------------------------------------------
+  if (pps_telemetry_enabled) {
+    bool seen = false;
+    uint32_t cyc = 0;
+    uint32_t cnt = 0;
+
+    noInterrupts();
+    if (pps_seen) {
+      seen = true;
+      cyc = pps_cycles;
+      cnt = pps_count;
+      pps_seen = false;
+    }
+    interrupts();
+
+    if (seen) {
+      uint32_t now_ms = millis();
+
+      // Emit at most once every PPS_EMIT_INTERVAL_MS
+      if (now_ms - last_pps_emit_ms >= PPS_EMIT_INTERVAL_MS) {
+        last_pps_emit_ms = now_ms;
+
+        // Snapshot VCLOCK observables
+        uint32_t vclk_cyc = ARM_DWT_CYCCNT;
+        int vclk_lvl = digitalRead(GNSS_VCLK_PIN);
+
+        // Emit event
+        enqueueEvent(
+          "GNSS_PPS",
+          buildGnssPpsBody(cyc, cnt, vclk_cyc, vclk_lvl)
+        );
+
+        // Reset PPS counter for next window
+        noInterrupts();
+        pps_count = 0;
+        interrupts();
+      }
+    }
+  }
 
   while (Serial.available()) {
     char c = Serial.read();
