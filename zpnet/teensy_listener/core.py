@@ -74,13 +74,11 @@ def open_teensy_serial() -> serial.Serial:
     time.sleep(0.05)  # CDC settle
     return ser
 
-
 def send_cmd(ser: serial.Serial, cmd: dict) -> None:
     payload = json.dumps(cmd, separators=(",", ":")) + "\n"
     logging.debug("[teensy_listener] → %s", payload.strip())
     ser.write(payload.encode("utf-8"))
     ser.flush()
-
 
 # ---------------------------------------------------------------------
 # Low-level framed drain (shared)
@@ -92,17 +90,6 @@ def drain_events(
     collect: bool,
     stop_after: int | None = None,
 ) -> List[Dict[str, Any]]:
-    """
-    Drain one framed EVENTS.GET transaction.
-
-    Args:
-        persist: whether to write events to Postgres
-        collect: whether to return events in-memory
-        stop_after: optional max events to collect
-
-    Returns:
-        list of collected event dicts (if collect=True)
-    """
     collected: List[Dict[str, Any]] = []
     in_drain = False
 
@@ -139,71 +126,35 @@ def drain_events(
             create_event(event_type, payload)
 
         if collect:
-            collected.append(
-                {
-                    "event_type": event_type,
-                    "payload": payload,
-                }
-            )
+            collected.append({
+                "event_type": event_type,
+                "payload": payload,
+            })
             if stop_after and len(collected) >= stop_after:
                 break
 
     return collected
 
-
 # ---------------------------------------------------------------------
-# Durable despooling path (unchanged semantics)
+# Durable despooling path
 # ---------------------------------------------------------------------
 def drain_events_once(ser: serial.Serial) -> tuple[int, float]:
-    """
-    Perform one durable despool transaction.
-
-    IMPORTANT:
-        This path must yield to real-time queries.
-        If the serial lock is held (likely by a real-time request),
-        we skip this cycle rather than blocking.
-
-    Returns:
-        (events_received, elapsed_seconds)
-    """
     start = time.time()
-
     acquired = _serial_lock.acquire(timeout=0.05)
     if not acquired:
-        # Real-time query has priority; we do not block.
         return 0, 0.0
 
     try:
-        events = drain_events(
-            ser,
-            persist=True,
-            collect=False,
-        )
+        events = drain_events(ser, persist=True, collect=False)
         return len(events), time.time() - start
     finally:
         _serial_lock.release()
-
 
 def perform_realtime_query(
     cmd: dict,
     *,
     timeout_s: float = 1.0,
 ) -> List[Dict[str, Any]]:
-    """
-    Issue a Teensy query command (CMD?) and synchronously return
-    the immediate JSON reply.
-
-    Semantics:
-      • Reads exactly one JSON line
-      • Does NOT drain the event queue
-      • Does NOT persist anything
-      • Returns a list for API symmetry
-
-    Returns:
-        list containing one dict with keys:
-            { "type": ..., "payload": {...} }
-        or empty list on timeout / failure
-    """
     if _serial is None:
         return []
 
@@ -212,7 +163,6 @@ def perform_realtime_query(
     with _serial_lock:
         send_cmd(_serial, cmd)
 
-        # Read exactly one immediate reply line
         while time.time() < deadline:
             line = _serial.read_until(b"\n", size=1024)
             if not line:
@@ -223,7 +173,6 @@ def perform_realtime_query(
             except json.JSONDecodeError:
                 continue
 
-            # Immediate replies use "type", not "event_type"
             msg_type = msg.get("type")
             if not msg_type:
                 continue
@@ -231,18 +180,15 @@ def perform_realtime_query(
             payload = msg.copy()
             payload.pop("type", None)
 
-            return [
-                {
-                    "event_type": msg_type,
-                    "payload": payload,
-                }
-            ]
+            return [{
+                "event_type": msg_type,
+                "payload": payload,
+            }]
 
     return []
 
-
 # ---------------------------------------------------------------------
-# Real-time IPC server (Unix socket)
+# Real-time IPC server
 # ---------------------------------------------------------------------
 def realtime_socket_server():
     if os.path.exists(REALTIME_SOCKET_PATH):
@@ -270,53 +216,25 @@ def realtime_socket_server():
 
             events = perform_realtime_query(cmd, timeout_s=timeout)
 
-            logging.info(
-                "[rt] PHOTODIODE query returned %d events",
-                len(events)
-            )
+            resp = json.dumps({
+                "ok": True,
+                "events": events,
+            }, separators=(",", ":"))
 
-            resp = json.dumps(
-                {
-                    "ok": True,
-                    "events": events,
-                },
-                separators=(",", ":"),
-            )
-
-            # ----------------------------------------------------------
-            # IMPORTANT:
-            # Client may disconnect early (timeout, UI navigation, etc.).
-            # BrokenPipeError must NOT kill this server thread.
-            # ----------------------------------------------------------
             try:
                 conn.sendall(resp.encode("utf-8"))
             except BrokenPipeError:
-                logging.debug(
-                    "[teensy_listener][rt] client disconnected before response could be delivered"
-                )
+                logging.debug("[teensy_listener][rt] client disconnected before response could be delivered")
 
         except BrokenPipeError:
-            # Treat as benign: client left early. Do not attempt further writes.
-            logging.debug(
-                "[teensy_listener][rt] broken pipe during request handling (client disconnected)"
-            )
+            logging.debug("[teensy_listener][rt] broken pipe during request handling (client disconnected)")
 
         except Exception as e:
-            # If the client is still connected, attempt to send an error response.
-            # If the client disconnected, swallow BrokenPipe cleanly.
-            err = json.dumps(
-                {
-                    "ok": False,
-                    "error": str(e),
-                },
-                separators=(",", ":"),
-            )
+            err = json.dumps({"ok": False, "error": str(e)}, separators=(",", ":"))
             try:
                 conn.sendall(err.encode("utf-8"))
             except BrokenPipeError:
-                logging.debug(
-                    "[teensy_listener][rt] client disconnected before error could be delivered"
-                )
+                logging.debug("[teensy_listener][rt] client disconnected before error could be delivered")
 
         finally:
             try:
@@ -324,44 +242,40 @@ def realtime_socket_server():
             except Exception:
                 pass
 
-
 # ---------------------------------------------------------------------
-# Main daemon loop
+# Main daemon loop with serial reconnect
 # ---------------------------------------------------------------------
 def run() -> None:
     logging.info("🚀 [teensy_listener] starting Teensy transport authority")
-
     global _serial
-    try:
-        _serial = open_teensy_serial()
-        logging.info("🔌 [teensy_listener] serial connection established")
 
-        # Start real-time IPC server
-        threading.Thread(
-            target=realtime_socket_server,
-            daemon=True,
-        ).start()
-
-        while True:
-            events_received, elapsed = drain_events_once(_serial)
-            logging.info(
-                "✅ [teensy_listener] despool complete (%d events, %.2fs)",
-                events_received,
-                elapsed,
-            )
-            time.sleep(EVENT_DESPOOL_INTERVAL_S)
-
-    except Exception as e:
-        logging.exception("💥 [teensy_listener] daemon failure: %s", e)
-        raise
-
-    finally:
+    while True:
         try:
-            if _serial:
-                _serial.close()
-        except Exception:
-            pass
+            _serial = open_teensy_serial()
+            logging.info("🔌 [teensy_listener] serial connection established")
 
+            threading.Thread(
+                target=realtime_socket_server,
+                daemon=True,
+            ).start()
+
+            while True:
+                try:
+                    events_received, elapsed = drain_events_once(_serial)
+                    time.sleep(EVENT_DESPOOL_INTERVAL_S)
+                except serial.SerialException as e:
+                    logging.error("💥 Serial exception: %s — attempting to reconnect", e)
+                    try:
+                        _serial.close()
+                    except Exception:
+                        pass
+                    _serial = None
+                    time.sleep(3)
+                    break  # exit inner loop to reconnect serial
+
+        except Exception as e:
+            logging.exception("💥 [teensy_listener] daemon failure: %s", e)
+            time.sleep(3)
 
 # ---------------------------------------------------------------------
 # Bootstrap
