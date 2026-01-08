@@ -113,18 +113,16 @@ void command_exec(const char* line) {
   }
 
   // ------------------------------------------------------------
-  // LASER COMMANDS
+  // LASER COMMANDS (ACTUATION ONLY)
   // ------------------------------------------------------------
   if (strcmp(cmd, "LASER.ON") == 0) {
     laser_on();
-    enqueueEvent("LASER_STATE", "\"enabled\":true");
     enqueueAckEvent(cmd);
     return;
   }
 
   if (strcmp(cmd, "LASER.OFF") == 0) {
     laser_off();
-    enqueueEvent("LASER_STATE", "\"enabled\":false");
     enqueueAckEvent(cmd);
     return;
   }

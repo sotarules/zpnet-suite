@@ -6,11 +6,6 @@
 #include <Arduino.h>
 
 // --------------------------------------------------------------
-// Internal state
-// --------------------------------------------------------------
-static bool ldOn = false;
-
-// --------------------------------------------------------------
 // Internal helpers
 // --------------------------------------------------------------
 //
@@ -47,23 +42,15 @@ void laser_init() {
 
   digitalWrite(EN_PIN, LOW);
   digitalWrite(LD_ON_PIN, LOW);
-
-  ldOn = false;
 }
 
 void laser_on() {
   digitalWrite(EN_PIN, HIGH);
   digitalWrite(LD_ON_PIN, HIGH);
-  ldOn = true;
 }
 
 void laser_off() {
   digitalWrite(LD_ON_PIN, LOW);
-  ldOn = false;
-}
-
-bool laser_is_enabled() {
-  return ldOn;
 }
 
 String laser_measure_voltages() {

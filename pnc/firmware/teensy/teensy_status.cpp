@@ -2,7 +2,6 @@
 
 #include "config.h"
 #include "util.h"
-#include "laser.h"
 
 #include <Arduino.h>
 
@@ -34,10 +33,6 @@ String buildTeensyStatusBody() {
   // Heap availability
   b += ",\"free_heap_bytes\":";
   b += freeHeapBytes();
-
-  // Commanded laser state (intent, not emission)
-  b += ",\"laser_enabled\":";
-  b += (laser_is_enabled() ? "true" : "false");
 
   return b;
 }
