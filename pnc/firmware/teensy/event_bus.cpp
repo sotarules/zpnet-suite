@@ -43,7 +43,6 @@ void enqueueEvent(const char* type, const String& body) {
   }
 
   EventItem& e = evtq[evt_head];
-  e.ms = millis();
   safeCopy(e.type, sizeof(e.type), type);
   safeCopy(e.body, sizeof(e.body), body.c_str());
 
@@ -66,11 +65,9 @@ void drainEventsNow() {
   EventItem e;
   while (dequeueEvent(e)) {
     String b;
-    b += "\"millis\":";
-    b += e.ms;
 
+    // Body is already a valid JSON fragment (no braces)
     if (e.body[0]) {
-      b += ",";
       b += e.body;
     }
 
@@ -87,8 +84,6 @@ void enqueueAckEvent(const char* cmd) {
   b += cmd;
   b += "\"";
   b += ",\"ok\":true";
-  b += ",\"millis\":";
-  b += millis();
 
   enqueueEvent("ACK", b);
 }
@@ -99,8 +94,6 @@ void enqueueErrEvent(const char* cmd, const char* msg) {
   b += cmd;
   b += "\"";
   b += ",\"ok\":false";
-  b += ",\"millis\":";
-  b += millis();
 
   if (msg) {
     b += ",\"error\":\"";

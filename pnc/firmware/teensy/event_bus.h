@@ -18,7 +18,6 @@
 // Event item
 // --------------------------------------------------------------
 struct EventItem {
-  uint32_t ms;
   char type[EVT_TYPE_MAX];
   char body[EVT_BODY_MAX];
 };

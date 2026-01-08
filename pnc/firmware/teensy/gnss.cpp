@@ -173,9 +173,7 @@ void gnss_handle_pps() {
   int vclk_level = digitalRead(GNSS_VCLK_PIN);
 
   String b;
-  b += "\"millis\":";
-  b += millis();
-  b += ",\"pps_count\":";
+  b += "\"pps_count\":";
   b += cnt;
   b += ",\"cycles\":";
   b += cyc;

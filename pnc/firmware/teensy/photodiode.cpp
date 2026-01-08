@@ -124,9 +124,6 @@ String buildPhotodiodeStatusBody() {
     b += buf;
   }
 
-  b += ",\"millis\":";
-  b += millis();
-
   return b;
 }
 
@@ -139,8 +136,6 @@ String buildPhotodiodeCountBody() {
   String b;
   b += "\"count\":";
   b += count;
-  b += ",\"millis\":";
-  b += millis();
 
   return b;
 }

@@ -4,6 +4,10 @@ indent_style = space
 indent_size = 4
 
 # Teensy firmware (C/C++)
-[teensy.cpp]
+[*.cpp]
+indent_style = space
+indent_size = 2
+
+[*.h]
 indent_style = space
 indent_size = 2

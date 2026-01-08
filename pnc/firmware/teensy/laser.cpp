@@ -84,9 +84,6 @@ String laser_measure_voltages() {
   appendFloatKV(b, "off_v", off_v, 5);
   b += ",";
   appendFloatKV(b, "on_v", on_v, 5);
-  b += ",";
-  b += "\"millis\":";
-  b += millis();
 
   return b;
 }

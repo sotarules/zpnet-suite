@@ -23,10 +23,6 @@ String buildTeensyStatusBody() {
   b += teensy_fw_version();
   b += "\"";
 
-  // Monotonic uptime
-  b += ",\"millis\":";
-  b += millis();
-
   // CPU temperature (best-effort)
   b += ",\"cpu_temp_c\":";
   b += cpuTempC();
