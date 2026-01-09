@@ -9,6 +9,9 @@
 #include "gnss.h"
 #include "teensy_status.h"
 
+#include <string.h>
+#include <stdlib.h>
+
 // --------------------------------------------------------------
 // Internal helpers
 // --------------------------------------------------------------
@@ -32,6 +35,30 @@ static bool extractCmd(const char* line, char* out, size_t out_sz) {
 
   memcpy(out, p, n);
   out[n] = '\0';
+  return true;
+}
+
+// --------------------------------------------------------------
+// Extract optional float argument from "args" object
+// --------------------------------------------------------------
+static bool extractArgFloat(const char* line, const char* key, float& out) {
+  const char* args = strstr(line, "\"args\"");
+  if (!args) return false;
+
+  const char* p = strstr(args, key);
+  if (!p) return false;
+
+  p = strchr(p, ':');
+  if (!p) return false;
+  p++;
+
+  while (*p == ' ') p++;
+
+  char* endptr = nullptr;
+  float v = strtof(p, &endptr);
+  if (p == endptr) return false;
+
+  out = v;
   return true;
 }
 
@@ -130,6 +157,24 @@ void command_exec(const char* line) {
   if (strcmp(cmd, "LASER.VOLTAGES") == 0) {
     String body = laser_measure_voltages();
     enqueueEvent("LASER_VOLTAGES", body);
+    enqueueAckEvent(cmd);
+    return;
+  }
+
+  // ------------------------------------------------------------
+  // TEMPO PROFILING COMMANDS
+  // ------------------------------------------------------------
+  if (strcmp(cmd, "TEMPO.START") == 0) {
+    float altitude_m = NAN;
+    extractArgFloat(line, "altitude_m", altitude_m);
+
+    gnss_tempo_start(altitude_m);
+    enqueueAckEvent(cmd);
+    return;
+  }
+
+  if (strcmp(cmd, "TEMPO.STOP") == 0) {
+    gnss_tempo_stop();
     enqueueAckEvent(cmd);
     return;
   }

@@ -8,6 +8,13 @@
 //
 // Commands arrive as single-line JSON objects containing "cmd".
 //
+// Optional arguments may be supplied via an "args" object.
+//
+// Examples:
+//
+//   { "cmd": "TEMPO.START" }
+//   { "cmd": "TEMPO.START", "args": { "altitude_m": 1234.5 } }
+//
 // Semantics:
 //   CMD        → enqueue durable event(s)
 //   CMD?       → immediate, non-destructive reply (no queue)

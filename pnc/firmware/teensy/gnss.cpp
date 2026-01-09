@@ -33,13 +33,29 @@ static size_t lineLen = 0;
 static unsigned long lastGnssByteMs = 0;
 
 // --------------------------------------------------------------
-// PPS / VCLOCK
+// Tempo profiling state
 // --------------------------------------------------------------
-static volatile bool     pps_seen   = false;
-static volatile uint32_t pps_cycles = 0;
-static volatile uint32_t pps_count  = 0;
+// NOTE:
+// GNSS 10 MHz counters are intentionally inert in this version.
+// They will be driven by a hardware timer in a future revision.
+//
+static uint64_t gnss_10mhz_ticks_minute = 0;
+static uint64_t gnss_10mhz_ticks_total  = 0;
 
-static uint32_t last_pps_emit_ms = 0;
+// Placeholder for future Kyocera OCXO
+static uint64_t ocxo_10mhz_ticks_minute = 0;
+static uint64_t ocxo_10mhz_ticks_total  = 0;
+
+static uint64_t teensy_cycles_minute = 0;
+static uint64_t teensy_cycles_total  = 0;
+
+static uint32_t last_cycle_snapshot = 0;
+
+static bool     tempo_active = false;
+static bool     tempo_stop_requested = false;
+
+static float    tempo_altitude_m = NAN;
+static uint32_t tempo_start_ms = 0;
 
 // --------------------------------------------------------------
 // Helpers
@@ -98,27 +114,21 @@ static void ingestGnssLine(const char* line) {
 // --------------------------------------------------------------
 void gnss_init() {
   Serial1.begin(GNSSDO_BAUD);
-
-  pinMode(GNSS_PPS_PIN, INPUT);
   pinMode(GNSS_VCLK_PIN, INPUT);
 
-  // Enable ARM DWT cycle counter (Teensy 4.1)
+  // Enable ARM DWT cycle counter (600 MHz)
   ARM_DEMCR |= ARM_DEMCR_TRCENA;
   ARM_DWT_CTRL |= ARM_DWT_CTRL_CYCCNTENA;
   ARM_DWT_CYCCNT = 0;
 
-  attachInterrupt(
-    digitalPinToInterrupt(GNSS_PPS_PIN),
-    []() {
-      pps_cycles = ARM_DWT_CYCCNT;
-      pps_count++;
-      pps_seen = true;
-    },
-    RISING
-  );
+  // GNSS VCLOCK handling intentionally disabled here.
+  // Hardware timer integration will reintroduce counting safely.
 }
 
 void gnss_poll() {
+  // ------------------------------------------------------------
+  // GNSS serial ingestion
+  // ------------------------------------------------------------
   const unsigned long start_ms = millis();
   const unsigned long BUDGET_MS = 2;
   const uint32_t MAX_BYTES = 512;
@@ -146,49 +156,80 @@ void gnss_poll() {
     ingestGnssLine(lineBuf);
     lineLen = 0;
   }
+
+  // ------------------------------------------------------------
+  // Tempo profiling (Teensy cycles only, GNSS stubbed)
+  // ------------------------------------------------------------
+  if (!tempo_active) return;
+
+  uint32_t now_cycles = ARM_DWT_CYCCNT;
+  uint32_t delta = now_cycles - last_cycle_snapshot;
+  last_cycle_snapshot = now_cycles;
+
+  teensy_cycles_minute += delta;
+  teensy_cycles_total  += delta;
+
+  if (teensy_cycles_minute < 600000000ULL) return;
+
+  // Emit TEMPO_PROFILE (GNSS/OCXO counts intentionally zero)
+  String b;
+  b += "\"run_start_ms\":";
+  b += tempo_start_ms;
+
+  if (!isnan(tempo_altitude_m)) {
+    b += ",\"altitude_m\":";
+    b += tempo_altitude_m;
+  }
+
+  b += ",\"teensy_cycles_minute\":";
+  b += teensy_cycles_minute;
+  b += ",\"gnss_10mhz_minute\":";
+  b += gnss_10mhz_ticks_minute;
+  b += ",\"ocxo_10mhz_minute\":";
+  b += ocxo_10mhz_ticks_minute;
+
+  b += ",\"teensy_cycles_total\":";
+  b += teensy_cycles_total;
+  b += ",\"gnss_10mhz_total\":";
+  b += gnss_10mhz_ticks_total;
+  b += ",\"ocxo_10mhz_total\":";
+  b += ocxo_10mhz_ticks_total;
+
+  enqueueEvent("TEMPO_PROFILE", b);
+
+  // Reset minute buckets
+  teensy_cycles_minute = 0;
+  gnss_10mhz_ticks_minute = 0;
+  ocxo_10mhz_ticks_minute = 0;
+
+  if (tempo_stop_requested) {
+    tempo_active = false;
+    tempo_stop_requested = false;
+  }
 }
 
-void gnss_handle_pps() {
-  bool seen = false;
-  uint32_t cyc = 0;
-  uint32_t cnt = 0;
+void gnss_tempo_start(float altitude_m) {
+  gnss_10mhz_ticks_minute = 0;
+  gnss_10mhz_ticks_total  = 0;
+  ocxo_10mhz_ticks_minute = 0;
+  ocxo_10mhz_ticks_total  = 0;
 
-  noInterrupts();
-  if (pps_seen) {
-    seen = true;
-    cyc = pps_cycles;
-    cnt = pps_count;
-    pps_seen = false;
+  teensy_cycles_minute = 0;
+  teensy_cycles_total  = 0;
+
+  tempo_altitude_m = altitude_m;
+  tempo_start_ms = millis();
+
+  last_cycle_snapshot = ARM_DWT_CYCCNT;
+
+  tempo_active = true;
+  tempo_stop_requested = false;
+}
+
+void gnss_tempo_stop() {
+  if (tempo_active) {
+    tempo_stop_requested = true;
   }
-  interrupts();
-
-  if (!seen) return;
-
-  uint32_t now_ms = millis();
-  if (now_ms - last_pps_emit_ms < PPS_EMIT_INTERVAL_MS) return;
-
-  last_pps_emit_ms = now_ms;
-
-  uint32_t vclk_cycles = ARM_DWT_CYCCNT;
-  int vclk_level = digitalRead(GNSS_VCLK_PIN);
-
-  String b;
-  b += "\"pps_count\":";
-  b += cnt;
-  b += ",\"cycles\":";
-  b += cyc;
-  b += ",\"vclk_cycles\":";
-  b += vclk_cycles;
-  b += ",\"vclk_level\":";
-  b += vclk_level;
-  b += ",\"emit_interval_ms\":";
-  b += PPS_EMIT_INTERVAL_MS;
-
-  enqueueEvent("GNSS_PPS", b);
-
-  noInterrupts();
-  pps_count = 0;
-  interrupts();
 }
 
 String buildGnssStatusBody() {

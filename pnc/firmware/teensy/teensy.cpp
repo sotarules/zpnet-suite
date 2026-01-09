@@ -68,9 +68,9 @@ void loop() {
   photodiode_update();
 
   // ------------------------------------------------------------
-  // Priority 2: GNSS PPS handling (internally rate-limited)
+  // Priority 2: GNSS serial ingestion + tempo profiling
   // ------------------------------------------------------------
-  gnss_handle_pps();
+  gnss_poll();
 
   // ------------------------------------------------------------
   // Priority 3: USB CDC command ingestion
@@ -91,9 +91,4 @@ void loop() {
       cmd_buf[cmd_len++] = c;
     }
   }
-
-  // ------------------------------------------------------------
-  // Priority 4: GNSS serial ingestion (bounded, opportunistic)
-  // ------------------------------------------------------------
-  gnss_poll();
 }
