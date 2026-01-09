@@ -1,4 +1,5 @@
 #include "event_bus.h"
+#include "transport.h"
 #include "util.h"
 
 // --------------------------------------------------------------
@@ -13,15 +14,56 @@ static uint32_t evt_dropped = 0;
 // --------------------------------------------------------------
 // Internal helpers
 // --------------------------------------------------------------
-static inline void emitJson(const char* type, const String& body) {
-  Serial.print("{\"event_type\":\"");
-  Serial.print(type);
-  Serial.print("\"");
-  if (body.length()) {
-    Serial.print(",");
-    Serial.print(body);
+//
+// Emit a protocol-control message (NOT an event).
+// If body == nullptr, only the control field is emitted.
+//
+static inline void emitControlMessage(
+    const char* control,
+    const String* body
+) {
+  String out;
+
+  out += "{\"control\":\"";
+  out += control;
+  out += "\"";
+
+  if (body && body->length() > 0) {
+    out += ",";
+    out += *body;
   }
-  Serial.println("}");
+
+  out += "}";
+
+  transport_send_frame(out.c_str(), out.length());
+}
+
+// Overload: control-only message (no body)
+static inline void emitControlMessage(const char* control) {
+  emitControlMessage(control, nullptr);
+}
+
+//
+// Emit a factual event message (durable truth).
+//
+static inline void emitEventMessage(
+    const char* type,
+    const String& body
+) {
+  String out;
+
+  out += "{\"event_type\":\"";
+  out += type;
+  out += "\"";
+
+  if (body.length() > 0) {
+    out += ",";
+    out += body;
+  }
+
+  out += "}";
+
+  transport_send_frame(out.c_str(), out.length());
 }
 
 static bool dequeueEvent(EventItem& out) {
@@ -51,31 +93,38 @@ void enqueueEvent(const char* type, const String& body) {
 }
 
 void drainEventsNow() {
-  // Frame: BEGIN
+  // ------------------------------------------------------------
+  // Protocol control: EVENTS_BEGIN
+  // ------------------------------------------------------------
   {
-    String b;
-    b += "\"count\":";
-    b += evt_count;
-    b += ",\"dropped\":";
-    b += evt_dropped;
-    emitJson("EVENTS_BEGIN", b);
+    String meta;
+    meta += "\"count\":";
+    meta += evt_count;
+    meta += ",\"dropped\":";
+    meta += evt_dropped;
+
+    emitControlMessage("EVENTS_BEGIN", &meta);
   }
 
-  // Drain queue
+  // ------------------------------------------------------------
+  // Drain queued events (pure facts)
+  // ------------------------------------------------------------
   EventItem e;
   while (dequeueEvent(e)) {
-    String b;
+    String body;
 
     // Body is already a valid JSON fragment (no braces)
     if (e.body[0]) {
-      b += e.body;
+      body += e.body;
     }
 
-    emitJson(e.type, b);
+    emitEventMessage(e.type, body);
   }
 
-  // Frame: END
-  emitJson("EVENTS_END", "\"count\":0");
+  // ------------------------------------------------------------
+  // Protocol control: EVENTS_END
+  // ------------------------------------------------------------
+  emitControlMessage("EVENTS_END");
 }
 
 void enqueueAckEvent(const char* cmd) {

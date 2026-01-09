@@ -52,7 +52,7 @@ static const int GNSS_VCLK_PIN = 9;
 // These define the maximum durable telemetry backlog.
 // Overflow results in dropped events, counted explicitly.
 //
-static const size_t EVT_MAX       = 32;
+static const size_t EVT_MAX       = 128;
 static const size_t EVT_TYPE_MAX  = 32;
 static const size_t EVT_BODY_MAX  = 512;
 

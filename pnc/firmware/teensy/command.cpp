@@ -8,6 +8,8 @@
 #include "photodiode.h"
 #include "gnss.h"
 #include "teensy_status.h"
+#include "dwt_clock.h"
+#include "transport.h"
 
 #include <string.h>
 #include <stdlib.h>
@@ -39,45 +41,29 @@ static bool extractCmd(const char* line, char* out, size_t out_sz) {
 }
 
 // --------------------------------------------------------------
-// Extract optional float argument from "args" object
-// --------------------------------------------------------------
-static bool extractArgFloat(const char* line, const char* key, float& out) {
-  const char* args = strstr(line, "\"args\"");
-  if (!args) return false;
-
-  const char* p = strstr(args, key);
-  if (!p) return false;
-
-  p = strchr(p, ':');
-  if (!p) return false;
-  p++;
-
-  while (*p == ' ') p++;
-
-  char* endptr = nullptr;
-  float v = strtof(p, &endptr);
-  if (p == endptr) return false;
-
-  out = v;
-  return true;
-}
-
-// --------------------------------------------------------------
-// Immediate JSON emit (QUERY plane only)
-// --------------------------------------------------------------
+// Immediate framed emit (QUERY plane only)
 //
 // Used ONLY for non-destructive CMD? queries.
 // Bypasses the event queue entirely.
-//
-static inline void emitImmediateJson(const char* type, const String& body) {
-  Serial.print("{\"type\":\"");
-  Serial.print(type);
-  Serial.print("\"");
-  if (body.length()) {
-    Serial.print(",");
-    Serial.print(body);
+// --------------------------------------------------------------
+static inline void emitImmediateFramed(
+    const char* type,
+    const String& body
+) {
+  String out;
+
+  out += "{\"type\":\"";
+  out += type;
+  out += "\"";
+
+  if (body.length() > 0) {
+    out += ",";
+    out += body;
   }
-  Serial.println("}");
+
+  out += "}";
+
+  transport_send_frame(out.c_str(), out.length());
 }
 
 // --------------------------------------------------------------
@@ -92,7 +78,7 @@ void command_exec(const char* line) {
   }
 
   // ------------------------------------------------------------
-  // STATUS / DATA COMMANDS (event-producing)
+  // STATUS / DATA COMMANDS (event-producing, durable)
   // ------------------------------------------------------------
   if (strcmp(cmd, "TEENSY.STATUS") == 0) {
     enqueueEvent("TEENSY_STATUS", buildTeensyStatusBody());
@@ -113,15 +99,24 @@ void command_exec(const char* line) {
   // QUERY COMMANDS (NON-DESTRUCTIVE, IMMEDIATE)
   // ------------------------------------------------------------
   if (strcmp(cmd, "PHOTODIODE.STATUS?") == 0) {
-    emitImmediateJson(
+    emitImmediateFramed(
       "PHOTODIODE_STATUS",
       buildPhotodiodeStatusBody()
     );
     return;
   }
 
+  if (strcmp(cmd, "DWT.COUNT?") == 0) {
+    String b;
+    b += "\"cycles\":";
+    b += dwt_clock_read();
+
+    emitImmediateFramed("DWT_COUNT", b);
+    return;
+  }
+
   // ------------------------------------------------------------
-  // PHOTODIODE COMMANDS
+  // PHOTODIODE COMMANDS (event-producing)
   // ------------------------------------------------------------
   if (strcmp(cmd, "PHOTODIODE.STATUS") == 0) {
     enqueueEvent("PHOTODIODE_STATUS", buildPhotodiodeStatusBody());
@@ -179,7 +174,7 @@ void command_exec(const char* line) {
   }
 
   // ------------------------------------------------------------
-  // UNKNOWN
+  // UNKNOWN COMMAND
   // ------------------------------------------------------------
   enqueueErrEvent(cmd, "unknown command");
 }
