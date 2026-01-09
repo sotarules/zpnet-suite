@@ -13,7 +13,7 @@ from pathlib import Path
 # ---------------------------------------------------------------------
 # Versioning / Metadata
 # ---------------------------------------------------------------------
-ZPNET_VERSION = "ZPNet 3.0.0"
+ZPNET_VERSION = "ZPNet 3.1.0"
 ZPNET_AUTHOR = "The Mule"
 
 # ---------------------------------------------------------------------
@@ -29,7 +29,6 @@ HTTP_RETRY_BACKOFF = 1.0           # seconds
 # Filesystem / Database
 # ---------------------------------------------------------------------
 ZPNET_ROOT = Path("/home/mule/zpnet")
-DB_PATH = ZPNET_ROOT / "zpnet.db"
 CACHE_PATH = Path("/home/mule/.cache/zpnet")
 
 # ---------------------------------------------------------------------
@@ -68,7 +67,7 @@ EMOJI = {
 # ---------------------------------------------------------------------
 # Teensy Serial Configuration
 # ---------------------------------------------------------------------
-TEENSY_SERIAL_PORT = os.environ.get("ZPNET_TEENSY_PORT", "/dev/zpnet-teensy")
+TEENSY_SERIAL_PORT = os.environ.get("ZPNET_TEENSY_PORT", "/dev/zpnet-teensy-serial")
 TEENSY_BAUDRATE = 115200
 TEENSY_RECONNECT_DELAY_S = 5     # seconds between reconnection attempts
 TEENSY_READ_TIMEOUT_S = 1        # serial read timeout (seconds)

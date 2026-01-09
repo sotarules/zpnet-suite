@@ -1,51 +1,20 @@
 """
 ZPNet GNSS Data Monitor — Authoritative Clock Snapshot Publisher
 
-Responsibilities:
-  • Issue a GNSS.DATA command to the Teensy
-  • Cause a GNSS_DATA event to be enqueued on the Teensy
-  • Perform NO interpretation, parsing, or cadence logic
-  • Emit NOTHING directly
-  • Remain stateless and scheduler-driven
-
-GNSS_DATA represents canonical clock truth.
-This module requests its publication; it does not own it.
-
-Delivery semantics:
-  • Command returns ACK only
-  • Actual GNSS_DATA flows through the EVENT queue
-  • Ingested via teensy_listener during normal despool
-  • Aggregated downstream
-
 Author: The Mule + GPT
 """
 
 import logging
 
 from zpnet.shared.logger import setup_logging
-from zpnet.shared.serial import (
-    send_teensy_command,
-    cmd_gnss_data,   # ← event-generating command (no ?)
-)
+from zpnet.shared.teensy import request_gnss_data
 
 # ---------------------------------------------------------------------
 # Main Routine
 # ---------------------------------------------------------------------
 def run() -> None:
-    """
-    Request that the Teensy publish its current authoritative GNSS data.
-
-    Semantics:
-      • Imperative command (GNSS.DATA)
-      • Causes GNSS_DATA to be enqueued as an EVENT
-      • No immediate response data is expected
-      • Durable, framed delivery via EVENTS.GET
-
-    Emits (indirectly, via Teensy event queue):
-        GNSS_DATA
-    """
     logging.debug("[gnss_data_monitor] requesting GNSS_DATA publication")
-    send_teensy_command(cmd_gnss_data())
+    request_gnss_data()
 
 
 # ---------------------------------------------------------------------

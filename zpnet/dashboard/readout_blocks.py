@@ -8,12 +8,8 @@ Author: The Mule + GPT
 """
 
 from collections.abc import Generator
-
-from zpnet.dashboard.core import (
-    fetch_aggregate,
-    teensy_realtime_query,
-)
-
+from zpnet.dashboard.core import fetch_aggregate
+from zpnet.shared.teensy import photodiode_status
 
 # ---------------------------------------------------------------------
 # GNSS
@@ -206,7 +202,7 @@ def photodiode_status_readout(locked: bool = False) -> Generator[str, None, None
       • No persistence
       • Ground-truth only
     """
-    events = teensy_realtime_query({"cmd": "PHOTODIODE.STATUS?"})
+    events = photodiode_status()
 
     if not events:
         yield "PHOTODIODE STATUS: DOWN"

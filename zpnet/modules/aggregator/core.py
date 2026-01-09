@@ -18,7 +18,7 @@ from typing import Any
 
 from zpnet.shared.db import open_db
 from zpnet.shared.logger import setup_logging
-
+from zpnet.shared.teensy import photodiode_status
 
 # ---------------------------------------------------------------------
 # Constants
@@ -376,10 +376,9 @@ def aggregate_laser_status():
     # Imperative photodiode query (safe IPC path)
     # ------------------------------------------------------------------
     try:
-        from zpnet.dashboard.core import teensy_realtime_query
         from zpnet.shared.constants import LASER_PHOTODIODE_ON_THRESHOLD_V
 
-        events = teensy_realtime_query({"cmd": "PHOTODIODE.STATUS?"})
+        events = photodiode_status()
         if events:
             pd = events[0].get("payload", {})
             analog_v = pd.get("analog_v")

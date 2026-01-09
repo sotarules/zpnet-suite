@@ -20,8 +20,7 @@ from smbus2 import SMBus
 
 from zpnet.shared.logger import setup_logging
 from zpnet.shared.events import create_event
-from zpnet.shared.serial import send_teensy_command
-from zpnet.shared.constants import DB_PATH  # retained for structural symmetry
+from zpnet.shared.teensy import system_shutdown
 
 
 # ---------------------------------------------------------------------
@@ -101,7 +100,7 @@ def shutdown_system(reason: str) -> None:
 
     # Step 2 — instruct Teensy to quiesce (best-effort)
     try:
-        send_teensy_command({"cmd": "SYSTEM.SHUTDOWN"})
+        system_shutdown()
     except Exception:
         pass
 

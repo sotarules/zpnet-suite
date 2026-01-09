@@ -6,9 +6,6 @@ This subsystem parallels the Teensy telemetry stream, providing host-level
 status such as CPU temperature, load averages, memory usage, disk usage,
 uptime, and network I/O statistics.
 
-Now imports shared constants (DB_PATH, etc.) from zpnet.shared.constants
-to maintain symmetry with other ZPNet modules.
-
 Author: The Mule
 """
 
@@ -24,7 +21,6 @@ import psutil
 
 from zpnet.shared.events import create_event
 from zpnet.shared.logger import setup_logging
-from zpnet.shared.constants import DB_PATH  # ← NEW (for consistency / future use)
 
 # ---------------------------------------------------------------------
 # Configuration

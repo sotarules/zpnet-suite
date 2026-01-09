@@ -66,49 +66,6 @@ TEENSY_RT_SOCKET_PATH = "/tmp/zpnet_teensy_rt.sock"
 TEENSY_RT_DEFAULT_TIMEOUT_S = 1.0
 TEENSY_RT_RECV_MAX_BYTES = 16384
 
-
-def teensy_realtime_query(cmd: dict, timeout_s: float = TEENSY_RT_DEFAULT_TIMEOUT_S) -> list[dict] | None:
-    """
-    Synchronously query Teensy via teensy_listener's real-time IPC socket.
-
-    Args:
-        cmd (dict): Teensy command dict, e.g. {"cmd":"PHOTODIODE.STATUS"}
-        timeout_s (float): socket timeout budget
-
-    Returns:
-        list[dict] | None: list of returned events on success, None on failure.
-
-    Contract:
-        • Dashboard never touches /dev/ttyACM0
-        • teensy_listener remains the sole serial owner
-        • Returned events are ephemeral (not persisted here)
-    """
-    try:
-        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
-            s.settimeout(timeout_s)
-            s.connect(TEENSY_RT_SOCKET_PATH)
-
-            req = {"cmd": cmd, "timeout_s": timeout_s}
-            s.sendall(json.dumps(req, separators=(",", ":")).encode("utf-8"))
-
-            raw = s.recv(TEENSY_RT_RECV_MAX_BYTES)
-            if not raw:
-                return None
-
-            resp = json.loads(raw.decode("utf-8"))
-            if not isinstance(resp, dict):
-                return None
-
-            if resp.get("ok") is True:
-                events = resp.get("events", [])
-                return events if isinstance(events, list) else []
-
-            return None
-
-    except Exception:
-        return None
-
-
 # ---------------------------------------------------------------------
 # DB Helper
 # ---------------------------------------------------------------------
