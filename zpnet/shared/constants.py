@@ -68,7 +68,7 @@ EMOJI = {
 # ---------------------------------------------------------------------
 # Teensy Serial Configuration
 # ---------------------------------------------------------------------
-TEENSY_SERIAL_PORT = os.environ.get("ZPNET_TEENSY_PORT", "/dev/ttyACM0")
+TEENSY_SERIAL_PORT = os.environ.get("ZPNET_TEENSY_PORT", "/dev/zpnet-teensy")
 TEENSY_BAUDRATE = 115200
 TEENSY_RECONNECT_DELAY_S = 5     # seconds between reconnection attempts
 TEENSY_READ_TIMEOUT_S = 1        # serial read timeout (seconds)

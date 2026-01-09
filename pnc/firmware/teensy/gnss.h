@@ -24,10 +24,7 @@ void gnss_init();
 // Opportunistic serial ingestion (call every loop)
 void gnss_poll();
 
-// Tempo profiling control
-void gnss_tempo_start(float altitude_m);
-void gnss_tempo_stop();
-
 // Telemetry builders (JSON body fragments)
 String buildGnssStatusBody();
 String buildGnssDataBody();
+

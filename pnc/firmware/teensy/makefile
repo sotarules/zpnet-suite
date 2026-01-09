@@ -4,7 +4,7 @@
 
 NAME=teensy
 BOARD=teensy:avr:teensy41
-PORT=/dev/ttyACM0
+PORT=/dev/zpnet-teensy
 BAUD=115200
 ARDUINO_CLI=../../bin/arduino-cli
 

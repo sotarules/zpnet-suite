@@ -162,24 +162,6 @@ void command_exec(const char* line) {
   }
 
   // ------------------------------------------------------------
-  // TEMPO PROFILING COMMANDS
-  // ------------------------------------------------------------
-  if (strcmp(cmd, "TEMPO.START") == 0) {
-    float altitude_m = NAN;
-    extractArgFloat(line, "altitude_m", altitude_m);
-
-    gnss_tempo_start(altitude_m);
-    enqueueAckEvent(cmd);
-    return;
-  }
-
-  if (strcmp(cmd, "TEMPO.STOP") == 0) {
-    gnss_tempo_stop();
-    enqueueAckEvent(cmd);
-    return;
-  }
-
-  // ------------------------------------------------------------
   // SYSTEM COMMANDS (TERMINAL)
   // ------------------------------------------------------------
   if (strcmp(cmd, "SYSTEM.SHUTDOWN") == 0) {
