@@ -4,12 +4,19 @@ ZPNet Dashboard Readout Blocks
 Each readout is a generator that emits lines of text representing
 a system status snapshot. These are used in the terminal UI.
 
+Important semantic rule:
+  • Readouts must NEVER throw.
+  • Imperative instruments must be wrapped defensively.
+  • Rendering consumes truth; it does not acquire it.
+
 Author: The Mule + GPT
 """
 
 from collections.abc import Generator
+
 from zpnet.dashboard.core import fetch_aggregate
 from zpnet.shared.teensy import photodiode_status
+
 
 # ---------------------------------------------------------------------
 # GNSS
@@ -23,13 +30,13 @@ def gnss_data_readout() -> Generator[str, None, None]:
         return
 
     if "utc_datetime" in ag:
-        yield f"UTC: {ag.get('utc_datetime')}"
+        yield f"UTC: {ag['utc_datetime']}"
     if "time_status" in ag:
-        yield f"TIME STATUS: {ag.get('time_status')}"
+        yield f"TIME STATUS: {ag['time_status']}"
     if "leap_seconds" in ag:
-        yield f"LEAP SECONDS: {ag.get('leap_seconds')}"
+        yield f"LEAP SECONDS: {ag['leap_seconds']}"
     if "freq_mode" in ag:
-        yield f"FREQ MODE: {ag.get('freq_mode')}"
+        yield f"FREQ MODE: {ag['freq_mode']}"
 
     if "pps_accuracy_ns" in ag:
         yield f"PPS ACCURACY: {ag['pps_accuracy_ns']} NS"
@@ -49,7 +56,7 @@ def gnss_data_readout() -> Generator[str, None, None]:
 
 
 # ---------------------------------------------------------------------
-# Laser
+# Laser (aggregated truth)
 # ---------------------------------------------------------------------
 def laser_status_readout() -> Generator[str, None, None]:
     ag = fetch_aggregate("LASER_STATUS")
@@ -64,7 +71,7 @@ def laser_status_readout() -> Generator[str, None, None]:
     yield f"ID1 ENABLED: {'YES' if ag.get('id1_enabled') else 'NO'}"
     yield f"MODE: {ag.get('id1_mode', 'UNKNOWN')}"
     yield f"CURRENT CODE: {ag.get('id1_current_code', 0)}"
-    yield f"LASER ENABLED: {'YES' if ag.get('laser_enabled') else 'NO'}"
+    yield f"LASER EMITTING: {'YES' if ag.get('laser_enabled') else 'NO'}"
 
 
 # ---------------------------------------------------------------------
@@ -90,6 +97,7 @@ def environment_status_readout() -> Generator[str, None, None]:
 def sensor_scan_readout() -> Generator[str, None, None]:
     ag = fetch_aggregate("SENSOR_SCAN")
     yield f"SENSOR SCAN: {ag.get('health_state', 'DOWN')}"
+
     for k, v in ag.items():
         if isinstance(v, str) and k != "health_state":
             yield f"{k.upper()}: {v.upper()}"
@@ -147,6 +155,7 @@ def power_status_readout() -> Generator[str, None, None]:
             load_total_w += p
 
     yield f"TOTAL LOAD POWER: {load_total_w:.3f} W"
+
     if battery_power_w and battery_power_w > 0:
         eff = (load_total_w / battery_power_w) * 100.0
         yield f"EFFICIENCY: {eff:.1f} %"
@@ -163,7 +172,7 @@ def network_status_readout() -> Generator[str, None, None]:
         yield "NETWORK DATA UNAVAILABLE."
         return
 
-    yield f"SERVER HOST: sota.ddns.net"
+    yield "SERVER HOST: sota.ddns.net"
     yield f"LOCAL IP: {ag.get('local_ip', '0.0.0.0')}"
     yield f"SSID: {ag.get('ssid', 'UNKNOWN')}"
     yield f"PING: {ag.get('ping_ms', 0):.1f} MS"
@@ -189,27 +198,28 @@ def teensy_status_readout() -> Generator[str, None, None]:
 
 
 # ---------------------------------------------------------------------
-# PHOTODIODE (REAL-TIME INSTRUMENT)
+# PHOTODIODE (IMPERATIVE INSTRUMENT — SNAPSHOT ONLY)
 # ---------------------------------------------------------------------
-def photodiode_status_readout(locked: bool = False) -> Generator[str, None, None]:
+def photodiode_status_readout() -> Generator[str, None, None]:
     """
-    Real-time photodiode instrument readout.
+    Ground-truth photodiode instrument snapshot.
 
     Semantics:
-      • Snapshot read when unlocked
-      • Continuous 1 Hz updates when locked (cadence handled by core)
+      • Imperative query
       • No aggregation
       • No persistence
-      • Ground-truth only
+      • Render-only
+      • Must NEVER throw
     """
-    events = photodiode_status()
+    try:
+        payload = photodiode_status(timeout_s=0.2)
+    except Exception:
+        payload = {}
 
-    if not events:
+    if not payload:
         yield "PHOTODIODE STATUS: DOWN"
         yield "NO REAL-TIME DATA"
         return
-
-    payload = events[0].get("payload", {})
 
     edge_level = payload.get("edge_level", 0)
     edge_count = payload.get("edge_pulse_count", 0)
@@ -238,24 +248,32 @@ def raspberry_pi_status_readout() -> Generator[str, None, None]:
 
     yield f"DEVICE: {ag.get('device_name', 'UNKNOWN')}"
     yield f"CPU TEMP: {ag.get('cpu_temp_c', 0):.1f} C"
-    yield f"LOAD (1/5/15): {ag.get('load_1m', 0):.2f} / {ag.get('load_5m', 0):.2f} / {ag.get('load_15m', 0):.2f}"
+    yield (
+        f"LOAD (1/5/15): "
+        f"{ag.get('load_1m', 0):.2f} / "
+        f"{ag.get('load_5m', 0):.2f} / "
+        f"{ag.get('load_15m', 0):.2f}"
+    )
     yield f"UPTIME: {ag.get('uptime_s', 0) / 3600:.2f} H"
 
     mem = ag.get("memory", {})
-    yield f"MEM USED: {mem.get('used_mb', 0):.0f} / {mem.get('total_mb', 0):.0f} MB ({mem.get('percent', 0):.1f}%)"
+    yield (
+        f"MEM USED: {mem.get('used_mb', 0):.0f} / "
+        f"{mem.get('total_mb', 0):.0f} MB "
+        f"({mem.get('percent', 0):.1f}%)"
+    )
 
     disk = ag.get("disk", {})
-    yield f"DISK USED: {disk.get('used_gb', 0):.2f} / {disk.get('total_gb', 0):.2f} GB ({disk.get('percent', 0):.1f}%)"
+    yield (
+        f"DISK USED: {disk.get('used_gb', 0):.2f} / "
+        f"{disk.get('total_gb', 0):.2f} GB "
+        f"({disk.get('percent', 0):.1f}%)"
+    )
 
     uv = ag.get("undervoltage_flags", {})
-    uv_now = uv.get("currently_undervolted")
-    uv_past = uv.get("previously_undervolted")
-
-    if uv_now is True:
+    if uv.get("currently_undervolted") is True:
         yield "⚠️ UNDERVOLTAGE: ACTIVE"
-    elif uv_past is True:
+    elif uv.get("previously_undervolted") is True:
         yield "⚠️ UNDERVOLTAGE: RECOVERED"
-    elif uv_now is False and uv_past is False:
-        yield "UNDERVOLTAGE: NONE"
     else:
-        yield "UNDERVOLTAGE: UNKNOWN"
+        yield "UNDERVOLTAGE: NONE"

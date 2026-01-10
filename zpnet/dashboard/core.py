@@ -1,15 +1,13 @@
 """
-ZPNet Dashboard — PostgreSQL-Compliant Edition (v2025-12-19-psql)
+ZPNet Dashboard — Stable Render + WebSocket Edition (v2026-01-09)
 
-Terminal-style real-time dashboard using pygame with dynamic readouts.
+Terminal-style real-time dashboard using pygame.
 
-Modes:
-  • UNLOCKED — TTY-style animated readouts (hacker chic)
-  • LOCKED   — Instrument panel with React-style reconciliation
-
-Live observable surface:
-  • WebSocket server on ws://zpnet.local:8765
-  • Broadcasts dashboard readout when rendered output changes
+Key invariants:
+  • Rendering must NEVER throw
+  • No imperative hardware queries in core
+  • WebSocket failures must never affect UI
+  • Dashboard is an observer, not an instrument
 
 Author: The Mule + GPT
 """
@@ -20,7 +18,6 @@ import sys
 import time
 import threading
 import asyncio
-import socket
 from collections.abc import Generator
 from typing import Callable
 
@@ -49,25 +46,20 @@ SCREEN_WIDTH, SCREEN_HEIGHT = 800, 480
 FONT_NAME = "IBM 3270"
 FONT_SIZE = 30
 READOUT_PADDING = 2
+
 BG_COLOR = (0, 0, 0)
 HEADER_COLOR = (255, 255, 255)
 TEXT_COLOR = (0, 255, 0)
 
-READOUT_DELAY = 2
+READOUT_DELAY = 2.0
 LOCKED_REFRESH_S = 0.5
 
 WS_HOST = "0.0.0.0"
 WS_PORT = 8765
 
-# ---------------------------------------------------------------------
-# Real-time Teensy query plane (IPC via teensy_listener)
-# ---------------------------------------------------------------------
-TEENSY_RT_SOCKET_PATH = "/tmp/zpnet_teensy_rt.sock"
-TEENSY_RT_DEFAULT_TIMEOUT_S = 1.0
-TEENSY_RT_RECV_MAX_BYTES = 16384
 
 # ---------------------------------------------------------------------
-# DB Helper
+# Database Access (read-only, defensive)
 # ---------------------------------------------------------------------
 def fetch_aggregate(name: str) -> dict:
     try:
@@ -83,13 +75,10 @@ def fetch_aggregate(name: str) -> dict:
             return {}
 
         payload = row["payload"]
-
         if isinstance(payload, dict):
             return payload
-
         if isinstance(payload, (str, bytes, bytearray)):
             return json.loads(payload)
-
         return {}
 
     except Exception:
@@ -116,7 +105,7 @@ def header_readout(prefix: str = "") -> list[str]:
     ag_net = fetch_aggregate("NETWORK_STATUS")
     ag_bat = fetch_aggregate("BATTERY_STATE_OF_CHARGE")
     ag_env = fetch_aggregate("ENVIRONMENT_STATUS")
-    ag_gnss = fetch_aggregate("GNSS_DATA")
+    ag_gns = fetch_aggregate("GNSS_DATA")
     ag_las = fetch_aggregate("LASER_STATUS")
     ag_pow = fetch_aggregate("POWER_STATUS")
     ag_sen = fetch_aggregate("SENSOR_SCAN")
@@ -131,7 +120,7 @@ def header_readout(prefix: str = "") -> list[str]:
         ag_net.get("health_state"),
         ag_bat.get("health_state"),
         ag_env.get("health_state"),
-        ag_gnss.get("health_state"),
+        ag_gns.get("health_state"),
         ag_las.get("health_state"),
         ag_pow.get("health_state"),
         ag_sen.get("health_state"),
@@ -141,12 +130,6 @@ def header_readout(prefix: str = "") -> list[str]:
 
     overall = combine_health([h for h in healths if h])
     return [f"{prefix}NET: {ssid}  BAT: {batt_str}  SYS: {overall}", ""]
-
-
-# ---------------------------------------------------------------------
-# Typing
-# ---------------------------------------------------------------------
-Readout = Generator[str, None, None]
 
 
 # ---------------------------------------------------------------------
@@ -161,10 +144,11 @@ from zpnet.dashboard.readout_blocks import (
     power_status_readout,
     network_status_readout,
     teensy_status_readout,
+    photodiode_status_readout,
     raspberry_pi_status_readout,
-    photodiode_status_readout,  # NEW
 )
 
+Readout = Generator[str, None, None]
 
 READOUTS: list[Callable[[], Readout]] = [
     gnss_data_readout,
@@ -175,13 +159,13 @@ READOUTS: list[Callable[[], Readout]] = [
     power_status_readout,
     network_status_readout,
     teensy_status_readout,
-    photodiode_status_readout,  # NEW
+    photodiode_status_readout,
     raspberry_pi_status_readout,
 ]
 
 
 # ---------------------------------------------------------------------
-# Event Pump
+# Event Pump (never blocks)
 # ---------------------------------------------------------------------
 def pump_events(locked: bool, idx: int, count: int) -> tuple[bool, int]:
     for event in pygame.event.get():
@@ -216,8 +200,6 @@ def render_tty(screen, font, header: list[str], body: list[str], clock) -> None:
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 handle_exit()
-            elif event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
-                handle_exit()
 
         surf = font.render(line.upper(), True, TEXT_COLOR)
         screen.blit(surf, (20, y))
@@ -246,7 +228,7 @@ def render_panel(screen, font, header: list[str], body: list[str]) -> None:
 
 
 # ---------------------------------------------------------------------
-# WebSocket Observable Surface
+# WebSocket Surface (hardened)
 # ---------------------------------------------------------------------
 _ws_clients: set = set()
 _ws_loop: asyncio.AbstractEventLoop | None = None
@@ -272,17 +254,17 @@ def start_ws_server():
     _ws_loop.run_until_complete(_ws_server())
 
 
-def ws_broadcast(payload: dict):
+def ws_broadcast(payload: dict) -> None:
     if not _ws_clients or _ws_loop is None:
         return
 
     msg = json.dumps(payload, separators=(",", ":"))
 
-    def _send():
-        for ws in list(_ws_clients):
-            asyncio.create_task(ws.send(msg))
-
-    _ws_loop.call_soon_threadsafe(_send)
+    for ws in list(_ws_clients):
+        try:
+            asyncio.run_coroutine_threadsafe(ws.send(msg), _ws_loop)
+        except Exception:
+            _ws_clients.discard(ws)
 
 
 # ---------------------------------------------------------------------
@@ -299,48 +281,46 @@ def main() -> None:
     readout_idx = 0
     last_rendered: list[str] | None = None
 
-    # Start WebSocket server inside dashboard
+    # Start WebSocket server
     threading.Thread(target=start_ws_server, daemon=True).start()
 
     while True:
-        locked, readout_idx = pump_events(locked, readout_idx, len(READOUTS))
-        prefix = "* " if locked else ""
-
-        header = header_readout(prefix=prefix)
-
-        # --------------------------------------------------------------
-        # Readout execution
-        # --------------------------------------------------------------
-        #
-        # All readouts remain simple generators.
-        # Some may optionally accept a `locked=` kwarg for cadence-sensitive behavior.
-        #
-        readout_fn = READOUTS[readout_idx]
         try:
-            body = list(readout_fn(locked=locked))  # type: ignore[misc]
-        except TypeError:
-            body = list(readout_fn())
+            locked, readout_idx = pump_events(locked, readout_idx, len(READOUTS))
+            prefix = "* " if locked else ""
 
-        combined = header + body
+            header = header_readout(prefix=prefix)
+            readout_fn = READOUTS[readout_idx]
 
-        payload = {
-            "header": header[0].upper(),
-            "body": [line.upper() for line in body],
-        }
+            try:
+                body = list(readout_fn())
+            except Exception:
+                body = ["READOUT ERROR"]
 
-        if locked:
-            if combined != last_rendered:
-                render_panel(screen, font, header, body)
-                ws_broadcast(payload)
-                last_rendered = combined
-            time.sleep(LOCKED_REFRESH_S)
-            continue
+            combined = header + body
+            payload = {
+                "header": header[0].upper(),
+                "body": [line.upper() for line in body],
+            }
 
-        render_tty(screen, font, header, body, clock)
-        ws_broadcast(payload)
+            if locked:
+                if combined != last_rendered:
+                    render_panel(screen, font, header, body)
+                    ws_broadcast(payload)
+                    last_rendered = combined
 
-        time.sleep(READOUT_DELAY)
-        readout_idx = (readout_idx + 1) % len(READOUTS)
+                time.sleep(LOCKED_REFRESH_S)
+                continue
+
+            render_tty(screen, font, header, body, clock)
+            ws_broadcast(payload)
+
+            time.sleep(READOUT_DELAY)
+            readout_idx = (readout_idx + 1) % len(READOUTS)
+
+        except Exception:
+            # Absolute last-resort containment
+            time.sleep(0.2)
 
 
 # ---------------------------------------------------------------------
