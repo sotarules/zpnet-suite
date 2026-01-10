@@ -67,6 +67,11 @@ STX_PREFIX = b"<STX="
 ETX_SEQ = b"<ETX>"
 
 # ---------------------------------------------------------------------
+# Environment overrides
+# ---------------------------------------------------------------------
+SERIAL_SNOOP_PATH = os.environ.get("ZPNET_SERIAL_SNOOP")
+
+# ---------------------------------------------------------------------
 # Serial ownership primitives
 # ---------------------------------------------------------------------
 _serial_lock = threading.RLock()
@@ -188,6 +193,7 @@ def frame_read_one(
     # Step 5: parse JSON payload
     try:
         msg = json.loads(payload.decode("utf-8", errors="strict"))
+        _snoop("←", payload)
     except Exception as e:
         raise ValueError(f"invalid JSON payload: {e}")
 
@@ -205,6 +211,7 @@ def send_cmd_framed(ser: serial.Serial, cmd: dict) -> None:
     """
     payload = json.dumps(cmd, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
     framed = frame_encode(payload)
+    _snoop("→", payload)
     logging.debug("[teensy_listener] → %s", payload.decode("utf-8", errors="ignore"))
     ser.write(framed)
     ser.flush()
@@ -500,6 +507,18 @@ def rpc_socket_server() -> None:
         conn, _ = sock.accept()
         threading.Thread(target=_handle_client, args=(conn,), daemon=True).start()
 
+
+def _snoop(direction: str, payload: bytes | str) -> None:
+    if not SERIAL_SNOOP_PATH:
+        return
+    try:
+        with open(SERIAL_SNOOP_PATH, "a") as f:
+            ts = time.time()
+            if isinstance(payload, bytes):
+                payload = payload.decode("utf-8", errors="replace")
+            f.write(f"{ts:.6f} {direction} {payload}\n")
+    except Exception:
+        pass  # absolutely never affect runtime
 
 # ---------------------------------------------------------------------
 # Main daemon loop with serial reconnect
