@@ -29,7 +29,7 @@ static const int LD_ON_PIN = 21;
 // PHOTODIODE_ANALOG_PIN:
 //   Continuous analog voltage while light is present
 //
-static const int PHOTODIODE_EDGE_PIN   = 14;
+static const int PHOTODIODE_EDGE_PIN   = 16;
 static const int PHOTODIODE_ANALOG_PIN = 15;
 
 // --------------------------------------------------------------

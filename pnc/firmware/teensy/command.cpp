@@ -9,6 +9,8 @@
 #include "gnss.h"
 #include "teensy_status.h"
 #include "dwt_clock.h"
+#include "qtimer.h"
+#include "gpt_count.h"
 #include "transport.h"
 
 #include <string.h>
@@ -106,12 +108,65 @@ void command_exec(const char* line) {
     return;
   }
 
-  if (strcmp(cmd, "DWT.COUNT?") == 0) {
-    String b;
-    b += "\"cycles\":";
-    b += dwt_clock_read();
+  // ------------------------------------------------------------
+  // QTIMER COMMANDS
+  // ------------------------------------------------------------
+  if (strcmp(cmd, "QTIMER.ARM") == 0) {
+    qtimer_arm();
+    enqueueAckEvent(cmd);
+    return;
+  }
 
-    emitImmediateFramed("DWT_COUNT", b);
+  if (strcmp(cmd, "QTIMER.DISARM") == 0) {
+    qtimer_disarm();
+    enqueueAckEvent(cmd);
+    return;
+  }
+
+  if (strcmp(cmd, "QTIMER.READ?") == 0) {
+    String b;
+    b += "\"count\":";
+    b += qtimer_read();
+    emitImmediateFramed("QTIMER_READ", b);
+    return;
+  }
+
+  if (strcmp(cmd, "QTIMER.CLEAR") == 0) {
+    qtimer_clear();
+    enqueueAckEvent(cmd);
+    return;
+  }
+
+  if (strcmp(cmd, "QTIMER.STATUS?") == 0) {
+    String b;
+    b += "\"armed\":";
+    b += qtimer_status() ? "true" : "false";
+    emitImmediateFramed("QTIMER_STATUS", b);
+    return;
+  }
+
+  // ------------------------------------------------------------
+  // GPT COUNT COMMANDS (GPT2 external clock)
+  // ------------------------------------------------------------
+  if (strcmp(cmd, "GPT.ARM") == 0) {
+    gpt_count_arm();
+    enqueueAckEvent(cmd);
+    return;
+  }
+
+  if (strcmp(cmd, "GPT.READ?") == 0) {
+    String b;
+    b += "\"count\":";
+    b += gpt_count_read();
+    emitImmediateFramed("GPT_READ", b);
+    return;
+  }
+
+  if (strcmp(cmd, "GPT.STATUS?") == 0) {
+    String b;
+    b += "\"armed\":";
+    b += gpt_count_status() ? "true" : "false";
+    emitImmediateFramed("GPT_STATUS", b);
     return;
   }
 
