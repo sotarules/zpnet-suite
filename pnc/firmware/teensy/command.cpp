@@ -175,14 +175,16 @@ void command_exec(const char* line) {
   // ------------------------------------------------------------
   if (strcmp(cmd, "GPT.CONFIRM") == 0) {
 
-    // 2 seconds @ 600 MHz
-    const uint32_t WINDOW_CYCLES = 600000000UL * 2;
+    // GNSS-defined window:
+    // 10 MHz × 2 seconds = 20,000,000 ticks
+    // We measure between edge 0 and edge to close the interval.
+    const uint32_t TARGET_EXT_TICKS = 20000000UL;
 
     uint32_t cpu_cycles = 0;
     float ratio = 0.0f;
 
     uint32_t gpt_count = gpt_count_confirm(
-        WINDOW_CYCLES,
+        TARGET_EXT_TICKS,
         &cpu_cycles,
         &ratio
     );
@@ -196,7 +198,7 @@ void command_exec(const char* line) {
 
     {
       char buf[32];
-      snprintf(buf, sizeof(buf), "%.6f", ratio);
+      snprintf(buf, sizeof(buf), "%.9f", ratio);
       body += buf;
     }
 
@@ -204,6 +206,7 @@ void command_exec(const char* line) {
     enqueueAckEvent(cmd);
     return;
   }
+
 
   // ------------------------------------------------------------
   // PHOTODIODE COMMANDS (event-producing)

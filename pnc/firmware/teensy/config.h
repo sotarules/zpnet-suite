@@ -43,7 +43,7 @@ static const int PHOTODIODE_ANALOG_PIN = 15;
 //   10 MHz VCLOCK square wave
 //
 static const int GNSS_PPS_PIN  = 33;
-static const int GNSS_VCLK_PIN = 9;
+static const int GNSS_VCLK_PIN = 14;
 
 // --------------------------------------------------------------
 // Event bus sizing
