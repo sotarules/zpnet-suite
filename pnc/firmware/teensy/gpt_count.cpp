@@ -1,5 +1,8 @@
 #include "gpt_count.h"
 #include "imxrt.h"
+#include "dwt_clock.h"
+
+#include <Arduino.h>
 
 // --------------------------------------------------------------
 // Internal state
@@ -62,7 +65,7 @@ static inline void gpt2_init_external_clock() {
   // CLKSRC = 3 -> external
   GPT2_CR = GPT_CR_CLKSRC(3);
 
-  // Enable GPT2 (do once, never disable)
+  // Enable GPT2
   GPT2_CR |= GPT_CR_EN;
 }
 
@@ -79,6 +82,15 @@ void gpt_count_arm() {
   gpt2_armed = true;
 }
 
+void gpt_count_disarm() {
+  if (!gpt2_armed) return;
+
+  // Disable counting, leave configuration intact
+  GPT2_CR &= ~GPT_CR_EN;
+
+  gpt2_armed = false;
+}
+
 uint32_t gpt_count_read() {
   if (!gpt2_armed) return 0;
   return GPT2_CNT;
@@ -87,3 +99,52 @@ uint32_t gpt_count_read() {
 bool gpt_count_status() {
   return gpt2_armed;
 }
+
+uint32_t gpt_count_confirm(
+    uint32_t window_cpu_cycles,
+    uint32_t* cpu_cycles_out,
+    float* ratio_out
+) {
+  // Defensive defaults
+  if (cpu_cycles_out) *cpu_cycles_out = 0;
+  if (ratio_out)      *ratio_out = 0.0f;
+
+  // Ensure DWT cycle counter is enabled
+  dwt_clock_init();
+
+  // Arm GPT2 (idempotent, owns setup)
+  gpt_count_arm();
+
+  noInterrupts();
+
+  uint32_t start_cpu = dwt_clock_read();
+  uint32_t start_ext = GPT2_CNT;
+
+  // Busy-wait until CPU-cycle window elapses
+  while ((uint32_t)(dwt_clock_read() - start_cpu) < window_cpu_cycles) {
+    // intentional spin — no sleeping, no SysTick
+  }
+
+  uint32_t end_cpu = dwt_clock_read();
+  uint32_t end_ext = GPT2_CNT;
+
+  interrupts();
+
+  // Disarm via public API (respect ownership boundary)
+  gpt_count_disarm();
+
+  // Compute deltas
+  uint32_t delta_cpu = end_cpu - start_cpu;
+  uint32_t delta_ext = end_ext - start_ext;
+
+  if (cpu_cycles_out) {
+    *cpu_cycles_out = delta_cpu;
+  }
+
+  if (ratio_out && delta_cpu > 0) {
+    *ratio_out = (float)delta_ext / (float)delta_cpu;
+  }
+
+  return delta_ext;
+}
+

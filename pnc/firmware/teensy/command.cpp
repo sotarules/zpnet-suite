@@ -171,6 +171,41 @@ void command_exec(const char* line) {
   }
 
   // ------------------------------------------------------------
+  // GPT CONFIRM (durable calibration event)
+  // ------------------------------------------------------------
+  if (strcmp(cmd, "GPT.CONFIRM") == 0) {
+
+    // 2 seconds @ 600 MHz
+    const uint32_t WINDOW_CYCLES = 600000000UL * 2;
+
+    uint32_t cpu_cycles = 0;
+    float ratio = 0.0f;
+
+    uint32_t gpt_count = gpt_count_confirm(
+        WINDOW_CYCLES,
+        &cpu_cycles,
+        &ratio
+    );
+
+    String body;
+    body += "\"gpt_count\":";
+    body += gpt_count;
+    body += ",\"cpu_cycles\":";
+    body += cpu_cycles;
+    body += ",\"ratio\":";
+
+    {
+      char buf[32];
+      snprintf(buf, sizeof(buf), "%.6f", ratio);
+      body += buf;
+    }
+
+    enqueueEvent("GPT_CONFIRM_RESULT", body);
+    enqueueAckEvent(cmd);
+    return;
+  }
+
+  // ------------------------------------------------------------
   // PHOTODIODE COMMANDS (event-producing)
   // ------------------------------------------------------------
   if (strcmp(cmd, "PHOTODIODE.STATUS") == 0) {
