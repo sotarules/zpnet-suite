@@ -146,31 +146,6 @@ void command_exec(const char* line) {
   }
 
   // ------------------------------------------------------------
-  // GPT COUNT COMMANDS (GPT2 external clock)
-  // ------------------------------------------------------------
-  if (strcmp(cmd, "GPT.ARM") == 0) {
-    gpt_count_arm();
-    enqueueAckEvent(cmd);
-    return;
-  }
-
-  if (strcmp(cmd, "GPT.READ?") == 0) {
-    String b;
-    b += "\"count\":";
-    b += gpt_count_read();
-    emitImmediateFramed("GPT_READ", b);
-    return;
-  }
-
-  if (strcmp(cmd, "GPT.STATUS?") == 0) {
-    String b;
-    b += "\"armed\":";
-    b += gpt_count_status() ? "true" : "false";
-    emitImmediateFramed("GPT_STATUS", b);
-    return;
-  }
-
-  // ------------------------------------------------------------
   // GPT CONFIRM (durable calibration event)
   // ------------------------------------------------------------
   if (strcmp(cmd, "GPT.CONFIRM") == 0) {
