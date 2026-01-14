@@ -142,11 +142,13 @@ def run():
             v_max = ideal * (1 + tol / 100)
             actual = result["voltage_v"]
 
-            if not (v_min <= actual <= v_max):
-                shutdown_system(
-                    f"{cfg['label']} out of tolerance: "
-                    f"{actual:.3f} V (expected {v_min:.2f}–{v_max:.2f} V)"
-                )
+            # Temporary defeat during OCXO testing (Mule 26JUN24)
+            #if not (v_min <= actual <= v_max):
+            #    shutdown_system(
+            #        f"{cfg['label']} out of tolerance: "
+            #        f"{actual:.3f} V (expected {v_min:.2f}–{v_max:.2f} V)"
+            #    )
+
 
     except SystemExit:
         raise

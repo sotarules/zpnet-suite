@@ -178,7 +178,7 @@ void command_exec(const char* line) {
     // GNSS-defined window:
     // 10 MHz × 2 seconds = 20,000,000 ticks
     // We measure between edge 0 and edge to close the interval.
-    const uint32_t TARGET_EXT_TICKS = 20000000UL;
+    const uint32_t TARGET_EXT_TICKS = 40000000UL;
 
     uint32_t cpu_cycles = 0;
     float ratio = 0.0f;
