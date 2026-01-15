@@ -24,7 +24,7 @@ from zpnet.shared.teensy import photodiode_status
 # Constants
 # ---------------------------------------------------------------------
 BATTERY_LABEL = "battery"
-BATTERY_CAPACITY_WH = 110.0
+BATTERY_CAPACITY_WH = 650
 
 POWER_SAMPLE_STEP = 50
 MAX_ERRORS_AGGREGATED = 5

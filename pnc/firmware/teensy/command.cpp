@@ -42,6 +42,28 @@ static bool extractCmd(const char* line, char* out, size_t out_sz) {
   return true;
 }
 
+static bool extractUintArg(
+    const char* line,
+    const char* key,
+    uint64_t* out
+) {
+  const char* p = strstr(line, key);
+  if (!p) return false;
+
+  p = strchr(p, ':');
+  if (!p) return false;
+  p++;
+
+  while (*p == ' ') p++;
+
+  char* end = nullptr;
+  unsigned long long val = strtoull(p, &end, 10);
+  if (end == p) return false;
+
+  *out = (uint64_t)val;
+  return true;
+}
+
 // --------------------------------------------------------------
 // Immediate framed emit (QUERY plane only)
 //
@@ -150,22 +172,35 @@ void command_exec(const char* line) {
   // ------------------------------------------------------------
   if (strcmp(cmd, "GPT.CONFIRM") == 0) {
 
-    // GNSS-defined window:
-    // 10 MHz × 2 seconds = 20,000,000 ticks
-    // We measure between edge 0 and edge to close the interval.
-    const uint32_t TARGET_EXT_TICKS = 40000000UL;
+    // Default duration (seconds)
+    uint64_t seconds = 2;
 
-    uint32_t cpu_cycles = 0;
-    float ratio = 0.0f;
+    // Optional override
+    extractUintArg(line, "\"seconds\"", &seconds);
 
-    uint32_t gpt_count = gpt_count_confirm(
+    // Sanity clamp (avoid absurd values)
+    if (seconds == 0) seconds = 1;
+    if (seconds > 3600) seconds = 3600;  // 1 hour cap (adjust if desired)
+
+    // GNSS VCLOCK = 10 MHz
+    const uint64_t TARGET_EXT_TICKS =
+        seconds * 10000000ULL;
+
+    uint64_t cpu_cycles = 0;
+    double ratio = 0.0;
+    int64_t error_cycles_out = 0;
+
+    uint64_t gpt_count = gpt_count_confirm(
         TARGET_EXT_TICKS,
         &cpu_cycles,
-        &ratio
+        &ratio,
+        &error_cycles_out
     );
 
     String body;
-    body += "\"gpt_count\":";
+    body += "\"seconds\":";
+    body += seconds;
+    body += ",\"gpt_count\":";
     body += gpt_count;
     body += ",\"cpu_cycles\":";
     body += cpu_cycles;
@@ -173,15 +208,17 @@ void command_exec(const char* line) {
 
     {
       char buf[32];
-      snprintf(buf, sizeof(buf), "%.9f", ratio);
+      snprintf(buf, sizeof(buf), "%.12f", ratio);
       body += buf;
     }
+
+    body += ",\"error_cycles\":";
+    body += error_cycles_out;
 
     enqueueEvent("GPT_CONFIRM_RESULT", body);
     enqueueAckEvent(cmd);
     return;
   }
-
 
   // ------------------------------------------------------------
   // PHOTODIODE COMMANDS (event-producing)

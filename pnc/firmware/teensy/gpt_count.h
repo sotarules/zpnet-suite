@@ -15,8 +15,10 @@
 //   • Window is defined by external clock, not CPU time
 //   • CPU acts strictly as observer
 // --------------------------------------------------------------
-uint32_t gpt_count_confirm(
-    uint32_t target_ext_ticks,
-    uint32_t* cpu_cycles_out,
-    float* ratio_out
+uint64_t gpt_count_confirm(
+    uint64_t  target_ext_ticks,
+    uint64_t* cpu_cycles_out,
+    double*   ratio_out,
+    int64_t*  error_cycles_out
 );
+
