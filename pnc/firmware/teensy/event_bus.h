@@ -1,7 +1,7 @@
 #pragma once
 
 #include <Arduino.h>
-#include "config/config.h"
+#include "config.h"
 
 // --------------------------------------------------------------
 // Event bus interface

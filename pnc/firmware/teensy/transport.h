@@ -19,10 +19,6 @@
 //
 // Invalid frames are discarded silently.
 //
-// Design intent:
-//   • Exactly one runtime transport
-//   • No semantics here — framing only
-//   • No unsolicited output
 // --------------------------------------------------------------
 
 // Maximum payload size accepted (defensive bound)
