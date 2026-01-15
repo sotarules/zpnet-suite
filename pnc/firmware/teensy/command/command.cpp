@@ -1,17 +1,19 @@
-#include "command.h"
+#include "command/command.h"
 
-#include "event_bus.h"
-#include "util.h"
-#include "system.h"
+#include "event/event_bus.h"
+#include "util/util.h"
+#include "core/system.h"
 
-#include "laser.h"
-#include "photodiode.h"
-#include "gnss.h"
-#include "teensy_status.h"
-#include "dwt_clock.h"
-#include "qtimer.h"
-#include "gpt_count.h"
-#include "transport.h"
+#include "subsystems/laser/laser.h"
+#include "subsystems/photodiode/photodiode.h"
+#include "subsystems/gnss/gnss.h"
+#include "subsystems/status/teensy_status.h"
+
+#include "clock/dwt_clock.h"
+#include "clock/qtimer.h"
+#include "clock/gpt_count.h"
+
+#include "transport/transport.h"
 
 #include <string.h>
 #include <stdlib.h>
@@ -102,7 +104,7 @@ void command_exec(const char* line) {
   }
 
   // ------------------------------------------------------------
-  // STATUS / DATA COMMANDS (event-producing, durable)
+  // STATUS / DATA COMMANDS (durable events)
   // ------------------------------------------------------------
   if (strcmp(cmd, "TEENSY.STATUS") == 0) {
     enqueueEvent("TEENSY_STATUS", buildTeensyStatusBody());
@@ -120,7 +122,7 @@ void command_exec(const char* line) {
   }
 
   // ------------------------------------------------------------
-  // QUERY COMMANDS (NON-DESTRUCTIVE, IMMEDIATE)
+  // QUERY COMMANDS (non-destructive, immediate)
   // ------------------------------------------------------------
   if (strcmp(cmd, "PHOTODIODE.STATUS?") == 0) {
     emitImmediateFramed(
@@ -172,29 +174,24 @@ void command_exec(const char* line) {
   // ------------------------------------------------------------
   if (strcmp(cmd, "GPT.CONFIRM") == 0) {
 
-    // Default duration (seconds)
     uint64_t seconds = 2;
-
-    // Optional override
     extractUintArg(line, "\"seconds\"", &seconds);
 
-    // Sanity clamp (avoid absurd values)
     if (seconds == 0) seconds = 1;
-    if (seconds > 3600) seconds = 3600;  // 1 hour cap (adjust if desired)
+    if (seconds > 3600) seconds = 3600;
 
-    // GNSS VCLOCK = 10 MHz
     const uint64_t TARGET_EXT_TICKS =
         seconds * 10000000ULL;
 
     uint64_t cpu_cycles = 0;
     double ratio = 0.0;
-    int64_t error_cycles_out = 0;
+    int64_t error_cycles = 0;
 
     uint64_t gpt_count = gpt_count_confirm(
         TARGET_EXT_TICKS,
         &cpu_cycles,
         &ratio,
-        &error_cycles_out
+        &error_cycles
     );
 
     String body;
@@ -213,7 +210,7 @@ void command_exec(const char* line) {
     }
 
     body += ",\"error_cycles\":";
-    body += error_cycles_out;
+    body += error_cycles;
 
     enqueueEvent("GPT_CONFIRM_RESULT", body);
     enqueueAckEvent(cmd);
@@ -221,7 +218,7 @@ void command_exec(const char* line) {
   }
 
   // ------------------------------------------------------------
-  // PHOTODIODE COMMANDS (event-producing)
+  // PHOTODIODE COMMANDS
   // ------------------------------------------------------------
   if (strcmp(cmd, "PHOTODIODE.STATUS") == 0) {
     enqueueEvent("PHOTODIODE_STATUS", buildPhotodiodeStatusBody());
@@ -240,7 +237,7 @@ void command_exec(const char* line) {
   }
 
   // ------------------------------------------------------------
-  // LASER COMMANDS (ACTUATION ONLY)
+  // LASER COMMANDS (actuation only)
   // ------------------------------------------------------------
   if (strcmp(cmd, "LASER.ON") == 0) {
     laser_on();
@@ -262,7 +259,7 @@ void command_exec(const char* line) {
   }
 
   // ------------------------------------------------------------
-  // SYSTEM COMMANDS (TERMINAL)
+  // SYSTEM COMMANDS (terminal)
   // ------------------------------------------------------------
   if (strcmp(cmd, "SYSTEM.SHUTDOWN") == 0) {
     enqueueAckEvent(cmd);

@@ -1,52 +1,55 @@
 /*
-  ZPNet Teensy Telemetry Firmware — Integration Shell
+  ZPNet Teensy Telemetry Firmware — Core Shell
 
   Responsibilities:
     • setup() / loop()
     • Priority ordering
-    • Delegation to subsystems
-    • Transport ingress only (no semantics)
+    • Delegation only (no domain logic)
 
   Invariants:
+    • Single-threaded, single-loop execution
+    • No multitasking, no scheduler
     • No unsolicited serial output
-    • Durable truth exits only via event bus
+    • Durable truth exits ONLY via event bus
     • QUERY replies are immediate and non-destructive
-    • Exactly one serial consumer
-    • All inbound messages are framed and validated
 */
 
 #include <Arduino.h>
 
 // --------------------------------------------------------------
-// Core configuration and shared infrastructure
+// Core configuration and infrastructure
 // --------------------------------------------------------------
-#include "config.h"
-#include "util.h"
-#include "event_bus.h"
-#include "command.h"
-#include "system.h"
-#include "zpnet_serial.h"
-#include "transport.h"
+#include "config/config.h"
+#include "util/util.h"
+#include "event/event_bus.h"
+#include "command/command.h"
+#include "core/system.h"
+#include "transport/transport.h"
+#include "transport/zpnet_serial.h"
 
 // --------------------------------------------------------------
-// Subsystems
+// Subsystems (passive, cooperative)
 // --------------------------------------------------------------
-#include "gnss.h"
-#include "laser.h"
-#include "photodiode.h"
-#include "dwt_clock.h"
+#include "subsystems/gnss/gnss.h"
+#include "subsystems/laser/laser.h"
+#include "subsystems/photodiode/photodiode.h"
+
+// --------------------------------------------------------------
+// Clock substrate (shared, side-effect conscious)
+// --------------------------------------------------------------
+#include "clock/dwt_clock.h"
 
 // --------------------------------------------------------------
 // Transport RX callback
 // --------------------------------------------------------------
 //
-// Called ONLY after a fully validated frame is received.
+// Invoked ONLY after a fully validated framed payload is received.
+// Payload is NOT null-terminated.
 //
 static void on_transport_frame(
     const char* payload,
     size_t      length
 ) {
-  // Payload is NOT null-terminated; copy safely
   static char cmd_buf[256];
 
   if (length == 0 || length >= sizeof(cmd_buf)) {
@@ -60,22 +63,22 @@ static void on_transport_frame(
 }
 
 // --------------------------------------------------------------
-// Setup
+// setup()
 // --------------------------------------------------------------
 void setup() {
   // ------------------------------------------------------------
-  // Enable DWT cycle counter (USB-safe)
+  // Enable core-local cycle counter (USB-safe)
   // ------------------------------------------------------------
   dwt_clock_init();
 
   // ------------------------------------------------------------
-  // Initialize UART transport
+  // Initialize UART transport (runtime channel)
   // ------------------------------------------------------------
   ZPNET_SERIAL.begin(115200);
   transport_init(on_transport_frame);
 
   // ------------------------------------------------------------
-  // Core system state
+  // System lifecycle state
   // ------------------------------------------------------------
   system_init();
 
@@ -93,11 +96,11 @@ void setup() {
 }
 
 // --------------------------------------------------------------
-// Main loop
+// loop()
 // --------------------------------------------------------------
 void loop() {
   // ------------------------------------------------------------
-  // Terminal condition
+  // Terminal condition (irreversible)
   // ------------------------------------------------------------
   if (system_is_shutdown()) {
     system_enter_quiescence();
@@ -110,7 +113,7 @@ void loop() {
   photodiode_update();
 
   // ------------------------------------------------------------
-  // Priority 2: GNSS serial ingestion
+  // Priority 2: GNSS serial ingestion (budgeted)
   // ------------------------------------------------------------
   gnss_poll();
 

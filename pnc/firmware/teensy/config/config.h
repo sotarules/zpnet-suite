@@ -59,7 +59,7 @@ static const size_t EVT_BODY_MAX  = 512;
 // --------------------------------------------------------------
 // GNSS ingestion limits
 // --------------------------------------------------------------
-static const size_t GNSS_LINE_MAX             = 192;
+static const size_t GNSS_LINE_MAX = 192;
 static const unsigned long GNSS_SILENCE_FLUSH_MS = 50;
 
 // --------------------------------------------------------------

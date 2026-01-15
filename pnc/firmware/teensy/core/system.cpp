@@ -1,7 +1,7 @@
-#include "system.h"
+#include "core/system.h"
 
-#include "event_bus.h"
-#include "config.h"
+#include "event/event_bus.h"
+#include "config/config.h"
 
 #include <Arduino.h>
 

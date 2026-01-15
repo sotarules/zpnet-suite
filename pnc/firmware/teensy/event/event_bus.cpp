@@ -1,6 +1,7 @@
-#include "event_bus.h"
-#include "transport.h"
-#include "util.h"
+#include "event/event_bus.h"
+
+#include "transport/transport.h"
+#include "util/util.h"
 
 // --------------------------------------------------------------
 // Internal ring buffer state

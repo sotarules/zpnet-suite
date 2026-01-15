@@ -9,11 +9,17 @@
 // This module owns irreversible transitions.
 // Once shutdown is requested, no further behavior is permitted.
 //
+// Design intent:
+//   • Single authority over terminal state
+//   • Idempotent shutdown requests
+//   • Explicit quiescence (no return)
+//   • No domain knowledge
+//
 
 // Initialize system-level state
 void system_init();
 
-// Request terminal shutdown (no return)
+// Request terminal shutdown (irreversible, no return)
 void system_request_shutdown();
 
 // Enter permanent quiescence (never returns)

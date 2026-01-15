@@ -1,5 +1,5 @@
-#include "transport.h"
-#include "zpnet_serial.h"
+#include "transport/transport.h"
+#include "transport/zpnet_serial.h"
 
 #include <string.h>
 #include <stdlib.h>
@@ -54,9 +54,10 @@ void transport_init(transport_rx_callback_t cb) {
 }
 
 void transport_ingest_byte(char c) {
-    #ifdef TRANSPORT_DEBUG
+#ifdef TRANSPORT_DEBUG
     ZPNET_SERIAL.write(c);
-    #endif
+#endif
+
     switch (rx_state) {
 
         case RX_IDLE:

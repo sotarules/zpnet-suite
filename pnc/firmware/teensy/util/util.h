@@ -9,6 +9,11 @@
 // These functions have no domain meaning.
 // They exist to support other modules cleanly.
 //
+// Design intent:
+//   • No side effects beyond return values
+//   • No ownership of hardware
+//   • Safe to call from anywhere
+//
 
 // Safe bounded string copy (always null-terminated)
 void safeCopy(char* dst, size_t dst_sz, const char* src);
