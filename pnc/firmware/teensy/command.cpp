@@ -66,9 +66,6 @@ static bool extractUintArg(
 
 // --------------------------------------------------------------
 // Immediate framed emit (QUERY plane only)
-//
-// Used ONLY for non-destructive CMD? queries.
-// Bypasses the event queue entirely.
 // --------------------------------------------------------------
 static inline void emitImmediateFramed(
     const char* type,
@@ -102,7 +99,7 @@ void command_exec(const char* line) {
   }
 
   // ------------------------------------------------------------
-  // STATUS / DATA COMMANDS (event-producing, durable)
+  // STATUS / DATA COMMANDS
   // ------------------------------------------------------------
   if (strcmp(cmd, "TEENSY.STATUS") == 0) {
     enqueueEvent("TEENSY_STATUS", buildTeensyStatusBody());
@@ -120,7 +117,7 @@ void command_exec(const char* line) {
   }
 
   // ------------------------------------------------------------
-  // QUERY COMMANDS (NON-DESTRUCTIVE, IMMEDIATE)
+  // QUERY COMMANDS (NON-DESTRUCTIVE)
   // ------------------------------------------------------------
   if (strcmp(cmd, "PHOTODIODE.STATUS?") == 0) {
     emitImmediateFramed(
@@ -168,21 +165,16 @@ void command_exec(const char* line) {
   }
 
   // ------------------------------------------------------------
-  // GPT CONFIRM (durable calibration event)
+  // GPT CONFIRM (LEGACY, SINGLE-SAMPLE)
   // ------------------------------------------------------------
   if (strcmp(cmd, "GPT.CONFIRM") == 0) {
 
-    // Default duration (seconds)
     uint64_t seconds = 2;
-
-    // Optional override
     extractUintArg(line, "\"seconds\"", &seconds);
 
-    // Sanity clamp (avoid absurd values)
     if (seconds == 0) seconds = 1;
-    if (seconds > 3600) seconds = 3600;  // 1 hour cap (adjust if desired)
+    if (seconds > 3600) seconds = 3600;
 
-    // GNSS VCLOCK = 10 MHz
     const uint64_t TARGET_EXT_TICKS =
         seconds * 10000000ULL;
 
@@ -221,7 +213,55 @@ void command_exec(const char* line) {
   }
 
   // ------------------------------------------------------------
-  // PHOTODIODE COMMANDS (event-producing)
+  // TAU PROFILING (NEW, MONTE CARLO)
+  // ------------------------------------------------------------
+  if (strcmp(cmd, "TAU.PROFILE") == 0) {
+
+    uint64_t total_seconds  = 0;
+    uint64_t sample_seconds = 0;
+    uint64_t span_cycles    = 0;
+    uint64_t bucket_width  = 0;
+
+    if (!extractUintArg(line, "\"total_seconds\"", &total_seconds) ||
+        !extractUintArg(line, "\"sample_seconds\"", &sample_seconds) ||
+        !extractUintArg(line, "\"span_cycles\"", &span_cycles) ||
+        !extractUintArg(line, "\"bucket_width\"", &bucket_width)) {
+      enqueueErrEvent(cmd, "missing or invalid arguments");
+      return;
+    }
+
+    // Sanity clamps
+    if (sample_seconds == 0 ||
+        total_seconds < sample_seconds ||
+        bucket_width == 0) {
+      enqueueErrEvent(cmd, "invalid parameter range");
+      return;
+    }
+
+    // Hard safety caps (adjust as needed)
+    if (total_seconds > (48ULL * 3600ULL)) {
+      enqueueErrEvent(cmd, "total_seconds exceeds cap");
+      return;
+    }
+
+    bool ok = gpt_tau_profile(
+        (uint32_t)total_seconds,
+        (uint32_t)sample_seconds,
+        (int32_t)span_cycles,
+        (uint32_t)bucket_width
+    );
+
+    if (!ok) {
+      enqueueErrEvent(cmd, "tau profiling failed");
+      return;
+    }
+
+    enqueueAckEvent(cmd);
+    return;
+  }
+
+  // ------------------------------------------------------------
+  // PHOTODIODE COMMANDS
   // ------------------------------------------------------------
   if (strcmp(cmd, "PHOTODIODE.STATUS") == 0) {
     enqueueEvent("PHOTODIODE_STATUS", buildPhotodiodeStatusBody());
@@ -240,7 +280,7 @@ void command_exec(const char* line) {
   }
 
   // ------------------------------------------------------------
-  // LASER COMMANDS (ACTUATION ONLY)
+  // LASER COMMANDS
   // ------------------------------------------------------------
   if (strcmp(cmd, "LASER.ON") == 0) {
     laser_on();
@@ -262,12 +302,12 @@ void command_exec(const char* line) {
   }
 
   // ------------------------------------------------------------
-  // SYSTEM COMMANDS (TERMINAL)
+  // SYSTEM COMMANDS
   // ------------------------------------------------------------
   if (strcmp(cmd, "SYSTEM.SHUTDOWN") == 0) {
     enqueueAckEvent(cmd);
     system_request_shutdown();
-    // no return
+    return;
   }
 
   // ------------------------------------------------------------
