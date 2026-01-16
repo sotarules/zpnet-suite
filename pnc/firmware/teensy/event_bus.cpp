@@ -11,6 +11,9 @@ static size_t evt_tail = 0;
 static size_t evt_count = 0;
 static uint32_t evt_dropped = 0;
 
+// Uncomment for imperative diagnostics
+#define EVENTBUS_IMMEDIATE_DIAGNOSTICS
+
 // --------------------------------------------------------------
 // Internal helpers
 // --------------------------------------------------------------
@@ -79,6 +82,19 @@ static bool dequeueEvent(EventItem& out) {
 // Public API
 // --------------------------------------------------------------
 void enqueueEvent(const char* type, const String& body) {
+
+#ifdef EVENTBUS_IMMEDIATE_DIAGNOSTICS
+  // ------------------------------------------------------------
+  // Diagnostic mode:
+  // Emit immediately, bypassing queue and durability semantics.
+  // ------------------------------------------------------------
+  emitEventMessage(type, body);
+  return;
+#endif
+
+  // ------------------------------------------------------------
+  // Normal durable mode (unchanged)
+  // ------------------------------------------------------------
   if (evt_count >= EVT_MAX) {
     evt_dropped++;
     return;
@@ -91,6 +107,7 @@ void enqueueEvent(const char* type, const String& body) {
   evt_head = (evt_head + 1) % EVT_MAX;
   evt_count++;
 }
+
 
 void drainEventsNow() {
   // ------------------------------------------------------------
