@@ -8,7 +8,6 @@
 #include "photodiode.h"
 #include "gnss.h"
 #include "teensy_status.h"
-#include "dwt_clock.h"
 #include "qtimer.h"
 #include "gpt_count.h"
 #include "transport.h"

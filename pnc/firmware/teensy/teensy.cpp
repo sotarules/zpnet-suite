@@ -21,6 +21,7 @@
 // Core configuration and shared infrastructure
 // --------------------------------------------------------------
 #include "config.h"
+#include "clock.h"
 #include "util.h"
 #include "event_bus.h"
 #include "command.h"
@@ -34,7 +35,6 @@
 #include "gnss.h"
 #include "laser.h"
 #include "photodiode.h"
-#include "dwt_clock.h"
 
 // --------------------------------------------------------------
 // Transport RX callback
@@ -66,7 +66,7 @@ void setup() {
   // ------------------------------------------------------------
   // Enable DWT cycle counter (USB-safe)
   // ------------------------------------------------------------
-  dwt_clock_init();
+  dwt_init();
 
   // ------------------------------------------------------------
   // Initialize UART transport

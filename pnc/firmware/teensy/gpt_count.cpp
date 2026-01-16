@@ -2,6 +2,7 @@
 #include <stddef.h>
 
 #include "imxrt.h"
+#include "clock.h"
 #include "config.h"
 #include "gpt_count.h"
 #include "dwt_clock.h"
@@ -14,30 +15,6 @@
 // GNSS edge gates
 static volatile bool start_edge_seen = false;
 static volatile bool end_edge_seen   = false;
-
-// Synthetic DWT state (64-bit)
-static uint32_t dwt_last = 0;
-static uint64_t dwt_acc  = 0;
-
-// =============================================================
-// SYNTHETIC DWT — MAINTENANCE PUMP (UNCHANGED)
-// =============================================================
-// Must be called periodically (<< 7 seconds)
-
-void dwt_pump(void) {
-  uint32_t now = dwt_clock_read();
-  uint32_t delta = now - dwt_last;   // wrap-safe
-  dwt_acc += (uint64_t)delta;
-  dwt_last = now;
-}
-
-// =============================================================
-// SYNTHETIC DWT — READ (NO SIDE EFFECTS)
-// =============================================================
-
-static inline uint64_t dwt_read_64(void) {
-  return dwt_acc;
-}
 
 // =============================================================
 // ISR: START edge (phase gate only) — UNCHANGED
@@ -93,23 +70,15 @@ uint64_t gpt_count_confirm(
   start_edge_seen = false;
   end_edge_seen   = false;
 
-  // -----------------------------------------------------------
-  // Ensure DWT is enabled and primed
-  // -----------------------------------------------------------
-  dwt_clock_init();
-
-  dwt_last = dwt_clock_read();
-  dwt_acc  = 0;
-
   // ===========================================================
   // PHASE 0 — wait for START GNSS edge
   // ===========================================================
   attachInterrupt(GNSS_VCLK_PIN, gpt_confirm_start_isr, RISING);
   while (!start_edge_seen) {
-    dwt_pump();
+    dwt_now();
   }
 
-  uint64_t start_cycles = dwt_read_64();
+  uint64_t start_cycles = dwt_now();
 
   // ===========================================================
   // PHASE 1 — GNSS pin → GPT2 external clock
@@ -140,7 +109,7 @@ uint64_t gpt_count_confirm(
   uint32_t gpt_start = GPT2_CNT;
 
   while ((uint64_t)(GPT2_CNT - gpt_start) < target_ext_ticks) {
-    dwt_pump();
+    dwt_now();
   }
 
   // ===========================================================
@@ -154,10 +123,10 @@ uint64_t gpt_count_confirm(
 
   attachInterrupt(GNSS_VCLK_PIN, gpt_confirm_end_isr, RISING);
   while (!end_edge_seen) {
-    dwt_pump();
+    dwt_now();
   }
 
-  uint64_t end_cycles = dwt_read_64();
+  uint64_t end_cycles = dwt_now();
 
   // ===========================================================
   // PHASE 4 — compute results
@@ -591,38 +560,46 @@ bool gpt_tau_profile(
   uint32_t elapsed = 0;
 
   while (elapsed < total_seconds) {
-    int64_t err64 = 0;
+    uint32_t cpu_cycles = 0;
+    double   ratio       = 0.0;
+    int64_t  error_cycles = 0;
 
-    enqueueEvent("TAU_DIAG_BEFORE_CONFIRM", "\"note\":\"calling_confirm\"");
-    gpt_count_confirm(sample_seconds, nullptr, nullptr, &err64);
-    enqueueEvent("TAU_DIAG_AFTER_CONFIRM", "\"note\":\"confirm_returned\"");
+    // ---- GNSS-anchored confirm measurement ----
+    gpt_count_confirm(sample_seconds, &cpu_cycles, &ratio, &error_cycles);
 
-    // -------------------------------
-    // CHANGE #1 (normalization)
-    // -------------------------------
-    double err_per_second =
-        (double)err64 / (double)sample_seconds;
-
+    // ---- Residual computation ----
     int32_t residual =
-        (int32_t)(err_per_second - (double)baseline_error);
+        (int32_t)(error_cycles - (baseline_error * sample_seconds));
 
+    // ---- Full sample diagnostic ----
     {
       String d;
-      d += "\"err64\":";
-      d += err64;
-      d += ",\"err_per_second\":";
-      d += err_per_second;
-      d += ",\"baseline\":";
+      d += "\"cpu_cycles\":";
+      d += cpu_cycles;
+      d += ",\"error_cycles\":";
+      d += error_cycles;
+      d += ",\"baseline_error\":";
       d += baseline_error;
+      d += ",\"sample_seconds\":";
+      d += sample_seconds;
       d += ",\"residual\":";
       d += residual;
-      enqueueEvent("TAU_DIAG_RESIDUAL_NORM", d);
+      d += ",\"ratio\":";
+      {
+        char buf[32];
+        snprintf(buf, sizeof(buf), "%.12f", ratio);
+        d += buf;
+      }
+      enqueueEvent("TAU_DIAG_SAMPLE", d);
     }
 
+    // ---- Histogram classification ----
     tau_hist_add_residual(&hist, residual);
 
+    // ---- Accumulate time ----
     elapsed += sample_seconds;
 
+    // ---- Periodic emit ----
     if ((elapsed - last_emit_elapsed) >= TAU_EMIT_INTERVAL_SECONDS) {
       last_emit_elapsed = elapsed;
       emit_tau_result(
@@ -636,6 +613,7 @@ bool gpt_tau_profile(
     }
   }
 
+  // ---- Final summary ----
   emit_tau_result(
       "TAU_FINAL_RESULT",
       elapsed,
