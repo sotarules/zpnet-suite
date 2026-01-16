@@ -264,18 +264,9 @@ void command_exec(const char* line) {
   if (strcmp(cmd, "TAU.PROFILE") == 0) {
 
     uint64_t total_seconds  = 0;
-    uint64_t sample_seconds = 0;
 
-    if (!extractUintArg(line, "\"total_seconds\"", &total_seconds) ||
-        !extractUintArg(line, "\"sample_seconds\"", &sample_seconds)) {
+    if (!extractUintArg(line, "\"total_seconds\"", &total_seconds)) {
       enqueueErrEvent(cmd, "missing or invalid arguments");
-      return;
-    }
-
-    // Sanity checks
-    if (sample_seconds == 0 ||
-        total_seconds < sample_seconds) {
-      enqueueErrEvent(cmd, "invalid parameter range");
       return;
     }
 
@@ -286,8 +277,7 @@ void command_exec(const char* line) {
     }
 
     bool ok = gpt_tau_profile(
-        (uint32_t)total_seconds,
-        (uint32_t)sample_seconds
+        (uint32_t)total_seconds
     );
 
     if (!ok) {

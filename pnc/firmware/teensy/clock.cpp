@@ -39,16 +39,7 @@ static uint32_t ocxo_last   = 0;
 static IntervalTimer dwt_guard_timer;
 
 static void dwt_guard_tick() {
-  uint32_t raw = DWT_CYCCNT;
-  uint64_t now = dwt_now();
-
-  String body;
-  body += "\"raw\":";
-  body += raw;
-  body += ",\"now\":";
-  body += now;
-
-  enqueueEvent("DWT_PUMP", body);
+  (void)dwt_now();
 }
 
 // --------------------------------------------------------------

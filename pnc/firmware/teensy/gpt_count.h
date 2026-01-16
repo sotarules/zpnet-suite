@@ -97,7 +97,6 @@ bool gpt_discover_standard_error(
 //
 // Parameters:
 //   • total_seconds  — total profiling duration (seconds)
-//   • sample_seconds — GNSS-defined window per sample (seconds)
 //
 // Compatibility notes:
 //   • span_cycles and bucket_width are retained for API stability,
@@ -107,8 +106,7 @@ bool gpt_discover_standard_error(
 //   • Histogram bins are 1 cycle wide by design.
 // --------------------------------------------------------------
 bool gpt_tau_profile(
-    uint32_t total_seconds,
-    uint32_t sample_seconds
+    uint32_t total_seconds
 );
 
 

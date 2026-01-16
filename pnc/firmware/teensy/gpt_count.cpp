@@ -269,16 +269,13 @@ bool gpt_discover_standard_error(
 // MONTE CARLO τ ACCUMULATION LAYER (1-CYCLE BINS, SELF-CALIBRATING)
 // =============================================================
 
-// ---- histogram configuration limits ----
 #define MAX_TAU_BINS 2048
 
-// Envelope policy (baseline-derived)
-#define HIST_SIGMA_MULT       4.0   // histogram span = ±4σ
-#define GATE_SIGMA_MULT       3.0   // hard outlier gate = ±3σ
-#define MIN_SPAN_CYCLES       64    // defensive minimum span
-#define MAX_SPAN_CYCLES       1000  // defensive cap (fits in MAX_TAU_BINS)
+#define HIST_SIGMA_MULT       4.0
+#define GATE_SIGMA_MULT       3.0
+#define MIN_SPAN_CYCLES       64
+#define MAX_SPAN_CYCLES       1000
 
-// Emit cadence (seconds)
 #define TAU_EMIT_INTERVAL_SECONDS 10
 
 static uint32_t last_emit_elapsed = 0;
@@ -319,8 +316,7 @@ static void tau_hist_init_from_baseline(
 
   h->min_residual = -span;
   h->max_residual = +span;
-  h->bin_count =
-      (uint32_t)(h->max_residual - h->min_residual + 1);
+  h->bin_count = (uint32_t)(h->max_residual - h->min_residual + 1);
 
   int32_t gate = (int32_t)(GATE_SIGMA_MULT * baseline_stddev + 0.5);
   if (gate < MIN_SPAN_CYCLES / 2) gate = MIN_SPAN_CYCLES / 2;
@@ -335,7 +331,6 @@ static void tau_hist_init_from_baseline(
     h->bins[i] = 0;
   }
 
-  // ---- diagnostic ----
   {
     String d;
     d += "\"baseline_stddev\":";
@@ -392,7 +387,6 @@ static inline bool tau_hist_add_residual(
 static void tau_hist_reduce(
     const tau_histogram_t* h,
     int32_t baseline_error,
-    uint32_t sample_seconds,
     double*  tau_out,
     double*  mean_error_out,
     double*  sem_seconds_out
@@ -411,36 +405,25 @@ static void tau_hist_reduce(
     sum += (int64_t)(h->min_residual + (int32_t)i) * h->bins[i];
   }
 
-  double mean_residual =
-      (double)sum / (double)h->samples_kept;
-
-  double mean_error =
-      (double)baseline_error + mean_residual;
+  double mean_residual = (double)sum / (double)h->samples_kept;
+  double mean_error = (double)baseline_error + mean_residual;
 
   double var = 0.0;
   for (uint32_t i = 0; i < h->bin_count; i++) {
     if (!h->bins[i]) continue;
-    double d =
-        (double)(h->min_residual + (int32_t)i) - mean_residual;
+    double d = (double)(h->min_residual + (int32_t)i) - mean_residual;
     var += d * d * (double)h->bins[i];
   }
   var /= (double)h->samples_kept;
 
   double stddev_cycles = sqrt(var);
-  double sem_cycles =
-      stddev_cycles / sqrt((double)h->samples_kept);
-  double sem_seconds =
-      sem_cycles / 600000000.0;
+  double sem_cycles = stddev_cycles / sqrt((double)h->samples_kept);
+  double sem_seconds = sem_cycles / 600000000.0;
 
-  int64_t ideal_cycles =
-      (int64_t)sample_seconds * 10000000LL * 60LL;
+  int64_t ideal_cycles = 600000000LL;  // 1 second * 60 MHz
 
-  // -------------------------------
-  // CHANGE #2 (τ scaling)
-  // -------------------------------
   double tau =
-      (double)ideal_cycles /
-      (double)((double)ideal_cycles + mean_error * sample_seconds);
+      ((double)ideal_cycles + mean_error) / (double)ideal_cycles;
 
   if (tau_out) *tau_out = tau;
   if (mean_error_out) *mean_error_out = mean_error;
@@ -454,7 +437,6 @@ static void tau_hist_reduce(
 static void emit_tau_result(
     const char* event_type,
     uint32_t elapsed,
-    uint32_t sample_seconds,
     int32_t baseline_error,
     double baseline_stddev,
     const tau_histogram_t* hist
@@ -465,20 +447,11 @@ static void emit_tau_result(
   double mean_error = 0.0;
   double sem_seconds = 0.0;
 
-  tau_hist_reduce(
-      hist,
-      baseline_error,
-      sample_seconds,
-      &tau,
-      &mean_error,
-      &sem_seconds
-  );
+  tau_hist_reduce(hist, baseline_error, &tau, &mean_error, &sem_seconds);
 
   String body;
   body += "\"elapsed\":";
   body += elapsed;
-  body += ",\"sample_seconds\":";
-  body += sample_seconds;
   body += ",\"baseline_error\":";
   body += baseline_error;
   body += ",\"baseline_stddev\":";
@@ -519,14 +492,10 @@ static void emit_tau_result(
 // τ PROFILING WRAPPER
 // ------------------------------------------------------------
 
-bool gpt_tau_profile(
-    uint32_t total_seconds,
-    uint32_t sample_seconds
-) {
+bool gpt_tau_profile(uint32_t total_seconds) {
   enqueueEvent("TAU_DIAG_ENTER", "\"stage\":\"gpt_tau_profile\"");
 
-  if (sample_seconds == 0) return false;
-  if (total_seconds < sample_seconds) return false;
+  if (total_seconds < 1) return false;
 
   last_emit_elapsed = 0;
 
@@ -560,18 +529,14 @@ bool gpt_tau_profile(
   uint32_t elapsed = 0;
 
   while (elapsed < total_seconds) {
-    uint32_t cpu_cycles = 0;
+    uint64_t cpu_cycles = 0;
     double   ratio       = 0.0;
     int64_t  error_cycles = 0;
 
-    // ---- GNSS-anchored confirm measurement ----
-    gpt_count_confirm(sample_seconds, &cpu_cycles, &ratio, &error_cycles);
+    gpt_count_confirm(1, &cpu_cycles, &ratio, &error_cycles);
 
-    // ---- Residual computation ----
-    int32_t residual =
-        (int32_t)(error_cycles - (baseline_error * sample_seconds));
+    int32_t residual = (int32_t)(error_cycles - baseline_error);
 
-    // ---- Full sample diagnostic ----
     {
       String d;
       d += "\"cpu_cycles\":";
@@ -580,8 +545,6 @@ bool gpt_tau_profile(
       d += error_cycles;
       d += ",\"baseline_error\":";
       d += baseline_error;
-      d += ",\"sample_seconds\":";
-      d += sample_seconds;
       d += ",\"residual\":";
       d += residual;
       d += ",\"ratio\":";
@@ -593,19 +556,15 @@ bool gpt_tau_profile(
       enqueueEvent("TAU_DIAG_SAMPLE", d);
     }
 
-    // ---- Histogram classification ----
     tau_hist_add_residual(&hist, residual);
 
-    // ---- Accumulate time ----
-    elapsed += sample_seconds;
+    elapsed += 1;
 
-    // ---- Periodic emit ----
     if ((elapsed - last_emit_elapsed) >= TAU_EMIT_INTERVAL_SECONDS) {
       last_emit_elapsed = elapsed;
       emit_tau_result(
           "TAU_RESULT",
           elapsed,
-          sample_seconds,
           baseline_error,
           baseline_stddev,
           &hist
@@ -613,11 +572,9 @@ bool gpt_tau_profile(
     }
   }
 
-  // ---- Final summary ----
   emit_tau_result(
       "TAU_FINAL_RESULT",
       elapsed,
-      sample_seconds,
       baseline_error,
       baseline_stddev,
       &hist
