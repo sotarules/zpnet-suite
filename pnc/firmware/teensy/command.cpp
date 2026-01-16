@@ -172,21 +172,20 @@ void command_exec(const char* line) {
     uint64_t seconds = 2;
     extractUintArg(line, "\"seconds\"", &seconds);
 
+    // Sanity clamp
     if (seconds == 0) seconds = 1;
     if (seconds > 3600) seconds = 3600;
 
-    const uint64_t TARGET_EXT_TICKS =
-        seconds * 10000000ULL;
-
     uint64_t cpu_cycles = 0;
-    double ratio = 0.0;
-    int64_t error_cycles_out = 0;
+    double   ratio      = 0.0;
+    int64_t  error_cycles = 0;
 
+    // Seconds-based confirm (GNSS-anchored)
     uint64_t gpt_count = gpt_count_confirm(
-        TARGET_EXT_TICKS,
+        (uint32_t)seconds,
         &cpu_cycles,
         &ratio,
-        &error_cycles_out
+        &error_cycles
     );
 
     String body;
@@ -205,7 +204,7 @@ void command_exec(const char* line) {
     }
 
     body += ",\"error_cycles\":";
-    body += error_cycles_out;
+    body += error_cycles;
 
     enqueueEvent("GPT_CONFIRM_RESULT", body);
     enqueueAckEvent(cmd);
@@ -213,32 +212,75 @@ void command_exec(const char* line) {
   }
 
   // ------------------------------------------------------------
-  // TAU PROFILING (NEW, MONTE CARLO)
+  // TAU BASELINE DISCOVERY (SELF-CALIBRATING)
+  // ------------------------------------------------------------
+  if (strcmp(cmd, "TAU.BASELINE") == 0) {
+
+    uint32_t samples   = 0;
+    int32_t  min_error = 0;
+    int32_t  max_error = 0;
+    int32_t  med_error = 0;
+    int32_t  std_error = 0;
+    double   stddev    = 0.0;
+
+    bool ok = gpt_discover_standard_error(
+        &samples,
+        &min_error,
+        &max_error,
+        &med_error,
+        &std_error,
+        &stddev
+    );
+
+    if (!ok) {
+      enqueueErrEvent(cmd, "baseline discovery failed");
+      return;
+    }
+
+    String body;
+    body += "\"samples\":";
+    body += samples;
+    body += ",\"min_error\":";
+    body += min_error;
+    body += ",\"max_error\":";
+    body += max_error;
+    body += ",\"med_error\":";
+    body += med_error;
+    body += ",\"std_error\":";
+    body += std_error;
+    body += ",\"stddev\":";
+
+    char buf[32];
+    snprintf(buf, sizeof(buf), "%.6f", stddev);
+    body += buf;
+
+    enqueueEvent("TAU_BASELINE", body);
+    enqueueAckEvent(cmd);
+    return;
+  }
+
+  // ------------------------------------------------------------
+  // TAU PROFILING (SELF-CALIBRATING, MONTE CARLO)
   // ------------------------------------------------------------
   if (strcmp(cmd, "TAU.PROFILE") == 0) {
 
     uint64_t total_seconds  = 0;
     uint64_t sample_seconds = 0;
-    uint64_t span_cycles    = 0;
-    uint64_t bucket_width  = 0;
 
     if (!extractUintArg(line, "\"total_seconds\"", &total_seconds) ||
-        !extractUintArg(line, "\"sample_seconds\"", &sample_seconds) ||
-        !extractUintArg(line, "\"span_cycles\"", &span_cycles) ||
-        !extractUintArg(line, "\"bucket_width\"", &bucket_width)) {
+        !extractUintArg(line, "\"sample_seconds\"", &sample_seconds)) {
       enqueueErrEvent(cmd, "missing or invalid arguments");
       return;
     }
 
-    // Sanity clamps
+    // Sanity checks
     if (sample_seconds == 0 ||
-        total_seconds < sample_seconds ||
-        bucket_width == 0) {
+        total_seconds < sample_seconds) {
       enqueueErrEvent(cmd, "invalid parameter range");
       return;
     }
 
-    // Hard safety caps (adjust as needed)
+    // Hard safety cap (defensive)
     if (total_seconds > (48ULL * 3600ULL)) {
       enqueueErrEvent(cmd, "total_seconds exceeds cap");
       return;
@@ -246,9 +288,7 @@ void command_exec(const char* line) {
 
     bool ok = gpt_tau_profile(
         (uint32_t)total_seconds,
-        (uint32_t)sample_seconds,
-        (int32_t)span_cycles,
-        (uint32_t)bucket_width
+        (uint32_t)sample_seconds
     );
 
     if (!ok) {
@@ -259,7 +299,6 @@ void command_exec(const char* line) {
     enqueueAckEvent(cmd);
     return;
   }
-
   // ------------------------------------------------------------
   // PHOTODIODE COMMANDS
   // ------------------------------------------------------------
