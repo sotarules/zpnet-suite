@@ -1,5 +1,5 @@
+#include "bootloader.h"
 #include "command.h"
-
 #include "event_bus.h"
 #include "util.h"
 #include "system.h"

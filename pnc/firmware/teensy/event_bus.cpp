@@ -12,7 +12,7 @@ static size_t evt_count = 0;
 static uint32_t evt_dropped = 0;
 
 // Uncomment for imperative diagnostics
-#define EVENTBUS_IMMEDIATE_DIAGNOSTICS
+// #define EVENTBUS_IMMEDIATE_DIAGNOSTICS
 
 // --------------------------------------------------------------
 // Internal helpers
