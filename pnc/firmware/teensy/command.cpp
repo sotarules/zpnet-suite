@@ -1,8 +1,10 @@
 #include "bootloader.h"
+#include "debug.h"
 #include "command.h"
 #include "event_bus.h"
 #include "util.h"
 #include "system.h"
+#include "process.h"
 
 #include "laser.h"
 #include "photodiode.h"
@@ -87,9 +89,31 @@ static inline void emitImmediateFramed(
 }
 
 // --------------------------------------------------------------
+// Helper: process type parsing (minimal, explicit)
+// --------------------------------------------------------------
+static bool parseProcessType(const char* line, process_type_t& out) {
+  if (strstr(line, "\"type\":\"GNSS\"")) {
+    out = PROCESS_TYPE_GNSS;
+    return true;
+  }
+  if (strstr(line, "\"type\":\"TEMPEST\"")) {
+    out = PROCESS_TYPE_TEMPEST;
+    return true;
+  }
+  if (strstr(line, "\"type\":\"LANTERN\"")) {
+    out = PROCESS_TYPE_LANTERN;
+    return true;
+  }
+  return false;
+}
+
+// --------------------------------------------------------------
 // Command execution
 // --------------------------------------------------------------
 void command_exec(const char* line) {
+
+  debug_log("CMD", "ENTERED command_exec (kernel)");
+
   char cmd[64];
 
   if (!extractCmd(line, cmd, sizeof(cmd))) {
@@ -98,8 +122,153 @@ void command_exec(const char* line) {
   }
 
   // ------------------------------------------------------------
-  // STATUS / DATA COMMANDS
+  // EVENT BUS
   // ------------------------------------------------------------
+  if (strcmp(cmd, "EVENTS.GET") == 0) {
+    drainEventsNow();
+    return;
+  }
+
+  // ============================================================
+  // PROCESS COMMANDS
+  // ============================================================
+
+  if (strcmp(cmd, "PROCESS.LIST") == 0) {
+    String body = process_list_json();
+    emitImmediateFramed("PROCESS_LIST", body);
+    return;
+  }
+
+  if (strcmp(cmd, "PROCESS.START") == 0) {
+    process_type_t type;
+    if (!parseProcessType(line, type)) {
+      enqueueErrEvent(cmd, "missing or invalid process type");
+      return;
+    }
+
+    if (!process_start(type)) {
+      enqueueErrEvent(cmd, "process start failed");
+      return;
+    }
+
+    enqueueAckEvent(cmd);
+    return;
+  }
+
+  if (strcmp(cmd, "PROCESS.STOP") == 0) {
+    process_type_t type;
+    if (!parseProcessType(line, type)) {
+      enqueueErrEvent(cmd, "missing or invalid process type");
+      return;
+    }
+
+    if (!process_stop(type)) {
+      enqueueErrEvent(cmd, "process stop failed");
+      return;
+    }
+
+    enqueueAckEvent(cmd);
+    return;
+  }
+
+  if (strcmp(cmd, "PROCESS.QUERY") == 0) {
+    process_type_t type;
+    if (!parseProcessType(line, type)) {
+      emitImmediateFramed(
+        "PROCESS_QUERY",
+        "\"error\":\"missing or invalid process type\""
+      );
+      return;
+    }
+
+    String body;
+    if (!process_query(type, body)) {
+      emitImmediateFramed(
+        "PROCESS_QUERY",
+        "\"error\":\"process not found\""
+      );
+      return;
+    }
+
+    emitImmediateFramed("PROCESS_QUERY", body);
+    return;
+  }
+
+  if (strcmp(cmd, "PROCESS.COMMAND") == 0) {
+
+    process_type_t type;
+    if (!parseProcessType(line, type)) {
+      emitImmediateFramed(
+        "PROCESS_COMMAND",
+        "\"error\":\"missing or invalid process type\""
+      );
+      return;
+    }
+
+    const char* cmd_arg = strstr(line, "\"proc_cmd\"");
+    if (!cmd_arg) {
+      emitImmediateFramed(
+        "PROCESS_COMMAND",
+        "\"error\":\"missing proc_cmd\""
+      );
+      return;
+    }
+
+    cmd_arg = strchr(cmd_arg, ':');
+    if (!cmd_arg) {
+      emitImmediateFramed(
+        "PROCESS_COMMAND",
+        "\"error\":\"malformed proc_cmd (missing colon)\""
+      );
+      return;
+    }
+
+    cmd_arg++;
+    while (*cmd_arg == ' ') cmd_arg++;
+
+    if (*cmd_arg != '\"') {
+      emitImmediateFramed(
+        "PROCESS_COMMAND",
+        "\"error\":\"malformed proc_cmd (missing opening quote)\""
+      );
+      return;
+    }
+
+    cmd_arg++;
+
+    char proc_cmd[64];
+    const char* q = strchr(cmd_arg, '\"');
+    if (!q) {
+      emitImmediateFramed(
+        "PROCESS_COMMAND",
+        "\"error\":\"malformed proc_cmd (missing closing quote)\""
+      );
+      return;
+    }
+
+
+    size_t n = q - cmd_arg;
+    if (n >= sizeof(proc_cmd)) n = sizeof(proc_cmd) - 1;
+    memcpy(proc_cmd, cmd_arg, n);
+    proc_cmd[n] = '\0';
+
+    String body;
+    if (!process_command(type, proc_cmd, nullptr, body)) {
+      emitImmediateFramed(
+        "PROCESS_COMMAND",
+        "\"error\":\"command rejected\""
+      );
+      return;
+    }
+
+    enqueueAckEvent(cmd);
+    return;
+  }
+
+  // ============================================================
+  // STATUS / DATA COMMANDS (LEGACY – PRESERVED)
+  // ============================================================
+
   if (strcmp(cmd, "TEENSY.STATUS") == 0) {
     enqueueEvent("TEENSY_STATUS", buildTeensyStatusBody());
     return;
@@ -115,9 +284,10 @@ void command_exec(const char* line) {
     return;
   }
 
-  // ------------------------------------------------------------
+  // ============================================================
   // QUERY COMMANDS (NON-DESTRUCTIVE)
-  // ------------------------------------------------------------
+  // ============================================================
+
   if (strcmp(cmd, "PHOTODIODE.STATUS?") == 0) {
     emitImmediateFramed(
       "PHOTODIODE_STATUS",
@@ -126,9 +296,10 @@ void command_exec(const char* line) {
     return;
   }
 
-  // ------------------------------------------------------------
+  // ============================================================
   // QTIMER COMMANDS
-  // ------------------------------------------------------------
+  // ============================================================
+
   if (strcmp(cmd, "QTIMER.ARM") == 0) {
     qtimer_arm();
     enqueueAckEvent(cmd);
@@ -335,14 +506,6 @@ void command_exec(const char* line) {
   if (strcmp(cmd, "SYSTEM.SHUTDOWN") == 0) {
     enqueueAckEvent(cmd);
     system_request_shutdown();
-    return;
-  }
-
-  // ------------------------------------------------------------
-  // EVENT BUS
-  // ------------------------------------------------------------
-  if (strcmp(cmd, "EVENTS.GET") == 0) {
-    drainEventsNow();
     return;
   }
 

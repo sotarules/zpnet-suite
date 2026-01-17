@@ -7,4 +7,4 @@
 // USB is flash-only.
 // UART is runtime.
 // --------------------------------------------------------------
-#define ZPNET_SERIAL Serial2
+#define ZPNET_SERIAL Serial

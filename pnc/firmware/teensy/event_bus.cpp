@@ -1,6 +1,12 @@
+// ============================================================================
+// FILE: event_bus.cpp
+// ============================================================================
 #include "event_bus.h"
 #include "transport.h"
 #include "util.h"
+#include "timepop.h"
+
+#include <Arduino.h>
 
 // --------------------------------------------------------------
 // Internal ring buffer state
@@ -13,6 +19,28 @@ static uint32_t evt_dropped = 0;
 
 // Uncomment for imperative diagnostics
 // #define EVENTBUS_IMMEDIATE_DIAGNOSTICS
+
+// --------------------------------------------------------------
+// TimePop-driven drain scheduling (new)
+// --------------------------------------------------------------
+//
+// Design constraints:
+//   • event_bus owns its own cadence (self-rescheduling TimePop callback)
+//   • no work in ISR
+//   • no polling in zpnet_loop()
+//   • NO unsolicited serial output:
+//       - the tick emits nothing unless a drain has been explicitly requested
+//
+// Behavioral contract:
+//   • command plane requests a drain via event_bus_request_drain()
+//   • event_bus tick performs drain in scheduled context
+//
+static constexpr uint32_t EVENTBUS_TICK_INTERVAL_MS = 5;
+
+static volatile bool g_drain_requested  = false;
+static volatile bool g_drain_in_progress = false;
+
+static void eventbus_tick(void*);
 
 // --------------------------------------------------------------
 // Internal helpers
@@ -79,7 +107,30 @@ static bool dequeueEvent(EventItem& out) {
 }
 
 // --------------------------------------------------------------
-// Public API
+// Public API (new)
+// --------------------------------------------------------------
+void event_bus_init() {
+  // Reset scheduler state
+  g_drain_requested = false;
+  g_drain_in_progress = false;
+
+  // Arm first tick (self-scheduling thereafter)
+  timepop_schedule(
+      EVENTBUS_TICK_INTERVAL_MS,
+      TIMEPOP_UNITS_MILLISECONDS,
+      eventbus_tick,
+      nullptr,
+      "event-bus"
+  );
+}
+
+void event_bus_request_drain() {
+  // Idempotent: multiple requests collapse to one drain opportunity.
+  g_drain_requested = true;
+}
+
+// --------------------------------------------------------------
+// Public API (existing)
 // --------------------------------------------------------------
 void enqueueEvent(const char* type, const String& body) {
 
@@ -107,7 +158,6 @@ void enqueueEvent(const char* type, const String& body) {
   evt_head = (evt_head + 1) % EVT_MAX;
   evt_count++;
 }
-
 
 void drainEventsNow() {
   // ------------------------------------------------------------
@@ -171,9 +221,39 @@ void enqueueErrEvent(const char* cmd, const char* msg) {
 }
 
 uint32_t eventQueueDepth() {
-  return evt_count;
+  return (uint32_t)evt_count;
 }
 
 uint32_t eventDroppedCount() {
   return evt_dropped;
+}
+
+// --------------------------------------------------------------
+// TimePop tick (scheduled context)
+// --------------------------------------------------------------
+static void eventbus_tick(void*) {
+  // ------------------------------------------------------------
+  // No unsolicited output:
+  // Only drain if an explicit request has been made.
+  // ------------------------------------------------------------
+  if (g_drain_requested && !g_drain_in_progress) {
+
+    // Claim the drain (collapse multiple requests)
+    g_drain_requested = false;
+    g_drain_in_progress = true;
+
+    // Perform full drain in scheduled context (NOT ISR)
+    drainEventsNow();
+
+    g_drain_in_progress = false;
+  }
+
+  // Self-reschedule (module owns its cadence)
+  timepop_schedule(
+      EVENTBUS_TICK_INTERVAL_MS,
+      TIMEPOP_UNITS_MILLISECONDS,
+      eventbus_tick,
+      nullptr,
+      "event-bus"
+  );
 }

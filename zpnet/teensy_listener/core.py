@@ -48,7 +48,7 @@ from zpnet.shared.constants import (
 # ---------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------
-EVENT_DESPOOL_INTERVAL_S = 2.0
+EVENT_DESPOOL_INTERVAL_S = 10.0
 
 # Single well-known RPC socket
 RPC_SOCKET_PATH = "/tmp/zpnet_teensy_rt.sock"

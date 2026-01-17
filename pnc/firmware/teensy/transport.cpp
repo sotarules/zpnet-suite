@@ -1,5 +1,7 @@
+#include "config.h"
 #include "transport.h"
 #include "zpnet_serial.h"
+#include "debug.h"
 
 #include <string.h>
 #include <stdlib.h>
@@ -54,8 +56,14 @@ void transport_init(transport_rx_callback_t cb) {
 }
 
 void transport_ingest_byte(char c) {
-    #ifdef TRANSPORT_DEBUG
-    ZPNET_SERIAL.write(c);
+    // ------------------------------------------------------------------
+    // Optional raw transport ingress echo (DEBUG ONLY)
+    //
+    // Echoes every received transport byte to the debug UART.
+    // This is diagnostic scaffolding and MUST NOT be enabled in production.
+    // ------------------------------------------------------------------
+    #ifdef TRANSPORT_DEBUG_ECHO
+      Serial2.write(c);
     #endif
     switch (rx_state) {
 
