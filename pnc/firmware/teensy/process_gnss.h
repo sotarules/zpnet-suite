@@ -7,18 +7,18 @@
  * ------------------------------------------------------------------
  * GNSS Process (process_gnss)
  *
- * Owns:
- *   • Serial1 ingestion (CF-8802)
- *   • Sentence buffering
- *   • NMEA parsing
- *   • GNSS-derived observables
+ * Role:
+ *   • Owns GNSS ingestion and internal state
+ *   • Exposes authoritative GNSS state via commands
  *
- * This process replaces legacy gnss.cpp polling.
+ * Contract:
+ *   • Commands are declared explicitly
+ *   • Every command returns a CommandResponse JSON object
+ *   • No command/query syntactic distinction
  *
- * Behavior:
- *   • Interrupt / TimePop driven
- *   • No loop polling
- *   • Fully introspectable via QUERY
+ * Commands:
+ *   • STATUS — return current GNSS status snapshot
+ *   • DATA   — return current GNSS data snapshot
  *
  * ------------------------------------------------------------------
  */

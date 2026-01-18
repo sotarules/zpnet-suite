@@ -109,22 +109,25 @@ String buildPhotodiodeStatusBody() {
 
   float analog_v = (analog_raw / 4095.0f) * 3.3f;
 
-  String b;
-  b += "\"edge_level\":";
-  b += edge_level;
-  b += ",\"edge_pulse_count\":";
-  b += count;
-  b += ",\"analog_raw\":";
-  b += analog_raw;
-  b += ",\"analog_v\":";
+  String out;
+  out += "{";
+
+  out += "\"edge_level\":";
+  out += edge_level;
+  out += ",\"edge_pulse_count\":";
+  out += count;
+  out += ",\"analog_raw\":";
+  out += analog_raw;
+  out += ",\"analog_v\":";
 
   {
     char buf[32];
     snprintf(buf, sizeof(buf), "%.5f", analog_v);
-    b += buf;
+    out += buf;
   }
 
-  return b;
+  out += "}";
+  return out;
 }
 
 String buildPhotodiodeCountBody() {
@@ -133,9 +136,12 @@ String buildPhotodiodeCountBody() {
   count = photodiode_episode_count;
   interrupts();
 
-  String b;
-  b += "\"count\":";
-  b += count;
+  String out;
+  out += "{";
 
-  return b;
+  out += "\"count\":";
+  out += count;
+
+  out += "}";
+  return out;
 }

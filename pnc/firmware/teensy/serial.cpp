@@ -54,7 +54,6 @@ static void on_transport_frame(
     const char* payload,
     size_t      length
 ) {
-    debug_log("TRANSPORT", "frame complete");
     static char cmd_buf[TRANSPORT_MAX_PAYLOAD + 1];
 
     if (length >= sizeof(cmd_buf)) {
@@ -62,8 +61,8 @@ static void on_transport_frame(
         return;
     }
 
-    static char dbg[64];
-    size_t n = (length < 60) ? length : 60;
+    static char dbg[256];
+    size_t n = (length < 256) ? length : 256;
     memcpy(dbg, payload, n);
     dbg[n] = '\0';
     debug_log("TRANSPORT", dbg);

@@ -17,500 +17,311 @@
 #include <string.h>
 #include <stdlib.h>
 
-// --------------------------------------------------------------
-// Internal helpers
-// --------------------------------------------------------------
+// =============================================================
+// Helpers — req_id extraction (optional)
+// =============================================================
+
+static bool extractReqId(const char* line, uint32_t& out) {
+    const char* p = strstr(line, "\"req_id\"");
+    if (!p) return false;
+
+    p = strchr(p, ':');
+    if (!p) return false;
+    p++;
+
+    out = (uint32_t)strtoul(p, nullptr, 10);
+    return true;
+}
+
+// =============================================================
+// Helpers — Immediate JSON Response Emission (SOLE PATH)
+// =============================================================
+
+static inline void emitImmediateResponse(
+    bool success,
+    const char* message,
+    const String* payload,   // optional JSON body fragment
+    bool has_req_id,
+    uint32_t req_id
+) {
+    String out;
+    out += "{";
+
+    if (has_req_id) {
+        out += "\"req_id\":";
+        out += req_id;
+        out += ",";
+    }
+
+    out += "\"success\":";
+    out += success ? "true" : "false";
+
+    out += ",\"message\":\"";
+    out += message ? message : "";
+    out += "\"";
+
+    if (payload && payload->length() > 0) {
+        out += ",\"payload\":";
+        out += *payload;
+    }
+
+    out += "}";
+
+    transport_send_frame(out.c_str(), out.length());
+}
+
+static inline void emitOK(
+    const String* payload,
+    bool has_req_id,
+    uint32_t req_id
+) {
+    emitImmediateResponse(true, "OK", payload, has_req_id, req_id);
+}
+
+static inline void emitError(
+    const char* message,
+    bool has_req_id,
+    uint32_t req_id
+) {
+    // Wrap the error text as JSON in a payload object
+    String errPayload;
+    errPayload += "{";
+    errPayload += "\"message\":\"";
+    errPayload += message ? message : "";
+    errPayload += "\"}";
+    emitImmediateResponse(false, message, &errPayload, has_req_id, req_id);
+}
+
+// =============================================================
+// Parsing helpers
+// =============================================================
+
 static bool extractCmd(const char* line, char* out, size_t out_sz) {
-  const char* p = strstr(line, "\"cmd\"");
-  if (!p) return false;
+    const char* p = strstr(line, "\"cmd\"");
+    if (!p) return false;
 
-  p = strchr(p, ':');
-  if (!p) return false;
-  p++;
+    p = strchr(p, ':');
+    if (!p) return false;
+    p++;
 
-  while (*p == ' ') p++;
-  if (*p != '\"') return false;
-  p++;
+    while (*p == ' ') p++;
+    if (*p != '\"') return false;
+    p++;
 
-  const char* q = strchr(p, '\"');
-  if (!q) return false;
+    const char* q = strchr(p, '\"');
+    if (!q) return false;
 
-  size_t n = q - p;
-  if (n >= out_sz) n = out_sz - 1;
-
-  memcpy(out, p, n);
-  out[n] = '\0';
-  return true;
+    size_t n = q - p;
+    if (n >= out_sz) n = out_sz - 1;
+    memcpy(out, p, n);
+    out[n] = '\0';
+    return true;
 }
 
-static bool extractUintArg(
-    const char* line,
-    const char* key,
-    uint64_t* out
-) {
-  const char* p = strstr(line, key);
-  if (!p) return false;
-
-  p = strchr(p, ':');
-  if (!p) return false;
-  p++;
-
-  while (*p == ' ') p++;
-
-  char* end = nullptr;
-  unsigned long long val = strtoull(p, &end, 10);
-  if (end == p) return false;
-
-  *out = (uint64_t)val;
-  return true;
-}
-
-// --------------------------------------------------------------
-// Immediate framed emit (QUERY plane only)
-// --------------------------------------------------------------
-static inline void emitImmediateFramed(
-    const char* type,
-    const String& body
-) {
-  String out;
-
-  out += "{\"type\":\"";
-  out += type;
-  out += "\"";
-
-  if (body.length() > 0) {
-    out += ",";
-    out += body;
-  }
-
-  out += "}";
-
-  transport_send_frame(out.c_str(), out.length());
-}
-
-// --------------------------------------------------------------
-// Helper: process type parsing (minimal, explicit)
-// --------------------------------------------------------------
 static bool parseProcessType(const char* line, process_type_t& out) {
-  if (strstr(line, "\"type\":\"GNSS\"")) {
-    out = PROCESS_TYPE_GNSS;
-    return true;
-  }
-  if (strstr(line, "\"type\":\"TEMPEST\"")) {
-    out = PROCESS_TYPE_TEMPEST;
-    return true;
-  }
-  if (strstr(line, "\"type\":\"LANTERN\"")) {
-    out = PROCESS_TYPE_LANTERN;
-    return true;
-  }
-  return false;
+    if (strstr(line, "\"type\":\"GNSS\""))    { out = PROCESS_TYPE_GNSS; return true; }
+    if (strstr(line, "\"type\":\"TEMPEST\"")) { out = PROCESS_TYPE_TEMPEST; return true; }
+    if (strstr(line, "\"type\":\"LANTERN\"")) { out = PROCESS_TYPE_LANTERN; return true; }
+    return false;
 }
 
-// --------------------------------------------------------------
-// Command execution
-// --------------------------------------------------------------
+// =============================================================
+// Command Execution — NORMALIZED
+// =============================================================
+
 void command_exec(const char* line) {
 
-  debug_log("CMD", "ENTERED command_exec (kernel)");
+    debug_log("CMD", "command_exec ENTER");
 
-  char cmd[64];
+    uint32_t req_id = 0;
+    bool has_req_id = extractReqId(line, req_id);
 
-  if (!extractCmd(line, cmd, sizeof(cmd))) {
-    enqueueErrEvent("UNKNOWN", "missing cmd");
-    return;
-  }
-
-  // ------------------------------------------------------------
-  // EVENT BUS
-  // ------------------------------------------------------------
-  if (strcmp(cmd, "EVENTS.GET") == 0) {
-    drainEventsNow();
-    return;
-  }
-
-  // ============================================================
-  // PROCESS COMMANDS
-  // ============================================================
-
-  if (strcmp(cmd, "PROCESS.LIST") == 0) {
-    String body = process_list_json();
-    emitImmediateFramed("PROCESS_LIST", body);
-    return;
-  }
-
-  if (strcmp(cmd, "PROCESS.START") == 0) {
-    process_type_t type;
-    if (!parseProcessType(line, type)) {
-      enqueueErrEvent(cmd, "missing or invalid process type");
-      return;
+    char cmd[64];
+    if (!extractCmd(line, cmd, sizeof(cmd))) {
+        emitError("missing cmd", has_req_id, req_id);
+        return;
     }
 
-    if (!process_start(type)) {
-      enqueueErrEvent(cmd, "process start failed");
-      return;
+    // ---------------------------------------------------------
+    // EVENT BUS CONTROL
+    // ---------------------------------------------------------
+    if (strcmp(cmd, "EVENTS.GET") == 0) {
+        drainEventsNow();
+        emitOK(nullptr, has_req_id, req_id);
+        return;
     }
 
-    enqueueAckEvent(cmd);
-    return;
-  }
+    // ---------------------------------------------------------
+    // PROCESS COMMANDS (ALL NORMALIZED)
+    // ---------------------------------------------------------
 
-  if (strcmp(cmd, "PROCESS.STOP") == 0) {
-    process_type_t type;
-    if (!parseProcessType(line, type)) {
-      enqueueErrEvent(cmd, "missing or invalid process type");
-      return;
+    if (strcmp(cmd, "PROCESS.LIST") == 0) {
+        String payload = process_list_json();
+        emitOK(&payload, has_req_id, req_id);
+        return;
     }
 
-    if (!process_stop(type)) {
-      enqueueErrEvent(cmd, "process stop failed");
-      return;
+    if (strcmp(cmd, "PROCESS.START") == 0) {
+        process_type_t type;
+        if (!parseProcessType(line, type)) {
+            emitError("missing or invalid process type", has_req_id, req_id);
+            return;
+        }
+        if (!process_start(type)) {
+            emitError("process start failed", has_req_id, req_id);
+            return;
+        }
+        emitOK(nullptr, has_req_id, req_id);
+        return;
     }
 
-    enqueueAckEvent(cmd);
-    return;
-  }
-
-  if (strcmp(cmd, "PROCESS.QUERY") == 0) {
-    process_type_t type;
-    if (!parseProcessType(line, type)) {
-      emitImmediateFramed(
-        "PROCESS_QUERY",
-        "\"error\":\"missing or invalid process type\""
-      );
-      return;
+    if (strcmp(cmd, "PROCESS.STOP") == 0) {
+        process_type_t type;
+        if (!parseProcessType(line, type)) {
+            emitError("missing or invalid process type", has_req_id, req_id);
+            return;
+        }
+        if (!process_stop(type)) {
+            emitError("process stop failed", has_req_id, req_id);
+            return;
+        }
+        emitOK(nullptr, has_req_id, req_id);
+        return;
     }
 
-    String body;
-    if (!process_query(type, body)) {
-      emitImmediateFramed(
-        "PROCESS_QUERY",
-        "\"error\":\"process not found\""
-      );
-      return;
+    if (strcmp(cmd, "PROCESS.QUERY") == 0) {
+        process_type_t type;
+        if (!parseProcessType(line, type)) {
+            emitError("missing or invalid process type", has_req_id, req_id);
+            return;
+        }
+
+        String payload;
+        if (!process_query(type, payload)) {
+            emitError("process not found", has_req_id, req_id);
+            return;
+        }
+
+        emitOK(&payload, has_req_id, req_id);
+        return;
     }
 
-    emitImmediateFramed("PROCESS_QUERY", body);
-    return;
-  }
+    if (strcmp(cmd, "PROCESS.COMMAND") == 0) {
+        process_type_t type;
+        if (!parseProcessType(line, type)) {
+            emitError("missing or invalid process type", has_req_id, req_id);
+            return;
+        }
 
-  if (strcmp(cmd, "PROCESS.COMMAND") == 0) {
+        const char* p = strstr(line, "\"proc_cmd\"");
+        if (!p) {
+            emitError("missing proc_cmd", has_req_id, req_id);
+            return;
+        }
 
-    process_type_t type;
-    if (!parseProcessType(line, type)) {
-      emitImmediateFramed(
-        "PROCESS_COMMAND",
-        "\"error\":\"missing or invalid process type\""
-      );
-      return;
+        p = strchr(p, ':');
+        if (!p) {
+            emitError("malformed proc_cmd", has_req_id, req_id);
+            return;
+        }
+
+        p++;
+        while (*p == ' ') p++;
+        if (*p != '\"') {
+            emitError("malformed proc_cmd", has_req_id, req_id);
+            return;
+        }
+        p++;
+
+        char proc_cmd[64];
+        const char* q = strchr(p, '\"');
+        if (!q) {
+            emitError("malformed proc_cmd", has_req_id, req_id);
+            return;
+        }
+
+        size_t n = q - p;
+        if (n >= sizeof(proc_cmd)) n = sizeof(proc_cmd) - 1;
+        memcpy(proc_cmd, p, n);
+        proc_cmd[n] = '\0';
+
+        String payload;
+        if (!process_command(type, proc_cmd, nullptr, payload)) {
+            emitError("process command failed", has_req_id, req_id);
+            return;
+        }
+
+        emitOK(payload.length() ? &payload : nullptr, has_req_id, req_id);
+        return;
     }
 
-    const char* cmd_arg = strstr(line, "\"proc_cmd\"");
-    if (!cmd_arg) {
-      emitImmediateFramed(
-        "PROCESS_COMMAND",
-        "\"error\":\"missing proc_cmd\""
-      );
-      return;
+    // ---------------------------------------------------------
+    // LEGACY / DIRECT COMMANDS
+    // ---------------------------------------------------------
+
+    if (strcmp(cmd, "TEENSY.STATUS") == 0) {
+        String payload = buildTeensyStatusBody();
+        emitOK(&payload, has_req_id, req_id);
+        return;
     }
 
-    cmd_arg = strchr(cmd_arg, ':');
-    if (!cmd_arg) {
-      emitImmediateFramed(
-        "PROCESS_COMMAND",
-        "\"error\":\"malformed proc_cmd (missing colon)\""
-      );
-      return;
+    if (strcmp(cmd, "GNSS.STATUS") == 0) {
+        String payload = buildGnssStatusBody();
+        emitOK(&payload, has_req_id, req_id);
+        return;
     }
 
-    cmd_arg++;
-    while (*cmd_arg == ' ') cmd_arg++;
-
-    if (*cmd_arg != '\"') {
-      emitImmediateFramed(
-        "PROCESS_COMMAND",
-        "\"error\":\"malformed proc_cmd (missing opening quote)\""
-      );
-      return;
+    if (strcmp(cmd, "GNSS.DATA") == 0) {
+        String payload = buildGnssDataBody();
+        emitOK(&payload, has_req_id, req_id);
+        return;
     }
 
-    cmd_arg++;
-
-    char proc_cmd[64];
-    const char* q = strchr(cmd_arg, '\"');
-    if (!q) {
-      emitImmediateFramed(
-        "PROCESS_COMMAND",
-        "\"error\":\"malformed proc_cmd (missing closing quote)\""
-      );
-      return;
+    if (strcmp(cmd, "PHOTODIODE.STATUS") == 0) {
+        String payload = buildPhotodiodeStatusBody();
+        emitOK(&payload, has_req_id, req_id);
+        return;
     }
 
-
-    size_t n = q - cmd_arg;
-    if (n >= sizeof(proc_cmd)) n = sizeof(proc_cmd) - 1;
-    memcpy(proc_cmd, cmd_arg, n);
-    proc_cmd[n] = '\0';
-
-    String body;
-    if (!process_command(type, proc_cmd, nullptr, body)) {
-      emitImmediateFramed(
-        "PROCESS_COMMAND",
-        "\"error\":\"command rejected\""
-      );
-      return;
+    if (strcmp(cmd, "PHOTODIODE.COUNT") == 0) {
+        String payload = buildPhotodiodeCountBody();
+        emitOK(&payload, has_req_id, req_id);
+        return;
     }
 
-    enqueueAckEvent(cmd);
-    return;
-  }
-
-  // ============================================================
-  // STATUS / DATA COMMANDS (LEGACY – PRESERVED)
-  // ============================================================
-
-  if (strcmp(cmd, "TEENSY.STATUS") == 0) {
-    enqueueEvent("TEENSY_STATUS", buildTeensyStatusBody());
-    return;
-  }
-
-  if (strcmp(cmd, "GNSS.STATUS") == 0) {
-    enqueueEvent("GNSS_STATUS", buildGnssStatusBody());
-    return;
-  }
-
-  if (strcmp(cmd, "GNSS.DATA") == 0) {
-    enqueueEvent("GNSS_DATA", buildGnssDataBody());
-    return;
-  }
-
-  // ============================================================
-  // QUERY COMMANDS (NON-DESTRUCTIVE)
-  // ============================================================
-
-  if (strcmp(cmd, "PHOTODIODE.STATUS?") == 0) {
-    emitImmediateFramed(
-      "PHOTODIODE_STATUS",
-      buildPhotodiodeStatusBody()
-    );
-    return;
-  }
-
-  // ============================================================
-  // QTIMER COMMANDS
-  // ============================================================
-
-  if (strcmp(cmd, "QTIMER.ARM") == 0) {
-    qtimer_arm();
-    enqueueAckEvent(cmd);
-    return;
-  }
-
-  if (strcmp(cmd, "QTIMER.DISARM") == 0) {
-    qtimer_disarm();
-    enqueueAckEvent(cmd);
-    return;
-  }
-
-  if (strcmp(cmd, "QTIMER.READ?") == 0) {
-    String b;
-    b += "\"count\":";
-    b += qtimer_read();
-    emitImmediateFramed("QTIMER_READ", b);
-    return;
-  }
-
-  if (strcmp(cmd, "QTIMER.CLEAR") == 0) {
-    qtimer_clear();
-    enqueueAckEvent(cmd);
-    return;
-  }
-
-  if (strcmp(cmd, "QTIMER.STATUS?") == 0) {
-    String b;
-    b += "\"armed\":";
-    b += qtimer_status() ? "true" : "false";
-    emitImmediateFramed("QTIMER_STATUS", b);
-    return;
-  }
-
-  // ------------------------------------------------------------
-  // GPT CONFIRM (LEGACY, SINGLE-SAMPLE)
-  // ------------------------------------------------------------
-  if (strcmp(cmd, "GPT.CONFIRM") == 0) {
-
-    uint64_t seconds = 2;
-    extractUintArg(line, "\"seconds\"", &seconds);
-
-    // Sanity clamp
-    if (seconds == 0) seconds = 1;
-    if (seconds > 3600) seconds = 3600;
-
-    uint64_t cpu_cycles = 0;
-    double   ratio      = 0.0;
-    int64_t  error_cycles = 0;
-
-    // Seconds-based confirm (GNSS-anchored)
-    uint64_t gpt_count = gpt_count_confirm(
-        (uint32_t)seconds,
-        &cpu_cycles,
-        &ratio,
-        &error_cycles
-    );
-
-    String body;
-    body += "\"seconds\":";
-    body += seconds;
-    body += ",\"gpt_count\":";
-    body += gpt_count;
-    body += ",\"cpu_cycles\":";
-    body += cpu_cycles;
-    body += ",\"ratio\":";
-
-    {
-      char buf[32];
-      snprintf(buf, sizeof(buf), "%.12f", ratio);
-      body += buf;
+    if (strcmp(cmd, "PHOTODIODE.CLEAR") == 0) {
+        photodiode_clear();
+        emitOK(nullptr, has_req_id, req_id);
+        return;
     }
 
-    body += ",\"error_cycles\":";
-    body += error_cycles;
-
-    enqueueEvent("GPT_CONFIRM_RESULT", body);
-    enqueueAckEvent(cmd);
-    return;
-  }
-
-  // ------------------------------------------------------------
-  // TAU BASELINE DISCOVERY (SELF-CALIBRATING)
-  // ------------------------------------------------------------
-  if (strcmp(cmd, "TAU.BASELINE") == 0) {
-
-    uint32_t samples   = 0;
-    int32_t  min_error = 0;
-    int32_t  max_error = 0;
-    int32_t  med_error = 0;
-    int32_t  std_error = 0;
-    double   stddev    = 0.0;
-
-    bool ok = gpt_discover_standard_error(
-        &samples,
-        &min_error,
-        &max_error,
-        &med_error,
-        &std_error,
-        &stddev
-    );
-
-    if (!ok) {
-      enqueueErrEvent(cmd, "baseline discovery failed");
-      return;
+    if (strcmp(cmd, "LASER.ON") == 0) {
+        laser_on();
+        emitOK(nullptr, has_req_id, req_id);
+        return;
     }
 
-    String body;
-    body += "\"samples\":";
-    body += samples;
-    body += ",\"min_error\":";
-    body += min_error;
-    body += ",\"max_error\":";
-    body += max_error;
-    body += ",\"med_error\":";
-    body += med_error;
-    body += ",\"std_error\":";
-    body += std_error;
-    body += ",\"stddev\":";
-
-    char buf[32];
-    snprintf(buf, sizeof(buf), "%.6f", stddev);
-    body += buf;
-
-    enqueueEvent("TAU_BASELINE", body);
-    enqueueAckEvent(cmd);
-    return;
-  }
-
-  // ------------------------------------------------------------
-  // TAU PROFILING (SELF-CALIBRATING, MONTE CARLO)
-  // ------------------------------------------------------------
-  if (strcmp(cmd, "TAU.PROFILE") == 0) {
-
-    uint64_t total_seconds  = 0;
-
-    if (!extractUintArg(line, "\"total_seconds\"", &total_seconds)) {
-      enqueueErrEvent(cmd, "missing or invalid arguments");
-      return;
+    if (strcmp(cmd, "LASER.OFF") == 0) {
+        laser_off();
+        emitOK(nullptr, has_req_id, req_id);
+        return;
     }
 
-    // Hard safety cap (defensive)
-    if (total_seconds > (48ULL * 3600ULL)) {
-      enqueueErrEvent(cmd, "total_seconds exceeds cap");
-      return;
+    if (strcmp(cmd, "LASER.VOLTAGES") == 0) {
+        String payload = laser_measure_voltages();
+        emitOK(&payload, has_req_id, req_id);
+        return;
     }
 
-    bool ok = gpt_tau_profile(
-        (uint32_t)total_seconds
-    );
-
-    if (!ok) {
-      enqueueErrEvent(cmd, "tau profiling failed");
-      return;
+    if (strcmp(cmd, "SYSTEM.SHUTDOWN") == 0) {
+        emitOK(nullptr, has_req_id, req_id);
+        system_request_shutdown();
+        return;
     }
 
-    enqueueAckEvent(cmd);
-    return;
-  }
-  // ------------------------------------------------------------
-  // PHOTODIODE COMMANDS
-  // ------------------------------------------------------------
-  if (strcmp(cmd, "PHOTODIODE.STATUS") == 0) {
-    enqueueEvent("PHOTODIODE_STATUS", buildPhotodiodeStatusBody());
-    return;
-  }
+    // ---------------------------------------------------------
+    // UNKNOWN
+    // ---------------------------------------------------------
 
-  if (strcmp(cmd, "PHOTODIODE.COUNT") == 0) {
-    enqueueEvent("PHOTODIODE_COUNT", buildPhotodiodeCountBody());
-    return;
-  }
-
-  if (strcmp(cmd, "PHOTODIODE.CLEAR") == 0) {
-    photodiode_clear();
-    enqueueAckEvent(cmd);
-    return;
-  }
-
-  // ------------------------------------------------------------
-  // LASER COMMANDS
-  // ------------------------------------------------------------
-  if (strcmp(cmd, "LASER.ON") == 0) {
-    laser_on();
-    enqueueAckEvent(cmd);
-    return;
-  }
-
-  if (strcmp(cmd, "LASER.OFF") == 0) {
-    laser_off();
-    enqueueAckEvent(cmd);
-    return;
-  }
-
-  if (strcmp(cmd, "LASER.VOLTAGES") == 0) {
-    String body = laser_measure_voltages();
-    enqueueEvent("LASER_VOLTAGES", body);
-    enqueueAckEvent(cmd);
-    return;
-  }
-
-  // ------------------------------------------------------------
-  // SYSTEM COMMANDS
-  // ------------------------------------------------------------
-  if (strcmp(cmd, "SYSTEM.SHUTDOWN") == 0) {
-    enqueueAckEvent(cmd);
-    system_request_shutdown();
-    return;
-  }
-
-  // ------------------------------------------------------------
-  // UNKNOWN COMMAND
-  // ------------------------------------------------------------
-  enqueueErrEvent(cmd, "unknown command");
+    emitError("unknown command", has_req_id, req_id);
 }

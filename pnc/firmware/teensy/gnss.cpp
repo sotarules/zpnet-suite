@@ -1,3 +1,4 @@
+#include "debug.h"
 #include "gnss.h"
 
 #include "config.h"
@@ -140,28 +141,59 @@ String buildGnssStatusBody() {
 }
 
 String buildGnssDataBody() {
-  String b;
+
+  String out;
+  out += "{";
 
   if (!isnan(latitude_deg) && !isnan(longitude_deg)) {
-    b += "\"latitude_deg\":";
-    b += latitude_deg;
-    b += ",\"longitude_deg\":";
-    b += longitude_deg;
+    out += "\"latitude_deg\":";
+    out += latitude_deg;
+    out += ",\"longitude_deg\":";
+    out += longitude_deg;
   }
 
   if (last_zda[0]) {
-    if (b.length()) b += ",";
-    b += "\"raw_zda\":\"";
-    b += jsonEscape(last_zda);
-    b += "\"";
+    if (out.length()) out += ",";
+    out += "\"raw_zda\":\"";
+    out += jsonEscape(last_zda);
+    out += "\"";
   }
 
   if (last_rmc[0]) {
-    if (b.length()) b += ",";
-    b += "\"raw_rmc\":\"";
-    b += jsonEscape(last_rmc);
-    b += "\"";
+    if (out.length()) out += ",";
+    out += "\"raw_rmc\":\"";
+    out += jsonEscape(last_rmc);
+    out += "\"";
   }
 
-  return b;
+  out += "}";
+  return out;
 }
+
+void gnss_diagnostic_poll_loop() {
+  debug_log("GNSS", "diagnostic poll loop STARTED");
+
+  uint32_t last_log_ms = 0;
+
+  while (true) {
+
+    // Opportunistic GNSS ingestion
+    gnss_poll();
+
+    // Periodic heartbeat so we know this loop is alive
+    uint32_t now = millis();
+    if (now - last_log_ms >= 1000) {
+      last_log_ms = now;
+
+      if (last_sentence[0]) {
+        debug_log("GNSS", last_sentence);
+      } else {
+        debug_log("GNSS", "no sentence yet");
+      }
+    }
+
+    // Yield a little so USB + debug UART stay healthy
+    delay(5);
+  }
+}
+

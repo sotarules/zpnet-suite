@@ -4,19 +4,10 @@
 #include <cstddef>
 
 // --------------------------------------------------------------
-// Debug / forensic instrumentation
-// --------------------------------------------------------------
-//
-// Enable raw transport ingress echo to debug UART.
-// This MUST NOT be enabled in production.
-//
-//#define TRANSPORT_DEBUG_ECHO
-
-// --------------------------------------------------------------
 // Serial configuration
 // --------------------------------------------------------------
 static const unsigned long USB_SERIAL_BAUD = 115200;
-static const unsigned long GNSSDO_BAUD     = 115200;
+static const unsigned long GNSSDO_BAUD     = 38400;
 
 // --------------------------------------------------------------
 // Laser control pins

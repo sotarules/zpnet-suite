@@ -62,9 +62,11 @@ void transport_ingest_byte(char c) {
     // Echoes every received transport byte to the debug UART.
     // This is diagnostic scaffolding and MUST NOT be enabled in production.
     // ------------------------------------------------------------------
-    #ifdef TRANSPORT_DEBUG_ECHO
-      Serial2.write(c);
-    #endif
+
+    // TEMPORARY
+    Serial2.write(c);
+
+
     switch (rx_state) {
 
         case RX_IDLE:

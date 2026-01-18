@@ -2,6 +2,7 @@
 
 #include <Arduino.h>
 #include <stdint.h>
+#include <stddef.h>
 
 // --------------------------------------------------
 // Process Types
@@ -23,19 +24,61 @@ typedef enum {
 } process_state_t;
 
 // --------------------------------------------------
+// Command Response Contract
+// --------------------------------------------------
+//
+// All process commands return a JSON object with:
+//
+//   {
+//     "success": true|false,
+//     "message": "OK" | "...",
+//     "payload": { ... }   // optional
+//   }
+//
+// The framework does not interpret payload contents.
+//
+
+typedef String (*process_command_fn)(
+  const char* args_json   // may be nullptr
+);
+
+// --------------------------------------------------
+// Process Command Declaration
+// --------------------------------------------------
+
+typedef struct {
+  const char*          name;
+  process_command_fn   handler;
+} process_command_entry_t;
+
+// --------------------------------------------------
 // Process VTable
 // --------------------------------------------------
+//
+// Each process explicitly declares its command surface.
+// No command name inference, no parser heuristics.
+//
+
 typedef struct {
   const char* name;
-  bool   (*start)(void);
-  void   (*stop)(void);
+
+  // Lifecycle
+  bool (*start)(void);
+  void (*stop)(void);
+
+  // Introspection (optional but recommended)
   String (*query)(void);
-  String (*command)(const char* cmd, const char* args);
+
+  // Command surface
+  const process_command_entry_t* commands;
+  size_t                         command_count;
+
 } process_vtable_t;
 
 // --------------------------------------------------
-// Public API (DECLARATIONS ONLY)
+// Public API
 // --------------------------------------------------
+
 void process_init(void);
 
 bool process_register(
@@ -46,16 +89,19 @@ bool process_register(
 bool process_start(process_type_t type);
 bool process_stop(process_type_t type);
 
+// Introspection (used by PROCESS.QUERY)
 bool process_query(
   process_type_t type,
   String& out_body
 );
 
+// Canonical command invocation
 bool process_command(
   process_type_t type,
-  const char* cmd,
-  const char* args,
-  String& out_body
+  const char*    cmd_name,
+  const char*    args_json,
+  String&        out_response
 );
 
+// Registry introspection
 String process_list_json(void);

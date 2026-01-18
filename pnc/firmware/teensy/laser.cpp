@@ -67,10 +67,13 @@ String laser_measure_voltages() {
   // (3) Laser OFF again (leave EN untouched)
   laser_off();
 
-  String b;
-  appendFloatKV(b, "off_v", off_v, 5);
-  b += ",";
-  appendFloatKV(b, "on_v", on_v, 5);
+  String out;
+  out += "{";
 
-  return b;
+  appendFloatKV(out, "off_v", off_v, 5);
+  out += ",";
+  appendFloatKV(out, "on_v", on_v, 5);
+
+  out += "}";
+  return out;
 }

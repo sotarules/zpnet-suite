@@ -7,23 +7,20 @@
 
 #include <Arduino.h>
 #include <math.h>
+#include <string.h>
 
 // ================================================================
 // Configuration
 // ================================================================
 
-// GNSS ingestion cadence (ms)
 static const uint32_t GNSS_POLL_INTERVAL_MS = 10;
-
-// Budget constraints (preserved from legacy)
-static const unsigned long GNSS_BUDGET_MS = 2;
-static const uint32_t GNSS_MAX_BYTES = 512;
+static const unsigned long GNSS_BUDGET_MS  = 2;
+static const uint32_t GNSS_MAX_BYTES       = 512;
 
 // ================================================================
-// Legacy GNSS state (PRESERVED)
+// GNSS State (Authoritative)
 // ================================================================
 
-// Sentence buffers (last-seen truth)
 static char last_sentence[GNSS_LINE_MAX] = "";
 static char last_crw[GNSS_LINE_MAX] = "";
 static char last_crx[GNSS_LINE_MAX] = "";
@@ -32,17 +29,15 @@ static char last_zda[GNSS_LINE_MAX] = "";
 static char last_rmc[GNSS_LINE_MAX] = "";
 static char last_gga[GNSS_LINE_MAX] = "";
 
-// Parsed authoritative fields
 static float latitude_deg  = NAN;
 static float longitude_deg = NAN;
 
-// GNSS serial ingestion state
 static char   lineBuf[GNSS_LINE_MAX];
 static size_t lineLen = 0;
 static unsigned long lastGnssByteMs = 0;
 
 // ================================================================
-// Helpers (PRESERVED)
+// Helpers
 // ================================================================
 
 static inline bool startsWith(const char* s, const char* p) {
@@ -76,6 +71,27 @@ static void parseRMC(const char* l) {
   }
 }
 
+// Extract TPS mode from PERDCR* sentences (e.g. TPS4)
+static void extractDisciplineMode(const char* line, String& out) {
+  if (!line) return;
+
+  const char* p = strchr(line, ',');
+  if (!p) return;
+  p++;
+
+  const char* q = strchr(p, ',');
+  if (!q) return;
+
+  size_t len = q - p;
+  if (len == 0 || len >= 16) return;
+
+  char buf[16];
+  memcpy(buf, p, len);
+  buf[len] = '\0';
+
+  out = buf;
+}
+
 static void ingestGnssLine(const char* line) {
   if (!line || !*line) return;
 
@@ -97,7 +113,7 @@ static void ingestGnssLine(const char* line) {
 }
 
 // ================================================================
-// TimePop-driven ingestion
+// TimePop-driven ingestion (GOOD CITIZEN)
 // ================================================================
 
 static void gnss_poll_tick(void*) {
@@ -128,7 +144,6 @@ static void gnss_poll_tick(void*) {
     lineLen = 0;
   }
 
-  // Reschedule (self-owned cadence)
   timepop_schedule(
     GNSS_POLL_INTERVAL_MS,
     TIMEPOP_UNITS_MILLISECONDS,
@@ -139,7 +154,7 @@ static void gnss_poll_tick(void*) {
 }
 
 // ================================================================
-// Process lifecycle
+// Lifecycle
 // ================================================================
 
 static bool gnss_start(void) {
@@ -148,7 +163,6 @@ static bool gnss_start(void) {
   lineLen = 0;
   lastGnssByteMs = 0;
 
-  // Arm first ingestion tick
   timepop_schedule(
     GNSS_POLL_INTERVAL_MS,
     TIMEPOP_UNITS_MILLISECONDS,
@@ -161,125 +175,134 @@ static bool gnss_start(void) {
 }
 
 static void gnss_stop(void) {
-  // No hard shutdown of Serial1 required
-  // Process simply ceases scheduling
+  // Passive stop
 }
 
 // ================================================================
-// QUERY (FULL INTROSPECTION)
+// Introspection (PROCESS.QUERY)
 // ================================================================
 
 static String gnss_query(void) {
   String b;
-
-  if (last_sentence[0]) {
-    b += "\"raw_sentence\":\"";
-    b += jsonEscape(last_sentence);
-    b += "\"";
-  }
-
-  if (!isnan(latitude_deg) && !isnan(longitude_deg)) {
-    if (b.length()) b += ",";
-    b += "\"latitude_deg\":";
-    b += latitude_deg;
-    b += ",\"longitude_deg\":";
-    b += longitude_deg;
-  }
-
-  if (last_zda[0]) {
-    if (b.length()) b += ",";
-    b += "\"raw_zda\":\"";
-    b += jsonEscape(last_zda);
-    b += "\"";
-  }
-
-  if (last_rmc[0]) {
-    if (b.length()) b += ",";
-    b += "\"raw_rmc\":\"";
-    b += jsonEscape(last_rmc);
-    b += "\"";
-  }
-
-  // Visibility for debugging
-  if (b.length()) b += ",";
   b += "\"buffer_len\":";
   b += lineLen;
   b += ",\"last_byte_ms\":";
   b += lastGnssByteMs;
-
   return b;
 }
 
 // ================================================================
-// COMMANDS
+// Command Implementation — REPORT (CommandResponse with payload object)
 // ================================================================
 
-static String gnss_command(const char* cmd, const char* /*args*/) {
+static String cmd_report(const char* /*args*/) {
+  // ------------------------------------------------------------
+  // Build payload object (flat GNSS report)
+  // ------------------------------------------------------------
+  String payload;
+  payload += "{";
 
-  enqueueEvent("GNSS_STATUS", "\"status\":\"fire\"");
+  bool first = true;
+  auto sep = [&]() {
+    if (!first) payload += ",";
+    first = false;
+  };
 
-  if (strcmp(cmd, "EMIT_STATUS") == 0) {
+  // Last raw sentence
+  if (last_sentence[0]) {
+    sep();
+    payload += "\"last_sentence\":\"";
+    payload += jsonEscape(last_sentence);
+    payload += "\"";
 
-    if (last_sentence[0]) {
-      String body;
-      body += "\"raw_sentence\":\"";
-      body += jsonEscape(last_sentence);
-      body += "\"";
+    // Sentence type
+    if (last_sentence[0] == '$') {
+      const char* end = strchr(last_sentence, ',');
+      if (end) {
+        size_t len = (size_t)(end - last_sentence - 1);
+        if (len > 0 && len < 16) {
+          char buf[16];
+          memcpy(buf, last_sentence + 1, len);
+          buf[len] = '\0';
 
-      enqueueEvent("GNSS_STATUS", body);
+          sep();
+          payload += "\"sentence_type\":\"";
+          payload += buf;
+          payload += "\"";
+        }
+      }
     }
 
-    return "\"ok\":true";
+    // Discipline mode (TPS*)
+    if (startsWith(last_sentence, "$PERDCR")) {
+      String mode;
+      extractDisciplineMode(last_sentence, mode);
+      if (mode.length()) {
+        sep();
+        payload += "\"discipline_mode\":\"";
+        payload += mode;
+        payload += "\"";
+      }
+    }
   }
 
-  if (strcmp(cmd, "EMIT_DATA") == 0) {
+  // Parsed position
+  if (!isnan(latitude_deg) && !isnan(longitude_deg)) {
+    sep();
+    payload += "\"latitude_deg\":";
+    payload += latitude_deg;
 
-    String body;
-    bool have = false;
-
-    if (last_rmc[0]) {
-      body += "\"raw_rmc\":\"";
-      body += jsonEscape(last_rmc);
-      body += "\"";
-      have = true;
-    }
-
-    if (last_zda[0]) {
-      if (have) body += ",";
-      body += "\"raw_zda\":\"";
-      body += jsonEscape(last_zda);
-      body += "\"";
-      have = true;
-    }
-
-    if (!isnan(latitude_deg) && !isnan(longitude_deg)) {
-      if (have) body += ",";
-      body += "\"latitude_deg\":";
-      body += latitude_deg;
-      body += ",\"longitude_deg\":";
-      body += longitude_deg;
-    }
-
-    enqueueEvent("GNSS_DATA", body);
-
-    return "\"ok\":true";
+    sep();
+    payload += "\"longitude_deg\":";
+    payload += longitude_deg;
   }
 
-  // Unknown process command
-  return "\"error\":\"unknown gnss command\"";
+  // Canonical raw sentences (trace-friendly)
+  if (last_rmc[0]) {
+    sep();
+    payload += "\"raw_rmc\":\"";
+    payload += jsonEscape(last_rmc);
+    payload += "\"";
+  }
+
+  if (last_zda[0]) {
+    sep();
+    payload += "\"raw_zda\":\"";
+    payload += jsonEscape(last_zda);
+    payload += "\"";
+  }
+
+  if (last_crz[0]) {
+    sep();
+    payload += "\"raw_crz\":\"";
+    payload += jsonEscape(last_crz);
+    payload += "\"";
+  }
+
+  payload += "}";
+
+  return payload;
 }
 
+// ================================================================
+// Command Table
+// ================================================================
+
+static const process_command_entry_t GNSS_COMMANDS[] = {
+  { "REPORT", cmd_report },
+};
 
 // ================================================================
-// Process registration
+// Process Registration
 // ================================================================
 
 static const process_vtable_t GNSS_PROCESS = {
-  .name    = "GNSS",
-  .start   = gnss_start,
-  .stop    = gnss_stop,
-  .query   = gnss_query,
-  .command = gnss_command
+  .name          = "GNSS",
+  .start         = gnss_start,
+  .stop          = gnss_stop,
+  .query         = gnss_query,
+  .commands      = GNSS_COMMANDS,
+  .command_count = sizeof(GNSS_COMMANDS) / sizeof(GNSS_COMMANDS[0]),
 };
 
 void process_gnss_register(void) {

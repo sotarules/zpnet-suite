@@ -28,3 +28,5 @@ void gnss_poll();
 String buildGnssStatusBody();
 String buildGnssDataBody();
 
+void gnss_diagnostic_poll_loop();
+

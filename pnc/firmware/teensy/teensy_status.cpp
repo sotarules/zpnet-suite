@@ -15,24 +15,27 @@ const char* teensy_fw_version() {
 }
 
 String buildTeensyStatusBody() {
-  String b;
+
+  String out;
+  out += "{";
 
   // Firmware identity
-  b += "\"fw_version\":\"";
-  b += teensy_fw_version();
-  b += "\"";
+  out += "\"fw_version\":\"";
+  out += teensy_fw_version();
+  out += "\"";
 
   // CPU temperature (best-effort)
-  b += ",\"cpu_temp_c\":";
-  b += cpuTempC();
+  out += ",\"cpu_temp_c\":";
+  out += cpuTempC();
 
   // Internal reference voltage (best-effort)
-  b += ",\"vref_v\":";
-  b += readVrefVolts();
+  out += ",\"vref_v\":";
+  out += readVrefVolts();
 
   // Heap availability
-  b += ",\"free_heap_bytes\":";
-  b += freeHeapBytes();
+  out += ",\"free_heap_bytes\":";
+  out += freeHeapBytes();
 
-  return b;
+  out += "}";
+  return out;
 }

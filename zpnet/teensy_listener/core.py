@@ -1,28 +1,9 @@
 """
-ZPNet Teensy Listener — Serial Transport Authority + Socket RPC Server
-(UART framed transport edition)
+ZPNet Teensy Listener — Serial Transport Authority + Deterministic RPC
 
-This daemon is the absolute sole owner of the Teensy runtime serial interface
-(e.g. /dev/zpnet-teensy-serial). It provides two orthogonal services:
-
-  1) Durable Event Despooling (canonical memory path)
-     - Periodically issues EVENTS.GET
-     - Drains Teensy event queue (durable facts only)
-     - Persists events to PostgreSQL via create_event()
-
-  2) Local Socket RPC (client command/query plane)
-     - UNIX socket server used by all other Python modules
-     - Allows:
-         op="send"  : send a command (no immediate reply expected)
-         op="query" : send a command and wait for one immediate reply (type)
-         op="drain" : force an EVENTS.GET drain and return events (optional persist)
-
-Design invariants:
-  • Exactly one owner of the Teensy serial port (THIS daemon)
-  • Framed UART transport (<STX=N> payload <ETX>)
-  • Durable truth is persisted to PostgreSQL
-  • Ephemeral truth is observable via socket RPC but not remembered by default
-  • No other module opens the serial device
+Single reader. Explicit correlation. No guessing.
+This version is hardened for bring-up, forensic visibility,
+and USB disconnect/reconnect resilience.
 
 Author: The Mule + GPT
 """
@@ -33,7 +14,10 @@ import os
 import socket
 import threading
 import time
-from typing import Any, Dict, List, Optional, Tuple
+import itertools
+import queue
+from queue import Queue
+from typing import Dict
 
 import serial
 
@@ -48,521 +32,376 @@ from zpnet.shared.constants import (
 # ---------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------
+
+RPC_SOCKET_PATH = "/tmp/zpnet_teensy_rt.sock"
+RPC_BACKLOG = 8
+
 EVENT_DESPOOL_INTERVAL_S = 10.0
 
-# Single well-known RPC socket
-RPC_SOCKET_PATH = "/tmp/zpnet_teensy_rt.sock"
-
-# Socket behavior
-RPC_LISTEN_BACKLOG = 8
-RPC_RECV_MAX_BYTES = 256 * 1024  # defensive cap per request
-RPC_DEFAULT_TIMEOUT_S = 1.0
-
-# Drain behavior
-DRAIN_READ_TIMEOUT_S = 1.0
-DRAIN_MAX_EVENTS_RETURNED = 64
-
-# Framing constants
 STX_PREFIX = b"<STX="
 ETX_SEQ = b"<ETX>"
 
-# ---------------------------------------------------------------------
-# Environment overrides
-# ---------------------------------------------------------------------
 SERIAL_SNOOP_PATH = os.environ.get("ZPNET_SERIAL_SNOOP")
 
 # ---------------------------------------------------------------------
-# Serial ownership primitives
+# Global state
 # ---------------------------------------------------------------------
-_serial_lock = threading.RLock()
-_serial: serial.Serial | None = None
+
+serial_port: serial.Serial | None = None
+
+# req_id → Queue[dict]
+pending_replies: Dict[int, Queue[dict]] = {}
+
+req_id_counter = itertools.count(1)
+
+state_lock = threading.Lock()
 
 # ---------------------------------------------------------------------
-# Serial open/close
+# Serial open / reopen
 # ---------------------------------------------------------------------
-def open_teensy_serial() -> serial.Serial:
+
+def open_serial_blocking() -> serial.Serial:
     """
-    Open the Teensy runtime serial port.
-
-    Note: TEENSY_SERIAL_PORT should point to the runtime UART identity,
-    typically /dev/zpnet-teensy-serial.
+    Open the Teensy serial port, blocking until it is available.
+    Used on startup and after USB disconnect.
     """
-    ser = serial.Serial(
-        TEENSY_SERIAL_PORT,
-        TEENSY_BAUDRATE,
-        timeout=TEENSY_READ_TIMEOUT_S,
-        write_timeout=TEENSY_READ_TIMEOUT_S,
-    )
-    # Small settle is fine even for UART; harmless and stabilizing.
-    time.sleep(0.05)
-    return ser
-
+    while True:
+        try:
+            ser = serial.Serial(
+                TEENSY_SERIAL_PORT,
+                TEENSY_BAUDRATE,
+                timeout=TEENSY_READ_TIMEOUT_S,
+                write_timeout=TEENSY_READ_TIMEOUT_S,
+            )
+            logging.info("[teensy_listener] serial connected")
+            return ser
+        except Exception as e:
+            logging.warning(
+                "[teensy_listener] waiting for Teensy serial (%s)",
+                e,
+            )
+            time.sleep(1.0)
 
 # ---------------------------------------------------------------------
 # Framed transport helpers
 # ---------------------------------------------------------------------
-def frame_encode(payload: bytes) -> bytes:
+
+def send_frame(payload: dict) -> None:
     """
-    Encode payload bytes into a framed message:
-      <STX=N><payload><ETX>
+    Frame and send a JSON payload to the Teensy.
+    This is the ONLY outbound serial path.
     """
-    if not isinstance(payload, (bytes, bytearray)):
-        raise TypeError("frame_encode expects bytes")
+    raw = json.dumps(
+        payload,
+        separators=(",", ":"),
+        ensure_ascii=False
+    ).encode("utf-8")
 
-    n = len(payload)
-    return b"<STX=" + str(n).encode("ascii") + b">" + payload + ETX_SEQ
+    frame = (
+        b"<STX=" +
+        str(len(raw)).encode("ascii") +
+        b">" +
+        raw +
+        ETX_SEQ
+    )
+
+    logging.info(
+        "[teensy_listener] SEND_FRAME cmd=%s bytes=%d",
+        payload.get("cmd"),
+        len(raw),
+    )
+
+    _snoop("→", raw)
+
+    serial_port.write(frame)
+    serial_port.flush()
 
 
-def _read_exact(ser: serial.Serial, n: int, deadline: float) -> bytes:
+def read_frame(timeout_s: float) -> dict | None:
     """
-    Read exactly n bytes from serial or raise TimeoutError.
-    """
-    buf = bytearray()
-    while len(buf) < n:
-        if time.time() > deadline:
-            raise TimeoutError("serial read_exact timeout")
-        chunk = ser.read(n - len(buf))
-        if chunk:
-            buf.extend(chunk)
-            continue
-        # No data: yield briefly
-        time.sleep(0.001)
-    return bytes(buf)
-
-
-def frame_read_one(
-    ser: serial.Serial,
-    *,
-    timeout_s: float,
-) -> Optional[dict]:
-    """
-    Read one framed payload and return it parsed as JSON dict.
-
-    Returns:
-        dict on success, None on timeout/empty.
-    Raises:
-        ValueError on malformed framing or JSON.
+    Read exactly one framed payload from the serial port.
+    JSON errors are logged and ignored.
     """
     deadline = time.time() + timeout_s
 
-    # Step 1: hunt for '<'
-    while True:
-        if time.time() > deadline:
-            return None
-        b = ser.read(1)
-        if not b:
-            continue
+    # Seek '<'
+    while time.time() < deadline:
+        b = serial_port.read(1)
         if b == b"<":
             break
+    else:
+        return None
 
-    # Step 2: read until '>' to complete "<STX=...>"
-    header = bytearray(b"<")
+    # Read STX header
+    header = b"<"
     while True:
-        if time.time() > deadline:
-            raise TimeoutError("timeout while reading STX header")
-        b = ser.read(1)
-        if not b:
-            continue
-        header.extend(b)
+        b = serial_port.read(1)
+        header += b
         if b == b">":
             break
-        if len(header) > 32:
-            raise ValueError("STX header too long")
 
-    # Validate and parse length
-    if not header.startswith(STX_PREFIX) or not header.endswith(b">"):
-        raise ValueError(f"invalid STX header: {header!r}")
-
-    # header like b"<STX=21>"
-    inner = header[len(STX_PREFIX):-1]  # b"21"
-    if not inner.isdigit():
-        raise ValueError(f"invalid STX length: {inner!r}")
-
-    length = int(inner.decode("ascii"))
-    if length <= 0 or length > 4096:
-        raise ValueError(f"unsupported payload length: {length}")
-
-    # Step 3: read payload bytes
-    payload = _read_exact(ser, length, deadline)
-
-    # Step 4: read ETX sequence
-    etx = _read_exact(ser, len(ETX_SEQ), deadline)
-    if etx != ETX_SEQ:
-        raise ValueError(f"invalid ETX terminator: {etx!r}")
-
-    # Step 5: parse JSON payload
     try:
-        msg = json.loads(payload.decode("utf-8", errors="strict"))
-        _snoop("←", payload)
-    except Exception as e:
-        raise ValueError(f"invalid JSON payload: {e}")
+        length = int(header[len(STX_PREFIX):-1])
+    except Exception:
+        logging.error(
+            "[teensy_listener] BAD STX HEADER: %r",
+            header,
+        )
+        return None
 
-    if not isinstance(msg, dict):
-        raise ValueError("framed payload was not a JSON object")
+    payload = serial_port.read(length)
+    serial_port.read(len(ETX_SEQ))
 
-    return msg
+    _snoop("←", payload)
 
-
-def send_cmd_framed(ser: serial.Serial, cmd: dict) -> None:
-    """
-    Send a command dict as framed JSON.
-
-    This is the ONLY correct way to send commands over the new transport.
-    """
-    payload = json.dumps(cmd, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
-    framed = frame_encode(payload)
-    _snoop("→", payload)
-    logging.debug("[teensy_listener] → %s", payload.decode("utf-8", errors="ignore"))
-    ser.write(framed)
-    ser.flush()
-
+    try:
+        return json.loads(payload.decode("utf-8"))
+    except json.JSONDecodeError as e:
+        logging.error(
+            "[teensy_listener] INVALID JSON FROM TEENSY: %r (%s)",
+            payload,
+            e,
+        )
+        _snoop("✗", payload)
+        return None
 
 # ---------------------------------------------------------------------
-# Drain logic (durable event queue)
+# Serial reader loop (IMMORTAL + USB-RESILIENT)
 # ---------------------------------------------------------------------
-def drain_events(
-    ser: serial.Serial,
-    *,
-    persist: bool,
-    collect: bool,
-    stop_after: int | None = None,
-    timeout_s: float = DRAIN_READ_TIMEOUT_S,
-) -> List[Dict[str, Any]]:
-    """
-    Issue EVENTS.GET, then read framed messages until control EVENTS_END.
 
-    Teensy emits:
-      {"control":"EVENTS_BEGIN", "count":..., "dropped":...}
-      {"event_type":"...", ...payload fields...}
-      {"control":"EVENTS_END"}
+def serial_reader() -> None:
+    global serial_port
 
-    Returns collected durable events if collect=True.
-
-    Notes:
-      • control messages are not persisted
-      • only messages with "event_type" are treated as durable facts
-    """
-    collected: List[Dict[str, Any]] = []
-    in_drain = False
-
-    send_cmd_framed(ser, {"cmd": "EVENTS.GET"})
+    logging.info("[teensy_listener] serial_reader started")
+    last_drain = 0.0
 
     while True:
-        msg = frame_read_one(ser, timeout_s=timeout_s)
-        if msg is None:
-            break
+        try:
+            msg = read_frame(timeout_s=0.1)
+            now = time.time()
 
-        # Control messages
-        control = msg.get("control")
-        if isinstance(control, str):
-            if control == "EVENTS_BEGIN":
-                in_drain = True
-                continue
-            if control == "EVENTS_END":
-                break
-            # Unknown control: ignore
-            continue
+            if msg:
+                logging.debug(
+                    "[teensy_listener] RX_FRAME %s",
+                    msg,
+                )
 
-        if not in_drain:
-            # Ignore anything arriving outside a drain window
-            continue
+                # -----------------------------------------------------
+                # Correlated RPC response
+                # -----------------------------------------------------
+                if "req_id" in msg:
+                    req_id = msg["req_id"]
+                    with state_lock:
+                        q = pending_replies.pop(req_id, None)
+                    if q:
+                        q.put(msg)
+                    else:
+                        logging.warning(
+                            "[teensy_listener] ORPHAN RESPONSE req_id=%s",
+                            req_id,
+                        )
+                    continue
 
-        event_type = msg.get("event_type")
-        if not isinstance(event_type, str) or not event_type:
-            continue
+                # -----------------------------------------------------
+                # Event drain
+                # -----------------------------------------------------
+                if msg.get("control") == "EVENTS_BEGIN":
+                    logging.info("[teensy_listener] EVENTS_BEGIN")
+                    while True:
+                        ev = read_frame(timeout_s=1.0)
+                        if ev is None:
+                            break
+                        if ev.get("control") == "EVENTS_END":
+                            logging.info("[teensy_listener] EVENTS_END")
+                            break
+                        if "event_type" in ev:
+                            payload = ev.copy()
+                            event_type = payload.pop("event_type")
+                            create_event(event_type, payload)
+                    continue
 
-        payload = msg.copy()
-        payload.pop("event_type", None)
+            # ---------------------------------------------------------
+            # Periodic drain request
+            # ---------------------------------------------------------
+            if now - last_drain >= EVENT_DESPOOL_INTERVAL_S:
+                send_frame({"cmd": "EVENTS.GET"})
+                last_drain = now
 
-        if persist:
-            create_event(event_type, payload)
+        except serial.SerialException as e:
+            # USB disconnect / Teensy reset
+            logging.error(
+                "[teensy_listener] serial disconnected (%s) — reopening",
+                e,
+            )
+            try:
+                serial_port.close()
+            except Exception:
+                pass
 
-        if collect:
-            collected.append({"event_type": event_type, "payload": payload})
-            if stop_after and len(collected) >= stop_after:
-                break
+            serial_port = open_serial_blocking()
+            last_drain = 0.0
 
-    return collected
+        except Exception as e:
+            # Absolute last-resort containment: reader must never die
+            logging.exception(
+                "[teensy_listener] serial_reader exception (ignored): %s",
+                e,
+            )
+            time.sleep(0.1)
 
+# ---------------------------------------------------------------------
+# RPC handler
+# ---------------------------------------------------------------------
 
-def drain_events_once(ser: serial.Serial) -> Tuple[int, float]:
-    """
-    Durable, periodic despool. Persists to PostgreSQL.
-    """
-    start = time.time()
-    acquired = _serial_lock.acquire(timeout=0.25)
-    if not acquired:
-        return 0, 0.0
+def handle_client(conn: socket.socket) -> None:
+    req_id = 0
+    q: Queue[dict] | None = None
 
     try:
-        events = drain_events(ser, persist=True, collect=False)
-        return len(events), time.time() - start
-    finally:
-        _serial_lock.release()
-
-
-# ---------------------------------------------------------------------
-# Realtime query plane (immediate replies only)
-# ---------------------------------------------------------------------
-def perform_realtime_query(
-    cmd: dict,
-    *,
-    timeout_s: float = RPC_DEFAULT_TIMEOUT_S,
-) -> Dict[str, Any]:
-    """
-    Send a command and wait for one immediate reply message:
-
-      {"type":"DWT_COUNT", ...}
-      {"type":"PHOTODIODE_STATUS", ...}
-
-    Returns:
-      {"type": <str>, "payload": <dict>} on success
-
-    Raises:
-      TimeoutError if no immediate reply arrives.
-      ValueError on malformed reply.
-    """
-    if _serial is None:
-        raise RuntimeError("serial not connected")
-
-    deadline = time.time() + timeout_s
-
-    with _serial_lock:
-        send_cmd_framed(_serial, cmd)
-
-        while time.time() < deadline:
-            msg = frame_read_one(_serial, timeout_s=max(0.01, deadline - time.time()))
-            if msg is None:
+        # Buffered read-until-JSON (stream-safe)
+        buf = bytearray()
+        while True:
+            chunk = conn.recv(4096)
+            if not chunk:
+                break
+            buf.extend(chunk)
+            try:
+                req = json.loads(buf.decode("utf-8"))
+                break
+            except json.JSONDecodeError:
                 continue
 
-            msg_type = msg.get("type")
-            if not isinstance(msg_type, str) or not msg_type:
-                # Not an immediate reply; ignore it here.
-                # (Durable events should only appear during drains.)
-                continue
+        logging.info("[teensy_listener] RPC_REQUEST %s", req)
 
-            payload = msg.copy()
-            payload.pop("type", None)
+        req_id = next(req_id_counter)
+        req["req_id"] = req_id
 
-            return {"type": msg_type, "payload": payload}
+        q = Queue(maxsize=1)
 
-    raise TimeoutError("no immediate reply from Teensy")
+        with state_lock:
+            pending_replies[req_id] = q
 
+        send_frame(req)
 
-def perform_send_only(cmd: dict) -> None:
-    """
-    Send a command that is expected to enqueue durable events (ACK, etc.)
-    and does not produce an immediate reply.
-    """
-    if _serial is None:
-        raise RuntimeError("serial not connected")
+        reply = q.get(timeout=1.0)
 
-    with _serial_lock:
-        send_cmd_framed(_serial, cmd)
-
-
-def perform_drain_on_demand(
-    *,
-    persist: bool,
-    max_events: int,
-    timeout_s: float,
-) -> List[Dict[str, Any]]:
-    """
-    Force an EVENTS.GET drain and return collected durable events.
-    Optionally persist them.
-    """
-    if _serial is None:
-        raise RuntimeError("serial not connected")
-
-    with _serial_lock:
-        events = drain_events(
-            _serial,
-            persist=persist,
-            collect=True,
-            stop_after=max_events,
-            timeout_s=timeout_s,
-        )
-    return events
-
-
-# ---------------------------------------------------------------------
-# Socket RPC server
-# ---------------------------------------------------------------------
-def _read_json_request(conn: socket.socket) -> dict:
-    """
-    Read one JSON request object from a stream socket.
-
-    Contract:
-      • client sends exactly one JSON object
-      • client may close immediately after sending
-      • server reads until JSON parses or size cap reached
-
-    Raises:
-      ValueError on invalid JSON
-    """
-    buf = bytearray()
-    conn.settimeout(2.0)
-
-    while True:
-        if len(buf) > RPC_RECV_MAX_BYTES:
-            raise ValueError("request too large")
-
-        chunk = conn.recv(4096)
-        if not chunk:
-            # EOF
-            break
-        buf.extend(chunk)
-
-        # Try parsing at each step (cheap for small payloads)
         try:
-            obj = json.loads(buf.decode("utf-8"))
-            if not isinstance(obj, dict):
-                raise ValueError("request must be a JSON object")
-            return obj
-        except json.JSONDecodeError:
-            continue
+            conn.sendall(
+                json.dumps(reply, separators=(",", ":")).encode("utf-8")
+            )
+        except BrokenPipeError:
+            logging.warning(
+                "[teensy_listener] client disconnected before reply (req_id=%s)",
+                req_id,
+            )
 
-    # Final parse attempt
-    obj = json.loads(buf.decode("utf-8"))
-    if not isinstance(obj, dict):
-        raise ValueError("request must be a JSON object")
-    return obj
-
-
-def _send_json_response(conn: socket.socket, payload: dict) -> None:
-    raw = json.dumps(payload, separators=(",", ":")).encode("utf-8")
-    conn.sendall(raw)
-
-
-def _handle_client(conn: socket.socket) -> None:
-    """
-    Handle one RPC connection.
-    """
-    try:
-        req = _read_json_request(conn)
-
-        op = req.get("op", "query")
-        cmd = req.get("cmd")
-        timeout_s = float(req.get("timeout_s", RPC_DEFAULT_TIMEOUT_S))
-
-        # Defensive normalization
-        if op not in ("query", "send", "drain"):
-            raise ValueError("invalid op (expected query|send|drain)")
-
-        if op in ("query", "send"):
-            if not isinstance(cmd, dict):
-                raise ValueError("cmd must be a dict for query/send")
-
-        if op == "query":
-            reply = perform_realtime_query(cmd, timeout_s=timeout_s)
-            _send_json_response(conn, {"ok": True, "reply": reply})
-            return
-
-        if op == "send":
-            perform_send_only(cmd)
-            _send_json_response(conn, {"ok": True})
-            return
-
-        # op == "drain"
-        persist = bool(req.get("persist", False))
-        max_events = int(req.get("max_events", DRAIN_MAX_EVENTS_RETURNED))
-        max_events = max(1, min(max_events, DRAIN_MAX_EVENTS_RETURNED))
-        events = perform_drain_on_demand(
-            persist=persist,
-            max_events=max_events,
-            timeout_s=timeout_s,
+    except queue.Empty:
+        logging.warning(
+            "[teensy_listener] RPC TIMEOUT req_id=%s",
+            req_id,
         )
-        _send_json_response(conn, {"ok": True, "events": events})
-        return
+        with state_lock:
+            pending_replies.pop(req_id, None)
 
-    except BrokenPipeError:
-        logging.debug("[teensy_listener][rpc] client disconnected (broken pipe)")
-    except Exception as e:
         try:
-            _send_json_response(conn, {"ok": False, "error": str(e)})
-        except Exception:
+            conn.sendall(
+                json.dumps(
+                    {"success": False, "message": "RPC timeout"},
+                    separators=(",", ":")
+                ).encode("utf-8")
+            )
+        except BrokenPipeError:
             pass
+
+    except Exception as e:
+        logging.exception(
+            "[teensy_listener] RPC ERROR req_id=%s: %s",
+            req_id,
+            e,
+        )
+        with state_lock:
+            if req_id:
+                pending_replies.pop(req_id, None)
+
+        try:
+            conn.sendall(
+                json.dumps(
+                    {"success": False, "message": str(e)},
+                    separators=(",", ":")
+                ).encode("utf-8")
+            )
+        except BrokenPipeError:
+            pass
+
     finally:
         try:
             conn.close()
         except Exception:
             pass
 
+# ---------------------------------------------------------------------
+# RPC server
+# ---------------------------------------------------------------------
 
-def rpc_socket_server() -> None:
-    """
-    Run the UNIX socket RPC server forever.
-    """
+def rpc_server() -> None:
     if os.path.exists(RPC_SOCKET_PATH):
         os.unlink(RPC_SOCKET_PATH)
 
     sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     sock.bind(RPC_SOCKET_PATH)
-    os.chmod(RPC_SOCKET_PATH, 0o660)  # group-readable/writable
-    sock.listen(RPC_LISTEN_BACKLOG)
+    os.chmod(RPC_SOCKET_PATH, 0o660)
+    sock.listen(RPC_BACKLOG)
 
-    logging.info("🧭 [teensy_listener] RPC socket ready at %s", RPC_SOCKET_PATH)
+    logging.info(
+        "🧭 [teensy_listener] RPC socket ready at %s",
+        RPC_SOCKET_PATH,
+    )
 
     while True:
         conn, _ = sock.accept()
-        threading.Thread(target=_handle_client, args=(conn,), daemon=True).start()
+        threading.Thread(
+            target=handle_client,
+            args=(conn,),
+            daemon=True
+        ).start()
 
+# ---------------------------------------------------------------------
+# Serial snoop
+# ---------------------------------------------------------------------
 
-def _snoop(direction: str, payload: bytes | str) -> None:
+def _snoop(direction: str, payload: bytes) -> None:
     if not SERIAL_SNOOP_PATH:
         return
     try:
         with open(SERIAL_SNOOP_PATH, "a") as f:
-            ts = time.time()
-            if isinstance(payload, bytes):
-                payload = payload.decode("utf-8", errors="replace")
-            f.write(f"{ts:.6f} {direction} {payload}\n")
+            f.write(
+                f"{time.time():.6f} {direction} "
+                f"{payload.decode('utf-8', errors='replace')}\n"
+            )
     except Exception:
-        pass  # absolutely never affect runtime
+        pass
 
 # ---------------------------------------------------------------------
-# Main daemon loop with serial reconnect
+# Main
 # ---------------------------------------------------------------------
+
 def run() -> None:
-    """
-    Main daemon loop. Owns the serial port forever.
-    Starts RPC socket server once and keeps it alive.
-    """
-    logging.info("🚀 [teensy_listener] starting Teensy transport authority")
-    global _serial
+    global serial_port
 
-    # Start RPC server once (independent of serial reconnects)
-    threading.Thread(target=rpc_socket_server, daemon=True).start()
+    setup_logging()
+    logging.info("🚀 [teensy_listener] starting Teensy transport authority")
+
+    serial_port = open_serial_blocking()
+
+    threading.Thread(target=serial_reader, daemon=True).start()
+    threading.Thread(target=rpc_server, daemon=True).start()
 
     while True:
-        try:
-            _serial = open_teensy_serial()
-            logging.info("🔌 [teensy_listener] serial connection established: %s", TEENSY_SERIAL_PORT)
-
-            while True:
-                try:
-                    _count, _elapsed = drain_events_once(_serial)
-                    time.sleep(EVENT_DESPOOL_INTERVAL_S)
-
-                except serial.SerialException as e:
-                    logging.error("💥 [teensy_listener] serial exception: %s — reconnecting", e)
-                    try:
-                        _serial.close()
-                    except Exception:
-                        pass
-                    _serial = None
-                    time.sleep(1.0)
-                    break  # exit inner loop; reconnect
-
-        except Exception as e:
-            logging.exception("💥 [teensy_listener] daemon failure: %s", e)
-            _serial = None
-            time.sleep(2.0)
-
+        time.sleep(1)
 
 # ---------------------------------------------------------------------
 # Bootstrap
 # ---------------------------------------------------------------------
+
 def bootstrap() -> None:
-    setup_logging()
     run()

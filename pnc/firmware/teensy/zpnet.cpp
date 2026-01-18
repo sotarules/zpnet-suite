@@ -11,6 +11,8 @@
 // -----------------------------------------------------------------------------
 
 void zpnet_setup() {
+
+  // Debug will always be enabled in this build
   debug_init();
 
   // Initialize TimePop kernel
