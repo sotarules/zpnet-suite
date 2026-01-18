@@ -72,7 +72,6 @@ def send_command(
     # --------------------------------------------------------------
     try:
         resp = json.loads(buf.decode("utf-8"))
-        logging.info(f"Teensy RPC response: {resp}")
     except Exception as e:
         raise RuntimeError(f"Invalid JSON reply from teensy_listener: {e}")
 

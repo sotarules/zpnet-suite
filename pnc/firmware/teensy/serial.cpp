@@ -65,7 +65,6 @@ static void on_transport_frame(
     size_t n = (length < 256) ? length : 256;
     memcpy(dbg, payload, n);
     dbg[n] = '\0';
-    debug_log("TRANSPORT", dbg);
 
     memcpy(cmd_buf, payload, length);
     cmd_buf[length] = '\0';

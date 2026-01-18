@@ -105,13 +105,7 @@ def send_frame(payload: dict) -> None:
         ETX_SEQ
     )
 
-    logging.info(
-        "[teensy_listener] SEND_FRAME cmd=%s bytes=%d",
-        payload.get("cmd"),
-        len(raw),
-    )
-
-    _snoop("→", raw)
+    _snoop("←", raw)
 
     serial_port.write(frame)
     serial_port.flush()
@@ -152,7 +146,7 @@ def read_frame(timeout_s: float) -> dict | None:
     payload = serial_port.read(length)
     serial_port.read(len(ETX_SEQ))
 
-    _snoop("←", payload)
+    _snoop("→", payload)
 
     try:
         return json.loads(payload.decode("utf-8"))
@@ -172,7 +166,6 @@ def read_frame(timeout_s: float) -> dict | None:
 def serial_reader() -> None:
     global serial_port
 
-    logging.info("[teensy_listener] serial_reader started")
     last_drain = 0.0
 
     while True:
@@ -181,10 +174,6 @@ def serial_reader() -> None:
             now = time.time()
 
             if msg:
-                logging.debug(
-                    "[teensy_listener] RX_FRAME %s",
-                    msg,
-                )
 
                 # -----------------------------------------------------
                 # Correlated RPC response
@@ -206,13 +195,11 @@ def serial_reader() -> None:
                 # Event drain
                 # -----------------------------------------------------
                 if msg.get("control") == "EVENTS_BEGIN":
-                    logging.info("[teensy_listener] EVENTS_BEGIN")
                     while True:
                         ev = read_frame(timeout_s=1.0)
                         if ev is None:
                             break
                         if ev.get("control") == "EVENTS_END":
-                            logging.info("[teensy_listener] EVENTS_END")
                             break
                         if "event_type" in ev:
                             payload = ev.copy()
@@ -270,8 +257,6 @@ def handle_client(conn: socket.socket) -> None:
                 break
             except json.JSONDecodeError:
                 continue
-
-        logging.info("[teensy_listener] RPC_REQUEST %s", req)
 
         req_id = next(req_id_counter)
         req["req_id"] = req_id

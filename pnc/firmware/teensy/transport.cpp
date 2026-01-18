@@ -63,10 +63,6 @@ void transport_ingest_byte(char c) {
     // This is diagnostic scaffolding and MUST NOT be enabled in production.
     // ------------------------------------------------------------------
 
-    // TEMPORARY
-    Serial2.write(c);
-
-
     switch (rx_state) {
 
         case RX_IDLE:

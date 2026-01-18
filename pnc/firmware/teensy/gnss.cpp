@@ -171,7 +171,6 @@ String buildGnssDataBody() {
 }
 
 void gnss_diagnostic_poll_loop() {
-  debug_log("GNSS", "diagnostic poll loop STARTED");
 
   uint32_t last_log_ms = 0;
 
@@ -184,12 +183,6 @@ void gnss_diagnostic_poll_loop() {
     uint32_t now = millis();
     if (now - last_log_ms >= 1000) {
       last_log_ms = now;
-
-      if (last_sentence[0]) {
-        debug_log("GNSS", last_sentence);
-      } else {
-        debug_log("GNSS", "no sentence yet");
-      }
     }
 
     // Yield a little so USB + debug UART stay healthy

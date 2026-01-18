@@ -131,8 +131,6 @@ static bool parseProcessType(const char* line, process_type_t& out) {
 
 void command_exec(const char* line) {
 
-    debug_log("CMD", "command_exec ENTER");
-
     uint32_t req_id = 0;
     bool has_req_id = extractReqId(line, req_id);
 
