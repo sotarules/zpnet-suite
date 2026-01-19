@@ -119,7 +119,9 @@ static bool extractCmd(const char* line, char* out, size_t out_sz) {
 }
 
 static bool parseProcessType(const char* line, process_type_t& out) {
-    if (strstr(line, "\"type\":\"GNSS\""))    { out = PROCESS_TYPE_GNSS; return true; }
+    if (strstr(line, "\"type\":\"GNSS\"")) { out = PROCESS_TYPE_GNSS; return true; }
+    if (strstr(line, "\"type\":\"LASER\"")) { out = PROCESS_TYPE_LASER; return true; }
+    if (strstr(line, "\"type\":\"PHOTODIODE\"")) { out = PROCESS_TYPE_PHOTODIODE; return true; }
     if (strstr(line, "\"type\":\"TEMPEST\"")) { out = PROCESS_TYPE_TEMPEST; return true; }
     if (strstr(line, "\"type\":\"LANTERN\"")) { out = PROCESS_TYPE_LANTERN; return true; }
     return false;
@@ -302,12 +304,6 @@ void command_exec(const char* line) {
     if (strcmp(cmd, "LASER.OFF") == 0) {
         laser_off();
         emitOK(nullptr, has_req_id, req_id);
-        return;
-    }
-
-    if (strcmp(cmd, "LASER.VOLTAGES") == 0) {
-        String payload = laser_measure_voltages();
-        emitOK(&payload, has_req_id, req_id);
         return;
     }
 

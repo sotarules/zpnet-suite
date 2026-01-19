@@ -31,7 +31,6 @@ void system_request_shutdown() {
 
   // Safety: disable laser outputs immediately
   digitalWrite(LD_ON_PIN, LOW);
-  digitalWrite(EN_PIN, LOW);
 
   // Durable signal before silence
   enqueueEvent("SYSTEM_SHUTDOWN", "\"status\":\"REQUESTED\"");

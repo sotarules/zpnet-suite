@@ -1,6 +1,5 @@
 #include "config.h"
 #include "transport.h"
-#include "zpnet_serial.h"
 #include "debug.h"
 
 #include <string.h>

@@ -4,6 +4,13 @@
 #include <cstddef>
 
 // --------------------------------------------------------------
+// ZPNet runtime transport
+// --------------------------------------------------------------
+
+#define ZPNET_SERIAL Serial
+
+
+// --------------------------------------------------------------
 // Serial configuration
 // --------------------------------------------------------------
 static const unsigned long USB_SERIAL_BAUD = 115200;
@@ -12,15 +19,8 @@ static const unsigned long GNSSDO_BAUD     = 38400;
 // --------------------------------------------------------------
 // Laser control pins
 // --------------------------------------------------------------
-//
-// EN_PIN:
-//   Enables laser power stage
-//
-// LD_ON_PIN:
-//   Controls laser emission
-//
-static const int EN_PIN    = 20;
-static const int LD_ON_PIN = 21;
+static const int LD_ON_PIN = 30;
+static const int LASER_MONITOR_PIN = 17;
 
 // --------------------------------------------------------------
 // Photodiode (TDM split-pin design)

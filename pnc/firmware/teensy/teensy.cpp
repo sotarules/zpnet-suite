@@ -1,11 +1,13 @@
-#include "zpnet.h"
+#include "debug.h"
 #include "timepop.h"
 #include "event_bus.h"
 #include "serial.h"
+#include "laser.h"
+#include "cpu_usage.h"
 #include "process.h"
 #include "process_gnss.h"
-#include "debug.h"
-#include "cpu_usage.h"
+#include "process_laser.h"
+#include "process_photodiode.h"
 
 // ------------------------------------------------------------
 // CPU usage sampler (TimePop task)
@@ -27,14 +29,20 @@ static void cpu_usage_tick(void*) {
 // ZPNet Runtime Initialization
 // -----------------------------------------------------------------------------
 
-void zpnet_setup() {
+void setup() {
 
+  //laser_init();
   cpu_usage_init();
   debug_init();
   timepop_init();
   serial_init();
   event_bus_init();
   process_init();
+
+  process_laser_register();
+  process_start(PROCESS_TYPE_LASER);
+  process_photodiode_register();
+  process_start(PROCESS_TYPE_PHOTODIODE);
   //process_gnss_register();
   //process_start(PROCESS_TYPE_GNSS);
 
@@ -54,7 +62,7 @@ void zpnet_setup() {
 // ZPNet Runtime Loop
 // -----------------------------------------------------------------------------
 
-void zpnet_loop() {
+void loop() {
 
   // Dispatch interrupt-authorized callbacks
   timepop_dispatch();

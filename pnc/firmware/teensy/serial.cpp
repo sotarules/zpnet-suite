@@ -1,5 +1,5 @@
+#include "config.h"
 #include "serial.h"
-#include "zpnet_serial.h"
 #include "timepop.h"
 #include "command.h"
 #include "debug.h"

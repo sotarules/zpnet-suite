@@ -230,18 +230,18 @@ def teensy_status_readout() -> Generator[str, None, None]:
 # PHOTODIODE (IMPERATIVE INSTRUMENT — SNAPSHOT ONLY)
 # ---------------------------------------------------------------------
 def photodiode_status_readout() -> Generator[str, None, None]:
-    """
-    Ground-truth photodiode instrument snapshot.
 
-    Semantics:
-      • Imperative query
-      • No aggregation
-      • No persistence
-      • Render-only
-      • Must NEVER throw
-    """
+    # -------------------------------------------------------------
+    # Teensy: Query LASER process for optical ground truth
+    # -------------------------------------------------------------
     try:
-        resp = send_command("PHOTODIODE.STATUS")
+        resp = send_command(
+            "PROCESS.COMMAND",
+            {
+                "type": "PHOTODIODE",
+                "proc_cmd": "REPORT",
+            }
+        )
     except Exception:
         resp = {}
 
