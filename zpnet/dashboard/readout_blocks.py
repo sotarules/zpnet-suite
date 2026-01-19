@@ -15,44 +15,73 @@ Author: The Mule + GPT
 from collections.abc import Generator
 
 from zpnet.dashboard.core import fetch_aggregate
-from zpnet.shared.teensy import photodiode_status
+from zpnet.shared.teensy import send_command
 
 
 # ---------------------------------------------------------------------
-# GNSS
+# GNSS REPORT (AUTHORITATIVE, IMPERATIVE)
 # ---------------------------------------------------------------------
-def gnss_data_readout() -> Generator[str, None, None]:
-    ag = fetch_aggregate("GNSS_DATA")
-    yield f"GNSS DATA: {ag.get('health_state', 'DOWN')}"
+def gnss_report_readout() -> Generator[str, None, None]:
+    """
+    GNSS authoritative report snapshot.
 
-    if not ag:
-        yield "GNSS DATA UNAVAILABLE."
+    Semantics:
+      • Imperative query (PROCESS.COMMAND)
+      • No aggregation
+      • No persistence
+      • Render-only
+      • Must NEVER throw
+    """
+    try:
+        resp = send_command(
+            "PROCESS.COMMAND",
+            {
+                "type": "GNSS",
+                "proc_cmd": "REPORT",
+            }
+        )
+    except Exception:
+        resp = {}
+
+    if not resp or not resp.get("success"):
+        yield "GNSS REPORT: DOWN"
+        yield "NO GNSS DATA"
         return
 
-    if "utc_datetime" in ag:
-        yield f"UTC: {ag['utc_datetime']}"
-    if "time_status" in ag:
-        yield f"TIME STATUS: {ag['time_status']}"
-    if "leap_seconds" in ag:
-        yield f"LEAP SECONDS: {ag['leap_seconds']}"
-    if "freq_mode" in ag:
-        yield f"FREQ MODE: {ag['freq_mode']}"
+    payload = resp.get("payload", {})
 
-    if "pps_accuracy_ns" in ag:
-        yield f"PPS ACCURACY: {ag['pps_accuracy_ns']} NS"
-    if "pps_timing_error_ns" in ag:
-        yield f"PPS ERROR: {ag['pps_timing_error_ns']} NS"
-    if "clock_drift_ppb" in ag:
-        yield f"CLOCK DRIFT: {ag['clock_drift_ppb']} PPB"
-    if "temperature_c" in ag:
-        yield f"OSC TEMP: {ag['temperature_c']:.2f} C"
+    yield "GNSS REPORT: NOMINAL"
 
-    if "latitude_deg" in ag and "longitude_deg" in ag:
-        yield f"LAT/LON: {ag['latitude_deg']:.6f}, {ag['longitude_deg']:.6f}"
+    # -------------------------------------------------------------
+    # Clock
+    # -------------------------------------------------------------
+    if "date" in payload and "time" in payload:
+        yield f"UTC DATE: {payload['date']}"
+        yield f"UTC TIME: {payload['time']}"
+    elif "time" in payload:
+        yield f"UTC TIME: {payload['time']}"
 
-    for key in ["raw_zda", "raw_rmc", "raw_crw", "raw_crx", "raw_crz"]:
-        if key in ag:
-            yield f"{key.upper()}: {str(ag[key])[:38]}"
+    # -------------------------------------------------------------
+    # Discipline
+    # -------------------------------------------------------------
+    if "discipline" in payload:
+        yield f"DISCIPLINE MODE: {payload['discipline']}"
+
+    # -------------------------------------------------------------
+    # Position
+    # -------------------------------------------------------------
+    lat = payload.get("latitude_deg")
+    lon = payload.get("longitude_deg")
+
+    if lat is not None and lon is not None:
+        yield f"LATITUDE:  {lat:.6f}°"
+        yield f"LONGITUDE: {lon:.6f}°"
+
+    # -------------------------------------------------------------
+    # Altitude (optional)
+    # -------------------------------------------------------------
+    if "altitude_m" in payload:
+        yield f"ALTITUDE: {payload['altitude_m']:.1f} M"
 
 
 # ---------------------------------------------------------------------
@@ -212,14 +241,16 @@ def photodiode_status_readout() -> Generator[str, None, None]:
       • Must NEVER throw
     """
     try:
-        payload = photodiode_status(timeout_s=0.2)
+        resp = send_command("PHOTODIODE.STATUS")
     except Exception:
-        payload = {}
+        resp = {}
 
-    if not payload:
+    if not resp or not resp.get("success"):
         yield "PHOTODIODE STATUS: DOWN"
         yield "NO REAL-TIME DATA"
         return
+
+    payload = resp.get("payload", {})
 
     edge_level = payload.get("edge_level", 0)
     edge_count = payload.get("edge_pulse_count", 0)

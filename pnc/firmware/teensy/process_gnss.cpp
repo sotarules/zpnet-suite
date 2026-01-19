@@ -169,6 +169,8 @@ static void extractDiscipline(const char* l) {
 static void ingestGnssLine(const char* line) {
   if (!line || !*line) return;
 
+  debug_log("GNSS: ", line);
+
   safeCopy(GNSS.last_sentence, sizeof(GNSS.last_sentence), line);
   GNSS.last_rx_ms = millis();
 

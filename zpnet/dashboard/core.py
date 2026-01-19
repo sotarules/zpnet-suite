@@ -136,7 +136,7 @@ def header_readout(prefix: str = "") -> list[str]:
 # Readout imports
 # ---------------------------------------------------------------------
 from zpnet.dashboard.readout_blocks import (
-    gnss_data_readout,
+    gnss_report_readout,
     laser_status_readout,
     environment_status_readout,
     sensor_scan_readout,
@@ -151,7 +151,7 @@ from zpnet.dashboard.readout_blocks import (
 Readout = Generator[str, None, None]
 
 READOUTS: list[Callable[[], Readout]] = [
-    gnss_data_readout,
+    gnss_report_readout,
     laser_status_readout,
     environment_status_readout,
     sensor_scan_readout,
