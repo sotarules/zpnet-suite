@@ -169,8 +169,6 @@ static void extractDiscipline(const char* l) {
 static void ingestGnssLine(const char* line) {
   if (!line || !*line) return;
 
-  debug_log("GNSS: ", line);
-
   safeCopy(GNSS.last_sentence, sizeof(GNSS.last_sentence), line);
   GNSS.last_rx_ms = millis();
 
@@ -220,8 +218,8 @@ static void gnss_poll_tick(void*) {
   unsigned long start_ms = millis();
   uint32_t bytes = 0;
 
-  while (Serial1.available()) {
-    char c = Serial1.read();
+  while (Serial7.available()) {
+    char c = Serial7.read();
     GNSS.last_rx_ms = millis();
 
     if (c == '\n') {
@@ -249,7 +247,7 @@ static void gnss_poll_tick(void*) {
 // ================================================================
 
 static bool gnss_start(void) {
-  Serial1.begin(GNSSDO_BAUD);
+  Serial7.begin(GNSSDO_BAUD);
   lineLen = 0;
   timepop_schedule(GNSS_POLL_INTERVAL_MS,
                    TIMEPOP_UNITS_MILLISECONDS,

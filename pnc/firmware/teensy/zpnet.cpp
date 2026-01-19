@@ -35,7 +35,7 @@ void zpnet_setup() {
   serial_init();
   event_bus_init();
   process_init();
-  process_gnss_register();
+  //process_gnss_register();
   //process_start(PROCESS_TYPE_GNSS);
 
   // Arm CPU usage sampler AFTER timepop_init()
