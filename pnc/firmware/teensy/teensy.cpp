@@ -1,4 +1,5 @@
 #include "debug.h"
+#include "system.h"
 #include "timepop.h"
 #include "event_bus.h"
 #include "serial.h"
@@ -31,12 +32,12 @@ static void cpu_usage_tick(void*) {
 
 void setup() {
 
-  //laser_init();
   cpu_usage_init();
   debug_init();
   timepop_init();
   serial_init();
   event_bus_init();
+  system_init();
   process_init();
 
   process_laser_register();

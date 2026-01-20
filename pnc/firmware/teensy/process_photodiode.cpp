@@ -14,11 +14,16 @@ static volatile bool     pd_edge_seen = false;
 static volatile bool     pd_episode_latched = false;
 static volatile uint32_t pd_episode_count = 0;
 
+static volatile uint32_t pd_isr_count = 0;
+static int last_edge_level = -1;
+static bool edge_level_changed = false;
+
 // ================================================================
 // ISR
 // ================================================================
 
 static void photodiodeISR() {
+  pd_isr_count++;
   pd_edge_seen = true;
 }
 
@@ -87,6 +92,14 @@ static void photodiode_snapshot(void) {
 
   PD.edge_pulse_count = pd_episode_count;
   PD.edge_level = digitalRead(PHOTODIODE_EDGE_PIN);
+
+  int level = digitalRead(PHOTODIODE_EDGE_PIN);
+  if (last_edge_level != -1 && level != last_edge_level) {
+    edge_level_changed = true;
+  }
+  last_edge_level = level;
+
+  PD.edge_level = level;
 
   interrupts();
 }
@@ -165,6 +178,18 @@ static String cmd_report(const char*) {
     snprintf(buf, sizeof(buf), "%.5f", PD.analog_v);
     p += buf;
   }
+
+  p += ",\"isr_count\":";
+  {
+    uint32_t count;
+    noInterrupts();
+    count = pd_isr_count;
+    interrupts();
+    p += count;
+  }
+
+  p += ",\"edge_level_changed\":";
+  p += (edge_level_changed ? "true" : "false");
 
   p += "}";
 

@@ -1,9 +1,10 @@
+#include "debug.h"
 #include "system.h"
-
 #include "event_bus.h"
 #include "config.h"
 
 #include <Arduino.h>
+#include <NativeEthernet.h>
 
 // --------------------------------------------------------------
 // Internal system state
@@ -11,9 +12,19 @@
 static bool system_shutdown = false;
 
 // --------------------------------------------------------------
+// Ethernet identity
+// --------------------------------------------------------------
+// NOTE: MAC address must be unique on your LAN.
+// You may later want to derive this from hardware ID.
+static byte SYSTEM_MAC[6] = {
+  0x04, 0xE9, 0xE5, 0x00, 0x00, 0x01
+};
+
+// --------------------------------------------------------------
 // Public API
 // --------------------------------------------------------------
 void system_init() {
+  // Reset shutdown state
   system_shutdown = false;
 }
 
@@ -29,9 +40,6 @@ void system_request_shutdown() {
 
   system_shutdown = true;
 
-  // Safety: disable laser outputs immediately
-  digitalWrite(LD_ON_PIN, LOW);
-
   // Durable signal before silence
   enqueueEvent("SYSTEM_SHUTDOWN", "\"status\":\"REQUESTED\"");
 
@@ -42,8 +50,6 @@ void system_request_shutdown() {
 // Terminal quiescence (no return)
 // --------------------------------------------------------------
 void system_enter_quiescence() {
-  // Optional: detach interrupts to reduce noise
-  detachInterrupt(digitalPinToInterrupt(PHOTODIODE_EDGE_PIN));
 
   // Inert forever
   while (true) {

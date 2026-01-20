@@ -20,7 +20,7 @@ static const unsigned long GNSSDO_BAUD     = 38400;
 // Laser control pins
 // --------------------------------------------------------------
 static const int LD_ON_PIN = 30;
-static const int LASER_MONITOR_PIN = 17;
+static const int LASER_MONITOR_PIN = 20;
 
 // --------------------------------------------------------------
 // Photodiode (TDM split-pin design)
@@ -32,7 +32,7 @@ static const int LASER_MONITOR_PIN = 17;
 // PHOTODIODE_ANALOG_PIN:
 //   Continuous analog voltage while light is present
 //
-static const int PHOTODIODE_EDGE_PIN   = 16;
+static const int PHOTODIODE_EDGE_PIN   = 34;
 static const int PHOTODIODE_ANALOG_PIN = 15;
 
 // --------------------------------------------------------------
