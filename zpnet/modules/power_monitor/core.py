@@ -30,7 +30,7 @@ DEVICE_CONFIG = {
     0x40: {"label": "Battery",   "ideal_voltage_v": 12.8, "max_dev_pct": 10},
     0x41: {"label": "3v3 Rail",  "ideal_voltage_v": 3.3,  "max_dev_pct": 5},
     0x44: {"label": "5v0 Rail",  "ideal_voltage_v": 5.0,  "max_dev_pct": 5},
-    0x45: {"label": "24v Spur",  "ideal_voltage_v": 24.0, "max_dev_pct": 5},
+    0x45: {"label": "5v0 Teensy Rail", "ideal_voltage_v": 5.0, "max_dev_pct": 5},
 }
 
 # INA260 registers

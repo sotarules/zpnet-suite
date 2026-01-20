@@ -24,7 +24,7 @@ I2C_DEVICES = {
     0x40: "INA260 0x40 (Battery)",
     0x41: "INA260 0x41 (3v3 Rail)",
     0x44: "INA260 0x44 (5v0 Rail)",
-    0x45: "INA260 0x45 (24v Spur)",
+    0x45: "INA260 0x45 (5v Teensy Rail)",
     0x76: "BME280 0x76 (Environment)",
     0x66: "EV5491 0x66 (Laser Controller)",
 }
