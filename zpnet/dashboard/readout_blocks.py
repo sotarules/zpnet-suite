@@ -15,7 +15,7 @@ Author: The Mule + GPT
 from collections.abc import Generator
 
 from zpnet.dashboard.core import fetch_aggregate
-from zpnet.shared.teensy import send_command
+from zpnet.processes.processes import send_command
 
 
 # ---------------------------------------------------------------------
