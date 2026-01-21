@@ -27,7 +27,7 @@ from typing import Any, Dict, Optional
 # Transport Configuration (internal policy)
 # ---------------------------------------------------------------------
 TEENSY_RPC_SOCKET = "/tmp/zpnet_teensy_rt.sock"
-RPC_TIMEOUT_S = 1.0
+RPC_TIMEOUT_S = 10.0
 MAX_REPLY_BYTES = 256 * 1024
 
 

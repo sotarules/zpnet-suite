@@ -6,9 +6,9 @@
 #include "laser.h"
 #include "cpu_usage.h"
 #include "process.h"
-#include "process_gnss.h"
 #include "process_laser.h"
 #include "process_photodiode.h"
+#include "process_tempest.h"
 
 // ------------------------------------------------------------
 // CPU usage sampler (TimePop task)
@@ -44,8 +44,7 @@ void setup() {
   process_start(PROCESS_TYPE_LASER);
   process_photodiode_register();
   process_start(PROCESS_TYPE_PHOTODIODE);
-  //process_gnss_register();
-  //process_start(PROCESS_TYPE_GNSS);
+  process_tempest_register();
 
   // Arm CPU usage sampler AFTER timepop_init()
   timepop_schedule(

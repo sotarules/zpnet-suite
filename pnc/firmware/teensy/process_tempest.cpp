@@ -4,12 +4,18 @@
 #include "imxrt.h"
 #include "clock.h"
 #include "config.h"
-#include "gpt_count.h"
-#include "dwt_clock.h"
+#include "process_tempest.h"
 #include "event_bus.h"
+#include "process.h"
+
+// ------------------------------------------------------------
+// Forward declarations (lifecycle)
+// ------------------------------------------------------------
+static bool tempest_start(void);
+static void tempest_stop(void);
 
 // =============================================================
-// EXISTING INTERNAL STATE (UNCHANGED)
+// INTERNAL STATE (UNCHANGED)
 // =============================================================
 
 // GNSS edge gates
@@ -17,76 +23,55 @@ static volatile bool start_edge_seen = false;
 static volatile bool end_edge_seen   = false;
 
 // =============================================================
-// ISR: START edge (phase gate only) — UNCHANGED
+// ISR: START edge
 // =============================================================
 
-static void gpt_confirm_start_isr() {
+static void tempest_confirm_start_isr() {
   start_edge_seen = true;
   detachInterrupt(GNSS_VCLK_PIN);
 }
 
 // =============================================================
-// ISR: END edge (phase gate only) — UNCHANGED
+// ISR: END edge
 // =============================================================
 
-static void gpt_confirm_end_isr() {
+static void tempest_confirm_end_isr() {
   end_edge_seen = true;
   detachInterrupt(GNSS_VCLK_PIN);
 }
 
 // =============================================================
-// CONFIRM — SINGLE GNSS-ANCHORED SAMPLE (SECONDS-BASED API)
-// =============================================================
-//
-// Semantics:
-//   • Measures CPU state transitions over an exact GNSS-defined
-//     interval expressed in seconds
-//   • GNSS VCLOCK (10 MHz) defines the authoritative window
-//   • CPU acts strictly as observer
-//   • Jitter is preserved intentionally
-//
-// This function is a single Monte Carlo draw.
+// CONFIRM
 // =============================================================
 
-uint64_t gpt_count_confirm(
+uint64_t tempest_confirm(
     uint32_t seconds,
     uint64_t* cpu_cycles_out,
     double*   ratio_out,
     int64_t*  error_cycles_out
 ) {
-  // -----------------------------------------------------------
-  // Defensive defaults
-  // -----------------------------------------------------------
   if (cpu_cycles_out)   *cpu_cycles_out   = 0;
   if (ratio_out)        *ratio_out        = 0.0;
   if (error_cycles_out) *error_cycles_out = 0;
 
   if (seconds == 0) return 0;
 
-  // GNSS VCLOCK = 10 MHz
   uint64_t target_ext_ticks =
       (uint64_t)seconds * 10000000ULL;
 
   start_edge_seen = false;
   end_edge_seen   = false;
 
-  // ===========================================================
-  // PHASE 0 — wait for START GNSS edge
-  // ===========================================================
-  attachInterrupt(GNSS_VCLK_PIN, gpt_confirm_start_isr, RISING);
+  attachInterrupt(GNSS_VCLK_PIN, tempest_confirm_start_isr, RISING);
   while (!start_edge_seen) {
     dwt_now();
   }
 
   uint64_t start_cycles = dwt_now();
 
-  // ===========================================================
-  // PHASE 1 — GNSS pin → GPT2 external clock
-  // ===========================================================
-
   CCM_CCGR0 |= CCM_CCGR0_GPT2_BUS(CCM_CCGR_ON);
 
-  IOMUXC_SW_MUX_CTL_PAD_GPIO_AD_B1_02 = 8;   // ALT8 = GPT2_CLK
+  IOMUXC_SW_MUX_CTL_PAD_GPIO_AD_B1_02 = 8;
   IOMUXC_SW_PAD_CTL_PAD_GPIO_AD_B1_02 =
       IOMUXC_PAD_HYS |
       IOMUXC_PAD_PKE |
@@ -96,10 +81,6 @@ uint64_t gpt_count_confirm(
   IOMUXC_GPT2_IPP_IND_CLKIN_SELECT_INPUT = 1;
 
   delayMicroseconds(1);
-
-  // ===========================================================
-  // PHASE 2 — GPT2 external counting
-  // ===========================================================
 
   GPT2_CR = 0;
   GPT2_SR = 0x3F;
@@ -112,25 +93,17 @@ uint64_t gpt_count_confirm(
     dwt_now();
   }
 
-  // ===========================================================
-  // PHASE 3 — restore GPIO + wait for END GNSS edge
-  // ===========================================================
-
-  IOMUXC_SW_MUX_CTL_PAD_GPIO_AD_B1_02 = 5;   // ALT5 = GPIO
+  IOMUXC_SW_MUX_CTL_PAD_GPIO_AD_B1_02 = 5;
   delayMicroseconds(1);
 
   GPT2_CR &= ~GPT_CR_EN;
 
-  attachInterrupt(GNSS_VCLK_PIN, gpt_confirm_end_isr, RISING);
+  attachInterrupt(GNSS_VCLK_PIN, tempest_confirm_end_isr, RISING);
   while (!end_edge_seen) {
     dwt_now();
   }
 
   uint64_t end_cycles = dwt_now();
-
-  // ===========================================================
-  // PHASE 4 — compute results
-  // ===========================================================
 
   uint64_t delta_cpu_cycles =
       end_cycles - start_cycles;
@@ -156,6 +129,136 @@ uint64_t gpt_count_confirm(
   return target_ext_ticks;
 }
 
+// ================================================================
+// Commands
+// ================================================================
+
+static String cmd_confirm(const char* args) {
+
+  if (!args) {
+    return "{\"error\":\"missing args\"}";
+  }
+
+  const char* p = strstr(args, "\"seconds\"");
+  if (!p) {
+    return "{\"error\":\"missing seconds\"}";
+  }
+
+  p = strchr(p, ':');
+  if (!p) {
+    return "{\"error\":\"malformed seconds\"}";
+  }
+  p++;
+
+  uint32_t seconds = (uint32_t)strtoul(p, nullptr, 10);
+
+  uint64_t cpu = 0;
+  double   ratio = 0.0;
+  int64_t  err = 0;
+
+  tempest_confirm(seconds, &cpu, &ratio, &err);
+
+  String r = "{";
+
+  r += "\"cpu_cycles\":";
+  r += cpu;
+
+  r += ",\"ratio\":";
+  {
+    char buf[32];
+    snprintf(buf, sizeof(buf), "%.12f", ratio);
+    r += buf;
+  }
+
+  r += ",\"error_cycles\":";
+  r += err;
+
+  r += "}";
+
+  return r;
+}
+
+static String cmd_baseline(const char*) {
+  uint32_t samples = 0;
+  int32_t  min_e = 0, max_e = 0, med_e = 0, std_e = 0;
+  double   stddev = 0.0;
+
+  tempest_discover_standard_error(
+      &samples,
+      &min_e,
+      &max_e,
+      &med_e,
+      &std_e,
+      &stddev
+  );
+
+  String r = "{";
+
+  r += "\"samples\":";
+  r += samples;
+
+  r += ",\"baseline_error\":";
+  r += std_e;
+
+  r += ",\"stddev\":";
+  {
+    char buf[32];
+    snprintf(buf, sizeof(buf), "%.6f", stddev);
+    r += buf;
+  }
+
+  r += "}";
+
+  return r;
+}
+
+static String cmd_tau(const char* args) {
+  uint32_t seconds = 0;
+
+  const char* p = strstr(args, "seconds=");
+  if (!p) {
+    return "{\"error\":\"missing seconds\"}";
+  }
+
+  seconds = (uint32_t)strtoul(p + 8, nullptr, 10);
+
+  bool ok = tempest_tau_profile(seconds);
+
+  return ok ? "{\"status\":\"ok\"}" : "{\"status\":\"fail\"}";
+}
+
+// ================================================================
+// Registration
+// ================================================================
+
+static const process_command_entry_t TEMPEST_COMMANDS[] = {
+  { "CONFIRM",  cmd_confirm  },
+  { "BASELINE", cmd_baseline },
+  { "TAU",      cmd_tau      },
+};
+
+static const process_vtable_t TEMPEST_PROCESS = {
+  .name = "TEMPEST",
+  .start = tempest_start,
+  .stop  = tempest_stop,
+  .query = nullptr,
+  .commands = TEMPEST_COMMANDS,
+  .command_count = 3,
+};
+
+void process_tempest_register(void) {
+  process_register(PROCESS_TYPE_TEMPEST, &TEMPEST_PROCESS);
+}
+
+static bool tempest_start(void) {
+  enqueueEvent("TEMPEST_INIT_ENTER", "\"stage\":\"process_start\"");
+  return true;
+}
+
+static void tempest_stop(void) {
+  enqueueEvent("TEMPEST_STOP", "\"stage\":\"process_stop\"");
+}
+
 // =============================================================
 // STANDARD ERROR DISCOVERY (SELF-CALIBRATING)
 // =============================================================
@@ -170,7 +273,7 @@ static int cmp_int32(const void* a, const void* b) {
   return (x > y) - (x < y);
 }
 
-bool gpt_discover_standard_error(
+bool tempest_discover_standard_error(
     uint32_t* samples_out,
     int32_t*  min_error_out,
     int32_t*  max_error_out,
@@ -194,8 +297,8 @@ bool gpt_discover_standard_error(
     int64_t error_cycles = 0;
 
     // One GNSS-anchored Monte Carlo draw
-    gpt_count_confirm(
-        1,        // 1 second samples are fine
+    tempest_confirm(
+        1,        // 1 second samples
         nullptr,
         nullptr,
         &error_cycles
@@ -263,7 +366,6 @@ bool gpt_discover_standard_error(
     last_median = median;
   }
 }
-
 
 // =============================================================
 // MONTE CARLO τ ACCUMULATION LAYER (1-CYCLE BINS, SELF-CALIBRATING)
@@ -488,12 +590,12 @@ static void emit_tau_result(
   enqueueEvent(event_type, body);
 }
 
-// ------------------------------------------------------------
+// =============================================================
 // τ PROFILING WRAPPER
-// ------------------------------------------------------------
+// =============================================================
 
-bool gpt_tau_profile(uint32_t total_seconds) {
-  enqueueEvent("TAU_DIAG_ENTER", "\"stage\":\"gpt_tau_profile\"");
+bool tempest_tau_profile(uint32_t total_seconds) {
+  enqueueEvent("TAU_DIAG_ENTER", "\"stage\":\"tempest_tau_profile\"");
 
   if (total_seconds < 1) return false;
 
@@ -501,10 +603,10 @@ bool gpt_tau_profile(uint32_t total_seconds) {
 
   // ---- baseline discovery (1-second units) ----
   uint32_t baseline_samples = 0;
-  int32_t  baseline_error = 0;
-  double   baseline_stddev = 0.0;
+  int32_t  baseline_error   = 0;
+  double   baseline_stddev  = 0.0;
 
-  if (!gpt_discover_standard_error(
+  if (!tempest_discover_standard_error(
         &baseline_samples,
         nullptr, nullptr, nullptr,
         &baseline_error,
@@ -529,11 +631,11 @@ bool gpt_tau_profile(uint32_t total_seconds) {
   uint32_t elapsed = 0;
 
   while (elapsed < total_seconds) {
-    uint64_t cpu_cycles = 0;
+    uint64_t cpu_cycles  = 0;
     double   ratio       = 0.0;
     int64_t  error_cycles = 0;
 
-    gpt_count_confirm(1, &cpu_cycles, &ratio, &error_cycles);
+    tempest_confirm(1, &cpu_cycles, &ratio, &error_cycles);
 
     int32_t residual = (int32_t)(error_cycles - baseline_error);
 
@@ -583,4 +685,3 @@ bool gpt_tau_profile(uint32_t total_seconds) {
   enqueueEvent("TAU_DIAG_EXIT", "\"stage\":\"complete\"");
   return true;
 }
-

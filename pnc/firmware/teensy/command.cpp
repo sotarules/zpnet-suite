@@ -8,10 +8,7 @@
 
 #include "laser.h"
 #include "photodiode.h"
-#include "gnss.h"
 #include "teensy_status.h"
-#include "qtimer.h"
-#include "gpt_count.h"
 #include "transport.h"
 
 #include <string.h>
@@ -245,8 +242,22 @@ void command_exec(const char* line) {
         memcpy(proc_cmd, p, n);
         proc_cmd[n] = '\0';
 
+        const char* args_json = nullptr;
+
+        const char* a = strstr(line, "\"args\"");
+        if (a) {
+            a = strchr(a, ':');
+            if (a) {
+                a++;
+                while (*a == ' ') a++;
+                if (*a == '{') {
+                    args_json = a;
+                }
+            }
+        }
+
         String payload;
-        if (!process_command(type, proc_cmd, nullptr, payload)) {
+        if (!process_command(type, proc_cmd, args_json, payload)) {
             emitError("process command failed", has_req_id, req_id);
             return;
         }
@@ -261,18 +272,6 @@ void command_exec(const char* line) {
 
     if (strcmp(cmd, "TEENSY.STATUS") == 0) {
         String payload = buildTeensyStatusBody();
-        emitOK(&payload, has_req_id, req_id);
-        return;
-    }
-
-    if (strcmp(cmd, "GNSS.STATUS") == 0) {
-        String payload = buildGnssStatusBody();
-        emitOK(&payload, has_req_id, req_id);
-        return;
-    }
-
-    if (strcmp(cmd, "GNSS.DATA") == 0) {
-        String payload = buildGnssDataBody();
         emitOK(&payload, has_req_id, req_id);
         return;
     }

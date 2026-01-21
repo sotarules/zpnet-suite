@@ -12,15 +12,6 @@
 static bool system_shutdown = false;
 
 // --------------------------------------------------------------
-// Ethernet identity
-// --------------------------------------------------------------
-// NOTE: MAC address must be unique on your LAN.
-// You may later want to derive this from hardware ID.
-static byte SYSTEM_MAC[6] = {
-  0x04, 0xE9, 0xE5, 0x00, 0x00, 0x01
-};
-
-// --------------------------------------------------------------
 // Public API
 // --------------------------------------------------------------
 void system_init() {

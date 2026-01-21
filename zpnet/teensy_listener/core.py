@@ -268,7 +268,7 @@ def handle_client(conn: socket.socket) -> None:
 
         send_frame(req)
 
-        reply = q.get(timeout=1.0)
+        reply = q.get(timeout=10.0)
 
         try:
             conn.sendall(

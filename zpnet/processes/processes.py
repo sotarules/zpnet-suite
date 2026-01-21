@@ -80,7 +80,7 @@ def _process_command(
     ptype: ProcessType,
     proc_cmd: str,
     args: Optional[Dict[str, Any]] = None,
-    timeout_s: float = 2.0,
+    timeout_s: float = 10.0,
 ) -> Dict[str, Any]:
     """
     Low-level PROCESS.COMMAND implementation.
