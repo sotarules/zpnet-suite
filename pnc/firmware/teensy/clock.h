@@ -34,6 +34,10 @@ uint64_t dwt_now(void);
 uint64_t gnss_now(void);
 uint64_t ocxo_now(void);
 
+// Prescaled tick counters (10 kHz domains)
+uint64_t clock_gnss_prescaled_ticks();
+uint64_t clock_ocxo_prescaled_ticks();
+
 // Optional: zero accumulated clocks (resets accumulator + reseeds last)
 void dwt_zero(void);
 void gnss_zero(void);

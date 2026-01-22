@@ -31,6 +31,9 @@ static String cmd_report(const char*) {
   uint64_t gnss = gnss_now();
   uint64_t ocxo = ocxo_now();
 
+  uint64_t gnss_prescaled_ticks = clock_gnss_prescaled_ticks();
+  uint64_t ocxo_prescaled_ticks = clock_ocxo_prescaled_ticks();
+
   String r = "{";
 
   r += "\"dwt_cycles\":";
@@ -41,6 +44,12 @@ static String cmd_report(const char*) {
 
   r += ",\"ocxo_ticks\":";
   r += ocxo;
+
+  r += ",\"gnss_prescaled_ticks\":";
+  r += gnss_prescaled_ticks;
+
+  r += ",\"ocxo_prescaled_ticks\":";
+  r += ocxo_prescaled_ticks;
 
   r += "}";
 
