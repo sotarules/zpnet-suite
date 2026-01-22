@@ -9,6 +9,29 @@
 
 #define ZPNET_SERIAL Serial
 
+// --------------------------------------------------------------
+// Base units
+// --------------------------------------------------------------
+
+static constexpr uint64_t NS_PER_SECOND      = 1000000000ULL;
+static constexpr uint64_t NS_PER_MILLISECOND = 1000000ULL;
+static constexpr uint64_t NS_PER_MICROSECOND = 1000ULL;
+
+// --------------------------------------------------------------
+// Prescaled clock domains
+// --------------------------------------------------------------
+
+// SmartPOP / clock prescale
+static constexpr uint32_t SMARTPOP_HZ        = 10000U;      // 10 kHz
+static constexpr uint64_t NS_PER_SMART_TICK  = NS_PER_SECOND / SMARTPOP_HZ; // 100,000 ns
+
+// --------------------------------------------------------------
+// DWT conversion (600 MHz core clock)
+// --------------------------------------------------------------
+
+// Exact rational conversion: 1 DWT cycle = 5/3 ns
+static constexpr uint64_t DWT_NS_NUM = 5ULL;
+static constexpr uint64_t DWT_NS_DEN = 3ULL;
 
 // --------------------------------------------------------------
 // Serial configuration

@@ -1,18 +1,22 @@
 #include <Arduino.h>
 #include <stddef.h>
 
+#include "process_tempest.h"
 #include "imxrt.h"
 #include "clock.h"
 #include "config.h"
-#include "process_tempest.h"
 #include "event_bus.h"
 #include "process.h"
+#include "smartpop.h"
 
 // ------------------------------------------------------------
 // Forward declarations (lifecycle)
 // ------------------------------------------------------------
 static bool tempest_start(void);
 static void tempest_stop(void);
+
+static void tempest_confirm_start_cb(void* context);
+static void tempest_confirm_end_cb(void* context);
 
 // =============================================================
 // INTERNAL STATE (UNCHANGED)
@@ -23,123 +27,103 @@ static volatile bool start_edge_seen = false;
 static volatile bool end_edge_seen   = false;
 
 // =============================================================
-// ISR: START edge
+// INTERNAL STATE (SmartPOP-based)
 // =============================================================
 
-static void tempest_confirm_start_isr() {
-  start_edge_seen = true;
-  detachInterrupt(GNSS_VCLK_PIN);
+static volatile bool confirm_done = false;
+static volatile bool confirm_active = false;
+
+// Parameters
+static uint32_t confirm_seconds = 0;
+
+// Captured times (ns)
+static uint64_t confirm_start_ns = 0;
+static uint64_t confirm_end_ns   = 0;
+
+
+// -------------------------------------------------------------
+// SmartPOP-aligned START callback
+// -------------------------------------------------------------
+
+static void tempest_confirm_start_cb(void* context) {
+
+  uint32_t seconds = (uint32_t)(uintptr_t)context;
+
+  // Capture aligned start time
+  confirm_start_ns = clock_dwt_ns_now();
+
+  // Schedule aligned end
+  uint32_t ticks = seconds * SMARTPOP_HZ;
+
+  smartpop_end(
+    ticks,
+    tempest_confirm_end_cb,
+    nullptr
+  );
 }
 
-// =============================================================
-// ISR: END edge
-// =============================================================
+// -------------------------------------------------------------
+// SmartPOP-aligned END callback
+// -------------------------------------------------------------
+static void tempest_confirm_end_cb(void* /*context*/) {
 
-static void tempest_confirm_end_isr() {
-  end_edge_seen = true;
-  detachInterrupt(GNSS_VCLK_PIN);
+  confirm_end_ns = clock_dwt_ns_now();
+
+  uint64_t measured_ns = confirm_end_ns - confirm_start_ns;
+  uint64_t ideal_ns    = (uint64_t)confirm_seconds * NS_PER_SECOND;
+  int64_t  error_ns    = (int64_t)measured_ns - (int64_t)ideal_ns;
+
+  double ratio = 0.0;
+  if (measured_ns > 0) {
+    ratio = (double)ideal_ns / (double)measured_ns;
+  }
+
+  // ---------------------------------------------------------
+  // Emit authoritative result
+  // ---------------------------------------------------------
+  String body;
+
+  body += "\"seconds\":";
+  body += confirm_seconds;
+
+  body += ",\"ideal_ns\":";
+  body += ideal_ns;
+
+  body += ",\"measured_ns\":";
+  body += measured_ns;
+
+  body += ",\"error_ns\":";
+  body += error_ns;
+
+  body += ",\"ratio\":";
+  {
+    char buf[32];
+    snprintf(buf, sizeof(buf), "%.12f", ratio);
+    body += buf;
+  }
+
+  enqueueEvent("TEMPEST_CONFIRM_RESULT", body);
+
+  // ---------------------------------------------------------
+  // Reset state
+  // ---------------------------------------------------------
+  confirm_active = false;
 }
 
-// =============================================================
-// CONFIRM
-// =============================================================
+// -------------------------------------------------------------
+// Forward declarations (SmartPOP callbacks)
+// -------------------------------------------------------------
 
-uint64_t tempest_confirm(
-    uint32_t seconds,
-    uint64_t* cpu_cycles_out,
-    double*   ratio_out,
-    int64_t*  error_cycles_out
-) {
-  if (cpu_cycles_out)   *cpu_cycles_out   = 0;
-  if (ratio_out)        *ratio_out        = 0.0;
-  if (error_cycles_out) *error_cycles_out = 0;
+static void tempest_confirm_start_cb(void* context);
+static void tempest_confirm_end_cb(void* context);
 
-  if (seconds == 0) return 0;
+static String cmd_confirm(const char* args_json) {
 
-  uint64_t target_ext_ticks =
-      (uint64_t)seconds * 10000000ULL;
-
-  start_edge_seen = false;
-  end_edge_seen   = false;
-
-  attachInterrupt(GNSS_VCLK_PIN, tempest_confirm_start_isr, RISING);
-  while (!start_edge_seen) {
-    clock_dwt_cycles_now();
-  }
-
-  uint64_t start_cycles = clock_dwt_cycles_now();
-
-  CCM_CCGR0 |= CCM_CCGR0_GPT2_BUS(CCM_CCGR_ON);
-
-  IOMUXC_SW_MUX_CTL_PAD_GPIO_AD_B1_02 = 8;
-  IOMUXC_SW_PAD_CTL_PAD_GPIO_AD_B1_02 =
-      IOMUXC_PAD_HYS |
-      IOMUXC_PAD_PKE |
-      IOMUXC_PAD_PUE |
-      IOMUXC_PAD_DSE(4);
-
-  IOMUXC_GPT2_IPP_IND_CLKIN_SELECT_INPUT = 1;
-
-  delayMicroseconds(1);
-
-  GPT2_CR = 0;
-  GPT2_SR = 0x3F;
-  GPT2_CR = GPT_CR_CLKSRC(3);
-  GPT2_CR |= GPT_CR_EN;
-
-  uint32_t gpt_start = GPT2_CNT;
-
-  while ((uint64_t)(GPT2_CNT - gpt_start) < target_ext_ticks) {
-    clock_dwt_cycles_now();
-  }
-
-  IOMUXC_SW_MUX_CTL_PAD_GPIO_AD_B1_02 = 5;
-  delayMicroseconds(1);
-
-  GPT2_CR &= ~GPT_CR_EN;
-
-  attachInterrupt(GNSS_VCLK_PIN, tempest_confirm_end_isr, RISING);
-  while (!end_edge_seen) {
-    clock_dwt_cycles_now();
-  }
-
-  uint64_t end_cycles = clock_dwt_cycles_now();
-
-  uint64_t delta_cpu_cycles =
-      end_cycles - start_cycles;
-
-  if (cpu_cycles_out) {
-    *cpu_cycles_out = delta_cpu_cycles;
-  }
-
-  if (ratio_out && delta_cpu_cycles > 0) {
-    *ratio_out =
-        (double)target_ext_ticks /
-        (double)delta_cpu_cycles;
-  }
-
-  int64_t ideal_cpu_cycles =
-      (int64_t)target_ext_ticks * 60LL;
-
-  if (error_cycles_out) {
-    *error_cycles_out =
-        (int64_t)delta_cpu_cycles - ideal_cpu_cycles;
-  }
-
-  return target_ext_ticks;
-}
-
-// ================================================================
-// Commands
-// ================================================================
-
-static String cmd_confirm(const char* args) {
-
-  if (!args) {
+  if (!args_json) {
     return "{\"error\":\"missing args\"}";
   }
 
-  const char* p = strstr(args, "\"seconds\"");
+  const char* p = strstr(args_json, "\"seconds\"");
   if (!p) {
     return "{\"error\":\"missing seconds\"}";
   }
@@ -151,31 +135,33 @@ static String cmd_confirm(const char* args) {
   p++;
 
   uint32_t seconds = (uint32_t)strtoul(p, nullptr, 10);
-
-  uint64_t cpu = 0;
-  double   ratio = 0.0;
-  int64_t  err = 0;
-
-  tempest_confirm(seconds, &cpu, &ratio, &err);
-
-  String r = "{";
-
-  r += "\"cpu_cycles\":";
-  r += cpu;
-
-  r += ",\"ratio\":";
-  {
-    char buf[32];
-    snprintf(buf, sizeof(buf), "%.12f", ratio);
-    r += buf;
+  if (seconds == 0) {
+    return "{\"error\":\"seconds must be > 0\"}";
   }
 
-  r += ",\"error_cycles\":";
-  r += err;
+  // ---------------------------------------------------------
+  // Enforce single in-flight confirm
+  // ---------------------------------------------------------
+  if (confirm_active) {
+    return "{\"error\":\"confirm already in progress\"}";
+  }
 
-  r += "}";
+  // ---------------------------------------------------------
+  // Arm confirm
+  // ---------------------------------------------------------
+  confirm_active    = true;
+  confirm_seconds   = seconds;
+  confirm_start_ns  = 0;
+  confirm_end_ns    = 0;
 
-  return r;
+  // Schedule aligned start on next GNSS tick
+  smartpop_start(
+    tempest_confirm_start_cb,
+    (void*)(uintptr_t)seconds
+  );
+
+  // Return immediately
+  return "{\"status\":\"armed\"}";
 }
 
 static String cmd_baseline(const char*) {
@@ -297,12 +283,14 @@ bool tempest_discover_standard_error(
     int64_t error_cycles = 0;
 
     // One GNSS-anchored Monte Carlo draw
+    /*
     tempest_confirm(
         1,        // 1 second samples
         nullptr,
         nullptr,
         &error_cycles
     );
+    */
 
     int32_t e = (int32_t)error_cycles;
 
@@ -635,7 +623,7 @@ bool tempest_tau_profile(uint32_t total_seconds) {
     double   ratio       = 0.0;
     int64_t  error_cycles = 0;
 
-    tempest_confirm(1, &cpu_cycles, &ratio, &error_cycles);
+    //tempest_confirm(1, &cpu_cycles, &ratio, &error_cycles);
 
     int32_t residual = (int32_t)(error_cycles - baseline_error);
 
