@@ -117,6 +117,7 @@ static bool extractCmd(const char* line, char* out, size_t out_sz) {
 
 static bool parseProcessType(const char* line, process_type_t& out) {\
     if (strstr(line, "\"type\":\"CLOCKS\"")) { out = PROCESS_TYPE_CLOCKS; return true; }
+    if (strstr(line, "\"type\":\"TIMEPOP\"")) { out = PROCESS_TYPE_TIMEPOP; return true; }
     if (strstr(line, "\"type\":\"LASER\"")) { out = PROCESS_TYPE_LASER; return true; }
     if (strstr(line, "\"type\":\"PHOTODIODE\"")) { out = PROCESS_TYPE_PHOTODIODE; return true; }
     if (strstr(line, "\"type\":\"TEMPEST\"")) { out = PROCESS_TYPE_TEMPEST; return true; }
@@ -143,7 +144,7 @@ void command_exec(const char* line) {
     // EVENT BUS CONTROL
     // ---------------------------------------------------------
     if (strcmp(cmd, "EVENTS.GET") == 0) {
-        drainEventsNow();
+        event_bus_request_drain();
         emitOK(nullptr, has_req_id, req_id);
         return;
     }

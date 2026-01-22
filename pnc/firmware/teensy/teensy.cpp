@@ -7,25 +7,22 @@
 #include "laser.h"
 #include "cpu_usage.h"
 #include "process.h"
+
 #include "process_clocks.h"
+#include "process_timepop.h"
 #include "process_laser.h"
 #include "process_photodiode.h"
 #include "process_tempest.h"
 
 // ------------------------------------------------------------
-// CPU usage sampler (TimePop task)
+// CPU usage sampler (TimePop recurring task)
 // ------------------------------------------------------------
-static void cpu_usage_tick(void*) {
-    cpu_usage_sample();
-
-    // Self-reschedule (1 Hz)
-    timepop_schedule(
-        1000,
-        TIMEPOP_UNITS_MILLISECONDS,
-        cpu_usage_tick,
-        nullptr,
-        "cpu-usage"
-    );
+//
+// This callback is invoked by TimePop at the cadence defined
+// for TIMEPOP_CLASS_CPU_SAMPLE. No self-rescheduling.
+//
+static void cpu_usage_tick(timepop_ctx_t* timer, void* /*user*/) {
+  cpu_usage_sample();
 }
 
 // -----------------------------------------------------------------------------
@@ -34,31 +31,79 @@ static void cpu_usage_tick(void*) {
 
 void setup() {
 
-  cpu_usage_init();
   debug_init();
+
+  debug_log("setup", "*fire*");
+
+  // ----------------------------------------------------------
+  // Core instrumentation / diagnostics
+  // ----------------------------------------------------------
+  debug_log("setup", "cpu_usage_init");
+  cpu_usage_init();
+
+  // ----------------------------------------------------------
+  // Bring time into existence (control plane)
+  // ----------------------------------------------------------
+  debug_log("setup", "timepop_init");
   timepop_init();
+
+  // ----------------------------------------------------------
+  // Core subsystems that depend on time
+  // ----------------------------------------------------------
+  debug_log("setup", "serial_init");
   serial_init();
+  debug_log("setup", "clock_init");
   clock_init();
+  debug_log("setup", "event_bus_init");
   event_bus_init();
+  debug_log("setup", "system_init");
   system_init();
+
+  // ----------------------------------------------------------
+  // Process framework
+  // ----------------------------------------------------------
+  debug_log("setup", "process_init");
   process_init();
 
+  // ----------------------------------------------------------
+  // Register processes
+  // ----------------------------------------------------------
+  debug_log("setup", "process_timepop_register");
+  process_timepop_register();
+  debug_log("setup", "process_clocks_register");
   process_clocks_register();
+  debug_log("setup", "process_laser_register");
   process_laser_register();
+  debug_log("setup", "process_start(PROCESS_TYPE_LASER)");
   process_start(PROCESS_TYPE_LASER);
+  debug_log("setup", "process_photodiode_register");
   process_photodiode_register();
+  debug_log("setup", "process_start(PROCESS_TYPE_PHOTODIODE)");
   process_start(PROCESS_TYPE_PHOTODIODE);
+  debug_log("setup", "process_tempest_register");
   process_tempest_register();
 
-  // Arm CPU usage sampler AFTER timepop_init()
-  timepop_schedule(
-      1000,
-      TIMEPOP_UNITS_MILLISECONDS,
-      cpu_usage_tick,
-      nullptr,
-      "cpu-usage"
+  // ----------------------------------------------------------
+  // Arm recurring CPU usage sampler
+  // ----------------------------------------------------------
+  //
+  // One call.
+  // No durations.
+  // No self-reschedule.
+  //
+  debug_log("setup", "timepop_arm(TIMEPOP_CLASS_CPU_SAMPLE)");
+  timepop_arm(
+    TIMEPOP_CLASS_CPU_SAMPLE,
+    true,                    // recurring
+    cpu_usage_tick,
+    nullptr,
+    "cpu-usage"
   );
 
+  // ----------------------------------------------------------
+  // Signal readiness
+  // ----------------------------------------------------------
+  debug_log("setup", "enqueueEvent(BOOT)");
   enqueueEvent("BOOT", "\"status\":\"READY\"");
 }
 
@@ -67,7 +112,7 @@ void setup() {
 // -----------------------------------------------------------------------------
 
 void loop() {
-
-  // Dispatch interrupt-authorized callbacks
-  timepop_dispatch();
+    timepop_dispatch();
 }
+
+

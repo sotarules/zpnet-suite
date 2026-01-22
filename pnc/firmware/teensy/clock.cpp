@@ -63,7 +63,7 @@ static bool gpt2_armed = false;
 // --------------------------------------------------------------
 // Forward declarations
 // --------------------------------------------------------------
-static void clock_guard_tick(void*);
+static void clock_guard_tick(timepop_ctx_t*, void*);
 extern "C" void gpt1_isr(void);
 extern "C" void gpt2_isr(void);
 
@@ -148,9 +148,9 @@ void clock_init() {
   gpt2_arm_external_clock_pin14();
   gpt1_arm_internal_freerun();
 
-  timepop_schedule(
-    2000,
-    TIMEPOP_UNITS_MILLISECONDS,
+  timepop_arm(
+    TIMEPOP_CLASS_GUARD,
+    true,                 // recurring
     clock_guard_tick,
     nullptr,
     "clock-guard"
@@ -160,15 +160,8 @@ void clock_init() {
 // --------------------------------------------------------------
 // Guard tick
 // --------------------------------------------------------------
-static void clock_guard_tick(void*) {
+static void clock_guard_tick(timepop_ctx_t*, void*) {
   (void)clock_dwt_cycles_now();
-  timepop_schedule(
-    2000,
-    TIMEPOP_UNITS_MILLISECONDS,
-    clock_guard_tick,
-    nullptr,
-    "clock-guard"
-  );
 }
 
 // --------------------------------------------------------------

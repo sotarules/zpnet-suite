@@ -1,7 +1,21 @@
 // ============================================================================
 // FILE: event_bus.cpp
 // ============================================================================
+//
+// ZPNet Event Bus (Durable Truth Queue)
+//
+// Core contract:
+//   • Enqueue facts freely.
+//   • Emit nothing unless explicitly asked.
+//   • Drain ONLY in scheduled (non-ISR) context.
+//   • No polling in loop().
+//   • TimePop owns cadence; event_bus does NOT self-schedule.
+//
+// ============================================================================
+
 #include "event_bus.h"
+
+#include "debug.h"
 #include "transport.h"
 #include "util.h"
 #include "timepop.h"
@@ -17,38 +31,38 @@ static size_t evt_tail = 0;
 static size_t evt_count = 0;
 static uint32_t evt_dropped = 0;
 
-// Uncomment for imperative diagnostics
+// Uncomment for imperative diagnostics (bypasses durability semantics)
 // #define EVENTBUS_IMMEDIATE_DIAGNOSTICS
 
 // --------------------------------------------------------------
-// TimePop-driven drain scheduling (new)
+// Drain request state (cross-context flags)
 // --------------------------------------------------------------
-//
-// Design constraints:
-//   • event_bus owns its own cadence (self-rescheduling TimePop callback)
-//   • no work in ISR
-//   • no polling in zpnet_loop()
-//   • NO unsolicited serial output:
-//       - the tick emits nothing unless a drain has been explicitly requested
-//
-// Behavioral contract:
-//   • command plane requests a drain via event_bus_request_drain()
-//   • event_bus tick performs drain in scheduled context
-//
-static constexpr uint32_t EVENTBUS_TICK_INTERVAL_MS = 5;
-
-static volatile bool g_drain_requested  = false;
+static volatile bool g_drain_requested   = false;
 static volatile bool g_drain_in_progress = false;
 
-static void eventbus_tick(void*);
+// --------------------------------------------------------------
+// Forward declarations
+// --------------------------------------------------------------
+static void eventbus_tick(timepop_ctx_t* timer, void* user);
 
 // --------------------------------------------------------------
-// Internal helpers
+// Optional debug tick (rate-limited to 1 Hz)
 // --------------------------------------------------------------
-//
-// Emit a protocol-control message (NOT an event).
-// If body == nullptr, only the control field is emitted.
-//
+static uint32_t last_tick_ms = 0;
+
+static void maybe_debug_tick(const char* tag) {
+  uint32_t now = millis();
+  if (now - last_tick_ms >= 1000) {
+    last_tick_ms = now;
+  }
+}
+
+// --------------------------------------------------------------
+// Internal helpers — protocol/control vs. fact emission
+// --------------------------------------------------------------
+
+// Emit a protocol-control message (NOT a durable event).
+// If body == nullptr, only {"control":"X"} is emitted.
 static inline void emitControlMessage(
     const char* control,
     const String* body
@@ -61,7 +75,7 @@ static inline void emitControlMessage(
 
   if (body && body->length() > 0) {
     out += ",";
-    out += *body;
+    out += *body;   // already a JSON fragment
   }
 
   out += "}";
@@ -74,9 +88,8 @@ static inline void emitControlMessage(const char* control) {
   emitControlMessage(control, nullptr);
 }
 
-//
 // Emit a factual event message (durable truth).
-//
+// Body must already be a valid JSON fragment WITHOUT braces.
 static inline void emitEventMessage(
     const char* type,
     const String& body
@@ -107,45 +120,39 @@ static bool dequeueEvent(EventItem& out) {
 }
 
 // --------------------------------------------------------------
-// Public API (new)
+// Public API (TimePop-owned lifecycle)
 // --------------------------------------------------------------
-void event_bus_init() {
-  // Reset scheduler state
-  g_drain_requested = false;
+void event_bus_init(void) {
+  g_drain_requested   = false;
   g_drain_in_progress = false;
 
-  // Arm first tick (self-scheduling thereafter)
-  timepop_schedule(
-      EVENTBUS_TICK_INTERVAL_MS,
-      TIMEPOP_UNITS_MILLISECONDS,
-      eventbus_tick,
-      nullptr,
-      "event-bus"
+  // Arm recurring event bus tick.
+  // TimePop owns cadence; this module does NOT self-reschedule.
+  timepop_arm(
+    TIMEPOP_CLASS_EVENTBUS,
+    true,                 // recurring
+    eventbus_tick,
+    nullptr,
+    "event-bus"
   );
 }
 
-void event_bus_request_drain() {
-  // Idempotent: multiple requests collapse to one drain opportunity.
+void event_bus_request_drain(void) {
+  // Idempotent: multiple requests collapse to one opportunity.
   g_drain_requested = true;
 }
 
 // --------------------------------------------------------------
-// Public API (existing)
+// Public API (durable truth queue)
 // --------------------------------------------------------------
 void enqueueEvent(const char* type, const String& body) {
 
 #ifdef EVENTBUS_IMMEDIATE_DIAGNOSTICS
-  // ------------------------------------------------------------
-  // Diagnostic mode:
-  // Emit immediately, bypassing queue and durability semantics.
-  // ------------------------------------------------------------
+  // Diagnostic mode: emit immediately (NOT durable).
   emitEventMessage(type, body);
   return;
 #endif
 
-  // ------------------------------------------------------------
-  // Normal durable mode (unchanged)
-  // ------------------------------------------------------------
   if (evt_count >= EVT_MAX) {
     evt_dropped++;
     return;
@@ -159,10 +166,12 @@ void enqueueEvent(const char* type, const String& body) {
   evt_count++;
 }
 
-void drainEventsNow() {
-  // ------------------------------------------------------------
+// --------------------------------------------------------------
+// Drain (protocol framing + factual events)
+// --------------------------------------------------------------
+void drainEventsNow(void) {
+
   // Protocol control: EVENTS_BEGIN
-  // ------------------------------------------------------------
   {
     String meta;
     meta += "\"count\":";
@@ -173,27 +182,23 @@ void drainEventsNow() {
     emitControlMessage("EVENTS_BEGIN", &meta);
   }
 
-  // ------------------------------------------------------------
   // Drain queued events (pure facts)
-  // ------------------------------------------------------------
   EventItem e;
   while (dequeueEvent(e)) {
     String body;
-
-    // Body is already a valid JSON fragment (no braces)
     if (e.body[0]) {
-      body += e.body;
+      body += e.body;  // already JSON fragment
     }
-
     emitEventMessage(e.type, body);
   }
 
-  // ------------------------------------------------------------
   // Protocol control: EVENTS_END
-  // ------------------------------------------------------------
   emitControlMessage("EVENTS_END");
 }
 
+// --------------------------------------------------------------
+// Convenience helpers (queue-only)
+// --------------------------------------------------------------
 void enqueueAckEvent(const char* cmd) {
   String b;
   b += "\"cmd\":\"";
@@ -220,40 +225,36 @@ void enqueueErrEvent(const char* cmd, const char* msg) {
   enqueueEvent("ERR", b);
 }
 
-uint32_t eventQueueDepth() {
+// --------------------------------------------------------------
+// Diagnostics
+// --------------------------------------------------------------
+uint32_t eventQueueDepth(void) {
   return (uint32_t)evt_count;
 }
 
-uint32_t eventDroppedCount() {
+uint32_t eventDroppedCount(void) {
   return evt_dropped;
 }
 
 // --------------------------------------------------------------
 // TimePop tick (scheduled context)
 // --------------------------------------------------------------
-static void eventbus_tick(void*) {
-  // ------------------------------------------------------------
+static void eventbus_tick(timepop_ctx_t* /*timer*/, void* /*user*/) {
+
+  // Optional visibility (rate-limited)
+  maybe_debug_tick("eventbus");
+
   // No unsolicited output:
-  // Only drain if an explicit request has been made.
-  // ------------------------------------------------------------
+  // only drain when explicitly requested.
   if (g_drain_requested && !g_drain_in_progress) {
 
-    // Claim the drain (collapse multiple requests)
-    g_drain_requested = false;
+    // Claim the drain (collapse concurrent requests)
+    g_drain_requested   = false;
     g_drain_in_progress = true;
 
-    // Perform full drain in scheduled context (NOT ISR)
+    // Drain in scheduled context (NOT ISR)
     drainEventsNow();
 
     g_drain_in_progress = false;
   }
-
-  // Self-reschedule (module owns its cadence)
-  timepop_schedule(
-      EVENTBUS_TICK_INTERVAL_MS,
-      TIMEPOP_UNITS_MILLISECONDS,
-      eventbus_tick,
-      nullptr,
-      "event-bus"
-  );
 }

@@ -1,25 +1,43 @@
 #pragma once
 
-#include <Arduino.h>
+#include <stdint.h>
+#include <stddef.h>
 
 // -----------------------------------------------------------------------------
-// Debug logging (USB Serial only)
-//
-// This module provides a simple, imperative debug output channel
-// over USB Serial (Serial).
-//
-// Design goals:
-//   • Out-of-band (does not use transport or event bus)
-//   • No scheduling, no buffering, no framing
-//   • Intended for human visibility via `screen`
-//   • Safe to call from normal code paths (NOT ISRs)
-//
+// Lifecycle
 // -----------------------------------------------------------------------------
 
-// Initialize USB debug serial (call from setup())
-void debug_init();
+void debug_init(void);
 
-// Log a debug message
-//   name: short tag (e.g. "CMD", "EVENTBUS", "PROCESS")
-//   body: free-form message (JSON OK, but not required)
-void debug_log(const char* name, const char* body);
+// -----------------------------------------------------------------------------
+// Core logging entry points
+// -----------------------------------------------------------------------------
+
+void debug_log(const char* name, const char* msg);
+
+// -----------------------------------------------------------------------------
+// Overloads for common scalar types
+// -----------------------------------------------------------------------------
+
+void debug_log(const char* name, int value);
+void debug_log(const char* name, unsigned int value);
+void debug_log(const char* name, int32_t value);
+void debug_log(const char* name, uint32_t value);
+void debug_log(const char* name, int64_t value);
+void debug_log(const char* name, uint64_t value);
+void debug_log(const char* name, float value);
+void debug_log(const char* name, double value);
+void debug_log(const char* name, bool value);
+void debug_log(const char* name, const void* ptr);
+
+// -----------------------------------------------------------------------------
+// Buffer / blob logging
+// -----------------------------------------------------------------------------
+
+void debug_log(const char* name, const uint8_t* buf, size_t len);
+
+// -----------------------------------------------------------------------------
+// Optional convenience macro (safe, minimal)
+// -----------------------------------------------------------------------------
+
+#define DEBUG(name, value) debug_log((name), (value))

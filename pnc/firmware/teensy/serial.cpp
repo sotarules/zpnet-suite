@@ -42,7 +42,7 @@ static constexpr uint32_t USB_ATTACH_TIMEOUT_MS = 2000;
 // Forward declarations
 // -----------------------------------------------------------------------------
 
-static void serial_rx_tick(void*);
+static void serial_rx_tick(timepop_ctx_t* /*timer*/, void* /*user*/);
 
 // -----------------------------------------------------------------------------
 // Transport RX callback
@@ -97,37 +97,24 @@ void serial_init() {
     // -------------------------------------------------------------------------
     // Arm RX ingestion loop (explicit causality via TimePop)
     // -------------------------------------------------------------------------
-    timepop_schedule(
-        SERIAL_RX_INTERVAL_MS,
-        TIMEPOP_UNITS_MILLISECONDS,
-        serial_rx_tick,
-        nullptr,
-        "serial-rx"
+    bool ok = timepop_arm(
+      TIMEPOP_CLASS_RX_POLL,
+      true,
+      serial_rx_tick,
+      nullptr,
+      "serial-rx"
     );
 }
 
 // -----------------------------------------------------------------------------
 // RX ingestion (TimePop-authorized, scheduled context)
 // -----------------------------------------------------------------------------
+static void serial_rx_tick(timepop_ctx_t* /*timer*/, void* /*user*/) {
 
-static void serial_rx_tick(void*) {
-    // Drain RX buffer.
-    // NOTE:
-    //   available() is the ONLY correct test for incoming data.
-    //   Do NOT use boolean semantics here.
     while (ZPNET_SERIAL.available()) {
-        char c = (char)ZPNET_SERIAL.read();
-        transport_ingest_byte(c);
+      char c = (char)ZPNET_SERIAL.read();
+      transport_ingest_byte(c);
     }
-
-    // Self-reschedule next ingestion window
-    timepop_schedule(
-        SERIAL_RX_INTERVAL_MS,
-        TIMEPOP_UNITS_MILLISECONDS,
-        serial_rx_tick,
-        nullptr,
-        "serial-rx"
-    );
 }
 
 // -----------------------------------------------------------------------------

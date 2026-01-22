@@ -4,55 +4,158 @@
 // -----------------------------------------------------------------------------
 // Configuration
 // -----------------------------------------------------------------------------
-//
-// NOTE:
-//   This is a *hardware UART* (Serial2), NOT USB CDC.
-//   There is no concept of host attachment or readiness.
-//   Once begin() is called, TX is electrically live.
-//
 
 static constexpr uint32_t DEBUG_BAUD = 115200;
+static constexpr uint32_t DEBUG_ENUM_TIMEOUT_MS = 20000;
 
-// Small settle delay after UART enable (defensive, cheap)
-static constexpr uint32_t DEBUG_SETTLE_MS = 10;
+// -----------------------------------------------------------------------------
+// Internal helpers
+// -----------------------------------------------------------------------------
+
+static inline bool debug_ready() {
+    return SerialUSB1;
+}
+
+static void debug_prefix(const char* name) {
+    SerialUSB1.print("[");
+    SerialUSB1.print(millis());
+    SerialUSB1.print("] ");
+    if (name && *name) {
+        SerialUSB1.print(name);
+        SerialUSB1.print(": ");
+    }
+}
 
 // -----------------------------------------------------------------------------
 // Initialization
 // -----------------------------------------------------------------------------
 
-void debug_init() {
-    // Enable UART peripheral and drive TX pin
-    Serial2.begin(DEBUG_BAUD);
+void debug_init(void) {
 
-    // Allow hardware to settle (no host semantics involved)
-    delay(DEBUG_SETTLE_MS);
+    SerialUSB1.begin(DEBUG_BAUD);
 
-    // Emit a visible, unconditional banner
-    Serial2.println();
-    Serial2.println("=== ZPNet Serial Debug Online ===");
+    uint32_t start = millis();
+    while (!SerialUSB1 && (millis() - start) < DEBUG_ENUM_TIMEOUT_MS) {
+        // wait briefly for host enumeration
+    }
+
+    if (SerialUSB1) {
+        SerialUSB1.println();
+        SerialUSB1.println("=== ZPNet USB Debug Online ===");
+        SerialUSB1.flush();
+    }
 }
 
 // -----------------------------------------------------------------------------
-// Logging
+// Core string logger
 // -----------------------------------------------------------------------------
 
-void debug_log(const char* name, const char* body) {
-    // IMPORTANT:
-    //   Do NOT test `if (!Serial2)`.
-    //   UARTs are always electrically present once begun.
+void debug_log(const char* name, const char* msg) {
 
-    Serial2.print("[");
-    Serial2.print(millis());
-    Serial2.print("] ");
+    if (!debug_ready()) return;
 
-    if (name && *name) {
-        Serial2.print(name);
-        Serial2.print(": ");
+    debug_prefix(name);
+    if (msg) {
+        SerialUSB1.print(msg);
+    }
+    SerialUSB1.println();
+    SerialUSB1.flush();
+}
+
+// -----------------------------------------------------------------------------
+// Scalar overloads
+// -----------------------------------------------------------------------------
+
+void debug_log(const char* name, int value) {
+    if (!debug_ready()) return;
+    debug_prefix(name);
+    SerialUSB1.print(value);
+    SerialUSB1.println();
+}
+
+void debug_log(const char* name, unsigned int value) {
+    if (!debug_ready()) return;
+    debug_prefix(name);
+    SerialUSB1.print(value);
+    SerialUSB1.println();
+}
+
+void debug_log(const char* name, int32_t value) {
+    if (!debug_ready()) return;
+    debug_prefix(name);
+    SerialUSB1.print(value);
+    SerialUSB1.println();
+}
+
+void debug_log(const char* name, uint32_t value) {
+    if (!debug_ready()) return;
+    debug_prefix(name);
+    SerialUSB1.print(value);
+    SerialUSB1.println();
+}
+
+void debug_log(const char* name, int64_t value) {
+    if (!debug_ready()) return;
+    debug_prefix(name);
+    SerialUSB1.print((long long)value);
+    SerialUSB1.println();
+}
+
+void debug_log(const char* name, uint64_t value) {
+    if (!debug_ready()) return;
+    debug_prefix(name);
+    SerialUSB1.print((unsigned long long)value);
+    SerialUSB1.println();
+}
+
+void debug_log(const char* name, float value) {
+    if (!debug_ready()) return;
+    debug_prefix(name);
+    SerialUSB1.print(value, 6);
+    SerialUSB1.println();
+}
+
+void debug_log(const char* name, double value) {
+    if (!debug_ready()) return;
+    debug_prefix(name);
+    SerialUSB1.print(value, 9);
+    SerialUSB1.println();
+}
+
+void debug_log(const char* name, bool value) {
+    if (!debug_ready()) return;
+    debug_prefix(name);
+    SerialUSB1.print(value ? "true" : "false");
+    SerialUSB1.println();
+}
+
+void debug_log(const char* name, const void* ptr) {
+    if (!debug_ready()) return;
+    debug_prefix(name);
+    SerialUSB1.print("0x");
+    SerialUSB1.print((uintptr_t)ptr, HEX);
+    SerialUSB1.println();
+}
+
+// -----------------------------------------------------------------------------
+// Buffer logger (hex dump, compact)
+// -----------------------------------------------------------------------------
+
+void debug_log(const char* name, const uint8_t* buf, size_t len) {
+
+    if (!debug_ready()) return;
+
+    debug_prefix(name);
+    SerialUSB1.print("len=");
+    SerialUSB1.print(len);
+    SerialUSB1.print(" [");
+
+    for (size_t i = 0; i < len; i++) {
+        if (i) SerialUSB1.print(' ');
+        if (buf[i] < 16) SerialUSB1.print('0');
+        SerialUSB1.print(buf[i], HEX);
     }
 
-    if (body && *body) {
-        Serial2.print(body);
-    }
-
-    Serial2.println();
+    SerialUSB1.print("]");
+    SerialUSB1.println();
 }
