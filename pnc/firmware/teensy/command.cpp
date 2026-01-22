@@ -115,8 +115,8 @@ static bool extractCmd(const char* line, char* out, size_t out_sz) {
     return true;
 }
 
-static bool parseProcessType(const char* line, process_type_t& out) {
-    if (strstr(line, "\"type\":\"GNSS\"")) { out = PROCESS_TYPE_GNSS; return true; }
+static bool parseProcessType(const char* line, process_type_t& out) {\
+    if (strstr(line, "\"type\":\"CLOCKS\"")) { out = PROCESS_TYPE_CLOCKS; return true; }
     if (strstr(line, "\"type\":\"LASER\"")) { out = PROCESS_TYPE_LASER; return true; }
     if (strstr(line, "\"type\":\"PHOTODIODE\"")) { out = PROCESS_TYPE_PHOTODIODE; return true; }
     if (strstr(line, "\"type\":\"TEMPEST\"")) { out = PROCESS_TYPE_TEMPEST; return true; }

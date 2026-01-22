@@ -9,7 +9,7 @@
 // --------------------------------------------------
 typedef enum {
   PROCESS_TYPE_NONE = 0,
-  PROCESS_TYPE_GNSS,
+  PROCESS_TYPE_CLOCKS,
   PROCESS_TYPE_LASER,
   PROCESS_TYPE_PHOTODIODE,
   PROCESS_TYPE_TEMPEST,

@@ -1,11 +1,13 @@
 #include "debug.h"
 #include "system.h"
+#include "clock.h"
 #include "timepop.h"
 #include "event_bus.h"
 #include "serial.h"
 #include "laser.h"
 #include "cpu_usage.h"
 #include "process.h"
+#include "process_clocks.h"
 #include "process_laser.h"
 #include "process_photodiode.h"
 #include "process_tempest.h"
@@ -36,10 +38,12 @@ void setup() {
   debug_init();
   timepop_init();
   serial_init();
+  clock_init();
   event_bus_init();
   system_init();
   process_init();
 
+  process_clocks_register();
   process_laser_register();
   process_start(PROCESS_TYPE_LASER);
   process_photodiode_register();
