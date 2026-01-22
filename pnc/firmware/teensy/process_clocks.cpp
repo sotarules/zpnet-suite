@@ -24,45 +24,57 @@ static void clocks_stop(void) {
 // ================================================================
 
 // ------------------------------------------------------------
-// REPORT — dump raw synthetic clocks
+// REPORT — dump raw ledgers + synthetic nanosecond clocks
 // ------------------------------------------------------------
 static String cmd_report(const char*) {
-  uint64_t dwt  = dwt_now();
-  uint64_t gnss = gnss_now();
-  uint64_t ocxo = ocxo_now();
 
-  uint64_t gnss_prescaled_ticks = clock_gnss_prescaled_ticks();
-  uint64_t ocxo_prescaled_ticks = clock_ocxo_prescaled_ticks();
+  // Raw authoritative ledgers
+  uint64_t dwt_cycles      = clock_dwt_cycles_now();
+  uint64_t gnss_10khz      = clock_gnss_10khz_ticks();
+  uint64_t ocxo_10khz      = clock_ocxo_10khz_ticks();
+
+  // Synthetic nanosecond clocks
+  uint64_t dwt_ns          = clock_dwt_ns_now();
+  uint64_t gnss_ns         = clock_gnss_ns_now();
+  uint64_t ocxo_ns         = clock_ocxo_ns_now();
 
   String r = "{";
 
+  // ----------------------------------------------------------
+  // Raw ledgers
+  // ----------------------------------------------------------
   r += "\"dwt_cycles\":";
-  r += dwt;
+  r += dwt_cycles;
 
-  r += ",\"gnss_ticks\":";
-  r += gnss;
+  r += ",\"gnss_10khz_ticks\":";
+  r += gnss_10khz;
 
-  r += ",\"ocxo_ticks\":";
-  r += ocxo;
+  r += ",\"ocxo_10khz_ticks\":";
+  r += ocxo_10khz;
 
-  r += ",\"gnss_prescaled_ticks\":";
-  r += gnss_prescaled_ticks;
+  // ----------------------------------------------------------
+  // Synthetic nanosecond clocks
+  // ----------------------------------------------------------
+  r += ",\"dwt_ns\":";
+  r += dwt_ns;
 
-  r += ",\"ocxo_prescaled_ticks\":";
-  r += ocxo_prescaled_ticks;
+  r += ",\"gnss_ns\":";
+  r += gnss_ns;
+
+  r += ",\"ocxo_ns\":";
+  r += ocxo_ns;
 
   r += "}";
 
   return r;
 }
 
+
 // ------------------------------------------------------------
 // CLEAR — zero all synthetic clocks
 // ------------------------------------------------------------
 static String cmd_clear(const char*) {
-  dwt_zero();
-  gnss_zero();
-  ocxo_zero();
+  clock_zero_all();
 
   enqueueEvent("CLOCKS_CLEAR", "\"action\":\"all_zeroed\"");
 

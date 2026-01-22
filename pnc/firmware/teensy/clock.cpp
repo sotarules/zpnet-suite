@@ -4,30 +4,24 @@
 //
 // ZPNet Clock Subsystem — Hardware-Prescaled Edge Provider
 //
-// Responsibilities:
-//   • Arm GPT hardware safely
-//   • Enable hardware prescaling (÷1000 → 10 kHz)
-//   • Maintain monotonic 64-bit synthetic clocks
-//   • Maintain diagnostic prescaled tick counters
-//   • Deliver prescaled edge interrupts to SmartPOP
-//
-// NON-RESPONSIBILITIES:
-//   • No scheduling policy
-//   • No client callbacks
-//   • No SmartPOP logic
+// Provides:
+//   • Raw monotonic ledgers (DWT, GNSS 10kHz, OCXO 10kHz)
+//   • Prescaled hardware edge delivery
+//   • Synthetic nanosecond clocks (integer math, reconciled)
+//   • SmartPOP edge dispatch
 //
 // Author: The Mule + GPT
 //
 
 #include "clock.h"
 #include "timepop.h"
-#include "smartpop.h"   // forward dependency (implemented later)
+#include "smartpop.h"
 
 #include <Arduino.h>
 #include "imxrt.h"
 
 // --------------------------------------------------------------
-// DWT Registers (core-local)
+// DWT Registers
 // --------------------------------------------------------------
 #define DEMCR               (*(volatile uint32_t *)0xE000EDFC)
 #define DEMCR_TRCENA        (1 << 24)
@@ -37,39 +31,41 @@
 #define DWT_CTRL_CYCCNTENA  (1 << 0)
 
 // --------------------------------------------------------------
-// Configuration
+// Prescale configuration
 // --------------------------------------------------------------
 #define GPT_PRESCALE_DIVIDER   1000u
 #define GPT_PRESCALE_VALUE     (GPT_PRESCALE_DIVIDER - 1)
 
 // --------------------------------------------------------------
-// Internal synthetic time state (monotonic 64-bit)
+// Canonical ledgers
 // --------------------------------------------------------------
-static uint64_t dwt_acc   = 0;
-static uint32_t dwt_last  = 0;
 
-static uint64_t gnss_acc  = 0;
-static uint32_t gnss_last = 0;
+// Raw DWT cycles (≈600 MHz), wrap-safe
+static uint64_t dwt_cycles_64 = 0;
+static uint32_t dwt_cycles_last = 0;
 
-static uint64_t ocxo_acc  = 0;
-static uint32_t ocxo_last = 0;
-
-// --------------------------------------------------------------
-// Diagnostic prescaled tick counters (10 kHz domains)
-// --------------------------------------------------------------
-static volatile uint64_t gnss_prescaled_ticks = 0;
-static volatile uint64_t ocxo_prescaled_ticks = 0;
+// GNSS / OCXO prescaled tick domains (10 kHz)
+static volatile uint64_t gnss_10khz_ticks = 0;
+static volatile uint64_t ocxo_10khz_ticks = 0;
 
 // --------------------------------------------------------------
-// Arm-once flags
+// Interpolation baselines (captured at prescaled edges)
 // --------------------------------------------------------------
-static volatile bool gpt1_armed = false;
-static volatile bool gpt2_armed = false;
+static volatile uint32_t gnss_dwt_baseline = 0;
+static volatile uint32_t ocxo_dwt_baseline = 0;
+
+// --------------------------------------------------------------
+// Arm flags
+// --------------------------------------------------------------
+static bool gpt1_armed = false;
+static bool gpt2_armed = false;
 
 // --------------------------------------------------------------
 // Forward declarations
 // --------------------------------------------------------------
 static void clock_guard_tick(void*);
+extern "C" void gpt1_isr(void);
+extern "C" void gpt2_isr(void);
 
 // --------------------------------------------------------------
 // DWT enable
@@ -78,91 +74,80 @@ static void dwt_enable() {
   DEMCR |= DEMCR_TRCENA;
   DWT_CYCCNT = 0;
   DWT_CTRL |= DWT_CTRL_CYCCNTENA;
-  dwt_last = DWT_CYCCNT;
+  dwt_cycles_last = DWT_CYCCNT;
 }
 
 // --------------------------------------------------------------
-// Clock gating — BUS gates only (proven-safe)
+// Clock gating
 // --------------------------------------------------------------
 static inline void enable_gpt1_bus_gate() {
-#if defined(CCM_CCGR1_GPT1_BUS)
   CCM_CCGR1 |= CCM_CCGR1_GPT1_BUS(CCM_CCGR_ON);
-#else
-# error "Missing CCM_CCGR1_GPT1_BUS"
-#endif
 }
 
 static inline void enable_gpt2_bus_gate() {
-#if defined(CCM_CCGR0_GPT2_BUS)
   CCM_CCGR0 |= CCM_CCGR0_GPT2_BUS(CCM_CCGR_ON);
-#else
-# error "Missing CCM_CCGR0_GPT2_BUS"
-#endif
 }
 
 // --------------------------------------------------------------
-// GPT2 — GNSS external clock, prescaled in hardware (10 MHz → 10 kHz)
+// GPT2 — GNSS external clock (10 MHz → 10 kHz)
 // --------------------------------------------------------------
-static inline void gpt2_arm_external_clock_pin14() {
+static void gpt2_arm_external_clock_pin14() {
   if (gpt2_armed) return;
 
   enable_gpt2_bus_gate();
 
-  // Pin 14 = GPIO_AD_B1_02, ALT8 → GPT2_CLK
   IOMUXC_SW_MUX_CTL_PAD_GPIO_AD_B1_02 = 8;
   IOMUXC_SW_PAD_CTL_PAD_GPIO_AD_B1_02 =
-      IOMUXC_PAD_HYS |
-      IOMUXC_PAD_PKE |
-      IOMUXC_PAD_PUE |
-      IOMUXC_PAD_DSE(4);
+      IOMUXC_PAD_HYS | IOMUXC_PAD_PKE | IOMUXC_PAD_PUE | IOMUXC_PAD_DSE(4);
 
   IOMUXC_GPT2_IPP_IND_CLKIN_SELECT_INPUT = 1;
 
   GPT2_CR = 0;
   GPT2_SR = 0x3F;
-  GPT2_PR = GPT_PRESCALE_VALUE;      // ÷1000 hardware prescaler
-  GPT2_CR = GPT_CR_CLKSRC(3);         // external clock
-  GPT2_CR |= GPT_CR_EN;
+  GPT2_PR = GPT_PRESCALE_VALUE;
+  GPT2_CR = GPT_CR_CLKSRC(3) | GPT_CR_FRR;
 
+  GPT2_OCR1 = GPT2_CNT + 1;
+  GPT2_IR |= GPT_IR_OF1IE;
+
+  attachInterruptVector(IRQ_GPT2, gpt2_isr);
+  NVIC_ENABLE_IRQ(IRQ_GPT2);
+
+  GPT2_CR |= GPT_CR_EN;
   gpt2_armed = true;
 }
 
 // --------------------------------------------------------------
-// GPT1 — OCXO baseline free-run, prescaled in hardware
+// GPT1 — OCXO prescaled free-run
 // --------------------------------------------------------------
-static inline void gpt1_arm_internal_freerun() {
+static void gpt1_arm_internal_freerun() {
   if (gpt1_armed) return;
 
   enable_gpt1_bus_gate();
 
   GPT1_CR = 0;
   GPT1_SR = 0x3F;
-  GPT1_PR = GPT_PRESCALE_VALUE;      // ÷1000 hardware prescaler
+  GPT1_PR = GPT_PRESCALE_VALUE;
   GPT1_CR = GPT_CR_CLKSRC(1) | GPT_CR_FRR;
-  GPT1_CR |= GPT_CR_EN;
 
+  GPT1_OCR1 = GPT1_CNT + 1;
+  GPT1_IR  |= GPT_IR_OF1IE;
+
+  attachInterruptVector(IRQ_GPT1, gpt1_isr);
+  NVIC_ENABLE_IRQ(IRQ_GPT1);
+
+  GPT1_CR |= GPT_CR_EN;
   gpt1_armed = true;
 }
 
 // --------------------------------------------------------------
-// Seeding
-// --------------------------------------------------------------
-static void gnss_seed() { gnss_last = GPT2_CNT; }
-static void ocxo_seed() { ocxo_last = GPT1_CNT; }
-
-// --------------------------------------------------------------
-// Public initialization
+// Init
 // --------------------------------------------------------------
 void clock_init() {
   dwt_enable();
-
   gpt2_arm_external_clock_pin14();
   gpt1_arm_internal_freerun();
 
-  gnss_seed();
-  ocxo_seed();
-
-  // Guard tick prevents rollover loss (lazy reconciliation)
   timepop_schedule(
     2000,
     TIMEPOP_UNITS_MILLISECONDS,
@@ -173,13 +158,10 @@ void clock_init() {
 }
 
 // --------------------------------------------------------------
-// Guard tick — prevents rollover loss
+// Guard tick
 // --------------------------------------------------------------
 static void clock_guard_tick(void*) {
-  (void)dwt_now();
-  (void)gnss_now();
-  (void)ocxo_now();
-
+  (void)clock_dwt_cycles_now();
   timepop_schedule(
     2000,
     TIMEPOP_UNITS_MILLISECONDS,
@@ -190,77 +172,81 @@ static void clock_guard_tick(void*) {
 }
 
 // --------------------------------------------------------------
-// GPT interrupt delegation + diagnostic tick counting
+// GPT ISRs — prescaled edge truth
 // --------------------------------------------------------------
+extern "C" void gpt2_isr(void) {
+  GPT2_SR = GPT_SR_OF1;
+  GPT2_OCR1 += 1;
+
+  gnss_10khz_ticks++;
+  gnss_dwt_baseline = DWT_CYCCNT;
+
+  smartpop_gnss_tick();
+}
 
 extern "C" void gpt1_isr(void) {
-  GPT1_SR = 0x3F;          // clear all status flags
-  ocxo_prescaled_ticks++; // diagnostic
-  smartpop_ocxo_tick();   // delegate
-}
+  GPT1_SR = GPT_SR_OF1;
+  GPT1_OCR1 += 1;
 
-extern "C" void gpt2_isr(void) {
-  GPT2_SR = 0x3F;          // clear all status flags
-  gnss_prescaled_ticks++; // diagnostic
-  smartpop_gnss_tick();   // delegate
-}
+  ocxo_10khz_ticks++;
+  ocxo_dwt_baseline = DWT_CYCCNT;
 
-// --------------------------------------------------------------
-// Query — lazy reconciliation (prescaled domains)
-// --------------------------------------------------------------
-uint64_t dwt_now() {
-  uint32_t now   = DWT_CYCCNT;
-  uint32_t delta = now - dwt_last;
-  dwt_acc  += (uint64_t)delta;
-  dwt_last  = now;
-  return dwt_acc;
-}
-
-uint64_t gnss_now() {
-  if (!gpt2_armed) return gnss_acc;
-  uint32_t now   = GPT2_CNT;
-  uint32_t delta = now - gnss_last;
-  gnss_acc += (uint64_t)delta;
-  gnss_last = now;
-  return gnss_acc;
-}
-
-uint64_t ocxo_now() {
-  if (!gpt1_armed) return ocxo_acc;
-  uint32_t now   = GPT1_CNT;
-  uint32_t delta = now - ocxo_last;
-  ocxo_acc += (uint64_t)delta;
-  ocxo_last = now;
-  return ocxo_acc;
+  smartpop_ocxo_tick();
 }
 
 // --------------------------------------------------------------
-// Diagnostic prescaled tick accessors
+// Raw accessors
 // --------------------------------------------------------------
-uint64_t clock_gnss_prescaled_ticks() {
-  return gnss_prescaled_ticks;
+uint64_t clock_dwt_cycles_now() {
+  uint32_t now = DWT_CYCCNT;
+  dwt_cycles_64 += (uint32_t)(now - dwt_cycles_last);
+  dwt_cycles_last = now;
+  return dwt_cycles_64;
 }
 
-uint64_t clock_ocxo_prescaled_ticks() {
-  return ocxo_prescaled_ticks;
+uint64_t clock_gnss_10khz_ticks() { return gnss_10khz_ticks; }
+uint64_t clock_ocxo_10khz_ticks() { return ocxo_10khz_ticks; }
+
+// --------------------------------------------------------------
+// Synthetic nanosecond clocks (integer math)
+// --------------------------------------------------------------
+static constexpr uint64_t NS_PER_10KHZ_TICK = 100000; // 100 µs
+
+uint64_t clock_dwt_ns_now() {
+  // ns = cycles * (5 / 3)
+  return (clock_dwt_cycles_now() * 5ull) / 3ull;
+}
+
+uint64_t clock_gnss_ns_now() {
+  uint64_t base_ns = gnss_10khz_ticks * NS_PER_10KHZ_TICK;
+  uint32_t delta_cycles = DWT_CYCCNT - gnss_dwt_baseline;
+
+  uint64_t interp_ns = (delta_cycles * 5ull) / 3ull;
+  if (interp_ns > NS_PER_10KHZ_TICK) interp_ns = NS_PER_10KHZ_TICK;
+
+  return base_ns + interp_ns;
+}
+
+uint64_t clock_ocxo_ns_now() {
+  uint64_t base_ns = ocxo_10khz_ticks * NS_PER_10KHZ_TICK;
+  uint32_t delta_cycles = DWT_CYCCNT - ocxo_dwt_baseline;
+
+  uint64_t interp_ns = (delta_cycles * 5ull) / 3ull;
+  if (interp_ns > NS_PER_10KHZ_TICK) interp_ns = NS_PER_10KHZ_TICK;
+
+  return base_ns + interp_ns;
 }
 
 // --------------------------------------------------------------
-// Optional zeroing (synthetic + prescaled domains)
+// Zeroing
 // --------------------------------------------------------------
-void dwt_zero() {
-  dwt_acc  = 0;
-  dwt_last = DWT_CYCCNT;
-}
+void clock_zero_all() {
+  dwt_cycles_64 = 0;
+  dwt_cycles_last = DWT_CYCCNT;
 
-void gnss_zero() {
-  gnss_acc             = 0;
-  gnss_last            = gpt2_armed ? GPT2_CNT : 0;
-  gnss_prescaled_ticks = 0;
-}
+  gnss_10khz_ticks = 0;
+  ocxo_10khz_ticks = 0;
 
-void ocxo_zero() {
-  ocxo_acc             = 0;
-  ocxo_last            = gpt1_armed ? GPT1_CNT : 0;
-  ocxo_prescaled_ticks = 0;
+  gnss_dwt_baseline = DWT_CYCCNT;
+  ocxo_dwt_baseline = DWT_CYCCNT;
 }

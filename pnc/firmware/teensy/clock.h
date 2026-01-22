@@ -1,44 +1,131 @@
 // =============================================================
 // FILE: clock.h
 // =============================================================
+//
+// ZPNet Clock Subsystem — Public Interface
+//
+// Exposes:
+//   • Raw monotonic ledgers
+//   • Prescaled (10 kHz) hardware-derived tick counts
+//   • Synthetic nanosecond clocks (integer math, reconciled)
+//   • Explicit zeroing
+//
+// IMPORTANT SEMANTICS:
+//   • GNSS / OCXO tick domains are PRESCALED TO 10 kHz
+//     (100 microseconds per tick — NOT 10 MHz)
+//   • Nanosecond clocks are SYNTHETIC but PHYSICALLY ANCHORED
+//
+// Author: The Mule + GPT
+//
+
 #pragma once
 
 #include <stdint.h>
 
-// ------------------------------------------------------------
-// CLOCK SUBSYSTEM — Lazy Reconciliation + Global Guard Tick
-//
-// Unified 64-bit synthetic clocks for:
-//   • DWT  (CPU cycles, ~600 MHz, 32-bit hardware counter)
-//   • GNSS (GPT2, 10 MHz GNSS VCLOCK, 32-bit hardware counter)
-//   • OCXO (GPT1, 10 MHz Kyocera REF, 32-bit hardware counter)
-//
-// Philosophy:
-//   • Each *_now() reconciles its 32-bit counter into a 64-bit accumulator.
-//   • Wrap-safe deltas (unsigned subtraction).
-//   • Clocks are "correct on demand".
-//   • A single global guard tick prevents rollover loss even if
-//     no code queries clocks for a while.
-//
-// No per-process ownership.
-// No prescalers.
-// No clock-specific ISRs.
-// ------------------------------------------------------------
+// --------------------------------------------------------------
+// Initialization
+// --------------------------------------------------------------
 
-// Initialize the clock subsystem (must be called from setup()).
-// Enables DWT and seeds GPT domains, then starts rollover guard tick.
+/**
+ * Initialize the clock subsystem.
+ *
+ * Arms GPT hardware, enables prescaling, and starts
+ * monotonic ledger tracking.
+ *
+ * Must be called once during system startup.
+ */
 void clock_init(void);
 
-// Query current synthetic time (monotonic 64-bit)
-uint64_t dwt_now(void);
-uint64_t gnss_now(void);
-uint64_t ocxo_now(void);
+// --------------------------------------------------------------
+// Raw ledgers (authoritative, monotonic)
+// --------------------------------------------------------------
 
-// Prescaled tick counters (10 kHz domains)
-uint64_t clock_gnss_prescaled_ticks();
-uint64_t clock_ocxo_prescaled_ticks();
+/**
+ * Return the current 64-bit DWT cycle count (wrap-safe).
+ *
+ * Units:
+ *   • cycles at ~600 MHz
+ *
+ * This is the highest-resolution monotonic counter.
+ */
+uint64_t clock_dwt_cycles_now(void);
 
-// Optional: zero accumulated clocks (resets accumulator + reseeds last)
-void dwt_zero(void);
-void gnss_zero(void);
-void ocxo_zero(void);
+/**
+ * Return GNSS-derived prescaled tick count.
+ *
+ * Units:
+ *   • 10 kHz ticks (100 microseconds per tick)
+ *
+ * NOT 10 MHz.
+ */
+uint64_t clock_gnss_10khz_ticks(void);
+
+/**
+ * Return OCXO-derived prescaled tick count.
+ *
+ * Units:
+ *   • 10 kHz ticks (100 microseconds per tick)
+ *
+ * NOT 10 MHz.
+ */
+uint64_t clock_ocxo_10khz_ticks(void);
+
+// --------------------------------------------------------------
+// Synthetic nanosecond clocks
+// --------------------------------------------------------------
+
+/**
+ * Return synthetic nanoseconds derived from DWT cycles.
+ *
+ * Units:
+ *   • nanoseconds since last zero
+ *
+ * Resolution:
+ *   • ~1.67 ns (5/3 ns per cycle)
+ *
+ * Monotonic, not externally anchored.
+ */
+uint64_t clock_dwt_ns_now(void);
+
+/**
+ * Return synthetic nanoseconds anchored to GNSS pulses.
+ *
+ * Units:
+ *   • nanoseconds since last zero
+ *
+ * Behavior:
+ *   • Reconciled on every 10 kHz GNSS-derived edge
+ *   • Linearly interpolated between edges using DWT
+ *   • Error bounded to < 100 microseconds
+ */
+uint64_t clock_gnss_ns_now(void);
+
+/**
+ * Return synthetic nanoseconds anchored to OCXO pulses.
+ *
+ * Units:
+ *   • nanoseconds since last zero
+ *
+ * Behavior:
+ *   • Reconciled on every 10 kHz OCXO-derived edge
+ *   • Linearly interpolated between edges using DWT
+ *   • Error bounded to < 100 microseconds
+ */
+uint64_t clock_ocxo_ns_now(void);
+
+// --------------------------------------------------------------
+// Control
+// --------------------------------------------------------------
+
+/**
+ * Zero all clock ledgers.
+ *
+ * Effects:
+ *   • Resets DWT cycle ledger
+ *   • Resets GNSS and OCXO 10 kHz tick counts
+ *   • Resets nanosecond epochs
+ *
+ * Safe to call when clocks are running.
+ */
+void clock_zero_all(void);
+

@@ -64,10 +64,10 @@ uint64_t tempest_confirm(
 
   attachInterrupt(GNSS_VCLK_PIN, tempest_confirm_start_isr, RISING);
   while (!start_edge_seen) {
-    dwt_now();
+    clock_dwt_cycles_now();
   }
 
-  uint64_t start_cycles = dwt_now();
+  uint64_t start_cycles = clock_dwt_cycles_now();
 
   CCM_CCGR0 |= CCM_CCGR0_GPT2_BUS(CCM_CCGR_ON);
 
@@ -90,7 +90,7 @@ uint64_t tempest_confirm(
   uint32_t gpt_start = GPT2_CNT;
 
   while ((uint64_t)(GPT2_CNT - gpt_start) < target_ext_ticks) {
-    dwt_now();
+    clock_dwt_cycles_now();
   }
 
   IOMUXC_SW_MUX_CTL_PAD_GPIO_AD_B1_02 = 5;
@@ -100,10 +100,10 @@ uint64_t tempest_confirm(
 
   attachInterrupt(GNSS_VCLK_PIN, tempest_confirm_end_isr, RISING);
   while (!end_edge_seen) {
-    dwt_now();
+    clock_dwt_cycles_now();
   }
 
-  uint64_t end_cycles = dwt_now();
+  uint64_t end_cycles = clock_dwt_cycles_now();
 
   uint64_t delta_cpu_cycles =
       end_cycles - start_cycles;
