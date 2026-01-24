@@ -32,11 +32,9 @@ static void cpu_usage_tick(timepop_ctx_t* timer, void* /*user*/) {
 // -----------------------------------------------------------------------------
 
 void setup() {
-
-  debug_init();
-
+  delay(100);   // allow USB enumeration to fully settle
   debug_blink("1155");
-
+  debug_init();
   debug_log("setup", "*fire*");
 
   // ----------------------------------------------------------

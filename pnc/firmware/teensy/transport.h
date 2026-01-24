@@ -19,9 +19,12 @@
 //
 // =============================================================
 
-// Defensive payload bound
-static constexpr size_t TRANSPORT_MAX_PAYLOAD = 512;
+// -------------------------------------------------------------
+// Transport size limits (authoritative)
+// -------------------------------------------------------------
 
+static constexpr size_t TRANSPORT_MAX_PAYLOAD = 512;
+static constexpr size_t TRANSPORT_MAX_MESSAGE = TRANSPORT_MAX_PAYLOAD + 32;
 
 // -------------------------------------------------------------
 // Lifecycle
