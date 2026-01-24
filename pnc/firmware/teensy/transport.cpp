@@ -13,59 +13,61 @@
 // -------------------------------------------------------------
 // Configuration
 // -------------------------------------------------------------
+//
+// IMPORTANT (Teensy RawHID semantics):
+//   • RawHID.send()/recv() operate on a fixed 64-byte PAYLOAD.
+//   • There is NO explicit report-id byte visible here.
+//   • Multiplexing must be done in-band.
+//   • In our policy:
+//       - Debug channel uses an in-band marker 0xD0 (handled in debug.cpp).
+//       - Transport frames are plain ASCII beginning with "<STX=".
+//
 
 static constexpr size_t   HID_PACKET_SIZE   = 64;
 static constexpr uint32_t HID_RX_TIMEOUT_MS = 0;
 
-// Report IDs
-static constexpr uint8_t HID_REPORT_TRANSPORT = 0x00;
-
 // -------------------------------------------------------------
-// RX parser state machine
+// Framing constants
 // -------------------------------------------------------------
 
-enum RxState {
-  RX_IDLE,
-  RX_STX,
-  RX_LEN,
-  RX_PAYLOAD,
-  RX_ETX
-};
-
-static RxState rx_state = RX_IDLE;
-
-static size_t expected_len = 0;
-static size_t received_len = 0;
-static size_t etx_pos      = 0;
-
+static constexpr uint8_t ASCII_LT = (uint8_t)'<';
 static const char ETX_SEQ[] = "<ETX>";
+static constexpr size_t ETX_LEN = 5;
 
 // -------------------------------------------------------------
-// Helpers
+// RX ingestion (TimePop-owned)
 // -------------------------------------------------------------
+//
+// Strategy:
+//   • Accumulate RawHID payload bytes into a binary-safe buffer.
+//   • Ignore zero padding bytes (host pads HID reports).
+//   • Scan for "<STX=" inside the buffer.
+//   • When a full frame is present, extract JSON and dispatch.
+//   • Consume exactly one frame per TimePop tick (intentional throttling).
+//
+// Hardening:
+//   • If buffer approaches capacity, compact to the next '<' or reset.
+//   • If malformed framing is detected, drop forward to re-sync.
 
-static inline void rx_reset() {
-  rx_state     = RX_IDLE;
-  expected_len = 0;
-  received_len = 0;
-  etx_pos      = 0;
+static inline void compact_or_reset(uint8_t* buf, size_t& len) {
+  if (len < sizeof(buf)) return;
+
+  // Find next plausible frame start
+  size_t stx = 0;
+  while (stx < len && buf[stx] != ASCII_LT) stx++;
+
+  if (stx >= len) {
+    len = 0;
+    return;
+  }
+
+  // Compact from that point
+  memmove(buf, buf + stx, len - stx);
+  len -= stx;
 }
-
-static inline bool is_digit(char c) {
-  return (c >= '0' && c <= '9');
-}
-
-static inline bool is_printable(char c) {
-  return (c >= 32 && c <= 126);
-}
-
-// -------------------------------------------------------------
-// RX scheduling (TimePop-owned)
-// -------------------------------------------------------------
 
 static void transport_rx_tick(timepop_ctx_t*, void*) {
 
-  // Persistent binary accumulator
   static uint8_t buf[512];
   static size_t  len = 0;
 
@@ -73,23 +75,40 @@ static void transport_rx_tick(timepop_ctx_t*, void*) {
   int n = RawHID.recv(hid, HID_RX_TIMEOUT_MS);
   if (n <= 0) return;
 
-  // Append HID payload (binary-safe)
-  for (int i = 0; i < n && len < sizeof(buf); i++) {
-    buf[len++] = hid[i];
+  // -----------------------------------------------------------
+  // Append HID payload bytes (binary-safe), skipping zero padding
+  // -----------------------------------------------------------
+  for (int i = 0; i < n; i++) {
+    uint8_t b = hid[i];
+
+    // Host-side HID writes are zero-padded; transport is ASCII framed.
+    if (b == 0x00) continue;
+
+    if (len >= sizeof(buf)) {
+      compact_or_reset(buf, len);
+      if (len >= sizeof(buf)) {
+        // Still full -> hard reset
+        len = 0;
+      }
+    }
+
+    buf[len++] = b;
   }
 
-  // We need at least "<STX=1><ETX>" to proceed
+  // Need at least "<STX=1><ETX>" (11 bytes) before we can possibly parse
   if (len < 11) return;
 
-  // Scan buffer for frame start
+  // -----------------------------------------------------------
+  // Scan for a framed message start
+  // -----------------------------------------------------------
   for (size_t i = 0; i + 5 < len; i++) {
 
     // Match "<STX="
     if (buf[i] != '<' ||
-        buf[i+1] != 'S' ||
-        buf[i+2] != 'T' ||
-        buf[i+3] != 'X' ||
-        buf[i+4] != '=') {
+        buf[i + 1] != 'S' ||
+        buf[i + 2] != 'T' ||
+        buf[i + 3] != 'X' ||
+        buf[i + 4] != '=') {
       continue;
     }
 
@@ -103,60 +122,77 @@ static void transport_rx_tick(timepop_ctx_t*, void*) {
     }
 
     // Expect '>'
-    if (j >= len || buf[j] != '>') {
-      return; // header incomplete
+    if (j >= len) {
+      // Header incomplete (need more bytes)
+      return;
     }
-
-    size_t json_start = j + 1;
-
-    // Need JSON + "<ETX>"
-    if (json_start + msg_len + 5 > len) {
-      return; // frame incomplete
-    }
-
-    // Verify "<ETX>"
-    size_t etx = json_start + msg_len;
-    if (buf[etx]     != '<' ||
-        buf[etx + 1] != 'E' ||
-        buf[etx + 2] != 'T' ||
-        buf[etx + 3] != 'X' ||
-        buf[etx + 4] != '>') {
-      // Malformed frame: drop everything up to '<'
+    if (buf[j] != '>') {
+      // Malformed header -> drop up to the next byte after '<' and resync
       memmove(buf, buf + i + 1, len - (i + 1));
       len -= (i + 1);
       return;
     }
 
-    // Null-terminate JSON in place
-    static char json[TRANSPORT_MAX_PAYLOAD + 1];
-    if ((size_t)msg_len >= sizeof(json)) {
-      len = 0;
+    // Bounds check payload
+    if (msg_len <= 0 || (size_t)msg_len > TRANSPORT_MAX_PAYLOAD) {
+      // Impossible or out-of-policy length -> resync
+      memmove(buf, buf + i + 1, len - (i + 1));
+      len -= (i + 1);
       return;
     }
 
-    memcpy(json, buf + json_start, msg_len);
+    size_t json_start = j + 1;
+
+    // Need JSON + "<ETX>"
+    if (json_start + (size_t)msg_len + ETX_LEN > len) {
+      // Frame incomplete (need more bytes)
+      return;
+    }
+
+    // Verify "<ETX>"
+    size_t etx = json_start + (size_t)msg_len;
+    if (buf[etx]     != '<' ||
+        buf[etx + 1] != 'E' ||
+        buf[etx + 2] != 'T' ||
+        buf[etx + 3] != 'X' ||
+        buf[etx + 4] != '>') {
+      // Malformed frame -> drop forward to next '<'
+      memmove(buf, buf + i + 1, len - (i + 1));
+      len -= (i + 1);
+      return;
+    }
+
+    // Copy JSON into a null-terminated buffer
+    static char json[TRANSPORT_MAX_PAYLOAD + 1];
+    memcpy(json, buf + json_start, (size_t)msg_len);
     json[msg_len] = '\0';
 
-    // Dispatch
+    // Dispatch to command layer
     command_exec(json);
 
-    // Consume frame from buffer
-    size_t consumed = etx + 5;
+    // Consume frame bytes from accumulator
+    size_t consumed = etx + ETX_LEN;
     memmove(buf, buf + consumed, len - consumed);
     len -= consumed;
 
-    return; // one frame per TimePop (intentional)
+    // One frame per tick (intentional throttling)
+    return;
+  }
+
+  // If we scanned the buffer and found no '<STX=', trim leading noise.
+  // Keep a small tail in case "<STX=" straddles a boundary.
+  if (len > 64) {
+    size_t keep = 64;
+    memmove(buf, buf + (len - keep), keep);
+    len = keep;
   }
 }
-
 
 // -------------------------------------------------------------
 // Lifecycle
 // -------------------------------------------------------------
 
 void transport_init(void) {
-
-  rx_reset();
 
   debug_log("transport", "*init*");
 
@@ -173,6 +209,40 @@ void transport_init(void) {
 // -------------------------------------------------------------
 // TX (framed egress)
 // -------------------------------------------------------------
+//
+// IMPORTANT:
+//   • We send RAW 64-byte payload packets via RawHID.
+//   • No synthetic "report id" byte is included.
+//   • Host will classify debug vs transport in-band:
+//
+//        debug   : payload[0] == 0xD0   (debug.cpp)
+//        transport: payload[0] == '<'   ("<STX=")
+//
+// Hardening:
+//   • Always send full 64-byte packets, zero padded.
+//   • Bound payload size to TRANSPORT_MAX_PAYLOAD.
+
+static inline void hid_send_payload_bytes(const uint8_t* data, size_t len) {
+  if (!data || len == 0) return;
+
+  uint8_t pkt[HID_PACKET_SIZE];
+  size_t offset = 0;
+
+  while (offset < len) {
+    size_t chunk = len - offset;
+    if (chunk > HID_PACKET_SIZE) {
+      chunk = HID_PACKET_SIZE;
+    }
+
+    memset(pkt, 0, sizeof(pkt));
+    memcpy(pkt, data + offset, chunk);
+
+    // RawHID payload is always 64 bytes.
+    RawHID.send(pkt, 50);
+
+    offset += chunk;
+  }
+}
 
 void transport_send_frame(const char* payload, size_t length) {
 
@@ -185,30 +255,9 @@ void transport_send_frame(const char* payload, size_t length) {
 
   static const char etx[] = "<ETX>";
 
-  auto send_bytes = [&](const uint8_t* data, size_t len) {
-    if (!data || !len) return;
-
-    uint8_t pkt[HID_PACKET_SIZE];
-    size_t offset = 0;
-
-    while (offset < len) {
-      size_t chunk = len - offset;
-      if (chunk > HID_PACKET_SIZE - 1) {
-        chunk = HID_PACKET_SIZE - 1;
-      }
-
-      memset(pkt, 0, sizeof(pkt));
-      pkt[0] = HID_REPORT_TRANSPORT;   // report ID
-      memcpy(pkt + 1, data + offset, chunk);
-
-      RawHID.send(pkt, 50);
-      offset += chunk;
-    }
-  };
-
-  send_bytes((const uint8_t*)header, header_len);
-  send_bytes((const uint8_t*)payload, length);
-  send_bytes((const uint8_t*)etx, sizeof(etx) - 1);
+  hid_send_payload_bytes((const uint8_t*)header, (size_t)header_len);
+  hid_send_payload_bytes((const uint8_t*)payload, length);
+  hid_send_payload_bytes((const uint8_t*)etx, sizeof(etx) - 1);
 }
 
 void transport_send_frame(const char* payload) {

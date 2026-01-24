@@ -131,6 +131,8 @@ static bool parseProcessType(const char* line, process_type_t& out) {\
 
 void command_exec(const char* line) {
 
+    debug_log("command msg", line);
+
     uint32_t req_id = 0;
     bool has_req_id = extractReqId(line, req_id);
 
@@ -139,6 +141,8 @@ void command_exec(const char* line) {
         emitError("missing cmd", has_req_id, req_id);
         return;
     }
+
+    debug_log("command", cmd);
 
     // ---------------------------------------------------------
     // SYSTEM CONTROL — TERMINAL ACTIONS
