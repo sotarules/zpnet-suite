@@ -2,6 +2,7 @@
 #include "debug.h"
 #include "command.h"
 #include "event_bus.h"
+#include "timepop.h"
 #include "util.h"
 #include "system.h"
 #include "process.h"
@@ -131,8 +132,6 @@ static bool parseProcessType(const char* line, process_type_t& out) {\
 
 void command_exec(const char* line) {
 
-    debug_log("command msg", line);
-
     uint32_t req_id = 0;
     bool has_req_id = extractReqId(line, req_id);
 
@@ -141,8 +140,6 @@ void command_exec(const char* line) {
         emitError("missing cmd", has_req_id, req_id);
         return;
     }
-
-    debug_log("command", cmd);
 
     // ---------------------------------------------------------
     // SYSTEM CONTROL — TERMINAL ACTIONS
@@ -154,24 +151,28 @@ void command_exec(const char* line) {
     // HalfKay bootloader.
     //
     // Semantics:
-    //   • Best-effort immediate ACK
-    //   • No event bus dependency
+    //   • Immediate OK reply
+    //   • Asynchronous execution
     //   • No process involvement
-    //   • Does not return
+    //   • Guaranteed command-path return
     //
     // This command MUST appear before any process dispatch.
     //
     if (strcmp(cmd, "SYSTEM.ENTER_BOOTLOADER") == 0) {
 
-        // Acknowledge command receipt if a req_id was supplied.
-        // This is best-effort only; the system may reset immediately.
+        // Acknowledge receipt immediately and cleanly
         emitOK(nullptr, has_req_id, req_id);
 
-        // Enter bootloader.
-        // This function does not return.
-        system_enter_bootloader();
+        // Schedule bootloader entry asynchronously
+        timepop_arm(
+            TIMEPOP_CLASS_FLASH,
+            false,                      // one-shot
+            system_enter_bootloader,    // terminal action
+            nullptr,
+            "bootloader-flash"
+        );
 
-        // Absolute fallback — should never execute.
+        // Command handler returns normally
         return;
     }
 

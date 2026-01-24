@@ -3,10 +3,17 @@ ZPNet GNSS Process (Pi-side, authoritative)
 
 This supersedes the Teensy GNSS process.
 
-Semantic contract:
-  • PROCESS.COMMAND type=GNSS proc_cmd=REPORT
-  • Identical payload semantics to process_gnss.cpp
-  • Explicit command surface
+Responsibilities:
+  • Own the GNSS UART
+  • Parse NMEA into authoritative state
+  • Expose derived facts via REPORT
+  • Expose raw NMEA sentences via a live stream socket
+
+Process model:
+  • One systemd service
+  • One acquisition thread (UART)
+  • One blocking command socket (REPORT)
+  • One blocking stream socket (fan-out)
 """
 
 from __future__ import annotations
@@ -17,8 +24,8 @@ import os
 import socket
 import threading
 import time
-from dataclasses import dataclass, field
-from typing import Dict, Optional
+from dataclasses import dataclass
+from typing import Dict, Optional, Set
 
 import serial
 
@@ -29,11 +36,13 @@ import serial
 
 GNSS_DEVICE = os.environ.get("ZPNET_GNSS_PORT", "/dev/zpnet-gnss-serial")
 GNSS_BAUD   = int(os.environ.get("ZPNET_GNSS_BAUD", "38400"))
-SOCKET_PATH = "/tmp/zpnet-gnss.sock"
+
+CMD_SOCKET_PATH    = "/tmp/zpnet-gnss.sock"
+STREAM_SOCKET_PATH = "/tmp/zpnet-gnss-stream.sock"
 
 
 # ------------------------------------------------------------------
-# Authoritative GNSS State (isomorphic to gnss_state_t)
+# Authoritative GNSS State
 # ------------------------------------------------------------------
 
 @dataclass
@@ -85,12 +94,56 @@ GNSS = GnssState()
 
 
 # ------------------------------------------------------------------
-# Helpers
+# Sentence stream fan-out
 # ------------------------------------------------------------------
 
-def startswith(s: str, p: str) -> bool:
-    return s.startswith(p)
+_stream_clients: Set[socket.socket] = set()
+_stream_lock = threading.Lock()
 
+
+def publish_sentence(line: str) -> None:
+    """Send a raw NMEA sentence to all connected stream clients."""
+    if not line:
+        return
+
+    payload = (line + "\n").encode("utf-8", errors="ignore")
+
+    with _stream_lock:
+        dead = []
+        for conn in _stream_clients:
+            try:
+                conn.sendall(payload)
+            except Exception:
+                dead.append(conn)
+
+        for conn in dead:
+            _stream_clients.discard(conn)
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
+def stream_server() -> None:
+    """Blocking stream socket; clients receive live NMEA sentences."""
+    try:
+        os.unlink(STREAM_SOCKET_PATH)
+    except FileNotFoundError:
+        pass
+
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as srv:
+        srv.bind(STREAM_SOCKET_PATH)
+        srv.listen()
+
+        while True:
+            conn, _ = srv.accept()
+            with _stream_lock:
+                _stream_clients.add(conn)
+
+
+# ------------------------------------------------------------------
+# Helpers
+# ------------------------------------------------------------------
 
 def nmea_latlon_to_deg(ddmm: str, hemi: str) -> float:
     if not ddmm or not hemi:
@@ -108,7 +161,7 @@ def nmea_latlon_to_deg(ddmm: str, hemi: str) -> float:
 
 
 # ------------------------------------------------------------------
-# Sentence Parsers (RMC is king)
+# Sentence Parsers
 # ------------------------------------------------------------------
 
 def parse_rmc(line: str) -> None:
@@ -176,13 +229,12 @@ def extract_discipline(line: str) -> None:
 # ------------------------------------------------------------------
 
 def ingest_line(line: str) -> None:
-    if not line:
-        return
-
     GNSS.last_sentence = line
     GNSS.last_rx_ts = time.time()
 
-    if startswith(line, "$PERDCRZ,"):
+    publish_sentence(line)
+
+    if line.startswith("$PERDCRZ,"):
         GNSS.last_crz = line
         extract_discipline(line)
         if "$GNRMC," in line:
@@ -191,22 +243,22 @@ def ingest_line(line: str) -> None:
             parse_rmc(rmc)
         return
 
-    if startswith(line, ("$GNRMC,", "$GPRMC,")):
+    if line.startswith(("$GNRMC,", "$GPRMC,")):
         GNSS.last_rmc = line
         parse_rmc(line)
-    elif startswith(line, ("$GNGGA,", "$GPGGA,")):
+    elif line.startswith(("$GNGGA,", "$GPGGA,")):
         GNSS.last_gga = line
         parse_gga(line)
-    elif startswith(line, "$GNGSA,"):
+    elif line.startswith("$GNGSA,"):
         GNSS.last_gsa = line
         parse_gsa(line)
-    elif startswith(line, "$GPZDA,"):
+    elif line.startswith("$GPZDA,"):
         GNSS.last_zda = line
-    elif startswith(line, ("$GPGSV,", "$GAGSV,")):
+    elif line.startswith(("$GPGSV,", "$GAGSV,")):
         GNSS.last_gsv = line
-    elif startswith(line, "$PERDCRW,"):
+    elif line.startswith("$PERDCRW,"):
         GNSS.last_crw = line
-    elif startswith(line, "$PERDCRX,"):
+    elif line.startswith("$PERDCRX,"):
         GNSS.last_crx = line
 
 
@@ -232,7 +284,7 @@ def gnss_reader() -> None:
 
 
 # ------------------------------------------------------------------
-# REPORT Command (semantic clone of cmd_report)
+# REPORT Command
 # ------------------------------------------------------------------
 
 def cmd_report(_: Optional[dict]) -> Dict:
@@ -260,34 +312,24 @@ def cmd_report(_: Optional[dict]) -> Dict:
         }.items() if v
     }
 
-    return {
-        "success": True,
-        "message": "OK",
-        "payload": p,
-    }
+    return {"success": True, "message": "OK", "payload": p}
+
+
+COMMANDS = {"REPORT": cmd_report}
 
 
 # ------------------------------------------------------------------
-# Command Table (extensible)
-# ------------------------------------------------------------------
-
-COMMANDS = {
-    "REPORT": cmd_report,
-}
-
-
-# ------------------------------------------------------------------
-# Socket Server
+# Command Socket Server
 # ------------------------------------------------------------------
 
 def command_server() -> None:
     try:
-        os.unlink(SOCKET_PATH)
+        os.unlink(CMD_SOCKET_PATH)
     except FileNotFoundError:
         pass
 
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as srv:
-        srv.bind(SOCKET_PATH)
+        srv.bind(CMD_SOCKET_PATH)
         srv.listen()
 
         while True:
@@ -297,15 +339,11 @@ def command_server() -> None:
                 if not data:
                     continue
                 req = json.loads(data.decode())
-                cmd = req.get("cmd")
-                args = req.get("args")
-
-                handler = COMMANDS.get(cmd)
-                if not handler:
-                    resp = {"success": False, "message": "unrecognized command"}
-                else:
-                    resp = handler(args)
-
+                handler = COMMANDS.get(req.get("cmd"))
+                resp = handler(req.get("args")) if handler else {
+                    "success": False,
+                    "message": "unrecognized command"
+                }
                 conn.sendall(json.dumps(resp).encode())
 
 
@@ -315,4 +353,5 @@ def command_server() -> None:
 
 def run() -> None:
     threading.Thread(target=gnss_reader, daemon=True).start()
+    threading.Thread(target=stream_server, daemon=True).start()
     command_server()

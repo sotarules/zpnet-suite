@@ -18,15 +18,18 @@
 #define TIMEPOP_MAX_SLOTS   16       // hard upper bound (tune later)
 
 // Fixed cadence per class (in ticks)
-static const uint32_t CLASS_PERIOD_TICKS[TIMEPOP_CLASS_COUNT] = {
-  [TIMEPOP_CLASS_RX_POLL]       = 5,
-  [TIMEPOP_CLASS_EVENTBUS]      = 1,
-  [TIMEPOP_CLASS_CPU_SAMPLE]    = 1000,
-  [TIMEPOP_CLASS_GUARD]         = 500,
-  [TIMEPOP_CLASS_DEBUG_BEACON]  = 10000,
-  [TIMEPOP_CLASS_USER_1]        = 10,
-  [TIMEPOP_CLASS_USER_2]        = 100
-};
+static uint32_t CLASS_PERIOD_TICKS[TIMEPOP_CLASS_COUNT];
+
+static void init_timepop_class_periods() {
+  CLASS_PERIOD_TICKS[TIMEPOP_CLASS_RX_POLL]      = 5;
+  CLASS_PERIOD_TICKS[TIMEPOP_CLASS_EVENTBUS]     = 1;
+  CLASS_PERIOD_TICKS[TIMEPOP_CLASS_CPU_SAMPLE]   = 1000;
+  CLASS_PERIOD_TICKS[TIMEPOP_CLASS_GUARD]        = 500;
+  CLASS_PERIOD_TICKS[TIMEPOP_CLASS_FLASH]        = 20;
+  CLASS_PERIOD_TICKS[TIMEPOP_CLASS_DEBUG_BEACON] = 10000;
+  CLASS_PERIOD_TICKS[TIMEPOP_CLASS_USER_1]       = 10;
+  CLASS_PERIOD_TICKS[TIMEPOP_CLASS_USER_2]       = 100;
+}
 
 // ================================================================
 // Internal Slot
@@ -98,6 +101,9 @@ void pit0_isr(void) {
 // ================================================================
 
 void timepop_init(void) {
+
+  // Initialize class cadence table (must precede any arming)
+  init_timepop_class_periods();
 
   for (uint32_t i = 0; i < TIMEPOP_MAX_SLOTS; i++) {
     slots[i] = {};

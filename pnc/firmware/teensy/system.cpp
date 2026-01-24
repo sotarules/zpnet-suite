@@ -47,30 +47,30 @@ void system_request_shutdown() {
 }
 
 void system_enter_bootloader() {
+
   // Idempotent + higher priority than shutdown
   if (system_bootloader) {
-    // If we somehow get here twice, just halt
     system_enter_quiescence();
   }
 
   system_bootloader = true;
 
-  // Best-effort observability before USB disappears
+  // Best-effort observability
   enqueueEvent(
     "SYSTEM_BOOTLOADER",
     "\"status\":\"ENTERING\""
   );
 
-  // Give the event bus a moment to drain if it can
+  // Allow event bus to drain
   delay(10);
 
   // Visible debug pattern
   debug_blink("911");
 
-  // This never returns
+  // Terminal transition — never returns
   enter_bootloader_cleanly();
 
-  // Absolute fallback (should never execute)
+  // Absolute fallback
   system_enter_quiescence();
 }
 
