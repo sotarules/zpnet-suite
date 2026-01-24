@@ -8,6 +8,7 @@
 // -----------------------------------------------------------------------------
 
 void debug_init(void);
+void debug_beacon(void);
 
 // -----------------------------------------------------------------------------
 // Core logging entry points
@@ -35,6 +36,11 @@ void debug_log(const char* name, const void* ptr);
 // -----------------------------------------------------------------------------
 
 void debug_log(const char* name, const uint8_t* buf, size_t len);
+
+// Blink a visible debug pattern on LED_BUILTIN.
+// Pattern digits define blink duration units.
+// Example: "111511"
+void debug_blink(const char* pattern);
 
 // -----------------------------------------------------------------------------
 // Optional convenience macro (safe, minimal)

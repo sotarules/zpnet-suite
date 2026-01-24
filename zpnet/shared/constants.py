@@ -64,6 +64,9 @@ EMOJI = {
     "heartbeat": "💓",
 }
 
+TEENSY_TRANSPORT = os.environ.get("ZPNET_TEENSY_TRANSPORT", "serial")  # "serial"|"hid"
+TEENSY_HIDRAW_PATH = os.environ.get("ZPNET_TEENSY_HIDRAW", "/dev/zpnet-teensy-hid")
+
 # ---------------------------------------------------------------------
 # Teensy Serial Configuration
 # ---------------------------------------------------------------------

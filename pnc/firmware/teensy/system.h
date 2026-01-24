@@ -21,3 +21,7 @@ void system_enter_quiescence();
 
 // Query terminal state
 bool system_is_shutdown();
+
+// Enter MCU bootloader (no return)
+void system_enter_bootloader();
+

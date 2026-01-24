@@ -1,12 +1,14 @@
+#include "config.h"
 #include "debug.h"
+
 #include "system.h"
 #include "clock.h"
 #include "timepop.h"
 #include "event_bus.h"
-#include "serial.h"
 #include "laser.h"
 #include "cpu_usage.h"
 #include "process.h"
+#include "transport.h"
 
 #include "process_clocks.h"
 #include "process_timepop.h"
@@ -33,6 +35,8 @@ void setup() {
 
   debug_init();
 
+  debug_blink("1155");
+
   debug_log("setup", "*fire*");
 
   // ----------------------------------------------------------
@@ -48,10 +52,14 @@ void setup() {
   timepop_init();
 
   // ----------------------------------------------------------
+  // Transport subsystem
+  // ----------------------------------------------------------
+  debug_log("setup", "transport_init");
+  transport_init();
+
+  // ----------------------------------------------------------
   // Core subsystems that depend on time
   // ----------------------------------------------------------
-  debug_log("setup", "serial_init");
-  serial_init();
   debug_log("setup", "clock_init");
   clock_init();
   debug_log("setup", "event_bus_init");
@@ -105,6 +113,11 @@ void setup() {
   // ----------------------------------------------------------
   debug_log("setup", "enqueueEvent(BOOT)");
   enqueueEvent("BOOT", "\"status\":\"READY\"");
+
+  // ----------------------------------------------------------
+  // Keep stuff flowing in the debug channel during development
+  // ----------------------------------------------------------
+  debug_beacon();
 }
 
 // -----------------------------------------------------------------------------

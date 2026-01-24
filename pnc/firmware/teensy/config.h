@@ -3,11 +3,19 @@
 #include <cstdint>
 #include <cstddef>
 
-// --------------------------------------------------------------
-// ZPNet runtime transport
-// --------------------------------------------------------------
-
 #define ZPNET_SERIAL Serial
+
+// -------------------------------------------------------------
+// Transport backend selection (runtime)
+// -------------------------------------------------------------
+
+typedef enum {
+  TRANSPORT_NONE = 0,
+  TRANSPORT_HID,
+  TRANSPORT_SERIAL
+} transport_backend_t;
+
+static constexpr transport_backend_t ZPNET_TRANSPORT = TRANSPORT_HID;
 
 // --------------------------------------------------------------
 // Base units

@@ -1,101 +1,92 @@
-# ================================================================
-# Teensy 4.1 build + flash helper
-# ================================================================
-# Assumes arduino-cli lives in ../../bin/arduino-cli
-# and teensy_loader_cli is installed in $PATH
+# =============================================================
+# ZPNet Teensy 4.1 build + flash helper
 #
-# Warnings control:
-#   WARNINGS=off   → suppress all compiler warnings (default)
-#   WARNINGS=on    → show full compiler warnings
+# ARCHITECTURAL NOTE:
+#   This firmware uses a SINGLE RawHID interface.
 #
-# USB configuration:
-#   Dual USB Serial (ZPNet + Debug)
+#   • Application traffic and debug output are SOFTWARE-MULTIPLEXED
+#     over one RawHID endpoint.
+#   • No CDC / Serial interface is present.
+#   • USB Type MUST be RawHID.
 #
-# Example:
-#   make flash
-#   make flash WARNINGS=on
-# ================================================================
+#   Debug framing:
+#     pkt[0] = channel selector (e.g. 0xD0 = debug, 0x01 = app)
+#
+# =============================================================
 
-# ------------------------------------------------
-# ccache (speed)
-# ------------------------------------------------
-export CCACHE_CPP2=yes
-export PATH := /usr/lib/ccache:$(PATH)
-# ------------------------------------------------
+NAME        = teensy
+BOARD       = teensy:avr:teensy41:usb=rawhid
+ARDUINO_CLI = ../../bin/arduino-cli
 
-NAME=teensy
+# -------------------------------------------------------------
+# USB configuration (FIXED)
+# -------------------------------------------------------------
 
-# Base board
-BOARD_BASE=teensy:avr:teensy41
+# RawHID only. No CDC, no composite.
+USB_MODE = hid
 
-# USB type: Dual Serial
-USB_TYPE=usb=serial2
+# No serial port exists in RawHID-only mode
+PORT =
+BAUD = 115200
 
-# Full board spec (authoritative)
-BOARD=$(BOARD_BASE):$(USB_TYPE)
-
-PORT=/dev/zpnet-teensy
-BAUD=115200
-ARDUINO_CLI=../../bin/arduino-cli
-
-# ------------------------------------------------
-# Warning control
-# ------------------------------------------------
-
-WARNINGS ?= off
-
-ifeq ($(WARNINGS),on)
-  WARN_FLAGS =
-else
-  WARN_FLAGS = -w
-endif
-
-BUILD_FLAGS = \
-  --build-property compiler.cpp.extra_flags="$(WARN_FLAGS)" \
-  --build-property compiler.c.extra_flags="$(WARN_FLAGS)"
-
-# ------------------------------------------------
+# -------------------------------------------------------------
 # Targets
-# ------------------------------------------------
+# -------------------------------------------------------------
 
 all: build
 
-# Compile sketch into ./build directory
+# -------------------------------------------------------------
+# Build
+# -------------------------------------------------------------
+
 build:
+	@echo "🔧 Building Teensy (USB_RAWHID, single interface, multiplexed)..."
 	$(ARDUINO_CLI) compile \
 	  --fqbn $(BOARD) \
-	  $(BUILD_FLAGS) \
 	  . \
 	  --output-dir ./build
 
-# Upload using arduino-cli (requires Teensy Loader GUI running)
-upload: build
-	$(ARDUINO_CLI) upload -p $(PORT) --fqbn $(BOARD) .
-	@echo "✅ Upload complete (arduino-cli)."
+# -------------------------------------------------------------
+# Flash (HID-based, no button required)
+# -------------------------------------------------------------
 
-# Flash using teensy_loader_cli (headless, no button required)
 flash: build
 	@echo "🚀 Flashing Teensy 4.1 via HID reboot (no button)..."
-	sudo teensy_loader_cli --mcu=TEENSY41 -w -s build/$(NAME).ino.hex
+	sudo teensy_loader_cli \
+	  --mcu=TEENSY41 \
+	  -w -s \
+	  build/$(NAME).ino.hex
 	@echo "✅ Teensy flashed successfully."
 
-# Serial monitor (ZPNet channel)
-monitor:
-	@echo "🔍 Opening serial monitor on $(PORT) at $(BAUD). Press Ctrl-A then K to quit (screen)."
-	screen $(PORT) $(BAUD)
+# -------------------------------------------------------------
+# Upload (CDC) — intentionally unavailable
+# -------------------------------------------------------------
 
-# List connected boards
+upload:
+	@echo "❌ Upload via CDC is unavailable."
+	@echo "   This firmware uses RawHID only."
+	@echo "   Use: make flash"
+
+# -------------------------------------------------------------
+# Serial monitor — intentionally unavailable
+# -------------------------------------------------------------
+
+monitor:
+	@echo "❌ Serial monitor unavailable (RawHID-only firmware)."
+
+# -------------------------------------------------------------
+# Info / utilities
+# -------------------------------------------------------------
+
 info:
 	@echo "ℹ️  Listing connected boards..."
 	$(ARDUINO_CLI) board list
 
-# Clean local build artifacts
 clean:
 	rm -rf build
 
-# Clean local + Arduino CLI global build cache
 clobber: clean
 	@echo "🧹 Removing Arduino CLI global build cache..."
 	rm -rf ~/.arduino15/packages/*/hardware/*/*/build
 
-.PHONY: all build upload flash monitor info clean clobber
+.PHONY: all build flash upload monitor info clean clobber

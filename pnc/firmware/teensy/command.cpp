@@ -141,6 +141,37 @@ void command_exec(const char* line) {
     }
 
     // ---------------------------------------------------------
+    // SYSTEM CONTROL — TERMINAL ACTIONS
+    // ---------------------------------------------------------
+    //
+    // SYSTEM.ENTER_BOOTLOADER
+    //
+    // Authoritative, irreversible transition into the Teensy
+    // HalfKay bootloader.
+    //
+    // Semantics:
+    //   • Best-effort immediate ACK
+    //   • No event bus dependency
+    //   • No process involvement
+    //   • Does not return
+    //
+    // This command MUST appear before any process dispatch.
+    //
+    if (strcmp(cmd, "SYSTEM.ENTER_BOOTLOADER") == 0) {
+
+        // Acknowledge command receipt if a req_id was supplied.
+        // This is best-effort only; the system may reset immediately.
+        emitOK(nullptr, has_req_id, req_id);
+
+        // Enter bootloader.
+        // This function does not return.
+        system_enter_bootloader();
+
+        // Absolute fallback — should never execute.
+        return;
+    }
+
+    // ---------------------------------------------------------
     // EVENT BUS CONTROL
     // ---------------------------------------------------------
     if (strcmp(cmd, "EVENTS.GET") == 0) {

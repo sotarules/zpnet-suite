@@ -19,12 +19,13 @@
 
 // Fixed cadence per class (in ticks)
 static const uint32_t CLASS_PERIOD_TICKS[TIMEPOP_CLASS_COUNT] = {
-  [TIMEPOP_CLASS_RX_POLL]     = 5,
-  [TIMEPOP_CLASS_EVENTBUS]   = 1,
-  [TIMEPOP_CLASS_CPU_SAMPLE] = 1000,
-  [TIMEPOP_CLASS_GUARD]      = 500,
-  [TIMEPOP_CLASS_USER_1]     = 10,
-  [TIMEPOP_CLASS_USER_2]     = 100
+  [TIMEPOP_CLASS_RX_POLL]       = 5,
+  [TIMEPOP_CLASS_EVENTBUS]      = 1,
+  [TIMEPOP_CLASS_CPU_SAMPLE]    = 1000,
+  [TIMEPOP_CLASS_GUARD]         = 500,
+  [TIMEPOP_CLASS_DEBUG_BEACON]  = 10000,
+  [TIMEPOP_CLASS_USER_1]        = 10,
+  [TIMEPOP_CLASS_USER_2]        = 100
 };
 
 // ================================================================
@@ -58,24 +59,6 @@ static uint32_t next_slot_id = 1;
 volatile uint32_t pit_tick_count     = 0;
 volatile uint32_t pit_last_remaining = 0;
 volatile uint32_t pit_zero_hits      = 0;
-
-// ================================================================
-// Cancellation (per-instance)
-// ================================================================
-
-static void ctx_cancel(timepop_ctx_t* self) {
-  uint32_t slot_index = (uint32_t)(uintptr_t)self->cancel; // encoded index
-
-  if (slot_index >= TIMEPOP_MAX_SLOTS) return;
-
-  noInterrupts();
-  slots[slot_index].active  = false;
-  slots[slot_index].expired = false;
-  slots[slot_index].remaining_ticks = 0;
-  interrupts();
-
-  debug_log("timepop", "slot cancelled");
-}
 
 // ================================================================
 // PIT ISR

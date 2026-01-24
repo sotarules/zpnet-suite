@@ -63,10 +63,6 @@ static void laser_inhibit(void) {
   digitalWrite(LD_ON_PIN, LOW);
 }
 
-static void laser_allow(void) {
-  digitalWrite(LD_ON_PIN, HIGH);
-}
-
 // ================================================================
 // Laser State (authoritative snapshot)
 // ================================================================
