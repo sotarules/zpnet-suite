@@ -18,7 +18,6 @@ The Teensy is treated as a remote instrument, not a local device.
 Author: The Mule + GPT
 """
 
-import logging
 import json
 import socket
 from typing import Any, Dict, Optional

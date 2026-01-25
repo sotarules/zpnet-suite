@@ -1,5 +1,5 @@
 """
-ZPNet Dashboard — Stable Render + WebSocket Edition (v2026-01-09)
+ZPNet Dashboard — Stable Render + WebSocket Edition (v2026-01-25)
 
 Terminal-style real-time dashboard using pygame.
 
@@ -8,6 +8,7 @@ Key invariants:
   • No imperative hardware queries in core
   • WebSocket failures must never affect UI
   • Dashboard is an observer, not an instrument
+  • SYSTEM snapshot is the sole source of truth
 
 Author: The Mule + GPT
 """
@@ -24,9 +25,6 @@ from typing import Callable
 import pygame
 import websockets
 
-from zpnet.shared.db import open_db
-
-
 # ---------------------------------------------------------------------
 # Signal Handling
 # ---------------------------------------------------------------------
@@ -37,7 +35,6 @@ def handle_exit(signum: int | None = None, frame: object | None = None) -> None:
 
 signal.signal(signal.SIGINT, handle_exit)
 signal.signal(signal.SIGTERM, handle_exit)
-
 
 # ---------------------------------------------------------------------
 # Config
@@ -57,83 +54,43 @@ LOCKED_REFRESH_S = 5
 WS_HOST = "0.0.0.0"
 WS_PORT = 8765
 
+# ---------------------------------------------------------------------
+# SYSTEM Snapshot Source (authoritative)
+# ---------------------------------------------------------------------
+from zpnet.dashboard.readout_blocks import get_system_snapshot
 
 # ---------------------------------------------------------------------
-# Database Access (read-only, defensive)
-# ---------------------------------------------------------------------
-def fetch_aggregate(name: str) -> dict:
-    try:
-        with open_db(row_dict=True) as conn:
-            cur = conn.cursor()
-            cur.execute(
-                "SELECT payload FROM aggregates WHERE aggregate_type = %s",
-                (name,),
-            )
-            row = cur.fetchone()
-
-        if not row or row["payload"] is None:
-            return {}
-
-        payload = row["payload"]
-        if isinstance(payload, dict):
-            return payload
-        if isinstance(payload, (str, bytes, bytearray)):
-            return json.loads(payload)
-        return {}
-
-    except Exception:
-        return {}
-
-
-# ---------------------------------------------------------------------
-# Health Combiner
-# ---------------------------------------------------------------------
-def combine_health(states: list[str]) -> str:
-    if not states:
-        return "DOWN"
-    if all(s == "NOMINAL" for s in states):
-        return "NOMINAL"
-    if any(s == "DOWN" for s in states):
-        return "DOWN"
-    return "HOLD"
-
-
-# ---------------------------------------------------------------------
-# Header
+# Header (SYSTEM-driven)
 # ---------------------------------------------------------------------
 def header_readout(prefix: str = "") -> list[str]:
-    ag_net = fetch_aggregate("NETWORK_STATUS")
-    ag_bat = fetch_aggregate("BATTERY_STATE_OF_CHARGE")
-    ag_env = fetch_aggregate("ENVIRONMENT_STATUS")
-    ag_gns = fetch_aggregate("GNSS_DATA")
-    ag_las = fetch_aggregate("LASER_STATUS")
-    ag_pow = fetch_aggregate("POWER_STATUS")
-    ag_sen = fetch_aggregate("SENSOR_SCAN")
-    ag_tee = fetch_aggregate("TEENSY_STATUS")
-    ag_pi  = fetch_aggregate("RASPBERRY_PI_STATUS")
+    system = get_system_snapshot() or {}
 
-    ssid = ag_net.get("ssid", "UNKNOWN")
-    batt = ag_bat.get("remaining_pct")
-    batt_str = f"{batt:.1f}%" if batt is not None else "N/A"
+    health_states: list[str] = []
 
-    healths = [
-        ag_net.get("health_state"),
-        ag_bat.get("health_state"),
-        ag_env.get("health_state"),
-        ag_gns.get("health_state"),
-        ag_las.get("health_state"),
-        ag_pow.get("health_state"),
-        ag_sen.get("health_state"),
-        ag_tee.get("health_state"),
-        ag_pi.get("health_state"),
+    for block in system.values():
+        if isinstance(block, dict):
+            state = block.get("health_state")
+            if state:
+                health_states.append(state)
+
+    if not health_states:
+        overall = "DOWN"
+    elif all(state == "NOMINAL" for state in health_states):
+        overall = "NOMINAL"
+    elif any(state == "DOWN" for state in health_states):
+        overall = "DOWN"
+    else:
+        overall = "HOLD"
+
+    ssid = system.get("network", {}).get("ssid", "UNKNOWN")
+
+    return [
+        f"{prefix}NET: {ssid}  SYS: {overall}",
+        "",
     ]
 
-    overall = combine_health([h for h in healths if h])
-    return [f"{prefix}NET: {ssid}  BAT: {batt_str}  SYS: {overall}", ""]
-
-
 # ---------------------------------------------------------------------
-# Readout imports
+# Readout imports (SYSTEM-backed)
 # ---------------------------------------------------------------------
 from zpnet.dashboard.readout_blocks import (
     gnss_report_readout,
@@ -163,7 +120,6 @@ READOUTS: list[Callable[[], Readout]] = [
     raspberry_pi_status_readout,
 ]
 
-
 # ---------------------------------------------------------------------
 # Event Pump (never blocks)
 # ---------------------------------------------------------------------
@@ -179,7 +135,6 @@ def pump_events(locked: bool, idx: int, count: int) -> tuple[bool, int]:
             elif event.key == pygame.K_SPACE and locked:
                 idx = (idx + 1) % count
     return locked, idx
-
 
 # ---------------------------------------------------------------------
 # Renderers
@@ -226,7 +181,6 @@ def render_panel(screen, font, header: list[str], body: list[str]) -> None:
 
     pygame.display.flip()
 
-
 # ---------------------------------------------------------------------
 # WebSocket Surface (hardened)
 # ---------------------------------------------------------------------
@@ -266,7 +220,6 @@ def ws_broadcast(payload: dict) -> None:
         except Exception:
             _ws_clients.discard(ws)
 
-
 # ---------------------------------------------------------------------
 # Main Loop
 # ---------------------------------------------------------------------
@@ -281,7 +234,6 @@ def main() -> None:
     readout_idx = 0
     last_rendered: list[str] | None = None
 
-    # Start WebSocket server
     threading.Thread(target=start_ws_server, daemon=True).start()
 
     while True:
@@ -319,9 +271,7 @@ def main() -> None:
             readout_idx = (readout_idx + 1) % len(READOUTS)
 
         except Exception:
-            # Absolute last-resort containment
             time.sleep(0.2)
-
 
 # ---------------------------------------------------------------------
 # Entrypoint

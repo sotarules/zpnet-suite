@@ -39,17 +39,21 @@ import threading
 import time
 from pathlib import Path
 from statistics import mean
-from typing import Dict, Optional, Tuple
+from typing import Dict, Tuple
+from typing import Optional
 
 import psutil
 import requests
 from smbus2 import SMBus
 
+from zpnet.processes.processes import send_command as send_command_pi
 from zpnet.shared.constants import ZPNET_REMOTE_HOST, ZPNET_TEST_PATH, HTTP_TIMEOUT, EXPECTED_TEST_STRING
 from zpnet.shared.events import create_event
+from zpnet.shared.util import normalize_payload, normalize_ts
 from zpnet.shared.http import gzip_text
 from zpnet.shared.logger import setup_logging
-from zpnet.shared.teensy import send_command
+from zpnet.shared.teensy import send_command as send_command_teensy
+from zpnet.shared.db import open_db
 
 # ------------------------------------------------------------------
 # Configuration
@@ -73,7 +77,7 @@ DEVICE_NAME = platform.node() or "raspberrypi"
 # Hardware constants
 # ------------------------------------------------------------------
 
-I2C_BUS  = 1
+I2C_BUS = 1
 
 LASER_ADDR = 0x66
 
@@ -143,8 +147,13 @@ REG_CURRENT = 0x01
 REG_VOLTAGE = 0x02
 REG_POWER   = 0x03
 
-I2C_BUS = 1
+# ------------------------------------------------------------------
+# Battery monitoring (legacy: battery_monitor)
+# ------------------------------------------------------------------
 
+BATTERY_LABEL = "Battery"
+BATTERY_CAPACITY_WH = 640.0          # example — use your real value
+POWER_SAMPLE_STEP = 5                # same semantics as before
 
 # ------------------------------------------------------------------
 # Authoritative SYSTEM snapshot
@@ -498,7 +507,7 @@ def query_teensy_laser_status() -> dict:
     Query Teensy LASER.REPORT for optical ground truth.
     """
     try:
-        resp = send_command(
+        resp = send_command_teensy(
             "PROCESS.COMMAND",
             {
                 "type": "LASER",
@@ -562,6 +571,65 @@ def build_laser_status() -> dict:
         payload["health_state"] = "DOWN"
 
     return payload
+
+# ------------------------------------------------------------------
+# GNSS helpers (migrated from gnss_monitor)
+# ------------------------------------------------------------------
+
+def build_gnss_status() -> dict:
+    """
+    Build GNSS snapshot for SYSTEM payload.
+
+    Semantics:
+      • GNSS remains the authoritative instrument
+      • SYSTEM transports GNSS facts verbatim
+      • No inference, no aggregation, no synthesis
+      • health_state is SYSTEM-owned
+    """
+
+    payload: dict = {
+        "health_state": "DOWN",
+    }
+
+    try:
+        resp = send_command_pi(
+            "PROCESS.COMMAND",
+            {
+                "type": "GNSS",
+                "proc_cmd": "REPORT",
+            }
+        )
+
+        if not resp or not resp.get("success"):
+            return payload
+
+        g = resp.get("payload", {}) or {}
+
+        # ---------------------------------------------------------
+        # Transport raw GNSS facts (if present)
+        # ---------------------------------------------------------
+        for key in (
+            "date",
+            "time",
+            "discipline",
+            "latitude_deg",
+            "longitude_deg",
+            "altitude_m",
+        ):
+            if key in g:
+                payload[key] = g[key]
+
+        # ---------------------------------------------------------
+        # SYSTEM-owned health classification
+        # ---------------------------------------------------------
+        payload["health_state"] = "NOMINAL"
+
+        return payload
+
+    except Exception:
+        return payload
+
+
 
 # ------------------------------------------------------------------
 # Sensor helpers (migrated from sensor_monitor)
@@ -861,6 +929,221 @@ def build_power_status() -> dict:
 
     return payload
 
+# ------------------------------------------------------------------
+# Battery status helpers
+# ------------------------------------------------------------------
+
+def extract_battery_power_w(system_payload: dict) -> Optional[float]:
+    """
+    Extract battery power (W) from SYSTEM power rails.
+    """
+    power = system_payload.get("power", {})
+    rails = power.get("rails", [])
+
+    for rail in rails:
+        if rail.get("label") == BATTERY_LABEL:
+            return rail.get("power_w")
+
+    return None
+
+
+def get_last_battery_swap_ts() -> Optional[datetime]:
+    with open_db(row_dict=True) as conn:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT ts
+            FROM zpnet_events
+            WHERE event_type = 'SWAP_BATTERY'
+            ORDER BY ts DESC
+            LIMIT 1
+            """
+        )
+        row = cur.fetchone()
+
+    if not row:
+        return None
+
+    return normalize_ts(row["ts"])
+
+def build_battery_status() -> dict:
+    """
+    Build battery state-of-charge snapshot.
+
+    Semantics:
+      • Read-only
+      • Derived from SYSTEM power rails
+      • Integration window anchored at last SWAP_BATTERY
+      • No aggregates
+      • No events emitted
+    """
+
+    payload = {
+        "remaining_pct": None,
+        "tte_minutes": None,
+        "wh_used_since_recharge": None,
+        "wh_remaining_estimate": None,
+        "samples_used": 0,
+        "sample_step": POWER_SAMPLE_STEP,
+        "battery_capacity_wh": BATTERY_CAPACITY_WH,
+        "health_state": "UNKNOWN",
+    }
+
+    # --------------------------------------------------------------
+    # Determine integration start
+    # --------------------------------------------------------------
+    swap_ts = get_last_battery_swap_ts()
+    if not swap_ts:
+        return payload
+
+    # --------------------------------------------------------------
+    # Fetch SYSTEM_STATUS samples since swap
+    # --------------------------------------------------------------
+    with open_db(row_dict=True) as conn:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT ts, payload
+            FROM zpnet_events
+            WHERE event_type = 'SYSTEM_STATUS'
+              AND ts >= %s
+            ORDER BY ts ASC
+            """,
+            (swap_ts,),
+        )
+        rows = cur.fetchall()
+
+    if len(rows) < 2:
+        return payload
+
+    total_wh = 0.0
+    last_ts = None
+    last_power = None
+    samples_used = 0
+
+    # --------------------------------------------------------------
+    # Integrate battery power over time
+    # --------------------------------------------------------------
+    for i in range(0, len(rows), POWER_SAMPLE_STEP):
+        row = rows[i]
+
+        ts = normalize_ts(row["ts"])
+        system = normalize_payload(row["payload"])
+
+        power_w = extract_battery_power_w(system)
+        if power_w is None:
+            continue
+
+        if last_ts is not None and last_power is not None:
+            dt = (ts - last_ts).total_seconds()
+            avg_power = (power_w + last_power) / 2.0
+            total_wh += abs(avg_power * dt / 3600.0)
+            samples_used += 1
+
+        last_ts = ts
+        last_power = power_w
+
+    # --------------------------------------------------------------
+    # Compute remaining capacity
+    # --------------------------------------------------------------
+    remaining_wh = max(0.0, BATTERY_CAPACITY_WH - total_wh)
+    remaining_pct = round(
+        100.0 * remaining_wh / BATTERY_CAPACITY_WH, 1
+    )
+
+    if last_power and last_power > 1.0:
+        tte_minutes = round(remaining_wh / last_power * 60.0, 1)
+    else:
+        tte_minutes = float("inf")
+
+    # --------------------------------------------------------------
+    # Health classification
+    # --------------------------------------------------------------
+    if remaining_pct <= 3:
+        health_state = "DOWN"
+    elif remaining_pct <= 10:
+        health_state = "HOLD"
+    else:
+        health_state = "NOMINAL"
+
+    # --------------------------------------------------------------
+    # Final payload
+    # --------------------------------------------------------------
+    payload.update(
+        {
+            "remaining_pct": remaining_pct,
+            "tte_minutes": tte_minutes,
+            "wh_used_since_recharge": round(total_wh, 2),
+            "wh_remaining_estimate": round(remaining_wh, 2),
+            "samples_used": samples_used,
+            "health_state": health_state,
+        }
+    )
+
+    return payload
+
+
+# ------------------------------------------------------------------
+# Teensy status helpers (migrated from teensy_monitor)
+# ------------------------------------------------------------------
+
+def build_teensy_status() -> dict:
+    """
+    Build Teensy status snapshot for SYSTEM payload.
+
+    Semantics:
+      • Teensy is treated as a peer status producer (like pi, gnss, power)
+      • Returned payload MUST describe the Teensy only
+      • SYSTEM-shaped payloads are explicitly flattened
+      • No recursion is possible by construction
+    """
+
+    payload: dict = {
+        "health_state": "DOWN",
+    }
+
+    try:
+        resp = send_command_teensy(
+            "PROCESS.COMMAND",
+            {
+                "type": "SYSTEM",
+                "proc_cmd": "REPORT",
+            },
+        )
+
+        if not resp or not resp.get("success"):
+            return payload
+
+        raw = resp.get("payload", {}) or {}
+
+        # ---------------------------------------------------------
+        # Normalize payload shape
+        # ---------------------------------------------------------
+        # If Teensy returned a full SYSTEM snapshot, extract its own slice.
+        # Otherwise assume payload already represents Teensy-local facts.
+        if isinstance(raw, dict) and "teensy" in raw:
+            teensy = raw.get("teensy") or {}
+        else:
+            teensy = raw
+
+        if not isinstance(teensy, dict):
+            return payload
+
+        # ---------------------------------------------------------
+        # Copy Teensy facts verbatim (no interpretation)
+        # ---------------------------------------------------------
+        payload.update(teensy)
+
+        # ---------------------------------------------------------
+        # SYSTEM-owned health classification
+        # ---------------------------------------------------------
+        payload["health_state"] = "NOMINAL"
+
+        return payload
+
+    except Exception:
+        return payload
+
 
 # ------------------------------------------------------------------
 # System poller thread
@@ -880,74 +1163,27 @@ def system_poller() -> None:
     global SYSTEM
 
     while True:
-        teensy_payload: dict | None = None
 
-        try:
-            resp = send_command(
-                "PROCESS.COMMAND",
-                {
-                    "type": "SYSTEM",
-                    "proc_cmd": "REPORT",
-                },
-            )
-            if resp and resp.get("success"):
-                teensy_payload = resp.get("payload", {})
-        except Exception:
-            teensy_payload = None
-
-        try:
-            pi_payload = build_pi_status()
-            network_payload = build_network_status()
-        except Exception:
-            pi_payload = {
-                "device_name": DEVICE_NAME,
-                "health_state": "DOWN",
-            }
-            network_payload = {
-                "health_state": "DOWN",
-            }
-
-        try:
-            laser_payload = build_laser_status()
-        except Exception:
-            logging.exception("[system_poller] laser_status collection failed")
-            laser_payload = {
-                "device_present": False,
-                "health_state": "DOWN",
-                "i2c_address": "0x66",
-            }
-
-        try:
-            sensor_payload = build_sensor_scan_status()
-        except Exception:
-            sensor_payload = {}
-
-        try:
-            environment_payload = build_environment_status()
-        except Exception:
-            logging.exception("[system_poller] environment_status collection failed")
-            environment_payload = {
-                "sensor_address": "0x76",
-                "sensor_present": False,
-                "health_state": "DOWN",
-            }
-
-        try:
-            power_payload = build_power_status()
-        except Exception:
-            power_payload = {
-                "health_state": "DOWN",
-                "rails": [],
-            }
+        pi_payload = build_pi_status()
+        teensy_payload = build_teensy_status()
+        network_payload = build_network_status()
+        laser_payload = build_laser_status()
+        sensor_payload = build_sensor_scan_status()
+        environment_payload = build_environment_status()
+        gnss_payload = build_gnss_status()
+        power_payload = build_power_status()
+        battery_payload = build_battery_status()
 
         SYSTEM = {
-            "teensy": teensy_payload,
             "pi": dict(pi_payload),
+            "teensy": dict(teensy_payload),
             "network": dict(network_payload),
             "laser": dict(laser_payload),
             "sensors": dict(sensor_payload),
             "environment": dict(environment_payload),
+            "gnss": dict(gnss_payload),
             "power": dict(power_payload),
+            "battery": dict(battery_payload),
         }
 
         # ----------------------------------------------------------
