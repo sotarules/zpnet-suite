@@ -8,26 +8,26 @@ gzip-compressed request bodies.
 
 Author: The Mule
 """
-
 import logging
+from statistics import mean
 import socket
 import subprocess
 import time
-import requests
 import random
 import string
-import psutil
-from statistics import mean
 
-from zpnet.shared.events import create_event
-from zpnet.shared.logger import setup_logging
+import psutil
+import requests
+
 from zpnet.shared.constants import (
     ZPNET_REMOTE_HOST,
     ZPNET_TEST_PATH,
     EXPECTED_TEST_STRING,
     HTTP_TIMEOUT,
 )
+from zpnet.shared.events import create_event
 from zpnet.shared.http import gzip_text
+from zpnet.shared.logger import setup_logging
 
 
 # ---------------------------------------------------------------------
