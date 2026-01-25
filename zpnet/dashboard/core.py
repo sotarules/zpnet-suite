@@ -65,6 +65,9 @@ from zpnet.dashboard.readout_blocks import get_system_snapshot
 def header_readout(prefix: str = "") -> list[str]:
     system = get_system_snapshot() or {}
 
+    # ------------------------------------------------------------
+    # Collect subsystem health states
+    # ------------------------------------------------------------
     health_states: list[str] = []
 
     for block in system.values():
@@ -82,12 +85,24 @@ def header_readout(prefix: str = "") -> list[str]:
     else:
         overall = "HOLD"
 
+    # ------------------------------------------------------------
+    # Header fields
+    # ------------------------------------------------------------
     ssid = system.get("network", {}).get("ssid", "UNKNOWN")
 
+    battery = system.get("battery", {})
+    remaining_pct = battery.get("remaining_pct")
+
+    if isinstance(remaining_pct, (int, float)):
+        batt_str = f"{remaining_pct:.1f}%"
+    else:
+        batt_str = "N/A"
+
     return [
-        f"{prefix}NET: {ssid}  SYS: {overall}",
+        f"{prefix}NET: {ssid}  BAT: {batt_str}  SYS: {overall}",
         "",
     ]
+
 
 # ---------------------------------------------------------------------
 # Readout imports (SYSTEM-backed)
