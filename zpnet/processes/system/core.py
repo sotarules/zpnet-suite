@@ -138,9 +138,9 @@ SEA_LEVEL_PRESSURE_HPA = 1013.25
 
 DEVICE_CONFIG = {
     0x40: {"label": "Battery",          "ideal_voltage_v": 12.8},
-    0x41: {"label": "3v3 Rail",         "ideal_voltage_v": 3.3},
-    0x44: {"label": "5v0 Rail",         "ideal_voltage_v": 5.0},
-    0x45: {"label": "5v0 Teensy Rail",  "ideal_voltage_v": 5.0},
+    0x41: {"label": "3.3v Rail",        "ideal_voltage_v": 3.3},
+    0x44: {"label": "5v Rail",          "ideal_voltage_v": 5.0},
+    0x45: {"label": "Teensy",           "ideal_voltage_v": 5.0},
 }
 
 REG_CURRENT = 0x01
