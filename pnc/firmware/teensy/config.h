@@ -5,6 +5,8 @@
 
 #define ZPNET_SERIAL Serial
 
+static constexpr const char* FW_VERSION = "zpnet-teensy-4.3.5";
+
 // -------------------------------------------------------------
 // Transport backend selection (runtime)
 // -------------------------------------------------------------

@@ -15,6 +15,7 @@ typedef enum {
   PROCESS_TYPE_PHOTODIODE,
   PROCESS_TYPE_TEMPEST,
   PROCESS_TYPE_LANTERN,
+  PROCESS_TYPE_SYSTEM
 } process_type_t;
 
 // --------------------------------------------------

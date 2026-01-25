@@ -28,11 +28,12 @@ from typing import Any, Dict, Optional
 
 class ProcessType(IntEnum):
     NONE        = 0
-    GNSS        = 1
-    LASER       = 2
-    PHOTODIODE  = 3
-    TEMPEST     = 4
-    LANTERN     = 5
+    SYSTEM      = 1
+    GNSS        = 2
+    LASER       = 3
+    PHOTODIODE  = 4
+    TEMPEST     = 5
+    LANTERN     = 6
 
 
 # ---------------------------------------------------------------------
@@ -40,6 +41,7 @@ class ProcessType(IntEnum):
 # ---------------------------------------------------------------------
 
 _PROCESS_TYPE_BY_NAME = {
+    "SYSTEM":      ProcessType.SYSTEM,
     "GNSS":        ProcessType.GNSS,
     "LASER":       ProcessType.LASER,
     "PHOTODIODE":  ProcessType.PHOTODIODE,
@@ -53,6 +55,7 @@ _PROCESS_TYPE_BY_NAME = {
 # ---------------------------------------------------------------------
 
 _PROCESS_SOCKETS = {
+    ProcessType.SYSTEM:     "/tmp/zpnet-system.sock",
     ProcessType.GNSS:       "/tmp/zpnet-gnss.sock",
     ProcessType.LASER:      "/tmp/zpnet-laser.sock",
     ProcessType.PHOTODIODE: "/tmp/zpnet-photodiode.sock",

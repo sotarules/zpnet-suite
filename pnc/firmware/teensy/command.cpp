@@ -9,7 +9,6 @@
 
 #include "laser.h"
 #include "photodiode.h"
-#include "teensy_status.h"
 #include "transport.h"
 
 #include <string.h>
@@ -116,14 +115,19 @@ static bool extractCmd(const char* line, char* out, size_t out_sz) {
     return true;
 }
 
-static bool parseProcessType(const char* line, process_type_t& out) {\
-    if (strstr(line, "\"type\":\"CLOCKS\"")) { out = PROCESS_TYPE_CLOCKS; return true; }
-    if (strstr(line, "\"type\":\"TIMEPOP\"")) { out = PROCESS_TYPE_TIMEPOP; return true; }
-    if (strstr(line, "\"type\":\"LASER\"")) { out = PROCESS_TYPE_LASER; return true; }
-    if (strstr(line, "\"type\":\"PHOTODIODE\"")) { out = PROCESS_TYPE_PHOTODIODE; return true; }
-    if (strstr(line, "\"type\":\"TEMPEST\"")) { out = PROCESS_TYPE_TEMPEST; return true; }
-    if (strstr(line, "\"type\":\"LANTERN\"")) { out = PROCESS_TYPE_LANTERN; return true; }
+static bool parseProcessType(const char* line, process_type_t& out) {
+    if (strstr(line, "\"type\":\"CLOCKS\"")    != nullptr) { out = PROCESS_TYPE_CLOCKS;    return true; }
+    if (strstr(line, "\"type\":\"TIMEPOP\"")   != nullptr) { out = PROCESS_TYPE_TIMEPOP;   return true; }
+    if (strstr(line, "\"type\":\"LASER\"")     != nullptr) { out = PROCESS_TYPE_LASER;     return true; }
+    if (strstr(line, "\"type\":\"PHOTODIODE\"")!= nullptr) { out = PROCESS_TYPE_PHOTODIODE;return true; }
+    if (strstr(line, "\"type\":\"TEMPEST\"")   != nullptr) { out = PROCESS_TYPE_TEMPEST;   return true; }
+    if (strstr(line, "\"type\":\"LANTERN\"")   != nullptr) { out = PROCESS_TYPE_LANTERN;   return true; }
+    if (strstr(line, "\"type\":\"SYSTEM\"")    != nullptr) { out = PROCESS_TYPE_SYSTEM;   return true; }
     return false;
+}
+
+static void system_enter_bootloader_cb(timepop_ctx_t*, void*) {
+    system_enter_bootloader();
 }
 
 // =============================================================
@@ -166,8 +170,8 @@ void command_exec(const char* line) {
         // Schedule bootloader entry asynchronously
         timepop_arm(
             TIMEPOP_CLASS_FLASH,
-            false,                      // one-shot
-            system_enter_bootloader,    // terminal action
+            false,                         // one-shot
+            system_enter_bootloader_cb,    // terminal action
             nullptr,
             "bootloader-flash"
         );
@@ -306,12 +310,6 @@ void command_exec(const char* line) {
     // ---------------------------------------------------------
     // LEGACY / DIRECT COMMANDS
     // ---------------------------------------------------------
-
-    if (strcmp(cmd, "TEENSY.STATUS") == 0) {
-        String payload = buildTeensyStatusBody();
-        emitOK(&payload, has_req_id, req_id);
-        return;
-    }
 
     if (strcmp(cmd, "PHOTODIODE.STATUS") == 0) {
         String payload = buildPhotodiodeStatusBody();

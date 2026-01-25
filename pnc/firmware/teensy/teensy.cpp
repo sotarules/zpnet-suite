@@ -15,6 +15,7 @@
 #include "process_laser.h"
 #include "process_photodiode.h"
 #include "process_tempest.h"
+#include "process_system.h"
 
 // ------------------------------------------------------------
 // CPU usage sampler (TimePop recurring task)
@@ -74,6 +75,7 @@ void setup() {
   // ----------------------------------------------------------
   // Register processes
   // ----------------------------------------------------------
+
   debug_log("setup", "process_timepop_register");
   process_timepop_register();
   debug_log("setup", "process_clocks_register");
@@ -88,6 +90,8 @@ void setup() {
   process_start(PROCESS_TYPE_PHOTODIODE);
   debug_log("setup", "process_tempest_register");
   process_tempest_register();
+  debug_log("setup", "process_system_register");
+  process_system_register();
 
   // ----------------------------------------------------------
   // Arm recurring CPU usage sampler
