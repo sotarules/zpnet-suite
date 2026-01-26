@@ -20,9 +20,9 @@ Author: The Mule + GPT
 import logging
 from smbus2 import SMBus
 
+from zpnet.processes.processes import send_command
 from zpnet.shared.logger import setup_logging
 from zpnet.shared.events import create_event
-from zpnet.shared.teensy import send_command
 
 # ---------------------------------------------------------------------
 # Hardware constants
@@ -102,24 +102,10 @@ def run() -> None:
         # -------------------------------------------------------------
         # Teensy: Query LASER process for optical ground truth
         # -------------------------------------------------------------
-        try:
-            resp = send_command(
-                "PROCESS.COMMAND",
-                {
-                    "type": "LASER",
-                    "proc_cmd": "REPORT",
-                }
-            )
-        except Exception:
-            resp = {}
+        payload = send_command(machine="PI", subsystem="SYSTEM", command="REPORT")["payload"]
 
-        pd_voltage = None
-        laser_emitting = None
-
-        if resp and resp.get("success"):
-            tp = resp.get("payload", {})
-            pd_voltage = tp.get("PD_voltage")
-            laser_emitting = tp.get("laser_emitting")
+        pd_voltage = payload["PD_voltage"]
+        laser_emitting = payload["laser_emitting"]
 
         # -------------------------------------------------------------
         # Populate payload

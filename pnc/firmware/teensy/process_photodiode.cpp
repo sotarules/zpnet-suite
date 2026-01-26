@@ -1,7 +1,7 @@
 #include "process_photodiode.h"
 
 #include "config.h"
-#include "event_bus.h"
+#include "events.h"
 #include "process.h"
 
 #include <Arduino.h>
@@ -158,43 +158,92 @@ static void photodiode_stop(void) {
 // Commands
 // ================================================================
 
-static String cmd_report(const char*) {
+// ------------------------------------------------------------
+// REPORT — return current photodiode state snapshot
+// ------------------------------------------------------------
+static const String* cmd_report(const char* /*args_json*/) {
+
   photodiode_snapshot();
 
-  String p = "{";
+  // Persistent payload storage
+  static String payload;
+  payload = "{";
 
-  p += "\"edge_level\":";
-  p += PD.edge_level;
+  payload += "\"edge_level\":";
+  payload += PD.edge_level;
 
-  p += ",\"edge_pulse_count\":";
-  p += PD.edge_pulse_count;
+  payload += ",\"edge_pulse_count\":";
+  payload += PD.edge_pulse_count;
 
-  p += ",\"analog_raw\":";
-  p += PD.analog_raw;
+  payload += ",\"analog_raw\":";
+  payload += PD.analog_raw;
 
-  p += ",\"analog_v\":";
+  payload += ",\"analog_v\":";
   {
     char buf[32];
     snprintf(buf, sizeof(buf), "%.5f", PD.analog_v);
-    p += buf;
+    payload += buf;
   }
 
-  p += ",\"isr_count\":";
+  payload += ",\"isr_count\":";
   {
     uint32_t count;
     noInterrupts();
     count = pd_isr_count;
     interrupts();
-    p += count;
+    payload += count;
   }
 
-  p += ",\"edge_level_changed\":";
-  p += (edge_level_changed ? "true" : "false");
+  payload += ",\"edge_level_changed\":";
+  payload += (edge_level_changed ? "true" : "false");
 
-  p += "}";
+  payload += "}";
 
-  return p;
+  return &payload;
 }
+
+// ------------------------------------------------------------
+// COUNT — episode counter snapshot
+// ------------------------------------------------------------
+static const String* cmd_count(const char* /*args_json*/) {
+
+  uint32_t count;
+  noInterrupts();
+  count = pd_episode_count;
+  interrupts();
+
+  // Persistent payload storage
+  static String payload;
+  payload = "{";
+
+  payload += "\"count\":";
+  payload += count;
+
+  payload += "}";
+
+  return &payload;
+}
+
+// ------------------------------------------------------------
+// CLEAR — reset episode counter
+// ------------------------------------------------------------
+static const String* cmd_clear(const char* /*args_json*/) {
+
+  noInterrupts();
+  pd_episode_count   = 0;
+  pd_episode_latched = false;
+  pd_edge_seen       = false;
+  interrupts();
+
+  enqueueEvent(
+    "PHOTODIODE_CLEAR",
+    "\"action\":\"counter_reset\""
+  );
+
+  // Side-effect only, no payload
+  return nullptr;
+}
+
 
 // ================================================================
 // Registration
@@ -202,17 +251,22 @@ static String cmd_report(const char*) {
 
 static const process_command_entry_t PHOTODIODE_COMMANDS[] = {
   { "REPORT", cmd_report },
+  { "COUNT",  cmd_count  },
+  { "CLEAR",  cmd_clear  },
 };
 
 static const process_vtable_t PHOTODIODE_PROCESS = {
-  .name = "PHOTODIODE",
-  .start = photodiode_start,
-  .stop = photodiode_stop,
-  .query = nullptr,
-  .commands = PHOTODIODE_COMMANDS,
-  .command_count = 1,
+  .name          = "PHOTODIODE",
+  .start         = photodiode_start,
+  .stop          = photodiode_stop,
+  .query         = nullptr,              // deprecated
+  .commands      = PHOTODIODE_COMMANDS,
+  .command_count = 3,
 };
 
+// ------------------------------------------------------------
+// Registration
+// ------------------------------------------------------------
 void process_photodiode_register(void) {
   process_register(PROCESS_TYPE_PHOTODIODE, &PHOTODIODE_PROCESS);
 }

@@ -27,6 +27,7 @@ Process model:
 
 from __future__ import annotations
 
+import datetime
 import json
 import logging
 import os
@@ -46,13 +47,12 @@ import psutil
 import requests
 from smbus2 import SMBus
 
-from zpnet.processes.processes import send_command as send_command_pi
+from zpnet.processes.processes import send_command, serve_commands
 from zpnet.shared.constants import ZPNET_REMOTE_HOST, ZPNET_TEST_PATH, HTTP_TIMEOUT, EXPECTED_TEST_STRING
 from zpnet.shared.events import create_event
 from zpnet.shared.util import normalize_payload, normalize_ts
 from zpnet.shared.http import gzip_text
 from zpnet.shared.logger import setup_logging
-from zpnet.shared.teensy import send_command as send_command_teensy
 from zpnet.shared.db import open_db
 
 # ------------------------------------------------------------------
@@ -503,25 +503,9 @@ def decode_mp5491_state(vals: dict) -> dict:
     }
 
 def query_teensy_laser_status() -> dict:
-    """
-    Query Teensy LASER.REPORT for optical ground truth.
-    """
-    try:
-        resp = send_command_teensy(
-            "PROCESS.COMMAND",
-            {
-                "type": "LASER",
-                "proc_cmd": "REPORT",
-            }
-        )
-    except Exception:
-        return {}
 
-    if not resp or not resp.get("success"):
-        return {}
-
-    payload = resp.get("payload", {}) or {}
-
+    resp = send_command(machine="TEENSY", subsystem="LASER", command="REPORT")
+    payload = resp["payload"]
     return {
         "pd_voltage": payload.get("PD_voltage"),
         "laser_emitting": payload.get("laser_emitting"),
@@ -587,49 +571,16 @@ def build_gnss_status() -> dict:
       • health_state is SYSTEM-owned
     """
 
-    payload: dict = {
-        "health_state": "DOWN",
+    payload = send_command(
+        machine="PI",
+        subsystem="GNSS",
+        command="REPORT",
+    )["payload"]
+
+    return {
+        **payload,
+        "health_state": "NOMINAL",
     }
-
-    try:
-        resp = send_command_pi(
-            "PROCESS.COMMAND",
-            {
-                "type": "GNSS",
-                "proc_cmd": "REPORT",
-            }
-        )
-
-        if not resp or not resp.get("success"):
-            return payload
-
-        g = resp.get("payload", {}) or {}
-
-        # ---------------------------------------------------------
-        # Transport raw GNSS facts (if present)
-        # ---------------------------------------------------------
-        for key in (
-            "date",
-            "time",
-            "discipline",
-            "latitude_deg",
-            "longitude_deg",
-            "altitude_m",
-        ):
-            if key in g:
-                payload[key] = g[key]
-
-        # ---------------------------------------------------------
-        # SYSTEM-owned health classification
-        # ---------------------------------------------------------
-        payload["health_state"] = "NOMINAL"
-
-        return payload
-
-    except Exception:
-        return payload
-
-
 
 # ------------------------------------------------------------------
 # Sensor helpers (migrated from sensor_monitor)
@@ -1088,110 +1039,59 @@ def build_battery_status() -> dict:
 # ------------------------------------------------------------------
 
 def build_teensy_status() -> dict:
-    """
-    Build Teensy status snapshot for SYSTEM payload.
+    resp = send_command(machine="TEENSY", subsystem="SYSTEM", command="REPORT")
+    logging.warning("[build_teensy_status] raw response: %s", resp)
 
-    Semantics:
-      • Teensy is treated as a peer status producer (like pi, gnss, power)
-      • Returned payload MUST describe the Teensy only
-      • SYSTEM-shaped payloads are explicitly flattened
-      • No recursion is possible by construction
-    """
-
-    payload: dict = {
-        "health_state": "DOWN",
-    }
-
-    try:
-        resp = send_command_teensy(
-            "PROCESS.COMMAND",
-            {
-                "type": "SYSTEM",
-                "proc_cmd": "REPORT",
-            },
-        )
-
-        if not resp or not resp.get("success"):
-            return payload
-
-        raw = resp.get("payload", {}) or {}
-
-        # ---------------------------------------------------------
-        # Normalize payload shape
-        # ---------------------------------------------------------
-        # If Teensy returned a full SYSTEM snapshot, extract its own slice.
-        # Otherwise assume payload already represents Teensy-local facts.
-        if isinstance(raw, dict) and "teensy" in raw:
-            teensy = raw.get("teensy") or {}
-        else:
-            teensy = raw
-
-        if not isinstance(teensy, dict):
-            return payload
-
-        # ---------------------------------------------------------
-        # Copy Teensy facts verbatim (no interpretation)
-        # ---------------------------------------------------------
-        payload.update(teensy)
-
-        # ---------------------------------------------------------
-        # SYSTEM-owned health classification
-        # ---------------------------------------------------------
-        payload["health_state"] = "NOMINAL"
-
-        return payload
-
-    except Exception:
-        return payload
-
+    payload = resp["payload"]
+    payload["health_state"] = "NOMINAL"
+    return payload
 
 # ------------------------------------------------------------------
 # System poller thread
 # ------------------------------------------------------------------
 
 def system_poller() -> None:
-    """
-    Periodically request SYSTEM.REPORT from the Teensy and gather
-    consolidated Pi-side system metrics.
 
-    Semantics:
-      • Teensy is authoritative but optional
-      • Pi-side metrics are best-effort
-      • No last-known-good preservation
-      • Snapshot reflects current reality only
-    """
     global SYSTEM
 
-    while True:
+    try:
+        while True:
 
-        pi_payload = build_pi_status()
-        teensy_payload = build_teensy_status()
-        network_payload = build_network_status()
-        laser_payload = build_laser_status()
-        sensor_payload = build_sensor_scan_status()
-        environment_payload = build_environment_status()
-        gnss_payload = build_gnss_status()
-        power_payload = build_power_status()
-        battery_payload = build_battery_status()
+            logging.info("[system_poller] collecting SYSTEM snapshot")
 
-        SYSTEM = {
-            "pi": dict(pi_payload),
-            "teensy": dict(teensy_payload),
-            "network": dict(network_payload),
-            "laser": dict(laser_payload),
-            "sensors": dict(sensor_payload),
-            "environment": dict(environment_payload),
-            "gnss": dict(gnss_payload),
-            "power": dict(power_payload),
-            "battery": dict(battery_payload),
-        }
+            pi_payload = build_pi_status()
+            teensy_payload = build_teensy_status()
+            network_payload = build_network_status()
+            laser_payload = build_laser_status()
+            sensor_payload = build_sensor_scan_status()
+            environment_payload = build_environment_status()
+            gnss_payload = build_gnss_status()
+            power_payload = build_power_status()
+            battery_payload = build_battery_status()
 
-        # ----------------------------------------------------------
-        # Emit consolidated system event
-        # ----------------------------------------------------------
-        create_event("SYSTEM_STATUS", dict(SYSTEM))
+            SYSTEM = {
+                "pi": dict(pi_payload),
+                "teensy": dict(teensy_payload),
+                "network": dict(network_payload),
+                "laser": dict(laser_payload),
+                "sensors": dict(sensor_payload),
+                "environment": dict(environment_payload),
+                "gnss": dict(gnss_payload),
+                "power": dict(power_payload),
+                "battery": dict(battery_payload),
+            }
 
-        time.sleep(POLL_INTERVAL_SEC)
+            logging.info("[build_teensy_status] SYSTEM snapshot: %s", SYSTEM)
+
+            # ----------------------------------------------------------
+            # Emit consolidated system event
+            # ----------------------------------------------------------
+            create_event("SYSTEM_STATUS", dict(SYSTEM))
+
+            time.sleep(POLL_INTERVAL_SEC)
+
+    except Exception:
+        logging.exception("[system_poller] unhandled exception - poller thread terminating")
 
 
 # ------------------------------------------------------------------
@@ -1201,58 +1101,15 @@ def system_poller() -> None:
 def cmd_report(_: Optional[dict]) -> Dict:
     """Return the most recent SYSTEM snapshot."""
     snapshot = dict(SYSTEM)
-
     return {
         "success": True,
         "message": "OK",
         "payload": snapshot,
     }
 
-
 COMMANDS = {
-    "REPORT": cmd_report,
+    "REPORT": cmd_report
 }
-
-
-# ------------------------------------------------------------------
-# Command socket server
-# ------------------------------------------------------------------
-
-def command_server() -> None:
-    try:
-        os.unlink(CMD_SOCKET_PATH)
-    except FileNotFoundError:
-        pass
-
-    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as srv:
-        srv.bind(CMD_SOCKET_PATH)
-        srv.listen()
-
-        while True:
-            conn, _ = srv.accept()
-            with conn:
-                data = conn.recv(65536)
-                if not data:
-                    continue
-
-                try:
-                    req = json.loads(data.decode())
-                except Exception:
-                    resp = {
-                        "success": False,
-                        "message": "invalid json",
-                    }
-                    conn.sendall(json.dumps(resp).encode())
-                    continue
-
-                handler = COMMANDS.get(req.get("cmd"))
-                resp = handler(req.get("args")) if handler else {
-                    "success": False,
-                    "message": "unrecognized command",
-                }
-
-                conn.sendall(json.dumps(resp).encode())
-
 
 # ------------------------------------------------------------------
 # Entrypoint
@@ -1260,5 +1117,14 @@ def command_server() -> None:
 
 def run() -> None:
     setup_logging()
-    threading.Thread(target=system_poller, daemon=True).start()
-    command_server()
+
+    try:
+        threading.Thread(target=system_poller, daemon=True).start()
+        serve_commands(
+            socket_path=CMD_SOCKET_PATH,
+            commands=COMMANDS,
+        )
+
+    except Exception:
+        logging.exception("[system] unhandled exception in main thread — process exiting")
+

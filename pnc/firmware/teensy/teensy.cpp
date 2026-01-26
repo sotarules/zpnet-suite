@@ -1,16 +1,15 @@
 #include "config.h"
 #include "debug.h"
 
-#include "system.h"
 #include "clock.h"
 #include "timepop.h"
-#include "event_bus.h"
-#include "laser.h"
+#include "events.h"
 #include "cpu_usage.h"
 #include "process.h"
 #include "transport.h"
 
 #include "process_clocks.h"
+#include "process_events.h"
 #include "process_timepop.h"
 #include "process_laser.h"
 #include "process_photodiode.h"
@@ -61,10 +60,9 @@ void setup() {
   // ----------------------------------------------------------
   debug_log("setup", "clock_init");
   clock_init();
-  debug_log("setup", "event_bus_init");
-  event_bus_init();
-  debug_log("setup", "system_init");
-  system_init();
+
+  debug_log("setup", "process_events_register");
+  process_events_register();
 
   // ----------------------------------------------------------
   // Process framework

@@ -2,8 +2,8 @@
 #include "config.h"
 #include "debug.h"
 #include "timepop.h"
-#include "command.h"
-#include "event_bus.h"
+#include "events.h"
+#include "process.h"
 
 #include <Arduino.h>
 #include <usb_rawhid.h>
@@ -50,17 +50,11 @@ static size_t  raw_msg_len = 0;
 
 static void process_complete_message(const uint8_t* msg, size_t len) {
 
-  // We expect transport messages to begin with '<'
-  if (len < 11 || msg[0] != ASCII_LT) {
-    return;
-  }
+  // ---------------- protocol framing (unchanged) ----------------
 
-  // Must start with "<STX="
-  if (memcmp(msg, STX_PREFIX, 5) != 0) {
-    return;
-  }
+  if (len < 11 || msg[0] != ASCII_LT) return;
+  if (memcmp(msg, STX_PREFIX, 5) != 0) return;
 
-  // Parse decimal length
   size_t i = 5;
   int payload_len = 0;
 
@@ -69,35 +63,88 @@ static void process_complete_message(const uint8_t* msg, size_t len) {
     i++;
   }
 
-  if (i >= len || msg[i] != '>') {
-    return;
-  }
-
-  if (payload_len <= 0 || (size_t)payload_len > TRANSPORT_MAX_PAYLOAD) {
-    return;
-  }
+  if (i >= len || msg[i] != '>') return;
+  if (payload_len <= 0 || (size_t)payload_len > TRANSPORT_MAX_PAYLOAD) return;
 
   size_t json_start = i + 1;
   size_t json_end   = json_start + (size_t)payload_len;
-  size_t etx_pos    = json_end;
 
-  if (json_end + ETX_LEN > len) {
-    return;
-  }
+  if (json_end + ETX_LEN > len) return;
+  if (memcmp(msg + json_end, ETX_SEQ, ETX_LEN) != 0) return;
 
-  // Verify "<ETX>"
-  if (memcmp(msg + etx_pos, ETX_SEQ, ETX_LEN) != 0) {
-    return;
-  }
+  // ---------------- JSON extraction ----------------
 
-  // Extract JSON into null-terminated buffer
   static char json[TRANSPORT_MAX_PAYLOAD + 1];
   memcpy(json, msg + json_start, (size_t)payload_len);
   json[payload_len] = '\0';
 
-  // Dispatch (unchanged behavior)
-  command_exec(json);
+  // ---------------- minimal semantic extraction ----------------
+  // Expected envelope:
+  // {
+  //   "machine":"TEENSY",
+  //   "subsystem":"CLOCKS",
+  //   "command":"REPORT",
+  //   "args":{...}
+  // }
+
+  const char* subsystem = strstr(json, "\"subsystem\"");
+  const char* command   = strstr(json, "\"command\"");
+
+  if (!subsystem || !command) {
+    // Programmer error — do not recover
+    return;
+  }
+
+  // Extract subsystem string
+  subsystem = strchr(subsystem, ':') + 1;
+  while (*subsystem == ' ' || *subsystem == '\"') subsystem++;
+  const char* subsystem_end = strchr(subsystem, '\"');
+
+  char subsystem_name[32];
+  size_t sub_len = subsystem_end - subsystem;
+  memcpy(subsystem_name, subsystem, sub_len);
+  subsystem_name[sub_len] = '\0';
+
+  // Extract command string
+  command = strchr(command, ':') + 1;
+  while (*command == ' ' || *command == '\"') command++;
+  const char* command_end = strchr(command, '\"');
+
+  char command_name[32];
+  size_t cmd_len = command_end - command;
+  memcpy(command_name, command, cmd_len);
+  command_name[cmd_len] = '\0';
+
+  // Optional args (raw JSON object pointer)
+  const char* args_json = nullptr;
+  const char* a = strstr(json, "\"args\"");
+  if (a) {
+    a = strchr(a, ':');
+    if (a) {
+      a++;
+      while (*a == ' ') a++;
+      if (*a == '{') {
+        args_json = a;
+      }
+    }
+  }
+
+  // ---------------- process dispatch ----------------
+
+  process_type_t type;
+  if (!process_type_from_name(subsystem_name, type)) {
+    // Programmer error — do not recover
+    return;
+  }
+
+  String response;
+  process_command(type, command_name, args_json, response);
+
+  // ---------------- response egress ----------------
+
+  transport_send_frame(response.c_str(), response.length());
 }
+
 
 // -------------------------------------------------------------
 // RX tick (TimePop-owned)

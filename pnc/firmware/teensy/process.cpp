@@ -1,11 +1,31 @@
 #include "process.h"
-#include "event_bus.h"
+#include "events.h"
 
 // -----------------------------------------------------------------------------
 // Configuration
 // -----------------------------------------------------------------------------
 
 static const size_t MAX_PROCESSES = 8;
+
+// -----------------------------------------------------------------------------
+// Subsystem → process mapping (shared, canonical)
+// -----------------------------------------------------------------------------
+
+bool process_type_from_name(
+  const char* subsystem,
+  process_type_t& out
+) {
+  if (strcmp(subsystem, "CLOCKS")    == 0) { out = PROCESS_TYPE_CLOCKS;    return true; }
+  if (strcmp(subsystem, "EVENTS")    == 0) { out = PROCESS_TYPE_EVENTS;    return true; }
+  if (strcmp(subsystem, "TIMEPOP")   == 0) { out = PROCESS_TYPE_TIMEPOP;   return true; }
+  if (strcmp(subsystem, "LASER")     == 0) { out = PROCESS_TYPE_LASER;     return true; }
+  if (strcmp(subsystem, "PHOTODIODE")== 0) { out = PROCESS_TYPE_PHOTODIODE;return true; }
+  if (strcmp(subsystem, "TEMPEST")   == 0) { out = PROCESS_TYPE_TEMPEST;   return true; }
+  if (strcmp(subsystem, "LANTERN")   == 0) { out = PROCESS_TYPE_LANTERN;   return true; }
+  if (strcmp(subsystem, "SYSTEM")    == 0) { out = PROCESS_TYPE_SYSTEM;    return true; }
+
+  return false;  // programmer error → caller should not recover
+}
 
 // -----------------------------------------------------------------------------
 // Internal Registry Entry
@@ -39,8 +59,6 @@ static process_entry_t* find_process(process_type_t type) {
 
 static const process_command_entry_t*
 find_command(const process_vtable_t* vtable, const char* name) {
-  if (!vtable || !name) return nullptr;
-
   for (size_t i = 0; i < vtable->command_count; ++i) {
     if (strcmp(vtable->commands[i].name, name) == 0) {
       return &vtable->commands[i];
@@ -65,10 +83,6 @@ bool process_register(
   process_type_t type,
   const process_vtable_t* vtable
 ) {
-  if (!vtable || !vtable->name || !vtable->start || !vtable->stop) {
-    return false;
-  }
-
   if (registry_count >= MAX_PROCESSES) {
     return false;
   }
@@ -136,70 +150,42 @@ bool process_stop(process_type_t type) {
 }
 
 // -----------------------------------------------------------------------------
-// Introspection
-// -----------------------------------------------------------------------------
-
-bool process_query(
-  process_type_t type,
-  String& out_body
-) {
-  process_entry_t* p = find_process(type);
-  if (!p || !p->vtable->query) return false;
-
-  out_body = "{";
-  out_body = "\"name\":\"";
-  out_body += p->vtable->name;
-  out_body += "\",\"state\":\"";
-
-  switch (p->state) {
-    case PROCESS_STATE_RUNNING: out_body += "RUNNING"; break;
-    case PROCESS_STATE_STOPPED: out_body += "STOPPED"; break;
-    case PROCESS_STATE_ERROR:   out_body += "ERROR";   break;
-  }
-
-  out_body += "\"";
-
-  String inner = p->vtable->query();
-  if (inner.length()) {
-    out_body += ",";
-    out_body += inner;
-  }
-
-  out_body += "}";
-
-  return true;
-}
-
-// -----------------------------------------------------------------------------
 // Command Dispatch (Canonical)
 // -----------------------------------------------------------------------------
 
-bool process_command(
+void process_command(
   process_type_t type,
   const char*    cmd_name,
   const char*    args_json,
   String&        out_response
 ) {
   process_entry_t* p = find_process(type);
-  if (!p || !p->vtable || !p->vtable->commands) {
-    out_response =
-      "{\"success\":false,\"message\":\"process not found\"}";
-    return false;
+  if (!p) {
+    out_response = "{\"success\":false,\"message\":\"unknown subsystem\"}";
+    return;
   }
 
   const process_command_entry_t* entry =
       find_command(p->vtable, cmd_name);
 
   if (!entry || !entry->handler) {
-    out_response =
-      "{\"success\":false,\"message\":\"unrecognized command\"}";
-    return true;   // handled, but unsuccessful
+    out_response = "{\"success\":false,\"message\":\"unknown command\"}";
+    return;
   }
 
-  // Invoke command handler
-  out_response = entry->handler(args_json);
-  return true;
+  const String* payload = entry->handler(args_json);
+
+  out_response = "{";
+  out_response += "\"success\":true,\"message\":\"OK\"";
+
+  if (payload) {
+    out_response += ",\"payload\":";
+    out_response += *payload;
+  }
+
+  out_response += "}";
 }
+
 
 // -----------------------------------------------------------------------------
 // Registry Introspection
@@ -209,7 +195,6 @@ String process_list_json(void) {
 
   String out;
   out += "{";
-
   out += "\"processes\":[";
 
   for (size_t i = 0; i < registry_count; ++i) {
@@ -229,8 +214,6 @@ String process_list_json(void) {
     out += "\"}";
   }
 
-  out += "]";
-
-  out += "}";
+  out += "]}";
   return out;
 }

@@ -5,7 +5,7 @@
 #include "imxrt.h"
 #include "clock.h"
 #include "config.h"
-#include "event_bus.h"
+#include "events.h"
 #include "process.h"
 #include "smartpop.h"
 
@@ -113,37 +113,46 @@ static void tempest_confirm_end_cb(void* /*context*/) {
 // -------------------------------------------------------------
 // Forward declarations (SmartPOP callbacks)
 // -------------------------------------------------------------
-
 static void tempest_confirm_start_cb(void* context);
 static void tempest_confirm_end_cb(void* context);
 
-static String cmd_confirm(const char* args_json) {
+// -------------------------------------------------------------
+// CONFIRM — arm a GNSS-aligned confirm window
+// -------------------------------------------------------------
+static const String* cmd_confirm(const char* args_json) {
+
+  static String payload;
 
   if (!args_json) {
-    return "{\"error\":\"missing args\"}";
+    payload = "{\"error\":\"missing args\"}";
+    return &payload;
   }
 
   const char* p = strstr(args_json, "\"seconds\"");
   if (!p) {
-    return "{\"error\":\"missing seconds\"}";
+    payload = "{\"error\":\"missing seconds\"}";
+    return &payload;
   }
 
   p = strchr(p, ':');
   if (!p) {
-    return "{\"error\":\"malformed seconds\"}";
+    payload = "{\"error\":\"malformed seconds\"}";
+    return &payload;
   }
   p++;
 
   uint32_t seconds = (uint32_t)strtoul(p, nullptr, 10);
   if (seconds == 0) {
-    return "{\"error\":\"seconds must be > 0\"}";
+    payload = "{\"error\":\"seconds must be > 0\"}";
+    return &payload;
   }
 
   // ---------------------------------------------------------
   // Enforce single in-flight confirm
   // ---------------------------------------------------------
   if (confirm_active) {
-    return "{\"error\":\"confirm already in progress\"}";
+    payload = "{\"error\":\"confirm already in progress\"}";
+    return &payload;
   }
 
   // ---------------------------------------------------------
@@ -160,11 +169,15 @@ static String cmd_confirm(const char* args_json) {
     (void*)(uintptr_t)seconds
   );
 
-  // Return immediately
-  return "{\"status\":\"armed\"}";
+  payload = "{\"status\":\"armed\"}";
+  return &payload;
 }
 
-static String cmd_baseline(const char*) {
+// -------------------------------------------------------------
+// BASELINE — discover standard error baseline
+// -------------------------------------------------------------
+static const String* cmd_baseline(const char* /*args_json*/) {
+
   uint32_t samples = 0;
   int32_t  min_e = 0, max_e = 0, med_e = 0, std_e = 0;
   double   stddev = 0.0;
@@ -178,39 +191,55 @@ static String cmd_baseline(const char*) {
       &stddev
   );
 
-  String r = "{";
+  static String payload;
+  payload = "{";
 
-  r += "\"samples\":";
-  r += samples;
+  payload += "\"samples\":";
+  payload += samples;
 
-  r += ",\"baseline_error\":";
-  r += std_e;
+  payload += ",\"baseline_error\":";
+  payload += std_e;
 
-  r += ",\"stddev\":";
+  payload += ",\"stddev\":";
   {
     char buf[32];
     snprintf(buf, sizeof(buf), "%.6f", stddev);
-    r += buf;
+    payload += buf;
   }
 
-  r += "}";
+  payload += "}";
 
-  return r;
+  return &payload;
 }
 
-static String cmd_tau(const char* args) {
-  uint32_t seconds = 0;
+// -------------------------------------------------------------
+// TAU — run full tau profiling
+// -------------------------------------------------------------
+static const String* cmd_tau(const char* args) {
+
+  static String payload;
+
+  if (!args) {
+    payload = "{\"error\":\"missing args\"}";
+    return &payload;
+  }
 
   const char* p = strstr(args, "seconds=");
   if (!p) {
-    return "{\"error\":\"missing seconds\"}";
+    payload = "{\"error\":\"missing seconds\"}";
+    return &payload;
   }
 
-  seconds = (uint32_t)strtoul(p + 8, nullptr, 10);
+  uint32_t seconds = (uint32_t)strtoul(p + 8, nullptr, 10);
+  if (seconds == 0) {
+    payload = "{\"error\":\"seconds must be > 0\"}";
+    return &payload;
+  }
 
   bool ok = tempest_tau_profile(seconds);
 
-  return ok ? "{\"status\":\"ok\"}" : "{\"status\":\"fail\"}";
+  payload = ok ? "{\"status\":\"ok\"}" : "{\"status\":\"fail\"}";
+  return &payload;
 }
 
 // ================================================================

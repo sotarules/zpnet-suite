@@ -18,7 +18,6 @@ Process model:
 
 from __future__ import annotations
 
-import json
 import math
 import os
 import socket
@@ -29,6 +28,7 @@ from typing import Dict, Optional, Set
 
 import serial
 
+from zpnet.processes.processes import serve_commands
 
 # ------------------------------------------------------------------
 # Configuration
@@ -317,36 +317,6 @@ def cmd_report(_: Optional[dict]) -> Dict:
 
 COMMANDS = {"REPORT": cmd_report}
 
-
-# ------------------------------------------------------------------
-# Command Socket Server
-# ------------------------------------------------------------------
-
-def command_server() -> None:
-    try:
-        os.unlink(CMD_SOCKET_PATH)
-    except FileNotFoundError:
-        pass
-
-    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as srv:
-        srv.bind(CMD_SOCKET_PATH)
-        srv.listen()
-
-        while True:
-            conn, _ = srv.accept()
-            with conn:
-                data = conn.recv(65536)
-                if not data:
-                    continue
-                req = json.loads(data.decode())
-                handler = COMMANDS.get(req.get("cmd"))
-                resp = handler(req.get("args")) if handler else {
-                    "success": False,
-                    "message": "unrecognized command"
-                }
-                conn.sendall(json.dumps(resp).encode())
-
-
 # ------------------------------------------------------------------
 # Entrypoint
 # ------------------------------------------------------------------
@@ -354,4 +324,7 @@ def command_server() -> None:
 def run() -> None:
     threading.Thread(target=gnss_reader, daemon=True).start()
     threading.Thread(target=stream_server, daemon=True).start()
-    command_server()
+    serve_commands(
+        socket_path=CMD_SOCKET_PATH,
+        commands=COMMANDS,
+    )

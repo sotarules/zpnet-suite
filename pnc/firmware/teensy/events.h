@@ -1,5 +1,5 @@
 // ============================================================================
-// FILE: event_bus.h
+// FILE: events.h
 // ============================================================================
 //
 // ZPNet Event Bus (Durable Truth Queue)
@@ -30,39 +30,7 @@ struct EventItem {
   char body[EVT_BODY_MAX];
 };
 
-// --------------------------------------------------------------
-// TimePop-owned lifecycle
-// --------------------------------------------------------------
-
-// Initialize the event bus tick (must be called from setup()).
-// Arms a recurring TimePop timer (TIMEPOP_CLASS_EVENTBUS).
-void event_bus_init(void);
-
-// Request a drain (idempotent).
-// The actual drain is performed by the event bus TimePop tick.
-void event_bus_request_drain(void);
-
-// --------------------------------------------------------------
-// Public API (durable truth)
-// --------------------------------------------------------------
-
 // Enqueue a durable event (no serial output).
 // "body" must be a valid JSON fragment WITHOUT outer braces.
 void enqueueEvent(const char* type, const String& body);
 
-// Drain all queued events immediately.
-// Emits protocol-control framing (EVENTS_BEGIN / EVENTS_END).
-//
-// NOTE:
-//   This function is safe and remains available for compatibility.
-//   Under the new kernel standard, prefer event_bus_request_drain()
-//   so draining occurs in scheduled context.
-void drainEventsNow(void);
-
-// Convenience helpers (queue-only)
-void enqueueAckEvent(const char* cmd);
-void enqueueErrEvent(const char* cmd, const char* msg);
-
-// Diagnostics
-uint32_t eventQueueDepth(void);
-uint32_t eventDroppedCount(void);

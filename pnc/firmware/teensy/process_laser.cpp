@@ -1,7 +1,7 @@
 #include "process_laser.h"
 
 #include "config.h"
-#include "event_bus.h"
+#include "events.h"
 #include "process.h"
 
 #include <Arduino.h>
@@ -190,31 +190,62 @@ static void laser_stop(void) {
 // Commands
 // ================================================================
 
-static String cmd_report(const char*) {
+// ------------------------------------------------------------
+// REPORT — return current laser state snapshot
+// ------------------------------------------------------------
+static const String* cmd_report(const char* /*args_json*/) {
+
+  // Refresh authoritative snapshot
   laser_snapshot();
 
-  String p = "{";
+  // Persistent payload storage
+  static String payload;
+  payload = "{";
 
-  p += "\"ID1_current_ma\":";
+  payload += "\"ID1_current_ma\":";
   {
     char buf[32];
     snprintf(buf, sizeof(buf), "%.2f", LASER.id1_current_ma);
-    p += buf;
+    payload += buf;
   }
 
-  p += ",\"PD_voltage\":";
+  payload += ",\"PD_voltage\":";
   {
     char buf[32];
     snprintf(buf, sizeof(buf), "%.4f", LASER.pd_voltage);
-    p += buf;
+    payload += buf;
   }
 
-  p += ",\"laser_emitting\":";
-  p += (LASER.pd_voltage > 0.5f ? "true" : "false");
+  payload += ",\"laser_emitting\":";
+  payload += (LASER.pd_voltage > 0.5f ? "true" : "false");
 
-  p += "}";
+  payload += "}";
 
-  return p;
+  return &payload;
+}
+
+// ------------------------------------------------------------
+// ON — permit emission
+// ------------------------------------------------------------
+static const String* cmd_on(const char* /*args_json*/) {
+
+  enqueueEvent("LASER_ON", "\"action\":\"allow_emission\"");
+  digitalWrite(LD_ON_PIN, HIGH);
+
+  // Side-effect only, no payload
+  return nullptr;
+}
+
+// ------------------------------------------------------------
+// OFF — inhibit emission
+// ------------------------------------------------------------
+static const String* cmd_off(const char* /*args_json*/) {
+
+  enqueueEvent("LASER_OFF", "\"action\":\"inhibit_emission\"");
+  digitalWrite(LD_ON_PIN, LOW);
+
+  // Side-effect only, no payload
+  return nullptr;
 }
 
 // ================================================================
@@ -223,6 +254,8 @@ static String cmd_report(const char*) {
 
 static const process_command_entry_t LASER_COMMANDS[] = {
   { "REPORT", cmd_report },
+  { "ON",     cmd_on     },
+  { "OFF",    cmd_off    },
 };
 
 static const process_vtable_t LASER_PROCESS = {
@@ -231,7 +264,7 @@ static const process_vtable_t LASER_PROCESS = {
   .stop = laser_stop,
   .query = nullptr,
   .commands = LASER_COMMANDS,
-  .command_count = 1,
+  .command_count = 3,
 };
 
 void process_laser_register(void) {

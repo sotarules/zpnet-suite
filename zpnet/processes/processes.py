@@ -1,176 +1,139 @@
 """
-ZPNet Pi-Side Process Command Client
+ZPNet Unified Command Router (Pi-Side)
 
-Provides a Teensy-equivalent PROCESS.COMMAND interface
-for Pi-side systemd-managed processes.
-
-This module:
-  • does NOT track lifecycle or state
-  • does NOT start/stop processes
-  • assumes systemd is authoritative
-  • routes commands to process-owned sockets
-  • preserves the canonical command contract
+Single canonical send_command() for all machines.
 
 Author: The Mule + GPT
 """
 
-from __future__ import annotations
-
 import json
+import logging
+import os
 import socket
-from enum import IntEnum
-from typing import Any, Dict, Optional
-
-
-# ---------------------------------------------------------------------
-# Process Types (shared vocabulary with Teensy)
-# ---------------------------------------------------------------------
-
-class ProcessType(IntEnum):
-    NONE        = 0
-    SYSTEM      = 1
-    GNSS        = 2
-    LASER       = 3
-    PHOTODIODE  = 4
-    TEMPEST     = 5
-    LANTERN     = 6
-
+from typing import Any
+from typing import Dict, Callable, Optional
 
 # ---------------------------------------------------------------------
-# String → ProcessType mapping (Teensy-compatible)
+# Socket Configuration (single source of truth)
 # ---------------------------------------------------------------------
 
-_PROCESS_TYPE_BY_NAME = {
-    "SYSTEM":      ProcessType.SYSTEM,
-    "GNSS":        ProcessType.GNSS,
-    "LASER":       ProcessType.LASER,
-    "PHOTODIODE":  ProcessType.PHOTODIODE,
-    "TEMPEST":     ProcessType.TEMPEST,
-    "LANTERN":     ProcessType.LANTERN,
+# Pi-side subsystem sockets (systemd-managed)
+PI_SUBSYSTEM_SOCKETS: Dict[str, str] = {
+    "SYSTEM":     "/tmp/zpnet-system.sock",
+    "GNSS":       "/tmp/zpnet-gnss.sock",
+    "LASER":      "/tmp/zpnet-laser.sock",
+    "PHOTODIODE": "/tmp/zpnet-photodiode.sock",
+    "TEMPEST":    "/tmp/zpnet-tempest.sock",
+    "LANTERN":    "/tmp/zpnet-lantern.sock",
 }
 
+# Teensy transport authority (always single endpoint)
+TEENSY_RPC_SOCKET = "/tmp/zpnet_teensy_rt.sock"
 
 # ---------------------------------------------------------------------
-# Process → Socket Mapping (single source of truth)
+# Public API — single canonical entry point
 # ---------------------------------------------------------------------
 
-_PROCESS_SOCKETS = {
-    ProcessType.SYSTEM:     "/tmp/zpnet-system.sock",
-    ProcessType.GNSS:       "/tmp/zpnet-gnss.sock",
-    ProcessType.LASER:      "/tmp/zpnet-laser.sock",
-    ProcessType.PHOTODIODE: "/tmp/zpnet-photodiode.sock",
-    ProcessType.TEMPEST:    "/tmp/zpnet-tempest.sock",
-    ProcessType.LANTERN:    "/tmp/zpnet-lantern.sock",
-}
-
-
-# ---------------------------------------------------------------------
-# Command Response Helpers (shape only, no interpretation)
-# ---------------------------------------------------------------------
-
-def _resp_err(message: str, payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    out = {"success": False, "message": message}
-    if payload is not None:
-        out["payload"] = payload
-    return out
-
-
-# ---------------------------------------------------------------------
-# Low-level process command (socket-based)
-# ---------------------------------------------------------------------
-
-def _process_command(
-    ptype: ProcessType,
-    proc_cmd: str,
+def send_command(
+    *,
+    machine: str,
+    subsystem: str,
+    command: str,
     args: Optional[Dict[str, Any]] = None,
-    timeout_s: float = 10.0,
 ) -> Dict[str, Any]:
-    """
-    Low-level PROCESS.COMMAND implementation.
 
-    This is the Pi analogue of Teensy process_command().
-    """
+    sock_path = PI_SUBSYSTEM_SOCKETS.get(subsystem) if machine == "PI" else TEENSY_RPC_SOCKET
 
-    sock_path = _PROCESS_SOCKETS.get(ptype)
-    if not sock_path:
-        return _resp_err("unknown process type")
-
-    req = {
-        "cmd": proc_cmd,
-        "args": args,
+    req: Dict[str, Any] = {
+        "machine": machine,
+        "subsystem": subsystem,
+        "command": command,
     }
 
+    if args is not None:
+        req["args"] = args
+
+    raw = json.dumps(
+        req,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
+
+    print(f"Sending command to {machine} {subsystem} {command} {sock_path}")
+
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+        sock.connect(sock_path)
+        sock.sendall(raw)
+        sock.shutdown(socket.SHUT_WR)
+        buf = bytearray()
+        while True:
+            chunk = sock.recv(4096)
+            if not chunk:
+                break
+            buf.extend(chunk)
+        return json.loads(buf.decode("utf-8"))
+
+
+import socket
+import json
+import logging
+import os
+from typing import Dict, Callable, Optional
+
+def serve_commands(
+    *,
+    socket_path: str,
+    commands: Dict[str, Callable[[Optional[dict]], dict]],
+) -> None:
+    logging.info("[serve_commands] Starting command server on socket: %s", socket_path)
+    logging.info("[serve_commands] Registered command handlers: %s", list(commands.keys()))
+
     try:
-        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
-            sock.settimeout(timeout_s)
-            sock.connect(sock_path)
-            sock.sendall(json.dumps(req).encode("utf-8"))
-
-            data = sock.recv(256 * 1024)
-            if not data:
-                return _resp_err("empty response")
-
-            resp = json.loads(data.decode("utf-8"))
-            if not isinstance(resp, dict):
-                return _resp_err("invalid response")
-
-            return resp
-
+        os.unlink(socket_path)
     except FileNotFoundError:
-        return _resp_err("process not running")
-    except socket.timeout:
-        return _resp_err("process timeout")
+        pass
     except Exception as e:
-        return _resp_err(
-            "process communication failed",
-            {"exception": str(e)}
-        )
+        logging.error("[serve_commands] Failed to unlink socket: %s", e)
 
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as srv:
+        srv.bind(socket_path)
+        srv.listen()
+        logging.info("[serve_commands] Listening...")
 
-# ---------------------------------------------------------------------
-# Public send_command() — Teensy-compatible entry point
-# ---------------------------------------------------------------------
+        while True:
+            conn, _ = srv.accept()
+            with conn:
+                try:
+                    raw = conn.recv(65536).decode()
+                    logging.info("[serve_commands] Raw request: %s", raw)
 
-def send_command(op: str, payload: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Canonical command entry point.
+                    req = json.loads(raw)
 
-    This function intentionally mirrors the Teensy client interface.
+                    machine = req.get("machine")
+                    subsystem = req.get("subsystem")
+                    command = req.get("command")
+                    args = req.get("args", {})
 
-    Example:
-        send_command(
-            "PROCESS.COMMAND",
-            {
-                "type": "GNSS",
-                "proc_cmd": "REPORT",
-            }
-        )
-    """
+                    logging.info("[serve_commands] machine=%s subsystem=%s command=%s args=%s", machine, subsystem, command, args)
 
-    # -----------------------------------------------------------------
-    # PROCESS.COMMAND
-    # -----------------------------------------------------------------
+                    if command not in commands:
+                        logging.warning("[serve_commands] Unknown command: %s", command)
+                        conn.sendall(json.dumps({
+                            "success": False,
+                            "message": f"Unknown command: {command}"
+                        }).encode())
+                        continue
 
-    if op == "PROCESS.COMMAND":
-        type_name = payload.get("type")
-        proc_cmd  = payload.get("proc_cmd")
-        args      = payload.get("args")
+                    handler = commands[command]
+                    resp = handler(args)
 
-        if not type_name or not proc_cmd:
-            return _resp_err("missing type or proc_cmd")
+                    logging.info("[serve_commands] Response: %s", resp)
+                    conn.sendall(json.dumps(resp).encode())
 
-        ptype = _PROCESS_TYPE_BY_NAME.get(type_name)
-        if not ptype:
-            return _resp_err("unknown process type")
+                except Exception as e:
+                    logging.exception("[serve_commands] Exception while handling command")
+                    conn.sendall(json.dumps({
+                        "success": False,
+                        "message": str(e)
+                    }).encode())
 
-        return _process_command(
-            ptype=ptype,
-            proc_cmd=proc_cmd,
-            args=args,
-        )
-
-    # -----------------------------------------------------------------
-    # Unknown operation
-    # -----------------------------------------------------------------
-
-    return _resp_err("unrecognized operation")

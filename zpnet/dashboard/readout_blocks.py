@@ -1,16 +1,15 @@
 """
 ZPNet Dashboard Readout Blocks — SYSTEM Snapshot Edition
 
-All readouts are derived directly from the authoritative SYSTEM
-snapshot delivered via WebSocket.
+All readouts are derived directly from the authoritative SYSTEM snapshot.
 
 Invariants:
   • No database access
   • No aggregates
   • No events
-  • No inference
+  • No inference beyond explicit tests
   • Always fresh
-  • Readouts NEVER throw
+  • Defenseless (exceptions propagate to outer fault barrier)
 
 Author: The Mule + GPT
 """
@@ -19,118 +18,47 @@ from collections.abc import Generator
 
 from zpnet.processes.processes import send_command
 
+
 # ---------------------------------------------------------------------
 # Shared SYSTEM snapshot fetcher (AUTHORITATIVE)
 # ---------------------------------------------------------------------
 
 def get_system_snapshot() -> dict:
-    """
-    Retrieve the authoritative SYSTEM snapshot.
-
-    Semantics:
-      • SYSTEM is a logical authority, not a transport detail
-      • Under the hood, this resolves to the systemd-managed
-        ZPNet SYSTEM service via PROCESS.COMMAND
-      • Best-effort, snapshot-only
-      • NEVER throws
-      • NEVER blocks indefinitely
-      • NEVER returns partial protocol state
-
-    Returns:
-        dict: SYSTEM payload on success, or {} on failure.
-    """
-
-    try:
-        resp = send_command(
-            "PROCESS.COMMAND",
-            {
-                "type": "SYSTEM",
-                "proc_cmd": "REPORT",
-            }
-        )
-    except Exception:
-        # Transport failure, timeout, socket absence, etc.
-        return {}
-
-    # Defensive validation of response shape
-    if not isinstance(resp, dict):
-        return {}
-
-    if not resp.get("success"):
-        return {}
-
-    payload = resp.get("payload")
-
-    if not isinstance(payload, dict):
-        return {}
-
-    return payload
+    return send_command(machine="PI", subsystem="SYSTEM", command="REPORT")["payload"]
 
 
 # ---------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------
-
-def _safe(d: dict, *keys, default=None):
-    for k in keys:
-        if not isinstance(d, dict):
-            return default
-        d = d.get(k)
-    return d if d is not None else default
-
-# ---------------------------------------------------------------------
-# GNSS REPORT (authoritative, snapshot)
+# GNSS REPORT (snapshot)
 # ---------------------------------------------------------------------
 
 def gnss_report_readout() -> Generator[str, None, None]:
-    sys = get_system_snapshot()
-    gnss = sys.get("gnss", {})
+    g = get_system_snapshot()["gnss"]
 
-    yield "GNSS REPORT: NOMINAL" if gnss else "GNSS REPORT: DOWN"
+    yield f"GNSS REPORT: {g['health_state']}"
 
-    if not gnss:
-        yield "NO GNSS DATA"
-        return
+    if "date" in g:
+        yield f"UTC DATE: {g['date']}"
+    if "time" in g:
+        yield f"UTC TIME: {g['time']}"
 
-    # GNSS time/discipline may not always be present
-    # Report what exists, omit what does not
-    time_str = gnss.get("time")
-    date_str = gnss.get("date")
+    if "latitude_deg" in g and "longitude_deg" in g:
+        yield f"LATITUDE:  {g['latitude_deg']:.6f}°"
+        yield f"LONGITUDE: {g['longitude_deg']:.6f}°"
 
-    if date_str:
-        yield f"UTC DATE: {date_str}"
-    if time_str:
-        yield f"UTC TIME: {time_str}"
+    if "altitude_m" in g:
+        yield f"ALTITUDE: {g['altitude_m']:.1f} M"
 
-    lat = gnss.get("latitude_deg")
-    lon = gnss.get("longitude_deg")
+    if "discipline" in g:
+        yield f"DISCIPLINE MODE: {g['discipline']}"
 
-    if lat is not None and lon is not None:
-        yield f"LATITUDE:  {lat:.6f}°"
-        yield f"LONGITUDE: {lon:.6f}°"
-
-    alt = gnss.get("altitude_m")
-    if alt is not None:
-        yield f"ALTITUDE: {alt:.1f} M"
-
-    discipline = gnss.get("discipline")
-    if discipline:
-        yield f"DISCIPLINE MODE: {discipline}"
 
 # ---------------------------------------------------------------------
-# SENSOR SCAN (authoritative presence snapshot)
+# SENSOR SCAN
 # ---------------------------------------------------------------------
 
 def sensor_scan_readout() -> Generator[str, None, None]:
-    sys = get_system_snapshot()
-    sensors = sys.get("sensors", {})
-
+    sensors = get_system_snapshot()["sensors"]
     yield "SENSOR SCAN:"
-
-    if not sensors:
-        yield "NO SENSOR DATA"
-        return
-
     for name, state in sensors.items():
         yield f"{name.upper()}: {state}"
 
@@ -140,19 +68,13 @@ def sensor_scan_readout() -> Generator[str, None, None]:
 # ---------------------------------------------------------------------
 
 def environment_status_readout() -> Generator[str, None, None]:
-    sys = get_system_snapshot()
-    env = sys.get("environment", {})
+    e = get_system_snapshot()["environment"]
 
-    yield f"ENVIRONMENT: {env.get('health_state', 'DOWN')}"
-
-    if not env:
-        yield "ENVIRONMENT DATA UNAVAILABLE."
-        return
-
-    yield f"TEMPERATURE: {env.get('temperature_c', 0):.2f} C"
-    yield f"HUMIDITY: {env.get('humidity_pct', 0):.2f} %"
-    yield f"PRESSURE: {env.get('pressure_hpa', 0):.2f} HPA"
-    yield f"ALTITUDE: {env.get('altitude_m', 0):.1f} M"
+    yield f"ENVIRONMENT: {e['health_state']}"
+    yield f"TEMPERATURE: {e['temperature_c']:.2f} C"
+    yield f"HUMIDITY: {e['humidity_pct']:.2f} %"
+    yield f"PRESSURE: {e['pressure_hpa']:.2f} HPA"
+    yield f"ALTITUDE: {e['altitude_m']:.1f} M"
 
 
 # ---------------------------------------------------------------------
@@ -160,21 +82,15 @@ def environment_status_readout() -> Generator[str, None, None]:
 # ---------------------------------------------------------------------
 
 def laser_status_readout() -> Generator[str, None, None]:
-    sys = get_system_snapshot()
-    las = sys.get("laser", {})
+    l = get_system_snapshot()["laser"]
 
-    yield f"LASER STATUS: {las.get('health_state', 'DOWN')}"
-
-    if not las or not las.get("device_present"):
-        yield "LASER CONTROLLER UNAVAILABLE."
-        return
-
-    yield f"I2C ADDRESS: {las.get('i2c_address', 'UNKNOWN')}"
-    yield f"SYSTEM ENABLED: {'YES' if las.get('sys_enabled') else 'NO'}"
-    yield f"ID1 ENABLED: {'YES' if las.get('id1_enabled') else 'NO'}"
-    yield f"ID1 CURRENT: {las.get('id1_current_ma', 0):.2f} MA"
-    yield f"LASER EMITTING: {'YES' if las.get('laser_emitting') else 'NO'}"
-    yield f"PD VOLTAGE: {las.get('pd_voltage', 0):.4f} V"
+    yield f"LASER STATUS: {l['health_state']}"
+    yield f"I2C ADDRESS: {l['i2c_address']}"
+    yield f"SYSTEM ENABLED: {'YES' if l['sys_enabled'] else 'NO'}"
+    yield f"ID1 ENABLED: {'YES' if l['id1_enabled'] else 'NO'}"
+    yield f"ID1 CURRENT: {l['id1_current_ma']:.2f} MA"
+    yield f"LASER EMITTING: {'YES' if l['laser_emitting'] else 'NO'}"
+    yield f"PD VOLTAGE: {l['pd_voltage']:.4f} V"
 
 
 # ---------------------------------------------------------------------
@@ -182,20 +98,14 @@ def laser_status_readout() -> Generator[str, None, None]:
 # ---------------------------------------------------------------------
 
 def network_status_readout() -> Generator[str, None, None]:
-    sys = get_system_snapshot()
-    net = sys.get("network", {})
+    n = get_system_snapshot()["network"]
 
-    yield f"NETWORK STATUS: {net.get('network_status', 'DOWN')}"
-
-    if not net:
-        yield "NETWORK DATA UNAVAILABLE."
-        return
-
-    yield f"SSID: {net.get('ssid', 'UNKNOWN')}"
-    yield f"LOCAL IP: {net.get('local_ip', '0.0.0.0')}"
-    yield f"PING: {net.get('ping_ms', 0):.2f} MS"
-    yield f"DOWNLOAD: {net.get('download_mbps', 0):.2f} MBPS"
-    yield f"UPLOAD: {net.get('upload_mbps', 0):.2f} MBPS"
+    yield f"NETWORK STATUS: {n['network_status']}"
+    yield f"SSID: {n['ssid']}"
+    yield f"LOCAL IP: {n['local_ip']}"
+    yield f"PING: {n['ping_ms']:.2f} MS"
+    yield f"DOWNLOAD: {n['download_mbps']:.2f} MBPS"
+    yield f"UPLOAD: {n['upload_mbps']:.2f} MBPS"
 
 
 # ---------------------------------------------------------------------
@@ -203,142 +113,76 @@ def network_status_readout() -> Generator[str, None, None]:
 # ---------------------------------------------------------------------
 
 def power_status_readout() -> Generator[str, None, None]:
-    sys = get_system_snapshot()
-    pwr = sys.get("power", {})
+    p = get_system_snapshot()["power"]
+    rails = p["rails"]
 
-    yield f"POWER STATUS: {pwr.get('health_state', 'DOWN')}"
-
-    rails = pwr.get("rails")
-    if not rails:
-        yield "POWER DATA UNAVAILABLE."
-        return
+    yield f"POWER STATUS: {p['health_state']}"
 
     load_total = 0.0
     battery_power = None
 
     for r in rails:
-        label = r.get("label", "UNKNOWN")
-        v = r.get("voltage_v", 0.0)
-        i = r.get("current_ma", 0.0)
-        p = r.get("power_w", 0.0)
+        label = r["label"]
+        v = r["voltage_v"]
+        i = r["current_ma"]
+        pw = r["power_w"]
 
-        yield f"{label.upper():<14} {v:>6.3f} V {i:>7.1f} MA {p:>6.3f} W"
+        yield f"{label.upper():<14} {v:>6.3f} V {i:>7.1f} MA {pw:>6.3f} W"
 
         if label.lower() == "battery":
-            battery_power = p
+            battery_power = pw
         else:
-            load_total += p
+            load_total += pw
 
     yield f"TOTAL LOAD POWER: {load_total:.3f} W"
 
     if battery_power and battery_power > 0:
-        eff = (load_total / battery_power) * 100.0
-        yield f"EFFICIENCY: {eff:.1f} %"
+        yield f"EFFICIENCY: {(load_total / battery_power) * 100.0:.1f} %"
+
 
 # ---------------------------------------------------------------------
-# BATTERY STATUS (instantaneous, snapshot-only)
+# BATTERY STATUS
 # ---------------------------------------------------------------------
 
 def battery_status_readout() -> Generator[str, None, None]:
-    sys = get_system_snapshot()
-    pwr = sys.get("power", {})
+    p = get_system_snapshot()["power"]
+    rails = p["rails"]
 
-    yield f"BATTERY STATUS: {pwr.get('health_state', 'DOWN')}"
+    yield f"BATTERY STATUS: {p['health_state']}"
 
-    rails = pwr.get("rails")
-    if not rails:
-        yield "BATTERY DATA UNAVAILABLE."
-        return
+    battery = next(r for r in rails if r["label"].lower() == "battery")
 
-    battery = next(
-        (r for r in rails if r.get("label", "").lower() == "battery"),
-        None
-    )
+    yield f"VOLTAGE: {battery['voltage_v']:.3f} V"
+    yield f"CURRENT: {battery['current_ma']:.1f} MA"
+    yield f"POWER:   {battery['power_w']:.3f} W"
 
-    if not battery:
-        yield "BATTERY RAIL NOT FOUND."
-        return
-
-    v = battery.get("voltage_v", 0.0)
-    i = battery.get("current_ma", 0.0)
-    p = battery.get("power_w", 0.0)
-
-    yield f"VOLTAGE: {v:.3f} V"
-    yield f"CURRENT: {i:.1f} MA"
-    yield f"POWER:   {p:.3f} W"
-
-    ideal = battery.get("ideal_voltage_v")
-    if ideal:
-        yield f"IDEAL VOLTAGE: {ideal:.1f} V"
-
-
-# ---------------------------------------------------------------------
-# SENSORS
-# ---------------------------------------------------------------------
-
-def sensor_scan_readout() -> Generator[str, None, None]:
-    sys = get_system_snapshot()
-    sensors = sys.get("sensors", {})
-
-    yield "SENSOR SCAN:"
-
-    if not sensors:
-        yield "NO SENSOR DATA."
-        return
-
-    for name, state in sensors.items():
-        yield f"{name.upper()}: {state}"
-
+    if "ideal_voltage_v" in battery and battery["ideal_voltage_v"] is not None:
+        yield f"IDEAL VOLTAGE: {battery['ideal_voltage_v']:.1f} V"
 
 # ---------------------------------------------------------------------
 # TEENSY
 # ---------------------------------------------------------------------
 
 def teensy_status_readout() -> Generator[str, None, None]:
-    sys = get_system_snapshot()
-    tee = sys.get("teensy", {})
+    t = get_system_snapshot()["teensy"]
 
-    yield f"TEENSY STATUS: {tee.get('health_state', 'NOMINAL')}"
-
-    if not tee:
-        yield "TEENSY DATA UNAVAILABLE."
-        return
-
-    yield f"FW VERSION: {tee.get('fw_version', 'UNKNOWN')}"
-    yield f"CPU TEMP: {tee.get('cpu_temp_c', 0):.2f} C"
-    yield f"CPU USAGE: {tee.get('cpu_usage_pct', 0):.4f} %"
-    yield f"FREE HEAP: {tee.get('free_heap_bytes', 0)} BYTES"
+    yield f"TEENSY STATUS: {t['health_state']}"
+    yield f"FW VERSION: {t['fw_version']}"
+    yield f"CPU TEMP: {t['cpu_temp_c']:.2f} C"
+    yield f"CPU USAGE: {t['cpu_usage_pct']:.4f} %"
+    yield f"FREE HEAP: {t['free_heap_bytes']} BYTES"
 
 
 # ---------------------------------------------------------------------
-# PHOTODIODE STATUS (physical ground truth)
+# PHOTODIODE STATUS (laser-owned ground truth)
 # ---------------------------------------------------------------------
 
 def photodiode_status_readout() -> Generator[str, None, None]:
-    sys = get_system_snapshot()
-    las = sys.get("laser", {})
+    l = get_system_snapshot()["laser"]
 
-    # Health is inherited from laser observation path
-    yield f"PHOTODIODE STATUS: {las.get('health_state', 'DOWN')}"
-
-    if not las:
-        yield "NO PHOTODIODE DATA"
-        return
-
-    pd_v = las.get("pd_voltage")
-    emitting = las.get("laser_emitting")
-
-    if pd_v is not None:
-        yield f"ANALOG VOLTAGE: {pd_v:.5f} V"
-    else:
-        yield "ANALOG VOLTAGE: UNKNOWN"
-
-    if emitting is True:
-        yield "LIGHT PRESENT: YES"
-    elif emitting is False:
-        yield "LIGHT PRESENT: NO"
-    else:
-        yield "LIGHT PRESENT: UNKNOWN"
+    yield f"PHOTODIODE STATUS: {l['health_state']}"
+    yield f"ANALOG VOLTAGE: {l['pd_voltage']:.5f} V"
+    yield f"LIGHT PRESENT: {'YES' if l['laser_emitting'] else 'NO'}"
 
 
 # ---------------------------------------------------------------------
@@ -346,43 +190,22 @@ def photodiode_status_readout() -> Generator[str, None, None]:
 # ---------------------------------------------------------------------
 
 def raspberry_pi_status_readout() -> Generator[str, None, None]:
-    sys = get_system_snapshot()
-    pi = sys.get("pi", {})
+    p = get_system_snapshot()["pi"]
+    mem = p["memory"]
+    disk = p["disk"]
+    uv = p["undervoltage_flags"]
 
-    yield f"RASPBERRY PI STATUS: {pi.get('health_state', 'DOWN')}"
+    yield f"RASPBERRY PI STATUS: {p['health_state']}"
+    yield f"DEVICE: {p['device_name']}"
+    yield f"CPU TEMP: {p['cpu_temp_c']:.1f} C"
+    yield f"LOAD (1/5/15): {p['load_1m']:.2f} / {p['load_5m']:.2f} / {p['load_15m']:.2f}"
+    yield f"UPTIME: {p['uptime_s'] / 3600:.2f} H"
+    yield f"MEM USED: {mem['used_mb']:.0f} / {mem['total_mb']:.0f} MB ({mem['percent']:.1f}%)"
+    yield f"DISK USED: {disk['used_gb']:.2f} / {disk['total_gb']:.2f} GB ({disk['percent']:.1f}%)"
 
-    if not pi:
-        yield "PI DATA UNAVAILABLE."
-        return
-
-    yield f"DEVICE: {pi.get('device_name', 'UNKNOWN')}"
-    yield f"CPU TEMP: {pi.get('cpu_temp_c', 0):.1f} C"
-    yield (
-        f"LOAD (1/5/15): "
-        f"{pi.get('load_1m', 0):.2f} / "
-        f"{pi.get('load_5m', 0):.2f} / "
-        f"{pi.get('load_15m', 0):.2f}"
-    )
-    yield f"UPTIME: {pi.get('uptime_s', 0) / 3600:.2f} H"
-
-    mem = pi.get("memory", {})
-    yield (
-        f"MEM USED: {mem.get('used_mb', 0):.0f} / "
-        f"{mem.get('total_mb', 0):.0f} MB "
-        f"({mem.get('percent', 0):.1f}%)"
-    )
-
-    disk = pi.get("disk", {})
-    yield (
-        f"DISK USED: {disk.get('used_gb', 0):.2f} / "
-        f"{disk.get('total_gb', 0):.2f} GB "
-        f"({disk.get('percent', 0):.1f}%)"
-    )
-
-    uv = pi.get("undervoltage_flags", {})
-    if uv.get("currently_undervolted"):
+    if uv["currently_undervolted"]:
         yield "UNDERVOLTAGE: ACTIVE"
-    elif uv.get("previously_undervolted"):
+    elif uv["previously_undervolted"]:
         yield "UNDERVOLTAGE: RECOVERED"
     else:
         yield "UNDERVOLTAGE: NONE"

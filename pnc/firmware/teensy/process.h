@@ -10,6 +10,7 @@
 typedef enum {
   PROCESS_TYPE_NONE = 0,
   PROCESS_TYPE_CLOCKS,
+  PROCESS_TYPE_EVENTS,
   PROCESS_TYPE_TIMEPOP,
   PROCESS_TYPE_LASER,
   PROCESS_TYPE_PHOTODIODE,
@@ -30,19 +31,8 @@ typedef enum {
 // --------------------------------------------------
 // Command Response Contract
 // --------------------------------------------------
-//
-// All process commands return a JSON object with:
-//
-//   {
-//     "success": true|false,
-//     "message": "OK" | "...",
-//     "payload": { ... }   // optional
-//   }
-//
-// The framework does not interpret payload contents.
-//
 
-typedef String (*process_command_fn)(
+typedef const String* (*process_command_fn)(
   const char* args_json   // may be nullptr
 );
 
@@ -93,14 +83,8 @@ bool process_register(
 bool process_start(process_type_t type);
 bool process_stop(process_type_t type);
 
-// Introspection (used by PROCESS.QUERY)
-bool process_query(
-  process_type_t type,
-  String& out_body
-);
-
 // Canonical command invocation
-bool process_command(
+void process_command(
   process_type_t type,
   const char*    cmd_name,
   const char*    args_json,
@@ -109,3 +93,15 @@ bool process_command(
 
 // Registry introspection
 String process_list_json(void);
+
+// --------------------------------------------------
+// Subsystem name → process type mapping
+// --------------------------------------------------
+//
+// Returns true if the subsystem name is recognized and sets `out`.
+// Returns false for unknown subsystem names.
+//
+bool process_type_from_name(
+  const char* subsystem,
+  process_type_t& out
+);

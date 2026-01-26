@@ -228,10 +228,7 @@ def process_response(msg: bytes) -> None:
     if gt == -1:
         return
 
-    try:
-        length = int(msg[len(STX_PREFIX):gt])
-    except ValueError:
-        return
+    length = int(msg[len(STX_PREFIX):gt])
 
     payload_start = gt + 1
     payload_end   = payload_start + length
@@ -243,10 +240,7 @@ def process_response(msg: bytes) -> None:
     payload = msg[payload_start:payload_end]
     _snoop("→", payload)
 
-    try:
-        parsed = json.loads(payload.decode("utf-8"))
-    except json.JSONDecodeError:
-        return
+    parsed = json.loads(payload.decode("utf-8"))
 
     route_message(parsed)
 
@@ -276,167 +270,103 @@ def route_message(msg: dict) -> None:
 # ---------------------------------------------------------------------
 
 def hid_reader() -> None:
-    global hid_fd
-    last_drain = 0.0
 
-    while True:
-        if not hid_present.is_set():
-            logging.info("[teensy_listener] waiting for Teensy HID...")
-            hid_fd = open_hid_blocking()
-            continue
+    try:
+        global hid_fd
+        last_drain = 0.0
 
-        msg = read_rawhid_message()
-        if not msg:
-            continue
+        while True:
+            if not hid_present.is_set():
+                logging.info("[teensy_listener] waiting for Teensy HID...")
+                hid_fd = open_hid_blocking()
+                continue
 
-        first = msg[0]
+            msg = read_rawhid_message()
+            if not msg:
+                continue
 
-        if first == DEBUG_MARKER:
-            write_debug_line(
-                msg[1:].decode("utf-8", errors="replace")
-            )
-            continue
+            first = msg[0]
 
-        if first == ASCII_LT:
-            process_response(msg)
+            if first == DEBUG_MARKER:
+                write_debug_line(
+                    msg[1:].decode("utf-8", errors="replace")
+                )
+                continue
 
-        now = time.time()
-        if now - last_drain >= EVENT_DESPOOL_INTERVAL_S:
-            try:
-                send_frame({"cmd": "EVENTS.GET"})
-            except RuntimeError:
-                pass
-            last_drain = now
+            if first == ASCII_LT:
+                process_response(msg)
 
+            now = time.time()
+            if now - last_drain >= EVENT_DESPOOL_INTERVAL_S:
+                try:
+                    send_frame({"cmd": "EVENTS.GET"})
+                except RuntimeError:
+                    pass
+                last_drain = now
+
+    except Exception:
+        logging.exception("[hid_reader] teensy_listener unexpected exception")
 
 # ---------------------------------------------------------------------
 # RPC handler
 # ---------------------------------------------------------------------
-
 def handle_client(conn: socket.socket) -> None:
     req_id = 0
     q: Optional[Queue] = None
-
-    try:
-        # -------------------------
-        # Read one JSON request
-        # -------------------------
-        buf = bytearray()
-        while True:
-            chunk = conn.recv(4096)
-            if not chunk:
-                return
-            buf.extend(chunk)
-            try:
-                req = json.loads(buf.decode("utf-8"))
-                break
-            except json.JSONDecodeError:
-                continue
-
-        # -------------------------
-        # Register pending reply
-        # -------------------------
-        req_id = next(req_id_counter)
-        req["req_id"] = req_id
-
-        q = Queue(maxsize=1)
-        with state_lock:
-            pending_replies[req_id] = q
-
-        # -------------------------
-        # Dispatch to Teensy
-        # -------------------------
-        try:
-            send_frame(req)
-        except RuntimeError:
-            _safe_sendall(
-                conn,
-                json.dumps(
-                    {"success": False, "message": "Teensy unavailable"},
-                    separators=(",", ":")
-                ).encode("utf-8")
-            )
+    buf = bytearray()
+    while True:
+        chunk = conn.recv(4096)
+        if not chunk:
             return
-
-        # -------------------------
-        # Await reply
-        # -------------------------
+        buf.extend(chunk)
         try:
-            reply = q.get(timeout=10.0)
-        except queue.Empty:
-            with state_lock:
-                pending_replies.pop(req_id, None)
-            _safe_sendall(
-                conn,
-                json.dumps(
-                    {"success": False, "message": "RPC timeout"},
-                    separators=(",", ":")
-                ).encode("utf-8")
-            )
-            return
-
-        # -------------------------
-        # Return reply to client
-        # -------------------------
-        _safe_sendall(
-            conn,
-            json.dumps(reply, separators=(",", ":")).encode("utf-8")
-        )
-
-    except Exception:
-        # The service must not die because a client misbehaved.
-        # Keep logs lean but informative.
-        logging.exception("[teensy_listener] handle_client failed")
-        try:
-            with state_lock:
-                if req_id:
-                    pending_replies.pop(req_id, None)
-        except Exception:
-            pass
-
-    finally:
-        try:
-            conn.close()
-        except Exception:
-            pass
-
+            req = json.loads(buf.decode("utf-8"))
+            break
+        except json.JSONDecodeError:
+            continue
+    req_id = next(req_id_counter)
+    req["req_id"] = req_id
+    q = Queue(maxsize=1)
+    with state_lock:
+        pending_replies[req_id] = q
+    send_frame(req)
+    reply = q.get(timeout=10.0)
+    _safe_sendall(conn, json.dumps(reply, separators=(",", ":")).encode("utf-8"))
+    conn.close()
 
 # ---------------------------------------------------------------------
 # RPC server
 # ---------------------------------------------------------------------
 
 def rpc_server() -> None:
-    if os.path.exists(RPC_SOCKET_PATH):
-        os.unlink(RPC_SOCKET_PATH)
 
-    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    sock.bind(RPC_SOCKET_PATH)
-    os.chmod(RPC_SOCKET_PATH, 0o660)
-    sock.listen(RPC_BACKLOG)
+    try:
+        if os.path.exists(RPC_SOCKET_PATH):
+            os.unlink(RPC_SOCKET_PATH)
 
-    while True:
-        conn, _ = sock.accept()
-        threading.Thread(
-            target=handle_client,
-            args=(conn,),
-            daemon=True
-        ).start()
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.bind(RPC_SOCKET_PATH)
+        os.chmod(RPC_SOCKET_PATH, 0o660)
+        sock.listen(RPC_BACKLOG)
 
+        while True:
+            conn, _ = sock.accept()
+            threading.Thread(
+                target=handle_client,
+                args=(conn,),
+                daemon=True
+            ).start()
+
+    except Exception:
+        logging.exception("[rpc_server] teensy_listener unexpected exception")
 
 # ---------------------------------------------------------------------
 # Serial snoop
 # ---------------------------------------------------------------------
 
 def _snoop(direction: str, payload: bytes) -> None:
-    try:
-        with open(SERIAL_SNOOP_PATH, "a") as f:
-            f.write(
-                f"{time.time():.6f} {direction} "
-                f"{payload.decode('utf-8', errors='replace')}\n"
-            )
-    except Exception:
-        pass
-
+    with open(SERIAL_SNOOP_PATH, "a") as f:
+        f.write(f"{time.time():.6f} {direction} {payload.decode('utf-8', errors='replace')}\n")
 
 # ---------------------------------------------------------------------
 # Main
@@ -444,17 +374,16 @@ def _snoop(direction: str, payload: bytes) -> None:
 
 def run() -> None:
     global hid_fd
-
     setup_logging()
     open_debug_log()
-
-    hid_fd = open_hid_blocking()
-
-    threading.Thread(target=hid_reader, daemon=True).start()
-    threading.Thread(target=rpc_server, daemon=True).start()
-
-    while True:
-        time.sleep(1)
+    try:
+        hid_fd = open_hid_blocking()
+        threading.Thread(target=hid_reader, daemon=True).start()
+        threading.Thread(target=rpc_server, daemon=True).start()
+        while True:
+            time.sleep(1)
+    except Exception:
+        logging.exception("[main] teensy_listener fatal crash")
 
 def bootstrap() -> None:
     run()

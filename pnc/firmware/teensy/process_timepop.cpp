@@ -2,7 +2,7 @@
 #include "timepop.h"
 
 #include "process.h"
-#include "event_bus.h"
+#include "events.h"
 #include "cpu_usage.h"
 
 #include <Arduino.h>
@@ -228,29 +228,37 @@ uint32_t timepop_get_zero_hits(void) {
 // Commands
 // ================================================================
 
-static String cmd_report(const char*) {
+// ------------------------------------------------------------
+// REPORT — active TimePop timer snapshot
+// ------------------------------------------------------------
+static const String* cmd_report(const char* /*args_json*/) {
 
-  String p = "{ \"timers\": [";
+  // Persistent payload storage
+  static String payload;
+  payload = "{ \"timers\": [";
 
   bool first = true;
   for (uint32_t i = 0; i < TIMEPOP_MAX_SLOTS; i++) {
 
     if (!slots[i].active) continue;
 
-    if (!first) p += ",";
+    if (!first) payload += ",";
     first = false;
 
-    p += "{";
-    p += "\"slot\":";  p += i;
-    p += ",\"id\":";   p += slots[i].id;
-    p += ",\"class\":"; p += slots[i].klass;
-    p += ",\"name\":\""; p += slots[i].name ? slots[i].name : "unnamed"; p += "\"";
-    p += ",\"remaining_ticks\":"; p += slots[i].remaining_ticks;
-    p += "}";
+    payload += "{";
+    payload += "\"slot\":"; payload += i;
+    payload += ",\"id\":"; payload += slots[i].id;
+    payload += ",\"class\":"; payload += slots[i].klass;
+    payload += ",\"name\":\"";
+    payload += (slots[i].name ? slots[i].name : "unnamed");
+    payload += "\"";
+    payload += ",\"remaining_ticks\":"; payload += slots[i].remaining_ticks;
+    payload += "}";
   }
 
-  p += "] }";
-  return p;
+  payload += "] }";
+
+  return &payload;
 }
 
 // ================================================================
