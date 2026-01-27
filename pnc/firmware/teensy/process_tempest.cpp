@@ -6,6 +6,7 @@
 #include "clock.h"
 #include "config.h"
 #include "events.h"
+#include "payload.h"
 #include "process.h"
 #include "smartpop.h"
 
@@ -81,28 +82,14 @@ static void tempest_confirm_end_cb(void* /*context*/) {
   // ---------------------------------------------------------
   // Emit authoritative result
   // ---------------------------------------------------------
-  String body;
+  Payload ev;
+  ev.add("seconds", confirm_seconds);
+  ev.add("ideal_ns", ideal_ns);
+  ev.add("measured_ns", measured_ns);
+  ev.add("error_ns", error_ns);
+  ev.add_fmt("ratio", "%.12f", ratio);
 
-  body += "\"seconds\":";
-  body += confirm_seconds;
-
-  body += ",\"ideal_ns\":";
-  body += ideal_ns;
-
-  body += ",\"measured_ns\":";
-  body += measured_ns;
-
-  body += ",\"error_ns\":";
-  body += error_ns;
-
-  body += ",\"ratio\":";
-  {
-    char buf[32];
-    snprintf(buf, sizeof(buf), "%.12f", ratio);
-    body += buf;
-  }
-
-  enqueueEvent("TEMPEST_CONFIRM_RESULT", body);
+  enqueueEvent("TEMPEST_CONFIRM_RESULT", ev);
 
   // ---------------------------------------------------------
   // Reset state
@@ -119,40 +106,41 @@ static void tempest_confirm_end_cb(void* context);
 // -------------------------------------------------------------
 // CONFIRM — arm a GNSS-aligned confirm window
 // -------------------------------------------------------------
-static const String* cmd_confirm(const char* args_json) {
+static const Payload* cmd_confirm(const char* args_json) {
 
-  static String payload;
+  static Payload resp;
+  resp.clear();
 
   if (!args_json) {
-    payload = "{\"error\":\"missing args\"}";
-    return &payload;
+    resp.add("error", "missing args");
+    return &resp;
   }
 
   const char* p = strstr(args_json, "\"seconds\"");
   if (!p) {
-    payload = "{\"error\":\"missing seconds\"}";
-    return &payload;
+    resp.add("error", "missing seconds");
+    return &resp;
   }
 
   p = strchr(p, ':');
   if (!p) {
-    payload = "{\"error\":\"malformed seconds\"}";
-    return &payload;
+    resp.add("error", "malformed seconds");
+    return &resp;
   }
   p++;
 
   uint32_t seconds = (uint32_t)strtoul(p, nullptr, 10);
   if (seconds == 0) {
-    payload = "{\"error\":\"seconds must be > 0\"}";
-    return &payload;
+    resp.add("error", "seconds must be > 0");
+    return &resp;
   }
 
   // ---------------------------------------------------------
   // Enforce single in-flight confirm
   // ---------------------------------------------------------
   if (confirm_active) {
-    payload = "{\"error\":\"confirm already in progress\"}";
-    return &payload;
+    resp.add("error", "confirm already in progress");
+    return &resp;
   }
 
   // ---------------------------------------------------------
@@ -169,14 +157,14 @@ static const String* cmd_confirm(const char* args_json) {
     (void*)(uintptr_t)seconds
   );
 
-  payload = "{\"status\":\"armed\"}";
-  return &payload;
+  resp.add("status", "armed");
+  return &resp;
 }
 
 // -------------------------------------------------------------
 // BASELINE — discover standard error baseline
 // -------------------------------------------------------------
-static const String* cmd_baseline(const char* /*args_json*/) {
+static const Payload* cmd_baseline(const char* /*args_json*/) {
 
   uint32_t samples = 0;
   int32_t  min_e = 0, max_e = 0, med_e = 0, std_e = 0;
@@ -191,55 +179,45 @@ static const String* cmd_baseline(const char* /*args_json*/) {
       &stddev
   );
 
-  static String payload;
-  payload = "{";
+  static Payload p;
+  p.clear();
 
-  payload += "\"samples\":";
-  payload += samples;
+  p.add("samples", samples);
+  p.add("baseline_error", std_e);
+  p.add_fmt("stddev", "%.6f", stddev);
 
-  payload += ",\"baseline_error\":";
-  payload += std_e;
-
-  payload += ",\"stddev\":";
-  {
-    char buf[32];
-    snprintf(buf, sizeof(buf), "%.6f", stddev);
-    payload += buf;
-  }
-
-  payload += "}";
-
-  return &payload;
+  return &p;
 }
 
 // -------------------------------------------------------------
 // TAU — run full tau profiling
 // -------------------------------------------------------------
-static const String* cmd_tau(const char* args) {
+static const Payload* cmd_tau(const char* args) {
 
-  static String payload;
+  static Payload resp;
+  resp.clear();
 
   if (!args) {
-    payload = "{\"error\":\"missing args\"}";
-    return &payload;
+    resp.add("error", "missing args");
+    return &resp;
   }
 
   const char* p = strstr(args, "seconds=");
   if (!p) {
-    payload = "{\"error\":\"missing seconds\"}";
-    return &payload;
+    resp.add("error", "missing seconds");
+    return &resp;
   }
 
   uint32_t seconds = (uint32_t)strtoul(p + 8, nullptr, 10);
   if (seconds == 0) {
-    payload = "{\"error\":\"seconds must be > 0\"}";
-    return &payload;
+    resp.add("error", "seconds must be > 0");
+    return &resp;
   }
 
   bool ok = tempest_tau_profile(seconds);
 
-  payload = ok ? "{\"status\":\"ok\"}" : "{\"status\":\"fail\"}";
-  return &payload;
+  resp.add("status", ok ? "ok" : "fail");
+  return &resp;
 }
 
 // ================================================================
@@ -266,12 +244,16 @@ void process_tempest_register(void) {
 }
 
 static bool tempest_start(void) {
-  enqueueEvent("TEMPEST_INIT_ENTER", "\"stage\":\"process_start\"");
+  Payload ev;
+  ev.add("stage", "process_start");
+  enqueueEvent("TEMPEST_INIT_ENTER", ev);
   return true;
 }
 
 static void tempest_stop(void) {
-  enqueueEvent("TEMPEST_STOP", "\"stage\":\"process_stop\"");
+  Payload ev;
+  ev.add("stage", "process_stop");
+  enqueueEvent("TEMPEST_STOP", ev);
 }
 
 // =============================================================
@@ -451,16 +433,12 @@ static void tau_hist_init_from_baseline(
   }
 
   {
-    String d;
-    d += "\"baseline_stddev\":";
-    d += baseline_stddev;
-    d += ",\"span\":";
-    d += span;
-    d += ",\"gate\":";
-    d += gate;
-    d += ",\"bin_count\":";
-    d += h->bin_count;
-    enqueueEvent("TAU_DIAG_HIST_INIT", d);
+    Payload ev;
+    ev.add("baseline_stddev", baseline_stddev);
+    ev.add("span", span);
+    ev.add("gate", gate);
+    ev.add("bin_count", h->bin_count);
+    enqueueEvent("TAU_DIAG_HIST_INIT", ev);
   }
 }
 
@@ -471,23 +449,29 @@ static inline bool tau_hist_add_residual(
   h->samples_total++;
 
   {
-    String d;
-    d += "\"residual\":";
-    d += residual;
-    d += ",\"gate\":";
-    d += h->gate_cycles;
-    enqueueEvent("TAU_FOO_RESIDUAL", d);
+    Payload ev;
+    ev.add("residual", residual);
+    ev.add("gate", h->gate_cycles);
+    enqueueEvent("TAU_FOO_RESIDUAL", ev);
   }
 
   if (residual > h->gate_cycles || residual < -h->gate_cycles) {
     h->samples_dropped++;
-    enqueueEvent("TAU_FOO_DROP", "\"reason\":\"gate_violation\"");
+    {
+      Payload ev;
+      ev.add("reason", "gate_violation");
+      enqueueEvent("TAU_FOO_DROP", ev);
+    }
     return false;
   }
 
   if (residual < h->min_residual || residual > h->max_residual) {
     h->samples_dropped++;
-    enqueueEvent("TAU_FOO_DROP", "\"reason\":\"span_violation\"");
+    {
+      Payload ev;
+      ev.add("reason", "span_violation");
+      enqueueEvent("TAU_FOO_DROP", ev);
+    }
     return false;
   }
 
@@ -495,7 +479,11 @@ static inline bool tau_hist_add_residual(
   h->bins[idx]++;
   h->samples_kept++;
 
-  enqueueEvent("TAU_FOO_KEEP", "\"status\":\"accepted\"");
+  {
+    Payload ev;
+    ev.add("status", "accepted");
+    enqueueEvent("TAU_FOO_KEEP", ev);
+  }
   return true;
 }
 
@@ -511,7 +499,11 @@ static void tau_hist_reduce(
     double*  sem_seconds_out
 ) {
   if (!h || h->samples_kept == 0) {
-    enqueueEvent("TAU_DIAG_REDUCE_EMPTY", "\"note\":\"no_kept_samples\"");
+    {
+      Payload ev;
+      ev.add("note", "no_kept_samples");
+      enqueueEvent("TAU_DIAG_REDUCE_EMPTY", ev);
+    }
     if (tau_out) *tau_out = 1.0;
     if (mean_error_out) *mean_error_out = 0.0;
     if (sem_seconds_out) *sem_seconds_out = 0.0;
@@ -560,7 +552,11 @@ static void emit_tau_result(
     double baseline_stddev,
     const tau_histogram_t* hist
 ) {
-  enqueueEvent("TAU_DIAG_EMIT_ENTER", "\"stage\":\"emit_tau_result\"");
+  {
+    Payload ev;
+    ev.add("stage", "emit_tau_result");
+    enqueueEvent("TAU_DIAG_EMIT_ENTER", ev);
+  }
 
   double tau = 1.0;
   double mean_error = 0.0;
@@ -568,43 +564,18 @@ static void emit_tau_result(
 
   tau_hist_reduce(hist, baseline_error, &tau, &mean_error, &sem_seconds);
 
-  String body;
-  body += "\"elapsed\":";
-  body += elapsed;
-  body += ",\"baseline_error\":";
-  body += baseline_error;
-  body += ",\"baseline_stddev\":";
-  {
-    char buf[32];
-    snprintf(buf, sizeof(buf), "%.6f", baseline_stddev);
-    body += buf;
-  }
-  body += ",\"windows_total\":";
-  body += hist->samples_total;
-  body += ",\"samples_kept\":";
-  body += hist->samples_kept;
-  body += ",\"samples_dropped\":";
-  body += hist->samples_dropped;
-  body += ",\"mean_error\":";
-  {
-    char buf[32];
-    snprintf(buf, sizeof(buf), "%.6f", mean_error);
-    body += buf;
-  }
-  body += ",\"tau\":";
-  {
-    char buf[32];
-    snprintf(buf, sizeof(buf), "%.12f", tau);
-    body += buf;
-  }
-  body += ",\"sem_seconds\":";
-  {
-    char buf[32];
-    snprintf(buf, sizeof(buf), "%.12e", sem_seconds);
-    body += buf;
-  }
+  Payload ev;
+  ev.add("elapsed", elapsed);
+  ev.add("baseline_error", baseline_error);
+  ev.add_fmt("baseline_stddev", "%.6f", baseline_stddev);
+  ev.add("windows_total", hist->samples_total);
+  ev.add("samples_kept", hist->samples_kept);
+  ev.add("samples_dropped", hist->samples_dropped);
+  ev.add_fmt("mean_error", "%.6f", mean_error);
+  ev.add_fmt("tau", "%.12f", tau);
+  ev.add_fmt("sem_seconds", "%.12e", sem_seconds);
 
-  enqueueEvent(event_type, body);
+  enqueueEvent(event_type, ev);
 }
 
 // =============================================================
@@ -612,7 +583,11 @@ static void emit_tau_result(
 // =============================================================
 
 bool tempest_tau_profile(uint32_t total_seconds) {
-  enqueueEvent("TAU_DIAG_ENTER", "\"stage\":\"tempest_tau_profile\"");
+  {
+    Payload ev;
+    ev.add("stage", "tempest_tau_profile");
+    enqueueEvent("TAU_DIAG_ENTER", ev);
+  }
 
   if (total_seconds < 1) return false;
 
@@ -632,14 +607,11 @@ bool tempest_tau_profile(uint32_t total_seconds) {
   }
 
   {
-    String b;
-    b += "\"samples\":";
-    b += baseline_samples;
-    b += ",\"baseline_error\":";
-    b += baseline_error;
-    b += ",\"baseline_stddev\":";
-    b += baseline_stddev;
-    enqueueEvent("TAU_PROFILE_BASELINE", b);
+    Payload ev;
+    ev.add("samples", baseline_samples);
+    ev.add("baseline_error", baseline_error);
+    ev.add("baseline_stddev", baseline_stddev);
+    enqueueEvent("TAU_PROFILE_BASELINE", ev);
   }
 
   tau_histogram_t hist;
@@ -657,22 +629,13 @@ bool tempest_tau_profile(uint32_t total_seconds) {
     int32_t residual = (int32_t)(error_cycles - baseline_error);
 
     {
-      String d;
-      d += "\"cpu_cycles\":";
-      d += cpu_cycles;
-      d += ",\"error_cycles\":";
-      d += error_cycles;
-      d += ",\"baseline_error\":";
-      d += baseline_error;
-      d += ",\"residual\":";
-      d += residual;
-      d += ",\"ratio\":";
-      {
-        char buf[32];
-        snprintf(buf, sizeof(buf), "%.12f", ratio);
-        d += buf;
-      }
-      enqueueEvent("TAU_DIAG_SAMPLE", d);
+      Payload ev;
+      ev.add("cpu_cycles", cpu_cycles);
+      ev.add("error_cycles", error_cycles);
+      ev.add("baseline_error", baseline_error);
+      ev.add("residual", residual);
+      ev.add_fmt("ratio", "%.12f", ratio);
+      enqueueEvent("TAU_DIAG_SAMPLE", ev);
     }
 
     tau_hist_add_residual(&hist, residual);
@@ -699,6 +662,12 @@ bool tempest_tau_profile(uint32_t total_seconds) {
       &hist
   );
 
-  enqueueEvent("TAU_DIAG_EXIT", "\"stage\":\"complete\"");
+  {
+    Payload ev;
+    ev.add("stage", "complete");
+    enqueueEvent("TAU_DIAG_EXIT", ev);
+  }
+
   return true;
 }
+

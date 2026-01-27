@@ -16,6 +16,7 @@
 #include "config.h"
 #include "process.h"
 #include "events.h"
+#include "payload.h"
 #include "cpu_usage.h"
 #include "util.h"
 #include "timepop.h"
@@ -42,12 +43,18 @@ static bool system_bootloader = false;
 static bool system_start(void) {
   system_shutdown   = false;
   system_bootloader = false;
-  enqueueEvent("SYSTEM_INIT_ENTER", "\"stage\":\"process_start\"");
+
+  Payload ev;
+  ev.add("stage", "process_start");
+  enqueueEvent("SYSTEM_INIT_ENTER", ev);
+
   return true;
 }
 
 static void system_stop(void) {
-  enqueueEvent("SYSTEM_STOP", "\"stage\":\"process_stop\"");
+  Payload ev;
+  ev.add("stage", "process_stop");
+  enqueueEvent("SYSTEM_STOP", ev);
 }
 
 // ================================================================
@@ -55,30 +62,31 @@ static void system_stop(void) {
 // ================================================================
 
 static void enter_bootloader_cb(timepop_ctx_t*, void*) {
-    // Idempotent + higher priority than shutdown
-    if (system_bootloader) {
-      system_enter_quiescence();
-    }
-
-    system_bootloader = true;
-
-    // Best-effort observability
-    enqueueEvent(
-      "SYSTEM_BOOTLOADER",
-      "\"status\":\"ENTERING\""
-    );
-
-    // Allow event bus to drain
-    delay(10);
-
-    // Visible debug pattern
-    debug_blink("911");
-
-    // Terminal transition — never returns
-    enter_bootloader_cleanly();
-
-    // Absolute fallback
+  // Idempotent + higher priority than shutdown
+  if (system_bootloader) {
     system_enter_quiescence();
+  }
+
+  system_bootloader = true;
+
+  // Best-effort observability
+  {
+    Payload ev;
+    ev.add("status", "ENTERING");
+    enqueueEvent("SYSTEM_BOOTLOADER", ev);
+  }
+
+  // Allow event bus to drain
+  delay(10);
+
+  // Visible debug pattern
+  debug_blink("911");
+
+  // Terminal transition — never returns
+  enter_bootloader_cleanly();
+
+  // Absolute fallback
+  system_enter_quiescence();
 }
 
 bool system_is_shutdown() {
@@ -88,6 +96,7 @@ bool system_is_shutdown() {
 // --------------------------------------------------------------
 // Terminal actions
 // --------------------------------------------------------------
+
 void system_request_shutdown() {
   // Idempotent
   if (system_shutdown || system_bootloader) {
@@ -96,10 +105,11 @@ void system_request_shutdown() {
 
   system_shutdown = true;
 
-  enqueueEvent(
-    "SYSTEM_SHUTDOWN",
-    "\"status\":\"REQUESTED\""
-  );
+  {
+    Payload ev;
+    ev.add("status", "REQUESTED");
+    enqueueEvent("SYSTEM_SHUTDOWN", ev);
+  }
 
   system_enter_quiescence();
 }
@@ -107,6 +117,7 @@ void system_request_shutdown() {
 // --------------------------------------------------------------
 // Terminal quiescence (no return)
 // --------------------------------------------------------------
+
 void system_enter_quiescence() {
   while (true) {
     delay(1000);
@@ -125,71 +136,51 @@ void system_enter_quiescence() {
 //   • No aggregation
 //   • No interpretation
 // ------------------------------------------------------------
-static const String* cmd_report(const char* /*args_json*/) {
+static const Payload* cmd_report(const char* /*args_json*/) {
 
-  // Persistent payload storage
-  static String payload;
-  payload = "{";
+  static Payload p;
+  p.clear();
 
   // ------------------------------------------------------------
   // Firmware identity
   // ------------------------------------------------------------
-  payload += "\"fw_version\":\"";
-  payload += FW_VERSION;
-  payload += "\"";
+  p.add("fw_version", FW_VERSION);
 
   // ------------------------------------------------------------
   // CPU temperature (best-effort)
   // ------------------------------------------------------------
-  payload += ",\"cpu_temp_c\":";
-  payload += cpuTempC();
+  p.add("cpu_temp_c", cpuTempC());
 
   // ------------------------------------------------------------
   // Internal reference voltage (best-effort)
   // ------------------------------------------------------------
-  payload += ",\"vref_v\":";
-  payload += readVrefVolts();
+  p.add("vref_v", readVrefVolts());
 
   // ------------------------------------------------------------
   // Heap availability
   // ------------------------------------------------------------
-  payload += ",\"free_heap_bytes\":";
-  payload += freeHeapBytes();
+  p.add("free_heap_bytes", freeHeapBytes());
 
   // ------------------------------------------------------------
   // CPU usage (authoritative, idle-cycle accounting)
   // ------------------------------------------------------------
-  payload += ",\"cpu_usage_pct\":";
-  {
-    char buf[16];
-    snprintf(buf, sizeof(buf), "%.4f", cpu_usage_get_percent());
-    payload += buf;
-  }
+  p.add("cpu_usage_pct", cpu_usage_get_percent());
 
   // ------------------------------------------------------------
   // CPU usage raw counters (audit + diagnostics)
   // ------------------------------------------------------------
-  payload += ",\"cpu_busy_cycles\":";
-  payload += cpu_usage_get_busy_cycles();
+  p.add("cpu_busy_cycles", cpu_usage_get_busy_cycles());
+  p.add("cpu_total_cycles", cpu_usage_get_total_cycles());
+  p.add("cpu_sample_window_ms", cpu_usage_get_sample_window_ms());
+  p.add("cpu_freq_mhz", cpu_usage_get_cpu_freq_mhz());
 
-  payload += ",\"cpu_total_cycles\":";
-  payload += cpu_usage_get_total_cycles();
-
-  payload += ",\"cpu_sample_window_ms\":";
-  payload += cpu_usage_get_sample_window_ms();
-
-  payload += ",\"cpu_freq_mhz\":";
-  payload += cpu_usage_get_cpu_freq_mhz();
-
-  payload += "}";
-
-  return &payload;
+  return &p;
 }
 
 // ------------------------------------------------------------
 // ENTER_BOOTLOADER — terminal, irreversible
 // ------------------------------------------------------------
-static const String* cmd_enter_bootloader(const char* /*args_json*/) {
+static const Payload* cmd_enter_bootloader(const char* /*args_json*/) {
 
   // Schedule bootloader entry asynchronously so the command path
   // can return cleanly before USB disappears.
@@ -201,10 +192,11 @@ static const String* cmd_enter_bootloader(const char* /*args_json*/) {
     "bootloader-flash"
   );
 
-  enqueueEvent(
-    "SYSTEM_ENTER_BOOTLOADER",
-    "\"action\":\"scheduled\""
-  );
+  {
+    Payload ev;
+    ev.add("action", "scheduled");
+    enqueueEvent("SYSTEM_ENTER_BOOTLOADER", ev);
+  }
 
   // Side-effect only
   return nullptr;
@@ -213,12 +205,13 @@ static const String* cmd_enter_bootloader(const char* /*args_json*/) {
 // ------------------------------------------------------------
 // SHUTDOWN — cooperative system shutdown
 // ------------------------------------------------------------
-static const String* cmd_shutdown(const char* /*args_json*/) {
+static const Payload* cmd_shutdown(const char* /*args_json*/) {
 
-  enqueueEvent(
-    "SYSTEM_SHUTDOWN",
-    "\"action\":\"requested\""
-  );
+  {
+    Payload ev;
+    ev.add("action", "requested");
+    enqueueEvent("SYSTEM_SHUTDOWN", ev);
+  }
 
   system_request_shutdown();
 
@@ -229,19 +222,23 @@ static const String* cmd_shutdown(const char* /*args_json*/) {
 // ------------------------------------------------------------
 // PROCESS LIST — registry introspection
 // ------------------------------------------------------------
-static const String* cmd_process_list(const char* /*args_json*/) {
+static const Payload* cmd_process_list(const char* /*args_json*/) {
 
-  // Persistent payload storage
-  static String payload;
-  payload = process_list_json();
+  // process_list_json already returns a serialized object;
+  // wrap it as a payload explicitly.
+  static Payload p;
+  p.clear();
 
-  return &payload;
+  // Controlled escape hatch: inject trusted JSON object
+  p.add("processes", process_list_json().c_str());
+
+  return &p;
 }
 
 // ------------------------------------------------------------
 // PROCESS START
 // ------------------------------------------------------------
-static const String* cmd_process_start(const char* args_json) {
+static const Payload* cmd_process_start(const char* args_json) {
 
   process_type_t type;
   if (!process_type_from_name(args_json, type)) {
@@ -258,7 +255,7 @@ static const String* cmd_process_start(const char* args_json) {
 // ------------------------------------------------------------
 // PROCESS STOP
 // ------------------------------------------------------------
-static const String* cmd_process_stop(const char* args_json) {
+static const Payload* cmd_process_stop(const char* args_json) {
 
   process_type_t type;
   if (!process_type_from_name(args_json, type)) {

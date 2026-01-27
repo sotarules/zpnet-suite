@@ -22,19 +22,34 @@
  *     rollover protection handled in clock_init().
  *
  * Lifecycle:
- *   • start: announces availability (no hardware ownership)
- *   • stop: no side effects
+ *   • start
+ *       - Announces availability via CLOCKS_INIT_ENTER event
+ *       - No hardware ownership or mutation
+ *
+ *   • stop
+ *       - Emits CLOCKS_STOP event
+ *       - No hardware side effects
  *
  * Commands:
  *   • REPORT
- *       - Returns raw 64-bit synthetic counters:
+ *       - Returns a structured Payload containing:
  *           • dwt_cycles
- *           • gnss_ticks
- *           • ocxo_ticks
+ *           • gnss_10khz_ticks
+ *           • ocxo_10khz_ticks
+ *           • dwt_ns
+ *           • gnss_ns
+ *           • ocxo_ns
  *
  *   • CLEAR
  *       - Zeros all synthetic clocks
- *       - Intended for controlled test resets only
+ *       - Emits CLOCKS_CLEAR event
+ *       - Returns no command payload (side-effect only)
+ *
+ * Command Contract:
+ *   • All command handlers return `const Payload*`
+ *   • Returning nullptr indicates "no payload"
+ *   • Serialization and response envelope construction
+ *     are handled by the process framework
  *
  * ------------------------------------------------------------------
  */

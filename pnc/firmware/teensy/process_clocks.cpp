@@ -2,6 +2,7 @@
 
 #include "clock.h"
 #include "events.h"
+#include "payload.h"
 #include "process.h"
 
 #include <Arduino.h>
@@ -11,12 +12,16 @@
 // ================================================================
 
 static bool clocks_start(void) {
-  enqueueEvent("CLOCKS_INIT_ENTER", "\"stage\":\"process_start\"");
+  Payload ev;
+  ev.add("stage", "process_start");
+  enqueueEvent("CLOCKS_INIT_ENTER", ev);
   return true;
 }
 
 static void clocks_stop(void) {
-  enqueueEvent("CLOCKS_STOP", "\"stage\":\"process_stop\"");
+  Payload ev;
+  ev.add("stage", "process_stop");
+  enqueueEvent("CLOCKS_STOP", ev);
 }
 
 // ================================================================
@@ -26,11 +31,11 @@ static void clocks_stop(void) {
 // ------------------------------------------------------------
 // REPORT — dump raw ledgers + synthetic nanosecond clocks
 // ------------------------------------------------------------
-static const String* cmd_report(const char* /*args_json*/) {
+static const Payload* cmd_report(const char* /*args_json*/) {
 
   // Persistent payload storage (safe to return pointer)
-  static String payload;
-  payload = "{";
+  static Payload p;
+  p.clear();
 
   // Raw authoritative ledgers
   const uint64_t dwt_cycles = clock_dwt_cycles_now();
@@ -45,40 +50,32 @@ static const String* cmd_report(const char* /*args_json*/) {
   // ----------------------------------------------------------
   // Raw ledgers
   // ----------------------------------------------------------
-  payload += "\"dwt_cycles\":";
-  payload += dwt_cycles;
-
-  payload += ",\"gnss_10khz_ticks\":";
-  payload += gnss_10khz;
-
-  payload += ",\"ocxo_10khz_ticks\":";
-  payload += ocxo_10khz;
+  p.add("dwt_cycles", dwt_cycles);
+  p.add("gnss_10khz_ticks", gnss_10khz);
+  p.add("ocxo_10khz_ticks", ocxo_10khz);
 
   // ----------------------------------------------------------
   // Synthetic nanosecond clocks
   // ----------------------------------------------------------
-  payload += ",\"dwt_ns\":";
-  payload += dwt_ns;
+  p.add("dwt_ns", dwt_ns);
+  p.add("gnss_ns", gnss_ns);
+  p.add("ocxo_ns", ocxo_ns);
 
-  payload += ",\"gnss_ns\":";
-  payload += gnss_ns;
-
-  payload += ",\"ocxo_ns\":";
-  payload += ocxo_ns;
-
-  payload += "}";
-
-  return &payload;
+  return &p;
 }
 
 // ------------------------------------------------------------
 // CLEAR — zero all synthetic clocks
 // ------------------------------------------------------------
-static const String* cmd_clear(const char*) {
+static const Payload* cmd_clear(const char*) {
+
   clock_zero_all();
 
-  enqueueEvent("CLOCKS_CLEAR", "\"action\":\"all_zeroed\"");
+  Payload ev;
+  ev.add("action", "all_zeroed");
+  enqueueEvent("CLOCKS_CLEAR", ev);
 
+  // Side-effect only, no payload
   return nullptr;
 }
 

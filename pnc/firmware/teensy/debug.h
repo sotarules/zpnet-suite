@@ -1,5 +1,6 @@
 #pragma once
 
+#include <Arduino.h>
 #include <stdint.h>
 #include <stddef.h>
 
@@ -14,6 +15,7 @@ void debug_beacon(void);
 // Core logging entry points
 // -----------------------------------------------------------------------------
 
+void debug_log(const char* name, const String& value);
 void debug_log(const char* name, const char* msg);
 
 // -----------------------------------------------------------------------------

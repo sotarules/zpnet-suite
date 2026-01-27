@@ -45,12 +45,12 @@ static uint8_t raw_msg_buf[TRANSPORT_MAX_MESSAGE];
 static size_t  raw_msg_len = 0;
 
 // -------------------------------------------------------------
-// Protocol parsing (unchanged semantics, refactored entry)
+// Protocol parsing + dispatch
 // -------------------------------------------------------------
 
 static void process_complete_message(const uint8_t* msg, size_t len) {
 
-  // ---------------- protocol framing (unchanged) ----------------
+  // ---------------- protocol framing ----------------
 
   if (len < 11 || msg[0] != ASCII_LT) return;
   if (memcmp(msg, STX_PREFIX, 5) != 0) return;
@@ -84,7 +84,8 @@ static void process_complete_message(const uint8_t* msg, size_t len) {
   //   "machine":"TEENSY",
   //   "subsystem":"CLOCKS",
   //   "command":"REPORT",
-  //   "args":{...}
+  //   "args":{...},
+  //   "req_id":N
   // }
 
   const char* subsystem = strstr(json, "\"subsystem\"");
@@ -129,6 +130,16 @@ static void process_complete_message(const uint8_t* msg, size_t len) {
     }
   }
 
+  // Optional req_id (RPC correlation)
+  int req_id = -1;
+  const char* r = strstr(json, "\"req_id\"");
+  if (r) {
+    r = strchr(r, ':');
+    if (r) {
+      req_id = atoi(r + 1);
+    }
+  }
+
   // ---------------- process dispatch ----------------
 
   process_type_t type;
@@ -137,8 +148,22 @@ static void process_complete_message(const uint8_t* msg, size_t len) {
     return;
   }
 
+  String inner_response;
+  process_command(type, command_name, args_json, inner_response);
+
+  // ---------------- response envelope ----------------
+
   String response;
-  process_command(type, command_name, args_json, response);
+
+  if (req_id >= 0) {
+    response += "{";
+    response += "\"req_id\":";
+    response += req_id;
+    response += ",";
+    response += inner_response.substring(1);  // strip leading '{'
+  } else {
+    response = inner_response;
+  }
 
   // ---------------- response egress ----------------
 
@@ -149,13 +174,6 @@ static void process_complete_message(const uint8_t* msg, size_t len) {
 // -------------------------------------------------------------
 // RX tick (TimePop-owned)
 // -------------------------------------------------------------
-//
-// Responsibilities:
-//   • Read one RawHID frame
-//   • Append meaningful bytes to message buffer
-//   • Detect padding → message complete
-//   • Parse exactly one protocol frame
-//
 
 static void transport_rx_tick(timepop_ctx_t*, void*) {
 
@@ -173,7 +191,6 @@ static void transport_rx_tick(timepop_ctx_t*, void*) {
   // Append meaningful bytes
   if (end > 0) {
     if (raw_msg_len + end > sizeof(raw_msg_buf)) {
-      // Hard reset on overflow (same net effect as previous resync)
       raw_msg_len = 0;
       return;
     }
@@ -182,20 +199,15 @@ static void transport_rx_tick(timepop_ctx_t*, void*) {
     raw_msg_len += end;
   }
 
-  // If not final frame, wait for more
   if (!has_padding) {
     return;
   }
 
-  // -----------------------------------------------------------
-  // Complete RawHID message assembled
-  // -----------------------------------------------------------
-
   process_complete_message(raw_msg_buf, raw_msg_len);
 
-  // Reset for next message
   raw_msg_len = 0;
 }
+
 
 // -------------------------------------------------------------
 // Lifecycle
@@ -214,13 +226,10 @@ void transport_init(void) {
   );
 }
 
+
 // -------------------------------------------------------------
-// TX (unchanged behavior, clarified intent)
+// TX helpers (unchanged)
 // -------------------------------------------------------------
-//
-// Still sends <STX=N>, payload, <ETX> as before.
-// RawHID framing is responsible only for chunking + padding.
-//
 
 static inline void hid_send_message_bytes(const uint8_t* data, size_t len) {
 
@@ -247,15 +256,9 @@ void transport_send_frame(const char* payload, size_t length) {
   if (!payload || length == 0) return;
   if (length > TRANSPORT_MAX_PAYLOAD) return;
 
-  // ------------------------------------------------------------
-  // Construct full framed message contiguously:
-  //   <STX=N> + payload + <ETX>
-  // ------------------------------------------------------------
-
   uint8_t frame[TRANSPORT_MAX_MESSAGE];
   size_t  frame_len = 0;
 
-  // --- Header ---
   int header_len = snprintf(
       (char*)frame,
       sizeof(frame),
@@ -266,21 +269,15 @@ void transport_send_frame(const char* payload, size_t length) {
   if (header_len <= 0) return;
   frame_len += (size_t)header_len;
 
-  // --- Payload ---
   memcpy(frame + frame_len, payload, length);
   frame_len += length;
 
-  // --- ETX ---
   static constexpr char ETX[] = "<ETX>";
   memcpy(frame + frame_len, ETX, sizeof(ETX) - 1);
   frame_len += sizeof(ETX) - 1;
 
-  // ------------------------------------------------------------
-  // Send exactly ONE RawHID message
-  // ------------------------------------------------------------
   hid_send_message_bytes(frame, frame_len);
 }
-
 
 void transport_send_frame(const char* payload) {
   if (!payload) return;

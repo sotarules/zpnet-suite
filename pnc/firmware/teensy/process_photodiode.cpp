@@ -2,6 +2,7 @@
 
 #include "config.h"
 #include "events.h"
+#include "payload.h"
 #include "process.h"
 
 #include <Arduino.h>
@@ -109,14 +110,11 @@ static void photodiode_snapshot(void) {
 // ================================================================
 
 static void photodiode_emit_init_event(void) {
-  String body = "\"payload\": {";
+  Payload ev;
+  ev.add("edge_pin", PHOTODIODE_EDGE_PIN);
+  ev.add("analog_pin", PHOTODIODE_ANALOG_PIN);
 
-  body += "\"edge_pin\":"; body += PHOTODIODE_EDGE_PIN;
-  body += ",\"analog_pin\":"; body += PHOTODIODE_ANALOG_PIN;
-
-  body += "}";
-
-  enqueueEvent("PHOTODIODE_INITIALIZATION", body);
+  enqueueEvent("PHOTODIODE_INITIALIZATION", ev);
 }
 
 // ================================================================
@@ -124,7 +122,11 @@ static void photodiode_emit_init_event(void) {
 // ================================================================
 
 static bool photodiode_start(void) {
-  enqueueEvent("PHOTODIODE_INIT_ENTER", "\"stage\":\"process_start\"");
+  {
+    Payload ev;
+    ev.add("stage", "process_start");
+    enqueueEvent("PHOTODIODE_INIT_ENTER", ev);
+  }
 
   pinMode(PHOTODIODE_EDGE_PIN, INPUT);
   pinMode(PHOTODIODE_ANALOG_PIN, INPUT);
@@ -148,10 +150,9 @@ static bool photodiode_start(void) {
 static void photodiode_stop(void) {
   detachInterrupt(digitalPinToInterrupt(PHOTODIODE_EDGE_PIN));
 
-  enqueueEvent(
-    "PHOTODIODE_STOP",
-    "\"action\":\"interrupt_detached\""
-  );
+  Payload ev;
+  ev.add("action", "interrupt_detached");
+  enqueueEvent("PHOTODIODE_STOP", ev);
 }
 
 // ================================================================
@@ -161,73 +162,52 @@ static void photodiode_stop(void) {
 // ------------------------------------------------------------
 // REPORT — return current photodiode state snapshot
 // ------------------------------------------------------------
-static const String* cmd_report(const char* /*args_json*/) {
+static const Payload* cmd_report(const char* /*args_json*/) {
 
   photodiode_snapshot();
 
-  // Persistent payload storage
-  static String payload;
-  payload = "{";
+  static Payload p;
+  p.clear();
 
-  payload += "\"edge_level\":";
-  payload += PD.edge_level;
+  p.add("edge_level", PD.edge_level);
+  p.add("edge_pulse_count", PD.edge_pulse_count);
+  p.add("analog_raw", PD.analog_raw);
+  p.add("analog_v", PD.analog_v);
 
-  payload += ",\"edge_pulse_count\":";
-  payload += PD.edge_pulse_count;
-
-  payload += ",\"analog_raw\":";
-  payload += PD.analog_raw;
-
-  payload += ",\"analog_v\":";
-  {
-    char buf[32];
-    snprintf(buf, sizeof(buf), "%.5f", PD.analog_v);
-    payload += buf;
-  }
-
-  payload += ",\"isr_count\":";
   {
     uint32_t count;
     noInterrupts();
     count = pd_isr_count;
     interrupts();
-    payload += count;
+    p.add("isr_count", count);
   }
 
-  payload += ",\"edge_level_changed\":";
-  payload += (edge_level_changed ? "true" : "false");
+  p.add("edge_level_changed", edge_level_changed);
 
-  payload += "}";
-
-  return &payload;
+  return &p;
 }
 
 // ------------------------------------------------------------
 // COUNT — episode counter snapshot
 // ------------------------------------------------------------
-static const String* cmd_count(const char* /*args_json*/) {
+static const Payload* cmd_count(const char* /*args_json*/) {
 
   uint32_t count;
   noInterrupts();
   count = pd_episode_count;
   interrupts();
 
-  // Persistent payload storage
-  static String payload;
-  payload = "{";
+  static Payload p;
+  p.clear();
+  p.add("count", count);
 
-  payload += "\"count\":";
-  payload += count;
-
-  payload += "}";
-
-  return &payload;
+  return &p;
 }
 
 // ------------------------------------------------------------
 // CLEAR — reset episode counter
 // ------------------------------------------------------------
-static const String* cmd_clear(const char* /*args_json*/) {
+static const Payload* cmd_clear(const char* /*args_json*/) {
 
   noInterrupts();
   pd_episode_count   = 0;
@@ -235,15 +215,13 @@ static const String* cmd_clear(const char* /*args_json*/) {
   pd_edge_seen       = false;
   interrupts();
 
-  enqueueEvent(
-    "PHOTODIODE_CLEAR",
-    "\"action\":\"counter_reset\""
-  );
+  Payload ev;
+  ev.add("action", "counter_reset");
+  enqueueEvent("PHOTODIODE_CLEAR", ev);
 
   // Side-effect only, no payload
   return nullptr;
 }
-
 
 // ================================================================
 // Registration

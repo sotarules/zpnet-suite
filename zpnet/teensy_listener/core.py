@@ -1,17 +1,17 @@
 """
 ZPNet Teensy Listener — RawHID Transport Authority + Deterministic RPC
 
-RawHID message semantics:
-  • A message consists of one or more 64-byte frames
-  • The final frame contains at least one \0 padding byte
-  • Message bytes are rstripped(payload) concatenated across frames
+Role:
+  • Own the RawHID transport
+  • Frame and send commands to Teensy
+  • Reassemble framed responses
+  • Perform strict req_id-based RPC correlation
 
-This layer is transport-only and semantics-free.
-
-Defensive stance:
-  • USB transport may vanish (EIO/ENODEV) during flash/re-enumeration
-  • RPC clients may disconnect at any time (BrokenPipe/ECONNRESET)
-  • The listener must never die because a client disappeared
+Non-responsibilities:
+  • No event handling
+  • No semantic interpretation
+  • No aggregation
+  • No fallback routing
 """
 
 import json
@@ -21,14 +21,11 @@ import socket
 import threading
 import time
 import itertools
-import queue
 from queue import Queue
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple
 
 from zpnet.shared.logger import setup_logging
-from zpnet.shared.events import create_event
 from zpnet.shared.constants import TEENSY_HIDRAW_PATH
-
 
 # ---------------------------------------------------------------------
 # Configuration
@@ -50,7 +47,6 @@ ETX_SEQ    = b"<ETX>"
 DEBUG_LOG_PATH = "/home/mule/zpnet/logs/zpnet-debug.log"
 SERIAL_SNOOP_PATH = "/home/mule/zpnet/logs/zpnet-teensy-listener-snoop.log"
 
-
 # ---------------------------------------------------------------------
 # Global state
 # ---------------------------------------------------------------------
@@ -66,9 +62,8 @@ hid_write_lock = threading.Lock()
 
 debug_log_fh = None
 
-
 # ---------------------------------------------------------------------
-# Debug sink
+# Debug sink (transport-level only)
 # ---------------------------------------------------------------------
 
 def open_debug_log() -> None:
@@ -80,36 +75,11 @@ def write_debug_line(text: str) -> None:
     if debug_log_fh:
         debug_log_fh.write(text + "\n")
 
-
 # ---------------------------------------------------------------------
-# RPC socket send helper (client may disappear)
-# ---------------------------------------------------------------------
-
-def _safe_sendall(conn: socket.socket, payload: bytes) -> None:
-    """
-    Best-effort send. Clients can disconnect anytime; that is not an error
-    worthy of killing the service or spamming tracebacks.
-    """
-    try:
-        conn.sendall(payload)
-    except (BrokenPipeError, ConnectionResetError):
-        # client closed early; ignore
-        return
-    except OSError as e:
-        # Treat common "client went away" cases as ignorable.
-        # EPIPE=32, ECONNRESET=104, ENOTCONN=107 (varies by platform)
-        if e.errno in (32, 104, 107):
-            return
-        raise
-
-
-# ---------------------------------------------------------------------
-# HID helpers (AUTHORITATIVE TRANSPORT BOUNDARY)
+# HID helpers (unowned boundary)
 # ---------------------------------------------------------------------
 
 def open_hid_blocking() -> int:
-    global hid_present
-
     while True:
         try:
             fd = os.open(TEENSY_HIDRAW_PATH, os.O_RDWR)
@@ -123,26 +93,21 @@ def open_hid_blocking() -> int:
 def hid_write(data: bytes) -> None:
     global hid_fd
 
-    if not data:
-        return
-
     if not hid_present.is_set():
         raise RuntimeError("Teensy HID not present")
 
     offset = 0
     with hid_write_lock:
         while offset < len(data):
-            chunk = data[offset: offset + HID_PACKET_SIZE]
+            chunk = data[offset:offset + HID_PACKET_SIZE]
             if len(chunk) < HID_PACKET_SIZE:
                 chunk += b"\x00" * (HID_PACKET_SIZE - len(chunk))
+
             try:
                 os.write(hid_fd, chunk)
             except OSError as e:
-                if e.errno in (5, 19):  # EIO or ENODEV
-                    logging.warning(
-                        "[teensy_listener] hidraw vanished during write (errno=%d)",
-                        e.errno
-                    )
+                if e.errno in (5, 19):  # EIO / ENODEV
+                    logging.warning("[teensy_listener] hidraw vanished during write")
                     hid_present.clear()
                     try:
                         os.close(hid_fd)
@@ -154,25 +119,22 @@ def hid_write(data: bytes) -> None:
 
             offset += HID_PACKET_SIZE
 
-
 # ---------------------------------------------------------------------
 # RawHID message reassembly
 # ---------------------------------------------------------------------
 
-def read_rawhid_message() -> Optional[bytes]:
+def read_rawhid_message() -> Optional[Tuple[bool, bytes]]:
     global hid_fd
 
     buf = bytearray()
+    is_debug = False
 
     while True:
         try:
             pkt = os.read(hid_fd, HID_PACKET_SIZE)
         except OSError as e:
-            if e.errno in (5, 19):  # EIO or ENODEV
-                logging.warning(
-                    "[teensy_listener] hidraw vanished during read (errno=%d)",
-                    e.errno
-                )
+            if e.errno in (5, 19):
+                logging.warning("[teensy_listener] hidraw vanished during read")
                 hid_present.clear()
                 try:
                     os.close(hid_fd)
@@ -185,24 +147,27 @@ def read_rawhid_message() -> Optional[bytes]:
         if not pkt:
             continue
 
+        # Detect debug on ANY packet
+        if pkt[0] == DEBUG_MARKER:
+            is_debug = True
+            pkt = pkt[1:]  # strip marker unconditionally
+
+        # Strip right-side zero padding
         stripped = pkt.rstrip(b"\x00")
         has_padding = len(stripped) < len(pkt)
-        buf.extend(stripped)
+
+        if stripped:
+            buf.extend(stripped)
 
         if has_padding:
-            return bytes(buf)
-
+            return is_debug, bytes(buf)
 
 # ---------------------------------------------------------------------
 # Transport helpers
 # ---------------------------------------------------------------------
 
 def send_frame(payload: dict) -> None:
-    raw = json.dumps(
-        payload,
-        separators=(",", ":"),
-        ensure_ascii=False
-    ).encode("utf-8")
+    raw = json.dumps(payload, separators=(",", ":")).encode("utf-8")
 
     frame = (
         b"<STX=" +
@@ -215,9 +180,8 @@ def send_frame(payload: dict) -> None:
     _snoop("←", raw)
     hid_write(frame)
 
-
 # ---------------------------------------------------------------------
-# Process a response message from Teensy
+# Response parsing + routing
 # ---------------------------------------------------------------------
 
 def process_response(msg: bytes) -> None:
@@ -244,102 +208,83 @@ def process_response(msg: bytes) -> None:
 
     route_message(parsed)
 
-
-# ---------------------------------------------------------------------
-# Message routing
-# ---------------------------------------------------------------------
-
 def route_message(msg: dict) -> None:
-    if "req_id" in msg:
-        with state_lock:
-            q = pending_replies.pop(msg["req_id"], None)
-        if q:
-            q.put(msg)
+    req_id = msg.get("req_id")
+    if req_id is None:
+        # Protocol violation — ignore silently
         return
 
-    if msg.get("control") == "EVENTS_BEGIN":
-        return
+    with state_lock:
+        q = pending_replies.pop(req_id, None)
 
-    if "event_type" in msg:
-        payload = msg.copy()
-        create_event(payload.pop("event_type"), payload)
-
+    if q:
+        q.put(msg)
 
 # ---------------------------------------------------------------------
-# HID reader (reconnect-aware, single authority)
+# HID reader (single authority)
 # ---------------------------------------------------------------------
 
 def hid_reader() -> None:
+    global hid_fd
 
     try:
-        global hid_fd
-        last_drain = 0.0
-
         while True:
             if not hid_present.is_set():
                 logging.info("[teensy_listener] waiting for Teensy HID...")
                 hid_fd = open_hid_blocking()
                 continue
 
-            msg = read_rawhid_message()
-            if not msg:
+            result = read_rawhid_message()
+            if not result:
                 continue
 
-            first = msg[0]
+            is_debug, msg = result
 
-            if first == DEBUG_MARKER:
+            if is_debug:
                 write_debug_line(
-                    msg[1:].decode("utf-8", errors="replace")
+                    msg.decode("utf-8", errors="replace")
                 )
                 continue
 
-            if first == ASCII_LT:
+            if msg and msg[0] == ASCII_LT:
                 process_response(msg)
 
-            now = time.time()
-            if now - last_drain >= EVENT_DESPOOL_INTERVAL_S:
-                try:
-                    send_frame({"cmd": "EVENTS.GET"})
-                except RuntimeError:
-                    pass
-                last_drain = now
-
     except Exception:
-        logging.exception("[hid_reader] teensy_listener unexpected exception")
+        logging.exception("[hid_reader] fatal exception")
+
 
 # ---------------------------------------------------------------------
 # RPC handler
 # ---------------------------------------------------------------------
+
 def handle_client(conn: socket.socket) -> None:
-    req_id = 0
-    q: Optional[Queue] = None
-    buf = bytearray()
-    while True:
-        chunk = conn.recv(4096)
-        if not chunk:
+    try:
+        buf = conn.recv(65536)
+        if not buf:
             return
-        buf.extend(chunk)
-        try:
-            req = json.loads(buf.decode("utf-8"))
-            break
-        except json.JSONDecodeError:
-            continue
-    req_id = next(req_id_counter)
-    req["req_id"] = req_id
-    q = Queue(maxsize=1)
-    with state_lock:
-        pending_replies[req_id] = q
-    send_frame(req)
-    reply = q.get(timeout=10.0)
-    _safe_sendall(conn, json.dumps(reply, separators=(",", ":")).encode("utf-8"))
-    conn.close()
+
+        req = json.loads(buf.decode("utf-8"))
+
+        req_id = next(req_id_counter)
+        req["req_id"] = req_id
+
+        q = Queue(maxsize=1)
+        with state_lock:
+            pending_replies[req_id] = q
+
+        send_frame(req)
+
+        reply = q.get(timeout=10.0)
+        conn.sendall(json.dumps(reply, separators=(",", ":")).encode("utf-8"))
+
+    finally:
+        conn.close()
 
 # ---------------------------------------------------------------------
 # RPC server
 # ---------------------------------------------------------------------
 
 def rpc_server() -> None:
-
     try:
         if os.path.exists(RPC_SOCKET_PATH):
             os.unlink(RPC_SOCKET_PATH)
@@ -358,18 +303,21 @@ def rpc_server() -> None:
             ).start()
 
     except Exception:
-        logging.exception("[rpc_server] teensy_listener unexpected exception")
+        logging.exception("[rpc_server] fatal exception")
 
 # ---------------------------------------------------------------------
-# Serial snoop
+# Serial snoop (forensics only)
 # ---------------------------------------------------------------------
 
 def _snoop(direction: str, payload: bytes) -> None:
     with open(SERIAL_SNOOP_PATH, "a") as f:
-        f.write(f"{time.time():.6f} {direction} {payload.decode('utf-8', errors='replace')}\n")
+        f.write(
+            f"{time.time():.6f} {direction} "
+            f"{payload.decode('utf-8', errors='replace')}\n"
+        )
 
 # ---------------------------------------------------------------------
-# Main
+# Entrypoint
 # ---------------------------------------------------------------------
 
 def run() -> None:

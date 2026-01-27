@@ -1,8 +1,6 @@
 """
 ZPNet GNSS Process (Pi-side, authoritative)
 
-This supersedes the Teensy GNSS process.
-
 Responsibilities:
   • Own the GNSS UART
   • Parse NMEA into authoritative state
@@ -29,10 +27,7 @@ from typing import Dict, Optional, Set
 import serial
 
 from zpnet.processes.processes import serve_commands
-
-# ------------------------------------------------------------------
-# Configuration
-# ------------------------------------------------------------------
+from zpnet.shared.logger import setup_logging
 
 GNSS_DEVICE = os.environ.get("ZPNET_GNSS_PORT", "/dev/zpnet-gnss-serial")
 GNSS_BAUD   = int(os.environ.get("ZPNET_GNSS_BAUD", "38400"))
@@ -40,14 +35,8 @@ GNSS_BAUD   = int(os.environ.get("ZPNET_GNSS_BAUD", "38400"))
 CMD_SOCKET_PATH    = "/tmp/zpnet-gnss.sock"
 STREAM_SOCKET_PATH = "/tmp/zpnet-gnss-stream.sock"
 
-
-# ------------------------------------------------------------------
-# Authoritative GNSS State
-# ------------------------------------------------------------------
-
 @dataclass
 class GnssState:
-    # --- Time / Date ---
     has_time: bool = False
     has_date: bool = False
     hour: int = 0
@@ -57,7 +46,6 @@ class GnssState:
     month: int = 0
     day: int = 0
 
-    # --- Position ---
     has_fix: bool = False
     fix_quality: int = 0
     fix_type: int = 0
@@ -67,15 +55,12 @@ class GnssState:
     longitude_deg: float = math.nan
     altitude_m: float = math.nan
 
-    # --- Navigation ---
     speed_knots: float = math.nan
     course_deg: float = math.nan
 
-    # --- Discipline ---
     has_discipline: bool = False
     discipline_mode: str = ""
 
-    # --- Raw provenance ---
     last_sentence: str = ""
     last_rmc: str = ""
     last_gga: str = ""
@@ -86,28 +71,15 @@ class GnssState:
     last_crx: str = ""
     last_crz: str = ""
 
-    # --- Liveness ---
     last_rx_ts: float = 0.0
 
-
 GNSS = GnssState()
-
-
-# ------------------------------------------------------------------
-# Sentence stream fan-out
-# ------------------------------------------------------------------
 
 _stream_clients: Set[socket.socket] = set()
 _stream_lock = threading.Lock()
 
-
 def publish_sentence(line: str) -> None:
-    """Send a raw NMEA sentence to all connected stream clients."""
-    if not line:
-        return
-
     payload = (line + "\n").encode("utf-8", errors="ignore")
-
     with _stream_lock:
         dead = []
         for conn in _stream_clients:
@@ -115,7 +87,6 @@ def publish_sentence(line: str) -> None:
                 conn.sendall(payload)
             except Exception:
                 dead.append(conn)
-
         for conn in dead:
             _stream_clients.discard(conn)
             try:
@@ -123,52 +94,35 @@ def publish_sentence(line: str) -> None:
             except Exception:
                 pass
 
-
 def stream_server() -> None:
-    """Blocking stream socket; clients receive live NMEA sentences."""
+    import logging
+
     try:
-        os.unlink(STREAM_SOCKET_PATH)
-    except FileNotFoundError:
-        pass
 
-    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as srv:
-        srv.bind(STREAM_SOCKET_PATH)
-        srv.listen()
+        if os.path.exists(STREAM_SOCKET_PATH):
+            os.unlink(STREAM_SOCKET_PATH)
 
-        while True:
-            conn, _ = srv.accept()
-            with _stream_lock:
-                _stream_clients.add(conn)
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as srv:
+            srv.bind(STREAM_SOCKET_PATH)
+            srv.listen()
 
+            while True:
+                conn, _ = srv.accept()
+                with _stream_lock:
+                    _stream_clients.add(conn)
 
-# ------------------------------------------------------------------
-# Helpers
-# ------------------------------------------------------------------
+    except Exception:
+        logging.exception("[stream_server] unhandled exception")
 
 def nmea_latlon_to_deg(ddmm: str, hemi: str) -> float:
-    if not ddmm or not hemi:
-        return math.nan
-    try:
-        v = float(ddmm)
-    except ValueError:
-        return math.nan
+    v = float(ddmm)
     deg = math.floor(v / 100.0)
     minutes = v - deg * 100.0
     out = deg + minutes / 60.0
-    if hemi in ("S", "W"):
-        out = -out
-    return out
-
-
-# ------------------------------------------------------------------
-# Sentence Parsers
-# ------------------------------------------------------------------
+    return -out if hemi in ("S", "W") else out
 
 def parse_rmc(line: str) -> None:
     parts = line.split(",")
-    if len(parts) < 10:
-        return
-
     time_s = parts[1]
     lat, lat_h = parts[3], parts[4]
     lon, lon_h = parts[5], parts[6]
@@ -178,55 +132,35 @@ def parse_rmc(line: str) -> None:
 
     GNSS.latitude_deg  = nmea_latlon_to_deg(lat, lat_h)
     GNSS.longitude_deg = nmea_latlon_to_deg(lon, lon_h)
-    GNSS.speed_knots   = float(spd) if spd else math.nan
-    GNSS.course_deg    = float(crs) if crs else math.nan
+    GNSS.speed_knots   = float(spd)
+    GNSS.course_deg    = float(crs)
     GNSS.has_fix       = True
 
-    if len(time_s) >= 6:
-        GNSS.hour   = int(time_s[0:2])
-        GNSS.minute = int(time_s[2:4])
-        GNSS.second = int(time_s[4:6])
-        GNSS.has_time = True
+    GNSS.hour   = int(time_s[0:2])
+    GNSS.minute = int(time_s[2:4])
+    GNSS.second = int(time_s[4:6])
+    GNSS.has_time = True
 
-    if len(date_s) == 6:
-        GNSS.day   = int(date_s[0:2])
-        GNSS.month = int(date_s[2:4])
-        GNSS.year  = 2000 + int(date_s[4:6])
-        GNSS.has_date = True
-
+    GNSS.day   = int(date_s[0:2])
+    GNSS.month = int(date_s[2:4])
+    GNSS.year  = 2000 + int(date_s[4:6])
+    GNSS.has_date = True
 
 def parse_gga(line: str) -> None:
     parts = line.split(",")
-    if len(parts) < 10:
-        return
-    try:
-        GNSS.fix_quality = int(parts[6])
-        GNSS.satellites  = int(parts[7])
-        GNSS.altitude_m  = float(parts[9])
-        GNSS.has_fix     = GNSS.fix_quality > 0
-    except ValueError:
-        pass
-
+    GNSS.fix_quality = int(parts[6])
+    GNSS.satellites  = int(parts[7])
+    GNSS.altitude_m  = float(parts[9])
+    GNSS.has_fix     = GNSS.fix_quality > 0
 
 def parse_gsa(line: str) -> None:
     parts = line.split(",")
-    if len(parts) >= 3:
-        try:
-            GNSS.fix_type = int(parts[2])
-        except ValueError:
-            pass
-
+    GNSS.fix_type = int(parts[2])
 
 def extract_discipline(line: str) -> None:
     parts = line.split(",")
-    if len(parts) >= 2:
-        GNSS.discipline_mode = parts[1]
-        GNSS.has_discipline = True
-
-
-# ------------------------------------------------------------------
-# Ingestion
-# ------------------------------------------------------------------
+    GNSS.discipline_mode = parts[1]
+    GNSS.has_discipline = True
 
 def ingest_line(line: str) -> None:
     GNSS.last_sentence = line
@@ -243,10 +177,10 @@ def ingest_line(line: str) -> None:
             parse_rmc(rmc)
         return
 
-    if line.startswith(("$GNRMC,", "$GPRMC,")):
+    if line.startswith( ("$GNRMC,", "$GPRMC,") ):
         GNSS.last_rmc = line
         parse_rmc(line)
-    elif line.startswith(("$GNGGA,", "$GPGGA,")):
+    elif line.startswith( ("$GNGGA,", "$GPGGA,") ):
         GNSS.last_gga = line
         parse_gga(line)
     elif line.startswith("$GNGSA,"):
@@ -254,38 +188,32 @@ def ingest_line(line: str) -> None:
         parse_gsa(line)
     elif line.startswith("$GPZDA,"):
         GNSS.last_zda = line
-    elif line.startswith(("$GPGSV,", "$GAGSV,")):
+    elif line.startswith( ("$GPGSV,", "$GAGSV,") ):
         GNSS.last_gsv = line
     elif line.startswith("$PERDCRW,"):
         GNSS.last_crw = line
     elif line.startswith("$PERDCRX,"):
         GNSS.last_crx = line
 
-
-# ------------------------------------------------------------------
-# GNSS Reader Thread
-# ------------------------------------------------------------------
-
 def gnss_reader() -> None:
-    with serial.Serial(GNSS_DEVICE, GNSS_BAUD, timeout=1) as ser:
-        buf = ""
-        while True:
-            c = ser.read(1)
-            if not c:
-                continue
-            ch = c.decode(errors="ignore")
-            if ch == "\n":
-                line = buf.strip()
-                buf = ""
-                if line:
-                    ingest_line(line)
-            elif ch != "\r":
-                buf += ch
-
-
-# ------------------------------------------------------------------
-# REPORT Command
-# ------------------------------------------------------------------
+    try:
+        with serial.Serial(GNSS_DEVICE, GNSS_BAUD, timeout=1) as ser:
+            buf = ""
+            while True:
+                c = ser.read(1)
+                if not c:
+                    continue
+                ch = c.decode(errors="ignore")
+                if ch == "\n":
+                    line = buf.strip()
+                    buf = ""
+                    if line:
+                        ingest_line(line)
+                elif ch != "\r":
+                    buf += ch
+    except Exception:
+        import logging
+        logging.exception("[gnss_reader] unhandled exception")
 
 def cmd_report(_: Optional[dict]) -> Dict:
     p: Dict[str, object] = {}
@@ -314,17 +242,18 @@ def cmd_report(_: Optional[dict]) -> Dict:
 
     return {"success": True, "message": "OK", "payload": p}
 
-
 COMMANDS = {"REPORT": cmd_report}
 
-# ------------------------------------------------------------------
-# Entrypoint
-# ------------------------------------------------------------------
-
 def run() -> None:
-    threading.Thread(target=gnss_reader, daemon=True).start()
-    threading.Thread(target=stream_server, daemon=True).start()
-    serve_commands(
-        socket_path=CMD_SOCKET_PATH,
-        commands=COMMANDS,
-    )
+    import logging
+    setup_logging()
+
+    try:
+        threading.Thread(target=gnss_reader, daemon=True).start()
+        threading.Thread(target=stream_server, daemon=True).start()
+        serve_commands(
+            socket_path=CMD_SOCKET_PATH,
+            commands=COMMANDS,
+        )
+    except Exception:
+        logging.exception("[gnss] unhandled exception in main thread")

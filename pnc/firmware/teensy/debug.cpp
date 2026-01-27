@@ -115,6 +115,10 @@ void debug_log(const char* name, const char* msg) {
     debug_send(line);
 }
 
+void debug_log(const char* name, const String& value) {
+    debug_log(name, value.c_str());
+}
+
 // -----------------------------------------------------------------------------
 // Scalar overloads (newline-framed)
 // -----------------------------------------------------------------------------

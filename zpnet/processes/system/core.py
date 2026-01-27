@@ -1,28 +1,17 @@
 """
 ZPNet SYSTEM Process (Pi-side, authoritative aggregator)
 
-This process replaces multiple Pi-side monitors with a single
-system_monitor service exposing a unified SYSTEM.REPORT surface.
-
 Responsibilities:
   • Query authoritative SYSTEM state from the Teensy
-  • Collect Raspberry Pi host metrics (formerly pi_monitor)
-  • Maintain a last-known-good system snapshot
-  • Expose system-wide facts via REPORT
-  • Emit SYSTEM_STATUS events on a fixed cadence
-  • (Transitional) Emit legacy RASPBERRY_PI_STATUS for compatibility
-  • Serve as the future consolidation point for system observability
-
-Design invariants:
-  • Read-only from the Pi perspective
-  • Single-writer semantics (Teensy owns mutation)
-  • Deterministic polling cadence
-  • Snapshot replacement (last-known-good)
+  • Collect Raspberry Pi host metrics
+  • Maintain last-known-good SYSTEM snapshot
+  • Expose SYSTEM.REPORT
+  • Emit SYSTEM_STATUS events on fixed cadence
 
 Process model:
   • One systemd service
-  • One polling thread (Teensy PROCESS.COMMAND + Pi metrics)
-  • One blocking command socket (REPORT)
+  • One polling thread
+  • One blocking command socket
 """
 
 from __future__ import annotations
@@ -172,42 +161,29 @@ SYSTEM: Dict[str, object] = {}
 # ------------------------------------------------------------------
 
 def get_cpu_temp_c() -> float | None:
-    """Read CPU temperature in °C from sysfs or psutil fallback."""
-    try:
-        for path in CPU_TEMP_PATHS:
-            if path.exists():
-                val = float(path.read_text().strip()) / 1000.0
-                return round(val, 1)
+    for path in CPU_TEMP_PATHS:
+        if path.exists():
+            return round(float(path.read_text().strip()) / 1000.0, 1)
 
-        temps = psutil.sensors_temperatures()
-        if temps:
-            for entries in temps.values():
-                for entry in entries:
-                    if "cpu" in entry.label.lower() or "core" in entry.label.lower():
-                        return round(entry.current, 1)
+    temps = psutil.sensors_temperatures()
+    for entries in temps.values():
+        for entry in entries:
+            if "cpu" in entry.label.lower() or "core" in entry.label.lower():
+                return round(entry.current, 1)
 
-        return None
-
-    except Exception:
-        return None
+    return None
 
 
 def get_uptime_seconds() -> float:
-    """Return system uptime in seconds."""
     return time.time() - psutil.boot_time()
 
 
 def get_load_average() -> Tuple[float, float, float]:
-    """Return (1 min, 5 min, 15 min) load averages."""
-    try:
-        one, five, fifteen = os.getloadavg()
-        return (round(one, 2), round(five, 2), round(fifteen, 2))
-    except Exception:
-        return (0.0, 0.0, 0.0)
+    one, five, fifteen = os.getloadavg()
+    return (round(one, 2), round(five, 2), round(fifteen, 2))
 
 
 def get_memory_stats() -> dict:
-    """Return memory usage metrics in MB."""
     mem = psutil.virtual_memory()
     return {
         "total_mb": round(mem.total / 1e6, 1),
@@ -218,7 +194,6 @@ def get_memory_stats() -> dict:
 
 
 def get_disk_stats() -> dict:
-    """Return disk usage for root filesystem in GB."""
     disk = psutil.disk_usage("/")
     return {
         "total_gb": round(disk.total / 1e9, 2),
@@ -229,7 +204,6 @@ def get_disk_stats() -> dict:
 
 
 def get_network_bytes() -> dict:
-    """Return aggregate RX/TX bytes across all interfaces."""
     counters = psutil.net_io_counters()
     return {
         "bytes_sent": counters.bytes_sent,
@@ -240,33 +214,22 @@ def get_network_bytes() -> dict:
 
 
 def get_undervoltage_flags() -> dict:
-    """
-    Query `vcgencmd get_throttled` and decode undervoltage condition flags.
-    Requires the vcgencmd binary to be available (normally present on RPi).
-    """
     try:
         result = subprocess.run(
             ["vcgencmd", "get_throttled"],
             capture_output=True,
             text=True,
+            check=True,
         )
-        if result.returncode != 0:
-            raise RuntimeError("vcgencmd failed")
-
-        line = (result.stdout or "").strip()
-        if not line.startswith("throttled="):
-            raise ValueError("unexpected vcgencmd output")
-
-        raw_hex = line.split("=")[-1]
-        flags = int(raw_hex, 16)
-
+        raw = result.stdout.strip().split("=")[-1]
+        flags = int(raw, 16)
         return {
-            "raw_hex": raw_hex,
+            "raw_hex": raw,
             "currently_undervolted": bool(flags & (1 << 0)),
             "previously_undervolted": bool(flags & (1 << 16)),
         }
-
     except Exception:
+        logging.exception("[system] vcgencmd failed")
         return {
             "raw_hex": "unavailable",
             "currently_undervolted": None,
@@ -275,8 +238,6 @@ def get_undervoltage_flags() -> dict:
 
 
 def build_pi_status() -> dict:
-    """Gather Raspberry Pi host metrics."""
-
     payload = {
         "device_name": DEVICE_NAME,
         "platform": platform.platform(),
@@ -291,7 +252,6 @@ def build_pi_status() -> dict:
         "undervoltage_flags": get_undervoltage_flags(),
     }
 
-    # Health classification (simple heuristic)
     temp = payload["cpu_temp_c"] or 0.0
     load = payload["load_1m"]
     mem_pct = payload["memory"]["percent"]
@@ -305,43 +265,32 @@ def build_pi_status() -> dict:
 
     return payload
 
+
 # ------------------------------------------------------------------
 # Network helpers (migrated from network_monitor)
 # ------------------------------------------------------------------
 
 def get_ssid() -> str:
-    """Return the currently associated Wi-Fi SSID, or empty string if none."""
-    try:
-        result = subprocess.run(
-            ["iwgetid", "-r"],
-            capture_output=True,
-            check=True,
-            text=True,
-        )
-        return result.stdout.strip()
-    except subprocess.CalledProcessError:
-        return ""
+    result = subprocess.run(
+        ["iwgetid", "-r"],
+        capture_output=True,
+        text=True,
+    )
+    return result.stdout.strip()
 
 def zpnet_definitive_test() -> bool:
-    """Definitive connectivity test against ZPNet API endpoint."""
-    try:
-        url = f"http://{ZPNET_REMOTE_HOST}{ZPNET_TEST_PATH}"
-        resp = requests.get(url, timeout=HTTP_TIMEOUT)
-        return resp.status_code == 200 and EXPECTED_TEST_STRING in resp.text
-    except requests.RequestException:
-        return False
+    url = f"http://{ZPNET_REMOTE_HOST}{ZPNET_TEST_PATH}"
+    resp = requests.get(url, timeout=HTTP_TIMEOUT)
+    return resp.status_code == 200 and EXPECTED_TEST_STRING in resp.text
 
 def get_local_ip() -> str:
-    """Best-effort local IP address."""
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    try:
-        s.connect(("8.8.8.8", 80))
-        return s.getsockname()[0]
-    finally:
-        s.close()
+    s.connect(("8.8.8.8", 80))
+    ip = s.getsockname()[0]
+    s.close()
+    return ip
 
 def ping_latency_ms() -> float:
-    """Approximate latency (ms) via TCP connect timing."""
     host = "8.8.8.8"
     port = 53
     attempts = 3
@@ -365,7 +314,6 @@ def ping_latency_ms() -> float:
     return round(mean(times), 2) if times else 0.0
 
 def get_interface_stats() -> dict:
-    """Return RX/TX bytes per interface."""
     stats = psutil.net_io_counters(pernic=True)
     return {
         iface: {
@@ -378,7 +326,6 @@ def get_interface_stats() -> dict:
     }
 
 def download_test_mbps() -> float:
-    """Estimate download throughput via a 1MB GET."""
     url = f"http://{ZPNET_REMOTE_HOST}/api/download_test"
     headers = {
         "Connection": "close",
@@ -393,7 +340,6 @@ def download_test_mbps() -> float:
     return round((bits / 1e6) / elapsed, 2) if elapsed > 0 else 0.0
 
 def upload_test_mbps() -> float:
-    """Estimate upload throughput via gzip-compressed POST."""
     url = f"http://{ZPNET_REMOTE_HOST}/api/upload_test"
 
     payload = "".join(
@@ -411,53 +357,42 @@ def upload_test_mbps() -> float:
     return round((bits / 1e6) / elapsed, 2) if elapsed > 0 else 0.0
 
 def build_network_status() -> dict:
-    """
-    Gather network status snapshot.
-
-    This is a direct refactor of network_monitor.run(),
-    returning a payload instead of emitting events.
-    """
-
-    payload: dict = {}
+    payload = {}
 
     try:
         payload["ssid"] = get_ssid()
+    except Exception:
+        logging.exception("[system] get_ssid failed")
+        payload["ssid"] = ""
 
-        test_ok = zpnet_definitive_test()
-        payload["network_status"] = "NOMINAL" if test_ok else "DOWN"
+    try:
+        if zpnet_definitive_test():
+            payload["network_status"] = "NOMINAL"
+            payload["local_ip"] = get_local_ip()
+            payload["interfaces"] = get_interface_stats()
+            payload["ping_ms"] = ping_latency_ms()
 
-        if not test_ok:
-            return payload
+            try:
+                payload["download_mbps"] = download_test_mbps()
+                payload["upload_mbps"] = upload_test_mbps()
+            except Exception:
+                logging.exception("[system] speed tests failed")
 
-        payload["local_ip"] = get_local_ip()
-        payload["interfaces"] = get_interface_stats()
-        payload["ping_ms"] = ping_latency_ms()
-
-        try:
-            payload["download_mbps"] = download_test_mbps()
-            payload["upload_mbps"] = upload_test_mbps()
-        except requests.RequestException:
-            pass
-        except Exception:
-            pass
+        else:
+            payload["network_status"] = "DOWN"
 
     except Exception:
-        # Absolute containment — match legacy behavior
-        pass
+        logging.exception("[system] definitive test block failed")
+        payload["network_status"] = "DOWN"
 
     return payload
+
 
 # ------------------------------------------------------------------
 # Laser helpers (migrated from laser_monitor)
 # ------------------------------------------------------------------
 
 def read_mp5491_registers() -> dict:
-    """
-    Read all MP5491 registers over I²C.
-
-    Returns:
-        dict[str, int]: register name → raw byte value
-    """
     bus = SMBus(I2C_BUS)
     try:
         return {
@@ -468,10 +403,6 @@ def read_mp5491_registers() -> dict:
         bus.close()
 
 def decode_mp5491_state(vals: dict) -> dict:
-    """
-    Decode MP5491 configuration, status, and protection flags.
-    """
-
     sysen  = bool(vals["CTL0"] & SYSEN_BIT)
     id_en  = bool(vals["CTL1"] & ID_EN_BIT)
     id1_en = bool(vals["CTL1"] & ID1_EN_BIT)
@@ -502,58 +433,30 @@ def decode_mp5491_state(vals: dict) -> dict:
         "ot_shutdown": ot_shdn,
     }
 
-def query_teensy_laser_status() -> dict:
-
-    resp = send_command(machine="TEENSY", subsystem="LASER", command="REPORT")
-    payload = resp["payload"]
-    return {
-        "pd_voltage": payload.get("PD_voltage"),
-        "laser_emitting": payload.get("laser_emitting"),
-    }
 
 def build_laser_status() -> dict:
-    """
-    Build consolidated laser status snapshot.
-
-    Combines:
-      • MP5491 I²C capability truth (Pi-side)
-      • Optical emission truth (Teensy-side)
-    """
-
-    payload = {
+    payload: dict[str, str | float | bool | dict[str, str]] = {
         "i2c_address": "0x66",
-        "device_present": False,
-        "health_state": "UNKNOWN",
+        "device_present": True,
     }
 
-    try:
-        # ----------------------------------------------------------
-        # I²C capability truth
-        # ----------------------------------------------------------
-        vals = read_mp5491_registers()
-        decoded = decode_mp5491_state(vals)
+    # ----------------------------------------------------------
+    # I²C capability truth (owned hardware)
+    # ----------------------------------------------------------
+    vals = read_mp5491_registers()
+    decoded = decode_mp5491_state(vals)
 
-        payload.update({
-            "device_present": True,
-            **decoded,
+    payload.update(decoded)
 
-            "raw_registers": {
-                f"0x{addr:02X}": f"0x{vals[name]:02X}"
-                for name, addr in REGS.items()
-            },
-        })
+    payload["raw_registers"] = {
+        f"0x{addr:02X}": f"0x{vals[name]:02X}"
+        for name, addr in REGS.items()
+    }
 
-        # ----------------------------------------------------------
-        # Optical ground truth (Teensy)
-        # ----------------------------------------------------------
-        teensy = query_teensy_laser_status()
-        payload.update(teensy)
+    teensy = send_command(machine="TEENSY", subsystem="LASER", command="REPORT")["payload"]
+    payload.update(teensy)
 
-        payload["health_state"] = "NOMINAL"
-
-    except Exception:
-        payload["health_state"] = "DOWN"
-
+    payload["health_state"] = "NOMINAL"
     return payload
 
 # ------------------------------------------------------------------
@@ -561,24 +464,8 @@ def build_laser_status() -> dict:
 # ------------------------------------------------------------------
 
 def build_gnss_status() -> dict:
-    """
-    Build GNSS snapshot for SYSTEM payload.
-
-    Semantics:
-      • GNSS remains the authoritative instrument
-      • SYSTEM transports GNSS facts verbatim
-      • No inference, no aggregation, no synthesis
-      • health_state is SYSTEM-owned
-    """
-
-    payload = send_command(
-        machine="PI",
-        subsystem="GNSS",
-        command="REPORT",
-    )["payload"]
-
     return {
-        **payload,
+        **send_command(machine="PI", subsystem="GNSS", command="REPORT")["payload"],
         "health_state": "NOMINAL",
     }
 
@@ -586,69 +473,29 @@ def build_gnss_status() -> dict:
 # Sensor helpers (migrated from sensor_monitor)
 # ------------------------------------------------------------------
 
-def sensor_scan_probe_device(bus: SMBus, addr: int, label: str) -> str:
-    """
-    Probe a single I²C device.
-
-    Returns:
-        "NOMINAL" | "OFFLINE"
-    """
-    try:
-        if "BME280" in label:
-            chip_id = bus.read_byte_data(addr, BME280_ID_REG)
-            if chip_id != BME280_EXPECTED_ID:
-                raise RuntimeError(
-                    f"unexpected BME280 chip ID 0x{chip_id:02X}"
-                )
-        else:
-            # Generic safe probe
-            bus.read_byte_data(addr, 0x00)
-
-        return "NOMINAL"
-
-    except Exception as e:
-        logging.info(f"[system_poller] sensor_scan {label} offline: {e}")
-        return "OFFLINE"
-
-
 def build_sensor_scan_status() -> dict:
     """
     Build sensor scan snapshot.
 
-    Legacy origin:
-        zpnet.modules.sensor_monitor
-
     Semantics:
-        • Best-effort
-        • Read-only
-        • No events
-        • No interpretation
+      • SYSTEM reports electrical presence only
+      • Boundary at SMBus acquisition
+      • Any probe failure is real and fatal
+      • No device identity verification
+      • No interpretation
     """
     results: dict[str, str] = {}
-    bus: SMBus | None = None
 
-    try:
-        bus = SMBus(I2C_BUS)
-
+    with SMBus(I2C_BUS) as bus:
         for addr, label in I2C_DEVICES.items():
-            results[label] = sensor_scan_probe_device(bus, addr, label)
-
-    except Exception as e:
-        logging.exception("[system_poller] sensor_scan I²C bus unavailable")
-        for label in I2C_DEVICES.values():
-            results[label] = "OFFLINE"
-
-    finally:
-        try:
-            if bus:
-                bus.close()
-        except Exception:
-            pass
+            # Generic I²C presence probe (ACK required)
+            bus.read_byte_data(addr, 0x00)
+            results[label] = "NOMINAL"
 
     return results
 
 # ------------------------------------------------------------------
-# Enviornment helpers (migrated from environment_monitor)
+# Environment helpers (migrated from environment_monitor)
 # ------------------------------------------------------------------
 
 def read_u16_le(bus: SMBus, addr: int, reg: int) -> int:
@@ -662,6 +509,7 @@ def read_s16_le(bus: SMBus, addr: int, reg: int) -> int:
     if val & 0x8000:
         val -= 1 << 16
     return val
+
 
 def read_bme280_calibration(bus: SMBus) -> dict:
     cal = {}
@@ -686,16 +534,20 @@ def read_bme280_calibration(bus: SMBus) -> dict:
     cal["dig_H1"] = bus.read_byte_data(BME280_ADDR, 0xA1)
     cal["dig_H2"] = read_s16_le(bus, BME280_ADDR, 0xE1)
     cal["dig_H3"] = bus.read_byte_data(BME280_ADDR, 0xE3)
+
     e4 = bus.read_byte_data(BME280_ADDR, 0xE4)
     e5 = bus.read_byte_data(BME280_ADDR, 0xE5)
     e6 = bus.read_byte_data(BME280_ADDR, 0xE6)
+
     cal["dig_H4"] = (e4 << 4) | (e5 & 0x0F)
     cal["dig_H5"] = (e6 << 4) | (e5 >> 4)
+
     cal["dig_H6"] = bus.read_byte_data(BME280_ADDR, 0xE7)
     if cal["dig_H6"] & 0x80:
         cal["dig_H6"] -= 256
 
     return cal
+
 
 def compensate_temperature(adc_T: int, cal: dict) -> tuple[float, float]:
     var1 = (adc_T / 16384.0 - cal["dig_T1"] / 1024.0) * cal["dig_T2"]
@@ -712,13 +564,11 @@ def compensate_pressure(adc_P: int, t_fine: float, cal: dict) -> float:
     var1 = (cal["dig_P3"] * var1 * var1 / 524288.0 + cal["dig_P2"] * var1) / 524288.0
     var1 = (1.0 + var1 / 32768.0) * cal["dig_P1"]
 
-    if var1 == 0:
-        return 0.0
-
     p = 1048576.0 - adc_P
     p = (p - var2 / 4096.0) * 6250.0 / var1
     var1 = cal["dig_P9"] * p * p / 2147483648.0
     var2 = p * cal["dig_P8"] / 32768.0
+
     return (p + (var1 + var2 + cal["dig_P7"]) / 16.0) / 100.0
 
 
@@ -732,22 +582,19 @@ def compensate_humidity(adc_H: int, t_fine: float, cal: dict) -> float:
     h *= 1.0 - cal["dig_H1"] * h / 524288.0
     return max(0.0, min(100.0, h))
 
+
 def build_environment_status() -> dict:
-    payload = {
-        "sensor_address": "0x76",
-        "sensor_present": False,
-        "health_state": "DOWN",
-    }
+    """
+    Read environmental data from BME280.
 
-    bus = None
-    try:
-        bus = SMBus(1)
-
+    Semantics:
+      • Either returns a complete, truthful payload
+      • Or raises
+    """
+    with SMBus(1) as bus:
         chip_id = bus.read_byte_data(BME280_ADDR, REG_ID)
         if chip_id != EXPECTED_CHIP_ID:
             raise RuntimeError(f"unexpected BME280 chip ID 0x{chip_id:02X}")
-
-        payload["sensor_present"] = True
 
         # Forced mode, oversampling x1
         bus.write_byte_data(BME280_ADDR, REG_CTRL_HUM, 0x01)
@@ -766,27 +613,15 @@ def build_environment_status() -> dict:
 
         altitude_m = 44330.0 * (1.0 - (pressure_hpa / SEA_LEVEL_PRESSURE_HPA) ** 0.1903)
 
-        payload.update(
-            {
-                "temperature_c": round(temp_c, 2),
-                "pressure_hpa": round(pressure_hpa, 2),
-                "humidity_pct": round(humidity_pct, 2),
-                "altitude_m": round(altitude_m, 1),
-                "health_state": "NOMINAL",
-            }
-        )
-
-    except Exception:
-        logging.exception("[system] environment_status collection failed")
-
-    finally:
-        try:
-            if bus:
-                bus.close()
-        except Exception:
-            pass
-
-    return payload
+        return {
+            "sensor_address": "0x76",
+            "sensor_present": True,
+            "temperature_c": round(temp_c, 2),
+            "pressure_hpa": round(pressure_hpa, 2),
+            "humidity_pct": round(humidity_pct, 2),
+            "altitude_m": round(altitude_m, 1),
+            "health_state": "NOMINAL",
+        }
 
 # ------------------------------------------------------------------
 # Power monitoring helpers (legacy: power_monitor)
@@ -797,11 +632,15 @@ def read_word(bus: SMBus, addr: int, reg: int) -> int:
     raw = bus.read_word_data(addr, reg)
     return ((raw & 0xFF) << 8) | (raw >> 8)
 
+
 def read_ina260(bus: SMBus, addr: int) -> dict:
     """
     Read current, voltage, and power from an INA260.
 
-    Returns raw, ground-truth measurements only.
+    Semantics:
+      • Raw, ground-truth measurements only
+      • Assumes device presence
+      • Any failure is real
     """
     current_raw = read_word(bus, addr, REG_CURRENT)
     voltage_raw = read_word(bus, addr, REG_VOLTAGE)
@@ -815,70 +654,39 @@ def read_ina260(bus: SMBus, addr: int) -> dict:
     voltage_v  = voltage_raw * 0.00125      # 1.25 mV/LSB
     power_w    = (power_raw * 10) / 1000.0  # 10 mW/LSB → W
 
-    cfg = DEVICE_CONFIG.get(addr, {})
+    cfg = DEVICE_CONFIG[addr]
 
     return {
         "address": f"0x{addr:02X}",
-        "label": cfg.get("label", "Unknown"),
+        "label": cfg["label"],
         "voltage_v": round(voltage_v, 3),
         "current_ma": round(current_ma, 2),
         "power_w": round(power_w, 3),
         "ideal_voltage_v": cfg.get("ideal_voltage_v"),
     }
 
+
 def build_power_status() -> dict:
     """
     Build power rail snapshot from INA260 sensors.
 
-    Legacy origin:
-        zpnet.modules.power_monitor
-
     Semantics:
-        • Observation only
-        • No inference
-        • No shutdown
-        • No tolerance enforcement
-        • No events
+      • Observation only
+      • No inference
+      • No per-rail fault masking
+      • Boundary at SMBus acquisition
     """
+    rails: list[dict] = []
 
-    payload = {
-        "bus": "i2c-1",
-        "health_state": "UNKNOWN",
-        "rails": [],
-    }
-
-    bus = None
-    try:
-        bus = SMBus(I2C_BUS)
-
+    with SMBus(I2C_BUS) as bus:
         for addr in DEVICE_CONFIG:
-            try:
-                rail = read_ina260(bus, addr)
-                payload["rails"].append(rail)
-            except Exception as e:
-                logging.exception(
-                    f"[system_poller] power rail 0x{addr:02X} read failed"
-                )
-                payload["rails"].append({
-                    "address": f"0x{addr:02X}",
-                    "label": DEVICE_CONFIG[addr]["label"],
-                    "health_state": "OFFLINE",
-                })
+            rails.append(read_ina260(bus, addr))
 
-        payload["health_state"] = "NOMINAL"
-
-    except Exception:
-        logging.exception("[system_poller] power_status I²C bus unavailable")
-        payload["health_state"] = "DOWN"
-
-    finally:
-        try:
-            if bus:
-                bus.close()
-        except Exception:
-            pass
-
-    return payload
+    return {
+        "bus": "i2c-1",
+        "health_state": "NOMINAL",
+        "rails": rails,
+    }
 
 # ------------------------------------------------------------------
 # Battery status helpers
@@ -1039,10 +847,7 @@ def build_battery_status() -> dict:
 # ------------------------------------------------------------------
 
 def build_teensy_status() -> dict:
-    resp = send_command(machine="TEENSY", subsystem="SYSTEM", command="REPORT")
-    logging.warning("[build_teensy_status] raw response: %s", resp)
-
-    payload = resp["payload"]
+    payload = send_command(machine="TEENSY", subsystem="SYSTEM", command="REPORT")["payload"]
     payload["health_state"] = "NOMINAL"
     return payload
 
@@ -1056,8 +861,6 @@ def system_poller() -> None:
 
     try:
         while True:
-
-            logging.info("[system_poller] collecting SYSTEM snapshot")
 
             pi_payload = build_pi_status()
             teensy_payload = build_teensy_status()
@@ -1080,8 +883,6 @@ def system_poller() -> None:
                 "power": dict(power_payload),
                 "battery": dict(battery_payload),
             }
-
-            logging.info("[build_teensy_status] SYSTEM snapshot: %s", SYSTEM)
 
             # ----------------------------------------------------------
             # Emit consolidated system event
@@ -1124,7 +925,10 @@ def run() -> None:
             socket_path=CMD_SOCKET_PATH,
             commands=COMMANDS,
         )
-
     except Exception:
-        logging.exception("[system] unhandled exception in main thread — process exiting")
+        logging.exception("[system] unhandled exception in main thread")
+
+
+if __name__ == "__main__":
+    run()
 

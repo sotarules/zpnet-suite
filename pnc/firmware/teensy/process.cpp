@@ -1,5 +1,9 @@
 #include "process.h"
 #include "events.h"
+#include "payload.h"
+
+#include <Arduino.h>
+#include <string.h>
 
 // -----------------------------------------------------------------------------
 // Configuration
@@ -15,14 +19,14 @@ bool process_type_from_name(
   const char* subsystem,
   process_type_t& out
 ) {
-  if (strcmp(subsystem, "CLOCKS")    == 0) { out = PROCESS_TYPE_CLOCKS;    return true; }
-  if (strcmp(subsystem, "EVENTS")    == 0) { out = PROCESS_TYPE_EVENTS;    return true; }
-  if (strcmp(subsystem, "TIMEPOP")   == 0) { out = PROCESS_TYPE_TIMEPOP;   return true; }
-  if (strcmp(subsystem, "LASER")     == 0) { out = PROCESS_TYPE_LASER;     return true; }
-  if (strcmp(subsystem, "PHOTODIODE")== 0) { out = PROCESS_TYPE_PHOTODIODE;return true; }
-  if (strcmp(subsystem, "TEMPEST")   == 0) { out = PROCESS_TYPE_TEMPEST;   return true; }
-  if (strcmp(subsystem, "LANTERN")   == 0) { out = PROCESS_TYPE_LANTERN;   return true; }
-  if (strcmp(subsystem, "SYSTEM")    == 0) { out = PROCESS_TYPE_SYSTEM;    return true; }
+  if (strcmp(subsystem, "CLOCKS")     == 0) { out = PROCESS_TYPE_CLOCKS;     return true; }
+  if (strcmp(subsystem, "EVENTS")     == 0) { out = PROCESS_TYPE_EVENTS;     return true; }
+  if (strcmp(subsystem, "TIMEPOP")    == 0) { out = PROCESS_TYPE_TIMEPOP;    return true; }
+  if (strcmp(subsystem, "LASER")      == 0) { out = PROCESS_TYPE_LASER;      return true; }
+  if (strcmp(subsystem, "PHOTODIODE") == 0) { out = PROCESS_TYPE_PHOTODIODE; return true; }
+  if (strcmp(subsystem, "TEMPEST")    == 0) { out = PROCESS_TYPE_TEMPEST;    return true; }
+  if (strcmp(subsystem, "LANTERN")    == 0) { out = PROCESS_TYPE_LANTERN;    return true; }
+  if (strcmp(subsystem, "SYSTEM")     == 0) { out = PROCESS_TYPE_SYSTEM;     return true; }
 
   return false;  // programmer error → caller should not recover
 }
@@ -113,17 +117,15 @@ bool process_start(process_type_t type) {
 
   bool ok = p->vtable->start();
 
-  String body;
-  body += "\"name\":\"";
-  body += p->vtable->name;
-  body += "\"";
+  Payload ev;
+  ev.add("name", p->vtable->name);
 
   if (ok) {
     p->state = PROCESS_STATE_RUNNING;
-    enqueueEvent("PROCESS_STARTED", body);
+    enqueueEvent("PROCESS_STARTED", ev);
   } else {
     p->state = PROCESS_STATE_ERROR;
-    enqueueEvent("PROCESS_ERROR", body);
+    enqueueEvent("PROCESS_ERROR", ev);
   }
 
   return ok;
@@ -140,12 +142,10 @@ bool process_stop(process_type_t type) {
   p->vtable->stop();
   p->state = PROCESS_STATE_STOPPED;
 
-  String body;
-  body += "\"name\":\"";
-  body += p->vtable->name;
-  body += "\"";
+  Payload ev;
+  ev.add("name", p->vtable->name);
+  enqueueEvent("PROCESS_STOPPED", ev);
 
-  enqueueEvent("PROCESS_STOPPED", body);
   return true;
 }
 
@@ -173,19 +173,23 @@ void process_command(
     return;
   }
 
-  const String* payload = entry->handler(args_json);
+  // Invoke handler (new contract)
+  const Payload* payload = entry->handler(args_json);
+
+  // -----------------------------------------------------------------
+  // Build response envelope (single authority)
+  // -----------------------------------------------------------------
 
   out_response = "{";
   out_response += "\"success\":true,\"message\":\"OK\"";
 
   if (payload) {
     out_response += ",\"payload\":";
-    out_response += *payload;
+    out_response += payload->to_json();
   }
 
   out_response += "}";
 }
-
 
 // -----------------------------------------------------------------------------
 // Registry Introspection
@@ -193,27 +197,35 @@ void process_command(
 
 String process_list_json(void) {
 
-  String out;
-  out += "{";
-  out += "\"processes\":[";
+  Payload root;
+
+  // Build array manually (Payload is object-only by design)
+  String arr;
+  arr += "[";
 
   for (size_t i = 0; i < registry_count; ++i) {
-    if (i) out += ",";
+    if (i) arr += ",";
 
-    out += "{";
-    out += "\"name\":\"";
-    out += registry[i].vtable->name;
-    out += "\",\"state\":\"";
+    Payload p;
+    p.add("name", registry[i].vtable->name);
 
     switch (registry[i].state) {
-      case PROCESS_STATE_RUNNING: out += "RUNNING"; break;
-      case PROCESS_STATE_STOPPED: out += "STOPPED"; break;
-      case PROCESS_STATE_ERROR:   out += "ERROR";   break;
+      case PROCESS_STATE_RUNNING: p.add("state", "RUNNING"); break;
+      case PROCESS_STATE_STOPPED: p.add("state", "STOPPED"); break;
+      case PROCESS_STATE_ERROR:   p.add("state", "ERROR");   break;
     }
 
-    out += "\"}";
+    arr += p.to_json();
   }
 
-  out += "]}";
+  arr += "]";
+
+  // Root object
+  String out;
+  out += "{";
+  out += "\"processes\":";
+  out += arr;
+  out += "}";
+
   return out;
 }

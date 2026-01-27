@@ -1,221 +1,144 @@
 // ============================================================================
-// FILE: process_events.cpp (Self-contained Version)
+// FILE: process_events.cpp
 // ============================================================================
 //
-// ZPNet EVENTS Process — Durable Event Drain via Structured Command
+// ZPNet EVENTS Process
 //
-// Responsibilities:
-//   • Supersedes event_bus.cpp by inlining all functionality
-//   • Provides command interface for GET
-//   • Implements internal event queue, enqueue, and drain logic
-//   • Conforms to process registration contract
+// Role:
+//   • Maintain a bounded FIFO of durable events
+//   • Expose queued events via EVENTS.GET
 //
-// Author: The Mule + GPT
+// Semantics:
+//   • enqueueEvent() records immutable facts (type + Payload)
+//   • EVENTS.GET returns queued events and clears the queue
+//   • No streaming, framing, timers, or side effects
+//
 // ============================================================================
 
+#include "debug.h"
 #include "process_events.h"
 #include "process.h"
-#include "timepop.h"
-#include "debug.h"
+#include "payload.h"
 #include "transport.h"
 #include "util.h"
 
 #include <Arduino.h>
 
 // --------------------------------------------------------------
-// Internal config + storage
+// Configuration
 // --------------------------------------------------------------
-#define EVT_MAX 64
-#define EVT_TYPE_MAX 32
-#define EVT_BODY_MAX 192
+#define EVT_MAX       64
+#define EVT_TYPE_MAX  32
+#define EVT_BODY_MAX  192   // serialized payload bound
+
+// --------------------------------------------------------------
+// Event storage
+// --------------------------------------------------------------
+//
+// NOTE:
+//   • Payload is serialized at enqueue time
+//   • EVENTS stores only complete, valid JSON objects
+//   • No fragments, no syntax splicing
+//
 
 struct EventItem {
   char type[EVT_TYPE_MAX];
-  char body[EVT_BODY_MAX];
+  char payload[EVT_BODY_MAX];  // full JSON object or empty string
 };
 
 static EventItem evtq[EVT_MAX];
-static size_t evt_head = 0;
-static size_t evt_tail = 0;
+static size_t evt_head  = 0;
+static size_t evt_tail  = 0;
 static size_t evt_count = 0;
-static uint32_t evt_dropped = 0;
-
-static volatile bool g_drain_requested   = false;
-static volatile bool g_drain_in_progress = false;
-
-static uint32_t last_tick_ms = 0;
-
-static void maybe_debug_tick(const char* tag) {
-  uint32_t now = millis();
-  if (now - last_tick_ms >= 1000) {
-    last_tick_ms = now;
-  }
-}
 
 // --------------------------------------------------------------
-// Protocol emitters
+// Public API — enqueue durable event
 // --------------------------------------------------------------
-static inline void emitControlMessage(const char* control, const String* body = nullptr) {
-  String out;
-  out += "{\"control\":\"";
-  out += control;
-  out += "\"";
-  if (body && body->length() > 0) {
-    out += ",";
-    out += *body;
-  }
-  out += "}";
-  transport_send_frame(out.c_str(), out.length());
-}
+//
+// Contract:
+//   • Payload is a complete JSON object
+//   • nullptr payload means "no payload"
+//   • Serialization happens here, once
+//
 
-static inline void emitEventMessage(const char* type, const String& body) {
-  String out;
-  out += "{\"event_type\":\"";
-  out += type;
-  out += "\"";
-  if (body.length() > 0) {
-    out += ",";
-    out += body;
-  }
-  out += "}";
-  transport_send_frame(out.c_str(), out.length());
-}
+void enqueueEvent(const char* type, const Payload& payload) {
 
-// --------------------------------------------------------------
-// Queue helpers
-// --------------------------------------------------------------
-static bool dequeueEvent(EventItem& out) {
-  if (!evt_count) return false;
-  out = evtq[evt_tail];
-  evt_tail = (evt_tail + 1) % EVT_MAX;
-  evt_count--;
-  return true;
-}
-
-// --------------------------------------------------------------
-// Public API for enqueue
-// --------------------------------------------------------------
-void enqueueEvent(const char* type, const String& body) {
   if (evt_count >= EVT_MAX) {
-    evt_dropped++;
+    // Drop silently: overflow is an observable condition downstream
     return;
   }
+
   EventItem& e = evtq[evt_head];
   safeCopy(e.type, sizeof(e.type), type);
-  safeCopy(e.body, sizeof(e.body), body.c_str());
+
+  if (!payload.empty()) {
+    String json = payload.to_json();
+    safeCopy(e.payload, sizeof(e.payload), json.c_str());
+  } else {
+    e.payload[0] = '\0';
+  }
+
   evt_head = (evt_head + 1) % EVT_MAX;
   evt_count++;
 }
 
 // --------------------------------------------------------------
-// Drain logic (immediate or tick)
+// Command: GET — return and clear all queued events
 // --------------------------------------------------------------
-void drainEventsNow(void) {
-  String meta;
-  meta += "\"count\":";
-  meta += evt_count;
-  meta += ",\"dropped\":";
-  meta += evt_dropped;
-  emitControlMessage("EVENTS_BEGIN", &meta);
+//
+// Returns Payload containing:
+//   {
+//     "events": [
+//       { "event_type": "...", "payload": { ... } },
+//       ...
+//     ]
+//   }
+//
+static const Payload* cmd_get(const char*) {
 
-  EventItem e;
-  while (dequeueEvent(e)) {
-    String body;
-    if (e.body[0]) body += e.body;
-    emitEventMessage(e.type, body);
+  static Payload out;
+  out.clear();
+
+  PayloadArray events;
+
+  while (evt_count > 0) {
+
+    const EventItem& e = evtq[evt_tail];
+
+    Payload item;
+    item.add("event_type", e.type);
+
+    if (e.payload[0] != '\0') {
+      // Adopt trusted JSON object as a real sub-node
+      item.add_raw_object("payload", e.payload);
+    }
+
+    events.add(item);
+
+    evt_tail = (evt_tail + 1) % EVT_MAX;
+    evt_count--;
   }
 
-  emitControlMessage("EVENTS_END");
+  out.add_array("events", events);
+
+  return &out;
 }
+
 
 // --------------------------------------------------------------
-// TimePop tick
+// Process registration
 // --------------------------------------------------------------
-static void eventbus_tick(timepop_ctx_t* /*timer*/, void* /*user*/) {
-  maybe_debug_tick("eventbus");
-  if (g_drain_requested && !g_drain_in_progress) {
-    g_drain_requested = false;
-    g_drain_in_progress = true;
-    drainEventsNow();
-    g_drain_in_progress = false;
-  }
-}
 
-// --------------------------------------------------------------
-// Public API
-// --------------------------------------------------------------
-void event_bus_init(void) {
-  g_drain_requested = false;
-  g_drain_in_progress = false;
-  timepop_arm(TIMEPOP_CLASS_EVENTBUS, true, eventbus_tick, nullptr, "event-bus");
-}
-
-void event_bus_request_drain(void) {
-  g_drain_requested = true;
-}
-
-void enqueueAckEvent(const char* cmd) {
-  String b;
-  b += "\"cmd\":\"";
-  b += cmd;
-  b += "\",\"ok\":true";
-  enqueueEvent("ACK", b);
-}
-
-void enqueueErrEvent(const char* cmd, const char* msg) {
-  String b;
-  b += "\"cmd\":\"";
-  b += cmd;
-  b += "\",\"ok\":false";
-  if (msg) {
-    b += ",\"error\":\"";
-    b += jsonEscape(msg);
-    b += "\"";
-  }
-  enqueueEvent("ERR", b);
-}
-
-uint32_t eventQueueDepth(void) {
-  return (uint32_t)evt_count;
-}
-
-uint32_t eventDroppedCount(void) {
-  return evt_dropped;
-}
-
-// ------------------------------------------------------------------
-// Lifecycle (process)
-// ------------------------------------------------------------------
-static bool events_start(void) {
-  event_bus_init();
-  return true;
-}
-
-static void events_stop(void) {}
-
-// ------------------------------------------------------------------
-// Commands
-// ------------------------------------------------------------------
-static const String* cmd_get(const char* /*args_json*/) {
-  static String payload;
-  payload = "{}";
-  drainEventsNow();
-  return &payload;
-}
-
-// ------------------------------------------------------------------
-// Registration
-// ------------------------------------------------------------------
 static const process_command_entry_t EVENTS_COMMANDS[] = {
   { "GET", cmd_get },
 };
 
 static const process_vtable_t EVENTS_PROCESS = {
-  .name = "EVENTS",
-  .start = events_start,
-  .stop  = events_stop,
-  .query = nullptr,
-  .commands = EVENTS_COMMANDS,
+  .name          = "EVENTS",
+  .start         = nullptr,
+  .stop          = nullptr,
+  .query         = nullptr,
+  .commands      = EVENTS_COMMANDS,
   .command_count = 1,
 };
 

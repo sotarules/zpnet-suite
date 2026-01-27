@@ -8,6 +8,8 @@
 #include "process.h"
 #include "transport.h"
 
+#include "payload.h"
+
 #include "process_clocks.h"
 #include "process_events.h"
 #include "process_timepop.h"
@@ -61,9 +63,6 @@ void setup() {
   debug_log("setup", "clock_init");
   clock_init();
 
-  debug_log("setup", "process_events_register");
-  process_events_register();
-
   // ----------------------------------------------------------
   // Process framework
   // ----------------------------------------------------------
@@ -74,20 +73,28 @@ void setup() {
   // Register processes
   // ----------------------------------------------------------
 
+  debug_log("setup", "process_events_register");
+  process_events_register();
+
   debug_log("setup", "process_timepop_register");
   process_timepop_register();
+
   debug_log("setup", "process_clocks_register");
   process_clocks_register();
+
   debug_log("setup", "process_laser_register");
   process_laser_register();
   debug_log("setup", "process_start(PROCESS_TYPE_LASER)");
   process_start(PROCESS_TYPE_LASER);
+
   debug_log("setup", "process_photodiode_register");
   process_photodiode_register();
   debug_log("setup", "process_start(PROCESS_TYPE_PHOTODIODE)");
   process_start(PROCESS_TYPE_PHOTODIODE);
+
   debug_log("setup", "process_tempest_register");
   process_tempest_register();
+
   debug_log("setup", "process_system_register");
   process_system_register();
 
@@ -112,7 +119,11 @@ void setup() {
   // Signal readiness
   // ----------------------------------------------------------
   debug_log("setup", "enqueueEvent(BOOT)");
-  enqueueEvent("BOOT", "\"status\":\"READY\"");
+  {
+    Payload ev;
+    ev.add("status", "READY");
+    enqueueEvent("BOOT", ev);
+  }
 
   // ----------------------------------------------------------
   // Keep stuff flowing in the debug channel during development
@@ -125,7 +136,5 @@ void setup() {
 // -----------------------------------------------------------------------------
 
 void loop() {
-    timepop_dispatch();
+  timepop_dispatch();
 }
-
-

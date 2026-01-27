@@ -4,6 +4,8 @@
 #include <stdint.h>
 #include <stddef.h>
 
+#include "payload.h"
+
 // --------------------------------------------------
 // Process Types
 // --------------------------------------------------
@@ -31,8 +33,17 @@ typedef enum {
 // --------------------------------------------------
 // Command Response Contract
 // --------------------------------------------------
+//
+// New canonical contract:
+//
+//   • Command handlers return `const Payload*`
+//   • Returning nullptr means:
+//       - side-effect only
+//       - no payload field is emitted in the response
+//   • Handlers MUST NOT perform serialization
+//
 
-typedef const String* (*process_command_fn)(
+typedef const Payload* (*process_command_fn)(
   const char* args_json   // may be nullptr
 );
 
@@ -51,6 +62,7 @@ typedef struct {
 //
 // Each process explicitly declares its command surface.
 // No command name inference, no parser heuristics.
+// No JSON construction in user code.
 //
 
 typedef struct {
@@ -60,7 +72,8 @@ typedef struct {
   bool (*start)(void);
   void (*stop)(void);
 
-  // Introspection (optional but recommended)
+  // Introspection (optional)
+  // NOTE: If retained, this should eventually return Payload as well.
   String (*query)(void);
 
   // Command surface
@@ -84,6 +97,7 @@ bool process_start(process_type_t type);
 bool process_stop(process_type_t type);
 
 // Canonical command invocation
+// Builds full JSON response envelope internally.
 void process_command(
   process_type_t type,
   const char*    cmd_name,

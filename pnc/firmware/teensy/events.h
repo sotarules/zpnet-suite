@@ -7,10 +7,12 @@
 // Core contract:
 //   • Events are durable facts.
 //   • Events are enqueued opportunistically.
+//   • Events carry structured meaning via Payload.
+//   • Serialization occurs exactly once, at enqueue time.
 //   • NOTHING is emitted unless an explicit drain is requested.
 //   • Draining occurs ONLY in scheduled (non-ISR) context.
 //
-// TimePop integration (new kernel standard):
+// TimePop integration (kernel standard):
 //   • The event bus tick is armed via timepop_arm(TIMEPOP_CLASS_EVENTBUS, ...).
 //   • The event bus does NOT self-schedule.
 //   • The tick performs work only when g_drain_requested is set.
@@ -21,16 +23,17 @@
 
 #include <Arduino.h>
 #include "config.h"
+#include "payload.h"
 
 // --------------------------------------------------------------
-// Event item (ring buffer entry)
+// Enqueue a durable event
 // --------------------------------------------------------------
-struct EventItem {
-  char type[EVT_TYPE_MAX];
-  char body[EVT_BODY_MAX];
-};
-
-// Enqueue a durable event (no serial output).
-// "body" must be a valid JSON fragment WITHOUT outer braces.
-void enqueueEvent(const char* type, const String& body);
-
+//
+// Contract:
+//   • `type` is a stable event identifier
+//   • `payload` is a complete semantic object
+//   • `payload` may be empty (no fields)
+//   • JSON serialization is owned by the event bus
+//   • Callers MUST NOT construct JSON
+//
+void enqueueEvent(const char* type, const Payload& payload);

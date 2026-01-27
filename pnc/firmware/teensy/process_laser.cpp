@@ -2,6 +2,7 @@
 
 #include "config.h"
 #include "events.h"
+#include "payload.h"
 #include "process.h"
 
 #include <Arduino.h>
@@ -113,40 +114,27 @@ static void laser_snapshot(void) {
 }
 
 static void laser_emit_init_event(void) {
-  String body = "\"payload\": {";
+  Payload p;
 
-  body += "\"CTL0\":"; body += LASER.ctl0;
-  body += ",\"CTL1\":"; body += LASER.ctl1;
-  body += ",\"CTL2\":"; body += LASER.ctl2;
+  p.add("CTL0", LASER.ctl0);
+  p.add("CTL1", LASER.ctl1);
+  p.add("CTL2", LASER.ctl2);
 
-  body += ",\"ID1_raw\":"; body += LASER.id1_raw;
-  body += ",\"ID1_current_ma\":";
-  {
-    char buf[32];
-    snprintf(buf, sizeof(buf), "%.2f", LASER.id1_current_ma);
-    body += buf;
-  }
+  p.add("id1_raw", LASER.id1_raw);
+  p.add("id1_current_ma", LASER.id1_current_ma);
 
-  body += ",\"STATUS1\":"; body += LASER.status1;
-  body += ",\"STATUS2\":"; body += LASER.status2;
-  body += ",\"STATUS3\":"; body += LASER.status3;
-  body += ",\"STATUS4\":"; body += LASER.status4;
-  body += ",\"INT\":"; body += LASER.intr;
+  p.add("STATUS1", LASER.status1);
+  p.add("STATUS2", LASER.status2);
+  p.add("STATUS3", LASER.status3);
+  p.add("STATUS4", LASER.status4);
+  p.add("INT", LASER.intr);
 
-  body += ",\"PD_adc_raw\":"; body += LASER.pd_adc_raw;
-  body += ",\"PD_voltage\":";
-  {
-    char buf[32];
-    snprintf(buf, sizeof(buf), "%.4f", LASER.pd_voltage);
-    body += buf;
-  }
+  p.add("pd_adc_raw", LASER.pd_adc_raw);
+  p.add("pd_voltage", LASER.pd_voltage);
 
-  body += ",\"laser_emitting\":";
-  body += (LASER.pd_voltage > 0.75f ? "true" : "false");
+  p.add("laser_emitting", LASER.pd_voltage > 0.75f);
 
-  body += "}";
-
-  enqueueEvent("LASER_INITIALIZATION", body);
+  enqueueEvent("LASER_INITIALIZATION", p);
 }
 
 // ================================================================
@@ -154,7 +142,11 @@ static void laser_emit_init_event(void) {
 // ================================================================
 
 static bool laser_start(void) {
-  enqueueEvent("LASER_INIT_ENTER", "\"stage\":\"process_start\"");
+  {
+    Payload p;
+    p.add("stage", "process_start");
+    enqueueEvent("LASER_INIT_ENTER", p);
+  }
 
   pinMode(LD_ON_PIN, OUTPUT);
   laser_inhibit();
@@ -183,53 +175,51 @@ static bool laser_start(void) {
 
 static void laser_stop(void) {
   laser_inhibit();
-  enqueueEvent("LASER_STOP", "\"action\":\"inhibit\"");
+
+  Payload p;
+  p.add("action", "inhibit");
+  enqueueEvent("LASER_STOP", p);
 }
 
 // ================================================================
 // Commands
 // ================================================================
+//
+// New command contract (assumed):
+//   • Handlers return const Payload* (nullptr means "no payload")
+//   • Framework serializes Payload and wraps response envelope
+//
 
 // ------------------------------------------------------------
 // REPORT — return current laser state snapshot
 // ------------------------------------------------------------
-static const String* cmd_report(const char* /*args_json*/) {
+static const Payload* cmd_report(const char* /*args_json*/) {
 
   // Refresh authoritative snapshot
   laser_snapshot();
 
-  // Persistent payload storage
-  static String payload;
-  payload = "{";
+  // Persistent payload storage (safe to return pointer)
+  static Payload p;
+  p.clear();
 
-  payload += "\"ID1_current_ma\":";
-  {
-    char buf[32];
-    snprintf(buf, sizeof(buf), "%.2f", LASER.id1_current_ma);
-    payload += buf;
-  }
+  // Prefer numeric JSON values by default
+  // Use add_fmt only when a human-facing precision policy is desired.
+  p.add("id1_current_ma", LASER.id1_current_ma);
+  p.add("pd_voltage", LASER.pd_voltage);
+  p.add("laser_emitting", LASER.pd_voltage > 0.5f);
 
-  payload += ",\"PD_voltage\":";
-  {
-    char buf[32];
-    snprintf(buf, sizeof(buf), "%.4f", LASER.pd_voltage);
-    payload += buf;
-  }
-
-  payload += ",\"laser_emitting\":";
-  payload += (LASER.pd_voltage > 0.5f ? "true" : "false");
-
-  payload += "}";
-
-  return &payload;
+  return &p;
 }
 
 // ------------------------------------------------------------
 // ON — permit emission
 // ------------------------------------------------------------
-static const String* cmd_on(const char* /*args_json*/) {
+static const Payload* cmd_on(const char* /*args_json*/) {
 
-  enqueueEvent("LASER_ON", "\"action\":\"allow_emission\"");
+  Payload ev;
+  ev.add("action", "allow_emission");
+  enqueueEvent("LASER_ON", ev);
+
   digitalWrite(LD_ON_PIN, HIGH);
 
   // Side-effect only, no payload
@@ -239,9 +229,12 @@ static const String* cmd_on(const char* /*args_json*/) {
 // ------------------------------------------------------------
 // OFF — inhibit emission
 // ------------------------------------------------------------
-static const String* cmd_off(const char* /*args_json*/) {
+static const Payload* cmd_off(const char* /*args_json*/) {
 
-  enqueueEvent("LASER_OFF", "\"action\":\"inhibit_emission\"");
+  Payload ev;
+  ev.add("action", "inhibit_emission");
+  enqueueEvent("LASER_OFF", ev);
+
   digitalWrite(LD_ON_PIN, LOW);
 
   // Side-effect only, no payload

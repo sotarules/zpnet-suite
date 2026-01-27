@@ -3,6 +3,7 @@
 
 #include "process.h"
 #include "events.h"
+#include "payload.h"
 #include "cpu_usage.h"
 
 #include <Arduino.h>
@@ -231,34 +232,40 @@ uint32_t timepop_get_zero_hits(void) {
 // ------------------------------------------------------------
 // REPORT — active TimePop timer snapshot
 // ------------------------------------------------------------
-static const String* cmd_report(const char* /*args_json*/) {
+static const Payload* cmd_report(const char* /*args_json*/) {
 
-  // Persistent payload storage
-  static String payload;
-  payload = "{ \"timers\": [";
+  static Payload out;
+  out.clear();
+
+  // Build timers array manually (Payload is object-only)
+  String timers;
+  timers += "[";
 
   bool first = true;
   for (uint32_t i = 0; i < TIMEPOP_MAX_SLOTS; i++) {
 
     if (!slots[i].active) continue;
 
-    if (!first) payload += ",";
+    if (!first) timers += ",";
     first = false;
 
-    payload += "{";
-    payload += "\"slot\":"; payload += i;
-    payload += ",\"id\":"; payload += slots[i].id;
-    payload += ",\"class\":"; payload += slots[i].klass;
-    payload += ",\"name\":\"";
-    payload += (slots[i].name ? slots[i].name : "unnamed");
-    payload += "\"";
-    payload += ",\"remaining_ticks\":"; payload += slots[i].remaining_ticks;
-    payload += "}";
+    timers += "{";
+    timers += "\"slot\":"; timers += i;
+    timers += ",\"id\":"; timers += slots[i].id;
+    timers += ",\"class\":"; timers += slots[i].klass;
+    timers += ",\"name\":\"";
+    timers += (slots[i].name ? slots[i].name : "unnamed");
+    timers += "\"";
+    timers += ",\"remaining_ticks\":"; timers += slots[i].remaining_ticks;
+    timers += "}";
   }
 
-  payload += "] }";
+  timers += "]";
 
-  return &payload;
+  // Controlled escape hatch: inject trusted JSON array
+  out.add("timers", timers.c_str());
+
+  return &out;
 }
 
 // ================================================================
