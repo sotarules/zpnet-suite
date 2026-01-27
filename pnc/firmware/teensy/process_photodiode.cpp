@@ -11,13 +11,13 @@
 // ISR-driven edge visibility
 // ================================================================
 
-static volatile bool     pd_edge_seen = false;
-static volatile bool     pd_episode_latched = false;
-static volatile uint32_t pd_episode_count = 0;
+static volatile bool     pd_edge_seen        = false;
+static volatile bool     pd_episode_latched  = false;
+static volatile uint32_t pd_episode_count    = 0;
 
-static volatile uint32_t pd_isr_count = 0;
-static int last_edge_level = -1;
-static bool edge_level_changed = false;
+static volatile uint32_t pd_isr_count        = 0;
+static int  last_edge_level                  = -1;
+static bool edge_level_changed               = false;
 
 // ================================================================
 // ISR
@@ -34,10 +34,10 @@ static void photodiodeISR() {
 
 struct photodiode_state_t {
   uint32_t edge_pulse_count = 0;
-  int      edge_level = 0;
+  int      edge_level       = 0;
 
   uint16_t analog_raw = 0;
-  float    analog_v = NAN;
+  float    analog_v   = NAN;
 };
 
 static photodiode_state_t PD;
@@ -47,6 +47,7 @@ static photodiode_state_t PD;
 // ================================================================
 
 static void photodiode_snapshot(void) {
+
   // --- Sample analog channel ---
   analogReadResolution(12);
   PD.analog_raw = analogRead(PHOTODIODE_ANALOG_PIN);
@@ -75,7 +76,6 @@ static void photodiode_snapshot(void) {
     if (dark_since_ms == 0) {
       dark_since_ms = now;
     }
-
     if (now - dark_since_ms >= PHOTODIODE_OFF_STABLE_MS) {
       pd_episode_latched = false;
     }
@@ -92,7 +92,6 @@ static void photodiode_snapshot(void) {
   pd_edge_seen = false;
 
   PD.edge_pulse_count = pd_episode_count;
-  PD.edge_level = digitalRead(PHOTODIODE_EDGE_PIN);
 
   int level = digitalRead(PHOTODIODE_EDGE_PIN);
   if (last_edge_level != -1 && level != last_edge_level) {
@@ -106,27 +105,10 @@ static void photodiode_snapshot(void) {
 }
 
 // ================================================================
-// Initialization Event
+// Explicit initialization (authoritative, idempotent)
 // ================================================================
 
-static void photodiode_emit_init_event(void) {
-  Payload ev;
-  ev.add("edge_pin", PHOTODIODE_EDGE_PIN);
-  ev.add("analog_pin", PHOTODIODE_ANALOG_PIN);
-
-  enqueueEvent("PHOTODIODE_INITIALIZATION", ev);
-}
-
-// ================================================================
-// Lifecycle
-// ================================================================
-
-static bool photodiode_start(void) {
-  {
-    Payload ev;
-    ev.add("stage", "process_start");
-    enqueueEvent("PHOTODIODE_INIT_ENTER", ev);
-  }
+void process_photodiode_init(void) {
 
   pinMode(PHOTODIODE_EDGE_PIN, INPUT);
   pinMode(PHOTODIODE_ANALOG_PIN, INPUT);
@@ -138,26 +120,28 @@ static bool photodiode_start(void) {
   );
 
   noInterrupts();
-  pd_edge_seen = false;
+  pd_edge_seen       = false;
   pd_episode_latched = false;
-  pd_episode_count = 0;
+  pd_episode_count   = 0;
   interrupts();
 
-  photodiode_emit_init_event();
-  return true;
-}
-
-static void photodiode_stop(void) {
-  detachInterrupt(digitalPinToInterrupt(PHOTODIODE_EDGE_PIN));
-
   Payload ev;
-  ev.add("action", "interrupt_detached");
-  enqueueEvent("PHOTODIODE_STOP", ev);
+  ev.add("edge_pin", PHOTODIODE_EDGE_PIN);
+  ev.add("analog_pin", PHOTODIODE_ANALOG_PIN);
+  enqueueEvent("PHOTODIODE_INITIALIZATION", ev);
 }
 
 // ================================================================
 // Commands
 // ================================================================
+
+// ------------------------------------------------------------
+// INIT — explicit hardware initialization wrapper
+// ------------------------------------------------------------
+static const Payload* cmd_init(const char* /*args_json*/) {
+  process_photodiode_init();
+  return nullptr;
+}
 
 // ------------------------------------------------------------
 // REPORT — return current photodiode state snapshot
@@ -219,7 +203,6 @@ static const Payload* cmd_clear(const char* /*args_json*/) {
   ev.add("action", "counter_reset");
   enqueueEvent("PHOTODIODE_CLEAR", ev);
 
-  // Side-effect only, no payload
   return nullptr;
 }
 
@@ -228,23 +211,22 @@ static const Payload* cmd_clear(const char* /*args_json*/) {
 // ================================================================
 
 static const process_command_entry_t PHOTODIODE_COMMANDS[] = {
+  { "INIT",   cmd_init   },
   { "REPORT", cmd_report },
   { "COUNT",  cmd_count  },
   { "CLEAR",  cmd_clear  },
 };
 
 static const process_vtable_t PHOTODIODE_PROCESS = {
-  .name          = "PHOTODIODE",
-  .start         = photodiode_start,
-  .stop          = photodiode_stop,
-  .query         = nullptr,              // deprecated
-  .commands      = PHOTODIODE_COMMANDS,
-  .command_count = 3,
+  .name = "PHOTODIODE",
+  .query = nullptr,
+  .commands = PHOTODIODE_COMMANDS,
+  .command_count = 4,
 };
 
 // ------------------------------------------------------------
 // Registration
 // ------------------------------------------------------------
 void process_photodiode_register(void) {
-  process_register(PROCESS_TYPE_PHOTODIODE, &PHOTODIODE_PROCESS);
+  process_register("PHOTODIODE", &PHOTODIODE_PROCESS);
 }

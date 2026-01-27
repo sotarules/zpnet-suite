@@ -21,7 +21,7 @@
 // Fixed cadence per class (in ticks)
 static uint32_t CLASS_PERIOD_TICKS[TIMEPOP_CLASS_COUNT];
 
-static void init_timepop_class_periods() {
+static void init_timepop_class_periods(void) {
   CLASS_PERIOD_TICKS[TIMEPOP_CLASS_RX_POLL]      = 5;
   CLASS_PERIOD_TICKS[TIMEPOP_CLASS_EVENTBUS]     = 1;
   CLASS_PERIOD_TICKS[TIMEPOP_CLASS_CPU_SAMPLE]   = 1000;
@@ -98,7 +98,7 @@ void pit0_isr(void) {
 }
 
 // ================================================================
-// Lifecycle
+// Explicit initialization (physical, required)
 // ================================================================
 
 void timepop_init(void) {
@@ -278,13 +278,11 @@ static const process_command_entry_t TIMEPOP_COMMANDS[] = {
 
 static const process_vtable_t TIMEPOP_PROCESS = {
   .name = "TIMEPOP",
-  .start = nullptr,
-  .stop = nullptr,
   .query = nullptr,
   .commands = TIMEPOP_COMMANDS,
   .command_count = 1,
 };
 
 void process_timepop_register(void) {
-  process_register(PROCESS_TYPE_TIMEPOP, &TIMEPOP_PROCESS);
+  process_register("TIMEPOP", &TIMEPOP_PROCESS);
 }

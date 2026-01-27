@@ -11,7 +11,8 @@
 // Semantics:
 //   • enqueueEvent() records immutable facts (type + Payload)
 //   • EVENTS.GET returns queued events and clears the queue
-//   • No streaming, framing, timers, or side effects
+//   • Event draining requires explicit scheduling via TimePop
+//   • No streaming, framing, or hidden lifecycle
 //
 // ============================================================================
 
@@ -21,6 +22,8 @@
 #include "payload.h"
 #include "transport.h"
 #include "util.h"
+#include "timepop.h"
+#include "payload.h"
 
 #include <Arduino.h>
 
@@ -50,6 +53,32 @@ static EventItem evtq[EVT_MAX];
 static size_t evt_head  = 0;
 static size_t evt_tail  = 0;
 static size_t evt_count = 0;
+
+// --------------------------------------------------------------
+// Explicit initialization
+// --------------------------------------------------------------
+//
+// EVENTS depends on TimePop to drain expired events.
+// This function must be called exactly once after timepop_init().
+//
+
+void process_events_init(void) {
+
+  // Arm the EVENTBUS class so queued events can be drained
+  bool ok = timepop_arm(
+    TIMEPOP_CLASS_EVENTBUS,
+    true,           // recurring
+    nullptr,        // event bus tick handled internally
+    nullptr,
+    "eventbus"
+  );
+
+  if (!ok) {
+    debug_log("events", "FAILED to arm EVENTBUS");
+  } else {
+    debug_log("events", "EVENTBUS armed");
+  }
+}
 
 // --------------------------------------------------------------
 // Public API — enqueue durable event
@@ -124,9 +153,8 @@ static const Payload* cmd_get(const char*) {
   return &out;
 }
 
-
 // --------------------------------------------------------------
-// Process registration
+// Registration
 // --------------------------------------------------------------
 
 static const process_command_entry_t EVENTS_COMMANDS[] = {
@@ -134,14 +162,12 @@ static const process_command_entry_t EVENTS_COMMANDS[] = {
 };
 
 static const process_vtable_t EVENTS_PROCESS = {
-  .name          = "EVENTS",
-  .start         = nullptr,
-  .stop          = nullptr,
-  .query         = nullptr,
-  .commands      = EVENTS_COMMANDS,
+  .name = "EVENTS",
+  .query = nullptr,
+  .commands = EVENTS_COMMANDS,
   .command_count = 1,
 };
 
 void process_events_register(void) {
-  process_register(PROCESS_TYPE_EVENTS, &EVENTS_PROCESS);
+  process_register("EVENTS", &EVENTS_PROCESS);
 }

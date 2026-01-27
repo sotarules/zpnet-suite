@@ -2,12 +2,14 @@
 // FILE: process_system.cpp
 // =============================================================
 //
-// SYSTEM Process — Teensy-side system status clearinghouse
+// SYSTEM Process — Teensy-side system truth surface
 //
-// Phase 1 implementation:
-//   • Implements SYSTEM.REPORT
-//   • Payload is identical to legacy TEENSY.STATUS
-//   • No side effects
+// SYSTEM is not a lifecycle-managed process.
+// It cannot start or stop from within itself.
+//
+// It exposes authoritative, read-only system facts and
+// provides explicit terminal transitions (shutdown, bootloader)
+// that represent irreversible boundary crossings.
 //
 // =============================================================
 
@@ -23,46 +25,26 @@
 #include "debug.h"
 
 // --------------------------------------------------------------
-// Forward declarations (internal terminal paths)
+// Forward declarations (terminal paths)
 // --------------------------------------------------------------
 void system_enter_quiescence(void);
 
-// Bootloader entry symbol (already implemented by you)
+// Bootloader entry symbol (ROM-provided, never returns)
 extern "C" void enter_bootloader_cleanly(void);
 
 // --------------------------------------------------------------
-// Internal system state
+// Internal terminal state
 // --------------------------------------------------------------
-static bool system_shutdown = false;
+static bool system_shutdown   = false;
 static bool system_bootloader = false;
 
-// ------------------------------------------------------------
-// Lifecycle
-// ------------------------------------------------------------
-
-static bool system_start(void) {
-  system_shutdown   = false;
-  system_bootloader = false;
-
-  Payload ev;
-  ev.add("stage", "process_start");
-  enqueueEvent("SYSTEM_INIT_ENTER", ev);
-
-  return true;
-}
-
-static void system_stop(void) {
-  Payload ev;
-  ev.add("stage", "process_stop");
-  enqueueEvent("SYSTEM_STOP", ev);
-}
-
 // ================================================================
-// Internal helpers
+// Terminal helpers
 // ================================================================
 
 static void enter_bootloader_cb(timepop_ctx_t*, void*) {
-  // Idempotent + higher priority than shutdown
+
+  // Idempotent, higher priority than shutdown
   if (system_bootloader) {
     system_enter_quiescence();
   }
@@ -82,23 +64,20 @@ static void enter_bootloader_cb(timepop_ctx_t*, void*) {
   // Visible debug pattern
   debug_blink("911");
 
-  // Terminal transition — never returns
+  // Irreversible transition
   enter_bootloader_cleanly();
 
-  // Absolute fallback
+  // Absolute fallback (should never return)
   system_enter_quiescence();
 }
 
-bool system_is_shutdown() {
+bool system_is_shutdown(void) {
   return system_shutdown;
 }
 
-// --------------------------------------------------------------
-// Terminal actions
-// --------------------------------------------------------------
+void system_request_shutdown(void) {
 
-void system_request_shutdown() {
-  // Idempotent
+  // Idempotent terminal action
   if (system_shutdown || system_bootloader) {
     system_enter_quiescence();
   }
@@ -117,58 +96,46 @@ void system_request_shutdown() {
 // --------------------------------------------------------------
 // Terminal quiescence (no return)
 // --------------------------------------------------------------
-
-void system_enter_quiescence() {
+void system_enter_quiescence(void) {
   while (true) {
     delay(1000);
   }
 }
 
-// ------------------------------------------------------------
+// ================================================================
 // Commands
-// ------------------------------------------------------------
+// ================================================================
 
 // ------------------------------------------------------------
 // REPORT — authoritative system snapshot
 //
-// Phase 1 semantics:
-//   • EXACTLY the same payload as legacy TEENSY.STATUS
+// Semantics:
+//   • Stateless
+//   • Read-only
 //   • No aggregation
-//   • No interpretation
+//   • No inference
 // ------------------------------------------------------------
 static const Payload* cmd_report(const char* /*args_json*/) {
 
   static Payload p;
   p.clear();
 
-  // ------------------------------------------------------------
   // Firmware identity
-  // ------------------------------------------------------------
   p.add("fw_version", FW_VERSION);
 
-  // ------------------------------------------------------------
   // CPU temperature (best-effort)
-  // ------------------------------------------------------------
   p.add("cpu_temp_c", cpuTempC());
 
-  // ------------------------------------------------------------
   // Internal reference voltage (best-effort)
-  // ------------------------------------------------------------
   p.add("vref_v", readVrefVolts());
 
-  // ------------------------------------------------------------
   // Heap availability
-  // ------------------------------------------------------------
   p.add("free_heap_bytes", freeHeapBytes());
 
-  // ------------------------------------------------------------
   // CPU usage (authoritative, idle-cycle accounting)
-  // ------------------------------------------------------------
   p.add("cpu_usage_pct", cpu_usage_get_percent());
 
-  // ------------------------------------------------------------
-  // CPU usage raw counters (audit + diagnostics)
-  // ------------------------------------------------------------
+  // CPU usage diagnostics
   p.add("cpu_busy_cycles", cpu_usage_get_busy_cycles());
   p.add("cpu_total_cycles", cpu_usage_get_total_cycles());
   p.add("cpu_sample_window_ms", cpu_usage_get_sample_window_ms());
@@ -182,11 +149,10 @@ static const Payload* cmd_report(const char* /*args_json*/) {
 // ------------------------------------------------------------
 static const Payload* cmd_enter_bootloader(const char* /*args_json*/) {
 
-  // Schedule bootloader entry asynchronously so the command path
-  // can return cleanly before USB disappears.
+  // Schedule transition so command path can return cleanly
   timepop_arm(
     TIMEPOP_CLASS_FLASH,
-    false,                       // one-shot
+    false,                 // one-shot
     enter_bootloader_cb,
     nullptr,
     "bootloader-flash"
@@ -198,12 +164,11 @@ static const Payload* cmd_enter_bootloader(const char* /*args_json*/) {
     enqueueEvent("SYSTEM_ENTER_BOOTLOADER", ev);
   }
 
-  // Side-effect only
   return nullptr;
 }
 
 // ------------------------------------------------------------
-// SHUTDOWN — cooperative system shutdown
+// SHUTDOWN — terminal, irreversible
 // ------------------------------------------------------------
 static const Payload* cmd_shutdown(const char* /*args_json*/) {
 
@@ -214,58 +179,21 @@ static const Payload* cmd_shutdown(const char* /*args_json*/) {
   }
 
   system_request_shutdown();
-
-  // Side-effect only
   return nullptr;
 }
 
 // ------------------------------------------------------------
-// PROCESS LIST — registry introspection
+// PROCESS_LIST — registry introspection (diagnostic only)
 // ------------------------------------------------------------
 static const Payload* cmd_process_list(const char* /*args_json*/) {
 
-  // process_list_json already returns a serialized object;
-  // wrap it as a payload explicitly.
   static Payload p;
   p.clear();
 
-  // Controlled escape hatch: inject trusted JSON object
+  // Controlled escape hatch: trusted JSON object
   p.add("processes", process_list_json().c_str());
 
   return &p;
-}
-
-// ------------------------------------------------------------
-// PROCESS START
-// ------------------------------------------------------------
-static const Payload* cmd_process_start(const char* args_json) {
-
-  process_type_t type;
-  if (!process_type_from_name(args_json, type)) {
-    // Programmer error — no payload
-    return nullptr;
-  }
-
-  process_start(type);
-
-  // Side-effect only
-  return nullptr;
-}
-
-// ------------------------------------------------------------
-// PROCESS STOP
-// ------------------------------------------------------------
-static const Payload* cmd_process_stop(const char* args_json) {
-
-  process_type_t type;
-  if (!process_type_from_name(args_json, type)) {
-    return nullptr;
-  }
-
-  process_stop(type);
-
-  // Side-effect only
-  return nullptr;
 }
 
 // ================================================================
@@ -273,23 +201,19 @@ static const Payload* cmd_process_stop(const char* args_json) {
 // ================================================================
 
 static const process_command_entry_t SYSTEM_COMMANDS[] = {
-  { "REPORT",            cmd_report            },
-  { "ENTER_BOOTLOADER",  cmd_enter_bootloader  },
-  { "SHUTDOWN",          cmd_shutdown          },
-  { "PROCESS_LIST",      cmd_process_list      },
-  { "PROCESS_START",     cmd_process_start     },
-  { "PROCESS_STOP",      cmd_process_stop      },
+  { "REPORT",           cmd_report          },
+  { "ENTER_BOOTLOADER", cmd_enter_bootloader},
+  { "SHUTDOWN",         cmd_shutdown        },
+  { "PROCESS_LIST",     cmd_process_list    },
 };
 
 static const process_vtable_t SYSTEM_PROCESS = {
   .name          = "SYSTEM",
-  .start         = system_start,
-  .stop          = system_stop,
-  .query         = nullptr,            // deprecated
+  .query         = nullptr,
   .commands      = SYSTEM_COMMANDS,
   .command_count = sizeof(SYSTEM_COMMANDS) / sizeof(SYSTEM_COMMANDS[0]),
 };
 
 void process_system_register(void) {
-  process_register(PROCESS_TYPE_SYSTEM, &SYSTEM_PROCESS);
+  process_register("SYSTEM", &SYSTEM_PROCESS);
 }

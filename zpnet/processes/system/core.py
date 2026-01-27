@@ -17,7 +17,6 @@ Process model:
 from __future__ import annotations
 
 import datetime
-import json
 import logging
 import os
 import platform
@@ -38,11 +37,11 @@ from smbus2 import SMBus
 
 from zpnet.processes.processes import send_command, serve_commands
 from zpnet.shared.constants import ZPNET_REMOTE_HOST, ZPNET_TEST_PATH, HTTP_TIMEOUT, EXPECTED_TEST_STRING
+from zpnet.shared.db import open_db
 from zpnet.shared.events import create_event
-from zpnet.shared.util import normalize_payload, normalize_ts
 from zpnet.shared.http import gzip_text
 from zpnet.shared.logger import setup_logging
-from zpnet.shared.db import open_db
+from zpnet.shared.util import normalize_payload, normalize_ts
 
 # ------------------------------------------------------------------
 # Configuration

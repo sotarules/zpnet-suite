@@ -79,20 +79,12 @@ static void process_complete_message(const uint8_t* msg, size_t len) {
   json[payload_len] = '\0';
 
   // ---------------- minimal semantic extraction ----------------
-  // Expected envelope:
-  // {
-  //   "machine":"TEENSY",
-  //   "subsystem":"CLOCKS",
-  //   "command":"REPORT",
-  //   "args":{...},
-  //   "req_id":N
-  // }
 
   const char* subsystem = strstr(json, "\"subsystem\"");
   const char* command   = strstr(json, "\"command\"");
 
   if (!subsystem || !command) {
-    // Programmer error — do not recover
+    // malformed message — do not recover
     return;
   }
 
@@ -116,7 +108,7 @@ static void process_complete_message(const uint8_t* msg, size_t len) {
   memcpy(command_name, command, cmd_len);
   command_name[cmd_len] = '\0';
 
-  // Optional args (raw JSON object pointer)
+  // Optional args
   const char* args_json = nullptr;
   const char* a = strstr(json, "\"args\"");
   if (a) {
@@ -130,7 +122,7 @@ static void process_complete_message(const uint8_t* msg, size_t len) {
     }
   }
 
-  // Optional req_id (RPC correlation)
+  // Optional req_id
   int req_id = -1;
   const char* r = strstr(json, "\"req_id\"");
   if (r) {
@@ -142,34 +134,29 @@ static void process_complete_message(const uint8_t* msg, size_t len) {
 
   // ---------------- process dispatch ----------------
 
-  process_type_t type;
-  if (!process_type_from_name(subsystem_name, type)) {
-    // Programmer error — do not recover
-    return;
-  }
-
   String inner_response;
-  process_command(type, command_name, args_json, inner_response);
+  process_command(
+    subsystem_name,
+    command_name,
+    args_json,
+    inner_response
+  );
 
   // ---------------- response envelope ----------------
 
   String response;
-
   if (req_id >= 0) {
     response += "{";
     response += "\"req_id\":";
     response += req_id;
     response += ",";
-    response += inner_response.substring(1);  // strip leading '{'
+    response += inner_response.substring(1);
   } else {
     response = inner_response;
   }
 
-  // ---------------- response egress ----------------
-
   transport_send_frame(response.c_str(), response.length());
 }
-
 
 // -------------------------------------------------------------
 // RX tick (TimePop-owned)

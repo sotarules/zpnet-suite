@@ -1,4 +1,5 @@
 #include "cpu_usage.h"
+#include "timepop.h"
 #include <Arduino.h>
 
 // ------------------------------------------------------------
@@ -37,6 +38,27 @@ void cpu_usage_init(void) {
 
     last_sample_time_ms   = millis();
     last_sample_window_ms = 0;
+}
+
+// ------------------------------------------------------------
+// CPU usage sampler (TimePop recurring task)
+// ------------------------------------------------------------
+//
+// This callback is invoked by TimePop at the cadence defined
+// for TIMEPOP_CLASS_CPU_SAMPLE. No self-rescheduling.
+//
+static void cpu_usage_tick(timepop_ctx_t* timer, void* /*user*/) {
+  cpu_usage_sample();
+}
+
+void cpu_usage_init_timer(void) {
+    timepop_arm(
+      TIMEPOP_CLASS_CPU_SAMPLE,
+      true,                    // recurring
+      cpu_usage_tick,
+      nullptr,
+      "cpu-usage"
+    );
 }
 
 // ------------------------------------------------------------

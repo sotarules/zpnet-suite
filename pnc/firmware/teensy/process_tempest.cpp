@@ -10,12 +10,6 @@
 #include "process.h"
 #include "smartpop.h"
 
-// ------------------------------------------------------------
-// Forward declarations (lifecycle)
-// ------------------------------------------------------------
-static bool tempest_start(void);
-static void tempest_stop(void);
-
 static void tempest_confirm_start_cb(void* context);
 static void tempest_confirm_end_cb(void* context);
 
@@ -218,42 +212,6 @@ static const Payload* cmd_tau(const char* args) {
 
   resp.add("status", ok ? "ok" : "fail");
   return &resp;
-}
-
-// ================================================================
-// Registration
-// ================================================================
-
-static const process_command_entry_t TEMPEST_COMMANDS[] = {
-  { "CONFIRM",  cmd_confirm  },
-  { "BASELINE", cmd_baseline },
-  { "TAU",      cmd_tau      },
-};
-
-static const process_vtable_t TEMPEST_PROCESS = {
-  .name = "TEMPEST",
-  .start = tempest_start,
-  .stop  = tempest_stop,
-  .query = nullptr,
-  .commands = TEMPEST_COMMANDS,
-  .command_count = 3,
-};
-
-void process_tempest_register(void) {
-  process_register(PROCESS_TYPE_TEMPEST, &TEMPEST_PROCESS);
-}
-
-static bool tempest_start(void) {
-  Payload ev;
-  ev.add("stage", "process_start");
-  enqueueEvent("TEMPEST_INIT_ENTER", ev);
-  return true;
-}
-
-static void tempest_stop(void) {
-  Payload ev;
-  ev.add("stage", "process_stop");
-  enqueueEvent("TEMPEST_STOP", ev);
 }
 
 // =============================================================
@@ -671,3 +629,23 @@ bool tempest_tau_profile(uint32_t total_seconds) {
   return true;
 }
 
+// ================================================================
+// Registration
+// ================================================================
+
+static const process_command_entry_t TEMPEST_COMMANDS[] = {
+  { "CONFIRM",  cmd_confirm  },
+  { "BASELINE", cmd_baseline },
+  { "TAU",      cmd_tau      },
+};
+
+static const process_vtable_t TEMPEST_PROCESS = {
+  .name = "TEMPEST",
+  .query = nullptr,
+  .commands = TEMPEST_COMMANDS,
+  .command_count = 3,
+};
+
+void process_tempest_register(void) {
+  process_register("TEMPEST", &TEMPEST_PROCESS);
+}

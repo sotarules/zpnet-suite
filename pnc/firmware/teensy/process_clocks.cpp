@@ -8,23 +8,6 @@
 #include <Arduino.h>
 
 // ================================================================
-// Lifecycle
-// ================================================================
-
-static bool clocks_start(void) {
-  Payload ev;
-  ev.add("stage", "process_start");
-  enqueueEvent("CLOCKS_INIT_ENTER", ev);
-  return true;
-}
-
-static void clocks_stop(void) {
-  Payload ev;
-  ev.add("stage", "process_stop");
-  enqueueEvent("CLOCKS_STOP", ev);
-}
-
-// ================================================================
 // Commands
 // ================================================================
 
@@ -67,7 +50,7 @@ static const Payload* cmd_report(const char* /*args_json*/) {
 // ------------------------------------------------------------
 // CLEAR — zero all synthetic clocks
 // ------------------------------------------------------------
-static const Payload* cmd_clear(const char*) {
+static const Payload* cmd_clear(const char* /*args_json*/) {
 
   clock_zero_all();
 
@@ -90,13 +73,11 @@ static const process_command_entry_t CLOCKS_COMMANDS[] = {
 
 static const process_vtable_t CLOCKS_PROCESS = {
   .name = "CLOCKS",
-  .start = clocks_start,
-  .stop  = clocks_stop,
   .query = nullptr,
   .commands = CLOCKS_COMMANDS,
   .command_count = 2,
 };
 
 void process_clocks_register(void) {
-  process_register(PROCESS_TYPE_CLOCKS, &CLOCKS_PROCESS);
+  process_register("CLOCKS", &CLOCKS_PROCESS);
 }

@@ -257,7 +257,16 @@ def hid_reader() -> None:
 # RPC handler
 # ---------------------------------------------------------------------
 
+from queue import Queue, Empty
+
+MAX_TEENSY_RETRIES = 3
+REPLY_TIMEOUT_S = 3.0
+
+
 def handle_client(conn: socket.socket) -> None:
+    req_id = None
+    q = None
+
     try:
         buf = conn.recv(65536)
         if not buf:
@@ -272,13 +281,44 @@ def handle_client(conn: socket.socket) -> None:
         with state_lock:
             pending_replies[req_id] = q
 
-        send_frame(req)
+        last_exc = None
 
-        reply = q.get(timeout=10.0)
-        conn.sendall(json.dumps(reply, separators=(",", ":")).encode("utf-8"))
+        for attempt in range(1, MAX_TEENSY_RETRIES + 1):
+            send_frame(req)
+
+            try:
+                reply = q.get(timeout=REPLY_TIMEOUT_S)
+                conn.sendall(
+                    json.dumps(reply, separators=(",", ":")).encode("utf-8")
+                )
+                return
+
+            except Empty as e:
+                last_exc = e
+                # retry unless this was the last attempt
+
+        # ---------------------------------------------------------
+        # All retries exhausted — explicit failure
+        # ---------------------------------------------------------
+        failure = {
+            "req_id": req_id,
+            "success": False,
+            "message": (
+                f"TEENSY did not respond after "
+                f"{MAX_TEENSY_RETRIES} attempts"
+            ),
+        }
+
+        conn.sendall(
+            json.dumps(failure, separators=(",", ":")).encode("utf-8")
+        )
 
     finally:
+        if req_id is not None:
+            with state_lock:
+                pending_replies.pop(req_id, None)
         conn.close()
+
 
 # ---------------------------------------------------------------------
 # RPC server

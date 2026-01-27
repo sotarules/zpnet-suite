@@ -18,7 +18,6 @@ from typing import Any
 
 from zpnet.shared.db import open_db
 from zpnet.shared.logger import setup_logging
-from zpnet.shared.teensy import photodiode_status
 
 # ---------------------------------------------------------------------
 # Constants

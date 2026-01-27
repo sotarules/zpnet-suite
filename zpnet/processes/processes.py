@@ -171,7 +171,6 @@ def serve_commands(
             conn, _ = srv.accept()
             with conn:
                 raw = conn.recv(65536).decode("utf-8")
-                logging.info("[serve_commands] raw request: %s", raw)
 
                 req = json.loads(raw)
 

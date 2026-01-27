@@ -41,6 +41,9 @@ static constexpr uint8_t ID1_EN_BIT = 0x08;
 static constexpr uint8_t ID1_CURRENT_MSB = 0x14;
 static constexpr uint8_t ID1_CURRENT_LSB = 0x00;
 
+// Emission classification threshold (authoritative)
+static constexpr float LASER_EMIT_THRESHOLD_V = 0.75f;
+
 // ================================================================
 // Helpers
 // ================================================================
@@ -64,89 +67,16 @@ static void laser_inhibit(void) {
   digitalWrite(LD_ON_PIN, LOW);
 }
 
-// ================================================================
-// Laser State (authoritative snapshot)
-// ================================================================
-
-struct laser_state_t {
-  uint16_t id1_raw = 0;
-  float    id1_current_ma = NAN;
-
-  uint8_t ctl0 = 0;
-  uint8_t ctl1 = 0;
-  uint8_t ctl2 = 0;
-
-  uint8_t status1 = 0;
-  uint8_t status2 = 0;
-  uint8_t status3 = 0;
-  uint8_t status4 = 0;
-  uint8_t intr    = 0;
-
-  uint16_t pd_adc_raw = 0;
-  float    pd_voltage = NAN;
-};
-
-static laser_state_t LASER;
-
-// ================================================================
-// Initialization / Snapshot
-// ================================================================
-
-static void laser_snapshot(void) {
-  LASER.ctl0 = i2c_read(REG_CTL0);
-  LASER.ctl1 = i2c_read(REG_CTL1);
-  LASER.ctl2 = i2c_read(REG_CTL2);
-
-  uint8_t msb = i2c_read(REG_ID1_MSB);
-  uint8_t lsb = i2c_read(REG_ID1_LSB);
-
-  LASER.id1_raw = (msb << 2) | (lsb & 0x03);
-  LASER.id1_current_ma = LASER.id1_raw * 0.25f;
-
-  LASER.status1 = i2c_read(REG_STATUS1);
-  LASER.status2 = i2c_read(REG_STATUS2);
-  LASER.status3 = i2c_read(REG_STATUS3);
-  LASER.status4 = i2c_read(REG_STATUS4);
-  LASER.intr    = i2c_read(REG_INT);
-
-  LASER.pd_adc_raw = analogRead(LASER_MONITOR_PIN);
-  LASER.pd_voltage = (LASER.pd_adc_raw / 4095.0f) * 3.3f;
-}
-
-static void laser_emit_init_event(void) {
-  Payload p;
-
-  p.add("CTL0", LASER.ctl0);
-  p.add("CTL1", LASER.ctl1);
-  p.add("CTL2", LASER.ctl2);
-
-  p.add("id1_raw", LASER.id1_raw);
-  p.add("id1_current_ma", LASER.id1_current_ma);
-
-  p.add("STATUS1", LASER.status1);
-  p.add("STATUS2", LASER.status2);
-  p.add("STATUS3", LASER.status3);
-  p.add("STATUS4", LASER.status4);
-  p.add("INT", LASER.intr);
-
-  p.add("pd_adc_raw", LASER.pd_adc_raw);
-  p.add("pd_voltage", LASER.pd_voltage);
-
-  p.add("laser_emitting", LASER.pd_voltage > 0.75f);
-
-  enqueueEvent("LASER_INITIALIZATION", p);
+static float read_pd_voltage(void) {
+  uint16_t raw = analogRead(LASER_MONITOR_PIN);
+  return (raw / 4095.0f) * 3.3f;
 }
 
 // ================================================================
-// Lifecycle
+// Public initialization (authoritative, idempotent)
 // ================================================================
 
-static bool laser_start(void) {
-  {
-    Payload p;
-    p.add("stage", "process_start");
-    enqueueEvent("LASER_INIT_ENTER", p);
-  }
+void process_laser_init(void) {
 
   pinMode(LD_ON_PIN, OUTPUT);
   laser_inhibit();
@@ -167,46 +97,57 @@ static bool laser_start(void) {
   uint8_t lsb = i2c_read(REG_ID1_LSB);
   i2c_write(REG_ID1_LSB, (lsb & ~0x03) | ID1_CURRENT_LSB);
 
-  laser_snapshot();
-  laser_emit_init_event();
+  // ------------------------------------------------------------
+  // Forensic initialization snapshot
+  // ------------------------------------------------------------
+  uint8_t msb = i2c_read(REG_ID1_MSB);
+  uint8_t lsb2 = i2c_read(REG_ID1_LSB);
 
-  return true;
-}
+  uint16_t id1_raw = (msb << 2) | (lsb2 & 0x03);
+  float id1_current_ma = id1_raw * 0.25f;
 
-static void laser_stop(void) {
-  laser_inhibit();
+  float pd_voltage = read_pd_voltage();
 
   Payload p;
-  p.add("action", "inhibit");
-  enqueueEvent("LASER_STOP", p);
+  p.add("id1_raw", id1_raw);
+  p.add("id1_current_ma", id1_current_ma);
+  p.add("pd_voltage", pd_voltage);
+  p.add("laser_emitting", pd_voltage > LASER_EMIT_THRESHOLD_V);
+
+  enqueueEvent("LASER_INITIALIZATION", p);
 }
 
 // ================================================================
 // Commands
 // ================================================================
-//
-// New command contract (assumed):
-//   • Handlers return const Payload* (nullptr means "no payload")
-//   • Framework serializes Payload and wraps response envelope
-//
 
 // ------------------------------------------------------------
-// REPORT — return current laser state snapshot
+// INIT — explicit initialization wrapper
+// ------------------------------------------------------------
+static const Payload* cmd_init(const char* /*args_json*/) {
+  process_laser_init();
+  return nullptr;
+}
+
+// ------------------------------------------------------------
+// REPORT — authoritative laser snapshot (stateless)
 // ------------------------------------------------------------
 static const Payload* cmd_report(const char* /*args_json*/) {
 
-  // Refresh authoritative snapshot
-  laser_snapshot();
-
-  // Persistent payload storage (safe to return pointer)
   static Payload p;
   p.clear();
 
-  // Prefer numeric JSON values by default
-  // Use add_fmt only when a human-facing precision policy is desired.
-  p.add("id1_current_ma", LASER.id1_current_ma);
-  p.add("pd_voltage", LASER.pd_voltage);
-  p.add("laser_emitting", LASER.pd_voltage > 0.5f);
+  uint8_t msb = i2c_read(REG_ID1_MSB);
+  uint8_t lsb = i2c_read(REG_ID1_LSB);
+
+  uint16_t id1_raw = (msb << 2) | (lsb & 0x03);
+  float id1_current_ma = id1_raw * 0.25f;
+
+  float pd_voltage = read_pd_voltage();
+
+  p.add("id1_current_ma", id1_current_ma);
+  p.add("pd_voltage", pd_voltage);
+  p.add("laser_emitting", pd_voltage > LASER_EMIT_THRESHOLD_V);
 
   return &p;
 }
@@ -221,8 +162,6 @@ static const Payload* cmd_on(const char* /*args_json*/) {
   enqueueEvent("LASER_ON", ev);
 
   digitalWrite(LD_ON_PIN, HIGH);
-
-  // Side-effect only, no payload
   return nullptr;
 }
 
@@ -236,8 +175,6 @@ static const Payload* cmd_off(const char* /*args_json*/) {
   enqueueEvent("LASER_OFF", ev);
 
   digitalWrite(LD_ON_PIN, LOW);
-
-  // Side-effect only, no payload
   return nullptr;
 }
 
@@ -246,6 +183,7 @@ static const Payload* cmd_off(const char* /*args_json*/) {
 // ================================================================
 
 static const process_command_entry_t LASER_COMMANDS[] = {
+  { "INIT",   cmd_init   },
   { "REPORT", cmd_report },
   { "ON",     cmd_on     },
   { "OFF",    cmd_off    },
@@ -253,13 +191,11 @@ static const process_command_entry_t LASER_COMMANDS[] = {
 
 static const process_vtable_t LASER_PROCESS = {
   .name = "LASER",
-  .start = laser_start,
-  .stop = laser_stop,
   .query = nullptr,
   .commands = LASER_COMMANDS,
-  .command_count = 3,
+  .command_count = 4,
 };
 
 void process_laser_register(void) {
-  process_register(PROCESS_TYPE_LASER, &LASER_PROCESS);
+  process_register("LASER", &LASER_PROCESS);
 }

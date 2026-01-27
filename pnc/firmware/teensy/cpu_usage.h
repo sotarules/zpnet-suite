@@ -30,6 +30,9 @@
 // Initialize CPU usage instrumentation
 void cpu_usage_init(void);
 
+// Initialize CPU usage timer (TimePop)
+void cpu_usage_init_timer(void);
+
 // ------------------------------------------------------------
 // Busy-cycle accounting (scheduler boundary)
 // ------------------------------------------------------------
