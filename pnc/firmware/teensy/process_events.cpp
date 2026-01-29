@@ -90,6 +90,23 @@ void enqueueEvent(const char* type, const Payload& payload) {
   evt_count++;
 }
 
+void emit_system_error(
+  const char* subsystem,
+  const char* file,
+  const char* function,
+  const char* condition
+) {
+  Payload ev;
+
+  if (subsystem) ev.add("subsystem", subsystem);
+  if (file)      ev.add("file", file);
+  if (function)  ev.add("function", function);
+  if (condition) ev.add("condition", condition);
+
+  enqueueEvent("SYSTEM_ERROR", ev);
+}
+
+
 // --------------------------------------------------------------
 // Command: GET — return and clear all queued events
 // --------------------------------------------------------------

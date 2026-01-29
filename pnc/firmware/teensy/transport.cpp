@@ -5,12 +5,12 @@
 // This file owns the entire byte ↔ meaning boundary.
 // All invariants are assumed to be correct by construction.
 //
-#include "util.h"
 #include "transport.h"
 
 #include "config.h"
 #include "debug.h"
 #include "timepop.h"
+#include "events.h"
 
 #include <Arduino.h>
 #include <usb_rawhid.h>
@@ -25,7 +25,7 @@ static constexpr size_t   HID_PACKET_SIZE   = 64;
 static constexpr uint32_t HID_RX_TIMEOUT_MS = 0;
 
 // Legacy framing (REQUEST_RESPONSE only)
-static const char ETX_SEQ[]    = "<ETX>";
+static const char ETX_SEQ[]     = "<ETX>";
 static constexpr size_t ETX_LEN = 5;
 
 // -------------------------------------------------------------
@@ -96,7 +96,18 @@ static void fragment_and_send(
 }
 
 // -------------------------------------------------------------
-// PRIVATE: send-side delimitation
+// PRIVATE: send-side delimitation (JsonView-based)
+// -------------------------------------------------------------
+//
+// REQUEST_RESPONSE:
+//   <STX=n>{JSON}<ETX>
+//
+// All other traffic:
+//   {JSON}
+//
+// BOUNDS:
+//   We MUST NOT write beyond out_buf capacity (TRANSPORT_MAX_MESSAGE).
+//   On overflow, emit a small explicit error JSON.
 // -------------------------------------------------------------
 
 static void handle_send_delimiters(
@@ -105,8 +116,11 @@ static void handle_send_delimiters(
   uint8_t* out_buf,
   size_t& out_len
 ) {
-  String json = payload.to_json();
-  const size_t json_len = json.length();
+  out_len = 0;
+
+  // Primary path: transient view (no heap)
+  JsonView v = payload.json_view();
+  const size_t json_len = v.len;
 
   if (traffic == TRAFFIC_REQUEST_RESPONSE) {
 
@@ -118,16 +132,49 @@ static void handle_send_delimiters(
       (unsigned)json_len
     );
 
-    memcpy(out_buf, header, (size_t)header_len);
-    memcpy(out_buf + header_len, json.c_str(), json_len);
-    memcpy(out_buf + header_len + json_len, ETX_SEQ, ETX_LEN);
+    if (header_len <= 0) {
+      emit_system_error(
+        "transport",
+        "transport.cpp",
+        "handle_send_delimiters",
+        "header_len <= 0 - message not sent"
+      );
+      return;
+    }
 
-    out_len = (size_t)header_len + json_len + ETX_LEN;
+    const size_t total_len =
+      (size_t)header_len + json_len + ETX_LEN;
+
+    if (total_len > TRANSPORT_MAX_MESSAGE) {
+      emit_system_error(
+        "transport",
+        "transport.cpp",
+        "handle_send_delimiters",
+        "total_len > TRANSPORT_MAX_MESSAGE - message not sent"
+      );
+      return;
+    }
+
+    memcpy(out_buf, header, (size_t)header_len);
+    memcpy(out_buf + (size_t)header_len, v.data, json_len);
+    memcpy(out_buf + (size_t)header_len + json_len, ETX_SEQ, ETX_LEN);
+
+    out_len = total_len;
     return;
   }
 
   // All other traffic: raw JSON
-  memcpy(out_buf, json.c_str(), json_len);
+  if (json_len > TRANSPORT_MAX_MESSAGE) {
+    emit_system_error(
+      "transport",
+      "transport.cpp",
+      "handle_send_delimiters",
+      "json_len > TRANSPORT_MAX_MESSAGE - message not sent"
+    );
+    return;
+  }
+
+  memcpy(out_buf, v.data, json_len);
   out_len = json_len;
 }
 
@@ -141,7 +188,19 @@ void transport_send(
 ) {
   static uint8_t send_buf[TRANSPORT_MAX_MESSAGE];
   size_t send_len = 0;
+
   handle_send_delimiters(traffic, payload, send_buf, send_len);
+
+  if (send_len == 0) {
+    emit_system_error(
+      "transport",
+      "transport.cpp",
+      "transport_send",
+      "send_len == 0 - transport_send aborted"
+    );
+    return;    // Nothing to send (should be rare; treated as best-effort drop)
+  }
+
   fragment_and_send(traffic, send_buf, send_len);
 }
 
@@ -211,7 +270,6 @@ static void handle_receive_delimiters(
   out.parseJSON(buf + i, json_len);
 }
 
-
 // -------------------------------------------------------------
 // RX semantic dispatch
 // -------------------------------------------------------------
@@ -220,10 +278,17 @@ static void handle_complete_message(
   const uint8_t* msg,
   size_t len
 ) {
-  uint8_t traffic = msg[0];
+  if (!msg || len < 1) {
+    emit_system_error(
+      "transport",
+      "transport.cpp",
+      "handle_complete_message",
+      "!msg || len < 1 - invalid message ignored"
+    );
+    return;
+  }
 
-  char buf[8];
-  snprintf(buf, sizeof(buf), "0x%02X", traffic);
+  uint8_t traffic = msg[0];
 
   const uint8_t* payload = msg + 1;
   size_t payload_len = len - 1;
@@ -245,19 +310,30 @@ static void transport_rx_tick(
   timepop_ctx_t*,
   void*
 ) {
-
   uint8_t pkt[HID_PACKET_SIZE];
 
   int n = RawHID.recv(pkt, HID_RX_TIMEOUT_MS);
-
   if (n <= 0) return;
 
+  // Trim zero padding
   size_t end = HID_PACKET_SIZE;
   while (end > 0 && pkt[end - 1] == 0x00) {
     end--;
   }
 
   bool has_padding = (end < HID_PACKET_SIZE);
+
+  // Bounded reassembly (never overflow rx_buf)
+  if (rx_len + end > TRANSPORT_MAX_MESSAGE) {
+    emit_system_error(
+      "transport",
+      "transport.cpp",
+      "transport_rx_tick",
+      "rx_len + end > TRANSPORT_MAX_MESSAGE - incoming data ingored"
+    );    // Drop the current partial message to preserve memory integrity.
+    rx_len = 0;
+    return;
+  }
 
   memcpy(rx_buf + rx_len, pkt, end);
   rx_len += end;

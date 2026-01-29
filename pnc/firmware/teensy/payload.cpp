@@ -14,6 +14,11 @@ static constexpr size_t PAYLOAD_JSON_MAX = 10 * 1024; // 10 KiB
 // =============================================================
 // Internal helpers (serialization only)
 // =============================================================
+//
+// JsonBuf is a bounded, allocator-free JSON construction buffer.
+// It is reused across serializations and is NOT re-entrant.
+// The produced JSON is transient and must be consumed immediately.
+//
 
 namespace {
 
@@ -90,7 +95,17 @@ struct JsonBuf {
   Payload — Semantic State Holder
   -------------------------------
   entries[] is authoritative.
-  JSON is a bounded, heap-free derivative.
+  JSON serialization is a bounded, heap-free derivative.
+
+  json_view():
+    • Returns a transient view into an internal static buffer
+    • Caller must consume immediately
+    • No allocation, no ownership transfer
+
+  to_json():
+    • Legacy convenience wrapper
+    • Allocates exactly once
+    • Should not be used on hot paths
 
   ============================================================================
 */
@@ -113,12 +128,17 @@ bool Payload::empty() const {
 }
 
 // -------------------------------------------------------------
-// JSON serialization (allocator-stable, bounded)
+// JSON serialization — primary, zero-alloc path
 // -------------------------------------------------------------
 
-String Payload::to_json() const {
+JsonView Payload::json_view() const {
 
-  JsonBuf jb;
+  static JsonBuf jb;
+
+  // Reset buffer
+  jb.len = 0;
+  jb.overflow = false;
+  jb.buf[0] = '\0';
 
   jb.append_char('{');
 
@@ -177,8 +197,16 @@ String Payload::to_json() const {
     jb.reset_to_error();
   }
 
-  // Single allocation at boundary only
-  return String(jb.buf);
+  return JsonView{ jb.buf, jb.len };
+}
+
+// -------------------------------------------------------------
+// JSON serialization — legacy convenience wrapper
+// -------------------------------------------------------------
+
+String Payload::to_json() const {
+  JsonView v = json_view();
+  return String(v.data);
 }
 
 // =============================================================
@@ -308,6 +336,7 @@ bool Payload::parseJSON(const uint8_t* data, size_t len) {
 
   return true;
 }
+
 
 // =============================================================
 // Lookup / Accessors

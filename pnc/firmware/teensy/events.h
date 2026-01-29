@@ -37,3 +37,27 @@
 //   • Callers MUST NOT construct JSON
 //
 void enqueueEvent(const char* type, const Payload& payload);
+
+// --------------------------------------------------------------
+// System error helper (semantic, non-fatal)
+// --------------------------------------------------------------
+//
+// Emits a durable SYSTEM_ERROR event describing an internal
+// invariant violation or boundary anomaly.
+//
+// Intended for:
+//   • transport boundary checks
+//   • defensive guards
+//   • unexpected-but-survivable conditions
+//
+// NOT intended for:
+//   • ISR context
+//   • hard fault replacement
+//
+void emit_system_error(
+  const char* subsystem,
+  const char* file,
+  const char* function,
+  const char* condition
+);
+

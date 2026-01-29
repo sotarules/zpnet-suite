@@ -14,17 +14,46 @@
   HARD CONTRACT (DO NOT VIOLATE):
 
     • Payload has exactly ONE authoritative internal state: `entries[]`
-    • JSON text is a derived representation, never state
-    • Accessors must be referentially transparent
-    • No accessor may depend on call order
-    • No shared or ephemeral buffers may escape
+    • JSON is a DERIVED REPRESENTATION, never state
+    • Serialization does NOT imply ownership transfer
+    • Accessors are referentially transparent
+    • No accessor depends on call order
+    • No shared or ephemeral buffers escape implicitly
     • Callers must not need to understand storage or lifetime rules
 
-  This header reflects those constraints explicitly.
+  DESIGN INTENT:
+
+    Payload is a semantic object.
+    JSON is a transient view over that object.
+
   ============================================================================
 */
 
 class PayloadArray;
+
+/*
+  ============================================================================
+  JsonView — Transient JSON Serialization View
+  ----------------------------------------------------------------------------
+
+  JsonView represents a non-owning, read-only view into a transient
+  serialization buffer owned by Payload.
+
+  CONTRACT:
+    • JsonView is valid ONLY until the next call to Payload::json_view()
+    • Callers MUST consume immediately
+    • Callers MUST NOT store, cache, or retain pointers
+    • No allocation occurs
+    • No ownership is transferred
+
+  This type exists to make serialization lifetime explicit and honest.
+
+  ============================================================================
+*/
+struct JsonView {
+  const char* data;
+  size_t      len;
+};
 
 class Payload {
 public:
@@ -37,8 +66,26 @@ public:
   void clear();
   bool empty() const;
 
-  // Serialize the current semantic state to JSON.
-  // This is a pure derivative of entries[].
+  // --------------------------------------------------
+  // Serialization
+  // --------------------------------------------------
+
+  /*
+    Primary serialization API.
+
+    Returns a transient, non-owning view into an internal static buffer.
+    No heap allocation occurs.
+
+    Callers MUST consume immediately.
+  */
+  JsonView json_view() const;
+
+  /*
+    Legacy convenience wrapper.
+
+    Allocates exactly once and copies the JSON into a String.
+    Intended for debugging, logging, and non–hot-path usage ONLY.
+  */
   String to_json() const;
 
   // --------------------------------------------------
@@ -77,7 +124,7 @@ public:
   // --------------------------------------------------
 
   // Parse a bounded JSON object into semantic entries.
-  // This function canonicalizes values into entries[].
+  // Canonicalizes values into entries[].
   bool parseJSON(const uint8_t* data, size_t len);
 
   bool has(const char* key) const;
@@ -153,6 +200,12 @@ private:
 // =============================================================
 // PayloadArray — JSON array (object-only elements)
 // =============================================================
+//
+// NOTE:
+//   PayloadArray remains partially builder-oriented.
+//   This is acceptable because it is not part of the semantic routing spine.
+//   It may be refactored later to use JsonView-style semantics.
+//
 
 class PayloadArray {
 public:
@@ -161,7 +214,8 @@ public:
   void clear();
   bool empty() const;
 
-  // Serialize array contents (pure derivative)
+  // Serialize array contents (pure derivative).
+  // Uses String; acceptable for now because this is not hot-path.
   String to_json() const;
 
   // Append object (semantic)
@@ -174,11 +228,6 @@ public:
   Payload get(size_t idx) const;
 
 private:
-  // NOTE:
-  // PayloadArray remains partially builder-oriented for now.
-  // This is acceptable because it is not a routing or semantic spine.
-  // It may be refactored later using the same single-state rules.
-
   String buf;
   bool first;
 
