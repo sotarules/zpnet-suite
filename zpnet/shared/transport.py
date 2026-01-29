@@ -84,7 +84,7 @@ def open_hid(path: str) -> None:
 
     hid_fd = os.open(path, os.O_RDWR)
     hid_present.set()
-    logger.info("[transport] HID opened: %s", path)
+    logger.info("🚀 [transport] HID opened: %s", path)
 
 def close_hid() -> None:
     global hid_fd
@@ -92,7 +92,7 @@ def close_hid() -> None:
         os.close(hid_fd)
         hid_fd = None
         hid_present.clear()
-        logger.info("[transport] HID closed")
+        logger.info("🛑 [transport] HID closed")
 
 # ---------------------------------------------------------------------
 # Delimiting (send-side)
@@ -143,8 +143,6 @@ def transport_send(traffic: int, payload: Payload) -> None:
     The object is JSON-encoded here, then passed through
     transport-level delimiting and fragmentation.
     """
-    if hid_fd is None:
-        raise RuntimeError("HID not open")
 
     # Semantic → JSON → bytes
     raw = payload_to_json_bytes(payload)
@@ -194,7 +192,7 @@ def _fragment_and_send(data: bytes, traffic: int) -> None:
                     except Exception:
                         pass
                     hid_fd = None
-                    raise RuntimeError("Teensy disconnected") from e
+                    raise RuntimeError("⚠️ [transport] Teensy disconnected") from e
                 raise
 
             offset += HID_PACKET_SIZE
@@ -218,7 +216,7 @@ def reader_loop() -> None:
         global hid_fd
 
         if hid_fd is None:
-            raise RuntimeError("reader_loop started with HID not open")
+            raise RuntimeError("⚠️ [transport] reader_loop started with HID not open")
 
         rx_buf = bytearray()
         traffic: Optional[int] = None
@@ -226,10 +224,9 @@ def reader_loop() -> None:
         while True:
             try:
                 pkt = os.read(hid_fd, HID_PACKET_SIZE)
-                logging.info("[transport] read pkt: %s", pkt)
             except OSError as e:
                 if e.errno in (5, 19):
-                    logger.warning("[transport] hidraw vanished during read")
+                    logger.warning("⚠️ [transport] hidraw vanished during read")
                     hid_present.clear()
                     try:
                         os.close(hid_fd)
@@ -256,11 +253,10 @@ def reader_loop() -> None:
             if has_padding:
                 message = bytes(rx_buf)
                 rx_buf.clear()
-                logging.info( "[transport] block chunking finished %s traffic %s",    message, repr(traffic))
                 _dispatch_complete_message(traffic, message)
                 traffic = None
     except Exception:
-        logging.exception("[transport] reader_loop fatal exception")
+        logging.exception("💥 [transport] reader_loop fatal exception")
 
 # ---------------------------------------------------------------------
 # Dispatch
@@ -269,7 +265,6 @@ def reader_loop() -> None:
 def _dispatch_complete_message(traffic: int, message: bytes) -> None:
 
     undelimited = _undelimit_on_receive(traffic, message)
-    logging.info("[transport] received undelimited: %s", undelimited)
     _snoop("→", undelimited)
 
     if traffic == constants.TRAFFIC_REQUEST_RESPONSE:
@@ -296,4 +291,4 @@ def transport_init() -> None:
         threading.Thread(target=reader_loop, daemon=True, name="transport-reader").start()
 
     except Exception:
-        logging.exception("[main] teensy_listener fatal crash")
+        logging.exception("💥 [transport] teensy_listener fatal crash")

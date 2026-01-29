@@ -851,6 +851,15 @@ def build_teensy_status() -> dict:
     return payload
 
 # ------------------------------------------------------------------
+# Teensy status helpers (migrated from teensy_monitor)
+# ------------------------------------------------------------------
+
+def build_clocks_status() -> dict:
+    payload = send_command(machine="TEENSY", subsystem="CLOCKS", command="REPORT")["payload"]
+    payload["health_state"] = "NOMINAL"
+    return payload
+
+# ------------------------------------------------------------------
 # System poller thread
 # ------------------------------------------------------------------
 
@@ -870,6 +879,7 @@ def system_poller() -> None:
             gnss_payload = build_gnss_status()
             power_payload = build_power_status()
             battery_payload = build_battery_status()
+            clocks_payload = build_clocks_status()
 
             SYSTEM = {
                 "pi": dict(pi_payload),
@@ -881,6 +891,7 @@ def system_poller() -> None:
                 "gnss": dict(gnss_payload),
                 "power": dict(power_payload),
                 "battery": dict(battery_payload),
+                "clocks": dict(clocks_payload)
             }
 
             # ----------------------------------------------------------
