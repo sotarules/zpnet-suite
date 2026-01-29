@@ -43,7 +43,7 @@ from zpnet.shared.util import payload_to_json_bytes
 # ---------------------------------------------------------------------
 
 HID_PACKET_SIZE = 64
-TRANSPORT_MAX_MESSAGE = 1024
+TRANSPORT_MAX_MESSAGE = 10 * 1024
 
 STX_PREFIX = b"<STX="
 ETX_SEQ    = b"<ETX>"

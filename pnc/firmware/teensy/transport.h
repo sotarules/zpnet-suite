@@ -20,7 +20,7 @@
 // MUST be bounded to preserve memory integrity.
 //
 
-static constexpr size_t TRANSPORT_MAX_MESSAGE = 1024;
+static constexpr size_t TRANSPORT_MAX_MESSAGE = 10 * 1024;
 
 // -------------------------------------------------------------
 // Traffic types (authoritative)
