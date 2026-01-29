@@ -13,11 +13,13 @@ Invariants:
 
 Author: The Mule + GPT
 """
-
+import json
 from collections.abc import Generator
 
 from zpnet.processes.processes import send_command
 
+import logging
+log = logging.getLogger("zpnet.dashboard")
 
 # ---------------------------------------------------------------------
 # Shared SYSTEM snapshot fetcher (AUTHORITATIVE)
@@ -26,6 +28,9 @@ from zpnet.processes.processes import send_command
 def get_system_snapshot() -> dict:
     return send_command(machine="PI", subsystem="SYSTEM", command="REPORT")["payload"]
 
+
+def get_clocks_report() -> dict:
+    return send_command(machine="TEENSY", subsystem="CLOCKS", command="REPORT")["payload"]
 
 # ---------------------------------------------------------------------
 # GNSS REPORT (snapshot)
@@ -50,6 +55,32 @@ def gnss_report_readout() -> Generator[str, None, None]:
 
     if "discipline" in g:
         yield f"DISCIPLINE MODE: {g['discipline']}"
+
+
+# ---------------------------------------------------------------------
+# CLOCKS (synthetic clock substrate)
+# ---------------------------------------------------------------------
+
+def clocks_status_readout() -> Generator[str, None, None]:
+    c = get_clocks_report()
+
+    # Status line with elapsed time inline
+    yield f"CLOCKS STATUS: NOMINAL {c['elapsed_hms']}"
+
+    yield f""
+
+    # Header
+    yield f"{'CLOCK':<8} {'TAU':>14} {'PPB':>14}"
+
+    # GNSS baseline
+    yield f"{'GNSS':<8} {'1.0000000000':>14} {'0.00':>14}"
+
+    # DWT
+    yield f"{'DWT':<8} {c['tau_dwt']:>14.10f} {c['dwt_ppb']:>14.2f}"
+
+    # OCXO
+    yield f"{'OCXO':<8} {c['tau_ocxo']:>14.10f} {c['ocxo_ppb']:>14.2f}"
+
 
 
 # ---------------------------------------------------------------------
@@ -158,6 +189,7 @@ def battery_status_readout() -> Generator[str, None, None]:
 
     if "ideal_voltage_v" in battery and battery["ideal_voltage_v"] is not None:
         yield f"IDEAL VOLTAGE: {battery['ideal_voltage_v']:.1f} V"
+
 
 # ---------------------------------------------------------------------
 # TEENSY

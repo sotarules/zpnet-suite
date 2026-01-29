@@ -53,6 +53,42 @@ SERIAL_SNOOP_PATH = "/home/mule/zpnet/logs/zpnet-teensy-listener-snoop.log"
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------
+# Raw HID forensic logging (authoritative black box)
+# ---------------------------------------------------------------------
+
+RAW_HID_LOG_PATH = "/home/mule/zpnet/logs/zpnet-hid.log"
+
+def _log_raw_hid(
+    traffic: int,
+    message: bytes
+) -> None:
+    """
+    Log a fully reassembled HID message exactly once,
+    before any semantic processing.
+
+    This is a forensic truth surface.
+    """
+    try:
+        ts = time.time()
+        traffic_hex = f"0x{traffic:02X}"
+        length = len(message)
+
+        # Safe dual representation
+        ascii_preview = message.decode("utf-8", errors="replace")
+        hex_preview = message.hex()
+
+        with open(RAW_HID_LOG_PATH, "a") as f:
+            f.write(
+                f"{ts:.6f} traffic={traffic_hex} len={length}\n"
+                f"ASCII: {ascii_preview}\n"
+                f"HEX:   {hex_preview}\n"
+                f"---\n"
+            )
+    except Exception:
+        # Logging must never interfere with transport
+        pass
+
+# ---------------------------------------------------------------------
 # Receive callback registry
 # ---------------------------------------------------------------------
 
@@ -253,6 +289,10 @@ def reader_loop() -> None:
             if has_padding:
                 message = bytes(rx_buf)
                 rx_buf.clear()
+
+                # 🔴 FORENSIC TAP — log before any processing
+                _log_raw_hid(traffic, message)
+
                 _dispatch_complete_message(traffic, message)
                 traffic = None
     except Exception:

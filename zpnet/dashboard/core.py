@@ -48,8 +48,8 @@ BG_COLOR = (0, 0, 0)
 HEADER_COLOR = (255, 255, 255)
 TEXT_COLOR = (0, 255, 0)
 
-READOUT_DELAY = 2.0
-LOCKED_REFRESH_S = 5
+READOUT_DELAY = 3.0
+LOCKED_REFRESH_S = 1
 
 WS_HOST = "0.0.0.0"
 WS_PORT = 8765
@@ -108,6 +108,7 @@ def header_readout(prefix: str = "") -> list[str]:
 # Readout imports (SYSTEM-backed)
 # ---------------------------------------------------------------------
 from zpnet.dashboard.readout_blocks import (
+    clocks_status_readout,
     gnss_report_readout,
     laser_status_readout,
     environment_status_readout,
@@ -123,6 +124,7 @@ from zpnet.dashboard.readout_blocks import (
 Readout = Generator[str, None, None]
 
 READOUTS: list[Callable[[], Readout]] = [
+    clocks_status_readout,
     gnss_report_readout,
     laser_status_readout,
     environment_status_readout,

@@ -1,5 +1,10 @@
+// teensy.cpp — ZPNet Runtime + Morse Fault Annunciator
+//
+// Fault reporting is LED-only, allocator-free, and unconditional.
+// No logging, no transport, no heap, no scheduler dependency.
+//
+
 #include "config.h"
-#include "debug.h"
 
 #include "clock.h"
 #include "timepop.h"
@@ -7,7 +12,6 @@
 #include "cpu_usage.h"
 #include "process.h"
 #include "transport.h"
-
 #include "payload.h"
 
 #include "process_clocks.h"
@@ -18,60 +22,107 @@
 #include "process_tempest.h"
 #include "process_system.h"
 
+#include <Arduino.h>
+
 // ============================================================================
-// HARD FAULT BARRIER (TOP-LEVEL, NON-NEGOTIABLE)
+// LED MORSE PRIMITIVES (FAULT-SAFE)
+// ============================================================================
+
+static constexpr uint32_t DOT_MS  = 150;
+static constexpr uint32_t DASH_MS = 450;
+static constexpr uint32_t GAP_MS  = 150;
+static constexpr uint32_t LETTER_GAP_MS = 600;
+static constexpr uint32_t REPEAT_GAP_MS = 1500;
+
+static inline void led_on()  { digitalWrite(LED_BUILTIN, HIGH); }
+static inline void led_off() { digitalWrite(LED_BUILTIN, LOW);  }
+
+static void dot() {
+  led_on();  delay(DOT_MS);
+  led_off(); delay(GAP_MS);
+}
+
+static void dash() {
+  led_on();  delay(DASH_MS);
+  led_off(); delay(GAP_MS);
+}
+
+// ============================================================================
+// MORSE FAULT PATTERNS
 // ============================================================================
 //
-// On Teensy (ARM Cortex-M), there are NO language-level exceptions.
-// Any serious failure results in a CPU fault.
+// H = ....
+// M = --
+// B = -...
+// U = ..-
+// ? = ..--..
 //
-// These handlers ARE the outermost fault barrier.
-// They must log aggressively and NEVER return.
-//
+
+[[noreturn]]
+static void fault_morse_hardfault() {
+  pinMode(LED_BUILTIN, OUTPUT);
+  while (true) {
+    dot(); dot(); dot(); dot();          // H
+    delay(REPEAT_GAP_MS);
+  }
+}
+
+[[noreturn]]
+static void fault_morse_memmanage() {
+  pinMode(LED_BUILTIN, OUTPUT);
+  while (true) {
+    dash(); dash();                      // M
+    delay(REPEAT_GAP_MS);
+  }
+}
+
+[[noreturn]]
+static void fault_morse_busfault() {
+  pinMode(LED_BUILTIN, OUTPUT);
+  while (true) {
+    dash(); dot(); dot(); dot();         // B
+    delay(REPEAT_GAP_MS);
+  }
+}
+
+[[noreturn]]
+static void fault_morse_usagefault() {
+  pinMode(LED_BUILTIN, OUTPUT);
+  while (true) {
+    dot(); dot(); dash();                // U
+    delay(REPEAT_GAP_MS);
+  }
+}
+
+[[noreturn]]
+static void fault_morse_unknown() {
+  pinMode(LED_BUILTIN, OUTPUT);
+  while (true) {
+    dot(); dot(); dash(); dash(); dot(); dot();   // ?
+    delay(REPEAT_GAP_MS);
+  }
+}
+
+// ============================================================================
+// ARM CORTEX-M FAULT HANDLERS (HARD-CODED SYMBOLS)
 // ============================================================================
 
 extern "C" {
 
-// --------------------------------------------------------------------------
-// Shared fault barrier
-// --------------------------------------------------------------------------
-
-[[noreturn]]
-void fault_barrier(const char* fault_name) {
-
-  // Announce failure loudly and immediately
-  debug_log("FAULT", "==================================================");
-  debug_log("FAULT", "ENTERING FAULT BARRIER");
-  debug_log("FAULT", fault_name);
-  debug_log("FAULT", "SYSTEM STATE IS NO LONGER TRUSTWORTHY");
-  debug_log("FAULT", "EXECUTION HALTED");
-  debug_log("FAULT", "==================================================");
-
-  // Visual indicator: unmistakable fault pattern
-  while (true) {
-    debug_blink("FAULT");
-    delay(500);
-  }
-}
-
-// --------------------------------------------------------------------------
-// Cortex-M fault handlers
-// --------------------------------------------------------------------------
-
 void HardFault_Handler(void) {
-  fault_barrier("HardFault");
+  fault_morse_hardfault();
 }
 
 void MemManage_Handler(void) {
-  fault_barrier("MemManageFault");
+  fault_morse_memmanage();
 }
 
 void BusFault_Handler(void) {
-  fault_barrier("BusFault");
+  fault_morse_busfault();
 }
 
 void UsageFault_Handler(void) {
-  fault_barrier("UsageFault");
+  fault_morse_usagefault();
 }
 
 } // extern "C"
@@ -79,130 +130,77 @@ void UsageFault_Handler(void) {
 // ============================================================================
 // ZPNet Runtime Initialization
 // ============================================================================
-//
-// This function performs all construction-time wiring of the system.
-// No execution-time assumptions are made here.
-//
-// Order is logical, not temporal.
-// No data flows until loop() begins dispatching TimePop.
-// ============================================================================
 
 void setup() {
 
-  delay(100);   // Allow USB enumeration to fully settle
+  delay(100);   // USB settle (not relied upon for faults)
+
+  pinMode(LED_BUILTIN, OUTPUT);
+  led_off();
 
   // ----------------------------------------------------------
-  // Visible liveness + debug channel
+  // Core instrumentation
   // ----------------------------------------------------------
 
-  debug_blink("1155");
-  debug_init();
-  debug_log("setup", "*fire*");
-
-  // ----------------------------------------------------------
-  // Core instrumentation / diagnostics
-  // ----------------------------------------------------------
-
-  debug_log("setup", "cpu_usage *init*");
   cpu_usage_init();
 
   // ----------------------------------------------------------
-  // Bring time into existence (control plane)
+  // Time substrate
   // ----------------------------------------------------------
 
-  debug_log("setup", "timepop *init*");
   timepop_init();
 
   // ----------------------------------------------------------
-  // Transport subsystem (byte ↔ meaning boundary)
+  // Transport
   // ----------------------------------------------------------
 
-  debug_log("setup", "transport *init*");
   transport_init();
-
-  // ----------------------------------------------------------
-  // Register receive callbacks (semantic entry points)
-  // ----------------------------------------------------------
-  //
-  // Transport owns decoding and routing.
-  // Application intent is bound here, once.
-  //
-
-  debug_log("setup", "transport_register_receive_callback *fire*");
   transport_register_receive_callback(
     TRAFFIC_REQUEST_RESPONSE,
     process_command
   );
 
   // ----------------------------------------------------------
-  // Core subsystems that depend on time
+  // Clock subsystem
   // ----------------------------------------------------------
 
-  debug_log("setup", "clock *init*");
   clock_init();
 
   // ----------------------------------------------------------
-  // Process framework (semantic command surface)
+  // Process framework
   // ----------------------------------------------------------
 
-  debug_log("setup", "process *init*");
   process_init();
 
-  // ----------------------------------------------------------
-  // Register processes (authoritative command surfaces)
-  // ----------------------------------------------------------
-
-  debug_log("setup", "process_events *init*");
   process_events_init();
   process_events_register();
 
-  // Explicit boot fact (durable truth)
-  debug_log("setup", "enqueueEvent(TEENSY_BOOT)");
+  // Boot fact
   Payload ev;
   ev.add("status", "READY");
   enqueueEvent("TEENSY_BOOT", ev);
 
-  debug_log("setup", "process_timepop_register");
   process_timepop_register();
-
-  debug_log("setup", "process_clocks_register");
   process_clocks_register();
 
-  debug_log("setup", "process_laser *init*");
   process_laser_init();
   process_laser_register();
 
-  debug_log("setup", "process_photodiode *init*");
   process_photodiode_init();
   process_photodiode_register();
 
-  debug_log("setup", "process_tempest_register");
   process_tempest_register();
-
-  debug_log("setup", "process_system_register");
   process_system_register();
 
   // ----------------------------------------------------------
-  // Periodic CPU usage sampling (TimePop-managed)
+  // CPU usage sampling
   // ----------------------------------------------------------
 
-  debug_log("setup", "cpu_usage_init_timer");
   cpu_usage_init_timer();
-
-  // ----------------------------------------------------------
-  // Keep debug channel alive during development
-  // ----------------------------------------------------------
-
-  debug_beacon();
 }
 
 // ============================================================================
-// ZPNet Runtime Loop
-// ============================================================================
-//
-// All execution happens here.
-// TimePop owns dispatch.
-// No work occurs outside scheduled context.
+// Runtime loop
 // ============================================================================
 
 void loop() {
