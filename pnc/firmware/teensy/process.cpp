@@ -126,8 +126,13 @@ void process_command(const Payload& request) {
 
   Payload response;
 
-  debug_log("process_command", "command received");
-  debug_log_payload("process_command", request);
+  // ---------------------------------------------------------
+  // Add req_id to response no matter what (even errors)
+  // ---------------------------------------------------------
+
+  if (request.has("req_id")) {
+    response.add("req_id", request.getUInt("req_id"));
+  }
 
   // ---------------------------------------------------------
   // Extract routing fields (COPY IMMEDIATELY)
@@ -136,19 +141,12 @@ void process_command(const Payload& request) {
   String subsystem = request.getString("subsystem");
   String command   = request.getString("command");
 
-  debug_log("subsystem", subsystem.c_str());
-  debug_log("command", command.c_str());
-
-  // Optional forensic dump (remove when stable)
-  request.debug_dump("process_command request");
-
   // ---------------------------------------------------------
   // Resolve subsystem
   // ---------------------------------------------------------
 
   process_entry_t* p = find_process(subsystem.c_str());
   if (!p) {
-    debug_log("process_command", "***SUBSYSTEM NOT FOUND***");
     response.add("success", false);
     response.add("message", "unknown subsystem");
     transport_send(TRAFFIC_REQUEST_RESPONSE, response);
@@ -159,20 +157,15 @@ void process_command(const Payload& request) {
   // Resolve command
   // ---------------------------------------------------------
 
-  debug_log("process_command", "resolving command");
-
   const process_command_entry_t* entry =
       find_command(p->vtable, command.c_str());
 
   if (!entry || !entry->handler) {
-    debug_log("process_command", "***COMMAND NOT FOUND***");
     response.add("success", false);
     response.add("message", "unknown command");
     transport_send(TRAFFIC_REQUEST_RESPONSE, response);
     return;
   }
-
-  debug_log("process_command", "executing command");
 
   // ---------------------------------------------------------
   // Extract args (structured, optional)
@@ -188,12 +181,6 @@ void process_command(const Payload& request) {
   // ---------------------------------------------------------
 
   const Payload* payload = entry->handler(args);
-  if (payload) {
-    String json = payload->to_json();
-    debug_log("process_command.payload", json.c_str());
-  } else {
-    debug_log("process_command.payload", "(null)");
-  }
 
   // ---------------------------------------------------------
   // Construct canonical success envelope
@@ -207,7 +194,7 @@ void process_command(const Payload& request) {
   }
 
   // ---------------------------------------------------------
-  // Emit response
+  // Send response
   // ---------------------------------------------------------
 
   transport_send(

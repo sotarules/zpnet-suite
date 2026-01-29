@@ -128,7 +128,7 @@ void setup() {
   // Application intent is bound here, once.
   //
 
-  debug_log("setup", "transport_register_receive_callback(REQUEST_RESPONSE)");
+  debug_log("setup", "transport_register_receive_callback *fire*");
   transport_register_receive_callback(
     TRAFFIC_REQUEST_RESPONSE,
     process_command

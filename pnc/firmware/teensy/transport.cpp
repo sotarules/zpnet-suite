@@ -141,13 +141,8 @@ void transport_send(
 ) {
   static uint8_t send_buf[TRANSPORT_MAX_MESSAGE];
   size_t send_len = 0;
-  debug_log("transport_send", "enter");
   handle_send_delimiters(traffic, payload, send_buf, send_len);
-  debug_log("transport_send", "after delimiters");
-  debug_log("transport_send.send_buf", send_buf, send_len);
-  debug_log("transport_send.send_len", send_len);
   fragment_and_send(traffic, send_buf, send_len);
-  debug_log("transport_send", "after fragment_and_send");
 }
 
 // -------------------------------------------------------------
@@ -174,27 +169,17 @@ static void handle_receive_delimiters(
   size_t len,
   Payload& out
 ) {
-  debug_log("delim", "enter");
   out.clear();
 
-  debug_log("delim", "after clear");
-
   if (traffic != TRAFFIC_REQUEST_RESPONSE) {
-    debug_log("delim", "non-RR traffic");
     out.parseJSON(buf, len);
-    debug_log("delim", "non-RR parsed");
     return;
   }
-
-  debug_log("delim", "RR traffic");
 
   // ---- MINIMUM SAFE GUARD ----
   if (len < 6) {
-    debug_log("delim", "len < 6");
     return;
   }
-
-  debug_log("delim", "len OK");
 
   // ---- VERIFY PREFIX ----
   if (buf[0] != '<' ||
@@ -202,43 +187,28 @@ static void handle_receive_delimiters(
       buf[2] != 'T' ||
       buf[3] != 'X' ||
       buf[4] != '=') {
-    debug_log("delim", "bad STX prefix");
     return;
   }
 
-  debug_log("delim", "STX prefix OK");
-
   size_t i = 5;
   size_t json_len = 0;
-
-  debug_log("delim", "before digit loop");
 
   while (i < len && buf[i] >= '0' && buf[i] <= '9') {
     json_len = (json_len * 10) + (buf[i] - '0');
     i++;
   }
 
-  debug_log("delim", "after digit loop");
-
   if (i >= len || buf[i] != '>') {
-    debug_log("delim", "missing >");
     return;
   }
 
   i++;  // skip '>'
 
-  debug_log("delim", "after >");
-
   if (i + json_len > len) {
-    debug_log("delim", "json_len overflow");
     return;
   }
 
-  debug_log("delim", "before parseJSON");
-
   out.parseJSON(buf + i, json_len);
-
-  debug_log("delim", "after parseJSON");
 }
 
 
@@ -254,28 +224,17 @@ static void handle_complete_message(
 
   char buf[8];
   snprintf(buf, sizeof(buf), "0x%02X", traffic);
-  debug_log("traffic", buf);
 
   const uint8_t* payload = msg + 1;
   size_t payload_len = len - 1;
 
   if (!recv_cb[traffic]) {
-    debug_log("transport", "RX with no registered callback");
     return;
   }
 
-  debug_log("before delimiters", "enter");
   Payload p;
   handle_receive_delimiters(traffic, payload, payload_len, p);
-  debug_log("before callback", "exit delimiters");
-  debug_log("recv_cb ptr", (const void*)recv_cb[traffic]);
-
-  debug_log_payload("msg_text", p);
-
-
-  debug_log("before callback invoke", "calling");
   recv_cb[traffic](p);
-  debug_log("after callback invoke", "returned");
 }
 
 // -------------------------------------------------------------
@@ -304,8 +263,6 @@ static void transport_rx_tick(
   rx_len += end;
 
   if (!has_padding) return;
-
-  debug_log("transport_rx_tick message", rx_buf);
 
   handle_complete_message(rx_buf, rx_len);
   rx_len = 0;

@@ -121,8 +121,6 @@ void timepop_init(void) {
 
   attachInterruptVector(IRQ_PIT, pit0_isr);
   NVIC_ENABLE_IRQ(IRQ_PIT);
-
-  debug_log("timepop", "initialized");
 }
 
 // ================================================================
@@ -158,13 +156,11 @@ bool timepop_arm(
 
     interrupts();
 
-    debug_log("timepop", "arm slot");
     return true;
   }
 
   interrupts();
 
-  debug_log("timepop", "NO FREE SLOTS");
   return false;
 }
 

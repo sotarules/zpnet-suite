@@ -59,18 +59,30 @@ String Payload::to_json() const {
     out += "\":";
 
     switch (e.kind) {
-      case 'p':
-        // Primitive values are stored canonically (no quotes)
-        if (e.value == "true" || e.value == "false" ||
-            (e.value.length() > 0 &&
-             (isdigit(e.value[0]) || e.value[0] == '-' || e.value.indexOf('.') >= 0))) {
+
+      case 'p': {
+        // Emit raw ONLY for valid JSON literals:
+        //   • true / false
+        //   • numbers that fully parse
+        if (e.value == "true" || e.value == "false") {
           out += e.value;
         } else {
-          out += "\"";
-          out += escape(e.value.c_str());
-          out += "\"";
+          const char* s = e.value.c_str();
+          char* end = nullptr;
+          strtod(s, &end);
+
+          if (s[0] != '\0' && end && *end == '\0') {
+            // Entire string parsed as a number
+            out += e.value;
+          } else {
+            // Everything else is a string
+            out += "\"";
+            out += escape(s);
+            out += "\"";
+          }
         }
         break;
+      }
 
       case 'o':
       case 'a':
