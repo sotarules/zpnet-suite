@@ -82,15 +82,18 @@ static const int GNSS_PPS_PIN  = 33;
 static const int GNSS_VCLK_PIN = 14;
 
 // --------------------------------------------------------------
-// Event bus sizing
+// Event bus sizing (authoritative)
 // --------------------------------------------------------------
 //
 // These define the maximum durable telemetry backlog.
-// Overflow results in dropped events, counted explicitly.
+// Events are small, frequent, and cheap.
+// Large payloads belong in request/response, not events.
 //
-static const size_t EVT_MAX       = 128;
-static const size_t EVT_TYPE_MAX  = 32;
-static const size_t EVT_BODY_MAX  = 512;
+// Overflow results in dropped events (explicitly observable).
+//
+static constexpr size_t EVT_MAX       = 128;
+static constexpr size_t EVT_TYPE_MAX  = 32;
+static constexpr size_t EVT_BODY_MAX  = 512;
 
 // --------------------------------------------------------------
 // GNSS ingestion limits

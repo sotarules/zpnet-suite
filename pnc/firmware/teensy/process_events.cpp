@@ -16,6 +16,7 @@
 //
 // ============================================================================
 
+#include "config.h"
 #include "debug.h"
 #include "process_events.h"
 #include "process.h"
@@ -25,14 +26,6 @@
 #include "timepop.h"
 
 #include <Arduino.h>
-
-// --------------------------------------------------------------
-// Configuration
-// --------------------------------------------------------------
-
-#define EVT_MAX       64
-#define EVT_TYPE_MAX  32
-#define EVT_BODY_MAX  192   // serialized payload bound
 
 // --------------------------------------------------------------
 // Event storage

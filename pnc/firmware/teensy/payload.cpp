@@ -5,21 +5,93 @@
 #include <stdlib.h>
 #include <string.h>
 
+// =============================================================
+// Configuration
+// =============================================================
+
+static constexpr size_t PAYLOAD_JSON_MAX = 10 * 1024; // 10 KiB
+
+// =============================================================
+// Internal helpers (serialization only)
+// =============================================================
+
+namespace {
+
+struct JsonBuf {
+  char   buf[PAYLOAD_JSON_MAX];
+  size_t len;
+  bool   overflow;
+
+  JsonBuf() : len(0), overflow(false) {
+    buf[0] = '\0';
+  }
+
+  inline size_t remaining() const {
+    return PAYLOAD_JSON_MAX - len;
+  }
+
+  void append(const char* s) {
+    if (overflow || !s) return;
+
+    size_t n = strlen(s);
+    if (n + 1 > remaining()) {
+      overflow = true;
+      return;
+    }
+
+    memcpy(buf + len, s, n);
+    len += n;
+    buf[len] = '\0';
+  }
+
+  void append_char(char c) {
+    if (overflow) return;
+
+    if (remaining() < 2) {
+      overflow = true;
+      return;
+    }
+
+    buf[len++] = c;
+    buf[len] = '\0';
+  }
+
+  void append_escaped(const char* s) {
+    if (overflow || !s) return;
+
+    while (*s) {
+      char c = *s++;
+      switch (c) {
+        case '\"': append("\\\""); break;
+        case '\\': append("\\\\"); break;
+        case '\n': append("\\n");  break;
+        case '\r': append("\\r");  break;
+        case '\t': append("\\t");  break;
+        default:   append_char(c); break;
+      }
+      if (overflow) return;
+    }
+  }
+
+  void reset_to_error() {
+    const char* err = "{\"error\":\"payload_overflow\"}";
+    strncpy(buf, err, PAYLOAD_JSON_MAX - 1);
+    buf[PAYLOAD_JSON_MAX - 1] = '\0';
+    len = strlen(buf);
+    overflow = false; // terminal state
+  }
+};
+
+} // namespace
+
 /*
   ============================================================================
-  Payload — Single-State, Semantic Implementation
-  ----------------------------------------------------------------------------
 
-  Authoritative state:
-    • entries[]
-    • entry_count
+  Payload — Semantic State Holder
+  -------------------------------
+  entries[] is authoritative.
+  JSON is a bounded, heap-free derivative.
 
-  All JSON text is a pure derivative.
-  No builder buffers.
-  No call-order dependence.
-
-  PayloadArray is restored below for link completeness. It remains partially
-  builder-oriented by design and is NOT part of the semantic routing spine.
   ============================================================================
 */
 
@@ -33,7 +105,7 @@ Payload::Payload()
 
 void Payload::clear() {
   entry_count = 0;
-  raw = "";  // staging only, not authoritative
+  raw = ""; // staging only
 }
 
 bool Payload::empty() const {
@@ -41,44 +113,45 @@ bool Payload::empty() const {
 }
 
 // -------------------------------------------------------------
-// JSON serialization (pure derivative of entries[])
+// JSON serialization (allocator-stable, bounded)
 // -------------------------------------------------------------
 
 String Payload::to_json() const {
 
-  String out = "{";
+  JsonBuf jb;
+
+  jb.append_char('{');
 
   for (size_t i = 0; i < entry_count; i++) {
 
-    if (i) out += ",";
+    if (i) jb.append_char(',');
 
     const Entry& e = entries[i];
 
-    out += "\"";
-    out += e.key;
-    out += "\":";
+    jb.append_char('\"');
+    jb.append_escaped(e.key.c_str());
+    jb.append("\":");
+
+    if (jb.overflow) break;
 
     switch (e.kind) {
 
       case 'p': {
-        // Emit raw ONLY for valid JSON literals:
-        //   • true / false
-        //   • numbers that fully parse
-        if (e.value == "true" || e.value == "false") {
-          out += e.value;
+        const char* s = e.value.c_str();
+
+        // Raw literals: true / false / numbers
+        if (!strcmp(s, "true") || !strcmp(s, "false")) {
+          jb.append(s);
         } else {
-          const char* s = e.value.c_str();
           char* end = nullptr;
           strtod(s, &end);
 
           if (s[0] != '\0' && end && *end == '\0') {
-            // Entire string parsed as a number
-            out += e.value;
+            jb.append(s); // valid number
           } else {
-            // Everything else is a string
-            out += "\"";
-            out += escape(s);
-            out += "\"";
+            jb.append_char('\"');
+            jb.append_escaped(s);
+            jb.append_char('\"');
           }
         }
         break;
@@ -86,53 +159,35 @@ String Payload::to_json() const {
 
       case 'o':
       case 'a':
-        // Stored as raw JSON fragments
-        out += e.value;
+        // Pre-validated raw JSON fragments
+        jb.append(e.value.c_str());
         break;
 
       default:
-        out += "null";
+        jb.append("null");
         break;
     }
+
+    if (jb.overflow) break;
   }
 
-  out += "}";
-  return out;
-}
+  jb.append_char('}');
 
-// -------------------------------------------------------------
-// Escaping helper (pure function)
-// -------------------------------------------------------------
-
-String Payload::escape(const char* s) {
-  String out;
-  while (*s) {
-    char c = *s++;
-    switch (c) {
-      case '\"': out += "\\\""; break;
-      case '\\': out += "\\\\"; break;
-      case '\n': out += "\\n";  break;
-      case '\r': out += "\\r";  break;
-      case '\t': out += "\\t";  break;
-      default:   out += c;      break;
-    }
+  if (jb.overflow) {
+    jb.reset_to_error();
   }
-  return out;
+
+  // Single allocation at boundary only
+  return String(jb.buf);
 }
 
 // =============================================================
-// Semantic construction — populates entries[]
+// Semantic construction — unchanged
 // =============================================================
 
 void Payload::add(const char* key, const char* value) {
-
   if (entry_count >= MAX_ENTRIES) return;
-
-  entries[entry_count++] = {
-    String(key),
-    String(value ? value : ""),
-    'p'
-  };
+  entries[entry_count++] = { String(key), String(value ? value : ""), 'p' };
 }
 
 void Payload::add(const char* key, const String& value) {
@@ -140,40 +195,21 @@ void Payload::add(const char* key, const String& value) {
 }
 
 void Payload::add(const char* key, bool value) {
-
   if (entry_count >= MAX_ENTRIES) return;
-
-  entries[entry_count++] = {
-    String(key),
-    value ? "true" : "false",
-    'p'
-  };
+  entries[entry_count++] = { String(key), value ? "true" : "false", 'p' };
 }
 
 void Payload::add(const char* key, float value) {
-
   if (entry_count >= MAX_ENTRIES) return;
-
-  entries[entry_count++] = {
-    String(key),
-    String(value, 6),
-    'p'
-  };
+  entries[entry_count++] = { String(key), String(value, 6), 'p' };
 }
 
 void Payload::add(const char* key, double value) {
-
   if (entry_count >= MAX_ENTRIES) return;
-
-  entries[entry_count++] = {
-    String(key),
-    String(value, 6),
-    'p'
-  };
+  entries[entry_count++] = { String(key), String(value, 6), 'p' };
 }
 
 void Payload::add_fmt(const char* key, const char* fmt, ...) {
-
   if (entry_count >= MAX_ENTRIES) return;
 
   char tmp[96];
@@ -182,39 +218,21 @@ void Payload::add_fmt(const char* key, const char* fmt, ...) {
   vsnprintf(tmp, sizeof(tmp), fmt, args);
   va_end(args);
 
-  entries[entry_count++] = {
-    String(key),
-    String(tmp),
-    'p'
-  };
+  entries[entry_count++] = { String(key), String(tmp), 'p' };
 }
 
 void Payload::add_object(const char* key, const Payload& obj) {
-
   if (entry_count >= MAX_ENTRIES) return;
-
-  entries[entry_count++] = {
-    String(key),
-    obj.to_json(),
-    'o'
-  };
+  entries[entry_count++] = { String(key), obj.to_json(), 'o' };
 }
 
 void Payload::add_array(const char* key, const PayloadArray& arr) {
-
   if (entry_count >= MAX_ENTRIES) return;
-
-  entries[entry_count++] = {
-    String(key),
-    arr.to_json(),
-    'a'
-  };
+  entries[entry_count++] = { String(key), arr.to_json(), 'a' };
 }
 
 void Payload::add_raw_object(const char* key, const char* raw_json_object) {
-
   if (entry_count >= MAX_ENTRIES) return;
-
   entries[entry_count++] = {
     String(key),
     String(raw_json_object ? raw_json_object : "{}"),
