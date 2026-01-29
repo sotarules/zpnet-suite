@@ -233,6 +233,9 @@ uint64_t clock_ocxo_ns_now() {
 // --------------------------------------------------------------
 // Zeroing
 // --------------------------------------------------------------
+
+static uint64_t gnss_zero_ns = 0;
+
 void clock_zero_all() {
   dwt_cycles_64 = 0;
   dwt_cycles_last = DWT_CYCCNT;
@@ -242,4 +245,15 @@ void clock_zero_all() {
 
   gnss_dwt_baseline = DWT_CYCCNT;
   ocxo_dwt_baseline = DWT_CYCCNT;
+
+  // Record authoritative zero epoch
+  gnss_zero_ns = clock_gnss_ns_now();
+}
+
+// --------------------------------------------------------------
+// Zero-time accessor
+// --------------------------------------------------------------
+
+uint64_t clock_gnss_zero_ns(void) {
+  return gnss_zero_ns;
 }

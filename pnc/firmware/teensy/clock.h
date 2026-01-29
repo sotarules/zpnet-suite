@@ -129,3 +129,13 @@ uint64_t clock_ocxo_ns_now(void);
  */
 void clock_zero_all(void);
 
+// --------------------------------------------------------------
+// Zero-time introspection
+// --------------------------------------------------------------
+
+/**
+ * Return GNSS nanoseconds at last zeroing.
+ *
+ * Used to compute elapsed wall time since clocks were cleared.
+ */
+uint64_t clock_gnss_zero_ns(void);

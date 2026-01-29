@@ -8,41 +8,91 @@
 #include <Arduino.h>
 
 // ================================================================
+// Helpers
+// ================================================================
+
+static void format_hms(uint64_t seconds, char* out, size_t out_sz) {
+  uint64_t h = seconds / 3600;
+  uint64_t m = (seconds % 3600) / 60;
+  uint64_t s = seconds % 60;
+
+  snprintf(out, out_sz, "%02llu:%02llu:%02llu",
+           (unsigned long long)h,
+           (unsigned long long)m,
+           (unsigned long long)s);
+}
+
+// ================================================================
 // Commands
 // ================================================================
 
 // ------------------------------------------------------------
-// REPORT — dump raw ledgers + synthetic nanosecond clocks
+// REPORT — extended synthetic clock introspection
 // ------------------------------------------------------------
 static const Payload* cmd_report(const Payload& /*args*/) {
 
-  // Persistent payload storage (safe to return pointer)
   static Payload p;
   p.clear();
 
-  // Raw authoritative ledgers
-  const uint64_t dwt_cycles = clock_dwt_cycles_now();
-  const uint64_t gnss_10khz = clock_gnss_10khz_ticks();
-  const uint64_t ocxo_10khz = clock_ocxo_10khz_ticks();
-
-  // Synthetic nanosecond clocks
+  // ----------------------------------------------------------
+  // Raw authoritative clocks
+  // ----------------------------------------------------------
   const uint64_t dwt_ns  = clock_dwt_ns_now();
   const uint64_t gnss_ns = clock_gnss_ns_now();
   const uint64_t ocxo_ns = clock_ocxo_ns_now();
 
-  // ----------------------------------------------------------
-  // Raw ledgers
-  // ----------------------------------------------------------
-  p.add("dwt_cycles", dwt_cycles);
-  p.add("gnss_10khz_ticks", gnss_10khz);
-  p.add("ocxo_10khz_ticks", ocxo_10khz);
-
-  // ----------------------------------------------------------
-  // Synthetic nanosecond clocks
-  // ----------------------------------------------------------
   p.add("dwt_ns", dwt_ns);
   p.add("gnss_ns", gnss_ns);
   p.add("ocxo_ns", ocxo_ns);
+
+  // ----------------------------------------------------------
+  // Elapsed wall time since last zero (GNSS-anchored)
+  // ----------------------------------------------------------
+  uint64_t zero_ns    = clock_gnss_zero_ns();
+  uint64_t elapsed_ns = (gnss_ns >= zero_ns) ? (gnss_ns - zero_ns) : 0;
+  uint64_t elapsed_s  = elapsed_ns / 1000000000ULL;
+
+  char hms[16];
+  format_hms(elapsed_s, hms, sizeof(hms));
+
+  p.add("elapsed_hms", hms);
+  p.add("elapsed_seconds", elapsed_s);
+
+  // ----------------------------------------------------------
+  // Drift + tempo metrics (relative to GNSS)
+  // ----------------------------------------------------------
+  if (gnss_ns > 0) {
+
+    // Absolute drift (signed)
+    int64_t drift_dwt_ns  = (int64_t)dwt_ns  - (int64_t)gnss_ns;
+    int64_t drift_ocxo_ns = (int64_t)ocxo_ns - (int64_t)gnss_ns;
+
+    p.add("dwt_drift_ns",  drift_dwt_ns);
+    p.add("ocxo_drift_ns", drift_ocxo_ns);
+
+    // Tau (dimensionless)
+    double tau_dwt  = (double)dwt_ns  / (double)gnss_ns;
+    double tau_ocxo = (double)ocxo_ns / (double)gnss_ns;
+
+    p.add_fmt("tau_dwt",  "%.12f", tau_dwt);
+    p.add_fmt("tau_ocxo", "%.12f", tau_ocxo);
+
+    // Parts per billion (tempo offset)
+    double ppb_dwt  = ((double)drift_dwt_ns  / (double)gnss_ns) * 1e9;
+    double ppb_ocxo = ((double)drift_ocxo_ns / (double)gnss_ns) * 1e9;
+
+    p.add_fmt("dwt_ppb",  "%.6f", ppb_dwt);
+    p.add_fmt("ocxo_ppb", "%.6f", ppb_ocxo);
+
+  } else {
+    // GNSS not yet valid
+    p.add("dwt_drift_ns",  0);
+    p.add("ocxo_drift_ns", 0);
+    p.add("tau_dwt",       0.0);
+    p.add("tau_ocxo",      0.0);
+    p.add("dwt_ppb",       0.0);
+    p.add("ocxo_ppb",      0.0);
+  }
 
   return &p;
 }
@@ -58,7 +108,6 @@ static const Payload* cmd_clear(const Payload& /*args*/) {
   ev.add("action", "all_zeroed");
   enqueueEvent("CLOCKS_CLEAR", ev);
 
-  // Side-effect only, no payload
   return nullptr;
 }
 
