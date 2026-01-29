@@ -1,5 +1,6 @@
 #pragma once
 
+#include "payload.h"
 #include <Arduino.h>
 
 // --------------------------------------------------------------
@@ -32,3 +33,26 @@ float readVrefVolts();
 
 // Free heap memory (bytes)
 uint32_t freeHeapBytes();
+
+// --------------------------------------------------------------
+// Debug helpers
+// --------------------------------------------------------------
+//
+// Render a bounded byte buffer as printable text for diagnostics.
+// Non-printable bytes are passed through verbatim.
+// The buffer is always null-terminated locally.
+//
+// Intended for:
+//   • transport debugging
+//   • forensic inspection
+//   • temporary observability
+//
+// NOT intended for:
+//   • parsing
+//   • semantic interpretation
+// --------------------------------------------------------------
+
+void debug_log_payload(
+  const char* name,
+  const Payload& p
+);

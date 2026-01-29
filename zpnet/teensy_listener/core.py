@@ -31,7 +31,7 @@ from typing import Optional, TextIO
 
 from zpnet.shared.constants import TRAFFIC_REQUEST_RESPONSE, TRAFFIC_DEBUG
 from zpnet.shared.logger import setup_logging
-from zpnet.shared.transport import transport_send, transport_register_receive_callback
+from zpnet.shared.transport import transport_send, transport_register_receive_callback, transport_init
 
 # ---------------------------------------------------------------------
 # Configuration
@@ -71,11 +71,12 @@ def open_debug_log() -> None:
 # Debug receive callback
 # ---------------------------------------------------------------------
 
-def on_receive_debug(payload: Dict[str, Any]) -> None:
+def on_receive_debug(message: bytes) -> None:
     """
     Receive DEBUG traffic from Teensy.
     """
-    debug_log_fh.write(json.dumps(payload) + "\n")
+    text = message.decode("utf-8", errors="replace")
+    debug_log_fh.write(repr(message) + "\n")
 
 # ---------------------------------------------------------------------
 # REQUEST / RESPONSE receive callback
@@ -189,6 +190,7 @@ def run() -> None:
 
     setup_logging()
     open_debug_log()
+    transport_init()
 
     # -------------------------------------------------------------
     # Register receive callbacks (symmetric with Teensy)

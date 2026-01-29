@@ -1,5 +1,6 @@
 #include "util.h"
-
+#include "debug.h"
+#include "payload.h"
 #include <malloc.h>
 #include <string.h>
 
@@ -98,4 +99,14 @@ float readVrefVolts() {
 uint32_t freeHeapBytes() {
   struct mallinfo mi = mallinfo();
   return (uint32_t)mi.fordblks;
+}
+
+// --------------------------------------------------------------
+// Debug: bounded buffer → text
+// --------------------------------------------------------------
+void debug_log_payload(
+  const char* name,
+  const Payload& p
+) {
+  debug_log(name, p.to_json().c_str());
 }

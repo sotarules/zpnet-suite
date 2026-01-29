@@ -63,21 +63,7 @@ static size_t evt_count = 0;
 //
 
 void process_events_init(void) {
-
-  // Arm the EVENTBUS class so queued events can be drained
-  bool ok = timepop_arm(
-    TIMEPOP_CLASS_EVENTBUS,
-    true,           // recurring
-    nullptr,        // event bus tick handled internally
-    nullptr,
-    "eventbus"
-  );
-
-  if (!ok) {
-    debug_log("events", "FAILED to arm EVENTBUS");
-  } else {
-    debug_log("events", "EVENTBUS armed");
-  }
+  // No operation
 }
 
 // --------------------------------------------------------------

@@ -5,7 +5,7 @@
 // This file owns the entire byte ↔ meaning boundary.
 // All invariants are assumed to be correct by construction.
 //
-
+#include "util.h"
 #include "transport.h"
 
 #include "config.h"
@@ -141,13 +141,31 @@ void transport_send(
 ) {
   static uint8_t send_buf[TRANSPORT_MAX_MESSAGE];
   size_t send_len = 0;
-
+  debug_log("transport_send", "enter");
   handle_send_delimiters(traffic, payload, send_buf, send_len);
+  debug_log("transport_send", "after delimiters");
+  debug_log("transport_send.send_buf", send_buf, send_len);
+  debug_log("transport_send.send_len", send_len);
   fragment_and_send(traffic, send_buf, send_len);
+  debug_log("transport_send", "after fragment_and_send");
 }
 
 // -------------------------------------------------------------
 // PRIVATE: receive-side delimitation
+// -------------------------------------------------------------
+//
+// Expected formats:
+//
+// REQUEST_RESPONSE:
+//   <STX=n>{JSON}<ETX>
+//
+// All other traffic:
+//   {JSON}
+//
+// This function MUST:
+//   • Never read past buf[len]
+//   • Never assume framing is well-formed
+//   • Fail silently (caller owns observability)
 // -------------------------------------------------------------
 
 static void handle_receive_delimiters(
@@ -156,25 +174,73 @@ static void handle_receive_delimiters(
   size_t len,
   Payload& out
 ) {
-  if (traffic == TRAFFIC_REQUEST_RESPONSE) {
+  debug_log("delim", "enter");
+  out.clear();
 
-    // <STX=n>
-    size_t i = 5;
-    int json_len = 0;
+  debug_log("delim", "after clear");
 
-    while (buf[i] >= '0' && buf[i] <= '9') {
-      json_len = json_len * 10 + (buf[i] - '0');
-      i++;
-    }
-
-    size_t json_start = i + 1;
-    out.parseJSON(buf + json_start, (size_t)json_len);
+  if (traffic != TRAFFIC_REQUEST_RESPONSE) {
+    debug_log("delim", "non-RR traffic");
+    out.parseJSON(buf, len);
+    debug_log("delim", "non-RR parsed");
     return;
   }
 
-  // All other traffic
-  out.parseJSON(buf, len);
+  debug_log("delim", "RR traffic");
+
+  // ---- MINIMUM SAFE GUARD ----
+  if (len < 6) {
+    debug_log("delim", "len < 6");
+    return;
+  }
+
+  debug_log("delim", "len OK");
+
+  // ---- VERIFY PREFIX ----
+  if (buf[0] != '<' ||
+      buf[1] != 'S' ||
+      buf[2] != 'T' ||
+      buf[3] != 'X' ||
+      buf[4] != '=') {
+    debug_log("delim", "bad STX prefix");
+    return;
+  }
+
+  debug_log("delim", "STX prefix OK");
+
+  size_t i = 5;
+  size_t json_len = 0;
+
+  debug_log("delim", "before digit loop");
+
+  while (i < len && buf[i] >= '0' && buf[i] <= '9') {
+    json_len = (json_len * 10) + (buf[i] - '0');
+    i++;
+  }
+
+  debug_log("delim", "after digit loop");
+
+  if (i >= len || buf[i] != '>') {
+    debug_log("delim", "missing >");
+    return;
+  }
+
+  i++;  // skip '>'
+
+  debug_log("delim", "after >");
+
+  if (i + json_len > len) {
+    debug_log("delim", "json_len overflow");
+    return;
+  }
+
+  debug_log("delim", "before parseJSON");
+
+  out.parseJSON(buf + i, json_len);
+
+  debug_log("delim", "after parseJSON");
 }
+
 
 // -------------------------------------------------------------
 // RX semantic dispatch
@@ -185,6 +251,11 @@ static void handle_complete_message(
   size_t len
 ) {
   uint8_t traffic = msg[0];
+
+  char buf[8];
+  snprintf(buf, sizeof(buf), "0x%02X", traffic);
+  debug_log("traffic", buf);
+
   const uint8_t* payload = msg + 1;
   size_t payload_len = len - 1;
 
@@ -193,10 +264,18 @@ static void handle_complete_message(
     return;
   }
 
+  debug_log("before delimiters", "enter");
   Payload p;
   handle_receive_delimiters(traffic, payload, payload_len, p);
+  debug_log("before callback", "exit delimiters");
+  debug_log("recv_cb ptr", (const void*)recv_cb[traffic]);
 
+  debug_log_payload("msg_text", p);
+
+
+  debug_log("before callback invoke", "calling");
   recv_cb[traffic](p);
+  debug_log("after callback invoke", "returned");
 }
 
 // -------------------------------------------------------------
@@ -207,8 +286,11 @@ static void transport_rx_tick(
   timepop_ctx_t*,
   void*
 ) {
+
   uint8_t pkt[HID_PACKET_SIZE];
+
   int n = RawHID.recv(pkt, HID_RX_TIMEOUT_MS);
+
   if (n <= 0) return;
 
   size_t end = HID_PACKET_SIZE;
@@ -222,6 +304,8 @@ static void transport_rx_tick(
   rx_len += end;
 
   if (!has_padding) return;
+
+  debug_log("transport_rx_tick message", rx_buf);
 
   handle_complete_message(rx_buf, rx_len);
   rx_len = 0;

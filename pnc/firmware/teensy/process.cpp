@@ -1,5 +1,5 @@
 #include "process.h"
-
+#include "util.h"
 #include "transport.h"
 #include "debug.h"
 
@@ -109,24 +109,46 @@ const char* process_get_name(size_t idx) {
 // -----------------------------------------------------------------------------
 // Unified REQUEST / RESPONSE command processor
 // -----------------------------------------------------------------------------
+//
+// Semantics:
+//   • Accepts a fully parsed semantic request Payload
+//   • Routes by subsystem + command
+//   • Invokes the registered handler with optional args Payload
+//   • Emits a canonical response envelope via transport
+//
+// Notes:
+//   • request.getString() returns a pointer backed by a shared static buffer
+//     in the current Payload implementation, so we COPY into String immediately.
+//   • We validate subsystem existence BEFORE attempting to use p->vtable.
+// -----------------------------------------------------------------------------
 
 void process_command(const Payload& request) {
 
   Payload response;
 
+  debug_log("process_command", "command received");
+  debug_log_payload("process_command", request);
+
   // ---------------------------------------------------------
-  // Extract routing fields
+  // Extract routing fields (COPY IMMEDIATELY)
   // ---------------------------------------------------------
 
-  const char* process = request.getString("process");
-  const char* command = request.getString("command");
+  String subsystem = request.getString("subsystem");
+  String command   = request.getString("command");
+
+  debug_log("subsystem", subsystem.c_str());
+  debug_log("command", command.c_str());
+
+  // Optional forensic dump (remove when stable)
+  request.debug_dump("process_command request");
 
   // ---------------------------------------------------------
   // Resolve subsystem
   // ---------------------------------------------------------
 
-  process_entry_t* p = find_process(process);
+  process_entry_t* p = find_process(subsystem.c_str());
   if (!p) {
+    debug_log("process_command", "***SUBSYSTEM NOT FOUND***");
     response.add("success", false);
     response.add("message", "unknown subsystem");
     transport_send(TRAFFIC_REQUEST_RESPONSE, response);
@@ -137,15 +159,20 @@ void process_command(const Payload& request) {
   // Resolve command
   // ---------------------------------------------------------
 
+  debug_log("process_command", "resolving command");
+
   const process_command_entry_t* entry =
-      find_command(p->vtable, command);
+      find_command(p->vtable, command.c_str());
 
   if (!entry || !entry->handler) {
+    debug_log("process_command", "***COMMAND NOT FOUND***");
     response.add("success", false);
     response.add("message", "unknown command");
     transport_send(TRAFFIC_REQUEST_RESPONSE, response);
     return;
   }
+
+  debug_log("process_command", "executing command");
 
   // ---------------------------------------------------------
   // Extract args (structured, optional)
@@ -161,6 +188,12 @@ void process_command(const Payload& request) {
   // ---------------------------------------------------------
 
   const Payload* payload = entry->handler(args);
+  if (payload) {
+    String json = payload->to_json();
+    debug_log("process_command.payload", json.c_str());
+  } else {
+    debug_log("process_command.payload", "(null)");
+  }
 
   // ---------------------------------------------------------
   // Construct canonical success envelope

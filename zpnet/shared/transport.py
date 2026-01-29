@@ -32,9 +32,9 @@ import logging
 import os
 import threading
 import time
-from typing import Callable, Dict, Optional
+from typing import Callable, Dict, Optional, Any
 
-import constants
+from zpnet.shared import constants
 from zpnet.shared.constants import Payload
 from zpnet.shared.util import payload_to_json_bytes
 
@@ -56,11 +56,11 @@ logger = logging.getLogger(__name__)
 # Receive callback registry
 # ---------------------------------------------------------------------
 
-_transport_recv_cb: Dict[int, Callable[[Payload], None]] = {}
+_transport_recv_cb: Dict[int, Callable[[Any], None]] = {}
 
 def transport_register_receive_callback(
     traffic: int,
-    cb: Callable[[Payload], None]
+    cb: Callable[[Any], None]
 ) -> None:
     _transport_recv_cb[traffic] = cb
 
@@ -226,6 +226,7 @@ def reader_loop() -> None:
         while True:
             try:
                 pkt = os.read(hid_fd, HID_PACKET_SIZE)
+                logging.info("[transport] read pkt: %s", pkt)
             except OSError as e:
                 if e.errno in (5, 19):
                     logger.warning("[transport] hidraw vanished during read")
@@ -255,7 +256,7 @@ def reader_loop() -> None:
             if has_padding:
                 message = bytes(rx_buf)
                 rx_buf.clear()
-
+                logging.info( "[transport] block chunking finished %s traffic %s",    message, repr(traffic))
                 _dispatch_complete_message(traffic, message)
                 traffic = None
     except Exception:
@@ -268,10 +269,16 @@ def reader_loop() -> None:
 def _dispatch_complete_message(traffic: int, message: bytes) -> None:
 
     undelimited = _undelimit_on_receive(traffic, message)
+    logging.info("[transport] received undelimited: %s", undelimited)
     _snoop("→", undelimited)
 
-    payload = json.loads(undelimited.decode("utf-8"))
+    if traffic == constants.TRAFFIC_REQUEST_RESPONSE:
+        payload = json.loads(undelimited.decode("utf-8"))
+    else:
+        payload = undelimited
+
     cb = _transport_recv_cb[traffic]
+
     cb(payload)
 
 # ---------------------------------------------------------------------
@@ -282,9 +289,10 @@ def _snoop(direction: str, payload: bytes) -> None:
     with open(SERIAL_SNOOP_PATH, "a") as f:
         f.write(f"{time.time():.6f} {direction} {payload.decode('utf-8', errors='replace')}\n")
 
-def init_transport() -> None:
-
+def transport_init() -> None:
+    open_hid(constants.TEENSY_HIDRAW_PATH)
     try:
+
         threading.Thread(target=reader_loop, daemon=True, name="transport-reader").start()
 
     except Exception:

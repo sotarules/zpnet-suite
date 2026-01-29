@@ -5,39 +5,92 @@
 #include <stdlib.h>
 #include <string.h>
 
+/*
+  ============================================================================
+  Payload — Single-State, Semantic Implementation
+  ----------------------------------------------------------------------------
+
+  Authoritative state:
+    • entries[]
+    • entry_count
+
+  All JSON text is a pure derivative.
+  No builder buffers.
+  No call-order dependence.
+
+  PayloadArray is restored below for link completeness. It remains partially
+  builder-oriented by design and is NOT part of the semantic routing spine.
+  ============================================================================
+*/
+
 // =============================================================
 // Payload
 // =============================================================
 
 Payload::Payload()
-  : buf(""),
-    first(true),
-    raw(""),
-    entry_count(0) {}
+  : entry_count(0),
+    raw("") {}
 
 void Payload::clear() {
-  buf = "";
-  raw = "";
-  first = true;
   entry_count = 0;
+  raw = "";  // staging only, not authoritative
 }
 
 bool Payload::empty() const {
-  return buf.length() == 0 && raw.length() == 0;
+  return entry_count == 0;
 }
+
+// -------------------------------------------------------------
+// JSON serialization (pure derivative of entries[])
+// -------------------------------------------------------------
 
 String Payload::to_json() const {
-  if (raw.length() > 0) return raw;
-  return String("{") + buf + "}";
+
+  String out = "{";
+
+  for (size_t i = 0; i < entry_count; i++) {
+
+    if (i) out += ",";
+
+    const Entry& e = entries[i];
+
+    out += "\"";
+    out += e.key;
+    out += "\":";
+
+    switch (e.kind) {
+      case 'p':
+        // Primitive values are stored canonically (no quotes)
+        if (e.value == "true" || e.value == "false" ||
+            (e.value.length() > 0 &&
+             (isdigit(e.value[0]) || e.value[0] == '-' || e.value.indexOf('.') >= 0))) {
+          out += e.value;
+        } else {
+          out += "\"";
+          out += escape(e.value.c_str());
+          out += "\"";
+        }
+        break;
+
+      case 'o':
+      case 'a':
+        // Stored as raw JSON fragments
+        out += e.value;
+        break;
+
+      default:
+        out += "null";
+        break;
+    }
+  }
+
+  out += "}";
+  return out;
 }
 
-void Payload::append_key(const char* key) {
-  if (!first) buf += ",";
-  first = false;
-  buf += "\"";
-  buf += key;
-  buf += "\":";
-}
+// -------------------------------------------------------------
+// Escaping helper (pure function)
+// -------------------------------------------------------------
 
 String Payload::escape(const char* s) {
   String out;
@@ -55,15 +108,19 @@ String Payload::escape(const char* s) {
   return out;
 }
 
-// --------------------------------------------------
-// Emit primitives
-// --------------------------------------------------
+// =============================================================
+// Semantic construction — populates entries[]
+// =============================================================
 
 void Payload::add(const char* key, const char* value) {
-  append_key(key);
-  buf += "\"";
-  buf += escape(value ? value : "");
-  buf += "\"";
+
+  if (entry_count >= MAX_ENTRIES) return;
+
+  entries[entry_count++] = {
+    String(key),
+    String(value ? value : ""),
+    'p'
+  };
 }
 
 void Payload::add(const char* key, const String& value) {
@@ -71,22 +128,41 @@ void Payload::add(const char* key, const String& value) {
 }
 
 void Payload::add(const char* key, bool value) {
-  append_key(key);
-  buf += (value ? "true" : "false");
+
+  if (entry_count >= MAX_ENTRIES) return;
+
+  entries[entry_count++] = {
+    String(key),
+    value ? "true" : "false",
+    'p'
+  };
 }
 
 void Payload::add(const char* key, float value) {
-  append_key(key);
-  buf += String(value, 6);
+
+  if (entry_count >= MAX_ENTRIES) return;
+
+  entries[entry_count++] = {
+    String(key),
+    String(value, 6),
+    'p'
+  };
 }
 
 void Payload::add(const char* key, double value) {
-  append_key(key);
-  buf += String(value, 6);
+
+  if (entry_count >= MAX_ENTRIES) return;
+
+  entries[entry_count++] = {
+    String(key),
+    String(value, 6),
+    'p'
+  };
 }
 
 void Payload::add_fmt(const char* key, const char* fmt, ...) {
-  append_key(key);
+
+  if (entry_count >= MAX_ENTRIES) return;
 
   char tmp[96];
   va_list args;
@@ -94,65 +170,118 @@ void Payload::add_fmt(const char* key, const char* fmt, ...) {
   vsnprintf(tmp, sizeof(tmp), fmt, args);
   va_end(args);
 
-  buf += "\"";
-  buf += escape(tmp);
-  buf += "\"";
+  entries[entry_count++] = {
+    String(key),
+    String(tmp),
+    'p'
+  };
 }
 
-// --------------------------------------------------
-// Emit structured
-// --------------------------------------------------
-
 void Payload::add_object(const char* key, const Payload& obj) {
-  append_key(key);
-  buf += obj.to_json();
+
+  if (entry_count >= MAX_ENTRIES) return;
+
+  entries[entry_count++] = {
+    String(key),
+    obj.to_json(),
+    'o'
+  };
 }
 
 void Payload::add_array(const char* key, const PayloadArray& arr) {
-  append_key(key);
-  buf += arr.to_json();
+
+  if (entry_count >= MAX_ENTRIES) return;
+
+  entries[entry_count++] = {
+    String(key),
+    arr.to_json(),
+    'a'
+  };
 }
 
 void Payload::add_raw_object(const char* key, const char* raw_json_object) {
-  append_key(key);
-  buf += raw_json_object;
+
+  if (entry_count >= MAX_ENTRIES) return;
+
+  entries[entry_count++] = {
+    String(key),
+    String(raw_json_object ? raw_json_object : "{}"),
+    'o'
+  };
 }
 
-// --------------------------------------------------
-// Parse / access
-// --------------------------------------------------
+// =============================================================
+// Parsing — canonicalizes into entries[]
+// =============================================================
 
 bool Payload::parseJSON(const uint8_t* data, size_t len) {
-  raw = String((const char*)data).substring(0, len);
-  entry_count = 0;
 
-  int i = 1; // skip '{'
-  while (i < (int)len && entry_count < MAX_ENTRIES) {
-    while (i < (int)len && raw[i] != '"') i++;
-    if (i >= (int)len) break;
+  clear();
 
-    int k0 = ++i;
-    while (raw[i] != '"') i++;
-    String key = raw.substring(k0, i++);
-    while (raw[i] != ':') i++;
+  if (!data || len < 2 || data[0] != '{') {
+    return false;
+  }
+
+  size_t i = 1;
+
+  while (i < len && entry_count < MAX_ENTRIES) {
+
+    while (i < len && data[i] != '"') i++;
+    if (i >= len) break;
+
+    size_t key_start = ++i;
+    while (i < len && data[i] != '"') i++;
+    if (i >= len) break;
+
+    String key =
+      String((const char*)data + key_start).substring(0, i - key_start);
+
+    i++; // skip closing quote
+
+    while (i < len && data[i] != ':') i++;
+    if (i >= len) break;
     i++;
 
-    char kind = raw[i] == '{' ? 'o' :
-                raw[i] == '[' ? 'a' : 'p';
+    char kind =
+      data[i] == '{' ? 'o' :
+      data[i] == '[' ? 'a' :
+      'p';
 
-    int v0 = i;
-    int depth = 0;
-    do {
-      if (raw[i] == '{' || raw[i] == '[') depth++;
-      if (raw[i] == '}' || raw[i] == ']') depth--;
-      i++;
-    } while (depth > 0 && i < (int)len);
+    size_t value_start = i;
 
-    entries[entry_count++] = { key, raw.substring(v0, i), kind };
+    if (kind == 'p') {
+      while (i < len && data[i] != ',' && data[i] != '}') i++;
+    } else {
+      int depth = 0;
+      do {
+        if (data[i] == '{' || data[i] == '[') depth++;
+        if (data[i] == '}' || data[i] == ']') depth--;
+        i++;
+      } while (i < len && depth > 0);
+    }
+
+    String raw_value =
+      String((const char*)data + value_start).substring(0, i - value_start);
+
+    // Canonicalize quoted strings once
+    if (kind == 'p' &&
+        raw_value.length() >= 2 &&
+        raw_value[0] == '"' &&
+        raw_value[raw_value.length() - 1] == '"') {
+      raw_value = raw_value.substring(1, raw_value.length() - 1);
+    }
+
+    entries[entry_count++] = { key, raw_value, kind };
+
+    if (i < len && data[i] == ',') i++;
   }
 
   return true;
 }
+
+// =============================================================
+// Lookup / Accessors
+// =============================================================
 
 const Payload::Entry* Payload::find(const char* key) const {
   for (size_t i = 0; i < entry_count; i++) {
@@ -165,29 +294,19 @@ bool Payload::has(const char* key) const {
   return find(key) != nullptr;
 }
 
-// --------------------------------------------------
-// Primitive accessors
-// --------------------------------------------------
+// -------------------------------------------------------------
+// Primitive accessors — owned, stable, order-independent
+// -------------------------------------------------------------
 
 const char* Payload::getString(const char* key) const {
   const Entry* e = find(key);
   if (!e || e->kind != 'p') return nullptr;
-
-  static String tmp;
-  tmp = e->value;
-
-  if (tmp.length() >= 2 &&
-      tmp[0] == '"' &&
-      tmp[tmp.length() - 1] == '"') {
-    tmp = tmp.substring(1, tmp.length() - 1);
-  }
-
-  return tmp.c_str();
+  return e->value.c_str();
 }
 
-// --------------------------------------------------
-// Primitive accessors (strict) — tryGetX
-// --------------------------------------------------
+// =============================================================
+// Strict accessors
+// =============================================================
 
 bool Payload::tryGetBool(const char* key, bool& out) const {
   const char* s = getString(key);
@@ -200,11 +319,9 @@ bool Payload::tryGetBool(const char* key, bool& out) const {
 bool Payload::tryGetInt(const char* key, int32_t& out) const {
   const char* s = getString(key);
   if (!s) return false;
-
   char* end = nullptr;
   long v = strtol(s, &end, 10);
   if (!end || *end != '\0') return false;
-
   out = (int32_t)v;
   return true;
 }
@@ -212,23 +329,25 @@ bool Payload::tryGetInt(const char* key, int32_t& out) const {
 bool Payload::tryGetUInt(const char* key, uint32_t& out) const {
   const char* s = getString(key);
   if (!s) return false;
-
   char* end = nullptr;
   unsigned long v = strtoul(s, &end, 10);
   if (!end || *end != '\0') return false;
-
   out = (uint32_t)v;
   return true;
+}
+
+// Compatibility overload for existing callers
+uint32_t Payload::getUInt(const char* key, unsigned long default_value) const {
+  uint32_t v;
+  return tryGetUInt(key, v) ? v : (uint32_t)default_value;
 }
 
 bool Payload::tryGetFloat(const char* key, float& out) const {
   const char* s = getString(key);
   if (!s) return false;
-
   char* end = nullptr;
   float v = strtof(s, &end);
   if (!end || *end != '\0') return false;
-
   out = v;
   return true;
 }
@@ -236,53 +355,21 @@ bool Payload::tryGetFloat(const char* key, float& out) const {
 bool Payload::tryGetDouble(const char* key, double& out) const {
   const char* s = getString(key);
   if (!s) return false;
-
   char* end = nullptr;
   double v = strtod(s, &end);
   if (!end || *end != '\0') return false;
-
   out = v;
   return true;
 }
 
-// --------------------------------------------------
-// Primitive accessors (convenience) — getX
-// --------------------------------------------------
-
-bool Payload::getBool(const char* key, bool default_value) const {
-  bool v;
-  return tryGetBool(key, v) ? v : default_value;
-}
-
-int32_t Payload::getInt(const char* key, int32_t default_value) const {
-  int32_t v;
-  return tryGetInt(key, v) ? v : default_value;
-}
-
-uint32_t Payload::getUInt(const char* key, uint32_t default_value) const {
-  uint32_t v;
-  return tryGetUInt(key, v) ? v : default_value;
-}
-
-float Payload::getFloat(const char* key, float default_value) const {
-  float v;
-  return tryGetFloat(key, v) ? v : default_value;
-}
-
-double Payload::getDouble(const char* key, double default_value) const {
-  double v;
-  return tryGetDouble(key, v) ? v : default_value;
-}
-
-// --------------------------------------------------
+// =============================================================
 // Structured accessors
-// --------------------------------------------------
+// =============================================================
 
 Payload Payload::getPayload(const char* key) const {
   Payload p;
   const Entry* e = find(key);
   if (!e || e->kind != 'o') return p;
-
   p.parseJSON((const uint8_t*)e->value.c_str(), e->value.length());
   return p;
 }
@@ -291,13 +378,57 @@ PayloadArray Payload::getArray(const char* key) const {
   PayloadArray arr;
   const Entry* e = find(key);
   if (!e || e->kind != 'a') return arr;
-
   arr.parseJSON(e->value.c_str());
   return arr;
 }
 
 // =============================================================
-// PayloadArray
+// Diagnostics
+// =============================================================
+
+void Payload::debug_dump(const char* tag) const {
+
+  char line[128];
+
+  snprintf(
+    line,
+    sizeof(line),
+    "Payload dump (%s): %u entr%s",
+    tag ? tag : "",
+    (unsigned)entry_count,
+    entry_count == 1 ? "y" : "ies"
+  );
+  debug_log("payload", line);
+
+  for (size_t i = 0; i < entry_count; i++) {
+
+    const Entry& e = entries[i];
+
+    const char* kind =
+      e.kind == 'p' ? "primitive" :
+      e.kind == 'o' ? "object" :
+      e.kind == 'a' ? "array" :
+      "unknown";
+
+    debug_log("payload.key", e.key.c_str());
+    debug_log("payload.kind", kind);
+
+    const char* v = e.value.c_str();
+
+    char preview[96];
+    size_t n = strlen(v);
+    if (n > sizeof(preview) - 1) {
+      n = sizeof(preview) - 1;
+    }
+    memcpy(preview, v, n);
+    preview[n] = '\0';
+
+    debug_log("payload.value", preview);
+  }
+}
+
+// =============================================================
+// PayloadArray — restored for compatibility
 // =============================================================
 
 PayloadArray::PayloadArray()
@@ -312,10 +443,11 @@ void PayloadArray::clear() {
 }
 
 bool PayloadArray::empty() const {
-  return buf.length() == 0 && item_count == 0;
+  return item_count == 0 && buf.length() == 0;
 }
 
 String PayloadArray::to_json() const {
+
   if (item_count > 0) {
     String out = "[";
     for (size_t i = 0; i < item_count; i++) {
@@ -325,6 +457,7 @@ String PayloadArray::to_json() const {
     out += "]";
     return out;
   }
+
   return String("[") + buf + "]";
 }
 
@@ -335,15 +468,19 @@ void PayloadArray::add(const Payload& obj) {
 }
 
 bool PayloadArray::parseJSON(const char* json) {
+
   item_count = 0;
+  if (!json || json[0] != '[') return false;
 
   int i = 1; // skip '['
   while (json[i] && item_count < MAX_ITEMS) {
+
     while (json[i] && json[i] != '{') i++;
     if (!json[i]) break;
 
     int v0 = i;
     int depth = 0;
+
     do {
       if (json[i] == '{') depth++;
       if (json[i] == '}') depth--;
@@ -354,6 +491,7 @@ bool PayloadArray::parseJSON(const char* json) {
       (const uint8_t*)(json + v0),
       (size_t)(i - v0)
     );
+
     item_count++;
   }
 
