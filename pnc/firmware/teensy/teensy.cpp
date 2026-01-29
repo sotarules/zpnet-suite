@@ -94,15 +94,6 @@ static void fault_morse_usagefault() {
   }
 }
 
-[[noreturn]]
-static void fault_morse_unknown() {
-  pinMode(LED_BUILTIN, OUTPUT);
-  while (true) {
-    dot(); dot(); dash(); dash(); dot(); dot();   // ?
-    delay(REPEAT_GAP_MS);
-  }
-}
-
 // ============================================================================
 // ARM CORTEX-M FAULT HANDLERS (HARD-CODED SYMBOLS)
 // ============================================================================
