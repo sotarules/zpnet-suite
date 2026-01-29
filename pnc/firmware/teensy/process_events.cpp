@@ -23,13 +23,13 @@
 #include "transport.h"
 #include "util.h"
 #include "timepop.h"
-#include "payload.h"
 
 #include <Arduino.h>
 
 // --------------------------------------------------------------
 // Configuration
 // --------------------------------------------------------------
+
 #define EVT_MAX       64
 #define EVT_TYPE_MAX  32
 #define EVT_BODY_MAX  192   // serialized payload bound
@@ -86,7 +86,7 @@ void process_events_init(void) {
 //
 // Contract:
 //   • Payload is a complete JSON object
-//   • nullptr payload means "no payload"
+//   • Empty payload means "no payload"
 //   • Serialization happens here, once
 //
 
@@ -123,7 +123,10 @@ void enqueueEvent(const char* type, const Payload& payload) {
 //     ]
 //   }
 //
-static const Payload* cmd_get(const char*) {
+// Args are ignored (EVENTS.GET takes no arguments).
+//
+
+static const Payload* cmd_get(const Payload& /*args*/) {
 
   static Payload out;
   out.clear();

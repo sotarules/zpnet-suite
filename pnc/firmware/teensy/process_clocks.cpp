@@ -14,7 +14,7 @@
 // ------------------------------------------------------------
 // REPORT — dump raw ledgers + synthetic nanosecond clocks
 // ------------------------------------------------------------
-static const Payload* cmd_report(const char* /*args_json*/) {
+static const Payload* cmd_report(const Payload& /*args*/) {
 
   // Persistent payload storage (safe to return pointer)
   static Payload p;
@@ -50,7 +50,7 @@ static const Payload* cmd_report(const char* /*args_json*/) {
 // ------------------------------------------------------------
 // CLEAR — zero all synthetic clocks
 // ------------------------------------------------------------
-static const Payload* cmd_clear(const char* /*args_json*/) {
+static const Payload* cmd_clear(const Payload& /*args*/) {
 
   clock_zero_all();
 

@@ -9,6 +9,7 @@ Author: The Mule
 """
 import os
 from pathlib import Path
+from typing import Any, Dict
 
 # ---------------------------------------------------------------------
 # Versioning / Metadata
@@ -95,3 +96,15 @@ def http_endpoint(path: str) -> str:
     if not path.startswith("/"):
         path = "/" + path
     return f"http://{ZPNET_REMOTE_HOST}{path}"
+
+# ---------------------------------------------------------------------
+# HID traffic bytes
+# ---------------------------------------------------------------------
+TRAFFIC_DEBUG             = 0xD0
+TRAFFIC_REQUEST_RESPONSE  = 0xD1
+TRAFFIC_PUBLISH_SUBSCRIBE = 0xD2
+
+# ---------------------------------------------------------------------
+# Payload
+# ---------------------------------------------------------------------
+Payload = Dict[str, Any]

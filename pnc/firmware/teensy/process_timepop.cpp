@@ -232,7 +232,7 @@ uint32_t timepop_get_zero_hits(void) {
 // ------------------------------------------------------------
 // REPORT — active TimePop timer snapshot
 // ------------------------------------------------------------
-static const Payload* cmd_report(const char* /*args_json*/) {
+static const Payload* cmd_report(const Payload& /*args*/) {
 
   static Payload out;
   out.clear();

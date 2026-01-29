@@ -115,7 +115,7 @@ void system_enter_quiescence(void) {
 //   • No aggregation
 //   • No inference
 // ------------------------------------------------------------
-static const Payload* cmd_report(const char* /*args_json*/) {
+static const Payload* cmd_report(const Payload& /*args*/) {
 
   static Payload p;
   p.clear();
@@ -147,7 +147,7 @@ static const Payload* cmd_report(const char* /*args_json*/) {
 // ------------------------------------------------------------
 // ENTER_BOOTLOADER — terminal, irreversible
 // ------------------------------------------------------------
-static const Payload* cmd_enter_bootloader(const char* /*args_json*/) {
+static const Payload* cmd_enter_bootloader(const Payload& /*args*/) {
 
   // Schedule transition so command path can return cleanly
   timepop_arm(
@@ -170,7 +170,7 @@ static const Payload* cmd_enter_bootloader(const char* /*args_json*/) {
 // ------------------------------------------------------------
 // SHUTDOWN — terminal, irreversible
 // ------------------------------------------------------------
-static const Payload* cmd_shutdown(const char* /*args_json*/) {
+static const Payload* cmd_shutdown(const Payload& /*args*/) {
 
   {
     Payload ev;
@@ -185,14 +185,20 @@ static const Payload* cmd_shutdown(const char* /*args_json*/) {
 // ------------------------------------------------------------
 // PROCESS_LIST — registry introspection (diagnostic only)
 // ------------------------------------------------------------
-static const Payload* cmd_process_list(const char* /*args_json*/) {
+static const Payload* cmd_process_list(const Payload&) {
 
   static Payload p;
   p.clear();
 
-  // Controlled escape hatch: trusted JSON object
-  p.add("processes", process_list_json().c_str());
+  PayloadArray arr;
 
+  for (size_t i = 0; i < process_get_count(); i++) {
+    Payload entry;
+    entry.add("name", process_get_name(i));
+    arr.add(entry);
+  }
+
+  p.add_array("processes", arr);
   return &p;
 }
 
@@ -201,10 +207,10 @@ static const Payload* cmd_process_list(const char* /*args_json*/) {
 // ================================================================
 
 static const process_command_entry_t SYSTEM_COMMANDS[] = {
-  { "REPORT",           cmd_report          },
-  { "ENTER_BOOTLOADER", cmd_enter_bootloader},
-  { "SHUTDOWN",         cmd_shutdown        },
-  { "PROCESS_LIST",     cmd_process_list    },
+  { "REPORT",           cmd_report           },
+  { "ENTER_BOOTLOADER", cmd_enter_bootloader },
+  { "SHUTDOWN",         cmd_shutdown         },
+  { "PROCESS_LIST",     cmd_process_list     },
 };
 
 static const process_vtable_t SYSTEM_PROCESS = {

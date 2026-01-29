@@ -1,5 +1,8 @@
 #include <Arduino.h>
 #include <stddef.h>
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
 
 #include "process_tempest.h"
 #include "imxrt.h"
@@ -100,30 +103,20 @@ static void tempest_confirm_end_cb(void* context);
 // -------------------------------------------------------------
 // CONFIRM — arm a GNSS-aligned confirm window
 // -------------------------------------------------------------
-static const Payload* cmd_confirm(const char* args_json) {
+static const Payload* cmd_confirm(const Payload& args) {
 
   static Payload resp;
   resp.clear();
 
-  if (!args_json) {
-    resp.add("error", "missing args");
-    return &resp;
-  }
-
-  const char* p = strstr(args_json, "\"seconds\"");
-  if (!p) {
+  // ---------------------------------------------------------
+  // Argument validation
+  // ---------------------------------------------------------
+  if (!args.has("seconds")) {
     resp.add("error", "missing seconds");
     return &resp;
   }
 
-  p = strchr(p, ':');
-  if (!p) {
-    resp.add("error", "malformed seconds");
-    return &resp;
-  }
-  p++;
-
-  uint32_t seconds = (uint32_t)strtoul(p, nullptr, 10);
+  uint32_t seconds = args.getUInt("seconds");
   if (seconds == 0) {
     resp.add("error", "seconds must be > 0");
     return &resp;
@@ -140,10 +133,10 @@ static const Payload* cmd_confirm(const char* args_json) {
   // ---------------------------------------------------------
   // Arm confirm
   // ---------------------------------------------------------
-  confirm_active    = true;
-  confirm_seconds   = seconds;
-  confirm_start_ns  = 0;
-  confirm_end_ns    = 0;
+  confirm_active   = true;
+  confirm_seconds  = seconds;
+  confirm_start_ns = 0;
+  confirm_end_ns   = 0;
 
   // Schedule aligned start on next GNSS tick
   smartpop_start(
@@ -155,10 +148,11 @@ static const Payload* cmd_confirm(const char* args_json) {
   return &resp;
 }
 
+
 // -------------------------------------------------------------
 // BASELINE — discover standard error baseline
 // -------------------------------------------------------------
-static const Payload* cmd_baseline(const char* /*args_json*/) {
+static const Payload* cmd_baseline(const Payload& /*args*/) {
 
   uint32_t samples = 0;
   int32_t  min_e = 0, max_e = 0, med_e = 0, std_e = 0;
@@ -186,23 +180,20 @@ static const Payload* cmd_baseline(const char* /*args_json*/) {
 // -------------------------------------------------------------
 // TAU — run full tau profiling
 // -------------------------------------------------------------
-static const Payload* cmd_tau(const char* args) {
+static const Payload* cmd_tau(const Payload& args) {
 
   static Payload resp;
   resp.clear();
 
-  if (!args) {
-    resp.add("error", "missing args");
-    return &resp;
-  }
-
-  const char* p = strstr(args, "seconds=");
-  if (!p) {
+  // ---------------------------------------------------------
+  // Argument validation (Payload-first)
+  // ---------------------------------------------------------
+  if (!args.has("seconds")) {
     resp.add("error", "missing seconds");
     return &resp;
   }
 
-  uint32_t seconds = (uint32_t)strtoul(p + 8, nullptr, 10);
+  uint32_t seconds = args.getUInt("seconds");
   if (seconds == 0) {
     resp.add("error", "seconds must be > 0");
     return &resp;
@@ -211,6 +202,7 @@ static const Payload* cmd_tau(const char* args) {
   bool ok = tempest_tau_profile(seconds);
 
   resp.add("status", ok ? "ok" : "fail");
+  resp.add("seconds", seconds);
   return &resp;
 }
 

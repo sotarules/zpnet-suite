@@ -100,6 +100,7 @@ void process_laser_init(void) {
   // ------------------------------------------------------------
   // Forensic initialization snapshot
   // ------------------------------------------------------------
+
   uint8_t msb = i2c_read(REG_ID1_MSB);
   uint8_t lsb2 = i2c_read(REG_ID1_LSB);
 
@@ -124,7 +125,7 @@ void process_laser_init(void) {
 // ------------------------------------------------------------
 // INIT — explicit initialization wrapper
 // ------------------------------------------------------------
-static const Payload* cmd_init(const char* /*args_json*/) {
+static const Payload* cmd_init(const Payload& /*args*/) {
   process_laser_init();
   return nullptr;
 }
@@ -132,7 +133,7 @@ static const Payload* cmd_init(const char* /*args_json*/) {
 // ------------------------------------------------------------
 // REPORT — authoritative laser snapshot (stateless)
 // ------------------------------------------------------------
-static const Payload* cmd_report(const char* /*args_json*/) {
+static const Payload* cmd_report(const Payload& /*args*/) {
 
   static Payload p;
   p.clear();
@@ -155,7 +156,7 @@ static const Payload* cmd_report(const char* /*args_json*/) {
 // ------------------------------------------------------------
 // ON — permit emission
 // ------------------------------------------------------------
-static const Payload* cmd_on(const char* /*args_json*/) {
+static const Payload* cmd_on(const Payload& /*args*/) {
 
   Payload ev;
   ev.add("action", "allow_emission");
@@ -168,7 +169,7 @@ static const Payload* cmd_on(const char* /*args_json*/) {
 // ------------------------------------------------------------
 // OFF — inhibit emission
 // ------------------------------------------------------------
-static const Payload* cmd_off(const char* /*args_json*/) {
+static const Payload* cmd_off(const Payload& /*args*/) {
 
   Payload ev;
   ev.add("action", "inhibit_emission");

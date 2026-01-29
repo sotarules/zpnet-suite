@@ -138,7 +138,7 @@ void process_photodiode_init(void) {
 // ------------------------------------------------------------
 // INIT — explicit hardware initialization wrapper
 // ------------------------------------------------------------
-static const Payload* cmd_init(const char* /*args_json*/) {
+static const Payload* cmd_init(const Payload& /*args*/) {
   process_photodiode_init();
   return nullptr;
 }
@@ -146,7 +146,7 @@ static const Payload* cmd_init(const char* /*args_json*/) {
 // ------------------------------------------------------------
 // REPORT — return current photodiode state snapshot
 // ------------------------------------------------------------
-static const Payload* cmd_report(const char* /*args_json*/) {
+static const Payload* cmd_report(const Payload& /*args*/) {
 
   photodiode_snapshot();
 
@@ -174,7 +174,7 @@ static const Payload* cmd_report(const char* /*args_json*/) {
 // ------------------------------------------------------------
 // COUNT — episode counter snapshot
 // ------------------------------------------------------------
-static const Payload* cmd_count(const char* /*args_json*/) {
+static const Payload* cmd_count(const Payload& /*args*/) {
 
   uint32_t count;
   noInterrupts();
@@ -191,7 +191,7 @@ static const Payload* cmd_count(const char* /*args_json*/) {
 // ------------------------------------------------------------
 // CLEAR — reset episode counter
 // ------------------------------------------------------------
-static const Payload* cmd_clear(const char* /*args_json*/) {
+static const Payload* cmd_clear(const Payload& /*args*/) {
 
   noInterrupts();
   pd_episode_count   = 0;
@@ -227,6 +227,7 @@ static const process_vtable_t PHOTODIODE_PROCESS = {
 // ------------------------------------------------------------
 // Registration
 // ------------------------------------------------------------
+
 void process_photodiode_register(void) {
   process_register("PHOTODIODE", &PHOTODIODE_PROCESS);
 }

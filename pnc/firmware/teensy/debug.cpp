@@ -19,25 +19,53 @@ static constexpr size_t   HID_PAYLOAD_SZ  = HID_PACKET_SIZE - 1;
 // -----------------------------------------------------------------------------
 
 static inline void debug_send(const char* msg) {
+
+    // Debug is best-effort and non-semantic
     if (!msg) return;
 
     const size_t msg_len = strlen(msg);
+    if (msg_len == 0) return;
+
     size_t offset = 0;
+    bool first_packet = true;
 
     while (offset < msg_len) {
+
+        // One raw HID packet (always zero-padded)
         uint8_t pkt[HID_PACKET_SIZE];
         memset(pkt, 0, sizeof(pkt));
 
-        pkt[0] = DEBUG_MARKER;
+        size_t payload_offset = 0;
 
-        size_t chunk = msg_len - offset;
-        if (chunk > HID_PAYLOAD_SZ) {
-            chunk = HID_PAYLOAD_SZ;
+        // ---------------------------------------------------------
+        // First packet only: emit traffic marker
+        // ---------------------------------------------------------
+        if (first_packet) {
+            pkt[0] = DEBUG_MARKER;
+            payload_offset = 1;   // payload starts after traffic byte
+            first_packet = false;
         }
 
-        memcpy(&pkt[1], msg + offset, chunk);
+        // ---------------------------------------------------------
+        // Determine how much message data fits in this packet
+        // ---------------------------------------------------------
+        size_t available = HID_PACKET_SIZE - payload_offset;
+        size_t chunk = msg_len - offset;
 
+        if (chunk > available) {
+            chunk = available;
+        }
+
+        // ---------------------------------------------------------
+        // Copy raw debug bytes into packet
+        // ---------------------------------------------------------
+        memcpy(pkt + payload_offset, msg + offset, chunk);
+
+        // ---------------------------------------------------------
+        // Physical egress (no framing, no retries, no recovery)
+        // ---------------------------------------------------------
         RawHID.send(pkt, 0);
+
         offset += chunk;
     }
 }

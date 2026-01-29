@@ -1,45 +1,83 @@
 #pragma once
 
-#include <stddef.h>
 #include <stdint.h>
+#include <stddef.h>
 
-// =============================================================
-// ZPNet Transport (Unified, Final)
-// =============================================================
-//
-// This module owns ALL transport responsibilities:
-//
-//   • Runtime selection of physical transport (HID or Serial)
-//   • Framed TX (<STX=N> ... <ETX>)
-//   • Bytewise RX ingestion
-//   • RX scheduling via TimePop
-//   • Transport → command bridge (command_exec)
-//
-// There are NO other transport-related files in the system.
-//
-// =============================================================
+#include "payload.h"
 
 // -------------------------------------------------------------
-// Transport size limits (authoritative)
+// Transport limits (authoritative)
 // -------------------------------------------------------------
+//
+// Maximum size of a fully reassembled semantic message
+// (after delimitation, before fragmentation).
+//
+// This bounds:
+//   • RX reassembly buffer
+//   • TX staging buffer
+//
+// MUST be large enough to hold the largest expected Payload.
+// MUST be bounded to preserve memory integrity.
+//
 
-static constexpr size_t TRANSPORT_MAX_PAYLOAD = 512;
-static constexpr size_t TRANSPORT_MAX_MESSAGE = TRANSPORT_MAX_PAYLOAD + 32;
+static constexpr size_t TRANSPORT_MAX_MESSAGE = 1024;
+
+// -------------------------------------------------------------
+// Traffic types (authoritative)
+// -------------------------------------------------------------
+//
+// Traffic types are DATA, not API shape.
+//
+
+static constexpr uint8_t TRAFFIC_DEBUG             = 0xD0;
+static constexpr uint8_t TRAFFIC_REQUEST_RESPONSE  = 0xD1;
+static constexpr uint8_t TRAFFIC_PUBLISH_SUBSCRIBE = 0xD2;
+
+// -------------------------------------------------------------
+// Application receive callback
+// -------------------------------------------------------------
+//
+// Invoked exactly once per fully reassembled and
+// semantically decoded message.
+//
+
+using transport_receive_cb_t =
+  void (*)(const Payload&);
+
+// -------------------------------------------------------------
+// Receive registration
+// -------------------------------------------------------------
+//
+// Registers a callback for a specific traffic type.
+// Transport performs all decoding and routing.
+//
+
+void transport_register_receive_callback(
+  uint8_t traffic,
+  transport_receive_cb_t cb
+);
+
+// -------------------------------------------------------------
+// Send API (semantic entry point)
+// -------------------------------------------------------------
+//
+// Sends ONE complete semantic message.
+// The caller provides meaning as a Payload.
+// Transport performs delimitation, fragmentation,
+// and physical I/O.
+//
+
+void transport_send(
+  uint8_t traffic,
+  const Payload& payload
+);
 
 // -------------------------------------------------------------
 // Lifecycle
 // -------------------------------------------------------------
+//
+// Initializes transport and arms RX polling.
+// Safe to call once during setup().
+//
 
-// Initialize the transport subsystem.
-// Must be called once during setup().
 void transport_init(void);
-
-// -------------------------------------------------------------
-// TX egress (framed)
-// -------------------------------------------------------------
-
-// Send framed payload (payload only, no framing bytes)
-void transport_send_frame(const char* payload, size_t length);
-
-// Convenience overload
-void transport_send_frame(const char* payload);

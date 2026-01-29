@@ -7,7 +7,7 @@
 #include "payload.h"
 
 // --------------------------------------------------
-// Command Response Contract
+// Command Handler Contract (AUTHORITATIVE)
 // --------------------------------------------------
 //
 // Canonical contract:
@@ -16,12 +16,12 @@
 //   • Returning nullptr means:
 //       - side-effect only
 //       - no payload field is emitted in the response
+//   • Handlers receive structured arguments as Payload
 //   • Handlers MUST NOT perform serialization
 //
 
-typedef const Payload* (*process_command_fn)(
-  const char* args_json   // may be nullptr
-);
+using process_command_fn =
+  const Payload* (*)(const Payload& args);
 
 // --------------------------------------------------
 // Process Command Declaration
@@ -39,15 +39,11 @@ typedef struct {
 // A process is a named command surface.
 // It has no implicit lifecycle.
 //
-// If a process requires initialization or shutdown,
-// it must expose explicit commands to do so.
-//
 
 typedef struct {
   const char* name;
 
   // Optional introspection (legacy / transitional)
-  // NOTE: Prefer explicit REPORT commands instead.
   String (*query)(void);
 
   // Command surface
@@ -63,21 +59,29 @@ typedef struct {
 // Reset the process registry (called once at boot)
 void process_init(void);
 
+// Register a process command surface
 bool process_register(
   const char* process_id,
   const process_vtable_t* vtable
 );
 
+// --------------------------------------------------
+// Registry Introspection (READ-ONLY, DIAGNOSTIC)
+// --------------------------------------------------
+//
+// These functions expose the registered process set
+// for SYSTEM-level inspection only.
+//
 
-// Canonical command invocation
-// Builds full JSON response envelope internally.
-void process_command(
-  const char*    process_id,
-  const char*    cmd_name,
-  const char*    args_json,
-  String&        out_response
-);
+size_t      process_get_count(void);
+const char* process_get_name(size_t idx);
 
-// Registry introspection (presence only)
-String process_list_json(void);
+// --------------------------------------------------
+// Transport-facing command processor
+// --------------------------------------------------
+//
+// This function IS the semantic entry point for
+// TRAFFIC_REQUEST_RESPONSE.
+//
 
+void process_command(const Payload& request);

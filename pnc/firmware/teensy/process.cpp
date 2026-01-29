@@ -1,5 +1,7 @@
 #include "process.h"
-#include "payload.h"
+
+#include "transport.h"
+#include "debug.h"
 
 #include <Arduino.h>
 #include <string.h>
@@ -71,8 +73,7 @@ bool process_register(
     return false;
   }
 
-  // Enforce single-identity invariant:
-  // process_id must equal vtable->name
+  // Enforce single-identity invariant
   if (strcmp(process_id, vtable->name) != 0) {
     return false;
   }
@@ -93,74 +94,91 @@ bool process_register(
 }
 
 // -----------------------------------------------------------------------------
-// Command Dispatch (Canonical)
+// Registry Introspection (READ-ONLY)
 // -----------------------------------------------------------------------------
 
-void process_command(
-  const char* process_id,
-  const char* cmd_name,
-  const char* args_json,
-  String&     out_response
-) {
-  process_entry_t* p = find_process(process_id);
-  if (!p) {
-    out_response = "{\"success\":false,\"message\":\"unknown subsystem\"}";
-    return;
-  }
+size_t process_get_count(void) {
+  return registry_count;
+}
 
-  const process_command_entry_t* entry =
-      find_command(p->vtable, cmd_name);
-
-  if (!entry || !entry->handler) {
-    out_response = "{\"success\":false,\"message\":\"unknown command\"}";
-    return;
-  }
-
-  // Invoke handler
-  const Payload* payload = entry->handler(args_json);
-
-  // -----------------------------------------------------------------
-  // Build response envelope (single authority)
-  // -----------------------------------------------------------------
-
-  out_response = "{";
-  out_response += "\"success\":true,\"message\":\"OK\"";
-
-  if (payload) {
-    out_response += ",\"payload\":";
-    out_response += payload->to_json();
-  }
-
-  out_response += "}";
+const char* process_get_name(size_t idx) {
+  if (idx >= registry_count) return nullptr;
+  return registry[idx].id;
 }
 
 // -----------------------------------------------------------------------------
-// Registry Introspection
+// Unified REQUEST / RESPONSE command processor
 // -----------------------------------------------------------------------------
 
-String process_list_json(void) {
+void process_command(const Payload& request) {
 
-  // Build array manually (Payload is object-only by design)
-  String arr;
-  arr += "[";
+  Payload response;
 
-  for (size_t i = 0; i < registry_count; ++i) {
-    if (i) arr += ",";
+  // ---------------------------------------------------------
+  // Extract routing fields
+  // ---------------------------------------------------------
 
-    Payload p;
-    p.add("name", registry[i].id);
+  const char* process = request.getString("process");
+  const char* command = request.getString("command");
 
-    arr += p.to_json();
+  // ---------------------------------------------------------
+  // Resolve subsystem
+  // ---------------------------------------------------------
+
+  process_entry_t* p = find_process(process);
+  if (!p) {
+    response.add("success", false);
+    response.add("message", "unknown subsystem");
+    transport_send(TRAFFIC_REQUEST_RESPONSE, response);
+    return;
   }
 
-  arr += "]";
+  // ---------------------------------------------------------
+  // Resolve command
+  // ---------------------------------------------------------
 
-  // Root object
-  String out;
-  out += "{";
-  out += "\"processes\":";
-  out += arr;
-  out += "}";
+  const process_command_entry_t* entry =
+      find_command(p->vtable, command);
 
-  return out;
+  if (!entry || !entry->handler) {
+    response.add("success", false);
+    response.add("message", "unknown command");
+    transport_send(TRAFFIC_REQUEST_RESPONSE, response);
+    return;
+  }
+
+  // ---------------------------------------------------------
+  // Extract args (structured, optional)
+  // ---------------------------------------------------------
+
+  Payload args;
+  if (request.has("args")) {
+    args = request.getPayload("args");
+  }
+
+  // ---------------------------------------------------------
+  // Invoke command handler
+  // ---------------------------------------------------------
+
+  const Payload* payload = entry->handler(args);
+
+  // ---------------------------------------------------------
+  // Construct canonical success envelope
+  // ---------------------------------------------------------
+
+  response.add("success", true);
+  response.add("message", "OK");
+
+  if (payload) {
+    response.add_object("payload", *payload);
+  }
+
+  // ---------------------------------------------------------
+  // Emit response
+  // ---------------------------------------------------------
+
+  transport_send(
+    TRAFFIC_REQUEST_RESPONSE,
+    response
+  );
 }

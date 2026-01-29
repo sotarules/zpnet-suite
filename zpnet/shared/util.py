@@ -2,6 +2,9 @@ import json
 from datetime import datetime
 from typing import Any
 
+from zpnet.shared.constants import Payload
+
+
 def normalize_payload(payload: Any) -> dict:
     """
     Ensure payload is always a dict.
@@ -32,3 +35,6 @@ def normalize_ts(ts: Any) -> datetime:
     if isinstance(ts, str):
         return datetime.fromisoformat(ts.replace("Z", "+00:00"))
     raise TypeError(f"Unsupported ts type: {type(ts)}")
+
+def payload_to_json_bytes(payload: Payload) -> bytes:
+    return json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
