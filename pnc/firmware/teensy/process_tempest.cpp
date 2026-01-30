@@ -103,23 +103,22 @@ static void tempest_confirm_end_cb(void* context);
 // -------------------------------------------------------------
 // CONFIRM — arm a GNSS-aligned confirm window
 // -------------------------------------------------------------
-static const Payload* cmd_confirm(const Payload& args) {
+static Payload cmd_confirm(const Payload& args) {
 
-  static Payload resp;
-  resp.clear();
+  Payload resp;
 
   // ---------------------------------------------------------
   // Argument validation
   // ---------------------------------------------------------
   if (!args.has("seconds")) {
     resp.add("error", "missing seconds");
-    return &resp;
+    return resp;
   }
 
   uint32_t seconds = args.getUInt("seconds");
   if (seconds == 0) {
     resp.add("error", "seconds must be > 0");
-    return &resp;
+    return resp;
   }
 
   // ---------------------------------------------------------
@@ -127,7 +126,7 @@ static const Payload* cmd_confirm(const Payload& args) {
   // ---------------------------------------------------------
   if (confirm_active) {
     resp.add("error", "confirm already in progress");
-    return &resp;
+    return resp;
   }
 
   // ---------------------------------------------------------
@@ -145,14 +144,14 @@ static const Payload* cmd_confirm(const Payload& args) {
   );
 
   resp.add("status", "armed");
-  return &resp;
+  return resp;
 }
 
 
 // -------------------------------------------------------------
 // BASELINE — discover standard error baseline
 // -------------------------------------------------------------
-static const Payload* cmd_baseline(const Payload& /*args*/) {
+static Payload cmd_baseline(const Payload& /*args*/) {
 
   uint32_t samples = 0;
   int32_t  min_e = 0, max_e = 0, med_e = 0, std_e = 0;
@@ -167,43 +166,41 @@ static const Payload* cmd_baseline(const Payload& /*args*/) {
       &stddev
   );
 
-  static Payload p;
-  p.clear();
+  Payload p;
 
   p.add("samples", samples);
   p.add("baseline_error", std_e);
   p.add_fmt("stddev", "%.6f", stddev);
 
-  return &p;
+  return p;
 }
 
 // -------------------------------------------------------------
 // TAU — run full tau profiling
 // -------------------------------------------------------------
-static const Payload* cmd_tau(const Payload& args) {
+static Payload cmd_tau(const Payload& args) {
 
-  static Payload resp;
-  resp.clear();
+  Payload resp;
 
   // ---------------------------------------------------------
   // Argument validation (Payload-first)
   // ---------------------------------------------------------
   if (!args.has("seconds")) {
     resp.add("error", "missing seconds");
-    return &resp;
+    return resp;
   }
 
   uint32_t seconds = args.getUInt("seconds");
   if (seconds == 0) {
     resp.add("error", "seconds must be > 0");
-    return &resp;
+    return resp;
   }
 
   bool ok = tempest_tau_profile(seconds);
 
   resp.add("status", ok ? "ok" : "fail");
   resp.add("seconds", seconds);
-  return &resp;
+  return resp;
 }
 
 // =============================================================

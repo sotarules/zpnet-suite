@@ -138,20 +138,19 @@ void process_photodiode_init(void) {
 // ------------------------------------------------------------
 // INIT — explicit hardware initialization wrapper
 // ------------------------------------------------------------
-static const Payload* cmd_init(const Payload& /*args*/) {
+static Payload cmd_init(const Payload& /*args*/) {
   process_photodiode_init();
-  return nullptr;
+  return ok_payload();
 }
 
 // ------------------------------------------------------------
 // REPORT — return current photodiode state snapshot
 // ------------------------------------------------------------
-static const Payload* cmd_report(const Payload& /*args*/) {
+static Payload cmd_report(const Payload& /*args*/) {
 
   photodiode_snapshot();
 
-  static Payload p;
-  p.clear();
+  Payload p;
 
   p.add("edge_level", PD.edge_level);
   p.add("edge_pulse_count", PD.edge_pulse_count);
@@ -168,30 +167,29 @@ static const Payload* cmd_report(const Payload& /*args*/) {
 
   p.add("edge_level_changed", edge_level_changed);
 
-  return &p;
+  return p;
 }
 
 // ------------------------------------------------------------
 // COUNT — episode counter snapshot
 // ------------------------------------------------------------
-static const Payload* cmd_count(const Payload& /*args*/) {
+static Payload cmd_count(const Payload& /*args*/) {
 
   uint32_t count;
   noInterrupts();
   count = pd_episode_count;
   interrupts();
 
-  static Payload p;
-  p.clear();
+  Payload p;
   p.add("count", count);
 
-  return &p;
+  return p;
 }
 
 // ------------------------------------------------------------
 // CLEAR — reset episode counter
 // ------------------------------------------------------------
-static const Payload* cmd_clear(const Payload& /*args*/) {
+static Payload cmd_clear(const Payload& /*args*/) {
 
   noInterrupts();
   pd_episode_count   = 0;
@@ -203,7 +201,7 @@ static const Payload* cmd_clear(const Payload& /*args*/) {
   ev.add("action", "counter_reset");
   enqueueEvent("PHOTODIODE_CLEAR", ev);
 
-  return nullptr;
+  return ok_payload();
 }
 
 // ================================================================

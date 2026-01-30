@@ -108,15 +108,15 @@ def header_readout(prefix: str = "") -> list[str]:
 # Readout imports (SYSTEM-backed)
 # ---------------------------------------------------------------------
 from zpnet.dashboard.readout_blocks import (
-    clocks_status_readout,
+    # clocks_status_readout,
     gnss_report_readout,
-    laser_status_readout,
+    #laser_status_readout,
     environment_status_readout,
     sensor_scan_readout,
     battery_status_readout,
     power_status_readout,
     network_status_readout,
-    teensy_status_readout,
+    # teensy_status_readout,
     photodiode_status_readout,
     raspberry_pi_status_readout,
 )
@@ -124,15 +124,15 @@ from zpnet.dashboard.readout_blocks import (
 Readout = Generator[str, None, None]
 
 READOUTS: list[Callable[[], Readout]] = [
-    clocks_status_readout,
+    # clocks_status_readout,
     gnss_report_readout,
-    laser_status_readout,
+    #laser_status_readout,
     environment_status_readout,
     sensor_scan_readout,
     battery_status_readout,
     power_status_readout,
     network_status_readout,
-    teensy_status_readout,
+    # teensy_status_readout,
     photodiode_status_readout,
     raspberry_pi_status_readout,
 ]

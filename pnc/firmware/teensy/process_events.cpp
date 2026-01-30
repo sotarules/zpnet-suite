@@ -122,10 +122,9 @@ void emit_system_error(
 // Args are ignored (EVENTS.GET takes no arguments).
 //
 
-static const Payload* cmd_get(const Payload& /*args*/) {
+static Payload cmd_get(const Payload& /*args*/) {
 
-  static Payload out;
-  out.clear();
+  Payload out;
 
   PayloadArray events;
 
@@ -149,7 +148,7 @@ static const Payload* cmd_get(const Payload& /*args*/) {
 
   out.add_array("events", events);
 
-  return &out;
+  return out;
 }
 
 // --------------------------------------------------------------

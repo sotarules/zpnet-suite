@@ -29,10 +29,9 @@ static void format_hms(uint64_t seconds, char* out, size_t out_sz) {
 // ------------------------------------------------------------
 // REPORT — extended synthetic clock introspection
 // ------------------------------------------------------------
-static const Payload* cmd_report(const Payload& /*args*/) {
+static Payload cmd_report(const Payload& /*args*/) {
 
-  static Payload p;
-  p.clear();
+  Payload p;
 
   // ----------------------------------------------------------
   // Raw authoritative clocks
@@ -94,21 +93,25 @@ static const Payload* cmd_report(const Payload& /*args*/) {
     p.add("ocxo_ppb",      0.0);
   }
 
-  return &p;
+  return p;
 }
 
 // ------------------------------------------------------------
 // CLEAR — zero all synthetic clocks
 // ------------------------------------------------------------
-static const Payload* cmd_clear(const Payload& /*args*/) {
+static Payload cmd_clear(const Payload&) {
 
   clock_zero_all();
 
-  Payload ev;
-  ev.add("action", "all_zeroed");
-  enqueueEvent("CLOCKS_CLEAR", ev);
+  // Durable fact
+  {
+    Payload ev;
+    ev.add("action", "all_zeroed");
+    enqueueEvent("CLOCKS_CLEAR", ev);
+  }
 
-  return nullptr;
+  // Command acknowledgment
+  return ok_payload();
 }
 
 // ================================================================

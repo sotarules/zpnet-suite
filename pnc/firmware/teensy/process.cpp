@@ -53,6 +53,16 @@ find_command(const process_vtable_t* vtable, const char* name) {
   return nullptr;
 }
 
+// -------------------------------------------------------------
+// Canonical OK payload
+// -------------------------------------------------------------
+
+Payload ok_payload() {
+  Payload p;
+  p.add("status", "ok");
+  return p;
+}
+
 // -----------------------------------------------------------------------------
 // Canonical error payload helper
 // -----------------------------------------------------------------------------
@@ -188,10 +198,6 @@ void process_command(const Payload& request) {
     return;
   }
 
-  // ---------------------------------------------------------
-  // Extract args (structured, optional)
-  // ---------------------------------------------------------
-
   Payload args;
   if (request.has("args")) {
     args = request.getPayload("args");
@@ -201,7 +207,7 @@ void process_command(const Payload& request) {
   // Invoke command handler
   // ---------------------------------------------------------
 
-  const Payload* payload = entry->handler(args);
+  Payload payload = entry->handler(args);
 
   // ---------------------------------------------------------
   // Construct canonical success envelope
@@ -209,10 +215,7 @@ void process_command(const Payload& request) {
 
   response.add("success", true);
   response.add("message", "OK");
-
-  if (payload) {
-    response.add_object("payload", *payload);
-  }
+  response.add_object("payload", payload);
 
   // ---------------------------------------------------------
   // Send response

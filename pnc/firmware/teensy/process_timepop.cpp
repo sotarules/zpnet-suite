@@ -228,10 +228,9 @@ uint32_t timepop_get_zero_hits(void) {
 // ------------------------------------------------------------
 // REPORT — active TimePop timer snapshot
 // ------------------------------------------------------------
-static const Payload* cmd_report(const Payload& /*args*/) {
+static Payload cmd_report(const Payload& /*args*/) {
 
-  static Payload out;
-  out.clear();
+  Payload out;
 
   // Build timers array manually (Payload is object-only)
   String timers;
@@ -261,7 +260,7 @@ static const Payload* cmd_report(const Payload& /*args*/) {
   // Controlled escape hatch: inject trusted JSON array
   out.add("timers", timers.c_str());
 
-  return &out;
+  return out;
 }
 
 // ================================================================

@@ -21,7 +21,7 @@
 //
 
 using process_command_fn =
-  const Payload* (*)(const Payload& args);
+  Payload (*)(const Payload& args);
 
 // --------------------------------------------------
 // Process Command Declaration
@@ -85,3 +85,15 @@ const char* process_get_name(size_t idx);
 //
 
 void process_command(const Payload& request);
+
+// -------------------------------------------------------------
+// Canonical command acknowledgment payloads
+// -------------------------------------------------------------
+//
+// These helpers standardize command responses that carry
+// no semantic data beyond success/failure.
+//
+// They are intentionally small, fixed-shape, and cheap.
+// -------------------------------------------------------------
+
+Payload ok_payload();

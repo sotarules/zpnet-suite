@@ -115,10 +115,9 @@ void system_enter_quiescence(void) {
 //   • No aggregation
 //   • No inference
 // ------------------------------------------------------------
-static const Payload* cmd_report(const Payload& /*args*/) {
+static Payload cmd_report(const Payload& /*args*/) {
 
-  static Payload p;
-  p.clear();
+  Payload p;
 
   // Firmware identity
   p.add("fw_version", FW_VERSION);
@@ -141,13 +140,13 @@ static const Payload* cmd_report(const Payload& /*args*/) {
   p.add("cpu_sample_window_ms", cpu_usage_get_sample_window_ms());
   p.add("cpu_freq_mhz", cpu_usage_get_cpu_freq_mhz());
 
-  return &p;
+  return p;
 }
 
 // ------------------------------------------------------------
 // ENTER_BOOTLOADER — terminal, irreversible
 // ------------------------------------------------------------
-static const Payload* cmd_enter_bootloader(const Payload& /*args*/) {
+static Payload cmd_enter_bootloader(const Payload& /*args*/) {
 
   // Schedule transition so command path can return cleanly
   timepop_arm(
@@ -164,13 +163,13 @@ static const Payload* cmd_enter_bootloader(const Payload& /*args*/) {
     enqueueEvent("SYSTEM_ENTER_BOOTLOADER", ev);
   }
 
-  return nullptr;
+  return ok_payload();
 }
 
 // ------------------------------------------------------------
 // SHUTDOWN — terminal, irreversible
 // ------------------------------------------------------------
-static const Payload* cmd_shutdown(const Payload& /*args*/) {
+static Payload cmd_shutdown(const Payload& /*args*/) {
 
   {
     Payload ev;
@@ -179,16 +178,15 @@ static const Payload* cmd_shutdown(const Payload& /*args*/) {
   }
 
   system_request_shutdown();
-  return nullptr;
+  return ok_payload();
 }
 
 // ------------------------------------------------------------
 // PROCESS_LIST — registry introspection (diagnostic only)
 // ------------------------------------------------------------
-static const Payload* cmd_process_list(const Payload&) {
+static Payload cmd_process_list(const Payload&) {
 
-  static Payload p;
-  p.clear();
+  Payload p;
 
   PayloadArray arr;
 
@@ -199,34 +197,32 @@ static const Payload* cmd_process_list(const Payload&) {
   }
 
   p.add_array("processes", arr);
-  return &p;
+  return p;
 }
 
 // ------------------------------------------------------------
 // PROCESS_LIST — registry introspection (diagnostic only)
 // ------------------------------------------------------------
-static const Payload* cmd_debug(const Payload& args) {
+static Payload cmd_debug(const Payload& args) {
 
-  static Payload resp;
-  resp.clear();
+  Payload resp;
 
   if (!args.has("length")) {
     resp.add("error", "missing length");
-    return &resp;
+    return resp;
   }
 
   uint32_t length = args.getUInt("length");
   if (length == 0 || length > 1024) {
     resp.add("error", "length must be 1..1024");
-    return &resp;
+    return resp;
   }
 
   char buf[length];
   memset(buf, 'A', sizeof(buf));
   debug_send_framed(buf, sizeof(buf));
 
-  resp.add("status", "ok");
-  return &resp;
+  return ok_payload();
 }
 
 // ================================================================

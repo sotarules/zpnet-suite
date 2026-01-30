@@ -125,18 +125,17 @@ void process_laser_init(void) {
 // ------------------------------------------------------------
 // INIT — explicit initialization wrapper
 // ------------------------------------------------------------
-static const Payload* cmd_init(const Payload& /*args*/) {
+static Payload cmd_init(const Payload& /*args*/) {
   process_laser_init();
-  return nullptr;
+  return ok_payload();
 }
 
 // ------------------------------------------------------------
 // REPORT — authoritative laser snapshot (stateless)
 // ------------------------------------------------------------
-static const Payload* cmd_report(const Payload& /*args*/) {
+static Payload cmd_report(const Payload& /*args*/) {
 
-  static Payload p;
-  p.clear();
+  Payload p;
 
   uint8_t msb = i2c_read(REG_ID1_MSB);
   uint8_t lsb = i2c_read(REG_ID1_LSB);
@@ -150,33 +149,33 @@ static const Payload* cmd_report(const Payload& /*args*/) {
   p.add("pd_voltage", pd_voltage);
   p.add("laser_emitting", pd_voltage > LASER_EMIT_THRESHOLD_V);
 
-  return &p;
+  return p;
 }
 
 // ------------------------------------------------------------
 // ON — permit emission
 // ------------------------------------------------------------
-static const Payload* cmd_on(const Payload& /*args*/) {
+static Payload cmd_on(const Payload& /*args*/) {
 
   Payload ev;
   ev.add("action", "allow_emission");
   enqueueEvent("LASER_ON", ev);
 
   digitalWrite(LD_ON_PIN, HIGH);
-  return nullptr;
+  return ok_payload();
 }
 
 // ------------------------------------------------------------
 // OFF — inhibit emission
 // ------------------------------------------------------------
-static const Payload* cmd_off(const Payload& /*args*/) {
+static Payload cmd_off(const Payload& /*args*/) {
 
   Payload ev;
   ev.add("action", "inhibit_emission");
   enqueueEvent("LASER_OFF", ev);
 
   digitalWrite(LD_ON_PIN, LOW);
-  return nullptr;
+  return ok_payload();;
 }
 
 // ================================================================
