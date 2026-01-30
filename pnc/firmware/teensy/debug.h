@@ -39,6 +39,11 @@ void debug_log(const char* name, const void* ptr);
 
 void debug_log(const char* name, const uint8_t* buf, size_t len);
 
+// -----------------------------------------------------------------------------
+// Debugging the debugger,
+// -----------------------------------------------------------------------------
+void debug_send_framed(const char* payload, size_t payload_len);
+
 // Blink a visible debug pattern on LED_BUILTIN.
 // Pattern digits define blink duration units.
 // Example: "111511"

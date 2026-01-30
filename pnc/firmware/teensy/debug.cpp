@@ -7,68 +7,111 @@
 #include "timepop.h"
 
 // -----------------------------------------------------------------------------
-// RawHID Debug Transport (software-multiplexed)
+// RawHID Debug Transport (framed, proprietary, transport-independent)
 // -----------------------------------------------------------------------------
 
 static constexpr uint8_t  DEBUG_MARKER    = 0xD0;
 static constexpr size_t   HID_PACKET_SIZE = 64;
-static constexpr size_t   HID_PAYLOAD_SZ  = HID_PACKET_SIZE - 1;
+
+// Framing literals (authoritative)
+static const char STX_PREFIX[] = "<STX=";
+static const char ETX_SEQ[]    = "<ETX>";
 
 // -----------------------------------------------------------------------------
-// Internal helpers
+// Low-level framed send
 // -----------------------------------------------------------------------------
+//
+// Sends:
+//   [DEBUG_MARKER]<STX=n>payload<ETX>
+//
+// Fragmented into 64-byte RawHID packets.
+// Padding is physical only (zeros), never semantic.
+//
 
-static inline void debug_send(const char* msg) {
+// -----------------------------------------------------------------------------
+// Low-level framed send
+// -----------------------------------------------------------------------------
+//
+// Sends:
+//   [DEBUG_MARKER]<STX=n>payload<ETX>
+//
+// Fragmented into 64-byte RawHID packets.
+// Padding is physical only (zeros), never semantic.
+//
+void debug_send_framed(const char* payload, size_t payload_len) {
 
-    // Debug is best-effort and non-semantic
-    if (!msg) return;
+    if (!payload || payload_len == 0) return;
 
-    const size_t msg_len = strlen(msg);
-    if (msg_len == 0) return;
+    // ---------------------------------------------------------
+    // Build header: "<STX=n>"
+    // ---------------------------------------------------------
+    char header[12];   // exact fit for <STX=10240>
+    int header_len = snprintf(
+        header,
+        sizeof(header),
+        "%s%u>",
+        STX_PREFIX,
+        (unsigned)payload_len
+    );
 
-    size_t offset = 0;
-    bool first_packet = true;
+    // Hard invariants
+    if (header_len <= 0 || header_len >= (int)sizeof(header)) {
+        return;
+    }
 
-    while (offset < msg_len) {
+    // ---------------------------------------------------------
+    // Compute total stream length
+    //   [traffic][header][payload][ETX]
+    // ---------------------------------------------------------
+    const size_t etx_len = sizeof(ETX_SEQ) - 1;  // exclude '\0'
+    const size_t total   = 1 + (size_t)header_len + payload_len + etx_len;
 
-        // One raw HID packet (always zero-padded)
-        uint8_t pkt[HID_PACKET_SIZE];
-        memset(pkt, 0, sizeof(pkt));
+    // ---------------------------------------------------------
+    // Build contiguous stream (single pass)
+    // ---------------------------------------------------------
+    uint8_t stream[total];
+    size_t off = 0;
 
-        size_t payload_offset = 0;
+    // Traffic byte
+    stream[off++] = DEBUG_MARKER;
 
-        // ---------------------------------------------------------
-        // First packet only: emit traffic marker
-        // ---------------------------------------------------------
-        if (first_packet) {
-            pkt[0] = DEBUG_MARKER;
-            payload_offset = 1;   // payload starts after traffic byte
-            first_packet = false;
-        }
+    // Header
+    memcpy(stream + off, header, (size_t)header_len);
+    off += (size_t)header_len;
 
-        // ---------------------------------------------------------
-        // Determine how much message data fits in this packet
-        // ---------------------------------------------------------
-        size_t available = HID_PACKET_SIZE - payload_offset;
-        size_t chunk = msg_len - offset;
+    // Payload
+    memcpy(stream + off, payload, payload_len);
+    off += payload_len;
 
-        if (chunk > available) {
-            chunk = available;
-        }
+    // ETX
+    memcpy(stream + off, ETX_SEQ, etx_len);
+    off += etx_len;
 
-        // ---------------------------------------------------------
-        // Copy raw debug bytes into packet
-        // ---------------------------------------------------------
-        memcpy(pkt + payload_offset, msg + offset, chunk);
+    // Final sanity check (debug invariant)
+    if (off != total) return;
 
-        // ---------------------------------------------------------
-        // Physical egress (no framing, no retries, no recovery)
-        // ---------------------------------------------------------
+    // ---------------------------------------------------------
+    // Fragment into HID packets
+    // ---------------------------------------------------------
+    uint8_t pkt[HID_PACKET_SIZE];
+    size_t pos = 0;
+
+    while (pos < total) {
+
+        size_t n = total - pos;
+        if (n > HID_PACKET_SIZE) n = HID_PACKET_SIZE;
+
+        memset(pkt, 0, HID_PACKET_SIZE);
+        memcpy(pkt, stream + pos, n);
+
         RawHID.send(pkt, 0);
-
-        offset += chunk;
+        pos += n;
     }
 }
+
+// -----------------------------------------------------------------------------
+// Prefix helper
+// -----------------------------------------------------------------------------
 
 static void debug_prefix(char* out, size_t out_sz, const char* name) {
     if (!out || out_sz == 0) return;
@@ -125,22 +168,20 @@ void debug_beacon(void) {
 }
 
 // -----------------------------------------------------------------------------
-// Core string logger (newline-framed)
+// Core string logger
 // -----------------------------------------------------------------------------
 
 void debug_log(const char* name, const char* msg) {
+
+    if (!msg) return;
+
     char line[512];
     char prefix[64];
 
     debug_prefix(prefix, sizeof(prefix), name);
+    snprintf(line, sizeof(line), "%s%s", prefix, msg);
 
-    if (msg) {
-        snprintf(line, sizeof(line), "%s%s", prefix, msg);
-    } else {
-        snprintf(line, sizeof(line), "%s", prefix);
-    }
-
-    debug_send(line);
+    debug_send_framed(line, strlen(line));
 }
 
 void debug_log(const char* name, const String& value) {
@@ -148,7 +189,7 @@ void debug_log(const char* name, const String& value) {
 }
 
 // -----------------------------------------------------------------------------
-// Scalar overloads (newline-framed)
+// Scalar overloads
 // -----------------------------------------------------------------------------
 
 #define DEBUG_SCALAR_FMT(fmt, value)                    \
@@ -158,7 +199,7 @@ void debug_log(const char* name, const String& value) {
         debug_prefix(prefix, sizeof(prefix), name);     \
         snprintf(line, sizeof(line), "%s" fmt,          \
                  prefix, value);                        \
-        debug_send(line);                               \
+        debug_send_framed(line, strlen(line));          \
     } while (0)
 
 void debug_log(const char* name, int value)            { DEBUG_SCALAR_FMT("%d", value); }
@@ -173,10 +214,13 @@ void debug_log(const char* name, bool value)           { DEBUG_SCALAR_FMT("%s", 
 void debug_log(const char* name, const void* ptr)      { DEBUG_SCALAR_FMT("0x%lx", (unsigned long)ptr); }
 
 // -----------------------------------------------------------------------------
-// Buffer logger (newline-framed hex dump)
+// Buffer logger (hex dump)
 // -----------------------------------------------------------------------------
 
 void debug_log(const char* name, const uint8_t* buf, size_t len) {
+
+    if (!buf || len == 0) return;
+
     char line[512];
     char prefix[64];
 
@@ -203,7 +247,7 @@ void debug_log(const char* name, const uint8_t* buf, size_t len) {
         line[pos] = '\0';
     }
 
-    debug_send(line);
+    debug_send_framed(line, strlen(line));
 }
 
 // -----------------------------------------------------------------------------

@@ -202,6 +202,33 @@ static const Payload* cmd_process_list(const Payload&) {
   return &p;
 }
 
+// ------------------------------------------------------------
+// PROCESS_LIST — registry introspection (diagnostic only)
+// ------------------------------------------------------------
+static const Payload* cmd_debug(const Payload& args) {
+
+  static Payload resp;
+  resp.clear();
+
+  if (!args.has("length")) {
+    resp.add("error", "missing length");
+    return &resp;
+  }
+
+  uint32_t length = args.getUInt("length");
+  if (length == 0 || length > 1024) {
+    resp.add("error", "length must be 1..1024");
+    return &resp;
+  }
+
+  char buf[length];
+  memset(buf, 'A', sizeof(buf));
+  debug_send_framed(buf, sizeof(buf));
+
+  resp.add("status", "ok");
+  return &resp;
+}
+
 // ================================================================
 // Registration
 // ================================================================
@@ -211,6 +238,7 @@ static const process_command_entry_t SYSTEM_COMMANDS[] = {
   { "ENTER_BOOTLOADER", cmd_enter_bootloader },
   { "SHUTDOWN",         cmd_shutdown         },
   { "PROCESS_LIST",     cmd_process_list     },
+  { "DEBUG",            cmd_debug            }
 };
 
 static const process_vtable_t SYSTEM_PROCESS = {

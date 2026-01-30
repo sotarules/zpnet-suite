@@ -47,6 +47,7 @@ TRANSPORT_MAX_MESSAGE = 10 * 1024
 
 STX_PREFIX = b"<STX="
 ETX_SEQ    = b"<ETX>"
+ETX_LEN    = len(ETX_SEQ)
 
 SERIAL_SNOOP_PATH = "/home/mule/zpnet/logs/zpnet-teensy-listener-snoop.log"
 
@@ -237,6 +238,44 @@ def _fragment_and_send(data: bytes, traffic: int) -> None:
 # Reader loop (single RX authority)
 # ---------------------------------------------------------------------
 
+
+def _try_parse_expected_len(buf: bytearray) -> Optional[int]:
+    """
+    If buf begins with <STX=n>, return the total framed message length:
+      header_len + n + ETX_LEN
+    Otherwise return None.
+
+    Minimal contract:
+      • we require STX at offset 0 (no resync logic here by design)
+      • we parse decimal digits until '>'
+      • we do NOT rely on padding
+    """
+    if len(buf) < len(STX_PREFIX) + 2:   # need at least "<STX=0>"
+        return None
+
+    if not buf.startswith(STX_PREFIX):
+        return None
+
+    i = len(STX_PREFIX)
+    n = 0
+    saw_digit = False
+
+    # Parse decimal length
+    while i < len(buf) and 48 <= buf[i] <= 57:  # '0'..'9'
+        saw_digit = True
+        n = (n * 10) + (buf[i] - 48)
+        i += 1
+
+    if not saw_digit:
+        return None
+
+    if i >= len(buf) or buf[i] != ord('>'):
+        return None
+
+    header_len = i + 1  # include '>'
+    return header_len + n + ETX_LEN
+
+
 def reader_loop() -> None:
     """
     Blocking reader loop.
@@ -244,8 +283,7 @@ def reader_loop() -> None:
     Owns:
       • packet reassembly
       • traffic extraction
-      • padding-based message termination
-      • undelimiting
+      • delimiter-based message termination (length-authoritative)
       • dispatch
     """
     try:
@@ -256,6 +294,7 @@ def reader_loop() -> None:
 
         rx_buf = bytearray()
         traffic: Optional[int] = None
+        expected_total: Optional[int] = None
 
         while True:
             try:
@@ -280,23 +319,43 @@ def reader_loop() -> None:
                 traffic = pkt[0]
                 pkt = pkt[1:]
 
-            stripped = pkt.rstrip(b"\x00")
-            has_padding = len(stripped) < len(pkt)
+            # IMPORTANT: padding is now meaningless; keep bytes as-is
+            if pkt:
+                rx_buf.extend(pkt)
 
-            if stripped:
-                rx_buf.extend(stripped)
+            # If we don't yet know expected message length, try to parse <STX=n>
+            if expected_total is None:
+                expected_total = _try_parse_expected_len(rx_buf)
 
-            if has_padding:
-                message = bytes(rx_buf)
+            # If expected length is known, wait until we have enough bytes
+            if expected_total is not None and len(rx_buf) >= expected_total:
+
+                # Extract exactly one framed message
+                message = bytes(rx_buf[:expected_total])
+
+                # Current transport is message-atomic → discard everything else
                 rx_buf.clear()
 
-                # 🔴 FORENSIC TAP — log before any processing
-                _log_raw_hid(traffic, message)
+                # Reset for next message (next message begins immediately if present)
+                expected_total = None
+                traffic_done = traffic
 
-                _dispatch_complete_message(traffic, message)
+                # 🔴 FORENSIC TAP — log before any processing
+                _log_raw_hid(traffic_done, message)
+
+                _dispatch_complete_message(traffic_done, message)
+
+                # If there is already another message in the buffer,
+                # we keep the same traffic byte only if you guarantee
+                # one message per traffic extraction.
+                #
+                # Minimal assumption (matching current behavior):
+                # each logical message begins with a fresh traffic byte.
                 traffic = None
+
     except Exception:
         logging.exception("💥 [transport] reader_loop fatal exception")
+
 
 # ---------------------------------------------------------------------
 # Dispatch
