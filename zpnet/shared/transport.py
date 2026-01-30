@@ -61,7 +61,8 @@ RAW_HID_LOG_PATH = "/home/mule/zpnet/logs/zpnet-hid.log"
 
 def _log_raw_hid(
     traffic: int,
-    message: bytes
+    message: bytes,
+    direction: str
 ) -> None:
     """
     Log a fully reassembled HID message exactly once,
@@ -80,7 +81,7 @@ def _log_raw_hid(
 
         with open(RAW_HID_LOG_PATH, "a") as f:
             f.write(
-                f"{ts:.6f} traffic={traffic_hex} len={length}\n"
+                f"{direction} traffic={traffic_hex} len={length}\n"
                 f"ASCII: {ascii_preview}\n"
                 f"HEX:   {hex_preview}\n"
                 f"---\n"
@@ -213,6 +214,9 @@ def _fragment_and_send(data: bytes, traffic: int) -> None:
     data = bytes([traffic]) + data
     offset = 0
 
+    # 🔴 FORENSIC TAP — log before any processing
+    _log_raw_hid(traffic, data, "Pi -> Teensy")
+
     with hid_write_lock:
         while offset < len(data):
             chunk = data[offset:offset + HID_PACKET_SIZE]
@@ -341,7 +345,7 @@ def reader_loop() -> None:
                 traffic_done = traffic
 
                 # 🔴 FORENSIC TAP — log before any processing
-                _log_raw_hid(traffic_done, message)
+                _log_raw_hid(traffic_done, message, "Teensy -> Pi")
 
                 _dispatch_complete_message(traffic_done, message)
 

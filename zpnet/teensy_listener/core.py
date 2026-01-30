@@ -83,6 +83,7 @@ def open_debug_log() -> None:
 # ---------------------------------------------------------------------
 
 def on_receive_debug(message: bytes) -> None:
+    logging.info("🐞 [teensy debug] %s", message.decode("utf-8", errors="replace"))
     debug_log_fh.write(repr(message) + "\n")
 
 def on_receive_request_response(payload: Dict[str, Any]) -> None:
@@ -267,7 +268,9 @@ def run() -> None:
     open_debug_log()
     transport_init()
 
-    transport_register_receive_callback(TRAFFIC_DEBUG, on_receive_debug)
+    transport_register_receive_callback(
+        TRAFFIC_DEBUG,
+        on_receive_debug)
     transport_register_receive_callback(
         TRAFFIC_REQUEST_RESPONSE,
         on_receive_request_response,

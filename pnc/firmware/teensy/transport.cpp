@@ -315,33 +315,50 @@ static void transport_rx_tick(
   int n = RawHID.recv(pkt, HID_RX_TIMEOUT_MS);
   if (n <= 0) return;
 
-  // Trim zero padding
-  size_t end = HID_PACKET_SIZE;
-  while (end > 0 && pkt[end - 1] == 0x00) {
-    end--;
-  }
-
-  bool has_padding = (end < HID_PACKET_SIZE);
-
+  // ---------------------------------------------------------
   // Bounded reassembly (never overflow rx_buf)
-  if (rx_len + end > TRANSPORT_MAX_MESSAGE) {
+  // ---------------------------------------------------------
+  if (rx_len + (size_t)n > TRANSPORT_MAX_MESSAGE) {
     emit_system_error(
       "transport",
       "transport.cpp",
       "transport_rx_tick",
-      "rx_len + end > TRANSPORT_MAX_MESSAGE - incoming data ingored"
-    );    // Drop the current partial message to preserve memory integrity.
+      "rx_len + n > TRANSPORT_MAX_MESSAGE - incoming data ignored"
+    );
     rx_len = 0;
     return;
   }
 
-  memcpy(rx_buf + rx_len, pkt, end);
-  rx_len += end;
+  memcpy(rx_buf + rx_len, pkt, (size_t)n);
+  rx_len += (size_t)n;
 
-  if (!has_padding) return;
+  // ---------------------------------------------------------
+  // Explicit framing termination ONLY
+  // ---------------------------------------------------------
+  //
+  // We do NOT infer message completion from zero padding.
+  // A message is complete iff an explicit ETX is present.
+  //
+  // This applies only to framed traffic (REQUEST_RESPONSE).
+  //
 
-  handle_complete_message(rx_buf, rx_len);
-  rx_len = 0;
+  // Minimum length to contain "<ETX>"
+  if (rx_len < ETX_LEN) {
+    return;
+  }
+
+  // Scan tail for ETX sequence
+  for (size_t i = 0; i + ETX_LEN <= rx_len; i++) {
+    if (memcmp(rx_buf + i, ETX_SEQ, ETX_LEN) == 0) {
+
+      // Complete framed message found
+      handle_complete_message(rx_buf, rx_len);
+      rx_len = 0;
+      return;
+    }
+  }
+
+  // No complete frame yet — wait for more data
 }
 
 // -------------------------------------------------------------

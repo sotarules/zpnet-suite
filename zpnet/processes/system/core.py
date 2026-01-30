@@ -36,7 +36,7 @@ import requests
 from smbus2 import SMBus
 
 from zpnet.processes.processes import send_command, server_setup, publish
-from zpnet.shared.constants import ZPNET_REMOTE_HOST, ZPNET_TEST_PATH, HTTP_TIMEOUT, EXPECTED_TEST_STRING, Payload
+from zpnet.shared.constants import (ZPNET_REMOTE_HOST, ZPNET_TEST_PATH, HTTP_TIMEOUT, EXPECTED_TEST_STRING, Payload)
 from zpnet.shared.db import open_db
 from zpnet.shared.events import create_event
 from zpnet.shared.http import gzip_text
