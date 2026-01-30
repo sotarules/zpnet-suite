@@ -16,6 +16,7 @@ Process model:
 
 from __future__ import annotations
 
+import logging
 import math
 import os
 import socket
@@ -26,7 +27,8 @@ from typing import Dict, Optional, Set
 
 import serial
 
-from zpnet.processes.processes import serve_commands
+from zpnet.processes.processes import server_setup, publish
+from zpnet.shared.constants import Payload
 from zpnet.shared.logger import setup_logging
 
 GNSS_DEVICE = os.environ.get("ZPNET_GNSS_PORT", "/dev/zpnet-gnss-serial")
@@ -242,18 +244,54 @@ def cmd_report(_: Optional[dict]) -> Dict:
 
     return {"success": True, "message": "OK", "payload": p}
 
-COMMANDS = {"REPORT": cmd_report}
+def cmd_publish(_: Optional[dict]) -> Dict:
+    payload: Payload = {}
+    payload["alpha"] = "GNSS"
+    payload["beta"] = "News"
+    payload["gamma"] = "Feed"
+    logging.info("🚀 [gnss] publishing %s: ", payload)
+    publish("GNSS_NEWS_FEED", payload)
+    return {
+        "success": True,
+        "message": "OK",
+        "payload": { "implications": "Nothing short of astounding." },
+    }
+
+COMMANDS = {
+    "REPORT": cmd_report,
+    "PUBLISH": cmd_publish
+}
+
+# ---------------------------------------------------------------------
+# Publish surface
+# ---------------------------------------------------------------------
+
+def on_message(topic: str, payload: Payload) -> None:
+    logging.info("🚀 [gnss] received message on topic %s: %s", topic, payload)
+
+# ---------------------------------------------------------------------
+# Entrypoint
+# ---------------------------------------------------------------------
 
 def run() -> None:
-    import logging
     setup_logging()
 
     try:
-        threading.Thread(target=gnss_reader, daemon=True).start()
-        threading.Thread(target=stream_server, daemon=True).start()
-        serve_commands(
-            socket_path=CMD_SOCKET_PATH,
+        threading.Thread(
+            target=gnss_reader,
+            daemon=True,
+        ).start()
+
+        server_setup(
+            subsystem="GNSS",
             commands=COMMANDS,
+            subscriptions=["EVENTS_NEWS_FEED"],
+            on_message=on_message,
         )
+
     except Exception:
-        logging.exception("[gnss] unhandled exception in main thread")
+        import logging
+        logging.exception("💥 [gnss] unhandled exception in main thread")
+
+if __name__ == "__main__":
+    run()

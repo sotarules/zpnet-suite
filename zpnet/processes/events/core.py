@@ -18,15 +18,16 @@ Semantics:
 
 from __future__ import annotations
 
+import logging
 import threading
 import time
 from typing import Dict, Optional
 
-from zpnet.processes.processes import serve_commands, send_command
+from zpnet.processes.processes import send_command, server_setup, publish
+from zpnet.shared.constants import Payload
 from zpnet.shared.events import create_event
 from zpnet.shared.logger import setup_logging
 
-CMD_SOCKET_PATH = "/tmp/zpnet-events.sock"
 POLL_INTERVAL_S = 5
 
 
@@ -57,7 +58,7 @@ def despooler_loop() -> None:
 
     except Exception:
         logging.exception(
-            "[event_despooler] unhandled exception — despooler thread terminating"
+            "💥 [event_despooler] unhandled exception — despooler thread terminating"
         )
 
 
@@ -76,11 +77,42 @@ def cmd_report(_: Optional[dict]) -> Dict:
         },
     }
 
+def cmd_subscribe(_: Optional[dict]) -> Dict:
+    payload: Payload = {}
+    payload["subsystem"] = "EVENTS"
+    payload["topics"] = ["GNSS_NEWS_FEED"]
+    publish("SUBSCRIPTION", payload)
+    return {
+        "success": True,
+        "message": "OK",
+        "payload": { "status": "NOMINAL" }
+    }
+
+def cmd_publish(_: Optional[dict]) -> Dict:
+    payload: Payload = {}
+    payload["alpha"] = "Events"
+    payload["beta"] = "News"
+    payload["gamma"] = "Feed"
+    publish("EVENTS_NEWS_FEED", payload)
+    return {
+        "success": True,
+        "message": "OK",
+        "payload": { "status": "NOMINAL" }
+    }
+
 
 COMMANDS = {
     "REPORT": cmd_report,
+    "PUBLISH": cmd_publish,
+    "SUBSCRIBE": cmd_subscribe
 }
 
+# ---------------------------------------------------------------------
+# Publish surface
+# ---------------------------------------------------------------------
+
+def on_message(topic: str, payload: Payload) -> None:
+    logging.info("🚀 [event_despooler] received message on topic %s: %s", topic, payload)
 
 # ---------------------------------------------------------------------
 # Entrypoint
@@ -95,14 +127,16 @@ def run() -> None:
             daemon=True,
         ).start()
 
-        serve_commands(
-            socket_path=CMD_SOCKET_PATH,
+        server_setup(
+            subsystem="EVENTS",
             commands=COMMANDS,
+            subscriptions=["GNSS_NEWS_FEED"],
+            on_message=on_message,
         )
 
     except Exception:
         import logging
-        logging.exception("[event_despooler] unhandled exception in main thread")
+        logging.exception("💥 [event_despooler] unhandled exception in main thread")
 
 
 if __name__ == "__main__":

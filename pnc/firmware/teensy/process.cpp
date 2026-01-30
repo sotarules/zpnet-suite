@@ -54,6 +54,23 @@ find_command(const process_vtable_t* vtable, const char* name) {
 }
 
 // -----------------------------------------------------------------------------
+// Canonical error payload helper
+// -----------------------------------------------------------------------------
+
+Payload make_error_payload(const char* error_msg) {
+  Payload p;
+
+  // Defensive: never emit null or empty error msg
+  if (error_msg && *error_msg) {
+    p.add("error", error_msg);
+  } else {
+    p.add("error", "unknown error");
+  }
+
+  return p;
+}
+
+// -----------------------------------------------------------------------------
 // Registry Initialization
 // -----------------------------------------------------------------------------
 
@@ -148,7 +165,9 @@ void process_command(const Payload& request) {
   process_entry_t* p = find_process(subsystem.c_str());
   if (!p) {
     response.add("success", false);
-    response.add("message", "unknown subsystem");
+    response.add("message", "BAD");
+    Payload err = make_error_payload("unknown subsystem");
+    response.add_object("payload", err);
     transport_send(TRAFFIC_REQUEST_RESPONSE, response);
     return;
   }
@@ -162,7 +181,9 @@ void process_command(const Payload& request) {
 
   if (!entry || !entry->handler) {
     response.add("success", false);
-    response.add("message", "unknown command");
+    response.add("message", "BAD");
+    Payload err = make_error_payload("unknown command");
+    response.add_object("payload", err);
     transport_send(TRAFFIC_REQUEST_RESPONSE, response);
     return;
   }

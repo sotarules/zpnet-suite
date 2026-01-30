@@ -35,8 +35,8 @@ import psutil
 import requests
 from smbus2 import SMBus
 
-from zpnet.processes.processes import send_command, serve_commands
-from zpnet.shared.constants import ZPNET_REMOTE_HOST, ZPNET_TEST_PATH, HTTP_TIMEOUT, EXPECTED_TEST_STRING
+from zpnet.processes.processes import send_command, server_setup, publish
+from zpnet.shared.constants import ZPNET_REMOTE_HOST, ZPNET_TEST_PATH, HTTP_TIMEOUT, EXPECTED_TEST_STRING, Payload
 from zpnet.shared.db import open_db
 from zpnet.shared.events import create_event
 from zpnet.shared.http import gzip_text
@@ -47,7 +47,6 @@ from zpnet.shared.util import normalize_payload, normalize_ts
 # Configuration
 # ------------------------------------------------------------------
 
-CMD_SOCKET_PATH = "/tmp/zpnet-system.sock"
 POLL_INTERVAL_SEC = 30
 
 # ------------------------------------------------------------------
@@ -904,10 +903,27 @@ def system_poller() -> None:
     except Exception:
         logging.exception("[system_poller] unhandled exception - poller thread terminating")
 
+# ---------------------------------------------------------------------
+# Publish surface
+# ---------------------------------------------------------------------
+
+def on_message(topic: str, payload: Payload) -> None:
+    logging.info("🚀 [system] received message on topic %s: %s", topic, payload)
 
 # ------------------------------------------------------------------
-# REPORT command
+# Command handlers
 # ------------------------------------------------------------------
+def cmd_publish(_: Optional[dict]) -> Dict:
+    payload: Payload = {}
+    payload["alpha"] = "System"
+    payload["beta"] = "News"
+    payload["gamma"] = "Feed"
+    publish("SYSTEM_NEWS_FEED", payload)
+    return {
+        "success": True,
+        "message": "OK",
+        "payload": { "status": "NOMINAL" },
+    }
 
 def cmd_report(_: Optional[dict]) -> Dict:
     """Return the most recent SYSTEM snapshot."""
@@ -919,25 +935,33 @@ def cmd_report(_: Optional[dict]) -> Dict:
     }
 
 COMMANDS = {
-    "REPORT": cmd_report
+    "REPORT": cmd_report,
+    "PUBLISH": cmd_publish
 }
 
-# ------------------------------------------------------------------
+# ---------------------------------------------------------------------
 # Entrypoint
-# ------------------------------------------------------------------
+# ---------------------------------------------------------------------
 
 def run() -> None:
     setup_logging()
 
     try:
-        threading.Thread(target=system_poller, daemon=True).start()
-        serve_commands(
-            socket_path=CMD_SOCKET_PATH,
-            commands=COMMANDS,
-        )
-    except Exception:
-        logging.exception("[system] unhandled exception in main thread")
+        threading.Thread(
+            target=system_poller,
+            daemon=True,
+        ).start()
 
+        server_setup(
+            subsystem="SYSTEM",
+            commands=COMMANDS,
+            subscriptions=["GNSS_NEWS_FEED"],
+            on_message=on_message,
+        )
+
+    except Exception:
+        import logging
+        logging.exception("💥 [system] unhandled exception in main thread")
 
 if __name__ == "__main__":
     run()

@@ -1,43 +1,57 @@
 """
-ZPNet Unified Command Router (Pi-Side)
+ZPNet Process Runtime (Pi-Side)
 
-Single canonical send_command() for all machines.
+Provides a unified, declarative runtime for Pi-side processes.
+
+A process declares:
+  • its subsystem name
+  • the commands it serves
+  • the topics it subscribes to
+  • a single pub/sub callback
+
+All transport, sockets, threads, and routing are owned here.
 
 Semantics:
-  • One request → one response
-  • Message-based, not stream-based
-  • No internal recovery
-  • All failures are programmer-visible
+  • Commands are synchronous (request → response)
+  • Pub/Sub is asynchronous, best-effort
+  • No polling
+  • No retries
+  • No lifecycle obsession
 
 Author: The Mule + GPT
 """
+
+from __future__ import annotations
 
 import json
 import logging
 import os
 import socket
+import threading
 import time
-from typing import Any, Dict, Callable, Optional
+from typing import Any, Dict, Callable, Optional, Iterable
 
-# ---------------------------------------------------------------------
-# Socket Configuration (single source of truth)
-# ---------------------------------------------------------------------
+from zpnet.shared.constants import Payload
 
-PI_SUBSYSTEM_SOCKETS: Dict[str, str] = {
-    "SYSTEM":     "/tmp/zpnet-system.sock",
-    "GNSS":       "/tmp/zpnet-gnss.sock",
-    "EVENTS":     "/tmp/zpnet-events.sock",
-    "LASER":      "/tmp/zpnet-laser.sock",
-    "PHOTODIODE": "/tmp/zpnet-photodiode.sock",
-    "TEMPEST":    "/tmp/zpnet-tempest.sock",
-    "LANTERN":    "/tmp/zpnet-lantern.sock",
-}
+# =============================================================================
+# Socket naming
+# =============================================================================
 
-TEENSY_RPC_SOCKET = "/tmp/zpnet_teensy_rt.sock"
+SOCKET_DIR = "/tmp"
 
-# ---------------------------------------------------------------------
-# Public API — canonical RPC client
-# ---------------------------------------------------------------------
+def command_socket_path(subsystem: str) -> str:
+    return f"{SOCKET_DIR}/zpnet-{subsystem.lower()}-command.sock"
+
+def pubsub_socket_path(subsystem: str) -> str:
+    return f"{SOCKET_DIR}/zpnet-{subsystem.lower()}-pubsub.sock"
+
+
+TEENSY_REQUEST_RESPONSE_SOCKET = "/tmp/zpnet_teensy_rt.sock"
+TEENSY_PUBLISH_SUBSCRIBE_SOCKET = "/tmp/zpnet_teensy_ps.sock"
+
+# =============================================================================
+# Canonical RPC client (UNCHANGED)
+# =============================================================================
 
 def send_command(
     *,
@@ -58,9 +72,9 @@ def send_command(
     """
 
     if machine == "PI":
-        sock_path = PI_SUBSYSTEM_SOCKETS[subsystem]
+        sock_path = command_socket_path(subsystem)
     else:
-        sock_path = TEENSY_RPC_SOCKET
+        sock_path = TEENSY_REQUEST_RESPONSE_SOCKET
 
     req: Dict[str, Any] = {
         "machine": machine,
@@ -87,11 +101,8 @@ def send_command(
                 sock.shutdown(socket.SHUT_WR)
 
                 resp_raw = sock.recv(65536)
-
                 if not resp_raw:
-                    raise RuntimeError(
-                        "[send_command] empty response (device reset or transport not ready)"
-                    )
+                    raise RuntimeError("empty response")
 
                 return json.loads(resp_raw.decode("utf-8"))
 
@@ -102,85 +113,198 @@ def send_command(
             RuntimeError,
         ) as e:
             last_exc = e
-
             if attempt >= retries:
                 break
-
             time.sleep(retry_delay_s)
 
-    # -----------------------------------------------------------------
-    # Final failure — propagate loudly
-    # -----------------------------------------------------------------
     raise RuntimeError(
         f"[send_command] failed after {retries} attempts "
         f"({machine} {subsystem} {command})"
     ) from last_exc
 
 
-# ---------------------------------------------------------------------
-# Command server (Pi-side process endpoint)
-# ---------------------------------------------------------------------
+# =============================================================================
+# Public Pub/Sub API — publishing
+# =============================================================================
 
-def serve_commands(
-    *,
-    socket_path: str,
-    commands: Dict[str, Callable[[Optional[dict]], dict]],
+def publish(
+    topic: str,
+    payload: Payload,
 ) -> None:
     """
-    Serve blocking command requests forever.
+    Publish a message under a topic.
 
     Semantics:
-      • Exactly one server owns the socket
-      • One connection = one request
-      • One handler invocation
-      • One response
-      • Stale socket files are removed
-      • Live servers are never preempted
+      • Fire-and-forget
+      • Best-effort
+      • No retries
+      • No return value
+      • Silence on failure
     """
 
-    logging.info("[serve_commands] binding socket: %s", socket_path)
-    logging.info(
-        "[serve_commands] commands: %s",
-        sorted(commands.keys())
-    )
+    msg = {
+        "topic": topic,
+        "payload": payload,
+    }
 
-    # ------------------------------------------------------------
-    # Socket ownership check (unowned boundary)
-    # ------------------------------------------------------------
-    if os.path.exists(socket_path):
-        # Is someone already listening?
+    raw = json.dumps(
+        msg,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
+
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+            sock.connect(TEENSY_PUBLISH_SUBSCRIBE_SOCKET)
+            sock.sendall(raw)
+            sock.shutdown(socket.SHUT_WR)
+    except Exception:
+        # Publishing failures are intentionally silent
+        return
+
+# =============================================================================
+# Internal helpers
+# =============================================================================
+
+def _bind_unix_socket(path: str) -> socket.socket:
+    if os.path.exists(path):
         try:
             with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as probe:
-                probe.connect(socket_path)
-            # If connect() succeeds, another server is alive.
-            raise RuntimeError(
-                f"command socket already active: {socket_path}"
-            )
+                probe.connect(path)
+            raise RuntimeError(f"socket already active: {path}")
         except ConnectionRefusedError:
-            # Stale socket file — safe to remove
-            os.unlink(socket_path)
+            os.unlink(path)
 
-    # ------------------------------------------------------------
-    # Bind and serve
-    # ------------------------------------------------------------
-    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as srv:
-        srv.bind(socket_path)
-        srv.listen()
+    srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    srv.bind(path)
+    srv.listen()
+    return srv
 
-        while True:
-            conn, _ = srv.accept()
-            with conn:
-                raw = conn.recv(65536).decode("utf-8")
 
-                req = json.loads(raw)
+# =============================================================================
+# Command server (internal)
+# =============================================================================
 
-                command = req["command"]
-                args = req.get("args")
+def _serve_commands(
+    *,
+    subsystem: str,
+    commands: Dict[str, Callable[[Optional[dict]], dict]],
+) -> None:
+    sock_path = command_socket_path(subsystem)
 
-                handler = commands[command]
-                resp = handler(args)
+    logging.info("🚀 [commands] %s → %s", subsystem, sock_path)
+    srv = _bind_unix_socket(sock_path)
 
-                conn.sendall(
-                    json.dumps(resp, separators=(",", ":")).encode("utf-8")
-                )
+    while True:
+        conn, _ = srv.accept()
+        with conn:
+            raw = conn.recv(65536)
+            req = json.loads(raw.decode("utf-8"))
 
+            cmd = req["command"]
+            args = req.get("args")
+
+            handler = commands[cmd]
+            resp = handler(args)
+
+            conn.sendall(
+                json.dumps(resp, separators=(",", ":")).encode("utf-8")
+            )
+
+
+# =============================================================================
+# Pub/Sub server (internal)
+# =============================================================================
+
+def _serve_pubsub(
+    *,
+    subsystem: str,
+    subscriptions: Iterable[str],
+    on_message: Callable[[str, dict], None],
+) -> None:
+    """
+    Receive published messages and dispatch to the user callback.
+
+    Semantics:
+      • One socket
+      • One callback
+      • Best-effort
+      • No filtering beyond topic match
+    """
+
+    sock_path = pubsub_socket_path(subsystem)
+
+    logging.info("🚀 [pubsub] %s → %s", subsystem, sock_path)
+    srv = _bind_unix_socket(sock_path)
+
+    subs = set(subscriptions)
+
+    while True:
+        conn, _ = srv.accept()
+        with conn:
+            raw = conn.recv(65536)
+            msg = json.loads(raw.decode("utf-8"))
+
+            topic = msg.get("topic")
+            payload = msg.get("payload")
+
+            if topic in subs:
+                try:
+                    on_message(topic, payload)
+                except Exception:
+                    logging.exception("[pubsub] user callback failed")
+
+
+# =============================================================================
+# Public declarative API
+# =============================================================================
+
+def server_setup(
+    *,
+    subsystem: str,
+    commands: Dict[str, Callable[[Optional[dict]], dict]],
+    subscriptions: Iterable[str],
+    on_message: Callable[[str, dict], None],
+) -> None:
+    """
+    Declaratively start a ZPNet Pi-side process.
+
+    This function never returns.
+
+    The caller declares:
+      • subsystem name
+      • command handlers
+      • pub/sub subscriptions
+      • pub/sub callback
+
+    All sockets, threads, and routing are handled internally.
+    """
+
+    logging.info("🚀 [process] starting subsystem: %s", subsystem)
+
+    # Command plane
+    threading.Thread(
+        target=_serve_commands,
+        kwargs={
+            "subsystem": subsystem,
+            "commands": commands,
+        },
+        daemon=True,
+        name=f"{subsystem}-commands",
+    ).start()
+
+    # Pub/Sub plane
+    threading.Thread(
+        target=_serve_pubsub,
+        kwargs={
+            "subsystem": subsystem,
+            "subscriptions": subscriptions,
+            "on_message": on_message,
+        },
+        daemon=True,
+        name=f"{subsystem}-pubsub",
+    ).start()
+
+    # Block forever (process lifetime)
+    while True:
+        time.sleep(3600)
