@@ -33,6 +33,9 @@
 static constexpr size_t TRANSPORT_BLOCK_SIZE = 64;
 static constexpr size_t RX_BUF_MAX = 2048;
 
+static constexpr char STX_SEQ[] = "<STX=";
+static constexpr size_t STX_LEN = 5;
+
 static constexpr char   ETX_SEQ[] = "<ETX>";
 static constexpr size_t ETX_LEN  = 5;
 
@@ -182,10 +185,12 @@ void transport_send(
 
 #elif defined(ZPNET_TRANSPORT_SELECTED_SERIAL)
 
-  // Stream-truthful send (no padding):
-  //   [traffic][<STX=n>JSON<ETX>]
-  serial_send_bytes(&traffic, 1);
-  serial_send_bytes(send_buf, total_len);
+  static uint8_t serial_tx_buf[1 + TRANSPORT_MAX_MESSAGE];
+
+  serial_tx_buf[0] = traffic;
+  memcpy(serial_tx_buf + 1, send_buf, total_len);
+
+  serial_send_bytes(serial_tx_buf, 1 + total_len);
 
 #endif
 }
@@ -194,50 +199,114 @@ void transport_send(
 // RECEIVE: Delimiter + dispatch (shared)
 // =============================================================
 
-static void dispatch_if_complete() {
-  // Look for first <ETX>
-  for (size_t i = 0; i + ETX_LEN <= rx_len; ++i) {
-    if (memcmp(rx_buf + i, ETX_SEQ, ETX_LEN) != 0)
-      continue;
+// =============================================================
+// RECEIVE: Delimiter + dispatch (length-authoritative, shared)
+// =============================================================
+//
+// Framing is EXACTLY:
+//
+//   <STX=n> JSON_BYTES <ETX>
+//
+// Rules (match transport.py):
+//   • We only accept frames that begin with "<STX=" at rx_buf[0].
+//   • We parse declared length n from the header.
+//   • We require that exactly n JSON bytes follow '>'.
+//   • We require "<ETX>" to appear exactly at (json_start + n).
+//   • We dispatch exactly those n bytes (not "whatever precedes ETX").
+//   • If framing is corrupt, we reset and resync hard (adversarial).
+//
+// Note: This intentionally does NOT “scan for ETX anywhere”.
+//       It uses declared length as the authority.
+//
+static void rx_reset_hard() {
+  rx_len = 0;
+  rx_have_traffic = false;
+  // rx_traffic is "latched" only when rx_have_traffic == true.
+}
 
-    // Must have latched traffic
-    if (!rx_have_traffic) {
-      rx_len = 0;
+static void dispatch_if_complete() {
+  // Must have traffic before we consider the buffer meaningful.
+  if (!rx_have_traffic) {
+    rx_len = 0;
+    return;
+  }
+
+  // Need at least "<STX=0><ETX>" => 5 + 1 + 1 + 5 = 12 bytes
+  // (We'll be stricter below; this is just a fast guard.)
+  if (rx_len < (STX_LEN + 3 + ETX_LEN)) return;
+
+  // Frame must start with "<STX="
+  if (memcmp(rx_buf, STX_SEQ, STX_LEN) != 0) {
+    rx_reset_hard();
+    return;
+  }
+
+  // Parse header: "<STX=" + digits + ">"
+  // Find '>' and parse the digits in between.
+  size_t i = STX_LEN;        // position after "<STX="
+  size_t declared_len = 0;
+  bool   saw_digit = false;
+
+  // Parse decimal digits until we hit '>'
+  while (i < rx_len && rx_buf[i] != '>') {
+    uint8_t c = rx_buf[i];
+
+    if (c < '0' || c > '9') {
+      // Bad header character: adversarial reset
+      rx_reset_hard();
       return;
     }
 
-    // 1. Find end of <STX=...> header
-    size_t json_start = 0;
-    for (size_t i = 0; i + 1 < rx_len; ++i) {
-      if (rx_buf[i] == '>') {
-        json_start = i + 1;
-        break;
-      }
+    saw_digit = true;
+
+    // Safe-ish decimal accumulate (cap to prevent overflow / nonsense)
+    declared_len = declared_len * 10 + (size_t)(c - '0');
+    if (declared_len > TRANSPORT_MAX_MESSAGE) {
+      rx_reset_hard();
+      return;
     }
 
-    // 2. Find beginning of <ETX>
-    size_t json_end = 0;
-    for (size_t i = json_start; i + ETX_LEN <= rx_len; ++i) {
-      if (memcmp(rx_buf + i, ETX_SEQ, ETX_LEN) == 0) {
-        json_end = i;
-        break;
-      }
-    }
+    ++i;
+  }
 
-    // 3. Parse JSON between delimiters
-    if (json_start < json_end) {
-      Payload p;
-      p.parseJSON(rx_buf + json_start, json_end - json_start);
+  // Must have a closing '>' and at least one digit
+  if (!saw_digit) return;                 // incomplete header (no digits yet)
+  if (i >= rx_len) return;                // incomplete header (no '>' yet)
 
-    if (recv_cb[rx_traffic]) {
-      recv_cb[rx_traffic](p);
-    }
+  const size_t header_end = i;            // index of '>'
+  const size_t json_start = header_end + 1;
 
-    // Reset receive state after dispatch
-    rx_len = 0;
-    rx_have_traffic = false;
+  // Now we know exactly how many bytes must be present:
+  //   json_start + declared_len + ETX_LEN
+  const size_t required_total = json_start + declared_len + ETX_LEN;
+
+  if (required_total > RX_BUF_MAX) {
+    rx_reset_hard();
     return;
   }
+
+  // Not enough bytes yet: keep accumulating
+  if (rx_len < required_total) return;
+
+  // ETX must appear EXACTLY after the declared JSON length
+  const size_t etx_pos = json_start + declared_len;
+  if (memcmp(rx_buf + etx_pos, ETX_SEQ, ETX_LEN) != 0) {
+    rx_reset_hard();
+    return;
+  }
+
+  // We have one complete, well-formed frame. Parse EXACTLY declared_len bytes.
+  Payload p;
+  p.parseJSON(rx_buf + json_start, declared_len);
+
+  if (recv_cb[rx_traffic]) {
+    recv_cb[rx_traffic](p);
+  }
+
+  // Reset receive state after dispatch.
+  // If you ever support back-to-back frames in the same rx_buf,
+  // this becomes a "consume" + memmove; but for now you reset hard.
+  rx_reset_hard();
 }
 
 
