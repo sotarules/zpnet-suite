@@ -36,5 +36,8 @@ def normalize_ts(ts: Any) -> datetime:
         return datetime.fromisoformat(ts.replace("Z", "+00:00"))
     raise TypeError(f"Unsupported ts type: {type(ts)}")
 
+def payload_to_json_str(payload: Payload) -> str:
+    return json.dumps(payload, separators=(",", ":"), sort_keys=True)
+
 def payload_to_json_bytes(payload: Payload) -> bytes:
-    return json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    return payload_to_json_str(payload).encode("utf-8")

@@ -5,13 +5,24 @@ This module is the single authoritative byte ↔ meaning boundary
 on the host side. It is intentionally symmetric with
 `transport.cpp` on the Teensy.
 
+NEW ARCHITECTURE (TRUTHFUL SPLIT):
+  • Four explicit physical paths:
+      - HID   TX
+      - HID   RX
+      - SERIAL TX
+      - SERIAL RX
+  • Public API remains invariant:
+      - transport_send(...)
+      - transport_register_receive_callback(...)
+      - transport_init()
+      - transport_close()
+
 Responsibilities:
   • Own physical I/O (hidraw OR USB CDC serial)
-  • Fragment and reassemble fixed 64-byte blocks
-  • Delimit / undelimit messages by traffic class
+  • Delimit / undelimit semantic messages
   • Demultiplex by traffic byte
   • Deliver decoded messages via registered callbacks
-  • Preserve forensic snooping
+  • Preserve snoop and forensic logging
 
 Non-responsibilities:
   • No RPC correlation
@@ -22,7 +33,7 @@ Non-responsibilities:
 Design philosophy:
   • Transport is boring and correct
   • Meaning crosses this boundary exactly once
-  • Receive is asynchronous and callback-driven
+  • Receive is adversarial and callback-driven
 """
 
 from __future__ import annotations
@@ -32,7 +43,7 @@ import logging
 import os
 import threading
 import time
-from typing import Callable, Dict, Optional, Any
+from typing import Callable, Dict, Optional
 
 from zpnet.shared import constants
 from zpnet.shared.constants import Payload
@@ -60,10 +71,17 @@ TRANSPORT_BLOCK_SIZE = 64
 TRANSPORT_MAX_MESSAGE = 10 * 1024
 
 STX_PREFIX = b"<STX="
-ETX_SEQ    = b"<ETX>"
-ETX_LEN    = len(ETX_SEQ)
+ETX_SEQ = b"<ETX>"
+ETX_LEN = len(ETX_SEQ)
 
 SERIAL_SNOOP_PATH = "/home/mule/zpnet/logs/zpnet-teensy-listener-snoop.log"
+
+# Traffic bytes (shared vocabulary)
+TRAFFIC_DEBUG = 0xD0
+TRAFFIC_REQUEST_RESPONSE = 0xD1
+TRAFFIC_PUBLISH_SUBSCRIBE = 0xD2
+
+_VALID_TRAFFIC = {TRAFFIC_DEBUG, TRAFFIC_REQUEST_RESPONSE, TRAFFIC_PUBLISH_SUBSCRIBE}
 
 # ---------------------------------------------------------------------
 # Forensic logging (authoritative black box)
@@ -71,11 +89,8 @@ SERIAL_SNOOP_PATH = "/home/mule/zpnet/logs/zpnet-teensy-listener-snoop.log"
 
 RAW_TRANSPORT_LOG_PATH = "/home/mule/zpnet/logs/zpnet-transport.log"
 
-def _log_raw_transport(
-    traffic: int,
-    message: bytes,
-    direction: str
-) -> None:
+
+def _log_raw_transport(traffic: int, message: bytes, direction: str) -> None:
     """
     Log a fully reassembled transport message exactly once,
     before any semantic processing.
@@ -101,17 +116,17 @@ def _log_raw_transport(
         # Logging must never interfere with transport
         pass
 
+
 # ---------------------------------------------------------------------
 # Receive callback registry (semantic)
 # ---------------------------------------------------------------------
 
 _transport_recv_cb: Dict[int, Callable[[Payload], None]] = {}
 
-def transport_register_receive_callback(
-    traffic: int,
-    cb: Callable[[Payload], None]
-) -> None:
+
+def transport_register_receive_callback(traffic: int, cb: Callable[[Payload], None]) -> None:
     _transport_recv_cb[traffic] = cb
+
 
 # ---------------------------------------------------------------------
 # Physical transport state
@@ -126,148 +141,29 @@ _hid_present = threading.Event()
 # SERIAL backend
 _ser = None  # pyserial.Serial instance when in SERIAL mode
 
-# Shared write lock
+# Shared write lock (protects both hidraw and serial writes)
 _write_lock = threading.Lock()
 
-# ---------------------------------------------------------------------
-# Public physical boundary (64-byte blocks)
-# ---------------------------------------------------------------------
-
-def transport_send_block(block: bytes) -> None:
-    """
-    Physical boundary: send exactly one 64-byte block.
-    Padding is physical only (zeros), never semantic.
-    """
-    if not isinstance(block, (bytes, bytearray)):
-        raise TypeError("transport_send_block requires bytes/bytearray")
-
-    if len(block) != TRANSPORT_BLOCK_SIZE:
-        raise ValueError(f"transport_send_block requires {TRANSPORT_BLOCK_SIZE} bytes, got {len(block)}")
-
-    if _transport_mode is None:
-        raise RuntimeError("transport not initialized")
-
-    with _write_lock:
-        if _transport_mode == TRANSPORT_HID:
-            if not _hid_present.is_set() or _hid_fd is None:
-                raise RuntimeError("Teensy HID not present")
-            os.write(_hid_fd, block)
-            return
-
-        if _transport_mode == TRANSPORT_SERIAL:
-            if _ser is None:
-                raise RuntimeError("Teensy serial not open")
-            _ser.write(block)
-            _ser.flush()
-            return
-
-        raise RuntimeError(f"unknown transport mode: {_transport_mode}")
-
-def transport_recv_block() -> bytes:
-    """
-    Physical boundary: receive exactly one 64-byte block.
-    Blocks until full block is available.
-    """
-    if _transport_mode is None:
-        raise RuntimeError("transport not initialized")
-
-    if _transport_mode == TRANSPORT_HID:
-        if not _hid_present.is_set() or _hid_fd is None:
-            raise RuntimeError("Teensy HID not present")
-
-        # hidraw read should return exactly 64 bytes, but loop defensively
-        buf = bytearray()
-        while len(buf) < TRANSPORT_BLOCK_SIZE:
-            chunk = os.read(_hid_fd, TRANSPORT_BLOCK_SIZE - len(buf))
-            if not chunk:
-                continue
-            buf.extend(chunk)
-        return bytes(buf)
-
-    if _transport_mode == TRANSPORT_SERIAL:
-        if _ser is None:
-            raise RuntimeError("Teensy serial not open")
-
-        # pyserial read() blocks until timeout; we run with timeout=None (blocking)
-        data = _ser.read(TRANSPORT_BLOCK_SIZE)
-        while len(data) < TRANSPORT_BLOCK_SIZE:
-            more = _ser.read(TRANSPORT_BLOCK_SIZE - len(data))
-            if not more:
-                continue
-            data += more
-        return data
-
-    raise RuntimeError(f"unknown transport mode: {_transport_mode}")
 
 # ---------------------------------------------------------------------
-# Physical open / close
+# Forensic snooping (semantic)
 # ---------------------------------------------------------------------
 
-def _open_hid(path: str) -> None:
-    global _hid_fd
-    if _hid_fd is not None:
-        raise RuntimeError("HID already open")
-
-    _hid_fd = os.open(path, os.O_RDWR)
-    _hid_present.set()
-    logger.info("🚀 [transport] HID opened: %s", path)
-
-def _close_hid() -> None:
-    global _hid_fd
-    if _hid_fd is not None:
-        try:
-            os.close(_hid_fd)
-        finally:
-            _hid_fd = None
-            _hid_present.clear()
-            logger.info("🛑 [transport] HID closed")
-
-def _open_serial(path: str) -> None:
-    global _ser
-    if _ser is not None:
-        raise RuntimeError("serial already open")
-
+def _snoop(direction: str, payload: bytes) -> None:
     try:
-        import serial  # type: ignore
-    except Exception as e:
-        raise RuntimeError("pyserial is required for ZPNET_TRANSPORT=SERIAL") from e
+        with open(SERIAL_SNOOP_PATH, "a") as f:
+            f.write(f"{time.time():.6f} {direction} {payload.decode('utf-8', errors='replace')}\n")
+    except Exception:
+        pass
 
-    # Blocking read model: timeout=None means block until requested bytes arrive.
-    _ser = serial.Serial(
-        port=path,
-        baudrate=115200,
-        timeout=None,
-        write_timeout=None
-    )
-    logger.info("🚀 [transport] SERIAL opened: %s", path)
-
-def _close_serial() -> None:
-    global _ser
-    if _ser is not None:
-        try:
-            _ser.close()
-        finally:
-            _ser = None
-            logger.info("🛑 [transport] SERIAL closed")
-
-def transport_close() -> None:
-    """
-    Close the underlying transport. (Best-effort.)
-    """
-    global _transport_mode
-    if _transport_mode == TRANSPORT_HID:
-        _close_hid()
-    elif _transport_mode == TRANSPORT_SERIAL:
-        _close_serial()
-    _transport_mode = None
 
 # ---------------------------------------------------------------------
-# Delimiting (send-side)
+# Delimiting / Undelimiting (shared semantic helpers)
 # ---------------------------------------------------------------------
 
-def _delimit_for_send(traffic: int, payload: bytes) -> bytes:
+def _delimit_for_send(payload: bytes) -> bytes:
     """
-    Apply framing to all semantic traffic.
+    Apply framing to semantic bytes.
 
     <STX=n> JSON <ETX>
     """
@@ -275,14 +171,9 @@ def _delimit_for_send(traffic: int, payload: bytes) -> bytes:
     return header + payload + ETX_SEQ
 
 
-# ---------------------------------------------------------------------
-# Undelimiting (receive-side)
-# ---------------------------------------------------------------------
-
-def _undelimit_on_receive(traffic: int, msg: bytes) -> bytes:
+def _undelimit_on_receive(msg: bytes) -> bytes:
     """
     Remove <STX=n> ... <ETX> framing and return raw JSON bytes.
-    All semantic traffic is now framed.
     """
     header, _, rest = msg.partition(b">")
     declared_len = int(header[len(STX_PREFIX):])
@@ -290,76 +181,14 @@ def _undelimit_on_receive(traffic: int, msg: bytes) -> bytes:
     return body[:declared_len]
 
 
-# ---------------------------------------------------------------------
-# Public semantic send API
-# ---------------------------------------------------------------------
-
-def transport_send(traffic: int, payload: Payload) -> None:
-    """
-    Send ONE complete semantic message.
-
-    The object is JSON-encoded here, then passed through
-    transport-level delimiting and fragmentation.
-    """
-    raw = payload_to_json_bytes(payload)
-
-    _snoop("←", raw)
-
-    framed = _delimit_for_send(traffic, raw)
-
-    # transport.cpp semantics: first block carries traffic byte
-    _fragment_and_send(framed, traffic)
-
-# ---------------------------------------------------------------------
-# Fragmentation (send-side)
-# ---------------------------------------------------------------------
-
-def _fragment_and_send(data: bytes, traffic: int) -> None:
-    """
-    Fragment a fully delimited message into 64-byte blocks.
-
-    First block:
-      [traffic][payload...]
-
-    Subsequent blocks:
-      [payload...]
-
-    Padding is physical only (zeros), never semantic.
-    """
-    if _transport_mode is None:
-        raise RuntimeError("transport not initialized")
-
-    msg = bytes([traffic]) + data
-
-    # 🔴 FORENSIC TAP — log before any processing
-    _log_raw_transport(traffic, msg, "Pi -> Teensy")
-
-    offset = 0
-    while offset < len(msg):
-        chunk = msg[offset:offset + TRANSPORT_BLOCK_SIZE]
-        if len(chunk) < TRANSPORT_BLOCK_SIZE:
-            chunk += b"\x00" * (TRANSPORT_BLOCK_SIZE - len(chunk))
-        transport_send_block(chunk)
-        offset += TRANSPORT_BLOCK_SIZE
-
-# ---------------------------------------------------------------------
-# Reader loop (single RX authority)
-# ---------------------------------------------------------------------
-
 def _try_parse_expected_len(buf: bytearray) -> Optional[int]:
     """
     If buf begins with <STX=n>, return the total framed message length:
       header_len + n + ETX_LEN
     Otherwise return None.
-
-    Minimal contract:
-      • require STX at offset 0
-      • parse decimal digits until '>'
-      • do NOT rely on padding
     """
-    if len(buf) < len(STX_PREFIX) + 2:   # need at least "<STX=0>"
+    if len(buf) < len(STX_PREFIX) + 2:  # need at least "<STX=0>"
         return None
-
     if not buf.startswith(STX_PREFIX):
         return None
 
@@ -374,22 +203,135 @@ def _try_parse_expected_len(buf: bytearray) -> Optional[int]:
 
     if not saw_digit:
         return None
-
-    if i >= len(buf) or buf[i] != ord('>'):
+    if i >= len(buf) or buf[i] != ord(">"):
         return None
 
     header_len = i + 1  # include '>'
     return header_len + n + ETX_LEN
 
-def reader_loop() -> None:
-    """
-    Blocking reader loop.
 
-    Owns:
-      • block reassembly
-      • traffic extraction
-      • delimiter-based message termination (length-authoritative for REQUEST_RESPONSE)
-      • dispatch
+# ---------------------------------------------------------------------
+# Dispatch (shared)
+# ---------------------------------------------------------------------
+
+def _dispatch_complete_message(traffic: int, framed_message: bytes) -> None:
+    """
+    framed_message is expected to be exactly:
+      <STX=n> JSON <ETX>
+    """
+    undelimited = _undelimit_on_receive(framed_message)
+
+    # Semantic snoop (post-undelimiting)
+    _snoop("→", undelimited)
+
+    payload = json.loads(undelimited.decode("utf-8"))
+
+    cb = _transport_recv_cb.get(traffic)
+    if cb is None:
+        return
+    cb(payload)
+
+
+# ---------------------------------------------------------------------
+# HID physical primitives (private)
+# ---------------------------------------------------------------------
+
+def _hid_send_block(block: bytes) -> None:
+    if len(block) != TRANSPORT_BLOCK_SIZE:
+        raise ValueError(f"HID block must be {TRANSPORT_BLOCK_SIZE} bytes")
+    if not _hid_present.is_set() or _hid_fd is None:
+        raise RuntimeError("Teensy HID not present")
+    os.write(_hid_fd, block)
+
+
+def _hid_recv_block() -> bytes:
+    if not _hid_present.is_set() or _hid_fd is None:
+        raise RuntimeError("Teensy HID not present")
+
+    buf = bytearray()
+    while len(buf) < TRANSPORT_BLOCK_SIZE:
+        chunk = os.read(_hid_fd, TRANSPORT_BLOCK_SIZE - len(buf))
+        if not chunk:
+            continue
+        buf.extend(chunk)
+    return bytes(buf)
+
+
+# ---------------------------------------------------------------------
+# SERIAL physical primitives (private)
+# ---------------------------------------------------------------------
+
+def _serial_write(data: bytes) -> None:
+    if _ser is None:
+        raise RuntimeError("Teensy serial not open")
+    _ser.write(data)
+    _ser.flush()
+
+
+def _serial_read_some() -> bytes:
+    """
+    Best-effort stream read:
+      • If bytes are waiting, drain them.
+      • Otherwise block for at least 1 byte.
+    """
+    if _ser is None:
+        raise RuntimeError("Teensy serial not open")
+
+    try:
+        waiting = getattr(_ser, "in_waiting", 0)
+    except Exception:
+        waiting = 0
+
+    if waiting and waiting > 0:
+        return _ser.read(waiting)
+
+    # Block until at least one byte arrives
+    return _ser.read(1)
+
+
+# ---------------------------------------------------------------------
+# TX path split
+# ---------------------------------------------------------------------
+
+def _hid_tx_send(traffic: int, framed: bytes) -> None:
+    """
+    HID TX: fixed 64-byte reports. Mandatory padding.
+    Physical message = [traffic] + framed
+    """
+    msg = bytes([traffic]) + framed
+    _log_raw_transport(traffic, msg, "Pi -> Teensy")
+
+    offset = 0
+    while offset < len(msg):
+        chunk = msg[offset:offset + TRANSPORT_BLOCK_SIZE]
+        if len(chunk) < TRANSPORT_BLOCK_SIZE:
+            chunk += b"\x00" * (TRANSPORT_BLOCK_SIZE - len(chunk))
+        _hid_send_block(chunk)
+        offset += TRANSPORT_BLOCK_SIZE
+
+
+def _serial_tx_send(traffic: int, framed: bytes) -> None:
+    """
+    SERIAL TX: stream write. No block padding.
+    Physical message = [traffic] + framed
+    """
+    msg = bytes([traffic]) + framed
+    _log_raw_transport(traffic, msg, "Pi -> Teensy")
+
+    with _write_lock:
+        _serial_write(msg)
+
+
+# ---------------------------------------------------------------------
+# RX path split
+# ---------------------------------------------------------------------
+
+def _hid_rx_loop() -> None:
+    """
+    HID RX: record device. Read fixed 64-byte blocks.
+    First block: [traffic][payload...]
+    Continuations: [payload...]
+    Completion is length-authoritative via <STX=n>.
     """
     try:
         rx_buf = bytearray()
@@ -397,13 +339,8 @@ def reader_loop() -> None:
         expected_total: Optional[int] = None
 
         while True:
-            try:
-                block = transport_recv_block()
-            except Exception:
-                logger.exception("💥 [transport] transport_recv_block fatal")
-                return
+            block = _hid_recv_block()
 
-            # First block: traffic byte is leading
             if traffic is None:
                 traffic = block[0]
                 payload_part = block[1:]
@@ -417,68 +354,194 @@ def reader_loop() -> None:
                     expected_total = _try_parse_expected_len(rx_buf)
 
                 if expected_total is not None and len(rx_buf) >= expected_total:
-                    message = bytes(rx_buf[:expected_total])
+                    framed = bytes(rx_buf[:expected_total])
 
-                    # Message-atomic receive model
+                    # Reset receive state atomically
                     rx_buf.clear()
                     expected_total = None
                     traffic_done = traffic
                     traffic = None
 
-                    # 🔴 FORENSIC TAP — log before any processing
-                    _log_raw_transport(traffic_done, message, "Teensy -> Pi")
-
-                    _dispatch_complete_message(traffic_done, message)
-
-            # else: wait for an explicit invariant (do nothing)
+                    _log_raw_transport(traffic_done, framed, "Teensy -> Pi")
+                    _dispatch_complete_message(traffic_done, framed)
 
     except Exception:
-        logger.exception("💥 [transport] reader_loop fatal exception")
+        logger.exception("💥 [transport] HID RX loop fatal exception")
 
-# ---------------------------------------------------------------------
-# Dispatch
-# ---------------------------------------------------------------------
 
-def _dispatch_complete_message(traffic: int, message: bytes) -> None:
-
-    undelimited = _undelimit_on_receive(traffic, message)
-
-    _snoop("→", undelimited)
-
-    payload = json.loads(undelimited.decode("utf-8"))
-
-    cb = _transport_recv_cb.get(traffic)
-    if cb is None:
-        return
-
-    cb(payload)
-
-# ---------------------------------------------------------------------
-# Forensic snooping
-# ---------------------------------------------------------------------
-
-def _snoop(direction: str, payload: bytes) -> None:
+def _serial_rx_loop() -> None:
+    """
+    SERIAL RX: byte stream. Must resynchronize.
+    Model mirrors Teensy SERIAL RX:
+      • Await traffic byte (valid classifier)
+      • Accumulate bytes until a framed message completes
+      • Completion is length-authoritative via <STX=n>
+    """
     try:
-        with open(SERIAL_SNOOP_PATH, "a") as f:
-            f.write(f"{time.time():.6f} {direction} {payload.decode('utf-8', errors='replace')}\n")
+        rx_buf = bytearray()
+        traffic: Optional[int] = None
+        expected_total: Optional[int] = None
+
+        while True:
+            data = _serial_read_some()
+            if not data:
+                continue
+
+            for b in data:
+                if traffic is None:
+                    # Ignore noise until a valid traffic classifier appears
+                    if b not in _VALID_TRAFFIC:
+                        continue
+                    traffic = b
+                    rx_buf.clear()
+                    expected_total = None
+                    continue
+
+                # Accumulate framed bytes
+                rx_buf.append(b)
+
+                # Hard cap to prevent runaway
+                if len(rx_buf) > TRANSPORT_MAX_MESSAGE:
+                    traffic = None
+                    rx_buf.clear()
+                    expected_total = None
+                    continue
+
+                if expected_total is None:
+                    expected_total = _try_parse_expected_len(rx_buf)
+
+                if expected_total is not None and len(rx_buf) >= expected_total:
+                    framed = bytes(rx_buf[:expected_total])
+
+                    traffic_done = traffic
+                    traffic = None
+                    rx_buf.clear()
+                    expected_total = None
+
+                    _log_raw_transport(traffic_done, framed, "Teensy -> Pi")
+                    _dispatch_complete_message(traffic_done, framed)
+
     except Exception:
-        pass
+        logger.exception("💥 [transport] SERIAL RX loop fatal exception")
+
 
 # ---------------------------------------------------------------------
-# Init
+# Public semantic send API (facade)
+# ---------------------------------------------------------------------
+
+def transport_send(traffic: int, payload: Payload) -> None:
+    """
+    Public facade: send ONE complete semantic message.
+
+    Callers do not know or care whether transport is HID or SERIAL.
+    """
+    raw = payload_to_json_bytes(payload)
+
+    # Semantic snoop (pre-framing)
+    _snoop("←", raw)
+
+    framed = _delimit_for_send(raw)
+
+    if _transport_mode is None:
+        raise RuntimeError("transport not initialized")
+
+    # Mode-specific TX (explicit split)
+    with _write_lock:
+        if _transport_mode == TRANSPORT_HID:
+            _hid_tx_send(traffic, framed)
+            return
+        if _transport_mode == TRANSPORT_SERIAL:
+            _serial_tx_send(traffic, framed)
+            return
+
+    raise RuntimeError(f"unknown transport mode: {_transport_mode}")
+
+
+# ---------------------------------------------------------------------
+# Physical open / close
+# ---------------------------------------------------------------------
+
+def _open_hid(path: str) -> None:
+    global _hid_fd
+    if _hid_fd is not None:
+        raise RuntimeError("HID already open")
+
+    _hid_fd = os.open(path, os.O_RDWR)
+    _hid_present.set()
+    logger.info("🚀 [transport] HID opened: %s", path)
+
+
+def _close_hid() -> None:
+    global _hid_fd
+    if _hid_fd is not None:
+        try:
+            os.close(_hid_fd)
+        finally:
+            _hid_fd = None
+            _hid_present.clear()
+            logger.info("🛑 [transport] HID closed")
+
+
+def _open_serial(path: str) -> None:
+    global _ser
+    if _ser is not None:
+        raise RuntimeError("serial already open")
+
+    try:
+        import serial  # type: ignore
+    except Exception as e:
+        raise RuntimeError("pyserial is required for ZPNET_TRANSPORT=SERIAL") from e
+
+    _ser = serial.Serial(
+        port=path,
+        baudrate=115200,
+        timeout=None,       # blocking
+        write_timeout=None
+    )
+    logger.info("🚀 [transport] SERIAL opened: %s", path)
+
+
+def _close_serial() -> None:
+    global _ser
+    if _ser is not None:
+        try:
+            _ser.close()
+        finally:
+            _ser = None
+            logger.info("🛑 [transport] SERIAL closed")
+
+
+def transport_close() -> None:
+    """
+    Close the underlying transport. (Best-effort.)
+    """
+    global _transport_mode
+
+    try:
+        if _transport_mode == TRANSPORT_HID:
+            _close_hid()
+        elif _transport_mode == TRANSPORT_SERIAL:
+            _close_serial()
+    finally:
+        _transport_mode = None
+
+
+# ---------------------------------------------------------------------
+# Init (facade)
 # ---------------------------------------------------------------------
 
 def transport_init() -> None:
     """
     Initialize host-side transport based on ZPNET_TRANSPORT and start RX thread.
+
+    Public behavior is invariant.
+    Internal RX/TX are explicitly mode-split.
     """
     global _transport_mode
 
     mode = os.environ.get(ENV_TRANSPORT, "").strip().upper()
     if mode not in (TRANSPORT_HID, TRANSPORT_SERIAL):
-        raise RuntimeError(
-            f"{ENV_TRANSPORT} must be set to HID or SERIAL (got: {mode!r})"
-        )
+        raise RuntimeError(f"{ENV_TRANSPORT} must be set to HID or SERIAL (got: {mode!r})")
 
     _transport_mode = mode
 
@@ -487,15 +550,21 @@ def transport_init() -> None:
             raise RuntimeError(f"Teensy HID device not found: {TEENSY_HIDRAW_PATH}")
         _open_hid(TEENSY_HIDRAW_PATH)
 
+        threading.Thread(
+            target=_hid_rx_loop,
+            daemon=True,
+            name="transport-hid-rx",
+        ).start()
+
     elif _transport_mode == TRANSPORT_SERIAL:
         if not os.path.exists(TEENSY_SERIAL_PATH):
             raise RuntimeError(f"Teensy serial device not found: {TEENSY_SERIAL_PATH}")
         _open_serial(TEENSY_SERIAL_PATH)
 
-    logger.info("✅ [transport] initialized mode=%s", _transport_mode)
+        threading.Thread(
+            target=_serial_rx_loop,
+            daemon=True,
+            name="transport-serial-rx",
+        ).start()
 
-    threading.Thread(
-        target=reader_loop,
-        daemon=True,
-        name="transport-reader"
-    ).start()
+    logger.info("✅ [transport] initialized mode=%s", _transport_mode)

@@ -34,6 +34,7 @@ from zpnet.shared.constants import (
     TRAFFIC_DEBUG,
 )
 from zpnet.shared.logger import setup_logging
+from zpnet.shared.util import payload_to_json_str, payload_to_json_bytes
 from zpnet.shared.transport import (
     transport_send,
     transport_register_receive_callback,
@@ -87,30 +88,10 @@ def open_debug_log() -> None:
 # ---------------------------------------------------------------------
 
 def on_receive_debug(payload: Dict[str, Any]) -> None:
-    """
-    Teensy DEBUG traffic sink.
 
-    Semantics:
-      • payload is a decoded JSON object
-      • no retries
-      • no recovery
-      • no inference
-      • logged verbosely at the transport boundary
-    """
-
-    # -------------------------------------------------------------
-    # Ground-truth log (entire payload, exactly as received)
-    # -------------------------------------------------------------
     if debug_log_fh:
-        debug_log_fh.write(f"DEBUG {payload}\n")
+        debug_log_fh.write(payload_to_json_str(payload) + "\n")
 
-    debug_text = payload.get("debug")
-
-    if isinstance(debug_text, str):
-        logger.info("🐞 [teensy debug] %s", debug_text)
-    else:
-        # Future-proof: debug payload evolved
-        logger.info("🐞 [teensy debug] %s", payload)
 
 def on_receive_request_response(payload: Dict[str, Any]) -> None:
     req_id = payload.get("req_id")
@@ -221,7 +202,7 @@ def route_publish(msg: Dict[str, Any]) -> None:
 
     logger.info("🚀 [pubsub] fan out routing for %s", targets)
 
-    raw = json.dumps(msg, separators=(",", ":")).encode("utf-8")
+    raw = payload_to_json_bytes(msg)
 
     for subsystem in targets:
         sock_path = f"{SOCKET_DIR}/zpnet-{subsystem.lower()}-pubsub.sock"

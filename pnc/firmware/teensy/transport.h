@@ -5,6 +5,26 @@
 
 #include "payload.h"
 
+// ============================================================================
+// ZPNet Transport — Public Interface (Teensy)
+// ============================================================================
+//
+// This header defines the ONLY public contract for the transport layer.
+//
+// TRUTHFUL DESIGN:
+//
+//   • Transport owns all physical I/O.
+//   • Receive is asynchronous and callback-driven.
+//   • Send is semantic and message-oriented.
+//   • HID and SERIAL diverge internally at the physical layer.
+//   • Message framing and dispatch are transport responsibilities.
+//
+// No public API exposes byte- or block-level I/O.
+// That boundary is intentionally sealed.
+//
+// ============================================================================
+
+
 // =============================================================
 // Compile-time transport selection (authoritative)
 // =============================================================
@@ -40,65 +60,73 @@
   #error "No transport backend defined (ZPNET_TRANSPORT_* or USB_*)"
 #endif
 
+
 // =============================================================
 // Transport limits (authoritative)
 // =============================================================
 
 static constexpr size_t TRANSPORT_MAX_MESSAGE = 10 * 1024;
 
-// =============================================================
-// Physical transport invariants
-// =============================================================
-
-static constexpr size_t TRANSPORT_BLOCK_SIZE = 64;
 
 // =============================================================
 // Traffic types (authoritative)
 // =============================================================
+//
+// Traffic byte is the first byte of every message and determines
+// semantic routing after message reassembly.
+//
 
 static constexpr uint8_t TRAFFIC_DEBUG             = 0xD0;
 static constexpr uint8_t TRAFFIC_REQUEST_RESPONSE  = 0xD1;
 static constexpr uint8_t TRAFFIC_PUBLISH_SUBSCRIBE = 0xD2;
 
+
 // =============================================================
 // Application receive callback
 // =============================================================
+//
+// Transport delivers fully reassembled, message-atomic Payloads
+// via registered callbacks. No receive polling API exists.
+//
 
 using transport_receive_cb_t =
   void (*)(const Payload&);
 
+
 // =============================================================
 // Receive registration
 // =============================================================
+//
+// Register a callback for a given traffic class.
+// Only one callback per traffic class is supported.
+//
 
 void transport_register_receive_callback(
   uint8_t traffic,
   transport_receive_cb_t cb
 );
 
+
 // =============================================================
-// Send API (semantic entry point)
+// Semantic send API (public entry point)
 // =============================================================
+//
+// Send ONE complete semantic message.
+// Framing, fragmentation, and physical I/O are handled internally.
+//
 
 void transport_send(
   uint8_t traffic,
   const Payload& payload
 );
 
-// =============================================================
-// Block API (physical transport boundary)
-// =============================================================
-
-bool transport_send_block(
-  const uint8_t block[TRANSPORT_BLOCK_SIZE]
-);
-
-bool transport_recv_block(
-  uint8_t block[TRANSPORT_BLOCK_SIZE]
-);
 
 // =============================================================
 // Lifecycle
 // =============================================================
+//
+// Initialize the transport subsystem.
+// Owns physical I/O, RX polling, framing, and dispatch.
+//
 
 void transport_init(void);

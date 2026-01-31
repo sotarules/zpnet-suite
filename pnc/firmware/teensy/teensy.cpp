@@ -128,12 +128,12 @@ void setup() {
   // Phase 2: Transport boundary comes alive
   // ----------------------------------------------------------
 
-  transport_init();
-
   transport_register_receive_callback(
     TRAFFIC_REQUEST_RESPONSE,
     process_command
   );
+
+  transport_init();
 
   // ----------------------------------------------------------
   // Phase 3: Debug subsystem becomes valid (transport-routed)
@@ -142,7 +142,7 @@ void setup() {
   debug_init();
 
   // Optional: enable periodic beacon once transport is stable
-  // debug_beacon();
+  //debug_beacon();
 
   debug_log("boot", "setup begin");
 
