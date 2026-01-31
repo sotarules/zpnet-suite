@@ -1,33 +1,62 @@
 # =============================================================
 # ZPNet Teensy 4.1 build + flash helper
 #
-# ARCHITECTURAL NOTE:
-#   This firmware uses a SINGLE RawHID interface.
+# TRANSPORT BIFURCATION:
+#   Build and runtime behavior are controlled exclusively by:
 #
-#   • Application traffic and debug output are SOFTWARE-MULTIPLEXED
-#     over one RawHID endpoint.
-#   • No CDC / Serial interface is present.
-#   • USB Type MUST be RawHID.
+#     ZPNET_TRANSPORT = HID | SERIAL
 #
-#   Debug framing:
-#     pkt[0] = channel selector (e.g. 0xD0 = debug, 0x01 = app)
+#   This variable is REQUIRED and permanent.
 #
+# FLASHING RULE:
+#   Teensy is ALWAYS flashed via teensy_loader_cli.
+#   USB mode affects runtime behavior only.
 # =============================================================
 
+# -------------------------------------------------------------
+# Required environment variable
+# -------------------------------------------------------------
+
+ifndef ZPNET_TRANSPORT
+$(error ❌ ZPNET_TRANSPORT is not set. Use: export ZPNET_TRANSPORT=HID or SERIAL)
+endif
+
+ifeq ($(ZPNET_TRANSPORT),HID)
+USB_MODE   = rawhid
+USB_LABEL  = USB_RAWHID
+HAS_SERIAL = no
+else ifeq ($(ZPNET_TRANSPORT),SERIAL)
+USB_MODE   = serial
+USB_LABEL  = USB_CDC_SERIAL
+HAS_SERIAL = yes
+else
+$(error ❌ Invalid ZPNET_TRANSPORT='$(ZPNET_TRANSPORT)'. Must be HID or SERIAL)
+endif
+
+# -------------------------------------------------------------
+# Compile-time transport defines
+# -------------------------------------------------------------
+
+CPP_DEFS =
+ifeq ($(ZPNET_TRANSPORT),HID)
+CPP_DEFS += -DZPNET_TRANSPORT_HID
+else ifeq ($(ZPNET_TRANSPORT),SERIAL)
+CPP_DEFS += -DZPNET_TRANSPORT_SERIAL
+endif
+
+# -------------------------------------------------------------
+# Toolchain
+# -------------------------------------------------------------
+
 NAME        = teensy
-BOARD       = teensy:avr:teensy41:usb=rawhid
 ARDUINO_CLI = ../../bin/arduino-cli
+TEENSY_LOADER = teensy_loader_cli
 
-# -------------------------------------------------------------
-# USB configuration (FIXED)
-# -------------------------------------------------------------
+BOARD = teensy:avr:teensy41:usb=$(USB_MODE)
 
-# RawHID only. No CDC, no composite.
-USB_MODE = hid
-
-# No serial port exists in RawHID-only mode
-PORT =
-BAUD = 115200
+# Serial parameters (used only if SERIAL)
+PORT ?= /dev/zpnet-teensy-serial
+BAUD ?= 115200
 
 # -------------------------------------------------------------
 # Targets
@@ -40,46 +69,57 @@ all: build
 # -------------------------------------------------------------
 
 build:
-	@echo "🔧 Building Teensy (USB_RAWHID, single interface, multiplexed)..."
+	@echo "🔧 Building Teensy 4.1 ($(USB_LABEL))..."
+	@echo "    Transport mode: $(ZPNET_TRANSPORT)"
 	$(ARDUINO_CLI) compile \
 	  --fqbn $(BOARD) \
+	  --build-property build.extra_flags="$(CPP_DEFS)" \
 	  . \
 	  --output-dir ./build
 
 # -------------------------------------------------------------
-# Flash (HID-based, no button required)
+# Flash (authoritative for Teensy)
 # -------------------------------------------------------------
 
 flash: build
-	@echo "🚀 Flashing Teensy 4.1 via HID reboot (no button)..."
-	sudo teensy_loader_cli \
+	@echo "🚀 Flashing Teensy 4.1 via teensy_loader_cli..."
+	sudo $(TEENSY_LOADER) \
 	  --mcu=TEENSY41 \
 	  -w -s \
 	  build/$(NAME).ino.hex
 	@echo "✅ Teensy flashed successfully."
 
 # -------------------------------------------------------------
-# Upload (CDC) — intentionally unavailable
+# Upload (explicitly unsupported)
 # -------------------------------------------------------------
 
 upload:
-	@echo "❌ Upload via CDC is unavailable."
-	@echo "   This firmware uses RawHID only."
+	@echo "❌ Upload via arduino-cli is unsupported on Teensy."
 	@echo "   Use: make flash"
 
 # -------------------------------------------------------------
-# Serial monitor — intentionally unavailable
+# Serial monitor (SERIAL only)
 # -------------------------------------------------------------
 
 monitor:
-	@echo "❌ Serial monitor unavailable (RawHID-only firmware)."
+ifeq ($(HAS_SERIAL),yes)
+	@echo "📡 Opening serial monitor on $(PORT)..."
+	$(ARDUINO_CLI) monitor \
+	  --port $(PORT) \
+	  --baud $(BAUD)
+else
+	@echo "❌ Serial monitor unavailable (HID transport)."
+endif
 
 # -------------------------------------------------------------
 # Info / utilities
 # -------------------------------------------------------------
 
 info:
-	@echo "ℹ️  Listing connected boards..."
+	@echo "ℹ️  Transport mode: $(ZPNET_TRANSPORT)"
+	@echo "ℹ️  USB mode:       $(USB_MODE)"
+	@echo "ℹ️  Board FQBN:     $(BOARD)"
+	@echo
 	$(ARDUINO_CLI) board list
 
 clean:

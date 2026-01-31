@@ -10,6 +10,7 @@ Role:
   • Route published traffic to Pi subsystems
 
 Semantics:
+  • All transport callbacks receive semantic JSON payloads
   • Pub/Sub is fire-and-forget
   • No retries
   • No delivery guarantees
@@ -28,7 +29,10 @@ import time
 from queue import Queue, Empty
 from typing import Dict, Any, Optional, TextIO, Set
 
-from zpnet.shared.constants import TRAFFIC_REQUEST_RESPONSE, TRAFFIC_DEBUG
+from zpnet.shared.constants import (
+    TRAFFIC_REQUEST_RESPONSE,
+    TRAFFIC_DEBUG,
+)
 from zpnet.shared.logger import setup_logging
 from zpnet.shared.transport import (
     transport_send,
@@ -79,12 +83,34 @@ def open_debug_log() -> None:
     debug_log_fh = open(DEBUG_LOG_PATH, "w", buffering=1)
 
 # ---------------------------------------------------------------------
-# Teensy receive callbacks
+# Teensy receive callbacks (semantic only)
 # ---------------------------------------------------------------------
 
-def on_receive_debug(message: bytes) -> None:
-    logging.info("🐞 [teensy debug] %s", message.decode("utf-8", errors="replace"))
-    debug_log_fh.write(repr(message) + "\n")
+def on_receive_debug(payload: Dict[str, Any]) -> None:
+    """
+    Teensy DEBUG traffic sink.
+
+    Semantics:
+      • payload is a decoded JSON object
+      • no retries
+      • no recovery
+      • no inference
+      • logged verbosely at the transport boundary
+    """
+
+    # -------------------------------------------------------------
+    # Ground-truth log (entire payload, exactly as received)
+    # -------------------------------------------------------------
+    if debug_log_fh:
+        debug_log_fh.write(f"DEBUG {payload}\n")
+
+    debug_text = payload.get("debug")
+
+    if isinstance(debug_text, str):
+        logger.info("🐞 [teensy debug] %s", debug_text)
+    else:
+        # Future-proof: debug payload evolved
+        logger.info("🐞 [teensy debug] %s", payload)
 
 def on_receive_request_response(payload: Dict[str, Any]) -> None:
     req_id = payload.get("req_id")
@@ -193,7 +219,7 @@ def route_publish(msg: Dict[str, Any]) -> None:
             if topic in topic_set
         ]
 
-    logger.info("🚀 [pubsub] fan out routing for %s",targets)
+    logger.info("🚀 [pubsub] fan out routing for %s", targets)
 
     raw = json.dumps(msg, separators=(",", ":")).encode("utf-8")
 
@@ -270,7 +296,8 @@ def run() -> None:
 
     transport_register_receive_callback(
         TRAFFIC_DEBUG,
-        on_receive_debug)
+        on_receive_debug,
+    )
     transport_register_receive_callback(
         TRAFFIC_REQUEST_RESPONSE,
         on_receive_request_response,

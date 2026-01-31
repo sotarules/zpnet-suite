@@ -4,8 +4,8 @@
 #include <cstddef>
 
 #define ZPNET_SERIAL Serial
-
-static constexpr const char* FW_VERSION = "zpnet-teensy-4.3.5";
+#define FW_VERSION_STR "zpnet-teensy-4.3.5"
+static constexpr const char* FW_VERSION = FW_VERSION_STR;
 
 // -------------------------------------------------------------
 // Transport backend selection (runtime)

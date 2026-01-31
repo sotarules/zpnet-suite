@@ -6,8 +6,8 @@ on the host side. It is intentionally symmetric with
 `transport.cpp` on the Teensy.
 
 Responsibilities:
-  • Own hidraw I/O
-  • Fragment and reassemble 64-byte HID packets
+  • Own physical I/O (hidraw OR USB CDC serial)
+  • Fragment and reassemble fixed 64-byte blocks
   • Delimit / undelimit messages by traffic class
   • Demultiplex by traffic byte
   • Deliver decoded messages via registered callbacks
@@ -38,11 +38,25 @@ from zpnet.shared import constants
 from zpnet.shared.constants import Payload
 from zpnet.shared.util import payload_to_json_bytes
 
+logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------
+# Environment-selected transport (authoritative)
+# ---------------------------------------------------------------------
+
+ENV_TRANSPORT = "ZPNET_TRANSPORT"
+TRANSPORT_HID = "HID"
+TRANSPORT_SERIAL = "SERIAL"
+
+# Canonical device paths (prefer shared constants if present)
+TEENSY_HIDRAW_PATH = getattr(constants, "TEENSY_HIDRAW_PATH", "/dev/zpnet-teensy-hid")
+TEENSY_SERIAL_PATH = getattr(constants, "TEENSY_SERIAL_PATH", "/dev/zpnet-teensy-serial")
+
 # ---------------------------------------------------------------------
 # Constants (authoritative, must match Teensy)
 # ---------------------------------------------------------------------
 
-HID_PACKET_SIZE = 64
+TRANSPORT_BLOCK_SIZE = 64
 TRANSPORT_MAX_MESSAGE = 10 * 1024
 
 STX_PREFIX = b"<STX="
@@ -51,21 +65,19 @@ ETX_LEN    = len(ETX_SEQ)
 
 SERIAL_SNOOP_PATH = "/home/mule/zpnet/logs/zpnet-teensy-listener-snoop.log"
 
-logger = logging.getLogger(__name__)
-
 # ---------------------------------------------------------------------
-# Raw HID forensic logging (authoritative black box)
+# Forensic logging (authoritative black box)
 # ---------------------------------------------------------------------
 
-RAW_HID_LOG_PATH = "/home/mule/zpnet/logs/zpnet-hid.log"
+RAW_TRANSPORT_LOG_PATH = "/home/mule/zpnet/logs/zpnet-transport.log"
 
-def _log_raw_hid(
+def _log_raw_transport(
     traffic: int,
     message: bytes,
     direction: str
 ) -> None:
     """
-    Log a fully reassembled HID message exactly once,
+    Log a fully reassembled transport message exactly once,
     before any semantic processing.
 
     This is a forensic truth surface.
@@ -75,13 +87,12 @@ def _log_raw_hid(
         traffic_hex = f"0x{traffic:02X}"
         length = len(message)
 
-        # Safe dual representation
         ascii_preview = message.decode("utf-8", errors="replace")
         hex_preview = message.hex()
 
-        with open(RAW_HID_LOG_PATH, "a") as f:
+        with open(RAW_TRANSPORT_LOG_PATH, "a") as f:
             f.write(
-                f"{direction} traffic={traffic_hex} len={length}\n"
+                f"{ts:.6f} {direction} traffic={traffic_hex} len={length}\n"
                 f"ASCII: {ascii_preview}\n"
                 f"HEX:   {hex_preview}\n"
                 f"---\n"
@@ -91,46 +102,164 @@ def _log_raw_hid(
         pass
 
 # ---------------------------------------------------------------------
-# Receive callback registry
+# Receive callback registry (semantic)
 # ---------------------------------------------------------------------
 
-_transport_recv_cb: Dict[int, Callable[[Any], None]] = {}
+_transport_recv_cb: Dict[int, Callable[[Payload], None]] = {}
 
 def transport_register_receive_callback(
     traffic: int,
-    cb: Callable[[Any], None]
+    cb: Callable[[Payload], None]
 ) -> None:
     _transport_recv_cb[traffic] = cb
 
-
 # ---------------------------------------------------------------------
-# HID device state
-# ---------------------------------------------------------------------
-
-hid_fd: Optional[int] = None
-hid_present = threading.Event()
-hid_write_lock = threading.Lock()
-
-# ---------------------------------------------------------------------
-# HID open / close
+# Physical transport state
 # ---------------------------------------------------------------------
 
-def open_hid(path: str) -> None:
-    global hid_fd
-    if hid_fd is not None:
+_transport_mode: Optional[str] = None
+
+# HID backend
+_hid_fd: Optional[int] = None
+_hid_present = threading.Event()
+
+# SERIAL backend
+_ser = None  # pyserial.Serial instance when in SERIAL mode
+
+# Shared write lock
+_write_lock = threading.Lock()
+
+# ---------------------------------------------------------------------
+# Public physical boundary (64-byte blocks)
+# ---------------------------------------------------------------------
+
+def transport_send_block(block: bytes) -> None:
+    """
+    Physical boundary: send exactly one 64-byte block.
+    Padding is physical only (zeros), never semantic.
+    """
+    if not isinstance(block, (bytes, bytearray)):
+        raise TypeError("transport_send_block requires bytes/bytearray")
+
+    if len(block) != TRANSPORT_BLOCK_SIZE:
+        raise ValueError(f"transport_send_block requires {TRANSPORT_BLOCK_SIZE} bytes, got {len(block)}")
+
+    if _transport_mode is None:
+        raise RuntimeError("transport not initialized")
+
+    with _write_lock:
+        if _transport_mode == TRANSPORT_HID:
+            if not _hid_present.is_set() or _hid_fd is None:
+                raise RuntimeError("Teensy HID not present")
+            os.write(_hid_fd, block)
+            return
+
+        if _transport_mode == TRANSPORT_SERIAL:
+            if _ser is None:
+                raise RuntimeError("Teensy serial not open")
+            _ser.write(block)
+            _ser.flush()
+            return
+
+        raise RuntimeError(f"unknown transport mode: {_transport_mode}")
+
+def transport_recv_block() -> bytes:
+    """
+    Physical boundary: receive exactly one 64-byte block.
+    Blocks until full block is available.
+    """
+    if _transport_mode is None:
+        raise RuntimeError("transport not initialized")
+
+    if _transport_mode == TRANSPORT_HID:
+        if not _hid_present.is_set() or _hid_fd is None:
+            raise RuntimeError("Teensy HID not present")
+
+        # hidraw read should return exactly 64 bytes, but loop defensively
+        buf = bytearray()
+        while len(buf) < TRANSPORT_BLOCK_SIZE:
+            chunk = os.read(_hid_fd, TRANSPORT_BLOCK_SIZE - len(buf))
+            if not chunk:
+                continue
+            buf.extend(chunk)
+        return bytes(buf)
+
+    if _transport_mode == TRANSPORT_SERIAL:
+        if _ser is None:
+            raise RuntimeError("Teensy serial not open")
+
+        # pyserial read() blocks until timeout; we run with timeout=None (blocking)
+        data = _ser.read(TRANSPORT_BLOCK_SIZE)
+        while len(data) < TRANSPORT_BLOCK_SIZE:
+            more = _ser.read(TRANSPORT_BLOCK_SIZE - len(data))
+            if not more:
+                continue
+            data += more
+        return data
+
+    raise RuntimeError(f"unknown transport mode: {_transport_mode}")
+
+# ---------------------------------------------------------------------
+# Physical open / close
+# ---------------------------------------------------------------------
+
+def _open_hid(path: str) -> None:
+    global _hid_fd
+    if _hid_fd is not None:
         raise RuntimeError("HID already open")
 
-    hid_fd = os.open(path, os.O_RDWR)
-    hid_present.set()
+    _hid_fd = os.open(path, os.O_RDWR)
+    _hid_present.set()
     logger.info("🚀 [transport] HID opened: %s", path)
 
-def close_hid() -> None:
-    global hid_fd
-    if hid_fd is not None:
-        os.close(hid_fd)
-        hid_fd = None
-        hid_present.clear()
-        logger.info("🛑 [transport] HID closed")
+def _close_hid() -> None:
+    global _hid_fd
+    if _hid_fd is not None:
+        try:
+            os.close(_hid_fd)
+        finally:
+            _hid_fd = None
+            _hid_present.clear()
+            logger.info("🛑 [transport] HID closed")
+
+def _open_serial(path: str) -> None:
+    global _ser
+    if _ser is not None:
+        raise RuntimeError("serial already open")
+
+    try:
+        import serial  # type: ignore
+    except Exception as e:
+        raise RuntimeError("pyserial is required for ZPNET_TRANSPORT=SERIAL") from e
+
+    # Blocking read model: timeout=None means block until requested bytes arrive.
+    _ser = serial.Serial(
+        port=path,
+        baudrate=115200,
+        timeout=None,
+        write_timeout=None
+    )
+    logger.info("🚀 [transport] SERIAL opened: %s", path)
+
+def _close_serial() -> None:
+    global _ser
+    if _ser is not None:
+        try:
+            _ser.close()
+        finally:
+            _ser = None
+            logger.info("🛑 [transport] SERIAL closed")
+
+def transport_close() -> None:
+    """
+    Close the underlying transport. (Best-effort.)
+    """
+    global _transport_mode
+    if _transport_mode == TRANSPORT_HID:
+        _close_hid()
+    elif _transport_mode == TRANSPORT_SERIAL:
+        _close_serial()
+    _transport_mode = None
 
 # ---------------------------------------------------------------------
 # Delimiting (send-side)
@@ -138,19 +267,13 @@ def close_hid() -> None:
 
 def _delimit_for_send(traffic: int, payload: bytes) -> bytes:
     """
-    Apply traffic-specific delimiting.
+    Apply framing to all semantic traffic.
 
-    REQUEST_RESPONSE:
-      <STX=n> JSON <ETX>
-
-    All other traffic:
-      raw JSON bytes
+    <STX=n> JSON <ETX>
     """
-    if traffic == constants.TRAFFIC_REQUEST_RESPONSE:
-        header = b"<STX=" + str(len(payload)).encode("ascii") + b">"
-        return header + payload + ETX_SEQ
+    header = b"<STX=" + str(len(payload)).encode("ascii") + b">"
+    return header + payload + ETX_SEQ
 
-    return payload
 
 # ---------------------------------------------------------------------
 # Undelimiting (receive-side)
@@ -158,20 +281,17 @@ def _delimit_for_send(traffic: int, payload: bytes) -> bytes:
 
 def _undelimit_on_receive(traffic: int, msg: bytes) -> bytes:
     """
-    Remove traffic-specific delimiters and return raw JSON bytes.
-
-    Any malformed message is a fatal error.
+    Remove <STX=n> ... <ETX> framing and return raw JSON bytes.
+    All semantic traffic is now framed.
     """
-    if traffic == constants.TRAFFIC_REQUEST_RESPONSE:
-        header, _, rest = msg.partition(b">")
-        declared_len = int(header[len(STX_PREFIX):])
-        body, _, _ = rest.partition(ETX_SEQ)
-        return body[:declared_len]
+    header, _, rest = msg.partition(b">")
+    declared_len = int(header[len(STX_PREFIX):])
+    body, _, _ = rest.partition(ETX_SEQ)
+    return body[:declared_len]
 
-    return msg
 
 # ---------------------------------------------------------------------
-# Public send API
+# Public semantic send API
 # ---------------------------------------------------------------------
 
 def transport_send(traffic: int, payload: Payload) -> None:
@@ -181,13 +301,13 @@ def transport_send(traffic: int, payload: Payload) -> None:
     The object is JSON-encoded here, then passed through
     transport-level delimiting and fragmentation.
     """
-
-    # Semantic → JSON → bytes
     raw = payload_to_json_bytes(payload)
 
     _snoop("←", raw)
 
     framed = _delimit_for_send(traffic, raw)
+
+    # transport.cpp semantics: first block carries traffic byte
     _fragment_and_send(framed, traffic)
 
 # ---------------------------------------------------------------------
@@ -196,52 +316,35 @@ def transport_send(traffic: int, payload: Payload) -> None:
 
 def _fragment_and_send(data: bytes, traffic: int) -> None:
     """
-    Fragment a fully delimited message into 64-byte HID packets.
+    Fragment a fully delimited message into 64-byte blocks.
 
-    First packet:
+    First block:
       [traffic][payload...]
 
-    Subsequent packets:
+    Subsequent blocks:
       [payload...]
 
-    Padding with zero bytes defines message termination.
+    Padding is physical only (zeros), never semantic.
     """
-    global hid_fd
+    if _transport_mode is None:
+        raise RuntimeError("transport not initialized")
 
-    if not hid_present.is_set():
-        raise RuntimeError("Teensy HID not present")
-
-    data = bytes([traffic]) + data
-    offset = 0
+    msg = bytes([traffic]) + data
 
     # 🔴 FORENSIC TAP — log before any processing
-    _log_raw_hid(traffic, data, "Pi -> Teensy")
+    _log_raw_transport(traffic, msg, "Pi -> Teensy")
 
-    with hid_write_lock:
-        while offset < len(data):
-            chunk = data[offset:offset + HID_PACKET_SIZE]
-            if len(chunk) < HID_PACKET_SIZE:
-                chunk += b"\x00" * (HID_PACKET_SIZE - len(chunk))
-
-            try:
-                os.write(hid_fd, chunk)
-            except OSError as e:
-                if e.errno in (5, 19):  # EIO / ENODEV
-                    hid_present.clear()
-                    try:
-                        os.close(hid_fd)
-                    except Exception:
-                        pass
-                    hid_fd = None
-                    raise RuntimeError("⚠️ [transport] Teensy disconnected") from e
-                raise
-
-            offset += HID_PACKET_SIZE
+    offset = 0
+    while offset < len(msg):
+        chunk = msg[offset:offset + TRANSPORT_BLOCK_SIZE]
+        if len(chunk) < TRANSPORT_BLOCK_SIZE:
+            chunk += b"\x00" * (TRANSPORT_BLOCK_SIZE - len(chunk))
+        transport_send_block(chunk)
+        offset += TRANSPORT_BLOCK_SIZE
 
 # ---------------------------------------------------------------------
 # Reader loop (single RX authority)
 # ---------------------------------------------------------------------
-
 
 def _try_parse_expected_len(buf: bytearray) -> Optional[int]:
     """
@@ -250,9 +353,9 @@ def _try_parse_expected_len(buf: bytearray) -> Optional[int]:
     Otherwise return None.
 
     Minimal contract:
-      • we require STX at offset 0 (no resync logic here by design)
-      • we parse decimal digits until '>'
-      • we do NOT rely on padding
+      • require STX at offset 0
+      • parse decimal digits until '>'
+      • do NOT rely on padding
     """
     if len(buf) < len(STX_PREFIX) + 2:   # need at least "<STX=0>"
         return None
@@ -264,7 +367,6 @@ def _try_parse_expected_len(buf: bytearray) -> Optional[int]:
     n = 0
     saw_digit = False
 
-    # Parse decimal length
     while i < len(buf) and 48 <= buf[i] <= 57:  # '0'..'9'
         saw_digit = True
         n = (n * 10) + (buf[i] - 48)
@@ -279,87 +381,59 @@ def _try_parse_expected_len(buf: bytearray) -> Optional[int]:
     header_len = i + 1  # include '>'
     return header_len + n + ETX_LEN
 
-
 def reader_loop() -> None:
     """
     Blocking reader loop.
 
     Owns:
-      • packet reassembly
+      • block reassembly
       • traffic extraction
-      • delimiter-based message termination (length-authoritative)
+      • delimiter-based message termination (length-authoritative for REQUEST_RESPONSE)
       • dispatch
     """
     try:
-        global hid_fd
-
-        if hid_fd is None:
-            raise RuntimeError("⚠️ [transport] reader_loop started with HID not open")
-
         rx_buf = bytearray()
         traffic: Optional[int] = None
         expected_total: Optional[int] = None
 
         while True:
             try:
-                pkt = os.read(hid_fd, HID_PACKET_SIZE)
-            except OSError as e:
-                if e.errno in (5, 19):
-                    logger.warning("⚠️ [transport] hidraw vanished during read")
-                    hid_present.clear()
-                    try:
-                        os.close(hid_fd)
-                    except Exception:
-                        pass
-                    hid_fd = None
-                    return
-                raise
+                block = transport_recv_block()
+            except Exception:
+                logger.exception("💥 [transport] transport_recv_block fatal")
+                return
 
-            if not pkt:
-                continue
-
-            # First packet: extract traffic byte
+            # First block: traffic byte is leading
             if traffic is None:
-                traffic = pkt[0]
-                pkt = pkt[1:]
+                traffic = block[0]
+                payload_part = block[1:]
+            else:
+                payload_part = block
 
-            # IMPORTANT: padding is now meaningless; keep bytes as-is
-            if pkt:
-                rx_buf.extend(pkt)
+            if payload_part:
+                rx_buf.extend(payload_part)
 
-            # If we don't yet know expected message length, try to parse <STX=n>
-            if expected_total is None:
-                expected_total = _try_parse_expected_len(rx_buf)
+                if expected_total is None:
+                    expected_total = _try_parse_expected_len(rx_buf)
 
-            # If expected length is known, wait until we have enough bytes
-            if expected_total is not None and len(rx_buf) >= expected_total:
+                if expected_total is not None and len(rx_buf) >= expected_total:
+                    message = bytes(rx_buf[:expected_total])
 
-                # Extract exactly one framed message
-                message = bytes(rx_buf[:expected_total])
+                    # Message-atomic receive model
+                    rx_buf.clear()
+                    expected_total = None
+                    traffic_done = traffic
+                    traffic = None
 
-                # Current transport is message-atomic → discard everything else
-                rx_buf.clear()
+                    # 🔴 FORENSIC TAP — log before any processing
+                    _log_raw_transport(traffic_done, message, "Teensy -> Pi")
 
-                # Reset for next message (next message begins immediately if present)
-                expected_total = None
-                traffic_done = traffic
+                    _dispatch_complete_message(traffic_done, message)
 
-                # 🔴 FORENSIC TAP — log before any processing
-                _log_raw_hid(traffic_done, message, "Teensy -> Pi")
-
-                _dispatch_complete_message(traffic_done, message)
-
-                # If there is already another message in the buffer,
-                # we keep the same traffic byte only if you guarantee
-                # one message per traffic extraction.
-                #
-                # Minimal assumption (matching current behavior):
-                # each logical message begins with a fresh traffic byte.
-                traffic = None
+            # else: wait for an explicit invariant (do nothing)
 
     except Exception:
-        logging.exception("💥 [transport] reader_loop fatal exception")
-
+        logger.exception("💥 [transport] reader_loop fatal exception")
 
 # ---------------------------------------------------------------------
 # Dispatch
@@ -368,14 +442,14 @@ def reader_loop() -> None:
 def _dispatch_complete_message(traffic: int, message: bytes) -> None:
 
     undelimited = _undelimit_on_receive(traffic, message)
+
     _snoop("→", undelimited)
 
-    if traffic == constants.TRAFFIC_REQUEST_RESPONSE:
-        payload = json.loads(undelimited.decode("utf-8"))
-    else:
-        payload = undelimited
+    payload = json.loads(undelimited.decode("utf-8"))
 
-    cb = _transport_recv_cb[traffic]
+    cb = _transport_recv_cb.get(traffic)
+    if cb is None:
+        return
 
     cb(payload)
 
@@ -384,14 +458,44 @@ def _dispatch_complete_message(traffic: int, message: bytes) -> None:
 # ---------------------------------------------------------------------
 
 def _snoop(direction: str, payload: bytes) -> None:
-    with open(SERIAL_SNOOP_PATH, "a") as f:
-        f.write(f"{time.time():.6f} {direction} {payload.decode('utf-8', errors='replace')}\n")
+    try:
+        with open(SERIAL_SNOOP_PATH, "a") as f:
+            f.write(f"{time.time():.6f} {direction} {payload.decode('utf-8', errors='replace')}\n")
+    except Exception:
+        pass
+
+# ---------------------------------------------------------------------
+# Init
+# ---------------------------------------------------------------------
 
 def transport_init() -> None:
-    open_hid(constants.TEENSY_HIDRAW_PATH)
-    try:
+    """
+    Initialize host-side transport based on ZPNET_TRANSPORT and start RX thread.
+    """
+    global _transport_mode
 
-        threading.Thread(target=reader_loop, daemon=True, name="transport-reader").start()
+    mode = os.environ.get(ENV_TRANSPORT, "").strip().upper()
+    if mode not in (TRANSPORT_HID, TRANSPORT_SERIAL):
+        raise RuntimeError(
+            f"{ENV_TRANSPORT} must be set to HID or SERIAL (got: {mode!r})"
+        )
 
-    except Exception:
-        logging.exception("💥 [transport] teensy_listener fatal crash")
+    _transport_mode = mode
+
+    if _transport_mode == TRANSPORT_HID:
+        if not os.path.exists(TEENSY_HIDRAW_PATH):
+            raise RuntimeError(f"Teensy HID device not found: {TEENSY_HIDRAW_PATH}")
+        _open_hid(TEENSY_HIDRAW_PATH)
+
+    elif _transport_mode == TRANSPORT_SERIAL:
+        if not os.path.exists(TEENSY_SERIAL_PATH):
+            raise RuntimeError(f"Teensy serial device not found: {TEENSY_SERIAL_PATH}")
+        _open_serial(TEENSY_SERIAL_PATH)
+
+    logger.info("✅ [transport] initialized mode=%s", _transport_mode)
+
+    threading.Thread(
+        target=reader_loop,
+        daemon=True,
+        name="transport-reader"
+    ).start()

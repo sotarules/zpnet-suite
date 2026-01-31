@@ -151,6 +151,8 @@ const char* process_get_name(size_t idx) {
 
 void process_command(const Payload& request) {
 
+  debug_log("command", "received command");
+
   Payload response;
 
   // ---------------------------------------------------------

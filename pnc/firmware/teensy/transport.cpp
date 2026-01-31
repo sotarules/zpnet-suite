@@ -1,49 +1,104 @@
-// transport.cpp
-//
-// ZPNet Transport Layer (Teensy side)
-//
-// This file owns the entire byte ↔ meaning boundary.
-// All invariants are assumed to be correct by construction.
-//
-#include "transport.h"
+// transport.cpp — RECAPPED: HID vs SERIAL bifurcated at IO boundary
+// -------------------------------------------------------------------
+// HID: Uses 64-byte blocks via RawHID
+// SERIAL: Uses byte stream with ETX-delimited framing
+// Shared: semantic framing, JSON view, RX dispatch, registration
 
+#include "transport.h"
 #include "config.h"
 #include "debug.h"
 #include "timepop.h"
 #include "events.h"
 
 #include <Arduino.h>
-#include <usb_rawhid.h>
 #include <string.h>
 #include <stdio.h>
 
-// -------------------------------------------------------------
+// =============================================================
 // Constants
-// -------------------------------------------------------------
+// =============================================================
 
-static constexpr size_t   HID_PACKET_SIZE   = 64;
-static constexpr uint32_t HID_RX_TIMEOUT_MS = 0;
+static constexpr uint32_t RX_TIMEOUT_MS = 0;
+static constexpr char     ETX_SEQ[]     = "<ETX>";
+static constexpr size_t   ETX_LEN       = 5;
 
-// Legacy framing (REQUEST_RESPONSE only)
-static const char ETX_SEQ[]     = "<ETX>";
-static constexpr size_t ETX_LEN = 5;
+static constexpr size_t STREAM_RX_BUF_MAX = 2048;  // for serial reassembly
 
-// -------------------------------------------------------------
-// Receive callback table
-// -------------------------------------------------------------
+// =============================================================
+// State
+// =============================================================
 
 static void (*recv_cb[256])(const Payload&) = { nullptr };
-
-// -------------------------------------------------------------
-// RX reassembly state
-// -------------------------------------------------------------
-
-static uint8_t rx_buf[TRANSPORT_MAX_MESSAGE];
+static uint8_t rx_buf[STREAM_RX_BUF_MAX];
 static size_t  rx_len = 0;
 
-// -------------------------------------------------------------
+// =============================================================
+// Transport Fingerprint
+// =============================================================
+
+#if defined(ZPNET_TRANSPORT_SELECTED_HID)
+static const char* BUILD_FINGERPINT = "__FP__XXZPNET_HIDXX__";
+#elif defined(ZPNET_TRANSPORT_SELECTED_SERIAL)
+static const char* BUILD_FINGERPINT = "__FP__XXZPNET_SERIALXX__";
+#endif
+
+// =============================================================
+// Backend: SEND
+// =============================================================
+
+#if defined(ZPNET_TRANSPORT_SELECTED_HID)
+
+bool transport_send_block(const uint8_t block[TRANSPORT_BLOCK_SIZE]) {
+  return RawHID.send(block, 50) > 0;
+}
+
+#elif defined(ZPNET_TRANSPORT_SELECTED_SERIAL)
+
+bool transport_send_block(const uint8_t block[TRANSPORT_BLOCK_SIZE]) {
+  size_t n = Serial.write(block, TRANSPORT_BLOCK_SIZE);
+  Serial.flush();
+  return n == TRANSPORT_BLOCK_SIZE;
+}
+
+#endif
+
+// =============================================================
+// Backend: RECEIVE
+// =============================================================
+
+#if defined(ZPNET_TRANSPORT_SELECTED_HID)
+
+bool transport_recv_block(uint8_t block[TRANSPORT_BLOCK_SIZE]) {
+  return RawHID.recv(block, RX_TIMEOUT_MS) > 0;
+}
+
+#elif defined(ZPNET_TRANSPORT_SELECTED_SERIAL)
+
+bool transport_recv_block(uint8_t block[TRANSPORT_BLOCK_SIZE]) {
+
+  static uint8_t buf[TRANSPORT_BLOCK_SIZE];
+  static size_t count = 0;
+
+  while (Serial.available() && count < TRANSPORT_BLOCK_SIZE) {
+    uint8_t b = Serial.read();
+    buf[count++] = b;
+
+    char hex_buf[8];
+    snprintf(hex_buf, sizeof(hex_buf), "0x%02X", b);
+  }
+
+  if (count < TRANSPORT_BLOCK_SIZE) return false;
+
+  memcpy(block, buf, TRANSPORT_BLOCK_SIZE);
+  count = 0;
+  return true;
+}
+
+#endif
+
+// =============================================================
 // Registration
-// -------------------------------------------------------------
+// =============================================================
 
 void transport_register_receive_callback(
   uint8_t traffic,
@@ -52,135 +107,41 @@ void transport_register_receive_callback(
   recv_cb[traffic] = cb;
 }
 
-// -------------------------------------------------------------
-// PRIVATE: fragmentation
-// -------------------------------------------------------------
+// =============================================================
+// SEND FRAGMENTATION (shared)
+// =============================================================
 
 static void fragment_and_send(
   uint8_t traffic,
   const uint8_t* buf,
   size_t len
 ) {
-  uint8_t pkt[HID_PACKET_SIZE];
+  uint8_t pkt[TRANSPORT_BLOCK_SIZE];
   size_t offset = 0;
 
-  // First packet: traffic byte + payload
   pkt[0] = traffic;
 
-  size_t first_chunk =
-    (len + 1 > HID_PACKET_SIZE)
-      ? HID_PACKET_SIZE - 1
-      : len;
+  size_t first_chunk = (len + 1 > TRANSPORT_BLOCK_SIZE)
+    ? TRANSPORT_BLOCK_SIZE - 1
+    : len;
 
   memcpy(pkt + 1, buf, first_chunk);
-  memset(pkt + 1 + first_chunk, 0,
-         HID_PACKET_SIZE - (first_chunk + 1));
-
-  RawHID.send(pkt, 50);
+  memset(pkt + 1 + first_chunk, 0, TRANSPORT_BLOCK_SIZE - (first_chunk + 1));
+  transport_send_block(pkt);
   offset += first_chunk;
 
-  // Subsequent packets
   while (offset < len) {
-    size_t remaining = len - offset;
-    size_t chunk =
-      (remaining > HID_PACKET_SIZE)
-        ? HID_PACKET_SIZE
-        : remaining;
-
+    size_t chunk = min(len - offset, TRANSPORT_BLOCK_SIZE);
     memcpy(pkt, buf + offset, chunk);
-    memset(pkt + chunk, 0, HID_PACKET_SIZE - chunk);
-
-    RawHID.send(pkt, 50);
+    memset(pkt + chunk, 0, TRANSPORT_BLOCK_SIZE - chunk);
+    transport_send_block(pkt);
     offset += chunk;
   }
 }
 
-// -------------------------------------------------------------
-// PRIVATE: send-side delimitation (JsonView-based)
-// -------------------------------------------------------------
-//
-// REQUEST_RESPONSE:
-//   <STX=n>{JSON}<ETX>
-//
-// All other traffic:
-//   {JSON}
-//
-// BOUNDS:
-//   We MUST NOT write beyond out_buf capacity (TRANSPORT_MAX_MESSAGE).
-//   On overflow, emit a small explicit error JSON.
-// -------------------------------------------------------------
-
-static void handle_send_delimiters(
-  uint8_t traffic,
-  const Payload& payload,
-  uint8_t* out_buf,
-  size_t& out_len
-) {
-  out_len = 0;
-
-  // Primary path: transient view (no heap)
-  JsonView v = payload.json_view();
-  const size_t json_len = v.len;
-
-  if (traffic == TRAFFIC_REQUEST_RESPONSE) {
-
-    char header[32];
-    int header_len = snprintf(
-      header,
-      sizeof(header),
-      "<STX=%u>",
-      (unsigned)json_len
-    );
-
-    if (header_len <= 0) {
-      emit_system_error(
-        "transport",
-        "transport.cpp",
-        "handle_send_delimiters",
-        "header_len <= 0 - message not sent"
-      );
-      return;
-    }
-
-    const size_t total_len =
-      (size_t)header_len + json_len + ETX_LEN;
-
-    if (total_len > TRANSPORT_MAX_MESSAGE) {
-      emit_system_error(
-        "transport",
-        "transport.cpp",
-        "handle_send_delimiters",
-        "total_len > TRANSPORT_MAX_MESSAGE - message not sent"
-      );
-      return;
-    }
-
-    memcpy(out_buf, header, (size_t)header_len);
-    memcpy(out_buf + (size_t)header_len, v.data, json_len);
-    memcpy(out_buf + (size_t)header_len + json_len, ETX_SEQ, ETX_LEN);
-
-    out_len = total_len;
-    return;
-  }
-
-  // All other traffic: raw JSON
-  if (json_len > TRANSPORT_MAX_MESSAGE) {
-    emit_system_error(
-      "transport",
-      "transport.cpp",
-      "handle_send_delimiters",
-      "json_len > TRANSPORT_MAX_MESSAGE - message not sent"
-    );
-    return;
-  }
-
-  memcpy(out_buf, v.data, json_len);
-  out_len = json_len;
-}
-
-// -------------------------------------------------------------
-// Public send API
-// -------------------------------------------------------------
+// =============================================================
+// SEND ENTRY POINT
+// =============================================================
 
 void transport_send(
   uint8_t traffic,
@@ -189,38 +150,28 @@ void transport_send(
   static uint8_t send_buf[TRANSPORT_MAX_MESSAGE];
   size_t send_len = 0;
 
-  handle_send_delimiters(traffic, payload, send_buf, send_len);
+  JsonView v = payload.json_view();
+  const size_t json_len = v.len;
 
-  if (send_len == 0) {
-    emit_system_error(
-      "transport",
-      "transport.cpp",
-      "transport_send",
-      "send_len == 0 - transport_send aborted"
-    );
-    return;    // Nothing to send (should be rare; treated as best-effort drop)
-  }
+  // All semantic traffic is framed
+  char header[32];
+  int header_len = snprintf(header, sizeof(header), "<STX=%u>", (unsigned)json_len);
+  if (header_len <= 0) return;
+
+  const size_t total_len = header_len + json_len + ETX_LEN;
+  if (total_len > TRANSPORT_MAX_MESSAGE) return;
+
+  memcpy(send_buf, header, header_len);
+  memcpy(send_buf + header_len, v.data, json_len);
+  memcpy(send_buf + header_len + json_len, ETX_SEQ, ETX_LEN);
+  send_len = total_len;
 
   fragment_and_send(traffic, send_buf, send_len);
 }
 
-// -------------------------------------------------------------
-// PRIVATE: receive-side delimitation
-// -------------------------------------------------------------
-//
-// Expected formats:
-//
-// REQUEST_RESPONSE:
-//   <STX=n>{JSON}<ETX>
-//
-// All other traffic:
-//   {JSON}
-//
-// This function MUST:
-//   • Never read past buf[len]
-//   • Never assume framing is well-formed
-//   • Fail silently (caller owns observability)
-// -------------------------------------------------------------
+// =============================================================
+// RECEIVE: Delimiter Scan + Dispatch (shared)
+// =============================================================
 
 static void handle_receive_delimiters(
   uint8_t traffic,
@@ -230,142 +181,76 @@ static void handle_receive_delimiters(
 ) {
   out.clear();
 
-  if (traffic != TRAFFIC_REQUEST_RESPONSE) {
-    out.parseJSON(buf, len);
-    return;
-  }
-
-  // ---- MINIMUM SAFE GUARD ----
-  if (len < 6) {
-    return;
-  }
-
-  // ---- VERIFY PREFIX ----
-  if (buf[0] != '<' ||
-      buf[1] != 'S' ||
-      buf[2] != 'T' ||
-      buf[3] != 'X' ||
-      buf[4] != '=') {
-    return;
-  }
+  if (len < 6) return;
+  if (buf[0] != '<' || buf[1] != 'S' || buf[2] != 'T' || buf[3] != 'X' || buf[4] != '=') return;
 
   size_t i = 5;
   size_t json_len = 0;
-
-  while (i < len && buf[i] >= '0' && buf[i] <= '9') {
+  while (i < len && isdigit(buf[i])) {
     json_len = (json_len * 10) + (buf[i] - '0');
     i++;
   }
 
-  if (i >= len || buf[i] != '>') {
-    return;
-  }
-
-  i++;  // skip '>'
-
-  if (i + json_len > len) {
-    return;
-  }
+  if (i >= len || buf[i] != '>') return;
+  i++;
+  if (i + json_len > len) return;
 
   out.parseJSON(buf + i, json_len);
 }
 
-// -------------------------------------------------------------
-// RX semantic dispatch
-// -------------------------------------------------------------
-
-static void handle_complete_message(
-  const uint8_t* msg,
-  size_t len
-) {
-  if (!msg || len < 1) {
-    emit_system_error(
-      "transport",
-      "transport.cpp",
-      "handle_complete_message",
-      "!msg || len < 1 - invalid message ignored"
-    );
-    return;
-  }
+static void handle_complete_message(const uint8_t* msg, size_t len) {
+  if (!msg || len < 1) return;
 
   uint8_t traffic = msg[0];
-
   const uint8_t* payload = msg + 1;
   size_t payload_len = len - 1;
 
-  if (!recv_cb[traffic]) {
-    return;
-  }
+  if (!recv_cb[traffic]) return;
 
   Payload p;
   handle_receive_delimiters(traffic, payload, payload_len, p);
   recv_cb[traffic](p);
 }
 
-// -------------------------------------------------------------
-// RX tick
-// -------------------------------------------------------------
+// =============================================================
+// RX Tick (shared)
+// =============================================================
 
-static void transport_rx_tick(
-  timepop_ctx_t*,
-  void*
-) {
-  uint8_t pkt[HID_PACKET_SIZE];
+static void transport_rx_tick(timepop_ctx_t*, void*) {
 
-  int n = RawHID.recv(pkt, HID_RX_TIMEOUT_MS);
-  if (n <= 0) return;
+  uint8_t pkt[TRANSPORT_BLOCK_SIZE];
 
-  // ---------------------------------------------------------
-  // Bounded reassembly (never overflow rx_buf)
-  // ---------------------------------------------------------
-  if (rx_len + (size_t)n > TRANSPORT_MAX_MESSAGE) {
-    emit_system_error(
-      "transport",
-      "transport.cpp",
-      "transport_rx_tick",
-      "rx_len + n > TRANSPORT_MAX_MESSAGE - incoming data ignored"
-    );
+  if (!transport_recv_block(pkt)) return;
+
+  if (rx_len + TRANSPORT_BLOCK_SIZE > STREAM_RX_BUF_MAX) {
     rx_len = 0;
     return;
   }
 
-  memcpy(rx_buf + rx_len, pkt, (size_t)n);
-  rx_len += (size_t)n;
+  memcpy(rx_buf + rx_len, pkt, TRANSPORT_BLOCK_SIZE);
+  rx_len += TRANSPORT_BLOCK_SIZE;
 
-  // ---------------------------------------------------------
-  // Explicit framing termination ONLY
-  // ---------------------------------------------------------
-  //
-  // We do NOT infer message completion from zero padding.
-  // A message is complete iff an explicit ETX is present.
-  //
-  // This applies only to framed traffic (REQUEST_RESPONSE).
-  //
+  if (rx_len < ETX_LEN) return;
 
-  // Minimum length to contain "<ETX>"
-  if (rx_len < ETX_LEN) {
-    return;
-  }
-
-  // Scan tail for ETX sequence
   for (size_t i = 0; i + ETX_LEN <= rx_len; i++) {
     if (memcmp(rx_buf + i, ETX_SEQ, ETX_LEN) == 0) {
-
-      // Complete framed message found
       handle_complete_message(rx_buf, rx_len);
       rx_len = 0;
       return;
     }
   }
-
-  // No complete frame yet — wait for more data
 }
 
-// -------------------------------------------------------------
+// =============================================================
 // Lifecycle
-// -------------------------------------------------------------
+// =============================================================
 
 void transport_init(void) {
+  debug_log("fingerprint", BUILD_FINGERPINT);
+
+#if defined(ZPNET_TRANSPORT_SELECTED_SERIAL)
+  Serial.begin(115200);
+#endif
 
   debug_log("transport", "*init*");
 

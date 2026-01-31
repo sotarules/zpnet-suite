@@ -220,8 +220,11 @@ static Payload cmd_debug(const Payload& args) {
 
   char buf[length];
   memset(buf, 'A', sizeof(buf));
-  debug_send_framed(buf, sizeof(buf));
-
+  debug_log(
+    "system.debug",
+    reinterpret_cast<const uint8_t*>(buf),
+    sizeof(buf)
+  );
   return ok_payload();
 }
 
