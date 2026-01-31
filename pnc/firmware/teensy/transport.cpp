@@ -3,6 +3,12 @@
 // HID: fixed 64-byte record device
 // SERIAL: unstructured byte stream
 //
+// Architecture (truthful split):
+//   • HID TX
+//   • HID RX
+//   • SERIAL TX
+//   • SERIAL RX
+//
 // Shared above framing boundary:
 //   • traffic byte semantics
 //   • <STX=n> JSON <ETX> framing
@@ -25,14 +31,13 @@
 // =============================================================
 
 static constexpr size_t TRANSPORT_BLOCK_SIZE = 64;
+static constexpr size_t RX_BUF_MAX = 2048;
 
 static constexpr char   ETX_SEQ[] = "<ETX>";
 static constexpr size_t ETX_LEN  = 5;
 
-static constexpr size_t RX_BUF_MAX = 2048;
-
 // =============================================================
-// State
+// State (shared semantic)
 // =============================================================
 
 static transport_receive_cb_t recv_cb[256] = { nullptr };
@@ -65,27 +70,33 @@ static const char* BUILD_FINGERPRINT = "__FP__ZPNET_SERIAL__";
 #endif
 
 // =============================================================
-// SEND: Physical backend
+// SEND: Physical backends (explicit split)
 // =============================================================
+//
+// HID TX remains block-based (mandatory 64-byte reports).
+// SERIAL TX becomes stream-truthful: write EXACT byte lengths,
+// no padding, no block fiction.
+//   [traffic][<STX=n>JSON<ETX>]
+//
 
 #if defined(ZPNET_TRANSPORT_SELECTED_HID)
 
-bool transport_send_block(const uint8_t block[TRANSPORT_BLOCK_SIZE]) {
+static inline bool hid_send_block(const uint8_t block[TRANSPORT_BLOCK_SIZE]) {
   return RawHID.send(block, 50) > 0;
 }
 
 #elif defined(ZPNET_TRANSPORT_SELECTED_SERIAL)
 
-bool transport_send_block(const uint8_t block[TRANSPORT_BLOCK_SIZE]) {
-  size_t n = Serial.write(block, TRANSPORT_BLOCK_SIZE);
+static inline bool serial_send_bytes(const uint8_t* buf, size_t len) {
+  size_t n = Serial.write(buf, len);
   Serial.flush();
-  return n == TRANSPORT_BLOCK_SIZE;
+  return n == len;
 }
 
 #endif
 
 // =============================================================
-// Registration
+// Registration (shared)
 // =============================================================
 
 void transport_register_receive_callback(
@@ -96,10 +107,16 @@ void transport_register_receive_callback(
 }
 
 // =============================================================
-// SEND: Fragmentation (shared)
+// SEND: Fragmentation (HID-only)
 // =============================================================
+//
+// Fragmentation exists to satisfy HID’s fixed 64-byte record device.
+// SERIAL TX bypasses this entirely (stream-truthful).
+//
 
-static void fragment_and_send(
+#if defined(ZPNET_TRANSPORT_SELECTED_HID)
+
+static void fragment_and_send_hid(
   uint8_t traffic,
   const uint8_t* buf,
   size_t len
@@ -112,27 +129,28 @@ static void fragment_and_send(
 
   size_t first = min(len, TRANSPORT_BLOCK_SIZE - 1);
   memcpy(pkt + 1, buf, first);
+  memset(pkt + 1 + first, 0, TRANSPORT_BLOCK_SIZE - (1 + first));
 
-  size_t padding_len = TRANSPORT_BLOCK_SIZE - (1 + first);
-  memset(pkt + 1 + first, 0, padding_len);
-
-  transport_send_block(pkt);
-
+  hid_send_block(pkt);
   offset += first;
 
   // Continuation blocks
   while (offset < len) {
     size_t remaining_bytes = len - offset;
     size_t chunk = min(remaining_bytes, TRANSPORT_BLOCK_SIZE);
+
     memcpy(pkt, buf + offset, chunk);
     memset(pkt + chunk, 0, TRANSPORT_BLOCK_SIZE - chunk);
-    transport_send_block(pkt);
+
+    hid_send_block(pkt);
     offset += chunk;
   }
 }
 
+#endif
+
 // =============================================================
-// SEND: Semantic entry
+// SEND: Semantic entry (shared surface, split internally)
 // =============================================================
 
 void transport_send(
@@ -145,65 +163,86 @@ void transport_send(
   const size_t json_len = v.len;
 
   char header[32];
-  int header_len = snprintf(header, sizeof(header),
-                            "<STX=%u>", (unsigned)json_len);
+  int header_len = snprintf(
+    header, sizeof(header),
+    "<STX=%u>", (unsigned)json_len
+  );
   if (header_len <= 0) return;
 
-  const size_t total_len = header_len + json_len + ETX_LEN;
+  const size_t total_len = (size_t)header_len + json_len + ETX_LEN;
   if (total_len > TRANSPORT_MAX_MESSAGE) return;
 
-  memcpy(send_buf, header, header_len);
-  memcpy(send_buf + header_len, v.data, json_len);
-  memcpy(send_buf + header_len + json_len, ETX_SEQ, ETX_LEN);
+  memcpy(send_buf, header, (size_t)header_len);
+  memcpy(send_buf + (size_t)header_len, v.data, json_len);
+  memcpy(send_buf + (size_t)header_len + json_len, ETX_SEQ, ETX_LEN);
 
-  fragment_and_send(traffic, send_buf, total_len);
+#if defined(ZPNET_TRANSPORT_SELECTED_HID)
+
+  fragment_and_send_hid(traffic, send_buf, total_len);
+
+#elif defined(ZPNET_TRANSPORT_SELECTED_SERIAL)
+
+  // Stream-truthful send (no padding):
+  //   [traffic][<STX=n>JSON<ETX>]
+  serial_send_bytes(&traffic, 1);
+  serial_send_bytes(send_buf, total_len);
+
+#endif
 }
 
 // =============================================================
-// RECEIVE: Message completion + dispatch (shared)
+// RECEIVE: Delimiter + dispatch (shared)
 // =============================================================
-
-static void handle_receive_delimiters(
-  uint8_t, const uint8_t* buf, size_t len, Payload& out
-) {
-  size_t i = 5, n = 0;                // skip "<STX="
-  while (buf[i] >= '0' && buf[i] <= '9')
-    n = n * 10 + (buf[i++] - '0');
-  out.parseJSON(buf + i + 1, n);      // skip '>' and parse JSON
-}
 
 static void dispatch_if_complete() {
-  if (rx_len < ETX_LEN) return;
+  // Look for first <ETX>
+  for (size_t i = 0; i + ETX_LEN <= rx_len; ++i) {
+    if (memcmp(rx_buf + i, ETX_SEQ, ETX_LEN) != 0)
+      continue;
 
-  for (size_t i = 0; i + ETX_LEN <= rx_len; i++) {
-    if (memcmp(rx_buf + i, ETX_SEQ, ETX_LEN) == 0) {
-
-      if (!rx_have_traffic) {
-        rx_len = 0;
-        return;
-      }
-
-      Payload p;
-      handle_receive_delimiters(
-        rx_traffic,
-        rx_buf,
-        rx_len,
-        p
-      );
-
-      if (recv_cb[rx_traffic]) {
-        recv_cb[rx_traffic](p);
-      }
-
+    // Must have latched traffic
+    if (!rx_have_traffic) {
       rx_len = 0;
-      rx_have_traffic = false;
       return;
     }
+
+    // 1. Find end of <STX=...> header
+    size_t json_start = 0;
+    for (size_t i = 0; i + 1 < rx_len; ++i) {
+      if (rx_buf[i] == '>') {
+        json_start = i + 1;
+        break;
+      }
+    }
+
+    // 2. Find beginning of <ETX>
+    size_t json_end = 0;
+    for (size_t i = json_start; i + ETX_LEN <= rx_len; ++i) {
+      if (memcmp(rx_buf + i, ETX_SEQ, ETX_LEN) == 0) {
+        json_end = i;
+        break;
+      }
+    }
+
+    // 3. Parse JSON between delimiters
+    if (json_start < json_end) {
+      Payload p;
+      p.parseJSON(rx_buf + json_start, json_end - json_start);
+
+    if (recv_cb[rx_traffic]) {
+      recv_cb[rx_traffic](p);
+    }
+
+    // Reset receive state after dispatch
+    rx_len = 0;
+    rx_have_traffic = false;
+    return;
   }
 }
 
+
 // =============================================================
-// RECEIVE: HID (record dispensing)
+// RECEIVE: HID RX (record-based)
 // =============================================================
 
 #if defined(ZPNET_TRANSPORT_SELECTED_HID)
@@ -236,7 +275,7 @@ static void rx_hid_tick() {
 #endif
 
 // =============================================================
-// RECEIVE: SERIAL (stream accumulation)
+// RECEIVE: SERIAL RX (stream-based)
 // =============================================================
 
 #if defined(ZPNET_TRANSPORT_SELECTED_SERIAL)
@@ -245,15 +284,9 @@ static void rx_serial_tick() {
   while (Serial.available()) {
     uint8_t b = Serial.read();
 
-    // ---------------------------------------------------------
-    // Awaiting traffic byte (message start)
-    // ---------------------------------------------------------
+    // Await traffic byte
     if (!rx_have_traffic) {
-
-      // Ignore noise until we see a valid traffic classifier
-      if (!is_valid_traffic(b)) {
-        continue;
-      }
+      if (!is_valid_traffic(b)) continue;
 
       rx_traffic = b;
       rx_have_traffic = true;
@@ -261,11 +294,8 @@ static void rx_serial_tick() {
       continue;
     }
 
-    // ---------------------------------------------------------
-    // Accumulating payload bytes
-    // ---------------------------------------------------------
+    // Accumulate payload bytes
     if (rx_len >= RX_BUF_MAX) {
-      // Overflow → abandon message atomically
       rx_len = 0;
       rx_have_traffic = false;
       return;
@@ -278,9 +308,8 @@ static void rx_serial_tick() {
 
 #endif
 
-
 // =============================================================
-// RX Poll
+// RX Poll (timepop)
 // =============================================================
 
 static void transport_rx_tick(timepop_ctx_t*, void*) {

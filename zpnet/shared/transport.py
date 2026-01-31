@@ -46,7 +46,7 @@ import time
 from typing import Callable, Dict, Optional
 
 from zpnet.shared import constants
-from zpnet.shared.constants import Payload
+from zpnet.shared.constants import Payload, TRAFFIC_DEBUG, TRAFFIC_PUBLISH_SUBSCRIBE, TRAFFIC_REQUEST_RESPONSE
 from zpnet.shared.util import payload_to_json_bytes
 
 logger = logging.getLogger(__name__)
@@ -77,10 +77,6 @@ ETX_LEN = len(ETX_SEQ)
 SERIAL_SNOOP_PATH = "/home/mule/zpnet/logs/zpnet-teensy-listener-snoop.log"
 
 # Traffic bytes (shared vocabulary)
-TRAFFIC_DEBUG = 0xD0
-TRAFFIC_REQUEST_RESPONSE = 0xD1
-TRAFFIC_PUBLISH_SUBSCRIBE = 0xD2
-
 _VALID_TRAFFIC = {TRAFFIC_DEBUG, TRAFFIC_REQUEST_RESPONSE, TRAFFIC_PUBLISH_SUBSCRIBE}
 
 # ---------------------------------------------------------------------
@@ -90,13 +86,11 @@ _VALID_TRAFFIC = {TRAFFIC_DEBUG, TRAFFIC_REQUEST_RESPONSE, TRAFFIC_PUBLISH_SUBSC
 RAW_TRANSPORT_LOG_PATH = "/home/mule/zpnet/logs/zpnet-transport.log"
 
 
-def _log_raw_transport(traffic: int, message: bytes, direction: str) -> None:
-    """
-    Log a fully reassembled transport message exactly once,
-    before any semantic processing.
+# ---------------------------------------------------------------------
+# Forensic snooping (semantic)
+# --------------------------------------------------------------------
 
-    This is a forensic truth surface.
-    """
+def _log_raw_transport(traffic: int, message: bytes, direction: str) -> None:
     try:
         ts = time.time()
         traffic_hex = f"0x{traffic:02X}"
@@ -116,6 +110,13 @@ def _log_raw_transport(traffic: int, message: bytes, direction: str) -> None:
         # Logging must never interfere with transport
         pass
 
+
+def _snoop(direction: str, payload: bytes) -> None:
+    try:
+        with open(SERIAL_SNOOP_PATH, "a") as f:
+            f.write(f"{time.time():.6f} {direction} {payload.decode('utf-8', errors='replace')}\n")
+    except Exception:
+        pass
 
 # ---------------------------------------------------------------------
 # Receive callback registry (semantic)
@@ -141,21 +142,6 @@ _hid_present = threading.Event()
 # SERIAL backend
 _ser = None  # pyserial.Serial instance when in SERIAL mode
 
-# Shared write lock (protects both hidraw and serial writes)
-_write_lock = threading.Lock()
-
-
-# ---------------------------------------------------------------------
-# Forensic snooping (semantic)
-# ---------------------------------------------------------------------
-
-def _snoop(direction: str, payload: bytes) -> None:
-    try:
-        with open(SERIAL_SNOOP_PATH, "a") as f:
-            f.write(f"{time.time():.6f} {direction} {payload.decode('utf-8', errors='replace')}\n")
-    except Exception:
-        pass
-
 
 # ---------------------------------------------------------------------
 # Delimiting / Undelimiting (shared semantic helpers)
@@ -179,36 +165,6 @@ def _undelimit_on_receive(msg: bytes) -> bytes:
     declared_len = int(header[len(STX_PREFIX):])
     body, _, _ = rest.partition(ETX_SEQ)
     return body[:declared_len]
-
-
-def _try_parse_expected_len(buf: bytearray) -> Optional[int]:
-    """
-    If buf begins with <STX=n>, return the total framed message length:
-      header_len + n + ETX_LEN
-    Otherwise return None.
-    """
-    if len(buf) < len(STX_PREFIX) + 2:  # need at least "<STX=0>"
-        return None
-    if not buf.startswith(STX_PREFIX):
-        return None
-
-    i = len(STX_PREFIX)
-    n = 0
-    saw_digit = False
-
-    while i < len(buf) and 48 <= buf[i] <= 57:  # '0'..'9'
-        saw_digit = True
-        n = (n * 10) + (buf[i] - 48)
-        i += 1
-
-    if not saw_digit:
-        return None
-    if i >= len(buf) or buf[i] != ord(">"):
-        return None
-
-    header_len = i + 1  # include '>'
-    return header_len + n + ETX_LEN
-
 
 # ---------------------------------------------------------------------
 # Dispatch (shared)
@@ -317,9 +273,7 @@ def _serial_tx_send(traffic: int, framed: bytes) -> None:
     """
     msg = bytes([traffic]) + framed
     _log_raw_transport(traffic, msg, "Pi -> Teensy")
-
-    with _write_lock:
-        _serial_write(msg)
+    _serial_write(msg)
 
 
 # ---------------------------------------------------------------------
@@ -350,17 +304,14 @@ def _hid_rx_loop() -> None:
             if payload_part:
                 rx_buf.extend(payload_part)
 
-                if expected_total is None:
-                    expected_total = _try_parse_expected_len(rx_buf)
-
-                if expected_total is not None and len(rx_buf) >= expected_total:
-                    framed = bytes(rx_buf[:expected_total])
-
-                    # Reset receive state atomically
-                    rx_buf.clear()
-                    expected_total = None
+                # Simple completion test
+                etx_pos = rx_buf.find(ETX_SEQ)
+                if etx_pos != -1 and rx_buf.startswith(STX_PREFIX):
+                    framed = bytes(rx_buf[:etx_pos + ETX_LEN])
                     traffic_done = traffic
+
                     traffic = None
+                    rx_buf.clear()
 
                     _log_raw_transport(traffic_done, framed, "Teensy -> Pi")
                     _dispatch_complete_message(traffic_done, framed)
@@ -371,16 +322,13 @@ def _hid_rx_loop() -> None:
 
 def _serial_rx_loop() -> None:
     """
-    SERIAL RX: byte stream. Must resynchronize.
-    Model mirrors Teensy SERIAL RX:
-      • Await traffic byte (valid classifier)
-      • Accumulate bytes until a framed message completes
-      • Completion is length-authoritative via <STX=n>
+    SERIAL RX: byte stream.
+    Completion rule:
+      framed message starts with <STX and ends with <ETX>
     """
     try:
         rx_buf = bytearray()
         traffic: Optional[int] = None
-        expected_total: Optional[int] = None
 
         while True:
             data = _serial_read_some()
@@ -388,13 +336,12 @@ def _serial_rx_loop() -> None:
                 continue
 
             for b in data:
+                # Hunt for traffic byte
                 if traffic is None:
-                    # Ignore noise until a valid traffic classifier appears
                     if b not in _VALID_TRAFFIC:
                         continue
                     traffic = b
                     rx_buf.clear()
-                    expected_total = None
                     continue
 
                 # Accumulate framed bytes
@@ -404,25 +351,23 @@ def _serial_rx_loop() -> None:
                 if len(rx_buf) > TRANSPORT_MAX_MESSAGE:
                     traffic = None
                     rx_buf.clear()
-                    expected_total = None
                     continue
 
-                if expected_total is None:
-                    expected_total = _try_parse_expected_len(rx_buf)
-
-                if expected_total is not None and len(rx_buf) >= expected_total:
-                    framed = bytes(rx_buf[:expected_total])
-
+                # Simple completion test
+                etx_pos = rx_buf.find(ETX_SEQ)
+                if etx_pos != -1 and rx_buf.startswith(STX_PREFIX):
+                    framed = bytes(rx_buf[:etx_pos + ETX_LEN])
                     traffic_done = traffic
+
                     traffic = None
                     rx_buf.clear()
-                    expected_total = None
 
                     _log_raw_transport(traffic_done, framed, "Teensy -> Pi")
                     _dispatch_complete_message(traffic_done, framed)
 
     except Exception:
         logger.exception("💥 [transport] SERIAL RX loop fatal exception")
+
 
 
 # ---------------------------------------------------------------------
@@ -446,13 +391,12 @@ def transport_send(traffic: int, payload: Payload) -> None:
         raise RuntimeError("transport not initialized")
 
     # Mode-specific TX (explicit split)
-    with _write_lock:
-        if _transport_mode == TRANSPORT_HID:
-            _hid_tx_send(traffic, framed)
-            return
-        if _transport_mode == TRANSPORT_SERIAL:
-            _serial_tx_send(traffic, framed)
-            return
+    if _transport_mode == TRANSPORT_HID:
+        _hid_tx_send(traffic, framed)
+        return
+    if _transport_mode == TRANSPORT_SERIAL:
+        _serial_tx_send(traffic, framed)
+        return
 
     raise RuntimeError(f"unknown transport mode: {_transport_mode}")
 
