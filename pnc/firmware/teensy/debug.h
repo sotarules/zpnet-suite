@@ -4,6 +4,9 @@
 #include <stdint.h>
 #include <stddef.h>
 
+// Forward declaration to avoid circular include
+class Payload;
+
 // -----------------------------------------------------------------------------
 // Lifecycle
 // -----------------------------------------------------------------------------
@@ -34,14 +37,16 @@ void debug_log(const char* name, bool value);
 void debug_log(const char* name, const void* ptr);
 
 // -----------------------------------------------------------------------------
-// Buffer / blob logging
+// Buffer / structured logging
 // -----------------------------------------------------------------------------
 
 void debug_log(const char* name, const uint8_t* buf, size_t len);
+void debug_log(const char* name, const Payload& p);
 
 // -----------------------------------------------------------------------------
-// Debugging the debugger,
+// Debugging the debugger
 // -----------------------------------------------------------------------------
+
 void debug_send_framed(const char* payload, size_t payload_len);
 
 // Blink a visible debug pattern on LED_BUILTIN.
@@ -50,7 +55,7 @@ void debug_send_framed(const char* payload, size_t payload_len);
 void debug_blink(const char* pattern);
 
 // -----------------------------------------------------------------------------
-// Optional convenience macro (safe, minimal)
+// Optional convenience macro
 // -----------------------------------------------------------------------------
 
 #define DEBUG(name, value) debug_log((name), (value))

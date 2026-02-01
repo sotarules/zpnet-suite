@@ -6,6 +6,7 @@
 
 #include "config.h"
 
+#include "nvm.h"
 #include "clock.h"
 #include "timepop.h"
 #include "events.h"
@@ -15,6 +16,7 @@
 #include "payload.h"
 #include "debug.h"
 
+#include "process_nvm.h"
 #include "process_clocks.h"
 #include "process_events.h"
 #include "process_timepop.h"
@@ -150,6 +152,14 @@ void setup() {
   debug_log("boot", "setup begin");
 
   // ----------------------------------------------------------
+  // NVM subsystem
+  // ----------------------------------------------------------
+
+  debug_log("boot", "nvm_init");
+  nvm_init();
+  debug_log("boot", "nvm_init done");
+
+  // ----------------------------------------------------------
   // Clock subsystem
   // ----------------------------------------------------------
 
@@ -191,6 +201,10 @@ void setup() {
   // Process registration
   // ----------------------------------------------------------
 
+  debug_log("boot", "process_nvm_register");
+  process_nvm_register();
+  debug_log("boot", "process_nvm_register done");
+
   debug_log("boot", "process_timepop_register");
   process_timepop_register();
   debug_log("boot", "process_timepop_register done");
@@ -226,6 +240,7 @@ void setup() {
   debug_log("boot", "process_system_register");
   process_system_register();
   debug_log("boot", "process_system_register done");
+
 
   // ----------------------------------------------------------
   // CPU usage sampling

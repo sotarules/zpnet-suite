@@ -269,13 +269,13 @@ static Payload cmd_report(const Payload& /*args*/) {
 
 static const process_command_entry_t TIMEPOP_COMMANDS[] = {
   { "REPORT", cmd_report },
+  { nullptr,  nullptr }   // sentinel
 };
 
 static const process_vtable_t TIMEPOP_PROCESS = {
-  .name = "TIMEPOP",
-  .query = nullptr,
-  .commands = TIMEPOP_COMMANDS,
-  .command_count = 1,
+  .process_id    = "TIMEPOP",
+  .commands      = TIMEPOP_COMMANDS,
+  .subscriptions = nullptr,
 };
 
 void process_timepop_register(void) {

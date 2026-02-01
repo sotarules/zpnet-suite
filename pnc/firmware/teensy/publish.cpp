@@ -1,49 +1,55 @@
+// ============================================================================
+// FILE: publish.cpp
+// ============================================================================
+//
+// ZPNet Publish API — Semantic Pub/Sub Egress
+//
+// Responsibilities:
+//   • Provide a simple publish(topic, payload) API
+//   • Deliver publications locally via process framework
+//   • Forward publications to the Pi for authoritative routing
+//
+// Non-responsibilities:
+//   • Subscription storage
+//   • Topic matching
+//   • Fan-out logic
+//   • Process introspection
+//
+// All local routing is owned by the process framework.
+//
+// ============================================================================
+
 #include "publish.h"
 
 #include "process.h"
 #include "transport.h"
 
-#include <string.h>
-
 // -----------------------------------------------------------------------------
-// Helpers
+// Local delivery (delegated)
 // -----------------------------------------------------------------------------
-
-static inline bool topic_matches(const char* a, const char* b) {
-  return a && b && strcmp(a, b) == 0;
-}
-
-// -----------------------------------------------------------------------------
-// Local fan-out (shared by all pub/sub paths)
-// -----------------------------------------------------------------------------
+//
+// All local pub/sub delivery is handled by the process framework.
+// This function exists only as a semantic hook.
+//
 
 void publish_local(const char* topic, const Payload& payload) {
   if (!topic || !*topic) return;
-
-  size_t count = process_get_count();
-
-  for (size_t i = 0; i < count; i++) {
-
-    const process_vtable_t* v = process_get_vtable(i);
-    if (!v || !v->subscriptions || !v->on_message) {
-      continue;
-    }
-
-    for (size_t s = 0; s < v->subscription_count; s++) {
-      const char* sub = v->subscriptions[s].topic;
-      if (topic_matches(sub, topic)) {
-        v->on_message(topic, payload);
-        break; // one delivery per process
-      }
-    }
-  }
+  process_publish_dispatch(topic, payload);
 }
 
 // -----------------------------------------------------------------------------
 // Public publish()
 // -----------------------------------------------------------------------------
+//
+// Semantics:
+//   • Synchronous local delivery
+//   • Unconditional forward to Pi
+//   • No inference, no filtering
+//
 
 void publish(const char* topic, const Payload& payload) {
+
+  if (!topic || !*topic) return;
 
   // 1) Local synchronous delivery
   publish_local(topic, payload);

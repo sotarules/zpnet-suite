@@ -11,6 +11,10 @@
 # FLASHING RULE:
 #   Teensy is ALWAYS flashed via teensy_loader_cli.
 #   USB mode affects runtime behavior only.
+#
+# NVM RULE:
+#   LittleFS on QSPI flash is enabled explicitly via compile-time
+#   define (CLI-equivalent of Arduino IDE Flash Size menu).
 # =============================================================
 
 # -------------------------------------------------------------
@@ -34,22 +38,28 @@ $(error ❌ Invalid ZPNET_TRANSPORT='$(ZPNET_TRANSPORT)'. Must be HID or SERIAL)
 endif
 
 # -------------------------------------------------------------
-# Compile-time transport defines
+# Compile-time defines (authoritative)
 # -------------------------------------------------------------
 
 CPP_DEFS =
+
+# Transport selection
 ifeq ($(ZPNET_TRANSPORT),HID)
 CPP_DEFS += -DZPNET_TRANSPORT_HID
 else ifeq ($(ZPNET_TRANSPORT),SERIAL)
 CPP_DEFS += -DZPNET_TRANSPORT_SERIAL
 endif
 
+# Enable LittleFS on QSPI flash (Teensy 4.1)
+# CLI-equivalent of: Tools → Flash Size → Program + LittleFS (QSPI)
+CPP_DEFS += -DLITTLEFS_QSPI
+
 # -------------------------------------------------------------
 # Toolchain
 # -------------------------------------------------------------
 
-NAME        = teensy
-ARDUINO_CLI = ../../bin/arduino-cli
+NAME          = teensy
+ARDUINO_CLI   = ../../bin/arduino-cli
 TEENSY_LOADER = teensy_loader_cli
 
 BOARD = teensy:avr:teensy41:usb=$(USB_MODE)
@@ -71,9 +81,11 @@ all: build
 build:
 	@echo "🔧 Building Teensy 4.1 ($(USB_LABEL))..."
 	@echo "    Transport mode: $(ZPNET_TRANSPORT)"
+	@echo "    NVM backend:    LittleFS (QSPI)"
 	$(ARDUINO_CLI) compile \
 	  --fqbn $(BOARD) \
-	  --build-property build.extra_flags="$(CPP_DEFS)" \
+	  --build-property compiler.c.extra_flags="$(CPP_DEFS)" \
+	  --build-property compiler.cpp.extra_flags="$(CPP_DEFS)" \
 	  . \
 	  --output-dir ./build
 
@@ -119,6 +131,7 @@ info:
 	@echo "ℹ️  Transport mode: $(ZPNET_TRANSPORT)"
 	@echo "ℹ️  USB mode:       $(USB_MODE)"
 	@echo "ℹ️  Board FQBN:     $(BOARD)"
+	@echo "ℹ️  NVM enabled:    LITTLEFS_QSPI"
 	@echo
 	$(ARDUINO_CLI) board list
 

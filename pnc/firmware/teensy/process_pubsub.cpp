@@ -6,20 +6,21 @@
 //
 // Responsibilities:
 //   • Ingress for TRAFFIC_PUBLISH_SUBSCRIBE (0xD2)
-//   • Command-oriented experimentation surface
-//   • Delegation to publish() / publish_local()
+//   • Diagnostic / experimental command surface
+//   • Delegation to process_publish_dispatch()
 //
 // Non-responsibilities:
 //   • Routing
 //   • Fan-out to Pi processes
 //   • Transport policy
+//   • Subscription mutation
 //
 // =============================================================
 
 #include "process_pubsub.h"
 
-#include "publish.h"
 #include "process.h"
+#include "publish.h"
 #include "payload.h"
 #include "debug.h"
 
@@ -28,6 +29,16 @@
 // ================================================================
 // Ingress: publications arriving from Pi
 // ================================================================
+//
+// Payload shape (authoritative):
+//   {
+//     "topic":   "...",
+//     "payload": { ... }
+//   }
+//
+// This function is registered directly with transport
+// for TRAFFIC_PUBLISH_SUBSCRIBE.
+//
 
 void process_publish_dispatch(const Payload& message) {
 
@@ -46,8 +57,8 @@ void process_publish_dispatch(const Payload& message) {
     payload = message.getPayload("payload");
   }
 
-  // Local delivery only — NEVER forward back to Pi
-  publish_local(topic, payload);
+  // Semantic local delivery only
+  process_publish_dispatch(topic, payload);
 }
 
 // ================================================================
@@ -55,11 +66,11 @@ void process_publish_dispatch(const Payload& message) {
 // ================================================================
 
 // ------------------------------------------------------------
-// PUBLISH — invoke publish() directly
+// PUBLISH — invoke local + Pi-forward publish path
 //
 // Args:
 //   {
-//     "topic": "...",
+//     "topic":   "...",
 //     "payload": { ... }
 //   }
 // ------------------------------------------------------------
@@ -83,21 +94,19 @@ static Payload cmd_publish(const Payload& args) {
     payload = args.getPayload("payload");
   }
 
+  // Reuse canonical publish path
   publish(topic, payload);
+
   return ok_payload();
 }
 
 // ------------------------------------------------------------
-// SUBSCRIBE — command-oriented subscription control
+// SUBSCRIBE — acknowledge intent only (diagnostic)
 //
-// Semantics (initial):
-//   • Experimental / diagnostic
-//   • Acknowledges intent
-//   • Does NOT mutate static subscription tables yet
-//
-// Future:
-//   • Persist override to NVM
-//   • Rebuild subscription view
+// Semantics:
+//   • Experimental / non-authoritative
+//   • Does NOT mutate subscription tables
+//   • Exists for future control-plane exploration
 // ------------------------------------------------------------
 static Payload cmd_subscribe(const Payload& args) {
 
@@ -114,7 +123,6 @@ static Payload cmd_subscribe(const Payload& args) {
     return p;
   }
 
-  // Acknowledge only (no mutation yet)
   p.add("status", "ACK");
   p.add("topic", topic);
 
@@ -129,7 +137,7 @@ static Payload cmd_subscribe(const Payload& args) {
 // Semantics:
 //   • Stateless
 //   • Read-only
-//   • Diagnostic only
+//   • Reflects declared subscriptions only
 // ------------------------------------------------------------
 static Payload cmd_report(const Payload&) {
 
@@ -142,14 +150,16 @@ static Payload cmd_report(const Payload&) {
     if (!v) continue;
 
     Payload proc;
-    proc.add("name", v->name);
+    proc.add("name", v->process_id);
 
     PayloadArray subs;
 
     if (v->subscriptions) {
-      for (size_t s = 0; s < v->subscription_count; s++) {
+      for (const process_subscription_entry_t* s = v->subscriptions;
+           s->topic;
+           ++s) {
         Payload entry;
-        entry.add("topic", v->subscriptions[s].topic);
+        entry.add("topic", s->topic);
         subs.add(entry);
       }
     }
@@ -169,17 +179,14 @@ static Payload cmd_report(const Payload&) {
 static const process_command_entry_t PUBSUB_COMMANDS[] = {
   { "PUBLISH",   cmd_publish   },
   { "SUBSCRIBE", cmd_subscribe },
-  { "REPORT",    cmd_report    }
+  { "REPORT",    cmd_report    },
+  { nullptr,     nullptr       }   // terminator
 };
 
 static const process_vtable_t PUBSUB_PROCESS = {
-  .name          = "PUBSUB",
-  .query         = nullptr,
-  .commands      = PUBSUB_COMMANDS,
-  .command_count = sizeof(PUBSUB_COMMANDS) / sizeof(PUBSUB_COMMANDS[0]),
-  .subscriptions = nullptr,
-  .subscription_count = 0,
-  .on_message    = nullptr
+  .process_id   = "PUBSUB",
+  .commands     = PUBSUB_COMMANDS,
+  .subscriptions = nullptr
 };
 
 void process_pubsub_register(void) {

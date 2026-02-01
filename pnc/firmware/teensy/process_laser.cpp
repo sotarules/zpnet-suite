@@ -187,13 +187,13 @@ static const process_command_entry_t LASER_COMMANDS[] = {
   { "REPORT", cmd_report },
   { "ON",     cmd_on     },
   { "OFF",    cmd_off    },
+  { nullptr,  nullptr }   // sentinel
 };
 
 static const process_vtable_t LASER_PROCESS = {
-  .name = "LASER",
-  .query = nullptr,
-  .commands = LASER_COMMANDS,
-  .command_count = 4,
+  .process_id    = "LASER",
+  .commands      = LASER_COMMANDS,
+  .subscriptions = nullptr,
 };
 
 void process_laser_register(void) {

@@ -174,19 +174,14 @@ static Payload cmd_get(const Payload& /*args*/) {
   return out;
 }
 
-// --------------------------------------------------------------
-// Registration
-// --------------------------------------------------------------
-
 static const process_command_entry_t EVENTS_COMMANDS[] = {
   { "GET", cmd_get },
 };
 
 static const process_vtable_t EVENTS_PROCESS = {
-  .name = "EVENTS",
-  .query = nullptr,
-  .commands = EVENTS_COMMANDS,
-  .command_count = 1
+  .process_id    = "EVENTS",
+  .commands      = EVENTS_COMMANDS,
+  .subscriptions = nullptr,
 };
 
 void process_events_register(void) {

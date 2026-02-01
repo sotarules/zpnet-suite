@@ -103,6 +103,49 @@ void debug_log(const char* name, const String& value) {
 }
 
 // =============================================================
+// Payload overload (native)
+// =============================================================
+//
+// Logs the serialized JSON form of a Payload.
+// Uses json_view() (zero-alloc) and emits as one debug line.
+//
+
+void debug_log(const char* name, const Payload& p) {
+
+    char line[512];
+    char prefix[64];
+
+    debug_prefix(prefix, sizeof(prefix), name);
+
+    JsonView v = p.json_view();
+
+    // Render prefix + JSON into bounded line buffer.
+    // If it doesn't fit, we truncate (debug is observability, not protocol).
+    size_t pos = 0;
+
+    int n0 = snprintf(line, sizeof(line), "%s", prefix);
+    if (n0 < 0) return;
+    pos = (size_t)n0;
+    if (pos >= sizeof(line)) {
+        line[sizeof(line) - 1] = '\0';
+        debug_emit(line);
+        return;
+    }
+
+    size_t remaining = sizeof(line) - pos - 1; // leave room for '\0'
+    size_t take = (v.len < remaining) ? v.len : remaining;
+
+    if (take > 0) {
+        memcpy(line + pos, v.data, take);
+        pos += take;
+    }
+
+    line[pos] = '\0';
+
+    debug_emit(line);
+}
+
+// =============================================================
 // Scalar overloads
 // =============================================================
 

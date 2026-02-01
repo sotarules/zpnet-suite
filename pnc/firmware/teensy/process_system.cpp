@@ -237,14 +237,14 @@ static const process_command_entry_t SYSTEM_COMMANDS[] = {
   { "ENTER_BOOTLOADER", cmd_enter_bootloader },
   { "SHUTDOWN",         cmd_shutdown         },
   { "PROCESS_LIST",     cmd_process_list     },
-  { "DEBUG",            cmd_debug            }
+  { "DEBUG",            cmd_debug            },
+  { nullptr,            nullptr }   // sentinel
 };
 
 static const process_vtable_t SYSTEM_PROCESS = {
-  .name          = "SYSTEM",
-  .query         = nullptr,
+  .process_id    = "SYSTEM",
   .commands      = SYSTEM_COMMANDS,
-  .command_count = sizeof(SYSTEM_COMMANDS) / sizeof(SYSTEM_COMMANDS[0]),
+  .subscriptions = nullptr,
 };
 
 void process_system_register(void) {

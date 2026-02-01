@@ -213,19 +213,16 @@ static const process_command_entry_t PHOTODIODE_COMMANDS[] = {
   { "REPORT", cmd_report },
   { "COUNT",  cmd_count  },
   { "CLEAR",  cmd_clear  },
+  { nullptr,  nullptr }   // sentinel
 };
 
 static const process_vtable_t PHOTODIODE_PROCESS = {
-  .name = "PHOTODIODE",
-  .query = nullptr,
-  .commands = PHOTODIODE_COMMANDS,
-  .command_count = 4,
+  .process_id    = "PHOTODIODE",
+  .commands      = PHOTODIODE_COMMANDS,
+  .subscriptions = nullptr,
 };
-
-// ------------------------------------------------------------
-// Registration
-// ------------------------------------------------------------
 
 void process_photodiode_register(void) {
   process_register("PHOTODIODE", &PHOTODIODE_PROCESS);
 }
+

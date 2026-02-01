@@ -121,13 +121,13 @@ static Payload cmd_clear(const Payload&) {
 static const process_command_entry_t CLOCKS_COMMANDS[] = {
   { "REPORT", cmd_report },
   { "CLEAR",  cmd_clear  },
+  { nullptr,  nullptr }   // sentinel
 };
 
 static const process_vtable_t CLOCKS_PROCESS = {
-  .name = "CLOCKS",
-  .query = nullptr,
-  .commands = CLOCKS_COMMANDS,
-  .command_count = 2,
+  .process_id    = "CLOCKS",
+  .commands      = CLOCKS_COMMANDS,
+  .subscriptions = nullptr,
 };
 
 void process_clocks_register(void) {
