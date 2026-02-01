@@ -22,6 +22,7 @@
 #include "process_photodiode.h"
 #include "process_tempest.h"
 #include "process_system.h"
+#include "process_pubsub.h"
 
 #include <Arduino.h>
 
@@ -133,6 +134,11 @@ void setup() {
     process_command
   );
 
+  transport_register_receive_callback(
+    TRAFFIC_PUBLISH_SUBSCRIBE,
+    process_publish_dispatch
+  );
+
   transport_init();
 
   // ----------------------------------------------------------
@@ -140,9 +146,6 @@ void setup() {
   // ----------------------------------------------------------
 
   debug_init();
-
-  // Optional: enable periodic beacon once transport is stable
-  //debug_beacon();
 
   debug_log("boot", "setup begin");
 
@@ -161,6 +164,10 @@ void setup() {
   debug_log("boot", "process_init");
   process_init();
   debug_log("boot", "process_init done");
+
+  // ----------------------------------------------------------
+  // Events subsystem
+  // ----------------------------------------------------------
 
   debug_log("boot", "process_events_init");
   process_events_init();
@@ -211,6 +218,10 @@ void setup() {
   debug_log("boot", "process_tempest_register");
   process_tempest_register();
   debug_log("boot", "process_tempest_register done");
+
+  debug_log("boot", "process_pubsub_register");
+  process_pubsub_register();
+  debug_log("boot", "process_pubsub_register done");
 
   debug_log("boot", "process_system_register");
   process_system_register();

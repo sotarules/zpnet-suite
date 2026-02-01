@@ -81,7 +81,7 @@ def cmd_subscribe(_: Optional[dict]) -> Dict:
     payload: Payload = {}
     payload["subsystem"] = "EVENTS"
     payload["topics"] = ["GNSS_NEWS_FEED"]
-    publish("SUBSCRIPTION", payload)
+    publish("SUBSCRIBE", payload)
     return {
         "success": True,
         "message": "OK",

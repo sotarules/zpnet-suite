@@ -8,6 +8,7 @@ Role:
   • Own Pi-side pub/sub ingress
   • Maintain authoritative subscription table
   • Route published traffic to Pi subsystems
+  • Bridge Pi <-> Teensy pub/sub (0xD2)
 
 Semantics:
   • All transport callbacks receive semantic JSON payloads
@@ -32,6 +33,7 @@ from typing import Dict, Any, Optional, TextIO, Set
 from zpnet.shared.constants import (
     TRAFFIC_REQUEST_RESPONSE,
     TRAFFIC_DEBUG,
+    TRAFFIC_PUBLISH_SUBSCRIBE,
 )
 from zpnet.shared.logger import setup_logging
 from zpnet.shared.util import payload_to_json_str, payload_to_json_bytes
@@ -67,7 +69,7 @@ logger = logging.getLogger(__name__)
 pending_replies: Dict[int, Queue] = {}
 req_id_counter = itertools.count(1)
 
-# Pub/Sub subscription table
+# Pub/Sub subscription table: subsystem -> set(topics)
 subscriptions: Dict[str, Set[str]] = {}
 
 state_lock = threading.Lock()
@@ -88,7 +90,6 @@ def open_debug_log() -> None:
 # ---------------------------------------------------------------------
 
 def on_receive_debug(payload: Dict[str, Any]) -> None:
-
     if debug_log_fh:
         debug_log_fh.write(payload_to_json_str(payload) + "\n")
 
@@ -105,6 +106,18 @@ def on_receive_request_response(payload: Dict[str, Any]) -> None:
         raise RuntimeError(f"Unexpected req_id {req_id}")
 
     q.put(payload)
+
+
+def on_receive_publish_subscribe(payload: Dict[str, Any]) -> None:
+    """
+    Pub/Sub ingress from Teensy (0xD2).
+
+    Semantics:
+      • Treated identically to Pi-originated publications
+      • Routed to Pi subscribers only
+      • MUST NOT be forwarded back to Teensy
+    """
+    route_publish(payload, forward_to_teensy=False)
 
 # ---------------------------------------------------------------------
 # RPC handler
@@ -161,24 +174,24 @@ def handle_client(conn: socket.socket) -> None:
         conn.close()
 
 # ---------------------------------------------------------------------
-# Pub/Sub ingress and routing
+# Pub/Sub routing core
 # ---------------------------------------------------------------------
 
-def route_publish(msg: Dict[str, Any]) -> None:
+def route_publish(msg: Dict[str, Any], *, forward_to_teensy: bool) -> None:
     topic = msg.get("topic")
     if not topic:
         raise RuntimeError("Published message missing topic")
 
     # -------------------------------------------------------------
-    # SUBSCRIPTION control plane
+    # SUBSCRIBE control plane
     # -------------------------------------------------------------
-    if topic == "SUBSCRIPTION":
+    if topic == "SUBSCRIBE":
         payload = msg.get("payload", {})
         subsystem = payload.get("subsystem")
         topics = payload.get("topics")
 
         if not subsystem or not isinstance(topics, list):
-            raise RuntimeError("Malformed SUBSCRIPTION message")
+            raise RuntimeError("Malformed SUBSCRIBE message")
 
         with state_lock:
             subscriptions[subsystem] = set(topics)
@@ -191,7 +204,7 @@ def route_publish(msg: Dict[str, Any]) -> None:
         return
 
     # -------------------------------------------------------------
-    # Fan-out routing
+    # Fan-out to Pi subscribers
     # -------------------------------------------------------------
     with state_lock:
         targets = [
@@ -199,8 +212,6 @@ def route_publish(msg: Dict[str, Any]) -> None:
             for subsystem, topic_set in subscriptions.items()
             if topic in topic_set
         ]
-
-    logger.info("🚀 [pubsub] fan out routing for %s", targets)
 
     raw = payload_to_json_bytes(msg)
 
@@ -212,11 +223,16 @@ def route_publish(msg: Dict[str, Any]) -> None:
                 sock.sendall(raw)
                 sock.shutdown(socket.SHUT_WR)
         except Exception:
-            # Best-effort by design
-            continue
+            continue  # best-effort by design
+
+    # -------------------------------------------------------------
+    # Forward to Teensy (Pi-originated only)
+    # -------------------------------------------------------------
+    if forward_to_teensy:
+        transport_send(TRAFFIC_PUBLISH_SUBSCRIBE, msg)
 
 # ---------------------------------------------------------------------
-# Pub/Sub server
+# Pub/Sub server (Pi-side ingress)
 # ---------------------------------------------------------------------
 
 def pubsub_server() -> None:
@@ -236,7 +252,7 @@ def pubsub_server() -> None:
                 if not raw:
                     continue
                 msg = json.loads(raw.decode("utf-8"))
-                route_publish(msg)
+                route_publish(msg, forward_to_teensy=True)
 
     except Exception:
         logging.exception("💥 [pubsub_server] fatal exception")
@@ -283,6 +299,10 @@ def run() -> None:
         TRAFFIC_REQUEST_RESPONSE,
         on_receive_request_response,
     )
+    transport_register_receive_callback(
+        TRAFFIC_PUBLISH_SUBSCRIBE,
+        on_receive_publish_subscribe,
+    )
 
     try:
         threading.Thread(
@@ -302,6 +322,7 @@ def run() -> None:
 
     except Exception:
         logging.exception("💥 [teensy_listener] fatal crash")
+
 
 def bootstrap() -> None:
     run()

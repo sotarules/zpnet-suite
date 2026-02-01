@@ -164,7 +164,9 @@ static const process_vtable_t EVENTS_PROCESS = {
   .query = nullptr,
   .commands = EVENTS_COMMANDS,
   .command_count = 1,
-};
+  .subscribe = ["GNSS_NEWS_FEED"]  // Example subscription
+  .on_message = handle_message
+}
 
 void process_events_register(void) {
   process_register("EVENTS", &EVENTS_PROCESS);

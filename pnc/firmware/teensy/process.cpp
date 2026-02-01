@@ -67,10 +67,9 @@ Payload ok_payload() {
 // Canonical error payload helper
 // -----------------------------------------------------------------------------
 
-Payload make_error_payload(const char* error_msg) {
+static Payload make_error_payload(const char* error_msg) {
   Payload p;
 
-  // Defensive: never emit null or empty error msg
   if (error_msg && *error_msg) {
     p.add("error", error_msg);
   } else {
@@ -154,7 +153,7 @@ void process_command(const Payload& request) {
   Payload response;
 
   // ---------------------------------------------------------
-  // Add req_id to response no matter what (even errors)
+  // Add req_id to response no matter what
   // ---------------------------------------------------------
 
   if (request.has("req_id")) {

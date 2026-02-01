@@ -275,10 +275,14 @@ def on_message(topic: str, payload: Payload) -> None:
 
 def run() -> None:
     setup_logging()
-
     try:
         threading.Thread(
             target=gnss_reader,
+            daemon=True,
+        ).start()
+
+        threading.Thread(
+            target=stream_server,
             daemon=True,
         ).start()
 
