@@ -3,6 +3,14 @@
 #include "payload.h"
 
 // -----------------------------------------------------------------------------
+// Public publish()
+// -----------------------------------------------------------------------------
+
+void publish(const char* topic, const Payload& payload);
+
+void publish_local(const char* topic, const Payload& payload);
+
+// -----------------------------------------------------------------------------
 // Entry point for TRAFFIC_PUBLISH_SUBSCRIBE (0xD2)
 // -----------------------------------------------------------------------------
 //

@@ -42,25 +42,27 @@ _last_count: int = 0
 # Polling thread (fault barrier)
 # ---------------------------------------------------------------------
 
-def despooler_loop() -> None:
+def event_despooler(payload: Payload) -> None:
     import logging
     global _last_drain_ts, _last_count
 
     try:
-        while True:
-            payload = send_command(machine="TEENSY", subsystem="EVENTS", command="GET")["payload"]
-            for item in payload["events"]:
-                create_event(item["event_type"], item.get("payload"))
-            count = len(payload)
-            _last_count = count
-            _last_drain_ts = time.time()
-            time.sleep(POLL_INTERVAL_S)
+        for item in payload["events"]:
+            create_event(item["event_type"], item.get("payload"))
+        count = len(payload)
+        _last_count = count
+        _last_drain_ts = time.time()
 
     except Exception:
         logging.exception(
             "💥 [event_despooler] unhandled exception — despooler thread terminating"
         )
 
+def setup_events() -> None:
+    payload: Payload = {}
+    payload["subsystem"] = "EVENTS"
+    payload["topics"] = ["EVENTS"]
+    publish("SUBSCRIBE", payload)
 
 # ---------------------------------------------------------------------
 # Command surface
@@ -113,6 +115,8 @@ COMMANDS = {
 
 def on_message(topic: str, payload: Payload) -> None:
     logging.info("🚀 [event_despooler] received message on topic %s: %s", topic, payload)
+    event_despooler(payload)
+
 
 # ---------------------------------------------------------------------
 # Entrypoint
@@ -120,17 +124,18 @@ def on_message(topic: str, payload: Payload) -> None:
 
 def run() -> None:
     setup_logging()
-
+    setup_events()
     try:
-        threading.Thread(
-            target=despooler_loop,
-            daemon=True,
-        ).start()
+
+        #threading.Thread(
+        #    target=despooler_loop,
+        #    daemon=True,
+        #).start()
 
         server_setup(
             subsystem="EVENTS",
             commands=COMMANDS,
-            subscriptions=["GNSS_NEWS_FEED"],
+            subscriptions=["EVENTS"],
             on_message=on_message,
         )
 

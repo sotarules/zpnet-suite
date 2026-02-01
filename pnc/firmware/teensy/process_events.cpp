@@ -24,6 +24,7 @@
 #include "transport.h"
 #include "util.h"
 #include "timepop.h"
+#include "publish.h"
 
 #include <Arduino.h>
 
@@ -47,17 +48,7 @@ static size_t evt_head  = 0;
 static size_t evt_tail  = 0;
 static size_t evt_count = 0;
 
-// --------------------------------------------------------------
-// Explicit initialization
-// --------------------------------------------------------------
-//
-// EVENTS depends on TimePop to drain expired events.
-// This function must be called exactly once after timepop_init().
-//
 
-void process_events_init(void) {
-  // No operation
-}
 
 // --------------------------------------------------------------
 // Public API — enqueue durable event
@@ -106,6 +97,38 @@ void emit_system_error(
   enqueueEvent("SYSTEM_ERROR", ev);
 }
 
+static void publish_events(timepop_ctx_t*, void*) {
+
+  if (evt_count == 0) {
+    return;
+  }
+
+  Payload out;
+  PayloadArray events;
+
+  while (evt_count > 0) {
+
+    const EventItem& e = evtq[evt_tail];
+
+    Payload item;
+    item.add("event_type", e.type);
+
+    if (e.payload[0] != '\0') {
+      // Adopt trusted JSON object as a real sub-node
+      item.add_raw_object("payload", e.payload);
+    }
+
+    events.add(item);
+
+    evt_tail = (evt_tail + 1) % EVT_MAX;
+    evt_count--;
+  }
+
+  out.add_array("events", events);
+
+  debug_log("publish_events", (unsigned)events.size());
+  publish("EVENTS", out);
+}
 
 // --------------------------------------------------------------
 // Command: GET — return and clear all queued events
@@ -163,11 +186,22 @@ static const process_vtable_t EVENTS_PROCESS = {
   .name = "EVENTS",
   .query = nullptr,
   .commands = EVENTS_COMMANDS,
-  .command_count = 1,
-  .subscribe = ["GNSS_NEWS_FEED"]  // Example subscription
-  .on_message = handle_message
-}
+  .command_count = 1
+};
 
 void process_events_register(void) {
   process_register("EVENTS", &EVENTS_PROCESS);
+}
+
+// --------------------------------------------------------------
+// Explicit initialization
+// --------------------------------------------------------------
+void process_events_init(void) {
+  timepop_arm(
+    TIMEPOP_CLASS_EVENTBUS,
+    true,
+    publish_events,
+    nullptr,
+    "publish-events"
+  );
 }

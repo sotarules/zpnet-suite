@@ -132,6 +132,13 @@ const char* process_get_name(size_t idx) {
   return registry[idx].id;
 }
 
+const process_vtable_t* process_get_vtable(size_t idx) {
+  if (idx >= registry_count) {
+    return nullptr;
+  }
+  return registry[idx].vtable;
+}
+
 // -----------------------------------------------------------------------------
 // Unified REQUEST / RESPONSE command processor
 // -----------------------------------------------------------------------------

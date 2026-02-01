@@ -618,6 +618,29 @@ bool tempest_tau_profile(uint32_t total_seconds) {
   return true;
 }
 
+static void tempest_on_message(const char* topic, const Payload& payload) {
+
+  // Defensive: only handle what we subscribed to
+  if (strcmp(topic, "GNSS_NEWS_FEED") != 0) {
+    return;
+  }
+
+  // For now, just extract / log / stash
+  // (You can replace this with real TEMPEST logic later)
+
+  // Example: best-effort observability
+  debug_log("tempest.gnss", topic);
+
+  // TODO:
+  //  - correlate with local clock state
+  //  - update internal TEMPEST structures
+  //  - emit derived events if needed
+}
+
+static const process_subscription_entry_t TEMPEST_SUBSCRIPTIONS[] = {
+  { "GNSS_NEWS_FEED" }
+};
+
 // ================================================================
 // Registration
 // ================================================================
@@ -629,10 +652,18 @@ static const process_command_entry_t TEMPEST_COMMANDS[] = {
 };
 
 static const process_vtable_t TEMPEST_PROCESS = {
-  .name = "TEMPEST",
-  .query = nullptr,
-  .commands = TEMPEST_COMMANDS,
-  .command_count = 3,
+  .name               = "TEMPEST",
+  .query              = nullptr,
+
+  // Command surface
+  .commands           = TEMPEST_COMMANDS,
+  .command_count      = 3,
+
+  // Pub/Sub surface
+  .subscriptions      = TEMPEST_SUBSCRIPTIONS,
+  .subscription_count = sizeof(TEMPEST_SUBSCRIPTIONS)
+                          / sizeof(TEMPEST_SUBSCRIPTIONS[0]),
+  .on_message         = tempest_on_message,
 };
 
 void process_tempest_register(void) {

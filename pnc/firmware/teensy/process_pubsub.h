@@ -4,3 +4,6 @@
 
 // Entry point for TRAFFIC_PUBLISH_SUBSCRIBE
 void process_publish_dispatch(const Payload& message);
+
+// Register the PUBSUB process command surface
+void process_pubsub_register(void);
