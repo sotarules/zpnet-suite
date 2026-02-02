@@ -4,6 +4,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <ctype.h>
 
 // =============================================================
 // Configuration
@@ -89,27 +90,6 @@ struct JsonBuf {
 
 } // namespace
 
-/*
-  ============================================================================
-
-  Payload — Semantic State Holder
-  -------------------------------
-  entries[] is authoritative.
-  JSON serialization is a bounded, heap-free derivative.
-
-  json_view():
-    • Returns a transient view into an internal static buffer
-    • Caller must consume immediately
-    • No allocation, no ownership transfer
-
-  to_json():
-    • Legacy convenience wrapper
-    • Allocates exactly once
-    • Should not be used on hot paths
-
-  ============================================================================
-*/
-
 // =============================================================
 // Payload
 // =============================================================
@@ -135,7 +115,6 @@ JsonView Payload::json_view() const {
 
   static JsonBuf jb;
 
-  // Reset buffer
   jb.len = 0;
   jb.overflow = false;
   jb.buf[0] = '\0';
@@ -159,7 +138,6 @@ JsonView Payload::json_view() const {
       case 'p': {
         const char* s = e.value.c_str();
 
-        // Raw literals: true / false / numbers
         if (!strcmp(s, "true") || !strcmp(s, "false")) {
           jb.append(s);
         } else {
@@ -167,7 +145,7 @@ JsonView Payload::json_view() const {
           strtod(s, &end);
 
           if (s[0] != '\0' && end && *end == '\0') {
-            jb.append(s); // valid number
+            jb.append(s);
           } else {
             jb.append_char('\"');
             jb.append_escaped(s);
@@ -179,7 +157,6 @@ JsonView Payload::json_view() const {
 
       case 'o':
       case 'a':
-        // Pre-validated raw JSON fragments
         jb.append(e.value.c_str());
         break;
 
@@ -210,7 +187,7 @@ String Payload::to_json() const {
 }
 
 // =============================================================
-// Semantic construction — unchanged
+// Semantic construction
 // =============================================================
 
 void Payload::add(const char* key, const char* value) {
@@ -294,7 +271,7 @@ bool Payload::parseJSON(const uint8_t* data, size_t len) {
     String key =
       String((const char*)data + key_start).substring(0, i - key_start);
 
-    i++; // skip closing quote
+    i++;
 
     while (i < len && data[i] != ':') i++;
     if (i >= len) break;
@@ -321,7 +298,6 @@ bool Payload::parseJSON(const uint8_t* data, size_t len) {
     String raw_value =
       String((const char*)data + value_start).substring(0, i - value_start);
 
-    // Canonicalize quoted strings once
     if (kind == 'p' &&
         raw_value.length() >= 2 &&
         raw_value[0] == '"' &&
@@ -336,7 +312,6 @@ bool Payload::parseJSON(const uint8_t* data, size_t len) {
 
   return true;
 }
-
 
 // =============================================================
 // Lookup / Accessors
@@ -354,7 +329,7 @@ bool Payload::has(const char* key) const {
 }
 
 // -------------------------------------------------------------
-// Primitive accessors — owned, stable, order-independent
+// Primitive accessors
 // -------------------------------------------------------------
 
 const char* Payload::getString(const char* key) const {
@@ -442,52 +417,110 @@ PayloadArray Payload::getArray(const char* key) const {
 }
 
 // =============================================================
-// Diagnostics
+// Structured accessors (read-only views)
 // =============================================================
 
-void Payload::debug_dump(const char* tag) const {
+bool Payload::hasArray(const char* key) const {
+  const Entry* e = find(key);
+  return e && e->kind == 'a';
+}
 
-  char line[128];
-
-  snprintf(
-    line,
-    sizeof(line),
-    "Payload dump (%s): %u entr%s",
-    tag ? tag : "",
-    (unsigned)entry_count,
-    entry_count == 1 ? "y" : "ies"
-  );
-  debug_log("payload", line);
-
-  for (size_t i = 0; i < entry_count; i++) {
-
-    const Entry& e = entries[i];
-
-    const char* kind =
-      e.kind == 'p' ? "primitive" :
-      e.kind == 'o' ? "object" :
-      e.kind == 'a' ? "array" :
-      "unknown";
-
-    debug_log("payload.key", e.key.c_str());
-    debug_log("payload.kind", kind);
-
-    const char* v = e.value.c_str();
-
-    char preview[96];
-    size_t n = strlen(v);
-    if (n > sizeof(preview) - 1) {
-      n = sizeof(preview) - 1;
-    }
-    memcpy(preview, v, n);
-    preview[n] = '\0';
-
-    debug_log("payload.value", preview);
+PayloadArrayView Payload::getArrayView(const char* key) const {
+  const Entry* e = find(key);
+  if (!e || e->kind != 'a') {
+    return PayloadArrayView();
   }
+  return PayloadArrayView(e->value.c_str(), e->value.length());
 }
 
 // =============================================================
-// PayloadArray — restored for compatibility
+// PayloadArrayView — implementation
+// =============================================================
+
+PayloadArrayView::PayloadArrayView()
+  : _json(nullptr), _len(0) {}
+
+PayloadArrayView::PayloadArrayView(const char* json, size_t len)
+  : _json(json), _len(len) {}
+
+bool PayloadArrayView::valid() const {
+  return _json && _len >= 2 && _json[0] == '[';
+}
+
+size_t PayloadArrayView::size() const {
+  if (!valid()) return 0;
+
+  size_t count = 0;
+  int depth = 0;
+  bool in_string = false;
+
+  for (size_t i = 0; i < _len; i++) {
+    char c = _json[i];
+
+    if (c == '"' && (i == 0 || _json[i - 1] != '\\')) {
+      in_string = !in_string;
+    }
+
+    if (in_string) continue;
+
+    if (c == '{' || c == '[') depth++;
+    if (c == '}' || c == ']') depth--;
+
+    if (c == ',' && depth == 1) {
+      count++;
+    }
+  }
+
+  return count + 1;
+}
+
+Payload PayloadArrayView::get(size_t index) const {
+  Payload out;
+  if (!valid()) return out;
+
+  size_t current = 0;
+  int depth = 0;
+  bool in_string = false;
+  size_t start = 0;
+
+  for (size_t i = 1; i < _len; i++) {
+
+    char c = _json[i];
+
+    if (c == '"' && _json[i - 1] != '\\') {
+      in_string = !in_string;
+    }
+
+    if (in_string) continue;
+
+    if (c == '{' || c == '[') {
+      if (depth == 0 && current == index) {
+        start = i;
+      }
+      depth++;
+    }
+
+    if (c == '}' || c == ']') {
+      depth--;
+      if (depth == 0 && current == index) {
+        out.parseJSON(
+          (const uint8_t*)(_json + start),
+          i - start + 1
+        );
+        return out;
+      }
+    }
+
+    if (c == ',' && depth == 0) {
+      current++;
+    }
+  }
+
+  return Payload();
+}
+
+// =============================================================
+// PayloadArray — legacy implementation (unchanged)
 // =============================================================
 
 PayloadArray::PayloadArray()
@@ -531,7 +564,7 @@ bool PayloadArray::parseJSON(const char* json) {
   item_count = 0;
   if (!json || json[0] != '[') return false;
 
-  int i = 1; // skip '['
+  int i = 1;
   while (json[i] && item_count < MAX_ITEMS) {
 
     while (json[i] && json[i] != '{') i++;
@@ -564,4 +597,45 @@ size_t PayloadArray::size() const {
 Payload PayloadArray::get(size_t idx) const {
   if (idx >= item_count) return Payload();
   return items[idx];
+}
+
+void Payload::debug_dump(const char* tag) const {
+
+  char line[128];
+
+  snprintf(
+    line,
+    sizeof(line),
+    "Payload dump (%s): %u entr%s",
+    tag ? tag : "",
+    (unsigned)entry_count,
+    entry_count == 1 ? "y" : "ies"
+  );
+  debug_log("payload", line);
+
+  for (size_t i = 0; i < entry_count; i++) {
+
+    const Entry& e = entries[i];
+
+    const char* kind =
+      e.kind == 'p' ? "primitive" :
+      e.kind == 'o' ? "object" :
+      e.kind == 'a' ? "array" :
+      "unknown";
+
+    debug_log("payload.key", e.key.c_str());
+    debug_log("payload.kind", kind);
+
+    const char* v = e.value.c_str();
+
+    char preview[96];
+    size_t n = strlen(v);
+    if (n > sizeof(preview) - 1) {
+      n = sizeof(preview) - 1;
+    }
+    memcpy(preview, v, n);
+    preview[n] = '\0';
+
+    debug_log("payload.value", preview);
+  }
 }

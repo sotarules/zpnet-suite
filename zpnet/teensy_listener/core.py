@@ -1,11 +1,14 @@
 """
-ZPNet Teensy Listener — Deterministic RPC Broker + Pub/Sub Router (VERBOSE)
+ZPNet Teensy Listener — Deterministic RPC Broker + Pub/Sub Router
 
-This version is intentionally noisy.
-Its purpose is to make the entire control-plane and data-plane observable
-while the pub/sub architecture settles.
+Roles:
+  • Pi-side device driver for Teensy (RPC + pub/sub transport)
+  • Authoritative pub/sub router
+  • First-class Pi process (PUBSUB) for orchestration & introspection
 
-REMOVE OR DOWNGRADE LOGGING ONCE STABLE.
+IMPORTANT:
+  • SUBSCRIBE / UNSUBSCRIBE are COMMANDS ONLY
+  • Pub/Sub channel is DATA PLANE ONLY
 """
 
 from __future__ import annotations
@@ -16,24 +19,22 @@ import logging
 import os
 import socket
 import threading
-import time
-import json
 from queue import Queue, Empty
-from typing import Dict, Any, Optional, TextIO, Set
+from typing import Dict, Any, Optional, TextIO, Set, List
 
+from zpnet.processes.processes import server_setup, send_command, list_subsystems
 from zpnet.shared.constants import (
     TRAFFIC_REQUEST_RESPONSE,
     TRAFFIC_DEBUG,
     TRAFFIC_PUBLISH_SUBSCRIBE,
 )
 from zpnet.shared.logger import setup_logging
-from zpnet.shared.util import payload_to_json_str, payload_to_json_bytes
 from zpnet.shared.transport import (
     transport_send,
     transport_register_receive_callback,
     transport_init,
 )
-from zpnet.shared.db import open_db
+from zpnet.shared.util import payload_to_json_str, payload_to_json_bytes
 
 # ---------------------------------------------------------------------
 # Configuration
@@ -49,10 +50,7 @@ MAX_TEENSY_RETRIES = 3
 REPLY_TIMEOUT_S = 3.0
 
 DEBUG_LOG_PATH = "/home/mule/zpnet/logs/zpnet-debug.log"
-
 SOCKET_DIR = "/tmp"
-
-logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------
 # Global state
@@ -61,11 +59,10 @@ logger = logging.getLogger(__name__)
 pending_replies: Dict[int, Queue] = {}
 req_id_counter = itertools.count(1)
 
-# Pub/Sub subscription table: subsystem -> set(topics)
+# Router state (empty until applied later)
 subscriptions: Dict[str, Set[str]] = {}
 
 state_lock = threading.Lock()
-
 debug_log_fh: Optional[TextIO] = None
 
 # ---------------------------------------------------------------------
@@ -76,21 +73,18 @@ def open_debug_log() -> None:
     global debug_log_fh
     os.makedirs(os.path.dirname(DEBUG_LOG_PATH), exist_ok=True)
     debug_log_fh = open(DEBUG_LOG_PATH, "w", buffering=1)
-    logger.info("📝 [debug] debug log opened at %s", DEBUG_LOG_PATH)
+    logging.info("📝 [debug] debug log opened at %s", DEBUG_LOG_PATH)
 
 # ---------------------------------------------------------------------
-# Teensy receive callbacks (semantic only)
+# Teensy receive callbacks
 # ---------------------------------------------------------------------
 
 def on_receive_debug(payload: Dict[str, Any]) -> None:
-    logger.info("🐞 [rx-debug] %s", payload)
+    logging.info("🐞 [rx-debug] %s", payload)
     if debug_log_fh:
         debug_log_fh.write(payload_to_json_str(payload) + "\n")
 
-
 def on_receive_request_response(payload: Dict[str, Any]) -> None:
-    logger.info("📥 [rx-rpc] response payload=%s", payload)
-
     req_id = payload.get("req_id")
     if req_id is None:
         raise RuntimeError("Response missing req_id")
@@ -103,20 +97,11 @@ def on_receive_request_response(payload: Dict[str, Any]) -> None:
 
     q.put(payload)
 
-
 def on_receive_publish_subscribe(payload: Dict[str, Any]) -> None:
-    """
-    Pub/Sub ingress from Teensy (0xD2).
-    """
-    logger.info(
-        "📥 [rx-0xD2] publish from TEENSY topic=%s payload=%s",
-        payload.get("topic"),
-        payload.get("payload"),
-    )
     route_publish(payload, forward_to_teensy=False)
 
 # ---------------------------------------------------------------------
-# RPC handler
+# RPC handler (Pi → Teensy)
 # ---------------------------------------------------------------------
 
 def handle_client(conn: socket.socket) -> None:
@@ -129,8 +114,6 @@ def handle_client(conn: socket.socket) -> None:
             return
 
         req = json.loads(raw.decode("utf-8"))
-        logger.info("📤 [rpc] incoming request %s", req)
-
         req_id = next(req_id_counter)
         req["req_id"] = req_id
 
@@ -138,44 +121,20 @@ def handle_client(conn: socket.socket) -> None:
         with state_lock:
             pending_replies[req_id] = q
 
-        for attempt in range(1, MAX_TEENSY_RETRIES + 1):
-            logger.info(
-                "📡 [rpc] sending to TEENSY req_id=%s attempt=%d",
-                req_id,
-                attempt,
-            )
+        for _ in range(MAX_TEENSY_RETRIES):
             transport_send(TRAFFIC_REQUEST_RESPONSE, req)
-
             try:
                 reply = q.get(timeout=REPLY_TIMEOUT_S)
-                logger.info(
-                    "✅ [rpc] reply received req_id=%s payload=%s",
-                    req_id,
-                    reply,
-                )
-                conn.sendall(
-                    json.dumps(reply, separators=(",", ":")).encode("utf-8")
-                )
+                conn.sendall(json.dumps(reply, separators=(",", ":")).encode())
                 return
-
             except Empty:
-                logger.warning(
-                    "⏳ [rpc] timeout waiting for reply req_id=%s",
-                    req_id,
-                )
+                continue
 
-        failure = {
+        conn.sendall(json.dumps({
             "req_id": req_id,
             "success": False,
-            "message": (
-                f"TEENSY did not respond after "
-                f"{MAX_TEENSY_RETRIES} attempts"
-            ),
-        }
-
-        conn.sendall(
-            json.dumps(failure, separators=(",", ":")).encode("utf-8")
-        )
+            "message": "TEENSY did not respond",
+        }).encode())
 
     finally:
         if req_id is not None:
@@ -184,240 +143,302 @@ def handle_client(conn: socket.socket) -> None:
         conn.close()
 
 # ---------------------------------------------------------------------
-# Persisten subscription loader
-# ---------------------------------------------------------------------
-
-def load_persisted_subscriptions() -> Dict[str, Set[str]]:
-    """
-    Load subscription state from system.subscriptions.
-
-    Returns:
-        dict: subsystem -> set(topics)
-    """
-    with open_db(row_dict=True) as conn:
-        cur = conn.cursor()
-        cur.execute(
-            "SELECT subscriptions FROM system WHERE id = 1"
-        )
-        row = cur.fetchone()
-
-    if not row or not row["subscriptions"]:
-        return {}
-
-    raw = row["subscriptions"]  # psycopg decodes JSONB -> Python dict
-    return {
-        subsystem: set(topics)
-        for subsystem, topics in raw.items()
-    }
-
-# ---------------------------------------------------------------------
-# Persisten subscription saver
-# ---------------------------------------------------------------------
-
-def persist_subscriptions(subscriptions: Dict[str, Set[str]]) -> None:
-    """
-    Persist current subscription table into system.subscriptions.
-
-    Semantics:
-      • clobber-and-go
-      • authoritative
-    """
-    payload = {
-        subsystem: sorted(topics)
-        for subsystem, topics in subscriptions.items()
-    }
-
-    with open_db() as conn:
-        cur = conn.cursor()
-        cur.execute(
-            """
-            UPDATE system
-            SET subscriptions = %s::jsonb,
-                updated_at = now()
-            WHERE id = 1
-            """,
-            (json.dumps(payload),),
-        )
-
-# ---------------------------------------------------------------------
-# Pub/Sub routing core (HEAVILY INSTRUMENTED)
+# Pub/Sub routing core (DATA PLANE ONLY)
 # ---------------------------------------------------------------------
 
 def route_publish(msg: Dict[str, Any], *, forward_to_teensy: bool) -> None:
     topic = msg.get("topic")
-    payload = msg.get("payload")
-
-    logger.info(
-        "📨 [pubsub] incoming publish topic=%s forward_to_teensy=%s payload=%s",
-        topic,
-        forward_to_teensy,
-        payload,
-    )
-
     if not topic:
-        raise RuntimeError("Published message missing topic")
-
-    # -------------------------------------------------------------
-    # SUBSCRIBE control plane (announcement)
-    # -------------------------------------------------------------
-    if topic == "SUBSCRIBE":
-        subsystem = payload.get("subsystem")
-        topics = payload.get("topics")
-
-        if not subsystem or not isinstance(topics, list):
-            raise RuntimeError("Malformed SUBSCRIBE message")
-
-        with state_lock:
-            subscriptions[subsystem] = set(topics)
-
-        persist_subscriptions(subscriptions)
-
-        logger.info(
-            "🚀 [pubsub] subscription announcement ACCEPTED subsystem=%s topics=%s",
-            subsystem,
-            topics,
-        )
-
-        logger.info(
-            "🧭 [pubsub] current subscription table=%s",
-            {k: sorted(v) for k, v in subscriptions.items()},
-        )
-
-        if forward_to_teensy:
-            logger.info(
-                "📡 [pubsub] REPEATING subscription announcement to TEENSY %s -> %s",
-                subsystem,
-                topics,
-            )
-            transport_send(TRAFFIC_PUBLISH_SUBSCRIBE, msg)
-
         return
 
-    # -------------------------------------------------------------
-    # Fan-out to Pi subscribers (data plane)
-    # -------------------------------------------------------------
     with state_lock:
-        logger.info(
-            "🧭 [pubsub] routing snapshot subscriptions=%s",
-            {k: sorted(v) for k, v in subscriptions.items()},
-        )
-
         targets = [
             subsystem
             for subsystem, topic_set in subscriptions.items()
             if topic in topic_set
         ]
 
-    logger.info(
-        "🎯 [pubsub] routing decision topic=%s targets=%s",
-        topic,
-        targets,
-    )
-
     raw = payload_to_json_bytes(msg)
 
     for subsystem in targets:
         sock_path = f"{SOCKET_DIR}/zpnet-{subsystem.lower()}-pubsub.sock"
-        logger.info(
-            "📤 [pubsub] fan-out ATTEMPT topic=%s -> %s",
-            topic,
-            sock_path,
-        )
         try:
             with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
                 sock.connect(sock_path)
                 sock.sendall(raw)
                 sock.shutdown(socket.SHUT_WR)
-            logger.info(
-                "✅ [pubsub] fan-out SUCCESS topic=%s -> %s",
-                topic,
-                subsystem,
-            )
-        except Exception as e:
-            logger.warning(
-                "⚠️ [pubsub] fan-out FAILED topic=%s -> %s err=%r",
-                topic,
-                subsystem,
-                e,
-            )
+        except Exception:
+            logging.warning("⚠️ [pubsub] fan-out failed %s -> %s", topic, subsystem)
 
-    # -------------------------------------------------------------
-    # Forward to Teensy (Pi-originated only)
-    # -------------------------------------------------------------
     if forward_to_teensy:
-        logger.info(
-            "📡 [pubsub] forwarding publish to TEENSY topic=%s payload=%s",
-            topic,
-            payload,
-        )
         transport_send(TRAFFIC_PUBLISH_SUBSCRIBE, msg)
 
 # ---------------------------------------------------------------------
-# Pub/Sub server (Pi-side ingress)
+# Servers
 # ---------------------------------------------------------------------
 
 def pubsub_server() -> None:
-    try:
-        if os.path.exists(PS_SOCKET_PATH):
-            os.unlink(PS_SOCKET_PATH)
+    if os.path.exists(PS_SOCKET_PATH):
+        os.unlink(PS_SOCKET_PATH)
 
-        srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        srv.bind(PS_SOCKET_PATH)
-        os.chmod(PS_SOCKET_PATH, 0o660)
-        srv.listen(PS_BACKLOG)
+    srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    srv.bind(PS_SOCKET_PATH)
+    srv.listen(PS_BACKLOG)
 
-        logger.info(
-            "🟢 [pubsub-server] listening on %s backlog=%d",
-            PS_SOCKET_PATH,
-            PS_BACKLOG,
-        )
-
-        while True:
-            conn, _ = srv.accept()
-            with conn:
-                raw = conn.recv(65536)
-                if not raw:
-                    continue
-                msg = json.loads(raw.decode("utf-8"))
-                logger.info(
-                    "📥 [pubsub-server] received from PI socket msg=%s",
-                    msg,
-                )
-                route_publish(msg, forward_to_teensy=True)
-
-    except Exception:
-        logging.exception("💥 [pubsub_server] fatal exception")
-
-# ---------------------------------------------------------------------
-# RPC server
-# ---------------------------------------------------------------------
+    while True:
+        conn, _ = srv.accept()
+        with conn:
+            raw = conn.recv(65536)
+            if not raw:
+                continue
+            msg = json.loads(raw.decode())
+            route_publish(msg, forward_to_teensy=True)
 
 def rpc_server() -> None:
+    if os.path.exists(RPC_SOCKET_PATH):
+        os.unlink(RPC_SOCKET_PATH)
+
+    srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    srv.bind(RPC_SOCKET_PATH)
+    srv.listen(RPC_BACKLOG)
+
+    while True:
+        conn, _ = srv.accept()
+        threading.Thread(target=handle_client, args=(conn,), daemon=True).start()
+
+def build_teensy_setsubscriptions_payload(union_subs: list[dict]) -> dict:
+    """
+    Convert union subscription truth into Teensy SETSUBSCRIPTIONS payload.
+    """
+
+    entries = []
+
+    for row in union_subs:
+        if row.get("machine") != "TEENSY":
+            continue
+
+        process = row.get("subsystem")
+        subs = row.get("subscriptions", [])
+
+        topics = [s["name"] for s in subs if "name" in s]
+
+        if not process or not topics:
+            continue
+
+        entries.append({
+            "process": process,
+            "topics": topics,
+        })
+
+    return {
+        "subscriptions": entries
+    }
+
+# ---------------------------------------------------------------------
+# PUBSUB command surface
+# ---------------------------------------------------------------------
+
+def cmd_report(_: Optional[dict]) -> Dict[str, Any]:
+    with state_lock:
+        return {
+            "success": True,
+            "message": "OK",
+            "payload": {
+                "subscriptions": {
+                    k: sorted(v) for k, v in subscriptions.items()
+                }
+            },
+        }
+
+def cmd_allsubscriptions(_: Optional[dict]) -> Dict[str, Any]:
+    results: List[Dict[str, Any]] = []
+
+    for subsystem in list_subsystems():
+
+        try:
+            # Self-query: answer directly
+            if subsystem == "PUBSUB":
+                results.append({
+                    "machine": "PI",
+                    "subsystem": "PUBSUB",
+                    "subscriptions": [],
+                })
+                continue
+
+            # IPC for real subsystems
+            resp = send_command(
+                machine="PI",
+                subsystem=subsystem,  # protocol identity
+                command="SUBSCRIPTIONS",
+            )
+
+            payload = resp.get("payload")
+            if payload:
+                results.append(payload)
+
+        except Exception:
+            logging.warning(
+                "⚠️ [pubsub] failed to query SUBSCRIPTIONS from %s",
+                subsystem,
+            )
+
+    return {
+        "success": True,
+        "message": "OK",
+        "payload": {
+            "subscriptions": results
+        },
+    }
+
+def cmd_unionsubscriptions(_: Optional[dict]) -> Dict[str, Any]:
+    """
+    Return the union of PI-side and TEENSY-side declared subscriptions.
+
+    Semantics:
+      • Observational only
+      • No routing mutation
+      • Best-effort
+      • Canonical payload shape
+    """
+
+    results: List[Dict[str, Any]] = []
+
+    # ------------------------------------------------------------
+    # 1. PI-side subscriptions (local)
+    # ------------------------------------------------------------
     try:
-        if os.path.exists(RPC_SOCKET_PATH):
-            os.unlink(RPC_SOCKET_PATH)
+        pi_resp = cmd_allsubscriptions(None)
+        pi_payload = pi_resp.get("payload", {}).get("subscriptions", [])
+        results.extend(pi_payload)
+    except Exception:
+        logging.warning("⚠️ [pubsub] failed to collect PI subscriptions")
 
-        srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        srv.bind(RPC_SOCKET_PATH)
-        os.chmod(RPC_SOCKET_PATH, 0o660)
-        srv.listen(RPC_BACKLOG)
+    # ------------------------------------------------------------
+    # 2. TEENSY-side subscriptions (remote)
+    # ------------------------------------------------------------
+    try:
+        teensy_payload = send_command(
+            machine="TEENSY",
+            subsystem="PUBSUB",
+            command="ALLSUBSCRIPTIONS",
+        ).get("payload", {}).get("subscriptions", [])
 
-        logger.info(
-            "🟢 [rpc-server] listening on %s backlog=%d",
-            RPC_SOCKET_PATH,
-            RPC_BACKLOG,
-        )
-
-        while True:
-            conn, _ = srv.accept()
-            threading.Thread(
-                target=handle_client,
-                args=(conn,),
-                daemon=True,
-            ).start()
+        results.extend(teensy_payload)
 
     except Exception:
-        logging.exception("💥 [rpc_server] fatal exception")
+        logging.warning("⚠️ [pubsub] failed to collect TEENSY subscriptions")
+
+    # ------------------------------------------------------------
+    # 3. Canonical ordering (nice but optional)
+    # ------------------------------------------------------------
+    results.sort(key=lambda x: (x.get("machine"), x.get("subsystem")))
+
+    return {
+        "success": True,
+        "message": "OK",
+        "payload": {
+            "subscriptions": results
+        },
+    }
+
+def cmd_refresh(_: Optional[dict]) -> Dict[str, Any]:
+    """
+    REFRESH — commit canonical subscription truth.
+
+    Semantics:
+      • Collect PI + TEENSY declared subscriptions
+      • Union them into a single canonical payload
+      • Commit that payload verbatim to:
+          1) TEENSY (SETSUBSCRIPTIONS)
+          2) PI (local router state)
+    """
+
+    # ------------------------------------------------------------
+    # 1. Observe + union (single source of truth)
+    # ------------------------------------------------------------
+    union_resp = cmd_unionsubscriptions(None)
+    union_payload = union_resp.get("payload", {})
+
+    logging.info("🚀 ️ [pubsub] REFRESH union payload: %s", union_payload)
+
+    # ------------------------------------------------------------
+    # 2. Commit union verbatim to TEENSY
+    # ------------------------------------------------------------
+    logging.info("🚀 ️ [pubsub] REFRESH setting subscriptions in Teensy payload: %s", union_payload)
+    try:
+        teensy_resp = send_command(
+            machine="TEENSY",
+            subsystem="PUBSUB",
+            command="SETSUBSCRIPTIONS",
+            args=union_payload,
+        )
+    except Exception as e:
+        logging.warning("⚠️ [pubsub] REFRESH failed applying TEENSY state: %s", e)
+        return {
+            "success": False,
+            "message": "REFRESH failed (TEENSY SETSUBSCRIPTIONS error)",
+            "payload": {
+                "union": union_payload,
+            },
+        }
+
+    if not teensy_resp.get("success", False):
+        return {
+            "success": False,
+            "message": "REFRESH failed (TEENSY rejected SETSUBSCRIPTIONS)",
+            "payload": {
+                "union": union_payload,
+                "teensy_response": teensy_resp,
+            },
+        }
+
+
+
+    # ------------------------------------------------------------
+    # 3. Commit same union locally on PI
+    # ------------------------------------------------------------
+    new_table: Dict[str, Set[str]] = {}
+
+    for row in union_payload.get("subscriptions", []):
+        subsystem = row.get("subsystem")
+        subs = row.get("subscriptions", [])
+
+        if not subsystem:
+            continue
+
+        for s in subs:
+            name = s.get("name")
+            if not name:
+                continue
+            new_table.setdefault(subsystem, set()).add(name)
+
+
+
+    with state_lock:
+        subscriptions.clear()
+        subscriptions.update(new_table)
+        logging.info("🚀 ️ [pubsub] subscriptions updated: %s", subscriptions)
+
+    # ------------------------------------------------------------
+    # 4. Return committed truth
+    # ------------------------------------------------------------
+    return {
+        "success": True,
+        "message": "OK",
+        "payload": union_payload,
+    }
+
+
+# ---------------------------------------------------------------------
+# Declarations
+# ---------------------------------------------------------------------
+
+COMMANDS = {
+    "REPORT": cmd_report,
+    "ALLSUBSCRIPTIONS": cmd_allsubscriptions,
+    "UNIONSUBSCRIPTIONS": cmd_unionsubscriptions,
+    "REFRESH": cmd_refresh,
+}
 
 # ---------------------------------------------------------------------
 # Entrypoint
@@ -426,75 +447,20 @@ def rpc_server() -> None:
 def run() -> None:
     setup_logging()
     open_debug_log()
-
-    logger.info("🚀 [startup] initializing transport")
     transport_init()
 
-    # Restore persisted subscriptions
-    restored = load_persisted_subscriptions()
+    transport_register_receive_callback(TRAFFIC_DEBUG, on_receive_debug)
+    transport_register_receive_callback(TRAFFIC_REQUEST_RESPONSE, on_receive_request_response)
+    transport_register_receive_callback(TRAFFIC_PUBLISH_SUBSCRIBE, on_receive_publish_subscribe)
 
-    with state_lock:
-        subscriptions.update(restored)
+    threading.Thread(target=rpc_server, daemon=True).start()
+    threading.Thread(target=pubsub_server, daemon=True).start()
 
-    logger.info(
-        "♻️ [pubsub] restored subscriptions from system table: %s",
-        {k: sorted(v) for k, v in subscriptions.items()},
+    server_setup(
+        subsystem="PUBSUB",
+        commands=COMMANDS,
+        subscriptions={},
     )
-
-    # Replay to Teensy
-    for subsystem, topics in restored.items():
-        msg = {
-            "topic": "SUBSCRIBE",
-            "payload": {
-                "subsystem": subsystem,
-                "topics": sorted(topics),
-            },
-        }
-
-        logger.info(
-            "📡 [pubsub] replaying persisted subscription to TEENSY %s -> %s",
-            subsystem,
-            sorted(topics),
-        )
-
-        transport_send(TRAFFIC_PUBLISH_SUBSCRIBE, msg)
-
-    transport_register_receive_callback(
-        TRAFFIC_DEBUG,
-        on_receive_debug,
-    )
-    transport_register_receive_callback(
-        TRAFFIC_REQUEST_RESPONSE,
-        on_receive_request_response,
-    )
-    transport_register_receive_callback(
-        TRAFFIC_PUBLISH_SUBSCRIBE,
-        on_receive_publish_subscribe,
-    )
-
-    logger.info("🚀 [startup] transport callbacks registered")
-
-    try:
-        threading.Thread(
-            target=rpc_server,
-            daemon=True,
-            name="rpc-server",
-        ).start()
-
-        threading.Thread(
-            target=pubsub_server,
-            daemon=True,
-            name="pubsub-server",
-        ).start()
-
-        logger.info("🚀 [startup] teensy_listener fully online")
-
-        while True:
-            time.sleep(1)
-
-    except Exception:
-        logging.exception("💥 [teensy_listener] fatal crash")
-
 
 def bootstrap() -> None:
     run()

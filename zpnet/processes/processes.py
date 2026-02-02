@@ -30,7 +30,7 @@ import os
 import socket
 import threading
 import time
-from typing import Any, Dict, Callable, Optional, Iterable
+from typing import Any, Dict, Callable, Optional
 
 from zpnet.shared.constants import Payload
 
@@ -49,6 +49,33 @@ def pubsub_socket_path(subsystem: str) -> str:
 
 TEENSY_REQUEST_RESPONSE_SOCKET = "/tmp/zpnet_teensy_rt.sock"
 TEENSY_PUBLISH_SUBSCRIBE_SOCKET = "/tmp/zpnet_teensy_ps.sock"
+
+# =============================================================================
+# Helpers
+# =============================================================================
+
+def list_subsystems() -> list[str]:
+    """
+    Return a list of active Pi-side subsystems.
+
+    Semantics:
+      • Discovered by presence of command sockets
+      • Filesystem is the source of truth
+      • Returned names are UPPERCASE (protocol identity)
+      • Order is sorted for determinism
+    """
+    subsystems: set[str] = set()
+
+    for fname in os.listdir(SOCKET_DIR):
+        if not fname.startswith("zpnet-"):
+            continue
+        if not fname.endswith("-command.sock"):
+            continue
+
+        subsystem_fs = fname[len("zpnet-"):-len("-command.sock")]
+        subsystems.add(subsystem_fs.upper())
+
+    return sorted(subsystems)
 
 # =============================================================================
 # Canonical RPC client (UNCHANGED)
@@ -160,7 +187,6 @@ def publish(
             sock.sendall(raw)
             sock.shutdown(socket.SHUT_WR)
     except Exception:
-        # Publishing failures are intentionally silent
         return
 
 
@@ -236,7 +262,6 @@ def _serve_pubsub(
     """
 
     sock_path = pubsub_socket_path(subsystem)
-
     srv = _bind_unix_socket(sock_path)
 
     while True:
@@ -260,37 +285,6 @@ def _serve_pubsub(
                     subsystem,
                     topic,
                 )
-
-# =============================================================================
-# Announce subscriptions (internal)
-# =============================================================================
-
-def _announce_subscriptions(
-    *,
-    subsystem: str,
-    subscriptions: Dict[str, Callable[[dict], None]],
-) -> None:
-    topics = sorted(subscriptions.keys())
-
-    if not topics:
-        logging.info(
-            "🚀 [pubsub] %s has no subscriptions to announce",
-            subsystem,
-        )
-        return
-
-    payload: Payload = {
-        "subsystem": subsystem,
-        "topics": topics,
-    }
-
-    logging.info(
-        "🚀 [pubsub] announcing SUBSCRIBE %s → %s",
-        subsystem,
-        topics,
-    )
-
-    publish("SUBSCRIBE", payload)
 
 # =============================================================================
 # Public declarative API
@@ -317,18 +311,46 @@ def server_setup(
 
     logging.info("🚀 [process] starting subsystem: %s", subsystem)
 
+    # -----------------------------------------------------------------
+    # Inject implicit SUBSCRIPTIONS command
+    # -----------------------------------------------------------------
+
+    def _cmd_subscriptions(_: Optional[dict]) -> dict:
+        return {
+            "success": True,
+            "message": "OK",
+            "payload": {
+                "machine": "PI",
+                "subsystem": subsystem,
+                "subscriptions": [
+                    { "name": topic }
+                    for topic in sorted(subscriptions.keys())
+                ],
+            },
+        }
+
+    # Do not mutate caller's command table
+    effective_commands = dict(commands)
+    effective_commands["SUBSCRIPTIONS"] = _cmd_subscriptions
+
+    # -----------------------------------------------------------------
     # Command plane
+    # -----------------------------------------------------------------
+
     threading.Thread(
         target=_serve_commands,
         kwargs={
             "subsystem": subsystem,
-            "commands": commands,
+            "commands": effective_commands,
         },
         daemon=True,
         name=f"{subsystem}-commands",
     ).start()
 
+    # -----------------------------------------------------------------
     # Pub/Sub plane
+    # -----------------------------------------------------------------
+
     threading.Thread(
         target=_serve_pubsub,
         kwargs={
@@ -339,11 +361,9 @@ def server_setup(
         name=f"{subsystem}-pubsub",
     ).start()
 
-    _announce_subscriptions(
-        subsystem=subsystem,
-        subscriptions=subscriptions,
-    )
+    # -----------------------------------------------------------------
+    # Process lifetime
+    # -----------------------------------------------------------------
 
-    # Block forever (process lifetime)
     while True:
         time.sleep(3600)

@@ -30,6 +30,7 @@
 */
 
 class PayloadArray;
+class PayloadArrayView;
 
 /*
   ============================================================================
@@ -53,6 +54,57 @@ class PayloadArray;
 struct JsonView {
   const char* data;
   size_t      len;
+};
+
+/*
+  ============================================================================
+  PayloadArrayView — Read-Only View Over JSON Array
+  ----------------------------------------------------------------------------
+
+  PayloadArrayView represents a non-owning, read-only view over a JSON array
+  fragment already stored inside a Payload entry of kind 'a'.
+
+  CONTRACT:
+    • Does NOT own data
+    • Does NOT allocate
+    • Does NOT mutate state
+    • Valid ONLY while the parent Payload exists
+    • Produces value-semantic Payload objects on access
+    • No caching or internal state mutation
+
+  This type exists to enable safe, allocation-free traversal of arrays
+  without changing Payload’s authoritative state model.
+
+  ============================================================================
+*/
+class PayloadArrayView {
+public:
+  PayloadArrayView();  // invalid / empty view
+
+  // --------------------------------------------------
+  // Introspection
+  // --------------------------------------------------
+
+  bool   valid() const;
+  size_t size() const;
+
+  // --------------------------------------------------
+  // Element access
+  // --------------------------------------------------
+
+  // Returns a value-semantic Payload parsed from the
+  // indexed array element. If out of range or invalid,
+  // returns an empty Payload.
+  Payload get(size_t index) const;
+
+private:
+  friend class Payload;
+
+  // Constructed only by Payload
+  PayloadArrayView(const char* json, size_t len);
+
+  const char* _json;   // points to '[' of array fragment
+  size_t      _len;    // length of array fragment
 };
 
 class Payload {
@@ -92,17 +144,12 @@ public:
   // Semantic construction (authoritative)
   // --------------------------------------------------
 
-  // All add() methods populate entries[] directly.
-  // No builder buffers, no deferred state.
-
   void add(const char* key, const char* value);
   void add(const char* key, const String& value);
   void add(const char* key, bool value);
   void add(const char* key, float value);
   void add(const char* key, double value);
 
-  // Integral template (excluding bool)
-  // Delegates to canonical semantic path.
   template <typename T>
   typename std::enable_if<
       std::is_integral<T>::value && !std::is_same<T, bool>::value>::type
@@ -123,8 +170,6 @@ public:
   // Parse / Access
   // --------------------------------------------------
 
-  // Parse a bounded JSON object into semantic entries.
-  // Canonicalizes values into entries[].
   bool parseJSON(const uint8_t* data, size_t len);
 
   bool has(const char* key) const;
@@ -133,19 +178,14 @@ public:
   // Primitive accessors
   // --------------------------------------------------
 
-  // Returns a pointer to owned, stable storage.
-  // Lifetime is tied to the Payload object.
-  // Never call-order dependent.
   const char* getString(const char* key) const;
 
-  // Strict (validation-oriented)
   bool tryGetBool(const char* key, bool& out) const;
   bool tryGetInt(const char* key, int32_t& out) const;
   bool tryGetUInt(const char* key, uint32_t& out) const;
   bool tryGetFloat(const char* key, float& out) const;
   bool tryGetDouble(const char* key, double& out) const;
 
-  // Convenience (ergonomic)
   bool     getBool(const char* key, bool default_value) const;
   int32_t  getInt(const char* key, int32_t default_value = 0) const;
   uint32_t getUInt(const char* key, uint32_t default_value = 0) const;
@@ -160,11 +200,20 @@ public:
   PayloadArray getArray(const char* key) const;
 
   // --------------------------------------------------
+  // Structured accessors (read-only views)
+  // --------------------------------------------------
+
+  // Returns true only if the key exists and refers to an array.
+  bool hasArray(const char* key) const;
+
+  // Returns a read-only view over the array stored at key.
+  // If absent or mismatched, returns an invalid/empty view.
+  PayloadArrayView getArrayView(const char* key) const;
+
+  // --------------------------------------------------
   // Diagnostics
   // --------------------------------------------------
 
-  // Dump parsed key/value entries for debugging.
-  // Reflects semantic state, not serialization artifacts.
   void debug_dump(const char* tag) const;
 
 private:
@@ -179,18 +228,15 @@ private:
   };
 
   static constexpr size_t MAX_ENTRIES = 16;
-  Entry entries[MAX_ENTRIES];
+  Entry  entries[MAX_ENTRIES];
   size_t entry_count;
 
   // -----------------------------------------------------------------
   // Transitional / non-authoritative helpers
   // -----------------------------------------------------------------
 
-  // Used only as a staging buffer during parseJSON().
-  // Not authoritative state.
   String raw;
 
-  // Pure helper
   static String escape(const char* s);
 
   const Entry* find(const char* key) const;
@@ -214,24 +260,20 @@ public:
   void clear();
   bool empty() const;
 
-  // Serialize array contents (pure derivative).
-  // Uses String; acceptable for now because this is not hot-path.
   String to_json() const;
 
-  // Append object (semantic)
   void add(const Payload& obj);
 
-  // Parse array of objects (best-effort structural extraction)
   bool parseJSON(const char* json);
 
-  size_t size() const;
+  size_t  size() const;
   Payload get(size_t idx) const;
 
 private:
   String buf;
-  bool first;
+  bool   first;
 
   static constexpr size_t MAX_ITEMS = 16;
   Payload items[MAX_ITEMS];
-  size_t item_count;
+  size_t  item_count;
 };

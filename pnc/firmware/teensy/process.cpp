@@ -254,14 +254,15 @@ void process_publish_dispatch(
     const process_vtable_t* v = registry[i].vtable;
     if (!v) continue;
 
-    if (!subs->has(v->process_id)) continue;
+    if (!subs->hasArray(v->process_id)) continue;
 
-    PayloadArray topics = subs->getArray(v->process_id);
+    PayloadArrayView topics = subs->getArrayView(v->process_id);
 
     for (size_t j = 0; j < topics.size(); j++) {
-      Payload entry = topics.get(j);
-      const char* subscribed_topic = entry.getString("topic");
 
+      Payload entry = topics.get(j);
+
+      const char* subscribed_topic = entry.getString("topic");
       if (!subscribed_topic) continue;
       if (strcmp(subscribed_topic, topic) != 0) continue;
 
