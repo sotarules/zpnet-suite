@@ -188,6 +188,8 @@ const Payload* pubsub_get_subscriptions() {
 
 void process_publish_dispatch(const Payload& message) {
 
+  debug_log("process_publish_dispatch", message);
+
   if (!message.has("topic")) {
     return;
   }
