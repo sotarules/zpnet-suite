@@ -1,72 +1,39 @@
 # =============================================================
-# ZPNet Teensy 4.1 build + flash helper
+# ZPNet Teensy 4.1 — Build + Flash (Cold Ownership)
 #
-# TRANSPORT BIFURCATION:
-#   Build and runtime behavior are controlled exclusively by:
+# PRINCIPLE:
+#   • Bootloader (HalfKay) must have cold ownership
+#   • Makefile does NOT attempt to enter bootloader
+#   • Flashing assumes HalfKay is already active
 #
-#     ZPNET_TRANSPORT = HID | SERIAL
+# Flashing is correct ONLY after:
+#   • physical reset
+#   • external RESET_B control
+#   • button press
 #
-#   This variable is REQUIRED and permanent.
-#
-# FLASHING RULE:
-#   Teensy is ALWAYS flashed via teensy_loader_cli.
-#   USB mode affects runtime behavior only.
-#
-# NVM RULE:
-#   LittleFS on QSPI flash is enabled explicitly via compile-time
-#   define (CLI-equivalent of Arduino IDE Flash Size menu).
 # =============================================================
 
 # -------------------------------------------------------------
-# Required environment variable
-# -------------------------------------------------------------
-
-ifndef ZPNET_TRANSPORT
-$(error ❌ ZPNET_TRANSPORT is not set. Use: export ZPNET_TRANSPORT=HID or SERIAL)
-endif
-
-ifeq ($(ZPNET_TRANSPORT),HID)
-USB_MODE   = rawhid
-USB_LABEL  = USB_RAWHID
-HAS_SERIAL = no
-else ifeq ($(ZPNET_TRANSPORT),SERIAL)
-USB_MODE   = serial
-USB_LABEL  = USB_CDC_SERIAL
-HAS_SERIAL = yes
-else
-$(error ❌ Invalid ZPNET_TRANSPORT='$(ZPNET_TRANSPORT)'. Must be HID or SERIAL)
-endif
-
-# -------------------------------------------------------------
-# Compile-time defines (authoritative)
-# -------------------------------------------------------------
-
-CPP_DEFS =
-
-# Transport selection
-ifeq ($(ZPNET_TRANSPORT),HID)
-CPP_DEFS += -DZPNET_TRANSPORT_HID
-else ifeq ($(ZPNET_TRANSPORT),SERIAL)
-CPP_DEFS += -DZPNET_TRANSPORT_SERIAL
-endif
-
-# Enable LittleFS on QSPI flash (Teensy 4.1)
-# CLI-equivalent of: Tools → Flash Size → Program + LittleFS (QSPI)
-CPP_DEFS += -DLITTLEFS_QSPI
-
-# -------------------------------------------------------------
-# Toolchain
+# Configuration
 # -------------------------------------------------------------
 
 NAME          = teensy
 ARDUINO_CLI   = ../../bin/arduino-cli
 TEENSY_LOADER = teensy_loader_cli
 
-BOARD = teensy:avr:teensy41:usb=$(USB_MODE)
+# USB mode affects runtime only, not flashing
+# Choose one and stick to it
+USB_MODE = serial
+BOARD    = teensy:avr:teensy41:usb=$(USB_MODE)
 
-# Serial parameters (used only if SERIAL)
-PORT ?= /dev/zpnet-teensy-serial
-BAUD ?= 115200
+# -------------------------------------------------------------
+# Compile-time defines (runtime only)
+# -------------------------------------------------------------
+
+CPP_DEFS =
+
+# Explicit transport selection (runtime routing)
+CPP_DEFS += -DZPNET_TRANSPORT_SERIAL
 
 # -------------------------------------------------------------
 # Targets
@@ -79,9 +46,7 @@ all: build
 # -------------------------------------------------------------
 
 build:
-	@echo "🔧 Building Teensy 4.1 ($(USB_LABEL))..."
-	@echo "    Transport mode: $(ZPNET_TRANSPORT)"
-	@echo "    NVM backend:    LittleFS (QSPI)"
+	@echo "🔧 Building Teensy 4.1 (cold-boot compatible)..."
 	$(ARDUINO_CLI) compile \
 	  --fqbn $(BOARD) \
 	  --build-property compiler.c.extra_flags="$(CPP_DEFS)" \
@@ -90,56 +55,26 @@ build:
 	  --output-dir ./build
 
 # -------------------------------------------------------------
-# Flash (authoritative for Teensy)
+# Flash (HalfKay must already own the machine)
 # -------------------------------------------------------------
 
 flash: build
-	@echo "🚀 Flashing Teensy 4.1 via teensy_loader_cli..."
+	@echo "🚀 Flashing Teensy 4.1 (HalfKay must already be active)..."
 	sudo $(TEENSY_LOADER) \
-	  --mcu=TEENSY41 \
-	  -w -s \
+	  -mmcu=TEENSY41 \
+	  -w \
 	  build/$(NAME).ino.hex
-	@echo "✅ Teensy flashed successfully."
+	@echo "✅ Flash complete."
 
 # -------------------------------------------------------------
-# Upload (explicitly unsupported)
+# Housekeeping
 # -------------------------------------------------------------
-
-upload:
-	@echo "❌ Upload via arduino-cli is unsupported on Teensy."
-	@echo "   Use: make flash"
-
-# -------------------------------------------------------------
-# Serial monitor (SERIAL only)
-# -------------------------------------------------------------
-
-monitor:
-ifeq ($(HAS_SERIAL),yes)
-	@echo "📡 Opening serial monitor on $(PORT)..."
-	$(ARDUINO_CLI) monitor \
-	  --port $(PORT) \
-	  --baud $(BAUD)
-else
-	@echo "❌ Serial monitor unavailable (HID transport)."
-endif
-
-# -------------------------------------------------------------
-# Info / utilities
-# -------------------------------------------------------------
-
-info:
-	@echo "ℹ️  Transport mode: $(ZPNET_TRANSPORT)"
-	@echo "ℹ️  USB mode:       $(USB_MODE)"
-	@echo "ℹ️  Board FQBN:     $(BOARD)"
-	@echo "ℹ️  NVM enabled:    LITTLEFS_QSPI"
-	@echo
-	$(ARDUINO_CLI) board list
 
 clean:
 	rm -rf build
 
 clobber: clean
-	@echo "🧹 Removing Arduino CLI global build cache..."
+	@echo "🧹 Removing Arduino CLI build cache..."
 	rm -rf ~/.arduino15/packages/*/hardware/*/*/build
 
-.PHONY: all build flash upload monitor info clean clobber
+.PHONY: all build flash clean clobber

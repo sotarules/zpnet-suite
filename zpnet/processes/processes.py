@@ -6,8 +6,8 @@ Provides a unified, declarative runtime for Pi-side processes.
 A process declares:
   • its subsystem name
   • the commands it serves
-  • the topics it subscribes to
-  • a single pub/sub callback
+  • the topics it subscribes to (topic → handler)
+  • no routing logic whatsoever
 
 All transport, sockets, threads, and routing are owned here.
 
@@ -17,6 +17,7 @@ Semantics:
   • No polling
   • No retries
   • No lifecycle obsession
+  • Subscription state is clobber-and-go
 
 Author: The Mule + GPT
 """
@@ -124,7 +125,7 @@ def send_command(
 
 
 # =============================================================================
-# Public Pub/Sub API — publishing
+# Public Pub/Sub API — publishing (UNCHANGED)
 # =============================================================================
 
 def publish(
@@ -161,6 +162,7 @@ def publish(
     except Exception:
         # Publishing failures are intentionally silent
         return
+
 
 # =============================================================================
 # Internal helpers
@@ -219,25 +221,23 @@ def _serve_commands(
 def _serve_pubsub(
     *,
     subsystem: str,
-    subscriptions: Iterable[str],
-    on_message: Callable[[str, dict], None],
+    subscriptions: Dict[str, Callable[[dict], None]],
 ) -> None:
     """
-    Receive published messages and dispatch to the user callback.
+    Receive published messages and dispatch to per-topic handlers.
 
     Semantics:
       • One socket
-      • One callback
+      • One handler per topic
+      • Exact topic match
       • Best-effort
-      • No filtering beyond topic match
+      • No retries
+      • No fan-in callback
     """
 
     sock_path = pubsub_socket_path(subsystem)
 
-    logging.info("🚀 [pubsub] %s → %s", subsystem, sock_path)
     srv = _bind_unix_socket(sock_path)
-
-    subs = set(subscriptions)
 
     while True:
         conn, _ = srv.accept()
@@ -248,12 +248,49 @@ def _serve_pubsub(
             topic = msg.get("topic")
             payload = msg.get("payload")
 
-            if topic in subs:
-                try:
-                    on_message(topic, payload)
-                except Exception:
-                    logging.exception("[pubsub] user callback failed")
+            handler = subscriptions.get(topic)
+            if handler is None:
+                return
 
+            try:
+                handler(payload)
+            except Exception:
+                logging.exception(
+                    "[pubsub] handler failed (%s:%s)",
+                    subsystem,
+                    topic,
+                )
+
+# =============================================================================
+# Announce subscriptions (internal)
+# =============================================================================
+
+def _announce_subscriptions(
+    *,
+    subsystem: str,
+    subscriptions: Dict[str, Callable[[dict], None]],
+) -> None:
+    topics = sorted(subscriptions.keys())
+
+    if not topics:
+        logging.info(
+            "🚀 [pubsub] %s has no subscriptions to announce",
+            subsystem,
+        )
+        return
+
+    payload: Payload = {
+        "subsystem": subsystem,
+        "topics": topics,
+    }
+
+    logging.info(
+        "🚀 [pubsub] announcing SUBSCRIBE %s → %s",
+        subsystem,
+        topics,
+    )
+
+    publish("SUBSCRIBE", payload)
 
 # =============================================================================
 # Public declarative API
@@ -263,8 +300,7 @@ def server_setup(
     *,
     subsystem: str,
     commands: Dict[str, Callable[[Optional[dict]], dict]],
-    subscriptions: Iterable[str],
-    on_message: Callable[[str, dict], None],
+    subscriptions: Dict[str, Callable[[dict], None]],
 ) -> None:
     """
     Declaratively start a ZPNet Pi-side process.
@@ -274,8 +310,7 @@ def server_setup(
     The caller declares:
       • subsystem name
       • command handlers
-      • pub/sub subscriptions
-      • pub/sub callback
+      • pub/sub topic → handler mapping
 
     All sockets, threads, and routing are handled internally.
     """
@@ -299,11 +334,15 @@ def server_setup(
         kwargs={
             "subsystem": subsystem,
             "subscriptions": subscriptions,
-            "on_message": on_message,
         },
         daemon=True,
         name=f"{subsystem}-pubsub",
     ).start()
+
+    _announce_subscriptions(
+        subsystem=subsystem,
+        subscriptions=subscriptions,
+    )
 
     # Block forever (process lifetime)
     while True:

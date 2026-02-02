@@ -1,5 +1,22 @@
+// ============================================================================
+// process.cpp — ZPNet Process Framework (NVM-backed subscriptions)
+// ============================================================================
+//
+// Subscriptions:
+//   • NO local subscription storage
+//   • NO static subscription tables
+//   • All active subscriptions are stored in NVM
+//   • NVM is the single source of truth
+//
+// Handlers:
+//   • Handler functions live in process vtables (code truth)
+//   • NVM stores only topic names
+//
+// ============================================================================
+
 #include "process.h"
 #include "transport.h"
+#include "nvm.h"
 #include "debug.h"
 
 #include <Arduino.h>
@@ -10,6 +27,7 @@
 // ============================================================================
 
 static constexpr size_t MAX_PROCESSES = 30;
+static constexpr const char* NVM_SUBSCRIPTIONS_KEY = "subscriptions";
 
 // ============================================================================
 // Registry Entry
@@ -21,7 +39,7 @@ typedef struct {
 } process_entry_t;
 
 // ============================================================================
-// Registry State
+// Registry State (commands only)
 // ============================================================================
 
 static process_entry_t registry[MAX_PROCESSES];
@@ -58,7 +76,7 @@ find_command(const process_vtable_t* vtable, const char* name) {
 }
 
 static const process_subscription_entry_t*
-find_subscription(
+find_subscription_handler(
   const process_vtable_t* vtable,
   const char*             topic
 ) {
@@ -100,7 +118,7 @@ void process_init(void) {
 }
 
 // ============================================================================
-// Registration
+// Registration (commands + handler capability only)
 // ============================================================================
 
 bool process_register(
@@ -111,7 +129,6 @@ bool process_register(
     return false;
   }
 
-  // Enforce identity invariant
   if (strcmp(process_id, vtable->process_id) != 0) {
     return false;
   }
@@ -150,36 +167,16 @@ const process_vtable_t* process_get_vtable(size_t idx) {
 }
 
 // ============================================================================
-// REQUEST / RESPONSE Command Processor
+// REQUEST / RESPONSE Command Processor (UNCHANGED)
 // ============================================================================
-//
-// Expects a fully parsed semantic request Payload:
-//
-//   {
-//     "subsystem": "...",
-//     "command":   "...",
-//     "args":      { ... },
-//     "req_id":    N
-//   }
-//
-// Always responds exactly once.
-//
 
 void process_command(const Payload& request) {
 
   Payload response;
 
-  // ----------------------------------------------------------
-  // Preserve req_id if present
-  // ----------------------------------------------------------
-
   if (request.has("req_id")) {
     response.add("req_id", request.getUInt("req_id"));
   }
-
-  // ----------------------------------------------------------
-  // Extract routing fields (COPY IMMEDIATELY)
-  // ----------------------------------------------------------
 
   const char* subsystem_c = request.getString("subsystem");
   const char* command_c   = request.getString("command");
@@ -193,14 +190,7 @@ void process_command(const Payload& request) {
     return;
   }
 
-  String subsystem(subsystem_c);
-  String command(command_c);
-
-  // ----------------------------------------------------------
-  // Resolve process
-  // ----------------------------------------------------------
-
-  process_entry_t* proc = find_process(subsystem.c_str());
+  process_entry_t* proc = find_process(subsystem_c);
   if (!proc) {
     response.add("success", false);
     response.add("message", "BAD");
@@ -210,12 +200,8 @@ void process_command(const Payload& request) {
     return;
   }
 
-  // ----------------------------------------------------------
-  // Resolve command
-  // ----------------------------------------------------------
-
   const process_command_entry_t* entry =
-    find_command(proc->vtable, command.c_str());
+    find_command(proc->vtable, command_c);
 
   if (!entry || !entry->handler) {
     response.add("success", false);
@@ -226,24 +212,12 @@ void process_command(const Payload& request) {
     return;
   }
 
-  // ----------------------------------------------------------
-  // Extract args (if present)
-  // ----------------------------------------------------------
-
   Payload args;
   if (request.has("args")) {
     args = request.getPayload("args");
   }
 
-  // ----------------------------------------------------------
-  // Invoke handler
-  // ----------------------------------------------------------
-
   Payload payload = entry->handler(args);
-
-  // ----------------------------------------------------------
-  // Construct canonical success envelope
-  // ----------------------------------------------------------
 
   response.add("success", true);
   response.add("message", "OK");
@@ -256,11 +230,15 @@ void process_command(const Payload& request) {
 }
 
 // ============================================================================
-// PUB / SUB Dispatch (local delivery only)
+// PUB / SUB Dispatch (NVM-backed, NO local storage)
 // ============================================================================
 //
-// Called by pub/sub ingress (transport or local publish).
-// Exactly one handler per (process, topic).
+// Semantics:
+//   • For each process:
+//       - consult NVM to see which topics it is subscribed to
+//       - if topic is present, invoke handler
+//   • No caching
+//   • NVM is authoritative
 //
 
 void process_publish_dispatch(
@@ -269,17 +247,35 @@ void process_publish_dispatch(
 ) {
   if (!topic || !*topic) return;
 
+  Payload subs;
+  if (!nvm_read(NVM_SUBSCRIPTIONS_KEY, subs)) {
+    // No subscriptions defined
+    return;
+  }
+
   for (size_t i = 0; i < registry_count; i++) {
 
     const process_vtable_t* v = registry[i].vtable;
-    if (!v || !v->subscriptions) continue;
+    if (!v) continue;
 
-    const process_subscription_entry_t* sub =
-      find_subscription(v, topic);
+    // Does this process have any subscriptions?
+    if (!subs.has(v->process_id)) continue;
 
-    if (!sub || !sub->handler) continue;
+    PayloadArray topics = subs.getArray(v->process_id);
 
-    // Single, direct delivery
-    sub->handler(payload);
+    for (size_t j = 0; j < topics.size(); j++) {
+      Payload entry = topics.get(j);
+      const char* subscribed_topic = entry.getString("topic");
+
+      if (!subscribed_topic) continue;
+      if (strcmp(subscribed_topic, topic) != 0) continue;
+
+      const process_subscription_entry_t* handler =
+        find_subscription_handler(v, topic);
+
+      if (!handler || !handler->handler) continue;
+
+      handler->handler(payload);
+    }
   }
 }

@@ -2,18 +2,18 @@
 // FILE: process_pubsub.cpp
 // =============================================================
 //
-// PUBSUB Process — Teensy-side pub/sub control surface
+// PUBSUB Process — NVM-backed subscription control plane
 //
 // Responsibilities:
 //   • Ingress for TRAFFIC_PUBLISH_SUBSCRIBE (0xD2)
-//   • Diagnostic / experimental command surface
+//   • Control-plane mutation of subscription state (NVM)
 //   • Delegation to process_publish_dispatch()
 //
 // Non-responsibilities:
 //   • Routing
-//   • Fan-out to Pi processes
+//   • Fan-out
+//   • Handler ownership
 //   • Transport policy
-//   • Subscription mutation
 //
 // =============================================================
 
@@ -22,9 +22,16 @@
 #include "process.h"
 #include "publish.h"
 #include "payload.h"
+#include "nvm.h"
 #include "debug.h"
 
 #include <string.h>
+
+// -------------------------------------------------------------
+// NVM key (authoritative)
+// -------------------------------------------------------------
+
+static constexpr const char* NVM_SUBSCRIPTIONS_KEY = "subscriptions";
 
 // ================================================================
 // Ingress: publications arriving from Pi
@@ -36,13 +43,11 @@
 //     "payload": { ... }
 //   }
 //
-// This function is registered directly with transport
-// for TRAFFIC_PUBLISH_SUBSCRIBE.
+// Registered with transport for TRAFFIC_PUBLISH_SUBSCRIBE.
 //
 
 void process_publish_dispatch(const Payload& message) {
 
-  // Must have topic
   if (!message.has("topic")) {
     return;
   }
@@ -57,8 +62,33 @@ void process_publish_dispatch(const Payload& message) {
     payload = message.getPayload("payload");
   }
 
-  // Semantic local delivery only
+  // Semantic local delivery only (NVM-backed in process.cpp)
   process_publish_dispatch(topic, payload);
+}
+
+// ================================================================
+// Helpers (NVM subscription mutation)
+// ================================================================
+
+static Payload load_subscriptions() {
+  Payload subs;
+  nvm_read(NVM_SUBSCRIPTIONS_KEY, subs);
+  return subs;
+}
+
+static bool save_subscriptions(const Payload& subs) {
+  return nvm_write(NVM_SUBSCRIPTIONS_KEY, subs);
+}
+
+static bool topic_exists(const PayloadArray& arr, const char* topic) {
+  for (size_t i = 0; i < arr.size(); i++) {
+    Payload e = arr.get(i);
+    const char* t = e.getString("topic");
+    if (t && strcmp(t, topic) == 0) {
+      return true;
+    }
+  }
+  return false;
 }
 
 // ================================================================
@@ -67,12 +97,6 @@ void process_publish_dispatch(const Payload& message) {
 
 // ------------------------------------------------------------
 // PUBLISH — invoke local + Pi-forward publish path
-//
-// Args:
-//   {
-//     "topic":   "...",
-//     "payload": { ... }
-//   }
 // ------------------------------------------------------------
 static Payload cmd_publish(const Payload& args) {
 
@@ -94,81 +118,127 @@ static Payload cmd_publish(const Payload& args) {
     payload = args.getPayload("payload");
   }
 
-  // Reuse canonical publish path
   publish(topic, payload);
-
   return ok_payload();
 }
 
 // ------------------------------------------------------------
-// SUBSCRIBE — acknowledge intent only (diagnostic)
+// SUBSCRIBE — persist subscription in NVM
 //
-// Semantics:
-//   • Experimental / non-authoritative
-//   • Does NOT mutate subscription tables
-//   • Exists for future control-plane exploration
+// Args:
+//   {
+//     "process": "...",
+//     "topic":   "..."
+//   }
 // ------------------------------------------------------------
 static Payload cmd_subscribe(const Payload& args) {
 
-  Payload p;
-
-  if (!args.has("topic")) {
-    p.add("error", "missing topic");
-    return p;
+  if (!args.has("process") || !args.has("topic")) {
+    Payload err;
+    err.add("error", "missing process or topic");
+    return err;
   }
 
-  const char* topic = args.getString("topic");
-  if (!topic || !*topic) {
-    p.add("error", "invalid topic");
-    return p;
+  const char* process = args.getString("process");
+  const char* topic   = args.getString("topic");
+
+  if (!process || !*process || !topic || !*topic) {
+    Payload err;
+    err.add("error", "invalid process or topic");
+    return err;
   }
 
-  p.add("status", "ACK");
-  p.add("topic", topic);
+  Payload subs = load_subscriptions();
 
-  debug_log("pubsub.subscribe", topic);
+  PayloadArray arr;
+  if (subs.has(process)) {
+    arr = subs.getArray(process);
+  }
 
-  return p;
+  if (!topic_exists(arr, topic)) {
+    Payload entry;
+    entry.add("topic", topic);
+    arr.add(entry);
+  }
+
+  subs.add_array(process, arr);
+  save_subscriptions(subs);
+
+  Payload resp;
+  resp.add("status", "subscribed");
+  resp.add("process", process);
+  resp.add("topic", topic);
+  return resp;
 }
 
 // ------------------------------------------------------------
-// REPORT — pub/sub introspection snapshot
+// UNSUBSCRIBE — remove subscription from NVM
 //
-// Semantics:
-//   • Stateless
-//   • Read-only
-//   • Reflects declared subscriptions only
+// Args:
+//   {
+//     "process": "...",
+//     "topic":   "..."
+//   }
+// ------------------------------------------------------------
+static Payload cmd_unsubscribe(const Payload& args) {
+
+  if (!args.has("process") || !args.has("topic")) {
+    Payload err;
+    err.add("error", "missing process or topic");
+    return err;
+  }
+
+  const char* process = args.getString("process");
+  const char* topic   = args.getString("topic");
+
+  Payload subs;
+  if (!nvm_read(NVM_SUBSCRIPTIONS_KEY, subs)) {
+    Payload err;
+    err.add("error", "no subscriptions defined");
+    return err;
+  }
+
+  if (!subs.has(process)) {
+    Payload err;
+    err.add("error", "process not subscribed");
+    return err;
+  }
+
+  PayloadArray old_arr = subs.getArray(process);
+  PayloadArray new_arr;
+
+  for (size_t i = 0; i < old_arr.size(); i++) {
+    Payload e = old_arr.get(i);
+    const char* t = e.getString("topic");
+    if (t && strcmp(t, topic) != 0) {
+      new_arr.add(e);
+    }
+  }
+
+  subs.add_array(process, new_arr);
+  save_subscriptions(subs);
+
+  Payload resp;
+  resp.add("status", "unsubscribed");
+  resp.add("process", process);
+  resp.add("topic", topic);
+  return resp;
+}
+
+// ------------------------------------------------------------
+// REPORT — reflect NVM-backed subscription truth
 // ------------------------------------------------------------
 static Payload cmd_report(const Payload&) {
 
   Payload resp;
-  PayloadArray processes;
+  Payload subs;
 
-  for (size_t i = 0; i < process_get_count(); i++) {
-
-    const process_vtable_t* v = process_get_vtable(i);
-    if (!v) continue;
-
-    Payload proc;
-    proc.add("name", v->process_id);
-
-    PayloadArray subs;
-
-    if (v->subscriptions) {
-      for (const process_subscription_entry_t* s = v->subscriptions;
-           s->topic;
-           ++s) {
-        Payload entry;
-        entry.add("topic", s->topic);
-        subs.add(entry);
-      }
-    }
-
-    proc.add_array("subscriptions", subs);
-    processes.add(proc);
+  if (!nvm_read(NVM_SUBSCRIPTIONS_KEY, subs)) {
+    resp.add("subscriptions", "none");
+    return resp;
   }
 
-  resp.add_array("processes", processes);
+  resp.add_object("subscriptions", subs);
   return resp;
 }
 
@@ -177,15 +247,16 @@ static Payload cmd_report(const Payload&) {
 // ================================================================
 
 static const process_command_entry_t PUBSUB_COMMANDS[] = {
-  { "PUBLISH",   cmd_publish   },
-  { "SUBSCRIBE", cmd_subscribe },
-  { "REPORT",    cmd_report    },
-  { nullptr,     nullptr       }   // terminator
+  { "PUBLISH",     cmd_publish     },
+  { "SUBSCRIBE",   cmd_subscribe   },
+  { "UNSUBSCRIBE", cmd_unsubscribe },
+  { "REPORT",      cmd_report      },
+  { nullptr,       nullptr         }
 };
 
 static const process_vtable_t PUBSUB_PROCESS = {
-  .process_id   = "PUBSUB",
-  .commands     = PUBSUB_COMMANDS,
+  .process_id    = "PUBSUB",
+  .commands      = PUBSUB_COMMANDS,
   .subscriptions = nullptr
 };
 

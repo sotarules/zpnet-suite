@@ -19,11 +19,10 @@ Semantics:
 from __future__ import annotations
 
 import logging
-import threading
 import time
 from typing import Dict, Optional
 
-from zpnet.processes.processes import send_command, server_setup, publish
+from zpnet.processes.processes import server_setup, publish
 from zpnet.shared.constants import Payload
 from zpnet.shared.events import create_event
 from zpnet.shared.logger import setup_logging
@@ -58,11 +57,13 @@ def event_despooler(payload: Payload) -> None:
             "💥 [event_despooler] unhandled exception — despooler thread terminating"
         )
 
-def setup_events() -> None:
-    payload: Payload = {}
-    payload["subsystem"] = "EVENTS"
-    payload["topics"] = ["EVENTS"]
-    publish("SUBSCRIBE", payload)
+# ---------------------------------------------------------------------
+# Publish surface
+# ---------------------------------------------------------------------
+
+def on_events(payload: Payload) -> None:
+    logging.info("🚀 [event_despooler] received events: %s", payload)
+    event_despooler(payload)
 
 # ---------------------------------------------------------------------
 # Command surface
@@ -109,14 +110,9 @@ COMMANDS = {
     "SUBSCRIBE": cmd_subscribe
 }
 
-# ---------------------------------------------------------------------
-# Publish surface
-# ---------------------------------------------------------------------
-
-def on_message(topic: str, payload: Payload) -> None:
-    logging.info("🚀 [event_despooler] received message on topic %s: %s", topic, payload)
-    event_despooler(payload)
-
+SUBSCRIPTIONS = {
+    "EVENTS": on_events
+}
 
 # ---------------------------------------------------------------------
 # Entrypoint
@@ -124,25 +120,15 @@ def on_message(topic: str, payload: Payload) -> None:
 
 def run() -> None:
     setup_logging()
-    setup_events()
+
     try:
-
-        #threading.Thread(
-        #    target=despooler_loop,
-        #    daemon=True,
-        #).start()
-
         server_setup(
             subsystem="EVENTS",
             commands=COMMANDS,
-            subscriptions=["EVENTS"],
-            on_message=on_message,
+            subscriptions=SUBSCRIPTIONS
         )
-
     except Exception:
-        import logging
         logging.exception("💥 [event_despooler] unhandled exception in main thread")
-
 
 if __name__ == "__main__":
     run()
