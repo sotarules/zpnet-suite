@@ -907,8 +907,8 @@ def system_poller() -> None:
 # Publish surface
 # ---------------------------------------------------------------------
 
-def on_message(topic: str, payload: Payload) -> None:
-    logging.info("🚀 [system] received message on topic %s: %s", topic, payload)
+def on_message(payload: Payload) -> None:
+    logging.info("🚀 [system] received message on topic %s", payload)
 
 # ------------------------------------------------------------------
 # Command handlers
@@ -939,6 +939,10 @@ COMMANDS = {
     "PUBLISH": cmd_publish
 }
 
+SUBSCRIPTIONS = {
+    "GNSS_NEWS_FEED": on_message
+}
+
 # ---------------------------------------------------------------------
 # Entrypoint
 # ---------------------------------------------------------------------
@@ -955,8 +959,7 @@ def run() -> None:
         server_setup(
             subsystem="SYSTEM",
             commands=COMMANDS,
-            subscriptions=["GNSS_NEWS_FEED"],
-            on_message=on_message,
+            subscriptions=SUBSCRIPTIONS
         )
 
     except Exception:

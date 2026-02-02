@@ -2,6 +2,8 @@
 
 #include "payload.h"
 
+const Payload* pubsub_get_subscriptions();
+
 // Entry point for TRAFFIC_PUBLISH_SUBSCRIBE
 void process_publish_dispatch(const Payload& message);
 

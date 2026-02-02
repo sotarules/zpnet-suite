@@ -102,10 +102,7 @@ def _log_raw_transport(traffic: int, message: bytes, direction: str) -> None:
         ts = time.time()
         with open(RAW_TRANSPORT_LOG_PATH, "a") as f:
             f.write(
-                f"{ts:.6f} {direction} traffic=0x{traffic:02X} len={len(message)}\n"
-                f"ASCII: {message.decode('utf-8', errors='replace')}\n"
-                f"HEX:   {message.hex()}\n"
-                f"---\n"
+                f"{direction} 0x{traffic:02X} len={len(message)} {message.decode('utf-8', errors='replace')}\n"
             )
     except Exception:
         pass

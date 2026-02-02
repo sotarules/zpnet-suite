@@ -1,23 +1,21 @@
 // ============================================================================
-// process.cpp — ZPNet Process Framework (NVM-backed subscriptions)
+// process.cpp — ZPNet Process Framework
 // ============================================================================
 //
 // Subscriptions:
-//   • NO local subscription storage
-//   • NO static subscription tables
-//   • All active subscriptions are stored in NVM
-//   • NVM is the single source of truth
+//   • NO persistence
+//   • NO local storage
+//   • Subscription truth is owned by PUBSUB (volatile, RAM-only)
 //
 // Handlers:
 //   • Handler functions live in process vtables (code truth)
-//   • NVM stores only topic names
 //
 // ============================================================================
 
 #include "process.h"
 #include "transport.h"
-#include "nvm.h"
 #include "debug.h"
+#include "process_pubsub.h"   // <-- subscription access
 
 #include <Arduino.h>
 #include <string.h>
@@ -27,7 +25,6 @@
 // ============================================================================
 
 static constexpr size_t MAX_PROCESSES = 30;
-static constexpr const char* NVM_SUBSCRIPTIONS_KEY = "subscriptions";
 
 // ============================================================================
 // Registry Entry
@@ -230,16 +227,8 @@ void process_command(const Payload& request) {
 }
 
 // ============================================================================
-// PUB / SUB Dispatch (NVM-backed, NO local storage)
+// PUB / SUB Dispatch (volatile, PUBSUB-owned truth)
 // ============================================================================
-//
-// Semantics:
-//   • For each process:
-//       - consult NVM to see which topics it is subscribed to
-//       - if topic is present, invoke handler
-//   • No caching
-//   • NVM is authoritative
-//
 
 void process_publish_dispatch(
   const char* topic,
@@ -247,21 +236,27 @@ void process_publish_dispatch(
 ) {
   if (!topic || !*topic) return;
 
-  Payload subs;
-  if (!nvm_read(NVM_SUBSCRIPTIONS_KEY, subs)) {
-    // No subscriptions defined
-    return;
+  // ------------------------------------------------------------
+  // Obtain current volatile subscription truth
+  // ------------------------------------------------------------
+
+  const Payload* subs = pubsub_get_subscriptions();
+  if (!subs || subs->empty()) {
+    return;   // no active subscriptions in this runtime
   }
+
+  // ------------------------------------------------------------
+  // Deliver to matching process handlers
+  // ------------------------------------------------------------
 
   for (size_t i = 0; i < registry_count; i++) {
 
     const process_vtable_t* v = registry[i].vtable;
     if (!v) continue;
 
-    // Does this process have any subscriptions?
-    if (!subs.has(v->process_id)) continue;
+    if (!subs->has(v->process_id)) continue;
 
-    PayloadArray topics = subs.getArray(v->process_id);
+    PayloadArray topics = subs->getArray(v->process_id);
 
     for (size_t j = 0; j < topics.size(); j++) {
       Payload entry = topics.get(j);

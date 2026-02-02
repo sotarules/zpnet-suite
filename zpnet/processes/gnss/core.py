@@ -217,6 +217,10 @@ def gnss_reader() -> None:
         import logging
         logging.exception("[gnss_reader] unhandled exception")
 
+# ------------------------------------------------------------------
+# Command handlers
+# ------------------------------------------------------------------
+
 def cmd_report(_: Optional[dict]) -> Dict:
     p: Dict[str, object] = {}
 
@@ -257,17 +261,21 @@ def cmd_publish(_: Optional[dict]) -> Dict:
         "payload": { "implications": "Nothing short of astounding." },
     }
 
+# ---------------------------------------------------------------------
+# Publish surface
+# ---------------------------------------------------------------------
+
+def on_message(payload: Payload) -> None:
+    logging.info("🚀 [gnss] received message on topic %s", payload)
+
 COMMANDS = {
     "REPORT": cmd_report,
     "PUBLISH": cmd_publish
 }
 
-# ---------------------------------------------------------------------
-# Publish surface
-# ---------------------------------------------------------------------
-
-def on_message(topic: str, payload: Payload) -> None:
-    logging.info("🚀 [gnss] received message on topic %s: %s", topic, payload)
+SUBSCRIPTIONS = {
+    "EVENTS": on_message
+}
 
 # ---------------------------------------------------------------------
 # Entrypoint
@@ -289,8 +297,7 @@ def run() -> None:
         server_setup(
             subsystem="GNSS",
             commands=COMMANDS,
-            subscriptions=["EVENTS_NEWS_FEED"],
-            on_message=on_message,
+            subscriptions=SUBSCRIPTIONS
         )
 
     except Exception:
