@@ -125,6 +125,7 @@ const char* process_get_name(size_t idx);
 // Internal framework use only
 const process_vtable_t* process_get_vtable(size_t idx);
 
+const process_vtable_t* process_get_vtable_by_name(const char* name);
 
 // --------------------------------------------------
 // Transport-facing entry points

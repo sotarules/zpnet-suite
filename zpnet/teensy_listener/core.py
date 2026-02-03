@@ -20,7 +20,7 @@ import os
 import socket
 import threading
 from queue import Queue, Empty
-from typing import Dict, Any, Optional, TextIO, Set, List
+from typing import Dict, Any, Optional, TextIO, Set, List, Tuple
 
 from zpnet.processes.processes import server_setup, send_command, list_subsystems
 from zpnet.shared.constants import (
@@ -59,8 +59,43 @@ SOCKET_DIR = "/tmp"
 pending_replies: Dict[int, Queue] = {}
 req_id_counter = itertools.count(1)
 
-# Router state (empty until applied later)
-subscriptions: Dict[str, Set[str]] = {}
+# ---------------------------------------------------------------------
+# Routing table (cartesian subscription edges)
+# ---------------------------------------------------------------------
+#
+# Logical model:
+#   Each subscription declaration expands into atomic edges of the form:
+#
+#       (machine, subsystem, topic)
+#
+#   This is the Cartesian product of:
+#       • declaring entities (machine × subsystem)
+#       • declared topics
+#
+# Physical storage:
+#   routes_by_topic groups those edges by topic, dropping the topic
+#   dimension into the dictionary key:
+#
+#       routes_by_topic[topic] = {
+#           (machine, subsystem),
+#           (machine, subsystem),
+#           ...
+#       }
+#
+# Interpretation:
+#   • Each tuple represents ONE independent delivery target
+#   • The set enforces idempotence (no duplicate delivery edges)
+#   • No tuple implies ordering, grouping, or batching
+#   • Fan-out is performed once per tuple
+#
+# This structure is intentionally the inverse of declaration form:
+#   declaration:  subsystem -> [topics]
+#   routing:      topic -> {(machine, subsystem)}
+#
+# ---------------------------------------------------------------------
+
+routes_by_topic: Dict[str, Set[Tuple[str, str]]] = {}
+applied_union: Dict[str, Any] = {}
 
 state_lock = threading.Lock()
 debug_log_fh: Optional[TextIO] = None
@@ -80,7 +115,6 @@ def open_debug_log() -> None:
 # ---------------------------------------------------------------------
 
 def on_receive_debug(payload: Dict[str, Any]) -> None:
-    logging.info("🐞 [rx-debug] %s", payload)
     if debug_log_fh:
         debug_log_fh.write(payload_to_json_str(payload) + "\n")
 
@@ -98,6 +132,7 @@ def on_receive_request_response(payload: Dict[str, Any]) -> None:
     q.put(payload)
 
 def on_receive_publish_subscribe(payload: Dict[str, Any]) -> None:
+    # Message originated from Teensy. Never forward back to Teensy.
     route_publish(payload, forward_to_teensy=False)
 
 # ---------------------------------------------------------------------
@@ -147,20 +182,39 @@ def handle_client(conn: socket.socket) -> None:
 # ---------------------------------------------------------------------
 
 def route_publish(msg: Dict[str, Any], *, forward_to_teensy: bool) -> None:
+    """
+    Route a single published message to all interested targets.
+
+    Semantics:
+      • Fan-out to PI targets via per-subsystem pubsub sockets
+      • Forward to TEENSY at most once (transport layer) if:
+          - forward_to_teensy is True, and
+          - at least one TEENSY target exists for the topic
+      • Best-effort, silence on per-target failure
+    """
     topic = msg.get("topic")
     if not topic:
         return
 
+    # Snapshot the Cartesian product slice for this topic:
+    #   all (machine, subsystem) pairs that subscribed to it.
     with state_lock:
-        targets = [
-            subsystem
-            for subsystem, topic_set in subscriptions.items()
-            if topic in topic_set
-        ]
+        topic_routes = routes_by_topic.get(topic, set())
+
+    # Copy the set so fan-out iterates over a stable view
+    # of the subscription edge set.
+    targets = set(topic_routes)
 
     raw = payload_to_json_bytes(msg)
 
-    for subsystem in targets:
+    teensy_needed = False
+
+    for machine, subsystem in targets:
+        if machine == "TEENSY":
+            teensy_needed = True
+            continue
+
+        # PI target: deliver to its pubsub socket
         sock_path = f"{SOCKET_DIR}/zpnet-{subsystem.lower()}-pubsub.sock"
         try:
             with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
@@ -168,9 +222,9 @@ def route_publish(msg: Dict[str, Any], *, forward_to_teensy: bool) -> None:
                 sock.sendall(raw)
                 sock.shutdown(socket.SHUT_WR)
         except Exception:
-            logging.warning("⚠️ [pubsub] fan-out failed %s -> %s", topic, subsystem)
+            logging.warning("⚠️ [pubsub] fan-out failed %s -> %s:%s", topic, machine, subsystem)
 
-    if forward_to_teensy:
+    if forward_to_teensy and teensy_needed:
         transport_send(TRAFFIC_PUBLISH_SUBSCRIBE, msg)
 
 # ---------------------------------------------------------------------
@@ -178,6 +232,10 @@ def route_publish(msg: Dict[str, Any], *, forward_to_teensy: bool) -> None:
 # ---------------------------------------------------------------------
 
 def pubsub_server() -> None:
+    """
+    Accepts PI-originated publishes (local publishers).
+    These may need to be forwarded to Teensy if Teensy targets exist.
+    """
     if os.path.exists(PS_SOCKET_PATH):
         os.unlink(PS_SOCKET_PATH)
 
@@ -206,55 +264,47 @@ def rpc_server() -> None:
         conn, _ = srv.accept()
         threading.Thread(target=handle_client, args=(conn,), daemon=True).start()
 
-def build_teensy_setsubscriptions_payload(union_subs: list[dict]) -> dict:
-    """
-    Convert union subscription truth into Teensy SETSUBSCRIPTIONS payload.
-    """
-
-    entries = []
-
-    for row in union_subs:
-        if row.get("machine") != "TEENSY":
-            continue
-
-        process = row.get("subsystem")
-        subs = row.get("subscriptions", [])
-
-        topics = [s["name"] for s in subs if "name" in s]
-
-        if not process or not topics:
-            continue
-
-        entries.append({
-            "process": process,
-            "topics": topics,
-        })
-
-    return {
-        "subscriptions": entries
-    }
-
 # ---------------------------------------------------------------------
 # PUBSUB command surface
 # ---------------------------------------------------------------------
 
 def cmd_report(_: Optional[dict]) -> Dict[str, Any]:
+    """
+    Report the applied routing truth in its raw execution form.
+
+    The payload is the Cartesian product of:
+        (machine, subsystem, topic)
+
+    This is the exact structure used internally by the router,
+    with no projection, grouping, or semantic reshaping.
+    """
+
+    rows: List[Dict[str, str]] = []
+
     with state_lock:
-        return {
-            "success": True,
-            "message": "OK",
-            "payload": {
-                "subscriptions": {
-                    k: sorted(v) for k, v in subscriptions.items()
-                }
-            },
-        }
+        for topic, targets in routes_by_topic.items():
+            for machine, subsystem in targets:
+                rows.append({
+                    "machine": machine,
+                    "subsystem": subsystem,
+                    "topic": topic,
+                })
+
+    # Deterministic ordering for diffing and sanity
+    rows.sort(key=lambda r: (r["machine"], r["subsystem"], r["topic"]))
+
+    return {
+        "success": True,
+        "message": "OK",
+        "payload": {
+            "routes": rows
+        },
+    }
 
 def cmd_allsubscriptions(_: Optional[dict]) -> Dict[str, Any]:
     results: List[Dict[str, Any]] = []
 
     for subsystem in list_subsystems():
-
         try:
             # Self-query: answer directly
             if subsystem == "PUBSUB":
@@ -268,7 +318,7 @@ def cmd_allsubscriptions(_: Optional[dict]) -> Dict[str, Any]:
             # IPC for real subsystems
             resp = send_command(
                 machine="PI",
-                subsystem=subsystem,  # protocol identity
+                subsystem=subsystem,
                 command="SUBSCRIPTIONS",
             )
 
@@ -303,9 +353,7 @@ def cmd_unionsubscriptions(_: Optional[dict]) -> Dict[str, Any]:
 
     results: List[Dict[str, Any]] = []
 
-    # ------------------------------------------------------------
-    # 1. PI-side subscriptions (local)
-    # ------------------------------------------------------------
+    # 1) PI-side
     try:
         pi_resp = cmd_allsubscriptions(None)
         pi_payload = pi_resp.get("payload", {}).get("subscriptions", [])
@@ -313,9 +361,7 @@ def cmd_unionsubscriptions(_: Optional[dict]) -> Dict[str, Any]:
     except Exception:
         logging.warning("⚠️ [pubsub] failed to collect PI subscriptions")
 
-    # ------------------------------------------------------------
-    # 2. TEENSY-side subscriptions (remote)
-    # ------------------------------------------------------------
+    # 2) TEENSY-side
     try:
         teensy_payload = send_command(
             machine="TEENSY",
@@ -328,9 +374,7 @@ def cmd_unionsubscriptions(_: Optional[dict]) -> Dict[str, Any]:
     except Exception:
         logging.warning("⚠️ [pubsub] failed to collect TEENSY subscriptions")
 
-    # ------------------------------------------------------------
-    # 3. Canonical ordering (nice but optional)
-    # ------------------------------------------------------------
+    # 3) Canonical ordering
     results.sort(key=lambda x: (x.get("machine"), x.get("subsystem")))
 
     return {
@@ -350,21 +394,14 @@ def cmd_refresh(_: Optional[dict]) -> Dict[str, Any]:
       • Union them into a single canonical payload
       • Commit that payload verbatim to:
           1) TEENSY (SETSUBSCRIPTIONS)
-          2) PI (local router state)
+          2) PI (local routing state)
     """
 
-    # ------------------------------------------------------------
-    # 1. Observe + union (single source of truth)
-    # ------------------------------------------------------------
+    # 1) Observe + union (single source of truth)
     union_resp = cmd_unionsubscriptions(None)
     union_payload = union_resp.get("payload", {})
 
-    logging.info("🚀 ️ [pubsub] REFRESH union payload: %s", union_payload)
-
-    # ------------------------------------------------------------
-    # 2. Commit union verbatim to TEENSY
-    # ------------------------------------------------------------
-    logging.info("🚀 ️ [pubsub] REFRESH setting subscriptions in Teensy payload: %s", union_payload)
+    # 2) Commit union verbatim to TEENSY
     try:
         teensy_resp = send_command(
             machine="TEENSY",
@@ -392,42 +429,39 @@ def cmd_refresh(_: Optional[dict]) -> Dict[str, Any]:
             },
         }
 
-
-
-    # ------------------------------------------------------------
-    # 3. Commit same union locally on PI
-    # ------------------------------------------------------------
-    new_table: Dict[str, Set[str]] = {}
+    # 3) Build machine-qualified routes_by_topic from union
+    new_routes: Dict[str, Set[Tuple[str, str]]] = {}
 
     for row in union_payload.get("subscriptions", []):
+        machine = row.get("machine")
         subsystem = row.get("subsystem")
         subs = row.get("subscriptions", [])
 
-        if not subsystem:
+        if not machine or not subsystem:
             continue
 
         for s in subs:
-            name = s.get("name")
+            name = s.get("name") if isinstance(s, dict) else None
             if not name:
                 continue
-            new_table.setdefault(subsystem, set()).add(name)
+            new_routes.setdefault(name, set()).add((machine, subsystem))
 
-
-
+    # 4) Commit locally
     with state_lock:
-        subscriptions.clear()
-        subscriptions.update(new_table)
-        logging.info("🚀 ️ [pubsub] subscriptions updated: %s", subscriptions)
+        routes_by_topic.clear()
+        routes_by_topic.update(new_routes)
 
-    # ------------------------------------------------------------
-    # 4. Return committed truth
-    # ------------------------------------------------------------
+        applied_union.clear()
+        applied_union.update(union_payload)
+
+        logging.info("🚀 [pubsub] routes updated (%d topics)", len(routes_by_topic))
+
+    # 5) Return committed truth
     return {
         "success": True,
         "message": "OK",
         "payload": union_payload,
     }
-
 
 # ---------------------------------------------------------------------
 # Declarations
@@ -439,6 +473,20 @@ COMMANDS = {
     "UNIONSUBSCRIPTIONS": cmd_unionsubscriptions,
     "REFRESH": cmd_refresh,
 }
+
+def _delayed_refresh(delay_s: float = 10.0) -> None:
+    """
+    Invoke REFRESH after a fixed delay to allow full system bring-up.
+    """
+    import time
+
+    time.sleep(delay_s)
+    try:
+        logging.info("🔄 [pubsub] auto REFRESH starting")
+        cmd_refresh(None)
+        logging.info("✅ [pubsub] auto REFRESH complete")
+    except Exception:
+        logging.exception("❌ [pubsub] auto REFRESH failed")
 
 # ---------------------------------------------------------------------
 # Entrypoint
@@ -456,6 +504,14 @@ def run() -> None:
     threading.Thread(target=rpc_server, daemon=True).start()
     threading.Thread(target=pubsub_server, daemon=True).start()
 
+    # Automatic control-plane convergence
+    threading.Thread(
+        target=_delayed_refresh,
+        daemon=True,
+        name="pubsub-auto-refresh",
+    ).start()
+
+    # Process lifetime (never returns)
     server_setup(
         subsystem="PUBSUB",
         commands=COMMANDS,

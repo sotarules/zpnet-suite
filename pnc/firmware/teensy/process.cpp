@@ -72,24 +72,6 @@ find_command(const process_vtable_t* vtable, const char* name) {
   return nullptr;
 }
 
-static const process_subscription_entry_t*
-find_subscription_handler(
-  const process_vtable_t* vtable,
-  const char*             topic
-) {
-  if (!vtable || !vtable->subscriptions || !topic) return nullptr;
-
-  for (const process_subscription_entry_t* e = vtable->subscriptions;
-       e->topic;
-       ++e) {
-    if (strcmp(e->topic, topic) == 0) {
-      return e;
-    }
-  }
-
-  return nullptr;
-}
-
 // ============================================================================
 // Canonical helpers
 // ============================================================================
@@ -163,6 +145,17 @@ const process_vtable_t* process_get_vtable(size_t idx) {
   return registry[idx].vtable;
 }
 
+const process_vtable_t* process_get_vtable_by_name(const char* name) {
+  if (!name) return nullptr;
+
+  for (size_t i = 0; i < registry_count; i++) {
+    if (strcmp(registry[i].id, name) == 0) {
+      return registry[i].vtable;
+    }
+  }
+  return nullptr;
+}
+
 // ============================================================================
 // REQUEST / RESPONSE Command Processor (UNCHANGED)
 // ============================================================================
@@ -227,8 +220,12 @@ void process_command(const Payload& request) {
 }
 
 // ============================================================================
-// PUB / SUB Dispatch (volatile, PUBSUB-owned truth)
+// PUB / SUB Dispatch — delegated to PUBSUB
 // ============================================================================
+//
+// All subscription truth and fan-out logic lives in PUBSUB.
+// This function is now a thin semantic delegate only.
+//
 
 void process_publish_dispatch(
   const char* topic,
@@ -236,42 +233,6 @@ void process_publish_dispatch(
 ) {
   if (!topic || !*topic) return;
 
-  // ------------------------------------------------------------
-  // Obtain current volatile subscription truth
-  // ------------------------------------------------------------
-
-  const Payload* subs = pubsub_get_subscriptions();
-  if (!subs || subs->empty()) {
-    return;   // no active subscriptions in this runtime
-  }
-
-  // ------------------------------------------------------------
-  // Deliver to matching process handlers
-  // ------------------------------------------------------------
-
-  for (size_t i = 0; i < registry_count; i++) {
-
-    const process_vtable_t* v = registry[i].vtable;
-    if (!v) continue;
-
-    if (!subs->hasArray(v->process_id)) continue;
-
-    PayloadArrayView topics = subs->getArrayView(v->process_id);
-
-    for (size_t j = 0; j < topics.size(); j++) {
-
-      Payload entry = topics.get(j);
-
-      const char* subscribed_topic = entry.getString("topic");
-      if (!subscribed_topic) continue;
-      if (strcmp(subscribed_topic, topic) != 0) continue;
-
-      const process_subscription_entry_t* handler =
-        find_subscription_handler(v, topic);
-
-      if (!handler || !handler->handler) continue;
-
-      handler->handler(payload);
-    }
-  }
+  // Delegate entirely to PUBSUB
+  process_pubsub_fanout(topic, payload);
 }

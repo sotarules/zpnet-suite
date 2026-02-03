@@ -5,9 +5,10 @@
 // PUBSUB Process — Volatile Subscription Control Plane (Teensy)
 //
 // Responsibilities:
-//   • Maintain volatile subscription truth (RAM-only, authoritative)
-//   • Apply subscription sets exactly as delivered by Pi
-//   • Report applied subscription truth verbatim
+//   • Maintain volatile subscription truth (RAM-only)
+//   • Apply authoritative subscription sets from Pi
+//   • Derive and expose Cartesian routing edges
+//   • Report routing truth in execution form
 //   • Expose declared subscription intent (ALLSUBSCRIPTIONS)
 //
 // Semantics:
@@ -15,13 +16,6 @@
 //   • Teensy never infers or reshapes intent
 //   • Subscription state is clobber-and-go
 //   • No persistence
-//
-// Non-responsibilities:
-//   • Routing
-//   • Fan-out
-//   • Negotiation
-//   • Announcement
-//   • Transport policy
 //
 // =============================================================
 
@@ -34,26 +28,65 @@
 
 #include <string.h>
 
+// ------------------------------------------------------------
+// Local helper: find subscription handler in a vtable
+// ------------------------------------------------------------
+static const process_subscription_entry_t*
+find_subscription_handler(
+  const process_vtable_t* vtable,
+  const char*             topic
+) {
+  if (!vtable || !vtable->subscriptions || !topic) return nullptr;
+
+  for (const process_subscription_entry_t* e = vtable->subscriptions;
+       e->topic;
+       ++e) {
+    if (strcmp(e->topic, topic) == 0) {
+      return e;
+    }
+  }
+
+  return nullptr;
+}
+
 // ================================================================
-// Subscription state (authoritative, opaque)
+// Authoritative subscription payload (verbatim from Pi)
 //
-// Stored exactly as received from Pi.
 // Shape:
 //   {
 //     "subscriptions": [ ... ]
 //   }
+// ================================================================
+
+static Payload g_union_payload;
+
+// ================================================================
+// Derived Cartesian routing edges (execution truth)
 //
-// Interpreted later via PayloadArrayView.
+// Each row represents ONE atomic routing edge:
+//   (machine, subsystem, topic)
+//
+// Stored as an array of objects:
+//   { "machine": "...", "subsystem": "...", "topic": "..." }
 // ================================================================
 
-static Payload g_subscriptions;
+static Payload g_routes;  // { "routes": [ {m,s,t}, ... ] }
 
 // ================================================================
-// Accessor
+// Helpers
+// ================================================================
+
+static void clear_state() {
+  g_union_payload.clear();
+  g_routes.clear();
+}
+
+// ================================================================
+// Accessors
 // ================================================================
 
 const Payload* pubsub_get_subscriptions() {
-  return &g_subscriptions;
+  return &g_routes;
 }
 
 // ================================================================
@@ -74,6 +107,47 @@ void process_publish_dispatch(const Payload& message) {
 
   // DATA PLANE ONLY
   process_publish_dispatch(topic, payload);
+}
+
+// ================================================================
+// Fan-out (execution truth, Cartesian routing)
+// ================================================================
+
+void process_pubsub_fanout(
+  const char* topic,
+  const Payload& payload
+) {
+  if (!topic || !*topic) return;
+  if (!g_routes.hasArray("routes")) return;
+
+  PayloadArrayView routes = g_routes.getArrayView("routes");
+
+  for (size_t i = 0; i < routes.size(); i++) {
+
+    Payload edge = routes.get(i);
+
+    const char* machine   = edge.getString("machine");
+    const char* subsystem = edge.getString("subsystem");
+    const char* t         = edge.getString("topic");
+
+    if (!machine || !subsystem || !t) continue;
+    if (strcmp(t, topic) != 0) continue;
+
+    // ------------------------------------------------------------
+    // Only deliver locally for TEENSY targets
+    // ------------------------------------------------------------
+    if (strcmp(machine, "TEENSY") != 0) continue;
+
+    const process_vtable_t* vt = process_get_vtable_by_name(subsystem);
+    if (!vt || !vt->subscriptions) continue;
+
+    const process_subscription_entry_t* handler =
+      find_subscription_handler(vt, topic);
+
+    if (!handler || !handler->handler) continue;
+
+    handler->handler(payload);
+  }
 }
 
 // ================================================================
@@ -110,15 +184,13 @@ static Payload cmd_publish(const Payload& args) {
 // ------------------------------------------------------------
 // SETSUBSCRIPTIONS — authoritative apply (clobber-and-go)
 //
-// Payload shape (canonical, opaque):
+// Payload shape:
 // {
 //   "subscriptions": [
 //     {
-//       "machine": "PI" | "TEENSY",
-//       "subsystem": "NAME",
-//       "subscriptions": [
-//         { "name": "TOPIC" }
-//       ]
+//       "machine": "...",
+//       "subsystem": "...",
+//       "subscriptions": [ { "name": "TOPIC" } ]
 //     }
 //   ]
 // }
@@ -133,9 +205,48 @@ static Payload cmd_setsubscriptions(const Payload& args) {
     return err;
   }
 
-  // Clobber-and-go: store exactly what was received
-  g_subscriptions.clear();
-  g_subscriptions = args;
+  clear_state();
+
+  // Preserve union payload verbatim
+  g_union_payload = args;
+
+  // ------------------------------------------------------------
+  // Derive Cartesian routing edges
+  // ------------------------------------------------------------
+
+  PayloadArray routes;
+
+  PayloadArrayView rows = args.getArrayView("subscriptions");
+
+  for (size_t i = 0; i < rows.size(); i++) {
+
+    Payload row = rows.get(i);
+
+    const char* machine   = row.getString("machine");
+    const char* subsystem = row.getString("subsystem");
+
+    if (!machine || !*machine) continue;
+    if (!subsystem || !*subsystem) continue;
+    if (!row.hasArray("subscriptions")) continue;
+
+    PayloadArrayView topics = row.getArrayView("subscriptions");
+
+    for (size_t j = 0; j < topics.size(); j++) {
+
+      Payload t = topics.get(j);
+      const char* topic = t.getString("name");
+      if (!topic || !*topic) continue;
+
+      Payload edge;
+      edge.add("machine", machine);
+      edge.add("subsystem", subsystem);
+      edge.add("topic", topic);
+
+      routes.add(edge);
+    }
+  }
+
+  g_routes.add_array("routes", routes);
 
   Payload resp;
   resp.add("status", "applied");
@@ -143,20 +254,18 @@ static Payload cmd_setsubscriptions(const Payload& args) {
 }
 
 // ------------------------------------------------------------
-// REPORT — reflect applied subscription truth verbatim
+// REPORT — expose execution truth (Cartesian edge list)
 // ------------------------------------------------------------
 static Payload cmd_report(const Payload&) {
 
-  Payload resp;
-
-  if (!g_subscriptions.has("subscriptions")) {
-    resp.add("subscriptions", "none");
+  if (!g_routes.hasArray("routes")) {
+    Payload resp;
+    resp.add("routes", "none");
     return resp;
   }
 
-  // Return exactly what we are holding
-  resp = g_subscriptions;
-  return resp;
+  // Return execution truth verbatim
+  return g_routes;
 }
 
 // ------------------------------------------------------------
