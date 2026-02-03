@@ -2,6 +2,8 @@
 
 #include "payload.h"
 
+bool pubsub_routes_ready(void);
+
 const Payload* pubsub_get_subscriptions();
 
 // Entry point for TRAFFIC_PUBLISH_SUBSCRIBE

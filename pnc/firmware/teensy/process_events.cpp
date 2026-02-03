@@ -19,6 +19,7 @@
 #include "config.h"
 #include "debug.h"
 #include "process_events.h"
+#include "process_pubsub.h"
 #include "process.h"
 #include "payload.h"
 #include "transport.h"
@@ -100,6 +101,11 @@ void emit_system_error(
 static void publish_events(timepop_ctx_t*, void*) {
 
   if (evt_count == 0) {
+    return;
+  }
+
+  // Hard gate: do nothing until routing truth exists
+  if (!pubsub_routes_ready()) {
     return;
   }
 

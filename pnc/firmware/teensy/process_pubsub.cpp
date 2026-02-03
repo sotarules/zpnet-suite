@@ -70,11 +70,16 @@ static Payload g_union_payload;
 //   { "machine": "...", "subsystem": "...", "topic": "..." }
 // ================================================================
 
-static Payload g_routes;  // { "routes": [ {m,s,t}, ... ] }
+static Payload g_routes;
+static bool g_routes_ready = false;// { "routes": [ {m,s,t}, ... ] }
 
 // ================================================================
 // Helpers
 // ================================================================
+
+bool pubsub_routes_ready(void) {
+  return g_routes_ready;
+}
 
 static void clear_state() {
   g_union_payload.clear();
@@ -247,6 +252,7 @@ static Payload cmd_setsubscriptions(const Payload& args) {
   }
 
   g_routes.add_array("routes", routes);
+  g_routes_ready = true;
 
   Payload resp;
   resp.add("status", "applied");
