@@ -196,6 +196,7 @@ void setup() {
   debug_log("boot", "process_timepop_register done");
 
   debug_log("boot", "process_clocks_register");
+  process_clocks_init();
   process_clocks_register();
   debug_log("boot", "process_clocks_register done");
 

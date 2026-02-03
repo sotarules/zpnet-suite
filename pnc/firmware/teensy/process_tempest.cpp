@@ -618,10 +618,6 @@ bool tempest_tau_profile(uint32_t total_seconds) {
   return true;
 }
 
-static void on_gnss_news_feed(const Payload& payload) {
-  debug_log("tempest.gnss", payload);
-}
-
 // ================================================================
 // Commands
 // ================================================================
@@ -634,22 +630,13 @@ static const process_command_entry_t TEMPEST_COMMANDS[] = {
 };
 
 // ================================================================
-// Subscriptions
-// ================================================================
-
-static const process_subscription_entry_t TEMPEST_SUBSCRIPTIONS[] = {
-  { "GNSS_NEWS_FEED", on_gnss_news_feed },
-  { nullptr,         nullptr }
-};
-
-// ================================================================
 // Process VTable
 // ================================================================
 
 static const process_vtable_t TEMPEST_PROCESS = {
   .process_id    = "TEMPEST",
   .commands      = TEMPEST_COMMANDS,
-  .subscriptions = TEMPEST_SUBSCRIPTIONS,
+  .subscriptions = nullptr,
 };
 
 void process_tempest_register(void) {

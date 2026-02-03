@@ -53,6 +53,8 @@
  *
  * ------------------------------------------------------------------
  */
+// Transparent initialization of timer:
+void process_clocks_init(void);
 
 // Register CLOCKS process with the process registry
 void process_clocks_register(void);
