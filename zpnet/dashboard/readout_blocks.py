@@ -39,22 +39,62 @@ def get_clocks_report() -> dict:
 def gnss_report_readout() -> Generator[str, None, None]:
     g = get_system_snapshot()["gnss"]
 
-    yield f"GNSS REPORT: {g['health_state']}"
+    # Headline
+    yield f"GNSS REPORT: {g.get('lock_quality', 'UNKNOWN')}"
 
-    if "date" in g:
-        yield f"UTC DATE: {g['date']}"
-    if "time" in g:
-        yield f"UTC TIME: {g['time']}"
+    # Time validity & PPS
+    time_valid = g.get("time_valid")
+    pps_valid  = g.get("pps_valid")
 
+    yield (
+        f"TIME VALID: {'YES' if time_valid else 'NO'}"
+        f" | PPS: {'YES' if pps_valid else 'NO'}"
+    )
+
+    # UTC date/time
+    if "date" in g or "time" in g:
+        yield (
+            f"UTC: "
+            f"{g.get('date', '----')} "
+            f"{g.get('time', '--:--:--')}"
+        )
+
+    # Discipline & constellations
+    if "discipline" in g or "fix_mode" in g:
+        yield (
+            f"DISCIPLINE: {g.get('discipline', 'N/A')}"
+            f" | MODE: {g.get('fix_mode', '---')}"
+        )
+
+    # Satellites & geometry
+    if "satellites" in g or "hdop" in g:
+        yield (
+            f"SATELLITES: {g.get('satellites', '?')}"
+            f" | HDOP: {g.get('hdop', float('nan')):.2f}"
+        )
+
+    # Position
     if "latitude_deg" in g and "longitude_deg" in g:
         yield f"LATITUDE:  {g['latitude_deg']:.6f}°"
         yield f"LONGITUDE: {g['longitude_deg']:.6f}°"
 
+    # Altitude stack
     if "altitude_m" in g:
-        yield f"ALTITUDE: {g['altitude_m']:.1f} M"
+        yield f"ALTITUDE (MSL): {g['altitude_m']:.1f} m"
 
-    if "discipline" in g:
-        yield f"DISCIPLINE MODE: {g['discipline']}"
+    if "ellipsoid_height_m" in g or "geoid_sep_m" in g:
+        yield (
+            f"ELLIPSOID: {g.get('ellipsoid_height_m', float('nan')):.1f} m"
+            f" | GEOID Δ: {g.get('geoid_sep_m', float('nan')):.1f} m"
+        )
+
+    # Motion (optional but compact)
+    if "speed_knots" in g or "course_deg" in g:
+        yield (
+            f"SPEED / COURSE: "
+            f"{g.get('speed_knots', 0.0):.2f} kn"
+            f" / {g.get('course_deg', 0.0):.1f}°"
+        )
 
 
 # ---------------------------------------------------------------------
@@ -79,7 +119,7 @@ def clocks_status_readout() -> Generator[str, None, None]:
     yield f"{'DWT':<8} {c['tau_dwt']:>14.10f} {c['dwt_ppb']:>14.2f}"
 
     # OCXO
-    yield f"{'OCXO':<8} {c['tau_ocxo']:>14.10f} {c['ocxo_ppb']:>14.2f}"
+    #yield f"{'OCXO':<8} {c['tau_ocxo']:>14.10f} {c['ocxo_ppb']:>14.2f}"
 
 
 
