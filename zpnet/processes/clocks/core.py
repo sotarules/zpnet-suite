@@ -1,13 +1,12 @@
 """
-ZPNet Event Handler — Teensy Durable Event Queue Drainer
+ZPNet Clocks Handler — Monitor and persist clock stream updates
 
 Responsibilities:
-  • Respond to EVENTS topic messages
-  • Forward each event into the local ZPNet event store
+  • Respond to CLOCK topic messages
+  • Store most recent clock updates
 
 Process model:
   • One systemd service
-  • One polling thread (own execution context)
 
 Semantics:
   • No internal defensiveness
@@ -20,7 +19,6 @@ import logging
 
 from zpnet.processes.processes import server_setup
 from zpnet.shared.constants import Payload
-from zpnet.shared.events import create_event
 from zpnet.shared.logger import setup_logging
 
 
@@ -28,21 +26,18 @@ from zpnet.shared.logger import setup_logging
 # Publish surface
 # ---------------------------------------------------------------------
 
-def on_events(payload: Payload) -> None:
-
+def on_clocks(payload: Payload) -> None:
     try:
-        for item in payload["events"]:
-            logging.info("🚀 [on_events] received events: %s", payload)
-            create_event(item["event_type"], item.get("payload"))
+        logging.info("🚀 [on_clocks] received message: %s", payload)
     except Exception:
-        logging.exception("💥 [on_events] unhandled exception processing events: %s", payload)
+        logging.exception("💥 [on_clocks] unhandled exception processing events: %s", payload)
 
 # ---------------------------------------------------------------------
 # Publish surface
 # ---------------------------------------------------------------------
 
 SUBSCRIPTIONS = {
-    "EVENTS": on_events
+    "CLOCKS": on_clocks
 }
 
 # ---------------------------------------------------------------------
@@ -53,11 +48,11 @@ def run() -> None:
     setup_logging()
     try:
         server_setup(
-            subsystem="EVENTS",
+            subsystem="CLOCKS",
             subscriptions=SUBSCRIPTIONS
         )
     except Exception:
-        logging.exception("💥 [events] unhandled exception in main thread")
+        logging.exception("💥 [clocks] unhandled exception in main thread")
 
 if __name__ == "__main__":
     run()

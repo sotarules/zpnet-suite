@@ -293,9 +293,10 @@ def _serve_pubsub(
 def server_setup(
     *,
     subsystem: str,
-    commands: Dict[str, Callable[[Optional[dict]], dict]],
-    subscriptions: Dict[str, Callable[[dict], None]],
+    commands: Dict[str, Callable[[Optional[dict]], dict]] | None = None,
+    subscriptions: Dict[str, Callable[[dict], None]] | None = None,
 ) -> None:
+
     """
     Declaratively start a ZPNet Pi-side process.
 
@@ -310,6 +311,9 @@ def server_setup(
     """
 
     logging.info("🚀 [process] starting subsystem: %s", subsystem)
+
+    commands = commands or {}
+    subscriptions = subscriptions or {}
 
     # -----------------------------------------------------------------
     # Inject implicit SUBSCRIPTIONS command

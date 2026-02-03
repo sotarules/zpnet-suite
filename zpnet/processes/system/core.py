@@ -35,8 +35,8 @@ import psutil
 import requests
 from smbus2 import SMBus
 
-from zpnet.processes.processes import send_command, server_setup, publish
-from zpnet.shared.constants import (ZPNET_REMOTE_HOST, ZPNET_TEST_PATH, HTTP_TIMEOUT, EXPECTED_TEST_STRING, Payload)
+from zpnet.processes.processes import send_command, server_setup
+from zpnet.shared.constants import (ZPNET_REMOTE_HOST, ZPNET_TEST_PATH, HTTP_TIMEOUT, EXPECTED_TEST_STRING)
 from zpnet.shared.db import open_db
 from zpnet.shared.events import create_event
 from zpnet.shared.http import gzip_text
@@ -903,27 +903,9 @@ def system_poller() -> None:
     except Exception:
         logging.exception("[system_poller] unhandled exception - poller thread terminating")
 
-# ---------------------------------------------------------------------
-# Publish surface
-# ---------------------------------------------------------------------
-
-def on_message(payload: Payload) -> None:
-    logging.info("🚀 [system] received message on topic %s", payload)
-
 # ------------------------------------------------------------------
 # Command handlers
 # ------------------------------------------------------------------
-def cmd_publish(_: Optional[dict]) -> Dict:
-    payload: Payload = {}
-    payload["alpha"] = "System"
-    payload["beta"] = "News"
-    payload["gamma"] = "Feed"
-    publish("SYSTEM_NEWS_FEED", payload)
-    return {
-        "success": True,
-        "message": "OK",
-        "payload": { "status": "NOMINAL" },
-    }
 
 def cmd_report(_: Optional[dict]) -> Dict:
     """Return the most recent SYSTEM snapshot."""
@@ -935,12 +917,7 @@ def cmd_report(_: Optional[dict]) -> Dict:
     }
 
 COMMANDS = {
-    "REPORT": cmd_report,
-    "PUBLISH": cmd_publish
-}
-
-SUBSCRIPTIONS = {
-    "GNSS_NEWS_FEED": on_message
+    "REPORT": cmd_report
 }
 
 # ---------------------------------------------------------------------
@@ -958,8 +935,7 @@ def run() -> None:
 
         server_setup(
             subsystem="SYSTEM",
-            commands=COMMANDS,
-            subscriptions=SUBSCRIPTIONS
+            commands=COMMANDS
         )
 
     except Exception:

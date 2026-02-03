@@ -16,7 +16,6 @@ Process model:
 
 from __future__ import annotations
 
-import logging
 import math
 import os
 import socket
@@ -27,8 +26,7 @@ from typing import Dict, Optional, Set
 
 import serial
 
-from zpnet.processes.processes import server_setup, publish
-from zpnet.shared.constants import Payload
+from zpnet.processes.processes import server_setup
 from zpnet.shared.logger import setup_logging
 
 GNSS_DEVICE = os.environ.get("ZPNET_GNSS_PORT", "/dev/zpnet-gnss-serial")
@@ -248,33 +246,8 @@ def cmd_report(_: Optional[dict]) -> Dict:
 
     return {"success": True, "message": "OK", "payload": p}
 
-def cmd_publish(_: Optional[dict]) -> Dict:
-    payload: Payload = {}
-    payload["alpha"] = "GNSS"
-    payload["beta"] = "News"
-    payload["gamma"] = "Feed"
-    logging.info("🚀 [gnss] publishing %s: ", payload)
-    publish("GNSS_NEWS_FEED", payload)
-    return {
-        "success": True,
-        "message": "OK",
-        "payload": { "implications": "Nothing short of astounding." },
-    }
-
-# ---------------------------------------------------------------------
-# Publish surface
-# ---------------------------------------------------------------------
-
-def on_message(payload: Payload) -> None:
-    logging.info("🚀 [gnss] received message on topic %s", payload)
-
 COMMANDS = {
     "REPORT": cmd_report,
-    "PUBLISH": cmd_publish
-}
-
-SUBSCRIPTIONS = {
-    "EVENTS": on_message
 }
 
 # ---------------------------------------------------------------------
@@ -296,8 +269,7 @@ def run() -> None:
 
         server_setup(
             subsystem="GNSS",
-            commands=COMMANDS,
-            subscriptions=SUBSCRIPTIONS
+            commands=COMMANDS
         )
 
     except Exception:
