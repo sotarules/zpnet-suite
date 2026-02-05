@@ -60,10 +60,10 @@ def gnss_report_readout() -> Generator[str, None, None]:
         )
 
     # Discipline & constellations
-    if "discipline" in g or "fix_mode" in g:
+    if "discipline" in g or "position_mode" in g:
         yield (
             f"DISCIPLINE: {g.get('discipline', 'N/A')}"
-            f" | MODE: {g.get('fix_mode', '---')}"
+            f" | MODE: {g.get('position_mode', '---')}"
         )
 
     # Satellites & geometry
@@ -129,9 +129,20 @@ def clocks_status_readout() -> Generator[str, None, None]:
 
 def sensor_scan_readout() -> Generator[str, None, None]:
     sensors = get_system_snapshot()["sensors"]
-    yield "SENSOR SCAN:"
-    for name, state in sensors.items():
-        yield f"{name.upper()}: {state}"
+
+    health = sensors.get("health_state", "UNKNOWN")
+    yield f"SENSOR SCAN: {health}"
+
+    for bus_key, devices in sensors.items():
+        # Skip roll-up key
+        if bus_key == "health_state":
+            continue
+
+        # bus_key is "i2c-1", "i2c-2", etc.
+        bus_num = bus_key.split("-")[1]
+
+        for name, state in devices.items():
+            yield f"{bus_num} {name.upper()}: {state}"
 
 
 # ---------------------------------------------------------------------
@@ -180,35 +191,41 @@ def network_status_readout() -> Generator[str, None, None]:
 
 
 # ---------------------------------------------------------------------
-# POWER
+# POWER STATUS
 # ---------------------------------------------------------------------
 
 def power_status_readout() -> Generator[str, None, None]:
     p = get_system_snapshot()["power"]
-    rails = p["rails"]
 
     yield f"POWER STATUS: {p['health_state']}"
 
     load_total = 0.0
     battery_power = None
 
-    for r in rails:
-        label = r["label"]
-        v = r["voltage_v"]
-        i = r["current_ma"]
-        pw = r["power_w"]
+    for bus_key, devices in p.items():
+        if bus_key == "health_state":
+            continue
 
-        yield f"{label.upper():<14} {v:>6.3f} V {i:>7.1f} MA {pw:>6.3f} W"
+        # bus_key is "i2c-1", "i2c-2", etc.
+        bus_num = bus_key.split("-")[1]
 
-        if label.lower() == "battery":
-            battery_power = pw
-        else:
-            load_total += pw
+        for label, r in devices.items():
+            v  = r["volts"]
+            i  = r["amps"]
+            pw = r["watts"]
+
+            yield f"{bus_num} {label.upper():<14} {v:>6.3f} V {i:>7.1f} MA {pw:>6.3f} W"
+
+            if label.lower() == "battery":
+                battery_power = pw
+            else:
+                load_total += pw
 
     yield f"TOTAL LOAD POWER: {load_total:.3f} W"
 
     if battery_power and battery_power > 0:
         yield f"EFFICIENCY: {(load_total / battery_power) * 100.0:.1f} %"
+
 
 
 # ---------------------------------------------------------------------
@@ -217,17 +234,28 @@ def power_status_readout() -> Generator[str, None, None]:
 
 def battery_status_readout() -> Generator[str, None, None]:
     p = get_system_snapshot()["power"]
-    rails = p["rails"]
 
     yield f"BATTERY STATUS: {p['health_state']}"
 
-    battery = next(r for r in rails if r["label"].lower() == "battery")
+    # Flatten all rails across all I2C buses
+    rails = []
+    for bus_name, bus in p.items():
+        if bus_name == "health_state":
+            continue
+        if isinstance(bus, dict):
+            rails.extend(bus.values())
 
-    yield f"VOLTAGE: {battery['voltage_v']:.3f} V"
-    yield f"CURRENT: {battery['current_ma']:.1f} MA"
-    yield f"POWER:   {battery['power_w']:.3f} W"
+    # Find the battery rail
+    battery = next(
+        r for r in rails
+        if r.get("label", "").lower() == "battery"
+    )
 
-    if "ideal_voltage_v" in battery and battery["ideal_voltage_v"] is not None:
+    yield f"VOLTAGE: {battery['volts']:.3f} V"
+    yield f"CURRENT: {battery['amps']:.1f} MA"
+    yield f"POWER:   {battery['watts']:.3f} W"
+
+    if battery.get("ideal_voltage_v") is not None:
         yield f"IDEAL VOLTAGE: {battery['ideal_voltage_v']:.1f} V"
 
 

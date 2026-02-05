@@ -64,8 +64,6 @@ DEVICE_NAME = platform.node() or "raspberrypi"
 # Hardware constants
 # ------------------------------------------------------------------
 
-I2C_BUS = 1
-
 LASER_ADDR = 0x66
 
 REGS = {
@@ -94,16 +92,63 @@ OT_WARN_BIT = 0x02           # INT
 OT_SHDN_BIT = 0x01           # INT
 
 # ------------------------------------------------------------------
-# Sensor Scan (legacy: sensor_monitor)
+# I2C BUS IDENTITY (authoritative)
 # ------------------------------------------------------------------
 
-I2C_DEVICES = {
-    0x40: "INA260 0x40 (Battery)",
-    0x41: "INA260 0x41 (3v3 Rail)",
-    0x44: "INA260 0x44 (5v0 Rail)",
-    0x45: "INA260 0x45 (5v Teensy Rail)",
-    0x76: "BME280 0x76 (Environment)",
-    0x66: "EV5491 0x66 (Laser Controller)",
+I2C_BUS_LEGACY = 1          # SMBUS1 — hardware I2C (SDA/SCL)
+I2C_BUS_EXPANDED = 2        # SMBUS2 — i2c-gpio on GPIO23/24
+
+# ------------------------------------------------------------------
+# I2C ADDRESSES THAT ARE REAL BUT NOT SENSORS (must be ignored)
+# ------------------------------------------------------------------
+# Many DS3231 breakout boards include an AT24Cxx EEPROM at 0x57
+# alongside the RTC at 0x68. It will appear on any bus that hosts
+# such an RTC module.
+I2C_IGNORE_ADDRS = {
+    0x57,  # AT24Cxx EEPROM (RTC companion)
+}
+
+# ------------------------------------------------------------------
+# SENSOR INVENTORY BY BUS (explicit, no hidden assumptions)
+# ------------------------------------------------------------------
+
+I2C_SENSORS_BY_BUS = {
+    I2C_BUS_LEGACY: {
+        0x40: "INA260 0x40 (Battery)",
+        0x41: "INA260 0x41 (3v3 Rail)",
+        0x44: "INA260 0x44 (5v0 Rail)",
+        0x66: "EV5491 0x66 (Laser Controller)",
+        0x76: "BME280 0x76 (Environment)",
+        0x68: "DS3231 0x68 (RTC1)",
+        # 0x57 will appear via scan but is ignored (EEPROM)
+    },
+
+    I2C_BUS_EXPANDED: {
+        0x40: "INA260 0x40 (Pi Domain)",
+        0x41: "INA260 0x44 (Teensy Domain)",
+        0x44: "INA260 0x41 (24V Rail / Motors)",
+        0x45: "INA260 0x45 (OCXO 3v3 Domain)",
+        0x68: "DS3231 0x68 (RTC2)",
+        # 0x57 will appear via scan but is ignored (EEPROM)
+    },
+}
+
+# ------------------------------------------------------------------
+# Power monitoring (legacy: power_monitor)
+# ------------------------------------------------------------------
+
+POWER_CONFIG_BY_BUS = {
+    I2C_BUS_LEGACY: {
+        0x40: {"label": "Battery", "ideal_voltage_v": 12.8},
+        0x41: {"label": "3.3v Rail", "ideal_voltage_v": 3.3},
+        0x44: {"label": "5v Rail", "ideal_voltage_v": 5.0}
+    },
+    I2C_BUS_EXPANDED: {
+        0x40: {"label": "Pi Domain", "ideal_voltage_v": 5.0},
+        0x44: {"label": "Teensy Domain", "ideal_voltage_v": 5.0},
+        0x41: {"label": "24v Domain", "ideal_voltage_v": 24.0},
+        0x45: {"label": "OCXO Domain", "ideal_voltage_v": 3.0},
+    }
 }
 
 BME280_ID_REG = 0xD0
@@ -118,17 +163,6 @@ REG_DATA      = 0xF7
 
 EXPECTED_CHIP_ID = 0x60
 SEA_LEVEL_PRESSURE_HPA = 1013.25
-
-# ------------------------------------------------------------------
-# Power monitoring (legacy: power_monitor)
-# ------------------------------------------------------------------
-
-DEVICE_CONFIG = {
-    0x40: {"label": "Battery",          "ideal_voltage_v": 12.8},
-    0x41: {"label": "3.3v Rail",        "ideal_voltage_v": 3.3},
-    0x44: {"label": "5v Rail",          "ideal_voltage_v": 5.0},
-    0x45: {"label": "Teensy",           "ideal_voltage_v": 5.0},
-}
 
 REG_CURRENT = 0x01
 REG_VOLTAGE = 0x02
@@ -153,10 +187,40 @@ POWER_SAMPLE_STEP = 5                # same semantics as before
 #   }
 SYSTEM: Dict[str, object] = {}
 
+# ------------------------------------------------------------------
+# I2C BUS RESOLUTION (single source of truth)
+# ------------------------------------------------------------------
+
+def open_i2c(bus_id: int) -> SMBus:
+    """
+    Open an I2C bus by logical ID.
+    All SMBus access must go through here.
+    """
+    return SMBus(bus_id)
+
+# ------------------------------------------------------------------
+# Helper for instumenting I2C adapter names
+# ------------------------------------------------------------------
+
+def i2c_adapter_name(bus_id: int) -> str:
+    try:
+        return Path(f"/sys/class/i2c-dev/i2c-{bus_id}/name").read_text().strip()
+    except Exception:
+        return "UNKNOWN"
 
 # ------------------------------------------------------------------
 # Raspberry Pi helpers (migrated from pi_monitor)
 # ------------------------------------------------------------------
+
+from pathlib import Path
+
+def find_i2c_bus_by_name(name_fragment: str) -> int:
+    for d in Path("/sys/class/i2c-dev").iterdir():
+        name = (d / "name").read_text().strip()
+        if name_fragment in name:
+            return int(d.name.split("-")[1])
+    raise RuntimeError(f"I2C bus not found: {name_fragment}")
+
 
 def get_cpu_temp_c() -> float | None:
     for path in CPU_TEMP_PATHS:
@@ -390,15 +454,13 @@ def build_network_status() -> dict:
 # Laser helpers (migrated from laser_monitor)
 # ------------------------------------------------------------------
 
-def read_mp5491_registers() -> dict:
-    bus = SMBus(I2C_BUS)
-    try:
+def read_mp5491_registers():
+    with open_i2c(I2C_BUS_LEGACY) as bus:
         return {
             name: bus.read_byte_data(LASER_ADDR, addr)
             for name, addr in REGS.items()
         }
-    finally:
-        bus.close()
+
 
 def decode_mp5491_state(vals: dict) -> dict:
     sysen  = bool(vals["CTL0"] & SYSEN_BIT)
@@ -468,7 +530,7 @@ def build_gnss_status() -> dict:
     }
 
 # ------------------------------------------------------------------
-# Sensor helpers (migrated from sensor_monitor)
+# Sensor scan
 # ------------------------------------------------------------------
 
 def build_sensor_scan_status() -> dict:
@@ -476,21 +538,48 @@ def build_sensor_scan_status() -> dict:
     Build sensor scan snapshot.
 
     Semantics:
-      • SYSTEM reports electrical presence only
-      • Boundary at SMBus acquisition
-      • Any probe failure is real and fatal
-      • No device identity verification
-      • No interpretation
+      • Reports electrical presence only
+      • Two buses are first-class: SMBUS1 and SMBUS2
+      • Scan never crashes the poller
+      • Generic probes are best-effort; protocol reads belong elsewhere
+      • EEPROM companions (0x57) are ignored explicitly
+      • health_state is NOMINAL only if all sensors are NOMINAL
     """
-    results: dict[str, str] = {}
+    # Top-level snapshot is heterogeneous:
+    #   - per-bus entries are dict[str, str]
+    #   - health_state is a scalar
+    snapshot: dict[str, object] = {}
+    all_nominal = True
 
-    with SMBus(I2C_BUS) as bus:
-        for addr, label in I2C_DEVICES.items():
-            # Generic I²C presence probe (ACK required)
-            bus.read_byte_data(addr, 0x00)
-            results[label] = "NOMINAL"
+    for bus_id, devices in I2C_SENSORS_BY_BUS.items():
+        results: dict[str, str] = {}
+        snapshot[f"i2c-{bus_id}"] = results
 
-    return results
+        try:
+            with open_i2c(I2C_BUS_LEGACY) as bus:
+                for addr, label in devices.items():
+
+                    if addr in I2C_IGNORE_ADDRS:
+                        continue
+
+                    # Presence probe: best-effort.
+                    # Some devices do not support SMBus quick ops; do not treat
+                    # that as absence. We only require that the bus itself works.
+                    try:
+                        bus.write_quick(addr)
+                        results[label] = "NOMINAL"
+                    except OSError:
+                        results[label] = "PRESENT"
+                        all_nominal = False
+
+        except Exception:
+            logging.exception(f"[system] sensor scan failed on i2c-{bus_id}")
+            snapshot[f"i2c-{bus_id}"] = {"error": "scan_failed"}
+            all_nominal = False
+
+    snapshot["health_state"] = "NOMINAL" if all_nominal else "ANOMALY"
+    return snapshot
+
 
 # ------------------------------------------------------------------
 # Environment helpers (migrated from environment_monitor)
@@ -589,7 +678,7 @@ def build_environment_status() -> dict:
       • Either returns a complete, truthful payload
       • Or raises
     """
-    with SMBus(1) as bus:
+    with open_i2c(I2C_BUS_LEGACY) as bus:
         chip_id = bus.read_byte_data(BME280_ADDR, REG_ID)
         if chip_id != EXPECTED_CHIP_ID:
             raise RuntimeError(f"unexpected BME280 chip ID 0x{chip_id:02X}")
@@ -631,18 +720,27 @@ def read_word(bus: SMBus, addr: int, reg: int) -> int:
     return ((raw & 0xFF) << 8) | (raw >> 8)
 
 
-def read_ina260(bus: SMBus, addr: int) -> dict:
-    """
-    Read current, voltage, and power from an INA260.
+def read_ina260(bus_id: int, bus: SMBus, addr: int) -> dict:
+    adapter = i2c_adapter_name(bus_id)
 
-    Semantics:
-      • Raw, ground-truth measurements only
-      • Assumes device presence
-      • Any failure is real
-    """
     current_raw = read_word(bus, addr, REG_CURRENT)
     voltage_raw = read_word(bus, addr, REG_VOLTAGE)
     power_raw   = read_word(bus, addr, REG_POWER)
+
+    logging.info(
+        "[INA260 RAW] bus_id=%d adapter='%s' addr=0x%02X "
+        "I=0x%04X (%d) V=0x%04X (%d) P=0x%04X (%d)",
+        bus_id,
+        adapter,
+        addr,
+        current_raw & 0xFFFF,
+        current_raw,
+        voltage_raw & 0xFFFF,
+        voltage_raw,
+        power_raw & 0xFFFF,
+        power_raw,
+    )
+
 
     # Sign-extend current
     if current_raw & 0x8000:
@@ -652,15 +750,10 @@ def read_ina260(bus: SMBus, addr: int) -> dict:
     voltage_v  = voltage_raw * 0.00125      # 1.25 mV/LSB
     power_w    = (power_raw * 10) / 1000.0  # 10 mW/LSB → W
 
-    cfg = DEVICE_CONFIG[addr]
-
     return {
-        "address": f"0x{addr:02X}",
-        "label": cfg["label"],
-        "voltage_v": round(voltage_v, 3),
-        "current_ma": round(current_ma, 2),
-        "power_w": round(power_w, 3),
-        "ideal_voltage_v": cfg.get("ideal_voltage_v"),
+        "volts": round(voltage_v, 3),
+        "amps": round(current_ma, 2),
+        "watts": round(power_w, 3),
     }
 
 
@@ -674,32 +767,47 @@ def build_power_status() -> dict:
       • No per-rail fault masking
       • Boundary at SMBus acquisition
     """
-    rails: list[dict] = []
+    snapshot: dict[str, dict[str, dict]] = {}
 
-    with SMBus(I2C_BUS) as bus:
-        for addr in DEVICE_CONFIG:
-            rails.append(read_ina260(bus, addr))
+    for bus_id, devices in POWER_CONFIG_BY_BUS.items():
+        bus_key = f"i2c-{bus_id}"
+        results: dict[str, dict] = {}
+        snapshot[bus_key] = results
+
+        with open_i2c(bus_id) as bus:
+            for addr, cfg in devices.items():
+                reading = read_ina260(bus_id, bus, addr)
+                label = cfg["label"]
+
+                results[label] = {
+                    "label": label,
+                    "address": f"0x{addr:02X}",
+                    "ideal_voltage_v": cfg["ideal_voltage_v"],
+                    "volts": reading["volts"],
+                    "amps": reading["amps"],
+                    "watts": reading["watts"],
+                }
 
     return {
-        "bus": "i2c-1",
         "health_state": "NOMINAL",
-        "rails": rails,
+        **snapshot,
     }
+
 
 # ------------------------------------------------------------------
 # Battery status helpers
 # ------------------------------------------------------------------
 
 def extract_battery_power_w(system_payload: dict) -> Optional[float]:
-    """
-    Extract battery power (W) from SYSTEM power rails.
-    """
     power = system_payload.get("power", {})
-    rails = power.get("rails", [])
 
-    for rail in rails:
-        if rail.get("label") == BATTERY_LABEL:
-            return rail.get("power_w")
+    for key, bus in power.items():
+        if not key.startswith("i2c-"):
+            continue
+
+        for rail in bus.values():
+            if rail.get("label") == BATTERY_LABEL:
+                return rail.get("watts")
 
     return None
 
@@ -868,6 +976,7 @@ def system_poller() -> None:
 
     try:
         while True:
+            logging.info("[system_poller] *fire*")
 
             pi_payload = build_pi_status()
             teensy_payload = build_teensy_status()
@@ -879,6 +988,8 @@ def system_poller() -> None:
             power_payload = build_power_status()
             battery_payload = build_battery_status()
             clocks_payload = build_clocks_status()
+
+            logging.info("[system_poller] *built*")
 
             SYSTEM = {
                 "pi": dict(pi_payload),
@@ -927,6 +1038,8 @@ COMMANDS = {
 def run() -> None:
     setup_logging()
 
+    logging.info("[system] starting up *** SYSTEM process ***")
+
     try:
         threading.Thread(
             target=system_poller,
@@ -939,7 +1052,6 @@ def run() -> None:
         )
 
     except Exception:
-        import logging
         logging.exception("💥 [system] unhandled exception in main thread")
 
 if __name__ == "__main__":

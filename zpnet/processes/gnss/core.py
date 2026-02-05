@@ -16,13 +16,14 @@ Process model:
 
 from __future__ import annotations
 
+import logging
 import math
 import os
 import socket
 import threading
 import time
 from dataclasses import dataclass
-from typing import Dict, Optional, Set
+from typing import Dict, Optional, Set, TextIO
 
 import serial
 
@@ -33,6 +34,26 @@ GNSS_DEVICE = os.environ.get("ZPNET_GNSS_PORT", "/dev/zpnet-gnss-serial")
 GNSS_BAUD   = int(os.environ.get("ZPNET_GNSS_BAUD", "38400"))
 
 STREAM_SOCKET_PATH = "/tmp/zpnet-gnss-stream.sock"
+
+# ------------------------------------------------------------------
+# Logging
+# ------------------------------------------------------------------
+
+GNSS_LOG_PATH = "/home/mule/zpnet/logs/zpnet-gnss.log"
+
+gnss_log_fh: Optional[TextIO] = None
+
+def open_gnss_log() -> None:
+    global gnss_log_fh
+    if gnss_log_fh:
+        gnss_log_fh.close()
+    os.makedirs(os.path.dirname(GNSS_LOG_PATH), exist_ok=True)
+    gnss_log_fh = open(GNSS_LOG_PATH, "w", buffering=1)
+    logging.info("📝 [open_gnss_log] gnss log opened at %s", GNSS_LOG_PATH)
+
+def log_gnss(line: str) -> None:
+    if gnss_log_fh:
+        gnss_log_fh.write(line + "\n")
 
 # ------------------------------------------------------------------
 # State
@@ -50,11 +71,11 @@ class GnssState:
     month: int = 0
     day: int = 0
 
-    # Fix / quality
-    has_fix: bool = False
-    fix_quality: int = 0
-    fix_type: int = 0
-    fix_mode: str = ""
+    # Position acquisition (NOT a validated fix)
+    has_position: bool = False
+    position_quality: int = 0      # GGA quality indicator
+    position_type: int = 0         # GSA fix type
+    position_mode: str = ""        # GNS mode string
     satellites: int = 0
     hdop: float = math.nan
 
@@ -131,6 +152,12 @@ def stream_server() -> None:
 # Helpers
 # ------------------------------------------------------------------
 
+def maybe_int(s: str) -> Optional[int]:
+    return int(s) if s else None
+
+def maybe_float(s: str) -> Optional[float]:
+    return float(s) if s else None
+
 def nmea_latlon_to_deg(ddmm: str, hemi: str) -> float:
     v = float(ddmm)
     deg = math.floor(v / 100.0)
@@ -158,7 +185,7 @@ def parse_rmc(line: str) -> None:
     GNSS.latitude_deg  = nmea_latlon_to_deg(parts[3], parts[4])
     GNSS.longitude_deg = nmea_latlon_to_deg(parts[5], parts[6])
     GNSS.speed_knots   = float(parts[7])
-    GNSS.course_deg   = float(parts[8])
+    GNSS.course_deg    = float(parts[8])
 
     GNSS.hour   = int(time_s[0:2])
     GNSS.minute = int(time_s[2:4])
@@ -170,14 +197,19 @@ def parse_rmc(line: str) -> None:
     GNSS.year  = 2000 + int(date_s[4:6])
     GNSS.has_date = True
 
-    GNSS.has_fix = True
+    GNSS.has_position = True
 
 def parse_gga(line: str) -> None:
     parts = line.split(",")
-    GNSS.fix_quality = int(parts[6])
-    GNSS.satellites  = int(parts[7])
-    GNSS.altitude_m  = float(parts[9])
-    GNSS.has_fix     = GNSS.fix_quality > 0
+
+    GNSS.position_quality = int(parts[6]) if parts[6] else 0
+    GNSS.satellites       = int(parts[7]) if parts[7] else 0
+
+    alt = maybe_float(parts[9])
+    if alt is not None:
+        GNSS.altitude_m = alt
+
+    GNSS.has_position = GNSS.position_quality > 0
     recompute_ellipsoid_height()
 
 def parse_gns(line: str) -> None:
@@ -186,29 +218,43 @@ def parse_gns(line: str) -> None:
     GNSS.latitude_deg  = nmea_latlon_to_deg(parts[2], parts[3])
     GNSS.longitude_deg = nmea_latlon_to_deg(parts[4], parts[5])
 
-    GNSS.fix_mode   = parts[6]
-    GNSS.satellites = int(parts[7])
-    GNSS.hdop       = float(parts[8])
+    GNSS.position_mode = parts[6]
 
-    GNSS.altitude_m  = float(parts[9])
-    GNSS.geoid_sep_m = float(parts[10])
+    sats = maybe_int(parts[7])
+    if sats is not None:
+        GNSS.satellites = sats
 
-    GNSS.has_fix = True
+    hdop = maybe_float(parts[8])
+    if hdop is not None:
+        GNSS.hdop = hdop
+
+    alt = maybe_float(parts[9])
+    if alt is not None:
+        GNSS.altitude_m = alt
+
+    sep = maybe_float(parts[10])
+    if sep is not None:
+        GNSS.geoid_sep_m = sep
+
+    GNSS.has_position = bool(GNSS.position_mode and GNSS.position_mode != "N")
     recompute_ellipsoid_height()
 
 def parse_gsa(line: str) -> None:
     parts = line.split(",")
-    GNSS.fix_type = int(parts[2])
+    if parts[2]:
+        GNSS.position_type = int(parts[2])
 
 def extract_discipline(line: str) -> None:
     GNSS.discipline_mode = line.split(",")[1]
     GNSS.has_discipline = True
+
 
 # ------------------------------------------------------------------
 # Ingest
 # ------------------------------------------------------------------
 
 def ingest_line(line: str) -> None:
+    log_gnss(line)
     GNSS.last_rx_ts = time.time()
     publish_sentence(line)
 
@@ -248,7 +294,6 @@ def gnss_reader() -> None:
                 elif ch != "\r":
                     buf += ch
     except Exception:
-        import logging
         logging.exception("[gnss_reader] unhandled exception")
 
 # ------------------------------------------------------------------
@@ -272,15 +317,13 @@ def derive_lock_quality() -> str:
         elif GNSS.hdop <= 1.5:
             score += 1
 
-    if GNSS.fix_mode.count("D") >= 2:
+    if GNSS.position_mode.count("D") >= 2:
         score += 1
 
     if GNSS.has_discipline:
-        try:
+        if GNSS.discipline_mode[-1:].isdigit():
             if int(GNSS.discipline_mode[-1]) >= 4:
                 score += 2
-        except Exception:
-            pass
 
     if score >= 6:
         return "STRONG"
@@ -322,8 +365,8 @@ def cmd_report(_: Optional[dict]) -> Dict:
     if not math.isnan(GNSS.hdop):
         p["hdop"] = GNSS.hdop
 
-    if GNSS.fix_mode:
-        p["fix_mode"] = GNSS.fix_mode
+    if GNSS.position_mode:
+        p["position_mode"] = GNSS.position_mode
 
     if GNSS.has_discipline:
         p["discipline"] = GNSS.discipline_mode
@@ -351,12 +394,12 @@ COMMANDS = {
 
 def run() -> None:
     setup_logging()
+    open_gnss_log()
     try:
         threading.Thread(target=gnss_reader, daemon=True).start()
         threading.Thread(target=stream_server, daemon=True).start()
         server_setup(subsystem="GNSS", commands=COMMANDS)
     except Exception:
-        import logging
         logging.exception("💥 [gnss] unhandled exception in main thread")
 
 if __name__ == "__main__":
