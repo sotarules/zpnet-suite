@@ -13,12 +13,11 @@ Invariants:
 
 Author: The Mule + GPT
 """
-import json
+import logging
 from collections.abc import Generator
 
 from zpnet.processes.processes import send_command
 
-import logging
 log = logging.getLogger("zpnet.dashboard")
 
 # ---------------------------------------------------------------------
@@ -209,12 +208,13 @@ def power_status_readout() -> Generator[str, None, None]:
         # bus_key is "i2c-1", "i2c-2", etc.
         bus_num = bus_key.split("-")[1]
 
-        for label, r in devices.items():
+        for _, r in devices.items():
+            label = r.get("label", "UNKNOWN")
             v  = r["volts"]
             i  = r["amps"]
             pw = r["watts"]
 
-            yield f"{bus_num} {label.upper():<14} {v:>6.3f} V {i:>7.1f} MA {pw:>6.3f} W"
+            yield f"{label.upper():<14} {v:>6.3f} V {i:>7.1f} MA {pw:>6.3f} W"
 
             if label.lower() == "battery":
                 battery_power = pw
@@ -225,6 +225,7 @@ def power_status_readout() -> Generator[str, None, None]:
 
     if battery_power and battery_power > 0:
         yield f"EFFICIENCY: {(load_total / battery_power) * 100.0:.1f} %"
+
 
 
 

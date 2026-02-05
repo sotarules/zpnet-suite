@@ -28,15 +28,19 @@ import threading
 import time
 from pathlib import Path
 from statistics import mean
-from typing import Dict, Tuple
-from typing import Optional
+from typing import Dict, Tuple, Optional
 
 import psutil
 import requests
 from smbus2 import SMBus
 
 from zpnet.processes.processes import send_command, server_setup
-from zpnet.shared.constants import (ZPNET_REMOTE_HOST, ZPNET_TEST_PATH, HTTP_TIMEOUT, EXPECTED_TEST_STRING)
+from zpnet.shared.constants import (
+    ZPNET_REMOTE_HOST,
+    ZPNET_TEST_PATH,
+    HTTP_TIMEOUT,
+    EXPECTED_TEST_STRING,
+)
 from zpnet.shared.db import open_db
 from zpnet.shared.events import create_event
 from zpnet.shared.http import gzip_text
@@ -211,8 +215,6 @@ def i2c_adapter_name(bus_id: int) -> str:
 # ------------------------------------------------------------------
 # Raspberry Pi helpers (migrated from pi_monitor)
 # ------------------------------------------------------------------
-
-from pathlib import Path
 
 def find_i2c_bus_by_name(name_fragment: str) -> int:
     for d in Path("/sys/class/i2c-dev").iterdir():
@@ -727,21 +729,6 @@ def read_ina260(bus_id: int, bus: SMBus, addr: int) -> dict:
     voltage_raw = read_word(bus, addr, REG_VOLTAGE)
     power_raw   = read_word(bus, addr, REG_POWER)
 
-    logging.info(
-        "[INA260 RAW] bus_id=%d adapter='%s' addr=0x%02X "
-        "I=0x%04X (%d) V=0x%04X (%d) P=0x%04X (%d)",
-        bus_id,
-        adapter,
-        addr,
-        current_raw & 0xFFFF,
-        current_raw,
-        voltage_raw & 0xFFFF,
-        voltage_raw,
-        power_raw & 0xFFFF,
-        power_raw,
-    )
-
-
     # Sign-extend current
     if current_raw & 0x8000:
         current_raw -= 1 << 16
@@ -766,6 +753,11 @@ def build_power_status() -> dict:
       • No inference
       • No per-rail fault masking
       • Boundary at SMBus acquisition
+
+    Mongo / MiniMongo constraint:
+      • Dictionary keys must NOT contain '.'.
+      • Therefore, per-rail keys are address-derived (e.g., "0x41").
+      • Human-readable domain names live in the inner "label" field.
     """
     snapshot: dict[str, dict[str, dict]] = {}
 
@@ -779,9 +771,12 @@ def build_power_status() -> dict:
                 reading = read_ina260(bus_id, bus, addr)
                 label = cfg["label"]
 
-                results[label] = {
+                # MiniMongo-safe key: address only (no periods)
+                rail_key = f"0x{addr:02X}"
+
+                results[rail_key] = {
                     "label": label,
-                    "address": f"0x{addr:02X}",
+                    "address": rail_key,
                     "ideal_voltage_v": cfg["ideal_voltage_v"],
                     "volts": reading["volts"],
                     "amps": reading["amps"],
@@ -830,6 +825,7 @@ def get_last_battery_swap_ts() -> Optional[datetime]:
         return None
 
     return normalize_ts(row["ts"])
+
 
 def build_battery_status() -> dict:
     """
@@ -957,26 +953,22 @@ def build_teensy_status() -> dict:
     payload["health_state"] = "NOMINAL"
     return payload
 
-# ------------------------------------------------------------------
-# Teensy status helpers (migrated from teensy_monitor)
-# ------------------------------------------------------------------
 
 def build_clocks_status() -> dict:
     payload = send_command(machine="TEENSY", subsystem="CLOCKS", command="REPORT")["payload"]
     payload["health_state"] = "NOMINAL"
     return payload
 
+
 # ------------------------------------------------------------------
 # System poller thread
 # ------------------------------------------------------------------
 
 def system_poller() -> None:
-
     global SYSTEM
 
     try:
         while True:
-            logging.info("[system_poller] *fire*")
 
             pi_payload = build_pi_status()
             teensy_payload = build_teensy_status()
@@ -989,8 +981,6 @@ def system_poller() -> None:
             battery_payload = build_battery_status()
             clocks_payload = build_clocks_status()
 
-            logging.info("[system_poller] *built*")
-
             SYSTEM = {
                 "pi": dict(pi_payload),
                 "teensy": dict(teensy_payload),
@@ -1001,7 +991,7 @@ def system_poller() -> None:
                 "gnss": dict(gnss_payload),
                 "power": dict(power_payload),
                 "battery": dict(battery_payload),
-                "clocks": dict(clocks_payload)
+                "clocks": dict(clocks_payload),
             }
 
             # ----------------------------------------------------------
@@ -1013,6 +1003,7 @@ def system_poller() -> None:
 
     except Exception:
         logging.exception("[system_poller] unhandled exception - poller thread terminating")
+
 
 # ------------------------------------------------------------------
 # Command handlers
@@ -1038,8 +1029,6 @@ COMMANDS = {
 def run() -> None:
     setup_logging()
 
-    logging.info("[system] starting up *** SYSTEM process ***")
-
     try:
         threading.Thread(
             target=system_poller,
@@ -1054,6 +1043,6 @@ def run() -> None:
     except Exception:
         logging.exception("💥 [system] unhandled exception in main thread")
 
+
 if __name__ == "__main__":
     run()
-
