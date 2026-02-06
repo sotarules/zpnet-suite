@@ -100,6 +100,33 @@ applied_union: Dict[str, Any] = {}
 state_lock = threading.Lock()
 debug_log_fh: Optional[TextIO] = None
 
+# ------------------------------------------------------------------
+# Logging
+# ------------------------------------------------------------------
+
+PUBSUB_LOG_PATH = "/home/mule/zpnet/logs/zpnet-pubsub.log"
+
+pubsub_log_fh: Optional[TextIO] = None
+
+def open_pubsub_log() -> None:
+    global pubsub_log_fh
+    if pubsub_log_fh:
+        pubsub_log_fh.close()
+    os.makedirs(os.path.dirname(PUBSUB_LOG_PATH), exist_ok=True)
+    pubsub_log_fh = open(PUBSUB_LOG_PATH, "w", buffering=1)
+    logging.info("📝 [open_pubsub_log] pubsub log opened at %s", PUBSUB_LOG_PATH)
+
+def log_pubsub(payload: Dict[str, Any]) -> None:
+    if pubsub_log_fh:
+        topic = payload["topic"]
+        payload_string = payload_to_json_str(payload)
+
+        padding = max(0, 25 - len(topic))
+        line = f"{topic}{' ' * padding}{payload_string}\n"
+
+        pubsub_log_fh.write(line)
+
+
 # ---------------------------------------------------------------------
 # Debug sink
 # ---------------------------------------------------------------------
@@ -195,6 +222,8 @@ def route_publish(msg: Dict[str, Any], *, forward_to_teensy: bool) -> None:
     topic = msg.get("topic")
     if not topic:
         return
+
+    log_pubsub(msg)
 
     # Snapshot the Cartesian product slice for this topic:
     #   all (machine, subsystem) pairs that subscribed to it.
@@ -495,6 +524,7 @@ def _delayed_refresh(delay_s: float = 10.0) -> None:
 def run() -> None:
     setup_logging()
     open_debug_log()
+    open_pubsub_log()
     transport_init()
 
     transport_register_receive_callback(TRAFFIC_DEBUG, on_receive_debug)

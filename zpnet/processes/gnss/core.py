@@ -27,7 +27,7 @@ from typing import Dict, Optional, Set, TextIO
 
 import serial
 
-from zpnet.processes.processes import server_setup
+from zpnet.processes.processes import server_setup, publish
 from zpnet.shared.logger import setup_logging
 
 GNSS_DEVICE = os.environ.get("ZPNET_GNSS_PORT", "/dev/zpnet-gnss-serial")
@@ -199,6 +199,9 @@ def parse_rmc(line: str) -> None:
 
     GNSS.has_position = True
 
+    payload = get_gnss_payload(None)
+    publish("GNSS", payload)
+
 def parse_gga(line: str) -> None:
     parts = line.split(",")
 
@@ -332,10 +335,11 @@ def derive_lock_quality() -> str:
     return "WEAK"
 
 # ------------------------------------------------------------------
-# Command handlers
+# Shared payload for REPORT and publish
 # ------------------------------------------------------------------
 
-def cmd_report(_: Optional[dict]) -> Dict:
+def get_gnss_payload(_: Optional[dict]) -> Dict:
+
     lock_quality = derive_lock_quality()
 
     p: Dict[str, object] = {
@@ -381,8 +385,16 @@ def cmd_report(_: Optional[dict]) -> Dict:
             "crz": GNSS.last_crz,
         }.items() if v
     }
+    return p
 
-    return {"success": True, "message": "OK", "payload": p}
+# ------------------------------------------------------------------
+# Command handlers
+# ------------------------------------------------------------------
+
+def cmd_report(_: Optional[dict]) -> Dict:
+
+    payload = get_gnss_payload(None)
+    return {"success": True, "message": "OK", "payload": payload}
 
 COMMANDS = {
     "REPORT": cmd_report,
