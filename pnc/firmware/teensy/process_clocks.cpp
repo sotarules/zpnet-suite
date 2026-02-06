@@ -26,61 +26,63 @@ static void format_hms(uint64_t seconds, char* out, size_t out_sz) {
 }
 
 // ================================================================
-// PPS CAPTURE (AUTHORITATIVE EDGE TRUTH)
+// PPS CAPTURE — CLEAN, HARDWARE-TRUSTING
 // ================================================================
-
-// Minimum separation between valid PPS edges (ns)
-// Anything closer is ringing / bounce / noise.
-static constexpr uint64_t MIN_VALID_PPS_NS = 500000000ULL; // 0.5 s
-
-// Last accepted PPS timestamp
-static volatile uint64_t last_pps_dwt_ns = 0;
-
-// Monotonic PPS counter
-static volatile uint64_t pps_count = 0;
-
-// Enable gate (unchanged)
-static volatile bool pps_enabled = false;
-
-// Forward declaration
-static void pps_isr(void);
-
-// ------------------------------------------------------------
-// PPS ISR — edge truth only
-// ------------------------------------------------------------
 //
 // Semantics:
-//   • Executes at PPS edge arrival
-//   • Captures DWT-derived nanoseconds immediately
-//   • Publishes directly under topic "PPS"
-//   • No inference, no filtering, no rate logic
+//   • Hardware has already decided truth (pull-up / conditioning)
+//   • ISR captures authoritative DWT timestamp
+//   • No filtering, no plausibility checks
+//   • Publishing is deferred to non-ISR context
 //
+static volatile bool     pps_enabled     = false;
+static volatile bool     pps_followon_scheduled = false;
+static volatile uint64_t pps_count       = 0;
+static volatile uint64_t last_pps_dwt_ns = 0;
+
+// ------------------------------------------------------------
+// Forward declarations (ISR and follow-on callback)
+// ------------------------------------------------------------
+
+static void pps_isr(void);
+static void pps_followon_cb(timepop_ctx_t*, void*);
+
+
+// ------------------------------------------------------------
+// PPS ISR — MINIMAL, NON-BLOCKING
+// ------------------------------------------------------------
 static void pps_isr(void) {
 
-  if (!pps_enabled) {
-    return;
+  if (!pps_enabled) return;
+
+  // --- capture authoritative truth ---
+  last_pps_dwt_ns = clock_dwt_ns_now();
+  pps_count++;
+
+  // --- schedule continuation exactly once ---
+  if (!pps_followon_scheduled) {
+    pps_followon_scheduled = true;
+
+    timepop_arm(
+      TIMEPOP_CLASS_ASAP,   // <<< key change
+      false,                // one-shot
+      pps_followon_cb,
+      nullptr,
+      "pps-followon"
+    );
   }
+}
 
-  uint64_t now_ns = clock_dwt_ns_now();
+static void pps_followon_cb(timepop_ctx_t*, void*) {
 
-  // Time-based edge qualification
-  if (last_pps_dwt_ns != 0) {
-    uint64_t delta = now_ns - last_pps_dwt_ns;
-    if (delta < MIN_VALID_PPS_NS) {
-      // Reject: physically impossible PPS
-      return;
-    }
-  }
+  Payload ev;
+  ev.add("pps_count", pps_count);
+  ev.add("dwt_ns",    last_pps_dwt_ns);
 
-  // Accept this PPS
-  last_pps_dwt_ns = now_ns;
-  uint64_t count = ++pps_count;
+  publish("PPS", ev);
 
-  Payload p;
-  p.add("pps_count", count);
-  p.add("dwt_ns", now_ns);
-
-  publish("PPS", p);
+  // Allow next PPS to schedule again
+  pps_followon_scheduled = false;
 }
 
 
@@ -141,6 +143,8 @@ static Payload build_clock_report_payload(void) {
     p.add("ocxo_ppb",      0.0);
   }
 
+  p.add("gnss_lock", digitalRead(GNSS_LOCK_PIN));
+
   return p;
 }
 
@@ -165,12 +169,11 @@ static Payload cmd_clear(const Payload&) {
   return ok_payload();
 }
 
-// START_PPS — enable PPS capture + publish
 static Payload cmd_start_pps(const Payload&) {
 
-  // Idempotent enable
   pps_count = 0;
   pps_enabled = true;
+  pps_followon_scheduled = false;
 
   pinMode(GNSS_PPS_PIN, INPUT);
   attachInterrupt(
@@ -179,6 +182,8 @@ static Payload cmd_start_pps(const Payload&) {
     RISING
   );
 
+  pinMode(GNSS_LOCK_PIN, INPUT);
+
   Payload ev;
   ev.add("status", "started");
   publish("PPS_STARTED", ev);
@@ -186,7 +191,6 @@ static Payload cmd_start_pps(const Payload&) {
   return ok_payload();
 }
 
-// STOP_PPS — disable PPS capture
 static Payload cmd_stop_pps(const Payload&) {
 
   pps_enabled = false;
@@ -203,6 +207,8 @@ static Payload cmd_stop_pps(const Payload&) {
 // 1 Hz push publication
 // ================================================================
 static void clocks_1hz_tick(timepop_ctx_t*, void*) {
+
+  // Publish clock state
   Payload p = build_clock_report_payload();
   publish("CLOCKS/STATE", p);
 }

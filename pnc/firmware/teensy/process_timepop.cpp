@@ -19,9 +19,17 @@
 #define TIMEPOP_MAX_SLOTS   16       // hard upper bound (tune later)
 
 // Fixed cadence per class (in ticks)
+//
+// NOTE:
+//   remaining_ticks == 0 means:
+//     • expire immediately
+//     • dispatch on next timepop_dispatch()
+//     • no PIT involvement
+//
 static uint32_t CLASS_PERIOD_TICKS[TIMEPOP_CLASS_COUNT];
 
 static void init_timepop_class_periods(void) {
+  CLASS_PERIOD_TICKS[TIMEPOP_CLASS_ASAP]         = 0;
   CLASS_PERIOD_TICKS[TIMEPOP_CLASS_RX_POLL]      = 5;
   CLASS_PERIOD_TICKS[TIMEPOP_CLASS_EVENTBUS]     = 1000;
   CLASS_PERIOD_TICKS[TIMEPOP_CLASS_CPU_SAMPLE]   = 1000;
@@ -31,6 +39,10 @@ static void init_timepop_class_periods(void) {
   CLASS_PERIOD_TICKS[TIMEPOP_CLASS_DEBUG_BEACON] = 1000;
   CLASS_PERIOD_TICKS[TIMEPOP_CLASS_USER_1]       = 10;
   CLASS_PERIOD_TICKS[TIMEPOP_CLASS_USER_2]       = 100;
+
+  // IMPORTANT:
+  // Any class whose period is explicitly set to 0
+  // will behave as an ASAP continuation.
 }
 
 // ================================================================
@@ -80,16 +92,18 @@ void pit0_isr(void) {
 
     if (!slots[i].active) continue;
 
+    // Skip ASAP slots (remaining_ticks == 0)
     if (slots[i].remaining_ticks > 0) {
+
       slots[i].remaining_ticks--;
-    }
 
-    pit_last_remaining = slots[i].remaining_ticks;
+      pit_last_remaining = slots[i].remaining_ticks;
 
-    if (slots[i].remaining_ticks == 0 && !slots[i].expired) {
-      slots[i].expired = true;
-      pit_zero_hits++;
-      any_expired = true;
+      if (slots[i].remaining_ticks == 0 && !slots[i].expired) {
+        slots[i].expired = true;
+        pit_zero_hits++;
+        any_expired = true;
+      }
     }
   }
 
@@ -143,25 +157,35 @@ bool timepop_arm(
 
     if (slots[i].active) continue;
 
-    slots[i].active          = true;
-    slots[i].expired         = false;
-    slots[i].recurring       = recurring;
+    slots[i].active    = true;
+    slots[i].recurring = recurring;
+    slots[i].klass     = klass;
+    slots[i].callback  = callback;
+    slots[i].user_ctx  = user_ctx;
+    slots[i].name      = name;
+    slots[i].id        = next_slot_id++;
 
-    slots[i].klass           = klass;
-    slots[i].remaining_ticks = CLASS_PERIOD_TICKS[klass];
+    uint32_t period = CLASS_PERIOD_TICKS[klass];
 
-    slots[i].callback        = callback;
-    slots[i].user_ctx        = user_ctx;
-    slots[i].name            = name;
-    slots[i].id              = next_slot_id++;
+    if (period == 0) {
+      // ----------------------------------------------------------
+      // ASAP continuation semantics
+      // ----------------------------------------------------------
+      slots[i].remaining_ticks = 0;
+      slots[i].expired         = true;
+
+      // Force dispatch on next loop()
+      timepop_pending = true;
+    } else {
+      slots[i].remaining_ticks = period;
+      slots[i].expired         = false;
+    }
 
     interrupts();
-
     return true;
   }
 
   interrupts();
-
   return false;
 }
 
@@ -191,7 +215,16 @@ void timepop_dispatch(void) {
     cpu_usage_account_busy(end - start);
 
     if (slots[i].active && slots[i].recurring) {
-      slots[i].remaining_ticks = CLASS_PERIOD_TICKS[slots[i].klass];
+
+      uint32_t period = CLASS_PERIOD_TICKS[slots[i].klass];
+
+      if (period == 0) {
+        // Recurring ASAP is forbidden by construction
+        slots[i].active = false;
+      } else {
+        slots[i].remaining_ticks = period;
+      }
+
     } else {
       slots[i].active = false;
     }
@@ -233,7 +266,6 @@ static Payload cmd_report(const Payload& /*args*/) {
 
   Payload out;
 
-  // Build timers array manually (Payload is object-only)
   String timers;
   timers += "[";
 
@@ -254,13 +286,12 @@ static Payload cmd_report(const Payload& /*args*/) {
     timers += "\"";
     timers += ",\"remaining_ticks\":"; timers += slots[i].remaining_ticks;
     timers += "}";
+
   }
 
   timers += "]";
 
-  // Controlled escape hatch: inject trusted JSON array
   out.add("timers", timers.c_str());
-
   return out;
 }
 

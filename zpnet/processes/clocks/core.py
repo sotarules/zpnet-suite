@@ -18,10 +18,12 @@ Semantics:
 
 from __future__ import annotations
 
+from datetime import datetime
 import logging
+import time
 from typing import Dict, Any, Optional
 
-from zpnet.processes.processes import server_setup, publish
+from zpnet.processes.processes import server_setup, publish, send_command
 from zpnet.shared.constants import Payload
 from zpnet.shared.logger import setup_logging
 
@@ -35,21 +37,23 @@ _last_pps_payload: Optional[Dict[str, Any]] = None
 # Handlers
 # ---------------------------------------------------------------------
 
-def on_gnss(payload: Payload) -> None:
+def on_pps(payload: Payload) -> None:
     global _last_pps_payload
-    date = payload["date"]
-    time = payload["time"]
+
+    _last_pps_payload = payload
+    gnss_payload = send_command(machine="PI", subsystem="GNSS", command="REPORT")["payload"]
+    system_time = datetime.now().isoformat(timespec='milliseconds')
+    gnss_payload_date = gnss_payload["date"]
+    gnss_payload_time = gnss_payload["time"]
+
     timelock = {
-        "utc": f"{date}T{time}Z",
-        "date": date,
-        "time": time,
+        "utc": f"{gnss_payload_date}T{gnss_payload_time}Z",
+        "date": gnss_payload_date,
+        "time": gnss_payload_time,
+        "system_time": system_time,
         **_last_pps_payload
     }
     publish("TIMELOCK", timelock)
-
-def on_pps(payload: Payload) -> None:
-    global _last_pps_payload
-    _last_pps_payload = payload
 
 
 # ---------------------------------------------------------------------
@@ -57,7 +61,6 @@ def on_pps(payload: Payload) -> None:
 # ---------------------------------------------------------------------
 
 SUBSCRIPTIONS = {
-    "GNSS": on_gnss,
     "PPS": on_pps,
 }
 

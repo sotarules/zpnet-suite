@@ -27,7 +27,7 @@ from typing import Dict, Optional, Set, TextIO
 
 import serial
 
-from zpnet.processes.processes import server_setup, publish
+from zpnet.processes.processes import server_setup
 from zpnet.shared.logger import setup_logging
 
 GNSS_DEVICE = os.environ.get("ZPNET_GNSS_PORT", "/dev/zpnet-gnss-serial")
@@ -198,9 +198,6 @@ def parse_rmc(line: str) -> None:
     GNSS.has_date = True
 
     GNSS.has_position = True
-
-    payload = get_gnss_payload(None)
-    publish("GNSS", payload)
 
 def parse_gga(line: str) -> None:
     parts = line.split(",")

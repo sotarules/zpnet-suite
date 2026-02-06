@@ -24,7 +24,8 @@
 // -----------------------------------------------------------------------------
 
 typedef enum {
-  TIMEPOP_CLASS_RX_POLL = 0,
+  TIMEPOP_CLASS_ASAP = 0,  // special semantics, no PIT involvement
+  TIMEPOP_CLASS_RX_POLL,
   TIMEPOP_CLASS_EVENTBUS,
   TIMEPOP_CLASS_CPU_SAMPLE,
   TIMEPOP_CLASS_CLOCKS,
