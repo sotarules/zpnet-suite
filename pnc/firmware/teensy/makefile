@@ -22,8 +22,8 @@ ARDUINO_CLI   = ../../bin/arduino-cli
 TEENSY_LOADER = teensy_loader_cli
 
 # USB mode affects runtime only, not flashing
-# Choose one and stick to it
-USB_MODE = serial
+# Choose one and stick to it (serial or rawhid)
+USB_MODE = rawhid
 BOARD    = teensy:avr:teensy41:usb=$(USB_MODE)
 
 # -------------------------------------------------------------
@@ -33,7 +33,7 @@ BOARD    = teensy:avr:teensy41:usb=$(USB_MODE)
 CPP_DEFS =
 
 # Explicit transport selection (runtime routing)
-CPP_DEFS += -DZPNET_TRANSPORT_SERIAL
+CPP_DEFS += -DZPNET_TRANSPORT_HID
 
 # -------------------------------------------------------------
 # Targets

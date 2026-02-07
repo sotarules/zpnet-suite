@@ -36,9 +36,13 @@ from __future__ import annotations
 import json
 import logging
 import os
+import signal
 import threading
 import time
+import hid
 from typing import Callable, Dict, Optional
+
+import serial
 
 from zpnet.shared import constants
 from zpnet.shared.constants import (
@@ -49,7 +53,8 @@ from zpnet.shared.constants import (
 )
 from zpnet.shared.util import payload_to_json_bytes
 
-logger = logging.getLogger(__name__)
+import faulthandler
+faulthandler.register(signal.SIGUSR1)
 
 # ---------------------------------------------------------------------
 # Environment-selected transport (authoritative)
@@ -89,9 +94,82 @@ SERIAL_SNOOP_PATH = "/home/mule/zpnet/logs/zpnet-teensy-listener-snoop.log"
 _RETRY_MIN_SLEEP_S = 0.02
 _RETRY_MAX_SLEEP_S = 0.50
 
-def _sleep_backoff(s: float) -> float:
-    time.sleep(s)
-    return min(s * 2.0, _RETRY_MAX_SLEEP_S)
+# ---------------------------------------------------------------------
+# Physical transport state (authoritative)
+# ---------------------------------------------------------------------
+
+# _hid_dev is the single source of truth for HID physical state.
+# None => device not open / unavailable
+# not None => valid, open hid.device()
+_hid_dev: Optional[hid.device] = None
+
+# _ser is the single source of truth for SERIAL physical state.
+# None => device not open / unavailable
+# not None => open serial.Serial instance
+_ser: Optional["serial.Serial"] = None
+
+_transport_mode: Optional[str] = None
+
+# Supervisor control
+_transport_stop = threading.Event()
+_transport_supervisor_started = False
+
+# ---------------------------------------------------------------------
+# Open / close primitives (IMMORTAL)
+# ---------------------------------------------------------------------
+
+def _open_hid(_: str = None) -> None:
+    global _hid_dev
+
+    if _hid_dev is not None:
+        return  # already open
+
+    dev = hid.device()
+    dev.open_path(b'1-1.1:1.0')
+    dev.set_nonblocking(False)
+
+    _hid_dev = dev
+    logging.info("[transport] HID device opened")
+
+
+def _close_hid() -> None:
+    global _hid_dev
+
+    dev = _hid_dev
+    if dev is not None:
+        try:
+            dev.close()
+        except Exception:
+            pass
+
+    _hid_dev = None
+    logging.info("[transport] HID device closed")
+
+
+def _open_serial(path: str) -> None:
+    global _ser
+
+    if _ser is not None:
+        return  # idempotent
+
+    import serial
+    _ser = serial.Serial(port=path, baudrate=115200, timeout=None)
+
+    logging.info("[transport] SERIAL device opened")
+
+def _close_serial() -> None:
+    global _ser
+
+    ser = _ser
+    if ser is not None:
+        try:
+            ser.close()
+        except Exception:
+            pass
+
+    _ser = None
+    logging.info("[transport] SERIAL device closed")
+
 
 # ---------------------------------------------------------------------
 # Forensic logging
@@ -128,19 +206,12 @@ def transport_register_receive_callback(traffic: int, cb: Callable[[Payload], No
     _transport_recv_cb[traffic] = cb
 
 # ---------------------------------------------------------------------
-# Physical transport state
+# Helpers
 # ---------------------------------------------------------------------
 
-_transport_mode: Optional[str] = None
-
-_hid_fd: Optional[int] = None
-_hid_present = threading.Event()
-
-_ser = None  # pyserial.Serial
-
-# Supervisor control
-_transport_stop = threading.Event()
-_transport_supervisor_started = False
+def _sleep_backoff(s: float) -> float:
+    time.sleep(s)
+    return min(s * 2.0, _RETRY_MAX_SLEEP_S)
 
 # ---------------------------------------------------------------------
 # Framing helpers
@@ -183,7 +254,7 @@ def _dispatch_complete_message(traffic: int, framed: bytes) -> None:
             cb(payload)
 
     except Exception:
-        logger.exception(
+        logging.exception(
             "⚠️ [transport] dropped malformed frame traffic=0x%02X len=%d",
             traffic,
             len(framed),
@@ -194,29 +265,58 @@ def _dispatch_complete_message(traffic: int, framed: bytes) -> None:
 # ---------------------------------------------------------------------
 
 def _hid_send_block(block: bytes) -> None:
+    if _hid_dev is None:
+        logging.info("[transport] HID TX skipped — device not open")
+        return
+
     if len(block) != TRANSPORT_BLOCK_SIZE:
         raise ValueError("bad HID block size")
-    os.write(_hid_fd, block)
+
+    try:
+        _hid_dev.write(block)
+    except Exception:
+        logging.info("[transport] HID TX failed — closing device")
+        _close_hid()
 
 
-def _hid_recv_block() -> bytes:
-    buf = bytearray()
-    while len(buf) < TRANSPORT_BLOCK_SIZE:
-        chunk = os.read(_hid_fd, TRANSPORT_BLOCK_SIZE - len(buf))
-        if not chunk:
-            continue
-        buf.extend(chunk)
-    return bytes(buf)
+def _hid_recv_block(timeout_ms: int = 1000) -> Optional[bytes]:
+    if _hid_dev is None:
+        return None
+
+    try:
+        data = _hid_dev.read(TRANSPORT_BLOCK_SIZE, timeout_ms)
+        if not data:
+            return None
+
+        if len(data) != TRANSPORT_BLOCK_SIZE:
+            logging.warning(
+                "[transport] HID short read (%d bytes)", len(data)
+            )
+            return None
+
+        return bytes(data)
+
+    except Exception as e:
+        logging.info("[transport] HID RX error — closing device")
+        _close_hid()
+        return None
 
 
 def _serial_write(data: bytes) -> None:
-    _ser.write(data)
-    _ser.flush()
+    ser = _ser
+    if ser is None:
+        return
+    ser.write(data)
+    ser.flush()
 
 
 def _serial_read_some() -> bytes:
-    waiting = getattr(_ser, "in_waiting", 0)
-    return _ser.read(waiting if waiting else 1)
+    ser = _ser
+    if ser is None:
+        return b""
+
+    waiting = getattr(ser, "in_waiting", 0)
+    return ser.read(waiting if waiting else 1)
 
 # ---------------------------------------------------------------------
 # TX paths
@@ -249,6 +349,8 @@ def _hid_rx_loop() -> None:
 
     while True:
         block = _hid_recv_block()
+        if block is None:
+            continue  # idle wait
 
         if traffic is None:
             traffic = block[0]
@@ -294,36 +396,6 @@ def _serial_rx_loop() -> None:
                 rx_buf.clear()
 
 # ---------------------------------------------------------------------
-# Physical open / close
-# ---------------------------------------------------------------------
-
-def _open_hid(path: str) -> None:
-    global _hid_fd
-    _hid_fd = os.open(path, os.O_RDWR)
-    _hid_present.set()
-
-
-def _close_hid() -> None:
-    global _hid_fd
-    if _hid_fd is not None:
-        os.close(_hid_fd)
-        _hid_fd = None
-    _hid_present.clear()
-
-
-def _open_serial(path: str) -> None:
-    global _ser
-    import serial
-    _ser = serial.Serial(port=path, baudrate=115200, timeout=None)
-
-
-def _close_serial() -> None:
-    global _ser
-    if _ser:
-        _ser.close()
-        _ser = None
-
-# ---------------------------------------------------------------------
 # Supervisor (IMMORTAL CAMPER)
 # ---------------------------------------------------------------------
 
@@ -337,31 +409,43 @@ def _supervisor_loop() -> None:
                 sleep_s = _sleep_backoff(sleep_s)
                 continue
 
+            # ----------------------------------------------------------
+            # SERIAL transport (unchanged semantics)
+            # ----------------------------------------------------------
             if mode == TRANSPORT_SERIAL:
                 if not os.path.exists(TEENSY_SERIAL_PATH):
                     sleep_s = _sleep_backoff(sleep_s)
                     continue
+
                 if _ser is None:
                     _open_serial(TEENSY_SERIAL_PATH)
+
                 sleep_s = _RETRY_MIN_SLEEP_S
                 _serial_rx_loop()
 
+            # ----------------------------------------------------------
+            # HID transport (hidapi-backed)
+            # ----------------------------------------------------------
             elif mode == TRANSPORT_HID:
-                if not os.path.exists(TEENSY_HIDRAW_PATH):
-                    sleep_s = _sleep_backoff(sleep_s)
-                    continue
-                if _hid_fd is None:
-                    _open_hid(TEENSY_HIDRAW_PATH)
+                # No filesystem presence check here:
+                # hidapi, not hidraw, is the authority.
+                if _hid_dev is None:
+                    _open_hid()
+
                 sleep_s = _RETRY_MIN_SLEEP_S
                 _hid_rx_loop()
 
         except Exception:
+            # Any exception means the physical layer became unhealthy.
+            # Close everything, back off, and let the loop reattach.
             try:
                 _close_serial()
                 _close_hid()
             except Exception:
                 pass
+
             sleep_s = _sleep_backoff(sleep_s)
+
 
 # ---------------------------------------------------------------------
 # Public API

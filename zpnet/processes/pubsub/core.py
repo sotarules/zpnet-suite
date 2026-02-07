@@ -356,7 +356,7 @@ def cmd_allsubscriptions(_: Optional[dict]) -> Dict[str, Any]:
                 results.append(payload)
 
         except Exception:
-            logging.warning(
+            logging.exception(
                 "⚠️ [pubsub] failed to query SUBSCRIPTIONS from %s",
                 subsystem,
             )
