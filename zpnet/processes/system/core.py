@@ -949,13 +949,17 @@ def build_battery_status() -> dict:
 # ------------------------------------------------------------------
 
 def build_teensy_status() -> dict:
-    payload = send_command(machine="TEENSY", subsystem="SYSTEM", command="REPORT")["payload"]
+    response = send_command(machine="TEENSY", subsystem="SYSTEM", command="REPORT")
+    logging.info("[build_teensy_status] raw response: %s", response)
+    payload = response["payload"]
     payload["health_state"] = "NOMINAL"
     return payload
 
 
 def build_clocks_status() -> dict:
-    payload = send_command(machine="TEENSY", subsystem="CLOCKS", command="REPORT")["payload"]
+    response = send_command(machine="TEENSY", subsystem="CLOCKS", command="REPORT")
+    logging.info("[buld_clocks_status] raw response: %s", response)
+    payload = response["payload"]
     payload["health_state"] = "NOMINAL"
     return payload
 

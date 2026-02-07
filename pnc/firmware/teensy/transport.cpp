@@ -21,6 +21,7 @@
 #include "config.h"
 #include "debug.h"
 #include "timepop.h"
+#include "process_performance.h"
 
 #include <Arduino.h>
 #include <string.h>
@@ -339,6 +340,9 @@ static void rx_hid_tick() {
   rx_len += copy;
 
   dispatch_if_complete();
+
+  // RX opportunity completed
+  transport_rx_entered();
 }
 
 #endif
@@ -373,6 +377,9 @@ static void rx_serial_tick() {
     rx_buf[rx_len++] = b;
     dispatch_if_complete();
   }
+
+  // RX opportunity completed
+  transport_rx_entered();
 }
 
 #endif

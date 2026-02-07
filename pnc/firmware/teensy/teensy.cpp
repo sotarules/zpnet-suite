@@ -6,7 +6,6 @@
 
 #include "config.h"
 
-#include "clock.h"
 #include "timepop.h"
 #include "events.h"
 #include "cpu_usage.h"
@@ -20,9 +19,9 @@
 #include "process_timepop.h"
 #include "process_laser.h"
 #include "process_photodiode.h"
-#include "process_tempest.h"
 #include "process_system.h"
 #include "process_pubsub.h"
+#include "process_performance.h"
 
 #include <Arduino.h>
 
@@ -150,14 +149,6 @@ void setup() {
   debug_log("boot", "setup begin");
 
   // ----------------------------------------------------------
-  // Clock subsystem
-  // ----------------------------------------------------------
-
-  debug_log("boot", "clock_init");
-  clock_init();
-  debug_log("boot", "clock_init done");
-
-  // ----------------------------------------------------------
   // Process framework
   // ----------------------------------------------------------
 
@@ -195,8 +186,11 @@ void setup() {
   process_timepop_register();
   debug_log("boot", "process_timepop_register done");
 
-  debug_log("boot", "process_clocks_register");
+  debug_log("boot", "process_clocks_init");
   process_clocks_init();
+  debug_log("boot", "process_clocks_init_done");
+
+  debug_log("boot", "process_clocks_register done");
   process_clocks_register();
   debug_log("boot", "process_clocks_register done");
 
@@ -216,10 +210,6 @@ void setup() {
   process_photodiode_register();
   debug_log("boot", "process_photodiode_register done");
 
-  debug_log("boot", "process_tempest_register");
-  process_tempest_register();
-  debug_log("boot", "process_tempest_register done");
-
   debug_log("boot", "process_pubsub_register");
   process_pubsub_register();
   debug_log("boot", "process_pubsub_register done");
@@ -227,6 +217,10 @@ void setup() {
   debug_log("boot", "process_system_register");
   process_system_register();
   debug_log("boot", "process_system_register done");
+
+  debug_log("boot", "process_performance_register");
+  process_performance_register();
+  debug_log("boot", "process_performance_register done");
 
   // ----------------------------------------------------------
   // CPU usage sampling
