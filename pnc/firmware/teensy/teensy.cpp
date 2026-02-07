@@ -23,7 +23,6 @@
 #include "process_tempest.h"
 #include "process_system.h"
 #include "process_pubsub.h"
-#include "process_time.h"
 
 #include <Arduino.h>
 
@@ -228,11 +227,6 @@ void setup() {
   debug_log("boot", "process_system_register");
   process_system_register();
   debug_log("boot", "process_system_register done");
-
-  debug_log("boot", "process_time_register");
-  process_time_init();
-  process_time_register();
-  debug_log("boot", "process_time_register done");
 
   // ----------------------------------------------------------
   // CPU usage sampling
