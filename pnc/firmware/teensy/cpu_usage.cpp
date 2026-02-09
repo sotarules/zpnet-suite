@@ -70,9 +70,10 @@ void cpu_usage_account_busy(uint32_t cycles) {
 }
 
 // ------------------------------------------------------------
-// Sample CPU usage
+// Sample CPU usage (degenerate-window safe)
 // ------------------------------------------------------------
 void cpu_usage_sample(void) {
+
     uint32_t total_now = ARM_DWT_CYCCNT;
     uint32_t busy_now  = busy_cycles_accum;
 
@@ -80,22 +81,49 @@ void cpu_usage_sample(void) {
     uint32_t busy_delta  = busy_now  - last_busy_cycles;
 
     uint32_t now_ms = millis();
-    last_sample_window_ms = now_ms - last_sample_time_ms;
-    last_sample_time_ms   = now_ms;
+    uint32_t window_ms = now_ms - last_sample_time_ms;
 
-    if (total_delta > 0) {
-        float usage = (float)busy_delta / (float)total_delta;
+    // --------------------------------------------------------
+    // Reject degenerate samples
+    //
+    // A valid utilization sample requires a meaningful
+    // wall-clock interval. Very small deltas are scheduling
+    // artifacts and carry no semantic information.
+    // --------------------------------------------------------
 
-        // Clamp defensively
-        if (usage < 0.0f) usage = 0.0f;
-        if (usage > 1.0f) usage = 1.0f;
+    // Minimum: ~1 ms worth of CPU cycles
+    const uint32_t MIN_CYCLE_DELTA =
+        cpu_usage_get_cpu_freq_mhz() * 1000UL;
 
-        cpu_usage_percent = usage * 100.0f;
+    if (total_delta < MIN_CYCLE_DELTA) {
+        // Do NOT update any derived state.
+        // Preserve last meaningful sample.
+        return;
     }
+
+    // --------------------------------------------------------
+    // Compute utilization over a valid window
+    // --------------------------------------------------------
+
+    float usage = (float)busy_delta / (float)total_delta;
+
+    // Defensive clamp (should never trigger)
+    if (usage < 0.0f) usage = 0.0f;
+    if (usage > 1.0f) usage = 1.0f;
+
+    cpu_usage_percent = usage * 100.0f;
+
+    // --------------------------------------------------------
+    // Commit window bookkeeping ONLY for valid samples
+    // --------------------------------------------------------
+
+    last_sample_window_ms = window_ms;
+    last_sample_time_ms   = now_ms;
 
     last_total_cycles = total_now;
     last_busy_cycles  = busy_now;
 }
+
 
 // ------------------------------------------------------------
 // Accessors
