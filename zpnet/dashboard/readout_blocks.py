@@ -120,9 +120,9 @@ def clocks_status_readout() -> Generator[str, None, None]:
         campaign = c.get("campaign")
         secs = c.get("campaign_seconds", 0)
         elapsed_hms = seconds_to_hms(secs)
-        yield f"CLOCKS STATUS: STARTED {elapsed_hms} {campaign}"
+        yield f"CLOCKS: STARTED {elapsed_hms} {campaign}"
     else:
-        yield f"CLOCKS STATUS: {state}"
+        yield f"CLOCKS: {state}"
 
     yield ""
 
