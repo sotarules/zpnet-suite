@@ -269,6 +269,13 @@ static Payload cmd_debug(const Payload& args) {
   return ok_payload();
 }
 
+// ------------------------------------------------------------
+// STATUS — simple response of liveness
+// ------------------------------------------------------------
+static Payload cmd_status(const Payload& /*args*/) {
+  return ok_payload();
+}
+
 // ================================================================
 // Registration
 // ================================================================
@@ -280,6 +287,7 @@ static const process_command_entry_t SYSTEM_COMMANDS[] = {
   { "SHUTDOWN",         cmd_shutdown         },
   { "PROCESS_LIST",     cmd_process_list     },
   { "DEBUG",            cmd_debug            },
+  { "STATUS",           cmd_status           },
   { nullptr,            nullptr }
 };
 

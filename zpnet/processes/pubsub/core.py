@@ -33,8 +33,7 @@ from zpnet.shared.logger import setup_logging
 from zpnet.shared.transport import (
     transport_send,
     transport_register_receive_callback,
-    transport_init, transport_rx_snapshot,
-)
+    transport_init, )
 from zpnet.shared.util import payload_to_json_str, payload_to_json_bytes
 
 # ---------------------------------------------------------------------
@@ -139,7 +138,7 @@ def open_debug_log() -> None:
     logging.info("📝 [debug] debug log opened at %s", DEBUG_LOG_PATH)
 
 # ---------------------------------------------------------------------
-# Teensy receive callbacks
+# Teensy receive callbacks (GATED)
 # ---------------------------------------------------------------------
 
 def on_receive_debug(payload: Dict[str, Any]) -> None:
@@ -218,7 +217,7 @@ def handle_client(conn: socket.socket) -> None:
 
 
 # ---------------------------------------------------------------------
-# Pub/Sub routing core (DATA PLANE ONLY)
+# Pub/Sub routing core
 # ---------------------------------------------------------------------
 
 def route_publish(msg: Dict[str, Any], *, forward_to_teensy: bool) -> None:
