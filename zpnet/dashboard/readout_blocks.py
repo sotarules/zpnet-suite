@@ -100,15 +100,36 @@ def gnss_report_readout() -> Generator[str, None, None]:
 # CLOCKS (synthetic clock substrate)
 # ---------------------------------------------------------------------
 
+def seconds_to_hms(seconds: int) -> str:
+    h = seconds // 3600
+    m = (seconds % 3600) // 60
+    s = seconds % 60
+    return f"{h:02d}:{m:02d}:{s:02d}"
+
+
 def clocks_status_readout() -> Generator[str, None, None]:
     c = get_clocks_report()
 
-    # Status line with elapsed time inline
-    yield f"CLOCKS STATUS: NOMINAL {c['elapsed_hms']}"
+    state = c.get("campaign_state")
 
-    yield f""
+    # ------------------------------------------------------------
+    # Status line
+    # ------------------------------------------------------------
 
-    # Header
+    if state == "STARTED":
+        campaign = c.get("campaign")
+        secs = c.get("campaign_seconds", 0)
+        elapsed_hms = seconds_to_hms(secs)
+        yield f"CLOCKS STATUS: STARTED {elapsed_hms} {campaign}"
+    else:
+        yield f"CLOCKS STATUS: {state}"
+
+    yield ""
+
+    # ------------------------------------------------------------
+    # Clock table
+    # ------------------------------------------------------------
+
     yield f"{'CLOCK':<8} {'TAU':>14} {'PPB':>14}"
 
     # GNSS baseline
@@ -117,8 +138,10 @@ def clocks_status_readout() -> Generator[str, None, None]:
     # DWT
     yield f"{'DWT':<8} {c['tau_dwt']:>14.10f} {c['dwt_ppb']:>14.2f}"
 
-    # OCXO
-    #yield f"{'OCXO':<8} {c['tau_ocxo']:>14.10f} {c['ocxo_ppb']:>14.2f}"
+    # OCXO (optional / diagnostic)
+    # yield f"{'OCXO':<8} {c['tau_ocxo']:>14.10f} {c['ocxo_ppb']:>14.2f}"
+
+
 
 
 

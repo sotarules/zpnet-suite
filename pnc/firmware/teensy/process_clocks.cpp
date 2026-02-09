@@ -1,13 +1,57 @@
+// ============================================================================
+// process_clocks.cpp — ZPNet CLOCKS (Teensy)
+// ============================================================================
+//
+// CLOCKS is a dormant, PPS-anchored measurement instrument.
+//
+// • Boots fully silent
+// • Does NOT track PPS unless a campaign is active or pending
+// • Nanosecond clocks are ZERO unless a campaign is STARTED
+// • DWT cycle counter is always live (capability, not narration)
+//
+// START / STOP / RECOVER are *requests*.
+// All authoritative state transitions occur on the PPS boundary.
+//
+// ============================================================================
+
 #include "process_clocks.h"
 
-#include "events.h"
 #include "payload.h"
 #include "publish.h"
 #include "timepop.h"
 #include "config.h"
+#include "util.h"
 
 #include <Arduino.h>
 #include "imxrt.h"
+
+// ============================================================================
+// Campaign State
+// ============================================================================
+
+enum class clocks_campaign_state_t {
+  STOPPED,
+  STARTED
+};
+
+
+static volatile clocks_campaign_state_t campaign_state =
+  clocks_campaign_state_t::STOPPED;
+
+static char campaign_name[64] = {0};
+
+// Request flags (applied at PPS boundary)
+static volatile bool request_start   = false;
+static volatile bool request_stop    = false;
+static volatile bool request_recover = false;
+
+// Recovery parameters (authoritative, supplied by Pi)
+static uint64_t recover_dwt_cycles = 0;
+static uint64_t recover_gnss_ns    = 0;
+static uint64_t recover_ocxo_ns    = 0;
+
+// Campaign-scoped PPS second counter
+static uint64_t campaign_seconds = 0;
 
 // ============================================================================
 // DWT (CPU cycle counter)
@@ -20,8 +64,8 @@
 #define DWT_CYCCNT          (*(volatile uint32_t *)0xE0001004)
 #define DWT_CTRL_CYCCNTENA  (1 << 0)
 
-static uint64_t dwt_cycles_64  = 0;
-static uint32_t dwt_last_32    = 0;
+static uint64_t dwt_cycles_64 = 0;
+static uint32_t dwt_last_32   = 0;
 
 static inline void dwt_enable(void) {
   DEMCR |= DEMCR_TRCENA;
@@ -37,7 +81,6 @@ uint64_t clocks_dwt_cycles_now(void) {
   return dwt_cycles_64;
 }
 
-// Exact rational conversion: 1 cycle = 5/3 ns
 uint64_t clocks_dwt_ns_now(void) {
   return (clocks_dwt_cycles_now() * 5ull) / 3ull;
 }
@@ -96,8 +139,10 @@ static void arm_gpt2_external(void) {
   attachInterruptVector(IRQ_GPT2, [] {
     GPT2_SR = GPT_SR_OF1;
     GPT2_OCR1 += 1;
-    gnss_ticks_10khz++;
-    gnss_dwt_baseline = DWT_CYCCNT;
+    if (campaign_state == clocks_campaign_state_t::STARTED) {
+      gnss_ticks_10khz++;
+      gnss_dwt_baseline = DWT_CYCCNT;
+    }
   });
 
   NVIC_ENABLE_IRQ(IRQ_GPT2);
@@ -125,8 +170,10 @@ static void arm_gpt1_internal(void) {
   attachInterruptVector(IRQ_GPT1, [] {
     GPT1_SR = GPT_SR_OF1;
     GPT1_OCR1 += 1;
-    ocxo_ticks_10khz++;
-    ocxo_dwt_baseline = DWT_CYCCNT;
+    if (campaign_state == clocks_campaign_state_t::STARTED) {
+      ocxo_ticks_10khz++;
+      ocxo_dwt_baseline = DWT_CYCCNT;
+    }
   });
 
   NVIC_ENABLE_IRQ(IRQ_GPT1);
@@ -135,34 +182,10 @@ static void arm_gpt1_internal(void) {
 }
 
 // ============================================================================
-// SYNTHETIC NANOSECOND CLOCKS
+// Zeroing (campaign-scoped)
 // ============================================================================
 
-static constexpr uint64_t NS_PER_10KHZ = 100000ULL;
-
-uint64_t clocks_gnss_ns_now(void) {
-  uint64_t base = gnss_ticks_10khz * NS_PER_10KHZ;
-  uint32_t delta = DWT_CYCCNT - gnss_dwt_baseline;
-  uint64_t interp = (delta * 5ull) / 3ull;
-  if (interp > NS_PER_10KHZ) interp = NS_PER_10KHZ;
-  return base + interp;
-}
-
-uint64_t clocks_ocxo_ns_now(void) {
-  uint64_t base = ocxo_ticks_10khz * NS_PER_10KHZ;
-  uint32_t delta = DWT_CYCCNT - ocxo_dwt_baseline;
-  uint64_t interp = (delta * 5ull) / 3ull;
-  if (interp > NS_PER_10KHZ) interp = NS_PER_10KHZ;
-  return base + interp;
-}
-
-// ============================================================================
-// ZEROING
-// ============================================================================
-
-static uint64_t gnss_zero_ns = 0;
-
-void clocks_zero_all(void) {
+static void clocks_zero_all(void) {
   dwt_cycles_64 = 0;
   dwt_last_32   = DWT_CYCCNT;
 
@@ -172,175 +195,258 @@ void clocks_zero_all(void) {
   gnss_dwt_baseline = DWT_CYCCNT;
   ocxo_dwt_baseline = DWT_CYCCNT;
 
-  gnss_zero_ns = clocks_gnss_ns_now();
-}
-
-uint64_t clocks_gnss_zero_ns(void) {
-  return gnss_zero_ns;
+  campaign_seconds = 0;
 }
 
 // ============================================================================
-// PPS CAPTURE + 1 Hz PUBLICATION
+// Synthetic nanoseconds (campaign-scoped)
 // ============================================================================
 
-static volatile uint64_t pps_count = 0;
-static volatile uint64_t last_pps_dwt_cycles = 0;
+static constexpr uint64_t NS_PER_10KHZ = 100000ULL;
+
+uint64_t clocks_gnss_ns_now(void) {
+  if (campaign_state != clocks_campaign_state_t::STARTED) return 0;
+  uint64_t base = gnss_ticks_10khz * NS_PER_10KHZ;
+  uint32_t delta = DWT_CYCCNT - gnss_dwt_baseline;
+  uint64_t interp = (delta * 5ull) / 3ull;
+  return (interp > NS_PER_10KHZ) ? base + NS_PER_10KHZ : base + interp;
+}
+
+uint64_t clocks_ocxo_ns_now(void) {
+  if (campaign_state != clocks_campaign_state_t::STARTED) return 0;
+  uint64_t base = ocxo_ticks_10khz * NS_PER_10KHZ;
+  uint32_t delta = DWT_CYCCNT - ocxo_dwt_baseline;
+  uint64_t interp = (delta * 5ull) / 3ull;
+  return (interp > NS_PER_10KHZ) ? base + NS_PER_10KHZ : base + interp;
+}
+
+// ============================================================================
+// PPS handling
+// ============================================================================
+
 static volatile bool pps_scheduled = false;
 
 static void pps_isr(void) {
-  last_pps_dwt_cycles = clocks_dwt_cycles_now();
-  pps_count++;
 
-  if (!pps_scheduled) {
-    pps_scheduled = true;
-    timepop_arm(
-      TIMEPOP_CLASS_ASAP,
-      false,
-      [](timepop_ctx_t*, void*) {
+  if (!request_start && !request_stop && !request_recover &&
+      campaign_state != clocks_campaign_state_t::STARTED) {
+    return;  // PPS is irrelevant when dormant
+  }
+
+  if (pps_scheduled) return;
+  pps_scheduled = true;
+
+  timepop_arm(
+    TIMEPOP_CLASS_ASAP,
+    false,
+    [](timepop_ctx_t*, void*) {
+
+      if (request_stop) {
+        campaign_state = clocks_campaign_state_t::STOPPED;
+        request_stop = false;
+      }
+
+      if (request_recover) {
+        dwt_cycles_64    = recover_dwt_cycles;
+        gnss_ticks_10khz = recover_gnss_ns / NS_PER_10KHZ;
+        ocxo_ticks_10khz = recover_ocxo_ns / NS_PER_10KHZ;
+
+        gnss_dwt_baseline = DWT_CYCCNT;
+        ocxo_dwt_baseline = DWT_CYCCNT;
+
+        request_recover = false;
+      }
+
+      if (request_start) {
+        clocks_zero_all();
+        campaign_state = clocks_campaign_state_t::STARTED;
+        request_start = false;
+      }
+
+      if (campaign_state == clocks_campaign_state_t::STARTED) {
 
         Payload p;
-        p.add("pps_count",   pps_count);
-        p.add("dwt_cycles", last_pps_dwt_cycles);
+        p.add("campaign",   campaign_name);
+        p.add("dwt_cycles", clocks_dwt_cycles_now());
         p.add("dwt_ns",     clocks_dwt_ns_now());
         p.add("gnss_ns",    clocks_gnss_ns_now());
         p.add("ocxo_ns",    clocks_ocxo_ns_now());
         p.add("gnss_lock",  digitalRead(GNSS_LOCK_PIN));
 
-        publish("CLOCKS/PPS", p);
-        pps_scheduled = false;
-      },
-      nullptr,
-      "pps"
-    );
-  }
-}
+        publish("TIMEBASE_FRAGMENT", p);
 
-/*
- * format_hms
- *
- * Convert elapsed seconds into HH:MM:SS (zero-padded).
- *
- * Semantics:
- *   • hours are unbounded (roll past 24 if needed)
- *   • minutes and seconds are 00–59
- *   • output is always null-terminated
- *
- * Example:
- *   0        -> "00:00:00"
- *   59       -> "00:00:59"
- *   61       -> "00:01:01"
- *   3661     -> "01:01:01"
- *   90061    -> "25:01:01"
- */
-static inline void format_hms(
-    uint64_t seconds,
-    char*    out,
-    size_t   out_sz
-) {
-  if (!out || out_sz == 0) return;
+        if (campaign_state == clocks_campaign_state_t::STARTED) {
+          campaign_seconds++;
+        }
+      }
 
-  uint64_t h = seconds / 3600;
-  uint64_t m = (seconds % 3600) / 60;
-  uint64_t s = seconds % 60;
-
-  // Minimum required size: "HH:MM:SS" + '\0' = 9 bytes
-  // Using snprintf guarantees null termination.
-  snprintf(
-    out,
-    out_sz,
-    "%02llu:%02llu:%02llu",
-    (unsigned long long)h,
-    (unsigned long long)m,
-    (unsigned long long)s
+      pps_scheduled = false;
+    },
+    nullptr,
+    "pps"
   );
 }
 
-// ================================================================
-// Canonical clock report builder
-// ================================================================
-static Payload build_clock_report_payload(void) {
+// ============================================================================
+// Commands
+// ============================================================================
 
-  Payload p;
-
-  // Raw authoritative clocks
-  const uint64_t dwt_ns  = clocks_dwt_ns_now();
-  const uint64_t gnss_ns = clocks_gnss_ns_now();
-  const uint64_t ocxo_ns = clocks_ocxo_ns_now();
-
-  p.add("dwt_ns",  dwt_ns);
-  p.add("gnss_ns", gnss_ns);
-  p.add("ocxo_ns", ocxo_ns);
-
-  // Elapsed wall time since last GNSS zero
-  uint64_t zero_ns    = clocks_gnss_zero_ns();
-  uint64_t elapsed_ns = (gnss_ns >= zero_ns) ? (gnss_ns - zero_ns) : 0;
-  uint64_t elapsed_s  = elapsed_ns / 1000000000ULL;
-
-  char hms[16];
-  format_hms(elapsed_s, hms, sizeof(hms));
-
-  p.add("elapsed_hms",     hms);
-  p.add("elapsed_seconds", elapsed_s);
-
-  // Drift + tempo metrics
-  if (gnss_ns > 0) {
-
-    int64_t drift_dwt_ns  = (int64_t)dwt_ns  - (int64_t)gnss_ns;
-    int64_t drift_ocxo_ns = (int64_t)ocxo_ns - (int64_t)gnss_ns;
-
-    p.add("dwt_drift_ns",  drift_dwt_ns);
-    p.add("ocxo_drift_ns", drift_ocxo_ns);
-
-    double tau_dwt  = (double)dwt_ns  / (double)gnss_ns;
-    double tau_ocxo = (double)ocxo_ns / (double)gnss_ns;
-
-    p.add_fmt("tau_dwt",  "%.12f", tau_dwt);
-    p.add_fmt("tau_ocxo", "%.12f", tau_ocxo);
-
-    double ppb_dwt  = ((double)drift_dwt_ns  / (double)gnss_ns) * 1e9;
-    double ppb_ocxo = ((double)drift_ocxo_ns / (double)gnss_ns) * 1e9;
-
-    p.add_fmt("dwt_ppb",  "%.6f", ppb_dwt);
-    p.add_fmt("ocxo_ppb", "%.6f", ppb_ocxo);
-
-  } else {
-    p.add("dwt_drift_ns",  0);
-    p.add("ocxo_drift_ns", 0);
-    p.add("tau_dwt",       0.0);
-    p.add("tau_ocxo",      0.0);
-    p.add("dwt_ppb",       0.0);
-    p.add("ocxo_ppb",      0.0);
+static Payload cmd_start(const Payload& args) {
+  const char* name = args.getString("campaign");
+  if (!name || !*name) {
+    Payload err;
+    err.add("error", "missing campaign");
+    return err;
   }
 
-  p.add("gnss_lock", digitalRead(GNSS_LOCK_PIN));
+  safeCopy(campaign_name, sizeof(campaign_name), name);
+  request_start = true;
+  request_stop  = false;
 
+  Payload p;
+  p.add("status", "start_requested");
+  return p;
+}
+
+static Payload cmd_stop(const Payload&) {
+  request_stop  = true;
+  request_start = false;
+
+  Payload p;
+  p.add("status", "stop_requested");
+  return p;
+}
+
+static Payload cmd_recover(const Payload& args) {
+
+  const char* s_dwt  = args.getString("dwt_cycles");
+  const char* s_gnss = args.getString("gnss_ns");
+  const char* s_ocxo = args.getString("ocxo_ns");
+
+  if (!s_dwt || !s_gnss || !s_ocxo) {
+    Payload err;
+    err.add("error", "missing recovery parameters");
+    return err;
+  }
+
+  recover_dwt_cycles = strtoull(s_dwt,  nullptr, 10);
+  recover_gnss_ns    = strtoull(s_gnss, nullptr, 10);
+  recover_ocxo_ns    = strtoull(s_ocxo, nullptr, 10);
+
+  request_recover = true;
+  request_start   = true;
+  request_stop    = false;
+
+  Payload p;
+  p.add("status", "recover_requested");
   return p;
 }
 
 // ============================================================================
-// PROCESS COMMANDS
+// REPORT — diagnostic introspection only
 // ============================================================================
 
 static Payload cmd_report(const Payload&) {
-  return build_clock_report_payload();
+
+  Payload p;
+
+  // ------------------------------------------------------------
+  // Campaign state
+  // ------------------------------------------------------------
+
+  p.add(
+    "campaign_state",
+    campaign_state == clocks_campaign_state_t::STARTED
+      ? "STARTED"
+      : "STOPPED"
+  );
+
+  if (campaign_state == clocks_campaign_state_t::STARTED) {
+    p.add("campaign", campaign_name);
+    p.add("campaign_seconds", campaign_seconds);
+  }
+
+  // ------------------------------------------------------------
+  // Pending requests
+  // ------------------------------------------------------------
+
+  p.add("request_start",   request_start);
+  p.add("request_stop",    request_stop);
+  p.add("request_recover", request_recover);
+
+  // ------------------------------------------------------------
+  // Raw clocks (capability + campaign-scoped)
+  // ------------------------------------------------------------
+
+  const uint64_t dwt_cycles = clocks_dwt_cycles_now();
+  const uint64_t dwt_ns     = clocks_dwt_ns_now();
+  const uint64_t gnss_ns    = clocks_gnss_ns_now();
+  const uint64_t ocxo_ns    = clocks_ocxo_ns_now();
+
+  p.add("dwt_cycles_now", dwt_cycles);
+  p.add("dwt_ns_now",     dwt_ns);
+  p.add("gnss_ns_now",    gnss_ns);
+  p.add("ocxo_ns_now",    ocxo_ns);
+
+  p.add("gnss_lock", digitalRead(GNSS_LOCK_PIN));
+
+  // ------------------------------------------------------------
+  // Derived diagnostics (ONLY if meaningful)
+  // ------------------------------------------------------------
+  //
+  // These are NOT authoritative time claims.
+  // They exist purely to validate behavior during development.
+  //
+
+  if (campaign_state == clocks_campaign_state_t::STARTED && gnss_ns > 0) {
+
+    // --- Tau (dimensionless ratio) ---
+    //
+    // tau = clock_ns / gnss_ns
+    //
+
+    const double tau_dwt  = (double)dwt_ns  / (double)gnss_ns;
+    const double tau_ocxo = (double)ocxo_ns / (double)gnss_ns;
+
+    p.add_fmt("tau_dwt",  "%.12f", tau_dwt);
+    p.add_fmt("tau_ocxo", "%.12f", tau_ocxo);
+
+    // --- Deviation from GNSS in parts-per-billion ---
+    //
+    // ppb = (clock_ns - gnss_ns) / gnss_ns * 1e9
+    //
+
+    const double ppb_dwt =
+      ((double)((int64_t)dwt_ns - (int64_t)gnss_ns) / (double)gnss_ns) * 1e9;
+
+    const double ppb_ocxo =
+      ((double)((int64_t)ocxo_ns - (int64_t)gnss_ns) / (double)gnss_ns) * 1e9;
+
+    p.add_fmt("dwt_ppb",  "%.3f", ppb_dwt);
+    p.add_fmt("ocxo_ppb", "%.3f", ppb_ocxo);
+
+  } else {
+    // Explicitly report absence of meaning
+    p.add("tau_dwt",  0.0);
+    p.add("tau_ocxo", 0.0);
+    p.add("dwt_ppb",  0.0);
+    p.add("ocxo_ppb", 0.0);
+  }
+
+  return p;
 }
 
-static Payload cmd_clear(const Payload&) {
-  clocks_zero_all();
-  Payload ev;
-  ev.add("action", "zeroed");
-  publish("CLOCKS_CLEAR", ev);
-  return ok_payload();
-}
 
 // ============================================================================
-// PROCESS REGISTRATION
+// Process registration
 // ============================================================================
 
 static const process_command_entry_t CLOCKS_COMMANDS[] = {
-  { "REPORT", cmd_report },
-  { "CLEAR",  cmd_clear  },
-  { nullptr,  nullptr }
+  { "START",   cmd_start   },
+  { "STOP",    cmd_stop    },
+  { "RECOVER", cmd_recover },
+  { "REPORT",  cmd_report  },
+  { nullptr,   nullptr     }
 };
 
 static const process_vtable_t CLOCKS_PROCESS = {
@@ -354,7 +460,7 @@ void process_clocks_register(void) {
 }
 
 // ============================================================================
-// INITIALIZATION
+// Initialization
 // ============================================================================
 
 void process_clocks_init(void) {

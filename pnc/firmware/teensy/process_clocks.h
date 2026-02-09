@@ -44,5 +44,3 @@ uint64_t clocks_ocxo_ns_now(void);
 
 uint64_t clocks_gnss_zero_ns(void);
 
-// Explicit zeroing (rare, dangerous, observable)
-void clocks_zero_all(void);
