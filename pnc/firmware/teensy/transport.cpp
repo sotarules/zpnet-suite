@@ -32,13 +32,13 @@
 // =============================================================
 
 static constexpr size_t TRANSPORT_BLOCK_SIZE = 64;
-static constexpr size_t RX_BUF_MAX = 2048;
+static constexpr size_t RX_BUF_MAX           = 2048;
 
-static constexpr char STX_SEQ[] = "<STX=";
-static constexpr size_t STX_LEN = 5;
+static constexpr char   STX_SEQ[] = "<STX=";
+static constexpr size_t STX_LEN   = 5;
 
 static constexpr char   ETX_SEQ[] = "<ETX>";
-static constexpr size_t ETX_LEN  = 5;
+static constexpr size_t ETX_LEN   = 5;
 
 // =============================================================
 // State (shared semantic)
@@ -50,7 +50,33 @@ static uint8_t rx_buf[RX_BUF_MAX];
 static size_t  rx_len = 0;
 
 static bool    rx_have_traffic = false;
-static uint8_t rx_traffic = 0;
+static uint8_t rx_traffic      = 0;
+
+// =============================================================
+// RX instrumentation (monotonic, non-perturbing)
+// =============================================================
+//
+// These counters exist to prove transport behavior without
+// emitting any debug traffic or altering RX/TX timing.
+//
+// All fields are monotonic.
+// Best-effort snapshots are exported via transport_get_info().
+//
+
+static volatile uint32_t rx_blocks_total        = 0;
+static volatile uint32_t rx_bytes_total         = 0;
+
+static volatile uint32_t rx_frames_complete     = 0;
+static volatile uint32_t rx_frames_dispatched   = 0;
+
+static volatile uint32_t rx_reset_hard_count    = 0;
+static volatile uint32_t rx_bad_stx_count       = 0;
+static volatile uint32_t rx_bad_etx_count       = 0;
+static volatile uint32_t rx_len_overflow_count  = 0;
+
+static volatile uint32_t rx_overlap_count       = 0;
+
+static volatile uint32_t rx_expected_traffic_missing     = 0;
 
 // =============================================================
 // Helpers
@@ -259,7 +285,9 @@ void transport_send(
 // Note: This intentionally does NOT “scan for ETX anywhere”.
 //       It uses declared length as the authority.
 //
+
 static void rx_reset_hard() {
+  rx_reset_hard_count++;
   rx_len = 0;
   rx_have_traffic = false;
   // rx_traffic is "latched" only when rx_have_traffic == true.
@@ -272,37 +300,37 @@ static void dispatch_if_complete() {
     return;
   }
 
-  // Need at least "<STX=0><ETX>" => 5 + 1 + 1 + 5 = 12 bytes
-  // (We'll be stricter below; this is just a fast guard.)
-  if (rx_len < (STX_LEN + 3 + ETX_LEN)) return;
+  // Need at least "<STX=0>" to even begin parsing header.
+  // (ETX is NOT required yet.)
+  if (rx_len < (STX_LEN + 2)) return;
 
   // Frame must start with "<STX="
   if (memcmp(rx_buf, STX_SEQ, STX_LEN) != 0) {
+    rx_bad_stx_count++;
     rx_reset_hard();
     return;
   }
 
   // Parse header: "<STX=" + digits + ">"
-  // Find '>' and parse the digits in between.
   size_t i = STX_LEN;        // position after "<STX="
   size_t declared_len = 0;
   bool   saw_digit = false;
 
-  // Parse decimal digits until we hit '>'
   while (i < rx_len && rx_buf[i] != '>') {
     uint8_t c = rx_buf[i];
 
     if (c < '0' || c > '9') {
-      // Bad header character: adversarial reset
+      // Corrupt header (not incomplete)
+      rx_len_overflow_count++;
       rx_reset_hard();
       return;
     }
 
     saw_digit = true;
-
-    // Safe-ish decimal accumulate (cap to prevent overflow / nonsense)
     declared_len = declared_len * 10 + (size_t)(c - '0');
+
     if (declared_len > TRANSPORT_MAX_MESSAGE) {
+      rx_len_overflow_count++;
       rx_reset_hard();
       return;
     }
@@ -310,43 +338,52 @@ static void dispatch_if_complete() {
     ++i;
   }
 
-  // Must have a closing '>' and at least one digit
-  if (!saw_digit) return;                 // incomplete header (no digits yet)
-  if (i >= rx_len) return;                // incomplete header (no '>' yet)
+  // Header incomplete — wait for more bytes
+  if (!saw_digit) return;
+  if (i >= rx_len) return;
 
   const size_t header_end = i;            // index of '>'
   const size_t json_start = header_end + 1;
 
-  // Now we know exactly how many bytes must be present:
-  //   json_start + declared_len + ETX_LEN
-  const size_t required_total = json_start + declared_len + ETX_LEN;
+  // Total bytes required for a COMPLETE frame
+  const size_t required_total =
+    json_start + declared_len + ETX_LEN;
 
+  // Impossible framing — real error
   if (required_total > RX_BUF_MAX) {
+    rx_len_overflow_count++;
     rx_reset_hard();
     return;
   }
 
-  // Not enough bytes yet: keep accumulating
-  if (rx_len < required_total) return;
+  // Frame not complete yet — THIS IS THE KEY FIX
+  // Missing ETX bytes are NOT an error.
+  if (rx_len < required_total) {
+    return;
+  }
 
-  // ETX must appear EXACTLY after the declared JSON length
+  // At this point ETX bytes are fully present.
+  // Now and ONLY now may we validate them.
   const size_t etx_pos = json_start + declared_len;
   if (memcmp(rx_buf + etx_pos, ETX_SEQ, ETX_LEN) != 0) {
+    rx_bad_etx_count++;
+    debug_log("missing etx", rx_buf, rx_len);
     rx_reset_hard();
     return;
   }
 
-  // We have one complete, well-formed frame. Parse EXACTLY declared_len bytes.
+  // We have one complete, well-formed frame.
+  rx_frames_complete++;
+
   Payload p;
   p.parseJSON(rx_buf + json_start, declared_len);
 
   if (recv_cb[rx_traffic]) {
+    rx_frames_dispatched++;
     recv_cb[rx_traffic](p);
   }
 
   // Reset receive state after dispatch.
-  // If you ever support back-to-back frames in the same rx_buf,
-  // this becomes a "consume" + memmove; but for now you reset hard.
   rx_reset_hard();
 }
 
@@ -364,18 +401,32 @@ static void rx_hid_tick() {
   uint8_t block[TRANSPORT_BLOCK_SIZE];
   if (RawHID.recv(block, 0) <= 0) return;
 
+  rx_blocks_total++;
+
   size_t offset = 0;
 
   if (!rx_have_traffic) {
+
+    if (!is_valid_traffic(block[0])) {
+      rx_expected_traffic_missing++;  // better name than invalid_traffic
+      rx_reset_hard();                // or: return; or: discard block
+      return;
+    }
+
     rx_traffic = block[0];
     rx_have_traffic = true;
     offset = 1;
   }
 
   size_t copy = TRANSPORT_BLOCK_SIZE - offset;
+
+  // Accounting: bytes appended into RX buffer (not including traffic byte)
+  rx_bytes_total += (uint32_t)copy;
+
   if (rx_len + copy > RX_BUF_MAX) {
     rx_len = 0;
     rx_have_traffic = false;
+    rx_reset_hard();
     return;
   }
 
@@ -398,26 +449,36 @@ static void rx_serial_tick() {
   transport_rx_entered();
 
   while (Serial.available()) {
-    uint8_t b = Serial.read();
+    uint8_t b = (uint8_t)Serial.read();
 
     // Await traffic byte
     if (!rx_have_traffic) {
-      if (!is_valid_traffic(b)) continue;
-
+      if (!is_valid_traffic(b)) {
+        rx_expected_traffic_missing++;
+        continue;
+      }
       rx_traffic = b;
       rx_have_traffic = true;
       rx_len = 0;  // explicit reset: beginning of a new message
       continue;
     }
 
+    // Optional overlap signal:
+    // JSON is ASCII; a traffic byte (0xD0..0xD2) here strongly suggests
+    // a new frame arrived before the previous completed.
+    if (is_valid_traffic(b)) {
+      rx_overlap_count++;
+    }
+
     // Accumulate payload bytes
     if (rx_len >= RX_BUF_MAX) {
-      rx_len = 0;
-      rx_have_traffic = false;
+      rx_reset_hard();
       return;
     }
 
     rx_buf[rx_len++] = b;
+    rx_bytes_total++;
+
     dispatch_if_complete();
   }
 }
@@ -436,6 +497,31 @@ static void transport_rx_tick(timepop_ctx_t*, void*) {
   rx_serial_tick();
 #endif
 
+}
+
+// =============================================================
+// Transport diagnostics access (public)
+// =============================================================
+
+void transport_get_info(
+  transport_info_t* out
+) {
+  if (!out) return;
+
+  out->rx_blocks_total        = rx_blocks_total;
+  out->rx_bytes_total         = rx_bytes_total;
+
+  out->rx_frames_complete     = rx_frames_complete;
+  out->rx_frames_dispatched   = rx_frames_dispatched;
+
+  out->rx_reset_hard          = rx_reset_hard_count;
+
+  out->rx_bad_stx             = rx_bad_stx_count;
+  out->rx_bad_etx             = rx_bad_etx_count;
+  out->rx_len_overflow        = rx_len_overflow_count;
+
+  out->rx_overlap             = rx_overlap_count;
+  out->rx_expected_traffic_missing = rx_expected_traffic_missing;
 }
 
 // =============================================================

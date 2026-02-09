@@ -108,6 +108,9 @@ _ser: Optional["serial.Serial"] = None
 
 _transport_mode: Optional[str] = None
 
+# TX serialization (RawHID exclusivity)
+_tx_lock = threading.Lock()
+
 # Supervisor control
 _transport_stop = threading.Event()
 _transport_supervisor_started = False
@@ -398,12 +401,13 @@ def transport_send(traffic: int, payload: Payload) -> None:
     raw = payload_to_json_bytes(payload)
     framed = _delimit_for_send(raw)
 
-    if _transport_mode == TRANSPORT_HID:
-        _hid_tx_send(traffic, framed)
-    elif _transport_mode == TRANSPORT_SERIAL:
-        _serial_tx_send(traffic, framed)
-    else:
-        raise RuntimeError("transport not initialized")
+    with _tx_lock:
+        if _transport_mode == TRANSPORT_HID:
+            _hid_tx_send(traffic, framed)
+        elif _transport_mode == TRANSPORT_SERIAL:
+            _serial_tx_send(traffic, framed)
+        else:
+            raise RuntimeError("transport not initialized")
 
 
 def transport_init() -> None:

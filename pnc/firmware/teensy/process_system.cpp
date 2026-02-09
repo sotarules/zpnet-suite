@@ -23,6 +23,7 @@
 #include "util.h"
 #include "timepop.h"
 #include "debug.h"
+#include "transport.h"   // <-- NEW (for transport_get_info)
 
 // --------------------------------------------------------------
 // Forward declarations (terminal paths)
@@ -144,6 +145,47 @@ static Payload cmd_report(const Payload& /*args*/) {
 }
 
 // ------------------------------------------------------------
+// TRANSPORT_INFO — transport RX forensic snapshot
+//
+// Semantics:
+//   • Read-only
+//   • Snapshot-only
+//   • No inference
+//   • No allocation beyond Payload
+//   • No transport emission
+// ------------------------------------------------------------
+static Payload cmd_transport_info(const Payload& /*args*/) {
+
+  transport_info_t info;
+  transport_get_info(&info);
+
+  Payload p;
+
+  // Raw ingress
+  p.add("rx_blocks_total",      info.rx_blocks_total);
+  p.add("rx_bytes_total",       info.rx_bytes_total);
+
+  // Framing outcomes
+  p.add("rx_frames_complete",   info.rx_frames_complete);
+  p.add("rx_frames_dispatched", info.rx_frames_dispatched);
+
+  // RX state resets
+  p.add("rx_reset_hard",        info.rx_reset_hard);
+
+  // Framing failures
+  p.add("rx_bad_stx",           info.rx_bad_stx);
+  p.add("rx_bad_etx",           info.rx_bad_etx);
+  p.add("rx_len_overflow",      info.rx_len_overflow);
+
+  // Concurrency signal
+  p.add("rx_overlap",           info.rx_overlap);
+
+  p.add("rx_expected_traffic_missing",   info.rx_expected_traffic_missing);
+
+  return p;
+}
+
+// ------------------------------------------------------------
 // ENTER_BOOTLOADER — terminal, irreversible
 // ------------------------------------------------------------
 static Payload cmd_enter_bootloader(const Payload& /*args*/) {
@@ -187,7 +229,6 @@ static Payload cmd_shutdown(const Payload& /*args*/) {
 static Payload cmd_process_list(const Payload&) {
 
   Payload p;
-
   PayloadArray arr;
 
   for (size_t i = 0; i < process_get_count(); i++) {
@@ -201,7 +242,7 @@ static Payload cmd_process_list(const Payload&) {
 }
 
 // ------------------------------------------------------------
-// PROCESS_LIST — registry introspection (diagnostic only)
+// DEBUG — raw debug channel test
 // ------------------------------------------------------------
 static Payload cmd_debug(const Payload& args) {
 
@@ -234,11 +275,12 @@ static Payload cmd_debug(const Payload& args) {
 
 static const process_command_entry_t SYSTEM_COMMANDS[] = {
   { "REPORT",           cmd_report           },
+  { "TRANSPORT_INFO",   cmd_transport_info   }, // <-- NEW
   { "ENTER_BOOTLOADER", cmd_enter_bootloader },
   { "SHUTDOWN",         cmd_shutdown         },
   { "PROCESS_LIST",     cmd_process_list     },
   { "DEBUG",            cmd_debug            },
-  { nullptr,            nullptr }   // sentinel
+  { nullptr,            nullptr }
 };
 
 static const process_vtable_t SYSTEM_PROCESS = {

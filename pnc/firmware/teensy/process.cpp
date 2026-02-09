@@ -162,8 +162,6 @@ const process_vtable_t* process_get_vtable_by_name(const char* name) {
 
 void process_command(const Payload& request) {
 
-  debug_log("process_command *begin*", request);
-
   Payload response;
 
   if (request.has("req_id")) {
@@ -218,8 +216,6 @@ void process_command(const Payload& request) {
   response.add("success", true);
   response.add("message", "OK");
   response.add_object("payload", payload);
-
-  debug_log("process_command *end*", request);
 
   transport_send(
     TRAFFIC_REQUEST_RESPONSE,

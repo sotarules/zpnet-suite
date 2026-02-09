@@ -114,10 +114,79 @@ void transport_register_receive_callback(
 // Send ONE complete semantic message.
 // Framing, fragmentation, and physical I/O are handled internally.
 //
+// NOTE:
+//   • This API is non-reentrant by construction.
+//   • Physical I/O is scheduled internally; callers never transmit inline.
+//
 
 void transport_send(
   uint8_t traffic,
   const Payload& payload
+);
+
+
+// =============================================================
+// Transport RX diagnostics (authoritative snapshot)
+// =============================================================
+//
+// This structure represents a coherent snapshot of transport-layer
+// receive behavior and framing outcomes.
+//
+// Semantics:
+//   • All fields are monotonic counters.
+//   • Values are best-effort snapshots.
+//   • No locking or synchronization is performed.
+//   • This data is read-only from the caller’s perspective.
+//
+// Intended use:
+//   • SYSTEM.REPORT
+//   • PERFORMANCE diagnostics
+//   • Forensic debugging without perturbation
+//
+
+typedef struct {
+
+  // Raw ingress
+  uint32_t rx_blocks_total;        // RawHID blocks or serial RX chunks
+  uint32_t rx_bytes_total;         // Bytes appended to RX buffer
+
+  // Framing outcomes
+  uint32_t rx_frames_complete;     // Frames passing STX + length + ETX
+  uint32_t rx_frames_dispatched;   // Frames delivered to recv_cb
+
+  // RX state resets
+  uint32_t rx_reset_hard;          // Hard RX state resets
+
+  // Framing failures
+  uint32_t rx_bad_stx;             // Buffer did not start with "<STX="
+  uint32_t rx_bad_etx;             // Missing or misplaced "<ETX>"
+  uint32_t rx_len_overflow;        // Declared length exceeded limits
+
+  // Concurrency / overlap signal
+  uint32_t rx_overlap;             // New traffic observed while RX active
+
+  // Invalid traffic bit
+  uint32_t rx_expected_traffic_missing;
+
+} transport_info_t;
+
+
+// =============================================================
+// Transport diagnostics access
+// =============================================================
+//
+// Populate a snapshot of current transport RX diagnostics.
+//
+// Contract:
+//   • Safe to call from scheduled (non-ISR) context.
+//   • Does NOT allocate.
+//   • Does NOT schedule.
+//   • Does NOT emit transport traffic.
+//   • Transport remains the sole owner of the underlying state.
+//
+
+void transport_get_info(
+  transport_info_t* out
 );
 
 
