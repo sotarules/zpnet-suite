@@ -154,10 +154,19 @@ static void fragment_and_send_hid(
 #endif
 
 // =============================================================
-// SEND: Semantic entry (shared surface, split internally)
+// SEND: Scheduled context payload
 // =============================================================
 
-void transport_send(
+struct transport_send_ctx_t {
+  uint8_t traffic;
+  Payload payload;
+};
+
+// =============================================================
+// SEND: Physical implementation (scheduled context ONLY)
+// =============================================================
+
+static void transport_send_physical(
   uint8_t traffic,
   const Payload& payload
 ) {
@@ -173,7 +182,9 @@ void transport_send(
   );
   if (header_len <= 0) return;
 
-  const size_t total_len = (size_t)header_len + json_len + ETX_LEN;
+  const size_t total_len =
+    (size_t)header_len + json_len + ETX_LEN;
+
   if (total_len > TRANSPORT_MAX_MESSAGE) return;
 
   memcpy(send_buf, header, (size_t)header_len);
@@ -197,8 +208,37 @@ void transport_send(
 }
 
 // =============================================================
-// RECEIVE: Delimiter + dispatch (shared)
+// SEND: Semantic entry (NON-OPTIONAL scheduled isolation)
 // =============================================================
+
+void transport_send(
+  uint8_t traffic,
+  const Payload& payload
+) {
+  // Allocate explicit send context
+  auto* ctx = new transport_send_ctx_t{
+    traffic,
+    payload.clone()
+  };
+
+  timepop_arm(
+    TIMEPOP_CLASS_ASAP,
+    false,
+    [](timepop_ctx_t*, void* user_ctx) {
+
+      auto* send = static_cast<transport_send_ctx_t*>(user_ctx);
+
+      transport_send_physical(
+        send->traffic,
+        send->payload
+      );
+
+      delete send;
+    },
+    ctx,
+    "transport-send"
+  );
+}
 
 // =============================================================
 // RECEIVE: Delimiter + dispatch (length-authoritative, shared)
@@ -318,6 +358,9 @@ static void dispatch_if_complete() {
 #if defined(ZPNET_TRANSPORT_SELECTED_HID)
 
 static void rx_hid_tick() {
+
+  transport_rx_entered();
+
   uint8_t block[TRANSPORT_BLOCK_SIZE];
   if (RawHID.recv(block, 0) <= 0) return;
 
@@ -340,9 +383,6 @@ static void rx_hid_tick() {
   rx_len += copy;
 
   dispatch_if_complete();
-
-  // RX opportunity completed
-  transport_rx_entered();
 }
 
 #endif
@@ -354,6 +394,9 @@ static void rx_hid_tick() {
 #if defined(ZPNET_TRANSPORT_SELECTED_SERIAL)
 
 static void rx_serial_tick() {
+
+  transport_rx_entered();
+
   while (Serial.available()) {
     uint8_t b = Serial.read();
 
@@ -377,9 +420,6 @@ static void rx_serial_tick() {
     rx_buf[rx_len++] = b;
     dispatch_if_complete();
   }
-
-  // RX opportunity completed
-  transport_rx_entered();
 }
 
 #endif

@@ -7,63 +7,64 @@
 #include <ctype.h>
 
 // =============================================================
-// Configuration
+// Payload
 // =============================================================
 
-static constexpr size_t PAYLOAD_JSON_MAX = 10 * 1024; // 10 KiB
+Payload::Payload()
+  : entry_count(0) {}
 
-// =============================================================
-// Internal helpers (serialization only)
-// =============================================================
-//
-// JsonBuf is a bounded, allocator-free JSON construction buffer.
-// It is reused across serializations and is NOT re-entrant.
-// The produced JSON is transient and must be consumed immediately.
-//
+void Payload::clear() {
+  entry_count = 0;
+}
 
-namespace {
+bool Payload::empty() const {
+  return entry_count == 0;
+}
 
-struct JsonBuf {
-  char   buf[PAYLOAD_JSON_MAX];
-  size_t len;
-  bool   overflow;
+// -------------------------------------------------------------
+// JSON serialization — primary, zero-alloc path (per-instance)
+// -------------------------------------------------------------
 
-  JsonBuf() : len(0), overflow(false) {
-    buf[0] = '\0';
-  }
+JsonView Payload::json_view() const {
 
-  inline size_t remaining() const {
-    return PAYLOAD_JSON_MAX - len;
-  }
+  JsonBuf& jb = _json_buf;
 
-  void append(const char* s) {
-    if (overflow || !s) return;
+  // -----------------------------------------------------------
+  // Local helpers (behavior lives here, not in JsonBuf)
+  // -----------------------------------------------------------
+
+  auto remaining = [&]() -> size_t {
+    return JsonBuf::JSON_MAX - jb.len;
+  };
+
+  auto append = [&](const char* s) {
+    if (jb.overflow || !s) return;
 
     size_t n = strlen(s);
     if (n + 1 > remaining()) {
-      overflow = true;
+      jb.overflow = true;
       return;
     }
 
-    memcpy(buf + len, s, n);
-    len += n;
-    buf[len] = '\0';
-  }
+    memcpy(jb.buf + jb.len, s, n);
+    jb.len += n;
+    jb.buf[jb.len] = '\0';
+  };
 
-  void append_char(char c) {
-    if (overflow) return;
+  auto append_char = [&](char c) {
+    if (jb.overflow) return;
 
     if (remaining() < 2) {
-      overflow = true;
+      jb.overflow = true;
       return;
     }
 
-    buf[len++] = c;
-    buf[len] = '\0';
-  }
+    jb.buf[jb.len++] = c;
+    jb.buf[jb.len] = '\0';
+  };
 
-  void append_escaped(const char* s) {
-    if (overflow || !s) return;
+  auto append_escaped = [&](const char* s) {
+    if (jb.overflow || !s) return;
 
     while (*s) {
       char c = *s++;
@@ -75,61 +76,33 @@ struct JsonBuf {
         case '\t': append("\\t");  break;
         default:   append_char(c); break;
       }
-      if (overflow) return;
+      if (jb.overflow) return;
     }
-  }
+  };
 
-  void reset_to_error() {
-    const char* err = "{\"error\":\"payload_overflow\"}";
-    strncpy(buf, err, PAYLOAD_JSON_MAX - 1);
-    buf[PAYLOAD_JSON_MAX - 1] = '\0';
-    len = strlen(buf);
-    overflow = false; // terminal state
-  }
-};
-
-} // namespace
-
-// =============================================================
-// Payload
-// =============================================================
-
-Payload::Payload()
-  : entry_count(0),
-    raw("") {}
-
-void Payload::clear() {
-  entry_count = 0;
-  raw = ""; // staging only
-}
-
-bool Payload::empty() const {
-  return entry_count == 0;
-}
-
-// -------------------------------------------------------------
-// JSON serialization — primary, zero-alloc path
-// -------------------------------------------------------------
-
-JsonView Payload::json_view() const {
-
-  static JsonBuf jb;
+  // -----------------------------------------------------------
+  // Initialize buffer
+  // -----------------------------------------------------------
 
   jb.len = 0;
   jb.overflow = false;
   jb.buf[0] = '\0';
 
-  jb.append_char('{');
+  // -----------------------------------------------------------
+  // Serialize object
+  // -----------------------------------------------------------
+
+  append_char('{');
 
   for (size_t i = 0; i < entry_count; i++) {
 
-    if (i) jb.append_char(',');
+    if (i) append_char(',');
 
     const Entry& e = entries[i];
 
-    jb.append_char('\"');
-    jb.append_escaped(e.key.c_str());
-    jb.append("\":");
+    append_char('\"');
+    append_escaped(e.key.c_str());
+    append("\":");
 
     if (jb.overflow) break;
 
@@ -139,17 +112,17 @@ JsonView Payload::json_view() const {
         const char* s = e.value.c_str();
 
         if (!strcmp(s, "true") || !strcmp(s, "false")) {
-          jb.append(s);
+          append(s);
         } else {
           char* end = nullptr;
           strtod(s, &end);
 
           if (s[0] != '\0' && end && *end == '\0') {
-            jb.append(s);
+            append(s); // numeric
           } else {
-            jb.append_char('\"');
-            jb.append_escaped(s);
-            jb.append_char('\"');
+            append_char('\"');
+            append_escaped(s);
+            append_char('\"');
           }
         }
         break;
@@ -157,25 +130,34 @@ JsonView Payload::json_view() const {
 
       case 'o':
       case 'a':
-        jb.append(e.value.c_str());
+        append(e.value.c_str());
         break;
 
       default:
-        jb.append("null");
+        append("null");
         break;
     }
 
     if (jb.overflow) break;
   }
 
-  jb.append_char('}');
+  append_char('}');
+
+  // -----------------------------------------------------------
+  // Overflow handling (truth-preserving fallback)
+  // -----------------------------------------------------------
 
   if (jb.overflow) {
-    jb.reset_to_error();
+    const char* err = "{\"error\":\"payload_overflow\"}";
+    strncpy(jb.buf, err, JsonBuf::JSON_MAX - 1);
+    jb.buf[JsonBuf::JSON_MAX - 1] = '\0';
+    jb.len = strlen(jb.buf);
+    jb.overflow = false; // terminal state
   }
 
   return JsonView{ jb.buf, jb.len };
 }
+
 
 // -------------------------------------------------------------
 // JSON serialization — legacy convenience wrapper
@@ -185,6 +167,28 @@ String Payload::to_json() const {
   JsonView v = json_view();
   return String(v.data);
 }
+
+// -------------------------------------------------------------
+// Cloning — produces a deep copy of the payload, including all entries
+// -------------------------------------------------------------
+
+Payload Payload::clone() const {
+  Payload out;
+
+  out.entry_count = entry_count;
+
+  for (size_t i = 0; i < entry_count; i++) {
+    out.entries[i] = entries[i];  // value copy (String handles its own heap)
+  }
+
+  // JSON buffer is derived; ensure it starts clean
+  out._json_buf.len = 0;
+  out._json_buf.overflow = false;
+  out._json_buf.buf[0] = '\0';
+
+  return out;
+}
+
 
 // =============================================================
 // Semantic construction
@@ -370,12 +374,6 @@ bool Payload::tryGetUInt(const char* key, uint32_t& out) const {
   return true;
 }
 
-// Compatibility overload for existing callers
-uint32_t Payload::getUInt(const char* key, unsigned long default_value) const {
-  uint32_t v;
-  return tryGetUInt(key, v) ? v : (uint32_t)default_value;
-}
-
 bool Payload::tryGetFloat(const char* key, float& out) const {
   const char* s = getString(key);
   if (!s) return false;
@@ -414,6 +412,31 @@ PayloadArray Payload::getArray(const char* key) const {
   if (!e || e->kind != 'a') return arr;
   arr.parseJSON(e->value.c_str());
   return arr;
+}
+
+bool Payload::getBool(const char* key, bool default_value) const {
+  bool v;
+  return tryGetBool(key, v) ? v : default_value;
+}
+
+int32_t Payload::getInt(const char* key, int32_t default_value) const {
+  int32_t v;
+  return tryGetInt(key, v) ? v : default_value;
+}
+
+uint32_t Payload::getUInt(const char* key, uint32_t default_value) const {
+  uint32_t v;
+  return tryGetUInt(key, v) ? v : default_value;
+}
+
+float Payload::getFloat(const char* key, float default_value) const {
+  float v;
+  return tryGetFloat(key, v) ? v : default_value;
+}
+
+double Payload::getDouble(const char* key, double default_value) const {
+  double v;
+  return tryGetDouble(key, v) ? v : default_value;
 }
 
 // =============================================================

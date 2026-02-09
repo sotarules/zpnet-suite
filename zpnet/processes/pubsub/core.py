@@ -19,6 +19,7 @@ import logging
 import os
 import socket
 import threading
+import time
 from queue import Queue, Empty
 from typing import Dict, Any, Optional, TextIO, Set, List, Tuple
 
@@ -32,7 +33,7 @@ from zpnet.shared.logger import setup_logging
 from zpnet.shared.transport import (
     transport_send,
     transport_register_receive_callback,
-    transport_init,
+    transport_init, transport_rx_snapshot,
 )
 from zpnet.shared.util import payload_to_json_str, payload_to_json_bytes
 
@@ -156,6 +157,16 @@ def on_receive_request_response(payload: Dict[str, Any]) -> None:
     if q is None:
         raise RuntimeError(f"Unexpected req_id {req_id}")
 
+    sent_ms = payload.get("req_ts_ms")
+    if sent_ms is None:
+        raise RuntimeError("Response missing req_ts_ms")
+
+    now_ms = int(time.monotonic() * 1000)
+    latency = now_ms - sent_ms
+    logging.info("📩 [response] req_id=%d latency=%.2fms", req_id, latency)
+
+    payload["latency"] = latency
+
     q.put(payload)
 
 def on_receive_publish_subscribe(payload: Dict[str, Any]) -> None:
@@ -178,6 +189,7 @@ def handle_client(conn: socket.socket) -> None:
         req = json.loads(raw.decode("utf-8"))
         req_id = next(req_id_counter)
         req["req_id"] = req_id
+        req["req_ts_ms"] = int(time.monotonic() * 1000)
 
         q = Queue(maxsize=1)
         with state_lock:
@@ -203,6 +215,7 @@ def handle_client(conn: socket.socket) -> None:
             with state_lock:
                 pending_replies.pop(req_id, None)
         conn.close()
+
 
 # ---------------------------------------------------------------------
 # Pub/Sub routing core (DATA PLANE ONLY)

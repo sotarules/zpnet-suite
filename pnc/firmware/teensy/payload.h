@@ -32,25 +32,9 @@
 class PayloadArray;
 class PayloadArrayView;
 
-/*
-  ============================================================================
-  JsonView — Transient JSON Serialization View
-  ----------------------------------------------------------------------------
-
-  JsonView represents a non-owning, read-only view into a transient
-  serialization buffer owned by Payload.
-
-  CONTRACT:
-    • JsonView is valid ONLY until the next call to Payload::json_view()
-    • Callers MUST consume immediately
-    • Callers MUST NOT store, cache, or retain pointers
-    • No allocation occurs
-    • No ownership is transferred
-
-  This type exists to make serialization lifetime explicit and honest.
-
-  ============================================================================
-*/
+// JsonView is a transient, non-owning view over a per-instance
+// serialization buffer. Valid only until the next json_view() call
+// on the same Payload instance.
 struct JsonView {
   const char* data;
   size_t      len;
@@ -117,6 +101,12 @@ public:
 
   void clear();
   bool empty() const;
+
+  // --------------------------------------------------
+  // Cloning
+  // --------------------------------------------------
+
+  Payload clone() const;
 
   // --------------------------------------------------
   // Serialization
@@ -232,10 +222,30 @@ private:
   size_t entry_count;
 
   // -----------------------------------------------------------------
+  // DERIVED / TRANSIENT REPRESENTATION (NON-AUTHORITATIVE)
+  // -----------------------------------------------------------------
+  //
+  // Per-instance JSON serialization buffer.
+  // This exists solely to eliminate reentrancy and shared-state hazards.
+  //
+  struct JsonBuf {
+    static constexpr size_t JSON_MAX = 10 * 1024; // 10 KiB
+
+    char   buf[JSON_MAX];
+    size_t len;
+    bool   overflow;
+
+    JsonBuf() : len(0), overflow(false) {
+      buf[0] = '\0';
+    }
+  };
+
+  mutable JsonBuf _json_buf;
+
+
+  // -----------------------------------------------------------------
   // Transitional / non-authoritative helpers
   // -----------------------------------------------------------------
-
-  String raw;
 
   static String escape(const char* s);
 
