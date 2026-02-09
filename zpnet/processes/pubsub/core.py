@@ -47,7 +47,7 @@ RPC_BACKLOG = 8
 PS_BACKLOG  = 16
 
 MAX_TEENSY_RETRIES = 3
-REPLY_TIMEOUT_S = 3.0
+REPLY_TIMEOUT_S = 30.0
 
 DEBUG_LOG_PATH = "/home/mule/zpnet/logs/zpnet-debug.log"
 SOCKET_DIR = "/tmp"
