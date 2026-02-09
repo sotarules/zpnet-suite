@@ -154,7 +154,8 @@ def on_receive_request_response(payload: Dict[str, Any]) -> None:
         q = pending_replies.pop(req_id, None)
 
     if q is None:
-        raise RuntimeError(f"Unexpected req_id {req_id}")
+        logging.warning("⚠️ [on_receive_request_response] late or duplicate response req_id=%d (discarded)", req_id)
+        return
 
     sent_ms = payload.get("req_ts_ms")
     if sent_ms is None:
@@ -162,7 +163,7 @@ def on_receive_request_response(payload: Dict[str, Any]) -> None:
 
     now_ms = int(time.monotonic() * 1000)
     latency = now_ms - sent_ms
-    logging.info("📩 [response] req_id=%d latency=%.2fms", req_id, latency)
+    logging.info("📩 [on_receive_request_response] req_id=%d latency=%.2fms", req_id, latency)
 
     payload["latency"] = latency
 
@@ -177,43 +178,52 @@ def on_receive_publish_subscribe(payload: Dict[str, Any]) -> None:
 # ---------------------------------------------------------------------
 
 def handle_client(conn: socket.socket) -> None:
-    req_id = None
-    q = None
-
     try:
         raw = conn.recv(65536)
         if not raw:
             return
 
         req = json.loads(raw.decode("utf-8"))
-        req_id = next(req_id_counter)
-        req["req_id"] = req_id
-        req["req_ts_ms"] = int(time.monotonic() * 1000)
 
-        q = Queue(maxsize=1)
-        with state_lock:
-            pending_replies[req_id] = q
+        req_id = None
 
-        for _ in range(MAX_TEENSY_RETRIES):
-            transport_send(TRAFFIC_REQUEST_RESPONSE, req)
+        for attempt in range(MAX_TEENSY_RETRIES):
+            # NEW: fresh req_id per attempt
+            req_id = next(req_id_counter)
+            req["req_id"] = req_id
+            req["req_ts_ms"] = int(time.monotonic() * 1000)
+
+            q = Queue(maxsize=1)
+            with state_lock:
+                pending_replies[req_id] = q
+
             try:
+                transport_send(TRAFFIC_REQUEST_RESPONSE, req)
+
                 reply = q.get(timeout=REPLY_TIMEOUT_S)
-                conn.sendall(json.dumps(reply, separators=(",", ":")).encode())
+                conn.sendall(
+                    json.dumps(reply, separators=(",", ":")).encode()
+                )
                 return
+
             except Empty:
+                # Timeout on this attempt — clean up and retry
+                with state_lock:
+                    pending_replies.pop(req_id, None)
                 continue
 
-        conn.sendall(json.dumps({
-            "req_id": req_id,
-            "success": False,
-            "message": "TEENSY did not respond",
-        }).encode())
+        # All retries exhausted
+        conn.sendall(
+            json.dumps({
+                "req_id": req_id,
+                "success": False,
+                "message": "TEENSY did not respond",
+            }).encode()
+        )
 
     finally:
-        if req_id is not None:
-            with state_lock:
-                pending_replies.pop(req_id, None)
         conn.close()
+
 
 
 # ---------------------------------------------------------------------
