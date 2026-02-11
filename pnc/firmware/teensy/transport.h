@@ -9,18 +9,24 @@
 // ZPNet Transport — Public Interface (Teensy)
 // ============================================================================
 //
-// This header defines the ONLY public contract for the transport layer.
-//
 // TRUTHFUL DESIGN:
 //
 //   • Transport owns all physical I/O.
 //   • Receive is asynchronous and callback-driven.
 //   • Send is semantic and message-oriented.
-//   • HID and SERIAL diverge internally at the physical layer.
+//   • Callers enqueue; transport despools.
+//   • Only the transport subsystem may touch HID / Serial.
 //   • Message framing and dispatch are transport responsibilities.
 //
 // No public API exposes byte- or block-level I/O.
 // That boundary is intentionally sealed.
+//
+// TX Architecture (Revised):
+//
+//   • transport_send() enqueues a cloned payload.
+//   • A TIMEPOP-driven pump performs physical transmission.
+//   • Single-writer guarantee eliminates block interleave.
+//   • Memory is bounded via FIFO arena allocator.
 //
 // ============================================================================
 
@@ -28,18 +34,6 @@
 // =============================================================
 // Compile-time transport selection (authoritative)
 // =============================================================
-//
-// Transport backend selection is determined by ONE of:
-//
-//   1. Explicit ZPNET override (preferred for non-Arduino builds):
-//        - ZPNET_TRANSPORT_HID
-//        - ZPNET_TRANSPORT_SERIAL
-//
-//   2. Teensy USB build configuration (authoritative on Teensy):
-//        - USB_SERIAL
-//        - USB_RAWHID
-//        - USB_SERIAL_HID
-//        - USB_RAWHID_SERIAL
 //
 // Exactly ONE backend must be selected.
 //
@@ -84,10 +78,6 @@ static constexpr uint8_t TRAFFIC_PUBLISH_SUBSCRIBE = 0xD2;
 // =============================================================
 // Application receive callback
 // =============================================================
-//
-// Transport delivers fully reassembled, message-atomic Payloads
-// via registered callbacks. No receive polling API exists.
-//
 
 using transport_receive_cb_t =
   void (*)(const Payload&);
@@ -96,10 +86,6 @@ using transport_receive_cb_t =
 // =============================================================
 // Receive registration
 // =============================================================
-//
-// Register a callback for a given traffic class.
-// Only one callback per traffic class is supported.
-//
 
 void transport_register_receive_callback(
   uint8_t traffic,
@@ -112,11 +98,13 @@ void transport_register_receive_callback(
 // =============================================================
 //
 // Send ONE complete semantic message.
-// Framing, fragmentation, and physical I/O are handled internally.
 //
-// NOTE:
-//   • This API is non-reentrant by construction.
-//   • Physical I/O is scheduled internally; callers never transmit inline.
+// IMPORTANT:
+//
+//   • Callers do NOT transmit inline.
+//   • transport_send() enqueues.
+//   • Physical transmission occurs later in scheduled context.
+//   • This eliminates multi-writer interleave by construction.
 //
 
 void transport_send(
@@ -126,48 +114,77 @@ void transport_send(
 
 
 // =============================================================
-// Transport RX diagnostics (authoritative snapshot)
+// Transport diagnostics snapshot
 // =============================================================
 //
-// This structure represents a coherent snapshot of transport-layer
-// receive behavior and framing outcomes.
+// This structure exposes monotonic counters and bounded
+// memory usage metrics for both RX and TX subsystems.
 //
 // Semantics:
-//   • All fields are monotonic counters.
-//   • Values are best-effort snapshots.
-//   • No locking or synchronization is performed.
-//   • This data is read-only from the caller’s perspective.
+//   • All fields are monotonic counters or bounded snapshots.
+//   • Best-effort values (no locking).
+//   • No allocation.
+//   • No side effects.
 //
 // Intended use:
 //   • SYSTEM.REPORT
 //   • PERFORMANCE diagnostics
-//   • Forensic debugging without perturbation
+//   • Forensic debugging
 //
 
 typedef struct {
 
-  uint32_t tx_busy_count;          // RawHID blocks or serial RX chunks
+  // ===========================================================
+  // TX — Arena / Queue Health
+  // ===========================================================
 
-  // Raw ingress
-  uint32_t rx_blocks_total;        // RawHID blocks or serial RX chunks
-  uint32_t rx_bytes_total;         // Bytes appended to RX buffer
+  uint32_t tx_arena_size;         // Total arena bytes
+  uint32_t tx_arena_used;         // Current bytes allocated
+  uint32_t tx_arena_high_water;   // Peak arena usage
+  uint32_t tx_arena_alloc_fail;   // Allocation failures
 
-  // Framing outcomes
+  uint32_t tx_job_count;          // Current queued messages
+  uint32_t tx_job_high_water;     // Peak queue depth
+
+  uint32_t tx_jobs_enqueued;      // Total jobs enqueued
+  uint32_t tx_jobs_sent;          // Total jobs fully sent
+
+  uint32_t tx_bytes_enqueued;     // Total bytes enqueued
+  uint32_t tx_bytes_sent;         // Total bytes sent
+
+  // ===========================================================
+  // RX — Raw ingress
+  // ===========================================================
+
+  uint32_t rx_blocks_total;       // RawHID blocks or serial RX chunks
+  uint32_t rx_bytes_total;        // Bytes appended to RX buffer
+
+  // ===========================================================
+  // RX — Framing outcomes
+  // ===========================================================
+
   uint32_t rx_frames_complete;     // Frames passing STX + length + ETX
   uint32_t rx_frames_dispatched;   // Frames delivered to recv_cb
 
-  // RX state resets
+  // ===========================================================
+  // RX — State resets
+  // ===========================================================
+
   uint32_t rx_reset_hard;          // Hard RX state resets
 
-  // Framing failures
+  // ===========================================================
+  // RX — Framing failures
+  // ===========================================================
+
   uint32_t rx_bad_stx;             // Buffer did not start with "<STX="
   uint32_t rx_bad_etx;             // Missing or misplaced "<ETX>"
   uint32_t rx_len_overflow;        // Declared length exceeded limits
 
-  // Concurrency / overlap signal
-  uint32_t rx_overlap;             // New traffic observed while RX active
+  // ===========================================================
+  // RX — Concurrency / anomaly signals
+  // ===========================================================
 
-  // Invalid traffic bit
+  uint32_t rx_overlap;             // New traffic observed while RX active
   uint32_t rx_expected_traffic_missing;
 
 } transport_info_t;
@@ -177,14 +194,14 @@ typedef struct {
 // Transport diagnostics access
 // =============================================================
 //
-// Populate a snapshot of current transport RX diagnostics.
+// Populate a snapshot of current transport diagnostics.
 //
 // Contract:
 //   • Safe to call from scheduled (non-ISR) context.
 //   • Does NOT allocate.
 //   • Does NOT schedule.
 //   • Does NOT emit transport traffic.
-//   • Transport remains the sole owner of the underlying state.
+//   • Transport remains sole owner of state.
 //
 
 void transport_get_info(
@@ -197,7 +214,7 @@ void transport_get_info(
 // =============================================================
 //
 // Initialize the transport subsystem.
-// Owns physical I/O, RX polling, framing, and dispatch.
+// Owns physical I/O, RX polling, TX pumping, framing, dispatch.
 //
 
 void transport_init(void);

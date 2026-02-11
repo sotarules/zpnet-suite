@@ -101,12 +101,13 @@ uint32_t freeHeapBytes() {
   return (uint32_t)mi.fordblks;
 }
 
-// --------------------------------------------------------------
-// Debug: bounded buffer → text
-// --------------------------------------------------------------
-void debug_log_payload(
-  const char* name,
-  const Payload& p
-) {
-  debug_log(name, p.to_json().c_str());
+uint32_t maxAllocBytes() {
+  uint32_t lo = 0, hi = 256 * 1024; // Teensy 4.1 has plenty; clamp as needed
+  while (lo + 1 < hi) {
+    uint32_t mid = (lo + hi) / 2;
+    void* p = malloc(mid);
+    if (p) { free(p); lo = mid; }
+    else { hi = mid; }
+  }
+  return lo;
 }

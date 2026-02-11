@@ -131,6 +131,7 @@ static Payload cmd_report(const Payload& /*args*/) {
 
   // Heap availability
   p.add("free_heap_bytes", freeHeapBytes());
+  p.add("max_alloc_bytes", maxAllocBytes());
 
   // CPU usage (authoritative, idle-cycle accounting)
   p.add("cpu_usage_pct", cpu_usage_get_percent());
@@ -145,7 +146,7 @@ static Payload cmd_report(const Payload& /*args*/) {
 }
 
 // ------------------------------------------------------------
-// TRANSPORT_INFO — transport RX forensic snapshot
+// TRANSPORT_INFO — transport RX/TX forensic snapshot
 //
 // Semantics:
 //   • Read-only
@@ -161,28 +162,58 @@ static Payload cmd_transport_info(const Payload& /*args*/) {
 
   Payload p;
 
-  p.add("tx_busy_count",        info.tx_busy_count);
+  // ==========================================================
+  // TX — Arena / Queue Health
+  // ==========================================================
 
-  // Raw ingress
+  p.add("tx_arena_size",        info.tx_arena_size);
+  p.add("tx_arena_used",        info.tx_arena_used);
+  p.add("tx_arena_high_water",  info.tx_arena_high_water);
+  p.add("tx_arena_alloc_fail",  info.tx_arena_alloc_fail);
+
+  p.add("tx_job_count",         info.tx_job_count);
+  p.add("tx_job_high_water",    info.tx_job_high_water);
+
+  p.add("tx_jobs_enqueued",     info.tx_jobs_enqueued);
+  p.add("tx_jobs_sent",         info.tx_jobs_sent);
+
+  p.add("tx_bytes_enqueued",    info.tx_bytes_enqueued);
+  p.add("tx_bytes_sent",        info.tx_bytes_sent);
+
+  // ==========================================================
+  // RX — Raw ingress
+  // ==========================================================
+
   p.add("rx_blocks_total",      info.rx_blocks_total);
   p.add("rx_bytes_total",       info.rx_bytes_total);
 
-  // Framing outcomes
+  // ==========================================================
+  // RX — Framing outcomes
+  // ==========================================================
+
   p.add("rx_frames_complete",   info.rx_frames_complete);
   p.add("rx_frames_dispatched", info.rx_frames_dispatched);
 
-  // RX state resets
+  // ==========================================================
+  // RX — State resets
+  // ==========================================================
+
   p.add("rx_reset_hard",        info.rx_reset_hard);
 
-  // Framing failures
+  // ==========================================================
+  // RX — Framing failures
+  // ==========================================================
+
   p.add("rx_bad_stx",           info.rx_bad_stx);
   p.add("rx_bad_etx",           info.rx_bad_etx);
   p.add("rx_len_overflow",      info.rx_len_overflow);
 
-  // Concurrency signal
-  p.add("rx_overlap",           info.rx_overlap);
+  // ==========================================================
+  // RX — Concurrency / anomaly signals
+  // ==========================================================
 
-  p.add("rx_expected_traffic_missing",   info.rx_expected_traffic_missing);
+  p.add("rx_overlap",                 info.rx_overlap);
+  p.add("rx_expected_traffic_missing", info.rx_expected_traffic_missing);
 
   return p;
 }

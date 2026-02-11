@@ -962,6 +962,12 @@ def build_clocks_status() -> dict:
     return payload
 
 
+def build_transport_status() -> dict:
+    response = send_command(machine="TEENSY", subsystem="SYSTEM", command="TRANSPORT_INFO")
+    payload = response["payload"]
+    payload["health_state"] = "NOMINAL"
+    return payload
+
 # ------------------------------------------------------------------
 # System poller thread
 # ------------------------------------------------------------------
@@ -982,6 +988,7 @@ def system_poller() -> None:
             power_payload = build_power_status()
             battery_payload = build_battery_status()
             clocks_payload = build_clocks_status()
+            transport_payload = build_transport_status()
 
             SYSTEM = {
                 "pi": dict(pi_payload),
@@ -994,6 +1001,7 @@ def system_poller() -> None:
                 "power": dict(power_payload),
                 "battery": dict(battery_payload),
                 "clocks": dict(clocks_payload),
+                "transport": dict(transport_payload),
             }
 
             # ----------------------------------------------------------
