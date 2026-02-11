@@ -134,6 +134,11 @@ public:
   // Semantic construction (authoritative)
   // --------------------------------------------------
 
+  void add(const char* key, int32_t value);
+  void add(const char* key, uint32_t value);
+  void add(const char* key, int64_t value);
+  void add(const char* key, uint64_t value);
+
   void add(const char* key, const char* value);
   void add(const char* key, const String& value);
   void add(const char* key, bool value);

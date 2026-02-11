@@ -387,19 +387,24 @@ def _serial_rx_loop() -> None:
 # ---------------------------------------------------------------------
 
 def _supervisor_loop() -> None:
+
     while not _transport_stop.is_set():
-        mode = _transport_mode
+        try:
+            mode = _transport_mode
 
-        if mode == TRANSPORT_SERIAL:
-            _open_serial(TEENSY_SERIAL_PATH)
-            _serial_rx_loop()
+            if mode == TRANSPORT_SERIAL:
+                _open_serial(TEENSY_SERIAL_PATH)
+                _serial_rx_loop()
 
-        elif mode == TRANSPORT_HID:
-            _open_hid()
-            _hid_rx_loop()
+            elif mode == TRANSPORT_HID:
+                _open_hid()
+                _hid_rx_loop()
 
-        else:
-            raise RuntimeError("transport mode not set")
+            else:
+                raise RuntimeError("transport mode not set")
+
+        except Exception:
+            logging.exception("️️⚠️ [transport] supervisor caught fatal RX failure")
 
 # ---------------------------------------------------------------------
 # Public API

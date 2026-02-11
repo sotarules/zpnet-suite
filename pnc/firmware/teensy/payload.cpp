@@ -189,10 +189,29 @@ Payload Payload::clone() const {
   return out;
 }
 
+// =============================================================
+// Add
+// =============================================================
 
-// =============================================================
-// Semantic construction
-// =============================================================
+void Payload::add(const char* key, int32_t value) {
+  if (entry_count >= MAX_ENTRIES) return;
+  entries[entry_count++] = { String(key), String(value), 'p' };
+}
+
+void Payload::add(const char* key, uint32_t value) {
+  if (entry_count >= MAX_ENTRIES) return;
+  entries[entry_count++] = { String(key), String(value), 'p' };
+}
+
+void Payload::add(const char* key, int64_t value) {
+  if (entry_count >= MAX_ENTRIES) return;
+  entries[entry_count++] = { String(key), String(value), 'p' };
+}
+
+void Payload::add(const char* key, uint64_t value) {
+  if (entry_count >= MAX_ENTRIES) return;
+  entries[entry_count++] = { String(key), String(value), 'p' };
+}
 
 void Payload::add(const char* key, const char* value) {
   if (entry_count >= MAX_ENTRIES) return;
