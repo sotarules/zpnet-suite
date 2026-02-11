@@ -146,6 +146,8 @@ void transport_send(
 
 typedef struct {
 
+  uint32_t tx_busy_count;          // RawHID blocks or serial RX chunks
+
   // Raw ingress
   uint32_t rx_blocks_total;        // RawHID blocks or serial RX chunks
   uint32_t rx_bytes_total;         // Bytes appended to RX buffer

@@ -39,10 +39,7 @@ static void init_timepop_class_periods(void) {
   CLASS_PERIOD_TICKS[TIMEPOP_CLASS_DEBUG_BEACON] = 1000;
   CLASS_PERIOD_TICKS[TIMEPOP_CLASS_USER_1]       = 10;
   CLASS_PERIOD_TICKS[TIMEPOP_CLASS_USER_2]       = 100;
-
-  // IMPORTANT:
-  // Any class whose period is explicitly set to 0
-  // will behave as an ASAP continuation.
+  CLASS_PERIOD_TICKS[TIMEPOP_CLASS_DEBUG_TX]     = 5;
 }
 
 // ================================================================

@@ -184,12 +184,20 @@ def _close_serial() -> None:
 # Forensic logging
 # ---------------------------------------------------------------------
 
+def render_bytes_lossless(data: bytes) -> str:
+    out = []
+    for b in data:
+        if 32 <= b <= 126:   # printable ASCII
+            out.append(chr(b))
+        else:
+            out.append(f"\\x{b:02X}")
+    return ''.join(out)
+
 def _log_raw_transport(traffic: int, message: bytes, direction: str) -> None:
-    ts = time.time()
     with open(RAW_TRANSPORT_LOG_PATH, "a") as f:
         f.write(
             f"{direction} 0x{traffic:02X} len={len(message)} "
-            f"{message.decode('utf-8', errors='replace')}\n"
+            f"{render_bytes_lossless(message)}\n"
         )
 
 # ---------------------------------------------------------------------

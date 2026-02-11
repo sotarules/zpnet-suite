@@ -43,6 +43,7 @@ static constexpr size_t ETX_LEN   = 5;
 // =============================================================
 // State (shared semantic)
 // =============================================================
+static bool tx_busy = false;
 
 static transport_receive_cb_t recv_cb[256] = { nullptr };
 
@@ -62,6 +63,8 @@ static uint8_t rx_traffic      = 0;
 // All fields are monotonic.
 // Best-effort snapshots are exported via transport_get_info().
 //
+
+static volatile uint32_t tx_busy_count          = 0;
 
 static volatile uint32_t rx_blocks_total        = 0;
 static volatile uint32_t rx_bytes_total         = 0;
@@ -234,36 +237,16 @@ static void transport_send_physical(
 }
 
 // =============================================================
-// SEND: Semantic entry (NON-OPTIONAL scheduled isolation)
+// SEND
 // =============================================================
 
-void transport_send(
-  uint8_t traffic,
-  const Payload& payload
-) {
-  // Allocate explicit send context
-  auto* ctx = new transport_send_ctx_t{
-    traffic,
-    payload.clone()
-  };
-
-  timepop_arm(
-    TIMEPOP_CLASS_ASAP,
-    false,
-    [](timepop_ctx_t*, void* user_ctx) {
-
-      auto* send = static_cast<transport_send_ctx_t*>(user_ctx);
-
-      transport_send_physical(
-        send->traffic,
-        send->payload
-      );
-
-      delete send;
-    },
-    ctx,
-    "transport-send"
-  );
+void transport_send(uint8_t traffic, const Payload& payload) {
+  if (tx_busy) {
+    tx_busy_count++;
+  }
+  tx_busy = true;
+  transport_send_physical(traffic, payload);
+  tx_busy = false;
 }
 
 // =============================================================
@@ -507,6 +490,8 @@ void transport_get_info(
   transport_info_t* out
 ) {
   if (!out) return;
+
+  out->tx_busy_count          = tx_busy_count;
 
   out->rx_blocks_total        = rx_blocks_total;
   out->rx_bytes_total         = rx_bytes_total;

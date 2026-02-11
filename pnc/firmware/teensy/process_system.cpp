@@ -161,6 +161,8 @@ static Payload cmd_transport_info(const Payload& /*args*/) {
 
   Payload p;
 
+  p.add("tx_busy_count",        info.tx_busy_count);
+
   // Raw ingress
   p.add("rx_blocks_total",      info.rx_blocks_total);
   p.add("rx_bytes_total",       info.rx_bytes_total);
