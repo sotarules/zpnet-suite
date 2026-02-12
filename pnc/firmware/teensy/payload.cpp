@@ -8,7 +8,7 @@
 #include <ctype.h>
 
 // ============================================================================
-// Static scratch buffer (shared across all instances for json_view)
+// Static scratch buffer shared across all instances for json_view
 // ============================================================================
 
 char Payload::_scratch[Payload::SCRATCH_SIZE];
