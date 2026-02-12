@@ -78,7 +78,7 @@ def list_subsystems() -> list[str]:
     return sorted(subsystems)
 
 # =============================================================================
-# Canonical RPC client (UNCHANGED)
+# Canonical RPC client (MINIMALLY REVISED)
 # =============================================================================
 
 def send_command(
@@ -101,6 +101,19 @@ def send_command(
 
     if machine == "PI":
         sock_path = command_socket_path(subsystem)
+
+        # ------------------------------------------------------------
+        # Minimal defensive check: missing subsystem socket
+        # ------------------------------------------------------------
+        if not os.path.exists(sock_path):
+            return {
+                "success": False,
+                "message": "BAD",
+                "payload": {
+                    "error": "unknown subsystem"
+                }
+            }
+
     else:
         sock_path = TEENSY_REQUEST_RESPONSE_SOCKET
 
@@ -149,6 +162,7 @@ def send_command(
         f"[send_command] failed after {retries} attempts "
         f"({machine} {subsystem} {command})"
     ) from last_exc
+
 
 
 # =============================================================================
@@ -232,12 +246,29 @@ def _serve_commands(
             cmd = req["command"]
             args = req.get("args")
 
+            # ------------------------------------------------------------
+            # Minimal defensive check for invalid command
+            # ------------------------------------------------------------
+            if cmd not in commands:
+                resp = {
+                    "success": False,
+                    "message": "BAD",
+                    "payload": {
+                        "error": "unknown command"
+                    }
+                }
+                conn.sendall(
+                    json.dumps(resp, separators=(",", ":")).encode("utf-8")
+                )
+                continue
+
             handler = commands[cmd]
             resp = handler(args)
 
             conn.sendall(
                 json.dumps(resp, separators=(",", ":")).encode("utf-8")
             )
+
 
 
 # =============================================================================

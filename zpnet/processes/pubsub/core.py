@@ -163,7 +163,6 @@ def on_receive_request_response(payload: Dict[str, Any]) -> None:
 
     now_ms = int(time.monotonic() * 1000)
     latency = now_ms - sent_ms
-    logging.info("📩 [on_receive_request_response] req_id=%d latency=%.2fms", req_id, latency)
 
     payload["latency"] = latency
 
