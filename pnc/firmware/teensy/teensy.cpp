@@ -5,7 +5,7 @@
 //
 
 #include "config.h"
-
+#include "memory_info.h"
 #include "timepop.h"
 #include "events.h"
 #include "cpu_usage.h"
@@ -118,9 +118,10 @@ void setup() {
   led_off();
 
   // ----------------------------------------------------------
-  // Phase 1: Core instrumentation (still no debug_log)
+  // Phase 1: Core instrumentation
   // ----------------------------------------------------------
 
+  memory_info_init();
   cpu_usage_init();
   timepop_init();
 

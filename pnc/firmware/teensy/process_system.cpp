@@ -14,7 +14,7 @@
 // =============================================================
 
 #include "process_system.h"
-
+#include "memory_info.h"
 #include "config.h"
 #include "process.h"
 #include "events.h"
@@ -268,6 +268,68 @@ static Payload cmd_payload_info(const Payload& /*args*/) {
   return p;
 }
 
+// ============================================================================
+// cmd_memory_info — ZPNet SYSTEM command handler
+// ============================================================================
+//
+// Register in your SYSTEM process command table as:
+//
+//   { "MEMORY_INFO", cmd_memory_info },
+//
+// Call memory_info_init() once in setup() BEFORE other initialization.
+//
+// Query from Pi:
+//   .tc system memory_info
+//
+// Semantics:
+//   • Read-only
+//   • Snapshot-only
+//   • No inference
+//   • No allocation beyond Payload
+//   • No transport emission
+// ============================================================================
+
+static Payload cmd_memory_info(const Payload& /*args*/) {
+
+    memory_info_t info{};
+    memory_info_get(&info);
+
+    Payload p;
+
+    // ==========================================================
+    // DTCM / Stack
+    // ==========================================================
+
+    p.add("dtcm_total",          info.dtcm_total);
+    p.add("dtcm_static",         info.dtcm_static);
+    p.add("dtcm_stack_avail",    info.dtcm_stack_avail);
+
+    p.add("stack_current",       info.stack_current);
+    p.add("stack_high_water",    info.stack_high_water);
+    p.add("stack_usage_pct",     info.stack_usage_pct);
+
+    // ==========================================================
+    // Heap (RAM2)
+    // ==========================================================
+
+    p.add("heap_total",          info.heap_total);
+    p.add("heap_arena",          info.heap_arena);
+    p.add("heap_used",           info.heap_used);
+    p.add("heap_free_internal",  info.heap_free_internal);
+    p.add("heap_free_above",     info.heap_free_above);
+    p.add("heap_free_total",     info.heap_free_total);
+
+    p.add("heap_arena_high_water", info.heap_arena_high_water);
+
+    // ==========================================================
+    // Health indicators
+    // ==========================================================
+
+    p.add("heap_fragmentation_pct", info.heap_fragmentation_pct);
+    p.add("heap_growing",           info.heap_growing);
+
+    return p;
+}
 
 // ------------------------------------------------------------
 // ENTER_BOOTLOADER — terminal, irreversible
@@ -368,6 +430,7 @@ static const process_command_entry_t SYSTEM_COMMANDS[] = {
   { "REPORT",           cmd_report           },
   { "TRANSPORT_INFO",   cmd_transport_info   },
   { "PAYLOAD_INFO",     cmd_payload_info     },
+  { "MEMORY_INFO",      cmd_memory_info      },
   { "ENTER_BOOTLOADER", cmd_enter_bootloader },
   { "SHUTDOWN",         cmd_shutdown         },
   { "PROCESS_LIST",     cmd_process_list     },
