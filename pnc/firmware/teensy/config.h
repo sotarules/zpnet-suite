@@ -4,7 +4,7 @@
 #include <cstddef>
 
 #define ZPNET_SERIAL Serial
-#define FW_VERSION_STR "zpnet-teensy-4.3.5"
+#define FW_VERSION_STR "zpnet-teensy-5.1.1"
 static constexpr const char* FW_VERSION = FW_VERSION_STR;
 
 // -------------------------------------------------------------

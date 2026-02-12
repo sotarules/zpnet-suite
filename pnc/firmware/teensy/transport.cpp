@@ -36,8 +36,8 @@ static constexpr size_t RX_BUF_MAX           = 2048;
 
 // TX arena size (bounded, deterministic memory)
 // Adjust if needed. 12 KB is safe on Teensy 4.x.
-static constexpr size_t TX_ARENA_SIZE = 12 * 1024;
-static constexpr size_t TX_JOB_MAX    = 16;   // max queued messages
+static constexpr size_t TX_ARENA_SIZE = 24 * 1024;
+static constexpr size_t TX_JOB_MAX    = 64;   // max queued messages
 
 static constexpr char   STX_SEQ[] = "<STX=";
 static constexpr size_t STX_LEN   = 5;
@@ -90,6 +90,8 @@ static volatile uint32_t tx_jobs_enqueued = 0;
 static volatile uint32_t tx_jobs_sent     = 0;
 static volatile uint32_t tx_bytes_enqueued = 0;
 static volatile uint32_t tx_bytes_sent     = 0;
+
+static volatile uint32_t tx_rr_drop_count  = 0;
 
 // =============================================================
 // RX State (unchanged)
@@ -299,8 +301,12 @@ void transport_send(uint8_t traffic, const Payload& payload) {
 
   // Allocate arena space
   size_t start;
-  if (!tx_arena_alloc(total_len, &start))
+  if (!tx_arena_alloc(total_len, &start)) {
+    if (traffic == TRAFFIC_REQUEST_RESPONSE) {
+        tx_rr_drop_count++;
+    }
     return;
+  }
 
   // Clone into arena
   memcpy(tx_arena + start, header, header_len);
@@ -310,6 +316,9 @@ void transport_send(uint8_t traffic, const Payload& payload) {
   // Enqueue job
   if (tx_job_count >= TX_JOB_MAX) {
     tx_arena_free(total_len);
+    if (traffic == TRAFFIC_REQUEST_RESPONSE) {
+        tx_rr_drop_count++;
+    }
     return;
   }
 
@@ -530,6 +539,7 @@ void transport_get_info(transport_info_t* out) {
   out->tx_jobs_sent        = tx_jobs_sent;
   out->tx_bytes_enqueued   = tx_bytes_enqueued;
   out->tx_bytes_sent       = tx_bytes_sent;
+  out->tx_rr_drop_count    = tx_rr_drop_count;
 
   out->rx_blocks_total     = rx_blocks_total;
   out->rx_bytes_total      = rx_bytes_total;

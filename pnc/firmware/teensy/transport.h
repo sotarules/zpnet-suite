@@ -152,6 +152,8 @@ typedef struct {
   uint32_t tx_bytes_enqueued;     // Total bytes enqueued
   uint32_t tx_bytes_sent;         // Total bytes sent
 
+   uint32_t tx_rr_drop_count;     // Number of failed arena drops
+
   // ===========================================================
   // RX — Raw ingress
   // ===========================================================

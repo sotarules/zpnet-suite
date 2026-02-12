@@ -180,6 +180,8 @@ static Payload cmd_transport_info(const Payload& /*args*/) {
   p.add("tx_bytes_enqueued",    info.tx_bytes_enqueued);
   p.add("tx_bytes_sent",        info.tx_bytes_sent);
 
+  p.add("tx_rr_drop_count",     info.tx_rr_drop_count);
+
   // ==========================================================
   // RX — Raw ingress
   // ==========================================================
@@ -217,6 +219,55 @@ static Payload cmd_transport_info(const Payload& /*args*/) {
 
   return p;
 }
+
+// ------------------------------------------------------------
+// PAYLOAD_INFO — payload allocator / entry invariants snapshot
+//
+// Semantics:
+//   • Read-only
+//   • Snapshot-only
+//   • No inference
+//   • No allocation beyond Payload
+//   • No transport emission
+// ------------------------------------------------------------
+static Payload cmd_payload_info(const Payload& /*args*/) {
+
+  payload_info_t info{};
+  payload_get_info(&info);
+
+  Payload p;
+
+  // ==========================================================
+  // Lifetime totals
+  // ==========================================================
+
+  p.add("payload_instances_constructed", info.instances_constructed);
+  p.add("payload_instances_destroyed",   info.instances_destroyed);
+
+  // ==========================================================
+  // Live tracking (invariant support)
+  // ==========================================================
+
+  p.add("payload_alive_now",        info.alive_now);
+  p.add("payload_alive_high_water", info.alive_high_water);
+
+  // ==========================================================
+  // Arena behavior
+  // ==========================================================
+
+  p.add("payload_arena_alloc_fail", info.arena_alloc_fail);
+  p.add("payload_arena_high_water", info.arena_high_water);
+
+  // ==========================================================
+  // Entry behavior
+  // ==========================================================
+
+  p.add("payload_entry_overflow",   info.entry_overflow);
+  p.add("payload_entry_high_water", info.entry_high_water);
+
+  return p;
+}
+
 
 // ------------------------------------------------------------
 // ENTER_BOOTLOADER — terminal, irreversible
@@ -315,7 +366,8 @@ static Payload cmd_status(const Payload& /*args*/) {
 
 static const process_command_entry_t SYSTEM_COMMANDS[] = {
   { "REPORT",           cmd_report           },
-  { "TRANSPORT_INFO",   cmd_transport_info   }, // <-- NEW
+  { "TRANSPORT_INFO",   cmd_transport_info   },
+  { "PAYLOAD_INFO",     cmd_payload_info     },
   { "ENTER_BOOTLOADER", cmd_enter_bootloader },
   { "SHUTDOWN",         cmd_shutdown         },
   { "PROCESS_LIST",     cmd_process_list     },
