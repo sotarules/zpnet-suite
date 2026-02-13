@@ -330,9 +330,9 @@ Device Inventory
 
 Device Type   Address   A0 Strap   A1 Strap   Function / Notes
 ---------------------------------------------------------------------------
-INA260        0x40      Open       Open       Power monitor — Raspberry Pi
-INA260        0x44      Open       Bridged    Power monitor — Teensy
+INA260        0x40      Open       Open       Power monitor — Teensy
 INA260        0x41      Bridged    Open       Power monitor — 24V stepper motors
+INA260        0x44      Open       Bridged    Power monitor — Raspberry Pi
 INA260        0x45      Bridged    Bridged    Power monitor — 3.3V OCXO
 
 DS3231 RTC    0x68      Fixed      Fixed      Secondary real-time clock
