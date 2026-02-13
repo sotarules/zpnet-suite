@@ -36,7 +36,7 @@ static constexpr size_t RX_BUF_MAX           = 2048;
 
 // TX arena size (bounded, deterministic memory)
 // Adjust if needed. 12 KB is safe on Teensy 4.x.
-static constexpr size_t TX_ARENA_SIZE = 24 * 1024;
+static constexpr size_t TX_ARENA_SIZE = 48 * 1024;
 static constexpr size_t TX_JOB_MAX    = 64;   // max queued messages
 
 static constexpr char   STX_SEQ[] = "<STX=";
