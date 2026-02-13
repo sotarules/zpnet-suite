@@ -23,7 +23,7 @@ TEENSY_LOADER = teensy_loader_cli
 
 # USB mode affects runtime only, not flashing
 # Choose one and stick to it (serial or rawhid)
-USB_MODE = rawhid
+USB_MODE = serial
 BOARD    = teensy:avr:teensy41:usb=$(USB_MODE)
 
 # -------------------------------------------------------------
@@ -33,7 +33,7 @@ BOARD    = teensy:avr:teensy41:usb=$(USB_MODE)
 CPP_DEFS =
 
 # Explicit transport selection (runtime routing)
-CPP_DEFS += -DZPNET_TRANSPORT_HID
+CPP_DEFS += -DZPNET_TRANSPORT_SERIAL
 
 # -------------------------------------------------------------
 # Targets
