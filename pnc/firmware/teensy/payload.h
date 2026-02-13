@@ -71,15 +71,6 @@ class PayloadArray;
 class PayloadArrayView;
 
 // ----------------------------------------------------------------------------
-// JsonView — transient, non-owning view over serialized JSON
-// ----------------------------------------------------------------------------
-
-struct JsonView {
-    const char* data;
-    size_t      len;
-};
-
-// ----------------------------------------------------------------------------
 // PayloadArrayView — read-only view over a JSON array fragment
 // ----------------------------------------------------------------------------
 
@@ -140,10 +131,6 @@ public:
       Buffer is always NUL-terminated on success.
     */
     size_t write_json(char* buf, size_t buf_size) const;
-
-    // DEPRECATED — do not use from any path reachable by timepop callbacks.
-    // Retained only for ad-hoc serial console debugging if ever needed.
-    JsonView json_view() const;
 
     /*
       Legacy convenience wrapper.
@@ -283,13 +270,6 @@ private:
 
     // Add a pre-formatted string value with given kind.
     void _add_entry(const char* key, const char* value, size_t value_len, char kind);
-
-    // -----------------------------------------------------------------
-    // Shared scratch buffer for json_view()
-    // -----------------------------------------------------------------
-
-    static constexpr size_t SCRATCH_SIZE = 10 * 1024;
-    static char _scratch[SCRATCH_SIZE];
 };
 
 

@@ -8,12 +8,6 @@
 #include <ctype.h>
 
 // ============================================================================
-// Static scratch buffer shared across all instances for json_view
-// ============================================================================
-
-char Payload::_scratch[Payload::SCRATCH_SIZE];
-
-// ============================================================================
 // Global Payload Instrumentation (monotonic, centralized)
 // ============================================================================
 
@@ -362,7 +356,7 @@ void Payload::add_object(const char* key, const Payload& obj) {
     if (_count >= MAX_ENTRIES) return;
 
     // Serialize the nested object into scratch, then copy to arena
-    char local_buf[SCRATCH_SIZE];
+    char local_buf[ARENA_MAX];
     size_t json_len = obj.write_json(local_buf, sizeof(local_buf));
 
     if (json_len == 0) {
@@ -510,11 +504,6 @@ size_t Payload::write_json(char* buf, size_t buf_size) const {
 
     buf[pos] = '\0';
     return pos;
-}
-
-JsonView Payload::json_view() const {
-    size_t len = write_json(_scratch, SCRATCH_SIZE);
-    return JsonView{ _scratch, len };
 }
 
 String Payload::to_json() const {
