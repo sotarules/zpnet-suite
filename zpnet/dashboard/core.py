@@ -119,6 +119,7 @@ from zpnet.dashboard.readout_blocks import (
     teensy_status_readout,
     photodiode_status_readout,
     raspberry_pi_status_readout,
+    teensy_metrics_readout
 )
 
 Readout = Generator[str, None, None]
@@ -135,6 +136,7 @@ READOUTS: list[Callable[[], Readout]] = [
     teensy_status_readout,
     photodiode_status_readout,
     raspberry_pi_status_readout,
+    teensy_metrics_readout
 ]
 
 # ---------------------------------------------------------------------
