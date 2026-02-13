@@ -74,8 +74,9 @@ void debug_log(const char* name, const Payload& value) {
   Payload out;
   out.add("name", name);
 
-  JsonView v = value.json_view();
-  out.add_raw_object("value", v.data);
+  char local_buf[1024];
+  size_t len = value.write_json(local_buf, sizeof(local_buf));
+  out.add_raw_object("value", len > 0 ? local_buf : "{}");
 
   transport_send(TRAFFIC_DEBUG, out);
 }

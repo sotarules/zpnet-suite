@@ -288,54 +288,54 @@ static void transport_tx_pump(timepop_ctx_t*, void*) {
 
 void transport_send(uint8_t traffic, const Payload& payload) {
 
-  JsonView v = payload.json_view();
-  size_t json_len = v.len;
+    char local_buf[2048];
+    size_t json_len = payload.write_json(local_buf, sizeof(local_buf));
 
-  char header[32];
-  int header_len = snprintf(header, sizeof(header),
-                            "<STX=%u>", (unsigned)json_len);
-  if (header_len <= 0)
-    return;
+    if (json_len == 0)
+        return;
 
-  size_t total_len = header_len + json_len + ETX_LEN;
+    char header[32];
+    int header_len = snprintf(header, sizeof(header),
+                              "<STX=%u>", (unsigned)json_len);
+    if (header_len <= 0)
+        return;
 
-  // Allocate arena space
-  size_t start;
-  if (!tx_arena_alloc(total_len, &start)) {
-    if (traffic == TRAFFIC_REQUEST_RESPONSE) {
-        tx_rr_drop_count++;
+    size_t total_len = header_len + json_len + ETX_LEN;
+
+    size_t start;
+    if (!tx_arena_alloc(total_len, &start)) {
+        if (traffic == TRAFFIC_REQUEST_RESPONSE) {
+            tx_rr_drop_count++;
+        }
+        return;
     }
-    return;
-  }
 
-  // Clone into arena
-  memcpy(tx_arena + start, header, header_len);
-  memcpy(tx_arena + start + header_len, v.data, json_len);
-  memcpy(tx_arena + start + header_len + json_len, ETX_SEQ, ETX_LEN);
+    memcpy(tx_arena + start, header, header_len);
+    memcpy(tx_arena + start + header_len, local_buf, json_len);
+    memcpy(tx_arena + start + header_len + json_len, ETX_SEQ, ETX_LEN);
 
-  // Enqueue job
-  if (tx_job_count >= TX_JOB_MAX) {
-    tx_arena_free(total_len);
-    if (traffic == TRAFFIC_REQUEST_RESPONSE) {
-        tx_rr_drop_count++;
+    if (tx_job_count >= TX_JOB_MAX) {
+        tx_arena_free(total_len);
+        if (traffic == TRAFFIC_REQUEST_RESPONSE) {
+            tx_rr_drop_count++;
+        }
+        return;
     }
-    return;
-  }
 
-  tx_jobs[tx_job_head] = {
-    traffic,
-    start,
-    total_len,
-    0
-  };
+    tx_jobs[tx_job_head] = {
+        traffic,
+        start,
+        total_len,
+        0
+    };
 
-  tx_job_head = (tx_job_head + 1) % TX_JOB_MAX;
-  tx_job_count++;
-  tx_jobs_enqueued++;
-  tx_bytes_enqueued += total_len;
+    tx_job_head = (tx_job_head + 1) % TX_JOB_MAX;
+    tx_job_count++;
+    tx_jobs_enqueued++;
+    tx_bytes_enqueued += total_len;
 
-  if (tx_job_count > tx_job_high_water)
-    tx_job_high_water = tx_job_count;
+    if (tx_job_count > tx_job_high_water)
+        tx_job_high_water = tx_job_count;
 }
 
 // =============================================================

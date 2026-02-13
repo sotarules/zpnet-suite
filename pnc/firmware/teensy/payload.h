@@ -141,11 +141,8 @@ public:
     */
     size_t write_json(char* buf, size_t buf_size) const;
 
-    /*
-      Convenience: serialize into a shared static scratch buffer.
-      NOT reentrant across threads/ISRs.
-      Valid until next json_view() call on ANY Payload instance.
-    */
+    // DEPRECATED — do not use from any path reachable by timepop callbacks.
+    // Retained only for ad-hoc serial console debugging if ever needed.
     JsonView json_view() const;
 
     /*

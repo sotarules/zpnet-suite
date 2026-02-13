@@ -145,6 +145,84 @@ static Payload cmd_report(const Payload& /*args*/) {
   return p;
 }
 
+// ============================================================================
+// cmd_process_info — ZPNet SYSTEM command handler
+// ============================================================================
+//
+// Register in your SYSTEM process command table as:
+//
+//   { "PROCESS_INFO", cmd_process_info },
+//
+// Query from Pi:
+//   .tc system process_info
+//
+// Semantics:
+//   • Read-only
+//   • Snapshot-only
+//   • No inference
+//   • No allocation beyond Payload
+//   • No transport emission
+//
+// Invariant checks:
+//   If the system is healthy, the following MUST hold:
+//     received == routed + error_missing_fields
+//                        + error_unknown_subsys
+//                        + error_unknown_command
+//     routed == handler_invoked
+//     handler_invoked == handler_completed
+//     handler_completed == response_sent
+//
+//   Any deviation is a smoking gun.
+// ============================================================================
+
+static Payload cmd_process_info(const Payload& /*args*/) {
+
+    process_rpc_info_t info{};
+    process_get_rpc_info(&info);
+
+    Payload p;
+
+    // ==========================================================
+    // Pipeline (happy path)
+    // ==========================================================
+
+    p.add("rpc_received",          info.received);
+    p.add("rpc_routed",            info.routed);
+    p.add("rpc_handler_invoked",   info.handler_invoked);
+    p.add("rpc_handler_completed", info.handler_completed);
+    p.add("rpc_response_sent",     info.response_sent);
+
+    // ==========================================================
+    // Errors
+    // ==========================================================
+
+    p.add("rpc_err_missing_fields",  info.error_missing_fields);
+    p.add("rpc_err_unknown_subsys",  info.error_unknown_subsys);
+    p.add("rpc_err_unknown_command", info.error_unknown_command);
+    p.add("rpc_err_response_sent",   info.error_response_sent);
+
+    // ==========================================================
+    // Pub/sub
+    // ==========================================================
+
+    p.add("ps_dispatched",         info.ps_dispatched);
+
+    // ==========================================================
+    // Derived invariant checks
+    // ==========================================================
+
+    uint32_t expected_received = info.routed
+                               + info.error_missing_fields
+                               + info.error_unknown_subsys
+                               + info.error_unknown_command;
+
+    p.add("invariant_received_ok",  info.received == expected_received);
+    p.add("invariant_handler_ok",   info.handler_invoked == info.handler_completed);
+    p.add("invariant_response_ok",  info.handler_completed == info.response_sent);
+
+    return p;
+}
+
 // ------------------------------------------------------------
 // TRANSPORT_INFO — transport RX/TX forensic snapshot
 //
@@ -428,6 +506,7 @@ static Payload cmd_status(const Payload& /*args*/) {
 
 static const process_command_entry_t SYSTEM_COMMANDS[] = {
   { "REPORT",           cmd_report           },
+  { "PROCESS_INFO",     cmd_process_info     },
   { "TRANSPORT_INFO",   cmd_transport_info   },
   { "PAYLOAD_INFO",     cmd_payload_info     },
   { "MEMORY_INFO",      cmd_memory_info      },

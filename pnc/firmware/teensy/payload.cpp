@@ -518,8 +518,9 @@ JsonView Payload::json_view() const {
 }
 
 String Payload::to_json() const {
-    JsonView v = json_view();
-    return String(v.data);
+    char local_buf[2048];
+    write_json(local_buf, sizeof(local_buf));
+    return String(local_buf);
 }
 
 // ============================================================================

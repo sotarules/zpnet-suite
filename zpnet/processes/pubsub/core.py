@@ -148,7 +148,8 @@ def on_receive_debug(payload: Dict[str, Any]) -> None:
 def on_receive_request_response(payload: Dict[str, Any]) -> None:
     req_id = payload.get("req_id")
     if req_id is None:
-        raise RuntimeError("Response missing req_id")
+        logging.warning("⚠️ response missing req_id — discarded")
+        return
 
     with state_lock:
         q = pending_replies.pop(req_id, None)
@@ -159,7 +160,8 @@ def on_receive_request_response(payload: Dict[str, Any]) -> None:
 
     sent_ms = payload.get("req_ts_ms")
     if sent_ms is None:
-        raise RuntimeError("Response missing req_ts_ms")
+        logging.warning("⚠️ response missing req_ts_ms — discarded")
+        return
 
     now_ms = int(time.monotonic() * 1000)
     latency = now_ms - sent_ms
@@ -316,6 +318,23 @@ def rpc_server() -> None:
 # ---------------------------------------------------------------------
 # PUBSUB command surface
 # ---------------------------------------------------------------------
+
+def cmd_diagnostics(_: Optional[dict]) -> Dict[str, Any]:
+    with state_lock:
+        pending_count = len(pending_replies)
+        pending_ids = list(pending_replies.keys())
+
+    return {
+        "success": True,
+        "message": "OK",
+        "payload": {
+            "pending_reply_count": pending_count,
+            "pending_req_ids": pending_ids[:50],  # cap for sanity
+            "req_id_current": next(req_id_counter),
+            "routes_topic_count": len(routes_by_topic),
+            "active_threads": threading.active_count(),
+        },
+    }
 
 def cmd_report(_: Optional[dict]) -> Dict[str, Any]:
     """
@@ -521,6 +540,7 @@ COMMANDS = {
     "ALLSUBSCRIPTIONS": cmd_allsubscriptions,
     "UNIONSUBSCRIPTIONS": cmd_unionsubscriptions,
     "REFRESH": cmd_refresh,
+    "DIAGNOSTICS": cmd_diagnostics,
 }
 
 def _delayed_refresh(delay_s: float = 10.0) -> None:

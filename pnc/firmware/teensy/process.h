@@ -25,6 +25,58 @@
 //
 // ============================================================================
 
+// ============================================================================
+// process_rpc_info — add to process.h
+// ============================================================================
+//
+// Add this struct and function declaration to your existing process.h
+//
+
+struct process_rpc_info_t {
+
+    // --------------------------------------------------------
+    // Pipeline counters (monotonic, never reset)
+    // --------------------------------------------------------
+
+    uint32_t received;              // commands entered process_command()
+    uint32_t routed;                // successfully matched subsystem + command
+    uint32_t handler_invoked;       // entry->handler() was called
+    uint32_t handler_completed;     // entry->handler() returned
+    uint32_t response_sent;         // transport_send() called for response
+
+    // --------------------------------------------------------
+    // Error counters
+    // --------------------------------------------------------
+
+    uint32_t error_missing_fields;  // subsystem or command was null
+    uint32_t error_unknown_subsys;  // subsystem not in registry
+    uint32_t error_unknown_command; // command not in vtable
+    uint32_t error_response_sent;   // error responses sent
+
+    // --------------------------------------------------------
+    // Pub/sub
+    // --------------------------------------------------------
+
+    uint32_t ps_dispatched;         // publish messages dispatched
+
+    // --------------------------------------------------------
+    // Invariants (for health checking):
+    //
+    //   received == routed + error_missing_fields
+    //                      + error_unknown_subsys
+    //                      + error_unknown_command
+    //
+    //   routed == handler_invoked
+    //   handler_invoked == handler_completed
+    //   handler_completed == response_sent
+    //
+    // Any deviation indicates a stuck handler or lost response.
+    // --------------------------------------------------------
+};
+
+// Populate a snapshot. Safe to call from any context.
+// Does not allocate. Does not emit. Read-only.
+void process_get_rpc_info(process_rpc_info_t* out);
 
 // --------------------------------------------------
 // Command Handler Contract
