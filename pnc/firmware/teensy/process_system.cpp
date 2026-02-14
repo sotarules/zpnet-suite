@@ -260,6 +260,13 @@ static Payload cmd_transport_info(const Payload& /*args*/) {
 
   p.add("tx_rr_drop_count",     info.tx_rr_drop_count);
 
+  p.add("tx_gap_start",          info.tx_gap_start);
+  p.add("tx_arena_gap_skips",   info.tx_arena_gap_skips);
+  p.add("tx_arena_gap_bytes_tot",   info.tx_arena_gap_bytes_tot);
+  p.add("tx_arena_gap_bytes_max",   info.tx_arena_gap_bytes_max);
+  p.add("tx_debug_last_tail_at_gap_check",   info.tx_debug_last_tail_at_gap_check);
+  p.add("tx_debug_tail_before_free ",   info.tx_debug_tail_before_free );
+
   // ==========================================================
   // RX — Raw ingress
   // ==========================================================

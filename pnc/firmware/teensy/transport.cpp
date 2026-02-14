@@ -84,6 +84,7 @@ static size_t tx_job_head = 0;
 static size_t tx_job_tail = 0;
 static size_t tx_job_count = 0;
 
+
 static size_t tx_job_high_water = 0;
 
 static volatile uint32_t tx_jobs_enqueued = 0;
@@ -92,6 +93,19 @@ static volatile uint32_t tx_bytes_enqueued = 0;
 static volatile uint32_t tx_bytes_sent     = 0;
 
 static volatile uint32_t tx_rr_drop_count  = 0;
+
+// =============================================================
+// Arena state (additions)
+// =============================================================
+
+static volatile uint32_t tx_arena_gap_skips     = 0;  // gap-skip events
+static volatile uint32_t tx_arena_gap_bytes_tot = 0;  // cumulative wasted bytes
+static volatile uint32_t tx_arena_gap_bytes_max = 0;  // largest single gap
+
+static size_t tx_gap_start = TX_ARENA_SIZE;           // "no gap" sentinel
+
+static volatile uint32_t tx_debug_last_tail_at_gap_check = 0; // debug
+static volatile size_t tx_debug_tail_before_free = 0; // debug
 
 // =============================================================
 // RX State (unchanged)
@@ -139,39 +153,81 @@ static const char* BUILD_FINGERPRINT = "__FP__ZPNET_SERIAL__";
 #endif
 
 // =============================================================
-// Arena Allocation (FIFO ring)
+// Arena Allocation (FIFO ring, with tail-gap skip)
 // =============================================================
+//
+// When a message won't fit in the contiguous tail space but
+// WOULD fit if we wrapped to offset 0, we skip the unusable
+// tail bytes ("dead space") and allocate from the beginning.
+//
+// The dead space is accounted for in tx_used so that the
+// arena's free-space bookkeeping remains correct. The dead
+// bytes are reclaimed when tx_arena_free() advances tx_tail
+// past them.
+//
+// Invariant: at most one outstanding gap exists at any time.
+// This is guaranteed because gap creation requires head >= tail,
+// and after wrapping head to 0 we enter head < tail until the
+// tail catches up.
+//
 
 static bool tx_arena_alloc(size_t len, size_t* out_start) {
 
-  // Check if available space would be exceeded by this allocation
+  // Reject obviously impossible requests
+  if (len == 0 || len > TX_ARENA_SIZE) {
+    tx_arena_alloc_fail++;
+    return false;
+  }
+
+  // Not enough total free space regardless of layout
   if (len > TX_ARENA_SIZE - tx_used) {
     tx_arena_alloc_fail++;
     return false;
   }
 
-  // Case 1: head >= tail
+  // Case 1: head >= tail (free space is at end + beginning)
   if (tx_head >= tx_tail) {
 
     size_t space_end = TX_ARENA_SIZE - tx_head;
 
     if (len <= space_end) {
+      // Fits at the end — simple case
       *out_start = tx_head;
       tx_head = (tx_head + len) % TX_ARENA_SIZE;
     } else {
-      // Wrap to 0
-      if (len <= tx_tail) {
-        *out_start = 0;
-        tx_head = len;
-      } else {
+      // Won't fit at end. Skip the tail gap and wrap to 0.
+
+      size_t dead = space_end;
+
+      // After wasting the gap, is there still room at the front?
+      if (len > TX_ARENA_SIZE - tx_used - dead) {
         tx_arena_alloc_fail++;
         return false;
       }
+
+      // Record where the gap begins
+      tx_gap_start = tx_head;
+
+      // Account for dead space
+      tx_used += dead;
+      if (tx_used > tx_arena_high_water)
+        tx_arena_high_water = tx_used;
+
+      // Gap-skip telemetry
+      tx_arena_gap_skips++;
+      tx_arena_gap_bytes_tot += dead;
+      if (dead > tx_arena_gap_bytes_max)
+        tx_arena_gap_bytes_max = dead;
+
+      // Allocate from offset 0
+      *out_start = 0;
+      tx_head = len;
     }
 
   } else {
-    // head < tail
-    size_t space_mid = tx_tail - tx_head; // Space between head and tail
+    // Case 2: head < tail (free space is contiguous between them)
+    size_t space_mid = tx_tail - tx_head;
+
     if (len <= space_mid) {
       *out_start = tx_head;
       tx_head += len;
@@ -187,10 +243,36 @@ static bool tx_arena_alloc(size_t len, size_t* out_start) {
 
   return true;
 }
+// =============================================================
+// Arena Free (FIFO, with gap reclamation)
+// =============================================================
+//
+// Jobs are freed in strict FIFO order. When the tail reaches
+// the dead gap at the end of the arena, the gap bytes are
+// reclaimed and the tail wraps to 0.
+//
 
 static void tx_arena_free(size_t len) {
-  tx_tail = (tx_tail + len) % TX_ARENA_SIZE;
+
+  if (tx_gap_start != TX_ARENA_SIZE) {
+    tx_debug_tail_before_free = tx_tail;
+  }
+
+  tx_tail += len;
   tx_used -= len;
+
+  // If the tail has entered the dead gap region, skip to 0
+  if (tx_gap_start != TX_ARENA_SIZE && tx_tail >= tx_gap_start) {
+    size_t dead = TX_ARENA_SIZE - tx_gap_start;
+    tx_used -= dead;
+    tx_tail = 0;
+    tx_gap_start = TX_ARENA_SIZE;
+  }
+
+  // Normal wrap (no gap case)
+  if (tx_tail >= TX_ARENA_SIZE) {
+    tx_tail -= TX_ARENA_SIZE;
+  }
 }
 
 // =============================================================
@@ -540,6 +622,13 @@ void transport_get_info(transport_info_t* out) {
   out->tx_bytes_enqueued   = tx_bytes_enqueued;
   out->tx_bytes_sent       = tx_bytes_sent;
   out->tx_rr_drop_count    = tx_rr_drop_count;
+
+  out->tx_gap_start         = tx_gap_start;
+  out->tx_arena_gap_skips  = tx_arena_gap_skips;
+  out->tx_arena_gap_bytes_tot = tx_arena_gap_bytes_tot;
+  out->tx_arena_gap_bytes_max = tx_arena_gap_bytes_max;
+  out->tx_debug_last_tail_at_gap_check = tx_debug_last_tail_at_gap_check;
+  out->tx_debug_tail_before_free  = tx_debug_tail_before_free ;
 
   out->rx_blocks_total     = rx_blocks_total;
   out->rx_bytes_total      = rx_bytes_total;

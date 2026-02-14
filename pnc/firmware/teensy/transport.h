@@ -152,7 +152,16 @@ typedef struct {
   uint32_t tx_bytes_enqueued;     // Total bytes enqueued
   uint32_t tx_bytes_sent;         // Total bytes sent
 
-   uint32_t tx_rr_drop_count;     // Number of failed arena drops
+  uint32_t tx_rr_drop_count;      // Number of failed arena drops
+
+  uint32_t tx_gap_start;             // dead bytes at end of arena before wrap
+
+  uint32_t tx_debug_last_tail_at_gap_check; // debug
+  uint32_t tx_debug_tail_before_free; // debug
+
+  uint32_t tx_arena_gap_skips;      // gap-skip events
+  uint32_t tx_arena_gap_bytes_tot;  // cumulative wasted bytes
+  uint32_t tx_arena_gap_bytes_max;  // largest single gap
 
   // ===========================================================
   // RX — Raw ingress
