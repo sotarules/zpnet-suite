@@ -266,12 +266,13 @@ static void pps_isr(void) {
       if (campaign_state == clocks_campaign_state_t::STARTED) {
 
         Payload p;
-        p.add("campaign",   campaign_name);
-        p.add("dwt_cycles", clocks_dwt_cycles_now());
-        p.add("dwt_ns",     clocks_dwt_ns_now());
-        p.add("gnss_ns",    clocks_gnss_ns_now());
-        p.add("ocxo_ns",    clocks_ocxo_ns_now());
-        p.add("gnss_lock",  digitalRead(GNSS_LOCK_PIN));
+        p.add("campaign",         campaign_name);
+        p.add("dwt_cycles",       clocks_dwt_cycles_now());
+        p.add("dwt_ns",           clocks_dwt_ns_now());
+        p.add("gnss_ns",          clocks_gnss_ns_now());
+        p.add("ocxo_ns",          clocks_ocxo_ns_now());
+        p.add("teensy_pps_count", campaign_seconds);
+        p.add("gnss_lock",        digitalRead(GNSS_LOCK_PIN));
 
         publish("TIMEBASE_FRAGMENT", p);
 

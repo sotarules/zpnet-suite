@@ -46,6 +46,8 @@ PPS_GPIO_LINE = 18
 # Local state (process lifetime)
 # ---------------------------------------------------------------------
 
+_pi_pps_count: int = 0
+
 # Latest Pi-side PPS capture
 _last_pi_pps: Optional[Dict[str, Any]] = None
 
@@ -129,9 +131,11 @@ def _persist_timebase(tb: Dict[str, Any]) -> None:
                     teensy_rtc1_ns,
                     teensy_rtc2_ns,
                     pi_cycles,
-                    pi_ns
+                    pi_ns,
+                    teensy_pps_count,
+                    pi_pps_count                    
                 )
-                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                 """,
                 (
                     tb["campaign"],
@@ -143,6 +147,8 @@ def _persist_timebase(tb: Dict[str, Any]) -> None:
                     tb.get("teensy_rtc2_ns"),
                     tb["pi_cycles"],
                     tb["pi_ns"],
+                    tb.get("teensy_pps_count"),
+                    tb.get("pi_pps_count"),
                 ),
             )
     except Exception:
@@ -153,6 +159,7 @@ def _pps_listener() -> None:
     """
     Listen for PPS rising edge and capture Pi clocks immediately.
     """
+    global _pi_pps_count
     global _last_pi_pps
 
     chip = gpiod.Chip(GPIO_CHIP)
@@ -172,6 +179,7 @@ def _pps_listener() -> None:
         request.wait_edge_events()
 
         for event in request.read_edge_events():
+
             # Kernel timestamp of the PPS edge (best possible truth)
             pps_kernel_ns = event.timestamp_ns
 
@@ -186,7 +194,10 @@ def _pps_listener() -> None:
                     "pps_kernel_ns": pps_kernel_ns,
                     "pi_cycles": pi_cycles,
                     "pi_ns": pi_ns,
+                    "pi_pps_count": _pi_pps_count,
                 }
+
+            _pi_pps_count += 1
 
 # ---------------------------------------------------------------------
 # Teensy fragment handler
@@ -243,6 +254,10 @@ def _try_complete_timebase() -> None:
         # Pi clocks
         "pi_cycles": pi_pps["pi_cycles"],
         "pi_ns": pi_pps["pi_ns"],
+
+        # Counters (for sanity checking)
+        "teensy_pps_count": frag.get("teensy_pps_count"),
+        "pi_pps_count": pi_pps["pi_pps_count"],
     }
 
     # Publish sacred tuple
@@ -260,6 +275,9 @@ def cmd_start(args: Optional[dict]) -> dict:
     """
     Start a new campaign.
     """
+    global _pi_pps_count
+    _pi_pps_count = 0
+
     campaign = args.get("campaign")
 
     with open_db() as conn:

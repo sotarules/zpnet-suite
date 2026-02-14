@@ -120,11 +120,7 @@ def log_pubsub(payload: Dict[str, Any]) -> None:
     if pubsub_log_fh:
         topic = payload["topic"]
         payload_string = payload_to_json_str(payload)
-
-        padding = max(0, 25 - len(topic))
-        line = f"{topic}{' ' * padding}{payload_string}\n"
-
-        pubsub_log_fh.write(line)
+        pubsub_log_fh.write(f"{topic} {payload_string}\n" )
 
 
 # ---------------------------------------------------------------------
