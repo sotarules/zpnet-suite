@@ -241,13 +241,12 @@ static Payload cmd_transport_info(const Payload& /*args*/) {
   Payload p;
 
   // ==========================================================
-  // TX — Arena / Queue Health
+  // TX — Budget / Queue Health
   // ==========================================================
 
-  p.add("tx_arena_size",        info.tx_arena_size);
-  p.add("tx_arena_used",        info.tx_arena_used);
-  p.add("tx_arena_high_water",  info.tx_arena_high_water);
-  p.add("tx_arena_alloc_fail",  info.tx_arena_alloc_fail);
+  p.add("tx_budget_max",        info.tx_budget_max);
+  p.add("tx_budget_used",       info.tx_budget_used);
+  p.add("tx_budget_high_water", info.tx_budget_high_water);
 
   p.add("tx_job_count",         info.tx_job_count);
   p.add("tx_job_high_water",    info.tx_job_high_water);
@@ -258,14 +257,14 @@ static Payload cmd_transport_info(const Payload& /*args*/) {
   p.add("tx_bytes_enqueued",    info.tx_bytes_enqueued);
   p.add("tx_bytes_sent",        info.tx_bytes_sent);
 
-  p.add("tx_rr_drop_count",     info.tx_rr_drop_count);
+  // ==========================================================
+  // TX — Failure counters
+  // ==========================================================
 
-  p.add("tx_gap_start",          info.tx_gap_start);
-  p.add("tx_arena_gap_skips",   info.tx_arena_gap_skips);
-  p.add("tx_arena_gap_bytes_tot",   info.tx_arena_gap_bytes_tot);
-  p.add("tx_arena_gap_bytes_max",   info.tx_arena_gap_bytes_max);
-  p.add("tx_debug_last_tail_at_gap_check",   info.tx_debug_last_tail_at_gap_check);
-  p.add("tx_debug_tail_before_free ",   info.tx_debug_tail_before_free );
+  p.add("tx_alloc_fail",        info.tx_alloc_fail);
+  p.add("tx_budget_fail",       info.tx_budget_fail);
+  p.add("tx_queue_full",        info.tx_queue_full);
+  p.add("tx_rr_drop_count",     info.tx_rr_drop_count);
 
   // ==========================================================
   // RX — Raw ingress

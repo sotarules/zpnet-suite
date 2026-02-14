@@ -1,17 +1,23 @@
 // transport.cpp — ZPNet Transport (Teensy)
-// ---------------------------------------
+// -----------------------------------------
 //
-// TX Architecture (REVISED):
-//   • transport_send() no longer writes to HID/Serial.
-//   • It clones the payload and enqueues it into a TX arena.
-//   • A single TIMEPOP-driven pump function despools jobs.
+// TX Architecture:
+//   • transport_send() serializes, heap-allocates, and enqueues.
+//   • A single TIMEPOP-driven pump performs physical transmission.
 //   • Only the pump ever touches RawHID / Serial.
-//   • Interleave is now structurally impossible.
+//   • Interleave is structurally impossible.
+//   • Each job owns its own heap allocation — no ring, no gap.
 //
 // RX Architecture (UNCHANGED):
 //   • Length-authoritative framing
 //   • <STX=n> JSON <ETX>
 //   • Hard reset on corruption
+//
+// Memory model:
+//   • TX memory is bounded by TX_BUDGET_MAX (soft cap).
+//   • Each message is exactly the size it needs to be.
+//   • No geometric fragmentation. No dead space. No wrap logic.
+//   • Failure mode is simple: malloc succeeds or it doesn't.
 //
 // This file is intentionally verbose and explicit.
 // Determinism > cleverness.
@@ -34,10 +40,13 @@
 static constexpr size_t TRANSPORT_BLOCK_SIZE = 64;
 static constexpr size_t RX_BUF_MAX           = 2048;
 
-// TX arena size (bounded, deterministic memory)
-// Adjust if needed. 12 KB is safe on Teensy 4.x.
-static constexpr size_t TX_ARENA_SIZE = 48 * 1024;
-static constexpr size_t TX_JOB_MAX    = 64;   // max queued messages
+// TX job queue depth
+static constexpr size_t TX_JOB_MAX = 64;
+
+// TX memory budget (soft cap, bytes)
+// Replaces the fixed arena. Enforces bounded memory usage
+// without imposing geometric constraints.
+static constexpr size_t TX_BUDGET_MAX = 48 * 1024;
 
 static constexpr char   STX_SEQ[] = "<STX=";
 static constexpr size_t STX_LEN   = 5;
@@ -46,69 +55,56 @@ static constexpr char   ETX_SEQ[] = "<ETX>";
 static constexpr size_t ETX_LEN   = 5;
 
 // =============================================================
-// TX Arena (FIFO, zero-fragmentation)
+// TX Job Queue
 // =============================================================
 //
-// The arena behaves like a circular buffer.
-// Allocation and free must occur in FIFO order.
+// Each job owns a heap-allocated buffer containing a fully
+// framed message (STX + JSON + ETX). The pump sends from
+// this buffer and frees it on completion.
 //
-// Because TX jobs are strictly FIFO,
-// fragmentation is impossible.
+// The job descriptors form a simple ring for FIFO ordering.
+// The memory management is trivial: malloc on enqueue,
+// free on completion.
 //
-
-static uint8_t tx_arena[TX_ARENA_SIZE];
-
-static size_t  tx_head = 0;  // next write position
-static size_t  tx_tail = 0;  // next free position
-static size_t  tx_used = 0;
-
-static size_t  tx_arena_high_water = 0;
-
-// Allocation failure counter
-static volatile uint32_t tx_arena_alloc_fail = 0;
-
-// =============================================================
-// TX Job Queue (small descriptor ring)
-// =============================================================
 
 struct tx_job_t {
   uint8_t  traffic;
-  size_t   start;     // offset into arena
-  size_t   length;    // total bytes
-  size_t   sent;      // bytes already sent
+  uint8_t* data;       // heap-allocated, owned by this job
+  size_t   length;     // total bytes in data[]
+  size_t   sent;       // bytes already transmitted
 };
 
 static tx_job_t tx_jobs[TX_JOB_MAX];
 
-static size_t tx_job_head = 0;
-static size_t tx_job_tail = 0;
+static size_t tx_job_head  = 0;
+static size_t tx_job_tail  = 0;
 static size_t tx_job_count = 0;
 
+// =============================================================
+// TX Counters & Budget Tracking
+// =============================================================
 
-static size_t tx_job_high_water = 0;
+// Memory budget (current outstanding bytes across all jobs)
+static size_t tx_budget_used = 0;
 
-static volatile uint32_t tx_jobs_enqueued = 0;
-static volatile uint32_t tx_jobs_sent     = 0;
+// High-water marks
+static size_t tx_budget_high_water = 0;
+static size_t tx_job_high_water    = 0;
+
+// Lifetime counters (monotonic)
+static volatile uint32_t tx_jobs_enqueued  = 0;
+static volatile uint32_t tx_jobs_sent      = 0;
 static volatile uint32_t tx_bytes_enqueued = 0;
 static volatile uint32_t tx_bytes_sent     = 0;
 
-static volatile uint32_t tx_rr_drop_count  = 0;
+// Failure counters
+static volatile uint32_t tx_alloc_fail     = 0;  // malloc returned null
+static volatile uint32_t tx_budget_fail    = 0;  // budget cap exceeded
+static volatile uint32_t tx_queue_full     = 0;  // job ring full
+static volatile uint32_t tx_rr_drop_count  = 0;  // RR messages dropped (any reason)
 
 // =============================================================
-// Arena state (additions)
-// =============================================================
-
-static volatile uint32_t tx_arena_gap_skips     = 0;  // gap-skip events
-static volatile uint32_t tx_arena_gap_bytes_tot = 0;  // cumulative wasted bytes
-static volatile uint32_t tx_arena_gap_bytes_max = 0;  // largest single gap
-
-static size_t tx_gap_start = TX_ARENA_SIZE;           // "no gap" sentinel
-
-static volatile uint32_t tx_debug_last_tail_at_gap_check = 0; // debug
-static volatile size_t tx_debug_tail_before_free = 0; // debug
-
-// =============================================================
-// RX State (unchanged)
+// RX State
 // =============================================================
 
 static transport_receive_cb_t recv_cb[256] = { nullptr };
@@ -119,16 +115,16 @@ static size_t  rx_len = 0;
 static bool    rx_have_traffic = false;
 static uint8_t rx_traffic      = 0;
 
-// RX counters (unchanged)
-static volatile uint32_t rx_blocks_total        = 0;
-static volatile uint32_t rx_bytes_total         = 0;
-static volatile uint32_t rx_frames_complete     = 0;
-static volatile uint32_t rx_frames_dispatched   = 0;
-static volatile uint32_t rx_reset_hard_count    = 0;
-static volatile uint32_t rx_bad_stx_count       = 0;
-static volatile uint32_t rx_bad_etx_count       = 0;
-static volatile uint32_t rx_len_overflow_count  = 0;
-static volatile uint32_t rx_overlap_count       = 0;
+// RX counters
+static volatile uint32_t rx_blocks_total             = 0;
+static volatile uint32_t rx_bytes_total              = 0;
+static volatile uint32_t rx_frames_complete          = 0;
+static volatile uint32_t rx_frames_dispatched        = 0;
+static volatile uint32_t rx_reset_hard_count         = 0;
+static volatile uint32_t rx_bad_stx_count            = 0;
+static volatile uint32_t rx_bad_etx_count            = 0;
+static volatile uint32_t rx_len_overflow_count       = 0;
+static volatile uint32_t rx_overlap_count            = 0;
 static volatile uint32_t rx_expected_traffic_missing = 0;
 
 // =============================================================
@@ -153,130 +149,7 @@ static const char* BUILD_FINGERPRINT = "__FP__ZPNET_SERIAL__";
 #endif
 
 // =============================================================
-// Arena Allocation (FIFO ring, with tail-gap skip)
-// =============================================================
-//
-// When a message won't fit in the contiguous tail space but
-// WOULD fit if we wrapped to offset 0, we skip the unusable
-// tail bytes ("dead space") and allocate from the beginning.
-//
-// The dead space is accounted for in tx_used so that the
-// arena's free-space bookkeeping remains correct. The dead
-// bytes are reclaimed when tx_arena_free() advances tx_tail
-// past them.
-//
-// Invariant: at most one outstanding gap exists at any time.
-// This is guaranteed because gap creation requires head >= tail,
-// and after wrapping head to 0 we enter head < tail until the
-// tail catches up.
-//
-
-static bool tx_arena_alloc(size_t len, size_t* out_start) {
-
-  // Reject obviously impossible requests
-  if (len == 0 || len > TX_ARENA_SIZE) {
-    tx_arena_alloc_fail++;
-    return false;
-  }
-
-  // Not enough total free space regardless of layout
-  if (len > TX_ARENA_SIZE - tx_used) {
-    tx_arena_alloc_fail++;
-    return false;
-  }
-
-  // Case 1: head >= tail (free space is at end + beginning)
-  if (tx_head >= tx_tail) {
-
-    size_t space_end = TX_ARENA_SIZE - tx_head;
-
-    if (len <= space_end) {
-      // Fits at the end — simple case
-      *out_start = tx_head;
-      tx_head = (tx_head + len) % TX_ARENA_SIZE;
-    } else {
-      // Won't fit at end. Skip the tail gap and wrap to 0.
-
-      size_t dead = space_end;
-
-      // After wasting the gap, is there still room at the front?
-      if (len > TX_ARENA_SIZE - tx_used - dead) {
-        tx_arena_alloc_fail++;
-        return false;
-      }
-
-      // Record where the gap begins
-      tx_gap_start = tx_head;
-
-      // Account for dead space
-      tx_used += dead;
-      if (tx_used > tx_arena_high_water)
-        tx_arena_high_water = tx_used;
-
-      // Gap-skip telemetry
-      tx_arena_gap_skips++;
-      tx_arena_gap_bytes_tot += dead;
-      if (dead > tx_arena_gap_bytes_max)
-        tx_arena_gap_bytes_max = dead;
-
-      // Allocate from offset 0
-      *out_start = 0;
-      tx_head = len;
-    }
-
-  } else {
-    // Case 2: head < tail (free space is contiguous between them)
-    size_t space_mid = tx_tail - tx_head;
-
-    if (len <= space_mid) {
-      *out_start = tx_head;
-      tx_head += len;
-    } else {
-      tx_arena_alloc_fail++;
-      return false;
-    }
-  }
-
-  tx_used += len;
-  if (tx_used > tx_arena_high_water)
-    tx_arena_high_water = tx_used;
-
-  return true;
-}
-// =============================================================
-// Arena Free (FIFO, with gap reclamation)
-// =============================================================
-//
-// Jobs are freed in strict FIFO order. When the tail reaches
-// the dead gap at the end of the arena, the gap bytes are
-// reclaimed and the tail wraps to 0.
-//
-
-static void tx_arena_free(size_t len) {
-
-  if (tx_gap_start != TX_ARENA_SIZE) {
-    tx_debug_tail_before_free = tx_tail;
-  }
-
-  tx_tail += len;
-  tx_used -= len;
-
-  // If the tail has entered the dead gap region, skip to 0
-  if (tx_gap_start != TX_ARENA_SIZE && tx_tail >= tx_gap_start) {
-    size_t dead = TX_ARENA_SIZE - tx_gap_start;
-    tx_used -= dead;
-    tx_tail = 0;
-    tx_gap_start = TX_ARENA_SIZE;
-  }
-
-  // Normal wrap (no gap case)
-  if (tx_tail >= TX_ARENA_SIZE) {
-    tx_tail -= TX_ARENA_SIZE;
-  }
-}
-
-// =============================================================
-// Physical Send (unchanged semantics)
+// Physical Send
 // =============================================================
 
 #if defined(ZPNET_TRANSPORT_SELECTED_HID)
@@ -296,7 +169,7 @@ static inline bool serial_send_bytes(const uint8_t* buf, size_t len) {
 #endif
 
 // =============================================================
-// Registration (shared)
+// Registration
 // =============================================================
 
 void transport_register_receive_callback(
@@ -326,14 +199,14 @@ static void transport_tx_pump(timepop_ctx_t*, void*) {
     // First block carries traffic byte
     block[0] = job.traffic;
     size_t chunk = min(remaining, TRANSPORT_BLOCK_SIZE - 1);
-    memcpy(block + 1, tx_arena + job.start, chunk);
+    memcpy(block + 1, job.data, chunk);
     memset(block + 1 + chunk, 0, TRANSPORT_BLOCK_SIZE - (1 + chunk));
     hid_send_block(block);
     job.sent += chunk;
     tx_bytes_sent += chunk;
   } else {
     size_t chunk = min(remaining, TRANSPORT_BLOCK_SIZE);
-    memcpy(block, tx_arena + job.start + job.sent, chunk);
+    memcpy(block, job.data + job.sent, chunk);
     memset(block + chunk, 0, TRANSPORT_BLOCK_SIZE - chunk);
     hid_send_block(block);
     job.sent += chunk;
@@ -348,8 +221,8 @@ static void transport_tx_pump(timepop_ctx_t*, void*) {
   }
 
   size_t remaining = job.length - job.sent;
-  size_t chunk = remaining;  // serial sends whole remaining
-  serial_send_bytes(tx_arena + job.start + job.sent, chunk);
+  size_t chunk = remaining;
+  serial_send_bytes(job.data + job.sent, chunk);
   job.sent += chunk;
   tx_bytes_sent += chunk;
 
@@ -357,7 +230,15 @@ static void transport_tx_pump(timepop_ctx_t*, void*) {
 
   // Job complete?
   if (job.sent >= job.length) {
-    tx_arena_free(job.length);
+
+    // Release heap allocation
+    free(job.data);
+    job.data = nullptr;
+
+    // Release budget
+    tx_budget_used -= job.length;
+
+    // Advance queue
     tx_job_tail = (tx_job_tail + 1) % TX_JOB_MAX;
     tx_job_count--;
     tx_jobs_sent++;
@@ -365,63 +246,110 @@ static void transport_tx_pump(timepop_ctx_t*, void*) {
 }
 
 // =============================================================
-// transport_send() — now enqueue only
+// transport_send() — serialize, allocate, enqueue
 // =============================================================
 
 void transport_send(uint8_t traffic, const Payload& payload) {
 
-    char local_buf[2048];
-    size_t json_len = payload.write_json(local_buf, sizeof(local_buf));
+  // --------------------------------------------------------
+  // 1. Serialize to stack buffer
+  // --------------------------------------------------------
 
-    if (json_len == 0)
-        return;
+  char local_buf[2048];
+  size_t json_len = payload.write_json(local_buf, sizeof(local_buf));
 
-    char header[32];
-    int header_len = snprintf(header, sizeof(header),
-                              "<STX=%u>", (unsigned)json_len);
-    if (header_len <= 0)
-        return;
+  if (json_len == 0)
+    return;
 
-    size_t total_len = header_len + json_len + ETX_LEN;
+  // --------------------------------------------------------
+  // 2. Compute framed message size
+  // --------------------------------------------------------
 
-    size_t start;
-    if (!tx_arena_alloc(total_len, &start)) {
-        if (traffic == TRAFFIC_REQUEST_RESPONSE) {
-            tx_rr_drop_count++;
-        }
-        return;
+  char header[32];
+  int header_len = snprintf(header, sizeof(header),
+                            "<STX=%u>", (unsigned)json_len);
+  if (header_len <= 0)
+    return;
+
+  size_t total_len = (size_t)header_len + json_len + ETX_LEN;
+
+  // --------------------------------------------------------
+  // 3. Budget check (soft cap)
+  // --------------------------------------------------------
+
+  if (tx_budget_used + total_len > TX_BUDGET_MAX) {
+    tx_budget_fail++;
+    if (traffic == TRAFFIC_REQUEST_RESPONSE) {
+      tx_rr_drop_count++;
     }
+    return;
+  }
 
-    memcpy(tx_arena + start, header, header_len);
-    memcpy(tx_arena + start + header_len, local_buf, json_len);
-    memcpy(tx_arena + start + header_len + json_len, ETX_SEQ, ETX_LEN);
+  // --------------------------------------------------------
+  // 4. Job queue check
+  // --------------------------------------------------------
 
-    if (tx_job_count >= TX_JOB_MAX) {
-        tx_arena_free(total_len);
-        if (traffic == TRAFFIC_REQUEST_RESPONSE) {
-            tx_rr_drop_count++;
-        }
-        return;
+  if (tx_job_count >= TX_JOB_MAX) {
+    tx_queue_full++;
+    if (traffic == TRAFFIC_REQUEST_RESPONSE) {
+      tx_rr_drop_count++;
     }
+    return;
+  }
 
-    tx_jobs[tx_job_head] = {
-        traffic,
-        start,
-        total_len,
-        0
-    };
+  // --------------------------------------------------------
+  // 5. Heap allocate
+  // --------------------------------------------------------
 
-    tx_job_head = (tx_job_head + 1) % TX_JOB_MAX;
-    tx_job_count++;
-    tx_jobs_enqueued++;
-    tx_bytes_enqueued += total_len;
+  uint8_t* data = (uint8_t*)malloc(total_len);
 
-    if (tx_job_count > tx_job_high_water)
-        tx_job_high_water = tx_job_count;
+  if (!data) {
+    tx_alloc_fail++;
+    if (traffic == TRAFFIC_REQUEST_RESPONSE) {
+      tx_rr_drop_count++;
+    }
+    return;
+  }
+
+  // --------------------------------------------------------
+  // 6. Assemble framed message
+  // --------------------------------------------------------
+
+  memcpy(data, header, header_len);
+  memcpy(data + header_len, local_buf, json_len);
+  memcpy(data + header_len + json_len, ETX_SEQ, ETX_LEN);
+
+  // --------------------------------------------------------
+  // 7. Enqueue
+  // --------------------------------------------------------
+
+  tx_jobs[tx_job_head] = {
+    traffic,
+    data,
+    total_len,
+    0
+  };
+
+  tx_job_head = (tx_job_head + 1) % TX_JOB_MAX;
+  tx_job_count++;
+  tx_jobs_enqueued++;
+  tx_bytes_enqueued += total_len;
+
+  // --------------------------------------------------------
+  // 8. Budget + high-water tracking
+  // --------------------------------------------------------
+
+  tx_budget_used += total_len;
+
+  if (tx_budget_used > tx_budget_high_water)
+    tx_budget_high_water = tx_budget_used;
+
+  if (tx_job_count > tx_job_high_water)
+    tx_job_high_water = tx_job_count;
 }
 
 // =============================================================
-// RX (unchanged from your version)
+// RX — unchanged
 // =============================================================
 
 static void rx_reset_hard() {
@@ -562,13 +490,11 @@ static void rx_serial_tick() {
       }
       rx_traffic = b;
       rx_have_traffic = true;
-      rx_len = 0;  // explicit reset: beginning of a new message
+      rx_len = 0;
       continue;
     }
 
-    // Optional overlap signal:
-    // JSON is ASCII; a traffic byte (0xD0..0xD2) here strongly suggests
-    // a new frame arrived before the previous completed.
+    // Overlap signal
     if (is_valid_traffic(b)) {
       rx_overlap_count++;
     }
@@ -603,43 +529,44 @@ static void transport_rx_tick(timepop_ctx_t*, void*) {
 }
 
 // =============================================================
-// transport_get_info() — expanded
+// transport_get_info()
 // =============================================================
 
 void transport_get_info(transport_info_t* out) {
 
   if (!out) return;
 
-  out->tx_arena_size       = TX_ARENA_SIZE;
-  out->tx_arena_used       = tx_used;
-  out->tx_arena_high_water = tx_arena_high_water;
-  out->tx_arena_alloc_fail = tx_arena_alloc_fail;
+  // TX — Budget / Queue health
+  out->tx_budget_max        = TX_BUDGET_MAX;
+  out->tx_budget_used       = tx_budget_used;
+  out->tx_budget_high_water = tx_budget_high_water;
 
-  out->tx_job_count        = tx_job_count;
-  out->tx_job_high_water   = tx_job_high_water;
-  out->tx_jobs_enqueued    = tx_jobs_enqueued;
-  out->tx_jobs_sent        = tx_jobs_sent;
-  out->tx_bytes_enqueued   = tx_bytes_enqueued;
-  out->tx_bytes_sent       = tx_bytes_sent;
-  out->tx_rr_drop_count    = tx_rr_drop_count;
+  out->tx_job_count         = tx_job_count;
+  out->tx_job_high_water    = tx_job_high_water;
 
-  out->tx_gap_start         = tx_gap_start;
-  out->tx_arena_gap_skips  = tx_arena_gap_skips;
-  out->tx_arena_gap_bytes_tot = tx_arena_gap_bytes_tot;
-  out->tx_arena_gap_bytes_max = tx_arena_gap_bytes_max;
-  out->tx_debug_last_tail_at_gap_check = tx_debug_last_tail_at_gap_check;
-  out->tx_debug_tail_before_free  = tx_debug_tail_before_free ;
+  out->tx_jobs_enqueued     = tx_jobs_enqueued;
+  out->tx_jobs_sent         = tx_jobs_sent;
 
-  out->rx_blocks_total     = rx_blocks_total;
-  out->rx_bytes_total      = rx_bytes_total;
-  out->rx_frames_complete  = rx_frames_complete;
-  out->rx_frames_dispatched = rx_frames_dispatched;
-  out->rx_reset_hard       = rx_reset_hard_count;
-  out->rx_bad_stx          = rx_bad_stx_count;
-  out->rx_bad_etx          = rx_bad_etx_count;
-  out->rx_len_overflow     = rx_len_overflow_count;
-  out->rx_overlap          = rx_overlap_count;
-  out->rx_expected_traffic_missing = rx_expected_traffic_missing;
+  out->tx_bytes_enqueued    = tx_bytes_enqueued;
+  out->tx_bytes_sent        = tx_bytes_sent;
+
+  // TX — Failure counters
+  out->tx_alloc_fail        = tx_alloc_fail;
+  out->tx_budget_fail       = tx_budget_fail;
+  out->tx_queue_full        = tx_queue_full;
+  out->tx_rr_drop_count     = tx_rr_drop_count;
+
+  // RX
+  out->rx_blocks_total              = rx_blocks_total;
+  out->rx_bytes_total               = rx_bytes_total;
+  out->rx_frames_complete           = rx_frames_complete;
+  out->rx_frames_dispatched         = rx_frames_dispatched;
+  out->rx_reset_hard                = rx_reset_hard_count;
+  out->rx_bad_stx                   = rx_bad_stx_count;
+  out->rx_bad_etx                   = rx_bad_etx_count;
+  out->rx_len_overflow              = rx_len_overflow_count;
+  out->rx_overlap                   = rx_overlap_count;
+  out->rx_expected_traffic_missing  = rx_expected_traffic_missing;
 }
 
 // =============================================================
