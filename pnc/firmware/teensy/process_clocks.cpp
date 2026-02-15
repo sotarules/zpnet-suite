@@ -7,10 +7,24 @@
 // • Boots fully silent
 // • Does NOT track PPS unless a campaign is active or pending
 // • Nanosecond clocks are ZERO unless a campaign is STARTED
-// • DWT cycle counter is always live (capability, not narration)
+// • All three counters are always live (capability, not narration)
 //
 // START / STOP / RECOVER are *requests*.
 // All authoritative state transitions occur on the PPS boundary.
+//
+// Clock domains:
+//
+//   DWT    — ARM Cortex-M7 cycle counter, 600 MHz, internal
+//   GNSS   — GF-8802 10 MHz VCLOCK, external via GPT2 pin 14
+//   OCXO   — AOCJY1-A 10 MHz oven oscillator, external via GPT1 pin 25
+//
+// All three counters are structurally identical:
+//   • Hardware register counts autonomously
+//   • Software periodically latches and extends to 64-bit
+//   • No prescaler, no ISR, no interrupts
+//
+// At 10 MHz the GPT counters wrap every ~429 seconds (~7 minutes).
+// The 1-second PPS publish guarantees we read them well before wrap.
 //
 // ============================================================================
 
@@ -54,7 +68,7 @@ static uint64_t recover_ocxo_ns    = 0;
 static uint64_t campaign_seconds = 0;
 
 // ============================================================================
-// DWT (CPU cycle counter)
+// DWT (CPU cycle counter — 600 MHz internal)
 // ============================================================================
 
 #define DEMCR               (*(volatile uint32_t *)0xE000EDFC)
@@ -86,36 +100,24 @@ uint64_t clocks_dwt_ns_now(void) {
 }
 
 // ============================================================================
-// GNSS / OCXO PRESCALED DOMAINS (10 kHz)
+// GNSS VCLOCK (10 MHz external via GPT2 — raw, polled)
 // ============================================================================
+//
+// GPT2 counts the GNSS 10 MHz VCLOCK directly with no prescaler.
+// The 32-bit counter is extended to 64-bit by periodic latching,
+// structurally identical to the DWT and OCXO counters.
+//
+// Pin 14 = AD_B1_02, ALT8 = GPT2_CLK
+//
 
-#define GPT_PRESCALE_DIVIDER   1000u
-#define GPT_PRESCALE_VALUE     (GPT_PRESCALE_DIVIDER - 1)
+static uint64_t gnss_ticks_64 = 0;
+static uint32_t gnss_last_32  = 0;
 
-static volatile uint64_t gnss_ticks_10khz = 0;
-static volatile uint64_t ocxo_ticks_10khz = 0;
-
-static volatile uint32_t gnss_dwt_baseline = 0;
-static volatile uint32_t ocxo_dwt_baseline = 0;
-
-static bool gpt1_armed = false;
 static bool gpt2_armed = false;
-
-// -----------------------------------------------------------------------------
-// GPT clock gating
-// -----------------------------------------------------------------------------
-
-static inline void enable_gpt1(void) {
-  CCM_CCGR1 |= CCM_CCGR1_GPT1_BUS(CCM_CCGR_ON);
-}
 
 static inline void enable_gpt2(void) {
   CCM_CCGR0 |= CCM_CCGR0_GPT2_BUS(CCM_CCGR_ON);
 }
-
-// -----------------------------------------------------------------------------
-// GNSS VCLOCK → GPT2
-// -----------------------------------------------------------------------------
 
 static void arm_gpt2_external(void) {
   if (gpt2_armed) return;
@@ -130,55 +132,76 @@ static void arm_gpt2_external(void) {
 
   GPT2_CR = 0;
   GPT2_SR = 0x3F;
-  GPT2_PR = GPT_PRESCALE_VALUE;
-  GPT2_CR = GPT_CR_CLKSRC(3) | GPT_CR_FRR;
-
-  GPT2_OCR1 = GPT2_CNT + 1;
-  GPT2_IR |= GPT_IR_OF1IE;
-
-  attachInterruptVector(IRQ_GPT2, [] {
-    GPT2_SR = GPT_SR_OF1;
-    GPT2_OCR1 += 1;
-    if (campaign_state == clocks_campaign_state_t::STARTED) {
-      gnss_ticks_10khz++;
-      gnss_dwt_baseline = DWT_CYCCNT;
-    }
-  });
-
-  NVIC_ENABLE_IRQ(IRQ_GPT2);
+  GPT2_PR = 0;                                // No prescaler — raw 10 MHz
+  GPT2_CR = GPT_CR_CLKSRC(3) | GPT_CR_FRR;   // External clock, free-run
   GPT2_CR |= GPT_CR_EN;
+
+  gnss_last_32 = GPT2_CNT;
   gpt2_armed = true;
 }
 
-// -----------------------------------------------------------------------------
-// OCXO → GPT1
-// -----------------------------------------------------------------------------
+uint64_t clocks_gnss_ticks_now(void) {
+  uint32_t now = GPT2_CNT;
+  gnss_ticks_64 += (uint32_t)(now - gnss_last_32);
+  gnss_last_32 = now;
+  return gnss_ticks_64;
+}
 
-static void arm_gpt1_internal(void) {
+uint64_t clocks_gnss_ns_now(void) {
+  if (campaign_state != clocks_campaign_state_t::STARTED) return 0;
+  // 10 MHz → 100 ns per tick
+  return clocks_gnss_ticks_now() * 100ull;
+}
+
+// ============================================================================
+// OCXO (10 MHz external via GPT1 — raw, polled)
+// ============================================================================
+//
+// GPT1 counts the OCXO 10 MHz output directly with no prescaler.
+// The 32-bit counter is extended to 64-bit by periodic latching,
+// structurally identical to the DWT and GNSS counters.
+//
+// Pin 25 = AD_B0_13, ALT1 = GPT1_CLK
+//
+
+static uint64_t ocxo_ticks_64 = 0;
+static uint32_t ocxo_last_32  = 0;
+
+static bool gpt1_armed = false;
+
+static inline void enable_gpt1(void) {
+  CCM_CCGR1 |= CCM_CCGR1_GPT1_BUS(CCM_CCGR_ON);
+}
+
+static void arm_gpt1_external(void) {
   if (gpt1_armed) return;
 
   enable_gpt1();
 
+  // Pin 25 = AD_B0_13, ALT1 = GPT1_CLK
+  *(portConfigRegister(25)) = 1;
+
   GPT1_CR = 0;
   GPT1_SR = 0x3F;
-  GPT1_PR = GPT_PRESCALE_VALUE;
-  GPT1_CR = GPT_CR_CLKSRC(1) | GPT_CR_FRR;
-
-  GPT1_OCR1 = GPT1_CNT + 1;
-  GPT1_IR |= GPT_IR_OF1IE;
-
-  attachInterruptVector(IRQ_GPT1, [] {
-    GPT1_SR = GPT_SR_OF1;
-    GPT1_OCR1 += 1;
-    if (campaign_state == clocks_campaign_state_t::STARTED) {
-      ocxo_ticks_10khz++;
-      ocxo_dwt_baseline = DWT_CYCCNT;
-    }
-  });
-
-  NVIC_ENABLE_IRQ(IRQ_GPT1);
+  GPT1_PR = 0;                                // No prescaler — raw 10 MHz
+  GPT1_CR = GPT_CR_CLKSRC(3) | GPT_CR_FRR;   // External clock, free-run
   GPT1_CR |= GPT_CR_EN;
+
+  ocxo_last_32 = GPT1_CNT;
   gpt1_armed = true;
+}
+
+uint64_t clocks_ocxo_ticks_now(void) {
+  uint32_t now = GPT1_CNT;
+  ocxo_ticks_64 += (uint32_t)(now - ocxo_last_32);
+  ocxo_last_32 = now;
+  return ocxo_ticks_64;
+}
+
+uint64_t clocks_ocxo_ns_now(void) {
+  if (campaign_state != clocks_campaign_state_t::STARTED) return 0;
+  // 10 MHz → 100 ns per tick
+  return clocks_ocxo_ticks_now() * 100ull;
 }
 
 // ============================================================================
@@ -189,35 +212,13 @@ static void clocks_zero_all(void) {
   dwt_cycles_64 = 0;
   dwt_last_32   = DWT_CYCCNT;
 
-  gnss_ticks_10khz = 0;
-  ocxo_ticks_10khz = 0;
+  gnss_ticks_64 = 0;
+  gnss_last_32  = GPT2_CNT;
 
-  gnss_dwt_baseline = DWT_CYCCNT;
-  ocxo_dwt_baseline = DWT_CYCCNT;
+  ocxo_ticks_64 = 0;
+  ocxo_last_32  = GPT1_CNT;
 
   campaign_seconds = 0;
-}
-
-// ============================================================================
-// Synthetic nanoseconds (campaign-scoped)
-// ============================================================================
-
-static constexpr uint64_t NS_PER_10KHZ = 100000ULL;
-
-uint64_t clocks_gnss_ns_now(void) {
-  if (campaign_state != clocks_campaign_state_t::STARTED) return 0;
-  uint64_t base = gnss_ticks_10khz * NS_PER_10KHZ;
-  uint32_t delta = DWT_CYCCNT - gnss_dwt_baseline;
-  uint64_t interp = (delta * 5ull) / 3ull;
-  return (interp > NS_PER_10KHZ) ? base + NS_PER_10KHZ : base + interp;
-}
-
-uint64_t clocks_ocxo_ns_now(void) {
-  if (campaign_state != clocks_campaign_state_t::STARTED) return 0;
-  uint64_t base = ocxo_ticks_10khz * NS_PER_10KHZ;
-  uint32_t delta = DWT_CYCCNT - ocxo_dwt_baseline;
-  uint64_t interp = (delta * 5ull) / 3ull;
-  return (interp > NS_PER_10KHZ) ? base + NS_PER_10KHZ : base + interp;
 }
 
 // ============================================================================
@@ -247,12 +248,12 @@ static void pps_isr(void) {
       }
 
       if (request_recover) {
-        dwt_cycles_64    = recover_dwt_cycles;
-        gnss_ticks_10khz = recover_gnss_ns / NS_PER_10KHZ;
-        ocxo_ticks_10khz = recover_ocxo_ns / NS_PER_10KHZ;
+        dwt_cycles_64 = recover_dwt_cycles;
+        gnss_ticks_64 = recover_gnss_ns / 100ull;   // ns → 10 MHz ticks
+        ocxo_ticks_64 = recover_ocxo_ns / 100ull;   // ns → 10 MHz ticks
 
-        gnss_dwt_baseline = DWT_CYCCNT;
-        ocxo_dwt_baseline = DWT_CYCCNT;
+        gnss_last_32 = GPT2_CNT;
+        ocxo_last_32 = GPT1_CNT;
 
         request_recover = false;
       }
@@ -467,8 +468,8 @@ void process_clocks_register(void) {
 void process_clocks_init(void) {
 
   dwt_enable();
-  arm_gpt2_external();
-  arm_gpt1_internal();
+  arm_gpt2_external();    // GNSS VCLOCK → GPT2 pin 14, raw 10 MHz, polled
+  arm_gpt1_external();    // OCXO 10 MHz → GPT1 pin 25, raw 10 MHz, polled
 
   pinMode(GNSS_PPS_PIN, INPUT);
   pinMode(GNSS_LOCK_PIN, INPUT);

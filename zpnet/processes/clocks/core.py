@@ -21,6 +21,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
+from datetime import datetime, timezone
 from typing import Dict, Any, Optional
 
 import gpiod
@@ -240,13 +241,17 @@ def _try_complete_timebase() -> None:
 
     gnss_time = _get_gnss_time()
 
+    system_time = datetime.now(timezone.utc).isoformat(timespec='milliseconds')
+
     timebase = {
         "campaign": campaign,
+        "system_time_utc": system_time,
         "gnss_time_utc": gnss_time,
 
         # Teensy clocks
         "teensy_dwt_cycles": frag["dwt_cycles"],
         "teensy_dwt_ns": frag["dwt_ns"],
+        "teensy_gnss_ns": frag["gnss_ns"],
         "teensy_ocxo_ns": frag.get("ocxo_ns"),
         "teensy_rtc1_ns": frag.get("rtc1_ns"),
         "teensy_rtc2_ns": frag.get("rtc2_ns"),

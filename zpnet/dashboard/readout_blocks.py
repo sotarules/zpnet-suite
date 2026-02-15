@@ -139,10 +139,7 @@ def clocks_status_readout() -> Generator[str, None, None]:
     yield f"{'DWT':<8} {c['tau_dwt']:>14.10f} {c['dwt_ppb']:>14.2f}"
 
     # OCXO (optional / diagnostic)
-    # yield f"{'OCXO':<8} {c['tau_ocxo']:>14.10f} {c['ocxo_ppb']:>14.2f}"
-
-
-
+    yield f"{'OCXO':<8} {c['tau_ocxo']:>14.10f} {c['ocxo_ppb']:>14.2f}"
 
 
 # ---------------------------------------------------------------------

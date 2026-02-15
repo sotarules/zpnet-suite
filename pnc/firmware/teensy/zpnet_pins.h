@@ -114,7 +114,7 @@ Teensy Pin    Wire Color    Signal Name        Source / Destination             
 
 4             Green         GNSS_LOCK_IN       GF-8802                              Lock status signal
 
-6             Orange        OCXO_10MHZ_IN      OCXO                                 GPT1 capture (critical)
+25            Orange        OCXO_10MHZ_IN      OCXO                                 GPT1 capture (critical)
 
 -------------------------------------------------------------------------------
 Notes:
