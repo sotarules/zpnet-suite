@@ -22,7 +22,7 @@ import os
 import socket
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Dict, Optional, Set, TextIO
 
 import serial
@@ -54,6 +54,51 @@ def open_gnss_log() -> None:
 def log_gnss(line: str) -> None:
     if gnss_log_fh:
         gnss_log_fh.write(line + "\n")
+
+# ------------------------------------------------------------------
+# Frequency mode names (TPS4 field 2)
+# ------------------------------------------------------------------
+
+FREQ_MODE_NAMES = {
+    0: "WARMUP",
+    1: "PULLIN",
+    2: "COARSE_LOCK",
+    3: "FINE_LOCK",
+    4: "HOLDOVER",
+    5: "OUT_OF_HOLDOVER",
+}
+
+# PPS sync status names (TPS1 field 7)
+PPS_STATUS_NAMES = {
+    0: "RTC",
+    1: "GPS",
+    2: "UTC_USNO",
+    3: "UTC_SU",
+    4: "UTC_EU",
+    5: "UTC_NICT",
+}
+
+# Time status names (TPS1 field 3)
+TIME_STATUS_NAMES = {
+    0: "BEFORE_FIX",
+    1: "LS_UNKNOWN",
+    2: "LS_FIX",
+}
+
+# Position mode names (TPS3 field 2)
+POS_MODE_NAMES = {
+    0: "NAV",
+    1: "SS",
+    2: "CSS",
+    3: "TO",
+}
+
+# TRAIM solution names (TPS3 field 7)
+TRAIM_NAMES = {
+    0: "OK",
+    1: "ALARM",
+    2: "INSUFFICIENT",
+}
 
 # ------------------------------------------------------------------
 # State
@@ -91,9 +136,57 @@ class GnssState:
     speed_knots: float = math.nan
     course_deg: float = math.nan
 
-    # Discipline
+    # Discipline — basic flag (kept for backward compat)
     has_discipline: bool = False
     discipline_mode: str = ""
+
+    # ---------------------------------------------------------------
+    # TPS4 (CRZ) — VCLK Frequency and Control
+    # ---------------------------------------------------------------
+    tps4_freq_mode: int = -1               # 0-5
+    tps4_freq_mode_name: str = ""
+    tps4_phase_skip: int = -1              # 0=auto, 1=execute
+    tps4_alarm: int = 0                    # bitmask
+    tps4_status: int = 0                   # bitmask
+    tps4_pps_timing_error_ns: int = 0      # nsec offset from sync target
+    tps4_freq_error_ppb: int = 0           # VCLK deviation from nominal
+    tps4_learning_time_s: int = 0          # seconds in fine-lock learning
+    tps4_holdover_avail_s: int = 0         # holdover seconds remaining
+
+    # ---------------------------------------------------------------
+    # TPS1 (CRW) — Time and Leap Second
+    # ---------------------------------------------------------------
+    tps1_time_status: int = -1             # 0=before fix, 1=LS unknown, 2=LS fix
+    tps1_time_status_name: str = ""
+    tps1_pps_status: int = -1              # 0=RTC .. 5=UTC(NICT)
+    tps1_pps_status_name: str = ""
+    tps1_clock_drift_ppb: float = math.nan # 26MHz TCXO drift
+    tps1_temperature_c: float = math.nan   # ambient temp * 100 → degrees C
+    tps1_present_ls: int = 0               # current leap second
+    tps1_future_ls: int = 0                # upcoming leap second
+
+    # ---------------------------------------------------------------
+    # TPS2 (CRX) — PPS Information
+    # ---------------------------------------------------------------
+    tps2_pps_on: bool = False
+    tps2_pps_mode: int = -1                # 0-3
+    tps2_pulse_width_ms: int = 0
+    tps2_cable_delay_ns: int = 0
+    tps2_polarity: int = 0                 # 0=rising, 1=falling
+    tps2_estimated_accuracy_ns: int = 9999
+
+    # ---------------------------------------------------------------
+    # TPS3 (CRY) — Position Mode & TRAIM
+    # ---------------------------------------------------------------
+    tps3_pos_mode: int = -1                # 0=NAV,1=SS,2=CSS,3=TO
+    tps3_pos_mode_name: str = ""
+    tps3_pos_diff_m: int = 0               # fixed vs calculated position diff
+    tps3_survey_count: int = 0             # self-survey update count
+    tps3_survey_threshold: int = 0
+    tps3_traim_solution: int = 2           # 0=OK,1=ALARM,2=insufficient
+    tps3_traim_name: str = "INSUFFICIENT"
+    tps3_traim_removed_svs: int = 0
+    tps3_receiver_status: int = 0          # bitmask
 
     # Raw sentences
     last_rmc: str = ""
@@ -102,6 +195,9 @@ class GnssState:
     last_gsa: str = ""
     last_zda: str = ""
     last_crz: str = ""
+    last_crw: str = ""
+    last_crx: str = ""
+    last_cry: str = ""
 
     last_rx_ts: float = 0.0
 
@@ -169,8 +265,13 @@ def recompute_ellipsoid_height() -> None:
     if not math.isnan(GNSS.altitude_m) and not math.isnan(GNSS.geoid_sep_m):
         GNSS.ellipsoid_height_m = GNSS.altitude_m + GNSS.geoid_sep_m
 
+def strip_checksum(field: str) -> str:
+    """Remove *XX checksum suffix from the last field of an NMEA sentence."""
+    idx = field.find("*")
+    return field[:idx] if idx >= 0 else field
+
 # ------------------------------------------------------------------
-# Sentence parsers
+# Sentence parsers — standard NMEA
 # ------------------------------------------------------------------
 
 def parse_rmc(line: str) -> None:
@@ -244,9 +345,95 @@ def parse_gsa(line: str) -> None:
     if parts[2]:
         GNSS.position_type = int(parts[2])
 
-def extract_discipline(line: str) -> None:
-    GNSS.discipline_mode = line.split(",")[1]
+# ------------------------------------------------------------------
+# Sentence parsers — Furuno proprietary TPS sentences
+# ------------------------------------------------------------------
+
+def parse_crz(line: str) -> None:
+    """TPS4 — VCLK Frequency and Control.
+
+    $PERDCRZ,TPS4,<freq_mode>,<phase_skip>,<alarm>,<status>,
+             <pps_timing_error>,<freq_error>,<reserve>,
+             <learning_time>,<available_time>,<reserve>*XX
+    """
+    parts = line.split(",")
+    GNSS.discipline_mode = parts[1]          # "TPS4"
     GNSS.has_discipline = True
+
+    try:
+        GNSS.tps4_freq_mode      = int(parts[2])
+        GNSS.tps4_freq_mode_name = FREQ_MODE_NAMES.get(GNSS.tps4_freq_mode, f"UNKNOWN({GNSS.tps4_freq_mode})")
+        GNSS.tps4_phase_skip     = int(parts[3])
+        GNSS.tps4_alarm          = int(parts[4], 16)
+        GNSS.tps4_status         = int(parts[5], 16)
+        GNSS.tps4_pps_timing_error_ns = int(parts[6])
+        GNSS.tps4_freq_error_ppb = int(parts[7])
+        # parts[8] is reserved
+        GNSS.tps4_learning_time_s = int(parts[9])
+        GNSS.tps4_holdover_avail_s = int(strip_checksum(parts[10]))
+    except (IndexError, ValueError) as e:
+        logging.warning("[parse_crz] failed to parse TPS4: %s — %s", e, line)
+
+def parse_crw(line: str) -> None:
+    """TPS1 — Time and Leap Second.
+
+    $PERDCRW,TPS1,<datetime>,<time_status>,<update_date>,<present_ls>,
+             <future_ls>,<pps_status>,<drift>,<temperature>*XX
+    """
+    parts = line.split(",")
+    try:
+        GNSS.tps1_time_status      = int(parts[3])
+        GNSS.tps1_time_status_name = TIME_STATUS_NAMES.get(GNSS.tps1_time_status, f"UNKNOWN({GNSS.tps1_time_status})")
+        GNSS.tps1_present_ls       = int(parts[5])
+        GNSS.tps1_future_ls        = int(parts[6])
+        GNSS.tps1_pps_status       = int(parts[7])
+        GNSS.tps1_pps_status_name  = PPS_STATUS_NAMES.get(GNSS.tps1_pps_status, f"UNKNOWN({GNSS.tps1_pps_status})")
+        GNSS.tps1_clock_drift_ppb  = float(parts[8])
+        temp_raw = strip_checksum(parts[9])
+        GNSS.tps1_temperature_c    = int(temp_raw) / 100.0
+    except (IndexError, ValueError) as e:
+        logging.warning("[parse_crw] failed to parse TPS1: %s — %s", e, line)
+
+def parse_crx(line: str) -> None:
+    """TPS2 — PPS Information.
+
+    $PERDCRX,TPS2,<pps_out>,<pps_mode>,<period>,<pulse_width>,<cable_delay>,
+             <polarity>,<pps_type>,<est_accuracy>,<r1>,<r2>,<r3>,<r4>*XX
+    """
+    parts = line.split(",")
+    try:
+        GNSS.tps2_pps_on              = parts[2] == "1"
+        GNSS.tps2_pps_mode            = int(parts[3])
+        GNSS.tps2_pulse_width_ms      = int(parts[5])
+        GNSS.tps2_cable_delay_ns      = int(parts[6])
+        GNSS.tps2_polarity            = int(parts[7])
+        GNSS.tps2_estimated_accuracy_ns = int(parts[9])
+    except (IndexError, ValueError) as e:
+        logging.warning("[parse_crx] failed to parse TPS2: %s — %s", e, line)
+
+def parse_cry(line: str) -> None:
+    """TPS3 — Position Mode & TRAIM.
+
+    $PERDCRY,TPS3,<pos_mode>,<pos_diff>,<sigma_thresh>,<time>,<time_thresh>,
+             <traim_solution>,<traim_status>,<removed_svs>,<rx_status>,<reserve>*XX
+    """
+    parts = line.split(",")
+    try:
+        GNSS.tps3_pos_mode      = int(parts[2])
+        GNSS.tps3_pos_mode_name = POS_MODE_NAMES.get(GNSS.tps3_pos_mode, f"UNKNOWN({GNSS.tps3_pos_mode})")
+        GNSS.tps3_pos_diff_m    = int(parts[3])
+        GNSS.tps3_survey_count  = int(parts[5])
+        GNSS.tps3_survey_threshold = int(parts[6])
+        GNSS.tps3_traim_solution = int(parts[7])
+        GNSS.tps3_traim_name    = TRAIM_NAMES.get(GNSS.tps3_traim_solution, f"UNKNOWN({GNSS.tps3_traim_solution})")
+        GNSS.tps3_traim_removed_svs = int(parts[9])
+        rx_str = strip_checksum(parts[10])
+        if rx_str.startswith("0x"):
+            GNSS.tps3_receiver_status = int(rx_str, 16)
+        else:
+            GNSS.tps3_receiver_status = int(rx_str)
+    except (IndexError, ValueError) as e:
+        logging.warning("[parse_cry] failed to parse TPS3: %s — %s", e, line)
 
 
 # ------------------------------------------------------------------
@@ -260,7 +447,22 @@ def ingest_line(line: str) -> None:
 
     if line.startswith("$PERDCRZ,"):
         GNSS.last_crz = line
-        extract_discipline(line)
+        parse_crz(line)
+        return
+
+    if line.startswith("$PERDCRW,"):
+        GNSS.last_crw = line
+        parse_crw(line)
+        return
+
+    if line.startswith("$PERDCRX,"):
+        GNSS.last_crx = line
+        parse_crx(line)
+        return
+
+    if line.startswith("$PERDCRY,"):
+        GNSS.last_cry = line
+        parse_cry(line)
         return
 
     if line.startswith(("$GNRMC,", "$GPRMC,")):
@@ -321,9 +523,11 @@ def derive_lock_quality() -> str:
         score += 1
 
     if GNSS.has_discipline:
-        if GNSS.discipline_mode[-1:].isdigit():
-            if int(GNSS.discipline_mode[-1]) >= 4:
-                score += 2
+        # FINE_LOCK (3) or HOLDOVER (4) are the good states
+        if GNSS.tps4_freq_mode >= 3:
+            score += 2
+        elif GNSS.tps4_freq_mode >= 2:
+            score += 1
 
     if score >= 6:
         return "STRONG"
@@ -369,9 +573,74 @@ def get_gnss_payload(_: Optional[dict]) -> Dict:
     if GNSS.position_mode:
         p["position_mode"] = GNSS.position_mode
 
+    # -----------------------------------------------------------
+    # Discipline block — full TPS4 state
+    # -----------------------------------------------------------
     if GNSS.has_discipline:
-        p["discipline"] = GNSS.discipline_mode
+        p["discipline"] = {
+            "sentence":           GNSS.discipline_mode,       # "TPS4"
+            "freq_mode":          GNSS.tps4_freq_mode,        # 0-5
+            "freq_mode_name":     GNSS.tps4_freq_mode_name,   # "FINE_LOCK" etc
+            "phase_skip":         GNSS.tps4_phase_skip,
+            "alarm":              GNSS.tps4_alarm,
+            "status":             GNSS.tps4_status,
+            "pps_timing_error_ns": GNSS.tps4_pps_timing_error_ns,
+            "freq_error_ppb":     GNSS.tps4_freq_error_ppb,
+            "learning_time_s":    GNSS.tps4_learning_time_s,
+            "holdover_avail_s":   GNSS.tps4_holdover_avail_s,
+        }
 
+    # -----------------------------------------------------------
+    # Clock block — TPS1 time/drift/temperature
+    # -----------------------------------------------------------
+    clock: Dict[str, object] = {}
+    if GNSS.tps1_time_status >= 0:
+        clock["time_status"]      = GNSS.tps1_time_status
+        clock["time_status_name"] = GNSS.tps1_time_status_name
+    if GNSS.tps1_pps_status >= 0:
+        clock["pps_sync"]         = GNSS.tps1_pps_status_name
+    if not math.isnan(GNSS.tps1_clock_drift_ppb):
+        clock["drift_ppb"]        = GNSS.tps1_clock_drift_ppb
+    if not math.isnan(GNSS.tps1_temperature_c):
+        clock["temperature_c"]    = GNSS.tps1_temperature_c
+    if GNSS.tps1_present_ls:
+        clock["leap_second"]      = GNSS.tps1_present_ls
+    if clock:
+        p["clock"] = clock
+
+    # -----------------------------------------------------------
+    # PPS block — TPS2 configuration and estimated accuracy
+    # -----------------------------------------------------------
+    if GNSS.tps2_pps_mode >= 0:
+        p["pps"] = {
+            "active":              GNSS.tps2_pps_on,
+            "mode":                GNSS.tps2_pps_mode,
+            "pulse_width_ms":      GNSS.tps2_pulse_width_ms,
+            "cable_delay_ns":      GNSS.tps2_cable_delay_ns,
+            "polarity":            "rising" if GNSS.tps2_polarity == 0 else "falling",
+            "estimated_accuracy_ns": GNSS.tps2_estimated_accuracy_ns,
+        }
+
+    # -----------------------------------------------------------
+    # Integrity block — TPS3 position mode, TRAIM, survey
+    # -----------------------------------------------------------
+    if GNSS.tps3_pos_mode >= 0:
+        integrity: Dict[str, object] = {
+            "pos_mode":          GNSS.tps3_pos_mode_name,
+            "pos_diff_m":        GNSS.tps3_pos_diff_m,
+            "traim":             GNSS.tps3_traim_name,
+            "traim_removed_svs": GNSS.tps3_traim_removed_svs,
+        }
+        if GNSS.tps3_pos_mode in (1, 2):   # SS or CSS — survey in progress
+            integrity["survey_count"]     = GNSS.tps3_survey_count
+            integrity["survey_threshold"] = GNSS.tps3_survey_threshold
+        if GNSS.tps3_receiver_status:
+            integrity["receiver_status_hex"] = f"0x{GNSS.tps3_receiver_status:08X}"
+        p["integrity"] = integrity
+
+    # -----------------------------------------------------------
+    # Raw sentences
+    # -----------------------------------------------------------
     p["raw"] = {
         k: v for k, v in {
             "rmc": GNSS.last_rmc,
@@ -380,6 +649,9 @@ def get_gnss_payload(_: Optional[dict]) -> Dict:
             "gsa": GNSS.last_gsa,
             "zda": GNSS.last_zda,
             "crz": GNSS.last_crz,
+            "crw": GNSS.last_crw,
+            "crx": GNSS.last_crx,
+            "cry": GNSS.last_cry,
         }.items() if v
     }
     return p

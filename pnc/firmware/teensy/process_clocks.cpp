@@ -39,6 +39,8 @@
 #include <Arduino.h>
 #include "imxrt.h"
 
+#include <math.h>
+
 // ============================================================================
 // Campaign State
 // ============================================================================
@@ -66,6 +68,110 @@ static uint64_t recover_ocxo_ns    = 0;
 
 // Campaign-scoped PPS second counter
 static uint64_t campaign_seconds = 0;
+
+// ============================================================================
+// PPS residual tracking — per-clock-domain
+// ============================================================================
+//
+// On each PPS pulse, we snapshot each clock counter, compute the
+// delta from the prior PPS, and derive the residual:
+//
+//   residual = delta - expected_ticks_per_pps
+//
+// Running statistics are maintained using Welford's online algorithm,
+// which computes mean, variance, and standard deviation incrementally
+// without storing individual samples.
+//
+// Expected ticks per PPS interval:
+//
+//   DWT    600,000,000   (600 MHz internal)
+//   GNSS    10,000,000   (10 MHz external)
+//   OCXO    10,000,000   (10 MHz external)
+//
+
+static constexpr int64_t DWT_EXPECTED_PER_PPS  = 600000000LL;
+static constexpr int64_t GNSS_EXPECTED_PER_PPS =  10000000LL;
+static constexpr int64_t OCXO_EXPECTED_PER_PPS =  10000000LL;
+
+// ----------------------------------------------------------------------------
+// Per-clock residual state
+// ----------------------------------------------------------------------------
+
+struct pps_residual_t {
+  uint64_t ticks_at_last_pps;   // snapshot of 64-bit counter at prior PPS
+  int64_t  delta;               // raw tick count between two most recent PPS
+  int64_t  residual;            // delta - expected
+  bool     valid;               // false until the second PPS of a campaign
+
+  // Welford's online statistics
+  uint64_t n;                   // number of residual samples
+  double   mean;                // running mean of residuals
+  double   m2;                  // sum of squared differences from mean
+};
+
+static pps_residual_t residual_dwt  = {};
+static pps_residual_t residual_gnss = {};
+static pps_residual_t residual_ocxo = {};
+
+// ----------------------------------------------------------------------------
+// Reset all residual state (called on campaign start)
+// ----------------------------------------------------------------------------
+
+static void residual_reset(pps_residual_t& r) {
+  r.ticks_at_last_pps = 0;
+  r.delta             = 0;
+  r.residual          = 0;
+  r.valid             = false;
+  r.n                 = 0;
+  r.mean              = 0.0;
+  r.m2                = 0.0;
+}
+
+// ----------------------------------------------------------------------------
+// Update residual with a new PPS snapshot
+// ----------------------------------------------------------------------------
+
+static void residual_update(pps_residual_t& r,
+                            uint64_t ticks_now,
+                            int64_t  expected) {
+
+  if (r.ticks_at_last_pps > 0) {
+    r.delta    = (int64_t)(ticks_now - r.ticks_at_last_pps);
+    r.residual = r.delta - expected;
+    r.valid    = true;
+
+    // Welford's online algorithm
+    r.n++;
+    const double x     = (double)r.residual;
+    const double delta = x - r.mean;
+    r.mean += delta / (double)r.n;
+    const double delta2 = x - r.mean;
+    r.m2 += delta * delta2;
+
+  } else {
+    r.delta    = 0;
+    r.residual = 0;
+    r.valid    = false;
+  }
+
+  r.ticks_at_last_pps = ticks_now;
+}
+
+// ----------------------------------------------------------------------------
+// Derived statistics (safe accessors)
+// ----------------------------------------------------------------------------
+
+static inline double residual_variance(const pps_residual_t& r) {
+  return (r.n >= 2) ? r.m2 / (double)(r.n - 1) : 0.0;
+}
+
+static inline double residual_stddev(const pps_residual_t& r) {
+  return (r.n >= 2) ? sqrt(r.m2 / (double)(r.n - 1)) : 0.0;
+}
+
+static inline double residual_stderr(const pps_residual_t& r) {
+  return (r.n >= 2) ? sqrt(r.m2 / (double)(r.n - 1)) / sqrt((double)r.n) : 0.0;
+}
 
 // ============================================================================
 // DWT (CPU cycle counter — 600 MHz internal)
@@ -219,6 +325,11 @@ static void clocks_zero_all(void) {
   ocxo_last_32  = GPT1_CNT;
 
   campaign_seconds = 0;
+
+  // Reset all PPS residual tracking
+  residual_reset(residual_dwt);
+  residual_reset(residual_gnss);
+  residual_reset(residual_ocxo);
 }
 
 // ============================================================================
@@ -266,6 +377,18 @@ static void pps_isr(void) {
 
       if (campaign_state == clocks_campaign_state_t::STARTED) {
 
+        // --------------------------------------------------------
+        // Snapshot all clocks and compute PPS-to-PPS residuals
+        // --------------------------------------------------------
+
+        residual_update(residual_dwt,  clocks_dwt_cycles_now(), DWT_EXPECTED_PER_PPS);
+        residual_update(residual_gnss, clocks_gnss_ticks_now(), GNSS_EXPECTED_PER_PPS);
+        residual_update(residual_ocxo, clocks_ocxo_ticks_now(), OCXO_EXPECTED_PER_PPS);
+
+        // --------------------------------------------------------
+        // Publish TIMEBASE_FRAGMENT
+        // --------------------------------------------------------
+
         Payload p;
         p.add("campaign",         campaign_name);
         p.add("dwt_cycles",       clocks_dwt_cycles_now());
@@ -274,6 +397,11 @@ static void pps_isr(void) {
         p.add("ocxo_ns",          clocks_ocxo_ns_now());
         p.add("teensy_pps_count", campaign_seconds);
         p.add("gnss_lock",        digitalRead(GNSS_LOCK_PIN));
+
+        // PPS residuals (most recent pulse)
+        p.add("dwt_pps_residual",  residual_dwt.residual);
+        p.add("gnss_pps_residual", residual_gnss.residual);
+        p.add("ocxo_pps_residual", residual_ocxo.residual);
 
         publish("TIMEBASE_FRAGMENT", p);
 
@@ -345,6 +473,38 @@ static Payload cmd_recover(const Payload& args) {
 }
 
 // ============================================================================
+// Helper — emit residual stats for one clock domain into a Payload
+// ============================================================================
+
+static void report_residual(Payload& p,
+                            const char* prefix,
+                            const pps_residual_t& r) {
+
+  char key[48];
+
+  snprintf(key, sizeof(key), "%s_pps_valid", prefix);
+  p.add(key, r.valid);
+
+  snprintf(key, sizeof(key), "%s_pps_delta", prefix);
+  p.add(key, r.delta);
+
+  snprintf(key, sizeof(key), "%s_pps_residual", prefix);
+  p.add(key, r.residual);
+
+  snprintf(key, sizeof(key), "%s_pps_n", prefix);
+  p.add(key, r.n);
+
+  snprintf(key, sizeof(key), "%s_pps_mean", prefix);
+  p.add_fmt(key, "%.3f", r.mean);
+
+  snprintf(key, sizeof(key), "%s_pps_stddev", prefix);
+  p.add_fmt(key, "%.3f", residual_stddev(r));
+
+  snprintf(key, sizeof(key), "%s_pps_stderr", prefix);
+  p.add_fmt(key, "%.3f", residual_stderr(r));
+}
+
+// ============================================================================
 // REPORT — diagnostic introspection only
 // ============================================================================
 
@@ -391,6 +551,25 @@ static Payload cmd_report(const Payload&) {
   p.add("ocxo_ns_now",    ocxo_ns);
 
   p.add("gnss_lock", digitalRead(GNSS_LOCK_PIN));
+
+  // ------------------------------------------------------------
+  // PPS residual statistics — all clock domains
+  // ------------------------------------------------------------
+  //
+  // For each clock domain, we report:
+  //
+  //   *_pps_valid     true after the second PPS of a campaign
+  //   *_pps_delta     raw tick count between two most recent PPS
+  //   *_pps_residual  delta - expected  (signed, most recent)
+  //   *_pps_n         number of residual samples collected
+  //   *_pps_mean      running mean of residuals
+  //   *_pps_stddev    sample standard deviation of residuals
+  //   *_pps_stderr    standard error of the mean
+  //
+
+  report_residual(p, "dwt",  residual_dwt);
+  report_residual(p, "gnss", residual_gnss);
+  report_residual(p, "ocxo", residual_ocxo);
 
   // ------------------------------------------------------------
   // Derived diagnostics (ONLY if meaningful)

@@ -106,6 +106,18 @@ def seconds_to_hms(seconds: int) -> str:
     s = seconds % 60
     return f"{h:02d}:{m:02d}:{s:02d}"
 
+def _compute_tau(clock_ns: int, gnss_ns: int) -> float:
+    """Dimensionless ratio: clock_ns / gnss_ns."""
+    if gnss_ns == 0:
+        return 0.0
+    return clock_ns / gnss_ns
+
+def _compute_ppb(clock_ns: int, gnss_ns: int) -> float:
+    """Deviation from GNSS in parts-per-billion."""
+    if gnss_ns == 0:
+        return 0.0
+    return ((clock_ns - gnss_ns) / gnss_ns) * 1e9
+
 
 def clocks_status_readout() -> Generator[str, None, None]:
     c = get_clocks_report()
@@ -127,19 +139,47 @@ def clocks_status_readout() -> Generator[str, None, None]:
     yield ""
 
     # ------------------------------------------------------------
-    # Clock table
+    # Clock table — cumulative tau and PPB
     # ------------------------------------------------------------
 
-    yield f"{'CLOCK':<8} {'TAU':>14} {'PPB':>14}"
+    gnss_ns = int(c.get("gnss_ns_now", 0))
+    dwt_ns  = int(c.get("dwt_ns_now", 0))
+    ocxo_ns = int(c.get("ocxo_ns_now", 0))
+
+    tau_dwt  = _compute_tau(dwt_ns, gnss_ns)
+    tau_ocxo = _compute_tau(ocxo_ns, gnss_ns)
+    ppb_dwt  = _compute_ppb(dwt_ns, gnss_ns)
+    ppb_ocxo = _compute_ppb(ocxo_ns, gnss_ns)
+
+    yield f"{'CLK':<8} {'TAU':>14} {'PPB':>14}"
 
     # GNSS baseline
     yield f"{'GNSS':<8} {'1.0000000000':>14} {'0.00':>14}"
 
     # DWT
-    yield f"{'DWT':<8} {c['tau_dwt']:>14.10f} {c['dwt_ppb']:>14.2f}"
+    yield f"{'DWT':<8} {tau_dwt:>14.10f} {ppb_dwt:>14.2f}"
 
-    # OCXO (optional / diagnostic)
-    yield f"{'OCXO':<8} {c['tau_ocxo']:>14.10f} {c['ocxo_ppb']:>14.2f}"
+    # OCXO
+    yield f"{'OCXO':<8} {tau_ocxo:>14.10f} {ppb_ocxo:>14.2f}"
+
+    yield ""
+
+    # ------------------------------------------------------------
+    # Residual table
+    # ------------------------------------------------------------
+
+    yield f"{'CLK':<5} {'RES':>8} {'MEAN':>8} {'SD':>8} {'SE':>8}"
+
+    for name, prefix in [("GNSS", "gnss"), ("DWT", "dwt"), ("OCXO", "ocxo")]:
+        valid = c.get(f"{prefix}_pps_valid", False)
+        if valid:
+            res    = c.get(f"{prefix}_pps_residual", 0)
+            mean   = float(c.get(f"{prefix}_pps_mean", 0))
+            stddev = float(c.get(f"{prefix}_pps_stddev", 0))
+            stderr = float(c.get(f"{prefix}_pps_stderr", 0))
+            yield f"{name:<5} {res:>8} {mean:>8.1f} {stddev:>8.1f} {stderr:>8.1f}"
+        else:
+            yield f"{name:<5} {'---':>8} {'---':>8} {'---':>8} {'---':>8}"
 
 
 # ---------------------------------------------------------------------
