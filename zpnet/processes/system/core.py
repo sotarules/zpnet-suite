@@ -1002,12 +1002,12 @@ def system_poller() -> None:
             pi_payload = build_pi_status()
             teensy_payload = build_teensy_status()
             network_payload = build_network_status()
-            laser_payload = build_laser_status()
-            sensor_payload = build_sensor_scan_status()
-            environment_payload = build_environment_status()
+            #laser_payload = build_laser_status()
+            #sensor_payload = build_sensor_scan_status()
+            #environment_payload = build_environment_status()
             gnss_payload = build_gnss_status()
-            power_payload = build_power_status()
-            battery_payload = build_battery_status()
+            #power_payload = build_power_status()
+            #battery_payload = build_battery_status()
             clocks_payload = build_clocks_status()
             transport_payload = build_transport_status()
             payload_payload = build_payload_status()
@@ -1018,12 +1018,12 @@ def system_poller() -> None:
                 "pi": dict(pi_payload),
                 "teensy": dict(teensy_payload),
                 "network": dict(network_payload),
-                "laser": dict(laser_payload),
-                "sensors": dict(sensor_payload),
-                "environment": dict(environment_payload),
+                #"laser": dict(laser_payload),
+                #"sensors": dict(sensor_payload),
+                #"environment": dict(environment_payload),
                 "gnss": dict(gnss_payload),
-                "power": dict(power_payload),
-                "battery": dict(battery_payload),
+                #"power": dict(power_payload),
+                #"battery": dict(battery_payload),
                 "clocks": dict(clocks_payload),
                 "transport": dict(transport_payload),
                 "payload": dict(payload_payload),

@@ -2,13 +2,21 @@
 ZPNet CLOCKS Process — TIMEBASE Authority (Pi-side)
 
 Responsibilities:
-  • Capture PPS pulse on Raspberry Pi GPIO
+  • Capture PPS pulse via kernel /dev/pps0 driver
   • Capture Pi cycle count and Pi nanoseconds at PPS
   • Receive TIMEBASE_FRAGMENT from Teensy
   • Augment fragment into full TIMEBASE record
   • Publish TIMEBASE
   • Persist TIMEBASE to PostgreSQL (append-only, best-effort)
   • Recover clocks after restart if campaign is active
+  • Command GNSS into Time Only mode when campaign has a location
+
+PPS capture:
+  • The pps-gpio kernel driver owns GPIO18 and timestamps edges
+    in interrupt context (best possible precision)
+  • We read /dev/pps0 via PPS_FETCH ioctl (same as ppstest)
+  • chrony also reads /dev/pps0 — multiple readers are supported
+  • No gpiod dependency; no pin ownership conflict
 
 Semantics:
   • No derived values
@@ -18,14 +26,14 @@ Semantics:
 
 from __future__ import annotations
 
+import ctypes
+import fcntl
 import logging
+import os
 import threading
 import time
 from datetime import datetime, timezone
 from typing import Dict, Any, Optional
-
-import gpiod
-from gpiod.line import Edge
 
 from zpnet.processes.processes import (
     server_setup,
@@ -40,14 +48,73 @@ from zpnet.shared.logger import setup_logging
 # Configuration
 # ---------------------------------------------------------------------
 
-GPIO_CHIP = "/dev/gpiochip0"
-PPS_GPIO_LINE = 18
+PPS_DEVICE = "/dev/pps0"
+
+# ---------------------------------------------------------------------
+# Kernel PPS ioctl interface (linux/pps.h)
+#
+# struct pps_ktime {
+#     __s64   sec;
+#     __s32   nsec;
+#     __u32   flags;
+# };                              /* 16 bytes */
+#
+# struct pps_kinfo {
+#     __u32   assert_sequence;
+#     __u32   clear_sequence;
+#     struct pps_ktime assert_tu;
+#     struct pps_ktime clear_tu;
+#     int     current_mode;
+# };                              /* 44 bytes */
+#
+# struct pps_fdata {
+#     struct pps_kinfo info;
+#     struct pps_ktime timeout;
+# };                              /* 60 bytes */
+#
+# #define PPS_FETCH  _IOWR('p', 0xa4, struct pps_fdata)
+# ---------------------------------------------------------------------
+
+class _PpsKtime(ctypes.Structure):
+    _fields_ = [
+        ("sec", ctypes.c_int64),
+        ("nsec", ctypes.c_int32),
+        ("flags", ctypes.c_uint32),
+    ]
+
+class _PpsKinfo(ctypes.Structure):
+    _fields_ = [
+        ("assert_sequence", ctypes.c_uint32),
+        ("clear_sequence", ctypes.c_uint32),
+        ("assert_tu", _PpsKtime),
+        ("clear_tu", _PpsKtime),
+        ("current_mode", ctypes.c_int32),
+    ]
+
+class _PpsFdata(ctypes.Structure):
+    _fields_ = [
+        ("info", _PpsKinfo),
+        ("timeout", _PpsKtime),
+    ]
+
+# PPS_FETCH ioctl number: _IOWR('p', 0xa4, struct pps_fdata *)
+#
+# Note: the kernel header uses a POINTER to pps_fdata, so the size
+# field in the ioctl number is sizeof(pointer), not sizeof(struct).
+# On ARM64 (Pi 4/5): sizeof(void*) = 8  → ioctl = 0xC00870A4
+# Confirmed via: gcc -include linux/pps.h -e 'printf("%lX", PPS_FETCH)'
+_PPS_FETCH = 0xC00870A4
 
 # ---------------------------------------------------------------------
 # Local state (process lifetime)
 # ---------------------------------------------------------------------
 
 _pi_pps_count: int = 0
+
+# Monotonic epoch — captured at campaign start, subtracted from all
+# subsequent readings so pi_cycles and pi_ns are campaign-scoped
+# (same zeroing semantics as Teensy's clocks_zero_all).
+_pi_cycles_epoch: int = 0
 
 # Latest Pi-side PPS capture
 _last_pi_pps: Optional[Dict[str, Any]] = None
@@ -63,16 +130,26 @@ _state_lock = threading.Lock()
 
 def _read_pi_cycle_count() -> int:
     """
-    Best-effort Pi cycle count approximation.
-    Uses time.monotonic_ns() as the authoritative Pi clock substrate.
+    Campaign-scoped Pi cycle count.
+
+    Uses time.monotonic_ns() as the raw clock substrate, offset by
+    the epoch captured at campaign start — same zeroing semantics
+    as Teensy's clocks_zero_all().
+
+    Before any campaign starts, returns raw monotonic_ns (epoch=0).
     """
-    return time.monotonic_ns()
+    return time.monotonic_ns() - _pi_cycles_epoch
 
 
 def _read_pi_ns_from_cycles(cycles_ns: int) -> int:
     """
-    Canonical Pi nanosecond clock.
-    Currently identical to cycle count (monotonic_ns).
+    Convert Pi cycles to nanoseconds.
+
+    Pi monotonic_ns ticks at 1 GHz (1 ns per tick), so the
+    conversion factor is 1:1.  Equivalent to Teensy's:
+      DWT:  cycles * 5 / 3   (600 MHz)
+      GNSS: ticks * 100      (10 MHz)
+      Pi:   ticks * 1        (1 GHz)
     """
     return cycles_ns
 
@@ -93,24 +170,56 @@ def _get_gnss_time() -> str:
     return f"{date}T{time_s}Z"
 
 
-def _get_active_campaign_name() -> Optional[str]:
+def _get_active_campaign() -> Optional[Dict[str, Any]]:
     """
-    Return active campaign name or None.
+    Return active campaign row or None.
+
+    Returns dict with keys: campaign, location (nullable).
     """
     with open_db(row_dict=True) as conn:
         cur = conn.cursor()
         cur.execute(
             """
-            SELECT campaign
+            SELECT campaign, location
             FROM campaigns
             WHERE active = true
             ORDER BY started_at DESC
             LIMIT 1
             """
         )
-        row = cur.fetchone()
+        return cur.fetchone()
 
-    return row["campaign"] if row else None
+
+def _set_gnss_mode_to(location: str) -> Dict[str, Any]:
+    """
+    Command GNSS process to switch to Time Only mode at a location.
+
+    Blocks until GNSS confirms the mode change (or times out).
+    Returns the GNSS MODE command response dict.
+    Raises on IPC failure.
+    """
+    return send_command(
+        machine="PI",
+        subsystem="GNSS",
+        command="MODE",
+        args={"mode": "TO", "location": location},
+    )
+
+
+def _set_gnss_mode_normal() -> Dict[str, Any]:
+    """
+    Command GNSS process to return to normal (CSS) mode.
+
+    Blocks until GNSS confirms the mode change (or times out).
+    Returns the GNSS MODE command response dict.
+    Raises on IPC failure.
+    """
+    return send_command(
+        machine="PI",
+        subsystem="GNSS",
+        command="MODE",
+        args={"mode": "NORMAL"},
+    )
 
 
 def _persist_timebase(tb: Dict[str, Any]) -> None:
@@ -134,7 +243,7 @@ def _persist_timebase(tb: Dict[str, Any]) -> None:
                     pi_cycles,
                     pi_ns,
                     teensy_pps_count,
-                    pi_pps_count                    
+                    pi_pps_count
                 )
                 VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                 """,
@@ -158,36 +267,49 @@ def _persist_timebase(tb: Dict[str, Any]) -> None:
 
 def _pps_listener() -> None:
     """
-    Listen for PPS rising edge and capture Pi clocks immediately.
+    Listen for PPS assert events via kernel /dev/pps0 ioctl.
+
+    Uses the PPS_FETCH ioctl which blocks until the next PPS edge.
+    The kernel pps-gpio driver timestamps the edge in interrupt
+    context — this is the best precision available on the Pi.
+
+    Multiple readers (us + chrony) can read /dev/pps0 concurrently.
     """
     global _pi_pps_count
     global _last_pi_pps
 
-    chip = gpiod.Chip(GPIO_CHIP)
+    fd = os.open(PPS_DEVICE, os.O_RDONLY)
+    logging.info("⏱️ [clocks] PPS listener started on %s (fd=%d)", PPS_DEVICE, fd)
 
-    settings = gpiod.LineSettings(
-        edge_detection=Edge.RISING
-    )
-
-    request = chip.request_lines(
-        consumer="zpnet-clocks",
-        config={PPS_GPIO_LINE: settings},
-    )
-
-    logging.info("⏱️ [clocks] PPS listener started on GPIO18")
+    last_sequence = -1
 
     while True:
-        request.wait_edge_events()
+        try:
+            # Set up fetch request with 2-second timeout
+            fdata = _PpsFdata()
+            fdata.timeout.sec = 2
+            fdata.timeout.nsec = 0
+            fdata.timeout.flags = 0  # valid timeout
 
-        for event in request.read_edge_events():
+            # Block until next PPS assert event
+            fcntl.ioctl(fd, _PPS_FETCH, fdata)
 
-            # Kernel timestamp of the PPS edge (best possible truth)
-            pps_kernel_ns = event.timestamp_ns
+            seq = fdata.info.assert_sequence
 
-            # Capture Pi cycle counter ASAP
+            # Skip if we already saw this sequence number
+            if seq == last_sequence:
+                continue
+            last_sequence = seq
+
+            # Kernel timestamp of the PPS edge (nanoseconds since epoch)
+            pps_sec = fdata.info.assert_tu.sec
+            pps_nsec = fdata.info.assert_tu.nsec
+            pps_kernel_ns = pps_sec * 1_000_000_000 + pps_nsec
+
+            # Capture Pi cycle counter ASAP after ioctl returns
             pi_cycles = _read_pi_cycle_count()
 
-            # Convert cycles → ns via your tau math
+            # Convert cycles → ns
             pi_ns = _read_pi_ns_from_cycles(pi_cycles)
 
             with _state_lock:
@@ -199,6 +321,16 @@ def _pps_listener() -> None:
                 }
 
             _pi_pps_count += 1
+
+        except OSError as e:
+            if e.errno == 110:  # ETIMEDOUT — no PPS pulse within timeout
+                logging.warning("⚠️ [clocks] PPS fetch timed out (no pulse)")
+                continue
+            logging.exception("[_pps_listener] ioctl error")
+            time.sleep(1)
+        except Exception:
+            logging.exception("[_pps_listener] unhandled exception")
+            time.sleep(1)
 
 # ---------------------------------------------------------------------
 # Teensy fragment handler
@@ -234,11 +366,12 @@ def _try_complete_timebase() -> None:
         _last_pi_pps = None
         _last_teensy_fragment = None
 
-    campaign = _get_active_campaign_name()
-    if campaign is None:
+    row = _get_active_campaign()
+    if row is None:
         logging.warning("⚠️ [clocks] PPS received with no active campaign")
         return
 
+    campaign = row["campaign"]
     gnss_time = _get_gnss_time()
 
     system_time = datetime.now(timezone.utc).isoformat(timespec='milliseconds')
@@ -279,53 +412,151 @@ def _try_complete_timebase() -> None:
 def cmd_start(args: Optional[dict]) -> dict:
     """
     Start a new campaign.
+
+    Args:
+        campaign (str):   Campaign name (required)
+        location (str):   Profiled location name (optional)
+                          When provided, GNSS is switched to Time Only
+                          mode at this location before Teensy acquisition
+                          begins. When omitted, GNSS mode is left as-is.
+
+    Sequence:
+      1) Deactivate any existing campaign
+      2) Insert new campaign row (with optional location)
+      3) If location specified: command GNSS → TO mode (blocking)
+      4) Start Teensy CLOCKS acquisition
     """
-    global _pi_pps_count
+    global _pi_pps_count, _pi_cycles_epoch
     _pi_pps_count = 0
+    _pi_cycles_epoch = time.monotonic_ns()
 
     campaign = args.get("campaign")
+    if not campaign:
+        return {"success": False, "message": "START requires 'campaign' argument"}
 
+    location = (args.get("location") or "").strip() or None
+
+    # ----------------------------------------------------------
+    # 1) Deactivate existing + insert new campaign
+    # ----------------------------------------------------------
     with open_db() as conn:
         cur = conn.cursor()
 
-        # Stop any existing campaign
         cur.execute(
             "UPDATE campaigns SET active=false, stopped_at=now() WHERE active=true"
         )
 
         cur.execute(
             """
-            INSERT INTO campaigns (campaign, started_at, active)
-            VALUES (%s, now(), true)
+            INSERT INTO campaigns (campaign, location, started_at, active)
+            VALUES (%s, %s, now(), true)
             """,
-            (campaign,),
+            (campaign, location),
         )
 
-    payload = send_command(
+    # ----------------------------------------------------------
+    # 2) If location specified, switch GNSS to Time Only mode
+    # ----------------------------------------------------------
+    if location:
+        logging.info(
+            "📡 [clocks] commanding GNSS → TO mode for location '%s'",
+            location,
+        )
+
+        try:
+            gnss_resp = _set_gnss_mode_to(location)
+        except Exception:
+            logging.exception("💥 [clocks] GNSS MODE=TO IPC failed")
+            return {
+                "success": False,
+                "message": f"failed to command GNSS to TO mode for '{location}'",
+            }
+
+        if not gnss_resp.get("success"):
+            msg = gnss_resp.get("message", "unknown error")
+            logging.warning("⚠️ [clocks] GNSS MODE=TO failed: %s", msg)
+            return {
+                "success": False,
+                "message": f"GNSS MODE=TO failed: {msg}",
+                "payload": {"gnss_response": gnss_resp},
+            }
+
+        logging.info("✅ [clocks] GNSS confirmed TO mode")
+
+    # ----------------------------------------------------------
+    # 3) Start Teensy CLOCKS acquisition
+    # ----------------------------------------------------------
+    send_command(
         machine="TEENSY",
         subsystem="CLOCKS",
         command="START",
         args={"campaign": campaign},
-    )["payload"]
+    )
 
-    return {"success": True, "message": "OK"}
+    return {
+        "success": True,
+        "message": "OK",
+        "payload": {
+            "campaign": campaign,
+            "location": location,
+        },
+    }
 
 
 def cmd_stop(_: Optional[dict]) -> dict:
     """
     Stop active campaign.
+
+    Sequence:
+      1) Read active campaign (to check if it had a location)
+      2) Deactivate campaign in DB
+      3) Stop Teensy CLOCKS acquisition
+      4) If campaign had a location: restore GNSS → NORMAL (CSS)
     """
+
+    # ----------------------------------------------------------
+    # 1) Check if active campaign had a location
+    # ----------------------------------------------------------
+    row = _get_active_campaign()
+    had_location = row["location"] if row else None
+
+    # ----------------------------------------------------------
+    # 2) Deactivate campaign
+    # ----------------------------------------------------------
     with open_db() as conn:
         cur = conn.cursor()
         cur.execute(
             "UPDATE campaigns SET active=false, stopped_at=now() WHERE active=true"
         )
 
-    payload = send_command(
+    # ----------------------------------------------------------
+    # 3) Stop Teensy
+    # ----------------------------------------------------------
+    send_command(
         machine="TEENSY",
         subsystem="CLOCKS",
-        command="STOP"
-    )["payload"]
+        command="STOP",
+    )
+
+    # ----------------------------------------------------------
+    # 4) Restore GNSS mode if we changed it
+    # ----------------------------------------------------------
+    if had_location:
+        logging.info(
+            "📡 [clocks] restoring GNSS → NORMAL (campaign had location '%s')",
+            had_location,
+        )
+
+        try:
+            gnss_resp = _set_gnss_mode_normal()
+
+            if not gnss_resp.get("success"):
+                logging.warning(
+                    "⚠️ [clocks] GNSS MODE=NORMAL failed: %s",
+                    gnss_resp.get("message", "?"),
+                )
+        except Exception:
+            logging.exception("⚠️ [clocks] GNSS MODE=NORMAL IPC failed (ignored)")
 
     return {"success": True, "message": "OK"}
 
@@ -354,7 +585,7 @@ def cmd_report(_: Optional[dict]) -> Dict[str, Any]:
         # ------------------------------------------------------------
         cur.execute(
             """
-            SELECT id, campaign, started_at
+            SELECT id, campaign, location, started_at
             FROM campaigns
             WHERE active = true
             ORDER BY started_at DESC
@@ -376,6 +607,7 @@ def cmd_report(_: Optional[dict]) -> Dict[str, Any]:
             "active": True,
             "campaign_id": campaign_id,
             "campaign": campaign["campaign"],
+            "location": campaign["location"],
             "started_at": campaign["started_at"].isoformat(),
             "last_timebase_id": None,
         }
@@ -433,7 +665,7 @@ COMMANDS = {
 def run() -> None:
     setup_logging()
 
-    # Start PPS ISR thread
+    # Start PPS listener thread (reads /dev/pps0 via kernel ioctl)
     threading.Thread(
         target=_pps_listener,
         daemon=True,

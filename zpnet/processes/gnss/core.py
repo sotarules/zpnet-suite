@@ -2,16 +2,24 @@
 ZPNet GNSS Process (Pi-side, authoritative)
 
 Responsibilities:
-  • Own the GNSS UART
+  • Own the GNSS UART (read and write)
   • Parse NMEA into authoritative state
   • Expose derived facts via REPORT
   • Expose raw NMEA sentences via a live stream socket
+  • Profile and persist antenna locations for Time Only mode
+  • Switch receiver between NAV and Time Only (TO) modes
 
 Process model:
   • One systemd service
-  • One acquisition thread (UART)
-  • One blocking command socket (REPORT)
+  • One acquisition thread (UART read)
+  • One blocking command socket (REPORT, PROFILE_LOCATION, MODE)
   • One blocking stream socket (fan-out)
+
+UART ownership:
+  • gnss_reader() opens the serial port and stores it in _serial
+  • gnss_reader() is the sole reader (hot path)
+  • Command handlers may write via _send_nmea() under _serial_lock
+  • Writes are always complete NMEA sentences with checksum + CRLF
 """
 
 from __future__ import annotations
@@ -22,12 +30,13 @@ import os
 import socket
 import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Dict, Optional, Set, TextIO
 
 import serial
 
 from zpnet.processes.processes import server_setup
+from zpnet.shared.db import open_db
 from zpnet.shared.logger import setup_logging
 
 GNSS_DEVICE = os.environ.get("ZPNET_GNSS_PORT", "/dev/zpnet-gnss-serial")
@@ -99,6 +108,28 @@ TRAIM_NAMES = {
     1: "ALARM",
     2: "INSUFFICIENT",
 }
+
+# ------------------------------------------------------------------
+# Profile location configuration
+# ------------------------------------------------------------------
+
+# Minimum quality thresholds for accepting a location profile
+PROFILE_MIN_SATELLITES = 12
+PROFILE_MAX_HDOP = 1.5
+PROFILE_MIN_LOCK_QUALITY = "MEDIUM"   # MEDIUM or STRONG
+PROFILE_POLL_INTERVAL_S = 1.0
+PROFILE_DEFAULT_TIMEOUT_S = 300       # 5 minutes
+
+# Lock quality ranking for comparison
+_LOCK_QUALITY_RANK = {"WEAK": 0, "MEDIUM": 1, "STRONG": 2}
+
+# ------------------------------------------------------------------
+# MODE command configuration
+# ------------------------------------------------------------------
+
+MODE_VERIFY_TIMEOUT_S = 10           # seconds to wait for TPS3 confirmation
+MODE_VERIFY_POLL_S = 0.5             # poll interval during verification
+MODE_WRITE_SETTLE_S = 0.1            # delay after UART write before polling
 
 # ------------------------------------------------------------------
 # State
@@ -188,6 +219,14 @@ class GnssState:
     tps3_traim_removed_svs: int = 0
     tps3_receiver_status: int = 0          # bitmask
 
+    # ---------------------------------------------------------------
+    # ACK tracking (latest $PERDACK response)
+    # ---------------------------------------------------------------
+    last_ack_command: str = ""
+    last_ack_sequence: int = -1
+    last_ack_subcommand: str = ""
+    last_ack_ts: float = 0.0
+
     # Raw sentences
     last_rmc: str = ""
     last_gga: str = ""
@@ -202,6 +241,25 @@ class GnssState:
     last_rx_ts: float = 0.0
 
 GNSS = GnssState()
+
+# ------------------------------------------------------------------
+# Commanded mode state (Pi-side knowledge)
+#
+# The GF-8802 reports its actual position mode in TPS3 (pos_mode).
+# These variables track what WE commanded, so the REPORT can show
+# both the commanded intent and the receiver's confirmed state.
+# ------------------------------------------------------------------
+
+_commanded_mode: Optional[str] = None        # "TO" or "NORMAL" or None (unknown)
+_commanded_location: Optional[str] = None    # location name when TO
+_commanded_at: float = 0.0                   # monotonic timestamp of last command
+
+# ------------------------------------------------------------------
+# Serial port (module-level, owned by gnss_reader)
+# ------------------------------------------------------------------
+
+_serial: Optional[serial.Serial] = None
+_serial_lock = threading.Lock()
 
 _stream_clients: Set[socket.socket] = set()
 _stream_lock = threading.Lock()
@@ -245,7 +303,7 @@ def stream_server() -> None:
         logging.exception("[stream_server] unhandled exception")
 
 # ------------------------------------------------------------------
-# Helpers
+# NMEA helpers
 # ------------------------------------------------------------------
 
 def maybe_int(s: str) -> Optional[int]:
@@ -269,6 +327,59 @@ def strip_checksum(field: str) -> str:
     """Remove *XX checksum suffix from the last field of an NMEA sentence."""
     idx = field.find("*")
     return field[:idx] if idx >= 0 else field
+
+def nmea_checksum(sentence: str) -> str:
+    """
+    Compute NMEA checksum for a sentence body.
+
+    The input should be the content between '$' and '*' (exclusive).
+    Returns two uppercase hex characters.
+
+    Example:
+        nmea_checksum("PERDAPI,SURVEY,3,0,0,34.1739,-119.2245,8.8")
+        → "XX"
+    """
+    cs = 0
+    for ch in sentence:
+        cs ^= ord(ch)
+    return f"{cs:02X}"
+
+# ------------------------------------------------------------------
+# UART write (thread-safe)
+# ------------------------------------------------------------------
+
+def _send_nmea(body: str) -> bool:
+    """
+    Write a complete NMEA sentence to the GF-8802.
+
+    Args:
+        body: sentence content WITHOUT leading '$' or trailing '*XX\\r\\n'
+              e.g. "PERDAPI,SURVEY,3,0,0,34.1739,-119.2245,8.8"
+
+    Returns:
+        True if the write succeeded, False otherwise.
+
+    The function computes the checksum, frames the sentence,
+    and writes it atomically under _serial_lock.
+    """
+    cs = nmea_checksum(body)
+    sentence = f"${body}*{cs}\r\n"
+
+    with _serial_lock:
+        ser = _serial
+        if ser is None or not ser.is_open:
+            logging.error("[_send_nmea] serial port not available")
+            return False
+
+        try:
+            ser.write(sentence.encode("ascii"))
+            ser.flush()
+            logging.info("📡 [_send_nmea] TX: %s", sentence.strip())
+            log_gnss(f"TX: {sentence.strip()}")
+            return True
+        except Exception:
+            logging.exception("[_send_nmea] write failed")
+            return False
 
 # ------------------------------------------------------------------
 # Sentence parsers — standard NMEA
@@ -435,6 +546,39 @@ def parse_cry(line: str) -> None:
     except (IndexError, ValueError) as e:
         logging.warning("[parse_cry] failed to parse TPS3: %s — %s", e, line)
 
+# ------------------------------------------------------------------
+# Sentence parser — Furuno ACK
+# ------------------------------------------------------------------
+
+def parse_ack(line: str) -> None:
+    """$PERDACK,<command>,<sequence>,<subcommand>*XX
+
+    sequence: -1 = command failed, 0-255 = success count
+    """
+    parts = line.split(",")
+    try:
+        GNSS.last_ack_command    = parts[1]
+        GNSS.last_ack_sequence   = int(parts[2])
+        sub = parts[3] if len(parts) > 3 else ""
+        GNSS.last_ack_subcommand = strip_checksum(sub)
+        GNSS.last_ack_ts         = time.time()
+
+        if GNSS.last_ack_sequence == -1:
+            logging.warning(
+                "⚠️ [parse_ack] command REJECTED: %s %s",
+                GNSS.last_ack_command,
+                GNSS.last_ack_subcommand,
+            )
+        else:
+            logging.info(
+                "✅ [parse_ack] command ACK: %s %s (seq=%d)",
+                GNSS.last_ack_command,
+                GNSS.last_ack_subcommand,
+                GNSS.last_ack_sequence,
+            )
+    except (IndexError, ValueError) as e:
+        logging.warning("[parse_ack] failed to parse ACK: %s — %s", e, line)
+
 
 # ------------------------------------------------------------------
 # Ingest
@@ -465,6 +609,10 @@ def ingest_line(line: str) -> None:
         parse_cry(line)
         return
 
+    if line.startswith("$PERDACK,"):
+        parse_ack(line)
+        return
+
     if line.startswith(("$GNRMC,", "$GPRMC,")):
         GNSS.last_rmc = line
         parse_rmc(line)
@@ -481,22 +629,29 @@ def ingest_line(line: str) -> None:
         GNSS.last_zda = line
 
 def gnss_reader() -> None:
+    global _serial
+
     try:
-        with serial.Serial(GNSS_DEVICE, GNSS_BAUD, timeout=1) as ser:
-            buf = ""
-            while True:
-                c = ser.read(1)
-                if not c:
-                    continue
-                ch = c.decode(errors="ignore")
-                if ch == "\n":
-                    if buf:
-                        ingest_line(buf.strip())
-                        buf = ""
-                elif ch != "\r":
-                    buf += ch
+        ser = serial.Serial(GNSS_DEVICE, GNSS_BAUD, timeout=1)
+        _serial = ser
+        logging.info("📡 [gnss_reader] UART opened: %s @ %d", GNSS_DEVICE, GNSS_BAUD)
+
+        buf = ""
+        while True:
+            c = ser.read(1)
+            if not c:
+                continue
+            ch = c.decode(errors="ignore")
+            if ch == "\n":
+                if buf:
+                    ingest_line(buf.strip())
+                    buf = ""
+            elif ch != "\r":
+                buf += ch
     except Exception:
         logging.exception("[gnss_reader] unhandled exception")
+    finally:
+        _serial = None
 
 # ------------------------------------------------------------------
 # Lock-quality derivation
@@ -639,6 +794,31 @@ def get_gnss_payload(_: Optional[dict]) -> Dict:
         p["integrity"] = integrity
 
     # -----------------------------------------------------------
+    # Survey mode block — commanded mode + receiver truth
+    #
+    # This block unifies:
+    #   • What we commanded (Pi-side intent)
+    #   • What the receiver reports (GF-8802 truth via TPS3)
+    #   • The location we commanded for TO mode
+    # -----------------------------------------------------------
+    survey: Dict[str, object] = {}
+
+    # Receiver truth (always present if TPS3 is reporting)
+    if GNSS.tps3_pos_mode >= 0:
+        survey["receiver_mode"] = GNSS.tps3_pos_mode_name
+
+    # Commanded intent (present after first MODE command)
+    if _commanded_mode is not None:
+        survey["commanded_mode"] = _commanded_mode
+    if _commanded_location is not None:
+        survey["commanded_location"] = _commanded_location
+    if _commanded_at > 0:
+        survey["commanded_ago_s"] = round(time.monotonic() - _commanded_at, 1)
+
+    if survey:
+        p["survey_mode"] = survey
+
+    # -----------------------------------------------------------
     # Raw sentences
     # -----------------------------------------------------------
     p["raw"] = {
@@ -657,6 +837,133 @@ def get_gnss_payload(_: Optional[dict]) -> Dict:
     return p
 
 # ------------------------------------------------------------------
+# PROFILE_LOCATION — quality gate check
+# ------------------------------------------------------------------
+
+def _fix_quality_acceptable() -> bool:
+    """
+    Return True if the current GNSS state meets the quality
+    thresholds required to accept a location profile.
+
+    Requirements:
+      • Valid position (has_position)
+      • Satellites >= PROFILE_MIN_SATELLITES
+      • HDOP <= PROFILE_MAX_HDOP
+      • Lock quality >= PROFILE_MIN_LOCK_QUALITY
+      • Altitude available (not NaN)
+    """
+    if not GNSS.has_position:
+        return False
+
+    if GNSS.satellites < PROFILE_MIN_SATELLITES:
+        return False
+
+    if math.isnan(GNSS.hdop) or GNSS.hdop > PROFILE_MAX_HDOP:
+        return False
+
+    quality = derive_lock_quality()
+    min_rank = _LOCK_QUALITY_RANK.get(PROFILE_MIN_LOCK_QUALITY, 1)
+    if _LOCK_QUALITY_RANK.get(quality, 0) < min_rank:
+        return False
+
+    if math.isnan(GNSS.latitude_deg) or math.isnan(GNSS.longitude_deg):
+        return False
+
+    if math.isnan(GNSS.altitude_m):
+        return False
+
+    return True
+
+# ------------------------------------------------------------------
+# PROFILE_LOCATION — database persistence
+# ------------------------------------------------------------------
+
+def _persist_location(location: str) -> Dict:
+    """
+    Snapshot current GNSS state into the locations table.
+
+    Creates the row if it doesn't exist, updates it if it does.
+    Returns the persisted location facts.
+    """
+    from datetime import datetime, timezone
+
+    now = datetime.now(timezone.utc)
+
+    facts = {
+        "latitude":    round(GNSS.latitude_deg, 9),
+        "longitude":   round(GNSS.longitude_deg, 9),
+        "altitude":    round(GNSS.altitude_m, 3),
+        "hdop":        round(GNSS.hdop, 2) if not math.isnan(GNSS.hdop) else None,
+        "satellites":  GNSS.satellites,
+        "profiled_at": now,
+    }
+
+    with open_db() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            INSERT INTO locations (location, latitude, longitude, altitude,
+                                   hdop, satellites, profiled_at)
+            VALUES (%s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (location)
+            DO UPDATE SET
+                latitude    = EXCLUDED.latitude,
+                longitude   = EXCLUDED.longitude,
+                altitude    = EXCLUDED.altitude,
+                hdop        = EXCLUDED.hdop,
+                satellites  = EXCLUDED.satellites,
+                profiled_at = EXCLUDED.profiled_at
+            """,
+            (
+                location,
+                facts["latitude"],
+                facts["longitude"],
+                facts["altitude"],
+                facts["hdop"],
+                facts["satellites"],
+                facts["profiled_at"],
+            ),
+        )
+
+    logging.info(
+        "📍 [gnss] location '%s' profiled: lat=%.6f lon=%.6f alt=%.1f hdop=%.2f sats=%d",
+        location,
+        facts["latitude"],
+        facts["longitude"],
+        facts["altitude"],
+        facts["hdop"] or 0.0,
+        facts["satellites"],
+    )
+
+    # Return serializable copy
+    return {
+        **facts,
+        "profiled_at": now.isoformat().replace("+00:00", "Z"),
+    }
+
+# ------------------------------------------------------------------
+# MODE — location lookup
+# ------------------------------------------------------------------
+
+def _lookup_location(name: str) -> Optional[Dict]:
+    """
+    Fetch a profiled location from the database.
+
+    Returns dict with latitude, longitude, altitude or None.
+    """
+    with open_db(row_dict=True) as conn:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT latitude, longitude, altitude
+            FROM locations
+            WHERE location = %s
+            """,
+            (name,),
+        )
+        return cur.fetchone()
+
+# ------------------------------------------------------------------
 # Command handlers
 # ------------------------------------------------------------------
 
@@ -665,8 +972,264 @@ def cmd_report(_: Optional[dict]) -> Dict:
     payload = get_gnss_payload(None)
     return {"success": True, "message": "OK", "payload": payload}
 
+
+def cmd_profile_location(args: Optional[dict]) -> Dict:
+    """
+    PROFILE_LOCATION — block until GNSS achieves a quality fix,
+    then snapshot the position into the locations table.
+
+    Args:
+        location (str):       Location name (required)
+        timeout_s (int):      Max seconds to wait for fix (default: 300)
+
+    Semantics:
+      • Blocking (holds the command socket until complete or timeout)
+      • Polls GNSS state at 1 Hz
+      • Quality gate: satellites, HDOP, lock quality, altitude
+      • Upserts into locations table (idempotent on location name)
+      • Returns profiled facts on success
+    """
+    if not args or "location" not in args:
+        return {
+            "success": False,
+            "message": "PROFILE_LOCATION requires 'location' argument",
+        }
+
+    location = args["location"].strip()
+    if not location:
+        return {
+            "success": False,
+            "message": "location name must not be empty",
+        }
+
+    timeout_s = int(args.get("timeout_s", PROFILE_DEFAULT_TIMEOUT_S))
+
+    logging.info(
+        "📍 [gnss] PROFILE_LOCATION '%s' started (timeout=%ds)",
+        location, timeout_s,
+    )
+
+    deadline = time.monotonic() + timeout_s
+    poll_count = 0
+
+    while time.monotonic() < deadline:
+
+        if _fix_quality_acceptable():
+            facts = _persist_location(location)
+            return {
+                "success": True,
+                "message": "OK",
+                "payload": {
+                    "location": location,
+                    "polls": poll_count,
+                    **facts,
+                },
+            }
+
+        poll_count += 1
+        time.sleep(PROFILE_POLL_INTERVAL_S)
+
+    # Timeout — report what we had at the end
+    logging.warning(
+        "⏰ [gnss] PROFILE_LOCATION '%s' timed out after %ds "
+        "(sats=%d hdop=%.2f quality=%s has_pos=%s)",
+        location,
+        timeout_s,
+        GNSS.satellites,
+        GNSS.hdop if not math.isnan(GNSS.hdop) else -1,
+        derive_lock_quality(),
+        GNSS.has_position,
+    )
+
+    return {
+        "success": False,
+        "message": f"PROFILE_LOCATION timed out after {timeout_s}s",
+        "payload": {
+            "location": location,
+            "polls": poll_count,
+            "last_satellites": GNSS.satellites,
+            "last_hdop": GNSS.hdop if not math.isnan(GNSS.hdop) else None,
+            "last_lock_quality": derive_lock_quality(),
+            "has_position": GNSS.has_position,
+        },
+    }
+
+
+def cmd_mode(args: Optional[dict]) -> Dict:
+    """
+    MODE — switch the GF-8802 between NAV and Time Only modes.
+
+    Usage:
+      MODE mode=TO location=<name>     Switch to Time Only at profiled location
+      MODE mode=NORMAL                 Return to normal navigation (CSS)
+
+    Semantics:
+      • Looks up location coordinates from the locations table
+      • Sends $PERDAPI,SURVEY command to GF-8802 via UART
+      • Blocks and polls TPS3 (pos_mode) to verify the mode change
+      • Updates Pi-side commanded mode state
+      • Returns both the command sent and the verified receiver state
+
+    Furuno protocol (GT-87/GF-88xx eSIP):
+      TO mode:   $PERDAPI,SURVEY,3,0,0,<lat>,<lon>,<alt>*XX
+      NAV mode:  $PERDAPI,SURVEY,0*XX
+      CSS mode:  $PERDAPI,SURVEY,2*XX
+
+    Coordinates are decimal degrees (positive=N/E, negative=S/W).
+    Altitude is meters above mean sea level.
+
+    Verification:
+      TPS3 ($PERDCRY) field 2 reports pos_mode:
+        0=NAV, 1=SS, 2=CSS, 3=TO
+    """
+    global _commanded_mode, _commanded_location, _commanded_at
+
+    if not args or "mode" not in args:
+        return {
+            "success": False,
+            "message": "MODE requires 'mode' argument (TO or NORMAL)",
+        }
+
+    mode = args["mode"].strip().upper()
+
+    if mode == "TO":
+        # ----------------------------------------------------------
+        # TIME ONLY mode — requires a profiled location
+        # ----------------------------------------------------------
+        location_name = (args.get("location") or "").strip()
+        if not location_name:
+            return {
+                "success": False,
+                "message": "MODE=TO requires 'location' argument",
+            }
+
+        loc = _lookup_location(location_name)
+        if loc is None:
+            return {
+                "success": False,
+                "message": f"location '{location_name}' not found — run PROFILE_LOCATION first",
+            }
+
+        lat = float(loc["latitude"])
+        lon = float(loc["longitude"])
+        alt = float(loc["altitude"])
+
+        # Format: $PERDAPI,SURVEY,3,0,0,<lat>,<lon>,<alt>*XX
+        # Lat/lon as decimal degrees, alt in meters
+        body = f"PERDAPI,SURVEY,3,0,0,{lat:.4f},{lon:.4f},{alt:.1f}"
+
+        logging.info(
+            "📡 [gnss] MODE=TO location='%s' lat=%.4f lon=%.4f alt=%.1f",
+            location_name, lat, lon, alt,
+        )
+
+        if not _send_nmea(body):
+            return {
+                "success": False,
+                "message": "failed to write SURVEY command to UART",
+            }
+
+        expected_pos_mode = 3   # TO
+        _commanded_mode = "TO"
+        _commanded_location = location_name
+        _commanded_at = time.monotonic()
+
+    elif mode == "NORMAL":
+        # ----------------------------------------------------------
+        # Return to CSS (continual self-survey) mode
+        #
+        # We use CSS (mode 2) rather than NAV (mode 0) because CSS
+        # preserves the survey position across power cycles and
+        # continues refining it — better for a timing receiver.
+        # ----------------------------------------------------------
+        body = "PERDAPI,SURVEY,2"
+
+        logging.info("📡 [gnss] MODE=NORMAL (CSS)")
+
+        if not _send_nmea(body):
+            return {
+                "success": False,
+                "message": "failed to write SURVEY command to UART",
+            }
+
+        expected_pos_mode = 2   # CSS
+        _commanded_mode = "NORMAL"
+        _commanded_location = None
+        _commanded_at = time.monotonic()
+
+    else:
+        return {
+            "success": False,
+            "message": f"unknown mode '{mode}' — use TO or NORMAL",
+        }
+
+    # ----------------------------------------------------------
+    # Verify: poll TPS3 pos_mode until it matches or timeout
+    # ----------------------------------------------------------
+    time.sleep(MODE_WRITE_SETTLE_S)
+
+    deadline = time.monotonic() + MODE_VERIFY_TIMEOUT_S
+    polls = 0
+
+    while time.monotonic() < deadline:
+        if GNSS.tps3_pos_mode == expected_pos_mode:
+            logging.info(
+                "✅ [gnss] MODE verified: pos_mode=%d (%s) after %d polls",
+                GNSS.tps3_pos_mode,
+                POS_MODE_NAMES.get(GNSS.tps3_pos_mode, "?"),
+                polls,
+            )
+            return {
+                "success": True,
+                "message": "OK",
+                "payload": {
+                    "mode": mode,
+                    "location": _commanded_location,
+                    "verified_pos_mode": GNSS.tps3_pos_mode,
+                    "verified_pos_mode_name": POS_MODE_NAMES.get(GNSS.tps3_pos_mode, "?"),
+                    "polls": polls,
+                },
+            }
+
+        polls += 1
+        time.sleep(MODE_VERIFY_POLL_S)
+
+    # Timeout — command was sent but receiver hasn't confirmed
+    logging.warning(
+        "⏰ [gnss] MODE verification timed out after %.1fs "
+        "(expected=%d actual=%d/%s)",
+        MODE_VERIFY_TIMEOUT_S,
+        expected_pos_mode,
+        GNSS.tps3_pos_mode,
+        POS_MODE_NAMES.get(GNSS.tps3_pos_mode, "?"),
+    )
+
+    return {
+        "success": False,
+        "message": (
+            f"MODE command sent but verification timed out after "
+            f"{MODE_VERIFY_TIMEOUT_S}s — receiver reports "
+            f"pos_mode={GNSS.tps3_pos_mode} "
+            f"({POS_MODE_NAMES.get(GNSS.tps3_pos_mode, '?')}), "
+            f"expected {expected_pos_mode}"
+        ),
+        "payload": {
+            "mode": mode,
+            "location": _commanded_location,
+            "command_sent": True,
+            "verified": False,
+            "actual_pos_mode": GNSS.tps3_pos_mode,
+            "actual_pos_mode_name": POS_MODE_NAMES.get(GNSS.tps3_pos_mode, "?"),
+            "expected_pos_mode": expected_pos_mode,
+            "polls": polls,
+        },
+    }
+
+
 COMMANDS = {
     "REPORT": cmd_report,
+    "PROFILE_LOCATION": cmd_profile_location,
+    "MODE": cmd_mode,
 }
 
 # ------------------------------------------------------------------
