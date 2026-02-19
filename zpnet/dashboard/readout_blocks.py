@@ -28,8 +28,11 @@ def get_system_snapshot() -> dict:
     return send_command(machine="PI", subsystem="SYSTEM", command="REPORT")["payload"]
 
 
-def get_clocks_report() -> dict:
+def get_teensy_clocks_report() -> dict:
     return send_command(machine="TEENSY", subsystem="CLOCKS", command="REPORT")["payload"]
+
+def get_pi_clocks_report() -> dict:
+    return send_command(machine="PI", subsystem="CLOCKS", command="REPORT")["payload"]
 
 # ---------------------------------------------------------------------
 # GNSS REPORT (snapshot)
@@ -120,7 +123,8 @@ def _compute_ppb(clock_ns: int, gnss_ns: int) -> float:
 
 
 def clocks_status_readout() -> Generator[str, None, None]:
-    c = get_clocks_report()
+    c = get_teensy_clocks_report()        # Teensy CLOCKS REPORT
+    p = get_pi_clocks_report()     # Pi CLOCKS REPORT
 
     state = c.get("campaign_state")
 
@@ -145,11 +149,14 @@ def clocks_status_readout() -> Generator[str, None, None]:
     gnss_ns = int(c.get("gnss_ns_now", 0))
     dwt_ns  = int(c.get("dwt_ns_now", 0))
     ocxo_ns = int(c.get("ocxo_ns_now", 0))
+    pi_ns   = int(p.get("pi_ns_now", 0))
 
     tau_dwt  = _compute_tau(dwt_ns, gnss_ns)
     tau_ocxo = _compute_tau(ocxo_ns, gnss_ns)
+    tau_pi   = _compute_tau(pi_ns, gnss_ns)
     ppb_dwt  = _compute_ppb(dwt_ns, gnss_ns)
     ppb_ocxo = _compute_ppb(ocxo_ns, gnss_ns)
+    ppb_pi   = _compute_ppb(pi_ns, gnss_ns)
 
     yield f"{'CLK':<8} {'TAU':>14} {'PPB':>14}"
 
@@ -160,7 +167,10 @@ def clocks_status_readout() -> Generator[str, None, None]:
     yield f"{'DWT':<8} {tau_dwt:>14.10f} {ppb_dwt:>14.2f}"
 
     # OCXO
-    yield f"{'OCXO':<8} {tau_ocxo:>14.10f} {ppb_ocxo:>14.2f}"
+    #yield f"{'OCXO':<8} {tau_ocxo:>14.10f} {ppb_ocxo:>14.2f}"
+
+    # Pi
+    yield f"{'PI':<8} {tau_pi:>14.10f} {ppb_pi:>14.2f}"
 
     yield ""
 
@@ -170,16 +180,22 @@ def clocks_status_readout() -> Generator[str, None, None]:
 
     yield f"{'CLK':<5} {'RES':>8} {'MEAN':>8} {'SD':>8} {'SE':>8}"
 
-    for name, prefix in [("GNSS", "gnss"), ("DWT", "dwt"), ("OCXO", "ocxo")]:
-        valid = c.get(f"{prefix}_pps_valid", False)
+    for name, prefix, src in [
+        ("GNSS", "gnss", c),
+        ("DWT",  "dwt",  c),
+        # ("OCXO", "ocxo", c),
+        ("PI",   "pi",   p),
+    ]:
+        valid = src.get(f"{prefix}_pps_valid", False)
         if valid:
-            res    = c.get(f"{prefix}_pps_residual", 0)
-            mean   = float(c.get(f"{prefix}_pps_mean", 0))
-            stddev = float(c.get(f"{prefix}_pps_stddev", 0))
-            stderr = float(c.get(f"{prefix}_pps_stderr", 0))
+            res    = src.get(f"{prefix}_pps_residual", 0)
+            mean   = float(src.get(f"{prefix}_pps_mean", 0))
+            stddev = float(src.get(f"{prefix}_pps_stddev", 0))
+            stderr = float(src.get(f"{prefix}_pps_stderr", 0))
             yield f"{name:<5} {res:>8} {mean:>8.1f} {stddev:>8.1f} {stderr:>8.1f}"
         else:
             yield f"{name:<5} {'---':>8} {'---':>8} {'---':>8} {'---':>8}"
+
 
 
 # ---------------------------------------------------------------------

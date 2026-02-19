@@ -26,6 +26,17 @@
 // At 10 MHz the GPT counters wrap every ~429 seconds (~7 minutes).
 // The 1-second PPS publish guarantees we read them well before wrap.
 //
+// Recovery:
+//
+//   When the Pi restarts mid-campaign, it reads the last TIMEBASE
+//   from Postgres, projects all clock values forward using tau,
+//   and sends RECOVER with the projected dwt_cycles, gnss_ns, and
+//   ocxo_ns.  At the next PPS edge, the Teensy loads these values
+//   into its 64-bit accumulators, latches the current hardware
+//   register positions, transitions to STARTED, and resumes
+//   publishing TIMEBASE_FRAGMENTs.  The clocks continue as if
+//   the interruption never happened.
+//
 // ============================================================================
 
 #include "process_clocks.h"
@@ -311,7 +322,7 @@ uint64_t clocks_ocxo_ns_now(void) {
 }
 
 // ============================================================================
-// Zeroing (campaign-scoped)
+// Zeroing (campaign-scoped — fresh start only, NOT used for recovery)
 // ============================================================================
 
 static void clocks_zero_all(void) {
@@ -358,16 +369,51 @@ static void pps_isr(void) {
         request_stop = false;
       }
 
+      // --------------------------------------------------------
+      // RECOVER: load projected clock values from Pi, latch
+      // hardware register positions, transition to STARTED.
+      //
+      // This does NOT zero the accumulators — it loads the
+      // Pi-computed projections so the campaign continues
+      // seamlessly from where it left off.
+      //
+      // Recovery also resets residual trackers (the first PPS
+      // after recovery has no valid prior snapshot) and sets
+      // campaign_seconds from the projected GNSS ns.
+      // --------------------------------------------------------
+
       if (request_recover) {
+        // Load projected values into 64-bit accumulators
         dwt_cycles_64 = recover_dwt_cycles;
         gnss_ticks_64 = recover_gnss_ns / 100ull;   // ns → 10 MHz ticks
         ocxo_ticks_64 = recover_ocxo_ns / 100ull;   // ns → 10 MHz ticks
 
+        // Latch current hardware register positions so the
+        // next call to clocks_*_now() extends correctly from
+        // the recovered value (delta from latch = 0 initially)
+        dwt_last_32  = DWT_CYCCNT;
         gnss_last_32 = GPT2_CNT;
         ocxo_last_32 = GPT1_CNT;
 
+        // Derive campaign_seconds from projected GNSS ns
+        // (GNSS is truth; 1 second = 1,000,000,000 ns)
+        campaign_seconds = recover_gnss_ns / 1000000000ull;
+
+        // Reset residual trackers — no valid prior PPS snapshot
+        residual_reset(residual_dwt);
+        residual_reset(residual_gnss);
+        residual_reset(residual_ocxo);
+
+        // Transition to STARTED (replaces the request_start path)
+        campaign_state = clocks_campaign_state_t::STARTED;
         request_recover = false;
       }
+
+      // --------------------------------------------------------
+      // START: zero all clocks for a fresh campaign
+      // (only fires if request_start is set AND request_recover
+      // was not — recovery handles its own transition above)
+      // --------------------------------------------------------
 
       if (request_start) {
         clocks_zero_all();
@@ -463,8 +509,11 @@ static Payload cmd_recover(const Payload& args) {
   recover_gnss_ns    = strtoull(s_gnss, nullptr, 10);
   recover_ocxo_ns    = strtoull(s_ocxo, nullptr, 10);
 
+  // Only set request_recover — NOT request_start.
+  // The recover path in the PPS ISR handles its own transition
+  // to STARTED without zeroing the accumulators.
   request_recover = true;
-  request_start   = true;
+  request_start   = false;
   request_stop    = false;
 
   Payload p;
