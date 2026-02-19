@@ -8,16 +8,10 @@ Responsibilities:
   • Augment fragment into full TIMEBASE record
   • Publish TIMEBASE
   • Persist TIMEBASE to PostgreSQL (append-only, best-effort)
+  • Compute per-clock residual statistics (Welford's algorithm)
+  • Denormalize augmented report into active campaign payload
   • Recover clocks after restart if campaign is active
   • Command GNSS into Time Only mode when campaign has a location
-
-Database schema (JSONB):
-  All variable data lives in JSONB payload columns.
-  Relational columns are retained only for filtering/indexing.
-
-  campaigns:  id, ts, campaign, active, payload{location, started_at, stopped_at}
-  timebase:   id, ts, campaign, payload{...entire TIMEBASE tuple...}
-  locations:  id, ts, location, payload{latitude, longitude, altitude, ...}
 
 PPS capture:
   • The pps-gpio kernel driver owns GPIO18 and timestamps edges
@@ -48,17 +42,29 @@ Recovery after restart:
   • Compute synthetic Pi epoch so pi_ns is continuous
   • Resume normal PPS capture and TIMEBASE augmentation
 
-Pi PPS residual tracking:
-  • At each PPS edge, the Pi cycle count is snapshotted
-  • Delta between consecutive PPS edges is computed
-  • Residual = delta - expected_ticks_per_pps
+Per-clock residual statistics:
+  • At each TIMEBASE, the delta-ns between consecutive records
+    is computed for GNSS, DWT, and Pi clock domains
+  • Residual = delta_ns - 1,000,000,000 (deviation from ideal second)
   • Running statistics via Welford's online algorithm
-  • Identical structure to Teensy's pps_residual_t
+  • All three clocks use identical _PpsResidual instances
+  • Pi residual is updated from PPS-captured monotonic_ns
+  • DWT and GNSS residuals are updated from TIMEBASE fragment values
+
+Campaign report denormalization:
+  • After each TIMEBASE, the active campaign row's JSONB payload
+    is updated with a "report" key containing:
+      - Raw timebase fields
+      - Campaign metadata (name, seconds, HH:MM:SS)
+      - Per-clock statistics: ns_now, tau, ppb, residual stats
+  • cmd_report simply reads and returns the campaign payload
+  • No active campaign → empty OK response
 
 Semantics:
-  • No derived values (except during recovery projection)
   • No smoothing, inference, or filtering
   • TIMEBASE records are sacred and immutable
+  • Derivative statistics (tau, ppb, residuals) live only in
+    the campaign report — never in the TIMEBASE row itself
 """
 
 from __future__ import annotations
@@ -92,6 +98,13 @@ PPS_DEVICE = "/dev/pps0"
 # Pi monotonic_ns ticks at 1 GHz (1 ns per tick).
 # Expected ticks between consecutive PPS pulses = 1,000,000,000.
 PI_EXPECTED_PER_PPS = 1_000_000_000
+
+# Expected nanoseconds per PPS for all clock domains.
+# GNSS 10 MHz counter: 100 ns/tick × 10,000,000 ticks = 1e9 ns
+# DWT 600 MHz: cycles * 5/3 = ns, so 1 second = 1e9 ns
+# All clocks measure the same physical second — residual is
+# deviation from this ideal.
+NS_PER_SECOND = 1_000_000_000
 
 # Teensy DWT runs at 600 MHz.
 # dwt_cycles = dwt_ns * 3 / 5   (inverse of ns = cycles * 5 / 3)
@@ -162,15 +175,16 @@ _PPS_FETCH = 0xC00870A4
 # ---------------------------------------------------------------------
 # PPS residual tracking — Welford's online algorithm
 #
-# Structurally identical to Teensy's pps_residual_t.
-# Tracks PPS-to-PPS deltas for the Pi monotonic clock.
+# Used for all clock domains: GNSS, DWT, Pi.
+# Tracks per-PPS-second deltas and their deviation from the
+# ideal 1,000,000,000 ns second.
 # ---------------------------------------------------------------------
 
 class _PpsResidual:
     """Per-clock PPS residual state with Welford's online statistics."""
 
     __slots__ = (
-        "ticks_at_last_pps",
+        "last_ns",
         "delta",
         "residual",
         "valid",
@@ -183,7 +197,7 @@ class _PpsResidual:
         self.reset()
 
     def reset(self) -> None:
-        self.ticks_at_last_pps: int = 0
+        self.last_ns: int = 0
         self.delta: int = 0
         self.residual: int = 0
         self.valid: bool = False
@@ -191,10 +205,18 @@ class _PpsResidual:
         self.mean: float = 0.0
         self.m2: float = 0.0
 
-    def update(self, ticks_now: int, expected: int) -> None:
-        """Update with a new PPS snapshot (mirrors Teensy residual_update)."""
-        if self.ticks_at_last_pps > 0:
-            self.delta = ticks_now - self.ticks_at_last_pps
+    def update(self, ns_now: int, expected: int = NS_PER_SECOND) -> None:
+        """
+        Update with a new clock reading in nanoseconds.
+
+        For the Pi clock, ns_now is the raw monotonic_ns (not
+        campaign-scoped) so that deltas are always valid.
+
+        For GNSS and DWT, ns_now is the campaign-scoped value
+        from the TIMEBASE record.
+        """
+        if self.last_ns > 0:
+            self.delta = ns_now - self.last_ns
             self.residual = self.delta - expected
             self.valid = True
 
@@ -210,7 +232,7 @@ class _PpsResidual:
             self.residual = 0
             self.valid = False
 
-        self.ticks_at_last_pps = ticks_now
+        self.last_ns = ns_now
 
     @property
     def variance(self) -> float:
@@ -223,6 +245,18 @@ class _PpsResidual:
     @property
     def stderr(self) -> float:
         return (self.stddev / math.sqrt(self.n)) if self.n >= 2 else 0.0
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Serialize residual state for the campaign report."""
+        return {
+            "pps_valid": self.valid,
+            "pps_delta": self.delta,
+            "pps_residual": self.residual,
+            "pps_n": self.n,
+            "pps_mean": round(self.mean, 3),
+            "pps_stddev": round(self.stddev, 3),
+            "pps_stderr": round(self.stderr, 3),
+        }
 
 
 # ---------------------------------------------------------------------
@@ -246,8 +280,12 @@ _request_stop: bool = False
 # PPS boundary, never between pulses).
 _campaign_active: bool = False
 
-# Pi PPS residual tracker (mirrors Teensy's residual_dwt etc.)
+# Per-clock PPS residual trackers (Welford's online algorithm).
+# Pi residual is fed from raw monotonic_ns at PPS edges.
+# GNSS and DWT residuals are fed from TIMEBASE ns values.
 _residual_pi = _PpsResidual()
+_residual_gnss = _PpsResidual()
+_residual_dwt = _PpsResidual()
 
 # Latest Pi-side PPS capture
 _last_pi_pps: Optional[Dict[str, Any]] = None
@@ -357,10 +395,11 @@ def _wait_for_gnss_time() -> str:
 
 def _get_active_campaign() -> Optional[Dict[str, Any]]:
     """
-    Return active campaign or None.
+    Return active campaign row or None.
 
-    Returns dict with keys: campaign, payload (JSONB decoded).
-    The payload contains location, started_at, etc.
+    Returns dict with keys: campaign, payload (JSONB).
+    The payload contains location, started_at, and optionally
+    a denormalized report snapshot.
     """
     with open_db(row_dict=True) as conn:
         cur = conn.cursor()
@@ -378,11 +417,14 @@ def _get_active_campaign() -> Optional[Dict[str, Any]]:
     if row is None:
         return None
 
-    # payload is already a dict (psycopg2 decodes JSONB automatically)
-    p = row["payload"] if isinstance(row["payload"], dict) else json.loads(row["payload"])
+    # Decode payload JSONB
+    payload = row["payload"]
+    if isinstance(payload, str):
+        payload = json.loads(payload)
+
     return {
         "campaign": row["campaign"],
-        "location": p.get("location"),
+        "payload": payload,
     }
 
 
@@ -418,27 +460,164 @@ def _set_gnss_mode_normal() -> Dict[str, Any]:
     )
 
 
-def _persist_timebase(tb: Dict[str, Any]) -> None:
-    """
-    Best-effort TIMEBASE insert.
+# ---------------------------------------------------------------------
+# Clock statistics helpers
+# ---------------------------------------------------------------------
 
-    The entire TIMEBASE dict is stored verbatim as JSONB payload.
-    The campaign name is duplicated in the envelope column for
-    indexing.  Failure is logged and ignored.
+def _seconds_to_hms(seconds: int) -> str:
+    """Format integer seconds as HH:MM:SS."""
+    h = seconds // 3600
+    m = (seconds % 3600) // 60
+    s = seconds % 60
+    return f"{h:02d}:{m:02d}:{s:02d}"
+
+
+def _compute_tau(clock_ns: int, gnss_ns: int) -> float:
+    """Dimensionless ratio: clock_ns / gnss_ns."""
+    if gnss_ns == 0:
+        return 0.0
+    return clock_ns / gnss_ns
+
+
+def _compute_ppb(clock_ns: int, gnss_ns: int) -> float:
+    """Deviation from GNSS in parts-per-billion."""
+    if gnss_ns == 0:
+        return 0.0
+    return ((clock_ns - gnss_ns) / gnss_ns) * 1e9
+
+
+def _build_clock_block(
+    name: str,
+    ns_now: int,
+    gnss_ns: int,
+    residual: _PpsResidual,
+) -> Dict[str, Any]:
+    """
+    Build a per-clock statistics block for the campaign report.
+
+    Contains: ns_now, tau, ppb, and all residual statistics.
+    """
+    block: Dict[str, Any] = {
+        "ns_now": ns_now,
+        "tau": round(_compute_tau(ns_now, gnss_ns), 12),
+        "ppb": round(_compute_ppb(ns_now, gnss_ns), 3),
+    }
+    block.update(residual.to_dict())
+    return block
+
+
+# ---------------------------------------------------------------------
+# Campaign report builder
+# ---------------------------------------------------------------------
+
+def _build_report(
+    campaign_name: str,
+    campaign_payload: Dict[str, Any],
+    timebase: Dict[str, Any],
+) -> Dict[str, Any]:
+    """
+    Build the augmented campaign report from a TIMEBASE record
+    and current residual statistics.
+
+    This is denormalized into the campaign's JSONB payload as
+    the "report" key, and is what cmd_report returns verbatim.
+
+    Structure:
+      {
+        "campaign": "Alpha",
+        "campaign_state": "STARTED",
+        "campaign_seconds": 42,
+        "campaign_elapsed": "00:00:42",
+        "location": "Peninsula",
+        "gnss_time_utc": "...",
+        "system_time_utc": "...",
+        "teensy_pps_count": 42,
+        "pi_pps_count": 42,
+        "gnss": { ns_now, tau, ppb, pps_* },
+        "dwt":  { ns_now, tau, ppb, pps_* },
+        "pi":   { ns_now, tau, ppb, pps_* },
+      }
+    """
+    gnss_ns = int(timebase.get("teensy_gnss_ns") or 0)
+    dwt_ns = int(timebase.get("teensy_dwt_ns") or 0)
+    pi_ns = int(timebase.get("pi_ns") or 0)
+
+    # Campaign elapsed time derived from GNSS nanoseconds
+    # (GNSS is truth — use it as the elapsed-time reference)
+    campaign_seconds = gnss_ns // NS_PER_SECOND if gnss_ns > 0 else 0
+
+    report: Dict[str, Any] = {
+        # Campaign metadata
+        "campaign": campaign_name,
+        "campaign_state": "STARTED",
+        "campaign_seconds": campaign_seconds,
+        "campaign_elapsed": _seconds_to_hms(campaign_seconds),
+        "location": campaign_payload.get("location"),
+
+        # Timestamps
+        "gnss_time_utc": timebase.get("gnss_time_utc"),
+        "system_time_utc": timebase.get("system_time_utc"),
+
+        # PPS counts
+        "teensy_pps_count": timebase.get("teensy_pps_count"),
+        "pi_pps_count": timebase.get("pi_pps_count"),
+
+        # Raw Teensy clock values (for forensics / recovery)
+        "teensy_dwt_cycles": timebase.get("teensy_dwt_cycles"),
+        "teensy_ocxo_ns": timebase.get("teensy_ocxo_ns"),
+        "teensy_rtc1_ns": timebase.get("teensy_rtc1_ns"),
+        "teensy_rtc2_ns": timebase.get("teensy_rtc2_ns"),
+        "pi_cycles": timebase.get("pi_cycles"),
+
+        # Per-clock statistics
+        "gnss": _build_clock_block("GNSS", gnss_ns, gnss_ns, _residual_gnss),
+        "dwt": _build_clock_block("DWT", dwt_ns, gnss_ns, _residual_dwt),
+        "pi": _build_clock_block("PI", pi_ns, gnss_ns, _residual_pi),
+    }
+
+    return report
+
+
+# ---------------------------------------------------------------------
+# Persistence
+# ---------------------------------------------------------------------
+
+def _persist_timebase(tb: Dict[str, Any], report: Dict[str, Any]) -> None:
+    """
+    Best-effort TIMEBASE insert into the timebase table,
+    followed by denormalization of the augmented report into
+    the active campaign's JSONB payload.
+
+    The campaign row's payload is merged (not replaced) using
+    the || operator, so existing keys like 'location' and
+    'started_at' are preserved.
+
+    Failure is logged and ignored.
     """
     try:
         with open_db() as conn:
             cur = conn.cursor()
+
+            # 1) Append-only TIMEBASE row (sacred, immutable)
             cur.execute(
                 """
                 INSERT INTO timebase (campaign, payload)
                 VALUES (%s, %s)
                 """,
-                (
-                    tb["campaign"],
-                    json.dumps(tb),
-                ),
+                (tb["campaign"], json.dumps(tb)),
             )
+
+            # 2) Denormalize augmented report into campaign payload
+            cur.execute(
+                """
+                UPDATE campaigns
+                SET payload = payload || jsonb_build_object('report', %s::jsonb)
+                WHERE campaign = %s
+                  AND active = true
+                """,
+                (json.dumps(report), tb["campaign"]),
+            )
+
     except Exception:
         logging.exception("⚠️ [clocks] failed to persist TIMEBASE (ignored)")
 
@@ -509,7 +688,8 @@ def _recover_campaign() -> None:
         return
 
     campaign_name = row["campaign"]
-    campaign_location = row.get("location")
+    campaign_payload = row["payload"]
+    campaign_location = campaign_payload.get("location")
     logging.info(
         "🔍 [recovery] active campaign found: '%s' (location: %s)",
         campaign_name,
@@ -540,17 +720,19 @@ def _recover_campaign() -> None:
         )
         return
 
-    last_tb = tb_row["payload"] if isinstance(tb_row["payload"], dict) else json.loads(tb_row["payload"])
+    last_tb = tb_row["payload"]
+    if isinstance(last_tb, str):
+        last_tb = json.loads(last_tb)
 
     last_gnss_utc_str = last_tb["gnss_time_utc"]
     last_gnss_utc = datetime.fromisoformat(
         last_gnss_utc_str.replace("Z", "+00:00")
     )
-    last_dwt_cycles = int(last_tb.get("teensy_dwt_cycles", 0))
-    last_dwt_ns = int(last_tb.get("teensy_dwt_ns", 0))
+    last_dwt_cycles = int(last_tb["teensy_dwt_cycles"])
+    last_dwt_ns = int(last_tb["teensy_dwt_ns"])
     last_gnss_ns = int(last_tb.get("teensy_gnss_ns") or 0)
     last_ocxo_ns = int(last_tb.get("teensy_ocxo_ns") or 0)
-    last_pi_ns = int(last_tb.get("pi_ns", 0))
+    last_pi_ns = int(last_tb["pi_ns"])
 
     logging.info(
         "🔍 [recovery] last TIMEBASE: gnss_utc=%s  gnss_ns=%d  dwt_ns=%d  ocxo_ns=%d  pi_ns=%d",
@@ -675,12 +857,11 @@ def _recover_campaign() -> None:
     #    second after the PPS we just captured)
     # ----------------------------------------------------------
     project_seconds = elapsed_seconds + 1
-    ns_per_second = 1_000_000_000
 
-    projected_gnss_ns = last_gnss_ns + (project_seconds * ns_per_second)
-    projected_dwt_ns = last_dwt_ns + int(project_seconds * ns_per_second * tau_dwt)
-    projected_ocxo_ns = last_ocxo_ns + int(project_seconds * ns_per_second * tau_ocxo) if last_ocxo_ns > 0 else 0
-    projected_pi_ns = last_pi_ns + int(project_seconds * ns_per_second * tau_pi)
+    projected_gnss_ns = last_gnss_ns + (project_seconds * NS_PER_SECOND)
+    projected_dwt_ns = last_dwt_ns + int(project_seconds * NS_PER_SECOND * tau_dwt)
+    projected_ocxo_ns = last_ocxo_ns + int(project_seconds * NS_PER_SECOND * tau_ocxo) if last_ocxo_ns > 0 else 0
+    projected_pi_ns = last_pi_ns + int(project_seconds * NS_PER_SECOND * tau_pi)
 
     # Convert DWT ns back to cycles: cycles = ns * 3 / 5
     projected_dwt_cycles = (projected_dwt_ns * DWT_CYCLES_PER_NS_NUM) // DWT_CYCLES_PER_NS_DEN
@@ -736,9 +917,11 @@ def _recover_campaign() -> None:
     #    is sub-microsecond and corrects on the first real PPS
     #    capture.
     # ----------------------------------------------------------
-    _pi_cycles_epoch = (mono_at_pps + ns_per_second) - projected_pi_ns
+    _pi_cycles_epoch = (mono_at_pps + NS_PER_SECOND) - projected_pi_ns
     _pi_pps_count = 0
     _residual_pi.reset()
+    _residual_gnss.reset()
+    _residual_dwt.reset()
 
     # ----------------------------------------------------------
     # 11) Activate campaign — PPS listener will begin capturing
@@ -812,6 +995,8 @@ def _pps_listener() -> None:
                 _pi_pps_count = 0
                 _last_pi_pps = None
                 _residual_pi.reset()
+                _residual_gnss.reset()
+                _residual_dwt.reset()
                 _campaign_active = True
                 _request_start = False
                 logging.info("▶️ [clocks] campaign started at PPS boundary (epoch zeroed)")
@@ -835,7 +1020,9 @@ def _pps_listener() -> None:
             pi_ns = _read_pi_ns_from_cycles(pi_cycles)
 
             # ----------------------------------------------------------
-            # PPS residual tracking (mirrors Teensy residual_update)
+            # PPS residual tracking for Pi clock
+            # (GNSS and DWT residuals are updated in _try_complete_timebase
+            #  when the Teensy fragment arrives)
             # ----------------------------------------------------------
             _residual_pi.update(pi_cycles, PI_EXPECTED_PER_PPS)
 
@@ -879,6 +1066,8 @@ def on_timebase_fragment(payload: Payload) -> None:
 def _try_complete_timebase() -> None:
     """
     Combine Pi PPS + Teensy fragment + GNSS time into TIMEBASE.
+    Update per-clock residual statistics.
+    Build augmented report and denormalize into campaign payload.
     """
     global _last_pi_pps, _last_teensy_fragment
 
@@ -899,6 +1088,7 @@ def _try_complete_timebase() -> None:
         return
 
     campaign = row["campaign"]
+    campaign_payload = row["payload"]
     gnss_time = _get_gnss_time()
 
     system_time = datetime.now(timezone.utc).isoformat(timespec='milliseconds')
@@ -925,11 +1115,28 @@ def _try_complete_timebase() -> None:
         "pi_pps_count": pi_pps["pi_pps_count"],
     }
 
+    # ----------------------------------------------------------
+    # Update GNSS and DWT residual statistics
+    # (Pi residual is updated in _pps_listener at PPS edge)
+    # ----------------------------------------------------------
+    gnss_ns = int(frag.get("gnss_ns") or 0)
+    dwt_ns = int(frag.get("dwt_ns") or 0)
+
+    if gnss_ns > 0:
+        _residual_gnss.update(gnss_ns)
+    if dwt_ns > 0:
+        _residual_dwt.update(dwt_ns)
+
+    # ----------------------------------------------------------
+    # Build augmented report
+    # ----------------------------------------------------------
+    report = _build_report(campaign, campaign_payload, timebase)
+
     # Publish sacred tuple
     publish("TIMEBASE", timebase)
 
-    # Persist best-effort
-    _persist_timebase(timebase)
+    # Persist best-effort (also denormalizes report into campaign)
+    _persist_timebase(timebase, report)
 
 
 # ---------------------------------------------------------------------
@@ -949,7 +1156,7 @@ def cmd_start(args: Optional[dict]) -> dict:
 
     Sequence:
       1) Deactivate any existing campaign
-      2) Insert new campaign row (with optional location)
+      2) Insert new campaign row (with optional location in JSONB payload)
       3) If location specified: command GNSS → TO mode (blocking)
       4) Set _request_start flag (Pi epoch zeroed at next PPS)
       5) Start Teensy CLOCKS acquisition (Teensy also zeros at PPS)
@@ -966,30 +1173,31 @@ def cmd_start(args: Optional[dict]) -> dict:
 
     location = (args.get("location") or "").strip() or None
 
-    now_iso = datetime.now(timezone.utc).isoformat(timespec='milliseconds')
-
     # ----------------------------------------------------------
     # 1) Deactivate existing + insert new campaign
     # ----------------------------------------------------------
+    campaign_payload = {
+        "location": location,
+        "started_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+    }
+
     with open_db() as conn:
         cur = conn.cursor()
 
-        # Deactivate and stamp stopped_at in payload
+        # Mark any active campaign as stopped
         cur.execute(
             """
             UPDATE campaigns
             SET active = false,
-                payload = payload || %s
+                payload = payload || jsonb_build_object(
+                    'stopped_at', to_jsonb(%s::text)
+                )
             WHERE active = true
             """,
-            (json.dumps({"stopped_at": now_iso}),),
+            (datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),),
         )
 
-        campaign_payload = {
-            "location": location,
-            "started_at": now_iso,
-        }
-
+        # Insert new campaign with JSONB payload
         cur.execute(
             """
             INSERT INTO campaigns (campaign, active, payload)
@@ -1060,7 +1268,8 @@ def cmd_stop(_: Optional[dict]) -> dict:
 
     Sequence:
       1) Read active campaign (to check if it had a location)
-      2) Deactivate campaign in DB (merge stopped_at into payload)
+      2) Deactivate campaign in DB (set stopped_at in JSONB payload,
+         update campaign_state in report)
       3) Set _request_stop flag (applied at next PPS boundary)
       4) Stop Teensy CLOCKS acquisition
       5) If campaign had a location: restore GNSS → NORMAL (CSS)
@@ -1071,12 +1280,12 @@ def cmd_stop(_: Optional[dict]) -> dict:
     # 1) Check if active campaign had a location
     # ----------------------------------------------------------
     row = _get_active_campaign()
-    had_location = row["location"] if row else None
+    had_location = row["payload"].get("location") if row else None
 
     # ----------------------------------------------------------
-    # 2) Deactivate campaign
+    # 2) Deactivate campaign (add stopped_at, update report state)
     # ----------------------------------------------------------
-    now_iso = datetime.now(timezone.utc).isoformat(timespec='milliseconds')
+    stopped_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
     with open_db() as conn:
         cur = conn.cursor()
@@ -1084,10 +1293,19 @@ def cmd_stop(_: Optional[dict]) -> dict:
             """
             UPDATE campaigns
             SET active = false,
-                payload = payload || %s
+                payload = payload
+                    || jsonb_build_object('stopped_at', to_jsonb(%s::text))
+                    || CASE
+                        WHEN payload ? 'report'
+                        THEN jsonb_build_object(
+                            'report',
+                            (payload->'report') || '{"campaign_state":"STOPPED"}'::jsonb
+                        )
+                        ELSE '{}'::jsonb
+                       END
             WHERE active = true
             """,
-            (json.dumps({"stopped_at": now_iso}),),
+            (stopped_at,),
         )
 
     # ----------------------------------------------------------
@@ -1132,110 +1350,34 @@ def cmd_report(_: Optional[dict]) -> Dict[str, Any]:
     """
     Report current CLOCKS state.
 
-    Includes Pi clock statistics (pi_ns_now, PPS residuals) in the
-    same format as the Teensy CLOCKS REPORT, so the status readout
-    can display the Pi as a fourth clock domain.
+    Simply reads and returns the active campaign's payload,
+    which contains the denormalized report built each second
+    by _try_complete_timebase.
+
+    If no campaign is active, returns an empty OK response
+    indicating clocks are idle.
 
     Semantics:
       • Observational only
-      • No inference
-      • No derived values
+      • No computation at report time
+      • Campaign payload is the single source of truth
     """
 
-    payload: Dict[str, Any] = {
-        "campaign": {
-            "active": False
+    row = _get_active_campaign()
+
+    if not row:
+        return {
+            "success": True,
+            "message": "OK",
+            "payload": {
+                "campaign_state": "IDLE",
+            },
         }
-    }
-
-    # ----------------------------------------------------------------
-    # Pi clock state (always available, independent of DB)
-    # ----------------------------------------------------------------
-
-    pi_cycles_now = _read_pi_cycle_count()
-    pi_ns_now = _read_pi_ns_from_cycles(pi_cycles_now) if _campaign_active else 0
-
-    payload["pi_cycles_now"] = pi_cycles_now
-    payload["pi_ns_now"] = pi_ns_now
-    payload["pi_pps_count"] = _pi_pps_count
-    payload["pi_campaign_active"] = _campaign_active
-
-    # Pi PPS residual statistics (same keys as Teensy uses)
-    r = _residual_pi
-    payload["pi_pps_valid"] = r.valid
-    payload["pi_pps_delta"] = r.delta
-    payload["pi_pps_residual"] = r.residual
-    payload["pi_pps_n"] = r.n
-    payload["pi_pps_mean"] = f"{r.mean:.3f}"
-    payload["pi_pps_stddev"] = f"{r.stddev:.3f}"
-    payload["pi_pps_stderr"] = f"{r.stderr:.3f}"
-
-    # ----------------------------------------------------------------
-    # Campaign + TIMEBASE from DB
-    # ----------------------------------------------------------------
-
-    with open_db(row_dict=True) as conn:
-        cur = conn.cursor()
-
-        # ------------------------------------------------------------
-        # Fetch active campaign (authoritative)
-        # ------------------------------------------------------------
-        cur.execute(
-            """
-            SELECT id, campaign, payload
-            FROM campaigns
-            WHERE active = true
-            ORDER BY ts DESC
-            LIMIT 1
-            """
-        )
-        campaign = cur.fetchone()
-
-        if not campaign:
-            return {
-                "success": True,
-                "message": "OK",
-                "payload": payload,
-            }
-
-        campaign_id = campaign["id"]
-        cp = campaign["payload"] if isinstance(campaign["payload"], dict) else json.loads(campaign["payload"])
-
-        payload["campaign"] = {
-            "active": True,
-            "campaign_id": campaign_id,
-            "campaign": campaign["campaign"],
-            "location": cp.get("location"),
-            "started_at": cp.get("started_at"),
-            "last_timebase_id": None,
-        }
-
-        # ------------------------------------------------------------
-        # Fetch most recent TIMEBASE for this campaign
-        # ------------------------------------------------------------
-        cur.execute(
-            """
-            SELECT id, payload
-            FROM timebase
-            WHERE campaign = %s
-            ORDER BY ts DESC
-            LIMIT 1
-            """,
-            (campaign["campaign"],)
-        )
-        tb = cur.fetchone()
-
-        if tb:
-            payload["campaign"]["last_timebase_id"] = tb["id"]
-            payload["timebase"] = tb["payload"] if isinstance(tb["payload"], dict) else json.loads(tb["payload"])
-            payload["timebase"]["id"] = tb["id"]
-        else:
-            payload["timebase"] = None
 
     return {
         "success": True,
         "message": "OK",
-        "payload": payload,
+        "payload": row["payload"],
     }
 
 

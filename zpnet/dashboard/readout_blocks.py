@@ -103,99 +103,53 @@ def gnss_report_readout() -> Generator[str, None, None]:
 # CLOCKS (synthetic clock substrate)
 # ---------------------------------------------------------------------
 
-def seconds_to_hms(seconds: int) -> str:
-    h = seconds // 3600
-    m = (seconds % 3600) // 60
-    s = seconds % 60
-    return f"{h:02d}:{m:02d}:{s:02d}"
-
-def _compute_tau(clock_ns: int, gnss_ns: int) -> float:
-    """Dimensionless ratio: clock_ns / gnss_ns."""
-    if gnss_ns == 0:
-        return 0.0
-    return clock_ns / gnss_ns
-
-def _compute_ppb(clock_ns: int, gnss_ns: int) -> float:
-    """Deviation from GNSS in parts-per-billion."""
-    if gnss_ns == 0:
-        return 0.0
-    return ((clock_ns - gnss_ns) / gnss_ns) * 1e9
-
-
 def clocks_status_readout() -> Generator[str, None, None]:
-    c = get_teensy_clocks_report()        # Teensy CLOCKS REPORT
-    p = get_pi_clocks_report()     # Pi CLOCKS REPORT
+    p = get_pi_clocks_report()
 
-    state = c.get("campaign_state")
+    state = p.get("report", {}).get("campaign_state") or p.get("campaign_state", "IDLE")
 
-    # ------------------------------------------------------------
-    # Status line
-    # ------------------------------------------------------------
-
-    if state == "STARTED":
-        campaign = c.get("campaign")
-        secs = c.get("campaign_seconds", 0)
-        elapsed_hms = seconds_to_hms(secs)
-        yield f"CLOCKS: STARTED {elapsed_hms} {campaign}"
-    else:
+    if state != "STARTED":
         yield f"CLOCKS: {state}"
+        return
 
+    r = p["report"]
+
+    campaign = r.get("campaign", "?")
+    elapsed = r.get("campaign_elapsed", "00:00:00")
+    yield f"CLOCKS: STARTED {elapsed} {campaign}"
     yield ""
 
-    # ------------------------------------------------------------
+    # ----------------------------------------------------------------
     # Clock table — cumulative tau and PPB
-    # ------------------------------------------------------------
-
-    gnss_ns = int(c.get("gnss_ns_now", 0))
-    dwt_ns  = int(c.get("dwt_ns_now", 0))
-    ocxo_ns = int(c.get("ocxo_ns_now", 0))
-    pi_ns   = int(p.get("pi_ns_now", 0))
-
-    tau_dwt  = _compute_tau(dwt_ns, gnss_ns)
-    tau_ocxo = _compute_tau(ocxo_ns, gnss_ns)
-    tau_pi   = _compute_tau(pi_ns, gnss_ns)
-    ppb_dwt  = _compute_ppb(dwt_ns, gnss_ns)
-    ppb_ocxo = _compute_ppb(ocxo_ns, gnss_ns)
-    ppb_pi   = _compute_ppb(pi_ns, gnss_ns)
+    # ----------------------------------------------------------------
 
     yield f"{'CLK':<8} {'TAU':>14} {'PPB':>14}"
-
-    # GNSS baseline
     yield f"{'GNSS':<8} {'1.0000000000':>14} {'0.00':>14}"
 
-    # DWT
-    yield f"{'DWT':<8} {tau_dwt:>14.10f} {ppb_dwt:>14.2f}"
-
-    # OCXO
-    #yield f"{'OCXO':<8} {tau_ocxo:>14.10f} {ppb_ocxo:>14.2f}"
-
-    # Pi
-    yield f"{'PI':<8} {tau_pi:>14.10f} {ppb_pi:>14.2f}"
+    for name, key in [("DWT", "dwt"), ("PI", "pi")]:
+        blk = r.get(key, {})
+        tau = blk.get("tau", 0.0)
+        ppb = blk.get("ppb", 0.0)
+        yield f"{name:<8} {tau:>14.10f} {ppb:>14.2f}"
 
     yield ""
 
-    # ------------------------------------------------------------
+    # ----------------------------------------------------------------
     # Residual table
-    # ------------------------------------------------------------
+    # ----------------------------------------------------------------
 
     yield f"{'CLK':<5} {'RES':>8} {'MEAN':>8} {'SD':>8} {'SE':>8}"
 
-    for name, prefix, src in [
-        ("GNSS", "gnss", c),
-        ("DWT",  "dwt",  c),
-        # ("OCXO", "ocxo", c),
-        ("PI",   "pi",   p),
-    ]:
-        valid = src.get(f"{prefix}_pps_valid", False)
-        if valid:
-            res    = src.get(f"{prefix}_pps_residual", 0)
-            mean   = float(src.get(f"{prefix}_pps_mean", 0))
-            stddev = float(src.get(f"{prefix}_pps_stddev", 0))
-            stderr = float(src.get(f"{prefix}_pps_stderr", 0))
+    for name, key in [("GNSS", "gnss"), ("DWT", "dwt"), ("PI", "pi")]:
+        blk = r.get(key, {})
+        if blk.get("pps_valid"):
+            res    = blk.get("pps_residual", 0)
+            mean   = blk.get("pps_mean", 0.0)
+            stddev = blk.get("pps_stddev", 0.0)
+            stderr = blk.get("pps_stderr", 0.0)
             yield f"{name:<5} {res:>8} {mean:>8.1f} {stddev:>8.1f} {stderr:>8.1f}"
         else:
             yield f"{name:<5} {'---':>8} {'---':>8} {'---':>8} {'---':>8}"
-
 
 
 # ---------------------------------------------------------------------
