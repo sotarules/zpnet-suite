@@ -29,6 +29,8 @@ Campaign start synchronisation:
 Recovery after restart:
   • On startup, if an active campaign exists with TIMEBASE rows
     in Postgres, the Pi orchestrates clock recovery
+  • Patiently wait for GNSS to acquire satellites and produce
+    a valid timestamp (may take minutes after cold start)
   • Wait for PPS edge → capture GNSS time → compute seconds
     elapsed since last TIMEBASE
   • Project all clock nanosecond values forward using tau
@@ -86,6 +88,12 @@ PI_EXPECTED_PER_PPS = 1_000_000_000
 # dwt_cycles = dwt_ns * 3 / 5   (inverse of ns = cycles * 5 / 3)
 DWT_CYCLES_PER_NS_NUM = 3
 DWT_CYCLES_PER_NS_DEN = 5
+
+# How often to poll GNSS while waiting for a valid fix (seconds)
+GNSS_POLL_INTERVAL = 5
+
+# How often to log a "still waiting" message (seconds)
+GNSS_WAIT_LOG_INTERVAL = 60
 
 # ---------------------------------------------------------------------
 # Kernel PPS ioctl interface (linux/pps.h)
@@ -276,6 +284,9 @@ def _get_gnss_time() -> str:
     """
     Fetch last-known GNSS UTC time from GNSS process.
     Returns ISO8601 Z string.
+
+    Raises KeyError if the GNSS process has no valid fix yet
+    (date/time fields not present in REPORT payload).
     """
     payload = send_command(
         machine="PI",
@@ -286,6 +297,53 @@ def _get_gnss_time() -> str:
     date = payload["date"]
     time_s = payload["time"]
     return f"{date}T{time_s}Z"
+
+
+def _wait_for_gnss_time() -> str:
+    """
+    Patiently wait for the GNSS receiver to produce a valid timestamp.
+
+    After a cold start, the receiver may need minutes to acquire
+    satellites and compute a fix.  This function polls the GNSS
+    REPORT every GNSS_POLL_INTERVAL seconds and logs a "still
+    waiting" message every GNSS_WAIT_LOG_INTERVAL seconds.
+
+    Returns ISO8601 Z string once available.
+    Never times out — the math works regardless of how long
+    the wait is.
+    """
+    wait_start = time.monotonic()
+    last_log = wait_start
+
+    while True:
+        try:
+            payload = send_command(
+                machine="PI",
+                subsystem="GNSS",
+                command="REPORT",
+            )["payload"]
+
+            date = payload.get("date")
+            time_s = payload.get("time")
+
+            if date and time_s:
+                return f"{date}T{time_s}Z"
+
+        except Exception:
+            # GNSS process might not even be up yet — that's fine
+            pass
+
+        now = time.monotonic()
+        elapsed = now - wait_start
+
+        if now - last_log >= GNSS_WAIT_LOG_INTERVAL:
+            logging.info(
+                "⏳ [recovery] waiting for GNSS time... (%.0fs elapsed)",
+                elapsed,
+            )
+            last_log = now
+
+        time.sleep(GNSS_POLL_INTERVAL)
 
 
 def _get_active_campaign() -> Optional[Dict[str, Any]]:
@@ -355,6 +413,7 @@ def _persist_timebase(tb: Dict[str, Any]) -> None:
                     gnss_time_utc,
                     teensy_dwt_cycles,
                     teensy_dwt_ns,
+                    teensy_gnss_ns,
                     teensy_ocxo_ns,
                     teensy_rtc1_ns,
                     teensy_rtc2_ns,
@@ -363,13 +422,14 @@ def _persist_timebase(tb: Dict[str, Any]) -> None:
                     teensy_pps_count,
                     pi_pps_count
                 )
-                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                 """,
                 (
                     tb["campaign"],
                     tb["gnss_time_utc"],
                     tb["teensy_dwt_cycles"],
                     tb["teensy_dwt_ns"],
+                    tb.get("teensy_gnss_ns"),
                     tb.get("teensy_ocxo_ns"),
                     tb.get("teensy_rtc1_ns"),
                     tb.get("teensy_rtc2_ns"),
@@ -419,18 +479,24 @@ def _recover_campaign() -> None:
     Algorithm:
       1) Check for active campaign in Postgres
       2) Fetch the most recent TIMEBASE row for that campaign
-      3) If campaign has a location, restore GNSS → TO mode
-      4) Wait for PPS edge, capture GNSS time at that boundary
-      5) Compute elapsed seconds since last TIMEBASE
-      6) Compute tau for each Teensy clock domain
-      7) Project all clock values forward to the NEXT PPS edge
+      3) Wait patiently for GNSS to produce a valid timestamp
+         (may take minutes after a cold start — logs once per
+         minute while waiting)
+      4) If campaign has a location, restore GNSS → TO mode
+      5) Wait for PPS edge, capture GNSS time at that boundary
+      6) Compute elapsed seconds since last TIMEBASE
+      7) Compute tau for each Teensy clock domain
+      8) Project all clock values forward to the NEXT PPS edge
          (one more second beyond the one we just captured)
-      8) Send RECOVER to Teensy with projected values
-      9) Compute synthetic Pi epoch for continuous pi_ns
-     10) Activate campaign in _pps_listener (set _campaign_active)
+      9) Send RECOVER to Teensy with projected values
+     10) Compute synthetic Pi epoch for continuous pi_ns
+     11) Activate campaign in _pps_listener (set _campaign_active)
 
     The Teensy RECOVER command loads the projected values at its
     next PPS edge, then resumes publishing TIMEBASE_FRAGMENTs.
+
+    The wait for GNSS never times out — the projection math works
+    correctly regardless of how many seconds have elapsed.
     """
     global _pi_cycles_epoch, _pi_pps_count, _campaign_active
 
@@ -500,7 +566,24 @@ def _recover_campaign() -> None:
         last_gnss_ns = last_dwt_ns
 
     # ----------------------------------------------------------
-    # 3) If campaign has a location, restore GNSS → TO mode
+    # 3) Wait for GNSS to produce a valid timestamp
+    #
+    #    After a cold start the receiver may need minutes to
+    #    acquire satellites.  We poll patiently, logging once
+    #    per minute.  There is no timeout — the projection math
+    #    works regardless of how long we wait.
+    # ----------------------------------------------------------
+    logging.info("⏳ [recovery] waiting for GNSS time to become available...")
+
+    gnss_time_preflight = _wait_for_gnss_time()
+
+    logging.info(
+        "✅ [recovery] GNSS time available: %s",
+        gnss_time_preflight,
+    )
+
+    # ----------------------------------------------------------
+    # 4) If campaign has a location, restore GNSS → TO mode
     # ----------------------------------------------------------
     if campaign_location:
         logging.info(
@@ -520,7 +603,7 @@ def _recover_campaign() -> None:
             logging.exception("⚠️ [recovery] GNSS MODE=TO IPC failed (continuing)")
 
     # ----------------------------------------------------------
-    # 4) Wait for PPS edge and capture GNSS time
+    # 5) Wait for PPS edge and capture GNSS time
     # ----------------------------------------------------------
     logging.info("⏳ [recovery] waiting for PPS edge...")
 
@@ -537,7 +620,8 @@ def _recover_campaign() -> None:
     finally:
         os.close(fd)
 
-    # Get GNSS time at this PPS boundary
+    # Get GNSS time at this PPS boundary (GNSS is known to be
+    # available — we confirmed it in step 3)
     gnss_time_now_str = _get_gnss_time()
     gnss_time_now = datetime.fromisoformat(
         gnss_time_now_str.replace("Z", "+00:00")
@@ -546,7 +630,7 @@ def _recover_campaign() -> None:
     logging.info("⏱️ [recovery] PPS captured — GNSS time now: %s", gnss_time_now_str)
 
     # ----------------------------------------------------------
-    # 5) Compute elapsed seconds since last TIMEBASE
+    # 6) Compute elapsed seconds since last TIMEBASE
     # ----------------------------------------------------------
     # Both are UTC datetimes aligned to PPS second boundaries
     elapsed_td = gnss_time_now - last_gnss_utc
@@ -565,7 +649,7 @@ def _recover_campaign() -> None:
     )
 
     # ----------------------------------------------------------
-    # 6) Compute tau for each clock domain
+    # 7) Compute tau for each clock domain
     # ----------------------------------------------------------
     # tau = clock_ns / gnss_ns (dimensionless ratio)
     # GNSS is truth, so tau_gnss = 1.0 by definition.
@@ -582,7 +666,7 @@ def _recover_campaign() -> None:
     )
 
     # ----------------------------------------------------------
-    # 7) Project clock values to the NEXT PPS edge
+    # 8) Project clock values to the NEXT PPS edge
     #    (Teensy will load these at its next PPS, which is one
     #    second after the PPS we just captured)
     # ----------------------------------------------------------
@@ -607,7 +691,7 @@ def _recover_campaign() -> None:
     )
 
     # ----------------------------------------------------------
-    # 8) Send RECOVER to Teensy
+    # 9) Send RECOVER to Teensy
     # ----------------------------------------------------------
     logging.info("🚀 [recovery] sending RECOVER to Teensy...")
 
@@ -635,7 +719,7 @@ def _recover_campaign() -> None:
         return
 
     # ----------------------------------------------------------
-    # 9) Compute synthetic Pi epoch for continuous pi_ns
+    # 10) Compute synthetic Pi epoch for continuous pi_ns
     #
     #    We need: pi_ns = monotonic_ns - epoch = projected_pi_ns
     #    at the NEXT PPS edge.  The next PPS is ~1 second from
@@ -653,7 +737,7 @@ def _recover_campaign() -> None:
     _residual_pi.reset()
 
     # ----------------------------------------------------------
-    # 10) Activate campaign — PPS listener will begin capturing
+    # 11) Activate campaign — PPS listener will begin capturing
     # ----------------------------------------------------------
     _campaign_active = True
 
