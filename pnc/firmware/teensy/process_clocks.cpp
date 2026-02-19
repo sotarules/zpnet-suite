@@ -26,6 +26,27 @@
 // At 10 MHz the GPT counters wrap every ~429 seconds (~7 minutes).
 // The 1-second PPS publish guarantees we read them well before wrap.
 //
+// ISR-level hardware snapshot and raw residuals:
+//
+//   All three hardware counters (DWT_CYCCNT, GPT2_CNT, GPT1_CNT)
+//   are latched inside the PPS ISR itself — the absolute closest
+//   point to the PPS rising edge that software can reach.
+//
+//   Raw PPS-to-PPS residuals are computed directly in the ISR from
+//   consecutive 32-bit snapshots:
+//
+//     residual = (snap_now - snap_prev) - expected_ticks
+//
+//   These "ISR residuals" are published in the TIMEBASE_FRAGMENT
+//   as isr_residual_dwt/gnss/ocxo.  They represent the purest
+//   possible measurement — no 64-bit extension, no callback
+//   latency, no processing of any kind between the PPS edge and
+//   the subtraction.
+//
+//   The existing Welford-based residual tracking (computed from
+//   64-bit extended values in the callback) is retained for
+//   running statistics.
+//
 // Recovery:
 //
 //   When the Pi restarts mid-campaign, it reads the last TIMEBASE
@@ -81,52 +102,64 @@ static uint64_t recover_ocxo_ns    = 0;
 static uint64_t campaign_seconds = 0;
 
 // ============================================================================
-// PPS residual tracking — per-clock-domain
+// ISR-level hardware snapshots and raw residuals
 // ============================================================================
 //
-// On each PPS pulse, we snapshot each clock counter, compute the
-// delta from the prior PPS, and derive the residual:
+// Written ONLY inside pps_isr(), read ONLY in the deferred callback.
+// The pps_scheduled flag ensures they are consumed before the next
+// PPS can overwrite them.
 //
-//   residual = delta - expected_ticks_per_pps
+
+// Current PPS snapshots (raw 32-bit register reads)
+static volatile uint32_t isr_snap_dwt  = 0;
+static volatile uint32_t isr_snap_gnss = 0;
+static volatile uint32_t isr_snap_ocxo = 0;
+
+// Previous PPS snapshots (for ISR-level delta computation)
+static volatile uint32_t isr_prev_dwt  = 0;
+static volatile uint32_t isr_prev_gnss = 0;
+static volatile uint32_t isr_prev_ocxo = 0;
+
+// Raw ISR residuals: (snap - prev) - expected
+// Computed entirely in the ISR, zero processing overhead.
+// isr_residual_valid is false until the second PPS of a campaign.
+static volatile int32_t  isr_residual_dwt  = 0;
+static volatile int32_t  isr_residual_gnss = 0;
+static volatile int32_t  isr_residual_ocxo = 0;
+static volatile bool     isr_residual_valid = false;
+
+// Expected 32-bit tick counts per PPS interval
+static constexpr uint32_t ISR_DWT_EXPECTED  = 600000000u;
+static constexpr uint32_t ISR_GNSS_EXPECTED =  10000000u;
+static constexpr uint32_t ISR_OCXO_EXPECTED =  10000000u;
+
+// ============================================================================
+// PPS residual tracking — per-clock-domain (Welford's, callback-level)
+// ============================================================================
 //
-// Running statistics are maintained using Welford's online algorithm,
-// which computes mean, variance, and standard deviation incrementally
-// without storing individual samples.
-//
-// Expected ticks per PPS interval:
-//
-//   DWT    600,000,000   (600 MHz internal)
-//   GNSS    10,000,000   (10 MHz external)
-//   OCXO    10,000,000   (10 MHz external)
+// These use the 64-bit extended values from the callback for running
+// statistics.  The ISR residuals above are the raw, unprocessed
+// single-sample values.
 //
 
 static constexpr int64_t DWT_EXPECTED_PER_PPS  = 600000000LL;
 static constexpr int64_t GNSS_EXPECTED_PER_PPS =  10000000LL;
 static constexpr int64_t OCXO_EXPECTED_PER_PPS =  10000000LL;
 
-// ----------------------------------------------------------------------------
-// Per-clock residual state
-// ----------------------------------------------------------------------------
-
 struct pps_residual_t {
-  uint64_t ticks_at_last_pps;   // snapshot of 64-bit counter at prior PPS
-  int64_t  delta;               // raw tick count between two most recent PPS
-  int64_t  residual;            // delta - expected
-  bool     valid;               // false until the second PPS of a campaign
+  uint64_t ticks_at_last_pps;
+  int64_t  delta;
+  int64_t  residual;
+  bool     valid;
 
-  // Welford's online statistics
-  uint64_t n;                   // number of residual samples
-  double   mean;                // running mean of residuals
-  double   m2;                  // sum of squared differences from mean
+  uint64_t n;
+  double   mean;
+  double   m2;
 };
 
 static pps_residual_t residual_dwt  = {};
 static pps_residual_t residual_gnss = {};
 static pps_residual_t residual_ocxo = {};
-
-// ----------------------------------------------------------------------------
-// Reset all residual state (called on campaign start)
-// ----------------------------------------------------------------------------
 
 static void residual_reset(pps_residual_t& r) {
   r.ticks_at_last_pps = 0;
@@ -138,10 +171,6 @@ static void residual_reset(pps_residual_t& r) {
   r.m2                = 0.0;
 }
 
-// ----------------------------------------------------------------------------
-// Update residual with a new PPS snapshot
-// ----------------------------------------------------------------------------
-
 static void residual_update(pps_residual_t& r,
                             uint64_t ticks_now,
                             int64_t  expected) {
@@ -151,7 +180,6 @@ static void residual_update(pps_residual_t& r,
     r.residual = r.delta - expected;
     r.valid    = true;
 
-    // Welford's online algorithm
     r.n++;
     const double x     = (double)r.residual;
     const double delta = x - r.mean;
@@ -166,14 +194,6 @@ static void residual_update(pps_residual_t& r,
   }
 
   r.ticks_at_last_pps = ticks_now;
-}
-
-// ----------------------------------------------------------------------------
-// Derived statistics (safe accessors)
-// ----------------------------------------------------------------------------
-
-static inline double residual_variance(const pps_residual_t& r) {
-  return (r.n >= 2) ? r.m2 / (double)(r.n - 1) : 0.0;
 }
 
 static inline double residual_stddev(const pps_residual_t& r) {
@@ -212,6 +232,12 @@ uint64_t clocks_dwt_cycles_now(void) {
   return dwt_cycles_64;
 }
 
+static uint64_t dwt_extend_snapshot(uint32_t snap) {
+  dwt_cycles_64 += (uint32_t)(snap - dwt_last_32);
+  dwt_last_32 = snap;
+  return dwt_cycles_64;
+}
+
 uint64_t clocks_dwt_ns_now(void) {
   return (clocks_dwt_cycles_now() * 5ull) / 3ull;
 }
@@ -219,13 +245,6 @@ uint64_t clocks_dwt_ns_now(void) {
 // ============================================================================
 // GNSS VCLOCK (10 MHz external via GPT2 — raw, polled)
 // ============================================================================
-//
-// GPT2 counts the GNSS 10 MHz VCLOCK directly with no prescaler.
-// The 32-bit counter is extended to 64-bit by periodic latching,
-// structurally identical to the DWT and OCXO counters.
-//
-// Pin 14 = AD_B1_02, ALT8 = GPT2_CLK
-//
 
 static uint64_t gnss_ticks_64 = 0;
 static uint32_t gnss_last_32  = 0;
@@ -249,8 +268,8 @@ static void arm_gpt2_external(void) {
 
   GPT2_CR = 0;
   GPT2_SR = 0x3F;
-  GPT2_PR = 0;                                // No prescaler — raw 10 MHz
-  GPT2_CR = GPT_CR_CLKSRC(3) | GPT_CR_FRR;   // External clock, free-run
+  GPT2_PR = 0;
+  GPT2_CR = GPT_CR_CLKSRC(3) | GPT_CR_FRR;
   GPT2_CR |= GPT_CR_EN;
 
   gnss_last_32 = GPT2_CNT;
@@ -264,22 +283,20 @@ uint64_t clocks_gnss_ticks_now(void) {
   return gnss_ticks_64;
 }
 
+static uint64_t gnss_extend_snapshot(uint32_t snap) {
+  gnss_ticks_64 += (uint32_t)(snap - gnss_last_32);
+  gnss_last_32 = snap;
+  return gnss_ticks_64;
+}
+
 uint64_t clocks_gnss_ns_now(void) {
   if (campaign_state != clocks_campaign_state_t::STARTED) return 0;
-  // 10 MHz → 100 ns per tick
   return clocks_gnss_ticks_now() * 100ull;
 }
 
 // ============================================================================
 // OCXO (10 MHz external via GPT1 — raw, polled)
 // ============================================================================
-//
-// GPT1 counts the OCXO 10 MHz output directly with no prescaler.
-// The 32-bit counter is extended to 64-bit by periodic latching,
-// structurally identical to the DWT and GNSS counters.
-//
-// Pin 25 = AD_B0_13, ALT1 = GPT1_CLK
-//
 
 static uint64_t ocxo_ticks_64 = 0;
 static uint32_t ocxo_last_32  = 0;
@@ -295,13 +312,12 @@ static void arm_gpt1_external(void) {
 
   enable_gpt1();
 
-  // Pin 25 = AD_B0_13, ALT1 = GPT1_CLK
   *(portConfigRegister(25)) = 1;
 
   GPT1_CR = 0;
   GPT1_SR = 0x3F;
-  GPT1_PR = 0;                                // No prescaler — raw 10 MHz
-  GPT1_CR = GPT_CR_CLKSRC(3) | GPT_CR_FRR;   // External clock, free-run
+  GPT1_PR = 0;
+  GPT1_CR = GPT_CR_CLKSRC(3) | GPT_CR_FRR;
   GPT1_CR |= GPT_CR_EN;
 
   ocxo_last_32 = GPT1_CNT;
@@ -315,9 +331,14 @@ uint64_t clocks_ocxo_ticks_now(void) {
   return ocxo_ticks_64;
 }
 
+static uint64_t ocxo_extend_snapshot(uint32_t snap) {
+  ocxo_ticks_64 += (uint32_t)(snap - ocxo_last_32);
+  ocxo_last_32 = snap;
+  return ocxo_ticks_64;
+}
+
 uint64_t clocks_ocxo_ns_now(void) {
   if (campaign_state != clocks_campaign_state_t::STARTED) return 0;
-  // 10 MHz → 100 ns per tick
   return clocks_ocxo_ticks_now() * 100ull;
 }
 
@@ -327,37 +348,95 @@ uint64_t clocks_ocxo_ns_now(void) {
 
 static void clocks_zero_all(void) {
   dwt_cycles_64 = 0;
-  dwt_last_32   = DWT_CYCCNT;
+  dwt_last_32   = isr_snap_dwt;
 
   gnss_ticks_64 = 0;
-  gnss_last_32  = GPT2_CNT;
+  gnss_last_32  = isr_snap_gnss;
 
   ocxo_ticks_64 = 0;
-  ocxo_last_32  = GPT1_CNT;
+  ocxo_last_32  = isr_snap_ocxo;
 
   campaign_seconds = 0;
 
-  // Reset all PPS residual tracking
+  // Reset callback-level residual tracking
   residual_reset(residual_dwt);
   residual_reset(residual_gnss);
   residual_reset(residual_ocxo);
+
+  // Reset ISR-level residual tracking
+  isr_prev_dwt  = isr_snap_dwt;
+  isr_prev_gnss = isr_snap_gnss;
+  isr_prev_ocxo = isr_snap_ocxo;
+  isr_residual_valid = false;
 }
 
 // ============================================================================
 // PPS handling
 // ============================================================================
+//
+// Two-phase architecture:
+//
+//   Phase 1 (ISR): Snapshot all hardware counters and compute raw
+//   PPS-to-PPS residuals immediately at the PPS rising edge.
+//   Three register reads (~10 ns total) plus three subtractions.
+//
+//   Phase 2 (timepop callback): Extend snapshots to 64-bit,
+//   process state transitions, compute Welford statistics, build
+//   and publish the TIMEBASE_FRAGMENT.
+//
 
 static volatile bool pps_scheduled = false;
 
 static void pps_isr(void) {
 
+  // ============================================================
+  // PHASE 1: Hardware snapshot — absolute minimum latency
+  //
+  // Three register reads within ~10 ns of each other at 600 MHz.
+  // This is as close to the PPS edge as software can get.
+  // ============================================================
+
+  const uint32_t snap_dwt  = DWT_CYCCNT;
+  const uint32_t snap_gnss = GPT2_CNT;
+  const uint32_t snap_ocxo = GPT1_CNT;
+
+  // ============================================================
+  // Raw ISR-level residuals — computed here, zero overhead.
+  //
+  // Uses unsigned 32-bit subtraction (wrap-safe) cast to signed
+  // 32-bit, then subtract expected.  At 10 MHz the delta is
+  // 10,000,000 which fits easily in int32_t.  At 600 MHz the
+  // delta is 600,000,000 which also fits in int32_t (max ~2.1B).
+  // ============================================================
+
+  if (isr_residual_valid) {
+    isr_residual_dwt  = (int32_t)(snap_dwt  - isr_prev_dwt)  - (int32_t)ISR_DWT_EXPECTED;
+    isr_residual_gnss = (int32_t)(snap_gnss - isr_prev_gnss) - (int32_t)ISR_GNSS_EXPECTED;
+    isr_residual_ocxo = (int32_t)(snap_ocxo - isr_prev_ocxo) - (int32_t)ISR_OCXO_EXPECTED;
+  }
+
+  // Store current as previous for next PPS
+  isr_prev_dwt  = snap_dwt;
+  isr_prev_gnss = snap_gnss;
+  isr_prev_ocxo = snap_ocxo;
+
+  // Store for callback's 64-bit extension
+  isr_snap_dwt  = snap_dwt;
+  isr_snap_gnss = snap_gnss;
+  isr_snap_ocxo = snap_ocxo;
+
+  // Gate: only proceed if we care about this PPS
   if (!request_start && !request_stop && !request_recover &&
       campaign_state != clocks_campaign_state_t::STARTED) {
-    return;  // PPS is irrelevant when dormant
+    return;
   }
 
   if (pps_scheduled) return;
   pps_scheduled = true;
+
+  // ============================================================
+  // PHASE 2: Deferred processing
+  // ============================================================
 
   timepop_arm(
     TIMEPOP_CLASS_ASAP,
@@ -369,51 +448,27 @@ static void pps_isr(void) {
         request_stop = false;
       }
 
-      // --------------------------------------------------------
-      // RECOVER: load projected clock values from Pi, latch
-      // hardware register positions, transition to STARTED.
-      //
-      // This does NOT zero the accumulators — it loads the
-      // Pi-computed projections so the campaign continues
-      // seamlessly from where it left off.
-      //
-      // Recovery also resets residual trackers (the first PPS
-      // after recovery has no valid prior snapshot) and sets
-      // campaign_seconds from the projected GNSS ns.
-      // --------------------------------------------------------
-
       if (request_recover) {
-        // Load projected values into 64-bit accumulators
         dwt_cycles_64 = recover_dwt_cycles;
-        gnss_ticks_64 = recover_gnss_ns / 100ull;   // ns → 10 MHz ticks
-        ocxo_ticks_64 = recover_ocxo_ns / 100ull;   // ns → 10 MHz ticks
+        gnss_ticks_64 = recover_gnss_ns / 100ull;
+        ocxo_ticks_64 = recover_ocxo_ns / 100ull;
 
-        // Latch current hardware register positions so the
-        // next call to clocks_*_now() extends correctly from
-        // the recovered value (delta from latch = 0 initially)
-        dwt_last_32  = DWT_CYCCNT;
-        gnss_last_32 = GPT2_CNT;
-        ocxo_last_32 = GPT1_CNT;
+        dwt_last_32  = isr_snap_dwt;
+        gnss_last_32 = isr_snap_gnss;
+        ocxo_last_32 = isr_snap_ocxo;
 
-        // Derive campaign_seconds from projected GNSS ns
-        // (GNSS is truth; 1 second = 1,000,000,000 ns)
         campaign_seconds = recover_gnss_ns / 1000000000ull;
 
-        // Reset residual trackers — no valid prior PPS snapshot
         residual_reset(residual_dwt);
         residual_reset(residual_gnss);
         residual_reset(residual_ocxo);
 
-        // Transition to STARTED (replaces the request_start path)
+        // ISR residuals will become valid on the next PPS
+        isr_residual_valid = false;
+
         campaign_state = clocks_campaign_state_t::STARTED;
         request_recover = false;
       }
-
-      // --------------------------------------------------------
-      // START: zero all clocks for a fresh campaign
-      // (only fires if request_start is set AND request_recover
-      // was not — recovery handles its own transition above)
-      // --------------------------------------------------------
 
       if (request_start) {
         clocks_zero_all();
@@ -423,13 +478,33 @@ static void pps_isr(void) {
 
       if (campaign_state == clocks_campaign_state_t::STARTED) {
 
+        // Mark ISR residuals as valid for the NEXT PPS
+        // (the first PPS after start has no prior snapshot
+        // to delta against — this flag was cleared by
+        // clocks_zero_all or recover, so the ISR won't
+        // compute residuals until the second PPS)
+        if (!isr_residual_valid) {
+          isr_residual_valid = true;
+        }
+
         // --------------------------------------------------------
-        // Snapshot all clocks and compute PPS-to-PPS residuals
+        // Extend ISR snapshots to 64-bit
         // --------------------------------------------------------
 
-        residual_update(residual_dwt,  clocks_dwt_cycles_now(), DWT_EXPECTED_PER_PPS);
-        residual_update(residual_gnss, clocks_gnss_ticks_now(), GNSS_EXPECTED_PER_PPS);
-        residual_update(residual_ocxo, clocks_ocxo_ticks_now(), OCXO_EXPECTED_PER_PPS);
+        const uint64_t snap_dwt_cycles = dwt_extend_snapshot(isr_snap_dwt);
+        const uint64_t snap_dwt_ns     = (snap_dwt_cycles * 5ull) / 3ull;
+        const uint64_t snap_gnss_ticks = gnss_extend_snapshot(isr_snap_gnss);
+        const uint64_t snap_gnss_ns    = snap_gnss_ticks * 100ull;
+        const uint64_t snap_ocxo_ticks = ocxo_extend_snapshot(isr_snap_ocxo);
+        const uint64_t snap_ocxo_ns    = snap_ocxo_ticks * 100ull;
+
+        // --------------------------------------------------------
+        // Callback-level Welford residual tracking
+        // --------------------------------------------------------
+
+        residual_update(residual_dwt,  snap_dwt_cycles, DWT_EXPECTED_PER_PPS);
+        residual_update(residual_gnss, snap_gnss_ticks, GNSS_EXPECTED_PER_PPS);
+        residual_update(residual_ocxo, snap_ocxo_ticks, OCXO_EXPECTED_PER_PPS);
 
         // --------------------------------------------------------
         // Publish TIMEBASE_FRAGMENT
@@ -437,17 +512,25 @@ static void pps_isr(void) {
 
         Payload p;
         p.add("campaign",         campaign_name);
-        p.add("dwt_cycles",       clocks_dwt_cycles_now());
-        p.add("dwt_ns",           clocks_dwt_ns_now());
-        p.add("gnss_ns",          clocks_gnss_ns_now());
-        p.add("ocxo_ns",          clocks_ocxo_ns_now());
+        p.add("dwt_cycles",       snap_dwt_cycles);
+        p.add("dwt_ns",           snap_dwt_ns);
+        p.add("gnss_ns",          snap_gnss_ns);
+        p.add("ocxo_ns",          snap_ocxo_ns);
         p.add("teensy_pps_count", campaign_seconds);
         p.add("gnss_lock",        digitalRead(GNSS_LOCK_PIN));
 
-        // PPS residuals (most recent pulse)
+        // Callback-level residuals (from 64-bit extended values)
         p.add("dwt_pps_residual",  residual_dwt.residual);
         p.add("gnss_pps_residual", residual_gnss.residual);
         p.add("ocxo_pps_residual", residual_ocxo.residual);
+
+        // ISR-level raw residuals (from 32-bit register snapshots)
+        // These are the purest measurement — computed in the ISR
+        // with zero processing between PPS edge and subtraction.
+        p.add("isr_residual_dwt",  isr_residual_dwt);
+        p.add("isr_residual_gnss", isr_residual_gnss);
+        p.add("isr_residual_ocxo", isr_residual_ocxo);
+        p.add("isr_residual_valid", isr_residual_valid);
 
         publish("TIMEBASE_FRAGMENT", p);
 
@@ -509,9 +592,6 @@ static Payload cmd_recover(const Payload& args) {
   recover_gnss_ns    = strtoull(s_gnss, nullptr, 10);
   recover_ocxo_ns    = strtoull(s_ocxo, nullptr, 10);
 
-  // Only set request_recover — NOT request_start.
-  // The recover path in the PPS ISR handles its own transition
-  // to STARTED without zeroing the accumulators.
   request_recover = true;
   request_start   = false;
   request_stop    = false;
@@ -561,10 +641,6 @@ static Payload cmd_report(const Payload&) {
 
   Payload p;
 
-  // ------------------------------------------------------------
-  // Campaign state
-  // ------------------------------------------------------------
-
   p.add(
     "campaign_state",
     campaign_state == clocks_campaign_state_t::STARTED
@@ -577,17 +653,9 @@ static Payload cmd_report(const Payload&) {
     p.add("campaign_seconds", campaign_seconds);
   }
 
-  // ------------------------------------------------------------
-  // Pending requests
-  // ------------------------------------------------------------
-
   p.add("request_start",   request_start);
   p.add("request_stop",    request_stop);
   p.add("request_recover", request_recover);
-
-  // ------------------------------------------------------------
-  // Raw clocks (capability + campaign-scoped)
-  // ------------------------------------------------------------
 
   const uint64_t dwt_cycles = clocks_dwt_cycles_now();
   const uint64_t dwt_ns     = clocks_dwt_ns_now();
@@ -601,50 +669,24 @@ static Payload cmd_report(const Payload&) {
 
   p.add("gnss_lock", digitalRead(GNSS_LOCK_PIN));
 
-  // ------------------------------------------------------------
-  // PPS residual statistics — all clock domains
-  // ------------------------------------------------------------
-  //
-  // For each clock domain, we report:
-  //
-  //   *_pps_valid     true after the second PPS of a campaign
-  //   *_pps_delta     raw tick count between two most recent PPS
-  //   *_pps_residual  delta - expected  (signed, most recent)
-  //   *_pps_n         number of residual samples collected
-  //   *_pps_mean      running mean of residuals
-  //   *_pps_stddev    sample standard deviation of residuals
-  //   *_pps_stderr    standard error of the mean
-  //
-
+  // Callback-level residual statistics
   report_residual(p, "dwt",  residual_dwt);
   report_residual(p, "gnss", residual_gnss);
   report_residual(p, "ocxo", residual_ocxo);
 
-  // ------------------------------------------------------------
-  // Derived diagnostics (ONLY if meaningful)
-  // ------------------------------------------------------------
-  //
-  // These are NOT authoritative time claims.
-  // They exist purely to validate behavior during development.
-  //
+  // ISR-level raw residuals (most recent PPS)
+  p.add("isr_residual_dwt",   isr_residual_dwt);
+  p.add("isr_residual_gnss",  isr_residual_gnss);
+  p.add("isr_residual_ocxo",  isr_residual_ocxo);
+  p.add("isr_residual_valid", (bool)isr_residual_valid);
 
   if (campaign_state == clocks_campaign_state_t::STARTED && gnss_ns > 0) {
-
-    // --- Tau (dimensionless ratio) ---
-    //
-    // tau = clock_ns / gnss_ns
-    //
 
     const double tau_dwt  = (double)dwt_ns  / (double)gnss_ns;
     const double tau_ocxo = (double)ocxo_ns / (double)gnss_ns;
 
     p.add_fmt("tau_dwt",  "%.12f", tau_dwt);
     p.add_fmt("tau_ocxo", "%.12f", tau_ocxo);
-
-    // --- Deviation from GNSS in parts-per-billion ---
-    //
-    // ppb = (clock_ns - gnss_ns) / gnss_ns * 1e9
-    //
 
     const double ppb_dwt =
       ((double)((int64_t)dwt_ns - (int64_t)gnss_ns) / (double)gnss_ns) * 1e9;
@@ -656,7 +698,6 @@ static Payload cmd_report(const Payload&) {
     p.add_fmt("ocxo_ppb", "%.3f", ppb_ocxo);
 
   } else {
-    // Explicitly report absence of meaning
     p.add("tau_dwt",  0.0);
     p.add("tau_ocxo", 0.0);
     p.add("dwt_ppb",  0.0);
