@@ -24,6 +24,7 @@ UART ownership:
 
 from __future__ import annotations
 
+import json
 import logging
 import math
 import os
@@ -875,7 +876,7 @@ def _fix_quality_acceptable() -> bool:
     return True
 
 # ------------------------------------------------------------------
-# PROFILE_LOCATION — database persistence
+# PROFILE_LOCATION — database persistence (JSONB)
 # ------------------------------------------------------------------
 
 def _persist_location(location: str) -> Dict:
@@ -883,6 +884,9 @@ def _persist_location(location: str) -> Dict:
     Snapshot current GNSS state into the locations table.
 
     Creates the row if it doesn't exist, updates it if it does.
+    All variable data is stored in the JSONB payload column.
+    The 'location' column is retained as a relational key (UNIQUE).
+
     Returns the persisted location facts.
     """
     from datetime import datetime, timezone
@@ -895,34 +899,21 @@ def _persist_location(location: str) -> Dict:
         "altitude":    round(GNSS.altitude_m, 3),
         "hdop":        round(GNSS.hdop, 2) if not math.isnan(GNSS.hdop) else None,
         "satellites":  GNSS.satellites,
-        "profiled_at": now,
+        "profiled_at": now.isoformat().replace("+00:00", "Z"),
     }
 
     with open_db() as conn:
         cur = conn.cursor()
         cur.execute(
             """
-            INSERT INTO locations (location, latitude, longitude, altitude,
-                                   hdop, satellites, profiled_at)
-            VALUES (%s, %s, %s, %s, %s, %s, %s)
+            INSERT INTO locations (location, payload)
+            VALUES (%s, %s)
             ON CONFLICT (location)
             DO UPDATE SET
-                latitude    = EXCLUDED.latitude,
-                longitude   = EXCLUDED.longitude,
-                altitude    = EXCLUDED.altitude,
-                hdop        = EXCLUDED.hdop,
-                satellites  = EXCLUDED.satellites,
-                profiled_at = EXCLUDED.profiled_at
+                payload = EXCLUDED.payload,
+                ts      = now()
             """,
-            (
-                location,
-                facts["latitude"],
-                facts["longitude"],
-                facts["altitude"],
-                facts["hdop"],
-                facts["satellites"],
-                facts["profiled_at"],
-            ),
+            (location, json.dumps(facts)),
         )
 
     logging.info(
@@ -935,33 +926,42 @@ def _persist_location(location: str) -> Dict:
         facts["satellites"],
     )
 
-    # Return serializable copy
-    return {
-        **facts,
-        "profiled_at": now.isoformat().replace("+00:00", "Z"),
-    }
+    return facts
 
 # ------------------------------------------------------------------
-# MODE — location lookup
+# MODE — location lookup (JSONB)
 # ------------------------------------------------------------------
 
 def _lookup_location(name: str) -> Optional[Dict]:
     """
     Fetch a profiled location from the database.
 
-    Returns dict with latitude, longitude, altitude or None.
+    Reads the JSONB payload column and returns a dict with
+    latitude, longitude, altitude (and any other profiled facts),
+    or None if the location has not been profiled.
     """
     with open_db(row_dict=True) as conn:
         cur = conn.cursor()
         cur.execute(
             """
-            SELECT latitude, longitude, altitude
+            SELECT payload
             FROM locations
             WHERE location = %s
             """,
             (name,),
         )
-        return cur.fetchone()
+        row = cur.fetchone()
+
+    if row is None:
+        return None
+
+    payload = row["payload"]
+
+    # payload may arrive as dict (psycopg JSONB auto-decode) or str
+    if isinstance(payload, str):
+        return json.loads(payload)
+
+    return payload
 
 # ------------------------------------------------------------------
 # Command handlers

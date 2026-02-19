@@ -11,6 +11,14 @@ Responsibilities:
   • Recover clocks after restart if campaign is active
   • Command GNSS into Time Only mode when campaign has a location
 
+Database schema (JSONB):
+  All variable data lives in JSONB payload columns.
+  Relational columns are retained only for filtering/indexing.
+
+  campaigns:  id, ts, campaign, active, payload{location, started_at, stopped_at}
+  timebase:   id, ts, campaign, payload{...entire TIMEBASE tuple...}
+  locations:  id, ts, location, payload{latitude, longitude, altitude, ...}
+
 PPS capture:
   • The pps-gpio kernel driver owns GPIO18 and timestamps edges
     in interrupt context (best possible precision)
@@ -57,6 +65,7 @@ from __future__ import annotations
 
 import ctypes
 import fcntl
+import json
 import logging
 import math
 import os
@@ -348,22 +357,33 @@ def _wait_for_gnss_time() -> str:
 
 def _get_active_campaign() -> Optional[Dict[str, Any]]:
     """
-    Return active campaign row or None.
+    Return active campaign or None.
 
-    Returns dict with keys: campaign, location (nullable).
+    Returns dict with keys: campaign, payload (JSONB decoded).
+    The payload contains location, started_at, etc.
     """
     with open_db(row_dict=True) as conn:
         cur = conn.cursor()
         cur.execute(
             """
-            SELECT campaign, location
+            SELECT campaign, payload
             FROM campaigns
             WHERE active = true
-            ORDER BY started_at DESC
+            ORDER BY ts DESC
             LIMIT 1
             """
         )
-        return cur.fetchone()
+        row = cur.fetchone()
+
+    if row is None:
+        return None
+
+    # payload is already a dict (psycopg2 decodes JSONB automatically)
+    p = row["payload"] if isinstance(row["payload"], dict) else json.loads(row["payload"])
+    return {
+        "campaign": row["campaign"],
+        "location": p.get("location"),
+    }
 
 
 def _set_gnss_mode_to(location: str) -> Dict[str, Any]:
@@ -401,42 +421,22 @@ def _set_gnss_mode_normal() -> Dict[str, Any]:
 def _persist_timebase(tb: Dict[str, Any]) -> None:
     """
     Best-effort TIMEBASE insert.
-    Failure is logged and ignored.
+
+    The entire TIMEBASE dict is stored verbatim as JSONB payload.
+    The campaign name is duplicated in the envelope column for
+    indexing.  Failure is logged and ignored.
     """
     try:
         with open_db() as conn:
             cur = conn.cursor()
             cur.execute(
                 """
-                INSERT INTO timebase (
-                    campaign,
-                    gnss_time_utc,
-                    teensy_dwt_cycles,
-                    teensy_dwt_ns,
-                    teensy_gnss_ns,
-                    teensy_ocxo_ns,
-                    teensy_rtc1_ns,
-                    teensy_rtc2_ns,
-                    pi_cycles,
-                    pi_ns,
-                    teensy_pps_count,
-                    pi_pps_count
-                )
-                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                INSERT INTO timebase (campaign, payload)
+                VALUES (%s, %s)
                 """,
                 (
                     tb["campaign"],
-                    tb["gnss_time_utc"],
-                    tb["teensy_dwt_cycles"],
-                    tb["teensy_dwt_ns"],
-                    tb.get("teensy_gnss_ns"),
-                    tb.get("teensy_ocxo_ns"),
-                    tb.get("teensy_rtc1_ns"),
-                    tb.get("teensy_rtc2_ns"),
-                    tb["pi_cycles"],
-                    tb["pi_ns"],
-                    tb.get("teensy_pps_count"),
-                    tb.get("pi_pps_count"),
+                    json.dumps(tb),
                 ),
             )
     except Exception:
@@ -523,29 +523,34 @@ def _recover_campaign() -> None:
         cur = conn.cursor()
         cur.execute(
             """
-            SELECT *
+            SELECT payload
             FROM timebase
             WHERE campaign = %s
-            ORDER BY created_at DESC
+            ORDER BY ts DESC
             LIMIT 1
             """,
             (campaign_name,),
         )
-        last_tb = cur.fetchone()
+        tb_row = cur.fetchone()
 
-    if last_tb is None:
+    if tb_row is None:
         logging.warning(
             "⚠️ [recovery] campaign '%s' has no TIMEBASE rows — cannot recover",
             campaign_name,
         )
         return
 
-    last_gnss_utc: datetime = last_tb["gnss_time_utc"]
-    last_dwt_cycles = int(last_tb["teensy_dwt_cycles"])
-    last_dwt_ns = int(last_tb["teensy_dwt_ns"])
-    last_gnss_ns = int(last_tb["teensy_gnss_ns"] or 0) if "teensy_gnss_ns" in last_tb else 0
-    last_ocxo_ns = int(last_tb["teensy_ocxo_ns"] or 0)
-    last_pi_ns = int(last_tb["pi_ns"])
+    last_tb = tb_row["payload"] if isinstance(tb_row["payload"], dict) else json.loads(tb_row["payload"])
+
+    last_gnss_utc_str = last_tb["gnss_time_utc"]
+    last_gnss_utc = datetime.fromisoformat(
+        last_gnss_utc_str.replace("Z", "+00:00")
+    )
+    last_dwt_cycles = int(last_tb.get("teensy_dwt_cycles", 0))
+    last_dwt_ns = int(last_tb.get("teensy_dwt_ns", 0))
+    last_gnss_ns = int(last_tb.get("teensy_gnss_ns") or 0)
+    last_ocxo_ns = int(last_tb.get("teensy_ocxo_ns") or 0)
+    last_pi_ns = int(last_tb.get("pi_ns", 0))
 
     logging.info(
         "🔍 [recovery] last TIMEBASE: gnss_utc=%s  gnss_ns=%d  dwt_ns=%d  ocxo_ns=%d  pi_ns=%d",
@@ -556,8 +561,7 @@ def _recover_campaign() -> None:
         last_pi_ns,
     )
 
-    # If gnss_ns is not in the DB schema, fall back to computing
-    # from dwt_ns (tau_dwt ≈ 1.0 at this scale, gnss is truth)
+    # If gnss_ns is not available, fall back to dwt_ns
     if last_gnss_ns == 0:
         logging.warning(
             "⚠️ [recovery] teensy_gnss_ns not available in TIMEBASE — "
@@ -962,22 +966,36 @@ def cmd_start(args: Optional[dict]) -> dict:
 
     location = (args.get("location") or "").strip() or None
 
+    now_iso = datetime.now(timezone.utc).isoformat(timespec='milliseconds')
+
     # ----------------------------------------------------------
     # 1) Deactivate existing + insert new campaign
     # ----------------------------------------------------------
     with open_db() as conn:
         cur = conn.cursor()
 
+        # Deactivate and stamp stopped_at in payload
         cur.execute(
-            "UPDATE campaigns SET active=false, stopped_at=now() WHERE active=true"
+            """
+            UPDATE campaigns
+            SET active = false,
+                payload = payload || %s
+            WHERE active = true
+            """,
+            (json.dumps({"stopped_at": now_iso}),),
         )
+
+        campaign_payload = {
+            "location": location,
+            "started_at": now_iso,
+        }
 
         cur.execute(
             """
-            INSERT INTO campaigns (campaign, location, started_at, active)
-            VALUES (%s, %s, now(), true)
+            INSERT INTO campaigns (campaign, active, payload)
+            VALUES (%s, true, %s)
             """,
-            (campaign, location),
+            (campaign, json.dumps(campaign_payload)),
         )
 
     # ----------------------------------------------------------
@@ -1042,7 +1060,7 @@ def cmd_stop(_: Optional[dict]) -> dict:
 
     Sequence:
       1) Read active campaign (to check if it had a location)
-      2) Deactivate campaign in DB
+      2) Deactivate campaign in DB (merge stopped_at into payload)
       3) Set _request_stop flag (applied at next PPS boundary)
       4) Stop Teensy CLOCKS acquisition
       5) If campaign had a location: restore GNSS → NORMAL (CSS)
@@ -1058,10 +1076,18 @@ def cmd_stop(_: Optional[dict]) -> dict:
     # ----------------------------------------------------------
     # 2) Deactivate campaign
     # ----------------------------------------------------------
+    now_iso = datetime.now(timezone.utc).isoformat(timespec='milliseconds')
+
     with open_db() as conn:
         cur = conn.cursor()
         cur.execute(
-            "UPDATE campaigns SET active=false, stopped_at=now() WHERE active=true"
+            """
+            UPDATE campaigns
+            SET active = false,
+                payload = payload || %s
+            WHERE active = true
+            """,
+            (json.dumps({"stopped_at": now_iso}),),
         )
 
     # ----------------------------------------------------------
@@ -1156,10 +1182,10 @@ def cmd_report(_: Optional[dict]) -> Dict[str, Any]:
         # ------------------------------------------------------------
         cur.execute(
             """
-            SELECT id, campaign, location, started_at
+            SELECT id, campaign, payload
             FROM campaigns
             WHERE active = true
-            ORDER BY started_at DESC
+            ORDER BY ts DESC
             LIMIT 1
             """
         )
@@ -1173,13 +1199,14 @@ def cmd_report(_: Optional[dict]) -> Dict[str, Any]:
             }
 
         campaign_id = campaign["id"]
+        cp = campaign["payload"] if isinstance(campaign["payload"], dict) else json.loads(campaign["payload"])
 
         payload["campaign"] = {
             "active": True,
             "campaign_id": campaign_id,
             "campaign": campaign["campaign"],
-            "location": campaign["location"],
-            "started_at": campaign["started_at"].isoformat(),
+            "location": cp.get("location"),
+            "started_at": cp.get("started_at"),
             "last_timebase_id": None,
         }
 
@@ -1188,10 +1215,10 @@ def cmd_report(_: Optional[dict]) -> Dict[str, Any]:
         # ------------------------------------------------------------
         cur.execute(
             """
-            SELECT *
+            SELECT id, payload
             FROM timebase
             WHERE campaign = %s
-            ORDER BY created_at DESC
+            ORDER BY ts DESC
             LIMIT 1
             """,
             (campaign["campaign"],)
@@ -1200,19 +1227,8 @@ def cmd_report(_: Optional[dict]) -> Dict[str, Any]:
 
         if tb:
             payload["campaign"]["last_timebase_id"] = tb["id"]
-
-            payload["timebase"] = {
-                "id": tb["id"],
-                "created_at": tb["created_at"].isoformat(),
-                "gnss_time_utc": tb["gnss_time_utc"].isoformat(),
-                "teensy_dwt_cycles": tb["teensy_dwt_cycles"],
-                "teensy_dwt_ns": tb["teensy_dwt_ns"],
-                "teensy_ocxo_ns": tb["teensy_ocxo_ns"],
-                "teensy_rtc1_ns": tb["teensy_rtc1_ns"],
-                "teensy_rtc2_ns": tb["teensy_rtc2_ns"],
-                "pi_cycles": tb["pi_cycles"],
-                "pi_ns": tb["pi_ns"],
-            }
+            payload["timebase"] = tb["payload"] if isinstance(tb["payload"], dict) else json.loads(tb["payload"])
+            payload["timebase"]["id"] = tb["id"]
         else:
             payload["timebase"] = None
 
