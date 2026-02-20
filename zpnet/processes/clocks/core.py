@@ -2,11 +2,8 @@
 ZPNet CLOCKS Process — TIMEBASE Authority (Pi-side)
 
 Responsibilities:
-  • Capture PPS pulse via kernel /dev/pps0 driver
-  • Capture Pi system timer (CNTVCT_EL0) at PPS edge
-  • Capture chrony-disciplined system time at PPS edge
   • Receive TIMEBASE_FRAGMENT from Teensy
-  • Augment fragment into full TIMEBASE record
+  • Augment fragment with chrony-disciplined system time and GNSS time
   • Publish TIMEBASE
   • Persist TIMEBASE to PostgreSQL (append-only, best-effort)
   • Compute per-clock residual statistics (Welford's algorithm)
@@ -14,86 +11,42 @@ Responsibilities:
   • Recover clocks after restart if campaign is active
   • Command GNSS into Time Only mode when campaign has a location
 
-Pi clock source:
-  • ARM Generic Timer (CNTVCT_EL0) read via zpnet.native.systimer
-  • Single MRS instruction — no syscall, no vDSO, no NTP steering
-  • 54 MHz on Pi 4/5 → 18.519 ns resolution per tick
-  • Raw ticks are captured at PPS edge, converted to nanoseconds
-    only when building TIMEBASE records
-  • However, userspace tick reads have variable latency from the
-    kernel ioctl return — microseconds of scheduling jitter
+Pi role:
+  • Orchestration, persistence, networking, display
+  • Provides chrony-disciplined system_time_utc as a sanity check
+    against gnss_time_utc (expected delta: a few microseconds)
+  • The Pi is NOT a precision clock source
+  • Linux interrupt dispatch jitter (~1-2 µs) makes sub-microsecond
+    PPS timestamping infeasible on the Cortex-A72
 
-Pi residual measurement:
-  • The pps-gpio kernel driver timestamps the PPS edge in interrupt
-    context — this is the best precision available on the Pi
-  • The kernel PPS timestamp is driven by the same 54 MHz counter
-    (CNTVCT_EL0) that we read in userspace
-  • Therefore, Pi residual statistics use kernel PPS timestamps:
-    delta between consecutive kernel timestamps, minus 1e9 ns
-  • This measures the arch timer's true behavior (thermal drift,
-    crystal imperfections) without userspace scheduling noise
-  • Consistent with the universal residual policy: actual clock
-    ticks per PPS interval minus expected, normalized to nanoseconds
+Precision timing is owned entirely by the Teensy:
+  • GNSS: 10 MHz VCLK counted in Teensy ISR (~100 ns quantization)
+  • DWT: 600 MHz CPU cycle counter captured in Teensy ISR (~1.7 ns)
+  • OCXO: future precision oscillator (Teensy-owned)
+  • All PPS edge timestamping happens on bare-metal Cortex-M7 with
+    deterministic 20 ns interrupt latency
 
-System time capture:
-  • datetime.now(UTC) is captured immediately when PPS_FETCH returns,
-    alongside the ARM system timer read
-  • This is chrony-disciplined wall clock time — steered to UTC via
-    the same PPS pulse we're capturing
-  • Stored in the TIMEBASE record as system_time_utc for direct
-    comparison with gnss_time_utc from the GNSS receiver
-  • The delta between system_time_utc and gnss_time_utc validates
-    the entire PPS chain: antenna → LM393 → GPIO → kernel → chrony
-  • Expected delta: 1-2 µs (dominated by LM393 propagation delay)
-
-PPS capture:
-  • The pps-gpio kernel driver owns GPIO18 and timestamps edges
-    in interrupt context (best possible precision)
-  • We read /dev/pps0 via PPS_FETCH ioctl (same as ppstest)
-  • chrony also reads /dev/pps0 — multiple readers are supported
-  • No gpiod dependency; no pin ownership conflict
-
-Residual policy (all non-GNSS clocks):
-  • Count actual ticks (or nanoseconds) between consecutive PPS edges
-  • Subtract expected count for that clock's frequency
+Residual policy (Teensy clocks only):
+  • Count actual nanoseconds between consecutive PPS edges
+  • Subtract expected count (1e9 ns)
   • Express residual in nanoseconds
   • GNSS: Teensy counts 10 MHz VCLK edges, residual vs 1e9 ns
   • DWT: Teensy counts 600 MHz CPU cycles, residual vs 1e9 ns
-  • Pi: kernel timestamps PPS edge using 54 MHz arch timer,
-    residual = delta_ns - 1e9 ns (already in nanoseconds)
-  • Mechanical imperfections (temperature, power, crystal aging)
-    are welcome — they're what we're measuring
+  • Running statistics via Welford's online algorithm
 
-Campaign start synchronisation:
-  • cmd_start sets _request_start = True (same as Teensy)
-  • _pps_listener sees the flag on the next PPS edge and zeros
-    the Pi tick epoch at that exact moment
-  • This mirrors the Teensy's request_start → PPS ISR →
-    clocks_zero_all() pattern, so both machines zero on a PPS
-    boundary and their nanosecond clocks track together
+Campaign start:
+  • cmd_start arms the Teensy (CLOCKS.START)
+  • The Teensy zeros all clocks at the next PPS boundary
+  • The Pi sets _request_start, consumed on next fragment arrival
 
 Recovery after restart:
   • On startup, if an active campaign exists with TIMEBASE rows
     in Postgres, the Pi orchestrates clock recovery
-  • Patiently wait for GNSS to acquire satellites and produce
-    a valid timestamp (may take minutes after cold start)
-  • Wait for PPS edge → capture GNSS time → compute seconds
-    elapsed since last TIMEBASE
-  • Project all clock nanosecond values forward using tau
-    (ratio of each clock's ns to GNSS ns, from last TIMEBASE)
-  • Send RECOVER command to Teensy with projected dwt_cycles,
-    gnss_ns, ocxo_ns — Teensy loads these at next PPS edge
-  • Compute synthetic Pi tick epoch so pi_ns is continuous
-  • Resume normal PPS capture and TIMEBASE augmentation
-
-Per-clock residual statistics:
-  • At each PPS edge, the delta between consecutive readings
-    is computed for each clock domain
-  • GNSS: delta in nanoseconds from Teensy, residual vs 1e9
-  • DWT: delta in nanoseconds from Teensy, residual vs 1e9
-  • Pi: delta in nanoseconds from kernel PPS timestamp, residual vs 1e9
-  • Running statistics via Welford's online algorithm
-  • All residual stats are in nanoseconds — no scaling needed
+  • Patiently wait for GNSS to acquire satellites
+  • Compute elapsed seconds since last TIMEBASE
+  • Project all Teensy clock values forward using tau
+  • Send RECOVER command to Teensy with projected values
+  • Resume normal TIMEBASE augmentation
 
 Campaign report denormalization:
   • After each TIMEBASE, the active campaign row's JSONB payload
@@ -113,18 +66,14 @@ Semantics:
 
 from __future__ import annotations
 
-import ctypes
-import fcntl
 import json
 import logging
 import math
-import os
 import threading
 import time
 from datetime import datetime, timezone
 from typing import Dict, Any, Optional
 
-from zpnet.native import systimer
 from zpnet.processes.processes import (
     server_setup,
     publish,
@@ -133,27 +82,12 @@ from zpnet.processes.processes import (
 from zpnet.shared.constants import Payload
 from zpnet.shared.db import open_db
 from zpnet.shared.logger import setup_logging
-from zpnet.native.pps_raw import PpsRawReader
 
 # ---------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------
 
-PPS_DEVICE = "/dev/pps0"
-
-# ARM Generic Timer frequency — read from hardware at import time.
-# On Pi 4/5 this is 54,000,000 (54 MHz, ~18.519 ns per tick).
-# Used for converting raw tick counts to nanoseconds in TIMEBASE
-# records and for recovery projections.
-PI_TIMER_FREQ: int = systimer.frequency()
-PI_NS_PER_TICK: float = systimer.ns_per_tick()
-
 # Expected nanoseconds per PPS for all clock domains.
-# GNSS 10 MHz counter: 100 ns/tick × 10,000,000 ticks = 1e9 ns
-# DWT 600 MHz: cycles * 5/3 = ns, so 1 second = 1e9 ns
-# Pi 54 MHz: kernel PPS timestamp delta = 1e9 ns
-# All clocks measure the same physical second — residual is
-# deviation from this ideal.
 NS_PER_SECOND = 1_000_000_000
 
 # Teensy DWT runs at 600 MHz.
@@ -168,70 +102,13 @@ GNSS_POLL_INTERVAL = 5
 GNSS_WAIT_LOG_INTERVAL = 60
 
 # ---------------------------------------------------------------------
-# Kernel PPS ioctl interface (linux/pps.h)
-#
-# struct pps_ktime {
-#     __s64   sec;
-#     __s32   nsec;
-#     __u32   flags;
-# };                              /* 16 bytes */
-#
-# struct pps_kinfo {
-#     __u32   assert_sequence;
-#     __u32   clear_sequence;
-#     struct pps_ktime assert_tu;
-#     struct pps_ktime clear_tu;
-#     int     current_mode;
-# };                              /* 44 bytes */
-#
-# struct pps_fdata {
-#     struct pps_kinfo info;
-#     struct pps_ktime timeout;
-# };                              /* 60 bytes */
-#
-# #define PPS_FETCH  _IOWR('p', 0xa4, struct pps_fdata)
-# ---------------------------------------------------------------------
-
-class _PpsKtime(ctypes.Structure):
-    _fields_ = [
-        ("sec", ctypes.c_int64),
-        ("nsec", ctypes.c_int32),
-        ("flags", ctypes.c_uint32),
-    ]
-
-class _PpsKinfo(ctypes.Structure):
-    _fields_ = [
-        ("assert_sequence", ctypes.c_uint32),
-        ("clear_sequence", ctypes.c_uint32),
-        ("assert_tu", _PpsKtime),
-        ("clear_tu", _PpsKtime),
-        ("current_mode", ctypes.c_int32),
-    ]
-
-class _PpsFdata(ctypes.Structure):
-    _fields_ = [
-        ("info", _PpsKinfo),
-        ("timeout", _PpsKtime),
-    ]
-
-# PPS_FETCH ioctl number: _IOWR('p', 0xa4, struct pps_fdata *)
-#
-# Note: the kernel header uses a POINTER to pps_fdata, so the size
-# field in the ioctl number is sizeof(pointer), not sizeof(struct).
-# On ARM64 (Pi 4/5): sizeof(void*) = 8  → ioctl = 0xC00870A4
-# Confirmed via: gcc -include linux/pps.h -e 'printf("%lX", PPS_FETCH)'
-_PPS_FETCH = 0xC00870A4
-
-# ---------------------------------------------------------------------
 # PPS residual tracking — Welford's online algorithm
 #
-# Used for all clock domains: GNSS, DWT, Pi.
+# Used for Teensy clock domains only: GNSS, DWT.
 #
-# All three accumulate in nanoseconds with expected = 1e9.
-# GNSS and DWT: nanoseconds from Teensy ISR captures.
-# Pi: nanoseconds from kernel PPS interrupt-context timestamp.
-#
-# display_scale is always 1.0 — all clocks report in nanoseconds.
+# Both accumulate in nanoseconds with expected = 1e9.
+# GNSS: nanoseconds from Teensy ISR VCLK captures.
+# DWT: nanoseconds from Teensy ISR DWT captures.
 # ---------------------------------------------------------------------
 
 class _PpsResidual:
@@ -245,11 +122,9 @@ class _PpsResidual:
         "n",
         "mean",
         "m2",
-        "display_scale",
     )
 
-    def __init__(self, display_scale: float = 1.0) -> None:
-        self.display_scale = display_scale
+    def __init__(self) -> None:
         self.reset()
 
     def reset(self) -> None:
@@ -265,11 +140,8 @@ class _PpsResidual:
         """
         Update with a new clock reading.
 
-        value_now and expected must be in the same units:
-          - nanoseconds for GNSS and DWT (expected = 1e9)
-          - raw ticks for Pi (expected = PI_TIMER_FREQ)
-
-        Conversion to nanoseconds happens only in to_dict().
+        value_now and expected must be in the same units
+        (nanoseconds, expected = 1e9).
         """
         if self.last_value > 0:
             self.delta = value_now - self.last_value
@@ -303,92 +175,38 @@ class _PpsResidual:
         return (self.stddev / math.sqrt(self.n)) if self.n >= 2 else 0.0
 
     def to_dict(self) -> Dict[str, Any]:
-        """
-        Serialize residual state for the campaign report.
-
-        All values are scaled to nanoseconds for consistent display.
-        For GNSS and DWT (display_scale=1.0) this is a no-op.
-        For Pi (display_scale=ns_per_tick) this converts ticks → ns.
-        """
-        s = self.display_scale
+        """Serialize residual state for the campaign report."""
         return {
             "pps_valid": self.valid,
-            "pps_delta": round(self.delta * s, 3),
-            "pps_residual": round(self.residual * s, 3),
+            "pps_delta": round(self.delta, 3),
+            "pps_residual": round(self.residual, 3),
             "pps_n": self.n,
-            "pps_mean": round(self.mean * s, 3),
-            "pps_stddev": round(self.stddev * s, 3),
-            "pps_stderr": round(self.stderr * s, 3),
+            "pps_mean": round(self.mean, 3),
+            "pps_stddev": round(self.stddev, 3),
+            "pps_stderr": round(self.stderr, 3),
         }
 
 # ---------------------------------------------------------------------
 # Local state (process lifetime)
 # ---------------------------------------------------------------------
 
-_pi_pps_count: int = 0
-
-# Tick epoch — captured at the first PPS edge after campaign start.
-# Subtracted from raw tick count to produce campaign-scoped ticks,
-# which are then converted to nanoseconds for the TIMEBASE record.
-# Same zeroing semantics as Teensy's clocks_zero_all called from
-# the PPS ISR.
-_pi_tick_epoch: int = 0
-
 # Request flags — set by cmd_start/cmd_stop, consumed by
-# _pps_listener at the next PPS edge (mirrors Teensy pattern).
+# the fragment handler.
 _request_start: bool = False
 _request_stop: bool = False
 
-# True while a campaign is actively acquiring (set/cleared at
-# PPS boundary, never between pulses).
+# True while a campaign is actively acquiring.
 _campaign_active: bool = False
 
-# Per-clock PPS residual trackers (Welford's online algorithm).
-# All three accumulate in nanoseconds with expected = NS_PER_SECOND.
-_residual_pi = _PpsResidual(display_scale=PI_NS_PER_TICK)
+# Per-clock PPS residual trackers (Teensy clocks only).
 _residual_gnss = _PpsResidual()
 _residual_dwt = _PpsResidual()
-
-# Latest Pi-side PPS capture
-_last_pi_pps: Optional[Dict[str, Any]] = None
-
-# Latest Teensy fragment awaiting augmentation
-_last_teensy_fragment: Optional[Dict[str, Any]] = None
 
 _state_lock = threading.Lock()
 
 # ---------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------
-
-def _read_pi_ticks() -> int:
-    """
-    Raw ARM system timer ticks — unzeroed, free-running.
-
-    Reads CNTVCT_EL0 via a single MRS instruction through
-    the native systimer library.  No syscall, no vDSO.
-
-    At 54 MHz on Pi 4/5, wraps after ~10,800 years.
-
-    Note: this is read in userspace after the PPS_FETCH ioctl
-    returns, so it includes variable kernel→userspace latency.
-    It is stored in TIMEBASE records for forensics and pi_ns
-    computation, but is NOT used for residual statistics.
-    The kernel PPS timestamp is used for residuals instead.
-    """
-    return systimer.read()
-
-
-def _ticks_to_ns(ticks: int) -> int:
-    """
-    Convert a tick count (or tick delta) to nanoseconds.
-
-    Uses integer arithmetic:  ns = ticks * 1,000,000,000 // frequency
-
-    At 54 MHz: 1 tick = 18.519 ns (truncated to integer).
-    """
-    return systimer.ticks_to_ns(ticks)
-
 
 def _get_gnss_time() -> str:
     """
@@ -440,7 +258,6 @@ def _wait_for_gnss_time() -> str:
                 return f"{date}T{time_s}Z"
 
         except Exception:
-            # GNSS process might not even be up yet — that's fine
             pass
 
         now = time.monotonic()
@@ -461,8 +278,6 @@ def _get_active_campaign() -> Optional[Dict[str, Any]]:
     Return active campaign row or None.
 
     Returns dict with keys: campaign, payload (JSONB).
-    The payload contains location, started_at, and optionally
-    a denormalized report snapshot.
     """
     with open_db(row_dict=True) as conn:
         cur = conn.cursor()
@@ -480,7 +295,6 @@ def _get_active_campaign() -> Optional[Dict[str, Any]]:
     if row is None:
         return None
 
-    # Decode payload JSONB
     payload = row["payload"]
     if isinstance(payload, str):
         payload = json.loads(payload)
@@ -492,13 +306,7 @@ def _get_active_campaign() -> Optional[Dict[str, Any]]:
 
 
 def _set_gnss_mode_to(location: str) -> Dict[str, Any]:
-    """
-    Command GNSS process to switch to Time Only mode at a location.
-
-    Blocks until GNSS confirms the mode change (or times out).
-    Returns the GNSS MODE command response dict.
-    Raises on IPC failure.
-    """
+    """Command GNSS process to switch to Time Only mode at a location."""
     return send_command(
         machine="PI",
         subsystem="GNSS",
@@ -508,13 +316,7 @@ def _set_gnss_mode_to(location: str) -> Dict[str, Any]:
 
 
 def _set_gnss_mode_normal() -> Dict[str, Any]:
-    """
-    Command GNSS process to return to normal (CSS) mode.
-
-    Blocks until GNSS confirms the mode change (or times out).
-    Returns the GNSS MODE command response dict.
-    Raises on IPC failure.
-    """
+    """Command GNSS process to return to normal (CSS) mode."""
     return send_command(
         machine="PI",
         subsystem="GNSS",
@@ -585,26 +387,9 @@ def _build_report(
 
     This is denormalized into the campaign's JSONB payload as
     the "report" key, and is what cmd_report returns verbatim.
-
-    Structure:
-      {
-        "campaign": "Alpha",
-        "campaign_state": "STARTED",
-        "campaign_seconds": 42,
-        "campaign_elapsed": "00:00:42",
-        "location": "Peninsula",
-        "gnss_time_utc": "...",
-        "system_time_utc": "...",
-        "teensy_pps_count": 42,
-        "pi_pps_count": 42,
-        "gnss": { ns_now, tau, ppb, pps_* },
-        "dwt":  { ns_now, tau, ppb, pps_* },
-        "pi":   { ns_now, tau, ppb, pps_* },
-      }
     """
     gnss_ns = int(timebase.get("teensy_gnss_ns") or 0)
     dwt_ns = int(timebase.get("teensy_dwt_ns") or 0)
-    pi_ns = int(timebase.get("pi_ns") or 0)
 
     # Campaign elapsed time derived from GNSS nanoseconds
     # (GNSS is truth — use it as the elapsed-time reference)
@@ -622,21 +407,18 @@ def _build_report(
         "gnss_time_utc": timebase.get("gnss_time_utc"),
         "system_time_utc": timebase.get("system_time_utc"),
 
-        # PPS counts
+        # PPS count
         "teensy_pps_count": timebase.get("teensy_pps_count"),
-        "pi_pps_count": timebase.get("pi_pps_count"),
 
         # Raw Teensy clock values (for forensics / recovery)
         "teensy_dwt_cycles": timebase.get("teensy_dwt_cycles"),
         "teensy_ocxo_ns": timebase.get("teensy_ocxo_ns"),
         "teensy_rtc1_ns": timebase.get("teensy_rtc1_ns"),
         "teensy_rtc2_ns": timebase.get("teensy_rtc2_ns"),
-        "pi_ticks": timebase.get("pi_ticks"),
 
-        # Per-clock statistics (all residual stats in nanoseconds)
+        # Teensy clocks — full statistics (tau, ppb, residuals)
         "gnss": _build_clock_block("GNSS", gnss_ns, gnss_ns, _residual_gnss),
         "dwt": _build_clock_block("DWT", dwt_ns, gnss_ns, _residual_dwt),
-        "pi": _build_clock_block("PI", pi_ns, gnss_ns, _residual_pi),
     }
 
     return report
@@ -648,13 +430,7 @@ def _build_report(
 
 def _persist_timebase(tb: Dict[str, Any], report: Dict[str, Any]) -> None:
     """
-    Best-effort TIMEBASE insert into the timebase table,
-    followed by denormalization of the augmented report into
-    the active campaign's JSONB payload.
-
-    The campaign row's payload is merged (not replaced) using
-    the || operator, so existing keys like 'location' and
-    'started_at' are preserved.
+    Best-effort TIMEBASE insert + report denormalization.
 
     Failure is logged and ignored.
     """
@@ -662,7 +438,6 @@ def _persist_timebase(tb: Dict[str, Any], report: Dict[str, Any]) -> None:
         with open_db() as conn:
             cur = conn.cursor()
 
-            # 1) Append-only TIMEBASE row (sacred, immutable)
             cur.execute(
                 """
                 INSERT INTO timebase (campaign, payload)
@@ -671,7 +446,6 @@ def _persist_timebase(tb: Dict[str, Any], report: Dict[str, Any]) -> None:
                 (tb["campaign"], json.dumps(tb)),
             )
 
-            # 2) Denormalize augmented report into campaign payload
             cur.execute(
                 """
                 UPDATE campaigns
@@ -687,29 +461,6 @@ def _persist_timebase(tb: Dict[str, Any], report: Dict[str, Any]) -> None:
 
 
 # ---------------------------------------------------------------------
-# PPS fetch helper (used by both _pps_listener and _recover)
-# ---------------------------------------------------------------------
-
-def _pps_fetch_blocking(fd: int, timeout_sec: int = 2) -> Optional[_PpsFdata]:
-    """
-    Block until the next PPS assert event on the given fd.
-    Returns the filled _PpsFdata, or None on timeout.
-    """
-    fdata = _PpsFdata()
-    fdata.timeout.sec = timeout_sec
-    fdata.timeout.nsec = 0
-    fdata.timeout.flags = 0
-
-    try:
-        fcntl.ioctl(fd, _PPS_FETCH, fdata)
-        return fdata
-    except OSError as e:
-        if e.errno == 110:  # ETIMEDOUT
-            return None
-        raise
-
-
-# ---------------------------------------------------------------------
 # Recovery — restore clocks after Pi restart mid-campaign
 # ---------------------------------------------------------------------
 
@@ -717,31 +468,21 @@ def _recover_campaign() -> None:
     """
     Detect and recover an in-progress campaign after Pi restart.
 
-    Called once at startup, before the PPS listener begins.
+    Called once at startup, before normal operation begins.
 
     Algorithm:
       1) Check for active campaign in Postgres
       2) Fetch the most recent TIMEBASE row for that campaign
       3) Wait patiently for GNSS to produce a valid timestamp
-         (may take minutes after a cold start — logs once per
-         minute while waiting)
       4) If campaign has a location, restore GNSS → TO mode
-      5) Wait for PPS edge, capture GNSS time at that boundary
+      5) Capture GNSS time
       6) Compute elapsed seconds since last TIMEBASE
       7) Compute tau for each Teensy clock domain
       8) Project all clock values forward to the NEXT PPS edge
-         (one more second beyond the one we just captured)
       9) Send RECOVER to Teensy with projected values
-     10) Compute synthetic Pi tick epoch for continuous pi_ns
-     11) Activate campaign in _pps_listener (set _campaign_active)
-
-    The Teensy RECOVER command loads the projected values at its
-    next PPS edge, then resumes publishing TIMEBASE_FRAGMENTs.
-
-    The wait for GNSS never times out — the projection math works
-    correctly regardless of how many seconds have elapsed.
+     10) Activate campaign
     """
-    global _pi_tick_epoch, _pi_pps_count, _campaign_active
+    global _campaign_active
 
     # ----------------------------------------------------------
     # 1) Check for active campaign
@@ -792,19 +533,16 @@ def _recover_campaign() -> None:
     last_gnss_utc = datetime.fromisoformat(
         last_gnss_utc_str.replace("Z", "+00:00")
     )
-    last_dwt_cycles = int(last_tb["teensy_dwt_cycles"])
     last_dwt_ns = int(last_tb["teensy_dwt_ns"])
     last_gnss_ns = int(last_tb.get("teensy_gnss_ns") or 0)
     last_ocxo_ns = int(last_tb.get("teensy_ocxo_ns") or 0)
-    last_pi_ns = int(last_tb["pi_ns"])
 
     logging.info(
-        "🔍 [recovery] last TIMEBASE: gnss_utc=%s  gnss_ns=%d  dwt_ns=%d  ocxo_ns=%d  pi_ns=%d",
+        "🔍 [recovery] last TIMEBASE: gnss_utc=%s  gnss_ns=%d  dwt_ns=%d  ocxo_ns=%d",
         last_gnss_utc.isoformat(),
         last_gnss_ns,
         last_dwt_ns,
         last_ocxo_ns,
-        last_pi_ns,
     )
 
     # If gnss_ns is not available, fall back to dwt_ns
@@ -848,25 +586,14 @@ def _recover_campaign() -> None:
             logging.exception("⚠️ [recovery] GNSS MODE=TO IPC failed (continuing)")
 
     # ----------------------------------------------------------
-    # 5) Wait for PPS edge and capture GNSS time
+    # 5) Capture GNSS time
     # ----------------------------------------------------------
-    logging.info("⏳ [recovery] waiting for PPS edge...")
-
-    pps = PpsRawReader()
-    try:
-        capture = pps.read()
-        ticks_at_pps = capture.counter
-    finally:
-        pps.close()
-
-    # Get GNSS time at this PPS boundary (GNSS is known to be
-    # available — we confirmed it in step 3)
     gnss_time_now_str = _get_gnss_time()
     gnss_time_now = datetime.fromisoformat(
         gnss_time_now_str.replace("Z", "+00:00")
     )
 
-    logging.info("⏱️ [recovery] PPS captured — GNSS time now: %s", gnss_time_now_str)
+    logging.info("⏱️ [recovery] GNSS time now: %s", gnss_time_now_str)
 
     # ----------------------------------------------------------
     # 6) Compute elapsed seconds since last TIMEBASE
@@ -887,17 +614,15 @@ def _recover_campaign() -> None:
     )
 
     # ----------------------------------------------------------
-    # 7) Compute tau for each clock domain
+    # 7) Compute tau for each Teensy clock domain
     # ----------------------------------------------------------
     tau_dwt = float(last_dwt_ns) / float(last_gnss_ns) if last_gnss_ns > 0 else 1.0
     tau_ocxo = float(last_ocxo_ns) / float(last_gnss_ns) if (last_gnss_ns > 0 and last_ocxo_ns > 0) else 1.0
-    tau_pi = float(last_pi_ns) / float(last_gnss_ns) if last_gnss_ns > 0 else 1.0
 
     logging.info(
-        "📐 [recovery] tau — dwt=%.12f  ocxo=%.12f  pi=%.12f",
+        "📐 [recovery] tau — dwt=%.12f  ocxo=%.12f",
         tau_dwt,
         tau_ocxo,
-        tau_pi,
     )
 
     # ----------------------------------------------------------
@@ -908,17 +633,15 @@ def _recover_campaign() -> None:
     projected_gnss_ns = last_gnss_ns + (project_seconds * NS_PER_SECOND)
     projected_dwt_ns = last_dwt_ns + int(project_seconds * NS_PER_SECOND * tau_dwt)
     projected_ocxo_ns = last_ocxo_ns + int(project_seconds * NS_PER_SECOND * tau_ocxo) if last_ocxo_ns > 0 else 0
-    projected_pi_ns = last_pi_ns + int(project_seconds * NS_PER_SECOND * tau_pi)
 
     projected_dwt_cycles = (projected_dwt_ns * DWT_CYCLES_PER_NS_NUM) // DWT_CYCLES_PER_NS_DEN
 
     logging.info(
-        "📐 [recovery] projected to PPS+1 — gnss_ns=%d  dwt_cycles=%d  dwt_ns=%d  ocxo_ns=%d  pi_ns=%d",
+        "📐 [recovery] projected to PPS+1 — gnss_ns=%d  dwt_cycles=%d  dwt_ns=%d  ocxo_ns=%d",
         projected_gnss_ns,
         projected_dwt_cycles,
         projected_dwt_ns,
         projected_ocxo_ns,
-        projected_pi_ns,
     )
 
     # ----------------------------------------------------------
@@ -950,145 +673,18 @@ def _recover_campaign() -> None:
         return
 
     # ----------------------------------------------------------
-    # 10) Compute synthetic Pi tick epoch for continuous pi_ns
+    # 10) Activate campaign
     # ----------------------------------------------------------
-    projected_pi_ticks = (projected_pi_ns * PI_TIMER_FREQ) // NS_PER_SECOND
-    _pi_tick_epoch = (ticks_at_pps + PI_TIMER_FREQ) - projected_pi_ticks
-    _pi_pps_count = 0
-    _residual_pi.reset()
     _residual_gnss.reset()
     _residual_dwt.reset()
-
-    # ----------------------------------------------------------
-    # 11) Activate campaign — PPS listener will begin capturing
-    # ----------------------------------------------------------
     _campaign_active = True
 
     logging.info(
         "✅ [recovery] campaign '%s' recovered — "
-        "Pi tick epoch set, Teensy RECOVER sent, awaiting first TIMEBASE_FRAGMENT",
+        "Teensy RECOVER sent, awaiting first TIMEBASE_FRAGMENT",
         campaign_name,
     )
 
-
-# ---------------------------------------------------------------------
-# PPS listener
-# ---------------------------------------------------------------------
-
-def _pps_listener() -> None:
-    """
-    Listen for PPS assert events via /dev/pps_raw kernel module.
-
-    The pps_raw kernel module captures raw CNTVCT_EL0 ticks in
-    interrupt context at each PPS GPIO edge — no chrony/NTP
-    contamination, no userspace scheduling jitter.
-
-    After each PPS edge, captures (in rapid succession):
-      1) Raw arch timer ticks (from kernel module, interrupt-context)
-      2) Chrony-disciplined system time — datetime.now(UTC)
-
-    The raw tick capture is used for both:
-      - pi_ns computation (campaign-scoped nanoseconds for TIMEBASE)
-      - Pi residual statistics (actual ticks vs expected PI_TIMER_FREQ)
-
-    State transitions (start/stop) are applied at PPS boundaries,
-    mirroring the Teensy's pattern where request flags are set by
-    commands and consumed inside the PPS ISR.
-    """
-    global _pi_pps_count
-    global _pi_tick_epoch
-    global _last_pi_pps
-    global _request_start
-    global _request_stop
-    global _campaign_active
-
-    pps = PpsRawReader()
-    logging.info(
-        "⏱️ [clocks] PPS listener started on /dev/pps_raw — "
-        "systimer: %s, freq=%d Hz (%.3f ns/tick)",
-        "native" if systimer.available() else "fallback",
-        PI_TIMER_FREQ, PI_NS_PER_TICK,
-    )
-
-    while True:
-        try:
-            capture = pps.read()
-
-            # ======================================================
-            # CRITICAL CAPTURE ZONE — the raw tick value was already
-            # captured in kernel interrupt context by pps_raw.ko.
-            # We only need system time from userspace.
-            # ======================================================
-            pi_ticks = capture.counter
-            system_time_utc = datetime.now(timezone.utc)
-            # ======================================================
-
-            # ----------------------------------------------------------
-            # PPS boundary — process request flags (mirrors Teensy ISR)
-            # ----------------------------------------------------------
-
-            if _request_stop:
-                _campaign_active = False
-                _request_stop = False
-                logging.info("⏹️ [clocks] campaign stopped at PPS boundary")
-
-            if _request_start:
-                # Zero the Pi tick epoch at this exact PPS edge
-                _pi_tick_epoch = pi_ticks
-                _pi_pps_count = 0
-                _last_pi_pps = None
-                _residual_pi.reset()
-                _residual_gnss.reset()
-                _residual_dwt.reset()
-                _campaign_active = True
-                _request_start = False
-                logging.info("▶️ [clocks] campaign started at PPS boundary (tick epoch zeroed)")
-
-            # ----------------------------------------------------------
-            # Only capture clocks if a campaign is active
-            # ----------------------------------------------------------
-
-            if not _campaign_active:
-                continue
-
-            # Convert ticks → campaign-scoped nanoseconds
-            campaign_ticks = pi_ticks - _pi_tick_epoch
-            pi_ns = _ticks_to_ns(campaign_ticks)
-
-            # Serialize system time as ISO8601 with microseconds
-            system_time_str = system_time_utc.isoformat(timespec='microseconds')
-
-            # ----------------------------------------------------------
-            # PPS residual tracking for Pi clock
-            #
-            # Uses raw CNTVCT_EL0 ticks captured in kernel interrupt
-            # context by pps_raw.ko — no chrony contamination, no
-            # userspace scheduling jitter.
-            #
-            # Expected delta: PI_TIMER_FREQ ticks (54,000,000)
-            # Residual: actual_ticks - expected_ticks
-            # Converted to nanoseconds by display_scale in to_dict()
-            # ----------------------------------------------------------
-            _residual_pi.update(pi_ticks, PI_TIMER_FREQ)
-
-            with _state_lock:
-                _last_pi_pps = {
-                    "pps_kernel_ns": _ticks_to_ns(pi_ticks),
-                    "pi_ticks": pi_ticks,
-                    "pi_ns": pi_ns,
-                    "pi_pps_count": _pi_pps_count,
-                    "system_time_utc": system_time_str,
-                    "isr_residual_pi": _residual_pi.residual if _residual_pi.valid else None,
-                }
-
-            _pi_pps_count += 1
-
-            # Attempt to complete TIMEBASE if fragment is waiting
-            _try_complete_timebase()
-
-        except Exception:
-            logging.exception("[_pps_listener] unhandled exception")
-            time.sleep(1)
 
 # ---------------------------------------------------------------------
 # Teensy fragment handler
@@ -1096,45 +692,50 @@ def _pps_listener() -> None:
 
 def on_timebase_fragment(payload: Payload) -> None:
     """
-    Receive TIMEBASE_FRAGMENT from Teensy.
-    Attempt to complete TIMEBASE if Pi PPS is available.
+    Receive TIMEBASE_FRAGMENT from Teensy and build TIMEBASE.
+
+    This is the main data path.  Each fragment triggers:
+      1) Pi-side observation (chrony-disciplined system time)
+      2) TIMEBASE augmentation (combine Teensy + GNSS)
+      3) Residual statistics update (GNSS, DWT)
+      4) Report denormalization into campaign payload
+      5) Publish + persist
     """
-    global _last_teensy_fragment
+    global _request_start, _request_stop, _campaign_active
 
-    with _state_lock:
-        _last_teensy_fragment = payload.copy()
+    # ----------------------------------------------------------
+    # Capture chrony-disciplined system time immediately
+    # ----------------------------------------------------------
+    system_time_utc = datetime.now(timezone.utc)
 
-    _try_complete_timebase()
+    # ----------------------------------------------------------
+    # Process request flags
+    # ----------------------------------------------------------
+    if _request_stop:
+        _campaign_active = False
+        _request_stop = False
+        logging.info("⏹️ [clocks] campaign stopped")
 
+    if _request_start:
+        _residual_gnss.reset()
+        _residual_dwt.reset()
+        _campaign_active = True
+        _request_start = False
+        logging.info("▶️ [clocks] campaign started")
 
-def _try_complete_timebase() -> None:
-    """
-    Combine Pi PPS + Teensy fragment + GNSS time into TIMEBASE.
-    Update per-clock residual statistics.
-    Build augmented report and denormalize into campaign payload.
-    """
-    global _last_pi_pps, _last_teensy_fragment
+    if not _campaign_active:
+        return
 
-    with _state_lock:
-        has_pi = _last_pi_pps is not None
-        has_frag = _last_teensy_fragment is not None
-        if not has_pi or not has_frag:
-            logging.info("⏳ [clocks] try_complete: pi=%s frag=%s", has_pi, has_frag)
-            return
+    system_time_str = system_time_utc.isoformat(timespec='microseconds')
 
-        if _last_pi_pps is None or _last_teensy_fragment is None:
-            return
-
-        pi_pps = _last_pi_pps
-        frag = _last_teensy_fragment
-
-        # Clear state immediately (one-shot)
-        _last_pi_pps = None
-        _last_teensy_fragment = None
+    # ----------------------------------------------------------
+    # Build TIMEBASE record
+    # ----------------------------------------------------------
+    frag = payload
 
     row = _get_active_campaign()
     if row is None:
-        logging.warning("⚠️ [clocks] PPS received with no active campaign")
+        logging.warning("⚠️ [clocks] fragment received with no active campaign")
         return
 
     campaign = row["campaign"]
@@ -1144,13 +745,13 @@ def _try_complete_timebase() -> None:
     timebase = {
         "campaign": campaign,
 
-        # System time captured at PPS edge (chrony-disciplined)
-        "system_time_utc": pi_pps["system_time_utc"],
+        # System time when fragment arrived (chrony-disciplined, sanity check)
+        "system_time_utc": system_time_str,
 
         # GNSS time from receiver (integer-second, via NMEA)
         "gnss_time_utc": gnss_time,
 
-        # Teensy clocks
+        # Teensy clocks (authoritative)
         "teensy_dwt_cycles": frag["dwt_cycles"],
         "teensy_dwt_ns": frag["dwt_ns"],
         "teensy_gnss_ns": frag["gnss_ns"],
@@ -1158,29 +759,17 @@ def _try_complete_timebase() -> None:
         "teensy_rtc1_ns": frag.get("rtc1_ns"),
         "teensy_rtc2_ns": frag.get("rtc2_ns"),
 
-        # Pi clocks
-        "pps_kernel_ns": pi_pps["pps_kernel_ns"],
-        "pi_ticks": pi_pps["pi_ticks"],
-        "pi_ns": pi_pps["pi_ns"],
-
-        # Per-clock PPS residuals (nanoseconds, this second)
-        # Teensy residuals carried forward from TIMEBASE_FRAGMENT
-        # Pi residual computed from kernel PPS timestamps
+        # Per-clock PPS residuals from Teensy ISR (nanoseconds)
         "isr_residual_gnss": frag.get("isr_residual_gnss"),
         "isr_residual_dwt": frag.get("isr_residual_dwt"),
         "isr_residual_ocxo": frag.get("isr_residual_ocxo"),
-        "isr_residual_pi": round(pi_pps["isr_residual_pi"] * PI_NS_PER_TICK, 3) if pi_pps.get(
-            "isr_residual_pi") is not None else None,
 
-        # Counters (for sanity checking)
+        # Teensy PPS count
         "teensy_pps_count": frag.get("teensy_pps_count"),
-        "pi_pps_count": pi_pps["pi_pps_count"],
     }
 
     # ----------------------------------------------------------
-    # Update GNSS and DWT residual statistics (in nanoseconds)
-    # (Pi residual is updated in _pps_listener using kernel PPS
-    #  timestamps — already done before we get here)
+    # Update GNSS and DWT residual statistics (nanoseconds)
     # ----------------------------------------------------------
     gnss_ns = int(frag.get("gnss_ns") or 0)
     dwt_ns = int(frag.get("dwt_ns") or 0)
@@ -1213,20 +802,13 @@ def cmd_start(args: Optional[dict]) -> dict:
     Args:
         campaign (str):   Campaign name (required)
         location (str):   Profiled location name (optional)
-                          When provided, GNSS is switched to Time Only
-                          mode at this location before Teensy acquisition
-                          begins. When omitted, GNSS mode is left as-is.
 
     Sequence:
       1) Deactivate any existing campaign
-      2) Insert new campaign row (with optional location in JSONB payload)
+      2) Insert new campaign row
       3) If location specified: command GNSS → TO mode (blocking)
-      4) Set _request_start flag (Pi tick epoch zeroed at next PPS)
-      5) Start Teensy CLOCKS acquisition (Teensy also zeros at PPS)
-
-    Both Pi and Teensy zero their clocks at the next PPS boundary
-    after receiving the start command.  This ensures nanosecond
-    counters on both machines begin from the same PPS pulse.
+      4) Set _request_start flag (consumed on next fragment)
+      5) Start Teensy CLOCKS acquisition (Teensy zeros at PPS)
     """
     global _request_start, _request_stop
 
@@ -1247,7 +829,6 @@ def cmd_start(args: Optional[dict]) -> dict:
     with open_db() as conn:
         cur = conn.cursor()
 
-        # Mark any active campaign as stopped
         cur.execute(
             """
             UPDATE campaigns
@@ -1260,7 +841,6 @@ def cmd_start(args: Optional[dict]) -> dict:
             (datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),),
         )
 
-        # Insert new campaign with JSONB payload
         cur.execute(
             """
             INSERT INTO campaigns (campaign, active, payload)
@@ -1299,7 +879,7 @@ def cmd_start(args: Optional[dict]) -> dict:
         logging.info("✅ [clocks] GNSS confirmed TO mode")
 
     # ----------------------------------------------------------
-    # 3) Arm start — Pi tick epoch will be zeroed at next PPS edge
+    # 3) Arm start — consumed on next TIMEBASE_FRAGMENT
     # ----------------------------------------------------------
     _request_stop = False
     _request_start = True
@@ -1330,23 +910,16 @@ def cmd_stop(_: Optional[dict]) -> dict:
 
     Sequence:
       1) Read active campaign (to check if it had a location)
-      2) Deactivate campaign in DB (set stopped_at in JSONB payload,
-         update campaign_state in report)
-      3) Set _request_stop flag (applied at next PPS boundary)
+      2) Deactivate campaign in DB
+      3) Set _request_stop flag (applied on next fragment)
       4) Stop Teensy CLOCKS acquisition
       5) If campaign had a location: restore GNSS → NORMAL (CSS)
     """
     global _request_start, _request_stop
 
-    # ----------------------------------------------------------
-    # 1) Check if active campaign had a location
-    # ----------------------------------------------------------
     row = _get_active_campaign()
     had_location = row["payload"].get("location") if row else None
 
-    # ----------------------------------------------------------
-    # 2) Deactivate campaign (add stopped_at, update report state)
-    # ----------------------------------------------------------
     stopped_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
     with open_db() as conn:
@@ -1370,24 +943,15 @@ def cmd_stop(_: Optional[dict]) -> dict:
             (stopped_at,),
         )
 
-    # ----------------------------------------------------------
-    # 3) Arm stop — applied at next PPS boundary
-    # ----------------------------------------------------------
     _request_start = False
     _request_stop = True
 
-    # ----------------------------------------------------------
-    # 4) Stop Teensy
-    # ----------------------------------------------------------
     send_command(
         machine="TEENSY",
         subsystem="CLOCKS",
         command="STOP",
     )
 
-    # ----------------------------------------------------------
-    # 5) Restore GNSS mode if we changed it
-    # ----------------------------------------------------------
     if had_location:
         logging.info(
             "📡 [clocks] restoring GNSS → NORMAL (campaign had location '%s')",
@@ -1414,15 +978,10 @@ def cmd_report(_: Optional[dict]) -> Dict[str, Any]:
 
     Simply reads and returns the active campaign's payload,
     which contains the denormalized report built each second
-    by _try_complete_timebase.
+    by on_timebase_fragment.
 
     If no campaign is active, returns an empty OK response
     indicating clocks are idle.
-
-    Semantics:
-      • Observational only
-      • No computation at report time
-      • Campaign payload is the single source of truth
     """
 
     row = _get_active_campaign()
@@ -1457,31 +1016,23 @@ def run() -> None:
     setup_logging()
 
     logging.info(
-        "🕐 [clocks] ARM systimer: %s, freq=%d Hz (%.3f ns/tick)",
-        "native" if systimer.available() else "fallback(monotonic_ns)",
-        PI_TIMER_FREQ,
-        PI_NS_PER_TICK,
+        "🕐 [clocks] Pi role: orchestration + chrony-disciplined system time. "
+        "Precision timing owned by Teensy."
     )
 
     # ----------------------------------------------------------
     # Recovery check — before anything else, see if we need to
     # resume a campaign that was running when we last restarted.
-    # This must happen before the PPS listener starts so that
-    # _campaign_active and _pi_tick_epoch are set correctly.
     # ----------------------------------------------------------
     try:
         _recover_campaign()
     except Exception:
         logging.exception("❌ [recovery] unhandled exception during recovery")
 
-    # Start PPS listener thread (reads /dev/pps0 via kernel ioctl)
-    threading.Thread(
-        target=_pps_listener,
-        daemon=True,
-        name="pps-listener",
-    ).start()
-
-    # Start server
+    # ----------------------------------------------------------
+    # Start server — TIMEBASE_FRAGMENT subscription is the
+    # primary data path. No PPS listener, no arch timer reads.
+    # ----------------------------------------------------------
     server_setup(
         subsystem="CLOCKS",
         commands=COMMANDS,
