@@ -18,13 +18,22 @@ Pi clock source:
   • ARM Generic Timer (CNTVCT_EL0) read via zpnet.native.systimer
   • Single MRS instruction — no syscall, no vDSO, no NTP steering
   • 54 MHz on Pi 4/5 → 18.519 ns resolution per tick
-  • Significantly less jittery than time.monotonic_ns() which goes
-    through clock_gettime() with vDSO interpolation and chrony
-    adjustments
   • Raw ticks are captured at PPS edge, converted to nanoseconds
     only when building TIMEBASE records
-  • PPS residual statistics accumulate in raw ticks for maximum
-    precision, converted to nanoseconds only at display time
+  • However, userspace tick reads have variable latency from the
+    kernel ioctl return — microseconds of scheduling jitter
+
+Pi residual measurement:
+  • The pps-gpio kernel driver timestamps the PPS edge in interrupt
+    context — this is the best precision available on the Pi
+  • The kernel PPS timestamp is driven by the same 54 MHz counter
+    (CNTVCT_EL0) that we read in userspace
+  • Therefore, Pi residual statistics use kernel PPS timestamps:
+    delta between consecutive kernel timestamps, minus 1e9 ns
+  • This measures the arch timer's true behavior (thermal drift,
+    crystal imperfections) without userspace scheduling noise
+  • Consistent with the universal residual policy: actual clock
+    ticks per PPS interval minus expected, normalized to nanoseconds
 
 System time capture:
   • datetime.now(UTC) is captured immediately when PPS_FETCH returns,
@@ -43,6 +52,17 @@ PPS capture:
   • We read /dev/pps0 via PPS_FETCH ioctl (same as ppstest)
   • chrony also reads /dev/pps0 — multiple readers are supported
   • No gpiod dependency; no pin ownership conflict
+
+Residual policy (all non-GNSS clocks):
+  • Count actual ticks (or nanoseconds) between consecutive PPS edges
+  • Subtract expected count for that clock's frequency
+  • Express residual in nanoseconds
+  • GNSS: Teensy counts 10 MHz VCLK edges, residual vs 1e9 ns
+  • DWT: Teensy counts 600 MHz CPU cycles, residual vs 1e9 ns
+  • Pi: kernel timestamps PPS edge using 54 MHz arch timer,
+    residual = delta_ns - 1e9 ns (already in nanoseconds)
+  • Mechanical imperfections (temperature, power, crystal aging)
+    are welcome — they're what we're measuring
 
 Campaign start synchronisation:
   • cmd_start sets _request_start = True (same as Teensy)
@@ -67,13 +87,13 @@ Recovery after restart:
   • Resume normal PPS capture and TIMEBASE augmentation
 
 Per-clock residual statistics:
-  • At each TIMEBASE, the delta between consecutive records
-    is computed for GNSS, DWT, and Pi clock domains
-  • GNSS and DWT: delta in nanoseconds, residual vs 1,000,000,000
-  • Pi: delta in raw ticks, residual vs systimer frequency
+  • At each PPS edge, the delta between consecutive readings
+    is computed for each clock domain
+  • GNSS: delta in nanoseconds from Teensy, residual vs 1e9
+  • DWT: delta in nanoseconds from Teensy, residual vs 1e9
+  • Pi: delta in nanoseconds from kernel PPS timestamp, residual vs 1e9
   • Running statistics via Welford's online algorithm
-  • Pi residual stats are scaled to nanoseconds at display time
-    using ns_per_tick (~18.519 at 54 MHz)
+  • All residual stats are in nanoseconds — no scaling needed
 
 Campaign report denormalization:
   • After each TIMEBASE, the active campaign row's JSONB payload
@@ -113,6 +133,7 @@ from zpnet.processes.processes import (
 from zpnet.shared.constants import Payload
 from zpnet.shared.db import open_db
 from zpnet.shared.logger import setup_logging
+from zpnet.native.pps_raw import PpsRawReader
 
 # ---------------------------------------------------------------------
 # Configuration
@@ -122,14 +143,15 @@ PPS_DEVICE = "/dev/pps0"
 
 # ARM Generic Timer frequency — read from hardware at import time.
 # On Pi 4/5 this is 54,000,000 (54 MHz, ~18.519 ns per tick).
-# Used as the expected tick count between consecutive PPS pulses
-# for the Pi residual tracker.
+# Used for converting raw tick counts to nanoseconds in TIMEBASE
+# records and for recovery projections.
 PI_TIMER_FREQ: int = systimer.frequency()
 PI_NS_PER_TICK: float = systimer.ns_per_tick()
 
 # Expected nanoseconds per PPS for all clock domains.
 # GNSS 10 MHz counter: 100 ns/tick × 10,000,000 ticks = 1e9 ns
 # DWT 600 MHz: cycles * 5/3 = ns, so 1 second = 1e9 ns
+# Pi 54 MHz: kernel PPS timestamp delta = 1e9 ns
 # All clocks measure the same physical second — residual is
 # deviation from this ideal.
 NS_PER_SECOND = 1_000_000_000
@@ -205,10 +227,11 @@ _PPS_FETCH = 0xC00870A4
 #
 # Used for all clock domains: GNSS, DWT, Pi.
 #
-# GNSS and DWT accumulate in nanoseconds (expected = 1e9).
-# Pi accumulates in raw hardware ticks (expected = timer frequency).
-# The display_scale factor converts accumulated values to nanoseconds
-# at display time — 1.0 for ns-based clocks, ns_per_tick for Pi.
+# All three accumulate in nanoseconds with expected = 1e9.
+# GNSS and DWT: nanoseconds from Teensy ISR captures.
+# Pi: nanoseconds from kernel PPS interrupt-context timestamp.
+#
+# display_scale is always 1.0 — all clocks report in nanoseconds.
 # ---------------------------------------------------------------------
 
 class _PpsResidual:
@@ -244,7 +267,7 @@ class _PpsResidual:
 
         value_now and expected must be in the same units:
           - nanoseconds for GNSS and DWT (expected = 1e9)
-          - raw ticks for Pi (expected = timer frequency)
+          - raw ticks for Pi (expected = PI_TIMER_FREQ)
 
         Conversion to nanoseconds happens only in to_dict().
         """
@@ -298,7 +321,6 @@ class _PpsResidual:
             "pps_stderr": round(self.stderr * s, 3),
         }
 
-
 # ---------------------------------------------------------------------
 # Local state (process lifetime)
 # ---------------------------------------------------------------------
@@ -322,11 +344,10 @@ _request_stop: bool = False
 _campaign_active: bool = False
 
 # Per-clock PPS residual trackers (Welford's online algorithm).
-# Pi residual accumulates in raw ticks (display_scale converts to ns).
-# GNSS and DWT accumulate in nanoseconds (display_scale=1.0).
+# All three accumulate in nanoseconds with expected = NS_PER_SECOND.
 _residual_pi = _PpsResidual(display_scale=PI_NS_PER_TICK)
-_residual_gnss = _PpsResidual(display_scale=1.0)
-_residual_dwt = _PpsResidual(display_scale=1.0)
+_residual_gnss = _PpsResidual()
+_residual_dwt = _PpsResidual()
 
 # Latest Pi-side PPS capture
 _last_pi_pps: Optional[Dict[str, Any]] = None
@@ -348,6 +369,12 @@ def _read_pi_ticks() -> int:
     the native systimer library.  No syscall, no vDSO.
 
     At 54 MHz on Pi 4/5, wraps after ~10,800 years.
+
+    Note: this is read in userspace after the PPS_FETCH ioctl
+    returns, so it includes variable kernel→userspace latency.
+    It is stored in TIMEBASE records for forensics and pi_ns
+    computation, but is NOT used for residual statistics.
+    The kernel PPS timestamp is used for residuals instead.
     """
     return systimer.read()
 
@@ -532,7 +559,7 @@ def _build_clock_block(
     Build a per-clock statistics block for the campaign report.
 
     Contains: ns_now, tau, ppb, and all residual statistics.
-    Residual stats are already scaled to nanoseconds by to_dict().
+    All residual stats are in nanoseconds.
     """
     block: Dict[str, Any] = {
         "ns_now": ns_now,
@@ -825,18 +852,12 @@ def _recover_campaign() -> None:
     # ----------------------------------------------------------
     logging.info("⏳ [recovery] waiting for PPS edge...")
 
-    fd = os.open(PPS_DEVICE, os.O_RDONLY)
+    pps = PpsRawReader()
     try:
-        fdata = _pps_fetch_blocking(fd, timeout_sec=5)
-        if fdata is None:
-            logging.error("❌ [recovery] PPS timeout — cannot recover")
-            os.close(fd)
-            return
-
-        # Capture system timer ticks at this PPS edge
-        ticks_at_pps = _read_pi_ticks()
+        capture = pps.read()
+        ticks_at_pps = capture.counter
     finally:
-        os.close(fd)
+        pps.close()
 
     # Get GNSS time at this PPS boundary (GNSS is known to be
     # available — we confirmed it in step 3)
@@ -956,20 +977,19 @@ def _recover_campaign() -> None:
 
 def _pps_listener() -> None:
     """
-    Listen for PPS assert events via kernel /dev/pps0 ioctl.
+    Listen for PPS assert events via /dev/pps_raw kernel module.
 
-    Uses the PPS_FETCH ioctl which blocks until the next PPS edge.
-    The kernel pps-gpio driver timestamps the edge in interrupt
-    context — this is the best precision available on the Pi.
+    The pps_raw kernel module captures raw CNTVCT_EL0 ticks in
+    interrupt context at each PPS GPIO edge — no chrony/NTP
+    contamination, no userspace scheduling jitter.
 
     After each PPS edge, captures (in rapid succession):
-      1) ARM system timer (CNTVCT_EL0) — single MRS instruction
+      1) Raw arch timer ticks (from kernel module, interrupt-context)
       2) Chrony-disciplined system time — datetime.now(UTC)
 
-    The system time capture at PPS edge allows direct comparison
-    with gnss_time_utc to validate the PPS chain end-to-end.
-
-    Multiple readers (us + chrony) can read /dev/pps0 concurrently.
+    The raw tick capture is used for both:
+      - pi_ns computation (campaign-scoped nanoseconds for TIMEBASE)
+      - Pi residual statistics (actual ticks vs expected PI_TIMER_FREQ)
 
     State transitions (start/stop) are applied at PPS boundaries,
     mirroring the Teensy's pattern where request flags are set by
@@ -982,38 +1002,26 @@ def _pps_listener() -> None:
     global _request_stop
     global _campaign_active
 
-    fd = os.open(PPS_DEVICE, os.O_RDONLY)
+    pps = PpsRawReader()
     logging.info(
-        "⏱️ [clocks] PPS listener started on %s (fd=%d) — "
+        "⏱️ [clocks] PPS listener started on /dev/pps_raw — "
         "systimer: %s, freq=%d Hz (%.3f ns/tick)",
-        PPS_DEVICE, fd,
         "native" if systimer.available() else "fallback",
         PI_TIMER_FREQ, PI_NS_PER_TICK,
     )
 
-    last_sequence = -1
-
     while True:
         try:
-            fdata = _pps_fetch_blocking(fd)
-            if fdata is None:
-                logging.warning("⚠️ [clocks] PPS fetch timed out (no pulse)")
-                continue
+            capture = pps.read()
 
             # ======================================================
-            # CRITICAL CAPTURE ZONE — minimize work between these
-            # two reads.  The ioctl just returned from a PPS edge.
+            # CRITICAL CAPTURE ZONE — the raw tick value was already
+            # captured in kernel interrupt context by pps_raw.ko.
+            # We only need system time from userspace.
             # ======================================================
-            pi_ticks = _read_pi_ticks()
+            pi_ticks = capture.counter
             system_time_utc = datetime.now(timezone.utc)
             # ======================================================
-
-            seq = fdata.info.assert_sequence
-
-            # Skip if we already saw this sequence number
-            if seq == last_sequence:
-                continue
-            last_sequence = seq
 
             # ----------------------------------------------------------
             # PPS boundary — process request flags (mirrors Teensy ISR)
@@ -1043,11 +1051,6 @@ def _pps_listener() -> None:
             if not _campaign_active:
                 continue
 
-            # Kernel timestamp of the PPS edge (nanoseconds since epoch)
-            pps_sec = fdata.info.assert_tu.sec
-            pps_nsec = fdata.info.assert_tu.nsec
-            pps_kernel_ns = pps_sec * 1_000_000_000 + pps_nsec
-
             # Convert ticks → campaign-scoped nanoseconds
             campaign_ticks = pi_ticks - _pi_tick_epoch
             pi_ns = _ticks_to_ns(campaign_ticks)
@@ -1056,27 +1059,33 @@ def _pps_listener() -> None:
             system_time_str = system_time_utc.isoformat(timespec='microseconds')
 
             # ----------------------------------------------------------
-            # PPS residual tracking for Pi clock (in raw ticks)
+            # PPS residual tracking for Pi clock
+            #
+            # Uses raw CNTVCT_EL0 ticks captured in kernel interrupt
+            # context by pps_raw.ko — no chrony contamination, no
+            # userspace scheduling jitter.
+            #
+            # Expected delta: PI_TIMER_FREQ ticks (54,000,000)
+            # Residual: actual_ticks - expected_ticks
+            # Converted to nanoseconds by display_scale in to_dict()
             # ----------------------------------------------------------
             _residual_pi.update(pi_ticks, PI_TIMER_FREQ)
 
             with _state_lock:
                 _last_pi_pps = {
-                    "pps_kernel_ns": pps_kernel_ns,
+                    "pps_kernel_ns": _ticks_to_ns(pi_ticks),
                     "pi_ticks": pi_ticks,
                     "pi_ns": pi_ns,
                     "pi_pps_count": _pi_pps_count,
                     "system_time_utc": system_time_str,
+                    "isr_residual_pi": _residual_pi.residual if _residual_pi.valid else None,
                 }
 
             _pi_pps_count += 1
 
-        except OSError as e:
-            if e.errno == 110:  # ETIMEDOUT — no PPS pulse within timeout
-                logging.warning("⚠️ [clocks] PPS fetch timed out (no pulse)")
-                continue
-            logging.exception("[_pps_listener] ioctl error")
-            time.sleep(1)
+            # Attempt to complete TIMEBASE if fragment is waiting
+            _try_complete_timebase()
+
         except Exception:
             logging.exception("[_pps_listener] unhandled exception")
             time.sleep(1)
@@ -1107,6 +1116,12 @@ def _try_complete_timebase() -> None:
     global _last_pi_pps, _last_teensy_fragment
 
     with _state_lock:
+        has_pi = _last_pi_pps is not None
+        has_frag = _last_teensy_fragment is not None
+        if not has_pi or not has_frag:
+            logging.info("⏳ [clocks] try_complete: pi=%s frag=%s", has_pi, has_frag)
+            return
+
         if _last_pi_pps is None or _last_teensy_fragment is None:
             return
 
@@ -1144,8 +1159,18 @@ def _try_complete_timebase() -> None:
         "teensy_rtc2_ns": frag.get("rtc2_ns"),
 
         # Pi clocks
+        "pps_kernel_ns": pi_pps["pps_kernel_ns"],
         "pi_ticks": pi_pps["pi_ticks"],
         "pi_ns": pi_pps["pi_ns"],
+
+        # Per-clock PPS residuals (nanoseconds, this second)
+        # Teensy residuals carried forward from TIMEBASE_FRAGMENT
+        # Pi residual computed from kernel PPS timestamps
+        "isr_residual_gnss": frag.get("isr_residual_gnss"),
+        "isr_residual_dwt": frag.get("isr_residual_dwt"),
+        "isr_residual_ocxo": frag.get("isr_residual_ocxo"),
+        "isr_residual_pi": round(pi_pps["isr_residual_pi"] * PI_NS_PER_TICK, 3) if pi_pps.get(
+            "isr_residual_pi") is not None else None,
 
         # Counters (for sanity checking)
         "teensy_pps_count": frag.get("teensy_pps_count"),
@@ -1154,7 +1179,8 @@ def _try_complete_timebase() -> None:
 
     # ----------------------------------------------------------
     # Update GNSS and DWT residual statistics (in nanoseconds)
-    # (Pi residual is updated in _pps_listener in raw ticks)
+    # (Pi residual is updated in _pps_listener using kernel PPS
+    #  timestamps — already done before we get here)
     # ----------------------------------------------------------
     gnss_ns = int(frag.get("gnss_ns") or 0)
     dwt_ns = int(frag.get("dwt_ns") or 0)

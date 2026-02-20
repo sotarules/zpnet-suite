@@ -18,7 +18,7 @@ def startup_tasks():
     Add new tasks here.
     """
     return [
-        init_laser_driver,
+        # init_laser_driver,
         # future:
         # init_photodiode,
         # verify_gnss_lock,
