@@ -105,7 +105,7 @@ GND           Black         GND                Battery branching ground         
 
 30            Green         LASER_EN           EV5491-C-00A EN pin                  Laser driver enable
 
-32            Orange         GNSS_PPS_RELAY     GPIO relay to Pi for GNSS PPS         Relays GNSS PPS to Pi (critical timing)
+32            Orange        GNSS_PPS_RELAY     GPIO relay to Pi for GNSS PPS        Relays GNSS PPS to Pi (critical timing)
 
 34            Orange        PHOTODIODE_INT     Photodiode interrupt                 Digital interrupt
 

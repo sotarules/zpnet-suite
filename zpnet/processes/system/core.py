@@ -1002,7 +1002,7 @@ def system_poller() -> None:
             pi_payload = build_pi_status()
             teensy_payload = build_teensy_status()
             network_payload = build_network_status()
-            #laser_payload = build_laser_status()
+            laser_payload = build_laser_status()
             #sensor_payload = build_sensor_scan_status()
             #environment_payload = build_environment_status()
             gnss_payload = build_gnss_status()
@@ -1018,7 +1018,7 @@ def system_poller() -> None:
                 "pi": dict(pi_payload),
                 "teensy": dict(teensy_payload),
                 "network": dict(network_payload),
-                #"laser": dict(laser_payload),
+                "laser": dict(laser_payload),
                 #"sensors": dict(sensor_payload),
                 #"environment": dict(environment_payload),
                 "gnss": dict(gnss_payload),
