@@ -83,6 +83,25 @@
 //   publishing TIMEBASE_FRAGMENTs.  The clocks continue as if
 //   the interruption never happened.
 //
+// Pre-PPS Approach Timing (experimental):
+//
+//   To characterize ISR dispatch latency, we need to know how
+//   close to the PPS edge our software actually executes.  This
+//   is measured with a two-stage timer chain:
+//
+//     Stage 1 (PRE_PPS_COARSE, ms):  999 ms after PPS
+//     Stage 2 (PRE_PPS, µs):         999 µs after stage 1
+//
+//   Stage 2 snapshots GPT2_CNT (GNSS VCLK, 10 MHz) into a
+//   volatile shadow variable.  When the next PPS ISR fires,
+//   the delta between the ISR snapshot and the shadow gives
+//   the "approach time" — how many GNSS nanoseconds elapsed
+//   between our closest pre-PPS observation and the actual
+//   PPS edge.
+//
+//   Expected value: ~1 µs (1000 ns) = ~10 GNSS ticks.
+//   This is purely observational — no existing behavior changes.
+//
 // ============================================================================
 
 #include "debug.h"
@@ -182,6 +201,21 @@ static volatile bool     isr_residual_valid = false;
 static constexpr uint32_t ISR_DWT_EXPECTED  = 600000000u;
 static constexpr uint32_t ISR_GNSS_EXPECTED =  10000000u;
 static constexpr uint32_t ISR_OCXO_EXPECTED =  10000000u;
+
+// ============================================================================
+// Pre-PPS approach timing (experimental)
+// ============================================================================
+//
+// Shadow GNSS snapshot captured by the µs-stage callback,
+// ~1 µs before the expected PPS edge.
+//
+// Written by pre_pps_fine_cb(), read by the PPS ASAP callback.
+// pre_pps_approach_ns holds the computed result for publishing.
+//
+
+static volatile uint32_t pre_pps_shadow_gnss  = 0;
+static volatile bool     pre_pps_shadow_valid = false;
+static volatile int32_t  pre_pps_approach_ns  = -1;
 
 // ============================================================================
 // PPS residual tracking — per-clock-domain (Welford's, callback-level)
@@ -418,6 +452,60 @@ static void clocks_zero_all(void) {
   isr_prev_gnss = isr_snap_gnss;
   isr_prev_ocxo = isr_snap_ocxo;
   isr_residual_valid = false;
+
+  // Reset pre-PPS approach timing
+  pre_pps_shadow_gnss  = 0;
+  pre_pps_shadow_valid = false;
+  pre_pps_approach_ns  = -1;
+}
+
+// ============================================================================
+// Pre-PPS approach timing — two-stage callback chain
+// ============================================================================
+//
+// Stage 1 (coarse, ms):  Armed after each PPS.  Fires 999 ms later.
+//                         Its only job is to arm stage 2.
+//
+// Stage 2 (fine, µs):    Armed by stage 1.  Fires 999 µs later
+//                         (~1 µs before the next expected PPS edge).
+//                         Snapshots GPT2_CNT into pre_pps_shadow_gnss.
+//
+// The next PPS ISR captures isr_snap_gnss.  The ASAP callback
+// computes the approach time:
+//
+//   approach_ns = (isr_snap_gnss - pre_pps_shadow_gnss) * 100
+//
+// This tells us how many GNSS nanoseconds elapsed between our
+// closest pre-PPS observation and the actual PPS edge.
+//
+
+static void pre_pps_fine_cb(timepop_ctx_t*, void*) {
+  // Snapshot GNSS VCLK — this is our closest observation
+  // before the upcoming PPS edge.
+  pre_pps_shadow_gnss = GPT2_CNT;
+  pre_pps_shadow_valid = true;
+}
+
+static void pre_pps_coarse_cb(timepop_ctx_t*, void*) {
+  // Stage 1 complete.  Arm stage 2 (µs precision).
+  timepop_arm(
+    TIMEPOP_CLASS_PRE_PPS,
+    false,                    // one-shot
+    pre_pps_fine_cb,
+    nullptr,
+    "pre-pps-fine"
+  );
+}
+
+// Helper: arm the coarse stage (called from PPS ASAP callback)
+static void pre_pps_arm_chain(void) {
+  timepop_arm(
+    TIMEPOP_CLASS_PRE_PPS_COARSE,
+    false,                    // one-shot
+    pre_pps_coarse_cb,
+    nullptr,
+    "pre-pps-coarse"
+  );
 }
 
 // ============================================================================
@@ -528,6 +616,11 @@ static void pps_isr(void) {
       if (request_stop) {
         campaign_state = clocks_campaign_state_t::STOPPED;
         request_stop = false;
+
+        // Cancel any pending pre-PPS timers
+        timepop_cancel(TIMEPOP_CLASS_PRE_PPS_COARSE);
+        timepop_cancel(TIMEPOP_CLASS_PRE_PPS);
+        pre_pps_shadow_valid = false;
       }
 
       if (request_recover) {
@@ -547,6 +640,10 @@ static void pps_isr(void) {
 
         // ISR residuals will become valid on the next PPS
         isr_residual_valid = false;
+
+        // Reset pre-PPS approach timing
+        pre_pps_shadow_valid = false;
+        pre_pps_approach_ns  = -1;
 
         campaign_state = clocks_campaign_state_t::STARTED;
         request_recover = false;
@@ -568,6 +665,23 @@ static void pps_isr(void) {
         if (!isr_residual_valid) {
           isr_residual_valid = true;
         }
+
+        // --------------------------------------------------------
+        // Pre-PPS approach: compute result from previous cycle
+        // --------------------------------------------------------
+
+        if (pre_pps_shadow_valid) {
+          // GNSS VCLK is 10 MHz → 100 ns per tick
+          int32_t delta_ticks = (int32_t)(isr_snap_gnss - pre_pps_shadow_gnss);
+          pre_pps_approach_ns = delta_ticks * 100;
+          pre_pps_shadow_valid = false;
+        }
+
+        // --------------------------------------------------------
+        // Arm pre-PPS chain for the NEXT PPS edge
+        // --------------------------------------------------------
+
+        pre_pps_arm_chain();
 
         // --------------------------------------------------------
         // Extend ISR snapshots to 64-bit
@@ -613,6 +727,12 @@ static void pps_isr(void) {
         p.add("isr_residual_gnss", isr_residual_gnss);
         p.add("isr_residual_ocxo", isr_residual_ocxo);
         p.add("isr_residual_valid", isr_residual_valid);
+
+        // Pre-PPS approach timing (experimental)
+        // How many GNSS nanoseconds between our closest pre-PPS
+        // observation and the actual PPS edge.
+        // -1 = not yet available (first PPS of campaign).
+        p.add("pre_pps_approach_ns", pre_pps_approach_ns);
 
         publish("TIMEBASE_FRAGMENT", p);
 
@@ -761,6 +881,9 @@ static Payload cmd_report(const Payload&) {
   p.add("isr_residual_gnss",  isr_residual_gnss);
   p.add("isr_residual_ocxo",  isr_residual_ocxo);
   p.add("isr_residual_valid", (bool)isr_residual_valid);
+
+  // Pre-PPS approach timing
+  p.add("pre_pps_approach_ns", pre_pps_approach_ns);
 
   if (campaign_state == clocks_campaign_state_t::STARTED && gnss_ns > 0) {
 
