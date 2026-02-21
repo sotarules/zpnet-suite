@@ -69,7 +69,7 @@ SCL               Yellow        SCL1               Rail SCL1 (Yellow)           
 TXD               Yellow        PI_TXD             GF-8802 RX (Pin 12)            Pi → GNSS serial
 RXD               Blue          PI_RXD             GF-8802 TX (Pin 13)            GNSS → Pi serial
 
-IO18 (GPI018)     Orange        GNSS_PPS           GF-8802 PPS (Pin 17)           GNSS PPS shared with Teensy (critical timing)
+IO18 (GPI018)     Orange        GNSS_PPS_RELAY     GF-8802 PPS via Teensy         GNSS PPS relay (critical timing)
 
 IO23 (GPIO23)     Green         SDA2               Rail SDA2 (Green)              Secondary I2C data (Bus 2)
 IO24 (GPIO24)     Orange        SCL2               Rail SCL2 (Orange)             Secondary I2C clock (Bus 2)
@@ -93,6 +93,8 @@ Teensy Pin    Wire Color    Signal Name        Source / Destination             
 VIN           White         VIN_5V5            INA260 (5.5 V rail)                  Dedicated 5V+ CPU power (INA260 addr TBD)
 GND           Black         GND                Battery branching ground             Direct return to battery
 
+1             Twisted Pair  GNSS_PPS_IN        GNSS PPS                             1 hz pulse for absolute time reference
+
 20            White         LASER_PD_PLUS      Laser diode PD+                      Indicates laser on/off (active signal)
 
 19            Blue          SDA1               Rail bus SDA1                        Primary I2C data
@@ -103,7 +105,7 @@ GND           Black         GND                Battery branching ground         
 
 30            Green         LASER_EN           EV5491-C-00A EN pin                  Laser driver enable
 
-32            Orange        GNSS_PPS_IN        GNSS PPS                             1 hz pulse for absolute time reference
+32            Orange         GNSS_PPS_RELAY     GPIO relay to Pi for GNSS PPS         Relays GNSS PPS to Pi (critical timing)
 
 34            Orange        PHOTODIODE_INT     Photodiode interrupt                 Digital interrupt
 

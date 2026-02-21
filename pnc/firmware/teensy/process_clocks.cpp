@@ -47,6 +47,31 @@
 //   64-bit extended values in the callback) is retained for
 //   running statistics.
 //
+// PPS relay to Pi:
+//
+//   The raw GNSS PPS from the GF-8802 arrives on pin 1 via
+//   shielded twisted pair — this path achieves sub-nanosecond
+//   measurement noise and must not be compromised.
+//
+//   The Pi needs a PPS signal on GPIO 18 for chrony discipline.
+//   Rather than splitting the GF-8802 signal (which would
+//   degrade the Teensy's pristine capture), the Teensy relays
+//   the PPS from pin 32 (GNSS_PPS_RELAY).
+//
+//   Immediately after the three hardware snapshots in the ISR,
+//   pin 32 is driven HIGH.  The ISR sets a flag; the ASAP
+//   callback (running in scheduled context) arms a one-shot
+//   TimePop that fires 500 ms later to drive pin 32 LOW.
+//
+//   timepop_arm is NEVER called from ISR context.  Its internal
+//   noInterrupts/interrupts pair can re-enable interrupts mid-ISR,
+//   causing the PIT to nest into the PPS handler and corrupt
+//   timer state.  All timepop arming happens in scheduled context.
+//
+//   The relay latency is deterministic (~30-50 ns after the
+//   snapshots, ~50-70 ns after the true PPS edge) and constant.
+//   This is well within chrony's discipline capability.
+//
 // Recovery:
 //
 //   When the Pi restarts mid-campaign, it reads the last TIMEBASE
@@ -60,7 +85,9 @@
 //
 // ============================================================================
 
+#include "debug.h"
 #include "process_clocks.h"
+#include "process_timepop.h"
 
 #include "payload.h"
 #include "publish.h"
@@ -100,6 +127,29 @@ static uint64_t recover_ocxo_ns    = 0;
 
 // Campaign-scoped PPS second counter
 static uint64_t campaign_seconds = 0;
+
+// ============================================================================
+// PPS relay to Pi — 500 ms pulse on GNSS_PPS_RELAY (pin 32)
+// ============================================================================
+//
+// The relay pin is driven HIGH in the PPS ISR immediately after
+// the three hardware snapshots.  The ISR sets relay_arm_pending
+// to request that the deassert timer be armed from scheduled
+// context.  The ASAP callback checks this flag and arms the
+// one-shot before doing any other work.
+//
+// The relay fires on EVERY PPS edge, regardless of campaign state.
+// chrony needs continuous PPS discipline even when no campaign
+// is running.
+//
+
+static volatile bool relay_arm_pending = false;
+static volatile bool relay_timer_active = false;
+
+static void pps_relay_deassert(timepop_ctx_t*, void*) {
+  digitalWriteFast(GNSS_PPS_RELAY, LOW);
+  relay_timer_active = false;
+}
 
 // ============================================================================
 // ISR-level hardware snapshots and raw residuals
@@ -376,13 +426,18 @@ static void clocks_zero_all(void) {
 //
 // Two-phase architecture:
 //
-//   Phase 1 (ISR): Snapshot all hardware counters and compute raw
-//   PPS-to-PPS residuals immediately at the PPS rising edge.
-//   Three register reads (~10 ns total) plus three subtractions.
+//   Phase 1 (ISR): Snapshot all hardware counters, compute raw
+//   PPS-to-PPS residuals, and assert PPS relay HIGH — all
+//   immediately at the PPS rising edge.  Three register reads
+//   (~10 ns total), three subtractions, one digitalWriteFast.
+//   Set relay_arm_pending flag for deferred timer arming.
+//   NO timepop_arm calls from ISR context.
 //
-//   Phase 2 (timepop callback): Extend snapshots to 64-bit,
-//   process state transitions, compute Welford statistics, build
-//   and publish the TIMEBASE_FRAGMENT.
+//   Phase 2 (timepop ASAP callback): Arm the relay deassert
+//   timer first (always, regardless of campaign state), then
+//   extend snapshots to 64-bit, process state transitions,
+//   compute Welford statistics, build and publish the
+//   TIMEBASE_FRAGMENT.
 //
 
 static volatile bool pps_scheduled = false;
@@ -399,6 +454,25 @@ static void pps_isr(void) {
   const uint32_t snap_dwt  = DWT_CYCCNT;
   const uint32_t snap_gnss = GPT2_CNT;
   const uint32_t snap_ocxo = GPT1_CNT;
+
+  // ============================================================
+  // PPS relay to Pi — assert HIGH immediately after snapshots.
+  //
+  // This runs on every PPS, regardless of campaign state.
+  // chrony needs continuous PPS for system clock discipline.
+  //
+  // digitalWriteFast compiles to a single GPIO register write
+  // (~3 ns at 600 MHz).  The relay edge follows the true PPS
+  // edge by ~50-70 ns (ISR entry + 3 snapshots + this write).
+  //
+  // The deassert timer is armed from the ASAP callback — NEVER
+  // from ISR context.  timepop_arm's noInterrupts/interrupts
+  // pair would re-enable interrupts mid-ISR, allowing PIT to
+  // nest and corrupt timer state.
+  // ============================================================
+
+  digitalWriteFast(GNSS_PPS_RELAY, HIGH);
+  relay_arm_pending = true;
 
   // ============================================================
   // Raw ISR-level residuals — computed here, zero overhead.
@@ -425,23 +499,31 @@ static void pps_isr(void) {
   isr_snap_gnss = snap_gnss;
   isr_snap_ocxo = snap_ocxo;
 
-  // Gate: only proceed if we care about this PPS
-  if (!request_start && !request_stop && !request_recover &&
-      campaign_state != clocks_campaign_state_t::STARTED) {
-    return;
-  }
+  // ============================================================
+  // Always schedule ASAP callback — the relay deassert timer
+  // must be armed from scheduled context on every PPS.
+  // Campaign-gated work happens inside the callback.
+  // ============================================================
 
   if (pps_scheduled) return;
   pps_scheduled = true;
-
-  // ============================================================
-  // PHASE 2: Deferred processing
-  // ============================================================
 
   timepop_arm(
     TIMEPOP_CLASS_ASAP,
     false,
     [](timepop_ctx_t*, void*) {
+
+      if (relay_arm_pending) {
+          relay_arm_pending = false;
+          if (!relay_timer_active) {
+              relay_timer_active = true;
+              timepop_arm(TIMEPOP_CLASS_PPS_RELAY, false, pps_relay_deassert, nullptr, "pps-relay-off");
+          }
+      }
+
+      // --------------------------------------------------------
+      // Campaign state transitions
+      // --------------------------------------------------------
 
       if (request_stop) {
         campaign_state = clocks_campaign_state_t::STOPPED;
@@ -737,11 +819,18 @@ void process_clocks_register(void) {
 void process_clocks_init(void) {
 
   dwt_enable();
-  arm_gpt2_external();    // GNSS VCLOCK → GPT2 pin 14, raw 10 MHz, polled
-  arm_gpt1_external();    // OCXO 10 MHz → GPT1 pin 25, raw 10 MHz, polled
+  arm_gpt2_external();    // GNSS VCLOCK -> GPT2 pin 14, raw 10 MHz, polled
+  arm_gpt1_external();    // OCXO 10 MHz -> GPT1 pin 25, raw 10 MHz, polled
 
+  // PPS input from GF-8802 (pin 1, shielded twisted pair)
   pinMode(GNSS_PPS_PIN, INPUT);
   pinMode(GNSS_LOCK_PIN, INPUT);
+
+  // PPS relay output to Pi (pin 32 -> Pi GPIO 18)
+  // Configured as OUTPUT, initially LOW.
+  // Driven HIGH in ISR, deasserted LOW by TimePop after 500 ms.
+  pinMode(GNSS_PPS_RELAY, OUTPUT);
+  digitalWriteFast(GNSS_PPS_RELAY, LOW);
 
   attachInterrupt(
     digitalPinToInterrupt(GNSS_PPS_PIN),

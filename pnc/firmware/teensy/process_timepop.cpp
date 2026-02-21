@@ -35,6 +35,7 @@ static void init_timepop_class_periods(void) {
   CLASS_PERIOD_TICKS[TIMEPOP_CLASS_CPU_SAMPLE]   = 1000;
   CLASS_PERIOD_TICKS[TIMEPOP_CLASS_CLOCKS]       = 200;
   CLASS_PERIOD_TICKS[TIMEPOP_CLASS_GUARD]        = 500;
+  CLASS_PERIOD_TICKS[TIMEPOP_CLASS_PPS_RELAY]    = 500;
   CLASS_PERIOD_TICKS[TIMEPOP_CLASS_FLASH]        = 20;
   CLASS_PERIOD_TICKS[TIMEPOP_CLASS_DEBUG_BEACON] = 1000;
   CLASS_PERIOD_TICKS[TIMEPOP_CLASS_USER_1]       = 10;
@@ -125,10 +126,11 @@ void timepop_init(void) {
   CCM_CCGR1 |= CCM_CCGR1_PIT(CCM_CCGR_ON);
   PIT_MCR = 0;
 
-  uint32_t pit_cycles =
-    (uint32_t)((F_BUS_ACTUAL / 1000000) * TIMEPOP_TICK_US) - 1;
+  // uint32_t pit_cycles =
+  //   (uint32_t)((F_BUS_ACTUAL / 1000000) * TIMEPOP_TICK_US) - 1;
 
-  PIT_LDVAL0 = pit_cycles;
+  PIT_LDVAL0 = 23999;  // 24 MHz PIT clock, 1 ms tick
+
   PIT_TCTRL0 = PIT_TCTRL_TEN | PIT_TCTRL_TIE;
 
   attachInterruptVector(IRQ_PIT, pit0_isr);
@@ -184,6 +186,18 @@ bool timepop_arm(
 
   interrupts();
   return false;
+}
+
+bool timepop_cancel(timepop_class_t klass) {
+  noInterrupts();
+  for (uint32_t i = 0; i < TIMEPOP_MAX_SLOTS; i++) {
+    if (slots[i].active && slots[i].klass == klass) {
+      slots[i].active  = false;
+      slots[i].expired = false;
+    }
+  }
+  interrupts();
+  return true;
 }
 
 // ================================================================

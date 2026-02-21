@@ -81,9 +81,11 @@ static const int PHOTODIODE_ANALOG_PIN = 15;
 // GNSS_LOCK_PIN:
 //   GNSS lock status (true/false)
 //
-static const int GNSS_PPS_PIN  = 32;
+static const int GNSS_PPS_PIN  = 1;
 static const int GNSS_VCLK_PIN = 14;
 static const int GNSS_LOCK_PIN = 4;
+
+static const int GNSS_PPS_RELAY = 32;
 
 // --------------------------------------------------------------
 // Event bus sizing (authoritative)
