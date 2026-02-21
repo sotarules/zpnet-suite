@@ -15,13 +15,31 @@ Architecture:
   • The CLOCKS process calls PITIMER.REPORT via send_command when
     a TIMEBASE_FRAGMENT arrives, receiving the most recent capture
 
-Why this works:
+Pi-side TDC (time-to-digital converter):
   • chrony disciplines the system clock to ~39 ns of GNSS via PPS
   • The second boundary in the system clock IS the PPS edge
   • Busy-polling on an isolated core detects the rollover within
     ~10-50 ns (measured) — no IRQ dispatch jitter
-  • The arch timer read (MRS CNTVCT_EL0) is a single instruction
-  • Detection jitter is ~400 ns stddev vs ~1200 ns with kernel IRQ
+  • detect_ns = how many nanoseconds after the true second boundary
+    the polling loop noticed the rollover (analogous to Teensy
+    ISR dispatch latency)
+  • correction_ticks = detect_ns converted to arch timer ticks
+  • corrected_counter = raw_counter - correction_ticks
+    (best estimate of where the counter WAS at the true PPS edge)
+  • This is conceptually identical to the Teensy's software TDC:
+    measure the detection delay, subtract it from the raw capture
+
+Diagnostic fields exposed in REPORT:
+  • counter           — raw CNTVCT_EL0 at detection moment
+  • corrected         — counter minus detection latency (TDC-corrected)
+  • delta             — ticks between consecutive corrected captures
+  • residual          — delta minus expected frequency
+  • residual_ns       — residual in nanoseconds
+  • detect_ns         — polling detection latency (ns after second boundary)
+  • correction_ticks  — ticks subtracted from raw counter
+  • seq               — capture sequence number
+  • freq              — timer frequency (54 MHz)
+  • ns_per_tick       — nanoseconds per tick
 
 Requirements:
   • isolcpus=3 in /boot/firmware/cmdline.txt
@@ -81,18 +99,26 @@ def _parse_capture_line(line: str) -> Optional[Dict[str, Any]]:
     """
     Parse a single output line from pps_poll.
 
-    pps_poll prints lines like:
-         1    11510132462     54000409       409    7574.074         40
+    pps_poll (enhanced) prints lines like:
+         1    11510132462    11510132460     54000409       409    7574.074         40          2         40
 
     Fields (whitespace-separated):
-      seq  counter  delta  residual  resid_ns  detect_ns
+      seq  counter  corrected  delta  residual  resid_ns  detect_ns  corr_ticks  rt_ns
 
     The first capture has "---" for delta/residual/resid_ns,
     and header/separator lines start with non-digit characters.
+
+    Also handles legacy format (6 fields) for backward compatibility:
+      seq  counter  delta  residual  resid_ns  detect_ns
     """
     line = line.strip()
     if not line:
         return None
+
+    # Strip trailing Welford stats in parentheses
+    paren_idx = line.find("(")
+    if paren_idx != -1:
+        line = line[:paren_idx].strip()
 
     parts = line.split()
     if len(parts) < 6:
@@ -104,39 +130,90 @@ def _parse_capture_line(line: str) -> Optional[Dict[str, Any]]:
     except ValueError:
         return None
 
-    counter_str = parts[1]
-    delta_str = parts[2]
-    residual_str = parts[3]
-    resid_ns_str = parts[4]
-    detect_ns_str = parts[5]
+    # Detect format by field count
+    if len(parts) >= 9:
+        # Enhanced format: seq counter corrected delta residual resid_ns detect_ns corr_ticks rt_ns
+        counter_str = parts[1]
+        corrected_str = parts[2]
+        delta_str = parts[3]
+        residual_str = parts[4]
+        resid_ns_str = parts[5]
+        detect_ns_str = parts[6]
+        corr_ticks_str = parts[7]
+        rt_ns_str = parts[8]
 
-    try:
-        counter = int(counter_str)
-        detect_ns = int(detect_ns_str)
-    except ValueError:
-        return None
-
-    # Parse optional fields (first line has "---")
-    delta = None
-    residual = None
-    residual_ns = None
-
-    if delta_str != "---":
         try:
-            delta = int(delta_str)
-            residual = int(residual_str)
-            residual_ns = float(resid_ns_str)
+            counter = int(counter_str)
+            corrected = int(corrected_str)
+            detect_ns = int(detect_ns_str)
+            correction_ticks = int(corr_ticks_str)
         except ValueError:
-            pass
+            return None
 
-    return {
-        "seq": seq,
-        "counter": counter,
-        "delta": delta,
-        "residual": residual,
-        "residual_ns": residual_ns,
-        "detect_ns": detect_ns,
-    }
+        # Parse optional fields (first line has "---")
+        delta = None
+        residual = None
+        residual_ns = None
+
+        if delta_str != "---":
+            try:
+                delta = int(delta_str)
+                residual = int(residual_str)
+                residual_ns = float(resid_ns_str)
+            except ValueError:
+                pass
+
+        return {
+            "seq": seq,
+            "counter": counter,
+            "corrected": corrected,
+            "delta": delta,
+            "residual": residual,
+            "residual_ns": residual_ns,
+            "detect_ns": detect_ns,
+            "correction_ticks": correction_ticks,
+        }
+
+    else:
+        # Legacy format: seq counter delta residual resid_ns detect_ns
+        counter_str = parts[1]
+        delta_str = parts[2]
+        residual_str = parts[3]
+        resid_ns_str = parts[4]
+        detect_ns_str = parts[5]
+
+        try:
+            counter = int(counter_str)
+            detect_ns = int(detect_ns_str)
+        except ValueError:
+            return None
+
+        # Compute correction from detect_ns (same math as enhanced pps_poll)
+        correction_ticks = (detect_ns * PI_TIMER_FREQ) // 1_000_000_000
+        corrected = counter - correction_ticks
+
+        delta = None
+        residual = None
+        residual_ns = None
+
+        if delta_str != "---":
+            try:
+                delta = int(delta_str)
+                residual = int(residual_str)
+                residual_ns = float(resid_ns_str)
+            except ValueError:
+                pass
+
+        return {
+            "seq": seq,
+            "counter": counter,
+            "corrected": corrected,
+            "delta": delta,
+            "residual": residual,
+            "residual_ns": residual_ns,
+            "detect_ns": detect_ns,
+            "correction_ticks": correction_ticks,
+        }
 
 
 def _capture_reader(proc: subprocess.Popen) -> None:
@@ -160,11 +237,14 @@ def _capture_reader(proc: subprocess.Popen) -> None:
                 # Log periodically (every 60 captures ≈ once per minute)
                 if capture["seq"] % 60 == 0 and capture["delta"] is not None:
                     logging.info(
-                        "⏱️ [pitimer] seq=%d counter=%d residual=%.1f ns detect=%d ns",
+                        "⏱️ [pitimer] seq=%d counter=%d corrected=%d "
+                        "residual=%.1f ns detect=%d ns corr=%d ticks",
                         capture["seq"],
                         capture["counter"],
+                        capture["corrected"],
                         capture["residual_ns"] or 0.0,
                         capture["detect_ns"],
+                        capture["correction_ticks"],
                     )
 
         except Exception:
@@ -251,10 +331,12 @@ def cmd_report(_: Optional[dict]) -> Dict[str, Any]:
         "payload": {
           "seq": 42,
           "counter": 11510132462,
+          "corrected": 11510132460,
           "delta": 54000409,
           "residual": 409,
           "residual_ns": 7574.074,
           "detect_ns": 40,
+          "correction_ticks": 2,
           "freq": 54000000,
           "ns_per_tick": 18.519
         }
@@ -305,7 +387,8 @@ def run() -> None:
 
     logging.info(
         "⏱️ [pitimer] starting — Pi arch timer PPS capture via chrony polling. "
-        "freq=%d Hz, %.3f ns/tick, isolated core %d",
+        "freq=%d Hz, %.3f ns/tick, isolated core %d. "
+        "TDC correction enabled (detect_ns → correction_ticks).",
         PI_TIMER_FREQ,
         NS_PER_TICK,
         ISOLATED_CORE,

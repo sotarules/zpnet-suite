@@ -25,12 +25,27 @@ Pi clock architecture:
     busy-polling clock_gettime(CLOCK_REALTIME)
   * The instant a new second is detected, pps_poll captures
     CNTVCT_EL0 via a single MRS instruction
+  * detect_ns = how many nanoseconds after the second boundary
+    the polling loop detected the rollover
+  * correction_ticks = detect_ns converted to arch timer ticks
+  * corrected_counter = raw_counter - correction_ticks
+    (Pi-side TDC: best estimate of counter at true PPS edge)
   * The PITIMER process wraps pps_poll and exposes captures via
     the standard ZPNet command socket interface
   * CLOCKS queries PITIMER.REPORT when each TIMEBASE_FRAGMENT
-    arrives, obtaining the latest counter value
-  * Pi residual = delta between consecutive captures minus the
-    expected 54,000,000 ticks, converted to nanoseconds
+    arrives, obtaining the latest capture with full diagnostics
+  * Pi residual = delta between consecutive CORRECTED captures
+    minus the expected 54,000,000 ticks, converted to nanoseconds
+
+Pi TDC diagnostics in TIMEBASE:
+  * diag_pi_raw_counter     — raw CNTVCT_EL0 at detection moment
+  * diag_pi_corrected       — counter minus detection latency
+  * diag_pi_detect_ns       — polling detection latency (ns)
+  * diag_pi_correction_ticks — ticks subtracted from raw counter
+  * diag_pi_seq             — pps_poll capture sequence number
+  * diag_pi_delta           — ticks between consecutive corrected captures
+  * diag_pi_residual        — delta minus expected frequency (ticks)
+  * diag_pi_residual_ns     — residual in nanoseconds (from pps_poll)
 
 Residual policy (all clocks):
   * Count actual ticks/nanoseconds between consecutive PPS edges
@@ -38,7 +53,8 @@ Residual policy (all clocks):
   * Express residual in nanoseconds
   * GNSS: Teensy ISR, residual vs 1e9 ns
   * DWT: Teensy ISR, residual vs 1e9 ns
-  * Pi: pps_poll on isolated core, residual vs 54e6 ticks,
+  * Pi: pps_poll on isolated core, residual vs 54e6 ticks
+    (using CORRECTED counter for best accuracy),
     scaled to nanoseconds by display_scale (ns_per_tick)
   * Running statistics via Welford's online algorithm
 
@@ -228,12 +244,14 @@ _campaign_active: bool = False
 # Pi tick epoch -- the CNTVCT_EL0 value at campaign start.
 # Subtracted from raw counter to produce campaign-scoped ticks,
 # which are then converted to nanoseconds for the TIMEBASE record.
+# NOTE: We use the CORRECTED counter for epoch and all downstream
+# computations, so the Pi-side TDC correction is baked in.
 _pi_tick_epoch: int = 0
 _pi_tick_epoch_set: bool = False
 
 # Per-clock PPS residual trackers.
 # GNSS and DWT: nanoseconds, display_scale=1.0
-# Pi: raw ticks, display_scale=PI_NS_PER_TICK
+# Pi: raw ticks (CORRECTED), display_scale=PI_NS_PER_TICK
 _residual_gnss = _PpsResidual()
 _residual_dwt = _PpsResidual()
 _residual_pi = _PpsResidual(display_scale=PI_NS_PER_TICK)
@@ -251,12 +269,14 @@ def _get_pitimer_capture() -> Optional[Dict[str, Any]]:
     Returns the PITIMER REPORT payload, or None if PITIMER is
     not available or has no capture yet.
 
-    The payload contains:
-      - counter: raw CNTVCT_EL0 value at last second boundary
-      - delta: ticks since previous capture
+    The payload contains (enhanced format):
+      - counter: raw CNTVCT_EL0 value at detection moment
+      - corrected: counter minus detection latency (TDC-corrected)
+      - delta: ticks between consecutive corrected captures
       - residual: delta minus expected (PI_TIMER_FREQ)
       - residual_ns: residual in nanoseconds
       - detect_ns: detection latency (ns after second boundary)
+      - correction_ticks: ticks subtracted from raw counter
       - seq: capture sequence number
       - freq: timer frequency (54 MHz)
       - ns_per_tick: nanoseconds per tick
@@ -495,6 +515,7 @@ def _build_report(
         "teensy_rtc1_ns": timebase.get("teensy_rtc1_ns"),
         "teensy_rtc2_ns": timebase.get("teensy_rtc2_ns"),
         "pi_counter": timebase.get("pi_counter"),
+        "pi_corrected": timebase.get("pi_corrected"),
 
         # Per-clock statistics (all residual stats in nanoseconds)
         "gnss": _build_clock_block("GNSS", gnss_ns, gnss_ns, _residual_gnss),
@@ -678,10 +699,13 @@ def _recover_campaign() -> None:
     )
 
     pi_capture = _get_pitimer_capture()
-    pi_counter_now = pi_capture["counter"] if pi_capture else 0
+    # Use corrected counter if available, fall back to raw
+    pi_counter_now = 0
+    if pi_capture:
+        pi_counter_now = pi_capture.get("corrected") or pi_capture.get("counter", 0)
 
     logging.info(
-        "⏱️ [recovery] GNSS time now: %s  Pi counter: %d",
+        "⏱️ [recovery] GNSS time now: %s  Pi counter (corrected): %d",
         gnss_time_now_str,
         pi_counter_now,
     )
@@ -847,21 +871,49 @@ def on_timebase_fragment(payload: Payload) -> None:
 
     # ----------------------------------------------------------
     # Extract Pi counter and compute campaign-scoped pi_ns
+    #
+    # We use the CORRECTED counter (raw minus detection latency)
+    # as the authoritative Pi timestamp.  This is the Pi-side
+    # TDC correction: we know how late we detected the second
+    # boundary, so we subtract that latency in ticks.
+    #
+    # The raw counter is preserved as diag_pi_raw_counter for
+    # diagnostic visibility.
     # ----------------------------------------------------------
-    pi_counter = pi_capture["counter"] if pi_capture else None
+    pi_counter_raw = None
+    pi_counter_corrected = None
+    pi_detect_ns = None
+    pi_correction_ticks = None
+    pi_seq = None
+    pi_delta = None
+    pi_residual = None
+    pi_residual_ns = None
     pi_ns = 0
 
-    if pi_counter is not None:
-        if not _pi_tick_epoch_set:
-            _pi_tick_epoch = pi_counter
-            _pi_tick_epoch_set = True
-            logging.info("⏱️ [clocks] Pi tick epoch set: %d", _pi_tick_epoch)
+    if pi_capture is not None:
+        pi_counter_raw = pi_capture.get("counter")
+        pi_counter_corrected = pi_capture.get("corrected") or pi_counter_raw
+        pi_detect_ns = pi_capture.get("detect_ns")
+        pi_correction_ticks = pi_capture.get("correction_ticks", 0)
+        pi_seq = pi_capture.get("seq")
+        pi_delta = pi_capture.get("delta")
+        pi_residual = pi_capture.get("residual")
+        pi_residual_ns = pi_capture.get("residual_ns")
 
-        campaign_ticks = pi_counter - _pi_tick_epoch
+    if pi_counter_corrected is not None:
+        if not _pi_tick_epoch_set:
+            _pi_tick_epoch = pi_counter_corrected
+            _pi_tick_epoch_set = True
+            logging.info(
+                "⏱️ [clocks] Pi tick epoch set: %d (corrected counter)",
+                _pi_tick_epoch,
+            )
+
+        campaign_ticks = pi_counter_corrected - _pi_tick_epoch
         pi_ns = _ticks_to_ns(campaign_ticks)
 
-        # Update Pi residual (raw ticks, expected = PI_TIMER_FREQ)
-        _residual_pi.update(pi_counter, PI_TIMER_FREQ)
+        # Update Pi residual (CORRECTED ticks, expected = PI_TIMER_FREQ)
+        _residual_pi.update(pi_counter_corrected, PI_TIMER_FREQ)
 
     # ----------------------------------------------------------
     # Build TIMEBASE record
@@ -894,11 +946,23 @@ def on_timebase_fragment(payload: Payload) -> None:
         "teensy_rtc1_ns": frag.get("rtc1_ns"),
         "teensy_rtc2_ns": frag.get("rtc2_ns"),
 
-        # Pi clock (CNTVCT_EL0 via PITIMER)
-        "pi_counter": pi_counter,
+        # Pi clock — authoritative values (TDC-corrected)
+        "pi_counter": pi_counter_raw,
+        "pi_corrected": pi_counter_corrected,
         "pi_ns": pi_ns,
 
-        # Per-clock PPS residuals (nanoseconds)
+        # Pi TDC diagnostics (parallel to Teensy diag_* fields)
+        "diag_pi_raw_counter": pi_counter_raw,
+        "diag_pi_corrected": pi_counter_corrected,
+        "diag_pi_detect_ns": pi_detect_ns,
+        "diag_pi_correction_ticks": pi_correction_ticks,
+        "diag_pi_correction_ns": round(pi_correction_ticks * PI_NS_PER_TICK, 3) if pi_correction_ticks is not None else None,
+        "diag_pi_seq": pi_seq,
+        "diag_pi_delta": pi_delta,
+        "diag_pi_residual": pi_residual,
+        "diag_pi_residual_ns": pi_residual_ns,
+
+        # Per-clock PPS residuals (nanoseconds) — computed by this process
         "isr_residual_gnss": frag.get("isr_residual_gnss"),
         "isr_residual_dwt": frag.get("isr_residual_dwt"),
         "isr_residual_ocxo": frag.get("isr_residual_ocxo"),
@@ -906,6 +970,12 @@ def on_timebase_fragment(payload: Payload) -> None:
 
         # Teensy PPS count
         "teensy_pps_count": frag.get("teensy_pps_count"),
+
+        # Teensy TDC diagnostics (pass-through from fragment)
+        "diag_teensy_dispatch_delta_ns": frag.get("dispatch_delta_ns"),
+        "diag_teensy_pps_edge_valid": frag.get("pps_edge_valid"),
+        "diag_teensy_pps_edge_correction_ns": frag.get("pps_edge_correction_ns"),
+        "diag_teensy_detect_ns": frag.get("dispatch_delta_ns"),
     }
 
     # ----------------------------------------------------------
@@ -1159,7 +1229,8 @@ def run() -> None:
     logging.info(
         "🕐 [clocks] Three tracked clocks: GNSS (Teensy 10MHz), "
         "DWT (Teensy 600MHz), Pi (CNTVCT_EL0 54MHz via PITIMER). "
-        "chrony-disciplined system time for sanity checking."
+        "chrony-disciplined system time for sanity checking. "
+        "Pi TDC correction enabled (detect_ns → correction_ticks)."
     )
 
     # ----------------------------------------------------------
