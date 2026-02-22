@@ -117,7 +117,6 @@ def clocks_status_readout() -> Generator[str, None, None]:
     campaign = r.get("campaign", "?")
     elapsed = r.get("campaign_elapsed", "00:00:00")
     yield f"CLOCKS: STARTED {elapsed} {campaign}"
-    yield ""
 
     # ----------------------------------------------------------------
     # Clock table — cumulative tau and PPB
@@ -126,13 +125,11 @@ def clocks_status_readout() -> Generator[str, None, None]:
     yield f"{'CLK':<8} {'TAU':>14} {'PPB':>14}"
     yield f"{'GNSS':<8} {'1.0000000000':>14} {'0.00':>14}"
 
-    for name, key in [("DWT", "dwt"), ("PI", "pi")]:
+    for name, key in [("DWT", "dwt"), ("PI", "pi"),  ("OCXO", "ocxo")]:
         blk = r.get(key, {})
         tau = blk.get("tau", 0.0)
         ppb = blk.get("ppb", 0.0)
         yield f"{name:<8} {tau:>14.10f} {ppb:>14.2f}"
-
-    yield ""
 
     # ----------------------------------------------------------------
     # Residual table
@@ -140,7 +137,7 @@ def clocks_status_readout() -> Generator[str, None, None]:
 
     yield f"{'CLK':<5} {'RES':>8} {'MEAN':>8} {'SD':>8} {'SE':>8}"
 
-    for name, key in [("GNSS", "gnss"), ("DWT", "dwt"), ("PI", "pi")]:
+    for name, key in [("GNSS", "gnss"), ("DWT", "dwt"), ("PI", "pi"), ("OCXO", "ocxo")]:
         blk = r.get(key, {})
         if blk.get("pps_valid"):
             res    = blk.get("pps_residual", 0)

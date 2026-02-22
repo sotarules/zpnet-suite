@@ -12,12 +12,14 @@ Responsibilities:
   * Recover clocks after restart if campaign is active
   * Command GNSS into Time Only mode when campaign has a location
 
-Three tracked clocks:
+Four tracked clocks:
   * GNSS: 10 MHz VCLK counted in Teensy ISR (~100 ns quantization)
   * DWT: 600 MHz Cortex-M7 cycle counter captured in Teensy ISR
   * Pi: 54 MHz CNTVCT_EL0 (ARM Generic Timer Virtual Count Register)
     captured by pps_poll on an isolated core via chrony-disciplined
     second-boundary polling (~400 ns stddev, ~15 ns detection latency)
+  * OCXO: 10 MHz AOCJY1-A oven-controlled crystal oscillator counted
+    via Teensy GPT1 external clock input (~100 ns quantization)
 
 Pi clock architecture:
   * chrony disciplines the system clock to ~39 ns of GNSS via PPS
@@ -53,6 +55,7 @@ Residual policy (all clocks):
   * Express residual in nanoseconds
   * GNSS: Teensy ISR, residual vs 1e9 ns
   * DWT: Teensy ISR, residual vs 1e9 ns
+  * OCXO: Teensy ISR, residual vs 1e9 ns (100 ns quantization)
   * Pi: pps_poll on isolated core, residual vs 54e6 ticks
     (using CORRECTED counter for best accuracy),
     scaled to nanoseconds by display_scale (ns_per_tick)
@@ -135,9 +138,9 @@ GNSS_WAIT_LOG_INTERVAL = 60
 # ---------------------------------------------------------------------
 # PPS residual tracking -- Welford's online algorithm
 #
-# Used for all three clock domains: GNSS, DWT, Pi.
+# Used for all four clock domains: GNSS, DWT, OCXO, Pi.
 #
-# GNSS and DWT: accumulate in nanoseconds with expected = 1e9.
+# GNSS, DWT, OCXO: accumulate in nanoseconds with expected = 1e9.
 # Pi: accumulates in raw ticks with expected = PI_TIMER_FREQ.
 #     display_scale converts ticks -> nanoseconds for reporting.
 # ---------------------------------------------------------------------
@@ -174,7 +177,7 @@ class _PpsResidual:
         Update with a new clock reading.
 
         value_now and expected must be in the same units:
-          - nanoseconds for GNSS and DWT (expected = 1e9)
+          - nanoseconds for GNSS, DWT, and OCXO (expected = 1e9)
           - raw ticks for Pi (expected = PI_TIMER_FREQ = 54e6)
 
         Conversion to nanoseconds happens in to_dict() via display_scale.
@@ -215,7 +218,7 @@ class _PpsResidual:
         Serialize residual state for the campaign report.
 
         All values are scaled to nanoseconds for consistent display.
-        For GNSS and DWT (display_scale=1.0) this is a no-op.
+        For GNSS, DWT, and OCXO (display_scale=1.0) this is a no-op.
         For Pi (display_scale=PI_NS_PER_TICK) this converts ticks -> ns.
         """
         s = self.display_scale
@@ -251,10 +254,12 @@ _pi_tick_epoch_set: bool = False
 
 # Per-clock PPS residual trackers.
 # GNSS and DWT: nanoseconds, display_scale=1.0
+# OCXO: nanoseconds (100 ns quantization from 10 MHz), display_scale=1.0
 # Pi: raw ticks (CORRECTED), display_scale=PI_NS_PER_TICK
 _residual_gnss = _PpsResidual()
 _residual_dwt = _PpsResidual()
 _residual_pi = _PpsResidual(display_scale=PI_NS_PER_TICK)
+_residual_ocxo = _PpsResidual()
 
 # Last-seen pps_poll sequence number.
 # Guards against stale PITIMER captures: if TIMEBASE_FRAGMENT
@@ -497,6 +502,7 @@ def _build_report(
     gnss_ns = int(timebase.get("teensy_gnss_ns") or 0)
     dwt_ns = int(timebase.get("teensy_dwt_ns") or 0)
     pi_ns = int(timebase.get("pi_ns") or 0)
+    ocxo_ns = int(timebase.get("teensy_ocxo_ns") or 0)
 
     # Campaign elapsed time derived from GNSS nanoseconds
     # (GNSS is truth -- use it as the elapsed-time reference)
@@ -529,6 +535,7 @@ def _build_report(
         "gnss": _build_clock_block("GNSS", gnss_ns, gnss_ns, _residual_gnss),
         "dwt": _build_clock_block("DWT", dwt_ns, gnss_ns, _residual_dwt),
         "pi": _build_clock_block("PI", pi_ns, gnss_ns, _residual_pi),
+        "ocxo": _build_clock_block("OCXO", ocxo_ns, gnss_ns, _residual_ocxo),
     }
 
     return report
@@ -589,7 +596,7 @@ def _recover_campaign() -> None:
       6) Compute elapsed seconds since last TIMEBASE
       7) Compute tau for each clock domain
       8) Project all clock values forward to the NEXT PPS edge
-      9) Send RECOVER to Teensy with projected values
+      9) Send RECOVER command to Teensy with projected values
      10) Compute synthetic Pi tick epoch for continuous pi_ns
      11) Activate campaign
     """
@@ -822,6 +829,7 @@ def _recover_campaign() -> None:
     _residual_gnss.reset()
     _residual_dwt.reset()
     _residual_pi.reset()
+    _residual_ocxo.reset()
     _last_pi_seq = -1
     _campaign_active = True
 
@@ -843,7 +851,7 @@ def on_timebase_fragment(payload: Payload) -> None:
     This is the main data path.  Each fragment triggers:
       1) Pi-side observations (system time, PITIMER capture)
       2) TIMEBASE augmentation (combine Teensy + Pi + GNSS)
-      3) Residual statistics update (GNSS, DWT, Pi)
+      3) Residual statistics update (GNSS, DWT, OCXO, Pi)
       4) Report denormalization into campaign payload
       5) Publish + persist
     """
@@ -868,6 +876,7 @@ def on_timebase_fragment(payload: Payload) -> None:
         _residual_gnss.reset()
         _residual_dwt.reset()
         _residual_pi.reset()
+        _residual_ocxo.reset()
         _pi_tick_epoch_set = False
         _last_pi_seq = -1
         _campaign_active = True
@@ -1038,16 +1047,19 @@ def on_timebase_fragment(payload: Payload) -> None:
     }
 
     # ----------------------------------------------------------
-    # Update GNSS and DWT residual statistics (nanoseconds)
+    # Update GNSS, DWT, and OCXO residual statistics (nanoseconds)
     # (Pi residual was already updated above from PITIMER capture)
     # ----------------------------------------------------------
     gnss_ns = int(frag.get("gnss_ns") or 0)
     dwt_ns = int(frag.get("dwt_ns") or 0)
+    ocxo_ns = int(frag.get("ocxo_ns") or 0)
 
     if gnss_ns > 0:
         _residual_gnss.update(gnss_ns, NS_PER_SECOND)
     if dwt_ns > 0:
         _residual_dwt.update(dwt_ns, NS_PER_SECOND)
+    if ocxo_ns > 0:
+        _residual_ocxo.update(ocxo_ns, NS_PER_SECOND)
 
     # ----------------------------------------------------------
     # Build augmented report
@@ -1286,8 +1298,9 @@ def run() -> None:
     setup_logging()
 
     logging.info(
-        "🕐 [clocks] Three tracked clocks: GNSS (Teensy 10MHz), "
-        "DWT (Teensy 600MHz), Pi (CNTVCT_EL0 54MHz via PITIMER). "
+        "🕐 [clocks] Four tracked clocks: GNSS (Teensy 10MHz), "
+        "DWT (Teensy 600MHz), OCXO (Teensy GPT1 10MHz), "
+        "Pi (CNTVCT_EL0 54MHz via PITIMER). "
         "chrony-disciplined system time for sanity checking. "
         "Pi TDC correction enabled (detect_ns → correction_ticks)."
     )
