@@ -256,6 +256,14 @@ _residual_gnss = _PpsResidual()
 _residual_dwt = _PpsResidual()
 _residual_pi = _PpsResidual(display_scale=PI_NS_PER_TICK)
 
+# Last-seen pps_poll sequence number.
+# Guards against stale PITIMER captures: if TIMEBASE_FRAGMENT
+# arrives before pps_poll has emitted a new line, we'd feed the
+# same counter into Welford's twice.  Delta would be 0, residual
+# would be -54,000,000, and that single outlier catastrophically
+# blows up the variance.
+_last_pi_seq: int = -1
+
 _state_lock = threading.Lock()
 
 # ---------------------------------------------------------------------
@@ -814,6 +822,7 @@ def _recover_campaign() -> None:
     _residual_gnss.reset()
     _residual_dwt.reset()
     _residual_pi.reset()
+    _last_pi_seq = -1
     _campaign_active = True
 
     logging.info(
@@ -839,7 +848,7 @@ def on_timebase_fragment(payload: Payload) -> None:
       5) Publish + persist
     """
     global _request_start, _request_stop, _campaign_active
-    global _pi_tick_epoch, _pi_tick_epoch_set
+    global _pi_tick_epoch, _pi_tick_epoch_set, _last_pi_seq
 
     # ----------------------------------------------------------
     # Capture Pi-side observations immediately
@@ -860,6 +869,7 @@ def on_timebase_fragment(payload: Payload) -> None:
         _residual_dwt.reset()
         _residual_pi.reset()
         _pi_tick_epoch_set = False
+        _last_pi_seq = -1
         _campaign_active = True
         _request_start = False
         logging.info("▶️ [clocks] campaign started")
@@ -913,7 +923,56 @@ def on_timebase_fragment(payload: Payload) -> None:
         pi_ns = _ticks_to_ns(campaign_ticks)
 
         # Update Pi residual (CORRECTED ticks, expected = PI_TIMER_FREQ)
-        _residual_pi.update(pi_counter_corrected, PI_TIMER_FREQ)
+        #
+        # Two guards protect Welford's from catastrophic outliers:
+        #
+        # Guard 1 — Stale capture (deduplication):
+        #   If the TIMEBASE_FRAGMENT arrived before pps_poll emitted a
+        #   new line, pi_seq will repeat.  Delta=0, residual=-54e6.
+        #   Fixed by checking pi_seq != _last_pi_seq.
+        #
+        # Guard 2 — Skipped second (outlier rejection):
+        #   pps_poll busy-polls clock_gettime for second boundaries.
+        #   If the polling loop or the OS hiccups, pps_poll can miss
+        #   a second entirely.  The next capture arrives 2+ seconds
+        #   later, producing delta ≈ 108e6 ticks, residual ≈ +54e6.
+        #   A single such event permanently corrupts the Welford
+        #   running statistics (mean drifts by millions of ns, stddev
+        #   explodes to ~54 ms).
+        #
+        #   We reject any delta that deviates from expected by more
+        #   than 50% (i.e., delta < 27e6 or delta > 81e6).  This is
+        #   extremely conservative — normal residuals are < 1000 ticks.
+        #   When rejected, we still advance last_value so the NEXT
+        #   delta starts fresh from this capture.
+        #
+        if pi_seq is not None and pi_seq != _last_pi_seq:
+            # Peek at what the delta would be before committing to Welford's
+            if _residual_pi.last_value > 0:
+                prospective_delta = pi_counter_corrected - _residual_pi.last_value
+                deviation = abs(prospective_delta - PI_TIMER_FREQ)
+                if deviation > PI_TIMER_FREQ // 2:
+                    # Outlier: skip Welford's but advance the anchor
+                    logging.warning(
+                        "⚠️ [clocks] Pi residual outlier rejected: "
+                        "delta=%d ticks (expected %d, deviation %d) — "
+                        "pps_poll likely skipped a second (seq=%d)",
+                        prospective_delta, PI_TIMER_FREQ, deviation, pi_seq,
+                    )
+                    _residual_pi.last_value = pi_counter_corrected
+                    _last_pi_seq = pi_seq
+                else:
+                    _residual_pi.update(pi_counter_corrected, PI_TIMER_FREQ)
+                    _last_pi_seq = pi_seq
+            else:
+                # First sample — just set the anchor
+                _residual_pi.update(pi_counter_corrected, PI_TIMER_FREQ)
+                _last_pi_seq = pi_seq
+        elif pi_seq is not None and pi_seq == _last_pi_seq:
+            logging.debug(
+                "⏱️ [clocks] Pi capture stale (seq=%d repeated) — skipping residual update",
+                pi_seq,
+            )
 
     # ----------------------------------------------------------
     # Build TIMEBASE record

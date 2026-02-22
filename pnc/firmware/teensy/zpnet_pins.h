@@ -101,7 +101,7 @@ GND           Black         GND                Battery branching ground         
 18            Yellow        SCL1               Rail bus SCL1                        Primary I2C clock
 
 15            Yellow        PHOTODIODE_ADC     Photodiode output                    Analog input (ADC)
-14            Orange        GNSS_VCLOCK        GNSS vclock output                   10MHz reference from GF-8802 (critical timing)
+14            Twister Pair  GNSS_VCLOCK        GNSS vclock output                   10MHz reference from GF-8802 (critical timing)
 
 30            Green         LASER_EN           EV5491-C-00A EN pin                  Laser driver enable
 
