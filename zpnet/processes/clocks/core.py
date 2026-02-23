@@ -1416,10 +1416,60 @@ def cmd_report(_: Optional[dict]) -> Dict[str, Any]:
     }
 
 
+def cmd_clear(_: Optional[dict]) -> dict:
+    """
+    Delete all timebase records and all campaign records from Postgres.
+
+    This is a development convenience for rapid iteration while
+    shaking out clock behavior.  It also stops any active campaign
+    so the process state is consistent with the empty database.
+    """
+    global _request_stop, _request_start, _campaign_active
+
+    # Stop any active campaign so process state matches empty DB
+    if _campaign_active:
+        _campaign_active = False
+        _request_start = False
+        _request_stop = False
+        logging.info("⏹️ [clocks] CLEAR stopped active campaign")
+
+    try:
+        with open_db() as conn:
+            cur = conn.cursor()
+            cur.execute("DELETE FROM timebase")
+            tb_count = cur.rowcount
+            cur.execute("DELETE FROM campaigns")
+            camp_count = cur.rowcount
+
+        logging.info(
+            "🗑️ [clocks] CLEAR: deleted %d timebase rows, %d campaigns",
+            tb_count, camp_count,
+        )
+
+        return {
+            "success": True,
+            "message": "OK",
+            "payload": {
+                "timebase_deleted": tb_count,
+                "campaigns_deleted": camp_count,
+            },
+        }
+
+    except Exception as e:
+        logging.exception("❌ [clocks] CLEAR failed")
+        return {
+            "success": False,
+            "message": str(e),
+        }
+
+
+# ---- Update the COMMANDS dict to include CLEAR ----
+
 COMMANDS = {
     "START": cmd_start,
     "STOP": cmd_stop,
     "REPORT": cmd_report,
+    "CLEAR": cmd_clear,
 }
 
 # ---------------------------------------------------------------------
