@@ -12,9 +12,30 @@ Architecture:
     CNTVCT_EL0 and writes the result to stdout
   • This Python process spawns pps_poll as a subprocess, reads its
     output line by line, and stashes the latest capture
-  • Each capture is published as PPS_CAPTURE on the ZPNet pub/sub
-    bus for consumption by CLOCKS (and any future subscribers)
-  • The REPORT command is retained for testing and recovery
+  • Each capture is tagged with the GNSS time for that PPS edge
+    (fetched from the GNSS process via GET_TIME) and stored in
+    a ring buffer of the last 60 captures
+  • CLOCKS retrieves captures by GNSS time via REPORT command,
+    ensuring fragment/capture correlation by physical truth
+
+Correlation model:
+  • The GNSS receiver's NMEA sentences "forecast" the UTC time
+    of the next PPS edge.  The GNSS process caches this value.
+  • After each pps_poll capture, PITIMER calls GNSS.GET_TIME
+    to obtain the ISO8601 Zulu label for the PPS edge that
+    just occurred (e.g. "2026-02-23T21:45:07Z")
+  • This label is stored as the ring buffer key
+  • CLOCKS independently calls GNSS.GET_TIME when processing
+    a TIMEBASE_FRAGMENT, obtaining the same label
+  • CLOCKS then calls PITIMER.REPORT with gnss_time=<label>
+    to fetch the matching capture
+  • If the labels don't match, that's a hard fault — the system
+    has lost correlation and must stop rather than publish garbage
+
+  The GNSS time label is an opaque correlation key, not a
+  timestamp for arithmetic.  It is stable for ~1 second after
+  PPS, so both PITIMER and CLOCKS will read the same value
+  as long as they ask within a few hundred milliseconds of PPS.
 
 Pi-side TDC (time-to-digital converter):
   • chrony disciplines the system clock to ~39 ns of GNSS via PPS
@@ -30,56 +51,33 @@ Pi-side TDC (time-to-digital converter):
   • This is conceptually identical to the Teensy's software TDC:
     measure the detection delay, subtract it from the raw capture
 
-Published message (PPS_CAPTURE):
-  Each second, PITIMER publishes:
-    {
-      "seq": 42,
-      "counter": 11510132462,
-      "corrected": 11510132460,
-      "delta": 54000409,
-      "residual": 409,
-      "residual_ns": 7574.074,
-      "detect_ns": 40,
-      "correction_ticks": 2,
-      "freq": 54000000,
-      "ns_per_tick": 18.519
-    }
+REPORT command:
+  • With gnss_time argument: returns the capture matching that
+    GNSS time label, or success=False if not found
+  • Without gnss_time argument: returns the most recent capture
+    (for testing, recovery, and backward compatibility)
 
-  This replaces the old polling model where CLOCKS called
-  PITIMER.REPORT synchronously on each TIMEBASE_FRAGMENT.
-  That created a beat-frequency aliasing problem: the Teensy PPS
-  and Pi PPS are slightly phase-offset, so every ~38 seconds the
-  synchronous poll would land on the wrong side of a capture
-  boundary, producing a 2-second delta (108M ticks).  Pub/sub
-  eliminates this: every capture is delivered exactly once, in
-  order, regardless of fragment timing.
-
-Diagnostic fields exposed in PPS_CAPTURE and REPORT:
-  • counter           — raw CNTVCT_EL0 at detection moment
-  • corrected         — counter minus detection latency (TDC-corrected)
-  • delta             — ticks between consecutive corrected captures
-  • residual          — delta minus expected frequency
-  • residual_ns       — residual in nanoseconds
-  • detect_ns         — polling detection latency (ns after second boundary)
-  • correction_ticks  — ticks subtracted from raw counter
-  • seq               — capture sequence number
-  • freq              — timer frequency (54 MHz)
-  • ns_per_tick       — nanoseconds per tick
+Ring buffer diagnostics in REPORT payload:
+  • gnss_time         — the GNSS time label for this capture
+  • buffer_size       — current number of captures in ring buffer
+  • buffer_keys       — (only in unkeyed REPORT) list of available keys
 
 Requirements:
   • isolcpus=3 in /boot/firmware/cmdline.txt
   • pps_poll compiled: gcc -O2 -o pps_poll pps_poll.c -lm
   • chrony running and disciplined by PPS
+  • GNSS process running (for GET_TIME correlation keys)
 
 Process model:
   • One systemd service (zpnet-pitimer)
   • Two execution contexts:
       1) Capture reader thread (reads pps_poll stdout)
-      2) Command socket server (serves REPORT, publishes PPS_CAPTURE)
+      2) Command socket server (serves REPORT)
 """
 
 from __future__ import annotations
 
+import collections
 import logging
 import os
 import subprocess
@@ -87,7 +85,7 @@ import threading
 import time
 from typing import Any, Dict, Optional
 
-from zpnet.processes.processes import server_setup, publish
+from zpnet.processes.processes import server_setup, send_command
 from zpnet.shared.logger import setup_logging
 
 # ---------------------------------------------------------------------
@@ -108,12 +106,106 @@ ISOLATED_CORE = 3
 PI_TIMER_FREQ = 54_000_000
 NS_PER_TICK = 1e9 / PI_TIMER_FREQ
 
+# Ring buffer capacity — how many captures to retain.
+# At one capture per second, 60 entries = 60 seconds of history.
+# CLOCKS typically asks within milliseconds, so this is enormous
+# headroom.  If CLOCKS can't find its key in 60 seconds of history,
+# something is fundamentally broken.
+RING_BUFFER_CAPACITY = 60
+
 # ---------------------------------------------------------------------
-# Capture state
+# Capture ring buffer — indexed by GNSS time (ISO8601 Zulu string)
+#
+# OrderedDict preserves insertion order.  When capacity is exceeded,
+# the oldest entry is evicted.  Access is protected by _ring_lock.
+#
+# Each entry is a full capture payload dict (same fields as before,
+# plus "gnss_time").
 # ---------------------------------------------------------------------
 
+_ring: collections.OrderedDict[str, Dict[str, Any]] = collections.OrderedDict()
+_ring_lock = threading.Lock()
+
+# Also keep a reference to the most recent capture for unkeyed
+# REPORT calls (testing, recovery, backward compat).
 _last_capture: Optional[Dict[str, Any]] = None
-_capture_lock = threading.Lock()
+
+
+def _ring_put(gnss_time: str, capture: Dict[str, Any]) -> None:
+    """
+    Store a capture in the ring buffer, keyed by GNSS time.
+
+    If the buffer is at capacity, the oldest entry is evicted.
+    If the same gnss_time key already exists (shouldn't happen
+    in normal operation), it is overwritten.
+    """
+    global _last_capture
+
+    with _ring_lock:
+        # If key already exists, remove it so re-insert goes to end
+        if gnss_time in _ring:
+            del _ring[gnss_time]
+
+        _ring[gnss_time] = capture
+        _last_capture = capture
+
+        # Evict oldest if over capacity
+        while len(_ring) > RING_BUFFER_CAPACITY:
+            _ring.popitem(last=False)
+
+
+def _ring_get(gnss_time: str) -> Optional[Dict[str, Any]]:
+    """
+    Retrieve a capture by GNSS time key.
+
+    Returns the capture dict or None if not found.
+    """
+    with _ring_lock:
+        return _ring.get(gnss_time)
+
+
+def _ring_latest() -> Optional[Dict[str, Any]]:
+    """Return the most recent capture, or None if empty."""
+    with _ring_lock:
+        return _last_capture
+
+
+def _ring_keys() -> list:
+    """Return list of available GNSS time keys (oldest first)."""
+    with _ring_lock:
+        return list(_ring.keys())
+
+
+def _ring_size() -> int:
+    """Return current number of entries in the ring buffer."""
+    with _ring_lock:
+        return len(_ring)
+
+
+# ---------------------------------------------------------------------
+# GNSS time fetcher
+# ---------------------------------------------------------------------
+
+def _get_gnss_time() -> Optional[str]:
+    """
+    Fetch the current GNSS time label via GNSS.GET_TIME.
+
+    Returns the ISO8601 Zulu string (e.g. "2026-02-23T21:45:07Z")
+    or None if GNSS is not yet available.
+    """
+    try:
+        resp = send_command(
+            machine="PI",
+            subsystem="GNSS",
+            command="GET_TIME",
+        )
+        if resp.get("success"):
+            return resp["payload"]["gnss_time"]
+        else:
+            return None
+    except Exception:
+        logging.warning("⚠️ [pitimer] GNSS.GET_TIME failed")
+        return None
 
 
 # ---------------------------------------------------------------------
@@ -165,7 +257,6 @@ def _parse_capture_line(line: str) -> Optional[Dict[str, Any]]:
         resid_ns_str = parts[5]
         detect_ns_str = parts[6]
         corr_ticks_str = parts[7]
-        rt_ns_str = parts[8]
 
         try:
             counter = int(counter_str)
@@ -243,14 +334,12 @@ def _parse_capture_line(line: str) -> Optional[Dict[str, Any]]:
 
 def _capture_reader(proc: subprocess.Popen) -> None:
     """
-    Read pps_poll stdout line by line, stash the latest capture,
-    and publish each capture as PPS_CAPTURE on the pub/sub bus.
+    Read pps_poll stdout line by line, fetch GNSS time for
+    correlation, and store each capture in the ring buffer.
 
     Runs as a daemon thread. If pps_poll exits or crashes,
     logs the error and the supervisor will restart it.
     """
-    global _last_capture
-
     for raw_line in iter(proc.stdout.readline, b""):
         try:
             line = raw_line.decode("utf-8", errors="replace")
@@ -262,24 +351,36 @@ def _capture_reader(proc: subprocess.Popen) -> None:
                 payload["freq"] = PI_TIMER_FREQ
                 payload["ns_per_tick"] = round(NS_PER_TICK, 3)
 
-                # Stash for cmd_report (testing/recovery)
-                with _capture_lock:
-                    _last_capture = payload
+                # Fetch GNSS time label for this PPS edge
+                gnss_time = _get_gnss_time()
 
-                # Publish to all subscribers (CLOCKS, etc.)
-                publish("PPS_CAPTURE", payload)
+                if gnss_time is not None:
+                    payload["gnss_time"] = gnss_time
+                    _ring_put(gnss_time, payload)
+                else:
+                    # GNSS not yet available — store without key.
+                    # This happens during cold start before GNSS
+                    # has a fix.  We still update _last_capture
+                    # so unkeyed REPORT works for recovery.
+                    payload["gnss_time"] = None
+                    with _ring_lock:
+                        global _last_capture
+                        _last_capture = payload
 
                 # Log periodically (every 60 captures ≈ once per minute)
                 if capture["seq"] % 60 == 0 and capture["delta"] is not None:
                     logging.info(
                         "⏱️ [pitimer] seq=%d counter=%d corrected=%d "
-                        "residual=%.1f ns detect=%d ns corr=%d ticks",
+                        "residual=%.1f ns detect=%d ns corr=%d ticks "
+                        "gnss_time=%s buffer=%d",
                         capture["seq"],
                         capture["counter"],
                         capture["corrected"],
                         capture["residual_ns"] or 0.0,
                         capture["detect_ns"],
                         capture["correction_ticks"],
+                        gnss_time or "N/A",
+                        _ring_size(),
                     )
 
         except Exception:
@@ -353,49 +454,85 @@ def _supervisor() -> None:
 # Command handlers
 # ---------------------------------------------------------------------
 
-def cmd_report(_: Optional[dict]) -> Dict[str, Any]:
+def cmd_report(args: Optional[dict]) -> Dict[str, Any]:
     """
-    Return the most recent PPS capture from pps_poll.
+    Return a PPS capture from the ring buffer.
 
-    Retained for testing and recovery (CLOCKS uses PPS_CAPTURE
-    subscription during normal operation, but falls back to
-    PITIMER.REPORT during recovery before subscriptions are active).
+    With gnss_time argument:
+      Returns the capture matching that GNSS time label.
+      This is the primary path used by CLOCKS for correlation.
+      If the key is not found, returns success=False — this is
+      a hard fault indicating lost correlation.
 
-    Returns:
-      {
-        "success": true,
-        "message": "OK",
-        "payload": {
-          "seq": 42,
-          "counter": 11510132462,
-          "corrected": 11510132460,
-          "delta": 54000409,
-          "residual": 409,
-          "residual_ns": 7574.074,
-          "detect_ns": 40,
-          "correction_ticks": 2,
-          "freq": 54000000,
-          "ns_per_tick": 18.519
-        }
-      }
+    Without gnss_time argument:
+      Returns the most recent capture (for testing, recovery,
+      and backward compatibility).
+
+    Payload includes all capture fields plus:
+      • gnss_time      — the GNSS time label
+      • buffer_size    — current ring buffer occupancy
+      • buffer_keys    — (unkeyed only) available keys for debugging
     """
-    with _capture_lock:
-        capture = _last_capture
+    gnss_time = None
+    if args:
+        gnss_time = args.get("gnss_time")
 
-    if capture is None:
+    if gnss_time is not None:
+        # ----------------------------------------------------------
+        # Keyed lookup — correlation path
+        # ----------------------------------------------------------
+        capture = _ring_get(gnss_time)
+
+        if capture is None:
+            available = _ring_keys()
+            logging.warning(
+                "⚠️ [pitimer] REPORT: no capture for gnss_time=%s "
+                "(buffer has %d entries: %s)",
+                gnss_time,
+                len(available),
+                available[-5:] if available else "empty",
+            )
+            return {
+                "success": False,
+                "message": "BAD",
+                "payload": {
+                    "error": f"unmatched time {gnss_time}",
+                    "buffer_size": len(available),
+                    "buffer_keys": available,
+                },
+            }
+
+        result = dict(capture)
+        result["buffer_size"] = _ring_size()
         return {
             "success": True,
             "message": "OK",
-            "payload": {
-                "state": "WAITING",
-            },
+            "payload": result,
         }
 
-    return {
-        "success": True,
-        "message": "OK",
-        "payload": dict(capture),
-    }
+    else:
+        # ----------------------------------------------------------
+        # Unkeyed — latest capture (testing/recovery)
+        # ----------------------------------------------------------
+        capture = _ring_latest()
+
+        if capture is None:
+            return {
+                "success": True,
+                "message": "OK",
+                "payload": {
+                    "state": "WAITING",
+                },
+            }
+
+        result = dict(capture)
+        result["buffer_size"] = _ring_size()
+        result["buffer_keys"] = _ring_keys()
+        return {
+            "success": True,
+            "message": "OK",
+            "payload": result,
+        }
 
 
 COMMANDS = {
@@ -413,9 +550,9 @@ def run() -> None:
 
     Execution contexts:
       1) pps_poll supervisor thread (spawns + monitors C subprocess)
-      2) Capture reader thread (reads stdout, stashes captures,
-         publishes PPS_CAPTURE)
-      3) Command socket server (serves REPORT for testing/recovery)
+      2) Capture reader thread (reads stdout, fetches GNSS time,
+         stores in ring buffer)
+      3) Command socket server (serves REPORT with keyed lookup)
     """
     setup_logging()
 
@@ -423,10 +560,12 @@ def run() -> None:
         "⏱️ [pitimer] starting — Pi arch timer PPS capture via chrony polling. "
         "freq=%d Hz, %.3f ns/tick, isolated core %d. "
         "TDC correction enabled (detect_ns → correction_ticks). "
-        "Publishing PPS_CAPTURE on each capture.",
+        "Ring buffer capacity=%d captures, indexed by GNSS time. "
+        "CLOCKS retrieves captures via REPORT(gnss_time=<key>).",
         PI_TIMER_FREQ,
         NS_PER_TICK,
         ISOLATED_CORE,
+        RING_BUFFER_CAPACITY,
     )
 
     # Verify binary exists

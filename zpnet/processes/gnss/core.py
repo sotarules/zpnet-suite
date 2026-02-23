@@ -5,6 +5,7 @@ Responsibilities:
   • Own the GNSS UART (read and write)
   • Parse NMEA into authoritative state
   • Expose derived facts via REPORT
+  • Expose cached GNSS time via GET_TIME (ISO8601 Zulu correlation key)
   • Expose raw NMEA sentences via a live stream socket
   • Profile and persist antenna locations for Time Only mode
   • Switch receiver between NAV and Time Only (TO) modes
@@ -12,7 +13,7 @@ Responsibilities:
 Process model:
   • One systemd service
   • One acquisition thread (UART read)
-  • One blocking command socket (REPORT, PROFILE_LOCATION, MODE)
+  • One blocking command socket (REPORT, GET_TIME, PROFILE_LOCATION, MODE)
   • One blocking stream socket (fan-out)
 
 UART ownership:
@@ -20,6 +21,18 @@ UART ownership:
   • gnss_reader() is the sole reader (hot path)
   • Command handlers may write via _send_nmea() under _serial_lock
   • Writes are always complete NMEA sentences with checksum + CRLF
+
+GET_TIME semantics:
+  • Returns the GNSS UTC time as an ISO8601 Zulu string
+    (e.g. "2026-02-23T21:45:07Z")
+  • This is the time "forecasted" by the most recent NMEA sentence
+    for the PPS edge that just occurred
+  • Used as a correlation key by PITIMER and CLOCKS to match
+    Pi PPS captures to Teensy TIMEBASE_FRAGMENT records
+  • The value is stable for nearly one full second after PPS,
+    until the next NMEA sentence overwrites it
+  • Returns success=False if time or date is not yet available
+    (cold start, no satellites)
 """
 
 from __future__ import annotations
@@ -973,6 +986,45 @@ def cmd_report(_: Optional[dict]) -> Dict:
     return {"success": True, "message": "OK", "payload": payload}
 
 
+def cmd_get_time(_: Optional[dict]) -> Dict:
+    """
+    GET_TIME — return the cached GNSS UTC time as an ISO8601 Zulu string.
+
+    This is the time "forecasted" by the most recent NMEA sentence
+    for the PPS edge that just occurred.  The NMEA sentences arrive
+    shortly after the PPS pulse and contain the time OF that pulse.
+    The value is stable for nearly one full second, until the next
+    NMEA sentence overwrites it.
+
+    Used as a correlation key by PITIMER and CLOCKS to match
+    Pi PPS captures to Teensy TIMEBASE_FRAGMENT records.  The key
+    is opaque — callers use it for string equality matching, never
+    for arithmetic.
+
+    Returns:
+      success=True, payload={"gnss_time": "2026-02-23T21:45:07Z"}
+      success=False if time or date is not yet available
+    """
+    if not (GNSS.has_time and GNSS.has_date):
+        return {
+            "success": False,
+            "message": "GNSS time not yet available (no fix)",
+        }
+
+    gnss_time = (
+        f"{GNSS.year:04d}-{GNSS.month:02d}-{GNSS.day:02d}"
+        f"T{GNSS.hour:02d}:{GNSS.minute:02d}:{GNSS.second:02d}Z"
+    )
+
+    return {
+        "success": True,
+        "message": "OK",
+        "payload": {
+            "gnss_time": gnss_time,
+        },
+    }
+
+
 def cmd_profile_location(args: Optional[dict]) -> Dict:
     """
     PROFILE_LOCATION — block until GNSS achieves a quality fix,
@@ -1228,6 +1280,7 @@ def cmd_mode(args: Optional[dict]) -> Dict:
 
 COMMANDS = {
     "REPORT": cmd_report,
+    "GET_TIME": cmd_get_time,
     "PROFILE_LOCATION": cmd_profile_location,
     "MODE": cmd_mode,
 }
