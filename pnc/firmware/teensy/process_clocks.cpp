@@ -745,6 +745,23 @@ static void clocks_zero_all(void) {
 // Pull slope is positive: higher voltage = higher frequency.
 // So: negative mean (slow) → increase DAC, positive mean (fast) → decrease.
 //
+// Two phases:
+//
+//   Phase 1 (proportional): Each decision estimates the DAC step
+//   from the current mean residual using an empirical sensitivity
+//   of ~1 tick per DAC count (conservative; actual is ~1.6).
+//   This continues until a zero crossing is detected.
+//
+//   Phase 2 (binary search): After the first zero crossing,
+//   reverse direction and halve step size on each subsequent
+//   crossing until the step collapses to zero.
+//
+// The servo resets Welford stats after each DAC change so only
+// post-change data informs the next decision, and waits
+// SERVO_SETTLE_SECONDS for the crystal to stabilize.
+//
+
+static bool servo_in_binary_phase = false;  // true after first zero crossing
 
 static void ocxo_calibration_servo(void) {
 
@@ -762,25 +779,22 @@ static void ocxo_calibration_servo(void) {
   // Negative = OCXO running slow, positive = running fast.
   int32_t mean_residual = (int32_t)residual_ocxo.mean;
 
-  // Initialize servo direction on first decision
-  if (servo_step == 0) {
-    if (mean_residual < 0) {
-      servo_step = SERVO_COARSE_STEP;   // need higher frequency → increase voltage
-    } else if (mean_residual > 0) {
-      servo_step = -SERVO_COARSE_STEP;  // need lower frequency → decrease voltage
-    } else {
-      // Already at zero — hold
-      servo_converged = true;
-      return;
-    }
+  // Dead on zero — done
+  if (mean_residual == 0) {
+    servo_converged = true;
+    return;
   }
 
   // Detect zero crossing (sign change in residual vs last decision)
-  bool sign_changed = (mean_residual > 0 && servo_last_residual < 0) ||
-                      (mean_residual < 0 && servo_last_residual > 0);
+  bool sign_changed = (servo_last_residual != 0) &&
+                      ((mean_residual > 0 && servo_last_residual < 0) ||
+                       (mean_residual < 0 && servo_last_residual > 0));
 
   if (sign_changed) {
-    // Crossed the target — reverse direction and halve step size
+    // Enter binary phase on first crossing (stay in it thereafter)
+    servo_in_binary_phase = true;
+
+    // Reverse direction and halve step size
     servo_step = -(servo_step / 2);
 
     // If step size collapsed to zero, we're done
@@ -788,6 +802,25 @@ static void ocxo_calibration_servo(void) {
       servo_converged = true;
       return;
     }
+  } else if (servo_in_binary_phase) {
+    // Already in binary phase, same sign as last time —
+    // continue in the same direction with same step size
+  } else {
+    // Proportional phase: estimate step from current residual.
+    // Empirical sensitivity: ~1.6 ticks per DAC count at 10 MHz.
+    // Use conservative 1:1 ratio to avoid overshoot.
+    // Negative residual (slow) → positive step (increase voltage).
+    // Positive residual (fast) → negative step (decrease voltage).
+    int32_t estimated_step = -mean_residual;
+
+    // Clamp to SERVO_COARSE_STEP to bound the maximum single move
+    if (estimated_step > SERVO_COARSE_STEP) estimated_step = SERVO_COARSE_STEP;
+    if (estimated_step < -SERVO_COARSE_STEP) estimated_step = -SERVO_COARSE_STEP;
+
+    // Ensure we move at least 1 count
+    if (estimated_step == 0) estimated_step = (mean_residual < 0) ? 1 : -1;
+
+    servo_step = estimated_step;
   }
 
   servo_last_residual = mean_residual;

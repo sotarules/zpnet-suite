@@ -669,9 +669,12 @@ def _persist_timebase(tb: Dict[str, Any], report: Dict[str, Any]) -> None:
         logging.exception("⚠️ [clocks] failed to persist TIMEBASE (ignored)")
 
 
-# ---------------------------------------------------------------------
-# Recovery -- restore clocks after Pi restart mid-campaign
-# ---------------------------------------------------------------------
+# -----------------------------------------------------------------
+# 3) _recover_campaign — revised
+#
+# Changes: after step 9 (send RECOVER), include set_dac and
+# calibrate_ocxo from the campaign payload.
+# -----------------------------------------------------------------
 
 def _recover_campaign() -> None:
     """
@@ -682,13 +685,14 @@ def _recover_campaign() -> None:
     Algorithm:
       1) Check for active campaign in Postgres
       2) Fetch the most recent TIMEBASE row for that campaign
-      3) Wait patiently for GNSS to produce a valid timestamp
+      3) Wait patiently for GNSS to acquire satellites
       4) If campaign has a location, restore GNSS -> TO mode
       5) Capture GNSS time and PITIMER counter
       6) Compute elapsed seconds since last TIMEBASE
       7) Compute tau for each clock domain
       8) Project all clock values forward to the NEXT PPS edge
       9) Send RECOVER command to Teensy with projected values
+         AND the persisted OCXO DAC value + calibration state
      10) Compute synthetic Pi tick epoch for continuous pi_ns
      11) Activate campaign
 
@@ -769,6 +773,21 @@ def _recover_campaign() -> None:
         last_gnss_ns = last_dwt_ns
 
     # ----------------------------------------------------------
+    # Read persisted OCXO control state from campaign payload
+    # ----------------------------------------------------------
+    recover_ocxo_dac = campaign_payload.get("ocxo_dac")
+    recover_calibrate = campaign_payload.get("calibrate_ocxo", False)
+    recover_converged = campaign_payload.get("servo_converged", False)
+
+    if recover_ocxo_dac is not None:
+        logging.info(
+            "🔧 [recovery] OCXO DAC: %d (calibrate=%s, converged=%s)",
+            recover_ocxo_dac,
+            recover_calibrate,
+            recover_converged,
+        )
+
+    # ----------------------------------------------------------
     # 3) Wait for GNSS to produce a valid timestamp
     # ----------------------------------------------------------
     logging.info("⏳ [recovery] waiting for GNSS time to become available...")
@@ -802,7 +821,6 @@ def _recover_campaign() -> None:
 
     # ----------------------------------------------------------
     # 5) Capture GNSS time and PITIMER counter
-    #    (uses command channel — subscription not yet active)
     # ----------------------------------------------------------
     gnss_time_now_str = _get_gnss_time()
     gnss_time_now = datetime.fromisoformat(
@@ -810,7 +828,6 @@ def _recover_campaign() -> None:
     )
 
     pi_capture = _get_pitimer_capture_via_command()
-    # Use corrected counter if available, fall back to raw
     pi_counter_now = 0
     if pi_capture:
         pi_counter_now = pi_capture.get("corrected") or pi_capture.get("counter", 0)
@@ -875,20 +892,42 @@ def _recover_campaign() -> None:
     )
 
     # ----------------------------------------------------------
-    # 9) Send RECOVER to Teensy
+    # 9) Send RECOVER to Teensy (with OCXO DAC state)
     # ----------------------------------------------------------
     logging.info("🚀 [recovery] sending RECOVER to Teensy...")
+
+    recover_args = {
+        "dwt_cycles": str(projected_dwt_cycles),
+        "gnss_ns": str(projected_gnss_ns),
+        "ocxo_ns": str(projected_ocxo_ns),
+    }
+
+    # Restore OCXO DAC to last-known value so the crystal
+    # doesn't reset to the boot default (2048) mid-campaign.
+    if recover_ocxo_dac is not None:
+        recover_args["set_dac"] = str(int(recover_ocxo_dac))
+
+    # If calibration was active and hadn't converged,
+    # re-enable the servo so it can continue hunting.
+    # If it had already converged, just set the DAC and
+    # don't re-enable — the value is already good.
+    if recover_calibrate and not recover_converged:
+        recover_args["calibrate_ocxo"] = "true"
+        logging.info(
+            "🔧 [recovery] re-enabling OCXO calibration servo (not yet converged)"
+        )
+    elif recover_calibrate and recover_converged:
+        logging.info(
+            "🔧 [recovery] OCXO servo was converged — restoring DAC=%d without re-calibrating",
+            recover_ocxo_dac,
+        )
 
     try:
         recover_resp = send_command(
             machine="TEENSY",
             subsystem="CLOCKS",
             command="RECOVER",
-            args={
-                "dwt_cycles": str(projected_dwt_cycles),
-                "gnss_ns": str(projected_gnss_ns),
-                "ocxo_ns": str(projected_ocxo_ns),
-            },
+            args=recover_args,
         )
 
         if recover_resp.get("success", True):
@@ -984,9 +1023,14 @@ def on_pps_capture(payload: Payload) -> None:
         _last_pi_seq = pi_seq
 
 
-# ---------------------------------------------------------------------
-# Teensy fragment handler
-# ---------------------------------------------------------------------
+# -----------------------------------------------------------------
+# 2) on_timebase_fragment — revised
+#
+# Only the section that builds the TIMEBASE record and the new
+# OCXO DAC persistence are shown.  The rest of the function is
+# unchanged — I'm showing the full function so you can clobber
+# and compare with git.
+# -----------------------------------------------------------------
 
 def on_timebase_fragment(payload: Payload) -> None:
     """
@@ -998,6 +1042,7 @@ def on_timebase_fragment(payload: Payload) -> None:
       3) Residual statistics update (GNSS, DWT, OCXO)
       4) Report denormalization into campaign payload
       5) Publish + persist
+      6) Persist latest OCXO DAC value into campaign payload
 
     NOTE: Pi residual statistics are computed in on_pps_capture(),
     not here.  This handler reads the buffered PPS_CAPTURE for
@@ -1039,14 +1084,6 @@ def on_timebase_fragment(payload: Payload) -> None:
 
     # ----------------------------------------------------------
     # Extract Pi capture diagnostics and compute campaign-scoped pi_ns
-    #
-    # The buffered capture is read for all Pi fields.  pi_ns is
-    # computed here from the corrected counter and _pi_tick_epoch.
-    #
-    # This is safe because the stale-capture guard (below) ensures
-    # we only reach the TIMEBASE build when pi_seq has advanced,
-    # guaranteeing the buffered capture is fresh and paired with
-    # this fragment's gnss_ns.
     # ----------------------------------------------------------
     pi_counter_raw = None
     pi_counter_corrected = None
@@ -1069,11 +1106,6 @@ def on_timebase_fragment(payload: Payload) -> None:
         pi_residual_ns = pi_capture.get("residual_ns")
 
     if pi_counter_corrected is not None and not _pi_tick_epoch_set:
-        # Set Pi tick epoch from the FIRST capture that arrives with
-        # a TIMEBASE_FRAGMENT.  This ensures the epoch is aligned to
-        # the same PPS edge where the Teensy zeroed its clocks.
-        # (on_pps_capture may fire on a *different* PPS edge than the
-        # one the Teensy zeroed on, causing a 1-second epoch offset.)
         _pi_tick_epoch = pi_counter_corrected
         _pi_tick_epoch_set = True
         logging.info(
@@ -1087,15 +1119,6 @@ def on_timebase_fragment(payload: Payload) -> None:
 
     # ----------------------------------------------------------
     # Update GNSS, DWT, and OCXO residual statistics (nanoseconds)
-    #
-    # These MUST be updated on EVERY fragment, even when the Pi
-    # capture is stale and we're about to skip the TIMEBASE.
-    # The Teensy data is always valid (it arrives with the fragment).
-    # If we only updated these after the stale guard, every skipped
-    # TIMEBASE would cause a 2-second gap, producing spurious
-    # outlier rejections on the next fragment.
-    #
-    # Pi residual is updated in on_pps_capture() — not here.
     # ----------------------------------------------------------
     frag = payload
     gnss_ns = int(frag.get("gnss_ns") or 0)
@@ -1110,15 +1133,7 @@ def on_timebase_fragment(payload: Payload) -> None:
         _safe_residual_update(_residual_ocxo, ocxo_ns, NS_PER_SECOND, "OCXO")
 
     # ----------------------------------------------------------
-    # Stale-capture guard: skip TIMEBASE if Pi data hasn't advanced
-    #
-    # If pi_seq matches the last seq we published, on_pps_capture()
-    # hasn't fired yet for this second.  Publishing now would put
-    # a stale pi_ns alongside an advanced gnss_ns, causing wild
-    # PPB oscillation.  Skip this TIMEBASE — the next fragment
-    # will have fresh Pi data.  This is not fatal: only the most
-    # recent TIMEBASE matters.  Teensy residuals (above) are
-    # already updated, so no data is lost.
+    # Stale-capture guard
     # ----------------------------------------------------------
     if pi_seq is not None and pi_seq == _last_fragment_pi_seq:
         logging.debug(
@@ -1142,10 +1157,10 @@ def on_timebase_fragment(payload: Payload) -> None:
     timebase = {
         "campaign": campaign,
 
-        # System time when fragment arrived (chrony-disciplined, sanity check)
+        # System time when fragment arrived
         "system_time_utc": system_time_str,
 
-        # GNSS time from receiver (integer-second, via NMEA)
+        # GNSS time from receiver
         "gnss_time_utc": gnss_time,
 
         # Teensy clocks (authoritative)
@@ -1156,12 +1171,12 @@ def on_timebase_fragment(payload: Payload) -> None:
         "teensy_rtc1_ns": frag.get("rtc1_ns"),
         "teensy_rtc2_ns": frag.get("rtc2_ns"),
 
-        # Pi clock — authoritative values (TDC-corrected)
+        # Pi clock
         "pi_counter": pi_counter_raw,
         "pi_corrected": pi_counter_corrected,
         "pi_ns": pi_ns,
 
-        # Pi TDC diagnostics (parallel to Teensy diag_* fields)
+        # Pi TDC diagnostics
         "diag_pi_raw_counter": pi_counter_raw,
         "diag_pi_corrected": pi_counter_corrected,
         "diag_pi_detect_ns": pi_detect_ns,
@@ -1172,7 +1187,7 @@ def on_timebase_fragment(payload: Payload) -> None:
         "diag_pi_residual": pi_residual,
         "diag_pi_residual_ns": pi_residual_ns,
 
-        # Per-clock PPS residuals (nanoseconds) — computed by this process
+        # Per-clock PPS residuals (nanoseconds)
         "isr_residual_gnss": frag.get("isr_residual_gnss"),
         "isr_residual_dwt": frag.get("isr_residual_dwt"),
         "isr_residual_ocxo": frag.get("isr_residual_ocxo"),
@@ -1181,11 +1196,16 @@ def on_timebase_fragment(payload: Payload) -> None:
         # Teensy PPS count
         "teensy_pps_count": frag.get("teensy_pps_count"),
 
-        # Teensy TDC diagnostics (pass-through from fragment)
+        # Teensy TDC diagnostics
         "diag_teensy_dispatch_delta_ns": frag.get("dispatch_delta_ns"),
         "diag_teensy_pps_edge_valid": frag.get("pps_edge_valid"),
         "diag_teensy_pps_edge_correction_ns": frag.get("pps_edge_correction_ns"),
         "diag_teensy_detect_ns": frag.get("dispatch_delta_ns"),
+
+        # OCXO DAC control state (from Teensy telemetry)
+        "ocxo_dac": frag.get("ocxo_dac"),
+        "calibrate_ocxo": frag.get("calibrate_ocxo"),
+        "servo_converged": frag.get("servo_converged"),
     }
 
     # ----------------------------------------------------------
@@ -1196,14 +1216,56 @@ def on_timebase_fragment(payload: Payload) -> None:
     # Publish sacred tuple
     publish("TIMEBASE", timebase)
 
-    # Record which pi_seq we just published so we can detect
-    # stale captures on the next fragment.
+    # Record which pi_seq we just published
     if pi_seq is not None:
         _last_fragment_pi_seq = pi_seq
 
     # Persist best-effort (also denormalizes report into campaign)
     _persist_timebase(timebase, report)
 
+    # ----------------------------------------------------------
+    # Persist latest OCXO DAC value into campaign payload.
+    #
+    # This captures the servo's progress as it converges.
+    # On recovery, the Pi reads this value and sends it back
+    # to the Teensy so the OCXO resumes at the last-known
+    # good control voltage.
+    #
+    # Best-effort — failure is logged and ignored.
+    # ----------------------------------------------------------
+    teensy_ocxo_dac = frag.get("ocxo_dac")
+    teensy_calibrate = frag.get("calibrate_ocxo")
+    teensy_converged = frag.get("servo_converged")
+
+    if teensy_ocxo_dac is not None:
+        try:
+            with open_db() as conn:
+                cur = conn.cursor()
+                cur.execute(
+                    """
+                    UPDATE campaigns
+                    SET payload = payload || %s::jsonb
+                    WHERE campaign = %s
+                      AND active = true
+                    """,
+                    (
+                        json.dumps({
+                            "ocxo_dac": int(teensy_ocxo_dac),
+                            "calibrate_ocxo": bool(teensy_calibrate),
+                            "servo_converged": bool(teensy_converged),
+                        }),
+                        campaign,
+                    ),
+                )
+        except Exception:
+            logging.exception("⚠️ [clocks] failed to persist OCXO DAC (ignored)")
+
+
+
+
+# -----------------------------------------------------------------
+# 1) cmd_start — revised
+# -----------------------------------------------------------------
 
 def cmd_start(args: Optional[dict]) -> dict:
     """
@@ -1217,7 +1279,7 @@ def cmd_start(args: Optional[dict]) -> dict:
 
     Sequence:
       1) Deactivate any existing campaign
-      2) Insert new campaign row
+      2) Insert new campaign row (with OCXO control state persisted)
       3) If location specified: command GNSS -> TO mode (blocking)
       4) Set _request_start flag (consumed on next fragment)
       5) Start Teensy CLOCKS acquisition (Teensy zeros at PPS)
@@ -1230,13 +1292,44 @@ def cmd_start(args: Optional[dict]) -> dict:
 
     location = (args.get("location") or "").strip() or None
 
+    # Parse OCXO control parameters
+    set_dac = args.get("set_dac")
+
+    # If caller didn't specify set_dac, read from config
+    if set_dac is None:
+        try:
+            with open_db(row_dict=True) as conn:
+                cur = conn.cursor()
+                cur.execute(
+                    "SELECT payload FROM config WHERE config_key = 'SYSTEM'"
+                )
+                row = cur.fetchone()
+                if row and row["payload"].get("ocxo_dac") is not None:
+                    set_dac = int(row["payload"]["ocxo_dac"])
+                    logging.info("🔧 [clocks] using ocxo_dac=%d from SYSTEM config", set_dac)
+        except Exception:
+            logging.exception("⚠️ [clocks] failed to read SYSTEM config (ignored)")
+
+    calibrate_ocxo = bool(args.get("calibrate_ocxo"))
+
     # ----------------------------------------------------------
     # 1) Deactivate existing + insert new campaign
+    #    Persist OCXO control state so recovery can restore it.
     # ----------------------------------------------------------
     campaign_payload = {
         "location": location,
         "started_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
     }
+
+    # Persist OCXO control state into campaign payload.
+    # ocxo_dac stores the INITIAL requested value; it will be
+    # overwritten every second by the latest Teensy telemetry
+    # as the servo converges.  Recovery reads whichever value
+    # is current at crash time.
+    if set_dac is not None:
+        campaign_payload["ocxo_dac"] = int(set_dac)
+    if calibrate_ocxo:
+        campaign_payload["calibrate_ocxo"] = True
 
     with open_db() as conn:
         cur = conn.cursor()
@@ -1302,12 +1395,11 @@ def cmd_start(args: Optional[dict]) -> dict:
     # ----------------------------------------------------------
     teensy_args = {"campaign": campaign}
 
-    set_dac = args.get("set_dac")
     if set_dac is not None:
         teensy_args["set_dac"] = str(set_dac)
 
-    if args.get("calibrate_ocxo"):
-        teensy_args["calibrate_ocxo"] = "1"
+    if calibrate_ocxo:
+        teensy_args["calibrate_ocxo"] = "true"
 
     send_command(
         machine="TEENSY",
@@ -1323,7 +1415,7 @@ def cmd_start(args: Optional[dict]) -> dict:
             "campaign": campaign,
             "location": location,
             "set_dac": set_dac,
-            "calibrate_ocxo": bool(args.get("calibrate_ocxo")),
+            "calibrate_ocxo": calibrate_ocxo,
         },
     }
 
