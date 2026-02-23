@@ -1205,17 +1205,15 @@ def on_timebase_fragment(payload: Payload) -> None:
     _persist_timebase(timebase, report)
 
 
-# ---------------------------------------------------------------------
-# Command handlers (control plane)
-# ---------------------------------------------------------------------
-
 def cmd_start(args: Optional[dict]) -> dict:
     """
     Start a new campaign.
 
     Args:
-        campaign (str):   Campaign name (required)
-        location (str):   Profiled location name (optional)
+        campaign (str):          Campaign name (required)
+        location (str):          Profiled location name (optional)
+        set_dac (int):           OCXO DAC value 0–4095 (optional)
+        calibrate_ocxo (bool):   Enable OCXO calibration servo (optional)
 
     Sequence:
       1) Deactivate any existing campaign
@@ -1300,12 +1298,22 @@ def cmd_start(args: Optional[dict]) -> dict:
 
     # ----------------------------------------------------------
     # 4) Start Teensy CLOCKS acquisition
+    #    Pass through OCXO control parameters to Teensy.
     # ----------------------------------------------------------
+    teensy_args = {"campaign": campaign}
+
+    set_dac = args.get("set_dac")
+    if set_dac is not None:
+        teensy_args["set_dac"] = str(set_dac)
+
+    if args.get("calibrate_ocxo"):
+        teensy_args["calibrate_ocxo"] = "1"
+
     send_command(
         machine="TEENSY",
         subsystem="CLOCKS",
         command="START",
-        args={"campaign": campaign},
+        args=teensy_args,
     )
 
     return {
@@ -1314,9 +1322,10 @@ def cmd_start(args: Optional[dict]) -> dict:
         "payload": {
             "campaign": campaign,
             "location": location,
+            "set_dac": set_dac,
+            "calibrate_ocxo": bool(args.get("calibrate_ocxo")),
         },
     }
-
 
 def cmd_stop(_: Optional[dict]) -> dict:
     """
