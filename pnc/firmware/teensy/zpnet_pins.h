@@ -103,6 +103,8 @@ GND           Black         GND                Battery branching ground         
 15            Yellow        PHOTODIODE_ADC     Photodiode output                    Analog input (ADC)
 14            Twister Pair  GNSS_VCLOCK        GNSS vclock output                   10MHz reference from GF-8802 (critical timing)
 
+22            Gray          OCXO_CTL           OCXO Pin 1 (CTL)                     DAC output for OCXO frequency trim
+
 30            Green         LASER_EN           EV5491-C-00A EN pin                  Laser driver enable
 
 32            Orange        GNSS_PPS_RELAY     GPIO relay to Pi for GNSS PPS        Relays GNSS PPS to Pi (critical timing)

@@ -3,7 +3,7 @@ ZPNet CLOCKS Process — TIMEBASE Authority (Pi-side)
 
 Responsibilities:
   * Receive TIMEBASE_FRAGMENT from Teensy
-  * Query PITIMER for Pi arch timer capture (CNTVCT_EL0)
+  * Receive PPS_CAPTURE from PITIMER (subscription, not polling)
   * Augment fragment with Pi capture, GNSS time, and system time
   * Publish TIMEBASE
   * Persist TIMEBASE to PostgreSQL (append-only, best-effort)
@@ -32,12 +32,31 @@ Pi clock architecture:
   * correction_ticks = detect_ns converted to arch timer ticks
   * corrected_counter = raw_counter - correction_ticks
     (Pi-side TDC: best estimate of counter at true PPS edge)
-  * The PITIMER process wraps pps_poll and exposes captures via
-    the standard ZPNet command socket interface
-  * CLOCKS queries PITIMER.REPORT when each TIMEBASE_FRAGMENT
-    arrives, obtaining the latest capture with full diagnostics
+  * The PITIMER process wraps pps_poll and publishes each capture
+    as a PPS_CAPTURE message on the standard ZPNet pub/sub bus
+  * CLOCKS subscribes to PPS_CAPTURE and buffers the latest capture
+  * When TIMEBASE_FRAGMENT arrives from Teensy, the fragment handler
+    reads the buffered PPS_CAPTURE — no synchronous IPC, no timing
+    coupling, no beat-frequency aliasing
   * Pi residual = delta between consecutive CORRECTED captures
     minus the expected 54,000,000 ticks, converted to nanoseconds
+
+  NOTE: Previous versions polled PITIMER.REPORT synchronously when
+  each TIMEBASE_FRAGMENT arrived.  This created a beat frequency
+  between the Teensy PPS (which drives fragment timing) and the
+  Pi PPS (which drives pps_poll captures).  Every ~38 seconds the
+  phase alignment slipped, causing CLOCKS to see a 2-second delta
+  (108M ticks) instead of 1-second.  The subscription model
+  eliminates this entirely: every PPS_CAPTURE is received exactly
+  once, in order, regardless of fragment timing.
+
+  NOTE: Pi residual statistics are computed directly in the
+  on_pps_capture() handler, driven by PPS_CAPTURE arrival — NOT
+  in the fragment handler.  This decouples Pi residual tracking
+  from TIMEBASE_FRAGMENT timing, eliminating a race condition
+  where a fragment arriving before the next capture would read
+  a stale buffer, skip the update, and then see a 2-second delta
+  (108M ticks) on the following fragment.
 
 Pi TDC diagnostics in TIMEBASE:
   * diag_pi_raw_counter     — raw CNTVCT_EL0 at detection moment
@@ -60,6 +79,10 @@ Residual policy (all clocks):
     (using CORRECTED counter for best accuracy),
     scaled to nanoseconds by display_scale (ns_per_tick)
   * Running statistics via Welford's online algorithm
+  * Outlier rejection on all clock domains: any delta that
+    deviates from expected by more than 50% is rejected and
+    logged, preventing a single glitch from permanently
+    corrupting the running statistics
 
 Campaign start:
   * cmd_start arms the Teensy (CLOCKS.START)
@@ -143,6 +166,11 @@ GNSS_WAIT_LOG_INTERVAL = 60
 # GNSS, DWT, OCXO: accumulate in nanoseconds with expected = 1e9.
 # Pi: accumulates in raw ticks with expected = PI_TIMER_FREQ.
 #     display_scale converts ticks -> nanoseconds for reporting.
+#
+# All clock domains use outlier rejection: any delta that deviates
+# from expected by more than 50% is rejected and logged, preventing
+# a single glitch (recovery discontinuity, skipped PPS, Teensy
+# hiccup) from permanently corrupting the running statistics.
 # ---------------------------------------------------------------------
 
 class _PpsResidual:
@@ -232,6 +260,53 @@ class _PpsResidual:
             "pps_stderr": round(self.stderr * s, 3),
         }
 
+
+# ---------------------------------------------------------------------
+# Outlier-safe residual update
+#
+# Wraps _PpsResidual.update() with a deviation guard that rejects
+# any delta deviating from expected by more than 50%.  This prevents
+# a single glitch (recovery discontinuity, skipped PPS, Teensy
+# hiccup, or stale capture) from permanently corrupting the Welford
+# running statistics.
+#
+# When an outlier is rejected, last_value is still advanced so
+# the NEXT delta starts fresh from the current reading.
+# ---------------------------------------------------------------------
+
+def _safe_residual_update(
+    tracker: _PpsResidual,
+    value_now: int,
+    expected: int,
+    label: str,
+) -> None:
+    """
+    Update a residual tracker with outlier rejection.
+
+    If the tracker already has a previous value, peek at the
+    prospective delta before committing to Welford's.  If the
+    delta deviates from expected by more than 50%, reject the
+    sample, log a warning, and advance the anchor so the next
+    delta starts clean.
+
+    If this is the first sample (last_value == 0), just pass
+    through to update() which will set the anchor without
+    computing a delta.
+    """
+    if tracker.last_value > 0:
+        prospective_delta = value_now - tracker.last_value
+        deviation = abs(prospective_delta - expected)
+        if deviation > expected // 2:
+            logging.warning(
+                "⚠️ [clocks] %s residual outlier rejected: "
+                "delta=%d (expected %d, deviation %d)",
+                label, prospective_delta, expected, deviation,
+            )
+            tracker.last_value = value_now
+            return
+    tracker.update(value_now, expected)
+
+
 # ---------------------------------------------------------------------
 # Local state (process lifetime)
 # ---------------------------------------------------------------------
@@ -262,12 +337,26 @@ _residual_pi = _PpsResidual(display_scale=PI_NS_PER_TICK)
 _residual_ocxo = _PpsResidual()
 
 # Last-seen pps_poll sequence number.
-# Guards against stale PITIMER captures: if TIMEBASE_FRAGMENT
-# arrives before pps_poll has emitted a new line, we'd feed the
-# same counter into Welford's twice.  Delta would be 0, residual
-# would be -54,000,000, and that single outlier catastrophically
-# blows up the variance.
+# Guards against stale PPS_CAPTURE messages: if the same capture
+# is seen twice (e.g. due to message replay or timing), we skip it.
+# Updated in on_pps_capture() where Pi residual is computed.
 _last_pi_seq: int = -1
+
+# Last pi_seq used in a published TIMEBASE record.
+# If the fragment handler sees the same seq as last time, it means
+# on_pps_capture() hasn't fired yet for this second — the Pi data
+# is stale.  We skip the TIMEBASE rather than publish with a pi_ns
+# that's one second behind gnss_ns (which causes wild PPB swings).
+_last_fragment_pi_seq: int = -1
+
+# Latest PPS_CAPTURE from PITIMER, received via subscription.
+# Written by on_pps_capture(), read by on_timebase_fragment().
+# Protected by _pi_capture_lock for thread safety.
+# The fragment handler computes pi_ns directly from the buffered
+# capture's corrected counter, guarded by _last_fragment_pi_seq
+# to ensure the capture is fresh (not stale from the previous PPS).
+_latest_pi_capture: Optional[Dict[str, Any]] = None
+_pi_capture_lock = threading.Lock()
 
 _state_lock = threading.Lock()
 
@@ -275,24 +364,27 @@ _state_lock = threading.Lock()
 # Helpers
 # ---------------------------------------------------------------------
 
-def _get_pitimer_capture() -> Optional[Dict[str, Any]]:
+def _get_pitimer_capture_from_buffer() -> Optional[Dict[str, Any]]:
     """
-    Fetch the latest Pi arch timer capture from the PITIMER process.
+    Return the latest PPS_CAPTURE received via subscription.
+
+    This replaces the old synchronous PITIMER.REPORT polling.
+    Returns None if no capture has been received yet.
+    """
+    with _pi_capture_lock:
+        return _latest_pi_capture
+
+
+def _get_pitimer_capture_via_command() -> Optional[Dict[str, Any]]:
+    """
+    Fetch the latest Pi arch timer capture from the PITIMER process
+    via the command channel.
+
+    Used ONLY during recovery, before the subscription is active.
+    Normal operation uses _get_pitimer_capture_from_buffer().
 
     Returns the PITIMER REPORT payload, or None if PITIMER is
     not available or has no capture yet.
-
-    The payload contains (enhanced format):
-      - counter: raw CNTVCT_EL0 value at detection moment
-      - corrected: counter minus detection latency (TDC-corrected)
-      - delta: ticks between consecutive corrected captures
-      - residual: delta minus expected (PI_TIMER_FREQ)
-      - residual_ns: residual in nanoseconds
-      - detect_ns: detection latency (ns after second boundary)
-      - correction_ticks: ticks subtracted from raw counter
-      - seq: capture sequence number
-      - freq: timer frequency (54 MHz)
-      - ns_per_tick: nanoseconds per tick
     """
     try:
         resp = send_command(
@@ -599,8 +691,11 @@ def _recover_campaign() -> None:
       9) Send RECOVER command to Teensy with projected values
      10) Compute synthetic Pi tick epoch for continuous pi_ns
      11) Activate campaign
+
+    NOTE: Recovery uses _get_pitimer_capture_via_command() because
+    the PPS_CAPTURE subscription is not yet active at this point.
     """
-    global _campaign_active, _pi_tick_epoch, _pi_tick_epoch_set
+    global _campaign_active, _pi_tick_epoch, _pi_tick_epoch_set, _last_pi_seq
 
     # ----------------------------------------------------------
     # 1) Check for active campaign
@@ -707,13 +802,14 @@ def _recover_campaign() -> None:
 
     # ----------------------------------------------------------
     # 5) Capture GNSS time and PITIMER counter
+    #    (uses command channel — subscription not yet active)
     # ----------------------------------------------------------
     gnss_time_now_str = _get_gnss_time()
     gnss_time_now = datetime.fromisoformat(
         gnss_time_now_str.replace("Z", "+00:00")
     )
 
-    pi_capture = _get_pitimer_capture()
+    pi_capture = _get_pitimer_capture_via_command()
     # Use corrected counter if available, fall back to raw
     pi_counter_now = 0
     if pi_capture:
@@ -831,6 +927,7 @@ def _recover_campaign() -> None:
     _residual_pi.reset()
     _residual_ocxo.reset()
     _last_pi_seq = -1
+    _last_fragment_pi_seq = -1
     _campaign_active = True
 
     logging.info(
@@ -838,6 +935,53 @@ def _recover_campaign() -> None:
         "Teensy RECOVER sent, awaiting first TIMEBASE_FRAGMENT",
         campaign_name,
     )
+
+
+# ---------------------------------------------------------------------
+# PPS_CAPTURE subscription handler
+# ---------------------------------------------------------------------
+
+def on_pps_capture(payload: Payload) -> None:
+    """
+    Receive PPS_CAPTURE from PITIMER via pub/sub.
+
+    This replaces the old synchronous PITIMER.REPORT polling.
+    Each PPS_CAPTURE contains the latest pps_poll capture with
+    full diagnostics (counter, corrected, detect_ns, seq, etc.).
+
+    We buffer the latest capture under _pi_capture_lock for the
+    fragment handler to read, AND we compute Pi residual statistics
+    here — driven by PPS_CAPTURE arrival, not by fragment timing.
+
+    Pi tick epoch and pi_ns are set/computed in the fragment handler,
+    not here, because the epoch must be aligned to the PPS edge where
+    the Teensy zeroed its clocks (signaled by the first fragment).
+
+    The fragment handler computes pi_ns directly from the buffered
+    capture's corrected counter, guarded by _last_fragment_pi_seq
+    to ensure the capture is fresh (not stale from the previous PPS).
+    """
+    global _latest_pi_capture, _last_pi_seq
+
+    capture = dict(payload)
+    pi_seq = capture.get("seq")
+    pi_counter_corrected = capture.get("corrected") or capture.get("counter")
+
+    with _pi_capture_lock:
+        _latest_pi_capture = capture
+
+    if not _campaign_active:
+        return
+
+    if pi_counter_corrected is None:
+        return
+
+    # Compute Pi residual, driven by PPS_CAPTURE arrival.
+    if pi_seq is not None and pi_seq != _last_pi_seq:
+        _safe_residual_update(
+            _residual_pi, pi_counter_corrected, PI_TIMER_FREQ, "Pi"
+        )
+        _last_pi_seq = pi_seq
 
 
 # ---------------------------------------------------------------------
@@ -849,20 +993,24 @@ def on_timebase_fragment(payload: Payload) -> None:
     Receive TIMEBASE_FRAGMENT from Teensy and build TIMEBASE.
 
     This is the main data path.  Each fragment triggers:
-      1) Pi-side observations (system time, PITIMER capture)
+      1) Pi-side observations (system time, buffered PPS_CAPTURE)
       2) TIMEBASE augmentation (combine Teensy + Pi + GNSS)
-      3) Residual statistics update (GNSS, DWT, OCXO, Pi)
+      3) Residual statistics update (GNSS, DWT, OCXO)
       4) Report denormalization into campaign payload
       5) Publish + persist
+
+    NOTE: Pi residual statistics are computed in on_pps_capture(),
+    not here.  This handler reads the buffered PPS_CAPTURE for
+    pi_ns and diagnostics only.
     """
     global _request_start, _request_stop, _campaign_active
-    global _pi_tick_epoch, _pi_tick_epoch_set, _last_pi_seq
+    global _pi_tick_epoch, _pi_tick_epoch_set, _last_pi_seq, _last_fragment_pi_seq
 
     # ----------------------------------------------------------
     # Capture Pi-side observations immediately
     # ----------------------------------------------------------
     system_time_utc = datetime.now(timezone.utc)
-    pi_capture = _get_pitimer_capture()
+    pi_capture = _get_pitimer_capture_from_buffer()
 
     # ----------------------------------------------------------
     # Process request flags
@@ -879,6 +1027,7 @@ def on_timebase_fragment(payload: Payload) -> None:
         _residual_ocxo.reset()
         _pi_tick_epoch_set = False
         _last_pi_seq = -1
+        _last_fragment_pi_seq = -1
         _campaign_active = True
         _request_start = False
         logging.info("▶️ [clocks] campaign started")
@@ -889,15 +1038,15 @@ def on_timebase_fragment(payload: Payload) -> None:
     system_time_str = system_time_utc.isoformat(timespec='microseconds')
 
     # ----------------------------------------------------------
-    # Extract Pi counter and compute campaign-scoped pi_ns
+    # Extract Pi capture diagnostics and compute campaign-scoped pi_ns
     #
-    # We use the CORRECTED counter (raw minus detection latency)
-    # as the authoritative Pi timestamp.  This is the Pi-side
-    # TDC correction: we know how late we detected the second
-    # boundary, so we subtract that latency in ticks.
+    # The buffered capture is read for all Pi fields.  pi_ns is
+    # computed here from the corrected counter and _pi_tick_epoch.
     #
-    # The raw counter is preserved as diag_pi_raw_counter for
-    # diagnostic visibility.
+    # This is safe because the stale-capture guard (below) ensures
+    # we only reach the TIMEBASE build when pi_seq has advanced,
+    # guaranteeing the buffered capture is fresh and paired with
+    # this fragment's gnss_ns.
     # ----------------------------------------------------------
     pi_counter_raw = None
     pi_counter_corrected = None
@@ -919,75 +1068,68 @@ def on_timebase_fragment(payload: Payload) -> None:
         pi_residual = pi_capture.get("residual")
         pi_residual_ns = pi_capture.get("residual_ns")
 
-    if pi_counter_corrected is not None:
-        if not _pi_tick_epoch_set:
-            _pi_tick_epoch = pi_counter_corrected
-            _pi_tick_epoch_set = True
-            logging.info(
-                "⏱️ [clocks] Pi tick epoch set: %d (corrected counter)",
-                _pi_tick_epoch,
-            )
+    if pi_counter_corrected is not None and not _pi_tick_epoch_set:
+        # Set Pi tick epoch from the FIRST capture that arrives with
+        # a TIMEBASE_FRAGMENT.  This ensures the epoch is aligned to
+        # the same PPS edge where the Teensy zeroed its clocks.
+        # (on_pps_capture may fire on a *different* PPS edge than the
+        # one the Teensy zeroed on, causing a 1-second epoch offset.)
+        _pi_tick_epoch = pi_counter_corrected
+        _pi_tick_epoch_set = True
+        logging.info(
+            "⏱️ [clocks] Pi tick epoch set: %d (corrected counter, from fragment handler)",
+            _pi_tick_epoch,
+        )
 
+    if pi_counter_corrected is not None and _pi_tick_epoch_set:
         campaign_ticks = pi_counter_corrected - _pi_tick_epoch
         pi_ns = _ticks_to_ns(campaign_ticks)
 
-        # Update Pi residual (CORRECTED ticks, expected = PI_TIMER_FREQ)
-        #
-        # Two guards protect Welford's from catastrophic outliers:
-        #
-        # Guard 1 — Stale capture (deduplication):
-        #   If the TIMEBASE_FRAGMENT arrived before pps_poll emitted a
-        #   new line, pi_seq will repeat.  Delta=0, residual=-54e6.
-        #   Fixed by checking pi_seq != _last_pi_seq.
-        #
-        # Guard 2 — Skipped second (outlier rejection):
-        #   pps_poll busy-polls clock_gettime for second boundaries.
-        #   If the polling loop or the OS hiccups, pps_poll can miss
-        #   a second entirely.  The next capture arrives 2+ seconds
-        #   later, producing delta ≈ 108e6 ticks, residual ≈ +54e6.
-        #   A single such event permanently corrupts the Welford
-        #   running statistics (mean drifts by millions of ns, stddev
-        #   explodes to ~54 ms).
-        #
-        #   We reject any delta that deviates from expected by more
-        #   than 50% (i.e., delta < 27e6 or delta > 81e6).  This is
-        #   extremely conservative — normal residuals are < 1000 ticks.
-        #   When rejected, we still advance last_value so the NEXT
-        #   delta starts fresh from this capture.
-        #
-        if pi_seq is not None and pi_seq != _last_pi_seq:
-            # Peek at what the delta would be before committing to Welford's
-            if _residual_pi.last_value > 0:
-                prospective_delta = pi_counter_corrected - _residual_pi.last_value
-                deviation = abs(prospective_delta - PI_TIMER_FREQ)
-                if deviation > PI_TIMER_FREQ // 2:
-                    # Outlier: skip Welford's but advance the anchor
-                    logging.warning(
-                        "⚠️ [clocks] Pi residual outlier rejected: "
-                        "delta=%d ticks (expected %d, deviation %d) — "
-                        "pps_poll likely skipped a second (seq=%d)",
-                        prospective_delta, PI_TIMER_FREQ, deviation, pi_seq,
-                    )
-                    _residual_pi.last_value = pi_counter_corrected
-                    _last_pi_seq = pi_seq
-                else:
-                    _residual_pi.update(pi_counter_corrected, PI_TIMER_FREQ)
-                    _last_pi_seq = pi_seq
-            else:
-                # First sample — just set the anchor
-                _residual_pi.update(pi_counter_corrected, PI_TIMER_FREQ)
-                _last_pi_seq = pi_seq
-        elif pi_seq is not None and pi_seq == _last_pi_seq:
-            logging.debug(
-                "⏱️ [clocks] Pi capture stale (seq=%d repeated) — skipping residual update",
-                pi_seq,
-            )
+    # ----------------------------------------------------------
+    # Update GNSS, DWT, and OCXO residual statistics (nanoseconds)
+    #
+    # These MUST be updated on EVERY fragment, even when the Pi
+    # capture is stale and we're about to skip the TIMEBASE.
+    # The Teensy data is always valid (it arrives with the fragment).
+    # If we only updated these after the stale guard, every skipped
+    # TIMEBASE would cause a 2-second gap, producing spurious
+    # outlier rejections on the next fragment.
+    #
+    # Pi residual is updated in on_pps_capture() — not here.
+    # ----------------------------------------------------------
+    frag = payload
+    gnss_ns = int(frag.get("gnss_ns") or 0)
+    dwt_ns = int(frag.get("dwt_ns") or 0)
+    ocxo_ns = int(frag.get("ocxo_ns") or 0)
+
+    if gnss_ns > 0:
+        _safe_residual_update(_residual_gnss, gnss_ns, NS_PER_SECOND, "GNSS")
+    if dwt_ns > 0:
+        _safe_residual_update(_residual_dwt, dwt_ns, NS_PER_SECOND, "DWT")
+    if ocxo_ns > 0:
+        _safe_residual_update(_residual_ocxo, ocxo_ns, NS_PER_SECOND, "OCXO")
+
+    # ----------------------------------------------------------
+    # Stale-capture guard: skip TIMEBASE if Pi data hasn't advanced
+    #
+    # If pi_seq matches the last seq we published, on_pps_capture()
+    # hasn't fired yet for this second.  Publishing now would put
+    # a stale pi_ns alongside an advanced gnss_ns, causing wild
+    # PPB oscillation.  Skip this TIMEBASE — the next fragment
+    # will have fresh Pi data.  This is not fatal: only the most
+    # recent TIMEBASE matters.  Teensy residuals (above) are
+    # already updated, so no data is lost.
+    # ----------------------------------------------------------
+    if pi_seq is not None and pi_seq == _last_fragment_pi_seq:
+        logging.debug(
+            "⏱️ [clocks] Pi capture stale for TIMEBASE (seq=%d repeated) — skipping",
+            pi_seq,
+        )
+        return
 
     # ----------------------------------------------------------
     # Build TIMEBASE record
     # ----------------------------------------------------------
-    frag = payload
-
     row = _get_active_campaign()
     if row is None:
         logging.warning("⚠️ [clocks] fragment received with no active campaign")
@@ -1047,27 +1189,17 @@ def on_timebase_fragment(payload: Payload) -> None:
     }
 
     # ----------------------------------------------------------
-    # Update GNSS, DWT, and OCXO residual statistics (nanoseconds)
-    # (Pi residual was already updated above from PITIMER capture)
-    # ----------------------------------------------------------
-    gnss_ns = int(frag.get("gnss_ns") or 0)
-    dwt_ns = int(frag.get("dwt_ns") or 0)
-    ocxo_ns = int(frag.get("ocxo_ns") or 0)
-
-    if gnss_ns > 0:
-        _residual_gnss.update(gnss_ns, NS_PER_SECOND)
-    if dwt_ns > 0:
-        _residual_dwt.update(dwt_ns, NS_PER_SECOND)
-    if ocxo_ns > 0:
-        _residual_ocxo.update(ocxo_ns, NS_PER_SECOND)
-
-    # ----------------------------------------------------------
     # Build augmented report
     # ----------------------------------------------------------
     report = _build_report(campaign, campaign_payload, timebase)
 
     # Publish sacred tuple
     publish("TIMEBASE", timebase)
+
+    # Record which pi_seq we just published so we can detect
+    # stale captures on the next fragment.
+    if pi_seq is not None:
+        _last_fragment_pi_seq = pi_seq
 
     # Persist best-effort (also denormalizes report into campaign)
     _persist_timebase(timebase, report)
@@ -1300,9 +1432,11 @@ def run() -> None:
     logging.info(
         "🕐 [clocks] Four tracked clocks: GNSS (Teensy 10MHz), "
         "DWT (Teensy 600MHz), OCXO (Teensy GPT1 10MHz), "
-        "Pi (CNTVCT_EL0 54MHz via PITIMER). "
+        "Pi (CNTVCT_EL0 54MHz via PPS_CAPTURE subscription). "
         "chrony-disciplined system time for sanity checking. "
-        "Pi TDC correction enabled (detect_ns → correction_ticks)."
+        "Pi TDC correction enabled (detect_ns → correction_ticks). "
+        "Outlier rejection on all clock domains (>50%% deviation → reject). "
+        "Pi residual computed in PPS_CAPTURE handler (decoupled from fragment timing)."
     )
 
     # ----------------------------------------------------------
@@ -1315,14 +1449,23 @@ def run() -> None:
         logging.exception("❌ [recovery] unhandled exception during recovery")
 
     # ----------------------------------------------------------
-    # Start server -- TIMEBASE_FRAGMENT subscription is the
-    # primary data path.
+    # Start server -- two subscriptions:
+    #   TIMEBASE_FRAGMENT: primary data path (Teensy -> Pi)
+    #   PPS_CAPTURE: Pi arch timer captures (PITIMER -> CLOCKS)
+    #
+    # PPS_CAPTURE replaces the old synchronous PITIMER.REPORT
+    # polling, eliminating beat-frequency aliasing between
+    # Teensy PPS and Pi PPS timing.
+    #
+    # Pi residual statistics are computed in on_pps_capture(),
+    # decoupled from fragment timing.
     # ----------------------------------------------------------
     server_setup(
         subsystem="CLOCKS",
         commands=COMMANDS,
         subscriptions={
             "TIMEBASE_FRAGMENT": on_timebase_fragment,
+            "PPS_CAPTURE": on_pps_capture,
         },
     )
 

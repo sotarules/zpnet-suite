@@ -12,8 +12,9 @@ Architecture:
     CNTVCT_EL0 and writes the result to stdout
   • This Python process spawns pps_poll as a subprocess, reads its
     output line by line, and stashes the latest capture
-  • The CLOCKS process calls PITIMER.REPORT via send_command when
-    a TIMEBASE_FRAGMENT arrives, receiving the most recent capture
+  • Each capture is published as PPS_CAPTURE on the ZPNet pub/sub
+    bus for consumption by CLOCKS (and any future subscribers)
+  • The REPORT command is retained for testing and recovery
 
 Pi-side TDC (time-to-digital converter):
   • chrony disciplines the system clock to ~39 ns of GNSS via PPS
@@ -29,7 +30,31 @@ Pi-side TDC (time-to-digital converter):
   • This is conceptually identical to the Teensy's software TDC:
     measure the detection delay, subtract it from the raw capture
 
-Diagnostic fields exposed in REPORT:
+Published message (PPS_CAPTURE):
+  Each second, PITIMER publishes:
+    {
+      "seq": 42,
+      "counter": 11510132462,
+      "corrected": 11510132460,
+      "delta": 54000409,
+      "residual": 409,
+      "residual_ns": 7574.074,
+      "detect_ns": 40,
+      "correction_ticks": 2,
+      "freq": 54000000,
+      "ns_per_tick": 18.519
+    }
+
+  This replaces the old polling model where CLOCKS called
+  PITIMER.REPORT synchronously on each TIMEBASE_FRAGMENT.
+  That created a beat-frequency aliasing problem: the Teensy PPS
+  and Pi PPS are slightly phase-offset, so every ~38 seconds the
+  synchronous poll would land on the wrong side of a capture
+  boundary, producing a 2-second delta (108M ticks).  Pub/sub
+  eliminates this: every capture is delivered exactly once, in
+  order, regardless of fragment timing.
+
+Diagnostic fields exposed in PPS_CAPTURE and REPORT:
   • counter           — raw CNTVCT_EL0 at detection moment
   • corrected         — counter minus detection latency (TDC-corrected)
   • delta             — ticks between consecutive corrected captures
@@ -50,7 +75,7 @@ Process model:
   • One systemd service (zpnet-pitimer)
   • Two execution contexts:
       1) Capture reader thread (reads pps_poll stdout)
-      2) Command socket server (serves REPORT)
+      2) Command socket server (serves REPORT, publishes PPS_CAPTURE)
 """
 
 from __future__ import annotations
@@ -62,7 +87,7 @@ import threading
 import time
 from typing import Any, Dict, Optional
 
-from zpnet.processes.processes import server_setup
+from zpnet.processes.processes import server_setup, publish
 from zpnet.shared.logger import setup_logging
 
 # ---------------------------------------------------------------------
@@ -218,10 +243,11 @@ def _parse_capture_line(line: str) -> Optional[Dict[str, Any]]:
 
 def _capture_reader(proc: subprocess.Popen) -> None:
     """
-    Read pps_poll stdout line by line and stash the latest capture.
+    Read pps_poll stdout line by line, stash the latest capture,
+    and publish each capture as PPS_CAPTURE on the pub/sub bus.
 
     Runs as a daemon thread. If pps_poll exits or crashes,
-    logs the error and attempts restart after a delay.
+    logs the error and the supervisor will restart it.
     """
     global _last_capture
 
@@ -231,8 +257,17 @@ def _capture_reader(proc: subprocess.Popen) -> None:
             capture = _parse_capture_line(line)
 
             if capture is not None:
+                # Build the full payload with freq metadata
+                payload = dict(capture)
+                payload["freq"] = PI_TIMER_FREQ
+                payload["ns_per_tick"] = round(NS_PER_TICK, 3)
+
+                # Stash for cmd_report (testing/recovery)
                 with _capture_lock:
-                    _last_capture = capture
+                    _last_capture = payload
+
+                # Publish to all subscribers (CLOCKS, etc.)
+                publish("PPS_CAPTURE", payload)
 
                 # Log periodically (every 60 captures ≈ once per minute)
                 if capture["seq"] % 60 == 0 and capture["delta"] is not None:
@@ -322,7 +357,9 @@ def cmd_report(_: Optional[dict]) -> Dict[str, Any]:
     """
     Return the most recent PPS capture from pps_poll.
 
-    Called by CLOCKS process when a TIMEBASE_FRAGMENT arrives.
+    Retained for testing and recovery (CLOCKS uses PPS_CAPTURE
+    subscription during normal operation, but falls back to
+    PITIMER.REPORT during recovery before subscriptions are active).
 
     Returns:
       {
@@ -354,14 +391,10 @@ def cmd_report(_: Optional[dict]) -> Dict[str, Any]:
             },
         }
 
-    payload = dict(capture)
-    payload["freq"] = PI_TIMER_FREQ
-    payload["ns_per_tick"] = round(NS_PER_TICK, 3)
-
     return {
         "success": True,
         "message": "OK",
-        "payload": payload,
+        "payload": dict(capture),
     }
 
 
@@ -380,15 +413,17 @@ def run() -> None:
 
     Execution contexts:
       1) pps_poll supervisor thread (spawns + monitors C subprocess)
-      2) Capture reader thread (reads stdout, stashes captures)
-      3) Command socket server (serves REPORT to CLOCKS)
+      2) Capture reader thread (reads stdout, stashes captures,
+         publishes PPS_CAPTURE)
+      3) Command socket server (serves REPORT for testing/recovery)
     """
     setup_logging()
 
     logging.info(
         "⏱️ [pitimer] starting — Pi arch timer PPS capture via chrony polling. "
         "freq=%d Hz, %.3f ns/tick, isolated core %d. "
-        "TDC correction enabled (detect_ns → correction_ticks).",
+        "TDC correction enabled (detect_ns → correction_ticks). "
+        "Publishing PPS_CAPTURE on each capture.",
         PI_TIMER_FREQ,
         NS_PER_TICK,
         ISOLATED_CORE,
