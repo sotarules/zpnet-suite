@@ -4,7 +4,7 @@
 #include <cstddef>
 
 #define ZPNET_SERIAL Serial
-#define FW_VERSION_STR "zpnet-teensy-5.1.1"
+#define FW_VERSION_STR "zpnet-teensy-5.1.2"
 static constexpr const char* FW_VERSION = FW_VERSION_STR;
 
 // -------------------------------------------------------------
@@ -86,6 +86,25 @@ static const int GNSS_VCLK_PIN = 14;
 static const int GNSS_LOCK_PIN = 4;
 
 static const int GNSS_PPS_RELAY = 32;
+
+// --------------------------------------------------------------
+// OCXO control pin (DAC output)
+// --------------------------------------------------------------
+//
+// OCXO_CTL_PIN:
+//   Teensy DAC output (A22, pin 22) driving AOCJY1-A Pin 1 (CTL).
+//   0–3.3V analog output for frequency trim.
+//   12-bit resolution (0–4095).
+//   Positive pull slope: higher voltage = higher frequency.
+//
+static const int OCXO_CTL_PIN = A22;
+
+// Default DAC value at boot (midpoint = ~1.65V)
+static constexpr uint32_t OCXO_DAC_DEFAULT = 2048;
+
+// DAC limits
+static constexpr uint32_t OCXO_DAC_MIN = 0;
+static constexpr uint32_t OCXO_DAC_MAX = 4095;
 
 // --------------------------------------------------------------
 // Event bus sizing (authoritative)

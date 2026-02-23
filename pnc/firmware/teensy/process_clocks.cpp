@@ -103,6 +103,27 @@
 //   Result: PPS edge timestamped to ±1 DWT cycle (1.67 ns)
 //   on a $30 microcontroller.  0.04% CPU cost.
 //
+// OCXO DAC Control:
+//
+//   The AOCJY1-A OCXO frequency is trimmed via Pin 1 (CTL),
+//   driven by Teensy DAC on pin 22 (A22).  12-bit resolution,
+//   0–3.3V output directly connected to the OCXO's 10 kΩ
+//   control input.
+//
+//   The DAC is initialized at boot to a default midpoint value.
+//   The current DAC value is always published in TIMEBASE_FRAGMENT
+//   regardless of campaign or calibration state.
+//
+//   Optional calibration servo: when a campaign is started with
+//   the calibrate_ocxo flag, a software servo adjusts the DAC
+//   to drive the OCXO residual toward zero (tau → 1.0).  The
+//   servo uses coarse-then-fine stepping with sign-change
+//   detection for convergence.
+//
+//   The Pi persists the converged DAC value and sends it back
+//   via set_dac on subsequent campaign starts.  The Teensy
+//   never remembers anything across reboots.
+//
 // ============================================================================
 
 #include "debug.h"
@@ -147,6 +168,52 @@ static uint64_t recover_ocxo_ns    = 0;
 
 // Campaign-scoped PPS second counter
 static uint64_t campaign_seconds = 0;
+
+// ============================================================================
+// OCXO DAC Control (Teensy pin 22 / A22 → OCXO CTL pin)
+// ============================================================================
+//
+// The DAC is initialized at boot and always active.
+// The current DAC value is published in every TIMEBASE_FRAGMENT.
+//
+// Calibration mode: when calibrate_ocxo_active is true, the PPS
+// callback runs a servo loop that adjusts the DAC to drive the
+// OCXO tau toward 1.0.
+//
+// The servo uses a two-phase approach:
+//
+//   Phase 1 (coarse): Step by SERVO_COARSE_STEP until the residual
+//   sign changes (we've crossed the zero point).
+//
+//   Phase 2 (fine): Reverse direction and halve step size on each
+//   sign change, continue until step size reaches 0.  Then hold.
+//
+// The servo waits SERVO_SETTLE_SECONDS after each DAC change for
+// the OCXO crystal to stabilize before evaluating the result.
+// After each change, the Welford stats are reset so only
+// post-change data informs the next decision.
+//
+
+static uint32_t ocxo_dac_value = OCXO_DAC_DEFAULT;
+
+// Calibration state
+static bool     calibrate_ocxo_active = false;
+static int32_t  servo_step            = 0;       // current step size (signed = direction)
+static int32_t  servo_last_residual   = 0;       // last mean residual used for decision
+static uint32_t servo_settle_count    = 0;       // PPS cycles since last DAC change
+static bool     servo_converged       = false;   // true when step size reached 0 and held
+
+// Servo tuning constants
+static constexpr int32_t  SERVO_COARSE_STEP    = 64;   // initial DAC step size
+static constexpr uint32_t SERVO_SETTLE_SECONDS = 5;    // seconds to wait after DAC change
+static constexpr uint32_t SERVO_MIN_SAMPLES    = 10;   // minimum residual samples before acting
+
+// Helper: write DAC value, clamped to valid range
+static void ocxo_dac_write(uint32_t value) {
+  if (value > OCXO_DAC_MAX) value = OCXO_DAC_MAX;
+  ocxo_dac_value = value;
+  analogWrite(OCXO_CTL_PIN, ocxo_dac_value);
+}
 
 // ============================================================================
 // PPS relay to Pi — 500 ms pulse on GNSS_PPS_RELAY (pin 32)
@@ -581,6 +648,83 @@ static void clocks_zero_all(void) {
 }
 
 // ============================================================================
+// OCXO Calibration Servo
+// ============================================================================
+//
+// Called once per PPS from the ASAP callback, only when
+// calibrate_ocxo_active is true and campaign is STARTED.
+//
+// Uses the callback-level OCXO residual (Welford) because it provides
+// a running mean that filters single-sample noise.
+//
+// The servo adjusts ocxo_dac_value to drive the mean OCXO residual
+// toward zero (i.e., OCXO runs at exactly 10 MHz relative to GNSS).
+//
+// Pull slope is positive: higher voltage = higher frequency.
+// So: negative mean (slow) → increase DAC, positive mean (fast) → decrease.
+//
+
+static void ocxo_calibration_servo(void) {
+
+  if (!calibrate_ocxo_active) return;
+  if (servo_converged) return;
+
+  // Wait for enough samples to have a meaningful mean
+  if (residual_ocxo.n < SERVO_MIN_SAMPLES) return;
+
+  // Wait for the OCXO to settle after the last DAC change
+  servo_settle_count++;
+  if (servo_settle_count < SERVO_SETTLE_SECONDS) return;
+
+  // Read the current mean residual (ticks per PPS interval).
+  // Negative = OCXO running slow, positive = running fast.
+  int32_t mean_residual = (int32_t)residual_ocxo.mean;
+
+  // Initialize servo direction on first decision
+  if (servo_step == 0) {
+    if (mean_residual < 0) {
+      servo_step = SERVO_COARSE_STEP;   // need higher frequency → increase voltage
+    } else if (mean_residual > 0) {
+      servo_step = -SERVO_COARSE_STEP;  // need lower frequency → decrease voltage
+    } else {
+      // Already at zero — hold
+      servo_converged = true;
+      return;
+    }
+  }
+
+  // Detect zero crossing (sign change in residual vs last decision)
+  bool sign_changed = (mean_residual > 0 && servo_last_residual < 0) ||
+                      (mean_residual < 0 && servo_last_residual > 0);
+
+  if (sign_changed) {
+    // Crossed the target — reverse direction and halve step size
+    servo_step = -(servo_step / 2);
+
+    // If step size collapsed to zero, we're done
+    if (servo_step == 0) {
+      servo_converged = true;
+      return;
+    }
+  }
+
+  servo_last_residual = mean_residual;
+
+  // Apply the step
+  int32_t new_dac = (int32_t)ocxo_dac_value + servo_step;
+  if (new_dac < (int32_t)OCXO_DAC_MIN) new_dac = (int32_t)OCXO_DAC_MIN;
+  if (new_dac > (int32_t)OCXO_DAC_MAX) new_dac = (int32_t)OCXO_DAC_MAX;
+
+  ocxo_dac_write((uint32_t)new_dac);
+
+  // Reset settle counter — wait for OCXO to respond
+  servo_settle_count = 0;
+
+  // Reset Welford stats so the next decision uses only post-change data
+  residual_reset(residual_ocxo);
+}
+
+// ============================================================================
 // Pre-PPS dispatch latency profiling — two-stage spin loop
 // ============================================================================
 //
@@ -808,6 +952,9 @@ static void pps_isr(void) {
         timepop_cancel(TIMEPOP_CLASS_PRE_PPS);
         dispatch_shadow_valid = false;
         pps_fired = true;  // break spin loop if it's running
+
+        // Stop calibration servo (DAC value is preserved)
+        calibrate_ocxo_active = false;
       }
 
       if (request_recover) {
@@ -971,6 +1118,12 @@ static void pps_isr(void) {
         residual_update(residual_ocxo, snap_ocxo_ticks, OCXO_EXPECTED_PER_PPS);
 
         // --------------------------------------------------------
+        // OCXO calibration servo (if active)
+        // --------------------------------------------------------
+
+        ocxo_calibration_servo();
+
+        // --------------------------------------------------------
         // Publish TIMEBASE_FRAGMENT
         // --------------------------------------------------------
 
@@ -1019,6 +1172,11 @@ static void pps_isr(void) {
         p.add("pps_edge_valid",         pps_edge_valid);
         p.add("pps_edge_correction_ns", pps_edge_correction_ns);
 
+        // OCXO DAC control state (always present, unconditional)
+        p.add("ocxo_dac",              ocxo_dac_value);
+        p.add("calibrate_ocxo",        calibrate_ocxo_active);
+        p.add("servo_converged",        servo_converged);
+
         // Dispatch profiling diagnostics
         p.add("diag_coarse_fires",   diag_coarse_fire_count);
         p.add("diag_fine_fires",     diag_fine_fire_count);
@@ -1064,11 +1222,40 @@ static Payload cmd_start(const Payload& args) {
   }
 
   safeCopy(campaign_name, sizeof(campaign_name), name);
+
+  // ----------------------------------------------------------
+  // Optional: set_dac — apply a known DAC value immediately.
+  // The Pi persists the last good DAC value and sends it back
+  // on campaign start so the Teensy doesn't have to remember.
+  // ----------------------------------------------------------
+  uint32_t dac_val;
+  if (args.tryGetUInt("set_dac", dac_val)) {
+    ocxo_dac_write(dac_val);
+  }
+
+  // ----------------------------------------------------------
+  // Optional: calibrate_ocxo — enable servo loop.
+  // When present (any value or no value), the servo will
+  // iteratively adjust the DAC to drive OCXO tau toward 1.0.
+  // Can be combined with set_dac to start near a known-good
+  // value and fine-tune from there.
+  // ----------------------------------------------------------
+  calibrate_ocxo_active = args.has("calibrate_ocxo");
+
+  if (calibrate_ocxo_active) {
+    servo_step          = 0;
+    servo_last_residual = 0;
+    servo_settle_count  = 0;
+    servo_converged     = false;
+  }
+
   request_start = true;
   request_stop  = false;
 
   Payload p;
   p.add("status", "start_requested");
+  p.add("ocxo_dac", ocxo_dac_value);
+  p.add("calibrate_ocxo", calibrate_ocxo_active);
   return p;
 }
 
@@ -1096,6 +1283,12 @@ static Payload cmd_recover(const Payload& args) {
   recover_dwt_cycles = strtoull(s_dwt,  nullptr, 10);
   recover_gnss_ns    = strtoull(s_gnss, nullptr, 10);
   recover_ocxo_ns    = strtoull(s_ocxo, nullptr, 10);
+
+  // Restore DAC value if provided (Pi persists this)
+  uint32_t dac_val;
+  if (args.tryGetUInt("set_dac", dac_val)) {
+    ocxo_dac_write(dac_val);
+  }
 
   request_recover = true;
   request_start   = false;
@@ -1196,6 +1389,13 @@ static Payload cmd_report(const Payload&) {
   p.add("pps_edge_valid",         pps_edge_valid);
   p.add("pps_edge_correction_ns", pps_edge_correction_ns);
 
+  // OCXO DAC control state
+  p.add("ocxo_dac",              ocxo_dac_value);
+  p.add("calibrate_ocxo",        calibrate_ocxo_active);
+  p.add("servo_converged",        servo_converged);
+  p.add("servo_step",             servo_step);
+  p.add("servo_settle_count",     servo_settle_count);
+
   // Dispatch profiling diagnostics
   p.add("diag_coarse_fires",   diag_coarse_fire_count);
   p.add("diag_fine_fires",     diag_fine_fire_count);
@@ -1260,6 +1460,12 @@ void process_clocks_register(void) {
 // ============================================================================
 
 void process_clocks_init(void) {
+
+  // OCXO DAC control output (pin 22 / A22)
+  // Initialize before clock capture so the OCXO starts receiving
+  // a defined control voltage immediately.
+  analogWriteResolution(12);
+  ocxo_dac_write(OCXO_DAC_DEFAULT);
 
   dwt_enable();
   arm_gpt2_external();    // GNSS VCLOCK -> GPT2 pin 14, raw 10 MHz, polled
