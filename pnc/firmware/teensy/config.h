@@ -97,7 +97,7 @@ static const int GNSS_PPS_RELAY = 32;
 //   12-bit resolution (0–4095).
 //   Positive pull slope: higher voltage = higher frequency.
 //
-static const int OCXO_CTL_PIN = A22;
+static const int OCXO_CTL_PIN = 22;
 
 // Default DAC value at boot (midpoint = ~1.65V)
 static constexpr uint32_t OCXO_DAC_DEFAULT = 2048;
