@@ -26,6 +26,31 @@
 // At 10 MHz the GPT counters wrap every ~429 seconds (~7 minutes).
 // The 1-second PPS publish guarantees we read them well before wrap.
 //
+// 64-bit extension architecture:
+//
+//   Each clock domain has exactly ONE function that touches the
+//   64-bit accumulator: clocks_xxx_now().  This function:
+//     1) Reads the live 32-bit hardware register
+//     2) Computes (uint32_t)(now - last_32) — always positive,
+//        wrap-safe as long as called within 2^31 ticks
+//     3) Adds the delta to the 64-bit accumulator
+//     4) Updates last_32
+//     5) Returns the 64-bit value
+//
+//   This function can be called from ANY context at ANY time:
+//   ISR, callback, command handler, diagnostic.  Multiple calls
+//   per PPS interval are harmless — each just ratchets forward.
+//
+//   To obtain the 64-bit value at a PAST moment (e.g., the PPS
+//   edge captured in the ISR), the PPS callback:
+//     1) Calls _now() to advance the accumulator to the present
+//     2) Computes (uint32_t)(last_32 - isr_snapshot) to get the
+//        small number of ticks between the snapshot and now
+//     3) Subtracts from the 64-bit value: snap_64 = now_64 - delta
+//
+//   This subtraction is always safe because the delta is small
+//   (microseconds between ISR and callback) and unambiguous.
+//
 // ISR-level hardware snapshot and raw residuals:
 //
 //   All three hardware counters (DWT_CYCCNT, GPT2_CNT, GPT1_CNT)
@@ -467,6 +492,38 @@ static inline double residual_stderr(const pps_residual_t& r) {
 }
 
 // ============================================================================
+// 64-bit Clock Extension — Unified Architecture
+// ============================================================================
+//
+// Each clock domain has exactly ONE state pair: {ticks_64, last_32}.
+// Exactly ONE function mutates this state: clocks_xxx_now().
+//
+// clocks_xxx_now() reads the LIVE hardware register, computes the
+// unsigned 32-bit delta from last_32, accumulates into ticks_64,
+// and updates last_32.  This is safe to call from ANY context
+// (ISR, callback, command handler, diagnostic) at ANY time, with
+// no ordering constraints.
+//
+// The only requirement is that it be called at least once per
+// 2^31 ticks of the hardware counter (to avoid wrap ambiguity):
+//   DWT  @ 600 MHz: every ~3.58 seconds
+//   GNSS @  10 MHz: every ~214 seconds
+//   OCXO @  10 MHz: every ~214 seconds
+//
+// The 1-second PPS callback satisfies this with enormous margin.
+//
+// To compute the 64-bit value at a PAST moment (the PPS edge
+// captured in the ISR), the callback:
+//   1) Calls _now() to advance to the present
+//   2) Computes (uint32_t)(last_32 - isr_snap) — the small
+//      positive tick count between snapshot and present
+//   3) Subtracts: snap_64 = now_64 - rewind
+//
+// This "advance then rewind" pattern is always safe because the
+// rewind is bounded (microseconds between ISR and callback).
+//
+
+// ============================================================================
 // DWT (CPU cycle counter — 600 MHz internal)
 // ============================================================================
 
@@ -491,12 +548,6 @@ uint64_t clocks_dwt_cycles_now(void) {
   uint32_t now = DWT_CYCCNT;
   dwt_cycles_64 += (uint32_t)(now - dwt_last_32);
   dwt_last_32 = now;
-  return dwt_cycles_64;
-}
-
-static uint64_t dwt_extend_snapshot(uint32_t snap) {
-  dwt_cycles_64 += (uint32_t)(snap - dwt_last_32);
-  dwt_last_32 = snap;
   return dwt_cycles_64;
 }
 
@@ -545,12 +596,6 @@ uint64_t clocks_gnss_ticks_now(void) {
   return gnss_ticks_64;
 }
 
-static uint64_t gnss_extend_snapshot(uint32_t snap) {
-  gnss_ticks_64 += (uint32_t)(snap - gnss_last_32);
-  gnss_last_32 = snap;
-  return gnss_ticks_64;
-}
-
 uint64_t clocks_gnss_ns_now(void) {
   if (campaign_state != clocks_campaign_state_t::STARTED) return 0;
   return clocks_gnss_ticks_now() * 100ull;
@@ -593,22 +638,59 @@ uint64_t clocks_ocxo_ticks_now(void) {
   return ocxo_ticks_64;
 }
 
-static uint64_t ocxo_extend_snapshot(uint32_t snap) {
-  ocxo_ticks_64 += (uint32_t)(snap - ocxo_last_32);
-  ocxo_last_32 = snap;
-  return ocxo_ticks_64;
-}
-
 uint64_t clocks_ocxo_ns_now(void) {
   if (campaign_state != clocks_campaign_state_t::STARTED) return 0;
   return clocks_ocxo_ticks_now() * 100ull;
 }
 
 // ============================================================================
+// Advance-then-rewind: recover 64-bit value at a past ISR snapshot
+// ============================================================================
+//
+// Each of these calls the domain's _now() to advance the accumulator
+// to the present, then rewinds by the small delta between the ISR
+// snapshot and the current register value.
+//
+// This is the ONLY way to obtain the 64-bit value at the PPS edge.
+// The _now() call is always safe and always moves forward.
+// The rewind is always a small positive number (< 1 second of ticks).
+//
+
+static uint64_t dwt_at_pps_edge(void) {
+  uint64_t now_64 = clocks_dwt_cycles_now();
+  uint32_t rewind = (uint32_t)(dwt_last_32 - isr_snap_dwt);
+  return now_64 - rewind;
+}
+
+static uint64_t gnss_at_pps_edge(void) {
+  uint64_t now_64 = clocks_gnss_ticks_now();
+  uint32_t rewind = (uint32_t)(gnss_last_32 - isr_snap_gnss);
+  return now_64 - rewind;
+}
+
+static uint64_t ocxo_at_pps_edge(void) {
+  uint64_t now_64 = clocks_ocxo_ticks_now();
+  uint32_t rewind = (uint32_t)(ocxo_last_32 - isr_snap_ocxo);
+  return now_64 - rewind;
+}
+
+// ============================================================================
 // Zeroing (campaign-scoped — fresh start only, NOT used for recovery)
 // ============================================================================
+//
+// Zeroing must leave last_32 pointing at the ISR snapshot so that
+// the next _now() call correctly computes the delta from the PPS
+// edge.  The 64-bit accumulator starts at 0 — meaning "zero ticks
+// have elapsed since campaign start."
+//
 
 static void clocks_zero_all(void) {
+  // Advance accumulators to present first (safe, monotonic)
+  clocks_dwt_cycles_now();
+  clocks_gnss_ticks_now();
+  clocks_ocxo_ticks_now();
+
+  // Zero the accumulators, anchor last_32 at the ISR snapshot
   dwt_cycles_64 = 0;
   dwt_last_32   = isr_snap_dwt;
 
@@ -833,9 +915,9 @@ static void pre_pps_arm(void) {
 //
 //   Phase 2 (timepop ASAP callback): Arm the relay deassert
 //   timer first (always, regardless of campaign state), then
-//   extend snapshots to 64-bit, process state transitions,
-//   compute Welford statistics, build and publish the
-//   TIMEBASE_FRAGMENT.
+//   use advance-then-rewind to recover 64-bit values at the
+//   PPS edge, process state transitions, compute Welford
+//   statistics, build and publish the TIMEBASE_FRAGMENT.
 //
 
 static volatile bool pps_scheduled = false;
@@ -912,7 +994,7 @@ static void pps_isr(void) {
   isr_prev_gnss = snap_gnss;
   isr_prev_ocxo = snap_ocxo;
 
-  // Store for callback's 64-bit extension
+  // Store for callback's advance-then-rewind
   isr_snap_dwt  = snap_dwt;
   isr_snap_gnss = snap_gnss;
   isr_snap_ocxo = snap_ocxo;
@@ -958,13 +1040,17 @@ static void pps_isr(void) {
       }
 
       if (request_recover) {
+        // Load projected values into accumulators.
+        // Anchor last_32 at the ISR snapshot so the next _now()
+        // call correctly accumulates from the PPS edge forward.
         dwt_cycles_64 = recover_dwt_cycles;
-        gnss_ticks_64 = recover_gnss_ns / 100ull;
-        ocxo_ticks_64 = recover_ocxo_ns / 100ull;
+        dwt_last_32   = isr_snap_dwt;
 
-        dwt_last_32  = isr_snap_dwt;
-        gnss_last_32 = isr_snap_gnss;
-        ocxo_last_32 = isr_snap_ocxo;
+        gnss_ticks_64 = recover_gnss_ns / 100ull;
+        gnss_last_32  = isr_snap_gnss;
+
+        ocxo_ticks_64 = recover_ocxo_ns / 100ull;
+        ocxo_last_32  = isr_snap_ocxo;
 
         campaign_seconds = recover_gnss_ns / 1000000000ull;
 
@@ -1033,15 +1119,26 @@ static void pps_isr(void) {
         pps_fired = false;
 
         // --------------------------------------------------------
-        // Extend ISR snapshots to 64-bit
+        // Recover 64-bit values at the PPS edge
+        //
+        // Uses advance-then-rewind: each _at_pps_edge() call
+        // first advances the accumulator to the present via
+        // _now(), then rewinds by the small delta between the
+        // live register and the ISR snapshot.
+        //
+        // This is safe regardless of any intervening _now()
+        // calls (e.g. from cmd_report) because _now() only
+        // moves forward, and the rewind is always the correct
+        // small positive offset from isr_snap to last_32.
         // --------------------------------------------------------
 
-        const uint64_t snap_dwt_cycles = dwt_extend_snapshot(isr_snap_dwt);
-        const uint64_t snap_dwt_ns     = (snap_dwt_cycles * 5ull) / 3ull;
-        const uint64_t snap_gnss_ticks = gnss_extend_snapshot(isr_snap_gnss);
-        const uint64_t snap_gnss_ns    = snap_gnss_ticks * 100ull;
-        const uint64_t snap_ocxo_ticks = ocxo_extend_snapshot(isr_snap_ocxo);
-        const uint64_t snap_ocxo_ns    = snap_ocxo_ticks * 100ull;
+        const uint64_t snap_dwt_cycles = dwt_at_pps_edge();
+        const uint64_t snap_gnss_ticks = gnss_at_pps_edge();
+        const uint64_t snap_ocxo_ticks = ocxo_at_pps_edge();
+
+        const uint64_t snap_dwt_ns  = (snap_dwt_cycles * 5ull) / 3ull;
+        const uint64_t snap_gnss_ns = snap_gnss_ticks * 100ull;
+        const uint64_t snap_ocxo_ns = snap_ocxo_ticks * 100ull;
 
         // --------------------------------------------------------
         // Pre-PPS dispatch latency and Software TDC correction.
@@ -1077,9 +1174,9 @@ static void pps_isr(void) {
           if (correction >= 0) {
             // Valid correction: reconstruct the true PPS edge.
             //
-            // The 64-bit accumulator was advanced by isr_snap_dwt.
-            // The correction is: edge = isr - (delta - correction)
-            // = isr - overhead.  In 64-bit space:
+            // The snap_dwt_cycles is the 64-bit value at the ISR
+            // snapshot.  The correction tells us the ISR was
+            // (overhead) cycles after the true PPS edge:
             uint32_t overhead_cycles = delta_cycles - (uint32_t)correction;
             pps_dwt_cycles       = snap_dwt_cycles - overhead_cycles;
             pps_dwt_ns           = (pps_dwt_cycles * 5ull) / 3ull;
@@ -1334,6 +1431,13 @@ static void report_residual(Payload& p,
 // ============================================================================
 // REPORT — diagnostic introspection only
 // ============================================================================
+//
+// cmd_report calls _now() for each domain.  This is always safe:
+// _now() advances the accumulator forward monotonically.  The PPS
+// callback's advance-then-rewind is unaffected because the rewind
+// is computed from (last_32 - isr_snap), which is correct regardless
+// of how many times _now() has been called in between.
+//
 
 static Payload cmd_report(const Payload&) {
 
@@ -1355,6 +1459,9 @@ static Payload cmd_report(const Payload&) {
   p.add("request_stop",    request_stop);
   p.add("request_recover", request_recover);
 
+  // These _now() calls are always safe — they advance the
+  // accumulator forward monotonically.  No interaction with
+  // the PPS callback's advance-then-rewind pattern.
   const uint64_t dwt_cycles = clocks_dwt_cycles_now();
   const uint64_t dwt_ns     = clocks_dwt_ns_now();
   const uint64_t gnss_ns    = clocks_gnss_ns_now();
