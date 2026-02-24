@@ -3,7 +3,7 @@ ZPNet CLOCKS Process — TIMEBASE Authority (Pi-side)
 
 Responsibilities:
   * Receive TIMEBASE_FRAGMENT from Teensy
-  * Fetch correlated Pi capture from PITIMER by GNSS time key
+  * Fetch correlated Pi capture from PITIMER by system clock key
   * Augment fragment with Pi capture, GNSS time, and system time
   * Publish TIMEBASE
   * Persist TIMEBASE to PostgreSQL (append-only, best-effort)
@@ -22,31 +22,26 @@ Four tracked clocks:
     via Teensy GPT1 external clock input (~100 ns quantization)
 
 Pi clock correlation model:
-  * CLOCKS is the single sequencer for TIMEBASE construction
-  * When a TIMEBASE_FRAGMENT arrives from Teensy:
-    1) CLOCKS calls GNSS.GET_TIME to get the ISO8601 Zulu label
-       for the PPS edge that triggered this fragment
-    2) CLOCKS calls PITIMER.REPORT with gnss_time=<label> to
-       fetch the Pi capture for that same PPS edge
-    3) PITIMER returns the matching capture from its ring buffer,
-       or returns success=False if no match exists
-    4) A match failure is a hard fault — CLOCKS logs a warning
-       with full PITIMER diagnostics and skips that TIMEBASE
-  * The GNSS time label is an opaque correlation key, not a
-    timestamp for arithmetic.  Both PITIMER and CLOCKS read the
-    same cached NMEA value within milliseconds of PPS, so they
-    always agree on which second just happened.
-  * This replaces the previous pub/sub model which had no
-    correlation guarantee — the fragment and capture could
-    arrive from different PPS edges, causing Pi PPB spikes.
+  * Both PITIMER and CLOCKS derive their correlation key from
+    the chrony-disciplined system clock via system_time_z()
+  * pps_poll detects the second boundary from clock_gettime and
+    stores the capture keyed by system_time_z() — within
+    milliseconds of PPS
+  * When a TIMEBASE_FRAGMENT arrives from Teensy (tens of ms
+    after PPS, due to USB serial latency), CLOCKS calls
+    system_time_z() to get the same key, then fetches the
+    matching capture from PITIMER via REPORT(gnss_time=<key>)
+  * Both sides read the same local clock within the same UTC
+    second — no IPC to GNSS, no NMEA cache race, no latency
+    window where the key could change
+  * A match failure is a hard fault — CLOCKS logs a warning
+    with full PITIMER diagnostics and skips that TIMEBASE
 
-  NOTE: Previous versions used a PPS_CAPTURE subscription from
-  PITIMER.  This created an identity problem: nothing guaranteed
-  that the buffered capture and the arriving fragment corresponded
-  to the same PPS edge.  When they didn't (due to timing races),
-  pi_ns would be off by one second, producing PPB spikes of ~1M.
-  The GNSS-time-keyed request/response model eliminates this
-  entirely: correlation is by physical truth, not by hope.
+  NOTE: Previous versions called GNSS.GET_TIME for the correlation
+  key.  The NMEA cache would be overwritten with the next second's
+  forecast before CLOCKS could read it, causing systematic one-
+  second mismatches.  Using the system clock eliminates this
+  entirely.
 
 Pi TDC diagnostics in TIMEBASE:
   * diag_pi_raw_counter     — raw CNTVCT_EL0 at detection moment
@@ -123,6 +118,7 @@ from zpnet.processes.processes import (
 from zpnet.shared.constants import Payload
 from zpnet.shared.db import open_db
 from zpnet.shared.logger import setup_logging
+from zpnet.shared.util import system_time_z
 
 # ---------------------------------------------------------------------
 # Configuration
@@ -252,15 +248,6 @@ class _PpsResidual:
 
 # ---------------------------------------------------------------------
 # Outlier-safe residual update
-#
-# Wraps _PpsResidual.update() with a deviation guard that rejects
-# any delta deviating from expected by more than 50%.  This prevents
-# a single glitch (recovery discontinuity, skipped PPS, Teensy
-# hiccup, or stale capture) from permanently corrupting the Welford
-# running statistics.
-#
-# When an outlier is rejected, last_value is still advanced so
-# the NEXT delta starts fresh from the current reading.
 # ---------------------------------------------------------------------
 
 def _safe_residual_update(
@@ -329,24 +316,33 @@ _residual_ocxo = _PpsResidual()
 # Helpers
 # ---------------------------------------------------------------------
 
-def _get_pitimer_capture_by_time(gnss_time: str) -> Optional[Dict[str, Any]]:
+def _get_pitimer_capture_by_time(time_key: str) -> Optional[Dict[str, Any]]:
     """
-    Fetch the Pi arch timer capture for a specific GNSS time from PITIMER.
+    Fetch the Pi arch timer capture for a specific time key from PITIMER.
 
     This is the primary correlation path.  PITIMER maintains a ring
-    buffer of the last 60 captures indexed by GNSS time.  We request
-    the capture matching the same PPS edge that triggered the Teensy
-    fragment.
+    buffer of captures indexed by system_time_z().  We request the
+    capture matching the same UTC second as this fragment.
+
+    Both PITIMER and CLOCKS derive the key from the same chrony-
+    disciplined system clock, so the keys are guaranteed to match
+    as long as both sides are within the same UTC second — which
+    they always are (pps_poll stores within ms of PPS, fragment
+    arrives tens of ms later via USB).
 
     Returns the PITIMER REPORT payload on match, or None on mismatch.
     On mismatch, logs a warning with full PITIMER diagnostics.
     """
     try:
+
+        # Give time for zpnet-pitimer to recognize the PPS capture and store it in the ring buffer.
+        time.sleep(0.100)
+
         resp = send_command(
             machine="PI",
             subsystem="PITIMER",
             command="REPORT",
-            args={"gnss_time": gnss_time},
+            args={"gnss_time": time_key},
         )
 
         if resp.get("success"):
@@ -355,17 +351,17 @@ def _get_pitimer_capture_by_time(gnss_time: str) -> Optional[Dict[str, Any]]:
         # Correlation failure — hard fault
         pitimer_payload = resp.get("payload", {})
         logging.warning(
-            "🚨 [clocks] PITIMER correlation FAILED for gnss_time=%s — "
+            "🚨 [clocks] PITIMER correlation FAILED for time_key=%s — "
             "PITIMER response: %s",
-            gnss_time,
+            time_key,
             json.dumps(pitimer_payload, indent=2),
         )
         return None
 
     except Exception:
         logging.exception(
-            "🚨 [clocks] PITIMER.REPORT IPC failed for gnss_time=%s",
-            gnss_time,
+            "🚨 [clocks] PITIMER.REPORT IPC failed for time_key=%s",
+            time_key,
         )
         return None
 
@@ -405,27 +401,6 @@ def _ticks_to_ns(ticks: int) -> int:
     return (ticks * NS_PER_SECOND) // PI_TIMER_FREQ
 
 
-def _get_gnss_time() -> Optional[str]:
-    """
-    Fetch the GNSS time correlation key via GNSS.GET_TIME.
-
-    Returns ISO8601 Zulu string (e.g. "2026-02-23T21:45:07Z")
-    or None if GNSS time is not yet available.
-    """
-    try:
-        resp = send_command(
-            machine="PI",
-            subsystem="GNSS",
-            command="GET_TIME",
-        )
-        if resp.get("success"):
-            return resp["payload"]["gnss_time"]
-        return None
-    except Exception:
-        logging.warning("⚠️ [clocks] GNSS.GET_TIME failed")
-        return None
-
-
 def _wait_for_gnss_time() -> str:
     """
     Patiently wait for the GNSS receiver to produce a valid timestamp.
@@ -435,6 +410,8 @@ def _wait_for_gnss_time() -> str:
     every GNSS_POLL_INTERVAL seconds and logs a "still waiting"
     message every GNSS_WAIT_LOG_INTERVAL seconds.
 
+    Used only during recovery.
+
     Returns ISO8601 Z string once available.
     Never times out -- the math works regardless of how long
     the wait is.
@@ -443,9 +420,16 @@ def _wait_for_gnss_time() -> str:
     last_log = wait_start
 
     while True:
-        gnss_time = _get_gnss_time()
-        if gnss_time is not None:
-            return gnss_time
+        try:
+            resp = send_command(
+                machine="PI",
+                subsystem="GNSS",
+                command="GET_TIME",
+            )
+            if resp.get("success"):
+                return resp["payload"]["gnss_time"]
+        except Exception:
+            pass
 
         now = time.monotonic()
         elapsed = now - wait_start
@@ -680,6 +664,10 @@ def _recover_campaign() -> None:
     NOTE: Recovery uses _get_pitimer_capture_via_command() (unkeyed)
     because correlated captures are not needed during recovery —
     we just need the latest counter value to compute the Pi epoch.
+
+    NOTE: Recovery still uses GNSS.GET_TIME for elapsed time
+    computation (needs actual GNSS time for datetime arithmetic).
+    Normal operation uses system_time_z() for correlation keys.
     """
     global _campaign_active, _pi_tick_epoch, _pi_tick_epoch_set
 
@@ -803,8 +791,12 @@ def _recover_campaign() -> None:
 
     # ----------------------------------------------------------
     # 5) Capture GNSS time and PITIMER counter
+    #
+    # Use system_time_z() for the current time — it's the same
+    # disciplined clock, and we only need it to compute elapsed
+    # seconds (not for correlation).
     # ----------------------------------------------------------
-    gnss_time_now_str = _get_gnss_time()
+    gnss_time_now_str = system_time_z()
     gnss_time_now = datetime.fromisoformat(
         gnss_time_now_str.replace("Z", "+00:00")
     )
@@ -815,7 +807,7 @@ def _recover_campaign() -> None:
         pi_counter_now = pi_capture.get("corrected") or pi_capture.get("counter", 0)
 
     logging.info(
-        "⏱️ [recovery] GNSS time now: %s  Pi counter (corrected): %d",
+        "⏱️ [recovery] system time now: %s  Pi counter (corrected): %d",
         gnss_time_now_str,
         pi_counter_now,
     )
@@ -966,18 +958,18 @@ def on_timebase_fragment(payload: Payload) -> None:
 
     This is the main data path.  Each fragment triggers:
       1) Pi-side observations (system time)
-      2) GNSS time correlation key (via GNSS.GET_TIME)
-      3) Correlated Pi capture (via PITIMER.REPORT with gnss_time)
+      2) System clock correlation key (via system_time_z)
+      3) Correlated Pi capture (via PITIMER.REPORT with time key)
       4) TIMEBASE augmentation (combine Teensy + Pi + GNSS)
       5) Residual statistics update (GNSS, DWT, OCXO, Pi)
       6) Report denormalization into campaign payload
       7) Publish + persist
       8) Persist latest OCXO DAC value into campaign payload
 
-    Pi residual statistics are now computed here in the fragment
+    Pi residual statistics are computed here in the fragment
     handler, driven by the correlated capture — not in a separate
     subscription handler.  Since the capture is guaranteed to match
-    the fragment's PPS edge (by GNSS time key), there is no race
+    the fragment's PPS edge (by system clock key), there is no race
     condition and no need for separate timing.
     """
     global _request_start, _request_stop, _campaign_active
@@ -1012,17 +1004,19 @@ def on_timebase_fragment(payload: Payload) -> None:
     system_time_str = system_time_utc.isoformat(timespec='microseconds')
 
     # ----------------------------------------------------------
-    # Get GNSS time correlation key
+    # Get correlation key from the system clock.
+    #
+    # Both PITIMER and CLOCKS derive this from the same chrony-
+    # disciplined clock.  pps_poll stored the capture with this
+    # same key within milliseconds of PPS.  The fragment arrives
+    # tens of ms later via USB, so the key is always available.
     # ----------------------------------------------------------
-    gnss_time = _get_gnss_time()
-    if gnss_time is None:
-        logging.warning("⚠️ [clocks] GNSS.GET_TIME returned None — skipping TIMEBASE")
-        return
+    time_key = system_time_z()
 
     # ----------------------------------------------------------
     # Fetch correlated Pi capture from PITIMER
     # ----------------------------------------------------------
-    pi_capture = _get_pitimer_capture_by_time(gnss_time)
+    pi_capture = _get_pitimer_capture_by_time(time_key)
 
     # ----------------------------------------------------------
     # Extract Pi capture diagnostics and compute campaign-scoped pi_ns
@@ -1051,9 +1045,9 @@ def on_timebase_fragment(payload: Payload) -> None:
         _pi_tick_epoch = pi_counter_corrected
         _pi_tick_epoch_set = True
         logging.info(
-            "⏱️ [clocks] Pi tick epoch set: %d (corrected counter, gnss_time=%s)",
+            "⏱️ [clocks] Pi tick epoch set: %d (corrected counter, time_key=%s)",
             _pi_tick_epoch,
-            gnss_time,
+            time_key,
         )
 
     if pi_counter_corrected is not None and _pi_tick_epoch_set:
@@ -1063,7 +1057,7 @@ def on_timebase_fragment(payload: Payload) -> None:
     # ----------------------------------------------------------
     # Update residual statistics (all four clocks)
     #
-    # Pi residual is now computed here, driven by the correlated
+    # Pi residual is computed here, driven by the correlated
     # capture.  Since the capture is guaranteed to match the
     # fragment's PPS edge, every update is a clean 1-second delta.
     # ----------------------------------------------------------
@@ -1098,8 +1092,8 @@ def on_timebase_fragment(payload: Payload) -> None:
         # System time when fragment arrived
         "system_time_utc": system_time_str,
 
-        # GNSS time correlation key
-        "gnss_time_utc": gnss_time,
+        # GNSS time correlation key (from system clock)
+        "gnss_time_utc": time_key,
 
         # Teensy clocks (authoritative)
         "teensy_dwt_cycles": frag["dwt_cycles"],
@@ -1513,11 +1507,11 @@ def run() -> None:
     logging.info(
         "🕐 [clocks] Four tracked clocks: GNSS (Teensy 10MHz), "
         "DWT (Teensy 600MHz), OCXO (Teensy GPT1 10MHz), "
-        "Pi (CNTVCT_EL0 54MHz via PITIMER correlated by GNSS time). "
-        "chrony-disciplined system time for sanity checking. "
+        "Pi (CNTVCT_EL0 54MHz via PITIMER correlated by system clock). "
+        "chrony-disciplined system time for correlation keys. "
         "Pi TDC correction enabled (detect_ns → correction_ticks). "
         "Outlier rejection on all clock domains (>50%% deviation → reject). "
-        "Pi capture correlated by GNSS time key (request/response, no pub/sub)."
+        "Pi capture correlated by system_time_z (request/response, no pub/sub)."
     )
 
     # ----------------------------------------------------------
@@ -1535,7 +1529,8 @@ def run() -> None:
     #
     # Pi captures are fetched via PITIMER.REPORT(gnss_time=<key>)
     # request/response in the fragment handler — no PPS_CAPTURE
-    # subscription needed.  Correlation is guaranteed by GNSS time.
+    # subscription needed.  Correlation is guaranteed by shared
+    # system clock (system_time_z).
     # ----------------------------------------------------------
     server_setup(
         subsystem="CLOCKS",
