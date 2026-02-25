@@ -23,6 +23,20 @@ PPS-count identity channel (SET_NEXT_PPS_COUNT):
     - Enables deterministic event-identity correlation
     - Avoids "which UTC second did I label this?" failure modes
 
+Edge-source visibility (TDC feasibility metric):
+  • Each capture includes an "edge_source" describing how close we
+    believe the capture is to the true second boundary.
+  • This is used to evaluate whether Pi-side "spin/loop" style
+    approaches are feasible under Linux scheduling/preemption.
+
+  Current definition:
+    edge_source = "TDC"     if pps_poll reports a non-negative detect_ns and
+                             we computed correction_ticks from it
+                 "RAW"     otherwise (no usable detect_ns; no correction)
+
+  This is intentionally conservative and cheap: it's not a claim of
+  nanosecond truth, it's a classified instrumentation channel.
+
 Diagnostics:
   • PITIMER_INFO exposes:
       - subprocess lifecycle counters
@@ -68,6 +82,13 @@ RING_BUFFER_CAPACITY = 5
 PPS_COUNT_RING_CAPACITY = 64
 
 # ---------------------------------------------------------------------
+# Edge-source classification
+# ---------------------------------------------------------------------
+
+EDGE_SOURCE_TDC = "TDC"
+EDGE_SOURCE_RAW = "RAW"
+
+# ---------------------------------------------------------------------
 # Diagnostics (monotonic counters + last anomaly snapshots)
 # ---------------------------------------------------------------------
 
@@ -106,6 +127,11 @@ _diag: Dict[str, Any] = {
     "pps_count_repeat": 0,
     "pps_count_regress": 0,
     "pps_count_jump": 0,
+
+    # Edge-source instrumentation (TDC feasibility)
+    "edge_source_tdc": 0,
+    "edge_source_raw": 0,
+    "last_edge_source": None,
 
     # Last-seen values
     "last_time_key": None,
@@ -202,6 +228,7 @@ def _ring_snapshot_rows() -> List[Dict[str, Any]]:
                 "corrected": v.get("corrected"),
                 "detect_ns": v.get("detect_ns"),
                 "correction_ticks": v.get("correction_ticks"),
+                "edge_source": v.get("edge_source"),
             })
         return rows
 
@@ -261,6 +288,7 @@ def _pps_ring_snapshot_rows(limit: int = 32) -> List[Dict[str, Any]]:
                 "corrected": v.get("corrected"),
                 "detect_ns": v.get("detect_ns"),
                 "correction_ticks": v.get("correction_ticks"),
+                "edge_source": v.get("edge_source"),
             })
         return rows
 
@@ -278,6 +306,9 @@ def _parse_capture_line(line: str) -> Optional[Dict[str, Any]]:
 
     Legacy format (6 fields):
       seq counter delta residual resid_ns detect_ns
+
+    This parser does not attempt to "fix" missing detect_ns; it classifies
+    edge_source downstream using conservative rules.
     """
     line = line.strip()
     if not line:
@@ -374,6 +405,26 @@ def _parse_capture_line(line: str) -> Optional[Dict[str, Any]]:
         "detect_ns": detect_ns,
         "correction_ticks": correction_ticks,
     }
+
+# ---------------------------------------------------------------------
+# Edge-source classification
+# ---------------------------------------------------------------------
+
+
+def _classify_edge_source(capture: Dict[str, Any]) -> str:
+    """
+    Classify the capture's edge-source in a conservative way.
+
+    Rule:
+      * If detect_ns is present and >= 0 -> TDC (we have a measured detection latency)
+      * Else -> RAW
+
+    This is a classification channel for feasibility analysis, not a guarantee.
+    """
+    detect_ns = capture.get("detect_ns")
+    if isinstance(detect_ns, int) and detect_ns >= 0:
+        return EDGE_SOURCE_TDC
+    return EDGE_SOURCE_RAW
 
 # ---------------------------------------------------------------------
 # PPS-count logic
@@ -481,6 +532,15 @@ def _capture_reader(proc: subprocess.Popen) -> None:
             payload["freq"] = PI_TIMER_FREQ
             payload["ns_per_tick"] = round(NS_PER_TICK, 3)
 
+            # Edge-source classification (feasibility metric)
+            edge_source = _classify_edge_source(payload)
+            payload["edge_source"] = edge_source
+            _diag["last_edge_source"] = edge_source
+            if edge_source == EDGE_SOURCE_TDC:
+                _diag["edge_source_tdc"] += 1
+            else:
+                _diag["edge_source_raw"] += 1
+
             time_key = system_time_z()
             payload["gnss_time"] = time_key
 
@@ -496,11 +556,12 @@ def _capture_reader(proc: subprocess.Popen) -> None:
 
             if payload.get("seq") and int(payload["seq"]) % 60 == 0 and payload.get("delta") is not None:
                 logging.info(
-                    "⏱️ [pitimer] ppspoll_seq=%d pps_count=%s corrected=%d "
+                    "⏱️ [pitimer] ppspoll_seq=%d pps_count=%s edge=%s corrected=%d "
                     "residual=%.1f ns detect=%d ns corr=%d ticks "
                     "time_key=%s ring=%d pps_ring=%d",
                     int(payload["seq"]),
                     str(payload.get("pps_count", "—")),
+                    str(payload.get("edge_source", "—")),
                     int(payload.get("corrected") or 0),
                     payload.get("residual_ns") or 0.0,
                     int(payload.get("detect_ns") or 0),
@@ -731,6 +792,7 @@ def cmd_pitimer_info(_: Optional[dict]) -> Dict[str, Any]:
       • Time-key ring snapshot
       • PPS-count ring snapshot
       • PPS-count mode state
+      • Edge-source (TDC feasibility) counters
     """
     payload = {
         "diag": dict(_diag),
@@ -775,6 +837,7 @@ def run() -> None:
         "TDC correction enabled (detect_ns → correction_ticks). "
         "Time-key ring capacity=%d. pps_count ring capacity=%d. "
         "PPS-count identity available (SET_NEXT_PPS_COUNT + REPORT_PPS_COUNT). "
+        "Edge-source classification enabled (edge_source=TDC|RAW). "
         "Instrumentation enabled (PITIMER_INFO).",
         PI_TIMER_FREQ,
         NS_PER_TICK,
