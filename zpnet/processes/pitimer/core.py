@@ -13,23 +13,22 @@ Architecture:
   • This Python process spawns pps_poll as a subprocess, reads its
     output line by line, and stashes captures in ring buffers
   • CLOCKS retrieves captures either by time key (legacy) or by
-    campaign-scoped pps_count (new, recommended)
+    campaign-scoped pps_count (recommended)
 
-NEW (v2026-02-25 pps_count identity channel):
-  • RESET_PPS_COUNT command:
-      - Arms a reset such that the *next* detected PPS capture becomes pps_count = 0
-      - Subsequent captures increment pps_count monotonically (0,1,2,...)
-      - This is campaign-scoped identity, designed to match Teensy "teensy_pps_count"
+PPS-count identity channel (SET_NEXT_PPS_COUNT):
+  • SET_NEXT_PPS_COUNT arms a set such that the *next* detected PPS
+    capture becomes pps_count=<v>
+  • Subsequent captures increment pps_count monotonically (<v>, <v+1>, ...)
   • A dedicated ring buffer indexed by pps_count is maintained
-      - Enables deterministic, event-identity correlation
-      - Avoids "which UTC second did I label this?" failure modes
+    - Enables deterministic event-identity correlation
+    - Avoids "which UTC second did I label this?" failure modes
 
 Diagnostics:
   • PITIMER_INFO exposes:
       - subprocess lifecycle counters
       - stdout ingestion / parse counters
       - time-key overwrite counters
-      - pps_count mode state + anomalies (repeat / jump / regress)
+      - pps_count mode state + anomalies (repeat / jump / regress / overwrite)
       - ring snapshots (time-key ring + pps_count ring)
       - last anomaly snapshots
 """
@@ -65,9 +64,7 @@ NS_PER_TICK = 1e9 / PI_TIMER_FREQ
 # Time-key ring capacity (legacy correlation window)
 RING_BUFFER_CAPACITY = 5
 
-# PPS-count ring capacity (campaign window)
-# If CLOCKS polls within tens/hundreds of ms, 16–64 is ample.
-# Set higher if you anticipate pauses or heavy startup contention.
+# PPS-count ring capacity (campaign identity window)
 PPS_COUNT_RING_CAPACITY = 64
 
 # ---------------------------------------------------------------------
@@ -94,9 +91,9 @@ _diag: Dict[str, Any] = {
 
     # PPS-count mode
     "pps_count_enabled": False,
-    "pps_count_reset_armed": False,
-    "pps_count_reset_requests": 0,
-    "pps_count_reset_applied": 0,
+    "pps_count_set_armed": False,
+    "pps_count_set_requests": 0,
+    "pps_count_set_applied": 0,
 
     # PPS-count ring behavior
     "pps_count_put_total": 0,
@@ -113,13 +110,13 @@ _diag: Dict[str, Any] = {
     # Last-seen values
     "last_time_key": None,
     "last_ppspoll_seq": None,          # seq as printed by pps_poll (free-running)
-    "last_pps_count": None,            # campaign-scoped pps_count
+    "last_pps_count": None,            # most recent assigned pps_count
 
     # Last anomaly snapshots
     "last_key_overwrite": {},
     "last_pps_count_anomaly": {},
     "last_parse_exception": {},
-    "last_reset_event": {},
+    "last_set_event": {},
 }
 
 # ---------------------------------------------------------------------
@@ -139,13 +136,14 @@ _pps_lock = threading.Lock()
 
 # PPS-count control state
 _pps_count_enabled: bool = False
-_pps_reset_armed: bool = False
-_pps_next_count: int = 0
+_pps_set_armed: bool = False
+_pps_next_count: int = 0      # while armed, this holds the armed value
 _last_pps_count_seen: Optional[int] = None
 
 # ---------------------------------------------------------------------
 # Ring helpers
 # ---------------------------------------------------------------------
+
 
 def _ring_put(time_key: str, capture: Dict[str, Any]) -> None:
     global _last_capture
@@ -214,7 +212,6 @@ def _pps_ring_put(pps_count: int, capture: Dict[str, Any]) -> None:
     with _pps_lock:
         # Overwrite is allowed (shouldn't happen normally) — deterministic last-write-wins
         if pps_count in _pps_ring:
-            # Treat overwrite as an anomaly worth recording
             prev = _pps_ring.get(pps_count) or {}
             _diag["last_pps_count_anomaly"] = {
                 "ts_utc": system_time_z(),
@@ -270,6 +267,7 @@ def _pps_ring_snapshot_rows(limit: int = 32) -> List[Dict[str, Any]]:
 # ---------------------------------------------------------------------
 # Capture parser
 # ---------------------------------------------------------------------
+
 
 def _parse_capture_line(line: str) -> Optional[Dict[str, Any]]:
     """
@@ -381,41 +379,41 @@ def _parse_capture_line(line: str) -> Optional[Dict[str, Any]]:
 # PPS-count logic
 # ---------------------------------------------------------------------
 
+
 def _pps_count_on_capture(capture: Dict[str, Any]) -> Optional[int]:
     """
     Determine (and advance) campaign-scoped pps_count for this capture.
 
     Semantics:
-      • pps_count is DISABLED until RESET_PPS_COUNT is called.
-      • RESET_PPS_COUNT arms a reset so that the *next* capture becomes pps_count=0.
+      • pps_count is DISABLED until SET_NEXT_PPS_COUNT is called.
+      • SET_NEXT_PPS_COUNT arms a set so that the *next* capture becomes pps_count=<v>.
       • Once enabled, pps_count increments by 1 on every parsed capture.
     """
-    global _pps_count_enabled, _pps_reset_armed, _pps_next_count, _last_pps_count_seen
+    global _pps_count_enabled, _pps_set_armed, _pps_next_count, _last_pps_count_seen
 
-    if not _pps_count_enabled and not _pps_reset_armed:
+    if not _pps_count_enabled and not _pps_set_armed:
         return None
 
-    if _pps_reset_armed:
-        # Apply reset on this capture
+    if _pps_set_armed:
+        # Apply armed set on THIS capture. Armed value is stored in _pps_next_count.
         _pps_count_enabled = True
-        _pps_reset_armed = False
-        _pps_next_count = 0
+        _pps_set_armed = False
         _last_pps_count_seen = None
 
-        _diag["pps_count_reset_applied"] += 1
+        _diag["pps_count_set_applied"] += 1
         _diag["pps_count_enabled"] = True
-        _diag["pps_count_reset_armed"] = False
-        _diag["last_reset_event"] = {
+        _diag["pps_count_set_armed"] = False
+        _diag["last_set_event"] = {
             "ts_utc": system_time_z(),
-            "event": "reset_applied",
+            "event": "set_applied",
+            "armed_value": int(_pps_next_count),
             "ppspoll_seq": capture.get("seq"),
             "time_key": capture.get("gnss_time"),
         }
 
-    pps_count = _pps_next_count
+    pps_count = int(_pps_next_count)
     _pps_next_count += 1
 
-    # Continuity bookkeeping (should be strictly increasing by 1)
     _diag["pps_count_seen"] += 1
     _diag["last_pps_count"] = pps_count
 
@@ -459,6 +457,7 @@ def _pps_count_on_capture(capture: Dict[str, Any]) -> Optional[int]:
 # Capture reader thread
 # ---------------------------------------------------------------------
 
+
 def _capture_reader(proc: subprocess.Popen) -> None:
     """
     Read pps_poll stdout line by line, derive time key, store in rings,
@@ -488,16 +487,13 @@ def _capture_reader(proc: subprocess.Popen) -> None:
             _diag["last_time_key"] = time_key
             _diag["last_ppspoll_seq"] = payload.get("seq")
 
-            # Store legacy time-key ring
             _ring_put(time_key, payload)
 
-            # Store pps_count ring if enabled/armed
             pps_count = _pps_count_on_capture(payload)
             if pps_count is not None:
                 payload["pps_count"] = pps_count
                 _pps_ring_put(pps_count, payload)
 
-            # Periodic log
             if payload.get("seq") and int(payload["seq"]) % 60 == 0 and payload.get("delta") is not None:
                 logging.info(
                     "⏱️ [pitimer] ppspoll_seq=%d pps_count=%s corrected=%d "
@@ -527,6 +523,7 @@ def _capture_reader(proc: subprocess.Popen) -> None:
 # ---------------------------------------------------------------------
 # Subprocess supervisor
 # ---------------------------------------------------------------------
+
 
 def _spawn_ppspoll() -> subprocess.Popen:
     cmd = [
@@ -574,6 +571,7 @@ def _supervisor() -> None:
 # ---------------------------------------------------------------------
 # Command handlers
 # ---------------------------------------------------------------------
+
 
 def cmd_report(args: Optional[dict]) -> Dict[str, Any]:
     """
@@ -623,41 +621,54 @@ def cmd_report(args: Optional[dict]) -> Dict[str, Any]:
     return {"success": True, "message": "OK", "payload": result}
 
 
-def cmd_reset_pps_count(_: Optional[dict]) -> Dict[str, Any]:
+def cmd_set_next_pps_count(args: Optional[dict]) -> Dict[str, Any]:
     """
-    RESET_PPS_COUNT — arm campaign identity reset.
+    SET_NEXT_PPS_COUNT — arm pps_count assignment.
 
     Semantics:
-      • The *next* parsed PPS capture becomes pps_count = 0
+      • The *next* parsed PPS capture becomes pps_count=<v>
       • Subsequent captures increment pps_count monotonically
+      • Clears the pps_count ring buffer immediately (fresh identity window)
       • Does not stop pps_poll or affect legacy time-key ring
-      • Clears the pps_count ring buffer immediately (fresh campaign view)
     """
-    global _pps_reset_armed, _pps_count_enabled, _pps_next_count, _last_pps_count_seen
+    global _pps_set_armed, _pps_next_count, _pps_count_enabled, _last_pps_count_seen
 
-    _diag["pps_count_reset_requests"] += 1
+    if not args or "pps_count" not in args:
+        return {"success": False, "message": "BAD", "payload": {"error": "missing pps_count"}}
+
+    try:
+        v = int(args["pps_count"])
+    except Exception:
+        return {"success": False, "message": "BAD", "payload": {"error": "invalid pps_count"}}
+
+    if v < 0:
+        return {"success": False, "message": "BAD", "payload": {"error": "pps_count must be >= 0"}}
+
+    _diag["pps_count_set_requests"] += 1
 
     with _pps_lock:
         _pps_ring.clear()
 
-    _pps_reset_armed = True
+    _pps_set_armed = True
+    _pps_next_count = v
     _pps_count_enabled = False
-    _pps_next_count = 0
     _last_pps_count_seen = None
 
-    _diag["pps_count_reset_armed"] = True
+    _diag["pps_count_set_armed"] = True
     _diag["pps_count_enabled"] = False
-    _diag["last_reset_event"] = {
+    _diag["last_set_event"] = {
         "ts_utc": system_time_z(),
-        "event": "reset_armed",
+        "event": "set_armed",
+        "armed_value": v,
     }
 
     return {
         "success": True,
         "message": "OK",
         "payload": {
-            "status": "reset_armed",
-            "note": "next PPS capture will be pps_count=0",
+            "status": "set_armed",
+            "note": "next PPS capture will be pps_count=<armed_value>",
+            "armed_value": v,
             "pps_count_ring_cleared": True,
         },
     }
@@ -665,13 +676,13 @@ def cmd_reset_pps_count(_: Optional[dict]) -> Dict[str, Any]:
 
 def cmd_report_by_pps_count(args: Optional[dict]) -> Dict[str, Any]:
     """
-    REPORT_PPS_COUNT — return capture by campaign pps_count.
+    REPORT_PPS_COUNT — return capture by pps_count.
 
     Args:
       { "pps_count": <int> }
 
     Returns:
-      success=False if pps_count mode is not enabled or capture not present.
+      success=False if pps_count mode is not enabled/armed or capture not present.
     """
     if not args or "pps_count" not in args:
         return {"success": False, "message": "BAD", "payload": {"error": "missing pps_count"}}
@@ -681,13 +692,13 @@ def cmd_report_by_pps_count(args: Optional[dict]) -> Dict[str, Any]:
     except Exception:
         return {"success": False, "message": "BAD", "payload": {"error": "invalid pps_count"}}
 
-    if not _pps_count_enabled and not _pps_reset_armed:
+    if not _pps_count_enabled and not _pps_set_armed:
         return {
             "success": False,
             "message": "BAD",
             "payload": {
                 "error": "pps_count not enabled",
-                "hint": "call RESET_PPS_COUNT first",
+                "hint": "call SET_NEXT_PPS_COUNT first",
             },
         }
 
@@ -725,8 +736,8 @@ def cmd_pitimer_info(_: Optional[dict]) -> Dict[str, Any]:
         "diag": dict(_diag),
         "pps_count_mode": {
             "enabled": _pps_count_enabled,
-            "reset_armed": _pps_reset_armed,
-            "next_pps_count": _pps_next_count if _pps_count_enabled else (0 if _pps_reset_armed else None),
+            "set_armed": _pps_set_armed,
+            "next_pps_count": _pps_next_count if (_pps_count_enabled or _pps_set_armed) else None,
             "pps_ring_size": _pps_ring_size(),
             "pps_ring_keys_tail": _pps_ring_keys()[-10:],
         },
@@ -745,7 +756,7 @@ def cmd_pitimer_info(_: Optional[dict]) -> Dict[str, Any]:
 
 COMMANDS = {
     "REPORT": cmd_report,
-    "RESET_PPS_COUNT": cmd_reset_pps_count,
+    "SET_NEXT_PPS_COUNT": cmd_set_next_pps_count,
     "REPORT_PPS_COUNT": cmd_report_by_pps_count,
     "PITIMER_INFO": cmd_pitimer_info,
 }
@@ -753,6 +764,7 @@ COMMANDS = {
 # ---------------------------------------------------------------------
 # Entrypoint
 # ---------------------------------------------------------------------
+
 
 def run() -> None:
     setup_logging()
@@ -762,7 +774,7 @@ def run() -> None:
         "freq=%d Hz, %.3f ns/tick, isolated core %d. "
         "TDC correction enabled (detect_ns → correction_ticks). "
         "Time-key ring capacity=%d. pps_count ring capacity=%d. "
-        "PPS-count identity available (RESET_PPS_COUNT + REPORT_PPS_COUNT). "
+        "PPS-count identity available (SET_NEXT_PPS_COUNT + REPORT_PPS_COUNT). "
         "Instrumentation enabled (PITIMER_INFO).",
         PI_TIMER_FREQ,
         NS_PER_TICK,
