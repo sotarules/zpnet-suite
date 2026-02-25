@@ -339,6 +339,11 @@ _campaign_active: bool = False
 _pi_tick_epoch: int = 0
 _pi_tick_epoch_set: bool = False
 
+# Recovery-time Pi epoch anchoring (must be boundary-aligned)
+_pi_epoch_pending: bool = False
+_pi_epoch_pending_pps_count: int = 0
+_pi_epoch_pending_projected_ticks: int = 0
+
 _residual_gnss = _PpsResidual()
 _residual_dwt = _PpsResidual()
 _residual_pi = _PpsResidual(display_scale=PI_NS_PER_TICK)
@@ -442,7 +447,7 @@ def _get_pitimer_capture_by_pps_count(pps_count: int) -> Optional[Dict[str, Any]
 def _get_pitimer_capture_via_command() -> Optional[Dict[str, Any]]:
     """
     Fetch the latest Pi arch timer capture from PITIMER (unkeyed).
-    Used ONLY during recovery for pi_counter_now.
+    Used ONLY during recovery for pi_counter_now (observational/logging only).
     """
     try:
         resp = send_command(
@@ -729,6 +734,7 @@ def _recover_campaign() -> None:
     global _campaign_active, _pi_tick_epoch, _pi_tick_epoch_set
     global _last_pi_seq, _last_pi_corrected
     global _last_pps_count_seen
+    global _pi_epoch_pending, _pi_epoch_pending_pps_count, _pi_epoch_pending_projected_ticks
 
     _diag["recovery_checks"] += 1
 
@@ -774,7 +780,17 @@ def _recover_campaign() -> None:
     if isinstance(last_tb, str):
         last_tb = json.loads(last_tb)
 
-    last_gnss_utc_str = last_tb["gnss_time_utc"]
+    # IMPORTANT:
+    #   gnss_time_utc is a *label* (often sourced from PITIMER, or system fallback if capture missing).
+    #   For recovery downtime accounting we anchor to persisted system_time_utc (when the TIMEBASE row
+    #   was produced) to avoid PPS-label jitter and floor() off-by-one artifacts.
+    last_system_utc_str = last_tb.get("system_time_utc") or last_tb.get("gnss_time_utc")
+    if not last_system_utc_str:
+        last_system_utc_str = system_time_z()
+
+    last_system_utc = datetime.fromisoformat(last_system_utc_str.replace("Z", "+00:00"))
+
+    last_gnss_utc_str = last_tb.get("gnss_time_utc") or last_system_utc_str
     last_gnss_utc = datetime.fromisoformat(last_gnss_utc_str.replace("Z", "+00:00"))
 
     last_pps_count = last_tb.get("pps_count")
@@ -795,7 +811,8 @@ def _recover_campaign() -> None:
     last_pi_ns = int(last_tb.get("pi_ns") or 0)
 
     logging.info(
-        "🔍 [recovery] last TIMEBASE: gnss_utc=%s  pps_count=%d  gnss_ns=%d  dwt_ns=%d  ocxo_ns=%d  pi_ns=%d",
+        "🔍 [recovery] last TIMEBASE: system_utc=%s  gnss_utc=%s  pps_count=%d  gnss_ns=%d  dwt_ns=%d  ocxo_ns=%d  pi_ns=%d",
+        last_system_utc.isoformat(),
         last_gnss_utc.isoformat(),
         last_pps_count,
         last_gnss_ns,
@@ -844,12 +861,15 @@ def _recover_campaign() -> None:
         except Exception:
             logging.exception("⚠️ [recovery] GNSS MODE=TO IPC failed (continuing)")
 
-    # Use disciplined system clock as a proxy for GNSS seconds elapsed while down.
+    # Use disciplined system clock as a proxy for elapsed seconds while down.
+    # Anchor to last persisted system_time_utc (row production time), not gnss_time_utc label.
     now_str = system_time_z()
     now_utc = datetime.fromisoformat(now_str.replace("Z", "+00:00"))
 
-    elapsed_td = now_utc - last_gnss_utc
-    elapsed_seconds = int(elapsed_td.total_seconds())
+    elapsed_td = now_utc - last_system_utc
+
+    # Round to nearest second to avoid floor() off-by-one around PPS edges.
+    elapsed_seconds = int(round(elapsed_td.total_seconds()))
 
     if elapsed_seconds <= 0:
         _diag["recovery_elapsed_seconds_nonpositive"] += 1
@@ -863,6 +883,7 @@ def _recover_campaign() -> None:
     _diag["last_recovery"] = {
         "ts_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
         "campaign": campaign_name,
+        "last_system_utc": last_system_utc_str,
         "last_gnss_utc": last_gnss_utc_str,
         "now_utc": now_str,
         "elapsed_seconds": int(elapsed_seconds),
@@ -886,6 +907,7 @@ def _recover_campaign() -> None:
     # Reset local pps_count continuity tracker (fresh after recovery)
     _last_pps_count_seen = None
 
+    # Observational only (NOT used to set epoch; not PPS-edge aligned).
     pi_capture = _get_pitimer_capture_via_command()
     pi_counter_now = 0
     if pi_capture:
@@ -959,13 +981,26 @@ def _recover_campaign() -> None:
         logging.exception("❌ [recovery] Teensy RECOVER IPC failed")
         return
 
-    if pi_counter_now > 0 and projected_pi_ns > 0:
+    # Pi epoch MUST be set at the projected PPS boundary, not "now".
+    # Defer epoch establishment until we receive the first post-recovery PITIMER capture
+    # keyed by pps_count==next_pps_count (the boundary we projected to).
+    if projected_pi_ns > 0:
         projected_pi_ticks = (projected_pi_ns * PI_TIMER_FREQ) // NS_PER_SECOND
-        _pi_tick_epoch = pi_counter_now - projected_pi_ticks
-        _pi_tick_epoch_set = True
-        logging.info("📐 [recovery] Pi tick epoch set: %d (projected pi_ticks=%d)", _pi_tick_epoch, projected_pi_ticks)
+        _pi_epoch_pending = True
+        _pi_epoch_pending_pps_count = int(next_pps_count)
+        _pi_epoch_pending_projected_ticks = int(projected_pi_ticks)
+
+        _pi_tick_epoch_set = False
+        logging.info(
+            "📐 [recovery] Pi epoch pending: will set on pps_count=%d using projected_pi_ticks=%d",
+            _pi_epoch_pending_pps_count,
+            _pi_epoch_pending_projected_ticks,
+        )
     else:
-        logging.warning("⚠️ [recovery] PITIMER not available -- Pi tick epoch will be set on first capture")
+        logging.warning("⚠️ [recovery] PITIMER not available / projected_pi_ns=0 -- Pi tick epoch will be set on first capture (may break PPB)")
+        _pi_epoch_pending = False
+        _pi_epoch_pending_pps_count = 0
+        _pi_epoch_pending_projected_ticks = 0
 
     _residual_gnss.reset()
     _residual_dwt.reset()
@@ -994,6 +1029,7 @@ def on_timebase_fragment(payload: Payload) -> None:
     global _pi_tick_epoch, _pi_tick_epoch_set
     global _last_pi_seq, _last_pi_corrected
     global _last_pps_count_seen
+    global _pi_epoch_pending, _pi_epoch_pending_pps_count, _pi_epoch_pending_projected_ticks
 
     _diag["fragments_received"] += 1
 
@@ -1014,6 +1050,11 @@ def on_timebase_fragment(payload: Payload) -> None:
         _last_pi_seq = None
         _last_pi_corrected = None
         _last_pps_count_seen = None
+
+        # START defines origin; no recovery pending.
+        _pi_epoch_pending = False
+        _pi_epoch_pending_pps_count = 0
+        _pi_epoch_pending_projected_ticks = 0
 
         _campaign_active = True
         _request_start = False
@@ -1114,14 +1155,32 @@ def on_timebase_fragment(payload: Payload) -> None:
                 }
             _last_pi_corrected = pi_counter_corrected
 
+    # Pi epoch establishment:
+    #   * START: pps_count==0 defines origin (epoch = corrected counter at pps_count 0)
+    #   * RECOVER: epoch must be set only when pps_count reaches the recovery target boundary
     if pi_counter_corrected is not None and not _pi_tick_epoch_set:
-        _pi_tick_epoch = int(pi_counter_corrected)
-        _pi_tick_epoch_set = True
-        logging.info(
-            "⏱️ [clocks] Pi tick epoch set: %d (corrected counter, pps_count=%d)",
-            _pi_tick_epoch,
-            int(pps_count),
-        )
+        if _pi_epoch_pending and int(pps_count) == int(_pi_epoch_pending_pps_count):
+            _pi_tick_epoch = int(pi_counter_corrected) - int(_pi_epoch_pending_projected_ticks)
+            _pi_tick_epoch_set = True
+            _pi_epoch_pending = False
+
+            logging.info(
+                "⏱️ [clocks] Pi tick epoch set from recovery target: epoch=%d (pps_count=%d, corrected=%d, projected_ticks=%d)",
+                _pi_tick_epoch,
+                int(pps_count),
+                int(pi_counter_corrected),
+                int(_pi_epoch_pending_projected_ticks),
+            )
+        elif (not _pi_epoch_pending) and int(pps_count) == 0:
+            _pi_tick_epoch = int(pi_counter_corrected)
+            _pi_tick_epoch_set = True
+            logging.info(
+                "⏱️ [clocks] Pi tick epoch set at campaign origin: %d (pps_count=0)",
+                _pi_tick_epoch,
+            )
+        else:
+            # Do NOT set epoch opportunistically; would destroy absolute continuity.
+            pass
 
     if pi_counter_corrected is not None and _pi_tick_epoch_set:
         campaign_ticks = int(pi_counter_corrected) - _pi_tick_epoch
@@ -1412,6 +1471,8 @@ def cmd_clear(_: Optional[dict]) -> dict:
     global _request_stop, _request_start, _campaign_active
     global _last_pi_seq, _last_pi_corrected
     global _last_pps_count_seen
+    global _pi_epoch_pending, _pi_epoch_pending_pps_count, _pi_epoch_pending_projected_ticks
+    global _pi_tick_epoch, _pi_tick_epoch_set
 
     if _campaign_active:
         _campaign_active = False
@@ -1430,6 +1491,12 @@ def cmd_clear(_: Optional[dict]) -> dict:
         _last_pi_seq = None
         _last_pi_corrected = None
         _last_pps_count_seen = None
+
+        _pi_epoch_pending = False
+        _pi_epoch_pending_pps_count = 0
+        _pi_epoch_pending_projected_ticks = 0
+        _pi_tick_epoch_set = False
+        _pi_tick_epoch = 0
 
         logging.info("🗑️ [clocks] CLEAR: deleted %d timebase rows, %d campaigns", tb_count, camp_count)
 
@@ -1462,6 +1529,11 @@ def cmd_clocks_info(_: Optional[dict]) -> Dict[str, Any]:
 
         # pps_count continuity state
         "last_pps_count_seen": _last_pps_count_seen,
+
+        # Recovery-time Pi epoch pending state
+        "pi_epoch_pending": _pi_epoch_pending,
+        "pi_epoch_pending_pps_count": _pi_epoch_pending_pps_count if _pi_epoch_pending else None,
+        "pi_epoch_pending_projected_ticks": _pi_epoch_pending_projected_ticks if _pi_epoch_pending else None,
 
         "diag": _diag,
     }
