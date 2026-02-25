@@ -118,21 +118,21 @@ I2C_IGNORE_ADDRS = {
 
 I2C_SENSORS_BY_BUS = {
     I2C_BUS_LEGACY: {
-        0x40: "INA260 0x40 (Battery)",
-        0x41: "INA260 0x41 (3v3 Rail)",
-        0x44: "INA260 0x44 (5v0 Rail)",
+        0x40: "INA260 0x40 (3.3v Rail)",
+        0x41: "INA260 0x41 (5v Rail+",
+        0x44: "INA260 0x44 (12v Rail)",
         0x66: "EV5491 0x66 (Laser Controller)",
-        0x76: "BME280 0x76 (Environment)",
-        0x68: "DS3231 0x68 (RTC1)",
+        #0x76: "BME280 0x76 (Environment)",
+        #0x68: "DS3231 0x68 (RTC1)",
         # 0x57 will appear via scan but is ignored (EEPROM)
     },
 
     I2C_BUS_EXPANDED: {
-        0x40: "INA260 0x40 (Teensy Domain)",
-        0x41: "INA260 0x41 (24V Rail / Motors)",
-        0x44: "INA260 0x44 (Pi Domain)",
-        0x45: "INA260 0x45 (OCXO 3v3 Domain)",
-        0x68: "DS3231 0x68 (RTC2)",
+        #0x40: "INA260 0x40 (Teensy Domain)",
+        #0x41: "INA260 0x41 (24V Rail / Motors)",
+        #0x44: "INA260 0x44 (Pi Domain)",
+        #0x45: "INA260 0x45 (OCXO 3v3 Domain)",
+        #0x68: "DS3231 0x68 (RTC2)",
         # 0x57 will appear via scan but is ignored (EEPROM)
     },
 }
@@ -143,15 +143,15 @@ I2C_SENSORS_BY_BUS = {
 
 POWER_CONFIG_BY_BUS = {
     I2C_BUS_LEGACY: {
-        0x40: {"label": "Battery", "ideal_voltage_v": 12.8},
-        0x41: {"label": "3.3v Rail", "ideal_voltage_v": 3.3},
-        0x44: {"label": "5v Rail", "ideal_voltage_v": 5.0}
+        0x40: {"label": "3.3v Rail", "ideal_voltage_v": 3.3},
+        0x41: {"label": "5v Rail", "ideal_voltage_v": 5.0},
+        0x44: {"label": "Battery", "ideal_voltage_v": 12.8},
     },
     I2C_BUS_EXPANDED: {
-        0x40: {"label": "Teensy Domain", "ideal_voltage_v": 5.0},
-        0x41: {"label": "24v Domain", "ideal_voltage_v": 24.0},
-        0x44: {"label": "Pi Domain", "ideal_voltage_v": 5.0},
-        0x45: {"label": "OCXO Domain", "ideal_voltage_v": 3.0},
+        #0x40: {"label": "Teensy Domain", "ideal_voltage_v": 5.0},
+        #0x41: {"label": "24v Domain", "ideal_voltage_v": 24.0},
+        #0x44: {"label": "Pi Domain", "ideal_voltage_v": 5.0},
+        #0x45: {"label": "OCXO Domain", "ideal_voltage_v": 3.0},
     }
 }
 
@@ -564,14 +564,17 @@ def build_sensor_scan_status() -> dict:
                     if addr in I2C_IGNORE_ADDRS:
                         continue
 
+                    # MiniMongo-safe key: address only (no periods)
+                    rail_key = f"0x{addr:02X}"
+
                     # Presence probe: best-effort.
                     # Some devices do not support SMBus quick ops; do not treat
                     # that as absence. We only require that the bus itself works.
                     try:
                         bus.write_quick(addr)
-                        results[label] = "NOMINAL"
+                        results[rail_key] = "NOMINAL"
                     except OSError:
-                        results[label] = "PRESENT"
+                        results[rail_key] = "PRESENT"
                         all_nominal = False
 
         except Exception:
@@ -1003,11 +1006,11 @@ def system_poller() -> None:
             teensy_payload = build_teensy_status()
             network_payload = build_network_status()
             laser_payload = build_laser_status()
-            #sensor_payload = build_sensor_scan_status()
+            sensor_payload = build_sensor_scan_status()
             #environment_payload = build_environment_status()
             gnss_payload = build_gnss_status()
-            #power_payload = build_power_status()
-            #battery_payload = build_battery_status()
+            power_payload = build_power_status()
+            battery_payload = build_battery_status()
             clocks_payload = build_clocks_status()
             transport_payload = build_transport_status()
             payload_payload = build_payload_status()
@@ -1019,11 +1022,11 @@ def system_poller() -> None:
                 "teensy": dict(teensy_payload),
                 "network": dict(network_payload),
                 "laser": dict(laser_payload),
-                #"sensors": dict(sensor_payload),
+                "sensors": dict(sensor_payload),
                 #"environment": dict(environment_payload),
                 "gnss": dict(gnss_payload),
-                #"power": dict(power_payload),
-                #"battery": dict(battery_payload),
+                "power": dict(power_payload),
+                "battery": dict(battery_payload),
                 "clocks": dict(clocks_payload),
                 "transport": dict(transport_payload),
                 "payload": dict(payload_payload),

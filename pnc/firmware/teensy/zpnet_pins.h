@@ -292,9 +292,9 @@ Device Inventory
 
 Device Type   Address   A0 Strap   A1 Strap   Function / Notes
 ---------------------------------------------------------------------------
-INA260        0x40      Open       Open       Power monitor — Battery
-INA260        0x41      Open       Bridged    Power monitor — 3.3 V rail
-INA260        0x44      Bridged    Open       Power monitor — 5.0 V rail
+INA260        0x40      Open       Bridged    Power monitor — 3.3 V rail
+INA260        0x41      Bridged    Open       Power monitor — 5.0 V rail
+INA260        0x44      Open       Open       Power monitor — Battery
 
 BME280        0x76      Fixed      Fixed      Environmental sensor
 EV5491        0x66      Fixed      Fixed      Laser controller (I2C)
