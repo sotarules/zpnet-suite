@@ -275,47 +275,35 @@ def _serve_commands(
 # Pub/Sub server (internal)
 # =============================================================================
 
-def _serve_pubsub(
-    *,
-    subsystem: str,
-    subscriptions: Dict[str, Callable[[dict], None]],
-) -> None:
-    """
-    Receive published messages and dispatch to per-topic handlers.
-
-    Semantics:
-      • One socket
-      • One handler per topic
-      • Exact topic match
-      • Best-effort
-      • No retries
-      • No fan-in callback
-    """
-
+def _serve_pubsub(*, subsystem: str, subscriptions: Dict[str, Callable[[dict], None]]) -> None:
     sock_path = pubsub_socket_path(subsystem)
     srv = _bind_unix_socket(sock_path)
 
     while True:
         conn, _ = srv.accept()
         with conn:
-            raw = conn.recv(65536)
-            msg = json.loads(raw.decode("utf-8"))
+            try:
+                raw = conn.recv(65536)
+                if not raw:
+                    continue
+                msg = json.loads(raw.decode("utf-8"))
+            except Exception:
+                logging.exception("[pubsub] bad message (ignored) %s", subsystem)
+                continue
 
             topic = msg.get("topic")
             payload = msg.get("payload")
 
             handler = subscriptions.get(topic)
             if handler is None:
-                return
+                # IMPORTANT: do NOT kill the server thread
+                logging.warning("[pubsub] %s ignoring unknown topic=%r", subsystem, topic)
+                continue
 
             try:
                 handler(payload)
             except Exception:
-                logging.exception(
-                    "[pubsub] handler failed (%s:%s)",
-                    subsystem,
-                    topic,
-                )
+                logging.exception("[pubsub] handler failed (%s:%s)", subsystem, topic)
 
 # =============================================================================
 # Public declarative API

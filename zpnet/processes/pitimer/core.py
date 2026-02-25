@@ -11,84 +11,38 @@ Architecture:
   • The instant a new second is detected, pps_poll captures
     CNTVCT_EL0 and writes the result to stdout
   • This Python process spawns pps_poll as a subprocess, reads its
-    output line by line, and stashes the latest capture
-  • Each capture is tagged with the current UTC second derived from
-    the chrony-disciplined system clock and stored in a ring buffer
-    of the last 5 captures
-  • CLOCKS retrieves captures by time key via REPORT command,
-    ensuring fragment/capture correlation by shared system clock
+    output line by line, and stashes captures in ring buffers
+  • CLOCKS retrieves captures either by time key (legacy) or by
+    campaign-scoped pps_count (new, recommended)
 
-Correlation model:
-  • pps_poll detects the second boundary via clock_gettime(CLOCK_REALTIME)
-  • The capture reader calls system_time_z() to get the ISO8601 Zulu
-    label for the second that just rolled over (e.g. "2026-02-23T21:45:07Z")
-  • This label is stored as the ring buffer key
-  • CLOCKS independently calls system_time_z() when processing a
-    TIMEBASE_FRAGMENT, producing the same key (same disciplined clock,
-    same UTC second)
-  • CLOCKS then calls PITIMER.REPORT with gnss_time=<label> to fetch
-    the matching capture
-  • If the labels don't match, that's a hard fault — the system
-    has lost correlation and must skip rather than publish garbage
+NEW (v2026-02-25 pps_count identity channel):
+  • RESET_PPS_COUNT command:
+      - Arms a reset such that the *next* detected PPS capture becomes pps_count = 0
+      - Subsequent captures increment pps_count monotonically (0,1,2,...)
+      - This is campaign-scoped identity, designed to match Teensy "teensy_pps_count"
+  • A dedicated ring buffer indexed by pps_count is maintained
+      - Enables deterministic, event-identity correlation
+      - Avoids "which UTC second did I label this?" failure modes
 
-  Both sides derive the key from the same source: the chrony-disciplined
-  system clock, which tracks GNSS via PPS to ~39 ns.  No GNSS IPC is
-  needed — the system clock IS the authority for "what second is it."
-
-  NOTE: Previous versions called GNSS.GET_TIME for the correlation key.
-  This created a race condition: the GNSS NMEA cache would be
-  overwritten with the next second's forecast before CLOCKS could
-  read it, causing systematic one-second mismatches.  Using the
-  system clock eliminates this entirely — both sides read the same
-  clock at moments guaranteed to be within the same UTC second.
-
-Pi-side TDC (time-to-digital converter):
-  • chrony disciplines the system clock to ~39 ns of GNSS via PPS
-  • The second boundary in the system clock IS the PPS edge
-  • Busy-polling on an isolated core detects the rollover within
-    ~10-50 ns (measured) — no IRQ dispatch jitter
-  • detect_ns = how many nanoseconds after the true second boundary
-    the polling loop noticed the rollover (analogous to Teensy
-    ISR dispatch latency)
-  • correction_ticks = detect_ns converted to arch timer ticks
-  • corrected_counter = raw_counter - correction_ticks
-    (best estimate of where the counter WAS at the true PPS edge)
-  • This is conceptually identical to the Teensy's software TDC:
-    measure the detection delay, subtract it from the raw capture
-
-REPORT command:
-  • With gnss_time argument: returns the capture matching that
-    time key, or success=False if not found
-  • Without gnss_time argument: returns the most recent capture
-    (for testing, recovery, and backward compatibility)
-
-Ring buffer diagnostics in REPORT payload:
-  • gnss_time         — the time key for this capture
-  • buffer_size       — current number of captures in ring buffer
-  • buffer_keys       — (only in unkeyed REPORT) list of available keys
-
-Requirements:
-  • isolcpus=3 in /boot/firmware/cmdline.txt
-  • pps_poll compiled: gcc -O2 -o pps_poll pps_poll.c -lm
-  • chrony running and disciplined by PPS
-
-Process model:
-  • One systemd service (zpnet-pitimer)
-  • Two execution contexts:
-      1) Capture reader thread (reads pps_poll stdout)
-      2) Command socket server (serves REPORT)
+Diagnostics:
+  • PITIMER_INFO exposes:
+      - subprocess lifecycle counters
+      - stdout ingestion / parse counters
+      - time-key overwrite counters
+      - pps_count mode state + anomalies (repeat / jump / regress)
+      - ring snapshots (time-key ring + pps_count ring)
+      - last anomaly snapshots
 """
 
 from __future__ import annotations
 
 import collections
-import json
 import logging
 import os
 import subprocess
 import threading
 import time
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, List
 
 from zpnet.processes.processes import server_setup
 from zpnet.shared.logger import setup_logging
@@ -98,119 +52,239 @@ from zpnet.shared.util import system_time_z
 # Configuration
 # ---------------------------------------------------------------------
 
-# Path to the compiled pps_poll binary
 PPSPOLL_BINARY = os.environ.get(
     "PPSPOLL_BINARY",
     "/home/mule/zpnet/zpnet/native/pps_poll/pps_poll",
 )
 
-# CPU core to pin pps_poll to (must be in isolcpus)
 ISOLATED_CORE = 3
 
-# ARM Generic Timer frequency (54 MHz on Pi 4/5)
-# Read from hardware by pps_poll; we hardcode for Python-side math.
 PI_TIMER_FREQ = 54_000_000
 NS_PER_TICK = 1e9 / PI_TIMER_FREQ
 
-# Ring buffer capacity — how many captures to retain.
-# At one capture per second, 5 entries = 5 seconds of history.
-# CLOCKS typically asks within milliseconds, so this is ample.
+# Time-key ring capacity (legacy correlation window)
 RING_BUFFER_CAPACITY = 5
 
+# PPS-count ring capacity (campaign window)
+# If CLOCKS polls within tens/hundreds of ms, 16–64 is ample.
+# Set higher if you anticipate pauses or heavy startup contention.
+PPS_COUNT_RING_CAPACITY = 64
+
 # ---------------------------------------------------------------------
-# Capture ring buffer — indexed by time key (ISO8601 Zulu string)
-#
-# OrderedDict preserves insertion order.  When capacity is exceeded,
-# the oldest entry is evicted.  Access is protected by _ring_lock.
-#
-# Each entry is a full capture payload dict (same fields as before,
-# plus "gnss_time" key for the correlation label).
+# Diagnostics (monotonic counters + last anomaly snapshots)
+# ---------------------------------------------------------------------
+
+_diag: Dict[str, Any] = {
+    # Subprocess lifecycle
+    "ppspoll_spawns": 0,
+    "ppspoll_exits": 0,
+    "ppspoll_last_exit_code": None,
+
+    # Stdout ingestion
+    "stdout_lines_total": 0,
+    "stdout_lines_decoded": 0,
+    "stdout_lines_parsed_ok": 0,
+    "stdout_lines_parsed_none": 0,   # headers / separators / blanks
+    "stdout_parse_exceptions": 0,
+
+    # Time-key ring behavior
+    "ring_put_total": 0,
+    "ring_key_overwrite": 0,
+    "ring_evictions": 0,
+
+    # PPS-count mode
+    "pps_count_enabled": False,
+    "pps_count_reset_armed": False,
+    "pps_count_reset_requests": 0,
+    "pps_count_reset_applied": 0,
+
+    # PPS-count ring behavior
+    "pps_count_put_total": 0,
+    "pps_count_evictions": 0,
+    "pps_count_lookup_hits": 0,
+    "pps_count_lookup_misses": 0,
+
+    # PPS-count continuity
+    "pps_count_seen": 0,
+    "pps_count_repeat": 0,
+    "pps_count_regress": 0,
+    "pps_count_jump": 0,
+
+    # Last-seen values
+    "last_time_key": None,
+    "last_ppspoll_seq": None,          # seq as printed by pps_poll (free-running)
+    "last_pps_count": None,            # campaign-scoped pps_count
+
+    # Last anomaly snapshots
+    "last_key_overwrite": {},
+    "last_pps_count_anomaly": {},
+    "last_parse_exception": {},
+    "last_reset_event": {},
+}
+
+# ---------------------------------------------------------------------
+# Time-key ring buffer (legacy)
 # ---------------------------------------------------------------------
 
 _ring: collections.OrderedDict[str, Dict[str, Any]] = collections.OrderedDict()
 _ring_lock = threading.Lock()
-
-# Also keep a reference to the most recent capture for unkeyed
-# REPORT calls (testing, recovery, backward compat).
 _last_capture: Optional[Dict[str, Any]] = None
 
+# ---------------------------------------------------------------------
+# PPS-count ring buffer (campaign identity)
+# ---------------------------------------------------------------------
+
+_pps_ring: collections.OrderedDict[int, Dict[str, Any]] = collections.OrderedDict()
+_pps_lock = threading.Lock()
+
+# PPS-count control state
+_pps_count_enabled: bool = False
+_pps_reset_armed: bool = False
+_pps_next_count: int = 0
+_last_pps_count_seen: Optional[int] = None
+
+# ---------------------------------------------------------------------
+# Ring helpers
+# ---------------------------------------------------------------------
 
 def _ring_put(time_key: str, capture: Dict[str, Any]) -> None:
-    """
-    Store a capture in the ring buffer, keyed by time label.
-
-    If the buffer is at capacity, the oldest entry is evicted.
-    If the same key already exists (shouldn't happen in normal
-    operation), it is overwritten.
-    """
     global _last_capture
 
+    _diag["ring_put_total"] += 1
+
     with _ring_lock:
-        # If key already exists, remove it so re-insert goes to end
         if time_key in _ring:
+            _diag["ring_key_overwrite"] += 1
+            prev = _ring.get(time_key) or {}
+            _diag["last_key_overwrite"] = {
+                "ts_utc": system_time_z(),
+                "time_key": time_key,
+                "prev_ppspoll_seq": prev.get("seq"),
+                "new_ppspoll_seq": capture.get("seq"),
+                "prev_corrected": prev.get("corrected"),
+                "new_corrected": capture.get("corrected"),
+            }
             del _ring[time_key]
 
         _ring[time_key] = capture
         _last_capture = capture
 
-        # Evict oldest if over capacity
         while len(_ring) > RING_BUFFER_CAPACITY:
             _ring.popitem(last=False)
+            _diag["ring_evictions"] += 1
 
 
 def _ring_get(time_key: str) -> Optional[Dict[str, Any]]:
-    """
-    Retrieve a capture by time key.
-
-    Returns the capture dict or None if not found.
-    """
     with _ring_lock:
         return _ring.get(time_key)
 
 
 def _ring_latest() -> Optional[Dict[str, Any]]:
-    """Return the most recent capture, or None if empty."""
     with _ring_lock:
         return _last_capture
 
 
 def _ring_keys() -> list:
-    """Return list of available time keys (oldest first)."""
     with _ring_lock:
         return list(_ring.keys())
 
 
 def _ring_size() -> int:
-    """Return current number of entries in the ring buffer."""
     with _ring_lock:
         return len(_ring)
 
 
+def _ring_snapshot_rows() -> List[Dict[str, Any]]:
+    with _ring_lock:
+        rows: List[Dict[str, Any]] = []
+        for k, v in _ring.items():
+            rows.append({
+                "gnss_time": k,
+                "ppspoll_seq": v.get("seq"),
+                "corrected": v.get("corrected"),
+                "detect_ns": v.get("detect_ns"),
+                "correction_ticks": v.get("correction_ticks"),
+            })
+        return rows
+
+
+def _pps_ring_put(pps_count: int, capture: Dict[str, Any]) -> None:
+    _diag["pps_count_put_total"] += 1
+
+    with _pps_lock:
+        # Overwrite is allowed (shouldn't happen normally) — deterministic last-write-wins
+        if pps_count in _pps_ring:
+            # Treat overwrite as an anomaly worth recording
+            prev = _pps_ring.get(pps_count) or {}
+            _diag["last_pps_count_anomaly"] = {
+                "ts_utc": system_time_z(),
+                "reason": "pps_count_overwrite",
+                "pps_count": pps_count,
+                "prev_ppspoll_seq": prev.get("seq"),
+                "new_ppspoll_seq": capture.get("seq"),
+                "prev_corrected": prev.get("corrected"),
+                "new_corrected": capture.get("corrected"),
+            }
+            del _pps_ring[pps_count]
+
+        _pps_ring[pps_count] = capture
+
+        while len(_pps_ring) > PPS_COUNT_RING_CAPACITY:
+            _pps_ring.popitem(last=False)
+            _diag["pps_count_evictions"] += 1
+
+
+def _pps_ring_get(pps_count: int) -> Optional[Dict[str, Any]]:
+    with _pps_lock:
+        return _pps_ring.get(pps_count)
+
+
+def _pps_ring_keys() -> List[int]:
+    with _pps_lock:
+        return list(_pps_ring.keys())
+
+
+def _pps_ring_size() -> int:
+    with _pps_lock:
+        return len(_pps_ring)
+
+
+def _pps_ring_snapshot_rows(limit: int = 32) -> List[Dict[str, Any]]:
+    """
+    Return a compact snapshot of the most recent pps_count captures.
+    """
+    with _pps_lock:
+        rows: List[Dict[str, Any]] = []
+        items = list(_pps_ring.items())[-limit:]
+        for k, v in items:
+            rows.append({
+                "pps_count": k,
+                "ppspoll_seq": v.get("seq"),
+                "time_key": v.get("gnss_time"),
+                "corrected": v.get("corrected"),
+                "detect_ns": v.get("detect_ns"),
+                "correction_ticks": v.get("correction_ticks"),
+            })
+        return rows
+
 # ---------------------------------------------------------------------
-# Capture reader thread
+# Capture parser
 # ---------------------------------------------------------------------
 
 def _parse_capture_line(line: str) -> Optional[Dict[str, Any]]:
     """
     Parse a single output line from pps_poll.
 
-    pps_poll (enhanced) prints lines like:
-         1    11510132462    11510132460     54000409       409    7574.074         40          2         40
+    Enhanced format (>= 9 fields):
+      seq counter corrected delta residual resid_ns detect_ns corr_ticks rt_ns
 
-    Fields (whitespace-separated):
-      seq  counter  corrected  delta  residual  resid_ns  detect_ns  corr_ticks  rt_ns
-
-    The first capture has "---" for delta/residual/resid_ns,
-    and header/separator lines start with non-digit characters.
-
-    Also handles legacy format (6 fields) for backward compatibility:
-      seq  counter  delta  residual  resid_ns  detect_ns
+    Legacy format (6 fields):
+      seq counter delta residual resid_ns detect_ns
     """
     line = line.strip()
     if not line:
         return None
 
-    # Strip trailing Welford stats in parentheses
     paren_idx = line.find("(")
     if paren_idx != -1:
         line = line[:paren_idx].strip()
@@ -219,15 +293,12 @@ def _parse_capture_line(line: str) -> Optional[Dict[str, Any]]:
     if len(parts) < 6:
         return None
 
-    # Skip header, separator, and summary lines
     try:
         seq = int(parts[0])
     except ValueError:
         return None
 
-    # Detect format by field count
     if len(parts) >= 9:
-        # Enhanced format: seq counter corrected delta residual resid_ns detect_ns corr_ticks rt_ns
         counter_str = parts[1]
         corrected_str = parts[2]
         delta_str = parts[3]
@@ -244,7 +315,6 @@ def _parse_capture_line(line: str) -> Optional[Dict[str, Any]]:
         except ValueError:
             return None
 
-        # Parse optional fields (first line has "---")
         delta = None
         residual = None
         residual_ns = None
@@ -268,120 +338,204 @@ def _parse_capture_line(line: str) -> Optional[Dict[str, Any]]:
             "correction_ticks": correction_ticks,
         }
 
-    else:
-        # Legacy format: seq counter delta residual resid_ns detect_ns
-        counter_str = parts[1]
-        delta_str = parts[2]
-        residual_str = parts[3]
-        resid_ns_str = parts[4]
-        detect_ns_str = parts[5]
+    # Legacy format
+    counter_str = parts[1]
+    delta_str = parts[2]
+    residual_str = parts[3]
+    resid_ns_str = parts[4]
+    detect_ns_str = parts[5]
 
+    try:
+        counter = int(counter_str)
+        detect_ns = int(detect_ns_str)
+    except ValueError:
+        return None
+
+    correction_ticks = (detect_ns * PI_TIMER_FREQ) // 1_000_000_000
+    corrected = counter - correction_ticks
+
+    delta = None
+    residual = None
+    residual_ns = None
+
+    if delta_str != "---":
         try:
-            counter = int(counter_str)
-            detect_ns = int(detect_ns_str)
+            delta = int(delta_str)
+            residual = int(residual_str)
+            residual_ns = float(resid_ns_str)
         except ValueError:
-            return None
+            pass
 
-        # Compute correction from detect_ns (same math as enhanced pps_poll)
-        correction_ticks = (detect_ns * PI_TIMER_FREQ) // 1_000_000_000
-        corrected = counter - correction_ticks
+    return {
+        "seq": seq,
+        "counter": counter,
+        "corrected": corrected,
+        "delta": delta,
+        "residual": residual,
+        "residual_ns": residual_ns,
+        "detect_ns": detect_ns,
+        "correction_ticks": correction_ticks,
+    }
 
-        delta = None
-        residual = None
-        residual_ns = None
+# ---------------------------------------------------------------------
+# PPS-count logic
+# ---------------------------------------------------------------------
 
-        if delta_str != "---":
-            try:
-                delta = int(delta_str)
-                residual = int(residual_str)
-                residual_ns = float(resid_ns_str)
-            except ValueError:
-                pass
+def _pps_count_on_capture(capture: Dict[str, Any]) -> Optional[int]:
+    """
+    Determine (and advance) campaign-scoped pps_count for this capture.
 
-        return {
-            "seq": seq,
-            "counter": counter,
-            "corrected": corrected,
-            "delta": delta,
-            "residual": residual,
-            "residual_ns": residual_ns,
-            "detect_ns": detect_ns,
-            "correction_ticks": correction_ticks,
+    Semantics:
+      • pps_count is DISABLED until RESET_PPS_COUNT is called.
+      • RESET_PPS_COUNT arms a reset so that the *next* capture becomes pps_count=0.
+      • Once enabled, pps_count increments by 1 on every parsed capture.
+    """
+    global _pps_count_enabled, _pps_reset_armed, _pps_next_count, _last_pps_count_seen
+
+    if not _pps_count_enabled and not _pps_reset_armed:
+        return None
+
+    if _pps_reset_armed:
+        # Apply reset on this capture
+        _pps_count_enabled = True
+        _pps_reset_armed = False
+        _pps_next_count = 0
+        _last_pps_count_seen = None
+
+        _diag["pps_count_reset_applied"] += 1
+        _diag["pps_count_enabled"] = True
+        _diag["pps_count_reset_armed"] = False
+        _diag["last_reset_event"] = {
+            "ts_utc": system_time_z(),
+            "event": "reset_applied",
+            "ppspoll_seq": capture.get("seq"),
+            "time_key": capture.get("gnss_time"),
         }
 
+    pps_count = _pps_next_count
+    _pps_next_count += 1
+
+    # Continuity bookkeeping (should be strictly increasing by 1)
+    _diag["pps_count_seen"] += 1
+    _diag["last_pps_count"] = pps_count
+
+    if _last_pps_count_seen is not None:
+        if pps_count == _last_pps_count_seen:
+            _diag["pps_count_repeat"] += 1
+            _diag["last_pps_count_anomaly"] = {
+                "ts_utc": system_time_z(),
+                "reason": "pps_count_repeat",
+                "pps_count": pps_count,
+                "prev_pps_count": _last_pps_count_seen,
+                "ppspoll_seq": capture.get("seq"),
+                "time_key": capture.get("gnss_time"),
+            }
+        elif pps_count < _last_pps_count_seen:
+            _diag["pps_count_regress"] += 1
+            _diag["last_pps_count_anomaly"] = {
+                "ts_utc": system_time_z(),
+                "reason": "pps_count_regress",
+                "pps_count": pps_count,
+                "prev_pps_count": _last_pps_count_seen,
+                "ppspoll_seq": capture.get("seq"),
+                "time_key": capture.get("gnss_time"),
+            }
+        elif pps_count > _last_pps_count_seen + 1:
+            _diag["pps_count_jump"] += 1
+            _diag["last_pps_count_anomaly"] = {
+                "ts_utc": system_time_z(),
+                "reason": "pps_count_jump",
+                "pps_count": pps_count,
+                "prev_pps_count": _last_pps_count_seen,
+                "jump": pps_count - _last_pps_count_seen,
+                "ppspoll_seq": capture.get("seq"),
+                "time_key": capture.get("gnss_time"),
+            }
+
+    _last_pps_count_seen = pps_count
+    return pps_count
+
+# ---------------------------------------------------------------------
+# Capture reader thread
+# ---------------------------------------------------------------------
 
 def _capture_reader(proc: subprocess.Popen) -> None:
     """
-    Read pps_poll stdout line by line, generate time key from
-    the system clock, and store each capture in the ring buffer.
-
-    The time key is derived from the chrony-disciplined system clock
-    via system_time_z().  Since pps_poll detects the second boundary
-    from the same system clock, and this code runs within milliseconds
-    of detection, the key always matches the second that just rolled.
-
-    Runs as a daemon thread. If pps_poll exits or crashes,
-    logs the error and the supervisor will restart it.
+    Read pps_poll stdout line by line, derive time key, store in rings,
+    and (optionally) assign campaign-scoped pps_count.
     """
     for raw_line in iter(proc.stdout.readline, b""):
+        _diag["stdout_lines_total"] += 1
+
         try:
             line = raw_line.decode("utf-8", errors="replace")
+            _diag["stdout_lines_decoded"] += 1
+
             capture = _parse_capture_line(line)
+            if capture is None:
+                _diag["stdout_lines_parsed_none"] += 1
+                continue
 
-            if capture is not None:
-                # Build the full payload with freq metadata
-                payload = dict(capture)
-                payload["freq"] = PI_TIMER_FREQ
-                payload["ns_per_tick"] = round(NS_PER_TICK, 3)
+            _diag["stdout_lines_parsed_ok"] += 1
 
-                # Derive time key from the system clock.
-                # pps_poll just detected the second boundary from
-                # this same clock, so system_time_z() returns the
-                # label for the second that just started.
-                time_key = system_time_z()
+            payload = dict(capture)
+            payload["freq"] = PI_TIMER_FREQ
+            payload["ns_per_tick"] = round(NS_PER_TICK, 3)
 
-                payload["gnss_time"] = time_key
-                _ring_put(time_key, payload)
+            time_key = system_time_z()
+            payload["gnss_time"] = time_key
 
-                # Log periodically (every 60 captures ≈ once per minute)
-                if capture["seq"] % 60 == 0 and capture["delta"] is not None:
-                    logging.info(
-                        "⏱️ [pitimer] seq=%d counter=%d corrected=%d "
-                        "residual=%.1f ns detect=%d ns corr=%d ticks "
-                        "time_key=%s buffer=%d",
-                        capture["seq"],
-                        capture["counter"],
-                        capture["corrected"],
-                        capture["residual_ns"] or 0.0,
-                        capture["detect_ns"],
-                        capture["correction_ticks"],
-                        time_key,
-                        _ring_size(),
-                    )
+            _diag["last_time_key"] = time_key
+            _diag["last_ppspoll_seq"] = payload.get("seq")
 
-        except Exception:
+            # Store legacy time-key ring
+            _ring_put(time_key, payload)
+
+            # Store pps_count ring if enabled/armed
+            pps_count = _pps_count_on_capture(payload)
+            if pps_count is not None:
+                payload["pps_count"] = pps_count
+                _pps_ring_put(pps_count, payload)
+
+            # Periodic log
+            if payload.get("seq") and int(payload["seq"]) % 60 == 0 and payload.get("delta") is not None:
+                logging.info(
+                    "⏱️ [pitimer] ppspoll_seq=%d pps_count=%s corrected=%d "
+                    "residual=%.1f ns detect=%d ns corr=%d ticks "
+                    "time_key=%s ring=%d pps_ring=%d",
+                    int(payload["seq"]),
+                    str(payload.get("pps_count", "—")),
+                    int(payload.get("corrected") or 0),
+                    payload.get("residual_ns") or 0.0,
+                    int(payload.get("detect_ns") or 0),
+                    int(payload.get("correction_ticks") or 0),
+                    time_key,
+                    _ring_size(),
+                    _pps_ring_size(),
+                )
+
+        except Exception as e:
+            _diag["stdout_parse_exceptions"] += 1
+            _diag["last_parse_exception"] = {
+                "ts_utc": system_time_z(),
+                "exception": str(e),
+            }
             logging.exception("⚠️ [pitimer] error parsing pps_poll output")
 
     logging.warning("⚠️ [pitimer] pps_poll stdout closed")
 
+# ---------------------------------------------------------------------
+# Subprocess supervisor
+# ---------------------------------------------------------------------
 
 def _spawn_ppspoll() -> subprocess.Popen:
-    """
-    Spawn the pps_poll C program pinned to the isolated core.
-
-    Runs indefinitely (count=999999999) writing one line per second.
-    """
     cmd = [
         "taskset", "-c", str(ISOLATED_CORE),
         PPSPOLL_BINARY,
-        "999999999",  # effectively infinite
+        "999999999",
     ]
 
-    logging.info(
-        "🚀 [pitimer] spawning pps_poll on core %d: %s",
-        ISOLATED_CORE,
-        " ".join(cmd),
-    )
+    logging.info("🚀 [pitimer] spawning pps_poll on core %d: %s", ISOLATED_CORE, " ".join(cmd))
 
     proc = subprocess.Popen(
         cmd,
@@ -390,21 +544,15 @@ def _spawn_ppspoll() -> subprocess.Popen:
         bufsize=0,
     )
 
+    _diag["ppspoll_spawns"] += 1
     return proc
 
 
 def _supervisor() -> None:
-    """
-    Supervise the pps_poll subprocess.
-
-    If it exits unexpectedly, log and restart after a delay.
-    Runs as a daemon thread.
-    """
     while True:
         try:
             proc = _spawn_ppspoll()
 
-            # Start reader thread for this process instance
             reader = threading.Thread(
                 target=_capture_reader,
                 args=(proc,),
@@ -413,18 +561,15 @@ def _supervisor() -> None:
             )
             reader.start()
 
-            # Wait for process to exit
             retcode = proc.wait()
-            logging.warning(
-                "⚠️ [pitimer] pps_poll exited with code %d — restarting in 5s",
-                retcode,
-            )
+            _diag["ppspoll_exits"] += 1
+            _diag["ppspoll_last_exit_code"] = retcode
+            logging.warning("⚠️ [pitimer] pps_poll exited with code %d — restarting in 5s", retcode)
 
         except Exception:
             logging.exception("💥 [pitimer] supervisor error — restarting in 5s")
 
         time.sleep(5)
-
 
 # ---------------------------------------------------------------------
 # Command handlers
@@ -432,38 +577,24 @@ def _supervisor() -> None:
 
 def cmd_report(args: Optional[dict]) -> Dict[str, Any]:
     """
-    Return a PPS capture from the ring buffer.
+    REPORT — legacy interface.
 
-    With gnss_time argument:
-      Returns the capture matching that time key.
-      This is the primary path used by CLOCKS for correlation.
-      If the key is not found, returns success=False — this is
-      a hard fault indicating lost correlation.
+    With gnss_time:
+      returns capture by time key (legacy correlation)
 
-    Without gnss_time argument:
-      Returns the most recent capture (for testing, recovery,
-      and backward compatibility).
-
-    Payload includes all capture fields plus:
-      • gnss_time      — the time key
-      • buffer_size    — current ring buffer occupancy
-      • buffer_keys    — (unkeyed only) available keys for debugging
+    Without gnss_time:
+      returns latest capture and ring keys
     """
     gnss_time = None
     if args:
         gnss_time = args.get("gnss_time")
 
     if gnss_time is not None:
-        # ----------------------------------------------------------
-        # Keyed lookup — correlation path
-        # ----------------------------------------------------------
         capture = _ring_get(gnss_time)
-
         if capture is None:
             available = _ring_keys()
             logging.warning(
-                "⚠️ [pitimer] REPORT: no capture for gnss_time=%s "
-                "(buffer has %d entries: %s)",
+                "⚠️ [pitimer] REPORT: no capture for gnss_time=%s (buffer has %d entries: %s)",
                 gnss_time,
                 len(available),
                 available[-5:] if available else "empty",
@@ -480,87 +611,179 @@ def cmd_report(args: Optional[dict]) -> Dict[str, Any]:
 
         result = dict(capture)
         result["buffer_size"] = _ring_size()
+        return {"success": True, "message": "OK", "payload": result}
+
+    capture = _ring_latest()
+    if capture is None:
+        return {"success": True, "message": "OK", "payload": {"state": "WAITING"}}
+
+    result = dict(capture)
+    result["buffer_size"] = _ring_size()
+    result["buffer_keys"] = _ring_keys()
+    return {"success": True, "message": "OK", "payload": result}
+
+
+def cmd_reset_pps_count(_: Optional[dict]) -> Dict[str, Any]:
+    """
+    RESET_PPS_COUNT — arm campaign identity reset.
+
+    Semantics:
+      • The *next* parsed PPS capture becomes pps_count = 0
+      • Subsequent captures increment pps_count monotonically
+      • Does not stop pps_poll or affect legacy time-key ring
+      • Clears the pps_count ring buffer immediately (fresh campaign view)
+    """
+    global _pps_reset_armed, _pps_count_enabled, _pps_next_count, _last_pps_count_seen
+
+    _diag["pps_count_reset_requests"] += 1
+
+    with _pps_lock:
+        _pps_ring.clear()
+
+    _pps_reset_armed = True
+    _pps_count_enabled = False
+    _pps_next_count = 0
+    _last_pps_count_seen = None
+
+    _diag["pps_count_reset_armed"] = True
+    _diag["pps_count_enabled"] = False
+    _diag["last_reset_event"] = {
+        "ts_utc": system_time_z(),
+        "event": "reset_armed",
+    }
+
+    return {
+        "success": True,
+        "message": "OK",
+        "payload": {
+            "status": "reset_armed",
+            "note": "next PPS capture will be pps_count=0",
+            "pps_count_ring_cleared": True,
+        },
+    }
+
+
+def cmd_report_by_pps_count(args: Optional[dict]) -> Dict[str, Any]:
+    """
+    REPORT_PPS_COUNT — return capture by campaign pps_count.
+
+    Args:
+      { "pps_count": <int> }
+
+    Returns:
+      success=False if pps_count mode is not enabled or capture not present.
+    """
+    if not args or "pps_count" not in args:
+        return {"success": False, "message": "BAD", "payload": {"error": "missing pps_count"}}
+
+    try:
+        k = int(args["pps_count"])
+    except Exception:
+        return {"success": False, "message": "BAD", "payload": {"error": "invalid pps_count"}}
+
+    if not _pps_count_enabled and not _pps_reset_armed:
         return {
-            "success": True,
-            "message": "OK",
-            "payload": result,
+            "success": False,
+            "message": "BAD",
+            "payload": {
+                "error": "pps_count not enabled",
+                "hint": "call RESET_PPS_COUNT first",
+            },
         }
 
-    else:
-        # ----------------------------------------------------------
-        # Unkeyed — latest capture (testing/recovery)
-        # ----------------------------------------------------------
-        capture = _ring_latest()
-
-        if capture is None:
-            return {
-                "success": True,
-                "message": "OK",
-                "payload": {
-                    "state": "WAITING",
-                },
-            }
-
-        result = dict(capture)
-        result["buffer_size"] = _ring_size()
-        result["buffer_keys"] = _ring_keys()
+    cap = _pps_ring_get(k)
+    if cap is None:
+        _diag["pps_count_lookup_misses"] += 1
         return {
-            "success": True,
-            "message": "OK",
-            "payload": result,
+            "success": False,
+            "message": "BAD",
+            "payload": {
+                "error": "pps_count not found",
+                "pps_count": k,
+                "pps_ring_size": _pps_ring_size(),
+                "pps_ring_keys_tail": _pps_ring_keys()[-10:],
+            },
         }
+
+    _diag["pps_count_lookup_hits"] += 1
+    out = dict(cap)
+    out["pps_ring_size"] = _pps_ring_size()
+    return {"success": True, "message": "OK", "payload": out}
+
+
+def cmd_pitimer_info(_: Optional[dict]) -> Dict[str, Any]:
+    """
+    PITIMER_INFO — instrumentation snapshot.
+
+    Includes:
+      • Monotonic counters + last anomaly snapshots
+      • Time-key ring snapshot
+      • PPS-count ring snapshot
+      • PPS-count mode state
+    """
+    payload = {
+        "diag": dict(_diag),
+        "pps_count_mode": {
+            "enabled": _pps_count_enabled,
+            "reset_armed": _pps_reset_armed,
+            "next_pps_count": _pps_next_count if _pps_count_enabled else (0 if _pps_reset_armed else None),
+            "pps_ring_size": _pps_ring_size(),
+            "pps_ring_keys_tail": _pps_ring_keys()[-10:],
+        },
+        "ring_time_key": {
+            "buffer_size": _ring_size(),
+            "buffer_keys": _ring_keys(),
+            "buffer": _ring_snapshot_rows(),
+        },
+        "ring_pps_count": {
+            "buffer_size": _pps_ring_size(),
+            "buffer": _pps_ring_snapshot_rows(limit=32),
+        },
+    }
+    return {"success": True, "message": "OK", "payload": payload}
 
 
 COMMANDS = {
     "REPORT": cmd_report,
+    "RESET_PPS_COUNT": cmd_reset_pps_count,
+    "REPORT_PPS_COUNT": cmd_report_by_pps_count,
+    "PITIMER_INFO": cmd_pitimer_info,
 }
-
 
 # ---------------------------------------------------------------------
 # Entrypoint
 # ---------------------------------------------------------------------
 
 def run() -> None:
-    """
-    Start the PITIMER process.
-
-    Execution contexts:
-      1) pps_poll supervisor thread (spawns + monitors C subprocess)
-      2) Capture reader thread (reads stdout, derives time key from
-         system clock, stores in ring buffer)
-      3) Command socket server (serves REPORT with keyed lookup)
-    """
     setup_logging()
 
     logging.info(
         "⏱️ [pitimer] starting — Pi arch timer PPS capture via chrony polling. "
         "freq=%d Hz, %.3f ns/tick, isolated core %d. "
         "TDC correction enabled (detect_ns → correction_ticks). "
-        "Ring buffer capacity=%d captures, keyed by system clock (system_time_z). "
-        "CLOCKS retrieves captures via REPORT(gnss_time=<key>).",
+        "Time-key ring capacity=%d. pps_count ring capacity=%d. "
+        "PPS-count identity available (RESET_PPS_COUNT + REPORT_PPS_COUNT). "
+        "Instrumentation enabled (PITIMER_INFO).",
         PI_TIMER_FREQ,
         NS_PER_TICK,
         ISOLATED_CORE,
         RING_BUFFER_CAPACITY,
+        PPS_COUNT_RING_CAPACITY,
     )
 
-    # Verify binary exists
     if not os.path.isfile(PPSPOLL_BINARY):
         logging.error(
-            "❌ [pitimer] pps_poll binary not found at %s — "
-            "build with: gcc -O2 -o pps_poll pps_poll.c -lm",
+            "❌ [pitimer] pps_poll binary not found at %s — build with: gcc -O2 -o pps_poll pps_poll.c -lm",
             PPSPOLL_BINARY,
         )
         return
 
-    # Start supervisor thread (spawns pps_poll, restarts on crash)
     threading.Thread(
         target=_supervisor,
         daemon=True,
         name="pitimer-supervisor",
     ).start()
 
-    # Start command socket server (blocks forever)
     server_setup(
         subsystem="PITIMER",
         commands=COMMANDS,

@@ -12,93 +12,16 @@ Responsibilities:
   * Recover clocks after restart if campaign is active
   * Command GNSS into Time Only mode when campaign has a location
 
-Four tracked clocks:
-  * GNSS: 10 MHz VCLK counted in Teensy ISR (~100 ns quantization)
-  * DWT: 600 MHz Cortex-M7 cycle counter captured in Teensy ISR
-  * Pi: 54 MHz CNTVCT_EL0 (ARM Generic Timer Virtual Count Register)
-    captured by pps_poll on an isolated core via chrony-disciplined
-    second-boundary polling (~400 ns stddev, ~15 ns detection latency)
-  * OCXO: 10 MHz AOCJY1-A oven-controlled crystal oscillator counted
-    via Teensy GPT1 external clock input (~100 ns quantization)
-
-Pi clock correlation model:
-  * Both PITIMER and CLOCKS derive their correlation key from
-    the chrony-disciplined system clock via system_time_z()
-  * pps_poll detects the second boundary from clock_gettime and
-    stores the capture keyed by system_time_z() — within
-    milliseconds of PPS
-  * When a TIMEBASE_FRAGMENT arrives from Teensy (tens of ms
-    after PPS, due to USB serial latency), CLOCKS calls
-    system_time_z() to get the same key, then fetches the
-    matching capture from PITIMER via REPORT(gnss_time=<key>)
-  * Both sides read the same local clock within the same UTC
-    second — no IPC to GNSS, no NMEA cache race, no latency
-    window where the key could change
-  * A match failure is a hard fault — CLOCKS logs a warning
-    with full PITIMER diagnostics and skips that TIMEBASE
-
-  NOTE: Previous versions called GNSS.GET_TIME for the correlation
-  key.  The NMEA cache would be overwritten with the next second's
-  forecast before CLOCKS could read it, causing systematic one-
-  second mismatches.  Using the system clock eliminates this
-  entirely.
-
-Pi TDC diagnostics in TIMEBASE:
-  * diag_pi_raw_counter     — raw CNTVCT_EL0 at detection moment
-  * diag_pi_corrected       — counter minus detection latency
-  * diag_pi_detect_ns       — polling detection latency (ns)
-  * diag_pi_correction_ticks — ticks subtracted from raw counter
-  * diag_pi_seq             — pps_poll capture sequence number
-  * diag_pi_delta           — ticks between consecutive corrected captures
-  * diag_pi_residual        — delta minus expected frequency (ticks)
-  * diag_pi_residual_ns     — residual in nanoseconds (from pps_poll)
-
-Residual policy (all clocks):
-  * Count actual ticks/nanoseconds between consecutive PPS edges
-  * Subtract expected count for that clock's frequency
-  * Express residual in nanoseconds
-  * GNSS: Teensy ISR, residual vs 1e9 ns
-  * DWT: Teensy ISR, residual vs 1e9 ns
-  * OCXO: Teensy ISR, residual vs 1e9 ns (100 ns quantization)
-  * Pi: correlated capture from PITIMER, residual vs 54e6 ticks
-    (using CORRECTED counter for best accuracy),
-    scaled to nanoseconds by display_scale (ns_per_tick)
-  * Running statistics via Welford's online algorithm
-  * Outlier rejection on all clock domains: any delta that
-    deviates from expected by more than 50% is rejected and
-    logged, preventing a single glitch from permanently
-    corrupting the running statistics
-
-Campaign start:
-  * cmd_start arms the Teensy (CLOCKS.START)
-  * The Teensy zeros all clocks at the next PPS boundary
-  * The Pi sets _request_start, consumed on next fragment arrival
-  * Pi tick epoch is captured from the first correlated PITIMER capture
-
-Recovery after restart:
-  * On startup, if an active campaign exists with TIMEBASE rows
-    in Postgres, the Pi orchestrates clock recovery
-  * Patiently wait for GNSS to acquire satellites
-  * Compute elapsed seconds since last TIMEBASE
-  * Project all clock values forward using tau
-  * Send RECOVER command to Teensy with projected values
-  * Compute synthetic Pi tick epoch for continuous pi_ns
-  * Resume normal TIMEBASE augmentation
-
-Campaign report denormalization:
-  * After each TIMEBASE, the active campaign row's JSONB payload
-    is updated with a "report" key containing:
-      - Raw timebase fields
-      - Campaign metadata (name, seconds, HH:MM:SS)
-      - Per-clock statistics: ns_now, tau, ppb, residual stats
-  * cmd_report simply reads and returns the campaign payload
-  * No active campaign -> empty OK response
-
 Semantics:
   * No smoothing, inference, or filtering
   * TIMEBASE records are sacred and immutable
   * Derivative statistics (tau, ppb, residuals) live only in
     the campaign report -- never in the TIMEBASE row itself
+
+NEW (v2026-02-25 instrumentation seed):
+  * Replace "defensive logging" with monotonic diagnostic counters
+  * Add CLOCKS_INFO command to expose anomaly rates and last-known anomaly snapshots
+  * Preserve outlier rejection (to protect Welford), but instrument its frequency
 """
 
 from __future__ import annotations
@@ -124,38 +47,68 @@ from zpnet.shared.util import system_time_z
 # Configuration
 # ---------------------------------------------------------------------
 
-# Expected nanoseconds per PPS for all clock domains.
 NS_PER_SECOND = 1_000_000_000
 
-# ARM Generic Timer frequency (54 MHz on Pi 4/5).
-# Used for Pi residual computation: expected ticks per second.
 PI_TIMER_FREQ = 54_000_000
 PI_NS_PER_TICK = 1e9 / PI_TIMER_FREQ  # ~18.519 ns
 
-# Teensy DWT runs at 600 MHz.
-# dwt_cycles = dwt_ns * 3 / 5   (inverse of ns = cycles * 5 / 3)
 DWT_CYCLES_PER_NS_NUM = 3
 DWT_CYCLES_PER_NS_DEN = 5
 
-# How often to poll GNSS while waiting for a valid fix (seconds)
 GNSS_POLL_INTERVAL = 5
-
-# How often to log a "still waiting" message (seconds)
 GNSS_WAIT_LOG_INTERVAL = 60
+
+# PITIMER correlation retry (bounded, instrumented)
+PITIMER_LOOKUP_RETRIES = 5
+PITIMER_LOOKUP_SLEEP_S = 0.05  # 50 ms between attempts
+
+# ---------------------------------------------------------------------
+# Diagnostics (monotonic counters + last anomaly snapshots)
+# ---------------------------------------------------------------------
+
+_diag: Dict[str, Any] = {
+    # Fragment ingress
+    "fragments_received": 0,
+    "fragments_ignored_no_campaign": 0,
+
+    # PITIMER correlation
+    "pitimer_lookup_calls": 0,
+    "pitimer_lookup_retries": 0,
+    "pitimer_lookup_failures": 0,
+    "pitimer_lookup_ipc_failures": 0,
+
+    # Pi capture integrity
+    "pi_capture_missing": 0,
+    "pi_capture_missing_counter": 0,
+    "pi_capture_seq_missing": 0,
+    "pi_capture_seq_repeat": 0,
+    "pi_capture_seq_jump": 0,
+    "pi_capture_corrected_repeat": 0,
+
+    # Residual outliers (all clocks)
+    "outliers_rejected_total": 0,
+    "outliers_rejected_gnss": 0,
+    "outliers_rejected_dwt": 0,
+    "outliers_rejected_ocxo": 0,
+    "outliers_rejected_pi": 0,
+
+    # Pi outlier classification
+    "pi_delta_zero": 0,
+    "pi_delta_double": 0,
+    "pi_delta_other": 0,
+
+    # Last anomaly snapshots (small, overwritten)
+    "last_pitimer_failure": {},
+    "last_pi_capture_anomaly": {},
+    "last_outlier": {},
+}
+
+# Last-seen Pi capture identity (for detecting duplicates / gaps)
+_last_pi_seq: Optional[int] = None
+_last_pi_corrected: Optional[int] = None
 
 # ---------------------------------------------------------------------
 # PPS residual tracking -- Welford's online algorithm
-#
-# Used for all four clock domains: GNSS, DWT, OCXO, Pi.
-#
-# GNSS, DWT, OCXO: accumulate in nanoseconds with expected = 1e9.
-# Pi: accumulates in raw ticks with expected = PI_TIMER_FREQ.
-#     display_scale converts ticks -> nanoseconds for reporting.
-#
-# All clock domains use outlier rejection: any delta that deviates
-# from expected by more than 50% is rejected and logged, preventing
-# a single glitch (recovery discontinuity, skipped PPS, Teensy
-# hiccup) from permanently corrupting the running statistics.
 # ---------------------------------------------------------------------
 
 class _PpsResidual:
@@ -200,7 +153,6 @@ class _PpsResidual:
             self.residual = self.delta - expected
             self.valid = True
 
-            # Welford's online algorithm
             self.n += 1
             x = float(self.residual)
             d1 = x - self.mean
@@ -245,10 +197,46 @@ class _PpsResidual:
             "pps_stderr": round(self.stderr * s, 3),
         }
 
+# ---------------------------------------------------------------------
+# Outlier-safe residual update (instrumented)
+# ---------------------------------------------------------------------
 
-# ---------------------------------------------------------------------
-# Outlier-safe residual update
-# ---------------------------------------------------------------------
+def _classify_pi_delta(delta: int) -> str:
+    if delta == 0:
+        return "zero"
+    # "about 2 seconds" in ticks
+    if abs(delta - (2 * PI_TIMER_FREQ)) < 10_000:
+        return "double"
+    return "other"
+
+def _note_outlier(label: str, value_now: int, last_value: int, expected: int, delta: int, deviation: int) -> None:
+    _diag["outliers_rejected_total"] += 1
+    if label == "GNSS":
+        _diag["outliers_rejected_gnss"] += 1
+    elif label == "DWT":
+        _diag["outliers_rejected_dwt"] += 1
+    elif label == "OCXO":
+        _diag["outliers_rejected_ocxo"] += 1
+    elif label == "Pi":
+        _diag["outliers_rejected_pi"] += 1
+
+        cls = _classify_pi_delta(delta)
+        if cls == "zero":
+            _diag["pi_delta_zero"] += 1
+        elif cls == "double":
+            _diag["pi_delta_double"] += 1
+        else:
+            _diag["pi_delta_other"] += 1
+
+    _diag["last_outlier"] = {
+        "ts_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        "label": label,
+        "value_now": int(value_now),
+        "last_value": int(last_value),
+        "delta": int(delta),
+        "expected": int(expected),
+        "deviation": int(deviation),
+    }
 
 def _safe_residual_update(
     tracker: _PpsResidual,
@@ -257,56 +245,45 @@ def _safe_residual_update(
     label: str,
 ) -> None:
     """
-    Update a residual tracker with outlier rejection.
+    Update a residual tracker with outlier rejection + instrumentation.
 
-    If the tracker already has a previous value, peek at the
-    prospective delta before committing to Welford's.  If the
-    delta deviates from expected by more than 50%, reject the
-    sample, log a warning, and advance the anchor so the next
-    delta starts clean.
-
-    If this is the first sample (last_value == 0), just pass
-    through to update() which will set the anchor without
-    computing a delta.
+    Policy:
+      * Reject any delta with |delta-expected| > expected/2
+      * On reject:
+          - increment counters
+          - capture last anomaly snapshot
+          - advance anchor (last_value=value_now) so the next delta starts clean
+      * No warnings required for correctness; the counters are the signal.
     """
     if tracker.last_value > 0:
         prospective_delta = value_now - tracker.last_value
         deviation = abs(prospective_delta - expected)
         if deviation > expected // 2:
-            logging.warning(
-                "⚠️ [clocks] %s residual outlier rejected: "
-                "delta=%d (expected %d, deviation %d)",
-                label, prospective_delta, expected, deviation,
+            _note_outlier(
+                label=label,
+                value_now=value_now,
+                last_value=tracker.last_value,
+                expected=expected,
+                delta=prospective_delta,
+                deviation=deviation,
             )
             tracker.last_value = value_now
             return
-    tracker.update(value_now, expected)
 
+    tracker.update(value_now, expected)
 
 # ---------------------------------------------------------------------
 # Local state (process lifetime)
 # ---------------------------------------------------------------------
 
-# Request flags -- set by cmd_start/cmd_stop, consumed by
-# the fragment handler.
 _request_start: bool = False
 _request_stop: bool = False
 
-# True while a campaign is actively acquiring.
 _campaign_active: bool = False
 
-# Pi tick epoch -- the CNTVCT_EL0 value at campaign start.
-# Subtracted from raw counter to produce campaign-scoped ticks,
-# which are then converted to nanoseconds for the TIMEBASE record.
-# NOTE: We use the CORRECTED counter for epoch and all downstream
-# computations, so the Pi-side TDC correction is baked in.
 _pi_tick_epoch: int = 0
 _pi_tick_epoch_set: bool = False
 
-# Per-clock PPS residual trackers.
-# GNSS and DWT: nanoseconds, display_scale=1.0
-# OCXO: nanoseconds (100 ns quantization from 10 MHz), display_scale=1.0
-# Pi: raw ticks (CORRECTED), display_scale=PI_NS_PER_TICK
 _residual_gnss = _PpsResidual()
 _residual_dwt = _PpsResidual()
 _residual_pi = _PpsResidual(display_scale=PI_NS_PER_TICK)
@@ -320,61 +297,60 @@ def _get_pitimer_capture_by_time(time_key: str) -> Optional[Dict[str, Any]]:
     """
     Fetch the Pi arch timer capture for a specific time key from PITIMER.
 
-    This is the primary correlation path.  PITIMER maintains a ring
-    buffer of captures indexed by system_time_z().  We request the
-    capture matching the same UTC second as this fragment.
-
-    Both PITIMER and CLOCKS derive the key from the same chrony-
-    disciplined system clock, so the keys are guaranteed to match
-    as long as both sides are within the same UTC second — which
-    they always are (pps_poll stores within ms of PPS, fragment
-    arrives tens of ms later via USB).
-
-    Returns the PITIMER REPORT payload on match, or None on mismatch.
-    On mismatch, logs a warning with full PITIMER diagnostics.
+    Instrumented + bounded retry:
+      * PITIMER capture insertion and CLOCKS lookup are in separate threads/processes.
+      * During startup / recovery / transient load, a keyed capture can be absent briefly.
+      * We retry a few times to reduce false "missing capture" conditions.
+      * Any failure is counted and surfaced via CLOCKS_INFO.
     """
-    try:
+    _diag["pitimer_lookup_calls"] += 1
 
-        # Give time for zpnet-pitimer to recognize the PPS capture and store it in the ring buffer.
-        time.sleep(0.100)
+    for attempt in range(1, PITIMER_LOOKUP_RETRIES + 1):
+        try:
+            if attempt > 1:
+                _diag["pitimer_lookup_retries"] += 1
+                time.sleep(PITIMER_LOOKUP_SLEEP_S)
 
-        resp = send_command(
-            machine="PI",
-            subsystem="PITIMER",
-            command="REPORT",
-            args={"gnss_time": time_key},
-        )
+            resp = send_command(
+                machine="PI",
+                subsystem="PITIMER",
+                command="REPORT",
+                args={"gnss_time": time_key},
+            )
 
-        if resp.get("success"):
-            return resp.get("payload", {})
+            if resp.get("success"):
+                return resp.get("payload", {})
 
-        # Correlation failure — hard fault
-        pitimer_payload = resp.get("payload", {})
-        logging.warning(
-            "🚨 [clocks] PITIMER correlation FAILED for time_key=%s — "
-            "PITIMER response: %s",
-            time_key,
-            json.dumps(pitimer_payload, indent=2),
-        )
-        return None
+            # Not found / mismatch
+            pitimer_payload = resp.get("payload", {})
+            if attempt == PITIMER_LOOKUP_RETRIES:
+                _diag["pitimer_lookup_failures"] += 1
+                _diag["last_pitimer_failure"] = {
+                    "ts_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+                    "time_key": time_key,
+                    "attempts": PITIMER_LOOKUP_RETRIES,
+                    "pitimer_payload": pitimer_payload,
+                }
+            continue
 
-    except Exception:
-        logging.exception(
-            "🚨 [clocks] PITIMER.REPORT IPC failed for time_key=%s",
-            time_key,
-        )
-        return None
+        except Exception:
+            if attempt == PITIMER_LOOKUP_RETRIES:
+                _diag["pitimer_lookup_ipc_failures"] += 1
+                _diag["last_pitimer_failure"] = {
+                    "ts_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+                    "time_key": time_key,
+                    "attempts": PITIMER_LOOKUP_RETRIES,
+                    "exception": "PITIMER.REPORT IPC failed",
+                }
+            continue
+
+    return None
 
 
 def _get_pitimer_capture_via_command() -> Optional[Dict[str, Any]]:
     """
-    Fetch the latest Pi arch timer capture from the PITIMER process
-    via the command channel (unkeyed).
-
-    Used ONLY during recovery, before correlated captures are needed.
-
-    Returns the PITIMER REPORT payload, or None if PITIMER is
-    not available or has no capture yet.
+    Fetch the latest Pi arch timer capture from PITIMER (unkeyed).
+    Used ONLY during recovery.
     """
     try:
         resp = send_command(
@@ -403,18 +379,8 @@ def _ticks_to_ns(ticks: int) -> int:
 
 def _wait_for_gnss_time() -> str:
     """
-    Patiently wait for the GNSS receiver to produce a valid timestamp.
-
-    After a cold start, the receiver may need minutes to acquire
-    satellites and compute a fix.  This function polls GNSS.GET_TIME
-    every GNSS_POLL_INTERVAL seconds and logs a "still waiting"
-    message every GNSS_WAIT_LOG_INTERVAL seconds.
-
+    Patiently wait for GNSS time to be available (ISO8601 Z).
     Used only during recovery.
-
-    Returns ISO8601 Z string once available.
-    Never times out -- the math works regardless of how long
-    the wait is.
     """
     wait_start = time.monotonic()
     last_log = wait_start
@@ -435,10 +401,7 @@ def _wait_for_gnss_time() -> str:
         elapsed = now - wait_start
 
         if now - last_log >= GNSS_WAIT_LOG_INTERVAL:
-            logging.info(
-                "⏳ [recovery] waiting for GNSS time... (%.0fs elapsed)",
-                elapsed,
-            )
+            logging.info("⏳ [recovery] waiting for GNSS time... (%.0fs elapsed)", elapsed)
             last_log = now
 
         time.sleep(GNSS_POLL_INTERVAL)
@@ -447,7 +410,6 @@ def _wait_for_gnss_time() -> str:
 def _get_active_campaign() -> Optional[Dict[str, Any]]:
     """
     Return active campaign row or None.
-
     Returns dict with keys: campaign, payload (JSONB).
     """
     with open_db(row_dict=True) as conn:
@@ -470,14 +432,10 @@ def _get_active_campaign() -> Optional[Dict[str, Any]]:
     if isinstance(payload, str):
         payload = json.loads(payload)
 
-    return {
-        "campaign": row["campaign"],
-        "payload": payload,
-    }
+    return {"campaign": row["campaign"], "payload": payload}
 
 
 def _set_gnss_mode_to(location: str) -> Dict[str, Any]:
-    """Command GNSS process to switch to Time Only mode at a location."""
     return send_command(
         machine="PI",
         subsystem="GNSS",
@@ -487,7 +445,6 @@ def _set_gnss_mode_to(location: str) -> Dict[str, Any]:
 
 
 def _set_gnss_mode_normal() -> Dict[str, Any]:
-    """Command GNSS process to return to normal (CSS) mode."""
     return send_command(
         machine="PI",
         subsystem="GNSS",
@@ -495,13 +452,11 @@ def _set_gnss_mode_normal() -> Dict[str, Any]:
         args={"mode": "NORMAL"},
     )
 
-
 # ---------------------------------------------------------------------
 # Clock statistics helpers
 # ---------------------------------------------------------------------
 
 def _seconds_to_hms(seconds: int) -> str:
-    """Format integer seconds as HH:MM:SS."""
     h = seconds // 3600
     m = (seconds % 3600) // 60
     s = seconds % 60
@@ -509,14 +464,12 @@ def _seconds_to_hms(seconds: int) -> str:
 
 
 def _compute_tau(clock_ns: int, gnss_ns: int) -> float:
-    """Dimensionless ratio: clock_ns / gnss_ns."""
     if gnss_ns == 0:
         return 0.0
     return clock_ns / gnss_ns
 
 
 def _compute_ppb(clock_ns: int, gnss_ns: int) -> float:
-    """Deviation from GNSS in parts-per-billion."""
     if gnss_ns == 0:
         return 0.0
     return ((clock_ns - gnss_ns) / gnss_ns) * 1e9
@@ -542,7 +495,6 @@ def _build_clock_block(
     block.update(residual.to_dict())
     return block
 
-
 # ---------------------------------------------------------------------
 # Campaign report builder
 # ---------------------------------------------------------------------
@@ -552,38 +504,25 @@ def _build_report(
     campaign_payload: Dict[str, Any],
     timebase: Dict[str, Any],
 ) -> Dict[str, Any]:
-    """
-    Build the augmented campaign report from a TIMEBASE record
-    and current residual statistics.
-
-    This is denormalized into the campaign's JSONB payload as
-    the "report" key, and is what cmd_report returns verbatim.
-    """
     gnss_ns = int(timebase.get("teensy_gnss_ns") or 0)
     dwt_ns = int(timebase.get("teensy_dwt_ns") or 0)
     pi_ns = int(timebase.get("pi_ns") or 0)
     ocxo_ns = int(timebase.get("teensy_ocxo_ns") or 0)
 
-    # Campaign elapsed time derived from GNSS nanoseconds
-    # (GNSS is truth -- use it as the elapsed-time reference)
     campaign_seconds = gnss_ns // NS_PER_SECOND if gnss_ns > 0 else 0
 
     report: Dict[str, Any] = {
-        # Campaign metadata
         "campaign": campaign_name,
         "campaign_state": "STARTED",
         "campaign_seconds": campaign_seconds,
         "campaign_elapsed": _seconds_to_hms(campaign_seconds),
         "location": campaign_payload.get("location"),
 
-        # Timestamps
         "gnss_time_utc": timebase.get("gnss_time_utc"),
         "system_time_utc": timebase.get("system_time_utc"),
 
-        # PPS count
         "teensy_pps_count": timebase.get("teensy_pps_count"),
 
-        # Raw clock values (for forensics / recovery)
         "teensy_dwt_cycles": timebase.get("teensy_dwt_cycles"),
         "teensy_ocxo_ns": timebase.get("teensy_ocxo_ns"),
         "teensy_rtc1_ns": timebase.get("teensy_rtc1_ns"),
@@ -591,7 +530,6 @@ def _build_report(
         "pi_counter": timebase.get("pi_counter"),
         "pi_corrected": timebase.get("pi_corrected"),
 
-        # Per-clock statistics (all residual stats in nanoseconds)
         "gnss": _build_clock_block("GNSS", gnss_ns, gnss_ns, _residual_gnss),
         "dwt": _build_clock_block("DWT", dwt_ns, gnss_ns, _residual_dwt),
         "pi": _build_clock_block("PI", pi_ns, gnss_ns, _residual_pi),
@@ -600,17 +538,11 @@ def _build_report(
 
     return report
 
-
 # ---------------------------------------------------------------------
 # Persistence
 # ---------------------------------------------------------------------
 
 def _persist_timebase(tb: Dict[str, Any], report: Dict[str, Any]) -> None:
-    """
-    Best-effort TIMEBASE insert + report denormalization.
-
-    Failure is logged and ignored.
-    """
     try:
         with open_db() as conn:
             cur = conn.cursor()
@@ -636,44 +568,14 @@ def _persist_timebase(tb: Dict[str, Any], report: Dict[str, Any]) -> None:
     except Exception:
         logging.exception("⚠️ [clocks] failed to persist TIMEBASE (ignored)")
 
-
 # -----------------------------------------------------------------
 # Recovery
 # -----------------------------------------------------------------
 
 def _recover_campaign() -> None:
-    """
-    Detect and recover an in-progress campaign after Pi restart.
-
-    Called once at startup, before normal operation begins.
-
-    Algorithm:
-      1) Check for active campaign in Postgres
-      2) Fetch the most recent TIMEBASE row for that campaign
-      3) Wait patiently for GNSS to acquire satellites
-      4) If campaign has a location, restore GNSS -> TO mode
-      5) Capture GNSS time and PITIMER counter
-      6) Compute elapsed seconds since last TIMEBASE
-      7) Compute tau for each clock domain
-      8) Project all clock values forward to the NEXT PPS edge
-      9) Send RECOVER command to Teensy with projected values
-         AND the persisted OCXO DAC value + calibration state
-     10) Compute synthetic Pi tick epoch for continuous pi_ns
-     11) Activate campaign
-
-    NOTE: Recovery uses _get_pitimer_capture_via_command() (unkeyed)
-    because correlated captures are not needed during recovery —
-    we just need the latest counter value to compute the Pi epoch.
-
-    NOTE: Recovery still uses GNSS.GET_TIME for elapsed time
-    computation (needs actual GNSS time for datetime arithmetic).
-    Normal operation uses system_time_z() for correlation keys.
-    """
     global _campaign_active, _pi_tick_epoch, _pi_tick_epoch_set
+    global _last_pi_seq, _last_pi_corrected
 
-    # ----------------------------------------------------------
-    # 1) Check for active campaign
-    # ----------------------------------------------------------
     row = _get_active_campaign()
     if row is None:
         logging.info("🔍 [recovery] no active campaign -- nothing to recover")
@@ -682,15 +584,13 @@ def _recover_campaign() -> None:
     campaign_name = row["campaign"]
     campaign_payload = row["payload"]
     campaign_location = campaign_payload.get("location")
+
     logging.info(
         "🔍 [recovery] active campaign found: '%s' (location: %s)",
         campaign_name,
         campaign_location or "none",
     )
 
-    # ----------------------------------------------------------
-    # 2) Fetch most recent TIMEBASE for this campaign
-    # ----------------------------------------------------------
     with open_db(row_dict=True) as conn:
         cur = conn.cursor()
         cur.execute(
@@ -717,9 +617,8 @@ def _recover_campaign() -> None:
         last_tb = json.loads(last_tb)
 
     last_gnss_utc_str = last_tb["gnss_time_utc"]
-    last_gnss_utc = datetime.fromisoformat(
-        last_gnss_utc_str.replace("Z", "+00:00")
-    )
+    last_gnss_utc = datetime.fromisoformat(last_gnss_utc_str.replace("Z", "+00:00"))
+
     last_dwt_ns = int(last_tb["teensy_dwt_ns"])
     last_gnss_ns = int(last_tb.get("teensy_gnss_ns") or 0)
     last_ocxo_ns = int(last_tb.get("teensy_ocxo_ns") or 0)
@@ -734,7 +633,6 @@ def _recover_campaign() -> None:
         last_pi_ns,
     )
 
-    # If gnss_ns is not available, fall back to dwt_ns
     if last_gnss_ns == 0:
         logging.warning(
             "⚠️ [recovery] teensy_gnss_ns not available in TIMEBASE -- "
@@ -742,9 +640,6 @@ def _recover_campaign() -> None:
         )
         last_gnss_ns = last_dwt_ns
 
-    # ----------------------------------------------------------
-    # Read persisted OCXO control state from campaign payload
-    # ----------------------------------------------------------
     recover_ocxo_dac = campaign_payload.get("ocxo_dac")
     recover_calibrate = campaign_payload.get("calibrate_ocxo", False)
     recover_converged = campaign_payload.get("servo_converged", False)
@@ -757,21 +652,10 @@ def _recover_campaign() -> None:
             recover_converged,
         )
 
-    # ----------------------------------------------------------
-    # 3) Wait for GNSS to produce a valid timestamp
-    # ----------------------------------------------------------
     logging.info("⏳ [recovery] waiting for GNSS time to become available...")
-
     gnss_time_preflight = _wait_for_gnss_time()
+    logging.info("✅ [recovery] GNSS time available: %s", gnss_time_preflight)
 
-    logging.info(
-        "✅ [recovery] GNSS time available: %s",
-        gnss_time_preflight,
-    )
-
-    # ----------------------------------------------------------
-    # 4) If campaign has a location, restore GNSS -> TO mode
-    # ----------------------------------------------------------
     if campaign_location:
         logging.info(
             "📡 [recovery] restoring GNSS -> TO mode for location '%s'",
@@ -789,17 +673,8 @@ def _recover_campaign() -> None:
         except Exception:
             logging.exception("⚠️ [recovery] GNSS MODE=TO IPC failed (continuing)")
 
-    # ----------------------------------------------------------
-    # 5) Capture GNSS time and PITIMER counter
-    #
-    # Use system_time_z() for the current time — it's the same
-    # disciplined clock, and we only need it to compute elapsed
-    # seconds (not for correlation).
-    # ----------------------------------------------------------
     gnss_time_now_str = system_time_z()
-    gnss_time_now = datetime.fromisoformat(
-        gnss_time_now_str.replace("Z", "+00:00")
-    )
+    gnss_time_now = datetime.fromisoformat(gnss_time_now_str.replace("Z", "+00:00"))
 
     pi_capture = _get_pitimer_capture_via_command()
     pi_counter_now = 0
@@ -812,41 +687,21 @@ def _recover_campaign() -> None:
         pi_counter_now,
     )
 
-    # ----------------------------------------------------------
-    # 6) Compute elapsed seconds since last TIMEBASE
-    # ----------------------------------------------------------
     elapsed_td = gnss_time_now - last_gnss_utc
     elapsed_seconds = int(elapsed_td.total_seconds())
 
     if elapsed_seconds <= 0:
-        logging.error(
-            "❌ [recovery] elapsed seconds is %d -- time went backwards?",
-            elapsed_seconds,
-        )
+        logging.error("❌ [recovery] elapsed seconds is %d -- time went backwards?", elapsed_seconds)
         return
 
-    logging.info(
-        "📐 [recovery] elapsed since last TIMEBASE: %d seconds",
-        elapsed_seconds,
-    )
+    logging.info("📐 [recovery] elapsed since last TIMEBASE: %d seconds", elapsed_seconds)
 
-    # ----------------------------------------------------------
-    # 7) Compute tau for each clock domain
-    # ----------------------------------------------------------
     tau_dwt = float(last_dwt_ns) / float(last_gnss_ns) if last_gnss_ns > 0 else 1.0
     tau_ocxo = float(last_ocxo_ns) / float(last_gnss_ns) if (last_gnss_ns > 0 and last_ocxo_ns > 0) else 1.0
     tau_pi = float(last_pi_ns) / float(last_gnss_ns) if (last_gnss_ns > 0 and last_pi_ns > 0) else 1.0
 
-    logging.info(
-        "📐 [recovery] tau -- dwt=%.12f  ocxo=%.12f  pi=%.12f",
-        tau_dwt,
-        tau_ocxo,
-        tau_pi,
-    )
+    logging.info("📐 [recovery] tau -- dwt=%.12f  ocxo=%.12f  pi=%.12f", tau_dwt, tau_ocxo, tau_pi)
 
-    # ----------------------------------------------------------
-    # 8) Project clock values to the NEXT PPS edge
-    # ----------------------------------------------------------
     project_seconds = elapsed_seconds + 1
 
     projected_gnss_ns = last_gnss_ns + (project_seconds * NS_PER_SECOND)
@@ -865,9 +720,6 @@ def _recover_campaign() -> None:
         projected_pi_ns,
     )
 
-    # ----------------------------------------------------------
-    # 9) Send RECOVER to Teensy (with OCXO DAC state)
-    # ----------------------------------------------------------
     logging.info("🚀 [recovery] sending RECOVER to Teensy...")
 
     recover_args = {
@@ -876,20 +728,12 @@ def _recover_campaign() -> None:
         "ocxo_ns": str(projected_ocxo_ns),
     }
 
-    # Restore OCXO DAC to last-known value so the crystal
-    # doesn't reset to the boot default (2048) mid-campaign.
     if recover_ocxo_dac is not None:
         recover_args["set_dac"] = str(int(recover_ocxo_dac))
 
-    # If calibration was active and hadn't converged,
-    # re-enable the servo so it can continue hunting.
-    # If it had already converged, just set the DAC and
-    # don't re-enable — the value is already good.
     if recover_calibrate and not recover_converged:
         recover_args["calibrate_ocxo"] = "true"
-        logging.info(
-            "🔧 [recovery] re-enabling OCXO calibration servo (not yet converged)"
-        )
+        logging.info("🔧 [recovery] re-enabling OCXO calibration servo (not yet converged)")
     elif recover_calibrate and recover_converged:
         logging.info(
             "🔧 [recovery] OCXO servo was converged — restoring DAC=%d without re-calibrating",
@@ -907,82 +751,48 @@ def _recover_campaign() -> None:
         if recover_resp.get("success", True):
             logging.info("✅ [recovery] Teensy RECOVER accepted")
         else:
-            logging.warning(
-                "⚠️ [recovery] Teensy RECOVER response: %s",
-                recover_resp.get("message", "?"),
-            )
+            logging.warning("⚠️ [recovery] Teensy RECOVER response: %s", recover_resp.get("message", "?"))
     except Exception:
         logging.exception("❌ [recovery] Teensy RECOVER IPC failed")
         return
 
-    # ----------------------------------------------------------
-    # 10) Compute synthetic Pi tick epoch for continuous pi_ns
-    # ----------------------------------------------------------
     if pi_counter_now > 0 and projected_pi_ns > 0:
         projected_pi_ticks = (projected_pi_ns * PI_TIMER_FREQ) // NS_PER_SECOND
         _pi_tick_epoch = pi_counter_now - projected_pi_ticks
         _pi_tick_epoch_set = True
-        logging.info(
-            "📐 [recovery] Pi tick epoch set: %d (projected pi_ticks=%d)",
-            _pi_tick_epoch,
-            projected_pi_ticks,
-        )
+        logging.info("📐 [recovery] Pi tick epoch set: %d (projected pi_ticks=%d)", _pi_tick_epoch, projected_pi_ticks)
     else:
-        logging.warning(
-            "⚠️ [recovery] PITIMER not available -- Pi tick epoch will be set on first capture"
-        )
+        logging.warning("⚠️ [recovery] PITIMER not available -- Pi tick epoch will be set on first capture")
 
-    # ----------------------------------------------------------
-    # 11) Activate campaign
-    # ----------------------------------------------------------
     _residual_gnss.reset()
     _residual_dwt.reset()
     _residual_pi.reset()
     _residual_ocxo.reset()
+
+    # Reset last-seen Pi capture identity (fresh after recovery)
+    _last_pi_seq = None
+    _last_pi_corrected = None
+
     _campaign_active = True
 
     logging.info(
-        "✅ [recovery] campaign '%s' recovered -- "
-        "Teensy RECOVER sent, awaiting first TIMEBASE_FRAGMENT",
+        "✅ [recovery] campaign '%s' recovered -- Teensy RECOVER sent, awaiting first TIMEBASE_FRAGMENT",
         campaign_name,
     )
-
 
 # ---------------------------------------------------------------------
 # TIMEBASE_FRAGMENT handler
 # ---------------------------------------------------------------------
 
 def on_timebase_fragment(payload: Payload) -> None:
-    """
-    Receive TIMEBASE_FRAGMENT from Teensy and build TIMEBASE.
-
-    This is the main data path.  Each fragment triggers:
-      1) Pi-side observations (system time)
-      2) System clock correlation key (via system_time_z)
-      3) Correlated Pi capture (via PITIMER.REPORT with time key)
-      4) TIMEBASE augmentation (combine Teensy + Pi + GNSS)
-      5) Residual statistics update (GNSS, DWT, OCXO, Pi)
-      6) Report denormalization into campaign payload
-      7) Publish + persist
-      8) Persist latest OCXO DAC value into campaign payload
-
-    Pi residual statistics are computed here in the fragment
-    handler, driven by the correlated capture — not in a separate
-    subscription handler.  Since the capture is guaranteed to match
-    the fragment's PPS edge (by system clock key), there is no race
-    condition and no need for separate timing.
-    """
     global _request_start, _request_stop, _campaign_active
     global _pi_tick_epoch, _pi_tick_epoch_set
+    global _last_pi_seq, _last_pi_corrected
 
-    # ----------------------------------------------------------
-    # Capture Pi-side observations immediately
-    # ----------------------------------------------------------
+    _diag["fragments_received"] += 1
+
     system_time_utc = datetime.now(timezone.utc)
 
-    # ----------------------------------------------------------
-    # Process request flags
-    # ----------------------------------------------------------
     if _request_stop:
         _campaign_active = False
         _request_stop = False
@@ -994,33 +804,27 @@ def on_timebase_fragment(payload: Payload) -> None:
         _residual_pi.reset()
         _residual_ocxo.reset()
         _pi_tick_epoch_set = False
+
+        _last_pi_seq = None
+        _last_pi_corrected = None
+
         _campaign_active = True
         _request_start = False
         logging.info("▶️ [clocks] campaign started")
 
     if not _campaign_active:
+        _diag["fragments_ignored_no_campaign"] += 1
         return
 
-    system_time_str = system_time_utc.isoformat(timespec='microseconds')
+    system_time_str = system_time_utc.isoformat(timespec="microseconds")
 
-    # ----------------------------------------------------------
-    # Get correlation key from the system clock.
-    #
-    # Both PITIMER and CLOCKS derive this from the same chrony-
-    # disciplined clock.  pps_poll stored the capture with this
-    # same key within milliseconds of PPS.  The fragment arrives
-    # tens of ms later via USB, so the key is always available.
-    # ----------------------------------------------------------
+    # Correlation key derived from system clock (disciplined)
     time_key = system_time_z()
 
-    # ----------------------------------------------------------
     # Fetch correlated Pi capture from PITIMER
-    # ----------------------------------------------------------
     pi_capture = _get_pitimer_capture_by_time(time_key)
 
-    # ----------------------------------------------------------
     # Extract Pi capture diagnostics and compute campaign-scoped pi_ns
-    # ----------------------------------------------------------
     pi_counter_raw = None
     pi_counter_corrected = None
     pi_detect_ns = None
@@ -1031,7 +835,14 @@ def on_timebase_fragment(payload: Payload) -> None:
     pi_residual_ns = None
     pi_ns = 0
 
-    if pi_capture is not None:
+    if pi_capture is None:
+        _diag["pi_capture_missing"] += 1
+        _diag["last_pi_capture_anomaly"] = {
+            "ts_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+            "time_key": time_key,
+            "reason": "pitimer_capture_none",
+        }
+    else:
         pi_counter_raw = pi_capture.get("counter")
         pi_counter_corrected = pi_capture.get("corrected") or pi_counter_raw
         pi_detect_ns = pi_capture.get("detect_ns")
@@ -1041,26 +852,57 @@ def on_timebase_fragment(payload: Payload) -> None:
         pi_residual = pi_capture.get("residual")
         pi_residual_ns = pi_capture.get("residual_ns")
 
+        if pi_counter_corrected is None:
+            _diag["pi_capture_missing_counter"] += 1
+        if pi_seq is None:
+            _diag["pi_capture_seq_missing"] += 1
+
+        # Pi capture integrity checks (best-effort; purely observational)
+        if isinstance(pi_seq, int):
+            if _last_pi_seq is not None:
+                if pi_seq == _last_pi_seq:
+                    _diag["pi_capture_seq_repeat"] += 1
+                    _diag["last_pi_capture_anomaly"] = {
+                        "ts_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+                        "time_key": time_key,
+                        "reason": "seq_repeat",
+                        "seq": pi_seq,
+                        "prev_seq": _last_pi_seq,
+                    }
+                elif pi_seq > (_last_pi_seq + 1):
+                    _diag["pi_capture_seq_jump"] += 1
+                    _diag["last_pi_capture_anomaly"] = {
+                        "ts_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+                        "time_key": time_key,
+                        "reason": "seq_jump",
+                        "seq": pi_seq,
+                        "prev_seq": _last_pi_seq,
+                        "jump": pi_seq - _last_pi_seq,
+                    }
+            _last_pi_seq = pi_seq
+
+        if isinstance(pi_counter_corrected, int):
+            if _last_pi_corrected is not None and pi_counter_corrected == _last_pi_corrected:
+                _diag["pi_capture_corrected_repeat"] += 1
+                _diag["last_pi_capture_anomaly"] = {
+                    "ts_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+                    "time_key": time_key,
+                    "reason": "corrected_repeat",
+                    "corrected": pi_counter_corrected,
+                }
+            _last_pi_corrected = pi_counter_corrected
+
+    # Epoch and pi_ns derivation
     if pi_counter_corrected is not None and not _pi_tick_epoch_set:
-        _pi_tick_epoch = pi_counter_corrected
+        _pi_tick_epoch = int(pi_counter_corrected)
         _pi_tick_epoch_set = True
-        logging.info(
-            "⏱️ [clocks] Pi tick epoch set: %d (corrected counter, time_key=%s)",
-            _pi_tick_epoch,
-            time_key,
-        )
+        logging.info("⏱️ [clocks] Pi tick epoch set: %d (corrected counter, time_key=%s)", _pi_tick_epoch, time_key)
 
     if pi_counter_corrected is not None and _pi_tick_epoch_set:
-        campaign_ticks = pi_counter_corrected - _pi_tick_epoch
+        campaign_ticks = int(pi_counter_corrected) - _pi_tick_epoch
         pi_ns = _ticks_to_ns(campaign_ticks)
 
-    # ----------------------------------------------------------
-    # Update residual statistics (all four clocks)
-    #
-    # Pi residual is computed here, driven by the correlated
-    # capture.  Since the capture is guaranteed to match the
-    # fragment's PPS edge, every update is a clean 1-second delta.
-    # ----------------------------------------------------------
+    # Update residual statistics
     frag = payload
     gnss_ns = int(frag.get("gnss_ns") or 0)
     dwt_ns = int(frag.get("dwt_ns") or 0)
@@ -1073,14 +915,13 @@ def on_timebase_fragment(payload: Payload) -> None:
     if ocxo_ns > 0:
         _safe_residual_update(_residual_ocxo, ocxo_ns, NS_PER_SECOND, "OCXO")
     if pi_counter_corrected is not None:
-        _safe_residual_update(_residual_pi, pi_counter_corrected, PI_TIMER_FREQ, "Pi")
+        _safe_residual_update(_residual_pi, int(pi_counter_corrected), PI_TIMER_FREQ, "Pi")
 
-    # ----------------------------------------------------------
     # Build TIMEBASE record
-    # ----------------------------------------------------------
     row = _get_active_campaign()
     if row is None:
         logging.warning("⚠️ [clocks] fragment received with no active campaign")
+        _diag["fragments_ignored_no_campaign"] += 1
         return
 
     campaign = row["campaign"]
@@ -1089,13 +930,9 @@ def on_timebase_fragment(payload: Payload) -> None:
     timebase = {
         "campaign": campaign,
 
-        # System time when fragment arrived
         "system_time_utc": system_time_str,
-
-        # GNSS time correlation key (from system clock)
         "gnss_time_utc": time_key,
 
-        # Teensy clocks (authoritative)
         "teensy_dwt_cycles": frag["dwt_cycles"],
         "teensy_dwt_ns": frag["dwt_ns"],
         "teensy_gnss_ns": frag["gnss_ns"],
@@ -1103,12 +940,10 @@ def on_timebase_fragment(payload: Payload) -> None:
         "teensy_rtc1_ns": frag.get("rtc1_ns"),
         "teensy_rtc2_ns": frag.get("rtc2_ns"),
 
-        # Pi clock
         "pi_counter": pi_counter_raw,
         "pi_corrected": pi_counter_corrected,
         "pi_ns": pi_ns,
 
-        # Pi TDC diagnostics
         "diag_pi_raw_counter": pi_counter_raw,
         "diag_pi_corrected": pi_counter_corrected,
         "diag_pi_detect_ns": pi_detect_ns,
@@ -1119,48 +954,29 @@ def on_timebase_fragment(payload: Payload) -> None:
         "diag_pi_residual": pi_residual,
         "diag_pi_residual_ns": pi_residual_ns,
 
-        # Per-clock PPS residuals (nanoseconds)
         "isr_residual_gnss": frag.get("isr_residual_gnss"),
         "isr_residual_dwt": frag.get("isr_residual_dwt"),
         "isr_residual_ocxo": frag.get("isr_residual_ocxo"),
         "isr_residual_pi": round(_residual_pi.residual * PI_NS_PER_TICK, 3) if _residual_pi.valid else None,
 
-        # Teensy PPS count
         "teensy_pps_count": frag.get("teensy_pps_count"),
 
-        # Teensy TDC diagnostics
         "diag_teensy_dispatch_delta_ns": frag.get("dispatch_delta_ns"),
         "diag_teensy_pps_edge_valid": frag.get("pps_edge_valid"),
         "diag_teensy_pps_edge_correction_ns": frag.get("pps_edge_correction_ns"),
         "diag_teensy_detect_ns": frag.get("dispatch_delta_ns"),
 
-        # OCXO DAC control state (from Teensy telemetry)
         "ocxo_dac": frag.get("ocxo_dac"),
         "calibrate_ocxo": frag.get("calibrate_ocxo"),
         "servo_converged": frag.get("servo_converged"),
     }
 
-    # ----------------------------------------------------------
-    # Build augmented report
-    # ----------------------------------------------------------
     report = _build_report(campaign, campaign_payload, timebase)
 
-    # Publish sacred tuple
     publish("TIMEBASE", timebase)
-
-    # Persist best-effort (also denormalizes report into campaign)
     _persist_timebase(timebase, report)
 
-    # ----------------------------------------------------------
-    # Persist latest OCXO DAC value into campaign payload.
-    #
-    # This captures the servo's progress as it converges.
-    # On recovery, the Pi reads this value and sends it back
-    # to the Teensy so the OCXO resumes at the last-known
-    # good control voltage.
-    #
-    # Best-effort — failure is logged and ignored.
-    # ----------------------------------------------------------
+    # Persist latest OCXO DAC state into campaign payload (best-effort)
     teensy_ocxo_dac = frag.get("ocxo_dac")
     teensy_calibrate = frag.get("calibrate_ocxo")
     teensy_converged = frag.get("servo_converged")
@@ -1177,58 +993,39 @@ def on_timebase_fragment(payload: Payload) -> None:
                       AND active = true
                     """,
                     (
-                        json.dumps({
-                            "ocxo_dac": int(teensy_ocxo_dac),
-                            "calibrate_ocxo": bool(teensy_calibrate),
-                            "servo_converged": bool(teensy_converged),
-                        }),
+                        json.dumps(
+                            {
+                                "ocxo_dac": int(teensy_ocxo_dac),
+                                "calibrate_ocxo": bool(teensy_calibrate),
+                                "servo_converged": bool(teensy_converged),
+                            }
+                        ),
                         campaign,
                     ),
                 )
         except Exception:
             logging.exception("⚠️ [clocks] failed to persist OCXO DAC (ignored)")
 
-
 # -----------------------------------------------------------------
 # Command handlers
 # -----------------------------------------------------------------
 
 def cmd_start(args: Optional[dict]) -> dict:
-    """
-    Start a new campaign.
-
-    Args:
-        campaign (str):          Campaign name (required)
-        location (str):          Profiled location name (optional)
-        set_dac (int):           OCXO DAC value 0–4095 (optional)
-        calibrate_ocxo (bool):   Enable OCXO calibration servo (optional)
-
-    Sequence:
-      1) Deactivate any existing campaign
-      2) Insert new campaign row (with OCXO control state persisted)
-      3) If location specified: command GNSS -> TO mode (blocking)
-      4) Set _request_start flag (consumed on next fragment)
-      5) Start Teensy CLOCKS acquisition (Teensy zeros at PPS)
-    """
     global _request_start, _request_stop
 
-    campaign = args.get("campaign")
+    campaign = args.get("campaign") if args else None
     if not campaign:
         return {"success": False, "message": "START requires 'campaign' argument"}
 
     location = (args.get("location") or "").strip() or None
 
-    # Parse OCXO control parameters
     set_dac = args.get("set_dac")
 
-    # If caller didn't specify set_dac, read from config
     if set_dac is None:
         try:
             with open_db(row_dict=True) as conn:
                 cur = conn.cursor()
-                cur.execute(
-                    "SELECT payload FROM config WHERE config_key = 'SYSTEM'"
-                )
+                cur.execute("SELECT payload FROM config WHERE config_key = 'SYSTEM'")
                 row = cur.fetchone()
                 if row and row["payload"].get("ocxo_dac") is not None:
                     set_dac = int(row["payload"]["ocxo_dac"])
@@ -1238,20 +1035,11 @@ def cmd_start(args: Optional[dict]) -> dict:
 
     calibrate_ocxo = bool(args.get("calibrate_ocxo"))
 
-    # ----------------------------------------------------------
-    # 1) Deactivate existing + insert new campaign
-    #    Persist OCXO control state so recovery can restore it.
-    # ----------------------------------------------------------
     campaign_payload = {
         "location": location,
         "started_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
     }
 
-    # Persist OCXO control state into campaign payload.
-    # ocxo_dac stores the INITIAL requested value; it will be
-    # overwritten every second by the latest Teensy telemetry
-    # as the servo converges.  Recovery reads whichever value
-    # is current at crash time.
     if set_dac is not None:
         campaign_payload["ocxo_dac"] = int(set_dac)
     if calibrate_ocxo:
@@ -1280,59 +1068,32 @@ def cmd_start(args: Optional[dict]) -> dict:
             (campaign, json.dumps(campaign_payload)),
         )
 
-    # ----------------------------------------------------------
-    # 2) If location specified, switch GNSS to Time Only mode
-    # ----------------------------------------------------------
     if location:
-        logging.info(
-            "📡 [clocks] commanding GNSS -> TO mode for location '%s'",
-            location,
-        )
+        logging.info("📡 [clocks] commanding GNSS -> TO mode for location '%s'", location)
 
         try:
             gnss_resp = _set_gnss_mode_to(location)
         except Exception:
             logging.exception("💥 [clocks] GNSS MODE=TO IPC failed")
-            return {
-                "success": False,
-                "message": f"failed to command GNSS to TO mode for '{location}'",
-            }
+            return {"success": False, "message": f"failed to command GNSS to TO mode for '{location}'"}
 
         if not gnss_resp.get("success"):
             msg = gnss_resp.get("message", "unknown error")
             logging.warning("⚠️ [clocks] GNSS MODE=TO failed: %s", msg)
-            return {
-                "success": False,
-                "message": f"GNSS MODE=TO failed: {msg}",
-                "payload": {"gnss_response": gnss_resp},
-            }
+            return {"success": False, "message": f"GNSS MODE=TO failed: {msg}", "payload": {"gnss_response": gnss_resp}}
 
         logging.info("✅ [clocks] GNSS confirmed TO mode")
 
-    # ----------------------------------------------------------
-    # 3) Arm start -- consumed on next TIMEBASE_FRAGMENT
-    # ----------------------------------------------------------
     _request_stop = False
     _request_start = True
 
-    # ----------------------------------------------------------
-    # 4) Start Teensy CLOCKS acquisition
-    #    Pass through OCXO control parameters to Teensy.
-    # ----------------------------------------------------------
-    teensy_args = {"campaign": campaign}
-
+    teensy_args: Dict[str, Any] = {"campaign": campaign}
     if set_dac is not None:
         teensy_args["set_dac"] = str(set_dac)
-
     if calibrate_ocxo:
         teensy_args["calibrate_ocxo"] = "true"
 
-    send_command(
-        machine="TEENSY",
-        subsystem="CLOCKS",
-        command="START",
-        args=teensy_args,
-    )
+    send_command(machine="TEENSY", subsystem="CLOCKS", command="START", args=teensy_args)
 
     return {
         "success": True,
@@ -1346,16 +1107,6 @@ def cmd_start(args: Optional[dict]) -> dict:
     }
 
 def cmd_stop(_: Optional[dict]) -> dict:
-    """
-    Stop active campaign.
-
-    Sequence:
-      1) Read active campaign (to check if it had a location)
-      2) Deactivate campaign in DB
-      3) Set _request_stop flag (applied on next fragment)
-      4) Stop Teensy CLOCKS acquisition
-      5) If campaign had a location: restore GNSS -> NORMAL (CSS)
-    """
     global _request_start, _request_stop
 
     row = _get_active_campaign()
@@ -1387,73 +1138,35 @@ def cmd_stop(_: Optional[dict]) -> dict:
     _request_start = False
     _request_stop = True
 
-    send_command(
-        machine="TEENSY",
-        subsystem="CLOCKS",
-        command="STOP",
-    )
+    send_command(machine="TEENSY", subsystem="CLOCKS", command="STOP")
 
     if had_location:
-        logging.info(
-            "📡 [clocks] restoring GNSS -> NORMAL (campaign had location '%s')",
-            had_location,
-        )
-
+        logging.info("📡 [clocks] restoring GNSS -> NORMAL (campaign had location '%s')", had_location)
         try:
             gnss_resp = _set_gnss_mode_normal()
-
             if not gnss_resp.get("success"):
-                logging.warning(
-                    "⚠️ [clocks] GNSS MODE=NORMAL failed: %s",
-                    gnss_resp.get("message", "?"),
-                )
+                logging.warning("⚠️ [clocks] GNSS MODE=NORMAL failed: %s", gnss_resp.get("message", "?"))
         except Exception:
             logging.exception("⚠️ [clocks] GNSS MODE=NORMAL IPC failed (ignored)")
 
     return {"success": True, "message": "OK"}
 
-
 def cmd_report(_: Optional[dict]) -> Dict[str, Any]:
-    """
-    Report current CLOCKS state.
-
-    Simply reads and returns the active campaign's payload,
-    which contains the denormalized report built each second
-    by on_timebase_fragment.
-
-    If no campaign is active, returns an empty OK response
-    indicating clocks are idle.
-    """
-
     row = _get_active_campaign()
 
     if not row:
         return {
             "success": True,
             "message": "OK",
-            "payload": {
-                "campaign_state": "IDLE",
-            },
+            "payload": {"campaign_state": "IDLE"},
         }
 
-    return {
-        "success": True,
-        "message": "OK",
-        "payload": row["payload"],
-    }
-
+    return {"success": True, "message": "OK", "payload": row["payload"]}
 
 def cmd_clear(_: Optional[dict]) -> dict:
-    """
-    Delete all timebase records and all campaign records from Postgres.
-
-    This is a development convenience for rapid iteration while
-    shaking out clock behavior.  It also stops any active campaign
-    so the process state is consistent with the empty database.
-    """
     global _request_stop, _request_start, _campaign_active
+    global _last_pi_seq, _last_pi_corrected
 
-    # Stop any active campaign so process state matches empty DB
     if _campaign_active:
         _campaign_active = False
         _request_start = False
@@ -1468,33 +1181,47 @@ def cmd_clear(_: Optional[dict]) -> dict:
             cur.execute("DELETE FROM campaigns")
             camp_count = cur.rowcount
 
-        logging.info(
-            "🗑️ [clocks] CLEAR: deleted %d timebase rows, %d campaigns",
-            tb_count, camp_count,
-        )
+        _last_pi_seq = None
+        _last_pi_corrected = None
+
+        logging.info("🗑️ [clocks] CLEAR: deleted %d timebase rows, %d campaigns", tb_count, camp_count)
 
         return {
             "success": True,
             "message": "OK",
-            "payload": {
-                "timebase_deleted": tb_count,
-                "campaigns_deleted": camp_count,
-            },
+            "payload": {"timebase_deleted": tb_count, "campaigns_deleted": camp_count},
         }
 
     except Exception as e:
         logging.exception("❌ [clocks] CLEAR failed")
-        return {
-            "success": False,
-            "message": str(e),
-        }
+        return {"success": False, "message": str(e)}
 
+def cmd_clocks_info(_: Optional[dict]) -> Dict[str, Any]:
+    """
+    CLOCKS_INFO — instrumentation snapshot.
+
+    Semantics:
+      * Observational only
+      * Monotonic counters + last-anomaly snapshots
+      * No inference
+    """
+    payload = {
+        "campaign_active": _campaign_active,
+        "pi_tick_epoch_set": _pi_tick_epoch_set,
+        "pi_tick_epoch": _pi_tick_epoch if _pi_tick_epoch_set else None,
+        "last_pi_seq": _last_pi_seq,
+        "last_pi_corrected": _last_pi_corrected,
+        "diag": _diag,
+    }
+
+    return {"success": True, "message": "OK", "payload": payload}
 
 COMMANDS = {
     "START": cmd_start,
     "STOP": cmd_stop,
     "REPORT": cmd_report,
     "CLEAR": cmd_clear,
+    "CLOCKS_INFO": cmd_clocks_info,
 }
 
 # ---------------------------------------------------------------------
@@ -1511,27 +1238,15 @@ def run() -> None:
         "chrony-disciplined system time for correlation keys. "
         "Pi TDC correction enabled (detect_ns → correction_ticks). "
         "Outlier rejection on all clock domains (>50%% deviation → reject). "
-        "Pi capture correlated by system_time_z (request/response, no pub/sub)."
+        "Pi capture correlated by system_time_z (request/response, no pub/sub). "
+        "Instrumentation enabled (CLOCKS_INFO)."
     )
 
-    # ----------------------------------------------------------
-    # Recovery check -- before anything else, see if we need to
-    # resume a campaign that was running when we last restarted.
-    # ----------------------------------------------------------
     try:
         _recover_campaign()
     except Exception:
         logging.exception("❌ [recovery] unhandled exception during recovery")
 
-    # ----------------------------------------------------------
-    # Start server — single subscription:
-    #   TIMEBASE_FRAGMENT: primary data path (Teensy -> Pi)
-    #
-    # Pi captures are fetched via PITIMER.REPORT(gnss_time=<key>)
-    # request/response in the fragment handler — no PPS_CAPTURE
-    # subscription needed.  Correlation is guaranteed by shared
-    # system clock (system_time_z).
-    # ----------------------------------------------------------
     server_setup(
         subsystem="CLOCKS",
         commands=COMMANDS,
@@ -1539,7 +1254,6 @@ def run() -> None:
             "TIMEBASE_FRAGMENT": on_timebase_fragment,
         },
     )
-
 
 if __name__ == "__main__":
     run()
