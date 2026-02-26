@@ -1,8 +1,12 @@
 """
 ZPNet PITIMER Process — Pi Arch Timer PPS Capture (MINIMAL SURFACE)
 
-Intent (v2026-02-25+):
+Intent (v2026-02-26+):
   PITIMER is a single-edge capture service with a strict identity contract.
+
+  Uses a native C shared library (libppscapture.so) via ctypes to detect
+  second boundaries by polling clock_gettime(CLOCK_REALTIME). One blocking
+  call per PPS edge — no subprocess, no stdout parsing, no ambiguity.
 
 Contract:
   • CLOCKS sets PITIMER's pps_count via SET_PPS_COUNT(k).
@@ -12,20 +16,13 @@ Contract:
 Command surface (minimal):
   • SET_PPS_COUNT
   • REPORT
-
-REPORT payload includes:
-  • pps_count (for the latest capture, if available)
-  • counter, corrected, detect_ns, correction_ticks
-  • seq, gnss_time label, edge_source
-  • pps_count_mode (enabled + next_pps_count)
-  • basic diag counters
 """
 
 from __future__ import annotations
 
+import ctypes
 import logging
 import os
-import subprocess
 import threading
 import time
 from typing import Any, Dict, Optional
@@ -38,35 +35,77 @@ from zpnet.shared.util import system_time_z
 # Configuration
 # ---------------------------------------------------------------------
 
-PPSPOLL_BINARY = os.environ.get(
-    "PPSPOLL_BINARY",
-    "/home/mule/zpnet/zpnet/native/pps_poll/pps_poll",
+PPSCAPTURE_LIB = os.environ.get(
+    "PPSCAPTURE_LIB",
+    "/home/mule/zpnet/zpnet/native/ppscapture/libppscapture.so",
 )
-
-ISOLATED_CORE = 3
 
 PI_TIMER_FREQ = 54_000_000
 NS_PER_TICK = 1e9 / PI_TIMER_FREQ
 
-EDGE_SOURCE_TDC = "TDC"
-EDGE_SOURCE_RAW = "RAW"
+# ---------------------------------------------------------------------
+# Native library interface
+# ---------------------------------------------------------------------
+
+_lib: Optional[ctypes.CDLL] = None
+
+
+def _load_lib() -> ctypes.CDLL:
+    """Load libppscapture.so and configure function signatures."""
+    lib = ctypes.CDLL(PPSCAPTURE_LIB)
+    lib.ppscapture_next.argtypes = [
+        ctypes.POINTER(ctypes.c_uint64),  # counter_out
+        ctypes.POINTER(ctypes.c_int64),   # detect_ns_out
+        ctypes.POINTER(ctypes.c_int64),   # rt_sec_out
+        ctypes.POINTER(ctypes.c_int64),   # rt_nsec_out
+    ]
+    lib.ppscapture_next.restype = ctypes.c_int
+    return lib
+
+
+def _capture_one() -> Dict[str, Any]:
+    """Block until next second boundary, return capture dict."""
+    counter = ctypes.c_uint64()
+    detect_ns = ctypes.c_int64()
+    rt_sec = ctypes.c_int64()
+    rt_nsec = ctypes.c_int64()
+
+    _lib.ppscapture_next(
+        ctypes.byref(counter), ctypes.byref(detect_ns),
+        ctypes.byref(rt_sec), ctypes.byref(rt_nsec),
+    )
+
+    raw = counter.value
+    dns = detect_ns.value
+
+    # TDC correction: subtract detection latency
+    correction_ticks = (dns * PI_TIMER_FREQ) // 1_000_000_000
+    corrected = raw - correction_ticks
+
+    # Chrony-disciplined realtime: full nanoseconds since epoch
+    chrony_ns = (rt_sec.value * 1_000_000_000) + rt_nsec.value
+
+    return {
+        "counter": raw,
+        "corrected": corrected,
+        "detect_ns": dns,
+        "correction_ticks": correction_ticks,
+        "chrony_ns": chrony_ns,
+        "chrony_sec": rt_sec.value,
+        "chrony_nsec": rt_nsec.value,
+        "freq": PI_TIMER_FREQ,
+        "ns_per_tick": round(NS_PER_TICK, 3),
+    }
+
 
 # ---------------------------------------------------------------------
 # Diagnostics (monotonic counters + last snapshots)
 # ---------------------------------------------------------------------
 
 _diag: Dict[str, Any] = {
-    # Subprocess lifecycle
-    "ppspoll_spawns": 0,
-    "ppspoll_exits": 0,
-    "ppspoll_last_exit_code": None,
-
-    # Stdout ingestion
-    "stdout_lines_total": 0,
-    "stdout_lines_decoded": 0,
-    "stdout_lines_parsed_ok": 0,
-    "stdout_lines_parsed_none": 0,
-    "stdout_parse_exceptions": 0,
+    # Capture loop
+    "captures_total": 0,
+    "capture_exceptions": 0,
 
     # PPS-count control/continuity
     "pps_count_set_requests": 0,
@@ -77,20 +116,15 @@ _diag: Dict[str, Any] = {
     "pps_count_regress": 0,
     "pps_count_jump": 0,
 
-    # Edge-source instrumentation
-    "edge_source_tdc": 0,
-    "edge_source_raw": 0,
-    "last_edge_source": None,
-
     # Last-seen values
-    "last_ppspoll_seq": None,
     "last_time_key": None,
     "last_pps_count": None,
+    "last_seq": None,
 
     # Last anomaly snapshots
     "last_pps_count_anomaly": {},
-    "last_parse_exception": {},
     "last_set_event": {},
+    "last_capture_exception": {},
 }
 
 # ---------------------------------------------------------------------
@@ -100,119 +134,18 @@ _diag: Dict[str, Any] = {
 _state_lock = threading.Lock()
 
 _last_capture: Optional[Dict[str, Any]] = None
+_capture_seq: int = 0
 
 _pps_count_enabled: bool = False
 _pps_next_count: int = 0
 _last_pps_count_seen: Optional[int] = None
 
+# Delta tracking
+_last_corrected: Optional[int] = None
+
 # ---------------------------------------------------------------------
-# Capture parser
+# PPS count assignment
 # ---------------------------------------------------------------------
-
-
-def _parse_capture_line(line: str) -> Optional[Dict[str, Any]]:
-    """
-    Enhanced format (>= 9 fields):
-      seq counter corrected delta residual resid_ns detect_ns corr_ticks rt_ns
-
-    Legacy format (6 fields):
-      seq counter delta residual resid_ns detect_ns
-    """
-    line = line.strip()
-    if not line:
-        return None
-
-    paren_idx = line.find("(")
-    if paren_idx != -1:
-        line = line[:paren_idx].strip()
-
-    parts = line.split()
-    if len(parts) < 6:
-        return None
-
-    try:
-        seq = int(parts[0])
-    except ValueError:
-        return None
-
-    # Enhanced format
-    if len(parts) >= 9:
-        try:
-            counter = int(parts[1])
-            corrected = int(parts[2])
-            delta_str = parts[3]
-            residual_str = parts[4]
-            resid_ns_str = parts[5]
-            detect_ns = int(parts[6])
-            correction_ticks = int(parts[7])
-        except ValueError:
-            return None
-
-        delta = None
-        residual = None
-        residual_ns = None
-
-        if delta_str != "---":
-            try:
-                delta = int(delta_str)
-                residual = int(residual_str)
-                residual_ns = float(resid_ns_str)
-            except ValueError:
-                pass
-
-        return {
-            "seq": seq,
-            "counter": counter,
-            "corrected": corrected,
-            "delta": delta,
-            "residual": residual,
-            "residual_ns": residual_ns,
-            "detect_ns": detect_ns,
-            "correction_ticks": correction_ticks,
-        }
-
-    # Legacy format
-    try:
-        counter = int(parts[1])
-        delta_str = parts[2]
-        residual_str = parts[3]
-        resid_ns_str = parts[4]
-        detect_ns = int(parts[5])
-    except ValueError:
-        return None
-
-    correction_ticks = (detect_ns * PI_TIMER_FREQ) // 1_000_000_000
-    corrected = counter - correction_ticks
-
-    delta = None
-    residual = None
-    residual_ns = None
-
-    if delta_str != "---":
-        try:
-            delta = int(delta_str)
-            residual = int(residual_str)
-            residual_ns = float(resid_ns_str)
-        except ValueError:
-            pass
-
-    return {
-        "seq": seq,
-        "counter": counter,
-        "corrected": corrected,
-        "delta": delta,
-        "residual": residual,
-        "residual_ns": residual_ns,
-        "detect_ns": detect_ns,
-        "correction_ticks": correction_ticks,
-    }
-
-
-def _classify_edge_source(capture: Dict[str, Any]) -> str:
-    detect_ns = capture.get("detect_ns")
-    if isinstance(detect_ns, int) and detect_ns >= 0:
-        return EDGE_SOURCE_TDC
-    return EDGE_SOURCE_RAW
 
 
 def _assign_pps_count() -> Optional[int]:
@@ -260,124 +193,79 @@ def _assign_pps_count() -> Optional[int]:
     _last_pps_count_seen = k
     return k
 
+
 # ---------------------------------------------------------------------
-# Capture reader thread
+# Capture loop thread
 # ---------------------------------------------------------------------
 
 
-def _capture_reader(proc: subprocess.Popen) -> None:
+def _capture_loop() -> None:
     """
-    Read pps_poll stdout and retain ONLY the latest capture.
+    Blocking capture loop: one call to _capture_one() per PPS edge.
+    Each call blocks ~1s then returns exactly one capture.
     """
-    global _last_capture
+    global _last_capture, _capture_seq, _last_corrected
 
-    for raw_line in iter(proc.stdout.readline, b""):
-        _diag["stdout_lines_total"] += 1
+    logging.info("🚀 [pitimer] capture loop started — calling libppscapture directly")
 
+    while True:
         try:
-            line = raw_line.decode("utf-8", errors="replace")
-            _diag["stdout_lines_decoded"] += 1
+            cap = _capture_one()
+            _diag["captures_total"] += 1
+            _capture_seq += 1
 
-            cap = _parse_capture_line(line)
-            if cap is None:
-                _diag["stdout_lines_parsed_none"] += 1
-                continue
+            cap["seq"] = _capture_seq
 
-            _diag["stdout_lines_parsed_ok"] += 1
-
-            payload = dict(cap)
-            payload["freq"] = PI_TIMER_FREQ
-            payload["ns_per_tick"] = round(NS_PER_TICK, 3)
-
-            edge_source = _classify_edge_source(payload)
-            payload["edge_source"] = edge_source
-            _diag["last_edge_source"] = edge_source
-            if edge_source == EDGE_SOURCE_TDC:
-                _diag["edge_source_tdc"] += 1
+            # Delta from previous capture
+            corrected = cap["corrected"]
+            if _last_corrected is not None:
+                delta = corrected - _last_corrected
+                residual = delta - PI_TIMER_FREQ
+                residual_ns = residual * NS_PER_TICK
+                cap["delta"] = delta
+                cap["residual"] = residual
+                cap["residual_ns"] = round(residual_ns, 3)
             else:
-                _diag["edge_source_raw"] += 1
+                cap["delta"] = None
+                cap["residual"] = None
+                cap["residual_ns"] = None
+            _last_corrected = corrected
 
+            # Timestamp and edge source
             time_key = system_time_z()
-            payload["gnss_time"] = time_key
+            cap["gnss_time"] = time_key
+            cap["edge_source"] = "TDC" if cap["detect_ns"] >= 0 else "RAW"
 
             _diag["last_time_key"] = time_key
-            _diag["last_ppspoll_seq"] = payload.get("seq")
+            _diag["last_seq"] = _capture_seq
 
             with _state_lock:
                 pps_count = _assign_pps_count()
                 if pps_count is not None:
-                    payload["pps_count"] = int(pps_count)
+                    cap["pps_count"] = int(pps_count)
+                _last_capture = cap
 
-                _last_capture = payload
-
-            if payload.get("seq") and int(payload["seq"]) % 60 == 0:
+            # Periodic log (every 60 captures)
+            if _capture_seq % 60 == 0:
                 logging.info(
-                    "⏱️ [pitimer] seq=%d pps_count=%s edge=%s corrected=%d detect=%d corr=%d time=%s",
-                    int(payload.get("seq") or 0),
-                    str(payload.get("pps_count", "—")),
-                    str(payload.get("edge_source", "—")),
-                    int(payload.get("corrected") or 0),
-                    int(payload.get("detect_ns") or 0),
-                    int(payload.get("correction_ticks") or 0),
+                    "⏱️ [pitimer] seq=%d pps_count=%s corrected=%d detect=%d corr=%d time=%s",
+                    _capture_seq,
+                    str(cap.get("pps_count", "—")),
+                    corrected,
+                    cap["detect_ns"],
+                    cap["correction_ticks"],
                     time_key,
                 )
 
         except Exception as e:
-            _diag["stdout_parse_exceptions"] += 1
-            _diag["last_parse_exception"] = {
+            _diag["capture_exceptions"] += 1
+            _diag["last_capture_exception"] = {
                 "ts_utc": system_time_z(),
                 "exception": str(e),
             }
-            logging.exception("⚠️ [pitimer] error parsing pps_poll output")
+            logging.exception("💥 [pitimer] capture error — retrying in 1s")
+            time.sleep(1)
 
-    logging.warning("⚠️ [pitimer] pps_poll stdout closed")
-
-# ---------------------------------------------------------------------
-# Subprocess supervisor
-# ---------------------------------------------------------------------
-
-
-def _spawn_ppspoll() -> subprocess.Popen:
-    cmd = [
-        "taskset", "-c", str(ISOLATED_CORE),
-        PPSPOLL_BINARY,
-        "999999999",
-    ]
-
-    logging.info("🚀 [pitimer] spawning pps_poll on core %d: %s", ISOLATED_CORE, " ".join(cmd))
-
-    proc = subprocess.Popen(
-        cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        bufsize=0,
-    )
-
-    _diag["ppspoll_spawns"] += 1
-    return proc
-
-
-def _supervisor() -> None:
-    while True:
-        try:
-            proc = _spawn_ppspoll()
-
-            threading.Thread(
-                target=_capture_reader,
-                args=(proc,),
-                daemon=True,
-                name="pitimer-reader",
-            ).start()
-
-            retcode = proc.wait()
-            _diag["ppspoll_exits"] += 1
-            _diag["ppspoll_last_exit_code"] = retcode
-            logging.warning("⚠️ [pitimer] pps_poll exited with code %d — restarting in 5s", retcode)
-
-        except Exception:
-            logging.exception("💥 [pitimer] supervisor error — restarting in 5s")
-
-        time.sleep(5)
 
 # ---------------------------------------------------------------------
 # Command handlers (MINIMAL)
@@ -441,29 +329,22 @@ def cmd_report(_: Optional[dict]) -> Dict[str, Any]:
         "freq": PI_TIMER_FREQ,
         "ns_per_tick": round(NS_PER_TICK, 3),
         "diag": {
-            # keep this small but useful
-            "ppspoll_spawns": _diag["ppspoll_spawns"],
-            "ppspoll_exits": _diag["ppspoll_exits"],
-            "stdout_lines_total": _diag["stdout_lines_total"],
-            "stdout_lines_parsed_ok": _diag["stdout_lines_parsed_ok"],
-            "stdout_parse_exceptions": _diag["stdout_parse_exceptions"],
+            "captures_total": _diag["captures_total"],
+            "capture_exceptions": _diag["capture_exceptions"],
             "pps_count_seen": _diag["pps_count_seen"],
             "pps_count_repeat": _diag["pps_count_repeat"],
             "pps_count_regress": _diag["pps_count_regress"],
             "pps_count_jump": _diag["pps_count_jump"],
-            "edge_source_tdc": _diag["edge_source_tdc"],
-            "edge_source_raw": _diag["edge_source_raw"],
-            "last_ppspoll_seq": _diag["last_ppspoll_seq"],
+            "last_seq": _diag["last_seq"],
             "last_time_key": _diag["last_time_key"],
             "last_pps_count": _diag["last_pps_count"],
         },
         "last_set_event": _diag.get("last_set_event", {}),
         "last_pps_count_anomaly": _diag.get("last_pps_count_anomaly", {}),
-        "last_parse_exception": _diag.get("last_parse_exception", {}),
+        "last_capture_exception": _diag.get("last_capture_exception", {}),
     }
 
     if cap:
-        # core facts for correlation + debug
         payload.update(
             {
                 "gnss_time": cap.get("gnss_time"),
@@ -477,15 +358,35 @@ def cmd_report(_: Optional[dict]) -> Dict[str, Any]:
                 "delta": cap.get("delta"),
                 "residual": cap.get("residual"),
                 "residual_ns": cap.get("residual_ns"),
+                "chrony_ns": cap.get("chrony_ns"),
+                "chrony_sec": cap.get("chrony_sec"),
+                "chrony_nsec": cap.get("chrony_nsec"),
             }
         )
 
     return {"success": True, "message": "OK", "payload": payload}
 
 
+def cmd_ns(_: Optional[dict]) -> Dict[str, Any]:
+    """
+    NS — return the current chrony-disciplined time as ISO8601 with nanosecond precision.
+
+    Calls clock_gettime(CLOCK_REALTIME) directly via Python's time module.
+    No PPS edge needed — this is available at any moment.
+    """
+    ns = time.clock_gettime_ns(time.CLOCK_REALTIME)
+    sec, frac = divmod(ns, 1_000_000_000)
+    from datetime import datetime, timezone
+    dt = datetime.fromtimestamp(sec, tz=timezone.utc)
+    iso = dt.strftime("%Y-%m-%dT%H:%M:%S") + ".%09dZ" % frac
+
+    return {"success": True, "message": "OK", "payload": {"ns": ns, "iso": iso}}
+
+
 COMMANDS = {
     "SET_PPS_COUNT": cmd_set_pps_count,
     "REPORT": cmd_report,
+    "NS": cmd_ns,
 }
 
 # ---------------------------------------------------------------------
@@ -494,29 +395,33 @@ COMMANDS = {
 
 
 def run() -> None:
+    global _lib
+
     setup_logging()
 
     logging.info(
-        "⏱️ [pitimer] starting (MINIMAL) — Pi arch timer PPS capture via chrony polling. "
-        "freq=%d Hz, %.3f ns/tick, isolated core %d. "
-        "Single-capture model (no rings, no history). "
+        "⏱️ [pitimer] starting — Pi arch timer PPS capture via libppscapture (ctypes). "
+        "freq=%d Hz, %.3f ns/tick. "
+        "Single-capture model (no subprocess, no parsing, no rings). "
         "Commands: SET_PPS_COUNT, REPORT.",
         PI_TIMER_FREQ,
         NS_PER_TICK,
-        ISOLATED_CORE,
     )
 
-    if not os.path.isfile(PPSPOLL_BINARY):
+    if not os.path.isfile(PPSCAPTURE_LIB):
         logging.error(
-            "❌ [pitimer] pps_poll binary not found at %s — build with: gcc -O2 -o pps_poll pps_poll.c -lm",
-            PPSPOLL_BINARY,
+            "❌ [pitimer] libppscapture.so not found at %s — run build-native",
+            PPSCAPTURE_LIB,
         )
         return
 
+    _lib = _load_lib()
+    logging.info("✅ [pitimer] loaded %s", PPSCAPTURE_LIB)
+
     threading.Thread(
-        target=_supervisor,
+        target=_capture_loop,
         daemon=True,
-        name="pitimer-supervisor",
+        name="pitimer-capture",
     ).start()
 
     server_setup(

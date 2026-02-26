@@ -14,8 +14,7 @@ Core contract (v2026-02-25+):
 
   • On receipt of a TIMEBASE_FRAGMENT, CLOCKS interrogates PITIMER.REPORT immediately and demands:
         PITIMER.pps_count == TEENSY.teensy_pps_count
-    If not: HARD FAIL (either a programming bug or a one-in-a-billion PPS alignment lottery).
-    In either case we fail and log the exception.
+    If not: HARD FAULT → automatic recovery (STOP Teensy, re-arm, re-sync).
 
   • PITIMER is single-capture only. No keyed lookup. No buffering semantics. No "historical" correlation.
 
@@ -102,6 +101,8 @@ _diag: Dict[str, Any] = {
     "hard_fault_no_active_campaign": 0,
     "hard_fault_sync_timeout": 0,
     "last_hard_fault": {},
+    "hard_faults_total": 0,
+    "auto_recovery_failures": 0,
 
     # PITIMER control plane
     "pitimer_set_requests": 0,
@@ -372,15 +373,60 @@ _pending_projected_pi_ticks_at_target: Optional[int] = None
 # ---------------------------------------------------------------------
 
 
+_auto_recovery_in_progress: bool = False
+
+
 def _hard_fault(reason: str, details: Dict[str, Any]) -> None:
-    """Log and raise a hard fault. No recovery, no retry."""
+    """Log a hard fault and trigger automatic recovery.
+
+    Instead of crashing, we deactivate the campaign (so subsequent fragments
+    are ignored) and spawn a background thread to run _recover_campaign().
+    This must NOT block the PUBSUB handler thread.
+    """
+    global _campaign_active, _auto_recovery_in_progress
+
+    _diag["hard_faults_total"] = _diag.get("hard_faults_total", 0) + 1
     _diag["last_hard_fault"] = {
         "ts_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
         "reason": reason,
         "details": details,
     }
-    logging.exception("💥 [clocks] HARD FAULT: %s  details=%s", reason, details)
-    raise RuntimeError(f"HARD FAULT: {reason}")
+
+    # Deactivate campaign so the handler ignores fragments while we recover
+    _campaign_active = False
+
+    if _auto_recovery_in_progress:
+        logging.error(
+            "💥 [clocks] HARD FAULT: %s — auto-recovery already in progress, skipping",
+            reason,
+        )
+        raise RuntimeError(f"HARD FAULT: {reason} (recovery already in progress)")
+
+    logging.error(
+        "💥 [clocks] HARD FAULT: %s  details=%s — initiating auto-recovery",
+        reason, details,
+    )
+
+    _auto_recovery_in_progress = True
+
+    # Spawn recovery on a background thread so we don't block PUBSUB
+    def _auto_recover():
+        global _auto_recovery_in_progress
+        try:
+            logging.info("🔄 [clocks] @%s auto-recovery starting...", system_time_z())
+            _recover_campaign()
+            logging.info("✅ [clocks] @%s auto-recovery complete", system_time_z())
+        except Exception:
+            logging.exception("💥 [clocks] auto-recovery FAILED — campaign deactivated")
+            _diag["auto_recovery_failures"] = _diag.get("auto_recovery_failures", 0) + 1
+        finally:
+            _auto_recovery_in_progress = False
+
+    t = threading.Thread(target=_auto_recover, name="clocks-auto-recover", daemon=True)
+    t.start()
+
+    # Raise to abort the current fragment handler invocation
+    raise RuntimeError(f"HARD FAULT: {reason} (auto-recovery initiated)")
 
 
 def _ticks_to_ns(ticks: int) -> int:
