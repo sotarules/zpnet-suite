@@ -79,6 +79,7 @@ GNSS_WAIT_LOG_INTERVAL = 60
 
 # Draconian sync waits
 SYNC_FRAGMENT_TIMEOUT_S = 2.0    # generous: fragment should arrive within ~10ms
+SYNC_RECOVER_TIMEOUT_S = 5.0    # recovery needs more time: Teensy reinit + PPS edge
 SYNC_PITIMER_POLL_S = 0.005      # 5ms polling while awaiting sync edge
 SYNC_LOG_INTERVAL_S = 0.25       # keep logs sparse but visible during sync waits
 
@@ -121,6 +122,7 @@ _diag: Dict[str, Any] = {
     "pps_count_jump": 0,
     "pps_count_regress": 0,
     "last_pps_count": None,
+    "armed_pps_count": None,
     "last_pps_count_anomaly": {},
 
     # Epoch anchoring
@@ -338,6 +340,10 @@ _pi_tick_epoch: int = 0
 _pi_tick_epoch_set: bool = False
 
 _last_pps_count_seen: Optional[int] = None
+
+# What pps_count did we most recently tell PITIMER/Teensy to use?
+# Used for verbose diagnostics on mismatch.
+_armed_pps_count: Optional[int] = None
 
 # Pi capture integrity tracking (observational)
 _last_pi_seq: Optional[int] = None
@@ -606,7 +612,7 @@ def _begin_sync_wait(
         _sync_event.clear()
 
 
-def _end_sync_wait() -> Tuple[Dict[str, Any], float]:
+def _end_sync_wait(timeout_s: float = SYNC_FRAGMENT_TIMEOUT_S) -> Tuple[Dict[str, Any], float]:
     """
     Block until the sync fragment arrives or timeout. Hard fault on timeout.
 
@@ -619,12 +625,12 @@ def _end_sync_wait() -> Tuple[Dict[str, Any], float]:
 
     last_log = t0
     while True:
-        remaining = SYNC_FRAGMENT_TIMEOUT_S - (time.monotonic() - t0)
+        remaining = timeout_s - (time.monotonic() - t0)
         if remaining <= 0:
             _diag["hard_fault_sync_timeout"] += 1
             _hard_fault("sync_timeout_waiting_for_fragment", {
                 "expected_pps_count": _sync_expected_pps,
-                "timeout_s": SYNC_FRAGMENT_TIMEOUT_S,
+                "timeout_s": timeout_s,
             })
         if _sync_event.wait(timeout=min(remaining, SYNC_PITIMER_POLL_S)):
             break
@@ -641,7 +647,7 @@ def _end_sync_wait() -> Tuple[Dict[str, Any], float]:
         "ts_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
         "expected_pps_count": int(_sync_expected_pps or -1),
         "waited_s": round(float(waited), 3),
-        "timeout_s": float(SYNC_FRAGMENT_TIMEOUT_S),
+        "timeout_s": float(timeout_s),
     }
 
     with _sync_lock:
@@ -804,6 +810,7 @@ def on_timebase_fragment(payload: Payload) -> None:
     """
     global _campaign_active, _sync_fragment
     global _last_pi_seq, _last_pi_corrected
+    global _armed_pps_count
 
     _diag["fragments_received"] += 1
 
@@ -826,8 +833,8 @@ def on_timebase_fragment(payload: Payload) -> None:
     with _sync_lock:
         if _sync_expected_pps is not None:
             logging.info(
-                "🔎 [clocks] fragment arrived: teensy_pps_count=%d (waiting for %d) match=%s",
-                pps_count, _sync_expected_pps, str(pps_count == _sync_expected_pps),
+                "🔎 [clocks] @%s fragment arrived: teensy_pps_count=%d (waiting for %d) match=%s",
+                system_time_z(), pps_count, _sync_expected_pps, str(pps_count == _sync_expected_pps),
             )
 
     _note_pps_count(pps_count)
@@ -844,24 +851,77 @@ def on_timebase_fragment(payload: Payload) -> None:
         return
 
     # --- DRACONIAN CORRELATION ---
+    # Check Teensy pps_count against what we armed (if tracked)
+    armed = _armed_pps_count
+    sysclk = system_time_z()
+    if armed is not None and int(pps_count) != armed:
+        _diag["hard_fault_pps_mismatch"] += 1
+        delta = int(pps_count) - armed
+        logging.error(
+            "💥 [clocks] @%s TEENSY PPS COUNT MISMATCH! "
+            "I told Teensy the next second is %d but Teensy sent me pps_count=%d (off by %+d).",
+            sysclk, armed, int(pps_count), delta,
+        )
+        _hard_fault("pps_mismatch_teensy_vs_armed", {
+            "system_time": sysclk,
+            "armed_pps_count": armed,
+            "teensy_pps_count": int(pps_count),
+            "delta": delta,
+        })
+
+    # Give PITIMER's ppspoll thread time to detect and parse the PPS edge.
+    # The Teensy fragment arrives ~1.5ms after PPS, but PITIMER's subprocess
+    # may still be reading/parsing. 100ms is generous and deterministic.
+    time.sleep(0.100)
+
     # Ask PITIMER for its latest capture. It should be for THIS PPS edge.
     pit = _pitimer_report()
 
     pit_pps = pit.get("pps_count")
     if pit_pps is None:
         _diag["hard_fault_pitimer_pps_missing"] += 1
+        logging.error(
+            "💥 [clocks] @%s PITIMER returned no pps_count! "
+            "I told PITIMER the next second is %s but it has no count assigned. "
+            "Teensy sent pps_count=%d. PITIMER state: %s",
+            sysclk, str(armed), int(pps_count), pit.get("state", "?"),
+        )
         _hard_fault("pitimer_pps_missing", {
+            "system_time": sysclk,
+            "armed_pps_count": armed,
             "teensy_pps_count": int(pps_count),
             "pitimer": pit,
         })
 
     if int(pit_pps) != int(pps_count):
         _diag["hard_fault_pps_mismatch"] += 1
+        delta = int(pit_pps) - int(pps_count)
+        logging.error(
+            "💥 [clocks] @%s PITIMER PPS COUNT MISMATCH! "
+            "I told PITIMER the next second is %s. "
+            "I told Teensy the next second is %s. "
+            "Teensy sent me pps_count=%d (good). "
+            "But PITIMER reports pps_count=%d (off by %+d).",
+            sysclk, str(armed), str(armed),
+            int(pps_count), int(pit_pps), delta,
+        )
         _hard_fault("pps_mismatch_teensy_vs_pitimer", {
+            "system_time": sysclk,
+            "armed_pps_count": armed,
             "teensy_pps_count": int(pps_count),
             "pitimer_pps_count": int(pit_pps),
+            "delta": delta,
             "pitimer": pit,
         })
+
+    logging.debug(
+        "✅ [clocks] @%s draconian correlation OK: armed=%s teensy=%d pitimer=%d",
+        sysclk, str(armed), int(pps_count), int(pit_pps),
+    )
+
+    # Advance armed expectation to next second
+    _armed_pps_count = int(pps_count) + 1
+    _diag["armed_pps_count"] = _armed_pps_count
 
     # --- Extract Pi counter from PITIMER capture ---
     pi_counter_raw = pit.get("counter")
@@ -1073,7 +1133,7 @@ def cmd_start(args: Optional[dict]) -> dict:
       7. Wait <= timeout for fragment pps_count=0 (or hard fail).
       8. On that fragment, handler sets epoch (START mode) and begins producing TIMEBASE.
     """
-    global _campaign_active, _pi_tick_epoch_set, _pi_tick_epoch
+    global _campaign_active, _pi_tick_epoch_set, _pi_tick_epoch, _armed_pps_count
 
     campaign = args.get("campaign") if args else None
     if not campaign:
@@ -1145,10 +1205,8 @@ def cmd_start(args: Optional[dict]) -> dict:
     # Prepare sync wait FIRST, then issue both requests-to-set
     _begin_sync_wait(expected_pps=0, epoch_mode="START", projected_pi_ticks_at_target=None)
 
-    # PITIMER first (request-to-set for next PPS edge)
-    _set_pitimer_pps_count(0)
-
-    # TEENSY second (request-to-set for next PPS edge)
+    # Arm TEENSY first — slow path (serial round-trip)
+    logging.info("📡 [start] @%s arming TEENSY START (slow path): next PPS edge will be pps_count=0", system_time_z())
     teensy_args: Dict[str, Any] = {"campaign": campaign}
     if set_dac is not None:
         teensy_args["set_dac"] = str(int(set_dac))
@@ -1156,6 +1214,15 @@ def cmd_start(args: Optional[dict]) -> dict:
         teensy_args["calibrate_ocxo"] = "true"
 
     _request_teensy_start(campaign=campaign, pps_count=0, args=teensy_args)
+    logging.info("📡 [start] @%s TEENSY START returned — now arming PITIMER", system_time_z())
+
+    # Arm PITIMER last — fast path (local IPC, microseconds)
+    logging.info("📡 [start] @%s arming PITIMER: next PPS edge will be pps_count=0", system_time_z())
+    _set_pitimer_pps_count(0)
+
+    _armed_pps_count = 0
+    _diag["armed_pps_count"] = 0
+    logging.info("📡 [start] @%s both PITIMER and TEENSY armed for pps_count=0 — waiting for sync fragment...", system_time_z())
 
     # Activate campaign BEFORE waiting so the sync fragment gets fully
     # processed (including epoch application) when it arrives.
@@ -1168,7 +1235,7 @@ def cmd_start(args: Optional[dict]) -> dict:
         _campaign_active = False
         return {"success": False, "message": "HARD FAULT during START sync (see logs/diag)"}
 
-    logging.info("▶️ [clocks] START sync achieved pps_count=0 (waited=%.3fs)", waited_s)
+    logging.info("▶️ [clocks] @%s START sync achieved pps_count=0 (waited=%.3fs)", system_time_z(), waited_s)
 
     return {
         "success": True,
@@ -1287,7 +1354,7 @@ def _recover_campaign() -> None:
            - sets epoch (RECOVER mode) using projected_pi_ticks_at_target
            - begins TIMEBASE immediately
     """
-    global _campaign_active, _pi_tick_epoch_set, _pi_tick_epoch
+    global _campaign_active, _pi_tick_epoch_set, _pi_tick_epoch, _armed_pps_count
 
     _diag["recovery_checks"] += 1
 
@@ -1379,7 +1446,59 @@ def _recover_campaign() -> None:
             raise RuntimeError(f"recovery failed: GNSS MODE=TO failed: {gnss_resp.get('message', '?')}")
         logging.info("✅ [recovery] GNSS confirmed TO mode")
 
-    # Compute pps_count projection
+    # ---- Wait for routing to be live ----
+    # On a full cluster restart, PUBSUB needs ~10s to discover subscriptions
+    # and build routing tables. Until then, no fragments reach us.
+    # We wait until we actually see a fragment arrive (proving routing works)
+    # before computing the pps_count projection. This avoids projecting a
+    # pps_count that has already passed by the time fragments start flowing.
+    logging.info("⏳ [recovery] @%s waiting for first TIMEBASE_FRAGMENT to confirm routing is live...", system_time_z())
+    _diag["fragments_received"]  # just reference; we'll poll this
+    frag_wait_t0 = time.monotonic()
+    frag_count_before = _diag["fragments_received"]
+    ROUTING_WAIT_TIMEOUT_S = 30.0
+    ROUTING_WAIT_POLL_S = 0.25
+    while True:
+        elapsed_wait = time.monotonic() - frag_wait_t0
+        if _diag["fragments_received"] > frag_count_before:
+            logging.info(
+                "✅ [recovery] @%s routing confirmed — fragment received after %.1fs",
+                system_time_z(), elapsed_wait,
+            )
+            break
+        if elapsed_wait >= ROUTING_WAIT_TIMEOUT_S:
+            raise RuntimeError(
+                f"recovery failed: no TIMEBASE_FRAGMENT received in {ROUTING_WAIT_TIMEOUT_S}s "
+                "(PUBSUB routing may not be established)"
+            )
+        time.sleep(ROUTING_WAIT_POLL_S)
+
+    # ---- Stop Teensy ----
+    # Teensy has been running from the previous campaign, sending fragments
+    # that proved routing is live. Now we stop it so no stray PPS edges
+    # get counted by PITIMER before we arm. Teensy won't stop until the
+    # next second boundary, so we wait 2s for it to go quiet.
+    logging.info("📡 [recovery] @%s sending Teensy STOP — routing is confirmed, now quiescing", system_time_z())
+    _request_teensy_stop_best_effort()
+    logging.info("⏳ [recovery] @%s waiting 2s for Teensy to quiesce...", system_time_z())
+    time.sleep(2.0)
+    logging.info("✅ [recovery] @%s Teensy quiesce complete", system_time_z())
+
+    # ---- Snap to second boundary ----
+    # We need both PITIMER and Teensy to be armed before the next PPS edge.
+    # If we send commands at an arbitrary point within a second (e.g. 800ms in),
+    # PITIMER might see the next PPS in just 200ms and consume the pps_count
+    # before Teensy's RECOVER has been processed. By waiting for the system
+    # clock to roll to a fresh second, we get ~950+ ms of runway.
+    now_frac = time.time() % 1.0
+    sleep_to_boundary = (1.0 - now_frac) + 0.050  # 50ms past the rollover
+    logging.info(
+        "⏳ [recovery] @%s snapping to second boundary (sleeping %.3fs)...",
+        system_time_z(), sleep_to_boundary,
+    )
+    time.sleep(sleep_to_boundary)
+
+    # Compute pps_count projection (NOW, snapped to just after a second boundary)
     now_str = system_time_z()
     now_utc = datetime.fromisoformat(now_str.replace("Z", "+00:00"))
     elapsed_td = now_utc - last_system_utc
@@ -1388,6 +1507,8 @@ def _recover_campaign() -> None:
         _diag["recovery_elapsed_seconds_nonpositive"] += 1
         raise RuntimeError(f"recovery failed: elapsed_seconds={elapsed_seconds}")
 
+    # project_seconds = elapsed + 1:
+    #   +1 because we need to land on the NEXT PPS edge after arming
     project_seconds = elapsed_seconds + 1
     next_pps_count = last_pps_count + project_seconds
 
@@ -1443,10 +1564,13 @@ def _recover_campaign() -> None:
         projected_pi_ticks_at_target=int(projected_pi_ticks_at_target),
     )
 
-    # PITIMER first (request-to-set)
-    _set_pitimer_pps_count(int(next_pps_count))
-
-    # TEENSY second (request-to-set)
+    # Arm TEENSY first — this is the SLOW path (~2s serial round-trip).
+    # Teensy must receive the command, reinit counters, and wait for a PPS edge.
+    # We do this BEFORE arming PITIMER so PITIMER's exposure window is minimal.
+    logging.info(
+        "📡 [recovery] @%s arming TEENSY RECOVER (slow path): next PPS edge will be pps_count=%d",
+        system_time_z(), int(next_pps_count),
+    )
     recover_args: Dict[str, Any] = {
         "dwt_cycles": str(int(projected_dwt_cycles)),
         "gnss_ns": str(int(projected_gnss_ns)),
@@ -1459,6 +1583,26 @@ def _recover_campaign() -> None:
         recover_args["calibrate_ocxo"] = "true"
 
     _request_teensy_recover(int(next_pps_count), recover_args)
+    logging.info(
+        "📡 [recovery] @%s TEENSY RECOVER returned — now arming PITIMER",
+        system_time_z(),
+    )
+
+    # Arm PITIMER last — this is the FAST path (local IPC, microseconds).
+    # By arming PITIMER here, it only sees PPS edges from this point forward,
+    # not the edges that fired while Teensy was getting its bearings.
+    logging.info(
+        "📡 [recovery] @%s arming PITIMER: next PPS edge will be pps_count=%d",
+        system_time_z(), int(next_pps_count),
+    )
+    _set_pitimer_pps_count(int(next_pps_count))
+
+    _armed_pps_count = int(next_pps_count)
+    _diag["armed_pps_count"] = int(next_pps_count)
+    logging.info(
+        "📡 [recovery] @%s both PITIMER and TEENSY armed for pps_count=%d — waiting for sync fragment...",
+        system_time_z(), int(next_pps_count),
+    )
 
     # Activate campaign BEFORE waiting so the sync fragment gets fully
     # processed (including epoch application) when it arrives.
@@ -1466,13 +1610,13 @@ def _recover_campaign() -> None:
 
     # Wait for sync fragment
     try:
-        frag, waited_s = _end_sync_wait()
+        frag, waited_s = _end_sync_wait(timeout_s=SYNC_RECOVER_TIMEOUT_S)
     except Exception:
         _campaign_active = False
         raise
     logging.info(
-        "✅ [recovery] sync achieved pps_count=%d (waited=%.3fs) -- TIMEBASE resumes",
-        int(next_pps_count), float(waited_s),
+        "✅ [recovery] @%s sync achieved pps_count=%d (waited=%.3fs) -- TIMEBASE resumes",
+        system_time_z(), int(next_pps_count), float(waited_s),
     )
 
 
