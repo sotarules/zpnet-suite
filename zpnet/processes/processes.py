@@ -314,12 +314,10 @@ def server_setup(
     subsystem: str,
     commands: Dict[str, Callable[[Optional[dict]], dict]] | None = None,
     subscriptions: Dict[str, Callable[[dict], None]] | None = None,
+    blocking: bool = True,
 ) -> None:
-
     """
     Declaratively start a ZPNet Pi-side process.
-
-    This function never returns.
 
     The caller declares:
       • subsystem name
@@ -327,6 +325,11 @@ def server_setup(
       • pub/sub topic → handler mapping
 
     All sockets, threads, and routing are handled internally.
+
+    If blocking=True (default), this function never returns.
+    If blocking=False, this function returns after launching server
+    threads, allowing the caller to do further initialization (e.g.
+    recovery) before entering its own main loop.
     """
 
     logging.info("🚀 [process] starting subsystem: %s", subsystem)
@@ -388,5 +391,6 @@ def server_setup(
     # Process lifetime
     # -----------------------------------------------------------------
 
-    while True:
-        time.sleep(3600)
+    if blocking:
+        while True:
+            time.sleep(3600)
