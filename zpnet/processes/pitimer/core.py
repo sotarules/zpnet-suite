@@ -1,44 +1,51 @@
 """
-ZPNet PITIMER Process — Pi Arch Timer PPS Capture (MINIMAL SURFACE)
+ZPNet PITIMER Process — Pi Arch Timer PPS Capture (v2 — Pi Clock Authority)
 
-Intent (v2026-02-27+):
-  PITIMER is a single-edge capture service with a strict identity contract.
+Intent (v2026-02-27b+):
+  PITIMER is the Pi clock authority.  It owns both the raw CNTVCT_EL0
+  cycle count AND the derived Pi nanosecond clock.
 
-  pps_count is MANDATORY. PITIMER will NOT produce labeled captures until
-  CLOCKS has called SET_PPS_COUNT. Captures taken before arming are held
-  internally but not exposed via REPORT — REPORT returns state="UNARMED".
+  This makes the architecture symmetric:
+    • Teensy owns GNSS ns, DWT ns/cycles, OCXO ns — delivered in TIMEBASE_FRAGMENT
+    • PITIMER owns Pi ns and Pi ticks — served via GET_CAPTURE
+    • CLOCKS is a pure traffic cop: correlates by pps_count, joins, persists
+
+  Captures are stored in a dynamic buffer indexed by pps_count.  CLOCKS
+  fetches captures by identity (GET_CAPTURE pps_count=N), not by timing.
+  This eliminates the race condition where a late TIMEBASE_FRAGMENT causes
+  PITIMER to have already advanced past the needed capture.
+
+  pps_count is MANDATORY.  Captures taken before arming are not stored.
+
+  Epoch management:
+    • CLOCKS calls SET_EPOCH(pi_tick_epoch) at START or RECOVER.
+    • PITIMER computes pi_ns = (corrected - epoch) * 1e9 / freq for every
+      capture, storing it in the buffer alongside the raw ticks.
+    • CLOCKS never computes pi_ns — it reads it from GET_CAPTURE.
 
   Supports two capture modes:
 
     LOOP (default):
-      Uses a native C shared library (libppscapture.so) via ctypes to detect
-      second boundaries by polling clock_gettime(CLOCK_REALTIME). One blocking
-      call per PPS edge — no subprocess, no stdout parsing, no ambiguity.
+      Uses libppscapture.so via ctypes to detect second boundaries by
+      polling clock_gettime(CLOCK_REALTIME).
 
     PPS:
-      Uses the kernel PPS subsystem (/dev/pps0) via ioctl(PPS_FETCH) to obtain
-      CLOCK_REALTIME timestamps captured at the actual GPIO interrupt — the true
-      PPS edge.  CNTVCT_EL0 is read immediately after the ioctl returns.
-
-      This mode eliminates the tautology in LOOP mode where CLOCK_REALTIME's
-      own second rollover is used as the PPS surrogate, making the realtime
-      measurement self-referential.
-
-      PPS mode coexists peacefully with chrony reading /dev/pps0 — PPS_FETCH
-      is non-destructive and multiple consumers can read the same timestamps.
+      Uses the kernel PPS subsystem (/dev/pps0) via ioctl(PPS_FETCH).
 
 Contract:
-  • CLOCKS MUST call SET_PPS_COUNT(k) before PITIMER produces usable captures.
-  • The next PPS capture after SET_PPS_COUNT is labeled pps_count==k, then +1 each PPS.
-  • PITIMER retains ONLY the most recent armed capture (no history, no ring buffers).
-  • REPORT returns state="UNARMED" until SET_PPS_COUNT has been called.
+  • CLOCKS MUST call SET_PPS_COUNT(k) before captures are stored.
+  • CLOCKS MUST call SET_EPOCH(epoch) before pi_ns is valid.
+  • GET_CAPTURE(pps_count=N) returns and REMOVES the capture from the buffer.
+  • REPORT returns the latest capture (non-destructive) plus buffer state.
 
 Command surface:
-  • SET_PPS_COUNT
-  • REPORT
-  • NS
-  • SET_MODE
-  • GET_MODE
+  • SET_PPS_COUNT — arm with starting pps_count
+  • SET_EPOCH     — set Pi tick epoch for pi_ns computation
+  • GET_CAPTURE   — fetch and consume a capture by pps_count
+  • REPORT        — latest capture + buffer state (non-destructive)
+  • NS            — current chrony-disciplined time
+  • SET_MODE      — switch LOOP/PPS
+  • GET_MODE      — query current mode
 """
 
 from __future__ import annotations
@@ -48,6 +55,7 @@ import logging
 import os
 import threading
 import time
+from collections import OrderedDict
 from typing import Any, Dict, Optional
 
 from zpnet.processes.processes import server_setup
@@ -76,7 +84,13 @@ PPSFETCH_LIB = os.environ.get(
 PPS_DEVICE = os.environ.get("PPS_DEVICE", "/dev/pps0")
 
 PI_TIMER_FREQ = 54_000_000
+NS_PER_SECOND = 1_000_000_000
 NS_PER_TICK = 1e9 / PI_TIMER_FREQ
+
+# Safety limit: if buffer grows beyond this, oldest entries are pruned.
+# Under normal operation the buffer should never exceed ~5 entries.
+# This prevents unbounded memory growth if CLOCKS stops consuming.
+BUFFER_MAX_SIZE = 120
 
 # Capture mode: "loop" or "pps"
 _capture_mode: str = "loop"
@@ -206,11 +220,11 @@ def _capture_one_loop() -> Dict[str, Any]:
     dns = detect_ns.value
 
     # TDC correction: subtract detection latency
-    correction_ticks = (dns * PI_TIMER_FREQ) // 1_000_000_000
+    correction_ticks = (dns * PI_TIMER_FREQ) // NS_PER_SECOND
     corrected = raw - correction_ticks
 
     # Chrono-disciplined realtime: full nanoseconds since epoch
-    chrony_ns = (rt_sec.value * 1_000_000_000) + rt_nsec.value
+    chrony_ns = (rt_sec.value * NS_PER_SECOND) + rt_nsec.value
 
     return {
         "counter": raw,
@@ -229,37 +243,22 @@ def _capture_one_loop() -> Dict[str, Any]:
 def _capture_one_pps() -> Dict[str, Any]:
     """
     PPS mode: block on ioctl(PPS_FETCH), then read CNTVCT_EL0.
-
-    The kernel timestamps the GPIO interrupt with CLOCK_REALTIME at the
-    actual PPS edge — no polling, no tautology.  CNTVCT_EL0 is captured
-    immediately after the ioctl returns (microseconds of jitter from
-    syscall return latency).
     """
     global _pps_fd
 
     if _pps_fd is None:
         _pps_fd = _open_pps_device()
 
-    # Block until the next PPS assert edge
     pps = _pps_fetch(_pps_fd)
-
-    # Read CNTVCT_EL0 as close to the edge as we can get
     raw = _read_cntvct()
 
-    # The time elapsed between the actual PPS edge (kernel timestamp)
-    # and our CNTVCT_EL0 read is our "detect_ns" equivalent.
-    # We know current CLOCK_REALTIME ≈ now, and the PPS timestamp
-    # was pps_sec.pps_nsec.  The difference is our latency.
     now_ns = time.clock_gettime_ns(time.CLOCK_REALTIME)
-    pps_ns = (pps["pps_sec"] * 1_000_000_000) + pps["pps_nsec"]
+    pps_ns = (pps["pps_sec"] * NS_PER_SECOND) + pps["pps_nsec"]
     detect_ns = now_ns - pps_ns
 
-    # TDC correction: subtract detection latency from counter
-    correction_ticks = (detect_ns * PI_TIMER_FREQ) // 1_000_000_000
+    correction_ticks = (detect_ns * PI_TIMER_FREQ) // NS_PER_SECOND
     corrected = raw - correction_ticks
 
-    # In PPS mode, chrony_ns is the kernel's interrupt-level timestamp
-    # at the actual GPIO edge — the ground truth for PiHR.
     chrony_ns = pps_ns
 
     return {
@@ -289,6 +288,24 @@ def _capture_one() -> Dict[str, Any]:
 
 
 # ---------------------------------------------------------------------
+# Pi nanosecond computation (epoch-relative)
+# ---------------------------------------------------------------------
+
+
+def _compute_pi_ns(corrected: int) -> Optional[int]:
+    """
+    Compute campaign-relative Pi nanoseconds from corrected tick count.
+
+    Returns None if epoch is not set.
+    Uses integer arithmetic: (campaign_ticks * 1e9) // freq
+    """
+    if not _epoch_set:
+        return None
+    campaign_ticks = int(corrected) - int(_pi_tick_epoch)
+    return (campaign_ticks * NS_PER_SECOND) // PI_TIMER_FREQ
+
+
+# ---------------------------------------------------------------------
 # Diagnostics (monotonic counters + last snapshots)
 # ---------------------------------------------------------------------
 
@@ -297,6 +314,14 @@ _diag: Dict[str, Any] = {
     "captures_total": 0,
     "captures_unarmed": 0,
     "capture_exceptions": 0,
+
+    # Buffer management
+    "buffer_inserts": 0,
+    "buffer_evictions": 0,
+    "buffer_hits": 0,
+    "buffer_misses": 0,
+    "buffer_size_current": 0,
+    "buffer_size_max_seen": 0,
 
     # PPS-count control/continuity
     "pps_count_set_requests": 0,
@@ -307,6 +332,11 @@ _diag: Dict[str, Any] = {
     "pps_count_regress": 0,
     "pps_count_jump": 0,
 
+    # Epoch
+    "epoch_set_requests": 0,
+    "epoch_set_applied": 0,
+    "epoch_value": None,
+
     # Last-seen values
     "last_time_key": None,
     "last_pps_count": None,
@@ -316,6 +346,7 @@ _diag: Dict[str, Any] = {
     "last_pps_count_anomaly": {},
     "last_set_event": {},
     "last_capture_exception": {},
+    "last_eviction": {},
 
     # Mode transitions
     "mode_changes": 0,
@@ -323,17 +354,26 @@ _diag: Dict[str, Any] = {
 }
 
 # ---------------------------------------------------------------------
-# Single-capture state
+# State
 # ---------------------------------------------------------------------
 
 _state_lock = threading.Lock()
 
+# Capture buffer: pps_count -> capture dict (insertion-ordered)
+_capture_buffer: OrderedDict[int, Dict[str, Any]] = OrderedDict()
+
+# Latest capture reference (non-destructive, for REPORT)
 _last_capture: Optional[Dict[str, Any]] = None
 _capture_seq: int = 0
 
+# Arming
 _pps_armed: bool = False
 _pps_next_count: int = 0
 _last_pps_count_seen: Optional[int] = None
+
+# Epoch (Pi tick epoch for ns computation)
+_pi_tick_epoch: int = 0
+_epoch_set: bool = False
 
 # Delta tracking
 _last_corrected: Optional[int] = None
@@ -346,9 +386,7 @@ _last_corrected: Optional[int] = None
 def _assign_pps_count() -> int:
     """
     Assign pps_count for THIS capture and increment for next.
-
-    PITIMER must be armed via SET_PPS_COUNT before this is called.
-    The caller (_capture_loop) gates on _pps_armed.
+    Called under _state_lock when _pps_armed is True.
     """
     global _pps_next_count, _last_pps_count_seen
 
@@ -390,6 +428,54 @@ def _assign_pps_count() -> int:
 
 
 # ---------------------------------------------------------------------
+# Buffer management
+# ---------------------------------------------------------------------
+
+
+def _buffer_insert(pps_count: int, capture: Dict[str, Any]) -> None:
+    """
+    Insert a capture into the buffer, keyed by pps_count.
+    Evicts oldest entries if buffer exceeds BUFFER_MAX_SIZE.
+    Called under _state_lock.
+    """
+    _capture_buffer[pps_count] = capture
+    _diag["buffer_inserts"] += 1
+
+    size = len(_capture_buffer)
+    _diag["buffer_size_current"] = size
+    if size > _diag["buffer_size_max_seen"]:
+        _diag["buffer_size_max_seen"] = size
+
+    # Evict oldest if over limit
+    while len(_capture_buffer) > BUFFER_MAX_SIZE:
+        evicted_pps, evicted_cap = _capture_buffer.popitem(last=False)
+        _diag["buffer_evictions"] += 1
+        _diag["last_eviction"] = {
+            "ts_utc": system_time_z(),
+            "evicted_pps_count": evicted_pps,
+            "buffer_size": len(_capture_buffer),
+        }
+        logging.warning(
+            "⚠️ [pitimer] buffer eviction: pps_count=%d (buffer at max=%d)",
+            evicted_pps, BUFFER_MAX_SIZE,
+        )
+
+
+def _buffer_pop(pps_count: int) -> Optional[Dict[str, Any]]:
+    """
+    Remove and return a capture by pps_count, or None if not found.
+    Called under _state_lock.
+    """
+    cap = _capture_buffer.pop(pps_count, None)
+    if cap is not None:
+        _diag["buffer_hits"] += 1
+    else:
+        _diag["buffer_misses"] += 1
+    _diag["buffer_size_current"] = len(_capture_buffer)
+    return cap
+
+
+# ---------------------------------------------------------------------
 # Capture loop thread
 # ---------------------------------------------------------------------
 
@@ -399,8 +485,8 @@ def _capture_loop() -> None:
     Blocking capture loop: one call to _capture_one() per PPS edge.
     Each call blocks ~1s then returns exactly one capture.
 
-    Captures taken while unarmed are counted but NOT stored — REPORT
-    will return state="UNARMED" until SET_PPS_COUNT has been called.
+    Armed captures are stored in the buffer indexed by pps_count.
+    Unarmed captures keep delta tracking warm but are not stored.
     """
     global _last_capture, _capture_seq, _last_corrected
 
@@ -429,6 +515,10 @@ def _capture_loop() -> None:
                 cap["residual_ns"] = None
             _last_corrected = corrected
 
+            # Compute pi_ns if epoch is set
+            pi_ns = _compute_pi_ns(corrected)
+            cap["pi_ns"] = pi_ns
+
             # Timestamp and edge source
             time_key = system_time_z()
             cap["gnss_time"] = time_key
@@ -439,25 +529,30 @@ def _capture_loop() -> None:
 
             with _state_lock:
                 if not _pps_armed:
-                    # Unarmed: capture runs (keeps delta tracking warm)
-                    # but is NOT exposed via REPORT
                     _diag["captures_unarmed"] += 1
                     continue
 
                 pps_count = _assign_pps_count()
                 cap["pps_count"] = int(pps_count)
+
+                # Store in buffer and update latest reference
+                _buffer_insert(pps_count, cap)
                 _last_capture = cap
 
             # Periodic log (every 60 captures)
             if _capture_seq % 60 == 0:
+                with _state_lock:
+                    buf_size = len(_capture_buffer)
                 logging.info(
-                    "⏱️ [pitimer] seq=%d pps_count=%s corrected=%d detect=%d corr=%d mode=%s time=%s",
+                    "⏱️ [pitimer] seq=%d pps_count=%s corrected=%d pi_ns=%s "
+                    "detect=%d mode=%s buf=%d time=%s",
                     _capture_seq,
                     str(cap.get("pps_count", "—")),
                     corrected,
+                    str(pi_ns) if pi_ns is not None else "—",
                     cap["detect_ns"],
-                    cap["correction_ticks"],
                     cap.get("capture_mode", "loop"),
+                    buf_size,
                     time_key,
                 )
 
@@ -482,8 +577,7 @@ def cmd_set_pps_count(args: Optional[dict]) -> Dict[str, Any]:
 
     Arms PITIMER for mandatory pps_count tracking.
       • Next capture will be labeled pps_count==k, then increments each PPS.
-      • Previous capture state is cleared — REPORT returns the first
-        armed capture once it arrives.
+      • Buffer is cleared — all prior captures are discarded.
     """
     global _pps_armed, _pps_next_count, _last_pps_count_seen, _last_capture
 
@@ -504,19 +598,92 @@ def cmd_set_pps_count(args: Optional[dict]) -> Dict[str, Any]:
         _pps_armed = True
         _pps_next_count = int(k)
         _last_pps_count_seen = None
-        _last_capture = None  # Clear stale capture — next REPORT waits for fresh armed capture
+        _last_capture = None
+        _capture_buffer.clear()
 
     _diag["pps_count_set_applied"] += 1
     _diag["pps_count_armed"] = True
+    _diag["buffer_size_current"] = 0
     _diag["last_set_event"] = {
         "ts_utc": system_time_z(),
         "event": "set_pps_count",
         "value": int(k),
     }
 
-    logging.info("🎯 [pitimer] armed: next capture will be pps_count=%d", k)
+    logging.info("🎯 [pitimer] armed: next capture will be pps_count=%d (buffer cleared)", k)
 
     return {"success": True, "message": "OK", "payload": {"pps_count": int(k)}}
+
+
+def cmd_set_epoch(args: Optional[dict]) -> Dict[str, Any]:
+    """
+    SET_EPOCH(pi_tick_epoch)
+
+    Sets the Pi tick epoch for campaign-relative pi_ns computation.
+    All subsequent captures will have pi_ns = (corrected - epoch) * 1e9 / freq.
+
+    Called by CLOCKS at START (epoch = corrected at pps_count=0) or
+    RECOVER (epoch = corrected - projected_ticks_at_target).
+    """
+    global _pi_tick_epoch, _epoch_set
+
+    if not args or "pi_tick_epoch" not in args:
+        return {"success": False, "message": "BAD", "payload": {"error": "missing pi_tick_epoch"}}
+
+    try:
+        epoch = int(args["pi_tick_epoch"])
+    except (ValueError, TypeError):
+        return {"success": False, "message": "BAD", "payload": {"error": "invalid pi_tick_epoch"}}
+
+    _pi_tick_epoch = epoch
+    _epoch_set = True
+
+    _diag["epoch_set_requests"] += 1
+    _diag["epoch_set_applied"] += 1
+    _diag["epoch_value"] = epoch
+
+    logging.info("📐 [pitimer] epoch set: pi_tick_epoch=%d", epoch)
+
+    return {
+        "success": True, "message": "OK",
+        "payload": {"pi_tick_epoch": epoch},
+    }
+
+
+def cmd_get_capture(args: Optional[dict]) -> Dict[str, Any]:
+    """
+    GET_CAPTURE(pps_count=N)
+
+    Fetch and CONSUME the capture for a specific pps_count.
+    Returns the full capture dict including pi_ns if epoch is set.
+    The capture is removed from the buffer after retrieval.
+
+    Returns success=false with reason if the pps_count is not in the buffer.
+    """
+    if not args or "pps_count" not in args:
+        return {"success": False, "message": "BAD", "payload": {"error": "missing pps_count"}}
+
+    try:
+        target = int(args["pps_count"])
+    except (ValueError, TypeError):
+        return {"success": False, "message": "BAD", "payload": {"error": "invalid pps_count"}}
+
+    with _state_lock:
+        cap = _buffer_pop(target)
+        buf_keys = list(_capture_buffer.keys())
+
+    if cap is None:
+        return {
+            "success": False, "message": "NOT_FOUND",
+            "payload": {
+                "pps_count": target,
+                "buffer_size": len(buf_keys),
+                "buffer_range": [buf_keys[0], buf_keys[-1]] if buf_keys else None,
+                "buffer_keys": buf_keys[:10],  # first 10 for diagnostics
+            },
+        }
+
+    return {"success": True, "message": "OK", "payload": cap}
 
 
 def cmd_set_mode(args: Optional[dict]) -> Dict[str, Any]:
@@ -526,10 +693,6 @@ def cmd_set_mode(args: Optional[dict]) -> Dict[str, Any]:
     Dynamically switch capture mode.  Takes effect on the next capture
     cycle (~1s).  The capture loop, pps_count sequence, and delta
     tracking are uninterrupted.
-
-    Note: switching to PPS mode requires /dev/pps0 to be available
-    (pps_gpio kernel module loaded).  If it cannot be opened, the
-    mode change is rejected.
     """
     global _capture_mode, _pps_fd
 
@@ -555,7 +718,6 @@ def cmd_set_mode(args: Optional[dict]) -> Dict[str, Any]:
                 "success": False, "message": "BAD",
                 "payload": {"error": f"PPS device {PPS_DEVICE} not found — is pps_gpio loaded?"},
             }
-        # Pre-open the device to fail fast
         if _pps_fd is None:
             try:
                 _pps_fd = _open_pps_device()
@@ -604,13 +766,13 @@ def cmd_report(_: Optional[dict]) -> Dict[str, Any]:
     """
     REPORT
 
-    Returns the latest armed capture.  If PITIMER has not been armed
-    via SET_PPS_COUNT, returns state="UNARMED".
+    Returns the latest armed capture (non-destructive) plus buffer state.
     """
     with _state_lock:
         armed = bool(_pps_armed)
         cap = dict(_last_capture) if _last_capture else None
         next_pps = int(_pps_next_count)
+        buf_keys = list(_capture_buffer.keys())
 
     with _capture_mode_lock:
         mode = _capture_mode
@@ -619,17 +781,32 @@ def cmd_report(_: Optional[dict]) -> Dict[str, Any]:
         "state": "OK" if cap else ("WAITING" if armed else "UNARMED"),
         "capture_mode": mode,
         "pps_armed": armed,
+        "epoch_set": _epoch_set,
+        "pi_tick_epoch": _pi_tick_epoch if _epoch_set else None,
         "next_pps_count": next_pps if armed else None,
         "freq": PI_TIMER_FREQ,
         "ns_per_tick": round(NS_PER_TICK, 3),
+        "buffer": {
+            "size": len(buf_keys),
+            "range": [buf_keys[0], buf_keys[-1]] if buf_keys else None,
+            "keys": buf_keys[:20],  # first 20 for diagnostics
+            "max_size": BUFFER_MAX_SIZE,
+        },
         "diag": {
             "captures_total": _diag["captures_total"],
             "captures_unarmed": _diag["captures_unarmed"],
             "capture_exceptions": _diag["capture_exceptions"],
+            "buffer_inserts": _diag["buffer_inserts"],
+            "buffer_evictions": _diag["buffer_evictions"],
+            "buffer_hits": _diag["buffer_hits"],
+            "buffer_misses": _diag["buffer_misses"],
+            "buffer_size_max_seen": _diag["buffer_size_max_seen"],
             "pps_count_seen": _diag["pps_count_seen"],
             "pps_count_repeat": _diag["pps_count_repeat"],
             "pps_count_regress": _diag["pps_count_regress"],
             "pps_count_jump": _diag["pps_count_jump"],
+            "epoch_set_requests": _diag["epoch_set_requests"],
+            "epoch_set_applied": _diag["epoch_set_applied"],
             "last_seq": _diag["last_seq"],
             "last_time_key": _diag["last_time_key"],
             "last_pps_count": _diag["last_pps_count"],
@@ -639,6 +816,7 @@ def cmd_report(_: Optional[dict]) -> Dict[str, Any]:
         "last_set_event": _diag.get("last_set_event", {}),
         "last_pps_count_anomaly": _diag.get("last_pps_count_anomaly", {}),
         "last_capture_exception": _diag.get("last_capture_exception", {}),
+        "last_eviction": _diag.get("last_eviction", {}),
     }
 
     if cap:
@@ -649,6 +827,7 @@ def cmd_report(_: Optional[dict]) -> Dict[str, Any]:
                 "seq": cap.get("seq"),
                 "counter": cap.get("counter"),
                 "corrected": cap.get("corrected"),
+                "pi_ns": cap.get("pi_ns"),
                 "detect_ns": cap.get("detect_ns"),
                 "correction_ticks": cap.get("correction_ticks"),
                 "edge_source": cap.get("edge_source"),
@@ -669,12 +848,9 @@ def cmd_report(_: Optional[dict]) -> Dict[str, Any]:
 def cmd_ns(_: Optional[dict]) -> Dict[str, Any]:
     """
     NS — return the current chrony-disciplined time as ISO8601 with nanosecond precision.
-
-    Calls clock_gettime(CLOCK_REALTIME) directly via Python's time module.
-    No PPS edge needed — this is available at any moment.
     """
     ns = time.clock_gettime_ns(time.CLOCK_REALTIME)
-    sec, frac = divmod(ns, 1_000_000_000)
+    sec, frac = divmod(ns, NS_PER_SECOND)
     from datetime import datetime, timezone
     dt = datetime.fromtimestamp(sec, tz=timezone.utc)
     iso = dt.strftime("%Y-%m-%dT%H:%M:%S") + ".%09dZ" % frac
@@ -684,6 +860,8 @@ def cmd_ns(_: Optional[dict]) -> Dict[str, Any]:
 
 COMMANDS = {
     "SET_PPS_COUNT": cmd_set_pps_count,
+    "SET_EPOCH": cmd_set_epoch,
+    "GET_CAPTURE": cmd_get_capture,
     "REPORT": cmd_report,
     "NS": cmd_ns,
     "SET_MODE": cmd_set_mode,
@@ -701,13 +879,16 @@ def run() -> None:
     setup_logging()
 
     logging.info(
-        "⏱️ [pitimer] starting — Pi arch timer PPS capture. "
+        "⏱️ [pitimer] starting — Pi Clock Authority (v2). "
         "freq=%d Hz, %.3f ns/tick. "
-        "pps_count is MANDATORY — REPORT returns UNARMED until SET_PPS_COUNT. "
-        "Default mode: LOOP (libppscapture). "
-        "Commands: SET_PPS_COUNT, REPORT, NS, SET_MODE, GET_MODE.",
+        "pps_count MANDATORY, epoch MANDATORY for pi_ns. "
+        "Captures buffered by pps_count (dynamic, max=%d). "
+        "GET_CAPTURE consumes by pps_count identity. "
+        "Default mode: LOOP. "
+        "Commands: SET_PPS_COUNT, SET_EPOCH, GET_CAPTURE, REPORT, NS, SET_MODE, GET_MODE.",
         PI_TIMER_FREQ,
         NS_PER_TICK,
+        BUFFER_MAX_SIZE,
     )
 
     # Load libppscapture for LOOP mode
