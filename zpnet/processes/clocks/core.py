@@ -1493,11 +1493,6 @@ def _recover_campaign() -> None:
         logging.info("✅ [recovery] GNSS confirmed TO mode")
 
     # ---- Wait for routing to be live ----
-    # On a full cluster restart, PUBSUB needs ~10s to discover subscriptions
-    # and build routing tables. Until then, no fragments reach us.
-    # We wait until we actually see a fragment arrive (proving routing works)
-    # before computing the pps_count projection. This avoids projecting a
-    # pps_count that has already passed by the time fragments start flowing.
     logging.info("⏳ [recovery] @%s waiting for first TIMEBASE_FRAGMENT to confirm routing is live...", system_time_z())
     _diag["fragments_received"]  # just reference; we'll poll this
     frag_wait_t0 = time.monotonic()
@@ -1520,10 +1515,6 @@ def _recover_campaign() -> None:
         time.sleep(ROUTING_WAIT_POLL_S)
 
     # ---- Stop Teensy ----
-    # Teensy has been running from the previous campaign, sending fragments
-    # that proved routing is live. Now we stop it so no stray PPS edges
-    # get counted by PITIMER before we arm. Teensy won't stop until the
-    # next second boundary, so we wait 2s for it to go quiet.
     logging.info("📡 [recovery] @%s sending Teensy STOP — routing is confirmed, now quiescing", system_time_z())
     _request_teensy_stop_best_effort()
     logging.info("⏳ [recovery] @%s waiting 2s for Teensy to quiesce...", system_time_z())
@@ -1531,11 +1522,6 @@ def _recover_campaign() -> None:
     logging.info("✅ [recovery] @%s Teensy quiesce complete", system_time_z())
 
     # ---- Snap to second boundary ----
-    # We need both PITIMER and Teensy to be armed before the next PPS edge.
-    # If we send commands at an arbitrary point within a second (e.g. 800ms in),
-    # PITIMER might see the next PPS in just 200ms and consume the pps_count
-    # before Teensy's RECOVER has been processed. By waiting for the system
-    # clock to roll to a fresh second, we get ~950+ ms of runway.
     now_frac = time.time() % 1.0
     sleep_to_boundary = (1.0 - now_frac) + 0.050  # 50ms past the rollover
     logging.info(
@@ -1544,7 +1530,7 @@ def _recover_campaign() -> None:
     )
     time.sleep(sleep_to_boundary)
 
-    # Compute pps_count projection (NOW, snapped to just after a second boundary)
+    # Compute pps_count projection
     now_str = system_time_z()
     now_utc = datetime.fromisoformat(now_str.replace("Z", "+00:00"))
     elapsed_td = now_utc - last_system_utc
@@ -1553,8 +1539,6 @@ def _recover_campaign() -> None:
         _diag["recovery_elapsed_seconds_nonpositive"] += 1
         raise RuntimeError(f"recovery failed: elapsed_seconds={elapsed_seconds}")
 
-    # project_seconds = elapsed + 1:
-    #   +1 because we need to land on the NEXT PPS edge after arming
     project_seconds = elapsed_seconds + 1
     next_pps_count = last_pps_count + project_seconds
 
@@ -1610,9 +1594,7 @@ def _recover_campaign() -> None:
         projected_pi_ticks_at_target=int(projected_pi_ticks_at_target),
     )
 
-    # Arm TEENSY first — this is the SLOW path (~2s serial round-trip).
-    # Teensy must receive the command, reinit counters, and wait for a PPS edge.
-    # We do this BEFORE arming PITIMER so PITIMER's exposure window is minimal.
+    # Arm TEENSY first (slow path)
     logging.info(
         "📡 [recovery] @%s arming TEENSY RECOVER (slow path): next PPS edge will be pps_count=%d",
         system_time_z(), int(next_pps_count),
@@ -1634,9 +1616,7 @@ def _recover_campaign() -> None:
         system_time_z(),
     )
 
-    # Arm PITIMER last — this is the FAST path (local IPC, microseconds).
-    # By arming PITIMER here, it only sees PPS edges from this point forward,
-    # not the edges that fired while Teensy was getting its bearings.
+    # Arm PITIMER last (fast path)
     logging.info(
         "📡 [recovery] @%s arming PITIMER: next PPS edge will be pps_count=%d",
         system_time_z(), int(next_pps_count),
@@ -1650,8 +1630,7 @@ def _recover_campaign() -> None:
         system_time_z(), int(next_pps_count),
     )
 
-    # Activate campaign BEFORE waiting so the sync fragment gets fully
-    # processed (including epoch application) when it arrives.
+    # Activate campaign BEFORE waiting
     _campaign_active = True
 
     # Wait for sync fragment
@@ -1664,6 +1643,159 @@ def _recover_campaign() -> None:
         "✅ [recovery] @%s sync achieved pps_count=%d (waited=%.3fs) -- TIMEBASE resumes",
         system_time_z(), int(next_pps_count), float(waited_s),
     )
+
+
+# ---------------------------------------------------------------------
+# BASELINE — persist and retrieve baseline campaign for comparison
+# ---------------------------------------------------------------------
+
+
+def _get_baseline_from_config() -> Optional[Dict[str, Any]]:
+    """Read baseline_id and baseline_ppb from SYSTEM config. Returns None if unset."""
+    try:
+        with open_db(row_dict=True) as conn:
+            cur = conn.cursor()
+            cur.execute("SELECT payload FROM config WHERE config_key = 'SYSTEM'")
+            row = cur.fetchone()
+            if row and row["payload"].get("baseline_id") is not None:
+                return {
+                    "baseline_id": row["payload"]["baseline_id"],
+                    "baseline_ppb": row["payload"].get("baseline_ppb", {}),
+                    "baseline_campaign": row["payload"].get("baseline_campaign"),
+                    "baseline_pps_n": row["payload"].get("baseline_pps_n"),
+                }
+    except Exception:
+        logging.exception("⚠️ [clocks] failed to read baseline from config")
+    return None
+
+
+def cmd_set_baseline(args: Optional[dict]) -> Dict[str, Any]:
+    """
+    SET_BASELINE id=<campaign_row_id>
+
+    Reads the campaign row by its database primary key, extracts per-clock
+    PPB from its denormalized report, and persists baseline_id + baseline_ppb
+    into the SYSTEM config row.  The dashboard comparison readout reads
+    this on every refresh — no restart required.
+    """
+    if not args or "id" not in args:
+        return {"success": False, "message": "SET_BASELINE requires 'id' argument"}
+
+    try:
+        baseline_id = int(args["id"])
+    except (ValueError, TypeError):
+        return {"success": False, "message": f"Invalid baseline id: {args['id']}"}
+
+    # Fetch the campaign row by its database ID
+    with open_db(row_dict=True) as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT id, campaign, payload FROM campaigns WHERE id = %s",
+            (baseline_id,),
+        )
+        row = cur.fetchone()
+
+    if row is None:
+        return {"success": False, "message": f"No campaign with id={baseline_id}"}
+
+    payload = row["payload"]
+    if isinstance(payload, str):
+        payload = json.loads(payload)
+
+    report = payload.get("report")
+    if not report:
+        return {"success": False, "message": f"Campaign {baseline_id} has no report"}
+
+    # Extract per-clock PPB from the report
+    baseline_ppb = {}
+    for key in ("gnss", "dwt", "pi", "ocxo"):
+        blk = report.get(key, {})
+        ppb = blk.get("ppb")
+        if ppb is not None:
+            baseline_ppb[key] = round(float(ppb), 3)
+
+    if not baseline_ppb:
+        return {"success": False, "message": f"Campaign {baseline_id} report has no PPB data"}
+
+    # Persist into SYSTEM config (merge into existing JSON blob)
+    baseline_blob = {
+        "baseline_id": baseline_id,
+        "baseline_ppb": baseline_ppb,
+        "baseline_campaign": row["campaign"],
+        "baseline_pps_n": report.get("pps_count"),
+    }
+
+    try:
+        with open_db() as conn:
+            cur = conn.cursor()
+            cur.execute(
+                """
+                UPDATE config
+                SET payload = payload || %s::jsonb
+                WHERE config_key = 'SYSTEM'
+                """,
+                (json.dumps(baseline_blob),),
+            )
+    except Exception:
+        logging.exception("❌ [clocks] failed to persist baseline to config")
+        return {"success": False, "message": "Failed to persist baseline to config"}
+
+    logging.info(
+        "✅ [clocks] baseline set: id=%d campaign='%s' ppb=%s",
+        baseline_id, row["campaign"], baseline_ppb,
+    )
+
+    return {
+        "success": True,
+        "message": "OK",
+        "payload": baseline_blob,
+    }
+
+
+def cmd_baseline_info(_: Optional[dict]) -> Dict[str, Any]:
+    """
+    BASELINE_INFO — return the currently configured baseline.
+
+    Returns baseline_id, baseline_ppb, campaign name, pps_n, location,
+    and started_at from the referenced campaign row.
+    """
+    info = _get_baseline_from_config()
+    if info is None:
+        return {
+            "success": True,
+            "message": "OK",
+            "payload": {"baseline_set": False},
+        }
+
+    baseline_id = info["baseline_id"]
+
+    result: Dict[str, Any] = {
+        "baseline_set": True,
+        "baseline_id": baseline_id,
+        "baseline_ppb": info.get("baseline_ppb", {}),
+        "baseline_campaign": info.get("baseline_campaign"),
+        "baseline_pps_n": info.get("baseline_pps_n"),
+    }
+
+    # Enrich with live campaign row data (location, started_at)
+    try:
+        with open_db(row_dict=True) as conn:
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT id, campaign, payload FROM campaigns WHERE id = %s",
+                (baseline_id,),
+            )
+            row = cur.fetchone()
+        if row:
+            cpayload = row["payload"]
+            if isinstance(cpayload, str):
+                cpayload = json.loads(cpayload)
+            result["baseline_location"] = cpayload.get("location")
+            result["baseline_started_at"] = cpayload.get("started_at")
+    except Exception:
+        pass  # best-effort enrichment
+
+    return {"success": True, "message": "OK", "payload": result}
 
 
 # ---------------------------------------------------------------------
@@ -1693,6 +1825,8 @@ COMMANDS = {
     "STOP": cmd_stop,
     "REPORT": cmd_report,
     "CLEAR": cmd_clear,
+    "SET_BASELINE": cmd_set_baseline,
+    "BASELINE_INFO": cmd_baseline_info,
     "CLOCKS_INFO": cmd_clocks_info,
 }
 
@@ -1713,7 +1847,8 @@ def run() -> None:
         "START/RECOVER issue SET_PPS_COUNT then START/RECOVER on Teensy, "
         "then block waiting for the sync fragment. "
         "Outlier rejection on all clock domains (>50%% deviation -> reject). "
-        "Instrumentation via CLOCKS_INFO."
+        "Instrumentation via CLOCKS_INFO. "
+        "Baseline comparison via SET_BASELINE/BASELINE_INFO."
     )
 
     # Start command + pubsub servers FIRST (non-blocking) so that

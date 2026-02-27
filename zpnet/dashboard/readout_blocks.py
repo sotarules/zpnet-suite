@@ -1,4 +1,4 @@
-"""
+"""z
 ZPNet Dashboard Readout Blocks — SYSTEM Snapshot Edition
 
 All readouts are derived directly from the authoritative SYSTEM snapshot.
@@ -100,53 +100,115 @@ def gnss_report_readout() -> Generator[str, None, None]:
 
 
 # ---------------------------------------------------------------------
-# CLOCKS (synthetic clock substrate)
+# CLOCKS — shared helpers
 # ---------------------------------------------------------------------
 
-def clocks_status_readout() -> Generator[str, None, None]:
+_CLOCK_DOMAINS = [("GNSS", "gnss"), ("DWT", "dwt"), ("PI", "pi"), ("OCXO", "ocxo")]
+
+
+def _get_clocks_baseline() -> dict | None:
+    """Fetch baseline info from CLOCKS subsystem. Returns payload or None."""
+    try:
+        resp = send_command(machine="PI", subsystem="CLOCKS", command="BASELINE_INFO")
+        if resp.get("success"):
+            p = resp.get("payload", {})
+            if p.get("baseline_set"):
+                return p
+    except Exception:
+        pass
+    return None
+
+
+def _clocks_header() -> tuple[dict | None, str]:
+    """Fetch clocks report; return (report_dict, header_line) or (None, status)."""
     p = get_pi_clocks_report()
-
     state = p.get("report", {}).get("campaign_state") or p.get("campaign_state", "IDLE")
-
     if state != "STARTED":
-        yield f"CLOCKS: {state}"
-        return
-
+        return None, f"CLOCKS: {state}"
     r = p["report"]
-
     campaign = r.get("campaign", "?")
     elapsed = r.get("campaign_elapsed", "00:00:00")
-    yield f"CLOCKS: STARTED {elapsed} {campaign}"
+    n = r.get("pps_count", 0)
+    return r, f"CLOCKS: {campaign} {elapsed} n={n}"
 
-    # ----------------------------------------------------------------
-    # Clock table — cumulative tau and PPB
-    # ----------------------------------------------------------------
 
-    yield f"{'CLK':<8} {'TAU':>14} {'PPB':>14}"
-    yield f"{'GNSS':<8} {'1.0000000000':>14} {'0.00':>14}"
+# ---------------------------------------------------------------------
+# CLOCKS 1/3 — Tau
+# ---------------------------------------------------------------------
 
-    for name, key in [("DWT", "dwt"), ("PI", "pi"),  ("OCXO", "ocxo")]:
+def clocks_tau_readout() -> Generator[str, None, None]:
+    r, hdr = _clocks_header()
+    yield hdr
+    if r is None:
+        return
+
+    yield f"{'CLK':<6} {'TAU':>16} {'PPB':>10}"
+    yield f"{'GNSS':<6} {'1.0000000000':>16} {'0.00':>10}"
+
+    for name, key in _CLOCK_DOMAINS[1:]:
         blk = r.get(key, {})
         tau = blk.get("tau", 0.0)
         ppb = blk.get("ppb", 0.0)
-        yield f"{name:<8} {tau:>14.10f} {ppb:>14.2f}"
+        yield f"{name:<6} {tau:>16.10f} {ppb:>10.2f}"
 
-    # ----------------------------------------------------------------
-    # Residual table
-    # ----------------------------------------------------------------
 
-    yield f"{'CLK':<5} {'RES':>8} {'MEAN':>8} {'SD':>8} {'SE':>8}"
+# ---------------------------------------------------------------------
+# CLOCKS 2/3 — Welford's
+# ---------------------------------------------------------------------
 
-    for name, key in [("GNSS", "gnss"), ("DWT", "dwt"), ("PI", "pi"), ("OCXO", "ocxo")]:
+def clocks_welford_readout() -> Generator[str, None, None]:
+    r, hdr = _clocks_header()
+    yield hdr
+    if r is None:
+        return
+
+    yield f"{'CLK':<6} {'RES':>8} {'MEAN':>9} {'SD':>8} {'SE':>7}"
+
+    for name, key in _CLOCK_DOMAINS:
         blk = r.get(key, {})
         if blk.get("pps_valid"):
             res    = blk.get("pps_residual", 0)
             mean   = blk.get("pps_mean", 0.0)
             stddev = blk.get("pps_stddev", 0.0)
             stderr = blk.get("pps_stderr", 0.0)
-            yield f"{name:<5} {res:>8} {mean:>8.1f} {stddev:>8.1f} {stderr:>8.1f}"
+            yield f"{name:<6} {res:>8.1f} {mean:>9.2f} {stddev:>8.2f} {stderr:>7.2f}"
         else:
-            yield f"{name:<5} {'---':>8} {'---':>8} {'---':>8} {'---':>8}"
+            yield f"{name:<6} {'---':>8} {'---':>9} {'---':>8} {'---':>7}"
+
+
+# ---------------------------------------------------------------------
+# CLOCKS 3/3 — Comparison vs baseline
+# ---------------------------------------------------------------------
+
+def clocks_comparison_readout() -> Generator[str, None, None]:
+    r, hdr = _clocks_header()
+    yield hdr
+    if r is None:
+        return
+
+    baseline = _get_clocks_baseline()
+    if baseline is None:
+        yield "NO BASELINE SET"
+        yield "USE: .pc clocks SET_BASELINE id=<N>"
+        return
+
+    baseline_ppb = baseline.get("baseline_ppb", {})
+    baseline_id = baseline.get("baseline_id", "?")
+    baseline_campaign = baseline.get("baseline_campaign", "?")
+
+    yield f"BASELINE: {baseline_campaign} (#{baseline_id})"
+    yield f"{'CLK':<6} {'BASE':>10} {'NOW':>10} {'DELTA':>10}"
+
+    for name, key in _CLOCK_DOMAINS:
+        blk = r.get(key, {})
+        base_ppb = baseline_ppb.get(key)
+        now_ppb = blk.get("ppb")
+
+        if base_ppb is not None and now_ppb is not None:
+            delta = now_ppb - base_ppb
+            yield f"{name:<6} {base_ppb:>10.2f} {now_ppb:>10.2f} {delta:>+10.2f}"
+        else:
+            yield f"{name:<6} {'---':>10} {'---':>10} {'---':>10}"
 
 
 # ---------------------------------------------------------------------

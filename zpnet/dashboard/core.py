@@ -108,7 +108,9 @@ def header_readout(prefix: str = "") -> list[str]:
 # Readout imports (SYSTEM-backed)
 # ---------------------------------------------------------------------
 from zpnet.dashboard.readout_blocks import (
-    clocks_status_readout,
+    clocks_tau_readout,
+    clocks_welford_readout,
+    clocks_comparison_readout,
     gnss_report_readout,
     laser_status_readout,
     environment_status_readout,
@@ -125,7 +127,9 @@ from zpnet.dashboard.readout_blocks import (
 Readout = Generator[str, None, None]
 
 READOUTS: list[Callable[[], Readout]] = [
-    clocks_status_readout,
+    clocks_tau_readout,
+    clocks_welford_readout,
+    clocks_comparison_readout,
     gnss_report_readout,
     laser_status_readout,
     environment_status_readout,
