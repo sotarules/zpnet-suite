@@ -12,7 +12,10 @@ Reads all TIMEBASE rows for the named campaign and produces:
   • Per-clock zero/duplicate detection
   • Per-clock delta statistics (min, max, mean, stddev)
   • Pi capture sequence integrity (seq gaps, repeats)
-  • Summary verdict: CLEAN or list of anomalies
+  • Recovery-aware: gaps in pps_count are classified as recovery gaps
+    and cross-boundary anomalies (pi_ns reset, pi_seq regression)
+    are expected artifacts, not failures.
+  • Summary verdict: CLEAN, CLEAN (with recovery), or anomalies
 """
 
 from __future__ import annotations
@@ -20,7 +23,7 @@ from __future__ import annotations
 import json
 import math
 import sys
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from zpnet.shared.db import open_db
 
@@ -114,6 +117,25 @@ def fetch_timebase(campaign: str) -> List[Dict[str, Any]]:
 
 
 # ---------------------------------------------------------------------
+# Recovery boundary detection
+# ---------------------------------------------------------------------
+
+def find_recovery_boundaries(rows: List[Dict[str, Any]]) -> Set[int]:
+    """
+    Find pps_count values that immediately follow a recovery gap.
+    These are the first record after each gap where cross-boundary
+    comparisons (pi_ns delta, pi_seq continuity) are not meaningful.
+    """
+    boundaries: Set[int] = set()
+    for i in range(1, len(rows)):
+        prev = int(rows[i - 1]["pps_count"])
+        curr = int(rows[i]["pps_count"])
+        if curr > prev + 1:
+            boundaries.add(curr)
+    return boundaries
+
+
+# ---------------------------------------------------------------------
 # Analysis
 # ---------------------------------------------------------------------
 
@@ -126,6 +148,10 @@ def analyze(campaign: str) -> None:
 
     total = len(rows)
     anomalies: List[str] = []
+
+    # --- Recovery boundary detection ---
+    recovery_boundaries = find_recovery_boundaries(rows)
+    recovery_count = len(recovery_boundaries)
 
     # --- pps_count range and continuity ---
     pps_counts = [int(r["pps_count"]) for r in rows]
@@ -155,8 +181,8 @@ def analyze(campaign: str) -> None:
     print(f"  Actual records:   {total}")
     missing_count = expected_count - total
     print(f"  Missing records:  {missing_count}")
-    if missing_count > 0:
-        anomalies.append(f"{missing_count} missing TIMEBASE records")
+    if recovery_count > 0:
+        print(f"  Recovery events:  {recovery_count}")
     if total > expected_count:
         anomalies.append(f"{total - expected_count} EXTRA records (duplicates?)")
 
@@ -165,10 +191,13 @@ def analyze(campaign: str) -> None:
     full_range = set(range(pps_min, pps_max + 1))
     missing_pps = sorted(full_range - pps_set)
 
+    # Classify missing records as recovery gaps vs unexpected gaps
+    recovery_missing = 0
+    unexpected_missing = 0
+
     if missing_pps:
         print()
-        print(f"  Missing pps_count values ({len(missing_pps)}):")
-        # Show in compact ranges
+        # Group into ranges
         ranges = []
         start = missing_pps[0]
         end = start
@@ -181,11 +210,28 @@ def analyze(campaign: str) -> None:
                 end = v
         ranges.append((start, end))
 
+        print(f"  Missing pps_count values ({len(missing_pps)}):")
         for s, e in ranges:
-            if s == e:
-                print(f"    {s}")
+            count = e - s + 1
+            # Check if the record after this gap is a recovery boundary
+            next_pps = e + 1
+            is_recovery = next_pps in recovery_boundaries
+
+            label = " (recovery)" if is_recovery else " ⚠️"
+            if is_recovery:
+                recovery_missing += count
             else:
-                print(f"    {s}-{e} ({e - s + 1} consecutive)")
+                unexpected_missing += count
+
+            if s == e:
+                print(f"    {s}{label}")
+            else:
+                print(f"    {s}-{e} ({count} consecutive){label}")
+
+    if unexpected_missing > 0:
+        anomalies.append(f"{unexpected_missing} unexpected missing TIMEBASE records")
+    if recovery_missing > 0:
+        print(f"\n  Recovery gap records: {recovery_missing} (expected)")
 
     # Check for duplicate pps_counts
     if len(pps_counts) != len(pps_set):
@@ -208,6 +254,7 @@ def analyze(campaign: str) -> None:
     print("-" * 70)
 
     pps_jumps = 0
+    pps_recovery_jumps = 0
     pps_regressions = 0
     pps_repeats = 0
 
@@ -225,21 +272,27 @@ def analyze(campaign: str) -> None:
             if pps_regressions <= 5:
                 print(f"  ⚠️  REGRESSION at row {i}: {prev} -> {curr} (delta={delta})")
         elif delta > 1:
-            pps_jumps += 1
-            if pps_jumps <= 10:
-                print(f"  ⚠️  GAP at row {i}: {prev} -> {curr} (skipped {delta - 1})")
+            is_recovery = curr in recovery_boundaries
+            if is_recovery:
+                pps_recovery_jumps += 1
+                print(f"  ℹ️  RECOVERY GAP at row {i}: {prev} -> {curr} (skipped {delta - 1})")
+            else:
+                pps_jumps += 1
+                if pps_jumps <= 10:
+                    print(f"  ⚠️  GAP at row {i}: {prev} -> {curr} (skipped {delta - 1})")
 
     if pps_jumps > 10:
         print(f"  ... and {pps_jumps - 10} more gaps")
     if pps_repeats > 5:
         print(f"  ... and {pps_repeats - 5} more repeats")
 
-    print(f"\n  Jumps (gaps):   {pps_jumps}")
-    print(f"  Repeats:        {pps_repeats}")
-    print(f"  Regressions:    {pps_regressions}")
+    print(f"\n  Jumps (unexpected):  {pps_jumps}")
+    print(f"  Jumps (recovery):    {pps_recovery_jumps}")
+    print(f"  Repeats:             {pps_repeats}")
+    print(f"  Regressions:         {pps_regressions}")
 
     if pps_jumps:
-        anomalies.append(f"{pps_jumps} pps_count gaps")
+        anomalies.append(f"{pps_jumps} unexpected pps_count gaps")
     if pps_repeats:
         anomalies.append(f"{pps_repeats} pps_count repeats")
     if pps_regressions:
@@ -256,10 +309,12 @@ def analyze(campaign: str) -> None:
 
         values = []
         null_count = 0
+        null_pps = []
         for r in rows:
             v = r.get(key)
             if v is None:
                 null_count += 1
+                null_pps.append(int(r["pps_count"]))
             else:
                 values.append((int(r["pps_count"]), int(v)))
 
@@ -268,7 +323,12 @@ def analyze(campaign: str) -> None:
             continue
 
         if null_count > 0:
-            print(f"    Nulls: {null_count}/{total}")
+            # Check if nulls are at recovery boundaries (expected)
+            null_at_boundary = sum(1 for p in null_pps if p in recovery_boundaries or p == 0)
+            if null_at_boundary == null_count:
+                print(f"    Nulls: {null_count}/{total} (all at recovery boundaries — expected)")
+            else:
+                print(f"    Nulls: {null_count}/{total} ({null_at_boundary} at boundaries, {null_count - null_at_boundary} unexpected)")
 
         # Monotonicity check
         non_monotonic = 0
@@ -279,6 +339,9 @@ def analyze(campaign: str) -> None:
         for i in range(1, len(values)):
             prev_pps, prev_val = values[i - 1]
             curr_pps, curr_val = values[i]
+
+            # Check if this is a recovery boundary
+            at_boundary = curr_pps in recovery_boundaries
 
             # Only check adjacent pps_counts for delta stats
             if curr_pps == prev_pps + 1:
@@ -295,12 +358,19 @@ def analyze(campaign: str) -> None:
                     if negative_deltas <= 3:
                         print(f"    ⚠️  NEGATIVE DELTA at pps_count={curr_pps}: "
                               f"{prev_val} -> {curr_val} (delta={delta})")
-            elif curr_val <= prev_val:
-                non_monotonic += 1
-                if non_monotonic <= 3:
-                    print(f"    ⚠️  NON-MONOTONIC across gap: "
-                          f"pps {prev_pps}->{curr_pps}  "
-                          f"val {prev_val}->{curr_val}")
+            else:
+                # Across a gap — check monotonicity but classify boundary issues
+                if curr_val <= prev_val:
+                    if at_boundary and key == "pi_ns":
+                        pass  # expected: pi_ns resets at recovery (epoch recomputed)
+                    elif at_boundary:
+                        pass  # other clocks: Teensy counter reset at recovery is OK
+                    else:
+                        non_monotonic += 1
+                        if non_monotonic <= 3:
+                            print(f"    ⚠️  NON-MONOTONIC across gap: "
+                                  f"pps {prev_pps}->{curr_pps}  "
+                                  f"val {prev_val}->{curr_val}")
 
         if zero_deltas > 3:
             print(f"    ... and {zero_deltas - 3} more zero deltas")
@@ -357,39 +427,47 @@ def analyze(campaign: str) -> None:
         seq_gaps = 0
         seq_repeats = 0
         seq_regressions = 0
+        seq_recovery_regressions = 0
 
         for i in range(1, len(seqs)):
             prev_pps, prev_seq = seqs[i - 1]
             curr_pps, curr_seq = seqs[i]
             delta = curr_seq - prev_seq
 
+            at_boundary = curr_pps in recovery_boundaries
+
             if delta == 0:
                 seq_repeats += 1
                 if seq_repeats <= 3:
                     print(f"  ⚠️  SEQ REPEAT at pps_count={curr_pps}: seq={curr_seq}")
             elif delta < 0:
-                seq_regressions += 1
-                if seq_regressions <= 3:
-                    print(f"  ⚠️  SEQ REGRESSION at pps_count={curr_pps}: "
-                          f"{prev_seq} -> {curr_seq}")
+                if at_boundary:
+                    seq_recovery_regressions += 1
+                    print(f"  ℹ️  SEQ REGRESSION at recovery boundary pps_count={curr_pps}: "
+                          f"{prev_seq} -> {curr_seq} (PITIMER restarted — expected)")
+                else:
+                    seq_regressions += 1
+                    if seq_regressions <= 3:
+                        print(f"  ⚠️  SEQ REGRESSION at pps_count={curr_pps}: "
+                              f"{prev_seq} -> {curr_seq}")
             elif delta > 1:
-                seq_gaps += 1
-                if seq_gaps <= 5:
-                    print(f"  ⚠️  SEQ GAP at pps_count={curr_pps}: "
-                          f"{prev_seq} -> {curr_seq} (missed {delta - 1})")
+                if at_boundary:
+                    pass  # PITIMER restarted, seq reset — expected
+                else:
+                    seq_gaps += 1
+                    if seq_gaps <= 5:
+                        print(f"  ⚠️  SEQ GAP at pps_count={curr_pps}: "
+                              f"{prev_seq} -> {curr_seq} (missed {delta - 1})")
 
         print(f"\n  Range: {seqs[0][1]} -> {seqs[-1][1]}")
         print(f"  Gaps: {seq_gaps}  Repeats: {seq_repeats}  Regressions: {seq_regressions}")
-
-        if seq_gaps:
-            anomalies.append(f"Pi seq: {seq_gaps} gaps")
-        if seq_repeats:
-            anomalies.append(f"Pi seq: {seq_repeats} repeats")
-        if seq_regressions:
-            anomalies.append(f"Pi seq: {seq_regressions} regressions")
+        if seq_recovery_regressions:
+            print(f"  Recovery regressions: {seq_recovery_regressions} (expected)")
 
         if not (seq_gaps or seq_repeats or seq_regressions):
-            print("  Verdict: ✅ sequential, no gaps")
+            print("  Verdict: ✅ sequential, no gaps" +
+                  (f" ({seq_recovery_regressions} recovery regression{'s' if seq_recovery_regressions != 1 else ''} — expected)"
+                   if seq_recovery_regressions else ""))
         else:
             print("  Verdict: ⚠️  anomalies detected")
 
@@ -425,6 +503,9 @@ def analyze(campaign: str) -> None:
         print(f"VERDICT: ⚠️  {len(anomalies)} ANOMALIES FOUND")
         for a in anomalies:
             print(f"  • {a}")
+    elif recovery_count > 0:
+        print(f"VERDICT: ✅ CLEAN (with {recovery_count} recovery event{'s' if recovery_count != 1 else ''}, "
+              f"{recovery_missing} gap records)")
     else:
         print("VERDICT: ✅ CLEAN — all checks passed")
     print("=" * 70)

@@ -580,6 +580,7 @@ def cmd_set_pps_count(args: Optional[dict]) -> Dict[str, Any]:
       • Buffer is cleared — all prior captures are discarded.
     """
     global _pps_armed, _pps_next_count, _last_pps_count_seen, _last_capture
+    global _pi_tick_epoch, _epoch_set
 
     if not args or "pps_count" not in args:
         return {"success": False, "message": "BAD", "payload": {"error": "missing pps_count"}}
@@ -600,6 +601,11 @@ def cmd_set_pps_count(args: Optional[dict]) -> Dict[str, Any]:
         _last_pps_count_seen = None
         _last_capture = None
         _capture_buffer.clear()
+        # Clear epoch — CLOCKS must call SET_EPOCH after SET_PPS_COUNT.
+        # Without this, captures after re-arm could get pi_ns computed
+        # with a stale epoch from a previous campaign start.
+        _pi_tick_epoch = 0
+        _epoch_set = False
 
     _diag["pps_count_set_applied"] += 1
     _diag["pps_count_armed"] = True

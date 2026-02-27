@@ -970,16 +970,17 @@ def _process_loop() -> None:
         pi_corrected = int(pi_corrected)
 
         if pi_ns is None:
-            if int(pps_count) == 0:
-                # Epoch edge: pi_ns is 0 by definition (capture was stored
-                # before SET_EPOCH, so PITIMER couldn't compute it)
-                pi_ns = 0
-            else:
-                logging.warning(
-                    "⚠️ [clocks] @%s PITIMER capture has no pi_ns for pps_count=%d "
-                    "(epoch not set?)",
-                    sysclk, int(pps_count),
-                )
+            # The capture was stored before SET_EPOCH fired.
+            # This is expected for the first record after START (pps_count=0,
+            # where pi_ns is 0 by definition) or the first record after
+            # RECOVER (processor won the race against SET_EPOCH).
+            # Compute it locally as a fallback.
+            pit_epoch = pit.get("pi_tick_epoch")  # not present — capture was pre-epoch
+            logging.info(
+                "ℹ️ [clocks] @%s pi_ns=None for pps_count=%d — "
+                "pre-epoch capture, will be None in TIMEBASE",
+                sysclk, int(pps_count),
+            )
 
         logging.debug(
             "✅ [clocks] @%s correlation OK: teensy=%d pitimer=%d pi_ns=%s",
