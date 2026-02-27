@@ -1263,10 +1263,17 @@ def cmd_start(args: Optional[dict]) -> dict:
     _diag["armed_pps_count"] = 0
     logging.info("📡 [start] @%s both armed for pps_count=0 — waiting for sync fragment...", system_time_z())
 
-    # Wait for the sync fragment (DO NOT activate campaign yet)
+    # Activate campaign BEFORE waiting so the processor thread will
+    # accept pps_count=0 when it pulls it from the queue.  Without this,
+    # the processor may drain and discard pps_count=0 as "no campaign"
+    # before cmd_start returns and sets _campaign_active.
+    _campaign_active = True
+
+    # Wait for the sync fragment
     try:
         frag0, waited_s = _end_sync_wait()
     except Exception:
+        _campaign_active = False
         return {"success": False, "message": "HARD FAULT during START sync (see logs/diag)"}
 
     logging.info("✅ [start] @%s sync fragment received (waited=%.3fs)", system_time_z(), waited_s)
@@ -1284,12 +1291,6 @@ def cmd_start(args: Optional[dict]) -> dict:
 
     # Tell PITIMER the epoch so it can compute pi_ns from here on
     _set_pitimer_epoch(pi_tick_epoch)
-
-    # Activate campaign — processor thread will handle pps_count=0 from the queue
-    # armed=0 so the first fragment (pps_count=0) correlates correctly
-    _armed_pps_count = 0
-    _diag["armed_pps_count"] = 0
-    _campaign_active = True
 
     logging.info("▶️ [clocks] @%s START complete — campaign '%s' active", system_time_z(), campaign)
 
@@ -1591,10 +1592,15 @@ def _recover_campaign() -> None:
     _armed_pps_count = int(next_pps_count)
     _diag["armed_pps_count"] = int(next_pps_count)
 
-    # Wait for sync fragment (DO NOT activate campaign yet)
+    # Activate campaign BEFORE waiting so the processor thread will
+    # accept the sync fragment when it pulls it from the queue.
+    _campaign_active = True
+
+    # Wait for sync fragment
     try:
         frag, waited_s = _end_sync_wait(timeout_s=SYNC_RECOVER_TIMEOUT_S)
     except Exception:
+        _campaign_active = False
         raise
 
     logging.info("✅ [recovery] @%s sync fragment received (waited=%.3fs)", system_time_z(), waited_s)
@@ -1618,12 +1624,6 @@ def _recover_campaign() -> None:
     )
 
     _set_pitimer_epoch(pi_tick_epoch)
-
-    # Activate campaign — processor thread will handle the sync fragment from the queue
-    # armed=next_pps_count so the first fragment correlates correctly
-    _armed_pps_count = int(next_pps_count)
-    _diag["armed_pps_count"] = int(next_pps_count)
-    _campaign_active = True
 
     logging.info(
         "✅ [recovery] @%s campaign '%s' recovered — pps_count=%d, TIMEBASE resumes",
