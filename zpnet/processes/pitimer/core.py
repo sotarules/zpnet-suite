@@ -1,8 +1,12 @@
 """
 ZPNet PITIMER Process — Pi Arch Timer PPS Capture (MINIMAL SURFACE)
 
-Intent (v2026-02-26+):
+Intent (v2026-02-27+):
   PITIMER is a single-edge capture service with a strict identity contract.
+
+  pps_count is MANDATORY. PITIMER will NOT produce labeled captures until
+  CLOCKS has called SET_PPS_COUNT. Captures taken before arming are held
+  internally but not exposed via REPORT — REPORT returns state="UNARMED".
 
   Supports two capture modes:
 
@@ -24,9 +28,10 @@ Intent (v2026-02-26+):
       is non-destructive and multiple consumers can read the same timestamps.
 
 Contract:
-  • CLOCKS sets PITIMER's pps_count via SET_PPS_COUNT(k).
-  • The next PPS capture MUST be labeled pps_count==k, then PITIMER increments by 1 each PPS.
-  • PITIMER retains ONLY the most recent capture (no history, no ring buffers).
+  • CLOCKS MUST call SET_PPS_COUNT(k) before PITIMER produces usable captures.
+  • The next PPS capture after SET_PPS_COUNT is labeled pps_count==k, then +1 each PPS.
+  • PITIMER retains ONLY the most recent armed capture (no history, no ring buffers).
+  • REPORT returns state="UNARMED" until SET_PPS_COUNT has been called.
 
 Command surface:
   • SET_PPS_COUNT
@@ -290,12 +295,13 @@ def _capture_one() -> Dict[str, Any]:
 _diag: Dict[str, Any] = {
     # Capture loop
     "captures_total": 0,
+    "captures_unarmed": 0,
     "capture_exceptions": 0,
 
     # PPS-count control/continuity
     "pps_count_set_requests": 0,
     "pps_count_set_applied": 0,
-    "pps_count_enabled": False,
+    "pps_count_armed": False,
     "pps_count_seen": 0,
     "pps_count_repeat": 0,
     "pps_count_regress": 0,
@@ -325,7 +331,7 @@ _state_lock = threading.Lock()
 _last_capture: Optional[Dict[str, Any]] = None
 _capture_seq: int = 0
 
-_pps_count_enabled: bool = False
+_pps_armed: bool = False
 _pps_next_count: int = 0
 _last_pps_count_seen: Optional[int] = None
 
@@ -333,18 +339,18 @@ _last_pps_count_seen: Optional[int] = None
 _last_corrected: Optional[int] = None
 
 # ---------------------------------------------------------------------
-# PPS count assignment
+# PPS count assignment (MANDATORY)
 # ---------------------------------------------------------------------
 
 
-def _assign_pps_count() -> Optional[int]:
+def _assign_pps_count() -> int:
     """
-    If enabled, assign pps_count for THIS capture and increment for next.
+    Assign pps_count for THIS capture and increment for next.
+
+    PITIMER must be armed via SET_PPS_COUNT before this is called.
+    The caller (_capture_loop) gates on _pps_armed.
     """
     global _pps_next_count, _last_pps_count_seen
-
-    if not _pps_count_enabled:
-        return None
 
     k = int(_pps_next_count)
     _pps_next_count += 1
@@ -392,6 +398,9 @@ def _capture_loop() -> None:
     """
     Blocking capture loop: one call to _capture_one() per PPS edge.
     Each call blocks ~1s then returns exactly one capture.
+
+    Captures taken while unarmed are counted but NOT stored — REPORT
+    will return state="UNARMED" until SET_PPS_COUNT has been called.
     """
     global _last_capture, _capture_seq, _last_corrected
 
@@ -429,9 +438,14 @@ def _capture_loop() -> None:
             _diag["last_seq"] = _capture_seq
 
             with _state_lock:
+                if not _pps_armed:
+                    # Unarmed: capture runs (keeps delta tracking warm)
+                    # but is NOT exposed via REPORT
+                    _diag["captures_unarmed"] += 1
+                    continue
+
                 pps_count = _assign_pps_count()
-                if pps_count is not None:
-                    cap["pps_count"] = int(pps_count)
+                cap["pps_count"] = int(pps_count)
                 _last_capture = cap
 
             # Periodic log (every 60 captures)
@@ -466,11 +480,12 @@ def cmd_set_pps_count(args: Optional[dict]) -> Dict[str, Any]:
     """
     SET_PPS_COUNT(k)
 
-    Semantics:
-      • Enables pps_count mode.
+    Arms PITIMER for mandatory pps_count tracking.
       • Next capture will be labeled pps_count==k, then increments each PPS.
+      • Previous capture state is cleared — REPORT returns the first
+        armed capture once it arrives.
     """
-    global _pps_count_enabled, _pps_next_count, _last_pps_count_seen
+    global _pps_armed, _pps_next_count, _last_pps_count_seen, _last_capture
 
     if not args or "pps_count" not in args:
         return {"success": False, "message": "BAD", "payload": {"error": "missing pps_count"}}
@@ -486,17 +501,20 @@ def cmd_set_pps_count(args: Optional[dict]) -> Dict[str, Any]:
     _diag["pps_count_set_requests"] += 1
 
     with _state_lock:
-        _pps_count_enabled = True
+        _pps_armed = True
         _pps_next_count = int(k)
         _last_pps_count_seen = None
+        _last_capture = None  # Clear stale capture — next REPORT waits for fresh armed capture
 
     _diag["pps_count_set_applied"] += 1
-    _diag["pps_count_enabled"] = True
+    _diag["pps_count_armed"] = True
     _diag["last_set_event"] = {
         "ts_utc": system_time_z(),
         "event": "set_pps_count",
         "value": int(k),
     }
+
+    logging.info("🎯 [pitimer] armed: next capture will be pps_count=%d", k)
 
     return {"success": True, "message": "OK", "payload": {"pps_count": int(k)}}
 
@@ -586,25 +604,27 @@ def cmd_report(_: Optional[dict]) -> Dict[str, Any]:
     """
     REPORT
 
-    Returns the latest capture plus current pps_count mode state.
+    Returns the latest armed capture.  If PITIMER has not been armed
+    via SET_PPS_COUNT, returns state="UNARMED".
     """
     with _state_lock:
+        armed = bool(_pps_armed)
         cap = dict(_last_capture) if _last_capture else None
-        enabled = bool(_pps_count_enabled)
-        next_pps = int(_pps_next_count) if enabled else None
+        next_pps = int(_pps_next_count)
 
     with _capture_mode_lock:
         mode = _capture_mode
 
     payload: Dict[str, Any] = {
-        "state": "OK" if cap else "WAITING",
+        "state": "OK" if cap else ("WAITING" if armed else "UNARMED"),
         "capture_mode": mode,
-        "pps_count_enabled": enabled,
-        "next_pps_count": next_pps,
+        "pps_armed": armed,
+        "next_pps_count": next_pps if armed else None,
         "freq": PI_TIMER_FREQ,
         "ns_per_tick": round(NS_PER_TICK, 3),
         "diag": {
             "captures_total": _diag["captures_total"],
+            "captures_unarmed": _diag["captures_unarmed"],
             "capture_exceptions": _diag["capture_exceptions"],
             "pps_count_seen": _diag["pps_count_seen"],
             "pps_count_repeat": _diag["pps_count_repeat"],
@@ -683,6 +703,7 @@ def run() -> None:
     logging.info(
         "⏱️ [pitimer] starting — Pi arch timer PPS capture. "
         "freq=%d Hz, %.3f ns/tick. "
+        "pps_count is MANDATORY — REPORT returns UNARMED until SET_PPS_COUNT. "
         "Default mode: LOOP (libppscapture). "
         "Commands: SET_PPS_COUNT, REPORT, NS, SET_MODE, GET_MODE.",
         PI_TIMER_FREQ,

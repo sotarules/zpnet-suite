@@ -94,7 +94,6 @@ _diag: Dict[str, Any] = {
 
     # Draconian correlation failures
     "hard_fault_pitimer_report_failed": 0,
-    "hard_fault_pitimer_pps_missing": 0,
     "hard_fault_pps_mismatch": 0,
     "hard_fault_pitimer_counter_missing": 0,
     "hard_fault_epoch_not_set": 0,
@@ -103,6 +102,13 @@ _diag: Dict[str, Any] = {
     "last_hard_fault": {},
     "hard_faults_total": 0,
     "auto_recovery_failures": 0,
+
+    # PITIMER correlation skips (graceful — TIMEBASE not issued)
+    "pitimer_not_ready": 0,
+    "pitimer_pps_missing": 0,
+    "pitimer_pps_ahead": 0,
+    "pitimer_skips_total": 0,
+    "last_pitimer_skip": {},
 
     # PITIMER control plane
     "pitimer_set_requests": 0,
@@ -915,54 +921,108 @@ def on_timebase_fragment(payload: Payload) -> None:
             "delta": delta,
         })
 
-    # Give PITIMER's ppspoll thread time to detect and parse the PPS edge.
-    # The Teensy fragment arrives ~1.5ms after PPS, but PITIMER's subprocess
-    # may still be reading/parsing. 100ms is generous and deterministic.
+    # Give PITIMER time to detect the PPS edge.  The Teensy fragment
+    # arrives ~1.5ms after PPS; PITIMER's capture loop may still be
+    # completing.  100ms is generous and deterministic.
     time.sleep(0.100)
 
-    # Ask PITIMER for its latest capture. It should be for THIS PPS edge.
+    # Ask PITIMER for its latest capture.  It should be for THIS PPS edge.
     pit = _pitimer_report()
 
+    # --- PITIMER state gate: must be armed and have a capture ---
+    pit_state = pit.get("state", "OK")
+    if pit_state in ("UNARMED", "WAITING"):
+        _diag["pitimer_not_ready"] += 1
+        _diag["pitimer_skips_total"] += 1
+        _diag["last_pitimer_skip"] = {
+            "ts_utc": sysclk,
+            "reason": "pitimer_not_ready",
+            "pitimer_state": pit_state,
+            "teensy_pps_count": int(pps_count),
+        }
+        logging.warning(
+            "⚠️ [clocks] @%s PITIMER state=%s — skipping TIMEBASE for pps_count=%d",
+            sysclk, pit_state, int(pps_count),
+        )
+        _armed_pps_count = int(pps_count) + 1
+        _diag["armed_pps_count"] = _armed_pps_count
+        return
+
+    # --- PITIMER pps_count gate ---
     pit_pps = pit.get("pps_count")
     if pit_pps is None:
-        _diag["hard_fault_pitimer_pps_missing"] += 1
-        logging.error(
-            "💥 [clocks] @%s PITIMER returned no pps_count! "
-            "I told PITIMER the next second is %s but it has no count assigned. "
-            "Teensy sent pps_count=%d. PITIMER state: %s",
-            sysclk, str(armed), int(pps_count), pit.get("state", "?"),
-        )
-        _hard_fault("pitimer_pps_missing", {
-            "system_time": sysclk,
-            "armed_pps_count": armed,
+        _diag["pitimer_pps_missing"] += 1
+        _diag["pitimer_skips_total"] += 1
+        _diag["last_pitimer_skip"] = {
+            "ts_utc": sysclk,
+            "reason": "pitimer_pps_missing",
             "teensy_pps_count": int(pps_count),
+            "armed_pps_count": armed,
             "pitimer": pit,
-        })
+        }
+        logging.warning(
+            "⚠️ [clocks] @%s PITIMER returned no pps_count — "
+            "skipping TIMEBASE for pps_count=%d (PITIMER state: %s)",
+            sysclk, int(pps_count), pit.get("state", "?"),
+        )
+        _armed_pps_count = int(pps_count) + 1
+        _diag["armed_pps_count"] = _armed_pps_count
+        return
 
-    if int(pit_pps) != int(pps_count):
+    pit_pps = int(pit_pps)
+
+    # --- Correlation check: PITIMER pps_count vs Teensy pps_count ---
+    if pit_pps != int(pps_count):
+        pit_delta = pit_pps - int(pps_count)
+
+        if pit_delta == 1:
+            # PITIMER is exactly one ahead — classic late-fragment case.
+            # The PPS edge arrived, PITIMER captured it and incremented,
+            # but the Teensy fragment for the *previous* edge was delayed.
+            # Skip this TIMEBASE (honest gap) and resync.
+            _diag["pitimer_pps_ahead"] += 1
+            _diag["pitimer_skips_total"] += 1
+            _diag["last_pitimer_skip"] = {
+                "ts_utc": sysclk,
+                "reason": "pitimer_pps_ahead",
+                "teensy_pps_count": int(pps_count),
+                "pitimer_pps_count": pit_pps,
+                "armed_pps_count": armed,
+            }
+            logging.warning(
+                "⚠️ [clocks] @%s PITIMER ahead by 1: teensy=%d pitimer=%d — "
+                "skipping TIMEBASE (late fragment), resyncing",
+                sysclk, int(pps_count), pit_pps,
+            )
+            # Advance armed to match PITIMER's position so next fragment
+            # (pps_count+1) correlates with PITIMER's next capture (pps_count+2... no).
+            # Actually: PITIMER is now at pit_pps and will increment to pit_pps+1
+            # on the next edge.  Teensy's next fragment will be pps_count+1 == pit_pps.
+            # So armed should be pps_count+1 == pit_pps.
+            _armed_pps_count = int(pps_count) + 1
+            _diag["armed_pps_count"] = _armed_pps_count
+            return
+
+        # Any other mismatch is a hard fault — something seriously wrong.
         _diag["hard_fault_pps_mismatch"] += 1
-        delta = int(pit_pps) - int(pps_count)
         logging.error(
             "💥 [clocks] @%s PITIMER PPS COUNT MISMATCH! "
-            "I told PITIMER the next second is %s. "
-            "I told Teensy the next second is %s. "
-            "Teensy sent me pps_count=%d (good). "
-            "But PITIMER reports pps_count=%d (off by %+d).",
-            sysclk, str(armed), str(armed),
-            int(pps_count), int(pit_pps), delta,
+            "teensy_pps_count=%d pitimer_pps_count=%d (delta=%+d). "
+            "armed=%s.",
+            sysclk, int(pps_count), pit_pps, pit_delta, str(armed),
         )
         _hard_fault("pps_mismatch_teensy_vs_pitimer", {
             "system_time": sysclk,
             "armed_pps_count": armed,
             "teensy_pps_count": int(pps_count),
-            "pitimer_pps_count": int(pit_pps),
-            "delta": delta,
+            "pitimer_pps_count": pit_pps,
+            "delta": pit_delta,
             "pitimer": pit,
         })
 
     logging.debug(
         "✅ [clocks] @%s draconian correlation OK: armed=%s teensy=%d pitimer=%d",
-        sysclk, str(armed), int(pps_count), int(pit_pps),
+        sysclk, str(armed), int(pps_count), pit_pps,
     )
 
     # Advance armed expectation to next second
