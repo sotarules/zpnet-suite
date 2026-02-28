@@ -707,6 +707,83 @@ def _pitimer_get_capture(pps_count: int) -> Optional[Dict[str, Any]]:
     return None
 
 
+def _fetch_environment() -> Optional[Dict[str, Any]]:
+    """
+    Fetch environment snapshot from SYSTEM REPORT for TIMEBASE correlation.
+
+    Returns a flat dict with temperature, altitude, pressure, and power
+    readings, or None if the report is unavailable.  Best-effort — a miss
+    here should never block TIMEBASE production.
+    """
+    try:
+        resp = send_command(machine="PI", subsystem="SYSTEM", command="REPORT")
+        if not resp.get("success"):
+            return None
+        p = resp.get("payload", {})
+        if not isinstance(p, dict):
+            return None
+
+        env = p.get("environment", {})
+        gnss = p.get("gnss", {})
+        gnss_clock = gnss.get("clock", {})
+        teensy = p.get("teensy", {})
+        pi = p.get("pi", {})
+        power = p.get("power", {})
+        battery = p.get("battery", {})
+
+        # Power state: extract Pi, Teensy, OCXO domains from i2c-2
+        i2c2 = power.get("i2c-2", {})
+        pi_power = i2c2.get("0x40", {})
+        teensy_power = i2c2.get("0x45", {})
+        ocxo_power = i2c2.get("0x44", {})
+
+        return {
+            # Temperature
+            "ambient_temp_c": env.get("temperature_c"),
+            "teensy_temp_c": teensy.get("cpu_temp_c"),
+            "pi_temp_c": pi.get("cpu_temp_c"),
+            "gnss_temp_c": gnss_clock.get("temperature_c"),
+
+            # Altitude (all forms)
+            "barometric_altitude_m": env.get("altitude_m"),
+            "gnss_altitude_m": gnss.get("altitude_m"),
+            "ellipsoid_height_m": gnss.get("ellipsoid_height_m"),
+            "geoid_sep_m": gnss.get("geoid_sep_m"),
+
+            # Barometric pressure
+            "pressure_hpa": env.get("pressure_hpa"),
+            "humidity_pct": env.get("humidity_pct"),
+
+            # Power state
+            "pi_power": {
+                "volts": pi_power.get("volts"),
+                "amps": pi_power.get("amps"),
+                "watts": pi_power.get("watts"),
+            },
+            "teensy_power": {
+                "volts": teensy_power.get("volts"),
+                "amps": teensy_power.get("amps"),
+                "watts": teensy_power.get("watts"),
+            },
+            "ocxo_power": {
+                "volts": ocxo_power.get("volts"),
+                "amps": ocxo_power.get("amps"),
+                "watts": ocxo_power.get("watts"),
+            },
+
+            # Battery state
+            "battery": {
+                "remaining_pct": battery.get("remaining_pct"),
+                "tte_minutes": battery.get("tte_minutes"),
+                "wh_remaining": battery.get("wh_remaining_estimate"),
+                "health_state": battery.get("health_state"),
+            },
+        }
+    except Exception:
+        logging.debug("⚠️ [clocks] _fetch_environment failed (ignored)")
+        return None
+
+
 def _pitimer_report() -> Dict[str, Any]:
     """Fetch latest PITIMER state (non-destructive, for sync/diagnostics)."""
     try:
@@ -1081,6 +1158,9 @@ def _process_loop() -> None:
             _safe_residual_update(_residual_ocxo, ocxo_ns, NS_PER_SECOND, "OCXO")
         _safe_residual_update(_residual_pi, pi_corrected, PI_TIMER_FREQ, "Pi")
 
+        # --- Environment snapshot (best-effort, never blocks TIMEBASE) ---
+        env_snapshot = _fetch_environment()
+
         # --- Campaign lookup ---
         row = _get_active_campaign()
         if row is None:
@@ -1144,6 +1224,9 @@ def _process_loop() -> None:
             "ocxo_dac": frag.get("ocxo_dac"),
             "calibrate_ocxo": frag.get("calibrate_ocxo"),
             "servo_converged": frag.get("servo_converged"),
+
+            # Environment snapshot (correlated with this PPS edge)
+            "environment": env_snapshot,
         }
 
         report = _build_report(campaign, campaign_payload, timebase)
