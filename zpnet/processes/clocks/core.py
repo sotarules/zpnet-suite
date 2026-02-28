@@ -1493,19 +1493,41 @@ def _recover_campaign() -> None:
         if not gnss_resp.get("success"):
             raise RuntimeError(f"recovery failed: GNSS MODE=TO failed: {gnss_resp.get('message', '?')}")
 
-    # Wait for routing to be live
-    logging.info("⏳ [recovery] @%s waiting for first fragment to confirm routing...", system_time_z())
-    frag_wait_t0 = time.monotonic()
-    frag_count_before = _diag["fragments_received"]
+    # Wait for routing to be live (PUBSUB route check, not fragment arrival).
+    # After hard power-off, the Teensy boots into STOPPED and won't produce
+    # TIMEBASE_FRAGMENTs until we send RECOVER.  So we can't wait for a
+    # fragment — we verify that the PUBSUB route exists instead.
+    logging.info("⏳ [recovery] @%s waiting for PUBSUB routing...", system_time_z())
+    route_wait_t0 = time.monotonic()
     ROUTING_WAIT_TIMEOUT_S = 30.0
-    ROUTING_WAIT_POLL_S = 0.25
+    ROUTING_WAIT_POLL_S = 0.5
     while True:
-        elapsed_wait = time.monotonic() - frag_wait_t0
-        if _diag["fragments_received"] > frag_count_before:
-            logging.info("✅ [recovery] @%s routing confirmed (%.1fs)", system_time_z(), elapsed_wait)
-            break
+        elapsed_wait = time.monotonic() - route_wait_t0
+        try:
+            resp = send_command(machine="TEENSY", subsystem="PUBSUB", command="REPORT")
+            if resp.get("success"):
+                routes = resp.get("payload", {}).get("routes", [])
+                found = any(
+                    r.get("topic") == "TIMEBASE_FRAGMENT"
+                    and r.get("subsystem") == "CLOCKS"
+                    and r.get("machine") == "PI"
+                    for r in routes
+                )
+                if found:
+                    logging.info(
+                        "✅ [recovery] @%s PUBSUB route confirmed (%.1fs)",
+                        system_time_z(), elapsed_wait,
+                    )
+                    break
+        except RuntimeError:
+            raise
+        except Exception:
+            pass  # IPC not yet available — keep polling
+
         if elapsed_wait >= ROUTING_WAIT_TIMEOUT_S:
-            raise RuntimeError(f"recovery failed: no fragment in {ROUTING_WAIT_TIMEOUT_S}s")
+            raise RuntimeError(
+                f"recovery failed: PUBSUB route not found in {ROUTING_WAIT_TIMEOUT_S}s"
+            )
         time.sleep(ROUTING_WAIT_POLL_S)
 
     # Stop Teensy + quiesce

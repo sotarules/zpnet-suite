@@ -97,8 +97,8 @@ GND           Black         GND                Battery branching ground         
 
 20            White         LASER_PD_PLUS      Laser diode PD+                      Indicates laser on/off (active signal)
 
-19            Blue          SDA1               Rail bus SDA1                        Primary I2C data
-18            Yellow        SCL1               Rail bus SCL1                        Primary I2C clock
+18            Blue          SDA1               Rail bus SDA1                        Primary I2C data
+19            Yellow        SCL1               Rail bus SCL1                        Primary I2C clock
 
 15            Yellow        PHOTODIODE_ADC     Photodiode output                    Analog input (ADC)
 14            Twister Pair  GNSS_VCLOCK        GNSS vclock output                   10MHz reference from GF-8802 (critical timing)

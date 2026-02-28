@@ -118,21 +118,22 @@ I2C_IGNORE_ADDRS = {
 
 I2C_SENSORS_BY_BUS = {
     I2C_BUS_LEGACY: {
+
         0x40: "INA260 0x40 (3.3v Rail)",
         0x41: "INA260 0x41 (5v Rail+",
         0x44: "INA260 0x44 (12v Rail)",
         0x66: "EV5491 0x66 (Laser Controller)",
-        #0x76: "BME280 0x76 (Environment)",
+        0x76: "BME280 0x76 (Environment)",
         #0x68: "DS3231 0x68 (RTC1)",
         # 0x57 will appear via scan but is ignored (EEPROM)
     },
 
     I2C_BUS_EXPANDED: {
-        #0x40: "INA260 0x40 (Teensy Domain)",
+        0x40: "INA260 0x40 (Pi Domain)",
         0x41: "INA260 0x41 (24V Rail / Motors)",
-        #0x44: "INA260 0x44 (Pi Domain)",
-        #0x45: "INA260 0x45 (OCXO 3v3 Domain)",
-        #0x68: "DS3231 0x68 (RTC2)",
+        0x44: "INA260 0x44 (OCXO Domain)",
+        0x45: "INA260 0x45 (Teensy Domain)",
+        0x68: "DS3231 0x68 (RTC2)",
         # 0x57 will appear via scan but is ignored (EEPROM)
     },
 }
@@ -148,10 +149,10 @@ POWER_CONFIG_BY_BUS = {
         0x44: {"label": "Battery", "ideal_voltage_v": 12.8},
     },
     I2C_BUS_EXPANDED: {
-        #0x40: {"label": "Teensy Domain", "ideal_voltage_v": 5.0},
+        0x40: {"label": "Pi Domain", "ideal_voltage_v": 5.0},
         0x41: {"label": "24v Domain", "ideal_voltage_v": 24.0},
-        #0x44: {"label": "Pi Domain", "ideal_voltage_v": 5.0},
-        #0x45: {"label": "OCXO Domain", "ideal_voltage_v": 3.0},
+        0x44: {"label": "OCXO Domain", "ideal_voltage_v": 5.0},
+        0x45: {"label": "Teensy Domain", "ideal_voltage_v": 5.0},
     }
 }
 
@@ -1007,7 +1008,7 @@ def system_poller() -> None:
             network_payload = build_network_status()
             laser_payload = build_laser_status()
             sensor_payload = build_sensor_scan_status()
-            #environment_payload = build_environment_status()
+            environment_payload = build_environment_status()
             gnss_payload = build_gnss_status()
             power_payload = build_power_status()
             battery_payload = build_battery_status()
@@ -1023,7 +1024,7 @@ def system_poller() -> None:
                 "network": dict(network_payload),
                 "laser": dict(laser_payload),
                 "sensors": dict(sensor_payload),
-                #"environment": dict(environment_payload),
+                "environment": dict(environment_payload),
                 "gnss": dict(gnss_payload),
                 "power": dict(power_payload),
                 "battery": dict(battery_payload),
