@@ -1,7 +1,7 @@
 """
-ZPNet CLOCKS Process — TIMEBASE Authority (Pi-side) — v2 Queue Architecture
+ZPNet CLOCKS Process — TIMEBASE Authority (Pi-side) — v3 Queue Architecture
 
-Core contract (v2026-02-27b+):
+Core contract (v2026-02-28+):
 
   CLOCKS is a pure traffic cop.  It owns NO clock state.  It correlates
   data from two authorities by pps_count identity and produces TIMEBASE.
@@ -10,6 +10,12 @@ Core contract (v2026-02-27b+):
     • Teensy owns: GNSS ns, DWT ns/cycles, OCXO ns — in TIMEBASE_FRAGMENT
     • PITIMER owns: Pi ticks, Pi ns (epoch-relative) — in GET_CAPTURE
     • CLOCKS owns: correlation, Welford statistics, campaign lifecycle
+
+  v3: CLOCKS now manages PITIMER lifecycle via START/STOP commands,
+  symmetric with how it manages the Teensy.  PITIMER starts in STOPPED
+  state (capture loop runs, buffering disabled) and transitions to
+  RUNNING when CLOCKS sends START.  This eliminates spurious eviction
+  warnings when no campaign is active.
 
   Fragment reception is decoupled from processing:
     • on_timebase_fragment() — PUBSUB handler.  Extracts pps_count, drops
@@ -143,11 +149,14 @@ _diag: Dict[str, Any] = {
     "pitimer_skips_total": 0,
     "last_pitimer_skip": {},
 
-    # PITIMER control plane
-    "pitimer_set_requests": 0,
-    "pitimer_set_failures": 0,
-    "pitimer_set_ipc_failures": 0,
-    "last_pitimer_set": {},
+    # PITIMER lifecycle control plane
+    "pitimer_start_requests": 0,
+    "pitimer_start_failures": 0,
+    "pitimer_start_ipc_failures": 0,
+    "last_pitimer_start": {},
+    "pitimer_stop_requests": 0,
+    "pitimer_stop_failures": 0,
+    "last_pitimer_stop": {},
     "pitimer_epoch_requests": 0,
     "pitimer_epoch_failures": 0,
     "last_pitimer_epoch": {},
@@ -567,31 +576,55 @@ def _set_gnss_mode_normal() -> Dict[str, Any]:
 # ---------------------------------------------------------------------
 
 
-def _set_pitimer_pps_count(k: int) -> None:
-    """Command PITIMER to arm pps_count = k.  Hard fault on failure."""
-    _diag["pitimer_set_requests"] += 1
+def _start_pitimer(pps_count: int) -> None:
+    """
+    Command PITIMER to START (transition to RUNNING, arm pps_count,
+    clear buffer).  Hard fault on failure.
+    """
+    _diag["pitimer_start_requests"] += 1
     try:
         resp = send_command(
             machine="PI",
             subsystem="PITIMER",
-            command="SET_PPS_COUNT",
-            args={"pps_count": int(k)},
+            command="START",
+            args={"pps_count": int(pps_count)},
         )
         ok = bool(resp.get("success", False))
-        _diag["last_pitimer_set"] = {
+        _diag["last_pitimer_start"] = {
             "ts_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
-            "pps_count": int(k),
+            "pps_count": int(pps_count),
             "success": ok,
             "response": resp.get("payload", {}) if isinstance(resp, dict) else {},
         }
         if not ok:
-            _diag["pitimer_set_failures"] += 1
-            _hard_fault("pitimer_set_failed", {"pps_count": int(k), "resp": resp})
+            _diag["pitimer_start_failures"] += 1
+            _hard_fault("pitimer_start_failed", {"pps_count": int(pps_count), "resp": resp})
     except RuntimeError:
         raise
     except Exception:
-        _diag["pitimer_set_ipc_failures"] += 1
-        _hard_fault("pitimer_set_ipc_failed", {"pps_count": int(k)})
+        _diag["pitimer_start_ipc_failures"] += 1
+        _hard_fault("pitimer_start_ipc_failed", {"pps_count": int(pps_count)})
+
+
+def _stop_pitimer_best_effort() -> None:
+    """Command PITIMER to STOP (transition to STOPPED).  Best-effort."""
+    _diag["pitimer_stop_requests"] += 1
+    try:
+        resp = send_command(
+            machine="PI",
+            subsystem="PITIMER",
+            command="STOP",
+        )
+        ok = bool(resp.get("success", False))
+        _diag["last_pitimer_stop"] = {
+            "ts_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+            "success": ok,
+        }
+        if not ok:
+            _diag["pitimer_stop_failures"] += 1
+            logging.warning("⚠️ [clocks] PITIMER STOP failed: %s", resp.get("message", "?"))
+    except Exception:
+        logging.warning("⚠️ [clocks] PITIMER STOP IPC failed (ignored)")
 
 
 def _set_pitimer_epoch(pi_tick_epoch: int) -> None:
@@ -911,6 +944,22 @@ def _process_loop() -> None:
         armed = _armed_pps_count
         sysclk = system_time_z()
         if armed is not None and int(pps_count) != armed:
+            # If a sync wait is active, this is likely a transitional
+            # fragment from before the RECOVER took effect.  Skip it
+            # rather than hard-faulting — the sync wait will handle
+            # alignment.
+            with _sync_lock:
+                sync_active = _sync_expected_pps is not None
+            if sync_active:
+                logging.info(
+                    "ℹ️ [clocks] @%s pps_count mismatch during sync wait: "
+                    "armed=%d teensy=%d — skipping (transitional)",
+                    sysclk, armed, int(pps_count),
+                )
+                _armed_pps_count = int(pps_count) + 1
+                _diag["armed_pps_count"] = _armed_pps_count
+                continue
+
             _diag["hard_fault_pps_mismatch"] += 1
             delta = int(pps_count) - armed
             logging.error(
@@ -1169,11 +1218,11 @@ def cmd_start(args: Optional[dict]) -> dict:
     """
     START:
       1. Create campaign in DB (deactivate any prior).
-      2. Stop Teensy (best-effort).
+      2. Stop Teensy + PITIMER (best-effort).
       3. Reset trackers.
       4. Begin sync wait for fragment pps_count=0.
       5. Arm TEENSY START(pps_count=0) — slow path.
-      6. Arm PITIMER SET_PPS_COUNT(0) — fast path.
+      6. Start PITIMER(pps_count=0) — fast path.
       7. Wait for sync fragment pps_count=0.
       8. On sync fragment: fetch Pi capture, compute epoch, call SET_EPOCH.
       9. Activate campaign — processor thread begins TIMEBASE production.
@@ -1241,6 +1290,7 @@ def cmd_start(args: Optional[dict]) -> dict:
         logging.info("✅ [clocks] GNSS confirmed TO mode")
 
     _request_teensy_stop_best_effort()
+    _stop_pitimer_best_effort()
     _reset_trackers()
 
     # Prepare sync wait FIRST
@@ -1255,10 +1305,10 @@ def cmd_start(args: Optional[dict]) -> dict:
         teensy_args["calibrate_ocxo"] = "true"
 
     _request_teensy_start(campaign=campaign, pps_count=0, args=teensy_args)
-    logging.info("📡 [start] @%s TEENSY START returned — arming PITIMER", system_time_z())
+    logging.info("📡 [start] @%s TEENSY START returned — starting PITIMER", system_time_z())
 
-    # Arm PITIMER — fast path
-    _set_pitimer_pps_count(0)
+    # Start PITIMER — fast path (transitions to RUNNING, arms pps_count=0)
+    _start_pitimer(0)
 
     _armed_pps_count = 0
     _diag["armed_pps_count"] = 0
@@ -1317,6 +1367,7 @@ def cmd_stop(_: Optional[dict]) -> dict:
     had_location = row["payload"].get("location") if row else None
 
     _request_teensy_stop_best_effort()
+    _stop_pitimer_best_effort()
 
     stopped_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
     with open_db() as conn:
@@ -1367,6 +1418,7 @@ def cmd_clear(_: Optional[dict]) -> dict:
     global _campaign_active
 
     _request_teensy_stop_best_effort()
+    _stop_pitimer_best_effort()
 
     try:
         with open_db() as conn:
@@ -1398,9 +1450,9 @@ def _recover_campaign() -> None:
       1. Read last TIMEBASE row, compute next_pps_count.
       2. Wait for GNSS time availability.
       3. Restore GNSS TO mode if campaign had a location.
-      4. Wait for routing (first fragment confirms PUBSUB is live).
-      5. Stop Teensy, quiesce, snap to second boundary.
-      6. Arm TEENSY RECOVER + PITIMER SET_PPS_COUNT.
+      4. Wait for routing (PUBSUB route check).
+      5. Stop Teensy + PITIMER, quiesce, snap to second boundary.
+      6. Arm TEENSY RECOVER + start PITIMER(next_pps_count).
       7. Wait for sync fragment.
       8. Compute epoch from sync edge, call PITIMER SET_EPOCH.
       9. Activate campaign.
@@ -1530,9 +1582,10 @@ def _recover_campaign() -> None:
             )
         time.sleep(ROUTING_WAIT_POLL_S)
 
-    # Stop Teensy + quiesce
-    logging.info("📡 [recovery] @%s stopping Teensy...", system_time_z())
+    # Stop Teensy + PITIMER + quiesce
+    logging.info("📡 [recovery] @%s stopping Teensy + PITIMER...", system_time_z())
     _request_teensy_stop_best_effort()
+    _stop_pitimer_best_effort()
     time.sleep(2.0)
 
     # Snap to second boundary
@@ -1550,7 +1603,7 @@ def _recover_campaign() -> None:
         _diag["recovery_elapsed_seconds_nonpositive"] += 1
         raise RuntimeError(f"recovery failed: elapsed_seconds={elapsed_seconds}")
 
-    project_seconds = elapsed_seconds + 1
+    project_seconds = elapsed_seconds + 2
     next_pps_count = last_pps_count + project_seconds
 
     _diag["last_recovery"] = {
@@ -1608,9 +1661,9 @@ def _recover_campaign() -> None:
 
     _request_teensy_recover(int(next_pps_count), recover_args)
 
-    # Arm PITIMER (fast path)
-    logging.info("📡 [recovery] @%s arming PITIMER: pps_count=%d", system_time_z(), next_pps_count)
-    _set_pitimer_pps_count(int(next_pps_count))
+    # Start PITIMER (transitions to RUNNING, arms pps_count)
+    logging.info("📡 [recovery] @%s starting PITIMER: pps_count=%d", system_time_z(), next_pps_count)
+    _start_pitimer(int(next_pps_count))
 
     _armed_pps_count = int(next_pps_count)
     _diag["armed_pps_count"] = int(next_pps_count)
@@ -1678,24 +1731,38 @@ def _get_baseline_from_config() -> Optional[Dict[str, Any]]:
 
 
 def cmd_set_baseline(args: Optional[dict]) -> Dict[str, Any]:
-    if not args or "id" not in args:
-        return {"success": False, "message": "SET_BASELINE requires 'id' argument"}
+    if not args:
+        return {"success": False, "message": "SET_BASELINE requires 'id' or 'campaign' argument"}
 
-    try:
-        baseline_id = int(args["id"])
-    except (ValueError, TypeError):
-        return {"success": False, "message": f"Invalid baseline id: {args['id']}"}
+    baseline_id = args.get("id")
+    campaign_name = args.get("campaign")
+
+    if baseline_id is None and campaign_name is None:
+        return {"success": False, "message": "SET_BASELINE requires 'id' or 'campaign' argument"}
 
     with open_db(row_dict=True) as conn:
         cur = conn.cursor()
-        cur.execute(
-            "SELECT id, campaign, payload FROM campaigns WHERE id = %s",
-            (baseline_id,),
-        )
+        if baseline_id is not None:
+            try:
+                baseline_id = int(baseline_id)
+            except (ValueError, TypeError):
+                return {"success": False, "message": f"Invalid baseline id: {args['id']}"}
+            cur.execute(
+                "SELECT id, campaign, payload FROM campaigns WHERE id = %s",
+                (baseline_id,),
+            )
+        else:
+            cur.execute(
+                "SELECT id, campaign, payload FROM campaigns WHERE campaign = %s ORDER BY ts DESC LIMIT 1",
+                (campaign_name,),
+            )
         row = cur.fetchone()
 
     if row is None:
-        return {"success": False, "message": f"No campaign with id={baseline_id}"}
+        lookup = f"id={baseline_id}" if baseline_id is not None else f"campaign='{campaign_name}'"
+        return {"success": False, "message": f"No campaign with {lookup}"}
+
+    baseline_id = row["id"]
 
     payload = row["payload"]
     if isinstance(payload, str):
@@ -1703,7 +1770,7 @@ def cmd_set_baseline(args: Optional[dict]) -> Dict[str, Any]:
 
     report = payload.get("report")
     if not report:
-        return {"success": False, "message": f"Campaign {baseline_id} has no report"}
+        return {"success": False, "message": f"Campaign {baseline_id} ('{row['campaign']}') has no report"}
 
     baseline_ppb = {}
     for key in ("gnss", "dwt", "pi", "ocxo"):
@@ -1713,7 +1780,7 @@ def cmd_set_baseline(args: Optional[dict]) -> Dict[str, Any]:
             baseline_ppb[key] = round(float(ppb), 3)
 
     if not baseline_ppb:
-        return {"success": False, "message": f"Campaign {baseline_id} report has no PPB data"}
+        return {"success": False, "message": f"Campaign {baseline_id} ('{row['campaign']}') report has no PPB data"}
 
     baseline_blob = {
         "baseline_id": baseline_id,
@@ -1775,6 +1842,56 @@ def cmd_baseline_info(_: Optional[dict]) -> Dict[str, Any]:
     return {"success": True, "message": "OK", "payload": result}
 
 
+def cmd_delete(args: Optional[dict]) -> Dict[str, Any]:
+    """
+    DELETE(campaign)
+
+    Delete a campaign and all its TIMEBASE records by name.
+    Refuses to delete the currently active campaign — stop it first.
+    """
+    if not args or "campaign" not in args:
+        return {"success": False, "message": "DELETE requires 'campaign' argument"}
+
+    campaign_name = args["campaign"]
+
+    # Refuse to delete the active campaign
+    row = _get_active_campaign()
+    if row is not None and row["campaign"] == campaign_name:
+        return {"success": False, "message": f"Campaign '{campaign_name}' is active — STOP it first"}
+
+    try:
+        with open_db() as conn:
+            cur = conn.cursor()
+            cur.execute(
+                "DELETE FROM timebase WHERE campaign = %s",
+                (campaign_name,),
+            )
+            tb_count = cur.rowcount
+            cur.execute(
+                "DELETE FROM campaigns WHERE campaign = %s",
+                (campaign_name,),
+            )
+            camp_count = cur.rowcount
+    except Exception as e:
+        logging.exception("❌ [clocks] DELETE failed for campaign '%s'", campaign_name)
+        return {"success": False, "message": str(e)}
+
+    if camp_count == 0:
+        return {"success": False, "message": f"No campaign named '{campaign_name}'"}
+
+    logging.info(
+        "🗑️ [clocks] DELETE: campaign='%s' — %d campaign row(s), %d timebase row(s) deleted",
+        campaign_name, camp_count, tb_count,
+    )
+    return {
+        "success": True, "message": "OK",
+        "payload": {
+            "campaign": campaign_name,
+            "campaigns_deleted": camp_count,
+            "timebase_deleted": tb_count,
+        },
+    }
+
 # ---------------------------------------------------------------------
 # CLOCKS_INFO
 # ---------------------------------------------------------------------
@@ -1791,12 +1908,48 @@ def cmd_clocks_info(_: Optional[dict]) -> Dict[str, Any]:
     }
     return {"success": True, "message": "OK", "payload": payload}
 
+def cmd_set_dac(args: Optional[dict]) -> Dict[str, Any]:
+    """
+    SET_DAC(dac)
+
+    Update the OCXO DAC value in the SYSTEM config record.
+    This becomes the default DAC for subsequent campaign starts.
+    """
+    if not args or "dac" not in args:
+        return {"success": False, "message": "SET_DAC requires 'dac' argument"}
+
+    try:
+        dac = int(args["dac"])
+    except (ValueError, TypeError):
+        return {"success": False, "message": f"Invalid dac value: {args['dac']}"}
+
+    try:
+        with open_db() as conn:
+            cur = conn.cursor()
+            cur.execute(
+                """
+                UPDATE config
+                SET payload = payload || %s::jsonb
+                WHERE config_key = 'SYSTEM'
+                """,
+                (json.dumps({"ocxo_dac": dac}),),
+            )
+            if cur.rowcount == 0:
+                return {"success": False, "message": "No SYSTEM config record found"}
+    except Exception as e:
+        logging.exception("❌ [clocks] SET_DAC failed")
+        return {"success": False, "message": str(e)}
+
+    logging.info("🔧 [clocks] SET_DAC: ocxo_dac=%d", dac)
+    return {"success": True, "message": "OK", "payload": {"ocxo_dac": dac}}
 
 COMMANDS = {
     "START": cmd_start,
     "STOP": cmd_stop,
     "REPORT": cmd_report,
     "CLEAR": cmd_clear,
+    "DELETE": cmd_delete,
+    "SET_DAC": cmd_set_dac,
     "SET_BASELINE": cmd_set_baseline,
     "BASELINE_INFO": cmd_baseline_info,
     "CLOCKS_INFO": cmd_clocks_info,
@@ -1811,9 +1964,10 @@ def run() -> None:
     setup_logging()
 
     logging.info(
-        "🕐 [clocks] v2 Queue Architecture. "
+        "🕐 [clocks] v3 Queue Architecture. "
         "PUBSUB handler enqueues fragments — processor thread correlates. "
         "PITIMER is Pi clock authority (owns epoch + pi_ns). "
+        "CLOCKS manages PITIMER lifecycle via START/STOP (symmetric with Teensy). "
         "CLOCKS is pure traffic cop — no clock state. "
         "GET_CAPTURE by pps_count identity — no timing race. "
         "Commands: START, STOP, REPORT, CLEAR, SET_BASELINE, BASELINE_INFO, CLOCKS_INFO."
@@ -1834,10 +1988,11 @@ def run() -> None:
         blocking=False,
     )
 
-    # Recover or stop stray Teensy
+    # Recover or stop stray Teensy + PITIMER
     row = _get_active_campaign()
     if row is None:
         _request_teensy_stop_best_effort()
+        _stop_pitimer_best_effort()
     else:
         _recover_campaign()
 
