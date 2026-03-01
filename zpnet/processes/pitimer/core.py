@@ -605,25 +605,6 @@ def _capture_loop() -> None:
                 _buffer_insert(pps_count, cap)
                 _last_capture = cap
 
-            # Periodic log (every 60 captures, only when running)
-            if _capture_seq % 60 == 0:
-                with _state_lock:
-                    buf_size = len(_capture_buffer)
-                    running = _running
-                if running:
-                    logging.info(
-                        "⏱️ [pitimer] seq=%d pps_count=%s corrected=%d pi_ns=%s "
-                        "detect=%d mode=%s buf=%d time=%s",
-                        _capture_seq,
-                        str(cap.get("pps_count", "—")),
-                        corrected,
-                        str(cap.get("pi_ns")) if cap.get("pi_ns") is not None else "—",
-                        cap["detect_ns"],
-                        cap.get("capture_mode", "loop"),
-                        buf_size,
-                        time_key,
-                    )
-
         except Exception as e:
             _diag["capture_exceptions"] += 1
             _diag["last_capture_exception"] = {

@@ -893,10 +893,11 @@ def _end_sync_wait(timeout_s: float = SYNC_FRAGMENT_TIMEOUT_S) -> Tuple[Dict[str
     """Block until the sync fragment arrives or timeout.  Hard fault on timeout."""
     global _sync_expected_pps
 
+    logging.info("⏳ [_end_sync_wait] waiting for TIMEBASE_FRAGMENT pps_count=%s...", str(_sync_expected_pps))
+
     t0 = time.monotonic()
     _diag["sync_waits"] += 1
 
-    last_log = t0
     while True:
         remaining = timeout_s - (time.monotonic() - t0)
         if remaining <= 0:
@@ -907,10 +908,6 @@ def _end_sync_wait(timeout_s: float = SYNC_FRAGMENT_TIMEOUT_S) -> Tuple[Dict[str
             })
         if _sync_event.wait(timeout=min(remaining, SYNC_PITIMER_POLL_S)):
             break
-        now = time.monotonic()
-        if now - last_log >= SYNC_LOG_INTERVAL_S:
-            logging.info("⏳ [clocks] waiting for TIMEBASE_FRAGMENT pps_count=%s...", str(_sync_expected_pps))
-            last_log = now
 
     waited = time.monotonic() - t0
     _diag["sync_wait_success"] += 1
@@ -1045,7 +1042,7 @@ def on_timebase_fragment(payload: Payload) -> None:
         if _sync_expected_pps is not None:
             match = int(pps_count) >= int(_sync_expected_pps)
             logging.info(
-                "🔎 [clocks] @%s fragment arrived: teensy_pps_count=%d (waiting for >=%d) match=%s",
+                "🔎 [on_timebase_fragment] @%s fragment arrived: teensy_pps_count=%d (waiting for >=%d) match=%s",
                 system_time_z(), pps_count, _sync_expected_pps, str(match),
             )
             if match:
@@ -1386,21 +1383,53 @@ def _request_teensy_recover(pps_count: int, args: Dict[str, Any]) -> None:
 def cmd_start(args: Optional[dict]) -> dict:
     """
     START:
-      1. Create campaign in DB (deactivate any prior).
-      2. Stop Teensy + PITIMER (best-effort).
-      3. Reset trackers.
-      4. Begin sync wait for fragment pps_count=0.
-      5. Arm TEENSY START(pps_count=0) — slow path.
-      6. Start PITIMER(pps_count=0) — fast path.
-      7. Wait for sync fragment pps_count=0.
-      8. On sync fragment: PEEK Pi capture at pps_count=0, compute epoch.
-      9. Call SET_EPOCH.  Activate campaign.
+      1. Reject if campaign name already exists in DB.
+      2. Create campaign in DB (deactivate any prior).
+      3. Stop Teensy + PITIMER (best-effort).
+      4. Reset trackers.
+      5. Begin sync wait for fragment pps_count=0.
+      6. Arm TEENSY START(pps_count=0) — slow path.
+      7. Start PITIMER(pps_count=0) — fast path.
+      8. Wait for sync fragment pps_count=0.
+      9. On sync fragment: PEEK Pi capture at pps_count=0, compute epoch.
+     10. Call SET_EPOCH.  Activate campaign.
     """
     global _campaign_active, _armed_pps_count
 
     campaign = args.get("campaign") if args else None
     if not campaign:
         return {"success": False, "message": "START requires 'campaign' argument"}
+
+    # --- Refuse if a campaign is already running ---
+    active_row = _get_active_campaign()
+    if active_row is not None:
+        return {
+            "success": False,
+            "message": (
+                f"Campaign '{active_row['campaign']}' is currently active - "
+                f"STOP it before starting a new one"
+            ),
+        }
+
+    # --- Reject duplicate campaign name ---
+    with open_db(row_dict=True) as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT id, active FROM campaigns WHERE campaign = %s",
+            (campaign,),
+        )
+        existing = cur.fetchone()
+
+    if existing is not None:
+        if existing["active"]:
+            return {
+                "success": False,
+                "message": f"Campaign '{campaign}' is already active (id={existing['id']}) — STOP it or choose a new name",
+            }
+        return {
+            "success": False,
+            "message": f"Campaign '{campaign}' already exists (id={existing['id']}) — DELETE it first or choose a new name",
+        }
 
     location = (args.get("location") or "").strip() or None
     set_dac = args.get("set_dac")
@@ -1501,13 +1530,6 @@ def cmd_start(args: Optional[dict]) -> dict:
     logging.info("✅ [start] @%s sync fragment received (waited=%.3fs)", system_time_z(), waited_s)
 
     # --- Compute epoch via PEEK at the exact sync edge (pps_count=0) ---
-    # Uses GET_CAPTURE(pps_count=0, peek=true) to read the corrected
-    # value at the PRECISE edge we synced on, without consuming it.
-    # The processor thread will later consume it via normal GET_CAPTURE.
-    #
-    # This replaces the old _pitimer_report() call which was racy:
-    # by the time the REPORT IPC completed, PITIMER could have advanced
-    # to a later edge, causing an epoch error of N * 54,000,000 ticks.
     pit_peek = _pitimer_get_capture_peek(0)
     if pit_peek is None:
         return {"success": False, "message": "START failed: PITIMER peek at pps_count=0 returned None"}
