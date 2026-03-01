@@ -26,6 +26,89 @@
 #include <Arduino.h>
 
 // ============================================================================
+// DWT CLOCK DETERMINISM CONFIGURATION
+// ============================================================================
+//
+// Goal: maximize DWT cycle counter stability for precision timing.
+//
+// 1. Overclock to 1.008 GHz — ~1 ns per DWT tick, maximum resolution.
+//    The Teensy 4.1 (i.MX RT1062) supports this with adequate cooling.
+//    set_arm_clock() reconfigures PLL1 and adjusts DCDC voltage.
+//
+// 2. Disable all ARM sleep modes — prevent core clock gating.
+//    SLEEPONEXIT and SLEEPDEEP in SCB_SCR can gate the core clock
+//    between interrupts, introducing DWT counter stalls.
+//
+// 3. F_CPU_ACTUAL is updated automatically by set_arm_clock().
+//    All downstream code that uses F_CPU_ACTUAL will pick up the
+//    new frequency.  Hardcoded 600 MHz constants (e.g. in
+//    process_clocks.cpp) must be updated separately.
+//
+// THERMAL NOTE:
+//    1.008 GHz + heatsink = safe continuous operation.
+//    CPU temperature is monitored via SYSTEM.REPORT (tempmonGetTemp).
+//
+// DWT NS CONVERSION NOTE:
+//    At 600 MHz: 1 cycle = 5/3 ns (exact)
+//    At 1008 MHz: 1 cycle = 125/126 ns (exact rational, ~0.9921 ns)
+//
+//    The existing (cycles * 5) / 3 conversion in process_clocks.cpp
+//    MUST be updated.  See DWT_NS_NUM / DWT_NS_DEN in config.h.
+//
+// ============================================================================
+
+// Declared in Teensyduino core — reconfigures PLL1 + DCDC voltage
+extern "C" uint32_t set_arm_clock(uint32_t frequency);
+
+static void maximize_dwt_determinism(void) {
+
+  // ----------------------------------------------------------
+  // 1. Overclock to 1.008 GHz
+  //
+  // set_arm_clock() handles:
+  //   • PLL1 (ARM_PLL) reconfiguration
+  //   • DCDC target voltage increase for stable 1 GHz operation
+  //   • F_CPU_ACTUAL global variable update
+  //   • AHB/IPG clock divider adjustment
+  //
+  // The DWT cycle counter (DWT_CYCCNT) ticks at the core clock
+  // rate, so this immediately gives us ~1 ns resolution.
+  // ----------------------------------------------------------
+
+  set_arm_clock(1008000000);
+
+  // ----------------------------------------------------------
+  // 2. Disable ARM sleep modes
+  //
+  // The Cortex-M7 System Control Register (SCR) has two bits
+  // that can gate the core clock:
+  //
+  //   SLEEPONEXIT — enter sleep automatically on ISR return
+  //   SLEEPDEEP   — enter deep sleep on WFI/WFE
+  //
+  // When the core clock is gated, DWT_CYCCNT stops counting.
+  // This introduces non-deterministic gaps in the cycle counter
+  // that appear as timing jitter.
+  //
+  // Clearing both bits ensures the core clock runs continuously.
+  // This wastes power but that's irrelevant for our use case.
+  // ----------------------------------------------------------
+
+  SCB_SCR &= ~(SCB_SCR_SLEEPONEXIT | SCB_SCR_SLEEPDEEP);
+
+  // ----------------------------------------------------------
+  // 3. Verify DWT is enabled and running
+  //
+  // This is belt-and-suspenders — process_clocks_init() also
+  // enables DWT via DEMCR and DWT_CTRL.  But we want the
+  // counter running from the earliest possible moment.
+  // ----------------------------------------------------------
+
+  ARM_DEMCR |= ARM_DEMCR_TRCENA;
+  ARM_DWT_CTRL |= ARM_DWT_CTRL_CYCCNTENA;
+}
+
+// ============================================================================
 // LED MORSE PRIMITIVES (FAULT-SAFE)
 // ============================================================================
 
@@ -112,6 +195,13 @@ void setup() {
   // ----------------------------------------------------------
 
   delay(100);            // USB settle (not relied upon for faults)
+
+  // *** DWT DETERMINISM: overclock + disable sleep FIRST ***
+  // This must happen before ANY timing-sensitive initialization.
+  // set_arm_clock() adjusts PLL1 and DCDC voltage.
+  // All subsequent code runs at 1.008 GHz.
+  maximize_dwt_determinism();
+
   debug_blink("911");    // unconditional startup indicator (LED-only)
 
   pinMode(LED_BUILTIN, OUTPUT);
@@ -149,6 +239,9 @@ void setup() {
 
   debug_log("boot", "setup begin");
 
+  // Log clock configuration for forensic verification
+  debug_log("boot.cpu_mhz", (uint32_t)(F_CPU_ACTUAL / 1000000UL));
+
   // ----------------------------------------------------------
   // Process framework
   // ----------------------------------------------------------
@@ -176,6 +269,7 @@ void setup() {
   debug_log("boot", "enqueue TEENSY_BOOT");
   Payload ev;
   ev.add("status", "READY");
+  ev.add("cpu_mhz", (uint32_t)(F_CPU_ACTUAL / 1000000UL));
   enqueueEvent("TEENSY_BOOT", ev);
   debug_log("boot", "enqueue TEENSY_BOOT done");
 

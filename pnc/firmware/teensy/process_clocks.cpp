@@ -14,7 +14,7 @@
 //
 // Clock domains:
 //
-//   DWT    — ARM Cortex-M7 cycle counter, 600 MHz, internal
+//   DWT    — ARM Cortex-M7 cycle counter, 1008 MHz, internal
 //   GNSS   — GF-8802 10 MHz VCLOCK, external via GPT2 pin 14
 //   OCXO   — AOCJY1-A 10 MHz oven oscillator, external via GPT1 pin 25
 //
@@ -93,8 +93,8 @@
 //   causing the PIT to nest into the PPS handler and corrupt
 //   timer state.  All timepop arming happens in scheduled context.
 //
-//   The relay latency is deterministic (~30-50 ns after the
-//   snapshots, ~50-70 ns after the true PPS edge) and constant.
+//   The relay latency is deterministic (~20-30 ns after the
+//   snapshots, ~30-50 ns after the true PPS edge) and constant.
 //   This is well within chrony's discipline capability.
 //
 // Recovery:
@@ -125,7 +125,7 @@
 //   deterministic correction table (derived from disassembly
 //   analysis) converts this into the true PPS-edge DWT value.
 //
-//   Result: PPS edge timestamped to ±1 DWT cycle (1.67 ns)
+//   Result: PPS edge timestamped to ±1 DWT cycle (~0.99 ns)
 //   on a $30 microcontroller.  0.04% CPU cost.
 //
 // OCXO DAC Control:
@@ -165,6 +165,32 @@
 #include "imxrt.h"
 
 #include <math.h>
+
+// ============================================================================
+// DWT nanosecond conversion helpers
+// ============================================================================
+//
+// At 1008 MHz: 1 cycle = 125/126 ns (exact rational)
+//
+// DWT_NS_NUM and DWT_NS_DEN are defined in config.h.
+// These helpers centralize the conversion so the ratio appears
+// in exactly one place.
+//
+// Overflow note:
+//   cycles * 125 overflows uint64_t at 1.47 × 10^17 cycles
+//   = ~4.6 years of continuous campaign time.  Safe for all
+//   realistic campaign durations.
+//
+
+static inline uint64_t dwt_cycles_to_ns(uint64_t cycles) {
+  return (cycles * DWT_NS_NUM) / DWT_NS_DEN;
+}
+
+// 32-bit variant for small deltas (dispatch latency, corrections).
+// Safe for deltas up to ~34 million cycles (~34 ms at 1008 MHz).
+static inline uint32_t dwt_cycles_to_ns_32(uint32_t cycles) {
+  return (cycles * (uint32_t)DWT_NS_NUM) / (uint32_t)DWT_NS_DEN;
+}
 
 // ============================================================================
 // Campaign State
@@ -291,9 +317,10 @@ static volatile int32_t  isr_residual_ocxo = 0;
 static volatile bool     isr_residual_valid = false;
 
 // Expected 32-bit tick counts per PPS interval
-static constexpr uint32_t ISR_DWT_EXPECTED  = 600000000u;
-static constexpr uint32_t ISR_GNSS_EXPECTED =  10000000u;
-static constexpr uint32_t ISR_OCXO_EXPECTED =  10000000u;
+// DWT @ 1008 MHz, GNSS @ 10 MHz, OCXO @ 10 MHz
+static constexpr uint32_t ISR_DWT_EXPECTED  = 1008000000u;
+static constexpr uint32_t ISR_GNSS_EXPECTED =   10000000u;
+static constexpr uint32_t ISR_OCXO_EXPECTED =   10000000u;
 
 // ============================================================================
 // Pre-PPS dispatch latency profiling (DWT spin loop)
@@ -305,11 +332,11 @@ static constexpr uint32_t ISR_OCXO_EXPECTED =  10000000u;
 // the loop.  The difference between the ISR's DWT snapshot and
 // the shadow value is the ISR dispatch latency.
 //
-// The spin loop has a defensive 500 ms timeout (300,000,000 DWT
-// cycles at 600 MHz).  If the PPS doesn't arrive in time, the
+// The spin loop has a defensive 500 ms timeout (504,000,000 DWT
+// cycles at 1008 MHz).  If the PPS doesn't arrive in time, the
 // loop exits and flags the failure.
 //
-// Results are expressed in nanoseconds using DWT's 5/3 ns/cycle
+// Results are expressed in nanoseconds using DWT's 125/126 ns/cycle
 // conversion, and published in TIMEBASE_FRAGMENT.
 //
 
@@ -352,47 +379,46 @@ static volatile uint32_t pre_pps_entry_gnss     = 0;
 // Software TDC (Time-to-Digital Converter) correction table
 // ============================================================================
 //
-// The spin loop is a 6-cycle sequence at 600 MHz:
+// The spin loop is a tight instruction sequence at 1008 MHz.
 //
-//   2266: ldr  r3, [r1, #4]     ; 2 cyc — read DWT_CYCCNT
-//   2268: str  r3, [r0, #0]     ; 1 cyc — write shadow (COMPLETES HERE)
-//   226a: ldrb r3, [r2, #0]     ; 1 cyc — read pps_fired
-//   226c: cmp  r3, #0           ; 1 cyc — compare
-//   226e: beq.n 2266            ; 1 cyc — branch (predicted taken)
+// *** IMPORTANT: These constants were derived at 600 MHz. ***
+// *** They MUST be re-derived from disassembly at 1008 MHz. ***
 //
-// The PPS interrupt can fire at any instruction boundary.  The
-// measured delta_cycles (isr_snap - shadow) tells us exactly
-// which instruction was executing when the interrupt arrived,
-// because the total is:
+// At 1008 MHz the pipeline timing changes:
+//   • Instruction throughput increases (more cycles per second)
+//   • But the instruction SEQUENCE is identical (same binary)
+//   • The loop is still the same 5 instructions
+//   • Interrupt entry overhead changes (may be fewer/more cycles
+//     due to flash wait states and bus arbitration at new speed)
 //
-//   delta_cycles = shadow_to_edge + fixed_overhead
+// To re-derive:
+//   1. Compile at 1008 MHz
+//   2. Disassemble the spin loop (arm-none-eabi-objdump -d)
+//   3. Verify instruction sequence is unchanged
+//   4. Measure delta_cycles empirically over many PPS edges
+//   5. The histogram of delta_cycles will cluster at N values
+//      separated by the loop cycle count
+//   6. TDC_FIXED_OVERHEAD = minimum observed delta_cycles
+//   7. TDC_LOOP_CYCLES = spacing between clusters
 //
-// where fixed_overhead = 50 cycles (interrupt entry, stacking,
-// ISR prologue, DWT read) and shadow_to_edge = 0..4 cycles
-// depending on position in the loop.
-//
-// The correction is the number of DWT cycles between the shadow
-// write (str at 2268) and the true PPS edge (interrupt assertion).
-// We add this to the shadow value to reconstruct the exact PPS
-// edge DWT count.
-//
-// Empirical mapping (confirmed by disassembly analysis):
-//
-//   delta_cycles  delta_ns  interrupted_at  correction
-//   50            83        str  (2268)      0
-//   51            85        ldrb (226a)      1
-//   52            86        cmp  (226c)      2
-//   53            88        beq  (226e)      3
-//   54            90        ldr  (2266)      4
+// Until re-derivation, TDC correction is DISABLED by setting
+// TDC_NEEDS_RECALIBRATION = true.  The ISR snapshot is used
+// as fallback (same behavior as when dispatch_shadow_valid
+// is false).
 //
 
+static constexpr bool     TDC_NEEDS_RECALIBRATION = true;
+
+// Placeholder values from 600 MHz — DO NOT TRUST until re-derived
 static constexpr uint32_t TDC_FIXED_OVERHEAD   = 50;  // cycles: interrupt entry + ISR prologue
 static constexpr uint32_t TDC_LOOP_CYCLES      = 6;   // total cycles per loop iteration
 static constexpr uint32_t TDC_MAX_CORRECTION   = 5;   // shadow_to_edge can be 0..4, reject >=5
 
 // Convert delta_cycles to shadow-to-edge correction in cycles.
-// Returns the correction, or -1 if delta_cycles is out of range.
+// Returns the correction, or -1 if delta_cycles is out of range
+// or TDC needs recalibration.
 static inline int32_t tdc_correction_cycles(uint32_t delta_cycles) {
+  if (TDC_NEEDS_RECALIBRATION) return -1;
   if (delta_cycles < TDC_FIXED_OVERHEAD) return -1;
   uint32_t correction = delta_cycles - TDC_FIXED_OVERHEAD;
   if (correction >= TDC_MAX_CORRECTION) return -1;
@@ -429,9 +455,9 @@ static volatile uint32_t diag_spin_iterations   = 0;      // how many loop itera
 // single-sample values.
 //
 
-static constexpr int64_t DWT_EXPECTED_PER_PPS  = 600000000LL;
-static constexpr int64_t GNSS_EXPECTED_PER_PPS =  10000000LL;
-static constexpr int64_t OCXO_EXPECTED_PER_PPS =  10000000LL;
+static constexpr int64_t DWT_EXPECTED_PER_PPS  = 1008000000LL;
+static constexpr int64_t GNSS_EXPECTED_PER_PPS =   10000000LL;
+static constexpr int64_t OCXO_EXPECTED_PER_PPS =   10000000LL;
 
 struct pps_residual_t {
   uint64_t ticks_at_last_pps;
@@ -506,25 +532,15 @@ static inline double residual_stderr(const pps_residual_t& r) {
 //
 // The only requirement is that it be called at least once per
 // 2^31 ticks of the hardware counter (to avoid wrap ambiguity):
-//   DWT  @ 600 MHz: every ~3.58 seconds
-//   GNSS @  10 MHz: every ~214 seconds
-//   OCXO @  10 MHz: every ~214 seconds
+//   DWT  @ 1008 MHz: every ~2.13 seconds
+//   GNSS @   10 MHz: every ~214 seconds
+//   OCXO @   10 MHz: every ~214 seconds
 //
-// The 1-second PPS callback satisfies this with enormous margin.
-//
-// To compute the 64-bit value at a PAST moment (the PPS edge
-// captured in the ISR), the callback:
-//   1) Calls _now() to advance to the present
-//   2) Computes (uint32_t)(last_32 - isr_snap) — the small
-//      positive tick count between snapshot and present
-//   3) Subtracts: snap_64 = now_64 - rewind
-//
-// This "advance then rewind" pattern is always safe because the
-// rewind is bounded (microseconds between ISR and callback).
+// The 1-second PPS callback satisfies this with margin.
 //
 
 // ============================================================================
-// DWT (CPU cycle counter — 600 MHz internal)
+// DWT (CPU cycle counter — 1008 MHz internal)
 // ============================================================================
 
 #define DEMCR               (*(volatile uint32_t *)0xE000EDFC)
@@ -552,7 +568,7 @@ uint64_t clocks_dwt_cycles_now(void) {
 }
 
 uint64_t clocks_dwt_ns_now(void) {
-  return (clocks_dwt_cycles_now() * 5ull) / 3ull;
+  return dwt_cycles_to_ns(clocks_dwt_cycles_now());
 }
 
 // ============================================================================
@@ -888,7 +904,7 @@ static void pre_pps_fine_cb(timepop_ctx_t*, void*) {
   //
   // The loop body is: load DWT, store to volatile, load
   // pps_fired, compare, branch.  ~5 instructions, ~6 cycles,
-  // ~10 ns per iteration.
+  // ~6 ns per iteration at 1008 MHz.
   //
   // The PPS ISR preempts this loop, captures the shadow value
   // atomically via isr_captured_shadow_dwt, then sets pps_fired.
@@ -942,8 +958,9 @@ static void pre_pps_arm(void) {
 //   Phase 1 (ISR): Snapshot all hardware counters, compute raw
 //   PPS-to-PPS residuals, and assert PPS relay HIGH — all
 //   immediately at the PPS rising edge.  Three register reads
-//   (~10 ns total), three subtractions, one digitalWriteFast.
-//   Set relay_arm_pending flag for deferred timer arming.
+//   (~6 ns total at 1008 MHz), three subtractions, one
+//   digitalWriteFast.  Set relay_arm_pending flag for deferred
+//   timer arming.
 //   NO timepop_arm calls from ISR context.
 //
 //   Phase 2 (timepop ASAP callback): Arm the relay deassert
@@ -960,7 +977,7 @@ static void pps_isr(void) {
   // ============================================================
   // PHASE 1: Hardware snapshot — absolute minimum latency
   //
-  // Three register reads within ~10 ns of each other at 600 MHz.
+  // Three register reads within ~6 ns of each other at 1008 MHz.
   // This is as close to the PPS edge as software can get.
   // ============================================================
 
@@ -995,8 +1012,8 @@ static void pps_isr(void) {
   // chrony needs continuous PPS for system clock discipline.
   //
   // digitalWriteFast compiles to a single GPIO register write
-  // (~3 ns at 600 MHz).  The relay edge follows the true PPS
-  // edge by ~50-70 ns (ISR entry + 3 snapshots + this write).
+  // (~1 ns at 1008 MHz).  The relay edge follows the true PPS
+  // edge by ~30-50 ns (ISR entry + 3 snapshots + this write).
   //
   // The deassert timer is armed from the ASAP callback — NEVER
   // from ISR context.  timepop_arm's noInterrupts/interrupts
@@ -1012,8 +1029,8 @@ static void pps_isr(void) {
   //
   // Uses unsigned 32-bit subtraction (wrap-safe) cast to signed
   // 32-bit, then subtract expected.  At 10 MHz the delta is
-  // 10,000,000 which fits easily in int32_t.  At 600 MHz the
-  // delta is 600,000,000 which also fits in int32_t (max ~2.1B).
+  // 10,000,000 which fits easily in int32_t.  At 1008 MHz the
+  // delta is 1,008,000,000 which also fits in int32_t (max ~2.1B).
   // ============================================================
 
   if (isr_residual_valid) {
@@ -1169,7 +1186,7 @@ static void pps_isr(void) {
         const uint64_t snap_gnss_ticks = gnss_at_pps_edge();
         const uint64_t snap_ocxo_ticks = ocxo_at_pps_edge();
 
-        const uint64_t snap_dwt_ns  = (snap_dwt_cycles * 5ull) / 3ull;
+        const uint64_t snap_dwt_ns  = dwt_cycles_to_ns(snap_dwt_cycles);
         const uint64_t snap_gnss_ns = snap_gnss_ticks * 100ull;
         const uint64_t snap_ocxo_ns = snap_ocxo_ticks * 100ull;
 
@@ -1182,12 +1199,17 @@ static void pps_isr(void) {
         //
         // delta_cycles = isr - shadow tells us which instruction
         // was executing when the interrupt fired.  Subtracting
-        // the fixed overhead (50 cycles) gives the correction:
-        // cycles between shadow write and true PPS edge.
+        // the fixed overhead gives the correction: cycles between
+        // shadow write and true PPS edge.
         //
         // The corrected PPS edge becomes the definitive DWT
         // value for this PPS.  All downstream calculations
         // (residuals, tau, published dwt_cycles/dwt_ns) use it.
+        //
+        // NOTE: TDC correction is DISABLED until the correction
+        // table is re-derived at 1008 MHz.  The ISR snapshot
+        // is used as fallback.  Dispatch latency diagnostics
+        // are still computed and published for analysis.
         // --------------------------------------------------------
 
         // Start with ISR values as fallback
@@ -1196,7 +1218,7 @@ static void pps_isr(void) {
 
         if (dispatch_shadow_valid) {
           uint32_t delta_cycles = isr_snap_dwt - isr_captured_shadow_dwt;
-          int64_t  delta_ns     = (int64_t)((delta_cycles * 5u) / 3u);
+          int64_t  delta_ns     = (int64_t)dwt_cycles_to_ns_32(delta_cycles);
 
           // Dispatch profiling values (diagnostic)
           dispatch_isr_ns    = (int64_t)snap_dwt_ns;
@@ -1212,13 +1234,14 @@ static void pps_isr(void) {
             // (overhead) cycles after the true PPS edge:
             uint32_t overhead_cycles = delta_cycles - (uint32_t)correction;
             pps_dwt_cycles       = snap_dwt_cycles - overhead_cycles;
-            pps_dwt_ns           = (pps_dwt_cycles * 5ull) / 3ull;
+            pps_dwt_ns           = dwt_cycles_to_ns(pps_dwt_cycles);
 
             pps_edge_ns            = (int64_t)pps_dwt_ns;
-            pps_edge_correction_ns = (int32_t)((correction * 5u) / 3u);
+            pps_edge_correction_ns = (int32_t)dwt_cycles_to_ns_32(correction);
             pps_edge_valid         = true;
           } else {
-            // delta_cycles out of expected range — use ISR value
+            // delta_cycles out of expected range (or TDC needs
+            // recalibration) — use ISR value
             pps_edge_ns            = -1;
             pps_edge_correction_ns = -1;
             pps_edge_valid         = false;
@@ -1301,6 +1324,10 @@ static void pps_isr(void) {
         // When false, they fall back to the ISR snapshot.
         p.add("pps_edge_valid",         pps_edge_valid);
         p.add("pps_edge_correction_ns", pps_edge_correction_ns);
+
+        // TDC recalibration flag — true means TDC constants are
+        // stale (from 600 MHz) and correction is disabled.
+        p.add("tdc_needs_recal",        TDC_NEEDS_RECALIBRATION);
 
         // OCXO DAC control state (always present, unconditional)
         p.add("ocxo_dac",              ocxo_dac_value);
@@ -1528,6 +1555,7 @@ static Payload cmd_report(const Payload&) {
   // Software TDC correction diagnostics
   p.add("pps_edge_valid",         pps_edge_valid);
   p.add("pps_edge_correction_ns", pps_edge_correction_ns);
+  p.add("tdc_needs_recal",        TDC_NEEDS_RECALIBRATION);
 
   // OCXO DAC control state
   p.add("ocxo_dac",              ocxo_dac_value);

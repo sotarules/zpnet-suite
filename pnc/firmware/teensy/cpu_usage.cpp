@@ -145,9 +145,7 @@ uint32_t cpu_usage_get_sample_window_ms(void) {
 }
 
 uint32_t cpu_usage_get_cpu_freq_mhz(void) {
-#if defined(F_CPU_ACTUAL)
+    // F_CPU_ACTUAL is a runtime global updated by set_arm_clock().
+    // This returns the ACTUAL core clock, not the compile-time default.
     return (uint32_t)(F_CPU_ACTUAL / 1000000UL);
-#else
-    return (uint32_t)(F_CPU / 1000000UL);
-#endif
 }

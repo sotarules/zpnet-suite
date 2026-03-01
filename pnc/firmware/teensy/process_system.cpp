@@ -123,6 +123,11 @@ static Payload cmd_report(const Payload& /*args*/) {
   // Firmware identity
   p.add("fw_version", FW_VERSION);
 
+  // CPU clock frequency — authoritative runtime value.
+  // F_CPU_ACTUAL is updated by set_arm_clock() at boot.
+  // This is the ACTUAL core clock, not the compile-time default.
+  p.add("cpu_freq_mhz", (uint32_t)(F_CPU_ACTUAL / 1000000UL));
+
   // CPU temperature (best-effort)
   p.add("cpu_temp_c", cpuTempC());
 
@@ -140,7 +145,6 @@ static Payload cmd_report(const Payload& /*args*/) {
   p.add("cpu_busy_cycles", cpu_usage_get_busy_cycles());
   p.add("cpu_total_cycles", cpu_usage_get_total_cycles());
   p.add("cpu_sample_window_ms", cpu_usage_get_sample_window_ms());
-  p.add("cpu_freq_mhz", cpu_usage_get_cpu_freq_mhz());
 
   return p;
 }

@@ -1,5 +1,6 @@
 #include "timebase.h"
 #include "process_clocks.h"
+#include "config.h"
 
 #include <string.h>
 #include <stdlib.h>
@@ -122,7 +123,7 @@ void TimeBase::set(const Payload& p) {
   // accounts for the propagation delay (fragment → Pi → TIMEBASE
   // → Teensy subscription → this call).  This is typically 2-6 ms.
   //
-  // now() computes: elapsed = (dwt_now - anchor_dwt_cycles) * 5/3
+  // now() computes: elapsed = (dwt_now - anchor_dwt_cycles) * 125/126
   // and adds that (scaled by tau) to each domain's PPS snapshot.
   //
   // Because anchor_dwt_cycles_ is the live value and the clock
@@ -150,7 +151,7 @@ void TimeBase::set(const Payload& p) {
 //
 //   1) Read DWT cycles right now
 //   2) Compute elapsed DWT cycles since the PPS-edge anchor
-//   3) Convert to elapsed DWT nanoseconds: cycles * 5 / 3
+//   3) Convert to elapsed DWT nanoseconds: cycles * 125 / 126
 //   4) Scale to target domain: elapsed_target = elapsed_dwt * tau
 //      where tau = target_ns_at_pps / dwt_ns_at_pps
 //   5) Return: target_ns_at_pps + elapsed_target
@@ -182,8 +183,8 @@ uint64_t TimeBase::now(const char* clock_name) const {
   // Elapsed DWT cycles since PPS edge
   uint64_t elapsed_cycles = dwt_now - anchor_dwt_cycles_;
 
-  // Convert to DWT nanoseconds: cycles * 5 / 3
-  uint64_t elapsed_dwt_ns = (elapsed_cycles * 5ull) / 3ull;
+  // Convert to DWT nanoseconds: cycles * 125 / 126
+  uint64_t elapsed_dwt_ns = (elapsed_cycles * DWT_NS_NUM) / DWT_NS_DEN;
 
   // Special case: DWT domain — no scaling needed
   if (strncmp(clock_name, "DWT", NAME_LEN) == 0) {
@@ -271,7 +272,7 @@ uint32_t TimeBase::age_ms() const {
 
   uint64_t dwt_now = clocks_dwt_cycles_now();
   uint64_t elapsed_cycles = dwt_now - anchor_dwt_cycles_;
-  uint64_t elapsed_ns = (elapsed_cycles * 5ull) / 3ull;
+  uint64_t elapsed_ns = (elapsed_cycles * DWT_NS_NUM) / DWT_NS_DEN;
 
   return (uint32_t)(elapsed_ns / 1000000ull);
 }

@@ -39,9 +39,9 @@ static constexpr uint64_t NS_PER_SMART_TICK  = NS_PER_SECOND / SMARTPOP_HZ; // 1
 // DWT conversion (600 MHz core clock)
 // --------------------------------------------------------------
 
-// Exact rational conversion: 1 DWT cycle = 5/3 ns
-static constexpr uint64_t DWT_NS_NUM = 5ULL;
-static constexpr uint64_t DWT_NS_DEN = 3ULL;
+// Exact rational conversion: 1 DWT cycle = 125/126:
+static constexpr uint64_t DWT_NS_NUM = 125ULL;
+static constexpr uint64_t DWT_NS_DEN = 126ULL;
 
 // --------------------------------------------------------------
 // Serial configuration
