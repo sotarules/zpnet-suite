@@ -52,6 +52,10 @@ REPLY_TIMEOUT_S = 30.0
 DEBUG_LOG_PATH = "/home/mule/zpnet/logs/zpnet-debug.log"
 SOCKET_DIR = "/tmp"
 
+# Subsystems that PUBSUB should never query during ALLSUBSCRIPTIONS.
+# These are test/utility programs that may leave stale sockets behind.
+SUBSYSTEM_SKIP = {"TIMEBASE_WATCH"}
+
 # ---------------------------------------------------------------------
 # Global state
 # ---------------------------------------------------------------------
@@ -369,6 +373,13 @@ def cmd_allsubscriptions(_: Optional[dict]) -> Dict[str, Any]:
     results: List[Dict[str, Any]] = []
 
     for subsystem in list_subsystems():
+        # Skip known non-service subsystems (test/utility programs)
+        if subsystem in SUBSYSTEM_SKIP:
+            logging.debug(
+                "ℹ️ [pubsub] skipping %s (in SUBSYSTEM_SKIP)", subsystem,
+            )
+            continue
+
         try:
             # Self-query: answer directly
             if subsystem == "PUBSUB":
@@ -377,6 +388,15 @@ def cmd_allsubscriptions(_: Optional[dict]) -> Dict[str, Any]:
                     "subsystem": "PUBSUB",
                     "subscriptions": [],
                 })
+                continue
+
+            # Skip subsystems whose command socket doesn't exist
+            sock_path = f"{SOCKET_DIR}/zpnet-{subsystem.lower()}-command.sock"
+            if not os.path.exists(sock_path):
+                logging.debug(
+                    "ℹ️ [pubsub] skipping %s (no socket at %s)",
+                    subsystem, sock_path,
+                )
                 continue
 
             # IPC for real subsystems
@@ -391,8 +411,9 @@ def cmd_allsubscriptions(_: Optional[dict]) -> Dict[str, Any]:
                 results.append(payload)
 
         except Exception:
-            logging.exception(
-                "⚠️ [pubsub] failed to query SUBSCRIPTIONS from %s",
+            # Stale socket or subsystem not yet ready — skip quietly
+            logging.debug(
+                "ℹ️ [pubsub] skipping %s (SUBSCRIPTIONS query failed)",
                 subsystem,
             )
 

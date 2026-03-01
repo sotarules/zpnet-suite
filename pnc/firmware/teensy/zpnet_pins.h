@@ -19,6 +19,8 @@
 
  This file WILL change.
  That is expected.
+
+ REVISION: 2026-02-28 — Added GNSS_10KHZ_RELAY (Teensy pin 9 → Pi GPIO25)
 ===============================================================================
 */
 
@@ -69,10 +71,12 @@ SCL               Yellow        SCL1               Rail SCL1 (Yellow)           
 TXD               Yellow        PI_TXD             GF-8802 RX (Pin 12)            Pi → GNSS serial
 RXD               Blue          PI_RXD             GF-8802 TX (Pin 13)            GNSS → Pi serial
 
-IO18 (GPI018)     Orange        GNSS_PPS_RELAY     GF-8802 PPS via Teensy         GNSS PPS relay (critical timing)
+IO18 (GPIO18)     Orange        GNSS_PPS_RELAY     GF-8802 PPS via Teensy         GNSS PPS relay (critical timing)
 
 IO23 (GPIO23)     Green         SDA2               Rail SDA2 (Green)              Secondary I2C data (Bus 2)
 IO24 (GPIO24)     Orange        SCL2               Rail SCL2 (Orange)             Secondary I2C clock (Bus 2)
+
+IO25 (GPIO25)     TBD           GNSS_10KHZ_RELAY   Teensy pin 9 via STP           10 kHz GNSS clock relay (critical timing)
 
 ---------------------------------------------------------------------------------------
 Notes:
@@ -81,6 +85,10 @@ Notes:
 • Bus 2 is wired but not yet energized.
 • Pi power is isolated via its own INA260 on Bus 2.
 • No Pi GPIO is exposed to 5V signaling.
+• GNSS_10KHZ_RELAY provides 10,000 GNSS-phase-locked edges per second
+  for sub-microsecond Timebase interpolation.
+• STP shield for GNSS_10KHZ_RELAY is drained at the Teensy end only
+  (same convention as GNSS_PPS_RELAY and OCXO signals).
 =============================================================================*/
 
 
@@ -93,7 +101,11 @@ Teensy Pin    Wire Color    Signal Name        Source / Destination             
 VIN           White         VIN_5V5            INA260 (5.5 V rail)                  Dedicated 5V+ CPU power (INA260 addr TBD)
 GND           Black         GND                Battery branching ground             Direct return to battery
 
-1             Twisted Pair  GNSS_PPS_IN        GNSS PPS                             1 hz pulse for absolute time reference
+1             Twisted Pair  GNSS_PPS_IN        GNSS PPS                             1 Hz pulse for absolute time reference
+
+9             TBD (STP)     GNSS_10KHZ_RELAY   Pi GPIO25 via STP                    10 kHz GNSS clock relay output
+                                                                                     GPT2 compare ISR toggles every 1000 GNSS ticks
+                                                                                     Shield drained at Teensy GND (dupont header)
 
 20            White         LASER_PD_PLUS      Laser diode PD+                      Indicates laser on/off (active signal)
 
@@ -101,7 +113,7 @@ GND           Black         GND                Battery branching ground         
 19            Yellow        SCL1               Rail bus SCL1                        Primary I2C clock
 
 15            Yellow        PHOTODIODE_ADC     Photodiode output                    Analog input (ADC)
-14            Twister Pair  GNSS_VCLOCK        GNSS vclock output                   10MHz reference from GF-8802 (critical timing)
+14            Twisted Pair  GNSS_VCLOCK        GNSS vclock output                   10 MHz reference from GF-8802 (critical timing)
 
 22            Green         OCXO_CTL           OCXO Pin 1 (CTL)                     DAC output for OCXO frequency trim
 
@@ -121,12 +133,47 @@ Teensy Pin    Wire Color    Signal Name        Source / Destination             
 25            Orange        OCXO_10MHZ_IN      OCXO                                 GPT1 capture (critical)
 
 -------------------------------------------------------------------------------
+Unassigned pins (available for future use):
+  5, 6, 7, 8, 10, 11, 12
+
 Notes:
 • Wire colors are pragmatic (limited Kynar stock), not canonical signal colors.
 • VIN and GND belong to isolated CPU power domain.
 • Laser PD+ is intentionally monitored (not parked).
 • GNSS_VCLOCK is passively clamped to protect Teensy input.
+• GNSS_10KHZ_RELAY uses STP with shield drained at Teensy end only,
+  consistent with all other timing-critical signals.
+• GND for the STP shield drain uses dupont female header (not screw terminal),
+  as screw terminals are fully committed.
 • Table reflects current physical wiring, not final design.
+=============================================================================*/
+
+
+/*=============================================================================
+ (3) TIMING SIGNAL WIRING SUMMARY
+-------------------------------------------------------------------------------
+
+This section consolidates all timing-critical signal paths for reference.
+All timing signals use Shielded Twisted Pair (STP).
+All shields are drained at the SOURCE end only to prevent ground loops.
+
+Signal Name          Source          Destination      Frequency    Shield Drain
+----------------------------------------------------------------------------------
+GNSS_PPS_IN          GF-8802 P17    Teensy pin 1     1 Hz         GF-8802 end
+GNSS_VCLOCK          GF-8802 P11    Teensy pin 14    10 MHz       GF-8802 end
+OCXO_10MHZ_IN        OCXO           Teensy pin 25    10 MHz       OCXO end
+GNSS_PPS_RELAY       Teensy pin 32  Pi GPIO18        1 Hz         Teensy end
+GNSS_10KHZ_RELAY     Teensy pin 9   Pi GPIO25        10 kHz       Teensy end
+
+----------------------------------------------------------------------------------
+Notes:
+• GNSS_10KHZ_RELAY is generated by GPT2 output compare ISR dividing the
+  10 MHz GNSS clock by 1000.  Each rising edge represents exactly 100 µs
+  of elapsed GNSS time.
+• The ISR toggles pin 9 every 1000 GPT2_CNT ticks.  Jitter is ~30 ns,
+  which is < 0.03% of the 100 µs interval.
+• GPT2_CNT continues to count at 10 MHz with prescaler 1:1.  The output
+  compare does not disturb the free-running counter.
 =============================================================================*/
 
 
@@ -240,9 +287,9 @@ Timing / Control Outputs
 Pin #    Signal Name        Wire Color    Connected To        Destination     Notes
 ----------------------------------------------------------------------------------
 18       EPPS Output       —             —                   —              Unused
-17       PPS Output        Brown         Teensy              Pin 33          Primary PPS
+17       PPS Output        Brown         Teensy              Pin 1           Primary PPS
 16       GLCK Out          —             —                   —              Unused
-15       LOCK Signal       Green         Teensy              TBD             Lock status
+15       LOCK Signal       Green         Teensy              Pin 4           Lock status
 14       Alarm             —             —                   —              Unused
 11       BCLOCK Out        Orange        Teensy              Pin 14          10 MHz square wave
 
@@ -268,10 +315,44 @@ Pin #    Signal Name        Notes
 Notes:
 • PPS (Pin 17) is the primary absolute time reference for the system.
 • BCLOCK (Pin 11) provides a 10 MHz square-wave reference to the Teensy.
-• LOCK signal is wired but Teensy pin assignment is pending.
+• LOCK signal is wired to Teensy pin 4.
 • Antenna VIN is powered from the +5V rail.
 • All unused pins are intentionally left unconnected.
 • This table reflects physical wiring as built, not schematic ideals.
+=============================================================================*/
+
+/*=============================================================================
+ (7) I2C BUS 2 (SMBUS2) — DEVICE ASSIGNMENTS
+-------------------------------------------------------------------------------
+
+Bus Identity:
+SMBUS2
+Wiring: SDA2 (Green) / SCL2 (Orange)
+Status: Wired, not yet energized
+
+All device addresses are inferred from hardware strap configuration.
+
+-------------------------------------------------------------------------------
+Device Inventory
+-------------------------------------------------------------------------------
+
+Device Type   Address   A0 Strap   A1 Strap   Function / Notes
+---------------------------------------------------------------------------
+INA260        0x40      Open       Open       Power monitor — Teensy
+INA260        0x41      Bridged    Open       Power monitor — 24V stepper motors
+INA260        0x44      Open       Bridged    Power monitor — Raspberry Pi
+INA260        0x45      Bridged    Bridged    Power monitor — 3.3V OCXO
+
+DS3231 RTC    0x68      Fixed      Fixed      Secondary real-time clock
+
+-------------------------------------------------------------------------------
+Notes:
+• INA260 base address is 0x40.
+• Address selection formula: 0x40 + (A1 << 1) + A0.
+• DS3231 address is fixed at 0x68 (no strap options).
+• All devices on this bus use SDA2/SCL2 (Green / Orange).
+• This bus has not yet been powered or scanned.
+• Address conflicts are not expected given current strapping.
 =============================================================================*/
 
 /*=============================================================================
@@ -315,38 +396,4 @@ Notes:
 • Address 0x45 is currently unused on SMBUS1.
 • All devices on this bus use SDA1/SCL1 (Blue / Yellow).
 • This bus is already energized and operational.
-=============================================================================*/
-
-/*=============================================================================
- (7) I2C BUS 2 (SMBUS2) — DEVICE ASSIGNMENTS
--------------------------------------------------------------------------------
-
-Bus Identity:
-SMBUS2
-Wiring: SDA2 (Green) / SCL2 (Orange)
-Status: Wired, not yet energized
-
-All device addresses are inferred from hardware strap configuration.
-
--------------------------------------------------------------------------------
-Device Inventory
--------------------------------------------------------------------------------
-
-Device Type   Address   A0 Strap   A1 Strap   Function / Notes
----------------------------------------------------------------------------
-INA260        0x40      Open       Open       Power monitor — Teensy
-INA260        0x41      Bridged    Open       Power monitor — 24V stepper motors
-INA260        0x44      Open       Bridged    Power monitor — Raspberry Pi
-INA260        0x45      Bridged    Bridged    Power monitor — 3.3V OCXO
-
-DS3231 RTC    0x68      Fixed      Fixed      Secondary real-time clock
-
--------------------------------------------------------------------------------
-Notes:
-• INA260 base address is 0x40.
-• Address selection formula: 0x40 + (A1 << 1) + A0.
-• DS3231 address is fixed at 0x68 (no strap options).
-• All devices on this bus use SDA2/SCL2 (Green / Orange).
-• This bus has not yet been powered or scanned.
-• Address conflicts are not expected given current strapping.
 =============================================================================*/

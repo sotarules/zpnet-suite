@@ -38,6 +38,12 @@ Core contract (v2026-02-28+):
     • PITIMER computes pi_ns for every capture autonomously
     • CLOCKS reads pi_ns from GET_CAPTURE — never computes it
 
+  Epoch computation uses GET_CAPTURE(pps_count=N, peek=true) to read
+  the corrected value at the EXACT sync edge without consuming it.
+  This eliminates the race where _pitimer_report() could return a
+  later edge's corrected value if PPS edges advanced between the
+  sync fragment arriving and the REPORT IPC completing.
+
 Responsibilities:
   * Receive TIMEBASE_FRAGMENT from Teensy (queue-buffered)
   * Fetch correlated Pi capture from PITIMER by pps_count
@@ -144,6 +150,12 @@ _diag: Dict[str, Any] = {
     "pitimer_get_capture_misses": 0,
     "pitimer_get_capture_retries_total": 0,
     "last_pitimer_get_capture": {},
+
+    # PITIMER peek (epoch computation — non-destructive)
+    "pitimer_peek_requests": 0,
+    "pitimer_peek_hits": 0,
+    "pitimer_peek_misses": 0,
+    "last_pitimer_peek": {},
 
     # PITIMER skips (graceful — TIMEBASE not issued)
     "pitimer_skips_total": 0,
@@ -655,7 +667,7 @@ def _set_pitimer_epoch(pi_tick_epoch: int) -> None:
 
 def _pitimer_get_capture(pps_count: int) -> Optional[Dict[str, Any]]:
     """
-    Fetch a specific capture from PITIMER by pps_count.
+    Fetch a specific capture from PITIMER by pps_count (CONSUMING it).
 
     Retries briefly in case PITIMER hasn't captured this edge yet
     (the Teensy fragment can arrive before PITIMER's capture loop
@@ -699,6 +711,67 @@ def _pitimer_get_capture(pps_count: int) -> Optional[Dict[str, Any]]:
     _diag["pitimer_get_capture_misses"] += 1
     _diag["pitimer_get_capture_retries_total"] += retries
     _diag["last_pitimer_get_capture"] = {
+        "ts_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        "pps_count": int(pps_count),
+        "hit": False,
+        "retries": retries,
+    }
+    return None
+
+
+def _pitimer_get_capture_peek(pps_count: int) -> Optional[Dict[str, Any]]:
+    """
+    Non-destructive peek at a specific capture for epoch computation.
+
+    Uses GET_CAPTURE(pps_count=N, peek=true) to read the corrected value
+    at the EXACT sync edge without removing it from PITIMER's buffer.
+    The capture remains available for the processor thread to consume
+    via the normal (non-peek) GET_CAPTURE path.
+
+    This eliminates the epoch race condition where _pitimer_report()
+    could return a later edge's corrected value if PPS edges advanced
+    between the sync fragment arriving and the REPORT IPC completing.
+
+    Same retry logic as _pitimer_get_capture — PITIMER may not have
+    captured the edge yet when the sync fragment arrives from Teensy.
+    """
+    _diag["pitimer_peek_requests"] += 1
+    retries = 0
+
+    for attempt in range(PITIMER_CAPTURE_RETRIES + 1):
+        try:
+            resp = send_command(
+                machine="PI",
+                subsystem="PITIMER",
+                command="GET_CAPTURE",
+                args={"pps_count": int(pps_count), "peek": True},
+            )
+            if resp.get("success"):
+                _diag["pitimer_peek_hits"] += 1
+                _diag["last_pitimer_peek"] = {
+                    "ts_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+                    "pps_count": int(pps_count),
+                    "hit": True,
+                    "retries": retries,
+                    "corrected": resp.get("payload", {}).get("corrected"),
+                }
+                return resp.get("payload", {}) if isinstance(resp, dict) else {}
+
+            # NOT_FOUND — PITIMER hasn't captured this edge yet
+            if resp.get("message") == "NOT_FOUND" and attempt < PITIMER_CAPTURE_RETRIES:
+                retries += 1
+                time.sleep(PITIMER_CAPTURE_RETRY_INTERVAL_S)
+                continue
+
+            # Definitive miss after retries
+            break
+
+        except Exception:
+            # IPC failure — don't retry, just miss
+            break
+
+    _diag["pitimer_peek_misses"] += 1
+    _diag["last_pitimer_peek"] = {
         "ts_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
         "pps_count": int(pps_count),
         "hit": False,
@@ -785,7 +858,13 @@ def _fetch_environment() -> Optional[Dict[str, Any]]:
 
 
 def _pitimer_report() -> Dict[str, Any]:
-    """Fetch latest PITIMER state (non-destructive, for sync/diagnostics)."""
+    """Fetch latest PITIMER state (non-destructive, for diagnostics only).
+
+    WARNING: Do NOT use for epoch computation — the 'corrected' value
+    returned here is whatever PITIMER's latest state is, which may be
+    a DIFFERENT edge than the one you synced on.  Use
+    _pitimer_get_capture_peek(pps_count) instead.
+    """
     try:
         resp = send_command(machine="PI", subsystem="PITIMER", command="REPORT")
         if resp.get("success"):
@@ -956,13 +1035,20 @@ def on_timebase_fragment(payload: Payload) -> None:
         return
 
     # --- Sync latch (for START/RECOVER waits) ---
+    # Accept pps_count >= expected, not exact match.  The projected
+    # next_pps_count is approximate (depends on wall-clock timing of
+    # sleep-to-boundary, serial round-trip, etc.), so the Teensy may
+    # land one or two counts ahead.  We latch on the FIRST fragment
+    # that meets or exceeds the target and record the actual pps_count
+    # so the caller can adjust projections accordingly.
     with _sync_lock:
         if _sync_expected_pps is not None:
+            match = int(pps_count) >= int(_sync_expected_pps)
             logging.info(
-                "🔎 [clocks] @%s fragment arrived: teensy_pps_count=%d (waiting for %d) match=%s",
-                system_time_z(), pps_count, _sync_expected_pps, str(pps_count == _sync_expected_pps),
+                "🔎 [clocks] @%s fragment arrived: teensy_pps_count=%d (waiting for >=%d) match=%s",
+                system_time_z(), pps_count, _sync_expected_pps, str(match),
             )
-            if int(pps_count) == int(_sync_expected_pps):
+            if match:
                 _sync_fragment = dict(frag)
                 _sync_event.set()
 
@@ -1307,8 +1393,8 @@ def cmd_start(args: Optional[dict]) -> dict:
       5. Arm TEENSY START(pps_count=0) — slow path.
       6. Start PITIMER(pps_count=0) — fast path.
       7. Wait for sync fragment pps_count=0.
-      8. On sync fragment: fetch Pi capture, compute epoch, call SET_EPOCH.
-      9. Activate campaign — processor thread begins TIMEBASE production.
+      8. On sync fragment: PEEK Pi capture at pps_count=0, compute epoch.
+      9. Call SET_EPOCH.  Activate campaign.
     """
     global _campaign_active, _armed_pps_count
 
@@ -1393,38 +1479,52 @@ def cmd_start(args: Optional[dict]) -> dict:
     # Start PITIMER — fast path (transitions to RUNNING, arms pps_count=0)
     _start_pitimer(0)
 
-    _armed_pps_count = 0
-    _diag["armed_pps_count"] = 0
+    # The processor thread will never see pps_count=0 because
+    # _campaign_active is set after epoch computation.  The first
+    # fragment it processes will be pps_count=1, so arm for that.
+    _armed_pps_count = 1
+    _diag["armed_pps_count"] = 1
     logging.info("📡 [start] @%s both armed for pps_count=0 — waiting for sync fragment...", system_time_z())
 
-    # Activate campaign BEFORE waiting so the processor thread will
-    # accept pps_count=0 when it pulls it from the queue.  Without this,
-    # the processor may drain and discard pps_count=0 as "no campaign"
-    # before cmd_start returns and sets _campaign_active.
-    _campaign_active = True
+    # Do NOT activate campaign yet.  The processor thread must not consume
+    # the sync edge capture before we peek it for epoch computation.
+    # The pps_count=0 edge is a pre-epoch record (pi_ns=None) anyway.
+    # We activate after SET_EPOCH so the first real TIMEBASE record has
+    # a valid pi_ns.
 
     # Wait for the sync fragment
     try:
         frag0, waited_s = _end_sync_wait()
     except Exception:
-        _campaign_active = False
         return {"success": False, "message": "HARD FAULT during START sync (see logs/diag)"}
 
     logging.info("✅ [start] @%s sync fragment received (waited=%.3fs)", system_time_z(), waited_s)
 
-    # --- Compute epoch from PITIMER REPORT (non-destructive peek) ---
-    # DO NOT use GET_CAPTURE here — that would consume the capture,
-    # leaving the processor thread unable to build TIMEBASE for pps_count=0.
-    pit_report = _pitimer_report()
-    pi_corrected_0 = pit_report.get("corrected")
+    # --- Compute epoch via PEEK at the exact sync edge (pps_count=0) ---
+    # Uses GET_CAPTURE(pps_count=0, peek=true) to read the corrected
+    # value at the PRECISE edge we synced on, without consuming it.
+    # The processor thread will later consume it via normal GET_CAPTURE.
+    #
+    # This replaces the old _pitimer_report() call which was racy:
+    # by the time the REPORT IPC completed, PITIMER could have advanced
+    # to a later edge, causing an epoch error of N * 54,000,000 ticks.
+    pit_peek = _pitimer_get_capture_peek(0)
+    if pit_peek is None:
+        return {"success": False, "message": "START failed: PITIMER peek at pps_count=0 returned None"}
+
+    pi_corrected_0 = pit_peek.get("corrected")
     if pi_corrected_0 is None:
-        return {"success": False, "message": "START failed: PITIMER REPORT has no corrected value"}
+        return {"success": False, "message": "START failed: PITIMER peek has no corrected value"}
 
     pi_tick_epoch = int(pi_corrected_0)
-    logging.info("📐 [start] @%s epoch: pi_tick_epoch=%d (corrected at pps_count=0)", system_time_z(), pi_tick_epoch)
+    logging.info("📐 [start] @%s epoch: pi_tick_epoch=%d (peeked at pps_count=0)", system_time_z(), pi_tick_epoch)
 
     # Tell PITIMER the epoch so it can compute pi_ns from here on
     _set_pitimer_epoch(pi_tick_epoch)
+
+    # NOW activate — epoch is set, processor thread will produce
+    # TIMEBASE with valid pi_ns from the next edge onward.
+    _campaign_active = True
 
     logging.info("▶️ [clocks] @%s START complete — campaign '%s' active", system_time_z(), campaign)
 
@@ -1523,6 +1623,173 @@ def cmd_clear(_: Optional[dict]) -> dict:
 
 
 # ---------------------------------------------------------------------
+# RESUME — re-activate an explicitly stopped campaign
+# ---------------------------------------------------------------------
+
+
+def cmd_resume(args: Optional[dict]) -> dict:
+    """
+    RESUME(campaign)
+
+    Re-activate a previously stopped campaign and recover clocks.
+
+      1. Look up campaign by name (must exist, must NOT be active).
+      2. Verify it has TIMEBASE rows (otherwise nothing to recover from).
+      3. Re-activate in DB: active=true, clear stopped_at, set STARTED.
+      4. Deactivate any OTHER active campaign first.
+      5. Delegate to _recover_campaign() for the full clock recovery.
+
+    This is the explicit-command equivalent of boot-time recovery.
+    Use it after a programming change, debugging session, or any time
+    you've STOPped a campaign and want to pick it back up.
+    """
+    global _campaign_active
+
+    if not args or "campaign" not in args:
+        return {"success": False, "message": "RESUME requires 'campaign' argument"}
+
+    campaign_name = args["campaign"]
+
+    # Refuse if there's already an active campaign running
+    active_row = _get_active_campaign()
+    if active_row is not None:
+        if active_row["campaign"] == campaign_name:
+            return {
+                "success": False,
+                "message": f"Campaign '{campaign_name}' is already active — nothing to resume",
+            }
+        return {
+            "success": False,
+            "message": (
+                f"Campaign '{active_row['campaign']}' is currently active — "
+                f"STOP it before resuming '{campaign_name}'"
+            ),
+        }
+
+    # Look up the campaign
+    with open_db(row_dict=True) as conn:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT id, campaign, active, payload
+            FROM campaigns
+            WHERE campaign = %s
+            ORDER BY ts DESC
+            LIMIT 1
+            """,
+            (campaign_name,),
+        )
+        row = cur.fetchone()
+
+    if row is None:
+        return {"success": False, "message": f"No campaign named '{campaign_name}'"}
+
+    payload = row["payload"]
+    if isinstance(payload, str):
+        payload = json.loads(payload)
+
+    if row["active"]:
+        return {"success": False, "message": f"Campaign '{campaign_name}' is already active"}
+
+    # Verify it has TIMEBASE rows (otherwise there's nothing to recover from)
+    with open_db(row_dict=True) as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT COUNT(*) AS cnt FROM timebase WHERE campaign = %s",
+            (campaign_name,),
+        )
+        cnt_row = cur.fetchone()
+    tb_count = cnt_row["cnt"] if cnt_row else 0
+
+    if tb_count == 0:
+        return {
+            "success": False,
+            "message": f"Campaign '{campaign_name}' has no TIMEBASE rows — use START instead",
+        }
+
+    # Re-activate: set active=true, remove stopped_at, update report state
+    resumed_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    with open_db() as conn:
+        cur = conn.cursor()
+        # Deactivate any other campaign (defensive)
+        cur.execute(
+            """
+            UPDATE campaigns
+            SET active = false
+            WHERE active = true AND campaign != %s
+            """,
+            (campaign_name,),
+        )
+        # Re-activate the target campaign
+        cur.execute(
+            """
+            UPDATE campaigns
+            SET active = true,
+                payload = payload
+                    - 'stopped_at'
+                    || jsonb_build_object('resumed_at', to_jsonb(%s::text))
+                    || CASE
+                        WHEN payload ? 'report'
+                        THEN jsonb_build_object(
+                            'report',
+                            (payload->'report') || '{"campaign_state":"STARTED"}'::jsonb
+                        )
+                        ELSE '{}'::jsonb
+                       END
+            WHERE campaign = %s
+            """,
+            (resumed_at, campaign_name),
+        )
+        if cur.rowcount == 0:
+            return {"success": False, "message": f"Failed to re-activate campaign '{campaign_name}'"}
+
+    logging.info(
+        "▶️ [clocks] RESUME: campaign '%s' re-activated (%d TIMEBASE rows) — starting recovery...",
+        campaign_name, tb_count,
+    )
+
+    # Now delegate to the standard recovery path
+    try:
+        _recover_campaign()
+    except Exception as e:
+        logging.exception("💥 [clocks] RESUME recovery failed for '%s'", campaign_name)
+        # Deactivate on failure so we don't leave a zombie
+        _campaign_active = False
+        try:
+            with open_db() as conn:
+                cur = conn.cursor()
+                cur.execute(
+                    """
+                    UPDATE campaigns
+                    SET active = false,
+                        payload = payload || jsonb_build_object(
+                            'stopped_at', to_jsonb(%s::text),
+                            'resume_failed', to_jsonb(%s::text)
+                        )
+                    WHERE campaign = %s AND active = true
+                    """,
+                    (
+                        datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+                        str(e),
+                        campaign_name,
+                    ),
+                )
+        except Exception:
+            pass
+        return {"success": False, "message": f"RESUME recovery failed: {e}"}
+
+    return {
+        "success": True,
+        "message": "OK",
+        "payload": {
+            "campaign": campaign_name,
+            "timebase_rows": tb_count,
+            "resumed_at": resumed_at,
+        },
+    }
+
+
+# ---------------------------------------------------------------------
 # Recovery
 # ---------------------------------------------------------------------
 
@@ -1537,7 +1804,7 @@ def _recover_campaign() -> None:
       5. Stop Teensy + PITIMER, quiesce, snap to second boundary.
       6. Arm TEENSY RECOVER + start PITIMER(next_pps_count).
       7. Wait for sync fragment.
-      8. Compute epoch from sync edge, call PITIMER SET_EPOCH.
+      8. PEEK Pi capture at sync edge, compute epoch, call SET_EPOCH.
       9. Activate campaign.
     """
     global _campaign_active, _armed_pps_count
@@ -1596,6 +1863,54 @@ def _recover_campaign() -> None:
     last_gnss_ns = int(last_tb.get("teensy_gnss_ns") or 0)
     last_ocxo_ns = int(last_tb.get("teensy_ocxo_ns") or 0)
     last_pi_ns = int(last_tb.get("pi_ns") or 0)
+
+    # If pi_ns is 0/None (epoch edge or pre-epoch capture), try to find
+    # a recent TIMEBASE row with a valid pi_ns for tau estimation.
+    if last_pi_ns == 0:
+        logging.info("ℹ️ [recovery] last TIMEBASE has pi_ns=0 — searching for valid pi_ns row...")
+        try:
+            with open_db(row_dict=True) as conn:
+                cur = conn.cursor()
+                cur.execute(
+                    """
+                    SELECT payload
+                    FROM timebase
+                    WHERE campaign = %s
+                      AND (payload->>'pi_ns')::bigint > 0
+                    ORDER BY ts DESC
+                    LIMIT 1
+                    """,
+                    (campaign_name,),
+                )
+                pi_row = cur.fetchone()
+            if pi_row is not None:
+                pi_tb = pi_row["payload"]
+                if isinstance(pi_tb, str):
+                    pi_tb = json.loads(pi_tb)
+                fallback_pi_ns = int(pi_tb.get("pi_ns") or 0)
+                fallback_gnss_ns = int(pi_tb.get("teensy_gnss_ns") or 0)
+                fallback_pps = int(pi_tb.get("pps_count") or 0)
+                if fallback_pi_ns > 0 and fallback_gnss_ns > 0:
+                    last_pi_ns = fallback_pi_ns
+                    logging.info(
+                        "✅ [recovery] found valid pi_ns=%d at pps_count=%d (gnss_ns=%d)",
+                        fallback_pi_ns, fallback_pps, fallback_gnss_ns,
+                    )
+                    # Use the gnss_ns from the same row for consistent tau
+                    last_gnss_ns = fallback_gnss_ns
+                    last_pps_count = fallback_pps
+                    last_dwt_ns = int(pi_tb.get("teensy_dwt_ns") or last_dwt_ns)
+                    last_ocxo_ns = int(pi_tb.get("teensy_ocxo_ns") or last_ocxo_ns)
+                    # Recompute system time from this row
+                    fb_utc_str = pi_tb.get("system_time_utc") or pi_tb.get("gnss_time_utc")
+                    if fb_utc_str:
+                        last_system_utc = datetime.fromisoformat(fb_utc_str.replace("Z", "+00:00"))
+                else:
+                    logging.warning("⚠️ [recovery] fallback row had invalid pi_ns — using tau_pi=1.0")
+            else:
+                logging.warning("⚠️ [recovery] no TIMEBASE row with valid pi_ns — using tau_pi=1.0")
+        except Exception:
+            logging.warning("⚠️ [recovery] pi_ns fallback query failed — using tau_pi=1.0")
 
     if last_gnss_ns == 0:
         logging.warning("⚠️ [recovery] teensy_gnss_ns=0 — using dwt_ns as proxy")
@@ -1712,13 +2027,22 @@ def _recover_campaign() -> None:
     projected_gnss_ns = last_gnss_ns + (project_seconds * NS_PER_SECOND)
     projected_dwt_ns = last_dwt_ns + int(project_seconds * NS_PER_SECOND * tau_dwt)
     projected_ocxo_ns = last_ocxo_ns + int(project_seconds * NS_PER_SECOND * tau_ocxo) if last_ocxo_ns > 0 else 0
-    projected_pi_ns = last_pi_ns + int(project_seconds * NS_PER_SECOND * tau_pi) if last_pi_ns > 0 else 0
+    # Pi projection: last_pi_ns=0 is valid (epoch edge or pre-epoch record).
+    # In that case tau_pi is already 1.0 (nominal).  Always project forward
+    # from whatever last_pi_ns was — including zero.
+    projected_pi_ns = last_pi_ns + int(project_seconds * NS_PER_SECOND * tau_pi)
 
     projected_dwt_cycles = (projected_dwt_ns * DWT_CYCLES_PER_NS_NUM) // DWT_CYCLES_PER_NS_DEN
     projected_pi_ticks_at_target = (int(projected_pi_ns) * PI_TIMER_FREQ) // NS_PER_SECOND
 
     if projected_pi_ns <= 0:
-        raise RuntimeError("recovery failed: projected_pi_ns <= 0")
+        # This can happen if last_pi_ns was 0 (epoch edge) AND tau_pi
+        # computation somehow produced 0.  Use gnss projection as fallback.
+        logging.warning(
+            "⚠️ [recovery] projected_pi_ns=%d <= 0 — using gnss_ns as fallback",
+            projected_pi_ns,
+        )
+        projected_pi_ns = projected_gnss_ns
 
     logging.info(
         "📐 [recovery] projected@target -- gnss_ns=%d dwt_ns=%d ocxo_ns=%d pi_ns=%d pi_ticks=%d",
@@ -1751,9 +2075,11 @@ def _recover_campaign() -> None:
     _armed_pps_count = int(next_pps_count)
     _diag["armed_pps_count"] = int(next_pps_count)
 
-    # Activate campaign BEFORE waiting so the processor thread will
-    # accept the sync fragment when it pulls it from the queue.
-    _campaign_active = True
+    # Do NOT activate campaign yet.  The processor thread must not consume
+    # the sync edge capture before we peek it for epoch computation.
+    # The sync edge is a pre-epoch record (pi_ns=None) anyway — the
+    # processor would just log a gap.  We activate after SET_EPOCH so
+    # the first real TIMEBASE record has a valid pi_ns.
 
     # Wait for sync fragment
     try:
@@ -1764,13 +2090,57 @@ def _recover_campaign() -> None:
 
     logging.info("✅ [recovery] @%s sync fragment received (waited=%.3fs)", system_time_z(), waited_s)
 
-    # --- Compute epoch from PITIMER REPORT (non-destructive peek) ---
-    # DO NOT use GET_CAPTURE here — that would consume the capture,
-    # leaving the processor thread unable to build TIMEBASE for this pps_count.
-    pit_report = _pitimer_report()
-    pi_corrected_at_sync = pit_report.get("corrected")
+    # The Teensy's actual pps_count may differ from next_pps_count if it
+    # landed ahead of our projection.  The Teensy and PITIMER saw the SAME
+    # physical PPS edge, but they label it differently:
+    #   - Teensy labels it: actual_pps_count (e.g. 2682)
+    #   - PITIMER labels it: next_pps_count  (e.g. 2681, the armed value)
+    # We must adjust projections for the overshoot, peek using PITIMER's
+    # label, and then re-arm PITIMER so subsequent captures match Teensy.
+    teensy_pps_count = int(frag.get("teensy_pps_count", next_pps_count))
+    pitimer_sync_pps = next_pps_count  # what PITIMER calls this edge
+    overshoot = teensy_pps_count - next_pps_count
+
+    if overshoot != 0:
+        logging.info(
+            "📐 [recovery] pps_count overshoot: teensy=%d projected=%d (overshoot=%+d) "
+            "— PITIMER labeled this edge as %d",
+            teensy_pps_count, next_pps_count, overshoot, pitimer_sync_pps,
+        )
+        # Adjust projected ticks/ns for the extra (or fewer) seconds
+        projected_pi_ticks_at_target += int(overshoot * PI_TIMER_FREQ * tau_pi)
+        projected_gnss_ns += overshoot * NS_PER_SECOND
+        logging.info(
+            "📐 [recovery] adjusted projections: gnss_ns=%d pi_ticks=%d",
+            projected_gnss_ns, projected_pi_ticks_at_target,
+        )
+
+    # The processor thread will never see the sync edge because
+    # _campaign_active is still False.  The first fragment it processes
+    # will be teensy_pps_count + 1, so arm for that.
+    _armed_pps_count = teensy_pps_count + 1
+    _diag["armed_pps_count"] = _armed_pps_count
+
+    # --- Compute epoch via PEEK at the exact sync edge ---
+    # PEEK using PITIMER's pps_count label (next_pps_count), NOT the
+    # Teensy's label.  PITIMER assigned pps_count sequentially starting
+    # from the armed value, so the first captured edge is next_pps_count
+    # regardless of what the Teensy calls it.
+    pit_peek = _pitimer_get_capture_peek(pitimer_sync_pps)
+    if pit_peek is None:
+        _campaign_active = False
+        raise RuntimeError(
+            f"recovery failed: PITIMER peek at pps_count={pitimer_sync_pps} "
+            f"(teensy={teensy_pps_count}) returned None"
+        )
+
+    pi_corrected_at_sync = pit_peek.get("corrected")
     if pi_corrected_at_sync is None:
-        raise RuntimeError(f"recovery failed: PITIMER REPORT has no corrected value at pps_count={next_pps_count}")
+        _campaign_active = False
+        raise RuntimeError(
+            f"recovery failed: PITIMER peek has no corrected value at "
+            f"pps_count={pitimer_sync_pps}"
+        )
 
     pi_corrected_at_sync = int(pi_corrected_at_sync)
 
@@ -1778,15 +2148,50 @@ def _recover_campaign() -> None:
     pi_tick_epoch = pi_corrected_at_sync - projected_pi_ticks_at_target
 
     logging.info(
-        "📐 [recovery] epoch: corrected=%d - projected_ticks=%d = epoch=%d",
+        "📐 [recovery] epoch: corrected=%d - projected_ticks=%d = epoch=%d "
+        "(peeked at pitimer_pps=%d, teensy_pps=%d, overshoot=%+d)",
         pi_corrected_at_sync, projected_pi_ticks_at_target, pi_tick_epoch,
+        pitimer_sync_pps, teensy_pps_count, overshoot,
     )
 
+    # Set epoch FIRST, then re-arm pps_count.  This ordering ensures
+    # the next capture after SET_PPS_COUNT already has the epoch applied.
     _set_pitimer_epoch(pi_tick_epoch)
 
+    # Now re-arm PITIMER so its pps_count numbering aligns with Teensy
+    # for subsequent edges.  The processor thread will fetch captures by
+    # Teensy's pps_count, so they must match.  SET_PPS_COUNT clears the
+    # buffer (the sync edge capture is lost — that's expected, it was
+    # a pre-epoch gap record anyway).
+    if overshoot != 0:
+        new_pitimer_next = teensy_pps_count + 1
+        logging.info(
+            "📐 [recovery] re-arming PITIMER: SET_PPS_COUNT=%d (align with Teensy)",
+            new_pitimer_next,
+        )
+        try:
+            resp = send_command(
+                machine="PI",
+                subsystem="PITIMER",
+                command="SET_PPS_COUNT",
+                args={"pps_count": int(new_pitimer_next)},
+            )
+            if not resp.get("success"):
+                logging.warning(
+                    "⚠️ [recovery] SET_PPS_COUNT failed: %s (continuing anyway)",
+                    resp.get("message", "?"),
+                )
+        except Exception:
+            logging.warning("⚠️ [recovery] SET_PPS_COUNT IPC failed (continuing anyway)")
+
+    # NOW activate — epoch is set, PITIMER pps_count is aligned with
+    # Teensy.  The processor thread will start producing TIMEBASE from
+    # the next edge with valid pi_ns.
+    _campaign_active = True
+
     logging.info(
-        "✅ [recovery] @%s campaign '%s' recovered — pps_count=%d, TIMEBASE resumes",
-        system_time_z(), campaign_name, int(next_pps_count),
+        "✅ [recovery] @%s campaign '%s' recovered — teensy_pps=%d, TIMEBASE resumes",
+        system_time_z(), campaign_name, teensy_pps_count,
     )
 
 
@@ -1980,6 +2385,83 @@ def cmd_delete(args: Optional[dict]) -> Dict[str, Any]:
 # ---------------------------------------------------------------------
 
 
+def cmd_list_campaigns(_: Optional[dict]) -> Dict[str, Any]:
+    """
+    LIST_CAMPAIGNS
+
+    Return a compact list of all campaigns with name, start/stop times,
+    active status, pps_count, and whether it's the current baseline.
+    """
+    baseline_info = _get_baseline_from_config()
+    baseline_campaign = baseline_info.get("baseline_campaign") if baseline_info else None
+
+    try:
+        with open_db(row_dict=True) as conn:
+            cur = conn.cursor()
+            cur.execute(
+                """
+                SELECT id, campaign, active, ts, payload
+                FROM campaigns
+                ORDER BY ts ASC
+                """
+            )
+            rows = cur.fetchall()
+    except Exception as e:
+        logging.exception("❌ [clocks] LIST_CAMPAIGNS query failed")
+        return {"success": False, "message": str(e)}
+
+    campaigns = []
+    for row in rows:
+        payload = row["payload"]
+        if isinstance(payload, str):
+            payload = json.loads(payload)
+
+        report = payload.get("report", {})
+        is_baseline = (row["campaign"] == baseline_campaign)
+
+        entry: Dict[str, Any] = {
+            "campaign": row["campaign"],
+            "active": bool(row["active"]),
+            "baseline": is_baseline,
+            "started_at": payload.get("started_at"),
+            "stopped_at": payload.get("stopped_at"),
+            "resumed_at": payload.get("resumed_at"),
+            "location": payload.get("location"),
+            "pps_count": report.get("pps_count"),
+        }
+        campaigns.append(entry)
+
+    # Build a human-readable text table for display
+    lines = []
+    for c in campaigns:
+        star = " ★" if c["baseline"] else ""
+        state = "ACTIVE" if c["active"] else "stopped"
+        started = (c["started_at"] or "?")[:19]
+        stopped = (c["stopped_at"] or "—")[:19] if not c["active"] else "—"
+        pps = c["pps_count"] if c["pps_count"] is not None else "—"
+        loc = c["location"] or "—"
+        lines.append(
+            f"  {c['campaign']}{star}  [{state}]  "
+            f"start={started}  stop={stopped}  "
+            f"pps={pps}  loc={loc}"
+        )
+
+    return {
+        "success": True,
+        "message": "OK",
+        "payload": {
+            "count": len(campaigns),
+            "campaigns": campaigns,
+            "text": "\n".join(lines) if lines else "(no campaigns)",
+        },
+    }
+
+
+# ---------------------------------------------------------------------
+# CLOCKS_INFO
+# ---------------------------------------------------------------------
+
+
 def cmd_clocks_info(_: Optional[dict]) -> Dict[str, Any]:
     payload = {
         "campaign_active": _campaign_active,
@@ -2029,12 +2511,14 @@ def cmd_set_dac(args: Optional[dict]) -> Dict[str, Any]:
 COMMANDS = {
     "START": cmd_start,
     "STOP": cmd_stop,
+    "RESUME": cmd_resume,
     "REPORT": cmd_report,
     "CLEAR": cmd_clear,
     "DELETE": cmd_delete,
     "SET_DAC": cmd_set_dac,
     "SET_BASELINE": cmd_set_baseline,
     "BASELINE_INFO": cmd_baseline_info,
+    "LIST_CAMPAIGNS": cmd_list_campaigns,
     "CLOCKS_INFO": cmd_clocks_info,
 }
 
@@ -2053,7 +2537,8 @@ def run() -> None:
         "CLOCKS manages PITIMER lifecycle via START/STOP (symmetric with Teensy). "
         "CLOCKS is pure traffic cop — no clock state. "
         "GET_CAPTURE by pps_count identity — no timing race. "
-        "Commands: START, STOP, REPORT, CLEAR, SET_BASELINE, BASELINE_INFO, CLOCKS_INFO."
+        "Epoch computation uses GET_CAPTURE(peek=true) for race-free sync edge read. "
+        "Commands: START, STOP, RESUME, REPORT, CLEAR, SET_BASELINE, BASELINE_INFO, CLOCKS_INFO."
     )
 
     # Start processor thread

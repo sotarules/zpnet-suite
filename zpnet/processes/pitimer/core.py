@@ -59,6 +59,7 @@ Contract:
   • CLOCKS SHOULD call SET_EPOCH before pi_ns is valid (or pass
     pi_tick_epoch in START).
   • GET_CAPTURE(pps_count=N) returns and REMOVES the capture from the buffer.
+  • GET_CAPTURE(pps_count=N, peek=true) returns WITHOUT removing (for epoch).
   • REPORT returns the latest capture (non-destructive) plus buffer state.
   • STOP returns PITIMER to idle — capture loop continues, buffering stops.
 
@@ -67,7 +68,7 @@ Command surface:
   • STOP          — stop buffering, clear buffer, return to idle
   • SET_PPS_COUNT — re-arm pps_count (without lifecycle transition)
   • SET_EPOCH     — set Pi tick epoch for pi_ns computation
-  • GET_CAPTURE   — fetch and consume a capture by pps_count
+  • GET_CAPTURE   — fetch a capture by pps_count (consume or peek)
   • REPORT        — latest capture + buffer state (non-destructive)
   • NS            — current chrony-disciplined time
   • SET_MODE      — switch LOOP/PPS
@@ -345,6 +346,7 @@ _diag: Dict[str, Any] = {
     "buffer_inserts": 0,
     "buffer_evictions": 0,
     "buffer_hits": 0,
+    "buffer_peeks": 0,
     "buffer_misses": 0,
     "buffer_size_current": 0,
     "buffer_size_max_seen": 0,
@@ -508,6 +510,20 @@ def _buffer_pop(pps_count: int) -> Optional[Dict[str, Any]]:
         _diag["buffer_misses"] += 1
     _diag["buffer_size_current"] = len(_capture_buffer)
     return cap
+
+
+def _buffer_peek(pps_count: int) -> Optional[Dict[str, Any]]:
+    """
+    Return a COPY of the capture for pps_count WITHOUT removing it.
+    Called under _state_lock.
+    """
+    cap = _capture_buffer.get(pps_count)
+    if cap is not None:
+        _diag["buffer_peeks"] += 1
+        return dict(cap)
+    else:
+        _diag["buffer_misses"] += 1
+    return None
 
 
 # ---------------------------------------------------------------------
@@ -830,13 +846,28 @@ def cmd_set_epoch(args: Optional[dict]) -> Dict[str, Any]:
 
 def cmd_get_capture(args: Optional[dict]) -> Dict[str, Any]:
     """
-    GET_CAPTURE(pps_count=N)
+    GET_CAPTURE(pps_count=N, [peek=false])
 
-    Fetch and CONSUME the capture for a specific pps_count.
-    Returns the full capture dict including pi_ns if epoch is set.
-    The capture is removed from the buffer after retrieval.
+    Fetch a capture for a specific pps_count from the buffer.
 
-    Returns success=false with reason if the pps_count is not in the buffer.
+    Default (peek=false):
+      Returns and REMOVES the capture from the buffer.
+      This is the normal consumption path used by the CLOCKS processor
+      thread when building TIMEBASE records.
+
+    Peek mode (peek=true):
+      Returns a COPY of the capture WITHOUT removing it from the buffer.
+      The capture remains available for subsequent GET_CAPTURE (consume)
+      or peek calls.  This is used by CLOCKS during START/RECOVER epoch
+      computation to read the corrected value at the sync edge without
+      stealing it from the processor thread.
+
+      This eliminates the epoch race condition where _pitimer_report()
+      could return a later edge's corrected value if PPS edges advanced
+      between the sync fragment arriving and the REPORT IPC completing.
+
+    Returns success=false with message="NOT_FOUND" if the pps_count
+    is not in the buffer.
     """
     if not args or "pps_count" not in args:
         return {"success": False, "message": "BAD", "payload": {"error": "missing pps_count"}}
@@ -846,8 +877,22 @@ def cmd_get_capture(args: Optional[dict]) -> Dict[str, Any]:
     except (ValueError, TypeError):
         return {"success": False, "message": "BAD", "payload": {"error": "invalid pps_count"}}
 
+    # Peek mode: return copy without removing
+    peek = False
+    peek_raw = args.get("peek")
+    if peek_raw is not None:
+        if isinstance(peek_raw, bool):
+            peek = peek_raw
+        elif isinstance(peek_raw, str):
+            peek = peek_raw.lower() in ("true", "1", "yes")
+        else:
+            peek = bool(peek_raw)
+
     with _state_lock:
-        cap = _buffer_pop(target)
+        if peek:
+            cap = _buffer_peek(target)
+        else:
+            cap = _buffer_pop(target)
         buf_keys = list(_capture_buffer.keys())
 
     if cap is None:
@@ -855,6 +900,7 @@ def cmd_get_capture(args: Optional[dict]) -> Dict[str, Any]:
             "success": False, "message": "NOT_FOUND",
             "payload": {
                 "pps_count": target,
+                "peek": peek,
                 "running": _running,
                 "buffer_size": len(buf_keys),
                 "buffer_range": [buf_keys[0], buf_keys[-1]] if buf_keys else None,
@@ -987,6 +1033,7 @@ def cmd_report(_: Optional[dict]) -> Dict[str, Any]:
             "buffer_inserts": _diag["buffer_inserts"],
             "buffer_evictions": _diag["buffer_evictions"],
             "buffer_hits": _diag["buffer_hits"],
+            "buffer_peeks": _diag["buffer_peeks"],
             "buffer_misses": _diag["buffer_misses"],
             "buffer_size_max_seen": _diag["buffer_size_max_seen"],
             "pps_count_seen": _diag["pps_count_seen"],
@@ -1080,7 +1127,7 @@ def run() -> None:
         "STOP returns to idle. "
         "SET_PPS_COUNT and SET_EPOCH available as independent primitives. "
         "Captures buffered by pps_count (dynamic, max=%d). "
-        "GET_CAPTURE consumes by pps_count identity. "
+        "GET_CAPTURE consumes by pps_count identity (peek=true for non-destructive). "
         "Default mode: LOOP. "
         "Commands: START, STOP, SET_PPS_COUNT, SET_EPOCH, GET_CAPTURE, "
         "REPORT, NS, SET_MODE, GET_MODE.",
