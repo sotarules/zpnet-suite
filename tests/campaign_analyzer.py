@@ -18,12 +18,17 @@ Reads all TIMEBASE rows for the named campaign and produces:
   • PPB sanity check: flags any record where a clock domain's
     cumulative PPB (relative to GNSS) exceeds an absolute threshold.
     No real clock in ZPNet drifts more than 10,000 ppb — values
-    beyond that indicate an epoch projection error (typically Pi
-    after recovery).
-  • Recovery forensics: at each recovery boundary, reconstructs
-    the epoch computation that _recover_campaign() would have
-    performed, showing tau values, projected ticks/ns, actual
-    post-recovery values, and the resulting epoch error.
+    beyond that indicate a projection error.
+  • Recovery forensics (v4): at each recovery boundary, reconstructs
+    the symmetric nanosecond projection that _recover_campaign()
+    performed.  All four clock domains use the same formula:
+
+      projected_gnss_ns = next_pps_count × NS_PER_SECOND
+      projected_ns = projected_gnss_ns × last_clock_ns ÷ last_gnss_ns
+
+    Pure integer arithmetic, no DWT cycle counts, no Pi epochs,
+    no +2 padding.  Shows tau values, projected nanoseconds,
+    actual post-recovery nanoseconds, and the resulting errors.
   • Summary verdict: CLEAN, CLEAN (with recovery), or anomalies
 """
 
@@ -43,7 +48,7 @@ from zpnet.shared.db import open_db
 
 # Absolute PPB threshold.  Any clock domain showing |ppb| above this
 # is flagged as an anomaly.  No real ZPNet clock drifts this much —
-# values beyond 10K ppb indicate an epoch projection error, typically
+# values beyond 10K ppb indicate a projection error, typically
 # in the Pi domain after recovery.
 PPB_ABSOLUTE_THRESHOLD = 10_000
 
@@ -51,8 +56,6 @@ PPB_ABSOLUTE_THRESHOLD = 10_000
 NS_PER_SECOND = 1_000_000_000
 PI_TIMER_FREQ = 54_000_000
 PI_NS_PER_TICK = 1e9 / PI_TIMER_FREQ  # ~18.519 ns/tick
-DWT_CYCLES_PER_NS_NUM = 126
-DWT_CYCLES_PER_NS_DEN = 125
 
 
 # ---------------------------------------------------------------------
@@ -315,7 +318,7 @@ def analyze_ppb_sanity(
 
 
 # ---------------------------------------------------------------------
-# Recovery forensics — reconstruct epoch computation at each boundary
+# Recovery forensics — v4 nanosecond architecture
 # ---------------------------------------------------------------------
 
 def analyze_recovery_forensics(
@@ -323,23 +326,28 @@ def analyze_recovery_forensics(
     recovery_boundaries: Set[int],
 ) -> List[str]:
     """
-    At each recovery boundary, reconstruct the computation that
-    _recover_campaign() would have performed:
+    At each recovery boundary, reconstruct the v4 symmetric nanosecond
+    projection that _recover_campaign() performed.
 
-      1. Read last pre-gap row (the "anchor")
-      2. Compute tau_dwt, tau_ocxo, tau_pi from anchor
-      3. Compute gap_seconds and projections:
-         - Teensy clocks: padded project_seconds (elapsed + 2)
-         - Pi: actual_elapsed (post_pps - pre_pps, the true sync edge)
-      4. Compare projected values against actual post-recovery values
-      5. Reconstruct the epoch and show the error
+    v4 algorithm:
+      1. Read last pre-gap row (the "anchor") — nanosecond values
+         and GNSS wall-clock timestamp.
+      2. Compute elapsed GNSS seconds from wall-clock timestamps.
+      3. next_pps_count = anchor_pps + elapsed + 1.
+      4. projected_gnss_ns = next_pps_count × NS_PER_SECOND.
+      5. For each clock domain, project forward using the ratio
+         from the anchor — pure integer arithmetic:
+           projected_ns = projected_gnss_ns × last_clock_ns ÷ last_gnss_ns
+      6. The Teensy and PITIMER each receive projected nanoseconds
+         and derive their own internal state (DWT cycles, Pi epoch).
 
-    This mirrors _recover_campaign() exactly:
-      - Teensy projections use the padded project_seconds because they
-        are instructions loaded into the Teensy's accumulators.
-      - Pi projection uses actual_elapsed because the epoch is derived
-        from a hardware reading minus projected ticks, so it must match
-        where the sync edge actually landed.
+    We can verify this because the actual post-recovery pps_count tells
+    us what next_pps_count was, and the actual nanosecond values show
+    how close the projections landed.
+
+    Since we don't know the exact GNSS wall-clock times used during
+    recovery, we infer next_pps_count from the actual post-recovery
+    pps_count (which should match what CLOCKS computed).
     """
     lines: List[str] = []
 
@@ -365,20 +373,15 @@ def analyze_recovery_forensics(
         gap_seconds = post_pps - pre_pps - 1
         elapsed_seconds = post_pps - pre_pps
 
-        # Teensy projections use padded project_seconds (matches _recover_campaign)
-        teensy_project_seconds = elapsed_seconds + 2
-
-        # Pi projection uses actual elapsed from anchor to sync edge
-        # (matches the fixed _recover_campaign — no padding)
-        pi_actual_elapsed = elapsed_seconds
+        # v4: next_pps_count = post_pps (what the recovery actually produced)
+        next_pps_count = post_pps
 
         lines.append(f"\n  {'=' * 62}")
         lines.append(f"  RECOVERY FORENSICS: pps_count {pre_pps} -> {post_pps}")
         lines.append(f"  {'=' * 62}")
         lines.append(f"  Gap: {gap_seconds} missing seconds")
         lines.append(f"  Elapsed (pps delta): {elapsed_seconds} seconds")
-        lines.append(f"  Teensy project seconds: {teensy_project_seconds} (elapsed + 2, padded)")
-        lines.append(f"  Pi actual elapsed: {pi_actual_elapsed} (no padding)")
+        lines.append(f"  Inferred next_pps_count: {next_pps_count}")
 
         # --- Anchor values (pre-gap row) ---
         anchor_gnss_ns = int(pre_row.get("teensy_gnss_ns") or 0)
@@ -388,23 +391,21 @@ def analyze_recovery_forensics(
         anchor_pi_corrected = int(pre_row.get("pi_corrected") or 0)
         anchor_dwt_cycles = int(pre_row.get("teensy_dwt_cycles") or 0)
 
-        anchor_system_utc = pre_row.get("system_time_utc") or pre_row.get("gnss_time_utc", "?")
+        anchor_time = pre_row.get("gnss_time_utc") or pre_row.get("system_time_utc", "?")
 
         lines.append(f"\n  Anchor (pps_count={pre_pps}):")
-        lines.append(f"    system_time_utc:   {anchor_system_utc}")
+        lines.append(f"    gnss_time_utc:     {anchor_time}")
         lines.append(f"    gnss_ns:           {anchor_gnss_ns:,}")
         lines.append(f"    dwt_ns:            {anchor_dwt_ns:,}")
-        lines.append(f"    dwt_cycles:        {anchor_dwt_cycles:,}")
         lines.append(f"    ocxo_ns:           {anchor_ocxo_ns:,}")
         lines.append(f"    pi_ns:             {anchor_pi_ns:,}")
-        lines.append(f"    pi_corrected:      {anchor_pi_corrected:,}")
 
-        # --- Tau computation (mirrors _recover_campaign) ---
-        tau_dwt = float(anchor_dwt_ns) / float(anchor_gnss_ns) if anchor_gnss_ns > 0 else 1.0
-        tau_ocxo = float(anchor_ocxo_ns) / float(anchor_gnss_ns) if (anchor_gnss_ns > 0 and anchor_ocxo_ns > 0) else 1.0
-        tau_pi = float(anchor_pi_ns) / float(anchor_gnss_ns) if (anchor_gnss_ns > 0 and anchor_pi_ns > 0) else 1.0
+        # --- Tau computation (ratio from anchor) ---
+        tau_dwt = anchor_dwt_ns / anchor_gnss_ns if anchor_gnss_ns > 0 else 1.0
+        tau_ocxo = anchor_ocxo_ns / anchor_gnss_ns if (anchor_gnss_ns > 0 and anchor_ocxo_ns > 0) else 1.0
+        tau_pi = anchor_pi_ns / anchor_gnss_ns if (anchor_gnss_ns > 0 and anchor_pi_ns > 0) else 1.0
 
-        lines.append(f"\n  Tau (computed from anchor):")
+        lines.append(f"\n  Tau (from anchor ratios):")
         lines.append(f"    tau_dwt:   {tau_dwt:.12f}")
         lines.append(f"    tau_ocxo:  {tau_ocxo:.12f}")
         lines.append(f"    tau_pi:    {tau_pi:.12f}")
@@ -412,29 +413,20 @@ def analyze_recovery_forensics(
         if anchor_pi_ns == 0:
             lines.append(f"    ⚠️  anchor pi_ns=0 — tau_pi defaulted to 1.0")
 
-        # --- Teensy projections (padded, matches _recover_campaign) ---
-        tps = teensy_project_seconds
+        # --- v4 symmetric projection (all nanoseconds) ---
+        # projected_gnss_ns = next_pps_count × NS_PER_SECOND
+        # projected_ns = projected_gnss_ns × last_clock_ns ÷ last_gnss_ns
+        proj_gnss_ns = next_pps_count * NS_PER_SECOND
+        proj_dwt_ns = proj_gnss_ns * anchor_dwt_ns // anchor_gnss_ns if anchor_gnss_ns > 0 else proj_gnss_ns
+        proj_ocxo_ns = proj_gnss_ns * anchor_ocxo_ns // anchor_gnss_ns if (anchor_gnss_ns > 0 and anchor_ocxo_ns > 0) else 0
+        proj_pi_ns = proj_gnss_ns * anchor_pi_ns // anchor_gnss_ns if (anchor_gnss_ns > 0 and anchor_pi_ns > 0) else 0
 
-        proj_gnss_ns = anchor_gnss_ns + (tps * NS_PER_SECOND)
-        proj_dwt_ns = anchor_dwt_ns + int(tps * NS_PER_SECOND * tau_dwt)
-        proj_ocxo_ns = anchor_ocxo_ns + int(tps * NS_PER_SECOND * tau_ocxo) if anchor_ocxo_ns > 0 else 0
-        proj_dwt_cycles = (proj_dwt_ns * DWT_CYCLES_PER_NS_NUM) // DWT_CYCLES_PER_NS_DEN
-
-        lines.append(f"\n  Teensy projections (padded, project_seconds={tps}):")
-        lines.append(f"    proj_gnss_ns:      {proj_gnss_ns:,}")
-        lines.append(f"    proj_dwt_ns:       {proj_dwt_ns:,}")
-        lines.append(f"    proj_dwt_cycles:   {proj_dwt_cycles:,}")
-        lines.append(f"    proj_ocxo_ns:      {proj_ocxo_ns:,}")
-
-        # --- Pi projection (actual elapsed, matches fixed _recover_campaign) ---
-        pae = pi_actual_elapsed
-
-        proj_pi_ns = anchor_pi_ns + int(pae * NS_PER_SECOND * tau_pi)
-        proj_pi_ticks = (proj_pi_ns * PI_TIMER_FREQ) // NS_PER_SECOND
-
-        lines.append(f"\n  Pi projection (actual elapsed={pae}, no padding):")
-        lines.append(f"    proj_pi_ns:        {proj_pi_ns:,}")
-        lines.append(f"    proj_pi_ticks:     {proj_pi_ticks:,}")
+        lines.append(f"\n  v4 Symmetric projection (projected_gnss_ns × last_clock_ns ÷ last_gnss_ns):")
+        lines.append(f"    projected_gnss_ns = {next_pps_count} × {NS_PER_SECOND:,} = {proj_gnss_ns:,}")
+        lines.append(f"    GNSS:  {proj_gnss_ns:,}  (tau = 1.000000000000)")
+        lines.append(f"    DWT:   {proj_dwt_ns:,}  (tau = {tau_dwt:.12f})")
+        lines.append(f"    OCXO:  {proj_ocxo_ns:,}  (tau = {tau_ocxo:.12f})")
+        lines.append(f"    Pi:    {proj_pi_ns:,}  (tau = {tau_pi:.12f})")
 
         # --- Actual post-recovery values ---
         actual_gnss_ns = int(post_row.get("teensy_gnss_ns") or 0)
@@ -444,82 +436,84 @@ def analyze_recovery_forensics(
         actual_pi_corrected = int(post_row.get("pi_corrected") or 0)
         actual_dwt_cycles = int(post_row.get("teensy_dwt_cycles") or 0)
 
-        actual_system_utc = post_row.get("system_time_utc") or post_row.get("gnss_time_utc", "?")
+        actual_time = post_row.get("gnss_time_utc") or post_row.get("system_time_utc", "?")
 
         lines.append(f"\n  Actual (pps_count={post_pps}):")
-        lines.append(f"    system_time_utc:   {actual_system_utc}")
+        lines.append(f"    gnss_time_utc:     {actual_time}")
         lines.append(f"    gnss_ns:           {actual_gnss_ns:,}")
         lines.append(f"    dwt_ns:            {actual_dwt_ns:,}")
-        lines.append(f"    dwt_cycles:        {actual_dwt_cycles:,}")
         lines.append(f"    ocxo_ns:           {actual_ocxo_ns:,}")
         lines.append(f"    pi_ns:             {actual_pi_ns:,}")
-        lines.append(f"    pi_corrected:      {actual_pi_corrected:,}")
 
-        # --- Teensy projection errors ---
-        lines.append(f"\n  Teensy projection errors (actual - projected):")
-
+        # --- Projection errors (actual - projected) ---
         d_gnss = actual_gnss_ns - proj_gnss_ns
         d_dwt = actual_dwt_ns - proj_dwt_ns
         d_ocxo = actual_ocxo_ns - proj_ocxo_ns
-
-        lines.append(f"    gnss_ns error:     {d_gnss:+,d} ns")
-        lines.append(f"    dwt_ns error:      {d_dwt:+,d} ns")
-        lines.append(f"    ocxo_ns error:     {d_ocxo:+,d} ns")
-        lines.append(f"    (Teensy errors are ~-2s from padding — expected and harmless)")
-
-        # --- Pi projection error ---
         d_pi = actual_pi_ns - proj_pi_ns
 
-        lines.append(f"\n  Pi projection error (actual - projected):")
-        lines.append(f"    pi_ns error:       {d_pi:+,d} ns")
+        lines.append(f"\n  Projection errors (actual - projected):")
+        lines.append(f"    GNSS:  {d_gnss:+,d} ns")
+        lines.append(f"    DWT:   {d_dwt:+,d} ns")
+        lines.append(f"    OCXO:  {d_ocxo:+,d} ns")
+        lines.append(f"    Pi:    {d_pi:+,d} ns")
 
+        # Error as PPB of GNSS (how much the projection was off
+        # relative to the campaign duration at that point)
         if actual_gnss_ns > 0:
-            d_pi_ppb = (d_pi / actual_gnss_ns) * 1e9
-            lines.append(f"    pi_ns error as ppb of gnss: {d_pi_ppb:+,.1f}")
+            lines.append(f"\n  Projection error as PPB of campaign GNSS time:")
+            for lbl, err in [("GNSS", d_gnss), ("DWT", d_dwt), ("OCXO", d_ocxo), ("Pi", d_pi)]:
+                err_ppb = (err / actual_gnss_ns) * 1e9
+                lines.append(f"    {lbl:6s} {err_ppb:+,.3f} ppb")
 
-        # --- Epoch reconstruction ---
+        # --- GNSS ns error interpretation ---
+        # In v4, projected_gnss_ns = next_pps_count × NS_PER_SECOND.
+        # The Teensy derives campaign_seconds from gnss_ns ÷ 1e9,
+        # so actual_gnss_ns should be exactly projected_gnss_ns
+        # (plus sub-second quantization from the GNSS receiver).
+        if d_gnss != 0:
+            gnss_err_seconds = d_gnss / NS_PER_SECOND
+            lines.append(f"\n  GNSS ns discrepancy: {d_gnss:+,d} ns ({gnss_err_seconds:+.6f} seconds)")
+            if abs(d_gnss) <= 400:
+                lines.append(f"    (within GNSS receiver quantization — normal)")
+            else:
+                lines.append(f"    ⚠️  larger than expected GNSS quantization")
+
+        # --- Pi epoch verification ---
+        # PITIMER derived: epoch = corrected - (pi_ns × PI_TIMER_FREQ ÷ NS_PER_SECOND)
+        # We can reverse this to verify the epoch is consistent.
         if actual_pi_ns > 0 and actual_pi_corrected > 0:
-            actual_pi_ticks_elapsed = (actual_pi_ns * PI_TIMER_FREQ) // NS_PER_SECOND
-            actual_epoch = actual_pi_corrected - actual_pi_ticks_elapsed
+            actual_pi_ticks_from_epoch = (actual_pi_ns * PI_TIMER_FREQ) // NS_PER_SECOND
+            inferred_epoch = actual_pi_corrected - actual_pi_ticks_from_epoch
 
-            ideal_pi_ns = int(actual_gnss_ns * 1.0000077)
-            ideal_pi_ticks_elapsed = (ideal_pi_ns * PI_TIMER_FREQ) // NS_PER_SECOND
-            ideal_epoch = actual_pi_corrected - ideal_pi_ticks_elapsed
+            # Compare with anchor: at anchor, epoch = anchor_pi_corrected - (anchor_pi_ns × freq ÷ 1e9)
+            if anchor_pi_ns > 0 and anchor_pi_corrected > 0:
+                anchor_pi_ticks_from_epoch = (anchor_pi_ns * PI_TIMER_FREQ) // NS_PER_SECOND
+                anchor_epoch = anchor_pi_corrected - anchor_pi_ticks_from_epoch
 
-            epoch_error_ticks = actual_epoch - ideal_epoch
-            epoch_error_ns = int(epoch_error_ticks * PI_NS_PER_TICK)
+                epoch_drift_ticks = inferred_epoch - anchor_epoch
+                epoch_drift_ns = int(epoch_drift_ticks * PI_NS_PER_TICK)
 
-            lines.append(f"\n  Epoch reconstruction:")
-            lines.append(f"    actual pi_ticks elapsed:  {actual_pi_ticks_elapsed:,}")
-            lines.append(f"    actual epoch (reversed):  {actual_epoch:,}")
-            lines.append(f"    ideal pi_ticks elapsed:   {ideal_pi_ticks_elapsed:,}")
-            lines.append(f"    ideal epoch (for ~7650 ppb): {ideal_epoch:,}")
-            lines.append(f"    epoch error:              {epoch_error_ticks:+,d} ticks")
-            lines.append(f"    epoch error:              {epoch_error_ns:+,d} ns ({epoch_error_ns / 1e9:+.3f} seconds)")
+                lines.append(f"\n  Pi epoch consistency:")
+                lines.append(f"    anchor epoch (inferred):  {anchor_epoch:,}")
+                lines.append(f"    post-recovery epoch:      {inferred_epoch:,}")
+                lines.append(f"    epoch drift:              {epoch_drift_ticks:+,d} ticks ({epoch_drift_ns:+,d} ns)")
+                if abs(epoch_drift_ns) < 1000:
+                    lines.append(f"    ✅ epoch consistent across recovery (drift < 1µs)")
+                elif abs(epoch_drift_ns) < 100_000:
+                    lines.append(f"    ✅ epoch consistent across recovery (drift < 100µs)")
+                else:
+                    lines.append(f"    ⚠️  epoch drift {epoch_drift_ns / 1e6:+,.1f} µs — may indicate projection error")
 
-            # Reverse-engineer what projected_pi_ticks was actually used
-            inferred_proj_ticks = actual_pi_corrected - actual_epoch
-            lines.append(f"\n  Inferred from actual epoch:")
-            lines.append(f"    projected_pi_ticks used:  {inferred_proj_ticks:,}")
-            lines.append(f"    our estimate of proj_pi_ticks: {proj_pi_ticks:,}")
-            lines.append(f"    difference:               {inferred_proj_ticks - proj_pi_ticks:+,d} ticks")
-
-            if pae > 0:
-                inferred_proj_pi_ns = (inferred_proj_ticks * NS_PER_SECOND) // PI_TIMER_FREQ
-                inferred_addition = inferred_proj_pi_ns - anchor_pi_ns
-                inferred_tau_pi = inferred_addition / (pae * NS_PER_SECOND) if (pae * NS_PER_SECOND) > 0 else 0
-                lines.append(f"    inferred proj_pi_ns:      {inferred_proj_pi_ns:,}")
-                lines.append(f"    inferred pi_ns addition:  {inferred_addition:,}")
-                lines.append(f"    inferred tau_pi used:     {inferred_tau_pi:.12f}")
-                lines.append(f"    our computed tau_pi:      {tau_pi:.12f}")
-                lines.append(f"    tau_pi discrepancy:       {inferred_tau_pi - tau_pi:+.12f}")
-
-        # --- PPB check on post-recovery row ---
-        if actual_gnss_ns > 0 and actual_pi_ns > 0:
-            post_ppb = _compute_ppb(actual_pi_ns, actual_gnss_ns)
-            lines.append(f"\n  Post-recovery Pi PPB: {post_ppb:+,.1f}")
-            if post_ppb is not None and abs(post_ppb) > PPB_ABSOLUTE_THRESHOLD:
-                lines.append(f"    ⚠️  EXCEEDS ±{PPB_ABSOLUTE_THRESHOLD:,} ppb threshold")
+        # --- Post-recovery PPB ---
+        lines.append(f"\n  Post-recovery PPB (all domains vs GNSS):")
+        if actual_gnss_ns > 0:
+            for lbl, actual_ns in [("DWT", actual_dwt_ns), ("OCXO", actual_ocxo_ns), ("Pi", actual_pi_ns)]:
+                if actual_ns > 0:
+                    ppb = _compute_ppb(actual_ns, actual_gnss_ns)
+                    flag = ""
+                    if ppb is not None and abs(ppb) > PPB_ABSOLUTE_THRESHOLD:
+                        flag = f"  ⚠️  EXCEEDS ±{PPB_ABSOLUTE_THRESHOLD:,} ppb"
+                    lines.append(f"    {lbl:6s} {ppb:+,.1f} ppb{flag}")
 
     return lines
 
@@ -744,10 +738,8 @@ def analyze(campaign: str) -> None:
                               f"{prev_val} -> {curr_val} (delta={delta})")
             else:
                 if curr_val <= prev_val:
-                    if at_boundary and key == "pi_ns":
-                        pass
-                    elif at_boundary:
-                        pass
+                    if at_boundary:
+                        pass  # Expected across recovery boundaries
                     else:
                         non_monotonic += 1
                         if non_monotonic <= 3:
@@ -866,7 +858,7 @@ def analyze(campaign: str) -> None:
     if recovery_boundaries:
         print()
         print("-" * 70)
-        print("RECOVERY FORENSICS")
+        print("RECOVERY FORENSICS (v4 nanosecond architecture)")
         print("-" * 70)
 
         forensic_lines = analyze_recovery_forensics(rows, recovery_boundaries)

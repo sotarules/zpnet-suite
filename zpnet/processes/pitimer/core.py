@@ -1,7 +1,7 @@
 """
-ZPNet PITIMER Process — Pi Arch Timer PPS Capture (v3 — START/STOP lifecycle)
+ZPNet PITIMER Process — Pi Arch Timer PPS Capture (v4 — nanosecond recovery)
 
-Intent (v2026-02-28+):
+Intent (v2026-03-03+):
   PITIMER is the Pi clock authority.  It owns both the raw CNTVCT_EL0
   cycle count AND the derived Pi nanosecond clock.
 
@@ -10,7 +10,27 @@ Intent (v2026-02-28+):
     • PITIMER owns Pi ns and Pi ticks — served via GET_CAPTURE
     • CLOCKS is a pure traffic cop: correlates by pps_count, joins, persists
 
-  v3 adds explicit START/STOP lifecycle:
+  v4 makes the recovery interface symmetric with the Teensy:
+
+    CLOCKS speaks only nanoseconds to both the Teensy and PITIMER.
+    The same formula (last_ns + elapsed * tau) projects every clock
+    domain forward during recovery.  CLOCKS never computes or sends
+    tick-domain values — each instrument derives its own internal
+    representation from the nanosecond value it receives.
+
+    For PITIMER this means:
+      • START and RECOVER accept pi_ns (nanoseconds), not pi_tick_epoch
+      • PITIMER derives its own epoch from the first capture after
+        receiving a pi_ns value:
+          epoch = corrected - (pi_ns * PI_TIMER_FREQ // NS_PER_SECOND)
+      • This pairs the nanosecond projection with the actual hardware
+        reading at the same physical PPS edge — no race condition,
+        no separate SET_EPOCH call, no PEEK needed for epoch computation
+
+    The epoch is an internal implementation detail of PITIMER, just as
+    DWT cycle counts are an internal implementation detail of the Teensy.
+
+  v3 lifecycle (retained):
 
     STOPPED (default):
       Capture loop runs continuously to keep delta tracking warm, but
@@ -18,32 +38,47 @@ Intent (v2026-02-28+):
       are impossible.  PITIMER is calm.  This is the idle state between
       campaigns and at boot.
 
-    RUNNING (after START):
+    RUNNING (after START or RECOVER):
       Captures are buffered by pps_count for CLOCKS consumption.
       Metrics are tracked, evictions are warnings, pi_ns is computed
       if epoch is set.  This is the active campaign state.
 
     START transitions to RUNNING.  It takes pps_count (required) and
-    optionally pi_tick_epoch.  If epoch is not provided, CLOCKS calls
-    SET_EPOCH separately after the sync fragment arrives.
+    optionally pi_ns.  If pi_ns is provided, PITIMER derives the epoch
+    from the first capture.  If not provided, CLOCKS calls SET_EPOCH
+    separately (legacy/diagnostic path).
+
+    RECOVER transitions to RUNNING with pi_ns.  Symmetric with the
+    Teensy's RECOVER command.  Takes pps_count and pi_ns, clears
+    buffer, and derives epoch from the first capture.
 
     STOP clears all campaign state and returns to idle.  The capture
     loop continues uninterrupted — only buffering stops.
 
+  Epoch derivation from pi_ns:
+
+    When PITIMER receives a pi_ns value (via START or RECOVER), it
+    stores it as _pending_pi_ns.  On the first capture after arming,
+    the capture loop pairs the pending pi_ns with the actual corrected
+    counter value at that PPS edge:
+
+      epoch = corrected - (pi_ns * PI_TIMER_FREQ // NS_PER_SECOND)
+
+    This is the inverse of the normal pi_ns computation:
+      pi_ns = (corrected - epoch) * NS_PER_SECOND // PI_TIMER_FREQ
+
+    Once the epoch is set, _pending_pi_ns is cleared.  All subsequent
+    captures use the derived epoch for pi_ns computation.
+
   SET_PPS_COUNT and SET_EPOCH remain as independent primitives.
   SET_PPS_COUNT can be used without START (e.g. re-arming mid-campaign).
-  SET_EPOCH can be called at any time to update the epoch.
+  SET_EPOCH can be called at any time to update the epoch (diagnostic/
+  manual override — CLOCKS no longer calls it during normal recovery).
 
   Captures are stored in a dynamic buffer indexed by pps_count.  CLOCKS
   fetches captures by identity (GET_CAPTURE pps_count=N), not by timing.
   This eliminates the race condition where a late TIMEBASE_FRAGMENT causes
   PITIMER to have already advanced past the needed capture.
-
-  Epoch management:
-    • CLOCKS calls START(pps_count, [pi_tick_epoch]) or SET_EPOCH later.
-    • PITIMER computes pi_ns = (corrected - epoch) * 1e9 / freq for every
-      capture, storing it in the buffer alongside the raw ticks.
-    • CLOCKS never computes pi_ns — it reads it from GET_CAPTURE.
 
   Supports two capture modes:
 
@@ -55,19 +90,18 @@ Intent (v2026-02-28+):
       Uses the kernel PPS subsystem (/dev/pps0) via ioctl(PPS_FETCH).
 
 Contract:
-  • CLOCKS MUST call START before captures are buffered.
-  • CLOCKS SHOULD call SET_EPOCH before pi_ns is valid (or pass
-    pi_tick_epoch in START).
+  • CLOCKS MUST call START or RECOVER before captures are buffered.
   • GET_CAPTURE(pps_count=N) returns and REMOVES the capture from the buffer.
-  • GET_CAPTURE(pps_count=N, peek=true) returns WITHOUT removing (for epoch).
+  • GET_CAPTURE(pps_count=N, peek=true) returns WITHOUT removing.
   • REPORT returns the latest capture (non-destructive) plus buffer state.
   • STOP returns PITIMER to idle — capture loop continues, buffering stops.
 
 Command surface:
-  • START         — arm with pps_count, optionally set epoch, begin buffering
+  • START         — arm with pps_count, optionally set pi_ns, begin buffering
+  • RECOVER       — arm with pps_count + pi_ns (symmetric with Teensy RECOVER)
   • STOP          — stop buffering, clear buffer, return to idle
   • SET_PPS_COUNT — re-arm pps_count (without lifecycle transition)
-  • SET_EPOCH     — set Pi tick epoch for pi_ns computation
+  • SET_EPOCH     — set Pi tick epoch directly (diagnostic/manual override)
   • GET_CAPTURE   — fetch a capture by pps_count (consume or peek)
   • REPORT        — latest capture + buffer state (non-destructive)
   • NS            — current chrony-disciplined time
@@ -333,6 +367,28 @@ def _compute_pi_ns(corrected: int) -> Optional[int]:
 
 
 # ---------------------------------------------------------------------
+# Epoch derivation from pi_ns
+# ---------------------------------------------------------------------
+
+
+def _derive_epoch_from_pi_ns(corrected: int, pi_ns: int) -> int:
+    """
+    Derive the Pi tick epoch from a corrected counter value and
+    the corresponding pi_ns at the same PPS edge.
+
+    This is the inverse of _compute_pi_ns:
+      pi_ns = (corrected - epoch) * 1e9 / freq
+      epoch = corrected - (pi_ns * freq / 1e9)
+
+    Used when CLOCKS sends a projected pi_ns value (via START or
+    RECOVER) and PITIMER needs to derive its internal epoch from
+    the first capture.
+    """
+    pi_ticks_elapsed = (pi_ns * PI_TIMER_FREQ) // NS_PER_SECOND
+    return corrected - pi_ticks_elapsed
+
+
+# ---------------------------------------------------------------------
 # Diagnostics (monotonic counters + last snapshots)
 # ---------------------------------------------------------------------
 
@@ -360,13 +416,16 @@ _diag: Dict[str, Any] = {
     # Epoch
     "epoch_set_requests": 0,
     "epoch_set_applied": 0,
+    "epoch_derived_from_pi_ns": 0,
     "epoch_value": None,
 
     # Lifecycle
     "starts": 0,
     "stops": 0,
+    "recovers": 0,
     "last_start": {},
     "last_stop": {},
+    "last_recover": {},
 
     # Last-seen values
     "last_time_key": None,
@@ -411,6 +470,12 @@ _last_pps_count_seen: Optional[int] = None
 # Epoch (Pi tick epoch for ns computation)
 _pi_tick_epoch: int = 0
 _epoch_set: bool = False
+
+# Pending pi_ns: set by START(pi_ns=X) or RECOVER(pi_ns=X).
+# Consumed by the capture loop on the first capture after arming.
+# The capture loop derives the epoch from corrected and pending_pi_ns,
+# then clears this value.
+_pending_pi_ns: Optional[int] = None
 
 # Delta tracking (always active — keeps running across START/STOP)
 _last_corrected: Optional[int] = None
@@ -542,8 +607,18 @@ def _capture_loop() -> None:
     When STOPPED: captures still update delta tracking and _last_capture
     for diagnostics, but are not buffered or assigned pps_count.
     The loop is calm — no warnings, no eviction concern.
+
+    Epoch derivation from pi_ns:
+      When _pending_pi_ns is set (by START or RECOVER), the first
+      capture pairs the projected pi_ns with the actual corrected
+      counter value at the same PPS edge to derive the epoch:
+        epoch = corrected - (pi_ns * freq / 1e9)
+      This eliminates the race condition inherent in separate
+      SET_EPOCH calls — the epoch is always derived from the same
+      physical PPS edge as the first buffered capture.
     """
     global _last_capture, _capture_seq, _last_corrected
+    global _pi_tick_epoch, _epoch_set, _pending_pi_ns
 
     logging.info("🚀 [pitimer] capture loop started — mode=%s", _capture_mode)
 
@@ -594,6 +669,27 @@ def _capture_loop() -> None:
                     continue
 
                 # RUNNING + armed: assign pps_count, compute pi_ns, buffer
+
+                # Derive epoch from pending pi_ns on first capture.
+                # This pairs the nanosecond projection with the actual
+                # hardware reading at the same physical PPS edge.
+                if _pending_pi_ns is not None:
+                    _pi_tick_epoch = _derive_epoch_from_pi_ns(
+                        corrected, _pending_pi_ns
+                    )
+                    _epoch_set = True
+
+                    _diag["epoch_derived_from_pi_ns"] += 1
+                    _diag["epoch_set_applied"] += 1
+                    _diag["epoch_value"] = _pi_tick_epoch
+
+                    logging.info(
+                        "📐 [pitimer] epoch derived from pi_ns=%d corrected=%d → epoch=%d",
+                        _pending_pi_ns, corrected, _pi_tick_epoch,
+                    )
+
+                    _pending_pi_ns = None
+
                 pps_count = _assign_pps_count()
                 cap["pps_count"] = int(pps_count)
 
@@ -622,19 +718,21 @@ def _capture_loop() -> None:
 
 def cmd_start(args: Optional[dict]) -> Dict[str, Any]:
     """
-    START(pps_count, [pi_tick_epoch])
+    START(pps_count, [pi_ns])
 
     Transition to RUNNING state:
       • Clears buffer and resets pps_count tracking.
       • Arms pps_count — next capture will be labeled pps_count==k.
-      • Optionally sets epoch for pi_ns computation.
-      • If epoch is not provided, CLOCKS must call SET_EPOCH separately.
+      • If pi_ns is provided, stores it as pending — the epoch will be
+        derived from the first capture (epoch = corrected - ticks_from_ns).
+      • If pi_ns is not provided, epoch is deferred — CLOCKS must call
+        SET_EPOCH separately (legacy/diagnostic path).
 
     Idempotent: calling START while already RUNNING restarts cleanly
     (stops, clears, re-arms).
     """
     global _running, _pps_armed, _pps_next_count, _last_pps_count_seen
-    global _last_capture, _pi_tick_epoch, _epoch_set
+    global _last_capture, _pi_tick_epoch, _epoch_set, _pending_pi_ns
 
     if not args or "pps_count" not in args:
         return {"success": False, "message": "BAD", "payload": {"error": "missing pps_count"}}
@@ -647,9 +745,18 @@ def cmd_start(args: Optional[dict]) -> Dict[str, Any]:
     if k < 0:
         return {"success": False, "message": "BAD", "payload": {"error": "pps_count must be >= 0"}}
 
-    # Optional epoch
+    # Optional pi_ns — if provided, epoch will be derived from first capture
+    pi_ns = args.get("pi_ns")
+    has_pi_ns = pi_ns is not None
+    if has_pi_ns:
+        try:
+            pi_ns = int(pi_ns)
+        except (ValueError, TypeError):
+            return {"success": False, "message": "BAD", "payload": {"error": "invalid pi_ns"}}
+
+    # Legacy support: also accept pi_tick_epoch for backward compatibility
     epoch = args.get("pi_tick_epoch")
-    has_epoch = epoch is not None
+    has_epoch = epoch is not None and not has_pi_ns
     if has_epoch:
         try:
             epoch = int(epoch)
@@ -664,21 +771,30 @@ def cmd_start(args: Optional[dict]) -> Dict[str, Any]:
         _last_capture = None
         _capture_buffer.clear()
 
-        if has_epoch:
-            _pi_tick_epoch = epoch
-            _epoch_set = True
-        else:
-            # Clear stale epoch from prior campaign
+        if has_pi_ns:
+            # Defer epoch derivation to first capture
+            _pending_pi_ns = pi_ns
             _pi_tick_epoch = 0
             _epoch_set = False
+        elif has_epoch:
+            # Legacy: direct epoch (backward compatibility)
+            _pi_tick_epoch = epoch
+            _epoch_set = True
+            _pending_pi_ns = None
+        else:
+            # No epoch info — clear stale epoch from prior campaign
+            _pi_tick_epoch = 0
+            _epoch_set = False
+            _pending_pi_ns = None
 
     _diag["starts"] += 1
     _diag["buffer_size_current"] = 0
     _diag["last_start"] = {
         "ts_utc": system_time_z(),
         "pps_count": int(k),
+        "pi_ns": pi_ns if has_pi_ns else None,
         "pi_tick_epoch": epoch if has_epoch else None,
-        "epoch_provided": has_epoch,
+        "epoch_source": "pi_ns" if has_pi_ns else ("direct" if has_epoch else "deferred"),
     }
     _diag["last_set_event"] = {
         "ts_utc": system_time_z(),
@@ -692,16 +808,107 @@ def cmd_start(args: Optional[dict]) -> Dict[str, Any]:
         _diag["epoch_value"] = epoch
 
     logging.info(
-        "▶️ [pitimer] START: pps_count=%d epoch=%s (buffer cleared, RUNNING)",
+        "▶️ [pitimer] START: pps_count=%d %s (buffer cleared, RUNNING)",
         k,
-        str(epoch) if has_epoch else "deferred",
+        f"pi_ns={pi_ns} (epoch deferred to first capture)"
+        if has_pi_ns
+        else (f"epoch={epoch}" if has_epoch else "epoch=deferred"),
     )
 
     payload: Dict[str, Any] = {"pps_count": int(k), "running": True}
-    if has_epoch:
+    if has_pi_ns:
+        payload["pi_ns"] = pi_ns
+        payload["epoch_source"] = "pi_ns"
+    elif has_epoch:
         payload["pi_tick_epoch"] = epoch
+        payload["epoch_source"] = "direct"
+    else:
+        payload["epoch_source"] = "deferred"
 
     return {"success": True, "message": "OK", "payload": payload}
+
+
+def cmd_recover(args: Optional[dict]) -> Dict[str, Any]:
+    """
+    RECOVER(pps_count, pi_ns)
+
+    Recovery entry point — symmetric with the Teensy's RECOVER command.
+    CLOCKS sends the projected pi_ns at the next PPS edge.  PITIMER
+    derives its own epoch from the first capture:
+      epoch = corrected - (pi_ns * freq / 1e9)
+
+    This eliminates all epoch-domain math from CLOCKS.  The same
+    formula (last_ns + elapsed * tau) projects every clock domain
+    forward during recovery — CLOCKS speaks only nanoseconds to
+    both the Teensy and PITIMER.
+
+    Behavior:
+      • Transitions to RUNNING (like START)
+      • Clears buffer and resets pps_count tracking
+      • Arms pps_count and stores pending pi_ns
+      • Epoch derived from first capture after arming
+    """
+    global _running, _pps_armed, _pps_next_count, _last_pps_count_seen
+    global _last_capture, _pi_tick_epoch, _epoch_set, _pending_pi_ns
+
+    if not args or "pps_count" not in args:
+        return {"success": False, "message": "BAD", "payload": {"error": "missing pps_count"}}
+
+    if "pi_ns" not in args:
+        return {"success": False, "message": "BAD", "payload": {"error": "missing pi_ns"}}
+
+    try:
+        k = int(args["pps_count"])
+    except Exception:
+        return {"success": False, "message": "BAD", "payload": {"error": "invalid pps_count"}}
+
+    if k < 0:
+        return {"success": False, "message": "BAD", "payload": {"error": "pps_count must be >= 0"}}
+
+    try:
+        pi_ns = int(args["pi_ns"])
+    except (ValueError, TypeError):
+        return {"success": False, "message": "BAD", "payload": {"error": "invalid pi_ns"}}
+
+    with _state_lock:
+        _running = True
+        _pps_armed = True
+        _pps_next_count = int(k)
+        _last_pps_count_seen = None
+        _last_capture = None
+        _capture_buffer.clear()
+        _pending_pi_ns = pi_ns
+        _pi_tick_epoch = 0
+        _epoch_set = False
+
+    _diag["recovers"] += 1
+    _diag["buffer_size_current"] = 0
+    _diag["last_recover"] = {
+        "ts_utc": system_time_z(),
+        "pps_count": int(k),
+        "pi_ns": pi_ns,
+    }
+    _diag["last_set_event"] = {
+        "ts_utc": system_time_z(),
+        "event": "recover",
+        "value": int(k),
+        "pi_ns": pi_ns,
+    }
+
+    logging.info(
+        "🔄 [pitimer] RECOVER: pps_count=%d pi_ns=%d (epoch deferred to first capture, RUNNING)",
+        k, pi_ns,
+    )
+
+    return {
+        "success": True, "message": "OK",
+        "payload": {
+            "pps_count": int(k),
+            "pi_ns": pi_ns,
+            "running": True,
+            "epoch_source": "pi_ns",
+        },
+    }
 
 
 def cmd_stop(_: Optional[dict]) -> Dict[str, Any]:
@@ -710,13 +917,13 @@ def cmd_stop(_: Optional[dict]) -> Dict[str, Any]:
 
     Transition to STOPPED state:
       • Stops buffering — captures continue but are not stored.
-      • Clears buffer and epoch.
+      • Clears buffer, epoch, and pending pi_ns.
       • Delta tracking continues uninterrupted.
 
     Idempotent: calling STOP while already STOPPED is a no-op success.
     """
     global _running, _pps_armed, _pps_next_count, _last_pps_count_seen
-    global _pi_tick_epoch, _epoch_set
+    global _pi_tick_epoch, _epoch_set, _pending_pi_ns
 
     with _state_lock:
         was_running = _running
@@ -727,6 +934,7 @@ def cmd_stop(_: Optional[dict]) -> Dict[str, Any]:
         _capture_buffer.clear()
         _pi_tick_epoch = 0
         _epoch_set = False
+        _pending_pi_ns = None
 
     _diag["stops"] += 1
     _diag["buffer_size_current"] = 0
@@ -754,9 +962,10 @@ def cmd_set_pps_count(args: Optional[dict]) -> Dict[str, Any]:
       • Next capture will be labeled pps_count==k, then increments each PPS.
       • Buffer is cleared — all prior captures are discarded.
       • Does NOT change RUNNING/STOPPED lifecycle state.
-      • Does NOT clear epoch (unlike START which clears stale epoch).
+      • Does NOT clear epoch or pending pi_ns (unlike START/RECOVER).
 
-    This is the low-level primitive.  Prefer START for campaign transitions.
+    This is the low-level primitive.  Prefer START or RECOVER for
+    campaign transitions.
     """
     global _pps_armed, _pps_next_count, _last_pps_count_seen, _last_capture
 
@@ -790,41 +999,6 @@ def cmd_set_pps_count(args: Optional[dict]) -> Dict[str, Any]:
     return {"success": True, "message": "OK", "payload": {"pps_count": int(k)}}
 
 
-def cmd_set_epoch(args: Optional[dict]) -> Dict[str, Any]:
-    """
-    SET_EPOCH(pi_tick_epoch)
-
-    Sets the Pi tick epoch for campaign-relative pi_ns computation.
-    All subsequent captures will have pi_ns = (corrected - epoch) * 1e9 / freq.
-
-    Called by CLOCKS after the sync fragment arrives (when epoch was not
-    provided in START).
-    """
-    global _pi_tick_epoch, _epoch_set
-
-    if not args or "pi_tick_epoch" not in args:
-        return {"success": False, "message": "BAD", "payload": {"error": "missing pi_tick_epoch"}}
-
-    try:
-        epoch = int(args["pi_tick_epoch"])
-    except (ValueError, TypeError):
-        return {"success": False, "message": "BAD", "payload": {"error": "invalid pi_tick_epoch"}}
-
-    _pi_tick_epoch = epoch
-    _epoch_set = True
-
-    _diag["epoch_set_requests"] += 1
-    _diag["epoch_set_applied"] += 1
-    _diag["epoch_value"] = epoch
-
-    logging.info("📐 [pitimer] epoch set: pi_tick_epoch=%d", epoch)
-
-    return {
-        "success": True, "message": "OK",
-        "payload": {"pi_tick_epoch": epoch},
-    }
-
-
 def cmd_get_capture(args: Optional[dict]) -> Dict[str, Any]:
     """
     GET_CAPTURE(pps_count=N, [peek=false])
@@ -839,13 +1013,7 @@ def cmd_get_capture(args: Optional[dict]) -> Dict[str, Any]:
     Peek mode (peek=true):
       Returns a COPY of the capture WITHOUT removing it from the buffer.
       The capture remains available for subsequent GET_CAPTURE (consume)
-      or peek calls.  This is used by CLOCKS during START/RECOVER epoch
-      computation to read the corrected value at the sync edge without
-      stealing it from the processor thread.
-
-      This eliminates the epoch race condition where _pitimer_report()
-      could return a later edge's corrected value if PPS edges advanced
-      between the sync fragment arriving and the REPORT IPC completing.
+      or peek calls.
 
     Returns success=false with message="NOT_FOUND" if the pps_count
     is not in the buffer.
@@ -982,6 +1150,7 @@ def cmd_report(_: Optional[dict]) -> Dict[str, Any]:
         cap = dict(_last_capture) if _last_capture else None
         next_pps = int(_pps_next_count)
         buf_keys = list(_capture_buffer.keys())
+        pending = _pending_pi_ns
 
     with _capture_mode_lock:
         mode = _capture_mode
@@ -998,6 +1167,7 @@ def cmd_report(_: Optional[dict]) -> Dict[str, Any]:
         "pps_armed": armed,
         "epoch_set": _epoch_set,
         "pi_tick_epoch": _pi_tick_epoch if _epoch_set else None,
+        "pending_pi_ns": pending,
         "next_pps_count": next_pps if running else None,
         "freq": PI_TIMER_FREQ,
         "ns_per_tick": round(NS_PER_TICK, 3),
@@ -1023,16 +1193,19 @@ def cmd_report(_: Optional[dict]) -> Dict[str, Any]:
             "pps_count_jump": _diag["pps_count_jump"],
             "epoch_set_requests": _diag["epoch_set_requests"],
             "epoch_set_applied": _diag["epoch_set_applied"],
+            "epoch_derived_from_pi_ns": _diag["epoch_derived_from_pi_ns"],
             "last_seq": _diag["last_seq"],
             "last_time_key": _diag["last_time_key"],
             "last_pps_count": _diag["last_pps_count"],
             "starts": _diag["starts"],
             "stops": _diag["stops"],
+            "recovers": _diag["recovers"],
             "mode_changes": _diag["mode_changes"],
             "last_mode_change": _diag.get("last_mode_change", {}),
         },
         "last_start": _diag.get("last_start", {}),
         "last_stop": _diag.get("last_stop", {}),
+        "last_recover": _diag.get("last_recover", {}),
         "last_set_event": _diag.get("last_set_event", {}),
         "last_pps_count_anomaly": _diag.get("last_pps_count_anomaly", {}),
         "last_capture_exception": _diag.get("last_capture_exception", {}),
@@ -1080,9 +1253,9 @@ def cmd_ns(_: Optional[dict]) -> Dict[str, Any]:
 
 COMMANDS = {
     "START": cmd_start,
+    "RECOVER": cmd_recover,
     "STOP": cmd_stop,
     "SET_PPS_COUNT": cmd_set_pps_count,
-    "SET_EPOCH": cmd_set_epoch,
     "GET_CAPTURE": cmd_get_capture,
     "REPORT": cmd_report,
     "NS": cmd_ns,
@@ -1101,16 +1274,17 @@ def run() -> None:
     setup_logging()
 
     logging.info(
-        "⏱️ [pitimer] starting — Pi Clock Authority (v3 START/STOP lifecycle). "
+        "⏱️ [pitimer] starting — Pi Clock Authority (v4 nanosecond recovery). "
         "freq=%d Hz, %.3f ns/tick. "
         "STOPPED at boot — capture loop runs, buffering disabled. "
-        "START(pps_count, [epoch]) begins buffering. "
+        "START(pps_count, [pi_ns]) begins buffering. "
+        "RECOVER(pps_count, pi_ns) for campaign recovery. "
         "STOP returns to idle. "
         "SET_PPS_COUNT and SET_EPOCH available as independent primitives. "
         "Captures buffered by pps_count (dynamic, max=%d). "
         "GET_CAPTURE consumes by pps_count identity (peek=true for non-destructive). "
         "Default mode: LOOP. "
-        "Commands: START, STOP, SET_PPS_COUNT, SET_EPOCH, GET_CAPTURE, "
+        "Commands: START, RECOVER, STOP, SET_PPS_COUNT, SET_EPOCH, GET_CAPTURE, "
         "REPORT, NS, SET_MODE, GET_MODE.",
         PI_TIMER_FREQ,
         NS_PER_TICK,

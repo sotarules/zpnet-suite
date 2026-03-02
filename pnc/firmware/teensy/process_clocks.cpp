@@ -101,12 +101,21 @@
 //
 //   When the Pi restarts mid-campaign, it reads the last TIMEBASE
 //   from Postgres, projects all clock values forward using tau,
-//   and sends RECOVER with the projected dwt_cycles, gnss_ns, and
-//   ocxo_ns.  At the next PPS edge, the Teensy loads these values
-//   into its 64-bit accumulators, latches the current hardware
-//   register positions, transitions to STARTED, and resumes
-//   publishing TIMEBASE_FRAGMENTs.  The clocks continue as if
-//   the interruption never happened.
+//   and sends RECOVER with the projected dwt_ns, gnss_ns, and
+//   ocxo_ns — all nanosecond values.  The Teensy derives its own
+//   internal cycle/tick counts from the nanosecond values using
+//   its known conversion ratios (DWT: ns * 126/125, GNSS/OCXO:
+//   ns / 100).  At the next PPS edge, the Teensy loads these
+//   values into its 64-bit accumulators, latches the current
+//   hardware register positions, transitions to STARTED, and
+//   resumes publishing TIMEBASE_FRAGMENTs.  The clocks continue
+//   as if the interruption never happened.
+//
+//   The cycle count is an internal implementation detail of the
+//   Teensy — CLOCKS on the Pi speaks only nanoseconds.  This
+//   makes recovery symmetric across all clock domains: the same
+//   formula (last_ns + elapsed * tau) computes the projected
+//   nanosecond value for every domain.
 //
 // Pre-PPS Software TDC (Time-to-Digital Converter):
 //
@@ -192,6 +201,14 @@ static inline uint32_t dwt_cycles_to_ns_32(uint32_t cycles) {
   return (cycles * (uint32_t)DWT_NS_NUM) / (uint32_t)DWT_NS_DEN;
 }
 
+// Inverse: convert nanoseconds to DWT cycles.
+// At 1008 MHz: cycles = ns * 126 / 125 (exact rational inverse).
+// Used during recovery to derive the internal cycle accumulator
+// from the nanosecond value supplied by the Pi.
+static inline uint64_t dwt_ns_to_cycles(uint64_t ns) {
+  return (ns * DWT_NS_DEN) / DWT_NS_NUM;
+}
+
 // ============================================================================
 // Campaign State
 // ============================================================================
@@ -212,10 +229,12 @@ static volatile bool request_start   = false;
 static volatile bool request_stop    = false;
 static volatile bool request_recover = false;
 
-// Recovery parameters (authoritative, supplied by Pi)
-static uint64_t recover_dwt_cycles = 0;
-static uint64_t recover_gnss_ns    = 0;
-static uint64_t recover_ocxo_ns    = 0;
+// Recovery parameters — all nanoseconds (supplied by Pi).
+// The Teensy derives its own internal cycle/tick counts from these
+// using its known conversion ratios at the PPS boundary.
+static uint64_t recover_dwt_ns  = 0;
+static uint64_t recover_gnss_ns = 0;
+static uint64_t recover_ocxo_ns = 0;
 
 // Campaign-scoped PPS second counter
 static uint64_t campaign_seconds = 0;
@@ -933,7 +952,337 @@ static void pre_pps_arm(void) {
 }
 
 // ============================================================================
-// PPS handling
+// PPS handling — Phase 2: ASAP callback (scheduled context)
+// ============================================================================
+//
+// This is the deferred callback invoked by the PPS ISR via timepop.
+// It runs in scheduled context (not ISR), so timepop_arm is safe.
+//
+// Responsibilities:
+//   1. Arm the PPS relay deassert timer (always, regardless of state)
+//   2. Process campaign state transitions (start/stop/recover)
+//   3. Recover 64-bit values at the PPS edge via advance-then-rewind
+//   4. Compute dispatch latency and Software TDC correction
+//   5. Update Welford residual statistics
+//   6. Run OCXO calibration servo
+//   7. Build and publish TIMEBASE_FRAGMENT
+//
+
+static volatile bool pps_scheduled = false;
+
+static void pps_asap_callback(timepop_ctx_t*, void*) {
+
+  if (relay_arm_pending) {
+      relay_arm_pending = false;
+      if (!relay_timer_active) {
+          relay_timer_active = true;
+          timepop_arm(TIMEPOP_CLASS_PPS_RELAY, false, pps_relay_deassert, nullptr, "pps-relay-off");
+      }
+  }
+
+  // --------------------------------------------------------
+  // Campaign state transitions
+  // --------------------------------------------------------
+
+  if (request_stop) {
+    campaign_state = clocks_campaign_state_t::STOPPED;
+    request_stop = false;
+
+    // Cancel any pending pre-PPS timers
+    timepop_cancel(TIMEPOP_CLASS_PRE_PPS_COARSE);
+    timepop_cancel(TIMEPOP_CLASS_PRE_PPS);
+    dispatch_shadow_valid = false;
+    pps_fired = true;  // break spin loop if it's running
+
+    // Stop calibration servo (DAC value is preserved)
+    calibrate_ocxo_active = false;
+  }
+
+  if (request_recover) {
+    // --------------------------------------------------------
+    // Recovery: load nanosecond values into accumulators.
+    //
+    // The Pi supplies dwt_ns, gnss_ns, ocxo_ns — all nanoseconds.
+    // The Teensy derives internal cycle/tick counts:
+    //   DWT:  cycles = ns * 126 / 125  (dwt_ns_to_cycles)
+    //   GNSS: ticks  = ns / 100
+    //   OCXO: ticks  = ns / 100
+    //
+    // Anchor last_32 at the ISR snapshot so the next _now()
+    // call correctly accumulates from the PPS edge forward.
+    // --------------------------------------------------------
+
+    dwt_cycles_64 = dwt_ns_to_cycles(recover_dwt_ns);
+    dwt_last_32   = isr_snap_dwt;
+
+    gnss_ticks_64 = recover_gnss_ns / 100ull;
+    gnss_last_32  = isr_snap_gnss;
+
+    ocxo_ticks_64 = recover_ocxo_ns / 100ull;
+    ocxo_last_32  = isr_snap_ocxo;
+
+    campaign_seconds = recover_gnss_ns / 1000000000ull;
+
+    residual_reset(residual_dwt);
+    residual_reset(residual_gnss);
+    residual_reset(residual_ocxo);
+
+    // ISR residuals will become valid on the next PPS
+    isr_residual_valid = false;
+
+    // Reset pre-PPS dispatch profiling
+    dispatch_shadow_valid = false;
+    pps_fired = true;  // break spin loop if running
+    dispatch_shadow_ns     = -1;
+    dispatch_isr_ns        = -1;
+    dispatch_delta_ns      = -1;
+    pps_edge_ns            = -1;
+    pps_edge_correction_ns = -1;
+    pps_edge_valid         = false;
+    pre_pps_approach_ns    = -1;
+
+    campaign_state = clocks_campaign_state_t::STARTED;
+    request_recover = false;
+  }
+
+  if (request_start) {
+    clocks_zero_all();
+    campaign_state = clocks_campaign_state_t::STARTED;
+    request_start = false;
+  }
+
+  if (campaign_state == clocks_campaign_state_t::STARTED) {
+
+    // Mark ISR residuals as valid for the NEXT PPS
+    // (the first PPS after start has no prior snapshot
+    // to delta against — this flag was cleared by
+    // clocks_zero_all or recover, so the ISR won't
+    // compute residuals until the second PPS)
+    if (!isr_residual_valid) {
+      isr_residual_valid = true;
+    }
+
+    // --------------------------------------------------------
+    // Pre-PPS approach time (computed before 64-bit extension
+    // because it uses raw 32-bit GNSS snapshots only)
+    // --------------------------------------------------------
+
+    if (dispatch_shadow_valid) {
+      int32_t approach_ticks = (int32_t)(isr_snap_gnss - pre_pps_entry_gnss);
+      pre_pps_approach_ns = approach_ticks * 100;
+    } else if (dispatch_timeout) {
+      pre_pps_approach_ns = -1;
+      dispatch_timeout    = false;
+    }
+
+    // --------------------------------------------------------
+    // Arm pre-PPS chain for the NEXT PPS edge
+    // --------------------------------------------------------
+
+    pre_pps_arm();
+
+    // Clear pps_fired so the spin callback doesn't see the
+    // stale flag from THIS PPS.  The spin callback will set
+    // it to false again at entry, but if it checks before
+    // clearing, it would see true and bail out as "late".
+    pps_fired = false;
+
+    // --------------------------------------------------------
+    // Recover 64-bit values at the PPS edge
+    //
+    // Uses advance-then-rewind: each _at_pps_edge() call
+    // first advances the accumulator to the present via
+    // _now(), then rewinds by the small delta between the
+    // live register and the ISR snapshot.
+    //
+    // This is safe regardless of any intervening _now()
+    // calls (e.g. from cmd_report) because _now() only
+    // moves forward, and the rewind is always the correct
+    // small positive offset from isr_snap to last_32.
+    // --------------------------------------------------------
+
+    const uint64_t snap_dwt_cycles = dwt_at_pps_edge();
+    const uint64_t snap_gnss_ticks = gnss_at_pps_edge();
+    const uint64_t snap_ocxo_ticks = ocxo_at_pps_edge();
+
+    const uint64_t snap_dwt_ns  = dwt_cycles_to_ns(snap_dwt_cycles);
+    const uint64_t snap_gnss_ns = snap_gnss_ticks * 100ull;
+    const uint64_t snap_ocxo_ns = snap_ocxo_ticks * 100ull;
+
+    // --------------------------------------------------------
+    // Pre-PPS dispatch latency and Software TDC correction.
+    //
+    // The spin loop + ISR capture gives us two DWT values:
+    //   isr_snap_dwt           — DWT_CYCCNT read in ISR
+    //   isr_captured_shadow_dwt — last shadow before ISR
+    //
+    // delta_cycles = isr - shadow tells us which instruction
+    // was executing when the interrupt fired.  Subtracting
+    // the fixed overhead gives the correction: cycles between
+    // shadow write and true PPS edge.
+    //
+    // The corrected PPS edge becomes the definitive DWT
+    // value for this PPS.  All downstream calculations
+    // (residuals, tau, published dwt_cycles/dwt_ns) use it.
+    //
+    // NOTE: TDC correction is DISABLED until the correction
+    // table is re-derived at 1008 MHz.  The ISR snapshot
+    // is used as fallback.  Dispatch latency diagnostics
+    // are still computed and published for analysis.
+    // --------------------------------------------------------
+
+    // Start with ISR values as fallback
+    uint64_t pps_dwt_cycles = snap_dwt_cycles;
+    uint64_t pps_dwt_ns     = snap_dwt_ns;
+
+    if (dispatch_shadow_valid) {
+      uint32_t delta_cycles = isr_snap_dwt - isr_captured_shadow_dwt;
+      int64_t  delta_ns     = (int64_t)dwt_cycles_to_ns_32(delta_cycles);
+
+      // Dispatch profiling values (diagnostic)
+      dispatch_isr_ns    = (int64_t)snap_dwt_ns;
+      dispatch_delta_ns  = delta_ns;
+      dispatch_shadow_ns = (int64_t)snap_dwt_ns - delta_ns;
+
+      int32_t correction = tdc_correction_cycles(delta_cycles);
+      if (correction >= 0) {
+        // Valid correction: reconstruct the true PPS edge.
+        //
+        // The snap_dwt_cycles is the 64-bit value at the ISR
+        // snapshot.  The correction tells us the ISR was
+        // (overhead) cycles after the true PPS edge:
+        uint32_t overhead_cycles = delta_cycles - (uint32_t)correction;
+        pps_dwt_cycles       = snap_dwt_cycles - overhead_cycles;
+        pps_dwt_ns           = dwt_cycles_to_ns(pps_dwt_cycles);
+
+        pps_edge_ns            = (int64_t)pps_dwt_ns;
+        pps_edge_correction_ns = (int32_t)dwt_cycles_to_ns_32(correction);
+        pps_edge_valid         = true;
+      } else {
+        // delta_cycles out of expected range (or TDC needs
+        // recalibration) — use ISR value
+        pps_edge_ns            = -1;
+        pps_edge_correction_ns = -1;
+        pps_edge_valid         = false;
+      }
+
+      dispatch_shadow_valid = false;
+    } else {
+      // Spin loop didn't run this cycle (late, timeout, or not armed).
+      dispatch_shadow_ns     = -1;
+      dispatch_isr_ns        = -1;
+      dispatch_delta_ns      = -1;
+      pps_edge_ns            = -1;
+      pps_edge_correction_ns = -1;
+      pps_edge_valid         = false;
+      dispatch_timeout       = false;
+    }
+
+    // --------------------------------------------------------
+    // Callback-level Welford residual tracking
+    //
+    // Uses the TDC-corrected DWT cycles when available.
+    // GNSS and OCXO are unaffected (no dispatch correction).
+    // --------------------------------------------------------
+
+    residual_update(residual_dwt,  pps_dwt_cycles, DWT_EXPECTED_PER_PPS);
+    residual_update(residual_gnss, snap_gnss_ticks, GNSS_EXPECTED_PER_PPS);
+    residual_update(residual_ocxo, snap_ocxo_ticks, OCXO_EXPECTED_PER_PPS);
+
+    // --------------------------------------------------------
+    // OCXO calibration servo (if active)
+    // --------------------------------------------------------
+
+    ocxo_calibration_servo();
+
+    // --------------------------------------------------------
+    // Publish TIMEBASE_FRAGMENT
+    // --------------------------------------------------------
+
+    Payload p;
+    p.add("campaign",         campaign_name);
+
+    // Definitive DWT state at PPS edge (TDC-corrected when valid,
+    // ISR snapshot as fallback).  All downstream consumers use these.
+    p.add("dwt_cycles",       pps_dwt_cycles);
+    p.add("dwt_ns",           pps_dwt_ns);
+    p.add("gnss_ns",          snap_gnss_ns);
+    p.add("ocxo_ns",          snap_ocxo_ns);
+    p.add("teensy_pps_count", campaign_seconds);
+    p.add("gnss_lock",        digitalRead(GNSS_LOCK_PIN));
+
+    // Callback-level residuals (from 64-bit extended values)
+    p.add("dwt_pps_residual",  residual_dwt.residual);
+    p.add("gnss_pps_residual", residual_gnss.residual);
+    p.add("ocxo_pps_residual", residual_ocxo.residual);
+
+    // ISR-level raw residuals (from 32-bit register snapshots)
+    // These are the purest measurement — computed in the ISR
+    // with zero processing between PPS edge and subtraction.
+    p.add("isr_residual_dwt",  isr_residual_dwt);
+    p.add("isr_residual_gnss", isr_residual_gnss);
+    p.add("isr_residual_ocxo", isr_residual_ocxo);
+    p.add("isr_residual_valid", isr_residual_valid);
+
+    // Pre-PPS dispatch latency profiling (nanoseconds).
+    // All three values use the 64-bit extended DWT clock.
+    // shadow = last spin loop DWT ns before ISR fired
+    // isr = DWT ns captured as first ISR instruction
+    // delta = isr - shadow = true dispatch latency
+    // approach = GNSS ns from spin loop entry to PPS edge
+    // -1 = not yet available or timeout.
+    p.add("dispatch_shadow_ns",  dispatch_shadow_ns);
+    p.add("dispatch_isr_ns",     dispatch_isr_ns);
+    p.add("dispatch_delta_ns",   dispatch_delta_ns);
+    p.add("pre_pps_approach_ns", pre_pps_approach_ns);
+    p.add("dispatch_timeout",    (bool)dispatch_timeout);
+
+    // Software TDC correction diagnostics.
+    // When pps_edge_valid is true, dwt_cycles and dwt_ns above
+    // are the TDC-corrected values (source of truth).
+    // When false, they fall back to the ISR snapshot.
+    p.add("pps_edge_valid",         pps_edge_valid);
+    p.add("pps_edge_correction_ns", pps_edge_correction_ns);
+
+    // TDC recalibration flag — true means TDC constants are
+    // stale (from 600 MHz) and correction is disabled.
+    p.add("tdc_needs_recal",        TDC_NEEDS_RECALIBRATION);
+
+    // OCXO DAC control state (always present, unconditional)
+    p.add("ocxo_dac",              ocxo_dac_value);
+    p.add("calibrate_ocxo",        calibrate_ocxo_active);
+    p.add("servo_adjustments",     servo_adjustments);
+
+    // Dispatch profiling diagnostics
+    p.add("diag_coarse_fires",   diag_coarse_fire_count);
+    p.add("diag_fine_fires",     diag_fine_fire_count);
+    p.add("diag_late",           diag_fine_late_count);
+    p.add("diag_spins",          diag_spin_count);
+    p.add("diag_timeouts",       diag_timeout_count);
+    p.add("diag_fine_was_late",  diag_fine_was_late);
+    p.add("diag_spin_iters",     diag_spin_iterations);
+
+    // Raw 32-bit DWT cycle values for debugging.
+    p.add("diag_raw_isr_cyc",    (uint32_t)isr_snap_dwt);
+    p.add("diag_raw_shadow_cyc", (uint32_t)isr_captured_shadow_dwt);
+
+    // Raw ISR snapshot (64-bit extended, before TDC correction).
+    // These are what dwt_cycles/dwt_ns used to be before the TDC.
+    p.add("diag_isr_dwt_cycles", snap_dwt_cycles);
+    p.add("diag_isr_dwt_ns",     snap_dwt_ns);
+
+    publish("TIMEBASE_FRAGMENT", p);
+
+    if (campaign_state == clocks_campaign_state_t::STARTED) {
+      campaign_seconds++;
+    }
+  }
+
+  pps_scheduled = false;
+}
+
+// ============================================================================
+// PPS handling — Phase 1: ISR (minimum latency)
 // ============================================================================
 //
 // Two-phase architecture:
@@ -946,14 +1295,8 @@ static void pre_pps_arm(void) {
 //   timer arming.
 //   NO timepop_arm calls from ISR context.
 //
-//   Phase 2 (timepop ASAP callback): Arm the relay deassert
-//   timer first (always, regardless of campaign state), then
-//   use advance-then-rewind to recover 64-bit values at the
-//   PPS edge, process state transitions, compute Welford
-//   statistics, build and publish the TIMEBASE_FRAGMENT.
+//   Phase 2 (timepop ASAP callback): pps_asap_callback() above.
 //
-
-static volatile bool pps_scheduled = false;
 
 static void pps_isr(void) {
 
@@ -1044,306 +1387,7 @@ static void pps_isr(void) {
   timepop_arm(
     TIMEPOP_CLASS_ASAP,
     false,
-    [](timepop_ctx_t*, void*) {
-
-      if (relay_arm_pending) {
-          relay_arm_pending = false;
-          if (!relay_timer_active) {
-              relay_timer_active = true;
-              timepop_arm(TIMEPOP_CLASS_PPS_RELAY, false, pps_relay_deassert, nullptr, "pps-relay-off");
-          }
-      }
-
-      // --------------------------------------------------------
-      // Campaign state transitions
-      // --------------------------------------------------------
-
-      if (request_stop) {
-        campaign_state = clocks_campaign_state_t::STOPPED;
-        request_stop = false;
-
-        // Cancel any pending pre-PPS timers
-        timepop_cancel(TIMEPOP_CLASS_PRE_PPS_COARSE);
-        timepop_cancel(TIMEPOP_CLASS_PRE_PPS);
-        dispatch_shadow_valid = false;
-        pps_fired = true;  // break spin loop if it's running
-
-        // Stop calibration servo (DAC value is preserved)
-        calibrate_ocxo_active = false;
-      }
-
-      if (request_recover) {
-        // Load projected values into accumulators.
-        // Anchor last_32 at the ISR snapshot so the next _now()
-        // call correctly accumulates from the PPS edge forward.
-        dwt_cycles_64 = recover_dwt_cycles;
-        dwt_last_32   = isr_snap_dwt;
-
-        gnss_ticks_64 = recover_gnss_ns / 100ull;
-        gnss_last_32  = isr_snap_gnss;
-
-        ocxo_ticks_64 = recover_ocxo_ns / 100ull;
-        ocxo_last_32  = isr_snap_ocxo;
-
-        campaign_seconds = recover_gnss_ns / 1000000000ull;
-
-        residual_reset(residual_dwt);
-        residual_reset(residual_gnss);
-        residual_reset(residual_ocxo);
-
-        // ISR residuals will become valid on the next PPS
-        isr_residual_valid = false;
-
-        // Reset pre-PPS dispatch profiling
-        dispatch_shadow_valid = false;
-        pps_fired = true;  // break spin loop if running
-        dispatch_shadow_ns     = -1;
-        dispatch_isr_ns        = -1;
-        dispatch_delta_ns      = -1;
-        pps_edge_ns            = -1;
-        pps_edge_correction_ns = -1;
-        pps_edge_valid         = false;
-        pre_pps_approach_ns    = -1;
-
-        campaign_state = clocks_campaign_state_t::STARTED;
-        request_recover = false;
-      }
-
-      if (request_start) {
-        clocks_zero_all();
-        campaign_state = clocks_campaign_state_t::STARTED;
-        request_start = false;
-      }
-
-      if (campaign_state == clocks_campaign_state_t::STARTED) {
-
-        // Mark ISR residuals as valid for the NEXT PPS
-        // (the first PPS after start has no prior snapshot
-        // to delta against — this flag was cleared by
-        // clocks_zero_all or recover, so the ISR won't
-        // compute residuals until the second PPS)
-        if (!isr_residual_valid) {
-          isr_residual_valid = true;
-        }
-
-        // --------------------------------------------------------
-        // Pre-PPS approach time (computed before 64-bit extension
-        // because it uses raw 32-bit GNSS snapshots only)
-        // --------------------------------------------------------
-
-        if (dispatch_shadow_valid) {
-          int32_t approach_ticks = (int32_t)(isr_snap_gnss - pre_pps_entry_gnss);
-          pre_pps_approach_ns = approach_ticks * 100;
-        } else if (dispatch_timeout) {
-          pre_pps_approach_ns = -1;
-          dispatch_timeout    = false;
-        }
-
-        // --------------------------------------------------------
-        // Arm pre-PPS chain for the NEXT PPS edge
-        // --------------------------------------------------------
-
-        pre_pps_arm();
-
-        // Clear pps_fired so the spin callback doesn't see the
-        // stale flag from THIS PPS.  The spin callback will set
-        // it to false again at entry, but if it checks before
-        // clearing, it would see true and bail out as "late".
-        pps_fired = false;
-
-        // --------------------------------------------------------
-        // Recover 64-bit values at the PPS edge
-        //
-        // Uses advance-then-rewind: each _at_pps_edge() call
-        // first advances the accumulator to the present via
-        // _now(), then rewinds by the small delta between the
-        // live register and the ISR snapshot.
-        //
-        // This is safe regardless of any intervening _now()
-        // calls (e.g. from cmd_report) because _now() only
-        // moves forward, and the rewind is always the correct
-        // small positive offset from isr_snap to last_32.
-        // --------------------------------------------------------
-
-        const uint64_t snap_dwt_cycles = dwt_at_pps_edge();
-        const uint64_t snap_gnss_ticks = gnss_at_pps_edge();
-        const uint64_t snap_ocxo_ticks = ocxo_at_pps_edge();
-
-        const uint64_t snap_dwt_ns  = dwt_cycles_to_ns(snap_dwt_cycles);
-        const uint64_t snap_gnss_ns = snap_gnss_ticks * 100ull;
-        const uint64_t snap_ocxo_ns = snap_ocxo_ticks * 100ull;
-
-        // --------------------------------------------------------
-        // Pre-PPS dispatch latency and Software TDC correction.
-        //
-        // The spin loop + ISR capture gives us two DWT values:
-        //   isr_snap_dwt           — DWT_CYCCNT read in ISR
-        //   isr_captured_shadow_dwt — last shadow before ISR
-        //
-        // delta_cycles = isr - shadow tells us which instruction
-        // was executing when the interrupt fired.  Subtracting
-        // the fixed overhead gives the correction: cycles between
-        // shadow write and true PPS edge.
-        //
-        // The corrected PPS edge becomes the definitive DWT
-        // value for this PPS.  All downstream calculations
-        // (residuals, tau, published dwt_cycles/dwt_ns) use it.
-        //
-        // NOTE: TDC correction is DISABLED until the correction
-        // table is re-derived at 1008 MHz.  The ISR snapshot
-        // is used as fallback.  Dispatch latency diagnostics
-        // are still computed and published for analysis.
-        // --------------------------------------------------------
-
-        // Start with ISR values as fallback
-        uint64_t pps_dwt_cycles = snap_dwt_cycles;
-        uint64_t pps_dwt_ns     = snap_dwt_ns;
-
-        if (dispatch_shadow_valid) {
-          uint32_t delta_cycles = isr_snap_dwt - isr_captured_shadow_dwt;
-          int64_t  delta_ns     = (int64_t)dwt_cycles_to_ns_32(delta_cycles);
-
-          // Dispatch profiling values (diagnostic)
-          dispatch_isr_ns    = (int64_t)snap_dwt_ns;
-          dispatch_delta_ns  = delta_ns;
-          dispatch_shadow_ns = (int64_t)snap_dwt_ns - delta_ns;
-
-          int32_t correction = tdc_correction_cycles(delta_cycles);
-          if (correction >= 0) {
-            // Valid correction: reconstruct the true PPS edge.
-            //
-            // The snap_dwt_cycles is the 64-bit value at the ISR
-            // snapshot.  The correction tells us the ISR was
-            // (overhead) cycles after the true PPS edge:
-            uint32_t overhead_cycles = delta_cycles - (uint32_t)correction;
-            pps_dwt_cycles       = snap_dwt_cycles - overhead_cycles;
-            pps_dwt_ns           = dwt_cycles_to_ns(pps_dwt_cycles);
-
-            pps_edge_ns            = (int64_t)pps_dwt_ns;
-            pps_edge_correction_ns = (int32_t)dwt_cycles_to_ns_32(correction);
-            pps_edge_valid         = true;
-          } else {
-            // delta_cycles out of expected range (or TDC needs
-            // recalibration) — use ISR value
-            pps_edge_ns            = -1;
-            pps_edge_correction_ns = -1;
-            pps_edge_valid         = false;
-          }
-
-          dispatch_shadow_valid = false;
-        } else {
-          // Spin loop didn't run this cycle (late, timeout, or not armed).
-          dispatch_shadow_ns     = -1;
-          dispatch_isr_ns        = -1;
-          dispatch_delta_ns      = -1;
-          pps_edge_ns            = -1;
-          pps_edge_correction_ns = -1;
-          pps_edge_valid         = false;
-          dispatch_timeout       = false;
-        }
-
-        // --------------------------------------------------------
-        // Callback-level Welford residual tracking
-        //
-        // Uses the TDC-corrected DWT cycles when available.
-        // GNSS and OCXO are unaffected (no dispatch correction).
-        // --------------------------------------------------------
-
-        residual_update(residual_dwt,  pps_dwt_cycles, DWT_EXPECTED_PER_PPS);
-        residual_update(residual_gnss, snap_gnss_ticks, GNSS_EXPECTED_PER_PPS);
-        residual_update(residual_ocxo, snap_ocxo_ticks, OCXO_EXPECTED_PER_PPS);
-
-        // --------------------------------------------------------
-        // OCXO calibration servo (if active)
-        // --------------------------------------------------------
-
-        ocxo_calibration_servo();
-
-        // --------------------------------------------------------
-        // Publish TIMEBASE_FRAGMENT
-        // --------------------------------------------------------
-
-        Payload p;
-        p.add("campaign",         campaign_name);
-
-        // Definitive DWT state at PPS edge (TDC-corrected when valid,
-        // ISR snapshot as fallback).  All downstream consumers use these.
-        p.add("dwt_cycles",       pps_dwt_cycles);
-        p.add("dwt_ns",           pps_dwt_ns);
-        p.add("gnss_ns",          snap_gnss_ns);
-        p.add("ocxo_ns",          snap_ocxo_ns);
-        p.add("teensy_pps_count", campaign_seconds);
-        p.add("gnss_lock",        digitalRead(GNSS_LOCK_PIN));
-
-        // Callback-level residuals (from 64-bit extended values)
-        p.add("dwt_pps_residual",  residual_dwt.residual);
-        p.add("gnss_pps_residual", residual_gnss.residual);
-        p.add("ocxo_pps_residual", residual_ocxo.residual);
-
-        // ISR-level raw residuals (from 32-bit register snapshots)
-        // These are the purest measurement — computed in the ISR
-        // with zero processing between PPS edge and subtraction.
-        p.add("isr_residual_dwt",  isr_residual_dwt);
-        p.add("isr_residual_gnss", isr_residual_gnss);
-        p.add("isr_residual_ocxo", isr_residual_ocxo);
-        p.add("isr_residual_valid", isr_residual_valid);
-
-        // Pre-PPS dispatch latency profiling (nanoseconds).
-        // All three values use the 64-bit extended DWT clock.
-        // shadow = last spin loop DWT ns before ISR fired
-        // isr = DWT ns captured as first ISR instruction
-        // delta = isr - shadow = true dispatch latency
-        // approach = GNSS ns from spin loop entry to PPS edge
-        // -1 = not yet available or timeout.
-        p.add("dispatch_shadow_ns",  dispatch_shadow_ns);
-        p.add("dispatch_isr_ns",     dispatch_isr_ns);
-        p.add("dispatch_delta_ns",   dispatch_delta_ns);
-        p.add("pre_pps_approach_ns", pre_pps_approach_ns);
-        p.add("dispatch_timeout",    (bool)dispatch_timeout);
-
-        // Software TDC correction diagnostics.
-        // When pps_edge_valid is true, dwt_cycles and dwt_ns above
-        // are the TDC-corrected values (source of truth).
-        // When false, they fall back to the ISR snapshot.
-        p.add("pps_edge_valid",         pps_edge_valid);
-        p.add("pps_edge_correction_ns", pps_edge_correction_ns);
-
-        // TDC recalibration flag — true means TDC constants are
-        // stale (from 600 MHz) and correction is disabled.
-        p.add("tdc_needs_recal",        TDC_NEEDS_RECALIBRATION);
-
-        // OCXO DAC control state (always present, unconditional)
-        p.add("ocxo_dac",              ocxo_dac_value);
-        p.add("calibrate_ocxo",        calibrate_ocxo_active);
-        p.add("servo_adjustments",     servo_adjustments);
-
-        // Dispatch profiling diagnostics
-        p.add("diag_coarse_fires",   diag_coarse_fire_count);
-        p.add("diag_fine_fires",     diag_fine_fire_count);
-        p.add("diag_late",           diag_fine_late_count);
-        p.add("diag_spins",          diag_spin_count);
-        p.add("diag_timeouts",       diag_timeout_count);
-        p.add("diag_fine_was_late",  diag_fine_was_late);
-        p.add("diag_spin_iters",     diag_spin_iterations);
-
-        // Raw 32-bit DWT cycle values for debugging.
-        p.add("diag_raw_isr_cyc",    (uint32_t)isr_snap_dwt);
-        p.add("diag_raw_shadow_cyc", (uint32_t)isr_captured_shadow_dwt);
-
-        // Raw ISR snapshot (64-bit extended, before TDC correction).
-        // These are what dwt_cycles/dwt_ns used to be before the TDC.
-        p.add("diag_isr_dwt_cycles", snap_dwt_cycles);
-        p.add("diag_isr_dwt_ns",     snap_dwt_ns);
-
-        publish("TIMEBASE_FRAGMENT", p);
-
-        if (campaign_state == clocks_campaign_state_t::STARTED) {
-          campaign_seconds++;
-        }
-      }
-
-      pps_scheduled = false;
-    },
+    pps_asap_callback,
     nullptr,
     "pps"
   );
@@ -1410,19 +1454,22 @@ static Payload cmd_stop(const Payload&) {
 
 static Payload cmd_recover(const Payload& args) {
 
-  const char* s_dwt  = args.getString("dwt_cycles");
-  const char* s_gnss = args.getString("gnss_ns");
-  const char* s_ocxo = args.getString("ocxo_ns");
+  // All recovery parameters are nanoseconds.
+  // The Teensy derives its own internal cycle/tick counts
+  // from these values at the PPS boundary.
+  const char* s_dwt_ns = args.getString("dwt_ns");
+  const char* s_gnss   = args.getString("gnss_ns");
+  const char* s_ocxo   = args.getString("ocxo_ns");
 
-  if (!s_dwt || !s_gnss || !s_ocxo) {
+  if (!s_dwt_ns || !s_gnss || !s_ocxo) {
     Payload err;
-    err.add("error", "missing recovery parameters");
+    err.add("error", "missing recovery parameters (dwt_ns, gnss_ns, ocxo_ns)");
     return err;
   }
 
-  recover_dwt_cycles = strtoull(s_dwt,  nullptr, 10);
-  recover_gnss_ns    = strtoull(s_gnss, nullptr, 10);
-  recover_ocxo_ns    = strtoull(s_ocxo, nullptr, 10);
+  recover_dwt_ns  = strtoull(s_dwt_ns, nullptr, 10);
+  recover_gnss_ns = strtoull(s_gnss,   nullptr, 10);
+  recover_ocxo_ns = strtoull(s_ocxo,   nullptr, 10);
 
   // Restore DAC value if provided (Pi persists this)
   uint32_t dac_val;
