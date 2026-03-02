@@ -140,10 +140,10 @@
 //   regardless of campaign or calibration state.
 //
 //   Optional calibration servo: when a campaign is started with
-//   the calibrate_ocxo flag, a software servo adjusts the DAC
-//   to drive the OCXO residual toward zero (tau → 1.0).  The
-//   servo uses coarse-then-fine stepping with sign-change
-//   detection for convergence.
+//   the calibrate_ocxo flag, a perpetual software servo adjusts
+//   the DAC to continuously drive the OCXO residual toward zero
+//   (tau → 1.0).  The servo never converges — it keeps tracking
+//   to compensate for thermal drift, supply changes, and aging.
 //
 //   The Pi persists the converged DAC value and sends it back
 //   via set_dac on subsequent campaign starts.  The Teensy
@@ -228,20 +228,29 @@ static uint64_t campaign_seconds = 0;
 // The current DAC value is published in every TIMEBASE_FRAGMENT.
 //
 // Calibration mode: when calibrate_ocxo_active is true, the PPS
-// callback runs a servo loop that adjusts the DAC to drive the
-// OCXO tau toward 1.0.
+// callback runs a perpetual servo loop that adjusts the DAC to
+// drive the OCXO residual toward zero (tau → 1.0).
 //
-// The servo uses a two-phase approach:
+// The servo NEVER converges.  It continuously tracks the OCXO
+// residual and adjusts the DAC as needed.  This compensates for
+// thermal drift, supply voltage changes, and aging over the
+// lifetime of a campaign.
 //
-//   Phase 1 (coarse): Step by SERVO_COARSE_STEP until the residual
-//   sign changes (we've crossed the zero point).
+// Algorithm (proportional with clamping):
 //
-//   Phase 2 (fine): Reverse direction and halve step size on each
-//   sign change, continue until step size reaches 0.  Then hold.
+//   1) Wait for SERVO_MIN_SAMPLES of fresh Welford data
+//   2) Wait SERVO_SETTLE_SECONDS after the last DAC change
+//   3) Read the current mean residual (ticks per PPS)
+//   4) If mean is zero, do nothing (but keep watching)
+//   5) Compute step = -mean_residual (1:1 conservative ratio)
+//   6) Clamp step to ±SERVO_MAX_STEP
+//   7) Apply step, reset Welford, reset settle counter
 //
-// The servo waits SERVO_SETTLE_SECONDS after each DAC change for
-// the OCXO crystal to stabilize before evaluating the result.
-// After each change, the Welford stats are reset so only
+// The 1:1 ratio is conservative (actual sensitivity is ~1.6
+// ticks per DAC count).  This prevents overshoot and lets the
+// servo approach zero asymptotically.
+//
+// The servo resets Welford stats after each DAC change so only
 // post-change data informs the next decision.
 //
 
@@ -249,13 +258,13 @@ static uint32_t ocxo_dac_value = OCXO_DAC_DEFAULT;
 
 // Calibration state
 static bool     calibrate_ocxo_active = false;
-static int32_t  servo_step            = 0;       // current step size (signed = direction)
+static int32_t  servo_step            = 0;       // last step applied (for diagnostics)
 static int32_t  servo_last_residual   = 0;       // last mean residual used for decision
 static uint32_t servo_settle_count    = 0;       // PPS cycles since last DAC change
-static bool     servo_converged       = false;   // true when step size reached 0 and held
+static uint32_t servo_adjustments     = 0;       // total DAC adjustments made (monotonic)
 
 // Servo tuning constants
-static constexpr int32_t  SERVO_COARSE_STEP    = 64;   // initial DAC step size
+static constexpr int32_t  SERVO_MAX_STEP       = 64;   // maximum single DAC step
 static constexpr uint32_t SERVO_SETTLE_SECONDS = 5;    // seconds to wait after DAC change
 static constexpr uint32_t SERVO_MIN_SAMPLES    = 10;   // minimum residual samples before acting
 
@@ -746,7 +755,7 @@ static void clocks_zero_all(void) {
 }
 
 // ============================================================================
-// OCXO Calibration Servo
+// OCXO Calibration Servo (Perpetual Proportional Tracker)
 // ============================================================================
 //
 // Called once per PPS from the ASAP callback, only when
@@ -755,34 +764,19 @@ static void clocks_zero_all(void) {
 // Uses the callback-level OCXO residual (Welford) because it provides
 // a running mean that filters single-sample noise.
 //
-// The servo adjusts ocxo_dac_value to drive the mean OCXO residual
-// toward zero (i.e., OCXO runs at exactly 10 MHz relative to GNSS).
+// The servo NEVER stops.  It continuously evaluates the mean
+// residual and adjusts the DAC to drive it toward zero.  When
+// the mean is already zero, it does nothing but keeps watching.
+// If the OCXO drifts (thermal, supply, aging), the servo
+// corrects on the next evaluation cycle.
 //
 // Pull slope is positive: higher voltage = higher frequency.
 // So: negative mean (slow) → increase DAC, positive mean (fast) → decrease.
 //
-// Two phases:
-//
-//   Phase 1 (proportional): Each decision estimates the DAC step
-//   from the current mean residual using an empirical sensitivity
-//   of ~1 tick per DAC count (conservative; actual is ~1.6).
-//   This continues until a zero crossing is detected.
-//
-//   Phase 2 (binary search): After the first zero crossing,
-//   reverse direction and halve step size on each subsequent
-//   crossing until the step collapses to zero.
-//
-// The servo resets Welford stats after each DAC change so only
-// post-change data informs the next decision, and waits
-// SERVO_SETTLE_SECONDS for the crystal to stabilize.
-//
-
-static bool servo_in_binary_phase = false;  // true after first zero crossing
 
 static void ocxo_calibration_servo(void) {
 
   if (!calibrate_ocxo_active) return;
-  if (servo_converged) return;
 
   // Wait for enough samples to have a meaningful mean
   if (residual_ocxo.n < SERVO_MIN_SAMPLES) return;
@@ -792,61 +786,50 @@ static void ocxo_calibration_servo(void) {
   if (servo_settle_count < SERVO_SETTLE_SECONDS) return;
 
   // Read the current mean residual (ticks per PPS interval).
+  // This is a double — critical for sub-tick resolution.
+  // At 10 MHz, 1 tick = 100 ns, so a mean of -0.966 is -96.6 ppb.
+  // Truncating to int32_t would lose this entirely.
   // Negative = OCXO running slow, positive = running fast.
-  int32_t mean_residual = (int32_t)residual_ocxo.mean;
+  double mean_residual = residual_ocxo.mean;
 
-  // Dead on zero — done
-  if (mean_residual == 0) {
-    servo_converged = true;
-    return;
-  }
+  // Record for diagnostics (truncated, but the real decision uses the double)
+  servo_last_residual = (int32_t)mean_residual;
 
-  // Detect zero crossing (sign change in residual vs last decision)
-  bool sign_changed = (servo_last_residual != 0) &&
-                      ((mean_residual > 0 && servo_last_residual < 0) ||
-                       (mean_residual < 0 && servo_last_residual > 0));
+  // Dead band: if |mean| < 0.1 ticks (10 ppb at 10 MHz), don't adjust.
+  // The OCXO is close enough — avoid chasing noise.
+  // But keep watching: don't reset Welford, don't reset settle.
+  // The mean will continue to refine with more samples.
+  if (fabs(mean_residual) < 0.1) return;
 
-  if (sign_changed) {
-    // Enter binary phase on first crossing (stay in it thereafter)
-    servo_in_binary_phase = true;
-
-    // Reverse direction and halve step size
-    servo_step = -(servo_step / 2);
-
-    // If step size collapsed to zero, we're done
-    if (servo_step == 0) {
-      servo_converged = true;
-      return;
-    }
-  } else if (servo_in_binary_phase) {
-    // Already in binary phase, same sign as last time —
-    // continue in the same direction with same step size
+  // Proportional step: estimate DAC change from current residual.
+  // Empirical sensitivity: ~1.6 ticks per DAC count at 10 MHz.
+  // Use conservative 1:1 ratio to avoid overshoot.
+  // Round away from zero so sub-tick drift always produces a step.
+  // Negative residual (slow) → positive step (increase voltage).
+  // Positive residual (fast) → negative step (decrease voltage).
+  int32_t step;
+  if (mean_residual < 0.0) {
+    step = (int32_t)((-mean_residual) + 0.5);
+    if (step < 1) step = 1;
   } else {
-    // Proportional phase: estimate step from current residual.
-    // Empirical sensitivity: ~1.6 ticks per DAC count at 10 MHz.
-    // Use conservative 1:1 ratio to avoid overshoot.
-    // Negative residual (slow) → positive step (increase voltage).
-    // Positive residual (fast) → negative step (decrease voltage).
-    int32_t estimated_step = -mean_residual;
-
-    // Clamp to SERVO_COARSE_STEP to bound the maximum single move
-    if (estimated_step > SERVO_COARSE_STEP) estimated_step = SERVO_COARSE_STEP;
-    if (estimated_step < -SERVO_COARSE_STEP) estimated_step = -SERVO_COARSE_STEP;
-
-    // Ensure we move at least 1 count
-    if (estimated_step == 0) estimated_step = (mean_residual < 0) ? 1 : -1;
-
-    servo_step = estimated_step;
+    step = -(int32_t)(mean_residual + 0.5);
+    if (step > -1) step = -1;
   }
 
-  servo_last_residual = mean_residual;
+  // Clamp to SERVO_MAX_STEP to bound the maximum single move
+  if (step > SERVO_MAX_STEP) step = SERVO_MAX_STEP;
+  if (step < -SERVO_MAX_STEP) step = -SERVO_MAX_STEP;
 
   // Apply the step
-  int32_t new_dac = (int32_t)ocxo_dac_value + servo_step;
+  int32_t new_dac = (int32_t)ocxo_dac_value + step;
   if (new_dac < (int32_t)OCXO_DAC_MIN) new_dac = (int32_t)OCXO_DAC_MIN;
   if (new_dac > (int32_t)OCXO_DAC_MAX) new_dac = (int32_t)OCXO_DAC_MAX;
 
   ocxo_dac_write((uint32_t)new_dac);
+
+  // Record for diagnostics
+  servo_step = step;
+  servo_adjustments++;
 
   // Reset settle counter — wait for OCXO to respond
   servo_settle_count = 0;
@@ -1332,7 +1315,7 @@ static void pps_isr(void) {
         // OCXO DAC control state (always present, unconditional)
         p.add("ocxo_dac",              ocxo_dac_value);
         p.add("calibrate_ocxo",        calibrate_ocxo_active);
-        p.add("servo_converged",        servo_converged);
+        p.add("servo_adjustments",     servo_adjustments);
 
         // Dispatch profiling diagnostics
         p.add("diag_coarse_fires",   diag_coarse_fire_count);
@@ -1403,7 +1386,7 @@ static Payload cmd_start(const Payload& args) {
     servo_step          = 0;
     servo_last_residual = 0;
     servo_settle_count  = 0;
-    servo_converged     = false;
+    servo_adjustments   = 0;
   }
 
   request_start = true;
@@ -1560,8 +1543,9 @@ static Payload cmd_report(const Payload&) {
   // OCXO DAC control state
   p.add("ocxo_dac",              ocxo_dac_value);
   p.add("calibrate_ocxo",        calibrate_ocxo_active);
-  p.add("servo_converged",        servo_converged);
+  p.add("servo_adjustments",     servo_adjustments);
   p.add("servo_step",             servo_step);
+  p.add("servo_last_residual",    servo_last_residual);
   p.add("servo_settle_count",     servo_settle_count);
 
   // Dispatch profiling diagnostics
@@ -1654,4 +1638,7 @@ void process_clocks_init(void) {
     pps_isr,
     RISING
   );
+
+  int pps_irq = digitalPinToInterrupt(GNSS_PPS_PIN);
+  NVIC_SET_PRIORITY(1, 0);  // highest priority — preempts everything
 }

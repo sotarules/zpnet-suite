@@ -387,6 +387,20 @@ def _serial_rx_loop() -> None:
 # ---------------------------------------------------------------------
 
 def _supervisor_loop() -> None:
+    """
+    Immortal supervisor — keeps the RX path alive across device
+    unavailability, flash cycles, and transient I/O errors.
+
+    Behaviour:
+      • First failure logs a single INFO line
+      • All subsequent failures are swallowed silently
+      • Closes stale handles before each retry
+      • Polls with capped exponential backoff (20 ms → 500 ms)
+      • Logs once on successful (re)connect
+      • RuntimeError (mode not set) still propagates — that's a bug
+    """
+    announced = False
+    backoff = _RETRY_MIN_SLEEP_S
 
     while not _transport_stop.is_set():
         try:
@@ -394,17 +408,41 @@ def _supervisor_loop() -> None:
 
             if mode == TRANSPORT_SERIAL:
                 _open_serial(TEENSY_SERIAL_PATH)
+                if announced:
+                    logging.info("✅ [transport] SERIAL device available — RX loop starting")
+                    announced = False
+                backoff = _RETRY_MIN_SLEEP_S
                 _serial_rx_loop()
 
             elif mode == TRANSPORT_HID:
                 _open_hid()
+                if announced:
+                    logging.info("✅ [transport] HID device available — RX loop starting")
+                    announced = False
+                backoff = _RETRY_MIN_SLEEP_S
                 _hid_rx_loop()
 
             else:
                 raise RuntimeError("transport mode not set")
 
+        except RuntimeError:
+            # Programming error (mode not set) — let it crash
+            raise
+
         except Exception:
-            logging.exception("️️⚠️ [transport] supervisor caught fatal RX failure")
+            # Device not ready, I/O error, stale handle, etc.
+            # Close whatever is open so the next iteration re-opens cleanly.
+            if mode == TRANSPORT_SERIAL:
+                _close_serial()
+            elif mode == TRANSPORT_HID:
+                _close_hid()
+
+            if not announced:
+                logging.info("⏳ [transport] device not ready — supervisor retrying silently")
+                announced = True
+
+            time.sleep(backoff)
+            backoff = min(backoff * 2.0, _RETRY_MAX_SLEEP_S)
 
 # ---------------------------------------------------------------------
 # Public API

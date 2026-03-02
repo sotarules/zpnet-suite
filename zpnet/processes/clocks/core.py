@@ -93,8 +93,8 @@ NS_PER_SECOND = 1_000_000_000
 PI_TIMER_FREQ = 54_000_000
 PI_NS_PER_TICK = 1e9 / PI_TIMER_FREQ  # ~18.519 ns/tick
 
-DWT_CYCLES_PER_NS_NUM = 3
-DWT_CYCLES_PER_NS_DEN = 5
+DWT_CYCLES_PER_NS_NUM = 126
+DWT_CYCLES_PER_NS_DEN = 125
 
 GNSS_POLL_INTERVAL = 5
 GNSS_WAIT_LOG_INTERVAL = 60
@@ -1302,6 +1302,10 @@ def _process_loop() -> None:
             "diag_teensy_dispatch_delta_ns": frag.get("dispatch_delta_ns"),
             "diag_teensy_pps_edge_valid": frag.get("pps_edge_valid"),
             "diag_teensy_pps_edge_correction_ns": frag.get("pps_edge_correction_ns"),
+
+            # Raw DWT cycle counts for TDC derivation
+            "diag_raw_isr_cyc": frag.get("diag_raw_isr_cyc"),
+            "diag_raw_shadow_cyc": frag.get("diag_raw_shadow_cyc"),
 
             # OCXO control state
             "ocxo_dac": frag.get("ocxo_dac"),

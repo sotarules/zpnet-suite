@@ -52,6 +52,9 @@ REPLY_TIMEOUT_S = 30.0
 DEBUG_LOG_PATH = "/home/mule/zpnet/logs/zpnet-debug.log"
 SOCKET_DIR = "/tmp"
 
+# Transport retry configuration
+TRANSPORT_RETRY_INTERVAL_S = 0.25   # poll every 250 ms — aggressive but not a spinlock
+
 # Subsystems that PUBSUB should never query during ALLSUBSCRIPTIONS.
 # These are test/utility programs that may leave stale sockets behind.
 SUBSYSTEM_SKIP = {"TIMEBASE_WATCH"}
@@ -575,6 +578,48 @@ def _delayed_refresh(delay_s: float = 10.0) -> None:
         logging.exception("❌ [pubsub] auto REFRESH failed")
 
 # ---------------------------------------------------------------------
+# Transport init with aggressive retry
+# ---------------------------------------------------------------------
+
+def _transport_init_with_retry() -> None:
+    """
+    Attempt transport_init() in a tight silent loop until the HID
+    device is available.  This handles the race condition where PUBSUB
+    launches before the Teensy USB HID device has been enumerated by
+    the kernel (e.g. during flash/reboot).
+
+    Catches every transient failure mode observed during bring-up:
+      • OSError / IOError   — HID device present but not responding
+                               (errno 5: Input/output error)
+      • FileNotFoundError   — /dev/zpnet-teensy-serial symlink not yet
+                               created by udev
+      • serial.SerialException — pyserial wrapper around the above
+                               (e.g. "could not open port")
+      • Exception           — any other transient init failure
+
+    Behaviour:
+      • First failure logs a single INFO line so we know we're waiting
+      • All subsequent failures are swallowed silently
+      • Polls every TRANSPORT_RETRY_INTERVAL_S (250 ms)
+      • Runs indefinitely until success — the device WILL appear
+      • On success logs once and returns
+    """
+    announced = False
+
+    while True:
+        try:
+            transport_init()
+            if announced:
+                logging.info("✅ [transport] device available — transport initialized")
+            return
+        except Exception:
+            if not announced:
+                logging.info("⏳ [transport] device not ready — polling every %.0f ms",
+                             TRANSPORT_RETRY_INTERVAL_S * 1000)
+                announced = True
+            time.sleep(TRANSPORT_RETRY_INTERVAL_S)
+
+# ---------------------------------------------------------------------
 # Entrypoint
 # ---------------------------------------------------------------------
 
@@ -582,7 +627,10 @@ def run() -> None:
     setup_logging()
     open_debug_log()
     open_pubsub_log()
-    transport_init()
+
+    # Block here until the Teensy HID device is enumerable.
+    # Silent indefinite retry — survives flash, reboot, late enumeration.
+    _transport_init_with_retry()
 
     transport_register_receive_callback(TRAFFIC_DEBUG, on_receive_debug)
     transport_register_receive_callback(TRAFFIC_REQUEST_RESPONSE, on_receive_request_response)
