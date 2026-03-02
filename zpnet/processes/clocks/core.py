@@ -1819,7 +1819,6 @@ def cmd_resume(args: Optional[dict]) -> dict:
 # Recovery
 # ---------------------------------------------------------------------
 
-
 def _recover_campaign() -> None:
     """
     RECOVER:
@@ -1830,8 +1829,9 @@ def _recover_campaign() -> None:
       5. Stop Teensy + PITIMER, quiesce, snap to second boundary.
       6. Arm TEENSY RECOVER + start PITIMER(next_pps_count).
       7. Wait for sync fragment.
-      8. PEEK Pi capture at sync edge, compute epoch, call SET_EPOCH.
-      9. Activate campaign.
+      8. Recompute Pi projection from actual sync edge.
+      9. PEEK Pi capture at sync edge, compute epoch, call SET_EPOCH.
+     10. Activate campaign.
     """
     global _campaign_active, _armed_pps_count
 
@@ -2043,37 +2043,52 @@ def _recover_campaign() -> None:
         last_pps_count, elapsed_seconds, next_pps_count,
     )
 
-    # Project clocks to target edge
+    # Compute tau from anchor — these ratios are used for projection.
     tau_dwt = float(last_dwt_ns) / float(last_gnss_ns) if last_gnss_ns > 0 else 1.0
     tau_ocxo = float(last_ocxo_ns) / float(last_gnss_ns) if (last_gnss_ns > 0 and last_ocxo_ns > 0) else 1.0
     tau_pi = float(last_pi_ns) / float(last_gnss_ns) if (last_gnss_ns > 0 and last_pi_ns > 0) else 1.0
 
     logging.info("📐 [recovery] tau -- dwt=%.12f  ocxo=%.12f  pi=%.12f", tau_dwt, tau_ocxo, tau_pi)
 
+    # ------------------------------------------------------------------
+    # Teensy clock projections.
+    #
+    # These are INSTRUCTIONS to the Teensy: "load these values into your
+    # 64-bit accumulators at the next PPS edge."  The Teensy obeys
+    # unconditionally — it doesn't care if they're a few seconds ahead
+    # of ground truth.  What matters is that the ratios between domains
+    # are preserved (same tau), so PPB stays correct.
+    #
+    # The +2 padding in project_seconds ensures the Teensy hasn't already
+    # passed next_pps_count by the time the RECOVER command arrives.
+    # ------------------------------------------------------------------
     projected_gnss_ns = last_gnss_ns + (project_seconds * NS_PER_SECOND)
     projected_dwt_ns = last_dwt_ns + int(project_seconds * NS_PER_SECOND * tau_dwt)
     projected_ocxo_ns = last_ocxo_ns + int(project_seconds * NS_PER_SECOND * tau_ocxo) if last_ocxo_ns > 0 else 0
-    # Pi projection: last_pi_ns=0 is valid (epoch edge or pre-epoch record).
-    # In that case tau_pi is already 1.0 (nominal).  Always project forward
-    # from whatever last_pi_ns was — including zero.
-    projected_pi_ns = last_pi_ns + int(project_seconds * NS_PER_SECOND * tau_pi)
 
     projected_dwt_cycles = (projected_dwt_ns * DWT_CYCLES_PER_NS_NUM) // DWT_CYCLES_PER_NS_DEN
-    projected_pi_ticks_at_target = (int(projected_pi_ns) * PI_TIMER_FREQ) // NS_PER_SECOND
-
-    if projected_pi_ns <= 0:
-        # This can happen if last_pi_ns was 0 (epoch edge) AND tau_pi
-        # computation somehow produced 0.  Use gnss projection as fallback.
-        logging.warning(
-            "⚠️ [recovery] projected_pi_ns=%d <= 0 — using gnss_ns as fallback",
-            projected_pi_ns,
-        )
-        projected_pi_ns = projected_gnss_ns
 
     logging.info(
-        "📐 [recovery] projected@target -- gnss_ns=%d dwt_ns=%d ocxo_ns=%d pi_ns=%d pi_ticks=%d",
-        projected_gnss_ns, projected_dwt_ns, projected_ocxo_ns, projected_pi_ns, projected_pi_ticks_at_target,
+        "📐 [recovery] projected@target -- gnss_ns=%d dwt_ns=%d ocxo_ns=%d",
+        projected_gnss_ns, projected_dwt_ns, projected_ocxo_ns,
     )
+
+    # ------------------------------------------------------------------
+    # Pi projection is NOT computed here.
+    #
+    # Unlike the Teensy clocks, Pi epoch is derived from a hardware
+    # reading (pi_corrected_at_sync) minus projected_pi_ticks.  If
+    # projected_pi_ticks doesn't match where the sync edge actually
+    # landed, the epoch is wrong and every subsequent pi_ns is biased.
+    #
+    # The +2 padding in project_seconds means we project 2 seconds
+    # beyond where the Teensy will actually land.  The Teensy clocks
+    # absorb this harmlessly (they're told what to be), but the Pi
+    # projection must match the ACTUAL sync edge.
+    #
+    # So we defer Pi projection until after the sync fragment arrives
+    # and we know the Teensy's actual pps_count.
+    # ------------------------------------------------------------------
 
     _reset_trackers()
 
@@ -2133,13 +2148,42 @@ def _recover_campaign() -> None:
             "— PITIMER labeled this edge as %d",
             teensy_pps_count, next_pps_count, overshoot, pitimer_sync_pps,
         )
-        # Adjust projected ticks/ns for the extra (or fewer) seconds
-        projected_pi_ticks_at_target += int(overshoot * PI_TIMER_FREQ * tau_pi)
-        projected_gnss_ns += overshoot * NS_PER_SECOND
-        logging.info(
-            "📐 [recovery] adjusted projections: gnss_ns=%d pi_ticks=%d",
-            projected_gnss_ns, projected_pi_ticks_at_target,
+
+    # ------------------------------------------------------------------
+    # NOW compute Pi projection from the ACTUAL sync edge.
+    #
+    # The Teensy landed at teensy_pps_count, which is
+    # (teensy_pps_count - last_pps_count) seconds after the anchor.
+    # This is the true elapsed time — no padding, no estimation.
+    #
+    # This is the critical fix: the Pi epoch must be derived from where
+    # the sync edge actually landed, not from the padded projection
+    # target.  The Teensy clocks don't need this because they're loaded
+    # with projected values directly.  But the Pi epoch is computed from
+    # a hardware reading minus projected ticks, so any mismatch between
+    # the projection and reality becomes a permanent bias in pi_ns.
+    # ------------------------------------------------------------------
+    actual_elapsed_from_anchor = teensy_pps_count - last_pps_count
+
+    projected_pi_ns = last_pi_ns + int(actual_elapsed_from_anchor * NS_PER_SECOND * tau_pi)
+    projected_pi_ticks_at_target = (int(projected_pi_ns) * PI_TIMER_FREQ) // NS_PER_SECOND
+
+    if projected_pi_ns <= 0:
+        # This can happen if last_pi_ns was 0 (epoch edge) AND tau_pi
+        # computation somehow produced 0.  Use gnss projection as fallback.
+        logging.warning(
+            "⚠️ [recovery] projected_pi_ns=%d <= 0 — using gnss_ns as fallback",
+            projected_pi_ns,
         )
+        actual_gnss_at_sync = last_gnss_ns + (actual_elapsed_from_anchor * NS_PER_SECOND)
+        projected_pi_ns = actual_gnss_at_sync
+        projected_pi_ticks_at_target = (int(projected_pi_ns) * PI_TIMER_FREQ) // NS_PER_SECOND
+
+    logging.info(
+        "📐 [recovery] Pi projection@actual sync edge -- "
+        "actual_elapsed=%d tau_pi=%.12f proj_pi_ns=%d proj_pi_ticks=%d",
+        actual_elapsed_from_anchor, tau_pi, projected_pi_ns, projected_pi_ticks_at_target,
+    )
 
     # The processor thread will never see the sync edge because
     # _campaign_active is still False.  The first fragment it processes
@@ -2175,9 +2219,11 @@ def _recover_campaign() -> None:
 
     logging.info(
         "📐 [recovery] epoch: corrected=%d - projected_ticks=%d = epoch=%d "
-        "(peeked at pitimer_pps=%d, teensy_pps=%d, overshoot=%+d)",
+        "(peeked at pitimer_pps=%d, teensy_pps=%d, overshoot=%+d, "
+        "actual_elapsed=%d)",
         pi_corrected_at_sync, projected_pi_ticks_at_target, pi_tick_epoch,
         pitimer_sync_pps, teensy_pps_count, overshoot,
+        actual_elapsed_from_anchor,
     )
 
     # Set epoch FIRST, then re-arm pps_count.  This ordering ensures
@@ -2219,7 +2265,6 @@ def _recover_campaign() -> None:
         "✅ [recovery] @%s campaign '%s' recovered — teensy_pps=%d, TIMEBASE resumes",
         system_time_z(), campaign_name, teensy_pps_count,
     )
-
 
 # ---------------------------------------------------------------------
 # BASELINE — persist and retrieve baseline campaign for comparison
