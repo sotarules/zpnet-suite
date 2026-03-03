@@ -101,7 +101,7 @@ Teensy Pin    Wire Color    Signal Name        Source / Destination             
 VIN           White         VIN_5V5            INA260 (5.5 V rail)                  Dedicated 5V+ CPU power (INA260 addr TBD)
 GND           Black         GND                Battery branching ground             Direct return to battery
 
-1             Twisted Pair  GNSS_PPS_IN        GNSS PPS                             1 Hz pulse for absolute time reference
+1             Orange        GNSS_PPS_IN        GNSS PPS                             1 Hz pulse for absolute time reference
 
 9             TBD (STP)     GNSS_10KHZ_RELAY   Pi GPIO25 via STP                    10 kHz GNSS clock relay output
                                                                                      GPT2 compare ISR toggles every 1000 GNSS ticks
@@ -286,12 +286,12 @@ Timing / Control Outputs
 
 Pin #    Signal Name        Wire Color    Connected To        Destination     Notes
 ----------------------------------------------------------------------------------
-18       EPPS Output       —             —                   —              Unused
-17       PPS Output        Brown         Teensy              Pin 1           Primary PPS
-16       GLCK Out          —             —                   —              Unused
-15       LOCK Signal       Green         Teensy              Pin 4           Lock status
-14       Alarm             —             —                   —              Unused
-11       BCLOCK Out        Orange        Teensy              Pin 14          10 MHz square wave
+18       EPPS Output       —             —                   —                Unused
+17       PPS Output        Orange        Teensy              Pin 1            Primary PPS
+16       GLCK Out          —             —                   —                Unused
+15       LOCK Signal       Green         Teensy              Pin 4            Lock status
+14       Alarm             —             —                   —                Unused
+11       BCLOCK Out        Twisted Pair  Teensy              Pin 14           10 MHz square wave
 
 -------------------------------------------------------------------------------
 Communication Pins
