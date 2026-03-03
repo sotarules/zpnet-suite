@@ -22,10 +22,11 @@ Core contract (v2026-03-02+):
     Recovery is symmetric across all clock domains.  The same formula
     projects every domain forward:
 
-      projected_ns = outage_ns * last_clock_ns // last_gnss_ns
+      projected_gnss_ns = next_pps_count * NS_PER_SECOND
+      projected_ns = projected_gnss_ns * last_clock_ns // last_gnss_ns
 
-    Where outage_ns is the number of nanoseconds from campaign start
-    to the next PPS edge (computed from GNSS wall-clock times).
+    The projected values are ABSOLUTE from campaign start.  The Teensy
+    derives campaign_seconds (= pps_count) from gnss_ns / 1e9.
 
     This eliminates:
       • The +2 padding hack (GNSS time gives exact second)
@@ -37,6 +38,18 @@ Core contract (v2026-03-02+):
     START is also simplified: PITIMER derives its own epoch from the
     first capture when given pi_ns=0 at campaign start.  No PEEK,
     no SET_EPOCH, no epoch computation in CLOCKS.
+
+  Flash-cut campaign switching:
+
+    START while a campaign is active performs a seamless "flash cut"
+    to the new campaign.  The PPS stream continues uninterrupted.
+    OCXOs are never disturbed.  Nanosecond counters and pps_count
+    reset to zero under the new campaign name.  The previous campaign
+    is closed in the DB with a stopped_at timestamp.
+
+    This supports continuous operation across the Lantern experiment:
+    overnight baseline → en route → Badwater → en route → Little Lakes
+    without ever shutting down the system.
 
   v3 queue architecture (retained):
 
@@ -55,6 +68,7 @@ Responsibilities:
   * Compute per-clock residual statistics (Welford's algorithm)
   * Denormalize augmented report into active campaign payload
   * Recover clocks after restart if campaign is active
+  * Flash-cut to new campaign while running (seamless switch)
   * Command GNSS into Time Only mode when campaign has a location
 
 Semantics:
@@ -1443,8 +1457,9 @@ def _request_teensy_recover(pps_count: int, args: Dict[str, Any]) -> None:
 
 def cmd_start(args: Optional[dict]) -> dict:
     """
-    START — v4 nanosecond architecture:
+    START — v4 nanosecond architecture with flash-cut support:
 
+    If NO campaign is active (cold start):
       1. Reject if campaign name already exists in DB.
       2. Create campaign in DB (deactivate any prior).
       3. Stop Teensy + PITIMER (best-effort).
@@ -1452,11 +1467,23 @@ def cmd_start(args: Optional[dict]) -> dict:
       5. Begin sync wait for fragment pps_count=0.
       6. Arm TEENSY START(pps_count=0) — slow path.
       7. Start PITIMER(pps_count=0, pi_ns=0) — fast path.
-         At pps_count=0, pi_ns is 0 by definition.
-         PITIMER derives epoch from first capture:
-           epoch = corrected - (0 * freq / 1e9) = corrected
       8. Wait for sync fragment pps_count=0.
-      9. Activate campaign.  No PEEK, no SET_EPOCH needed.
+      9. Activate campaign.
+
+    If a campaign IS already active (flash-cut):
+      1. Reject if campaign name already exists in DB.
+      2. Close the active campaign in the DB (set stopped_at, deactivate).
+      3. Create the new campaign in the DB (active).
+      4. Reset trackers (Welford's, pi_seq, etc.).
+      5. Arm Teensy START (zeroes all accumulators, pps_count=0).
+         The Teensy resets its counters at the next PPS edge — no stop needed.
+         The PPS stream continues uninterrupted.  OCXOs undisturbed.
+      6. Arm PITIMER START(pi_ns=0) (new epoch from next capture).
+      7. Sync on pps_count=0, resume processing under the new campaign name.
+
+    The flash-cut is seamless: no STOP, no power cycle, no GNSS re-acquisition.
+    The only observable effect is that nanosecond counters and pps_count reset
+    to zero.  The OCXOs, GNSS receiver, and PPS stream are never interrupted.
     """
     global _campaign_active, _armed_pps_count
 
@@ -1464,16 +1491,9 @@ def cmd_start(args: Optional[dict]) -> dict:
     if not campaign:
         return {"success": False, "message": "START requires 'campaign' argument"}
 
-    # --- Refuse if a campaign is already running ---
+    # --- Check for active campaign (determines cold start vs flash-cut) ---
     active_row = _get_active_campaign()
-    if active_row is not None:
-        return {
-            "success": False,
-            "message": (
-                f"Campaign '{active_row['campaign']}' is currently active - "
-                f"STOP it before starting a new one"
-            ),
-        }
+    flash_cut = active_row is not None
 
     # --- Reject duplicate campaign name ---
     with open_db(row_dict=True) as conn:
@@ -1521,7 +1541,30 @@ def cmd_start(args: Optional[dict]) -> dict:
     if calibrate_ocxo:
         campaign_payload["calibrate_ocxo"] = True
 
-    # Deactivate prior campaigns + create new one
+    # --- Flash-cut preamble ---
+    if flash_cut:
+        prev_campaign = active_row["campaign"]
+        prev_location = active_row["payload"].get("location")
+
+        logging.info(
+            "⚡ [start] FLASH CUT: '%s' → '%s' (seamless campaign switch, no stop)",
+            prev_campaign, campaign,
+        )
+
+        campaign_payload["flash_cut_from"] = prev_campaign
+
+        # Carry forward the previous location if the new campaign doesn't
+        # specify one.  This preserves GNSS TO mode across the cut.
+        if location is None and prev_location:
+            location = prev_location
+            campaign_payload["location"] = location
+            logging.info(
+                "📡 [start] inheriting location '%s' from previous campaign",
+                location,
+            )
+
+    # Deactivate prior campaigns + create new one (atomic in single transaction)
+    cutover_ts = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
     with open_db() as conn:
         cur = conn.cursor()
         cur.execute(
@@ -1531,7 +1574,7 @@ def cmd_start(args: Optional[dict]) -> dict:
                 payload = payload || jsonb_build_object('stopped_at', to_jsonb(%s::text))
             WHERE active = true
             """,
-            (datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),),
+            (cutover_ts,),
         )
         cur.execute(
             """
@@ -1541,16 +1584,25 @@ def cmd_start(args: Optional[dict]) -> dict:
             (campaign, json.dumps(campaign_payload)),
         )
 
-    # GNSS Time Only mode if location specified
+    # GNSS Time Only mode if location specified (skip on flash-cut if location unchanged)
     if location:
-        logging.info("📡 [clocks] commanding GNSS -> TO mode for location '%s'", location)
-        gnss_resp = _set_gnss_mode_to(location)
-        if not gnss_resp.get("success"):
-            msg = gnss_resp.get("message", "unknown error")
-            logging.warning("⚠️ [clocks] GNSS MODE=TO failed: %s", msg)
-            return {"success": False, "message": f"GNSS MODE=TO failed: {msg}", "payload": {"gnss_response": gnss_resp}}
-        logging.info("✅ [clocks] GNSS confirmed TO mode")
+        if flash_cut and location == active_row["payload"].get("location"):
+            logging.info("📡 [start] GNSS TO mode unchanged (same location '%s')", location)
+        else:
+            logging.info("📡 [clocks] commanding GNSS -> TO mode for location '%s'", location)
+            gnss_resp = _set_gnss_mode_to(location)
+            if not gnss_resp.get("success"):
+                msg = gnss_resp.get("message", "unknown error")
+                logging.warning("⚠️ [clocks] GNSS MODE=TO failed: %s", msg)
+                return {"success": False, "message": f"GNSS MODE=TO failed: {msg}", "payload": {"gnss_response": gnss_resp}}
+            logging.info("✅ [clocks] GNSS confirmed TO mode")
 
+    # --- Stop Teensy + PITIMER before arming ---
+    # On flash-cut this is still needed: the Teensy STOP clears its ISR
+    # state so the subsequent START can arm cleanly at pps_count=0.
+    # The STOP is instantaneous — the PPS stream from the GNSS receiver
+    # continues, and the OCXOs keep oscillating.  We're just resetting
+    # the Teensy's software counters and PITIMER's epoch.
     _request_teensy_stop_best_effort()
     _stop_pitimer_best_effort()
     _reset_trackers()
@@ -1594,11 +1646,13 @@ def cmd_start(args: Optional[dict]) -> dict:
 
     logging.info("✅ [start] @%s sync fragment received (waited=%.3fs)", system_time_z(), waited_s)
 
-    # Campaign was already activated before the sync wait.
-    # PITIMER has the epoch (derived from first capture with pi_ns=0).
-    # The processor thread will handle pps_count=0 and all subsequent records.
-
-    logging.info("▶️ [clocks] @%s START complete — campaign '%s' active", system_time_z(), campaign)
+    if flash_cut:
+        logging.info(
+            "⚡ [start] @%s FLASH CUT complete — '%s' → '%s' (no interruption)",
+            system_time_z(), prev_campaign, campaign,
+        )
+    else:
+        logging.info("▶️ [clocks] @%s START complete — campaign '%s' active", system_time_z(), campaign)
 
     return {
         "success": True,
@@ -1610,6 +1664,8 @@ def cmd_start(args: Optional[dict]) -> dict:
             "calibrate_ocxo": calibrate_ocxo,
             "pps_count": 0,
             "waited_s": round(float(waited_s), 3),
+            "flash_cut": flash_cut,
+            "previous_campaign": active_row["campaign"] if flash_cut else None,
         },
     }
 
@@ -1872,11 +1928,11 @@ def _recover_campaign() -> None:
       2. Get current GNSS wall-clock time.
       3. Compute elapsed whole seconds between the two GNSS times.
       4. next_pps_second = elapsed + 1 (the next PPS edge).
-      5. outage_ns = next_pps_second * NS_PER_SECOND.
-      6. For each clock domain, project forward using the ratio
+      5. next_pps_count = last_pps_count + next_pps_second.
+      6. projected_gnss_ns = next_pps_count * NS_PER_SECOND.
+      7. For each clock domain, project forward using the ratio
          from the last TIMEBASE — pure integer arithmetic:
-           projected_ns = outage_ns * last_clock_ns // last_gnss_ns
-      7. next_pps_count = last_pps_count + next_pps_second.
+           projected_ns = projected_gnss_ns * last_clock_ns // last_gnss_ns
       8. Send RECOVER to Teensy with projected dwt_ns, gnss_ns, ocxo_ns.
       9. Send RECOVER to PITIMER with projected pi_ns.
      10. Wait for sync fragment, activate campaign.
@@ -2585,9 +2641,10 @@ def run() -> None:
         "🕐 [clocks] v4 Nanosecond Recovery Architecture. "
         "CLOCKS speaks ONLY nanoseconds to Teensy and PITIMER. "
         "Each instrument derives its own internal representation. "
-        "Recovery is symmetric: projected_ns = outage_ns × last_clock_ns ÷ last_gnss_ns. "
+        "Recovery is symmetric: projected_ns = projected_gnss_ns × last_clock_ns ÷ last_gnss_ns. "
         "No DWT cycle counts. No Pi epochs. No SET_EPOCH in normal flow. "
         "START uses PITIMER START(pi_ns=0). "
+        "START while active performs seamless flash-cut to new campaign. "
         "RECOVER uses PITIMER RECOVER(pps_count, pi_ns). "
         "Commands: START, STOP, RESUME, REPORT, CLEAR, DELETE, SET_DAC, "
         "SET_BASELINE, BASELINE_INFO, LIST_CAMPAIGNS, CLOCKS_INFO."
