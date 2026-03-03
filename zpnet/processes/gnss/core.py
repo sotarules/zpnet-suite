@@ -6,6 +6,7 @@ Responsibilities:
   • Parse NMEA into authoritative state
   • Expose derived facts via REPORT
   • Expose cached GNSS time via GET_TIME (ISO8601 Zulu correlation key)
+  • Expose discipline snapshot via GET_GNSS_INFO (for TIMEBASE records)
   • Expose raw NMEA sentences via a live stream socket
   • Profile and persist antenna locations for Time Only mode
   • Switch receiver between NAV and Time Only (TO) modes
@@ -13,7 +14,8 @@ Responsibilities:
 Process model:
   • One systemd service
   • One acquisition thread (UART read)
-  • One blocking command socket (REPORT, GET_TIME, PROFILE_LOCATION, MODE)
+  • One blocking command socket (REPORT, GET_TIME, GET_GNSS_INFO,
+    PROFILE_LOCATION, MODE)
   • One blocking stream socket (fan-out)
 
 UART ownership:
@@ -33,6 +35,18 @@ GET_TIME semantics:
     until the next NMEA sentence overwrites it
   • Returns success=False if time or date is not yet available
     (cold start, no satellites)
+
+GET_GNSS_INFO semantics:
+  • Returns a frozen snapshot of the GF-8802's discipline state
+  • Intended to be embedded verbatim as a "gnss" block inside
+    each TIMEBASE record by the CLOCKS process
+  • Lightweight read of already-parsed state — no UART writes,
+    no blocking, no database access
+  • Includes discipline loop state (TPS4), independent clock
+    estimate (TPS1), PPS health (TPS2), TRAIM integrity (TPS3),
+    and a staleness indicator (age_ms)
+  • Returns success=False if no TPS4 sentence has been received
+    (discipline state unknown)
 """
 
 from __future__ import annotations
@@ -1025,6 +1039,97 @@ def cmd_get_time(_: Optional[dict]) -> Dict:
     }
 
 
+def cmd_get_gnss_info(_: Optional[dict]) -> Dict:
+    """
+    GET_GNSS_INFO — return a frozen snapshot of the GF-8802's
+    discipline state for embedding in TIMEBASE records.
+
+    This is the companion to GET_TIME.  CLOCKS calls GET_TIME
+    for the correlation key and GET_GNSS_INFO for the discipline
+    metadata.  The returned payload is intended to be embedded
+    verbatim as the "gnss" block inside each TIMEBASE record.
+
+    The snapshot captures four dimensions of receiver state:
+
+      Discipline loop (TPS4/CRZ):
+        freq_mode, freq_mode_name  — where in the PLL state machine
+        pps_timing_error_ns        — phase detector output (ns)
+        freq_error_ppb             — VCLK deviation from nominal
+        phase_skip                 — 0=auto, 1=execute
+        alarm                      — oscillator alarm bitmask
+        learning_time_s            — seconds of fine-lock learning
+        holdover_avail_s           — holdover budget remaining
+
+      Independent clock estimate (TPS1/CRW):
+        clock_drift_ppb            — 26MHz TCXO drift from GNSS solution
+        temperature_c              — ambient temperature (°C)
+        pps_sync                   — sync target name (UTC_USNO etc)
+        time_status                — time fix quality name
+        leap_second                — current UTC leap second
+
+      PPS health (TPS2/CRX):
+        estimated_accuracy_ns      — receiver's own PPS accuracy estimate
+
+      Integrity (TPS3/CRY):
+        traim                      — TRAIM solution status
+        pos_mode                   — position mode name (TO, CSS, etc)
+
+      Staleness:
+        age_ms                     — ms since last UART sentence received
+
+    Returns:
+      success=True with flat payload dict
+      success=False if no TPS4 sentence has been received yet
+    """
+    if not GNSS.has_discipline:
+        return {
+            "success": False,
+            "message": "GNSS discipline state not yet available (no TPS4 received)",
+        }
+
+    # Staleness: milliseconds since last sentence from UART
+    now = time.time()
+    if GNSS.last_rx_ts > 0:
+        age_ms = round((now - GNSS.last_rx_ts) * 1000)
+    else:
+        age_ms = -1
+
+    info: Dict[str, object] = {
+        # ---- Discipline loop (TPS4) ----
+        "freq_mode":             GNSS.tps4_freq_mode,
+        "freq_mode_name":        GNSS.tps4_freq_mode_name,
+        "pps_timing_error_ns":   GNSS.tps4_pps_timing_error_ns,
+        "freq_error_ppb":        GNSS.tps4_freq_error_ppb,
+        "phase_skip":            GNSS.tps4_phase_skip,
+        "alarm":                 GNSS.tps4_alarm,
+        "learning_time_s":       GNSS.tps4_learning_time_s,
+        "holdover_avail_s":      GNSS.tps4_holdover_avail_s,
+
+        # ---- Independent clock estimate (TPS1) ----
+        "clock_drift_ppb":       GNSS.tps1_clock_drift_ppb if not math.isnan(GNSS.tps1_clock_drift_ppb) else None,
+        "temperature_c":         GNSS.tps1_temperature_c if not math.isnan(GNSS.tps1_temperature_c) else None,
+        "pps_sync":              GNSS.tps1_pps_status_name if GNSS.tps1_pps_status >= 0 else None,
+        "time_status":           GNSS.tps1_time_status_name if GNSS.tps1_time_status >= 0 else None,
+        "leap_second":           GNSS.tps1_present_ls if GNSS.tps1_present_ls else None,
+
+        # ---- PPS health (TPS2) ----
+        "estimated_accuracy_ns": GNSS.tps2_estimated_accuracy_ns if GNSS.tps2_pps_mode >= 0 else None,
+
+        # ---- Integrity (TPS3) ----
+        "traim":                 GNSS.tps3_traim_name if GNSS.tps3_pos_mode >= 0 else None,
+        "pos_mode":              GNSS.tps3_pos_mode_name if GNSS.tps3_pos_mode >= 0 else None,
+
+        # ---- Staleness ----
+        "age_ms":                age_ms,
+    }
+
+    return {
+        "success": True,
+        "message": "OK",
+        "payload": info,
+    }
+
+
 def cmd_profile_location(args: Optional[dict]) -> Dict:
     """
     PROFILE_LOCATION — block until GNSS achieves a quality fix,
@@ -1281,6 +1386,7 @@ def cmd_mode(args: Optional[dict]) -> Dict:
 COMMANDS = {
     "REPORT": cmd_report,
     "GET_TIME": cmd_get_time,
+    "GET_GNSS_INFO": cmd_get_gnss_info,
     "PROFILE_LOCATION": cmd_profile_location,
     "MODE": cmd_mode,
 }
