@@ -438,9 +438,9 @@ static volatile uint32_t pre_pps_entry_gnss     = 0;
 static constexpr bool     TDC_NEEDS_RECALIBRATION = true;
 
 // Placeholder values from 600 MHz — DO NOT TRUST until re-derived
-static constexpr uint32_t TDC_FIXED_OVERHEAD   = 50;  // cycles: interrupt entry + ISR prologue
-static constexpr uint32_t TDC_LOOP_CYCLES      = 6;   // total cycles per loop iteration
-static constexpr uint32_t TDC_MAX_CORRECTION   = 5;   // shadow_to_edge can be 0..4, reject >=5
+static constexpr uint32_t TDC_FIXED_OVERHEAD   = 48;  // cycles: interrupt entry + ISR prologue
+static constexpr uint32_t TDC_LOOP_CYCLES      = 1;   // total cycles per loop iteration
+static constexpr uint32_t TDC_MAX_CORRECTION   = 1;   // shadow_to_edge can be 0..4, reject >=5
 
 // Convert delta_cycles to shadow-to-edge correction in cycles.
 // Returns the correction, or -1 if delta_cycles is out of range
