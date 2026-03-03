@@ -28,7 +28,9 @@ This tool:
   3. Identifies clusters (discrete peaks)
   4. Computes TDC_FIXED_OVERHEAD (minimum cluster center)
   5. Computes TDC_LOOP_CYCLES (spacing between clusters)
-  6. Outputs recommended C++ constants
+  6. Computes TDC_MAX_CORRECTION (number of primary clusters = distinct
+     landing positions within one loop iteration)
+  7. Outputs recommended C++ constants
 """
 
 from __future__ import annotations
@@ -345,11 +347,24 @@ def analyze(campaign: str) -> None:
             print("      (possible if the loop is very tight relative to interrupt jitter)")
         tdc_loop_cycles = None
 
-    # TDC_MAX_CORRECTION
-    if tdc_loop_cycles and tdc_loop_cycles > 0:
-        tdc_max_correction = tdc_loop_cycles
-    else:
-        tdc_max_correction = 1
+    # TDC_MAX_CORRECTION = number of primary clusters.
+    #
+    # Each primary cluster represents a distinct landing position within
+    # one loop iteration.  The correction value for each is:
+    #   correction = delta_cycles - TDC_FIXED_OVERHEAD
+    # which ranges from 0 to (len(primary) - 1).  We reject any
+    # correction >= len(primary).
+    #
+    # At 600 MHz: 6 primary clusters (overhead=50, values 50-55, loop=6)
+    #   → corrections 0-5, reject >=6, so MAX_CORRECTION=6
+    #
+    # At 1008 MHz: 5 primary clusters (overhead=48, values 48-52, loop=1)
+    #   → corrections 0-4, reject >=5, so MAX_CORRECTION=5
+    #
+    # This is correct regardless of TDC_LOOP_CYCLES because the number
+    # of valid landing positions is a property of the interrupt pipeline,
+    # not the loop structure.
+    tdc_max_correction = len(primary)
 
     print()
     print(f"  TDC_FIXED_OVERHEAD = {tdc_fixed_overhead}")
@@ -357,8 +372,9 @@ def analyze(campaign: str) -> None:
         print(f"  TDC_LOOP_CYCLES    = {tdc_loop_cycles}")
     else:
         print(f"  TDC_LOOP_CYCLES    = (undetermined — need raw cycle data)")
-    print(f"  TDC_MAX_CORRECTION = {tdc_max_correction}")
-    print(f"  Primary clusters   = {len(primary)}")
+    print(f"  TDC_MAX_CORRECTION = {tdc_max_correction}  (from {len(primary)} primary clusters)")
+    print(f"  Primary clusters   = {primary}")
+    print(f"  Valid corrections  = 0..{tdc_max_correction - 1}  (reject >= {tdc_max_correction})")
     print()
 
     # --- Verify correction distribution ---
@@ -393,6 +409,45 @@ def analyze(campaign: str) -> None:
             print(f"\n    Below overhead: {out_of_range}")
 
         # Uniformity check
+        if len(correction_counter) > 1:
+            counts = list(correction_counter.values())
+            mean_cnt = sum(counts) / len(counts)
+            max_dev = max(abs(c - mean_cnt) / mean_cnt for c in counts) * 100
+            if max_dev < 20:
+                print(f"\n  ✅ Corrections roughly uniform (max deviation {max_dev:.0f}% from mean)")
+            else:
+                print(f"\n  ⚠️  Corrections non-uniform (max deviation {max_dev:.0f}% from mean)")
+
+    elif len(primary) > 1:
+        # TDC_LOOP_CYCLES undetermined but we have multiple clusters —
+        # show direct correction values (delta - overhead)
+        print("-" * 70)
+        print("CORRECTION DISTRIBUTION (direct, no modulo)")
+        print("-" * 70)
+        print()
+        print(f"  correction = delta - {tdc_fixed_overhead}")
+        print()
+
+        correction_counter = Counter()
+        out_of_range = 0
+
+        for d in deltas:
+            if d < tdc_fixed_overhead:
+                out_of_range += 1
+                continue
+            if d > primary[-1] + 20:
+                continue
+            correction = d - tdc_fixed_overhead
+            correction_counter[correction] += 1
+
+        for corr in sorted(correction_counter.keys()):
+            cnt = correction_counter[corr]
+            pct_val = (cnt / len(deltas)) * 100
+            print(f"    correction={corr}: {cnt:5d} ({pct_val:5.1f}%)")
+
+        if out_of_range:
+            print(f"\n    Below overhead: {out_of_range}")
+
         if len(correction_counter) > 1:
             counts = list(correction_counter.values())
             mean_cnt = sum(counts) / len(counts)
@@ -459,6 +514,19 @@ def analyze(campaign: str) -> None:
         print(f"  At 1008 MHz: overhead = {tdc_fixed_overhead} cyc × 0.992 ns = {tdc_fixed_overhead * 125 / 126:.1f} ns")
         print(f"  At 600 MHz:  loop    = 6 cyc × 1.667 ns = {6 * 5 / 3:.1f} ns")
         print(f"  At 1008 MHz: loop    = {tdc_loop_cycles} cyc × 0.992 ns = {tdc_loop_cycles * 125 / 126:.1f} ns")
+
+    # --- Correction precision summary ---
+    print()
+    print("-" * 70)
+    print("CORRECTION PRECISION")
+    print("-" * 70)
+    print()
+    if tdc_loop_cycles is not None:
+        correction_resolution_ns = tdc_loop_cycles * 125 / 126
+        uncorrected_window_ns = tdc_max_correction * 125 / 126
+        print(f"  Correction resolution:   {correction_resolution_ns:.2f} ns per correction step")
+        print(f"  Uncorrected ISR window:  {uncorrected_window_ns:.2f} ns ({tdc_max_correction} positions × {correction_resolution_ns:.2f} ns)")
+        print(f"  With TDC correction:     ±{correction_resolution_ns / 2:.2f} ns (quantization limit)")
 
     print()
     print("=" * 70)

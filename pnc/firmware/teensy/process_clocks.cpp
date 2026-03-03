@@ -435,12 +435,11 @@ static volatile uint32_t pre_pps_entry_gnss     = 0;
 // is false).
 //
 
-static constexpr bool     TDC_NEEDS_RECALIBRATION = true;
+static constexpr bool     TDC_NEEDS_RECALIBRATION = false;
 
-// Placeholder values from 600 MHz — DO NOT TRUST until re-derived
 static constexpr uint32_t TDC_FIXED_OVERHEAD   = 48;  // cycles: interrupt entry + ISR prologue
 static constexpr uint32_t TDC_LOOP_CYCLES      = 1;   // total cycles per loop iteration
-static constexpr uint32_t TDC_MAX_CORRECTION   = 1;   // shadow_to_edge can be 0..4, reject >=5
+static constexpr uint32_t TDC_MAX_CORRECTION   = 5;   // shadow_to_edge can be 0..4, reject >=5
 
 // Convert delta_cycles to shadow-to-edge correction in cycles.
 // Returns the correction, or -1 if delta_cycles is out of range
@@ -880,6 +879,14 @@ static void ocxo_calibration_servo(void) {
 // CPU cost: ~400 µs per second = ~0.04%.
 //
 
+static inline void mask_low_priority_irqs(uint8_t pri) {
+    __asm volatile("MSR BASEPRI, %0" : : "r"(pri) : "memory");
+}
+
+static inline void unmask_all_irqs() {
+    __asm volatile("MSR BASEPRI, %0" : : "r"(0) : "memory");
+}
+
 static void pre_pps_fine_cb(timepop_ctx_t*, void*) {
 
   diag_fine_fire_count++;
@@ -916,10 +923,16 @@ static void pre_pps_fine_cb(timepop_ctx_t*, void*) {
   // the Teensy.  Acceptable because PPS is GPS-disciplined.
   // --------------------------------------------------------
 
+  // Block all interrupts with priority >= 32 (allows only PPS at 0)
+  mask_low_priority_irqs(32);
+
   for (;;) {
-    dispatch_shadow_dwt = DWT_CYCCNT;
-    if (pps_fired) break;
+      dispatch_shadow_dwt = DWT_CYCCNT;
+      if (pps_fired) break;
   }
+
+  // Restore normal interrupt handling
+  unmask_all_irqs();
 
   // Normal exit: PPS ISR fired while we were spinning.
   // isr_captured_shadow_dwt holds the true pre-ISR shadow.
@@ -1686,6 +1699,5 @@ void process_clocks_init(void) {
     RISING
   );
 
-  int pps_irq = digitalPinToInterrupt(GNSS_PPS_PIN);
-  NVIC_SET_PRIORITY(1, 0);  // highest priority — preempts everything
+  NVIC_SET_PRIORITY(IRQ_GPIO6789, 0);  // This is PPS from GF-8802
 }

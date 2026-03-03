@@ -1412,9 +1412,36 @@ def _process_loop() -> None:
             "isr_residual_pi": round(_residual_pi.residual * PI_NS_PER_TICK, 3) if _residual_pi.valid else None,
 
             # Teensy dispatch profiling / PPS diagnostics
+            #
+            # The pre-PPS spin loop captures the DWT shadow register
+            # continuously.  The PPS ISR snapshots the shadow, and
+            # the ASAP callback computes dispatch latency and TDC
+            # correction.  All fields below are from the Teensy's
+            # TIMEBASE_FRAGMENT.
+            #
+            # Latency and TDC correction (per-edge):
             "diag_teensy_dispatch_delta_ns": frag.get("dispatch_delta_ns"),
+            "diag_teensy_dispatch_shadow_ns": frag.get("dispatch_shadow_ns"),
+            "diag_teensy_dispatch_isr_ns": frag.get("dispatch_isr_ns"),
             "diag_teensy_pps_edge_valid": frag.get("pps_edge_valid"),
             "diag_teensy_pps_edge_correction_ns": frag.get("pps_edge_correction_ns"),
+            "diag_teensy_tdc_needs_recal": frag.get("tdc_needs_recal"),
+
+            # Approach time: GNSS ns from spin loop entry to PPS edge.
+            # Tells you how long the spin loop actually ran.
+            "diag_teensy_approach_ns": frag.get("pre_pps_approach_ns"),
+
+            # Spin loop status for THIS edge:
+            "diag_teensy_dispatch_timeout": frag.get("dispatch_timeout"),
+            "diag_teensy_fine_was_late": frag.get("diag_fine_was_late"),
+            "diag_teensy_spin_iters": frag.get("diag_spin_iters"),
+
+            # Monotonic counters (diff consecutive records for per-second rates):
+            "diag_teensy_coarse_fires": frag.get("diag_coarse_fires"),
+            "diag_teensy_fine_fires": frag.get("diag_fine_fires"),
+            "diag_teensy_late_count": frag.get("diag_late"),
+            "diag_teensy_spin_count": frag.get("diag_spins"),
+            "diag_teensy_timeout_count": frag.get("diag_timeouts"),
 
             # Raw DWT cycle counts for TDC derivation
             "diag_raw_isr_cyc": frag.get("diag_raw_isr_cyc"),
@@ -1430,6 +1457,55 @@ def _process_loop() -> None:
 
             # GF-8802 discipline snapshot (correlated with this PPS edge)
             "gnss": gnss_info,
+
+            # Running Welford statistics — per-clock-domain residual
+            # accumulators snapshotted at this PPS edge.  These are
+            # cumulative from campaign start (or last reset).
+            #
+            # Each domain carries:
+            #   n        — sample count
+            #   mean_ns  — mean residual (ns)
+            #   stddev_ns — population stddev of residual (ns)
+            #   stderr_ns — standard error of the mean (ns)
+            #   tau      — cumulative clock_ns / gnss_ns ratio
+            #   ppb      — cumulative parts-per-billion offset vs GNSS
+            #
+            # The Pi residual tracker uses display_scale=PI_NS_PER_TICK,
+            # so its mean/stddev/stderr are already in nanoseconds.
+            "stats": {
+                "gnss": {
+                    "n": _residual_gnss.n,
+                    "mean_ns": round(_residual_gnss.mean * _residual_gnss.display_scale, 3),
+                    "stddev_ns": round(_residual_gnss.stddev * _residual_gnss.display_scale, 3),
+                    "stderr_ns": round(_residual_gnss.stderr * _residual_gnss.display_scale, 3),
+                    "tau": round(_compute_tau(gnss_ns, gnss_ns), 12) if gnss_ns else None,
+                    "ppb": round(_compute_ppb(gnss_ns, gnss_ns), 3) if gnss_ns else None,
+                },
+                "dwt": {
+                    "n": _residual_dwt.n,
+                    "mean_ns": round(_residual_dwt.mean * _residual_dwt.display_scale, 3),
+                    "stddev_ns": round(_residual_dwt.stddev * _residual_dwt.display_scale, 3),
+                    "stderr_ns": round(_residual_dwt.stderr * _residual_dwt.display_scale, 3),
+                    "tau": round(_compute_tau(dwt_ns, gnss_ns), 12) if gnss_ns else None,
+                    "ppb": round(_compute_ppb(dwt_ns, gnss_ns), 3) if gnss_ns else None,
+                },
+                "ocxo": {
+                    "n": _residual_ocxo.n,
+                    "mean_ns": round(_residual_ocxo.mean * _residual_ocxo.display_scale, 3),
+                    "stddev_ns": round(_residual_ocxo.stddev * _residual_ocxo.display_scale, 3),
+                    "stderr_ns": round(_residual_ocxo.stderr * _residual_ocxo.display_scale, 3),
+                    "tau": round(_compute_tau(ocxo_ns, gnss_ns), 12) if gnss_ns else None,
+                    "ppb": round(_compute_ppb(ocxo_ns, gnss_ns), 3) if gnss_ns else None,
+                },
+                "pi": {
+                    "n": _residual_pi.n,
+                    "mean_ns": round(_residual_pi.mean * _residual_pi.display_scale, 3),
+                    "stddev_ns": round(_residual_pi.stddev * _residual_pi.display_scale, 3),
+                    "stderr_ns": round(_residual_pi.stderr * _residual_pi.display_scale, 3),
+                    "tau": round(_compute_tau(int(pi_ns), gnss_ns), 12) if (gnss_ns and pi_ns is not None) else None,
+                    "ppb": round(_compute_ppb(int(pi_ns), gnss_ns), 3) if (gnss_ns and pi_ns is not None) else None,
+                },
+            },
         }
 
         report = _build_report(campaign, campaign_payload, timebase)
