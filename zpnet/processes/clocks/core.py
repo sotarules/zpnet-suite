@@ -1605,6 +1605,19 @@ def cmd_start(args: Optional[dict]) -> dict:
     # the Teensy's software counters and PITIMER's epoch.
     _request_teensy_stop_best_effort()
     _stop_pitimer_best_effort()
+
+    # Drain stale fragments from the previous campaign.  Without this,
+    # the processor thread may dequeue fragments that belonged to the
+    # old campaign, call _get_active_campaign() (which now returns the
+    # NEW campaign), and persist them under the wrong campaign name.
+    # Those stale records create duplicate pps_count values when the
+    # new campaign's counters eventually reach the same pps_count.
+    while not _fragment_queue.empty():
+        try:
+            _fragment_queue.get_nowait()
+        except queue.Empty:
+            break
+
     _reset_trackers()
 
     # Prepare sync wait FIRST
