@@ -9,6 +9,7 @@ Core contract (v2026-03-02+):
   Architecture:
     • Teensy owns: GNSS ns, DWT ns/cycles, OCXO ns — in TIMEBASE_FRAGMENT
     • PITIMER owns: Pi ticks, Pi ns (epoch-relative) — in GET_CAPTURE
+    • GNSS owns: GF-8802 discipline state — in GET_GNSS_INFO
     • CLOCKS owns: correlation, Welford statistics, campaign lifecycle
 
   v4 Nanosecond Recovery:
@@ -62,7 +63,9 @@ Core contract (v2026-03-02+):
 Responsibilities:
   * Receive TIMEBASE_FRAGMENT from Teensy (queue-buffered)
   * Fetch correlated Pi capture from PITIMER by pps_count
-  * Augment fragment with Pi capture, GNSS time, and system time
+  * Fetch GF-8802 discipline snapshot from GNSS (GET_GNSS_INFO)
+  * Augment fragment with Pi capture, GNSS time, GNSS discipline,
+    environment, and system time
   * Publish TIMEBASE
   * Persist TIMEBASE to PostgreSQL (append-only, best-effort)
   * Compute per-clock residual statistics (Welford's algorithm)
@@ -226,6 +229,11 @@ _diag: Dict[str, Any] = {
     "gnss_wait_seconds_total": 0.0,
     "gnss_wait_seconds_last": 0.0,
     "last_gnss_wait": {},
+
+    # GNSS discipline info fetch
+    "gnss_info_requests": 0,
+    "gnss_info_hits": 0,
+    "gnss_info_misses": 0,
 
     # Residual outliers (all clocks)
     "outliers_rejected_total": 0,
@@ -946,6 +954,37 @@ def _fetch_environment() -> Optional[Dict[str, Any]]:
         return None
 
 
+def _fetch_gnss_info() -> Optional[Dict[str, Any]]:
+    """
+    Fetch GF-8802 discipline snapshot from GNSS GET_GNSS_INFO.
+
+    Returns the flat payload dict (freq_mode, pps_timing_error_ns,
+    freq_error_ppb, clock_drift_ppb, temperature_c, traim, etc.)
+    or None if unavailable.
+
+    Best-effort — a miss here should never block TIMEBASE production.
+    The returned dict is embedded verbatim as the "gnss" block in
+    each TIMEBASE record, providing per-second visibility into the
+    GF-8802's discipline loop alongside the Teensy and Pi clock data.
+    """
+    _diag["gnss_info_requests"] += 1
+    try:
+        resp = send_command(
+            machine="PI",
+            subsystem="GNSS",
+            command="GET_GNSS_INFO",
+        )
+        if resp.get("success"):
+            _diag["gnss_info_hits"] += 1
+            return resp.get("payload", {}) if isinstance(resp, dict) else {}
+        _diag["gnss_info_misses"] += 1
+        return None
+    except Exception:
+        _diag["gnss_info_misses"] += 1
+        logging.debug("⚠️ [clocks] _fetch_gnss_info failed (ignored)")
+        return None
+
+
 def _pitimer_report() -> Dict[str, Any]:
     """Fetch latest PITIMER state (non-destructive, for diagnostics only)."""
     try:
@@ -1315,6 +1354,9 @@ def _process_loop() -> None:
         # --- Environment snapshot (best-effort, never blocks TIMEBASE) ---
         env_snapshot = _fetch_environment()
 
+        # --- GNSS discipline snapshot (best-effort, never blocks TIMEBASE) ---
+        gnss_info = _fetch_gnss_info()
+
         # --- Campaign lookup ---
         row = _get_active_campaign()
         if row is None:
@@ -1385,6 +1427,9 @@ def _process_loop() -> None:
 
             # Environment snapshot (correlated with this PPS edge)
             "environment": env_snapshot,
+
+            # GF-8802 discipline snapshot (correlated with this PPS edge)
+            "gnss": gnss_info,
         }
 
         report = _build_report(campaign, campaign_payload, timebase)
