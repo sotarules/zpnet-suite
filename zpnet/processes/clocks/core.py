@@ -1576,7 +1576,7 @@ def _process_loop() -> None:
                         """,
                         (
                             json.dumps({
-                                "ocxo_dac": int(teensy_ocxo_dac),
+                                "ocxo_dac": float(teensy_ocxo_dac),
                                 "calibrate_ocxo": bool(teensy_calibrate),
                                 "servo_converged": bool(teensy_converged),
                             }),
@@ -1585,6 +1585,24 @@ def _process_loop() -> None:
                     )
             except Exception:
                 logging.exception("⚠️ [clocks] failed to persist OCXO DAC (ignored)")
+
+        # Persist calibrated DAC to SYSTEM config so it survives
+        # across campaigns.  Only during active calibration — we
+        # don't overwrite a manually-set value during normal runs.
+        if teensy_calibrate and teensy_ocxo_dac is not None:
+            try:
+                with open_db() as conn:
+                    cur = conn.cursor()
+                    cur.execute(
+                        """
+                        UPDATE config
+                        SET payload = payload || %s::jsonb
+                        WHERE config_key = 'SYSTEM'
+                        """,
+                        (json.dumps({"ocxo_dac": float(teensy_ocxo_dac)}),),
+                    )
+            except Exception:
+                logging.exception("⚠️ [clocks] failed to persist OCXO DAC to config (ignored)")
 
 
 # ---------------------------------------------------------------------
@@ -1715,8 +1733,8 @@ def cmd_start(args: Optional[dict]) -> dict:
                 cur.execute("SELECT payload FROM config WHERE config_key = 'SYSTEM'")
                 row = cur.fetchone()
                 if row and row["payload"].get("ocxo_dac") is not None:
-                    set_dac = int(row["payload"]["ocxo_dac"])
-                    logging.info("🔧 [clocks] using ocxo_dac=%d from SYSTEM config", set_dac)
+                    set_dac = float(row["payload"]["ocxo_dac"])
+                    logging.info("🔧 [clocks] using ocxo_dac=%s from SYSTEM config", set_dac)
         except Exception:
             logging.exception("⚠️ [clocks] failed to read SYSTEM config (ignored)")
 
@@ -1725,7 +1743,7 @@ def cmd_start(args: Optional[dict]) -> dict:
         "started_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
     }
     if set_dac is not None:
-        campaign_payload["ocxo_dac"] = int(set_dac)
+        campaign_payload["ocxo_dac"] = float(set_dac)
     if calibrate_ocxo:
         campaign_payload["calibrate_ocxo"] = True
 
@@ -1815,7 +1833,7 @@ def cmd_start(args: Optional[dict]) -> dict:
     logging.info("📡 [start] @%s arming TEENSY START: pps_count=0", system_time_z())
     teensy_args: Dict[str, Any] = {"campaign": campaign}
     if set_dac is not None:
-        teensy_args["set_dac"] = str(int(set_dac))
+        teensy_args["set_dac"] = str(set_dac)
     if calibrate_ocxo:
         teensy_args["calibrate_ocxo"] = "true"
 
@@ -2255,7 +2273,7 @@ def _recover_campaign() -> None:
         recover_ocxo_dac = campaign_payload.get("ocxo_dac")
         recover_calibrate = campaign_payload.get("calibrate_ocxo", False)
         if recover_ocxo_dac is not None:
-            teensy_args["set_dac"] = str(int(recover_ocxo_dac))
+            teensy_args["set_dac"] = str(float(recover_ocxo_dac))
         if recover_calibrate:
             teensy_args["calibrate_ocxo"] = "true"
 
@@ -2329,7 +2347,7 @@ def _recover_campaign() -> None:
 
     if recover_ocxo_dac is not None:
         logging.info(
-            "🔧 [recovery] OCXO DAC: %d (calibrate=%s, converged=%s)",
+            "🔧 [recovery] OCXO DAC: %s (calibrate=%s, converged=%s)",
             recover_ocxo_dac, recover_calibrate, recover_converged,
         )
 
@@ -2540,7 +2558,7 @@ def _recover_campaign() -> None:
         "ocxo_ns": str(int(projected_ocxo_ns)),
     }
     if recover_ocxo_dac is not None:
-        teensy_recover_args["set_dac"] = str(int(recover_ocxo_dac))
+        teensy_recover_args["set_dac"] = str(float(recover_ocxo_dac))
     if recover_calibrate and not recover_converged:
         teensy_recover_args["calibrate_ocxo"] = "true"
 
@@ -3095,20 +3113,31 @@ def cmd_clocks_info(_: Optional[dict]) -> Dict[str, Any]:
     return {"success": True, "message": "OK", "payload": payload}
 
 
+# ============================================================================
+# 4. cmd_set_dac — accept and persist float
+# ============================================================================
+#
+# Full replacement:
+#
+
 def cmd_set_dac(args: Optional[dict]) -> Dict[str, Any]:
     """
     SET_DAC(dac)
 
     Update the OCXO DAC value in the SYSTEM config record.
     This becomes the default DAC for subsequent campaign starts.
+    Accepts integer or decimal values (e.g. 3054 or 3054.238).
     """
     if not args or "dac" not in args:
         return {"success": False, "message": "SET_DAC requires 'dac' argument"}
 
     try:
-        dac = int(args["dac"])
+        dac = float(args["dac"])
     except (ValueError, TypeError):
         return {"success": False, "message": f"Invalid dac value: {args['dac']}"}
+
+    if dac < 0 or dac > 4095:
+        return {"success": False, "message": f"DAC value {dac} out of range (0–4095)"}
 
     try:
         with open_db() as conn:
@@ -3127,7 +3156,7 @@ def cmd_set_dac(args: Optional[dict]) -> Dict[str, Any]:
         logging.exception("❌ [clocks] SET_DAC failed")
         return {"success": False, "message": str(e)}
 
-    logging.info("🔧 [clocks] SET_DAC: ocxo_dac=%d", dac)
+    logging.info("🔧 [clocks] SET_DAC: ocxo_dac=%s", dac)
     return {"success": True, "message": "OK", "payload": {"ocxo_dac": dac}}
 
 

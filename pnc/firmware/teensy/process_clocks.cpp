@@ -240,58 +240,33 @@ static uint64_t recover_ocxo_ns = 0;
 static uint64_t campaign_seconds = 0;
 
 // ============================================================================
-// OCXO DAC Control (Teensy pin 22 / A22 → OCXO CTL pin)
+// 1. Replace the OCXO DAC state block (was lines 358–376)
 // ============================================================================
-//
-// The DAC is initialized at boot and always active.
-// The current DAC value is published in every TIMEBASE_FRAGMENT.
-//
-// Calibration mode: when calibrate_ocxo_active is true, the PPS
-// callback runs a perpetual servo loop that adjusts the DAC to
-// drive the OCXO residual toward zero (tau → 1.0).
-//
-// The servo NEVER converges.  It continuously tracks the OCXO
-// residual and adjusts the DAC as needed.  This compensates for
-// thermal drift, supply voltage changes, and aging over the
-// lifetime of a campaign.
-//
-// Algorithm (proportional with clamping):
-//
-//   1) Wait for SERVO_MIN_SAMPLES of fresh Welford data
-//   2) Wait SERVO_SETTLE_SECONDS after the last DAC change
-//   3) Read the current mean residual (ticks per PPS)
-//   4) If mean is zero, do nothing (but keep watching)
-//   5) Compute step = -mean_residual (1:1 conservative ratio)
-//   6) Clamp step to ±SERVO_MAX_STEP
-//   7) Apply step, reset Welford, reset settle counter
-//
-// The 1:1 ratio is conservative (actual sensitivity is ~1.6
-// ticks per DAC count).  This prevents overshoot and lets the
-// servo approach zero asymptotically.
-//
-// The servo resets Welford stats after each DAC change so only
-// post-change data informs the next decision.
-//
 
-static uint32_t ocxo_dac_value = OCXO_DAC_DEFAULT;
+static double   ocxo_dac_fractional = (double)OCXO_DAC_DEFAULT;
 
-// Calibration state
+// Dither state — driven by TIMEPOP_CLASS_OCXO_DITHER at 1 kHz
+static uint32_t dither_cycle  = 0;
+static constexpr uint32_t DITHER_PERIOD = 1000;
+
+// Calibration state (unchanged names, servo now adjusts the double)
 static bool     calibrate_ocxo_active = false;
 static int32_t  servo_step            = 0;       // last step applied (for diagnostics)
-static int32_t  servo_last_residual   = 0;       // last mean residual used for decision
+static double   servo_last_residual   = 0.0;     // last mean residual used for decision
 static uint32_t servo_settle_count    = 0;       // PPS cycles since last DAC change
 static uint32_t servo_adjustments     = 0;       // total DAC adjustments made (monotonic)
 
-// Servo tuning constants
+// Servo tuning constants (unchanged)
 static constexpr int32_t  SERVO_MAX_STEP       = 64;   // maximum single DAC step
 static constexpr uint32_t SERVO_SETTLE_SECONDS = 5;    // seconds to wait after DAC change
 static constexpr uint32_t SERVO_MIN_SAMPLES    = 10;   // minimum residual samples before acting
 
-// Helper: write DAC value, clamped to valid range
-static void ocxo_dac_write(uint32_t value) {
-  if (value > OCXO_DAC_MAX) value = OCXO_DAC_MAX;
-  ocxo_dac_value = value;
-  analogWrite(OCXO_CTL_PIN, ocxo_dac_value);
+// Set the fractional DAC value.  Clamped to valid range.
+// The dither callback handles all physical DAC writes.
+static void ocxo_dac_set(double value) {
+  if (value < (double)OCXO_DAC_MIN) value = (double)OCXO_DAC_MIN;
+  if (value > (double)OCXO_DAC_MAX) value = (double)OCXO_DAC_MAX;
+  ocxo_dac_fractional = value;
 }
 
 // ============================================================================
@@ -831,23 +806,22 @@ static void clocks_zero_all(void) {
 }
 
 // ============================================================================
-// OCXO Calibration Servo (Perpetual Proportional Tracker)
+// 3. Updated calibration servo — adjusts ocxo_dac_fractional (double)
 // ============================================================================
 //
-// Called once per PPS from the ASAP callback, only when
-// calibrate_ocxo_active is true and campaign is STARTED.
+// The servo now operates in fractional DAC space.  Instead of computing
+// an integer step and calling ocxo_dac_write(), it computes a double
+// adjustment and calls ocxo_dac_set().  The dither callback translates
+// the fractional value into physical DAC writes.
 //
-// Uses the callback-level OCXO residual (Welford) because it provides
-// a running mean that filters single-sample noise.
+// The proportional gain is now expressed in DAC counts per tick of
+// residual.  At ~1.6 ticks per DAC count, a gain of 1/1.6 ≈ 0.625
+// would be unity.  We use 0.5 (conservative, slight undershoot) to
+// avoid oscillation while still converging.
 //
-// The servo NEVER stops.  It continuously evaluates the mean
-// residual and adjusts the DAC to drive it toward zero.  When
-// the mean is already zero, it does nothing but keeps watching.
-// If the OCXO drifts (thermal, supply, aging), the servo
-// corrects on the next evaluation cycle.
-//
-// Pull slope is positive: higher voltage = higher frequency.
-// So: negative mean (slow) → increase DAC, positive mean (fast) → decrease.
+// The dead band is removed.  With fractional resolution, the servo
+// can make arbitrarily small adjustments.  Sub-tick residuals that
+// were previously in the dead band now produce sub-LSB DAC corrections.
 //
 
 static void ocxo_calibration_servo(void) {
@@ -862,49 +836,33 @@ static void ocxo_calibration_servo(void) {
   if (servo_settle_count < SERVO_SETTLE_SECONDS) return;
 
   // Read the current mean residual (ticks per PPS interval).
-  // This is a double — critical for sub-tick resolution.
-  // At 10 MHz, 1 tick = 100 ns, so a mean of -0.966 is -96.6 ppb.
-  // Truncating to int32_t would lose this entirely.
+  // At 10 MHz, 1 tick = 100 ns, so a mean of -0.042 = -4.2 ppb.
   // Negative = OCXO running slow, positive = running fast.
   double mean_residual = residual_ocxo.mean;
 
-  // Record for diagnostics (truncated, but the real decision uses the double)
-  servo_last_residual = (int32_t)mean_residual;
+  // Record for diagnostics
+  servo_last_residual = mean_residual;
 
-  // Dead band: if |mean| < 0.1 ticks (10 ppb at 10 MHz), don't adjust.
-  // The OCXO is close enough — avoid chasing noise.
-  // But keep watching: don't reset Welford, don't reset settle.
-  // The mean will continue to refine with more samples.
-  if (fabs(mean_residual) < 0.1) return;
+  // Dead band: if |mean| < 0.01 ticks (1 ppb at 10 MHz), don't adjust.
+  // With fractional DAC resolution we can be much tighter than before.
+  if (fabs(mean_residual) < 0.01) return;
 
-  // Proportional step: estimate DAC change from current residual.
+  // Proportional step in fractional DAC counts.
   // Empirical sensitivity: ~1.6 ticks per DAC count at 10 MHz.
-  // Use conservative 1:1 ratio to avoid overshoot.
-  // Round away from zero so sub-tick drift always produces a step.
+  // Use gain of 0.5 (conservative) to avoid oscillation.
   // Negative residual (slow) → positive step (increase voltage).
   // Positive residual (fast) → negative step (decrease voltage).
-  int32_t step;
-  if (mean_residual < 0.0) {
-    step = (int32_t)((-mean_residual) + 0.5);
-    if (step < 1) step = 1;
-  } else {
-    step = -(int32_t)(mean_residual + 0.5);
-    if (step > -1) step = -1;
-  }
+  double step = -mean_residual * 0.5;
 
   // Clamp to SERVO_MAX_STEP to bound the maximum single move
-  if (step > SERVO_MAX_STEP) step = SERVO_MAX_STEP;
-  if (step < -SERVO_MAX_STEP) step = -SERVO_MAX_STEP;
+  if (step > (double)SERVO_MAX_STEP) step = (double)SERVO_MAX_STEP;
+  if (step < -(double)SERVO_MAX_STEP) step = -(double)SERVO_MAX_STEP;
 
-  // Apply the step
-  int32_t new_dac = (int32_t)ocxo_dac_value + step;
-  if (new_dac < (int32_t)OCXO_DAC_MIN) new_dac = (int32_t)OCXO_DAC_MIN;
-  if (new_dac > (int32_t)OCXO_DAC_MAX) new_dac = (int32_t)OCXO_DAC_MAX;
-
-  ocxo_dac_write((uint32_t)new_dac);
+  // Apply the fractional step
+  ocxo_dac_set(ocxo_dac_fractional + step);
 
   // Record for diagnostics
-  servo_step = step;
+  servo_step = (int32_t)(step >= 0.0 ? step + 0.5 : step - 0.5);
   servo_adjustments++;
 
   // Reset settle counter — wait for OCXO to respond
@@ -1320,7 +1278,7 @@ static void pps_asap_callback(timepop_ctx_t*, void*) {
     p.add("tdc_needs_recal",        TDC_NEEDS_RECALIBRATION);
 
     // OCXO DAC control state (always present, unconditional)
-    p.add("ocxo_dac",              ocxo_dac_value);
+    p.add("ocxo_dac",              ocxo_dac_fractional);
     p.add("calibrate_ocxo",        calibrate_ocxo_active);
     p.add("servo_adjustments",     servo_adjustments);
 
@@ -1465,6 +1423,22 @@ static void pps_isr(void) {
 }
 
 // ============================================================================
+// 2. Dither callback — armed in process_clocks_init(), runs forever
+// ============================================================================
+
+static void ocxo_dither_cb(timepop_ctx_t*, void*) {
+  uint32_t base = (uint32_t)ocxo_dac_fractional;
+  double frac = ocxo_dac_fractional - (double)base;
+  uint32_t threshold = (uint32_t)(frac * DITHER_PERIOD);
+
+  dither_cycle = (dither_cycle + 1) % DITHER_PERIOD;
+
+  uint32_t output = (dither_cycle < threshold) ? base + 1 : base;
+  if (output > OCXO_DAC_MAX) output = OCXO_DAC_MAX;
+  analogWrite(OCXO_CTL_PIN, output);
+}
+
+// ============================================================================
 // Commands
 // ============================================================================
 
@@ -1483,9 +1457,9 @@ static Payload cmd_start(const Payload& args) {
   // The Pi persists the last good DAC value and sends it back
   // on campaign start so the Teensy doesn't have to remember.
   // ----------------------------------------------------------
-  uint32_t dac_val;
-  if (args.tryGetUInt("set_dac", dac_val)) {
-    ocxo_dac_write(dac_val);
+  double dac_val;
+  if (args.tryGetDouble("set_dac", dac_val)) {
+    ocxo_dac_set(dac_val);
   }
 
   // ----------------------------------------------------------
@@ -1509,7 +1483,7 @@ static Payload cmd_start(const Payload& args) {
 
   Payload p;
   p.add("status", "start_requested");
-  p.add("ocxo_dac", ocxo_dac_value);
+  p.add("ocxo_dac", ocxo_dac_fractional);
   p.add("calibrate_ocxo", calibrate_ocxo_active);
   return p;
 }
@@ -1543,9 +1517,19 @@ static Payload cmd_recover(const Payload& args) {
   recover_ocxo_ns = strtoull(s_ocxo,   nullptr, 10);
 
   // Restore DAC value if provided (Pi persists this)
-  uint32_t dac_val;
-  if (args.tryGetUInt("set_dac", dac_val)) {
-    ocxo_dac_write(dac_val);
+  double dac_val;
+  if (args.tryGetDouble("set_dac", dac_val)) {
+    ocxo_dac_set(dac_val);
+  }
+
+  // Restore calibration state if provided (Pi persists this)
+  calibrate_ocxo_active = args.has("calibrate_ocxo");
+
+  if (calibrate_ocxo_active) {
+    servo_step          = 0;
+    servo_last_residual = 0.0;
+    servo_settle_count  = 0;
+    // Preserve servo_adjustments — running count across recovery
   }
 
   request_recover = true;
@@ -1659,7 +1643,7 @@ static Payload cmd_report(const Payload&) {
   p.add("tdc_needs_recal",        TDC_NEEDS_RECALIBRATION);
 
   // OCXO DAC control state
-  p.add("ocxo_dac",              ocxo_dac_value);
+  p.add("ocxo_dac",              ocxo_dac_fractional);
   p.add("calibrate_ocxo",        calibrate_ocxo_active);
   p.add("servo_adjustments",     servo_adjustments);
   p.add("servo_step",             servo_step);
@@ -1735,7 +1719,18 @@ void process_clocks_init(void) {
   // Initialize before clock capture so the OCXO starts receiving
   // a defined control voltage immediately.
   analogWriteResolution(12);
-  ocxo_dac_write(OCXO_DAC_DEFAULT);
+  ocxo_dac_set((double)OCXO_DAC_DEFAULT);
+
+  // Arm the dither timer — runs forever, even when no campaign is active.
+  // 1 kHz (1 ms period) is three orders of magnitude faster than the
+  // OCXO thermal time constant (~1–10 s), ensuring perfect integration.
+  timepop_arm(
+    TIMEPOP_CLASS_OCXO_DITHER,
+    true,                    // recurring
+    ocxo_dither_cb,
+    nullptr,
+    "ocxo-dither"
+  );
 
   dwt_enable();
   arm_gpt2_external();    // GNSS VCLOCK -> GPT2 pin 14, raw 10 MHz, polled

@@ -60,6 +60,7 @@ typedef enum {
   TIMEPOP_CLASS_USER_1,
   TIMEPOP_CLASS_USER_2,
   TIMEPOP_CLASS_TX_PUMP,
+  TIMEPOP_CLASS_OCXO_DITHER,
   TIMEPOP_CLASS_PRE_PPS_COARSE,  // First stage: 999 ms after PPS (ms-resolution).
                                   // Callback arms the µs-resolution second stage.
 
