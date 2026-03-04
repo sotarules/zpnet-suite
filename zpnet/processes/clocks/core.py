@@ -89,6 +89,7 @@ import logging
 import math
 import queue
 import threading
+import subprocess
 import time
 from datetime import datetime, timezone
 from typing import Dict, Any, Optional, Tuple
@@ -140,6 +141,10 @@ PITIMER_CAPTURE_RETRY_INTERVAL_S = 0.010  # 10ms per retry = 200ms max
 # This prevents the death spiral where CLOCKS falls further behind
 # with every retry cycle.
 PITIMER_STALE_THRESHOLD = 5
+
+# Add near the other configuration constants:
+PREFLIGHT_POLL_INTERVAL_S = 30
+PREFLIGHT_LOG_PREFIX = "🛡️ [preflight]"
 
 # ---------------------------------------------------------------------
 # Fragment queue (decouples reception from processing)
@@ -1622,6 +1627,9 @@ def cmd_start(args: Optional[dict]) -> dict:
     START — v4 nanosecond architecture with flash-cut support:
 
     If NO campaign is active (cold start):
+      0. Wait for preflight prerequisites (GNSS lock, chrony PPS
+         selected, PITIMER warm).  This ensures the system clock is
+         aligned with true PPS edges before arming.
       1. Reject if campaign name already exists in DB.
       2. Create campaign in DB (deactivate any prior).
       3. Stop Teensy + PITIMER (best-effort).
@@ -1646,6 +1654,9 @@ def cmd_start(args: Optional[dict]) -> dict:
     The flash-cut is seamless: no STOP, no power cycle, no GNSS re-acquisition.
     The only observable effect is that nanosecond counters and pps_count reset
     to zero.  The OCXOs, GNSS receiver, and PPS stream are never interrupted.
+
+    The preflight gate is skipped on flash-cut because the system is already
+    running — chrony is locked, PITIMER is warm, GNSS is disciplined.
     """
     global _campaign_active, _armed_pps_count
 
@@ -1656,6 +1667,21 @@ def cmd_start(args: Optional[dict]) -> dict:
     # --- Check for active campaign (determines cold start vs flash-cut) ---
     active_row = _get_active_campaign()
     flash_cut = active_row is not None
+
+    # ------------------------------------------------------------------
+    # Cold start only: wait for preflight prerequisites.
+    #
+    # On flash-cut the system is already running — chrony is locked,
+    # PITIMER is warm, GNSS is disciplined.  No gate needed.
+    #
+    # On cold start the system may have just booted.  The preflight
+    # gate ensures GNSS lock, chrony PPS selection, and PITIMER warmth
+    # before we proceed.  This prevents the pps_count desynchronization
+    # that occurs when PITIMER's ppscapture_next() detects phantom
+    # second boundaries from an undisciplined system clock.
+    # ------------------------------------------------------------------
+    if not flash_cut:
+        _wait_for_preflight("start")
 
     # --- Reject duplicate campaign name ---
     with open_db(row_dict=True) as conn:
@@ -1843,7 +1869,6 @@ def cmd_start(args: Optional[dict]) -> dict:
             "previous_campaign": active_row["campaign"] if flash_cut else None,
         },
     }
-
 
 def cmd_stop(_: Optional[dict]) -> dict:
     global _campaign_active
@@ -2098,6 +2123,10 @@ def _recover_campaign() -> None:
     Each instrument derives its own internal representation.
 
     Algorithm:
+      0. Wait for preflight prerequisites (GNSS lock, chrony PPS
+         selected, PITIMER warm).  This replaces the old
+         _wait_for_gnss_time() call and ensures the system clock
+         is aligned with true PPS edges before arming either side.
       1. Read last TIMEBASE row for clock nanosecond values and
          GNSS wall-clock timestamp.
       2. Get current GNSS wall-clock time.
@@ -2108,8 +2137,8 @@ def _recover_campaign() -> None:
       7. For each clock domain, project forward using the ratio
          from the last TIMEBASE — pure integer arithmetic:
            projected_ns = projected_gnss_ns * last_clock_ns // last_gnss_ns
-      8. Send RECOVER to Teensy with projected dwt_ns, gnss_ns, ocxo_ns.
-      9. Send RECOVER to PITIMER with projected pi_ns.
+      8. Send RECOVER to PITIMER with projected pi_ns.
+      9. Send RECOVER to Teensy with projected dwt_ns, gnss_ns, ocxo_ns.
      10. Wait for sync fragment, activate campaign.
 
     No DWT cycle counts.  No Pi epochs.  No +2 padding.  No special cases.
@@ -2167,9 +2196,8 @@ def _recover_campaign() -> None:
         # campaign record.
         # ---------------------------------------------------------------
 
-        # Wait for GNSS time
-        logging.info("⏳ [recovery/cold] waiting for GNSS time...")
-        _wait_for_gnss_time()
+        # Wait for all preflight prerequisites
+        _wait_for_preflight("recovery/cold")
 
         # Restore GNSS TO mode if campaign had location
         if campaign_location:
@@ -2306,11 +2334,15 @@ def _recover_campaign() -> None:
         )
 
     # ------------------------------------------------------------------
-    # Step 2: Wait for GNSS time availability
+    # Step 2: Wait for all preflight prerequisites
+    #
+    # This replaces the old _wait_for_gnss_time() call.  The preflight
+    # gate ensures GNSS lock, chrony PPS selection, and PITIMER warmth
+    # before we proceed.  Once it passes, the system clock is aligned
+    # with true PPS edges, eliminating the pps_count desynchronization
+    # that occurred when recovery was attempted before chrony locked.
     # ------------------------------------------------------------------
-    logging.info("⏳ [recovery] waiting for GNSS time...")
-    gnss_time_preflight = _wait_for_gnss_time()
-    logging.info("✅ [recovery] GNSS time available: %s", gnss_time_preflight)
+    _wait_for_preflight("recovery")
 
     # Restore GNSS TO mode if campaign had location
     if campaign_location:
@@ -2470,11 +2502,28 @@ def _recover_campaign() -> None:
     _reset_trackers()
 
     # ------------------------------------------------------------------
-    # Step 6: Begin sync wait, arm Teensy RECOVER + PITIMER RECOVER
+    # Step 6: Begin sync wait, arm PITIMER RECOVER then Teensy RECOVER
+    #
+    # PITIMER is armed FIRST.  The Teensy's two-phase ISR + ASAP
+    # architecture allows it to apply RECOVER retroactively to an edge
+    # whose ISR already fired.  PITIMER cannot — once ppscapture_next()
+    # returns and the capture is discarded as idle, that edge is gone.
+    # By arming PITIMER first, we maximize the window for PITIMER to be
+    # in RUNNING state when the next PPS edge arrives.
     # ------------------------------------------------------------------
     _begin_sync_wait(expected_pps=int(next_pps_count))
 
-    # Teensy RECOVER — all nanoseconds, no cycle counts
+    # PITIMER RECOVER — symmetric, nanoseconds only (FIRST)
+    logging.info(
+        "📡 [recovery] @%s arming PITIMER RECOVER:\n"
+        "    pps_count = %d\n"
+        "    pi_ns     = %d",
+        system_time_z(), next_pps_count, projected_pi_ns,
+    )
+
+    _recover_pitimer(pps_count=int(next_pps_count), pi_ns=int(projected_pi_ns))
+
+    # Teensy RECOVER — all nanoseconds, no cycle counts (SECOND)
     logging.info(
         "📡 [recovery] @%s arming TEENSY RECOVER:\n"
         "    pps_count = %d\n"
@@ -2496,16 +2545,6 @@ def _recover_campaign() -> None:
         teensy_recover_args["calibrate_ocxo"] = "true"
 
     _request_teensy_recover(int(next_pps_count), teensy_recover_args)
-
-    # PITIMER RECOVER — symmetric, nanoseconds only
-    logging.info(
-        "📡 [recovery] @%s arming PITIMER RECOVER:\n"
-        "    pps_count = %d\n"
-        "    pi_ns     = %d",
-        system_time_z(), next_pps_count, projected_pi_ns,
-    )
-
-    _recover_pitimer(pps_count=int(next_pps_count), pi_ns=int(projected_pi_ns))
 
     # The sync fragment will also be enqueued for the processor thread.
     # Arm at next_pps_count so the processor accepts it and advances itself.
@@ -2680,6 +2719,203 @@ def cmd_set_baseline(args: Optional[dict]) -> Dict[str, Any]:
 
     logging.info("✅ [clocks] baseline set: id=%d campaign='%s' ppb=%s", baseline_id, row["campaign"], baseline_ppb)
     return {"success": True, "message": "OK", "payload": baseline_blob}
+
+# ---------------------------------------------------------------------
+# Preflight gate — prerequisites for campaign start/recovery
+# ---------------------------------------------------------------------
+#
+# The system must not attempt to start or recover a campaign until the
+# physical measurement chain is trustworthy.  This function checks a
+# strict set of prerequisites and returns a structured verdict.
+#
+# Design:
+#   • Every constraint is checked independently and reported by name.
+#   • The function returns (ready: bool, reasons: List[str]).
+#   • If ready is False, reasons contains a human-readable line for
+#     each unmet constraint — suitable for direct logging.
+#   • If ready is True, reasons is empty.
+#   • Callers should retry at calm intervals (e.g. 30s) until ready.
+#
+# Constraints:
+#   1. GNSS time must be valid (GF-8802 has time and date from satellites)
+#   2. GNSS lock quality must be MEDIUM or STRONG (not WEAK)
+#   3. GNSS PPS must be valid (discipline loop is active — TPS4 reporting)
+#   4. Chrony must have selected the PPS refclock as its time source
+#   5. PITIMER capture loop must be alive (producing captures)
+#
+# Rationale:
+#   Without GNSS lock, the PPS signal is unanchored — measurements are
+#   meaningless.  Without chrony PPS selection, the Pi system clock
+#   second boundaries do not align with true PPS edges, which causes
+#   PITIMER's ppscapture_next() to detect phantom boundaries.  This
+#   desynchronizes the pps_count assignment between PITIMER and the
+#   Teensy, producing the off-by-one failure observed in cold restart.
+#
+# This function must be added to clocks/core.py.  It requires
+# `import subprocess` to be added to the imports.
+# ---------------------------------------------------------------------
+
+
+def _check_preflight() -> tuple[bool, list[str]]:
+    """
+    Check whether the system is ready to start or recover a campaign.
+
+    Returns:
+        (ready, reasons) where ready is True if all prerequisites are
+        met, and reasons is a list of human-readable strings describing
+        each unmet constraint.
+    """
+    reasons: list[str] = []
+
+    # -----------------------------------------------------------------
+    # 1. GNSS time valid
+    # -----------------------------------------------------------------
+    try:
+        gnss_resp = send_command(machine="PI", subsystem="GNSS", command="REPORT")
+        if not gnss_resp.get("success"):
+            reasons.append("GNSS REPORT unavailable")
+        else:
+            gnss = gnss_resp.get("payload", {})
+
+            # 1a. Time valid
+            if not gnss.get("time_valid"):
+                reasons.append("GNSS time not valid (no satellite time/date)")
+
+            # 2. Lock quality
+            lock_quality = gnss.get("lock_quality", "WEAK")
+            if lock_quality == "WEAK":
+                reasons.append(
+                    f"GNSS lock quality is WEAK "
+                    f"(satellites={gnss.get('satellites', '?')}, "
+                    f"hdop={gnss.get('hdop', '?')})"
+                )
+
+            # 3. PPS valid (discipline loop active)
+            if not gnss.get("pps_valid"):
+                reasons.append("GNSS PPS not valid (discipline loop not active)")
+            else:
+                # Extra: check that discipline is in a good state
+                discipline = gnss.get("discipline", {})
+                freq_mode = discipline.get("freq_mode", -1)
+                freq_mode_name = discipline.get("freq_mode_name", "UNKNOWN")
+                # freq_mode: 0=IDLE, 1=WARM_UP, 2=COARSE_LOCK, 3=FINE_LOCK, 4=HOLDOVER, 5=RECOVERY
+                # We require at least COARSE_LOCK (2) for recovery, FINE_LOCK (3) is ideal
+                if freq_mode < 2:
+                    reasons.append(
+                        f"GNSS discipline not locked "
+                        f"(freq_mode={freq_mode} '{freq_mode_name}', "
+                        f"need at least COARSE_LOCK)"
+                    )
+
+    except Exception as e:
+        reasons.append(f"GNSS REPORT failed: {e}")
+
+    # -----------------------------------------------------------------
+    # 4. Chrony PPS selected
+    # -----------------------------------------------------------------
+    try:
+        result = subprocess.run(
+            ["chronyc", "-c", "sources"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if result.returncode != 0:
+            reasons.append(f"chronyc sources failed (rc={result.returncode})")
+        else:
+            # chronyc -c sources outputs CSV lines:
+            # mode,state,name,stratum,poll,reach,last_rx,last_sample_offset,last_sample_err
+            # We need a line where name contains "PPS" and state == "*" (selected)
+            # In -c mode: field[0] = mode char (^=server, #=refclock), field[1] = state char
+            pps_selected = False
+            for line in result.stdout.strip().splitlines():
+                fields = line.split(",")
+                if len(fields) >= 3:
+                    state = fields[1]
+                    name = fields[2]
+                    if "PPS" in name.upper() and state == "*":
+                        pps_selected = True
+                        break
+
+            if not pps_selected:
+                reasons.append(
+                    "chrony has not selected PPS as time source "
+                    "(system clock may not align with PPS edges)"
+                )
+
+    except subprocess.TimeoutExpired:
+        reasons.append("chronyc sources timed out")
+    except FileNotFoundError:
+        reasons.append("chronyc not found")
+    except Exception as e:
+        reasons.append(f"chrony check failed: {e}")
+
+    # -----------------------------------------------------------------
+    # 5. PITIMER capture loop alive
+    # -----------------------------------------------------------------
+    try:
+        pit_resp = send_command(machine="PI", subsystem="PITIMER", command="REPORT")
+        if not pit_resp.get("success"):
+            reasons.append("PITIMER REPORT unavailable")
+        else:
+            pit = pit_resp.get("payload", {})
+            diag = pit.get("diag", {})
+            captures_total = diag.get("captures_total", 0)
+            if captures_total < 3:
+                reasons.append(
+                    f"PITIMER capture loop not warm "
+                    f"(captures_total={captures_total}, need >= 3)"
+                )
+
+    except Exception as e:
+        reasons.append(f"PITIMER REPORT failed: {e}")
+
+    ready = len(reasons) == 0
+    return ready, reasons
+
+
+def _wait_for_preflight(context: str = "recovery") -> None:
+    """
+    Block until all preflight prerequisites are met.
+
+    Logs the unmet constraints every PREFLIGHT_POLL_INTERVAL_S seconds
+    so the operator can see exactly what the system is waiting for.
+
+    Args:
+        context: "recovery" or "start" — used only in log messages.
+    """
+    attempt = 0
+    t0 = time.monotonic()
+
+    while True:
+        ready, reasons = _check_preflight()
+
+        if ready:
+            elapsed = time.monotonic() - t0
+            if attempt > 0:
+                logging.info(
+                    "%s @%s all prerequisites met after %d checks (%.0fs) — "
+                    "proceeding with %s",
+                    PREFLIGHT_LOG_PREFIX, system_time_z(),
+                    attempt, elapsed, context,
+                )
+            else:
+                logging.info(
+                    "%s @%s all prerequisites met — proceeding with %s",
+                    PREFLIGHT_LOG_PREFIX, system_time_z(), context,
+                )
+            return
+
+        attempt += 1
+        elapsed = time.monotonic() - t0
+
+        # Log each unmet constraint on its own line for clarity
+        reason_block = "\n".join(f"    • {r}" for r in reasons)
+        logging.info(
+            "%s @%s not ready for %s (check #%d, %.0fs elapsed):\n%s",
+            PREFLIGHT_LOG_PREFIX, system_time_z(),
+            context, attempt, elapsed, reason_block,
+        )
+
+        time.sleep(PREFLIGHT_POLL_INTERVAL_S)
 
 
 def cmd_baseline_info(_: Optional[dict]) -> Dict[str, Any]:
