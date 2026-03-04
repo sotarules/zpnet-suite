@@ -599,6 +599,43 @@ uint64_t clocks_dwt_ns_now(void) {
 }
 
 // ============================================================================
+// 10 KHz GNSS Relay — GPT2 Output Compare Channel 1 ISR
+// ============================================================================
+//
+// GPT2 counts the GNSS 10 MHz VCLOCK at 1:1 (no prescaler).
+// Output Compare 1 fires every 1,000 ticks (100 µs).
+// The ISR toggles GNSS_10KHZ_RELAY (pin 9) and advances
+// the compare register by TIMEPULSE_GNSS_TICKS.
+//
+// This produces a 5 KHz square wave (50% duty cycle) that is
+// phase-locked to the GNSS clock by construction — the counter
+// IS the GNSS clock.
+//
+// Phase alignment with PPS: the PPS ISR resets GPT2_OCR1 on
+// every PPS edge so that the 10 KHz edges are phase-coherent
+// with the 1 Hz PPS boundary.
+//
+// Runs continuously from boot, independent of campaign state.
+//
+
+static volatile bool timepulse_relay_state = false;
+
+static void gpt2_compare_isr(void) {
+
+  // Clear Output Compare 1 flag (write 1 to clear)
+  GPT2_SR = GPT_SR_OF1;
+
+  // Toggle the 10 KHz relay pin
+  timepulse_relay_state = !timepulse_relay_state;
+  digitalWriteFast(GNSS_10KHZ_RELAY, timepulse_relay_state ? HIGH : LOW);
+
+  // Advance compare register by 1,000 GNSS ticks.
+  // This is wrap-safe: GPT2 is a 32-bit free-running counter
+  // and unsigned addition handles the wrap naturally.
+  GPT2_OCR1 += TIMEPULSE_GNSS_TICKS;
+}
+
+// ============================================================================
 // GNSS VCLOCK (10 MHz external via GPT2 — raw, polled)
 // ============================================================================
 
@@ -623,12 +660,33 @@ static void arm_gpt2_external(void) {
   IOMUXC_GPT2_IPP_IND_CLKIN_SELECT_INPUT = 1;
 
   GPT2_CR = 0;
-  GPT2_SR = 0x3F;
+  GPT2_SR = 0x3F;                    // Clear all status flags
   GPT2_PR = 0;
   GPT2_CR = GPT_CR_CLKSRC(3) | GPT_CR_FRR;
   GPT2_CR |= GPT_CR_EN;
 
   gnss_last_32 = GPT2_CNT;
+
+  // ----------------------------------------------------------
+  // 10 KHz relay: configure Output Compare Channel 1
+  //
+  // Set initial compare value relative to current counter.
+  // The ISR will advance by TIMEPULSE_GNSS_TICKS on each match.
+  // ----------------------------------------------------------
+
+  GPT2_OCR1 = GPT2_CNT + TIMEPULSE_GNSS_TICKS;
+
+  // Enable Output Compare 1 interrupt
+  GPT2_IR = GPT_IR_OF1IE;
+
+  // Install GPT2 ISR and enable in NVIC.
+  // Priority 16: below PPS (priority 0) but above normal.
+  // This ensures PPS ISR always preempts the 10 KHz ISR,
+  // which is critical for PPS phase realignment.
+  attachInterruptVector(IRQ_GPT2, gpt2_compare_isr);
+  NVIC_SET_PRIORITY(IRQ_GPT2, 16);
+  NVIC_ENABLE_IRQ(IRQ_GPT2);
+
   gpt2_armed = true;
 }
 
@@ -1700,4 +1758,10 @@ void process_clocks_init(void) {
   );
 
   NVIC_SET_PRIORITY(IRQ_GPIO6789, 0);  // This is PPS from GF-8802
+
+  // 10 KHz GNSS relay output to Pi (pin 9 -> Pi GPIO 25)
+  // Configured as OUTPUT, initially LOW.
+  // Driven by GPT2 Output Compare ISR at 10 KHz toggle rate.
+  pinMode(GNSS_10KHZ_RELAY, OUTPUT);
+  digitalWriteFast(GNSS_10KHZ_RELAY, LOW);
 }

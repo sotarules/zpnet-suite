@@ -153,3 +153,14 @@ static const uint32_t PHOTODIODE_OFF_STABLE_MS = 20;
 // --------------------------------------------------------------
 static const float ADC_FS_VOLTS  = 3.3f;
 static const float ADC_FS_COUNTS = 4095.0f;
+
+// --------------------------------------------------------------
+// TIMEPULSE 10KHz relay
+// --------------------------------------------------------------
+
+static const int GNSS_10KHZ_RELAY = 9;
+
+// TIMEPULSE: GPT2 output compare interval for 10 KHz relay.
+// At 10 MHz, 1000 ticks = 100 µs.  Toggle every 100 µs produces
+// a 5 KHz square wave (50% duty, 10,000 edges per second).
+static constexpr uint32_t TIMEPULSE_GNSS_TICKS = 500;
