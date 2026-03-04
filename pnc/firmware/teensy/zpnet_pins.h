@@ -103,7 +103,7 @@ GND           Black         GND                Battery branching ground         
 
 1             Orange        GNSS_PPS_IN        GNSS PPS                             1 Hz pulse for absolute time reference
 
-9             TBD (STP)     GNSS_10KHZ_RELAY   Pi GPIO25 via STP                    10 kHz GNSS clock relay output
+9             Twisted Pair  GNSS_10KHZ_RELAY   Pi GPIO25 via STP                    10 kHz GNSS clock relay output
                                                                                      GPT2 compare ISR toggles every 1000 GNSS ticks
                                                                                      Shield drained at Teensy GND (dupont header)
 
@@ -125,9 +125,6 @@ GND           Black         GND                Battery branching ground         
 
 Teensy Pin    Wire Color    Signal Name        Source / Destination                 Notes
 ------------------------------------------------------------------------------------------
-2             Yellow        RTC1_SQW_IN        DS3231 (Bus 1)                       Square wave output
-3             Yellow        RTC2_SQW_IN        DS3231 (Bus 2)                       Square wave output
-
 4             Green         GNSS_LOCK_IN       GF-8802                              Lock status signal
 
 25            Twised Pair   OCXO_10MHZ_IN      OCXO                                 GPT1 capture (critical)
@@ -343,13 +340,10 @@ INA260        0x41      Bridged    Open       Power monitor — 24V stepper moto
 INA260        0x44      Open       Bridged    Power monitor — Raspberry Pi
 INA260        0x45      Bridged    Bridged    Power monitor — 3.3V OCXO
 
-DS3231 RTC    0x68      Fixed      Fixed      Secondary real-time clock
-
 -------------------------------------------------------------------------------
 Notes:
 • INA260 base address is 0x40.
 • Address selection formula: 0x40 + (A1 << 1) + A0.
-• DS3231 address is fixed at 0x68 (no strap options).
 • All devices on this bus use SDA2/SCL2 (Green / Orange).
 • This bus has not yet been powered or scanned.
 • Address conflicts are not expected given current strapping.
@@ -379,7 +373,6 @@ INA260        0x44      Open       Open       Power monitor — Battery
 
 BME280        0x76      Fixed      Fixed      Environmental sensor
 EV5491        0x66      Fixed      Fixed      Laser controller (I2C)
-DS3231 RTC    0x68      Fixed      Fixed      Secondary real-time clock
 
 -------------------------------------------------------------------------------
 INA260 Address Mapping (Adafruit Boards)
