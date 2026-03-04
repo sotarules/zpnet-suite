@@ -133,6 +133,14 @@ FRAGMENT_QUEUE_MAXSIZE = 0
 PITIMER_CAPTURE_RETRIES = 20
 PITIMER_CAPTURE_RETRY_INTERVAL_S = 0.010  # 10ms per retry = 200ms max
 
+# PITIMER stale detection: if the gap between the requested pps_count
+# and the last successful hit exceeds this threshold, the capture has
+# been evicted from PITIMER's buffer (max 120 entries).  Skip
+# immediately instead of burning 200ms of retries on a hopeless case.
+# This prevents the death spiral where CLOCKS falls further behind
+# with every retry cycle.
+PITIMER_STALE_THRESHOLD = 5
+
 # ---------------------------------------------------------------------
 # Fragment queue (decouples reception from processing)
 # ---------------------------------------------------------------------
@@ -179,6 +187,8 @@ _diag: Dict[str, Any] = {
 
     # PITIMER skips (graceful — TIMEBASE not issued)
     "pitimer_skips_total": 0,
+    "pitimer_stale_skips": 0,
+    "pitimer_last_hit_pps_count": None,
     "last_pitimer_skip": {},
 
     # PITIMER lifecycle control plane
@@ -779,8 +789,38 @@ def _pitimer_get_capture(pps_count: int) -> Optional[Dict[str, Any]]:
     Retries briefly in case PITIMER hasn't captured this edge yet
     (the Teensy fragment can arrive before PITIMER's capture loop
     completes).  Returns None if not found after retries.
+
+    Stale detection: if we've been missing captures consecutively,
+    the requested pps_count has likely been evicted from PITIMER's
+    buffer (max 120 entries).  In that case, retrying is hopeless
+    and just deepens the death spiral.  We skip immediately.
     """
     _diag["pitimer_get_capture_requests"] += 1
+
+    # Stale detection: if we've missed more than PITIMER_STALE_THRESHOLD
+    # consecutive captures, the buffer has moved past us.  Skip
+    # immediately to let CLOCKS catch up to the present.
+    consecutive_misses = (
+        _diag["pitimer_get_capture_requests"]
+        - _diag["pitimer_get_capture_hits"]
+        - 1  # exclude the current request
+    ) - _diag.get("pitimer_stale_skips", 0)
+
+    # More precise: check gap between requested pps_count and last hit
+    last_hit_pps = _diag.get("pitimer_last_hit_pps_count")
+    if last_hit_pps is not None and (int(pps_count) - int(last_hit_pps)) > PITIMER_STALE_THRESHOLD:
+        _diag["pitimer_stale_skips"] = _diag.get("pitimer_stale_skips", 0) + 1
+        _diag["pitimer_get_capture_misses"] += 1
+        _diag["last_pitimer_get_capture"] = {
+            "ts_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+            "pps_count": int(pps_count),
+            "hit": False,
+            "retries": 0,
+            "stale_skip": True,
+            "gap": int(pps_count) - int(last_hit_pps),
+        }
+        return None
+
     retries = 0
 
     for attempt in range(PITIMER_CAPTURE_RETRIES + 1):
@@ -794,6 +834,7 @@ def _pitimer_get_capture(pps_count: int) -> Optional[Dict[str, Any]]:
             if resp.get("success"):
                 _diag["pitimer_get_capture_hits"] += 1
                 _diag["pitimer_get_capture_retries_total"] += retries
+                _diag["pitimer_last_hit_pps_count"] = int(pps_count)
                 _diag["last_pitimer_get_capture"] = {
                     "ts_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
                     "pps_count": int(pps_count),
@@ -2112,7 +2153,112 @@ def _recover_campaign() -> None:
 
     if tb_row is None:
         _diag["recovery_missing_timebase"] += 1
-        raise RuntimeError(f"recovery failed: campaign '{campaign_name}' has no TIMEBASE rows")
+        logging.info(
+            "ℹ️ [recovery] campaign '%s' has no TIMEBASE rows — "
+            "treating as fresh start (cold restart)",
+            campaign_name,
+        )
+
+        # ---------------------------------------------------------------
+        # Cold restart: the campaign was created but no TIMEBASE was ever
+        # produced (e.g. the system crashed during the initial START
+        # before the first PPS edge arrived).  We re-arm everything at
+        # pps_count=0 exactly as cmd_start would, reusing the existing
+        # campaign record.
+        # ---------------------------------------------------------------
+
+        # Wait for GNSS time
+        logging.info("⏳ [recovery/cold] waiting for GNSS time...")
+        _wait_for_gnss_time()
+
+        # Restore GNSS TO mode if campaign had location
+        if campaign_location:
+            logging.info("📡 [recovery/cold] restoring GNSS -> TO mode for '%s'", campaign_location)
+            gnss_resp = _set_gnss_mode_to(campaign_location)
+            if not gnss_resp.get("success"):
+                raise RuntimeError(f"recovery/cold failed: GNSS MODE=TO failed: {gnss_resp.get('message', '?')}")
+
+        # Wait for PUBSUB routing
+        logging.info("⏳ [recovery/cold] @%s waiting for PUBSUB routing...", system_time_z())
+        route_wait_t0 = time.monotonic()
+        while True:
+            elapsed_wait = time.monotonic() - route_wait_t0
+            try:
+                resp = send_command(machine="TEENSY", subsystem="PUBSUB", command="REPORT")
+                if resp.get("success"):
+                    routes = resp.get("payload", {}).get("routes", [])
+                    found = any(
+                        r.get("topic") == "TIMEBASE_FRAGMENT"
+                        and r.get("subsystem") == "CLOCKS"
+                        and r.get("machine") == "PI"
+                        for r in routes
+                    )
+                    if found:
+                        logging.info(
+                            "✅ [recovery/cold] @%s PUBSUB route confirmed (%.1fs)",
+                            system_time_z(), elapsed_wait,
+                        )
+                        break
+            except RuntimeError:
+                raise
+            except Exception:
+                pass
+            if elapsed_wait >= 30.0:
+                raise RuntimeError("recovery/cold failed: PUBSUB route not found in 30s")
+            time.sleep(0.5)
+
+        # Stop + drain + reset
+        _request_teensy_stop_best_effort()
+        _stop_pitimer_best_effort()
+
+        while not _fragment_queue.empty():
+            try:
+                _fragment_queue.get_nowait()
+            except queue.Empty:
+                break
+
+        _reset_trackers()
+
+        # Arm at pps_count=0
+        _begin_sync_wait(expected_pps=0)
+
+        # Build Teensy args from campaign payload
+        teensy_args: Dict[str, Any] = {"campaign": campaign_name}
+        recover_ocxo_dac = campaign_payload.get("ocxo_dac")
+        recover_calibrate = campaign_payload.get("calibrate_ocxo", False)
+        if recover_ocxo_dac is not None:
+            teensy_args["set_dac"] = str(int(recover_ocxo_dac))
+        if recover_calibrate:
+            teensy_args["calibrate_ocxo"] = "true"
+
+        logging.info("📡 [recovery/cold] @%s arming TEENSY START: pps_count=0", system_time_z())
+        _request_teensy_start(campaign=campaign_name, pps_count=0, args=teensy_args)
+
+        _start_pitimer(pps_count=0, pi_ns=0)
+
+        _armed_pps_count = 0
+        _diag["armed_pps_count"] = 0
+        _campaign_active = True
+
+        try:
+            frag, waited_s = _end_sync_wait()
+        except Exception:
+            _campaign_active = False
+            raise
+
+        logging.info(
+            "✅ [recovery/cold] @%s campaign '%s' cold-restarted — TIMEBASE begins\n"
+            "    waited = %.3fs",
+            system_time_z(), campaign_name, waited_s,
+        )
+
+        _diag["last_recovery"] = {
+            "ts_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+            "campaign": campaign_name,
+            "mode": "cold_restart",
+            "pps_count": 0,
+        }
+        return
 
     last_tb = tb_row["payload"]
     if isinstance(last_tb, str):
