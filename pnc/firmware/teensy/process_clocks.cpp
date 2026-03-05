@@ -181,18 +181,32 @@
 //   TIMEPULSE_TEENSY message has been retired — consumers should
 //   subscribe to TIMEBASE_FRAGMENT instead.
 //
-//   At every PPS edge, the PPS ISR realigns GPT2_OCR1 so that
-//   the 10 KHz grid remains phase-coherent with PPS.  The toggle
-//   state is reset to HIGH (logically), pin forced LOW, so the
-//   first post-PPS compare match produces a falling edge (no
-//   TIMEPULSE action) and the second produces a rising edge —
-//   the first TIMEPULSE tick of the new second, at exactly
-//   +100 µs after PPS.
+//   At every PPS edge, the PPS ISR captures the three hardware
+//   counters.  The 10 KHz grid is inherently phase-coherent with
+//   PPS because it is derived from the same GNSS VCLOCK by a
+//   fixed integer division.  No realignment is performed.
 //
-//   timepulse_ticks_at_pps reflects the full count including the
-//   compensating tick delivered by the ASAP callback.  Expected
-//   value is exactly 10000 every second when the system is
-//   operating correctly.
+//   PPS observation model:
+//
+//   TIMEPULSE is pure math on a proven-coherent foundation.
+//   The 10 MHz VCLOCK is phase-locked to PPS (empirically
+//   verified: zero residual on every sample).  GPT2 output
+//   compare divides by 1,000.  The ISR increments gnss_ns
+//   by TIMEPULSE_NS_PER_TICK on each rising edge.  This
+//   produces exactly 10,000 ticks per second and gnss_ns
+//   advances by exactly 1,000,000,000 ns.  Correct by
+//   construction.  No compensation, no snapping, no
+//   synthetic corrections of any kind.
+//
+//   At each PPS, the ASAP callback observes the state of
+//   the anchor as a diagnostic.  timepulse_phase_error_ns
+//   reports the difference between gnss_ns and the expected
+//   value.  A nonzero phase error is evidence of a problem
+//   below TIMEPULSE, not something to correct at this level.
+//
+//   timepulse_ticks_at_pps records the number of rising edges
+//   the ISR delivered in the preceding second.  This is a pure
+//   observation.
 //
 //   The quantized clock is zeroed on campaign START, restored on
 //   RECOVER, and publication is gated on campaign state.  The
@@ -297,9 +311,10 @@ static void pps_relay_deassert(timepop_ctx_t*, void*) {
 // TIMEPULSE — 10 KHz Anchor for Clock Domain Interpolation
 // ============================================================================
 //
-// timepulse_ticks_at_pps is captured AFTER the compensating tick
-// is delivered by the ASAP callback.  Expected value: exactly
-// 10000 every second for a correctly operating system.
+// TIMEPULSE is pure math.  The ISR increments gnss_ns on each
+// rising edge.  At PPS we observe — we do not correct.
+// timepulse_ticks_at_pps and timepulse_phase_error_ns are
+// read-only diagnostics.
 //
 
 struct timepulse_anchor_t {
@@ -317,9 +332,7 @@ static volatile uint32_t timepulse_tick_in_second  = 0;
 // TIMEPULSE diagnostic counters
 // ============================================================================
 
-static volatile uint32_t tp_diag_pps_realign_count = 0;
-
-// Captured AFTER compensating tick delivery. Expected: 10000.
+// ISR rising-edge count for the preceding second (diagnostic).
 static volatile uint32_t tp_diag_ticks_at_pps      = 0;
 
 static volatile int64_t  tp_diag_phase_error_ns    = 0;
@@ -363,8 +376,6 @@ static volatile int32_t  pre_pps_approach_ns   = -1;
 static volatile int64_t  pps_edge_ns            = -1;
 static volatile int32_t  pps_edge_correction_ns = -1;
 static volatile bool     pps_edge_valid         = false;
-
-static volatile uint32_t pre_pps_entry_gnss     = 0;
 
 // ============================================================================
 // Software TDC correction table
@@ -666,7 +677,6 @@ static void clocks_zero_all(void) {
   pps_edge_correction_ns  = -1;
   pps_edge_valid          = false;
   pre_pps_approach_ns     = -1;
-  pre_pps_entry_gnss      = 0;
 
   timepulse_anchor.gnss_ns  = 0;
   timepulse_anchor.dwt_snap = 0;
@@ -718,9 +728,33 @@ static inline void unmask_all_irqs() {
   __asm volatile("MSR BASEPRI, %0" : : "r"(0) : "memory");
 }
 
+static volatile uint32_t diag_approach_gpt2_cnt    = 0;
+static volatile uint32_t diag_approach_gnss_last32  = 0;
+static volatile uint64_t diag_approach_gnss_ticks64 = 0;
+static volatile uint64_t diag_approach_gnss_ns_now  = 0;
+static volatile uint64_t diag_approach_into_second  = 0;
+
 static void pre_pps_fine_cb(timepop_ctx_t*, void*) {
   diag_fine_fire_count++;
-  pre_pps_entry_gnss = GPT2_CNT;
+
+  // Compute approach time in GNSS nanoseconds: how far are we
+  // from the next PPS edge?
+  //
+  // Uses raw GPT2_CNT minus isr_snap_gnss (the PPS-edge snapshot).
+  // This is immune to the gnss_ticks_64 accumulator ordering issue:
+  // the ASAP callback and fine callback can land in the same
+  // timepop_dispatch() pass, with the ASAP updating gnss_last_32
+  // before the fine callback reads it.  Raw subtraction from the
+  // ISR snapshot has no such dependency.
+  uint32_t ticks_since_pps = (uint32_t)(GPT2_CNT - isr_snap_gnss);
+  pre_pps_approach_ns      = (int32_t)(ISR_GNSS_EXPECTED - ticks_since_pps) * 100;
+
+  // Debug captures
+  diag_approach_gpt2_cnt    = GPT2_CNT;
+  diag_approach_gnss_last32  = gnss_last_32;
+  diag_approach_gnss_ticks64 = gnss_ticks_64;
+  diag_approach_gnss_ns_now  = (uint64_t)ticks_since_pps * 100;
+  diag_approach_into_second  = ticks_since_pps;
 
   if (pps_fired) {
     diag_fine_late_count++;
@@ -745,13 +779,8 @@ static void pre_pps_fine_cb(timepop_ctx_t*, void*) {
   diag_spin_iterations  = 0;
 }
 
-static void pre_pps_coarse_cb(timepop_ctx_t*, void*) {
-  diag_coarse_fire_count++;
-  timepop_arm(TIMEPOP_CLASS_PRE_PPS, false, pre_pps_fine_cb, nullptr, "pre-pps-fine");
-}
-
 static void pre_pps_arm(void) {
-  timepop_arm(TIMEPOP_CLASS_PRE_PPS_COARSE, false, pre_pps_coarse_cb, nullptr, "pre-pps-coarse");
+  timepop_arm(TIMEPOP_CLASS_PRE_PPS_COARSE, false, pre_pps_fine_cb, nullptr, "pre-pps");
 }
 
 // ============================================================================
@@ -778,7 +807,6 @@ static void pps_asap_callback(timepop_ctx_t*, void*) {
     campaign_state = clocks_campaign_state_t::STOPPED;
     request_stop   = false;
     timepop_cancel(TIMEPOP_CLASS_PRE_PPS_COARSE);
-    timepop_cancel(TIMEPOP_CLASS_PRE_PPS);
     dispatch_shadow_valid = false;
     pps_fired             = true;
     calibrate_ocxo_active = false;
@@ -839,42 +867,30 @@ static void pps_asap_callback(timepop_ctx_t*, void*) {
     }
 
     // --------------------------------------------------------
-    // TIMEPULSE PPS diagnostics
+    // TIMEPULSE PPS observation
     //
-    // Deliver the compensating tick FIRST, then capture
-    // tp_diag_ticks_at_pps so the published value includes it.
-    // Expected: exactly 10000 every second.
+    // TIMEPULSE is pure math.  The 10 KHz ISR increments
+    // gnss_ns by 100,000 on every rising edge.  The foundation
+    // (GNSS 10 MHz phase-locked to PPS) guarantees exactly
+    // 10,000 rising edges per second.  gnss_ns is correct by
+    // construction.  We observe, we do not correct.
     // --------------------------------------------------------
 
-    if (timepulse_anchor.valid) {
-      timepulse_anchor.gnss_ns += TIMEPULSE_NS_PER_TICK;
-      timepulse_anchor.dwt_snap = isr_snap_dwt;
-      timepulse_tick_count++;
-      timepulse_tick_in_second++;
-    }
-
-    // Capture AFTER compensation — expected value is 10000.
     tp_diag_ticks_at_pps     = timepulse_tick_in_second;
     timepulse_tick_in_second = 0;
 
     if (timepulse_anchor.valid) {
-      uint64_t remainder = timepulse_anchor.gnss_ns % NS_PER_SECOND;
-      if (remainder == 0) {
-        tp_diag_phase_error_ns = 0;
-      } else {
-        tp_diag_phase_error_ns = (int64_t)remainder;
-        if (remainder > NS_PER_SECOND / 2)
-          tp_diag_phase_error_ns = (int64_t)remainder - (int64_t)NS_PER_SECOND;
-      }
+      uint64_t expected = campaign_seconds * NS_PER_SECOND;
+      tp_diag_phase_error_ns = (int64_t)timepulse_anchor.gnss_ns
+                             - (int64_t)expected;
     }
 
     // --------------------------------------------------------
     // Pre-PPS approach time
+    // (computed in pre_pps_fine_cb, in the GNSS domain)
     // --------------------------------------------------------
 
-    if (dispatch_shadow_valid) {
-      pre_pps_approach_ns = (int32_t)(isr_snap_gnss - pre_pps_entry_gnss) * 100;
-    } else if (dispatch_timeout) {
+    if (dispatch_timeout) {
       pre_pps_approach_ns = -1;
       dispatch_timeout    = false;
     }
@@ -994,16 +1010,22 @@ static void pps_asap_callback(timepop_ctx_t*, void*) {
     p.add("diag_isr_dwt_cycles", snap_dwt_cycles);
     p.add("diag_isr_dwt_ns",     snap_dwt_ns);
 
+    // Debug: pre-PPS approach internals
+    p.add("dbg_approach_gpt2_cnt",    diag_approach_gpt2_cnt);
+    p.add("dbg_approach_gnss_last32", diag_approach_gnss_last32);
+    p.add("dbg_approach_gnss_t64",    diag_approach_gnss_ticks64);
+    p.add("dbg_approach_gnss_ns_now", diag_approach_gnss_ns_now);
+    p.add("dbg_approach_into_second", diag_approach_into_second);
+
     // --------------------------------------------------------
     // TIMEPULSE diagnostics
-    // timepulse_ticks_at_pps: expected 10000 every second.
-    // timepulse_phase_error_ns: expected 0 every second.
+    // timepulse_ticks_at_pps: ISR rising edges in preceding second.
+    // timepulse_phase_error_ns: drift from expected (should be 0).
     // --------------------------------------------------------
 
     p.add("timepulse_ticks_at_pps",      tp_diag_ticks_at_pps);
     p.add("timepulse_phase_error_ns",    tp_diag_phase_error_ns);
     p.add("timepulse_tick_count",        timepulse_tick_count);
-    p.add("timepulse_pps_realign_count", tp_diag_pps_realign_count);
     p.add("timepulse_valid",             timepulse_anchor.valid);
 
     publish("TIMEBASE_FRAGMENT", p);
@@ -1034,18 +1056,6 @@ static void pps_isr(void) {
 
   digitalWriteFast(GNSS_PPS_RELAY, HIGH);
   relay_arm_pending = true;
-
-  // TIMEPULSE phase realignment:
-  // Force pin LOW, set state to true (as-if HIGH), clear pending
-  // match flag.  Next match = falling edge (no tick).  Match after
-  // that = rising edge = first tick of new second at +100 µs.
-  // Eaten tick is compensated in pps_asap_callback().
-  GPT2_OCR1 = snap_gnss + TIMEPULSE_GNSS_HALF_PERIOD;
-  GPT2_SR   = GPT_SR_OF1;
-  timepulse_relay_state = true;
-  digitalWriteFast(GNSS_10KHZ_RELAY, LOW);
-
-  tp_diag_pps_realign_count++;
 
   if (isr_residual_valid) {
     isr_residual_dwt  = (int32_t)(snap_dwt  - isr_prev_dwt)  - (int32_t)ISR_DWT_EXPECTED;
@@ -1131,6 +1141,11 @@ static Payload cmd_recover(const Payload& args) {
     Payload err;
     err.add("error", "missing recovery parameters (dwt_ns, gnss_ns, ocxo_ns)");
     return err;
+  }
+
+  const char* name = args.getString("campaign");
+  if (name && *name) {
+    safeCopy(campaign_name, sizeof(campaign_name), name);
   }
 
   recover_dwt_ns  = strtoull(s_dwt_ns, nullptr, 10);
@@ -1239,7 +1254,6 @@ static Payload cmd_report(const Payload&) {
   p.add("timepulse_ticks_at_pps",      tp_diag_ticks_at_pps);
   p.add("timepulse_phase_error_ns",    tp_diag_phase_error_ns);
   p.add("timepulse_tick_count",        timepulse_tick_count);
-  p.add("timepulse_pps_realign_count", tp_diag_pps_realign_count);
   p.add("timepulse_valid",             timepulse_anchor.valid);
 
   if (campaign_state == clocks_campaign_state_t::STARTED && gnss_ns > 0) {

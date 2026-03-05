@@ -2553,6 +2553,7 @@ def _recover_campaign() -> None:
     )
 
     teensy_recover_args: Dict[str, Any] = {
+        "campaign": campaign_name,  # <-- add this
         "dwt_ns": str(int(projected_dwt_ns)),
         "gnss_ns": str(int(projected_gnss_ns)),
         "ocxo_ns": str(int(projected_ocxo_ns)),

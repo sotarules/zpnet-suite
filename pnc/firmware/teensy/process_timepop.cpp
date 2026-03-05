@@ -78,9 +78,6 @@ static void init_class_definitions(void) {
   CLASS_DEF[TIMEPOP_CLASS_TX_PUMP]      = { TIMEPOP_INTERVAL_MS,      1 };
   CLASS_DEF[TIMEPOP_CLASS_OCXO_DITHER]  = { TIMEPOP_INTERVAL_MS,      1 };
   CLASS_DEF[TIMEPOP_CLASS_PRE_PPS_COARSE] = { TIMEPOP_INTERVAL_MS,  999 };
-
-  // --- Microsecond classes (PIT1) ---
-  CLASS_DEF[TIMEPOP_CLASS_PRE_PPS]      = { TIMEPOP_INTERVAL_US, 999 };
 }
 
 // ================================================================

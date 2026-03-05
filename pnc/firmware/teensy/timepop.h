@@ -61,15 +61,7 @@ typedef enum {
   TIMEPOP_CLASS_USER_2,
   TIMEPOP_CLASS_TX_PUMP,
   TIMEPOP_CLASS_OCXO_DITHER,
-  TIMEPOP_CLASS_PRE_PPS_COARSE,  // First stage: 999 ms after PPS (ms-resolution).
-                                  // Callback arms the µs-resolution second stage.
-
-  // === Microsecond classes (PIT1) ===
-  TIMEPOP_CLASS_PRE_PPS,   // Second stage: 999 µs after coarse (µs-resolution).
-                            // PPS edge, fires to enter shadow-copy spin loop.
-                            // Default period: 999000 µs (999 ms).
-                            // Overridable via timepop_arm_with_period().
-
+  TIMEPOP_CLASS_PRE_PPS_COARSE,
   TIMEPOP_CLASS_COUNT,
 } timepop_class_t;
 
