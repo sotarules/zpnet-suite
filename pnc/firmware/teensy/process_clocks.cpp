@@ -158,6 +158,40 @@
 //   via set_dac on subsequent campaign starts.  The Teensy
 //   never remembers anything across reboots.
 //
+// TIMEPULSE (10 KHz high-resolution clock domain interpolation):
+//
+//   GPT2 Output Compare 1 fires every TIMEPULSE_GNSS_HALF_PERIOD
+//   (500 GNSS ticks = 50 µs) and toggles GNSS_10KHZ_RELAY.
+//   This produces a 10 KHz square wave (full period = 1,000 GNSS
+//   ticks = 100 µs).
+//
+//   On the rising edge only (when toggle transitions to HIGH),
+//   the ISR:
+//     1) Captures DWT_CYCCNT
+//     2) Increments the quantized GNSS clock by TIMEPULSE_NS_PER_TICK
+//        (100,000 ns = 100 µs)
+//     3) Writes both values to a volatile anchor struct
+//
+//   This anchor is the TIMEPULSE "publication" on the Teensy:
+//   a direct memory read, zero allocation, zero dispatch.
+//   Timebase (and any future consumer) reads it synchronously.
+//
+//   A once-per-PPS diagnostic is published as TIMEPULSE_TEENSY
+//   via the normal publish() path for remote monitoring.
+//
+//   At every PPS edge, the PPS ISR realigns GPT2_OCR1 so that
+//   the 10 KHz grid remains phase-coherent with PPS.  The toggle
+//   state is reset to HIGH (logically), pin forced LOW, so the
+//   first post-PPS compare match produces a falling edge (no
+//   TIMEPULSE action) and the second produces a rising edge —
+//   the first TIMEPULSE tick of the new second, at exactly
+//   +100 µs after PPS.
+//
+//   The quantized clock is zeroed on campaign START, restored on
+//   RECOVER, and publication is gated on campaign state.  The
+//   10 KHz hardware signal runs continuously from boot regardless
+//   of campaign state.
+//
 // ============================================================================
 
 #include "debug.h"
@@ -293,6 +327,61 @@ static void pps_relay_deassert(timepop_ctx_t*, void*) {
 }
 
 // ============================================================================
+// TIMEPULSE — 10 KHz Anchor for Clock Domain Interpolation
+// ============================================================================
+//
+// The TIMEPULSE anchor is a volatile struct written by the 10 KHz
+// GPT2 compare ISR on every rising edge, and read synchronously
+// by Timebase (or any other consumer) via direct memory access.
+//
+// This is NOT a pub/sub publication.  On the Teensy, TIMEPULSE
+// is a memory-resident fact.  A once-per-PPS diagnostic summary
+// is published as "TIMEPULSE_TEENSY" for remote monitoring only.
+//
+// The quantized GNSS clock (timepulse_gnss_ns) increments by
+// TIMEPULSE_NS_PER_TICK (100,000 ns) on each rising edge.
+// It is zeroed on campaign START, restored on RECOVER, and
+// gated on campaign state.
+//
+// The DWT snapshot (timepulse_dwt_snap) is the raw 32-bit
+// DWT_CYCCNT captured at the same instant as the quantized
+// clock increment.  This is not 64-bit extended — the ISR
+// must remain minimal.
+//
+
+struct timepulse_anchor_t {
+  volatile uint64_t gnss_ns;     // quantized GNSS nanosecond clock
+  volatile uint32_t dwt_snap;    // raw DWT_CYCCNT at this rising edge
+  volatile bool     valid;       // true after first rising edge in campaign
+};
+
+static timepulse_anchor_t timepulse_anchor = {0, 0, false};
+
+// Monotonic tick count since campaign start (rising edges only)
+static volatile uint32_t timepulse_tick_count = 0;
+
+// Tick-within-second counter: 0..9999, resets at each PPS.
+// At PPS boundary this should be 10000 (exactly one second of
+// ticks).  Any other value indicates a phase error.
+static volatile uint32_t timepulse_tick_in_second = 0;
+
+// ============================================================================
+// TIMEPULSE diagnostic counters (published once per PPS)
+// ============================================================================
+
+// PPS phase realignment count (monotonic, never reset)
+static volatile uint32_t tp_diag_pps_realign_count = 0;
+
+// Ticks-in-second at last PPS: captured in the ASAP callback
+// before resetting.  Should be 10000 (one second of ticks).
+static volatile uint32_t tp_diag_ticks_at_pps = 0;
+
+// Phase error in nanoseconds: how far the quantized clock has
+// drifted from the expected value at PPS.  Computed in the ASAP
+// callback.  Should be zero for a perfectly locked system.
+static volatile int64_t  tp_diag_phase_error_ns = 0;
+
+// ============================================================================
 // ISR-level hardware snapshots and raw residuals
 // ============================================================================
 //
@@ -328,20 +417,6 @@ static constexpr uint32_t ISR_OCXO_EXPECTED =   10000000u;
 // ============================================================================
 // Pre-PPS dispatch latency profiling (DWT spin loop)
 // ============================================================================
-//
-// The fine-stage callback enters a tight spin loop that
-// continuously copies DWT_CYCCNT to a volatile shadow variable.
-// When the PPS ISR fires, it sets pps_fired = true, breaking
-// the loop.  The difference between the ISR's DWT snapshot and
-// the shadow value is the ISR dispatch latency.
-//
-// The spin loop has a defensive 500 ms timeout (504,000,000 DWT
-// cycles at 1008 MHz).  If the PPS doesn't arrive in time, the
-// loop exits and flags the failure.
-//
-// Results are expressed in nanoseconds using DWT's 125/126 ns/cycle
-// conversion, and published in TIMEBASE_FRAGMENT.
-//
 
 // Written by the spin loop continuously
 static volatile uint32_t dispatch_shadow_dwt    = 0;
@@ -381,34 +456,6 @@ static volatile uint32_t pre_pps_entry_gnss     = 0;
 // ============================================================================
 // Software TDC (Time-to-Digital Converter) correction table
 // ============================================================================
-//
-// The spin loop is a tight instruction sequence at 1008 MHz.
-//
-// *** IMPORTANT: These constants were derived at 600 MHz. ***
-// *** They MUST be re-derived from disassembly at 1008 MHz. ***
-//
-// At 1008 MHz the pipeline timing changes:
-//   • Instruction throughput increases (more cycles per second)
-//   • But the instruction SEQUENCE is identical (same binary)
-//   • The loop is still the same 5 instructions
-//   • Interrupt entry overhead changes (may be fewer/more cycles
-//     due to flash wait states and bus arbitration at new speed)
-//
-// To re-derive:
-//   1. Compile at 1008 MHz
-//   2. Disassemble the spin loop (arm-none-eabi-objdump -d)
-//   3. Verify instruction sequence is unchanged
-//   4. Measure delta_cycles empirically over many PPS edges
-//   5. The histogram of delta_cycles will cluster at N values
-//      separated by the loop cycle count
-//   6. TDC_FIXED_OVERHEAD = minimum observed delta_cycles
-//   7. TDC_LOOP_CYCLES = spacing between clusters
-//
-// Until re-derivation, TDC correction is DISABLED by setting
-// TDC_NEEDS_RECALIBRATION = true.  The ISR snapshot is used
-// as fallback (same behavior as when dispatch_shadow_valid
-// is false).
-//
 
 static constexpr bool     TDC_NEEDS_RECALIBRATION = false;
 
@@ -416,9 +463,6 @@ static constexpr uint32_t TDC_FIXED_OVERHEAD   = 48;  // cycles: interrupt entry
 static constexpr uint32_t TDC_LOOP_CYCLES      = 1;   // total cycles per loop iteration
 static constexpr uint32_t TDC_MAX_CORRECTION   = 5;   // shadow_to_edge can be 0..4, reject >=5
 
-// Convert delta_cycles to shadow-to-edge correction in cycles.
-// Returns the correction, or -1 if delta_cycles is out of range
-// or TDC needs recalibration.
 static inline int32_t tdc_correction_cycles(uint32_t delta_cycles) {
   if (TDC_NEEDS_RECALIBRATION) return -1;
   if (delta_cycles < TDC_FIXED_OVERHEAD) return -1;
@@ -430,32 +474,21 @@ static inline int32_t tdc_correction_cycles(uint32_t delta_cycles) {
 // ============================================================================
 // Dispatch profiling diagnostics
 // ============================================================================
-//
-// These counters and flags help diagnose why some PPS cycles
-// show stale shadow values (~1.43s delta) instead of the
-// expected ~80-90 ns dispatch latency.
-//
 
 // Monotonic counters — never reset, always increment
-static volatile uint32_t diag_coarse_fire_count = 0;  // coarse callback invocations
-static volatile uint32_t diag_fine_fire_count   = 0;  // fine callback invocations
-static volatile uint32_t diag_fine_late_count   = 0;  // fine arrived with pps_fired=true (too late)
-static volatile uint32_t diag_spin_count        = 0;  // times we entered the spin loop
-static volatile uint32_t diag_timeout_count     = 0;  // spin loop timeouts
+static volatile uint32_t diag_coarse_fire_count = 0;
+static volatile uint32_t diag_fine_fire_count   = 0;
+static volatile uint32_t diag_fine_late_count   = 0;
+static volatile uint32_t diag_spin_count        = 0;
+static volatile uint32_t diag_timeout_count     = 0;
 
-// Per-cycle flags — set by callbacks, consumed by ASAP publisher
-// These describe what happened on THIS PPS cycle.
-static volatile bool     diag_fine_was_late     = false;  // pps_fired was true at fine entry
-static volatile uint32_t diag_spin_iterations   = 0;      // how many loop iterations we did
+// Per-cycle flags
+static volatile bool     diag_fine_was_late     = false;
+static volatile uint32_t diag_spin_iterations   = 0;
 
 // ============================================================================
 // PPS residual tracking — per-clock-domain (Welford's, callback-level)
 // ============================================================================
-//
-// These use the 64-bit extended values from the callback for running
-// statistics.  The ISR residuals above are the raw, unprocessed
-// single-sample values.
-//
 
 static constexpr int64_t DWT_EXPECTED_PER_PPS  = 1008000000LL;
 static constexpr int64_t GNSS_EXPECTED_PER_PPS =   10000000LL;
@@ -522,24 +555,6 @@ static inline double residual_stderr(const pps_residual_t& r) {
 // ============================================================================
 // 64-bit Clock Extension — Unified Architecture
 // ============================================================================
-//
-// Each clock domain has exactly ONE state pair: {ticks_64, last_32}.
-// Exactly ONE function mutates this state: clocks_xxx_now().
-//
-// clocks_xxx_now() reads the LIVE hardware register, computes the
-// unsigned 32-bit delta from last_32, accumulates into ticks_64,
-// and updates last_32.  This is safe to call from ANY context
-// (ISR, callback, command handler, diagnostic) at ANY time, with
-// no ordering constraints.
-//
-// The only requirement is that it be called at least once per
-// 2^31 ticks of the hardware counter (to avoid wrap ambiguity):
-//   DWT  @ 1008 MHz: every ~2.13 seconds
-//   GNSS @   10 MHz: every ~214 seconds
-//   OCXO @   10 MHz: every ~214 seconds
-//
-// The 1-second PPS callback satisfies this with margin.
-//
 
 // ============================================================================
 // DWT (CPU cycle counter — 1008 MHz internal)
@@ -578,19 +593,30 @@ uint64_t clocks_dwt_ns_now(void) {
 // ============================================================================
 //
 // GPT2 counts the GNSS 10 MHz VCLOCK at 1:1 (no prescaler).
-// Output Compare 1 fires every 1,000 ticks (100 µs).
-// The ISR toggles GNSS_10KHZ_RELAY (pin 9) and advances
-// the compare register by TIMEPULSE_GNSS_TICKS.
+// Output Compare 1 fires every TIMEPULSE_GNSS_HALF_PERIOD
+// (500 GNSS ticks = 50 µs).
 //
-// This produces a 5 KHz square wave (50% duty cycle) that is
-// phase-locked to the GNSS clock by construction — the counter
-// IS the GNSS clock.
+// The ISR toggles GNSS_10KHZ_RELAY on each invocation, producing
+// a 5 KHz square wave (50% duty) — equivalently, 10,000 edges
+// per second with a full period of TIMEPULSE_GNSS_FULL_PERIOD
+// (1,000 GNSS ticks = 100 µs).
 //
-// Phase alignment with PPS: the PPS ISR resets GPT2_OCR1 on
-// every PPS edge so that the 10 KHz edges are phase-coherent
-// with the 1 Hz PPS boundary.
+// TIMEPULSE logic executes on the RISING EDGE ONLY:
+//   1) Capture DWT_CYCCNT
+//   2) Increment quantized GNSS clock by TIMEPULSE_NS_PER_TICK
+//   3) Write anchor struct
+//
+// The falling edge invocation does nothing beyond toggling the
+// pin and advancing the compare register.
+//
+// Phase alignment with PPS: the PPS ISR resets GPT2_OCR1 and
+// the toggle state on every PPS edge so that the 10 KHz grid
+// is phase-coherent with the 1 Hz PPS boundary.  The PPS ISR
+// has higher NVIC priority (0) than GPT2 (16), so it always
+// preempts.
 //
 // Runs continuously from boot, independent of campaign state.
+// TIMEPULSE publication (anchor writes) is campaign-gated.
 //
 
 static volatile bool timepulse_relay_state = false;
@@ -604,10 +630,33 @@ static void gpt2_compare_isr(void) {
   timepulse_relay_state = !timepulse_relay_state;
   digitalWriteFast(GNSS_10KHZ_RELAY, timepulse_relay_state ? HIGH : LOW);
 
-  // Advance compare register by 1,000 GNSS ticks.
+  // Advance compare register by half-period.
   // This is wrap-safe: GPT2 is a 32-bit free-running counter
   // and unsigned addition handles the wrap naturally.
-  GPT2_OCR1 += TIMEPULSE_GNSS_TICKS;
+  GPT2_OCR1 += TIMEPULSE_GNSS_HALF_PERIOD;
+
+  // ----------------------------------------------------------------
+  // TIMEPULSE: rising edge only, campaign-gated
+  //
+  // On the rising edge (relay just went HIGH), capture the DWT
+  // cycle count and advance the quantized GNSS clock.  This is
+  // the anchor that Timebase will use for interpolation.
+  //
+  // The falling edge (relay just went LOW) exits here.
+  // ----------------------------------------------------------------
+
+  if (!timepulse_relay_state) return;  // falling edge — nothing to do
+
+  if (campaign_state != clocks_campaign_state_t::STARTED) return;
+
+  const uint32_t snap_dwt = DWT_CYCCNT;
+
+  timepulse_anchor.gnss_ns  += TIMEPULSE_NS_PER_TICK;
+  timepulse_anchor.dwt_snap  = snap_dwt;
+  timepulse_anchor.valid     = true;
+
+  timepulse_tick_count++;
+  timepulse_tick_in_second++;
 }
 
 // ============================================================================
@@ -646,10 +695,10 @@ static void arm_gpt2_external(void) {
   // 10 KHz relay: configure Output Compare Channel 1
   //
   // Set initial compare value relative to current counter.
-  // The ISR will advance by TIMEPULSE_GNSS_TICKS on each match.
+  // The ISR will advance by TIMEPULSE_GNSS_HALF_PERIOD on each match.
   // ----------------------------------------------------------
 
-  GPT2_OCR1 = GPT2_CNT + TIMEPULSE_GNSS_TICKS;
+  GPT2_OCR1 = GPT2_CNT + TIMEPULSE_GNSS_HALF_PERIOD;
 
   // Enable Output Compare 1 interrupt
   GPT2_IR = GPT_IR_OF1IE;
@@ -722,15 +771,6 @@ uint64_t clocks_ocxo_ns_now(void) {
 // ============================================================================
 // Advance-then-rewind: recover 64-bit value at a past ISR snapshot
 // ============================================================================
-//
-// Each of these calls the domain's _now() to advance the accumulator
-// to the present, then rewinds by the small delta between the ISR
-// snapshot and the current register value.
-//
-// This is the ONLY way to obtain the 64-bit value at the PPS edge.
-// The _now() call is always safe and always moves forward.
-// The rewind is always a small positive number (< 1 second of ticks).
-//
 
 static uint64_t dwt_at_pps_edge(void) {
   uint64_t now_64 = clocks_dwt_cycles_now();
@@ -753,20 +793,12 @@ static uint64_t ocxo_at_pps_edge(void) {
 // ============================================================================
 // Zeroing (campaign-scoped — fresh start only, NOT used for recovery)
 // ============================================================================
-//
-// Zeroing must leave last_32 pointing at the ISR snapshot so that
-// the next _now() call correctly computes the delta from the PPS
-// edge.  The 64-bit accumulator starts at 0 — meaning "zero ticks
-// have elapsed since campaign start."
-//
 
 static void clocks_zero_all(void) {
-  // Advance accumulators to present first (safe, monotonic)
   clocks_dwt_cycles_now();
   clocks_gnss_ticks_now();
   clocks_ocxo_ticks_now();
 
-  // Zero the accumulators, anchor last_32 at the ISR snapshot
   dwt_cycles_64 = 0;
   dwt_last_32   = isr_snap_dwt;
 
@@ -778,18 +810,15 @@ static void clocks_zero_all(void) {
 
   campaign_seconds = 0;
 
-  // Reset callback-level residual tracking
   residual_reset(residual_dwt);
   residual_reset(residual_gnss);
   residual_reset(residual_ocxo);
 
-  // Reset ISR-level residual tracking
   isr_prev_dwt  = isr_snap_dwt;
   isr_prev_gnss = isr_snap_gnss;
   isr_prev_ocxo = isr_snap_ocxo;
   isr_residual_valid = false;
 
-  // Reset pre-PPS dispatch profiling
   dispatch_shadow_dwt      = 0;
   isr_captured_shadow_dwt  = 0;
   dispatch_shadow_valid    = false;
@@ -803,97 +832,53 @@ static void clocks_zero_all(void) {
   pps_edge_valid           = false;
   pre_pps_approach_ns      = -1;
   pre_pps_entry_gnss       = 0;
+
+  // Zero TIMEPULSE quantized clock and diagnostics.
+  // The 10 KHz ISR will begin incrementing from zero on the
+  // next rising edge (which occurs ~100 µs after this PPS).
+  timepulse_anchor.gnss_ns  = 0;
+  timepulse_anchor.dwt_snap = 0;
+  timepulse_anchor.valid    = false;
+  timepulse_tick_count      = 0;
+  timepulse_tick_in_second  = 0;
+  tp_diag_phase_error_ns    = 0;
+  tp_diag_ticks_at_pps      = 0;
 }
 
 // ============================================================================
-// 3. Updated calibration servo — adjusts ocxo_dac_fractional (double)
+// OCXO calibration servo
 // ============================================================================
-//
-// The servo now operates in fractional DAC space.  Instead of computing
-// an integer step and calling ocxo_dac_write(), it computes a double
-// adjustment and calls ocxo_dac_set().  The dither callback translates
-// the fractional value into physical DAC writes.
-//
-// The proportional gain is now expressed in DAC counts per tick of
-// residual.  At ~1.6 ticks per DAC count, a gain of 1/1.6 ≈ 0.625
-// would be unity.  We use 0.5 (conservative, slight undershoot) to
-// avoid oscillation while still converging.
-//
-// The dead band is removed.  With fractional resolution, the servo
-// can make arbitrarily small adjustments.  Sub-tick residuals that
-// were previously in the dead band now produce sub-LSB DAC corrections.
-//
 
 static void ocxo_calibration_servo(void) {
 
   if (!calibrate_ocxo_active) return;
-
-  // Wait for enough samples to have a meaningful mean
   if (residual_ocxo.n < SERVO_MIN_SAMPLES) return;
 
-  // Wait for the OCXO to settle after the last DAC change
   servo_settle_count++;
   if (servo_settle_count < SERVO_SETTLE_SECONDS) return;
 
-  // Read the current mean residual (ticks per PPS interval).
-  // At 10 MHz, 1 tick = 100 ns, so a mean of -0.042 = -4.2 ppb.
-  // Negative = OCXO running slow, positive = running fast.
   double mean_residual = residual_ocxo.mean;
-
-  // Record for diagnostics
   servo_last_residual = mean_residual;
 
-  // Dead band: if |mean| < 0.01 ticks (1 ppb at 10 MHz), don't adjust.
-  // With fractional DAC resolution we can be much tighter than before.
   if (fabs(mean_residual) < 0.01) return;
 
-  // Proportional step in fractional DAC counts.
-  // Empirical sensitivity: ~1.6 ticks per DAC count at 10 MHz.
-  // Use gain of 0.5 (conservative) to avoid oscillation.
-  // Negative residual (slow) → positive step (increase voltage).
-  // Positive residual (fast) → negative step (decrease voltage).
   double step = -mean_residual * 0.5;
 
-  // Clamp to SERVO_MAX_STEP to bound the maximum single move
   if (step > (double)SERVO_MAX_STEP) step = (double)SERVO_MAX_STEP;
   if (step < -(double)SERVO_MAX_STEP) step = -(double)SERVO_MAX_STEP;
 
-  // Apply the fractional step
   ocxo_dac_set(ocxo_dac_fractional + step);
 
-  // Record for diagnostics
   servo_step = (int32_t)(step >= 0.0 ? step + 0.5 : step - 0.5);
   servo_adjustments++;
-
-  // Reset settle counter — wait for OCXO to respond
   servo_settle_count = 0;
 
-  // Reset Welford stats so the next decision uses only post-change data
   residual_reset(residual_ocxo);
 }
 
 // ============================================================================
 // Pre-PPS dispatch latency profiling — two-stage spin loop
 // ============================================================================
-//
-// Two-stage timer chain landing in a tight DWT spin loop:
-//
-//   Stage 1 (coarse, ms, PIT0):  998 ms after PPS.
-//     Dispatched ~998.3 ms.  Arms stage 2.
-//
-//   Stage 2 (fine, µs, PIT1):    999 µs after coarse dispatch.
-//     Fires ~999.3 ms.  Dispatched ~999.6 ms.
-//     Enters the spin loop.
-//
-//   Spin loop: ~400 µs until PPS at 1000 ms.
-//     Continuously writes DWT_CYCCNT to dispatch_shadow_dwt.
-//     PPS ISR captures the shadow, sets pps_fired, loop exits.
-//
-// The TDC correction table (see above) converts the measured
-// delta into the true PPS edge DWT value.
-//
-// CPU cost: ~400 µs per second = ~0.04%.
-//
 
 static inline void mask_low_priority_irqs(uint8_t pri) {
     __asm volatile("MSR BASEPRI, %0" : : "r"(pri) : "memory");
@@ -959,21 +944,19 @@ static void pre_pps_fine_cb(timepop_ctx_t*, void*) {
 
 static void pre_pps_coarse_cb(timepop_ctx_t*, void*) {
   diag_coarse_fire_count++;
-  // Stage 1 complete.  Arm stage 2 (µs precision).
   timepop_arm(
     TIMEPOP_CLASS_PRE_PPS,
-    false,                    // one-shot
+    false,
     pre_pps_fine_cb,
     nullptr,
     "pre-pps-fine"
   );
 }
 
-// Helper: arm the coarse stage (called from PPS ASAP callback)
 static void pre_pps_arm(void) {
   timepop_arm(
     TIMEPOP_CLASS_PRE_PPS_COARSE,
-    false,                    // one-shot
+    false,
     pre_pps_coarse_cb,
     nullptr,
     "pre-pps-coarse"
@@ -983,19 +966,6 @@ static void pre_pps_arm(void) {
 // ============================================================================
 // PPS handling — Phase 2: ASAP callback (scheduled context)
 // ============================================================================
-//
-// This is the deferred callback invoked by the PPS ISR via timepop.
-// It runs in scheduled context (not ISR), so timepop_arm is safe.
-//
-// Responsibilities:
-//   1. Arm the PPS relay deassert timer (always, regardless of state)
-//   2. Process campaign state transitions (start/stop/recover)
-//   3. Recover 64-bit values at the PPS edge via advance-then-rewind
-//   4. Compute dispatch latency and Software TDC correction
-//   5. Update Welford residual statistics
-//   6. Run OCXO calibration servo
-//   7. Build and publish TIMEBASE_FRAGMENT
-//
 
 static volatile bool pps_scheduled = false;
 
@@ -1017,30 +987,15 @@ static void pps_asap_callback(timepop_ctx_t*, void*) {
     campaign_state = clocks_campaign_state_t::STOPPED;
     request_stop = false;
 
-    // Cancel any pending pre-PPS timers
     timepop_cancel(TIMEPOP_CLASS_PRE_PPS_COARSE);
     timepop_cancel(TIMEPOP_CLASS_PRE_PPS);
     dispatch_shadow_valid = false;
-    pps_fired = true;  // break spin loop if it's running
+    pps_fired = true;
 
-    // Stop calibration servo (DAC value is preserved)
     calibrate_ocxo_active = false;
   }
 
   if (request_recover) {
-    // --------------------------------------------------------
-    // Recovery: load nanosecond values into accumulators.
-    //
-    // The Pi supplies dwt_ns, gnss_ns, ocxo_ns — all nanoseconds.
-    // The Teensy derives internal cycle/tick counts:
-    //   DWT:  cycles = ns * 126 / 125  (dwt_ns_to_cycles)
-    //   GNSS: ticks  = ns / 100
-    //   OCXO: ticks  = ns / 100
-    //
-    // Anchor last_32 at the ISR snapshot so the next _now()
-    // call correctly accumulates from the PPS edge forward.
-    // --------------------------------------------------------
-
     dwt_cycles_64 = dwt_ns_to_cycles(recover_dwt_ns);
     dwt_last_32   = isr_snap_dwt;
 
@@ -1056,12 +1011,10 @@ static void pps_asap_callback(timepop_ctx_t*, void*) {
     residual_reset(residual_gnss);
     residual_reset(residual_ocxo);
 
-    // ISR residuals will become valid on the next PPS
     isr_residual_valid = false;
 
-    // Reset pre-PPS dispatch profiling
     dispatch_shadow_valid = false;
-    pps_fired = true;  // break spin loop if running
+    pps_fired = true;
     dispatch_shadow_ns     = -1;
     dispatch_isr_ns        = -1;
     dispatch_delta_ns      = -1;
@@ -1069,6 +1022,19 @@ static void pps_asap_callback(timepop_ctx_t*, void*) {
     pps_edge_correction_ns = -1;
     pps_edge_valid         = false;
     pre_pps_approach_ns    = -1;
+
+    // TIMEPULSE recovery: restore quantized clock.
+    // Round down to nearest TIMEPULSE_NS_PER_TICK boundary.
+    uint64_t recovered_tp_ns =
+      (recover_gnss_ns / TIMEPULSE_NS_PER_TICK) * TIMEPULSE_NS_PER_TICK;
+
+    timepulse_anchor.gnss_ns  = recovered_tp_ns;
+    timepulse_anchor.dwt_snap = isr_snap_dwt;
+    timepulse_anchor.valid    = true;
+    timepulse_tick_count      = (uint32_t)(recovered_tp_ns / TIMEPULSE_NS_PER_TICK);
+    timepulse_tick_in_second  = 0;
+    tp_diag_phase_error_ns    = 0;
+    tp_diag_ticks_at_pps      = 0;
 
     campaign_state = clocks_campaign_state_t::STARTED;
     request_recover = false;
@@ -1082,18 +1048,44 @@ static void pps_asap_callback(timepop_ctx_t*, void*) {
 
   if (campaign_state == clocks_campaign_state_t::STARTED) {
 
-    // Mark ISR residuals as valid for the NEXT PPS
-    // (the first PPS after start has no prior snapshot
-    // to delta against — this flag was cleared by
-    // clocks_zero_all or recover, so the ISR won't
-    // compute residuals until the second PPS)
     if (!isr_residual_valid) {
       isr_residual_valid = true;
     }
 
     // --------------------------------------------------------
-    // Pre-PPS approach time (computed before 64-bit extension
-    // because it uses raw 32-bit GNSS snapshots only)
+    // TIMEPULSE PPS diagnostics
+    // --------------------------------------------------------
+
+    tp_diag_ticks_at_pps = timepulse_tick_in_second;
+
+    // Deliver the tick that was eaten by PPS phase realignment.
+    // The PPS ISR clears the GPT2 compare flag to protect the
+    // realigned OCR1 value, which prevents the 10,000th ISR
+    // invocation from running.  The time genuinely elapsed, so
+    // we account for it here.
+    if (timepulse_anchor.valid) {
+      timepulse_anchor.gnss_ns += TIMEPULSE_NS_PER_TICK;
+      timepulse_anchor.dwt_snap = isr_snap_dwt;  // PPS edge DWT is the best available
+      timepulse_tick_count++;
+      timepulse_tick_in_second++;
+    }
+
+    timepulse_tick_in_second = 0;
+
+    if (timepulse_anchor.valid) {
+      uint64_t remainder = timepulse_anchor.gnss_ns % NS_PER_SECOND;
+      if (remainder == 0) {
+        tp_diag_phase_error_ns = 0;
+      } else {
+        tp_diag_phase_error_ns = (int64_t)remainder;
+        if (remainder > NS_PER_SECOND / 2) {
+          tp_diag_phase_error_ns = (int64_t)remainder - (int64_t)NS_PER_SECOND;
+        }
+      }
+    }
+
+    // --------------------------------------------------------
+    // Pre-PPS approach time
     // --------------------------------------------------------
 
     if (dispatch_shadow_valid) {
@@ -1110,24 +1102,10 @@ static void pps_asap_callback(timepop_ctx_t*, void*) {
 
     pre_pps_arm();
 
-    // Clear pps_fired so the spin callback doesn't see the
-    // stale flag from THIS PPS.  The spin callback will set
-    // it to false again at entry, but if it checks before
-    // clearing, it would see true and bail out as "late".
     pps_fired = false;
 
     // --------------------------------------------------------
     // Recover 64-bit values at the PPS edge
-    //
-    // Uses advance-then-rewind: each _at_pps_edge() call
-    // first advances the accumulator to the present via
-    // _now(), then rewinds by the small delta between the
-    // live register and the ISR snapshot.
-    //
-    // This is safe regardless of any intervening _now()
-    // calls (e.g. from cmd_report) because _now() only
-    // moves forward, and the rewind is always the correct
-    // small positive offset from isr_snap to last_32.
     // --------------------------------------------------------
 
     const uint64_t snap_dwt_cycles = dwt_at_pps_edge();
@@ -1139,28 +1117,9 @@ static void pps_asap_callback(timepop_ctx_t*, void*) {
     const uint64_t snap_ocxo_ns = snap_ocxo_ticks * 100ull;
 
     // --------------------------------------------------------
-    // Pre-PPS dispatch latency and Software TDC correction.
-    //
-    // The spin loop + ISR capture gives us two DWT values:
-    //   isr_snap_dwt           — DWT_CYCCNT read in ISR
-    //   isr_captured_shadow_dwt — last shadow before ISR
-    //
-    // delta_cycles = isr - shadow tells us which instruction
-    // was executing when the interrupt fired.  Subtracting
-    // the fixed overhead gives the correction: cycles between
-    // shadow write and true PPS edge.
-    //
-    // The corrected PPS edge becomes the definitive DWT
-    // value for this PPS.  All downstream calculations
-    // (residuals, tau, published dwt_cycles/dwt_ns) use it.
-    //
-    // NOTE: TDC correction is DISABLED until the correction
-    // table is re-derived at 1008 MHz.  The ISR snapshot
-    // is used as fallback.  Dispatch latency diagnostics
-    // are still computed and published for analysis.
+    // Pre-PPS dispatch latency and Software TDC correction
     // --------------------------------------------------------
 
-    // Start with ISR values as fallback
     uint64_t pps_dwt_cycles = snap_dwt_cycles;
     uint64_t pps_dwt_ns     = snap_dwt_ns;
 
@@ -1168,18 +1127,12 @@ static void pps_asap_callback(timepop_ctx_t*, void*) {
       uint32_t delta_cycles = isr_snap_dwt - isr_captured_shadow_dwt;
       int64_t  delta_ns     = (int64_t)dwt_cycles_to_ns_32(delta_cycles);
 
-      // Dispatch profiling values (diagnostic)
       dispatch_isr_ns    = (int64_t)snap_dwt_ns;
       dispatch_delta_ns  = delta_ns;
       dispatch_shadow_ns = (int64_t)snap_dwt_ns - delta_ns;
 
       int32_t correction = tdc_correction_cycles(delta_cycles);
       if (correction >= 0) {
-        // Valid correction: reconstruct the true PPS edge.
-        //
-        // The snap_dwt_cycles is the 64-bit value at the ISR
-        // snapshot.  The correction tells us the ISR was
-        // (overhead) cycles after the true PPS edge:
         uint32_t overhead_cycles = delta_cycles - (uint32_t)correction;
         pps_dwt_cycles       = snap_dwt_cycles - overhead_cycles;
         pps_dwt_ns           = dwt_cycles_to_ns(pps_dwt_cycles);
@@ -1188,8 +1141,6 @@ static void pps_asap_callback(timepop_ctx_t*, void*) {
         pps_edge_correction_ns = (int32_t)dwt_cycles_to_ns_32(correction);
         pps_edge_valid         = true;
       } else {
-        // delta_cycles out of expected range (or TDC needs
-        // recalibration) — use ISR value
         pps_edge_ns            = -1;
         pps_edge_correction_ns = -1;
         pps_edge_valid         = false;
@@ -1197,7 +1148,6 @@ static void pps_asap_callback(timepop_ctx_t*, void*) {
 
       dispatch_shadow_valid = false;
     } else {
-      // Spin loop didn't run this cycle (late, timeout, or not armed).
       dispatch_shadow_ns     = -1;
       dispatch_isr_ns        = -1;
       dispatch_delta_ns      = -1;
@@ -1209,9 +1159,6 @@ static void pps_asap_callback(timepop_ctx_t*, void*) {
 
     // --------------------------------------------------------
     // Callback-level Welford residual tracking
-    //
-    // Uses the TDC-corrected DWT cycles when available.
-    // GNSS and OCXO are unaffected (no dispatch correction).
     // --------------------------------------------------------
 
     residual_update(residual_dwt,  pps_dwt_cycles, DWT_EXPECTED_PER_PPS);
@@ -1231,8 +1178,6 @@ static void pps_asap_callback(timepop_ctx_t*, void*) {
     Payload p;
     p.add("campaign",         campaign_name);
 
-    // Definitive DWT state at PPS edge (TDC-corrected when valid,
-    // ISR snapshot as fallback).  All downstream consumers use these.
     p.add("dwt_cycles",       pps_dwt_cycles);
     p.add("dwt_ns",           pps_dwt_ns);
     p.add("gnss_ns",          snap_gnss_ns);
@@ -1240,49 +1185,30 @@ static void pps_asap_callback(timepop_ctx_t*, void*) {
     p.add("teensy_pps_count", campaign_seconds);
     p.add("gnss_lock",        digitalRead(GNSS_LOCK_PIN));
 
-    // Callback-level residuals (from 64-bit extended values)
     p.add("dwt_pps_residual",  residual_dwt.residual);
     p.add("gnss_pps_residual", residual_gnss.residual);
     p.add("ocxo_pps_residual", residual_ocxo.residual);
 
-    // ISR-level raw residuals (from 32-bit register snapshots)
-    // These are the purest measurement — computed in the ISR
-    // with zero processing between PPS edge and subtraction.
     p.add("isr_residual_dwt",  isr_residual_dwt);
     p.add("isr_residual_gnss", isr_residual_gnss);
     p.add("isr_residual_ocxo", isr_residual_ocxo);
     p.add("isr_residual_valid", isr_residual_valid);
 
-    // Pre-PPS dispatch latency profiling (nanoseconds).
-    // All three values use the 64-bit extended DWT clock.
-    // shadow = last spin loop DWT ns before ISR fired
-    // isr = DWT ns captured as first ISR instruction
-    // delta = isr - shadow = true dispatch latency
-    // approach = GNSS ns from spin loop entry to PPS edge
-    // -1 = not yet available or timeout.
     p.add("dispatch_shadow_ns",  dispatch_shadow_ns);
     p.add("dispatch_isr_ns",     dispatch_isr_ns);
     p.add("dispatch_delta_ns",   dispatch_delta_ns);
     p.add("pre_pps_approach_ns", pre_pps_approach_ns);
     p.add("dispatch_timeout",    (bool)dispatch_timeout);
 
-    // Software TDC correction diagnostics.
-    // When pps_edge_valid is true, dwt_cycles and dwt_ns above
-    // are the TDC-corrected values (source of truth).
-    // When false, they fall back to the ISR snapshot.
     p.add("pps_edge_valid",         pps_edge_valid);
     p.add("pps_edge_correction_ns", pps_edge_correction_ns);
 
-    // TDC recalibration flag — true means TDC constants are
-    // stale (from 600 MHz) and correction is disabled.
     p.add("tdc_needs_recal",        TDC_NEEDS_RECALIBRATION);
 
-    // OCXO DAC control state (always present, unconditional)
     p.add("ocxo_dac",              ocxo_dac_fractional);
     p.add("calibrate_ocxo",        calibrate_ocxo_active);
     p.add("servo_adjustments",     servo_adjustments);
 
-    // Dispatch profiling diagnostics
     p.add("diag_coarse_fires",   diag_coarse_fire_count);
     p.add("diag_fine_fires",     diag_fine_fire_count);
     p.add("diag_late",           diag_fine_late_count);
@@ -1291,16 +1217,36 @@ static void pps_asap_callback(timepop_ctx_t*, void*) {
     p.add("diag_fine_was_late",  diag_fine_was_late);
     p.add("diag_spin_iters",     diag_spin_iterations);
 
-    // Raw 32-bit DWT cycle values for debugging.
     p.add("diag_raw_isr_cyc",    (uint32_t)isr_snap_dwt);
     p.add("diag_raw_shadow_cyc", (uint32_t)isr_captured_shadow_dwt);
 
-    // Raw ISR snapshot (64-bit extended, before TDC correction).
-    // These are what dwt_cycles/dwt_ns used to be before the TDC.
     p.add("diag_isr_dwt_cycles", snap_dwt_cycles);
     p.add("diag_isr_dwt_ns",     snap_dwt_ns);
 
     publish("TIMEBASE_FRAGMENT", p);
+
+    // --------------------------------------------------------
+    // Publish TIMEPULSE_TEENSY — once-per-PPS diagnostic
+    // --------------------------------------------------------
+
+    {
+      Payload tp;
+
+      tp.add("gnss_ns",              timepulse_anchor.gnss_ns);
+      tp.add("dwt_snap",             timepulse_anchor.dwt_snap);
+      tp.add("valid",                timepulse_anchor.valid);
+
+      tp.add("tick_count",           timepulse_tick_count);
+      tp.add("ticks_at_pps",         tp_diag_ticks_at_pps);
+
+      tp.add("phase_error_ns",       tp_diag_phase_error_ns);
+      tp.add("pps_realign_count",    tp_diag_pps_realign_count);
+
+      tp.add("campaign",             campaign_name);
+      tp.add("campaign_seconds",     campaign_seconds);
+
+      publish("TIMEPULSE_TEENSY", tp);
+    }
 
     if (campaign_state == clocks_campaign_state_t::STARTED) {
       campaign_seconds++;
@@ -1313,79 +1259,49 @@ static void pps_asap_callback(timepop_ctx_t*, void*) {
 // ============================================================================
 // PPS handling — Phase 1: ISR (minimum latency)
 // ============================================================================
-//
-// Two-phase architecture:
-//
-//   Phase 1 (ISR): Snapshot all hardware counters, compute raw
-//   PPS-to-PPS residuals, and assert PPS relay HIGH — all
-//   immediately at the PPS rising edge.  Three register reads
-//   (~6 ns total at 1008 MHz), three subtractions, one
-//   digitalWriteFast.  Set relay_arm_pending flag for deferred
-//   timer arming.
-//   NO timepop_arm calls from ISR context.
-//
-//   Phase 2 (timepop ASAP callback): pps_asap_callback() above.
-//
 
 static void pps_isr(void) {
-
-  // ============================================================
-  // PHASE 1: Hardware snapshot — absolute minimum latency
-  //
-  // Three register reads within ~6 ns of each other at 1008 MHz.
-  // This is as close to the PPS edge as software can get.
-  // ============================================================
 
   const uint32_t snap_dwt  = DWT_CYCCNT;
   const uint32_t snap_gnss = GPT2_CNT;
   const uint32_t snap_ocxo = GPT1_CNT;
 
-  // ============================================================
-  // Capture the spin loop's shadow value, then break the loop.
-  //
-  // The spin loop continuously writes DWT_CYCCNT to
-  // dispatch_shadow_dwt.  When the ISR fires, the loop is
-  // frozen mid-iteration.  We grab the shadow NOW, while the
-  // loop can't touch it.
-  //
-  // After the ISR returns, the loop may resume and execute one
-  // more write (if the interrupt landed between the pps_fired
-  // check and the DWT write).  That clobbers dispatch_shadow_dwt
-  // with a post-ISR value.  But isr_captured_shadow_dwt is safe.
-  //
-  // The ASAP callback uses isr_captured_shadow_dwt (not
-  // dispatch_shadow_dwt) for the delta computation.
-  // ============================================================
-
   isr_captured_shadow_dwt = dispatch_shadow_dwt;
   pps_fired = true;
-
-  // ============================================================
-  // PPS relay to Pi — assert HIGH immediately after snapshots.
-  //
-  // This runs on every PPS, regardless of campaign state.
-  // chrony needs continuous PPS for system clock discipline.
-  //
-  // digitalWriteFast compiles to a single GPIO register write
-  // (~1 ns at 1008 MHz).  The relay edge follows the true PPS
-  // edge by ~30-50 ns (ISR entry + 3 snapshots + this write).
-  //
-  // The deassert timer is armed from the ASAP callback — NEVER
-  // from ISR context.  timepop_arm's noInterrupts/interrupts
-  // pair would re-enable interrupts mid-ISR, allowing PIT to
-  // nest and corrupt timer state.
-  // ============================================================
 
   digitalWriteFast(GNSS_PPS_RELAY, HIGH);
   relay_arm_pending = true;
 
   // ============================================================
-  // Raw ISR-level residuals — computed here, zero overhead.
+  // TIMEPULSE phase realignment.
   //
-  // Uses unsigned 32-bit subtraction (wrap-safe) cast to signed
-  // 32-bit, then subtract expected.  At 10 MHz the delta is
-  // 10,000,000 which fits easily in int32_t.  At 1008 MHz the
-  // delta is 1,008,000,000 which also fits in int32_t (max ~2.1B).
+  // Reset the GPT2 output compare register so the 10 KHz grid
+  // is anchored to this PPS edge.
+  //
+  // Toggle state logic:
+  //   timepulse_relay_state = true  (as if pin was HIGH)
+  //   digitalWriteFast(LOW)         (force pin LOW now)
+  //   First match at +500 ticks:    toggle → false, pin LOW
+  //     ISR sees false → returns (falling edge, no TIMEPULSE)
+  //   Second match at +1000 ticks:  toggle → true, pin HIGH
+  //     ISR sees true → TIMEPULSE fires (first tick of second)
+  //
+  // This puts the first TIMEPULSE tick at exactly +1000 GNSS
+  // ticks (100 µs) after the PPS edge.
+  //
+  // Clear the output compare flag to prevent a stale pending
+  // match from firing immediately.
+  // ============================================================
+
+  GPT2_OCR1 = snap_gnss + TIMEPULSE_GNSS_HALF_PERIOD;
+  GPT2_SR = GPT_SR_OF1;  // clear any pending compare match
+  timepulse_relay_state = true;
+  digitalWriteFast(GNSS_10KHZ_RELAY, LOW);
+
+  tp_diag_pps_realign_count++;
+
+  // ============================================================
+  // Raw ISR-level residuals
   // ============================================================
 
   if (isr_residual_valid) {
@@ -1394,20 +1310,16 @@ static void pps_isr(void) {
     isr_residual_ocxo = (int32_t)(snap_ocxo - isr_prev_ocxo) - (int32_t)ISR_OCXO_EXPECTED;
   }
 
-  // Store current as previous for next PPS
   isr_prev_dwt  = snap_dwt;
   isr_prev_gnss = snap_gnss;
   isr_prev_ocxo = snap_ocxo;
 
-  // Store for callback's advance-then-rewind
   isr_snap_dwt  = snap_dwt;
   isr_snap_gnss = snap_gnss;
   isr_snap_ocxo = snap_ocxo;
 
   // ============================================================
-  // Always schedule ASAP callback — the relay deassert timer
-  // must be armed from scheduled context on every PPS.
-  // Campaign-gated work happens inside the callback.
+  // Schedule ASAP callback
   // ============================================================
 
   if (pps_scheduled) return;
@@ -1423,7 +1335,7 @@ static void pps_isr(void) {
 }
 
 // ============================================================================
-// 2. Dither callback — armed in process_clocks_init(), runs forever
+// Dither callback — armed in process_clocks_init(), runs forever
 // ============================================================================
 
 static void ocxo_dither_cb(timepop_ctx_t*, void*) {
@@ -1452,23 +1364,11 @@ static Payload cmd_start(const Payload& args) {
 
   safeCopy(campaign_name, sizeof(campaign_name), name);
 
-  // ----------------------------------------------------------
-  // Optional: set_dac — apply a known DAC value immediately.
-  // The Pi persists the last good DAC value and sends it back
-  // on campaign start so the Teensy doesn't have to remember.
-  // ----------------------------------------------------------
   double dac_val;
   if (args.tryGetDouble("set_dac", dac_val)) {
     ocxo_dac_set(dac_val);
   }
 
-  // ----------------------------------------------------------
-  // Optional: calibrate_ocxo — enable servo loop.
-  // When present (any value or no value), the servo will
-  // iteratively adjust the DAC to drive OCXO tau toward 1.0.
-  // Can be combined with set_dac to start near a known-good
-  // value and fine-tune from there.
-  // ----------------------------------------------------------
   calibrate_ocxo_active = args.has("calibrate_ocxo");
 
   if (calibrate_ocxo_active) {
@@ -1499,9 +1399,6 @@ static Payload cmd_stop(const Payload&) {
 
 static Payload cmd_recover(const Payload& args) {
 
-  // All recovery parameters are nanoseconds.
-  // The Teensy derives its own internal cycle/tick counts
-  // from these values at the PPS boundary.
   const char* s_dwt_ns = args.getString("dwt_ns");
   const char* s_gnss   = args.getString("gnss_ns");
   const char* s_ocxo   = args.getString("ocxo_ns");
@@ -1516,20 +1413,17 @@ static Payload cmd_recover(const Payload& args) {
   recover_gnss_ns = strtoull(s_gnss,   nullptr, 10);
   recover_ocxo_ns = strtoull(s_ocxo,   nullptr, 10);
 
-  // Restore DAC value if provided (Pi persists this)
   double dac_val;
   if (args.tryGetDouble("set_dac", dac_val)) {
     ocxo_dac_set(dac_val);
   }
 
-  // Restore calibration state if provided (Pi persists this)
   calibrate_ocxo_active = args.has("calibrate_ocxo");
 
   if (calibrate_ocxo_active) {
     servo_step          = 0;
     servo_last_residual = 0.0;
     servo_settle_count  = 0;
-    // Preserve servo_adjustments — running count across recovery
   }
 
   request_recover = true;
@@ -1576,13 +1470,6 @@ static void report_residual(Payload& p,
 // ============================================================================
 // REPORT — diagnostic introspection only
 // ============================================================================
-//
-// cmd_report calls _now() for each domain.  This is always safe:
-// _now() advances the accumulator forward monotonically.  The PPS
-// callback's advance-then-rewind is unaffected because the rewind
-// is computed from (last_32 - isr_snap), which is correct regardless
-// of how many times _now() has been called in between.
-//
 
 static Payload cmd_report(const Payload&) {
 
@@ -1604,9 +1491,6 @@ static Payload cmd_report(const Payload&) {
   p.add("request_stop",    request_stop);
   p.add("request_recover", request_recover);
 
-  // These _now() calls are always safe — they advance the
-  // accumulator forward monotonically.  No interaction with
-  // the PPS callback's advance-then-rewind pattern.
   const uint64_t dwt_cycles = clocks_dwt_cycles_now();
   const uint64_t dwt_ns     = clocks_dwt_ns_now();
   const uint64_t gnss_ns    = clocks_gnss_ns_now();
@@ -1619,30 +1503,25 @@ static Payload cmd_report(const Payload&) {
 
   p.add("gnss_lock", digitalRead(GNSS_LOCK_PIN));
 
-  // Callback-level residual statistics
   report_residual(p, "dwt",  residual_dwt);
   report_residual(p, "gnss", residual_gnss);
   report_residual(p, "ocxo", residual_ocxo);
 
-  // ISR-level raw residuals (most recent PPS)
   p.add("isr_residual_dwt",   isr_residual_dwt);
   p.add("isr_residual_gnss",  isr_residual_gnss);
   p.add("isr_residual_ocxo",  isr_residual_ocxo);
   p.add("isr_residual_valid", (bool)isr_residual_valid);
 
-  // Pre-PPS dispatch latency profiling
   p.add("dispatch_shadow_ns",  dispatch_shadow_ns);
   p.add("dispatch_isr_ns",     dispatch_isr_ns);
   p.add("dispatch_delta_ns",   dispatch_delta_ns);
   p.add("pre_pps_approach_ns", pre_pps_approach_ns);
   p.add("dispatch_timeout",    (bool)dispatch_timeout);
 
-  // Software TDC correction diagnostics
   p.add("pps_edge_valid",         pps_edge_valid);
   p.add("pps_edge_correction_ns", pps_edge_correction_ns);
   p.add("tdc_needs_recal",        TDC_NEEDS_RECALIBRATION);
 
-  // OCXO DAC control state
   p.add("ocxo_dac",              ocxo_dac_fractional);
   p.add("calibrate_ocxo",        calibrate_ocxo_active);
   p.add("servo_adjustments",     servo_adjustments);
@@ -1650,7 +1529,6 @@ static Payload cmd_report(const Payload&) {
   p.add("servo_last_residual",    servo_last_residual);
   p.add("servo_settle_count",     servo_settle_count);
 
-  // Dispatch profiling diagnostics
   p.add("diag_coarse_fires",   diag_coarse_fire_count);
   p.add("diag_fine_fires",     diag_fine_fire_count);
   p.add("diag_late",           diag_fine_late_count);
@@ -1658,6 +1536,15 @@ static Payload cmd_report(const Payload&) {
   p.add("diag_timeouts",       diag_timeout_count);
   p.add("diag_fine_was_late",  diag_fine_was_late);
   p.add("diag_spin_iters",     diag_spin_iterations);
+
+  // TIMEPULSE diagnostics
+  p.add("tp_gnss_ns",            timepulse_anchor.gnss_ns);
+  p.add("tp_dwt_snap",           timepulse_anchor.dwt_snap);
+  p.add("tp_valid",              timepulse_anchor.valid);
+  p.add("tp_tick_count",         timepulse_tick_count);
+  p.add("tp_ticks_at_pps",       tp_diag_ticks_at_pps);
+  p.add("tp_phase_error_ns",     tp_diag_phase_error_ns);
+  p.add("tp_pps_realign_count",  tp_diag_pps_realign_count);
 
   if (campaign_state == clocks_campaign_state_t::STARTED && gnss_ns > 0) {
 
@@ -1715,18 +1602,12 @@ void process_clocks_register(void) {
 
 void process_clocks_init(void) {
 
-  // OCXO DAC control output (pin 22 / A22)
-  // Initialize before clock capture so the OCXO starts receiving
-  // a defined control voltage immediately.
   analogWriteResolution(12);
   ocxo_dac_set((double)OCXO_DAC_DEFAULT);
 
-  // Arm the dither timer — runs forever, even when no campaign is active.
-  // 1 kHz (1 ms period) is three orders of magnitude faster than the
-  // OCXO thermal time constant (~1–10 s), ensuring perfect integration.
   timepop_arm(
     TIMEPOP_CLASS_OCXO_DITHER,
-    true,                    // recurring
+    true,
     ocxo_dither_cb,
     nullptr,
     "ocxo-dither"
@@ -1736,13 +1617,9 @@ void process_clocks_init(void) {
   arm_gpt2_external();    // GNSS VCLOCK -> GPT2 pin 14, raw 10 MHz, polled
   arm_gpt1_external();    // OCXO 10 MHz -> GPT1 pin 25, raw 10 MHz, polled
 
-  // PPS input from GF-8802 (pin 1, shielded twisted pair)
   pinMode(GNSS_PPS_PIN, INPUT);
   pinMode(GNSS_LOCK_PIN, INPUT);
 
-  // PPS relay output to Pi (pin 32 -> Pi GPIO 18)
-  // Configured as OUTPUT, initially LOW.
-  // Driven HIGH in ISR, deasserted LOW by TimePop after 500 ms.
   pinMode(GNSS_PPS_RELAY, OUTPUT);
   digitalWriteFast(GNSS_PPS_RELAY, LOW);
 
@@ -1752,11 +1629,11 @@ void process_clocks_init(void) {
     RISING
   );
 
-  NVIC_SET_PRIORITY(IRQ_GPIO6789, 0);  // This is PPS from GF-8802
+  NVIC_SET_PRIORITY(IRQ_GPIO6789, 0);  // PPS from GF-8802
 
   // 10 KHz GNSS relay output to Pi (pin 9 -> Pi GPIO 25)
-  // Configured as OUTPUT, initially LOW.
   // Driven by GPT2 Output Compare ISR at 10 KHz toggle rate.
+  // TIMEPULSE anchor writes are campaign-gated inside the ISR.
   pinMode(GNSS_10KHZ_RELAY, OUTPUT);
   digitalWriteFast(GNSS_10KHZ_RELAY, LOW);
 }
