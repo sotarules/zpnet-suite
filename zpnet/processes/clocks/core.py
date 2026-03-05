@@ -142,7 +142,12 @@ PITIMER_CAPTURE_RETRY_INTERVAL_S = 0.010  # 10ms per retry = 200ms max
 # with every retry cycle.
 PITIMER_STALE_THRESHOLD = 5
 
-# Add near the other configuration constants:
+# PITIMER consecutive miss auto-recovery: if PITIMER misses this many
+# consecutive captures, CLOCKS triggers a hard fault and auto-recovery.
+# Cooldown prevents recovery loops.
+PITIMER_MISS_RECOVERY_THRESHOLD = 3
+PITIMER_MISS_RECOVERY_COOLDOWN_S = 60.0
+
 PREFLIGHT_POLL_INTERVAL_S = 30
 PREFLIGHT_LOG_PREFIX = "🛡️ [preflight]"
 
@@ -195,6 +200,11 @@ _diag: Dict[str, Any] = {
     "pitimer_stale_skips": 0,
     "pitimer_last_hit_pps_count": None,
     "last_pitimer_skip": {},
+
+    # PITIMER consecutive miss auto-recovery
+    "pitimer_consecutive_misses": 0,
+    "pitimer_miss_recoveries": 0,
+    "last_pitimer_miss_recovery": {},
 
     # PITIMER lifecycle control plane
     "pitimer_start_requests": 0,
@@ -443,9 +453,8 @@ _sync_fragment: Optional[Dict[str, Any]] = None
 # Helpers
 # ---------------------------------------------------------------------
 
-
 _auto_recovery_in_progress: bool = False
-
+_last_pitimer_miss_recovery_ts: float = 0.0
 
 def _hard_fault(reason: str, details: Dict[str, Any]) -> None:
     """Log a hard fault and trigger automatic recovery."""
@@ -1304,20 +1313,54 @@ def _process_loop() -> None:
 
         if pit is None:
             _diag["pitimer_skips_total"] += 1
+            _diag["pitimer_consecutive_misses"] = _diag.get("pitimer_consecutive_misses", 0) + 1
+            consecutive = _diag["pitimer_consecutive_misses"]
             _diag["last_pitimer_skip"] = {
                 "ts_utc": sysclk,
                 "reason": "capture_not_found",
                 "teensy_pps_count": int(pps_count),
                 "armed_pps_count": armed,
+                "consecutive": consecutive,
             }
             logging.warning(
                 "⚠️ [clocks] @%s PITIMER capture not found for pps_count=%d — "
-                "skipping TIMEBASE (gap)",
-                sysclk, int(pps_count),
+                "skipping TIMEBASE (gap, consecutive=%d)",
+                sysclk, int(pps_count), consecutive,
             )
             _armed_pps_count = int(pps_count) + 1
             _diag["armed_pps_count"] = _armed_pps_count
+
+            # Auto-recovery on persistent PITIMER desync
+            if consecutive >= PITIMER_MISS_RECOVERY_THRESHOLD:
+                now_mono = time.monotonic()
+                elapsed = now_mono - _last_pitimer_miss_recovery_ts
+                if elapsed >= PITIMER_MISS_RECOVERY_COOLDOWN_S:
+                    _last_pitimer_miss_recovery_ts = now_mono
+                    _diag["pitimer_miss_recoveries"] = _diag.get("pitimer_miss_recoveries", 0) + 1
+                    _diag["last_pitimer_miss_recovery"] = {
+                        "ts_utc": sysclk,
+                        "consecutive_misses": consecutive,
+                        "pps_count": int(pps_count),
+                    }
+                    try:
+                        _hard_fault("pitimer_consecutive_miss", {
+                            "system_time": sysclk,
+                            "consecutive_misses": consecutive,
+                            "pps_count": int(pps_count),
+                            "threshold": PITIMER_MISS_RECOVERY_THRESHOLD,
+                        })
+                    except RuntimeError:
+                        pass  # _hard_fault raises to break out of processing
+                else:
+                    logging.warning(
+                        "⚠️ [clocks] @%s PITIMER miss recovery cooldown: %.0fs remaining",
+                        sysclk, PITIMER_MISS_RECOVERY_COOLDOWN_S - elapsed,
+                    )
+
             continue
+
+        # Successful capture — reset consecutive miss counter
+        _diag["pitimer_consecutive_misses"] = 0
 
         # --- Extract Pi data from capture ---
         pi_counter_raw = pit.get("counter")

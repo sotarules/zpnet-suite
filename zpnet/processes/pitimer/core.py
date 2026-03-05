@@ -620,6 +620,17 @@ def _capture_loop() -> None:
     global _last_capture, _capture_seq, _last_corrected
     global _pi_tick_epoch, _epoch_set, _pending_pi_ns
 
+    # Pin this thread to isolated core 3 with real-time scheduling.
+    # Only the capture thread gets core 3 — the command handler thread
+    # stays on the normal cores so it can respond to IPC.
+    try:
+        os.sched_setaffinity(0, {3})
+        param = os.sched_param(50)
+        os.sched_setscheduler(0, os.SCHED_FIFO, param)
+        logging.info("📌 [pitimer] capture loop pinned to core 3, SCHED_FIFO priority 50")
+    except Exception as e:
+        logging.warning("⚠️ [pitimer] could not pin capture loop: %s", e)
+
     logging.info("🚀 [pitimer] capture loop started — mode=%s", _capture_mode)
 
     while True:
