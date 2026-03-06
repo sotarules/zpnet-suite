@@ -641,6 +641,163 @@ def _get_machine_clock_data(location: Optional[str]) -> Dict[str, Any]:
     return mcd if isinstance(mcd, dict) else {}
 
 
+MACHINE_CLOCK_DEFAULTS: Dict[str, Dict[str, Any]] = {
+    "PI": {
+        "machine_id": "zpnet-pi-1",
+        "clock_domain": "PI",
+    },
+    "TEENSY": {
+        "machine_id": "zpnet-teensy-1",
+        "clock_domain": "DWT",
+    },
+}
+
+
+def _get_machine_clock_entry(location: Optional[str], machine: str) -> Dict[str, Any]:
+    """Return one machine entry from a location's machine_clock_data block, or {}."""
+    mcd = _get_machine_clock_data(location)
+    machines = mcd.get("machines", {})
+    if not isinstance(machines, dict):
+        return {}
+    entry = machines.get(machine, {})
+    return entry if isinstance(entry, dict) else {}
+
+
+def _classify_machine_clock_quality(
+    *,
+    stddev_ns: Optional[float],
+    stderr_ns: Optional[float],
+    pps_samples: Optional[int],
+) -> str:
+    """
+    Classify machine clock data quality from cumulative PPS statistics.
+
+    This is intentionally simple and conservative.  The value is a
+    convenience label for humans, not a scientific truth claim.
+    """
+    n = int(pps_samples or 0)
+    if n <= 0 or stddev_ns is None or stderr_ns is None:
+        return "WEAK"
+
+    sdev = float(stddev_ns)
+    serr = float(stderr_ns)
+
+    if n >= 10_000 and sdev <= 75.0 and serr <= 2.0:
+        return "STRONG"
+    if n >= 1_000 and sdev <= 150.0 and serr <= 5.0:
+        return "GOOD"
+    if n >= 100 and sdev <= 500.0 and serr <= 25.0:
+        return "FAIR"
+    return "WEAK"
+
+
+def _build_machine_clock_entry(
+    *,
+    machine: str,
+    report_block: Dict[str, Any],
+    existing_entry: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """
+    Build one machine_clock_data.machines entry from the cumulative
+    report block for a machine.
+    """
+    existing = existing_entry if isinstance(existing_entry, dict) else {}
+    defaults = MACHINE_CLOCK_DEFAULTS.get(machine, {})
+
+    stddev_ns = report_block.get("pps_stddev")
+    stderr_ns = report_block.get("pps_stderr")
+    pps_samples = report_block.get("pps_n")
+
+    entry: Dict[str, Any] = {
+        "machine_id": existing.get("machine_id", defaults.get("machine_id", machine.lower())),
+        "clock_domain": existing.get("clock_domain", defaults.get("clock_domain", machine)),
+        "mean_ppb_vs_gnss": report_block.get("ppb"),
+        "tau_mean": report_block.get("tau"),
+        "stddev_ns": stddev_ns,
+        "stderr_ns": stderr_ns,
+        "pps_samples": pps_samples,
+        "quality": _classify_machine_clock_quality(
+            stddev_ns=stddev_ns,
+            stderr_ns=stderr_ns,
+            pps_samples=pps_samples,
+        ),
+    }
+
+    return entry
+
+
+def _persist_machine_clock_data(
+    *,
+    location: Optional[str],
+    source_campaign: str,
+    report: Dict[str, Any],
+) -> None:
+    """
+    Persist location-specific machine clock data.
+
+    This is intentionally best-effort.  Machine clock data is the best
+    currently known persisted estimate for each service-hosting machine
+    at a given location.  It is updated opportunistically from the live
+    cumulative report as TIMEBASE records arrive.
+    """
+    if not location:
+        return
+
+    row = _get_location_record(location)
+    if row is None:
+        logging.warning(
+            "⚠️ [clocks] machine_clock_data update skipped — unknown location '%s'",
+            location,
+        )
+        return
+
+    payload = row["payload"]
+    existing_mcd = payload.get("machine_clock_data", {})
+    if not isinstance(existing_mcd, dict):
+        existing_mcd = {}
+
+    existing_machines = existing_mcd.get("machines", {})
+    if not isinstance(existing_machines, dict):
+        existing_machines = {}
+
+    pi_report = report.get("pi", {})
+    dwt_report = report.get("dwt", {})
+
+    block = {
+        "updated_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        "source_campaign": source_campaign,
+        "machines": {
+            "PI": _build_machine_clock_entry(
+                machine="PI",
+                report_block=pi_report if isinstance(pi_report, dict) else {},
+                existing_entry=existing_machines.get("PI", {}),
+            ),
+            "TEENSY": _build_machine_clock_entry(
+                machine="TEENSY",
+                report_block=dwt_report if isinstance(dwt_report, dict) else {},
+                existing_entry=existing_machines.get("TEENSY", {}),
+            ),
+        },
+    }
+
+    try:
+        with open_db() as conn:
+            cur = conn.cursor()
+            cur.execute(
+                """
+                UPDATE locations
+                SET payload = payload || jsonb_build_object('machine_clock_data', %s::jsonb)
+                WHERE location = %s
+                """,
+                (json.dumps(block), location),
+            )
+    except Exception:
+        logging.exception(
+            "⚠️ [clocks] failed to persist machine_clock_data for location '%s' (ignored)",
+            location,
+        )
+
+
 def _location_has_time_only_profile(location: Optional[str]) -> bool:
     """
     True if the location record contains the geodetic facts needed
@@ -1273,7 +1430,7 @@ def _build_report(
         "campaign_state": "STARTED",
         "campaign_seconds": int(campaign_seconds),
         "campaign_elapsed": _seconds_to_hms(int(campaign_seconds)),
-        "location": campaign_payload.get("location"),
+        "location": campaign_payload.get("location") or _get_current_location(),
         "gnss_time_utc": timebase.get("gnss_time_utc"),
         "system_time_utc": timebase.get("system_time_utc"),
         "pps_count": int(timebase.get("pps_count") or 0),
@@ -1719,6 +1876,28 @@ def _process_loop() -> None:
 
         publish("TIMEBASE", timebase)
         _persist_timebase(timebase, report)
+
+        # Opportunistically refresh location-specific machine clock data
+        # from the cumulative live report.  This is campaign-scoped:
+        # only campaigns that are explicitly associated with a location
+        # may update that location's machine clock data.  We do NOT
+        # fall back to the current system location here, because the
+        # persisted association must come from the campaign record
+        # itself, not from ambient system state.
+        campaign_location_for_machine_clock_data = campaign_payload.get("location")
+        if isinstance(campaign_location_for_machine_clock_data, str):
+            campaign_location_for_machine_clock_data = (
+                campaign_location_for_machine_clock_data.strip() or None
+            )
+        else:
+            campaign_location_for_machine_clock_data = None
+
+        if campaign_location_for_machine_clock_data:
+            _persist_machine_clock_data(
+                location=campaign_location_for_machine_clock_data,
+                source_campaign=campaign,
+                report=report,
+            )
 
         # Persist OCXO DAC fields into campaign payload (best-effort)
         teensy_ocxo_dac = frag.get("ocxo_dac")
@@ -3197,6 +3376,11 @@ def cmd_delete(args: Optional[dict]) -> Dict[str, Any]:
     }
 
 
+# ---------------------------------------------------------------------
+# LIST_CAMPAIGNS
+# ---------------------------------------------------------------------
+
+
 def cmd_list_campaigns(_: Optional[dict]) -> Dict[str, Any]:
     """
     LIST_CAMPAIGNS
@@ -3274,8 +3458,12 @@ def cmd_list_campaigns(_: Optional[dict]) -> Dict[str, Any]:
 
 
 def cmd_clocks_info(_: Optional[dict]) -> Dict[str, Any]:
+    current_location = _get_current_location()
     payload = {
         "campaign_active": _campaign_active,
+        "current_location": current_location,
+        "time_only_capable": _location_has_time_only_profile(current_location),
+        "machine_clock_data": _get_machine_clock_data(current_location),
         "last_pps_count_seen": _last_pps_count_seen,
         "last_pi_seq": _last_pi_seq,
         "last_pi_corrected": _last_pi_corrected,
