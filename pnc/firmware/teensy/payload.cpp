@@ -507,7 +507,7 @@ size_t Payload::write_json(char* buf, size_t buf_size) const {
 }
 
 String Payload::to_json() const {
-    char local_buf[3072];
+    char local_buf[2048];
     write_json(local_buf, sizeof(local_buf));
     return String(local_buf);
 }

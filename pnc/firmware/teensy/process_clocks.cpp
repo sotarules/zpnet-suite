@@ -1229,7 +1229,7 @@ static void report_residual(Payload& p, const char* prefix,
 }
 
 // ============================================================================
-// REPORT
+// REPORT — authoritative operational surface
 // ============================================================================
 
 static Payload cmd_report(const Payload&) {
@@ -1257,6 +1257,91 @@ static Payload cmd_report(const Payload&) {
   p.add("gnss_ns_now",    gnss_ns);
   p.add("ocxo_ns_now",    ocxo_ns);
   p.add("gnss_lock",      digitalRead(GNSS_LOCK_PIN));
+
+  // Lightweight Timebase surface
+  const int64_t tb_gnss = timebase_now_ns(timebase_domain_t::GNSS);
+  const int64_t tb_dwt  = timebase_now_ns(timebase_domain_t::DWT);
+  const int64_t tb_ocxo = timebase_now_ns(timebase_domain_t::OCXO);
+
+  p.add("timebase_gnss_ns", tb_gnss);
+  p.add("timebase_dwt_ns",  tb_dwt);
+  p.add("timebase_ocxo_ns", tb_ocxo);
+  p.add("timebase_valid",   timebase_valid());
+
+  report_residual(p, "dwt",  residual_dwt);
+  report_residual(p, "gnss", residual_gnss);
+  report_residual(p, "ocxo", residual_ocxo);
+
+  p.add("isr_residual_dwt",   isr_residual_dwt);
+  p.add("isr_residual_gnss",  isr_residual_gnss);
+  p.add("isr_residual_ocxo",  isr_residual_ocxo);
+  p.add("isr_residual_valid", (bool)isr_residual_valid);
+
+  p.add("dispatch_shadow_ns",  dispatch_shadow_ns);
+  p.add("dispatch_isr_ns",     dispatch_isr_ns);
+  p.add("dispatch_delta_ns",   dispatch_delta_ns);
+  p.add("pre_pps_approach_ns", pre_pps_approach_ns);
+  p.add("dispatch_timeout",    (bool)dispatch_timeout);
+
+  p.add("pps_edge_valid",         pps_edge_valid);
+  p.add("pps_edge_correction_ns", pps_edge_correction_ns);
+  p.add("tdc_needs_recal",        TDC_NEEDS_RECALIBRATION);
+
+  p.add("ocxo_dac",            ocxo_dac_fractional);
+  p.add("calibrate_ocxo",      calibrate_ocxo_active);
+  p.add("servo_adjustments",   servo_adjustments);
+  p.add("servo_step",          servo_step);
+  p.add("servo_last_residual", servo_last_residual);
+  p.add("servo_settle_count",  servo_settle_count);
+
+  p.add("timepulse_ticks_at_pps",   tp_diag_ticks_at_pps);
+  p.add("timepulse_phase_error_ns", tp_diag_phase_error_ns);
+  p.add("timepulse_tick_count",     timepulse_tick_count);
+  p.add("timepulse_valid",          timepulse_anchor.valid);
+
+  if (campaign_state == clocks_campaign_state_t::STARTED && gnss_ns > 0) {
+    const double tau_dwt  = (double)dwt_ns  / (double)gnss_ns;
+    const double tau_ocxo = (double)ocxo_ns / (double)gnss_ns;
+    p.add_fmt("tau_dwt",  "%.12f", tau_dwt);
+    p.add_fmt("tau_ocxo", "%.12f", tau_ocxo);
+    p.add_fmt("dwt_ppb",  "%.3f",
+      ((double)((int64_t)dwt_ns  - (int64_t)gnss_ns) / (double)gnss_ns) * 1e9);
+    p.add_fmt("ocxo_ppb", "%.3f",
+      ((double)((int64_t)ocxo_ns - (int64_t)gnss_ns) / (double)gnss_ns) * 1e9);
+  } else {
+    p.add("tau_dwt",  0.0);
+    p.add("tau_ocxo", 0.0);
+    p.add("dwt_ppb",  0.0);
+    p.add("ocxo_ppb", 0.0);
+  }
+
+  return p;
+}
+
+// ============================================================================
+// CLOCKS_INFO — forensic / diagnostic surface
+// ============================================================================
+
+static Payload cmd_clocks_info(const Payload&) {
+  Payload p;
+
+  p.add("campaign_state",
+    campaign_state == clocks_campaign_state_t::STARTED ? "STARTED" : "STOPPED");
+
+  if (campaign_state == clocks_campaign_state_t::STARTED) {
+    p.add("campaign",         campaign_name);
+    p.add("campaign_seconds", campaign_seconds);
+  }
+
+  const uint64_t dwt_cycles = clocks_dwt_cycles_now();
+  const uint64_t dwt_ns     = clocks_dwt_ns_now();
+  const uint64_t gnss_ns    = clocks_gnss_ns_now();
+  const uint64_t ocxo_ns    = clocks_ocxo_ns_now();
+
+  p.add("dwt_cycles_now", dwt_cycles);
+  p.add("dwt_ns_now",     dwt_ns);
+  p.add("gnss_ns_now",    gnss_ns);
+  p.add("ocxo_ns_now",    ocxo_ns);
 
   // --------------------------------------------------------------------------
   // TIMEBASE FORENSICS
@@ -1373,38 +1458,12 @@ static Payload cmd_report(const Payload&) {
   // ISR-level Timebase self-check diagnostics
   // --------------------------------------------------------------------------
 
-  p.add("diag_timebase_tp_now_gnss_ns",           diag_timebase_tp_now_gnss_ns);
-  p.add("diag_timebase_tp_now_minus_anchor_ns",   diag_timebase_tp_now_minus_anchor_ns);
-  p.add("diag_timebase_tp_now_mod_tick_ns",       diag_timebase_tp_now_mod_tick_ns);
+  p.add("diag_timebase_tp_now_gnss_ns",         diag_timebase_tp_now_gnss_ns);
+  p.add("diag_timebase_tp_now_minus_anchor_ns", diag_timebase_tp_now_minus_anchor_ns);
+  p.add("diag_timebase_tp_now_mod_tick_ns",     diag_timebase_tp_now_mod_tick_ns);
 
-  p.add("diag_timebase_pps_now_gnss_ns",          diag_timebase_pps_now_gnss_ns);
-  p.add("diag_timebase_pps_now_mod_1s_ns",        diag_timebase_pps_now_mod_1s_ns);
-
-  report_residual(p, "dwt",  residual_dwt);
-  report_residual(p, "gnss", residual_gnss);
-  report_residual(p, "ocxo", residual_ocxo);
-
-  p.add("isr_residual_dwt",   isr_residual_dwt);
-  p.add("isr_residual_gnss",  isr_residual_gnss);
-  p.add("isr_residual_ocxo",  isr_residual_ocxo);
-  p.add("isr_residual_valid", (bool)isr_residual_valid);
-
-  p.add("dispatch_shadow_ns",  dispatch_shadow_ns);
-  p.add("dispatch_isr_ns",     dispatch_isr_ns);
-  p.add("dispatch_delta_ns",   dispatch_delta_ns);
-  p.add("pre_pps_approach_ns", pre_pps_approach_ns);
-  p.add("dispatch_timeout",    (bool)dispatch_timeout);
-
-  p.add("pps_edge_valid",         pps_edge_valid);
-  p.add("pps_edge_correction_ns", pps_edge_correction_ns);
-  p.add("tdc_needs_recal",        TDC_NEEDS_RECALIBRATION);
-
-  p.add("ocxo_dac",            ocxo_dac_fractional);
-  p.add("calibrate_ocxo",      calibrate_ocxo_active);
-  p.add("servo_adjustments",   servo_adjustments);
-  p.add("servo_step",          servo_step);
-  p.add("servo_last_residual", servo_last_residual);
-  p.add("servo_settle_count",  servo_settle_count);
+  p.add("diag_timebase_pps_now_gnss_ns",        diag_timebase_pps_now_gnss_ns);
+  p.add("diag_timebase_pps_now_mod_1s_ns",      diag_timebase_pps_now_mod_1s_ns);
 
   p.add("diag_coarse_fires",  diag_coarse_fire_count);
   p.add("diag_fine_fires",    diag_fine_fire_count);
@@ -1414,40 +1473,19 @@ static Payload cmd_report(const Payload&) {
   p.add("diag_fine_was_late", diag_fine_was_late);
   p.add("diag_spin_iters",    diag_spin_iterations);
 
-  p.add("timepulse_ticks_at_pps",   tp_diag_ticks_at_pps);
-  p.add("timepulse_phase_error_ns", tp_diag_phase_error_ns);
-  p.add("timepulse_tick_count",     timepulse_tick_count);
-  p.add("timepulse_valid",          timepulse_anchor.valid);
-
-  if (campaign_state == clocks_campaign_state_t::STARTED && gnss_ns > 0) {
-    const double tau_dwt  = (double)dwt_ns  / (double)gnss_ns;
-    const double tau_ocxo = (double)ocxo_ns / (double)gnss_ns;
-    p.add_fmt("tau_dwt",  "%.12f", tau_dwt);
-    p.add_fmt("tau_ocxo", "%.12f", tau_ocxo);
-    p.add_fmt("dwt_ppb",  "%.3f",
-      ((double)((int64_t)dwt_ns  - (int64_t)gnss_ns) / (double)gnss_ns) * 1e9);
-    p.add_fmt("ocxo_ppb", "%.3f",
-      ((double)((int64_t)ocxo_ns - (int64_t)gnss_ns) / (double)gnss_ns) * 1e9);
-  } else {
-    p.add("tau_dwt",  0.0);
-    p.add("tau_ocxo", 0.0);
-    p.add("dwt_ppb",  0.0);
-    p.add("ocxo_ppb", 0.0);
-  }
-
   return p;
 }
-
 // ============================================================================
 // Process registration
 // ============================================================================
 
 static const process_command_entry_t CLOCKS_COMMANDS[] = {
-  { "START",   cmd_start   },
-  { "STOP",    cmd_stop    },
-  { "RECOVER", cmd_recover },
-  { "REPORT",  cmd_report  },
-  { nullptr,   nullptr     }
+  { "START",      cmd_start      },
+  { "STOP",       cmd_stop       },
+  { "RECOVER",    cmd_recover    },
+  { "REPORT",     cmd_report     },
+  { "CLOCKS_INFO", cmd_clocks_info },
+  { nullptr,      nullptr        }
 };
 
 static const process_subscription_entry_t CLOCKS_SUBSCRIPTIONS[] = {
