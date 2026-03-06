@@ -216,6 +216,7 @@
 // ============================================================================
 
 #include "debug.h"
+#include "timebase.h"
 #include "process_clocks.h"
 #include "process_timepop.h"
 
@@ -521,6 +522,8 @@ static void gpt2_compare_isr(void) {
   timepulse_anchor.gnss_ns  += TIMEPULSE_NS_PER_TICK;
   timepulse_anchor.dwt_snap  = snap_dwt;
   timepulse_anchor.valid     = true;
+
+  timebase_update_anchor(timepulse_anchor.gnss_ns, snap_dwt);
 
   timepulse_tick_count++;
   timepulse_tick_in_second++;
@@ -1217,6 +1220,11 @@ static Payload cmd_report(const Payload&) {
   p.add("ocxo_ns_now",    ocxo_ns);
   p.add("gnss_lock",      digitalRead(GNSS_LOCK_PIN));
 
+  // Timebase singleton — interpolated GNSS nanoseconds
+  int64_t tb_gnss = timebase_now_ns("GNSS");
+  p.add("timebase_gnss_ns", tb_gnss);
+  p.add("timebase_valid",   timebase_valid());
+
   report_residual(p, "dwt",  residual_dwt);
   report_residual(p, "gnss", residual_gnss);
   report_residual(p, "ocxo", residual_ocxo);
@@ -1287,10 +1295,19 @@ static const process_command_entry_t CLOCKS_COMMANDS[] = {
   { nullptr,   nullptr     }
 };
 
+static const process_subscription_entry_t CLOCKS_SUBSCRIPTIONS[] = {
+  { "TIMEBASE_FRAGMENT", on_timebase_fragment },
+  { nullptr, nullptr },
+};
+
+const process_subscription_entry_t* timebase_subscriptions(void) {
+  return CLOCKS_SUBSCRIPTIONS;
+}
+
 static const process_vtable_t CLOCKS_PROCESS = {
   .process_id    = "CLOCKS",
   .commands      = CLOCKS_COMMANDS,
-  .subscriptions = nullptr
+  .subscriptions = CLOCKS_SUBSCRIPTIONS
 };
 
 void process_clocks_register(void) {
@@ -1302,6 +1319,9 @@ void process_clocks_register(void) {
 // ============================================================================
 
 void process_clocks_init(void) {
+
+  timebase_init();
+
   analogWriteResolution(12);
   ocxo_dac_set((double)OCXO_DAC_DEFAULT);
 

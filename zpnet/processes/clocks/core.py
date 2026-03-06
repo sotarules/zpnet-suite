@@ -1245,7 +1245,7 @@ def _process_loop() -> None:
     builds TIMEBASE, persists.  Runs forever.
     """
     global _campaign_active, _armed_pps_count
-    global _last_pi_seq, _last_pi_corrected
+    global _last_pi_seq, _last_pi_corrected, _last_pitimer_miss_recovery_ts
 
     logging.info("🚀 [clocks] processor thread started")
 
