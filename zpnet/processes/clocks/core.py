@@ -3197,11 +3197,6 @@ def cmd_delete(args: Optional[dict]) -> Dict[str, Any]:
     }
 
 
-# ---------------------------------------------------------------------
-# LIST_CAMPAIGNS
-# ---------------------------------------------------------------------
-
-
 def cmd_list_campaigns(_: Optional[dict]) -> Dict[str, Any]:
     """
     LIST_CAMPAIGNS
@@ -3336,6 +3331,115 @@ def cmd_set_dac(args: Optional[dict]) -> Dict[str, Any]:
     logging.info("🔧 [clocks] SET_DAC: ocxo_dac=%s", dac)
     return {"success": True, "message": "OK", "payload": {"ocxo_dac": dac}}
 
+def cmd_set_location(args: Optional[dict]) -> Dict[str, Any]:
+    """
+    SET_LOCATION(location)
+
+    Update the authoritative system-level current location in the
+    SYSTEM config record.
+
+    This location is used by CLOCKS to determine GNSS steady-state
+    mode (TO vs NORMAL) and to resolve location-specific machine
+    clock data.
+
+    If the named location does not exist in the locations table,
+    the command is rejected.
+    """
+    if not args or "location" not in args:
+        return {"success": False, "message": "SET_LOCATION requires 'location' argument"}
+
+    raw_location = args["location"]
+    if not isinstance(raw_location, str):
+        return {"success": False, "message": "SET_LOCATION location must be a string"}
+
+    location = raw_location.strip()
+    if not location:
+        return {"success": False, "message": "SET_LOCATION location may not be empty"}
+
+    row = _get_location_record(location)
+    if row is None:
+        return {"success": False, "message": f"No location named '{location}'"}
+
+    try:
+        with open_db() as conn:
+            cur = conn.cursor()
+            cur.execute(
+                """
+                UPDATE config
+                SET payload = payload || %s::jsonb
+                WHERE config_key = 'SYSTEM'
+                """,
+                (json.dumps({"current_location": location}),),
+            )
+            if cur.rowcount == 0:
+                return {"success": False, "message": "No SYSTEM config record found"}
+    except Exception as e:
+        logging.exception("❌ [clocks] SET_LOCATION failed")
+        return {"success": False, "message": str(e)}
+
+    try:
+        _ensure_gnss_mode_for_current_location()
+    except Exception as e:
+        return {
+            "success": False,
+            "message": f"Location set but GNSS mode reconciliation failed: {e}",
+            "payload": {"current_location": location},
+        }
+
+    logging.info("📍 [clocks] SET_LOCATION: current_location='%s'", location)
+    return {
+        "success": True,
+        "message": "OK",
+        "payload": {
+            "current_location": location,
+            "time_only_capable": _location_has_time_only_profile(location),
+            "machine_clock_data": _get_machine_clock_data(location),
+        },
+    }
+
+
+def cmd_clear_location(_: Optional[dict]) -> Dict[str, Any]:
+    """
+    CLEAR_LOCATION()
+
+    Remove the authoritative system-level current location from the
+    SYSTEM config record.
+
+    This is used for free-roaming operation or while profiling a new
+    location that has not yet been established as the current site.
+    """
+    try:
+        with open_db() as conn:
+            cur = conn.cursor()
+            cur.execute(
+                """
+                UPDATE config
+                SET payload = payload - 'current_location'
+                WHERE config_key = 'SYSTEM'
+                """
+            )
+            if cur.rowcount == 0:
+                return {"success": False, "message": "No SYSTEM config record found"}
+    except Exception as e:
+        logging.exception("❌ [clocks] CLEAR_LOCATION failed")
+        return {"success": False, "message": str(e)}
+
+    try:
+        _ensure_gnss_mode_for_current_location()
+    except Exception as e:
+        return {
+            "success": False,
+            "message": f"Location cleared but GNSS mode reconciliation failed: {e}",
+        }
+
+    logging.info("📍 [clocks] CLEAR_LOCATION: current_location cleared")
+    return {
+        "success": True,
+        "message": "OK",
+        "payload": {
+            "current_location": None,
+        },
+    }
 
 COMMANDS = {
     "START": cmd_start,
@@ -3345,6 +3449,8 @@ COMMANDS = {
     "CLEAR": cmd_clear,
     "DELETE": cmd_delete,
     "SET_DAC": cmd_set_dac,
+    "SET_LOCATION": cmd_set_location,
+    "CLEAR_LOCATION": cmd_clear_location,
     "SET_BASELINE": cmd_set_baseline,
     "BASELINE_INFO": cmd_baseline_info,
     "LIST_CAMPAIGNS": cmd_list_campaigns,
