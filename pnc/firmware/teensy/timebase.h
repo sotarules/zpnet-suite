@@ -2,57 +2,79 @@
 // timebase.h — ZPNet Timebase Singleton (Teensy)
 // ============================================================================
 //
-// Timebase is a system-wide singleton that provides nanosecond-precision
-// time in any clock domain.  It is the universal answer to "what time
-// is it?" on the Teensy.
+// Timebase is the canonical clock-domain translation layer for the Teensy.
 //
-// Architecture:
+// It answers two classes of questions:
 //
-//   Timebase subscribes to TIMEBASE_FRAGMENT via pubsub.  Each second,
-//   the fragment callback stores all clock-domain values as integers
-//   for fast, lock-free access.  The TIMEPULSE 10 KHz ISR provides
-//   a sub-millisecond anchor (gnss_ns + DWT snap) that is updated
-//   every 100 µs.
+//   1) "What time is it right now in domain X?"
+//   2) "What is the corresponding nanosecond value in domain B for a value
+//       expressed in domain A?"
 //
-//   now("GNSS") returns the GNSS nanosecond count interpolated to
-//   the present moment:
+// Current supported domains:
 //
-//     result = anchor_gnss_ns + (DWT_CYCCNT - anchor_dwt) * gnss_per_dwt
+//   • "GNSS" — GNSS nanoseconds
+//   • "DWT"  — DWT nanoseconds
+//   • "OCXO" — OCXO nanoseconds
 //
-//   where gnss_per_dwt is the ratio of GNSS ns per DWT cycle, derived
-//   from the anchor's known relationship.  The anchor is refreshed at
-//   10 KHz by the TIMEPULSE ISR, so worst-case staleness is 100 µs.
-//   DWT at 1.008 GHz provides sub-nanosecond interpolation granularity.
+// Architecture
+// ------------
 //
-// ISR safety:
+// 1. TIMEPULSE anchor (10 KHz, written by ISR)
+//    Every 100 µs, the TIMEPULSE ISR publishes an anchor:
 //
-//   now() is safe to call from any context: ISR, scheduled, main loop.
-//   No locks, no malloc, no floating point.  Integer arithmetic on
-//   volatile state plus a single register read.  One UDIV instruction
-//   (2-12 cycles on Cortex-M7).
+//      anchor = { gnss_ns, dwt_snap }
 //
-// API:
+//    where:
+//      • gnss_ns  = quantized GNSS nanoseconds at the TIMEPULSE rising edge
+//      • dwt_snap = DWT_CYCCNT captured at that same edge
 //
-//   timebase_init()           — call once at startup
-//   timebase_now_ns("GNSS")  — current GNSS nanoseconds (interpolated)
-//   timebase_now_ns("DWT")   — current DWT nanoseconds (direct read)
-//   timebase_valid()          — true once first TIMEPULSE anchor exists
+//    This anchor is the high-resolution interpolation base.
 //
-// Clock domain strings:
+// 2. TIMEBASE_FRAGMENT (1 Hz, written by pub/sub callback)
+//    Once per second, CLOCKS publishes authoritative PPS-edge totals:
 //
-//   "GNSS"  — GNSS 10 MHz domain, interpolated via DWT from TIMEPULSE
-//   "DWT"   — ARM DWT cycle counter, converted to ns at nominal rate
-//   "OCXO"  — (future) OCXO 10 MHz domain
-//   "PI"    — (future) Pi arch timer domain
+//      • gnss_ns
+//      • dwt_ns
+//      • dwt_cycles
+//      • ocxo_ns
+//      • pps_count
+//      • residuals
 //
-// The string-based selector is intentional: same API on Pi side,
-// easy to reason about, no enum synchronization across builds.
+//    These totals define the current inter-domain ratios ("tau").
 //
-// Ownership:
+// 3. now(domain)
+//    Timebase first computes "now" in GNSS nanoseconds using the fresh
+//    TIMEPULSE anchor:
 //
-//   Timebase owns the TIMEPULSE anchor struct.  process_clocks.cpp
-//   calls timebase_update_anchor() from the TIMEPULSE ISR.
-//   Timebase subscribes to TIMEBASE_FRAGMENT for per-second data.
+//      gnss_now = anchor_gnss_ns + elapsed_dwt_cycles * 125 / 126
+//
+//    It then converts GNSS nanoseconds into the requested domain using the
+//    most recent authoritative fragment ratios.
+//
+// 4. convert_ns(value, from_domain, to_domain)
+//    Domain conversion always normalizes through GNSS:
+//
+//      from_domain → GNSS → to_domain
+//
+//    The conversion ratios are derived from the latest fragment totals.
+//
+// Design Notes
+// ------------
+//
+// • The string API is intentional.  It mirrors the Pi-side conceptual API and
+//   avoids enum synchronization across builds.
+//
+// • GNSS interpolation is integer-only and ISR-safe.
+//
+// • Both the TIMEPULSE anchor and the fragment use sequence counters so readers
+//   never observe torn multiword state.
+//
+// • Anchor freshness is enforced.  A stale TIMEPULSE anchor is treated as
+//   invalid, which prevents Timebase from reporting stale "now" values after a
+//   campaign stops or the anchor stream stalls.
+//
+// • Conversion uses exact integer multiply/divide via 128-bit intermediate
+//   arithmetic to preserve nanosecond-scale integrity.
 //
 // ============================================================================
 
@@ -66,59 +88,77 @@
 // Initialization
 // ============================================================================
 
-// Call once during clocks subsystem init.
-// Initializes state.  The caller (process_clocks) must include
-// timebase_subscriptions() in the CLOCKS vtable for TIMEBASE_FRAGMENT
-// delivery.
+// Initialize internal state.
+// Call once during clocks subsystem initialization.
 void timebase_init(void);
 
 // ============================================================================
 // Primary API — "what time is it?"
 // ============================================================================
 
-// Returns the current nanosecond count in the specified clock domain.
-// Returns -1 if the domain is unknown or not yet valid.
-//
-// ISR-safe.  No locks, no allocation, no floating point.
+// Returns the current nanosecond count in the specified domain.
+// Returns -1 if the domain is unknown or the required state is not valid.
 //
 // Supported domains:
-//   "GNSS"  — interpolated from TIMEPULSE anchor + DWT delta
-//   "DWT"   — direct DWT_CYCCNT converted to ns at nominal 1.008 GHz
+//   "GNSS"
+//   "DWT"
+//   "OCXO"
 //
+// ISR-safe. No allocation. Integer-only.
 int64_t timebase_now_ns(const char* domain);
 
-// Returns true once TIMEPULSE has produced at least one valid anchor.
-// Until this returns true, now_ns("GNSS") returns -1.
+// ============================================================================
+// Domain conversion API
+// ============================================================================
+
+// Convert a nanosecond value from one clock domain to another.
+// Returns -1 on failure (unknown domain, missing fragment, invalid ratio).
+//
+// Examples:
+//   timebase_convert_ns(gnss_ns, "GNSS", "DWT")
+//   timebase_convert_ns(dwt_ns,  "DWT",  "OCXO")
+//
+// Conversion is performed through GNSS using the latest authoritative
+// TIMEBASE_FRAGMENT ratios.
+int64_t timebase_convert_ns(
+  uint64_t    value_ns,
+  const char* from_domain,
+  const char* to_domain
+);
+
+// ============================================================================
+// Validity
+// ============================================================================
+
+// Returns true if Timebase can answer "now" in GNSS right now.
+// This requires a fresh TIMEPULSE anchor.
 bool timebase_valid(void);
+
+// Returns true if domain-to-domain conversion is currently valid.
+// This requires a valid TIMEBASE_FRAGMENT with nonzero domain totals.
+bool timebase_conversion_valid(void);
 
 // ============================================================================
 // TIMEPULSE anchor update (called from TIMEPULSE ISR only)
 // ============================================================================
 
-// Called by the TIMEPULSE 10 KHz ISR on each rising edge.
-// Stores the current gnss_ns and DWT snapshot as the interpolation anchor.
+// Update the interpolation anchor.
 //
-// This is the only write path to the anchor.  ISR context guarantees
-// atomicity on Cortex-M7 (single-writer, no preemption of ISR by
-// non-ISR readers causes at most a torn 64-bit read, handled by
-// double-read consistency check).
-//
+// Called by the TIMEPULSE ISR on each rising edge.
+// Single write path only.
 void timebase_update_anchor(uint64_t gnss_ns, uint32_t dwt_snap);
 
 // ============================================================================
-// TIMEPULSE anchor invalidation
+// Invalidation
 // ============================================================================
 
-// Called when the campaign stops or the anchor is no longer trustworthy.
+// Invalidate all Timebase state.
+// Safe to call when campaign truth is no longer trustworthy.
 void timebase_invalidate(void);
 
 // ============================================================================
 // Fragment data access (per-second values from TIMEBASE_FRAGMENT)
 // ============================================================================
-
-// Last TIMEBASE_FRAGMENT values, stored as integers for fast access.
-// Updated once per second by the fragment subscription callback.
-// These are point-in-time PPS-edge values, NOT interpolated.
 
 struct timebase_fragment_t {
   volatile uint64_t gnss_ns;
@@ -132,10 +172,9 @@ struct timebase_fragment_t {
   volatile bool     valid;
 };
 
-// Read-only access to the last fragment.  Returns pointer to internal
-// static — do not free.  Fields are volatile; safe to read from any
-// context but individual fields may update independently.
+// Read-only access to the last fragment.
+// Returns pointer to internal static storage.
 const timebase_fragment_t* timebase_last_fragment(void);
 
-// On timebase callback.
+// TIMEBASE_FRAGMENT subscription callback.
 void on_timebase_fragment(const Payload& payload);

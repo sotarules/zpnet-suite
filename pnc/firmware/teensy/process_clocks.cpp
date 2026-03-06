@@ -399,13 +399,13 @@ static inline int32_t tdc_correction_cycles(uint32_t delta_cycles) {
 // Dispatch profiling diagnostics
 // ============================================================================
 
-static volatile uint32_t diag_coarse_fire_count = 0;
-static volatile uint32_t diag_fine_fire_count   = 0;
-static volatile uint32_t diag_fine_late_count   = 0;
-static volatile uint32_t diag_spin_count        = 0;
-static volatile uint32_t diag_timeout_count     = 0;
-static volatile bool     diag_fine_was_late     = false;
-static volatile uint32_t diag_spin_iterations   = 0;
+static volatile uint32_t diag_coarse_fire_count  = 0;
+static volatile uint32_t diag_fine_fire_count    = 0;
+static volatile uint32_t diag_fine_late_count    = 0;
+static volatile uint32_t diag_spin_count         = 0;
+static volatile uint32_t diag_timeout_count      = 0;
+static volatile bool     diag_fine_was_late      = false;
+static volatile uint32_t diag_spin_iterations    = 0;
 
 // ============================================================================
 // PPS residual tracking — Welford's, callback-level
@@ -520,8 +520,8 @@ static void gpt2_compare_isr(void) {
   const uint32_t snap_dwt = DWT_CYCCNT;
 
   timepulse_anchor.gnss_ns  += TIMEPULSE_NS_PER_TICK;
-  timepulse_anchor.dwt_snap  = snap_dwt;
-  timepulse_anchor.valid     = true;
+  timepulse_anchor.dwt_snap = snap_dwt;
+  timepulse_anchor.valid    = true;
 
   timebase_update_anchor(timepulse_anchor.gnss_ns, snap_dwt);
 
@@ -649,6 +649,8 @@ static uint64_t ocxo_at_pps_edge(void) {
 // ============================================================================
 
 static void clocks_zero_all(void) {
+  timebase_invalidate();
+
   clocks_dwt_cycles_now();
   clocks_gnss_ticks_now();
   clocks_ocxo_ticks_now();
@@ -731,7 +733,7 @@ static inline void unmask_all_irqs() {
   __asm volatile("MSR BASEPRI, %0" : : "r"(0) : "memory");
 }
 
-static volatile uint32_t diag_approach_gpt2_cnt    = 0;
+static volatile uint32_t diag_approach_gpt2_cnt     = 0;
 static volatile uint32_t diag_approach_gnss_last32  = 0;
 static volatile uint64_t diag_approach_gnss_ticks64 = 0;
 static volatile uint64_t diag_approach_gnss_ns_now  = 0;
@@ -740,20 +742,10 @@ static volatile uint64_t diag_approach_into_second  = 0;
 static void pre_pps_fine_cb(timepop_ctx_t*, void*) {
   diag_fine_fire_count++;
 
-  // Compute approach time in GNSS nanoseconds: how far are we
-  // from the next PPS edge?
-  //
-  // Uses raw GPT2_CNT minus isr_snap_gnss (the PPS-edge snapshot).
-  // This is immune to the gnss_ticks_64 accumulator ordering issue:
-  // the ASAP callback and fine callback can land in the same
-  // timepop_dispatch() pass, with the ASAP updating gnss_last_32
-  // before the fine callback reads it.  Raw subtraction from the
-  // ISR snapshot has no such dependency.
   uint32_t ticks_since_pps = (uint32_t)(GPT2_CNT - isr_snap_gnss);
   pre_pps_approach_ns      = (int32_t)(ISR_GNSS_EXPECTED - ticks_since_pps) * 100;
 
-  // Debug captures
-  diag_approach_gpt2_cnt    = GPT2_CNT;
+  diag_approach_gpt2_cnt     = GPT2_CNT;
   diag_approach_gnss_last32  = gnss_last_32;
   diag_approach_gnss_ticks64 = gnss_ticks_64;
   diag_approach_gnss_ns_now  = (uint64_t)ticks_since_pps * 100;
@@ -813,9 +805,13 @@ static void pps_asap_callback(timepop_ctx_t*, void*) {
     dispatch_shadow_valid = false;
     pps_fired             = true;
     calibrate_ocxo_active = false;
+    timebase_invalidate();
   }
 
   if (request_recover) {
+
+    timebase_invalidate();
+
     dwt_cycles_64 = dwt_ns_to_cycles(recover_dwt_ns);
     dwt_last_32   = isr_snap_dwt;
 
@@ -831,16 +827,16 @@ static void pps_asap_callback(timepop_ctx_t*, void*) {
     residual_reset(residual_gnss);
     residual_reset(residual_ocxo);
 
-    isr_residual_valid    = false;
-    dispatch_shadow_valid = false;
-    pps_fired             = true;
-    dispatch_shadow_ns    = -1;
-    dispatch_isr_ns       = -1;
-    dispatch_delta_ns     = -1;
-    pps_edge_ns           = -1;
+    isr_residual_valid     = false;
+    dispatch_shadow_valid  = false;
+    pps_fired              = true;
+    dispatch_shadow_ns     = -1;
+    dispatch_isr_ns        = -1;
+    dispatch_delta_ns      = -1;
+    pps_edge_ns            = -1;
     pps_edge_correction_ns = -1;
-    pps_edge_valid        = false;
-    pre_pps_approach_ns   = -1;
+    pps_edge_valid         = false;
+    pre_pps_approach_ns    = -1;
 
     uint64_t recovered_tp_ns =
       (recover_gnss_ns / TIMEPULSE_NS_PER_TICK) * TIMEPULSE_NS_PER_TICK;
@@ -871,12 +867,6 @@ static void pps_asap_callback(timepop_ctx_t*, void*) {
 
     // --------------------------------------------------------
     // TIMEPULSE PPS observation
-    //
-    // TIMEPULSE is pure math.  The 10 KHz ISR increments
-    // gnss_ns by 100,000 on every rising edge.  The foundation
-    // (GNSS 10 MHz phase-locked to PPS) guarantees exactly
-    // 10,000 rising edges per second.  gnss_ns is correct by
-    // construction.  We observe, we do not correct.
     // --------------------------------------------------------
 
     tp_diag_ticks_at_pps     = timepulse_tick_in_second;
@@ -890,7 +880,6 @@ static void pps_asap_callback(timepop_ctx_t*, void*) {
 
     // --------------------------------------------------------
     // Pre-PPS approach time
-    // (computed in pre_pps_fine_cb, in the GNSS domain)
     // --------------------------------------------------------
 
     if (dispatch_timeout) {
@@ -1013,28 +1002,18 @@ static void pps_asap_callback(timepop_ctx_t*, void*) {
     p.add("diag_isr_dwt_cycles", snap_dwt_cycles);
     p.add("diag_isr_dwt_ns",     snap_dwt_ns);
 
-    // Debug: pre-PPS approach internals
     p.add("dbg_approach_gpt2_cnt",    diag_approach_gpt2_cnt);
     p.add("dbg_approach_gnss_last32", diag_approach_gnss_last32);
     p.add("dbg_approach_gnss_t64",    diag_approach_gnss_ticks64);
     p.add("dbg_approach_gnss_ns_now", diag_approach_gnss_ns_now);
     p.add("dbg_approach_into_second", diag_approach_into_second);
 
-    // --------------------------------------------------------
-    // TIMEPULSE diagnostics
-    // timepulse_ticks_at_pps: ISR rising edges in preceding second.
-    // timepulse_phase_error_ns: drift from expected (should be 0).
-    // --------------------------------------------------------
-
-    p.add("timepulse_ticks_at_pps",      tp_diag_ticks_at_pps);
-    p.add("timepulse_phase_error_ns",    tp_diag_phase_error_ns);
-    p.add("timepulse_tick_count",        timepulse_tick_count);
-    p.add("timepulse_valid",             timepulse_anchor.valid);
+    p.add("timepulse_ticks_at_pps",   tp_diag_ticks_at_pps);
+    p.add("timepulse_phase_error_ns", tp_diag_phase_error_ns);
+    p.add("timepulse_tick_count",     timepulse_tick_count);
+    p.add("timepulse_valid",          timepulse_anchor.valid);
 
     publish("TIMEBASE_FRAGMENT", p);
-
-    // NOTE: TIMEPULSE_TEENSY has been retired.
-    // All TIMEPULSE diagnostics are in TIMEBASE_FRAGMENT above.
 
     if (campaign_state == clocks_campaign_state_t::STARTED) {
       campaign_seconds++;
@@ -1181,13 +1160,13 @@ static Payload cmd_recover(const Payload& args) {
 static void report_residual(Payload& p, const char* prefix,
                             const pps_residual_t& r) {
   char key[48];
-  snprintf(key, sizeof(key), "%s_pps_valid",   prefix); p.add(key, r.valid);
-  snprintf(key, sizeof(key), "%s_pps_delta",   prefix); p.add(key, r.delta);
-  snprintf(key, sizeof(key), "%s_pps_residual",prefix); p.add(key, r.residual);
-  snprintf(key, sizeof(key), "%s_pps_n",       prefix); p.add(key, r.n);
-  snprintf(key, sizeof(key), "%s_pps_mean",    prefix); p.add_fmt(key, "%.3f", r.mean);
-  snprintf(key, sizeof(key), "%s_pps_stddev",  prefix); p.add_fmt(key, "%.3f", residual_stddev(r));
-  snprintf(key, sizeof(key), "%s_pps_stderr",  prefix); p.add_fmt(key, "%.3f", residual_stderr(r));
+  snprintf(key, sizeof(key), "%s_pps_valid",    prefix); p.add(key, r.valid);
+  snprintf(key, sizeof(key), "%s_pps_delta",    prefix); p.add(key, r.delta);
+  snprintf(key, sizeof(key), "%s_pps_residual", prefix); p.add(key, r.residual);
+  snprintf(key, sizeof(key), "%s_pps_n",        prefix); p.add(key, r.n);
+  snprintf(key, sizeof(key), "%s_pps_mean",     prefix); p.add_fmt(key, "%.3f", r.mean);
+  snprintf(key, sizeof(key), "%s_pps_stddev",   prefix); p.add_fmt(key, "%.3f", residual_stddev(r));
+  snprintf(key, sizeof(key), "%s_pps_stderr",   prefix); p.add_fmt(key, "%.3f", residual_stderr(r));
 }
 
 // ============================================================================
@@ -1220,10 +1199,121 @@ static Payload cmd_report(const Payload&) {
   p.add("ocxo_ns_now",    ocxo_ns);
   p.add("gnss_lock",      digitalRead(GNSS_LOCK_PIN));
 
-  // Timebase singleton — interpolated GNSS nanoseconds
-  int64_t tb_gnss = timebase_now_ns("GNSS");
-  p.add("timebase_gnss_ns", tb_gnss);
-  p.add("timebase_valid",   timebase_valid());
+  // --------------------------------------------------------------------------
+  // TIMEBASE FORENSICS
+  //
+  // The goal is to make "now" observable rather than mystical.
+  // We expose:
+  //   • direct now() in all supported domains
+  //   • conversion validity
+  //   • deltas versus local raw clock snapshots
+  //   • last fragment values
+  //   • deltas versus the last PPS-edge fragment
+  //   • conversion cross-checks through timebase_convert_ns()
+  // --------------------------------------------------------------------------
+
+  const int64_t tb_gnss = timebase_now_ns("GNSS");
+  const int64_t tb_dwt  = timebase_now_ns("DWT");
+  const int64_t tb_ocxo = timebase_now_ns("OCXO");
+
+  const bool tb_valid            = timebase_valid();
+  const bool tb_conversion_valid = timebase_conversion_valid();
+
+  p.add("timebase_gnss_ns",         tb_gnss);
+  p.add("timebase_dwt_ns",          tb_dwt);
+  p.add("timebase_ocxo_ns",         tb_ocxo);
+  p.add("timebase_valid",           tb_valid);
+  p.add("timebase_conversion_valid", tb_conversion_valid);
+
+  if (tb_gnss >= 0) {
+    p.add("timebase_gnss_minus_gnss_now_ns", (int64_t)tb_gnss - (int64_t)gnss_ns);
+  } else {
+    p.add("timebase_gnss_minus_gnss_now_ns", (int64_t)-1);
+  }
+
+  if (tb_dwt >= 0) {
+    p.add("timebase_dwt_minus_dwt_now_ns", (int64_t)tb_dwt - (int64_t)dwt_ns);
+  } else {
+    p.add("timebase_dwt_minus_dwt_now_ns", (int64_t)-1);
+  }
+
+  if (tb_ocxo >= 0) {
+    p.add("timebase_ocxo_minus_ocxo_now_ns", (int64_t)tb_ocxo - (int64_t)ocxo_ns);
+  } else {
+    p.add("timebase_ocxo_minus_ocxo_now_ns", (int64_t)-1);
+  }
+
+  const timebase_fragment_t* tb_frag = timebase_last_fragment();
+
+  if (tb_frag) {
+    p.add("timebase_fragment_valid",             (bool)tb_frag->valid);
+    p.add("timebase_fragment_gnss_ns",           (uint64_t)tb_frag->gnss_ns);
+    p.add("timebase_fragment_dwt_ns",            (uint64_t)tb_frag->dwt_ns);
+    p.add("timebase_fragment_dwt_cycles",        (uint64_t)tb_frag->dwt_cycles);
+    p.add("timebase_fragment_ocxo_ns",           (uint64_t)tb_frag->ocxo_ns);
+    p.add("timebase_fragment_pps_count",         (uint32_t)tb_frag->pps_count);
+    p.add("timebase_fragment_isr_residual_dwt",  (int32_t)tb_frag->isr_residual_dwt);
+    p.add("timebase_fragment_isr_residual_gnss", (int32_t)tb_frag->isr_residual_gnss);
+    p.add("timebase_fragment_isr_residual_ocxo", (int32_t)tb_frag->isr_residual_ocxo);
+
+    if (tb_gnss >= 0 && tb_frag->valid) {
+      p.add("timebase_gnss_minus_fragment_gnss_ns",
+            (int64_t)tb_gnss - (int64_t)tb_frag->gnss_ns);
+    } else {
+      p.add("timebase_gnss_minus_fragment_gnss_ns", (int64_t)-1);
+    }
+
+    if (tb_dwt >= 0 && tb_frag->valid) {
+      p.add("timebase_dwt_minus_fragment_dwt_ns",
+            (int64_t)tb_dwt - (int64_t)tb_frag->dwt_ns);
+    } else {
+      p.add("timebase_dwt_minus_fragment_dwt_ns", (int64_t)-1);
+    }
+
+    if (tb_ocxo >= 0 && tb_frag->valid) {
+      p.add("timebase_ocxo_minus_fragment_ocxo_ns",
+            (int64_t)tb_ocxo - (int64_t)tb_frag->ocxo_ns);
+    } else {
+      p.add("timebase_ocxo_minus_fragment_ocxo_ns", (int64_t)-1);
+    }
+  } else {
+    p.add("timebase_fragment_valid", false);
+    p.add("timebase_fragment_gnss_ns", (uint64_t)0);
+    p.add("timebase_fragment_dwt_ns", (uint64_t)0);
+    p.add("timebase_fragment_dwt_cycles", (uint64_t)0);
+    p.add("timebase_fragment_ocxo_ns", (uint64_t)0);
+    p.add("timebase_fragment_pps_count", (uint32_t)0);
+    p.add("timebase_fragment_isr_residual_dwt", (int32_t)0);
+    p.add("timebase_fragment_isr_residual_gnss", (int32_t)0);
+    p.add("timebase_fragment_isr_residual_ocxo", (int32_t)0);
+    p.add("timebase_gnss_minus_fragment_gnss_ns", (int64_t)-1);
+    p.add("timebase_dwt_minus_fragment_dwt_ns", (int64_t)-1);
+    p.add("timebase_ocxo_minus_fragment_ocxo_ns", (int64_t)-1);
+  }
+
+  const int64_t tb_conv_gnss_to_dwt  = timebase_convert_ns(gnss_ns, "GNSS", "DWT");
+  const int64_t tb_conv_gnss_to_ocxo = timebase_convert_ns(gnss_ns, "GNSS", "OCXO");
+  const int64_t tb_conv_dwt_to_gnss  = timebase_convert_ns(dwt_ns,  "DWT",  "GNSS");
+  const int64_t tb_conv_ocxo_to_gnss = timebase_convert_ns(ocxo_ns, "OCXO", "GNSS");
+
+  p.add("timebase_conv_gnss_to_dwt_ns",   tb_conv_gnss_to_dwt);
+  p.add("timebase_conv_gnss_to_ocxo_ns",  tb_conv_gnss_to_ocxo);
+  p.add("timebase_conv_dwt_to_gnss_ns",   tb_conv_dwt_to_gnss);
+  p.add("timebase_conv_ocxo_to_gnss_ns",  tb_conv_ocxo_to_gnss);
+
+  if (tb_dwt >= 0 && tb_conv_gnss_to_dwt >= 0) {
+    p.add("timebase_dwt_minus_conv_gnss_to_dwt_ns",
+          (int64_t)tb_dwt - (int64_t)tb_conv_gnss_to_dwt);
+  } else {
+    p.add("timebase_dwt_minus_conv_gnss_to_dwt_ns", (int64_t)-1);
+  }
+
+  if (tb_ocxo >= 0 && tb_conv_gnss_to_ocxo >= 0) {
+    p.add("timebase_ocxo_minus_conv_gnss_to_ocxo_ns",
+          (int64_t)tb_ocxo - (int64_t)tb_conv_gnss_to_ocxo);
+  } else {
+    p.add("timebase_ocxo_minus_conv_gnss_to_ocxo_ns", (int64_t)-1);
+  }
 
   report_residual(p, "dwt",  residual_dwt);
   report_residual(p, "gnss", residual_gnss);
@@ -1259,10 +1349,10 @@ static Payload cmd_report(const Payload&) {
   p.add("diag_fine_was_late", diag_fine_was_late);
   p.add("diag_spin_iters",    diag_spin_iterations);
 
-  p.add("timepulse_ticks_at_pps",      tp_diag_ticks_at_pps);
-  p.add("timepulse_phase_error_ns",    tp_diag_phase_error_ns);
-  p.add("timepulse_tick_count",        timepulse_tick_count);
-  p.add("timepulse_valid",             timepulse_anchor.valid);
+  p.add("timepulse_ticks_at_pps",   tp_diag_ticks_at_pps);
+  p.add("timepulse_phase_error_ns", tp_diag_phase_error_ns);
+  p.add("timepulse_tick_count",     timepulse_tick_count);
+  p.add("timepulse_valid",          timepulse_anchor.valid);
 
   if (campaign_state == clocks_campaign_state_t::STARTED && gnss_ns > 0) {
     const double tau_dwt  = (double)dwt_ns  / (double)gnss_ns;
