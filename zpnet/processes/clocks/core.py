@@ -564,6 +564,124 @@ def _get_active_campaign() -> Optional[Dict[str, Any]]:
     return {"campaign": row["campaign"], "payload": payload}
 
 
+def _get_system_config() -> Dict[str, Any]:
+    """Return SYSTEM config payload, or {} if unavailable."""
+    try:
+        with open_db(row_dict=True) as conn:
+            cur = conn.cursor()
+            cur.execute("SELECT payload FROM config WHERE config_key = 'SYSTEM'")
+            row = cur.fetchone()
+    except Exception:
+        logging.exception("⚠️ [clocks] failed to read SYSTEM config")
+        return {}
+
+    if row is None:
+        return {}
+
+    payload = row["payload"]
+    if isinstance(payload, str):
+        payload = json.loads(payload)
+
+    return payload if isinstance(payload, dict) else {}
+
+
+def _get_current_location() -> Optional[str]:
+    """Return the authoritative system-level current location, if set."""
+    cfg = _get_system_config()
+    location = cfg.get("current_location")
+    if isinstance(location, str):
+        location = location.strip()
+        return location or None
+    return None
+
+
+def _get_location_record(location: Optional[str]) -> Optional[Dict[str, Any]]:
+    """Return a location row and decoded payload, or None if not found."""
+    if not location:
+        return None
+
+    try:
+        with open_db(row_dict=True) as conn:
+            cur = conn.cursor()
+            cur.execute(
+                """
+                SELECT location, payload
+                FROM locations
+                WHERE location = %s
+                LIMIT 1
+                """,
+                (location,),
+            )
+            row = cur.fetchone()
+    except Exception:
+        logging.exception("⚠️ [clocks] failed to read location record for '%s'", location)
+        return None
+
+    if row is None:
+        return None
+
+    payload = row["payload"]
+    if isinstance(payload, str):
+        payload = json.loads(payload)
+
+    return {
+        "location": row["location"],
+        "payload": payload if isinstance(payload, dict) else {},
+    }
+
+
+def _get_machine_clock_data(location: Optional[str]) -> Dict[str, Any]:
+    """Return machine_clock_data block for the given location, or {}."""
+    row = _get_location_record(location)
+    if row is None:
+        return {}
+
+    payload = row["payload"]
+    mcd = payload.get("machine_clock_data", {})
+    return mcd if isinstance(mcd, dict) else {}
+
+
+def _location_has_time_only_profile(location: Optional[str]) -> bool:
+    """
+    True if the location record contains the geodetic facts needed
+    to command GNSS into Time Only mode.
+    """
+    row = _get_location_record(location)
+    if row is None:
+        return False
+
+    payload = row["payload"]
+    return (
+        payload.get("latitude") is not None
+        and payload.get("longitude") is not None
+        and payload.get("altitude") is not None
+    )
+
+
+def _ensure_gnss_mode_for_current_location() -> Optional[str]:
+    """
+    Keep GNSS in TO mode whenever the authoritative current location
+    has a usable profile; otherwise place GNSS in NORMAL mode.
+
+    Returns the current system location (which may be None).
+    Raises RuntimeError only if a GNSS MODE command is explicitly rejected.
+    """
+    location = _get_current_location()
+
+    if location and _location_has_time_only_profile(location):
+        logging.info("📡 [clocks] ensuring GNSS -> TO mode for current location '%s'", location)
+        gnss_resp = _set_gnss_mode_to(location)
+        if not gnss_resp.get("success"):
+            raise RuntimeError(f"GNSS MODE=TO failed for '{location}': {gnss_resp.get('message', '?')}")
+        return location
+
+    logging.info("📡 [clocks] ensuring GNSS -> NORMAL mode (no TO-capable current location)")
+    gnss_resp = _set_gnss_mode_normal()
+    if not gnss_resp.get("success"):
+        raise RuntimeError(f"GNSS MODE=NORMAL failed: {gnss_resp.get('message', '?')}")
+    return location
+
+
 def _persist_timebase(tb: Dict[str, Any], report: Dict[str, Any]) -> None:
     """Append TIMEBASE row and denormalize report into campaign payload."""
     try:
@@ -1741,6 +1859,15 @@ def cmd_start(args: Optional[dict]) -> dict:
     # that occurs when PITIMER's ppscapture_next() detects phantom
     # second boundaries from an undisciplined system clock.
     # ------------------------------------------------------------------
+    current_location = _get_current_location()
+
+    # Keep GNSS in the correct steady-state mode for the current site
+    # before attempting preflight or campaign start.
+    try:
+        _ensure_gnss_mode_for_current_location()
+    except Exception as e:
+        return {"success": False, "message": str(e)}
+
     if not flash_cut:
         _wait_for_preflight("start")
 
@@ -1764,7 +1891,7 @@ def cmd_start(args: Optional[dict]) -> dict:
             "message": f"Campaign '{campaign}' already exists (id={existing['id']}) — DELETE it first or choose a new name",
         }
 
-    location = (args.get("location") or "").strip() or None
+    location = current_location
     set_dac = args.get("set_dac")
     calibrate_ocxo = bool(args.get("calibrate_ocxo"))
 
@@ -1833,18 +1960,8 @@ def cmd_start(args: Optional[dict]) -> dict:
             (campaign, json.dumps(campaign_payload)),
         )
 
-    # GNSS Time Only mode if location specified (skip on flash-cut if location unchanged)
-    if location:
-        if flash_cut and location == active_row["payload"].get("location"):
-            logging.info("📡 [start] GNSS TO mode unchanged (same location '%s')", location)
-        else:
-            logging.info("📡 [clocks] commanding GNSS -> TO mode for location '%s'", location)
-            gnss_resp = _set_gnss_mode_to(location)
-            if not gnss_resp.get("success"):
-                msg = gnss_resp.get("message", "unknown error")
-                logging.warning("⚠️ [clocks] GNSS MODE=TO failed: %s", msg)
-                return {"success": False, "message": f"GNSS MODE=TO failed: {msg}", "payload": {"gnss_response": gnss_resp}}
-            logging.info("✅ [clocks] GNSS confirmed TO mode")
+    # GNSS mode is now owned by the authoritative system-level current
+    # location, not by campaign arguments.  It was already enforced above.
 
     # --- Stop Teensy + PITIMER before arming ---
     # On flash-cut this is still needed: the Teensy STOP clears its ISR
@@ -1935,7 +2052,11 @@ def cmd_stop(_: Optional[dict]) -> dict:
     global _campaign_active
 
     row = _get_active_campaign()
-    had_location = row["payload"].get("location") if row else None
+    stop_location = (
+        row["payload"].get("location")
+        if row and isinstance(row.get("payload"), dict)
+        else _get_current_location()
+    )
 
     _request_teensy_stop_best_effort()
     _stop_pitimer_best_effort()
@@ -1965,14 +2086,18 @@ def cmd_stop(_: Optional[dict]) -> dict:
     _campaign_active = False
     _reset_trackers()
 
-    if had_location:
-        logging.info("📡 [clocks] restoring GNSS -> NORMAL (campaign had location '%s')", had_location)
-        try:
-            gnss_resp = _set_gnss_mode_normal()
-            if not gnss_resp.get("success"):
-                logging.warning("⚠️ [clocks] GNSS MODE=NORMAL failed: %s", gnss_resp.get("message", "?"))
-        except Exception:
-            logging.exception("⚠️ [clocks] GNSS MODE=NORMAL IPC failed (ignored)")
+    try:
+        effective_location = _ensure_gnss_mode_for_current_location()
+        if effective_location:
+            logging.info(
+                "📡 [clocks] stop complete — GNSS kept in TO mode for current location '%s' (campaign snapshot was '%s')",
+                effective_location,
+                stop_location,
+            )
+        else:
+            logging.info("📡 [clocks] stop complete — GNSS returned to NORMAL mode")
+    except Exception:
+        logging.exception("⚠️ [clocks] failed to reconcile GNSS mode at stop (ignored)")
 
     logging.info("⏹️ [clocks] campaign stopped")
     return {"success": True, "message": "OK"}
@@ -2217,11 +2342,14 @@ def _recover_campaign() -> None:
     campaign_name = row["campaign"]
     campaign_payload = row["payload"]
     campaign_location = campaign_payload.get("location")
+    system_location = _get_current_location()
+    effective_location = campaign_location or system_location
 
     logging.info(
-        "🔍 [recovery] active campaign found: '%s' (location: %s)",
+        "🔍 [recovery] active campaign found: '%s' (campaign location: %s, system location: %s)",
         campaign_name,
         campaign_location or "none",
+        system_location or "none",
     )
 
     # ------------------------------------------------------------------
@@ -2261,11 +2389,14 @@ def _recover_campaign() -> None:
         _wait_for_preflight("recovery/cold")
 
         # Restore GNSS TO mode if campaign had location
-        if campaign_location:
-            logging.info("📡 [recovery/cold] restoring GNSS -> TO mode for '%s'", campaign_location)
-            gnss_resp = _set_gnss_mode_to(campaign_location)
-            if not gnss_resp.get("success"):
-                raise RuntimeError(f"recovery/cold failed: GNSS MODE=TO failed: {gnss_resp.get('message', '?')}")
+        try:
+            effective_location = _ensure_gnss_mode_for_current_location()
+            if effective_location:
+                logging.info("📡 [recovery/cold] GNSS ensured in TO mode for '%s'", effective_location)
+            else:
+                logging.info("📡 [recovery/cold] GNSS ensured in NORMAL mode")
+        except Exception as e:
+            raise RuntimeError(f"recovery/cold failed: {e}")
 
         # Wait for PUBSUB routing
         logging.info("⏳ [recovery/cold] @%s waiting for PUBSUB routing...", system_time_z())
@@ -2403,14 +2534,16 @@ def _recover_campaign() -> None:
     # with true PPS edges, eliminating the pps_count desynchronization
     # that occurred when recovery was attempted before chrony locked.
     # ------------------------------------------------------------------
-    _wait_for_preflight("recovery")
+    try:
+        effective_location = _ensure_gnss_mode_for_current_location()
+        if effective_location:
+            logging.info("📡 [recovery] GNSS ensured in TO mode for '%s'", effective_location)
+        else:
+            logging.info("📡 [recovery] GNSS ensured in NORMAL mode")
+    except Exception as e:
+        raise RuntimeError(f"recovery failed: {e}")
 
-    # Restore GNSS TO mode if campaign had location
-    if campaign_location:
-        logging.info("📡 [recovery] restoring GNSS -> TO mode for '%s'", campaign_location)
-        gnss_resp = _set_gnss_mode_to(campaign_location)
-        if not gnss_resp.get("success"):
-            raise RuntimeError(f"recovery failed: GNSS MODE=TO failed: {gnss_resp.get('message', '?')}")
+    _wait_for_preflight("recovery")
 
     # ------------------------------------------------------------------
     # Wait for PUBSUB routing to be live
@@ -3259,6 +3392,14 @@ def run() -> None:
     if row is None:
         _request_teensy_stop_best_effort()
         _stop_pitimer_best_effort()
+        try:
+            effective_location = _ensure_gnss_mode_for_current_location()
+            if effective_location:
+                logging.info("📡 [clocks] boot idle state — GNSS kept in TO mode for '%s'", effective_location)
+            else:
+                logging.info("📡 [clocks] boot idle state — GNSS in NORMAL mode")
+        except Exception:
+            logging.exception("⚠️ [clocks] failed to reconcile GNSS mode at boot idle")
     else:
         _recover_campaign()
 
