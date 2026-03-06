@@ -14,7 +14,7 @@
 //      • anchor.gnss_ns
 //      • anchor.dwt_snap
 //
-//    To answer now("GNSS"), we read ARM_DWT_CYCCNT, compute:
+//    To answer now(GNSS), we read ARM_DWT_CYCCNT, compute:
 //
 //      dwt_elapsed = dwt_now - anchor.dwt_snap
 //
@@ -57,7 +57,6 @@
 
 #include <Arduino.h>
 #include <stdlib.h>
-#include <string.h>
 #include <math.h>
 #include "imxrt.h"
 
@@ -80,25 +79,6 @@ static constexpr uint32_t DWT_TO_GNSS_DEN = 126;
 //
 // Generous margin: 50 TIMEPULSE intervals = 5 ms.
 static constexpr uint64_t TIMEBASE_MAX_ANCHOR_AGE_NS = 5000000ULL;
-
-// ============================================================================
-// Domain model
-// ============================================================================
-
-enum class timebase_domain_t : uint8_t {
-  UNKNOWN = 0,
-  GNSS,
-  DWT,
-  OCXO,
-};
-
-static timebase_domain_t parse_domain(const char* domain) {
-  if (!domain) return timebase_domain_t::UNKNOWN;
-  if (strcmp(domain, "GNSS") == 0) return timebase_domain_t::GNSS;
-  if (strcmp(domain, "DWT")  == 0) return timebase_domain_t::DWT;
-  if (strcmp(domain, "OCXO") == 0) return timebase_domain_t::OCXO;
-  return timebase_domain_t::UNKNOWN;
-}
 
 // ============================================================================
 // Anchor state (written by TIMEPULSE ISR, read by anyone)
@@ -132,7 +112,7 @@ struct fragment_store_t {
 
 static fragment_store_t frag_store = {0, 0, 0, 0, 0, 0, 0, 0, 0, false};
 
-// Legacy/public read-only static view
+// Public mirror for diagnostics / reports
 static timebase_fragment_t frag_public = {};
 
 // ============================================================================
@@ -147,7 +127,7 @@ static inline void dmb(void) {
 // Safe multiply/divide helper
 // ============================================================================
 //
-// The original naive form:
+// The naive form:
 //
 //   (value * num) / den
 //
@@ -156,7 +136,7 @@ static inline void dmb(void) {
 //
 //   value * (num / den)
 //
-// using double precision.
+// using double precision when necessary.
 //
 // For current ZPNet time scales (absolute nanosecond totals in the low 10^12
 // to 10^13 range), double precision is more than adequate and avoids wrap.
@@ -169,17 +149,15 @@ static inline uint64_t mul_div_u64(
 ) {
   if (den == 0) return 0;
 
-  // Small exact path: safe 64-bit multiply
-  if (value <= (UINT64_MAX / (num == 0 ? 1 : num))) {
+  if (num != 0 && value <= (UINT64_MAX / num)) {
     return (value * num) / den;
   }
 
-  // Large path: avoid overflow via ratio
   double ratio  = (double)num / (double)den;
   double scaled = (double)value * ratio;
 
-  if (scaled <= 0.0) return 0.0;
-  return (uint64_t)(scaled + 0.5);  // nearest-integer nanosecond result
+  if (scaled <= 0.0) return 0;
+  return (uint64_t)(scaled + 0.5);
 }
 
 // ============================================================================
@@ -289,11 +267,10 @@ static bool fragment_domain_total_ns(
     case timebase_domain_t::OCXO:
       out_ns = snap.ocxo_ns;
       return snap.ocxo_ns > 0;
-
-    default:
-      out_ns = 0;
-      return false;
   }
+
+  out_ns = 0;
+  return false;
 }
 
 // ============================================================================
@@ -310,7 +287,6 @@ static bool gnss_now_from_anchor(uint64_t& out_gnss_ns) {
   uint64_t gnss_elapsed_ns =
     mul_div_u64((uint64_t)dwt_elapsed, DWT_TO_GNSS_NUM, DWT_TO_GNSS_DEN);
 
-  // Reject stale anchors
   if (gnss_elapsed_ns > TIMEBASE_MAX_ANCHOR_AGE_NS) {
     return false;
   }
@@ -324,16 +300,11 @@ static bool gnss_now_from_anchor(uint64_t& out_gnss_ns) {
 // ============================================================================
 
 static bool convert_via_fragment(
-  uint64_t          value_ns,
-  timebase_domain_t from_domain,
-  timebase_domain_t to_domain,
-  uint64_t&         out_ns
+  uint64_t           value_ns,
+  timebase_domain_t  from_domain,
+  timebase_domain_t  to_domain,
+  uint64_t&          out_ns
 ) {
-  if (from_domain == timebase_domain_t::UNKNOWN ||
-      to_domain   == timebase_domain_t::UNKNOWN) {
-    return false;
-  }
-
   if (from_domain == to_domain) {
     out_ns = value_ns;
     return true;
@@ -350,7 +321,6 @@ static bool convert_via_fragment(
   if (!fragment_domain_total_ns(snap, from_domain, from_total_ns)) return false;
   if (!fragment_domain_total_ns(snap, to_domain,   to_total_ns))   return false;
 
-  // Normalize to GNSS
   uint64_t gnss_ns;
   if (from_domain == timebase_domain_t::GNSS) {
     gnss_ns = value_ns;
@@ -358,7 +328,6 @@ static bool convert_via_fragment(
     gnss_ns = mul_div_u64(value_ns, snap.gnss_ns, from_total_ns);
   }
 
-  // Convert GNSS to target
   if (to_domain == timebase_domain_t::GNSS) {
     out_ns = gnss_ns;
   } else {
@@ -372,14 +341,11 @@ static bool convert_via_fragment(
 // Public API — now(domain)
 // ============================================================================
 
-int64_t timebase_now_ns(const char* domain) {
-  timebase_domain_t target = parse_domain(domain);
-  if (target == timebase_domain_t::UNKNOWN) return -1;
-
+int64_t timebase_now_ns(timebase_domain_t domain) {
   uint64_t gnss_now_ns = 0;
   if (!gnss_now_from_anchor(gnss_now_ns)) return -1;
 
-  if (target == timebase_domain_t::GNSS) {
+  if (domain == timebase_domain_t::GNSS) {
     return (int64_t)gnss_now_ns;
   }
 
@@ -387,7 +353,7 @@ int64_t timebase_now_ns(const char* domain) {
   if (!convert_via_fragment(
         gnss_now_ns,
         timebase_domain_t::GNSS,
-        target,
+        domain,
         converted)) {
     return -1;
   }
@@ -395,20 +361,23 @@ int64_t timebase_now_ns(const char* domain) {
   return (int64_t)converted;
 }
 
+int64_t timebase_now_gnss_ns(void) {
+  uint64_t gnss_now_ns = 0;
+  if (!gnss_now_from_anchor(gnss_now_ns)) return -1;
+  return (int64_t)gnss_now_ns;
+}
+
 // ============================================================================
 // Public API — convert(value, from, to)
 // ============================================================================
 
 int64_t timebase_convert_ns(
-  uint64_t    value_ns,
-  const char* from_domain,
-  const char* to_domain
+  uint64_t           value_ns,
+  timebase_domain_t  from_domain,
+  timebase_domain_t  to_domain
 ) {
-  timebase_domain_t from = parse_domain(from_domain);
-  timebase_domain_t to   = parse_domain(to_domain);
-
   uint64_t converted = 0;
-  if (!convert_via_fragment(value_ns, from, to, converted)) {
+  if (!convert_via_fragment(value_ns, from_domain, to_domain, converted)) {
     return -1;
   }
 
@@ -534,7 +503,6 @@ void on_timebase_fragment(const Payload& payload) {
   dmb();
   frag_store.seq++;
 
-  // Public mirror for diagnostics / reports
   frag_public.gnss_ns           = gnss_ns;
   frag_public.dwt_ns            = dwt_ns;
   frag_public.dwt_cycles        = dwt_cycles;

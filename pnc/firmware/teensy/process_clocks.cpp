@@ -339,6 +339,30 @@ static volatile uint32_t tp_diag_ticks_at_pps      = 0;
 static volatile int64_t  tp_diag_phase_error_ns    = 0;
 
 // ============================================================================
+// ISR-level Timebase self-check diagnostics
+// ============================================================================
+//
+// These are captured in ISR context immediately after the relevant
+// Timebase state is established or observed.
+//
+//   • TIMEPULSE ISR:
+//       - call timebase_now_gnss_ns() immediately after anchor update
+//       - compare the returned value to the just-written anchor
+//
+//   • PPS ISR:
+//       - call timebase_now_gnss_ns() immediately after raw snapshots
+//       - inspect how close the interpolated GNSS "now" is to the
+//         1-second boundary
+//
+
+static volatile int64_t  diag_timebase_tp_now_gnss_ns           = -1;
+static volatile int64_t  diag_timebase_tp_now_minus_anchor_ns   = -1;
+static volatile int64_t  diag_timebase_tp_now_mod_tick_ns       = -1;
+
+static volatile int64_t  diag_timebase_pps_now_gnss_ns          = -1;
+static volatile int64_t  diag_timebase_pps_now_mod_1s_ns        = -1;
+
+// ============================================================================
 // ISR-level hardware snapshots and raw residuals
 // ============================================================================
 
@@ -525,6 +549,19 @@ static void gpt2_compare_isr(void) {
 
   timebase_update_anchor(timepulse_anchor.gnss_ns, snap_dwt);
 
+  // Immediate Timebase self-check at the TIMEPULSE edge.
+  const int64_t tb_now = timebase_now_gnss_ns();
+  diag_timebase_tp_now_gnss_ns = tb_now;
+  if (tb_now >= 0) {
+    diag_timebase_tp_now_minus_anchor_ns =
+      tb_now - (int64_t)timepulse_anchor.gnss_ns;
+    diag_timebase_tp_now_mod_tick_ns =
+      tb_now % (int64_t)TIMEPULSE_NS_PER_TICK;
+  } else {
+    diag_timebase_tp_now_minus_anchor_ns = -1;
+    diag_timebase_tp_now_mod_tick_ns = -1;
+  }
+
   timepulse_tick_count++;
   timepulse_tick_in_second++;
 }
@@ -690,6 +727,12 @@ static void clocks_zero_all(void) {
   timepulse_tick_in_second  = 0;
   tp_diag_phase_error_ns    = 0;
   tp_diag_ticks_at_pps      = 0;
+
+  diag_timebase_tp_now_gnss_ns         = -1;
+  diag_timebase_tp_now_minus_anchor_ns = -1;
+  diag_timebase_tp_now_mod_tick_ns     = -1;
+  diag_timebase_pps_now_gnss_ns        = -1;
+  diag_timebase_pps_now_mod_1s_ns      = -1;
 }
 
 // ============================================================================
@@ -848,6 +891,12 @@ static void pps_asap_callback(timepop_ctx_t*, void*) {
     timepulse_tick_in_second  = 0;
     tp_diag_phase_error_ns    = 0;
     tp_diag_ticks_at_pps      = 0;
+
+    diag_timebase_tp_now_gnss_ns         = -1;
+    diag_timebase_tp_now_minus_anchor_ns = -1;
+    diag_timebase_tp_now_mod_tick_ns     = -1;
+    diag_timebase_pps_now_gnss_ns        = -1;
+    diag_timebase_pps_now_mod_1s_ns      = -1;
 
     campaign_state  = clocks_campaign_state_t::STARTED;
     request_recover = false;
@@ -1049,6 +1098,16 @@ static void pps_isr(void) {
   isr_prev_gnss = isr_snap_gnss = snap_gnss;
   isr_prev_ocxo = isr_snap_ocxo = snap_ocxo;
 
+  // Immediate Timebase self-check at the PPS edge.
+  const int64_t tb_now = timebase_now_gnss_ns();
+  diag_timebase_pps_now_gnss_ns = tb_now;
+  if (tb_now >= 0) {
+    diag_timebase_pps_now_mod_1s_ns =
+      tb_now % (int64_t)NS_PER_SECOND;
+  } else {
+    diag_timebase_pps_now_mod_1s_ns = -1;
+  }
+
   if (pps_scheduled) return;
   pps_scheduled = true;
 
@@ -1201,28 +1260,19 @@ static Payload cmd_report(const Payload&) {
 
   // --------------------------------------------------------------------------
   // TIMEBASE FORENSICS
-  //
-  // The goal is to make "now" observable rather than mystical.
-  // We expose:
-  //   • direct now() in all supported domains
-  //   • conversion validity
-  //   • deltas versus local raw clock snapshots
-  //   • last fragment values
-  //   • deltas versus the last PPS-edge fragment
-  //   • conversion cross-checks through timebase_convert_ns()
   // --------------------------------------------------------------------------
 
-  const int64_t tb_gnss = timebase_now_ns("GNSS");
-  const int64_t tb_dwt  = timebase_now_ns("DWT");
-  const int64_t tb_ocxo = timebase_now_ns("OCXO");
+  const int64_t tb_gnss = timebase_now_ns(timebase_domain_t::GNSS);
+  const int64_t tb_dwt  = timebase_now_ns(timebase_domain_t::DWT);
+  const int64_t tb_ocxo = timebase_now_ns(timebase_domain_t::OCXO);
 
   const bool tb_valid            = timebase_valid();
   const bool tb_conversion_valid = timebase_conversion_valid();
 
-  p.add("timebase_gnss_ns",         tb_gnss);
-  p.add("timebase_dwt_ns",          tb_dwt);
-  p.add("timebase_ocxo_ns",         tb_ocxo);
-  p.add("timebase_valid",           tb_valid);
+  p.add("timebase_gnss_ns",          tb_gnss);
+  p.add("timebase_dwt_ns",           tb_dwt);
+  p.add("timebase_ocxo_ns",          tb_ocxo);
+  p.add("timebase_valid",            tb_valid);
   p.add("timebase_conversion_valid", tb_conversion_valid);
 
   if (tb_gnss >= 0) {
@@ -1291,10 +1341,14 @@ static Payload cmd_report(const Payload&) {
     p.add("timebase_ocxo_minus_fragment_ocxo_ns", (int64_t)-1);
   }
 
-  const int64_t tb_conv_gnss_to_dwt  = timebase_convert_ns(gnss_ns, "GNSS", "DWT");
-  const int64_t tb_conv_gnss_to_ocxo = timebase_convert_ns(gnss_ns, "GNSS", "OCXO");
-  const int64_t tb_conv_dwt_to_gnss  = timebase_convert_ns(dwt_ns,  "DWT",  "GNSS");
-  const int64_t tb_conv_ocxo_to_gnss = timebase_convert_ns(ocxo_ns, "OCXO", "GNSS");
+  const int64_t tb_conv_gnss_to_dwt  =
+    timebase_convert_ns(gnss_ns, timebase_domain_t::GNSS, timebase_domain_t::DWT);
+  const int64_t tb_conv_gnss_to_ocxo =
+    timebase_convert_ns(gnss_ns, timebase_domain_t::GNSS, timebase_domain_t::OCXO);
+  const int64_t tb_conv_dwt_to_gnss  =
+    timebase_convert_ns(dwt_ns, timebase_domain_t::DWT, timebase_domain_t::GNSS);
+  const int64_t tb_conv_ocxo_to_gnss =
+    timebase_convert_ns(ocxo_ns, timebase_domain_t::OCXO, timebase_domain_t::GNSS);
 
   p.add("timebase_conv_gnss_to_dwt_ns",   tb_conv_gnss_to_dwt);
   p.add("timebase_conv_gnss_to_ocxo_ns",  tb_conv_gnss_to_ocxo);
@@ -1314,6 +1368,17 @@ static Payload cmd_report(const Payload&) {
   } else {
     p.add("timebase_ocxo_minus_conv_gnss_to_ocxo_ns", (int64_t)-1);
   }
+
+  // --------------------------------------------------------------------------
+  // ISR-level Timebase self-check diagnostics
+  // --------------------------------------------------------------------------
+
+  p.add("diag_timebase_tp_now_gnss_ns",           diag_timebase_tp_now_gnss_ns);
+  p.add("diag_timebase_tp_now_minus_anchor_ns",   diag_timebase_tp_now_minus_anchor_ns);
+  p.add("diag_timebase_tp_now_mod_tick_ns",       diag_timebase_tp_now_mod_tick_ns);
+
+  p.add("diag_timebase_pps_now_gnss_ns",          diag_timebase_pps_now_gnss_ns);
+  p.add("diag_timebase_pps_now_mod_1s_ns",        diag_timebase_pps_now_mod_1s_ns);
 
   report_residual(p, "dwt",  residual_dwt);
   report_residual(p, "gnss", residual_gnss);

@@ -10,11 +10,11 @@
 //   2) "What is the corresponding nanosecond value in domain B for a value
 //       expressed in domain A?"
 //
-// Current supported domains:
+// Supported domains:
 //
-//   • "GNSS" — GNSS nanoseconds
-//   • "DWT"  — DWT nanoseconds
-//   • "OCXO" — OCXO nanoseconds
+//   • GNSS — GNSS nanoseconds
+//   • DWT  — DWT nanoseconds
+//   • OCXO — OCXO nanoseconds
 //
 // Architecture
 // ------------
@@ -61,20 +61,14 @@
 // Design Notes
 // ------------
 //
-// • The string API is intentional.  It mirrors the Pi-side conceptual API and
-//   avoids enum synchronization across builds.
-//
+// • The core API is enum-based for hot-path and ISR use.
+// • No string dispatch in timing-sensitive code.
 // • GNSS interpolation is integer-only and ISR-safe.
-//
-// • Both the TIMEPULSE anchor and the fragment use sequence counters so readers
-//   never observe torn multiword state.
-//
-// • Anchor freshness is enforced.  A stale TIMEPULSE anchor is treated as
-//   invalid, which prevents Timebase from reporting stale "now" values after a
-//   campaign stops or the anchor stream stalls.
-//
-// • Conversion uses exact integer multiply/divide via 128-bit intermediate
-//   arithmetic to preserve nanosecond-scale integrity.
+// • Both the TIMEPULSE anchor and the fragment use sequence counters so
+//   readers never observe torn multiword state.
+// • Anchor freshness is enforced. A stale TIMEPULSE anchor is treated as
+//   invalid, which prevents Timebase from reporting stale "now" values
+//   after a campaign stops or the anchor stream stalls.
 //
 // ============================================================================
 
@@ -83,6 +77,16 @@
 #include "payload.h"
 
 #include <stdint.h>
+
+// ============================================================================
+// Clock domain enum (core API)
+// ============================================================================
+
+enum class timebase_domain_t : uint8_t {
+  GNSS = 0,
+  DWT  = 1,
+  OCXO = 2,
+};
 
 // ============================================================================
 // Initialization
@@ -97,33 +101,28 @@ void timebase_init(void);
 // ============================================================================
 
 // Returns the current nanosecond count in the specified domain.
-// Returns -1 if the domain is unknown or the required state is not valid.
-//
-// Supported domains:
-//   "GNSS"
-//   "DWT"
-//   "OCXO"
+// Returns -1 if the required state is not valid.
 //
 // ISR-safe. No allocation. Integer-only.
-int64_t timebase_now_ns(const char* domain);
+int64_t timebase_now_ns(timebase_domain_t domain);
+
+// Fast-path helper for the hottest call site.
+// Equivalent to timebase_now_ns(timebase_domain_t::GNSS).
+int64_t timebase_now_gnss_ns(void);
 
 // ============================================================================
 // Domain conversion API
 // ============================================================================
 
 // Convert a nanosecond value from one clock domain to another.
-// Returns -1 on failure (unknown domain, missing fragment, invalid ratio).
-//
-// Examples:
-//   timebase_convert_ns(gnss_ns, "GNSS", "DWT")
-//   timebase_convert_ns(dwt_ns,  "DWT",  "OCXO")
+// Returns -1 on failure (missing fragment, invalid ratio).
 //
 // Conversion is performed through GNSS using the latest authoritative
 // TIMEBASE_FRAGMENT ratios.
 int64_t timebase_convert_ns(
-  uint64_t    value_ns,
-  const char* from_domain,
-  const char* to_domain
+  uint64_t           value_ns,
+  timebase_domain_t  from_domain,
+  timebase_domain_t  to_domain
 );
 
 // ============================================================================

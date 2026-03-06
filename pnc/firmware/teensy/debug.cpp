@@ -74,7 +74,7 @@ void debug_log(const char* name, const Payload& value) {
   Payload out;
   out.add("name", name);
 
-  char local_buf[1024];
+  char local_buf[3072];
   size_t len = value.write_json(local_buf, sizeof(local_buf));
   out.add_raw_object("value", len > 0 ? local_buf : "{}");
 

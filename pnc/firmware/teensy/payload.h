@@ -217,7 +217,7 @@ public:
     // Limits
     // --------------------------------------------------
 
-    static constexpr size_t MAX_ENTRIES   = 128;
+    static constexpr size_t MAX_ENTRIES   = 256;
     static constexpr size_t ARENA_INITIAL = 512;
     static constexpr size_t ARENA_MAX     = 8192;
 
