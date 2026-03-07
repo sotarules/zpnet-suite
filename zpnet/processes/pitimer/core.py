@@ -154,7 +154,7 @@ NS_PER_TICK = 1e9 / PI_TIMER_FREQ
 BUFFER_MAX_SIZE = 120
 
 # Capture mode: "loop" or "pps"
-_capture_mode: str = "loop"
+_capture_mode: str = "pps"
 _capture_mode_lock = threading.Lock()
 
 # ---------------------------------------------------------------------
