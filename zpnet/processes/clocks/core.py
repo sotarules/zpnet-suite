@@ -790,6 +790,55 @@ def _persist_timebase(tb: Dict[str, Any], report: Dict[str, Any]) -> None:
         logging.exception("⚠️ [clocks] failed to persist TIMEBASE (ignored)")
 
 
+
+
+def _wait_for_pubsub_route(
+    *,
+    context: str,
+    topic: str,
+    timeout_s: float = 30.0,
+    poll_s: float = 0.5,
+) -> None:
+    """
+    Wait until the Teensy PUBSUB report shows a specific route.
+
+    This is used during startup/recovery sequencing when CLOCKS must not
+    proceed until PUBSUB delivery is known to be live for a required topic.
+    """
+    logging.info(
+        "⏳ [%s] @%s waiting for PUBSUB routing for topic '%s'...",
+        context, system_time_z(), topic,
+    )
+    route_wait_t0 = time.monotonic()
+
+    while True:
+        elapsed_wait = time.monotonic() - route_wait_t0
+        try:
+            resp = send_command(machine="TEENSY", subsystem="PUBSUB", command="REPORT")
+            if resp.get("success"):
+                routes = resp.get("payload", {}).get("routes", [])
+                found = any(
+                    r.get("topic") == topic
+                    for r in routes
+                )
+                if found:
+                    logging.info(
+                        "✅ [%s] @%s PUBSUB route confirmed for topic '%s' (%.1fs)",
+                        context, system_time_z(), topic, elapsed_wait,
+                    )
+                    return
+        except RuntimeError:
+            raise
+        except Exception:
+            pass
+
+        if elapsed_wait >= timeout_s:
+            raise RuntimeError(
+                f"{context} failed: PUBSUB route '{topic}' not found in {timeout_s}s"
+            )
+        time.sleep(poll_s)
+
+
 def _wait_for_gnss_time() -> str:
     """Patiently wait for GNSS time to be available. Instrumented."""
     _diag["gnss_waits"] += 1
@@ -2490,33 +2539,7 @@ def _recover_campaign() -> None:
             raise RuntimeError(f"recovery/cold failed: {e}")
 
         # Wait for PUBSUB routing
-        logging.info("⏳ [recovery/cold] @%s waiting for PUBSUB routing...", system_time_z())
-        route_wait_t0 = time.monotonic()
-        while True:
-            elapsed_wait = time.monotonic() - route_wait_t0
-            try:
-                resp = send_command(machine="TEENSY", subsystem="PUBSUB", command="REPORT")
-                if resp.get("success"):
-                    routes = resp.get("payload", {}).get("routes", [])
-                    found = any(
-                        r.get("topic") == "TIMEBASE_FRAGMENT"
-                        and r.get("subsystem") == "CLOCKS"
-                        and r.get("machine") == "PI"
-                        for r in routes
-                    )
-                    if found:
-                        logging.info(
-                            "✅ [recovery/cold] @%s PUBSUB route confirmed (%.1fs)",
-                            system_time_z(), elapsed_wait,
-                        )
-                        break
-            except RuntimeError:
-                raise
-            except Exception:
-                pass
-            if elapsed_wait >= 30.0:
-                raise RuntimeError("recovery/cold failed: PUBSUB route not found in 30s")
-            time.sleep(0.5)
+        _wait_for_pubsub_route(context="recovery/cold", topic="TIMEBASE_FRAGMENT")
 
         # Stop + drain + reset
         _request_teensy_stop_best_effort()
@@ -2639,38 +2662,7 @@ def _recover_campaign() -> None:
     # ------------------------------------------------------------------
     # Wait for PUBSUB routing to be live
     # ------------------------------------------------------------------
-    logging.info("⏳ [recovery] @%s waiting for PUBSUB routing...", system_time_z())
-    route_wait_t0 = time.monotonic()
-    ROUTING_WAIT_TIMEOUT_S = 30.0
-    ROUTING_WAIT_POLL_S = 0.5
-    while True:
-        elapsed_wait = time.monotonic() - route_wait_t0
-        try:
-            resp = send_command(machine="TEENSY", subsystem="PUBSUB", command="REPORT")
-            if resp.get("success"):
-                routes = resp.get("payload", {}).get("routes", [])
-                found = any(
-                    r.get("topic") == "TIMEBASE_FRAGMENT"
-                    and r.get("subsystem") == "CLOCKS"
-                    and r.get("machine") == "PI"
-                    for r in routes
-                )
-                if found:
-                    logging.info(
-                        "✅ [recovery] @%s PUBSUB route confirmed (%.1fs)",
-                        system_time_z(), elapsed_wait,
-                    )
-                    break
-        except RuntimeError:
-            raise
-        except Exception:
-            pass
-
-        if elapsed_wait >= ROUTING_WAIT_TIMEOUT_S:
-            raise RuntimeError(
-                f"recovery failed: PUBSUB route not found in {ROUTING_WAIT_TIMEOUT_S}s"
-            )
-        time.sleep(ROUTING_WAIT_POLL_S)
+    _wait_for_pubsub_route(context="recovery", topic="TIMEBASE_FRAGMENT")
 
     # ------------------------------------------------------------------
     # Stop Teensy + PITIMER, quiesce, snap to second boundary
@@ -3478,6 +3470,11 @@ def run() -> None:
         blocking=False,
     )
 
+    # Wait for PUBSUB routing
+    _wait_for_pubsub_route(context="recovery/cold", topic="TEENSY_MACHINE_CLOCK_DATA")
+    bootstrap_location = _get_current_location()
+    _publish_teensy_machine_clock_data_from_location(bootstrap_location)
+
     # Recover or stop stray Teensy + PITIMER
     row = _get_active_campaign()
     if row is None:
@@ -3493,23 +3490,6 @@ def run() -> None:
             logging.exception("⚠️ [clocks] failed to reconcile GNSS mode at boot idle")
     else:
         _recover_campaign()
-
-    # Publish persisted Teensy machine-clock data at startup so the Teensy
-    # can hydrate its local model immediately, even before the next TIMEBASE.
-    try:
-        bootstrap_location = None
-        active_row = _get_active_campaign()
-        if active_row is not None:
-            active_payload = active_row.get("payload", {})
-            if isinstance(active_payload, dict):
-                active_location = active_payload.get("location")
-                if isinstance(active_location, str):
-                    bootstrap_location = active_location.strip() or None
-        if not bootstrap_location:
-            bootstrap_location = _get_current_location()
-        _publish_teensy_machine_clock_data_from_location(bootstrap_location)
-    except Exception:
-        logging.exception("⚠️ [clocks] startup TEENSY_MACHINE_CLOCK_DATA publish failed (ignored)")
 
     # Block forever
     logging.info("🏁 [clocks] entering main loop")
