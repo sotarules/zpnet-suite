@@ -4,20 +4,38 @@ import ctypes
 import logging
 import math
 import os
+import signal
 import threading
 import time
 from collections import OrderedDict
 from typing import Any, Dict, Optional
-
-import gpiod
 
 from zpnet.processes.processes import server_setup
 from zpnet.shared.logger import setup_logging
 from zpnet.shared.util import system_time_z
 
 # ---------------------------------------------------------------------
+# Optional userspace GPIO backend
+# ---------------------------------------------------------------------
+
+try:
+    import gpiod  # type: ignore
+except Exception:
+    gpiod = None
+
+# ---------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------
+
+# Defensive default:
+#   gpio_user  -> userspace libgpiod edge events (safer, latency-prone)
+#   ppslatch   -> native hardware-edge latch engine
+CAPTURE_BACKEND = os.environ.get("PITIMER_BACKEND", "ppslatch").strip().lower()
+
+PPSLATCH_LIB = os.environ.get(
+    "PPSLATCH_LIB",
+    "/home/mule/zpnet/zpnet/native/ppslatch/libppslatch.so",
+)
 
 CNTVCT_LIB = os.environ.get(
     "CNTVCT_LIB",
@@ -29,23 +47,21 @@ NS_PER_SECOND = 1_000_000_000
 NS_PER_TICK = 1e9 / PI_TIMER_FREQ
 
 BUFFER_MAX_SIZE = 120
+PPSLATCH_RING_SIZE = 4096
 
-# Dedicated PITIMER PPS input on the Pi.
 GPIO_CHIP_PATH = os.environ.get("PITIMER_GPIO_CHIP", "/dev/gpiochip0")
 GPIO_LINE_OFFSET = int(os.environ.get("PITIMER_GPIO_LINE", "25"))
 GPIO_CONSUMER = "pitimer-pps"
 
-CAPTURE_CORE = int(os.environ.get("PITIMER_CAPTURE_CORE", "3"))
-LOOP_SHADOW_CORE = int(os.environ.get("PITIMER_LOOP_SHADOW_CORE", "3"))
-
-ENABLE_LOOP_SHADOW = True
-
-# We treat the rising edge as the sacred PPS identity boundary.
-# Falling edges are observed diagnostically only.
 SACRED_EDGE = "rising"
+ENABLE_LOOP_SHADOW = True
+USER_GPIO_POLL_TIMEOUT_S = 1.0
+
+# Core 3 is dedicated to the ppslatch spin loop.
+LATCH_CPU_CORE = int(os.environ.get("PITIMER_LATCH_CORE", "3"))
 
 # ---------------------------------------------------------------------
-# Native library interface — CNTVCT
+# Native library interface — cntvct
 # ---------------------------------------------------------------------
 
 _cntvct_lib: Optional[ctypes.CDLL] = None
@@ -63,25 +79,188 @@ def _read_cntvct() -> int:
 
 
 # ---------------------------------------------------------------------
+# Native library interface — ppslatch
+# ---------------------------------------------------------------------
+#
+# IMPORTANT — struct layout must match ppslatch.c exactly.
+#
+# The C ring uses _Alignas(64) on each atomic field, so each occupies
+# a full 64-byte cache line.  The ctypes structs below mirror this
+# with explicit padding bytes.  If the C struct ever changes, re-run
+# ppslatch_ring_struct_size() / ppslatch_entry_size() and verify.
+# ---------------------------------------------------------------------
+
+_ppslatch_lib: Optional[ctypes.CDLL] = None
+
+
+class PPSLatchEntry(ctypes.Structure):
+    """Mirror of ppslatch_entry_t in ppslatch.c.
+
+    Fields:
+        captured_cntvct  uint64  — CNTVCT_EL0 at sacred edge
+        shadow_cntvct    uint64  — last shadow read before edge
+        delta_ticks      uint64  — captured - shadow
+        edge_seq         uint64  — monotonic edge counter
+        shadow_seq       uint64  — monotonic shadow counter
+        flags            uint32  — reserved
+    """
+    _fields_ = [
+        ("captured_cntvct", ctypes.c_uint64),
+        ("shadow_cntvct", ctypes.c_uint64),
+        ("delta_ticks", ctypes.c_uint64),
+        ("edge_seq", ctypes.c_uint64),
+        ("shadow_seq", ctypes.c_uint64),
+        ("flags", ctypes.c_uint32),
+    ]
+
+
+class PPSLatchRing(ctypes.Structure):
+    """Mirror of ppslatch_ring_t in ppslatch.c.
+
+    Each atomic field in the C struct is _Alignas(64), occupying a full
+    cache line.  We model this with 64-byte sub-structs so that the
+    overall size and field offsets match exactly.
+    """
+
+    class _CacheLine_u64(ctypes.Structure):
+        _fields_ = [
+            ("value", ctypes.c_uint64),
+            ("_pad", ctypes.c_uint8 * 56),
+        ]
+
+    class _CacheLine_i32(ctypes.Structure):
+        _fields_ = [
+            ("value", ctypes.c_int32),
+            ("_pad", ctypes.c_uint8 * 60),
+        ]
+
+    _fields_ = [
+        ("head",               _CacheLine_u64),   # atomic_uint_fast64_t
+        ("tail",               _CacheLine_u64),
+        ("edges_total",        _CacheLine_u64),
+        ("overflows",          _CacheLine_u64),
+        ("last_shadow_cntvct", _CacheLine_u64),
+        ("last_shadow_seq",    _CacheLine_u64),
+        ("running",            _CacheLine_i32),    # atomic_int
+        ("stop",               _CacheLine_i32),
+        ("entries",            PPSLatchEntry * PPSLATCH_RING_SIZE),
+    ]
+
+
+def _load_ppslatch_lib() -> ctypes.CDLL:
+    lib = ctypes.CDLL(PPSLATCH_LIB)
+
+    lib.ppslatch_run.argtypes = [ctypes.POINTER(PPSLatchRing)]
+    lib.ppslatch_run.restype = ctypes.c_int
+
+    lib.ppslatch_stop.argtypes = [ctypes.POINTER(PPSLatchRing)]
+    lib.ppslatch_stop.restype = None
+
+    lib.ppslatch_cleanup.argtypes = []
+    lib.ppslatch_cleanup.restype = None
+
+    lib.ppslatch_drain.argtypes = [
+        ctypes.POINTER(PPSLatchRing),
+        ctypes.POINTER(PPSLatchEntry),
+        ctypes.c_uint32,
+    ]
+    lib.ppslatch_drain.restype = ctypes.c_uint32
+
+    lib.ppslatch_ring_size.argtypes = []
+    lib.ppslatch_ring_size.restype = ctypes.c_uint32
+
+    lib.ppslatch_entry_size.argtypes = []
+    lib.ppslatch_entry_size.restype = ctypes.c_uint64
+
+    lib.ppslatch_ring_struct_size.argtypes = []
+    lib.ppslatch_ring_struct_size.restype = ctypes.c_uint64
+
+    # Yield tuning — new in ppslatch with sched_yield() support
+    lib.ppslatch_set_yield.argtypes = [ctypes.c_uint32]
+    lib.ppslatch_set_yield.restype = None
+
+    lib.ppslatch_get_yield.argtypes = []
+    lib.ppslatch_get_yield.restype = ctypes.c_uint32
+
+    return lib
+
+
+def _verify_ppslatch_abi() -> None:
+    """Verify ctypes struct sizes match the C ABI at startup."""
+    c_entry_size = int(_ppslatch_lib.ppslatch_entry_size())
+    c_ring_size = int(_ppslatch_lib.ppslatch_ring_struct_size())
+    py_entry_size = ctypes.sizeof(PPSLatchEntry)
+    py_ring_size = ctypes.sizeof(PPSLatchRing)
+
+    logging.info(
+        "⏱️ [pitimer] ppslatch ABI check: "
+        "C entry_size=%d py=%d | C ring_struct_size=%d py=%d | ring_capacity=%d",
+        c_entry_size, py_entry_size,
+        c_ring_size, py_ring_size,
+        int(_ppslatch_lib.ppslatch_ring_size()),
+    )
+
+    if py_entry_size != c_entry_size:
+        logging.error(
+            "🚨 [pitimer] PPSLatchEntry size MISMATCH: C=%d Python=%d — "
+            "captures will be corrupt!",
+            c_entry_size, py_entry_size,
+        )
+
+    if py_ring_size != c_ring_size:
+        logging.error(
+            "🚨 [pitimer] PPSLatchRing size MISMATCH: C=%d Python=%d — "
+            "ring buffer will be corrupt!",
+            c_ring_size, py_ring_size,
+        )
+
+
+# ---------------------------------------------------------------------
 # Diagnostics
 # ---------------------------------------------------------------------
 
 _diag: Dict[str, Any] = {
-    # Capture loop
+    "backend": CAPTURE_BACKEND,
+
+    # Thread / backend state
+    "capture_thread_started": False,
+    "shadow_thread_started": False,
+    "latch_thread_started": False,
+    "drain_thread_started": False,
+    "native_run_rc": None,
+    "native_running": False,
+    "native_edges_total": 0,
+    "native_overflows": 0,
+    "native_last_edge_seq": None,
+    "native_last_shadow_seq": None,
+
+    # Core affinity
+    "latch_core_requested": LATCH_CPU_CORE,
+    "latch_core_affinity_set": False,
+    "latch_core_affinity_actual": None,
+    "latch_yield_interval": None,
+
+    # Capture processing
     "captures_total": 0,
     "capture_exceptions": 0,
     "captures_idle": 0,
     "rising_edges_seen": 0,
     "falling_edges_seen": 0,
 
-    # Edge timing / histogram surface
+    # Delta / histogram surface
+    "delta_ticks_last": None,
+    "delta_ticks_mean": 0.0,
+    "delta_ticks_stddev": 0.0,
+    "delta_ticks_min": None,
+    "delta_ticks_max": None,
+
     "same_edge_period_ticks_last": None,
     "same_edge_period_ticks_mean": 0.0,
     "same_edge_period_ticks_stddev": 0.0,
     "same_edge_period_ticks_min": None,
     "same_edge_period_ticks_max": None,
 
-    # Loop shadow (diagnostic only)
+    # Loop shadow
     "loop_shadow_enabled": ENABLE_LOOP_SHADOW,
     "loop_shadow_samples": 0,
     "loop_shadow_last_counter": None,
@@ -127,10 +306,6 @@ _diag: Dict[str, Any] = {
     # Last-seen values
     "last_capture": {},
     "last_set_event": {},
-
-    # Thread / scheduler
-    "capture_thread_started": False,
-    "shadow_thread_started": False,
 }
 
 # ---------------------------------------------------------------------
@@ -139,10 +314,7 @@ _diag: Dict[str, Any] = {
 
 _state_lock = threading.Lock()
 
-# RUNNING means sacred rising-edge captures are assigned pps_count and buffered.
-# STOPPED means edge loop still runs, but captures are observational only.
 _running: bool = False
-
 _capture_buffer: OrderedDict[int, Dict[str, Any]] = OrderedDict()
 _last_capture: Optional[Dict[str, Any]] = None
 _capture_seq: int = 0
@@ -155,8 +327,7 @@ _pi_tick_epoch: int = 0
 _epoch_set: bool = False
 _pending_pi_ns: Optional[int] = None
 
-_last_rising_cntvct: Optional[int] = None
-_last_falling_cntvct: Optional[int] = None
+_last_captured_cntvct: Optional[int] = None
 
 # ---------------------------------------------------------------------
 # Loop shadow state
@@ -167,32 +338,24 @@ _shadow_ns: int = 0
 _shadow_seq: int = 0
 _shadow_lock = threading.Lock()
 
-# Welford — loop shadow delta ticks (captured_cntvct - shadow_counter)
-_shadow_n = 0
-_shadow_mean = 0.0
-_shadow_m2 = 0.0
-_shadow_min: Optional[int] = None
-_shadow_max: Optional[int] = None
+_delta_n = 0
+_delta_mean = 0.0
+_delta_m2 = 0.0
+_delta_min: Optional[int] = None
+_delta_max: Optional[int] = None
 
-# Welford — same-edge period ticks (rising→rising)
 _period_n = 0
 _period_mean = 0.0
 _period_m2 = 0.0
 _period_min: Optional[int] = None
 _period_max: Optional[int] = None
 
+_ring = PPSLatchRing()
+_native_thread: Optional[threading.Thread] = None
 
 # ---------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------
-
-
-def _pin_this_thread_to_core(core: int) -> None:
-    try:
-        os.sched_setaffinity(0, {int(core)})
-        logging.info("📌 [pitimer] pinned thread to core %d", core)
-    except Exception:
-        logging.exception("⚠️ [pitimer] failed to pin thread to core %d", core)
 
 
 def _compute_pi_ns(corrected: int) -> Optional[int]:
@@ -290,37 +453,28 @@ def _buffer_peek(pps_count: int) -> Optional[Dict[str, Any]]:
     return None
 
 
-def _shadow_snapshot() -> Dict[str, int]:
-    with _shadow_lock:
-        return {
-            "counter": int(_shadow_counter),
-            "ns": int(_shadow_ns),
-            "seq": int(_shadow_seq),
-        }
+def _delta_update_stats(delta_ticks: int) -> None:
+    global _delta_n, _delta_mean, _delta_m2, _delta_min, _delta_max
 
+    _delta_n += 1
+    d1 = float(delta_ticks) - _delta_mean
+    _delta_mean += d1 / _delta_n
+    d2 = float(delta_ticks) - _delta_mean
+    _delta_m2 += d1 * d2
 
-def _shadow_update_stats(delta_ticks: int) -> None:
-    global _shadow_n, _shadow_mean, _shadow_m2, _shadow_min, _shadow_max
+    _delta_min = delta_ticks if _delta_min is None else min(_delta_min, delta_ticks)
+    _delta_max = delta_ticks if _delta_max is None else max(_delta_max, delta_ticks)
 
-    _shadow_n += 1
-    d1 = float(delta_ticks) - _shadow_mean
-    _shadow_mean += d1 / _shadow_n
-    d2 = float(delta_ticks) - _shadow_mean
-    _shadow_m2 += d1 * d2
-
-    _shadow_min = delta_ticks if _shadow_min is None else min(_shadow_min, delta_ticks)
-    _shadow_max = delta_ticks if _shadow_max is None else max(_shadow_max, delta_ticks)
-
-    if _shadow_n >= 2:
-        variance = _shadow_m2 / (_shadow_n - 1)
-        _diag["loop_shadow_delta_ticks_stddev"] = math.sqrt(variance)
+    if _delta_n >= 2:
+        variance = _delta_m2 / (_delta_n - 1)
+        _diag["delta_ticks_stddev"] = math.sqrt(variance)
     else:
-        _diag["loop_shadow_delta_ticks_stddev"] = 0.0
+        _diag["delta_ticks_stddev"] = 0.0
 
-    _diag["loop_shadow_delta_ticks_last"] = delta_ticks
-    _diag["loop_shadow_delta_ticks_mean"] = _shadow_mean
-    _diag["loop_shadow_delta_ticks_min"] = _shadow_min
-    _diag["loop_shadow_delta_ticks_max"] = _shadow_max
+    _diag["delta_ticks_last"] = delta_ticks
+    _diag["delta_ticks_mean"] = _delta_mean
+    _diag["delta_ticks_min"] = _delta_min
+    _diag["delta_ticks_max"] = _delta_max
 
 
 def _period_update_stats(period_ticks: int) -> None:
@@ -347,8 +501,233 @@ def _period_update_stats(period_ticks: int) -> None:
     _diag["same_edge_period_ticks_max"] = _period_max
 
 
-def _event_type_name(ev: gpiod.EdgeEvent) -> str:
-    et = ev.event_type
+def _shadow_snapshot() -> Dict[str, int]:
+    with _shadow_lock:
+        return {
+            "counter": int(_shadow_counter),
+            "ns": int(_shadow_ns),
+            "seq": int(_shadow_seq),
+        }
+
+
+def _shadow_update(counter: int, ns: int) -> None:
+    global _shadow_counter, _shadow_ns, _shadow_seq
+    with _shadow_lock:
+        _shadow_counter = int(counter)
+        _shadow_ns = int(ns)
+        _shadow_seq += 1
+    _diag["loop_shadow_samples"] += 1
+    _diag["loop_shadow_last_counter"] = int(counter)
+    _diag["loop_shadow_last_ns"] = int(ns)
+
+
+def _shadow_thread_loop() -> None:
+    _diag["shadow_thread_started"] = True
+    while True:
+        try:
+            _shadow_update(_read_cntvct(), time.monotonic_ns())
+        except Exception:
+            _diag["capture_exceptions"] += 1
+            logging.exception("💥 [pitimer] shadow loop failed")
+            time.sleep(0.05)
+
+
+def _process_capture(corrected: int, edge_meta: Dict[str, Any]) -> None:
+    global _last_capture, _capture_seq
+    global _pi_tick_epoch, _epoch_set, _pending_pi_ns
+    global _last_captured_cntvct
+
+    _diag["captures_total"] += 1
+
+    shadow = _shadow_snapshot() if ENABLE_LOOP_SHADOW else {"counter": None, "ns": None, "seq": None}
+    shadow_cntvct = shadow["counter"]
+    shadow_ns = shadow["ns"]
+    shadow_seq = shadow["seq"]
+
+    if shadow_cntvct is not None:
+        delta_ticks = int(corrected - shadow_cntvct)
+        delta_ns = int(round(delta_ticks * NS_PER_TICK))
+        _delta_update_stats(delta_ticks)
+        _diag["loop_shadow_delta_ticks_last"] = delta_ticks
+        _diag["loop_shadow_delta_ticks_mean"] = _diag["delta_ticks_mean"]
+        _diag["loop_shadow_delta_ticks_stddev"] = _diag["delta_ticks_stddev"]
+        _diag["loop_shadow_delta_ticks_min"] = _diag["delta_ticks_min"]
+        _diag["loop_shadow_delta_ticks_max"] = _diag["delta_ticks_max"]
+    else:
+        delta_ticks = None
+        delta_ns = None
+
+    if _last_captured_cntvct is not None:
+        same_edge_period_ticks = int(corrected - _last_captured_cntvct)
+        same_edge_period_ns = int(round(same_edge_period_ticks * NS_PER_TICK))
+        _period_update_stats(same_edge_period_ticks)
+    else:
+        same_edge_period_ticks = None
+        same_edge_period_ns = None
+    _last_captured_cntvct = corrected
+
+    cap: Dict[str, Any] = {
+        "capture_mode": CAPTURE_BACKEND,
+        "capture_seq": None,
+        "corrected": int(corrected),
+        "captured_cntvct": int(corrected),
+        "shadow_cntvct": shadow_cntvct,
+        "loop_shadow_counter": shadow_cntvct,
+        "loop_shadow_ns": shadow_ns,
+        "loop_shadow_seq": shadow_seq,
+        "loop_shadow_delta_ticks": delta_ticks,
+        "loop_shadow_delta_ns": delta_ns,
+        "delta_ticks": delta_ticks,
+        "delta_ns": delta_ns,
+        "same_edge_period_ticks": same_edge_period_ticks,
+        "same_edge_period_ns": same_edge_period_ns,
+        "freq": PI_TIMER_FREQ,
+        "ns_per_tick": round(NS_PER_TICK, 6),
+        **edge_meta,
+    }
+
+    with _state_lock:
+        _capture_seq += 1
+        cap["capture_seq"] = int(_capture_seq)
+        cap["system_time"] = system_time_z()
+
+        if _running and _pps_armed:
+            pps_count = _assign_pps_count()
+            cap["pps_count"] = int(pps_count)
+
+            if _pending_pi_ns is not None:
+                _pi_tick_epoch = _derive_epoch_from_pi_ns(int(corrected), int(_pending_pi_ns))
+                _epoch_set = True
+                _diag["epoch_derived_from_pi_ns"] += 1
+                _diag["epoch_value"] = int(_pi_tick_epoch)
+                _pending_pi_ns = None
+
+            cap["pi_ns"] = _compute_pi_ns(int(corrected))
+            _buffer_insert(pps_count, cap)
+        else:
+            _diag["captures_idle"] += 1
+            cap["pps_count"] = None
+            cap["pi_ns"] = _compute_pi_ns(int(corrected)) if _epoch_set else None
+
+        _last_capture = dict(cap)
+        _diag["last_capture"] = {
+            "ts_utc": system_time_z(),
+            "capture_seq": cap.get("capture_seq"),
+            "corrected": cap.get("corrected"),
+            "pi_ns": cap.get("pi_ns"),
+            "pps_count": cap.get("pps_count"),
+            "edge": cap.get("edge"),
+            "delta_ticks": cap.get("delta_ticks"),
+            "same_edge_period_ticks": cap.get("same_edge_period_ticks"),
+        }
+
+
+# ---------------------------------------------------------------------
+# Native ppslatch backend
+# ---------------------------------------------------------------------
+
+
+def _native_run_thread() -> None:
+    """Run the ppslatch spin loop on a dedicated core.
+
+    This thread MUST be pinned to LATCH_CPU_CORE before entering the C
+    spin loop.  The spin loop calls sched_yield() periodically (see
+    ppslatch_set_yield) to keep the kernel watchdog happy, but core
+    isolation is the primary defence against starving the scheduler.
+    """
+    _diag["latch_thread_started"] = True
+    try:
+        # ── Pin to dedicated latch core ──────────────────────────
+        try:
+            os.sched_setaffinity(0, {LATCH_CPU_CORE})
+            actual = os.sched_getaffinity(0)
+            _diag["latch_core_affinity_set"] = True
+            _diag["latch_core_affinity_actual"] = sorted(actual)
+            logging.info(
+                "⏱️ [pitimer] ppslatch latch thread pinned to core %d "
+                "(affinity=%s)",
+                LATCH_CPU_CORE, actual,
+            )
+        except OSError as exc:
+            _diag["latch_core_affinity_set"] = False
+            _diag["latch_core_affinity_actual"] = None
+            logging.error(
+                "🚨 [pitimer] FAILED to pin latch thread to core %d: %s — "
+                "system stability at risk without core isolation!",
+                LATCH_CPU_CORE, exc,
+            )
+
+        # ── Log yield interval for diagnostics ───────────────────
+        try:
+            yi = int(_ppslatch_lib.ppslatch_get_yield())
+            _diag["latch_yield_interval"] = yi
+            logging.info(
+                "⏱️ [pitimer] ppslatch yield interval=%d "
+                "(0=disabled, for isolated core with SCHED_FIFO)",
+                yi,
+            )
+        except Exception:
+            logging.warning("⚠️ [pitimer] could not query ppslatch yield interval")
+
+        # ── Enter the sacred spin loop (blocks until stop) ───────
+        logging.info("[pitimer] ppslatch native run thread starting")
+        rc = int(_ppslatch_lib.ppslatch_run(ctypes.byref(_ring)))
+        _diag["native_run_rc"] = rc
+        logging.info("[pitimer] ppslatch native run thread exited rc=%d", rc)
+
+    except Exception:
+        _diag["capture_exceptions"] += 1
+        logging.exception("💥 [pitimer] ppslatch native run failed")
+
+
+def _native_drain_loop() -> None:
+    _diag["drain_thread_started"] = True
+    drain_buf = (PPSLatchEntry * 1024)()
+
+    while True:
+        try:
+            count = int(_ppslatch_lib.ppslatch_drain(
+                ctypes.byref(_ring),
+                drain_buf,
+                len(drain_buf),
+            ))
+
+            _diag["native_edges_total"] = int(_ring.edges_total.value)
+            _diag["native_overflows"] = int(_ring.overflows.value)
+            _diag["native_running"] = bool(_ring.running.value)
+
+            if count == 0:
+                time.sleep(0.001)
+                continue
+
+            for i in range(count):
+                ent = drain_buf[i]
+                _diag["rising_edges_seen"] += 1
+                _diag["native_last_edge_seq"] = int(ent.edge_seq)
+                _diag["native_last_shadow_seq"] = int(ent.shadow_seq)
+
+                _process_capture(
+                    int(ent.captured_cntvct),
+                    {
+                        "edge": SACRED_EDGE,
+                        "event_seq": int(ent.edge_seq),
+                        "shadow_seq": int(ent.shadow_seq),
+                    },
+                )
+
+        except Exception:
+            _diag["capture_exceptions"] += 1
+            logging.exception("💥 [pitimer] native drain loop failed")
+            time.sleep(0.05)
+
+
+# ---------------------------------------------------------------------
+# Userspace GPIO backend
+# ---------------------------------------------------------------------
+
+
+def _event_type_name(ev: Any) -> str:
+    et = getattr(ev, "event_type", None)
     name = str(et).upper()
     if "RISING" in name:
         return "rising"
@@ -361,35 +740,9 @@ def _event_type_name(ev: gpiod.EdgeEvent) -> str:
     return f"unknown:{et}"
 
 
-# ---------------------------------------------------------------------
-# Loop shadow thread (diagnostic only)
-# ---------------------------------------------------------------------
-
-
-def _loop_shadow_thread() -> None:
-    global _shadow_counter, _shadow_ns, _shadow_seq
-
-    _pin_this_thread_to_core(LOOP_SHADOW_CORE)
-    _diag["shadow_thread_started"] = True
-
-    while True:
-        c = _read_cntvct()
-        n = time.monotonic_ns()
-        with _shadow_lock:
-            _shadow_counter = int(c)
-            _shadow_ns = int(n)
-            _shadow_seq += 1
-        _diag["loop_shadow_samples"] += 1
-        _diag["loop_shadow_last_counter"] = int(c)
-        _diag["loop_shadow_last_ns"] = int(n)
-
-
-# ---------------------------------------------------------------------
-# GPIO PPS capture — operational authority
-# ---------------------------------------------------------------------
-
-
-def _open_gpio_request() -> gpiod.LineRequest:
+def _gpio_request():
+    if gpiod is None:
+        raise RuntimeError("python gpiod bindings unavailable")
     chip = gpiod.Chip(GPIO_CHIP_PATH)
     return chip.request_lines(
         consumer=GPIO_CONSUMER,
@@ -403,25 +756,13 @@ def _open_gpio_request() -> gpiod.LineRequest:
     )
 
 
-def _capture_loop() -> None:
-    global _last_capture, _capture_seq
-    global _pi_tick_epoch, _epoch_set, _pending_pi_ns
-    global _last_rising_cntvct, _last_falling_cntvct
-
-    _pin_this_thread_to_core(CAPTURE_CORE)
+def _gpio_capture_loop() -> None:
     _diag["capture_thread_started"] = True
-
-    request = _open_gpio_request()
-    logging.info(
-        "⏱️ [pitimer] listening on %s line %d (sacred edge=%s)",
-        GPIO_CHIP_PATH,
-        GPIO_LINE_OFFSET,
-        SACRED_EDGE,
-    )
+    request = _gpio_request()
 
     while True:
         try:
-            if not request.wait_edge_events(timeout=1.0):
+            if not request.wait_edge_events(timeout=USER_GPIO_POLL_TIMEOUT_S):
                 continue
 
             events = request.read_edge_events()
@@ -433,103 +774,34 @@ def _capture_loop() -> None:
                     _diag["falling_edges_seen"] += 1
 
                 corrected = _read_cntvct()
-                monotonic_ns_after = time.monotonic_ns()
-                shadow = _shadow_snapshot() if ENABLE_LOOP_SHADOW else {"counter": None, "ns": None, "seq": None}
-
-                shadow_counter = shadow["counter"]
-                shadow_ns = shadow["ns"]
-                shadow_seq = shadow["seq"]
-
-                shadow_delta_ticks: Optional[int]
-                shadow_delta_ns: Optional[int]
-                if ENABLE_LOOP_SHADOW and shadow_counter is not None:
-                    shadow_delta_ticks = int(corrected - shadow_counter)
-                    shadow_delta_ns = int(round(shadow_delta_ticks * NS_PER_TICK))
-                    _shadow_update_stats(shadow_delta_ticks)
-                else:
-                    shadow_delta_ticks = None
-                    shadow_delta_ns = None
-
-                prev_same_edge_cntvct: Optional[int]
-                if kind == "rising":
-                    prev_same_edge_cntvct = _last_rising_cntvct
-                    _last_rising_cntvct = corrected
-                elif kind == "falling":
-                    prev_same_edge_cntvct = _last_falling_cntvct
-                    _last_falling_cntvct = corrected
-                else:
-                    prev_same_edge_cntvct = None
-
-                if prev_same_edge_cntvct is not None:
-                    same_edge_period_ticks = int(corrected - prev_same_edge_cntvct)
-                    same_edge_period_ns = int(round(same_edge_period_ticks * NS_PER_TICK))
-                    if kind == SACRED_EDGE:
-                        _period_update_stats(same_edge_period_ticks)
-                else:
-                    same_edge_period_ticks = None
-                    same_edge_period_ns = None
-
-                cap: Dict[str, Any] = {
+                edge_meta = {
+                    "edge": kind,
+                    "event_timestamp_ns": int(getattr(ev, "timestamp_ns", 0)),
+                    "event_monotonic_ns_after": int(time.monotonic_ns()),
                     "gpio_chip": GPIO_CHIP_PATH,
                     "gpio_line": GPIO_LINE_OFFSET,
-                    "edge": kind,
-                    "event_timestamp_ns": int(ev.timestamp_ns),
-                    "event_monotonic_ns_after": int(monotonic_ns_after),
-                    "corrected": int(corrected),
-                    "freq": PI_TIMER_FREQ,
-                    "ns_per_tick": round(NS_PER_TICK, 6),
-                    "capture_mode": "gpio_irq",
-                    "loop_shadow_enabled": ENABLE_LOOP_SHADOW,
-                    "loop_shadow_counter": shadow_counter,
-                    "loop_shadow_ns": shadow_ns,
-                    "loop_shadow_seq": shadow_seq,
-                    "loop_shadow_delta_ticks": shadow_delta_ticks,
-                    "loop_shadow_delta_ns": shadow_delta_ns,
-                    "same_edge_period_ticks": same_edge_period_ticks,
-                    "same_edge_period_ns": same_edge_period_ns,
                 }
 
-                with _state_lock:
-                    _capture_seq += 1
-                    cap["capture_seq"] = int(_capture_seq)
-                    cap["system_time"] = system_time_z()
-                    _diag["captures_total"] += 1
-
-                    # Only the sacred edge advances operational state.
-                    if kind == SACRED_EDGE and _running and _pps_armed:
-                        pps_count = _assign_pps_count()
-                        cap["pps_count"] = int(pps_count)
-
-                        if _pending_pi_ns is not None:
-                            _pi_tick_epoch = _derive_epoch_from_pi_ns(corrected, int(_pending_pi_ns))
-                            _epoch_set = True
-                            _diag["epoch_derived_from_pi_ns"] += 1
-                            _diag["epoch_value"] = int(_pi_tick_epoch)
-                            _pending_pi_ns = None
-
-                        cap["pi_ns"] = _compute_pi_ns(corrected)
-                        _buffer_insert(pps_count, cap)
-                    else:
+                if kind == SACRED_EDGE:
+                    _process_capture(corrected, edge_meta)
+                else:
+                    with _state_lock:
+                        global _last_capture
+                        _last_capture = {
+                            "capture_mode": CAPTURE_BACKEND,
+                            "capture_seq": _capture_seq,
+                            "corrected": int(corrected),
+                            "edge": kind,
+                            **edge_meta,
+                            "system_time": system_time_z(),
+                        }
+                        _diag["captures_total"] += 1
                         _diag["captures_idle"] += 1
-                        cap["pps_count"] = None
-                        cap["pi_ns"] = _compute_pi_ns(corrected) if (_epoch_set and kind == SACRED_EDGE) else None
-
-                    _last_capture = dict(cap)
-                    _diag["last_capture"] = {
-                        "ts_utc": system_time_z(),
-                        "capture_seq": cap.get("capture_seq"),
-                        "edge": cap.get("edge"),
-                        "pps_count": cap.get("pps_count"),
-                        "corrected": cap.get("corrected"),
-                        "pi_ns": cap.get("pi_ns"),
-                        "loop_shadow_delta_ticks": cap.get("loop_shadow_delta_ticks"),
-                        "same_edge_period_ticks": cap.get("same_edge_period_ticks"),
-                    }
 
         except Exception:
             _diag["capture_exceptions"] += 1
-            logging.exception("💥 [pitimer] GPIO PPS capture failed")
-            time.sleep(0.1)
+            logging.exception("💥 [pitimer] gpio capture loop failed")
+            time.sleep(0.05)
 
 
 # ---------------------------------------------------------------------
@@ -585,15 +857,9 @@ def cmd_stop(args: Dict[str, Any]) -> Dict[str, Any]:
         _last_pps_count_seen = None
 
         _diag["stops"] += 1
-        _diag["last_stop"] = {
-            "ts_utc": system_time_z(),
-        }
+        _diag["last_stop"] = {"ts_utc": system_time_z()}
 
-    payload = {
-        "status": "ok",
-        "running": False,
-        "pps_armed": False,
-    }
+    payload = {"status": "ok", "running": False, "pps_armed": False}
     return {"success": True, "message": "OK", "payload": payload}
 
 
@@ -650,11 +916,7 @@ def cmd_set_pps_count(args: Dict[str, Any]) -> Dict[str, Any]:
             "pps_count": int(pps_count),
         }
 
-    payload = {
-        "status": "ok",
-        "pps_armed": True,
-        "pps_next_count": int(pps_count),
-    }
+    payload = {"status": "ok", "pps_armed": True, "pps_next_count": int(pps_count)}
     return {"success": True, "message": "OK", "payload": payload}
 
 
@@ -677,10 +939,7 @@ def cmd_set_epoch(args: Dict[str, Any]) -> Dict[str, Any]:
             "epoch_ticks": int(epoch_ticks),
         }
 
-    payload = {
-        "status": "ok",
-        "epoch_ticks": int(_pi_tick_epoch),
-    }
+    payload = {"status": "ok", "epoch_ticks": int(_pi_tick_epoch)}
     return {"success": True, "message": "OK", "payload": payload}
 
 
@@ -692,16 +951,10 @@ def cmd_get_capture(args: Dict[str, Any]) -> Dict[str, Any]:
     peek = bool(args.get("peek", False))
 
     with _state_lock:
-        if peek:
-            cap = _buffer_peek(int(pps_count))
-        else:
-            cap = _buffer_pop(int(pps_count))
+        cap = _buffer_peek(int(pps_count)) if peek else _buffer_pop(int(pps_count))
 
     if cap is None:
-        payload = {
-            "hit": False,
-            "pps_count": int(pps_count),
-        }
+        payload = {"hit": False, "pps_count": int(pps_count)}
         return {"success": True, "message": "OK", "payload": payload}
 
     payload = dict(cap)
@@ -724,12 +977,11 @@ def cmd_ns(args: Dict[str, Any]) -> Dict[str, Any]:
             return {"success": False, "message": "BAD", "payload": {"error": "no capture yet"}}
         pi_ns = _last_capture.get("pi_ns")
         if pi_ns is None:
-            return {"success": False, "message": "BAD", "payload": {"error": "epoch not set or last edge not sacred"}}
+            return {"success": False, "message": "BAD", "payload": {"error": "epoch not set"}}
         payload = {
             "pi_ns": int(pi_ns),
             "corrected": int(_last_capture["corrected"]),
             "capture_seq": int(_last_capture["capture_seq"]),
-            "edge": _last_capture.get("edge"),
         }
     return {"success": True, "message": "OK", "payload": payload}
 
@@ -737,6 +989,7 @@ def cmd_ns(args: Dict[str, Any]) -> Dict[str, Any]:
 def cmd_report(args: Dict[str, Any]) -> Dict[str, Any]:
     with _state_lock:
         payload: Dict[str, Any] = {
+            "backend": CAPTURE_BACKEND,
             "running": _running,
             "pps_armed": _pps_armed,
             "pps_next_count": int(_pps_next_count),
@@ -746,11 +999,12 @@ def cmd_report(args: Dict[str, Any]) -> Dict[str, Any]:
             "buffer_size": len(_capture_buffer),
             "freq": PI_TIMER_FREQ,
             "ns_per_tick": round(NS_PER_TICK, 6),
-            "gpio_chip": GPIO_CHIP_PATH,
-            "gpio_line": GPIO_LINE_OFFSET,
-            "sacred_edge": SACRED_EDGE,
             "diag": dict(_diag),
         }
+        if CAPTURE_BACKEND == "gpio_user":
+            payload["gpio_chip"] = GPIO_CHIP_PATH
+            payload["gpio_line"] = GPIO_LINE_OFFSET
+            payload["sacred_edge"] = SACRED_EDGE
         if _last_capture is not None:
             payload["last_capture"] = dict(_last_capture)
     return {"success": True, "message": "OK", "payload": payload}
@@ -773,34 +1027,96 @@ COMMANDS = {
 }
 
 
+def _graceful_shutdown(signum, frame):
+    """Ensure ppslatch spin loop exits and GPIO is cleaned up before death.
+
+    Without this, a SIGTERM during the spin loop leaves the latch thread
+    killed mid-spin, gpio_cleanup() never runs, and the GPIO peripheral
+    can end up in a dirty state that hangs I2C and other shared buses.
+    """
+    signame = signal.Signals(signum).name if hasattr(signal, 'Signals') else str(signum)
+    logging.info("⏱️ [pitimer] %s received — initiating graceful ppslatch shutdown", signame)
+
+    if _ppslatch_lib is not None:
+        try:
+            _ppslatch_lib.ppslatch_stop(ctypes.byref(_ring))
+            logging.info("⏱️ [pitimer] ppslatch_stop signalled, waiting for latch thread...")
+        except Exception:
+            logging.exception("💥 [pitimer] ppslatch_stop failed")
+
+        if _native_thread is not None and _native_thread.is_alive():
+            _native_thread.join(timeout=3.0)
+            if _native_thread.is_alive():
+                logging.error(
+                    "🚨 [pitimer] latch thread did not exit within 3s — "
+                    "forcing cleanup anyway"
+                )
+
+        try:
+            _ppslatch_lib.ppslatch_cleanup()
+            logging.info("⏱️ [pitimer] ppslatch_cleanup complete — GPIO released")
+        except Exception:
+            logging.exception("💥 [pitimer] ppslatch_cleanup failed")
+
+    # Re-raise so the process actually exits
+    raise SystemExit(0)
+
+
 def run() -> None:
-    global _cntvct_lib
+    global _cntvct_lib, _ppslatch_lib, _native_thread
 
     setup_logging()
 
     logging.info(
-        "⏱️ [pitimer] GPIO IRQ capture authority. "
-        "Operational truth comes from GPIO edge events on %s:%d + immediate CNTVCT_EL0 read. "
-        "Loop shadow is diagnostic only. "
+        "⏱️ [pitimer] Defensive capture backend=%s. "
+        "Default is userspace GPIO edge consumption; native ppslatch is opt-in. "
         "Commands: START, STOP, RECOVER, SET_PPS_COUNT, SET_EPOCH, GET_CAPTURE, PEEK_CAPTURE, NS, REPORT.",
-        GPIO_CHIP_PATH,
-        GPIO_LINE_OFFSET,
+        CAPTURE_BACKEND,
     )
 
     _cntvct_lib = _load_cntvct_lib()
 
     if ENABLE_LOOP_SHADOW:
         threading.Thread(
-            target=_loop_shadow_thread,
+            target=_shadow_thread_loop,
             daemon=True,
-            name="pitimer-loop-shadow",
+            name="pitimer-shadow",
         ).start()
 
-    threading.Thread(
-        target=_capture_loop,
-        daemon=True,
-        name="pitimer-capture",
-    ).start()
+    if CAPTURE_BACKEND == "ppslatch":
+        _ppslatch_lib = _load_ppslatch_lib()
+        _verify_ppslatch_abi()
+
+        # Trap SIGTERM/SIGINT so we can cleanly stop the spin loop
+        # and release GPIO before the process dies.
+        signal.signal(signal.SIGTERM, _graceful_shutdown)
+        signal.signal(signal.SIGINT, _graceful_shutdown)
+        logging.info("⏱️ [pitimer] SIGTERM/SIGINT handlers installed for graceful GPIO cleanup")
+
+        _native_thread = threading.Thread(
+            target=_native_run_thread,
+            daemon=True,
+            name="pitimer-ppslatch-native",
+        )
+        _native_thread.start()
+
+        threading.Thread(
+            target=_native_drain_loop,
+            daemon=True,
+            name="pitimer-ppslatch-drain",
+        ).start()
+
+    elif CAPTURE_BACKEND == "gpio_user":
+        if gpiod is None:
+            raise RuntimeError("PITIMER_BACKEND=gpio_user but python gpiod bindings are unavailable")
+
+        threading.Thread(
+            target=_gpio_capture_loop,
+            daemon=True,
+            name="pitimer-gpio-user",
+        ).start()
+    else:
+        raise RuntimeError(f"unknown PITIMER_BACKEND '{CAPTURE_BACKEND}'")
 
     server_setup(
         subsystem="PITIMER",

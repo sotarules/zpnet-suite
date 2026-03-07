@@ -952,31 +952,32 @@ def _set_pitimer_epoch(pi_tick_epoch: int) -> None:
         _hard_fault("pitimer_epoch_ipc_failed", {"pi_tick_epoch": int(pi_tick_epoch)})
 
 
+def _pitimer_report_best_effort() -> Dict[str, Any]:
+    """Best-effort PITIMER REPORT snapshot for diagnostics only."""
+    try:
+        resp = send_command(machine="PI", subsystem="PITIMER", command="REPORT", args={})
+        if resp.get("success") and isinstance(resp.get("payload"), dict):
+            return resp.get("payload", {})
+    except Exception:
+        pass
+    return {}
+
+
 def _pitimer_get_capture(pps_count: int) -> Optional[Dict[str, Any]]:
     """
     Fetch a specific capture from PITIMER by pps_count (CONSUMING it).
 
-    Retries briefly in case PITIMER hasn't captured this edge yet
-    (the Teensy fragment can arrive before PITIMER's capture loop
-    completes).  Returns None if not found after retries.
+    Retries briefly in case PITIMER hasn't latched this edge yet
+    (the Teensy fragment can arrive before PITIMER publishes the capture).
+    Returns None if not found after retries.
 
-    Stale detection: if we've been missing captures consecutively,
-    the requested pps_count has likely been evicted from PITIMER's
-    buffer (max 120 entries).  In that case, retrying is hopeless
-    and just deepens the death spiral.  We skip immediately.
+    Contract (PITIMER vGPIO/ppslatch):
+      • transport success means the command itself executed
+      • payload.hit tells us whether the requested pps_count exists
+      • payload.corrected is the sacred Pi counter for a hit
     """
     _diag["pitimer_get_capture_requests"] += 1
 
-    # Stale detection: if we've missed more than PITIMER_STALE_THRESHOLD
-    # consecutive captures, the buffer has moved past us.  Skip
-    # immediately to let CLOCKS catch up to the present.
-    consecutive_misses = (
-        _diag["pitimer_get_capture_requests"]
-        - _diag["pitimer_get_capture_hits"]
-        - 1  # exclude the current request
-    ) - _diag.get("pitimer_stale_skips", 0)
-
-    # More precise: check gap between requested pps_count and last hit
     last_hit_pps = _diag.get("pitimer_last_hit_pps_count")
     if last_hit_pps is not None and (int(pps_count) - int(last_hit_pps)) > PITIMER_STALE_THRESHOLD:
         _diag["pitimer_stale_skips"] = _diag.get("pitimer_stale_skips", 0) + 1
@@ -992,6 +993,7 @@ def _pitimer_get_capture(pps_count: int) -> Optional[Dict[str, Any]]:
         return None
 
     retries = 0
+    last_payload: Dict[str, Any] = {}
 
     for attempt in range(PITIMER_CAPTURE_RETRIES + 1):
         try:
@@ -1001,7 +1003,20 @@ def _pitimer_get_capture(pps_count: int) -> Optional[Dict[str, Any]]:
                 command="GET_CAPTURE",
                 args={"pps_count": int(pps_count)},
             )
-            if resp.get("success"):
+
+            if not resp.get("success"):
+                break
+
+            payload = resp.get("payload", {}) if isinstance(resp, dict) else {}
+            if not isinstance(payload, dict):
+                payload = {}
+            last_payload = payload
+
+            hit = bool(payload.get("hit"))
+            returned_pps = payload.get("pps_count")
+            corrected = payload.get("corrected")
+
+            if hit and returned_pps is not None and int(returned_pps) == int(pps_count) and corrected is not None:
                 _diag["pitimer_get_capture_hits"] += 1
                 _diag["pitimer_get_capture_retries_total"] += retries
                 _diag["pitimer_last_hit_pps_count"] = int(pps_count)
@@ -1010,20 +1025,19 @@ def _pitimer_get_capture(pps_count: int) -> Optional[Dict[str, Any]]:
                     "pps_count": int(pps_count),
                     "hit": True,
                     "retries": retries,
+                    "capture_seq": payload.get("capture_seq"),
+                    "edge": payload.get("edge"),
                 }
-                return resp.get("payload", {}) if isinstance(resp, dict) else {}
+                return payload
 
-            # NOT_FOUND — PITIMER hasn't captured this edge yet
-            if resp.get("message") == "NOT_FOUND" and attempt < PITIMER_CAPTURE_RETRIES:
+            if (not hit) and attempt < PITIMER_CAPTURE_RETRIES:
                 retries += 1
                 time.sleep(PITIMER_CAPTURE_RETRY_INTERVAL_S)
                 continue
 
-            # Definitive miss after retries
             break
 
         except Exception:
-            # IPC failure — don't retry, just miss
             break
 
     _diag["pitimer_get_capture_misses"] += 1
@@ -1033,6 +1047,8 @@ def _pitimer_get_capture(pps_count: int) -> Optional[Dict[str, Any]]:
         "pps_count": int(pps_count),
         "hit": False,
         "retries": retries,
+        "payload": last_payload,
+        "pitimer_report": _pitimer_report_best_effort(),
     }
     return None
 
@@ -1320,6 +1336,7 @@ def _build_report(
         "teensy_ocxo_ns": timebase.get("teensy_ocxo_ns"),
         "teensy_rtc1_ns": timebase.get("teensy_rtc1_ns"),
         "teensy_rtc2_ns": timebase.get("teensy_rtc2_ns"),
+        "pi_counter": timebase.get("pi_counter"),
         "pi_corrected": timebase.get("pi_corrected"),
 
         "gnss": _build_clock_block(gnss_ns, gnss_ns, _residual_gnss),
@@ -1498,11 +1515,12 @@ def _process_loop() -> None:
                         "pps_count": int(pps_count),
                     }
                     try:
-                        _hard_fault("pitimer_consecutive_miss", {
+                        _hard_fault("pitimer_capture_miss", {
                             "system_time": sysclk,
                             "consecutive_misses": consecutive,
                             "pps_count": int(pps_count),
                             "threshold": PITIMER_MISS_RECOVERY_THRESHOLD,
+                            "last_pitimer_get_capture": _diag.get("last_pitimer_get_capture", {}),
                         })
                     except RuntimeError:
                         pass  # _hard_fault raises to break out of processing
@@ -1524,13 +1542,14 @@ def _process_loop() -> None:
         if pi_corrected is None:
             _diag["hard_fault_pitimer_counter_missing"] += 1
             logging.error(
-                "💥 [clocks] @%s PITIMER capture missing corrected counter for pps_count=%d",
+                "💥 [clocks] @%s PITIMER capture miss/invalid payload for pps_count=%d",
                 sysclk, int(pps_count),
             )
             try:
-                _hard_fault("pitimer_missing_corrected_counter", {
+                _hard_fault("pitimer_capture_miss", {
                     "pps_count": int(pps_count),
                     "pitimer": pit,
+                    "pitimer_report": _pitimer_report_best_effort(),
                 })
             except RuntimeError:
                 continue
@@ -1539,23 +1558,22 @@ def _process_loop() -> None:
 
         if pi_ns is None:
             logging.info(
-                "ℹ️ [clocks] @%s pi_ns=None for pps_count=%d — "
-                "pre-epoch capture, will be None in TIMEBASE",
+                "ℹ️ [clocks] @%s pi_ns=None for pps_count=%d — pre-epoch capture, will be None in TIMEBASE",
                 sysclk, int(pps_count),
             )
 
         logging.debug(
-            "✅ [clocks] @%s correlation OK: teensy=%d pitimer=%d edge=%s pi_ns=%s",
+            "✅ [clocks] @%s correlation OK: teensy=%d pitimer=%d pi_ns=%s capture_seq=%s edge=%s",
             sysclk, int(pps_count), int(pit.get("pps_count", -1)),
-            str(pit.get("edge")), str(pi_ns),
+            str(pi_ns), str(pit.get("capture_seq")), str(pit.get("edge")),
         )
 
         # Advance armed expectation to next second
         _armed_pps_count = int(pps_count) + 1
         _diag["armed_pps_count"] = _armed_pps_count
 
-        # --- Pi capture diagnostics (observational, GPIO IRQ model) ---
-        pi_capture_seq = pit.get("capture_seq")
+        # --- Pi capture diagnostics (observational) ---
+        pi_seq = pit.get("capture_seq")
         pi_edge = pit.get("edge")
         pi_event_timestamp_ns = pit.get("event_timestamp_ns")
         pi_event_monotonic_ns_after = pit.get("event_monotonic_ns_after")
@@ -1567,15 +1585,15 @@ def _process_loop() -> None:
         pi_same_edge_period_ticks = pit.get("same_edge_period_ticks")
         pi_same_edge_period_ns = pit.get("same_edge_period_ns")
 
-        if pi_capture_seq is None:
+        if pi_seq is None:
             _diag["pi_capture_seq_missing"] += 1
-        if isinstance(pi_capture_seq, int):
+        if isinstance(pi_seq, int):
             if _last_pi_seq is not None:
-                if pi_capture_seq == _last_pi_seq:
+                if pi_seq == _last_pi_seq:
                     _diag["pi_capture_seq_repeat"] += 1
-                elif pi_capture_seq > (_last_pi_seq + 1):
+                elif pi_seq > (_last_pi_seq + 1):
                     _diag["pi_capture_seq_jump"] += 1
-            _last_pi_seq = pi_capture_seq
+            _last_pi_seq = pi_seq
 
         if _last_pi_corrected is not None and pi_corrected == _last_pi_corrected:
             _diag["pi_capture_corrected_repeat"] += 1
@@ -1631,18 +1649,16 @@ def _process_loop() -> None:
             "teensy_dwt_ns": frag["dwt_ns"],
             "teensy_gnss_ns": frag["gnss_ns"],
             "teensy_ocxo_ns": frag.get("ocxo_ns"),
-            "teensy_rtc1_ns": frag.get("rtc1_ns"),
-            "teensy_rtc2_ns": frag.get("rtc2_ns"),
 
             "teensy_pps_count": int(pps_count),
 
-            # Pi authoritative clock state (from PITIMER GPIO IRQ capture)
+            # Pi authoritative clock state (from PITIMER)
             "pi_corrected": pi_corrected,
             "pi_ns": int(pi_ns) if pi_ns is not None else None,
 
-            # Pi capture diagnostics (truthful GPIO IRQ / loop-shadow model)
+            # Pi capture diagnostics (truthful to ppslatch model)
+            "diag_pi_capture_seq": pi_seq,
             "diag_pi_edge": pi_edge,
-            "diag_pi_capture_seq": pi_capture_seq,
             "diag_pi_event_timestamp_ns": pi_event_timestamp_ns,
             "diag_pi_event_monotonic_ns_after": pi_event_monotonic_ns_after,
             "diag_pi_loop_shadow_counter": pi_loop_shadow_counter,
@@ -1760,6 +1776,14 @@ def _process_loop() -> None:
 
         publish("TIMEBASE", timebase)
         _persist_timebase(timebase, report)
+
+        # Publish refreshed Teensy machine-clock data after incorporating
+        # this TIMEBASE. Best-effort only: this must never interfere with
+        # TIMEBASE persistence or campaign updates.
+        #_publish_teensy_machine_clock_data_from_report(
+        #    campaign_name=campaign,
+        #    report=report,
+        #)
 
         # Persist OCXO DAC fields into campaign payload (best-effort)
         teensy_ocxo_dac = frag.get("ocxo_dac")
@@ -3370,6 +3394,11 @@ def run() -> None:
         subscriptions={"TIMEBASE_FRAGMENT": on_timebase_fragment},
         blocking=False,
     )
+
+    # Wait for PUBSUB routing
+    #_wait_for_pubsub_route(context="recovery/cold", topic="TEENSY_MACHINE_CLOCK_DATA")
+    #bootstrap_location = _get_current_location()
+    #_publish_teensy_machine_clock_data_from_location(bootstrap_location)
 
     # Recover or stop stray Teensy + PITIMER
     row = _get_active_campaign()
