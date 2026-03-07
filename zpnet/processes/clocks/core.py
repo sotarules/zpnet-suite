@@ -630,100 +630,6 @@ def _get_location_record(location: Optional[str]) -> Optional[Dict[str, Any]]:
     }
 
 
-def _get_machine_clock_data(location: Optional[str]) -> Dict[str, Any]:
-    """Return machine_clock_data block for the given location, or {}."""
-    row = _get_location_record(location)
-    if row is None:
-        return {}
-
-    payload = row["payload"]
-    mcd = payload.get("machine_clock_data", {})
-    return mcd if isinstance(mcd, dict) else {}
-
-
-def _publish_teensy_machine_clock_data_from_location(location: Optional[str]) -> None:
-    """
-    Publish persisted TEENSY machine clock data from the location record.
-
-    Best-effort only. This is used during startup/recovery so the Teensy
-    can hydrate its local machine-clock model before the next TIMEBASE.
-    """
-    if not location:
-        return
-
-    try:
-        mcd = _get_machine_clock_data(location)
-        machines = mcd.get("machines", {}) if isinstance(mcd, dict) else {}
-        teensy = machines.get("TEENSY", {}) if isinstance(machines, dict) else {}
-        if not isinstance(teensy, dict) or not teensy:
-            return
-
-        payload = dict(teensy)
-        payload["location"] = location
-        if isinstance(mcd.get("updated_at"), str):
-            payload.setdefault("updated_at", mcd.get("updated_at"))
-        if isinstance(mcd.get("source_campaign"), str):
-            payload.setdefault("source_campaign", mcd.get("source_campaign"))
-
-        publish("TEENSY_MACHINE_CLOCK_DATA", payload)
-        logging.info(
-            "📤 [clocks] published persisted TEENSY_MACHINE_CLOCK_DATA for '%s'",
-            location,
-        )
-    except Exception:
-        logging.exception(
-            "⚠️ [clocks] failed to publish persisted TEENSY_MACHINE_CLOCK_DATA for '%s' (ignored)",
-            location,
-        )
-
-
-def _publish_teensy_machine_clock_data_from_report(
-    campaign_name: str,
-    report: Dict[str, Any],
-) -> None:
-    """
-    Publish refreshed TEENSY_MACHINE_CLOCK_DATA from the cumulative live
-    campaign report immediately after a new TIMEBASE has been processed.
-
-    Best-effort only. This must never interfere with TIMEBASE issuance,
-    persistence, or campaign updates.
-    """
-    if not campaign_name or not isinstance(report, dict):
-        return
-
-    location = report.get("location")
-    if not isinstance(location, str):
-        return
-    location = location.strip()
-    if not location:
-        return
-
-    dwt = report.get("dwt", {})
-    if not isinstance(dwt, dict):
-        return
-
-    payload = {
-        "location": location,
-        "source_campaign": campaign_name,
-        "machine_id": "zpnet-teensy-1",
-        "clock_domain": "DWT",
-        "mean_ppb_vs_gnss": dwt.get("ppb"),
-        "tau_mean": dwt.get("tau"),
-        "stddev_ns": dwt.get("pps_stddev"),
-        "stderr_ns": dwt.get("pps_stderr"),
-        "pps_samples": dwt.get("pps_n"),
-        "updated_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
-    }
-
-    try:
-        publish("TEENSY_MACHINE_CLOCK_DATA", payload)
-    except Exception:
-        logging.exception(
-            "⚠️ [clocks] failed to publish TEENSY_MACHINE_CLOCK_DATA from TIMEBASE for '%s' (ignored)",
-            campaign_name,
-        )
-
-
 def _location_has_time_only_profile(location: Optional[str]) -> bool:
     """
     True if the location record contains the geodetic facts needed
@@ -1851,14 +1757,6 @@ def _process_loop() -> None:
 
         publish("TIMEBASE", timebase)
         _persist_timebase(timebase, report)
-
-        # Publish refreshed Teensy machine-clock data after incorporating
-        # this TIMEBASE. Best-effort only: this must never interfere with
-        # TIMEBASE persistence or campaign updates.
-        #_publish_teensy_machine_clock_data_from_report(
-        #    campaign_name=campaign,
-        #    report=report,
-        #)
 
         # Persist OCXO DAC fields into campaign payload (best-effort)
         teensy_ocxo_dac = frag.get("ocxo_dac")
@@ -3469,11 +3367,6 @@ def run() -> None:
         subscriptions={"TIMEBASE_FRAGMENT": on_timebase_fragment},
         blocking=False,
     )
-
-    # Wait for PUBSUB routing
-    #_wait_for_pubsub_route(context="recovery/cold", topic="TEENSY_MACHINE_CLOCK_DATA")
-    #bootstrap_location = _get_current_location()
-    #_publish_teensy_machine_clock_data_from_location(bootstrap_location)
 
     # Recover or stop stray Teensy + PITIMER
     row = _get_active_campaign()
