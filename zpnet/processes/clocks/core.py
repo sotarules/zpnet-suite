@@ -1320,7 +1320,6 @@ def _build_report(
         "teensy_ocxo_ns": timebase.get("teensy_ocxo_ns"),
         "teensy_rtc1_ns": timebase.get("teensy_rtc1_ns"),
         "teensy_rtc2_ns": timebase.get("teensy_rtc2_ns"),
-        "pi_counter": timebase.get("pi_counter"),
         "pi_corrected": timebase.get("pi_corrected"),
 
         "gnss": _build_clock_block(gnss_ns, gnss_ns, _residual_gnss),
@@ -1519,18 +1518,17 @@ def _process_loop() -> None:
         _diag["pitimer_consecutive_misses"] = 0
 
         # --- Extract Pi data from capture ---
-        pi_counter_raw = pit.get("counter")
-        pi_corrected = pit.get("corrected") or pi_counter_raw
+        pi_corrected = pit.get("corrected")
         pi_ns = pit.get("pi_ns")
 
         if pi_corrected is None:
             _diag["hard_fault_pitimer_counter_missing"] += 1
             logging.error(
-                "💥 [clocks] @%s PITIMER capture missing counter for pps_count=%d",
+                "💥 [clocks] @%s PITIMER capture missing corrected counter for pps_count=%d",
                 sysclk, int(pps_count),
             )
             try:
-                _hard_fault("pitimer_missing_counter", {
+                _hard_fault("pitimer_missing_corrected_counter", {
                     "pps_count": int(pps_count),
                     "pitimer": pit,
                 })
@@ -1547,32 +1545,37 @@ def _process_loop() -> None:
             )
 
         logging.debug(
-            "✅ [clocks] @%s correlation OK: teensy=%d pitimer=%d pi_ns=%s",
+            "✅ [clocks] @%s correlation OK: teensy=%d pitimer=%d edge=%s pi_ns=%s",
             sysclk, int(pps_count), int(pit.get("pps_count", -1)),
-            str(pi_ns),
+            str(pit.get("edge")), str(pi_ns),
         )
 
         # Advance armed expectation to next second
         _armed_pps_count = int(pps_count) + 1
         _diag["armed_pps_count"] = _armed_pps_count
 
-        # --- Pi capture diagnostics (observational) ---
-        pi_detect_ns = pit.get("detect_ns")
-        pi_correction_ticks = pit.get("correction_ticks", 0)
-        pi_seq = pit.get("seq")
-        pi_delta = pit.get("delta")
-        pi_residual = pit.get("residual")
-        pi_residual_ns = pit.get("residual_ns")
+        # --- Pi capture diagnostics (observational, GPIO IRQ model) ---
+        pi_capture_seq = pit.get("capture_seq")
+        pi_edge = pit.get("edge")
+        pi_event_timestamp_ns = pit.get("event_timestamp_ns")
+        pi_event_monotonic_ns_after = pit.get("event_monotonic_ns_after")
+        pi_loop_shadow_counter = pit.get("loop_shadow_counter")
+        pi_loop_shadow_ns = pit.get("loop_shadow_ns")
+        pi_loop_shadow_seq = pit.get("loop_shadow_seq")
+        pi_loop_shadow_delta_ticks = pit.get("loop_shadow_delta_ticks")
+        pi_loop_shadow_delta_ns = pit.get("loop_shadow_delta_ns")
+        pi_same_edge_period_ticks = pit.get("same_edge_period_ticks")
+        pi_same_edge_period_ns = pit.get("same_edge_period_ns")
 
-        if pi_seq is None:
+        if pi_capture_seq is None:
             _diag["pi_capture_seq_missing"] += 1
-        if isinstance(pi_seq, int):
+        if isinstance(pi_capture_seq, int):
             if _last_pi_seq is not None:
-                if pi_seq == _last_pi_seq:
+                if pi_capture_seq == _last_pi_seq:
                     _diag["pi_capture_seq_repeat"] += 1
-                elif pi_seq > (_last_pi_seq + 1):
+                elif pi_capture_seq > (_last_pi_seq + 1):
                     _diag["pi_capture_seq_jump"] += 1
-            _last_pi_seq = pi_seq
+            _last_pi_seq = pi_capture_seq
 
         if _last_pi_corrected is not None and pi_corrected == _last_pi_corrected:
             _diag["pi_capture_corrected_repeat"] += 1
@@ -1633,22 +1636,22 @@ def _process_loop() -> None:
 
             "teensy_pps_count": int(pps_count),
 
-            # Pi authoritative clock state (from PITIMER)
-            "pi_counter": pi_counter_raw,
+            # Pi authoritative clock state (from PITIMER GPIO IRQ capture)
             "pi_corrected": pi_corrected,
             "pi_ns": int(pi_ns) if pi_ns is not None else None,
 
-            # Pi capture diagnostics
-            "diag_pi_raw_counter": pi_counter_raw,
-            "diag_pi_corrected": pi_corrected,
-            "diag_pi_detect_ns": pi_detect_ns,
-            "diag_pi_correction_ticks": pi_correction_ticks,
-            "diag_pi_correction_ns": round(pi_correction_ticks * PI_NS_PER_TICK, 3) if pi_correction_ticks is not None else None,
-            "diag_pi_seq": pi_seq,
-            "diag_pi_delta": pi_delta,
-            "diag_pi_residual": pi_residual,
-            "diag_pi_residual_ns": pi_residual_ns,
-            "diag_pitimer_edge_source": pit.get("edge_source"),
+            # Pi capture diagnostics (truthful GPIO IRQ / loop-shadow model)
+            "diag_pi_edge": pi_edge,
+            "diag_pi_capture_seq": pi_capture_seq,
+            "diag_pi_event_timestamp_ns": pi_event_timestamp_ns,
+            "diag_pi_event_monotonic_ns_after": pi_event_monotonic_ns_after,
+            "diag_pi_loop_shadow_counter": pi_loop_shadow_counter,
+            "diag_pi_loop_shadow_ns": pi_loop_shadow_ns,
+            "diag_pi_loop_shadow_seq": pi_loop_shadow_seq,
+            "diag_pi_loop_shadow_delta_ticks": pi_loop_shadow_delta_ticks,
+            "diag_pi_loop_shadow_delta_ns": pi_loop_shadow_delta_ns,
+            "diag_pi_same_edge_period_ticks": pi_same_edge_period_ticks,
+            "diag_pi_same_edge_period_ns": pi_same_edge_period_ns,
 
             # Teensy ISR residuals + derived Pi residual (in ns)
             "isr_residual_gnss": frag.get("isr_residual_gnss"),
