@@ -54,6 +54,7 @@
 // ============================================================================
 
 #include "timebase.h"
+#include "util.h"
 
 #include <Arduino.h>
 #include <stdlib.h>
@@ -114,14 +115,6 @@ static fragment_store_t frag_store = {0, 0, 0, 0, 0, 0, 0, 0, 0, false};
 
 // Public mirror for diagnostics / reports
 static timebase_fragment_t frag_public = {};
-
-// ============================================================================
-// Memory barrier
-// ============================================================================
-
-static inline void dmb(void) {
-  __asm volatile("dmb" ::: "memory");
-}
 
 // ============================================================================
 // Safe multiply/divide helper
@@ -459,33 +452,19 @@ const timebase_fragment_t* timebase_last_fragment(void) {
 }
 
 // ============================================================================
-// Helpers for fragment callback
-// ============================================================================
-
-static uint64_t payload_u64(const Payload& p, const char* key) {
-  const char* s = p.getString(key);
-  if (!s) return 0;
-  return strtoull(s, nullptr, 10);
-}
-
-static int32_t payload_i32(const Payload& p, const char* key) {
-  return p.getInt(key, 0);
-}
-
-// ============================================================================
 // TIMEBASE_FRAGMENT subscription callback
 // ============================================================================
 
 void on_timebase_fragment(const Payload& payload) {
-  const uint64_t gnss_ns    = payload_u64(payload, "gnss_ns");
-  const uint64_t dwt_ns     = payload_u64(payload, "dwt_ns");
-  const uint64_t dwt_cycles = payload_u64(payload, "dwt_cycles");
-  const uint64_t ocxo_ns    = payload_u64(payload, "ocxo_ns");
-  const uint32_t pps_count  = (uint32_t)payload_u64(payload, "teensy_pps_count");
+  const uint64_t gnss_ns    = payload.getUInt64("gnss_ns", 0);
+  const uint64_t dwt_ns     = payload.getUInt64("dwt_ns", 0);
+  const uint64_t dwt_cycles = payload.getUInt64("dwt_cycles", 0);
+  const uint64_t ocxo_ns    = payload.getUInt64("ocxo_ns", 0);
+  const uint32_t pps_count  = (uint32_t)payload.getUInt64("teensy_pps_count", 0);
 
-  const int32_t isr_dwt  = payload_i32(payload, "isr_residual_dwt");
-  const int32_t isr_gnss = payload_i32(payload, "isr_residual_gnss");
-  const int32_t isr_ocxo = payload_i32(payload, "isr_residual_ocxo");
+  const int32_t isr_dwt  = payload.getInt("isr_residual_dwt", 0);
+  const int32_t isr_gnss = payload.getInt("isr_residual_gnss", 0);
+  const int32_t isr_ocxo = payload.getInt("isr_residual_ocxo", 0);
 
   frag_store.seq++;
   dmb();

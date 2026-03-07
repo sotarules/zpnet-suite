@@ -230,6 +230,7 @@
 #include "imxrt.h"
 
 #include <math.h>
+#include <stdlib.h>
 
 // ============================================================================
 // DWT nanosecond conversion helpers
@@ -250,6 +251,41 @@ static inline uint64_t dwt_ns_to_cycles(uint64_t ns) {
 // ============================================================================
 // Campaign State
 // ============================================================================
+
+// ============================================================================
+// TEENSY_MACHINE_CLOCK_DATA snapshot
+// ============================================================================
+
+struct teensy_machine_clock_data_t {
+  bool     valid;
+  char     machine_id[64];
+  char     clock_domain[16];
+  char     quality[16];
+  char     source_campaign[64];
+  char     updated_at[48];
+  double   mean_ppb_vs_gnss;
+  double   tau_mean;
+  double   stddev_ns;
+  double   stderr_ns;
+  uint64_t pps_samples;
+  uint32_t received_millis;
+};
+
+static volatile bool teensy_machine_clock_data_valid = false;
+static teensy_machine_clock_data_t teensy_machine_clock_data = {};
+
+bool clocks_teensy_machine_clock_data_valid(void) {
+  return teensy_machine_clock_data_valid;
+}
+
+bool clocks_get_teensy_machine_clock_data(teensy_machine_clock_data_t* out) {
+  if (!out) return false;
+  noInterrupts();
+  *out = teensy_machine_clock_data;
+  const bool valid = teensy_machine_clock_data_valid;
+  interrupts();
+  return valid;
+}
 
 enum class clocks_campaign_state_t {
   STOPPED,
@@ -1475,6 +1511,137 @@ static Payload cmd_clocks_info(const Payload&) {
 
   return p;
 }
+
+// ============================================================================
+// MACHINE_CLOCK_DATA — focused machine-clock snapshot surface
+// ============================================================================
+
+static Payload cmd_machine_clock_data(const Payload&) {
+  Payload p;
+
+  p.add("campaign_state",
+    campaign_state == clocks_campaign_state_t::STARTED ? "STARTED" : "STOPPED");
+
+  if (campaign_state == clocks_campaign_state_t::STARTED) {
+    p.add("campaign",         campaign_name);
+    p.add("campaign_seconds", campaign_seconds);
+  }
+
+  teensy_machine_clock_data_t mcd = {};
+  const bool mcd_valid = clocks_get_teensy_machine_clock_data(&mcd);
+
+  p.add("teensy_machine_clock_data_valid", mcd_valid);
+
+  if (mcd_valid) {
+    p.add("teensy_mcd_machine_id",       mcd.machine_id);
+    p.add("teensy_mcd_clock_domain",     mcd.clock_domain);
+    p.add("teensy_mcd_quality",          mcd.quality);
+    p.add("teensy_mcd_source_campaign",  mcd.source_campaign);
+    p.add("teensy_mcd_updated_at",       mcd.updated_at);
+    p.add("teensy_mcd_mean_ppb_vs_gnss", mcd.mean_ppb_vs_gnss);
+    p.add("teensy_mcd_tau_mean",         mcd.tau_mean);
+    p.add("teensy_mcd_stddev_ns",        mcd.stddev_ns);
+    p.add("teensy_mcd_stderr_ns",        mcd.stderr_ns);
+    p.add("teensy_mcd_pps_samples",      mcd.pps_samples);
+    p.add("teensy_mcd_received_millis",  mcd.received_millis);
+  }
+
+  return p;
+}
+
+// ============================================================================
+// TEENSY_MACHINE_CLOCK_DATA subscription callback
+// ============================================================================
+
+struct TeensyMachineClockDataSnapshot {
+  uint32_t seq = 0;
+
+  uint64_t pps_samples = 0;
+
+  double mean_ppb_vs_gnss = 0.0;
+  double tau_mean         = 0.0;
+  double stddev_ns        = 0.0;
+  double stderr_ns        = 0.0;
+
+  bool valid = false;
+};
+
+static volatile TeensyMachineClockDataSnapshot teensy_machine_clock_store;
+static TeensyMachineClockDataSnapshot teensy_machine_clock_public;
+
+void on_teensy_machine_clock_data(const Payload& payload) {
+
+  const uint64_t pps_samples      = payload.getUInt64("pps_samples", 0);
+  const double   mean_ppb_vs_gnss = payload.getDouble("mean_ppb_vs_gnss", 0.0);
+  const double   tau_mean         = payload.getDouble("tau_mean", 0.0);
+  const double   stddev_ns        = payload.getDouble("stddev_ns", 0.0);
+  const double   stderr_ns        = payload.getDouble("stderr_ns", 0.0);
+
+  const char* machine_id      = payload.getString("machine_id");
+  const char* clock_domain    = payload.getString("clock_domain");
+  const char* quality         = payload.getString("quality");
+  const char* source_campaign = payload.getString("source_campaign");
+  const char* updated_at      = payload.getString("updated_at");
+
+  const bool valid =
+      (pps_samples > 0) &&
+      std::isfinite(mean_ppb_vs_gnss) &&
+      std::isfinite(tau_mean) &&
+      std::isfinite(stddev_ns) &&
+      std::isfinite(stderr_ns);
+
+  teensy_machine_clock_store.seq++;
+  dmb();
+
+  teensy_machine_clock_store.pps_samples      = pps_samples;
+  teensy_machine_clock_store.mean_ppb_vs_gnss = mean_ppb_vs_gnss;
+  teensy_machine_clock_store.tau_mean         = tau_mean;
+  teensy_machine_clock_store.stddev_ns        = stddev_ns;
+  teensy_machine_clock_store.stderr_ns        = stderr_ns;
+  teensy_machine_clock_store.valid            = valid;
+
+  dmb();
+  teensy_machine_clock_store.seq++;
+
+  teensy_machine_clock_public.pps_samples      = pps_samples;
+  teensy_machine_clock_public.mean_ppb_vs_gnss = mean_ppb_vs_gnss;
+  teensy_machine_clock_public.tau_mean         = tau_mean;
+  teensy_machine_clock_public.stddev_ns        = stddev_ns;
+  teensy_machine_clock_public.stderr_ns        = stderr_ns;
+  teensy_machine_clock_public.valid            = valid;
+
+  noInterrupts();
+
+  teensy_machine_clock_data.valid = valid;
+  safeCopy(teensy_machine_clock_data.machine_id,
+           sizeof(teensy_machine_clock_data.machine_id),
+           machine_id ? machine_id : "");
+  safeCopy(teensy_machine_clock_data.clock_domain,
+           sizeof(teensy_machine_clock_data.clock_domain),
+           clock_domain ? clock_domain : "");
+  safeCopy(teensy_machine_clock_data.quality,
+           sizeof(teensy_machine_clock_data.quality),
+           quality ? quality : "");
+  safeCopy(teensy_machine_clock_data.source_campaign,
+           sizeof(teensy_machine_clock_data.source_campaign),
+           source_campaign ? source_campaign : "");
+  safeCopy(teensy_machine_clock_data.updated_at,
+           sizeof(teensy_machine_clock_data.updated_at),
+           updated_at ? updated_at : "");
+
+  teensy_machine_clock_data.mean_ppb_vs_gnss = mean_ppb_vs_gnss;
+  teensy_machine_clock_data.tau_mean         = tau_mean;
+  teensy_machine_clock_data.stddev_ns        = stddev_ns;
+  teensy_machine_clock_data.stderr_ns        = stderr_ns;
+  teensy_machine_clock_data.pps_samples      = pps_samples;
+  teensy_machine_clock_data.received_millis  = millis();
+
+  dmb();
+  teensy_machine_clock_data_valid = valid;
+
+  interrupts();
+}
+
 // ============================================================================
 // Process registration
 // ============================================================================
@@ -1484,12 +1651,14 @@ static const process_command_entry_t CLOCKS_COMMANDS[] = {
   { "STOP",       cmd_stop       },
   { "RECOVER",    cmd_recover    },
   { "REPORT",     cmd_report     },
-  { "CLOCKS_INFO", cmd_clocks_info },
+  { "CLOCKS_INFO",          cmd_clocks_info },
+  { "MACHINE_CLOCK_DATA",  cmd_machine_clock_data },
   { nullptr,      nullptr        }
 };
 
 static const process_subscription_entry_t CLOCKS_SUBSCRIPTIONS[] = {
-  { "TIMEBASE_FRAGMENT", on_timebase_fragment },
+  { "TIMEBASE_FRAGMENT",          on_timebase_fragment },
+  { "TEENSY_MACHINE_CLOCK_DATA",  on_teensy_machine_clock_data },
   { nullptr, nullptr },
 };
 

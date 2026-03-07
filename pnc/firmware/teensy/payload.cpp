@@ -422,7 +422,7 @@ size_t Payload::write_json(char* buf, size_t buf_size) const {
         while (*s) {
             char c = *s++;
             switch (c) {
-                case '\"': append_str("\\\"", 2); break;
+                case '"': append_str("\\\"", 2); break;
                 case '\\': append_str("\\\\", 2); break;
                 case '\n': append_str("\\n", 2);  break;
                 case '\r': append_str("\\r", 2);  break;
@@ -447,7 +447,7 @@ size_t Payload::write_json(char* buf, size_t buf_size) const {
         const char* val = _at(e.val_off);
 
         // Key
-        append_char('\"');
+        append_char('"');
         append_escaped(key);
         append_str("\":", 2);
 
@@ -467,9 +467,9 @@ size_t Payload::write_json(char* buf, size_t buf_size) const {
                         append(val);
                     } else {
                         // String — emit quoted
-                        append_char('\"');
+                        append_char('"');
                         append_escaped(val);
-                        append_char('\"');
+                        append_char('"');
                     }
                 }
                 break;
@@ -661,6 +661,16 @@ bool Payload::tryGetUInt(const char* key, uint32_t& out) const {
     return true;
 }
 
+bool Payload::tryGetUInt64(const char* key, uint64_t& out) const {
+    const char* s = getString(key);
+    if (!s) return false;
+    char* end = nullptr;
+    unsigned long long v = strtoull(s, &end, 10);
+    if (!end || *end != '\0') return false;
+    out = (uint64_t)v;
+    return true;
+}
+
 bool Payload::tryGetFloat(const char* key, float& out) const {
     const char* s = getString(key);
     if (!s) return false;
@@ -698,6 +708,11 @@ int32_t Payload::getInt(const char* key, int32_t default_value) const {
 uint32_t Payload::getUInt(const char* key, uint32_t default_value) const {
     uint32_t v;
     return tryGetUInt(key, v) ? v : default_value;
+}
+
+uint64_t Payload::getUInt64(const char* key, uint64_t default_value) const {
+    uint64_t v;
+    return tryGetUInt64(key, v) ? v : default_value;
 }
 
 float Payload::getFloat(const char* key, float default_value) const {
@@ -973,4 +988,3 @@ void payload_get_info(payload_info_t* out)
     out->entry_overflow        = g_payload_entry_overflow;
     out->entry_high_water      = g_payload_entry_high_water_global;
 }
-

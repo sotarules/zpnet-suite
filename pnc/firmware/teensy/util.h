@@ -35,3 +35,11 @@ float readVrefVolts();
 uint32_t freeHeapBytes();
 
 uint32_t maxAllocBytes();
+
+// ============================================================================
+// Full memory barrier used when publishing lock-free shared snapshots
+// ============================================================================
+
+static inline void dmb(void) {
+  __asm volatile("dmb" ::: "memory");
+}

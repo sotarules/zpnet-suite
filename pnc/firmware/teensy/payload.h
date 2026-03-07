@@ -153,12 +153,24 @@ public:
     void add(const char* key, float value);
     void add(const char* key, double value);
 
-    // Catch-all for other integral types (size_t, int, unsigned, etc.)
+    // Catch-all for signed integral types not covered above.
     template <typename T>
     typename std::enable_if<
-        std::is_integral<T>::value && !std::is_same<T, bool>::value>::type
+        std::is_integral<T>::value &&
+        std::is_signed<T>::value &&
+        !std::is_same<T, bool>::value>::type
     add(const char* key, T value) {
         add(key, (int64_t)value);
+    }
+
+    // Catch-all for unsigned integral types not covered above.
+    template <typename T>
+    typename std::enable_if<
+        std::is_integral<T>::value &&
+        std::is_unsigned<T>::value &&
+        !std::is_same<T, bool>::value>::type
+    add(const char* key, T value) {
+        add(key, (uint64_t)value);
     }
 
     void add_fmt(const char* key, const char* fmt, ...);
@@ -184,12 +196,14 @@ public:
     bool tryGetBool(const char* key, bool& out) const;
     bool tryGetInt(const char* key, int32_t& out) const;
     bool tryGetUInt(const char* key, uint32_t& out) const;
+    bool tryGetUInt64(const char* key, uint64_t& out) const;
     bool tryGetFloat(const char* key, float& out) const;
     bool tryGetDouble(const char* key, double& out) const;
 
     bool     getBool(const char* key, bool default_value = false) const;
     int32_t  getInt(const char* key, int32_t default_value = 0) const;
     uint32_t getUInt(const char* key, uint32_t default_value = 0) const;
+    uint64_t getUInt64(const char* key, uint64_t default_value = 0) const;
     float    getFloat(const char* key, float default_value = 0.0f) const;
     double   getDouble(const char* key, double default_value = 0.0) const;
 

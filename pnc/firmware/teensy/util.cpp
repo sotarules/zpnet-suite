@@ -111,3 +111,4 @@ uint32_t maxAllocBytes() {
   }
   return lo;
 }
+
