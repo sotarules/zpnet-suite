@@ -1855,10 +1855,10 @@ def _process_loop() -> None:
         # Publish refreshed Teensy machine-clock data after incorporating
         # this TIMEBASE. Best-effort only: this must never interfere with
         # TIMEBASE persistence or campaign updates.
-        _publish_teensy_machine_clock_data_from_report(
-            campaign_name=campaign,
-            report=report,
-        )
+        #_publish_teensy_machine_clock_data_from_report(
+        #    campaign_name=campaign,
+        #    report=report,
+        #)
 
         # Persist OCXO DAC fields into campaign payload (best-effort)
         teensy_ocxo_dac = frag.get("ocxo_dac")
@@ -3471,9 +3471,9 @@ def run() -> None:
     )
 
     # Wait for PUBSUB routing
-    _wait_for_pubsub_route(context="recovery/cold", topic="TEENSY_MACHINE_CLOCK_DATA")
-    bootstrap_location = _get_current_location()
-    _publish_teensy_machine_clock_data_from_location(bootstrap_location)
+    #_wait_for_pubsub_route(context="recovery/cold", topic="TEENSY_MACHINE_CLOCK_DATA")
+    #bootstrap_location = _get_current_location()
+    #_publish_teensy_machine_clock_data_from_location(bootstrap_location)
 
     # Recover or stop stray Teensy + PITIMER
     row = _get_active_campaign()
