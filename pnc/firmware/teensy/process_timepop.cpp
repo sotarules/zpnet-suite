@@ -36,19 +36,7 @@ static constexpr uint32_t PIT1_TICK_US  = 10u;
 //   4. Marks slots as expired when remaining_ticks reaches 0
 //   5. Sets timepop_pending to wake the dispatch loop
 //
-// The ONLY differences between the two channels:
-//
-//   PIT0                          PIT1
-//   ----                          ----
-//   Tick rate:  1 ms              Tick rate:  10 µs
-//   Interval:   TIMEPOP_INTERVAL_MS    TIMEPOP_INTERVAL_US
-//   Lifecycle:  Always running    Lifecycle:  Active only when
-//                                             µs clients > 0
-//
-// Period units follow the interval type:
-//   ms class with period 500  → fires every 500 ms (500 PIT0 ticks)
-//   µs class with period 999000 → fires every 999 ms (99900 PIT1 ticks)
-//
+// ================================================================
 
 // ================================================================
 // Class Definition Table
@@ -64,20 +52,20 @@ static timepop_class_def_t CLASS_DEF[TIMEPOP_CLASS_COUNT];
 static void init_class_definitions(void) {
 
   // --- Millisecond classes (PIT0) ---
-  CLASS_DEF[TIMEPOP_CLASS_ASAP]         = { TIMEPOP_INTERVAL_MS,      0 };
-  CLASS_DEF[TIMEPOP_CLASS_RX_POLL]      = { TIMEPOP_INTERVAL_MS,      1 };
-  CLASS_DEF[TIMEPOP_CLASS_EVENTBUS]     = { TIMEPOP_INTERVAL_MS,   1000 };
-  CLASS_DEF[TIMEPOP_CLASS_CPU_SAMPLE]   = { TIMEPOP_INTERVAL_MS,   1000 };
-  CLASS_DEF[TIMEPOP_CLASS_CLOCKS]       = { TIMEPOP_INTERVAL_MS,    200 };
-  CLASS_DEF[TIMEPOP_CLASS_GUARD]        = { TIMEPOP_INTERVAL_MS,    500 };
-  CLASS_DEF[TIMEPOP_CLASS_PPS_RELAY]    = { TIMEPOP_INTERVAL_MS,    500 };
-  CLASS_DEF[TIMEPOP_CLASS_FLASH]        = { TIMEPOP_INTERVAL_MS,   5000 };
-  CLASS_DEF[TIMEPOP_CLASS_DEBUG_BEACON] = { TIMEPOP_INTERVAL_MS,   1000 };
-  CLASS_DEF[TIMEPOP_CLASS_USER_1]       = { TIMEPOP_INTERVAL_MS,     10 };
-  CLASS_DEF[TIMEPOP_CLASS_USER_2]       = { TIMEPOP_INTERVAL_MS,    100 };
-  CLASS_DEF[TIMEPOP_CLASS_TX_PUMP]      = { TIMEPOP_INTERVAL_MS,      1 };
-  CLASS_DEF[TIMEPOP_CLASS_OCXO_DITHER]  = { TIMEPOP_INTERVAL_MS,      1 };
-  CLASS_DEF[TIMEPOP_CLASS_PRE_PPS_COARSE] = { TIMEPOP_INTERVAL_MS,  999 };
+  CLASS_DEF[TIMEPOP_CLASS_ASAP]           = { TIMEPOP_INTERVAL_MS,      0 };
+  CLASS_DEF[TIMEPOP_CLASS_RX_POLL]        = { TIMEPOP_INTERVAL_MS,      1 };
+  CLASS_DEF[TIMEPOP_CLASS_EVENTBUS]       = { TIMEPOP_INTERVAL_MS,   1000 };
+  CLASS_DEF[TIMEPOP_CLASS_CPU_SAMPLE]     = { TIMEPOP_INTERVAL_MS,   1000 };
+  CLASS_DEF[TIMEPOP_CLASS_CLOCKS]         = { TIMEPOP_INTERVAL_MS,    200 };
+  CLASS_DEF[TIMEPOP_CLASS_GUARD]          = { TIMEPOP_INTERVAL_MS,    500 };
+  CLASS_DEF[TIMEPOP_CLASS_PPS_RELAY]      = { TIMEPOP_INTERVAL_MS,    500 };
+  CLASS_DEF[TIMEPOP_CLASS_FLASH]          = { TIMEPOP_INTERVAL_MS,   5000 };
+  CLASS_DEF[TIMEPOP_CLASS_DEBUG_BEACON]   = { TIMEPOP_INTERVAL_MS,   1000 };
+  CLASS_DEF[TIMEPOP_CLASS_USER_1]         = { TIMEPOP_INTERVAL_MS,     10 };
+  CLASS_DEF[TIMEPOP_CLASS_USER_2]         = { TIMEPOP_INTERVAL_MS,    100 };
+  CLASS_DEF[TIMEPOP_CLASS_TX_PUMP]        = { TIMEPOP_INTERVAL_MS,      1 };
+  CLASS_DEF[TIMEPOP_CLASS_OCXO_DITHER]    = { TIMEPOP_INTERVAL_MS,      1 };
+  CLASS_DEF[TIMEPOP_CLASS_PRE_PPS_COARSE] = { TIMEPOP_INTERVAL_MS,    999 };
 }
 
 // ================================================================
@@ -120,25 +108,57 @@ static volatile uint32_t pit0_zero_hits  = 0;
 // PIT1 State and Diagnostics
 // ================================================================
 
-// Active µs-class client count.
-// PIT1 is enabled when this transitions 0 → 1,
-// disabled when it transitions 1 → 0.
-static volatile uint8_t pit1_client_count = 0;
+static volatile uint8_t  pit1_client_count = 0;
+static volatile uint32_t pit1_tick_count   = 0;
+static volatile uint32_t pit1_zero_hits    = 0;
 
-static volatile uint32_t pit1_tick_count = 0;
-static volatile uint32_t pit1_zero_hits  = 0;
+// ================================================================
+// Execution-context helpers
+// ================================================================
+//
+// Cortex-M IPSR:
+//   0 => thread mode (normal scheduled context)
+//  !=0 => exception / interrupt context
+//
+// ================================================================
+
+static inline bool in_isr_context(void) {
+  uint32_t ipsr;
+  __asm volatile("MRS %0, ipsr" : "=r"(ipsr));
+  return ipsr != 0;
+}
+
+struct critical_state_t {
+  bool entered;
+};
+
+static inline critical_state_t critical_enter(void) {
+  critical_state_t s = { false };
+
+  // If already in ISR context, do NOT call noInterrupts()/interrupts().
+  // We are already in exception context, and unconditional restoration
+  // is unsafe there.
+  if (!in_isr_context()) {
+    noInterrupts();
+    s.entered = true;
+  }
+
+  return s;
+}
+
+static inline void critical_exit(critical_state_t s) {
+  if (s.entered) {
+    interrupts();
+  }
+}
 
 // ================================================================
 // PIT1 Enable / Disable
 // ================================================================
-//
-// Called with interrupts disabled.
-// These manage PIT1's physical state based on client count.
-//
 
 static void pit1_enable(void) {
   PIT_TFLG1  = PIT_TFLG_TIF;   // clear any stale flag
-  PIT_LDVAL1 = PIT1_LOAD;       // 10 µs tick
+  PIT_LDVAL1 = PIT1_LOAD;      // 10 µs tick
   PIT_TCTRL1 = PIT_TCTRL_TEN | PIT_TCTRL_TIE;
 }
 
@@ -147,8 +167,7 @@ static void pit1_disable(void) {
   PIT_TFLG1  = PIT_TFLG_TIF;   // clear flag
 }
 
-// Track a µs client being added.  Enable PIT1 on first client.
-// Must be called with interrupts disabled.
+// Must be called inside an appropriate critical section.
 static void pit1_client_add(void) {
   pit1_client_count++;
   if (pit1_client_count == 1) {
@@ -156,8 +175,7 @@ static void pit1_client_add(void) {
   }
 }
 
-// Track a µs client being removed.  Disable PIT1 on last client.
-// Must be called with interrupts disabled.
+// Must be called inside an appropriate critical section.
 static void pit1_client_remove(void) {
   if (pit1_client_count > 0) {
     pit1_client_count--;
@@ -170,13 +188,6 @@ static void pit1_client_remove(void) {
 // ================================================================
 // Period Conversion
 // ================================================================
-//
-// Convert a period in native units (ms or µs) to PIT ticks.
-//
-//   ms class: 1 period unit = 1 PIT0 tick (1:1)
-//   µs class: 1 period unit = 1/PIT1_TICK_US PIT1 ticks
-//             e.g. 999000 µs / 10 µs = 99900 ticks
-//
 
 static inline uint32_t period_to_ticks(timepop_class_t klass, uint32_t period) {
   if (CLASS_DEF[klass].interval == TIMEPOP_INTERVAL_US) {
@@ -188,9 +199,6 @@ static inline uint32_t period_to_ticks(timepop_class_t klass, uint32_t period) {
 // ================================================================
 // PIT0 ISR — Millisecond channel
 // ================================================================
-//
-// Scans all active ms-class slots.  Identical logic to PIT1.
-//
 
 static void pit0_isr(void) {
 
@@ -223,9 +231,6 @@ static void pit0_isr(void) {
 // ================================================================
 // PIT1 ISR — Microsecond channel
 // ================================================================
-//
-// Scans all active µs-class slots.  Identical logic to PIT0.
-//
 
 static void pit1_isr(void) {
 
@@ -258,10 +263,6 @@ static void pit1_isr(void) {
 // ================================================================
 // Combined PIT ISR dispatcher
 // ================================================================
-//
-// All PIT channels on the i.MX RT1062 share IRQ_PIT.
-// Check both flag registers and dispatch accordingly.
-//
 
 static void pit_combined_isr(void) {
 
@@ -300,7 +301,6 @@ void timepop_init(void) {
 
   // --------------------------------------------------------
   // PIT1 — Microsecond channel (initially disabled)
-  // Enabled on-demand by pit1_client_add().
   // --------------------------------------------------------
   PIT_TCTRL1 = 0;
   PIT_TFLG1  = PIT_TFLG_TIF;
@@ -319,33 +319,35 @@ void timepop_init(void) {
 
 static bool timepop_arm_internal(
   timepop_class_t     klass,
-  bool               recurring,
-  uint32_t           period_native,   // in ms or µs depending on class
-  timepop_callback_t callback,
-  void*              user_ctx,
-  const char*        name
+  bool                recurring,
+  uint32_t            period_native,   // in ms or µs depending on class
+  timepop_callback_t  callback,
+  void*               user_ctx,
+  const char*         name
 ) {
   if (klass >= TIMEPOP_CLASS_COUNT || !callback) return false;
 
   const timepop_class_def_t& def = CLASS_DEF[klass];
-  bool is_us = (def.interval == TIMEPOP_INTERVAL_US);
+  const bool is_us = (def.interval == TIMEPOP_INTERVAL_US);
 
-  noInterrupts();
+  critical_state_t cs = critical_enter();
 
   for (uint32_t i = 0; i < TIMEPOP_MAX_SLOTS; i++) {
 
     if (slots[i].active) continue;
 
-    uint32_t ticks = period_to_ticks(klass, period_native);
+    const uint32_t ticks = period_to_ticks(klass, period_native);
 
-    slots[i].active          = true;
-    slots[i].recurring       = recurring;
-    slots[i].klass           = klass;
-    slots[i].callback        = callback;
-    slots[i].user_ctx        = user_ctx;
-    slots[i].name            = name;
-    slots[i].id              = next_slot_id++;
-    slots[i].period_ticks    = ticks;
+    slots[i].active       = true;
+    slots[i].expired      = false;
+    slots[i].recurring    = recurring;
+    slots[i].klass        = klass;
+    slots[i].remaining_ticks = ticks;
+    slots[i].period_ticks = ticks;
+    slots[i].callback     = callback;
+    slots[i].user_ctx     = user_ctx;
+    slots[i].name         = name;
+    slots[i].id           = next_slot_id++;
 
     if (klass == TIMEPOP_CLASS_ASAP) {
       // ----------------------------------------------------------
@@ -355,20 +357,17 @@ static bool timepop_arm_internal(
       slots[i].expired         = true;
       timepop_pending          = true;
     } else {
-      slots[i].remaining_ticks = ticks;
-      slots[i].expired         = false;
-
       // Enable PIT1 if this is its first client
       if (is_us) {
         pit1_client_add();
       }
     }
 
-    interrupts();
+    critical_exit(cs);
     return true;
   }
 
-  interrupts();
+  critical_exit(cs);
   return false;
 }
 
@@ -378,10 +377,10 @@ static bool timepop_arm_internal(
 
 bool timepop_arm(
   timepop_class_t     klass,
-  bool               recurring,
-  timepop_callback_t callback,
-  void*              user_ctx,
-  const char*        name
+  bool                recurring,
+  timepop_callback_t  callback,
+  void*               user_ctx,
+  const char*         name
 ) {
   return timepop_arm_internal(
     klass, recurring,
@@ -396,11 +395,11 @@ bool timepop_arm(
 
 bool timepop_arm_with_period(
   timepop_class_t     klass,
-  bool               recurring,
-  uint32_t           period,
-  timepop_callback_t callback,
-  void*              user_ctx,
-  const char*        name
+  bool                recurring,
+  uint32_t            period,
+  timepop_callback_t  callback,
+  void*               user_ctx,
+  const char*         name
 ) {
   return timepop_arm_internal(
     klass, recurring,
@@ -415,9 +414,9 @@ bool timepop_arm_with_period(
 
 bool timepop_cancel(timepop_class_t klass) {
 
-  bool is_us = (CLASS_DEF[klass].interval == TIMEPOP_INTERVAL_US);
+  const bool is_us = (CLASS_DEF[klass].interval == TIMEPOP_INTERVAL_US);
 
-  noInterrupts();
+  critical_state_t cs = critical_enter();
 
   for (uint32_t i = 0; i < TIMEPOP_MAX_SLOTS; i++) {
     if (slots[i].active && slots[i].klass == klass) {
@@ -425,14 +424,13 @@ bool timepop_cancel(timepop_class_t klass) {
       slots[i].active  = false;
       slots[i].expired = false;
 
-      // Disable PIT1 if this was its last client
       if (is_us) {
         pit1_client_remove();
       }
     }
   }
 
-  interrupts();
+  critical_exit(cs);
   return true;
 }
 
@@ -470,31 +468,24 @@ void timepop_dispatch(void) {
         bool is_us = (CLASS_DEF[slots[i].klass].interval == TIMEPOP_INTERVAL_US);
         slots[i].active = false;
         if (is_us) {
-          noInterrupts();
+          critical_state_t cs = critical_enter();
           pit1_client_remove();
-          interrupts();
+          critical_exit(cs);
         }
       } else {
         slots[i].remaining_ticks = reload;
       }
 
     } else {
-      // One-shot complete, or canceled during callback.
-      //
-      // Guard: if the callback already canceled itself via
-      // timepop_cancel(), active is already false and the
-      // client count was already decremented.  Only remove
-      // the client if WE are the ones deactivating the slot.
       bool was_active = slots[i].active;
       bool is_us = (CLASS_DEF[slots[i].klass].interval == TIMEPOP_INTERVAL_US);
 
       slots[i].active = false;
 
-      // Release PIT1 client only if we just deactivated it
       if (was_active && is_us) {
-        noInterrupts();
+        critical_state_t cs = critical_enter();
         pit1_client_remove();
-        interrupts();
+        critical_exit(cs);
       }
     }
   }
@@ -517,9 +508,6 @@ uint32_t timepop_get_pit_tick_count(void) {
 }
 
 uint32_t timepop_get_last_remaining(void) {
-  // Legacy: return 0.  This diagnostic was PIT0-specific
-  // and of limited value.  The REPORT command provides
-  // per-slot remaining_ticks for full visibility.
   return 0;
 }
 
@@ -535,14 +523,10 @@ static const char* interval_str(timepop_interval_t iv) {
   return (iv == TIMEPOP_INTERVAL_US) ? "us" : "ms";
 }
 
-// ------------------------------------------------------------
-// REPORT — active TimePop timer snapshot
-// ------------------------------------------------------------
 static Payload cmd_report(const Payload& /*args*/) {
 
   Payload out;
 
-  // Channel health
   out.add("pit0_tick_count",    pit0_tick_count);
   out.add("pit0_zero_hits",     pit0_zero_hits);
   out.add("pit1_tick_count",    pit1_tick_count);

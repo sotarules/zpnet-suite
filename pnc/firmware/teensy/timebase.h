@@ -2,9 +2,9 @@
 // timebase.h — ZPNet Timebase Singleton (Teensy)
 // ============================================================================
 //
-// Timebase is the canonical clock-domain translation layer for the Teensy.
+// PPS-fragment anchored Timebase.
 //
-// It answers two classes of questions:
+// Timebase answers two classes of questions:
 //
 //   1) "What time is it right now in domain X?"
 //   2) "What is the corresponding nanosecond value in domain B for a value
@@ -19,18 +19,7 @@
 // Architecture
 // ------------
 //
-// 1. TIMEPULSE anchor (10 KHz, written by ISR)
-//    Every 100 µs, the TIMEPULSE ISR publishes an anchor:
-//
-//      anchor = { gnss_ns, dwt_snap }
-//
-//    where:
-//      • gnss_ns  = quantized GNSS nanoseconds at the TIMEPULSE rising edge
-//      • dwt_snap = DWT_CYCCNT captured at that same edge
-//
-//    This anchor is the high-resolution interpolation base.
-//
-// 2. TIMEBASE_FRAGMENT (1 Hz, written by pub/sub callback)
+// 1. TIMEBASE_FRAGMENT (1 Hz, written by pub/sub callback)
 //    Once per second, CLOCKS publishes authoritative PPS-edge totals:
 //
 //      • gnss_ns
@@ -40,16 +29,21 @@
 //      • pps_count
 //      • residuals
 //
-//    These totals define the current inter-domain ratios ("tau").
+// 2. Local receipt snapshot
+//    When the fragment is received, Timebase captures the local
+//    ARM_DWT_CYCCNT in scheduled context.
 //
 // 3. now(domain)
-//    Timebase first computes "now" in GNSS nanoseconds using the fresh
-//    TIMEPULSE anchor:
+//    Timebase projects forward from the most recent fragment using
+//    local DWT elapsed time since fragment receipt.
 //
-//      gnss_now = anchor_gnss_ns + elapsed_dwt_cycles * 125 / 126
+//      elapsed_ns = elapsed_dwt_cycles * 125 / 126
 //
-//    It then converts GNSS nanoseconds into the requested domain using the
-//    most recent authoritative fragment ratios.
+//      GNSS now = fragment.gnss_ns + elapsed_ns
+//      DWT  now = fragment.dwt_ns  + elapsed_ns
+//
+//    OCXO "now" is derived by converting projected GNSS through the
+//    most recent fragment ratio.
 //
 // 4. convert_ns(value, from_domain, to_domain)
 //    Domain conversion always normalizes through GNSS:
@@ -61,14 +55,11 @@
 // Design Notes
 // ------------
 //
-// • The core API is enum-based for hot-path and ISR use.
-// • No string dispatch in timing-sensitive code.
-// • GNSS interpolation is integer-only and ISR-safe.
-// • Both the TIMEPULSE anchor and the fragment use sequence counters so
-//   readers never observe torn multiword state.
-// • Anchor freshness is enforced. A stale TIMEPULSE anchor is treated as
-//   invalid, which prevents Timebase from reporting stale "now" values
-//   after a campaign stops or the anchor stream stalls.
+// • No TIMEPULSE support remains.
+// • The core API is enum-based for hot-path use.
+// • Both the fragment store and public mirror are sequence-safe / read-only.
+// • Fragment freshness is enforced to prevent stale "now" narration after
+//   stop or pipeline failure.
 //
 // ============================================================================
 
@@ -92,33 +83,19 @@ enum class timebase_domain_t : uint8_t {
 // Initialization
 // ============================================================================
 
-// Initialize internal state.
-// Call once during clocks subsystem initialization.
 void timebase_init(void);
 
 // ============================================================================
 // Primary API — "what time is it?"
 // ============================================================================
 
-// Returns the current nanosecond count in the specified domain.
-// Returns -1 if the required state is not valid.
-//
-// ISR-safe. No allocation. Integer-only.
 int64_t timebase_now_ns(timebase_domain_t domain);
-
-// Fast-path helper for the hottest call site.
-// Equivalent to timebase_now_ns(timebase_domain_t::GNSS).
 int64_t timebase_now_gnss_ns(void);
 
 // ============================================================================
 // Domain conversion API
 // ============================================================================
 
-// Convert a nanosecond value from one clock domain to another.
-// Returns -1 on failure (missing fragment, invalid ratio).
-//
-// Conversion is performed through GNSS using the latest authoritative
-// TIMEBASE_FRAGMENT ratios.
 int64_t timebase_convert_ns(
   uint64_t           value_ns,
   timebase_domain_t  from_domain,
@@ -129,30 +106,13 @@ int64_t timebase_convert_ns(
 // Validity
 // ============================================================================
 
-// Returns true if Timebase can answer "now" in GNSS right now.
-// This requires a fresh TIMEPULSE anchor.
 bool timebase_valid(void);
-
-// Returns true if domain-to-domain conversion is currently valid.
-// This requires a valid TIMEBASE_FRAGMENT with nonzero domain totals.
 bool timebase_conversion_valid(void);
-
-// ============================================================================
-// TIMEPULSE anchor update (called from TIMEPULSE ISR only)
-// ============================================================================
-
-// Update the interpolation anchor.
-//
-// Called by the TIMEPULSE ISR on each rising edge.
-// Single write path only.
-void timebase_update_anchor(uint64_t gnss_ns, uint32_t dwt_snap);
 
 // ============================================================================
 // Invalidation
 // ============================================================================
 
-// Invalidate all Timebase state.
-// Safe to call when campaign truth is no longer trustworthy.
 void timebase_invalidate(void);
 
 // ============================================================================
@@ -171,9 +131,5 @@ struct timebase_fragment_t {
   volatile bool     valid;
 };
 
-// Read-only access to the last fragment.
-// Returns pointer to internal static storage.
 const timebase_fragment_t* timebase_last_fragment(void);
-
-// TIMEBASE_FRAGMENT subscription callback.
 void on_timebase_fragment(const Payload& payload);
