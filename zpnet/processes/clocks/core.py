@@ -1585,6 +1585,14 @@ def _process_loop() -> None:
         pi_same_edge_period_ticks = pit.get("same_edge_period_ticks")
         pi_same_edge_period_ns = pit.get("same_edge_period_ns")
 
+        # Native ppslatch latch latency (C spin loop, core 3).
+        # These measure captured_cntvct - shadow_cntvct entirely
+        # within the tight poll loop — the true Pi-side analogue
+        # of the Teensy's dispatch_delta_ns.
+        pi_latch_shadow_cntvct = pit.get("latch_shadow_cntvct")
+        pi_latch_delta_ticks = pit.get("latch_delta_ticks")
+        pi_latch_delta_ns = pit.get("latch_delta_ns")
+
         if pi_seq is None:
             _diag["pi_capture_seq_missing"] += 1
         if isinstance(pi_seq, int):
@@ -1668,6 +1676,14 @@ def _process_loop() -> None:
             "diag_pi_loop_shadow_delta_ns": pi_loop_shadow_delta_ns,
             "diag_pi_same_edge_period_ticks": pi_same_edge_period_ticks,
             "diag_pi_same_edge_period_ns": pi_same_edge_period_ns,
+
+            # Pi native latch latency (ppslatch C spin loop on core 3).
+            # This is the Pi-side analogue of diag_teensy_dispatch_delta_ns:
+            # the time between the last shadow CNTVCT read and the sacred
+            # capture CNTVCT, both from the tight poll loop.
+            "diag_pi_latch_shadow_cntvct": pi_latch_shadow_cntvct,
+            "diag_pi_latch_delta_ticks": pi_latch_delta_ticks,
+            "diag_pi_latch_delta_ns": pi_latch_delta_ns,
 
             # Teensy ISR residuals + derived Pi residual (in ns)
             "isr_residual_gnss": frag.get("isr_residual_gnss"),

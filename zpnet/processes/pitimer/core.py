@@ -45,6 +45,7 @@ CNTVCT_LIB = os.environ.get(
 PI_TIMER_FREQ = 54_000_000
 NS_PER_SECOND = 1_000_000_000
 NS_PER_TICK = 1e9 / PI_TIMER_FREQ
+PI_LATCH_FIXED_OVERHEAD = 5  # ticks (92.6 ns) — from TDC analysis
 
 BUFFER_MAX_SIZE = 120
 PPSLATCH_RING_SIZE = 4096
@@ -657,6 +658,43 @@ def _native_run_thread() -> None:
                 LATCH_CPU_CORE, exc,
             )
 
+        # ── Detect isolcpus and disable yield if core is isolated ──
+        try:
+            with open("/proc/cmdline", "r") as f:
+                cmdline = f.read()
+            core_isolated = False
+            for token in cmdline.split():
+                if token.startswith("isolcpus="):
+                    isolated_cores = set()
+                    for part in token.split("=", 1)[1].split(","):
+                        part = part.strip()
+                        if "-" in part:
+                            lo, hi = part.split("-", 1)
+                            isolated_cores.update(range(int(lo), int(hi) + 1))
+                        else:
+                            isolated_cores.add(int(part))
+                    core_isolated = LATCH_CPU_CORE in isolated_cores
+                    break
+
+            if core_isolated:
+                _ppslatch_lib.ppslatch_set_yield(0)
+                _diag["latch_core_isolated"] = True
+                logging.info(
+                    "⏱️ [pitimer] core %d is in isolcpus — yield DISABLED "
+                    "(pure spin, zero outliers)",
+                    LATCH_CPU_CORE,
+                )
+            else:
+                _diag["latch_core_isolated"] = False
+                logging.info(
+                    "⏱️ [pitimer] core %d is NOT in isolcpus — yield remains "
+                    "enabled as safety valve",
+                    LATCH_CPU_CORE,
+                )
+        except Exception:
+            _diag["latch_core_isolated"] = None
+            logging.warning("⚠️ [pitimer] could not check isolcpus status")
+
         # ── Log yield interval for diagnostics ───────────────────
         try:
             yi = int(_ppslatch_lib.ppslatch_get_yield())
@@ -707,11 +745,16 @@ def _native_drain_loop() -> None:
                 _diag["native_last_shadow_seq"] = int(ent.shadow_seq)
 
                 _process_capture(
-                    int(ent.captured_cntvct),
+                    int(ent.shadow_cntvct) + PI_LATCH_FIXED_OVERHEAD,
                     {
                         "edge": SACRED_EDGE,
                         "event_seq": int(ent.edge_seq),
                         "shadow_seq": int(ent.shadow_seq),
+                        "latch_shadow_cntvct": int(ent.shadow_cntvct),
+                        "latch_delta_ticks": int(ent.delta_ticks),
+                        "latch_delta_ns": int(round(
+                            int(ent.delta_ticks) * NS_PER_TICK
+                        )),
                     },
                 )
 
@@ -1014,12 +1057,38 @@ def cmd_report(args: Dict[str, Any]) -> Dict[str, Any]:
 # Entrypoint
 # ---------------------------------------------------------------------
 
+def cmd_set_yield(args: Dict[str, Any]) -> Dict[str, Any]:
+    interval = args.get("interval")
+    if interval is None:
+        return {"success": False, "message": "BAD", "payload": {"error": "missing interval"}}
+
+    interval = int(interval)
+    if interval < 0:
+        return {"success": False, "message": "BAD", "payload": {"error": "interval must be >= 0"}}
+
+    if _ppslatch_lib is None:
+        return {"success": False, "message": "BAD", "payload": {"error": "ppslatch backend not loaded"}}
+
+    _ppslatch_lib.ppslatch_set_yield(interval)
+    actual = int(_ppslatch_lib.ppslatch_get_yield())
+    _diag["latch_yield_interval"] = actual
+
+    logging.info(
+        "⏱️ [pitimer] SET_YIELD: interval=%d (0=pure spin, >0=yield every N polls)",
+        actual,
+    )
+
+    payload = {"status": "ok", "yield_interval": actual}
+    return {"success": True, "message": "OK", "payload": payload}
+
+
 COMMANDS = {
     "START": cmd_start,
     "STOP": cmd_stop,
     "RECOVER": cmd_recover,
     "SET_PPS_COUNT": cmd_set_pps_count,
     "SET_EPOCH": cmd_set_epoch,
+    "SET_YIELD": cmd_set_yield,
     "GET_CAPTURE": cmd_get_capture,
     "PEEK_CAPTURE": cmd_peek_capture,
     "NS": cmd_ns,
@@ -1070,7 +1139,7 @@ def run() -> None:
     logging.info(
         "⏱️ [pitimer] Defensive capture backend=%s. "
         "Default is userspace GPIO edge consumption; native ppslatch is opt-in. "
-        "Commands: START, STOP, RECOVER, SET_PPS_COUNT, SET_EPOCH, GET_CAPTURE, PEEK_CAPTURE, NS, REPORT.",
+        "Commands: START, STOP, RECOVER, SET_PPS_COUNT, SET_EPOCH, SET_YIELD, GET_CAPTURE, PEEK_CAPTURE, NS, REPORT.",
         CAPTURE_BACKEND,
     )
 
