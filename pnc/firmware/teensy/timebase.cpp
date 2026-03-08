@@ -4,31 +4,18 @@
 //
 // PPS-fragment anchored Timebase.
 //
-// Architecture
-// ------------
+// The authoritative TIMEBASE_FRAGMENT provides PPS-edge totals once per
+// second.  When received, Timebase captures the local ARM_DWT_CYCCNT.
+// "Now" is answered by projecting forward from that anchor:
 //
-// The authoritative TIMEBASE_FRAGMENT provides PPS-edge totals:
+//   gnss_now = fragment.gnss_ns + elapsed_dwt_cycles × 125 / 126
 //
-//   • gnss_ns
-//   • dwt_ns
-//   • dwt_cycles
-//   • ocxo_ns
+// The DWT runs at 1008 MHz.  The 125/126 ratio converts DWT cycles to
+// nanoseconds.  At 19.5 ns period stddev and ±0.50 ns TDC quantization,
+// the Teensy achieves sub-nanosecond timing over √n averages.
 //
-// When the fragment is received in scheduled context, Timebase captures
-// the local ARM_DWT_CYCCNT at fragment receipt.  "Now" is then answered by
-// projecting forward from that fragment using local DWT elapsed time.
-//
-// GNSS projection:
-//   gnss_now = fragment.gnss_ns + elapsed_dwt_cycles * 125 / 126
-//
-// DWT projection:
-//   dwt_now = fragment.dwt_ns + elapsed_dwt_cycles * 125 / 126
-//
-// OCXO projection:
-//   first compute gnss_now, then convert through the fragment ratio
-//   GNSS → OCXO.
-//
-// This design eliminates all reliance on TIMEPULSE / 10 kHz anchor updates.
+// All public API speaks nanoseconds.  Clock domain details (DWT cycles,
+// OCXO ticks) are internal to this module and the conversion helpers.
 //
 // ============================================================================
 
@@ -51,6 +38,29 @@ static constexpr uint32_t DWT_TO_NS_DEN = 126;
 // This comfortably spans the normal 1 Hz publish cadence while still rejecting
 // genuinely stale state after stop or pipeline failure.
 static constexpr uint64_t TIMEBASE_MAX_FRAGMENT_AGE_NS = 3000000000ULL;
+
+// ============================================================================
+// GPS epoch and leap seconds
+// ============================================================================
+//
+// GNSS nanoseconds in ZPNet count from the GPS epoch (1980-01-06T00:00:00Z).
+// The GNSS module applies the current UTC-GPS leap second correction, so
+// gnss_ns is effectively UTC nanoseconds counted from the GPS epoch.
+//
+// GPS epoch = 1980-01-06 = Unix timestamp 315964800
+// As of 2025, GPS-UTC leap seconds = 18 (already applied by module)
+
+static constexpr uint64_t GPS_EPOCH_UNIX = 315964800ULL;
+
+// Days in each month (non-leap, then leap)
+static const uint8_t DAYS_IN_MONTH[2][12] = {
+  {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31},  // non-leap
+  {31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31},   // leap
+};
+
+static inline bool is_leap_year(uint32_t y) {
+  return (y % 4 == 0 && y % 100 != 0) || (y % 400 == 0);
+}
 
 // ============================================================================
 // Fragment state (written by TIMEBASE_FRAGMENT callback, read by anyone)
@@ -86,10 +96,12 @@ static inline uint64_t mul_div_u64(
 ) {
   if (den == 0) return 0;
 
+  // Fast path: no overflow
   if (num != 0 && value <= (UINT64_MAX / num)) {
     return (value * num) / den;
   }
 
+  // Slow path: use double for very large values
   double ratio  = (double)num / (double)den;
   double scaled = (double)value * ratio;
 
@@ -98,7 +110,7 @@ static inline uint64_t mul_div_u64(
 }
 
 // ============================================================================
-// Snapshot struct
+// Snapshot struct (stack-local, for torn-read-safe access)
 // ============================================================================
 
 struct fragment_snapshot_t {
@@ -245,6 +257,7 @@ static bool convert_via_fragment(
   if (!fragment_domain_total_ns(snap, from_domain, from_total_ns)) return false;
   if (!fragment_domain_total_ns(snap, to_domain,   to_total_ns))   return false;
 
+  // Normalize to GNSS first
   uint64_t gnss_ns = 0;
   if (from_domain == timebase_domain_t::GNSS) {
     gnss_ns = value_ns;
@@ -252,6 +265,7 @@ static bool convert_via_fragment(
     gnss_ns = mul_div_u64(value_ns, snap.gnss_ns, from_total_ns);
   }
 
+  // Then convert to target domain
   if (to_domain == timebase_domain_t::GNSS) {
     out_ns = gnss_ns;
   } else {
@@ -316,6 +330,74 @@ int64_t timebase_convert_ns(
   }
 
   return (int64_t)converted;
+}
+
+// ============================================================================
+// Public API — ISO 8601 formatting
+// ============================================================================
+
+int timebase_format_iso8601(uint64_t gnss_ns, char* buf, size_t buf_len) {
+  if (buf == nullptr || buf_len < 31) return 0;
+  if (gnss_ns == 0) return 0;
+
+  // Convert GNSS nanoseconds to Unix seconds + sub-second nanoseconds
+  uint64_t total_secs = gnss_ns / 1000000000ULL;
+  uint32_t sub_ns     = (uint32_t)(gnss_ns % 1000000000ULL);
+
+  uint64_t unix_secs = GPS_EPOCH_UNIX + total_secs;
+
+  // Break Unix seconds into date/time components
+  // Days since Unix epoch
+  uint32_t days    = (uint32_t)(unix_secs / 86400ULL);
+  uint32_t day_sec = (uint32_t)(unix_secs % 86400ULL);
+
+  uint32_t hour = day_sec / 3600;
+  uint32_t min  = (day_sec % 3600) / 60;
+  uint32_t sec  = day_sec % 60;
+
+  // Convert days since 1970-01-01 to year/month/day
+  // Using a simple loop — called at most once per timestamp, not hot path
+  uint32_t year = 1970;
+  while (true) {
+    uint32_t days_in_year = is_leap_year(year) ? 366 : 365;
+    if (days < days_in_year) break;
+    days -= days_in_year;
+    year++;
+  }
+
+  uint8_t leap = is_leap_year(year) ? 1 : 0;
+  uint32_t month = 0;
+  while (month < 12 && days >= DAYS_IN_MONTH[leap][month]) {
+    days -= DAYS_IN_MONTH[leap][month];
+    month++;
+  }
+  month += 1;   // 1-based
+  days  += 1;   // 1-based
+
+  // Format: "2026-03-08T01:34:44.123456789Z"
+  int written = snprintf(buf, buf_len,
+    "%04lu-%02lu-%02luT%02lu:%02lu:%02lu.%09luZ",
+    (unsigned long)year, (unsigned long)month, (unsigned long)days,
+    (unsigned long)hour, (unsigned long)min, (unsigned long)sec,
+    (unsigned long)sub_ns);
+
+  return (written > 0 && (size_t)written < buf_len) ? written : 0;
+}
+
+int timebase_now_iso8601(char* buf, size_t buf_len) {
+  int64_t now = timebase_now_gnss_ns();
+  if (now < 0) return 0;
+  return timebase_format_iso8601((uint64_t)now, buf, buf_len);
+}
+
+// ============================================================================
+// Public API — PPS count
+// ============================================================================
+
+uint32_t timebase_pps_count(void) {
+  fragment_snapshot_t snap = read_fragment();
+  if (!snap.ok) return 0;
+  return snap.pps_count;
 }
 
 // ============================================================================
@@ -387,6 +469,7 @@ void on_timebase_fragment(const Payload& payload) {
   const uint32_t local_dwt_snap = ARM_DWT_CYCCNT;
   const bool valid = (gnss_ns > 0 && dwt_ns > 0 && ocxo_ns > 0);
 
+  // Sequence-protected write (odd = in-progress, even = stable)
   frag_store.seq++;
   dmb();
 
@@ -404,6 +487,7 @@ void on_timebase_fragment(const Payload& payload) {
   dmb();
   frag_store.seq++;
 
+  // Unsynchronized public mirror for diagnostic/report reads
   frag_public.gnss_ns           = gnss_ns;
   frag_public.dwt_ns            = dwt_ns;
   frag_public.dwt_cycles        = dwt_cycles;

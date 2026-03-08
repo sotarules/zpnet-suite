@@ -2,19 +2,22 @@
 // timebase.h — ZPNet Timebase Singleton (Teensy)
 // ============================================================================
 //
-// PPS-fragment anchored Timebase.
+// PPS-fragment anchored Timebase.  Any Teensy module that includes this
+// header can ask "what time is it?" and receive GNSS-disciplined
+// nanoseconds without caring about DWT cycles, clock domains, or PPS
+// edge mechanics.
 //
-// Timebase answers two classes of questions:
+// Timebase answers three classes of questions:
 //
-//   1) "What time is it right now in domain X?"
-//   2) "What is the corresponding nanosecond value in domain B for a value
-//       expressed in domain A?"
+//   1) "What time is it right now?"          → timebase_now_gnss_ns()
+//   2) "How long did something take?"        → timebase_elapsed_ns()
+//   3) "Convert between clock domains."      → timebase_convert_ns()
 //
 // Supported domains:
 //
-//   • GNSS — GNSS nanoseconds
-//   • DWT  — DWT nanoseconds
-//   • OCXO — OCXO nanoseconds
+//   • GNSS — GNSS nanoseconds (the universal language of ZPNet)
+//   • DWT  — DWT nanoseconds  (Teensy crystal, ~-3770 PPB drift)
+//   • OCXO — OCXO nanoseconds (10 MHz disciplined oscillator)
 //
 // Architecture
 // ------------
@@ -22,44 +25,40 @@
 // 1. TIMEBASE_FRAGMENT (1 Hz, written by pub/sub callback)
 //    Once per second, CLOCKS publishes authoritative PPS-edge totals:
 //
-//      • gnss_ns
-//      • dwt_ns
-//      • dwt_cycles
-//      • ocxo_ns
-//      • pps_count
-//      • residuals
+//      • gnss_ns, dwt_ns, dwt_cycles, ocxo_ns
+//      • pps_count, residuals
 //
 // 2. Local receipt snapshot
-//    When the fragment is received, Timebase captures the local
-//    ARM_DWT_CYCCNT in scheduled context.
+//    When the fragment arrives, Timebase captures ARM_DWT_CYCCNT.
 //
 // 3. now(domain)
-//    Timebase projects forward from the most recent fragment using
-//    local DWT elapsed time since fragment receipt.
+//    Projects forward from the most recent fragment using local DWT
+//    elapsed time since fragment receipt:
 //
-//      elapsed_ns = elapsed_dwt_cycles * 125 / 126
+//      elapsed_ns = elapsed_dwt_cycles × 125 / 126
+//      GNSS now   = fragment.gnss_ns + elapsed_ns
 //
-//      GNSS now = fragment.gnss_ns + elapsed_ns
-//      DWT  now = fragment.dwt_ns  + elapsed_ns
+// 4. Durations
+//    Capture a GNSS timestamp, do work, capture another.  The difference
+//    is a duration in nanoseconds — directly comparable across instruments.
 //
-//    OCXO "now" is derived by converting projected GNSS through the
-//    most recent fragment ratio.
+// 5. ISO 8601
+//    Format any GNSS nanosecond value as "2026-03-08T01:34:44.123456789Z".
+//    Uses the GPS epoch (1980-01-06) plus leap seconds.
 //
-// 4. convert_ns(value, from_domain, to_domain)
-//    Domain conversion always normalizes through GNSS:
+// Setup
+// -----
 //
-//      from_domain → GNSS → to_domain
+//   #include "timebase.h"
 //
-//    The conversion ratios are derived from the latest fragment totals.
+//   void setup() {
+//     timebase_init();
+//     pubsub_subscribe("TIMEBASE_FRAGMENT", on_timebase_fragment);
+//   }
 //
-// Design Notes
-// ------------
-//
-// • No TIMEPULSE support remains.
-// • The core API is enum-based for hot-path use.
-// • Both the fragment store and public mirror are sequence-safe / read-only.
-// • Fragment freshness is enforced to prevent stale "now" narration after
-//   stop or pipeline failure.
+//   // Anywhere in your code:
+//   int64_t now = timebase_now_gnss_ns();
+//   if (now >= 0) { /* valid */ }
 //
 // ============================================================================
 
@@ -70,7 +69,7 @@
 #include <stdint.h>
 
 // ============================================================================
-// Clock domain enum (core API)
+// Clock domain enum
 // ============================================================================
 
 enum class timebase_domain_t : uint8_t {
@@ -83,19 +82,60 @@ enum class timebase_domain_t : uint8_t {
 // Initialization
 // ============================================================================
 
+/// Call once in setup().  Clears all fragment state.
 void timebase_init(void);
 
 // ============================================================================
 // Primary API — "what time is it?"
 // ============================================================================
 
+/// Returns the current time in the specified domain, in nanoseconds.
+/// Returns -1 if Timebase is not yet valid (no fragment received, or
+/// fragment is stale beyond the 3-second freshness window).
 int64_t timebase_now_ns(timebase_domain_t domain);
+
+/// Convenience: equivalent to timebase_now_ns(GNSS).
+/// This is the primary call for most code.
 int64_t timebase_now_gnss_ns(void);
+
+// ============================================================================
+// Duration API — "how long did that take?"
+// ============================================================================
+
+/// Capture a GNSS timestamp for later duration computation.
+/// Returns -1 if Timebase is not valid.
+///
+/// Usage:
+///   int64_t t0 = timebase_stamp();
+///   // ... do work ...
+///   int64_t elapsed = timebase_elapsed_ns(t0);
+static inline int64_t timebase_stamp(void) {
+  return timebase_now_gnss_ns();
+}
+
+/// Returns nanoseconds elapsed since a prior stamp.
+/// Returns -1 if either the current time or the stamp is invalid.
+static inline int64_t timebase_elapsed_ns(int64_t stamp) {
+  if (stamp < 0) return -1;
+  int64_t now = timebase_now_gnss_ns();
+  if (now < 0) return -1;
+  return now - stamp;
+}
+
+/// Returns the duration between two stamps (end - start) in nanoseconds.
+/// Returns -1 if either stamp is invalid.
+static inline int64_t timebase_duration_ns(int64_t start, int64_t end) {
+  if (start < 0 || end < 0) return -1;
+  return end - start;
+}
 
 // ============================================================================
 // Domain conversion API
 // ============================================================================
 
+/// Convert a nanosecond value from one domain to another.
+/// Conversion always normalizes through GNSS using the latest fragment
+/// ratios.  Returns -1 on failure.
 int64_t timebase_convert_ns(
   uint64_t           value_ns,
   timebase_domain_t  from_domain,
@@ -103,20 +143,50 @@ int64_t timebase_convert_ns(
 );
 
 // ============================================================================
+// ISO 8601 formatting
+// ============================================================================
+
+/// Format a GNSS nanosecond value as ISO 8601 with nanosecond precision.
+/// Writes to buf (must be at least 31 bytes): "2026-03-08T01:34:44.123456789Z"
+/// Returns the number of characters written (excluding null terminator),
+/// or 0 on failure.
+///
+/// GNSS nanoseconds count from the GPS epoch (1980-01-06T00:00:00Z) with
+/// the current leap second offset applied by the GNSS module.
+int timebase_format_iso8601(uint64_t gnss_ns, char* buf, size_t buf_len);
+
+/// Convenience: format the current GNSS time as ISO 8601.
+/// Returns 0 if Timebase is not valid.
+int timebase_now_iso8601(char* buf, size_t buf_len);
+
+// ============================================================================
+// PPS count
+// ============================================================================
+
+/// Returns the PPS count from the most recent valid fragment.
+/// Returns 0 if no fragment has been received.
+uint32_t timebase_pps_count(void);
+
+// ============================================================================
 // Validity
 // ============================================================================
 
+/// True if timebase_now_gnss_ns() would succeed right now.
 bool timebase_valid(void);
+
+/// True if all three domains (GNSS, DWT, OCXO) have nonzero fragment
+/// totals, meaning convert_ns() can operate between any pair.
 bool timebase_conversion_valid(void);
 
 // ============================================================================
 // Invalidation
 // ============================================================================
 
+/// Clear all fragment state.  Called on STOP or pipeline failure.
 void timebase_invalidate(void);
 
 // ============================================================================
-// Fragment data access (per-second values from TIMEBASE_FRAGMENT)
+// Fragment data access (diagnostic / reporting)
 // ============================================================================
 
 struct timebase_fragment_t {
@@ -131,5 +201,13 @@ struct timebase_fragment_t {
   volatile bool     valid;
 };
 
+/// Returns a pointer to the most recent fragment (diagnostic use).
 const timebase_fragment_t* timebase_last_fragment(void);
+
+// ============================================================================
+// TIMEBASE_FRAGMENT subscription callback
+// ============================================================================
+
+/// Pub/sub callback — wire this to "TIMEBASE_FRAGMENT" in your setup:
+///   pubsub_subscribe("TIMEBASE_FRAGMENT", on_timebase_fragment);
 void on_timebase_fragment(const Payload& payload);
