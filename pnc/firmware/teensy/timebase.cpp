@@ -5,14 +5,23 @@
 // PPS-fragment anchored Timebase.
 //
 // The authoritative TIMEBASE_FRAGMENT provides PPS-edge totals once per
-// second.  When received, Timebase captures the local ARM_DWT_CYCCNT.
-// "Now" is answered by projecting forward from that anchor:
+// second.  The fragment carries diag_raw_shadow_cyc — the raw DWT_CYCCNT
+// register value captured by the spin loop just before the PPS edge.
+// This is the interpolation anchor.
 //
-//   gnss_now = fragment.gnss_ns + elapsed_dwt_cycles × 125 / 126
+// "Now" is answered by measuring elapsed DWT cycles since that anchor
+// and scaling to GNSS nanoseconds using the empirical ratio:
+//
+//   elapsed_dwt_cycles = ARM_DWT_CYCCNT - dwt_cyccnt_at_pps
+//   elapsed_gnss_ns = elapsed_dwt_cycles × (fragment.gnss_ns / fragment.dwt_cycles)
+//   gnss_now = fragment.gnss_ns + elapsed_gnss_ns
+//
+// The anchor is the raw hardware register, captured within ~50 ns of
+// the true PPS edge.  The ratio gnss_ns / dwt_cycles is the true,
+// measured conversion factor — no assumed 125/126 constant.
 //
 // The DWT runs at 1008 MHz.  The 125/126 ratio converts DWT cycles to
-// nanoseconds.  At 19.5 ns period stddev and ±0.50 ns TDC quantization,
-// the Teensy achieves sub-nanosecond timing over √n averages.
+// nominal nanoseconds and is used only for the DWT domain.
 //
 // All public API speaks nanoseconds.  Clock domain details (DWT cycles,
 // OCXO ticks) are internal to this module and the conversion helpers.
@@ -35,27 +44,17 @@ static constexpr uint32_t DWT_TO_NS_NUM = 125;
 static constexpr uint32_t DWT_TO_NS_DEN = 126;
 
 // Allow the most recent fragment to remain authoritative for up to 3 seconds.
-// This comfortably spans the normal 1 Hz publish cadence while still rejecting
-// genuinely stale state after stop or pipeline failure.
 static constexpr uint64_t TIMEBASE_MAX_FRAGMENT_AGE_NS = 3000000000ULL;
 
 // ============================================================================
 // GPS epoch and leap seconds
 // ============================================================================
-//
-// GNSS nanoseconds in ZPNet count from the GPS epoch (1980-01-06T00:00:00Z).
-// The GNSS module applies the current UTC-GPS leap second correction, so
-// gnss_ns is effectively UTC nanoseconds counted from the GPS epoch.
-//
-// GPS epoch = 1980-01-06 = Unix timestamp 315964800
-// As of 2025, GPS-UTC leap seconds = 18 (already applied by module)
 
 static constexpr uint64_t GPS_EPOCH_UNIX = 315964800ULL;
 
-// Days in each month (non-leap, then leap)
 static const uint8_t DAYS_IN_MONTH[2][12] = {
-  {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31},  // non-leap
-  {31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31},   // leap
+  {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31},
+  {31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31},
 };
 
 static inline bool is_leap_year(uint32_t y) {
@@ -75,7 +74,7 @@ struct fragment_store_t {
   volatile int32_t  isr_residual_dwt;
   volatile int32_t  isr_residual_gnss;
   volatile int32_t  isr_residual_ocxo;
-  volatile uint32_t local_dwt_snap;
+  volatile uint32_t dwt_cyccnt_at_pps;
   volatile uint32_t seq;
   volatile bool     valid;
 };
@@ -110,10 +109,10 @@ static inline uint64_t mul_div_u64(
 }
 
 // ============================================================================
-// Snapshot struct (stack-local, for torn-read-safe access)
+// Fragment copy (stack-local, torn-read-safe)
 // ============================================================================
 
-struct fragment_snapshot_t {
+struct fragment_copy_t {
   uint64_t gnss_ns;
   uint64_t dwt_ns;
   uint64_t dwt_cycles;
@@ -122,7 +121,7 @@ struct fragment_snapshot_t {
   int32_t  isr_residual_dwt;
   int32_t  isr_residual_gnss;
   int32_t  isr_residual_ocxo;
-  uint32_t local_dwt_snap;
+  uint32_t dwt_cyccnt_at_pps;
   bool     valid;
   bool     ok;
 };
@@ -131,35 +130,35 @@ struct fragment_snapshot_t {
 // Fragment read with torn-read protection
 // ============================================================================
 
-static fragment_snapshot_t read_fragment(void) {
-  fragment_snapshot_t snap = {};
-  snap.ok = false;
+static fragment_copy_t read_fragment(void) {
+  fragment_copy_t f = {};
+  f.ok = false;
 
   for (int attempt = 0; attempt < 4; attempt++) {
     uint32_t s1 = frag_store.seq;
     dmb();
 
-    snap.gnss_ns           = frag_store.gnss_ns;
-    snap.dwt_ns            = frag_store.dwt_ns;
-    snap.dwt_cycles        = frag_store.dwt_cycles;
-    snap.ocxo_ns           = frag_store.ocxo_ns;
-    snap.pps_count         = frag_store.pps_count;
-    snap.isr_residual_dwt  = frag_store.isr_residual_dwt;
-    snap.isr_residual_gnss = frag_store.isr_residual_gnss;
-    snap.isr_residual_ocxo = frag_store.isr_residual_ocxo;
-    snap.local_dwt_snap    = frag_store.local_dwt_snap;
-    snap.valid             = frag_store.valid;
+    f.gnss_ns           = frag_store.gnss_ns;
+    f.dwt_ns            = frag_store.dwt_ns;
+    f.dwt_cycles        = frag_store.dwt_cycles;
+    f.ocxo_ns           = frag_store.ocxo_ns;
+    f.pps_count         = frag_store.pps_count;
+    f.isr_residual_dwt  = frag_store.isr_residual_dwt;
+    f.isr_residual_gnss = frag_store.isr_residual_gnss;
+    f.isr_residual_ocxo = frag_store.isr_residual_ocxo;
+    f.dwt_cyccnt_at_pps = frag_store.dwt_cyccnt_at_pps;
+    f.valid             = frag_store.valid;
 
     dmb();
     uint32_t s2 = frag_store.seq;
 
     if (s1 == s2 && (s1 & 1u) == 0u) {
-      snap.ok = true;
-      return snap;
+      f.ok = true;
+      return f;
     }
   }
 
-  return snap;
+  return f;
 }
 
 // ============================================================================
@@ -167,22 +166,22 @@ static fragment_snapshot_t read_fragment(void) {
 // ============================================================================
 
 static bool fragment_domain_total_ns(
-  const fragment_snapshot_t& snap,
-  timebase_domain_t          domain,
-  uint64_t&                  out_ns
+  const fragment_copy_t& f,
+  timebase_domain_t      domain,
+  uint64_t&              out_ns
 ) {
   switch (domain) {
     case timebase_domain_t::GNSS:
-      out_ns = snap.gnss_ns;
-      return snap.gnss_ns > 0;
+      out_ns = f.gnss_ns;
+      return f.gnss_ns > 0;
 
     case timebase_domain_t::DWT:
-      out_ns = snap.dwt_ns;
-      return snap.dwt_ns > 0;
+      out_ns = f.dwt_ns;
+      return f.dwt_ns > 0;
 
     case timebase_domain_t::OCXO:
-      out_ns = snap.ocxo_ns;
-      return snap.ocxo_ns > 0;
+      out_ns = f.ocxo_ns;
+      return f.ocxo_ns > 0;
   }
 
   out_ns = 0;
@@ -190,44 +189,56 @@ static bool fragment_domain_total_ns(
 }
 
 // ============================================================================
-// Forward projection from fragment receipt
+// Forward projection — direct DWT cycles to GNSS nanoseconds
 // ============================================================================
 
-static bool fragment_elapsed_ns(
-  const fragment_snapshot_t& snap,
-  uint64_t&                  out_elapsed_ns
-) {
-  if (!snap.ok || !snap.valid) return false;
+static bool current_gnss_now(uint64_t& out_gnss_ns) {
+  fragment_copy_t f = read_fragment();
+  if (!f.ok || !f.valid) return false;
+  if (f.dwt_cycles == 0) return false;
 
   uint32_t dwt_now     = ARM_DWT_CYCCNT;
-  uint32_t dwt_elapsed = dwt_now - snap.local_dwt_snap;
+  uint32_t dwt_elapsed = dwt_now - f.dwt_cyccnt_at_pps;
 
-  uint64_t elapsed_ns =
-    mul_div_u64((uint64_t)dwt_elapsed, DWT_TO_NS_NUM, DWT_TO_NS_DEN);
+  // Convert elapsed DWT cycles directly to GNSS nanoseconds using
+  // the empirical ratio from the fragment:
+  //
+  //   elapsed_gnss_ns = elapsed_dwt_cycles × (gnss_ns / dwt_cycles)
+  //
+  // This bypasses the nominal 125/126 conversion entirely.  The ratio
+  // gnss_ns / dwt_cycles IS the true, measured relationship between
+  // DWT ticks and GNSS time — incorporating both the conversion factor
+  // and the crystal's frequency offset (~3.6 ppm).
+  uint64_t elapsed_gnss_ns =
+    mul_div_u64((uint64_t)dwt_elapsed, f.gnss_ns, f.dwt_cycles);
 
-  if (elapsed_ns > TIMEBASE_MAX_FRAGMENT_AGE_NS) {
+  if (elapsed_gnss_ns > TIMEBASE_MAX_FRAGMENT_AGE_NS) {
     return false;
   }
 
-  out_elapsed_ns = elapsed_ns;
+  out_gnss_ns = f.gnss_ns + elapsed_gnss_ns;
   return true;
 }
 
-static bool current_gnss_now(uint64_t& out_gnss_ns) {
-  fragment_snapshot_t snap = read_fragment();
-  uint64_t elapsed_ns = 0;
-  if (!fragment_elapsed_ns(snap, elapsed_ns)) return false;
-
-  out_gnss_ns = snap.gnss_ns + elapsed_ns;
-  return true;
-}
+// ============================================================================
+// Forward projection — DWT domain (nominal 125/126, no tau correction)
+// ============================================================================
 
 static bool current_dwt_now(uint64_t& out_dwt_ns) {
-  fragment_snapshot_t snap = read_fragment();
-  uint64_t elapsed_ns = 0;
-  if (!fragment_elapsed_ns(snap, elapsed_ns)) return false;
+  fragment_copy_t f = read_fragment();
+  if (!f.ok || !f.valid) return false;
 
-  out_dwt_ns = snap.dwt_ns + elapsed_ns;
+  uint32_t dwt_now     = ARM_DWT_CYCCNT;
+  uint32_t dwt_elapsed = dwt_now - f.dwt_cyccnt_at_pps;
+
+  uint64_t elapsed_dwt_ns =
+    mul_div_u64((uint64_t)dwt_elapsed, DWT_TO_NS_NUM, DWT_TO_NS_DEN);
+
+  if (elapsed_dwt_ns > TIMEBASE_MAX_FRAGMENT_AGE_NS) {
+    return false;
+  }
+
+  out_dwt_ns = f.dwt_ns + elapsed_dwt_ns;
   return true;
 }
 
@@ -246,30 +257,30 @@ static bool convert_via_fragment(
     return true;
   }
 
-  fragment_snapshot_t snap = read_fragment();
-  if (!snap.ok || !snap.valid || snap.gnss_ns == 0) {
+  fragment_copy_t f = read_fragment();
+  if (!f.ok || !f.valid || f.gnss_ns == 0) {
     return false;
   }
 
   uint64_t from_total_ns = 0;
   uint64_t to_total_ns   = 0;
 
-  if (!fragment_domain_total_ns(snap, from_domain, from_total_ns)) return false;
-  if (!fragment_domain_total_ns(snap, to_domain,   to_total_ns))   return false;
+  if (!fragment_domain_total_ns(f, from_domain, from_total_ns)) return false;
+  if (!fragment_domain_total_ns(f, to_domain,   to_total_ns))   return false;
 
   // Normalize to GNSS first
   uint64_t gnss_ns = 0;
   if (from_domain == timebase_domain_t::GNSS) {
     gnss_ns = value_ns;
   } else {
-    gnss_ns = mul_div_u64(value_ns, snap.gnss_ns, from_total_ns);
+    gnss_ns = mul_div_u64(value_ns, f.gnss_ns, from_total_ns);
   }
 
   // Then convert to target domain
   if (to_domain == timebase_domain_t::GNSS) {
     out_ns = gnss_ns;
   } else {
-    out_ns = mul_div_u64(gnss_ns, to_total_ns, snap.gnss_ns);
+    out_ns = mul_div_u64(gnss_ns, to_total_ns, f.gnss_ns);
   }
 
   return true;
@@ -340,14 +351,11 @@ int timebase_format_iso8601(uint64_t gnss_ns, char* buf, size_t buf_len) {
   if (buf == nullptr || buf_len < 31) return 0;
   if (gnss_ns == 0) return 0;
 
-  // Convert GNSS nanoseconds to Unix seconds + sub-second nanoseconds
   uint64_t total_secs = gnss_ns / 1000000000ULL;
   uint32_t sub_ns     = (uint32_t)(gnss_ns % 1000000000ULL);
 
   uint64_t unix_secs = GPS_EPOCH_UNIX + total_secs;
 
-  // Break Unix seconds into date/time components
-  // Days since Unix epoch
   uint32_t days    = (uint32_t)(unix_secs / 86400ULL);
   uint32_t day_sec = (uint32_t)(unix_secs % 86400ULL);
 
@@ -355,8 +363,6 @@ int timebase_format_iso8601(uint64_t gnss_ns, char* buf, size_t buf_len) {
   uint32_t min  = (day_sec % 3600) / 60;
   uint32_t sec  = day_sec % 60;
 
-  // Convert days since 1970-01-01 to year/month/day
-  // Using a simple loop — called at most once per timestamp, not hot path
   uint32_t year = 1970;
   while (true) {
     uint32_t days_in_year = is_leap_year(year) ? 366 : 365;
@@ -371,10 +377,9 @@ int timebase_format_iso8601(uint64_t gnss_ns, char* buf, size_t buf_len) {
     days -= DAYS_IN_MONTH[leap][month];
     month++;
   }
-  month += 1;   // 1-based
-  days  += 1;   // 1-based
+  month += 1;
+  days  += 1;
 
-  // Format: "2026-03-08T01:34:44.123456789Z"
   int written = snprintf(buf, buf_len,
     "%04lu-%02lu-%02luT%02lu:%02lu:%02lu.%09luZ",
     (unsigned long)year, (unsigned long)month, (unsigned long)days,
@@ -395,9 +400,9 @@ int timebase_now_iso8601(char* buf, size_t buf_len) {
 // ============================================================================
 
 uint32_t timebase_pps_count(void) {
-  fragment_snapshot_t snap = read_fragment();
-  if (!snap.ok) return 0;
-  return snap.pps_count;
+  fragment_copy_t f = read_fragment();
+  if (!f.ok) return 0;
+  return f.pps_count;
 }
 
 // ============================================================================
@@ -410,11 +415,11 @@ bool timebase_valid(void) {
 }
 
 bool timebase_conversion_valid(void) {
-  fragment_snapshot_t snap = read_fragment();
-  if (!snap.ok || !snap.valid) return false;
-  if (snap.gnss_ns == 0) return false;
-  if (snap.dwt_ns  == 0) return false;
-  if (snap.ocxo_ns == 0) return false;
+  fragment_copy_t f = read_fragment();
+  if (!f.ok || !f.valid) return false;
+  if (f.gnss_ns == 0) return false;
+  if (f.dwt_ns  == 0) return false;
+  if (f.ocxo_ns == 0) return false;
   return true;
 }
 
@@ -434,7 +439,7 @@ void timebase_invalidate(void) {
   frag_store.isr_residual_dwt  = 0;
   frag_store.isr_residual_gnss = 0;
   frag_store.isr_residual_ocxo = 0;
-  frag_store.local_dwt_snap    = 0;
+  frag_store.dwt_cyccnt_at_pps = 0;
   frag_store.valid             = false;
 
   dmb();
@@ -466,7 +471,12 @@ void on_timebase_fragment(const Payload& payload) {
   const int32_t isr_gnss = payload.getInt("isr_residual_gnss", 0);
   const int32_t isr_ocxo = payload.getInt("isr_residual_ocxo", 0);
 
-  const uint32_t local_dwt_snap = ARM_DWT_CYCCNT;
+  // The interpolation anchor is the raw DWT_CYCCNT register value
+  // captured by the spin loop just before the PPS edge.  This is the
+  // actual hardware register value — NOT the 64-bit accumulator.
+  // When current_gnss_now() later computes (DWT_CYCCNT - anchor),
+  // the result is elapsed cycles since the PPS edge.
+  const uint32_t dwt_cyccnt_at_pps = payload.getUInt("dwt_cyccnt_at_pps", 0);
   const bool valid = (gnss_ns > 0 && dwt_ns > 0 && ocxo_ns > 0);
 
   // Sequence-protected write (odd = in-progress, even = stable)
@@ -481,7 +491,7 @@ void on_timebase_fragment(const Payload& payload) {
   frag_store.isr_residual_dwt  = isr_dwt;
   frag_store.isr_residual_gnss = isr_gnss;
   frag_store.isr_residual_ocxo = isr_ocxo;
-  frag_store.local_dwt_snap    = local_dwt_snap;
+  frag_store.dwt_cyccnt_at_pps = dwt_cyccnt_at_pps;
   frag_store.valid             = valid;
 
   dmb();
