@@ -1,5 +1,5 @@
 // ============================================================================
-// process_clocks.cpp — ZPNet CLOCKS (Teensy) — v6 Phase-Coherent
+// process_clocks.cpp — ZPNet CLOCKS (Teensy) — v7 Direct Delta Accumulation
 // ============================================================================
 //
 // CLOCKS is a dormant, PPS-anchored measurement instrument.
@@ -18,22 +18,27 @@
 //   GNSS   — GF-8802 10 MHz VCLOCK, external via GPT2 pin 14
 //   OCXO   — AOCJY1-A 10 MHz oven oscillator, external via GPT1 pin 25
 //
-// v6: Phase-coherent simplification.
+// v7: Direct delta accumulation.
 //
-//   PPS and VCLOCK are phase-locked (proven by test).  Therefore:
+//   64-bit accumulators are built from successive raw 32-bit register
+//   deltas at each PPS edge.  No advance-then-rewind.  No intermediate
+//   reads can corrupt the accumulator.
 //
-//   • GNSS ns = campaign_seconds × 1,000,000,000 (arithmetic, no snapshot)
-//   • DWT at PPS = spin loop shadow value (best available, no TDC adjustment)
-//   • OCXO at PPS = advance-then-rewind (real measurement, drifts at sub-ppb)
+//   The v6 advance-then-rewind pattern called clocks_xxx_now() to
+//   advance the accumulator to "now", then subtracted a rewind to
+//   get the value "at the PPS edge".  But between the PPS ISR and
+//   the ASAP callback, other code could call clocks_xxx_now() —
+//   shifting the accumulator's phase and corrupting the rewind by
+//   ±600 cycles.  This produced the oscillating discrepancy seen
+//   in the cycle_analyzer.
 //
-//   The advance-then-rewind pattern is eliminated for DWT and GNSS.
-//   The TDC correction table is removed — the raw spin shadow is
-//   already within ~50 ns of the true edge, and the TDC was adding
-//   complexity without improving the TIMEBASE measurement.
+//   Fix: at each PPS, compute the raw 32-bit delta from the previous
+//   PPS and add it directly to the 64-bit accumulator.  The accumulator
+//   is touched ONLY here, ONCE per second, with exact hardware deltas.
 //
-//   The fragment publishes the spin loop's DWT cycle count directly.
-//   Timebase.cpp uses this as its interpolation anchor, eliminating
-//   the ~70 µs latency from the pub/sub round-trip DWT snapshot.
+//   For DWT: delta = dispatch_shadow_dwt - prev_dwt_at_pps
+//   For OCXO: delta = isr_snap_ocxo - prev_ocxo_at_pps
+//   For GNSS: pure arithmetic (campaign_seconds × constant)
 //
 // ============================================================================
 
@@ -142,9 +147,10 @@ static void pps_relay_deassert(timepop_ctx_t*, void*) {
 // The ISR captures raw 32-bit register values for three purposes:
 //   1. VCLOCK validation gate (isr_snap_gnss vs isr_prev_gnss)
 //   2. ISR residual canaries (should be near-zero for GNSS, stable for DWT/OCXO)
-//   3. OCXO advance-then-rewind (isr_snap_ocxo is the rewind anchor)
+//   3. OCXO delta accumulation (isr_snap_ocxo is the per-PPS anchor)
 //
-// DWT and GNSS no longer use advance-then-rewind for TIMEBASE production.
+// DWT uses the spin loop shadow, not the ISR capture.
+// Neither DWT nor OCXO uses advance-then-rewind.
 
 static volatile uint32_t isr_snap_dwt  = 0;
 static volatile uint32_t isr_snap_gnss = 0;
@@ -267,6 +273,38 @@ static inline double residual_stderr(const pps_residual_t& r) {
 }
 
 // ============================================================================
+// 64-bit accumulators — built from successive raw 32-bit deltas
+// ============================================================================
+//
+// At each PPS edge, we compute the raw 32-bit delta from the previous
+// edge and add it to the 64-bit accumulator.  The accumulator is
+// touched ONLY in the ASAP callback, ONCE per second.
+//
+// DWT: uses spin loop shadow (dispatch_shadow_dwt)
+// OCXO: uses ISR snapshot (isr_snap_ocxo)
+// GNSS: pure arithmetic (campaign_seconds × constant)
+//
+// prev_dwt_at_pps and prev_ocxo_at_pps hold the raw 32-bit register
+// value from the previous PPS edge, for delta computation.
+
+static uint64_t dwt_cycles_64      = 0;
+static uint32_t prev_dwt_at_pps    = 0;
+
+static uint64_t ocxo_ticks_64      = 0;
+static uint32_t prev_ocxo_at_pps   = 0;
+
+// ============================================================================
+// Rolling 64-bit extensions for general use (TimePop, reports)
+// ============================================================================
+//
+// These are the "anytime" 64-bit extensions for code that needs to
+// read DWT/GNSS/OCXO outside the PPS callback.  They use the
+// traditional advance-on-read pattern and are NOT used for TIMEBASE.
+
+static uint64_t dwt_rolling_64  = 0;
+static uint32_t dwt_rolling_32  = 0;
+
+// ============================================================================
 // DWT (CPU cycle counter — 1008 MHz internal)
 // ============================================================================
 
@@ -276,21 +314,18 @@ static inline double residual_stderr(const pps_residual_t& r) {
 #define DWT_CYCCNT          (*(volatile uint32_t *)0xE0001004)
 #define DWT_CTRL_CYCCNTENA  (1 << 0)
 
-static uint64_t dwt_cycles_64 = 0;
-static uint32_t dwt_last_32   = 0;
-
 static inline void dwt_enable(void) {
   DEMCR |= DEMCR_TRCENA;
   DWT_CYCCNT = 0;
   DWT_CTRL |= DWT_CTRL_CYCCNTENA;
-  dwt_last_32 = DWT_CYCCNT;
+  dwt_rolling_32 = DWT_CYCCNT;
 }
 
 uint64_t clocks_dwt_cycles_now(void) {
   uint32_t now = DWT_CYCCNT;
-  dwt_cycles_64 += (uint32_t)(now - dwt_last_32);
-  dwt_last_32 = now;
-  return dwt_cycles_64;
+  dwt_rolling_64 += (uint32_t)(now - dwt_rolling_32);
+  dwt_rolling_32 = now;
+  return dwt_rolling_64;
 }
 
 uint64_t clocks_dwt_ns_now(void) {
@@ -349,13 +384,14 @@ uint64_t clocks_gnss_ns_now(void) {
 // OCXO (10 MHz external via GPT1 — raw, polled)
 // ============================================================================
 
-static uint64_t ocxo_ticks_64 = 0;
-static uint32_t ocxo_last_32  = 0;
-static bool     gpt1_armed    = false;
+static bool gpt1_armed = false;
 
 static inline void enable_gpt1(void) {
   CCM_CCGR1 |= CCM_CCGR1_GPT1_BUS(CCM_CCGR_ON);
 }
+
+static uint64_t ocxo_rolling_64 = 0;
+static uint32_t ocxo_rolling_32 = 0;
 
 static void arm_gpt1_external(void) {
   if (gpt1_armed) return;
@@ -370,46 +406,20 @@ static void arm_gpt1_external(void) {
   GPT1_CR = GPT_CR_CLKSRC(3) | GPT_CR_FRR;
   GPT1_CR |= GPT_CR_EN;
 
-  ocxo_last_32 = GPT1_CNT;
-  gpt1_armed   = true;
+  ocxo_rolling_32 = GPT1_CNT;
+  gpt1_armed      = true;
 }
 
 uint64_t clocks_ocxo_ticks_now(void) {
   uint32_t now = GPT1_CNT;
-  ocxo_ticks_64 += (uint32_t)(now - ocxo_last_32);
-  ocxo_last_32 = now;
-  return ocxo_ticks_64;
+  ocxo_rolling_64 += (uint32_t)(now - ocxo_rolling_32);
+  ocxo_rolling_32 = now;
+  return ocxo_rolling_64;
 }
 
 uint64_t clocks_ocxo_ns_now(void) {
   if (campaign_state != clocks_campaign_state_t::STARTED) return 0;
   return clocks_ocxo_ticks_now() * 100ull;
-}
-
-// ============================================================================
-// OCXO advance-then-rewind (real measurement — OCXO drifts)
-// ============================================================================
-
-static uint64_t ocxo_at_pps_edge(void) {
-  uint64_t now_64 = clocks_ocxo_ticks_now();
-  uint32_t rewind = (uint32_t)(ocxo_last_32 - isr_snap_ocxo);
-  return now_64 - rewind;
-}
-
-// ============================================================================
-// DWT 64-bit extension at spin loop shadow
-// ============================================================================
-//
-// The spin loop captures dispatch_shadow_dwt (raw 32-bit DWT_CYCCNT)
-// just before PPS fires.  We extend it to 64-bit using the same
-// advance-then-rewind trick, but from the shadow value instead of
-// the ISR snapshot.  This gives us the 64-bit DWT cycle count at
-// the moment closest to the true PPS edge.
-
-static uint64_t dwt_at_pps_shadow(void) {
-  uint64_t now_64 = clocks_dwt_cycles_now();
-  uint32_t rewind = (uint32_t)(dwt_last_32 - dispatch_shadow_dwt);
-  return now_64 - rewind;
 }
 
 // ============================================================================
@@ -419,15 +429,19 @@ static uint64_t dwt_at_pps_shadow(void) {
 static void clocks_zero_all(void) {
   timebase_invalidate();
 
-  clocks_dwt_cycles_now();
-  clocks_gnss_ticks_now();
-  clocks_ocxo_ticks_now();
+  // Zero the TIMEBASE accumulators and anchor at this PPS edge
+  dwt_cycles_64    = 0;
+  prev_dwt_at_pps  = dispatch_shadow_valid ? dispatch_shadow_dwt : isr_snap_dwt;
 
-  dwt_cycles_64 = 0;  dwt_last_32  = dispatch_shadow_valid ? dispatch_shadow_dwt : isr_snap_dwt;
-  gnss_ticks_64 = 0;  gnss_last_32 = isr_snap_gnss;
-  ocxo_ticks_64 = 0;  ocxo_last_32 = isr_snap_ocxo;
+  ocxo_ticks_64    = 0;
+  prev_ocxo_at_pps = isr_snap_ocxo;
 
   campaign_seconds = 0;
+
+  // Zero the rolling extensions (for reports / TimePop)
+  dwt_rolling_64  = 0;  dwt_rolling_32  = DWT_CYCCNT;
+  gnss_ticks_64   = 0;  gnss_last_32    = GPT2_CNT;
+  ocxo_rolling_64 = 0;  ocxo_rolling_32 = GPT1_CNT;
 
   residual_reset(residual_dwt);
   residual_reset(residual_gnss);
@@ -550,16 +564,21 @@ static void pps_asap_callback(timepop_ctx_t*, void*) {
 
     timebase_invalidate();
 
-    dwt_cycles_64 = dwt_ns_to_cycles(recover_dwt_ns);
-    dwt_last_32   = dispatch_shadow_valid ? dispatch_shadow_dwt : isr_snap_dwt;
+    // Seed the accumulators from recovered nanosecond values
+    dwt_cycles_64    = dwt_ns_to_cycles(recover_dwt_ns);
+    prev_dwt_at_pps  = dispatch_shadow_valid ? dispatch_shadow_dwt : isr_snap_dwt;
+
+    ocxo_ticks_64    = recover_ocxo_ns / 100ull;
+    prev_ocxo_at_pps = isr_snap_ocxo;
 
     gnss_ticks_64 = recover_gnss_ns / 100ull;
     gnss_last_32  = isr_snap_gnss;
 
-    ocxo_ticks_64 = recover_ocxo_ns / 100ull;
-    ocxo_last_32  = isr_snap_ocxo;
-
     campaign_seconds = recover_gnss_ns / 1000000000ull;
+
+    // Reset rolling extensions
+    dwt_rolling_64  = 0;  dwt_rolling_32  = DWT_CYCCNT;
+    ocxo_rolling_64 = 0;  ocxo_rolling_32 = GPT1_CNT;
 
     residual_reset(residual_dwt);
     residual_reset(residual_gnss);
@@ -594,26 +613,35 @@ static void pps_asap_callback(timepop_ctx_t*, void*) {
     pre_pps_arm();
     pps_fired = false;
 
-    // ── Clock values at PPS edge ──
+    // ── Clock values at PPS edge — direct delta accumulation ──
     //
+    // Each accumulator advances by the exact raw 32-bit delta since
+    // the previous PPS edge.  No advance-then-rewind.  No intermediate
+    // reads.  The accumulator is touched ONLY here, ONCE per second.
+
     // GNSS: arithmetic (phase coherent — exact by definition)
     const uint64_t pps_gnss_ns = campaign_seconds * NS_PER_SECOND;
 
-    // DWT: spin loop shadow (best available, ~50 ns from true edge)
-    // Falls back to ISR snapshot if spin loop was late.
-    uint64_t pps_dwt_cycles;
+    // DWT: delta from spin loop shadow (or ISR fallback)
+    uint32_t dwt_raw_at_pps;
     if (dispatch_shadow_valid) {
-      pps_dwt_cycles = dwt_at_pps_shadow();
+      dwt_raw_at_pps = dispatch_shadow_dwt;
     } else {
-      // Fallback: use ISR snapshot (less precise but still valid)
-      uint64_t now_64 = clocks_dwt_cycles_now();
-      uint32_t rewind = (uint32_t)(dwt_last_32 - isr_snap_dwt);
-      pps_dwt_cycles = now_64 - rewind;
+      dwt_raw_at_pps = isr_snap_dwt;
     }
-    const uint64_t pps_dwt_ns = dwt_cycles_to_ns(pps_dwt_cycles);
+    uint32_t dwt_delta = dwt_raw_at_pps - prev_dwt_at_pps;
+    dwt_cycles_64   += dwt_delta;
+    prev_dwt_at_pps  = dwt_raw_at_pps;
 
-    // OCXO: advance-then-rewind (real measurement)
-    const uint64_t pps_ocxo_ticks = ocxo_at_pps_edge();
+    const uint64_t pps_dwt_cycles = dwt_cycles_64;
+    const uint64_t pps_dwt_ns     = dwt_cycles_to_ns(pps_dwt_cycles);
+
+    // OCXO: delta from ISR snapshot
+    uint32_t ocxo_delta = isr_snap_ocxo - prev_ocxo_at_pps;
+    ocxo_ticks_64    += ocxo_delta;
+    prev_ocxo_at_pps  = isr_snap_ocxo;
+
+    const uint64_t pps_ocxo_ticks = ocxo_ticks_64;
     const uint64_t pps_ocxo_ns    = pps_ocxo_ticks * 100ull;
 
     // GNSS ticks for residual tracking (phase coherent)
@@ -621,7 +649,7 @@ static void pps_asap_callback(timepop_ctx_t*, void*) {
 
     dispatch_shadow_valid = false;
 
-    // ── Dispatch delta diagnostic (retained for TDC analysis) ──
+    // ── Dispatch delta diagnostic ──
     int64_t dispatch_delta_ns = -1;
     if (isr_captured_shadow_dwt != 0) {
       uint32_t delta_cycles = isr_snap_dwt - isr_captured_shadow_dwt;
@@ -645,7 +673,7 @@ static void pps_asap_callback(timepop_ctx_t*, void*) {
     p.add("ocxo_ns",          pps_ocxo_ns);
     p.add("teensy_pps_count", campaign_seconds);
     p.add("gnss_lock",        digitalRead(GNSS_LOCK_PIN));
-    p.add("dwt_cyccnt_at_pps", (uint32_t)isr_captured_shadow_dwt);
+    p.add("dwt_cyccnt_at_pps", (uint32_t)dwt_raw_at_pps);
 
     p.add("dwt_pps_residual",  residual_dwt.residual);
     p.add("gnss_pps_residual", residual_gnss.residual);
@@ -673,7 +701,7 @@ static void pps_asap_callback(timepop_ctx_t*, void*) {
     p.add("diag_spin_iters",    diag_spin_iterations);
 
     p.add("diag_raw_isr_cyc",    (uint32_t)isr_snap_dwt);
-    p.add("diag_raw_shadow_cyc", (uint32_t)isr_captured_shadow_dwt);
+    p.add("diag_raw_shadow_cyc", (uint32_t)dwt_raw_at_pps);
 
     p.add("diag_pps_rejected_total",     diag_pps_rejected_total);
     p.add("diag_pps_rejected_remainder", diag_pps_rejected_remainder);
