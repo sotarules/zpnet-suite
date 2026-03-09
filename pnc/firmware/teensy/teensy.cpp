@@ -99,9 +99,9 @@ static void maximize_dwt_determinism(void) {
   // ----------------------------------------------------------
   // 3. Verify DWT is enabled and running
   //
-  // This is belt-and-suspenders — process_clocks_init() also
-  // enables DWT via DEMCR and DWT_CTRL.  But we want the
-  // counter running from the earliest possible moment.
+  // This is belt-and-suspenders — process_clocks_init_hardware()
+  // also enables DWT.  But we want the counter running from the
+  // earliest possible moment.
   // ----------------------------------------------------------
 
   ARM_DEMCR |= ARM_DEMCR_TRCENA;
@@ -109,8 +109,15 @@ static void maximize_dwt_determinism(void) {
 }
 
 // ============================================================================
-// LED MORSE PRIMITIVES (FAULT-SAFE)
+// LED MORSE PRIMITIVES (FAULT-SAFE, DWT-BASED)
 // ============================================================================
+//
+// These use DWT cycle-counting for timing, NOT delay()/millis().
+// This is critical because:
+//   • Hard fault handlers run with interrupts disabled
+//   • SysTick ISR cannot fire → millis() is frozen → delay() hangs
+//   • DWT cycle counter runs regardless of interrupt state
+//
 
 static constexpr uint32_t DOT_MS  = 150;
 static constexpr uint32_t DASH_MS = 450;
@@ -121,14 +128,35 @@ static constexpr uint32_t REPEAT_GAP_MS = 1500;
 static inline void led_on()  { digitalWrite(LED_BUILTIN, HIGH); }
 static inline void led_off() { digitalWrite(LED_BUILTIN, LOW);  }
 
+// DWT busy-wait: works with interrupts disabled, at any clock speed
+static void dwt_spin_ms(uint32_t ms) {
+  if (ms == 0) return;
+
+  // Ensure DWT is running (may be called before maximize_dwt_determinism)
+  ARM_DEMCR |= ARM_DEMCR_TRCENA;
+  ARM_DWT_CTRL |= ARM_DWT_CTRL_CYCCNTENA;
+
+  uint32_t freq = F_CPU_ACTUAL;
+  if (freq == 0) freq = 600000000UL;
+
+  uint32_t cycles_per_ms = freq / 1000;
+
+  for (uint32_t i = 0; i < ms; i++) {
+    uint32_t start = ARM_DWT_CYCCNT;
+    while ((ARM_DWT_CYCCNT - start) < cycles_per_ms) {
+      // spin
+    }
+  }
+}
+
 static void dot() {
-  led_on();  delay(DOT_MS);
-  led_off(); delay(GAP_MS);
+  led_on();  dwt_spin_ms(DOT_MS);
+  led_off(); dwt_spin_ms(GAP_MS);
 }
 
 static void dash() {
-  led_on();  delay(DASH_MS);
-  led_off(); delay(GAP_MS);
+  led_on();  dwt_spin_ms(DASH_MS);
+  led_off(); dwt_spin_ms(GAP_MS);
 }
 
 // ============================================================================
@@ -140,7 +168,7 @@ static void fault_morse_hardfault() {
   pinMode(LED_BUILTIN, OUTPUT);
   while (true) {
     dot(); dot(); dot(); dot();          // H
-    delay(REPEAT_GAP_MS);
+    dwt_spin_ms(REPEAT_GAP_MS);
   }
 }
 
@@ -149,7 +177,7 @@ static void fault_morse_memmanage() {
   pinMode(LED_BUILTIN, OUTPUT);
   while (true) {
     dash(); dash();                      // M
-    delay(REPEAT_GAP_MS);
+    dwt_spin_ms(REPEAT_GAP_MS);
   }
 }
 
@@ -158,7 +186,7 @@ static void fault_morse_busfault() {
   pinMode(LED_BUILTIN, OUTPUT);
   while (true) {
     dash(); dot(); dot(); dot();         // B
-    delay(REPEAT_GAP_MS);
+    dwt_spin_ms(REPEAT_GAP_MS);
   }
 }
 
@@ -167,7 +195,7 @@ static void fault_morse_usagefault() {
   pinMode(LED_BUILTIN, OUTPUT);
   while (true) {
     dot(); dot(); dash();                // U
-    delay(REPEAT_GAP_MS);
+    dwt_spin_ms(REPEAT_GAP_MS);
   }
 }
 
@@ -186,6 +214,22 @@ void UsageFault_Handler(void) { fault_morse_usagefault(); }
 
 // ============================================================================
 // ZPNet Runtime Initialization
+// ============================================================================
+//
+// Boot order is critical.  The dependency chain is:
+//
+//   1. maximize_dwt_determinism()     — CPU clock, DWT counter
+//   2. memory_info_init()             — stack sentinel painting
+//   3. cpu_usage_init()               — DWT accounting baseline
+//   4. process_clocks_init_hardware() — starts GPT2 (GNSS 10 MHz),
+//                                       GPT1 (OCXO), DWT
+//   5. timepop_init()                 — installs GPT2 OCR1 ISR
+//                                       (GPT2 MUST be running)
+//   6. transport_init()               — arms RX/TX timers
+//                                       (TimePop MUST be ready)
+//   7. debug_init()                   — transport-routed logging
+//   8. process framework + subsystems — everything else
+//
 // ============================================================================
 
 void setup() {
@@ -208,11 +252,18 @@ void setup() {
   led_off();
 
   // ----------------------------------------------------------
-  // Phase 1: Core instrumentation
+  // Phase 1: Core instrumentation + hardware clocks
   // ----------------------------------------------------------
 
   memory_info_init();
   cpu_usage_init();
+
+  // Start GPT2/GPT1/DWT hardware BEFORE TimePop.
+  // TimePop uses GPT2 output compare — the counter must be
+  // running before timepop_init() installs its ISR.
+  process_clocks_init_hardware();
+
+  // Now TimePop can safely install its OCR1 compare on GPT2.
   timepop_init();
 
   // ----------------------------------------------------------
@@ -283,9 +334,9 @@ void setup() {
 
   debug_log("boot", "process_clocks_init");
   process_clocks_init();
-  debug_log("boot", "process_clocks_init_done");
+  debug_log("boot", "process_clocks_init done");
 
-  debug_log("boot", "process_clocks_register done");
+  debug_log("boot", "process_clocks_register");
   process_clocks_register();
   debug_log("boot", "process_clocks_register done");
 

@@ -30,6 +30,12 @@
 #include <Arduino.h>
 
 // --------------------------------------------------------------
+// TimePop delay constants (nanoseconds)
+// --------------------------------------------------------------
+
+static constexpr uint64_t EVENTBUS_PERIOD_NS = 1000000000ULL;  // 1 second
+
+// --------------------------------------------------------------
 // Event storage
 // --------------------------------------------------------------
 //
@@ -199,7 +205,7 @@ void process_events_register(void) {
 // --------------------------------------------------------------
 void process_events_init(void) {
   timepop_arm(
-    TIMEPOP_CLASS_EVENTBUS,
+    EVENTBUS_PERIOD_NS,
     true,
     publish_events,
     nullptr,

@@ -1,556 +1,505 @@
-#include "debug.h"
-#include "timepop.h"
+// ============================================================================
+// process_timepop.cpp — TimePop v2 (GPT2 Output Compare)
+// ============================================================================
+//
+// The time experience in ZPNet is the GNSS clock.
+//
+// GPT2 free-runs at 10 MHz clocked by the GF-8802 GNSS VCLOCK.
+// TimePop uses Output Compare channel 1 (OCR1) to fire an interrupt
+// at precise GPT2 count values.
+//
+// When the ISR fires, it captures GPT2_CNT immediately.  This
+// timestamp is stored in the slot and passed to the callback via
+// timepop_ctx_t.  Every callback knows the exact GNSS tick at which
+// it was triggered — independent of dispatch latency.
+//
+// No PIT.  No clock domains.  No drift correction.
+//
+// ============================================================================
 
+#include "timepop.h"
+#include "process_timepop.h"
+
+#include "debug.h"
 #include "process.h"
 #include "events.h"
 #include "payload.h"
 #include "cpu_usage.h"
+#include "timebase.h"
 
 #include <Arduino.h>
 #include "imxrt.h"
+#include <string.h>
 
-// ================================================================
-// Configuration
-// ================================================================
+// ============================================================================
+// Constants
+// ============================================================================
 
-#define TIMEPOP_MAX_SLOTS    16      // hard upper bound (tune later)
+static constexpr uint32_t MAX_SLOTS = 16;
 
-// PIT0: 1 ms tick = 24 MHz / 24000
-static constexpr uint32_t PIT0_LOAD = 23999u;
+// 1 GPT2 tick = 100 ns
+static constexpr uint64_t NS_PER_TICK = 100ULL;
 
-// PIT1: 10 µs tick = 24 MHz / 240
-// 10 µs gives ample precision for pre-PPS camp-on.
-// ISR overhead at 100 kHz: ~0.3-0.5% CPU when active.
-static constexpr uint32_t PIT1_LOAD     = 239u;
-static constexpr uint32_t PIT1_TICK_US  = 10u;
+// Maximum delay: half the 32-bit range (~214 seconds)
+static constexpr uint32_t MAX_DELAY_TICKS = 0x7FFFFFFFU;
 
-// ================================================================
-// Dual-PIT Architecture (Symmetric)
-// ================================================================
-//
-// PIT0 and PIT1 implement IDENTICAL countdown logic.  Each channel:
-//
-//   1. Fires its ISR at a fixed tick rate
-//   2. Scans all active slots belonging to its interval type
-//   3. Decrements remaining_ticks
-//   4. Marks slots as expired when remaining_ticks reaches 0
-//   5. Sets timepop_pending to wake the dispatch loop
-//
-// ================================================================
+// Minimum delay: avoid setting OCR in the immediate past
+static constexpr uint32_t MIN_DELAY_TICKS = 2;
 
-// ================================================================
-// Class Definition Table
-// ================================================================
+// ============================================================================
+// Slot
+// ============================================================================
 
-struct timepop_class_def_t {
-  timepop_interval_t interval;   // ms or µs
-  uint32_t           period;     // default period in native units
-};
-
-static timepop_class_def_t CLASS_DEF[TIMEPOP_CLASS_COUNT];
-
-static void init_class_definitions(void) {
-
-  // --- Millisecond classes (PIT0) ---
-  CLASS_DEF[TIMEPOP_CLASS_ASAP]           = { TIMEPOP_INTERVAL_MS,      0 };
-  CLASS_DEF[TIMEPOP_CLASS_RX_POLL]        = { TIMEPOP_INTERVAL_MS,      1 };
-  CLASS_DEF[TIMEPOP_CLASS_EVENTBUS]       = { TIMEPOP_INTERVAL_MS,   1000 };
-  CLASS_DEF[TIMEPOP_CLASS_CPU_SAMPLE]     = { TIMEPOP_INTERVAL_MS,   1000 };
-  CLASS_DEF[TIMEPOP_CLASS_CLOCKS]         = { TIMEPOP_INTERVAL_MS,    200 };
-  CLASS_DEF[TIMEPOP_CLASS_GUARD]          = { TIMEPOP_INTERVAL_MS,    500 };
-  CLASS_DEF[TIMEPOP_CLASS_PPS_RELAY]      = { TIMEPOP_INTERVAL_MS,    500 };
-  CLASS_DEF[TIMEPOP_CLASS_FLASH]          = { TIMEPOP_INTERVAL_MS,   5000 };
-  CLASS_DEF[TIMEPOP_CLASS_DEBUG_BEACON]   = { TIMEPOP_INTERVAL_MS,   1000 };
-  CLASS_DEF[TIMEPOP_CLASS_USER_1]         = { TIMEPOP_INTERVAL_MS,     10 };
-  CLASS_DEF[TIMEPOP_CLASS_USER_2]         = { TIMEPOP_INTERVAL_MS,    100 };
-  CLASS_DEF[TIMEPOP_CLASS_TX_PUMP]        = { TIMEPOP_INTERVAL_MS,      1 };
-  CLASS_DEF[TIMEPOP_CLASS_OCXO_DITHER]    = { TIMEPOP_INTERVAL_MS,      1 };
-  CLASS_DEF[TIMEPOP_CLASS_PRE_PPS_COARSE] = { TIMEPOP_INTERVAL_MS,    999 };
-}
-
-// ================================================================
-// Internal Slot (identical for both interval types)
-// ================================================================
-
-typedef struct {
+struct timepop_slot_t {
   bool                active;
   bool                expired;
   bool                recurring;
 
-  timepop_class_t     klass;
-  uint32_t            remaining_ticks;   // PIT ticks until expiration
-  uint32_t            period_ticks;      // reload value for recurring
+  timepop_handle_t    handle;
+  uint32_t            deadline;       // GPT2 count at intended expiry
+  uint32_t            fire_gpt2;      // GPT2_CNT captured in ISR at expiry
+  uint32_t            period_ticks;   // reload value for recurring
+  uint64_t            period_ns;      // original delay (for diagnostics)
 
   timepop_callback_t  callback;
-  void*               user_ctx;
+  void*               user_data;
   const char*         name;
-
-  uint32_t            id;                // monotonic instance id
-} timepop_slot_t;
-
-// ================================================================
-// State
-// ================================================================
-
-static timepop_slot_t slots[TIMEPOP_MAX_SLOTS];
-static volatile bool timepop_pending = false;
-
-static uint32_t next_slot_id = 1;
-
-// ================================================================
-// PIT0 Diagnostics
-// ================================================================
-
-static volatile uint32_t pit0_tick_count = 0;
-static volatile uint32_t pit0_zero_hits  = 0;
-
-// ================================================================
-// PIT1 State and Diagnostics
-// ================================================================
-
-static volatile uint8_t  pit1_client_count = 0;
-static volatile uint32_t pit1_tick_count   = 0;
-static volatile uint32_t pit1_zero_hits    = 0;
-
-// ================================================================
-// Execution-context helpers
-// ================================================================
-//
-// Cortex-M IPSR:
-//   0 => thread mode (normal scheduled context)
-//  !=0 => exception / interrupt context
-//
-// ================================================================
-
-static inline bool in_isr_context(void) {
-  uint32_t ipsr;
-  __asm volatile("MRS %0, ipsr" : "=r"(ipsr));
-  return ipsr != 0;
-}
-
-struct critical_state_t {
-  bool entered;
 };
 
-static inline critical_state_t critical_enter(void) {
-  critical_state_t s = { false };
+// ============================================================================
+// State
+// ============================================================================
 
-  // If already in ISR context, do NOT call noInterrupts()/interrupts().
-  // We are already in exception context, and unconditional restoration
-  // is unsafe there.
-  if (!in_isr_context()) {
-    noInterrupts();
-    s.entered = true;
-  }
+static timepop_slot_t slots[MAX_SLOTS];
+static volatile bool  timepop_pending = false;
+static uint32_t       next_handle = 1;
 
-  return s;
+// ============================================================================
+// Diagnostics
+// ============================================================================
+
+static volatile uint32_t isr_fire_count  = 0;
+static volatile uint32_t expired_count   = 0;
+
+// ============================================================================
+// GPT2 helpers
+// ============================================================================
+
+static inline uint32_t gpt2_count(void) {
+  return GPT2_CNT;
 }
 
-static inline void critical_exit(critical_state_t s) {
-  if (s.entered) {
-    interrupts();
-  }
+// Is deadline in the "past" half of the 32-bit range?
+static inline bool deadline_expired(uint32_t deadline, uint32_t now) {
+  return (deadline - now) > MAX_DELAY_TICKS;
 }
 
-// ================================================================
-// PIT1 Enable / Disable
-// ================================================================
-
-static void pit1_enable(void) {
-  PIT_TFLG1  = PIT_TFLG_TIF;   // clear any stale flag
-  PIT_LDVAL1 = PIT1_LOAD;      // 10 µs tick
-  PIT_TCTRL1 = PIT_TCTRL_TEN | PIT_TCTRL_TIE;
+// Is `a` sooner than `b` relative to `now`?
+static inline bool deadline_sooner(uint32_t a, uint32_t b, uint32_t now) {
+  return (a - now) < (b - now);
 }
 
-static void pit1_disable(void) {
-  PIT_TCTRL1 = 0;
-  PIT_TFLG1  = PIT_TFLG_TIF;   // clear flag
+// ============================================================================
+// Nanoseconds to GPT2 ticks
+// ============================================================================
+
+static inline uint32_t ns_to_ticks(uint64_t ns) {
+  uint64_t ticks = ns / NS_PER_TICK;
+  if (ticks < MIN_DELAY_TICKS) ticks = MIN_DELAY_TICKS;
+  if (ticks > MAX_DELAY_TICKS) ticks = MAX_DELAY_TICKS;
+  return (uint32_t)ticks;
 }
 
-// Must be called inside an appropriate critical section.
-static void pit1_client_add(void) {
-  pit1_client_count++;
-  if (pit1_client_count == 1) {
-    pit1_enable();
-  }
+// ============================================================================
+// OCR1 management
+// ============================================================================
+
+static void ocr1_set(uint32_t value) {
+  GPT2_OCR1 = value;
+  GPT2_SR   = GPT_SR_OF1;          // clear any pending flag
+  GPT2_IR  |= GPT_IR_OF1IE;        // enable compare interrupt
 }
 
-// Must be called inside an appropriate critical section.
-static void pit1_client_remove(void) {
-  if (pit1_client_count > 0) {
-    pit1_client_count--;
-  }
-  if (pit1_client_count == 0) {
-    pit1_disable();
-  }
+static void ocr1_disable(void) {
+  GPT2_IR &= ~GPT_IR_OF1IE;        // disable compare interrupt
+  GPT2_SR  = GPT_SR_OF1;           // clear flag
 }
 
-// ================================================================
-// Period Conversion
-// ================================================================
+// Reload OCR1 with the nearest active, non-expired deadline.
+// Call with interrupts disabled.
+static void reload_ocr(void) {
 
-static inline uint32_t period_to_ticks(timepop_class_t klass, uint32_t period) {
-  if (CLASS_DEF[klass].interval == TIMEPOP_INTERVAL_US) {
-    return period / PIT1_TICK_US;
-  }
-  return period;  // ms classes: 1:1
-}
+  uint32_t now = gpt2_count();
+  uint32_t nearest = 0;
+  bool found = false;
 
-// ================================================================
-// PIT0 ISR — Millisecond channel
-// ================================================================
+  for (uint32_t i = 0; i < MAX_SLOTS; i++) {
+    if (!slots[i].active || slots[i].expired) continue;
 
-static void pit0_isr(void) {
-
-  PIT_TFLG0 = PIT_TFLG_TIF;
-  pit0_tick_count++;
-
-  bool any_expired = false;
-
-  for (uint32_t i = 0; i < TIMEPOP_MAX_SLOTS; i++) {
-
-    if (!slots[i].active) continue;
-    if (CLASS_DEF[slots[i].klass].interval != TIMEPOP_INTERVAL_MS) continue;
-
-    if (slots[i].remaining_ticks > 0) {
-      slots[i].remaining_ticks--;
-
-      if (slots[i].remaining_ticks == 0 && !slots[i].expired) {
-        slots[i].expired = true;
-        pit0_zero_hits++;
-        any_expired = true;
-      }
+    if (!found || deadline_sooner(slots[i].deadline, nearest, now)) {
+      nearest = slots[i].deadline;
+      found = true;
     }
   }
 
-  if (any_expired) {
-    timepop_pending = true;
+  if (found) {
+    // If already past, nudge forward to fire ASAP
+    if (deadline_expired(nearest, now)) {
+      nearest = now + MIN_DELAY_TICKS;
+    }
+    ocr1_set(nearest);
+  } else {
+    ocr1_disable();
   }
 }
 
-// ================================================================
-// PIT1 ISR — Microsecond channel
-// ================================================================
+// ============================================================================
+// GPT2 Output Compare ISR
+// ============================================================================
 
-static void pit1_isr(void) {
+static void gpt2_compare_isr(void) {
 
-  PIT_TFLG1 = PIT_TFLG_TIF;
-  pit1_tick_count++;
+  // Capture GPT2_CNT immediately — this is the authoritative
+  // "when did the ISR fire?" timestamp in GNSS ticks.
+  const uint32_t now = GPT2_CNT;
 
-  bool any_expired = false;
+  GPT2_SR = GPT_SR_OF1;
+  isr_fire_count++;
 
-  for (uint32_t i = 0; i < TIMEPOP_MAX_SLOTS; i++) {
+  for (uint32_t i = 0; i < MAX_SLOTS; i++) {
+    if (!slots[i].active || slots[i].expired) continue;
 
-    if (!slots[i].active) continue;
-    if (CLASS_DEF[slots[i].klass].interval != TIMEPOP_INTERVAL_US) continue;
-
-    if (slots[i].remaining_ticks > 0) {
-      slots[i].remaining_ticks--;
-
-      if (slots[i].remaining_ticks == 0 && !slots[i].expired) {
-        slots[i].expired = true;
-        pit1_zero_hits++;
-        any_expired = true;
-      }
+    if (deadline_expired(slots[i].deadline, now)) {
+      slots[i].expired   = true;
+      slots[i].fire_gpt2 = now;
+      expired_count++;
     }
   }
 
-  if (any_expired) {
-    timepop_pending = true;
-  }
+  reload_ocr();
+
+  timepop_pending = true;
 }
 
-// ================================================================
-// Combined PIT ISR dispatcher
-// ================================================================
-
-static void pit_combined_isr(void) {
-
-  if (PIT_TFLG0 & PIT_TFLG_TIF) {
-    pit0_isr();
-  }
-
-  if (PIT_TFLG1 & PIT_TFLG_TIF) {
-    pit1_isr();
-  }
-}
-
-// ================================================================
+// ============================================================================
 // Initialization
-// ================================================================
+// ============================================================================
 
 void timepop_init(void) {
 
-  init_class_definitions();
-
-  for (uint32_t i = 0; i < TIMEPOP_MAX_SLOTS; i++) {
+  // Clear all slots
+  for (uint32_t i = 0; i < MAX_SLOTS; i++) {
     slots[i] = {};
   }
 
-  // --------------------------------------------------------
-  // PIT module clock gate (shared by all channels)
-  // --------------------------------------------------------
-  CCM_CCGR1 |= CCM_CCGR1_PIT(CCM_CCGR_ON);
-  PIT_MCR = 0;
+  // Disable output compare 1 and clear stale flags
+  GPT2_IR &= ~(GPT_IR_OF1IE | GPT_IR_OF2IE | GPT_IR_OF3IE);
+  GPT2_SR  = GPT_SR_OF1 | GPT_SR_OF2 | GPT_SR_OF3;
 
-  // --------------------------------------------------------
-  // PIT0 — Millisecond channel (always running)
-  // --------------------------------------------------------
-  PIT_LDVAL0 = PIT0_LOAD;   // 24 MHz / 24000 = 1 kHz
-  PIT_TCTRL0 = PIT_TCTRL_TEN | PIT_TCTRL_TIE;
-
-  // --------------------------------------------------------
-  // PIT1 — Microsecond channel (initially disabled)
-  // --------------------------------------------------------
-  PIT_TCTRL1 = 0;
-  PIT_TFLG1  = PIT_TFLG_TIF;
-  pit1_client_count = 0;
-
-  // --------------------------------------------------------
-  // Install combined ISR
-  // --------------------------------------------------------
-  attachInterruptVector(IRQ_PIT, pit_combined_isr);
-  NVIC_ENABLE_IRQ(IRQ_PIT);
+  // Install ISR — priority 16 (below PPS at 0)
+  attachInterruptVector(IRQ_GPT2, gpt2_compare_isr);
+  NVIC_SET_PRIORITY(IRQ_GPT2, 16);
+  NVIC_ENABLE_IRQ(IRQ_GPT2);
 }
 
-// ================================================================
-// Arm (internal, shared by both public entry points)
-// ================================================================
+// ============================================================================
+// Arm
+// ============================================================================
 
-static bool timepop_arm_internal(
-  timepop_class_t     klass,
+timepop_handle_t timepop_arm(
+  uint64_t            delay_ns,
   bool                recurring,
-  uint32_t            period_native,   // in ms or µs depending on class
   timepop_callback_t  callback,
-  void*               user_ctx,
+  void*               user_data,
   const char*         name
 ) {
-  if (klass >= TIMEPOP_CLASS_COUNT || !callback) return false;
+  if (!callback) return TIMEPOP_INVALID_HANDLE;
 
-  const timepop_class_def_t& def = CLASS_DEF[klass];
-  const bool is_us = (def.interval == TIMEPOP_INTERVAL_US);
+  bool is_asap = (delay_ns == 0);
 
-  critical_state_t cs = critical_enter();
-
-  for (uint32_t i = 0; i < TIMEPOP_MAX_SLOTS; i++) {
-
-    if (slots[i].active) continue;
-
-    const uint32_t ticks = period_to_ticks(klass, period_native);
-
-    slots[i].active       = true;
-    slots[i].expired      = false;
-    slots[i].recurring    = recurring;
-    slots[i].klass        = klass;
-    slots[i].remaining_ticks = ticks;
-    slots[i].period_ticks = ticks;
-    slots[i].callback     = callback;
-    slots[i].user_ctx     = user_ctx;
-    slots[i].name         = name;
-    slots[i].id           = next_slot_id++;
-
-    if (klass == TIMEPOP_CLASS_ASAP) {
-      // ----------------------------------------------------------
-      // ASAP: expire immediately, no PIT involvement
-      // ----------------------------------------------------------
-      slots[i].remaining_ticks = 0;
-      slots[i].expired         = true;
-      timepop_pending          = true;
-    } else {
-      // Enable PIT1 if this is its first client
-      if (is_us) {
-        pit1_client_add();
-      }
-    }
-
-    critical_exit(cs);
-    return true;
+  uint32_t ticks = 0;
+  if (!is_asap) {
+    ticks = ns_to_ticks(delay_ns);
   }
 
-  critical_exit(cs);
+  noInterrupts();
+
+  for (uint32_t i = 0; i < MAX_SLOTS; i++) {
+    if (slots[i].active) continue;
+
+    timepop_handle_t h = next_handle++;
+    if (next_handle == TIMEPOP_INVALID_HANDLE) next_handle = 1;
+
+    slots[i].active       = true;
+    slots[i].expired      = is_asap;
+    slots[i].recurring    = recurring;
+    slots[i].handle       = h;
+    slots[i].period_ns    = delay_ns;
+    slots[i].period_ticks = ticks;
+    slots[i].callback     = callback;
+    slots[i].user_data    = user_data;
+    slots[i].name         = name;
+    slots[i].fire_gpt2    = 0;
+
+    if (is_asap) {
+      slots[i].deadline = 0;
+      timepop_pending = true;
+    } else {
+      slots[i].deadline = gpt2_count() + ticks;
+      reload_ocr();
+    }
+
+    interrupts();
+    return h;
+  }
+
+  interrupts();
+  return TIMEPOP_INVALID_HANDLE;
+}
+
+// ============================================================================
+// Cancel by handle
+// ============================================================================
+
+bool timepop_cancel(timepop_handle_t handle) {
+  if (handle == TIMEPOP_INVALID_HANDLE) return false;
+
+  noInterrupts();
+
+  for (uint32_t i = 0; i < MAX_SLOTS; i++) {
+    if (slots[i].active && slots[i].handle == handle) {
+      slots[i].active  = false;
+      slots[i].expired = false;
+      reload_ocr();
+      interrupts();
+      return true;
+    }
+  }
+
+  interrupts();
   return false;
 }
 
-// ================================================================
-// Arm (public API — default period)
-// ================================================================
+// ============================================================================
+// Cancel by name
+// ============================================================================
 
-bool timepop_arm(
-  timepop_class_t     klass,
-  bool                recurring,
-  timepop_callback_t  callback,
-  void*               user_ctx,
-  const char*         name
-) {
-  return timepop_arm_internal(
-    klass, recurring,
-    CLASS_DEF[klass].period,
-    callback, user_ctx, name
-  );
-}
+uint32_t timepop_cancel_by_name(const char* name) {
+  if (!name) return 0;
 
-// ================================================================
-// Arm with custom period (public API)
-// ================================================================
+  uint32_t cancelled = 0;
 
-bool timepop_arm_with_period(
-  timepop_class_t     klass,
-  bool                recurring,
-  uint32_t            period,
-  timepop_callback_t  callback,
-  void*               user_ctx,
-  const char*         name
-) {
-  return timepop_arm_internal(
-    klass, recurring,
-    period,
-    callback, user_ctx, name
-  );
-}
+  noInterrupts();
 
-// ================================================================
-// Cancel
-// ================================================================
-
-bool timepop_cancel(timepop_class_t klass) {
-
-  const bool is_us = (CLASS_DEF[klass].interval == TIMEPOP_INTERVAL_US);
-
-  critical_state_t cs = critical_enter();
-
-  for (uint32_t i = 0; i < TIMEPOP_MAX_SLOTS; i++) {
-    if (slots[i].active && slots[i].klass == klass) {
-
+  for (uint32_t i = 0; i < MAX_SLOTS; i++) {
+    if (slots[i].active && slots[i].name &&
+        strcmp(slots[i].name, name) == 0) {
       slots[i].active  = false;
       slots[i].expired = false;
-
-      if (is_us) {
-        pit1_client_remove();
-      }
+      cancelled++;
     }
   }
 
-  critical_exit(cs);
-  return true;
+  if (cancelled > 0) reload_ocr();
+
+  interrupts();
+  return cancelled;
 }
 
-// ================================================================
+// ============================================================================
 // Dispatch (scheduled context)
-// ================================================================
+// ============================================================================
 
 void timepop_dispatch(void) {
 
   if (!timepop_pending) return;
   timepop_pending = false;
 
-  for (uint32_t i = 0; i < TIMEPOP_MAX_SLOTS; i++) {
+  for (uint32_t i = 0; i < MAX_SLOTS; i++) {
 
     if (!slots[i].active || !slots[i].expired) continue;
 
     slots[i].expired = false;
 
+    // Build context with ISR-captured fire time
     timepop_ctx_t ctx;
-    ctx.klass  = slots[i].klass;
-    ctx.cancel = (void (*)(timepop_ctx_t*))((uintptr_t)i);
+    ctx.handle    = slots[i].handle;
+    ctx.fire_gpt2 = slots[i].fire_gpt2;
+    ctx.deadline  = slots[i].deadline;
+    ctx.fire_ns   = (int32_t)(slots[i].fire_gpt2 - slots[i].deadline) * 100;
 
     uint32_t start = ARM_DWT_CYCCNT;
-    slots[i].callback(&ctx, slots[i].user_ctx);
+    slots[i].callback(&ctx, slots[i].user_data);
     uint32_t end   = ARM_DWT_CYCCNT;
 
     cpu_usage_account_busy(end - start);
 
     if (slots[i].active && slots[i].recurring) {
 
-      uint32_t reload = slots[i].period_ticks;
-
-      if (reload == 0) {
-        // Recurring ASAP is forbidden by construction
-        bool is_us = (CLASS_DEF[slots[i].klass].interval == TIMEPOP_INTERVAL_US);
+      if (slots[i].period_ticks == 0) {
+        // Recurring ASAP is nonsensical — retire
         slots[i].active = false;
-        if (is_us) {
-          critical_state_t cs = critical_enter();
-          pit1_client_remove();
-          critical_exit(cs);
-        }
       } else {
-        slots[i].remaining_ticks = reload;
+        // Re-arm from previous deadline to avoid cumulative
+        // dispatch latency drift
+        slots[i].deadline += slots[i].period_ticks;
+
+        // If the new deadline is already past (callback was slow),
+        // reset to now + period
+        uint32_t now = gpt2_count();
+        if (deadline_expired(slots[i].deadline, now)) {
+          slots[i].deadline = now + slots[i].period_ticks;
+        }
+
+        noInterrupts();
+        reload_ocr();
+        interrupts();
       }
 
-    } else {
-      bool was_active = slots[i].active;
-      bool is_us = (CLASS_DEF[slots[i].klass].interval == TIMEPOP_INTERVAL_US);
-
+    } else if (slots[i].active) {
+      // One-shot: retire
       slots[i].active = false;
 
-      if (was_active && is_us) {
-        critical_state_t cs = critical_enter();
-        pit1_client_remove();
-        critical_exit(cs);
-      }
+      noInterrupts();
+      reload_ocr();
+      interrupts();
     }
   }
 }
 
-// ================================================================
+// ============================================================================
 // Introspection
-// ================================================================
+// ============================================================================
 
 uint32_t timepop_active_count(void) {
   uint32_t n = 0;
-  for (uint32_t i = 0; i < TIMEPOP_MAX_SLOTS; i++) {
+  for (uint32_t i = 0; i < MAX_SLOTS; i++) {
     if (slots[i].active) n++;
   }
   return n;
 }
 
-uint32_t timepop_get_pit_tick_count(void) {
-  return pit0_tick_count;
+// ============================================================================
+// TEST command
+// ============================================================================
+
+struct test_context_t {
+  int64_t  arm_gnss_ns;
+  uint64_t requested_ns;
+  uint32_t arm_frag_pps;
+};
+
+static test_context_t test_ctx = {};
+static volatile bool  test_in_flight = false;
+
+static void test_timer_callback(timepop_ctx_t* ctx, void*) {
+
+  // Capture GPT2 at callback entry (for dispatch latency measurement)
+  uint32_t cb_gpt2 = GPT2_CNT;
+
+  int64_t end_gnss_ns = timebase_now_gnss_ns();
+  const timebase_fragment_t* end_frag = timebase_last_fragment();
+
+  int64_t measured_ns = -1;
+  if (test_ctx.arm_gnss_ns >= 0 && end_gnss_ns >= 0) {
+    measured_ns = end_gnss_ns - test_ctx.arm_gnss_ns;
+  }
+
+  int64_t error_ns = -1;
+  if (measured_ns >= 0) {
+    error_ns = measured_ns - (int64_t)test_ctx.requested_ns;
+  }
+
+  // Dispatch latency: how long between ISR fire and callback entry
+  int32_t dispatch_ns = (int32_t)(cb_gpt2 - ctx->fire_gpt2) * 100;
+
+  Payload ev;
+  ev.add("err",         error_ns);
+  ev.add("meas",        measured_ns);
+  ev.add("req",         test_ctx.requested_ns);
+  ev.add("fire_ns",     ctx->fire_ns);       // OCR precision: ISR vs deadline
+  ev.add("dispatch_ns", dispatch_ns);         // dispatch latency: callback vs ISR
+  ev.add("arm_pps",     test_ctx.arm_frag_pps);
+  ev.add("end_pps",     end_frag ? (uint32_t)end_frag->pps_count : (uint32_t)0);
+  ev.add("pps_x",       end_frag ? (int32_t)((uint32_t)end_frag->pps_count - test_ctx.arm_frag_pps) : -1);
+
+  enqueueEvent("TIMEPOP_TEST", ev);
+
+  test_in_flight = false;
 }
 
-uint32_t timepop_get_last_remaining(void) {
-  return 0;
+static Payload cmd_test(const Payload& args) {
+
+  Payload resp;
+
+  if (test_in_flight) {
+    resp.add("error", "test already in flight");
+    return resp;
+  }
+
+  if (!args.has("ns")) {
+    resp.add("error", "specify ns=<nanoseconds>");
+    return resp;
+  }
+
+  uint64_t ns_val = args.getUInt64("ns", 0);
+  if (ns_val == 0) {
+    resp.add("error", "ns must be > 0");
+    return resp;
+  }
+
+  int64_t arm_gnss = timebase_now_gnss_ns();
+  const timebase_fragment_t* arm_frag = timebase_last_fragment();
+
+  test_ctx = {};
+  test_ctx.arm_gnss_ns  = arm_gnss;
+  test_ctx.requested_ns = ns_val;
+  test_ctx.arm_frag_pps = arm_frag ? arm_frag->pps_count : 0;
+
+  timepop_handle_t h = timepop_arm(
+    ns_val, false,
+    test_timer_callback, nullptr, "test"
+  );
+
+  if (h == TIMEPOP_INVALID_HANDLE) {
+    resp.add("error", "arm failed");
+    return resp;
+  }
+
+  test_in_flight = true;
+
+  resp.add("status", "armed");
+  resp.add("req",    ns_val);
+
+  return resp;
 }
 
-uint32_t timepop_get_zero_hits(void) {
-  return pit0_zero_hits;
-}
+// ============================================================================
+// REPORT command
+// ============================================================================
 
-// ================================================================
-// Commands
-// ================================================================
-
-static const char* interval_str(timepop_interval_t iv) {
-  return (iv == TIMEPOP_INTERVAL_US) ? "us" : "ms";
-}
-
-static Payload cmd_report(const Payload& /*args*/) {
+static Payload cmd_report(const Payload&) {
 
   Payload out;
 
-  out.add("pit0_tick_count",    pit0_tick_count);
-  out.add("pit0_zero_hits",     pit0_zero_hits);
-  out.add("pit1_tick_count",    pit1_tick_count);
-  out.add("pit1_zero_hits",     pit1_zero_hits);
-  out.add("pit1_client_count",  (uint32_t)pit1_client_count);
-  out.add("pit1_active",        pit1_client_count > 0);
+  out.add("isr_fires",      isr_fire_count);
+  out.add("expired",        expired_count);
+  out.add("gpt2_cnt",       gpt2_count());
+  out.add("test_in_flight", test_in_flight);
 
   PayloadArray timers;
 
-  for (uint32_t i = 0; i < TIMEPOP_MAX_SLOTS; i++) {
-
+  for (uint32_t i = 0; i < MAX_SLOTS; i++) {
     if (!slots[i].active) continue;
 
-    const timepop_class_def_t& def = CLASS_DEF[slots[i].klass];
-
     Payload entry;
-    entry.add("slot",            i);
-    entry.add("id",              slots[i].id);
-    entry.add("class",           (uint32_t)slots[i].klass);
-    entry.add("name",            slots[i].name ? slots[i].name : "unnamed");
-    entry.add("interval",        interval_str(def.interval));
-    entry.add("period_ticks",    slots[i].period_ticks);
-    entry.add("remaining_ticks", slots[i].remaining_ticks);
-    entry.add("recurring",       slots[i].recurring);
+    entry.add("slot",      i);
+    entry.add("handle",    slots[i].handle);
+    entry.add("name",      slots[i].name ? slots[i].name : "");
+    entry.add("period_ns", slots[i].period_ns);
+    entry.add("ticks",     slots[i].period_ticks);
+    entry.add("deadline",  slots[i].deadline);
+    entry.add("recurring", slots[i].recurring);
 
     timers.add(entry);
   }
@@ -559,12 +508,13 @@ static Payload cmd_report(const Payload& /*args*/) {
   return out;
 }
 
-// ================================================================
-// Registration
-// ================================================================
+// ============================================================================
+// Process registration
+// ============================================================================
 
 static const process_command_entry_t TIMEPOP_COMMANDS[] = {
   { "REPORT", cmd_report },
+  { "TEST",   cmd_test   },
   { nullptr,  nullptr }
 };
 

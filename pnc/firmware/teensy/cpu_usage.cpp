@@ -3,6 +3,12 @@
 #include <Arduino.h>
 
 // ------------------------------------------------------------
+// TimePop delay constants (nanoseconds)
+// ------------------------------------------------------------
+
+static constexpr uint64_t CPU_SAMPLE_PERIOD_NS = 1000000000ULL;  // 1 second
+
+// ------------------------------------------------------------
 // Internal state
 // ------------------------------------------------------------
 
@@ -43,17 +49,14 @@ void cpu_usage_init(void) {
 // ------------------------------------------------------------
 // CPU usage sampler (TimePop recurring task)
 // ------------------------------------------------------------
-//
-// This callback is invoked by TimePop at the cadence defined
-// for TIMEPOP_CLASS_CPU_SAMPLE. No self-rescheduling.
-//
+
 static void cpu_usage_tick(timepop_ctx_t* timer, void* /*user*/) {
   cpu_usage_sample();
 }
 
 void cpu_usage_init_timer(void) {
     timepop_arm(
-      TIMEPOP_CLASS_CPU_SAMPLE,
+      CPU_SAMPLE_PERIOD_NS,
       true,                    // recurring
       cpu_usage_tick,
       nullptr,

@@ -37,6 +37,9 @@
 // Constants
 // =============================================================
 
+static constexpr uint64_t TRANSPORT_RX_POLL_NS = 1000000ULL;  // 1 millisecond
+static constexpr uint64_t TRANSPORT_TX_POLL_NS = 1000000ULL;  // 1 millisecond
+
 static constexpr size_t TRANSPORT_BLOCK_SIZE = 64;
 static constexpr size_t RX_BUF_MAX           = 2048;
 
@@ -582,7 +585,7 @@ void transport_init(void) {
   debug_log("transport", BUILD_FINGERPRINT);
 
   timepop_arm(
-    TIMEPOP_CLASS_RX_POLL,
+    TRANSPORT_RX_POLL_NS,
     true,
     transport_rx_tick,
     nullptr,
@@ -590,7 +593,7 @@ void transport_init(void) {
   );
 
   timepop_arm(
-    TIMEPOP_CLASS_TX_PUMP,
+    TRANSPORT_TX_POLL_NS,
     true,
     transport_tx_pump,
     nullptr,

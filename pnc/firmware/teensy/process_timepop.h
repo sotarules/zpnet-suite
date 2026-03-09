@@ -1,49 +1,25 @@
 #pragma once
 
 // ============================================================================
-// TimePop — Process Interface (Control Plane)
+// TimePop v2 — Process Interface
 // ============================================================================
 //
-// This header exposes TimePop as a managed system process.
+// System initialization and process registration only.
+// General consumers include timepop.h, not this file.
 //
-// It is intended ONLY for:
-//   • system initialization (setup())
-//   • process registration
-//   • diagnostics / reporting (e.g., REPORT command)
-//
-// It must NOT be included by general timer consumers.
-//
-// Dual-PIT Architecture (Symmetric):
-//
-//   PIT0 — Millisecond channel (1 kHz, always running)
-//   PIT1 — Microsecond channel (100 kHz = 10 µs, on-demand)
-//
-//   Both channels use identical scan/decrement/expire logic.
-//   See timepop.h for full architectural documentation.
+// Commands:
+//   REPORT — active timer diagnostics
+//   TEST   — timer accuracy verification { "ns": <uint64> }
 //
 // ============================================================================
 
-// -----------------------------------------------------------------------------
-// Lifecycle
-// -----------------------------------------------------------------------------
+#include "timepop.h"
+#include <stdint.h>
 
-// Initialize TimePop hardware and internal state.
-// Must be called once during system startup *before* timers are used.
-// Configures PIT0 (always on) and PIT1 (initially disabled).
+/// Initialize TimePop hardware (GPT2 output compare).
+/// GPT2 must already be running (process_clocks_init_hardware).
+/// Must be called once during setup().
 void timepop_init(void);
 
-// -----------------------------------------------------------------------------
-// Process Registration
-// -----------------------------------------------------------------------------
-
-// Register the TimePop process with the system process registry.
-// Enables commands such as REPORT.
+/// Register the TIMEPOP process with the command framework.
 void process_timepop_register(void);
-
-// -----------------------------------------------------------------------------
-// TimePop diagnostics (read-only, legacy compatibility)
-// -----------------------------------------------------------------------------
-
-uint32_t timepop_get_pit_tick_count(void);
-uint32_t timepop_get_last_remaining(void);
-uint32_t timepop_get_zero_hits(void);

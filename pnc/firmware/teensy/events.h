@@ -13,7 +13,6 @@
 //   • Draining occurs ONLY in scheduled (non-ISR) context.
 //
 // TimePop integration (kernel standard):
-//   • The event bus tick is armed via timepop_arm(TIMEPOP_CLASS_EVENTBUS, ...).
 //   • The event bus does NOT self-schedule.
 //   • The tick performs work only when g_drain_requested is set.
 //

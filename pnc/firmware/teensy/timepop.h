@@ -4,153 +4,170 @@
 #include <stdbool.h>
 
 // ============================================================================
-// TimePop — Public Timer Interface (Consumer API)
+// TimePop v2 — GPT2 Output Compare Timer System
 // ============================================================================
 //
-// TimePop provides a declarative, class-based timer facility.
-// Consumers declare *roles* (classes), not durations.
+// TimePop provides nanosecond-resolution software timers backed by the
+// GF-8802 GNSS 10 MHz clock on GPT2.
 //
-// • All callbacks execute in scheduled (non-ISR) context
-// • The PIT ISR only marks expiration
-// • TimePop owns all wall-clock semantics
+// The time experience in ZPNet is the GNSS clock.  Period.
 //
-// Dual-PIT Architecture (Symmetric):
+// Architecture:
 //
-//   Every timer class has an interval type: milliseconds or microseconds.
-//   The interval type determines which PIT channel drives the countdown.
-//   All other semantics — arming, dispatch, recurring re-arm, cancel —
-//   are identical regardless of interval type.
+//   GPT2 free-runs at 10 MHz (100 ns/tick), clocked directly by the
+//   GF-8802 GNSS VCLOCK.  This signal is present from power-on —
+//   it is hardware, not firmware-dependent.
 //
-//   PIT0 — Millisecond channel (1 kHz tick, always running)
-//     Drives all ms-class timers.  Always active.
+//   TimePop maintains a priority queue of deadlines expressed as
+//   GPT2 count values.  OCR1 is always loaded with the nearest
+//   deadline.  When the compare matches, an ISR fires and captures
+//   GPT2_CNT at that instant.  This timestamp is carried through
+//   to the callback via the context struct, giving every callback
+//   the exact GNSS tick at which it was triggered — independent
+//   of dispatch latency.
 //
-//   PIT1 — Microsecond channel (100 kHz = 10 µs tick, on-demand)
-//     Drives all µs-class timers.  Enabled automatically when the
-//     first µs client arms, disabled when the last µs client cancels
-//     or completes.  Zero overhead when no µs timers are active.
+// API:
 //
-//   The 10 µs tick gives ample precision for pre-PPS camp-on timing
-//   while keeping PIT1 ISR overhead under 0.5% CPU when active.
+//   Everything speaks nanoseconds.  The conversion is trivial:
 //
-// This header is SAFE for inclusion by any subsystem.
-// No process or control-plane semantics are exposed here.
+//     gpt2_ticks = nanoseconds / 100
+//
+//   No clock domains.  No drift correction.  No conversion ratios.
+//   The timer hardware IS the GNSS clock.
+//
+// Callback Context:
+//
+//   Every callback receives a timepop_ctx_t with:
+//
+//     handle       — for cancellation
+//     fire_gpt2    — GPT2_CNT captured in the ISR at the moment
+//                    the deadline was detected as expired
+//     deadline     — the GPT2 count the timer was targeting
+//
+//   fire_gpt2 - deadline = OCR hardware precision (in ticks)
+//   Multiply by 100 for nanoseconds.
+//
+//   This allows callbacks to know exactly when they were triggered
+//   in GNSS time, regardless of how long dispatch took.
+//
+// Resolution:
+//
+//   100 ns (one GPT2 tick at 10 MHz).
+//   Hardware-precise triggering via output compare.
+//   Zero ISR overhead between timer fires.
+//
+// Wrap handling:
+//
+//   GPT2 is 32-bit.  At 10 MHz it wraps every ~429 seconds.
+//   All deadline comparisons use unsigned delta arithmetic.
+//   Maximum single-shot delay: ~214 seconds (half the wrap range).
+//
+// Concurrency:
+//
+//   Up to 16 timers may be active simultaneously.
+//   Callbacks execute in scheduled (non-ISR) context.
+//
 // ============================================================================
 
+// ============================================================================
+// Timer handle (opaque, for cancellation)
+// ============================================================================
 
-// -----------------------------------------------------------------------------
-// Timer Classes (semantic roles)
-// -----------------------------------------------------------------------------
+typedef uint32_t timepop_handle_t;
+
+static constexpr timepop_handle_t TIMEPOP_INVALID_HANDLE = 0;
+
+// ============================================================================
+// Timer context (passed to callbacks)
+// ============================================================================
 //
-// Each class has a fixed interval type (ms or µs) and a default period.
-// The interval type is an intrinsic property of the class — it cannot
-// be changed at runtime.
+// fire_gpt2:  GPT2_CNT captured in the ISR at the moment the timer
+//             was detected as expired.  This is the authoritative
+//             "when did this fire?" timestamp in GNSS ticks.
 //
-
-typedef enum {
-  // === Millisecond classes (PIT0) ===
-  TIMEPOP_CLASS_ASAP = 0,  // special semantics, no PIT involvement
-  TIMEPOP_CLASS_RX_POLL,
-  TIMEPOP_CLASS_EVENTBUS,
-  TIMEPOP_CLASS_CPU_SAMPLE,
-  TIMEPOP_CLASS_CLOCKS,
-  TIMEPOP_CLASS_GUARD,
-  TIMEPOP_CLASS_PPS_RELAY,
-  TIMEPOP_CLASS_FLASH,
-  TIMEPOP_CLASS_DEBUG_BEACON,
-  TIMEPOP_CLASS_USER_1,
-  TIMEPOP_CLASS_USER_2,
-  TIMEPOP_CLASS_TX_PUMP,
-  TIMEPOP_CLASS_OCXO_DITHER,
-  TIMEPOP_CLASS_PRE_PPS_COARSE,
-  TIMEPOP_CLASS_COUNT,
-} timepop_class_t;
-
-// -----------------------------------------------------------------------------
-// Interval Type (intrinsic per class, not caller-selectable)
-// -----------------------------------------------------------------------------
-
-typedef enum {
-  TIMEPOP_INTERVAL_MS,   // Period expressed in milliseconds, driven by PIT0
-  TIMEPOP_INTERVAL_US,   // Period expressed in microseconds, driven by PIT1
-} timepop_interval_t;
-
-// -----------------------------------------------------------------------------
-// Timer Control Interface (passed to callbacks)
-// -----------------------------------------------------------------------------
+// deadline:   The GPT2 count value the timer was targeting.
+//
+// fire_ns:    fire_gpt2 converted to nanoseconds offset from deadline.
+//             (fire_gpt2 - deadline) * 100.  Positive = ISR arrived
+//             after the ideal moment (normal).
+//
+// handle:     Opaque handle for cancellation.
+//
 
 typedef struct timepop_ctx_t {
-  timepop_class_t klass;
-
-  // Cancel this timer (one-shot or recurring)
-  void (*cancel)(struct timepop_ctx_t* self);
+  timepop_handle_t handle;
+  uint32_t         fire_gpt2;    // GPT2_CNT at ISR entry
+  uint32_t         deadline;     // target GPT2 count
+  int32_t          fire_ns;      // (fire_gpt2 - deadline) * 100
 } timepop_ctx_t;
 
-
-// -----------------------------------------------------------------------------
-// Callback Signature
-// -----------------------------------------------------------------------------
+// ============================================================================
+// Callback signature
+// ============================================================================
 
 typedef void (*timepop_callback_t)(
-  timepop_ctx_t* timer,
-  void*          user_ctx
+  timepop_ctx_t* ctx,
+  void*          user_data
 );
 
+// ============================================================================
+// Arm a timer
+// ============================================================================
+//
+// Schedule a callback to fire after `delay_ns` nanoseconds of GNSS time.
+//
+// Resolution: 100 ns.  Values are rounded down to the nearest 100 ns.
+//
+// If recurring=true, the timer re-arms automatically after each fire
+// with the same delay.
+//
+// Special case: delay_ns=0 means "fire as soon as possible" (ASAP).
+// The callback will execute on the next timepop_dispatch() call.
+// For ASAP timers, fire_gpt2 and deadline will both be 0.
+//
+// Returns a handle for cancellation, or TIMEPOP_INVALID_HANDLE on
+// failure (all slots in use, or callback is null).
+//
 
-// -----------------------------------------------------------------------------
-// Arm / Cancel
-// -----------------------------------------------------------------------------
-
-// Arm a timer by semantic class, using the default period for that class.
-//
-// If recurring=true, the timer automatically re-arms after each fire
-// until explicitly canceled.
-//
-// The interval type (ms or µs) is determined by the class — callers
-// do not specify it.
-//
-// Returns true on success.
-bool timepop_arm(
-  timepop_class_t     klass,
-  bool               recurring,
-  timepop_callback_t callback,
-  void*              user_ctx,
-  const char*        name
+timepop_handle_t timepop_arm(
+  uint64_t            delay_ns,
+  bool                recurring,
+  timepop_callback_t  callback,
+  void*               user_data,
+  const char*         name
 );
 
-// Arm a timer by semantic class with a custom period override.
+// ============================================================================
+// Cancel a timer by handle
+// ============================================================================
 //
-// The period is interpreted in the class's native interval type
-// (ms for ms-classes, µs for µs-classes).  This allows dynamic
-// period computation without changing the class definition.
+// Returns true if a timer was found and cancelled.
 //
-// Returns true on success.
-bool timepop_arm_with_period(
-  timepop_class_t     klass,
-  bool               recurring,
-  uint32_t           period,     // in the class's native units (ms or µs)
-  timepop_callback_t callback,
-  void*              user_ctx,
-  const char*        name
-);
 
-// Cancel a timer by class.
-// Safe to call multiple times.
-bool timepop_cancel(timepop_class_t klass);
+bool timepop_cancel(timepop_handle_t handle);
 
+// ============================================================================
+// Cancel all timers with a given name
+// ============================================================================
+//
+// Returns the number of timers cancelled.
+//
 
-// -----------------------------------------------------------------------------
+uint32_t timepop_cancel_by_name(const char* name);
+
+// ============================================================================
 // Dispatch
-// -----------------------------------------------------------------------------
+// ============================================================================
+//
+// Process expired timers.  Must be called from the main loop.
+// All callbacks execute in this context (non-ISR).
+//
 
-// Dispatch expired timers.
-// Must be called from scheduled (non-ISR) runtime context.
 void timepop_dispatch(void);
 
+// ============================================================================
+// Introspection
+// ============================================================================
 
-// -----------------------------------------------------------------------------
-// Introspection (lightweight, consumer-safe)
-// -----------------------------------------------------------------------------
-
-// Return number of active timers.
-// Intended for debugging and visibility only.
+/// Number of currently active timers.
 uint32_t timepop_active_count(void);

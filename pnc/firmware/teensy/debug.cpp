@@ -14,6 +14,13 @@
 //   • Physical transmission is handled by transport TX pump.
 //   • No async scheduling required here.
 //
+// Blink facility:
+//   • Uses DWT cycle-counting busy-wait (not delay()/millis()).
+//   • Works with interrupts disabled.
+//   • Works in hard fault handlers.
+//   • Works at any CPU clock speed.
+//   • No SysTick dependency.
+//
 
 #include "debug.h"
 #include "transport.h"
@@ -23,6 +30,42 @@
 #include <stdint.h>
 #include <string.h>
 #include <stdio.h>
+
+// =============================================================
+// DWT-based busy-wait (fault-safe, ISR-safe, clock-safe)
+// =============================================================
+//
+// Uses ARM DWT cycle counter for timing.  Does not depend on
+// SysTick, millis(), delay(), or any ISR.  Works correctly
+// even inside hard fault handlers with interrupts disabled.
+//
+// F_CPU_ACTUAL is a runtime global updated by set_arm_clock().
+// At 1008 MHz: 1 ms = 1,008,000 cycles.
+// At 600 MHz:  1 ms = 600,000 cycles.
+//
+
+static void dwt_delay_ms(uint32_t ms) {
+  if (ms == 0) return;
+
+  // Ensure DWT is enabled (may not be if called very early or in fault)
+  ARM_DEMCR |= ARM_DEMCR_TRCENA;
+  ARM_DWT_CTRL |= ARM_DWT_CTRL_CYCCNTENA;
+
+  // Compute cycles to wait.
+  // F_CPU_ACTUAL may be 0 if called before set_arm_clock().
+  // Fall back to 600 MHz (default Teensy 4.1 clock).
+  uint32_t freq = F_CPU_ACTUAL;
+  if (freq == 0) freq = 600000000UL;
+
+  uint32_t cycles_per_ms = freq / 1000;
+
+  for (uint32_t i = 0; i < ms; i++) {
+    uint32_t start = ARM_DWT_CYCCNT;
+    while ((ARM_DWT_CYCCNT - start) < cycles_per_ms) {
+      // spin
+    }
+  }
+}
 
 // =============================================================
 // Initialization
@@ -207,8 +250,15 @@ void debug_log(const char* name, const uint8_t* buf, size_t len) {
 }
 
 // =============================================================
-// Blink primitive (physical, unchanged)
+// Blink facility (DWT-based, fault-safe)
 // =============================================================
+//
+// Pattern digits define blink duration units.
+// Example: "911" = 9-unit ON, 1-unit ON, 1-unit ON
+//
+// Uses dwt_delay_ms() — works with interrupts disabled,
+// works inside hard fault handlers, works at any CPU clock.
+//
 
 static constexpr uint32_t BLINK_UNIT_MS  = 150;
 static constexpr uint32_t BLINK_GAP_MS   = 150;
@@ -227,10 +277,10 @@ void debug_blink(const char* pattern) {
     if (units == 0) continue;
 
     digitalWrite(LED_BUILTIN, HIGH);
-    delay(units * BLINK_UNIT_MS);
+    dwt_delay_ms(units * BLINK_UNIT_MS);
     digitalWrite(LED_BUILTIN, LOW);
-    delay(BLINK_GAP_MS);
+    dwt_delay_ms(BLINK_GAP_MS);
   }
 
-  delay(PATTERN_GAP_MS);
+  dwt_delay_ms(PATTERN_GAP_MS);
 }

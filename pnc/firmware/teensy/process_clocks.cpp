@@ -42,11 +42,11 @@
 //
 // Pre-PPS Software TDC (Time-to-Digital Converter):
 //
-//   Two-stage timer chain + spin loop + deterministic correction.
-//
-//   Stage 1 (coarse, PIT0): 998 ms after PPS.
-//   Stage 2 (fine, PIT1):   999 µs after coarse.
-//   Spin loop:              ~400 µs until PPS edge.
+//   TimePop schedules a callback 999 ms after PPS (in GNSS time).
+//   The callback enters a DWT spin loop with BASEPRI masking,
+//   waiting for the PPS ISR to fire.  The spin loop captures
+//   the DWT shadow register immediately before the PPS edge,
+//   enabling sub-nanosecond TDC correction.
 //
 // PPS relay to Pi:
 //
@@ -61,7 +61,7 @@
 //
 //   Immediately after the three hardware snapshots in the ISR,
 //   pin 32 is driven HIGH.  Deferred follow-on work is handed
-//   off via TIMEPOP_CLASS_ASAP.  Scheduled context then arms a
+//   off via ASAP (delay_ns=0).  Scheduled context then arms a
 //   one-shot TimePop that fires 500 ms later to drive pin 32 LOW.
 //
 // ============================================================================
@@ -98,6 +98,14 @@ static inline uint32_t dwt_cycles_to_ns_32(uint32_t cycles) {
 static inline uint64_t dwt_ns_to_cycles(uint64_t ns) {
   return (ns * DWT_NS_DEN) / DWT_NS_NUM;
 }
+
+// ============================================================================
+// TimePop delay constants (nanoseconds)
+// ============================================================================
+
+static constexpr uint64_t OCXO_DITHER_NS   =     1000000ULL;  //   1 ms
+static constexpr uint64_t PPS_RELAY_OFF_NS  =   500000000ULL;  // 500 ms
+static constexpr uint64_t PRE_PPS_NS        =   999000000ULL;  // 999 ms
 
 // ============================================================================
 // Campaign State
@@ -508,7 +516,7 @@ static void ocxo_calibration_servo(void) {
 }
 
 // ============================================================================
-// Pre-PPS dispatch latency profiling — two-stage spin loop
+// Pre-PPS dispatch latency profiling — spin loop
 // ============================================================================
 
 static inline void mask_low_priority_irqs(uint8_t pri) {
@@ -561,7 +569,7 @@ static void pre_pps_fine_cb(timepop_ctx_t*, void*) {
 }
 
 static void pre_pps_arm(void) {
-  timepop_arm(TIMEPOP_CLASS_PRE_PPS_COARSE, false, pre_pps_fine_cb, nullptr, "pre-pps");
+  timepop_arm(PRE_PPS_NS, false, pre_pps_fine_cb, nullptr, "pre-pps");
 }
 
 // ============================================================================
@@ -576,14 +584,14 @@ static void pps_asap_callback(timepop_ctx_t*, void*) {
     relay_arm_pending = false;
     if (!relay_timer_active) {
       relay_timer_active = true;
-      timepop_arm(TIMEPOP_CLASS_PPS_RELAY, false, pps_relay_deassert, nullptr, "pps-relay-off");
+      timepop_arm(PPS_RELAY_OFF_NS, false, pps_relay_deassert, nullptr, "pps-relay-off");
     }
   }
 
   if (request_stop) {
     campaign_state = clocks_campaign_state_t::STOPPED;
     request_stop   = false;
-    timepop_cancel(TIMEPOP_CLASS_PRE_PPS_COARSE);
+    timepop_cancel_by_name("pre-pps");
     dispatch_shadow_valid = false;
     pps_fired             = true;
     calibrate_ocxo_active = false;
@@ -797,7 +805,7 @@ static void pps_isr(void) {
   if (pps_scheduled) return;
   pps_scheduled = true;
 
-  timepop_arm(TIMEPOP_CLASS_ASAP, false, pps_asap_callback, nullptr, "pps");
+  timepop_arm(0, false, pps_asap_callback, nullptr, "pps");
 }
 
 // ============================================================================
@@ -1177,7 +1185,23 @@ void process_clocks_register(void) {
 }
 
 // ============================================================================
-// Initialization
+// Initialization — Phase 1 (hardware only, no TimePop dependency)
+// ============================================================================
+//
+// Starts DWT, GPT2 (GNSS VCLOCK), and GPT1 (OCXO).
+// Must be called BEFORE timepop_init() so that GPT2 is running
+// when TimePop installs its output compare ISR.
+//
+// Safe to call multiple times (all three are idempotent).
+
+void process_clocks_init_hardware(void) {
+  dwt_enable();
+  arm_gpt2_external();
+  arm_gpt1_external();
+}
+
+// ============================================================================
+// Initialization — Phase 2 (full lifecycle, requires TimePop)
 // ============================================================================
 
 void process_clocks_init(void) {
@@ -1187,11 +1211,7 @@ void process_clocks_init(void) {
   analogWriteResolution(12);
   ocxo_dac_set((double)OCXO_DAC_DEFAULT);
 
-  timepop_arm(TIMEPOP_CLASS_OCXO_DITHER, true, ocxo_dither_cb, nullptr, "ocxo-dither");
-
-  dwt_enable();
-  arm_gpt2_external();
-  arm_gpt1_external();
+  timepop_arm(OCXO_DITHER_NS, true, ocxo_dither_cb, nullptr, "ocxo-dither");
 
   pinMode(GNSS_PPS_PIN,   INPUT);
   pinMode(GNSS_LOCK_PIN,  INPUT);

@@ -25,6 +25,8 @@
 #include "debug.h"
 #include "transport.h"   // <-- NEW (for transport_get_info)
 
+static constexpr uint64_t FLASH_DELAY_NS = 5000000000ULL;  // 5 seconds
+
 // --------------------------------------------------------------
 // Forward declarations (terminal paths)
 // --------------------------------------------------------------
@@ -424,10 +426,9 @@ static Payload cmd_memory_info(const Payload& /*args*/) {
 // ------------------------------------------------------------
 static Payload cmd_enter_bootloader(const Payload& /*args*/) {
 
-  // Schedule transition so command path can return cleanly
   timepop_arm(
-    TIMEPOP_CLASS_FLASH,
-    false,                 // one-shot
+    FLASH_DELAY_NS,
+    false,
     enter_bootloader_cb,
     nullptr,
     "bootloader-flash"
