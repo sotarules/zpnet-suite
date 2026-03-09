@@ -1123,10 +1123,6 @@ def _process_loop() -> None:
             "diag_raw_isr_cyc": frag.get("diag_raw_isr_cyc"),
             "diag_raw_shadow_cyc": frag.get("diag_raw_shadow_cyc"),
 
-            # TIMEPULSE diagnostics (from TIMEBASE_FRAGMENT)
-            "timepulse_ticks_at_pps": frag.get("timepulse_ticks_at_pps"),
-            "timepulse_phase_error_ns": frag.get("timepulse_phase_error_ns"),
-
             # OCXO control state
             "ocxo_dac": frag.get("ocxo_dac"),
             "calibrate_ocxo": frag.get("calibrate_ocxo"),

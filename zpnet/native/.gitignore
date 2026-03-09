@@ -1,2 +1,0 @@
-# Built shared libraries — rebuild on Pi with `make`
-*.so
