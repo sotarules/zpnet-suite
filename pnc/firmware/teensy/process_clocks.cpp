@@ -197,6 +197,27 @@ static constexpr uint32_t ISR_GNSS_EXPECTED =   10000000u;
 static constexpr uint32_t ISR_OCXO_EXPECTED =   10000000u;
 
 // ============================================================================
+// PPS VCLOCK validation — reject spurious edges
+// ============================================================================
+//
+// A legitimate PPS edge arrives when the GNSS VCLOCK (10 MHz, phase-locked)
+// crosses a multiple of 10,000,000.  We validate by checking:
+//
+//   remainder = (snap_gnss - isr_prev_gnss) % 10,000,000
+//
+// The tolerance accounts for OCXO discipline steering (sub-ppb) and the
+// ISR entry latency (~50 ns = ~0.5 ticks at 10 MHz).  A spurious edge
+// at a random point in the second fails by millions of ticks.
+//
+// The first edge after START/RECOVER has isr_prev_gnss == 0, so we skip
+// validation when isr_residual_valid is false.
+
+static constexpr uint32_t PPS_VCLOCK_TOLERANCE = 5;  // ±500 ns at 10 MHz
+
+static volatile uint32_t diag_pps_rejected_total   = 0;
+static volatile uint32_t diag_pps_rejected_remainder = 0;
+
+// ============================================================================
 // Pre-PPS dispatch latency profiling (DWT spin loop)
 // ============================================================================
 
@@ -750,6 +771,8 @@ static void pps_asap_callback(timepop_ctx_t*, void*) {
     p.add("diag_raw_shadow_cyc", (uint32_t)isr_captured_shadow_dwt);
     p.add("diag_isr_dwt_cycles", snap_dwt_cycles);
     p.add("diag_isr_dwt_ns",     snap_dwt_ns);
+    p.add("diag_pps_rejected_total",     diag_pps_rejected_total);
+    p.add("diag_pps_rejected_remainder", diag_pps_rejected_remainder);
 
     p.add("dbg_approach_gpt2_cnt",    diag_approach_gpt2_cnt);
     p.add("dbg_approach_gnss_last32", diag_approach_gnss_last32);
@@ -776,6 +799,24 @@ static void pps_isr(void) {
   const uint32_t snap_dwt  = DWT_CYCCNT;
   const uint32_t snap_gnss = GPT2_CNT;
   const uint32_t snap_ocxo = GPT1_CNT;
+
+  // ── VCLOCK validation: reject spurious PPS edges ──
+  //
+  // If we have a previous GNSS snapshot, check that the elapsed
+  // VCLOCK ticks are within tolerance of a 10,000,000 boundary.
+  // Skip on first edge (isr_residual_valid == false).
+  if (isr_residual_valid) {
+    uint32_t elapsed = snap_gnss - isr_prev_gnss;
+    uint32_t remainder = elapsed % ISR_GNSS_EXPECTED;
+    // remainder is in [0, 9999999].  Valid edges land near 0 or near 10M.
+    if (remainder > PPS_VCLOCK_TOLERANCE &&
+        remainder < (ISR_GNSS_EXPECTED - PPS_VCLOCK_TOLERANCE)) {
+      // Spurious edge — reject silently, do not update any state.
+      diag_pps_rejected_total++;
+      diag_pps_rejected_remainder = remainder;
+      return;
+    }
+  }
 
   isr_captured_shadow_dwt = dispatch_shadow_dwt;
   pps_fired               = true;
@@ -1148,6 +1189,9 @@ static Payload cmd_clocks_info(const Payload&) {
   p.add("diag_timeouts",      diag_timeout_count);
   p.add("diag_fine_was_late", diag_fine_was_late);
   p.add("diag_spin_iters",    diag_spin_iterations);
+
+  p.add("pps_rejected_total",     diag_pps_rejected_total);
+  p.add("pps_rejected_remainder", diag_pps_rejected_remainder);
 
   return p;
 }
