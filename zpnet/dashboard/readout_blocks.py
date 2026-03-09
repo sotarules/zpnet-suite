@@ -27,7 +27,6 @@ log = logging.getLogger("zpnet.dashboard")
 def get_system_snapshot() -> dict:
     return send_command(machine="PI", subsystem="SYSTEM", command="REPORT")["payload"]
 
-
 def get_teensy_clocks_report() -> dict:
     return send_command(machine="TEENSY", subsystem="CLOCKS", command="REPORT")["payload"]
 
@@ -103,7 +102,7 @@ def gnss_report_readout() -> Generator[str, None, None]:
 # CLOCKS — shared helpers
 # ---------------------------------------------------------------------
 
-_CLOCK_DOMAINS = [("GNSS", "gnss"), ("DWT", "dwt"), ("PI", "pi"), ("OCXO", "ocxo")]
+_CLOCK_DOMAINS = [("GNSS", "gnss"), ("DWT", "dwt"), ("OCXO", "ocxo")]
 
 
 def _get_clocks_baseline() -> dict | None:

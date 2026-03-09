@@ -123,8 +123,7 @@ I2C_SENSORS_BY_BUS = {
         0x41: "INA260 0x41 (5v Rail+",
         0x44: "INA260 0x44 (12v Rail)",
         0x66: "EV5491 0x66 (Laser Controller)",
-        0x76: "BME280 0x76 (Environment)",
-        #0x68: "DS3231 0x68 (RTC1)",
+        0x76: "BME280 0x76 (Environment)"
         # 0x57 will appear via scan but is ignored (EEPROM)
     },
 
@@ -132,8 +131,7 @@ I2C_SENSORS_BY_BUS = {
         0x40: "INA260 0x40 (Pi Domain)",
         0x41: "INA260 0x41 (24V Rail / Motors)",
         0x44: "INA260 0x44 (OCXO Domain)",
-        0x45: "INA260 0x45 (Teensy Domain)",
-        0x68: "DS3231 0x68 (RTC2)",
+        0x45: "INA260 0x45 (Teensy Domain)"
         # 0x57 will appear via scan but is ignored (EEPROM)
     },
 }
@@ -559,7 +557,7 @@ def build_sensor_scan_status() -> dict:
         snapshot[f"i2c-{bus_id}"] = results
 
         try:
-            with open_i2c(I2C_BUS_LEGACY) as bus:
+            with open_i2c(bus_id) as bus:
                 for addr, label in devices.items():
 
                     if addr in I2C_IGNORE_ADDRS:
