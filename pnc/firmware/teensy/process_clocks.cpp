@@ -1322,8 +1322,4 @@ void process_clocks_init(void) {
 
   attachInterrupt(digitalPinToInterrupt(GNSS_PPS_PIN), pps_isr, RISING);
   NVIC_SET_PRIORITY(IRQ_GPIO6789, 0);
-
-  // TIMEPULSE retired. Keep relay pin quiescent.
-  pinMode(GNSS_10KHZ_RELAY, OUTPUT);
-  digitalWriteFast(GNSS_10KHZ_RELAY, LOW);
 }

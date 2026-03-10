@@ -180,22 +180,3 @@ static const uint32_t PHOTODIODE_OFF_STABLE_MS = 20;
 // --------------------------------------------------------------
 static const float ADC_FS_VOLTS  = 3.3f;
 static const float ADC_FS_COUNTS = 4095.0f;
-
-// --------------------------------------------------------------
-// TIMEPULSE 10 KHz relay and quantized clock constants
-// --------------------------------------------------------------
-
-static const int GNSS_10KHZ_RELAY = 9;
-
-// GPT2 output compare half-period: 500 GNSS ticks = 50 µs.
-// The ISR toggles on each match, producing a 10 KHz square wave
-// (full period = 1,000 GNSS ticks = 100 µs).
-// TIMEPULSE advances the quantized clock on the rising edge only.
-static constexpr uint32_t TIMEPULSE_GNSS_HALF_PERIOD = 500;
-
-// Full period in GNSS ticks (diagnostic / documentation only).
-static constexpr uint32_t TIMEPULSE_GNSS_FULL_PERIOD = 1000;
-
-// Nanoseconds per TIMEPULSE tick.
-// 100 µs = 100,000 ns.  10,000 ticks × 100,000 ns = 1 second.
-static constexpr uint64_t TIMEPULSE_NS_PER_TICK = 100000;

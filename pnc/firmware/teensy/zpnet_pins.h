@@ -20,7 +20,6 @@
  This file WILL change.
  That is expected.
 
- REVISION: 2026-02-28 — Added GNSS_10KHZ_RELAY (Teensy pin 9 → Pi GPIO25)
 ===============================================================================
 */
 
@@ -76,8 +75,6 @@ IO18 (GPIO18)     Orange        GNSS_PPS_RELAY     GF-8802 PPS via Teensy       
 IO23 (GPIO23)     Green         SDA2               Rail SDA2 (Green)              Secondary I2C data (Bus 2)
 IO24 (GPIO24)     Orange        SCL2               Rail SCL2 (Orange)             Secondary I2C clock (Bus 2)
 
-IO25 (GPIO25)     TBD           GNSS_10KHZ_RELAY   Teensy pin 9 via STP           10 kHz GNSS clock relay (critical timing)
-
 ---------------------------------------------------------------------------------------
 Notes:
 • Bus 1 uses hardware I2C (SDA/SCL).
@@ -85,10 +82,6 @@ Notes:
 • Bus 2 is wired but not yet energized.
 • Pi power is isolated via its own INA260 on Bus 2.
 • No Pi GPIO is exposed to 5V signaling.
-• GNSS_10KHZ_RELAY provides 10,000 GNSS-phase-locked edges per second
-  for sub-microsecond Timebase interpolation.
-• STP shield for GNSS_10KHZ_RELAY is drained at the Teensy end only
-  (same convention as GNSS_PPS_RELAY and OCXO signals).
 =============================================================================*/
 
 
@@ -102,10 +95,6 @@ VIN           White         VIN_5V5            INA260 (5.5 V rail)              
 GND           Black         GND                Battery branching ground             Direct return to battery
 
 1             Orange        GNSS_PPS_IN        GNSS PPS                             1 Hz pulse for absolute time reference
-
-9             Twisted Pair  GNSS_10KHZ_RELAY   Pi GPIO25 via STP                    10 kHz GNSS clock relay output
-                                                                                     GPT2 compare ISR toggles every 1000 GNSS ticks
-                                                                                     Shield drained at Teensy GND (dupont header)
 
 20            White         LASER_PD_PLUS      Laser diode PD+                      Indicates laser on/off (active signal)
 
@@ -138,7 +127,6 @@ Notes:
 • VIN and GND belong to isolated CPU power domain.
 • Laser PD+ is intentionally monitored (not parked).
 • GNSS_VCLOCK is passively clamped to protect Teensy input.
-• GNSS_10KHZ_RELAY uses STP with shield drained at Teensy end only,
   consistent with all other timing-critical signals.
 • GND for the STP shield drain uses dupont female header (not screw terminal),
   as screw terminals are fully committed.
