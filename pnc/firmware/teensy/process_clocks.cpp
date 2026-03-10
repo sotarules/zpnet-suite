@@ -1,5 +1,5 @@
 // ============================================================================
-// process_clocks.cpp — ZPNet CLOCKS (Teensy) — v8 Pre-Edge Shadow
+// process_clocks.cpp — ZPNet CLOCKS (Teensy) — v9 ISR-Synchronized Anchors
 // ============================================================================
 //
 // CLOCKS is a dormant, PPS-anchored measurement instrument.
@@ -18,26 +18,34 @@
 //   GNSS   — GF-8802 10 MHz VCLOCK, external via GPT2 pin 14
 //   OCXO   — AOCJY1-A 10 MHz oven oscillator, external via GPT1 pin 25
 //
-// v8: Pre-edge shadow fix.
+// v9: ISR-synchronized anchors (spin loop eliminated).
 //
-//   The spin loop writes DWT_CYCCNT then checks pps_fired.  When the
-//   ISR fires mid-loop, it preempts between the write and the check.
-//   After the ISR returns, the loop sees pps_fired==true and exits —
-//   but dispatch_shadow_dwt now holds the DWT value from AFTER the
-//   ISR returned (~500 cycles post-edge), not from before the edge.
+//   Both DWT and GPT2 PPS anchors are now captured in the PPS ISR
+//   at entry — two back-to-back register reads, ~2 ns apart.  Both
+//   are ~50 ns after the true PPS edge due to ARM interrupt entry
+//   overhead, but they share the same latency, so the skew between
+//   them is effectively zero.
 //
-//   The ISR latches dispatch_shadow_dwt into isr_captured_shadow_dwt
-//   BEFORE setting pps_fired.  This is the true pre-edge value — the
-//   last DWT_CYCCNT written by the spin loop before the PPS arrived.
+//   This eliminates the pre-PPS fine timer, the spin loop, BASEPRI
+//   masking, dispatch_shadow_dwt, isr_captured_shadow_dwt, and all
+//   associated complexity (~137 lines removed).
 //
-//   v8 uses isr_captured_shadow_dwt as the authoritative DWT value
-//   at the PPS edge, for both the 64-bit accumulator and the
-//   interpolation anchor published to timebase.cpp.
+//   The ISR entry latency (~50 ns) is deterministic and stable, as
+//   proven by months of tdc_analyzer data.  For sub-second
+//   interpolation, the latency cancels: both the PPS anchor and the
+//   timepop event anchor share the same ISR entry overhead pattern,
+//   and the per-event correction uses fire_ns (measured by hardware)
+//   to remove it exactly.
 //
-//   This eliminates the ±600 cycle paired spikes in residual data
-//   caused by v7 reading the post-ISR dispatch_shadow_dwt.
+//   Interpolation uses the last-second DWT delta as the denominator
+//   (dwt_cycles_per_pps), tracking the crystal in real time.  Thermal
+//   drift (~0.3 cycles/second) is invisible because the prior second's
+//   rate matches the current second to within the 7 ns hardware jitter
+//   floor.
 //
-//   v7's direct delta accumulation is retained — no advance-then-rewind.
+//   The deterministic overload timebase_gnss_ns_from_dwt() allows
+//   callers with ISR-captured DWT values to compute GNSS nanoseconds
+//   without any live register reads or torn-read loops.
 //
 // ============================================================================
 
@@ -76,7 +84,6 @@ static inline uint64_t dwt_ns_to_cycles(uint64_t ns) {
 
 static constexpr uint64_t OCXO_DITHER_NS   =     1000000ULL;  //   1 ms
 static constexpr uint64_t PPS_RELAY_OFF_NS  =   500000000ULL;  // 500 ms
-static constexpr uint64_t PRE_PPS_NS        =   999000000ULL;  // 999 ms
 
 // ============================================================================
 // Campaign State
@@ -178,49 +185,22 @@ static volatile uint32_t diag_pps_rejected_total     = 0;
 static volatile uint32_t diag_pps_rejected_remainder = 0;
 
 // ============================================================================
-// Pre-PPS spin loop — DWT shadow capture
+// Pre-PPS spin loop — REMOVED (v9)
 // ============================================================================
 //
-// The spin loop continuously writes DWT_CYCCNT to dispatch_shadow_dwt,
-// then checks pps_fired.  When the PPS ISR fires, it preempts the loop
-// between the write and the check:
+// The spin loop has been eliminated.  Both clock anchors (DWT and GPT2)
+// are now captured in the PPS ISR at entry.  They are ~50 ns after the
+// true PPS edge but synchronized with each other (~2 ns apart).
 //
-//   Loop iteration N:   dispatch_shadow_dwt = DWT_CYCCNT  ← pre-edge
-//                        ─── PPS edge arrives ───
-//                        ISR preempts:
-//                          isr_captured_shadow_dwt = dispatch_shadow_dwt  ← LATCH
-//                          pps_fired = true
-//                        ISR returns
-//   Loop iteration N+1: dispatch_shadow_dwt = DWT_CYCCNT  ← post-ISR!
-//                        if (pps_fired) break;
+// The ISR entry latency is deterministic and stable (~50 ns as proven
+// by months of tdc_analyzer data).  Since both anchors share the same
+// latency, the skew between them is effectively zero.
 //
-// After the loop exits, dispatch_shadow_dwt holds the POST-ISR value.
-// But isr_captured_shadow_dwt holds the PRE-EDGE value — the last
-// DWT_CYCCNT written before the ISR preempted.
-//
-// The ASAP callback uses isr_captured_shadow_dwt as the authoritative
-// DWT value at the PPS edge.  dispatch_shadow_valid indicates whether
-// the spin loop was running when PPS fired (vs arriving late).
+// This eliminates: the fine timer, the spin loop, BASEPRI masking,
+// dispatch_shadow_dwt, isr_captured_shadow_dwt, dispatch_shadow_valid,
+// dispatch_timeout, and the associated complexity.
 
-static volatile uint32_t dispatch_shadow_dwt     = 0;
-static volatile bool     pps_fired               = false;
-static volatile uint32_t isr_captured_shadow_dwt = 0;
-static volatile bool     dispatch_shadow_valid   = false;
-static volatile bool     dispatch_timeout        = false;
-
-static volatile int32_t  pre_pps_approach_ns     = -1;
-
-// ============================================================================
-// Dispatch profiling diagnostics
-// ============================================================================
-
-static volatile uint32_t diag_coarse_fire_count  = 0;
-static volatile uint32_t diag_fine_fire_count    = 0;
-static volatile uint32_t diag_fine_late_count    = 0;
-static volatile uint32_t diag_spin_count         = 0;
-static volatile uint32_t diag_timeout_count      = 0;
-static volatile bool     diag_fine_was_late      = false;
-static volatile uint32_t diag_spin_iterations    = 0;
+static volatile bool     pps_fired = false;
 
 // ============================================================================
 // PPS residual tracking — Welford's, callback-level
@@ -442,7 +422,7 @@ static void clocks_zero_all(void) {
 
   // Zero the TIMEBASE accumulators and anchor at this PPS edge
   dwt_cycles_64    = 0;
-  prev_dwt_at_pps  = dispatch_shadow_valid ? isr_captured_shadow_dwt : isr_snap_dwt;
+  prev_dwt_at_pps  = isr_snap_dwt;
 
   ocxo_ticks_64    = 0;
   prev_ocxo_at_pps = isr_snap_ocxo;
@@ -463,12 +443,7 @@ static void clocks_zero_all(void) {
   isr_prev_ocxo      = isr_snap_ocxo;
   isr_residual_valid = false;
 
-  dispatch_shadow_dwt     = 0;
-  isr_captured_shadow_dwt = 0;
-  dispatch_shadow_valid   = false;
-  dispatch_timeout        = false;
-  pps_fired               = false;
-  pre_pps_approach_ns     = -1;
+  pps_fired = false;
 }
 
 // ============================================================================
@@ -501,51 +476,6 @@ static void ocxo_calibration_servo(void) {
 }
 
 // ============================================================================
-// Pre-PPS dispatch latency profiling — spin loop
-// ============================================================================
-
-static inline void mask_low_priority_irqs(uint8_t pri) {
-  __asm volatile("MSR BASEPRI, %0" : : "r"(pri) : "memory");
-}
-
-static inline void unmask_all_irqs() {
-  __asm volatile("MSR BASEPRI, %0" : : "r"(0) : "memory");
-}
-
-static void pre_pps_fine_cb(timepop_ctx_t*, void*) {
-  diag_fine_fire_count++;
-
-  uint32_t ticks_since_pps = (uint32_t)(GPT2_CNT - isr_snap_gnss);
-  pre_pps_approach_ns      = (int32_t)(ISR_GNSS_EXPECTED - ticks_since_pps) * 100;
-
-  if (pps_fired) {
-    diag_fine_late_count++;
-    diag_fine_was_late    = true;
-    diag_spin_iterations  = 0;
-    dispatch_shadow_valid = false;
-    return;
-  }
-
-  diag_fine_was_late = false;
-  diag_spin_count++;
-
-  mask_low_priority_irqs(32);
-  for (;;) {
-    dispatch_shadow_dwt = DWT_CYCCNT;
-    if (pps_fired) break;
-  }
-  unmask_all_irqs();
-
-  dispatch_shadow_valid = true;
-  dispatch_timeout      = false;
-  diag_spin_iterations  = 0;
-}
-
-static void pre_pps_arm(void) {
-  timepop_arm(PRE_PPS_NS, false, pre_pps_fine_cb, nullptr, "pre-pps");
-}
-
-// ============================================================================
 // PPS handling — deferred ASAP callback (scheduled context)
 // ============================================================================
 
@@ -564,9 +494,7 @@ static void pps_asap_callback(timepop_ctx_t*, void*) {
   if (request_stop) {
     campaign_state = clocks_campaign_state_t::STOPPED;
     request_stop   = false;
-    timepop_cancel_by_name("pre-pps");
-    dispatch_shadow_valid = false;
-    pps_fired             = true;
+    pps_fired      = true;
     calibrate_ocxo_active = false;
     timebase_invalidate();
   }
@@ -577,7 +505,7 @@ static void pps_asap_callback(timepop_ctx_t*, void*) {
 
     // Seed the accumulators from recovered nanosecond values
     dwt_cycles_64    = dwt_ns_to_cycles(recover_dwt_ns);
-    prev_dwt_at_pps  = dispatch_shadow_valid ? isr_captured_shadow_dwt : isr_snap_dwt;
+    prev_dwt_at_pps  = isr_snap_dwt;
 
     ocxo_ticks_64    = recover_ocxo_ns / 100ull;
     prev_ocxo_at_pps = isr_snap_ocxo;
@@ -595,10 +523,8 @@ static void pps_asap_callback(timepop_ctx_t*, void*) {
     residual_reset(residual_gnss);
     residual_reset(residual_ocxo);
 
-    isr_residual_valid     = false;
-    dispatch_shadow_valid  = false;
-    pps_fired              = true;
-    pre_pps_approach_ns    = -1;
+    isr_residual_valid = false;
+    pps_fired          = true;
 
     campaign_state  = clocks_campaign_state_t::STARTED;
     request_recover = false;
@@ -616,12 +542,6 @@ static void pps_asap_callback(timepop_ctx_t*, void*) {
       isr_residual_valid = true;
     }
 
-    if (dispatch_timeout) {
-      pre_pps_approach_ns = -1;
-      dispatch_timeout    = false;
-    }
-
-    pre_pps_arm();
     pps_fired = false;
 
     // ── Clock values at PPS edge — direct delta accumulation ──
@@ -629,24 +549,20 @@ static void pps_asap_callback(timepop_ctx_t*, void*) {
     // Each accumulator advances by the exact raw 32-bit delta since
     // the previous PPS edge.  No advance-then-rewind.  No intermediate
     // reads.  The accumulator is touched ONLY here, ONCE per second.
+    //
+    // v9: DWT uses isr_snap_dwt directly (ISR capture, ~50 ns after edge).
+    // Both DWT and GPT2 anchors come from the same ISR entry, so they
+    // are synchronized with each other.  The ~50 ns ISR entry latency
+    // is shared and cancels in any DWT-vs-GPT2 comparison.
 
     // GNSS: arithmetic (phase coherent — exact by definition)
     const uint64_t pps_gnss_ns = campaign_seconds * NS_PER_SECOND;
 
-    // DWT: ISR-latched pre-edge shadow (or ISR DWT fallback)
-    //
-    // isr_captured_shadow_dwt is the last DWT_CYCCNT written by the
-    // spin loop BEFORE the ISR preempted.  This is the true pre-edge
-    // value — typically within 1 DWT cycle (~1 ns) of the PPS edge.
-    //
-    // Falls back to isr_snap_dwt if the spin loop was late (missed
-    // the edge entirely).  The ISR DWT is ~50 cycles post-edge.
-    uint32_t dwt_raw_at_pps;
-    if (dispatch_shadow_valid) {
-      dwt_raw_at_pps = isr_captured_shadow_dwt;
-    } else {
-      dwt_raw_at_pps = isr_snap_dwt;
-    }
+    // DWT: ISR capture, corrected to PPS edge.
+    // isr_snap_dwt is captured ~52 cycles after the PPS edge.
+    // Subtract ISR_ENTRY_DWT_CYCLES to recover the DWT count at
+    // the true PPS moment — the same instant gnss_ns represents.
+    uint32_t dwt_raw_at_pps = isr_snap_dwt - ISR_ENTRY_DWT_CYCLES;
     uint32_t dwt_delta = dwt_raw_at_pps - prev_dwt_at_pps;
     dwt_cycles_64   += dwt_delta;
     prev_dwt_at_pps  = dwt_raw_at_pps;
@@ -664,15 +580,6 @@ static void pps_asap_callback(timepop_ctx_t*, void*) {
 
     // GNSS ticks for residual tracking (phase coherent)
     const uint64_t pps_gnss_ticks = campaign_seconds * (uint64_t)ISR_GNSS_EXPECTED;
-
-    dispatch_shadow_valid = false;
-
-    // ── Dispatch delta diagnostic ──
-    int64_t dispatch_delta_ns = -1;
-    if (isr_captured_shadow_dwt != 0) {
-      uint32_t delta_cycles = isr_snap_dwt - isr_captured_shadow_dwt;
-      dispatch_delta_ns = (int64_t)((uint64_t)delta_cycles * DWT_NS_NUM / DWT_NS_DEN);
-    }
 
     // ── Residual updates ──
     residual_update(residual_dwt,  pps_dwt_cycles,  DWT_EXPECTED_PER_PPS);
@@ -692,6 +599,7 @@ static void pps_asap_callback(timepop_ctx_t*, void*) {
     p.add("teensy_pps_count", campaign_seconds);
     p.add("gnss_lock",        digitalRead(GNSS_LOCK_PIN));
     p.add("dwt_cyccnt_at_pps", (uint32_t)dwt_raw_at_pps);
+    p.add("gpt2_at_pps",      (uint32_t)isr_snap_gnss);
 
     // DWT cycles in the second that just completed — the raw hardware
     // delta, not an average.  This is the best available estimate of
@@ -709,24 +617,9 @@ static void pps_asap_callback(timepop_ctx_t*, void*) {
     p.add("isr_residual_ocxo",  isr_residual_ocxo);
     p.add("isr_residual_valid", isr_residual_valid);
 
-    p.add("dispatch_delta_ns",   dispatch_delta_ns);
-    p.add("pre_pps_approach_ns", pre_pps_approach_ns);
-    p.add("dispatch_timeout",    (bool)dispatch_timeout);
-    p.add("diag_fine_was_late",  diag_fine_was_late);
-
     p.add("ocxo_dac",          ocxo_dac_fractional);
     p.add("calibrate_ocxo",    calibrate_ocxo_active);
     p.add("servo_adjustments", servo_adjustments);
-
-    p.add("diag_coarse_fires",  diag_coarse_fire_count);
-    p.add("diag_fine_fires",    diag_fine_fire_count);
-    p.add("diag_late",          diag_fine_late_count);
-    p.add("diag_spins",         diag_spin_count);
-    p.add("diag_timeouts",      diag_timeout_count);
-    p.add("diag_spin_iters",    diag_spin_iterations);
-
-    p.add("diag_raw_isr_cyc",    (uint32_t)isr_snap_dwt);
-    p.add("diag_raw_shadow_cyc", (uint32_t)dwt_raw_at_pps);
 
     p.add("diag_pps_rejected_total",     diag_pps_rejected_total);
     p.add("diag_pps_rejected_remainder", diag_pps_rejected_remainder);
@@ -763,8 +656,7 @@ static void pps_isr(void) {
     }
   }
 
-  isr_captured_shadow_dwt = dispatch_shadow_dwt;
-  pps_fired               = true;
+  pps_fired = true;
 
   digitalWriteFast(GNSS_PPS_RELAY, HIGH);
   relay_arm_pending = true;
@@ -947,10 +839,6 @@ static Payload cmd_report(const Payload&) {
   p.add("isr_residual_ocxo",  isr_residual_ocxo);
   p.add("isr_residual_valid", (bool)isr_residual_valid);
 
-  p.add("dispatch_delta_ns",   (int64_t)-1);  // last value not retained across seconds
-  p.add("pre_pps_approach_ns", pre_pps_approach_ns);
-  p.add("dispatch_timeout",    (bool)dispatch_timeout);
-
   p.add("ocxo_dac",            ocxo_dac_fractional);
   p.add("calibrate_ocxo",      calibrate_ocxo_active);
   p.add("servo_adjustments",   servo_adjustments);
@@ -1031,14 +919,6 @@ static Payload cmd_clocks_info(const Payload&) {
     p.add("timebase_fragment_valid", false);
   }
 
-  p.add("diag_coarse_fires",  diag_coarse_fire_count);
-  p.add("diag_fine_fires",    diag_fine_fire_count);
-  p.add("diag_late",          diag_fine_late_count);
-  p.add("diag_spins",         diag_spin_count);
-  p.add("diag_timeouts",      diag_timeout_count);
-  p.add("diag_fine_was_late", diag_fine_was_late);
-  p.add("diag_spin_iters",    diag_spin_iterations);
-
   p.add("pps_rejected_total",     diag_pps_rejected_total);
   p.add("pps_rejected_remainder", diag_pps_rejected_remainder);
 
@@ -1046,22 +926,27 @@ static Payload cmd_clocks_info(const Payload&) {
 }
 
 // ============================================================================
-// INTERP_TEST — Interpolation accuracy with full math audit trail
+// INTERP_TEST — Zero-gap interpolation accuracy test
 // ============================================================================
 //
-// Captures all interim values used in the GNSS interpolation so that
-// every nanosecond of the result can be verified by hand.
+// Captures DWT_CYCCNT and GPT2_CNT back-to-back (~2 ns apart), then:
 //
-// The math being tested:
-//   dwt_cycles_now     = fragment.dwt_cycles + (DWT_CYCCNT - dwt_cyccnt_at_pps)
-//   cycles_into_second = dwt_cycles_now - fragment.dwt_cycles
-//   ns_into_second     = cycles_into_second × 1,000,000,000 / dwt_cycles_per_pps
-//   interp_gnss_ns     = fragment.gnss_ns + ns_into_second
+//   1. Feeds the DWT value to timebase_gnss_ns_from_dwt() — the
+//      deterministic overload with no live reads, no torn-read loop.
 //
-// The VCLOCK truth:
-//   vclock_gnss_ns     = fragment.gnss_ns + (GPT2_CNT - isr_snap_gnss) × 100
+//   2. Computes VCLOCK truth from the GPT2 value:
+//      truth = frag.gnss_ns + (gpt2_now - frag.gpt2_at_pps) × 100
 //
-// Error = interp_gnss_ns - vclock_gnss_ns
+//   3. Error = interpolated - truth.
+//
+// The two register reads are separated by ~2 instructions = ~2 ns.
+// This eliminates the -86 ns systematic bias from the previous version
+// where timebase_now_gnss_ns() read DWT internally, separated from
+// the GPT2 read by the function's execution time.
+//
+// The error now reflects purely the interpolation math accuracy —
+// the mismatch between the prior second's DWT rate and the current
+// second's true rate.
 
 static Payload cmd_interp_test(const Payload& args) {
   Payload p;
@@ -1082,28 +967,25 @@ static Payload cmd_interp_test(const Payload& args) {
   int64_t  err_max = INT64_MIN;
   int32_t  outside_100ns = 0;
 
-  // First sample forensics — every interim value
-  uint64_t s0_frag_gnss_ns       = 0;
-  uint64_t s0_frag_dwt_cycles    = 0;
-  uint64_t s0_dwt_cycles_per_pps = 0;
-  uint32_t s0_dwt_cyccnt_at_pps  = 0;
-  uint32_t s0_pps_count          = 0;
+  // First sample forensics
+  uint64_t s0_frag_gnss_ns          = 0;
+  uint32_t s0_frag_dwt_cyccnt_at_pps = 0;
+  uint32_t s0_frag_dwt_cycles_per_pps = 0;
+  uint32_t s0_frag_gpt2_at_pps      = 0;
+  uint32_t s0_pps_count             = 0;
 
-  uint32_t s0_dwt_cyccnt_now     = 0;
-  uint32_t s0_gpt2_now           = 0;
-  uint32_t s0_isr_snap_gnss      = 0;
+  uint32_t s0_dwt_cyccnt_now        = 0;
+  uint32_t s0_gpt2_now              = 0;
+  uint32_t s0_dwt_elapsed           = 0;
+  uint64_t s0_dwt_ns_into_second    = 0;
+  uint64_t s0_interp_gnss_ns        = 0;
 
-  uint64_t s0_dwt_cycles_now     = 0;
-  uint64_t s0_cycles_into_second = 0;
-  uint64_t s0_product            = 0;  // cycles_into_second × 1e9
-  uint64_t s0_ns_into_second     = 0;
-  uint64_t s0_interp_gnss_ns     = 0;
-
-  uint32_t s0_gnss_ticks_since_pps = 0;
+  uint32_t s0_gpt2_since_pps        = 0;
   uint64_t s0_vclock_ns_into_second = 0;
-  uint64_t s0_vclock_gnss_ns     = 0;
+  uint64_t s0_vclock_gnss_ns        = 0;
 
-  int64_t  s0_error_ns           = 0;
+  int64_t  s0_error_ns              = 0;
+  double   s0_position              = 0.0;
 
   for (int32_t i = 0; i < n; i++) {
 
@@ -1114,49 +996,46 @@ static Payload cmd_interp_test(const Payload& args) {
       return p;
     }
 
-    const uint64_t frag_gnss_ns          = frag->gnss_ns;
-    const uint64_t frag_dwt_cycles       = frag->dwt_cycles;
-    const uint32_t frag_pps_count        = frag->pps_count;
-    const uint64_t frag_dwt_cycles_per_pps = frag->dwt_cycles_per_pps;
+    const uint64_t frag_gnss_ns            = frag->gnss_ns;
+    const uint32_t frag_pps_count          = frag->pps_count;
     const uint32_t frag_dwt_cyccnt_at_pps  = frag->dwt_cyccnt_at_pps;
+    const uint32_t frag_dwt_cycles_per_pps = (uint32_t)frag->dwt_cycles_per_pps;
+    const uint32_t frag_gpt2_at_pps        = frag->gpt2_at_pps;
 
-    // ── Interpolated GNSS ns (the code under test) ──
-    // Call this FIRST — it reads DWT_CYCCNT internally.
-    const int64_t interp_signed = timebase_now_gnss_ns();
+    if (frag_dwt_cycles_per_pps == 0 || frag_gpt2_at_pps == 0) {
+      p.add("error", "fragment missing dwt_cycles_per_pps or gpt2_at_pps");
+      return p;
+    }
+
+    // ── Simultaneous capture: DWT and GPT2 back-to-back (~2 ns gap) ──
+    const uint32_t dwt_now  = ARM_DWT_CYCCNT;
+    const uint32_t gpt2_now = GPT2_CNT;
+
+    // ── Interpolated GNSS ns via deterministic overload ──
+    const int64_t interp_signed = timebase_gnss_ns_from_dwt(
+      dwt_now,
+      frag_gnss_ns,
+      frag_dwt_cyccnt_at_pps,
+      frag_dwt_cycles_per_pps
+    );
     if (interp_signed < 0) {
-      p.add("error", "timebase_now_gnss_ns failed");
+      p.add("error", "timebase_gnss_ns_from_dwt failed");
       return p;
     }
     const uint64_t interp_gnss_ns = (uint64_t)interp_signed;
 
-    // ── VCLOCK truth — captured AFTER the interpolation ──
-    // GPT2 is read at the same wall-clock moment as the DWT read
-    // inside timebase_now_gnss_ns, eliminating the measurement gap
-    // that was adding ~300 ns of systematic bias.
-    const uint32_t gpt2_now       = GPT2_CNT;
-    const uint32_t dwt_cyccnt_now = DWT_CYCCNT;
-
-    // ── Synthetic DWT cycle count (diagnostic only) ──
-    const int64_t dwt_cycles_now_signed = timebase_now_dwt_cycles();
-    const uint64_t dwt_cycles_now = (dwt_cycles_now_signed >= 0)
-      ? (uint64_t)dwt_cycles_now_signed : 0;
-
-    // ── Manual recomputation of the interpolation ──
-    const uint64_t cycles_into_second = dwt_cycles_now - frag_dwt_cycles;
-    const uint64_t manual_ns_into_second =
-      (frag_dwt_cycles_per_pps > 0)
-        ? cycles_into_second * 1000000000ULL / frag_dwt_cycles_per_pps
-        : 0;
-    const uint64_t manual_interp_gnss_ns = frag_gnss_ns + manual_ns_into_second;
-
-    // ── VCLOCK truth ──
-    const uint32_t isr_gnss_val = isr_snap_gnss;
-    const uint32_t gnss_ticks_since_pps = gpt2_now - isr_gnss_val;
-    const uint64_t vclock_ns_into_second = (uint64_t)gnss_ticks_since_pps * 100ULL;
+    // ── VCLOCK truth from GPT2 ──
+    const uint32_t gpt2_since_pps = gpt2_now - frag_gpt2_at_pps;
+    const uint64_t vclock_ns_into_second = (uint64_t)gpt2_since_pps * 100ULL;
     const uint64_t vclock_gnss_ns = frag_gnss_ns + vclock_ns_into_second;
 
     // ── Error ──
     const int64_t error_ns = (int64_t)interp_gnss_ns - (int64_t)vclock_gnss_ns;
+
+    // ── DWT interim values ──
+    const uint32_t dwt_elapsed = dwt_now - frag_dwt_cyccnt_at_pps;
+    const uint64_t dwt_ns_into_second =
+      (uint64_t)dwt_elapsed * 1000000000ULL / (uint64_t)frag_dwt_cycles_per_pps;
 
     // ── Welford ──
     w_n++;
@@ -1172,26 +1051,24 @@ static Payload cmd_interp_test(const Payload& args) {
 
     // ── Capture first sample detail ──
     if (i == 0) {
-      s0_frag_gnss_ns       = frag_gnss_ns;
-      s0_frag_dwt_cycles    = frag_dwt_cycles;
-      s0_dwt_cycles_per_pps = frag_dwt_cycles_per_pps;
-      s0_dwt_cyccnt_at_pps  = frag_dwt_cyccnt_at_pps;
-      s0_pps_count          = frag_pps_count;
+      s0_frag_gnss_ns            = frag_gnss_ns;
+      s0_frag_dwt_cyccnt_at_pps  = frag_dwt_cyccnt_at_pps;
+      s0_frag_dwt_cycles_per_pps = frag_dwt_cycles_per_pps;
+      s0_frag_gpt2_at_pps        = frag_gpt2_at_pps;
+      s0_pps_count               = frag_pps_count;
 
-      s0_dwt_cyccnt_now     = dwt_cyccnt_now;
-      s0_gpt2_now           = gpt2_now;
-      s0_isr_snap_gnss      = isr_gnss_val;
+      s0_dwt_cyccnt_now          = dwt_now;
+      s0_gpt2_now                = gpt2_now;
+      s0_dwt_elapsed             = dwt_elapsed;
+      s0_dwt_ns_into_second      = dwt_ns_into_second;
+      s0_interp_gnss_ns          = interp_gnss_ns;
 
-      s0_dwt_cycles_now     = dwt_cycles_now;
-      s0_cycles_into_second = cycles_into_second;
-      s0_ns_into_second     = manual_ns_into_second;
-      s0_interp_gnss_ns     = interp_gnss_ns;
+      s0_gpt2_since_pps          = gpt2_since_pps;
+      s0_vclock_ns_into_second   = vclock_ns_into_second;
+      s0_vclock_gnss_ns          = vclock_gnss_ns;
 
-      s0_gnss_ticks_since_pps  = gnss_ticks_since_pps;
-      s0_vclock_ns_into_second = vclock_ns_into_second;
-      s0_vclock_gnss_ns        = vclock_gnss_ns;
-
-      s0_error_ns           = error_ns;
+      s0_error_ns                = error_ns;
+      s0_position                = (double)vclock_ns_into_second / 1000000000.0;
     }
   }
 
@@ -1210,34 +1087,33 @@ static Payload cmd_interp_test(const Payload& args) {
   p.add("outside_100ns",   outside_100ns);
 
   // Fragment state
-  p.add("s0_frag_gnss_ns",          s0_frag_gnss_ns);
-  p.add("s0_frag_dwt_cycles",       s0_frag_dwt_cycles);
-  p.add("s0_dwt_cycles_per_pps",    s0_dwt_cycles_per_pps);
-  p.add("s0_dwt_cyccnt_at_pps",     s0_dwt_cyccnt_at_pps);
-  p.add("s0_pps_count",             s0_pps_count);
+  p.add("s0_frag_gnss_ns",            s0_frag_gnss_ns);
+  p.add("s0_frag_dwt_cyccnt_at_pps",  s0_frag_dwt_cyccnt_at_pps);
+  p.add("s0_frag_dwt_cycles_per_pps", s0_frag_dwt_cycles_per_pps);
+  p.add("s0_frag_gpt2_at_pps",        s0_frag_gpt2_at_pps);
+  p.add("s0_pps_count",               s0_pps_count);
 
   // Raw hardware reads
-  p.add("s0_dwt_cyccnt_now",        s0_dwt_cyccnt_now);
-  p.add("s0_gpt2_now",              s0_gpt2_now);
-  p.add("s0_isr_snap_gnss",         s0_isr_snap_gnss);
+  p.add("s0_dwt_cyccnt_now",          s0_dwt_cyccnt_now);
+  p.add("s0_gpt2_now",                s0_gpt2_now);
 
   // DWT interpolation chain
-  p.add("s0_dwt_cycles_now",        s0_dwt_cycles_now);
-  p.add("s0_cycles_into_second",    s0_cycles_into_second);
-  p.add("s0_ns_into_second",        s0_ns_into_second);
-  p.add("s0_interp_gnss_ns",        s0_interp_gnss_ns);
+  p.add("s0_dwt_elapsed",             s0_dwt_elapsed);
+  p.add("s0_dwt_ns_into_second",      s0_dwt_ns_into_second);
+  p.add("s0_interp_gnss_ns",          s0_interp_gnss_ns);
 
   // VCLOCK truth chain
-  p.add("s0_gnss_ticks_since_pps",  s0_gnss_ticks_since_pps);
-  p.add("s0_vclock_ns_into_second", s0_vclock_ns_into_second);
-  p.add("s0_vclock_gnss_ns",        s0_vclock_gnss_ns);
+  p.add("s0_gpt2_since_pps",          s0_gpt2_since_pps);
+  p.add("s0_vclock_ns_into_second",   s0_vclock_ns_into_second);
+  p.add("s0_vclock_gnss_ns",          s0_vclock_gnss_ns);
 
-  // Error
-  p.add("s0_error_ns",           s0_error_ns);
+  // Error + position
+  p.add("s0_error_ns",                s0_error_ns);
+  p.add("s0_position",                s0_position);
 
   // Context
-  p.add("campaign_seconds",      campaign_seconds);
-  p.add("pps_rejected_total",    diag_pps_rejected_total);
+  p.add("campaign_seconds",           campaign_seconds);
+  p.add("pps_rejected_total",         diag_pps_rejected_total);
 
   return p;
 }

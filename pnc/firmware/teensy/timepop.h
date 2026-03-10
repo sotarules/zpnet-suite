@@ -99,6 +99,28 @@ typedef struct timepop_ctx_t {
   uint32_t         fire_gpt2;    // GPT2_CNT at ISR entry
   uint32_t         deadline;     // target GPT2 count
   int32_t          fire_ns;      // (fire_gpt2 - deadline) * 100
+
+  // ── DWT + GNSS snapshot (v3) ──
+  //
+  // Captured in the ISR at the same instant as fire_gpt2.
+  // Together with frag_gnss_ns and frag_dwt_cycles, these allow
+  // the callback to reconstruct the exact GNSS nanosecond at the
+  // fire moment via timebase_now_gnss_ns_from_dwt().
+  //
+  // fire_dwt_cyccnt:  raw ARM_DWT_CYCCNT register at ISR entry.
+  // frag_gnss_ns:     fragment gnss_ns at PPS (base for interpolation).
+  // frag_dwt_cycles:  fragment dwt_cycles at PPS (64-bit accumulator).
+  // frag_dwt_cyccnt_at_pps:  raw DWT_CYCCNT at PPS edge (32-bit anchor).
+  // frag_dwt_cycles_per_pps: DWT cycles in the prior second (denominator).
+  // frag_valid:       true if a valid fragment was available at ISR time.
+
+  uint32_t         fire_dwt_cyccnt;         // DWT_CYCCNT at ISR entry
+  uint64_t         frag_gnss_ns;            // fragment.gnss_ns
+  uint64_t         frag_dwt_cycles;         // fragment.dwt_cycles
+  uint32_t         frag_dwt_cyccnt_at_pps;  // fragment.dwt_cyccnt_at_pps
+  uint32_t         frag_dwt_cycles_per_pps; // fragment.dwt_cycles_per_pps
+  uint32_t         frag_gpt2_at_pps;        // fragment.gpt2_at_pps (VCLOCK anchor)
+  bool             frag_valid;              // was fragment available?
 } timepop_ctx_t;
 
 // ============================================================================

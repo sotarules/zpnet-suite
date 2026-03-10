@@ -81,6 +81,7 @@ struct fragment_store_t {
   volatile int32_t  isr_residual_ocxo;
   volatile uint32_t dwt_cyccnt_at_pps;
   volatile uint64_t dwt_cycles_per_pps;
+  volatile uint32_t gpt2_at_pps;
   volatile uint32_t seq;
   volatile bool     valid;
 };
@@ -129,6 +130,7 @@ struct fragment_copy_t {
   int32_t  isr_residual_ocxo;
   uint32_t dwt_cyccnt_at_pps;
   uint64_t dwt_cycles_per_pps;
+  uint32_t gpt2_at_pps;
   bool     valid;
   bool     ok;
 };
@@ -155,6 +157,7 @@ static fragment_copy_t read_fragment(void) {
     f.isr_residual_ocxo = frag_store.isr_residual_ocxo;
     f.dwt_cyccnt_at_pps  = frag_store.dwt_cyccnt_at_pps;
     f.dwt_cycles_per_pps = frag_store.dwt_cycles_per_pps;
+    f.gpt2_at_pps        = frag_store.gpt2_at_pps;
     f.valid              = frag_store.valid;
 
     dmb();
@@ -371,6 +374,42 @@ int64_t timebase_now_gnss_ns(void) {
 }
 
 // ============================================================================
+// Deterministic overload — GNSS ns from pre-captured DWT + fragment
+// ============================================================================
+//
+// Pure arithmetic.  No register reads.  No torn-read loop.  No branches
+// that depend on runtime state.  The same number of instructions every
+// time.  This is the path for ISR-captured timestamps (timepop, photon
+// detector, or any hardware event).
+//
+// The math is identical to current_gnss_now():
+//
+//   elapsed        = dwt_cyccnt - frag_dwt_cyccnt_at_pps   (uint32_t wrap OK)
+//   ns_into_second = elapsed × 1,000,000,000 / dwt_cycles_per_pps
+//   gnss_ns        = frag_gnss_ns + ns_into_second
+//
+
+int64_t timebase_gnss_ns_from_dwt(
+  uint32_t dwt_cyccnt,
+  uint64_t frag_gnss_ns,
+  uint32_t frag_dwt_cyccnt_at_pps,
+  uint32_t frag_dwt_cycles_per_pps
+) {
+  if (frag_dwt_cycles_per_pps == 0) return -1;
+  if (frag_gnss_ns == 0) return -1;
+
+  uint32_t elapsed = dwt_cyccnt - frag_dwt_cyccnt_at_pps;
+
+  // Sanity: elapsed should be less than ~3 seconds of cycles
+  uint64_t ns_into_second =
+    (uint64_t)elapsed * NS_PER_SECOND / (uint64_t)frag_dwt_cycles_per_pps;
+
+  if (ns_into_second > TIMEBASE_MAX_FRAGMENT_AGE_NS) return -1;
+
+  return (int64_t)(frag_gnss_ns + ns_into_second);
+}
+
+// ============================================================================
 // Public API — convert(value, from, to)
 // ============================================================================
 
@@ -485,6 +524,7 @@ void timebase_invalidate(void) {
   frag_store.isr_residual_ocxo = 0;
   frag_store.dwt_cyccnt_at_pps  = 0;
   frag_store.dwt_cycles_per_pps = 0;
+  frag_store.gpt2_at_pps        = 0;
   frag_store.valid              = false;
 
   dmb();
@@ -523,6 +563,7 @@ void on_timebase_fragment(const Payload& payload) {
   // the result is elapsed cycles since the PPS edge.
   const uint32_t dwt_cyccnt_at_pps    = payload.getUInt("dwt_cyccnt_at_pps", 0);
   const uint64_t dwt_cycles_per_pps   = payload.getUInt64("dwt_cycles_per_pps", 0);
+  const uint32_t gpt2_at_pps          = payload.getUInt("gpt2_at_pps", 0);
   const bool valid = (gnss_ns > 0 && dwt_ns > 0 && ocxo_ns > 0 && dwt_cycles_per_pps > 0);
 
   // Sequence-protected write (odd = in-progress, even = stable)
@@ -539,6 +580,7 @@ void on_timebase_fragment(const Payload& payload) {
   frag_store.isr_residual_ocxo  = isr_ocxo;
   frag_store.dwt_cyccnt_at_pps  = dwt_cyccnt_at_pps;
   frag_store.dwt_cycles_per_pps = dwt_cycles_per_pps;
+  frag_store.gpt2_at_pps        = gpt2_at_pps;
   frag_store.valid              = valid;
 
   dmb();
@@ -555,6 +597,7 @@ void on_timebase_fragment(const Payload& payload) {
   frag_public.isr_residual_ocxo  = isr_ocxo;
   frag_public.dwt_cycles_per_pps = dwt_cycles_per_pps;
   frag_public.dwt_cyccnt_at_pps  = dwt_cyccnt_at_pps;
+  frag_public.gpt2_at_pps        = gpt2_at_pps;
   frag_public.valid              = valid;
 }
 

@@ -30,6 +30,8 @@
 #include <Arduino.h>
 #include "imxrt.h"
 #include <string.h>
+#include <math.h>
+#include <climits>
 
 // ============================================================================
 // Constants
@@ -60,6 +62,15 @@ struct timepop_slot_t {
   uint32_t            fire_gpt2;      // GPT2_CNT captured in ISR at expiry
   uint32_t            period_ticks;   // reload value for recurring
   uint64_t            period_ns;      // original delay (for diagnostics)
+
+  // DWT + fragment snapshot (captured in ISR alongside fire_gpt2)
+  uint32_t            fire_dwt_cyccnt;
+  uint64_t            frag_gnss_ns;
+  uint64_t            frag_dwt_cycles;
+  uint32_t            frag_dwt_cyccnt_at_pps;
+  uint32_t            frag_dwt_cycles_per_pps;
+  uint32_t            frag_gpt2_at_pps;
+  bool                frag_valid;
 
   timepop_callback_t  callback;
   void*               user_data;
@@ -159,9 +170,16 @@ static void reload_ocr(void) {
 
 static void gpt2_compare_isr(void) {
 
-  // Capture GPT2_CNT immediately — this is the authoritative
-  // "when did the ISR fire?" timestamp in GNSS ticks.
-  const uint32_t now = GPT2_CNT;
+  // Capture GPT2_CNT and DWT_CYCCNT simultaneously — these are the
+  // authoritative "when did the ISR fire?" timestamps.  GPT2 gives
+  // GNSS ticks, DWT gives CPU cycles.  Both captured within 1-2
+  // instructions of each other.
+  const uint32_t now     = GPT2_CNT;
+  const uint32_t dwt_now = ARM_DWT_CYCCNT;
+
+  // Snapshot the current timebase fragment (read once, use for all slots)
+  const timebase_fragment_t* frag = timebase_last_fragment();
+  const bool frag_ok = frag && frag->valid;
 
   GPT2_SR = GPT_SR_OF1;
   isr_fire_count++;
@@ -170,8 +188,21 @@ static void gpt2_compare_isr(void) {
     if (!slots[i].active || slots[i].expired) continue;
 
     if (deadline_expired(slots[i].deadline, now)) {
-      slots[i].expired   = true;
-      slots[i].fire_gpt2 = now;
+      slots[i].expired        = true;
+      slots[i].fire_gpt2      = now;
+      slots[i].fire_dwt_cyccnt = dwt_now;
+
+      if (frag_ok) {
+        slots[i].frag_gnss_ns            = frag->gnss_ns;
+        slots[i].frag_dwt_cycles         = frag->dwt_cycles;
+        slots[i].frag_dwt_cyccnt_at_pps  = frag->dwt_cyccnt_at_pps;
+        slots[i].frag_dwt_cycles_per_pps = frag->dwt_cycles_per_pps;
+        slots[i].frag_gpt2_at_pps        = frag->gpt2_at_pps;
+        slots[i].frag_valid              = true;
+      } else {
+        slots[i].frag_valid = false;
+      }
+
       expired_count++;
     }
   }
@@ -321,12 +352,20 @@ void timepop_dispatch(void) {
 
     slots[i].expired = false;
 
-    // Build context with ISR-captured fire time
+    // Build context with ISR-captured fire time + DWT/GNSS snapshot
     timepop_ctx_t ctx;
     ctx.handle    = slots[i].handle;
     ctx.fire_gpt2 = slots[i].fire_gpt2;
     ctx.deadline  = slots[i].deadline;
     ctx.fire_ns   = (int32_t)(slots[i].fire_gpt2 - slots[i].deadline) * 100;
+
+    ctx.fire_dwt_cyccnt         = slots[i].fire_dwt_cyccnt;
+    ctx.frag_gnss_ns            = slots[i].frag_gnss_ns;
+    ctx.frag_dwt_cycles         = slots[i].frag_dwt_cycles;
+    ctx.frag_dwt_cyccnt_at_pps  = slots[i].frag_dwt_cyccnt_at_pps;
+    ctx.frag_dwt_cycles_per_pps = slots[i].frag_dwt_cycles_per_pps;
+    ctx.frag_gpt2_at_pps        = slots[i].frag_gpt2_at_pps;
+    ctx.frag_valid              = slots[i].frag_valid;
 
     uint32_t start = ARM_DWT_CYCCNT;
     slots[i].callback(&ctx, slots[i].user_data);
@@ -475,6 +514,172 @@ static Payload cmd_test(const Payload& args) {
 }
 
 // ============================================================================
+// INTERP_TEST — Pure math cross-check via TimePop
+// ============================================================================
+//
+// The GNSS time at the OCR compare moment is known exactly:
+//
+//   vclock_ns_into_second = (deadline - gpt2_at_pps) × 100
+//   vclock_gnss_ns        = frag_gnss_ns + vclock_ns_into_second
+//
+// From this known GNSS time, we synthesize the DWT cycle count that
+// timebase SHOULD produce at that moment:
+//
+//   synth_dwt = frag_dwt_cyccnt_at_pps +
+//               vclock_ns_into_second × dwt_cycles_per_pps / 1,000,000,000
+//
+// Then we feed that synthesized DWT value back through
+// timebase_gnss_ns_from_dwt() and compare the result to the known
+// GNSS time.  The difference is purely the interpolation math error —
+// integer truncation, rounding, rate mismatch.  No ISR latency.
+// No DWT capture.  No correction constants.  Just math vs math.
+//
+// If the result is not zero (or very near zero), the interpolation
+// is broken.
+//
+// ============================================================================
+
+struct interp_test_ctx_t {
+  uint32_t tests_remaining;
+  uint64_t delay_ns;
+
+  // Welford accumulators
+  int64_t  w_n;
+  double   w_mean;
+  double   w_m2;
+  int64_t  err_min;
+  int64_t  err_max;
+  int32_t  outside_100ns;
+};
+
+static interp_test_ctx_t itest_ctx = {};
+static volatile bool     itest_in_flight = false;
+
+static void interp_test_callback(timepop_ctx_t* ctx, void*);
+
+static void interp_test_arm_next(void) {
+  timepop_handle_t h = timepop_arm(
+    itest_ctx.delay_ns, false,
+    interp_test_callback, nullptr, "itest"
+  );
+  if (h == TIMEPOP_INVALID_HANDLE) {
+    itest_in_flight = false;
+  }
+}
+
+static void interp_test_callback(timepop_ctx_t* ctx, void*) {
+
+  if (!ctx->frag_valid || ctx->frag_dwt_cycles_per_pps == 0) {
+    if (itest_ctx.tests_remaining > 0) {
+      interp_test_arm_next();
+    } else {
+      itest_in_flight = false;
+    }
+    return;
+  }
+
+  // ── GNSS truth from deadline (exact, 100 ns quantized) ──
+  const uint32_t gpt2_since_pps = ctx->deadline - ctx->frag_gpt2_at_pps;
+  const uint64_t vclock_ns_into_second = (uint64_t)gpt2_since_pps * 100ULL;
+  const int64_t  vclock_gnss_ns = (int64_t)(ctx->frag_gnss_ns + vclock_ns_into_second);
+
+  // ── Synthesize DWT cycle count at the deadline moment ──
+  // Reverse interpolation: GNSS nanoseconds → DWT cycles
+  const uint32_t synth_dwt_elapsed =
+    (uint32_t)(vclock_ns_into_second * (uint64_t)ctx->frag_dwt_cycles_per_pps / 1000000000ULL);
+  const uint32_t synth_dwt = ctx->frag_dwt_cyccnt_at_pps + synth_dwt_elapsed;
+
+  // ── Forward interpolation: DWT cycles → GNSS nanoseconds ──
+  const int64_t interp_gnss_ns = timebase_gnss_ns_from_dwt(
+    synth_dwt,
+    ctx->frag_gnss_ns,
+    ctx->frag_dwt_cyccnt_at_pps,
+    ctx->frag_dwt_cycles_per_pps
+  );
+
+  // ── Error: round-trip residual ──
+  const int64_t error_ns = (interp_gnss_ns >= 0)
+    ? interp_gnss_ns - vclock_gnss_ns
+    : 0;
+
+  // ── Welford update ──
+  itest_ctx.w_n++;
+  const double x  = (double)error_ns;
+  const double d1 = x - itest_ctx.w_mean;
+  itest_ctx.w_mean += d1 / (double)itest_ctx.w_n;
+  const double d2 = x - itest_ctx.w_mean;
+  itest_ctx.w_m2 += d1 * d2;
+
+  if (error_ns < itest_ctx.err_min) itest_ctx.err_min = error_ns;
+  if (error_ns > itest_ctx.err_max) itest_ctx.err_max = error_ns;
+  if (error_ns > 100 || error_ns < -100) itest_ctx.outside_100ns++;
+
+  // ── Arm next or emit results ──
+  itest_ctx.tests_remaining--;
+
+  if (itest_ctx.tests_remaining > 0) {
+    interp_test_arm_next();
+    return;
+  }
+
+  // ── All samples collected — emit event ──
+  const double w_stddev = (itest_ctx.w_n >= 2)
+    ? sqrt(itest_ctx.w_m2 / (double)(itest_ctx.w_n - 1)) : 0.0;
+  const double w_stderr = (itest_ctx.w_n >= 2)
+    ? w_stddev / sqrt((double)itest_ctx.w_n) : 0.0;
+
+  Payload ev;
+
+  ev.add("samples",         (int32_t)itest_ctx.w_n);
+  ev.add("error_mean_ns",   itest_ctx.w_mean);
+  ev.add("error_stddev_ns", w_stddev);
+  ev.add("error_stderr_ns", w_stderr);
+  ev.add("error_min_ns",    itest_ctx.err_min);
+  ev.add("error_max_ns",    itest_ctx.err_max);
+  ev.add("outside_100ns",   itest_ctx.outside_100ns);
+
+  // Forensics (last sample only)
+  ev.add("s0_error_ns",              error_ns);
+  ev.add("s0_synth_dwt_elapsed",     synth_dwt_elapsed);
+  ev.add("s0_vclock_ns_into_second", vclock_ns_into_second);
+  ev.add("s0_position",              (double)vclock_ns_into_second / 1000000000.0);
+  ev.add("s0_fire_ns",               ctx->fire_ns);
+
+  enqueueEvent("TIMEPOP_INTERP_TEST", ev);
+
+  itest_in_flight = false;
+}
+
+static Payload cmd_interp_test(const Payload& args) {
+
+  Payload resp;
+
+  if (itest_in_flight) {
+    resp.add("error", "test already in flight");
+    return resp;
+  }
+
+  const uint64_t delay_ns = args.getUInt64("delay_ns", 200000000ULL);
+  const int32_t count_raw = args.getInt("count", 10);
+  const int32_t count = (count_raw < 1) ? 1 : (count_raw > 100) ? 100 : count_raw;
+
+  itest_ctx = {};
+  itest_ctx.tests_remaining = count;
+  itest_ctx.delay_ns        = delay_ns;
+  itest_ctx.err_min         = INT64_MAX;
+  itest_ctx.err_max         = INT64_MIN;
+
+  itest_in_flight = true;
+
+  interp_test_arm_next();
+
+  resp.add("status", "armed");
+  resp.add("count",  count);
+  resp.add("delay_ns", delay_ns);
+  return resp;
+}
+
+// ============================================================================
 // REPORT command
 // ============================================================================
 
@@ -513,9 +718,10 @@ static Payload cmd_report(const Payload&) {
 // ============================================================================
 
 static const process_command_entry_t TIMEPOP_COMMANDS[] = {
-  { "REPORT", cmd_report },
-  { "TEST",   cmd_test   },
-  { nullptr,  nullptr }
+  { "REPORT",      cmd_report      },
+  { "TEST",        cmd_test        },
+  { "INTERP_TEST", cmd_interp_test },
+  { nullptr,       nullptr }
 };
 
 static const process_vtable_t TIMEPOP_PROCESS = {

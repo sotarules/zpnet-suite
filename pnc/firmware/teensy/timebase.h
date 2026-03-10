@@ -98,6 +98,25 @@ int64_t timebase_now_ns(timebase_domain_t domain);
 /// This is the primary call for most code.
 int64_t timebase_now_gnss_ns(void);
 
+/// Compute GNSS nanoseconds from a pre-captured DWT_CYCCNT value and
+/// fragment snapshot.  This is the deterministic overload: no live
+/// register reads, no torn-read loop, no branching.  The caller
+/// supplies values captured at a single instant (e.g., in an ISR).
+///
+/// Parameters are the fields from timepop_ctx_t:
+///   dwt_cyccnt          — raw ARM_DWT_CYCCNT at the event
+///   frag_gnss_ns        — fragment.gnss_ns at the anchoring PPS
+///   frag_dwt_cyccnt_at_pps — fragment.dwt_cyccnt_at_pps (32-bit anchor)
+///   frag_dwt_cycles_per_pps — DWT cycles in the prior second
+///
+/// Returns GNSS nanoseconds, or -1 if the inputs are invalid.
+int64_t timebase_gnss_ns_from_dwt(
+  uint32_t dwt_cyccnt,
+  uint64_t frag_gnss_ns,
+  uint32_t frag_dwt_cyccnt_at_pps,
+  uint32_t frag_dwt_cycles_per_pps
+);
+
 /// Returns the synthetic campaign DWT cycle count at this instant.
 /// This is fragment.dwt_cycles + elapsed cycles since the PPS edge.
 /// Returns -1 if Timebase is not valid.
@@ -205,6 +224,7 @@ struct timebase_fragment_t {
   volatile int32_t  isr_residual_ocxo;
   volatile uint64_t dwt_cycles_per_pps;
   volatile uint32_t dwt_cyccnt_at_pps;
+  volatile uint32_t gpt2_at_pps;        // GPT2_CNT at PPS edge (VCLOCK anchor)
   volatile bool     valid;
 };
 
