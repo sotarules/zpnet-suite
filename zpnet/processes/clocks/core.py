@@ -1,5 +1,5 @@
 """
-ZPNet CLOCKS Process — TIMEBASE Authority (Pi-side) — v5 Three-Domain
+ZPNet CLOCKS Process — TIMEBASE Authority (Pi-side) — v6 Simplified
 
 Core contract (v2026-03+):
 
@@ -15,8 +15,6 @@ Core contract (v2026-03+):
     • CLOCKS owns: correlation, Welford statistics, campaign lifecycle
 
   Three clock domains: GNSS (reference), DWT, OCXO.
-  The Pi is NOT a clock domain.  No PITIMER service, no dedicated
-  processor core, no native capture code, no Pi nanoseconds.
 
   Recovery is symmetric across all three domains:
 
@@ -970,7 +968,7 @@ def _process_loop() -> None:
     environment and GNSS discipline data, builds TIMEBASE, persists.
     Runs forever.
 
-    v5: No PITIMER correlation.  The Pi is not a clock domain.
+    v6: Teensy v9 ISR-synchronized anchors.  No spin loop diagnostics.
     Fragments arrive from the Teensy with GNSS, DWT, and OCXO
     nanoseconds.  CLOCKS decorates and persists — straight through.
     """
@@ -1091,42 +1089,23 @@ def _process_loop() -> None:
 
             "teensy_pps_count": int(pps_count),
 
-            # Teensy ISR residuals (ns)
+            # Teensy ISR residuals (raw counts)
             "isr_residual_gnss": frag.get("isr_residual_gnss"),
             "isr_residual_dwt": frag.get("isr_residual_dwt"),
             "isr_residual_ocxo": frag.get("isr_residual_ocxo"),
 
-            # Teensy dispatch profiling / PPS diagnostics
-            "diag_teensy_dispatch_delta_ns": frag.get("dispatch_delta_ns"),
-            "diag_teensy_dispatch_shadow_ns": frag.get("dispatch_shadow_ns"),
-            "diag_teensy_dispatch_isr_ns": frag.get("dispatch_isr_ns"),
-            "diag_teensy_pps_edge_valid": frag.get("pps_edge_valid"),
-            "diag_teensy_pps_edge_correction_ns": frag.get("pps_edge_correction_ns"),
-            "diag_teensy_tdc_needs_recal": frag.get("tdc_needs_recal"),
-
-            # Approach time
-            "diag_teensy_approach_ns": frag.get("pre_pps_approach_ns"),
-
-            # Spin loop status for THIS edge
-            "diag_teensy_dispatch_timeout": frag.get("dispatch_timeout"),
-            "diag_teensy_fine_was_late": frag.get("diag_fine_was_late"),
-            "diag_teensy_spin_iters": frag.get("diag_spin_iters"),
-
-            # Monotonic counters
-            "diag_teensy_coarse_fires": frag.get("diag_coarse_fires"),
-            "diag_teensy_fine_fires": frag.get("diag_fine_fires"),
-            "diag_teensy_late_count": frag.get("diag_late"),
-            "diag_teensy_spin_count": frag.get("diag_spins"),
-            "diag_teensy_timeout_count": frag.get("diag_timeouts"),
-
-            # Raw DWT cycle counts for TDC derivation
-            "diag_raw_isr_cyc": frag.get("diag_raw_isr_cyc"),
-            "diag_raw_shadow_cyc": frag.get("diag_raw_shadow_cyc"),
+            # Teensy interpolation anchors
+            "dwt_cyccnt_at_pps": frag.get("dwt_cyccnt_at_pps"),
+            "gpt2_at_pps": frag.get("gpt2_at_pps"),
+            "dwt_cycles_per_pps": frag.get("dwt_cycles_per_pps"),
 
             # OCXO control state
             "ocxo_dac": frag.get("ocxo_dac"),
             "calibrate_ocxo": frag.get("calibrate_ocxo"),
-            "servo_converged": frag.get("servo_converged"),
+
+            # PPS rejection diagnostics
+            "pps_rejected_total": frag.get("diag_pps_rejected_total"),
+            "pps_rejected_remainder": frag.get("diag_pps_rejected_remainder"),
 
             # Environment snapshot (correlated with this PPS edge)
             "environment": env_snapshot,
@@ -1173,7 +1152,6 @@ def _process_loop() -> None:
         # Persist OCXO DAC fields into campaign payload (best-effort)
         teensy_ocxo_dac = frag.get("ocxo_dac")
         teensy_calibrate = frag.get("calibrate_ocxo")
-        teensy_converged = frag.get("servo_converged")
         if teensy_ocxo_dac is not None:
             try:
                 with open_db() as conn:
@@ -1189,7 +1167,6 @@ def _process_loop() -> None:
                             json.dumps({
                                 "ocxo_dac": float(teensy_ocxo_dac),
                                 "calibrate_ocxo": bool(teensy_calibrate),
-                                "servo_converged": bool(teensy_converged),
                             }),
                             campaign,
                         ),
@@ -1910,12 +1887,11 @@ def _recover_campaign() -> None:
     # OCXO DAC state from campaign payload
     recover_ocxo_dac = campaign_payload.get("ocxo_dac")
     recover_calibrate = campaign_payload.get("calibrate_ocxo", False)
-    recover_converged = campaign_payload.get("servo_converged", False)
 
     if recover_ocxo_dac is not None:
         logging.info(
-            "🔧 [recovery] OCXO DAC: %s (calibrate=%s, converged=%s)",
-            recover_ocxo_dac, recover_calibrate, recover_converged,
+            "🔧 [recovery] OCXO DAC: %s (calibrate=%s)",
+            recover_ocxo_dac, recover_calibrate
         )
 
     # ------------------------------------------------------------------
@@ -2071,7 +2047,7 @@ def _recover_campaign() -> None:
     }
     if recover_ocxo_dac is not None:
         teensy_recover_args["set_dac"] = str(float(recover_ocxo_dac))
-    if recover_calibrate and not recover_converged:
+    if recover_calibrate:
         teensy_recover_args["calibrate_ocxo"] = "true"
 
     _request_teensy_recover(int(next_pps_count), teensy_recover_args)
@@ -2188,7 +2164,7 @@ def cmd_set_baseline(args: Optional[dict]) -> Dict[str, Any]:
         return {"success": False, "message": f"Campaign {baseline_id} ('{row['campaign']}') has no report"}
 
     baseline_ppb = {}
-    for key in ("gnss", "dwt", "pi", "ocxo"):
+    for key in ("gnss", "dwt", "ocxo"):
         blk = report.get(key, {})
         ppb = blk.get("ppb")
         if ppb is not None:
@@ -2624,10 +2600,10 @@ def run() -> None:
     setup_logging()
 
     logging.info(
-        "🕐 [clocks] v5 — Pi clock domain removed. "
+        "🕐 [clocks] v6 — Teensy v9 ISR-synchronized anchors. "
         "Three clock domains: GNSS (reference), DWT, OCXO. "
+        "Spin loop eliminated. TIMEBASE record simplified. "
         "Recovery is symmetric: projected_ns = projected_gnss_ns × last_clock_ns ÷ last_gnss_ns. "
-        "No PITIMER. No Pi captures. No dedicated core. "
         "START while active performs seamless flash-cut to new campaign. "
         "Commands: START, STOP, RESUME, REPORT, CLEAR, DELETE, SET_DAC, "
         "SET_BASELINE, BASELINE_INFO, LIST_CAMPAIGNS, CLOCKS_INFO."

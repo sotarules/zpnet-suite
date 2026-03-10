@@ -420,9 +420,11 @@ uint64_t clocks_ocxo_ns_now(void) {
 static void clocks_zero_all(void) {
   timebase_invalidate();
 
-  // Zero the TIMEBASE accumulators and anchor at this PPS edge
+  // Zero the TIMEBASE accumulators and anchor at this PPS edge.
+  // prev_dwt_at_pps must use the same ISR correction as dwt_raw_at_pps
+  // in the ASAP callback, otherwise the first delta wraps by -52.
   dwt_cycles_64    = 0;
-  prev_dwt_at_pps  = isr_snap_dwt;
+  prev_dwt_at_pps  = isr_snap_dwt - ISR_ENTRY_DWT_CYCLES;
 
   ocxo_ticks_64    = 0;
   prev_ocxo_at_pps = isr_snap_ocxo;
@@ -503,9 +505,10 @@ static void pps_asap_callback(timepop_ctx_t*, void*) {
 
     timebase_invalidate();
 
-    // Seed the accumulators from recovered nanosecond values
+    // Seed the accumulators from recovered nanosecond values.
+    // prev_dwt_at_pps must use the same ISR correction as dwt_raw_at_pps.
     dwt_cycles_64    = dwt_ns_to_cycles(recover_dwt_ns);
-    prev_dwt_at_pps  = isr_snap_dwt;
+    prev_dwt_at_pps  = isr_snap_dwt - ISR_ENTRY_DWT_CYCLES;
 
     ocxo_ticks_64    = recover_ocxo_ns / 100ull;
     prev_ocxo_at_pps = isr_snap_ocxo;
