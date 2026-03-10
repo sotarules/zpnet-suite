@@ -5,20 +5,25 @@
 // PPS-fragment anchored Timebase.
 //
 // The authoritative TIMEBASE_FRAGMENT provides PPS-edge totals once per
-// second.  The fragment carries diag_raw_shadow_cyc — the raw DWT_CYCCNT
-// register value captured by the spin loop just before the PPS edge.
-// This is the interpolation anchor.
+// second.  The fragment carries:
 //
-// "Now" is answered by measuring elapsed DWT cycles since that anchor
-// and scaling to GNSS nanoseconds using the empirical ratio:
+//   dwt_cycles         — synthetic 64-bit DWT cycle count at PPS edge
+//   dwt_cyccnt_at_pps  — raw DWT_CYCCNT from the spin loop pre-edge shadow
+//   dwt_cycles_per_pps — Welford mean of DWT cycles per GNSS second
 //
-//   elapsed_dwt_cycles = ARM_DWT_CYCCNT - dwt_cyccnt_at_pps
-//   elapsed_gnss_ns = elapsed_dwt_cycles × (fragment.gnss_ns / fragment.dwt_cycles)
-//   gnss_now = fragment.gnss_ns + elapsed_gnss_ns
+// Interpolation within the current second:
 //
-// The anchor is the raw hardware register, captured within ~50 ns of
-// the true PPS edge.  The ratio gnss_ns / dwt_cycles is the true,
-// measured conversion factor — no assumed 125/126 constant.
+//   dwt_cycles_now     = fragment.dwt_cycles + (DWT_CYCCNT - dwt_cyccnt_at_pps)
+//   cycles_into_second = dwt_cycles_now - fragment.dwt_cycles
+//   ns_into_second     = cycles_into_second × 1,000,000,000 / dwt_cycles_per_pps
+//   gnss_now           = fragment.gnss_ns + ns_into_second
+//
+// The product cycles_into_second × 1e9 fits in uint64 (max ~1.008e18).
+// No floating point.  No mul_div_u64 double fallback.  No rounding bias.
+//
+// timebase_now_dwt_cycles() returns the synthetic campaign cycle count
+// at any instant — for code that needs the raw cycle count before
+// nanosecond conversion.
 //
 // The DWT runs at 1008 MHz.  The 125/126 ratio converts DWT cycles to
 // nominal nanoseconds and is used only for the DWT domain.
@@ -75,11 +80,12 @@ struct fragment_store_t {
   volatile int32_t  isr_residual_gnss;
   volatile int32_t  isr_residual_ocxo;
   volatile uint32_t dwt_cyccnt_at_pps;
+  volatile uint64_t dwt_cycles_per_pps;
   volatile uint32_t seq;
   volatile bool     valid;
 };
 
-static fragment_store_t frag_store = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, false};
+static fragment_store_t frag_store = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, false};
 
 // Public mirror for diagnostics / reports
 static timebase_fragment_t frag_public = {};
@@ -122,6 +128,7 @@ struct fragment_copy_t {
   int32_t  isr_residual_gnss;
   int32_t  isr_residual_ocxo;
   uint32_t dwt_cyccnt_at_pps;
+  uint64_t dwt_cycles_per_pps;
   bool     valid;
   bool     ok;
 };
@@ -146,8 +153,9 @@ static fragment_copy_t read_fragment(void) {
     f.isr_residual_dwt  = frag_store.isr_residual_dwt;
     f.isr_residual_gnss = frag_store.isr_residual_gnss;
     f.isr_residual_ocxo = frag_store.isr_residual_ocxo;
-    f.dwt_cyccnt_at_pps = frag_store.dwt_cyccnt_at_pps;
-    f.valid             = frag_store.valid;
+    f.dwt_cyccnt_at_pps  = frag_store.dwt_cyccnt_at_pps;
+    f.dwt_cycles_per_pps = frag_store.dwt_cycles_per_pps;
+    f.valid              = frag_store.valid;
 
     dmb();
     uint32_t s2 = frag_store.seq;
@@ -189,34 +197,70 @@ static bool fragment_domain_total_ns(
 }
 
 // ============================================================================
-// Forward projection — direct DWT cycles to GNSS nanoseconds
+// Synthetic campaign DWT cycle count — "how many DWT cycles since PPS 0?"
 // ============================================================================
+
+static constexpr uint64_t NS_PER_SECOND = 1000000000ULL;
+
+static bool current_dwt_cycles(const fragment_copy_t& f, uint64_t& out_cycles) {
+  uint32_t dwt_now     = ARM_DWT_CYCCNT;
+  uint32_t dwt_elapsed = dwt_now - f.dwt_cyccnt_at_pps;
+
+  // Sanity: elapsed should be less than ~3 seconds of cycles
+  if ((uint64_t)dwt_elapsed * NS_PER_SECOND / (f.dwt_cycles_per_pps ? f.dwt_cycles_per_pps : 1008000000ULL) > TIMEBASE_MAX_FRAGMENT_AGE_NS) {
+    return false;
+  }
+
+  out_cycles = f.dwt_cycles + (uint64_t)dwt_elapsed;
+  return true;
+}
+
+// ============================================================================
+// Public API — synthetic DWT cycle count
+// ============================================================================
+
+int64_t timebase_now_dwt_cycles(void) {
+  fragment_copy_t f = read_fragment();
+  if (!f.ok || !f.valid) return -1;
+  if (f.dwt_cycles_per_pps == 0) return -1;
+
+  uint64_t cycles = 0;
+  if (!current_dwt_cycles(f, cycles)) return -1;
+  return (int64_t)cycles;
+}
+
+// ============================================================================
+// Forward projection — pure integer, no floating point
+// ============================================================================
+//
+// The math:
+//   dwt_cycles_now        = fragment.dwt_cycles + (DWT_CYCCNT - dwt_cyccnt_at_pps)
+//   cycles_into_second    = dwt_cycles_now - fragment.dwt_cycles
+//                         = DWT_CYCCNT - dwt_cyccnt_at_pps
+//   ns_into_second        = cycles_into_second × 1,000,000,000 / dwt_cycles_per_pps
+//   gnss_now              = fragment.gnss_ns + ns_into_second
 
 static bool current_gnss_now(uint64_t& out_gnss_ns) {
   fragment_copy_t f = read_fragment();
   if (!f.ok || !f.valid) return false;
-  if (f.dwt_cycles == 0) return false;
+  if (f.dwt_cycles_per_pps == 0) return false;
 
-  uint32_t dwt_now     = ARM_DWT_CYCCNT;
-  uint32_t dwt_elapsed = dwt_now - f.dwt_cyccnt_at_pps;
+  uint64_t dwt_cycles_now = 0;
+  if (!current_dwt_cycles(f, dwt_cycles_now)) return false;
 
-  // Convert elapsed DWT cycles directly to GNSS nanoseconds using
-  // the empirical ratio from the fragment:
-  //
-  //   elapsed_gnss_ns = elapsed_dwt_cycles × (gnss_ns / dwt_cycles)
-  //
-  // This bypasses the nominal 125/126 conversion entirely.  The ratio
-  // gnss_ns / dwt_cycles IS the true, measured relationship between
-  // DWT ticks and GNSS time — incorporating both the conversion factor
-  // and the crystal's frequency offset (~3.6 ppm).
-  uint64_t elapsed_gnss_ns =
-    mul_div_u64((uint64_t)dwt_elapsed, f.gnss_ns, f.dwt_cycles);
+  // Cycles elapsed since the PPS edge that anchors this fragment
+  uint64_t cycles_into_second = dwt_cycles_now - f.dwt_cycles;
 
-  if (elapsed_gnss_ns > TIMEBASE_MAX_FRAGMENT_AGE_NS) {
+  // Convert to GNSS nanoseconds using the Welford mean rate.
+  // Max product: ~1,008,000,000 × 1,000,000,000 = 1.008e18 < UINT64_MAX
+  uint64_t ns_into_second =
+    cycles_into_second * NS_PER_SECOND / f.dwt_cycles_per_pps;
+
+  if (ns_into_second > TIMEBASE_MAX_FRAGMENT_AGE_NS) {
     return false;
   }
 
-  out_gnss_ns = f.gnss_ns + elapsed_gnss_ns;
+  out_gnss_ns = f.gnss_ns + ns_into_second;
   return true;
 }
 
@@ -439,8 +483,9 @@ void timebase_invalidate(void) {
   frag_store.isr_residual_dwt  = 0;
   frag_store.isr_residual_gnss = 0;
   frag_store.isr_residual_ocxo = 0;
-  frag_store.dwt_cyccnt_at_pps = 0;
-  frag_store.valid             = false;
+  frag_store.dwt_cyccnt_at_pps  = 0;
+  frag_store.dwt_cycles_per_pps = 0;
+  frag_store.valid              = false;
 
   dmb();
   frag_store.seq++;
@@ -476,37 +521,41 @@ void on_timebase_fragment(const Payload& payload) {
   // actual hardware register value — NOT the 64-bit accumulator.
   // When current_gnss_now() later computes (DWT_CYCCNT - anchor),
   // the result is elapsed cycles since the PPS edge.
-  const uint32_t dwt_cyccnt_at_pps = payload.getUInt("dwt_cyccnt_at_pps", 0);
-  const bool valid = (gnss_ns > 0 && dwt_ns > 0 && ocxo_ns > 0);
+  const uint32_t dwt_cyccnt_at_pps    = payload.getUInt("dwt_cyccnt_at_pps", 0);
+  const uint64_t dwt_cycles_per_pps   = payload.getUInt64("dwt_cycles_per_pps", 0);
+  const bool valid = (gnss_ns > 0 && dwt_ns > 0 && ocxo_ns > 0 && dwt_cycles_per_pps > 0);
 
   // Sequence-protected write (odd = in-progress, even = stable)
   frag_store.seq++;
   dmb();
 
-  frag_store.gnss_ns           = gnss_ns;
-  frag_store.dwt_ns            = dwt_ns;
-  frag_store.dwt_cycles        = dwt_cycles;
-  frag_store.ocxo_ns           = ocxo_ns;
-  frag_store.pps_count         = pps_count;
-  frag_store.isr_residual_dwt  = isr_dwt;
-  frag_store.isr_residual_gnss = isr_gnss;
-  frag_store.isr_residual_ocxo = isr_ocxo;
-  frag_store.dwt_cyccnt_at_pps = dwt_cyccnt_at_pps;
-  frag_store.valid             = valid;
+  frag_store.gnss_ns            = gnss_ns;
+  frag_store.dwt_ns             = dwt_ns;
+  frag_store.dwt_cycles         = dwt_cycles;
+  frag_store.ocxo_ns            = ocxo_ns;
+  frag_store.pps_count          = pps_count;
+  frag_store.isr_residual_dwt   = isr_dwt;
+  frag_store.isr_residual_gnss  = isr_gnss;
+  frag_store.isr_residual_ocxo  = isr_ocxo;
+  frag_store.dwt_cyccnt_at_pps  = dwt_cyccnt_at_pps;
+  frag_store.dwt_cycles_per_pps = dwt_cycles_per_pps;
+  frag_store.valid              = valid;
 
   dmb();
   frag_store.seq++;
 
   // Unsynchronized public mirror for diagnostic/report reads
-  frag_public.gnss_ns           = gnss_ns;
-  frag_public.dwt_ns            = dwt_ns;
-  frag_public.dwt_cycles        = dwt_cycles;
-  frag_public.ocxo_ns           = ocxo_ns;
-  frag_public.pps_count         = pps_count;
-  frag_public.isr_residual_dwt  = isr_dwt;
-  frag_public.isr_residual_gnss = isr_gnss;
-  frag_public.isr_residual_ocxo = isr_ocxo;
-  frag_public.valid             = valid;
+  frag_public.gnss_ns            = gnss_ns;
+  frag_public.dwt_ns             = dwt_ns;
+  frag_public.dwt_cycles         = dwt_cycles;
+  frag_public.ocxo_ns            = ocxo_ns;
+  frag_public.pps_count          = pps_count;
+  frag_public.isr_residual_dwt   = isr_dwt;
+  frag_public.isr_residual_gnss  = isr_gnss;
+  frag_public.isr_residual_ocxo  = isr_ocxo;
+  frag_public.dwt_cycles_per_pps = dwt_cycles_per_pps;
+  frag_public.dwt_cyccnt_at_pps  = dwt_cyccnt_at_pps;
+  frag_public.valid              = valid;
 }
 
 // ============================================================================
@@ -514,6 +563,6 @@ void on_timebase_fragment(const Payload& payload) {
 // ============================================================================
 
 void timebase_init(void) {
-  frag_store  = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, false};
+  frag_store  = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, false};
   frag_public = {};
 }

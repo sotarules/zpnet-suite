@@ -98,6 +98,11 @@ int64_t timebase_now_ns(timebase_domain_t domain);
 /// This is the primary call for most code.
 int64_t timebase_now_gnss_ns(void);
 
+/// Returns the synthetic campaign DWT cycle count at this instant.
+/// This is fragment.dwt_cycles + elapsed cycles since the PPS edge.
+/// Returns -1 if Timebase is not valid.
+int64_t timebase_now_dwt_cycles(void);
+
 // ============================================================================
 // Duration API — "how long did that take?"
 // ============================================================================
@@ -198,6 +203,8 @@ struct timebase_fragment_t {
   volatile int32_t  isr_residual_dwt;
   volatile int32_t  isr_residual_gnss;
   volatile int32_t  isr_residual_ocxo;
+  volatile uint64_t dwt_cycles_per_pps;
+  volatile uint32_t dwt_cyccnt_at_pps;
   volatile bool     valid;
 };
 
