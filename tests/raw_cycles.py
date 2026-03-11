@@ -1,6 +1,10 @@
 """
 ZPNet Raw DWT Cycles — bare per-second cycle table with running stats
 
+Recovery-aware: gaps in pps_count (from service restarts) are shown
+as marker lines and excluded from the Welford accumulators.  Only
+consecutive pps_count pairs (delta == 1) contribute to statistics.
+
 Usage:
     python -m zpnet.tests.raw_cycles <campaign_name> [limit]
     .zt raw_cycles Shakeout1
@@ -61,20 +65,33 @@ def analyze(campaign: str, limit: int = 0) -> None:
     w_m2 = 0.0
 
     count = 0
+    gaps = 0
     for i in range(1, len(rows)):
         prev = rows[i - 1]
         curr = rows[i]
 
         pps = curr.get("pps_count")
+        prev_pps = prev.get("pps_count")
         start = prev.get("teensy_dwt_cycles")
         end = curr.get("teensy_dwt_cycles")
 
-        if pps is None or start is None or end is None:
+        if pps is None or prev_pps is None or start is None or end is None:
             continue
 
         pps = int(pps)
+        prev_pps = int(prev_pps)
         start = int(start)
         end = int(end)
+
+        # Recovery gap: pps_count jumped by more than 1.
+        # Show a marker line and skip — the delta spans multiple
+        # seconds and would poison the Welford accumulators.
+        if pps != prev_pps + 1:
+            skipped = pps - prev_pps - 1
+            gaps += 1
+            print(f"  {'':>5s}  {'--- recovery':>14s}  gap {prev_pps} → {pps}  ({skipped} seconds lost)  ---")
+            continue
+
         actual = end - start
         residual = actual - DWT_FREQ_HZ
 
@@ -95,7 +112,7 @@ def analyze(campaign: str, limit: int = 0) -> None:
             break
 
     print()
-    print(f"  {count} rows")
+    print(f"  {count} rows, {gaps} recovery gap(s) skipped")
 
 
 def main():

@@ -1,5 +1,5 @@
 """
-ZPNet CLOCKS Process — TIMEBASE Authority (Pi-side) — v6 Simplified
+ZPNet CLOCKS Process — TIMEBASE Authority (Pi-side) — v7 Recovery Hardened
 
 Core contract (v2026-03+):
 
@@ -20,6 +20,17 @@ Core contract (v2026-03+):
 
     projected_gnss_ns = next_pps_count * NS_PER_SECOND
     projected_ns = projected_gnss_ns * last_clock_ns // last_gnss_ns
+
+  v7 recovery hardening (four fixes):
+
+    1. Campaign deactivated immediately on recovery entry — processor
+       thread ignores all fragments during the entire recovery window.
+    2. Fragment queue drained after Teensy STOP in warm recovery —
+       eliminates stale-fragment poisoning of Welford accumulators.
+    3. Small pps_count mismatches (≤5) are soft-skipped with re-arm
+       instead of triggering a cascading hard-fault → recovery loop.
+    4. Welford reset moved to AFTER sync fragment arrives and
+       armed_pps_count is set — zero chance of stale data.
 
   Flash-cut campaign switching:
 
@@ -126,6 +137,7 @@ _diag: Dict[str, Any] = {
     "last_hard_fault": {},
     "hard_faults_total": 0,
     "auto_recovery_failures": 0,
+    "pps_mismatch_soft_skips": 0,
 
     # Sync waits
     "sync_waits": 0,
@@ -968,7 +980,7 @@ def _process_loop() -> None:
     environment and GNSS discipline data, builds TIMEBASE, persists.
     Runs forever.
 
-    v6: Teensy v9 ISR-synchronized anchors.  No spin loop diagnostics.
+    v7: Recovery hardened.  Teensy v9 ISR-synchronized anchors.
     Fragments arrive from the Teensy with GNSS, DWT, and OCXO
     nanoseconds.  CLOCKS decorates and persists — straight through.
     """
@@ -1006,20 +1018,31 @@ def _process_loop() -> None:
         armed = _armed_pps_count
         sysclk = system_time_z()
         if armed is not None and int(pps_count) != armed:
+            delta = int(pps_count) - armed
+            _diag["pps_mismatch_soft_skips"] = _diag.get("pps_mismatch_soft_skips", 0) + 1
+
             with _sync_lock:
                 sync_active = _sync_expected_pps is not None
-            if sync_active:
-                logging.info(
-                    "ℹ️ [clocks] @%s pps_count mismatch during sync wait: "
-                    "armed=%d teensy=%d — skipping (transitional)",
-                    sysclk, armed, int(pps_count),
+
+            # Whether this is a transitional fragment during sync wait
+            # or a stale fragment after recovery, the response is the
+            # same: log it, skip processing, re-arm to the received
+            # pps_count + 1.  This prevents a cascading hard-fault →
+            # auto-recovery → hard-fault loop that was poisoning the
+            # Welford accumulators with wild residual values.
+            if abs(delta) <= 5:
+                logging.warning(
+                    "⚠️ [clocks] @%s pps_count mismatch: "
+                    "armed=%d teensy=%d (off by %+d) sync_active=%s "
+                    "— soft skip, re-arming",
+                    sysclk, armed, int(pps_count), delta, sync_active,
                 )
                 _armed_pps_count = int(pps_count) + 1
                 _diag["armed_pps_count"] = _armed_pps_count
                 continue
 
+            # Large jump (>5) is genuinely anomalous — hard fault
             _diag["hard_fault_pps_mismatch"] += 1
-            delta = int(pps_count) - armed
             logging.error(
                 "💥 [clocks] @%s TEENSY PPS COUNT MISMATCH! "
                 "armed=%d teensy=%d (off by %+d).",
@@ -1415,23 +1438,27 @@ def cmd_start(args: Optional[dict]) -> dict:
     _request_teensy_start(campaign=campaign, pps_count=0, args=teensy_args)
     logging.info("📡 [start] @%s TEENSY START returned", system_time_z())
 
-    # The sync fragment (pps_count=0) will also be enqueued for the
-    # processor thread.  Arm at 0 so the processor accepts it and
-    # advances to 1 itself.
-    _armed_pps_count = 0
-    _diag["armed_pps_count"] = 0
-    logging.info("📡 [start] @%s armed for pps_count=0 — waiting for sync fragment...", system_time_z())
+    # Wait for the sync fragment (campaign stays inactive so processor
+    # ignores any fragments that arrive during the wait).
+    logging.info("📡 [start] @%s waiting for sync fragment (pps_count=0)...", system_time_z())
 
-    # Activate campaign BEFORE waiting for sync so the processor thread
-    # will process the sync fragment when it arrives (rather than
-    # discarding it as "no campaign").
-    _campaign_active = True
-
-    # Wait for the sync fragment
     try:
         frag0, waited_s = _end_sync_wait()
     except Exception:
         return {"success": False, "message": "HARD FAULT during START sync (see logs/diag)"}
+
+    # Set armed to 1 (next expected), drain queue, reset, then activate.
+    _armed_pps_count = 1
+    _diag["armed_pps_count"] = 1
+
+    while not _fragment_queue.empty():
+        try:
+            _fragment_queue.get_nowait()
+        except queue.Empty:
+            break
+
+    _reset_trackers()
+    _campaign_active = True
 
     logging.info("✅ [start] @%s sync fragment received (waited=%.3fs)", system_time_z(), waited_s)
 
@@ -1732,6 +1759,11 @@ def _recover_campaign() -> None:
     """
     global _campaign_active, _armed_pps_count
 
+    # Immediately deactivate so the processor thread ignores all
+    # fragments during recovery — prevents stale-fragment poisoning.
+    _campaign_active = False
+    _armed_pps_count = None
+
     _diag["recovery_checks"] += 1
 
     row = _get_active_campaign()
@@ -1828,15 +1860,25 @@ def _recover_campaign() -> None:
         logging.info("📡 [recovery/cold] @%s arming TEENSY START: pps_count=0", system_time_z())
         _request_teensy_start(campaign=campaign_name, pps_count=0, args=teensy_args)
 
-        _armed_pps_count = 0
-        _diag["armed_pps_count"] = 0
-        _campaign_active = True
-
+        # Do NOT activate yet — wait for sync fragment first.
         try:
             frag, waited_s = _end_sync_wait()
         except Exception:
-            _campaign_active = False
             raise
+
+        # Set armed to 1 (next expected after pps_count=0 sync fragment),
+        # drain any accumulated fragments, then activate.
+        _armed_pps_count = 1
+        _diag["armed_pps_count"] = 1
+
+        while not _fragment_queue.empty():
+            try:
+                _fragment_queue.get_nowait()
+            except queue.Empty:
+                break
+
+        _reset_trackers()
+        _campaign_active = True
 
         logging.info(
             "✅ [recovery/cold] @%s campaign '%s' cold-restarted — TIMEBASE begins\n"
@@ -1922,6 +1964,20 @@ def _recover_campaign() -> None:
     logging.info("📡 [recovery] @%s stopping Teensy...", system_time_z())
     _request_teensy_stop_best_effort()
     time.sleep(2.0)
+
+    # Drain stale fragments that arrived before/during stop.
+    # Without this, the processor thread can dequeue old fragments
+    # after recovery completes, see a pps_count mismatch, and
+    # trigger a cascading hard-fault → recovery loop.
+    _drained = 0
+    while not _fragment_queue.empty():
+        try:
+            _fragment_queue.get_nowait()
+            _drained += 1
+        except queue.Empty:
+            break
+    if _drained > 0:
+        logging.info("🧹 [recovery] drained %d stale fragments from queue", _drained)
 
     now_frac = time.time() % 1.0
     sleep_to_boundary = (1.0 - now_frac) + 0.050
@@ -2021,8 +2077,6 @@ def _recover_campaign() -> None:
         "tau_ocxo": round(tau_ocxo, 12),
     }
 
-    _reset_trackers()
-
     # ------------------------------------------------------------------
     # Step 6: Begin sync wait, arm Teensy RECOVER
     # ------------------------------------------------------------------
@@ -2052,19 +2106,14 @@ def _recover_campaign() -> None:
 
     _request_teensy_recover(int(next_pps_count), teensy_recover_args)
 
-    # The sync fragment will also be enqueued for the processor thread.
-    # Arm at next_pps_count so the processor accepts it and advances itself.
-    _armed_pps_count = int(next_pps_count)
-    _diag["armed_pps_count"] = int(next_pps_count)
-
-    # Activate campaign BEFORE waiting for sync so the processor thread
-    # will process the sync fragment when it arrives (rather than
-    # discarding it as "no campaign").
-    _campaign_active = True
+    # Do NOT activate the campaign yet.  The sync fragment will be
+    # caught by the _sync_event latch (runs on the PUBSUB thread) and
+    # also enqueued for the processor.  But with _campaign_active=False,
+    # the processor ignores it — no race over _armed_pps_count.
+    # We activate AFTER setting the final armed value below.
     try:
         frag, waited_s = _end_sync_wait(timeout_s=SYNC_RECOVER_TIMEOUT_S)
     except Exception:
-        _campaign_active = False
         raise
 
     logging.info("✅ [recovery] @%s sync fragment received (waited=%.3fs)", system_time_z(), waited_s)
@@ -2078,14 +2127,37 @@ def _recover_campaign() -> None:
             teensy_pps_count, next_pps_count, overshoot,
         )
 
-    # The sync fragment is also in the processor queue.  Arm at
-    # teensy_pps_count so the processor accepts it and advances to +1.
-    _armed_pps_count = teensy_pps_count
+    # Set the final armed value from the ACTUAL teensy pps_count,
+    # then drain any fragments that accumulated during the sync wait
+    # (including the sync fragment itself — the processor would just
+    # soft-skip it anyway since campaign was inactive).  This ensures
+    # the processor starts with an empty queue and a correct armed value.
+    _armed_pps_count = teensy_pps_count + 1
     _diag["armed_pps_count"] = _armed_pps_count
 
+    _drained_post = 0
+    while not _fragment_queue.empty():
+        try:
+            _fragment_queue.get_nowait()
+            _drained_post += 1
+        except queue.Empty:
+            break
+    if _drained_post > 0:
+        logging.info("🧹 [recovery] drained %d fragments accumulated during sync wait", _drained_post)
+
+    # Reset Welford accumulators AFTER the sync fragment and arming are
+    # settled.  This guarantees no stale fragments can poison the new
+    # campaign statistics — the queue was drained, the campaign was
+    # deactivated during the entire recovery window, and now we start
+    # fresh.
+    _reset_trackers()
+
+    # NOW activate — processor thread will see the next fresh fragment
+    # from the Teensy with _armed_pps_count already correct.
+    _campaign_active = True
+
     # ------------------------------------------------------------------
-    # Step 7: Campaign already active (activated before sync wait).
-    # Log final state.
+    # Step 7: Campaign activated.  Log final state.
     # ------------------------------------------------------------------
 
     logging.info(
@@ -2600,10 +2672,9 @@ def run() -> None:
     setup_logging()
 
     logging.info(
-        "🕐 [clocks] v6 — Teensy v9 ISR-synchronized anchors. "
+        "🕐 [clocks] v7 — Recovery hardened. Teensy v9 ISR-synchronized anchors. "
         "Three clock domains: GNSS (reference), DWT, OCXO. "
-        "Spin loop eliminated. TIMEBASE record simplified. "
-        "Recovery is symmetric: projected_ns = projected_gnss_ns × last_clock_ns ÷ last_gnss_ns. "
+        "Recovery: campaign deactivated + queue drained + soft-skip mismatch (≤5) + late Welford reset. "
         "START while active performs seamless flash-cut to new campaign. "
         "Commands: START, STOP, RESUME, REPORT, CLEAR, DELETE, SET_DAC, "
         "SET_BASELINE, BASELINE_INFO, LIST_CAMPAIGNS, CLOCKS_INFO."
