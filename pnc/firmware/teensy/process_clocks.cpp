@@ -1,5 +1,5 @@
 // ============================================================================
-// process_clocks.cpp — ZPNet CLOCKS (Teensy) — v9 ISR-Synchronized Anchors
+// process_clocks.cpp — ZPNet CLOCKS (Teensy) — v10 Trend-Aware Statistics
 // ============================================================================
 //
 // CLOCKS is a dormant, PPS-anchored measurement instrument.
@@ -46,6 +46,42 @@
 //   The deterministic overload timebase_gnss_ns_from_dwt() allows
 //   callers with ISR-captured DWT values to compute GNSS nanoseconds
 //   without any live register reads or torn-read loops.
+//
+// v10: Trend-aware prediction statistics.
+//
+//   The per-second DWT and OCXO deltas exhibit slow thermal drift —
+//   the crystal frequency changes by a few cycles per second over
+//   minutes.  The existing Welford residual tracker measures the
+//   spread of all residuals relative to the nominal frequency, which
+//   conflates thermal drift range with measurement noise.
+//
+//   v10 adds a trend-aware prediction layer:
+//
+//     predicted_delta = prev_delta + (prev_delta - prev_prev_delta)
+//     prediction_residual = actual_delta - predicted_delta
+//
+//   This is linear extrapolation from the two most recent deltas.
+//   Welford statistics on the prediction residual directly measure
+//   the instrument's actual interpolation uncertainty — "how wrong
+//   is my best estimate of this second's crystal rate?"
+//
+//   The prediction residual stddev is the authoritative confidence
+//   metric for sub-second interpolation.  For DWT this is expected
+//   to be ~2-4 cycles (2-4 ns); for OCXO ~1-3 ticks (100-300 ns).
+//
+//   Additionally, dwt_cycles_per_pps now uses the PREDICTED count
+//   instead of the raw prior count, improving interpolation accuracy
+//   when the crystal is actively drifting.
+//
+//   New TIMEBASE_FRAGMENT fields:
+//     dwt_pred_residual      — latest prediction error (cycles)
+//     dwt_pred_mean          — running mean of prediction errors
+//     dwt_pred_stddev        — stddev of prediction errors
+//     dwt_pred_n             — sample count
+//     ocxo_pred_residual     — latest prediction error (ticks)
+//     ocxo_pred_mean         — running mean of prediction errors
+//     ocxo_pred_stddev       — stddev of prediction errors
+//     ocxo_pred_n            — sample count
 //
 // ============================================================================
 
@@ -149,14 +185,6 @@ static void pps_relay_deassert(timepop_ctx_t*, void*) {
 // ============================================================================
 // ISR-level hardware snapshots and residuals (canary diagnostics)
 // ============================================================================
-//
-// The ISR captures raw 32-bit register values for three purposes:
-//   1. VCLOCK validation gate (isr_snap_gnss vs isr_prev_gnss)
-//   2. ISR residual canaries (should be near-zero for GNSS, stable for DWT/OCXO)
-//   3. OCXO delta accumulation (isr_snap_ocxo is the per-PPS anchor)
-//
-// DWT uses the spin loop shadow, not the ISR capture.
-// Neither DWT nor OCXO uses advance-then-rewind.
 
 static volatile uint32_t isr_snap_dwt  = 0;
 static volatile uint32_t isr_snap_gnss = 0;
@@ -185,25 +213,13 @@ static volatile uint32_t diag_pps_rejected_total     = 0;
 static volatile uint32_t diag_pps_rejected_remainder = 0;
 
 // ============================================================================
-// Pre-PPS spin loop — REMOVED (v9)
+// PPS state
 // ============================================================================
-//
-// The spin loop has been eliminated.  Both clock anchors (DWT and GPT2)
-// are now captured in the PPS ISR at entry.  They are ~50 ns after the
-// true PPS edge but synchronized with each other (~2 ns apart).
-//
-// The ISR entry latency is deterministic and stable (~50 ns as proven
-// by months of tdc_analyzer data).  Since both anchors share the same
-// latency, the skew between them is effectively zero.
-//
-// This eliminates: the fine timer, the spin loop, BASEPRI masking,
-// dispatch_shadow_dwt, isr_captured_shadow_dwt, dispatch_shadow_valid,
-// dispatch_timeout, and the associated complexity.
 
 static volatile bool     pps_fired = false;
 
 // ============================================================================
-// PPS residual tracking — Welford's, callback-level
+// PPS residual tracking — Welford's, callback-level (EXISTING)
 // ============================================================================
 
 static constexpr int64_t DWT_EXPECTED_PER_PPS  = 1008000000LL;
@@ -264,19 +280,107 @@ static inline double residual_stderr(const pps_residual_t& r) {
 }
 
 // ============================================================================
-// 64-bit accumulators — built from successive raw 32-bit deltas
+// Trend-aware prediction tracking (v10)
 // ============================================================================
 //
-// At each PPS edge, we compute the raw 32-bit delta from the previous
-// edge and add it to the 64-bit accumulator.  The accumulator is
-// touched ONLY in the ASAP callback, ONCE per second.
+// For DWT and OCXO, we track:
+//   - The previous raw delta (prev_delta)
+//   - The delta before that (prev_prev_delta), for trend computation
+//   - Whether we have enough history to predict (need 2 prior deltas)
+//   - A predicted value for the current second
+//   - Welford statistics on the prediction residual (actual - predicted)
 //
-// DWT: uses ISR-latched pre-edge shadow (isr_captured_shadow_dwt)
-// OCXO: uses ISR snapshot (isr_snap_ocxo)
-// GNSS: pure arithmetic (campaign_seconds × constant)
+// The prediction is simple linear extrapolation:
+//   predicted = prev_delta + (prev_delta - prev_prev_delta)
+//             = 2 * prev_delta - prev_prev_delta
 //
-// prev_dwt_at_pps and prev_ocxo_at_pps hold the raw 32-bit register
-// value from the previous PPS edge, for delta computation.
+// This captures the first derivative of thermal drift.  For a crystal
+// drifting at ~2 cycles/second/second, the prediction residual will be
+// near zero (the trend is the friend).
+//
+// GNSS ticks are exact by definition (10 MHz phase-coherent) so no
+// prediction is needed.
+//
+
+struct prediction_tracker_t {
+  // History (raw deltas, in native units: cycles for DWT, ticks for OCXO)
+  uint32_t prev_delta;
+  uint32_t prev_prev_delta;
+  uint32_t predicted;           // predicted delta for THIS second
+  int32_t  pred_residual;       // actual - predicted (latest)
+  uint8_t  history_count;       // 0, 1, or 2+ (need 2 to predict)
+  bool     predicted_valid;     // true if we have a prediction for this second
+
+  // Welford on prediction residuals
+  uint64_t n;
+  double   mean;
+  double   m2;
+};
+
+static prediction_tracker_t pred_dwt  = {};
+static prediction_tracker_t pred_ocxo = {};
+
+static void prediction_reset(prediction_tracker_t& p) {
+  p.prev_delta      = 0;
+  p.prev_prev_delta = 0;
+  p.predicted       = 0;
+  p.pred_residual   = 0;
+  p.history_count   = 0;
+  p.predicted_valid = false;
+  p.n               = 0;
+  p.mean            = 0.0;
+  p.m2              = 0.0;
+}
+
+// Call AFTER computing this second's raw delta.
+// Updates prediction stats and shifts history for next second.
+static void prediction_update(prediction_tracker_t& p, uint32_t actual_delta) {
+
+  if (p.predicted_valid) {
+    // We had a prediction for this second — score it
+    p.pred_residual = (int32_t)actual_delta - (int32_t)p.predicted;
+
+    p.n++;
+    const double x  = (double)p.pred_residual;
+    const double d1 = x - p.mean;
+    p.mean += d1 / (double)p.n;
+    const double d2 = x - p.mean;
+    p.m2 += d1 * d2;
+  }
+
+  // Shift history: current becomes previous, previous becomes prev_prev
+  p.prev_prev_delta = p.prev_delta;
+  p.prev_delta      = actual_delta;
+
+  if (p.history_count < 2) {
+    p.history_count++;
+  }
+
+  // Compute prediction for NEXT second (available to callers immediately)
+  if (p.history_count >= 2) {
+    // Linear extrapolation: next = current + (current - previous)
+    // = 2 * current - previous
+    // Done in signed to handle the case where previous > current
+    int64_t pred = 2 * (int64_t)p.prev_delta - (int64_t)p.prev_prev_delta;
+    // Clamp to positive (a negative cycle count is nonsensical)
+    p.predicted = (pred > 0) ? (uint32_t)pred : p.prev_delta;
+    p.predicted_valid = true;
+  } else {
+    p.predicted_valid = false;
+  }
+}
+
+static inline double prediction_stddev(const prediction_tracker_t& p) {
+  return (p.n >= 2) ? sqrt(p.m2 / (double)(p.n - 1)) : 0.0;
+}
+
+static inline double prediction_stderr(const prediction_tracker_t& p) {
+  return (p.n >= 2) ? sqrt(p.m2 / (double)(p.n - 1)) / sqrt((double)p.n) : 0.0;
+}
+
+// ============================================================================
+// 64-bit accumulators — built from successive raw 32-bit deltas
+// ============================================================================
 
 static uint64_t dwt_cycles_64      = 0;
 static uint32_t prev_dwt_at_pps    = 0;
@@ -287,10 +391,6 @@ static uint32_t prev_ocxo_at_pps   = 0;
 // ============================================================================
 // Rolling 64-bit extensions for general use (TimePop, reports)
 // ============================================================================
-//
-// These are the "anytime" 64-bit extensions for code that needs to
-// read DWT/GNSS/OCXO outside the PPS callback.  They use the
-// traditional advance-on-read pattern and are NOT used for TIMEBASE.
 
 static uint64_t dwt_rolling_64  = 0;
 static uint32_t dwt_rolling_32  = 0;
@@ -326,10 +426,6 @@ uint64_t clocks_dwt_ns_now(void) {
 // ============================================================================
 // GNSS VCLOCK (10 MHz external via GPT2 — raw, polled)
 // ============================================================================
-//
-// The rolling 64-bit extension is maintained for TimePop (which uses
-// GPT2 for scheduling).  For TIMEBASE, GNSS ns is pure arithmetic:
-// gnss_ns = campaign_seconds × NS_PER_SECOND (phase coherence).
 
 static uint64_t gnss_ticks_64 = 0;
 static uint32_t gnss_last_32  = 0;
@@ -420,9 +516,6 @@ uint64_t clocks_ocxo_ns_now(void) {
 static void clocks_zero_all(void) {
   timebase_invalidate();
 
-  // Zero the TIMEBASE accumulators and anchor at this PPS edge.
-  // prev_dwt_at_pps must use the same ISR correction as dwt_raw_at_pps
-  // in the ASAP callback, otherwise the first delta wraps by -52.
   dwt_cycles_64    = 0;
   prev_dwt_at_pps  = isr_snap_dwt - ISR_ENTRY_DWT_CYCLES;
 
@@ -431,7 +524,6 @@ static void clocks_zero_all(void) {
 
   campaign_seconds = 0;
 
-  // Zero the rolling extensions (for reports / TimePop)
   dwt_rolling_64  = 0;  dwt_rolling_32  = DWT_CYCCNT;
   gnss_ticks_64   = 0;  gnss_last_32    = GPT2_CNT;
   ocxo_rolling_64 = 0;  ocxo_rolling_32 = GPT1_CNT;
@@ -439,6 +531,10 @@ static void clocks_zero_all(void) {
   residual_reset(residual_dwt);
   residual_reset(residual_gnss);
   residual_reset(residual_ocxo);
+
+  // v10: reset prediction trackers
+  prediction_reset(pred_dwt);
+  prediction_reset(pred_ocxo);
 
   isr_prev_dwt       = isr_snap_dwt;
   isr_prev_gnss      = isr_snap_gnss;
@@ -505,8 +601,6 @@ static void pps_asap_callback(timepop_ctx_t*, void*) {
 
     timebase_invalidate();
 
-    // Seed the accumulators from recovered nanosecond values.
-    // prev_dwt_at_pps must use the same ISR correction as dwt_raw_at_pps.
     dwt_cycles_64    = dwt_ns_to_cycles(recover_dwt_ns);
     prev_dwt_at_pps  = isr_snap_dwt - ISR_ENTRY_DWT_CYCLES;
 
@@ -518,13 +612,16 @@ static void pps_asap_callback(timepop_ctx_t*, void*) {
 
     campaign_seconds = recover_gnss_ns / 1000000000ull;
 
-    // Reset rolling extensions
     dwt_rolling_64  = 0;  dwt_rolling_32  = DWT_CYCCNT;
     ocxo_rolling_64 = 0;  ocxo_rolling_32 = GPT1_CNT;
 
     residual_reset(residual_dwt);
     residual_reset(residual_gnss);
     residual_reset(residual_ocxo);
+
+    // v10: reset prediction trackers on recovery
+    prediction_reset(pred_dwt);
+    prediction_reset(pred_ocxo);
 
     isr_residual_valid = false;
     pps_fired          = true;
@@ -548,23 +645,11 @@ static void pps_asap_callback(timepop_ctx_t*, void*) {
     pps_fired = false;
 
     // ── Clock values at PPS edge — direct delta accumulation ──
-    //
-    // Each accumulator advances by the exact raw 32-bit delta since
-    // the previous PPS edge.  No advance-then-rewind.  No intermediate
-    // reads.  The accumulator is touched ONLY here, ONCE per second.
-    //
-    // v9: DWT uses isr_snap_dwt directly (ISR capture, ~50 ns after edge).
-    // Both DWT and GPT2 anchors come from the same ISR entry, so they
-    // are synchronized with each other.  The ~50 ns ISR entry latency
-    // is shared and cancels in any DWT-vs-GPT2 comparison.
 
     // GNSS: arithmetic (phase coherent — exact by definition)
     const uint64_t pps_gnss_ns = campaign_seconds * NS_PER_SECOND;
 
     // DWT: ISR capture, corrected to PPS edge.
-    // isr_snap_dwt is captured ~52 cycles after the PPS edge.
-    // Subtract ISR_ENTRY_DWT_CYCLES to recover the DWT count at
-    // the true PPS moment — the same instant gnss_ns represents.
     uint32_t dwt_raw_at_pps = isr_snap_dwt - ISR_ENTRY_DWT_CYCLES;
     uint32_t dwt_delta = dwt_raw_at_pps - prev_dwt_at_pps;
     dwt_cycles_64   += dwt_delta;
@@ -584,10 +669,20 @@ static void pps_asap_callback(timepop_ctx_t*, void*) {
     // GNSS ticks for residual tracking (phase coherent)
     const uint64_t pps_gnss_ticks = campaign_seconds * (uint64_t)ISR_GNSS_EXPECTED;
 
-    // ── Residual updates ──
+    // ── Existing residual updates (unchanged) ──
     residual_update(residual_dwt,  pps_dwt_cycles,  DWT_EXPECTED_PER_PPS);
     residual_update(residual_gnss, pps_gnss_ticks,  GNSS_EXPECTED_PER_PPS);
     residual_update(residual_ocxo, pps_ocxo_ticks,  OCXO_EXPECTED_PER_PPS);
+
+    // ── v10: Prediction tracking ──
+    //
+    // prediction_update() scores the prediction we made last second
+    // (if any), shifts history, and computes a prediction for NEXT
+    // second.  The predicted value is immediately available as
+    // pred_dwt.predicted / pred_ocxo.predicted.
+    //
+    prediction_update(pred_dwt,  dwt_delta);
+    prediction_update(pred_ocxo, ocxo_delta);
 
     ocxo_calibration_servo();
 
@@ -604,13 +699,29 @@ static void pps_asap_callback(timepop_ctx_t*, void*) {
     p.add("dwt_cyccnt_at_pps", (uint32_t)dwt_raw_at_pps);
     p.add("gpt2_at_pps",      (uint32_t)isr_snap_gnss);
 
-    // DWT cycles in the second that just completed — the raw hardware
-    // delta, not an average.  This is the best available estimate of
-    // the crystal's current frequency for sub-second interpolation.
-    // Jitter is ~7 ns (the DWT measurement floor).
+    // DWT cycles in the second that just completed.
+    //
+    // v10: If the prediction tracker has a valid prediction, use it
+    // as the interpolation denominator.  The predicted value accounts
+    // for the crystal's thermal drift trend and is a better estimate
+    // of the current second's true rate than the raw prior delta.
+    //
     // On pps_count == 0 there is no prior second, so use nominal.
-    p.add("dwt_cycles_per_pps", (campaign_seconds > 0) ? (uint64_t)dwt_delta : (uint64_t)DWT_EXPECTED_PER_PPS);
+    // During the first two seconds (history_count < 2), fall back
+    // to the raw delta.
+    if (campaign_seconds == 0) {
+      p.add("dwt_cycles_per_pps", (uint64_t)DWT_EXPECTED_PER_PPS);
+    } else if (pred_dwt.predicted_valid) {
+      p.add("dwt_cycles_per_pps", (uint64_t)pred_dwt.predicted);
+    } else {
+      p.add("dwt_cycles_per_pps", (uint64_t)dwt_delta);
+    }
 
+    // Raw delta (always published for diagnostics and raw_cycles tool)
+    p.add("dwt_delta_raw",    (uint64_t)dwt_delta);
+    p.add("ocxo_delta_raw",   (uint64_t)ocxo_delta);
+
+    // Existing residual stats
     p.add("dwt_pps_residual",  residual_dwt.residual);
     p.add("gnss_pps_residual", residual_gnss.residual);
     p.add("ocxo_pps_residual", residual_ocxo.residual);
@@ -620,6 +731,18 @@ static void pps_asap_callback(timepop_ctx_t*, void*) {
     p.add("isr_residual_ocxo",  isr_residual_ocxo);
     p.add("isr_residual_valid", isr_residual_valid);
 
+    // ── v10: Prediction statistics ──
+    p.add("dwt_pred_residual",  pred_dwt.pred_residual);
+    p.add("dwt_pred_mean",      pred_dwt.mean);
+    p.add("dwt_pred_stddev",    prediction_stddev(pred_dwt));
+    p.add("dwt_pred_n",         pred_dwt.n);
+
+    p.add("ocxo_pred_residual", pred_ocxo.pred_residual);
+    p.add("ocxo_pred_mean",     pred_ocxo.mean);
+    p.add("ocxo_pred_stddev",   prediction_stddev(pred_ocxo));
+    p.add("ocxo_pred_n",        pred_ocxo.n);
+
+    // OCXO control state
     p.add("ocxo_dac",          ocxo_dac_fractional);
     p.add("calibrate_ocxo",    calibrate_ocxo_active);
     p.add("servo_adjustments", servo_adjustments);
@@ -795,6 +918,23 @@ static void report_residual(Payload& p, const char* prefix,
 }
 
 // ============================================================================
+// Helper — prediction stats into a Payload (v10)
+// ============================================================================
+
+static void report_prediction(Payload& p, const char* prefix,
+                              const prediction_tracker_t& t) {
+  char key[48];
+  snprintf(key, sizeof(key), "%s_pred_residual", prefix); p.add(key, t.pred_residual);
+  snprintf(key, sizeof(key), "%s_pred_n",        prefix); p.add(key, t.n);
+  snprintf(key, sizeof(key), "%s_pred_mean",     prefix); p.add_fmt(key, "%.3f", t.mean);
+  snprintf(key, sizeof(key), "%s_pred_stddev",   prefix); p.add_fmt(key, "%.3f", prediction_stddev(t));
+  snprintf(key, sizeof(key), "%s_pred_stderr",   prefix); p.add_fmt(key, "%.3f", prediction_stderr(t));
+  snprintf(key, sizeof(key), "%s_pred_valid",    prefix); p.add(key, t.predicted_valid);
+  snprintf(key, sizeof(key), "%s_pred_predicted", prefix); p.add(key, t.predicted);
+  snprintf(key, sizeof(key), "%s_delta_raw",     prefix); p.add(key, t.prev_delta);
+}
+
+// ============================================================================
 // REPORT — authoritative operational surface
 // ============================================================================
 
@@ -836,6 +976,10 @@ static Payload cmd_report(const Payload&) {
   report_residual(p, "dwt",  residual_dwt);
   report_residual(p, "gnss", residual_gnss);
   report_residual(p, "ocxo", residual_ocxo);
+
+  // v10: prediction stats in REPORT
+  report_prediction(p, "dwt",  pred_dwt);
+  report_prediction(p, "ocxo", pred_ocxo);
 
   p.add("isr_residual_dwt",   isr_residual_dwt);
   p.add("isr_residual_gnss",  isr_residual_gnss);
@@ -931,25 +1075,6 @@ static Payload cmd_clocks_info(const Payload&) {
 // ============================================================================
 // INTERP_TEST — Zero-gap interpolation accuracy test
 // ============================================================================
-//
-// Captures DWT_CYCCNT and GPT2_CNT back-to-back (~2 ns apart), then:
-//
-//   1. Feeds the DWT value to timebase_gnss_ns_from_dwt() — the
-//      deterministic overload with no live reads, no torn-read loop.
-//
-//   2. Computes VCLOCK truth from the GPT2 value:
-//      truth = frag.gnss_ns + (gpt2_now - frag.gpt2_at_pps) × 100
-//
-//   3. Error = interpolated - truth.
-//
-// The two register reads are separated by ~2 instructions = ~2 ns.
-// This eliminates the -86 ns systematic bias from the previous version
-// where timebase_now_gnss_ns() read DWT internally, separated from
-// the GPT2 read by the function's execution time.
-//
-// The error now reflects purely the interpolation math accuracy —
-// the mismatch between the prior second's DWT rate and the current
-// second's true rate.
 
 static Payload cmd_interp_test(const Payload& args) {
   Payload p;
@@ -962,7 +1087,6 @@ static Payload cmd_interp_test(const Payload& args) {
   const int32_t count = args.getInt("count", 10);
   const int32_t n = (count < 1) ? 1 : (count > 100) ? 100 : count;
 
-  // Welford accumulators for error
   int64_t  w_n     = 0;
   double   w_mean  = 0.0;
   double   w_m2    = 0.0;
@@ -970,7 +1094,6 @@ static Payload cmd_interp_test(const Payload& args) {
   int64_t  err_max = INT64_MIN;
   int32_t  outside_100ns = 0;
 
-  // First sample forensics
   uint64_t s0_frag_gnss_ns          = 0;
   uint32_t s0_frag_dwt_cyccnt_at_pps = 0;
   uint32_t s0_frag_dwt_cycles_per_pps = 0;
@@ -992,7 +1115,6 @@ static Payload cmd_interp_test(const Payload& args) {
 
   for (int32_t i = 0; i < n; i++) {
 
-    // ── Read fragment ──
     const timebase_fragment_t* frag = timebase_last_fragment();
     if (!frag || !frag->valid) {
       p.add("error", "timebase not valid");
@@ -1010,11 +1132,9 @@ static Payload cmd_interp_test(const Payload& args) {
       return p;
     }
 
-    // ── Simultaneous capture: DWT and GPT2 back-to-back (~2 ns gap) ──
     const uint32_t dwt_now  = ARM_DWT_CYCCNT;
     const uint32_t gpt2_now = GPT2_CNT;
 
-    // ── Interpolated GNSS ns via deterministic overload ──
     const int64_t interp_signed = timebase_gnss_ns_from_dwt(
       dwt_now,
       frag_gnss_ns,
@@ -1027,20 +1147,16 @@ static Payload cmd_interp_test(const Payload& args) {
     }
     const uint64_t interp_gnss_ns = (uint64_t)interp_signed;
 
-    // ── VCLOCK truth from GPT2 ──
     const uint32_t gpt2_since_pps = gpt2_now - frag_gpt2_at_pps;
     const uint64_t vclock_ns_into_second = (uint64_t)gpt2_since_pps * 100ULL;
     const uint64_t vclock_gnss_ns = frag_gnss_ns + vclock_ns_into_second;
 
-    // ── Error ──
     const int64_t error_ns = (int64_t)interp_gnss_ns - (int64_t)vclock_gnss_ns;
 
-    // ── DWT interim values ──
     const uint32_t dwt_elapsed = dwt_now - frag_dwt_cyccnt_at_pps;
     const uint64_t dwt_ns_into_second =
       (uint64_t)dwt_elapsed * 1000000000ULL / (uint64_t)frag_dwt_cycles_per_pps;
 
-    // ── Welford ──
     w_n++;
     const double x  = (double)error_ns;
     const double d1 = x - w_mean;
@@ -1052,7 +1168,6 @@ static Payload cmd_interp_test(const Payload& args) {
     if (error_ns > err_max) err_max = error_ns;
     if (error_ns > 100 || error_ns < -100) outside_100ns++;
 
-    // ── Capture first sample detail ──
     if (i == 0) {
       s0_frag_gnss_ns            = frag_gnss_ns;
       s0_frag_dwt_cyccnt_at_pps  = frag_dwt_cyccnt_at_pps;
@@ -1075,12 +1190,9 @@ static Payload cmd_interp_test(const Payload& args) {
     }
   }
 
-  // ── Build response ──
-
   const double w_stddev = (w_n >= 2) ? sqrt(w_m2 / (double)(w_n - 1)) : 0.0;
   const double w_stderr = (w_n >= 2) ? w_stddev / sqrt((double)w_n)    : 0.0;
 
-  // Stats
   p.add("samples",         (int32_t)w_n);
   p.add("error_mean_ns",   w_mean);
   p.add("error_stddev_ns", w_stddev);
@@ -1089,32 +1201,26 @@ static Payload cmd_interp_test(const Payload& args) {
   p.add("error_max_ns",    err_max);
   p.add("outside_100ns",   outside_100ns);
 
-  // Fragment state
   p.add("s0_frag_gnss_ns",            s0_frag_gnss_ns);
   p.add("s0_frag_dwt_cyccnt_at_pps",  s0_frag_dwt_cyccnt_at_pps);
   p.add("s0_frag_dwt_cycles_per_pps", s0_frag_dwt_cycles_per_pps);
   p.add("s0_frag_gpt2_at_pps",        s0_frag_gpt2_at_pps);
   p.add("s0_pps_count",               s0_pps_count);
 
-  // Raw hardware reads
   p.add("s0_dwt_cyccnt_now",          s0_dwt_cyccnt_now);
   p.add("s0_gpt2_now",                s0_gpt2_now);
 
-  // DWT interpolation chain
   p.add("s0_dwt_elapsed",             s0_dwt_elapsed);
   p.add("s0_dwt_ns_into_second",      s0_dwt_ns_into_second);
   p.add("s0_interp_gnss_ns",          s0_interp_gnss_ns);
 
-  // VCLOCK truth chain
   p.add("s0_gpt2_since_pps",          s0_gpt2_since_pps);
   p.add("s0_vclock_ns_into_second",   s0_vclock_ns_into_second);
   p.add("s0_vclock_gnss_ns",          s0_vclock_gnss_ns);
 
-  // Error + position
   p.add("s0_error_ns",                s0_error_ns);
   p.add("s0_position",                s0_position);
 
-  // Context
   p.add("campaign_seconds",           campaign_seconds);
   p.add("pps_rejected_total",         diag_pps_rejected_total);
 
@@ -1124,25 +1230,6 @@ static Payload cmd_interp_test(const Payload& args) {
 // ============================================================================
 // INTERP_PROOF — Long-running interpolation accuracy proof
 // ============================================================================
-//
-// Takes ONE sample per invocation and accumulates Welford stats across
-// calls.  Designed to be called once per second (or at any interval)
-// from the Pi side.  The position within the second varies naturally
-// with command arrival time, providing coverage across the full second.
-//
-// Commands:
-//   INTERP_PROOF               — take one sample, return running stats
-//   INTERP_PROOF reset=1       — clear accumulators, then take one sample
-//
-// If the math is correct:
-//   - mean converges to zero (or a small physical constant)
-//   - stddev converges to the jitter floor (~30 ns)
-//   - stderr shrinks as 1/sqrt(N)
-//   - no correlation between error and position in second
-//
-// If there's a systematic bug:
-//   - mean converges to a nonzero value
-//   - stderr gets small enough to prove the offset is real
 
 static int64_t  proof_n       = 0;
 static double   proof_mean    = 0.0;
@@ -1151,10 +1238,9 @@ static int64_t  proof_err_min = 0;
 static int64_t  proof_err_max = 0;
 static int32_t  proof_outside_100 = 0;
 
-// Position tracking — to detect correlation with position
-static double   proof_pos_mean = 0.0;   // mean position in second (0..1)
+static double   proof_pos_mean = 0.0;
 static double   proof_pos_m2   = 0.0;
-static double   proof_covar    = 0.0;   // covariance(error, position)
+static double   proof_covar    = 0.0;
 
 static Payload cmd_interp_proof(const Payload& args) {
   Payload p;
@@ -1164,7 +1250,6 @@ static Payload cmd_interp_proof(const Payload& args) {
     return p;
   }
 
-  // Reset if requested
   if (args.getInt("reset", 0)) {
     proof_n       = 0;
     proof_mean    = 0.0;
@@ -1177,9 +1262,6 @@ static Payload cmd_interp_proof(const Payload& args) {
     proof_covar    = 0.0;
   }
 
-  // ── Take one sample ──
-
-  // Interpolated GNSS ns (the code under test)
   const int64_t interp_signed = timebase_now_gnss_ns();
   if (interp_signed < 0) {
     p.add("error", "timebase_now_gnss_ns failed");
@@ -1187,10 +1269,8 @@ static Payload cmd_interp_proof(const Payload& args) {
   }
   const uint64_t interp_gnss_ns = (uint64_t)interp_signed;
 
-  // VCLOCK truth — captured immediately after
   const uint32_t gpt2_now = GPT2_CNT;
 
-  // Fragment for base
   const timebase_fragment_t* frag = timebase_last_fragment();
   if (!frag || !frag->valid) {
     p.add("error", "timebase not valid");
@@ -1205,10 +1285,8 @@ static Payload cmd_interp_proof(const Payload& args) {
 
   const int64_t error_ns = (int64_t)interp_gnss_ns - (int64_t)vclock_gnss_ns;
 
-  // Position in second (0.0 to 1.0)
   const double position = (double)vclock_ns_into_second / 1000000000.0;
 
-  // ── Welford update for error ──
   proof_n++;
   const double x  = (double)error_ns;
   const double d1 = x - proof_mean;
@@ -1225,26 +1303,21 @@ static Payload cmd_interp_proof(const Payload& args) {
   }
   if (error_ns > 100 || error_ns < -100) proof_outside_100++;
 
-  // ── Welford update for position + covariance ──
   const double pd1 = position - proof_pos_mean;
   proof_pos_mean += pd1 / (double)proof_n;
   const double pd2 = position - proof_pos_mean;
   proof_pos_m2 += pd1 * pd2;
 
-  // Online covariance: Co(n) += (x - mean_x_new) * (pos - mean_pos_old)
   proof_covar += d2 * pd1;
 
-  // ── Compute stats ──
   const double stddev = (proof_n >= 2) ? sqrt(proof_m2 / (double)(proof_n - 1)) : 0.0;
   const double stderr_val = (proof_n >= 2) ? stddev / sqrt((double)proof_n) : 0.0;
   const double pos_stddev = (proof_n >= 2) ? sqrt(proof_pos_m2 / (double)(proof_n - 1)) : 0.0;
 
-  // Correlation coefficient: r = covar / (stddev_error * stddev_position)
   const double correlation = (proof_n >= 2 && stddev > 0.0 && pos_stddev > 0.0)
     ? (proof_covar / (double)(proof_n - 1)) / (stddev * pos_stddev)
     : 0.0;
 
-  // ── Build response ──
   p.add("n",               (int32_t)proof_n);
   p.add("error_ns",        error_ns);
   p.add("mean_ns",         proof_mean);
