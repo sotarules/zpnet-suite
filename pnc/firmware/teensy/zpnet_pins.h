@@ -118,7 +118,7 @@ GND           Black         GND                Battery branching ground         
 
 10            Twisted Pair  OCXO2_10MHZ_IN     OCXO2                                QTimer1 ch0 external clock (critical timing)
 
-11            —             OCXO2_CTL          OCXO2 CTL                            PWM output for OCXO2 frequency trim
+11            Green         OCXO2_CTL          OCXO2 CTL                            PWM output for OCXO2 frequency trim
 
 -------------------------------------------------------------------------------
 Unassigned pins (available for future use):

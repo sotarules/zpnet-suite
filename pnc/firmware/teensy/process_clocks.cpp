@@ -1,5 +1,5 @@
 // ============================================================================
-// process_clocks.cpp — ZPNet CLOCKS (Teensy) — v11 Dual OCXO
+// process_clocks.cpp — ZPNet CLOCKS (Teensy) — v11.1 Dual OCXO (QTimer edge fix)
 // ============================================================================
 //
 // CLOCKS is a dormant, PPS-anchored measurement instrument.
@@ -36,6 +36,25 @@
 //
 //   The dither callback runs at 1 kHz and writes both PWM pins in
 //   the same invocation.
+//
+// v11.1: QTimer dual-edge correction.
+//
+//   The i.MX RT1062 QTimer in CM(2) mode ("count rising edges of
+//   primary source") counts BOTH rising and falling edges of the
+//   external 10 MHz signal, producing ~20 MHz raw counts.  This is
+//   a known hardware behavior — the GPT timers (used for GNSS and
+//   OCXO1) do not exhibit this because their external clock input
+//   path (CLKSRC=3) has dedicated edge selection logic.
+//
+//   Fix: all OCXO2 raw QTimer counts are divided by 2 at the point
+//   of conversion to 10 MHz ticks.  The raw 20 MHz values are
+//   preserved in ISR snapshots and isr_residual_ocxo2 for hardware
+//   diagnostics.  The divided values flow into the 64-bit tick
+//   accumulator, prediction tracker, and nanosecond conversion —
+//   making OCXO2 ticks semantically identical to OCXO1 ticks.
+//
+//   The ±0.5 tick quantization from integer division is negligible:
+//   50 ns against a prediction stddev of ~100 ns.
 //
 // v10.1: Prediction Welford initialization guard (unchanged).
 // v10:   Trend-aware prediction statistics (unchanged).
@@ -174,6 +193,11 @@ static volatile bool     isr_residual_valid = false;
 static constexpr uint32_t ISR_DWT_EXPECTED  = DWT_EXPECTED_PER_PPS;
 static constexpr uint32_t ISR_GNSS_EXPECTED = TICKS_10MHZ_PER_SECOND;
 static constexpr uint32_t ISR_OCXO_EXPECTED = TICKS_10MHZ_PER_SECOND;
+
+// QTimer1 counts both edges of the 10 MHz signal (hardware behavior).
+// Raw counts are 2x the actual 10 MHz tick rate.
+static constexpr uint32_t OCXO2_EDGE_DIVISOR    = 2;
+static constexpr uint32_t ISR_OCXO2_RAW_EXPECTED = TICKS_10MHZ_PER_SECOND * OCXO2_EDGE_DIVISOR;
 
 // ============================================================================
 // PPS VCLOCK validation — reject spurious edges
@@ -438,6 +462,11 @@ uint64_t clocks_ocxo1_ns_now(void) {
 
 // ============================================================================
 // OCXO2 (10 MHz external via QTimer1 ch0+ch1 — cascaded 32-bit)
+//
+// IMPORTANT: QTimer CM(2) counts both rising and falling edges,
+// producing ~20 MHz raw counts for a 10 MHz input.  All conversions
+// from raw QTimer counts to 10 MHz ticks divide by OCXO2_EDGE_DIVISOR.
+// ISR snapshots and isr_residual_ocxo2 remain in raw 20 MHz space.
 // ============================================================================
 
 static bool qtimer1_armed = false;
@@ -461,15 +490,15 @@ static void arm_qtimer1_external(void) {
   IOMUXC_SW_PAD_CTL_PAD_GPIO_B0_00 =
       IOMUXC_PAD_HYS | IOMUXC_PAD_PKE | IOMUXC_PAD_PUE | IOMUXC_PAD_DSE(4);
 
+  // Only touch channels 0 and 1 (our cascade pair).
+  // Do NOT touch channels 2 and 3 — pin 11 (OCXO2 CTL) uses
+  // FlexPWM1 submodule 2, which shares the QTimer1 module.
+  // Zeroing CH[2] clobbers pin 11's PWM output.
   IMXRT_TMR1.CH[0].CTRL = 0;
   IMXRT_TMR1.CH[1].CTRL = 0;
-  IMXRT_TMR1.CH[2].CTRL = 0;
-  IMXRT_TMR1.CH[3].CTRL = 0;
 
   IMXRT_TMR1.CH[0].CNTR = 0;
   IMXRT_TMR1.CH[1].CNTR = 0;
-  IMXRT_TMR1.CH[2].CNTR = 0;
-  IMXRT_TMR1.CH[3].CNTR = 0;
 
   IMXRT_TMR1.CH[0].SCTRL  = 0;
   IMXRT_TMR1.CH[0].CSCTRL = 0;
@@ -484,7 +513,8 @@ static void arm_qtimer1_external(void) {
   IMXRT_TMR1.CH[0].CMPLD1 = 0xFFFF;
   IMXRT_TMR1.CH[1].CMPLD1 = 0xFFFF;
 
-  // ch0: count rising edges of external pin (CM=2, PCS=0)
+  // ch0: count edges of external pin (CM=2, PCS=0)
+  // NOTE: CM(2) counts BOTH edges — raw rate is 2x input frequency
   IMXRT_TMR1.CH[0].CTRL = TMR_CTRL_CM(2) | TMR_CTRL_PCS(0);
 
   // ch1: cascade from ch0 overflow (CM=7)
@@ -496,7 +526,7 @@ static void arm_qtimer1_external(void) {
 
 uint64_t clocks_ocxo2_ticks_now(void) {
   uint32_t now = qtimer1_read_32();
-  ocxo2_rolling_64 += (uint32_t)(now - ocxo2_rolling_32);
+  ocxo2_rolling_64 += (uint32_t)(now - ocxo2_rolling_32) / OCXO2_EDGE_DIVISOR;
   ocxo2_rolling_32 = now;
   return ocxo2_rolling_64;
 }
@@ -625,7 +655,7 @@ static void pps_asap_callback(timepop_ctx_t*, void*) {
 
     dwt_rolling_64    = 0;  dwt_rolling_32    = DWT_CYCCNT;
     ocxo1_rolling_64  = 0;  ocxo1_rolling_32  = GPT1_CNT;
-    ocxo2_rolling_64  = 0;  ocxo2_rolling_32  = qtimer1_read_32();
+    ocxo2_rolling_64  = 0;  ocxo2_rolling_32  = qtimer1_read_32();  // raw 20 MHz space
 
     residual_reset(residual_dwt);
     residual_reset(residual_gnss);
@@ -676,7 +706,10 @@ static void pps_asap_callback(timepop_ctx_t*, void*) {
     const uint64_t pps_ocxo1_ticks = ocxo1_ticks_64;
     const uint64_t pps_ocxo1_ns    = pps_ocxo1_ticks * 100ull;
 
-    uint32_t ocxo2_delta = isr_snap_ocxo2 - prev_ocxo2_at_pps;
+    // OCXO2: QTimer raw counts are 2x (both edges).  Divide to get
+    // 10 MHz ticks.  Raw value preserved for delta_raw diagnostic.
+    uint32_t ocxo2_raw_delta = isr_snap_ocxo2 - prev_ocxo2_at_pps;
+    uint32_t ocxo2_delta     = ocxo2_raw_delta / OCXO2_EDGE_DIVISOR;
     ocxo2_ticks_64    += ocxo2_delta;
     prev_ocxo2_at_pps  = isr_snap_ocxo2;
 
@@ -722,7 +755,7 @@ static void pps_asap_callback(timepop_ctx_t*, void*) {
 
     p.add("dwt_delta_raw",    (uint64_t)dwt_delta);
     p.add("ocxo1_delta_raw",  (uint64_t)ocxo1_delta);
-    p.add("ocxo2_delta_raw",  (uint64_t)ocxo2_delta);
+    p.add("ocxo2_delta_raw",  (uint64_t)ocxo2_raw_delta);
 
     p.add("dwt_pps_residual",   residual_dwt.residual);
     p.add("gnss_pps_residual",  residual_gnss.residual);
@@ -800,7 +833,7 @@ static void pps_isr(void) {
     isr_residual_dwt   = (int32_t)(snap_dwt   - isr_prev_dwt)   - (int32_t)ISR_DWT_EXPECTED;
     isr_residual_gnss  = (int32_t)(snap_gnss  - isr_prev_gnss)  - (int32_t)ISR_GNSS_EXPECTED;
     isr_residual_ocxo1 = (int32_t)(snap_ocxo1 - isr_prev_ocxo1) - (int32_t)ISR_OCXO_EXPECTED;
-    isr_residual_ocxo2 = (int32_t)(snap_ocxo2 - isr_prev_ocxo2) - (int32_t)ISR_OCXO_EXPECTED;
+    isr_residual_ocxo2 = (int32_t)(snap_ocxo2 - isr_prev_ocxo2) - (int32_t)ISR_OCXO2_RAW_EXPECTED;
   }
 
   isr_prev_dwt   = isr_snap_dwt   = snap_dwt;
@@ -1299,6 +1332,7 @@ void process_clocks_init(void) {
   timebase_init();
 
   analogWriteResolution(12);
+
   ocxo_dac_set(ocxo1_dac, (double)OCXO1_DAC_DEFAULT);
   ocxo_dac_set(ocxo2_dac, (double)OCXO2_DAC_DEFAULT);
 

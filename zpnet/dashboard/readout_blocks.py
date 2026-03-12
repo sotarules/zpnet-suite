@@ -1,15 +1,15 @@
 """
-ZPNet Dashboard Readout Blocks — v8 Prediction-Aware Edition
+ZPNet Dashboard Readout Blocks — v9 Dual OCXO Edition
 
 All readouts are derived directly from the authoritative SYSTEM snapshot
 or from direct process queries.
 
-v8 changes:
-  • clocks_welford_readout() replaced with clocks_prediction_readout()
-    which displays Teensy prediction statistics (pred_stddev, pred_n,
-    pred_residual) as the authoritative interpolation uncertainty.
-  • clocks_tau_readout() and clocks_comparison_readout() unchanged
-    (tau and ppb fields are in the same location).
+v9 changes:
+  • clocks_prediction_readout() displays Teensy prediction statistics
+    (pred_stddev, pred_n, pred_residual) for DWT, OCXO1, and OCXO2.
+  • Dual OCXO.  _CLOCK_DOMAINS includes OCXO1 and OCXO2.
+    All tau, prediction, and comparison readouts show four domains.
+    Baseline comparison handles ocxo1 and ocxo2 PPB keys.
 
 Invariants:
   • No database access
@@ -110,7 +110,7 @@ def gnss_report_readout() -> Generator[str, None, None]:
 # CLOCKS — shared helpers
 # ---------------------------------------------------------------------
 
-_CLOCK_DOMAINS = [("GNSS", "gnss"), ("DWT", "dwt"), ("OCXO", "ocxo")]
+_CLOCK_DOMAINS = [("GNSS", "gnss"), ("DWT", "dwt"), ("OCXO1", "ocxo1"), ("OCXO2", "ocxo2")]
 
 
 def _get_clocks_baseline() -> dict | None:
@@ -140,7 +140,7 @@ def _clocks_header() -> tuple[dict | None, str]:
 
 
 # ---------------------------------------------------------------------
-# CLOCKS 1/3 — Tau
+# CLOCKS 1/4 — Tau
 # ---------------------------------------------------------------------
 
 def clocks_tau_readout() -> Generator[str, None, None]:
@@ -160,19 +160,19 @@ def clocks_tau_readout() -> Generator[str, None, None]:
 
 
 # ---------------------------------------------------------------------
-# CLOCKS 2/3 — Prediction Statistics (v8, replaces Welford readout)
+# CLOCKS 2/4 — Prediction Statistics (v8, replaces Welford readout)
 # ---------------------------------------------------------------------
 
 def clocks_prediction_readout() -> Generator[str, None, None]:
     """
-    Display Teensy prediction statistics for DWT and OCXO.
+    Display Teensy prediction statistics for DWT, OCXO1, and OCXO2.
 
     The prediction residual stddev is the authoritative interpolation
     uncertainty metric — "how wrong is my best estimate of this
     second's crystal rate?"
 
     For DWT this is typically ~3-4 cycles (3-4 ns).
-    For OCXO this is typically ~1 tick (100 ns) when servo-locked.
+    For OCXO1/OCXO2 this is typically ~1 tick (100 ns) when servo-locked.
 
     GNSS is phase-coherent by definition (residual always 0), so
     we show the stream health canary instead.
@@ -189,7 +189,7 @@ def clocks_prediction_readout() -> Generator[str, None, None]:
     gnss_res = gnss_blk.get("pps_residual", 0)
     yield f"{'GNSS':<6} {gnss_res:>6} {'---':>8} {'---':>8} {'---':>6}"
 
-    # DWT and OCXO — Teensy prediction stats
+    # DWT, OCXO1, OCXO2 — Teensy prediction stats
     for name, key in _CLOCK_DOMAINS[1:]:
         blk = r.get(key, {})
         pred_n = blk.get("pred_n")
@@ -205,7 +205,7 @@ def clocks_prediction_readout() -> Generator[str, None, None]:
 
 
 # ---------------------------------------------------------------------
-# CLOCKS 3/3 — Comparison vs baseline
+# CLOCKS 3/4 — Comparison vs baseline
 # ---------------------------------------------------------------------
 
 def clocks_comparison_readout() -> Generator[str, None, None]:
@@ -237,6 +237,38 @@ def clocks_comparison_readout() -> Generator[str, None, None]:
             yield f"{name:<6} {base_ppb:>10.2f} {now_ppb:>10.2f} {delta:>+10.2f}"
         else:
             yield f"{name:<6} {'---':>10} {'---':>10} {'---':>10}"
+
+
+# ---------------------------------------------------------------------
+# CLOCKS 4/4 — OCXO Servo Status
+# ---------------------------------------------------------------------
+
+def clocks_servo_readout() -> Generator[str, None, None]:
+    """
+    Display OCXO1 and OCXO2 servo/DAC state from the Teensy CLOCKS report.
+    """
+    try:
+        t = get_teensy_clocks_report()
+    except Exception:
+        yield "SERVO: UNAVAILABLE"
+        return
+
+    cal = t.get("calibrate_ocxo", False)
+    yield f"SERVO: {'CALIBRATING' if cal else 'IDLE'}"
+
+    for label, dac_key, adj_key, res_key in [
+        ("OCXO1", "ocxo1_dac", "ocxo1_servo_adjustments", "isr_residual_ocxo1"),
+        ("OCXO2", "ocxo2_dac", "ocxo2_servo_adjustments", "isr_residual_ocxo2"),
+    ]:
+        dac = t.get(dac_key)
+        adj = t.get(adj_key, 0)
+        res = t.get(res_key)
+
+        if dac is not None:
+            res_str = f"{res:+d}" if res is not None else "---"
+            yield f"{label:<6} DAC={dac:>10.3f}  ADJ={adj:>4}  RES={res_str}"
+        else:
+            yield f"{label:<6} ---"
 
 
 # ---------------------------------------------------------------------

@@ -877,7 +877,8 @@ def _build_report(
 ) -> Dict[str, Any]:
     gnss_ns = int(timebase.get("teensy_gnss_ns") or 0)
     dwt_ns = int(timebase.get("teensy_dwt_ns") or 0)
-    ocxo_ns = int(timebase.get("teensy_ocxo1_ns") or 0)
+    ocxo1_ns = int(timebase.get("teensy_ocxo1_ns") or 0)
+    ocxo2_ns = int(timebase.get("teensy_ocxo2_ns") or 0)
 
     pps_count = timebase.get("pps_count")
     campaign_seconds = int(pps_count) if isinstance(pps_count, int) else (gnss_ns // NS_PER_SECOND if gnss_ns else 0)
@@ -898,7 +899,8 @@ def _build_report(
 
         "gnss": _build_clock_block(gnss_ns, gnss_ns, frag, "gnss"),
         "dwt": _build_clock_block(dwt_ns, gnss_ns, frag, "dwt"),
-        "ocxo1": _build_clock_block(ocxo_ns, gnss_ns, frag, "ocxo1"),
+        "ocxo1": _build_clock_block(ocxo1_ns, gnss_ns, frag, "ocxo1"),
+        "ocxo2": _build_clock_block(ocxo2_ns, gnss_ns, frag, "ocxo2")
     }
 
 

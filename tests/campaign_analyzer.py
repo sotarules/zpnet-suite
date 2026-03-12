@@ -1,5 +1,5 @@
 """
-ZPNet Campaign Analyzer — TIMEBASE integrity and continuity audit (v8)
+ZPNet Campaign Analyzer — TIMEBASE integrity and continuity audit (v9 Dual OCXO)
 
 Usage:
     python -m zpnet.tests.campaign_analyzer <campaign_name>
@@ -19,19 +19,23 @@ Reads all TIMEBASE rows for the named campaign and produces:
     beyond that indicate a projection error.
   - Recovery forensics (v5): at each recovery boundary, reconstructs
     the symmetric nanosecond projection that _recover_campaign()
-    performed.  Three clock domains (GNSS, DWT, OCXO) use:
+    performed.  Four clock domains (GNSS, DWT, OCXO1, OCXO2) use:
 
       projected_gnss_ns = next_pps_count x NS_PER_SECOND
       projected_ns = projected_gnss_ns x last_clock_ns / last_gnss_ns
 
     Pure integer arithmetic, no DWT cycle counts, no Pi epochs.
+  - v9: Dual OCXO support.  All singular OCXO references split into
+    OCXO1 and OCXO2.  Recovery forensics, PPB sanity, raw delta
+    analysis, prediction quality, and servo state all handle both
+    OCXOs independently.
   - GNSS phase lock analysis: scans isr_residual_gnss for non-zero
     values, histograms the distribution, and flags any violations.
   - Prediction quality analysis (v8): examines Teensy prediction
-    statistics (dwt_pred_stddev, ocxo_pred_stddev) from the stats
+    statistics (dwt_pred_stddev, ocxo1_pred_stddev, ocxo2_pred_stddev) from the stats
     block in TIMEBASE records.  These are the authoritative
     interpolation uncertainty metrics.
-  - Raw delta analysis (v8): examines dwt_delta_raw and ocxo_delta_raw
+  - Raw delta analysis (v8): examines dwt_delta_raw, ocxo1_delta_raw, and ocxo2_delta_raw
     per-second deltas for anomalies and drift trends.
   - Summary verdict: CLEAN, CLEAN (with recovery), or anomalies
 
@@ -41,9 +45,9 @@ v8 changes:
   - Pi ISR residual removed (isr_residual_pi)
   - Pi recovery forensics removed (pi_ns, pi_corrected, tau_pi)
   - Pi PPB domain removed
-  - Prediction quality analysis added (DWT and OCXO pred_stddev)
-  - Raw delta analysis added (dwt_delta_raw, ocxo_delta_raw)
-  - OCXO servo state surfaced in campaign summary
+  - Prediction quality analysis added (DWT, OCXO1, OCXO2 pred_stddev)
+  - Raw delta analysis added (dwt_delta_raw, ocxo1_delta_raw, ocxo2_delta_raw)
+  - OCXO1/OCXO2 servo state surfaced in campaign summary
 """
 
 from __future__ import annotations
@@ -74,12 +78,14 @@ CLOCK_DOMAINS = [
     ("GNSS",    "teensy_gnss_ns",    "GNSS nanoseconds"),
     ("DWT_NS",  "teensy_dwt_ns",     "DWT nanoseconds"),
     ("DWT_CYC", "teensy_dwt_cycles", "DWT cycles"),
-    ("OCXO",    "teensy_ocxo_ns",    "OCXO nanoseconds"),
+    ("OCXO1",   "teensy_ocxo1_ns",   "OCXO1 nanoseconds"),
+    ("OCXO2",   "teensy_ocxo2_ns",   "OCXO2 nanoseconds"),
 ]
 
 PPB_DOMAINS = [
-    ("DWT",  "teensy_dwt_ns",  "DWT vs GNSS"),
-    ("OCXO", "teensy_ocxo_ns", "OCXO vs GNSS"),
+    ("DWT",   "teensy_dwt_ns",   "DWT vs GNSS"),
+    ("OCXO1", "teensy_ocxo1_ns", "OCXO1 vs GNSS"),
+    ("OCXO2", "teensy_ocxo2_ns", "OCXO2 vs GNSS"),
 ]
 
 
@@ -261,7 +267,7 @@ def analyze_ppb_sanity(
 
 
 # ---------------------------------------------------------------------
-# Recovery forensics — v5 nanosecond architecture (3 domains)
+# Recovery forensics — v6 nanosecond architecture (4 domains)
 # ---------------------------------------------------------------------
 
 def analyze_recovery_forensics(
@@ -300,55 +306,65 @@ def analyze_recovery_forensics(
 
         anchor_gnss_ns = int(pre_row.get("teensy_gnss_ns") or 0)
         anchor_dwt_ns  = int(pre_row.get("teensy_dwt_ns")  or 0)
-        anchor_ocxo_ns = int(pre_row.get("teensy_ocxo_ns") or 0)
+        anchor_ocxo1_ns = int(pre_row.get("teensy_ocxo1_ns") or 0)
+        anchor_ocxo2_ns = int(pre_row.get("teensy_ocxo2_ns") or 0)
         anchor_time = pre_row.get("gnss_time_utc") or pre_row.get("system_time_utc", "?")
 
         lines.append(f"\n  Anchor (pps_count={pre_pps}):")
         lines.append(f"    gnss_time_utc: {anchor_time}")
         lines.append(f"    gnss_ns:       {anchor_gnss_ns:,}")
         lines.append(f"    dwt_ns:        {anchor_dwt_ns:,}")
-        lines.append(f"    ocxo_ns:       {anchor_ocxo_ns:,}")
+        lines.append(f"    ocxo1_ns:      {anchor_ocxo1_ns:,}")
+        lines.append(f"    ocxo2_ns:      {anchor_ocxo2_ns:,}")
 
         tau_dwt  = anchor_dwt_ns  / anchor_gnss_ns if anchor_gnss_ns > 0 else 1.0
-        tau_ocxo = anchor_ocxo_ns / anchor_gnss_ns if (anchor_gnss_ns > 0 and anchor_ocxo_ns > 0) else 1.0
+        tau_ocxo1 = anchor_ocxo1_ns / anchor_gnss_ns if (anchor_gnss_ns > 0 and anchor_ocxo1_ns > 0) else 1.0
+        tau_ocxo2 = anchor_ocxo2_ns / anchor_gnss_ns if (anchor_gnss_ns > 0 and anchor_ocxo2_ns > 0) else 1.0
 
         lines.append(f"\n  Tau (from anchor ratios):")
         lines.append(f"    tau_dwt:  {tau_dwt:.12f}")
-        lines.append(f"    tau_ocxo: {tau_ocxo:.12f}")
+        lines.append(f"    tau_ocxo1: {tau_ocxo1:.12f}")
+        lines.append(f"    tau_ocxo2: {tau_ocxo2:.12f}")
 
         proj_gnss_ns = next_pps_count * NS_PER_SECOND
         proj_dwt_ns  = proj_gnss_ns * anchor_dwt_ns  // anchor_gnss_ns if anchor_gnss_ns > 0 else proj_gnss_ns
-        proj_ocxo_ns = proj_gnss_ns * anchor_ocxo_ns // anchor_gnss_ns if (anchor_gnss_ns > 0 and anchor_ocxo_ns > 0) else 0
+        proj_ocxo1_ns = proj_gnss_ns * anchor_ocxo1_ns // anchor_gnss_ns if (anchor_gnss_ns > 0 and anchor_ocxo1_ns > 0) else 0
+        proj_ocxo2_ns = proj_gnss_ns * anchor_ocxo2_ns // anchor_gnss_ns if (anchor_gnss_ns > 0 and anchor_ocxo2_ns > 0) else 0
 
         lines.append(f"\n  v5 Symmetric projection:")
         lines.append(f"    projected_gnss_ns = {next_pps_count} x {NS_PER_SECOND:,} = {proj_gnss_ns:,}")
         lines.append(f"    GNSS:  {proj_gnss_ns:,}  (tau = 1.000000000000)")
         lines.append(f"    DWT:   {proj_dwt_ns:,}  (tau = {tau_dwt:.12f})")
-        lines.append(f"    OCXO:  {proj_ocxo_ns:,}  (tau = {tau_ocxo:.12f})")
+        lines.append(f"    OCXO1: {proj_ocxo1_ns:,}  (tau = {tau_ocxo1:.12f})")
+        lines.append(f"    OCXO2: {proj_ocxo2_ns:,}  (tau = {tau_ocxo2:.12f})")
 
         actual_gnss_ns = int(post_row.get("teensy_gnss_ns") or 0)
         actual_dwt_ns  = int(post_row.get("teensy_dwt_ns")  or 0)
-        actual_ocxo_ns = int(post_row.get("teensy_ocxo_ns") or 0)
+        actual_ocxo1_ns = int(post_row.get("teensy_ocxo1_ns") or 0)
+        actual_ocxo2_ns = int(post_row.get("teensy_ocxo2_ns") or 0)
         actual_time = post_row.get("gnss_time_utc") or post_row.get("system_time_utc", "?")
 
         lines.append(f"\n  Actual (pps_count={post_pps}):")
         lines.append(f"    gnss_time_utc: {actual_time}")
         lines.append(f"    gnss_ns:       {actual_gnss_ns:,}")
         lines.append(f"    dwt_ns:        {actual_dwt_ns:,}")
-        lines.append(f"    ocxo_ns:       {actual_ocxo_ns:,}")
+        lines.append(f"    ocxo1_ns:      {actual_ocxo1_ns:,}")
+        lines.append(f"    ocxo2_ns:      {actual_ocxo2_ns:,}")
 
         d_gnss = actual_gnss_ns - proj_gnss_ns
         d_dwt  = actual_dwt_ns  - proj_dwt_ns
-        d_ocxo = actual_ocxo_ns - proj_ocxo_ns
+        d_ocxo1 = actual_ocxo1_ns - proj_ocxo1_ns
+        d_ocxo2 = actual_ocxo2_ns - proj_ocxo2_ns
 
         lines.append(f"\n  Projection errors (actual - projected):")
         lines.append(f"    GNSS:  {d_gnss:+,d} ns")
         lines.append(f"    DWT:   {d_dwt:+,d} ns")
-        lines.append(f"    OCXO:  {d_ocxo:+,d} ns")
+        lines.append(f"    OCXO1: {d_ocxo1:+,d} ns")
+        lines.append(f"    OCXO2: {d_ocxo2:+,d} ns")
 
         if actual_gnss_ns > 0:
             lines.append(f"\n  Projection error as PPB of campaign GNSS time:")
-            for lbl, err in [("GNSS", d_gnss), ("DWT", d_dwt), ("OCXO", d_ocxo)]:
+            for lbl, err in [("GNSS", d_gnss), ("DWT", d_dwt), ("OCXO1", d_ocxo1), ("OCXO2", d_ocxo2)]:
                 lines.append(f"    {lbl:6s} {(err / actual_gnss_ns) * 1e9:+,.3f} ppb")
 
         if d_gnss != 0:
@@ -360,7 +376,7 @@ def analyze_recovery_forensics(
 
         lines.append(f"\n  Post-recovery PPB (all domains vs GNSS):")
         if actual_gnss_ns > 0:
-            for lbl, actual_ns in [("DWT", actual_dwt_ns), ("OCXO", actual_ocxo_ns)]:
+            for lbl, actual_ns in [("DWT", actual_dwt_ns), ("OCXO1", actual_ocxo1_ns), ("OCXO2", actual_ocxo2_ns)]:
                 if actual_ns > 0:
                     ppb  = _compute_ppb(actual_ns, actual_gnss_ns)
                     flag = f"  WARN EXCEEDS +-{PPB_ABSOLUTE_THRESHOLD:,} ppb" if ppb is not None and abs(ppb) > PPB_ABSOLUTE_THRESHOLD else ""
@@ -528,7 +544,7 @@ def analyze_prediction_quality(
 
     The prediction residual stddev is the authoritative interpolation
     uncertainty metric.  For DWT this is typically ~3-4 cycles (3-4 ns);
-    for OCXO ~1 tick (100 ns) when servo-locked.
+    for OCXO1/OCXO2 ~1 tick (100 ns) when servo-locked.
 
     This section surfaces:
       - Final prediction stddev and N for each domain
@@ -539,7 +555,7 @@ def analyze_prediction_quality(
     anomalies: List[str] = []
     lines: List[str] = []
 
-    for label, pred_key_prefix in [("DWT", "dwt"), ("OCXO", "ocxo")]:
+    for label, pred_key_prefix in [("DWT", "dwt"), ("OCXO1", "ocxo1"), ("OCXO2", "ocxo2")]:
         lines.append(f"\n  [{label}] Prediction statistics (Teensy v10)")
 
         stddev_values: List[Tuple[int, float]] = []
@@ -637,7 +653,7 @@ def analyze_raw_deltas(
     recovery_boundaries: Set[int],
 ) -> Tuple[List[str], List[str]]:
     """
-    Examine dwt_delta_raw and ocxo_delta_raw per-second deltas.
+    Examine dwt_delta_raw, ocxo1_delta_raw, and ocxo2_delta_raw per-second deltas.
 
     These are the ground truth for what each oscillator actually did
     in each second.  The analysis looks for:
@@ -648,12 +664,17 @@ def analyze_raw_deltas(
     anomalies: List[str] = []
     lines: List[str] = []
 
-    DWT_NOMINAL = 1_008_000_000
+    DWT_NOMINAL  = 1_008_000_000
     OCXO_NOMINAL = 10_000_000
+    # OCXO2 raw deltas are in 20 MHz space (QTimer counts both edges
+    # of the 10 MHz input signal).  The firmware divides by 2 for tick
+    # accumulation, but ocxo2_delta_raw preserves the raw hardware value.
+    OCXO2_RAW_NOMINAL = 20_000_000
 
     for label, key, nominal in [
-        ("DWT",  "dwt_delta_raw",  DWT_NOMINAL),
-        ("OCXO", "ocxo_delta_raw", OCXO_NOMINAL),
+        ("DWT",   "dwt_delta_raw",   DWT_NOMINAL),
+        ("OCXO1", "ocxo1_delta_raw", OCXO_NOMINAL),
+        ("OCXO2", "ocxo2_delta_raw", OCXO2_RAW_NOMINAL),
     ]:
         lines.append(f"\n  [{label}] Raw per-second deltas (key: {key})")
 
@@ -721,42 +742,50 @@ def analyze_raw_deltas(
 
 def analyze_ocxo_servo(rows: List[Dict[str, Any]]) -> List[str]:
     """
-    Surface OCXO servo state from TIMEBASE records.
+    Surface OCXO1 and OCXO2 servo state from TIMEBASE records.
     """
     lines: List[str] = []
 
-    first_dac = None
-    last_dac = None
-    first_adj = None
-    last_adj = None
     calibrating = False
-
     for row in rows:
-        dac = row.get("ocxo_dac")
-        adj = row.get("servo_adjustments")
-        cal = row.get("calibrate_ocxo")
-
-        if dac is not None:
-            if first_dac is None:
-                first_dac = float(dac)
-            last_dac = float(dac)
-        if adj is not None:
-            if first_adj is None:
-                first_adj = int(adj)
-            last_adj = int(adj)
-        if cal:
+        if row.get("calibrate_ocxo"):
             calibrating = True
-
-    if first_dac is None:
-        lines.append(f"  No OCXO DAC data in TIMEBASE records.")
-        return lines
+            break
 
     lines.append(f"  Calibration active: {'YES' if calibrating else 'NO'}")
-    lines.append(f"  DAC range: {first_dac:.6f} -> {last_dac:.6f}")
-    lines.append(f"  DAC drift: {last_dac - first_dac:+.6f}")
 
-    if first_adj is not None and last_adj is not None:
-        lines.append(f"  Servo adjustments: {first_adj} -> {last_adj} ({last_adj - first_adj} during campaign)")
+    for label, dac_key, adj_key in [
+        ("OCXO1", "ocxo1_dac", "ocxo1_servo_adjustments"),
+        ("OCXO2", "ocxo2_dac", "ocxo2_servo_adjustments"),
+    ]:
+        first_dac = None
+        last_dac = None
+        first_adj = None
+        last_adj = None
+
+        for row in rows:
+            dac = row.get(dac_key)
+            adj = row.get(adj_key)
+
+            if dac is not None:
+                if first_dac is None:
+                    first_dac = float(dac)
+                last_dac = float(dac)
+            if adj is not None:
+                if first_adj is None:
+                    first_adj = int(adj)
+                last_adj = int(adj)
+
+        lines.append(f"\n  [{label}]")
+        if first_dac is None:
+            lines.append(f"    No DAC data.")
+            continue
+
+        lines.append(f"    DAC range: {first_dac:.6f} -> {last_dac:.6f}")
+        lines.append(f"    DAC drift: {last_dac - first_dac:+.6f}")
+
+        if first_adj is not None and last_adj is not None:
+            lines.append(f"    Servo adjustments: {first_adj} -> {last_adj} ({last_adj - first_adj} during campaign)")
 
     return lines
 
@@ -1011,7 +1040,7 @@ def analyze(campaign: str) -> None:
     # --- OCXO servo summary ---
     print()
     print("-" * 70)
-    print("OCXO SERVO STATE")
+    print("OCXO SERVO STATE (OCXO1 + OCXO2)")
     print("-" * 70)
 
     servo_lines = analyze_ocxo_servo(rows)
@@ -1022,7 +1051,7 @@ def analyze(campaign: str) -> None:
     if recovery_boundaries:
         print()
         print("-" * 70)
-        print("RECOVERY FORENSICS (v5 nanosecond architecture)")
+        print("RECOVERY FORENSICS (v6 nanosecond architecture, 4 domains)")
         print("-" * 70)
         for line in analyze_recovery_forensics(rows, recovery_boundaries):
             print(line)
@@ -1034,9 +1063,10 @@ def analyze(campaign: str) -> None:
     print("-" * 70)
 
     for label, key in [
-        ("GNSS", "isr_residual_gnss"),
-        ("DWT",  "isr_residual_dwt"),
-        ("OCXO", "isr_residual_ocxo"),
+        ("GNSS",  "isr_residual_gnss"),
+        ("DWT",   "isr_residual_dwt"),
+        ("OCXO1", "isr_residual_ocxo1"),
+        ("OCXO2", "isr_residual_ocxo2"),
     ]:
         stats = WelfordStats()
         nulls = 0
