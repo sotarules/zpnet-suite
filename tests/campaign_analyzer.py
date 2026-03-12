@@ -1,5 +1,5 @@
 """
-ZPNet Campaign Analyzer — TIMEBASE integrity and continuity audit
+ZPNet Campaign Analyzer — TIMEBASE integrity and continuity audit (v8)
 
 Usage:
     python -m zpnet.tests.campaign_analyzer <campaign_name>
@@ -11,32 +11,39 @@ Reads all TIMEBASE rows for the named campaign and produces:
   - Per-clock monotonicity checks (ns/cycles must always increase)
   - Per-clock zero/duplicate detection
   - Per-clock delta statistics (min, max, mean, stddev)
-  - Pi capture sequence integrity (seq gaps, repeats)
   - Recovery-aware: gaps in pps_count are classified as recovery gaps
-    and cross-boundary anomalies (pi_ns reset, pi_seq regression)
-    are expected artifacts, not failures.
+    and cross-boundary anomalies are expected artifacts, not failures.
   - PPB sanity check: flags any record where a clock domain's
     cumulative PPB (relative to GNSS) exceeds an absolute threshold.
     No real clock in ZPNet drifts more than 10,000 ppb -- values
     beyond that indicate a projection error.
-  - Recovery forensics (v4): at each recovery boundary, reconstructs
+  - Recovery forensics (v5): at each recovery boundary, reconstructs
     the symmetric nanosecond projection that _recover_campaign()
-    performed.  All four clock domains use the same formula:
+    performed.  Three clock domains (GNSS, DWT, OCXO) use:
 
       projected_gnss_ns = next_pps_count x NS_PER_SECOND
       projected_ns = projected_gnss_ns x last_clock_ns / last_gnss_ns
 
-    Pure integer arithmetic, no DWT cycle counts, no Pi epochs,
-    no +2 padding.  Shows tau values, projected nanoseconds,
-    actual post-recovery nanoseconds, and the resulting errors.
+    Pure integer arithmetic, no DWT cycle counts, no Pi epochs.
   - GNSS phase lock analysis: scans isr_residual_gnss for non-zero
     values, histograms the distribution, and flags any violations.
-    A perfect phase-locked system should show zero residual on every
-    PPS cycle; non-zero values indicate a phase boundary artifact.
-  - TIMEPULSE coherence: verifies tp_ticks_at_pps == 10000 and
-    tp_phase_error_ns == 0 on every second.  Deviations point to
-    the same phase boundary issue seen in isr_residual_gnss.
+  - Prediction quality analysis (v8): examines Teensy prediction
+    statistics (dwt_pred_stddev, ocxo_pred_stddev) from the stats
+    block in TIMEBASE records.  These are the authoritative
+    interpolation uncertainty metrics.
+  - Raw delta analysis (v8): examines dwt_delta_raw and ocxo_delta_raw
+    per-second deltas for anomalies and drift trends.
   - Summary verdict: CLEAN, CLEAN (with recovery), or anomalies
+
+v8 changes:
+  - Pi clock domains removed (PI_NS, PI_CORR, PI_RAW) — deprecated
+  - Pi capture sequence analysis removed (diag_pi_seq)
+  - Pi ISR residual removed (isr_residual_pi)
+  - Pi recovery forensics removed (pi_ns, pi_corrected, tau_pi)
+  - Pi PPB domain removed
+  - Prediction quality analysis added (DWT and OCXO pred_stddev)
+  - Raw delta analysis added (dwt_delta_raw, ocxo_delta_raw)
+  - OCXO servo state surfaced in campaign summary
 """
 
 from __future__ import annotations
@@ -57,10 +64,6 @@ from zpnet.shared.db import open_db
 PPB_ABSOLUTE_THRESHOLD = 10_000
 
 NS_PER_SECOND = 1_000_000_000
-PI_TIMER_FREQ = 54_000_000
-PI_NS_PER_TICK = 1e9 / PI_TIMER_FREQ  # ~18.519 ns/tick
-
-TIMEPULSE_TICKS_PER_SECOND = 10_000
 
 
 # ---------------------------------------------------------------------
@@ -72,15 +75,11 @@ CLOCK_DOMAINS = [
     ("DWT_NS",  "teensy_dwt_ns",     "DWT nanoseconds"),
     ("DWT_CYC", "teensy_dwt_cycles", "DWT cycles"),
     ("OCXO",    "teensy_ocxo_ns",    "OCXO nanoseconds"),
-    ("PI_NS",   "pi_ns",             "Pi nanoseconds"),
-    ("PI_CORR", "pi_corrected",      "Pi corrected ticks"),
-    ("PI_RAW",  "pi_counter",        "Pi raw counter"),
 ]
 
 PPB_DOMAINS = [
     ("DWT",  "teensy_dwt_ns",  "DWT vs GNSS"),
     ("OCXO", "teensy_ocxo_ns", "OCXO vs GNSS"),
-    ("Pi",   "pi_ns",          "Pi vs GNSS"),
 ]
 
 
@@ -262,7 +261,7 @@ def analyze_ppb_sanity(
 
 
 # ---------------------------------------------------------------------
-# Recovery forensics — v4 nanosecond architecture
+# Recovery forensics — v5 nanosecond architecture (3 domains)
 # ---------------------------------------------------------------------
 
 def analyze_recovery_forensics(
@@ -299,11 +298,9 @@ def analyze_recovery_forensics(
         lines.append(f"  Elapsed (pps delta): {elapsed_seconds} seconds")
         lines.append(f"  Inferred next_pps_count: {next_pps_count}")
 
-        anchor_gnss_ns      = int(pre_row.get("teensy_gnss_ns") or 0)
-        anchor_dwt_ns       = int(pre_row.get("teensy_dwt_ns")  or 0)
-        anchor_ocxo_ns      = int(pre_row.get("teensy_ocxo_ns") or 0)
-        anchor_pi_ns        = int(pre_row.get("pi_ns")          or 0)
-        anchor_pi_corrected = int(pre_row.get("pi_corrected")   or 0)
+        anchor_gnss_ns = int(pre_row.get("teensy_gnss_ns") or 0)
+        anchor_dwt_ns  = int(pre_row.get("teensy_dwt_ns")  or 0)
+        anchor_ocxo_ns = int(pre_row.get("teensy_ocxo_ns") or 0)
         anchor_time = pre_row.get("gnss_time_utc") or pre_row.get("system_time_utc", "?")
 
         lines.append(f"\n  Anchor (pps_count={pre_pps}):")
@@ -311,36 +308,27 @@ def analyze_recovery_forensics(
         lines.append(f"    gnss_ns:       {anchor_gnss_ns:,}")
         lines.append(f"    dwt_ns:        {anchor_dwt_ns:,}")
         lines.append(f"    ocxo_ns:       {anchor_ocxo_ns:,}")
-        lines.append(f"    pi_ns:         {anchor_pi_ns:,}")
 
         tau_dwt  = anchor_dwt_ns  / anchor_gnss_ns if anchor_gnss_ns > 0 else 1.0
         tau_ocxo = anchor_ocxo_ns / anchor_gnss_ns if (anchor_gnss_ns > 0 and anchor_ocxo_ns > 0) else 1.0
-        tau_pi   = anchor_pi_ns   / anchor_gnss_ns if (anchor_gnss_ns > 0 and anchor_pi_ns   > 0) else 1.0
 
         lines.append(f"\n  Tau (from anchor ratios):")
         lines.append(f"    tau_dwt:  {tau_dwt:.12f}")
         lines.append(f"    tau_ocxo: {tau_ocxo:.12f}")
-        lines.append(f"    tau_pi:   {tau_pi:.12f}")
-        if anchor_pi_ns == 0:
-            lines.append(f"    WARN anchor pi_ns=0 -- tau_pi defaulted to 1.0")
 
         proj_gnss_ns = next_pps_count * NS_PER_SECOND
         proj_dwt_ns  = proj_gnss_ns * anchor_dwt_ns  // anchor_gnss_ns if anchor_gnss_ns > 0 else proj_gnss_ns
         proj_ocxo_ns = proj_gnss_ns * anchor_ocxo_ns // anchor_gnss_ns if (anchor_gnss_ns > 0 and anchor_ocxo_ns > 0) else 0
-        proj_pi_ns   = proj_gnss_ns * anchor_pi_ns   // anchor_gnss_ns if (anchor_gnss_ns > 0 and anchor_pi_ns   > 0) else 0
 
-        lines.append(f"\n  v4 Symmetric projection:")
+        lines.append(f"\n  v5 Symmetric projection:")
         lines.append(f"    projected_gnss_ns = {next_pps_count} x {NS_PER_SECOND:,} = {proj_gnss_ns:,}")
         lines.append(f"    GNSS:  {proj_gnss_ns:,}  (tau = 1.000000000000)")
         lines.append(f"    DWT:   {proj_dwt_ns:,}  (tau = {tau_dwt:.12f})")
         lines.append(f"    OCXO:  {proj_ocxo_ns:,}  (tau = {tau_ocxo:.12f})")
-        lines.append(f"    Pi:    {proj_pi_ns:,}  (tau = {tau_pi:.12f})")
 
-        actual_gnss_ns      = int(post_row.get("teensy_gnss_ns") or 0)
-        actual_dwt_ns       = int(post_row.get("teensy_dwt_ns")  or 0)
-        actual_ocxo_ns      = int(post_row.get("teensy_ocxo_ns") or 0)
-        actual_pi_ns        = int(post_row.get("pi_ns")          or 0)
-        actual_pi_corrected = int(post_row.get("pi_corrected")   or 0)
+        actual_gnss_ns = int(post_row.get("teensy_gnss_ns") or 0)
+        actual_dwt_ns  = int(post_row.get("teensy_dwt_ns")  or 0)
+        actual_ocxo_ns = int(post_row.get("teensy_ocxo_ns") or 0)
         actual_time = post_row.get("gnss_time_utc") or post_row.get("system_time_utc", "?")
 
         lines.append(f"\n  Actual (pps_count={post_pps}):")
@@ -348,22 +336,19 @@ def analyze_recovery_forensics(
         lines.append(f"    gnss_ns:       {actual_gnss_ns:,}")
         lines.append(f"    dwt_ns:        {actual_dwt_ns:,}")
         lines.append(f"    ocxo_ns:       {actual_ocxo_ns:,}")
-        lines.append(f"    pi_ns:         {actual_pi_ns:,}")
 
         d_gnss = actual_gnss_ns - proj_gnss_ns
         d_dwt  = actual_dwt_ns  - proj_dwt_ns
         d_ocxo = actual_ocxo_ns - proj_ocxo_ns
-        d_pi   = actual_pi_ns   - proj_pi_ns
 
         lines.append(f"\n  Projection errors (actual - projected):")
         lines.append(f"    GNSS:  {d_gnss:+,d} ns")
         lines.append(f"    DWT:   {d_dwt:+,d} ns")
         lines.append(f"    OCXO:  {d_ocxo:+,d} ns")
-        lines.append(f"    Pi:    {d_pi:+,d} ns")
 
         if actual_gnss_ns > 0:
             lines.append(f"\n  Projection error as PPB of campaign GNSS time:")
-            for lbl, err in [("GNSS", d_gnss), ("DWT", d_dwt), ("OCXO", d_ocxo), ("Pi", d_pi)]:
+            for lbl, err in [("GNSS", d_gnss), ("DWT", d_dwt), ("OCXO", d_ocxo)]:
                 lines.append(f"    {lbl:6s} {(err / actual_gnss_ns) * 1e9:+,.3f} ppb")
 
         if d_gnss != 0:
@@ -373,28 +358,9 @@ def analyze_recovery_forensics(
             else:
                 lines.append(f"    WARN larger than expected GNSS quantization")
 
-        if actual_pi_ns > 0 and actual_pi_corrected > 0:
-            actual_ticks  = (actual_pi_ns  * PI_TIMER_FREQ) // NS_PER_SECOND
-            inferred_epoch = actual_pi_corrected - actual_ticks
-            if anchor_pi_ns > 0 and anchor_pi_corrected > 0:
-                anchor_ticks  = (anchor_pi_ns * PI_TIMER_FREQ) // NS_PER_SECOND
-                anchor_epoch  = anchor_pi_corrected - anchor_ticks
-                drift_ticks   = inferred_epoch - anchor_epoch
-                drift_ns      = int(drift_ticks * PI_NS_PER_TICK)
-                lines.append(f"\n  Pi epoch consistency:")
-                lines.append(f"    anchor epoch:     {anchor_epoch:,}")
-                lines.append(f"    post-recovery:    {inferred_epoch:,}")
-                lines.append(f"    drift:            {drift_ticks:+,d} ticks ({drift_ns:+,d} ns)")
-                if abs(drift_ns) < 1000:
-                    lines.append(f"    OK epoch consistent (drift < 1us)")
-                elif abs(drift_ns) < 100_000:
-                    lines.append(f"    OK epoch consistent (drift < 100us)")
-                else:
-                    lines.append(f"    WARN epoch drift {drift_ns / 1e6:+,.1f} us")
-
         lines.append(f"\n  Post-recovery PPB (all domains vs GNSS):")
         if actual_gnss_ns > 0:
-            for lbl, actual_ns in [("DWT", actual_dwt_ns), ("OCXO", actual_ocxo_ns), ("Pi", actual_pi_ns)]:
+            for lbl, actual_ns in [("DWT", actual_dwt_ns), ("OCXO", actual_ocxo_ns)]:
                 if actual_ns > 0:
                     ppb  = _compute_ppb(actual_ns, actual_gnss_ns)
                     flag = f"  WARN EXCEEDS +-{PPB_ABSOLUTE_THRESHOLD:,} ppb" if ppb is not None and abs(ppb) > PPB_ABSOLUTE_THRESHOLD else ""
@@ -417,15 +383,12 @@ def analyze_gnss_phase_lock(
     The ISR-level residual is:
         isr_residual_gnss = (snap_gnss_now - snap_gnss_prev) - 10_000_000
 
-    This is the purest possible measurement -- no 64-bit extension,
-    no callback latency.  A perfectly phase-locked system produces
-    exactly zero every cycle.
+    A perfectly phase-locked system produces exactly zero every cycle.
 
     Non-zero values:
       +1/-1 (oscillating): phase boundary artifact -- PPS edge lands
-        on the cusp between two 10 MHz cycles.  Values cancel
-        across consecutive cycles (net sum stays near zero).
-      Other values: real hardware issue (missed edge, glitch, etc).
+        on the cusp between two 10 MHz cycles.
+      Other values: real hardware issue.
     """
     anomalies: List[str] = []
     lines: List[str] = []
@@ -508,16 +471,6 @@ def analyze_gnss_phase_lock(
         lines.append(f"  Net sum = {total_sum:+d} -- residuals cancel across cycles.")
         lines.append(f"  This is NOT a missed pulse.  VCLOCK and PPS are phase-locked,")
         lines.append(f"  but the PPS edge lands on the cusp between two 10 MHz cycles.")
-        lines.append(f"  The ISR captures it as +1 or -1 depending on exact timing.")
-        lines.append(f"")
-        lines.append(f"  Implication for TIMEPULSE: this same +/-1 cycle ambiguity")
-        lines.append(f"  propagates to tp_ticks_at_pps (9999 vs 10000 vs 10001).")
-        lines.append(f"  The ASAP callback compensates with a delivered tick, but")
-        lines.append(f"  the root cause is this sub-cycle phase ambiguity at the")
-        lines.append(f"  PPS boundary.")
-        lines.append(f"")
-        lines.append(f"  Recommendation: no hardware fix needed.  The compensation")
-        lines.append(f"  logic in pps_asap_callback() handles this correctly.")
         anomalies.append(
             f"GNSS phase boundary artifact: {len(non_zero)} +/-1 residuals "
             f"(+1={plus_one}, -1={minus_one}, sum={total_sum:+d}) -- "
@@ -563,149 +516,249 @@ def analyze_gnss_phase_lock(
 
 
 # ---------------------------------------------------------------------
-# TIMEPULSE Coherence Analysis
+# Prediction Quality Analysis (v8)
 # ---------------------------------------------------------------------
 
-def analyze_timepulse_coherence(
+def analyze_prediction_quality(
     rows: List[Dict[str, Any]],
     recovery_boundaries: Set[int],
 ) -> Tuple[List[str], List[str]]:
     """
-    Verify TIMEPULSE produces exactly 10,000 ticks per PPS interval
-    and zero phase error.
+    Examine Teensy prediction statistics from TIMEBASE stats block.
 
-    tp_ticks_at_pps: rising edges counted in the previous second.
-      Expected: exactly 10,000.
+    The prediction residual stddev is the authoritative interpolation
+    uncertainty metric.  For DWT this is typically ~3-4 cycles (3-4 ns);
+    for OCXO ~1 tick (100 ns) when servo-locked.
 
-    tp_phase_error_ns: quantized GNSS clock drift at PPS boundary.
-      Expected: exactly 0.
-
-    Values of 9999/10001 and +/-100,000 ns are the same phase boundary
-    artifact seen in isr_residual_gnss and are informational only.
+    This section surfaces:
+      - Final prediction stddev and N for each domain
+      - Trend: is stddev stable or growing?
+      - Any records where prediction N is unexpectedly low
+        (indicates repeated resets / short campaigns)
     """
     anomalies: List[str] = []
     lines: List[str] = []
 
-    ticks_key     = next((k for k in ["tp_ticks_at_pps", "timepulse_ticks_at_pps"]     if rows and rows[0].get(k) is not None), "tp_ticks_at_pps")
-    phase_err_key = next((k for k in ["tp_phase_error_ns", "timepulse_phase_error_ns"] if rows and rows[0].get(k) is not None), "tp_phase_error_ns")
+    for label, pred_key_prefix in [("DWT", "dwt"), ("OCXO", "ocxo")]:
+        lines.append(f"\n  [{label}] Prediction statistics (Teensy v10)")
 
-    ticks_samples: List[Tuple[int, int]] = []
-    phase_samples: List[Tuple[int, int]] = []
-    ticks_nulls = phase_nulls = 0
+        stddev_values: List[Tuple[int, float]] = []
+        n_values: List[Tuple[int, int]] = []
+        residual_stats = WelfordStats()
+        nulls = 0
 
-    for row in rows:
-        pps         = int(row.get("pps_count", -1))
-        is_boundary = pps in recovery_boundaries
-        t = row.get(ticks_key)
-        p = row.get(phase_err_key)
-        if t is None:
-            ticks_nulls += 1
-        elif not is_boundary:
-            ticks_samples.append((pps, int(t)))
-        if p is None:
-            phase_nulls += 1
-        elif not is_boundary:
-            phase_samples.append((pps, int(p)))
+        for row in rows:
+            pps = int(row.get("pps_count", -1))
+            if pps in recovery_boundaries:
+                continue
 
-    # --- tp_ticks_at_pps ---
-    lines.append(f"\n  tp_ticks_at_pps -- 10 KHz rising edges per PPS interval")
-    lines.append(f"  (expected: exactly {TIMEPULSE_TICKS_PER_SECOND:,} every second)")
-    lines.append(f"")
+            stats = row.get("stats", {})
+            domain_stats = stats.get(pred_key_prefix, {})
 
-    if not ticks_samples:
-        lines.append(f"  No data ({ticks_nulls} nulls).  Key: {ticks_key}")
-    else:
-        tick_counts = Counter(v for _, v in ticks_samples)
-        correct     = tick_counts.get(TIMEPULSE_TICKS_PER_SECOND, 0)
-        total_t     = len(ticks_samples)
-        wrong       = [(pps, v) for pps, v in ticks_samples if v != TIMEPULSE_TICKS_PER_SECOND]
+            pred_n = domain_stats.get("pred_n")
+            pred_stddev = domain_stats.get("pred_stddev")
+            pred_residual = domain_stats.get("pred_residual")
 
-        lines.append(f"  Valid samples:    {total_t}")
-        lines.append(f"  Correct (10000):  {correct}  ({100*correct/total_t:.1f}%)")
-        lines.append(f"  Wrong:            {len(wrong)}  ({100*len(wrong)/total_t:.1f}%)")
+            if pred_n is None:
+                nulls += 1
+                continue
 
-        if wrong:
-            lines.append(f"\n  Tick count distribution:")
-            for val in sorted(tick_counts.keys()):
-                count = tick_counts[val]
-                flag  = "" if val == TIMEPULSE_TICKS_PER_SECOND else "  <- anomaly"
-                bar   = "#" * min(40, count)
-                lines.append(f"    {val:>6d}  {count:>6d}x  {bar}{flag}")
+            n_values.append((pps, int(pred_n)))
 
-            wrong_counts = Counter(v for _, v in wrong)
-            low  = sum(c for v, c in wrong_counts.items() if v < TIMEPULSE_TICKS_PER_SECOND)
-            high = sum(c for v, c in wrong_counts.items() if v > TIMEPULSE_TICKS_PER_SECOND)
+            if pred_stddev is not None:
+                stddev_values.append((pps, float(pred_stddev)))
 
-            lines.append(f"\n  Low  (<10000): {low}")
-            lines.append(f"  High (>10000): {high}")
+            if pred_residual is not None and int(pred_n) > 0:
+                residual_stats.update(float(pred_residual))
 
-            if low > 0 and high > 0:
-                lines.append(f"\n  Both low and high counts present -- oscillating phase artifact.")
-                lines.append(f"  Connects directly to isr_residual_gnss +/-1 pattern.")
-            elif low > 0:
-                lines.append(f"\n  Only low counts -- systematic short seconds.")
-            elif high > 0:
-                lines.append(f"\n  Only high counts -- systematic long seconds.")
+        if not n_values:
+            lines.append(f"    No prediction data ({nulls} nulls)")
+            continue
 
-            lines.append(f"\n  First anomalous seconds:")
-            for pps, v in wrong[:10]:
-                lines.append(f"    pps_count={pps:>7d}  ticks={v}  ({v - TIMEPULSE_TICKS_PER_SECOND:+d})")
-            if len(wrong) > 10:
-                lines.append(f"    ... and {len(wrong) - 10} more")
+        # Final values (last record)
+        final_pps, final_n = n_values[-1]
+        final_stddev = stddev_values[-1][1] if stddev_values else None
 
-            anomalies.append(
-                f"TIMEPULSE: {len(wrong)} seconds with tick count != {TIMEPULSE_TICKS_PER_SECOND} "
-                f"(low={low}, high={high})"
-            )
-        else:
-            lines.append(f"\n  PERFECT: all {total_t} samples show exactly {TIMEPULSE_TICKS_PER_SECOND} ticks.")
+        lines.append(f"    Records with data: {len(n_values)}")
+        lines.append(f"    Final pred_n:      {final_n}")
+        if final_stddev is not None:
+            unit = "cycles" if label == "DWT" else "ticks"
+            ns_equiv = final_stddev * (1.0 if label == "DWT" else 100.0)
+            lines.append(f"    Final pred_stddev: {final_stddev:.3f} {unit} ({ns_equiv:.1f} ns)")
 
-    # --- tp_phase_error_ns ---
-    lines.append(f"\n  tp_phase_error_ns -- quantized GNSS clock drift at PPS boundary")
-    lines.append(f"  (expected: exactly 0 every second)")
-    lines.append(f"")
+        if residual_stats.n > 0:
+            lines.append(f"    Prediction residuals (Pi-side observed): {residual_stats.summary()}")
 
-    if not phase_samples:
-        lines.append(f"  No data ({phase_nulls} nulls).  Key: {phase_err_key}")
-    else:
-        phase_counts = Counter(v for _, v in phase_samples)
-        zero_count   = phase_counts.get(0, 0)
-        total_p      = len(phase_samples)
-        nonzero_p    = [(pps, v) for pps, v in phase_samples if v != 0]
+        # Check for stability: compare first-quarter vs last-quarter stddev
+        if len(stddev_values) >= 20:
+            q1_end = len(stddev_values) // 4
+            q4_start = 3 * len(stddev_values) // 4
+            q1_mean = sum(s for _, s in stddev_values[:q1_end]) / q1_end
+            q4_mean = sum(s for _, s in stddev_values[q4_start:]) / (len(stddev_values) - q4_start)
 
-        lines.append(f"  Valid samples:    {total_p}")
-        lines.append(f"  Zero (correct):   {zero_count}  ({100*zero_count/total_p:.1f}%)")
-        lines.append(f"  Non-zero:         {len(nonzero_p)}  ({100*len(nonzero_p)/total_p:.1f}%)")
-
-        if nonzero_p:
-            nz_values  = [v for _, v in nonzero_p]
-            nz_counts  = Counter(nz_values)
-            min_err    = min(nz_values)
-            max_err    = max(nz_values)
-
-            lines.append(f"\n  Phase error distribution:")
-            for val in sorted(nz_counts.keys()):
-                count = nz_counts[val]
-                bar   = "#" * min(40, count)
-                lines.append(f"    {val:>+10d} ns  {count:>6d}x  {bar}")
-
-            lines.append(f"\n  Range: [{min_err:+,d} ns, {max_err:+,d} ns]")
-            lines.append(f"  Sum:   {sum(nz_values):+,d} ns")
-
-            if all(abs(v) == 100_000 for v in nz_values):
-                lines.append(f"\n  All phase errors are exactly +/-100,000 ns (+/-1 GNSS tick).")
-                lines.append(f"  This is the same +/-1 cycle artifact seen in isr_residual_gnss.")
+            if q4_mean > q1_mean * 1.5 and q4_mean > 1.0:
+                lines.append(f"    WARN stddev growing: Q1 mean={q1_mean:.3f} -> Q4 mean={q4_mean:.3f}")
+                anomalies.append(f"{label} prediction stddev growing (Q1={q1_mean:.3f} Q4={q4_mean:.3f})")
             else:
-                lines.append(f"\n  WARN Phase errors present.  Not all are +/-100,000 ns.")
+                lines.append(f"    Stability: OK (Q1={q1_mean:.3f} Q4={q4_mean:.3f})")
 
-            anomalies.append(
-                f"TIMEPULSE phase error: {len(nonzero_p)} non-zero values "
-                f"(range [{min_err:+,d}, {max_err:+,d}] ns)"
-            )
-        else:
-            lines.append(f"  PERFECT: all {total_p} samples show zero phase error.")
+        # Check for zero-N records in the middle of a campaign (not just startup).
+        # Records immediately after a recovery boundary are expected to have
+        # pred_n=0 (prediction trackers reset on recovery).  Only flag records
+        # that are NOT adjacent to a recovery boundary.
+        zero_n_mid = [(pps, n) for pps, n in n_values if n == 0 and pps > n_values[0][0] + 5]
+        if zero_n_mid:
+            # A pred_n=0 record is "expected" if it is within 3 seconds of a recovery boundary
+            at_recovery = [pps for pps, _ in zero_n_mid
+                           if any(abs(pps - rb) <= 3 for rb in recovery_boundaries)]
+            unexpected  = [pps for pps, _ in zero_n_mid
+                           if not any(abs(pps - rb) <= 3 for rb in recovery_boundaries)]
+
+            if at_recovery and not unexpected:
+                lines.append(f"    pred_n=0: {len(at_recovery)} records "
+                             f"(all at recovery boundaries — expected)")
+            elif unexpected:
+                lines.append(f"    WARN {len(unexpected)} records with pred_n=0 after startup "
+                             f"(not at recovery boundaries — possible mid-campaign reset)")
+                if at_recovery:
+                    lines.append(f"    pred_n=0 at recovery: {len(at_recovery)} (expected)")
+
+        lines.append(f"    Verdict: {'OK' if not any(label in a for a in anomalies) else 'WARN'}")
 
     return anomalies, lines
+
+
+# ---------------------------------------------------------------------
+# Raw Delta Analysis (v8)
+# ---------------------------------------------------------------------
+
+def analyze_raw_deltas(
+    rows: List[Dict[str, Any]],
+    recovery_boundaries: Set[int],
+) -> Tuple[List[str], List[str]]:
+    """
+    Examine dwt_delta_raw and ocxo_delta_raw per-second deltas.
+
+    These are the ground truth for what each oscillator actually did
+    in each second.  The analysis looks for:
+      - Basic statistics (mean, stddev, min, max)
+      - Outliers (deltas far from nominal)
+      - Drift trend (is the mean shifting over time?)
+    """
+    anomalies: List[str] = []
+    lines: List[str] = []
+
+    DWT_NOMINAL = 1_008_000_000
+    OCXO_NOMINAL = 10_000_000
+
+    for label, key, nominal in [
+        ("DWT",  "dwt_delta_raw",  DWT_NOMINAL),
+        ("OCXO", "ocxo_delta_raw", OCXO_NOMINAL),
+    ]:
+        lines.append(f"\n  [{label}] Raw per-second deltas (key: {key})")
+
+        delta_stats = WelfordStats()
+        residual_stats = WelfordStats()
+        nulls = 0
+        values: List[Tuple[int, int]] = []
+
+        for row in rows:
+            pps = int(row.get("pps_count", -1))
+            if pps in recovery_boundaries:
+                continue
+
+            v = row.get(key)
+            if v is None:
+                nulls += 1
+                continue
+
+            delta = int(v)
+            values.append((pps, delta))
+            delta_stats.update(float(delta))
+            residual_stats.update(float(delta - nominal))
+
+        if not values:
+            lines.append(f"    No data ({nulls} nulls)")
+            continue
+
+        lines.append(f"    Samples: {delta_stats.n}")
+        lines.append(f"    Delta stats:    {delta_stats.summary()}")
+        lines.append(f"    Residual stats: {residual_stats.summary()}")
+        lines.append(f"    Nominal: {nominal:,}")
+
+        # Outlier check: deltas more than 50% away from nominal
+        outlier_threshold = nominal // 2
+        outliers = [(pps, d) for pps, d in values if abs(d - nominal) > outlier_threshold]
+        if outliers:
+            lines.append(f"    WARN {len(outliers)} outlier deltas (>50% from nominal):")
+            for pps, d in outliers[:5]:
+                lines.append(f"      pps_count={pps}  delta={d:,}  residual={d - nominal:+,d}")
+            if len(outliers) > 5:
+                lines.append(f"      ... and {len(outliers) - 5} more")
+            anomalies.append(f"{label}: {len(outliers)} outlier raw deltas")
+
+        # Drift trend: compare first vs last quarter mean
+        if len(values) >= 20:
+            q1_end = len(values) // 4
+            q4_start = 3 * len(values) // 4
+            q1_deltas = [d for _, d in values[:q1_end]]
+            q4_deltas = [d for _, d in values[q4_start:]]
+            q1_mean = sum(q1_deltas) / len(q1_deltas)
+            q4_mean = sum(q4_deltas) / len(q4_deltas)
+            drift = q4_mean - q1_mean
+
+            lines.append(f"    Drift (Q4-Q1 mean): {drift:+.3f} counts "
+                         f"({drift * (1.0 if label == 'DWT' else 100.0):+.1f} ns)")
+
+        lines.append(f"    Verdict: {'OK' if not any(label in a for a in anomalies) else 'WARN'}")
+
+    return anomalies, lines
+
+
+# ---------------------------------------------------------------------
+# OCXO Servo Summary
+# ---------------------------------------------------------------------
+
+def analyze_ocxo_servo(rows: List[Dict[str, Any]]) -> List[str]:
+    """
+    Surface OCXO servo state from TIMEBASE records.
+    """
+    lines: List[str] = []
+
+    first_dac = None
+    last_dac = None
+    first_adj = None
+    last_adj = None
+    calibrating = False
+
+    for row in rows:
+        dac = row.get("ocxo_dac")
+        adj = row.get("servo_adjustments")
+        cal = row.get("calibrate_ocxo")
+
+        if dac is not None:
+            if first_dac is None:
+                first_dac = float(dac)
+            last_dac = float(dac)
+        if adj is not None:
+            if first_adj is None:
+                first_adj = int(adj)
+            last_adj = int(adj)
+        if cal:
+            calibrating = True
+
+    if first_dac is None:
+        lines.append(f"  No OCXO DAC data in TIMEBASE records.")
+        return lines
+
+    lines.append(f"  Calibration active: {'YES' if calibrating else 'NO'}")
+    lines.append(f"  DAC range: {first_dac:.6f} -> {last_dac:.6f}")
+    lines.append(f"  DAC drift: {last_dac - first_dac:+.6f}")
+
+    if first_adj is not None and last_adj is not None:
+        lines.append(f"  Servo adjustments: {first_adj} -> {last_adj} ({last_adj - first_adj} during campaign)")
+
+    return lines
 
 
 # ---------------------------------------------------------------------
@@ -922,63 +975,6 @@ def analyze(campaign: str) -> None:
         else:
             print(f"    Verdict: OK monotonic, no zeros, no duplicates")
 
-    # --- Pi capture sequence ---
-    print()
-    print("-" * 70)
-    print("PI CAPTURE SEQUENCE (diag_pi_seq)")
-    print("-" * 70)
-
-    seqs: List[Tuple[int, int]] = []
-    seq_nulls = 0
-    for r in rows:
-        s = r.get("diag_pi_seq")
-        if s is None:
-            seq_nulls += 1
-        else:
-            seqs.append((int(r["pps_count"]), int(s)))
-
-    if not seqs:
-        print("  ALL NULL")
-    else:
-        if seq_nulls:
-            print(f"  Nulls: {seq_nulls}/{total}")
-
-        seq_gaps = seq_repeats = seq_regressions = seq_recovery_regressions = 0
-
-        for i in range(1, len(seqs)):
-            prev_pps, prev_seq = seqs[i - 1]
-            curr_pps, curr_seq = seqs[i]
-            delta       = curr_seq - prev_seq
-            at_boundary = curr_pps in recovery_boundaries
-
-            if delta == 0:
-                seq_repeats += 1
-                if seq_repeats <= 3:
-                    print(f"  WARN SEQ REPEAT at pps_count={curr_pps}: seq={curr_seq}")
-            elif delta < 0:
-                if at_boundary:
-                    seq_recovery_regressions += 1
-                    print(f"  INFO SEQ REGRESSION at recovery pps_count={curr_pps}: {prev_seq} -> {curr_seq} (expected)")
-                else:
-                    seq_regressions += 1
-                    if seq_regressions <= 3:
-                        print(f"  WARN SEQ REGRESSION at pps_count={curr_pps}: {prev_seq} -> {curr_seq}")
-            elif delta > 1 and not at_boundary:
-                seq_gaps += 1
-                if seq_gaps <= 5:
-                    print(f"  WARN SEQ GAP at pps_count={curr_pps}: {prev_seq} -> {curr_seq} (missed {delta - 1})")
-
-        print(f"\n  Range: {seqs[0][1]} -> {seqs[-1][1]}")
-        print(f"  Gaps: {seq_gaps}  Repeats: {seq_repeats}  Regressions: {seq_regressions}")
-        if seq_recovery_regressions:
-            print(f"  Recovery regressions: {seq_recovery_regressions} (expected)")
-
-        if not (seq_gaps or seq_repeats or seq_regressions):
-            suffix = f" ({seq_recovery_regressions} recovery regressions -- expected)" if seq_recovery_regressions else ""
-            print(f"  Verdict: OK sequential, no gaps{suffix}")
-        else:
-            print(f"  Verdict: WARN anomalies detected")
-
     # --- PPB sanity check ---
     print()
     print("-" * 70)
@@ -990,11 +986,43 @@ def analyze(campaign: str) -> None:
         print(line)
     anomalies.extend(ppb_anomalies)
 
+    # --- Raw delta analysis (v8) ---
+    print()
+    print("-" * 70)
+    print("RAW DELTA ANALYSIS (per-second oscillator deltas)")
+    print("-" * 70)
+
+    delta_anomalies, delta_lines = analyze_raw_deltas(rows, recovery_boundaries)
+    for line in delta_lines:
+        print(line)
+    anomalies.extend(delta_anomalies)
+
+    # --- Prediction quality analysis (v8) ---
+    print()
+    print("-" * 70)
+    print("PREDICTION QUALITY (Teensy v10 trend-aware statistics)")
+    print("-" * 70)
+
+    pred_anomalies, pred_lines = analyze_prediction_quality(rows, recovery_boundaries)
+    for line in pred_lines:
+        print(line)
+    anomalies.extend(pred_anomalies)
+
+    # --- OCXO servo summary ---
+    print()
+    print("-" * 70)
+    print("OCXO SERVO STATE")
+    print("-" * 70)
+
+    servo_lines = analyze_ocxo_servo(rows)
+    for line in servo_lines:
+        print(line)
+
     # --- Recovery forensics ---
     if recovery_boundaries:
         print()
         print("-" * 70)
-        print("RECOVERY FORENSICS (v4 nanosecond architecture)")
+        print("RECOVERY FORENSICS (v5 nanosecond architecture)")
         print("-" * 70)
         for line in analyze_recovery_forensics(rows, recovery_boundaries):
             print(line)
@@ -1009,7 +1037,6 @@ def analyze(campaign: str) -> None:
         ("GNSS", "isr_residual_gnss"),
         ("DWT",  "isr_residual_dwt"),
         ("OCXO", "isr_residual_ocxo"),
-        ("Pi",   "isr_residual_pi"),
     ]:
         stats = WelfordStats()
         nulls = 0
@@ -1041,30 +1068,6 @@ def analyze(campaign: str) -> None:
         print()
         print("  [informational -- not counted as failures]")
         for a in informational_anomalies:
-            print(f"    INFO {a}")
-
-    # --- TIMEPULSE Coherence Analysis ---
-    print()
-    print("-" * 70)
-    print("TIMEPULSE COHERENCE (tp_ticks_at_pps, tp_phase_error_ns)")
-    print("-" * 70)
-
-    tp_anomalies, tp_lines = analyze_timepulse_coherence(rows, recovery_boundaries)
-    for line in tp_lines:
-        print(line)
-
-    hard_tp_anomalies = []
-    soft_tp_anomalies = []
-    for a in tp_anomalies:
-        if "TIMEPULSE:" in a and ("low=0" in a or "high=0" in a or "low=1" in a or "high=1" in a):
-            soft_tp_anomalies.append(a)
-        else:
-            hard_tp_anomalies.append(a)
-    anomalies.extend(hard_tp_anomalies)
-    if soft_tp_anomalies:
-        print()
-        print("  [informational -- phase boundary artifact, not a failure]")
-        for a in soft_tp_anomalies:
             print(f"    INFO {a}")
 
     # --- Final verdict ---
