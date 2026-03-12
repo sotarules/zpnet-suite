@@ -1,49 +1,14 @@
 // ============================================================================
-// timebase.cpp — ZPNet Timebase Singleton (Teensy)
+// timebase.cpp — ZPNet Timebase Singleton (Teensy) — v11 Dual OCXO
 // ============================================================================
 //
 // PPS-fragment anchored Timebase.
 //
-// The authoritative TIMEBASE_FRAGMENT provides PPS-edge totals once per
-// second.  The fragment carries:
+// v11: Dual OCXO.  Fragment store and conversion paths support four
+//      clock domains: GNSS, DWT, OCXO1, OCXO2.
 //
-//   dwt_cycles         — synthetic 64-bit DWT cycle count at PPS edge
-//   dwt_cyccnt_at_pps  — raw DWT_CYCCNT from the spin loop pre-edge shadow
-//   dwt_cycles_per_pps — Welford mean of DWT cycles per GNSS second
-//
-// Interpolation within the current second:
-//
-//   dwt_cycles_now     = fragment.dwt_cycles + (DWT_CYCCNT - dwt_cyccnt_at_pps)
-//   cycles_into_second = dwt_cycles_now - fragment.dwt_cycles
-//                      = DWT_CYCCNT - dwt_cyccnt_at_pps
-//   ns_into_second     = cycles_into_second × 1,000,000,000 / dwt_cycles_per_pps
-//   gnss_now           = fragment.gnss_ns + ns_into_second
-//
-// The product cycles_into_second × 1e9 fits in uint64 (max ~1.008e18).
-// No floating point.  No mul_div_u64 double fallback.  No rounding bias.
-//
-// Rounding policy (v8):
-//
-//   The cycles→nanoseconds division uses round-to-nearest instead of
-//   truncation.  This reduces the maximum interpolation error from
-//   [0, +1) ns to [-0.5, +0.5) ns, eliminating the systematic -1 ns
-//   bias observed in INTERP_TEST round-trip validation.
-//
-//   The rounding is implemented as:
-//     ns = (cycles * 1e9 + denominator/2) / denominator
-//
-//   The half-denominator addition (~504M) cannot overflow: the maximum
-//   product is ~1.008e18 + 5.04e8 ≈ 1.008e18, well within uint64 range.
-//
-// timebase_now_dwt_cycles() returns the synthetic campaign cycle count
-// at any instant — for code that needs the raw cycle count before
-// nanosecond conversion.
-//
-// The DWT runs at 1008 MHz.  The 125/126 ratio converts DWT cycles to
-// nominal nanoseconds and is used only for the DWT domain.
-//
-// All public API speaks nanoseconds.  Clock domain details (DWT cycles,
-// OCXO ticks) are internal to this module and the conversion helpers.
+// Rounding policy (v8, unchanged):
+//   cycles→ns uses round-to-nearest: ns = (cycles * 1e9 + denom/2) / denom
 //
 // ============================================================================
 
@@ -62,7 +27,6 @@
 static constexpr uint32_t DWT_TO_NS_NUM = 125;
 static constexpr uint32_t DWT_TO_NS_DEN = 126;
 
-// Allow the most recent fragment to remain authoritative for up to 3 seconds.
 static constexpr uint64_t TIMEBASE_MAX_FRAGMENT_AGE_NS = 3000000000ULL;
 
 // ============================================================================
@@ -88,11 +52,13 @@ struct fragment_store_t {
   volatile uint64_t gnss_ns;
   volatile uint64_t dwt_ns;
   volatile uint64_t dwt_cycles;
-  volatile uint64_t ocxo_ns;
+  volatile uint64_t ocxo1_ns;
+  volatile uint64_t ocxo2_ns;
   volatile uint32_t pps_count;
   volatile int32_t  isr_residual_dwt;
   volatile int32_t  isr_residual_gnss;
-  volatile int32_t  isr_residual_ocxo;
+  volatile int32_t  isr_residual_ocxo1;
+  volatile int32_t  isr_residual_ocxo2;
   volatile uint32_t dwt_cyccnt_at_pps;
   volatile uint64_t dwt_cycles_per_pps;
   volatile uint32_t gpt2_at_pps;
@@ -100,31 +66,21 @@ struct fragment_store_t {
   volatile bool     valid;
 };
 
-static fragment_store_t frag_store = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, false};
+static fragment_store_t frag_store = {};
 
-// Public mirror for diagnostics / reports
 static timebase_fragment_t frag_public = {};
 
 // ============================================================================
 // Safe multiply/divide helper
 // ============================================================================
 
-static inline uint64_t mul_div_u64(
-  uint64_t value,
-  uint64_t num,
-  uint64_t den
-) {
+static inline uint64_t mul_div_u64(uint64_t value, uint64_t num, uint64_t den) {
   if (den == 0) return 0;
-
-  // Fast path: no overflow
   if (num != 0 && value <= (UINT64_MAX / num)) {
     return (value * num) / den;
   }
-
-  // Slow path: use double for very large values
   double ratio  = (double)num / (double)den;
   double scaled = (double)value * ratio;
-
   if (scaled <= 0.0) return 0;
   return (uint64_t)(scaled + 0.5);
 }
@@ -137,21 +93,19 @@ struct fragment_copy_t {
   uint64_t gnss_ns;
   uint64_t dwt_ns;
   uint64_t dwt_cycles;
-  uint64_t ocxo_ns;
+  uint64_t ocxo1_ns;
+  uint64_t ocxo2_ns;
   uint32_t pps_count;
   int32_t  isr_residual_dwt;
   int32_t  isr_residual_gnss;
-  int32_t  isr_residual_ocxo;
+  int32_t  isr_residual_ocxo1;
+  int32_t  isr_residual_ocxo2;
   uint32_t dwt_cyccnt_at_pps;
   uint64_t dwt_cycles_per_pps;
   uint32_t gpt2_at_pps;
   bool     valid;
   bool     ok;
 };
-
-// ============================================================================
-// Fragment read with torn-read protection
-// ============================================================================
 
 static fragment_copy_t read_fragment(void) {
   fragment_copy_t f = {};
@@ -161,14 +115,16 @@ static fragment_copy_t read_fragment(void) {
     uint32_t s1 = frag_store.seq;
     dmb();
 
-    f.gnss_ns           = frag_store.gnss_ns;
-    f.dwt_ns            = frag_store.dwt_ns;
-    f.dwt_cycles        = frag_store.dwt_cycles;
-    f.ocxo_ns           = frag_store.ocxo_ns;
-    f.pps_count         = frag_store.pps_count;
-    f.isr_residual_dwt  = frag_store.isr_residual_dwt;
-    f.isr_residual_gnss = frag_store.isr_residual_gnss;
-    f.isr_residual_ocxo = frag_store.isr_residual_ocxo;
+    f.gnss_ns            = frag_store.gnss_ns;
+    f.dwt_ns             = frag_store.dwt_ns;
+    f.dwt_cycles         = frag_store.dwt_cycles;
+    f.ocxo1_ns           = frag_store.ocxo1_ns;
+    f.ocxo2_ns           = frag_store.ocxo2_ns;
+    f.pps_count          = frag_store.pps_count;
+    f.isr_residual_dwt   = frag_store.isr_residual_dwt;
+    f.isr_residual_gnss  = frag_store.isr_residual_gnss;
+    f.isr_residual_ocxo1 = frag_store.isr_residual_ocxo1;
+    f.isr_residual_ocxo2 = frag_store.isr_residual_ocxo2;
     f.dwt_cyccnt_at_pps  = frag_store.dwt_cyccnt_at_pps;
     f.dwt_cycles_per_pps = frag_store.dwt_cycles_per_pps;
     f.gpt2_at_pps        = frag_store.gpt2_at_pps;
@@ -204,9 +160,13 @@ static bool fragment_domain_total_ns(
       out_ns = f.dwt_ns;
       return f.dwt_ns > 0;
 
-    case timebase_domain_t::OCXO:
-      out_ns = f.ocxo_ns;
-      return f.ocxo_ns > 0;
+    case timebase_domain_t::OCXO1:
+      out_ns = f.ocxo1_ns;
+      return f.ocxo1_ns > 0;
+
+    case timebase_domain_t::OCXO2:
+      out_ns = f.ocxo2_ns;
+      return f.ocxo2_ns > 0;
   }
 
   out_ns = 0;
@@ -214,7 +174,7 @@ static bool fragment_domain_total_ns(
 }
 
 // ============================================================================
-// Synthetic campaign DWT cycle count — "how many DWT cycles since PPS 0?"
+// Synthetic campaign DWT cycle count
 // ============================================================================
 
 static constexpr uint64_t NS_PER_SECOND = 1000000000ULL;
@@ -223,7 +183,6 @@ static bool current_dwt_cycles(const fragment_copy_t& f, uint64_t& out_cycles) {
   uint32_t dwt_now     = ARM_DWT_CYCCNT;
   uint32_t dwt_elapsed = dwt_now - f.dwt_cyccnt_at_pps;
 
-  // Sanity: elapsed should be less than ~3 seconds of cycles
   if ((uint64_t)dwt_elapsed * NS_PER_SECOND / (f.dwt_cycles_per_pps ? f.dwt_cycles_per_pps : 1008000000ULL) > TIMEBASE_MAX_FRAGMENT_AGE_NS) {
     return false;
   }
@@ -232,34 +191,18 @@ static bool current_dwt_cycles(const fragment_copy_t& f, uint64_t& out_cycles) {
   return true;
 }
 
-// ============================================================================
-// Public API — synthetic DWT cycle count
-// ============================================================================
-
 int64_t timebase_now_dwt_cycles(void) {
   fragment_copy_t f = read_fragment();
   if (!f.ok || !f.valid) return -1;
   if (f.dwt_cycles_per_pps == 0) return -1;
-
   uint64_t cycles = 0;
   if (!current_dwt_cycles(f, cycles)) return -1;
   return (int64_t)cycles;
 }
 
 // ============================================================================
-// Forward projection — pure integer, round-to-nearest (v8)
+// Forward projection — GNSS (round-to-nearest)
 // ============================================================================
-//
-// The math:
-//   dwt_cycles_now        = fragment.dwt_cycles + (DWT_CYCCNT - dwt_cyccnt_at_pps)
-//   cycles_into_second    = dwt_cycles_now - fragment.dwt_cycles
-//                         = DWT_CYCCNT - dwt_cyccnt_at_pps
-//   ns_into_second        = (cycles_into_second × 1e9 + half_denom) / dwt_cycles_per_pps
-//   gnss_now              = fragment.gnss_ns + ns_into_second
-//
-// The half-denominator rounding reduces interpolation error from
-// [0, +1) ns to [-0.5, +0.5) ns.  The addition of ~504M to a
-// product that maxes at ~1.008e18 cannot overflow uint64.
 
 static bool current_gnss_now(uint64_t& out_gnss_ns) {
   fragment_copy_t f = read_fragment();
@@ -269,25 +212,20 @@ static bool current_gnss_now(uint64_t& out_gnss_ns) {
   uint64_t dwt_cycles_now = 0;
   if (!current_dwt_cycles(f, dwt_cycles_now)) return false;
 
-  // Cycles elapsed since the PPS edge that anchors this fragment
   uint64_t cycles_into_second = dwt_cycles_now - f.dwt_cycles;
 
-  // Convert to GNSS nanoseconds using the predicted rate,
-  // with round-to-nearest.
   uint64_t ns_into_second =
     (cycles_into_second * NS_PER_SECOND + f.dwt_cycles_per_pps / 2)
     / f.dwt_cycles_per_pps;
 
-  if (ns_into_second > TIMEBASE_MAX_FRAGMENT_AGE_NS) {
-    return false;
-  }
+  if (ns_into_second > TIMEBASE_MAX_FRAGMENT_AGE_NS) return false;
 
   out_gnss_ns = f.gnss_ns + ns_into_second;
   return true;
 }
 
 // ============================================================================
-// Forward projection — DWT domain (nominal 125/126, no tau correction)
+// Forward projection — DWT domain (nominal 125/126)
 // ============================================================================
 
 static bool current_dwt_now(uint64_t& out_dwt_ns) {
@@ -300,9 +238,7 @@ static bool current_dwt_now(uint64_t& out_dwt_ns) {
   uint64_t elapsed_dwt_ns =
     mul_div_u64((uint64_t)dwt_elapsed, DWT_TO_NS_NUM, DWT_TO_NS_DEN);
 
-  if (elapsed_dwt_ns > TIMEBASE_MAX_FRAGMENT_AGE_NS) {
-    return false;
-  }
+  if (elapsed_dwt_ns > TIMEBASE_MAX_FRAGMENT_AGE_NS) return false;
 
   out_dwt_ns = f.dwt_ns + elapsed_dwt_ns;
   return true;
@@ -324,9 +260,7 @@ static bool convert_via_fragment(
   }
 
   fragment_copy_t f = read_fragment();
-  if (!f.ok || !f.valid || f.gnss_ns == 0) {
-    return false;
-  }
+  if (!f.ok || !f.valid || f.gnss_ns == 0) return false;
 
   uint64_t from_total_ns = 0;
   uint64_t to_total_ns   = 0;
@@ -334,7 +268,6 @@ static bool convert_via_fragment(
   if (!fragment_domain_total_ns(f, from_domain, from_total_ns)) return false;
   if (!fragment_domain_total_ns(f, to_domain,   to_total_ns))   return false;
 
-  // Normalize to GNSS first
   uint64_t gnss_ns = 0;
   if (from_domain == timebase_domain_t::GNSS) {
     gnss_ns = value_ns;
@@ -342,7 +275,6 @@ static bool convert_via_fragment(
     gnss_ns = mul_div_u64(value_ns, f.gnss_ns, from_total_ns);
   }
 
-  // Then convert to target domain
   if (to_domain == timebase_domain_t::GNSS) {
     out_ns = gnss_ns;
   } else {
@@ -368,14 +300,28 @@ int64_t timebase_now_ns(timebase_domain_t domain) {
       if (!current_dwt_now(now_ns)) return -1;
       return (int64_t)now_ns;
 
-    case timebase_domain_t::OCXO: {
+    case timebase_domain_t::OCXO1: {
       uint64_t gnss_now_ns = 0;
       uint64_t ocxo_now_ns = 0;
       if (!current_gnss_now(gnss_now_ns)) return -1;
       if (!convert_via_fragment(
             gnss_now_ns,
             timebase_domain_t::GNSS,
-            timebase_domain_t::OCXO,
+            timebase_domain_t::OCXO1,
+            ocxo_now_ns)) {
+        return -1;
+      }
+      return (int64_t)ocxo_now_ns;
+    }
+
+    case timebase_domain_t::OCXO2: {
+      uint64_t gnss_now_ns = 0;
+      uint64_t ocxo_now_ns = 0;
+      if (!current_gnss_now(gnss_now_ns)) return -1;
+      if (!convert_via_fragment(
+            gnss_now_ns,
+            timebase_domain_t::GNSS,
+            timebase_domain_t::OCXO2,
             ocxo_now_ns)) {
         return -1;
       }
@@ -395,18 +341,6 @@ int64_t timebase_now_gnss_ns(void) {
 // ============================================================================
 // Deterministic overload — GNSS ns from pre-captured DWT + fragment
 // ============================================================================
-//
-// Pure arithmetic.  No register reads.  No torn-read loop.  No branches
-// that depend on runtime state.  The same number of instructions every
-// time.  This is the path for ISR-captured timestamps (timepop, photon
-// detector, or any hardware event).
-//
-// The math is identical to current_gnss_now(), including round-to-nearest:
-//
-//   elapsed        = dwt_cyccnt - frag_dwt_cyccnt_at_pps   (uint32_t wrap OK)
-//   ns_into_second = (elapsed × 1e9 + half_denom) / dwt_cycles_per_pps
-//   gnss_ns        = frag_gnss_ns + ns_into_second
-//
 
 int64_t timebase_gnss_ns_from_dwt(
   uint32_t dwt_cyccnt,
@@ -419,8 +353,6 @@ int64_t timebase_gnss_ns_from_dwt(
 
   uint32_t elapsed = dwt_cyccnt - frag_dwt_cyccnt_at_pps;
 
-  // Round-to-nearest: add half the denominator before dividing.
-  // Max product: ~1.008e18 + ~5.04e8 ≈ 1.008e18 — no overflow risk.
   uint64_t ns_into_second =
     ((uint64_t)elapsed * NS_PER_SECOND + (uint64_t)frag_dwt_cycles_per_pps / 2)
     / (uint64_t)frag_dwt_cycles_per_pps;
@@ -443,7 +375,6 @@ int64_t timebase_convert_ns(
   if (!convert_via_fragment(value_ns, from_domain, to_domain, converted)) {
     return -1;
   }
-
   return (int64_t)converted;
 }
 
@@ -500,7 +431,7 @@ int timebase_now_iso8601(char* buf, size_t buf_len) {
 }
 
 // ============================================================================
-// Public API — PPS count
+// PPS count
 // ============================================================================
 
 uint32_t timebase_pps_count(void) {
@@ -521,9 +452,10 @@ bool timebase_valid(void) {
 bool timebase_conversion_valid(void) {
   fragment_copy_t f = read_fragment();
   if (!f.ok || !f.valid) return false;
-  if (f.gnss_ns == 0) return false;
-  if (f.dwt_ns  == 0) return false;
-  if (f.ocxo_ns == 0) return false;
+  if (f.gnss_ns  == 0) return false;
+  if (f.dwt_ns   == 0) return false;
+  if (f.ocxo1_ns == 0) return false;
+  if (f.ocxo2_ns == 0) return false;
   return true;
 }
 
@@ -535,14 +467,16 @@ void timebase_invalidate(void) {
   frag_store.seq++;
   dmb();
 
-  frag_store.gnss_ns           = 0;
-  frag_store.dwt_ns            = 0;
-  frag_store.dwt_cycles        = 0;
-  frag_store.ocxo_ns           = 0;
-  frag_store.pps_count         = 0;
-  frag_store.isr_residual_dwt  = 0;
-  frag_store.isr_residual_gnss = 0;
-  frag_store.isr_residual_ocxo = 0;
+  frag_store.gnss_ns            = 0;
+  frag_store.dwt_ns             = 0;
+  frag_store.dwt_cycles         = 0;
+  frag_store.ocxo1_ns           = 0;
+  frag_store.ocxo2_ns           = 0;
+  frag_store.pps_count          = 0;
+  frag_store.isr_residual_dwt   = 0;
+  frag_store.isr_residual_gnss  = 0;
+  frag_store.isr_residual_ocxo1 = 0;
+  frag_store.isr_residual_ocxo2 = 0;
   frag_store.dwt_cyccnt_at_pps  = 0;
   frag_store.dwt_cycles_per_pps = 0;
   frag_store.gpt2_at_pps        = 0;
@@ -570,35 +504,33 @@ void on_timebase_fragment(const Payload& payload) {
   const uint64_t gnss_ns    = payload.getUInt64("gnss_ns", 0);
   const uint64_t dwt_ns     = payload.getUInt64("dwt_ns", 0);
   const uint64_t dwt_cycles = payload.getUInt64("dwt_cycles", 0);
-  const uint64_t ocxo_ns    = payload.getUInt64("ocxo_ns", 0);
+  const uint64_t ocxo1_ns   = payload.getUInt64("ocxo1_ns", 0);
+  const uint64_t ocxo2_ns   = payload.getUInt64("ocxo2_ns", 0);
   const uint32_t pps_count  = (uint32_t)payload.getUInt64("teensy_pps_count", 0);
 
-  const int32_t isr_dwt  = payload.getInt("isr_residual_dwt", 0);
-  const int32_t isr_gnss = payload.getInt("isr_residual_gnss", 0);
-  const int32_t isr_ocxo = payload.getInt("isr_residual_ocxo", 0);
+  const int32_t isr_dwt   = payload.getInt("isr_residual_dwt", 0);
+  const int32_t isr_gnss  = payload.getInt("isr_residual_gnss", 0);
+  const int32_t isr_ocxo1 = payload.getInt("isr_residual_ocxo1", 0);
+  const int32_t isr_ocxo2 = payload.getInt("isr_residual_ocxo2", 0);
 
-  // The interpolation anchor is the raw DWT_CYCCNT register value
-  // captured by the spin loop just before the PPS edge.  This is the
-  // actual hardware register value — NOT the 64-bit accumulator.
-  // When current_gnss_now() later computes (DWT_CYCCNT - anchor),
-  // the result is elapsed cycles since the PPS edge.
   const uint32_t dwt_cyccnt_at_pps    = payload.getUInt("dwt_cyccnt_at_pps", 0);
   const uint64_t dwt_cycles_per_pps   = payload.getUInt64("dwt_cycles_per_pps", 0);
   const uint32_t gpt2_at_pps          = payload.getUInt("gpt2_at_pps", 0);
-  const bool valid = (gnss_ns > 0 && dwt_ns > 0 && ocxo_ns > 0 && dwt_cycles_per_pps > 0);
+  const bool valid = (gnss_ns > 0 && dwt_ns > 0 && ocxo1_ns > 0 && dwt_cycles_per_pps > 0);
 
-  // Sequence-protected write (odd = in-progress, even = stable)
   frag_store.seq++;
   dmb();
 
   frag_store.gnss_ns            = gnss_ns;
   frag_store.dwt_ns             = dwt_ns;
   frag_store.dwt_cycles         = dwt_cycles;
-  frag_store.ocxo_ns            = ocxo_ns;
+  frag_store.ocxo1_ns           = ocxo1_ns;
+  frag_store.ocxo2_ns           = ocxo2_ns;
   frag_store.pps_count          = pps_count;
   frag_store.isr_residual_dwt   = isr_dwt;
   frag_store.isr_residual_gnss  = isr_gnss;
-  frag_store.isr_residual_ocxo  = isr_ocxo;
+  frag_store.isr_residual_ocxo1 = isr_ocxo1;
+  frag_store.isr_residual_ocxo2 = isr_ocxo2;
   frag_store.dwt_cyccnt_at_pps  = dwt_cyccnt_at_pps;
   frag_store.dwt_cycles_per_pps = dwt_cycles_per_pps;
   frag_store.gpt2_at_pps        = gpt2_at_pps;
@@ -607,15 +539,16 @@ void on_timebase_fragment(const Payload& payload) {
   dmb();
   frag_store.seq++;
 
-  // Unsynchronized public mirror for diagnostic/report reads
   frag_public.gnss_ns            = gnss_ns;
   frag_public.dwt_ns             = dwt_ns;
   frag_public.dwt_cycles         = dwt_cycles;
-  frag_public.ocxo_ns            = ocxo_ns;
+  frag_public.ocxo1_ns           = ocxo1_ns;
+  frag_public.ocxo2_ns           = ocxo2_ns;
   frag_public.pps_count          = pps_count;
   frag_public.isr_residual_dwt   = isr_dwt;
   frag_public.isr_residual_gnss  = isr_gnss;
-  frag_public.isr_residual_ocxo  = isr_ocxo;
+  frag_public.isr_residual_ocxo1 = isr_ocxo1;
+  frag_public.isr_residual_ocxo2 = isr_ocxo2;
   frag_public.dwt_cycles_per_pps = dwt_cycles_per_pps;
   frag_public.dwt_cyccnt_at_pps  = dwt_cyccnt_at_pps;
   frag_public.gpt2_at_pps        = gpt2_at_pps;
@@ -627,6 +560,6 @@ void on_timebase_fragment(const Payload& payload) {
 // ============================================================================
 
 void timebase_init(void) {
-  frag_store  = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, false};
+  frag_store  = {};
   frag_public = {};
 }

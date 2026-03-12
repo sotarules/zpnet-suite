@@ -41,7 +41,7 @@ static constexpr uint64_t TRANSPORT_RX_POLL_NS = 1000000ULL;  // 1 millisecond
 static constexpr uint64_t TRANSPORT_TX_POLL_NS = 1000000ULL;  // 1 millisecond
 
 static constexpr size_t TRANSPORT_BLOCK_SIZE = 64;
-static constexpr size_t RX_BUF_MAX           = 2048;
+static constexpr size_t RX_BUF_MAX           = 4096;
 
 // TX job queue depth
 static constexpr size_t TX_JOB_MAX = 64;
@@ -258,7 +258,7 @@ void transport_send(uint8_t traffic, const Payload& payload) {
   // 1. Serialize to stack buffer
   // --------------------------------------------------------
 
-  char local_buf[2048];
+  char local_buf[4096];
   size_t json_len = payload.write_json(local_buf, sizeof(local_buf));
 
   if (json_len == 0)

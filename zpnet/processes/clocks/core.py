@@ -1,25 +1,25 @@
 """
-ZPNet CLOCKS Process — TIMEBASE Authority (Pi-side) — v8 Prediction-Aware
+ZPNet CLOCKS Process — TIMEBASE Authority (Pi-side) — v9 Dual OCXO
 
 Core contract (v2026-03+):
 
   CLOCKS is a pure traffic cop.  It owns NO clock state.  It receives
-  TIMEBASE_FRAGMENT from the Teensy (containing GNSS, DWT, and OCXO
+  TIMEBASE_FRAGMENT from the Teensy (containing GNSS, DWT, OCXO1, and OCXO2
   nanoseconds), decorates each fragment with environment snapshots and
   GF-8802 discipline data, computes Welford statistics, and persists
   the result as an immutable TIMEBASE row.
 
   Architecture:
-    • Teensy owns: GNSS ns, DWT ns/cycles, OCXO ns — in TIMEBASE_FRAGMENT
+    • Teensy owns: GNSS ns, DWT ns/cycles, OCXO1 ns, OCXO2 ns — in TIMEBASE_FRAGMENT
     • GNSS owns: GF-8802 discipline state — in GET_GNSS_INFO
     • CLOCKS owns: correlation, campaign lifecycle
 
-  Three clock domains: GNSS (reference), DWT, OCXO.
+  Four clock domains: GNSS (reference), DWT, OCXO1, OCXO2.
 
-  v8: Prediction-aware statistics.
+  v9: Prediction-aware statistics.
 
     The Teensy (process_clocks.cpp v10) now computes trend-aware
-    prediction statistics for DWT and OCXO.  Instead of measuring
+    prediction statistics for DWT, OCXO1, and OCXO2.  Instead of measuring
     residuals against a fixed nominal frequency (which conflates
     thermal drift range with measurement noise), the Teensy does
     linear extrapolation from the two most recent per-second deltas:
@@ -33,24 +33,24 @@ Core contract (v2026-03+):
 
     The prediction residual stddev is the authoritative confidence
     metric for sub-second interpolation.  For DWT this is ~3-4
-    cycles (3-4 ns); for OCXO ~1 tick (100 ns).
+    cycles (3-4 ns); for OCXO1/OCXO2 ~1 tick (100 ns).
 
     Pi-side changes:
-      • DWT and OCXO prediction stats are passed through from the
+      • DWT, OCXO1, and OCXO2 prediction stats are passed through from the
         Teensy fragment and persisted in TIMEBASE records.
-      • Raw deltas (dwt_delta_raw, ocxo_delta_raw) are persisted.
-      • Pi-side Welford residual trackers for DWT and OCXO are
+      • Raw deltas (dwt_delta_raw, ocxo1_delta_raw, ocxo2_delta_raw) are persisted.
+      • Pi-side Welford residual trackers for DWT, OCXO1, OCXO2 are
         REMOVED — the Teensy's prediction stats are strictly
         superior and the Pi-side trackers were always second-hand.
       • GNSS Pi-side residual tracking is RETAINED as a stream
         health canary (GNSS is phase-coherent so residual == 0;
         any deviation indicates a problem).
       • The TIMEBASE stats block uses Teensy prediction stats
-        for DWT/OCXO and Pi-side sanity stats for GNSS.
+        for DWT/OCXO1/OCXO2 and Pi-side canary stats for GNSS.
       • The report clock blocks surface prediction stddev as the
         authoritative interpolation uncertainty.
 
-  Recovery is symmetric across all three domains:
+  Recovery is symmetric across all four domains:
 
     projected_gnss_ns = next_pps_count * NS_PER_SECOND
     projected_ns = projected_gnss_ns * last_clock_ns // last_gnss_ns
@@ -224,7 +224,7 @@ _diag: Dict[str, Any] = {
 # the GNSS residual Pi-side purely as a stream health canary: if it
 # ever goes nonzero, something is wrong with the PPS or VCLOCK path.
 #
-# DWT and OCXO residual tracking is NO LONGER done Pi-side.  The
+# DWT, OCXO1, and OCXO2 residual tracking is NO LONGER done Pi-side.  The
 # Teensy's prediction statistics (v10) are strictly superior.
 #
 
@@ -666,7 +666,7 @@ def _fetch_environment() -> Optional[Dict[str, Any]]:
         power = p.get("power", {})
         battery = p.get("battery", {})
 
-        # Power state: extract Pi, Teensy, OCXO domains from i2c-2
+        # Power state: extract Pi, Teensy, OCXO1 domains from i2c-2
         i2c2 = power.get("i2c-2", {})
         pi_power = i2c2.get("0x40", {})
         teensy_power = i2c2.get("0x45", {})
@@ -826,7 +826,7 @@ def _build_clock_block(
     """
     Build a clock domain block for the campaign report.
 
-    For DWT and OCXO, the authoritative interpolation uncertainty
+    For DWT, OCXO1, and OCXO2, the authoritative interpolation uncertainty
     comes from the Teensy's prediction statistics.  For GNSS, tau
     and ppb are trivially 1.0 and 0.0.
 
@@ -834,7 +834,7 @@ def _build_clock_block(
         ns_now: cumulative nanoseconds in this domain
         gnss_ns: cumulative GNSS nanoseconds (reference)
         frag: the raw TIMEBASE_FRAGMENT payload
-        domain: "gnss", "dwt", or "ocxo"
+        domain: "gnss", "dwt", "ocxo1", or "ocxo2"
     """
     block: Dict[str, Any] = {
         "ns_now": int(ns_now),
@@ -849,13 +849,20 @@ def _build_clock_block(
         block["pred_n"] = frag.get("dwt_pred_n")
         block["delta_raw"] = frag.get("dwt_delta_raw")
         block["pps_residual"] = frag.get("dwt_pps_residual")
-    elif domain == "ocxo":
-        block["pred_residual"] = frag.get("ocxo_pred_residual")
-        block["pred_mean"] = frag.get("ocxo_pred_mean")
-        block["pred_stddev"] = frag.get("ocxo_pred_stddev")
-        block["pred_n"] = frag.get("ocxo_pred_n")
-        block["delta_raw"] = frag.get("ocxo_delta_raw")
-        block["pps_residual"] = frag.get("ocxo_pps_residual")
+    elif domain == "ocxo1":
+        block["pred_residual"] = frag.get("ocxo1_pred_residual")
+        block["pred_mean"] = frag.get("ocxo1_pred_mean")
+        block["pred_stddev"] = frag.get("ocxo1_pred_stddev")
+        block["pred_n"] = frag.get("ocxo1_pred_n")
+        block["delta_raw"] = frag.get("ocxo1_delta_raw")
+        block["pps_residual"] = frag.get("ocxo1_pps_residual")
+    elif domain == "ocxo2":
+        block["pred_residual"] = frag.get("ocxo2_pred_residual")
+        block["pred_mean"] = frag.get("ocxo2_pred_mean")
+        block["pred_stddev"] = frag.get("ocxo2_pred_stddev")
+        block["pred_n"] = frag.get("ocxo2_pred_n")
+        block["delta_raw"] = frag.get("ocxo2_delta_raw")
+        block["pps_residual"] = frag.get("ocxo2_pps_residual")
     elif domain == "gnss":
         block["pps_residual"] = frag.get("gnss_pps_residual")
 
@@ -870,7 +877,7 @@ def _build_report(
 ) -> Dict[str, Any]:
     gnss_ns = int(timebase.get("teensy_gnss_ns") or 0)
     dwt_ns = int(timebase.get("teensy_dwt_ns") or 0)
-    ocxo_ns = int(timebase.get("teensy_ocxo_ns") or 0)
+    ocxo_ns = int(timebase.get("teensy_ocxo1_ns") or 0)
 
     pps_count = timebase.get("pps_count")
     campaign_seconds = int(pps_count) if isinstance(pps_count, int) else (gnss_ns // NS_PER_SECOND if gnss_ns else 0)
@@ -886,11 +893,12 @@ def _build_report(
         "pps_count": int(timebase.get("pps_count") or 0),
 
         "teensy_dwt_cycles": timebase.get("teensy_dwt_cycles"),
-        "teensy_ocxo_ns": timebase.get("teensy_ocxo_ns"),
+        "teensy_ocxo1_ns": timebase.get("teensy_ocxo1_ns"),
+        "teensy_ocxo2_ns": timebase.get("teensy_ocxo2_ns"),
 
         "gnss": _build_clock_block(gnss_ns, gnss_ns, frag, "gnss"),
         "dwt": _build_clock_block(dwt_ns, gnss_ns, frag, "dwt"),
-        "ocxo": _build_clock_block(ocxo_ns, gnss_ns, frag, "ocxo"),
+        "ocxo1": _build_clock_block(ocxo_ns, gnss_ns, frag, "ocxo1"),
     }
 
 
@@ -961,9 +969,9 @@ def _process_loop() -> None:
     environment and GNSS discipline data, builds TIMEBASE, persists.
     Runs forever.
 
-    v8: Prediction-aware.  Teensy prediction stats are passed through
+    v9: Prediction-aware.  Teensy prediction stats are passed through
     as the authoritative interpolation uncertainty metrics.  Pi-side
-    DWT/OCXO Welford trackers removed.
+    DWT/OCXO1/OCXO2 Welford trackers removed.
     """
     global _campaign_active, _armed_pps_count
 
@@ -1043,7 +1051,8 @@ def _process_loop() -> None:
 
         gnss_ns = int(frag.get("gnss_ns") or 0)
         dwt_ns = int(frag.get("dwt_ns") or 0)
-        ocxo_ns = int(frag.get("ocxo_ns") or 0)
+        ocxo1_ns = int(frag.get("ocxo1_ns") or 0)
+        ocxo2_ns = int(frag.get("ocxo2_ns") or 0)
 
         # --- GNSS stream health canary (Pi-side only) ---
         gnss_canary = _gnss_canary_update(gnss_ns) if gnss_ns > 0 else {"stream_valid": False, "residual": 0}
@@ -1079,14 +1088,16 @@ def _process_loop() -> None:
             "teensy_dwt_cycles": frag["dwt_cycles"],
             "teensy_dwt_ns": frag["dwt_ns"],
             "teensy_gnss_ns": frag["gnss_ns"],
-            "teensy_ocxo_ns": frag.get("ocxo_ns"),
+            "teensy_ocxo1_ns": frag.get("ocxo1_ns"),
+            "teensy_ocxo2_ns": frag.get("ocxo2_ns"),
 
             "teensy_pps_count": int(pps_count),
 
             # Teensy ISR residuals (raw counts)
             "isr_residual_gnss": frag.get("isr_residual_gnss"),
             "isr_residual_dwt": frag.get("isr_residual_dwt"),
-            "isr_residual_ocxo": frag.get("isr_residual_ocxo"),
+            "isr_residual_ocxo1": frag.get("isr_residual_ocxo1"),
+            "isr_residual_ocxo2": frag.get("isr_residual_ocxo2"),
 
             # Teensy interpolation anchors
             "dwt_cyccnt_at_pps": frag.get("dwt_cyccnt_at_pps"),
@@ -1095,17 +1106,21 @@ def _process_loop() -> None:
 
             # Raw per-second deltas (ground truth)
             "dwt_delta_raw": frag.get("dwt_delta_raw"),
-            "ocxo_delta_raw": frag.get("ocxo_delta_raw"),
+            "ocxo1_delta_raw": frag.get("ocxo1_delta_raw"),
+            "ocxo2_delta_raw": frag.get("ocxo2_delta_raw"),
 
             # Teensy PPS residuals (nominal-based, retained for continuity)
             "dwt_pps_residual": frag.get("dwt_pps_residual"),
             "gnss_pps_residual": frag.get("gnss_pps_residual"),
-            "ocxo_pps_residual": frag.get("ocxo_pps_residual"),
+            "ocxo1_pps_residual": frag.get("ocxo1_pps_residual"),
+            "ocxo2_pps_residual": frag.get("ocxo2_pps_residual"),
 
-            # OCXO control state
-            "ocxo_dac": frag.get("ocxo_dac"),
+            # OCXO control state (both OCXOs)
+            "ocxo1_dac": frag.get("ocxo1_dac"),
+            "ocxo2_dac": frag.get("ocxo2_dac"),
             "calibrate_ocxo": frag.get("calibrate_ocxo"),
-            "servo_adjustments": frag.get("servo_adjustments"),
+            "ocxo1_servo_adjustments": frag.get("ocxo1_servo_adjustments"),
+            "ocxo2_servo_adjustments": frag.get("ocxo2_servo_adjustments"),
 
             # PPS rejection diagnostics
             "pps_rejected_total": frag.get("diag_pps_rejected_total"),
@@ -1119,7 +1134,7 @@ def _process_loop() -> None:
 
             # --- Stats block ---
             #
-            # v8: DWT and OCXO stats come from Teensy prediction tracking
+            # v9: DWT, OCXO1, and OCXO2 stats come from Teensy prediction tracking
             # (authoritative).  GNSS stats are a Pi-side stream health
             # canary only.
             #
@@ -1140,15 +1155,25 @@ def _process_loop() -> None:
                     "tau": round(_compute_tau(dwt_ns, gnss_ns), 12) if gnss_ns else None,
                     "ppb": round(_compute_ppb(dwt_ns, gnss_ns), 3) if gnss_ns else None,
                 },
-                "ocxo": {
-                    "pred_residual": frag.get("ocxo_pred_residual"),
-                    "pred_mean": frag.get("ocxo_pred_mean"),
-                    "pred_stddev": frag.get("ocxo_pred_stddev"),
-                    "pred_n": frag.get("ocxo_pred_n"),
-                    "delta_raw": frag.get("ocxo_delta_raw"),
-                    "pps_residual": frag.get("ocxo_pps_residual"),
-                    "tau": round(_compute_tau(ocxo_ns, gnss_ns), 12) if gnss_ns else None,
-                    "ppb": round(_compute_ppb(ocxo_ns, gnss_ns), 3) if gnss_ns else None,
+                "ocxo1": {
+                    "pred_residual": frag.get("ocxo1_pred_residual"),
+                    "pred_mean": frag.get("ocxo1_pred_mean"),
+                    "pred_stddev": frag.get("ocxo1_pred_stddev"),
+                    "pred_n": frag.get("ocxo1_pred_n"),
+                    "delta_raw": frag.get("ocxo1_delta_raw"),
+                    "pps_residual": frag.get("ocxo1_pps_residual"),
+                    "tau": round(_compute_tau(ocxo1_ns, gnss_ns), 12) if gnss_ns else None,
+                    "ppb": round(_compute_ppb(ocxo1_ns, gnss_ns), 3) if gnss_ns else None,
+                },
+                "ocxo2": {
+                    "pred_residual": frag.get("ocxo2_pred_residual"),
+                    "pred_mean": frag.get("ocxo2_pred_mean"),
+                    "pred_stddev": frag.get("ocxo2_pred_stddev"),
+                    "pred_n": frag.get("ocxo2_pred_n"),
+                    "delta_raw": frag.get("ocxo2_delta_raw"),
+                    "pps_residual": frag.get("ocxo2_pps_residual"),
+                    "tau": round(_compute_tau(ocxo2_ns, gnss_ns), 12) if gnss_ns else None,
+                    "ppb": round(_compute_ppb(ocxo2_ns, gnss_ns), 3) if gnss_ns else None,
                 },
             },
         }
@@ -1158,10 +1183,11 @@ def _process_loop() -> None:
         publish("TIMEBASE", timebase)
         _persist_timebase(timebase, report)
 
-        # Persist OCXO DAC fields into campaign payload (best-effort)
-        teensy_ocxo_dac = frag.get("ocxo_dac")
+        # Persist OCXO1/OCXO2 DAC fields into campaign payload (best-effort)
+        teensy_ocxo1_dac = frag.get("ocxo1_dac")
+        teensy_ocxo2_dac = frag.get("ocxo2_dac")
         teensy_calibrate = frag.get("calibrate_ocxo")
-        if teensy_ocxo_dac is not None:
+        if teensy_ocxo1_dac is not None or teensy_ocxo2_dac is not None:
             try:
                 with open_db() as conn:
                     cur = conn.cursor()
@@ -1174,18 +1200,19 @@ def _process_loop() -> None:
                         """,
                         (
                             json.dumps({
-                                "ocxo_dac": float(teensy_ocxo_dac),
+                                "ocxo1_dac": float(teensy_ocxo1_dac) if teensy_ocxo1_dac is not None else None,
+                                "ocxo2_dac": float(teensy_ocxo2_dac) if teensy_ocxo2_dac is not None else None,
                                 "calibrate_ocxo": bool(teensy_calibrate),
                             }),
                             campaign,
                         ),
                     )
             except Exception:
-                logging.exception("⚠️ [clocks] failed to persist OCXO DAC (ignored)")
+                logging.exception("⚠️ [clocks] failed to persist OCXO DAC values (ignored)")
 
         # Persist calibrated DAC to SYSTEM config so it survives
         # across campaigns.  Only during active calibration.
-        if teensy_calibrate and teensy_ocxo_dac is not None:
+        if teensy_calibrate and teensy_ocxo1_dac is not None:
             try:
                 with open_db() as conn:
                     cur = conn.cursor()
@@ -1195,10 +1222,10 @@ def _process_loop() -> None:
                         SET payload = payload || %s::jsonb
                         WHERE config_key = 'SYSTEM'
                         """,
-                        (json.dumps({"ocxo_dac": float(teensy_ocxo_dac)}),),
+                        (json.dumps({"ocxo1_dac": float(teensy_ocxo1_dac), "ocxo2_dac": float(teensy_ocxo2_dac) if teensy_ocxo2_dac is not None else None}),),
                     )
             except Exception:
-                logging.exception("⚠️ [clocks] failed to persist OCXO DAC to config (ignored)")
+                logging.exception("⚠️ [clocks] failed to persist OCXO DAC values to config (ignored)")
 
 
 # ---------------------------------------------------------------------
@@ -1277,18 +1304,23 @@ def cmd_start(args: Optional[dict]) -> dict:
 
     location = current_location
     set_dac = args.get("set_dac")
+    set_dac2 = args.get("set_dac2")
     calibrate_ocxo = bool(args.get("calibrate_ocxo"))
 
     # Read default DAC from config if not specified
-    if set_dac is None:
+    if set_dac is None or set_dac2 is None:
         try:
             with open_db(row_dict=True) as conn:
                 cur = conn.cursor()
                 cur.execute("SELECT payload FROM config WHERE config_key = 'SYSTEM'")
                 row = cur.fetchone()
-                if row and row["payload"].get("ocxo_dac") is not None:
-                    set_dac = float(row["payload"]["ocxo_dac"])
-                    logging.info("🔧 [clocks] using ocxo_dac=%s from SYSTEM config", set_dac)
+                if row:
+                    if set_dac is None and row["payload"].get("ocxo1_dac") is not None:
+                        set_dac = float(row["payload"]["ocxo1_dac"])
+                        logging.info("🔧 [clocks] using ocxo1_dac=%s from SYSTEM config", set_dac)
+                    if set_dac2 is None and row["payload"].get("ocxo2_dac") is not None:
+                        set_dac2 = float(row["payload"]["ocxo2_dac"])
+                        logging.info("🔧 [clocks] using ocxo2_dac=%s from SYSTEM config", set_dac2)
         except Exception:
             logging.exception("⚠️ [clocks] failed to read SYSTEM config (ignored)")
 
@@ -1297,7 +1329,9 @@ def cmd_start(args: Optional[dict]) -> dict:
         "started_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
     }
     if set_dac is not None:
-        campaign_payload["ocxo_dac"] = float(set_dac)
+        campaign_payload["ocxo1_dac"] = float(set_dac)
+    if set_dac2 is not None:
+        campaign_payload["ocxo2_dac"] = float(set_dac2)
     if calibrate_ocxo:
         campaign_payload["calibrate_ocxo"] = True
 
@@ -1361,6 +1395,8 @@ def cmd_start(args: Optional[dict]) -> dict:
     teensy_args: Dict[str, Any] = {"campaign": campaign}
     if set_dac is not None:
         teensy_args["set_dac"] = str(set_dac)
+    if set_dac2 is not None:
+        teensy_args["set_dac2"] = str(set_dac2)
     if calibrate_ocxo:
         teensy_args["calibrate_ocxo"] = "true"
 
@@ -1404,6 +1440,7 @@ def cmd_start(args: Optional[dict]) -> dict:
             "campaign": campaign,
             "location": location,
             "set_dac": set_dac,
+            "set_dac2": set_dac2,
             "calibrate_ocxo": calibrate_ocxo,
             "pps_count": 0,
             "waited_s": round(float(waited_s), 3),
@@ -1656,7 +1693,7 @@ def cmd_resume(args: Optional[dict]) -> dict:
 
 def _recover_campaign() -> None:
     """
-    RECOVER — v5 three-domain architecture.
+    RECOVER — v6 four-domain architecture.
     """
     global _campaign_active, _armed_pps_count
 
@@ -1738,10 +1775,13 @@ def _recover_campaign() -> None:
         _begin_sync_wait(expected_pps=0)
 
         teensy_args: Dict[str, Any] = {"campaign": campaign_name}
-        recover_ocxo_dac = campaign_payload.get("ocxo_dac")
+        recover_ocxo1_dac = campaign_payload.get("ocxo1_dac")
+        recover_ocxo2_dac = campaign_payload.get("ocxo2_dac")
         recover_calibrate = campaign_payload.get("calibrate_ocxo", False)
-        if recover_ocxo_dac is not None:
-            teensy_args["set_dac"] = str(float(recover_ocxo_dac))
+        if recover_ocxo1_dac is not None:
+            teensy_args["set_dac"] = str(float(recover_ocxo1_dac))
+        if recover_ocxo2_dac is not None:
+            teensy_args["set_dac2"] = str(float(recover_ocxo2_dac))
         if recover_calibrate:
             teensy_args["calibrate_ocxo"] = "true"
 
@@ -1791,7 +1831,8 @@ def _recover_campaign() -> None:
 
     last_gnss_ns = int(last_tb.get("teensy_gnss_ns") or 0)
     last_dwt_ns = int(last_tb.get("teensy_dwt_ns") or 0)
-    last_ocxo_ns = int(last_tb.get("teensy_ocxo_ns") or 0)
+    last_ocxo1_ns = int(last_tb.get("teensy_ocxo1_ns") or 0)
+    last_ocxo2_ns = int(last_tb.get("teensy_ocxo2_ns") or 0)
 
     last_gnss_time_str = last_tb.get("gnss_time_utc") or last_tb.get("system_time_utc") or system_time_z()
 
@@ -1804,19 +1845,21 @@ def _recover_campaign() -> None:
         "    pps_count  = %d\n"
         "    gnss_ns    = %d\n"
         "    dwt_ns     = %d\n"
-        "    ocxo_ns    = %d\n"
+        "    ocxo1_ns   = %d\n"
+        "    ocxo2_ns   = %d\n"
         "    gnss_time  = %s",
-        last_pps_count, last_gnss_ns, last_dwt_ns, last_ocxo_ns,
+        last_pps_count, last_gnss_ns, last_dwt_ns, last_ocxo1_ns, last_ocxo2_ns,
         last_gnss_time_str,
     )
 
-    recover_ocxo_dac = campaign_payload.get("ocxo_dac")
+    recover_ocxo1_dac = campaign_payload.get("ocxo1_dac")
+    recover_ocxo2_dac = campaign_payload.get("ocxo2_dac")
     recover_calibrate = campaign_payload.get("calibrate_ocxo", False)
 
-    if recover_ocxo_dac is not None:
+    if recover_ocxo1_dac is not None:
         logging.info(
-            "🔧 [recovery] OCXO DAC: %s (calibrate=%s)",
-            recover_ocxo_dac, recover_calibrate
+            "🔧 [recovery] OCXO1 DAC: %s (calibrate=%s)",
+            recover_ocxo1_dac, recover_calibrate
         )
 
     # ------------------------------------------------------------------
@@ -1900,10 +1943,12 @@ def _recover_campaign() -> None:
 
     projected_gnss_ns = next_pps_count * NS_PER_SECOND
     projected_dwt_ns = projected_gnss_ns * last_dwt_ns // last_gnss_ns if last_gnss_ns > 0 else projected_gnss_ns
-    projected_ocxo_ns = projected_gnss_ns * last_ocxo_ns // last_gnss_ns if (last_gnss_ns > 0 and last_ocxo_ns > 0) else 0
+    projected_ocxo1_ns = projected_gnss_ns * last_ocxo1_ns // last_gnss_ns if (last_gnss_ns > 0 and last_ocxo1_ns > 0) else 0
+    projected_ocxo2_ns = projected_gnss_ns * last_ocxo2_ns // last_gnss_ns if (last_gnss_ns > 0 and last_ocxo2_ns > 0) else 0
 
     tau_dwt = last_dwt_ns / last_gnss_ns if last_gnss_ns > 0 else 1.0
-    tau_ocxo = last_ocxo_ns / last_gnss_ns if (last_gnss_ns > 0 and last_ocxo_ns > 0) else 1.0
+    tau_ocxo1 = last_ocxo1_ns / last_gnss_ns if (last_gnss_ns > 0 and last_ocxo1_ns > 0) else 1.0
+    tau_ocxo2 = last_ocxo2_ns / last_gnss_ns if (last_gnss_ns > 0 and last_ocxo2_ns > 0) else 1.0
 
     logging.info(
         "📐 [recovery] SYMMETRIC PROJECTION (all nanoseconds):\n"
@@ -1913,11 +1958,11 @@ def _recover_campaign() -> None:
         "    ---\n"
         "    GNSS:  projected = %d  (tau = 1.000000000000)\n"
         "    DWT:   projected = %d  (tau = %.12f, last_dwt_ns = %d)\n"
-        "    OCXO:  projected = %d  (tau = %.12f, last_ocxo_ns = %d)",
+        "    OCXO1: projected = %d  (tau = %.12f, last_ocxo1_ns = %d)",
         next_pps_count, projected_gnss_ns, last_gnss_ns,
         projected_gnss_ns,
         projected_dwt_ns, tau_dwt, last_dwt_ns,
-        projected_ocxo_ns, tau_ocxo, last_ocxo_ns,
+        projected_ocxo1_ns, tau_ocxo1, last_ocxo1_ns,
     )
 
     _diag["last_recovery"] = {
@@ -1931,9 +1976,11 @@ def _recover_campaign() -> None:
         "next_pps_count": int(next_pps_count),
         "projected_gnss_ns": int(projected_gnss_ns),
         "projected_dwt_ns": int(projected_dwt_ns),
-        "projected_ocxo_ns": int(projected_ocxo_ns),
+        "projected_ocxo1_ns": int(projected_ocxo1_ns),
+        "projected_ocxo2_ns": int(projected_ocxo2_ns),
         "tau_dwt": round(tau_dwt, 12),
-        "tau_ocxo": round(tau_ocxo, 12),
+        "tau_ocxo1": round(tau_ocxo1, 12),
+        "tau_ocxo2": round(tau_ocxo2, 12),
     }
 
     # ------------------------------------------------------------------
@@ -1946,19 +1993,23 @@ def _recover_campaign() -> None:
         "    pps_count = %d\n"
         "    dwt_ns    = %d\n"
         "    gnss_ns   = %d\n"
-        "    ocxo_ns   = %d",
+        "    ocxo1_ns  = %d\n"
+        "    ocxo2_ns  = %d",
         system_time_z(), next_pps_count,
-        projected_dwt_ns, projected_gnss_ns, projected_ocxo_ns,
+        projected_dwt_ns, projected_gnss_ns, projected_ocxo1_ns,
     )
 
     teensy_recover_args: Dict[str, Any] = {
         "campaign": campaign_name,
         "dwt_ns": str(int(projected_dwt_ns)),
         "gnss_ns": str(int(projected_gnss_ns)),
-        "ocxo_ns": str(int(projected_ocxo_ns)),
+        "ocxo1_ns": str(int(projected_ocxo1_ns)),
+        "ocxo2_ns": str(int(projected_ocxo2_ns)),
     }
-    if recover_ocxo_dac is not None:
-        teensy_recover_args["set_dac"] = str(float(recover_ocxo_dac))
+    if recover_ocxo1_dac is not None:
+        teensy_recover_args["set_dac"] = str(float(recover_ocxo1_dac))
+    if recover_ocxo2_dac is not None:
+        teensy_recover_args["set_dac2"] = str(float(recover_ocxo2_dac))
     if recover_calibrate:
         teensy_recover_args["calibrate_ocxo"] = "true"
 
@@ -2072,7 +2123,7 @@ def cmd_set_baseline(args: Optional[dict]) -> Dict[str, Any]:
         return {"success": False, "message": f"Campaign {baseline_id} ('{row['campaign']}') has no report"}
 
     baseline_ppb = {}
-    for key in ("gnss", "dwt", "ocxo"):
+    for key in ("gnss", "dwt", "ocxo1", "ocxo2"):
         blk = report.get(key, {})
         ppb = blk.get("ppb")
         if ppb is not None:
@@ -2409,20 +2460,33 @@ def cmd_clocks_info(_: Optional[dict]) -> Dict[str, Any]:
 
 def cmd_set_dac(args: Optional[dict]) -> Dict[str, Any]:
     """
-    SET_DAC(dac)
+    SET_DAC(dac, [dac2])
 
-    Update the OCXO DAC value in the SYSTEM config record.
+    Update OCXO DAC values in the SYSTEM config record.
+    'dac' sets OCXO1, 'dac2' sets OCXO2.  Either or both may be specified.
     """
-    if not args or "dac" not in args:
-        return {"success": False, "message": "SET_DAC requires 'dac' argument"}
+    if not args or ("dac" not in args and "dac2" not in args):
+        return {"success": False, "message": "SET_DAC requires 'dac' and/or 'dac2' argument"}
 
-    try:
-        dac = float(args["dac"])
-    except (ValueError, TypeError):
-        return {"success": False, "message": f"Invalid dac value: {args['dac']}"}
+    update_blob: Dict[str, Any] = {}
 
-    if dac < 0 or dac > 4095:
-        return {"success": False, "message": f"DAC value {dac} out of range (0–4095)"}
+    if "dac" in args:
+        try:
+            dac = float(args["dac"])
+        except (ValueError, TypeError):
+            return {"success": False, "message": f"Invalid dac value: {args['dac']}"}
+        if dac < 0 or dac > 4095:
+            return {"success": False, "message": f"DAC value {dac} out of range (0–4095)"}
+        update_blob["ocxo1_dac"] = dac
+
+    if "dac2" in args:
+        try:
+            dac2 = float(args["dac2"])
+        except (ValueError, TypeError):
+            return {"success": False, "message": f"Invalid dac2 value: {args['dac2']}"}
+        if dac2 < 0 or dac2 > 4095:
+            return {"success": False, "message": f"DAC2 value {dac2} out of range (0–4095)"}
+        update_blob["ocxo2_dac"] = dac2
 
     try:
         with open_db() as conn:
@@ -2433,7 +2497,7 @@ def cmd_set_dac(args: Optional[dict]) -> Dict[str, Any]:
                 SET payload = payload || %s::jsonb
                 WHERE config_key = 'SYSTEM'
                 """,
-                (json.dumps({"ocxo_dac": dac}),),
+                (json.dumps(update_blob),),
             )
             if cur.rowcount == 0:
                 return {"success": False, "message": "No SYSTEM config record found"}
@@ -2441,8 +2505,8 @@ def cmd_set_dac(args: Optional[dict]) -> Dict[str, Any]:
         logging.exception("❌ [clocks] SET_DAC failed")
         return {"success": False, "message": str(e)}
 
-    logging.info("🔧 [clocks] SET_DAC: ocxo_dac=%s", dac)
-    return {"success": True, "message": "OK", "payload": {"ocxo_dac": dac}}
+    logging.info("🔧 [clocks] SET_DAC: %s", update_blob)
+    return {"success": True, "message": "OK", "payload": update_blob}
 
 
 COMMANDS = {
@@ -2468,10 +2532,10 @@ def run() -> None:
     setup_logging()
 
     logging.info(
-        "🕐 [clocks] v8 — Prediction-aware statistics. Teensy v10 trend-aware tracking. "
-        "Three clock domains: GNSS (reference), DWT, OCXO. "
-        "DWT/OCXO prediction stats from Teensy are authoritative. "
-        "Pi-side Welford for DWT/OCXO removed. GNSS stream canary retained. "
+        "🕐 [clocks] v9 — Prediction-aware statistics. Teensy v10 trend-aware tracking. "
+        "Four clock domains: GNSS (reference), DWT, OCXO1, OCXO2. "
+        "DWT/OCXO1/OCXO2 prediction stats from Teensy are authoritative. "
+        "Pi-side Welford for DWT/OCXO1/OCXO2 removed. GNSS stream canary retained. "
         "Recovery: campaign deactivated + queue drained + soft-skip mismatch (≤5) + late reset. "
         "START while active performs seamless flash-cut to new campaign. "
         "Commands: START, STOP, RESUME, REPORT, CLEAR, DELETE, SET_DAC, "
