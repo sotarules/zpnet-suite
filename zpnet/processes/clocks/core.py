@@ -1,5 +1,5 @@
 """
-ZPNet CLOCKS Process — TIMEBASE Authority (Pi-side) — v7 Recovery Hardened
+ZPNet CLOCKS Process — TIMEBASE Authority (Pi-side) — v8 Prediction-Aware
 
 Core contract (v2026-03+):
 
@@ -12,9 +12,43 @@ Core contract (v2026-03+):
   Architecture:
     • Teensy owns: GNSS ns, DWT ns/cycles, OCXO ns — in TIMEBASE_FRAGMENT
     • GNSS owns: GF-8802 discipline state — in GET_GNSS_INFO
-    • CLOCKS owns: correlation, Welford statistics, campaign lifecycle
+    • CLOCKS owns: correlation, campaign lifecycle
 
   Three clock domains: GNSS (reference), DWT, OCXO.
+
+  v8: Prediction-aware statistics.
+
+    The Teensy (process_clocks.cpp v10) now computes trend-aware
+    prediction statistics for DWT and OCXO.  Instead of measuring
+    residuals against a fixed nominal frequency (which conflates
+    thermal drift range with measurement noise), the Teensy does
+    linear extrapolation from the two most recent per-second deltas:
+
+      predicted_delta = 2 * prev_delta - prev_prev_delta
+      prediction_residual = actual_delta - predicted_delta
+
+    Welford statistics on the prediction residual directly measure
+    the instrument's actual interpolation uncertainty — "how wrong
+    is my best estimate of this second's crystal rate?"
+
+    The prediction residual stddev is the authoritative confidence
+    metric for sub-second interpolation.  For DWT this is ~3-4
+    cycles (3-4 ns); for OCXO ~1 tick (100 ns).
+
+    Pi-side changes:
+      • DWT and OCXO prediction stats are passed through from the
+        Teensy fragment and persisted in TIMEBASE records.
+      • Raw deltas (dwt_delta_raw, ocxo_delta_raw) are persisted.
+      • Pi-side Welford residual trackers for DWT and OCXO are
+        REMOVED — the Teensy's prediction stats are strictly
+        superior and the Pi-side trackers were always second-hand.
+      • GNSS Pi-side residual tracking is RETAINED as a stream
+        health canary (GNSS is phase-coherent so residual == 0;
+        any deviation indicates a problem).
+      • The TIMEBASE stats block uses Teensy prediction stats
+        for DWT/OCXO and Pi-side sanity stats for GNSS.
+      • The report clock blocks surface prediction stddev as the
+        authoritative interpolation uncertainty.
 
   Recovery is symmetric across all three domains:
 
@@ -51,7 +85,7 @@ Responsibilities:
   * Augment fragment with GNSS time, environment, and system time
   * Publish TIMEBASE
   * Persist TIMEBASE to PostgreSQL (append-only, best-effort)
-  * Compute per-clock residual statistics (Welford's algorithm)
+  * Pass through Teensy prediction statistics (authoritative)
   * Denormalize augmented report into active campaign payload
   * Recover clocks after restart if campaign is active
   * Flash-cut to new campaign while running (seamless switch)
@@ -60,8 +94,9 @@ Responsibilities:
 Semantics:
   * No smoothing, inference, or filtering
   * TIMEBASE records are sacred and immutable
-  * Derivative statistics (tau, ppb, residuals) live only in
+  * Derivative statistics (tau, ppb) live only in
     the campaign report — never in the TIMEBASE row itself
+  * Prediction stats from the Teensy are passed through verbatim
   * Gaps in pps_count are canonical (recovery) and non-fatal
 """
 
@@ -175,138 +210,69 @@ _diag: Dict[str, Any] = {
     "gnss_info_hits": 0,
     "gnss_info_misses": 0,
 
-    # Residual outliers (Teensy clocks only)
-    "outliers_rejected_total": 0,
-    "outliers_rejected_gnss": 0,
-    "outliers_rejected_dwt": 0,
-    "outliers_rejected_ocxo": 0,
-    "last_outlier": {},
+    # GNSS stream health (Pi-side canary only)
+    "gnss_residual_nonzero": 0,
+    "last_gnss_residual_anomaly": {},
 }
 
 # ---------------------------------------------------------------------
-# PPS residual tracking -- Welford's online algorithm
+# GNSS stream health canary — lightweight Pi-side check
 # ---------------------------------------------------------------------
+#
+# GNSS ticks are exact by definition (10 MHz phase-coherent), so the
+# per-second residual from the Teensy should always be 0.  We track
+# the GNSS residual Pi-side purely as a stream health canary: if it
+# ever goes nonzero, something is wrong with the PPS or VCLOCK path.
+#
+# DWT and OCXO residual tracking is NO LONGER done Pi-side.  The
+# Teensy's prediction statistics (v10) are strictly superior.
+#
+
+_gnss_last_ns: int = 0
+_gnss_residual_valid: bool = False
 
 
-class _PpsResidual:
-    """Per-clock PPS residual state with Welford's online statistics."""
+def _gnss_canary_update(gnss_ns: int) -> Dict[str, Any]:
+    """
+    Update GNSS stream health canary.
 
-    __slots__ = (
-        "last_value", "delta", "residual", "valid",
-        "n", "mean", "m2", "display_scale",
-    )
+    Returns a dict with canary state for embedding in TIMEBASE stats.
+    """
+    global _gnss_last_ns, _gnss_residual_valid
 
-    def __init__(self, display_scale: float = 1.0) -> None:
-        self.display_scale = display_scale
-        self.reset()
-
-    def reset(self) -> None:
-        self.last_value: int = 0
-        self.delta: int = 0
-        self.residual: int = 0
-        self.valid: bool = False
-        self.n: int = 0
-        self.mean: float = 0.0
-        self.m2: float = 0.0
-
-    def update(self, value_now: int, expected: int) -> None:
-        if self.last_value > 0:
-            self.delta = value_now - self.last_value
-            self.residual = self.delta - expected
-            self.valid = True
-
-            self.n += 1
-            x = float(self.residual)
-            d1 = x - self.mean
-            self.mean += d1 / self.n
-            d2 = x - self.mean
-            self.m2 += d1 * d2
-        else:
-            self.delta = 0
-            self.residual = 0
-            self.valid = False
-
-        self.last_value = value_now
-
-    @property
-    def variance(self) -> float:
-        return (self.m2 / (self.n - 1)) if self.n >= 2 else 0.0
-
-    @property
-    def stddev(self) -> float:
-        return math.sqrt(self.variance) if self.n >= 2 else 0.0
-
-    @property
-    def stderr(self) -> float:
-        return (self.stddev / math.sqrt(self.n)) if self.n >= 2 else 0.0
-
-    def to_dict(self) -> Dict[str, Any]:
-        s = self.display_scale
-        return {
-            "pps_valid": self.valid,
-            "pps_delta": round(self.delta * s, 3),
-            "pps_residual": round(self.residual * s, 3),
-            "pps_n": self.n,
-            "pps_mean": round(self.mean * s, 3),
-            "pps_stddev": round(self.stddev * s, 3),
-            "pps_stderr": round(self.stderr * s, 3),
-        }
-
-
-# ---------------------------------------------------------------------
-# Outlier-safe residual update (instrumented)
-# ---------------------------------------------------------------------
-
-
-def _note_outlier(
-    label: str,
-    value_now: int,
-    last_value: int,
-    expected: int,
-    delta: int,
-    deviation: int,
-) -> None:
-    _diag["outliers_rejected_total"] += 1
-    if label == "GNSS":
-        _diag["outliers_rejected_gnss"] += 1
-    elif label == "DWT":
-        _diag["outliers_rejected_dwt"] += 1
-    elif label == "OCXO":
-        _diag["outliers_rejected_ocxo"] += 1
-
-    _diag["last_outlier"] = {
-        "ts_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
-        "label": label,
-        "value_now": int(value_now),
-        "last_value": int(last_value),
-        "delta": int(delta),
-        "expected": int(expected),
-        "deviation": int(deviation),
+    result: Dict[str, Any] = {
+        "stream_valid": False,
+        "residual": 0,
     }
 
+    if _gnss_last_ns > 0:
+        delta = gnss_ns - _gnss_last_ns
+        residual = delta - NS_PER_SECOND
+        result["stream_valid"] = True
+        result["residual"] = int(residual)
 
-def _safe_residual_update(
-    tracker: _PpsResidual,
-    value_now: int,
-    expected: int,
-    label: str,
-) -> None:
-    if tracker.last_value > 0:
-        prospective_delta = value_now - tracker.last_value
-        deviation = abs(prospective_delta - expected)
-        if deviation > expected // 2:
-            _note_outlier(
-                label=label,
-                value_now=value_now,
-                last_value=tracker.last_value,
-                expected=expected,
-                delta=prospective_delta,
-                deviation=deviation,
-            )
-            tracker.last_value = value_now
-            return
+        if residual != 0:
+            _diag["gnss_residual_nonzero"] += 1
+            _diag["last_gnss_residual_anomaly"] = {
+                "ts_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+                "gnss_ns": int(gnss_ns),
+                "delta": int(delta),
+                "residual": int(residual),
+            }
 
-    tracker.update(value_now, expected)
+        _gnss_residual_valid = True
+    else:
+        _gnss_residual_valid = False
+
+    _gnss_last_ns = gnss_ns
+    return result
+
+
+def _gnss_canary_reset() -> None:
+    """Reset GNSS canary state (on campaign start/stop/recover)."""
+    global _gnss_last_ns, _gnss_residual_valid
+    _gnss_last_ns = 0
+    _gnss_residual_valid = False
 
 
 # ---------------------------------------------------------------------
@@ -319,10 +285,6 @@ _last_pps_count_seen: Optional[int] = None
 
 # What pps_count did we most recently tell the Teensy to use?
 _armed_pps_count: Optional[int] = None
-
-_residual_gnss = _PpsResidual()
-_residual_dwt = _PpsResidual()
-_residual_ocxo = _PpsResidual()
 
 # Draconian sync: control-plane waits for a specific fragment pps_count
 _sync_lock = threading.Lock()
@@ -587,9 +549,6 @@ def _wait_for_pubsub_route(
 ) -> None:
     """
     Wait until the Teensy PUBSUB report shows a specific route.
-
-    This is used during startup/recovery sequencing when CLOCKS must not
-    proceed until PUBSUB delivery is known to be live for a required topic.
     """
     logging.info(
         "⏳ [%s] @%s waiting for PUBSUB routing for topic '%s'...",
@@ -764,14 +723,8 @@ def _fetch_gnss_info() -> Optional[Dict[str, Any]]:
     """
     Fetch GF-8802 discipline snapshot from GNSS GET_GNSS_INFO.
 
-    Returns the flat payload dict (freq_mode, pps_timing_error_ns,
-    freq_error_ppb, clock_drift_ppb, temperature_c, traim, etc.)
-    or None if unavailable.
-
+    Returns the flat payload dict or None if unavailable.
     Best-effort — a miss here should never block TIMEBASE production.
-    The returned dict is embedded verbatim as the "gnss" block in
-    each TIMEBASE record, providing per-second visibility into the
-    GF-8802's discipline loop alongside the Teensy clock data.
     """
     _diag["gnss_info_requests"] += 1
     try:
@@ -867,14 +820,45 @@ def _compute_ppb(clock_ns: int, gnss_ns: int) -> float:
 def _build_clock_block(
     ns_now: int,
     gnss_ns: int,
-    residual: _PpsResidual,
+    frag: Dict[str, Any],
+    domain: str,
 ) -> Dict[str, Any]:
+    """
+    Build a clock domain block for the campaign report.
+
+    For DWT and OCXO, the authoritative interpolation uncertainty
+    comes from the Teensy's prediction statistics.  For GNSS, tau
+    and ppb are trivially 1.0 and 0.0.
+
+    Args:
+        ns_now: cumulative nanoseconds in this domain
+        gnss_ns: cumulative GNSS nanoseconds (reference)
+        frag: the raw TIMEBASE_FRAGMENT payload
+        domain: "gnss", "dwt", or "ocxo"
+    """
     block: Dict[str, Any] = {
         "ns_now": int(ns_now),
         "tau": round(_compute_tau(int(ns_now), int(gnss_ns)), 12),
         "ppb": round(_compute_ppb(int(ns_now), int(gnss_ns)), 3),
     }
-    block.update(residual.to_dict())
+
+    if domain == "dwt":
+        block["pred_residual"] = frag.get("dwt_pred_residual")
+        block["pred_mean"] = frag.get("dwt_pred_mean")
+        block["pred_stddev"] = frag.get("dwt_pred_stddev")
+        block["pred_n"] = frag.get("dwt_pred_n")
+        block["delta_raw"] = frag.get("dwt_delta_raw")
+        block["pps_residual"] = frag.get("dwt_pps_residual")
+    elif domain == "ocxo":
+        block["pred_residual"] = frag.get("ocxo_pred_residual")
+        block["pred_mean"] = frag.get("ocxo_pred_mean")
+        block["pred_stddev"] = frag.get("ocxo_pred_stddev")
+        block["pred_n"] = frag.get("ocxo_pred_n")
+        block["delta_raw"] = frag.get("ocxo_delta_raw")
+        block["pps_residual"] = frag.get("ocxo_pps_residual")
+    elif domain == "gnss":
+        block["pps_residual"] = frag.get("gnss_pps_residual")
+
     return block
 
 
@@ -882,6 +866,7 @@ def _build_report(
     campaign_name: str,
     campaign_payload: Dict[str, Any],
     timebase: Dict[str, Any],
+    frag: Dict[str, Any],
 ) -> Dict[str, Any]:
     gnss_ns = int(timebase.get("teensy_gnss_ns") or 0)
     dwt_ns = int(timebase.get("teensy_dwt_ns") or 0)
@@ -903,9 +888,9 @@ def _build_report(
         "teensy_dwt_cycles": timebase.get("teensy_dwt_cycles"),
         "teensy_ocxo_ns": timebase.get("teensy_ocxo_ns"),
 
-        "gnss": _build_clock_block(gnss_ns, gnss_ns, _residual_gnss),
-        "dwt": _build_clock_block(dwt_ns, gnss_ns, _residual_dwt),
-        "ocxo": _build_clock_block(ocxo_ns, gnss_ns, _residual_ocxo),
+        "gnss": _build_clock_block(gnss_ns, gnss_ns, frag, "gnss"),
+        "dwt": _build_clock_block(dwt_ns, gnss_ns, frag, "dwt"),
+        "ocxo": _build_clock_block(ocxo_ns, gnss_ns, frag, "ocxo"),
     }
 
 
@@ -944,10 +929,6 @@ def on_timebase_fragment(payload: Payload) -> None:
         return
 
     # --- Sync latch (for START/RECOVER waits) ---
-    # Accept pps_count >= expected, not exact match.  The projected
-    # next_pps_count is approximate, so the Teensy may land one or
-    # two counts ahead.  We latch on the FIRST fragment that meets
-    # or exceeds the target.
     with _sync_lock:
         if _sync_expected_pps is not None:
             match = int(pps_count) >= int(_sync_expected_pps)
@@ -980,9 +961,9 @@ def _process_loop() -> None:
     environment and GNSS discipline data, builds TIMEBASE, persists.
     Runs forever.
 
-    v7: Recovery hardened.  Teensy v9 ISR-synchronized anchors.
-    Fragments arrive from the Teensy with GNSS, DWT, and OCXO
-    nanoseconds.  CLOCKS decorates and persists — straight through.
+    v8: Prediction-aware.  Teensy prediction stats are passed through
+    as the authoritative interpolation uncertainty metrics.  Pi-side
+    DWT/OCXO Welford trackers removed.
     """
     global _campaign_active, _armed_pps_count
 
@@ -1024,12 +1005,6 @@ def _process_loop() -> None:
             with _sync_lock:
                 sync_active = _sync_expected_pps is not None
 
-            # Whether this is a transitional fragment during sync wait
-            # or a stale fragment after recovery, the response is the
-            # same: log it, skip processing, re-arm to the received
-            # pps_count + 1.  This prevents a cascading hard-fault →
-            # auto-recovery → hard-fault loop that was poisoning the
-            # Welford accumulators with wild residual values.
             if abs(delta) <= 5:
                 logging.warning(
                     "⚠️ [clocks] @%s pps_count mismatch: "
@@ -1062,7 +1037,7 @@ def _process_loop() -> None:
         _armed_pps_count = int(pps_count) + 1
         _diag["armed_pps_count"] = _armed_pps_count
 
-        # --- Residual updates (Teensy clocks only) ---
+        # --- Extract clock values ---
         system_time_utc = datetime.now(timezone.utc)
         system_time_str = system_time_utc.isoformat(timespec="microseconds")
 
@@ -1070,12 +1045,8 @@ def _process_loop() -> None:
         dwt_ns = int(frag.get("dwt_ns") or 0)
         ocxo_ns = int(frag.get("ocxo_ns") or 0)
 
-        if gnss_ns > 0:
-            _safe_residual_update(_residual_gnss, gnss_ns, NS_PER_SECOND, "GNSS")
-        if dwt_ns > 0:
-            _safe_residual_update(_residual_dwt, dwt_ns, NS_PER_SECOND, "DWT")
-        if ocxo_ns > 0:
-            _safe_residual_update(_residual_ocxo, ocxo_ns, NS_PER_SECOND, "OCXO")
+        # --- GNSS stream health canary (Pi-side only) ---
+        gnss_canary = _gnss_canary_update(gnss_ns) if gnss_ns > 0 else {"stream_valid": False, "residual": 0}
 
         # --- Environment snapshot (best-effort, never blocks TIMEBASE) ---
         env_snapshot = _fetch_environment()
@@ -1122,9 +1093,19 @@ def _process_loop() -> None:
             "gpt2_at_pps": frag.get("gpt2_at_pps"),
             "dwt_cycles_per_pps": frag.get("dwt_cycles_per_pps"),
 
+            # Raw per-second deltas (ground truth)
+            "dwt_delta_raw": frag.get("dwt_delta_raw"),
+            "ocxo_delta_raw": frag.get("ocxo_delta_raw"),
+
+            # Teensy PPS residuals (nominal-based, retained for continuity)
+            "dwt_pps_residual": frag.get("dwt_pps_residual"),
+            "gnss_pps_residual": frag.get("gnss_pps_residual"),
+            "ocxo_pps_residual": frag.get("ocxo_pps_residual"),
+
             # OCXO control state
             "ocxo_dac": frag.get("ocxo_dac"),
             "calibrate_ocxo": frag.get("calibrate_ocxo"),
+            "servo_adjustments": frag.get("servo_adjustments"),
 
             # PPS rejection diagnostics
             "pps_rejected_total": frag.get("diag_pps_rejected_total"),
@@ -1136,38 +1117,43 @@ def _process_loop() -> None:
             # GF-8802 discipline snapshot (correlated with this PPS edge)
             "gnss": gnss_info,
 
-            # Running Welford statistics — per-clock-domain residual
-            # accumulators snapshotted at this PPS edge.  Cumulative
-            # from campaign start (or last reset).
+            # --- Stats block ---
+            #
+            # v8: DWT and OCXO stats come from Teensy prediction tracking
+            # (authoritative).  GNSS stats are a Pi-side stream health
+            # canary only.
+            #
             "stats": {
                 "gnss": {
-                    "n": _residual_gnss.n,
-                    "mean_ns": round(_residual_gnss.mean, 3),
-                    "stddev_ns": round(_residual_gnss.stddev, 3),
-                    "stderr_ns": round(_residual_gnss.stderr, 3),
+                    "stream_valid": gnss_canary["stream_valid"],
+                    "residual": gnss_canary["residual"],
                     "tau": round(_compute_tau(gnss_ns, gnss_ns), 12) if gnss_ns else None,
                     "ppb": round(_compute_ppb(gnss_ns, gnss_ns), 3) if gnss_ns else None,
                 },
                 "dwt": {
-                    "n": _residual_dwt.n,
-                    "mean_ns": round(_residual_dwt.mean, 3),
-                    "stddev_ns": round(_residual_dwt.stddev, 3),
-                    "stderr_ns": round(_residual_dwt.stderr, 3),
+                    "pred_residual": frag.get("dwt_pred_residual"),
+                    "pred_mean": frag.get("dwt_pred_mean"),
+                    "pred_stddev": frag.get("dwt_pred_stddev"),
+                    "pred_n": frag.get("dwt_pred_n"),
+                    "delta_raw": frag.get("dwt_delta_raw"),
+                    "pps_residual": frag.get("dwt_pps_residual"),
                     "tau": round(_compute_tau(dwt_ns, gnss_ns), 12) if gnss_ns else None,
                     "ppb": round(_compute_ppb(dwt_ns, gnss_ns), 3) if gnss_ns else None,
                 },
                 "ocxo": {
-                    "n": _residual_ocxo.n,
-                    "mean_ns": round(_residual_ocxo.mean, 3),
-                    "stddev_ns": round(_residual_ocxo.stddev, 3),
-                    "stderr_ns": round(_residual_ocxo.stderr, 3),
+                    "pred_residual": frag.get("ocxo_pred_residual"),
+                    "pred_mean": frag.get("ocxo_pred_mean"),
+                    "pred_stddev": frag.get("ocxo_pred_stddev"),
+                    "pred_n": frag.get("ocxo_pred_n"),
+                    "delta_raw": frag.get("ocxo_delta_raw"),
+                    "pps_residual": frag.get("ocxo_pps_residual"),
                     "tau": round(_compute_tau(ocxo_ns, gnss_ns), 12) if gnss_ns else None,
                     "ppb": round(_compute_ppb(ocxo_ns, gnss_ns), 3) if gnss_ns else None,
                 },
             },
         }
 
-        report = _build_report(campaign, campaign_payload, timebase)
+        report = _build_report(campaign, campaign_payload, timebase, frag)
 
         publish("TIMEBASE", timebase)
         _persist_timebase(timebase, report)
@@ -1198,8 +1184,7 @@ def _process_loop() -> None:
                 logging.exception("⚠️ [clocks] failed to persist OCXO DAC (ignored)")
 
         # Persist calibrated DAC to SYSTEM config so it survives
-        # across campaigns.  Only during active calibration — we
-        # don't overwrite a manually-set value during normal runs.
+        # across campaigns.  Only during active calibration.
         if teensy_calibrate and teensy_ocxo_dac is not None:
             try:
                 with open_db() as conn:
@@ -1224,9 +1209,7 @@ def _process_loop() -> None:
 def _reset_trackers() -> None:
     global _last_pps_count_seen
     _last_pps_count_seen = None
-    _residual_gnss.reset()
-    _residual_dwt.reset()
-    _residual_ocxo.reset()
+    _gnss_canary_reset()
 
 
 def _request_teensy_stop_best_effort() -> None:
@@ -1250,33 +1233,7 @@ def _request_teensy_recover(pps_count: int, args: Dict[str, Any]) -> None:
 
 def cmd_start(args: Optional[dict]) -> dict:
     """
-    START — v5 three-domain architecture with flash-cut support:
-
-    If NO campaign is active (cold start):
-      0. Wait for preflight prerequisites (GNSS lock, chrony PPS selected).
-      1. Reject if campaign name already exists in DB.
-      2. Create campaign in DB (deactivate any prior).
-      3. Stop Teensy (best-effort).
-      4. Reset trackers.
-      5. Begin sync wait for fragment pps_count=0.
-      6. Arm TEENSY START(pps_count=0).
-      7. Wait for sync fragment pps_count=0.
-      8. Activate campaign.
-
-    If a campaign IS already active (flash-cut):
-      1. Reject if campaign name already exists in DB.
-      2. Close the active campaign in the DB (set stopped_at, deactivate).
-      3. Create the new campaign in the DB (active).
-      4. Reset trackers (Welford's, etc.).
-      5. Arm Teensy START (zeroes all accumulators, pps_count=0).
-      6. Sync on pps_count=0, resume processing under the new campaign name.
-
-    The flash-cut is seamless: no STOP, no power cycle, no GNSS re-acquisition.
-    The only observable effect is that nanosecond counters and pps_count reset
-    to zero.  The OCXOs, GNSS receiver, and PPS stream are never interrupted.
-
-    The preflight gate is skipped on flash-cut because the system is already
-    running — chrony is locked, GNSS is disciplined.
+    START — v5 three-domain architecture with flash-cut support.
     """
     global _campaign_active, _armed_pps_count
 
@@ -1288,20 +1245,8 @@ def cmd_start(args: Optional[dict]) -> dict:
     active_row = _get_active_campaign()
     flash_cut = active_row is not None
 
-    # ------------------------------------------------------------------
-    # Cold start only: wait for preflight prerequisites.
-    #
-    # On flash-cut the system is already running — chrony is locked,
-    # GNSS is disciplined.  No gate needed.
-    #
-    # On cold start the system may have just booted.  The preflight
-    # gate ensures GNSS lock, chrony PPS selection, and discipline
-    # quality before we proceed.
-    # ------------------------------------------------------------------
     current_location = _get_current_location()
 
-    # Keep GNSS in the correct steady-state mode for the current site
-    # before attempting preflight or campaign start.
     try:
         _ensure_gnss_mode_for_current_location()
     except Exception as e:
@@ -1368,8 +1313,6 @@ def cmd_start(args: Optional[dict]) -> dict:
 
         campaign_payload["flash_cut_from"] = prev_campaign
 
-        # Carry forward the previous location if the new campaign doesn't
-        # specify one.  This preserves GNSS TO mode across the cut.
         if location is None and prev_location:
             location = prev_location
             campaign_payload["location"] = location
@@ -1378,7 +1321,7 @@ def cmd_start(args: Optional[dict]) -> dict:
                 location,
             )
 
-    # Deactivate prior campaigns + create new one (atomic in single transaction)
+    # Deactivate prior campaigns + create new one
     cutover_ts = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
     with open_db() as conn:
         cur = conn.cursor()
@@ -1399,23 +1342,9 @@ def cmd_start(args: Optional[dict]) -> dict:
             (campaign, json.dumps(campaign_payload)),
         )
 
-    # GNSS mode is now owned by the authoritative system-level current
-    # location, not by campaign arguments.  It was already enforced above.
-
-    # --- Stop Teensy before arming ---
-    # On flash-cut this is still needed: the Teensy STOP clears its ISR
-    # state so the subsequent START can arm cleanly at pps_count=0.
-    # The STOP is instantaneous — the PPS stream from the GNSS receiver
-    # continues, and the OCXOs keep oscillating.  We're just resetting
-    # the Teensy's software counters.
     _request_teensy_stop_best_effort()
 
-    # Drain stale fragments from the previous campaign.  Without this,
-    # the processor thread may dequeue fragments that belonged to the
-    # old campaign, call _get_active_campaign() (which now returns the
-    # NEW campaign), and persist them under the wrong campaign name.
-    # Those stale records create duplicate pps_count values when the
-    # new campaign's counters eventually reach the same pps_count.
+    # Drain stale fragments
     while not _fragment_queue.empty():
         try:
             _fragment_queue.get_nowait()
@@ -1427,7 +1356,7 @@ def cmd_start(args: Optional[dict]) -> dict:
     # Prepare sync wait FIRST
     _begin_sync_wait(expected_pps=0)
 
-    # Arm TEENSY — slow path (serial round-trip)
+    # Arm TEENSY
     logging.info("📡 [start] @%s arming TEENSY START: pps_count=0", system_time_z())
     teensy_args: Dict[str, Any] = {"campaign": campaign}
     if set_dac is not None:
@@ -1438,8 +1367,7 @@ def cmd_start(args: Optional[dict]) -> dict:
     _request_teensy_start(campaign=campaign, pps_count=0, args=teensy_args)
     logging.info("📡 [start] @%s TEENSY START returned", system_time_z())
 
-    # Wait for the sync fragment (campaign stays inactive so processor
-    # ignores any fragments that arrive during the wait).
+    # Wait for sync fragment
     logging.info("📡 [start] @%s waiting for sync fragment (pps_count=0)...", system_time_z())
 
     try:
@@ -1447,7 +1375,6 @@ def cmd_start(args: Optional[dict]) -> dict:
     except Exception:
         return {"success": False, "message": "HARD FAULT during START sync (see logs/diag)"}
 
-    # Set armed to 1 (next expected), drain queue, reset, then activate.
     _armed_pps_count = 1
     _diag["armed_pps_count"] = 1
 
@@ -1580,14 +1507,6 @@ def cmd_resume(args: Optional[dict]) -> dict:
     RESUME(campaign)
 
     Re-activate a previously stopped campaign and recover clocks.
-
-      1. Look up campaign by name (must exist, must NOT be active).
-      2. Verify it has TIMEBASE rows (otherwise nothing to recover from).
-      3. Re-activate in DB: active=true, clear stopped_at, set STARTED.
-      4. Deactivate any OTHER active campaign first.
-      5. Delegate to _recover_campaign() for the full clock recovery.
-
-    This is the explicit-command equivalent of boot-time recovery.
     """
     global _campaign_active
 
@@ -1737,30 +1656,12 @@ def cmd_resume(args: Optional[dict]) -> dict:
 
 def _recover_campaign() -> None:
     """
-    RECOVER — v5 three-domain architecture:
-
-    The recovery algorithm is symmetric across all three clock domains
-    (GNSS, DWT, OCXO).  CLOCKS speaks only nanoseconds to the Teensy.
-
-    Algorithm:
-      0. Wait for preflight prerequisites (GNSS lock, chrony PPS selected).
-      1. Read last TIMEBASE row for clock nanosecond values and
-         GNSS wall-clock timestamp.
-      2. Get current GNSS wall-clock time.
-      3. Compute elapsed whole seconds between the two GNSS times.
-      4. next_pps_second = elapsed + 1 (the next PPS edge).
-      5. next_pps_count = last_pps_count + next_pps_second.
-      6. projected_gnss_ns = next_pps_count * NS_PER_SECOND.
-      7. For each clock domain, project forward using the ratio
-         from the last TIMEBASE — pure integer arithmetic:
-           projected_ns = projected_gnss_ns * last_clock_ns // last_gnss_ns
-      8. Send RECOVER to Teensy with projected dwt_ns, gnss_ns, ocxo_ns.
-      9. Wait for sync fragment, activate campaign.
+    RECOVER — v5 three-domain architecture.
     """
     global _campaign_active, _armed_pps_count
 
     # Immediately deactivate so the processor thread ignores all
-    # fragments during recovery — prevents stale-fragment poisoning.
+    # fragments during recovery.
     _campaign_active = False
     _armed_pps_count = None
 
@@ -1810,18 +1711,9 @@ def _recover_campaign() -> None:
             campaign_name,
         )
 
-        # ---------------------------------------------------------------
-        # Cold restart: the campaign was created but no TIMEBASE was ever
-        # produced (e.g. the system crashed during the initial START
-        # before the first PPS edge arrived).  We re-arm everything at
-        # pps_count=0 exactly as cmd_start would, reusing the existing
-        # campaign record.
-        # ---------------------------------------------------------------
-
-        # Wait for all preflight prerequisites
+        # Cold restart
         _wait_for_preflight("recovery/cold")
 
-        # Restore GNSS TO mode if campaign had location
         try:
             effective_location = _ensure_gnss_mode_for_current_location()
             if effective_location:
@@ -1831,10 +1723,8 @@ def _recover_campaign() -> None:
         except Exception as e:
             raise RuntimeError(f"recovery/cold failed: {e}")
 
-        # Wait for PUBSUB routing
         _wait_for_pubsub_route(context="recovery/cold", topic="TIMEBASE_FRAGMENT")
 
-        # Stop + drain + reset
         _request_teensy_stop_best_effort()
 
         while not _fragment_queue.empty():
@@ -1845,10 +1735,8 @@ def _recover_campaign() -> None:
 
         _reset_trackers()
 
-        # Arm at pps_count=0
         _begin_sync_wait(expected_pps=0)
 
-        # Build Teensy args from campaign payload
         teensy_args: Dict[str, Any] = {"campaign": campaign_name}
         recover_ocxo_dac = campaign_payload.get("ocxo_dac")
         recover_calibrate = campaign_payload.get("calibrate_ocxo", False)
@@ -1860,14 +1748,11 @@ def _recover_campaign() -> None:
         logging.info("📡 [recovery/cold] @%s arming TEENSY START: pps_count=0", system_time_z())
         _request_teensy_start(campaign=campaign_name, pps_count=0, args=teensy_args)
 
-        # Do NOT activate yet — wait for sync fragment first.
         try:
             frag, waited_s = _end_sync_wait()
         except Exception:
             raise
 
-        # Set armed to 1 (next expected after pps_count=0 sync fragment),
-        # drain any accumulated fragments, then activate.
         _armed_pps_count = 1
         _diag["armed_pps_count"] = 1
 
@@ -1908,7 +1793,6 @@ def _recover_campaign() -> None:
     last_dwt_ns = int(last_tb.get("teensy_dwt_ns") or 0)
     last_ocxo_ns = int(last_tb.get("teensy_ocxo_ns") or 0)
 
-    # GNSS wall-clock timestamp from the last TIMEBASE record
     last_gnss_time_str = last_tb.get("gnss_time_utc") or last_tb.get("system_time_utc") or system_time_z()
 
     if last_gnss_ns == 0:
@@ -1926,7 +1810,6 @@ def _recover_campaign() -> None:
         last_gnss_time_str,
     )
 
-    # OCXO DAC state from campaign payload
     recover_ocxo_dac = campaign_payload.get("ocxo_dac")
     recover_calibrate = campaign_payload.get("calibrate_ocxo", False)
 
@@ -1937,10 +1820,7 @@ def _recover_campaign() -> None:
         )
 
     # ------------------------------------------------------------------
-    # Step 2: Wait for all preflight prerequisites
-    #
-    # The preflight gate ensures GNSS lock, chrony PPS selection,
-    # and discipline quality before we proceed.
+    # Step 2: Wait for preflight
     # ------------------------------------------------------------------
     try:
         effective_location = _ensure_gnss_mode_for_current_location()
@@ -1953,9 +1833,6 @@ def _recover_campaign() -> None:
 
     _wait_for_preflight("recovery")
 
-    # ------------------------------------------------------------------
-    # Wait for PUBSUB routing to be live
-    # ------------------------------------------------------------------
     _wait_for_pubsub_route(context="recovery", topic="TIMEBASE_FRAGMENT")
 
     # ------------------------------------------------------------------
@@ -1965,10 +1842,6 @@ def _recover_campaign() -> None:
     _request_teensy_stop_best_effort()
     time.sleep(2.0)
 
-    # Drain stale fragments that arrived before/during stop.
-    # Without this, the processor thread can dequeue old fragments
-    # after recovery completes, see a pps_count mismatch, and
-    # trigger a cascading hard-fault → recovery loop.
     _drained = 0
     while not _fragment_queue.empty():
         try:
@@ -2012,7 +1885,7 @@ def _recover_campaign() -> None:
     )
 
     # ------------------------------------------------------------------
-    # Step 4: next_pps_second = elapsed + 1
+    # Step 4-5: Symmetric projection
     # ------------------------------------------------------------------
     next_pps_second = elapsed_seconds + 1
     next_pps_count = last_pps_count + next_pps_second
@@ -2025,24 +1898,10 @@ def _recover_campaign() -> None:
         last_pps_count, next_pps_second, next_pps_count,
     )
 
-    # ------------------------------------------------------------------
-    # Step 5: Symmetric projection — all domains use the same formula
-    #
-    #   projected_ns = projected_gnss_ns * last_clock_ns // last_gnss_ns
-    #
-    # The projected values are ABSOLUTE (from campaign start), not
-    # relative to the outage.  The Teensy derives campaign_seconds
-    # (= teensy_pps_count) from gnss_ns / 1e9, so the nanosecond
-    # values must represent the full campaign elapsed time.
-    #
-    # GNSS projects to next_pps_count seconds by definition (tau = 1.0).
-    # Other domains scale by their tau ratio (last_clock_ns / last_gnss_ns).
-    # ------------------------------------------------------------------
-    projected_gnss_ns = next_pps_count * NS_PER_SECOND  # tau = 1.0 by definition
+    projected_gnss_ns = next_pps_count * NS_PER_SECOND
     projected_dwt_ns = projected_gnss_ns * last_dwt_ns // last_gnss_ns if last_gnss_ns > 0 else projected_gnss_ns
     projected_ocxo_ns = projected_gnss_ns * last_ocxo_ns // last_gnss_ns if (last_gnss_ns > 0 and last_ocxo_ns > 0) else 0
 
-    # Log the implicit tau values for verification
     tau_dwt = last_dwt_ns / last_gnss_ns if last_gnss_ns > 0 else 1.0
     tau_ocxo = last_ocxo_ns / last_gnss_ns if (last_gnss_ns > 0 and last_ocxo_ns > 0) else 1.0
 
@@ -2082,7 +1941,6 @@ def _recover_campaign() -> None:
     # ------------------------------------------------------------------
     _begin_sync_wait(expected_pps=int(next_pps_count))
 
-    # Teensy RECOVER — all nanoseconds, no cycle counts
     logging.info(
         "📡 [recovery] @%s arming TEENSY RECOVER:\n"
         "    pps_count = %d\n"
@@ -2106,11 +1964,6 @@ def _recover_campaign() -> None:
 
     _request_teensy_recover(int(next_pps_count), teensy_recover_args)
 
-    # Do NOT activate the campaign yet.  The sync fragment will be
-    # caught by the _sync_event latch (runs on the PUBSUB thread) and
-    # also enqueued for the processor.  But with _campaign_active=False,
-    # the processor ignores it — no race over _armed_pps_count.
-    # We activate AFTER setting the final armed value below.
     try:
         frag, waited_s = _end_sync_wait(timeout_s=SYNC_RECOVER_TIMEOUT_S)
     except Exception:
@@ -2127,11 +1980,6 @@ def _recover_campaign() -> None:
             teensy_pps_count, next_pps_count, overshoot,
         )
 
-    # Set the final armed value from the ACTUAL teensy pps_count,
-    # then drain any fragments that accumulated during the sync wait
-    # (including the sync fragment itself — the processor would just
-    # soft-skip it anyway since campaign was inactive).  This ensures
-    # the processor starts with an empty queue and a correct armed value.
     _armed_pps_count = teensy_pps_count + 1
     _diag["armed_pps_count"] = _armed_pps_count
 
@@ -2145,20 +1993,8 @@ def _recover_campaign() -> None:
     if _drained_post > 0:
         logging.info("🧹 [recovery] drained %d fragments accumulated during sync wait", _drained_post)
 
-    # Reset Welford accumulators AFTER the sync fragment and arming are
-    # settled.  This guarantees no stale fragments can poison the new
-    # campaign statistics — the queue was drained, the campaign was
-    # deactivated during the entire recovery window, and now we start
-    # fresh.
     _reset_trackers()
-
-    # NOW activate — processor thread will see the next fresh fragment
-    # from the Teensy with _armed_pps_count already correct.
     _campaign_active = True
-
-    # ------------------------------------------------------------------
-    # Step 7: Campaign activated.  Log final state.
-    # ------------------------------------------------------------------
 
     logging.info(
         "✅ [recovery] @%s campaign '%s' recovered — TIMEBASE resumes\n"
@@ -2273,26 +2109,11 @@ def cmd_set_baseline(args: Optional[dict]) -> Dict[str, Any]:
 # ---------------------------------------------------------------------
 # Preflight gate — prerequisites for campaign start/recovery
 # ---------------------------------------------------------------------
-#
-# The system must not attempt to start or recover a campaign until the
-# physical measurement chain is trustworthy.
-#
-# Constraints:
-#   1. GNSS time must be valid (GF-8802 has time and date from satellites)
-#   2. GNSS lock quality must be MEDIUM or STRONG (not WEAK)
-#   3. GNSS PPS must be valid (discipline loop is active — TPS4 reporting)
-#   4. Chrony must have selected the PPS refclock as its time source
-# ---------------------------------------------------------------------
 
 
 def _check_preflight() -> tuple[bool, list[str]]:
     """
     Check whether the system is ready to start or recover a campaign.
-
-    Returns:
-        (ready, reasons) where ready is True if all prerequisites are
-        met, and reasons is a list of human-readable strings describing
-        each unmet constraint.
     """
     reasons: list[str] = []
 
@@ -2306,11 +2127,9 @@ def _check_preflight() -> tuple[bool, list[str]]:
         else:
             gnss = gnss_resp.get("payload", {})
 
-            # 1a. Time valid
             if not gnss.get("time_valid"):
                 reasons.append("GNSS time not valid (no satellite time/date)")
 
-            # 2. Lock quality
             lock_quality = gnss.get("lock_quality", "WEAK")
             if lock_quality == "WEAK":
                 reasons.append(
@@ -2319,16 +2138,12 @@ def _check_preflight() -> tuple[bool, list[str]]:
                     f"hdop={gnss.get('hdop', '?')})"
                 )
 
-            # 3. PPS valid (discipline loop active)
             if not gnss.get("pps_valid"):
                 reasons.append("GNSS PPS not valid (discipline loop not active)")
             else:
-                # Extra: check that discipline is in a good state
                 discipline = gnss.get("discipline", {})
                 freq_mode = discipline.get("freq_mode", -1)
                 freq_mode_name = discipline.get("freq_mode_name", "UNKNOWN")
-                # freq_mode: 0=IDLE, 1=WARM_UP, 2=COARSE_LOCK, 3=FINE_LOCK, 4=HOLDOVER, 5=RECOVERY
-                # We require at least COARSE_LOCK (2) for recovery, FINE_LOCK (3) is ideal
                 if freq_mode < 2:
                     reasons.append(
                         f"GNSS discipline not locked "
@@ -2350,10 +2165,6 @@ def _check_preflight() -> tuple[bool, list[str]]:
         if result.returncode != 0:
             reasons.append(f"chronyc sources failed (rc={result.returncode})")
         else:
-            # chronyc -c sources outputs CSV lines:
-            # mode,state,name,stratum,poll,reach,last_rx,last_sample_offset,last_sample_err
-            # We need a line where name contains "PPS" and state == "*" (selected)
-            # In -c mode: field[0] = mode char (^=server, #=refclock), field[1] = state char
             pps_selected = False
             for line in result.stdout.strip().splitlines():
                 fields = line.split(",")
@@ -2384,12 +2195,6 @@ def _check_preflight() -> tuple[bool, list[str]]:
 def _wait_for_preflight(context: str = "recovery") -> None:
     """
     Block until all preflight prerequisites are met.
-
-    Logs the unmet constraints every PREFLIGHT_POLL_INTERVAL_S seconds
-    so the operator can see exactly what the system is waiting for.
-
-    Args:
-        context: "recovery" or "start" — used only in log messages.
     """
     attempt = 0
     t0 = time.monotonic()
@@ -2416,7 +2221,6 @@ def _wait_for_preflight(context: str = "recovery") -> None:
         attempt += 1
         elapsed = time.monotonic() - t0
 
-        # Log each unmet constraint on its own line for clarity
         reason_block = "\n".join(f"    • {r}" for r in reasons)
         logging.info(
             "%s @%s not ready for %s (check #%d, %.0fs elapsed):\n%s",
@@ -2519,9 +2323,6 @@ def cmd_delete(args: Optional[dict]) -> Dict[str, Any]:
 def cmd_list_campaigns(_: Optional[dict]) -> Dict[str, Any]:
     """
     LIST_CAMPAIGNS
-
-    Return a compact list of all campaigns with name, start/stop times,
-    active status, pps_count, and whether it's the current baseline.
     """
     baseline_info = _get_baseline_from_config()
     baseline_campaign = baseline_info.get("baseline_campaign") if baseline_info else None
@@ -2603,19 +2404,14 @@ def cmd_clocks_info(_: Optional[dict]) -> Dict[str, Any]:
 
 
 # ============================================================================
-# 4. cmd_set_dac — accept and persist float
+# cmd_set_dac
 # ============================================================================
-#
-# Full replacement:
-#
 
 def cmd_set_dac(args: Optional[dict]) -> Dict[str, Any]:
     """
     SET_DAC(dac)
 
     Update the OCXO DAC value in the SYSTEM config record.
-    This becomes the default DAC for subsequent campaign starts.
-    Accepts integer or decimal values (e.g. 3054 or 3054.238).
     """
     if not args or "dac" not in args:
         return {"success": False, "message": "SET_DAC requires 'dac' argument"}
@@ -2672,9 +2468,11 @@ def run() -> None:
     setup_logging()
 
     logging.info(
-        "🕐 [clocks] v7 — Recovery hardened. Teensy v9 ISR-synchronized anchors. "
+        "🕐 [clocks] v8 — Prediction-aware statistics. Teensy v10 trend-aware tracking. "
         "Three clock domains: GNSS (reference), DWT, OCXO. "
-        "Recovery: campaign deactivated + queue drained + soft-skip mismatch (≤5) + late Welford reset. "
+        "DWT/OCXO prediction stats from Teensy are authoritative. "
+        "Pi-side Welford for DWT/OCXO removed. GNSS stream canary retained. "
+        "Recovery: campaign deactivated + queue drained + soft-skip mismatch (≤5) + late reset. "
         "START while active performs seamless flash-cut to new campaign. "
         "Commands: START, STOP, RESUME, REPORT, CLEAR, DELETE, SET_DAC, "
         "SET_BASELINE, BASELINE_INFO, LIST_CAMPAIGNS, CLOCKS_INFO."

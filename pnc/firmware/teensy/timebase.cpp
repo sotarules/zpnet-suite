@@ -15,11 +15,25 @@
 //
 //   dwt_cycles_now     = fragment.dwt_cycles + (DWT_CYCCNT - dwt_cyccnt_at_pps)
 //   cycles_into_second = dwt_cycles_now - fragment.dwt_cycles
+//                      = DWT_CYCCNT - dwt_cyccnt_at_pps
 //   ns_into_second     = cycles_into_second × 1,000,000,000 / dwt_cycles_per_pps
 //   gnss_now           = fragment.gnss_ns + ns_into_second
 //
 // The product cycles_into_second × 1e9 fits in uint64 (max ~1.008e18).
 // No floating point.  No mul_div_u64 double fallback.  No rounding bias.
+//
+// Rounding policy (v8):
+//
+//   The cycles→nanoseconds division uses round-to-nearest instead of
+//   truncation.  This reduces the maximum interpolation error from
+//   [0, +1) ns to [-0.5, +0.5) ns, eliminating the systematic -1 ns
+//   bias observed in INTERP_TEST round-trip validation.
+//
+//   The rounding is implemented as:
+//     ns = (cycles * 1e9 + denominator/2) / denominator
+//
+//   The half-denominator addition (~504M) cannot overflow: the maximum
+//   product is ~1.008e18 + 5.04e8 ≈ 1.008e18, well within uint64 range.
 //
 // timebase_now_dwt_cycles() returns the synthetic campaign cycle count
 // at any instant — for code that needs the raw cycle count before
@@ -233,15 +247,19 @@ int64_t timebase_now_dwt_cycles(void) {
 }
 
 // ============================================================================
-// Forward projection — pure integer, no floating point
+// Forward projection — pure integer, round-to-nearest (v8)
 // ============================================================================
 //
 // The math:
 //   dwt_cycles_now        = fragment.dwt_cycles + (DWT_CYCCNT - dwt_cyccnt_at_pps)
 //   cycles_into_second    = dwt_cycles_now - fragment.dwt_cycles
 //                         = DWT_CYCCNT - dwt_cyccnt_at_pps
-//   ns_into_second        = cycles_into_second × 1,000,000,000 / dwt_cycles_per_pps
+//   ns_into_second        = (cycles_into_second × 1e9 + half_denom) / dwt_cycles_per_pps
 //   gnss_now              = fragment.gnss_ns + ns_into_second
+//
+// The half-denominator rounding reduces interpolation error from
+// [0, +1) ns to [-0.5, +0.5) ns.  The addition of ~504M to a
+// product that maxes at ~1.008e18 cannot overflow uint64.
 
 static bool current_gnss_now(uint64_t& out_gnss_ns) {
   fragment_copy_t f = read_fragment();
@@ -254,10 +272,11 @@ static bool current_gnss_now(uint64_t& out_gnss_ns) {
   // Cycles elapsed since the PPS edge that anchors this fragment
   uint64_t cycles_into_second = dwt_cycles_now - f.dwt_cycles;
 
-  // Convert to GNSS nanoseconds using the Welford mean rate.
-  // Max product: ~1,008,000,000 × 1,000,000,000 = 1.008e18 < UINT64_MAX
+  // Convert to GNSS nanoseconds using the predicted rate,
+  // with round-to-nearest.
   uint64_t ns_into_second =
-    cycles_into_second * NS_PER_SECOND / f.dwt_cycles_per_pps;
+    (cycles_into_second * NS_PER_SECOND + f.dwt_cycles_per_pps / 2)
+    / f.dwt_cycles_per_pps;
 
   if (ns_into_second > TIMEBASE_MAX_FRAGMENT_AGE_NS) {
     return false;
@@ -382,10 +401,10 @@ int64_t timebase_now_gnss_ns(void) {
 // time.  This is the path for ISR-captured timestamps (timepop, photon
 // detector, or any hardware event).
 //
-// The math is identical to current_gnss_now():
+// The math is identical to current_gnss_now(), including round-to-nearest:
 //
 //   elapsed        = dwt_cyccnt - frag_dwt_cyccnt_at_pps   (uint32_t wrap OK)
-//   ns_into_second = elapsed × 1,000,000,000 / dwt_cycles_per_pps
+//   ns_into_second = (elapsed × 1e9 + half_denom) / dwt_cycles_per_pps
 //   gnss_ns        = frag_gnss_ns + ns_into_second
 //
 
@@ -400,9 +419,11 @@ int64_t timebase_gnss_ns_from_dwt(
 
   uint32_t elapsed = dwt_cyccnt - frag_dwt_cyccnt_at_pps;
 
-  // Sanity: elapsed should be less than ~3 seconds of cycles
+  // Round-to-nearest: add half the denominator before dividing.
+  // Max product: ~1.008e18 + ~5.04e8 ≈ 1.008e18 — no overflow risk.
   uint64_t ns_into_second =
-    (uint64_t)elapsed * NS_PER_SECOND / (uint64_t)frag_dwt_cycles_per_pps;
+    ((uint64_t)elapsed * NS_PER_SECOND + (uint64_t)frag_dwt_cycles_per_pps / 2)
+    / (uint64_t)frag_dwt_cycles_per_pps;
 
   if (ns_into_second > TIMEBASE_MAX_FRAGMENT_AGE_NS) return -1;
 

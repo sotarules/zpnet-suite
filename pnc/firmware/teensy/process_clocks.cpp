@@ -1,5 +1,5 @@
 // ============================================================================
-// process_clocks.cpp — ZPNet CLOCKS (Teensy) — v10 Trend-Aware Statistics
+// process_clocks.cpp — ZPNet CLOCKS (Teensy) — v10.1 Trend-Aware Statistics
 // ============================================================================
 //
 // CLOCKS is a dormant, PPS-anchored measurement instrument.
@@ -82,6 +82,27 @@
 //     ocxo_pred_mean         — running mean of prediction errors
 //     ocxo_pred_stddev       — stddev of prediction errors
 //     ocxo_pred_n            — sample count
+//
+// v10.1: Prediction Welford initialization guard.
+//
+//   The first delta after campaign start (or recovery) is computed
+//   from an anchor set during clocks_zero_all() on the same PPS edge
+//   that triggered START.  This first delta is a valid measurement
+//   but should NOT be used as the basis for the first prediction,
+//   because the transition from zeroing to steady-state may produce
+//   an atypical delta.
+//
+//   Fix: require history_count >= 3 before scoring predictions.
+//   This means:
+//     pps 0→1: first delta recorded (history_count = 1)
+//     pps 1→2: second delta recorded, first prediction computed
+//              for next second (history_count = 2), but NOT scored
+//     pps 2→3: third delta recorded, prediction from step above is
+//              now scored (history_count = 3), Welford gets first
+//              clean sample
+//
+//   The predicted value for dwt_cycles_per_pps is still available
+//   at history_count >= 2 — only the Welford scoring is delayed.
 //
 // ============================================================================
 
@@ -280,13 +301,13 @@ static inline double residual_stderr(const pps_residual_t& r) {
 }
 
 // ============================================================================
-// Trend-aware prediction tracking (v10)
+// Trend-aware prediction tracking (v10, v10.1)
 // ============================================================================
 //
 // For DWT and OCXO, we track:
 //   - The previous raw delta (prev_delta)
 //   - The delta before that (prev_prev_delta), for trend computation
-//   - Whether we have enough history to predict (need 2 prior deltas)
+//   - How many clean deltas we have seen (history_count)
 //   - A predicted value for the current second
 //   - Welford statistics on the prediction residual (actual - predicted)
 //
@@ -301,6 +322,26 @@ static inline double residual_stderr(const pps_residual_t& r) {
 // GNSS ticks are exact by definition (10 MHz phase-coherent) so no
 // prediction is needed.
 //
+// v10.1: Scoring requires history_count >= 3.
+//
+//   The first delta after START/RECOVER is computed from an anchor
+//   set during clocks_zero_all() on the triggering PPS edge.  This
+//   delta is valid for accumulation but may be atypical for prediction
+//   purposes.  We need THREE clean deltas before the first prediction
+//   can be scored:
+//
+//     history_count 1: first delta seen (anchor → pps 1)
+//     history_count 2: second delta seen, prediction computed for
+//                      next second (available for dwt_cycles_per_pps)
+//                      but NOT yet scored against Welford
+//     history_count 3: third delta seen, prediction from previous
+//                      step is scored — first clean Welford sample
+//
+//   This prevents the initialization transient from contaminating
+//   the prediction Welford accumulators while still making the
+//   predicted interpolation denominator available as early as
+//   possible.
+//
 
 struct prediction_tracker_t {
   // History (raw deltas, in native units: cycles for DWT, ticks for OCXO)
@@ -308,7 +349,7 @@ struct prediction_tracker_t {
   uint32_t prev_prev_delta;
   uint32_t predicted;           // predicted delta for THIS second
   int32_t  pred_residual;       // actual - predicted (latest)
-  uint8_t  history_count;       // 0, 1, or 2+ (need 2 to predict)
+  uint8_t  history_count;       // 0, 1, 2, 3+ (need 3 to score)
   bool     predicted_valid;     // true if we have a prediction for this second
 
   // Welford on prediction residuals
@@ -336,8 +377,16 @@ static void prediction_reset(prediction_tracker_t& p) {
 // Updates prediction stats and shifts history for next second.
 static void prediction_update(prediction_tracker_t& p, uint32_t actual_delta) {
 
-  if (p.predicted_valid) {
-    // We had a prediction for this second — score it
+  // Score the prediction we made last second (if we have enough history).
+  //
+  // v10.1: Require history_count >= 3 before scoring.  At history_count
+  // == 2, predicted_valid is true (the prediction was computed from two
+  // prior deltas), but the first delta came from the zeroing anchor set
+  // during clocks_zero_all(), which may be atypical.  By waiting one
+  // more second, we ensure both deltas that formed the scored prediction
+  // are normal PPS-to-PPS intervals.
+  //
+  if (p.predicted_valid && p.history_count >= 3) {
     p.pred_residual = (int32_t)actual_delta - (int32_t)p.predicted;
 
     p.n++;
@@ -352,7 +401,7 @@ static void prediction_update(prediction_tracker_t& p, uint32_t actual_delta) {
   p.prev_prev_delta = p.prev_delta;
   p.prev_delta      = actual_delta;
 
-  if (p.history_count < 2) {
+  if (p.history_count < 255) {
     p.history_count++;
   }
 

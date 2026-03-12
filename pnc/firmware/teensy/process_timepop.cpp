@@ -537,6 +537,11 @@ static Payload cmd_test(const Payload& args) {
 // If the result is not zero (or very near zero), the interpolation
 // is broken.
 //
+// The forward synthesis (GNSS ns → DWT cycles) uses round-to-nearest.
+// The reverse path (timebase_gnss_ns_from_dwt) also uses round-to-nearest.
+// With symmetric rounding in both directions, the round-trip error is 0
+// for all positions within the second.
+//
 // ============================================================================
 
 struct interp_test_ctx_t {
@@ -584,9 +589,20 @@ static void interp_test_callback(timepop_ctx_t* ctx, void*) {
   const int64_t  vclock_gnss_ns = (int64_t)(ctx->frag_gnss_ns + vclock_ns_into_second);
 
   // ── Synthesize DWT cycle count at the deadline moment ──
-  // Reverse interpolation: GNSS nanoseconds → DWT cycles
+  //
+  // Reverse interpolation: GNSS nanoseconds → DWT cycles.
+  //
+  // Round-to-nearest in BOTH directions eliminates the systematic
+  // -1 ns bias.  The forward path (here) rounds ns→cycles, and
+  // the reverse path (timebase_gnss_ns_from_dwt) rounds cycles→ns.
+  // With symmetric rounding the round-trip error is 0 for all
+  // positions within the second.
+  //
+  // Overflow safety: max product ≈ 1e9 × 1.008e9 ≈ 1.008e18,
+  // plus 500M ≈ 1.008e18 — well within uint64 (max ~1.8e19).
+  //
   const uint32_t synth_dwt_elapsed =
-    (uint32_t)(vclock_ns_into_second * (uint64_t)ctx->frag_dwt_cycles_per_pps / 1000000000ULL);
+    (uint32_t)((vclock_ns_into_second * (uint64_t)ctx->frag_dwt_cycles_per_pps + 500000000ULL) / 1000000000ULL);
   const uint32_t synth_dwt = ctx->frag_dwt_cyccnt_at_pps + synth_dwt_elapsed;
 
   // ── Forward interpolation: DWT cycles → GNSS nanoseconds ──

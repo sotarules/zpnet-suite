@@ -1,7 +1,15 @@
-"""z
-ZPNet Dashboard Readout Blocks — SYSTEM Snapshot Edition
+"""
+ZPNet Dashboard Readout Blocks — v8 Prediction-Aware Edition
 
-All readouts are derived directly from the authoritative SYSTEM snapshot.
+All readouts are derived directly from the authoritative SYSTEM snapshot
+or from direct process queries.
+
+v8 changes:
+  • clocks_welford_readout() replaced with clocks_prediction_readout()
+    which displays Teensy prediction statistics (pred_stddev, pred_n,
+    pred_residual) as the authoritative interpolation uncertainty.
+  • clocks_tau_readout() and clocks_comparison_readout() unchanged
+    (tau and ppb fields are in the same location).
 
 Invariants:
   • No database access
@@ -152,27 +160,48 @@ def clocks_tau_readout() -> Generator[str, None, None]:
 
 
 # ---------------------------------------------------------------------
-# CLOCKS 2/3 — Welford's
+# CLOCKS 2/3 — Prediction Statistics (v8, replaces Welford readout)
 # ---------------------------------------------------------------------
 
-def clocks_welford_readout() -> Generator[str, None, None]:
+def clocks_prediction_readout() -> Generator[str, None, None]:
+    """
+    Display Teensy prediction statistics for DWT and OCXO.
+
+    The prediction residual stddev is the authoritative interpolation
+    uncertainty metric — "how wrong is my best estimate of this
+    second's crystal rate?"
+
+    For DWT this is typically ~3-4 cycles (3-4 ns).
+    For OCXO this is typically ~1 tick (100 ns) when servo-locked.
+
+    GNSS is phase-coherent by definition (residual always 0), so
+    we show the stream health canary instead.
+    """
     r, hdr = _clocks_header()
     yield hdr
     if r is None:
         return
 
-    yield f"{'CLK':<6} {'RES':>8} {'MEAN':>9} {'SD':>8} {'SE':>7}"
+    yield f"{'CLK':<6} {'RES':>6} {'MEAN':>8} {'SD':>8} {'N':>6}"
 
-    for name, key in _CLOCK_DOMAINS:
+    # GNSS — stream health canary (no prediction needed)
+    gnss_blk = r.get("gnss", {})
+    gnss_res = gnss_blk.get("pps_residual", 0)
+    yield f"{'GNSS':<6} {gnss_res:>6} {'---':>8} {'---':>8} {'---':>6}"
+
+    # DWT and OCXO — Teensy prediction stats
+    for name, key in _CLOCK_DOMAINS[1:]:
         blk = r.get(key, {})
-        if blk.get("pps_valid"):
-            res    = blk.get("pps_residual", 0)
-            mean   = blk.get("pps_mean", 0.0)
-            stddev = blk.get("pps_stddev", 0.0)
-            stderr = blk.get("pps_stderr", 0.0)
-            yield f"{name:<6} {res:>8.1f} {mean:>9.2f} {stddev:>8.2f} {stderr:>7.2f}"
+        pred_n = blk.get("pred_n")
+
+        if pred_n is not None and pred_n > 0:
+            res    = blk.get("pred_residual", 0)
+            mean   = blk.get("pred_mean", 0.0)
+            stddev = blk.get("pred_stddev", 0.0)
+            yield f"{name:<6} {res:>6} {mean:>8.2f} {stddev:>8.2f} {pred_n:>6}"
         else:
-            yield f"{name:<6} {'---':>8} {'---':>9} {'---':>8} {'---':>7}"
+            # Not enough history yet (need 3 deltas for first scored prediction)
+            yield f"{name:<6} {'---':>6} {'---':>8} {'---':>8} {'---':>6}"
 
 
 # ---------------------------------------------------------------------
@@ -398,7 +427,7 @@ def raspberry_pi_status_readout() -> Generator[str, None, None]:
         yield "UNDERVOLTAGE: NONE"
 
 """
-readout_teensy_metrics.py — Teensy Subsystem Health Readout
+Teensy Subsystem Health Readout
 
 Renders independent Pi-side health judgment for:
   • Process (RPC pipeline invariants)
@@ -490,13 +519,6 @@ def _assess_process(proc: dict) -> tuple[str, list[str]]:
 def _assess_transport(tx: dict) -> tuple[str, list[str]]:
     """
     Analyze transport TX/RX accounting and framing health.
-
-    Key checks:
-      tx_jobs_enqueued == tx_jobs_sent  (no stuck jobs)
-      tx_bytes_enqueued == tx_bytes_sent (byte-perfect accounting)
-      tx_rr_drop_count == 0 (no dropped request/responses)
-      tx_arena_alloc_fail == 0 (no arena exhaustion)
-      rx framing errors are zero or frozen
     """
     findings = []
 
@@ -517,9 +539,6 @@ def _assess_transport(tx: dict) -> tuple[str, list[str]]:
     pending = enqueued - sent
     if pending > 10:
         findings.append(f"TX BACKLOG: {pending} jobs pending")
-    elif pending > 0 and job_count == 0:
-        # jobs_enqueued > jobs_sent but queue is empty = counter mismatch
-        pass  # Transient, ignore
 
     # Byte-perfect accounting
     if bytes_enq != bytes_sent and job_count == 0:
@@ -556,12 +575,6 @@ def _assess_transport(tx: dict) -> tuple[str, list[str]]:
 def _assess_payload(pl: dict) -> tuple[str, list[str]]:
     """
     Analyze payload allocator health.
-
-    Key checks:
-      alive_now should be small and stable (5 is normal)
-      arena_alloc_fail == 0
-      entry_overflow == 0
-      constructed - destroyed == alive_now (no leaks)
     """
     findings = []
 
@@ -603,12 +616,6 @@ def _assess_payload(pl: dict) -> tuple[str, list[str]]:
 def _assess_memory(mem: dict) -> tuple[str, list[str]]:
     """
     Analyze Teensy memory health.
-
-    Key checks:
-      heap_growing == false (no monotonic sbrk advance)
-      stack_usage_pct < 50% (plenty of headroom)
-      heap_free_above is large (not approaching ceiling)
-      heap_fragmentation_pct is reasonable
     """
     findings = []
 
