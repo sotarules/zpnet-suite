@@ -1,2 +1,38 @@
 !Makefile
 !*/
+# CLion / JetBrains project files
+.idea/
+cmake-build-*/
+
+# CLion-generated files that shouldn't be in source control
+main.cpp
+
+# Arduino CLI build output
+build/
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
