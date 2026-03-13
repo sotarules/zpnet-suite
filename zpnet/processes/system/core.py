@@ -129,8 +129,8 @@ I2C_SENSORS_BY_BUS = {
 
     I2C_BUS_EXPANDED: {
         0x40: "INA260 0x40 (Pi Domain)",
-        0x41: "INA260 0x41 (24V Rail / Motors)",
-        0x44: "INA260 0x44 (OCXO Domain)",
+        0x41: "INA260 0x41 (OCXO1 Domain)",
+        0x44: "INA260 0x44 (OCXO1 Domain)",
         0x45: "INA260 0x45 (Teensy Domain)"
         # 0x57 will appear via scan but is ignored (EEPROM)
     },
@@ -142,15 +142,15 @@ I2C_SENSORS_BY_BUS = {
 
 POWER_CONFIG_BY_BUS = {
     I2C_BUS_LEGACY: {
+        0x44: {"label": "Battery", "ideal_voltage_v": 12.8},
         0x40: {"label": "3.3v Rail", "ideal_voltage_v": 3.3},
         0x41: {"label": "5v Rail", "ideal_voltage_v": 5.0},
-        0x44: {"label": "Battery", "ideal_voltage_v": 12.8},
     },
     I2C_BUS_EXPANDED: {
         0x40: {"label": "Pi Domain", "ideal_voltage_v": 5.0},
-        0x41: {"label": "24v Domain", "ideal_voltage_v": 24.0},
-        0x44: {"label": "OCXO Domain", "ideal_voltage_v": 5.0},
         0x45: {"label": "Teensy Domain", "ideal_voltage_v": 5.0},
+        0x44: {"label": "OCXO1 Domain", "ideal_voltage_v": 5.0},
+        0x41: {"label": "OCXO2 Domain", "ideal_voltage_v": 5.0},
     }
 }
 

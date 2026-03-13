@@ -670,7 +670,8 @@ def _fetch_environment() -> Optional[Dict[str, Any]]:
         i2c2 = power.get("i2c-2", {})
         pi_power = i2c2.get("0x40", {})
         teensy_power = i2c2.get("0x45", {})
-        ocxo_power = i2c2.get("0x44", {})
+        ocxo1_power = i2c2.get("0x44", {})
+        ocxo2_power = i2c2.get("0x41", {})
 
         return {
             # Temperature
@@ -700,10 +701,15 @@ def _fetch_environment() -> Optional[Dict[str, Any]]:
                 "amps": teensy_power.get("amps"),
                 "watts": teensy_power.get("watts"),
             },
-            "ocxo_power": {
-                "volts": ocxo_power.get("volts"),
-                "amps": ocxo_power.get("amps"),
-                "watts": ocxo_power.get("watts"),
+            "ocxo1_power": {
+                "volts": ocxo1_power.get("volts"),
+                "amps": ocxo1_power.get("amps"),
+                "watts": ocxo1_power.get("watts"),
+            },
+            "ocxo2_power": {
+                "volts": ocxo2_power.get("volts"),
+                "amps": ocxo2_power.get("amps"),
+                "watts": ocxo2_power.get("watts"),
             },
 
             # Battery state
@@ -1431,14 +1437,12 @@ def cmd_start(args: Optional[dict]) -> dict:
     except Exception:
         return {"success": False, "message": "HARD FAULT during START sync (see logs/diag)"}
 
-    _armed_pps_count = 1
-    _diag["armed_pps_count"] = 1
-
-    while not _fragment_queue.empty():
-        try:
-            _fragment_queue.get_nowait()
-        except queue.Empty:
-            break
+    # v12.3: Accept pps_count=0 (the first real measurement fragment).
+    # The sync wait captured it for verification, but it also went into
+    # the queue.  Don't drain the queue — let pps_count=0 be processed
+    # normally so teensy_dwt_ns reflects exactly one delta.
+    _armed_pps_count = 0
+    _diag["armed_pps_count"] = 0
 
     _reset_trackers()
     _campaign_active = True
