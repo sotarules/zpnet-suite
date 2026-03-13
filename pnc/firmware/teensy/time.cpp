@@ -6,7 +6,7 @@
 //
 // State model:
 //
-//   The PPS callback in process_clocks.cpp calls time_pps_update()
+//   The PPS callback in process_clocks_alpha.cpp calls time_pps_update()
 //   on every PPS edge.  This advances the anchor:
 //
 //     Call 1 (first PPS):
@@ -32,6 +32,15 @@
 //   pps_count is "PPS edges seen" (1-indexed).  Completed seconds
 //   is pps_count - 1.  After PPS #2: pps_count=2, completed=1,
 //   total at edge = 1,000,000,000.  Correct.
+//
+// Reverse conversion (GNSS ns → DWT):
+//
+//   target_gnss_ns → how many nanoseconds into the current second?
+//     ns_into_second = target_gnss_ns - (pps_count - 1) * 1e9
+//   Convert to DWT cycles:
+//     dwt_elapsed = ns_into_second * dwt_cycles_per_s / 1e9
+//   Add to PPS anchor:
+//     target_dwt = dwt_at_pps + dwt_elapsed
 //
 // Torn-read protection:
 //
@@ -81,7 +90,7 @@ static inline void dmb(void) {
 }
 
 // ============================================================================
-// Writer — called from PPS callback in process_clocks.cpp
+// Writer — called from PPS callback in process_clocks_alpha.cpp
 // ============================================================================
 
 void time_pps_update(uint32_t dwt_at_pps, uint32_t dwt_cycles_per_s) {
@@ -152,45 +161,74 @@ static time_snapshot_t read_anchor(void) {
 }
 
 // ============================================================================
-// Core API
+// Internal helper — DWT elapsed to GNSS nanoseconds (shared by forward APIs)
 // ============================================================================
 
-int64_t time_gnss_ns_now(void) {
-
-  time_snapshot_t s = read_anchor();
-  if (!s.ok || !s.valid) return -1;
-  if (s.dwt_cycles_per_s == 0) return -1;
-
-  // Read DWT_CYCCNT — this is the "now" moment.
-  const uint32_t dwt_now = ARM_DWT_CYCCNT;
-
-  // Elapsed DWT cycles since the last PPS edge.
-  // Unsigned subtraction handles 32-bit wrap correctly.
-  const uint32_t dwt_elapsed = dwt_now - s.dwt_at_pps;
-
-  // Convert to nanoseconds within the current second.
-  // Round-to-nearest: (elapsed * 1e9 + denom/2) / denom
+static inline int64_t interpolate_gnss_ns(const time_snapshot_t& s, uint32_t dwt_elapsed) {
   const uint64_t ns_into_second =
     ((uint64_t)dwt_elapsed * NS_PER_SEC + (uint64_t)s.dwt_cycles_per_s / 2)
     / (uint64_t)s.dwt_cycles_per_s;
 
-  // Staleness guard.
   if (ns_into_second > MAX_AGE_NS) return -1;
-
-  // Total GNSS nanoseconds: completed seconds + interpolation.
-  //
-  // pps_count is "PPS edges seen" (1-indexed).
-  // Completed seconds = pps_count - 1.
-  //
-  // After PPS #2: pps_count=2, completed=1.
-  //   At the edge: 1 * 1e9 + 0 = 1,000,000,000.  Correct.
-  //   Midway:      1 * 1e9 + 500,000,000 = 1,500,000,000.  Correct.
-  //
-  // After PPS #3: pps_count=3, completed=2.
-  //   At the edge: 2 * 1e9 = 2,000,000,000.  Correct.
 
   return (int64_t)((uint64_t)(s.pps_count - 1) * NS_PER_SEC + ns_into_second);
 }
+
+// ============================================================================
+// Core API — forward (DWT → GNSS nanoseconds)
+// ============================================================================
+
+int64_t time_gnss_ns_now(void) {
+  time_snapshot_t s = read_anchor();
+  if (!s.ok || !s.valid) return -1;
+  if (s.dwt_cycles_per_s == 0) return -1;
+
+  const uint32_t dwt_now = ARM_DWT_CYCCNT;
+  const uint32_t dwt_elapsed = dwt_now - s.dwt_at_pps;
+
+  return interpolate_gnss_ns(s, dwt_elapsed);
+}
+
+int64_t time_dwt_to_gnss_ns(uint32_t dwt_cyccnt) {
+  time_snapshot_t s = read_anchor();
+  if (!s.ok || !s.valid) return -1;
+  if (s.dwt_cycles_per_s == 0) return -1;
+
+  const uint32_t dwt_elapsed = dwt_cyccnt - s.dwt_at_pps;
+
+  return interpolate_gnss_ns(s, dwt_elapsed);
+}
+
+// ============================================================================
+// Core API — reverse (GNSS nanoseconds → DWT)
+// ============================================================================
+
+uint32_t time_gnss_ns_to_dwt(int64_t gnss_ns) {
+  time_snapshot_t s = read_anchor();
+  if (!s.ok || !s.valid) return 0;
+  if (s.dwt_cycles_per_s == 0) return 0;
+
+  // Nanoseconds into the current second relative to the PPS anchor.
+  // completed_seconds = pps_count - 1, so the anchor epoch is
+  // (pps_count - 1) * 1e9.
+  const int64_t anchor_ns = (int64_t)(s.pps_count - 1) * (int64_t)NS_PER_SEC;
+  const int64_t ns_into_second = gnss_ns - anchor_ns;
+
+  // If the target is in the past relative to the anchor, or more than
+  // 3 seconds in the future, something is wrong — but we still return
+  // a best-effort value.  The caller is responsible for reasonableness.
+
+  // Convert nanoseconds to DWT cycles.  Round-to-nearest.
+  const uint32_t dwt_elapsed =
+    (uint32_t)(((uint64_t)ns_into_second * (uint64_t)s.dwt_cycles_per_s + NS_PER_SEC / 2)
+    / NS_PER_SEC);
+
+  return s.dwt_at_pps + dwt_elapsed;
+}
+
+// ============================================================================
+// Status
+// ============================================================================
 
 uint32_t time_pps_count(void) {
   time_snapshot_t s = read_anchor();

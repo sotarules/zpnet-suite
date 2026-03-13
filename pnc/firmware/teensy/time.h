@@ -7,12 +7,15 @@
 // time.h — Universal GNSS Nanosecond Interface (Teensy)
 // ============================================================================
 //
-// Provides a single function: time_gnss_ns_now()
+// Core functions:
 //
-// Returns the current GNSS nanosecond — a monotonic, PPS-counted
-// value with DWT interpolation between PPS edges.  Available from
-// boot as soon as the second PPS edge establishes calibration.
-// No campaign dependency.  No external state.  ISR-safe.
+//   time_gnss_ns_now()       — current GNSS nanosecond (DWT interpolated)
+//   time_dwt_to_gnss_ns()    — convert a DWT_CYCCNT value to GNSS nanoseconds
+//   time_gnss_ns_to_dwt()    — convert a GNSS nanosecond to a DWT_CYCCNT value
+//
+// Returns monotonic, PPS-counted nanoseconds with DWT interpolation
+// between PPS edges.  Available from boot as soon as the second PPS
+// edge establishes calibration.  No campaign dependency.  ISR-safe.
 //
 // The returned value is a LOCAL temporal coordinate, not a wall clock.
 // It counts nanoseconds from the first PPS edge (time zero).
@@ -20,15 +23,13 @@
 //
 // Architecture:
 //
-//   process_clocks.cpp calls time_pps_update() once per PPS edge,
+//   process_clocks_alpha.cpp calls time_pps_update() once per PPS edge,
 //   providing:
 //     - dwt_at_pps:        DWT_CYCCNT captured at the PPS edge
 //     - dwt_cycles_per_s:  measured DWT cycles in the prior second
 //
 //   time.cpp maintains a seqlock-protected anchor and a PPS counter.
-//   time_gnss_ns_now() reads DWT_CYCCNT, computes elapsed cycles
-//   since the last PPS, converts to nanoseconds using the measured
-//   ratio, and adds to the accumulated PPS-second total.
+//   All conversions use the same anchor snapshot for consistency.
 //
 // Accuracy:
 //
@@ -44,7 +45,7 @@
 // ============================================================================
 
 // ============================================================================
-// Core API
+// Core API — forward (DWT → GNSS nanoseconds)
 // ============================================================================
 
 /// Returns the current GNSS nanosecond (monotonic, PPS-counted, DWT-interpolated).
@@ -56,7 +57,40 @@
 /// ISR-safe.  Zero allocation.  Zero blocking.  Pure register reads + arithmetic.
 int64_t time_gnss_ns_now(void);
 
-/// Returns the number of completed PPS seconds since time zero.
+/// Convert a pre-captured DWT_CYCCNT value to a GNSS nanosecond.
+///
+/// This is the deterministic overload — given a specific DWT cycle count
+/// (captured at some moment), returns the GNSS nanosecond at that moment.
+/// Used by TimePop nano-precise callbacks to convert the spin-landed
+/// DWT value to a GNSS nanosecond.
+///
+/// Returns -1 if time is not valid or anchor is stale.
+/// ISR-safe.
+int64_t time_dwt_to_gnss_ns(uint32_t dwt_cyccnt);
+
+// ============================================================================
+// Core API — reverse (GNSS nanoseconds → DWT)
+// ============================================================================
+
+/// Convert a target GNSS nanosecond to the corresponding DWT_CYCCNT value.
+///
+/// This is the reverse of time_dwt_to_gnss_ns().  Given a future GNSS
+/// nanosecond, returns the DWT_CYCCNT value that will be observed at
+/// that moment (assuming the current DWT-to-GNSS rate holds).
+///
+/// Used by TimePop nano-precise scheduling to compute the DWT spin
+/// target from a user-specified GNSS nanosecond.
+///
+/// Returns 0 if time is not valid.  The caller must check time_valid()
+/// before relying on the result.
+/// ISR-safe.
+uint32_t time_gnss_ns_to_dwt(int64_t gnss_ns);
+
+// ============================================================================
+// Status
+// ============================================================================
+
+/// Returns the number of PPS edges seen since time zero.
 /// Returns 0 if not yet valid.
 uint32_t time_pps_count(void);
 
@@ -64,17 +98,17 @@ uint32_t time_pps_count(void);
 bool time_valid(void);
 
 // ============================================================================
-// Update interface (called by process_clocks.cpp PPS callback ONLY)
+// Update interface (called by process_clocks_alpha.cpp PPS callback ONLY)
 // ============================================================================
 
 /// Feed a new PPS anchor to the time module.
 ///
 /// Called once per PPS edge from the deferred PPS callback in
-/// process_clocks.cpp, after the continuous calibration block
+/// process_clocks_alpha.cpp, after the continuous calibration block
 /// has updated dwt_cycles_per_gnss_s.
 ///
-/// On the first call: establishes time zero (pps_count = 0, anchor set).
-/// On the second call: calibration becomes valid (pps_count = 1).
+/// On the first call: establishes time zero (pps_count = 1, anchor set).
+/// On the second call: calibration becomes valid (pps_count = 2).
 /// Subsequent calls: pps_count increments, anchor advances.
 ///
 /// dwt_at_pps:       DWT_CYCCNT at the PPS edge (ISR-corrected).
