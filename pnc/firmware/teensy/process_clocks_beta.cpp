@@ -1,152 +1,30 @@
 // ============================================================================
-// process_clocks.cpp — ZPNet CLOCKS (Teensy) — v12.4 Accumulator Epoch Fix
+// process_clocks_beta.cpp — Campaign Layer
 // ============================================================================
 //
-// CLOCKS is a dormant, PPS-anchored measurement instrument.
+// Owns:
+//   • Campaign state machine (START / STOP / RECOVER)
+//   • Per-second delta accumulation (DWT, GNSS, OCXO1, OCXO2)
+//   • Prediction trackers (trend-aware linear extrapolation)
+//   • Welford residual tracking
+//   • OCXO calibration servo
+//   • TIMEBASE_FRAGMENT publishing
+//   • All command handlers (REPORT, CLOCKS_INFO, INTERP_TEST, INTERP_PROOF)
+//   • Process registration
+//   • Zeroing (clocks_zero_all)
 //
-// • Boots fully silent
-// • Does NOT track PPS unless a campaign is active or pending
-// • Nanosecond clocks are ZERO unless a campaign is STARTED
-// • All four counters are always live (capability, not narration)
-//
-// START / STOP / RECOVER are *requests*.
-// All authoritative state transitions occur on the PPS boundary.
-//
-// Clock domains:
-//
-//   DWT    — ARM Cortex-M7 cycle counter, 1008 MHz, internal
-//   GNSS   — GF-8802 10 MHz VCLOCK, external via GPT2 pin 14
-//   OCXO1  — AOCJY1-A #1 10 MHz, external via GPT1 pin 25
-//   OCXO2  — AOCJY1-A #2 10 MHz, external via QTimer1 ch0+ch1 pin 10
-//
-// v12.4: Accumulator epoch alignment.
-//
-//   campaign_seconds was incremented AFTER the payload was published.
-//   Since pps_gnss_ns = campaign_seconds * NS_PER_SECOND, the GNSS
-//   nanosecond count lagged the DWT/OCXO accumulators by exactly one
-//   delta.  After N measurement PPS edges, dwt_cycles_64 held N deltas
-//   but gnss_ns = (N-1) * 1e9.  This produced a permanent +1 second
-//   offset in DWT/OCXO ns relative to GNSS ns, making tau and ppb
-//   systematically wrong (error = 1/N, decaying but never zero).
-//
-//   Fix: Increment campaign_seconds immediately after delta accumulation,
-//   BEFORE computing pps_gnss_ns.  Now after N deltas are accumulated,
-//   campaign_seconds = N and gnss_ns = N * 1e9.  All four domains
-//   are epoch-aligned from the first fragment.
-//
-//   teensy_pps_count in the payload is now campaign_seconds (already
-//   incremented), so pps_count=1 on the first fragment instead of 0.
-//   This is semantically correct: pps_count=1 means "one PPS-second
-//   of measurement data accumulated."
-//
-// v12.3: Zero-delta guard on START and RECOVER.
-//
-//   clocks_zero_all() anchors prev_dwt_at_pps to isr_snap_dwt on the
-//   same PPS edge.  If the STARTED accumulation block runs on that same
-//   PPS, dwt_delta = snap - prev = 0.  This zero delta is fed into
-//   prediction_update(), which:
-//     1. Computes residual = 0 - seed ≈ -1,008,000,000 → Welford bomb
-//     2. Sets predicted = 2*0 - seed → negative → clamped to 0
-//   The seed is consumed and destroyed.  pps_count=1 then emits
-//   dwt_cycles_per_pps = 0, and pps_count=2 sees the 2× doubling
-//   because prev_prev_delta is now 0.
-//
-//   Fix: After clocks_zero_all() (fresh start) and after recovery
-//   setup, return immediately from pps_asap_callback() without entering
-//   the STARTED accumulation block.  The anchors are set, the seed is
-//   intact, and the first real measurement with a valid delta happens
-//   on the NEXT PPS edge.  This costs one second of latency at campaign
-//   start — campaign_seconds stays at 0 until the next PPS — but
-//   ensures every emitted TIMEBASE_FRAGMENT has valid delta data.
-//
-// v12.2: Prediction capture-before-update fix.
-//
-//   The v12/v12.1 code called prediction_update() BEFORE building the
-//   TIMEBASE_FRAGMENT payload.  prediction_update() overwrites
-//   pred_dwt.predicted with the NEXT second's prediction (2*actual - prev).
-//   The payload then read this post-update value instead of the prediction
-//   that was valid AT the PPS edge.
-//
-//   On campaign second 0 with a seed value S:
-//     - prediction_seed() sets predicted = S
-//     - prediction_update(actual) overwrites predicted = 2*actual - S
-//     - payload reads 2*actual - S instead of S
-//
-//   When S == DWT_EXPECTED_PER_PPS (no calibration), 2*actual - S ≈
-//   2*1,007,996,000 - 1,008,000,000 ≈ 1,007,992,000, which is 4000
-//   cycles off.  When S == 0 (v11.x without seed), it's 2*actual ≈
-//   2,016,000,000 — the doubling bug.
-//
-//   Fix: Snapshot dwt_cycles_per_pps BEFORE calling prediction_update(),
-//   and use the snapshot in the payload.  The prediction tracker still
-//   updates for the next second, but THIS second's interpolation uses
-//   the prediction that was valid at the PPS edge.
-//
-// v12.1: Prediction seed fix — two bugs.
-//
-//   Bug 1: prediction_seed() set history_count = 2.  On the first real
-//   prediction_update() call, history_count incremented to 3, but the
-//   prediction had already been overwritten to 2*actual - seed.  The
-//   Welford gate (history_count >= 3) opened on the SECOND real sample,
-//   computing a residual against a prediction derived from only one
-//   real sample plus the seed — correct in principle, but the emitted
-//   dwt_cycles_per_pps for the first record used the post-update
-//   prediction (2*actual - seed) instead of the seed value.
-//
-//   Fix: prediction_seed() now sets history_count = 3, so the Welford
-//   gate opens on the very first real sample.  The residual is
-//   actual - seed (a few hundred cycles), not a billion-cycle bomb.
-//
-//   Bug 2: prediction_seed() was gated on g_dwt_cal_valid.  If the
-//   campaign started before the continuous calibration had seen two
-//   PPS edges (early boot), the seed was skipped entirely.  The
-//   prediction tracker started with prev_prev_delta = 0, producing
-//   predicted = 2*actual - 0 = 2*actual on the first update.  This
-//   doubled value was emitted as dwt_cycles_per_pps and contaminated
-//   the Welford with a ~1 billion cycle residual.
-//
-//   Fix: Always seed the DWT prediction tracker.  Use the continuous
-//   calibration value if available, otherwise fall back to the
-//   compile-time constant DWT_EXPECTED_PER_PPS.  The constant is
-//   ~4000 cycles off from reality, but that's 4 µs of interpolation
-//   error for one second — infinitely better than the 2× doubling.
-//
-// v12: Continuous DWT-to-GNSS calibration.
-//
-//   A campaign-independent tracker maintains dwt_cycles_per_gnss_second,
-//   updated on every PPS edge regardless of campaign state.  This is
-//   simply the DWT cycle count delta between successive PPS edges —
-//   no averaging, no Welford, just the last measured value.  DWT drift
-//   is slow and smooth, so the last second's measurement is the best
-//   predictor of the next second's value.
-//
-//   This tracker:
-//     • Runs from the first PPS after boot
-//     • Is never zeroed by campaign start/stop/recover
-//     • Provides dwt_cycles_per_pps at campaign second 0 (no cold start)
-//     • Is published in TIMEBASE_FRAGMENT as dwt_cycles_per_pps
-//     • Is accessible via clocks_dwt_cycles_per_gnss_second()
-//
-//   At campaign start, clocks_zero_all() seeds the DWT prediction
-//   tracker with the pre-existing calibration value instead of
-//   falling back to the compile-time constant DWT_EXPECTED_PER_PPS.
-//   This eliminates the first-second jitter that previously occurred
-//   because the prediction tracker had no history.
-//
-// v11.2: OCXO2 accumulator truncation fix (unchanged).
-// v11.1: QTimer dual-edge correction (unchanged).
-// v11:   Dual OCXO architecture (unchanged).
-// v10.1: Prediction Welford initialization guard (unchanged).
-// v10:   Trend-aware prediction statistics (unchanged).
-// v9:    ISR-synchronized anchors (unchanged).
+// Entry point from alpha:
+//   clocks_beta_pps() is called once per PPS from the deferred callback
+//   in process_clocks_alpha.cpp, after the always-on work is done.
 //
 // ============================================================================
+
+#include "process_clocks_internal.h"
+#include "process_clocks.h"
 
 #include "debug.h"
 #include "timebase.h"
 #include "time.h"
-#include "process_clocks.h"
-#include "process_timepop.h"
 
 #include "payload.h"
 #include "publish.h"
@@ -159,198 +37,37 @@
 
 #include <math.h>
 #include <stdlib.h>
+#include <climits>
 
 // ============================================================================
-// DWT nanosecond conversion helpers
+// Campaign State — definitions
 // ============================================================================
 
-static inline uint64_t dwt_cycles_to_ns(uint64_t cycles) {
-  return (cycles * DWT_NS_NUM) / DWT_NS_DEN;
-}
-
-static inline uint64_t dwt_ns_to_cycles(uint64_t ns) {
-  return (ns * DWT_NS_DEN) / DWT_NS_NUM;
-}
-
-// ============================================================================
-// TimePop delay constants (nanoseconds)
-// ============================================================================
-
-static constexpr uint64_t OCXO_DITHER_NS   =     1000000ULL;  //   1 ms
-static constexpr uint64_t PPS_RELAY_OFF_NS  =   500000000ULL;  // 500 ms
-
-// ============================================================================
-// Continuous DWT-to-GNSS Calibration (campaign-independent)
-// ============================================================================
-//
-// Updated on every PPS edge, regardless of campaign state.
-// Never zeroed.  Survives across campaigns.
-//
-// This is the foundational calibration constant for the entire system.
-// It answers: "how many DWT cycles elapsed in the most recent GNSS second?"
-//
-// The value is simply the last measured delta — no averaging, no Welford.
-// DWT frequency drifts slowly with temperature and voltage, so the last
-// second's measurement is the best predictor of the next second's value.
-// Empirically, successive deltas agree to within ±5 ns (~5 DWT cycles).
-//
-// The ISR captures dwt_snap at each PPS edge.  The deferred callback
-// computes the delta and stores it.  The ISR itself does not compute
-// the delta because it must remain minimal.
-//
-
-static volatile uint32_t  g_dwt_at_last_pps      = 0;      // ISR-captured, corrected
-static volatile uint32_t  g_dwt_cycles_per_gnss_s = 0;     // last measured delta
-static volatile bool      g_dwt_cal_has_prev      = false;  // have we seen at least one PPS?
-static volatile bool      g_dwt_cal_valid         = false;  // have we seen at least two PPS?
-static volatile uint64_t  g_dwt_cal_pps_count     = 0;     // total PPS edges observed
-
-uint32_t clocks_dwt_cycles_per_gnss_second(void) {
-  return g_dwt_cal_valid ? g_dwt_cycles_per_gnss_s : 0;
-}
-
-bool clocks_dwt_calibration_valid(void) {
-  return g_dwt_cal_valid;
-}
-
-// ============================================================================
-// Campaign State
-// ============================================================================
-
-enum class clocks_campaign_state_t {
-  STOPPED,
-  STARTED
-};
-
-static volatile clocks_campaign_state_t campaign_state =
+volatile clocks_campaign_state_t campaign_state =
   clocks_campaign_state_t::STOPPED;
 
-static char campaign_name[64] = {0};
+char     campaign_name[64] = {0};
+uint64_t campaign_seconds  = 0;
 
-static volatile bool request_start   = false;
-static volatile bool request_stop    = false;
-static volatile bool request_recover = false;
+volatile bool request_start   = false;
+volatile bool request_stop    = false;
+volatile bool request_recover = false;
 
-static uint64_t recover_dwt_ns   = 0;
-static uint64_t recover_gnss_ns  = 0;
-static uint64_t recover_ocxo1_ns = 0;
-static uint64_t recover_ocxo2_ns = 0;
-
-static uint64_t campaign_seconds = 0;
-
-// ============================================================================
-// OCXO DAC state — dual oscillator
-// ============================================================================
-
-struct ocxo_dac_state_t {
-  double   dac_fractional;
-  uint32_t dither_cycle;
-  int32_t  servo_step;
-  double   servo_last_residual;
-  uint32_t servo_settle_count;
-  uint32_t servo_adjustments;
-};
-
-static ocxo_dac_state_t ocxo1_dac = {
-  (double)OCXO1_DAC_DEFAULT, 0, 0, 0.0, 0, 0
-};
-
-static ocxo_dac_state_t ocxo2_dac = {
-  (double)OCXO2_DAC_DEFAULT, 0, 0, 0.0, 0, 0
-};
-
-static constexpr uint32_t DITHER_PERIOD = 1000;
-
-static bool     calibrate_ocxo_active = false;
-
-static constexpr int32_t  SERVO_MAX_STEP       = 64;
-static constexpr uint32_t SERVO_SETTLE_SECONDS = 5;
-static constexpr uint32_t SERVO_MIN_SAMPLES    = 10;
-
-static void ocxo_dac_set(ocxo_dac_state_t& s, double value) {
-  if (value < (double)OCXO1_DAC_MIN) value = (double)OCXO1_DAC_MIN;
-  if (value > (double)OCXO1_DAC_MAX) value = (double)OCXO1_DAC_MAX;
-  s.dac_fractional = value;
-}
+uint64_t recover_dwt_ns   = 0;
+uint64_t recover_gnss_ns  = 0;
+uint64_t recover_ocxo1_ns = 0;
+uint64_t recover_ocxo2_ns = 0;
 
 // ============================================================================
-// PPS relay to Pi — 500 ms pulse on GNSS_PPS_RELAY (pin 32)
+// PPS residual tracking — definitions
 // ============================================================================
 
-static volatile bool relay_arm_pending  = false;
-static volatile bool relay_timer_active = false;
+pps_residual_t residual_dwt   = {};
+pps_residual_t residual_gnss  = {};
+pps_residual_t residual_ocxo1 = {};
+pps_residual_t residual_ocxo2 = {};
 
-static void pps_relay_deassert(timepop_ctx_t*, void*) {
-  digitalWriteFast(GNSS_PPS_RELAY, LOW);
-  relay_timer_active = false;
-}
-
-// ============================================================================
-// ISR-level hardware snapshots and residuals
-// ============================================================================
-
-static volatile uint32_t isr_snap_dwt   = 0;
-static volatile uint32_t isr_snap_gnss  = 0;
-static volatile uint32_t isr_snap_ocxo1 = 0;
-static volatile uint32_t isr_snap_ocxo2 = 0;
-
-static volatile uint32_t isr_prev_dwt   = 0;
-static volatile uint32_t isr_prev_gnss  = 0;
-static volatile uint32_t isr_prev_ocxo1 = 0;
-static volatile uint32_t isr_prev_ocxo2 = 0;
-
-static volatile int32_t  isr_residual_dwt   = 0;
-static volatile int32_t  isr_residual_gnss  = 0;
-static volatile int32_t  isr_residual_ocxo1 = 0;
-static volatile int32_t  isr_residual_ocxo2 = 0;
-static volatile bool     isr_residual_valid = false;
-
-static constexpr uint32_t ISR_DWT_EXPECTED  = DWT_EXPECTED_PER_PPS;
-static constexpr uint32_t ISR_GNSS_EXPECTED = TICKS_10MHZ_PER_SECOND;
-static constexpr uint32_t ISR_OCXO_EXPECTED = TICKS_10MHZ_PER_SECOND;
-
-// QTimer1 counts both edges of the 10 MHz signal (hardware behavior).
-// Raw counts are 2x the actual 10 MHz tick rate.
-static constexpr uint32_t OCXO2_EDGE_DIVISOR    = 2;
-static constexpr uint32_t ISR_OCXO2_RAW_EXPECTED = TICKS_10MHZ_PER_SECOND * OCXO2_EDGE_DIVISOR;
-
-// ============================================================================
-// PPS VCLOCK validation — reject spurious edges
-// ============================================================================
-
-static volatile uint32_t diag_pps_rejected_total     = 0;
-static volatile uint32_t diag_pps_rejected_remainder = 0;
-
-// ============================================================================
-// PPS state
-// ============================================================================
-
-static volatile bool     pps_fired = false;
-
-// ============================================================================
-// PPS residual tracking — Welford's, callback-level
-// ============================================================================
-
-static constexpr int64_t DWT_EXPECTED_PER_PPS_I  = (int64_t)DWT_EXPECTED_PER_PPS;
-static constexpr int64_t GNSS_EXPECTED_PER_PPS   = (int64_t)TICKS_10MHZ_PER_SECOND;
-static constexpr int64_t OCXO_EXPECTED_PER_PPS   = (int64_t)TICKS_10MHZ_PER_SECOND;
-
-struct pps_residual_t {
-  uint64_t ticks_at_last_pps;
-  int64_t  delta;
-  int64_t  residual;
-  bool     valid;
-  uint64_t n;
-  double   mean;
-  double   m2;
-};
-
-static pps_residual_t residual_dwt   = {};
-static pps_residual_t residual_gnss  = {};
-static pps_residual_t residual_ocxo1 = {};
-static pps_residual_t residual_ocxo2 = {};
-
-static void residual_reset(pps_residual_t& r) {
+void residual_reset(pps_residual_t& r) {
   r.ticks_at_last_pps = 0;
   r.delta             = 0;
   r.residual          = 0;
@@ -360,7 +77,7 @@ static void residual_reset(pps_residual_t& r) {
   r.m2                = 0.0;
 }
 
-static void residual_update(pps_residual_t& r, uint64_t ticks_now, int64_t expected) {
+void residual_update(pps_residual_t& r, uint64_t ticks_now, int64_t expected) {
   if (r.ticks_at_last_pps > 0) {
     r.delta    = (int64_t)(ticks_now - r.ticks_at_last_pps);
     r.residual = r.delta - expected;
@@ -379,35 +96,23 @@ static void residual_update(pps_residual_t& r, uint64_t ticks_now, int64_t expec
   r.ticks_at_last_pps = ticks_now;
 }
 
-static inline double residual_stddev(const pps_residual_t& r) {
+double residual_stddev(const pps_residual_t& r) {
   return (r.n >= 2) ? sqrt(r.m2 / (double)(r.n - 1)) : 0.0;
 }
 
-static inline double residual_stderr(const pps_residual_t& r) {
+double residual_stderr(const pps_residual_t& r) {
   return (r.n >= 2) ? sqrt(r.m2 / (double)(r.n - 1)) / sqrt((double)r.n) : 0.0;
 }
 
 // ============================================================================
-// Trend-aware prediction tracking (v10, v10.1)
+// Trend-aware prediction tracking — definitions
 // ============================================================================
 
-struct prediction_tracker_t {
-  uint32_t prev_delta;
-  uint32_t prev_prev_delta;
-  uint32_t predicted;
-  int32_t  pred_residual;
-  uint8_t  history_count;
-  bool     predicted_valid;
-  uint64_t n;
-  double   mean;
-  double   m2;
-};
+prediction_tracker_t pred_dwt   = {};
+prediction_tracker_t pred_ocxo1 = {};
+prediction_tracker_t pred_ocxo2 = {};
 
-static prediction_tracker_t pred_dwt   = {};
-static prediction_tracker_t pred_ocxo1 = {};
-static prediction_tracker_t pred_ocxo2 = {};
-
-static void prediction_reset(prediction_tracker_t& p) {
+void prediction_reset(prediction_tracker_t& p) {
   p.prev_delta      = 0;
   p.prev_prev_delta = 0;
   p.predicted       = 0;
@@ -419,27 +124,15 @@ static void prediction_reset(prediction_tracker_t& p) {
   p.m2              = 0.0;
 }
 
-// Seed a prediction tracker with a known-good value so that
-// predicted_valid is true immediately AND the Welford gate opens
-// on the very first real sample (history_count >= 3 required).
-//
-// v12.1: Changed from history_count = 2 to 3.  With 2, the first
-// prediction_update() incremented to 3 but the Welford gate didn't
-// fire until the second call — meanwhile the predicted value was
-// overwritten to 2*actual - seed, which was emitted as
-// dwt_cycles_per_pps before any Welford residual was computed.
-// With 3, the first real sample produces residual = actual - seed
-// (typically ~100 cycles), giving clean Welford stats from record 1.
-static void prediction_seed(prediction_tracker_t& p, uint32_t value) {
+void prediction_seed(prediction_tracker_t& p, uint32_t value) {
   p.prev_delta      = value;
   p.prev_prev_delta = value;
   p.predicted       = value;
   p.predicted_valid = true;
   p.history_count   = 3;
-  // n, mean, m2, pred_residual intentionally left at zero
 }
 
-static void prediction_update(prediction_tracker_t& p, uint32_t actual_delta) {
+void prediction_update(prediction_tracker_t& p, uint32_t actual_delta) {
   if (p.predicted_valid && p.history_count >= 3) {
     p.pred_residual = (int32_t)actual_delta - (int32_t)p.predicted;
     p.n++;
@@ -461,239 +154,32 @@ static void prediction_update(prediction_tracker_t& p, uint32_t actual_delta) {
   }
 }
 
-static inline double prediction_stddev(const prediction_tracker_t& p) {
+double prediction_stddev(const prediction_tracker_t& p) {
   return (p.n >= 2) ? sqrt(p.m2 / (double)(p.n - 1)) : 0.0;
 }
 
-static inline double prediction_stderr(const prediction_tracker_t& p) {
+double prediction_stderr(const prediction_tracker_t& p) {
   return (p.n >= 2) ? sqrt(p.m2 / (double)(p.n - 1)) / sqrt((double)p.n) : 0.0;
 }
 
 // ============================================================================
-// 64-bit accumulators — built from successive raw 32-bit deltas
+// 64-bit accumulators — definitions
 // ============================================================================
 
-static uint64_t dwt_cycles_64       = 0;
-static uint32_t prev_dwt_at_pps     = 0;
+uint64_t dwt_cycles_64     = 0;
+uint32_t prev_dwt_at_pps   = 0;
 
-static uint64_t ocxo1_ticks_64      = 0;
-static uint32_t prev_ocxo1_at_pps   = 0;
+uint64_t ocxo1_ticks_64    = 0;
+uint32_t prev_ocxo1_at_pps = 0;
 
-// ── OCXO2: accumulate in raw 20 MHz space, derive 10 MHz at query time ──
-//
-// v11.2 fix: accumulating per-second (raw_delta / 2) caused integer
-// truncation to compound monotonically (~50 ns/s worst case, ~180 ppb
-// after minutes).  Now we accumulate the raw 20 MHz deltas and divide
-// the running total by 2.  Truncation error is bounded to ±0.5 ticks
-// (±50 ns) regardless of campaign duration.
-//
-static uint64_t ocxo2_raw_64        = 0;   // accumulated raw 20 MHz counts
-static uint32_t prev_ocxo2_at_pps   = 0;
-
-// Derived 10 MHz ticks — always computed from ocxo2_raw_64.
-// This inline helper is the single point of truth for the conversion.
-static inline uint64_t ocxo2_ticks_64_get(void) {
-  return ocxo2_raw_64 / OCXO2_EDGE_DIVISOR;
-}
-
-// ============================================================================
-// Rolling 64-bit extensions for general use
-// ============================================================================
-
-static uint64_t dwt_rolling_64  = 0;
-static uint32_t dwt_rolling_32  = 0;
-
-// ============================================================================
-// DWT (CPU cycle counter — 1008 MHz internal)
-// ============================================================================
-
-#define DEMCR               (*(volatile uint32_t *)0xE000EDFC)
-#define DEMCR_TRCENA        (1 << 24)
-#define DWT_CTRL            (*(volatile uint32_t *)0xE0001000)
-#define DWT_CYCCNT          (*(volatile uint32_t *)0xE0001004)
-#define DWT_CTRL_CYCCNTENA  (1 << 0)
-
-static inline void dwt_enable(void) {
-  DEMCR |= DEMCR_TRCENA;
-  DWT_CYCCNT = 0;
-  DWT_CTRL |= DWT_CTRL_CYCCNTENA;
-  dwt_rolling_32 = DWT_CYCCNT;
-}
-
-uint64_t clocks_dwt_cycles_now(void) {
-  uint32_t now = DWT_CYCCNT;
-  dwt_rolling_64 += (uint32_t)(now - dwt_rolling_32);
-  dwt_rolling_32 = now;
-  return dwt_rolling_64;
-}
-
-uint64_t clocks_dwt_ns_now(void) {
-  return dwt_cycles_to_ns(clocks_dwt_cycles_now());
-}
-
-// ============================================================================
-// GNSS VCLOCK (10 MHz external via GPT2)
-// ============================================================================
-
-static uint64_t gnss_ticks_64 = 0;
-static uint32_t gnss_last_32  = 0;
-static bool     gpt2_armed    = false;
-
-static inline void enable_gpt2(void) {
-  CCM_CCGR0 |= CCM_CCGR0_GPT2_BUS(CCM_CCGR_ON);
-}
-
-static void arm_gpt2_external(void) {
-  if (gpt2_armed) return;
-  enable_gpt2();
-  IOMUXC_SW_MUX_CTL_PAD_GPIO_AD_B1_02 = 8;
-  IOMUXC_SW_PAD_CTL_PAD_GPIO_AD_B1_02 =
-      IOMUXC_PAD_HYS | IOMUXC_PAD_PKE | IOMUXC_PAD_PUE | IOMUXC_PAD_DSE(4);
-  IOMUXC_GPT2_IPP_IND_CLKIN_SELECT_INPUT = 1;
-  GPT2_CR = 0;
-  GPT2_SR = 0x3F;
-  GPT2_PR = 0;
-  GPT2_CR = GPT_CR_CLKSRC(3) | GPT_CR_FRR;
-  GPT2_CR |= GPT_CR_EN;
-  gnss_last_32 = GPT2_CNT;
-  gpt2_armed   = true;
-}
-
-uint64_t clocks_gnss_ticks_now(void) {
-  uint32_t now = GPT2_CNT;
-  gnss_ticks_64 += (uint32_t)(now - gnss_last_32);
-  gnss_last_32 = now;
-  return gnss_ticks_64;
-}
-
-uint64_t clocks_gnss_ns_now(void) {
-  if (campaign_state != clocks_campaign_state_t::STARTED) return 0;
-  return clocks_gnss_ticks_now() * 100ull;
-}
-
-// ============================================================================
-// OCXO1 (10 MHz external via GPT1)
-// ============================================================================
-
-static bool gpt1_armed = false;
-
-static inline void enable_gpt1(void) {
-  CCM_CCGR1 |= CCM_CCGR1_GPT1_BUS(CCM_CCGR_ON);
-}
-
-static uint64_t ocxo1_rolling_64 = 0;
-static uint32_t ocxo1_rolling_32 = 0;
-
-static void arm_gpt1_external(void) {
-  if (gpt1_armed) return;
-  enable_gpt1();
-  *(portConfigRegister(OCXO1_10MHZ_PIN)) = 1;
-  GPT1_CR = 0;
-  GPT1_SR = 0x3F;
-  GPT1_PR = 0;
-  GPT1_CR = GPT_CR_CLKSRC(3) | GPT_CR_FRR;
-  GPT1_CR |= GPT_CR_EN;
-  ocxo1_rolling_32 = GPT1_CNT;
-  gpt1_armed       = true;
-}
-
-uint64_t clocks_ocxo1_ticks_now(void) {
-  uint32_t now = GPT1_CNT;
-  ocxo1_rolling_64 += (uint32_t)(now - ocxo1_rolling_32);
-  ocxo1_rolling_32 = now;
-  return ocxo1_rolling_64;
-}
-
-uint64_t clocks_ocxo1_ns_now(void) {
-  if (campaign_state != clocks_campaign_state_t::STARTED) return 0;
-  return clocks_ocxo1_ticks_now() * 100ull;
-}
-
-// ============================================================================
-// OCXO2 (10 MHz external via QTimer1 ch0+ch1 — cascaded 32-bit)
-//
-// IMPORTANT: QTimer CM(2) counts both rising and falling edges,
-// producing ~20 MHz raw counts for a 10 MHz input.  All conversions
-// from raw QTimer counts to 10 MHz ticks divide by OCXO2_EDGE_DIVISOR.
-// ISR snapshots and isr_residual_ocxo2 remain in raw 20 MHz space.
-//
-// v11.2: Rolling accessor accumulates in raw 20 MHz space and derives
-// 10 MHz ticks by dividing the accumulated total.
-// ============================================================================
-
-static bool qtimer1_armed = false;
-
-static uint64_t ocxo2_rolling_raw_64 = 0;  // raw 20 MHz rolling accumulator
-static uint32_t ocxo2_rolling_32     = 0;
-
-static inline uint32_t qtimer1_read_32(void) {
-  const uint16_t lo = IMXRT_TMR1.CH[0].CNTR;
-  const uint16_t hi = IMXRT_TMR1.CH[1].CNTR;
-  return ((uint32_t)hi << 16) | (uint32_t)lo;
-}
-
-static void arm_qtimer1_external(void) {
-  if (qtimer1_armed) return;
-
-  CCM_CCGR6 |= CCM_CCGR6_QTIMER1(CCM_CCGR_ON);
-
-  // Pin 10 = GPIO_B0_00, ALT1 = QTIMER1_TIMER0
-  IOMUXC_SW_MUX_CTL_PAD_GPIO_B0_00 = 1;
-  IOMUXC_SW_PAD_CTL_PAD_GPIO_B0_00 =
-      IOMUXC_PAD_HYS | IOMUXC_PAD_PKE | IOMUXC_PAD_PUE | IOMUXC_PAD_DSE(4);
-
-  // Only touch channels 0 and 1 (our cascade pair).
-  // Do NOT touch channels 2 and 3 — pin 11 (OCXO2 CTL) uses
-  // FlexPWM1 submodule 2, which shares the QTimer1 module.
-  // Zeroing CH[2] clobbers pin 11's PWM output.
-  IMXRT_TMR1.CH[0].CTRL = 0;
-  IMXRT_TMR1.CH[1].CTRL = 0;
-
-  IMXRT_TMR1.CH[0].CNTR = 0;
-  IMXRT_TMR1.CH[1].CNTR = 0;
-
-  IMXRT_TMR1.CH[0].SCTRL  = 0;
-  IMXRT_TMR1.CH[0].CSCTRL = 0;
-  IMXRT_TMR1.CH[1].SCTRL  = 0;
-  IMXRT_TMR1.CH[1].CSCTRL = 0;
-
-  IMXRT_TMR1.CH[0].LOAD = 0;
-  IMXRT_TMR1.CH[1].LOAD = 0;
-
-  IMXRT_TMR1.CH[0].COMP1 = 0xFFFF;
-  IMXRT_TMR1.CH[1].COMP1 = 0xFFFF;
-  IMXRT_TMR1.CH[0].CMPLD1 = 0xFFFF;
-  IMXRT_TMR1.CH[1].CMPLD1 = 0xFFFF;
-
-  // ch0: count edges of external pin (CM=2, PCS=0)
-  // NOTE: CM(2) counts BOTH edges — raw rate is 2x input frequency
-  IMXRT_TMR1.CH[0].CTRL = TMR_CTRL_CM(2) | TMR_CTRL_PCS(0);
-
-  // ch1: cascade from ch0 overflow (CM=7)
-  IMXRT_TMR1.CH[1].CTRL = TMR_CTRL_CM(7);
-
-  ocxo2_rolling_32 = qtimer1_read_32();
-  qtimer1_armed    = true;
-}
-
-uint64_t clocks_ocxo2_ticks_now(void) {
-  uint32_t now = qtimer1_read_32();
-  // Accumulate in raw 20 MHz space, derive 10 MHz by dividing total
-  ocxo2_rolling_raw_64 += (uint32_t)(now - ocxo2_rolling_32);
-  ocxo2_rolling_32 = now;
-  return ocxo2_rolling_raw_64 / OCXO2_EDGE_DIVISOR;
-}
-
-uint64_t clocks_ocxo2_ns_now(void) {
-  if (campaign_state != clocks_campaign_state_t::STARTED) return 0;
-  return clocks_ocxo2_ticks_now() * 100ull;
-}
+uint64_t ocxo2_raw_64      = 0;
+uint32_t prev_ocxo2_at_pps = 0;
 
 // ============================================================================
 // Zeroing (campaign-scoped — fresh start only)
 // ============================================================================
 
-static void clocks_zero_all(void) {
+void clocks_zero_all(void) {
   timebase_invalidate();
 
   dwt_cycles_64     = 0;
@@ -721,12 +207,6 @@ static void clocks_zero_all(void) {
   prediction_reset(pred_ocxo1);
   prediction_reset(pred_ocxo2);
 
-  // v12.1: Always seed the DWT prediction tracker so that
-  // dwt_cycles_per_pps is immediately valid at second 0.
-  // If continuous calibration is available, use the measured value
-  // (~100 cycles from reality).  Otherwise, fall back to the
-  // compile-time constant (~4000 cycles off — but prevents the
-  // 2× doubling bug from an unseeded tracker with prev_prev_delta = 0).
   prediction_seed(pred_dwt,
     g_dwt_cal_valid ? g_dwt_cycles_per_gnss_s : DWT_EXPECTED_PER_PPS);
 
@@ -774,46 +254,10 @@ static void ocxo_calibration_servo(void) {
 }
 
 // ============================================================================
-// PPS handling — deferred ASAP callback (scheduled context)
+// clocks_beta_pps — called from alpha's pps_asap_callback
 // ============================================================================
 
-static volatile bool pps_scheduled = false;
-
-static void pps_asap_callback(timepop_ctx_t*, void*) {
-
-  // ── Continuous DWT calibration (always runs, campaign-independent) ──
-  //
-  // Compute DWT cycles elapsed since the previous PPS edge.
-  // This runs unconditionally on every PPS — even before any campaign
-  // starts.  The result is stored in g_dwt_cycles_per_gnss_s and is
-  // available to any consumer via clocks_dwt_cycles_per_gnss_second().
-  //
-  {
-    const uint32_t dwt_corrected = isr_snap_dwt - ISR_ENTRY_DWT_CYCLES;
-
-    if (g_dwt_cal_has_prev) {
-      g_dwt_cycles_per_gnss_s = dwt_corrected - g_dwt_at_last_pps;
-      g_dwt_cal_valid = true;
-    }
-
-    g_dwt_at_last_pps  = dwt_corrected;
-    g_dwt_cal_has_prev = true;
-    g_dwt_cal_pps_count++;
-  }
-
-  // ── Universal GNSS time anchor (campaign-independent) ──
-  time_pps_update(
-    isr_snap_dwt - ISR_ENTRY_DWT_CYCLES,
-    g_dwt_cal_valid ? g_dwt_cycles_per_gnss_s : 0
-  );
-
-  if (relay_arm_pending) {
-    relay_arm_pending = false;
-    if (!relay_timer_active) {
-      relay_timer_active = true;
-      timepop_arm(PPS_RELAY_OFF_NS, false, pps_relay_deassert, nullptr, "pps-relay-off");
-    }
-  }
+void clocks_beta_pps(void) {
 
   if (request_stop) {
     campaign_state = clocks_campaign_state_t::STOPPED;
@@ -821,6 +265,7 @@ static void pps_asap_callback(timepop_ctx_t*, void*) {
     pps_fired      = true;
     calibrate_ocxo_active = false;
     timebase_invalidate();
+    return;
   }
 
   if (request_recover) {
@@ -833,10 +278,6 @@ static void pps_asap_callback(timepop_ctx_t*, void*) {
     ocxo1_ticks_64    = recover_ocxo1_ns / 100ull;
     prev_ocxo1_at_pps = isr_snap_ocxo1;
 
-    // v11.2: recover into raw 20 MHz space.
-    // The recovered ns corresponds to 10 MHz ticks; multiply by 2
-    // to seed the raw accumulator so that ocxo2_raw_64 / 2 yields
-    // the correct tick total.
     ocxo2_raw_64      = (recover_ocxo2_ns / 100ull) * OCXO2_EDGE_DIVISOR;
     prev_ocxo2_at_pps = isr_snap_ocxo2;
 
@@ -858,8 +299,6 @@ static void pps_asap_callback(timepop_ctx_t*, void*) {
     prediction_reset(pred_ocxo1);
     prediction_reset(pred_ocxo2);
 
-    // v12.1: Always seed DWT prediction tracker on recovery,
-    // same logic as fresh start in clocks_zero_all().
     prediction_seed(pred_dwt,
       g_dwt_cal_valid ? g_dwt_cycles_per_gnss_s : DWT_EXPECTED_PER_PPS);
 
@@ -869,9 +308,6 @@ static void pps_asap_callback(timepop_ctx_t*, void*) {
     campaign_state  = clocks_campaign_state_t::STARTED;
     request_recover = false;
 
-    // v12.3: Same zero-delta guard as request_start.  Recovery anchors
-    // all prev_*_at_pps to the current ISR snapshots, so deltas on this
-    // PPS would all be 0.  Return now; first valid measurement on next PPS.
     pps_scheduled = false;
     return;
   }
@@ -880,11 +316,6 @@ static void pps_asap_callback(timepop_ctx_t*, void*) {
     clocks_zero_all();
     campaign_state = clocks_campaign_state_t::STARTED;
     request_start  = false;
-    // v12.3: Don't process this PPS as a measurement.  clocks_zero_all()
-    // just anchored prev_dwt_at_pps (and all other prevs) to the current
-    // ISR snapshot, so every delta would be 0.  A zero delta destroys the
-    // prediction seed and contaminates Welford stats.  The first real
-    // measurement with valid deltas happens on the NEXT PPS.
     pps_scheduled = false;
     return;
   }
@@ -914,8 +345,6 @@ static void pps_asap_callback(timepop_ctx_t*, void*) {
     const uint64_t pps_ocxo1_ticks = ocxo1_ticks_64;
     const uint64_t pps_ocxo1_ns    = pps_ocxo1_ticks * 100ull;
 
-    // OCXO2: accumulate raw 20 MHz delta, derive 10 MHz ticks from total.
-    // v11.2: no per-delta division — truncation cannot compound.
     uint32_t ocxo2_raw_delta = isr_snap_ocxo2 - prev_ocxo2_at_pps;
     ocxo2_raw_64      += ocxo2_raw_delta;
     prev_ocxo2_at_pps  = isr_snap_ocxo2;
@@ -923,27 +352,12 @@ static void pps_asap_callback(timepop_ctx_t*, void*) {
     const uint64_t pps_ocxo2_ticks = ocxo2_ticks_64_get();
     const uint64_t pps_ocxo2_ns    = pps_ocxo2_ticks * 100ull;
 
-    // Per-second divided delta for residual and prediction tracking.
-    // Integer division here introduces ±0.5 tick noise per sample,
-    // but this is white noise in Welford stats, not cumulative drift.
     const uint32_t ocxo2_delta = ocxo2_raw_delta / OCXO2_EDGE_DIVISOR;
 
-    // v12.4: Increment campaign_seconds AFTER delta accumulation but
-    // BEFORE computing gnss_ns.  This ensures that after N deltas are
-    // accumulated in dwt_cycles_64 etc., gnss_ns = N * 1e9.  All four
-    // clock domains are now epoch-aligned from the first fragment.
     campaign_seconds++;
 
     const uint64_t pps_gnss_ns    = campaign_seconds * NS_PER_SECOND;
     const uint64_t pps_gnss_ticks = campaign_seconds * (uint64_t)ISR_GNSS_EXPECTED;
-
-    // ── Snapshot predictions BEFORE update ──
-    //
-    // v12.2: prediction_update() overwrites .predicted with the NEXT
-    // second's prediction.  But dwt_cycles_per_pps in the payload must
-    // reflect the prediction valid at THIS PPS edge — i.e., the value
-    // that was set by prediction_seed() or the previous update.
-    // Capture it now, use it in the payload below.
 
     const uint32_t dwt_cycles_per_pps_snapshot =
       pred_dwt.predicted_valid ? pred_dwt.predicted :
@@ -976,9 +390,6 @@ static void pps_asap_callback(timepop_ctx_t*, void*) {
     p.add("dwt_cyccnt_at_pps", (uint32_t)dwt_raw_at_pps);
     p.add("gpt2_at_pps",      (uint32_t)isr_snap_gnss);
 
-    // v12.2: Use the pre-update snapshot captured before prediction_update().
-    // This is the prediction that was valid AT the PPS edge — the seed value
-    // on second 0, or the previous second's trend prediction thereafter.
     p.add("dwt_cycles_per_pps", (uint64_t)dwt_cycles_per_pps_snapshot);
 
     p.add("dwt_delta_raw",    (uint64_t)dwt_delta);
@@ -1020,83 +431,11 @@ static void pps_asap_callback(timepop_ctx_t*, void*) {
     p.add("diag_pps_rejected_total",     diag_pps_rejected_total);
     p.add("diag_pps_rejected_remainder", diag_pps_rejected_remainder);
 
-    // v12: Continuous calibration diagnostics
     p.add("dwt_cal_valid",     g_dwt_cal_valid);
     p.add("dwt_cal_pps_count", g_dwt_cal_pps_count);
 
     publish("TIMEBASE_FRAGMENT", p);
-
-    // v12.4: campaign_seconds++ moved to before pps_gnss_ns computation
-    // (see "Accumulator epoch alignment" above).  No increment here.
   }
-
-  pps_scheduled = false;
-}
-
-// ============================================================================
-// PPS handling — ISR (minimum latency)
-// ============================================================================
-
-static void pps_isr(void) {
-
-  const uint32_t snap_dwt   = DWT_CYCCNT;
-  const uint32_t snap_gnss  = GPT2_CNT;
-  const uint32_t snap_ocxo1 = GPT1_CNT;
-  const uint32_t snap_ocxo2 = qtimer1_read_32();
-
-  if (isr_residual_valid) {
-    uint32_t elapsed = snap_gnss - isr_prev_gnss;
-    uint32_t remainder = elapsed % ISR_GNSS_EXPECTED;
-    if (remainder > PPS_VCLOCK_TOLERANCE &&
-        remainder < (ISR_GNSS_EXPECTED - PPS_VCLOCK_TOLERANCE)) {
-      diag_pps_rejected_total++;
-      diag_pps_rejected_remainder = remainder;
-      return;
-    }
-  }
-
-  pps_fired = true;
-
-  digitalWriteFast(GNSS_PPS_RELAY, HIGH);
-  relay_arm_pending = true;
-
-  if (isr_residual_valid) {
-    isr_residual_dwt   = (int32_t)(snap_dwt   - isr_prev_dwt)   - (int32_t)ISR_DWT_EXPECTED;
-    isr_residual_gnss  = (int32_t)(snap_gnss  - isr_prev_gnss)  - (int32_t)ISR_GNSS_EXPECTED;
-    isr_residual_ocxo1 = (int32_t)(snap_ocxo1 - isr_prev_ocxo1) - (int32_t)ISR_OCXO_EXPECTED;
-    isr_residual_ocxo2 = (int32_t)(snap_ocxo2 - isr_prev_ocxo2) - (int32_t)ISR_OCXO2_RAW_EXPECTED;
-  }
-
-  isr_prev_dwt   = isr_snap_dwt   = snap_dwt;
-  isr_prev_gnss  = isr_snap_gnss  = snap_gnss;
-  isr_prev_ocxo1 = isr_snap_ocxo1 = snap_ocxo1;
-  isr_prev_ocxo2 = isr_snap_ocxo2 = snap_ocxo2;
-
-  if (pps_scheduled) return;
-  pps_scheduled = true;
-
-  timepop_arm(0, false, pps_asap_callback, nullptr, "pps");
-}
-
-// ============================================================================
-// Dither callback — runs forever at 1 kHz, writes both OCXO PWM pins
-// ============================================================================
-
-static void ocxo_dither_one(ocxo_dac_state_t& s, int pin) {
-  uint32_t base      = (uint32_t)s.dac_fractional;
-  double   frac      = s.dac_fractional - (double)base;
-  uint32_t threshold = (uint32_t)(frac * DITHER_PERIOD);
-
-  s.dither_cycle = (s.dither_cycle + 1) % DITHER_PERIOD;
-
-  uint32_t output = (s.dither_cycle < threshold) ? base + 1 : base;
-  if (output > OCXO1_DAC_MAX) output = OCXO1_DAC_MAX;
-  analogWrite(pin, output);
-}
-
-static void ocxo_dither_cb(timepop_ctx_t*, void*) {
-  ocxo_dither_one(ocxo1_dac, OCXO1_CTL_PIN);
-  ocxo_dither_one(ocxo2_dac, OCXO2_CTL_PIN);
 }
 
 // ============================================================================
@@ -1282,7 +621,6 @@ static Payload cmd_report(const Payload&) {
   p.add("ocxo1_servo_settle_count",  ocxo1_dac.servo_settle_count);
   p.add("ocxo2_servo_settle_count",  ocxo2_dac.servo_settle_count);
 
-  // v12: Continuous DWT calibration in REPORT
   p.add("dwt_cal_cycles_per_s",  g_dwt_cycles_per_gnss_s);
   p.add("dwt_cal_valid",         g_dwt_cal_valid);
   p.add("dwt_cal_pps_count",     g_dwt_cal_pps_count);
@@ -1347,7 +685,6 @@ static Payload cmd_clocks_info(const Payload&) {
     p.add("timebase_fragment_valid", false);
   }
 
-  // v12: Continuous DWT calibration in CLOCKS_INFO
   p.add("dwt_cal_cycles_per_s",  g_dwt_cycles_per_gnss_s);
   p.add("dwt_cal_valid",         g_dwt_cal_valid);
   p.add("dwt_cal_pps_count",     g_dwt_cal_pps_count);
@@ -1551,40 +888,4 @@ static const process_vtable_t CLOCKS_PROCESS = {
 
 void process_clocks_register(void) {
   process_register("CLOCKS", &CLOCKS_PROCESS);
-}
-
-// ============================================================================
-// Initialization — Phase 1 (hardware only, no TimePop dependency)
-// ============================================================================
-
-void process_clocks_init_hardware(void) {
-  dwt_enable();
-  arm_gpt2_external();
-  arm_gpt1_external();
-  arm_qtimer1_external();
-}
-
-// ============================================================================
-// Initialization — Phase 2 (full lifecycle, requires TimePop)
-// ============================================================================
-
-void process_clocks_init(void) {
-
-  time_init();
-  timebase_init();
-
-  analogWriteResolution(12);
-
-  ocxo_dac_set(ocxo1_dac, (double)OCXO1_DAC_DEFAULT);
-  ocxo_dac_set(ocxo2_dac, (double)OCXO2_DAC_DEFAULT);
-
-  timepop_arm(OCXO_DITHER_NS, true, ocxo_dither_cb, nullptr, "ocxo-dither");
-
-  pinMode(GNSS_PPS_PIN,   INPUT);
-  pinMode(GNSS_LOCK_PIN,  INPUT);
-  pinMode(GNSS_PPS_RELAY, OUTPUT);
-  digitalWriteFast(GNSS_PPS_RELAY, LOW);
-
-  attachInterrupt(digitalPinToInterrupt(GNSS_PPS_PIN), pps_isr, RISING);
-  NVIC_SET_PRIORITY(IRQ_GPIO6789, 0);
 }
