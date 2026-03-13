@@ -143,9 +143,8 @@ static const int GNSS_PPS_RELAY = 32;
 // --------------------------------------------------------------
 //
 // OCXO1_10MHZ_PIN:
-//   10 MHz output from OCXO1, counted by GPT1 (external clock,
-//   CLKSRC=3).  Pin 25 = GPIO_AD_B0_13, IOMUX ALT1.
-//
+//   10 MHz output from OCXO1.
+
 // OCXO1_CTL_PIN:
 //   PWM output (12-bit + dither) driving OCXO1 CTL input.
 //   Pin 22 = FlexPWM4 Module2.

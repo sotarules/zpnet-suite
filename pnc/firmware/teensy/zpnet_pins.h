@@ -86,20 +86,29 @@ Notes:
 
 
 /*=============================================================================
- (2) TEENSY 4.1 PIN ASSIGNMENTS — v12 QTimer Architecture
+ (2) TEENSY 4.1 PIN ASSIGNMENTS — v13 QTimer Architecture
 -------------------------------------------------------------------------------
 
-v12 CHANGES:
+v13 CHANGES (from v12):
+  • OCXO1 moved from QTimer2 ch0 (pin 13) to QTimer4 ch0 (pin 6)
+    PHYSICAL REWIRE: OCXO1 STP from pin 13 → pin 6.
+    Pin 13 conflict: QTimer2 ch0 shares pin 13 with LED_BUILTIN.
+    The 10 MHz signal drove the LED solid amber.  Resolved by moving
+    to QTimer4 ch0 on pin 6 (no conflicts).
+  • Both OCXOs now use QTimer CM(2) — counts both edges (20 MHz raw).
+    OCXO1 was previously on GPT1 (32-bit, single-edge 10 MHz).
+    Now symmetric with OCXO2: both 16-bit QTimer, both 20 MHz raw,
+    both divide by OCXO_EDGE_DIVISOR (2) for 10 MHz ticks.
+  • GPT1 remains freed (no assignment).
+  • Pin 13 returns to LED_BUILTIN (fault Morse annunciator).
+
+v12 CHANGES (from v11):
   • GNSS VCLOCK moved from GPT2 (pin 14, ALT8) to QTimer3 ch2 (pin 14, ALT1)
     Pin 14 is unchanged physically — IOMUX reconfigured only.
   • OCXO1 moved from GPT1 (pin 25, ALT1) to QTimer2 ch0 (pin 13, ALT1)
-    PHYSICAL REWIRE: OCXO1 STP from pin 25 → pin 13.
-  • OCXO2 unchanged on QTimer1 ch0 (pin 10, ALT1)
-  • GPT1 freed entirely (no assignment)
+    [subsequently moved to QTimer4 ch0 (pin 6) in v13]
   • GPT2 freed from external clock — now runs on internal 24 MHz crystal
-    for TimePop scheduling.  TimePop API unchanged (callers specify GNSS
-    nanoseconds); DWT-based deadline conversion provides ~1 ns resolution.
-  • Pin 25 becomes unassigned (available for future use)
+    for TimePop scheduling.
 
 Teensy Pin    Wire Color    Signal Name        Source / Destination                 Notes
 ------------------------------------------------------------------------------------------
@@ -126,7 +135,7 @@ GND           Black         GND                Battery branching ground         
 
 4             Green         GNSS_LOCK_IN       GF-8802                              Lock status signal
 
-13            Twisted Pair  OCXO1_10MHZ_IN     OCXO1                                QTimer2 ch0 external clock (critical timing)
+6             Twisted Pair  OCXO1_10MHZ_IN     OCXO1                                QTimer4 ch0 external clock (critical timing)
 
 10            Twisted Pair  OCXO2_10MHZ_IN     OCXO2                                QTimer1 ch0 external clock (critical timing)
 
@@ -134,7 +143,7 @@ GND           Black         GND                Battery branching ground         
 
 -------------------------------------------------------------------------------
 Unassigned pins (available for future use):
-  5, 6, 7, 8, 12, 25
+  5, 7, 8, 12, 13, 25
 
 Timer hardware binding summary:
 
@@ -144,10 +153,11 @@ Timer hardware binding summary:
              PPS ISR captures count for DWT-to-GNSS calibration
              No compare needed — measurement is PPS-anchored
 
-  Pin 13  →  QTimer2 ch0 input    (OCXO1 10 MHz)
-             GPIO_B0_03, IOMUXC ALT1 → QTIMER2_TIMER0
+  Pin 6   →  QTimer4 ch0 input    (OCXO1 10 MHz)
+             GPIO_B0_08, IOMUXC ALT1 → QTIMER4_TIMER0
              16-bit counter with COMP1 for reciprocal counting
-             Compare fires at OCXO-defined epochs (every 10M ticks)
+             NOTE: QTimer CM(2) counts BOTH edges — raw rate is 20 MHz
+             Compare fires at OCXO-defined epochs (every 20M raw counts)
              DWT_CYCCNT captured in ISR for sub-nanosecond interpolation
 
   Pin 10  →  QTimer1 ch0 input    (OCXO2 10 MHz)
@@ -156,8 +166,6 @@ Timer hardware binding summary:
              NOTE: QTimer CM(2) counts BOTH edges — raw rate is 20 MHz
              Compare fires at OCXO-defined epochs (every 20M raw counts)
              DWT_CYCCNT captured in ISR for sub-nanosecond interpolation
-             Cascade with ch1 no longer needed — reciprocal counter
-             uses compare-and-reset, not free-running accumulation
 
   Pin 22  →  FlexPWM4 Module0     (OCXO1 CTL)  analogWrite 12-bit + dither
   Pin 11  →  FlexPWM1 Module2     (OCXO2 CTL)  analogWrite 12-bit + dither
@@ -178,8 +186,8 @@ Notes:
   consistent with all other timing-critical signals.
 • GND for STP shield drains uses dupont female header (not screw terminal),
   as screw terminals are fully committed.
-• PHYSICAL REWIRE REQUIRED: OCXO1 STP moves from pin 25 to pin 13.
-  Pin 14 (GNSS) stays physically connected — IOMUX change only.
+• Pin 13 (LED_BUILTIN) is reserved for the fault Morse annunciator.
+  It must not be assigned to any external signal.
 =============================================================================*/
 
 
@@ -195,16 +203,16 @@ Signal Name          Source          Destination       Frequency    Timer HW    
 ----------------------------------------------------------------------------------------------------
 GNSS_PPS_IN          GF-8802 P17     Teensy pin 1      1 Hz         GPIO IRQ           GF-8802 end
 GNSS_VCLOCK          GF-8802 P11     Teensy pin 14     10 MHz       QTimer3 ch2        GF-8802 end
-OCXO1_10MHZ_IN       OCXO1           Teensy pin 13     10 MHz       QTimer2 ch0        OCXO1 end
+OCXO1_10MHZ_IN       OCXO1           Teensy pin 6      10 MHz       QTimer4 ch0        OCXO1 end
 OCXO2_10MHZ_IN       OCXO2           Teensy pin 10     10 MHz       QTimer1 ch0        OCXO2 end
 GNSS_PPS_RELAY 1     Teensy pin 32   Pi GPIO18         1 Hz         —                  Teensy end
 GNSS_PPS_RELAY 2     Teensy pin 32   Pi GPIO25         1 Hz         —                  Teensy end
 
 ----------------------------------------------------------------------------------------------------
 Notes:
-• All three 10 MHz clocks are now on QTimer modules (symmetric architecture).
+• All three 10 MHz clocks are on QTimer modules (symmetric architecture).
 • QTimer3 ch2 (GNSS) is free-running, PPS-anchored.
-• QTimer2 ch0 (OCXO1) and QTimer1 ch0 (OCXO2) use compare-and-reset
+• QTimer4 ch0 (OCXO1) and QTimer1 ch0 (OCXO2) use compare-and-reset
   for reciprocal frequency counting against DWT.
 • GPT2 runs on internal 24 MHz crystal for TimePop scheduling only.
   No external clock connection.  TimePop fires are converted to GNSS
@@ -444,10 +452,16 @@ Function: 10 MHz precision oven-controlled oscillator
 Power domain: Independent (dedicated INA260 on SMBUS2, 0x45)
 
 Connections:
-  10 MHz output  →  Teensy pin 13 (QTimer2 ch0 external clock) via STP
+  10 MHz output  →  Teensy pin 6 (QTimer4 ch0 external clock) via STP
   CTL input      →  Teensy pin 22 (PWM DAC output, 12-bit + dither)
   Power          →  Dedicated 5V domain
   GND            →  System ground
+
+Timer hardware:
+  QTimer4 ch0 counts the 10 MHz input directly.
+  NOTE: QTimer CM(2) counts BOTH edges — raw rate is 20 MHz.
+  COMP1 fires at OCXO-defined epochs for reciprocal counting.
+  DWT_CYCCNT captured in compare ISR for sub-nanosecond interpolation.
 
 Notes:
 • OCXO1 is intentionally free-running post-calibration as a local
@@ -456,8 +470,10 @@ Notes:
 • The servo loop runs in process_clocks.cpp with sub-ppb convergence.
 • DAC value is persisted across campaigns in SYSTEM config.
 • Shield drain is at the OCXO1 end (source-side grounding).
-• v12: Moved from GPT1 (pin 25) to QTimer2 ch0 (pin 13) for symmetric
-  QTimer architecture across all three clock domains.
+• v12: Moved from GPT1 (pin 25) to QTimer2 ch0 (pin 13).
+• v13: Moved from QTimer2 ch0 (pin 13) to QTimer4 ch0 (pin 6).
+  Pin 13 conflict with LED_BUILTIN caused solid amber when driven
+  by 10 MHz signal.  QTimer4 ch0 on pin 6 has no conflicts.
 =============================================================================*/
 
 /*=============================================================================
@@ -479,7 +495,6 @@ Connections:
 Timer hardware:
   QTimer1 ch0 counts the 10 MHz input directly.
   NOTE: QTimer CM(2) counts BOTH edges — raw rate is 20 MHz.
-  v12: Compare-and-reset mode replaces free-running cascade.
   COMP1 fires at OCXO-defined epochs for reciprocal counting.
   DWT_CYCCNT captured in compare ISR for sub-nanosecond interpolation.
   Cascade with ch1 no longer needed — ch1 is now available.
@@ -498,17 +513,17 @@ Notes:
 =============================================================================*/
 
 /*=============================================================================
- (11) CLOCK DOMAIN SUMMARY — v12 QTimer Architecture
+ (11) CLOCK DOMAIN SUMMARY — v13 QTimer Architecture
 -------------------------------------------------------------------------------
 
 ZPNet measures time using four clock domains, with three external 10 MHz
-clocks now unified on QTimer hardware:
+clocks unified on QTimer hardware:
 
 Domain     Source             Timer HW            Pin    Frequency    Resolution
 ---------------------------------------------------------------------------------
 DWT        ARM Cortex-M7      DWT_CYCCNT           —     1008 MHz     ~1 ns
 GNSS       GF-8802 VCLOCK     QTimer3 ch2          14    10 MHz       100 ns
-OCXO1      AOCJY1-A #1        QTimer2 ch0          13    10 MHz       100 ns
+OCXO1      AOCJY1-A #1        QTimer4 ch0          6     10 MHz       100 ns
 OCXO2      AOCJY1-A #2        QTimer1 ch0          10    10 MHz       100 ns
 
 All three QTimer counters free-run continuously from power-on.
@@ -518,15 +533,15 @@ DWT is captured first (~1 ns), then the three QTimer reads (~10 ns skew).
 The PPS edge from the GF-8802 (pin 1) is the synchronization event.
 At each PPS, the ISR reads:
   • DWT_CYCCNT       (ARM register, immediate)
-  • QTimer3 ch2 CNTR (GNSS 10 MHz ticks)
-  • QTimer2 ch0 CNTR (OCXO1 10 MHz ticks)
+  • GPT2_CNT         (GNSS 10 MHz ticks via GPT2 external clock)
+  • QTimer4 ch0 CNTR (OCXO1 10 MHz ticks — raw 20 MHz, divide by 2)
   • QTimer1 ch0 CNTR (OCXO2 10 MHz ticks — raw 20 MHz, divide by 2)
 
 These four values, captured within ~10 ns of each other, form the
 per-second clock tuple that anchors all TIMEBASE records.
 
 DWT-to-GNSS Calibration:
-  A continuous Welford tracker maintains dwt_cycles_per_gnss_second,
+  A continuous tracker maintains dwt_cycles_per_gnss_second,
   updated on every PPS edge regardless of campaign state.  This is the
   foundational calibration constant that enables:
     • TimePop scheduling in GNSS nanoseconds via DWT deadlines
@@ -536,10 +551,10 @@ DWT-to-GNSS Calibration:
 
 Reciprocal Frequency Counting:
   OCXO1 and OCXO2 use QTimer compare registers (COMP1) to fire ISRs
-  at OCXO-defined epochs (every 10,000,000 OCXO ticks).  At each
-  compare fire, DWT_CYCCNT is captured and compared to the predicted
-  DWT count derived from dwt_cycles_per_gnss_second.  The residual
-  is the true frequency offset measured at ~1 ns resolution, free of
+  at OCXO-defined epochs (every 10,000,000 OCXO ticks = 20,000,000
+  raw QTimer counts).  At each compare fire, DWT_CYCCNT is captured
+  and converted to GNSS nanoseconds via time.h.  The residual is
+  the true frequency offset measured at ~5 ns resolution, free of
   the ±100 ns phase quantization that PPS-anchored measurement suffers.
 
 GNSS is the deterministic reference: campaign_seconds × 1,000,000,000.

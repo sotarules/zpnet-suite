@@ -4,9 +4,13 @@
 // process_clocks_internal.h — Shared Internal State (Alpha ↔ Beta)
 // ============================================================================
 //
-// NOT for external consumption.  This header exposes the internal state
-// that process_clocks_alpha.cpp (always-on physics layer) shares with
-// process_clocks_beta.cpp (campaign layer).
+// v13: OCXO1 on GPT1 (pin 25, 10 MHz single-edge, 32-bit native).
+//      OCXO2 on QTimer1 ch0 (pin 10, 20 MHz dual-edge, 16-bit cascaded).
+//
+//      The measurement architecture is symmetric: both OCXOs use
+//      DWT capture at their respective epoch boundaries, converted
+//      to GNSS nanoseconds via time_dwt_to_gnss_ns().  The timer
+//      hardware differs but the measurement precision is identical.
 //
 // ============================================================================
 
@@ -18,7 +22,7 @@
 #include <math.h>
 
 // ============================================================================
-// DWT (CPU cycle counter — 1008 MHz internal)
+// DWT register defines (needed by both alpha and beta)
 // ============================================================================
 
 #define DEMCR               (*(volatile uint32_t *)0xE000EDFC)
@@ -75,7 +79,11 @@ extern volatile bool     isr_residual_valid;
 
 static constexpr uint32_t ISR_DWT_EXPECTED       = DWT_EXPECTED_PER_PPS;
 static constexpr uint32_t ISR_GNSS_EXPECTED      = TICKS_10MHZ_PER_SECOND;
-static constexpr uint32_t ISR_OCXO_EXPECTED      = TICKS_10MHZ_PER_SECOND;
+
+// OCXO1: GPT1 counts single-edge (10 MHz native)
+static constexpr uint32_t ISR_OCXO1_EXPECTED     = TICKS_10MHZ_PER_SECOND;
+
+// OCXO2: QTimer1 CM(2) counts both edges (20 MHz raw)
 static constexpr uint32_t OCXO2_EDGE_DIVISOR     = 2;
 static constexpr uint32_t ISR_OCXO2_RAW_EXPECTED = TICKS_10MHZ_PER_SECOND * OCXO2_EDGE_DIVISOR;
 
@@ -196,6 +204,9 @@ double prediction_stderr(const prediction_tracker_t& p);
 
 // ============================================================================
 // 64-bit accumulators (campaign-scoped)
+//
+// OCXO1: GPT1, 10 MHz single-edge, accumulates ticks directly.
+// OCXO2: QTimer1 CM(2), 20 MHz raw, accumulates raw then divides.
 // ============================================================================
 
 extern uint64_t dwt_cycles_64;

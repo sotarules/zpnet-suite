@@ -2,20 +2,9 @@
 // process_clocks_beta.cpp — Campaign Layer
 // ============================================================================
 //
-// Owns:
-//   • Campaign state machine (START / STOP / RECOVER)
-//   • Per-second delta accumulation (DWT, GNSS, OCXO1, OCXO2)
-//   • Prediction trackers (trend-aware linear extrapolation)
-//   • Welford residual tracking
-//   • OCXO calibration servo
-//   • TIMEBASE_FRAGMENT publishing
-//   • All command handlers (REPORT, CLOCKS_INFO, INTERP_TEST, INTERP_PROOF)
-//   • Process registration
-//   • Zeroing (clocks_zero_all)
-//
-// Entry point from alpha:
-//   clocks_beta_pps() is called once per PPS from the deferred callback
-//   in process_clocks_alpha.cpp, after the always-on work is done.
+// v13: OCXO1 on GPT1 (10 MHz single-edge, 32-bit native).
+//      OCXO2 on QTimer1 (20 MHz dual-edge, cascaded 32-bit).
+//      Asymmetric timer hardware, symmetric measurement via DWT + time.h.
 //
 // ============================================================================
 
@@ -164,6 +153,9 @@ double prediction_stderr(const prediction_tracker_t& p) {
 
 // ============================================================================
 // 64-bit accumulators — definitions
+//
+// OCXO1: GPT1 single-edge, accumulates 10 MHz ticks directly.
+// OCXO2: QTimer1 dual-edge, accumulates raw 20 MHz then divides.
 // ============================================================================
 
 uint64_t dwt_cycles_64     = 0;
@@ -338,6 +330,7 @@ void clocks_beta_pps(void) {
     const uint64_t pps_dwt_cycles = dwt_cycles_64;
     const uint64_t pps_dwt_ns     = dwt_cycles_to_ns(pps_dwt_cycles);
 
+    // OCXO1: GPT1 single-edge, 32-bit delta, accumulates ticks directly
     uint32_t ocxo1_delta = isr_snap_ocxo1 - prev_ocxo1_at_pps;
     ocxo1_ticks_64    += ocxo1_delta;
     prev_ocxo1_at_pps  = isr_snap_ocxo1;
@@ -345,6 +338,7 @@ void clocks_beta_pps(void) {
     const uint64_t pps_ocxo1_ticks = ocxo1_ticks_64;
     const uint64_t pps_ocxo1_ns    = pps_ocxo1_ticks * 100ull;
 
+    // OCXO2: QTimer1 dual-edge, 32-bit raw delta, accumulates raw then divides
     uint32_t ocxo2_raw_delta = isr_snap_ocxo2 - prev_ocxo2_at_pps;
     ocxo2_raw_64      += ocxo2_raw_delta;
     prev_ocxo2_at_pps  = isr_snap_ocxo2;
