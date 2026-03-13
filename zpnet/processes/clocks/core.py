@@ -826,9 +826,9 @@ def _build_clock_block(
     """
     Build a clock domain block for the campaign report.
 
-    For DWT, OCXO1, and OCXO2, the authoritative interpolation uncertainty
-    comes from the Teensy's prediction statistics.  For GNSS, tau
-    and ppb are trivially 1.0 and 0.0.
+    tau is cumulative (total clock ns / total GNSS ns).
+    ppb is instantaneous (per-second delta vs nominal).
+    Prediction stats from Teensy are authoritative.
 
     Args:
         ns_now: cumulative nanoseconds in this domain
@@ -839,10 +839,15 @@ def _build_clock_block(
     block: Dict[str, Any] = {
         "ns_now": int(ns_now),
         "tau": round(_compute_tau(int(ns_now), int(gnss_ns)), 12),
-        "ppb": round(_compute_ppb(int(ns_now), int(gnss_ns)), 3),
     }
 
+    # Instantaneous PPB from per-second raw deltas
     if domain == "dwt":
+        delta = frag.get("dwt_delta_raw")
+        if delta is not None:
+            block["ppb"] = round(((int(delta) - 1_008_000_000) / 1_008_000_000) * 1e9, 3)
+        else:
+            block["ppb"] = 0.0
         block["pred_residual"] = frag.get("dwt_pred_residual")
         block["pred_mean"] = frag.get("dwt_pred_mean")
         block["pred_stddev"] = frag.get("dwt_pred_stddev")
@@ -850,6 +855,11 @@ def _build_clock_block(
         block["delta_raw"] = frag.get("dwt_delta_raw")
         block["pps_residual"] = frag.get("dwt_pps_residual")
     elif domain == "ocxo1":
+        delta = frag.get("ocxo1_delta_raw")
+        if delta is not None:
+            block["ppb"] = round(((int(delta) - 10_000_000) / 10_000_000) * 1e9, 3)
+        else:
+            block["ppb"] = 0.0
         block["pred_residual"] = frag.get("ocxo1_pred_residual")
         block["pred_mean"] = frag.get("ocxo1_pred_mean")
         block["pred_stddev"] = frag.get("ocxo1_pred_stddev")
@@ -857,6 +867,13 @@ def _build_clock_block(
         block["delta_raw"] = frag.get("ocxo1_delta_raw")
         block["pps_residual"] = frag.get("ocxo1_pps_residual")
     elif domain == "ocxo2":
+        delta = frag.get("ocxo2_delta_raw")
+        if delta is not None:
+            # ocxo2_delta_raw is in 20 MHz space (QTimer both edges)
+            # Convert to 10 MHz equivalent for PPB calculation
+            block["ppb"] = round(((int(delta) - 20_000_000) / 20_000_000) * 1e9, 3)
+        else:
+            block["ppb"] = 0.0
         block["pred_residual"] = frag.get("ocxo2_pred_residual")
         block["pred_mean"] = frag.get("ocxo2_pred_mean")
         block["pred_stddev"] = frag.get("ocxo2_pred_stddev")
@@ -864,6 +881,7 @@ def _build_clock_block(
         block["delta_raw"] = frag.get("ocxo2_delta_raw")
         block["pps_residual"] = frag.get("ocxo2_pps_residual")
     elif domain == "gnss":
+        block["ppb"] = 0.0
         block["pps_residual"] = frag.get("gnss_pps_residual")
 
     return block

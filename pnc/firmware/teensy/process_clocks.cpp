@@ -1,5 +1,5 @@
 // ============================================================================
-// process_clocks.cpp — ZPNet CLOCKS (Teensy) — v11.1 Dual OCXO (QTimer edge fix)
+// process_clocks.cpp — ZPNet CLOCKS (Teensy) — v11.2 Dual OCXO (accumulator fix)
 // ============================================================================
 //
 // CLOCKS is a dormant, PPS-anchored measurement instrument.
@@ -55,6 +55,23 @@
 //
 //   The ±0.5 tick quantization from integer division is negligible:
 //   50 ns against a prediction stddev of ~100 ns.
+//
+// v11.2: OCXO2 accumulator truncation fix.
+//
+//   v11.1 divided each per-second raw delta by 2 and accumulated
+//   the quotient.  Integer truncation of odd deltas (loss of 0.5
+//   ticks per second) compounded monotonically, producing ~180 ppb
+//   of spurious cumulative drift in the OCXO2 nanosecond domain
+//   after hundreds of seconds — despite the per-second residuals
+//   being essentially zero.
+//
+//   Fix: accumulate the raw 20 MHz deltas in ocxo2_raw_64, then
+//   derive the 10 MHz tick total as ocxo2_raw_64 / 2 at the point
+//   of use.  Truncation errors cancel over even/odd seconds instead
+//   of compounding.  The per-second residual and prediction tracker
+//   still operate on per-second divided deltas (integer) to maintain
+//   the same Welford statistics semantics — the quantization noise
+//   there is white, not cumulative.
 //
 // v10.1: Prediction Welford initialization guard (unchanged).
 // v10:   Trend-aware prediction statistics (unchanged).
@@ -344,8 +361,22 @@ static uint32_t prev_dwt_at_pps     = 0;
 static uint64_t ocxo1_ticks_64      = 0;
 static uint32_t prev_ocxo1_at_pps   = 0;
 
-static uint64_t ocxo2_ticks_64      = 0;
+// ── OCXO2: accumulate in raw 20 MHz space, derive 10 MHz at query time ──
+//
+// v11.2 fix: accumulating per-second (raw_delta / 2) caused integer
+// truncation to compound monotonically (~50 ns/s worst case, ~180 ppb
+// after minutes).  Now we accumulate the raw 20 MHz deltas and divide
+// the running total by 2.  Truncation error is bounded to ±0.5 ticks
+// (±50 ns) regardless of campaign duration.
+//
+static uint64_t ocxo2_raw_64        = 0;   // accumulated raw 20 MHz counts
 static uint32_t prev_ocxo2_at_pps   = 0;
+
+// Derived 10 MHz ticks — always computed from ocxo2_raw_64.
+// This inline helper is the single point of truth for the conversion.
+static inline uint64_t ocxo2_ticks_64_get(void) {
+  return ocxo2_raw_64 / OCXO2_EDGE_DIVISOR;
+}
 
 // ============================================================================
 // Rolling 64-bit extensions for general use
@@ -467,12 +498,15 @@ uint64_t clocks_ocxo1_ns_now(void) {
 // producing ~20 MHz raw counts for a 10 MHz input.  All conversions
 // from raw QTimer counts to 10 MHz ticks divide by OCXO2_EDGE_DIVISOR.
 // ISR snapshots and isr_residual_ocxo2 remain in raw 20 MHz space.
+//
+// v11.2: Rolling accessor accumulates in raw 20 MHz space and derives
+// 10 MHz ticks by dividing the accumulated total.
 // ============================================================================
 
 static bool qtimer1_armed = false;
 
-static uint64_t ocxo2_rolling_64 = 0;
-static uint32_t ocxo2_rolling_32 = 0;
+static uint64_t ocxo2_rolling_raw_64 = 0;  // raw 20 MHz rolling accumulator
+static uint32_t ocxo2_rolling_32     = 0;
 
 static inline uint32_t qtimer1_read_32(void) {
   const uint16_t lo = IMXRT_TMR1.CH[0].CNTR;
@@ -526,9 +560,10 @@ static void arm_qtimer1_external(void) {
 
 uint64_t clocks_ocxo2_ticks_now(void) {
   uint32_t now = qtimer1_read_32();
-  ocxo2_rolling_64 += (uint32_t)(now - ocxo2_rolling_32) / OCXO2_EDGE_DIVISOR;
+  // Accumulate in raw 20 MHz space, derive 10 MHz by dividing total
+  ocxo2_rolling_raw_64 += (uint32_t)(now - ocxo2_rolling_32);
   ocxo2_rolling_32 = now;
-  return ocxo2_rolling_64;
+  return ocxo2_rolling_raw_64 / OCXO2_EDGE_DIVISOR;
 }
 
 uint64_t clocks_ocxo2_ns_now(void) {
@@ -549,7 +584,7 @@ static void clocks_zero_all(void) {
   ocxo1_ticks_64    = 0;
   prev_ocxo1_at_pps = isr_snap_ocxo1;
 
-  ocxo2_ticks_64    = 0;
+  ocxo2_raw_64      = 0;
   prev_ocxo2_at_pps = isr_snap_ocxo2;
 
   campaign_seconds  = 0;
@@ -557,7 +592,7 @@ static void clocks_zero_all(void) {
   dwt_rolling_64    = 0;  dwt_rolling_32    = DWT_CYCCNT;
   gnss_ticks_64     = 0;  gnss_last_32      = GPT2_CNT;
   ocxo1_rolling_64  = 0;  ocxo1_rolling_32  = GPT1_CNT;
-  ocxo2_rolling_64  = 0;  ocxo2_rolling_32  = qtimer1_read_32();
+  ocxo2_rolling_raw_64 = 0;  ocxo2_rolling_32  = qtimer1_read_32();
 
   residual_reset(residual_dwt);
   residual_reset(residual_gnss);
@@ -645,7 +680,11 @@ static void pps_asap_callback(timepop_ctx_t*, void*) {
     ocxo1_ticks_64    = recover_ocxo1_ns / 100ull;
     prev_ocxo1_at_pps = isr_snap_ocxo1;
 
-    ocxo2_ticks_64    = recover_ocxo2_ns / 100ull;
+    // v11.2: recover into raw 20 MHz space.
+    // The recovered ns corresponds to 10 MHz ticks; multiply by 2
+    // to seed the raw accumulator so that ocxo2_raw_64 / 2 yields
+    // the correct tick total.
+    ocxo2_raw_64      = (recover_ocxo2_ns / 100ull) * OCXO2_EDGE_DIVISOR;
     prev_ocxo2_at_pps = isr_snap_ocxo2;
 
     gnss_ticks_64 = recover_gnss_ns / 100ull;
@@ -655,7 +694,7 @@ static void pps_asap_callback(timepop_ctx_t*, void*) {
 
     dwt_rolling_64    = 0;  dwt_rolling_32    = DWT_CYCCNT;
     ocxo1_rolling_64  = 0;  ocxo1_rolling_32  = GPT1_CNT;
-    ocxo2_rolling_64  = 0;  ocxo2_rolling_32  = qtimer1_read_32();  // raw 20 MHz space
+    ocxo2_rolling_raw_64 = 0;  ocxo2_rolling_32  = qtimer1_read_32();
 
     residual_reset(residual_dwt);
     residual_reset(residual_gnss);
@@ -706,15 +745,19 @@ static void pps_asap_callback(timepop_ctx_t*, void*) {
     const uint64_t pps_ocxo1_ticks = ocxo1_ticks_64;
     const uint64_t pps_ocxo1_ns    = pps_ocxo1_ticks * 100ull;
 
-    // OCXO2: QTimer raw counts are 2x (both edges).  Divide to get
-    // 10 MHz ticks.  Raw value preserved for delta_raw diagnostic.
+    // OCXO2: accumulate raw 20 MHz delta, derive 10 MHz ticks from total.
+    // v11.2: no per-delta division — truncation cannot compound.
     uint32_t ocxo2_raw_delta = isr_snap_ocxo2 - prev_ocxo2_at_pps;
-    uint32_t ocxo2_delta     = ocxo2_raw_delta / OCXO2_EDGE_DIVISOR;
-    ocxo2_ticks_64    += ocxo2_delta;
+    ocxo2_raw_64      += ocxo2_raw_delta;
     prev_ocxo2_at_pps  = isr_snap_ocxo2;
 
-    const uint64_t pps_ocxo2_ticks = ocxo2_ticks_64;
+    const uint64_t pps_ocxo2_ticks = ocxo2_ticks_64_get();
     const uint64_t pps_ocxo2_ns    = pps_ocxo2_ticks * 100ull;
+
+    // Per-second divided delta for residual and prediction tracking.
+    // Integer division here introduces ±0.5 tick noise per sample,
+    // but this is white noise in Welford stats, not cumulative drift.
+    const uint32_t ocxo2_delta = ocxo2_raw_delta / OCXO2_EDGE_DIVISOR;
 
     const uint64_t pps_gnss_ticks = campaign_seconds * (uint64_t)ISR_GNSS_EXPECTED;
 
