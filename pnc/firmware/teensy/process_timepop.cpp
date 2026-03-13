@@ -1,5 +1,5 @@
 // ============================================================================
-// process_timepop.cpp — TimePop v2 (GPT2 Output Compare)
+// process_timepop.cpp — TimePop v3.1 (GPT2 Output Compare + time.h)
 // ============================================================================
 //
 // The time experience in ZPNet is the GNSS clock.
@@ -15,6 +15,21 @@
 //
 // No PIT.  No clock domains.  No drift correction.
 //
+// v3.1: Fixed INTERP_TEST Path 2 epoch mismatch.
+//
+//   time_gnss_ns_now() counts from first-PPS-after-boot.
+//   TIMEBASE fragment gnss_ns counts from campaign start.
+//   These are different epochs — comparing them directly produces
+//   a systematic offset equal to the boot-to-campaign-start gap.
+//
+//   Fix: Path 2 now captures time_gnss_ns_now() at arm time AND
+//   at callback dispatch time.  The delta is compared against the
+//   VCLOCK delta (GPT2 ticks * 100 ns).  This is a pure rate
+//   comparison with no epoch dependency.
+//
+// v3: TEST and INTERP_TEST commands use time_gnss_ns_now() from
+//     time.h instead of timebase_now_gnss_ns().  Campaign-independent.
+//
 // ============================================================================
 
 #include "timepop.h"
@@ -26,6 +41,7 @@
 #include "payload.h"
 #include "cpu_usage.h"
 #include "timebase.h"
+#include "time.h"
 
 #include <Arduino.h>
 #include "imxrt.h"
@@ -419,13 +435,17 @@ uint32_t timepop_active_count(void) {
 }
 
 // ============================================================================
-// TEST command
+// TEST command — validates TimePop delay accuracy via time.h
 // ============================================================================
+//
+// v3: Uses time_gnss_ns_now() instead of timebase_now_gnss_ns().
+//     Works without a running campaign — only needs PPS lock.
+//
 
 struct test_context_t {
-  int64_t  arm_gnss_ns;
-  uint64_t requested_ns;
-  uint32_t arm_frag_pps;
+  int64_t  arm_gnss_ns;       // time_gnss_ns_now() at arm
+  uint64_t requested_ns;      // requested delay
+  uint32_t arm_pps_count;     // time_pps_count() at arm
 };
 
 static test_context_t test_ctx = {};
@@ -436,8 +456,8 @@ static void test_timer_callback(timepop_ctx_t* ctx, void*) {
   // Capture GPT2 at callback entry (for dispatch latency measurement)
   uint32_t cb_gpt2 = GPT2_CNT;
 
-  int64_t end_gnss_ns = timebase_now_gnss_ns();
-  const timebase_fragment_t* end_frag = timebase_last_fragment();
+  // v3: Use time.h for GNSS nanosecond at callback entry
+  int64_t end_gnss_ns = time_gnss_ns_now();
 
   int64_t measured_ns = -1;
   if (test_ctx.arm_gnss_ns >= 0 && end_gnss_ns >= 0) {
@@ -452,15 +472,19 @@ static void test_timer_callback(timepop_ctx_t* ctx, void*) {
   // Dispatch latency: how long between ISR fire and callback entry
   int32_t dispatch_ns = (int32_t)(cb_gpt2 - ctx->fire_gpt2) * 100;
 
+  // PPS crossings during the delay
+  uint32_t end_pps = time_pps_count();
+
   Payload ev;
   ev.add("err",         error_ns);
   ev.add("meas",        measured_ns);
   ev.add("req",         test_ctx.requested_ns);
   ev.add("fire_ns",     ctx->fire_ns);       // OCR precision: ISR vs deadline
   ev.add("dispatch_ns", dispatch_ns);         // dispatch latency: callback vs ISR
-  ev.add("arm_pps",     test_ctx.arm_frag_pps);
-  ev.add("end_pps",     end_frag ? (uint32_t)end_frag->pps_count : (uint32_t)0);
-  ev.add("pps_x",       end_frag ? (int32_t)((uint32_t)end_frag->pps_count - test_ctx.arm_frag_pps) : -1);
+  ev.add("arm_pps",     test_ctx.arm_pps_count);
+  ev.add("end_pps",     end_pps);
+  ev.add("pps_x",       (int32_t)(end_pps - test_ctx.arm_pps_count));
+  ev.add("time_valid",  time_valid());
 
   enqueueEvent("TIMEPOP_TEST", ev);
 
@@ -487,13 +511,17 @@ static Payload cmd_test(const Payload& args) {
     return resp;
   }
 
-  int64_t arm_gnss = timebase_now_gnss_ns();
-  const timebase_fragment_t* arm_frag = timebase_last_fragment();
+  // v3: Use time.h instead of timebase
+  int64_t arm_gnss = time_gnss_ns_now();
+  if (arm_gnss < 0) {
+    resp.add("error", "time not valid (need PPS lock)");
+    return resp;
+  }
 
   test_ctx = {};
-  test_ctx.arm_gnss_ns  = arm_gnss;
-  test_ctx.requested_ns = ns_val;
-  test_ctx.arm_frag_pps = arm_frag ? arm_frag->pps_count : 0;
+  test_ctx.arm_gnss_ns   = arm_gnss;
+  test_ctx.requested_ns  = ns_val;
+  test_ctx.arm_pps_count = time_pps_count();
 
   timepop_handle_t h = timepop_arm(
     ns_val, false,
@@ -514,33 +542,27 @@ static Payload cmd_test(const Payload& args) {
 }
 
 // ============================================================================
-// INTERP_TEST — Pure math cross-check via TimePop
+// INTERP_TEST — Dual-path interpolation validation via TimePop
 // ============================================================================
 //
-// The GNSS time at the OCR compare moment is known exactly:
+// Path 1 (math round-trip, requires campaign):
 //
-//   vclock_ns_into_second = (deadline - gpt2_at_pps) × 100
-//   vclock_gnss_ns        = frag_gnss_ns + vclock_ns_into_second
+//   VCLOCK truth → synthesized DWT → timebase_gnss_ns_from_dwt()
+//   Validates the interpolation MATH with zero real-world noise.
+//   Round-trip error should be exactly 0 ns.
 //
-// From this known GNSS time, we synthesize the DWT cycle count that
-// timebase SHOULD produce at that moment:
+// Path 2 (time.h rate accuracy, campaign-independent):
 //
-//   synth_dwt = frag_dwt_cyccnt_at_pps +
-//               vclock_ns_into_second × dwt_cycles_per_pps / 1,000,000,000
+//   Captures time_gnss_ns_now() at arm time and at callback dispatch
+//   time.  The delta is compared against the VCLOCK delta (GPT2 ticks
+//   between arm and fire, multiplied by 100 ns/tick).
 //
-// Then we feed that synthesized DWT value back through
-// timebase_gnss_ns_from_dwt() and compare the result to the known
-// GNSS time.  The difference is purely the interpolation math error —
-// integer truncation, rounding, rate mismatch.  No ISR latency.
-// No DWT capture.  No correction constants.  Just math vs math.
+//   This is a pure rate comparison — no epoch dependency.  The error
+//   reflects real DWT interpolation accuracy plus dispatch latency.
 //
-// If the result is not zero (or very near zero), the interpolation
-// is broken.
-//
-// The forward synthesis (GNSS ns → DWT cycles) uses round-to-nearest.
-// The reverse path (timebase_gnss_ns_from_dwt) also uses round-to-nearest.
-// With symmetric rounding in both directions, the round-trip error is 0
-// for all positions within the second.
+// v3.1: Path 2 fixed.  Previous version compared time_gnss_ns_now()
+//   (boot-relative) against frag_gnss_ns + offset (campaign-relative),
+//   producing a systematic offset equal to the boot-to-campaign gap.
 //
 // ============================================================================
 
@@ -548,13 +570,24 @@ struct interp_test_ctx_t {
   uint32_t tests_remaining;
   uint64_t delay_ns;
 
-  // Welford accumulators
+  // Path 2 arm-time captures (for delta comparison)
+  int64_t  arm_time_ns;       // time_gnss_ns_now() at arm
+  uint32_t arm_gpt2;          // GPT2_CNT at arm
+
+  // Path 1: math round-trip (Welford)
   int64_t  w_n;
   double   w_mean;
   double   w_m2;
   int64_t  err_min;
   int64_t  err_max;
   int32_t  outside_100ns;
+
+  // Path 2: time.h rate accuracy (Welford)
+  int64_t  t_n;
+  double   t_mean;
+  double   t_m2;
+  int64_t  t_err_min;
+  int64_t  t_err_max;
 };
 
 static interp_test_ctx_t itest_ctx = {};
@@ -563,6 +596,12 @@ static volatile bool     itest_in_flight = false;
 static void interp_test_callback(timepop_ctx_t* ctx, void*);
 
 static void interp_test_arm_next(void) {
+  // Capture arm-time references for Path 2 delta comparison.
+  // These are taken at the moment the timer is armed, so the
+  // delta between arm and fire reflects the actual elapsed time.
+  itest_ctx.arm_time_ns = time_gnss_ns_now();
+  itest_ctx.arm_gpt2    = GPT2_CNT;
+
   timepop_handle_t h = timepop_arm(
     itest_ctx.delay_ns, false,
     interp_test_callback, nullptr, "itest"
@@ -574,61 +613,88 @@ static void interp_test_arm_next(void) {
 
 static void interp_test_callback(timepop_ctx_t* ctx, void*) {
 
-  if (!ctx->frag_valid || ctx->frag_dwt_cycles_per_pps == 0) {
-    if (itest_ctx.tests_remaining > 0) {
-      interp_test_arm_next();
-    } else {
-      itest_in_flight = false;
-    }
-    return;
+  // ── Path 1: math round-trip (requires campaign fragment) ──
+
+  bool path1_valid = false;
+  int64_t path1_error_ns = 0;
+  uint64_t vclock_ns_into_second = 0;
+
+  if (ctx->frag_valid && ctx->frag_dwt_cycles_per_pps > 0) {
+    const uint32_t gpt2_since_pps = ctx->deadline - ctx->frag_gpt2_at_pps;
+    vclock_ns_into_second = (uint64_t)gpt2_since_pps * 100ULL;
+    const int64_t vclock_gnss_ns = (int64_t)(ctx->frag_gnss_ns + vclock_ns_into_second);
+
+    // Synthesize DWT cycle count at the deadline moment (round-to-nearest)
+    const uint32_t synth_dwt_elapsed =
+      (uint32_t)((vclock_ns_into_second * (uint64_t)ctx->frag_dwt_cycles_per_pps + 500000000ULL) / 1000000000ULL);
+    const uint32_t synth_dwt = ctx->frag_dwt_cyccnt_at_pps + synth_dwt_elapsed;
+
+    // Forward interpolation: DWT cycles → GNSS nanoseconds
+    const int64_t interp_gnss_ns = timebase_gnss_ns_from_dwt(
+      synth_dwt,
+      ctx->frag_gnss_ns,
+      ctx->frag_dwt_cyccnt_at_pps,
+      ctx->frag_dwt_cycles_per_pps
+    );
+
+    path1_error_ns = (interp_gnss_ns >= 0)
+      ? interp_gnss_ns - vclock_gnss_ns
+      : 0;
+    path1_valid = true;
   }
 
-  // ── GNSS truth from deadline (exact, 100 ns quantized) ──
-  const uint32_t gpt2_since_pps = ctx->deadline - ctx->frag_gpt2_at_pps;
-  const uint64_t vclock_ns_into_second = (uint64_t)gpt2_since_pps * 100ULL;
-  const int64_t  vclock_gnss_ns = (int64_t)(ctx->frag_gnss_ns + vclock_ns_into_second);
-
-  // ── Synthesize DWT cycle count at the deadline moment ──
+  // ── Path 2: time.h rate accuracy (epoch-independent) ──
   //
-  // Reverse interpolation: GNSS nanoseconds → DWT cycles.
+  // Compare elapsed time as measured by time.h vs VCLOCK.
   //
-  // Round-to-nearest in BOTH directions eliminates the systematic
-  // -1 ns bias.  The forward path (here) rounds ns→cycles, and
-  // the reverse path (timebase_gnss_ns_from_dwt) rounds cycles→ns.
-  // With symmetric rounding the round-trip error is 0 for all
-  // positions within the second.
+  //   time_delta  = time_gnss_ns_now()  -  arm_time_ns
+  //   vclock_delta = (GPT2_CNT - arm_gpt2) * 100
+  //   error = time_delta - vclock_delta
   //
-  // Overflow safety: max product ≈ 1e9 × 1.008e9 ≈ 1.008e18,
-  // plus 500M ≈ 1.008e18 — well within uint64 (max ~1.8e19).
-  //
-  const uint32_t synth_dwt_elapsed =
-    (uint32_t)((vclock_ns_into_second * (uint64_t)ctx->frag_dwt_cycles_per_pps + 500000000ULL) / 1000000000ULL);
-  const uint32_t synth_dwt = ctx->frag_dwt_cyccnt_at_pps + synth_dwt_elapsed;
+  // Both deltas measure the same physical interval.  The difference
+  // is the DWT interpolation error accumulated over the delay.
 
-  // ── Forward interpolation: DWT cycles → GNSS nanoseconds ──
-  const int64_t interp_gnss_ns = timebase_gnss_ns_from_dwt(
-    synth_dwt,
-    ctx->frag_gnss_ns,
-    ctx->frag_dwt_cyccnt_at_pps,
-    ctx->frag_dwt_cycles_per_pps
-  );
+  bool path2_valid = false;
+  int64_t path2_error_ns = 0;
 
-  // ── Error: round-trip residual ──
-  const int64_t error_ns = (interp_gnss_ns >= 0)
-    ? interp_gnss_ns - vclock_gnss_ns
-    : 0;
+  {
+    const int64_t fire_time_ns = time_gnss_ns_now();
+    const uint32_t fire_gpt2   = GPT2_CNT;
 
-  // ── Welford update ──
-  itest_ctx.w_n++;
-  const double x  = (double)error_ns;
-  const double d1 = x - itest_ctx.w_mean;
-  itest_ctx.w_mean += d1 / (double)itest_ctx.w_n;
-  const double d2 = x - itest_ctx.w_mean;
-  itest_ctx.w_m2 += d1 * d2;
+    if (itest_ctx.arm_time_ns >= 0 && fire_time_ns >= 0) {
+      const int64_t time_delta_ns   = fire_time_ns - itest_ctx.arm_time_ns;
+      const int64_t vclock_delta_ns = (int64_t)((uint32_t)(fire_gpt2 - itest_ctx.arm_gpt2)) * 100LL;
+      path2_error_ns = time_delta_ns - vclock_delta_ns;
+      path2_valid = true;
+    }
+  }
 
-  if (error_ns < itest_ctx.err_min) itest_ctx.err_min = error_ns;
-  if (error_ns > itest_ctx.err_max) itest_ctx.err_max = error_ns;
-  if (error_ns > 100 || error_ns < -100) itest_ctx.outside_100ns++;
+  // ── Path 1: Welford update ──
+  if (path1_valid) {
+    itest_ctx.w_n++;
+    const double x  = (double)path1_error_ns;
+    const double d1 = x - itest_ctx.w_mean;
+    itest_ctx.w_mean += d1 / (double)itest_ctx.w_n;
+    const double d2 = x - itest_ctx.w_mean;
+    itest_ctx.w_m2 += d1 * d2;
+
+    if (path1_error_ns < itest_ctx.err_min) itest_ctx.err_min = path1_error_ns;
+    if (path1_error_ns > itest_ctx.err_max) itest_ctx.err_max = path1_error_ns;
+    if (path1_error_ns > 100 || path1_error_ns < -100) itest_ctx.outside_100ns++;
+  }
+
+  // ── Path 2: Welford update ──
+  if (path2_valid) {
+    itest_ctx.t_n++;
+    const double x  = (double)path2_error_ns;
+    const double d1 = x - itest_ctx.t_mean;
+    itest_ctx.t_mean += d1 / (double)itest_ctx.t_n;
+    const double d2 = x - itest_ctx.t_mean;
+    itest_ctx.t_m2 += d1 * d2;
+
+    if (path2_error_ns < itest_ctx.t_err_min) itest_ctx.t_err_min = path2_error_ns;
+    if (path2_error_ns > itest_ctx.t_err_max) itest_ctx.t_err_max = path2_error_ns;
+  }
 
   // ── Arm next or emit results ──
   itest_ctx.tests_remaining--;
@@ -644,22 +710,35 @@ static void interp_test_callback(timepop_ctx_t* ctx, void*) {
   const double w_stderr = (itest_ctx.w_n >= 2)
     ? w_stddev / sqrt((double)itest_ctx.w_n) : 0.0;
 
+  const double t_stddev = (itest_ctx.t_n >= 2)
+    ? sqrt(itest_ctx.t_m2 / (double)(itest_ctx.t_n - 1)) : 0.0;
+  const double t_stderr = (itest_ctx.t_n >= 2)
+    ? t_stddev / sqrt((double)itest_ctx.t_n) : 0.0;
+
   Payload ev;
 
-  ev.add("samples",         (int32_t)itest_ctx.w_n);
-  ev.add("error_mean_ns",   itest_ctx.w_mean);
-  ev.add("error_stddev_ns", w_stddev);
-  ev.add("error_stderr_ns", w_stderr);
-  ev.add("error_min_ns",    itest_ctx.err_min);
-  ev.add("error_max_ns",    itest_ctx.err_max);
-  ev.add("outside_100ns",   itest_ctx.outside_100ns);
+  // Path 1: math round-trip
+  ev.add("m_n",    (int32_t)itest_ctx.w_n);
+  ev.add("m_mean", itest_ctx.w_mean);
+  ev.add("m_sd",   w_stddev);
+  ev.add("m_se",   w_stderr);
+  ev.add("m_min",  (itest_ctx.w_n > 0) ? itest_ctx.err_min : (int64_t)0);
+  ev.add("m_max",  (itest_ctx.w_n > 0) ? itest_ctx.err_max : (int64_t)0);
+  ev.add("m_out",  itest_ctx.outside_100ns);
+
+  // Path 2: time.h rate accuracy
+  ev.add("t_n",    (int32_t)itest_ctx.t_n);
+  ev.add("t_mean", itest_ctx.t_mean);
+  ev.add("t_sd",   t_stddev);
+  ev.add("t_se",   t_stderr);
+  ev.add("t_min",  (itest_ctx.t_n > 0) ? itest_ctx.t_err_min : (int64_t)0);
+  ev.add("t_max",  (itest_ctx.t_n > 0) ? itest_ctx.t_err_max : (int64_t)0);
 
   // Forensics (last sample only)
-  ev.add("s0_error_ns",              error_ns);
-  ev.add("s0_synth_dwt_elapsed",     synth_dwt_elapsed);
-  ev.add("s0_vclock_ns_into_second", vclock_ns_into_second);
-  ev.add("s0_position",              (double)vclock_ns_into_second / 1000000000.0);
-  ev.add("s0_fire_ns",               ctx->fire_ns);
+  ev.add("s0_p1",  path1_error_ns);
+  ev.add("s0_p2",  path2_error_ns);
+  ev.add("s0_pos", (double)vclock_ns_into_second / 1000000000.0);
+  ev.add("s0_fns", ctx->fire_ns);
 
   enqueueEvent("TIMEPOP_INTERP_TEST", ev);
 
@@ -675,6 +754,13 @@ static Payload cmd_interp_test(const Payload& args) {
     return resp;
   }
 
+  // time.h must be valid (PPS lock) for path 2.
+  // Path 1 additionally requires a campaign for fragment data.
+  if (!time_valid()) {
+    resp.add("error", "time not valid (need PPS lock)");
+    return resp;
+  }
+
   const uint64_t delay_ns = args.getUInt64("delay_ns", 200000000ULL);
   const int32_t count_raw = args.getInt("count", 10);
   const int32_t count = (count_raw < 1) ? 1 : (count_raw > 100) ? 100 : count_raw;
@@ -684,6 +770,8 @@ static Payload cmd_interp_test(const Payload& args) {
   itest_ctx.delay_ns        = delay_ns;
   itest_ctx.err_min         = INT64_MAX;
   itest_ctx.err_max         = INT64_MIN;
+  itest_ctx.t_err_min       = INT64_MAX;
+  itest_ctx.t_err_max       = INT64_MIN;
 
   itest_in_flight = true;
 
@@ -707,6 +795,8 @@ static Payload cmd_report(const Payload&) {
   out.add("expired",        expired_count);
   out.add("gpt2_cnt",       gpt2_count());
   out.add("test_in_flight", test_in_flight);
+  out.add("time_valid",     time_valid());
+  out.add("time_pps_count", time_pps_count());
 
   PayloadArray timers;
 

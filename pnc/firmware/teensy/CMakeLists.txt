@@ -79,6 +79,7 @@ set(ZPNET_SOURCES
     transport.cpp
     util.cpp
     teensy.ino
+    time.cpp
 )
 
 set(ZPNET_HEADERS
@@ -104,6 +105,7 @@ set(ZPNET_HEADERS
     transport.h
     util.h
     zpnet_pins.h
+    time.h
 )
 
 # -------------------------------------------------------------

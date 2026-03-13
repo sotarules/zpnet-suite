@@ -144,6 +144,7 @@
 
 #include "debug.h"
 #include "timebase.h"
+#include "time.h"
 #include "process_clocks.h"
 #include "process_timepop.h"
 
@@ -799,6 +800,12 @@ static void pps_asap_callback(timepop_ctx_t*, void*) {
     g_dwt_cal_has_prev = true;
     g_dwt_cal_pps_count++;
   }
+
+  // ── Universal GNSS time anchor (campaign-independent) ──
+  time_pps_update(
+    isr_snap_dwt - ISR_ENTRY_DWT_CYCLES,
+    g_dwt_cal_valid ? g_dwt_cycles_per_gnss_s : 0
+  );
 
   if (relay_arm_pending) {
     relay_arm_pending = false;
@@ -1563,6 +1570,7 @@ void process_clocks_init_hardware(void) {
 
 void process_clocks_init(void) {
 
+  time_init();
   timebase_init();
 
   analogWriteResolution(12);
