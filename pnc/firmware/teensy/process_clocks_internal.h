@@ -4,13 +4,20 @@
 // process_clocks_internal.h — Shared Internal State (Alpha ↔ Beta)
 // ============================================================================
 //
-// v13: OCXO1 on GPT1 (pin 25, 10 MHz single-edge, 32-bit native).
-//      OCXO2 on QTimer1 ch0 (pin 10, 20 MHz dual-edge, 16-bit cascaded).
+// v14: Symmetric GPT architecture for both OCXOs.
 //
-//      The measurement architecture is symmetric: both OCXOs use
-//      DWT capture at their respective epoch boundaries, converted
-//      to GNSS nanoseconds via time_dwt_to_gnss_ns().  The timer
-//      hardware differs but the measurement precision is identical.
+//   OCXO1 on GPT1  (pin 25, 10 MHz single-edge, 32-bit native).
+//   OCXO2 on GPT2  (pin 14, 10 MHz single-edge, 32-bit native).
+//   GNSS  on QTimer1 ch0+ch1 (pin 10, 20 MHz dual-edge, cascaded 32-bit).
+//
+//   Both OCXOs now have clean single-edge counting — no dual-edge
+//   phase aliasing artifact.  GNSS VCLOCK moves to QTimer1 where
+//   the dual-edge alternation is harmless: GNSS authority comes
+//   from PPS count, not VCLOCK precision.  VCLOCK serves only as
+//   a PPS sanity check.
+//
+//   GPT2 is no longer available for TimePop internal scheduling.
+//   TimePop uses DWT-based deadline conversion (already implemented).
 //
 // ============================================================================
 
@@ -77,15 +84,15 @@ extern volatile bool     isr_residual_valid;
 // ISR constants
 // ============================================================================
 
-static constexpr uint32_t ISR_DWT_EXPECTED       = DWT_EXPECTED_PER_PPS;
-static constexpr uint32_t ISR_GNSS_EXPECTED      = TICKS_10MHZ_PER_SECOND;
+static constexpr uint32_t ISR_DWT_EXPECTED  = DWT_EXPECTED_PER_PPS;
 
-// OCXO1: GPT1 counts single-edge (10 MHz native)
-static constexpr uint32_t ISR_OCXO1_EXPECTED     = TICKS_10MHZ_PER_SECOND;
+// GNSS: QTimer1 CM(2) counts both edges — 20 MHz raw expected
+static constexpr uint32_t GNSS_EDGE_DIVISOR     = 2;
+static constexpr uint32_t ISR_GNSS_RAW_EXPECTED = TICKS_10MHZ_PER_SECOND * GNSS_EDGE_DIVISOR;
 
-// OCXO2: QTimer1 CM(2) counts both edges (20 MHz raw)
-static constexpr uint32_t OCXO2_EDGE_DIVISOR     = 2;
-static constexpr uint32_t ISR_OCXO2_RAW_EXPECTED = TICKS_10MHZ_PER_SECOND * OCXO2_EDGE_DIVISOR;
+// Both OCXOs: GPT single-edge — 10 MHz expected
+static constexpr uint32_t ISR_OCXO1_EXPECTED = TICKS_10MHZ_PER_SECOND;
+static constexpr uint32_t ISR_OCXO2_EXPECTED = TICKS_10MHZ_PER_SECOND;
 
 // ============================================================================
 // PPS diagnostics (alpha-owned, beta-readable)
@@ -205,8 +212,8 @@ double prediction_stderr(const prediction_tracker_t& p);
 // ============================================================================
 // 64-bit accumulators (campaign-scoped)
 //
-// OCXO1: GPT1, 10 MHz single-edge, accumulates ticks directly.
-// OCXO2: QTimer1 CM(2), 20 MHz raw, accumulates raw then divides.
+// Both OCXOs: GPT single-edge, accumulate 10 MHz ticks directly.
+// GNSS: QTimer1 dual-edge, accumulates raw 20 MHz then divides.
 // ============================================================================
 
 extern uint64_t dwt_cycles_64;
@@ -215,11 +222,14 @@ extern uint32_t prev_dwt_at_pps;
 extern uint64_t ocxo1_ticks_64;
 extern uint32_t prev_ocxo1_at_pps;
 
-extern uint64_t ocxo2_raw_64;
+extern uint64_t ocxo2_ticks_64;
 extern uint32_t prev_ocxo2_at_pps;
 
-inline uint64_t ocxo2_ticks_64_get(void) {
-  return ocxo2_raw_64 / OCXO2_EDGE_DIVISOR;
+extern uint64_t gnss_raw_64;
+extern uint32_t prev_gnss_at_pps;
+
+inline uint64_t gnss_ticks_64_get(void) {
+  return gnss_raw_64 / GNSS_EDGE_DIVISOR;
 }
 
 // ============================================================================
@@ -229,17 +239,17 @@ inline uint64_t ocxo2_ticks_64_get(void) {
 extern uint64_t dwt_rolling_64;
 extern uint32_t dwt_rolling_32;
 
-extern uint64_t gnss_ticks_64;
-extern uint32_t gnss_last_32;
+extern uint64_t gnss_rolling_raw_64;
+extern uint32_t gnss_rolling_32;
 
 extern uint64_t ocxo1_rolling_64;
 extern uint32_t ocxo1_rolling_32;
 
-extern uint64_t ocxo2_rolling_raw_64;
+extern uint64_t ocxo2_rolling_64;
 extern uint32_t ocxo2_rolling_32;
 
 // ============================================================================
-// QTimer1 read helper (alpha-owned hardware)
+// QTimer1 read helper (alpha-owned hardware, used for GNSS)
 // ============================================================================
 
 uint32_t qtimer1_read_32(void);

@@ -2,20 +2,20 @@
 // process_clocks_alpha.cpp — Always-On Physics Layer
 // ============================================================================
 //
-// v13: Asymmetric timer hardware, symmetric measurement.
+// v14: Symmetric GPT architecture for both OCXOs.
 //
-//   OCXO1 on GPT1 (pin 25, 10 MHz single-edge, 32-bit native).
-//   OCXO2 on QTimer1 ch0+ch1 (pin 10, 20 MHz dual-edge, cascaded 32-bit).
+//   OCXO1 on GPT1  (pin 25, GPIO_AD_B0_13, ALT1, 10 MHz single-edge).
+//   OCXO2 on GPT2  (pin 14, GPIO_AD_B1_02, ALT8, 10 MHz single-edge).
+//   GNSS  on QTimer1 ch0+ch1 (pin 10, GPIO_B0_00, ALT1, 20 MHz dual-edge).
 //
-//   QTimer2/4 cannot be used for OCXO1 because:
-//     - QTimer2 ch0 = pin 13 = LED_BUILTIN (conflict)
-//     - QTimer2 ch1-3: no accessible pins on Teensy 4.1
-//     - QTimer4: all channels route through XBAR, no direct pin access
+//   Both OCXOs have clean, deterministic single-edge counting.
+//   GNSS VCLOCK on QTimer1 serves as a PPS sanity check only.
+//   The dual-edge alternation on GNSS is harmless — GNSS time
+//   authority derives from PPS count, not VCLOCK tick precision.
 //
-//   GPT1 is 32-bit native with direct external clock input on pin 25.
-//   The measurement architecture is symmetric: both OCXOs use DWT
-//   capture at their respective epoch boundaries, converted to GNSS
-//   nanoseconds via time_dwt_to_gnss_ns().
+//   GPT2 no longer runs on internal 24 MHz — it now counts OCXO2
+//   externally.  TimePop scheduling uses DWT-based deadline
+//   conversion (unchanged from v13).
 //
 // ============================================================================
 
@@ -160,38 +160,80 @@ uint64_t clocks_dwt_ns_now(void) {
 }
 
 // ============================================================================
-// GNSS VCLOCK (10 MHz external via GPT2)
+// GNSS VCLOCK (10 MHz external via QTimer1 ch0+ch1 — cascaded 32-bit)
+//
+// Pin 10 = GPIO_B0_00, IOMUXC ALT1 = QTIMER1_TIMER0
+//
+// QTimer CM(2) counts both rising and falling edges, producing
+// ~20 MHz raw counts for a 10 MHz input.  The dual-edge alternation
+// is harmless for GNSS — time authority comes from PPS count.
+// VCLOCK serves only as a PPS sanity check.
+//
+// ch0+ch1 cascade for 32-bit range.
+//
+// IMPORTANT: Do NOT touch channels 2 and 3 — pin 11 (OCXO2 CTL) uses
+// FlexPWM1 submodule 2, which shares the QTimer1 module.
 // ============================================================================
 
-uint64_t gnss_ticks_64 = 0;
-uint32_t gnss_last_32  = 0;
-static bool gpt2_armed = false;
+static bool qtimer1_armed = false;
 
-static inline void enable_gpt2(void) {
-  CCM_CCGR0 |= CCM_CCGR0_GPT2_BUS(CCM_CCGR_ON);
+uint64_t gnss_rolling_raw_64 = 0;
+uint32_t gnss_rolling_32     = 0;
+
+uint32_t qtimer1_read_32(void) {
+  const uint16_t lo = IMXRT_TMR1.CH[0].CNTR;
+  const uint16_t hi = IMXRT_TMR1.CH[1].CNTR;
+  return ((uint32_t)hi << 16) | (uint32_t)lo;
 }
 
-static void arm_gpt2_external(void) {
-  if (gpt2_armed) return;
-  enable_gpt2();
-  IOMUXC_SW_MUX_CTL_PAD_GPIO_AD_B1_02 = 8;
-  IOMUXC_SW_PAD_CTL_PAD_GPIO_AD_B1_02 =
+static void arm_qtimer1_external(void) {
+  if (qtimer1_armed) return;
+
+  CCM_CCGR6 |= CCM_CCGR6_QTIMER1(CCM_CCGR_ON);
+
+  // Pin 10 = GPIO_B0_00, ALT1 = QTIMER1_TIMER0
+  IOMUXC_SW_MUX_CTL_PAD_GPIO_B0_00 = 1;
+  IOMUXC_SW_PAD_CTL_PAD_GPIO_B0_00 =
       IOMUXC_PAD_HYS | IOMUXC_PAD_PKE | IOMUXC_PAD_PUE | IOMUXC_PAD_DSE(4);
-  IOMUXC_GPT2_IPP_IND_CLKIN_SELECT_INPUT = 1;
-  GPT2_CR = 0;
-  GPT2_SR = 0x3F;
-  GPT2_PR = 0;
-  GPT2_CR = GPT_CR_CLKSRC(3) | GPT_CR_FRR;
-  GPT2_CR |= GPT_CR_EN;
-  gnss_last_32 = GPT2_CNT;
-  gpt2_armed   = true;
+
+  // Only touch channels 0 and 1 (our cascade pair).
+  // Do NOT touch channels 2 and 3 — pin 11 (OCXO2 CTL) uses
+  // FlexPWM1 submodule 2, which shares the QTimer1 module.
+  IMXRT_TMR1.CH[0].CTRL = 0;
+  IMXRT_TMR1.CH[1].CTRL = 0;
+
+  IMXRT_TMR1.CH[0].CNTR = 0;
+  IMXRT_TMR1.CH[1].CNTR = 0;
+
+  IMXRT_TMR1.CH[0].SCTRL  = 0;
+  IMXRT_TMR1.CH[0].CSCTRL = 0;
+  IMXRT_TMR1.CH[1].SCTRL  = 0;
+  IMXRT_TMR1.CH[1].CSCTRL = 0;
+
+  IMXRT_TMR1.CH[0].LOAD = 0;
+  IMXRT_TMR1.CH[1].LOAD = 0;
+
+  IMXRT_TMR1.CH[0].COMP1 = 0xFFFF;
+  IMXRT_TMR1.CH[1].COMP1 = 0xFFFF;
+  IMXRT_TMR1.CH[0].CMPLD1 = 0xFFFF;
+  IMXRT_TMR1.CH[1].CMPLD1 = 0xFFFF;
+
+  // ch0: count edges of external pin (CM=2, PCS=0)
+  // NOTE: CM(2) counts BOTH edges — raw rate is 2x input frequency
+  IMXRT_TMR1.CH[0].CTRL = TMR_CTRL_CM(2) | TMR_CTRL_PCS(0);
+
+  // ch1: cascade from ch0 overflow (CM=7)
+  IMXRT_TMR1.CH[1].CTRL = TMR_CTRL_CM(7);
+
+  gnss_rolling_32 = qtimer1_read_32();
+  qtimer1_armed   = true;
 }
 
 uint64_t clocks_gnss_ticks_now(void) {
-  uint32_t now = GPT2_CNT;
-  gnss_ticks_64 += (uint32_t)(now - gnss_last_32);
-  gnss_last_32 = now;
-  return gnss_ticks_64;
+  uint32_t now = qtimer1_read_32();
+  gnss_rolling_raw_64 += (uint32_t)(now - gnss_rolling_32);
+  gnss_rolling_32 = now;
+  return gnss_rolling_raw_64 / GNSS_EDGE_DIVISOR;
 }
 
 uint64_t clocks_gnss_ns_now(void) {
@@ -241,74 +283,46 @@ uint64_t clocks_ocxo1_ns_now(void) {
 }
 
 // ============================================================================
-// OCXO2 (10 MHz external via QTimer1 ch0+ch1 — cascaded 32-bit)
+// OCXO2 (10 MHz external via GPT2 — pin 14)
 //
-// QTimer CM(2) counts both rising and falling edges (20 MHz raw).
-// ch0+ch1 cascade for 32-bit range.
+// GPT2 counts single edges at 10 MHz.  32-bit native, no cascade.
+// Pin 14 = GPIO_AD_B1_02, IOMUX ALT8 = GPT2_CLK.
 //
-// IMPORTANT: Do NOT touch channels 2 and 3 — pin 11 (OCXO2 CTL) uses
-// FlexPWM1 submodule 2, which shares the QTimer1 module.
+// This is the same pin and IOMUX configuration that previously
+// counted GNSS VCLOCK.  The only change is what signal is wired
+// to the pin.
 // ============================================================================
 
-static bool qtimer1_armed = false;
+static bool gpt2_armed = false;
 
-uint64_t ocxo2_rolling_raw_64 = 0;
-uint32_t ocxo2_rolling_32     = 0;
-
-uint32_t qtimer1_read_32(void) {
-  const uint16_t lo = IMXRT_TMR1.CH[0].CNTR;
-  const uint16_t hi = IMXRT_TMR1.CH[1].CNTR;
-  return ((uint32_t)hi << 16) | (uint32_t)lo;
+static inline void enable_gpt2(void) {
+  CCM_CCGR0 |= CCM_CCGR0_GPT2_BUS(CCM_CCGR_ON);
 }
 
-static void arm_qtimer1_external(void) {
-  if (qtimer1_armed) return;
+uint64_t ocxo2_rolling_64 = 0;
+uint32_t ocxo2_rolling_32 = 0;
 
-  CCM_CCGR6 |= CCM_CCGR6_QTIMER1(CCM_CCGR_ON);
-
-  // Pin 10 = GPIO_B0_00, ALT1 = QTIMER1_TIMER0
-  IOMUXC_SW_MUX_CTL_PAD_GPIO_B0_00 = 1;
-  IOMUXC_SW_PAD_CTL_PAD_GPIO_B0_00 =
+static void arm_gpt2_external(void) {
+  if (gpt2_armed) return;
+  enable_gpt2();
+  IOMUXC_SW_MUX_CTL_PAD_GPIO_AD_B1_02 = 8;
+  IOMUXC_SW_PAD_CTL_PAD_GPIO_AD_B1_02 =
       IOMUXC_PAD_HYS | IOMUXC_PAD_PKE | IOMUXC_PAD_PUE | IOMUXC_PAD_DSE(4);
-
-  // Only touch channels 0 and 1 (our cascade pair).
-  // Do NOT touch channels 2 and 3 — pin 11 (OCXO2 CTL) uses
-  // FlexPWM1 submodule 2, which shares the QTimer1 module.
-  IMXRT_TMR1.CH[0].CTRL = 0;
-  IMXRT_TMR1.CH[1].CTRL = 0;
-
-  IMXRT_TMR1.CH[0].CNTR = 0;
-  IMXRT_TMR1.CH[1].CNTR = 0;
-
-  IMXRT_TMR1.CH[0].SCTRL  = 0;
-  IMXRT_TMR1.CH[0].CSCTRL = 0;
-  IMXRT_TMR1.CH[1].SCTRL  = 0;
-  IMXRT_TMR1.CH[1].CSCTRL = 0;
-
-  IMXRT_TMR1.CH[0].LOAD = 0;
-  IMXRT_TMR1.CH[1].LOAD = 0;
-
-  IMXRT_TMR1.CH[0].COMP1 = 0xFFFF;
-  IMXRT_TMR1.CH[1].COMP1 = 0xFFFF;
-  IMXRT_TMR1.CH[0].CMPLD1 = 0xFFFF;
-  IMXRT_TMR1.CH[1].CMPLD1 = 0xFFFF;
-
-  // ch0: count edges of external pin (CM=2, PCS=0)
-  // NOTE: CM(2) counts BOTH edges — raw rate is 2x input frequency
-  IMXRT_TMR1.CH[0].CTRL = TMR_CTRL_CM(2) | TMR_CTRL_PCS(0);
-
-  // ch1: cascade from ch0 overflow (CM=7)
-  IMXRT_TMR1.CH[1].CTRL = TMR_CTRL_CM(7);
-
-  ocxo2_rolling_32 = qtimer1_read_32();
-  qtimer1_armed    = true;
+  IOMUXC_GPT2_IPP_IND_CLKIN_SELECT_INPUT = 1;
+  GPT2_CR = 0;
+  GPT2_SR = 0x3F;
+  GPT2_PR = 0;
+  GPT2_CR = GPT_CR_CLKSRC(3) | GPT_CR_FRR;
+  GPT2_CR |= GPT_CR_EN;
+  ocxo2_rolling_32 = GPT2_CNT;
+  gpt2_armed       = true;
 }
 
 uint64_t clocks_ocxo2_ticks_now(void) {
-  uint32_t now = qtimer1_read_32();
-  ocxo2_rolling_raw_64 += (uint32_t)(now - ocxo2_rolling_32);
+  uint32_t now = GPT2_CNT;
+  ocxo2_rolling_64 += (uint32_t)(now - ocxo2_rolling_32);
   ocxo2_rolling_32 = now;
-  return ocxo2_rolling_raw_64 / OCXO2_EDGE_DIVISOR;
+  return ocxo2_rolling_64;
 }
 
 uint64_t clocks_ocxo2_ns_now(void) {
@@ -358,20 +372,26 @@ static void pps_asap_callback(timepop_ctx_t*, void*) {
 
 // ============================================================================
 // PPS handling — ISR (minimum latency)
+//
+// Read order: DWT first (highest frequency, most latency-sensitive),
+// then the two GPTs (OCXO1, OCXO2), then QTimer1 (GNSS).
 // ============================================================================
 
 static void pps_isr(void) {
 
   const uint32_t snap_dwt   = DWT_CYCCNT;
-  const uint32_t snap_gnss  = GPT2_CNT;
   const uint32_t snap_ocxo1 = GPT1_CNT;
-  const uint32_t snap_ocxo2 = qtimer1_read_32();
+  const uint32_t snap_ocxo2 = GPT2_CNT;
+  const uint32_t snap_gnss  = qtimer1_read_32();
 
+  // PPS validation uses GNSS raw count (20 MHz dual-edge).
+  // The alternation means isr_residual_gnss will oscillate,
+  // but PPS_VCLOCK_TOLERANCE accommodates this.
   if (isr_residual_valid) {
     uint32_t elapsed = snap_gnss - isr_prev_gnss;
-    uint32_t remainder = elapsed % ISR_GNSS_EXPECTED;
+    uint32_t remainder = elapsed % ISR_GNSS_RAW_EXPECTED;
     if (remainder > PPS_VCLOCK_TOLERANCE &&
-        remainder < (ISR_GNSS_EXPECTED - PPS_VCLOCK_TOLERANCE)) {
+        remainder < (ISR_GNSS_RAW_EXPECTED - PPS_VCLOCK_TOLERANCE)) {
       diag_pps_rejected_total++;
       diag_pps_rejected_remainder = remainder;
       return;
@@ -385,9 +405,9 @@ static void pps_isr(void) {
 
   if (isr_residual_valid) {
     isr_residual_dwt   = (int32_t)(snap_dwt   - isr_prev_dwt)   - (int32_t)ISR_DWT_EXPECTED;
-    isr_residual_gnss  = (int32_t)(snap_gnss  - isr_prev_gnss)  - (int32_t)ISR_GNSS_EXPECTED;
+    isr_residual_gnss  = (int32_t)(snap_gnss  - isr_prev_gnss)  - (int32_t)ISR_GNSS_RAW_EXPECTED;
     isr_residual_ocxo1 = (int32_t)(snap_ocxo1 - isr_prev_ocxo1) - (int32_t)ISR_OCXO1_EXPECTED;
-    isr_residual_ocxo2 = (int32_t)(snap_ocxo2 - isr_prev_ocxo2) - (int32_t)ISR_OCXO2_RAW_EXPECTED;
+    isr_residual_ocxo2 = (int32_t)(snap_ocxo2 - isr_prev_ocxo2) - (int32_t)ISR_OCXO2_EXPECTED;
   }
 
   isr_prev_dwt   = isr_snap_dwt   = snap_dwt;
@@ -428,9 +448,9 @@ static void ocxo_dither_cb(timepop_ctx_t*, void*) {
 
 void process_clocks_init_hardware(void) {
   dwt_enable();
-  arm_gpt2_external();     // GNSS VCLOCK (TimePop scheduling)
-  arm_gpt1_external();     // OCXO1 10 MHz (GPT1, pin 25)
-  arm_qtimer1_external();  // OCXO2 10 MHz (QTimer1 ch0, pin 10)
+  arm_gpt1_external();      // OCXO1 10 MHz (GPT1, pin 25)
+  arm_gpt2_external();      // OCXO2 10 MHz (GPT2, pin 14)
+  arm_qtimer1_external();   // GNSS VCLOCK (QTimer1 ch0, pin 10)
 }
 
 // ============================================================================

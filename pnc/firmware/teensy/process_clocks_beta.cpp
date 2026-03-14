@@ -2,9 +2,14 @@
 // process_clocks_beta.cpp — Campaign Layer
 // ============================================================================
 //
-// v13: OCXO1 on GPT1 (10 MHz single-edge, 32-bit native).
-//      OCXO2 on QTimer1 (20 MHz dual-edge, cascaded 32-bit).
-//      Asymmetric timer hardware, symmetric measurement via DWT + time.h.
+// v14: Symmetric GPT counting for both OCXOs.
+//
+//   OCXO1 on GPT1 (10 MHz single-edge, 32-bit native).
+//   OCXO2 on GPT2 (10 MHz single-edge, 32-bit native).
+//   GNSS  on QTimer1 (20 MHz dual-edge, cascaded 32-bit).
+//
+//   Both OCXOs accumulate clean 10 MHz ticks directly.
+//   GNSS accumulates raw 20 MHz and divides by GNSS_EDGE_DIVISOR.
 //
 // ============================================================================
 
@@ -154,8 +159,8 @@ double prediction_stderr(const prediction_tracker_t& p) {
 // ============================================================================
 // 64-bit accumulators — definitions
 //
-// OCXO1: GPT1 single-edge, accumulates 10 MHz ticks directly.
-// OCXO2: QTimer1 dual-edge, accumulates raw 20 MHz then divides.
+// Both OCXOs: GPT single-edge, accumulate 10 MHz ticks directly.
+// GNSS: QTimer1 dual-edge, accumulates raw 20 MHz then divides.
 // ============================================================================
 
 uint64_t dwt_cycles_64     = 0;
@@ -164,8 +169,11 @@ uint32_t prev_dwt_at_pps   = 0;
 uint64_t ocxo1_ticks_64    = 0;
 uint32_t prev_ocxo1_at_pps = 0;
 
-uint64_t ocxo2_raw_64      = 0;
+uint64_t ocxo2_ticks_64    = 0;
 uint32_t prev_ocxo2_at_pps = 0;
+
+uint64_t gnss_raw_64       = 0;
+uint32_t prev_gnss_at_pps  = 0;
 
 // ============================================================================
 // Zeroing (campaign-scoped — fresh start only)
@@ -180,15 +188,18 @@ void clocks_zero_all(void) {
   ocxo1_ticks_64    = 0;
   prev_ocxo1_at_pps = isr_snap_ocxo1;
 
-  ocxo2_raw_64      = 0;
+  ocxo2_ticks_64    = 0;
   prev_ocxo2_at_pps = isr_snap_ocxo2;
+
+  gnss_raw_64       = 0;
+  prev_gnss_at_pps  = isr_snap_gnss;
 
   campaign_seconds  = 0;
 
-  dwt_rolling_64    = 0;  dwt_rolling_32    = DWT_CYCCNT;
-  gnss_ticks_64     = 0;  gnss_last_32      = GPT2_CNT;
-  ocxo1_rolling_64  = 0;  ocxo1_rolling_32  = GPT1_CNT;
-  ocxo2_rolling_raw_64 = 0;  ocxo2_rolling_32  = qtimer1_read_32();
+  dwt_rolling_64       = 0;  dwt_rolling_32       = DWT_CYCCNT;
+  gnss_rolling_raw_64  = 0;  gnss_rolling_32      = qtimer1_read_32();
+  ocxo1_rolling_64     = 0;  ocxo1_rolling_32     = GPT1_CNT;
+  ocxo2_rolling_64     = 0;  ocxo2_rolling_32     = GPT2_CNT;
 
   residual_reset(residual_dwt);
   residual_reset(residual_gnss);
@@ -270,17 +281,18 @@ void clocks_beta_pps(void) {
     ocxo1_ticks_64    = recover_ocxo1_ns / 100ull;
     prev_ocxo1_at_pps = isr_snap_ocxo1;
 
-    ocxo2_raw_64      = (recover_ocxo2_ns / 100ull) * OCXO2_EDGE_DIVISOR;
+    ocxo2_ticks_64    = recover_ocxo2_ns / 100ull;
     prev_ocxo2_at_pps = isr_snap_ocxo2;
 
-    gnss_ticks_64 = recover_gnss_ns / 100ull;
-    gnss_last_32  = isr_snap_gnss;
+    gnss_raw_64       = (recover_gnss_ns / 100ull) * GNSS_EDGE_DIVISOR;
+    prev_gnss_at_pps  = isr_snap_gnss;
 
     campaign_seconds = recover_gnss_ns / 1000000000ull;
 
-    dwt_rolling_64    = 0;  dwt_rolling_32    = DWT_CYCCNT;
-    ocxo1_rolling_64  = 0;  ocxo1_rolling_32  = GPT1_CNT;
-    ocxo2_rolling_raw_64 = 0;  ocxo2_rolling_32  = qtimer1_read_32();
+    dwt_rolling_64       = 0;  dwt_rolling_32       = DWT_CYCCNT;
+    gnss_rolling_raw_64  = 0;  gnss_rolling_32      = qtimer1_read_32();
+    ocxo1_rolling_64     = 0;  ocxo1_rolling_32     = GPT1_CNT;
+    ocxo2_rolling_64     = 0;  ocxo2_rolling_32     = GPT2_CNT;
 
     residual_reset(residual_dwt);
     residual_reset(residual_gnss);
@@ -320,8 +332,7 @@ void clocks_beta_pps(void) {
 
     pps_fired = false;
 
-    // ── Clock values at PPS edge — direct delta accumulation ──
-
+    // ── DWT ──
     uint32_t dwt_raw_at_pps = isr_snap_dwt - ISR_ENTRY_DWT_CYCLES;
     uint32_t dwt_delta = dwt_raw_at_pps - prev_dwt_at_pps;
     dwt_cycles_64   += dwt_delta;
@@ -330,7 +341,7 @@ void clocks_beta_pps(void) {
     const uint64_t pps_dwt_cycles = dwt_cycles_64;
     const uint64_t pps_dwt_ns     = dwt_cycles_to_ns(pps_dwt_cycles);
 
-    // OCXO1: GPT1 single-edge, 32-bit delta, accumulates ticks directly
+    // ── OCXO1: GPT1, single-edge, 32-bit delta ──
     uint32_t ocxo1_delta = isr_snap_ocxo1 - prev_ocxo1_at_pps;
     ocxo1_ticks_64    += ocxo1_delta;
     prev_ocxo1_at_pps  = isr_snap_ocxo1;
@@ -338,20 +349,23 @@ void clocks_beta_pps(void) {
     const uint64_t pps_ocxo1_ticks = ocxo1_ticks_64;
     const uint64_t pps_ocxo1_ns    = pps_ocxo1_ticks * 100ull;
 
-    // OCXO2: QTimer1 dual-edge, 32-bit raw delta, accumulates raw then divides
-    uint32_t ocxo2_raw_delta = isr_snap_ocxo2 - prev_ocxo2_at_pps;
-    ocxo2_raw_64      += ocxo2_raw_delta;
+    // ── OCXO2: GPT2, single-edge, 32-bit delta ──
+    uint32_t ocxo2_delta = isr_snap_ocxo2 - prev_ocxo2_at_pps;
+    ocxo2_ticks_64    += ocxo2_delta;
     prev_ocxo2_at_pps  = isr_snap_ocxo2;
 
-    const uint64_t pps_ocxo2_ticks = ocxo2_ticks_64_get();
+    const uint64_t pps_ocxo2_ticks = ocxo2_ticks_64;
     const uint64_t pps_ocxo2_ns    = pps_ocxo2_ticks * 100ull;
 
-    const uint32_t ocxo2_delta = ocxo2_raw_delta / OCXO2_EDGE_DIVISOR;
+    // ── GNSS: QTimer1, dual-edge, 32-bit raw delta, divide for ticks ──
+    uint32_t gnss_raw_delta = isr_snap_gnss - prev_gnss_at_pps;
+    gnss_raw_64      += gnss_raw_delta;
+    prev_gnss_at_pps  = isr_snap_gnss;
 
     campaign_seconds++;
 
     const uint64_t pps_gnss_ns    = campaign_seconds * NS_PER_SECOND;
-    const uint64_t pps_gnss_ticks = campaign_seconds * (uint64_t)ISR_GNSS_EXPECTED;
+    const uint64_t pps_gnss_ticks = campaign_seconds * (uint64_t)TICKS_10MHZ_PER_SECOND;
 
     const uint32_t dwt_cycles_per_pps_snapshot =
       pred_dwt.predicted_valid ? pred_dwt.predicted :
@@ -382,13 +396,14 @@ void clocks_beta_pps(void) {
     p.add("teensy_pps_count", campaign_seconds);
     p.add("gnss_lock",        digitalRead(GNSS_LOCK_PIN));
     p.add("dwt_cyccnt_at_pps", (uint32_t)dwt_raw_at_pps);
-    p.add("gpt2_at_pps",      (uint32_t)isr_snap_gnss);
+    p.add("gpt2_at_pps",      (uint32_t)isr_snap_ocxo2);
 
     p.add("dwt_cycles_per_pps", (uint64_t)dwt_cycles_per_pps_snapshot);
 
     p.add("dwt_delta_raw",    (uint64_t)dwt_delta);
     p.add("ocxo1_delta_raw",  (uint64_t)ocxo1_delta);
-    p.add("ocxo2_delta_raw",  (uint64_t)ocxo2_raw_delta);
+    p.add("ocxo2_delta_raw",  (uint64_t)ocxo2_delta);
+    p.add("gnss_raw_delta",   (uint64_t)gnss_raw_delta);
 
     p.add("dwt_pps_residual",   residual_dwt.residual);
     p.add("gnss_pps_residual",  residual_gnss.residual);
@@ -690,7 +705,15 @@ static Payload cmd_clocks_info(const Payload&) {
 }
 
 // ============================================================================
-// INTERP_TEST — unchanged (DWT/GNSS only, OCXO not involved)
+// INTERP_TEST — uses DWT interpolation against GNSS tick position
+//
+// NOTE: gpt2_at_pps is now OCXO2 (not GNSS). INTERP_TEST still works
+// because it reads GPT2_CNT for VCLOCK position — but wait, GPT2 is
+// now OCXO2.  We need to use QTimer1 for GNSS position.
+//
+// For now, INTERP_TEST uses the campaign GNSS ticks from the timebase
+// fragment (which are PPS-derived and exact) plus QTimer1 for intra-
+// second GNSS position.
 // ============================================================================
 
 static Payload cmd_interp_test(const Payload& args) {
@@ -709,10 +732,10 @@ static Payload cmd_interp_test(const Payload& args) {
   int32_t  outside_100ns = 0;
 
   uint64_t s0_frag_gnss_ns = 0; uint32_t s0_frag_dwt_cyccnt_at_pps = 0;
-  uint32_t s0_frag_dwt_cycles_per_pps = 0, s0_frag_gpt2_at_pps = 0, s0_pps_count = 0;
-  uint32_t s0_dwt_cyccnt_now = 0, s0_gpt2_now = 0, s0_dwt_elapsed = 0;
+  uint32_t s0_frag_dwt_cycles_per_pps = 0, s0_pps_count = 0;
+  uint32_t s0_dwt_cyccnt_now = 0, s0_dwt_elapsed = 0;
   uint64_t s0_dwt_ns_into_second = 0, s0_interp_gnss_ns = 0;
-  uint32_t s0_gpt2_since_pps = 0;
+  uint32_t s0_gnss_raw_since_pps = 0;
   uint64_t s0_vclock_ns_into_second = 0, s0_vclock_gnss_ns = 0;
   int64_t  s0_error_ns = 0; double s0_position = 0.0;
 
@@ -724,22 +747,23 @@ static Payload cmd_interp_test(const Payload& args) {
     const uint32_t frag_pps_count          = frag->pps_count;
     const uint32_t frag_dwt_cyccnt_at_pps  = frag->dwt_cyccnt_at_pps;
     const uint32_t frag_dwt_cycles_per_pps = (uint32_t)frag->dwt_cycles_per_pps;
-    const uint32_t frag_gpt2_at_pps        = frag->gpt2_at_pps;
 
-    if (frag_dwt_cycles_per_pps == 0 || frag_gpt2_at_pps == 0) {
-      p.add("error", "fragment missing dwt_cycles_per_pps or gpt2_at_pps"); return p;
+    if (frag_dwt_cycles_per_pps == 0) {
+      p.add("error", "fragment missing dwt_cycles_per_pps"); return p;
     }
 
     const uint32_t dwt_now  = ARM_DWT_CYCCNT;
-    const uint32_t gpt2_now = GPT2_CNT;
+    const uint32_t gnss_now = qtimer1_read_32();
 
     const int64_t interp_signed = timebase_gnss_ns_from_dwt(
       dwt_now, frag_gnss_ns, frag_dwt_cyccnt_at_pps, frag_dwt_cycles_per_pps);
     if (interp_signed < 0) { p.add("error", "timebase_gnss_ns_from_dwt failed"); return p; }
     const uint64_t interp_gnss_ns = (uint64_t)interp_signed;
 
-    const uint32_t gpt2_since_pps = gpt2_now - frag_gpt2_at_pps;
-    const uint64_t vclock_ns_into_second = (uint64_t)gpt2_since_pps * 100ULL;
+    // GNSS VCLOCK is on QTimer1 (20 MHz raw).  Divide by 2 for 10 MHz ticks.
+    const uint32_t gnss_raw_since_pps = gnss_now - (uint32_t)isr_snap_gnss;
+    const uint64_t gnss_ticks_since_pps = (uint64_t)gnss_raw_since_pps / GNSS_EDGE_DIVISOR;
+    const uint64_t vclock_ns_into_second = gnss_ticks_since_pps * 100ULL;
     const uint64_t vclock_gnss_ns = frag_gnss_ns + vclock_ns_into_second;
     const int64_t error_ns = (int64_t)interp_gnss_ns - (int64_t)vclock_gnss_ns;
     const uint32_t dwt_elapsed = dwt_now - frag_dwt_cyccnt_at_pps;
@@ -756,10 +780,10 @@ static Payload cmd_interp_test(const Payload& args) {
 
     if (i == 0) {
       s0_frag_gnss_ns = frag_gnss_ns; s0_frag_dwt_cyccnt_at_pps = frag_dwt_cyccnt_at_pps;
-      s0_frag_dwt_cycles_per_pps = frag_dwt_cycles_per_pps; s0_frag_gpt2_at_pps = frag_gpt2_at_pps;
-      s0_pps_count = frag_pps_count; s0_dwt_cyccnt_now = dwt_now; s0_gpt2_now = gpt2_now;
+      s0_frag_dwt_cycles_per_pps = frag_dwt_cycles_per_pps;
+      s0_pps_count = frag_pps_count; s0_dwt_cyccnt_now = dwt_now;
       s0_dwt_elapsed = dwt_elapsed; s0_dwt_ns_into_second = dwt_ns_into_second;
-      s0_interp_gnss_ns = interp_gnss_ns; s0_gpt2_since_pps = gpt2_since_pps;
+      s0_interp_gnss_ns = interp_gnss_ns; s0_gnss_raw_since_pps = gnss_raw_since_pps;
       s0_vclock_ns_into_second = vclock_ns_into_second; s0_vclock_gnss_ns = vclock_gnss_ns;
       s0_error_ns = error_ns; s0_position = (double)vclock_ns_into_second / 1000000000.0;
     }
@@ -774,13 +798,12 @@ static Payload cmd_interp_test(const Payload& args) {
   p.add("s0_frag_gnss_ns", s0_frag_gnss_ns);
   p.add("s0_frag_dwt_cyccnt_at_pps", s0_frag_dwt_cyccnt_at_pps);
   p.add("s0_frag_dwt_cycles_per_pps", s0_frag_dwt_cycles_per_pps);
-  p.add("s0_frag_gpt2_at_pps", s0_frag_gpt2_at_pps);
   p.add("s0_pps_count", s0_pps_count);
-  p.add("s0_dwt_cyccnt_now", s0_dwt_cyccnt_now); p.add("s0_gpt2_now", s0_gpt2_now);
+  p.add("s0_dwt_cyccnt_now", s0_dwt_cyccnt_now);
   p.add("s0_dwt_elapsed", s0_dwt_elapsed);
   p.add("s0_dwt_ns_into_second", s0_dwt_ns_into_second);
   p.add("s0_interp_gnss_ns", s0_interp_gnss_ns);
-  p.add("s0_gpt2_since_pps", s0_gpt2_since_pps);
+  p.add("s0_gnss_raw_since_pps", s0_gnss_raw_since_pps);
   p.add("s0_vclock_ns_into_second", s0_vclock_ns_into_second);
   p.add("s0_vclock_gnss_ns", s0_vclock_gnss_ns);
   p.add("s0_error_ns", s0_error_ns); p.add("s0_position", s0_position);
@@ -790,7 +813,7 @@ static Payload cmd_interp_test(const Payload& args) {
 }
 
 // ============================================================================
-// INTERP_PROOF — unchanged
+// INTERP_PROOF — unchanged logic, uses QTimer1 for GNSS position
 // ============================================================================
 
 static int64_t proof_n = 0; static double proof_mean = 0.0, proof_m2 = 0.0;
@@ -811,12 +834,13 @@ static Payload cmd_interp_proof(const Payload& args) {
   const int64_t interp_signed = timebase_now_gnss_ns();
   if (interp_signed < 0) { p.add("error", "timebase_now_gnss_ns failed"); return p; }
   const uint64_t interp_gnss_ns = (uint64_t)interp_signed;
-  const uint32_t gpt2_now = GPT2_CNT;
+  const uint32_t gnss_now = qtimer1_read_32();
   const timebase_fragment_t* frag = timebase_last_fragment();
   if (!frag || !frag->valid) { p.add("error", "timebase not valid"); return p; }
   const uint64_t frag_gnss_ns = frag->gnss_ns;
-  const uint32_t gnss_ticks_since_pps = gpt2_now - isr_snap_gnss;
-  const uint64_t vclock_ns_into_second = (uint64_t)gnss_ticks_since_pps * 100ULL;
+  const uint32_t gnss_raw_since_pps = gnss_now - (uint32_t)isr_snap_gnss;
+  const uint64_t gnss_ticks_since_pps = (uint64_t)gnss_raw_since_pps / GNSS_EDGE_DIVISOR;
+  const uint64_t vclock_ns_into_second = gnss_ticks_since_pps * 100ULL;
   const uint64_t vclock_gnss_ns = frag_gnss_ns + vclock_ns_into_second;
   const int64_t error_ns = (int64_t)interp_gnss_ns - (int64_t)vclock_gnss_ns;
   const double position = (double)vclock_ns_into_second / 1000000000.0;
