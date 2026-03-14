@@ -877,7 +877,7 @@ def _build_clock_block(
         if delta is not None:
             # ocxo2_delta_raw is in 20 MHz space (QTimer both edges)
             # Convert to 10 MHz equivalent for PPB calculation
-            block["ppb"] = round(((int(delta) - 20_000_000) / 20_000_000) * 1e9, 3)
+            block["ppb"] = round(((int(delta) - 10_000_000) / 10_000_000) * 1e9, 3)
         else:
             block["ppb"] = 0.0
         block["pred_residual"] = frag.get("ocxo2_pred_residual")
