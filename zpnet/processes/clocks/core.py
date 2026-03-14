@@ -863,7 +863,7 @@ def _build_clock_block(
     elif domain == "ocxo1":
         delta = frag.get("ocxo1_delta_raw")
         if delta is not None:
-            block["ppb"] = round(((int(delta) - 10_000_000) / 10_000_000) * 1e9, 3)
+            block["ppb"] = round(_compute_ppb(int(ns_now), int(gnss_ns)), 3)
         else:
             block["ppb"] = 0.0
         block["pred_residual"] = frag.get("ocxo1_pred_residual")
@@ -877,7 +877,7 @@ def _build_clock_block(
         if delta is not None:
             # ocxo2_delta_raw is in 20 MHz space (QTimer both edges)
             # Convert to 10 MHz equivalent for PPB calculation
-            block["ppb"] = round(((int(delta) - 10_000_000) / 10_000_000) * 1e9, 3)
+            block["ppb"] = round(_compute_ppb(int(ns_now), int(gnss_ns)), 3)
         else:
             block["ppb"] = 0.0
         block["pred_residual"] = frag.get("ocxo2_pred_residual")
@@ -2438,27 +2438,12 @@ def cmd_list_campaigns(_: Optional[dict]) -> Dict[str, Any]:
         }
         campaigns.append(entry)
 
-    lines = []
-    for c in campaigns:
-        star = " ★" if c["baseline"] else ""
-        state = "ACTIVE" if c["active"] else "stopped"
-        started = (c["started_at"] or "?")[:19]
-        stopped = (c["stopped_at"] or "—")[:19] if not c["active"] else "—"
-        pps = c["pps_count"] if c["pps_count"] is not None else "—"
-        loc = c["location"] or "—"
-        lines.append(
-            f"  {c['campaign']}{star}  [{state}]  "
-            f"start={started}  stop={stopped}  "
-            f"pps={pps}  loc={loc}"
-        )
-
     return {
         "success": True,
         "message": "OK",
         "payload": {
             "count": len(campaigns),
-            "campaigns": campaigns,
-            "text": "\n".join(lines) if lines else "(no campaigns)",
+            "campaigns": campaigns
         },
     }
 

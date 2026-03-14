@@ -45,7 +45,7 @@ static constexpr uint32_t NS_PER_10MHZ_TICK = 100U;
 // PPS edge validation tolerance (ticks).
 // Any PPS edge whose 10 MHz elapsed count modulo TICKS_10MHZ_PER_SECOND
 // has a remainder outside ±PPS_VCLOCK_TOLERANCE is rejected as spurious.
-static constexpr uint32_t PPS_VCLOCK_TOLERANCE = 100000;
+static constexpr uint32_t PPS_VCLOCK_TOLERANCE = 100;
 
 // --------------------------------------------------------------
 // Prescaled clock domains
