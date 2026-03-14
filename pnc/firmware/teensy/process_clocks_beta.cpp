@@ -2,6 +2,26 @@
 // process_clocks_beta.cpp — Campaign Layer
 // ============================================================================
 //
+// v15: Random walk prediction model.
+//
+//   Empirical testing over 38,000+ seconds (Baseline4 campaign) showed
+//   that a random walk predictor (predicted = prev_delta) produces 1.67x
+//   lower prediction stddev than linear extrapolation (predicted =
+//   2*prev - prev_prev) for DWT.  For OCXOs the difference is negligible
+//   since their deltas are near-constant when servo-locked.
+//
+//   The random walk model assumes the crystal's current rate is the best
+//   estimate of its next rate.  Linear extrapolation assumes trends
+//   continue, but thermal drift is a random walk — when the trend
+//   reverses, the extrapolator overshoots in both directions.
+//
+//   Changes from v14:
+//     • prediction_tracker_t: prev_prev_delta removed
+//     • prediction_update(): predicted = prev_delta (random walk)
+//     • prediction_seed(): simplified, history_count = 2
+//     • Welford gate: history_count >= 2 (scores one second earlier)
+//     • prediction_reset(): prev_prev_delta removed
+//
 // v14: Symmetric GPT counting for both OCXOs.
 //
 //   OCXO1 on GPT1 (10 MHz single-edge, 32-bit native).
@@ -99,7 +119,10 @@ double residual_stderr(const pps_residual_t& r) {
 }
 
 // ============================================================================
-// Trend-aware prediction tracking — definitions
+// Random walk prediction tracking — definitions
+//
+// v15: Random walk model.  predicted = prev_delta.
+// Empirically 1.67x lower stddev than linear extrapolation for DWT.
 // ============================================================================
 
 prediction_tracker_t pred_dwt   = {};
@@ -108,7 +131,6 @@ prediction_tracker_t pred_ocxo2 = {};
 
 void prediction_reset(prediction_tracker_t& p) {
   p.prev_delta      = 0;
-  p.prev_prev_delta = 0;
   p.predicted       = 0;
   p.pred_residual   = 0;
   p.history_count   = 0;
@@ -120,14 +142,14 @@ void prediction_reset(prediction_tracker_t& p) {
 
 void prediction_seed(prediction_tracker_t& p, uint32_t value) {
   p.prev_delta      = value;
-  p.prev_prev_delta = value;
   p.predicted       = value;
   p.predicted_valid = true;
-  p.history_count   = 3;
+  p.history_count   = 2;
 }
 
 void prediction_update(prediction_tracker_t& p, uint32_t actual_delta) {
-  if (p.predicted_valid && p.history_count >= 3) {
+  // Score the prediction if we have a valid one
+  if (p.predicted_valid && p.history_count >= 2) {
     p.pred_residual = (int32_t)actual_delta - (int32_t)p.predicted;
     p.n++;
     const double x  = (double)p.pred_residual;
@@ -136,12 +158,13 @@ void prediction_update(prediction_tracker_t& p, uint32_t actual_delta) {
     const double d2 = x - p.mean;
     p.m2 += d1 * d2;
   }
-  p.prev_prev_delta = p.prev_delta;
-  p.prev_delta      = actual_delta;
+
+  // Random walk: next prediction is this delta
+  p.prev_delta = actual_delta;
   if (p.history_count < 255) p.history_count++;
-  if (p.history_count >= 2) {
-    int64_t pred = 2 * (int64_t)p.prev_delta - (int64_t)p.prev_prev_delta;
-    p.predicted = (pred > 0) ? (uint32_t)pred : p.prev_delta;
+
+  if (p.history_count >= 1) {
+    p.predicted       = p.prev_delta;
     p.predicted_valid = true;
   } else {
     p.predicted_valid = false;
@@ -371,6 +394,16 @@ void clocks_beta_pps(void) {
       pred_dwt.predicted_valid ? pred_dwt.predicted :
       (g_dwt_cal_valid ? g_dwt_cycles_per_gnss_s : DWT_EXPECTED_PER_PPS);
 
+    // Reset dither counters for this PPS interval (snapshot before reset)
+    const uint32_t o1_dither_high = ocxo1_dac.dither_high_count;
+    const uint32_t o1_dither_low  = ocxo1_dac.dither_low_count;
+    const uint32_t o2_dither_high = ocxo2_dac.dither_high_count;
+    const uint32_t o2_dither_low  = ocxo2_dac.dither_low_count;
+    ocxo1_dac.dither_high_count = 0;
+    ocxo1_dac.dither_low_count  = 0;
+    ocxo2_dac.dither_high_count = 0;
+    ocxo2_dac.dither_low_count  = 0;
+
     // ── Residual updates ──
     residual_update(residual_dwt,   pps_dwt_cycles,   DWT_EXPECTED_PER_PPS_I);
     residual_update(residual_gnss,  pps_gnss_ticks,   GNSS_EXPECTED_PER_PPS);
@@ -436,6 +469,11 @@ void clocks_beta_pps(void) {
     p.add("calibrate_ocxo",    calibrate_ocxo_active);
     p.add("ocxo1_servo_adjustments", ocxo1_dac.servo_adjustments);
     p.add("ocxo2_servo_adjustments", ocxo2_dac.servo_adjustments);
+
+    p.add("ocxo1_dither_high", o1_dither_high);
+    p.add("ocxo1_dither_low",  o1_dither_low);
+    p.add("ocxo2_dither_high", o2_dither_high);
+    p.add("ocxo2_dither_low",  o2_dither_low);
 
     p.add("diag_pps_rejected_total",     diag_pps_rejected_total);
     p.add("diag_pps_rejected_remainder", diag_pps_rejected_remainder);
@@ -620,6 +658,12 @@ static Payload cmd_report(const Payload&) {
 
   p.add("ocxo1_dac",               ocxo1_dac.dac_fractional);
   p.add("ocxo2_dac",               ocxo2_dac.dac_fractional);
+
+  p.add("ocxo1_dither_high", ocxo1_dac.dither_high_count);
+  p.add("ocxo1_dither_low",  ocxo1_dac.dither_low_count);
+  p.add("ocxo2_dither_high", ocxo2_dac.dither_high_count);
+  p.add("ocxo2_dither_low",  ocxo2_dac.dither_low_count);
+
   p.add("calibrate_ocxo",          calibrate_ocxo_active);
   p.add("ocxo1_servo_adjustments", ocxo1_dac.servo_adjustments);
   p.add("ocxo2_servo_adjustments", ocxo2_dac.servo_adjustments);

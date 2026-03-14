@@ -2,6 +2,12 @@
 // process_clocks_alpha.cpp — Always-On Physics Layer
 // ============================================================================
 //
+// v15: DAC dither telemetry + random walk prediction model.
+//
+//   ocxo_dither_one() now captures the integer DAC value written to
+//   analogWrite() in dac_output_int, so that the TIMEBASE_FRAGMENT
+//   can report the actual integer value applied each second.
+//
 // v14: Symmetric GPT architecture for both OCXOs.
 //
 //   OCXO1 on GPT1  (pin 25, GPIO_AD_B0_13, ALT1, 10 MHz single-edge).
@@ -66,14 +72,16 @@ bool clocks_dwt_calibration_valid(void) {
 
 // ============================================================================
 // OCXO DAC state — definitions
+//
+// v15: dac_output_int added — the aggregate initializer gains one field.
 // ============================================================================
 
 ocxo_dac_state_t ocxo1_dac = {
-  (double)OCXO1_DAC_DEFAULT, 0, 0, 0.0, 0, 0
+  (double)OCXO1_DAC_DEFAULT, 0, 0.0, 0, 0, 0, 0.0, 0, 0
 };
 
 ocxo_dac_state_t ocxo2_dac = {
-  (double)OCXO2_DAC_DEFAULT, 0, 0, 0.0, 0, 0
+  (double)OCXO2_DAC_DEFAULT, 0, 0.0, 0, 0, 0, 0.0, 0, 0
 };
 
 bool calibrate_ocxo_active = false;
@@ -423,16 +431,25 @@ static void pps_isr(void) {
 
 // ============================================================================
 // Dither callback — runs forever at 1 kHz, writes both OCXO PWM pins
+//
+// v15: captures dac_output_int for telemetry in TIMEBASE_FRAGMENT.
 // ============================================================================
 
 static void ocxo_dither_one(ocxo_dac_state_t& s, int pin) {
-  uint32_t base      = (uint32_t)s.dac_fractional;
-  double   frac      = s.dac_fractional - (double)base;
-  uint32_t threshold = (uint32_t)(frac * DITHER_PERIOD);
+  uint32_t base = (uint32_t)s.dac_fractional;
+  double   frac = s.dac_fractional - (double)base;
 
-  s.dither_cycle = (s.dither_cycle + 1) % DITHER_PERIOD;
+  s.dither_accum += frac;
+  uint32_t output;
+  if (s.dither_accum >= 1.0) {
+    s.dither_accum -= 1.0;
+    output = base + 1;
+    s.dither_high_count++;
+  } else {
+    output = base;
+    s.dither_low_count++;
+  }
 
-  uint32_t output = (s.dither_cycle < threshold) ? base + 1 : base;
   if (output > OCXO1_DAC_MAX) output = OCXO1_DAC_MAX;
   analogWrite(pin, output);
 }
