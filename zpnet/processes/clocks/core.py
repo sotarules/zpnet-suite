@@ -2020,7 +2020,7 @@ def _recover_campaign() -> None:
         "    ocxo1_ns  = %d\n"
         "    ocxo2_ns  = %d",
         system_time_z(), next_pps_count,
-        projected_dwt_ns, projected_gnss_ns, projected_ocxo1_ns,
+        projected_dwt_ns, projected_gnss_ns, projected_ocxo1_ns, projected_ocxo2_ns,
     )
 
     teensy_recover_args: Dict[str, Any] = {
@@ -2270,9 +2270,17 @@ def _check_preflight() -> tuple[bool, list[str]]:
 def _wait_for_preflight(context: str = "recovery") -> None:
     """
     Block until all preflight prerequisites are met.
+
+    On cluster restart, the GNSS process needs a few seconds to parse
+    its first NMEA sentences.  We poll silently at 2-second intervals
+    for the first PREFLIGHT_GRACE_S seconds before switching to the
+    normal 30-second polling with logged warnings.
     """
     attempt = 0
     t0 = time.monotonic()
+
+    GRACE_S = 15.0        # silent fast-poll window
+    GRACE_POLL_S = 2.0    # poll interval during grace period
 
     while True:
         ready, reasons = _check_preflight()
@@ -2296,14 +2304,18 @@ def _wait_for_preflight(context: str = "recovery") -> None:
         attempt += 1
         elapsed = time.monotonic() - t0
 
-        reason_block = "\n".join(f"    • {r}" for r in reasons)
-        logging.info(
-            "%s @%s not ready for %s (check #%d, %.0fs elapsed):\n%s",
-            PREFLIGHT_LOG_PREFIX, system_time_z(),
-            context, attempt, elapsed, reason_block,
-        )
-
-        time.sleep(PREFLIGHT_POLL_INTERVAL_S)
+        if elapsed >= GRACE_S:
+            # Past grace period — log warnings at normal interval
+            reason_block = "\n".join(f"    • {r}" for r in reasons)
+            logging.info(
+                "%s @%s not ready for %s (check #%d, %.0fs elapsed):\n%s",
+                PREFLIGHT_LOG_PREFIX, system_time_z(),
+                context, attempt, elapsed, reason_block,
+            )
+            time.sleep(PREFLIGHT_POLL_INTERVAL_S)
+        else:
+            # Grace period — poll silently and quickly
+            time.sleep(GRACE_POLL_S)
 
 
 def cmd_baseline_info(_: Optional[dict]) -> Dict[str, Any]:

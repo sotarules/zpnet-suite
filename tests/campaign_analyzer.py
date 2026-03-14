@@ -666,10 +666,9 @@ def analyze_raw_deltas(
 
     DWT_NOMINAL  = 1_008_000_000
     OCXO_NOMINAL = 10_000_000
-    # OCXO2 raw deltas are in 20 MHz space (QTimer counts both edges
-    # of the 10 MHz input signal).  The firmware divides by 2 for tick
-    # accumulation, but ocxo2_delta_raw preserves the raw hardware value.
-    OCXO2_RAW_NOMINAL = 20_000_000
+
+    # v14: Both OCXOs on GPT single-edge counting.  All raw deltas are 10 MHz.
+    OCXO2_RAW_NOMINAL = 10_000_000
 
     for label, key, nominal in [
         ("DWT",   "dwt_delta_raw",   DWT_NOMINAL),
