@@ -658,6 +658,7 @@ def _assess_memory(mem: dict) -> tuple[str, list[str]]:
     heap_frag = mem.get("heap_fragmentation_pct", 0)
     heap_arena = mem.get("heap_arena", 0)
     heap_used = mem.get("heap_used", 0)
+    heap_free_above = mem.get("heap_free_above", 0)
 
     # Heap growth (leak indicator)
     if heap_growing:
@@ -677,7 +678,7 @@ def _assess_memory(mem: dict) -> tuple[str, list[str]]:
         findings.append(f"HEAP ELEVATED: {heap_used_pct}% committed")
 
     # Fragmentation (only matters if heap is large)
-    if heap_frag > 80 and heap_arena > 16384:
+    if heap_frag > 80 and heap_arena > 16384 and heap_free_above < 32768:
         findings.append(f"FRAGMENTATION: {heap_frag}% of {heap_arena} bytes")
 
     if any("CRITICAL" in f or "GROWING" in f for f in findings):
