@@ -1,8 +1,38 @@
 // ============================================================================
-// process_timepop.cpp — TimePop v4.2 (Caller-Owns-Target Nano-Spin)
+// process_timepop.cpp — TimePop v4.3 (Forensic Diagnostics)
 // ============================================================================
 //
 // The time experience in ZPNet is the GNSS clock.
+//
+// v4.3: Comprehensive forensic diagnostics.
+//
+//   Following a production stall where a PPS ASAP callback was lost
+//   with no trace, v4.3 adds slot-level and ASAP-specific telemetry
+//   to make such failures visible and diagnosable.
+//
+//   New diagnostics:
+//
+//   Slot pressure:
+//     slots_active_now       — current active slot count (snapshot)
+//     slots_high_water       — lifetime high-water mark of active slots
+//     slots_max              — compile-time MAX_SLOTS (for context)
+//     arm_failures           — total timepop_arm/arm_ns INVALID_HANDLE
+//
+//   ASAP tracking:
+//     asap_armed             — ASAP callbacks successfully armed
+//     asap_dispatched        — ASAP callbacks successfully dispatched
+//     asap_arm_failures      — ASAP arm attempts that returned
+//                              INVALID_HANDLE (slot exhaustion)
+//     asap_last_armed_dwt    — DWT_CYCCNT at last successful ASAP arm
+//     asap_last_dispatch_dwt — DWT_CYCCNT at last successful ASAP dispatch
+//
+//   Dispatch health:
+//     dispatch_calls         — total timepop_dispatch() invocations
+//     dispatch_callbacks     — total callbacks fired from dispatch
+//
+//   The ASAP armed-vs-dispatched delta is the critical signal:
+//   if armed > dispatched, an ASAP callback was lost between arm
+//   and dispatch.
 //
 // v4.2: Caller-owns-target for nano-precise timers.
 //
@@ -97,6 +127,41 @@ static volatile uint32_t isr_fire_count     = 0;
 static volatile uint32_t expired_count      = 0;
 static volatile uint32_t nano_spin_count    = 0;
 static volatile uint32_t nano_timeout_count = 0;
+
+// ── v4.3: Slot pressure ──
+static volatile uint32_t diag_slots_high_water  = 0;
+static volatile uint32_t diag_arm_failures      = 0;
+
+// ── v4.3: ASAP tracking ──
+//
+// ASAP callbacks are one-shot timers armed with delay_ns == 0.
+// They are immediately marked expired and dispatched on the next
+// timepop_dispatch() call.  The armed-vs-dispatched delta reveals
+// lost callbacks.
+static volatile uint32_t diag_asap_armed             = 0;
+static volatile uint32_t diag_asap_dispatched         = 0;
+static volatile uint32_t diag_asap_arm_failures       = 0;
+static volatile uint32_t diag_asap_last_armed_dwt     = 0;
+static volatile uint32_t diag_asap_last_dispatch_dwt  = 0;
+static volatile const char* diag_asap_last_armed_name = nullptr;
+
+// ── v4.3: Dispatch health ──
+static volatile uint32_t diag_dispatch_calls     = 0;
+static volatile uint32_t diag_dispatch_callbacks = 0;
+
+// ============================================================================
+// Slot counting helper (called with interrupts disabled)
+// ============================================================================
+
+static inline void update_slot_high_water(void) {
+  uint32_t active = 0;
+  for (uint32_t i = 0; i < MAX_SLOTS; i++) {
+    if (slots[i].active) active++;
+  }
+  if (active > diag_slots_high_water) {
+    diag_slots_high_water = active;
+  }
+}
 
 // ============================================================================
 // GPT2 helpers
@@ -311,14 +376,23 @@ timepop_handle_t timepop_arm(
     if (is_asap) {
       slots[i].deadline = 0;
       timepop_pending = true;
+      diag_asap_armed++;
+      diag_asap_last_armed_dwt  = ARM_DWT_CYCCNT;
+      diag_asap_last_armed_name = name;
     } else {
       slots[i].deadline = gpt2_count() + ticks;
       reload_ocr();
     }
 
+    update_slot_high_water();
+
     interrupts();
     return h;
   }
+
+  // All slots full
+  diag_arm_failures++;
+  if (is_asap) diag_asap_arm_failures++;
 
   interrupts();
   return TIMEPOP_INVALID_HANDLE;
@@ -384,10 +458,14 @@ timepop_handle_t timepop_arm_ns(
     slots[i].nano_timeout   = false;
     slots[i].deadline       = gpt2_deadline;
 
+    update_slot_high_water();
+
     reload_ocr();
     interrupts();
     return h;
   }
+
+  diag_arm_failures++;
 
   interrupts();
   return TIMEPOP_INVALID_HANDLE;
@@ -459,11 +537,17 @@ void timepop_dispatch(void) {
   if (!timepop_pending) return;
   timepop_pending = false;
 
+  diag_dispatch_calls++;
+
   for (uint32_t i = 0; i < MAX_SLOTS; i++) {
     if (!slots[i].active || !slots[i].expired) continue;
     if (slots[i].nano_precise) continue;
 
     slots[i].expired = false;
+
+    // Track ASAP dispatch: ASAP callbacks have period_ns == 0 and
+    // are non-recurring one-shots.  Their deadline is 0 (set at arm).
+    const bool is_asap = (slots[i].period_ns == 0 && !slots[i].recurring);
 
     timepop_ctx_t ctx;
     ctx.handle       = slots[i].handle;
@@ -487,6 +571,13 @@ void timepop_dispatch(void) {
     uint32_t end   = ARM_DWT_CYCCNT;
 
     cpu_usage_account_busy(end - start);
+
+    diag_dispatch_callbacks++;
+
+    if (is_asap) {
+      diag_asap_dispatched++;
+      diag_asap_last_dispatch_dwt = end;
+    }
 
     if (slots[i].active && slots[i].recurring) {
       if (slots[i].period_ticks == 0) {
@@ -844,6 +935,24 @@ static Payload cmd_report(const Payload&) {
   out.add("nano_spins",        nano_spin_count);
   out.add("nano_timeouts",     nano_timeout_count);
 
+  // ── v4.3: Slot pressure ──
+  out.add("slots_active_now",  timepop_active_count());
+  out.add("slots_high_water",  diag_slots_high_water);
+  out.add("slots_max",         (uint32_t)MAX_SLOTS);
+  out.add("arm_failures",      diag_arm_failures);
+
+  // ── v4.3: ASAP tracking ──
+  out.add("asap_armed",             diag_asap_armed);
+  out.add("asap_dispatched",        diag_asap_dispatched);
+  out.add("asap_arm_failures",      diag_asap_arm_failures);
+  out.add("asap_last_armed_dwt",    diag_asap_last_armed_dwt);
+  out.add("asap_last_dispatch_dwt", diag_asap_last_dispatch_dwt);
+  out.add("asap_last_armed_name", (const char*)(diag_asap_last_armed_name ? diag_asap_last_armed_name : ""));
+
+  // ── v4.3: Dispatch health ──
+  out.add("dispatch_calls",     diag_dispatch_calls);
+  out.add("dispatch_callbacks", diag_dispatch_callbacks);
+
   PayloadArray timers;
   for (uint32_t i = 0; i < MAX_SLOTS; i++) {
     if (!slots[i].active) continue;
@@ -856,6 +965,7 @@ static Payload cmd_report(const Payload&) {
     entry.add("deadline",  slots[i].deadline);
     entry.add("recurring", slots[i].recurring);
     entry.add("nano",      slots[i].nano_precise);
+    entry.add("expired",   slots[i].expired);
     timers.add(entry);
   }
   out.add_array("timers", timers);

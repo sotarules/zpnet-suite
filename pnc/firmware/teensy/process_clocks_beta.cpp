@@ -744,6 +744,14 @@ static Payload cmd_clocks_info(const Payload&) {
 
   p.add("pps_rejected_total",     diag_pps_rejected_total);
   p.add("pps_rejected_remainder", diag_pps_rejected_remainder);
+  p.add("pps_scheduled_stuck",     diag_pps_scheduled_stuck);
+  p.add("pps_watchdog_recoveries", diag_pps_watchdog_recoveries);
+  p.add("pps_asap_arm_failures",   diag_pps_asap_arm_failures);
+  p.add("pps_asap_armed",          diag_pps_asap_armed);
+  p.add("pps_asap_dispatched",     diag_pps_asap_dispatched);
+  p.add("pps_stuck_since_dwt",     diag_pps_stuck_since_dwt);
+  p.add("pps_stuck_max",           diag_pps_stuck_max);
+  p.add("pps_scheduled",           (bool)pps_scheduled);
 
   return p;
 }

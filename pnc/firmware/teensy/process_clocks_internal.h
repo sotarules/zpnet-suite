@@ -100,6 +100,13 @@ static constexpr uint32_t ISR_OCXO2_EXPECTED = TICKS_10MHZ_PER_SECOND;
 
 extern volatile uint32_t diag_pps_rejected_total;
 extern volatile uint32_t diag_pps_rejected_remainder;
+extern volatile uint32_t diag_pps_scheduled_stuck;
+extern volatile uint32_t diag_pps_watchdog_recoveries;
+extern volatile uint32_t diag_pps_asap_arm_failures;
+extern volatile uint32_t diag_pps_asap_armed;
+extern volatile uint32_t diag_pps_asap_dispatched;
+extern volatile uint32_t diag_pps_stuck_since_dwt;
+extern volatile uint32_t diag_pps_stuck_max;
 
 // ============================================================================
 // PPS state

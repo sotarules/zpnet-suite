@@ -2,6 +2,36 @@
 // process_clocks_alpha.cpp — Always-On Physics Layer
 // ============================================================================
 //
+// v16: PPS watchdog — self-healing pps_scheduled stall.
+//
+//   The PPS ISR defers all processing to a TimePop ASAP callback via
+//   pps_scheduled.  If the ASAP callback ever fails to fire (TimePop
+//   slot exhaustion, dispatch stall, or callback fault), pps_scheduled
+//   stays true and every subsequent PPS is silently rejected — killing
+//   the entire measurement pipeline with zero diagnostic output.
+//
+//   v16 fixes:
+//
+//   1. Consecutive-rejection watchdog: after PPS_WATCHDOG_THRESHOLD
+//      consecutive rejections due to pps_scheduled being stuck, the
+//      ISR force-clears pps_scheduled and re-arms.  This self-heals
+//      within PPS_WATCHDOG_THRESHOLD seconds (default 3).
+//
+//   2. timepop_arm() return value check: if timepop_arm() returns
+//      TIMEPOP_INVALID_HANDLE (slots full), pps_scheduled is
+//      immediately cleared and a diagnostic counter incremented.
+//
+//   3. Rich forensic counters: pps_scheduled_stuck (consecutive
+//      rejections due to stuck flag), pps_watchdog_recoveries
+//      (force-clear events), pps_asap_arm_failures (timepop_arm
+//      returned INVALID_HANDLE), pps_asap_armed (successful arms),
+//      pps_asap_dispatched (callback completions).  All surfaced
+//      in CLOCKS_INFO for post-mortem analysis.
+//
+//   4. DWT timestamp capture at stall onset: diag_pps_stuck_since_dwt
+//      records the DWT_CYCCNT at which the consecutive rejection
+//      counter first became nonzero, enabling elapsed-time forensics.
+//
 // v15: DAC dither telemetry + random walk prediction model.
 //
 //   ocxo_dither_one() now captures the integer DAC value written to
@@ -51,6 +81,20 @@
 
 static constexpr uint64_t OCXO_DITHER_NS   =     1000000ULL;  //   1 ms
 static constexpr uint64_t PPS_RELAY_OFF_NS  =   500000000ULL;  // 500 ms
+
+// ============================================================================
+// PPS watchdog — self-healing threshold
+//
+// If pps_scheduled remains stuck for this many consecutive PPS edges,
+// the ISR force-clears it and re-arms.  At 1 Hz PPS, this is also
+// the recovery time in seconds.
+//
+// 3 is chosen to distinguish a genuine one-off dispatch delay (1-2
+// edges) from a permanent stall, while recovering quickly enough
+// that an overnight campaign loses at most 3 seconds of data.
+// ============================================================================
+
+static constexpr uint32_t PPS_WATCHDOG_THRESHOLD = 3;
 
 // ============================================================================
 // Continuous DWT-to-GNSS Calibration (campaign-independent)
@@ -130,6 +174,38 @@ volatile bool     isr_residual_valid = false;
 
 volatile uint32_t diag_pps_rejected_total     = 0;
 volatile uint32_t diag_pps_rejected_remainder = 0;
+
+// ── v16 PPS watchdog diagnostics ──
+//
+// pps_scheduled_stuck:     consecutive PPS edges rejected because
+//                          pps_scheduled was true (resets to 0 on
+//                          each successful arm or watchdog recovery)
+//
+// pps_watchdog_recoveries: number of times the watchdog force-cleared
+//                          pps_scheduled (each represents a stall that
+//                          would have been permanent in v15)
+//
+// pps_asap_arm_failures:   timepop_arm() returned TIMEPOP_INVALID_HANDLE
+//                          (slot exhaustion — pps_scheduled cleared
+//                          immediately to avoid deadlock)
+//
+// pps_asap_armed:          successful timepop_arm() calls for PPS ASAP
+//
+// pps_asap_dispatched:     successful pps_asap_callback completions
+//
+// pps_stuck_since_dwt:     DWT_CYCCNT when the current stuck streak
+//                          began (0 when not stuck)
+//
+// pps_stuck_max:           high-water mark of pps_scheduled_stuck
+//                          (helps identify near-miss stalls)
+
+volatile uint32_t diag_pps_scheduled_stuck     = 0;
+volatile uint32_t diag_pps_watchdog_recoveries = 0;
+volatile uint32_t diag_pps_asap_arm_failures   = 0;
+volatile uint32_t diag_pps_asap_armed          = 0;
+volatile uint32_t diag_pps_asap_dispatched     = 0;
+volatile uint32_t diag_pps_stuck_since_dwt     = 0;
+volatile uint32_t diag_pps_stuck_max           = 0;
 
 // ============================================================================
 // PPS state
@@ -375,6 +451,7 @@ static void pps_asap_callback(timepop_ctx_t*, void*) {
   // ── Campaign-scoped processing (beta) ──
   clocks_beta_pps();
 
+  diag_pps_asap_dispatched++;
   pps_scheduled = false;
 }
 
@@ -383,6 +460,19 @@ static void pps_asap_callback(timepop_ctx_t*, void*) {
 //
 // Read order: DWT first (highest frequency, most latency-sensitive),
 // then the two GPTs (OCXO1, OCXO2), then QTimer1 (GNSS).
+//
+// v16: Watchdog for pps_scheduled stall.
+//
+//   If pps_scheduled remains true for PPS_WATCHDOG_THRESHOLD consecutive
+//   PPS edges, the ISR force-clears it and re-arms.  This prevents a
+//   single missed TimePop ASAP callback from permanently killing the
+//   measurement pipeline.
+//
+//   The force-clear is safe: the original ASAP callback either already
+//   fired (and something prevented pps_scheduled = false), or it was
+//   lost entirely.  In both cases, the ISR snapshots in isr_snap_*
+//   are being overwritten each PPS regardless, so re-arming with
+//   fresh snapshots is correct.
 // ============================================================================
 
 static void pps_isr(void) {
@@ -423,10 +513,47 @@ static void pps_isr(void) {
   isr_prev_ocxo1 = isr_snap_ocxo1 = snap_ocxo1;
   isr_prev_ocxo2 = isr_snap_ocxo2 = snap_ocxo2;
 
-  if (pps_scheduled) return;
+  // ── v16: PPS watchdog — detect and recover from pps_scheduled stall ──
+  if (pps_scheduled) {
+    diag_pps_scheduled_stuck++;
+
+    if (diag_pps_scheduled_stuck == 1) {
+      diag_pps_stuck_since_dwt = snap_dwt;
+    }
+
+    if (diag_pps_scheduled_stuck > diag_pps_stuck_max) {
+      diag_pps_stuck_max = diag_pps_scheduled_stuck;
+    }
+
+    if (diag_pps_scheduled_stuck < PPS_WATCHDOG_THRESHOLD) {
+      return;
+    }
+
+    // Watchdog triggered: force-clear and fall through to re-arm.
+    // The old ASAP callback is either lost or already fired without
+    // clearing the flag.  Either way, re-arming is safe — we have
+    // fresh ISR snapshots above.
+    pps_scheduled = false;
+    diag_pps_watchdog_recoveries++;
+    diag_pps_scheduled_stuck = 0;
+    diag_pps_stuck_since_dwt = 0;
+  } else {
+    diag_pps_scheduled_stuck = 0;
+    diag_pps_stuck_since_dwt = 0;
+  }
+
   pps_scheduled = true;
 
-  timepop_arm(0, false, pps_asap_callback, nullptr, "pps");
+  timepop_handle_t h = timepop_arm(0, false, pps_asap_callback, nullptr, "pps");
+  if (h == TIMEPOP_INVALID_HANDLE) {
+    // TimePop slots full — cannot arm the ASAP callback.
+    // Clear pps_scheduled immediately so the next PPS edge can retry
+    // instead of deadlocking.
+    pps_scheduled = false;
+    diag_pps_asap_arm_failures++;
+  } else {
+    diag_pps_asap_armed++;
+  }
 }
 
 // ============================================================================
