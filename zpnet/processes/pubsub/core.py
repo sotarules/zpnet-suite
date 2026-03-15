@@ -5,10 +5,24 @@ Roles:
   • Pi-side device driver for Teensy (RPC + pub/sub transport)
   • Authoritative pub/sub router
   • First-class Pi process (PUBSUB) for orchestration & introspection
+  • TCP bridge for SERVER machine (Meteor/Node.js via reverse tunnel)
 
 IMPORTANT:
   • SUBSCRIBE / UNSUBSCRIBE are COMMANDS ONLY
   • Pub/Sub channel is DATA PLANE ONLY
+
+SERVER integration:
+  • Pubsub listens on a TCP port (localhost only)
+  • SERVER connects through the SSH reverse tunnel
+  • Wire protocol: newline-delimited JSON, bidirectional
+  • SERVER is a first-class machine with subscriptions and commands
+  • One persistent connection at a time; graceful reconnect
+
+SERVER command relay:
+  • Pi-side processes send commands to SERVER via send_command(machine="SERVER")
+  • These arrive at the SERVER_CMD_SOCKET Unix socket owned by pubsub
+  • Pubsub relays them over the TCP bridge and returns the response
+  • Symmetric with the Teensy RPC relay (RPC_SOCKET_PATH)
 """
 
 from __future__ import annotations
@@ -59,6 +73,17 @@ TRANSPORT_RETRY_INTERVAL_S = 0.25   # poll every 250 ms — aggressive but not a
 # These are test/utility programs that may leave stale sockets behind.
 SUBSYSTEM_SKIP = {"TIMEBASE_WATCH"}
 
+# SERVER TCP configuration
+SERVER_TCP_HOST = "127.0.0.1"     # localhost only — SERVER arrives via reverse tunnel
+SERVER_TCP_PORT = 9800            # configurable; must match SERVER-side client
+SERVER_TCP_BACKLOG = 1            # one connection at a time
+
+# SERVER command relay socket (Pi → SERVER via pubsub TCP bridge)
+# Symmetric with RPC_SOCKET_PATH (Pi → TEENSY via pubsub HID/serial)
+SERVER_CMD_SOCKET_PATH = "/tmp/zpnet_server_cmd.sock"
+SERVER_CMD_BACKLOG = 4
+SERVER_CMD_TIMEOUT_S = 30.0       # max wait for SERVER to respond
+
 # ---------------------------------------------------------------------
 # Global state
 # ---------------------------------------------------------------------
@@ -106,6 +131,35 @@ applied_union: Dict[str, Any] = {}
 
 state_lock = threading.Lock()
 debug_log_fh: Optional[TextIO] = None
+
+# ---------------------------------------------------------------------
+# SERVER connection state
+# ---------------------------------------------------------------------
+#
+# Persistent bidirectional TCP connection to the SERVER machine.
+#
+# server_conn is the live socket (or None if SERVER is not connected).
+# server_conn_lock serializes writes and connection lifecycle.
+# server_subscriptions holds the most recent subscription declaration
+# from SERVER, in the same canonical shape as PI/TEENSY declarations.
+#
+# server_pending_commands holds pending command relay requests:
+#   req_id → Queue(maxsize=1)
+# These are commands sent FROM Pi-side processes TO SERVER.
+# The reader thread deposits SERVER's response into the queue.
+#
+# Semantics:
+#   • One connection at a time
+#   • Reader thread owns recv; writer path is shared via lock
+#   • Disconnect clears server_conn and server_subscriptions
+#   • Reconnect replaces both atomically
+#
+# ---------------------------------------------------------------------
+
+server_conn: Optional[socket.socket] = None
+server_conn_lock = threading.Lock()
+server_subscriptions: List[Dict[str, Any]] = []
+server_pending_commands: Dict[int, Queue] = {}
 
 # ------------------------------------------------------------------
 # Logging
@@ -242,6 +296,9 @@ def route_publish(msg: Dict[str, Any], *, forward_to_teensy: bool) -> None:
       • Forward to TEENSY at most once (transport layer) if:
           - forward_to_teensy is True, and
           - at least one TEENSY target exists for the topic
+      • Forward to SERVER via persistent TCP connection if:
+          - at least one SERVER target exists for the topic
+          - SERVER is connected
       • Best-effort, silence on per-target failure
     """
     topic = msg.get("topic")
@@ -262,10 +319,15 @@ def route_publish(msg: Dict[str, Any], *, forward_to_teensy: bool) -> None:
     raw = payload_to_json_bytes(msg)
 
     teensy_needed = False
+    server_needed = False
 
     for machine, subsystem in targets:
         if machine == "TEENSY":
             teensy_needed = True
+            continue
+
+        if machine == "SERVER":
+            server_needed = True
             continue
 
         # PI target: deliver to its pubsub socket
@@ -280,6 +342,519 @@ def route_publish(msg: Dict[str, Any], *, forward_to_teensy: bool) -> None:
 
     if forward_to_teensy and teensy_needed:
         transport_send(TRAFFIC_PUBLISH_SUBSCRIBE, msg)
+
+    if server_needed:
+        _server_send_publication(msg)
+
+
+def _server_send_publication(msg: Dict[str, Any]) -> None:
+    """
+    Forward a publication to SERVER over the persistent TCP connection.
+
+    Wire format: newline-delimited JSON with type=publish.
+    Best-effort: if SERVER is disconnected, silently skip.
+    """
+    wire_msg = {
+        "type": "publish",
+        "topic": msg.get("topic"),
+        "payload": msg.get("payload"),
+    }
+
+    _server_send(wire_msg)
+
+
+def _server_send(wire_msg: Dict[str, Any]) -> None:
+    """
+    Send a single wire message to SERVER.
+
+    Serializes as compact JSON + newline.
+    Thread-safe via server_conn_lock.
+    Best-effort: disconnects are logged, not fatal.
+    """
+    with server_conn_lock:
+        conn = server_conn
+        if conn is None:
+            return
+
+        try:
+            line = json.dumps(wire_msg, separators=(",", ":")) + "\n"
+            conn.sendall(line.encode("utf-8"))
+        except Exception:
+            logging.warning("⚠️ [pubsub] SERVER send failed (disconnected?)")
+
+
+# ---------------------------------------------------------------------
+# SERVER TCP listener and connection handler
+# ---------------------------------------------------------------------
+
+def server_tcp_listener() -> None:
+    """
+    Accept TCP connections from SERVER.
+
+    Binds to localhost on SERVER_TCP_PORT.
+    Accepts one connection at a time.
+    Each connection spawns a reader thread and replaces any prior connection.
+    """
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind((SERVER_TCP_HOST, SERVER_TCP_PORT))
+    srv.listen(SERVER_TCP_BACKLOG)
+
+    logging.info("🌐 [pubsub] SERVER TCP listener on %s:%d", SERVER_TCP_HOST, SERVER_TCP_PORT)
+
+    while True:
+        conn, addr = srv.accept()
+        logging.info("🌐 [pubsub] SERVER connected from %s:%d", addr[0], addr[1])
+
+        # Replace any prior connection
+        _server_disconnect("new connection replacing old")
+
+        with server_conn_lock:
+            global server_conn
+            server_conn = conn
+
+        threading.Thread(
+            target=_server_reader,
+            args=(conn,),
+            daemon=True,
+            name="server-tcp-reader",
+        ).start()
+
+
+def _server_disconnect(reason: str) -> None:
+    """
+    Cleanly tear down the SERVER connection.
+
+    Clears the socket, subscription state, and any pending command relays.
+    Pending command relays receive an error response so callers don't hang.
+    """
+    global server_conn
+
+    with server_conn_lock:
+        old = server_conn
+        server_conn = None
+
+    if old is not None:
+        try:
+            old.close()
+        except Exception:
+            pass
+        logging.info("🌐 [pubsub] SERVER disconnected (%s)", reason)
+
+    with state_lock:
+        server_subscriptions.clear()
+
+        # Unblock any Pi-side callers waiting for SERVER command responses
+        for req_id, q in server_pending_commands.items():
+            q.put({
+                "success": False,
+                "message": "SERVER disconnected",
+                "payload": {},
+            })
+        server_pending_commands.clear()
+
+
+def _server_reader(conn: socket.socket) -> None:
+    """
+    Read newline-delimited JSON messages from SERVER.
+
+    Each message has a "type" field:
+      • "subscribe"  — SERVER declares its subscriptions
+      • "command"    — SERVER sends a command to PI or TEENSY
+      • "publish"    — SERVER publishes to the bus
+      • "response"   — SERVER returns a response to a relayed command
+
+    On disconnect (EOF or error), cleans up and exits.
+    """
+    buf = b""
+
+    try:
+        while True:
+            chunk = conn.recv(65536)
+            if not chunk:
+                break
+
+            buf += chunk
+
+            while b"\n" in buf:
+                line, buf = buf.split(b"\n", 1)
+                if not line.strip():
+                    continue
+
+                msg = json.loads(line.decode("utf-8"))
+                msg_type = msg.get("type")
+
+                if msg_type == "subscribe":
+                    _server_handle_subscribe(msg)
+                elif msg_type == "command":
+                    _server_handle_command(msg, conn)
+                elif msg_type == "publish":
+                    _server_handle_publish(msg)
+                elif msg_type == "response":
+                    _server_handle_response(msg)
+                else:
+                    logging.warning("⚠️ [pubsub] SERVER sent unknown message type: %r", msg_type)
+
+    except Exception:
+        logging.exception("💥 [pubsub] SERVER reader exception")
+    finally:
+        _server_disconnect("reader exited")
+
+
+def _server_handle_subscribe(msg: Dict[str, Any]) -> None:
+    """
+    Process a subscription declaration from SERVER.
+
+    Expected shape:
+        {
+            "type": "subscribe",
+            "subscriptions": [
+                {
+                    "machine": "SERVER",
+                    "subsystem": "SYSTEM",
+                    "subscriptions": [
+                        {"name": "EVENTS"},
+                        {"name": "TIMEBASE"}
+                    ]
+                }
+            ]
+        }
+
+    This replaces the entire SERVER subscription set.
+    A REFRESH is triggered automatically to rebuild routes.
+    """
+    with state_lock:
+        server_subscriptions.clear()
+        server_subscriptions.extend(msg.get("subscriptions", []))
+
+    logging.info(
+        "🌐 [pubsub] SERVER subscriptions updated (%d entries)",
+        len(server_subscriptions),
+    )
+
+    # Auto-refresh routes to include SERVER subscriptions
+    try:
+        cmd_refresh(None)
+    except Exception:
+        logging.exception("⚠️ [pubsub] auto REFRESH after SERVER subscribe failed")
+
+
+def _server_handle_command(msg: Dict[str, Any], conn: socket.socket) -> None:
+    """
+    Route a command from SERVER to the target machine.
+
+    Expected shape:
+        {
+            "type": "command",
+            "req_id": <int>,       (SERVER-assigned, returned in response)
+            "machine": "PI"|"TEENSY",
+            "subsystem": "CLOCKS",
+            "command": "REPORT",
+            "args": {...}          (optional)
+        }
+
+    The response is sent back to SERVER on the same connection as:
+        {
+            "type": "response",
+            "req_id": <int>,
+            "success": true|false,
+            "message": "...",
+            "payload": {...}
+        }
+    """
+    server_req_id = msg.get("req_id")
+    machine = msg.get("machine")
+    subsystem = msg.get("subsystem")
+    command = msg.get("command")
+    args = msg.get("args")
+
+    try:
+        if machine == "TEENSY":
+            resp = _server_command_to_teensy(subsystem, command, args)
+        elif machine == "PI":
+            resp = send_command(
+                machine="PI",
+                subsystem=subsystem,
+                command=command,
+                args=args,
+            )
+        else:
+            resp = {
+                "success": False,
+                "message": f"unknown target machine: {machine}",
+                "payload": {},
+            }
+    except Exception as e:
+        resp = {
+            "success": False,
+            "message": str(e),
+            "payload": {},
+        }
+
+    wire_resp = {
+        "type": "response",
+        "req_id": server_req_id,
+        "success": resp.get("success", False),
+        "message": resp.get("message", ""),
+        "payload": resp.get("payload", {}),
+    }
+
+    _server_send(wire_resp)
+
+
+def _server_command_to_teensy(
+    subsystem: str,
+    command: str,
+    args: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """
+    Route a SERVER-originated command to TEENSY via the RPC path.
+
+    Uses the same req_id / pending_replies / transport_send mechanism
+    as handle_client, but without the Unix socket wrapper.
+    """
+    req: Dict[str, Any] = {
+        "machine": "TEENSY",
+        "subsystem": subsystem,
+        "command": command,
+    }
+    if args is not None:
+        req["args"] = args
+
+    for attempt in range(MAX_TEENSY_RETRIES):
+        req_id = next(req_id_counter)
+        req["req_id"] = req_id
+        req["req_ts_ms"] = int(time.monotonic() * 1000)
+
+        q = Queue(maxsize=1)
+        with state_lock:
+            pending_replies[req_id] = q
+
+        try:
+            transport_send(TRAFFIC_REQUEST_RESPONSE, req)
+            reply = q.get(timeout=REPLY_TIMEOUT_S)
+            return reply
+
+        except Empty:
+            with state_lock:
+                pending_replies.pop(req_id, None)
+            continue
+
+    return {
+        "success": False,
+        "message": "TEENSY did not respond",
+        "payload": {},
+    }
+
+
+def _server_handle_publish(msg: Dict[str, Any]) -> None:
+    """
+    Handle a publication from SERVER.
+
+    SERVER publishes are routed to all subscribers (PI + TEENSY)
+    but NOT echoed back to SERVER.
+    """
+    pub_msg = {
+        "topic": msg.get("topic"),
+        "payload": msg.get("payload"),
+    }
+
+    # Route to PI and TEENSY targets, but do not fan-out back to SERVER.
+    # We achieve this by routing normally and relying on the fact that
+    # SERVER targets in route_publish will send back to the same connection.
+    # However, to avoid echo, we route without SERVER targets.
+
+    topic = pub_msg.get("topic")
+    if not topic:
+        return
+
+    log_pubsub(pub_msg)
+
+    with state_lock:
+        topic_routes = routes_by_topic.get(topic, set())
+
+    targets = set(topic_routes)
+    raw = payload_to_json_bytes(pub_msg)
+
+    teensy_needed = False
+
+    for machine, subsystem in targets:
+        if machine == "TEENSY":
+            teensy_needed = True
+            continue
+
+        if machine == "SERVER":
+            # Do NOT echo back to the originator
+            continue
+
+        # PI target
+        sock_path = f"{SOCKET_DIR}/zpnet-{subsystem.lower()}-pubsub.sock"
+        try:
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+                sock.connect(sock_path)
+                sock.sendall(raw)
+                sock.shutdown(socket.SHUT_WR)
+        except Exception:
+            logging.warning("⚠️ [pubsub] fan-out failed %s -> %s:%s", topic, machine, subsystem)
+
+    if teensy_needed:
+        transport_send(TRAFFIC_PUBLISH_SUBSCRIBE, pub_msg)
+
+
+def _server_handle_response(msg: Dict[str, Any]) -> None:
+    """
+    Handle a command response from SERVER.
+
+    This is the return path for commands relayed from Pi-side
+    processes to SERVER via the SERVER_CMD_SOCKET.
+
+    Expected shape:
+        {
+            "type": "response",
+            "req_id": <int>,
+            "success": true|false,
+            "message": "...",
+            "payload": {...}
+        }
+
+    The req_id is used to find the waiting Queue and unblock
+    the caller in server_cmd_relay_server.
+    """
+    req_id = msg.get("req_id")
+    if req_id is None:
+        logging.warning("⚠️ [pubsub] SERVER response missing req_id — discarded")
+        return
+
+    with state_lock:
+        q = server_pending_commands.pop(req_id, None)
+
+    if q is None:
+        logging.warning(
+            "⚠️ [pubsub] SERVER response for unknown req_id=%s — discarded",
+            req_id,
+        )
+        return
+
+    q.put(msg)
+
+
+# ---------------------------------------------------------------------
+# SERVER command relay (Pi → SERVER)
+# ---------------------------------------------------------------------
+#
+# This is the reverse direction: a Pi-side process calls
+# send_command(machine="SERVER", ...) which connects to
+# SERVER_CMD_SOCKET_PATH.  Pubsub accepts the connection,
+# forwards the command over the TCP bridge, and blocks until
+# SERVER responds (or timeout).
+#
+# Structurally symmetric with handle_client (Pi → TEENSY relay).
+#
+# ---------------------------------------------------------------------
+
+def server_cmd_relay_server() -> None:
+    """
+    Accept Pi-side command requests destined for SERVER.
+
+    Binds SERVER_CMD_SOCKET_PATH.
+    Each connection is one synchronous command relay.
+    """
+    if os.path.exists(SERVER_CMD_SOCKET_PATH):
+        os.unlink(SERVER_CMD_SOCKET_PATH)
+
+    srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    srv.bind(SERVER_CMD_SOCKET_PATH)
+    srv.listen(SERVER_CMD_BACKLOG)
+
+    logging.info("🌐 [pubsub] SERVER command relay on %s", SERVER_CMD_SOCKET_PATH)
+
+    while True:
+        conn, _ = srv.accept()
+        threading.Thread(
+            target=_handle_server_cmd_client,
+            args=(conn,),
+            daemon=True,
+            name="server-cmd-relay",
+        ).start()
+
+
+def _handle_server_cmd_client(conn: socket.socket) -> None:
+    """
+    Relay a single command from a Pi-side caller to SERVER.
+
+    Protocol (identical to Teensy RPC from the caller's perspective):
+      1. Read JSON request from Unix socket
+      2. Assign a req_id and forward to SERVER over TCP
+      3. Block on Queue until SERVER responds or timeout
+      4. Return response to caller on Unix socket
+
+    If SERVER is not connected, returns an immediate error.
+    """
+    try:
+        raw = conn.recv(65536)
+        if not raw:
+            return
+
+        req = json.loads(raw.decode("utf-8"))
+
+        # Check SERVER connectivity before attempting relay
+        with server_conn_lock:
+            if server_conn is None:
+                conn.sendall(json.dumps({
+                    "success": False,
+                    "message": "SERVER not connected",
+                    "payload": {},
+                }, separators=(",", ":")).encode("utf-8"))
+                return
+
+        # Assign a relay req_id (internal to pubsub, not the caller's)
+        req_id = next(req_id_counter)
+
+        q = Queue(maxsize=1)
+        with state_lock:
+            server_pending_commands[req_id] = q
+
+        # Forward to SERVER over TCP
+        wire_msg = {
+            "type": "command",
+            "req_id": req_id,
+            "machine": "SERVER",
+            "subsystem": req.get("subsystem"),
+            "command": req.get("command"),
+        }
+        if req.get("args") is not None:
+            wire_msg["args"] = req["args"]
+
+        _server_send(wire_msg)
+
+        # Block until SERVER responds or timeout
+        try:
+            resp = q.get(timeout=SERVER_CMD_TIMEOUT_S)
+
+            # Return the semantic response, stripping wire envelope
+            relay_resp = {
+                "success": resp.get("success", False),
+                "message": resp.get("message", ""),
+                "payload": resp.get("payload", {}),
+            }
+
+        except Empty:
+            with state_lock:
+                server_pending_commands.pop(req_id, None)
+
+            relay_resp = {
+                "success": False,
+                "message": "SERVER did not respond",
+                "payload": {},
+            }
+
+        conn.sendall(
+            json.dumps(relay_resp, separators=(",", ":")).encode("utf-8")
+        )
+
+    finally:
+        conn.close()
+
 
 # ---------------------------------------------------------------------
 # Servers
@@ -326,6 +901,10 @@ def cmd_diagnostics(_: Optional[dict]) -> Dict[str, Any]:
     with state_lock:
         pending_count = len(pending_replies)
         pending_ids = list(pending_replies.keys())
+        server_cmd_pending = len(server_pending_commands)
+
+    with server_conn_lock:
+        server_connected = server_conn is not None
 
     return {
         "success": True,
@@ -336,6 +915,9 @@ def cmd_diagnostics(_: Optional[dict]) -> Dict[str, Any]:
             "req_id_current": next(req_id_counter),
             "routes_topic_count": len(routes_by_topic),
             "active_threads": threading.active_count(),
+            "server_connected": server_connected,
+            "server_subscription_count": len(server_subscriptions),
+            "server_cmd_pending": server_cmd_pending,
         },
     }
 
@@ -430,7 +1012,8 @@ def cmd_allsubscriptions(_: Optional[dict]) -> Dict[str, Any]:
 
 def cmd_unionsubscriptions(_: Optional[dict]) -> Dict[str, Any]:
     """
-    Return the union of PI-side and TEENSY-side declared subscriptions.
+    Return the union of PI-side, TEENSY-side, and SERVER-side
+    declared subscriptions.
 
     Semantics:
       • Observational only
@@ -462,7 +1045,12 @@ def cmd_unionsubscriptions(_: Optional[dict]) -> Dict[str, Any]:
     except Exception:
         logging.warning("⚠️ [pubsub] failed to collect TEENSY subscriptions")
 
-    # 3) Canonical ordering
+    # 3) SERVER-side (from cached subscription declaration)
+    with state_lock:
+        if server_subscriptions:
+            results.extend(list(server_subscriptions))
+
+    # 4) Canonical ordering
     results.sort(key=lambda x: (x.get("machine"), x.get("subsystem")))
 
     return {
@@ -478,11 +1066,14 @@ def cmd_refresh(_: Optional[dict]) -> Dict[str, Any]:
     REFRESH — commit canonical subscription truth.
 
     Semantics:
-      • Collect PI + TEENSY declared subscriptions
+      • Collect PI + TEENSY + SERVER declared subscriptions
       • Union them into a single canonical payload
       • Commit that payload verbatim to:
           1) TEENSY (SETSUBSCRIPTIONS)
           2) PI (local routing state)
+      • SERVER subscriptions are included in the routing table
+        but are NOT forwarded to TEENSY (TEENSY does not need to
+        know about SERVER; pubsub handles SERVER fan-out)
     """
 
     # 1) Observe + union (single source of truth)
@@ -490,6 +1081,9 @@ def cmd_refresh(_: Optional[dict]) -> Dict[str, Any]:
     union_payload = union_resp.get("payload", {})
 
     # 2) Commit union verbatim to TEENSY
+    #    NOTE: TEENSY receives the full union including SERVER entries.
+    #    This is harmless — TEENSY ignores subscriptions it doesn't
+    #    originate, and the union is observational truth.
     try:
         teensy_resp = send_command(
             machine="TEENSY",
@@ -638,6 +1232,20 @@ def run() -> None:
 
     threading.Thread(target=rpc_server, daemon=True).start()
     threading.Thread(target=pubsub_server, daemon=True).start()
+
+    # SERVER TCP listener — accepts connections from the Meteor server
+    threading.Thread(
+        target=server_tcp_listener,
+        daemon=True,
+        name="server-tcp-listener",
+    ).start()
+
+    # SERVER command relay — accepts Pi→SERVER command requests
+    threading.Thread(
+        target=server_cmd_relay_server,
+        daemon=True,
+        name="server-cmd-relay",
+    ).start()
 
     # Automatic control-plane convergence
     threading.Thread(

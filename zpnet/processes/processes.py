@@ -19,6 +19,11 @@ Semantics:
   • No lifecycle obsession
   • Subscription state is clobber-and-go
 
+Machine routing:
+  • PI      — direct Unix domain socket to subsystem
+  • TEENSY  — via pubsub RPC broker (Unix socket → HID/serial)
+  • SERVER  — via pubsub TCP bridge (Unix socket → TCP → Meteor)
+
 Author: The Mule + GPT
 """
 
@@ -51,6 +56,25 @@ TEENSY_REQUEST_RESPONSE_SOCKET = "/tmp/zpnet_teensy_rt.sock"
 TEENSY_PUBLISH_SUBSCRIBE_SOCKET = "/tmp/zpnet_teensy_ps.sock"
 
 # =============================================================================
+# SERVER command relay socket
+# =============================================================================
+#
+# Commands destined for SERVER are relayed through pubsub's TCP bridge.
+# This Unix domain socket is owned by pubsub and speaks the same
+# request/response JSON protocol as the Teensy RPC socket.
+#
+# Wire format (identical to TEENSY RPC):
+#   Request:  {"machine": "SERVER", "subsystem": "...", "command": "...", "args": {...}}
+#   Response: {"success": true|false, "message": "...", "payload": {...}}
+#
+# This socket exists only when pubsub is running.
+# Failures propagate the same way as TEENSY failures.
+#
+# =============================================================================
+
+SERVER_COMMAND_SOCKET = "/tmp/zpnet_server_cmd.sock"
+
+# =============================================================================
 # Helpers
 # =============================================================================
 
@@ -78,7 +102,7 @@ def list_subsystems() -> list[str]:
     return sorted(subsystems)
 
 # =============================================================================
-# Canonical RPC client (MINIMALLY REVISED)
+# Canonical RPC client
 # =============================================================================
 
 def send_command(
@@ -97,6 +121,11 @@ def send_command(
       • JSON-in / JSON-out
       • Bounded retries at unowned transport boundary
       • Any persistent failure propagates
+
+    Machine routing:
+      • PI      — direct to subsystem's Unix command socket
+      • TEENSY  — via pubsub RPC broker (TEENSY_REQUEST_RESPONSE_SOCKET)
+      • SERVER  — via pubsub TCP bridge (SERVER_COMMAND_SOCKET)
     """
 
     if machine == "PI":
@@ -114,7 +143,11 @@ def send_command(
                 }
             }
 
+    elif machine == "SERVER":
+        sock_path = SERVER_COMMAND_SOCKET
+
     else:
+        # TEENSY (and any future machine routed through pubsub RPC)
         sock_path = TEENSY_REQUEST_RESPONSE_SOCKET
 
     req: Dict[str, Any] = {
