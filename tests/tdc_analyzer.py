@@ -1,33 +1,39 @@
 """
-ZPNet TDC Analyzer — Derive TDC correction constants from TIMEBASE data
+ZPNet TDC Analyzer — v6 Spin Capture Edition
 
-Usage:
-    python -m zpnet.tests.tdc_analyzer <campaign_name>
-    .zt tdc_analyzer Test2
+Analyzes the spin capture data from process_clocks_alpha v17 to derive
+TDC correction constants at 1008 MHz.
 
-Reads all TIMEBASE rows for the named campaign and analyzes Teensy
-dispatch / latch latency in the DWT cycle domain.
+The spin capture fires a nano-precise TimePop callback ~50 µs before
+each PPS edge, landing on a predicted DWT cycle count with zero jitter.
+The PPS ISR then captures its own DWT snapshot.  The delta between
+the two reveals the ISR entry latency fingerprint.
 
-  The dispatch delta (ISR DWT snapshot − spin loop shadow DWT) tells
-  you how many DWT cycles elapsed between the last shadow read and
-  the PPS ISR entry.  Two data sources, in priority order:
-    1. Raw cycle counts: diag_raw_isr_cyc − diag_raw_shadow_cyc
-    2. Fallback: diag_teensy_dispatch_delta_ns back-derived to cycles
+Key fields from TIMEBASE rows:
 
-At 1008 MHz the delta should cluster at discrete values separated by
-the loop cycle count.  The minimum cluster center is the fixed overhead.
+  spin_valid          — true if both spin and ISR captured successfully
+  spin_delta_cycles   — isr_dwt - landed_dwt (the TDC measurement)
+  spin_error_cycles   — landed_dwt - target_dwt (nano-spin precision)
+  spin_landed_dwt     — DWT where the nano-spin landed
+  spin_isr_dwt        — DWT captured by the PPS ISR
+  spin_timed_out      — true if the nano-spin timed out
+
+The spin_delta_cycles histogram should cluster at discrete values
+determined by the ISR entry latency and the instruction that was
+executing when the PPS interrupt fired.
 
 This tool:
-  1. Extracts delta values from TIMEBASE records
-  2. Builds a histogram of delta values
-  3. Identifies clusters (discrete peaks)
-  4. Computes fixed overhead (minimum cluster center)
-  5. Computes loop cycle spacing between clusters
-  6. Computes max correction (number of primary clusters)
-  7. Outputs recommended C++ constants / correction tables
+  1. Extracts spin_delta_cycles from valid TIMEBASE records
+  2. Builds a histogram and identifies clusters
+  3. Separates the fixed early-arrival component (~50 µs) from
+     the ISR latency jitter component
+  4. Analyzes spin_error_cycles for nano-spin precision
+  5. Derives recommended TDC constants for firmware
 
-v5: Pi clock domain removed.  Teensy-only analysis.
-    DWT PPS period stability retained for interpolation quality.
+Usage:
+    python -m zpnet.tests.tdc_analyzer <campaign_name> [limit]
+    .zt tdc_analyzer Baseline8
+    .zt tdc_analyzer Baseline8 200
 """
 
 from __future__ import annotations
@@ -36,65 +42,52 @@ import json
 import math
 import sys
 from collections import Counter
-from functools import reduce
-from math import gcd
 from typing import Any, Dict, List, Optional, Tuple
 
 from zpnet.shared.db import open_db
 
-
-# ---------------------------------------------------------------------
-# Configuration
-# ---------------------------------------------------------------------
-
 DWT_FREQ_HZ = 1_008_000_000
-DWT_NS_PER_CYCLE = 125.0 / 126.0   # 1008 MHz → 0.992 ns/cycle
-MAX_DELTA = 1000
-
-# Reference constants for comparison (update after each recalibration)
-REFERENCE_OVERHEAD = 50
-REFERENCE_LOOP = 6
-REFERENCE_MAX_CORR = 5
-REFERENCE_LABEL = "600 MHz"
+DWT_NS_PER_CYCLE = 125.0 / 126.0
+EARLY_MARGIN_NS = 50_000  # 50 µs early arrival target
 
 
-# ---------------------------------------------------------------------
-# Delta extraction
-# ---------------------------------------------------------------------
+class Welford:
+    __slots__ = ("n", "mean", "m2", "min_val", "max_val")
 
-def _extract_delta(r: Dict[str, Any]) -> Tuple[Optional[int], str]:
-    """Extract Teensy dispatch delta in DWT cycles.
+    def __init__(self) -> None:
+        self.n = 0
+        self.mean = 0.0
+        self.m2 = 0.0
+        self.min_val: Optional[float] = None
+        self.max_val: Optional[float] = None
 
-    Returns (delta_cycles, source) or (None, reason).
-    """
-    # Priority 1: Raw cycle counts (exact)
-    isr_cyc = r.get("diag_raw_isr_cyc")
-    shadow_cyc = r.get("diag_raw_shadow_cyc")
+    def update(self, x: float) -> None:
+        self.n += 1
+        d1 = x - self.mean
+        self.mean += d1 / self.n
+        d2 = x - self.mean
+        self.m2 += d1 * d2
+        if self.min_val is None or x < self.min_val:
+            self.min_val = x
+        if self.max_val is None or x > self.max_val:
+            self.max_val = x
 
-    if isr_cyc is not None and shadow_cyc is not None:
-        delta = (int(isr_cyc) - int(shadow_cyc)) & 0xFFFFFFFF
-        return (delta, "raw") if delta > 0 else (None, "zero")
+    @property
+    def stddev(self) -> float:
+        return math.sqrt(self.m2 / (self.n - 1)) if self.n >= 2 else 0.0
 
-    # Priority 2: Back-derive from ns
-    delta_ns = r.get("diag_teensy_dispatch_delta_ns")
-    if delta_ns is None:
-        return (None, "null")
+    @property
+    def stderr(self) -> float:
+        return self.stddev / math.sqrt(self.n) if self.n >= 2 else 0.0
 
-    delta_ns = int(delta_ns)
-    if delta_ns <= 0:
-        return (None, "zero")
+    @property
+    def range(self) -> float:
+        if self.min_val is not None and self.max_val is not None:
+            return self.max_val - self.min_val
+        return 0.0
 
-    # Back-derive cycles: ns × 126 / 125 (1008 MHz DWT)
-    delta_cycles = round(delta_ns * 126 / 125)
-    return (delta_cycles, "ns")
-
-
-# ---------------------------------------------------------------------
-# Fetch campaign TIMEBASE rows
-# ---------------------------------------------------------------------
 
 def fetch_timebase(campaign: str) -> List[Dict[str, Any]]:
-    """Fetch all TIMEBASE rows for a campaign, ordered by pps_count."""
     with open_db(row_dict=True) as conn:
         cur = conn.cursor()
         cur.execute(
@@ -118,50 +111,10 @@ def fetch_timebase(campaign: str) -> List[Dict[str, Any]]:
     return result
 
 
-# ---------------------------------------------------------------------
-# Welford's online stats
-# ---------------------------------------------------------------------
-
-class WelfordStats:
-    __slots__ = ("n", "mean", "m2", "min_val", "max_val")
-
-    def __init__(self):
-        self.n = 0
-        self.mean = 0.0
-        self.m2 = 0.0
-        self.min_val = float("inf")
-        self.max_val = float("-inf")
-
-    def update(self, x: float):
-        self.n += 1
-        d1 = x - self.mean
-        self.mean += d1 / self.n
-        d2 = x - self.mean
-        self.m2 += d1 * d2
-        if x < self.min_val:
-            self.min_val = x
-        if x > self.max_val:
-            self.max_val = x
-
-    @property
-    def stddev(self) -> float:
-        return math.sqrt(self.m2 / (self.n - 1)) if self.n >= 2 else 0.0
-
-
-# ---------------------------------------------------------------------
-# Cluster detection
-# ---------------------------------------------------------------------
-
 def find_clusters(
     values: List[int],
     min_count: int = 3,
 ) -> List[Tuple[int, int]]:
-    """
-    Find discrete clusters in a list of integer values.
-
-    Returns list of (value, count) for values that appear at least
-    min_count times, sorted by value.
-    """
     counter = Counter(values)
     clusters = [
         (val, cnt)
@@ -172,509 +125,326 @@ def find_clusters(
     return clusters
 
 
-def compute_spacings(clusters: List[Tuple[int, int]]) -> List[int]:
-    """Compute spacings between consecutive cluster centers."""
-    if len(clusters) < 2:
-        return []
-    return [clusters[i + 1][0] - clusters[i][0] for i in range(len(clusters) - 1)]
+def analyze(campaign: str, limit: int = 0) -> None:
+    rows = fetch_timebase(campaign)
 
-
-# ---------------------------------------------------------------------
-# TDC analysis
-# ---------------------------------------------------------------------
-
-def analyze_tdc(rows: List[Dict[str, Any]]) -> None:
-    """Run full TDC analysis on Teensy dispatch delta data."""
-
-    unit = "cycles"
-    ns_per = DWT_NS_PER_CYCLE
-
-    print()
-    print("=" * 70)
-    print(f"TDC ANALYSIS: Teensy (DWT domain, {DWT_FREQ_HZ/1e6:.0f} MHz)")
-    print("=" * 70)
-    print()
-
-    # --- Extract deltas ---
-    deltas: List[int] = []
-    raw_count = 0
-    ns_count = 0
-    skipped_none = 0
-    skipped_zero = 0
-    skipped_huge = 0
-
-    for r in rows:
-        result, source = _extract_delta(r)
-
-        if result is None:
-            if source == "null":
-                skipped_none += 1
-            elif source == "zero":
-                skipped_zero += 1
-            continue
-
-        if result > MAX_DELTA:
-            skipped_huge += 1
-            continue
-
-        deltas.append(result)
-        if source == "raw":
-            raw_count += 1
-        else:
-            ns_count += 1
-
-    print(f"  Total TIMEBASE records: {len(rows)}")
-    print(f"  Valid delta samples:    {len(deltas)}")
-    print(f"    From raw {unit}:      {raw_count}")
-    print(f"    From ns (fallback):   {ns_count}")
-    if ns_count > 0 and raw_count == 0:
-        print(f"    ⚠️  All samples from ns fallback — quantization noise expected")
-    print(f"  Skipped (null fields):  {skipped_none}")
-    print(f"  Skipped (zero):         {skipped_zero}")
-    print(f"  Skipped (> {MAX_DELTA} {unit}):  {skipped_huge}")
-    print()
-
-    if len(deltas) < 10:
-        print(f"  ❌ Insufficient data for TDC analysis (need ≥ 10, have {len(deltas)})")
+    if not rows:
+        print(f"No TIMEBASE rows for campaign '{campaign}'")
         return
 
-    # --- Basic statistics ---
-    stats = WelfordStats()
-    for d in deltas:
-        stats.update(float(d))
-
-    print("-" * 70)
-    print(f"RAW DELTA STATISTICS ({unit})")
-    print("-" * 70)
-    print(f"  n      = {stats.n}")
-    print(f"  mean   = {stats.mean:.2f} {unit}  ({stats.mean * ns_per:.1f} ns)")
-    print(f"  stddev = {stats.stddev:.2f} {unit}  ({stats.stddev * ns_per:.1f} ns)")
-    print(f"  min    = {int(stats.min_val)} {unit}  ({int(stats.min_val) * ns_per:.1f} ns)")
-    print(f"  max    = {int(stats.max_val)} {unit}  ({int(stats.max_val) * ns_per:.1f} ns)")
+    print("=" * 70)
+    print(f"ZPNet TDC ANALYZER v6 — Spin Capture Edition")
+    print(f"Campaign: {campaign}  ({len(rows)} TIMEBASE records)")
+    print("=" * 70)
     print()
 
-    # --- Histogram ---
-    print("-" * 70)
-    print("DELTA HISTOGRAM")
-    print("-" * 70)
+    # ── Extract spin capture data ──
 
-    counter = Counter(deltas)
+    deltas: List[int] = []
+    spin_errors: List[int] = []
+    skipped_no_field = 0
+    skipped_invalid = 0
+    skipped_timeout = 0
+
+    for i, r in enumerate(rows):
+        if limit and len(deltas) >= limit:
+            break
+
+        valid = r.get("spin_valid")
+        if valid is None:
+            skipped_no_field += 1
+            continue
+
+        if not valid:
+            skipped_invalid += 1
+            continue
+
+        if r.get("spin_timed_out"):
+            skipped_timeout += 1
+            continue
+
+        delta = r.get("spin_delta_cycles")
+        if delta is None:
+            skipped_no_field += 1
+            continue
+
+        deltas.append(int(delta))
+
+        err = r.get("spin_error_cycles")
+        if err is not None:
+            spin_errors.append(int(err))
+
+    print(f"  Valid spin captures:    {len(deltas)}")
+    print(f"  Skipped (no fields):    {skipped_no_field}")
+    print(f"  Skipped (invalid):      {skipped_invalid}")
+    print(f"  Skipped (timeout):      {skipped_timeout}")
+    print()
+
+    if len(deltas) < 5:
+        print(f"  Insufficient data (need >= 5, have {len(deltas)})")
+        return
+
+    # ── Delta statistics ──
+
+    print("-" * 70)
+    print("SPIN DELTA STATISTICS (isr_dwt - landed_dwt)")
+    print("-" * 70)
+    print()
+
+    w_delta = Welford()
+    for d in deltas:
+        w_delta.update(float(d))
+
+    mean_ns = w_delta.mean * DWT_NS_PER_CYCLE
+    std_ns = w_delta.stddev * DWT_NS_PER_CYCLE
+
+    print(f"  n       = {w_delta.n:,}")
+    print(f"  mean    = {w_delta.mean:,.2f} cycles  ({mean_ns:,.1f} ns)")
+    print(f"  stddev  = {w_delta.stddev:,.2f} cycles  ({std_ns:,.1f} ns)")
+    print(f"  min     = {int(w_delta.min_val):,} cycles")
+    print(f"  max     = {int(w_delta.max_val):,} cycles")
+    print(f"  range   = {int(w_delta.range):,} cycles  ({w_delta.range * DWT_NS_PER_CYCLE:,.1f} ns)")
+    print()
+
+    # The delta is ~50,400 cycles (50 µs early margin) plus ISR entry latency.
+    # The variation is what we care about — it contains the TDC fingerprint.
+    expected_early_cycles = int(EARLY_MARGIN_NS * DWT_FREQ_HZ / 1_000_000_000)
+    isr_overhead_mean = w_delta.mean - expected_early_cycles
+    print(f"  Expected early margin:  {expected_early_cycles:,} cycles ({EARLY_MARGIN_NS / 1000:.0f} µs)")
+    print(f"  Implied ISR overhead:   {isr_overhead_mean:,.1f} cycles ({isr_overhead_mean * DWT_NS_PER_CYCLE:,.1f} ns)")
+    print(f"    (mean delta - early margin; includes prediction error)")
+    print()
+
+    # ── Nano-spin precision ──
+
+    if spin_errors:
+        print("-" * 70)
+        print("NANO-SPIN PRECISION (landed_dwt - target_dwt)")
+        print("-" * 70)
+        print()
+
+        w_err = Welford()
+        for e in spin_errors:
+            w_err.update(float(e))
+
+        print(f"  n       = {w_err.n:,}")
+        print(f"  mean    = {w_err.mean:,.2f} cycles  ({w_err.mean * DWT_NS_PER_CYCLE:,.1f} ns)")
+        print(f"  stddev  = {w_err.stddev:,.2f} cycles  ({w_err.stddev * DWT_NS_PER_CYCLE:,.1f} ns)")
+        print(f"  min     = {int(w_err.min_val):,} cycles")
+        print(f"  max     = {int(w_err.max_val):,} cycles")
+        print(f"  range   = {int(w_err.range):,} cycles")
+        print()
+
+    # ── Delta histogram ──
+    #
+    # To reveal the ISR latency fingerprint, we subtract the minimum
+    # delta (the fixed component) and look at the residual distribution.
+
+    min_delta = int(w_delta.min_val)
+    residuals = [d - min_delta for d in deltas]
+
+    print("-" * 70)
+    print(f"DELTA HISTOGRAM (offset from minimum {min_delta:,})")
+    print("-" * 70)
+    print()
+
+    counter = Counter(residuals)
     all_vals = sorted(counter.keys())
-    max_count = max(counter.values())
+    max_count = max(counter.values()) if counter else 1
     bar_width = 50
 
+    # Show compact histogram for values up to reasonable range
+    display_vals = [v for v in all_vals if v <= 200]
+    hidden = len(all_vals) - len(display_vals)
+
     last_val = None
-    for val in all_vals:
-        if last_val is not None and val - last_val > 10:
+    for val in display_vals:
+        if last_val is not None and val - last_val > 3:
             print(f"       │ {'':.<{bar_width}s}  ···")
         cnt = counter[val]
         bar_len = int((cnt / max_count) * bar_width)
         bar = "█" * bar_len
-        pct = (cnt / len(deltas)) * 100
-        ns_approx = val * ns_per
-        print(f"  {val:4d} │ {bar:<{bar_width}s} {cnt:5d} ({pct:5.1f}%)  [{ns_approx:.1f} ns]")
+        pct = (cnt / len(residuals)) * 100
+        ns_off = val * DWT_NS_PER_CYCLE
+        print(f"  {val:4d} │ {bar:<{bar_width}s} {cnt:5d} ({pct:5.1f}%)  [{ns_off:+.1f} ns]")
         last_val = val
 
+    if hidden > 0:
+        print(f"       │  ... {hidden} additional values beyond +200 cycles")
     print()
 
-    # --- Cluster detection ---
+    # ── Cluster detection ──
+
     print("-" * 70)
     print("CLUSTER ANALYSIS")
     print("-" * 70)
+    print()
 
-    min_hits = max(3, len(deltas) // 100)
-    significant = find_clusters(deltas, min_count=min_hits)
+    min_hits = max(2, len(residuals) // 50)
+    clusters = find_clusters(residuals, min_count=min_hits)
 
-    if not significant:
-        significant = find_clusters(deltas, min_count=2)
+    if not clusters:
+        clusters = find_clusters(residuals, min_count=1)
 
-    if not significant:
-        print("  ❌ No significant clusters found")
+    if not clusters:
+        print("  No clusters found")
         return
 
-    print(f"  Significant clusters (≥ {min_hits} hits):")
+    print(f"  Clusters (>= {min_hits} hits):")
     print()
 
     total_in_clusters = 0
-    for val, cnt in significant:
-        pct = (cnt / len(deltas)) * 100
+    for val, cnt in clusters:
+        pct = (cnt / len(residuals)) * 100
         total_in_clusters += cnt
-        ns_approx = val * ns_per
-        print(f"    Cluster at {val:4d} {unit} ({ns_approx:6.1f} ns):  {cnt:5d} hits ({pct:5.1f}%)")
+        abs_cycles = val + min_delta
+        ns_off = val * DWT_NS_PER_CYCLE
+        print(f"    offset {val:4d} (abs {abs_cycles:,}):  {cnt:5d} hits ({pct:5.1f}%)  [{ns_off:.1f} ns from min]")
 
-    unclustered = len(deltas) - total_in_clusters
-    print(f"\n  In clusters:  {total_in_clusters} ({total_in_clusters / len(deltas) * 100:.1f}%)")
-    print(f"  Unclustered:  {unclustered} ({unclustered / len(deltas) * 100:.1f}%)")
+    unclustered = len(residuals) - total_in_clusters
     print()
+    print(f"  In clusters:  {total_in_clusters} ({total_in_clusters / len(residuals) * 100:.1f}%)")
+    print(f"  Unclustered:  {unclustered} ({unclustered / len(residuals) * 100:.1f}%)")
 
-    # --- Derive TDC constants ---
-    print("-" * 70)
-    print("TDC CONSTANT DERIVATION")
-    print("-" * 70)
+    # ── Spacing analysis ──
 
-    cluster_values = [v for v, _ in significant]
+    cluster_vals = [v for v, _ in clusters]
 
-    # Separate primary clusters from outliers (gap > 20 units)
-    primary = [cluster_values[0]]
-    outlier_clusters = []
-    for i in range(1, len(cluster_values)):
-        if cluster_values[i] - cluster_values[i - 1] > 20:
-            outlier_clusters.extend(cluster_values[i:])
-            break
-        primary.append(cluster_values[i])
-
-    if outlier_clusters:
-        print(f"  Primary clusters: {primary}")
-        print(f"  Outlier clusters: {outlier_clusters} (late, excluded from derivation)")
-        print()
-
-    tdc_fixed_overhead = primary[0]
-
-    primary_clusters = [(v, c) for v, c in significant if v in primary]
-    spacings = compute_spacings(primary_clusters)
-
-    if spacings:
+    if len(cluster_vals) >= 2:
+        spacings = [cluster_vals[i + 1] - cluster_vals[i] for i in range(len(cluster_vals) - 1)]
         spacing_counter = Counter(spacings)
-        most_common_spacing = spacing_counter.most_common(1)[0][0]
-        spacing_gcd = reduce(gcd, spacings)
+        most_common = spacing_counter.most_common(1)[0][0]
 
-        print(f"  Primary cluster spacings: {spacings}")
-        print(f"  Most common spacing: {most_common_spacing}")
-        print(f"  GCD of spacings: {spacing_gcd}")
         print()
+        print(f"  Cluster spacings: {spacings}")
+        print(f"  Most common spacing: {most_common} cycles ({most_common * DWT_NS_PER_CYCLE:.1f} ns)")
+        print(f"    (this is the loop iteration cycle count at 1008 MHz)")
 
-        tdc_loop_cycles = most_common_spacing
-
-        irregular = [s for s in spacings if s % tdc_loop_cycles != 0]
-        if irregular:
-            print(f"  ⚠️  Irregular spacings (not multiples of {tdc_loop_cycles}): {irregular}")
-            print(f"      Using GCD ({spacing_gcd}) instead")
-            tdc_loop_cycles = spacing_gcd
-    else:
-        if len(primary) == 1:
-            print(f"  Only one primary cluster — cannot determine loop cycle count")
-            print(f"  ℹ️  This may indicate all captures land at the same loop phase")
-            print(f"      (possible if the loop is very tight relative to capture jitter)")
-        tdc_loop_cycles = None
-
-    tdc_max_correction = len(primary)
+    # ── Decomposition ──
+    #
+    # The spin_delta_cycles = early_margin + prediction_error + ISR_latency
+    #
+    # early_margin: ~50,400 cycles (constant, known)
+    # prediction_error: the random walk residual (~3 cycles stddev)
+    # ISR_latency: the TDC fingerprint (clusters at discrete values)
+    #
+    # Since the prediction error is small (~3 cycles) relative to the
+    # ISR latency jitter (~10-50 cycles range), the cluster structure
+    # in the histogram is dominated by the ISR latency fingerprint.
 
     print()
-    print(f"  FIXED_OVERHEAD  = {tdc_fixed_overhead} {unit}  ({tdc_fixed_overhead * ns_per:.1f} ns)")
-    if tdc_loop_cycles is not None:
-        print(f"  LOOP_CYCLES     = {tdc_loop_cycles} {unit}  ({tdc_loop_cycles * ns_per:.1f} ns)")
-    else:
-        print(f"  LOOP_CYCLES     = (undetermined — need more data or raw counts)")
-    print(f"  MAX_CORRECTION  = {tdc_max_correction}  (from {len(primary)} primary clusters)")
-    print(f"  Primary clusters = {primary}")
-    print(f"  Valid corrections = 0..{tdc_max_correction - 1}  (reject >= {tdc_max_correction})")
+    print("-" * 70)
+    print("DECOMPOSITION")
+    print("-" * 70)
+    print()
+    print(f"  spin_delta = early_margin + prediction_error + ISR_latency")
+    print()
+    print(f"  Early margin (target):  {expected_early_cycles:,} cycles ({EARLY_MARGIN_NS / 1000:.0f} µs)")
+    print(f"  Delta range:            {int(w_delta.range):,} cycles ({w_delta.range * DWT_NS_PER_CYCLE:.1f} ns)")
+    print(f"  Delta stddev:           {w_delta.stddev:.2f} cycles ({std_ns:.1f} ns)")
     print()
 
-    # --- Correction distribution ---
-    if tdc_loop_cycles and tdc_loop_cycles > 0:
-        print("-" * 70)
-        print("CORRECTION DISTRIBUTION")
-        print("-" * 70)
+    if spin_errors:
+        print(f"  Spin landing jitter:    {w_err.stddev:.2f} cycles ({w_err.stddev * DWT_NS_PER_CYCLE:.1f} ns)")
+        # The ISR latency jitter is the delta jitter minus the spin jitter (RSS)
+        if w_delta.stddev > w_err.stddev:
+            isr_jitter = math.sqrt(w_delta.stddev**2 - w_err.stddev**2)
+            print(f"  ISR latency jitter:     {isr_jitter:.2f} cycles ({isr_jitter * DWT_NS_PER_CYCLE:.1f} ns)")
+            print(f"    (delta jitter with spin jitter removed via RSS)")
         print()
-        print(f"  correction = (delta - {tdc_fixed_overhead}) % {tdc_loop_cycles}")
-        print()
 
-        correction_counter: Counter = Counter()
-        out_of_range = 0
+    # ── Consecutive delta differences ──
+    #
+    # How much does the delta change from one PPS to the next?
+    # This reveals the second-to-second variability.
 
-        for d in deltas:
-            if d < tdc_fixed_overhead:
-                out_of_range += 1
-                continue
-            if d > primary[-1] + 20:
-                continue
-            adjusted = d - tdc_fixed_overhead
-            correction = adjusted % tdc_loop_cycles
-            correction_counter[correction] += 1
-
-        for corr in sorted(correction_counter.keys()):
-            cnt = correction_counter[corr]
-            pct = (cnt / len(deltas)) * 100
-            ns_corr = corr * ns_per
-            print(f"    correction={corr}: {cnt:5d} ({pct:5.1f}%)  [{ns_corr:.1f} ns]")
-
-        if out_of_range:
-            print(f"\n    Below overhead: {out_of_range}")
-
-        if len(correction_counter) > 1:
-            counts = list(correction_counter.values())
-            mean_cnt = sum(counts) / len(counts)
-            max_dev = max(abs(c - mean_cnt) / mean_cnt for c in counts) * 100
-            if max_dev < 20:
-                print(f"\n  ✅ Corrections roughly uniform (max deviation {max_dev:.0f}% from mean)")
-            else:
-                print(f"\n  ⚠️  Corrections non-uniform (max deviation {max_dev:.0f}% from mean)")
-
-    elif len(primary) > 1:
+    if len(deltas) >= 3:
         print("-" * 70)
-        print("CORRECTION DISTRIBUTION (direct, no modulo)")
+        print("SECOND-TO-SECOND STABILITY")
         print("-" * 70)
         print()
-        print(f"  correction = delta - {tdc_fixed_overhead}")
+
+        w_diff = Welford()
+        for i in range(1, len(deltas)):
+            w_diff.update(float(deltas[i] - deltas[i - 1]))
+
+        print(f"  Consecutive delta differences:")
+        print(f"    n       = {w_diff.n:,}")
+        print(f"    mean    = {w_diff.mean:+.2f} cycles")
+        print(f"    stddev  = {w_diff.stddev:.2f} cycles ({w_diff.stddev * DWT_NS_PER_CYCLE:.1f} ns)")
+        print(f"    min     = {int(w_diff.min_val):+,} cycles")
+        print(f"    max     = {int(w_diff.max_val):+,} cycles")
         print()
 
-        correction_counter = Counter()
-        out_of_range = 0
+    # ── Per-second detail table (first 20 and last 10) ──
 
-        for d in deltas:
-            if d < tdc_fixed_overhead:
-                out_of_range += 1
-                continue
-            if d > primary[-1] + 20:
-                continue
-            correction = d - tdc_fixed_overhead
-            correction_counter[correction] += 1
-
-        for corr in sorted(correction_counter.keys()):
-            cnt = correction_counter[corr]
-            pct_val = (cnt / len(deltas)) * 100
-            ns_corr = corr * ns_per
-            print(f"    correction={corr}: {cnt:5d} ({pct_val:5.1f}%)  [{ns_corr:.1f} ns]")
-
-        if out_of_range:
-            print(f"\n    Below overhead: {out_of_range}")
-
-        if len(correction_counter) > 1:
-            counts = list(correction_counter.values())
-            mean_cnt = sum(counts) / len(counts)
-            max_dev = max(abs(c - mean_cnt) / mean_cnt for c in counts) * 100
-            if max_dev < 20:
-                print(f"\n  ✅ Corrections roughly uniform (max deviation {max_dev:.0f}% from mean)")
-            else:
-                print(f"\n  ⚠️  Corrections non-uniform (max deviation {max_dev:.0f}% from mean)")
-
-    # --- Data quality assessment ---
-    print()
     print("-" * 70)
-    print("DATA QUALITY")
+    print("PER-SECOND DETAIL (first 20)")
     print("-" * 70)
     print()
-    if raw_count > 0:
-        print(f"  ✅ Using raw cycles ({raw_count} samples) — exact, no conversion loss")
-        if ns_count > 0:
-            print(f"     ({ns_count} samples from ns fallback — mixed precision)")
-    else:
-        print(f"  ⚠️  All {ns_count} samples from ns fallback — quantization noise")
-        print(f"      The histogram may show artificial spreading of clusters")
+    print(f"  {'pps':>6s}  {'delta':>8s}  {'offset':>7s}  {'spin_err':>9s}  {'delta_ns':>10s}  {'err_ns':>8s}")
+    print(f"  {'─'*6}  {'─'*8}  {'─'*7}  {'─'*9}  {'─'*10}  {'─'*8}")
 
-    # --- Correction precision ---
-    print()
-    print("-" * 70)
-    print("CORRECTION PRECISION")
-    print("-" * 70)
-    print()
-    if tdc_loop_cycles is not None:
-        correction_resolution_ns = tdc_loop_cycles * ns_per
-        uncorrected_window_ns = tdc_max_correction * tdc_loop_cycles * ns_per
-        print(f"  Correction resolution:   {correction_resolution_ns:.2f} ns per correction step")
-        print(f"  Uncorrected window:      {uncorrected_window_ns:.2f} ns ({tdc_max_correction} positions × {correction_resolution_ns:.2f} ns)")
-        print(f"  With correction:         ±{correction_resolution_ns / 2:.2f} ns (quantization limit)")
-    else:
-        total_span_ns = (primary[-1] - primary[0]) * ns_per if len(primary) > 1 else 0
-        print(f"  Uncorrected window:      {total_span_ns:.2f} ns (span of primary clusters)")
-        print(f"  Cannot determine correction resolution without loop spacing")
+    shown = 0
+    for i, r in enumerate(rows):
+        if not r.get("spin_valid"):
+            continue
 
-    # --- Reference comparison ---
-    print()
-    print("-" * 70)
-    print(f"COMPARISON WITH {REFERENCE_LABEL} CONSTANTS")
-    print("-" * 70)
-    print()
-    print(f"  {'':24s} {'Reference':>10s}  {'Current':>10s}  {'Change':>10s}")
-    print(f"  {'─' * 24} {'─' * 10}  {'─' * 10}  {'─' * 10}")
-    print(f"  {'FIXED_OVERHEAD':24s} {REFERENCE_OVERHEAD:>10d}  {tdc_fixed_overhead:>10d}  {tdc_fixed_overhead - REFERENCE_OVERHEAD:>+10d}")
-    if REFERENCE_LOOP is not None and tdc_loop_cycles is not None:
-        print(f"  {'LOOP_CYCLES':24s} {REFERENCE_LOOP:>10d}  {tdc_loop_cycles:>10d}  {tdc_loop_cycles - REFERENCE_LOOP:>+10d}")
-    if REFERENCE_MAX_CORR is not None:
-        print(f"  {'MAX_CORRECTION':24s} {REFERENCE_MAX_CORR:>10d}  {tdc_max_correction:>10d}  {tdc_max_correction - REFERENCE_MAX_CORR:>+10d}")
+        delta = r.get("spin_delta_cycles")
+        err = r.get("spin_error_cycles", 0)
+        pps = r.get("pps_count", r.get("teensy_pps_count", "?"))
 
-    # --- Recommended C++ constants ---
-    print()
-    print("-" * 70)
-    print("RECOMMENDED C++ CONSTANTS")
-    print("-" * 70)
-    print()
+        if delta is None:
+            continue
 
-    if raw_count == 0 and tdc_loop_cycles and tdc_loop_cycles <= 1:
-        print("  ⚠️  Loop cycle count unreliable from ns-derived data.")
-        print("      Re-run with raw cycle data before updating firmware.")
-        print()
-        print(f"  // PROVISIONAL — re-derive with raw cycle data")
-        print(f"  static constexpr bool     TDC_NEEDS_RECALIBRATION = true;")
-    else:
-        print(f"  static constexpr bool     TDC_NEEDS_RECALIBRATION = false;")
-    print()
-    print(f"  static constexpr uint32_t TDC_FIXED_OVERHEAD   = {tdc_fixed_overhead};")
-    if tdc_loop_cycles is not None:
-        print(f"  static constexpr uint32_t TDC_LOOP_CYCLES      = {tdc_loop_cycles};")
-    else:
-        print(f"  static constexpr uint32_t TDC_LOOP_CYCLES      = 6;   // PLACEHOLDER")
-    print(f"  static constexpr uint32_t TDC_MAX_CORRECTION   = {tdc_max_correction};")
+        delta = int(delta)
+        offset = delta - min_delta
+        delta_ns = delta * DWT_NS_PER_CYCLE
+        err_ns = int(err) * DWT_NS_PER_CYCLE
 
+        print(f"  {pps:>6}  {delta:>8,}  {offset:>+7d}  {int(err):>+9d}  {delta_ns:>10.1f}  {err_ns:>8.1f}")
 
-# ---------------------------------------------------------------------
-# DWT PPS period stability (interpolation quality)
-# ---------------------------------------------------------------------
-
-def analyze_period_stability(rows: List[Dict[str, Any]]) -> None:
-    """Analyze DWT PPS period stability for sub-second interpolation quality."""
+        shown += 1
+        if shown >= 20:
+            remaining = len(deltas) - shown
+            if remaining > 0:
+                print(f"  ... {remaining} more rows ...")
+            break
 
     print()
-    print()
+
+    # ── Summary ──
+
     print("=" * 70)
-    print("DWT PPS PERIOD STABILITY (INTERPOLATION BASE)")
+    print("SUMMARY")
     print("=" * 70)
     print()
-
-    # Extract consecutive shadow pairs
-    teensy_shadows = []
-    for r in rows:
-        sc = r.get("diag_raw_shadow_cyc")
-        if sc is not None:
-            teensy_shadows.append(int(sc))
-
-    periods = []
-    for i in range(1, len(teensy_shadows)):
-        diff = (teensy_shadows[i] - teensy_shadows[i - 1]) & 0xFFFFFFFF
-        # Sanity: should be close to 1,008,000,000 (± 0.1%)
-        if 1_007_000_000 < diff < 1_009_000_000:
-            periods.append(diff)
-
-    if len(periods) < 2:
-        print(f"  ❌ Insufficient data ({len(periods)} periods, need ≥ 2)")
-        print(f"     from {len(teensy_shadows)} consecutive shadow_cyc values")
-        return
-
-    stats = WelfordStats()
-    for p in periods:
-        stats.update(float(p))
-
-    mean_period = stats.mean
-    std_period = stats.stddev
-    mean_ns = mean_period * DWT_NS_PER_CYCLE
-    std_ns = std_period * DWT_NS_PER_CYCLE
-
-    # Drift from nominal in PPB
-    drift_ppb = ((mean_period - DWT_FREQ_HZ) / DWT_FREQ_HZ) * 1e9
-
-    # Allan-deviation-like: RMS of consecutive period differences
-    consec_diffs = [float(periods[i] - periods[i - 1]) for i in range(1, len(periods))]
-    if consec_diffs:
-        adev_like = math.sqrt(sum(d * d for d in consec_diffs) / (2 * len(consec_diffs)))
-        adev_ns = adev_like * DWT_NS_PER_CYCLE
-        adev_ppb = (adev_like / DWT_FREQ_HZ) * 1e9
-    else:
-        adev_like = adev_ns = adev_ppb = None
-
-    print(f"  Samples:           {len(periods)}  (from {len(teensy_shadows)} consecutive shadow_cyc diffs)")
-    print(f"  Nominal frequency: {DWT_FREQ_HZ:,} Hz")
+    print(f"  Spin capture success rate:  {len(deltas)}/{len(deltas) + skipped_invalid} "
+          f"({100 * len(deltas) / max(1, len(deltas) + skipped_invalid):.1f}%)")
+    print(f"  Nano-spin precision:        {w_err.stddev:.1f} cycles ({w_err.stddev * DWT_NS_PER_CYCLE:.1f} ns) stddev" if spin_errors else "")
+    print(f"  Delta stability:            {w_delta.stddev:.1f} cycles ({std_ns:.1f} ns) stddev")
+    print(f"  Delta range:                {int(w_delta.range)} cycles ({w_delta.range * DWT_NS_PER_CYCLE:.1f} ns)")
     print()
 
-    print("-" * 70)
-    print("PERIOD STATISTICS")
-    print("-" * 70)
-    print(f"  mean   = {mean_period:,.2f} cycles  ({mean_ns:,.2f} ns)")
-    print(f"  stddev = {std_period:,.4f} cycles  ({std_ns:,.2f} ns)")
-    print(f"  min    = {int(stats.min_val):,} cycles")
-    print(f"  max    = {int(stats.max_val):,} cycles")
-    print(f"  range  = {int(stats.max_val) - int(stats.min_val):,} cycles"
-          f"  ({(int(stats.max_val) - int(stats.min_val)) * DWT_NS_PER_CYCLE:,.1f} ns)")
-    print()
-    print(f"  Mean drift from nominal: {drift_ppb:+.3f} PPB")
-    print(f"  Period stddev:           {std_ns:.2f} ns  ({std_period / DWT_FREQ_HZ * 1e9:.3f} PPB)")
-    print()
-
-    if adev_like is not None:
-        print(f"  Successive-diff RMS:     {adev_ns:.2f} ns  ({adev_ppb:.3f} PPB)")
-        print(f"    (Allan deviation proxy at τ=1s)")
+    if len(cluster_vals) >= 2:
+        print(f"  Cluster spacing:            {most_common} cycles ({most_common * DWT_NS_PER_CYCLE:.1f} ns)")
+        print(f"    → This is the spin loop iteration time at 1008 MHz")
         print()
 
-    # --- Interpolation quality ---
-    print("-" * 70)
-    print("INTERPOLATION QUALITY")
-    print("-" * 70)
-    print()
-
-    mid_err_ns = std_ns / 2.0
-    quant_ns = DWT_NS_PER_CYCLE
-    total_err = math.sqrt(mid_err_ns**2 + (quant_ns / 2)**2)
-
-    print(f"  Mid-second interpolation error:  ±{mid_err_ns:.2f} ns (from period stddev)")
-    print(f"  TDC quantization:                ±{quant_ns / 2:.2f} ns (DWT @ {DWT_FREQ_HZ/1e6:.0f} MHz)")
-    print(f"  Combined (RSS):                  ±{total_err:.2f} ns")
-    print()
-
-    tau = mean_period / DWT_FREQ_HZ
-    print(f"  τ (ticks-per-second ratio):      {tau:.12f}")
-    print(f"  τ deviation from unity:          {(tau - 1.0) * 1e9:+.3f} PPB")
-    print()
-
-    # --- Period histogram ---
-    offsets = [p - int(round(mean_period)) for p in periods]
-    offset_counter = Counter(offsets)
-    offset_vals = sorted(offset_counter.keys())
-
-    if len(offset_vals) <= 40:
-        print("-" * 70)
-        print(f"PERIOD HISTOGRAM (offset from {int(round(mean_period)):,})")
-        print("-" * 70)
-
-        max_cnt = max(offset_counter.values())
-        bar_width = 50
-        for val in offset_vals:
-            cnt = offset_counter[val]
-            bar_len = int((cnt / max_cnt) * bar_width) if max_cnt > 0 else 0
-            bar = "█" * bar_len
-            pct = (cnt / len(periods)) * 100
-            ns_off = val * DWT_NS_PER_CYCLE
-            print(f"  {val:+5d} │ {bar:<{bar_width}s} {cnt:5d} ({pct:5.1f}%)  [{ns_off:+.1f} ns]")
-        print()
-    else:
-        print(f"  (Period spread too wide for histogram: {len(offset_vals)} distinct values)")
-        print()
-
-
-# ---------------------------------------------------------------------
-# Top-level analysis
-# ---------------------------------------------------------------------
-
-def analyze(campaign: str) -> None:
-    rows = fetch_timebase(campaign)
-
-    if not rows:
-        print(f"❌ No TIMEBASE rows found for campaign '{campaign}'")
-        return
-
-    print("=" * 70)
-    print(f"ZPNet TDC ANALYZER — Campaign: {campaign}")
-    print(f"  Total TIMEBASE records: {len(rows)}")
-    print(f"  Three clock domains: GNSS (reference), DWT, OCXO")
-    print("=" * 70)
-
-    # --- TDC analysis ---
-    analyze_tdc(rows)
-
-    # --- Period stability ---
-    analyze_period_stability(rows)
-
+    print(f"  Next steps:")
+    print(f"    1. Collect 500+ seconds of data for robust histogram")
+    print(f"    2. If clusters are visible, derive TDC_FIXED_OVERHEAD")
+    print(f"       and TDC_LOOP_CYCLES from the cluster positions")
+    print(f"    3. If clusters are NOT visible (prediction error dominates),")
+    print(f"       the spin capture is already better than the old TDC —")
+    print(f"       the landed_dwt IS the corrected value, no table needed")
     print()
     print("=" * 70)
-    print("DONE")
-    print("=" * 70)
 
-
-# ---------------------------------------------------------------------
-# Entrypoint
-# ---------------------------------------------------------------------
 
 def main():
     if len(sys.argv) < 2:
-        print("Usage: tdc_analyzer <campaign_name>")
+        print("Usage: tdc_analyzer <campaign_name> [limit]")
         print()
         try:
             with open_db(row_dict=True) as conn:
@@ -683,11 +453,8 @@ def main():
                     """
                     SELECT campaign, count(*) as cnt,
                            count(*) FILTER (
-                               WHERE (payload->>'diag_raw_isr_cyc') IS NOT NULL
-                           ) as has_raw,
-                           count(*) FILTER (
-                               WHERE (payload->>'diag_teensy_dispatch_delta_ns') IS NOT NULL
-                           ) as has_ns
+                               WHERE (payload->>'spin_valid')::boolean = true
+                           ) as spin_valid
                     FROM timebase
                     GROUP BY campaign
                     ORDER BY max(ts) DESC
@@ -697,19 +464,17 @@ def main():
                 rows = cur.fetchall()
             if rows:
                 print("Available campaigns:")
-                print(f"  {'CAMPAIGN':<20s} {'RECORDS':>8s} {'RAW_CYC':>8s} {'NS':>8s}")
-                print(f"  {'─' * 20} {'─' * 8} {'─' * 8} {'─' * 8}")
+                print(f"  {'CAMPAIGN':<20s} {'RECORDS':>8s} {'SPIN OK':>8s}")
+                print(f"  {'─' * 20} {'─' * 8} {'─' * 8}")
                 for r in rows:
-                    print(
-                        f"  {r['campaign']:<20s} {r['cnt']:>8d} "
-                        f"{r['has_raw']:>8d} {r['has_ns']:>8d}"
-                    )
+                    print(f"  {r['campaign']:<20s} {r['cnt']:>8d} {r['spin_valid']:>8d}")
         except Exception:
             pass
         sys.exit(1)
 
     campaign = sys.argv[1]
-    analyze(campaign)
+    limit_val = int(sys.argv[2]) if len(sys.argv) > 2 else 0
+    analyze(campaign, limit_val)
 
 
 if __name__ == "__main__":

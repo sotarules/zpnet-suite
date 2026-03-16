@@ -108,6 +108,7 @@ set(ZPNET_HEADERS
     util.h
     zpnet_pins.h
     time.h
+        tdc_correction.h
 )
 
 # -------------------------------------------------------------

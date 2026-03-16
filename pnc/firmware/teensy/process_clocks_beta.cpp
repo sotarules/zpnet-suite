@@ -478,6 +478,19 @@ void clocks_beta_pps(void) {
     p.add("diag_pps_rejected_total",     diag_pps_rejected_total);
     p.add("diag_pps_rejected_remainder", diag_pps_rejected_remainder);
 
+    // Spin capture (subset — forensic, persisted in TIMEBASE)
+    p.add("spin_valid",             pps_spin.valid);
+    p.add("spin_approach_cycles",   pps_spin.approach_cycles);
+    p.add("spin_delta_cycles",      pps_spin.delta_cycles);
+    p.add("spin_error_cycles",      pps_spin.spin_error);
+    p.add("spin_isr_dwt",           pps_spin.isr_dwt);
+    p.add("spin_landed_dwt",        pps_spin.landed_dwt);
+    p.add("spin_shadow_dwt",        pps_spin.shadow_dwt);
+    p.add("spin_corrected_dwt",     pps_spin.corrected_dwt);
+    p.add("spin_tdc_correction",    pps_spin.tdc_correction);
+    p.add("spin_nano_timed_out",    pps_spin.nano_timed_out);
+    p.add("spin_shadow_timed_out",  pps_spin.shadow_timed_out);
+
     p.add("dwt_cal_valid",     g_dwt_cal_valid);
     p.add("dwt_cal_pps_count", g_dwt_cal_pps_count);
 
@@ -753,6 +766,40 @@ static Payload cmd_clocks_info(const Payload&) {
   p.add("pps_stuck_max",           diag_pps_stuck_max);
   p.add("pps_scheduled",           (bool)pps_scheduled);
 
+  // ── Spin capture forensics ──
+  //
+  // Two timeout classes:
+  //   nano_*   — TimePop nano-spin couldn't reach target DWT
+  //   shadow_* — shadow-write loop PPS never arrived
+  //
+  p.add("spin_valid",             pps_spin.valid);
+  p.add("spin_armed",            pps_spin.armed);
+  p.add("spin_completed",        pps_spin.completed);
+  p.add("spin_target_dwt",       pps_spin.target_dwt);
+  p.add("spin_landed_dwt",       pps_spin.landed_dwt);
+  p.add("spin_landed_gnss_ns",   pps_spin.landed_gnss_ns);
+  p.add("spin_error_cycles",     pps_spin.spin_error);
+  p.add("spin_shadow_dwt",       pps_spin.shadow_dwt);
+  p.add("spin_isr_dwt",          pps_spin.isr_dwt);
+  p.add("spin_delta_cycles",     pps_spin.delta_cycles);
+  p.add("spin_approach_cycles",  pps_spin.approach_cycles);
+  p.add("spin_corrected_dwt",    pps_spin.corrected_dwt);
+  p.add("spin_tdc_correction",   pps_spin.tdc_correction);
+
+  // Nano-spin timeout (couldn't reach target DWT)
+  p.add("spin_nano_timed_out",   pps_spin.nano_timed_out);
+  p.add("spin_nano_timeouts",    pps_spin.nano_timeouts);
+
+  // Shadow-loop timeout (PPS never arrived)
+  p.add("spin_shadow_timed_out", pps_spin.shadow_timed_out);
+  p.add("spin_shadow_timeouts",  pps_spin.shadow_timeouts);
+
+  // Lifetime counters
+  p.add("spin_arms",             pps_spin.arms);
+  p.add("spin_arm_failures",     pps_spin.arm_failures);
+  p.add("spin_completions",      pps_spin.completions);
+  p.add("spin_misses",           pps_spin.misses);
+
   return p;
 }
 
@@ -865,64 +912,226 @@ static Payload cmd_interp_test(const Payload& args) {
 }
 
 // ============================================================================
-// INTERP_PROOF — unchanged logic, uses QTimer1 for GNSS position
+// INTERP_PROOF — Head-to-head interpolation accuracy test
+//
+// Compares two interpolation strategies against VCLOCK ground truth
+// at the same instant:
+//
+//   Path A (PPS anchor):
+//     Interpolate from the PPS-edge DWT using dwt_cycles_per_pps.
+//     This is the current production path — the interpolation window
+//     is up to 1 second (wherever in the second the query lands).
+//
+//   Path B (Spin anchor):
+//     Interpolate from the spin capture's landed_dwt / landed_gnss_ns.
+//     The spin lands ~50 µs before the PPS edge, so the interpolation
+//     window is the time since the spin landing.  Currently this is
+//     still up to ~1 second (the spin only fires once per PPS), but
+//     the anchor itself is more precise (2.3 ns jitter vs ~47-51
+//     cycle ISR latency).
+//
+//     When 10 KHz anchoring is added, the spin anchor will update
+//     every 100 µs, reducing the interpolation window from ~500 ms
+//     (average) to ~50 µs — a 10,000x reduction.
+//
+//   Ground truth:
+//     GNSS VCLOCK (QTimer1) ticks since PPS, multiplied by 100 ns.
+//     This gives the true position on a 100 ns grid.
+//
+// The test accumulates independent Welford stats for both paths,
+// plus position correlation for each.  The comparison answers:
+// "Is the spin anchor better than the PPS anchor, and by how much?"
+//
+// This is a forensic/validation tool, not a production path.
+// It runs on command and does not affect TIMEBASE production.
 // ============================================================================
 
-static int64_t proof_n = 0; static double proof_mean = 0.0, proof_m2 = 0.0;
-static int64_t proof_err_min = 0, proof_err_max = 0;
-static int32_t proof_outside_100 = 0;
-static double  proof_pos_mean = 0.0, proof_pos_m2 = 0.0, proof_covar = 0.0;
+// ── Accumulators (persistent across calls, reset on command) ──
+
+// Path A: PPS anchor (current production interpolation)
+static int64_t proof_a_n = 0;
+static double  proof_a_mean = 0.0, proof_a_m2 = 0.0;
+static int64_t proof_a_min = 0, proof_a_max = 0;
+static int32_t proof_a_outside_100 = 0;
+static double  proof_a_pos_mean = 0.0, proof_a_pos_m2 = 0.0, proof_a_covar = 0.0;
+
+// Path B: Spin anchor (TDC-corrected spin landing)
+static int64_t proof_b_n = 0;
+static double  proof_b_mean = 0.0, proof_b_m2 = 0.0;
+static int64_t proof_b_min = 0, proof_b_max = 0;
+static int32_t proof_b_outside_100 = 0;
+static double  proof_b_pos_mean = 0.0, proof_b_pos_m2 = 0.0, proof_b_covar = 0.0;
+
+static void proof_reset(void) {
+  proof_a_n = 0; proof_a_mean = 0.0; proof_a_m2 = 0.0;
+  proof_a_min = 0; proof_a_max = 0; proof_a_outside_100 = 0;
+  proof_a_pos_mean = 0.0; proof_a_pos_m2 = 0.0; proof_a_covar = 0.0;
+
+  proof_b_n = 0; proof_b_mean = 0.0; proof_b_m2 = 0.0;
+  proof_b_min = 0; proof_b_max = 0; proof_b_outside_100 = 0;
+  proof_b_pos_mean = 0.0; proof_b_pos_m2 = 0.0; proof_b_covar = 0.0;
+}
+
+// Welford update helper (inline, no allocation)
+static inline void proof_welford(
+  int64_t& n, double& mean, double& m2,
+  int64_t& err_min, int64_t& err_max, int32_t& outside,
+  double& pos_mean, double& pos_m2, double& covar,
+  int64_t error_ns, double position
+) {
+  n++;
+  const double x = (double)error_ns;
+  const double d1 = x - mean;
+  mean += d1 / (double)n;
+  const double d2 = x - mean;
+  m2 += d1 * d2;
+
+  if (n == 1) { err_min = error_ns; err_max = error_ns; }
+  else {
+    if (error_ns < err_min) err_min = error_ns;
+    if (error_ns > err_max) err_max = error_ns;
+  }
+  if (error_ns > 100 || error_ns < -100) outside++;
+
+  const double pd1 = position - pos_mean;
+  pos_mean += pd1 / (double)n;
+  pos_m2 += (position - pos_mean) * pd1;
+  covar += d2 * pd1;
+}
 
 static Payload cmd_interp_proof(const Payload& args) {
   Payload p;
+
   if (campaign_state != clocks_campaign_state_t::STARTED) {
     p.add("error", "no active campaign"); return p;
   }
+
   if (args.getInt("reset", 0)) {
-    proof_n = 0; proof_mean = 0.0; proof_m2 = 0.0;
-    proof_err_min = 0; proof_err_max = 0; proof_outside_100 = 0;
-    proof_pos_mean = 0.0; proof_pos_m2 = 0.0; proof_covar = 0.0;
+    proof_reset();
   }
-  const int64_t interp_signed = timebase_now_gnss_ns();
-  if (interp_signed < 0) { p.add("error", "timebase_now_gnss_ns failed"); return p; }
-  const uint64_t interp_gnss_ns = (uint64_t)interp_signed;
+
+  // ── Single-point capture: DWT + VCLOCK as close together as possible ──
+  const uint32_t dwt_now  = DWT_CYCCNT;
   const uint32_t gnss_now = qtimer1_read_32();
+
+  // ── Fragment (the PPS-edge truth) ──
   const timebase_fragment_t* frag = timebase_last_fragment();
-  if (!frag || !frag->valid) { p.add("error", "timebase not valid"); return p; }
-  const uint64_t frag_gnss_ns = frag->gnss_ns;
+  if (!frag || !frag->valid) {
+    p.add("error", "timebase not valid"); return p;
+  }
+
+  const uint64_t frag_gnss_ns            = frag->gnss_ns;
+  const uint32_t frag_dwt_cyccnt_at_pps  = frag->dwt_cyccnt_at_pps;
+  const uint32_t frag_dwt_cycles_per_pps = (uint32_t)frag->dwt_cycles_per_pps;
+
+  if (frag_dwt_cycles_per_pps == 0) {
+    p.add("error", "fragment missing dwt_cycles_per_pps"); return p;
+  }
+
+  // ── Ground truth: VCLOCK position ──
   const uint32_t gnss_raw_since_pps = gnss_now - (uint32_t)isr_snap_gnss;
   const uint64_t gnss_ticks_since_pps = (uint64_t)gnss_raw_since_pps / GNSS_EDGE_DIVISOR;
   const uint64_t vclock_ns_into_second = gnss_ticks_since_pps * 100ULL;
   const uint64_t vclock_gnss_ns = frag_gnss_ns + vclock_ns_into_second;
-  const int64_t error_ns = (int64_t)interp_gnss_ns - (int64_t)vclock_gnss_ns;
-  const double position = (double)vclock_ns_into_second / 1000000000.0;
+  const double   position = (double)vclock_ns_into_second / 1000000000.0;
 
-  proof_n++;
-  const double x = (double)error_ns, d1 = x - proof_mean;
-  proof_mean += d1 / (double)proof_n;
-  const double d2 = x - proof_mean;
-  proof_m2 += d1 * d2;
-  if (proof_n == 1) { proof_err_min = error_ns; proof_err_max = error_ns; }
-  else { if (error_ns < proof_err_min) proof_err_min = error_ns; if (error_ns > proof_err_max) proof_err_max = error_ns; }
-  if (error_ns > 100 || error_ns < -100) proof_outside_100++;
-  const double pd1 = position - proof_pos_mean;
-  proof_pos_mean += pd1 / (double)proof_n;
-  proof_pos_m2 += (position - proof_pos_mean) * pd1;
-  proof_covar += d2 * pd1;
+  // ── Path A: PPS anchor interpolation (current production path) ──
+  const uint32_t dwt_elapsed_a = dwt_now - frag_dwt_cyccnt_at_pps;
+  const uint64_t dwt_ns_into_second_a =
+    (uint64_t)dwt_elapsed_a * 1000000000ULL / (uint64_t)frag_dwt_cycles_per_pps;
+  const uint64_t interp_a = frag_gnss_ns + dwt_ns_into_second_a;
+  const int64_t  error_a  = (int64_t)interp_a - (int64_t)vclock_gnss_ns;
 
-  const double stddev = (proof_n >= 2) ? sqrt(proof_m2 / (double)(proof_n - 1)) : 0.0;
-  const double pos_stddev = (proof_n >= 2) ? sqrt(proof_pos_m2 / (double)(proof_n - 1)) : 0.0;
-  const double correlation = (proof_n >= 2 && stddev > 0.0 && pos_stddev > 0.0)
-    ? (proof_covar / (double)(proof_n - 1)) / (stddev * pos_stddev) : 0.0;
+  proof_welford(
+    proof_a_n, proof_a_mean, proof_a_m2,
+    proof_a_min, proof_a_max, proof_a_outside_100,
+    proof_a_pos_mean, proof_a_pos_m2, proof_a_covar,
+    error_a, position
+  );
 
-  p.add("n", (int32_t)proof_n); p.add("error_ns", error_ns);
-  p.add("mean_ns", proof_mean); p.add("stddev_ns", stddev);
-  p.add("stderr_ns", (proof_n >= 2) ? stddev / sqrt((double)proof_n) : 0.0);
-  p.add("min_ns", proof_err_min); p.add("max_ns", proof_err_max);
-  p.add("outside_100ns", proof_outside_100);
-  p.add("position", position); p.add("pos_mean", proof_pos_mean);
-  p.add("pos_stddev", pos_stddev); p.add("correlation", correlation);
-  p.add("campaign_seconds", campaign_seconds); p.add("pps_count", frag->pps_count);
+  // ── Path B: Spin anchor interpolation ──
+  //
+  // Use the spin capture's TDC-corrected DWT and GNSS ns as the anchor.
+  // Interpolate forward from there using the same rate.
+  //
+  // The spin landed ~50 µs before the PPS edge.  If the query arrives
+  // at position 0.6 in the second, the PPS anchor is 0.6s away but
+  // the spin anchor is 0.6 + 0.00005 = 0.60005s away.  So the spin
+  // anchor's interpolation window is slightly LONGER than the PPS
+  // anchor's — the advantage isn't window size (yet), it's anchor
+  // precision.
+  //
+  // When 10 KHz anchoring is added, the most recent anchor will be
+  // at most 100 µs old, and Path B's window shrinks to ~50 µs.
+
+  int64_t error_b  = 0;
+
+  if (pps_spin.valid && pps_spin.tdc_correction >= 0) {
+    // spin_gnss is approximate: landed_gnss_ns is the time.h estimate
+    // at spin landing, adjusted forward by the TDC correction.
+    // A simpler and more robust approach: the spin landing is
+    // (delta_cycles) DWT cycles before the ISR snapshot.
+    // The corrected_dwt is the true PPS-edge DWT.
+    // So the corrected anchor is: {frag_gnss_ns, corrected_dwt}
+    // — same GNSS time as the PPS edge, but a more precise DWT.
+
+    const uint32_t dwt_elapsed_b = dwt_now - pps_spin.corrected_dwt;
+    const uint64_t dwt_ns_into_second_b =
+      (uint64_t)dwt_elapsed_b * 1000000000ULL / (uint64_t)frag_dwt_cycles_per_pps;
+    const uint64_t interp_b = frag_gnss_ns + dwt_ns_into_second_b;
+    error_b = (int64_t)interp_b - (int64_t)vclock_gnss_ns;
+
+    proof_welford(
+      proof_b_n, proof_b_mean, proof_b_m2,
+      proof_b_min, proof_b_max, proof_b_outside_100,
+      proof_b_pos_mean, proof_b_pos_m2, proof_b_covar,
+      error_b, position
+    );
+  }
+
+  // ── Emit results ──
+
+  const double a_stddev = (proof_a_n >= 2) ? sqrt(proof_a_m2 / (double)(proof_a_n - 1)) : 0.0;
+  const double a_pos_sd = (proof_a_n >= 2) ? sqrt(proof_a_pos_m2 / (double)(proof_a_n - 1)) : 0.0;
+  const double a_corr   = (proof_a_n >= 2 && a_stddev > 0.0 && a_pos_sd > 0.0)
+    ? (proof_a_covar / (double)(proof_a_n - 1)) / (a_stddev * a_pos_sd) : 0.0;
+
+  // Path A results
+  p.add("a_n",       (int32_t)proof_a_n);
+  p.add("a_err",     error_a);
+  p.add("a_mean",    proof_a_mean);
+  p.add("a_stddev",  a_stddev);
+  p.add("a_stderr",  (proof_a_n >= 2) ? a_stddev / sqrt((double)proof_a_n) : 0.0);
+  p.add("a_min",     proof_a_min);
+  p.add("a_max",     proof_a_max);
+  p.add("a_out100",  proof_a_outside_100);
+  p.add("a_corr",    a_corr);
+
+  // Path B results
+  if (proof_b_n > 0) {
+    const double b_stddev = (proof_b_n >= 2) ? sqrt(proof_b_m2 / (double)(proof_b_n - 1)) : 0.0;
+    const double b_pos_sd = (proof_b_n >= 2) ? sqrt(proof_b_pos_m2 / (double)(proof_b_n - 1)) : 0.0;
+    const double b_corr   = (proof_b_n >= 2 && b_stddev > 0.0 && b_pos_sd > 0.0)
+      ? (proof_b_covar / (double)(proof_b_n - 1)) / (b_stddev * b_pos_sd) : 0.0;
+
+    p.add("b_n",       (int32_t)proof_b_n);
+    p.add("b_err",     error_b);
+    p.add("b_mean",    b_stddev > 0 ? proof_b_mean : 0.0);
+    p.add("b_stddev",  b_stddev);
+    p.add("b_stderr",  (proof_b_n >= 2) ? b_stddev / sqrt((double)proof_b_n) : 0.0);
+    p.add("b_min",     proof_b_min);
+    p.add("b_max",     proof_b_max);
+    p.add("b_out100",  proof_b_outside_100);
+    p.add("b_corr",    b_corr);
+  } else {
+    p.add("b_n", (int32_t)0);
+  }
+
+  // Common context
+  p.add("position",         position);
+  p.add("campaign_seconds", campaign_seconds);
+  p.add("pps_count",        frag->pps_count);
+
   return p;
 }
 

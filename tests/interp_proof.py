@@ -1,29 +1,30 @@
 """
-ZPNet Interpolation Proof — continuous accuracy test
+ZPNet Interpolation Proof — Head-to-Head Accuracy Test
+
+Compares two interpolation strategies against VCLOCK ground truth:
+
+  Path A (PPS anchor):  Interpolate from PPS-edge DWT using 1-second
+                        prediction.  Current production path.  Window
+                        is 0-1 seconds depending on query position.
+
+  Path B (Spin anchor): Interpolate from TDC-corrected spin capture DWT.
+                        Currently same window as Path A (spin fires once
+                        per PPS), but the anchor is more precise (~1.3 ns
+                        vs ~47-51 cycle ISR jitter).  When 10 KHz anchoring
+                        is added, the window shrinks to ~100 µs.
+
+Both paths are compared to the same VCLOCK reading at the same instant.
+The difference in stddev answers: "Is the spin anchor worth it?"
+
+The correlation with position (0.0 = just after PPS, 1.0 = just before
+next PPS) reveals whether error grows with distance from the anchor.
+If Path A shows correlation and Path B doesn't, the spin anchor is
+eliminating drift-dependent error.
 
 Usage:
     python -m zpnet.tests.interp_proof [interval_seconds] [reset]
     .zt interp_proof
-    .zt interp_proof 1
-    .zt interp_proof 2 reset
-
-Calls INTERP_PROOF on the Teensy once per interval (default 1 second).
-Each call takes one sample at whatever position in the second the
-command happens to arrive, accumulating Welford stats on the Teensy.
-
-Prints a running table showing:
-  n       — sample count
-  err     — this sample's error (ns)
-  mean    — running mean error (should converge to ~0 if math is right)
-  stddev  — running stddev (should converge to jitter floor)
-  stderr  — standard error of the mean (shrinks as 1/sqrt(n))
-  pos     — position in second (0.0 to 1.0) where this sample landed
-  corr    — Pearson r(error, position) — should be ~0 if ratio is right
-  min/max — running min/max error
-
-Press Ctrl-C to stop.  The Teensy retains the accumulators — you can
-restart this script and it continues from where it left off.  Send
-reset=1 to clear and start fresh.
+    .zt interp_proof 1 reset
 """
 
 from __future__ import annotations
@@ -40,14 +41,43 @@ def run(interval: float = 1.0, reset: bool = False) -> None:
         args["reset"] = "1"
         print("Resetting accumulators...")
 
-    # Header
     print()
-    print(f"  {'n':>5s}  {'err':>7s}  {'mean':>8s}  {'stddev':>8s}"
-          f"  {'stderr':>8s}  {'pos':>5s}  {'corr':>7s}"
-          f"  {'min':>7s}  {'max':>7s}  {'out':>4s}")
-    print(f"  {'─'*5}  {'─'*7}  {'─'*8}  {'─'*8}"
-          f"  {'─'*8}  {'─'*5}  {'─'*7}"
-          f"  {'─'*7}  {'─'*7}  {'─'*4}")
+    print("  ── Path A: PPS anchor (production)  │  Path B: Spin anchor (TDC-corrected)")
+    print()
+    print(
+        f"  {'n':>5s}"
+        f"  {'pos':>5s}"
+        f"  │ {'a_err':>7s}"
+        f"  {'a_mean':>8s}"
+        f"  {'a_sd':>7s}"
+        f"  {'a_corr':>7s}"
+        f"  │ {'b_err':>7s}"
+        f"  {'b_mean':>8s}"
+        f"  {'b_sd':>7s}"
+        f"  {'b_corr':>7s}"
+        f"  │ {'winner':>7s}"
+    )
+    print(
+        f"  {'─'*5}"
+        f"  {'─'*5}"
+        f"  │ {'─'*7}"
+        f"  {'─'*8}"
+        f"  {'─'*7}"
+        f"  {'─'*7}"
+        f"  │ {'─'*7}"
+        f"  {'─'*8}"
+        f"  {'─'*7}"
+        f"  {'─'*7}"
+        f"  │ {'─'*7}"
+    )
+
+    n = 0
+    a_stddev = 0.0
+    b_stddev = 0.0
+    a_corr = 0.0
+    b_corr = 0.0
+    a_mean = 0.0
+    b_mean = 0.0
 
     first = True
     try:
@@ -64,7 +94,6 @@ def run(interval: float = 1.0, reset: bool = False) -> None:
                 time.sleep(interval)
                 continue
 
-            # Only send reset on the first call
             if first:
                 args = {}
                 first = False
@@ -77,36 +106,97 @@ def run(interval: float = 1.0, reset: bool = False) -> None:
 
             p = resp.get("payload", {})
 
-            n       = p.get("n", 0)
-            err     = p.get("error_ns", 0)
-            mean    = p.get("mean_ns", 0.0)
-            stddev  = p.get("stddev_ns", 0.0)
-            stderr  = p.get("stderr_ns", 0.0)
-            pos     = p.get("position", 0.0)
-            corr    = p.get("correlation", 0.0)
-            err_min = p.get("min_ns", 0)
-            err_max = p.get("max_ns", 0)
-            outside = p.get("outside_100ns", 0)
+            n        = p.get("a_n", 0)
+            pos      = p.get("position", 0.0)
 
-            print(f"  {n:>5d}  {err:>+7d}  {mean:>+8.1f}  {stddev:>8.1f}"
-                  f"  {stderr:>8.2f}  {pos:>5.3f}  {corr:>+7.4f}"
-                  f"  {err_min:>+7d}  {err_max:>+7d}  {outside:>4d}")
+            a_err    = p.get("a_err", 0)
+            a_mean   = p.get("a_mean", 0.0)
+            a_stddev = p.get("a_stddev", 0.0)
+            a_corr   = p.get("a_corr", 0.0)
+
+            b_n      = p.get("b_n", 0)
+            b_err    = p.get("b_err", 0)
+            b_mean   = p.get("b_mean", 0.0)
+            b_stddev = p.get("b_stddev", 0.0)
+            b_corr   = p.get("b_corr", 0.0)
+
+            if b_n > 0 and n >= 2 and b_stddev > 0:
+                if a_stddev > 0 and b_stddev > 0:
+                    ratio = a_stddev / b_stddev
+                    winner = f"B {ratio:.1f}x" if ratio > 1.0 else f"A {1.0/ratio:.1f}x" if ratio < 1.0 else "TIE"
+                else:
+                    winner = "---"
+
+                print(
+                    f"  {n:>5d}"
+                    f"  {pos:>5.3f}"
+                    f"  │ {a_err:>+7d}"
+                    f"  {a_mean:>+8.1f}"
+                    f"  {a_stddev:>7.1f}"
+                    f"  {a_corr:>+7.4f}"
+                    f"  │ {b_err:>+7d}"
+                    f"  {b_mean:>+8.1f}"
+                    f"  {b_stddev:>7.1f}"
+                    f"  {b_corr:>+7.4f}"
+                    f"  │ {winner:>7s}"
+                )
+            else:
+                print(
+                    f"  {n:>5d}"
+                    f"  {pos:>5.3f}"
+                    f"  │ {a_err:>+7d}"
+                    f"  {a_mean:>+8.1f}"
+                    f"  {a_stddev:>7.1f}"
+                    f"  {a_corr:>+7.4f}"
+                    f"  │ {'(waiting)':>7s}"
+                    f"  {'':>8s}"
+                    f"  {'':>7s}"
+                    f"  {'':>7s}"
+                    f"  │ {'---':>7s}"
+                )
 
             time.sleep(interval)
 
     except KeyboardInterrupt:
         print()
-        print(f"  Stopped after {n} samples.")
+        print("=" * 78)
+        print(f"  RESULTS after {n} samples")
+        print("=" * 78)
+        print()
+
         if n >= 2:
-            print(f"  Final mean: {mean:+.1f} ns  stderr: {stderr:.2f} ns")
-            if abs(mean) < 2 * stderr:
-                print(f"  ✅ Mean is within 2σ of zero — no systematic bias detected.")
+            print(f"  Path A (PPS anchor — production):")
+            print(f"    mean:    {a_mean:+.1f} ns")
+            print(f"    stddev:  {a_stddev:.1f} ns")
+            print(f"    corr:    {a_corr:+.4f}  ({'position-dependent' if abs(a_corr) > 0.1 else 'position-independent'})")
+            print()
+
+            if b_stddev > 0:
+                print(f"  Path B (Spin anchor — TDC-corrected):")
+                print(f"    mean:    {b_mean:+.1f} ns")
+                print(f"    stddev:  {b_stddev:.1f} ns")
+                print(f"    corr:    {b_corr:+.4f}  ({'position-dependent' if abs(b_corr) > 0.1 else 'position-independent'})")
+                print()
+
+                if a_stddev > 0 and b_stddev > 0:
+                    ratio = a_stddev / b_stddev
+                    if ratio > 1.05:
+                        print(f"  VERDICT: Spin anchor wins by {ratio:.2f}x lower stddev")
+                        print(f"           ({a_stddev:.1f} ns → {b_stddev:.1f} ns)")
+                    elif ratio < 0.95:
+                        print(f"  VERDICT: PPS anchor wins by {1.0/ratio:.2f}x lower stddev")
+                        print(f"           ({a_stddev:.1f} ns vs {b_stddev:.1f} ns)")
+                    else:
+                        print(f"  VERDICT: No significant difference ({a_stddev:.1f} ns vs {b_stddev:.1f} ns)")
+
+                    if abs(a_corr) > 0.1 and abs(b_corr) < 0.1:
+                        print(f"           Path A error correlates with position (r={a_corr:+.3f})")
+                        print(f"           Path B eliminates this — anchor precision matters more than window size")
+                    elif abs(a_corr) > 0.1 and abs(b_corr) > 0.1:
+                        print(f"           Both paths show position correlation — 10 KHz anchoring will help")
             else:
-                print(f"  ⚠️  Mean is {abs(mean)/stderr:.1f}σ from zero — possible systematic bias.")
-            if abs(corr) < 0.1:
-                print(f"  ✅ No correlation with position (r={corr:+.4f})")
-            else:
-                print(f"  ⚠️  Correlation with position: r={corr:+.4f}")
+                print(f"  Path B: insufficient data (spin capture may not be active)")
+
         print()
 
 

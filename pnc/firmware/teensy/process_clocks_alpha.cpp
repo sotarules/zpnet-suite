@@ -2,58 +2,26 @@
 // process_clocks_alpha.cpp — Always-On Physics Layer
 // ============================================================================
 //
+// v19: Shadow-loop timeout protection + consistent timeout naming.
+//
+//   v18 introduced the shadow-write loop but had no timeout — if the
+//   PPS edge never arrived, the Teensy locked up permanently.  v19
+//   adds SPIN_LOOP_TIMEOUT_CYCLES (100 µs at 1008 MHz) as a safety
+//   net.  If the PPS doesn't preempt within that window, the loop
+//   exits and increments shadow_timeouts.
+//
+//   Timeout field naming is now symmetric:
+//     nano_timed_out   / nano_timeouts   — nano-spin couldn't reach target
+//     shadow_timed_out / shadow_timeouts — PPS never arrived during loop
+//
+// v18: Spin Capture with shadow-write loop — TDC at 1008 MHz.
 // v16: PPS watchdog — self-healing pps_scheduled stall.
-//
-//   The PPS ISR defers all processing to a TimePop ASAP callback via
-//   pps_scheduled.  If the ASAP callback ever fails to fire (TimePop
-//   slot exhaustion, dispatch stall, or callback fault), pps_scheduled
-//   stays true and every subsequent PPS is silently rejected — killing
-//   the entire measurement pipeline with zero diagnostic output.
-//
-//   v16 fixes:
-//
-//   1. Consecutive-rejection watchdog: after PPS_WATCHDOG_THRESHOLD
-//      consecutive rejections due to pps_scheduled being stuck, the
-//      ISR force-clears pps_scheduled and re-arms.  This self-heals
-//      within PPS_WATCHDOG_THRESHOLD seconds (default 3).
-//
-//   2. timepop_arm() return value check: if timepop_arm() returns
-//      TIMEPOP_INVALID_HANDLE (slots full), pps_scheduled is
-//      immediately cleared and a diagnostic counter incremented.
-//
-//   3. Rich forensic counters: pps_scheduled_stuck (consecutive
-//      rejections due to stuck flag), pps_watchdog_recoveries
-//      (force-clear events), pps_asap_arm_failures (timepop_arm
-//      returned INVALID_HANDLE), pps_asap_armed (successful arms),
-//      pps_asap_dispatched (callback completions).  All surfaced
-//      in CLOCKS_INFO for post-mortem analysis.
-//
-//   4. DWT timestamp capture at stall onset: diag_pps_stuck_since_dwt
-//      records the DWT_CYCCNT at which the consecutive rejection
-//      counter first became nonzero, enabling elapsed-time forensics.
-//
 // v15: DAC dither telemetry + random walk prediction model.
-//
-//   ocxo_dither_one() now captures the integer DAC value written to
-//   analogWrite() in dac_output_int, so that the TIMEBASE_FRAGMENT
-//   can report the actual integer value applied each second.
-//
 // v14: Symmetric GPT architecture for both OCXOs.
 //
-//   OCXO1 on GPT1  (pin 25, GPIO_AD_B0_13, ALT1, 10 MHz single-edge).
-//   OCXO2 on GPT2  (pin 14, GPIO_AD_B1_02, ALT8, 10 MHz single-edge).
-//   GNSS  on QTimer1 ch0+ch1 (pin 10, GPIO_B0_00, ALT1, 20 MHz dual-edge).
-//
-//   Both OCXOs have clean, deterministic single-edge counting.
-//   GNSS VCLOCK on QTimer1 serves as a PPS sanity check only.
-//   The dual-edge alternation on GNSS is harmless — GNSS time
-//   authority derives from PPS count, not VCLOCK tick precision.
-//
-//   GPT2 no longer runs on internal 24 MHz — it now counts OCXO2
-//   externally.  TimePop scheduling uses DWT-based deadline
-//   conversion (unchanged from v13).
-//
 // ============================================================================
+
+#include "tdc_correction.h"
 
 #include "process_clocks_internal.h"
 #include "process_clocks.h"
@@ -84,17 +52,153 @@ static constexpr uint64_t PPS_RELAY_OFF_NS  =   500000000ULL;  // 500 ms
 
 // ============================================================================
 // PPS watchdog — self-healing threshold
-//
-// If pps_scheduled remains stuck for this many consecutive PPS edges,
-// the ISR force-clears it and re-arms.  At 1 Hz PPS, this is also
-// the recovery time in seconds.
-//
-// 3 is chosen to distinguish a genuine one-off dispatch delay (1-2
-// edges) from a permanent stall, while recovering quickly enough
-// that an overnight campaign loses at most 3 seconds of data.
 // ============================================================================
 
 static constexpr uint32_t PPS_WATCHDOG_THRESHOLD = 3;
+
+// ============================================================================
+// Spin capture timeout — shadow-write loop safety net
+//
+// If the PPS ISR doesn't preempt the shadow-write loop within
+// this many DWT cycles, the loop exits to prevent a permanent
+// Teensy lockup.  100 µs is 2x the 50 µs early margin — generous
+// enough to absorb prediction error, tight enough to never hang.
+// ============================================================================
+
+static constexpr uint32_t SPIN_LOOP_TIMEOUT_CYCLES = 100800;  // 100 µs at 1008 MHz
+
+// ============================================================================
+// Spin Capture — nano-precise DWT anchoring with shadow-write TDC
+// ============================================================================
+
+volatile uint32_t dispatch_shadow_dwt     = 0;
+volatile uint32_t isr_captured_shadow_dwt = 0;
+
+spin_capture_t pps_spin = {};
+
+// ── Nano-spin callback for PPS (fires in ISR context) ──
+//
+// The nano-spin lands at the target DWT (~50 µs before PPS).
+// After recording the landing, it enters the shadow-write loop.
+// The PPS ISR (priority 0) preempts this callback (priority 16),
+// captures the shadow via isr_captured_shadow_dwt, and sets
+// pps_fired = true to break the loop.
+//
+// Two timeout paths:
+//   1. Nano-spin timeout (ctx->nano_timeout): couldn't reach target DWT.
+//      Record and return immediately — don't enter the shadow loop.
+//   2. Shadow-loop timeout (SPIN_LOOP_TIMEOUT_CYCLES): PPS never arrived.
+//      Exit the loop to prevent permanent lockup.
+
+static void pps_spin_callback(timepop_ctx_t* ctx, void*) {
+  // Record the precise nano-spin landing
+  pps_spin.landed_dwt     = ctx->fire_dwt_cyccnt;
+  pps_spin.landed_gnss_ns = ctx->fire_gnss_ns;
+  pps_spin.spin_error     = (int32_t)(ctx->fire_dwt_cyccnt - pps_spin.target_dwt);
+
+  // ── Nano-spin timeout: couldn't reach target DWT ──
+  if (ctx->nano_timeout) {
+    pps_spin.nano_timed_out = true;
+    pps_spin.nano_timeouts++;
+    pps_spin.completed = true;
+    return;
+  }
+
+  pps_spin.nano_timed_out = false;
+
+  // ── Shadow-write loop: spin until PPS ISR preempts ──
+  const uint32_t spin_start = DWT_CYCCNT;
+  for (;;) {
+    dispatch_shadow_dwt = DWT_CYCCNT;
+    if (pps_fired) break;
+    if ((DWT_CYCCNT - spin_start) > SPIN_LOOP_TIMEOUT_CYCLES) {
+      pps_spin.shadow_timed_out = true;
+      pps_spin.shadow_timeouts++;
+      pps_spin.completed = true;
+      return;
+    }
+  }
+
+  // PPS ISR has fired.  isr_captured_shadow_dwt holds the
+  // last shadow value the ISR saw.
+  pps_spin.shadow_dwt       = isr_captured_shadow_dwt;
+  pps_spin.shadow_timed_out = false;
+  pps_spin.completed        = true;
+  pps_spin.completions++;
+}
+
+// ── Arm the PPS spin capture for the next PPS edge ──
+
+static constexpr int64_t SPIN_EARLY_NS = 50000LL;  // 50 µs
+
+static void pps_spin_arm(void) {
+  if (!g_dwt_cal_valid) return;
+  if (!time_valid()) return;
+
+  int64_t now_ns = time_gnss_ns_now();
+  if (now_ns < 0) return;
+
+  int64_t target_gnss_ns = now_ns + (int64_t)NS_PER_SECOND - SPIN_EARLY_NS;
+  uint32_t target_dwt    = time_gnss_ns_to_dwt(target_gnss_ns);
+
+  pps_spin.target_dwt       = target_dwt;
+  pps_spin.target_gnss_ns   = target_gnss_ns;
+  pps_spin.completed        = false;
+  pps_spin.nano_timed_out   = false;
+  pps_spin.shadow_timed_out = false;
+  pps_spin.arms++;
+
+  // Clear pps_fired so the shadow loop doesn't exit immediately.
+  pps_fired = false;
+
+  timepop_handle_t h = timepop_arm_ns(
+    target_gnss_ns, target_dwt,
+    pps_spin_callback, nullptr, "pps-spin"
+  );
+
+  if (h == TIMEPOP_INVALID_HANDLE) {
+    pps_spin.armed = false;
+    pps_spin.arm_failures++;
+  } else {
+    pps_spin.armed = true;
+  }
+}
+
+// ── Complete the PPS spin capture (called from ASAP callback) ──
+
+static void pps_spin_complete(uint32_t isr_dwt_snap) {
+  if (!pps_spin.completed) {
+    pps_spin.valid = false;
+    if (pps_spin.armed) {
+      pps_spin.misses++;
+      timepop_cancel_by_name("pps-spin");
+    }
+    return;
+  }
+
+  // If either timeout fired, the capture is not usable for TDC
+  if (pps_spin.nano_timed_out || pps_spin.shadow_timed_out) {
+    pps_spin.valid = false;
+    pps_spin.armed = false;
+    return;
+  }
+
+  pps_spin.isr_dwt         = isr_dwt_snap;
+  pps_spin.delta_cycles     = (int32_t)(isr_dwt_snap - pps_spin.shadow_dwt);
+  pps_spin.approach_cycles  = (int32_t)(isr_dwt_snap - pps_spin.landed_dwt);
+
+  // TDC correction: derive the true PPS-edge DWT from the shadow
+  int32_t correction = -1;
+  pps_spin.corrected_dwt = tdc_correct(
+    pps_spin.shadow_dwt,
+    pps_spin.delta_cycles,
+    correction
+  );
+  pps_spin.tdc_correction = correction;
+
+  pps_spin.valid  = true;
+  pps_spin.armed  = false;
+}
 
 // ============================================================================
 // Continuous DWT-to-GNSS Calibration (campaign-independent)
@@ -116,8 +220,6 @@ bool clocks_dwt_calibration_valid(void) {
 
 // ============================================================================
 // OCXO DAC state — definitions
-//
-// v15: dac_output_int added — the aggregate initializer gains one field.
 // ============================================================================
 
 ocxo_dac_state_t ocxo1_dac = {
@@ -175,30 +277,6 @@ volatile bool     isr_residual_valid = false;
 volatile uint32_t diag_pps_rejected_total     = 0;
 volatile uint32_t diag_pps_rejected_remainder = 0;
 
-// ── v16 PPS watchdog diagnostics ──
-//
-// pps_scheduled_stuck:     consecutive PPS edges rejected because
-//                          pps_scheduled was true (resets to 0 on
-//                          each successful arm or watchdog recovery)
-//
-// pps_watchdog_recoveries: number of times the watchdog force-cleared
-//                          pps_scheduled (each represents a stall that
-//                          would have been permanent in v15)
-//
-// pps_asap_arm_failures:   timepop_arm() returned TIMEPOP_INVALID_HANDLE
-//                          (slot exhaustion — pps_scheduled cleared
-//                          immediately to avoid deadlock)
-//
-// pps_asap_armed:          successful timepop_arm() calls for PPS ASAP
-//
-// pps_asap_dispatched:     successful pps_asap_callback completions
-//
-// pps_stuck_since_dwt:     DWT_CYCCNT when the current stuck streak
-//                          began (0 when not stuck)
-//
-// pps_stuck_max:           high-water mark of pps_scheduled_stuck
-//                          (helps identify near-miss stalls)
-
 volatile uint32_t diag_pps_scheduled_stuck     = 0;
 volatile uint32_t diag_pps_watchdog_recoveries = 0;
 volatile uint32_t diag_pps_asap_arm_failures   = 0;
@@ -245,18 +323,6 @@ uint64_t clocks_dwt_ns_now(void) {
 
 // ============================================================================
 // GNSS VCLOCK (10 MHz external via QTimer1 ch0+ch1 — cascaded 32-bit)
-//
-// Pin 10 = GPIO_B0_00, IOMUXC ALT1 = QTIMER1_TIMER0
-//
-// QTimer CM(2) counts both rising and falling edges, producing
-// ~20 MHz raw counts for a 10 MHz input.  The dual-edge alternation
-// is harmless for GNSS — time authority comes from PPS count.
-// VCLOCK serves only as a PPS sanity check.
-//
-// ch0+ch1 cascade for 32-bit range.
-//
-// IMPORTANT: Do NOT touch channels 2 and 3 — pin 11 (OCXO2 CTL) uses
-// FlexPWM1 submodule 2, which shares the QTimer1 module.
 // ============================================================================
 
 static bool qtimer1_armed = false;
@@ -275,14 +341,10 @@ static void arm_qtimer1_external(void) {
 
   CCM_CCGR6 |= CCM_CCGR6_QTIMER1(CCM_CCGR_ON);
 
-  // Pin 10 = GPIO_B0_00, ALT1 = QTIMER1_TIMER0
   IOMUXC_SW_MUX_CTL_PAD_GPIO_B0_00 = 1;
   IOMUXC_SW_PAD_CTL_PAD_GPIO_B0_00 =
       IOMUXC_PAD_HYS | IOMUXC_PAD_PKE | IOMUXC_PAD_PUE | IOMUXC_PAD_DSE(4);
 
-  // Only touch channels 0 and 1 (our cascade pair).
-  // Do NOT touch channels 2 and 3 — pin 11 (OCXO2 CTL) uses
-  // FlexPWM1 submodule 2, which shares the QTimer1 module.
   IMXRT_TMR1.CH[0].CTRL = 0;
   IMXRT_TMR1.CH[1].CTRL = 0;
 
@@ -302,11 +364,7 @@ static void arm_qtimer1_external(void) {
   IMXRT_TMR1.CH[0].CMPLD1 = 0xFFFF;
   IMXRT_TMR1.CH[1].CMPLD1 = 0xFFFF;
 
-  // ch0: count edges of external pin (CM=2, PCS=0)
-  // NOTE: CM(2) counts BOTH edges — raw rate is 2x input frequency
   IMXRT_TMR1.CH[0].CTRL = TMR_CTRL_CM(2) | TMR_CTRL_PCS(0);
-
-  // ch1: cascade from ch0 overflow (CM=7)
   IMXRT_TMR1.CH[1].CTRL = TMR_CTRL_CM(7);
 
   gnss_rolling_32 = qtimer1_read_32();
@@ -327,9 +385,6 @@ uint64_t clocks_gnss_ns_now(void) {
 
 // ============================================================================
 // OCXO1 (10 MHz external via GPT1 — pin 25)
-//
-// GPT1 counts single edges at 10 MHz.  32-bit native, no cascade.
-// Pin 25 = GPIO_AD_B0_13, IOMUX ALT1 = GPT1_CLK.
 // ============================================================================
 
 static bool gpt1_armed = false;
@@ -368,13 +423,6 @@ uint64_t clocks_ocxo1_ns_now(void) {
 
 // ============================================================================
 // OCXO2 (10 MHz external via GPT2 — pin 14)
-//
-// GPT2 counts single edges at 10 MHz.  32-bit native, no cascade.
-// Pin 14 = GPIO_AD_B1_02, IOMUX ALT8 = GPT2_CLK.
-//
-// This is the same pin and IOMUX configuration that previously
-// counted GNSS VCLOCK.  The only change is what signal is wired
-// to the pin.
 // ============================================================================
 
 static bool gpt2_armed = false;
@@ -440,6 +488,10 @@ static void pps_asap_callback(timepop_ctx_t*, void*) {
     g_dwt_cal_valid ? g_dwt_cycles_per_gnss_s : 0
   );
 
+  // ── Spin capture: complete the current capture, arm the next ──
+  pps_spin_complete(isr_snap_dwt);
+  pps_spin_arm();
+
   if (relay_arm_pending) {
     relay_arm_pending = false;
     if (!relay_timer_active) {
@@ -458,21 +510,7 @@ static void pps_asap_callback(timepop_ctx_t*, void*) {
 // ============================================================================
 // PPS handling — ISR (minimum latency)
 //
-// Read order: DWT first (highest frequency, most latency-sensitive),
-// then the two GPTs (OCXO1, OCXO2), then QTimer1 (GNSS).
-//
-// v16: Watchdog for pps_scheduled stall.
-//
-//   If pps_scheduled remains true for PPS_WATCHDOG_THRESHOLD consecutive
-//   PPS edges, the ISR force-clears it and re-arms.  This prevents a
-//   single missed TimePop ASAP callback from permanently killing the
-//   measurement pipeline.
-//
-//   The force-clear is safe: the original ASAP callback either already
-//   fired (and something prevented pps_scheduled = false), or it was
-//   lost entirely.  In both cases, the ISR snapshots in isr_snap_*
-//   are being overwritten each PPS regardless, so re-arming with
-//   fresh snapshots is correct.
+// v18: Captures the spin loop shadow value before setting pps_fired.
 // ============================================================================
 
 static void pps_isr(void) {
@@ -482,9 +520,6 @@ static void pps_isr(void) {
   const uint32_t snap_ocxo2 = GPT2_CNT;
   const uint32_t snap_gnss  = qtimer1_read_32();
 
-  // PPS validation uses GNSS raw count (20 MHz dual-edge).
-  // The alternation means isr_residual_gnss will oscillate,
-  // but PPS_VCLOCK_TOLERANCE accommodates this.
   if (isr_residual_valid) {
     uint32_t elapsed = snap_gnss - isr_prev_gnss;
     uint32_t remainder = elapsed % ISR_GNSS_RAW_EXPECTED;
@@ -496,6 +531,8 @@ static void pps_isr(void) {
     }
   }
 
+  // Capture the shadow BEFORE setting pps_fired.
+  isr_captured_shadow_dwt = dispatch_shadow_dwt;
   pps_fired = true;
 
   digitalWriteFast(GNSS_PPS_RELAY, HIGH);
@@ -513,7 +550,7 @@ static void pps_isr(void) {
   isr_prev_ocxo1 = isr_snap_ocxo1 = snap_ocxo1;
   isr_prev_ocxo2 = isr_snap_ocxo2 = snap_ocxo2;
 
-  // ── v16: PPS watchdog — detect and recover from pps_scheduled stall ──
+  // ── v16: PPS watchdog ──
   if (pps_scheduled) {
     diag_pps_scheduled_stuck++;
 
@@ -529,10 +566,6 @@ static void pps_isr(void) {
       return;
     }
 
-    // Watchdog triggered: force-clear and fall through to re-arm.
-    // The old ASAP callback is either lost or already fired without
-    // clearing the flag.  Either way, re-arming is safe — we have
-    // fresh ISR snapshots above.
     pps_scheduled = false;
     diag_pps_watchdog_recoveries++;
     diag_pps_scheduled_stuck = 0;
@@ -546,9 +579,6 @@ static void pps_isr(void) {
 
   timepop_handle_t h = timepop_arm(0, false, pps_asap_callback, nullptr, "pps");
   if (h == TIMEPOP_INVALID_HANDLE) {
-    // TimePop slots full — cannot arm the ASAP callback.
-    // Clear pps_scheduled immediately so the next PPS edge can retry
-    // instead of deadlocking.
     pps_scheduled = false;
     diag_pps_asap_arm_failures++;
   } else {
@@ -558,8 +588,6 @@ static void pps_isr(void) {
 
 // ============================================================================
 // Dither callback — runs forever at 1 kHz, writes both OCXO PWM pins
-//
-// v15: captures dac_output_int for telemetry in TIMEBASE_FRAGMENT.
 // ============================================================================
 
 static void ocxo_dither_one(ocxo_dac_state_t& s, int pin) {

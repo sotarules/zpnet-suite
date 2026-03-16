@@ -1152,6 +1152,19 @@ def _process_loop() -> None:
             "pps_rejected_total": frag.get("diag_pps_rejected_total"),
             "pps_rejected_remainder": frag.get("diag_pps_rejected_remainder"),
 
+            # Spin capture forensics (v19 field names)
+            "spin_valid": frag.get("spin_valid"),
+            "spin_delta_cycles": frag.get("spin_delta_cycles"),
+            "spin_error_cycles": frag.get("spin_error_cycles"),
+            "spin_approach_cycles": frag.get("spin_approach_cycles"),
+            "spin_isr_dwt": frag.get("spin_isr_dwt"),
+            "spin_landed_dwt": frag.get("spin_landed_dwt"),
+            "spin_shadow_dwt": frag.get("spin_shadow_dwt"),
+            "spin_corrected_dwt": frag.get("spin_corrected_dwt"),
+            "spin_tdc_correction": frag.get("spin_tdc_correction"),
+            "spin_nano_timed_out": frag.get("spin_nano_timed_out"),
+            "spin_shadow_timed_out": frag.get("spin_shadow_timed_out"),
+
             # Environment snapshot (correlated with this PPS edge)
             "environment": env_snapshot,
 
