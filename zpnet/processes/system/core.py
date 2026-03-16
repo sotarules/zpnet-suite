@@ -1057,8 +1057,16 @@ def cmd_report(_: Optional[dict]) -> Dict:
         "payload": snapshot,
     }
 
+def cmd_swap_battery(_: Optional[dict]) -> Dict:
+    create_event("SWAP_BATTERY", None)
+    return {
+        "success": True,
+        "message": "OK",
+    }
+
 COMMANDS = {
-    "REPORT": cmd_report
+    "REPORT": cmd_report,
+    "SWAP_BATTERY": cmd_swap_battery
 }
 
 # ---------------------------------------------------------------------

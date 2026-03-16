@@ -171,7 +171,7 @@ def despooler_loop() -> None:
       • Network failure leaves events untouched
       • Success marks events permanently despooled
     """
-    endpoint = f"http://{ZPNET_REMOTE_HOST}/api"
+    endpoint = f"http://{ZPNET_REMOTE_HOST}/api/events"
 
     while True:
         try:
