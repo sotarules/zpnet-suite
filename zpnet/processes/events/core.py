@@ -23,6 +23,7 @@ Semantics:
   • One fault barrier per execution context
   • Failures are logged, never fabricated into success
   • Database is the source of truth for event durability
+  • Server unavailability is a normal operating state, not an error
 
 This file intentionally replaces the legacy event_despooler module
 and paves the way for its deprecation.
@@ -57,7 +58,8 @@ from zpnet.shared.logger import setup_logging
 # ---------------------------------------------------------------------
 
 DESPOOL_BATCH_SIZE = 50          # events per HTTP POST
-DESPOOL_INTERVAL_S = 5.0         # polling interval for unsent events
+DESPOOL_INTERVAL_S = 5.0         # polling interval when server is reachable
+DESPOOL_BACKOFF_S = 60.0         # polling interval when server is unreachable
 
 
 # ---------------------------------------------------------------------
@@ -166,12 +168,14 @@ def despooler_loop() -> None:
     Periodically POST undelivered events to the ZPNet backend.
 
     Semantics:
-      • Best-effort
+      • Best-effort, patient
       • No retries inside the loop
-      • Network failure leaves events untouched
+      • Network failure leaves events untouched in the DB
       • Success marks events permanently despooled
+      • Server unavailability is boring — back off and wait quietly
     """
     endpoint = f"http://{ZPNET_REMOTE_HOST}/api/events"
+    server_down = False
 
     while True:
         try:
@@ -197,10 +201,16 @@ def despooler_loop() -> None:
             ids = [e["id"] for e in events]
             _mark_despooled(ids)
 
-        except requests.RequestException as e:
-            logging.warning(
-                f"📡 [events] despool network issue: {e} — will retry"
-            )
+            if server_down:
+                logging.info("📡 [events] server reachable — despool resumed")
+                server_down = False
+
+        except requests.RequestException:
+            if not server_down:
+                logging.info("📡 [events] server unreachable — backing off")
+                server_down = True
+            time.sleep(DESPOOL_BACKOFF_S)
+            continue
 
         except Exception:
             logging.exception(

@@ -37,9 +37,9 @@ from smbus2 import SMBus
 from zpnet.processes.processes import send_command, server_setup
 from zpnet.shared.constants import (
     ZPNET_REMOTE_HOST,
-    ZPNET_TEST_PATH,
     HTTP_TIMEOUT,
-    EXPECTED_TEST_STRING,
+    DEFINITIVE_TEST_TIMEOUT_S,
+    DEFINITIVE_TEST_HOST,
 )
 from zpnet.shared.db import open_db
 from zpnet.shared.events import create_event
@@ -189,6 +189,15 @@ POWER_SAMPLE_STEP = 5                # same semantics as before
 #     "pi":     { ... Raspberry Pi host metrics ... }
 #   }
 SYSTEM: Dict[str, object] = {}
+
+# ------------------------------------------------------------------
+# ZPNet Server reachability state (speed tests only)
+# ------------------------------------------------------------------
+# Speed tests hit sota.ddns.net which is an unowned boundary.
+# Server downtime is normal (deploys, OOM, maintenance) and must
+# not fill the log with traceback spam every poll cycle.
+
+_server_reachable = True
 
 # ------------------------------------------------------------------
 # I2C BUS RESOLUTION (single source of truth)
@@ -342,9 +351,13 @@ def get_ssid() -> str:
     return result.stdout.strip()
 
 def zpnet_definitive_test() -> bool:
-    url = f"http://{ZPNET_REMOTE_HOST}{ZPNET_TEST_PATH}"
-    resp = requests.get(url, timeout=HTTP_TIMEOUT)
-    return resp.status_code == 200 and EXPECTED_TEST_STRING in resp.text
+    """Verify basic internet reachability via ICMP ping."""
+    result = subprocess.run(
+        ["ping", "-c", "1", "-W", str(DEFINITIVE_TEST_TIMEOUT_S), DEFINITIVE_TEST_HOST],
+        capture_output=True,
+        text=True,
+    )
+    return result.returncode == 0
 
 def get_local_ip() -> str:
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -420,6 +433,18 @@ def upload_test_mbps() -> float:
     return round((bits / 1e6) / elapsed, 2) if elapsed > 0 else 0.0
 
 def build_network_status() -> dict:
+    """
+    Build network status snapshot.
+
+    Semantics:
+      • Definitive test (ICMP ping) determines network reachability
+      • Speed tests hit sota.ddns.net — an unowned boundary
+      • Server downtime is normal and must not spam the log
+      • Transition logging: one message when server goes away,
+        one message when it comes back
+    """
+    global _server_reachable
+
     payload = {}
 
     try:
@@ -438,8 +463,15 @@ def build_network_status() -> dict:
             try:
                 payload["download_mbps"] = download_test_mbps()
                 payload["upload_mbps"] = upload_test_mbps()
-            except Exception:
-                logging.exception("[system] speed tests failed")
+
+                if not _server_reachable:
+                    logging.info("[system] ZPNet Server reachable — speed tests resumed")
+                    _server_reachable = True
+
+            except requests.RequestException:
+                if _server_reachable:
+                    logging.info("[system] ZPNet Server unreachable — speed tests skipped")
+                    _server_reachable = False
 
         else:
             payload["network_status"] = "DOWN"

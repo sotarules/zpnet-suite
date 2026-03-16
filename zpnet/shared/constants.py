@@ -83,6 +83,12 @@ CHOOSENET_PATH = "/usr/local/bin/choosenet.sh"
 CHOOSENET_RETRY_INTERVAL_S = 120  # seconds between connectivity checks
 
 # ---------------------------------------------------------------------
+# Definitive Network Test (ICMP ping to public DNS)
+# ---------------------------------------------------------------------
+DEFINITIVE_TEST_HOST = "8.8.8.8"
+DEFINITIVE_TEST_TIMEOUT_S = 5     # seconds
+
+# ---------------------------------------------------------------------
 # Laser / Photodiode Semantics
 # ---------------------------------------------------------------------
 

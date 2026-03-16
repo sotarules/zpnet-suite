@@ -1,15 +1,15 @@
 """
-ZPNet Choosenet Network Healer — Stellar-Compliant + Constants-Integrated Revision
-(v2025-12-29-gzip-aligned)
+ZPNet Choosenet Network Healer
+(v2026-03-16-ping-definitive)
 
-Performs definitive network test (ZPNet REST API at sota.ddns.net).
+Performs definitive network reachability test (ICMP ping to 8.8.8.8).
 If test fails, invokes choosenet.sh healing script and retries until success.
 When choosenet.sh reports success, emits CHOOSENET_SUCCESS event containing
 the previous and new SSIDs.
 
-Note:
-  • Server-side gzip enforcement applies to requests with bodies (POST/PUT).
-  • This module uses a bodyless GET for its definitive test and remains unchanged.
+The definitive test no longer depends on ZPNet Server availability.
+A downed or restarting server is not a network fault and must not
+trigger WPA supplicant recovery.
 
 Author: The Mule
 """
@@ -17,17 +17,14 @@ Author: The Mule
 import logging
 import subprocess
 import time
-import requests
 
 from zpnet.shared.logger import setup_logging
 from zpnet.shared.events import create_event
 from zpnet.shared.constants import (
-    ZPNET_REMOTE_HOST,
-    ZPNET_TEST_PATH,
-    EXPECTED_TEST_STRING,
-    HTTP_TIMEOUT,
     CHOOSENET_PATH,
     CHOOSENET_RETRY_INTERVAL_S,
+    DEFINITIVE_TEST_HOST,
+    DEFINITIVE_TEST_TIMEOUT_S,
 )
 
 # ---------------------------------------------------------------------
@@ -49,16 +46,19 @@ def get_ssid() -> str:
 
 def zpnet_definitive_test() -> bool:
     """
-    Check ZPNet API endpoint for definitive OK response.
+    Verify basic internet reachability via ICMP ping to a public host.
 
-    This is a bodyless GET request and is not subject to gzip
-    request-body policy.
+    This tests the network itself, not the ZPNet application stack.
+    A downed ZPNet Server no longer triggers false network recovery.
     """
     try:
-        url = f"http://{ZPNET_REMOTE_HOST}{ZPNET_TEST_PATH}"
-        response = requests.get(url, timeout=HTTP_TIMEOUT)
-        return response.status_code == 200 and EXPECTED_TEST_STRING in response.text
-    except requests.RequestException as e:
+        result = subprocess.run(
+            ["ping", "-c", "1", "-W", str(DEFINITIVE_TEST_TIMEOUT_S), DEFINITIVE_TEST_HOST],
+            capture_output=True,
+            text=True,
+        )
+        return result.returncode == 0
+    except Exception as e:
         logging.warning(f"[choosenet] connectivity test failed: {e}")
         return False
 
