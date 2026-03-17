@@ -1,24 +1,14 @@
 """
-ZPNet Metrics Readout Blocks — Combined Clocks Panel
+ZPNet Metrics Readout Blocks — Dense Clocks Panel (v5)
 
-Designed for full-screen terminal display over SSH.
-Each readout returns a list of lines (not a generator)
-so the curses display can measure and position them.
+Designed for full-screen terminal display over SSH at 1080p.
 
-The combined clocks panel shows everything the dashboard
-spreads across four separate readouts in a single dense view:
-  • Campaign status and elapsed time
-  • Tau and PPB for all four clock domains
-  • Prediction statistics (residual, mean, stddev, n)
-  • Baseline comparison (if set)
-  • OCXO servo/DAC state
-
-Invariants:
-  • No database access
-  • No aggregates
-  • No events
-  • No inference beyond explicit tests
-  • Defenseless (exceptions propagate to outer fault barrier)
+Data sources:
+  • Pi CLOCKS REPORT → campaign payload with report dict (tau, ppb,
+    prediction stats, timestamps, DWT clock blocks)
+  • Teensy CLOCKS REPORT → spin capture, ISR residuals, DWT internals,
+    PPS diagnostics, servo state
+  • Pi SYSTEM REPORT → GNSS, environment, power
 
 Author: The Mule + GPT
 """
@@ -26,7 +16,7 @@ Author: The Mule + GPT
 from zpnet.processes.processes import send_command
 
 # ---------------------------------------------------------------------
-# Data fetchers (same RPC as dashboard)
+# Data fetchers
 # ---------------------------------------------------------------------
 
 def _get_system_snapshot() -> dict:
@@ -54,10 +44,38 @@ def _get_clocks_baseline() -> dict | None:
 
 
 # ---------------------------------------------------------------------
-# Clock domains (shared constant)
+# Clock domains
 # ---------------------------------------------------------------------
 
 _CLOCK_DOMAINS = [("GNSS", "gnss"), ("DWT", "dwt"), ("OCXO1", "ocxo1"), ("OCXO2", "ocxo2")]
+
+
+# ---------------------------------------------------------------------
+# Formatting helpers
+# ---------------------------------------------------------------------
+
+def _fmt(value, fmt_str, width, fallback="---"):
+    if value is None:
+        return f"{fallback:>{width}}"
+    return f"{value:{fmt_str}}"
+
+
+def _sign_int(value, width):
+    if value is None:
+        return f"{'---':>{width}}"
+    return f"{value:>+{width}d}"
+
+
+def _comma_int(value, width):
+    if value is None:
+        return f"{'---':>{width}}"
+    return f"{value:>{width},d}"
+
+
+def _bool_str(value):
+    if value is None:
+        return "---"
+    return "YES" if value else "NO"
 
 
 # ---------------------------------------------------------------------
@@ -65,11 +83,6 @@ _CLOCK_DOMAINS = [("GNSS", "gnss"), ("DWT", "dwt"), ("OCXO1", "ocxo1"), ("OCXO2"
 # ---------------------------------------------------------------------
 
 def status_header() -> str:
-    """
-    Single-line system status for the top of the screen.
-
-    Shows: network, battery voltage, Pi health, Teensy health, GNSS lock.
-    """
     try:
         s = _get_system_snapshot()
 
@@ -78,7 +91,6 @@ def status_header() -> str:
         teensy_health = s.get("teensy", {}).get("health_state", "?")
         gnss_lock = s.get("gnss", {}).get("lock_quality", "?")
 
-        # Find battery voltage from power rails
         bat_v = "?"
         power = s.get("power", {})
         for bus_key, devices in power.items():
@@ -89,9 +101,13 @@ def status_header() -> str:
                     if isinstance(rail, dict) and rail.get("label", "").lower() == "battery":
                         bat_v = f"{rail['volts']:.2f}V"
 
+        battery = s.get("battery", {})
+        pct = battery.get("remaining_pct")
+        bat_pct = f"{pct:.0f}%" if pct is not None else "?"
+
         return (
             f" NET: {net}"
-            f"  BAT: {bat_v}"
+            f"  BAT: {bat_v} {bat_pct}"
             f"  PI: {pi_health}"
             f"  TEENSY: {teensy_health}"
             f"  GNSS: {gnss_lock}"
@@ -102,19 +118,14 @@ def status_header() -> str:
 
 
 # ---------------------------------------------------------------------
-# Combined clocks readout
+# Combined clocks readout — dense wide-format
 # ---------------------------------------------------------------------
 
 def clocks_combined_readout() -> list[str]:
-    """
-    Combined clocks panel — all clock data in one dense view.
-
-    Returns a list of lines ready for curses positioning.
-    """
     lines = []
 
     # ==============================================================
-    # Campaign header
+    # Fetch Pi clocks report (campaign payload with report dict)
     # ==============================================================
     try:
         p = _get_pi_clocks_report()
@@ -125,109 +136,357 @@ def clocks_combined_readout() -> list[str]:
     if state != "STARTED":
         return [f"CLOCKS: {state}"]
 
+    # r = the report dict (tau, ppb, timestamps, clock blocks)
     r = p["report"]
     campaign = r.get("campaign", "?")
     elapsed = r.get("campaign_elapsed", "00:00:00")
     n = r.get("pps_count", 0)
 
-    lines.append(f"CAMPAIGN: {campaign}  ELAPSED: {elapsed}  n={n}")
-    lines.append("")
-
     # ==============================================================
-    # Tau + PPB table
-    # ==============================================================
-    lines.append(f"{'CLK':<6} {'TAU':>16} {'PPB':>10}")
-    lines.append(f"{'GNSS':<6} {'1.0000000000':>16} {'0.000':>10}")
-
-    for name, key in _CLOCK_DOMAINS[1:]:
-        blk = r.get(key, {})
-        tau = blk.get("tau", 0.0)
-        ppb = blk.get("ppb", 0.0)
-        lines.append(f"{name:<6} {tau:>16.10f} {ppb:>10.3f}")
-
-    lines.append("")
-
-    # ==============================================================
-    # Prediction statistics
-    # ==============================================================
-    lines.append(f"{'CLK':<6} {'RES':>6} {'MEAN':>8} {'SD':>8} {'N':>6}")
-
-    gnss_blk = r.get("gnss", {})
-    gnss_res = gnss_blk.get("pps_residual", 0)
-    lines.append(f"{'GNSS':<6} {gnss_res:>6} {'---':>8} {'---':>8} {'---':>6}")
-
-    for name, key in _CLOCK_DOMAINS[1:]:
-        blk = r.get(key, {})
-        pred_n = blk.get("pred_n")
-
-        if pred_n is not None and pred_n > 0:
-            res = blk.get("pred_residual", 0)
-            mean = blk.get("pred_mean", 0.0)
-            stddev = blk.get("pred_stddev", 0.0)
-            lines.append(f"{name:<6} {res:>6} {mean:>8.3f} {stddev:>8.3f} {pred_n:>6}")
-        else:
-            lines.append(f"{name:<6} {'---':>6} {'---':>8} {'---':>8} {'---':>6}")
-
-    lines.append("")
-
-    # ==============================================================
-    # Baseline comparison (if set)
-    # ==============================================================
-    baseline = _get_clocks_baseline()
-    if baseline is not None:
-        baseline_ppb = baseline.get("baseline_ppb", {})
-        baseline_id = baseline.get("baseline_id", "?")
-        baseline_campaign = baseline.get("baseline_campaign", "?")
-
-        lines.append(f"BASELINE: {baseline_campaign} (#{baseline_id})")
-        lines.append(f"{'CLK':<6} {'BASE':>10} {'NOW':>10} {'DELTA':>10}")
-
-        for name, key in _CLOCK_DOMAINS:
-            blk = r.get(key, {})
-            base_ppb = baseline_ppb.get(key)
-            now_ppb = blk.get("ppb")
-
-            if base_ppb is not None and now_ppb is not None:
-                delta = now_ppb - base_ppb
-                lines.append(f"{name:<6} {base_ppb:>10.3f} {now_ppb:>10.3f} {delta:>+10.3f}")
-            else:
-                lines.append(f"{name:<6} {'---':>10} {'---':>10} {'---':>10}")
-    else:
-        lines.append("BASELINE: NOT SET")
-
-    lines.append("")
-
-    # ==============================================================
-    # OCXO servo status
+    # Fetch Teensy clocks report (spin, ISR, DWT internals, servo)
     # ==============================================================
     try:
         t = _get_teensy_clocks_report()
     except Exception:
-        lines.append("SERVO: UNAVAILABLE")
-        return lines
+        t = {}
 
     cal = t.get("calibrate_ocxo", False)
-    lines.append(f"SERVO: {'CALIBRATING' if cal else 'IDLE'}")
 
-    for label, dac_key, adj_key, res_key in [
-        ("OCXO1", "ocxo1_dac", "ocxo1_servo_adjustments", "isr_residual_ocxo1"),
-        ("OCXO2", "ocxo2_dac", "ocxo2_servo_adjustments", "isr_residual_ocxo2"),
+    # ==============================================================
+    # Fetch baseline
+    # ==============================================================
+    baseline = _get_clocks_baseline()
+    baseline_ppb = baseline.get("baseline_ppb", {}) if baseline else {}
+    baseline_id = baseline.get("baseline_id", "?") if baseline else None
+
+    # ==============================================================
+    # Campaign header
+    # ==============================================================
+    servo_str = "CALIBRATING" if cal else "IDLE"
+    baseline_str = f"BASELINE: #{baseline_id}" if baseline_id else "BASELINE: NONE"
+
+    lines.append(
+        f"CAMPAIGN: {campaign}  ELAPSED: {elapsed}  n={n}"
+        f"    SERVO: {servo_str}"
+        f"    {baseline_str}"
+    )
+    lines.append("")
+
+    # ==============================================================
+    # Clock domain table — one row per domain
+    # ==============================================================
+
+    lines.append(
+        f"{'CLK':<6}"
+        f"{'TAU':>18}"
+        f"{'PPB':>10}"
+        f"{'RAW':>14}"
+        f"{'RES':>6}"
+        f"{'MEAN':>8}"
+        f"{'SD':>8}"
+        f"{'N':>6}"
+        f"  │"
+        f"{'BASE':>10}"
+        f"{'NOW':>10}"
+        f"{'DELTA':>10}"
+        f"  │ EXTRA"
+    )
+
+    # GNSS row
+    gnss_blk = r.get("gnss", {})
+    gnss_res = gnss_blk.get("pps_residual", 0)
+    gnss_base = baseline_ppb.get("gnss")
+    gnss_now = gnss_blk.get("ppb", 0.0)
+
+    if gnss_base is not None and gnss_now is not None:
+        gnss_delta = gnss_now - gnss_base
+        gnss_comp = f"{gnss_base:>10.3f}{gnss_now:>10.3f}{gnss_delta:>+10.3f}"
+    else:
+        gnss_comp = f"{'---':>10}{'---':>10}{'---':>10}"
+
+    lines.append(
+        f"{'GNSS':<6}"
+        f"{'1.000000000000':>18}"
+        f"{'0.000':>10}"
+        f"{'---':>14}"
+        f"{gnss_res:>6}"
+        f"{'---':>8}"
+        f"{'---':>8}"
+        f"{'---':>6}"
+        f"  │"
+        f"{gnss_comp}"
+        f"  │ stream={'OK' if gnss_blk.get('stream_valid', True) else 'BAD'}"
+    )
+
+    # DWT row
+    dwt_blk = r.get("dwt", {})
+    dwt_tau = dwt_blk.get("tau", 0.0)
+    dwt_ppb = dwt_blk.get("ppb", 0.0)
+    dwt_raw = dwt_blk.get("delta_raw")
+    dwt_res = dwt_blk.get("pred_residual")
+    dwt_mean = dwt_blk.get("pred_mean")
+    dwt_sd = dwt_blk.get("pred_stddev")
+    dwt_n = dwt_blk.get("pred_n")
+    dwt_base = baseline_ppb.get("dwt")
+    dwt_now = dwt_blk.get("ppb")
+
+    if dwt_base is not None and dwt_now is not None:
+        dwt_delta = dwt_now - dwt_base
+        dwt_comp = f"{dwt_base:>10.3f}{dwt_now:>10.3f}{dwt_delta:>+10.3f}"
+    else:
+        dwt_comp = f"{'---':>10}{'---':>10}{'---':>10}"
+
+    lines.append(
+        f"{'DWT':<6}"
+        f"{dwt_tau:>18.12f}"
+        f"{dwt_ppb:>10.3f}"
+        f"{_comma_int(dwt_raw, 14)}"
+        f"{_sign_int(dwt_res, 6)}"
+        f"{_fmt(dwt_mean, '>8.3f', 8)}"
+        f"{_fmt(dwt_sd, '>8.3f', 8)}"
+        f"{_fmt(dwt_n, '>6d', 6)}"
+        f"  │"
+        f"{dwt_comp}"
+        f"  │"
+    )
+
+    # OCXO1 and OCXO2 rows
+    for name, key, dac_key, adj_key in [
+        ("OCXO1", "ocxo1", "ocxo1_dac", "ocxo1_servo_adjustments"),
+        ("OCXO2", "ocxo2", "ocxo2_dac", "ocxo2_servo_adjustments"),
     ]:
+        blk = r.get(key, {})
+        tau = blk.get("tau", 0.0)
+        ppb = blk.get("ppb", 0.0)
+        raw = blk.get("delta_raw")
+        res = blk.get("pred_residual")
+        mean = blk.get("pred_mean")
+        sd = blk.get("pred_stddev")
+        pred_n = blk.get("pred_n")
+        base_ppb = baseline_ppb.get(key)
+        now_ppb = blk.get("ppb")
+
+        if base_ppb is not None and now_ppb is not None:
+            delta = now_ppb - base_ppb
+            comp = f"{base_ppb:>10.3f}{now_ppb:>10.3f}{delta:>+10.3f}"
+        else:
+            comp = f"{'---':>10}{'---':>10}{'---':>10}"
+
         dac = t.get(dac_key)
         adj = t.get(adj_key, 0)
-        res = t.get(res_key)
+        extra = f" DAC={dac:>10.3f} ADJ={adj:>4}" if dac is not None else ""
 
-        if dac is not None:
-            res_str = f"{res:+d}" if res is not None else "---"
-            lines.append(f"{label:<6} DAC={dac:>10.3f}  ADJ={adj:>4}  RES={res_str}")
+        lines.append(
+            f"{name:<6}"
+            f"{tau:>18.12f}"
+            f"{ppb:>10.3f}"
+            f"{_comma_int(raw, 14)}"
+            f"{_sign_int(res, 6)}"
+            f"{_fmt(mean, '>8.3f', 8)}"
+            f"{_fmt(sd, '>8.3f', 8)}"
+            f"{_fmt(pred_n, '>6d', 6)}"
+            f"  │"
+            f"{comp}"
+            f"  │"
+            f"{extra}"
+        )
+
+    lines.append("")
+
+    # ==============================================================
+    # TIME — from Pi report dict (r)
+    # ==============================================================
+    gnss_time = r.get("gnss_time_utc", "---")
+    system_time = r.get("system_time_utc", "---")
+
+    lines.append(f"TIME  GNSS: {gnss_time}    SYSTEM: {system_time}")
+    lines.append("")
+
+    # ==============================================================
+    # DWT PREDICTION — from Pi report dict (r)
+    # ==============================================================
+    dwt_cycles_per_pps = r.get("dwt_cycles_per_pps")
+    dwt_cyccnt_at_pps = r.get("dwt_cyccnt_at_pps")
+    dwt_r_delta_raw = r.get("dwt", {}).get("delta_raw")
+    dwt_r_pps_residual = r.get("dwt", {}).get("pps_residual")
+
+    lines.append(
+        f"DWT   CYCLES/PPS: {_comma_int(dwt_cycles_per_pps, 14)}"
+        f"    DELTA_RAW: {_comma_int(dwt_r_delta_raw, 14)}"
+        f"    PPS_RESIDUAL: {_sign_int(dwt_r_pps_residual, 6)}"
+        f"    CYCCNT@PPS: {_comma_int(dwt_cyccnt_at_pps, 14)}"
+    )
+    lines.append("")
+
+    # ==============================================================
+    # SPIN & PPS — from Pi report dict (r)
+    # ==============================================================
+    spin_valid = r.get("spin_valid")
+    spin_approach = r.get("spin_approach_cycles")
+    spin_delta = r.get("spin_delta_cycles")
+    spin_error = r.get("spin_error_cycles")
+    spin_tdc = r.get("spin_tdc_correction")
+    spin_nano_to = r.get("spin_nano_timed_out")
+    spin_shadow_to = r.get("spin_shadow_timed_out")
+
+    lines.append(
+        f"SPIN  VALID: {_bool_str(spin_valid)}"
+        f"    APPROACH: {_comma_int(spin_approach, 8)}"
+        f"    DELTA: {_fmt(spin_delta, '>4d', 4)}"
+        f"    ERROR: {_fmt(spin_error, '>4d', 4)}"
+        f"    TDC: {_fmt(spin_tdc, '>2d', 2)}"
+        f"    NANO_TO: {_bool_str(spin_nano_to)}"
+        f"    SHADOW_TO: {_bool_str(spin_shadow_to)}"
+    )
+
+    # ISR residuals — from Pi report dict
+    isr_gnss = r.get("isr_residual_gnss")
+    isr_dwt = r.get("isr_residual_dwt")
+    isr_ocxo1 = r.get("isr_residual_ocxo1")
+    isr_ocxo2 = r.get("isr_residual_ocxo2")
+
+    lines.append(
+        f"ISR   GNSS: {_sign_int(isr_gnss, 6)}"
+        f"    DWT: {_sign_int(isr_dwt, 6)}"
+        f"    OCXO1: {_sign_int(isr_ocxo1, 6)}"
+        f"    OCXO2: {_sign_int(isr_ocxo2, 6)}"
+    )
+
+    # PPS diagnostics — from Pi report dict
+    pps_rej_total = r.get("pps_rejected_total")
+    pps_rej_rem = r.get("pps_rejected_remainder")
+
+    lines.append(
+        f"PPS   REJECTED: {_fmt(pps_rej_total, '>4d', 4)}"
+        f"    REMAINDER: {_fmt(pps_rej_rem, '>4d', 4)}"
+    )
+
+    lines.append("")
+
+    # ==============================================================
+    # GNSS Status + Position — from SYSTEM snapshot
+    # ==============================================================
+    try:
+        snapshot = _get_system_snapshot()
+    except Exception:
+        snapshot = {}
+
+    gnss = snapshot.get("gnss", {})
+
+    discipline = gnss.get("discipline", {})
+    freq_mode_name = discipline.get("freq_mode_name", "?") if isinstance(discipline, dict) else str(discipline)
+
+    survey = gnss.get("survey_mode", {})
+    pos_mode = survey.get("receiver_mode", "?") if isinstance(survey, dict) else "?"
+
+    integrity = gnss.get("integrity", {})
+    traim = integrity.get("traim", "?") if isinstance(integrity, dict) else "?"
+
+    sats = gnss.get("satellites", "?")
+    hdop = gnss.get("hdop")
+    hdop_str = f"{hdop:.2f}" if hdop is not None else "---"
+
+    lat = gnss.get("latitude_deg")
+    lon = gnss.get("longitude_deg")
+    alt_gnss = gnss.get("altitude_m")
+    ellipsoid = gnss.get("ellipsoid_height_m")
+    geoid = gnss.get("geoid_sep_m")
+
+    gnss_line = (
+        f"GNSS  MODE: {pos_mode}"
+        f"  DISC: {freq_mode_name}"
+        f"  SATS: {sats}"
+        f"  HDOP: {hdop_str}"
+        f"  TRAIM: {traim}"
+    )
+
+    pos_parts = []
+    if lat is not None and lon is not None:
+        pos_parts.append(f"LAT: {lat:.6f}")
+        pos_parts.append(f"LON: {lon:.6f}")
+    if alt_gnss is not None:
+        pos_parts.append(f"ALT(MSL): {alt_gnss:.1f}m")
+    if ellipsoid is not None:
+        pos_parts.append(f"ELLIP: {ellipsoid:.1f}m")
+    if geoid is not None:
+        pos_parts.append(f"GEOID: {geoid:.1f}m")
+
+    if pos_parts:
+        gnss_line += "  " + "  ".join(pos_parts)
+
+    lines.append(gnss_line)
+    lines.append("")
+
+    # ==============================================================
+    # Environment
+    # ==============================================================
+    env = snapshot.get("environment", {})
+    pi_data = snapshot.get("pi", {})
+    teensy_data = snapshot.get("teensy", {})
+
+    temp_c = env.get("temperature_c")
+    humidity = env.get("humidity_pct")
+    pressure = env.get("pressure_hpa")
+    baro_alt = env.get("altitude_m")
+    pi_temp = pi_data.get("cpu_temp_c")
+    teensy_temp = teensy_data.get("cpu_temp_c")
+
+    env_parts = []
+    if temp_c is not None:
+        env_parts.append(f"AMBIENT: {temp_c:.1f}°C")
+    if humidity is not None:
+        env_parts.append(f"RH: {humidity:.0f}%")
+    if pressure is not None:
+        env_parts.append(f"BARO: {pressure:.1f}hPa")
+    if baro_alt is not None:
+        env_parts.append(f"BARO_ALT: {baro_alt:.1f}m")
+    if pi_temp is not None:
+        env_parts.append(f"PI: {pi_temp:.1f}°C")
+    if teensy_temp is not None:
+        env_parts.append(f"TEENSY: {teensy_temp:.1f}°C")
+
+    lines.append("ENV   " + "  ".join(env_parts))
+    lines.append("")
+
+    # ==============================================================
+    # Power — tabular (Pi, Teensy, OCXO1, OCXO2 domains)
+    # ==============================================================
+    power = snapshot.get("power", {})
+
+    def _find_rail(label_match: str) -> dict | None:
+        for bus_key, devices in power.items():
+            if not bus_key.startswith("i2c-"):
+                continue
+            if isinstance(devices, dict):
+                for rail in devices.values():
+                    if isinstance(rail, dict) and label_match.lower() in rail.get("label", "").lower():
+                        return rail
+        return None
+
+    power_rails = [
+        ("PI DOMAIN",     _find_rail("pi domain")),
+        ("TEENSY DOMAIN", _find_rail("teensy")),
+        ("OCXO1 DOMAIN",  _find_rail("ocxo1")),
+        ("OCXO2 DOMAIN",  _find_rail("ocxo2")),
+    ]
+
+    lines.append(f"{'POWER':<18}{'V':>10}{'MA':>10}{'W':>10}")
+    for label, rail in power_rails:
+        if rail:
+            lines.append(
+                f"{label:<18}"
+                f"{rail['volts']:>10.3f}"
+                f"{rail['amps']:>10.1f}"
+                f"{rail['watts']:>10.3f}"
+            )
         else:
-            lines.append(f"{label:<6} ---")
+            lines.append(f"{label:<18}{'---':>10}{'---':>10}{'---':>10}")
 
     return lines
 
 
 # ---------------------------------------------------------------------
-# Readout registry — ordered list of (name, callable)
+# Readout registry
 # ---------------------------------------------------------------------
 
 READOUTS = [
