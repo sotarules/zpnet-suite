@@ -108,21 +108,10 @@ static inline uint32_t tdc_correct(
   int32_t  delta_cycles,
   int32_t& correction_applied
 ) {
-  // Delta must be within the expected range [47, 51].
-  // Values outside this range mean the spin loop was not active
-  // when the PPS fired — fall back to uncorrected shadow.
-  if (delta_cycles < (int32_t)TDC_FIXED_OVERHEAD) {
-    correction_applied = -1;
-    return shadow_dwt;
-  }
-
-  uint32_t correction = (uint32_t)(delta_cycles - (int32_t)TDC_FIXED_OVERHEAD);
-
-  if (correction > TDC_MAX_CORRECTION) {
-    correction_applied = -1;
-    return shadow_dwt;
-  }
-
-  correction_applied = (int32_t)correction;
-  return shadow_dwt + correction;
+  // Diagnostic mode:
+  // Always expose the raw correction implied by the observed delta.
+  // This defeats the old limiter so outliers become visible instead of
+  // collapsing to correction_applied = -1.
+  correction_applied = delta_cycles - (int32_t)TDC_FIXED_OVERHEAD;
+  return shadow_dwt + correction_applied;
 }

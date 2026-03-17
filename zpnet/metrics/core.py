@@ -36,7 +36,7 @@ from zpnet.metrics.readout_blocks import READOUTS, status_header
 # Configuration
 # ---------------------------------------------------------------------
 
-REFRESH_INTERVAL_S = 2.0         # screen repaint cadence
+REFRESH_INTERVAL_S = 1.0         # screen repaint cadence
 CYCLE_INTERVAL_S = 8.0           # auto-advance cadence (when unlocked)
 
 

@@ -55,6 +55,12 @@
 // TimePop delay constants (nanoseconds)
 // ============================================================================
 
+static constexpr int64_t SPIN_EARLY_NS = 3000LL;  // 3 µs
+
+// ============================================================================
+// TimePop delay constants (nanoseconds)
+// ============================================================================
+
 static constexpr uint64_t OCXO_DITHER_NS   =     1000000ULL;  //   1 ms
 static constexpr uint64_t PPS_RELAY_OFF_NS  =   500000000ULL;  // 500 ms
 
@@ -116,8 +122,6 @@ static void pps_spin_callback(timepop_ctx_t* ctx, void*) {
   pps_spin.completed        = true;
   pps_spin.completions++;
 }
-
-static constexpr int64_t SPIN_EARLY_NS = 50000LL;  // 50 µs
 
 static void pps_spin_arm(void) {
   if (!g_dwt_cal_valid) return;
