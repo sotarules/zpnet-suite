@@ -2,18 +2,26 @@
 // process_clocks_alpha.cpp — Always-On Physics Layer
 // ============================================================================
 //
+// v21: QTimer1 torn-read prevention.
+//
+//   The GNSS VCLOCK counter is a cascaded 16-bit + 16-bit QTimer1.
+//   Reading channel 0 (low) and channel 1 (high) is not atomic — if
+//   the low counter rolls over between the two reads, the combined
+//   32-bit value can be off by up to 65,536 ticks.
+//
+//   This single bad read poisoned the PPS rejection check's
+//   isr_prev_gnss baseline, causing ALL subsequent PPS edges to be
+//   rejected permanently (diagnosed 2026-03-17 overnight stall).
+//
+//   Fix: read high-low-high.  If the two high reads differ, the
+//   low word rolled over — re-read it.  This eliminates the torn
+//   read at the source with ~2-3 ns of additional ISR latency.
+//
+//   The rejection recovery watchdog (v20) remains as a safety net
+//   for problems we haven't imagined yet.
+//
+// v20: PPS rejection recovery watchdog.
 // v19: Shadow-loop timeout protection + consistent timeout naming.
-//
-//   v18 introduced the shadow-write loop but had no timeout — if the
-//   PPS edge never arrived, the Teensy locked up permanently.  v19
-//   adds SPIN_LOOP_TIMEOUT_CYCLES (100 µs at 1008 MHz) as a safety
-//   net.  If the PPS doesn't preempt within that window, the loop
-//   exits and increments shadow_timeouts.
-//
-//   Timeout field naming is now symmetric:
-//     nano_timed_out   / nano_timeouts   — nano-spin couldn't reach target
-//     shadow_timed_out / shadow_timeouts — PPS never arrived during loop
-//
 // v18: Spin Capture with shadow-write loop — TDC at 1008 MHz.
 // v16: PPS watchdog — self-healing pps_scheduled stall.
 // v15: DAC dither telemetry + random walk prediction model.
@@ -51,18 +59,19 @@ static constexpr uint64_t OCXO_DITHER_NS   =     1000000ULL;  //   1 ms
 static constexpr uint64_t PPS_RELAY_OFF_NS  =   500000000ULL;  // 500 ms
 
 // ============================================================================
-// PPS watchdog — self-healing threshold
+// PPS watchdog — self-healing thresholds
 // ============================================================================
 
 static constexpr uint32_t PPS_WATCHDOG_THRESHOLD = 3;
 
 // ============================================================================
+// PPS rejection recovery — consecutive rejection watchdog
+// ============================================================================
+
+static constexpr uint32_t PPS_REJECT_RECOVERY_THRESHOLD = 10;
+
+// ============================================================================
 // Spin capture timeout — shadow-write loop safety net
-//
-// If the PPS ISR doesn't preempt the shadow-write loop within
-// this many DWT cycles, the loop exits to prevent a permanent
-// Teensy lockup.  100 µs is 2x the 50 µs early margin — generous
-// enough to absorb prediction error, tight enough to never hang.
 // ============================================================================
 
 static constexpr uint32_t SPIN_LOOP_TIMEOUT_CYCLES = 100800;  // 100 µs at 1008 MHz
@@ -76,27 +85,11 @@ volatile uint32_t isr_captured_shadow_dwt = 0;
 
 spin_capture_t pps_spin = {};
 
-// ── Nano-spin callback for PPS (fires in ISR context) ──
-//
-// The nano-spin lands at the target DWT (~50 µs before PPS).
-// After recording the landing, it enters the shadow-write loop.
-// The PPS ISR (priority 0) preempts this callback (priority 16),
-// captures the shadow via isr_captured_shadow_dwt, and sets
-// pps_fired = true to break the loop.
-//
-// Two timeout paths:
-//   1. Nano-spin timeout (ctx->nano_timeout): couldn't reach target DWT.
-//      Record and return immediately — don't enter the shadow loop.
-//   2. Shadow-loop timeout (SPIN_LOOP_TIMEOUT_CYCLES): PPS never arrived.
-//      Exit the loop to prevent permanent lockup.
-
 static void pps_spin_callback(timepop_ctx_t* ctx, void*) {
-  // Record the precise nano-spin landing
   pps_spin.landed_dwt     = ctx->fire_dwt_cyccnt;
   pps_spin.landed_gnss_ns = ctx->fire_gnss_ns;
   pps_spin.spin_error     = (int32_t)(ctx->fire_dwt_cyccnt - pps_spin.target_dwt);
 
-  // ── Nano-spin timeout: couldn't reach target DWT ──
   if (ctx->nano_timeout) {
     pps_spin.nano_timed_out = true;
     pps_spin.nano_timeouts++;
@@ -106,7 +99,6 @@ static void pps_spin_callback(timepop_ctx_t* ctx, void*) {
 
   pps_spin.nano_timed_out = false;
 
-  // ── Shadow-write loop: spin until PPS ISR preempts ──
   const uint32_t spin_start = DWT_CYCCNT;
   for (;;) {
     dispatch_shadow_dwt = DWT_CYCCNT;
@@ -119,15 +111,11 @@ static void pps_spin_callback(timepop_ctx_t* ctx, void*) {
     }
   }
 
-  // PPS ISR has fired.  isr_captured_shadow_dwt holds the
-  // last shadow value the ISR saw.
   pps_spin.shadow_dwt       = isr_captured_shadow_dwt;
   pps_spin.shadow_timed_out = false;
   pps_spin.completed        = true;
   pps_spin.completions++;
 }
-
-// ── Arm the PPS spin capture for the next PPS edge ──
 
 static constexpr int64_t SPIN_EARLY_NS = 50000LL;  // 50 µs
 
@@ -148,7 +136,6 @@ static void pps_spin_arm(void) {
   pps_spin.shadow_timed_out = false;
   pps_spin.arms++;
 
-  // Clear pps_fired so the shadow loop doesn't exit immediately.
   pps_fired = false;
 
   timepop_handle_t h = timepop_arm_ns(
@@ -164,8 +151,6 @@ static void pps_spin_arm(void) {
   }
 }
 
-// ── Complete the PPS spin capture (called from ASAP callback) ──
-
 static void pps_spin_complete(uint32_t isr_dwt_snap) {
   if (!pps_spin.completed) {
     pps_spin.valid = false;
@@ -176,7 +161,6 @@ static void pps_spin_complete(uint32_t isr_dwt_snap) {
     return;
   }
 
-  // If either timeout fired, the capture is not usable for TDC
   if (pps_spin.nano_timed_out || pps_spin.shadow_timed_out) {
     pps_spin.valid = false;
     pps_spin.armed = false;
@@ -187,7 +171,6 @@ static void pps_spin_complete(uint32_t isr_dwt_snap) {
   pps_spin.delta_cycles     = (int32_t)(isr_dwt_snap - pps_spin.shadow_dwt);
   pps_spin.approach_cycles  = (int32_t)(isr_dwt_snap - pps_spin.landed_dwt);
 
-  // TDC correction: derive the true PPS-edge DWT from the shadow
   int32_t correction = -1;
   pps_spin.corrected_dwt = tdc_correct(
     pps_spin.shadow_dwt,
@@ -285,6 +268,10 @@ volatile uint32_t diag_pps_asap_dispatched     = 0;
 volatile uint32_t diag_pps_stuck_since_dwt     = 0;
 volatile uint32_t diag_pps_stuck_max           = 0;
 
+volatile uint32_t diag_pps_reject_consecutive  = 0;
+volatile uint32_t diag_pps_reject_recoveries   = 0;
+volatile uint32_t diag_pps_reject_max_run      = 0;
+
 // ============================================================================
 // PPS state
 // ============================================================================
@@ -323,6 +310,25 @@ uint64_t clocks_dwt_ns_now(void) {
 
 // ============================================================================
 // GNSS VCLOCK (10 MHz external via QTimer1 ch0+ch1 — cascaded 32-bit)
+//
+// v21: Torn-read prevention.
+//
+//   QTimer1 channels 0 and 1 form a cascaded 32-bit counter, but
+//   reading two 16-bit registers is not atomic.  If the low counter
+//   (ch0) rolls over between reading ch1 (high) and ch0 (low), the
+//   combined value is off by up to 65,536 ticks.
+//
+//   The high-low-high pattern detects this: read the high word,
+//   then the low word, then the high word again.  If the two high
+//   reads differ, the low word rolled over — re-read it.  The
+//   second low read is consistent with the new (second) high value.
+//
+//   Cost: one extra 16-bit register read in the common case (~1 ns).
+//   In the rare rollover case, two extra reads (~2 ns).
+//
+//   This is called from the PPS ISR (priority 0) and from scheduled
+//   context (clocks_gnss_ticks_now, INTERP_PROOF, etc.).  Both
+//   contexts benefit from the protection.
 // ============================================================================
 
 static bool qtimer1_armed = false;
@@ -331,9 +337,16 @@ uint64_t gnss_rolling_raw_64 = 0;
 uint32_t gnss_rolling_32     = 0;
 
 uint32_t qtimer1_read_32(void) {
-  const uint16_t lo = IMXRT_TMR1.CH[0].CNTR;
-  const uint16_t hi = IMXRT_TMR1.CH[1].CNTR;
-  return ((uint32_t)hi << 16) | (uint32_t)lo;
+  const uint16_t hi1 = IMXRT_TMR1.CH[1].CNTR;
+  const uint16_t lo  = IMXRT_TMR1.CH[0].CNTR;
+  const uint16_t hi2 = IMXRT_TMR1.CH[1].CNTR;
+  if (hi1 != hi2) {
+    // Low word rolled over between the two high reads.
+    // Re-read low — it's now consistent with hi2.
+    const uint16_t lo2 = IMXRT_TMR1.CH[0].CNTR;
+    return ((uint32_t)hi2 << 16) | (uint32_t)lo2;
+  }
+  return ((uint32_t)hi1 << 16) | (uint32_t)lo;
 }
 
 static void arm_qtimer1_external(void) {
@@ -510,7 +523,9 @@ static void pps_asap_callback(timepop_ctx_t*, void*) {
 // ============================================================================
 // PPS handling — ISR (minimum latency)
 //
-// v18: Captures the spin loop shadow value before setting pps_fired.
+// v21: QTimer1 torn-read prevention via high-low-high pattern.
+// v20: Consecutive rejection recovery watchdog.
+// v18: Captures spin loop shadow before setting pps_fired.
 // ============================================================================
 
 static void pps_isr(void) {
@@ -525,13 +540,30 @@ static void pps_isr(void) {
     uint32_t remainder = elapsed % ISR_GNSS_RAW_EXPECTED;
     if (remainder > PPS_VCLOCK_TOLERANCE &&
         remainder < (ISR_GNSS_RAW_EXPECTED - PPS_VCLOCK_TOLERANCE)) {
+
       diag_pps_rejected_total++;
       diag_pps_rejected_remainder = remainder;
+      diag_pps_reject_consecutive++;
+
+      if (diag_pps_reject_consecutive > diag_pps_reject_max_run) {
+        diag_pps_reject_max_run = diag_pps_reject_consecutive;
+      }
+
+      if (diag_pps_reject_consecutive >= PPS_REJECT_RECOVERY_THRESHOLD) {
+        isr_prev_dwt   = snap_dwt;
+        isr_prev_gnss  = snap_gnss;
+        isr_prev_ocxo1 = snap_ocxo1;
+        isr_prev_ocxo2 = snap_ocxo2;
+        diag_pps_reject_recoveries++;
+        diag_pps_reject_consecutive = 0;
+      }
+
       return;
     }
   }
 
-  // Capture the shadow BEFORE setting pps_fired.
+  diag_pps_reject_consecutive = 0;
+
   isr_captured_shadow_dwt = dispatch_shadow_dwt;
   pps_fired = true;
 

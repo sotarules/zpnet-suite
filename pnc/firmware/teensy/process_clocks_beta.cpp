@@ -708,6 +708,21 @@ static Payload cmd_report(const Payload&) {
 
 // ============================================================================
 // CLOCKS_INFO — forensic / diagnostic surface
+//
+// Replace the existing cmd_clocks_info function in process_clocks_beta.cpp
+// with this version.  Changes from the previous version:
+//
+//   1. Spin capture fields use v19 naming:
+//      - spin_timed_out  → spin_nano_timed_out
+//      - spin_timeouts   → spin_nano_timeouts
+//      - Added: spin_shadow_timed_out, spin_shadow_timeouts
+//      - Added: spin_shadow_dwt, spin_approach_cycles
+//
+//   2. PPS rejection recovery diagnostics (v20):
+//      - pps_reject_consecutive
+//      - pps_reject_recoveries
+//      - pps_reject_max_run
+//
 // ============================================================================
 
 static Payload cmd_clocks_info(const Payload&) {
@@ -755,8 +770,14 @@ static Payload cmd_clocks_info(const Payload&) {
   p.add("dwt_cal_valid",         g_dwt_cal_valid);
   p.add("dwt_cal_pps_count",     g_dwt_cal_pps_count);
 
-  p.add("pps_rejected_total",     diag_pps_rejected_total);
-  p.add("pps_rejected_remainder", diag_pps_rejected_remainder);
+  // ── PPS rejection diagnostics ──
+  p.add("pps_rejected_total",      diag_pps_rejected_total);
+  p.add("pps_rejected_remainder",  diag_pps_rejected_remainder);
+  p.add("pps_reject_consecutive",  diag_pps_reject_consecutive);
+  p.add("pps_reject_recoveries",   diag_pps_reject_recoveries);
+  p.add("pps_reject_max_run",      diag_pps_reject_max_run);
+
+  // ── PPS ASAP pipeline diagnostics ──
   p.add("pps_scheduled_stuck",     diag_pps_scheduled_stuck);
   p.add("pps_watchdog_recoveries", diag_pps_watchdog_recoveries);
   p.add("pps_asap_arm_failures",   diag_pps_asap_arm_failures);

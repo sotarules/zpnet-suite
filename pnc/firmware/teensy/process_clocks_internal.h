@@ -4,7 +4,8 @@
 // process_clocks_internal.h — Shared Internal State (Alpha ↔ Beta)
 // ============================================================================
 //
-// v18: Spin capture with shadow-write TDC + timeout protection.
+// v20: PPS rejection recovery watchdog diagnostics.
+// v19: Spin capture with shadow-write TDC + timeout protection.
 // v14: Symmetric GPT architecture for both OCXOs.
 //
 // ============================================================================
@@ -95,6 +96,11 @@ extern volatile uint32_t diag_pps_asap_armed;
 extern volatile uint32_t diag_pps_asap_dispatched;
 extern volatile uint32_t diag_pps_stuck_since_dwt;
 extern volatile uint32_t diag_pps_stuck_max;
+
+// ── PPS rejection recovery diagnostics (v20) ──
+extern volatile uint32_t diag_pps_reject_consecutive;
+extern volatile uint32_t diag_pps_reject_recoveries;
+extern volatile uint32_t diag_pps_reject_max_run;
 
 // ============================================================================
 // PPS state
@@ -210,23 +216,12 @@ double prediction_stderr(const prediction_tracker_t& p);
 // ============================================================================
 // Spin Capture — nano-precise DWT anchoring with shadow-write TDC
 //
-// The spin capture provides a parallel forensic stream alongside the
-// existing 1-second prediction path.  It arms a nano-spin before each
-// PPS edge, lands ~50 µs early, enters a tight shadow-write loop, and
-// waits for the PPS ISR to preempt and capture the shadow.
-//
 // Two distinct timeout failure modes:
 //
-//   1. Nano-spin timeout: TimePop's DWT spin exceeded NANO_SPIN_MAX_CYCLES
-//      trying to land on the target DWT.  The spin didn't reach its target.
-//      Cause: prediction was too far off, or ISR latency was excessive.
+//   1. Nano-spin timeout: TimePop's DWT spin exceeded NANO_SPIN_MAX_CYCLES.
 //      Fields: nano_timed_out (this cycle), nano_timeouts (lifetime count).
 //
-//   2. Shadow-loop timeout: The shadow-write loop exceeded
-//      SPIN_LOOP_TIMEOUT_CYCLES waiting for pps_fired.  The PPS ISR
-//      never preempted the loop.
-//      Cause: PPS edge didn't arrive (GNSS glitch, cable issue, signal
-//      dropout).  Without this timeout, the Teensy hangs permanently.
+//   2. Shadow-loop timeout: shadow-write loop exceeded SPIN_LOOP_TIMEOUT_CYCLES.
 //      Fields: shadow_timed_out (this cycle), shadow_timeouts (lifetime).
 //
 // The same struct will be reused for 10 KHz VCLOCK captures.
@@ -234,43 +229,40 @@ double prediction_stderr(const prediction_tracker_t& p);
 
 struct spin_capture_t {
   // ── Set by the arming code (scheduled context) ──
-  uint32_t  target_dwt;           // predicted DWT at ~50 µs before edge
-  int64_t   target_gnss_ns;       // predicted GNSS ns at that target
-  bool      armed;                // true if a spin is in flight
+  uint32_t  target_dwt;
+  int64_t   target_gnss_ns;
+  bool      armed;
 
   // ── Set by the nano-spin callback (ISR context) ──
-  uint32_t  landed_dwt;           // DWT where the nano-spin landed
-  int64_t   landed_gnss_ns;       // GNSS ns at spin landing (from time.h)
-  int32_t   spin_error;           // landed_dwt - target_dwt (cycles)
-  uint32_t  shadow_dwt;           // last shadow write before PPS ISR
-  bool      completed;            // true if callback finished (either path)
-  bool      nano_timed_out;       // true if nano-spin couldn't reach target
-  bool      shadow_timed_out;     // true if shadow loop PPS never arrived
+  uint32_t  landed_dwt;
+  int64_t   landed_gnss_ns;
+  int32_t   spin_error;
+  uint32_t  shadow_dwt;
+  bool      completed;
+  bool      nano_timed_out;
+  bool      shadow_timed_out;
 
   // ── Set by the edge handler (scheduled context) ──
-  uint32_t  isr_dwt;              // DWT captured by the actual edge ISR
-  int32_t   delta_cycles;         // isr_dwt - shadow_dwt (TDC measurement)
-  int32_t   approach_cycles;      // isr_dwt - landed_dwt (total wait time)
-  uint32_t  corrected_dwt;        // TDC-corrected DWT at true PPS edge
-  int32_t   tdc_correction;       // correction applied (0-4), or -1 if invalid
-  bool      valid;                // true if complete capture succeeded
+  uint32_t  isr_dwt;
+  int32_t   delta_cycles;
+  int32_t   approach_cycles;
+  uint32_t  corrected_dwt;
+  int32_t   tdc_correction;
+  bool      valid;
 
   // ── Diagnostics (monotonic, never reset) ──
-  uint32_t  arms;                 // total arm attempts
-  uint32_t  arm_failures;         // timepop_arm_ns returned INVALID
-  uint32_t  completions;          // successful full captures (nano + shadow)
-  uint32_t  nano_timeouts;        // nano-spin couldn't reach target DWT
-  uint32_t  shadow_timeouts;      // shadow loop PPS never arrived
-  uint32_t  misses;               // edge arrived before spin fired
+  uint32_t  arms;
+  uint32_t  arm_failures;
+  uint32_t  completions;
+  uint32_t  nano_timeouts;
+  uint32_t  shadow_timeouts;
+  uint32_t  misses;
 };
 
 extern spin_capture_t pps_spin;
 
 // ============================================================================
 // 64-bit accumulators (campaign-scoped)
-//
-// Both OCXOs: GPT single-edge, accumulate 10 MHz ticks directly.
-// GNSS: QTimer1 dual-edge, accumulates raw 20 MHz then divides.
 // ============================================================================
 
 extern uint64_t dwt_cycles_64;

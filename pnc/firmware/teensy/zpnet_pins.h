@@ -166,7 +166,7 @@ Pin #    Signal Name        Wire Color    Connected To        Destination     No
 9        VCC In            Purple        Backplane           +3V3           Logic power
 17       PPS Output        Orange        Teensy              Pin 1          Primary PPS
 15       LOCK Signal       Green         Teensy              Pin 4          Lock status
-11       BCLOCK Out        Twisted Pair  Teensy              Pin 10         10 MHz (QTimer1)
+11       VCLOCK Out        Twisted Pair  Teensy              Pin 10         10 MHz (QTimer1)
 13       Serial Out (TX)   Blue          Raspberry Pi        RXD            GNSS → Pi
 12       Serial In (RX)    Yellow        Raspberry Pi        TXD            Pi → GNSS
 
