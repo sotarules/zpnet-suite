@@ -150,13 +150,13 @@ def clocks_tau_readout() -> Generator[str, None, None]:
         return
 
     yield f"{'CLK':<6} {'TAU':>16} {'PPB':>10}"
-    yield f"{'GNSS':<6} {'1.0000000000':>16} {'0.00':>10}"
+    yield f"{'GNSS':<6} {'1.0000000000':>16} {'0.000':>10}"
 
     for name, key in _CLOCK_DOMAINS[1:]:
         blk = r.get(key, {})
         tau = blk.get("tau", 0.0)
         ppb = blk.get("ppb", 0.0)
-        yield f"{name:<6} {tau:>16.10f} {ppb:>10.2f}"
+        yield f"{name:<6} {tau:>16.10f} {ppb:>10.3f}"
 
 
 # ---------------------------------------------------------------------
@@ -198,7 +198,7 @@ def clocks_prediction_readout() -> Generator[str, None, None]:
             res    = blk.get("pred_residual", 0)
             mean   = blk.get("pred_mean", 0.0)
             stddev = blk.get("pred_stddev", 0.0)
-            yield f"{name:<6} {res:>6} {mean:>8.2f} {stddev:>8.2f} {pred_n:>6}"
+            yield f"{name:<6} {res:>6} {mean:>8.3f} {stddev:>8.3f} {pred_n:>6}"
         else:
             # Not enough history yet (need 3 deltas for first scored prediction)
             yield f"{name:<6} {'---':>6} {'---':>8} {'---':>8} {'---':>6}"
@@ -234,7 +234,7 @@ def clocks_comparison_readout() -> Generator[str, None, None]:
 
         if base_ppb is not None and now_ppb is not None:
             delta = now_ppb - base_ppb
-            yield f"{name:<6} {base_ppb:>10.2f} {now_ppb:>10.2f} {delta:>+10.2f}"
+            yield f"{name:<6} {base_ppb:>10.3f} {now_ppb:>10.3f} {delta:>+10.3f}"
         else:
             yield f"{name:<6} {'---':>10} {'---':>10} {'---':>10}"
 
