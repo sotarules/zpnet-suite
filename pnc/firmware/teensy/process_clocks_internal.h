@@ -317,10 +317,29 @@ extern volatile bool relay_timer_active;
 extern volatile bool pps_scheduled;
 
 // ============================================================================
-// Beta entry point — called from alpha's pps_asap_callback
+// Watchdog anomaly latch (beta-owned, alpha-readable)
+// ============================================================================
+
+extern volatile bool     watchdog_anomaly_active;
+extern volatile bool     watchdog_anomaly_publish_pending;
+extern volatile uint32_t watchdog_anomaly_sequence;
+extern char              watchdog_anomaly_reason[64];
+extern volatile uint32_t watchdog_anomaly_detail0;
+extern volatile uint32_t watchdog_anomaly_detail1;
+extern volatile uint32_t watchdog_anomaly_detail2;
+extern volatile uint32_t watchdog_anomaly_detail3;
+extern volatile uint32_t watchdog_anomaly_trigger_dwt;
+
+// ============================================================================
+// Beta entry points — called from alpha / commands
 // ============================================================================
 
 void clocks_beta_pps(void);
+void clocks_watchdog_anomaly(const char* reason,
+                             uint32_t detail0 = 0,
+                             uint32_t detail1 = 0,
+                             uint32_t detail2 = 0,
+                             uint32_t detail3 = 0);
 
 // ============================================================================
 // Zeroing (called by beta campaign commands, reads alpha ISR state)

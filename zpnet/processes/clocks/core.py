@@ -88,6 +88,7 @@ Responsibilities:
   * Pass through Teensy prediction statistics (authoritative)
   * Denormalize augmented report into active campaign payload
   * Recover clocks after restart if campaign is active
+  * Subscribe to WATCHDOG_ANOMALY and initiate Pi-side campaign recovery
   * Flash-cut to new campaign while running (seamless switch)
   * Command GNSS into Time Only mode when campaign has a location
 
@@ -98,6 +99,7 @@ Semantics:
     the campaign report — never in the TIMEBASE row itself
   * Prediction stats from the Teensy are passed through verbatim
   * Gaps in pps_count are canonical (recovery) and non-fatal
+  * WATCHDOG_ANOMALY triggers Pi-side recovery using the last canonical TIMEBASE
 """
 
 from __future__ import annotations
@@ -121,6 +123,7 @@ from zpnet.shared.constants import Payload
 from zpnet.shared.db import open_db
 from zpnet.shared.logger import setup_logging
 from zpnet.shared.util import system_time_z
+from zpnet.shared.events import create_event
 
 # ---------------------------------------------------------------------
 # Configuration
@@ -213,6 +216,12 @@ _diag: Dict[str, Any] = {
     # GNSS stream health (Pi-side canary only)
     "gnss_residual_nonzero": 0,
     "last_gnss_residual_anomaly": {},
+
+    # WATCHDOG_ANOMALY ingress / recovery
+    "watchdog_anomalies_received": 0,
+    "watchdog_anomaly_recovery_started": 0,
+    "watchdog_anomaly_event_enqueue_failures": 0,
+    "last_watchdog_anomaly": {},
 }
 
 # ---------------------------------------------------------------------
@@ -297,6 +306,55 @@ _sync_fragment: Optional[Dict[str, Any]] = None
 # ---------------------------------------------------------------------
 
 _auto_recovery_in_progress: bool = False
+
+def _begin_auto_recovery(reason: str, details: Dict[str, Any], *, source: str) -> bool:
+    """
+    Common auto-recovery launcher used by hard faults and WATCHDOG_ANOMALY.
+
+    Returns True if a new recovery thread was started, False if one was
+    already in progress.
+    """
+    global _campaign_active, _auto_recovery_in_progress
+
+    _diag["hard_faults_total"] = _diag.get("hard_faults_total", 0) + 1
+    _diag["last_hard_fault"] = {
+        "ts_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        "reason": reason,
+        "source": source,
+        "details": details,
+    }
+
+    _campaign_active = False
+
+    if _auto_recovery_in_progress:
+        logging.error(
+            "💥 [clocks] %s: %s — auto-recovery already in progress, skipping",
+            source, reason,
+        )
+        return False
+
+    logging.error(
+        "💥 [clocks] %s: %s details=%s — initiating auto-recovery",
+        source, reason, details,
+    )
+
+    _auto_recovery_in_progress = True
+
+    def _auto_recover():
+        global _auto_recovery_in_progress
+        try:
+            logging.info("🔄 [clocks] @%s auto-recovery starting...", system_time_z())
+            _recover_campaign()
+            logging.info("✅ [clocks] @%s auto-recovery complete", system_time_z())
+        except Exception:
+            logging.exception("💥 [clocks] auto-recovery FAILED — campaign deactivated")
+            _diag["auto_recovery_failures"] = _diag.get("auto_recovery_failures", 0) + 1
+        finally:
+            _auto_recovery_in_progress = False
+
+    t = threading.Thread(target=_auto_recover, name="clocks-auto-recover", daemon=True)
+    t.start()
+    return True
 
 def _hard_fault(reason: str, details: Dict[str, Any]) -> None:
     """Log a hard fault and trigger automatic recovery."""
@@ -950,6 +1008,46 @@ def _build_report(
         "pps_rejected_total": timebase.get("pps_rejected_total"),
         "pps_rejected_remainder": timebase.get("pps_rejected_remainder"),
     }
+
+
+# ---------------------------------------------------------------------
+# WATCHDOG_ANOMALY handler (PUBSUB — fast path)
+# ---------------------------------------------------------------------
+
+
+def on_watchdog_anomaly(payload: Payload) -> None:
+    """
+    PUBSUB handler for WATCHDOG_ANOMALY from Teensy CLOCKS.
+
+    This is an explicit semantic surrender by the Teensy: campaign continuity
+    is no longer being asserted. We enqueue a durable event and then initiate
+    Pi-side recovery using the existing battle-tested protocol.
+    """
+    _diag["watchdog_anomalies_received"] += 1
+
+    anomaly = dict(payload)
+    _diag["last_watchdog_anomaly"] = {
+        "ts_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        "reason": anomaly.get("reason"),
+        "campaign": anomaly.get("campaign"),
+        "sequence": anomaly.get("sequence"),
+        "teensy_pps_count": anomaly.get("teensy_pps_count"),
+        "campaign_seconds": anomaly.get("campaign_seconds"),
+    }
+
+    try:
+        create_event("WATCHDOG_ANOMALY", anomaly)
+    except Exception:
+        _diag["watchdog_anomaly_event_enqueue_failures"] += 1
+        logging.exception("⚠️ [clocks] failed to enqueue WATCHDOG_ANOMALY event")
+
+    started = _begin_auto_recovery(
+        "watchdog_anomaly",
+        {"payload": anomaly},
+        source="WATCHDOG_ANOMALY",
+    )
+    if started:
+        _diag["watchdog_anomaly_recovery_started"] += 1
 
 
 # ---------------------------------------------------------------------
@@ -2597,7 +2695,8 @@ def run() -> None:
         "Recovery: campaign deactivated + queue drained + soft-skip mismatch (≤5) + late reset. "
         "START while active performs seamless flash-cut to new campaign. "
         "Commands: START, STOP, RESUME, REPORT, CLEAR, DELETE, SET_DAC, "
-        "SET_BASELINE, BASELINE_INFO, LIST_CAMPAIGNS, CLOCKS_INFO."
+        "SET_BASELINE, BASELINE_INFO, LIST_CAMPAIGNS, CLOCKS_INFO. "
+        "Subscriptions: TIMEBASE_FRAGMENT, WATCHDOG_ANOMALY."
     )
 
     # Start processor thread
@@ -2611,7 +2710,10 @@ def run() -> None:
     server_setup(
         subsystem="CLOCKS",
         commands=COMMANDS,
-        subscriptions={"TIMEBASE_FRAGMENT": on_timebase_fragment},
+        subscriptions={
+            "TIMEBASE_FRAGMENT": on_timebase_fragment,
+            "WATCHDOG_ANOMALY": on_watchdog_anomaly,
+        },
         blocking=False,
     )
 

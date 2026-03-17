@@ -17,10 +17,10 @@
 //   low word rolled over — re-read it.  This eliminates the torn
 //   read at the source with ~2-3 ns of additional ISR latency.
 //
-//   The rejection recovery watchdog (v20) remains as a safety net
-//   for problems we haven't imagined yet.
+//   Any watchdog-class anomaly now publishes WATCHDOG_ANOMALY and
+//   stops the campaign cleanly for Pi-side canonical recovery.
 //
-// v20: PPS rejection recovery watchdog.
+// v22: WATCHDOG_ANOMALY stop-and-yield architecture.
 // v19: Shadow-loop timeout protection + consistent timeout naming.
 // v18: Spin Capture with shadow-write loop — TDC at 1008 MHz.
 // v16: PPS watchdog — self-healing pps_scheduled stall.
@@ -59,13 +59,13 @@ static constexpr uint64_t OCXO_DITHER_NS   =     1000000ULL;  //   1 ms
 static constexpr uint64_t PPS_RELAY_OFF_NS  =   500000000ULL;  // 500 ms
 
 // ============================================================================
-// PPS watchdog — self-healing thresholds
+// PPS watchdog — anomaly thresholds
 // ============================================================================
 
 static constexpr uint32_t PPS_WATCHDOG_THRESHOLD = 3;
 
 // ============================================================================
-// PPS rejection recovery — consecutive rejection watchdog
+// PPS rejection watchdog — consecutive rejection anomaly threshold
 // ============================================================================
 
 static constexpr uint32_t PPS_REJECT_RECOVERY_THRESHOLD = 10;
@@ -524,7 +524,7 @@ static void pps_asap_callback(timepop_ctx_t*, void*) {
 // PPS handling — ISR (minimum latency)
 //
 // v21: QTimer1 torn-read prevention via high-low-high pattern.
-// v20: Consecutive rejection recovery watchdog.
+// v22: Consecutive rejection anomaly threshold.
 // v18: Captures spin loop shadow before setting pps_fired.
 // ============================================================================
 
@@ -550,12 +550,14 @@ static void pps_isr(void) {
       }
 
       if (diag_pps_reject_consecutive >= PPS_REJECT_RECOVERY_THRESHOLD) {
-        isr_prev_dwt   = snap_dwt;
-        isr_prev_gnss  = snap_gnss;
-        isr_prev_ocxo1 = snap_ocxo1;
-        isr_prev_ocxo2 = snap_ocxo2;
         diag_pps_reject_recoveries++;
-        diag_pps_reject_consecutive = 0;
+        clocks_watchdog_anomaly(
+          "pps_reject_threshold",
+          remainder,
+          diag_pps_reject_consecutive,
+          snap_gnss,
+          isr_prev_gnss
+        );
       }
 
       return;
@@ -598,10 +600,15 @@ static void pps_isr(void) {
       return;
     }
 
-    pps_scheduled = false;
     diag_pps_watchdog_recoveries++;
-    diag_pps_scheduled_stuck = 0;
-    diag_pps_stuck_since_dwt = 0;
+    clocks_watchdog_anomaly(
+      "pps_scheduled_stuck",
+      diag_pps_scheduled_stuck,
+      diag_pps_asap_armed,
+      diag_pps_asap_dispatched,
+      diag_pps_stuck_since_dwt
+    );
+    return;
   } else {
     diag_pps_scheduled_stuck = 0;
     diag_pps_stuck_since_dwt = 0;

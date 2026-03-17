@@ -72,6 +72,16 @@ uint64_t recover_gnss_ns  = 0;
 uint64_t recover_ocxo1_ns = 0;
 uint64_t recover_ocxo2_ns = 0;
 
+volatile bool     watchdog_anomaly_active          = false;
+volatile bool     watchdog_anomaly_publish_pending = false;
+volatile uint32_t watchdog_anomaly_sequence        = 0;
+char              watchdog_anomaly_reason[64]      = {0};
+volatile uint32_t watchdog_anomaly_detail0         = 0;
+volatile uint32_t watchdog_anomaly_detail1         = 0;
+volatile uint32_t watchdog_anomaly_detail2         = 0;
+volatile uint32_t watchdog_anomaly_detail3         = 0;
+volatile uint32_t watchdog_anomaly_trigger_dwt     = 0;
+
 // ============================================================================
 // PPS residual tracking — definitions
 // ============================================================================
@@ -280,10 +290,189 @@ static void ocxo_calibration_servo(void) {
 }
 
 // ============================================================================
+// Watchdog anomaly publication / stop helpers
+// ============================================================================
+
+static void clocks_force_stop_campaign(void) {
+  campaign_state = clocks_campaign_state_t::STOPPED;
+  request_start = false;
+  request_stop = false;
+  request_recover = false;
+  calibrate_ocxo_active = false;
+  pps_scheduled = false;
+  pps_fired = false;
+  timebase_invalidate();
+}
+
+static void clocks_watchdog_anomaly_callback(timepop_ctx_t*, void*) {
+  if (!watchdog_anomaly_publish_pending) {
+    clocks_force_stop_campaign();
+    return;
+  }
+
+  Payload p;
+  p.add("sequence", watchdog_anomaly_sequence);
+  p.add("reason", watchdog_anomaly_reason);
+  p.add("campaign_state",
+    campaign_state == clocks_campaign_state_t::STARTED ? "STARTED" : "STOPPED");
+  p.add("campaign", campaign_name);
+  p.add("campaign_seconds", campaign_seconds);
+  p.add("teensy_pps_count", campaign_seconds);
+  p.add("dwt_cal_pps_count", g_dwt_cal_pps_count);
+  p.add("trigger_dwt", watchdog_anomaly_trigger_dwt);
+  p.add("detail0", watchdog_anomaly_detail0);
+  p.add("detail1", watchdog_anomaly_detail1);
+  p.add("detail2", watchdog_anomaly_detail2);
+  p.add("detail3", watchdog_anomaly_detail3);
+
+  p.add("request_start",   request_start);
+  p.add("request_stop",    request_stop);
+  p.add("request_recover", request_recover);
+  p.add("calibrate_ocxo",  calibrate_ocxo_active);
+  p.add("gnss_lock",       digitalRead(GNSS_LOCK_PIN));
+
+  p.add("dwt_cycles_now", clocks_dwt_cycles_now());
+  p.add("dwt_ns_now",     clocks_dwt_ns_now());
+  p.add("gnss_ns_now",    clocks_gnss_ns_now());
+  p.add("ocxo1_ns_now",   clocks_ocxo1_ns_now());
+  p.add("ocxo2_ns_now",   clocks_ocxo2_ns_now());
+
+  p.add("timebase_valid",            timebase_valid());
+  p.add("timebase_conversion_valid", timebase_conversion_valid());
+  p.add("timebase_gnss_ns",          timebase_now_ns(timebase_domain_t::GNSS));
+  p.add("timebase_dwt_ns",           timebase_now_ns(timebase_domain_t::DWT));
+  p.add("timebase_ocxo1_ns",         timebase_now_ns(timebase_domain_t::OCXO1));
+  p.add("timebase_ocxo2_ns",         timebase_now_ns(timebase_domain_t::OCXO2));
+
+  const timebase_fragment_t* tb_frag = timebase_last_fragment();
+  if (tb_frag && tb_frag->valid) {
+    p.add("timebase_fragment_valid", true);
+    p.add("timebase_fragment_pps_count",          (uint32_t)tb_frag->pps_count);
+    p.add("timebase_fragment_gnss_ns",            (uint64_t)tb_frag->gnss_ns);
+    p.add("timebase_fragment_dwt_ns",             (uint64_t)tb_frag->dwt_ns);
+    p.add("timebase_fragment_dwt_cycles",         (uint64_t)tb_frag->dwt_cycles);
+    p.add("timebase_fragment_ocxo1_ns",           (uint64_t)tb_frag->ocxo1_ns);
+    p.add("timebase_fragment_ocxo2_ns",           (uint64_t)tb_frag->ocxo2_ns);
+    p.add("timebase_fragment_isr_residual_dwt",   (int32_t)tb_frag->isr_residual_dwt);
+    p.add("timebase_fragment_isr_residual_gnss",  (int32_t)tb_frag->isr_residual_gnss);
+    p.add("timebase_fragment_isr_residual_ocxo1", (int32_t)tb_frag->isr_residual_ocxo1);
+    p.add("timebase_fragment_isr_residual_ocxo2", (int32_t)tb_frag->isr_residual_ocxo2);
+  } else {
+    p.add("timebase_fragment_valid", false);
+  }
+
+  p.add("isr_snap_dwt",   isr_snap_dwt);
+  p.add("isr_snap_gnss",  isr_snap_gnss);
+  p.add("isr_snap_ocxo1", isr_snap_ocxo1);
+  p.add("isr_snap_ocxo2", isr_snap_ocxo2);
+  p.add("isr_prev_dwt",   isr_prev_dwt);
+  p.add("isr_prev_gnss",  isr_prev_gnss);
+  p.add("isr_prev_ocxo1", isr_prev_ocxo1);
+  p.add("isr_prev_ocxo2", isr_prev_ocxo2);
+  p.add("isr_residual_dwt",   isr_residual_dwt);
+  p.add("isr_residual_gnss",  isr_residual_gnss);
+  p.add("isr_residual_ocxo1", isr_residual_ocxo1);
+  p.add("isr_residual_ocxo2", isr_residual_ocxo2);
+  p.add("isr_residual_valid", (bool)isr_residual_valid);
+
+  p.add("pps_scheduled",            (bool)pps_scheduled);
+  p.add("pps_rejected_total",       diag_pps_rejected_total);
+  p.add("pps_rejected_remainder",   diag_pps_rejected_remainder);
+  p.add("pps_reject_consecutive",   diag_pps_reject_consecutive);
+  p.add("pps_reject_recoveries",    diag_pps_reject_recoveries);
+  p.add("pps_reject_max_run",       diag_pps_reject_max_run);
+  p.add("pps_scheduled_stuck",      diag_pps_scheduled_stuck);
+  p.add("pps_watchdog_recoveries",  diag_pps_watchdog_recoveries);
+  p.add("pps_asap_arm_failures",    diag_pps_asap_arm_failures);
+  p.add("pps_asap_armed",           diag_pps_asap_armed);
+  p.add("pps_asap_dispatched",      diag_pps_asap_dispatched);
+  p.add("pps_stuck_since_dwt",      diag_pps_stuck_since_dwt);
+  p.add("pps_stuck_max",            diag_pps_stuck_max);
+
+  p.add("dwt_cal_cycles_per_s", g_dwt_cycles_per_gnss_s);
+  p.add("dwt_cal_valid",        g_dwt_cal_valid);
+
+  p.add("ocxo1_dac", ocxo1_dac.dac_fractional);
+  p.add("ocxo2_dac", ocxo2_dac.dac_fractional);
+  p.add("ocxo1_dither_high", ocxo1_dac.dither_high_count);
+  p.add("ocxo1_dither_low",  ocxo1_dac.dither_low_count);
+  p.add("ocxo2_dither_high", ocxo2_dac.dither_high_count);
+  p.add("ocxo2_dither_low",  ocxo2_dac.dither_low_count);
+  p.add("ocxo1_servo_adjustments",  ocxo1_dac.servo_adjustments);
+  p.add("ocxo2_servo_adjustments",  ocxo2_dac.servo_adjustments);
+  p.add("ocxo1_servo_step",         ocxo1_dac.servo_step);
+  p.add("ocxo2_servo_step",         ocxo2_dac.servo_step);
+  p.add("ocxo1_servo_last_residual", ocxo1_dac.servo_last_residual);
+  p.add("ocxo2_servo_last_residual", ocxo2_dac.servo_last_residual);
+  p.add("ocxo1_servo_settle_count",  ocxo1_dac.servo_settle_count);
+  p.add("ocxo2_servo_settle_count",  ocxo2_dac.servo_settle_count);
+
+  p.add("spin_valid",             pps_spin.valid);
+  p.add("spin_armed",             pps_spin.armed);
+  p.add("spin_completed",         pps_spin.completed);
+  p.add("spin_target_dwt",        pps_spin.target_dwt);
+  p.add("spin_landed_dwt",        pps_spin.landed_dwt);
+  p.add("spin_landed_gnss_ns",    pps_spin.landed_gnss_ns);
+  p.add("spin_error_cycles",      pps_spin.spin_error);
+  p.add("spin_shadow_dwt",        pps_spin.shadow_dwt);
+  p.add("spin_isr_dwt",           pps_spin.isr_dwt);
+  p.add("spin_delta_cycles",      pps_spin.delta_cycles);
+  p.add("spin_approach_cycles",   pps_spin.approach_cycles);
+  p.add("spin_corrected_dwt",     pps_spin.corrected_dwt);
+  p.add("spin_tdc_correction",    pps_spin.tdc_correction);
+  p.add("spin_nano_timed_out",    pps_spin.nano_timed_out);
+  p.add("spin_shadow_timed_out",  pps_spin.shadow_timed_out);
+  p.add("spin_nano_timeouts",     pps_spin.nano_timeouts);
+  p.add("spin_shadow_timeouts",   pps_spin.shadow_timeouts);
+  p.add("spin_arms",              pps_spin.arms);
+  p.add("spin_arm_failures",      pps_spin.arm_failures);
+  p.add("spin_completions",       pps_spin.completions);
+  p.add("spin_misses",            pps_spin.misses);
+
+  publish("WATCHDOG_ANOMALY", p);
+
+  watchdog_anomaly_publish_pending = false;
+  clocks_force_stop_campaign();
+}
+
+void clocks_watchdog_anomaly(const char* reason,
+                             uint32_t detail0,
+                             uint32_t detail1,
+                             uint32_t detail2,
+                             uint32_t detail3) {
+  if (!watchdog_anomaly_active) {
+    watchdog_anomaly_sequence++;
+    safeCopy(watchdog_anomaly_reason, sizeof(watchdog_anomaly_reason),
+             (reason && *reason) ? reason : "watchdog_anomaly");
+    watchdog_anomaly_detail0 = detail0;
+    watchdog_anomaly_detail1 = detail1;
+    watchdog_anomaly_detail2 = detail2;
+    watchdog_anomaly_detail3 = detail3;
+    watchdog_anomaly_trigger_dwt = DWT_CYCCNT;
+    watchdog_anomaly_publish_pending = true;
+  }
+
+  watchdog_anomaly_active = true;
+  pps_scheduled = false;
+
+  timepop_handle_t h = timepop_arm(0, false, clocks_watchdog_anomaly_callback, nullptr, "clocks-anomaly");
+  if (h == TIMEPOP_INVALID_HANDLE) {
+    diag_pps_asap_arm_failures++;
+    watchdog_anomaly_publish_pending = false;
+    clocks_force_stop_campaign();
+  }
+}
+
+// ============================================================================
 // clocks_beta_pps — called from alpha's pps_asap_callback
 // ============================================================================
 
 void clocks_beta_pps(void) {
+
+  if (watchdog_anomaly_active) {
+    pps_scheduled = false;
+    return;
+  }
 
   if (request_stop) {
     campaign_state = clocks_campaign_state_t::STOPPED;
@@ -524,6 +713,10 @@ static Payload cmd_start(const Payload& args) {
     ocxo2_dac.servo_settle_count = 0; ocxo2_dac.servo_adjustments = 0;
   }
 
+  watchdog_anomaly_active = false;
+  watchdog_anomaly_publish_pending = false;
+  watchdog_anomaly_reason[0] = '\0';
+
   request_start = true;
   request_stop  = false;
 
@@ -536,6 +729,10 @@ static Payload cmd_start(const Payload& args) {
 }
 
 static Payload cmd_stop(const Payload&) {
+  watchdog_anomaly_active = false;
+  watchdog_anomaly_publish_pending = false;
+  watchdog_anomaly_reason[0] = '\0';
+
   request_stop  = true;
   request_start = false;
   Payload p;
@@ -575,12 +772,23 @@ static Payload cmd_recover(const Payload& args) {
     ocxo2_dac.servo_settle_count = 0;
   }
 
+  watchdog_anomaly_active = false;
+  watchdog_anomaly_publish_pending = false;
+  watchdog_anomaly_reason[0] = '\0';
+
   request_recover = true;
   request_start   = false;
   request_stop    = false;
 
   Payload p;
   p.add("status", "recover_requested");
+  return p;
+}
+
+static Payload cmd_watchdog_test(const Payload&) {
+  clocks_watchdog_anomaly("watchdog_test");
+  Payload p;
+  p.add("status", "watchdog_anomaly_requested");
   return p;
 }
 
@@ -621,10 +829,20 @@ static Payload cmd_report(const Payload&) {
   p.add("campaign_state",
     campaign_state == clocks_campaign_state_t::STARTED ? "STARTED" : "STOPPED");
 
+  p.add("campaign", campaign_name);
   if (campaign_state == clocks_campaign_state_t::STARTED) {
-    p.add("campaign",         campaign_name);
     p.add("campaign_seconds", campaign_seconds);
   }
+
+  p.add("watchdog_anomaly_active",  (bool)watchdog_anomaly_active);
+  p.add("watchdog_anomaly_pending", (bool)watchdog_anomaly_publish_pending);
+  p.add("watchdog_anomaly_sequence", watchdog_anomaly_sequence);
+  p.add("watchdog_anomaly_reason", watchdog_anomaly_reason);
+  p.add("watchdog_anomaly_detail0", watchdog_anomaly_detail0);
+  p.add("watchdog_anomaly_detail1", watchdog_anomaly_detail1);
+  p.add("watchdog_anomaly_detail2", watchdog_anomaly_detail2);
+  p.add("watchdog_anomaly_detail3", watchdog_anomaly_detail3);
+  p.add("watchdog_anomaly_trigger_dwt", watchdog_anomaly_trigger_dwt);
 
   p.add("request_start",   request_start);
   p.add("request_stop",    request_stop);
@@ -731,10 +949,20 @@ static Payload cmd_clocks_info(const Payload&) {
   p.add("campaign_state",
     campaign_state == clocks_campaign_state_t::STARTED ? "STARTED" : "STOPPED");
 
+  p.add("campaign", campaign_name);
   if (campaign_state == clocks_campaign_state_t::STARTED) {
-    p.add("campaign",         campaign_name);
     p.add("campaign_seconds", campaign_seconds);
   }
+
+  p.add("watchdog_anomaly_active",  (bool)watchdog_anomaly_active);
+  p.add("watchdog_anomaly_pending", (bool)watchdog_anomaly_publish_pending);
+  p.add("watchdog_anomaly_sequence", watchdog_anomaly_sequence);
+  p.add("watchdog_anomaly_reason", watchdog_anomaly_reason);
+  p.add("watchdog_anomaly_detail0", watchdog_anomaly_detail0);
+  p.add("watchdog_anomaly_detail1", watchdog_anomaly_detail1);
+  p.add("watchdog_anomaly_detail2", watchdog_anomaly_detail2);
+  p.add("watchdog_anomaly_detail3", watchdog_anomaly_detail3);
+  p.add("watchdog_anomaly_trigger_dwt", watchdog_anomaly_trigger_dwt);
 
   p.add("dwt_cycles_now", clocks_dwt_cycles_now());
   p.add("dwt_ns_now",     clocks_dwt_ns_now());
@@ -1166,6 +1394,7 @@ static const process_command_entry_t CLOCKS_COMMANDS[] = {
   { "RECOVER",      cmd_recover      },
   { "REPORT",       cmd_report       },
   { "CLOCKS_INFO",  cmd_clocks_info  },
+  { "WATCHDOG_TEST", cmd_watchdog_test },
   { "INTERP_TEST",  cmd_interp_test  },
   { "INTERP_PROOF", cmd_interp_proof },
   { nullptr,        nullptr          }
