@@ -44,6 +44,7 @@
 
 #include "timepop.h"
 #include "process_timepop.h"
+#include "process_clocks_internal.h"
 
 #include "debug.h"
 #include "process.h"
@@ -1229,6 +1230,135 @@ static Payload cmd_diag_reset(const Payload&) {
 }
 
 // ============================================================================
+// VCLOCK_TEST — QTimer1 interval measurement via GPT2-scheduled callback
+//
+// Temporary diagnostic to characterize QTimer1 (GNSS VCLOCK) counting
+// accuracy and interrupt-readability independent of the scheduling engine.
+//
+// Protocol:
+//   1. Spin-wait for the next PPS edge (isr_snap_gnss changes).
+//      This aligns the arm point to the VCLOCK/PPS boundary — the same
+//      moment the system considers "time zero" for the new second.
+//   2. Capture qtimer1_read_32() immediately after the PPS edge.
+//   3. Arm a standard timepop_arm() timer for the requested duration.
+//   4. In the callback, capture qtimer1_read_32() again.
+//   5. Compute:
+//        vclock_raw_delta  = end_raw - start_raw   (dual-edge counts)
+//        vclock_ticks      = vclock_raw_delta / 2  (10 MHz ticks)
+//        expected_ticks    = requested_ns / 100     (100 ns per tick)
+//        residual_ticks    = vclock_ticks - expected_ticks
+//        residual_ns       = residual_ticks * 100
+//
+// The callback also captures DWT elapsed and time_gnss_ns_now() elapsed
+// for cross-reference against the VCLOCK measurement.
+//
+// Command: { "ns": <uint64> }
+//   Minimum: 1,000,000 (1 ms) to give GPT2 scheduling time.
+//   Maximum: 999,000,000 (999 ms) to stay within one PPS second.
+//
+// Event: TIMEPOP_VCLOCK_TEST
+// ============================================================================
+
+struct vclock_test_context_t {
+  uint32_t arm_vclock_raw;   // qtimer1_read_32() at arm point (post-PPS)
+  uint32_t arm_dwt;          // DWT_CYCCNT at arm point
+  int64_t  arm_gnss_ns;      // time_gnss_ns_now() at arm point
+  uint64_t requested_ns;     // requested duration
+  uint32_t arm_pps_count;    // time_pps_count() at arm
+};
+
+static vclock_test_context_t vclock_test_ctx = {};
+static volatile bool         vclock_test_in_flight = false;
+
+static void vclock_test_callback(timepop_ctx_t* ctx, void*) {
+
+  // Capture end state immediately
+  const uint32_t end_vclock_raw = qtimer1_read_32();
+  const uint32_t end_dwt        = ARM_DWT_CYCCNT;
+  const int64_t  end_gnss_ns    = time_gnss_ns_now();
+
+  // VCLOCK measurement
+  const uint32_t vclock_raw_delta  = end_vclock_raw - vclock_test_ctx.arm_vclock_raw;
+  const uint32_t vclock_ticks      = vclock_raw_delta / 2;
+  const uint64_t expected_ticks    = vclock_test_ctx.requested_ns / 100ULL;
+  const int32_t  residual_ticks    = (int32_t)vclock_ticks - (int32_t)expected_ticks;
+  const int32_t  residual_ns       = residual_ticks * 100;
+
+  // DWT cross-reference
+  const uint32_t dwt_elapsed = end_dwt - vclock_test_ctx.arm_dwt;
+
+  // GNSS cross-reference
+  int64_t gnss_elapsed_ns = -1;
+  if (vclock_test_ctx.arm_gnss_ns >= 0 && end_gnss_ns >= 0)
+    gnss_elapsed_ns = end_gnss_ns - vclock_test_ctx.arm_gnss_ns;
+
+  Payload ev;
+  ev.add("req_ns",           vclock_test_ctx.requested_ns);
+  ev.add("vclock_raw_delta", (uint64_t)vclock_raw_delta);  // dual-edge count
+  ev.add("vclock_ticks",     (uint64_t)vclock_ticks);      // /2 = 10 MHz ticks
+  ev.add("expected_ticks",   (uint64_t)expected_ticks);
+  ev.add("residual_ticks",   (int32_t)residual_ticks);
+  ev.add("residual_ns",      (int32_t)residual_ns);
+  ev.add("dwt_elapsed",      (uint64_t)dwt_elapsed);
+  ev.add("gnss_elapsed_ns",  gnss_elapsed_ns);
+  ev.add("arm_pps",          vclock_test_ctx.arm_pps_count);
+  ev.add("end_pps",          time_pps_count());
+  ev.add("fire_ns",          ctx->fire_ns);    // GPT2 lateness vs deadline
+
+  enqueueEvent("TIMEPOP_VCLOCK_TEST", ev);
+  vclock_test_in_flight = false;
+}
+
+static Payload cmd_vclock_test(const Payload& args) {
+  Payload resp;
+
+  if (vclock_test_in_flight) {
+    resp.add("error", "test already in flight");
+    return resp;
+  }
+  if (!time_valid()) {
+    resp.add("error", "time not valid (need PPS lock)");
+    return resp;
+  }
+
+  uint64_t ns_val = args.getUInt64("ns", 0);
+  if (ns_val < 1000000ULL) {
+    resp.add("error", "ns must be >= 1000000 (1 ms)");
+    return resp;
+  }
+  if (ns_val > 999000000ULL) {
+    resp.add("error", "ns must be <= 999000000 (999 ms)");
+    return resp;
+  }
+
+  // PPS just fired. Capture VCLOCK position immediately.
+  const uint32_t arm_vclock_raw = qtimer1_read_32();
+  const uint32_t arm_dwt        = ARM_DWT_CYCCNT;
+  const int64_t  arm_gnss_ns    = time_gnss_ns_now();
+
+  vclock_test_ctx = {};
+  vclock_test_ctx.arm_vclock_raw = arm_vclock_raw;
+  vclock_test_ctx.arm_dwt        = arm_dwt;
+  vclock_test_ctx.arm_gnss_ns    = arm_gnss_ns;
+  vclock_test_ctx.requested_ns   = ns_val;
+  vclock_test_ctx.arm_pps_count  = time_pps_count();
+
+  timepop_handle_t h = timepop_arm(
+    ns_val, false, vclock_test_callback, nullptr, "vclock-test"
+  );
+  if (h == TIMEPOP_INVALID_HANDLE) {
+    resp.add("error", "timepop_arm failed");
+    return resp;
+  }
+
+  vclock_test_in_flight = true;
+  resp.add("status",    "armed");
+  resp.add("req_ns",    ns_val);
+  resp.add("arm_vclock_raw", (uint64_t)arm_vclock_raw);
+  return resp;
+}
+
+// ============================================================================
 // Process registration
 // ============================================================================
 
@@ -1239,6 +1369,7 @@ static const process_command_entry_t TIMEPOP_COMMANDS[] = {
   { "TEST",        cmd_test        },
   { "NS_TEST",     cmd_ns_test     },
   { "INTERP_TEST", cmd_interp_test },
+  { "VCLOCK_TEST",  cmd_vclock_test  },
   { nullptr,       nullptr }
 };
 

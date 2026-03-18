@@ -36,3 +36,7 @@ void timepop_init(void);
 
 /// Register the TIMEPOP process with the command framework.
 void process_timepop_register(void);
+
+//   VCLOCK_TEST — QTimer1 interval measurement { "ns": <uint64> }
+//                 arm_ns range: 1,000,000–999,000,000
+//                 waits for PPS edge before arming, measures VCLOCK delta
