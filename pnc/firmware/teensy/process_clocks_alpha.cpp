@@ -502,7 +502,8 @@ static void pps_asap_callback(timepop_ctx_t*, void*) {
   // ── Universal GNSS time anchor (campaign-independent) ──
   time_pps_update(
     isr_snap_dwt - ISR_ENTRY_DWT_CYCLES,
-    g_dwt_cal_valid ? g_dwt_cycles_per_gnss_s : 0
+    g_dwt_cal_valid ? g_dwt_cycles_per_gnss_s : 0,
+    isr_snap_ocxo2
   );
 
   // ── Spin capture: complete the current capture, arm the next ──

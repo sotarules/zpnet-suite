@@ -12,6 +12,7 @@
 //   time_gnss_ns_now()       — current GNSS nanosecond (DWT interpolated)
 //   time_dwt_to_gnss_ns()    — convert a DWT_CYCCNT value to GNSS nanoseconds
 //   time_gnss_ns_to_dwt()    — convert a GNSS nanosecond to a DWT_CYCCNT value
+//   time_anchor_snapshot()   — seqlock-safe copy of the PPS anchor state
 //
 // Returns monotonic, PPS-counted nanoseconds with DWT interpolation
 // between PPS edges.  Available from boot as soon as the second PPS
@@ -27,6 +28,7 @@
 //   providing:
 //     - dwt_at_pps:        DWT_CYCCNT captured at the PPS edge
 //     - dwt_cycles_per_s:  measured DWT cycles in the prior second
+//     - gpt2_at_pps:       GPT2_CNT captured at the PPS edge
 //
 //   time.cpp maintains a seqlock-protected anchor and a PPS counter.
 //   All conversions use the same anchor snapshot for consistency.
@@ -43,6 +45,19 @@
 //   The PPS callback is the sole writer.  All other callers are readers.
 //
 // ============================================================================
+
+// ============================================================================
+// Anchor snapshot — public, seqlock-safe copy of the PPS anchor
+// ============================================================================
+
+struct time_anchor_snapshot_t {
+  uint32_t dwt_at_pps;       // DWT_CYCCNT at the PPS edge
+  uint32_t dwt_cycles_per_s; // DWT cycles in the prior GNSS second
+  uint32_t gpt2_at_pps;      // GPT2_CNT at the PPS edge (VCLOCK position)
+  uint32_t pps_count;        // PPS edges seen (1-indexed)
+  bool     valid;            // true after second PPS (rate available)
+  bool     ok;               // true if snapshot was consistent (no torn read)
+};
 
 // ============================================================================
 // Core API — forward (DWT → GNSS nanoseconds)
@@ -87,6 +102,21 @@ int64_t time_dwt_to_gnss_ns(uint32_t dwt_cyccnt);
 uint32_t time_gnss_ns_to_dwt(int64_t gnss_ns);
 
 // ============================================================================
+// Anchor snapshot — seqlock-safe copy of the full PPS anchor
+// ============================================================================
+
+/// Returns a consistent snapshot of the PPS anchor state.
+///
+/// If ok == false, a torn read occurred — retry or abandon.
+/// If valid == false, calibration is not yet established.
+///
+/// Used by TimePop for DWT prediction and VCLOCK ground truth
+/// without any dependency on the timebase fragment or campaigns.
+///
+/// ISR-safe.
+time_anchor_snapshot_t time_anchor_snapshot(void);
+
+// ============================================================================
 // Status
 // ============================================================================
 
@@ -115,7 +145,9 @@ bool time_valid(void);
 /// dwt_cycles_per_s: DWT cycles measured in the prior GNSS second.
 ///                   Zero on the first call (no prior second yet).
 ///                   Must be nonzero from the second call onward.
-void time_pps_update(uint32_t dwt_at_pps, uint32_t dwt_cycles_per_s);
+/// gpt2_at_pps:      GPT2_CNT captured at the PPS edge.
+///                   This is the GNSS VCLOCK position at the PPS moment.
+void time_pps_update(uint32_t dwt_at_pps, uint32_t dwt_cycles_per_s, uint32_t gpt2_at_pps);
 
 // ============================================================================
 // Initialization

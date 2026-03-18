@@ -75,6 +75,7 @@ struct time_anchor_t {
   volatile uint32_t seq;              // seqlock sequence number
   volatile uint32_t dwt_at_pps;       // DWT_CYCCNT at most recent PPS edge
   volatile uint32_t dwt_cycles_per_s; // DWT cycles in the prior GNSS second
+  volatile uint32_t gpt2_at_pps;      // GPT2_CNT at most recent PPS edge
   volatile uint32_t pps_count;        // PPS edges seen (1 = first PPS, 2 = first complete second)
   volatile bool     valid;            // true after second PPS (rate available)
 };
@@ -93,25 +94,20 @@ static inline void dmb(void) {
 // Writer — called from PPS callback in process_clocks_alpha.cpp
 // ============================================================================
 
-void time_pps_update(uint32_t dwt_at_pps, uint32_t dwt_cycles_per_s) {
+void time_pps_update(uint32_t dwt_at_pps, uint32_t dwt_cycles_per_s, uint32_t gpt2_at_pps) {
 
   anchor.seq++;
   dmb();
 
   if (!anchor.valid && anchor.pps_count == 0) {
-    // First PPS: establish time zero.
-    // dwt_cycles_per_s is 0 here (no prior second to measure).
-    // We record the anchor and mark "one PPS seen" so the next
-    // call takes the else branch.  Valid remains false — we need
-    // the rate from the second PPS before interpolation works.
     anchor.dwt_at_pps       = dwt_at_pps;
     anchor.dwt_cycles_per_s = 0;
+    anchor.gpt2_at_pps      = gpt2_at_pps;
     anchor.pps_count        = 1;
-    // valid remains false
   } else {
-    // Second PPS onward: advance the anchor.
     anchor.dwt_at_pps       = dwt_at_pps;
     anchor.dwt_cycles_per_s = dwt_cycles_per_s;
+    anchor.gpt2_at_pps      = gpt2_at_pps;
     anchor.pps_count++;
 
     if (dwt_cycles_per_s > 0) {
@@ -124,15 +120,16 @@ void time_pps_update(uint32_t dwt_at_pps, uint32_t dwt_cycles_per_s) {
 }
 
 // ============================================================================
-// Reader — stack-local snapshot with torn-read protection
+// Internal reader — stack-local snapshot with torn-read protection
 // ============================================================================
 
 struct time_snapshot_t {
   uint32_t dwt_at_pps;
   uint32_t dwt_cycles_per_s;
+  uint32_t gpt2_at_pps;
   uint32_t pps_count;
   bool     valid;
-  bool     ok;       // true if snapshot was consistent
+  bool     ok;
 };
 
 static time_snapshot_t read_anchor(void) {
@@ -145,6 +142,7 @@ static time_snapshot_t read_anchor(void) {
 
     s.dwt_at_pps       = anchor.dwt_at_pps;
     s.dwt_cycles_per_s = anchor.dwt_cycles_per_s;
+    s.gpt2_at_pps      = anchor.gpt2_at_pps;
     s.pps_count        = anchor.pps_count;
     s.valid            = anchor.valid;
 
@@ -157,7 +155,23 @@ static time_snapshot_t read_anchor(void) {
     }
   }
 
-  return s;  // ok = false
+  return s;
+}
+
+// ============================================================================
+// Public reader — seqlock-safe anchor snapshot
+// ============================================================================
+
+time_anchor_snapshot_t time_anchor_snapshot(void) {
+  time_snapshot_t s = read_anchor();
+  time_anchor_snapshot_t pub = {};
+  pub.dwt_at_pps       = s.dwt_at_pps;
+  pub.dwt_cycles_per_s = s.dwt_cycles_per_s;
+  pub.gpt2_at_pps      = s.gpt2_at_pps;
+  pub.pps_count        = s.pps_count;
+  pub.valid            = s.valid;
+  pub.ok               = s.ok;
+  return pub;
 }
 
 // ============================================================================
@@ -208,17 +222,9 @@ uint32_t time_gnss_ns_to_dwt(int64_t gnss_ns) {
   if (!s.ok || !s.valid) return 0;
   if (s.dwt_cycles_per_s == 0) return 0;
 
-  // Nanoseconds into the current second relative to the PPS anchor.
-  // completed_seconds = pps_count - 1, so the anchor epoch is
-  // (pps_count - 1) * 1e9.
   const int64_t anchor_ns = (int64_t)(s.pps_count - 1) * (int64_t)NS_PER_SEC;
   const int64_t ns_into_second = gnss_ns - anchor_ns;
 
-  // If the target is in the past relative to the anchor, or more than
-  // 3 seconds in the future, something is wrong — but we still return
-  // a best-effort value.  The caller is responsible for reasonableness.
-
-  // Convert nanoseconds to DWT cycles.  Round-to-nearest.
   const uint32_t dwt_elapsed =
     (uint32_t)(((uint64_t)ns_into_second * (uint64_t)s.dwt_cycles_per_s + NS_PER_SEC / 2)
     / NS_PER_SEC);
