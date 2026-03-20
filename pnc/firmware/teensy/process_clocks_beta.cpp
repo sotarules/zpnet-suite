@@ -1084,6 +1084,12 @@ static Payload cmd_clocks_info(const Payload&) {
   p.add("spin_completions",       pps_spin.completions);
   p.add("spin_misses",            pps_spin.misses);
 
+  // ── DEBUG: shadow capture forensics ──
+  p.add("dbg_post_dwt",      dbg_post_loop_dwt);
+  p.add("dbg_post_shadow",   dbg_post_loop_shadow);
+  p.add("dbg_post_isr_cap",  dbg_post_loop_isr_cap);
+  p.add("dbg_post_isr_snap", dbg_post_loop_isr_snap);
+
   // ── QTimer1 read diagnostics ──
   p.add("qread_total",            diag_qread_total);
   p.add("qread_same_hi",          diag_qread_same_hi);

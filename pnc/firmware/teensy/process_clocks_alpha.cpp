@@ -74,7 +74,7 @@
 // TimePop delay constants (nanoseconds)
 // ============================================================================
 
-static constexpr int64_t SPIN_EARLY_NS = 3000LL;  // 3 µs
+static constexpr int64_t SPIN_EARLY_NS = 5000LL;  // 5 µs — shadow loop needs margin
 
 // ============================================================================
 // TimePop delay constants (nanoseconds)
@@ -108,6 +108,11 @@ static constexpr uint32_t SPIN_LOOP_TIMEOUT_CYCLES = 100800;  // 100 µs at 1008
 volatile uint32_t dispatch_shadow_dwt     = 0;
 volatile uint32_t isr_captured_shadow_dwt = 0;
 
+volatile uint32_t dbg_post_loop_dwt       = 0;
+volatile uint32_t dbg_post_loop_shadow    = 0;
+volatile uint32_t dbg_post_loop_isr_cap   = 0;
+volatile uint32_t dbg_post_loop_isr_snap  = 0;
+
 spin_capture_t pps_spin = {};
 
 static void pps_spin_callback(timepop_ctx_t* ctx, void*) {
@@ -140,6 +145,12 @@ static void pps_spin_callback(timepop_ctx_t* ctx, void*) {
   pps_spin.shadow_timed_out = false;
   pps_spin.completed        = true;
   pps_spin.completions++;
+
+  // ── DEBUG: shadow capture forensics ──
+  dbg_post_loop_dwt     = DWT_CYCCNT;
+  dbg_post_loop_shadow  = dispatch_shadow_dwt;
+  dbg_post_loop_isr_cap = isr_captured_shadow_dwt;
+  dbg_post_loop_isr_snap = isr_snap_dwt;
 }
 
 static void pps_spin_arm(void) {

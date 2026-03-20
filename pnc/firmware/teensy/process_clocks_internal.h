@@ -331,6 +331,11 @@ uint32_t qtimer1_read_32(void);
 extern volatile bool relay_arm_pending;
 extern volatile bool relay_timer_active;
 
+extern volatile uint32_t dbg_post_loop_dwt;
+extern volatile uint32_t dbg_post_loop_shadow;
+extern volatile uint32_t dbg_post_loop_isr_cap;
+extern volatile uint32_t dbg_post_loop_isr_snap;
+
 // ============================================================================
 // PPS callback scheduling (alpha-owned)
 // ============================================================================
