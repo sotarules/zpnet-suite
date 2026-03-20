@@ -127,8 +127,10 @@ extern volatile bool pps_fired;
 
 struct ocxo_dac_state_t {
   double   dac_fractional;
-  uint32_t dither_cycle;        // retained for compatibility, no longer used
-  double   dither_accum;        // Bresenham accumulator
+  uint32_t dac_min;             // per-oscillator floor
+  uint32_t dac_max;             // per-oscillator ceiling
+  uint32_t dither_cycle;
+  double   dither_accum;
   uint32_t dither_high_count;
   uint32_t dither_low_count;
   int32_t  servo_step;

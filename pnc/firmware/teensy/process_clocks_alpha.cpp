@@ -210,18 +210,20 @@ bool clocks_dwt_calibration_valid(void) {
 // ============================================================================
 
 ocxo_dac_state_t ocxo1_dac = {
-  (double)OCXO1_DAC_DEFAULT, 0, 0.0, 0, 0, 0, 0.0, 0, 0
+  (double)OCXO1_DAC_DEFAULT, OCXO1_DAC_MIN, OCXO1_DAC_MAX,
+  0, 0.0, 0, 0, 0, 0.0, 0, 0
 };
 
 ocxo_dac_state_t ocxo2_dac = {
-  (double)OCXO2_DAC_DEFAULT, 0, 0.0, 0, 0, 0, 0.0, 0, 0
+  (double)OCXO2_DAC_DEFAULT, OCXO2_DAC_MIN, OCXO2_DAC_MAX,
+  0, 0.0, 0, 0, 0, 0.0, 0, 0
 };
 
 bool calibrate_ocxo_active = false;
 
 void ocxo_dac_set(ocxo_dac_state_t& s, double value) {
-  if (value < (double)OCXO1_DAC_MIN) value = (double)OCXO1_DAC_MIN;
-  if (value > (double)OCXO1_DAC_MAX) value = (double)OCXO1_DAC_MAX;
+  if (value < (double)s.dac_min) value = (double)s.dac_min;
+  if (value > (double)s.dac_max) value = (double)s.dac_max;
   s.dac_fractional = value;
 }
 
@@ -683,7 +685,7 @@ static void ocxo_dither_one(ocxo_dac_state_t& s, int pin) {
     s.dither_low_count++;
   }
 
-  if (output > OCXO1_DAC_MAX) output = OCXO1_DAC_MAX;
+  if (output > s.dac_max) output = s.dac_max;
   analogWrite(pin, output);
 }
 

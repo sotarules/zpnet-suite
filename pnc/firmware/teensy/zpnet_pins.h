@@ -96,7 +96,7 @@ Timer hardware binding summary:
   Pin 10  →  QTimer1 ch0+ch1 counter    (GNSS 10 MHz input, cascaded 32-bit)
   Pin 10  →  QTimer1 ch2 compare        (GNSS TimePop compare / interrupt path)
   Pin 22  →  FlexPWM4 Module0           (OCXO1 CTL, analogWrite 12-bit + dither)
-  Pin 11  →  FlexPWM1 Module2           (OCXO2 CTL, analogWrite 12-bit + dither)
+  Pin 5   →  FlexPWM2 Module1 Channel A (OCXO2 CTL, analogWrite 12-bit + dither)
 
 Notes:
 • QTimer1 ch2 compare matches only the low 16 bits in hardware; production
@@ -216,7 +216,7 @@ History: GPT1/pin25 → QTimer2/pin13 (LED conflict) → QTimer4/pin6
 -------------------------------------------------------------------------------
 
   10 MHz output  →  Teensy pin 14 (GPT2) via STP
-  CTL input      →  Teensy pin 11 (PWM DAC, 12-bit + dither)
+  CTL input      →  Teensy pin 5 (PWM DAC, 12-bit + dither)
   Power          →  Dedicated 5V domain
 
 GPT2, 32-bit, single-edge.  Symmetric with OCXO1.  Shield drain at OCXO2 end.

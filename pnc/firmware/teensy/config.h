@@ -132,7 +132,7 @@ static const int PHOTODIODE_ANALOG_PIN = 15;
 //   1 Hz pulse-per-second from GF-8802 (pin 17)
 //
 // GNSS_VCLK_PIN:
-//   10 MHz VCLOCK square wave from GF-8802 (pin 11)
+//   10 MHz VCLOCK square wave from GF-8802 (pin 10)
 //   Counted by QTimer1 ch0+ch1 (dual-edge raw counting, 50 ns raw ticks)
 //
 // GNSS_LOCK_PIN:
@@ -174,12 +174,12 @@ static constexpr uint32_t OCXO1_DAC_MAX     = 4095;
 //
 // OCXO2_CTL_PIN:
 //   PWM output (12-bit + dither) driving OCXO2 CTL input.
-//   Pin 11.
+//   Pin 5.
 //   0–3.3V for frequency trim.
 //   Positive pull slope: higher voltage = higher frequency.
 //
 static const int OCXO2_10MHZ_PIN = 14;
-static const int OCXO2_CTL_PIN   = 11;
+static const int OCXO2_CTL_PIN   = 5;
 
 // OCXO2 DAC defaults (identical range to OCXO1)
 static constexpr uint32_t OCXO2_DAC_DEFAULT = 2048;
@@ -219,7 +219,7 @@ static constexpr uint32_t QTIMER1_CH0_MASK = 0xFFFF;
 // OCXO1     GPT1             25   AOCJY1-A #1   10 MHz   100 ns
 // OCXO2     GPT2             14   AOCJY1-A #2   10 MHz   100 ns
 //
-// All timing domains free-run continuously.
+// All timing domains free-run continuously...
 // All are captured simultaneously in the PPS ISR.
 // GPT1 and GPT2 are 32-bit native.
 // QTimer1 is 16-bit cascaded to 32-bit.
