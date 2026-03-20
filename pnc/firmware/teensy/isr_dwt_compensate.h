@@ -26,27 +26,45 @@
 // Total: ~18-20 cycles for the hardware portion, plus whatever
 // instructions precede the ARM_DWT_CYCCNT read in the ISR body.
 //
-// For the GPT2 compare ISR (gpt2_compare_isr), the DWT read is
-// the very first operation.  The compiler may emit a function
-// prologue (push, frame pointer) before the first user instruction.
-// At 1008 MHz with -O2, the measured latency is approximately
-// 49 cycles (48.6 ns) from the GPT2 compare match to the DWT read.
+// ── QTimer1 CH2 compare path (TimePop production) ──
+//
+// The DWT read is the first operation inside qtimer1_ch2_compare_isr(),
+// but the NVIC vector points to qtimer1_irq_isr() which checks the
+// CH2 TCF1 flag and then calls qtimer1_ch2_compare_isr().  This adds
+// one flag read + conditional branch before the DWT capture compared
+// to a direct-vector ISR like the old GPT2 path.
+//
+// Initial estimate: 54 cycles (~53.6 ns at 1008 MHz).
+//
+//   Base NVIC + stacking:        ~20 cycles (same as GPT2)
+//   qtimer1_irq_isr prologue:    ~3 cycles  (push/frame)
+//   CH2 flag check + branch:     ~4 cycles  (load CSCTRL, test, branch)
+//   ch2_compare_isr prologue:    ~2 cycles  (inlined or minimal)
+//   Compiler prologue variance:  ~2 cycles
+//   ─────────────────────────────────────
+//   Subtotal:                    ~31 cycles (above GPT2's ~29)
+//   GPT2 measured total:          49 cycles
+//   Estimated QTimer1 CH2:        54 cycles (49 + ~5 for dispatch)
 //
 // This constant should be validated empirically using the DWT
 // prediction Welford accumulator: the mean DWT prediction residual
 // (actual - predicted) at steady state reveals the true ISR latency.
-// Adjust GPT2_ISR_ENTRY_DWT_CYCLES until the mean residual
+// Adjust QTIMER1_CH2_ISR_ENTRY_DWT_CYCLES until the mean residual
 // converges to zero.
 //
 // ============================================================================
 
-// ISR entry latency for the GPT2 output compare ISR.
-// This is the number of DWT cycles between the GPT2 compare match
+// ISR entry latency for the QTimer1 CH2 compare ISR (TimePop production).
+// This is the number of DWT cycles between the QTimer1 CH2 compare match
 // (the physical event) and the first ARM_DWT_CYCCNT read inside
-// gpt2_compare_isr().
+// qtimer1_ch2_compare_isr().
 //
-// Initial estimate: 49 cycles (~48.6 ns at 1008 MHz).
+// Initial estimate: 54 cycles (~53.6 ns at 1008 MHz).
 // Calibrate using TIMEPOP DIAG: adjust until dwt_pred_mean ≈ 0.
+static constexpr uint32_t QTIMER1_CH2_ISR_ENTRY_DWT_CYCLES = 54;
+
+// Retained for reference / any code that still needs GPT2 compensation.
+// GPT2 is now OCXO2's counter — no longer used for TimePop compare.
 static constexpr uint32_t GPT2_ISR_ENTRY_DWT_CYCLES = 49;
 
 // ============================================================================
@@ -54,7 +72,7 @@ static constexpr uint32_t GPT2_ISR_ENTRY_DWT_CYCLES = 49;
 //
 // Given a DWT_CYCCNT captured as the first instruction inside an ISR,
 // subtracts the ISR entry latency to estimate the DWT value at the
-// moment the hardware event (e.g., GPT2 compare match) actually fired.
+// moment the hardware event (e.g., compare match) actually fired.
 //
 // This is the inverse of ISR latency: the event happened BEFORE the
 // ISR read the counter, so the true DWT is earlier (smaller).
@@ -75,7 +93,15 @@ static inline uint32_t dwt_at_event(
 }
 
 // ============================================================================
-// Convenience: GPT2 compare ISR specific
+// Convenience: QTimer1 CH2 compare ISR (TimePop production)
+// ============================================================================
+
+static inline uint32_t dwt_at_qtimer1_ch2_compare(uint32_t isr_dwt_cyccnt) {
+  return dwt_at_event(isr_dwt_cyccnt, QTIMER1_CH2_ISR_ENTRY_DWT_CYCLES);
+}
+
+// ============================================================================
+// Convenience: GPT2 compare ISR (retained for reference)
 // ============================================================================
 
 static inline uint32_t dwt_at_gpt2_compare(uint32_t isr_dwt_cyccnt) {
