@@ -1,6 +1,18 @@
 // ============================================================================
-// process_timepop.cpp — TimePop v7.0 (Periodic 1 ms Heartbeat ISR)
+// process_timepop.cpp — TimePop v7.1 (VCLOCK_TEST Removed)
 // ============================================================================
+//
+// v7.1: VCLOCK_TEST removed.
+//
+//   VCLOCK_TEST was a proof-of-concept that validated QTimer1 CH3 as
+//   an independent compare/doorbell channel for GNSS scheduling.  The
+//   POC succeeded and its findings are incorporated into the production
+//   TimePop architecture.  CH3 is now unallocated and available for
+//   future use.
+//
+//   Removed: CH3 init, CH3 doorbell ISR, vclock_test_* state/helpers/
+//   context struct, cmd_vclock_test command, related diagnostics.
+//   The shared QTimer1 ISR now checks only CH2.
 //
 // v7.0: CH2 reconfigured as a periodic 1 ms heartbeat.
 //
@@ -19,34 +31,8 @@
 //   deadlines against the full 32-bit CH0+CH1 counter.  No dynamic
 //   compare arming, no domain translation, no race conditions.
 //
-//   Deadline math is unchanged — deadlines remain in the 32-bit
-//   CH0+CH1 domain, and deadline_expired() works identically.
-//
 //   The cost is one ISR entry per millisecond even when idle — trivial
 //   overhead on a 1008 MHz Cortex-M7 (~50 cycles per entry/exit).
-//
-//   ocr1_set(), ocr1_disable(), and reload_ocr() are eliminated.
-//
-// v6.0: CH2 compare rewritten to use delta-from-CH2-CNTR pattern.
-//       DWT compensation updated to dwt_at_qtimer1_ch2_compare().
-//       Staleness guard added to predict_dwt_at_deadline().
-//
-// v5.4: VCLOCK_TEST doorbell migrated to QTimer1 CH3 via internal PCS routing.
-//
-//   No external wire, no second pin, no IOMUX.  QTimer1 CH3 counts both
-//   edges of Counter 0's input pin (GNSS 10 MHz on pin 10) using:
-//     CM=2 (count rising AND falling edges of primary source)
-//     PCS=0 (primary clock source = Counter 0's input pin)
-//
-//   IRQ_QTIMER1 is shared across all four channels.  The ISR checks
-//   CH2's and CH3's TCF1 flags.  CH0 and CH1 CSCTRL registers are
-//   NEVER touched by the ISR — they have no TCF1EN set and generate
-//   no compare interrupts.
-//
-//   Pin assignment:
-//     Pin 10 (GPIO_B0_00, ALT1) — QTimer1 CH0+CH1 — passive 32-bit counting
-//     QTimer1 CH2              — 1 ms periodic heartbeat (TimePop production)
-//     QTimer1 CH3              — VCLOCK_TEST doorbell (internal PCS from CH0 pin)
 //
 // v5.0: Continuous DWT prediction and GNSS-now validation.
 // v4.3: Comprehensive forensic diagnostics.
@@ -55,6 +41,11 @@
 // v4: DWT nano-spin ISR delivery.
 // v3.1: INTERP_TEST Path 2 epoch fix.
 // v3: TEST and INTERP_TEST use time.h.  Campaign-independent.
+//
+// Pin assignment:
+//   Pin 10 (GPIO_B0_00, ALT1) — QTimer1 CH0+CH1 — passive 32-bit counting
+//   QTimer1 CH2              — 1 ms periodic heartbeat (TimePop production)
+//   QTimer1 CH3              — unallocated (available for future use)
 //
 // ============================================================================
 
@@ -220,21 +211,15 @@ static welford_t welford_gnss_now       = {};
 static volatile uint32_t diag_prediction_samples = 0;
 static volatile uint32_t diag_prediction_skipped = 0;
 
-static volatile uint32_t diag_vclock_candidate_irqs = 0;
-static volatile uint32_t diag_vclock_early_rejects   = 0;
-
 // ── v7.0: Heartbeat and IRQ diagnostics ──
 static volatile uint32_t diag_heartbeat_count    = 0;
 static volatile uint32_t diag_qtimer1_irq_count  = 0;
 
 // ============================================================================
-// VCLOCK_TEST forward declarations
+// Forward declarations
 // ============================================================================
 
-static inline void vclock_test_disable_compare(void);
-static void emit_deferred_vclock_test(void);
 static void qtimer1_irq_isr(void);
-static void qtimer1_ch3_doorbell_isr(void);
 
 // ============================================================================
 // Slot counting helper (called with interrupts disabled)
@@ -418,13 +403,6 @@ static void qtimer1_ch2_heartbeat_isr(void) {
 // Initialization
 // ============================================================================
 
-static volatile bool vclock_test_in_flight    = false;
-static volatile bool vclock_test_irq_armed    = false;
-static volatile bool vclock_test_result_ready = false;
-static Payload       vclock_test_result_ev;
-
-static void vclock_test_init_qtimer1_ch3(void);
-
 void timepop_init(void) {
   for (uint32_t i = 0; i < MAX_SLOTS; i++) slots[i] = {};
 
@@ -456,16 +434,9 @@ void timepop_init(void) {
   IMXRT_TMR1.CH[2].CSCTRL = TMR_CSCTRL_TCF1EN;
   IMXRT_TMR1.CH[2].CTRL   = TMR_CTRL_CM(2) | TMR_CTRL_PCS(0) | TMR_CTRL_LENGTH;
 
-  vclock_test_in_flight    = false;
-  vclock_test_irq_armed    = false;
-  vclock_test_result_ready = false;
-  vclock_test_disable_compare();
-
   attachInterruptVector(IRQ_QTIMER1, qtimer1_irq_isr);
   NVIC_SET_PRIORITY(IRQ_QTIMER1, 16);
   NVIC_ENABLE_IRQ(IRQ_QTIMER1);
-
-  vclock_test_init_qtimer1_ch3();
 }
 
 // ============================================================================
@@ -571,21 +542,20 @@ timepop_handle_t timepop_arm_ns(
     if (next_handle == TIMEPOP_INVALID_HANDLE) next_handle = 1;
 
     slots[i] = {};
-    slots[i].active         = true;
-    slots[i].expired        = false;
-    slots[i].recurring      = false;
-    slots[i].nano_precise   = true;
-    slots[i].handle         = h;
-    slots[i].period_ns      = (uint64_t)delay_ns;
-    slots[i].period_ticks   = 0;
-    slots[i].callback       = callback;
-    slots[i].user_data      = user_data;
-    slots[i].name           = name;
+    slots[i].active       = true;
+    slots[i].expired      = false;
+    slots[i].recurring    = false;
+    slots[i].nano_precise = true;
+    slots[i].handle       = h;
+    slots[i].period_ns    = 0;
+    slots[i].period_ticks = 0;
+    slots[i].deadline     = vclock_deadline;
     slots[i].target_gnss_ns = target_gnss_ns;
     slots[i].target_dwt     = target_dwt;
-    slots[i].fire_gnss_ns   = -1;
-    slots[i].nano_timeout   = false;
-    slots[i].deadline       = vclock_deadline;
+    slots[i].callback     = callback;
+    slots[i].user_data    = user_data;
+    slots[i].name         = name;
+    slots[i].fire_gnss_ns = -1;
 
     slots[i].predicted_dwt    = target_dwt;
     slots[i].prediction_valid = true;
@@ -603,16 +573,16 @@ timepop_handle_t timepop_arm_ns(
 }
 
 // ============================================================================
-// Cancel by handle
+// Cancel
 // ============================================================================
 
 bool timepop_cancel(timepop_handle_t handle) {
   if (handle == TIMEPOP_INVALID_HANDLE) return false;
+
   noInterrupts();
   for (uint32_t i = 0; i < MAX_SLOTS; i++) {
     if (slots[i].active && slots[i].handle == handle) {
-      slots[i].active  = false;
-      slots[i].expired = false;
+      slots[i].active = false;
       interrupts();
       return true;
     }
@@ -621,19 +591,14 @@ bool timepop_cancel(timepop_handle_t handle) {
   return false;
 }
 
-// ============================================================================
-// Cancel by name
-// ============================================================================
-
 uint32_t timepop_cancel_by_name(const char* name) {
   if (!name) return 0;
+
   uint32_t cancelled = 0;
   noInterrupts();
   for (uint32_t i = 0; i < MAX_SLOTS; i++) {
-    if (slots[i].active && slots[i].name &&
-        strcmp(slots[i].name, name) == 0) {
-      slots[i].active  = false;
-      slots[i].expired = false;
+    if (slots[i].active && slots[i].name && strcmp(slots[i].name, name) == 0) {
+      slots[i].active = false;
       cancelled++;
     }
   }
@@ -642,7 +607,7 @@ uint32_t timepop_cancel_by_name(const char* name) {
 }
 
 // ============================================================================
-// Deferred event emission for nano-precise tests
+// NS_TEST — deferred event emission
 // ============================================================================
 
 static volatile bool ns_test_result_ready = false;
@@ -700,7 +665,6 @@ static void slot_welford_update(const timepop_slot_t& slot) {
 void timepop_dispatch(void) {
 
   emit_deferred_ns_test();
-  emit_deferred_vclock_test();
 
   if (!timepop_pending) return;
   timepop_pending = false;
@@ -934,51 +898,72 @@ static Payload cmd_ns_test(const Payload& args) {
     target_gnss_ns, target_dwt,
     ns_test_timer_callback, nullptr, "ns-test"
   );
-  if (h == TIMEPOP_INVALID_HANDLE) {
-    resp.add("error", "arm_ns failed");
-    return resp;
-  }
+  if (h == TIMEPOP_INVALID_HANDLE) { resp.add("error", "arm_ns failed"); return resp; }
 
   ns_test_in_flight = true;
   resp.add("status", "armed");
   resp.add("req",    ns_val);
+  resp.add("target_gnss_ns", target_gnss_ns);
+  resp.add("target_dwt",     target_dwt);
   return resp;
 }
 
 // ============================================================================
-// INTERP_TEST
+// INTERP_TEST — dual-path interpolation validation
 // ============================================================================
 
-struct interp_test_ctx_t {
+struct interp_test_context_t {
   uint32_t tests_remaining;
   uint64_t delay_ns;
+
+  int64_t  arm_gnss_ns;
   int64_t  arm_time_ns;
   uint32_t arm_vclock_raw;
-  int64_t  w_n;   double w_mean, w_m2;
-  int64_t  err_min, err_max;
+
+  int64_t  w_n;
+  double   w_mean;
+  double   w_m2;
+  int64_t  err_min;
+  int64_t  err_max;
   int32_t  outside_100ns;
-  int64_t  t_n;   double t_mean, t_m2;
-  int64_t  t_err_min, t_err_max;
+
+  int64_t  t_n;
+  double   t_mean;
+  double   t_m2;
+  int64_t  t_err_min;
+  int64_t  t_err_max;
 };
 
-static interp_test_ctx_t itest_ctx = {};
-static volatile bool     itest_in_flight = false;
+static interp_test_context_t itest_ctx = {};
+static volatile bool         itest_in_flight = false;
 
-static void interp_test_callback(timepop_ctx_t* ctx, void*);
-
-static void interp_test_arm_next(void) {
-  itest_ctx.arm_time_ns    = time_gnss_ns_now();
-  itest_ctx.arm_vclock_raw = qtimer1_read_32();
-  timepop_handle_t h = timepop_arm(
-    itest_ctx.delay_ns, false, interp_test_callback, nullptr, "itest");
-  if (h == TIMEPOP_INVALID_HANDLE) itest_in_flight = false;
-}
+static void interp_test_arm_next(void);
 
 static void interp_test_callback(timepop_ctx_t* ctx, void*) {
 
   bool path1_valid = false;
   int64_t path1_error_ns = 0;
   uint64_t vclock_ns_into_second = 0;
+
+  {
+    time_anchor_snapshot_t snap = time_anchor_snapshot();
+    if (snap.ok && snap.valid && snap.pps_count >= 2 && snap.dwt_cycles_per_s > 0) {
+      const int64_t epoch_ns = (int64_t)(snap.pps_count - 1) * (int64_t)1000000000LL;
+
+      const uint32_t vclock_since_pps = ctx->fire_vclock_raw - snap.qtimer_at_pps;
+      vclock_ns_into_second = (uint64_t)vclock_since_pps * 50ULL;
+      const int64_t vclock_gnss_ns = epoch_ns + (int64_t)vclock_ns_into_second;
+
+      const uint32_t dwt_elapsed = ctx->fire_dwt_cyccnt - snap.dwt_at_pps;
+      const uint64_t dwt_ns_into_second =
+        ((uint64_t)dwt_elapsed * 1000000000ULL + (uint64_t)snap.dwt_cycles_per_s / 2)
+        / (uint64_t)snap.dwt_cycles_per_s;
+      const int64_t dwt_gnss_ns = epoch_ns + (int64_t)dwt_ns_into_second;
+
+      path1_error_ns = dwt_gnss_ns - vclock_gnss_ns;
+      path1_valid = true;
+    }
+  }
 
   bool path2_valid = false;
   int64_t path2_error_ns = 0;
@@ -1039,6 +1024,14 @@ static void interp_test_callback(timepop_ctx_t* ctx, void*) {
   itest_in_flight = false;
 }
 
+static void interp_test_arm_next(void) {
+  itest_ctx.arm_gnss_ns    = time_gnss_ns_now();
+  itest_ctx.arm_time_ns    = time_gnss_ns_now();
+  itest_ctx.arm_vclock_raw = qtimer1_read_32();
+
+  timepop_arm(itest_ctx.delay_ns, false, interp_test_callback, nullptr, "itest");
+}
+
 static Payload cmd_interp_test(const Payload& args) {
   Payload resp;
 
@@ -1095,7 +1088,8 @@ static Payload cmd_report(const Payload&) {
   out.add("asap_arm_failures",      diag_asap_arm_failures);
   out.add("asap_last_armed_dwt",    diag_asap_last_armed_dwt);
   out.add("asap_last_dispatch_dwt", diag_asap_last_dispatch_dwt);
-  out.add("asap_last_armed_name", (const char*)(diag_asap_last_armed_name ? diag_asap_last_armed_name : ""));
+  out.add("asap_last_armed_name", (const char*)(diag_asap_last_armed_name ?
+    diag_asap_last_armed_name : ""));
 
   out.add("dispatch_calls",     diag_dispatch_calls);
   out.add("dispatch_callbacks", diag_dispatch_callbacks);
@@ -1105,16 +1099,9 @@ static Payload cmd_report(const Payload&) {
   out.add("gnss_now_n",       (int32_t)welford_gnss_now.n);
   out.add("gnss_now_stddev",  welford_gnss_now.stddev());
 
-  out.add("vclock_test_in_flight",    vclock_test_in_flight);
-  out.add("vclock_test_result_ready", vclock_test_result_ready);
-  out.add("vclock_candidate_irqs", diag_vclock_candidate_irqs);
-  out.add("vclock_early_rejects",  diag_vclock_early_rejects);
-
-  // QTimer1 CH2/CH3 diagnostics
+  // QTimer1 CH2 diagnostics
   out.add("qtmr1_ch2_cntr",   (uint32_t)IMXRT_TMR1.CH[2].CNTR);
   out.add("qtmr1_ch2_csctrl", (uint32_t)IMXRT_TMR1.CH[2].CSCTRL);
-  out.add("qtmr1_ch3_cntr",   (uint32_t)IMXRT_TMR1.CH[3].CNTR);
-  out.add("qtmr1_ch3_csctrl", (uint32_t)IMXRT_TMR1.CH[3].CSCTRL);
 
   PayloadArray timers;
   for (uint32_t i = 0; i < MAX_SLOTS; i++) {
@@ -1208,267 +1195,14 @@ static Payload cmd_diag_reset(const Payload&) {
 }
 
 // ============================================================================
-// VCLOCK_TEST v5.4 — QTimer1 CH3 compare doorbell (internal PCS routing)
-//
-// Architecture:
-//   QTimer1 CH0 + CH1 = passive 32-bit counter.  Never touched by compare.
-//
-// When QTimer1 CH3's compare fires, the ISR reads QTimer1 CH0+CH1 via
-// qtimer1_read_32() — completely undisturbed.  IRQ_QTIMER1 is shared
-// across all four channels; the ISR checks only CH3's TCF1 flag.
-// CH0 and CH1 CSCTRL registers are NEVER modified by the ISR.
-//
-// QTimer1 CH3 target computation:
-//   At arm time, read QTimer1 CH3's current 16-bit count.
-//   Add the same raw_delta (requested_ticks * 2) used for the QTimer1 target.
-//   The low 16 bits of that sum become QTimer1 CH3's COMP1 value.
-//   The full 32-bit QTimer1 CH0+CH1 target is still computed for alias rejection.
+// QTimer1 ISR — CH2 only (CH3 unallocated)
 // ============================================================================
-
-struct vclock_test_context_t {
-  uint32_t arm_vclock_raw;
-  uint16_t arm_qtmr3_count;
-  uint32_t arm_dwt;
-  int64_t  arm_gnss_ns;
-  uint64_t requested_ns;
-  uint32_t requested_ticks;
-  uint32_t target_vclock_raw;
-  uint16_t target_qtmr3_low16;
-  uint32_t arm_pps_count;
-
-  uint32_t end_vclock_raw;
-  uint32_t end_dwt;
-  int64_t  end_gnss_ns;
-  uint32_t end_pps_count;
-
-  int32_t  fire_raw;
-  bool     fired;
-
-  // ── Forensics ──
-  uint32_t candidate_irq_count;
-  uint32_t early_reject_count;
-  uint32_t first_candidate_raw;
-  uint32_t last_candidate_raw;
-  uint32_t last_candidate_gap_raw;
-  uint32_t min_candidate_gap_raw;
-  uint32_t max_candidate_gap_raw;
-};
-
-static vclock_test_context_t vclock_test_ctx = {};
-
-// ── QTimer1 CH3 register helpers ──
-
-static inline void vclock_test_clear_flag(void) {
-  uint16_t csctrl = IMXRT_TMR1.CH[3].CSCTRL;
-  csctrl &= ~(TMR_CSCTRL_TCF1 | TMR_CSCTRL_TCF2);
-  IMXRT_TMR1.CH[3].CSCTRL = csctrl;
-}
-
-static inline void vclock_test_disable_compare(void) {
-  IMXRT_TMR1.CH[3].CSCTRL &= ~TMR_CSCTRL_TCF1EN;
-  vclock_test_clear_flag();
-}
-
-static inline void vclock_test_arm_compare(uint16_t target_low16) {
-  IMXRT_TMR1.CH[3].COMP1  = target_low16;
-  IMXRT_TMR1.CH[3].CMPLD1 = target_low16;
-  vclock_test_clear_flag();
-  IMXRT_TMR1.CH[3].CSCTRL |= TMR_CSCTRL_TCF1EN;
-}
-
-static void vclock_test_init_qtimer1_ch3(void) {
-  IMXRT_TMR1.CH[3].CTRL   = 0;
-  IMXRT_TMR1.CH[3].CNTR   = 0;
-  IMXRT_TMR1.CH[3].LOAD   = 0;
-  IMXRT_TMR1.CH[3].COMP1  = 0xFFFF;
-  IMXRT_TMR1.CH[3].CMPLD1 = 0xFFFF;
-  IMXRT_TMR1.CH[3].SCTRL  = 0;
-  IMXRT_TMR1.CH[3].CSCTRL = 0;
-
-  // CM=2 (count rising AND falling edges of primary source)
-  // PCS=0 (primary clock source = Counter 0's input pin = GNSS 10 MHz)
-  IMXRT_TMR1.CH[3].CTRL = TMR_CTRL_CM(2) | TMR_CTRL_PCS(0);
-}
-
-static void emit_deferred_vclock_test(void) {
-  if (!vclock_test_result_ready) return;
-  vclock_test_result_ready = false;
-  publish("TIMEPOP_VCLOCK_TEST", vclock_test_result_ev);
-  vclock_test_result_ev.clear();
-}
 
 static void qtimer1_irq_isr(void) {
   diag_qtimer1_irq_count++;
   if (IMXRT_TMR1.CH[2].CSCTRL & TMR_CSCTRL_TCF1) {
     qtimer1_ch2_heartbeat_isr();
   }
-  if (IMXRT_TMR1.CH[3].CSCTRL & TMR_CSCTRL_TCF1) {
-    qtimer1_ch3_doorbell_isr();
-  }
-}
-
-static void qtimer1_ch3_doorbell_isr(void) {
-  if ((IMXRT_TMR1.CH[3].CSCTRL & TMR_CSCTRL_TCF1) == 0) return;
-
-  vclock_test_clear_flag();
-
-  if (!vclock_test_irq_armed) return;
-
-  vclock_test_ctx.candidate_irq_count++;
-  if (vclock_test_ctx.candidate_irq_count > 100) {
-    vclock_test_disable_compare();
-    vclock_test_irq_armed = false;
-    vclock_test_in_flight = false;
-    return;
-  }
-
-  diag_vclock_candidate_irqs = vclock_test_ctx.candidate_irq_count;
-  diag_vclock_early_rejects = vclock_test_ctx.early_reject_count;
-
-  const uint32_t now_raw = qtimer1_read_32();
-
-  // Forensic gap tracking
-  if (vclock_test_ctx.candidate_irq_count == 1) {
-    vclock_test_ctx.first_candidate_raw = now_raw;
-    vclock_test_ctx.min_candidate_gap_raw = UINT32_MAX;
-    vclock_test_ctx.max_candidate_gap_raw = 0;
-  } else {
-    uint32_t gap = now_raw - vclock_test_ctx.last_candidate_raw;
-    vclock_test_ctx.last_candidate_gap_raw = gap;
-    if (gap < vclock_test_ctx.min_candidate_gap_raw) vclock_test_ctx.min_candidate_gap_raw = gap;
-    if (gap > vclock_test_ctx.max_candidate_gap_raw) vclock_test_ctx.max_candidate_gap_raw = gap;
-  }
-  vclock_test_ctx.last_candidate_raw = now_raw;
-
-  // ── 32-bit alias rejection ──
-  if ((int32_t)(now_raw - vclock_test_ctx.target_vclock_raw) < 0) {
-    vclock_test_ctx.early_reject_count++;
-    return;
-  }
-
-  const uint32_t end_dwt     = ARM_DWT_CYCCNT;
-  const int64_t  end_gnss_ns = time_gnss_ns_now();
-  const uint32_t end_pps     = time_pps_count();
-
-  vclock_test_disable_compare();
-  vclock_test_irq_armed = false;
-
-  vclock_test_ctx.end_vclock_raw = now_raw;
-  vclock_test_ctx.end_dwt        = end_dwt;
-  vclock_test_ctx.end_gnss_ns    = end_gnss_ns;
-  vclock_test_ctx.end_pps_count  = end_pps;
-  vclock_test_ctx.fire_raw       = (int32_t)(now_raw - vclock_test_ctx.target_vclock_raw);
-  vclock_test_ctx.fired          = true;
-
-  const uint32_t vclock_raw_delta =
-    vclock_test_ctx.end_vclock_raw - vclock_test_ctx.arm_vclock_raw;
-
-  const uint32_t vclock_ticks = vclock_raw_delta / 2U;
-
-  const int32_t residual_ticks =
-    (int32_t)vclock_ticks - (int32_t)vclock_test_ctx.requested_ticks;
-  const int32_t residual_ns = residual_ticks * 50;
-
-  const uint32_t dwt_elapsed =
-    vclock_test_ctx.end_dwt - vclock_test_ctx.arm_dwt;
-
-  int64_t gnss_elapsed_ns = -1;
-  if (vclock_test_ctx.arm_gnss_ns >= 0 && vclock_test_ctx.end_gnss_ns >= 0) {
-    gnss_elapsed_ns = vclock_test_ctx.end_gnss_ns - vclock_test_ctx.arm_gnss_ns;
-  }
-
-  Payload ev;
-  ev.add("req_ns",              vclock_test_ctx.requested_ns);
-  ev.add("requested_ticks",     (uint64_t)vclock_test_ctx.requested_ticks);
-  ev.add("arm_vclock_raw",      (uint64_t)vclock_test_ctx.arm_vclock_raw);
-  ev.add("target_vclock_raw",   (uint64_t)vclock_test_ctx.target_vclock_raw);
-  ev.add("end_vclock_raw",      (uint64_t)vclock_test_ctx.end_vclock_raw);
-  ev.add("vclock_raw_delta",    (uint64_t)vclock_raw_delta);
-  ev.add("vclock_ticks",        (uint64_t)vclock_ticks);
-  ev.add("residual_ticks",      residual_ticks);
-  ev.add("residual_ns",         residual_ns);
-  ev.add("fire_raw",            vclock_test_ctx.fire_raw);
-  ev.add("fire_ns",             vclock_test_ctx.fire_raw * 50);
-  ev.add("dwt_elapsed",         (uint64_t)dwt_elapsed);
-  ev.add("gnss_elapsed_ns",     gnss_elapsed_ns);
-  ev.add("arm_pps",             vclock_test_ctx.arm_pps_count);
-  ev.add("end_pps",             vclock_test_ctx.end_pps_count);
-  ev.add("candidate_irq_count",    vclock_test_ctx.candidate_irq_count);
-  ev.add("early_reject_count",     vclock_test_ctx.early_reject_count);
-  ev.add("first_candidate_raw",    (uint64_t)vclock_test_ctx.first_candidate_raw);
-  ev.add("last_candidate_raw",     (uint64_t)vclock_test_ctx.last_candidate_raw);
-  ev.add("last_candidate_gap_raw", (uint64_t)vclock_test_ctx.last_candidate_gap_raw);
-  ev.add("min_candidate_gap_raw",  (uint64_t)vclock_test_ctx.min_candidate_gap_raw);
-  ev.add("max_candidate_gap_raw",  (uint64_t)vclock_test_ctx.max_candidate_gap_raw);
-
-  vclock_test_result_ev    = ev;
-  vclock_test_result_ready = true;
-  vclock_test_in_flight    = false;
-  timepop_pending          = true;
-}
-
-static Payload cmd_vclock_test(const Payload& args) {
-  Payload resp;
-
-  if (vclock_test_in_flight || vclock_test_irq_armed) {
-    resp.add("error", "test already in flight");
-    return resp;
-  }
-  if (!time_valid()) {
-    resp.add("error", "time not valid (need PPS lock)");
-    return resp;
-  }
-
-  const uint64_t ns_val = args.getUInt64("ns", 0);
-  if (ns_val < 1000000ULL) {
-    resp.add("error", "ns must be >= 1000000 (1 ms)");
-    return resp;
-  }
-  if (ns_val > 999000000ULL) {
-    resp.add("error", "ns must be <= 999000000 (999 ms)");
-    return resp;
-  }
-
-  const uint32_t requested_ticks = (uint32_t)(ns_val / 100ULL);
-  const uint32_t raw_delta       = requested_ticks * 2U;
-
-  const uint32_t arm_vclock_raw  = qtimer1_read_32();
-  const uint16_t arm_qtmr3_count = IMXRT_TMR1.CH[3].CNTR;
-  const uint32_t arm_dwt         = ARM_DWT_CYCCNT;
-  const int64_t  arm_gnss_ns     = time_gnss_ns_now();
-  const uint32_t arm_pps_count   = time_pps_count();
-
-  const uint32_t target_vclock_raw = arm_vclock_raw + raw_delta;
-
-  const uint16_t target_qtmr3_low16 =
-    (uint16_t)((arm_qtmr3_count + (uint16_t)(raw_delta & 0xFFFFu)) & 0xFFFFu);
-
-  vclock_test_ctx = {};
-  vclock_test_ctx.arm_vclock_raw     = arm_vclock_raw;
-  vclock_test_ctx.arm_qtmr3_count    = arm_qtmr3_count;
-  vclock_test_ctx.arm_dwt            = arm_dwt;
-  vclock_test_ctx.arm_gnss_ns        = arm_gnss_ns;
-  vclock_test_ctx.requested_ns       = ns_val;
-  vclock_test_ctx.requested_ticks    = requested_ticks;
-  vclock_test_ctx.target_vclock_raw  = target_vclock_raw;
-  vclock_test_ctx.target_qtmr3_low16 = target_qtmr3_low16;
-  vclock_test_ctx.arm_pps_count      = arm_pps_count;
-
-  noInterrupts();
-  vclock_test_in_flight = true;
-  vclock_test_irq_armed = true;
-  vclock_test_arm_compare(target_qtmr3_low16);
-  interrupts();
-
-  resp.add("status",             "armed");
-  resp.add("req_ns",             ns_val);
-  resp.add("requested_ticks",    (uint64_t)requested_ticks);
-  resp.add("arm_vclock_raw",     (uint64_t)arm_vclock_raw);
-  resp.add("arm_qtmr3_count",    (uint32_t)arm_qtmr3_count);
-  resp.add("target_vclock_raw",  (uint64_t)target_vclock_raw);
-  resp.add("target_qtmr3_low16", (uint32_t)target_qtmr3_low16);
-  resp.add("arm_pps",            arm_pps_count);
-  return resp;
 }
 
 // ============================================================================
@@ -1482,7 +1216,6 @@ static const process_command_entry_t TIMEPOP_COMMANDS[] = {
   { "TEST",        cmd_test        },
   { "NS_TEST",     cmd_ns_test     },
   { "INTERP_TEST", cmd_interp_test },
-  { "VCLOCK_TEST", cmd_vclock_test },
   { nullptr,       nullptr }
 };
 
