@@ -28,7 +28,7 @@
 //   providing:
 //     - dwt_at_pps:        DWT_CYCCNT captured at the PPS edge
 //     - dwt_cycles_per_s:  measured DWT cycles in the prior second
-//     - gpt2_at_pps:       GPT2_CNT captured at the PPS edge
+//     - qtimer_at_pps:       QTimer1 raw counter captured at the PPS edge
 //
 //   time.cpp maintains a seqlock-protected anchor and a PPS counter.
 //   All conversions use the same anchor snapshot for consistency.
@@ -53,7 +53,7 @@
 struct time_anchor_snapshot_t {
   uint32_t dwt_at_pps;       // DWT_CYCCNT at the PPS edge
   uint32_t dwt_cycles_per_s; // DWT cycles in the prior GNSS second
-  uint32_t gpt2_at_pps;      // GPT2_CNT at the PPS edge (VCLOCK position)
+  uint32_t qtimer_at_pps;      // QTimer1 raw counter at the PPS edge (VCLOCK position)
   uint32_t pps_count;        // PPS edges seen (1-indexed)
   bool     valid;            // true after second PPS (rate available)
   bool     ok;               // true if snapshot was consistent (no torn read)
@@ -145,9 +145,9 @@ bool time_valid(void);
 /// dwt_cycles_per_s: DWT cycles measured in the prior GNSS second.
 ///                   Zero on the first call (no prior second yet).
 ///                   Must be nonzero from the second call onward.
-/// gpt2_at_pps:      GPT2_CNT captured at the PPS edge.
-///                   This is the GNSS VCLOCK position at the PPS moment.
-void time_pps_update(uint32_t dwt_at_pps, uint32_t dwt_cycles_per_s, uint32_t gpt2_at_pps);
+/// qtimer_at_pps:      QTimer1 raw counter captured at the PPS edge.
+///                   This is the GNSS VCLOCK raw position at the PPS moment.
+void time_pps_update(uint32_t dwt_at_pps, uint32_t dwt_cycles_per_s, uint32_t qtimer_at_pps);
 
 // ============================================================================
 // Initialization

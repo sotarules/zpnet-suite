@@ -32,8 +32,14 @@ static constexpr uint64_t NS_PER_MICROSECOND = 1000ULL;
 // --------------------------------------------------------------
 //
 // All three external 10 MHz clocks (GNSS VCLOCK, OCXO1, OCXO2)
-// share the same nominal frequency.  These constants are used
+// share the same nominal frequency. These constants are used
 // for ISR-level residual computation and PPS edge validation.
+//
+// NOTE:
+//   GNSS VCLOCK is on QTimer1 ch0+ch1 as a dual-edge raw counter
+//   (50 ns raw ticks). TimePop compare uses QTimer1 ch2.
+//   OCXO1 is on GPT1.
+//   OCXO2 is on GPT2.
 //
 
 // Expected ticks per PPS second at 10 MHz
@@ -52,8 +58,8 @@ static constexpr uint32_t PPS_VCLOCK_TOLERANCE = 100;
 // --------------------------------------------------------------
 
 // SmartPOP / clock prescale
-static constexpr uint32_t SMARTPOP_HZ        = 10000U;      // 10 kHz
-static constexpr uint64_t NS_PER_SMART_TICK  = NS_PER_SECOND / SMARTPOP_HZ; // 100,000 ns
+static constexpr uint32_t SMARTPOP_HZ       = 10000U; // 10 kHz
+static constexpr uint64_t NS_PER_SMART_TICK = NS_PER_SECOND / SMARTPOP_HZ; // 100,000 ns
 
 // --------------------------------------------------------------
 // DWT conversion (1008 MHz core clock)
@@ -72,7 +78,7 @@ static constexpr uint32_t DWT_EXPECTED_PER_PPS = 1008000000U;
 //
 // When a hardware interrupt fires (PPS edge, GPT2 output compare),
 // the ARM core saves registers and branches to the vector before
-// the ISR's first instruction executes.  The DWT_CYCCNT read in
+// the ISR's first instruction executes. The DWT_CYCCNT read in
 // the ISR is therefore late by this many DWT cycles.
 //
 // Measured empirically via tdc_analyzer over 23,170 PPS edges
@@ -84,7 +90,7 @@ static constexpr uint32_t DWT_EXPECTED_PER_PPS = 1008000000U;
 //   distribution: uniform across 50-54 (5 clusters, ~20% each)
 //
 // This constant is used to correct ISR-captured DWT values back
-// to the true event moment.  It applies to:
+// to the true event moment. It applies to:
 //   - PPS anchor (dwt_cyccnt_at_pps in TIMEBASE_FRAGMENT)
 //   - TimePop fire (fire_dwt_cyccnt in timepop_ctx_t)
 //   - Any future ISR-captured DWT timestamp (e.g., photon detector)
@@ -102,8 +108,8 @@ static const unsigned long GNSSDO_BAUD     = 38400;
 // --------------------------------------------------------------
 // Laser control pins
 // --------------------------------------------------------------
-static const int LD_ON_PIN = 30;
-static const int LASER_MONITOR_PIN = 20;
+static const int LD_ON_PIN          = 30;
+static const int LASER_MONITOR_PIN  = 20;
 
 // --------------------------------------------------------------
 // Photodiode (TDM split-pin design)
@@ -127,13 +133,13 @@ static const int PHOTODIODE_ANALOG_PIN = 15;
 //
 // GNSS_VCLK_PIN:
 //   10 MHz VCLOCK square wave from GF-8802 (pin 11)
-//   Counted by GPT2 (external clock, CLKSRC=3)
+//   Counted by QTimer1 ch0+ch1 (dual-edge raw counting, 50 ns raw ticks)
 //
 // GNSS_LOCK_PIN:
 //   GNSS lock status (true/false)
 //
 static const int GNSS_PPS_PIN  = 1;
-static const int GNSS_VCLK_PIN = 14;
+static const int GNSS_VCLK_PIN = 10;
 static const int GNSS_LOCK_PIN = 4;
 
 static const int GNSS_PPS_RELAY = 32;
@@ -143,11 +149,11 @@ static const int GNSS_PPS_RELAY = 32;
 // --------------------------------------------------------------
 //
 // OCXO1_10MHZ_PIN:
-//   10 MHz output from OCXO1.
-
+//   10 MHz output from OCXO1, counted by GPT1.
+//
 // OCXO1_CTL_PIN:
 //   PWM output (12-bit + dither) driving OCXO1 CTL input.
-//   Pin 22 = FlexPWM4 Module2.
+//   Pin 22.
 //   0–3.3V for frequency trim.
 //   Positive pull slope: higher voltage = higher frequency.
 //
@@ -164,18 +170,15 @@ static constexpr uint32_t OCXO1_DAC_MAX     = 4095;
 // --------------------------------------------------------------
 //
 // OCXO2_10MHZ_PIN:
-//   10 MHz output from OCXO2, counted by QTimer1 ch0 (external
-//   clock input).  Pin 10 = GPIO_B0_00, IOMUX ALT1.
-//   QTimer1 ch0 (16-bit) cascades into ch1 for 32-bit range.
-//   64-bit extension via delta accumulation in process_clocks.
+//   10 MHz output from OCXO2, counted by GPT2 on pin 14.
 //
 // OCXO2_CTL_PIN:
 //   PWM output (12-bit + dither) driving OCXO2 CTL input.
-//   Pin 11 = FlexPWM1 Module2.
+//   Pin 11.
 //   0–3.3V for frequency trim.
 //   Positive pull slope: higher voltage = higher frequency.
 //
-static const int OCXO2_10MHZ_PIN = 10;
+static const int OCXO2_10MHZ_PIN = 14;
 static const int OCXO2_CTL_PIN   = 11;
 
 // OCXO2 DAC defaults (identical range to OCXO1)
@@ -187,24 +190,20 @@ static constexpr uint32_t OCXO2_DAC_MAX     = 4095;
 // QTimer1 cascade configuration
 // --------------------------------------------------------------
 //
-// QTimer1 is used for OCXO2 10 MHz counting.
+// QTimer1 is used for GNSS VCLOCK counting and compare.
 //
-// ch0: primary counter, clocked by external 10 MHz on pin 10.
-//      16-bit, wraps every 65,536 ticks (~6.5 ms at 10 MHz).
+// ch0: primary external count source on pin 10 (GNSS 10 MHz)
+// ch1: cascaded extension for 32-bit range
+// ch2: TimePop compare doorbell (low-word compare; full 32-bit qualified in software)
+// ch3: reserved for VCLOCK_TEST / historical compare validation
 //
-// ch1: cascade counter, clocked by ch0 overflow.
-//      16-bit, increments on each ch0 rollover.
-//      Combined ch0|ch1 gives 32-bit range (~429 seconds).
-//
-// ch2, ch3: available for further cascade or other use.
+// NOTE:
+//   The raw QTimer count may reflect dual-edge behavior depending on the
+//   configured input mode. Software consuming this domain must account
+//   for that interpretation explicitly.
 //
 // The 32-bit QTimer value is read in the PPS ISR alongside
-// GPT1_CNT, GPT2_CNT, and DWT_CYCCNT.  The read sequence is:
-//   snap = (ch1.CNTR << 16) | ch0.CNTR
-// with ch0 read first to minimize cascade latency.
-//
-// IOMUX setup for pin 10 as QTimer1 ch0 input:
-//   IOMUXC_SW_MUX_CTL_PAD_GPIO_B0_00 = 1;  // ALT1
+// GPT1_CNT, GPT2_CNT, and DWT_CYCCNT.
 //
 static constexpr uint32_t QTIMER1_CH0_BITS = 16;
 static constexpr uint32_t QTIMER1_CH0_MASK = 0xFFFF;
@@ -216,15 +215,19 @@ static constexpr uint32_t QTIMER1_CH0_MASK = 0xFFFF;
 // Domain    Timer           Pin   Clock Source           Resolution
 // -------   -------------   ---   --------------------   ----------
 // DWT       ARM_DWT_CYCCNT   —    CPU core (1008 MHz)    ~1 ns
-// GNSS      GPT2             14   GF-8802 VCLOCK 10 MHz  100 ns
+// GNSS      QTimer1 ch0+1    10   GF-8802 VCLOCK 10 MHz  50 ns raw
 // OCXO1     GPT1             25   AOCJY1-A #1   10 MHz   100 ns
-// OCXO2     QTimer1 ch0+1    10   AOCJY1-A #2   10 MHz   100 ns
+// OCXO2     GPT2             14   AOCJY1-A #2   10 MHz   100 ns
 //
-// All 10 MHz counters free-run continuously.
+// All timing domains free-run continuously.
 // All are captured simultaneously in the PPS ISR.
 // GPT1 and GPT2 are 32-bit native.
 // QTimer1 is 16-bit cascaded to 32-bit.
-// 64-bit extension is via delta accumulation for all three.
+// 64-bit extension is via delta accumulation where needed.
+//
+// GNSS VCLOCK is intentionally hosted on QTimer1 because it is the
+// sovereign clock domain used by TimePop and broader timing semantics.
+// OCXO2 is hosted on GPT2.
 //
 
 // --------------------------------------------------------------
@@ -237,14 +240,14 @@ static constexpr uint32_t QTIMER1_CH0_MASK = 0xFFFF;
 //
 // Overflow results in dropped events (explicitly observable).
 //
-static constexpr size_t EVT_MAX       = 128;
-static constexpr size_t EVT_TYPE_MAX  = 32;
-static constexpr size_t EVT_BODY_MAX  = 512;
+static constexpr size_t EVT_MAX      = 128;
+static constexpr size_t EVT_TYPE_MAX = 32;
+static constexpr size_t EVT_BODY_MAX = 512;
 
 // --------------------------------------------------------------
 // GNSS ingestion limits
 // --------------------------------------------------------------
-static const size_t GNSS_LINE_MAX             = 192;
+static const size_t GNSS_LINE_MAX                = 192;
 static const unsigned long GNSS_SILENCE_FLUSH_MS = 50;
 
 // --------------------------------------------------------------

@@ -4,13 +4,13 @@
 #include <stdbool.h>
 
 // ============================================================================
-// TimePop v5.0 — GPT2 Output Compare Timer System + Nano-Precise DWT Spin
+// TimePop v5.0 — QTimer1 VCLOCK Compare Timer System + Nano-Precise DWT Spin
 // ============================================================================
 //
 // Two delivery modes:
 //
 //   Standard (timepop_arm):
-//     Resolution: 100 ns (one GPT2 tick).
+//     Resolution: 50 ns raw VCLOCK counts (dual-edge QTimer1).
 //     Callbacks execute in scheduled (non-ISR) context.
 //
 //   Nano-precise (timepop_arm_ns):
@@ -39,9 +39,9 @@ static constexpr timepop_handle_t TIMEPOP_INVALID_HANDLE = 0;
 
 typedef struct timepop_ctx_t {
   timepop_handle_t handle;
-  uint32_t         fire_gpt2;       // GPT2_CNT at ISR entry
-  uint32_t         deadline;        // target GPT2 count
-  int32_t          fire_ns;         // (fire_gpt2 - deadline) * 100
+  uint32_t         fire_vclock_raw; // qtimer1_read_32() at ISR entry
+  uint32_t         deadline;        // target QTimer1 raw count
+  int32_t          fire_ns;         // (fire_vclock_raw - deadline) * 50
 
   // ── Nano-precise fields ──
   int64_t          fire_gnss_ns;    // GNSS ns at spin-landed DWT (-1 for standard)
@@ -87,7 +87,7 @@ timepop_handle_t timepop_arm(
 // This eliminates arm-path bias — the target in the slot is exactly
 // the target the caller computed, with no recomputation delay.
 //
-// The GPT2 deadline is derived from the delay (target_ns minus the
+// The QTimer1 raw deadline is derived from the delay (target_ns minus the
 // current GNSS time estimate), backed off by NANO_EARLY_TICKS so
 // the ISR fires early and the DWT spin covers the final stretch.
 //

@@ -61,7 +61,7 @@ struct fragment_store_t {
   volatile int32_t  isr_residual_ocxo2;
   volatile uint32_t dwt_cyccnt_at_pps;
   volatile uint64_t dwt_cycles_per_pps;
-  volatile uint32_t gpt2_at_pps;
+  volatile uint32_t qtimer_at_pps;
   volatile uint32_t seq;
   volatile bool     valid;
 };
@@ -102,7 +102,7 @@ struct fragment_copy_t {
   int32_t  isr_residual_ocxo2;
   uint32_t dwt_cyccnt_at_pps;
   uint64_t dwt_cycles_per_pps;
-  uint32_t gpt2_at_pps;
+  uint32_t qtimer_at_pps;
   bool     valid;
   bool     ok;
 };
@@ -127,7 +127,7 @@ static fragment_copy_t read_fragment(void) {
     f.isr_residual_ocxo2 = frag_store.isr_residual_ocxo2;
     f.dwt_cyccnt_at_pps  = frag_store.dwt_cyccnt_at_pps;
     f.dwt_cycles_per_pps = frag_store.dwt_cycles_per_pps;
-    f.gpt2_at_pps        = frag_store.gpt2_at_pps;
+    f.qtimer_at_pps        = frag_store.qtimer_at_pps;
     f.valid              = frag_store.valid;
 
     dmb();
@@ -479,7 +479,7 @@ void timebase_invalidate(void) {
   frag_store.isr_residual_ocxo2 = 0;
   frag_store.dwt_cyccnt_at_pps  = 0;
   frag_store.dwt_cycles_per_pps = 0;
-  frag_store.gpt2_at_pps        = 0;
+  frag_store.qtimer_at_pps        = 0;
   frag_store.valid              = false;
 
   dmb();
@@ -515,7 +515,9 @@ void on_timebase_fragment(const Payload& payload) {
 
   const uint32_t dwt_cyccnt_at_pps    = payload.getUInt("dwt_cyccnt_at_pps", 0);
   const uint64_t dwt_cycles_per_pps   = payload.getUInt64("dwt_cycles_per_pps", 0);
-  const uint32_t gpt2_at_pps          = payload.getUInt("gpt2_at_pps", 0);
+  const uint32_t qtimer_at_pps          = payload.has("qtimer_at_pps")
+    ? payload.getUInt("qtimer_at_pps", 0)
+    : payload.getUInt("gpt2_at_pps", 0);
   const bool valid = (gnss_ns > 0 && dwt_ns > 0 && ocxo1_ns > 0 && dwt_cycles_per_pps > 0);
 
   frag_store.seq++;
@@ -533,7 +535,7 @@ void on_timebase_fragment(const Payload& payload) {
   frag_store.isr_residual_ocxo2 = isr_ocxo2;
   frag_store.dwt_cyccnt_at_pps  = dwt_cyccnt_at_pps;
   frag_store.dwt_cycles_per_pps = dwt_cycles_per_pps;
-  frag_store.gpt2_at_pps        = gpt2_at_pps;
+  frag_store.qtimer_at_pps        = qtimer_at_pps;
   frag_store.valid              = valid;
 
   dmb();
@@ -551,7 +553,7 @@ void on_timebase_fragment(const Payload& payload) {
   frag_public.isr_residual_ocxo2 = isr_ocxo2;
   frag_public.dwt_cycles_per_pps = dwt_cycles_per_pps;
   frag_public.dwt_cyccnt_at_pps  = dwt_cyccnt_at_pps;
-  frag_public.gpt2_at_pps        = gpt2_at_pps;
+  frag_public.qtimer_at_pps        = qtimer_at_pps;
   frag_public.valid              = valid;
 }
 

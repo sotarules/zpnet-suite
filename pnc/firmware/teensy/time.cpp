@@ -75,7 +75,7 @@ struct time_anchor_t {
   volatile uint32_t seq;              // seqlock sequence number
   volatile uint32_t dwt_at_pps;       // DWT_CYCCNT at most recent PPS edge
   volatile uint32_t dwt_cycles_per_s; // DWT cycles in the prior GNSS second
-  volatile uint32_t gpt2_at_pps;      // GPT2_CNT at most recent PPS edge
+  volatile uint32_t qtimer_at_pps;      // QTimer1 raw counter at most recent PPS edge
   volatile uint32_t pps_count;        // PPS edges seen (1 = first PPS, 2 = first complete second)
   volatile bool     valid;            // true after second PPS (rate available)
 };
@@ -94,7 +94,7 @@ static inline void dmb(void) {
 // Writer — called from PPS callback in process_clocks_alpha.cpp
 // ============================================================================
 
-void time_pps_update(uint32_t dwt_at_pps, uint32_t dwt_cycles_per_s, uint32_t gpt2_at_pps) {
+void time_pps_update(uint32_t dwt_at_pps, uint32_t dwt_cycles_per_s, uint32_t qtimer_at_pps) {
 
   anchor.seq++;
   dmb();
@@ -102,12 +102,12 @@ void time_pps_update(uint32_t dwt_at_pps, uint32_t dwt_cycles_per_s, uint32_t gp
   if (!anchor.valid && anchor.pps_count == 0) {
     anchor.dwt_at_pps       = dwt_at_pps;
     anchor.dwt_cycles_per_s = 0;
-    anchor.gpt2_at_pps      = gpt2_at_pps;
+    anchor.qtimer_at_pps      = qtimer_at_pps;
     anchor.pps_count        = 1;
   } else {
     anchor.dwt_at_pps       = dwt_at_pps;
     anchor.dwt_cycles_per_s = dwt_cycles_per_s;
-    anchor.gpt2_at_pps      = gpt2_at_pps;
+    anchor.qtimer_at_pps      = qtimer_at_pps;
     anchor.pps_count++;
 
     if (dwt_cycles_per_s > 0) {
@@ -126,7 +126,7 @@ void time_pps_update(uint32_t dwt_at_pps, uint32_t dwt_cycles_per_s, uint32_t gp
 struct time_snapshot_t {
   uint32_t dwt_at_pps;
   uint32_t dwt_cycles_per_s;
-  uint32_t gpt2_at_pps;
+  uint32_t qtimer_at_pps;
   uint32_t pps_count;
   bool     valid;
   bool     ok;
@@ -142,7 +142,7 @@ static time_snapshot_t read_anchor(void) {
 
     s.dwt_at_pps       = anchor.dwt_at_pps;
     s.dwt_cycles_per_s = anchor.dwt_cycles_per_s;
-    s.gpt2_at_pps      = anchor.gpt2_at_pps;
+    s.qtimer_at_pps      = anchor.qtimer_at_pps;
     s.pps_count        = anchor.pps_count;
     s.valid            = anchor.valid;
 
@@ -167,7 +167,7 @@ time_anchor_snapshot_t time_anchor_snapshot(void) {
   time_anchor_snapshot_t pub = {};
   pub.dwt_at_pps       = s.dwt_at_pps;
   pub.dwt_cycles_per_s = s.dwt_cycles_per_s;
-  pub.gpt2_at_pps      = s.gpt2_at_pps;
+  pub.qtimer_at_pps      = s.qtimer_at_pps;
   pub.pps_count        = s.pps_count;
   pub.valid            = s.valid;
   pub.ok               = s.ok;

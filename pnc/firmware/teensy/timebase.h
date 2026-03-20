@@ -131,7 +131,7 @@ struct timebase_fragment_t {
   volatile int32_t  isr_residual_ocxo2;
   volatile uint64_t dwt_cycles_per_pps;
   volatile uint32_t dwt_cyccnt_at_pps;
-  volatile uint32_t gpt2_at_pps;
+  volatile uint32_t qtimer_at_pps;
   volatile bool     valid;
 };
 
