@@ -408,9 +408,11 @@ static void arm_qtimer1_external(void) {
   IMXRT_TMR1.CH[0].CTRL = TMR_CTRL_CM(2) | TMR_CTRL_PCS(0);
   IMXRT_TMR1.CH[1].CTRL = TMR_CTRL_CM(7);
 
-  // Defensive cleanup for VCLOCK_TEST compare path on channel 0 low-word compare.
-  IMXRT_TMR1.CH[0].CSCTRL &= ~TMR_CSCTRL_TCF1EN;  // disable compare interrupt
-  IMXRT_TMR1.CH[0].CSCTRL |=  TMR_CSCTRL_TCF1;    // clear pending compare flag if W1C
+  // CH0 and CH1 are passive counter channels only. Production TimePop compare
+  // uses CH2, and VCLOCK_TEST history/forensics may use CH3. Keep CH0 compare
+  // interrupts disabled permanently so the 32-bit counter path remains sovereign.
+  IMXRT_TMR1.CH[0].CSCTRL &= ~TMR_CSCTRL_TCF1EN;
+  IMXRT_TMR1.CH[0].CSCTRL |=  TMR_CSCTRL_TCF1;
 
   // CH1 is cascade-only — silence its compare and overflow alarms permanently.
   IMXRT_TMR1.CH[1].CSCTRL = 0;
@@ -535,7 +537,7 @@ static void pps_asap_callback(timepop_ctx_t*, void*) {
   time_pps_update(
     isr_snap_dwt - ISR_ENTRY_DWT_CYCLES,
     g_dwt_cal_valid ? g_dwt_cycles_per_gnss_s : 0,
-    isr_snap_ocxo2
+    isr_snap_gnss
   );
 
   // ── Spin capture: complete the current capture, arm the next ──

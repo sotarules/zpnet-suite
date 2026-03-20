@@ -1,7 +1,7 @@
 #pragma once
 
 // ============================================================================
-// TimePop v5.3a — Process Interface
+// TimePop v6.0 — Process Interface
 // ============================================================================
 //
 // System initialization and process registration only.
@@ -13,7 +13,7 @@
 //   TEST   — timer accuracy verification { "ns": <uint64> }
 //   NS_TEST — nano-precise timer accuracy test
 //   INTERP_TEST — dual-path validation (legacy, pending removal)
-//   VCLOCK_TEST — direct QTimer3 CH3 compare interrupt validation
+//   VCLOCK_TEST — historical direct compare validation (retained)
 //
 // v5.3a: Added IOMUXC_QTIMER3_TIMER3_SELECT_INPUT daisy chain register.
 //
@@ -50,9 +50,9 @@
 #include "timepop.h"
 #include <stdint.h>
 
-/// Initialize TimePop hardware (GPT2 output compare + QTimer3 CH3 VCLOCK
-/// doorbell on pin 15).  GPT2 and QTimer1 must already be running
-/// (process_clocks_init_hardware).  Must be called once during setup().
+/// Initialize TimePop hardware (QTimer1 CH2 production compare + CH3
+/// historical VCLOCK_TEST doorbell). QTimer1 must already be running
+/// (process_clocks_init_hardware). Must be called once during setup().
 void timepop_init(void);
 
 /// Register the TIMEPOP process with the command framework.

@@ -54,28 +54,25 @@ IO24 (GPIO24)     Orange        SCL2               Rail SCL2 (Orange)           
 
 
 /*=============================================================================
- (2) TEENSY 4.1 PIN ASSIGNMENTS — v14 Symmetric GPT Architecture
+ (2) TEENSY 4.1 PIN ASSIGNMENTS — v15 Symmetric Production Clock Architecture
 -------------------------------------------------------------------------------
 
-v14 CHANGES (from v13):
-  • OCXO1 back to GPT1 (pin 25).  QTimer2/4 proved unusable:
-    - QTimer2 ch0 = pin 13 = LED_BUILTIN (conflict)
-    - QTimer2 ch1-3: no accessible pins on Teensy 4.1
-    - QTimer4: all channels route through XBAR, no direct pin access
-  • OCXO2 moved from QTimer1 ch0 (pin 10) to GPT2 (pin 14).
-    QTimer CM(2) dual-edge counting produced ±15,000 count alternation
-    per second due to phase aliasing at PPS boundaries.
-  • GNSS VCLOCK moved from GPT2 (pin 14) to QTimer1 ch0 (pin 10).
-    Dual-edge alternation is harmless — GNSS time = PPS count.
-  • Both OCXOs now have symmetric single-edge GPT counting.
+v15 CHANGES (from v14):
+  • GNSS moved fully onto QTimer1 production ownership.
+  • QTimer1 ch0 + ch1 form the cascaded 32-bit GNSS raw counter on pin 10.
+  • QTimer1 ch2 is reserved as the GNSS TimePop compare / interrupt channel.
+  • OCXO1 remains on GPT1 (pin 25).
+  • OCXO2 remains on GPT2 (pin 14).
+  • Clock ownership is now symmetric: GPT1 = OCXO1, GPT2 = OCXO2,
+    QTimer1 = GNSS.
 
 Teensy Pin    Wire Color    Signal Name        Source / Destination                 Notes
 ------------------------------------------------------------------------------------------
 VIN           White         VIN_5V5            INA260 (5.5 V rail)                  Dedicated 5V+ CPU power
 GND           Black         GND                Battery branching ground             Direct return to battery
-1             Twisted Pair  GNSS_PPS_IN        GNSS PPS                             1 Hz absolute time reference
-4             Green         GNSS_LOCK_IN       GF-8802                              Lock status signal
-10            Twisted Pair  GNSS_VCLOCK        GF-8802 BCLOCK                       10 MHz reference (QTimer1 ch0+ch1)
+1             Twisted Pair  GNSS_PPS_IN        GF-8802 PPS                          1 Hz absolute time reference
+4             Green         GNSS_LOCK_IN       GF-8802 LOCK                         Lock status signal
+10            Twisted Pair  GNSS_10MHZ_IN      GF-8802 VCLOCK                       10 MHz reference (QTimer1 ch0+ch1 counter)
 14            Twisted Pair  OCXO2_10MHZ_IN     OCXO2                                GPT2 external clock
 25            Twisted Pair  OCXO1_10MHZ_IN     OCXO1                                GPT1 external clock
 22            Green         OCXO1_CTL          OCXO1 CTL                            PWM 12-bit + dither
@@ -94,13 +91,16 @@ Unassigned pins (available for future use):
 
 Timer hardware binding summary:
 
-  Pin 25  →  GPT1 external clock   (OCXO1 10 MHz, single-edge, 32-bit)
-  Pin 14  →  GPT2 external clock   (OCXO2 10 MHz, single-edge, 32-bit)
-  Pin 10  →  QTimer1 ch0+ch1       (GNSS VCLOCK, dual-edge 20 MHz raw, cascaded 32-bit)
-  Pin 22  →  FlexPWM4 Module0      (OCXO1 CTL, analogWrite 12-bit + dither)
-  Pin 11  →  FlexPWM1 Module2      (OCXO2 CTL, analogWrite 12-bit + dither)
+  Pin 25  →  GPT1 external clock        (OCXO1 10 MHz, single-edge, 32-bit)
+  Pin 14  →  GPT2 external clock        (OCXO2 10 MHz, single-edge, 32-bit)
+  Pin 10  →  QTimer1 ch0+ch1 counter    (GNSS 10 MHz input, cascaded 32-bit)
+  Pin 10  →  QTimer1 ch2 compare        (GNSS TimePop compare / interrupt path)
+  Pin 22  →  FlexPWM4 Module0           (OCXO1 CTL, analogWrite 12-bit + dither)
+  Pin 11  →  FlexPWM1 Module2           (OCXO2 CTL, analogWrite 12-bit + dither)
 
 Notes:
+• QTimer1 ch2 compare matches only the low 16 bits in hardware; production
+  TimePop qualifies the full 32-bit target in software before firing.
 • Pin 13 (LED_BUILTIN) reserved for fault Morse annunciator.
 • STP shield drains at source end.
 =============================================================================*/
@@ -110,13 +110,13 @@ Notes:
  (3) TIMING SIGNAL WIRING SUMMARY
 -------------------------------------------------------------------------------
 
-Signal Name          Source          Destination       Frequency    Timer HW           Shield Drain
-----------------------------------------------------------------------------------------------------
-GNSS_PPS_IN          GF-8802 P17     Teensy pin 1      1 Hz         GPIO IRQ           GF-8802 end
-GNSS_VCLOCK          GF-8802 P11     Teensy pin 10     10 MHz       QTimer1 ch0+ch1    GF-8802 end
-OCXO1_10MHZ_IN       OCXO1           Teensy pin 25     10 MHz       GPT1               OCXO1 end
-OCXO2_10MHZ_IN       OCXO2           Teensy pin 14     10 MHz       GPT2               OCXO2 end
-GNSS_PPS_RELAY       Teensy pin 32   Pi GPIO18/25      1 Hz         —                  Teensy end
+Signal Name          Source          Destination       Frequency    Timer HW                 Shield Drain
+----------------------------------------------------------------------------------------------------------
+GNSS_PPS_IN          GF-8802 P17     Teensy pin 1      1 Hz         GPIO IRQ                 GF-8802 end
+GNSS_10MHZ_IN        GF-8802 P11     Teensy pin 10     10 MHz       QTimer1 ch0+ch1 (+ ch2)  GF-8802 end
+OCXO1_10MHZ_IN       OCXO1           Teensy pin 25     10 MHz       GPT1                     OCXO1 end
+OCXO2_10MHZ_IN       OCXO2           Teensy pin 14     10 MHz       GPT2                     OCXO2 end
+GNSS_PPS_RELAY       Teensy pin 32   Pi GPIO18/25      1 Hz         —                        Teensy end
 =============================================================================*/
 
 
@@ -166,7 +166,7 @@ Pin #    Signal Name        Wire Color    Connected To        Destination     No
 9        VCC In            Purple        Backplane           +3V3           Logic power
 17       PPS Output        Orange        Teensy              Pin 1          Primary PPS
 15       LOCK Signal       Green         Teensy              Pin 4          Lock status
-11       VCLOCK Out        Twisted Pair  Teensy              Pin 10         10 MHz (QTimer1)
+11       BCLOCK Out        Twisted Pair  Teensy              Pin 10         10 MHz (QTimer1 counter + compare base)
 13       Serial Out (TX)   Blue          Raspberry Pi        RXD            GNSS → Pi
 12       Serial In (RX)    Yellow        Raspberry Pi        TXD            Pi → GNSS
 
@@ -208,7 +208,7 @@ EV5491        0x66      Fixed      Fixed      Laser controller (I2C)
 
 GPT1, 32-bit, single-edge.  Shield drain at OCXO1 end.
 History: GPT1/pin25 → QTimer2/pin13 (LED conflict) → QTimer4/pin6
-(XBAR, no direct access) → GPT1/pin25 (v14, final).
+(XBAR, no direct access) → GPT1/pin25 (final).
 =============================================================================*/
 
 /*=============================================================================
@@ -220,20 +220,36 @@ History: GPT1/pin25 → QTimer2/pin13 (LED conflict) → QTimer4/pin6
   Power          →  Dedicated 5V domain
 
 GPT2, 32-bit, single-edge.  Symmetric with OCXO1.  Shield drain at OCXO2 end.
-Previously QTimer1/pin10 — moved to GPT2 in v14 to eliminate ±15,000 count
-dual-edge phase aliasing artifact.
+Previously QTimer1/pin10 — moved to GPT2 to eliminate ±15,000 count
+phase aliasing artifacts from the earlier dual-edge OCXO experiment.
 =============================================================================*/
 
 /*=============================================================================
- (11) CLOCK DOMAIN SUMMARY — v14
+ (11) GNSS 10 MHz — GF-8802 BCLOCK
 -------------------------------------------------------------------------------
 
-Domain     Source             Timer HW            Pin    Counting
+  10 MHz output  →  Teensy pin 10 (QTimer1) via STP
+  PPS output     →  Teensy pin 1
+  Lock signal    →  Teensy pin 4
+
+QTimer1 owns GNSS timing in production:
+  • ch0 + ch1 = cascaded 32-bit counter
+  • ch2       = TimePop compare / interrupt channel
+
+GNSS scheduling is therefore performed directly against the GNSS counter base,
+with low-word hardware compare and full 32-bit software qualification.
+=============================================================================*/
+
+/*=============================================================================
+ (12) CLOCK DOMAIN SUMMARY — v15
+-------------------------------------------------------------------------------
+
+Domain     Source             Timer HW                 Pin    Counting
 ---------------------------------------------------------------------------
-DWT        ARM Cortex-M7      DWT_CYCCNT           —     1008 MHz
-GNSS       GF-8802 VCLOCK     QTimer1 ch0+ch1      10    dual-edge (20 MHz raw)
-OCXO1      AOCJY1-A           GPT1                 25    single-edge (10 MHz)
-OCXO2      AOCJY1-A           GPT2                 14    single-edge (10 MHz)
+DWT        ARM Cortex-M7      DWT_CYCCNT                —     1008 MHz
+GNSS       GF-8802 BCLOCK     QTimer1 ch0+ch1 (+ ch2)   10    counter + compare path
+OCXO1      AOCJY1-A           GPT1                      25    single-edge (10 MHz)
+OCXO2      AOCJY1-A           GPT2                      14    single-edge (10 MHz)
 
 PPS ISR capture order: DWT → GPT1 → GPT2 → QTimer1.
 GNSS time = campaign_seconds × 1,000,000,000 (PPS-derived, exact).

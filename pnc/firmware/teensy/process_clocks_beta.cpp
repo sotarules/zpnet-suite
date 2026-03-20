@@ -618,6 +618,7 @@ void clocks_beta_pps(void) {
     p.add("teensy_pps_count", campaign_seconds);
     p.add("gnss_lock",        digitalRead(GNSS_LOCK_PIN));
     p.add("dwt_cyccnt_at_pps", (uint32_t)dwt_raw_at_pps);
+    p.add("qtimer_at_pps",    (uint32_t)isr_snap_gnss);
     p.add("gpt2_at_pps",      (uint32_t)isr_snap_ocxo2);
 
     p.add("dwt_cycles_per_pps", (uint64_t)dwt_cycles_per_pps_snapshot);
@@ -1098,13 +1099,9 @@ static Payload cmd_clocks_info(const Payload&) {
 // ============================================================================
 // INTERP_TEST — uses DWT interpolation against GNSS tick position
 //
-// NOTE: gpt2_at_pps is now OCXO2 (not GNSS). INTERP_TEST still works
-// because it reads GPT2_CNT for VCLOCK position — but wait, GPT2 is
-// now OCXO2.  We need to use QTimer1 for GNSS position.
-//
-// For now, INTERP_TEST uses the campaign GNSS ticks from the timebase
-// fragment (which are PPS-derived and exact) plus QTimer1 for intra-
-// second GNSS position.
+// NOTE: qtimer_at_pps is the authoritative GNSS VCLOCK PPS snapshot.
+// INTERP_TEST uses the campaign GNSS ticks from the timebase fragment
+// plus QTimer1 raw position for intra-second GNSS ground truth.
 // ============================================================================
 
 static Payload cmd_interp_test(const Payload& args) {

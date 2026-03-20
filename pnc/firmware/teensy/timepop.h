@@ -62,7 +62,7 @@ typedef void (*timepop_callback_t)(
 );
 
 // ============================================================================
-// Arm a standard timer (100 ns resolution, scheduled context)
+// Arm a standard timer (50 ns raw resolution, scheduled context)
 // ============================================================================
 
 timepop_handle_t timepop_arm(
