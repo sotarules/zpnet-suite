@@ -1,38 +1,33 @@
 // ============================================================================
-// process_timepop.cpp — TimePop v5.0 (Continuous DWT + GNSS Validation)
+// process_timepop.cpp — TimePop v5.4 (QTimer1 CH3 VCLOCK_TEST — internal routing)
 // ============================================================================
 //
-// The time experience in ZPNet is the GNSS clock.
+// v5.4: VCLOCK_TEST doorbell migrated to QTimer1 CH3 via internal PCS routing.
 //
+//   No external wire, no second pin, no IOMUX.  QTimer1 CH3 counts both
+//   edges of Counter 0's input pin (GNSS 10 MHz on pin 10) using:
+//     CM=2 (count rising AND falling edges of primary source)
+//     PCS=0 (primary clock source = Counter 0's input pin)
+//
+//   This was validated in v5.3a by running QTimer1 CH3 and QTimer3 CH3
+//   (on pin 15 via Kynar bridge) simultaneously.  Both counters tracked
+//   identically, confirming the internal PCS routing delivers the same
+//   GNSS signal without a physical connection.
+//
+//   IRQ_QTIMER1 is shared across all four channels.  The ISR checks
+//   only CH3's TCF1 flag and returns immediately otherwise.  CH0 and
+//   CH1 CSCTRL registers are NEVER touched by the ISR — they have no
+//   TCF1EN set and generate no compare interrupts.
+//
+//   Pin assignment:
+//     Pin 10 (GPIO_B0_00, ALT1) — QTimer1 CH0+CH1 — passive 32-bit counting
+//     QTimer1 CH3              — compare doorbell (internal PCS from CH0 pin)
+//
+// v5.3a: QTimer3 CH3 on pin 15 + daisy chain (validated, then superseded).
+// v5.3: QTimer3 CH3 on pin 15 (missing daisy chain — counter stayed at zero).
+// v5.2: QTimer1 CH3 via SCS (wrong clock source — CM=1/SCS=0 got IPBus).
+// v5.1: QTimer1 CH2 via XBAR (superseded — XBAR has no QTimer1 inputs).
 // v5.0: Continuous DWT prediction and GNSS-now validation.
-//
-//   Every standard timer dispatch now produces two residual measurements:
-//
-//   1. DWT Prediction Residual:
-//      At arm time, each slot computes a predicted DWT_CYCCNT for its
-//      deadline using the time.h anchor.  When the ISR fires,
-//      the very first instruction captures the actual DWT_CYCCNT.
-//      The residual (actual - predicted) feeds into a global Welford
-//      accumulator.  This directly measures how well we predict the
-//      DWT cycle count at interrupt time.
-//
-//   2. GNSS-now Residual:
-//      At ISR fire time, we know the exact GNSS nanosecond from the
-//      VCLOCK position: (pps-1)*1e9 + (fire_gpt2 - gpt2_at_pps) * 100.
-//      We also compute the GNSS nanosecond by feeding the captured
-//      DWT_CYCCNT into time_dwt_to_gnss_ns().  The residual between
-//      these two values feeds into a second Welford accumulator.
-//      This is the end-to-end test: can we derive GNSS time from a
-//      DWT cycle count with < 3ns stddev?
-//
-//   Both accumulators are global (not per-slot) and accumulate across
-//   all standard timer dispatches — thousands per second.
-//
-//   New command: DIAG — dumps the full Welford state for both
-//   accumulators plus recent sample forensics.
-//
-//   The standard REPORT now includes predicted_dwt per timer slot.
-//
 // v4.3: Comprehensive forensic diagnostics.
 // v4.2: Caller-owns-target for nano-precise timers.
 // v4.1: NS_TEST full forensics.
@@ -45,6 +40,8 @@
 #include "timepop.h"
 #include "process_timepop.h"
 #include "process_clocks_internal.h"
+
+#include "publish.h"
 
 #include "debug.h"
 #include "process.h"
@@ -195,6 +192,17 @@ static welford_t welford_gnss_now       = {};
 static volatile uint32_t diag_prediction_samples = 0;
 static volatile uint32_t diag_prediction_skipped = 0;
 
+static volatile uint32_t diag_vclock_candidate_irqs = 0;
+static volatile uint32_t diag_vclock_early_rejects   = 0;
+
+// ============================================================================
+// VCLOCK_TEST forward declarations
+// ============================================================================
+
+static inline void vclock_test_disable_compare(void);
+static void emit_deferred_vclock_test(void);
+static void qtimer1_ch3_doorbell_isr(void);
+
 // ============================================================================
 // Slot counting helper (called with interrupts disabled)
 // ============================================================================
@@ -232,18 +240,6 @@ static inline uint32_t ns_to_ticks(uint64_t ns) {
 
 // ============================================================================
 // DWT prediction helper
-//
-// Given a GPT2 deadline and a time.h anchor snapshot, predict the
-// DWT_CYCCNT value that will be observed when GPT2_CNT reaches
-// the deadline.
-//
-// The math:
-//   gpt2_elapsed = deadline - anchor.gpt2_at_pps   (GPT2 ticks since PPS)
-//   ns_elapsed   = gpt2_elapsed * 100              (each GPT2 tick = 100ns)
-//   dwt_elapsed  = ns_elapsed * dwt_cycles_per_s / 1,000,000,000
-//   predicted    = anchor.dwt_at_pps + dwt_elapsed
-//
-// Returns 0 with valid=false if anchor is not available.
 // ============================================================================
 
 static uint32_t predict_dwt_at_deadline(uint32_t deadline, bool& valid) {
@@ -355,8 +351,6 @@ static void gpt2_compare_isr(void) {
     if (!slots[i].active || slots[i].expired) continue;
     if (!deadline_expired(slots[i].deadline, now)) continue;
 
-    // ── Nano-precise: spin to exact DWT target, fire callback in ISR ──
-
     if (slots[i].nano_precise) {
       const uint32_t target_dwt = slots[i].target_dwt;
       uint32_t spin_start = ARM_DWT_CYCCNT;
@@ -392,8 +386,6 @@ static void gpt2_compare_isr(void) {
       continue;
     }
 
-    // ── Standard: snapshot and defer to dispatch ──
-
     slot_capture(slots[i], now, dwt_now, anchor);
     slots[i].expired = true;
     expired_count++;
@@ -407,6 +399,13 @@ static void gpt2_compare_isr(void) {
 // Initialization
 // ============================================================================
 
+static volatile bool vclock_test_in_flight    = false;
+static volatile bool vclock_test_irq_armed    = false;
+static volatile bool vclock_test_result_ready = false;
+static Payload       vclock_test_result_ev;
+
+static void vclock_test_init_qtimer1_ch3(void);
+
 void timepop_init(void) {
   for (uint32_t i = 0; i < MAX_SLOTS; i++) slots[i] = {};
 
@@ -419,10 +418,21 @@ void timepop_init(void) {
   attachInterruptVector(IRQ_GPT2, gpt2_compare_isr);
   NVIC_SET_PRIORITY(IRQ_GPT2, 16);
   NVIC_ENABLE_IRQ(IRQ_GPT2);
+
+  vclock_test_in_flight    = false;
+  vclock_test_irq_armed    = false;
+  vclock_test_result_ready = false;
+  vclock_test_disable_compare();
+
+  attachInterruptVector(IRQ_QTIMER1, qtimer1_ch3_doorbell_isr);
+  NVIC_SET_PRIORITY(IRQ_QTIMER1, 16);
+  NVIC_ENABLE_IRQ(IRQ_QTIMER1);
+
+  vclock_test_init_qtimer1_ch3();
 }
 
 // ============================================================================
-// Arm — standard (100 ns resolution, scheduled context)
+// Arm — standard
 // ============================================================================
 
 timepop_handle_t timepop_arm(
@@ -469,7 +479,6 @@ timepop_handle_t timepop_arm(
     } else {
       slots[i].deadline = gpt2_count() + ticks;
 
-      // ── v5.0: Compute DWT prediction at arm time ──
       slots[i].predicted_dwt = predict_dwt_at_deadline(
         slots[i].deadline, slots[i].prediction_valid);
 
@@ -482,7 +491,6 @@ timepop_handle_t timepop_arm(
     return h;
   }
 
-  // All slots full
   diag_arm_failures++;
   if (is_asap) diag_asap_arm_failures++;
 
@@ -491,10 +499,7 @@ timepop_handle_t timepop_arm(
 }
 
 // ============================================================================
-// Arm — nano-precise (~5 ns resolution, ISR context)
-//
-// Caller owns the target computation.  No internal time_gnss_ns_now()
-// or time_gnss_ns_to_dwt() — the target goes straight into the slot.
+// Arm — nano-precise
 // ============================================================================
 
 timepop_handle_t timepop_arm_ns(
@@ -547,7 +552,6 @@ timepop_handle_t timepop_arm_ns(
     slots[i].nano_timeout   = false;
     slots[i].deadline       = gpt2_deadline;
 
-    // Nano-precise slots use target_dwt as the prediction.
     slots[i].predicted_dwt    = target_dwt;
     slots[i].prediction_valid = true;
 
@@ -620,17 +624,7 @@ static void emit_deferred_ns_test(void) {
 }
 
 // ============================================================================
-// Slot-level Welford update — shared by all dispatch cases
-//
-// Given a slot with a captured DWT and fragment data, computes:
-//   1. DWT prediction residual (captured vs predicted)
-//   2. GNSS-now residual (time_dwt_to_gnss_ns vs VCLOCK ground truth)
-// and feeds both into the global Welford accumulators.
-//
-// Both sides of the GNSS residual use the time.h coordinate system:
-//   local GNSS ns = (pps_count - 1) * 1e9 + ns_into_second
-// where pps_count comes from time_pps_count() and ns_into_second
-// comes from the VCLOCK (GPT2) position relative to the PPS anchor.
+// Slot-level Welford update
 // ============================================================================
 
 static void slot_welford_update(const timepop_slot_t& slot) {
@@ -647,31 +641,15 @@ static void slot_welford_update(const timepop_slot_t& slot) {
     return;
   }
 
-  // DWT residual: captured DWT vs predicted DWT
   const int32_t dwt_residual =
     (int32_t)(slot.fire_dwt_cyccnt - slot.predicted_dwt);
   welford_dwt_prediction.update((int64_t)dwt_residual);
 
-  // GNSS residual: DWT-derived GNSS ns vs VCLOCK-derived GNSS ns
-  //
-  // Both sides use the SAME anchor captured in the ISR.
-  // This eliminates PPS-boundary skew between ISR and dispatch.
-  //
-  // VCLOCK path (ground truth):
-  //   gpt2_since_pps = fire_gpt2 - anchor_gpt2_at_pps
-  //   vclock_gnss_ns = (pps - 1) * 1e9 + gpt2_since_pps * 100
-  //
-  // DWT path (test):
-  //   dwt_elapsed = fire_dwt_cyccnt - anchor_dwt_at_pps
-  //   dwt_gnss_ns = (pps - 1) * 1e9 + dwt_elapsed * 1e9 / dwt_cycles_per_s
-
   const int64_t epoch_ns = (int64_t)(pps - 1) * (int64_t)1000000000LL;
 
-  // VCLOCK ground truth
   const uint32_t gpt2_since_pps = slot.fire_gpt2 - slot.anchor_gpt2_at_pps;
   const int64_t vclock_gnss_ns = epoch_ns + (int64_t)((uint64_t)gpt2_since_pps * 100ULL);
 
-  // DWT interpolation (same math as time_dwt_to_gnss_ns, but using slot anchor)
   const uint32_t dwt_elapsed = slot.fire_dwt_cyccnt - slot.anchor_dwt_at_pps;
   const uint64_t dwt_ns_into_second =
     ((uint64_t)dwt_elapsed * 1000000000ULL + (uint64_t)slot.anchor_dwt_cycles_per_s / 2)
@@ -684,21 +662,13 @@ static void slot_welford_update(const timepop_slot_t& slot) {
 }
 
 // ============================================================================
-// Dispatch (scheduled context)
-//
-// v5.0: Processes ALL expired slots in three monolithic cases.
-//
-// Each case is self-contained: callback, Welford, lifecycle.
-// No shared conditional branches.  Read any one case top-to-bottom.
-//
-//   ASAP:         fire callback, skip Welford, deactivate.
-//   Nano-precise: callback already fired in ISR, Welford, deactivate.
-//   Standard:     fire callback, Welford, re-arm or deactivate.
+// Dispatch
 // ============================================================================
 
 void timepop_dispatch(void) {
 
   emit_deferred_ns_test();
+  emit_deferred_vclock_test();
 
   if (!timepop_pending) return;
   timepop_pending = false;
@@ -710,10 +680,7 @@ void timepop_dispatch(void) {
 
     slots[i].expired = false;
 
-    // ================================================================
-    // Case 1: ASAP — one-shot, no deadline, no prediction
-    // ================================================================
-
+    // ── ASAP ──
     if (!slots[i].nano_precise &&
         slots[i].period_ns == 0 && !slots[i].recurring) {
 
@@ -737,10 +704,7 @@ void timepop_dispatch(void) {
       continue;
     }
 
-    // ================================================================
-    // Case 2: Nano-precise — callback already fired in ISR
-    // ================================================================
-
+    // ── Nano-precise ──
     if (slots[i].nano_precise) {
 
       if (!slots[i].nano_timeout) {
@@ -756,11 +720,7 @@ void timepop_dispatch(void) {
       continue;
     }
 
-    // ================================================================
-    // Case 3: Standard — fire callback, Welford, re-arm or deactivate
-    // ================================================================
-
-    // ── Callback ──
+    // ── Standard ──
 
     timepop_ctx_t ctx;
     slot_build_ctx(slots[i], ctx);
@@ -772,11 +732,7 @@ void timepop_dispatch(void) {
     cpu_usage_account_busy(end - start);
     diag_dispatch_callbacks++;
 
-    // ── Welford: DWT prediction + GNSS-now ──
-
     slot_welford_update(slots[i]);
-
-    // ── Lifecycle: re-arm recurring or deactivate one-shot ──
 
     if (slots[i].recurring) {
       if (slots[i].period_ticks == 0) {
@@ -817,7 +773,7 @@ uint32_t timepop_active_count(void) {
 }
 
 // ============================================================================
-// TEST command — standard timer accuracy via time.h
+// TEST command
 // ============================================================================
 
 struct test_context_t {
@@ -886,7 +842,7 @@ static Payload cmd_test(const Payload& args) {
 }
 
 // ============================================================================
-// NS_TEST — nano-precise timer accuracy test (full forensics)
+// NS_TEST — nano-precise timer accuracy test
 // ============================================================================
 
 struct ns_test_context_t {
@@ -971,7 +927,7 @@ static Payload cmd_ns_test(const Payload& args) {
 }
 
 // ============================================================================
-// INTERP_TEST — dual-path validation (unchanged from v3.1, pending removal)
+// INTERP_TEST
 // ============================================================================
 
 struct interp_test_ctx_t {
@@ -1001,8 +957,6 @@ static void interp_test_arm_next(void) {
 
 static void interp_test_callback(timepop_ctx_t* ctx, void*) {
 
-  // Path 1 disabled — fragment fields removed from timepop_ctx_t.
-  // Pending full removal of INTERP_TEST.
   bool path1_valid = false;
   int64_t path1_error_ns = 0;
   uint64_t vclock_ns_into_second = 0;
@@ -1110,13 +1064,11 @@ static Payload cmd_report(const Payload&) {
   out.add("nano_spins",        nano_spin_count);
   out.add("nano_timeouts",     nano_timeout_count);
 
-  // ── v4.3: Slot pressure ──
   out.add("slots_active_now",  timepop_active_count());
   out.add("slots_high_water",  diag_slots_high_water);
   out.add("slots_max",         (uint32_t)MAX_SLOTS);
   out.add("arm_failures",      diag_arm_failures);
 
-  // ── v4.3: ASAP tracking ──
   out.add("asap_armed",             diag_asap_armed);
   out.add("asap_dispatched",        diag_asap_dispatched);
   out.add("asap_arm_failures",      diag_asap_arm_failures);
@@ -1124,15 +1076,22 @@ static Payload cmd_report(const Payload&) {
   out.add("asap_last_dispatch_dwt", diag_asap_last_dispatch_dwt);
   out.add("asap_last_armed_name", (const char*)(diag_asap_last_armed_name ? diag_asap_last_armed_name : ""));
 
-  // ── v4.3: Dispatch health ──
   out.add("dispatch_calls",     diag_dispatch_calls);
   out.add("dispatch_callbacks", diag_dispatch_callbacks);
 
-  // ── v5.0: Validation summary (top-level) ──
   out.add("dwt_pred_n",       (int32_t)welford_dwt_prediction.n);
   out.add("dwt_pred_stddev",  welford_dwt_prediction.stddev());
   out.add("gnss_now_n",       (int32_t)welford_gnss_now.n);
   out.add("gnss_now_stddev",  welford_gnss_now.stddev());
+
+  out.add("vclock_test_in_flight",    vclock_test_in_flight);
+  out.add("vclock_test_result_ready", vclock_test_result_ready);
+  out.add("vclock_candidate_irqs", diag_vclock_candidate_irqs);
+  out.add("vclock_early_rejects",  diag_vclock_early_rejects);
+
+  // QTimer1 CH3 doorbell diagnostics (internal PCS routing from CH0 pin)
+  out.add("qtmr1_ch3_cntr",   (uint32_t)IMXRT_TMR1.CH[3].CNTR);
+  out.add("qtmr1_ch3_csctrl", (uint32_t)IMXRT_TMR1.CH[3].CSCTRL);
 
   PayloadArray timers;
   for (uint32_t i = 0; i < MAX_SLOTS; i++) {
@@ -1147,11 +1106,8 @@ static Payload cmd_report(const Payload&) {
     entry.add("recurring", slots[i].recurring);
     entry.add("nano",      slots[i].nano_precise);
     entry.add("expired",   slots[i].expired);
-
-    // ── v5.0: Per-slot prediction ──
     entry.add("predicted_dwt",    slots[i].predicted_dwt);
     entry.add("prediction_valid", slots[i].prediction_valid);
-
     timers.add(entry);
   }
   out.add_array("timers", timers);
@@ -1159,7 +1115,7 @@ static Payload cmd_report(const Payload&) {
 }
 
 // ============================================================================
-// DIAG command — full Welford statistics for DWT prediction + GNSS-now
+// DIAG command
 // ============================================================================
 
 static void report_welford(Payload& out, const char* prefix, const welford_t& w) {
@@ -1202,7 +1158,6 @@ static Payload cmd_diag(const Payload&) {
   out.add("time_valid",     time_valid());
   out.add("time_pps_count", time_pps_count());
 
-  // Current time.h anchor for context
   time_anchor_snapshot_t snap = time_anchor_snapshot();
   out.add("anchor_ok",               snap.ok);
   out.add("anchor_valid",            snap.valid);
@@ -1215,7 +1170,7 @@ static Payload cmd_diag(const Payload&) {
 }
 
 // ============================================================================
-// DIAG_RESET command — zero the Welford accumulators
+// DIAG_RESET command
 // ============================================================================
 
 static Payload cmd_diag_reset(const Payload&) {
@@ -1230,89 +1185,242 @@ static Payload cmd_diag_reset(const Payload&) {
 }
 
 // ============================================================================
-// VCLOCK_TEST — QTimer1 interval measurement via GPT2-scheduled callback
+// VCLOCK_TEST v5.4 — QTimer1 CH3 compare doorbell (internal PCS routing)
 //
-// Temporary diagnostic to characterize QTimer1 (GNSS VCLOCK) counting
-// accuracy and interrupt-readability independent of the scheduling engine.
+// Architecture:
+//   QTimer1 CH0 + CH1 = passive 32-bit counter.  Never touched by compare.
+//   QTimer1 CH3       = independent 16-bit compare-only doorbell channel,
+//                       counting both edges of CH0's input pin via PCS=0.
+//                       No external wire, no IOMUX, no daisy chain.
 //
-// Protocol:
-//   1. Spin-wait for the next PPS edge (isr_snap_gnss changes).
-//      This aligns the arm point to the VCLOCK/PPS boundary — the same
-//      moment the system considers "time zero" for the new second.
-//   2. Capture qtimer1_read_32() immediately after the PPS edge.
-//   3. Arm a standard timepop_arm() timer for the requested duration.
-//   4. In the callback, capture qtimer1_read_32() again.
-//   5. Compute:
-//        vclock_raw_delta  = end_raw - start_raw   (dual-edge counts)
-//        vclock_ticks      = vclock_raw_delta / 2  (10 MHz ticks)
-//        expected_ticks    = requested_ns / 100     (100 ns per tick)
-//        residual_ticks    = vclock_ticks - expected_ticks
-//        residual_ns       = residual_ticks * 100
+// When QTimer1 CH3's compare fires, the ISR reads QTimer1 CH0+CH1 via
+// qtimer1_read_32() — completely undisturbed.  IRQ_QTIMER1 is shared
+// across all four channels; the ISR checks only CH3's TCF1 flag.
+// CH0 and CH1 CSCTRL registers are NEVER modified by the ISR.
 //
-// The callback also captures DWT elapsed and time_gnss_ns_now() elapsed
-// for cross-reference against the VCLOCK measurement.
-//
-// Command: { "ns": <uint64> }
-//   Minimum: 1,000,000 (1 ms) to give GPT2 scheduling time.
-//   Maximum: 999,000,000 (999 ms) to stay within one PPS second.
-//
-// Event: TIMEPOP_VCLOCK_TEST
+// QTimer1 CH3 target computation:
+//   At arm time, read QTimer1 CH3's current 16-bit count.
+//   Add the same raw_delta (requested_ticks * 2) used for the QTimer1 target.
+//   The low 16 bits of that sum become QTimer1 CH3's COMP1 value.
+//   The full 32-bit QTimer1 CH0+CH1 target is still computed for alias rejection.
 // ============================================================================
 
 struct vclock_test_context_t {
-  uint32_t arm_vclock_raw;   // qtimer1_read_32() at arm point (post-PPS)
-  uint32_t arm_dwt;          // DWT_CYCCNT at arm point
-  int64_t  arm_gnss_ns;      // time_gnss_ns_now() at arm point
-  uint64_t requested_ns;     // requested duration
-  uint32_t arm_pps_count;    // time_pps_count() at arm
+  uint32_t arm_vclock_raw;      // qtimer1_read_32() at arm (CH0+CH1)
+  uint16_t arm_qtmr3_count;     // QTimer1 CH3 raw count at arm
+  uint32_t arm_dwt;             // DWT_CYCCNT at arm
+  int64_t  arm_gnss_ns;         // time_gnss_ns_now() at arm
+  uint64_t requested_ns;        // requested interval
+  uint32_t requested_ticks;     // requested_ns / 100
+  uint32_t target_vclock_raw;   // QTimer1 full 32-bit target (alias rejection)
+  uint16_t target_qtmr3_low16;  // QTimer1 CH3 COMP1 value
+  uint32_t arm_pps_count;       // time_pps_count() at arm
+
+  uint32_t end_vclock_raw;      // qtimer1_read_32() in ISR (undisturbed)
+  uint32_t end_dwt;             // DWT_CYCCNT in ISR
+  int64_t  end_gnss_ns;         // time_gnss_ns_now() in ISR
+  uint32_t end_pps_count;       // time_pps_count() in ISR
+
+  int32_t  fire_raw;            // end_vclock_raw - target_vclock_raw
+  bool     fired;
+
+  // ── Forensics ──
+  uint32_t candidate_irq_count;
+  uint32_t early_reject_count;
+  uint32_t first_candidate_raw;
+  uint32_t last_candidate_raw;
+  uint32_t last_candidate_gap_raw;
+  uint32_t min_candidate_gap_raw;
+  uint32_t max_candidate_gap_raw;
 };
 
 static vclock_test_context_t vclock_test_ctx = {};
-static volatile bool         vclock_test_in_flight = false;
 
-static void vclock_test_callback(timepop_ctx_t* ctx, void*) {
+// ── QTimer1 CH3 register helpers ──
 
-  // Capture end state immediately
-  const uint32_t end_vclock_raw = qtimer1_read_32();
-  const uint32_t end_dwt        = ARM_DWT_CYCCNT;
-  const int64_t  end_gnss_ns    = time_gnss_ns_now();
+static inline void vclock_test_clear_flag(void) {
+  uint16_t csctrl = IMXRT_TMR1.CH[3].CSCTRL;
+  csctrl &= ~(TMR_CSCTRL_TCF1 | TMR_CSCTRL_TCF2);
+  IMXRT_TMR1.CH[3].CSCTRL = csctrl;
+}
 
-  // VCLOCK measurement
-  const uint32_t vclock_raw_delta  = end_vclock_raw - vclock_test_ctx.arm_vclock_raw;
-  const uint32_t vclock_ticks      = vclock_raw_delta / 2;
-  const uint64_t expected_ticks    = vclock_test_ctx.requested_ns / 100ULL;
-  const int32_t  residual_ticks    = (int32_t)vclock_ticks - (int32_t)expected_ticks;
-  const int32_t  residual_ns       = residual_ticks * 100;
+static inline void vclock_test_disable_compare(void) {
+  IMXRT_TMR1.CH[3].CSCTRL &= ~TMR_CSCTRL_TCF1EN;
+  vclock_test_clear_flag();
+}
 
-  // DWT cross-reference
-  const uint32_t dwt_elapsed = end_dwt - vclock_test_ctx.arm_dwt;
+static inline void vclock_test_arm_compare(uint16_t target_low16) {
+  IMXRT_TMR1.CH[3].COMP1  = target_low16;
+  IMXRT_TMR1.CH[3].CMPLD1 = target_low16;
+  vclock_test_clear_flag();
+  IMXRT_TMR1.CH[3].CSCTRL |= TMR_CSCTRL_TCF1EN;
+}
 
-  // GNSS cross-reference
+static void vclock_test_init_qtimer1_ch3(void) {
+  // ── Architecture ──────────────────────────────────────────────────────────
+  // QTimer1 CH3 is configured as an independent compare-only doorbell,
+  // counting both edges of Counter 0's input pin (GNSS 10 MHz on pin 10)
+  // via the Primary Count Source (PCS) internal routing.
+  //
+  // No external wire, no IOMUX, no daisy chain.  PCS=0 within QTimer1
+  // selects Counter 0's input pin as the primary clock source for CH3.
+  // CM=2 counts both rising and falling edges, giving 20 MHz raw — same
+  // rate as QTimer1 CH0.
+  //
+  // QTimer1 CH0+CH1 remain the passive 32-bit counting pair, untouched.
+  // When CH3's compare fires, the ISR reads CH0+CH1 via qtimer1_read_32().
+  //
+  // IRQ_QTIMER1 is shared across all four channels.  The ISR checks only
+  // CH3's TCF1 flag.  CH0 and CH1 CSCTRL are NEVER modified by the ISR.
+  // ─────────────────────────────────────────────────────────────────────────
+
+  IMXRT_TMR1.CH[3].CTRL   = 0;
+  IMXRT_TMR1.CH[3].CNTR   = 0;
+  IMXRT_TMR1.CH[3].LOAD   = 0;
+  IMXRT_TMR1.CH[3].COMP1  = 0xFFFF;
+  IMXRT_TMR1.CH[3].CMPLD1 = 0xFFFF;
+  IMXRT_TMR1.CH[3].SCTRL  = 0;
+  IMXRT_TMR1.CH[3].CSCTRL = 0;
+
+  // CM=2 (count rising AND falling edges of primary source)
+  // PCS=0 (primary clock source = Counter 0's input pin = GNSS 10 MHz)
+  IMXRT_TMR1.CH[3].CTRL = TMR_CTRL_CM(2) | TMR_CTRL_PCS(0);
+}
+
+static void emit_deferred_vclock_test(void) {
+  if (!vclock_test_result_ready) return;
+  vclock_test_result_ready = false;
+  publish("TIMEPOP_VCLOCK_TEST", vclock_test_result_ev);
+  vclock_test_result_ev.clear();
+}
+
+// ── ISR ──
+// IRQ_QTIMER1 is shared across all four channels.
+// We service only QTimer1 CH3's TCF1 flag.
+// CH0 and CH1 CSCTRL are NEVER touched — they have no TCF1EN set.
+
+static void qtimer1_ch3_doorbell_isr(void) {
+  // Check QTimer1 CH3 flag — only channel we service.
+  if ((IMXRT_TMR1.CH[3].CSCTRL & TMR_CSCTRL_TCF1) == 0) return;
+
+  // Clear flag before any other work.
+  vclock_test_clear_flag();
+
+  if (!vclock_test_irq_armed) return;
+
+  // ── Storm guard ──
+  vclock_test_ctx.candidate_irq_count++;
+  if (vclock_test_ctx.candidate_irq_count > 100) {
+    vclock_test_disable_compare();
+    vclock_test_irq_armed = false;
+    vclock_test_in_flight = false;
+    return;
+  }
+
+  // after candidate_irq_count++:
+  diag_vclock_candidate_irqs = vclock_test_ctx.candidate_irq_count;
+
+  // after early_reject_count++:
+  diag_vclock_early_rejects = vclock_test_ctx.early_reject_count;
+
+  // Read QTimer1 CH0+CH1 — completely undisturbed.
+  const uint32_t now_raw = qtimer1_read_32();
+
+  // ── Candidate forensics ──
+  const uint32_t irq_n = vclock_test_ctx.candidate_irq_count;
+  if (irq_n == 1) {
+    vclock_test_ctx.first_candidate_raw    = now_raw;
+    vclock_test_ctx.last_candidate_raw     = now_raw;
+    vclock_test_ctx.last_candidate_gap_raw = 0;
+    vclock_test_ctx.min_candidate_gap_raw  = 0;
+    vclock_test_ctx.max_candidate_gap_raw  = 0;
+  } else {
+    const uint32_t gap = now_raw - vclock_test_ctx.last_candidate_raw;
+    vclock_test_ctx.last_candidate_gap_raw = gap;
+    if (irq_n == 2) {
+      vclock_test_ctx.min_candidate_gap_raw = gap;
+      vclock_test_ctx.max_candidate_gap_raw = gap;
+    } else {
+      if (gap < vclock_test_ctx.min_candidate_gap_raw) vclock_test_ctx.min_candidate_gap_raw = gap;
+      if (gap > vclock_test_ctx.max_candidate_gap_raw) vclock_test_ctx.max_candidate_gap_raw = gap;
+    }
+    vclock_test_ctx.last_candidate_raw = now_raw;
+  }
+
+  // Alias rejection: QTimer1 CH3 fires every 65,536 raw counts (16-bit wrap).
+  // At 20 MHz raw (dual-edge 10 MHz) that is ~3.28 ms per alias.
+  // Reject any fire where the QTimer1 32-bit target has not yet arrived.
+  if ((int32_t)(now_raw - vclock_test_ctx.target_vclock_raw) < 0) {
+    vclock_test_ctx.early_reject_count++;
+    return;
+  }
+
+  const uint32_t end_dwt     = ARM_DWT_CYCCNT;
+  const int64_t  end_gnss_ns = time_gnss_ns_now();
+  const uint32_t end_pps     = time_pps_count();
+
+  vclock_test_disable_compare();
+  vclock_test_irq_armed = false;
+
+  vclock_test_ctx.end_vclock_raw = now_raw;
+  vclock_test_ctx.end_dwt        = end_dwt;
+  vclock_test_ctx.end_gnss_ns    = end_gnss_ns;
+  vclock_test_ctx.end_pps_count  = end_pps;
+  vclock_test_ctx.fire_raw       = (int32_t)(now_raw - vclock_test_ctx.target_vclock_raw);
+  vclock_test_ctx.fired          = true;
+
+  const uint32_t vclock_raw_delta =
+    vclock_test_ctx.end_vclock_raw - vclock_test_ctx.arm_vclock_raw;
+
+  const uint32_t vclock_ticks = vclock_raw_delta / 2U;
+
+  const int32_t residual_ticks =
+    (int32_t)vclock_ticks - (int32_t)vclock_test_ctx.requested_ticks;
+  const int32_t residual_ns = residual_ticks * 100;
+
+  const uint32_t dwt_elapsed =
+    vclock_test_ctx.end_dwt - vclock_test_ctx.arm_dwt;
+
   int64_t gnss_elapsed_ns = -1;
-  if (vclock_test_ctx.arm_gnss_ns >= 0 && end_gnss_ns >= 0)
-    gnss_elapsed_ns = end_gnss_ns - vclock_test_ctx.arm_gnss_ns;
+  if (vclock_test_ctx.arm_gnss_ns >= 0 && vclock_test_ctx.end_gnss_ns >= 0) {
+    gnss_elapsed_ns = vclock_test_ctx.end_gnss_ns - vclock_test_ctx.arm_gnss_ns;
+  }
 
+  // Published directly via publish() — no EVT_BODY_MAX constraint.
   Payload ev;
-  ev.add("req_ns",           vclock_test_ctx.requested_ns);
-  ev.add("vclock_raw_delta", (uint64_t)vclock_raw_delta);  // dual-edge count
-  ev.add("vclock_ticks",     (uint64_t)vclock_ticks);      // /2 = 10 MHz ticks
-  ev.add("expected_ticks",   (uint64_t)expected_ticks);
-  ev.add("residual_ticks",   (int32_t)residual_ticks);
-  ev.add("residual_ns",      (int32_t)residual_ns);
-  ev.add("dwt_elapsed",      (uint64_t)dwt_elapsed);
-  ev.add("gnss_elapsed_ns",  gnss_elapsed_ns);
-  ev.add("arm_pps",          vclock_test_ctx.arm_pps_count);
-  ev.add("end_pps",          time_pps_count());
-  ev.add("fire_ns",          ctx->fire_ns);    // GPT2 lateness vs deadline
+  ev.add("req_ns",              vclock_test_ctx.requested_ns);
+  ev.add("requested_ticks",     (uint64_t)vclock_test_ctx.requested_ticks);
+  ev.add("arm_vclock_raw",      (uint64_t)vclock_test_ctx.arm_vclock_raw);
+  ev.add("target_vclock_raw",   (uint64_t)vclock_test_ctx.target_vclock_raw);
+  ev.add("end_vclock_raw",      (uint64_t)vclock_test_ctx.end_vclock_raw);
+  ev.add("vclock_raw_delta",    (uint64_t)vclock_raw_delta);
+  ev.add("vclock_ticks",        (uint64_t)vclock_ticks);
+  ev.add("residual_ticks",      residual_ticks);
+  ev.add("residual_ns",         residual_ns);
+  ev.add("fire_raw",            vclock_test_ctx.fire_raw);
+  ev.add("fire_ns",             vclock_test_ctx.fire_raw * 50);
+  ev.add("dwt_elapsed",         (uint64_t)dwt_elapsed);
+  ev.add("gnss_elapsed_ns",     gnss_elapsed_ns);
+  ev.add("arm_pps",             vclock_test_ctx.arm_pps_count);
+  ev.add("end_pps",             vclock_test_ctx.end_pps_count);
+  ev.add("candidate_irq_count",    vclock_test_ctx.candidate_irq_count);
+  ev.add("early_reject_count",     vclock_test_ctx.early_reject_count);
+  ev.add("first_candidate_raw",    (uint64_t)vclock_test_ctx.first_candidate_raw);
+  ev.add("last_candidate_raw",     (uint64_t)vclock_test_ctx.last_candidate_raw);
+  ev.add("last_candidate_gap_raw", (uint64_t)vclock_test_ctx.last_candidate_gap_raw);
+  ev.add("min_candidate_gap_raw",  (uint64_t)vclock_test_ctx.min_candidate_gap_raw);
+  ev.add("max_candidate_gap_raw",  (uint64_t)vclock_test_ctx.max_candidate_gap_raw);
 
-  enqueueEvent("TIMEPOP_VCLOCK_TEST", ev);
-  vclock_test_in_flight = false;
+  vclock_test_result_ev    = ev;
+  vclock_test_result_ready = true;
+  vclock_test_in_flight    = false;
+  timepop_pending          = true;   // wake dispatch to emit the deferred event
 }
 
 static Payload cmd_vclock_test(const Payload& args) {
   Payload resp;
 
-  if (vclock_test_in_flight) {
+  if (vclock_test_in_flight || vclock_test_irq_armed) {
     resp.add("error", "test already in flight");
     return resp;
   }
@@ -1321,7 +1429,7 @@ static Payload cmd_vclock_test(const Payload& args) {
     return resp;
   }
 
-  uint64_t ns_val = args.getUInt64("ns", 0);
+  const uint64_t ns_val = args.getUInt64("ns", 0);
   if (ns_val < 1000000ULL) {
     resp.add("error", "ns must be >= 1000000 (1 ms)");
     return resp;
@@ -1331,30 +1439,49 @@ static Payload cmd_vclock_test(const Payload& args) {
     return resp;
   }
 
-  // PPS just fired. Capture VCLOCK position immediately.
-  const uint32_t arm_vclock_raw = qtimer1_read_32();
-  const uint32_t arm_dwt        = ARM_DWT_CYCCNT;
-  const int64_t  arm_gnss_ns    = time_gnss_ns_now();
+  const uint32_t requested_ticks = (uint32_t)(ns_val / 100ULL);
+  const uint32_t raw_delta       = requested_ticks * 2U;
+
+  // Snapshot QTimer1 32-bit truth and QTimer1 CH3 doorbell at arm time.
+  const uint32_t arm_vclock_raw  = qtimer1_read_32();
+  const uint16_t arm_qtmr3_count = IMXRT_TMR1.CH[3].CNTR;
+  const uint32_t arm_dwt         = ARM_DWT_CYCCNT;
+  const int64_t  arm_gnss_ns     = time_gnss_ns_now();
+  const uint32_t arm_pps_count   = time_pps_count();
+
+  // QTimer1 32-bit target — used only for alias rejection in the ISR.
+  const uint32_t target_vclock_raw = arm_vclock_raw + raw_delta;
+
+  // QTimer1 CH3 target — the actual compare value that fires the doorbell.
+  // QTimer1 CH3 is 16-bit only; use low 16 bits of (arm_qtmr3 + raw_delta).
+  const uint16_t target_qtmr3_low16 =
+    (uint16_t)((arm_qtmr3_count + (uint16_t)(raw_delta & 0xFFFFu)) & 0xFFFFu);
 
   vclock_test_ctx = {};
-  vclock_test_ctx.arm_vclock_raw = arm_vclock_raw;
-  vclock_test_ctx.arm_dwt        = arm_dwt;
-  vclock_test_ctx.arm_gnss_ns    = arm_gnss_ns;
-  vclock_test_ctx.requested_ns   = ns_val;
-  vclock_test_ctx.arm_pps_count  = time_pps_count();
+  vclock_test_ctx.arm_vclock_raw     = arm_vclock_raw;
+  vclock_test_ctx.arm_qtmr3_count    = arm_qtmr3_count;
+  vclock_test_ctx.arm_dwt            = arm_dwt;
+  vclock_test_ctx.arm_gnss_ns        = arm_gnss_ns;
+  vclock_test_ctx.requested_ns       = ns_val;
+  vclock_test_ctx.requested_ticks    = requested_ticks;
+  vclock_test_ctx.target_vclock_raw  = target_vclock_raw;
+  vclock_test_ctx.target_qtmr3_low16 = target_qtmr3_low16;
+  vclock_test_ctx.arm_pps_count      = arm_pps_count;
 
-  timepop_handle_t h = timepop_arm(
-    ns_val, false, vclock_test_callback, nullptr, "vclock-test"
-  );
-  if (h == TIMEPOP_INVALID_HANDLE) {
-    resp.add("error", "timepop_arm failed");
-    return resp;
-  }
-
+  noInterrupts();
   vclock_test_in_flight = true;
-  resp.add("status",    "armed");
-  resp.add("req_ns",    ns_val);
-  resp.add("arm_vclock_raw", (uint64_t)arm_vclock_raw);
+  vclock_test_irq_armed = true;
+  vclock_test_arm_compare(target_qtmr3_low16);
+  interrupts();
+
+  resp.add("status",             "armed");
+  resp.add("req_ns",             ns_val);
+  resp.add("requested_ticks",    (uint64_t)requested_ticks);
+  resp.add("arm_vclock_raw",     (uint64_t)arm_vclock_raw);
+  resp.add("arm_qtmr3_count",    (uint32_t)arm_qtmr3_count);
+  resp.add("target_vclock_raw",  (uint64_t)target_vclock_raw);
+  resp.add("target_qtmr3_low16", (uint32_t)target_qtmr3_low16);
+  resp.add("arm_pps",            arm_pps_count);
   return resp;
 }
 
@@ -1369,7 +1496,7 @@ static const process_command_entry_t TIMEPOP_COMMANDS[] = {
   { "TEST",        cmd_test        },
   { "NS_TEST",     cmd_ns_test     },
   { "INTERP_TEST", cmd_interp_test },
-  { "VCLOCK_TEST",  cmd_vclock_test  },
+  { "VCLOCK_TEST", cmd_vclock_test },
   { nullptr,       nullptr }
 };
 

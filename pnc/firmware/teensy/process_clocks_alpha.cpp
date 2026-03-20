@@ -340,17 +340,41 @@ static bool qtimer1_armed = false;
 uint64_t gnss_rolling_raw_64 = 0;
 uint32_t gnss_rolling_32     = 0;
 
+// ============================================================================
+// QTimer1 read diagnostics
+// ============================================================================
+
+volatile uint32_t diag_qread_total            = 0;
+volatile uint32_t diag_qread_same_hi          = 0;
+volatile uint32_t diag_qread_retry_hi_changed = 0;
+
+volatile uint32_t diag_qread_last_hi1 = 0;
+volatile uint32_t diag_qread_last_hi2 = 0;
+volatile uint32_t diag_qread_last_lo  = 0;
+volatile uint32_t diag_qread_last_lo2 = 0;
+
 uint32_t qtimer1_read_32(void) {
-  const uint16_t hi1 = IMXRT_TMR1.CH[1].CNTR;
-  const uint16_t lo  = IMXRT_TMR1.CH[0].CNTR;
-  const uint16_t hi2 = IMXRT_TMR1.CH[1].CNTR;
+  diag_qread_total++;
+
+  const uint16_t lo1 = IMXRT_TMR1.CH[0].CNTR;   // latches CH1.HOLD
+  const uint16_t hi1 = IMXRT_TMR1.CH[1].HOLD;
+
+  const uint16_t lo2 = IMXRT_TMR1.CH[0].CNTR;   // relatches CH1.HOLD
+  const uint16_t hi2 = IMXRT_TMR1.CH[1].HOLD;
+
+  diag_qread_last_hi1 = hi1;
+  diag_qread_last_hi2 = hi2;
+  diag_qread_last_lo  = lo1;
+  diag_qread_last_lo2 = lo2;
+
+  // If the two snapshot reads disagree wildly, count it as a retry-style event.
   if (hi1 != hi2) {
-    // Low word rolled over between the two high reads.
-    // Re-read low — it's now consistent with hi2.
-    const uint16_t lo2 = IMXRT_TMR1.CH[0].CNTR;
+    diag_qread_retry_hi_changed++;
     return ((uint32_t)hi2 << 16) | (uint32_t)lo2;
   }
-  return ((uint32_t)hi1 << 16) | (uint32_t)lo;
+
+  diag_qread_same_hi++;
+  return ((uint32_t)hi1 << 16) | (uint32_t)lo1;
 }
 
 static void arm_qtimer1_external(void) {
@@ -383,6 +407,14 @@ static void arm_qtimer1_external(void) {
 
   IMXRT_TMR1.CH[0].CTRL = TMR_CTRL_CM(2) | TMR_CTRL_PCS(0);
   IMXRT_TMR1.CH[1].CTRL = TMR_CTRL_CM(7);
+
+  // Defensive cleanup for VCLOCK_TEST compare path on channel 0 low-word compare.
+  IMXRT_TMR1.CH[0].CSCTRL &= ~TMR_CSCTRL_TCF1EN;  // disable compare interrupt
+  IMXRT_TMR1.CH[0].CSCTRL |=  TMR_CSCTRL_TCF1;    // clear pending compare flag if W1C
+
+  // CH1 is cascade-only — silence its compare and overflow alarms permanently.
+  IMXRT_TMR1.CH[1].CSCTRL = 0;
+  IMXRT_TMR1.CH[1].SCTRL  &= ~(TMR_SCTRL_TOFIE | TMR_SCTRL_IEF | TMR_SCTRL_IEFIE);
 
   gnss_rolling_32 = qtimer1_read_32();
   qtimer1_armed   = true;

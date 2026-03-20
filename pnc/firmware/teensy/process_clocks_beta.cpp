@@ -927,24 +927,31 @@ static Payload cmd_report(const Payload&) {
 // ============================================================================
 // CLOCKS_INFO — forensic / diagnostic surface
 //
-// Replace the existing cmd_clocks_info function in process_clocks_beta.cpp
-// with this version.  Changes from the previous version:
+// Added forensic fields:
+//   - time_pps_count
+//   - gnss_raw_now
+//   - gnss_raw_64
+//   - gnss_ticks_64
+//   - gnss_rolling_raw_64
+//   - gnss_rolling_32
+//   - gnss_raw_since_pps
+//   - isr_snap_*
+//   - isr_prev_*
+//   - isr_residual_valid
+//   - isr_residual_*
 //
-//   1. Spin capture fields use v19 naming:
-//      - spin_timed_out  → spin_nano_timed_out
-//      - spin_timeouts   → spin_nano_timeouts
-//      - Added: spin_shadow_timed_out, spin_shadow_timeouts
-//      - Added: spin_shadow_dwt, spin_approach_cycles
-//
-//   2. PPS rejection recovery diagnostics (v20):
-//      - pps_reject_consecutive
-//      - pps_reject_recoveries
-//      - pps_reject_max_run
-//
+// Notes:
+//   - gnss_raw_now is the instantaneous qtimer1_read_32() raw value
+//   - gnss_raw_64 is the campaign-scoped accumulated raw GNSS count
+//   - gnss_ticks_64 is gnss_raw_64 / GNSS_EDGE_DIVISOR
+//   - gnss_raw_since_pps is current raw delta from the most recent PPS snapshot
 // ============================================================================
 
 static Payload cmd_clocks_info(const Payload&) {
   Payload p;
+
+  const uint32_t gnss_raw_now = qtimer1_read_32();
+  const uint32_t gnss_raw_since_pps = gnss_raw_now - (uint32_t)isr_snap_gnss;
 
   p.add("campaign_state",
     campaign_state == clocks_campaign_state_t::STARTED ? "STARTED" : "STOPPED");
@@ -964,11 +971,21 @@ static Payload cmd_clocks_info(const Payload&) {
   p.add("watchdog_anomaly_detail3", watchdog_anomaly_detail3);
   p.add("watchdog_anomaly_trigger_dwt", watchdog_anomaly_trigger_dwt);
 
+  p.add("time_pps_count", time_pps_count());
+
   p.add("dwt_cycles_now", clocks_dwt_cycles_now());
   p.add("dwt_ns_now",     clocks_dwt_ns_now());
   p.add("gnss_ns_now",    clocks_gnss_ns_now());
   p.add("ocxo1_ns_now",   clocks_ocxo1_ns_now());
   p.add("ocxo2_ns_now",   clocks_ocxo2_ns_now());
+
+  // ── Raw / rolling GNSS forensic surface ──
+  p.add("gnss_raw_now",         gnss_raw_now);
+  p.add("gnss_raw_64",          gnss_raw_64);
+  p.add("gnss_ticks_64",        gnss_ticks_64_get());
+  p.add("gnss_rolling_raw_64",  gnss_rolling_raw_64);
+  p.add("gnss_rolling_32",      gnss_rolling_32);
+  p.add("gnss_raw_since_pps",   gnss_raw_since_pps);
 
   p.add("timebase_gnss_ns",  timebase_now_ns(timebase_domain_t::GNSS));
   p.add("timebase_dwt_ns",   timebase_now_ns(timebase_domain_t::DWT));
@@ -998,6 +1015,23 @@ static Payload cmd_clocks_info(const Payload&) {
   p.add("dwt_cal_valid",         g_dwt_cal_valid);
   p.add("dwt_cal_pps_count",     g_dwt_cal_pps_count);
 
+  // ── ISR PPS-edge forensics ──
+  p.add("isr_snap_dwt",         isr_snap_dwt);
+  p.add("isr_snap_gnss",        isr_snap_gnss);
+  p.add("isr_snap_ocxo1",       isr_snap_ocxo1);
+  p.add("isr_snap_ocxo2",       isr_snap_ocxo2);
+
+  p.add("isr_prev_dwt",         isr_prev_dwt);
+  p.add("isr_prev_gnss",        isr_prev_gnss);
+  p.add("isr_prev_ocxo1",       isr_prev_ocxo1);
+  p.add("isr_prev_ocxo2",       isr_prev_ocxo2);
+
+  p.add("isr_residual_valid",   isr_residual_valid);
+  p.add("isr_residual_dwt",     isr_residual_dwt);
+  p.add("isr_residual_gnss",    isr_residual_gnss);
+  p.add("isr_residual_ocxo1",   isr_residual_ocxo1);
+  p.add("isr_residual_ocxo2",   isr_residual_ocxo2);
+
   // ── PPS rejection diagnostics ──
   p.add("pps_rejected_total",      diag_pps_rejected_total);
   p.add("pps_rejected_remainder",  diag_pps_rejected_remainder);
@@ -1022,32 +1056,41 @@ static Payload cmd_clocks_info(const Payload&) {
   //   shadow_* — shadow-write loop PPS never arrived
   //
   p.add("spin_valid",             pps_spin.valid);
-  p.add("spin_armed",            pps_spin.armed);
-  p.add("spin_completed",        pps_spin.completed);
-  p.add("spin_target_dwt",       pps_spin.target_dwt);
-  p.add("spin_landed_dwt",       pps_spin.landed_dwt);
-  p.add("spin_landed_gnss_ns",   pps_spin.landed_gnss_ns);
-  p.add("spin_error_cycles",     pps_spin.spin_error);
-  p.add("spin_shadow_dwt",       pps_spin.shadow_dwt);
-  p.add("spin_isr_dwt",          pps_spin.isr_dwt);
-  p.add("spin_delta_cycles",     pps_spin.delta_cycles);
-  p.add("spin_approach_cycles",  pps_spin.approach_cycles);
-  p.add("spin_corrected_dwt",    pps_spin.corrected_dwt);
-  p.add("spin_tdc_correction",   pps_spin.tdc_correction);
+  p.add("spin_armed",             pps_spin.armed);
+  p.add("spin_completed",         pps_spin.completed);
+  p.add("spin_target_dwt",        pps_spin.target_dwt);
+  p.add("spin_landed_dwt",        pps_spin.landed_dwt);
+  p.add("spin_landed_gnss_ns",    pps_spin.landed_gnss_ns);
+  p.add("spin_error_cycles",      pps_spin.spin_error);
+  p.add("spin_shadow_dwt",        pps_spin.shadow_dwt);
+  p.add("spin_isr_dwt",           pps_spin.isr_dwt);
+  p.add("spin_delta_cycles",      pps_spin.delta_cycles);
+  p.add("spin_approach_cycles",   pps_spin.approach_cycles);
+  p.add("spin_corrected_dwt",     pps_spin.corrected_dwt);
+  p.add("spin_tdc_correction",    pps_spin.tdc_correction);
 
   // Nano-spin timeout (couldn't reach target DWT)
-  p.add("spin_nano_timed_out",   pps_spin.nano_timed_out);
-  p.add("spin_nano_timeouts",    pps_spin.nano_timeouts);
+  p.add("spin_nano_timed_out",    pps_spin.nano_timed_out);
+  p.add("spin_nano_timeouts",     pps_spin.nano_timeouts);
 
   // Shadow-loop timeout (PPS never arrived)
-  p.add("spin_shadow_timed_out", pps_spin.shadow_timed_out);
-  p.add("spin_shadow_timeouts",  pps_spin.shadow_timeouts);
+  p.add("spin_shadow_timed_out",  pps_spin.shadow_timed_out);
+  p.add("spin_shadow_timeouts",   pps_spin.shadow_timeouts);
 
   // Lifetime counters
-  p.add("spin_arms",             pps_spin.arms);
-  p.add("spin_arm_failures",     pps_spin.arm_failures);
-  p.add("spin_completions",      pps_spin.completions);
-  p.add("spin_misses",           pps_spin.misses);
+  p.add("spin_arms",              pps_spin.arms);
+  p.add("spin_arm_failures",      pps_spin.arm_failures);
+  p.add("spin_completions",       pps_spin.completions);
+  p.add("spin_misses",            pps_spin.misses);
+
+  // ── QTimer1 read diagnostics ──
+  p.add("qread_total",            diag_qread_total);
+  p.add("qread_same_hi",          diag_qread_same_hi);
+  p.add("qread_retry_hi_changed", diag_qread_retry_hi_changed);
+  p.add("qread_last_hi1",         diag_qread_last_hi1);
+  p.add("qread_last_hi2",         diag_qread_last_hi2);
+  p.add("qread_last_lo",          diag_qread_last_lo);
+  p.add("qread_last_lo2",         diag_qread_last_lo2);
 
   return p;
 }

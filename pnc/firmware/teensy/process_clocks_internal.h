@@ -103,6 +103,19 @@ extern volatile uint32_t diag_pps_reject_recoveries;
 extern volatile uint32_t diag_pps_reject_max_run;
 
 // ============================================================================
+// QTimer1 read diagnostics (alpha-owned, beta-readable)
+// ============================================================================
+
+extern volatile uint32_t diag_qread_total;
+extern volatile uint32_t diag_qread_same_hi;
+extern volatile uint32_t diag_qread_retry_hi_changed;
+
+extern volatile uint32_t diag_qread_last_hi1;
+extern volatile uint32_t diag_qread_last_hi2;
+extern volatile uint32_t diag_qread_last_lo;
+extern volatile uint32_t diag_qread_last_lo2;
+
+// ============================================================================
 // PPS state
 // ============================================================================
 
