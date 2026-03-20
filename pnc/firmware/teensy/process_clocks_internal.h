@@ -4,6 +4,13 @@
 // process_clocks_internal.h — Shared Internal State (Alpha ↔ Beta)
 // ============================================================================
 //
+// v23: 10 MHz single-edge QTimer1 migration.
+//
+//   GNSS_EDGE_DIVISOR eliminated.  QTimer1 now counts rising edges
+//   only (CM=1, 10 MHz).  The raw counter IS the 10 MHz tick count.
+//   ISR_GNSS_RAW_EXPECTED = TICKS_10MHZ_PER_SECOND = 10,000,000.
+//   gnss_ticks_64_get() returns gnss_raw_64 directly.
+//
 // v20: PPS rejection recovery watchdog diagnostics.
 // v19: Spin capture with shadow-write TDC + timeout protection.
 // v14: Symmetric GPT architecture for both OCXOs.
@@ -75,9 +82,9 @@ extern volatile bool     isr_residual_valid;
 
 static constexpr uint32_t ISR_DWT_EXPECTED  = DWT_EXPECTED_PER_PPS;
 
-// GNSS: QTimer1 CM(2) counts both edges — 20 MHz raw expected
-static constexpr uint32_t GNSS_EDGE_DIVISOR     = 2;
-static constexpr uint32_t ISR_GNSS_RAW_EXPECTED = TICKS_10MHZ_PER_SECOND * GNSS_EDGE_DIVISOR;
+// v23: GNSS QTimer1 now counts rising edges only — 10 MHz.
+// Previously dual-edge (20 MHz) with GNSS_EDGE_DIVISOR = 2.
+static constexpr uint32_t ISR_GNSS_RAW_EXPECTED = TICKS_10MHZ_PER_SECOND;
 
 // Both OCXOs: GPT single-edge — 10 MHz expected
 static constexpr uint32_t ISR_OCXO1_EXPECTED = TICKS_10MHZ_PER_SECOND;
@@ -208,7 +215,6 @@ double residual_stderr(const pps_residual_t& r);
 
 struct prediction_tracker_t {
   uint32_t prev_delta;
-  uint32_t prev_prev_delta;
   uint32_t predicted;
   int32_t  pred_residual;
   uint8_t  history_count;
@@ -233,13 +239,12 @@ double prediction_stderr(const prediction_tracker_t& p);
 //
 // Two distinct timeout failure modes:
 //
-//   1. Nano-spin timeout: TimePop's DWT spin exceeded NANO_SPIN_MAX_CYCLES.
+//   1. Nano-spin timeout: TimePop's DWT spin exceeded its budget.
 //      Fields: nano_timed_out (this cycle), nano_timeouts (lifetime count).
 //
 //   2. Shadow-loop timeout: shadow-write loop exceeded SPIN_LOOP_TIMEOUT_CYCLES.
 //      Fields: shadow_timed_out (this cycle), shadow_timeouts (lifetime).
 //
-// The same struct will be reused for 10 KHz VCLOCK captures.
 // ============================================================================
 
 struct spin_capture_t {
@@ -292,8 +297,9 @@ extern uint32_t prev_ocxo2_at_pps;
 extern uint64_t gnss_raw_64;
 extern uint32_t prev_gnss_at_pps;
 
+// v23: gnss_raw_64 IS 10 MHz ticks — no divisor needed.
 inline uint64_t gnss_ticks_64_get(void) {
-  return gnss_raw_64 / GNSS_EDGE_DIVISOR;
+  return gnss_raw_64;
 }
 
 // ============================================================================

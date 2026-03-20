@@ -26,25 +26,23 @@
 // Total: ~18-20 cycles for the hardware portion, plus whatever
 // instructions precede the ARM_DWT_CYCCNT read in the ISR body.
 //
-// ── QTimer1 CH2 compare path (TimePop production) ──
+// ── QTimer1 CH2 compare path (TimePop v8.0 priority queue) ──
 //
-// The DWT read is the first operation inside qtimer1_ch2_compare_isr(),
+// The DWT read is the first operation inside qtimer1_ch2_isr(),
 // but the NVIC vector points to qtimer1_irq_isr() which checks the
-// CH2 TCF1 flag and then calls qtimer1_ch2_compare_isr().  This adds
+// CH2 TCF1 flag and then calls qtimer1_ch2_isr().  This adds
 // one flag read + conditional branch before the DWT capture compared
-// to a direct-vector ISR like the old GPT2 path.
+// to a direct-vector ISR like the PPS GPIO path.
 //
 // Initial estimate: 54 cycles (~53.6 ns at 1008 MHz).
 //
-//   Base NVIC + stacking:        ~20 cycles (same as GPT2)
+//   Base NVIC + stacking:        ~20 cycles
 //   qtimer1_irq_isr prologue:    ~3 cycles  (push/frame)
 //   CH2 flag check + branch:     ~4 cycles  (load CSCTRL, test, branch)
-//   ch2_compare_isr prologue:    ~2 cycles  (inlined or minimal)
+//   ch2_isr prologue:            ~2 cycles  (inlined or minimal)
 //   Compiler prologue variance:  ~2 cycles
 //   ─────────────────────────────────────
-//   Subtotal:                    ~31 cycles (above GPT2's ~29)
-//   GPT2 measured total:          49 cycles
-//   Estimated QTimer1 CH2:        54 cycles (49 + ~5 for dispatch)
+//   Estimated total:              ~54 cycles
 //
 // This constant should be validated empirically using the DWT
 // prediction Welford accumulator: the mean DWT prediction residual
@@ -52,19 +50,26 @@
 // Adjust QTIMER1_CH2_ISR_ENTRY_DWT_CYCLES until the mean residual
 // converges to zero.
 //
+// NOTE: The v8.0 CH2 configuration (CM=1, no LENGTH, dynamic compare)
+// differs from v7.0 (CM=2, LENGTH, periodic heartbeat).  The ISR
+// dispatch path is the same (flag check + call), so the latency
+// constant should be close.  Recalibrate via TIMEPOP DIAG after
+// the migration.
+//
 // ============================================================================
 
 // ISR entry latency for the QTimer1 CH2 compare ISR (TimePop production).
 // This is the number of DWT cycles between the QTimer1 CH2 compare match
 // (the physical event) and the first ARM_DWT_CYCCNT read inside
-// qtimer1_ch2_compare_isr().
+// qtimer1_ch2_isr().
 //
 // Initial estimate: 54 cycles (~53.6 ns at 1008 MHz).
 // Calibrate using TIMEPOP DIAG: adjust until dwt_pred_mean ≈ 0.
 static constexpr uint32_t QTIMER1_CH2_ISR_ENTRY_DWT_CYCLES = 54;
 
-// Retained for reference / any code that still needs GPT2 compensation.
-// GPT2 is now OCXO2's counter — no longer used for TimePop compare.
+// GPT2 ISR entry latency — retained for PPS-path reference.
+// GPT2 is now dedicated to OCXO2 counting; no longer used for
+// TimePop compare.
 static constexpr uint32_t GPT2_ISR_ENTRY_DWT_CYCLES = 49;
 
 // ============================================================================
@@ -101,7 +106,7 @@ static inline uint32_t dwt_at_qtimer1_ch2_compare(uint32_t isr_dwt_cyccnt) {
 }
 
 // ============================================================================
-// Convenience: GPT2 compare ISR (retained for reference)
+// Convenience: GPT2 ISR (retained for reference)
 // ============================================================================
 
 static inline uint32_t dwt_at_gpt2_compare(uint32_t isr_dwt_cyccnt) {

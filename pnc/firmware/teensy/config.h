@@ -35,11 +35,10 @@ static constexpr uint64_t NS_PER_MICROSECOND = 1000ULL;
 // share the same nominal frequency. These constants are used
 // for ISR-level residual computation and PPS edge validation.
 //
-// NOTE:
-//   GNSS VCLOCK is on QTimer1 ch0+ch1 as a dual-edge raw counter
-//   (50 ns raw ticks). TimePop compare uses QTimer1 ch2.
-//   OCXO1 is on GPT1.
-//   OCXO2 is on GPT2.
+// All three domains count at 10 MHz (100 ns per tick):
+//   GNSS VCLOCK on QTimer1 ch0+ch1 (single-edge, CM=1)
+//   OCXO1 on GPT1 (single-edge)
+//   OCXO2 on GPT2 (single-edge)
 //
 
 // Expected ticks per PPS second at 10 MHz
@@ -57,7 +56,9 @@ static constexpr uint32_t PPS_VCLOCK_TOLERANCE = 100;
 // Prescaled clock domains
 // --------------------------------------------------------------
 
-// SmartPOP / clock prescale
+// SmartPOP constants retained for reference.
+// SmartPOP functionality is subsumed by TimePop v8.0's phase-locked
+// priority queue scheduler.
 static constexpr uint32_t SMARTPOP_HZ       = 10000U; // 10 kHz
 static constexpr uint64_t NS_PER_SMART_TICK = NS_PER_SECOND / SMARTPOP_HZ; // 100,000 ns
 
@@ -76,9 +77,9 @@ static constexpr uint32_t DWT_EXPECTED_PER_PPS = 1008000000U;
 // ARM Cortex-M7 ISR entry latency
 // --------------------------------------------------------------
 //
-// When a hardware interrupt fires (PPS edge, GPT2 output compare),
+// When a hardware interrupt fires (PPS edge, QTimer1 CH2 compare),
 // the ARM core saves registers and branches to the vector before
-// the ISR's first instruction executes. The DWT_CYCCNT read in
+// the ISR's first instruction executes.  The DWT_CYCCNT read in
 // the ISR is therefore late by this many DWT cycles.
 //
 // Measured empirically via tdc_analyzer over 23,170 PPS edges
@@ -133,7 +134,7 @@ static const int PHOTODIODE_ANALOG_PIN = 15;
 //
 // GNSS_VCLK_PIN:
 //   10 MHz VCLOCK square wave from GF-8802 (pin 10)
-//   Counted by QTimer1 ch0+ch1 (dual-edge raw counting, 50 ns raw ticks)
+//   Counted by QTimer1 ch0+ch1 (single-edge, 100 ns per tick)
 //
 // GNSS_LOCK_PIN:
 //   GNSS lock status (true/false)
@@ -190,17 +191,15 @@ static constexpr uint32_t OCXO2_DAC_MAX     = 4095;
 // QTimer1 cascade configuration
 // --------------------------------------------------------------
 //
-// QTimer1 is used for GNSS VCLOCK counting and compare.
+// QTimer1 is used for GNSS VCLOCK counting and scheduling.
 //
-// ch0: primary external count source on pin 10 (GNSS 10 MHz)
-// ch1: cascaded extension for 32-bit range
-// ch2: TimePop compare doorbell (low-word compare; full 32-bit qualified in software)
-// ch3: reserved for VCLOCK_TEST / historical compare validation
+// ch0: primary external count source on pin 10 (GNSS 10 MHz, CM=1)
+// ch1: cascaded extension for 32-bit range (CM=7)
+// ch2: TimePop dynamic compare scheduler (priority queue, CM=1)
+// ch3: unallocated (available for future use)
 //
-// NOTE:
-//   The raw QTimer count may reflect dual-edge behavior depending on the
-//   configured input mode. Software consuming this domain must account
-//   for that interpretation explicitly.
+// The raw QTimer count is in 10 MHz ticks (100 ns per tick).
+// No domain translation is required — one tick = one GNSS cycle.
 //
 // The 32-bit QTimer value is read in the PPS ISR alongside
 // GPT1_CNT, GPT2_CNT, and DWT_CYCCNT.
@@ -215,14 +214,14 @@ static constexpr uint32_t QTIMER1_CH0_MASK = 0xFFFF;
 // Domain    Timer           Pin   Clock Source           Resolution
 // -------   -------------   ---   --------------------   ----------
 // DWT       ARM_DWT_CYCCNT   —    CPU core (1008 MHz)    ~1 ns
-// GNSS      QTimer1 ch0+1    10   GF-8802 VCLOCK 10 MHz  50 ns raw
+// GNSS      QTimer1 ch0+1    10   GF-8802 VCLOCK 10 MHz  100 ns
 // OCXO1     GPT1             25   AOCJY1-A #1   10 MHz   100 ns
 // OCXO2     GPT2             14   AOCJY1-A #2   10 MHz   100 ns
 //
-// All timing domains free-run continuously...
+// All timing domains free-run continuously.
 // All are captured simultaneously in the PPS ISR.
 // GPT1 and GPT2 are 32-bit native.
-// QTimer1 is 16-bit cascaded to 32-bit.
+// QTimer1 is 16-bit cascaded to 32-bit (wraps at ~429 seconds).
 // 64-bit extension is via delta accumulation where needed.
 //
 // GNSS VCLOCK is intentionally hosted on QTimer1 because it is the

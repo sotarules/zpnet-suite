@@ -26,10 +26,10 @@
 //
 //   OCXO1 on GPT1 (10 MHz single-edge, 32-bit native).
 //   OCXO2 on GPT2 (10 MHz single-edge, 32-bit native).
-//   GNSS  on QTimer1 (20 MHz dual-edge, cascaded 32-bit).
+//   GNSS  on QTimer1 (10 MHz single-edge, cascaded 32-bit).
 //
-//   Both OCXOs accumulate clean 10 MHz ticks directly.
-//   GNSS accumulates raw 20 MHz and divides by GNSS_EDGE_DIVISOR.
+//   All three 10 MHz domains accumulate ticks directly.
+//   No divisor or domain translation required.
 //
 // ============================================================================
 
@@ -192,8 +192,8 @@ double prediction_stderr(const prediction_tracker_t& p) {
 // ============================================================================
 // 64-bit accumulators — definitions
 //
-// Both OCXOs: GPT single-edge, accumulate 10 MHz ticks directly.
-// GNSS: QTimer1 dual-edge, accumulates raw 20 MHz then divides.
+// All three external clocks accumulate 10 MHz ticks directly.
+// GNSS: QTimer1 single-edge (v23), same as OCXOs on GPT.
 // ============================================================================
 
 uint64_t dwt_cycles_64     = 0;
@@ -496,7 +496,7 @@ void clocks_beta_pps(void) {
     ocxo2_ticks_64    = recover_ocxo2_ns / 100ull;
     prev_ocxo2_at_pps = isr_snap_ocxo2;
 
-    gnss_raw_64       = (recover_gnss_ns / 100ull) * GNSS_EDGE_DIVISOR;
+    gnss_raw_64       = recover_gnss_ns / 100ull;
     prev_gnss_at_pps  = isr_snap_gnss;
 
     campaign_seconds = recover_gnss_ns / 1000000000ull;
@@ -569,7 +569,7 @@ void clocks_beta_pps(void) {
     const uint64_t pps_ocxo2_ticks = ocxo2_ticks_64;
     const uint64_t pps_ocxo2_ns    = pps_ocxo2_ticks * 100ull;
 
-    // ── GNSS: QTimer1, dual-edge, 32-bit raw delta, divide for ticks ──
+    // GNSS: QTimer1, single-edge 10 MHz, 32-bit delt
     uint32_t gnss_raw_delta = isr_snap_gnss - prev_gnss_at_pps;
     gnss_raw_64      += gnss_raw_delta;
     prev_gnss_at_pps  = isr_snap_gnss;
@@ -944,7 +944,7 @@ static Payload cmd_report(const Payload&) {
 // Notes:
 //   - gnss_raw_now is the instantaneous qtimer1_read_32() raw value
 //   - gnss_raw_64 is the campaign-scoped accumulated raw GNSS count
-//   - gnss_ticks_64 is gnss_raw_64 / GNSS_EDGE_DIVISOR
+//   - gnss_ticks_64 is gnss_raw_64 (10 MHz, no divisor)
 //   - gnss_raw_since_pps is current raw delta from the most recent PPS snapshot
 // ============================================================================
 
@@ -1148,10 +1148,9 @@ static Payload cmd_interp_test(const Payload& args) {
     if (interp_signed < 0) { p.add("error", "timebase_gnss_ns_from_dwt failed"); return p; }
     const uint64_t interp_gnss_ns = (uint64_t)interp_signed;
 
-    // GNSS VCLOCK is on QTimer1 (20 MHz raw).  Divide by 2 for 10 MHz ticks.
+    // GNSS VCLOCK is on QTimer1 (10 MHz single-edge).  Raw IS 10 MHz ticks.
     const uint32_t gnss_raw_since_pps = gnss_now - (uint32_t)isr_snap_gnss;
-    const uint64_t gnss_ticks_since_pps = (uint64_t)gnss_raw_since_pps / GNSS_EDGE_DIVISOR;
-    const uint64_t vclock_ns_into_second = gnss_ticks_since_pps * 100ULL;
+    const uint64_t vclock_ns_into_second = (uint64_t)gnss_raw_since_pps * 100ULL;
     const uint64_t vclock_gnss_ns = frag_gnss_ns + vclock_ns_into_second;
     const int64_t error_ns = (int64_t)interp_gnss_ns - (int64_t)vclock_gnss_ns;
     const uint32_t dwt_elapsed = dwt_now - frag_dwt_cyccnt_at_pps;
@@ -1319,8 +1318,7 @@ static Payload cmd_interp_proof(const Payload& args) {
 
   // ── Ground truth: VCLOCK position ──
   const uint32_t gnss_raw_since_pps = gnss_now - (uint32_t)isr_snap_gnss;
-  const uint64_t gnss_ticks_since_pps = (uint64_t)gnss_raw_since_pps / GNSS_EDGE_DIVISOR;
-  const uint64_t vclock_ns_into_second = gnss_ticks_since_pps * 100ULL;
+  const uint64_t vclock_ns_into_second = (uint64_t)gnss_raw_since_pps * 100ULL;
   const uint64_t vclock_gnss_ns = frag_gnss_ns + vclock_ns_into_second;
   const double   position = (double)vclock_ns_into_second / 1000000000.0;
 

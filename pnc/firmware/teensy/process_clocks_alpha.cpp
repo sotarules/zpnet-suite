@@ -2,6 +2,25 @@
 // process_clocks_alpha.cpp — Always-On Physics Layer
 // ============================================================================
 //
+// v23: 10 MHz single-edge QTimer1 migration.
+//
+//   QTimer1 CH0 switched from CM(2) (dual-edge, 20 MHz) to CM(1)
+//   (rising-edge only, 10 MHz).  The raw QTimer counter now runs at
+//   the native GNSS frequency — one tick = one GNSS cycle = 100 ns.
+//
+//   This eliminates the GNSS_EDGE_DIVISOR translation layer:
+//     - qtimer1_read_32() returns 10 MHz ticks directly
+//     - clocks_gnss_ticks_now() no longer divides by 2
+//     - ISR residual math uses ISR_GNSS_RAW_EXPECTED = 10,000,000
+//     - All clock domains (DWT, GNSS, OCXO1, OCXO2) are now in
+//       their natural units with no domain translation
+//
+//   CH1 remains CM(7) (cascade from CH0 overflow) — unchanged.
+//   CH2 is TimePop's dynamic compare scheduler (also CM=1, set by
+//   timepop_init()).  CH3 is unallocated.
+//
+//   32-bit counter wrap extends from ~214s to ~429s at 10 MHz.
+//
 // v21: QTimer1 torn-read prevention.
 //
 //   The GNSS VCLOCK counter is a cascaded 16-bit + 16-bit QTimer1.
@@ -317,6 +336,15 @@ uint64_t clocks_dwt_ns_now(void) {
 // ============================================================================
 // GNSS VCLOCK (10 MHz external via QTimer1 ch0+ch1 — cascaded 32-bit)
 //
+// v23: Single-edge counting (CM=1, 10 MHz).
+//
+//   QTimer1 CH0 counts rising edges only of the GNSS 10 MHz signal.
+//   CH1 cascades from CH0 overflow to form a 32-bit counter.
+//   One tick = one GNSS cycle = 100 ns.
+//
+//   The raw counter value IS the 10 MHz tick count — no divisor needed.
+//   32-bit wrap: 429.5 seconds at 10 MHz.
+//
 // v21: Torn-read prevention.
 //
 //   QTimer1 channels 0 and 1 form a cascaded 32-bit counter, but
@@ -369,7 +397,6 @@ uint32_t qtimer1_read_32(void) {
   diag_qread_last_lo  = lo1;
   diag_qread_last_lo2 = lo2;
 
-  // If the two snapshot reads disagree wildly, count it as a retry-style event.
   if (hi1 != hi2) {
     diag_qread_retry_hi_changed++;
     return ((uint32_t)hi2 << 16) | (uint32_t)lo2;
@@ -407,12 +434,14 @@ static void arm_qtimer1_external(void) {
   IMXRT_TMR1.CH[0].CMPLD1 = 0xFFFF;
   IMXRT_TMR1.CH[1].CMPLD1 = 0xFFFF;
 
-  IMXRT_TMR1.CH[0].CTRL = TMR_CTRL_CM(2) | TMR_CTRL_PCS(0);
+  // v23: CM(1) = count rising edges only = 10 MHz.
+  // Previously CM(2) = dual-edge = 20 MHz.
+  IMXRT_TMR1.CH[0].CTRL = TMR_CTRL_CM(1) | TMR_CTRL_PCS(0);
   IMXRT_TMR1.CH[1].CTRL = TMR_CTRL_CM(7);
 
-  // CH0 and CH1 are passive counter channels only. Production TimePop compare
-  // uses CH2, and VCLOCK_TEST history/forensics may use CH3. Keep CH0 compare
-  // interrupts disabled permanently so the 32-bit counter path remains sovereign.
+  // CH0 and CH1 are passive counter channels only.  TimePop compare
+  // uses CH2.  CH3 is unallocated.  Keep CH0 compare interrupts
+  // disabled permanently so the 32-bit counter path remains sovereign.
   IMXRT_TMR1.CH[0].CSCTRL &= ~TMR_CSCTRL_TCF1EN;
   IMXRT_TMR1.CH[0].CSCTRL |=  TMR_CSCTRL_TCF1;
 
@@ -424,11 +453,12 @@ static void arm_qtimer1_external(void) {
   qtimer1_armed   = true;
 }
 
+// v23: Raw counter IS 10 MHz ticks — no divisor needed.
 uint64_t clocks_gnss_ticks_now(void) {
   uint32_t now = qtimer1_read_32();
   gnss_rolling_raw_64 += (uint32_t)(now - gnss_rolling_32);
   gnss_rolling_32 = now;
-  return gnss_rolling_raw_64 / GNSS_EDGE_DIVISOR;
+  return gnss_rolling_raw_64;
 }
 
 uint64_t clocks_gnss_ns_now(void) {
@@ -564,6 +594,9 @@ static void pps_asap_callback(timepop_ctx_t*, void*) {
 // ============================================================================
 // PPS handling — ISR (minimum latency)
 //
+// v23: ISR_GNSS_RAW_EXPECTED is now 10,000,000 (from internal.h).
+//      No code change here — the constant change propagates automatically.
+//
 // v21: QTimer1 torn-read prevention via high-low-high pattern.
 // v22: Consecutive rejection anomaly threshold.
 // v18: Captures spin loop shadow before setting pps_fired.
@@ -576,6 +609,11 @@ static void pps_isr(void) {
   const uint32_t snap_ocxo2 = GPT2_CNT;
   const uint32_t snap_gnss  = qtimer1_read_32();
 
+  // ── PPS edge validation — reject spurious edges ──
+  //
+  // At 10 MHz, elapsed between valid PPS edges should be exactly
+  // 10,000,000 ± PPS_VCLOCK_TOLERANCE ticks.  Any remainder outside
+  // that window indicates a spurious interrupt, not a real PPS edge.
   if (isr_residual_valid) {
     uint32_t elapsed = snap_gnss - isr_prev_gnss;
     uint32_t remainder = elapsed % ISR_GNSS_RAW_EXPECTED;
@@ -607,12 +645,21 @@ static void pps_isr(void) {
 
   diag_pps_reject_consecutive = 0;
 
+  // ── Capture spin loop shadow before signaling pps_fired ──
   isr_captured_shadow_dwt = dispatch_shadow_dwt;
   pps_fired = true;
 
+  // ── PPS relay pulse to Pi ──
   digitalWriteFast(GNSS_PPS_RELAY, HIGH);
   relay_arm_pending = true;
 
+  // ── ISR-level residuals ──
+  //
+  // All residuals are now in native units:
+  //   DWT:   cycles  (expected ~1,008,000,000)
+  //   GNSS:  10 MHz ticks (expected 10,000,000)
+  //   OCXO1: 10 MHz ticks (expected 10,000,000)
+  //   OCXO2: 10 MHz ticks (expected 10,000,000)
   if (isr_residual_valid) {
     isr_residual_dwt   = (int32_t)(snap_dwt   - isr_prev_dwt)   - (int32_t)ISR_DWT_EXPECTED;
     isr_residual_gnss  = (int32_t)(snap_gnss  - isr_prev_gnss)  - (int32_t)ISR_GNSS_RAW_EXPECTED;
@@ -656,6 +703,11 @@ static void pps_isr(void) {
   }
 
   pps_scheduled = true;
+
+  // Mark first PPS seen for residual tracking on next edge.
+  if (!isr_residual_valid) {
+    isr_residual_valid = true;
+  }
 
   timepop_handle_t h = timepop_arm(0, false, pps_asap_callback, nullptr, "pps");
   if (h == TIMEPOP_INVALID_HANDLE) {
@@ -702,7 +754,7 @@ void process_clocks_init_hardware(void) {
   dwt_enable();
   arm_gpt1_external();      // OCXO1 10 MHz (GPT1, pin 25)
   arm_gpt2_external();      // OCXO2 10 MHz (GPT2, pin 14)
-  arm_qtimer1_external();   // GNSS VCLOCK (QTimer1 ch0, pin 10)
+  arm_qtimer1_external();   // GNSS VCLOCK 10 MHz (QTimer1 ch0+ch1, pin 10)
 }
 
 // ============================================================================

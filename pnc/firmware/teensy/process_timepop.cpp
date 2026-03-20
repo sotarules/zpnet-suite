@@ -1,51 +1,72 @@
 // ============================================================================
-// process_timepop.cpp — TimePop v7.1 (VCLOCK_TEST Removed)
+// process_timepop.cpp — TimePop v8.0 (Priority Queue, 10 MHz Phase-Locked)
 // ============================================================================
 //
+// v8.0: Priority queue with a single hardware comparator.
+//
+//   Architecture:
+//
+//     All four QTimer1 channels now count at 10 MHz (CM=1, rising edge
+//     only).  CH0+CH1 form the passive 32-bit GNSS counter.  CH2 is
+//     the scheduling comparator.  CH3 is unallocated.
+//
+//     Every timer — recurring or one-shot — is nano-precise.  There is
+//     no "standard" vs "nano" distinction.  Every callback receives a
+//     predicted DWT_CYCCNT at its deadline moment.
+//
+//     Scheduling:
+//       After each ISR (and after each arm/cancel), the scheduler scans
+//       all active slots, finds the soonest deadline, and arms CH2's
+//       COMP1 with the low 16 bits of that deadline.  CH2 free-runs at
+//       10 MHz (no LENGTH reset), wrapping every 65,536 ticks = 6.5536 ms.
+//
+//       When CH2's compare fires, the ISR reads the full 32-bit CH0+CH1
+//       counter and qualifies each expired slot against its 32-bit
+//       deadline.  Phantom firings (16-bit alias matches where no 32-bit
+//       deadline is actually due) are detected and dismissed — the ISR
+//       simply rearms CH2 for the next deadline and exits.
+//
+//       A 1 ms ceiling ensures the system never goes silent: if the
+//       next deadline is more than 10,000 ticks away (or no slots are
+//       active), CH2 is armed 10,000 ticks ahead as a housekeeping
+//       heartbeat.
+//
+//     DWT spin:
+//       Every slot has a predicted_dwt computed at arm time.  When the
+//       ISR fires within one QTimer tick (100 ns) of the deadline, it
+//       DWT-spins to the predicted cycle count.  Maximum spin is ~100 ns
+//       ≈ 100 DWT cycles — negligible on a 1008 MHz core.
+//
+//     Phase locking:
+//       Deadlines are expressed in 10 MHz GNSS ticks — the native unit
+//       of every clock domain in ZPNet.  A recurring 1 ms timer fires
+//       at exact GNSS-aligned boundaries: PPS + 10000, PPS + 20000, ...
+//       One tick = 100 ns = one GNSS cycle.  No translation.
+//
+//     ASAP timers:
+//       delay_ns == 0 timers are marked immediately expired and
+//       dispatched on the next timepop_dispatch() call in scheduled
+//       context, bypassing the ISR entirely.
+//
+//   CH2 compare race avoidance:
+//
+//     After writing COMP1, the ISR reads CH2's CNTR.  If the counter
+//     has already passed the compare value (i.e., (COMP1 - CNTR) as
+//     unsigned 16-bit > 0x8000), the compare was missed.  In that case
+//     the ISR handles expired slots immediately rather than waiting for
+//     the next wrap.
+//
+//   Pin assignment:
+//     Pin 10 (GPIO_B0_00, ALT1) — QTimer1 CH0+CH1 — passive 32-bit (10 MHz)
+//     QTimer1 CH2              — dynamic compare (priority queue scheduler)
+//     QTimer1 CH3              — unallocated
+//
 // v7.1: VCLOCK_TEST removed.
-//
-//   VCLOCK_TEST was a proof-of-concept that validated QTimer1 CH3 as
-//   an independent compare/doorbell channel for GNSS scheduling.  The
-//   POC succeeded and its findings are incorporated into the production
-//   TimePop architecture.  CH3 is now unallocated and available for
-//   future use.
-//
-//   Removed: CH3 init, CH3 doorbell ISR, vclock_test_* state/helpers/
-//   context struct, cmd_vclock_test command, related diagnostics.
-//   The shared QTimer1 ISR now checks only CH2.
-//
-// v7.0: CH2 reconfigured as a periodic 1 ms heartbeat.
-//
-//   v6.0 corrected the CH2 compare domain (delta-from-CH2-CNTR), but
-//   QTimer 16-bit compare at 20 MHz is fundamentally unreliable for
-//   short-period scheduling: the counter wraps every 3.28 ms, and the
-//   write-to-COMP1 races the counter, hitting only ~19% of the time.
-//
-//   v7.0 eliminates dynamic compare scheduling entirely.  CH2 is now
-//   configured with LENGTH=1 so it resets to LOAD (0) when CNTR reaches
-//   COMP1 (19,999 = 20,000 counts = 1 ms at 20 MHz).  CMPLD1 auto-
-//   reloads the same value on each match, producing a perpetual 1 kHz
-//   interrupt.
-//
-//   The ISR fires every 1 ms unconditionally and checks all slot
-//   deadlines against the full 32-bit CH0+CH1 counter.  No dynamic
-//   compare arming, no domain translation, no race conditions.
-//
-//   The cost is one ISR entry per millisecond even when idle — trivial
-//   overhead on a 1008 MHz Cortex-M7 (~50 cycles per entry/exit).
-//
+// v7.0: CH2 as periodic 1 ms heartbeat (superseded by v8.0).
 // v5.0: Continuous DWT prediction and GNSS-now validation.
 // v4.3: Comprehensive forensic diagnostics.
-// v4.2: Caller-owns-target for nano-precise timers.
-// v4.1: NS_TEST full forensics.
 // v4: DWT nano-spin ISR delivery.
-// v3.1: INTERP_TEST Path 2 epoch fix.
 // v3: TEST and INTERP_TEST use time.h.  Campaign-independent.
-//
-// Pin assignment:
-//   Pin 10 (GPIO_B0_00, ALT1) — QTimer1 CH0+CH1 — passive 32-bit counting
-//   QTimer1 CH2              — 1 ms periodic heartbeat (TimePop production)
-//   QTimer1 CH3              — unallocated (available for future use)
 //
 // ============================================================================
 
@@ -70,22 +91,30 @@
 #include <climits>
 
 // ============================================================================
-// Constants
+// Constants — 10 MHz domain
 // ============================================================================
 
 static constexpr uint32_t MAX_SLOTS = 16;
-static constexpr uint64_t NS_PER_TICK = 50ULL;
+
+// One QTimer tick at 10 MHz = 100 ns.
+static constexpr uint64_t NS_PER_TICK = 100ULL;
+
+// 32-bit unsigned deadline math: any (deadline - now) above this is "expired".
 static constexpr uint32_t MAX_DELAY_TICKS = 0x7FFFFFFFU;
+
+// Minimum arm distance — prevents degenerate compare races.
 static constexpr uint32_t MIN_DELAY_TICKS = 2;
-static constexpr uint32_t NANO_EARLY_TICKS = 100;         // 10 us early arrival
-static constexpr uint32_t NANO_SPIN_MAX_CYCLES = 11000;   // ~10.9 us timeout
 
-// CH2 periodic heartbeat: 20,000 counts at 20 MHz = 1 ms.
-// COMP1 value is count-1 because match fires when CNTR reaches this value.
-static constexpr uint16_t CH2_HEARTBEAT_COMP = 19999;
+// 1 ms ceiling heartbeat: 10,000 ticks at 10 MHz.
+// If the next deadline is farther away (or no slots active), arm this far ahead.
+static constexpr uint32_t HEARTBEAT_TICKS = 10000;
 
-// Staleness limit for DWT prediction: 30,000,000 raw ticks = 1.5 seconds.
-static constexpr uint32_t PREDICT_MAX_QTIMER_ELAPSED = 30000000U;
+// DWT spin budget: 110 DWT cycles ≈ 109 ns at 1008 MHz.
+// One QTimer tick is 100 ns ≈ ~101 DWT cycles, so 110 gives margin.
+static constexpr uint32_t DWT_SPIN_MAX_CYCLES = 110;
+
+// Staleness limit for DWT prediction: 15,000,000 ticks = 1.5 seconds at 10 MHz.
+static constexpr uint32_t PREDICT_MAX_QTIMER_ELAPSED = 15000000U;
 
 // ============================================================================
 // Welford accumulator (ISR-safe: only written from dispatch context)
@@ -135,35 +164,28 @@ struct timepop_slot_t {
   bool                active;
   bool                expired;
   bool                recurring;
-  bool                nano_precise;
 
   timepop_handle_t    handle;
-  uint32_t            deadline;
+  uint32_t            deadline;       // 32-bit QTimer1 10 MHz tick
   uint32_t            fire_vclock_raw;
   uint32_t            period_ticks;
   uint64_t            period_ns;
 
-  int64_t             target_gnss_ns;
-  uint32_t            target_dwt;
+  int64_t             target_gnss_ns; // for arm_ns callers
   int64_t             fire_gnss_ns;
-  bool                nano_timeout;
 
   uint32_t            fire_dwt_cyccnt;
 
-  // ── v5.0: time.h anchor snapshot at ISR fire ──
+  // ── time.h anchor snapshot at ISR fire ──
   uint32_t            anchor_dwt_at_pps;
   uint32_t            anchor_dwt_cycles_per_s;
   uint32_t            anchor_qtimer_at_pps;
   uint32_t            anchor_pps_count;
   bool                anchor_valid;
 
-  // ── v5.0: DWT prediction ──
+  // ── DWT prediction ──
   uint32_t            predicted_dwt;
   bool                prediction_valid;
-
-  // ── v5.0: Deferred Welford ──
-  bool                nano_callback_fired;
-  uint32_t            fire_pps_count;
 
   timepop_callback_t  callback;
   void*               user_data;
@@ -184,14 +206,13 @@ static uint32_t       next_handle = 1;
 
 static volatile uint32_t isr_fire_count     = 0;
 static volatile uint32_t expired_count      = 0;
-static volatile uint32_t nano_spin_count    = 0;
-static volatile uint32_t nano_timeout_count = 0;
+static volatile uint32_t phantom_count      = 0;
 
-// ── v4.3: Slot pressure ──
+// ── Slot pressure ──
 static volatile uint32_t diag_slots_high_water  = 0;
 static volatile uint32_t diag_arm_failures      = 0;
 
-// ── v4.3: ASAP tracking ──
+// ── ASAP tracking ──
 static volatile uint32_t diag_asap_armed             = 0;
 static volatile uint32_t diag_asap_dispatched         = 0;
 static volatile uint32_t diag_asap_arm_failures       = 0;
@@ -199,27 +220,30 @@ static volatile uint32_t diag_asap_last_armed_dwt     = 0;
 static volatile uint32_t diag_asap_last_dispatch_dwt  = 0;
 static volatile const char* diag_asap_last_armed_name = nullptr;
 
-// ── v4.3: Dispatch health ──
+// ── Dispatch health ──
 static volatile uint32_t diag_dispatch_calls     = 0;
 static volatile uint32_t diag_dispatch_callbacks = 0;
 
-// ── v5.0: Continuous validation Welford accumulators ──
+// ── Continuous validation Welford accumulators ──
 static welford_t welford_dwt_prediction = {};
 static welford_t welford_gnss_now       = {};
 
-// ── v5.0: Dispatch-level sample counts ──
+// ── Dispatch-level sample counts ──
 static volatile uint32_t diag_prediction_samples = 0;
 static volatile uint32_t diag_prediction_skipped = 0;
 
-// ── v7.0: Heartbeat and IRQ diagnostics ──
-static volatile uint32_t diag_heartbeat_count    = 0;
-static volatile uint32_t diag_qtimer1_irq_count  = 0;
+// ── v8.0: Scheduler diagnostics ──
+static volatile uint32_t diag_isr_count          = 0;
+static volatile uint32_t diag_rearm_count        = 0;
+static volatile uint32_t diag_heartbeat_rearms   = 0;
+static volatile uint32_t diag_race_recoveries    = 0;
 
 // ============================================================================
 // Forward declarations
 // ============================================================================
 
 static void qtimer1_irq_isr(void);
+static void schedule_next(void);
 
 // ============================================================================
 // Slot counting helper (called with interrupts disabled)
@@ -236,17 +260,13 @@ static inline void update_slot_high_water(void) {
 }
 
 // ============================================================================
-// QTimer1 raw VCLOCK helpers
+// QTimer1 raw VCLOCK helpers — 10 MHz domain
 // ============================================================================
 
 static inline uint32_t vclock_count(void) { return qtimer1_read_32(); }
 
 static inline bool deadline_expired(uint32_t deadline, uint32_t now) {
   return (deadline - now) > MAX_DELAY_TICKS;
-}
-
-static inline bool deadline_sooner(uint32_t a, uint32_t b, uint32_t now) {
-  return (a - now) < (b - now);
 }
 
 static inline uint32_t ns_to_ticks(uint64_t ns) {
@@ -257,7 +277,7 @@ static inline uint32_t ns_to_ticks(uint64_t ns) {
 }
 
 // ============================================================================
-// DWT prediction helper
+// DWT prediction helper — 10 MHz domain
 // ============================================================================
 
 static uint32_t predict_dwt_at_deadline(uint32_t deadline, bool& valid) {
@@ -272,7 +292,8 @@ static uint32_t predict_dwt_at_deadline(uint32_t deadline, bool& valid) {
   // Staleness guard: reject predictions spanning > 1.5 seconds.
   if (qtimer_elapsed > PREDICT_MAX_QTIMER_ELAPSED) return 0;
 
-  const uint64_t ns_elapsed = (uint64_t)qtimer_elapsed * 50ULL;
+  // 10 MHz: 1 tick = 100 ns.
+  const uint64_t ns_elapsed = (uint64_t)qtimer_elapsed * NS_PER_TICK;
 
   const uint64_t dwt_elapsed =
     (ns_elapsed * (uint64_t)snap.dwt_cycles_per_s + 500000000ULL) / 1000000000ULL;
@@ -282,15 +303,110 @@ static uint32_t predict_dwt_at_deadline(uint32_t deadline, bool& valid) {
 }
 
 // ============================================================================
-// QTimer1 CH2 heartbeat management
+// CH2 compare management — dynamic priority queue scheduler
 //
-// v7.0: CH2 runs as a free-running periodic timer.  No dynamic compare
-// arming — the ISR fires every 1 ms unconditionally and checks deadlines
-// in software against the full 32-bit CH0+CH1 counter.
+// CH2 counts at 10 MHz (CM=1, PCS=0, no LENGTH).  Its 16-bit counter
+// free-runs in phase with CH0 (they count the same edges).  COMP1 is
+// written to the low 16 bits of the next soonest deadline.  When CNTR
+// matches COMP1, the ISR fires.
+//
+// 16-bit alias period: 65,536 ticks = 6.5536 ms at 10 MHz.
+// Phantom firings are resolved by 32-bit qualification in the ISR.
+//
+// Race avoidance: after writing COMP1, read CNTR.  If the compare
+// point has already passed, handle it immediately.
 // ============================================================================
 
 static inline void ch2_clear_flag(void) {
   IMXRT_TMR1.CH[2].CSCTRL &= ~(TMR_CSCTRL_TCF1 | TMR_CSCTRL_TCF2);
+}
+
+static inline void ch2_arm_compare(uint16_t target_low16) {
+  ch2_clear_flag();
+  IMXRT_TMR1.CH[2].COMP1  = target_low16;
+  IMXRT_TMR1.CH[2].CMPLD1 = target_low16;
+  ch2_clear_flag();
+  IMXRT_TMR1.CH[2].CSCTRL |= TMR_CSCTRL_TCF1EN;
+}
+
+// ============================================================================
+// schedule_next — scan all slots, arm CH2 for the soonest deadline.
+//
+// Called from:
+//   - The ISR after processing expired slots
+//   - timepop_arm / timepop_arm_ns after inserting a new slot
+//   - timepop_cancel after removing a slot
+//
+// Must be called with interrupts disabled.
+// ============================================================================
+
+static void schedule_next(void) {
+  const uint32_t now = vclock_count();
+  uint32_t soonest = 0;
+  bool found = false;
+
+  for (uint32_t i = 0; i < MAX_SLOTS; i++) {
+    if (!slots[i].active || slots[i].expired) continue;
+
+    // Already past due — mark pending and let dispatch handle it.
+    if (deadline_expired(slots[i].deadline, now)) {
+      slots[i].expired = true;
+      expired_count++;
+      timepop_pending = true;
+      continue;
+    }
+
+    if (!found || ((slots[i].deadline - now) < (soonest - now))) {
+      soonest = slots[i].deadline;
+      found = true;
+    }
+  }
+
+  uint32_t target;
+  if (!found) {
+    // No active non-expired slots — arm 1 ms heartbeat ceiling.
+    target = now + HEARTBEAT_TICKS;
+    diag_heartbeat_rearms++;
+  } else {
+    uint32_t distance = soonest - now;
+    if (distance > HEARTBEAT_TICKS) {
+      // Deadline is far away — arm ceiling heartbeat to stay alive.
+      target = now + HEARTBEAT_TICKS;
+      diag_heartbeat_rearms++;
+    } else {
+      target = soonest;
+    }
+  }
+
+  ch2_arm_compare((uint16_t)(target & 0xFFFF));
+  diag_rearm_count++;
+
+  // ── Race check: did the counter already pass our compare point? ──
+  const uint16_t cntr = IMXRT_TMR1.CH[2].CNTR;
+  const uint16_t comp = (uint16_t)(target & 0xFFFF);
+  const uint16_t distance_16 = comp - cntr;
+
+  // If distance_16 > 0x8000, the counter has already passed the compare
+  // value — the compare won't fire until the next 16-bit wrap (~6.5 ms).
+  // Check if the 32-bit deadline is actually past due now.
+  if (distance_16 > 0x8000u) {
+    const uint32_t now2 = vclock_count();
+    if (found && deadline_expired(soonest, now2)) {
+      // The soonest deadline has passed.  Flag it and let the main
+      // loop handle it via timepop_dispatch().  The ISR will fire
+      // on the next 16-bit wrap (~6.5 ms) or sooner if schedule_next
+      // is called again — but timepop_dispatch() will process it first.
+      for (uint32_t i = 0; i < MAX_SLOTS; i++) {
+        if (!slots[i].active || slots[i].expired) continue;
+        if (deadline_expired(slots[i].deadline, now2)) {
+          slots[i].expired = true;
+          expired_count++;
+          timepop_pending = true;
+        }
+      }
+      diag_race_recoveries++;
+    }
+  }
 }
 
 // ============================================================================
@@ -323,27 +439,30 @@ static inline void slot_build_ctx(
   ctx.handle          = slot.handle;
   ctx.fire_vclock_raw = slot.fire_vclock_raw;
   ctx.deadline        = slot.deadline;
-  ctx.fire_ns         = (int32_t)(slot.fire_vclock_raw - slot.deadline) * 50;
+  ctx.fire_ns         = (int32_t)(slot.fire_vclock_raw - slot.deadline) * (int32_t)NS_PER_TICK;
   ctx.fire_gnss_ns    = slot.fire_gnss_ns;
-  ctx.nano_precise    = slot.nano_precise;
-  ctx.nano_timeout    = slot.nano_timeout;
+  ctx.nano_precise    = true;
+  ctx.nano_timeout    = false;
   ctx.fire_dwt_cyccnt = slot.fire_dwt_cyccnt;
 }
 
 // ============================================================================
-// QTimer1 CH2 heartbeat ISR — fires every 1 ms
+// QTimer1 CH2 ISR — priority queue scheduler
+//
+// Fires when CH2's 16-bit CNTR matches COMP1.  May be a real deadline
+// or a phantom (16-bit alias).  The ISR qualifies against the full
+// 32-bit counter and DWT-spins to the predicted cycle count for each
+// expired slot.
 // ============================================================================
 
-static void qtimer1_ch2_heartbeat_isr(void) {
+static void qtimer1_ch2_isr(void) {
 
-  const uint32_t dwt_raw = ARM_DWT_CYCCNT;
-  const uint32_t dwt_now = dwt_at_qtimer1_ch2_compare(dwt_raw);
-  const uint32_t now     = qtimer1_read_32();
-
+  const uint32_t dwt_entry = ARM_DWT_CYCCNT;
+  const uint32_t now       = qtimer1_read_32();
   const time_anchor_snapshot_t anchor = time_anchor_snapshot();
 
   ch2_clear_flag();
-  diag_heartbeat_count++;
+  diag_isr_count++;
 
   bool any_expired = false;
 
@@ -351,43 +470,55 @@ static void qtimer1_ch2_heartbeat_isr(void) {
     if (!slots[i].active || slots[i].expired) continue;
     if (!deadline_expired(slots[i].deadline, now)) continue;
 
-    if (slots[i].nano_precise) {
-      const uint32_t target_dwt = slots[i].target_dwt;
-      uint32_t spin_start = ARM_DWT_CYCCNT;
-      bool timed_out = false;
+    // ── DWT fire moment determination ──
+    //
+    // The compare event fired at the QTimer tick corresponding to
+    // this slot's deadline.  The predicted_dwt is our best estimate
+    // of the DWT_CYCCNT at that exact tick.
+    //
+    // Three cases:
+    //
+    //   1. predicted_dwt is in the future relative to dwt_entry:
+    //      The ISR arrived early (rare, possible with cascaded slots).
+    //      Spin forward to the target.  Maximum spin: ~100 DWT cycles.
+    //
+    //   2. predicted_dwt is in the past relative to dwt_entry:
+    //      The ISR entry latency + processing overhead consumed the
+    //      window.  The compare DID fire at the right QTimer tick.
+    //      The predicted DWT at that tick is our best truth — use it
+    //      directly.  No spin needed.
+    //
+    //   3. No valid prediction: use dwt_entry as-is.
 
-      while ((int32_t)(target_dwt - ARM_DWT_CYCCNT) > 0) {
-        if ((ARM_DWT_CYCCNT - spin_start) > NANO_SPIN_MAX_CYCLES) {
-          timed_out = true;
-          break;
+    uint32_t landed_dwt;
+
+    if (slots[i].prediction_valid) {
+      const uint32_t target_dwt = slots[i].predicted_dwt;
+
+      if ((int32_t)(target_dwt - dwt_entry) > 0) {
+        // Case 1: target is still ahead — spin to it.
+        const uint32_t spin_start = ARM_DWT_CYCCNT;
+
+        while ((int32_t)(target_dwt - ARM_DWT_CYCCNT) > 0) {
+          if ((ARM_DWT_CYCCNT - spin_start) > DWT_SPIN_MAX_CYCLES) {
+            break;
+          }
         }
-      }
 
-      const uint32_t landed_dwt = ARM_DWT_CYCCNT;
-      nano_spin_count++;
-
-      slots[i].nano_timeout = timed_out;
-      if (timed_out) {
-        nano_timeout_count++;
-        slots[i].fire_gnss_ns = -1;
+        landed_dwt = ARM_DWT_CYCCNT;
       } else {
-        slots[i].fire_gnss_ns = time_dwt_to_gnss_ns(landed_dwt);
+        // Case 2: target already passed — the compare fired on time,
+        // ISR overhead consumed the window.  Trust the prediction.
+        landed_dwt = target_dwt;
       }
-
-      slot_capture(slots[i], now, landed_dwt, anchor);
-
-      timepop_ctx_t ctx;
-      slot_build_ctx(slots[i], ctx);
-      slots[i].callback(&ctx, slots[i].user_data);
-
-      slots[i].nano_callback_fired = true;
-      slots[i].expired = true;
-      expired_count++;
-      any_expired = true;
-      continue;
+    } else {
+      // Case 3: no prediction available.
+      landed_dwt = dwt_entry;
     }
 
-    slot_capture(slots[i], now, dwt_now, anchor);
+    slots[i].fire_gnss_ns = time_dwt_to_gnss_ns(landed_dwt);
+    slot_capture(slots[i], now, landed_dwt, anchor);
+
     slots[i].expired = true;
     expired_count++;
     any_expired = true;
@@ -396,7 +527,12 @@ static void qtimer1_ch2_heartbeat_isr(void) {
   if (any_expired) {
     isr_fire_count++;
     timepop_pending = true;
+  } else {
+    phantom_count++;
   }
+
+  // Rearm CH2 for the next soonest deadline (or heartbeat ceiling).
+  schedule_next();
 }
 
 // ============================================================================
@@ -409,38 +545,46 @@ void timepop_init(void) {
   welford_dwt_prediction.reset();
   welford_gnss_now.reset();
 
-  // ── Production TimePop heartbeat on QTimer1 CH2 ──
+  // ── QTimer1 CH2 — dynamic compare scheduler ──
   //
   // CH0+CH1 are already running as the passive 32-bit GNSS counter
-  // in process_clocks.  CH2 is configured as a periodic 1 ms heartbeat:
+  // (10 MHz, CM=1) in process_clocks.  CH2 is configured to count
+  // the same 10 MHz input, free-running (no LENGTH reset):
   //
-  //   CM=2    — count rising AND falling edges of primary source (20 MHz)
+  //   CM=1    — count rising edges only (10 MHz)
   //   PCS=0   — primary clock source = Counter 0's input pin (GNSS 10 MHz)
-  //   LENGTH  — reset CNTR to LOAD when CNTR reaches COMP1
+  //   No LENGTH — CNTR free-runs, wraps at 65535 → 0 every 6.5536 ms
   //
-  //   COMP1 = 19999 → match at 20,000 counts = 1 ms
-  //   CMPLD1 = 19999 → auto-reload on each match (perpetual)
-  //   LOAD = 0 → reset to zero on match
+  // COMP1 is dynamically set to the low 16 bits of the next deadline.
+  // CMPLD1 auto-reloads COMP1 on match (keeps value stable).
+  // TCF1EN enables the compare interrupt.
   //
-  // The ISR fires every 1 ms and checks all slot deadlines against the
-  // full 32-bit CH0+CH1 counter.  No dynamic compare arming needed.
+  // Initial compare: 1 ms heartbeat ceiling.
   //
   IMXRT_TMR1.CH[2].CTRL   = 0;
   IMXRT_TMR1.CH[2].CNTR   = 0;
   IMXRT_TMR1.CH[2].LOAD   = 0;
-  IMXRT_TMR1.CH[2].COMP1  = CH2_HEARTBEAT_COMP;
-  IMXRT_TMR1.CH[2].CMPLD1 = CH2_HEARTBEAT_COMP;
+  IMXRT_TMR1.CH[2].COMP1  = 0xFFFF;   // will be set by schedule_next()
+  IMXRT_TMR1.CH[2].CMPLD1 = 0xFFFF;
   IMXRT_TMR1.CH[2].SCTRL  = 0;
   IMXRT_TMR1.CH[2].CSCTRL = TMR_CSCTRL_TCF1EN;
-  IMXRT_TMR1.CH[2].CTRL   = TMR_CTRL_CM(2) | TMR_CTRL_PCS(0) | TMR_CTRL_LENGTH;
+  IMXRT_TMR1.CH[2].CTRL   = TMR_CTRL_CM(1) | TMR_CTRL_PCS(0);
 
   attachInterruptVector(IRQ_QTIMER1, qtimer1_irq_isr);
   NVIC_SET_PRIORITY(IRQ_QTIMER1, 16);
   NVIC_ENABLE_IRQ(IRQ_QTIMER1);
+
+  // Arm initial 1 ms heartbeat.
+  noInterrupts();
+  schedule_next();
+  interrupts();
 }
 
 // ============================================================================
-// Arm — standard
+// Arm — standard (delay in nanoseconds)
+//
+// All timers are nano-precise.  The deadline is placed in the 10 MHz
+// QTimer domain, and a DWT prediction is computed at arm time.
 // ============================================================================
 
 timepop_handle_t timepop_arm(
@@ -467,7 +611,6 @@ timepop_handle_t timepop_arm(
     slots[i].active       = true;
     slots[i].expired      = is_asap;
     slots[i].recurring    = recurring;
-    slots[i].nano_precise = false;
     slots[i].handle       = h;
     slots[i].period_ns    = delay_ns;
     slots[i].period_ticks = ticks;
@@ -475,6 +618,7 @@ timepop_handle_t timepop_arm(
     slots[i].user_data    = user_data;
     slots[i].name         = name;
     slots[i].fire_gnss_ns = -1;
+    slots[i].target_gnss_ns = -1;
 
     if (is_asap) {
       slots[i].deadline = 0;
@@ -489,6 +633,14 @@ timepop_handle_t timepop_arm(
 
       slots[i].predicted_dwt = predict_dwt_at_deadline(
         slots[i].deadline, slots[i].prediction_valid);
+
+      // Compute target GNSS nanosecond from QTimer deadline via PPS anchor.
+      if (slots[i].prediction_valid) {
+        slots[i].target_gnss_ns = time_dwt_to_gnss_ns(slots[i].predicted_dwt);
+      }
+
+      // New slot may be sooner than current CH2 target — reschedule.
+      schedule_next();
     }
 
     update_slot_high_water();
@@ -505,7 +657,10 @@ timepop_handle_t timepop_arm(
 }
 
 // ============================================================================
-// Arm — nano-precise
+// Arm — nano-precise (target GNSS nanosecond + DWT)
+//
+// The caller specifies a target GNSS nanosecond and the corresponding
+// DWT cycle count.  The QTimer deadline is derived from the delay.
 // ============================================================================
 
 timepop_handle_t timepop_arm_ns(
@@ -525,13 +680,9 @@ timepop_handle_t timepop_arm_ns(
   if (delay_ns <= 0) return TIMEPOP_INVALID_HANDLE;
 
   uint32_t delay_ticks = ns_to_ticks((uint64_t)delay_ns);
-  uint32_t vclock_deadline;
+  if (delay_ticks < MIN_DELAY_TICKS) delay_ticks = MIN_DELAY_TICKS;
 
-  if (delay_ticks > NANO_EARLY_TICKS) {
-    vclock_deadline = vclock_count() + delay_ticks - NANO_EARLY_TICKS;
-  } else {
-    vclock_deadline = vclock_count() + MIN_DELAY_TICKS;
-  }
+  uint32_t vclock_deadline = vclock_count() + delay_ticks;
 
   noInterrupts();
 
@@ -542,23 +693,24 @@ timepop_handle_t timepop_arm_ns(
     if (next_handle == TIMEPOP_INVALID_HANDLE) next_handle = 1;
 
     slots[i] = {};
-    slots[i].active       = true;
-    slots[i].expired      = false;
-    slots[i].recurring    = false;
-    slots[i].nano_precise = true;
-    slots[i].handle       = h;
-    slots[i].period_ns    = 0;
-    slots[i].period_ticks = 0;
-    slots[i].deadline     = vclock_deadline;
+    slots[i].active         = true;
+    slots[i].expired        = false;
+    slots[i].recurring      = false;
+    slots[i].handle         = h;
+    slots[i].period_ns      = 0;
+    slots[i].period_ticks   = 0;
+    slots[i].deadline       = vclock_deadline;
     slots[i].target_gnss_ns = target_gnss_ns;
-    slots[i].target_dwt     = target_dwt;
-    slots[i].callback     = callback;
-    slots[i].user_data    = user_data;
-    slots[i].name         = name;
-    slots[i].fire_gnss_ns = -1;
+    slots[i].callback       = callback;
+    slots[i].user_data      = user_data;
+    slots[i].name           = name;
+    slots[i].fire_gnss_ns   = -1;
 
     slots[i].predicted_dwt    = target_dwt;
     slots[i].prediction_valid = true;
+
+    // New slot may be sooner than current CH2 target — reschedule.
+    schedule_next();
 
     update_slot_high_water();
 
@@ -583,6 +735,7 @@ bool timepop_cancel(timepop_handle_t handle) {
   for (uint32_t i = 0; i < MAX_SLOTS; i++) {
     if (slots[i].active && slots[i].handle == handle) {
       slots[i].active = false;
+      schedule_next();
       interrupts();
       return true;
     }
@@ -602,6 +755,7 @@ uint32_t timepop_cancel_by_name(const char* name) {
       cancelled++;
     }
   }
+  if (cancelled > 0) schedule_next();
   interrupts();
   return cancelled;
 }
@@ -621,45 +775,61 @@ static void emit_deferred_ns_test(void) {
 }
 
 // ============================================================================
-// Slot-level Welford update
+// Slot-level Welford update — 10 MHz domain
 // ============================================================================
 
 static void slot_welford_update(const timepop_slot_t& slot) {
 
-  if (!slot.prediction_valid || !slot.anchor_valid ||
-      slot.anchor_dwt_cycles_per_s == 0) {
+  // Gate: need valid prediction and a target GNSS nanosecond.
+  if (!slot.prediction_valid || slot.target_gnss_ns <= 0) {
     diag_prediction_skipped++;
     return;
   }
 
-  const uint32_t pps = slot.anchor_pps_count;
-  if (pps < 2) {
+  if (slot.fire_gnss_ns <= 0) {
     diag_prediction_skipped++;
     return;
   }
 
-  const int32_t dwt_residual =
-    (int32_t)(slot.fire_dwt_cyccnt - slot.predicted_dwt);
-  welford_dwt_prediction.update((int64_t)dwt_residual);
+  // ── Primary residual: GNSS delivery accuracy ──
+  //
+  // How close did we land to the intended GNSS nanosecond?
+  // This is the authoritative measure of TimePop precision.
+  // Computed entirely in the GNSS domain — no DWT prediction
+  // error, no ISR latency, no multi-slot sequential bias.
+  const int64_t gnss_residual = slot.fire_gnss_ns - slot.target_gnss_ns;
+  welford_dwt_prediction.update(gnss_residual);
 
-  const int64_t epoch_ns = (int64_t)(pps - 1) * (int64_t)1000000000LL;
+  // ── Cross-check: DWT-interpolated ns vs QTimer-derived ns ──
+  //
+  // Validates that time_dwt_to_gnss_ns() and the QTimer position
+  // agree at the fire moment.  Independent of scheduling accuracy.
+  if (slot.anchor_valid && slot.anchor_dwt_cycles_per_s > 0 &&
+      slot.anchor_pps_count >= 2) {
 
-  const uint32_t qtimer_since_pps = slot.fire_vclock_raw - slot.anchor_qtimer_at_pps;
-  const int64_t vclock_gnss_ns = epoch_ns + (int64_t)((uint64_t)qtimer_since_pps * 50ULL);
+    const int64_t epoch_ns = (int64_t)(slot.anchor_pps_count - 1) * (int64_t)1000000000LL;
 
-  const uint32_t dwt_elapsed = slot.fire_dwt_cyccnt - slot.anchor_dwt_at_pps;
-  const uint64_t dwt_ns_into_second =
-    ((uint64_t)dwt_elapsed * 1000000000ULL + (uint64_t)slot.anchor_dwt_cycles_per_s / 2)
-    / (uint64_t)slot.anchor_dwt_cycles_per_s;
-  const int64_t dwt_gnss_ns = epoch_ns + (int64_t)dwt_ns_into_second;
+    const uint32_t qtimer_since_pps = slot.fire_vclock_raw - slot.anchor_qtimer_at_pps;
+    const int64_t vclock_gnss_ns = epoch_ns + (int64_t)((uint64_t)qtimer_since_pps * NS_PER_TICK);
 
-  const int64_t gnss_residual = dwt_gnss_ns - vclock_gnss_ns;
-  welford_gnss_now.update(gnss_residual);
+    const uint32_t dwt_elapsed = slot.fire_dwt_cyccnt - slot.anchor_dwt_at_pps;
+    const uint64_t dwt_ns_into_second =
+      ((uint64_t)dwt_elapsed * 1000000000ULL + (uint64_t)slot.anchor_dwt_cycles_per_s / 2)
+      / (uint64_t)slot.anchor_dwt_cycles_per_s;
+    const int64_t dwt_gnss_ns = epoch_ns + (int64_t)dwt_ns_into_second;
+
+    const int64_t crosscheck_residual = dwt_gnss_ns - vclock_gnss_ns;
+    welford_gnss_now.update(crosscheck_residual);
+      }
+
   diag_prediction_samples++;
 }
 
 // ============================================================================
-// Dispatch
+// Dispatch — scheduled context
+//
+// All callbacks fire here (not in ISR).  The ISR marks slots expired
+// and captures fire state; dispatch invokes the actual callbacks.
 // ============================================================================
 
 void timepop_dispatch(void) {
@@ -677,8 +847,7 @@ void timepop_dispatch(void) {
     slots[i].expired = false;
 
     // ── ASAP ──
-    if (!slots[i].nano_precise &&
-        slots[i].period_ns == 0 && !slots[i].recurring) {
+    if (slots[i].period_ns == 0 && !slots[i].recurring) {
 
       timepop_ctx_t ctx;
       slot_build_ctx(slots[i], ctx);
@@ -697,20 +866,7 @@ void timepop_dispatch(void) {
       continue;
     }
 
-    // ── Nano-precise ──
-    if (slots[i].nano_precise) {
-
-      if (!slots[i].nano_timeout) {
-        slot_welford_update(slots[i]);
-      } else {
-        diag_prediction_skipped++;
-      }
-
-      slots[i].active = false;
-      continue;
-    }
-
-    // ── Standard ──
+    // ── Timed (all are nano-precise) ──
 
     timepop_ctx_t ctx;
     slot_build_ctx(slots[i], ctx);
@@ -735,7 +891,18 @@ void timepop_dispatch(void) {
         }
 
         slots[i].predicted_dwt = predict_dwt_at_deadline(
-          slots[i].deadline, slots[i].prediction_valid);
+                  slots[i].deadline, slots[i].prediction_valid);
+
+        if (slots[i].prediction_valid) {
+          slots[i].target_gnss_ns = time_dwt_to_gnss_ns(slots[i].predicted_dwt);
+        }
+
+        slots[i].expired = false;
+
+        // Rearmed slot may affect the schedule.
+        noInterrupts();
+        schedule_next();
+        interrupts();
       }
     } else {
       slots[i].active = false;
@@ -756,7 +923,7 @@ uint32_t timepop_active_count(void) {
 }
 
 // ============================================================================
-// TEST command
+// TEST command — standard timer accuracy
 // ============================================================================
 
 struct test_context_t {
@@ -780,7 +947,7 @@ static void test_timer_callback(timepop_ctx_t* ctx, void*) {
   if (measured_ns >= 0)
     error_ns = measured_ns - (int64_t)test_ctx.requested_ns;
 
-  int32_t dispatch_ns = (int32_t)(cb_vclock - ctx->fire_vclock_raw) * 50;
+  int32_t dispatch_ns = (int32_t)(cb_vclock - ctx->fire_vclock_raw) * (int32_t)NS_PER_TICK;
   uint32_t end_pps = time_pps_count();
 
   Payload ev;
@@ -951,7 +1118,7 @@ static void interp_test_callback(timepop_ctx_t* ctx, void*) {
       const int64_t epoch_ns = (int64_t)(snap.pps_count - 1) * (int64_t)1000000000LL;
 
       const uint32_t vclock_since_pps = ctx->fire_vclock_raw - snap.qtimer_at_pps;
-      vclock_ns_into_second = (uint64_t)vclock_since_pps * 50ULL;
+      vclock_ns_into_second = (uint64_t)vclock_since_pps * NS_PER_TICK;
       const int64_t vclock_gnss_ns = epoch_ns + (int64_t)vclock_ns_into_second;
 
       const uint32_t dwt_elapsed = ctx->fire_dwt_cyccnt - snap.dwt_at_pps;
@@ -972,7 +1139,7 @@ static void interp_test_callback(timepop_ctx_t* ctx, void*) {
     const uint32_t fire_vclock_raw   = qtimer1_read_32();
     if (itest_ctx.arm_time_ns >= 0 && fire_time_ns >= 0) {
       const int64_t time_delta_ns   = fire_time_ns - itest_ctx.arm_time_ns;
-      const int64_t vclock_delta_ns = (int64_t)((uint32_t)(fire_vclock_raw - itest_ctx.arm_vclock_raw)) * 50LL;
+      const int64_t vclock_delta_ns = (int64_t)((uint32_t)(fire_vclock_raw - itest_ctx.arm_vclock_raw)) * (int64_t)NS_PER_TICK;
       path2_error_ns = time_delta_ns - vclock_delta_ns;
       path2_valid = true;
     }
@@ -1067,16 +1234,17 @@ static Payload cmd_report(const Payload&) {
   Payload out;
 
   out.add("isr_fires",         isr_fire_count);
-  out.add("heartbeat_count",   diag_heartbeat_count);
-  out.add("qtimer1_irq_count", diag_qtimer1_irq_count);
+  out.add("isr_count",         diag_isr_count);
+  out.add("phantom_count",     phantom_count);
+  out.add("rearm_count",       diag_rearm_count);
+  out.add("heartbeat_rearms",  diag_heartbeat_rearms);
+  out.add("race_recoveries",   diag_race_recoveries);
   out.add("expired",           expired_count);
   out.add("vclock_raw_now",    vclock_count());
   out.add("test_in_flight",    test_in_flight);
   out.add("ns_test_in_flight", ns_test_in_flight);
   out.add("time_valid",        time_valid());
   out.add("time_pps_count",    time_pps_count());
-  out.add("nano_spins",        nano_spin_count);
-  out.add("nano_timeouts",     nano_timeout_count);
 
   out.add("slots_active_now",  timepop_active_count());
   out.add("slots_high_water",  diag_slots_high_water);
@@ -1099,8 +1267,9 @@ static Payload cmd_report(const Payload&) {
   out.add("gnss_now_n",       (int32_t)welford_gnss_now.n);
   out.add("gnss_now_stddev",  welford_gnss_now.stddev());
 
-  // QTimer1 CH2 diagnostics
+  // QTimer1 CH2 state
   out.add("qtmr1_ch2_cntr",   (uint32_t)IMXRT_TMR1.CH[2].CNTR);
+  out.add("qtmr1_ch2_comp1",  (uint32_t)IMXRT_TMR1.CH[2].COMP1);
   out.add("qtmr1_ch2_csctrl", (uint32_t)IMXRT_TMR1.CH[2].CSCTRL);
 
   PayloadArray timers;
@@ -1114,7 +1283,6 @@ static Payload cmd_report(const Payload&) {
     entry.add("ticks",     slots[i].period_ticks);
     entry.add("deadline",  slots[i].deadline);
     entry.add("recurring", slots[i].recurring);
-    entry.add("nano",      slots[i].nano_precise);
     entry.add("expired",   slots[i].expired);
     entry.add("predicted_dwt",    slots[i].predicted_dwt);
     entry.add("prediction_valid", slots[i].prediction_valid);
@@ -1195,13 +1363,12 @@ static Payload cmd_diag_reset(const Payload&) {
 }
 
 // ============================================================================
-// QTimer1 ISR — CH2 only (CH3 unallocated)
+// QTimer1 ISR — CH2 only
 // ============================================================================
 
 static void qtimer1_irq_isr(void) {
-  diag_qtimer1_irq_count++;
   if (IMXRT_TMR1.CH[2].CSCTRL & TMR_CSCTRL_TCF1) {
-    qtimer1_ch2_heartbeat_isr();
+    qtimer1_ch2_isr();
   }
 }
 
