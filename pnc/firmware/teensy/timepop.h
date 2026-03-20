@@ -4,7 +4,7 @@
 #include <stdbool.h>
 
 // ============================================================================
-// timepop.h — TimePop v8.0 Public Interface
+// timepop.h — TimePop v8.1 Public Interface
 // ============================================================================
 //
 // TimePop is ZPNet's phase-locked timer subsystem.  All timers run at
@@ -31,11 +31,13 @@
 //     Deadline = vclock_count() + ns_to_ticks(delay_ns).
 //     DWT prediction computed at arm time.
 //     Supports recurring timers.
+//     Callbacks always fire in scheduled context.
 //
 //   timepop_arm_ns (target GNSS nanosecond + DWT):
 //     Caller owns the target computation.  The QTimer deadline is
 //     derived from the delay.  The caller-provided DWT target is
 //     used directly for the spin.  One-shot only.
+//     Optionally fires the callback in ISR context (isr_callback=true).
 //
 // Timer context:
 //
@@ -46,6 +48,7 @@
 //     fire_gnss_ns     — GNSS nanosecond at the spin-landed DWT moment
 //     fire_dwt_cyccnt  — DWT_CYCCNT at spin landing
 //
+// v8.1: ISR callback facility for timepop_arm_ns.
 // v8.0: Priority queue with single hardware comparator, 10 MHz.
 // v5.0: Campaign-independent.  All time references use time.h.
 //
@@ -72,9 +75,9 @@ typedef struct timepop_ctx_t {
   // ── GNSS nanosecond at fire moment ──
   int64_t          fire_gnss_ns;    // GNSS ns at spin-landed DWT
 
-  // ── Compatibility fields (always true / always false in v8.0) ──
-  bool             nano_precise;    // always true in v8.0
-  bool             nano_timeout;    // always false in v8.0
+  // ── Compatibility fields (always true / always false in v8.x) ──
+  bool             nano_precise;    // always true
+  bool             nano_timeout;    // always false
 
   // ── DWT capture ──
   uint32_t         fire_dwt_cyccnt; // DWT_CYCCNT at spin landing
@@ -135,7 +138,18 @@ timepop_handle_t timepop_arm(
 // The QTimer deadline is derived from the delay.  The ISR DWT-spins
 // to the caller-provided target_dwt.
 //
-// The callback fires in scheduled context via timepop_dispatch().
+// isr_callback:
+//   If false (default), the callback fires in scheduled context via
+//   timepop_dispatch(), like all other timers.
+//
+//   If true, the callback fires immediately in ISR context after the
+//   DWT spin lands.  This is required for time-critical patterns like
+//   the PPS shadow-write loop, where the callback must be actively
+//   executing when an external interrupt arrives.
+//
+//   ISR callbacks must be fast and must not call timepop_arm or any
+//   other function that acquires the slot lock.
+//
 // fire_gnss_ns contains the GNSS nanosecond at the landed DWT value.
 //
 // One-shot only.  Not available for recurring timers.
@@ -148,7 +162,8 @@ timepop_handle_t timepop_arm_ns(
   uint32_t            target_dwt,
   timepop_callback_t  callback,
   void*               user_data,
-  const char*         name
+  const char*         name,
+  bool                isr_callback = false
 );
 
 // ============================================================================
@@ -160,7 +175,7 @@ bool timepop_cancel(timepop_handle_t handle);
 uint32_t timepop_cancel_by_name(const char* name);
 
 // ============================================================================
-// Dispatch (scheduled context — all callbacks fire here)
+// Dispatch (scheduled context — all non-ISR callbacks fire here)
 // ============================================================================
 
 void timepop_dispatch(void);

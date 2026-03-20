@@ -162,8 +162,9 @@ static void pps_spin_arm(void) {
   pps_fired = false;
 
   timepop_handle_t h = timepop_arm_ns(
-    target_gnss_ns, target_dwt,
-    pps_spin_callback, nullptr, "pps-spin"
+      target_gnss_ns, target_dwt,
+      pps_spin_callback, nullptr, "pps-spin",
+      true  // ISR callback: shadow-write loop must run in ISR context
   );
 
   if (h == TIMEPOP_INVALID_HANDLE) {
