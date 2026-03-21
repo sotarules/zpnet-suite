@@ -1,5 +1,5 @@
 """
-ZPNet Metrics Readout Blocks — Dense Clocks Panel (v5)
+ZPNet Metrics Readout Blocks — Dense Clocks Panel (v6)
 
 Designed for full-screen terminal display over SSH at 1080p.
 
@@ -10,7 +10,12 @@ Data sources:
     PPS diagnostics, servo state
   • Pi SYSTEM REPORT → GNSS, environment, power
 
-Author: The Mule + GPT
+v6 changes:
+  • DWT line: CYCLES/PPS → PREDICTED, DELTA_RAW → ACTUAL
+    PREDICTED is the random walk prediction for the upcoming second.
+    ACTUAL is the measured DWT cycles for the last second.
+
+Author: The Mule + Claude
 """
 
 from zpnet.processes.processes import send_command
@@ -158,12 +163,13 @@ def clocks_combined_readout() -> list[str]:
     baseline = _get_clocks_baseline()
     baseline_ppb = baseline.get("baseline_ppb", {}) if baseline else {}
     baseline_id = baseline.get("baseline_id", "?") if baseline else None
+    baseline_campaign = baseline.get("baseline_campaign", "?") if baseline else None
 
     # ==============================================================
     # Campaign header
     # ==============================================================
     servo_str = "CALIBRATING" if cal else "IDLE"
-    baseline_str = f"BASELINE: #{baseline_id}" if baseline_id else "BASELINE: NONE"
+    baseline_str = f"BASELINE: #{baseline_id} ({baseline_campaign})" if baseline_id else "BASELINE: NONE"
 
     lines.append(
         f"CAMPAIGN: {campaign}  ELAPSED: {elapsed}  n={n}"
@@ -274,7 +280,9 @@ def clocks_combined_readout() -> list[str]:
 
         dac = t.get(dac_key)
         adj = t.get(adj_key, 0)
-        extra = f" DAC={dac:>10.3f} ADJ={adj:>4}" if dac is not None else ""
+        extra = (
+            f" DAC={dac:>10.3f} ADJ={adj:>4}" if dac is not None else ""
+        )
 
         lines.append(
             f"{name:<6}"
@@ -303,7 +311,17 @@ def clocks_combined_readout() -> list[str]:
     lines.append("")
 
     # ==============================================================
-    # DWT PREDICTION — from Pi report dict (r)
+    # DWT — predicted vs actual, with PPS residual
+    #
+    # PREDICTED: dwt_cycles_per_pps — the random walk prediction for
+    #   the upcoming second (predicted = prev_delta).  This is what
+    #   the system expects the DWT counter to advance by in the next
+    #   PPS interval.
+    #
+    # ACTUAL: dwt.delta_raw — the measured DWT cycles for the last
+    #   completed second.
+    #
+    # The difference (ACTUAL - PREDICTED) is the prediction residual.
     # ==============================================================
     dwt_cycles_per_pps = r.get("dwt_cycles_per_pps")
     dwt_cyccnt_at_pps = r.get("dwt_cyccnt_at_pps")
@@ -311,10 +329,19 @@ def clocks_combined_readout() -> list[str]:
     dwt_r_pps_residual = r.get("dwt", {}).get("pps_residual")
 
     lines.append(
-        f"DWT   CYCLES/PPS: {_comma_int(dwt_cycles_per_pps, 14)}"
-        f"    DELTA_RAW: {_comma_int(dwt_r_delta_raw, 14)}"
+        f"DWT   PREDICTED: {_comma_int(dwt_cycles_per_pps, 14)}"
+        f"    ACTUAL: {_comma_int(dwt_r_delta_raw, 14)}"
         f"    PPS_RESIDUAL: {_sign_int(dwt_r_pps_residual, 6)}"
         f"    CYCCNT@PPS: {_comma_int(dwt_cyccnt_at_pps, 14)}"
+    )
+
+    # ── Crown jewels: authoritative 64-bit accumulators at last PPS ──
+    dwt_cycles_64 = r.get("teensy_dwt_cycles")
+    gnss_ns_64 = n * 1_000_000_000 if n else None   # GNSS is phase-coherent: exactly n seconds
+
+    lines.append(
+        f"      DWT_CYCLES: {_comma_int(dwt_cycles_64, 20)}"
+        f"    GNSS_NS: {_comma_int(gnss_ns_64, 20)}"
     )
     lines.append("")
 

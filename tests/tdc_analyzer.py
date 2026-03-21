@@ -1,39 +1,51 @@
 """
-ZPNet TDC Analyzer — v6 Spin Capture Edition
+ZPNet TDC Analyzer — v7 (TimePop v8.1 Priority Queue Edition)
 
-Analyzes the spin capture data from process_clocks_alpha v17 to derive
-TDC correction constants at 1008 MHz.
+Analyzes the PPS spin capture data to derive TDC correction constants
+at 1008 MHz for the nested ISR shadow-write architecture.
 
-The spin capture fires a nano-precise TimePop callback ~50 µs before
-each PPS edge, landing on a predicted DWT cycle count with zero jitter.
-The PPS ISR then captures its own DWT snapshot.  The delta between
-the two reveals the ISR entry latency fingerprint.
+Architecture (v8.1):
+
+  TimePop's priority queue scheduler fires an ISR callback (priority 16)
+  ~5-50 µs before each PPS edge.  The callback enters a tight shadow-write
+  loop, continuously writing DWT_CYCCNT to dispatch_shadow_dwt.
+
+  The PPS ISR (priority 0) preempts via NVIC nesting, captures the shadow
+  DWT, and sets pps_fired.  The delta (isr_dwt - shadow_dwt) reveals the
+  nested ISR entry latency fingerprint.
+
+  The DWT spin lands on the predicted cycle count with zero jitter (the
+  TimePop scheduler delivers sub-nanosecond GNSS-phase-locked precision).
+  The shadow-write loop then runs until PPS arrives.
 
 Key fields from TIMEBASE rows:
 
-  spin_valid          — true if both spin and ISR captured successfully
-  spin_delta_cycles   — isr_dwt - landed_dwt (the TDC measurement)
-  spin_error_cycles   — landed_dwt - target_dwt (nano-spin precision)
-  spin_landed_dwt     — DWT where the nano-spin landed
-  spin_isr_dwt        — DWT captured by the PPS ISR
-  spin_timed_out      — true if the nano-spin timed out
+  spin_valid            — true if both spin and ISR captured successfully
+  spin_delta_cycles     — isr_dwt - shadow_dwt (the TDC measurement)
+  spin_error_cycles     — landed_dwt - target_dwt (spin landing precision)
+  spin_approach_cycles  — isr_dwt - landed_dwt (total time from spin to PPS)
+  spin_landed_dwt       — DWT where the spin landed
+  spin_isr_dwt          — DWT captured by the PPS ISR
+  spin_tdc_correction   — correction applied by tdc_correct()
+  spin_nano_timed_out   — true if DWT spin exceeded budget (should be false)
+  spin_shadow_timed_out — true if shadow loop timed out (should be false)
 
-The spin_delta_cycles histogram should cluster at discrete values
-determined by the ISR entry latency and the instruction that was
-executing when the PPS interrupt fired.
+The spin_delta_cycles histogram should show values determined by the
+nested ISR entry latency and the instruction that was executing when
+the PPS interrupt preempted the shadow-write loop.
 
 This tool:
   1. Extracts spin_delta_cycles from valid TIMEBASE records
-  2. Builds a histogram and identifies clusters
-  3. Separates the fixed early-arrival component (~50 µs) from
-     the ISR latency jitter component
-  4. Analyzes spin_error_cycles for nano-spin precision
-  5. Derives recommended TDC constants for firmware
+  2. Builds a histogram and identifies the delta distribution
+  3. Analyzes spin_error_cycles for DWT spin precision
+  4. Analyzes approach_cycles for shadow loop margin
+  5. Derives recommended TDC constants for tdc_correction.h
+  6. Reports second-to-second stability
 
 Usage:
     python -m zpnet.tests.tdc_analyzer <campaign_name> [limit]
-    .zt tdc_analyzer Baseline8
-    .zt tdc_analyzer Baseline8 200
+    .zt tdc_analyzer Shakeout4
+    .zt tdc_analyzer Shakeout4 200
 """
 
 from __future__ import annotations
@@ -48,7 +60,6 @@ from zpnet.shared.db import open_db
 
 DWT_FREQ_HZ = 1_008_000_000
 DWT_NS_PER_CYCLE = 125.0 / 126.0
-EARLY_MARGIN_NS = 50_000  # 50 µs early arrival target
 
 
 class Welford:
@@ -133,7 +144,7 @@ def analyze(campaign: str, limit: int = 0) -> None:
         return
 
     print("=" * 70)
-    print(f"ZPNet TDC ANALYZER v6 — Spin Capture Edition")
+    print(f"ZPNet TDC ANALYZER v7 — TimePop v8.1 Priority Queue Edition")
     print(f"Campaign: {campaign}  ({len(rows)} TIMEBASE records)")
     print("=" * 70)
     print()
@@ -142,6 +153,8 @@ def analyze(campaign: str, limit: int = 0) -> None:
 
     deltas: List[int] = []
     spin_errors: List[int] = []
+    approach_values: List[int] = []
+    tdc_corrections: List[int] = []
     skipped_no_field = 0
     skipped_invalid = 0
     skipped_timeout = 0
@@ -159,7 +172,8 @@ def analyze(campaign: str, limit: int = 0) -> None:
             skipped_invalid += 1
             continue
 
-        if r.get("spin_timed_out"):
+        # Check both timeout fields
+        if r.get("spin_nano_timed_out") or r.get("spin_shadow_timed_out"):
             skipped_timeout += 1
             continue
 
@@ -174,6 +188,14 @@ def analyze(campaign: str, limit: int = 0) -> None:
         if err is not None:
             spin_errors.append(int(err))
 
+        approach = r.get("spin_approach_cycles")
+        if approach is not None:
+            approach_values.append(int(approach))
+
+        tdc = r.get("spin_tdc_correction")
+        if tdc is not None:
+            tdc_corrections.append(int(tdc))
+
     print(f"  Valid spin captures:    {len(deltas)}")
     print(f"  Skipped (no fields):    {skipped_no_field}")
     print(f"  Skipped (invalid):      {skipped_invalid}")
@@ -184,10 +206,10 @@ def analyze(campaign: str, limit: int = 0) -> None:
         print(f"  Insufficient data (need >= 5, have {len(deltas)})")
         return
 
-    # ── Delta statistics ──
+    # ── Delta statistics (the TDC measurement) ──
 
     print("-" * 70)
-    print("SPIN DELTA STATISTICS (isr_dwt - landed_dwt)")
+    print("TDC DELTA STATISTICS (isr_dwt - shadow_dwt)")
     print("-" * 70)
     print()
 
@@ -197,29 +219,22 @@ def analyze(campaign: str, limit: int = 0) -> None:
 
     mean_ns = w_delta.mean * DWT_NS_PER_CYCLE
     std_ns = w_delta.stddev * DWT_NS_PER_CYCLE
+    min_delta = int(w_delta.min_val)
+    max_delta = int(w_delta.max_val)
 
     print(f"  n       = {w_delta.n:,}")
     print(f"  mean    = {w_delta.mean:,.2f} cycles  ({mean_ns:,.1f} ns)")
     print(f"  stddev  = {w_delta.stddev:,.2f} cycles  ({std_ns:,.1f} ns)")
-    print(f"  min     = {int(w_delta.min_val):,} cycles")
-    print(f"  max     = {int(w_delta.max_val):,} cycles")
+    print(f"  min     = {min_delta:,} cycles")
+    print(f"  max     = {max_delta:,} cycles")
     print(f"  range   = {int(w_delta.range):,} cycles  ({w_delta.range * DWT_NS_PER_CYCLE:,.1f} ns)")
     print()
 
-    # The delta is ~50,400 cycles (50 µs early margin) plus ISR entry latency.
-    # The variation is what we care about — it contains the TDC fingerprint.
-    expected_early_cycles = int(EARLY_MARGIN_NS * DWT_FREQ_HZ / 1_000_000_000)
-    isr_overhead_mean = w_delta.mean - expected_early_cycles
-    print(f"  Expected early margin:  {expected_early_cycles:,} cycles ({EARLY_MARGIN_NS / 1000:.0f} µs)")
-    print(f"  Implied ISR overhead:   {isr_overhead_mean:,.1f} cycles ({isr_overhead_mean * DWT_NS_PER_CYCLE:,.1f} ns)")
-    print(f"    (mean delta - early margin; includes prediction error)")
-    print()
-
-    # ── Nano-spin precision ──
+    # ── DWT spin precision ──
 
     if spin_errors:
         print("-" * 70)
-        print("NANO-SPIN PRECISION (landed_dwt - target_dwt)")
+        print("DWT SPIN PRECISION (landed_dwt - target_dwt)")
         print("-" * 70)
         print()
 
@@ -235,12 +250,54 @@ def analyze(campaign: str, limit: int = 0) -> None:
         print(f"  range   = {int(w_err.range):,} cycles")
         print()
 
+        if w_err.range == 0 and w_err.mean == 0:
+            print(f"  Assessment: PERFECT — zero landing error on every sample")
+        elif w_err.stddev <= 1.0:
+            print(f"  Assessment: EXCELLENT — sub-cycle jitter")
+        else:
+            print(f"  Assessment: NOMINAL — {w_err.stddev:.1f} cycle jitter")
+        print()
+
+    # ── Approach time (shadow loop margin) ──
+
+    if approach_values:
+        print("-" * 70)
+        print("APPROACH TIME (isr_dwt - landed_dwt)")
+        print("-" * 70)
+        print()
+
+        w_approach = Welford()
+        for a in approach_values:
+            w_approach.update(float(a))
+
+        approach_mean_us = w_approach.mean * DWT_NS_PER_CYCLE / 1000.0
+        approach_min_us = w_approach.min_val * DWT_NS_PER_CYCLE / 1000.0
+        approach_max_us = w_approach.max_val * DWT_NS_PER_CYCLE / 1000.0
+
+        print(f"  n       = {w_approach.n:,}")
+        print(f"  mean    = {w_approach.mean:,.0f} cycles  ({approach_mean_us:,.1f} µs)")
+        print(f"  min     = {int(w_approach.min_val):,} cycles  ({approach_min_us:,.1f} µs)")
+        print(f"  max     = {int(w_approach.max_val):,} cycles  ({approach_max_us:,.1f} µs)")
+        print()
+        print(f"  This is how long the shadow-write loop ran before PPS arrived.")
+        print(f"  It must be long enough for the loop to write at least one")
+        print(f"  fresh DWT value before the PPS ISR captures it.")
+        print()
+
+        if approach_min_us < 1.0:
+            print(f"  ⚠️  Minimum approach {approach_min_us:.1f} µs is dangerously tight")
+            print(f"     Consider increasing SPIN_EARLY_NS for more headroom")
+        elif approach_min_us < 3.0:
+            print(f"  ℹ️  Minimum approach {approach_min_us:.1f} µs — adequate but tight")
+        else:
+            print(f"  ✅ Minimum approach {approach_min_us:.1f} µs — comfortable margin")
+        print()
+
     # ── Delta histogram ──
     #
-    # To reveal the ISR latency fingerprint, we subtract the minimum
-    # delta (the fixed component) and look at the residual distribution.
+    # The delta is the TDC measurement: isr_dwt - shadow_dwt.
+    # Subtract the minimum to show the correction distribution.
 
-    min_delta = int(w_delta.min_val)
     residuals = [d - min_delta for d in deltas]
 
     print("-" * 70)
@@ -321,42 +378,67 @@ def analyze(campaign: str, limit: int = 0) -> None:
         print(f"    (this is the loop iteration cycle count at 1008 MHz)")
 
     # ── Decomposition ──
-    #
-    # The spin_delta_cycles = early_margin + prediction_error + ISR_latency
-    #
-    # early_margin: ~50,400 cycles (constant, known)
-    # prediction_error: the random walk residual (~3 cycles stddev)
-    # ISR_latency: the TDC fingerprint (clusters at discrete values)
-    #
-    # Since the prediction error is small (~3 cycles) relative to the
-    # ISR latency jitter (~10-50 cycles range), the cluster structure
-    # in the histogram is dominated by the ISR latency fingerprint.
 
     print()
     print("-" * 70)
     print("DECOMPOSITION")
     print("-" * 70)
     print()
-    print(f"  spin_delta = early_margin + prediction_error + ISR_latency")
+    print(f"  spin_delta = nested_ISR_entry_latency + loop_position_jitter")
     print()
-    print(f"  Early margin (target):  {expected_early_cycles:,} cycles ({EARLY_MARGIN_NS / 1000:.0f} µs)")
     print(f"  Delta range:            {int(w_delta.range):,} cycles ({w_delta.range * DWT_NS_PER_CYCLE:.1f} ns)")
     print(f"  Delta stddev:           {w_delta.stddev:.2f} cycles ({std_ns:.1f} ns)")
     print()
 
     if spin_errors:
-        print(f"  Spin landing jitter:    {w_err.stddev:.2f} cycles ({w_err.stddev * DWT_NS_PER_CYCLE:.1f} ns)")
+        print(f"  DWT spin jitter:        {w_err.stddev:.2f} cycles ({w_err.stddev * DWT_NS_PER_CYCLE:.1f} ns)")
         # The ISR latency jitter is the delta jitter minus the spin jitter (RSS)
         if w_delta.stddev > w_err.stddev:
             isr_jitter = math.sqrt(w_delta.stddev**2 - w_err.stddev**2)
-            print(f"  ISR latency jitter:     {isr_jitter:.2f} cycles ({isr_jitter * DWT_NS_PER_CYCLE:.1f} ns)")
+            print(f"  ISR nesting jitter:     {isr_jitter:.2f} cycles ({isr_jitter * DWT_NS_PER_CYCLE:.1f} ns)")
             print(f"    (delta jitter with spin jitter removed via RSS)")
         print()
 
+    # ── TDC constant recommendations ──
+
+    print("-" * 70)
+    print("TDC CONSTANT RECOMMENDATIONS (for tdc_correction.h)")
+    print("-" * 70)
+    print()
+
+    delta_range = max_delta - min_delta
+
+    print(f"  TDC_FIXED_OVERHEAD  = {min_delta}    // minimum observed delta")
+    print(f"  TDC_LOOP_CYCLES     = 1     // 1 cycle per loop iteration at 1008 MHz")
+    print(f"  TDC_MAX_CORRECTION  = {delta_range}    // max correction (delta range {min_delta}-{max_delta})")
+    print()
+
+    if delta_range <= 12:
+        print(f"  Assessment: GOOD — {delta_range + 1} discrete correction values")
+        print(f"  Correction precision: ±0.5 cycles (±{0.5 * DWT_NS_PER_CYCLE:.1f} ns)")
+    else:
+        print(f"  Assessment: WIDE — {delta_range + 1} values, consider investigating")
+        print(f"  NVIC nesting jitter may be higher than expected")
+    print()
+
+    if tdc_corrections:
+        w_tdc = Welford()
+        for t in tdc_corrections:
+            w_tdc.update(float(t))
+
+        tdc_counter = Counter(tdc_corrections)
+        print(f"  Applied corrections (from TIMEBASE spin_tdc_correction):")
+        print(f"    n={w_tdc.n}  mean={w_tdc.mean:.1f}  stddev={w_tdc.stddev:.1f}")
+        print(f"    min={int(w_tdc.min_val)}  max={int(w_tdc.max_val)}")
+        print()
+        print(f"    Distribution:")
+        for val in sorted(tdc_counter.keys()):
+            cnt = tdc_counter[val]
+            pct = cnt / len(tdc_corrections) * 100
+            print(f"      correction {val:>3d}: {cnt:>5d} ({pct:5.1f}%)")
+        print()
+
     # ── Consecutive delta differences ──
-    #
-    # How much does the delta change from one PPS to the next?
-    # This reveals the second-to-second variability.
 
     if len(deltas) >= 3:
         print("-" * 70)
@@ -376,14 +458,14 @@ def analyze(campaign: str, limit: int = 0) -> None:
         print(f"    max     = {int(w_diff.max_val):+,} cycles")
         print()
 
-    # ── Per-second detail table (first 20 and last 10) ──
+    # ── Per-second detail table ──
 
     print("-" * 70)
     print("PER-SECOND DETAIL (first 20)")
     print("-" * 70)
     print()
-    print(f"  {'pps':>6s}  {'delta':>8s}  {'offset':>7s}  {'spin_err':>9s}  {'delta_ns':>10s}  {'err_ns':>8s}")
-    print(f"  {'─'*6}  {'─'*8}  {'─'*7}  {'─'*9}  {'─'*10}  {'─'*8}")
+    print(f"  {'pps':>6s}  {'delta':>8s}  {'offset':>7s}  {'spin_err':>9s}  {'approach':>9s}  {'tdc':>4s}  {'delta_ns':>10s}")
+    print(f"  {'─'*6}  {'─'*8}  {'─'*7}  {'─'*9}  {'─'*9}  {'─'*4}  {'─'*10}")
 
     shown = 0
     for i, r in enumerate(rows):
@@ -392,6 +474,8 @@ def analyze(campaign: str, limit: int = 0) -> None:
 
         delta = r.get("spin_delta_cycles")
         err = r.get("spin_error_cycles", 0)
+        approach = r.get("spin_approach_cycles", 0)
+        tdc = r.get("spin_tdc_correction", "?")
         pps = r.get("pps_count", r.get("teensy_pps_count", "?"))
 
         if delta is None:
@@ -400,9 +484,10 @@ def analyze(campaign: str, limit: int = 0) -> None:
         delta = int(delta)
         offset = delta - min_delta
         delta_ns = delta * DWT_NS_PER_CYCLE
-        err_ns = int(err) * DWT_NS_PER_CYCLE
 
-        print(f"  {pps:>6}  {delta:>8,}  {offset:>+7d}  {int(err):>+9d}  {delta_ns:>10.1f}  {err_ns:>8.1f}")
+        tdc_str = str(int(tdc)) if isinstance(tdc, (int, float)) else str(tdc)
+
+        print(f"  {pps:>6}  {delta:>8,}  {offset:>+7d}  {int(err):>+9d}  {int(approach):>9,}  {tdc_str:>4s}  {delta_ns:>10.1f}")
 
         shown += 1
         if shown >= 20:
@@ -421,23 +506,31 @@ def analyze(campaign: str, limit: int = 0) -> None:
     print()
     print(f"  Spin capture success rate:  {len(deltas)}/{len(deltas) + skipped_invalid} "
           f"({100 * len(deltas) / max(1, len(deltas) + skipped_invalid):.1f}%)")
-    print(f"  Nano-spin precision:        {w_err.stddev:.1f} cycles ({w_err.stddev * DWT_NS_PER_CYCLE:.1f} ns) stddev" if spin_errors else "")
-    print(f"  Delta stability:            {w_delta.stddev:.1f} cycles ({std_ns:.1f} ns) stddev")
-    print(f"  Delta range:                {int(w_delta.range)} cycles ({w_delta.range * DWT_NS_PER_CYCLE:.1f} ns)")
+
+    if spin_errors:
+        if w_err.range == 0 and w_err.mean == 0:
+            print(f"  DWT spin precision:         PERFECT (zero error, all samples)")
+        else:
+            print(f"  DWT spin precision:         {w_err.stddev:.1f} cycles ({w_err.stddev * DWT_NS_PER_CYCLE:.1f} ns) stddev")
+
+    print(f"  TDC delta stability:        {w_delta.stddev:.1f} cycles ({std_ns:.1f} ns) stddev")
+    print(f"  TDC delta range:            {int(w_delta.range)} cycles ({w_delta.range * DWT_NS_PER_CYCLE:.1f} ns)")
+
+    if approach_values:
+        print(f"  Shadow loop margin:         {w_approach.min_val:,.0f}-{w_approach.max_val:,.0f} cycles "
+              f"({w_approach.min_val * DWT_NS_PER_CYCLE / 1000:.1f}-{w_approach.max_val * DWT_NS_PER_CYCLE / 1000:.1f} µs)")
+
     print()
+    print(f"  Recommended constants:")
+    print(f"    TDC_FIXED_OVERHEAD  = {min_delta}")
+    print(f"    TDC_LOOP_CYCLES     = 1")
+    print(f"    TDC_MAX_CORRECTION  = {delta_range}")
 
     if len(cluster_vals) >= 2:
-        print(f"  Cluster spacing:            {most_common} cycles ({most_common * DWT_NS_PER_CYCLE:.1f} ns)")
-        print(f"    → This is the spin loop iteration time at 1008 MHz")
         print()
+        print(f"  Cluster spacing:            {most_common} cycles ({most_common * DWT_NS_PER_CYCLE:.1f} ns)")
+        print(f"    → Shadow-write loop iteration time at 1008 MHz")
 
-    print(f"  Next steps:")
-    print(f"    1. Collect 500+ seconds of data for robust histogram")
-    print(f"    2. If clusters are visible, derive TDC_FIXED_OVERHEAD")
-    print(f"       and TDC_LOOP_CYCLES from the cluster positions")
-    print(f"    3. If clusters are NOT visible (prediction error dominates),")
-    print(f"       the spin capture is already better than the old TDC —")
-    print(f"       the landed_dwt IS the corrected value, no table needed")
     print()
     print("=" * 70)
 
