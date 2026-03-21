@@ -1,15 +1,17 @@
 """
-ZPNet Raw DWT Cycles — v4 Random Walk Prediction Quality
+ZPNet Raw Cycles — v5 DWT Prediction Residual Monitor
 
-Per-second DWT cycle table showing how well the random walk predictor
-(predicted = prev_delta) tracks the actual DWT cycle count.
+One row per second showing the DWT random walk prediction quality:
 
-The random walk model is the authoritative prediction approach for
-ZPNet's thermally drifting crystal: the current rate is the best
-predictor of the next rate.  This tool visualizes the prediction
-residuals, their running statistics, and flags outliers.
+    predicted   = dwt_cycles_per_pps  (Teensy: prev_delta)
+    actual      = dwt_delta_raw       (Teensy: measured this second)
+    residual    = actual - predicted
 
-Recovery-aware: gaps in pps_count reset prediction history.
+Running Welford statistics (mean, stddev, stderr) accumulate across
+the campaign, reset on recovery gaps.
+
+The prediction residual stddev is the authoritative interpolation
+uncertainty for sub-second DWT time.
 
 Usage:
     python -m zpnet.tests.raw_cycles <campaign_name> [limit]
@@ -26,8 +28,43 @@ from typing import Any, Dict, List, Optional
 
 from zpnet.shared.db import open_db
 
-DWT_FREQ_HZ = 1_008_000_000
 
+# ─────────────────────────────────────────────────────────────────────
+# Welford online accumulator
+# ─────────────────────────────────────────────────────────────────────
+
+class Welford:
+    __slots__ = ("n", "mean", "m2")
+
+    def __init__(self) -> None:
+        self.n = 0
+        self.mean = 0.0
+        self.m2 = 0.0
+
+    def update(self, x: float) -> None:
+        self.n += 1
+        d1 = x - self.mean
+        self.mean += d1 / self.n
+        d2 = x - self.mean
+        self.m2 += d1 * d2
+
+    @property
+    def stddev(self) -> float:
+        return math.sqrt(self.m2 / (self.n - 1)) if self.n >= 2 else 0.0
+
+    @property
+    def stderr(self) -> float:
+        return self.stddev / math.sqrt(self.n) if self.n >= 2 else 0.0
+
+    def reset(self) -> None:
+        self.n = 0
+        self.mean = 0.0
+        self.m2 = 0.0
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Database fetch
+# ─────────────────────────────────────────────────────────────────────
 
 def fetch_timebase(campaign: str) -> List[Dict[str, Any]]:
     with open_db(row_dict=True) as conn:
@@ -53,41 +90,9 @@ def fetch_timebase(campaign: str) -> List[Dict[str, Any]]:
     return result
 
 
-class Welford:
-    __slots__ = ("n", "mean", "m2", "min_val", "max_val")
-
-    def __init__(self) -> None:
-        self.n = 0
-        self.mean = 0.0
-        self.m2 = 0.0
-        self.min_val: Optional[float] = None
-        self.max_val: Optional[float] = None
-
-    def update(self, x: float) -> None:
-        self.n += 1
-        d1 = x - self.mean
-        self.mean += d1 / self.n
-        d2 = x - self.mean
-        self.m2 += d1 * d2
-        if self.min_val is None or x < self.min_val:
-            self.min_val = x
-        if self.max_val is None or x > self.max_val:
-            self.max_val = x
-
-    @property
-    def stddev(self) -> float:
-        return math.sqrt(self.m2 / (self.n - 1)) if self.n >= 2 else 0.0
-
-    @property
-    def stderr(self) -> float:
-        return self.stddev / math.sqrt(self.n) if self.n >= 2 else 0.0
-
-    @property
-    def range(self) -> float:
-        if self.min_val is not None and self.max_val is not None:
-            return self.max_val - self.min_val
-        return 0.0
-
+# ─────────────────────────────────────────────────────────────────────
+# Analysis
+# ─────────────────────────────────────────────────────────────────────
 
 def analyze(campaign: str, limit: int = 0) -> None:
     rows = fetch_timebase(campaign)
@@ -99,12 +104,12 @@ def analyze(campaign: str, limit: int = 0) -> None:
     print(f"Campaign: {campaign}  ({len(rows)} records)")
     print()
 
+    # Header
     print(
         f"  {'pps':>5s}"
-        f"  {'actual':>14s}"
-        f"  {'nominal_res':>11s}"
         f"  {'predicted':>14s}"
-        f"  {'pred_err':>9s}"
+        f"  {'actual':>14s}"
+        f"  {'residual':>9s}"
         f"  {'mean':>8s}"
         f"  {'stddev':>8s}"
         f"  {'stderr':>8s}"
@@ -112,7 +117,6 @@ def analyze(campaign: str, limit: int = 0) -> None:
     print(
         f"  {'─' * 5}"
         f"  {'─' * 14}"
-        f"  {'─' * 11}"
         f"  {'─' * 14}"
         f"  {'─' * 9}"
         f"  {'─' * 8}"
@@ -120,115 +124,80 @@ def analyze(campaign: str, limit: int = 0) -> None:
         f"  {'─' * 8}"
     )
 
-    w_pred = Welford()
-    w_nominal = Welford()
-
-    prev_delta: Optional[int] = None
+    w = Welford()
     count = 0
     gaps = 0
+    prev_pps: Optional[int] = None
 
-    for i in range(1, len(rows)):
-        prev = rows[i - 1]
-        curr = rows[i]
+    for rec in rows:
+        pps = rec.get("pps_count")
+        predicted = rec.get("dwt_cycles_per_pps")
+        actual = rec.get("dwt_delta_raw")
 
-        pps = curr.get("pps_count")
-        prev_pps = prev.get("pps_count")
-        start = prev.get("teensy_dwt_cycles")
-        end = curr.get("teensy_dwt_cycles")
-
-        if pps is None or prev_pps is None or start is None or end is None:
+        if pps is None:
             continue
 
         pps = int(pps)
-        prev_pps = int(prev_pps)
-        start = int(start)
-        end = int(end)
 
-        if pps != prev_pps + 1:
+        # Gap detection — reset Welford on non-consecutive PPS
+        if prev_pps is not None and pps != prev_pps + 1:
             skipped = pps - prev_pps - 1
             gaps += 1
-            print(f"  {'':>5s}  --- gap {prev_pps} → {pps} ({skipped}s lost) ---")
-            prev_delta = None
+            print(f"  {'':>5s}  --- gap {prev_pps} → {pps} ({skipped}s lost, stats reset) ---")
+            w.reset()
+
+        prev_pps = pps
+
+        # Both fields required for a meaningful row
+        if predicted is None or actual is None:
             continue
 
-        actual = end - start
-        nominal_res = actual - DWT_FREQ_HZ
-        w_nominal.update(float(nominal_res))
+        predicted = int(predicted)
+        actual = int(actual)
+        residual = actual - predicted
 
-        if prev_delta is not None:
-            pred_err = actual - prev_delta
-            w_pred.update(float(pred_err))
+        w.update(float(residual))
 
-            mean_str = f"{w_pred.mean:>+8.1f}" if w_pred.n >= 1 else f"{'---':>8s}"
-            sd_str = f"{w_pred.stddev:>8.1f}" if w_pred.n >= 2 else f"{'---':>8s}"
-            se_str = f"{w_pred.stderr:>8.2f}" if w_pred.n >= 2 else f"{'---':>8s}"
+        mean_str = f"{w.mean:>+8.1f}" if w.n >= 1 else f"{'---':>8s}"
+        sd_str = f"{w.stddev:>8.1f}" if w.n >= 2 else f"{'---':>8s}"
+        se_str = f"{w.stderr:>8.3f}" if w.n >= 2 else f"{'---':>8s}"
 
-            print(
-                f"  {pps:>5d}"
-                f"  {actual:>14,}"
-                f"  {nominal_res:>+11,}"
-                f"  {prev_delta:>14,}"
-                f"  {pred_err:>+9d}"
-                f"  {mean_str}"
-                f"  {sd_str}"
-                f"  {se_str}"
-            )
-        else:
-            print(
-                f"  {pps:>5d}"
-                f"  {actual:>14,}"
-                f"  {nominal_res:>+11,}"
-                f"  {'(seed)':>14s}"
-                f"  {'':>9s}"
-                f"  {'':>8s}"
-                f"  {'':>8s}"
-                f"  {'':>8s}"
-            )
+        print(
+            f"  {pps:>5d}"
+            f"  {predicted:>14,}"
+            f"  {actual:>14,}"
+            f"  {residual:>+9d}"
+            f"  {mean_str}"
+            f"  {sd_str}"
+            f"  {se_str}"
+        )
 
-        prev_delta = actual
         count += 1
         if limit and count >= limit:
             break
 
+    # Summary
     print()
     print(f"  {count} rows, {gaps} recovery gap(s)")
     print()
 
-    if w_nominal.n >= 2:
-        print(f"  Nominal residual (actual - {DWT_FREQ_HZ:,}):")
-        print(f"    n       = {w_nominal.n:,}")
-        print(f"    mean    = {w_nominal.mean:+.2f} cycles")
-        print(f"    stddev  = {w_nominal.stddev:.2f} cycles  (thermal drift range)")
-        print(f"    min     = {w_nominal.min_val:+.0f}")
-        print(f"    max     = {w_nominal.max_val:+.0f}")
-        print(f"    range   = {w_nominal.range:.0f}")
+    if w.n >= 2:
+        pred_ns = w.stddev * (125.0 / 126.0)
+        print(f"  DWT prediction residual (actual - predicted):")
+        print(f"    n       = {w.n:,}")
+        print(f"    mean    = {w.mean:+.2f} cycles")
+        print(f"    stddev  = {w.stddev:.2f} cycles")
+        print(f"    stderr  = {w.stderr:.3f} cycles")
         print()
-
-    if w_pred.n >= 2:
-        print(f"  Random walk prediction (predicted = prev_delta):")
-        print(f"    n       = {w_pred.n:,}")
-        print(f"    mean    = {w_pred.mean:+.2f} cycles")
-        print(f"    stddev  = {w_pred.stddev:.2f} cycles  (interpolation uncertainty)")
-        print(f"    stderr  = {w_pred.stderr:.3f} cycles")
-        print(f"    min     = {w_pred.min_val:+.0f}")
-        print(f"    max     = {w_pred.max_val:+.0f}")
-        print(f"    range   = {w_pred.range:.0f}")
-        print()
-
-        if w_nominal.n >= 2 and w_nominal.stddev > 0:
-            ratio = w_nominal.stddev / w_pred.stddev
-            print(f"  Prediction quality:")
-            print(f"    nominal stddev / prediction stddev = {ratio:.1f}x")
-            print(f"    The random walk predictor reduces uncertainty by {ratio:.1f}x")
-            print(f"    compared to assuming a fixed nominal frequency.")
-            print()
-
-        pred_ns = w_pred.stddev * (125.0 / 126.0)
         print(f"  Interpolation bound:")
         print(f"    1σ prediction uncertainty = {pred_ns:.1f} ns")
         print(f"    This is the authoritative sub-second interpolation error.")
         print()
 
+
+# ─────────────────────────────────────────────────────────────────────
+# Entrypoint
+# ─────────────────────────────────────────────────────────────────────
 
 def main():
     if len(sys.argv) < 2:

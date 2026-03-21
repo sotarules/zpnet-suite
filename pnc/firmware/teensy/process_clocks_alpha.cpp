@@ -578,30 +578,37 @@ uint64_t clocks_ocxo2_ns_now(void) {
 
 static void pps_asap_callback(timepop_ctx_t*, void*) {
 
+  // ── Spin capture: complete the current capture, arm the next ──
+  // Must run FIRST so pps_spin.corrected_dwt is available for
+  // the calibration and time anchor blocks below.
+  pps_spin_complete(isr_snap_dwt);
+  pps_spin_arm();
+
+  // ── Best-available DWT at the true PPS edge ──
+  // TDC-corrected when spin capture succeeded; ISR-compensated fallback otherwise.
+  const uint32_t dwt_at_pps_edge =
+    (pps_spin.valid && pps_spin.tdc_correction >= 0)
+      ? pps_spin.corrected_dwt
+      : (isr_snap_dwt - ISR_ENTRY_DWT_CYCLES);
+
   // ── Continuous DWT calibration (always runs, campaign-independent) ──
   {
-    const uint32_t dwt_corrected = isr_snap_dwt - ISR_ENTRY_DWT_CYCLES;
-
     if (g_dwt_cal_has_prev) {
-      g_dwt_cycles_per_gnss_s = dwt_corrected - g_dwt_at_last_pps;
+      g_dwt_cycles_per_gnss_s = dwt_at_pps_edge - g_dwt_at_last_pps;
       g_dwt_cal_valid = true;
     }
 
-    g_dwt_at_last_pps  = dwt_corrected;
+    g_dwt_at_last_pps  = dwt_at_pps_edge;
     g_dwt_cal_has_prev = true;
     g_dwt_cal_pps_count++;
   }
 
   // ── Universal GNSS time anchor (campaign-independent) ──
   time_pps_update(
-    isr_snap_dwt - ISR_ENTRY_DWT_CYCLES,
+    dwt_at_pps_edge,
     g_dwt_cal_valid ? g_dwt_cycles_per_gnss_s : 0,
     isr_snap_gnss
   );
-
-  // ── Spin capture: complete the current capture, arm the next ──
-  pps_spin_complete(isr_snap_dwt);
-  pps_spin_arm();
 
   if (relay_arm_pending) {
     relay_arm_pending = false;
