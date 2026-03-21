@@ -146,7 +146,7 @@ struct ocxo_dac_state_t {
   double   dither_accum;
   uint32_t dither_high_count;
   uint32_t dither_low_count;
-  int32_t  servo_step;
+  double   servo_last_step;
   double   servo_last_residual;
   uint32_t servo_settle_count;
   uint32_t servo_adjustments;

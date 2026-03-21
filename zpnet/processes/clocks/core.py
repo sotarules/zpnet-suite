@@ -1556,7 +1556,7 @@ def cmd_start(args: Optional[dict]) -> dict:
     logging.info("📡 [start] @%s arming TEENSY START: pps_count=0", system_time_z())
     teensy_args: Dict[str, Any] = {"campaign": campaign}
     if set_dac1 is not None:
-        teensy_args["set_dac"] = str(set_dac1)
+        teensy_args["set_dac1"] = str(set_dac1)
     if set_dac2 is not None:
         teensy_args["set_dac2"] = str(set_dac2)
     if calibrate_ocxo:
@@ -2622,19 +2622,19 @@ def cmd_set_dac(args: Optional[dict]) -> Dict[str, Any]:
     Update OCXO DAC values in the SYSTEM config record.
     'dac' sets OCXO1, 'dac2' sets OCXO2.  Either or both may be specified.
     """
-    if not args or ("dac" not in args and "dac2" not in args):
-        return {"success": False, "message": "SET_DAC requires 'dac' and/or 'dac2' argument"}
+    if not args or ("dac1" not in args and "dac2" not in args):
+        return {"success": False, "message": "SET_DAC requires 'dac1' and/or 'dac2' argument"}
 
     update_blob: Dict[str, Any] = {}
 
-    if "dac" in args:
+    if "dac1" in args:
         try:
-            dac = float(args["dac"])
+            dac1 = float(args["dac1"])
         except (ValueError, TypeError):
-            return {"success": False, "message": f"Invalid dac value: {args['dac']}"}
-        if dac < 0 or dac > 4095:
-            return {"success": False, "message": f"DAC value {dac} out of range (0–4095)"}
-        update_blob["ocxo1_dac"] = dac
+            return {"success": False, "message": f"Invalid dac1 value: {args['dac1']}"}
+        if dac1 < 0 or dac1 > 4095:
+            return {"success": False, "message": f"DAC1 value {dac1} out of range (0–4095)"}
+        update_blob["ocxo1_dac"] = dac1
 
     if "dac2" in args:
         try:
