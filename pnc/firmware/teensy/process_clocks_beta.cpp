@@ -651,7 +651,6 @@ void clocks_beta_pps(void) {
     p.add("gnss_lock",        digitalRead(GNSS_LOCK_PIN));
     p.add("dwt_cyccnt_at_pps", (uint32_t)dwt_raw_at_pps);
     p.add("qtimer_at_pps",    (uint32_t)isr_snap_gnss);
-    p.add("gpt2_at_pps",      (uint32_t)isr_snap_ocxo2);
 
     p.add("dwt_cycles_per_pps", (uint64_t)dwt_cycles_per_pps_snapshot);
 
@@ -735,7 +734,7 @@ static Payload cmd_start(const Payload& args) {
   safeCopy(campaign_name, sizeof(campaign_name), name);
 
   double dac_val;
-  if (args.tryGetDouble("set_dac", dac_val))  ocxo_dac_set(ocxo1_dac, dac_val);
+  if (args.tryGetDouble("set_dac1", dac_val))  ocxo_dac_set(ocxo1_dac, dac_val);
   if (args.tryGetDouble("set_dac2", dac_val)) ocxo_dac_set(ocxo2_dac, dac_val);
 
   calibrate_ocxo_mode = servo_mode_parse(args.getString("calibrate_ocxo"));
@@ -794,7 +793,7 @@ static Payload cmd_recover(const Payload& args) {
   recover_ocxo2_ns = strtoull(s_ocxo2,  nullptr, 10);
 
   double dac_val;
-  if (args.tryGetDouble("set_dac", dac_val))  ocxo_dac_set(ocxo1_dac, dac_val);
+  if (args.tryGetDouble("set_dac1", dac_val))  ocxo_dac_set(ocxo1_dac, dac_val);
   if (args.tryGetDouble("set_dac2", dac_val)) ocxo_dac_set(ocxo2_dac, dac_val);
 
   calibrate_ocxo_mode = servo_mode_parse(args.getString("calibrate_ocxo"));

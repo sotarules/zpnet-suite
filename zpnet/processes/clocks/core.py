@@ -1249,7 +1249,6 @@ def _process_loop() -> None:
 
             # Teensy interpolation anchors
             "dwt_cyccnt_at_pps": frag.get("dwt_cyccnt_at_pps"),
-            "gpt2_at_pps": frag.get("gpt2_at_pps"),
             "dwt_cycles_per_pps": frag.get("dwt_cycles_per_pps"),
 
             # Raw per-second deltas (ground truth)
@@ -1464,23 +1463,23 @@ def cmd_start(args: Optional[dict]) -> dict:
         }
 
     location = current_location
-    set_dac = args.get("set_dac")
+    set_dac1 = args.get("set_dac1")
     set_dac2 = args.get("set_dac2")
     calibrate_ocxo = args.get("calibrate_ocxo") or None
     if calibrate_ocxo and calibrate_ocxo not in ("MEAN", "TOTAL"):
         return {"success": False, "message": f"calibrate_ocxo must be 'MEAN' or 'TOTAL', got '{calibrate_ocxo}'"}
 
     # Read default DAC from config if not specified
-    if set_dac is None or set_dac2 is None:
+    if set_dac1 is None or set_dac2 is None:
         try:
             with open_db(row_dict=True) as conn:
                 cur = conn.cursor()
                 cur.execute("SELECT payload FROM config WHERE config_key = 'SYSTEM'")
                 row = cur.fetchone()
                 if row:
-                    if set_dac is None and row["payload"].get("ocxo1_dac") is not None:
-                        set_dac = float(row["payload"]["ocxo1_dac"])
-                        logging.info("🔧 [clocks] using ocxo1_dac=%s from SYSTEM config", set_dac)
+                    if set_dac1 is None and row["payload"].get("ocxo1_dac") is not None:
+                        set_dac1 = float(row["payload"]["ocxo1_dac"])
+                        logging.info("🔧 [clocks] using ocxo1_dac=%s from SYSTEM config", set_dac1)
                     if set_dac2 is None and row["payload"].get("ocxo2_dac") is not None:
                         set_dac2 = float(row["payload"]["ocxo2_dac"])
                         logging.info("🔧 [clocks] using ocxo2_dac=%s from SYSTEM config", set_dac2)
@@ -1491,8 +1490,8 @@ def cmd_start(args: Optional[dict]) -> dict:
         "location": location,
         "started_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
     }
-    if set_dac is not None:
-        campaign_payload["ocxo1_dac"] = float(set_dac)
+    if set_dac1 is not None:
+        campaign_payload["ocxo1_dac"] = float(set_dac1)
     if set_dac2 is not None:
         campaign_payload["ocxo2_dac"] = float(set_dac2)
     if calibrate_ocxo:
@@ -1556,8 +1555,8 @@ def cmd_start(args: Optional[dict]) -> dict:
     # Arm TEENSY
     logging.info("📡 [start] @%s arming TEENSY START: pps_count=0", system_time_z())
     teensy_args: Dict[str, Any] = {"campaign": campaign}
-    if set_dac is not None:
-        teensy_args["set_dac"] = str(set_dac)
+    if set_dac1 is not None:
+        teensy_args["set_dac"] = str(set_dac1)
     if set_dac2 is not None:
         teensy_args["set_dac2"] = str(set_dac2)
     if calibrate_ocxo:
@@ -1600,7 +1599,7 @@ def cmd_start(args: Optional[dict]) -> dict:
         "payload": {
             "campaign": campaign,
             "location": location,
-            "set_dac": set_dac,
+            "set_dac1": set_dac1,
             "set_dac2": set_dac2,
             "calibrate_ocxo": calibrate_ocxo,
             "pps_count": 0,
@@ -1940,7 +1939,7 @@ def _recover_campaign() -> None:
         recover_ocxo2_dac = campaign_payload.get("ocxo2_dac")
         recover_calibrate = campaign_payload.get("calibrate_ocxo", "MEAN")
         if recover_ocxo1_dac is not None:
-            teensy_args["set_dac"] = str(float(recover_ocxo1_dac))
+            teensy_args["set_dac1"] = str(float(recover_ocxo1_dac))
         if recover_ocxo2_dac is not None:
             teensy_args["set_dac2"] = str(float(recover_ocxo2_dac))
         if recover_calibrate:
@@ -2168,7 +2167,7 @@ def _recover_campaign() -> None:
         "ocxo2_ns": str(int(projected_ocxo2_ns)),
     }
     if recover_ocxo1_dac is not None:
-        teensy_recover_args["set_dac"] = str(float(recover_ocxo1_dac))
+        teensy_recover_args["set_dac1"] = str(float(recover_ocxo1_dac))
     if recover_ocxo2_dac is not None:
         teensy_recover_args["set_dac2"] = str(float(recover_ocxo2_dac))
     if recover_calibrate:

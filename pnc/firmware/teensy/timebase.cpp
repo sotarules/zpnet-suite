@@ -515,9 +515,8 @@ void on_timebase_fragment(const Payload& payload) {
 
   const uint32_t dwt_cyccnt_at_pps    = payload.getUInt("dwt_cyccnt_at_pps", 0);
   const uint64_t dwt_cycles_per_pps   = payload.getUInt64("dwt_cycles_per_pps", 0);
-  const uint32_t qtimer_at_pps          = payload.has("qtimer_at_pps")
-    ? payload.getUInt("qtimer_at_pps", 0)
-    : payload.getUInt("gpt2_at_pps", 0);
+  const uint32_t qtimer_at_pps        = payload.getUInt("qtimer_at_pps", 0);
+
   const bool valid = (gnss_ns > 0 && dwt_ns > 0 && ocxo1_ns > 0 && dwt_cycles_per_pps > 0);
 
   frag_store.seq++;
@@ -535,7 +534,7 @@ void on_timebase_fragment(const Payload& payload) {
   frag_store.isr_residual_ocxo2 = isr_ocxo2;
   frag_store.dwt_cyccnt_at_pps  = dwt_cyccnt_at_pps;
   frag_store.dwt_cycles_per_pps = dwt_cycles_per_pps;
-  frag_store.qtimer_at_pps        = qtimer_at_pps;
+  frag_store.qtimer_at_pps      = qtimer_at_pps;
   frag_store.valid              = valid;
 
   dmb();
