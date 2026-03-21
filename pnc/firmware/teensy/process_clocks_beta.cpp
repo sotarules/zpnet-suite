@@ -259,7 +259,8 @@ void clocks_zero_all(void) {
 // OCXO calibration servo — unified for both OCXOs
 // ============================================================================
 
-static void ocxo_calibration_servo_one(ocxo_dac_state_t& dac, pps_residual_t& res) {
+// MEAN mode: target Welford mean residual → 0
+static void ocxo_servo_mean(ocxo_dac_state_t& dac, pps_residual_t& res) {
   if (res.n < SERVO_MIN_SAMPLES) return;
 
   dac.servo_settle_count++;
@@ -283,12 +284,43 @@ static void ocxo_calibration_servo_one(ocxo_dac_state_t& dac, pps_residual_t& re
   residual_reset(res);
 }
 
-static void ocxo_calibration_servo(void) {
-  if (!calibrate_ocxo_active) return;
-  ocxo_calibration_servo_one(ocxo1_dac, residual_ocxo1);
-  ocxo_calibration_servo_one(ocxo2_dac, residual_ocxo2);
+// TOTAL mode: target cumulative tick deficit → 0 (tau → 1.0)
+//
+// Error signal is (ocxo_ticks - gnss_ticks) in 10 MHz ticks.
+// Each tick = 100 ns.  Positive = OCXO ran fast, steer down.
+static void ocxo_servo_total(ocxo_dac_state_t& dac, uint64_t ocxo_ticks, uint64_t gnss_ticks) {
+  if (campaign_seconds < SERVO_MIN_SAMPLES) return;
+
+  dac.servo_settle_count++;
+  if (dac.servo_settle_count < SERVO_SETTLE_SECONDS) return;
+
+  double total_error = (double)((int64_t)ocxo_ticks - (int64_t)gnss_ticks);
+  dac.servo_last_residual = total_error;
+
+  if (fabs(total_error) < 0.5) return;
+
+  double step = -total_error * 0.25;
+  if (step >  (double)SERVO_MAX_STEP) step =  (double)SERVO_MAX_STEP;
+  if (step < -(double)SERVO_MAX_STEP) step = -(double)SERVO_MAX_STEP;
+
+  ocxo_dac_set(dac, dac.dac_fractional + step);
+
+  dac.servo_step = (int32_t)(step >= 0.0 ? step + 0.5 : step - 0.5);
+  dac.servo_adjustments++;
+  dac.servo_settle_count = 0;
 }
 
+static void ocxo_calibration_servo(void) {
+  if (calibrate_ocxo_mode == servo_mode_t::OFF) return;
+
+  if (calibrate_ocxo_mode == servo_mode_t::MEAN) {
+    ocxo_servo_mean(ocxo1_dac, residual_ocxo1);
+    ocxo_servo_mean(ocxo2_dac, residual_ocxo2);
+  } else {
+    ocxo_servo_total(ocxo1_dac, ocxo1_ticks_64, gnss_raw_64);
+    ocxo_servo_total(ocxo2_dac, ocxo2_ticks_64, gnss_raw_64);
+  }
+}
 // ============================================================================
 // Watchdog anomaly publication / stop helpers
 // ============================================================================
@@ -298,7 +330,7 @@ static void clocks_force_stop_campaign(void) {
   request_start = false;
   request_stop = false;
   request_recover = false;
-  calibrate_ocxo_active = false;
+  calibrate_ocxo_mode = servo_mode_t::OFF;
   pps_scheduled = false;
   pps_fired = false;
   timebase_invalidate();
@@ -328,7 +360,7 @@ static void clocks_watchdog_anomaly_callback(timepop_ctx_t*, void*) {
   p.add("request_start",   request_start);
   p.add("request_stop",    request_stop);
   p.add("request_recover", request_recover);
-  p.add("calibrate_ocxo",  calibrate_ocxo_active);
+  p.add("calibrate_ocxo", servo_mode_str(calibrate_ocxo_mode));
   p.add("gnss_lock",       digitalRead(GNSS_LOCK_PIN));
 
   p.add("dwt_cycles_now", clocks_dwt_cycles_now());
@@ -478,7 +510,7 @@ void clocks_beta_pps(void) {
     campaign_state = clocks_campaign_state_t::STOPPED;
     request_stop   = false;
     pps_fired      = true;
-    calibrate_ocxo_active = false;
+    calibrate_ocxo_mode = servo_mode_t::OFF;
     timebase_invalidate();
     return;
   }
@@ -656,7 +688,7 @@ void clocks_beta_pps(void) {
 
     p.add("ocxo1_dac",         ocxo1_dac.dac_fractional);
     p.add("ocxo2_dac",         ocxo2_dac.dac_fractional);
-    p.add("calibrate_ocxo",    calibrate_ocxo_active);
+    p.add("calibrate_ocxo", servo_mode_str(calibrate_ocxo_mode));
     p.add("ocxo1_servo_adjustments", ocxo1_dac.servo_adjustments);
     p.add("ocxo2_servo_adjustments", ocxo2_dac.servo_adjustments);
 
@@ -706,8 +738,8 @@ static Payload cmd_start(const Payload& args) {
   if (args.tryGetDouble("set_dac", dac_val))  ocxo_dac_set(ocxo1_dac, dac_val);
   if (args.tryGetDouble("set_dac2", dac_val)) ocxo_dac_set(ocxo2_dac, dac_val);
 
-  calibrate_ocxo_active = args.has("calibrate_ocxo");
-  if (calibrate_ocxo_active) {
+  calibrate_ocxo_mode = servo_mode_parse(args.getString("calibrate_ocxo"));
+  if (calibrate_ocxo_mode != servo_mode_t::OFF) {
     ocxo1_dac.servo_step = 0; ocxo1_dac.servo_last_residual = 0.0;
     ocxo1_dac.servo_settle_count = 0; ocxo1_dac.servo_adjustments = 0;
     ocxo2_dac.servo_step = 0; ocxo2_dac.servo_last_residual = 0.0;
@@ -725,7 +757,7 @@ static Payload cmd_start(const Payload& args) {
   p.add("status",         "start_requested");
   p.add("ocxo1_dac",      ocxo1_dac.dac_fractional);
   p.add("ocxo2_dac",      ocxo2_dac.dac_fractional);
-  p.add("calibrate_ocxo", calibrate_ocxo_active);
+  p.add("calibrate_ocxo", servo_mode_str(calibrate_ocxo_mode));
   return p;
 }
 
@@ -765,8 +797,8 @@ static Payload cmd_recover(const Payload& args) {
   if (args.tryGetDouble("set_dac", dac_val))  ocxo_dac_set(ocxo1_dac, dac_val);
   if (args.tryGetDouble("set_dac2", dac_val)) ocxo_dac_set(ocxo2_dac, dac_val);
 
-  calibrate_ocxo_active = args.has("calibrate_ocxo");
-  if (calibrate_ocxo_active) {
+  calibrate_ocxo_mode = servo_mode_parse(args.getString("calibrate_ocxo"));
+  if (calibrate_ocxo_mode != servo_mode_t::OFF) {
     ocxo1_dac.servo_step = 0; ocxo1_dac.servo_last_residual = 0.0;
     ocxo1_dac.servo_settle_count = 0;
     ocxo2_dac.servo_step = 0; ocxo2_dac.servo_last_residual = 0.0;
@@ -896,7 +928,7 @@ static Payload cmd_report(const Payload&) {
   p.add("ocxo2_dither_high", ocxo2_dac.dither_high_count);
   p.add("ocxo2_dither_low",  ocxo2_dac.dither_low_count);
 
-  p.add("calibrate_ocxo",          calibrate_ocxo_active);
+  p.add("calibrate_ocxo", servo_mode_str(calibrate_ocxo_mode));
   p.add("ocxo1_servo_adjustments", ocxo1_dac.servo_adjustments);
   p.add("ocxo2_servo_adjustments", ocxo2_dac.servo_adjustments);
   p.add("ocxo1_servo_step",        ocxo1_dac.servo_step);

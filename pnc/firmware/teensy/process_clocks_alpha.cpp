@@ -250,7 +250,22 @@ ocxo_dac_state_t ocxo2_dac = {
   0, 0.0, 0, 0, 0, 0.0, 0, 0
 };
 
-bool calibrate_ocxo_active = false;
+servo_mode_t calibrate_ocxo_mode = servo_mode_t::OFF;
+
+const char* servo_mode_str(servo_mode_t mode) {
+  switch (mode) {
+  case servo_mode_t::MEAN:  return "MEAN";
+  case servo_mode_t::TOTAL: return "TOTAL";
+  default:                  return "OFF";
+  }
+}
+
+servo_mode_t servo_mode_parse(const char* s) {
+  if (!s || !*s) return servo_mode_t::OFF;
+  if (strcmp(s, "MEAN")  == 0) return servo_mode_t::MEAN;
+  if (strcmp(s, "TOTAL") == 0) return servo_mode_t::TOTAL;
+  return servo_mode_t::OFF;
+}
 
 void ocxo_dac_set(ocxo_dac_state_t& s, double value) {
   if (value < (double)s.dac_min) value = (double)s.dac_min;

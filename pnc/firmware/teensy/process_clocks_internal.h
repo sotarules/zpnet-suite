@@ -4,6 +4,12 @@
 // process_clocks_internal.h — Shared Internal State (Alpha ↔ Beta)
 // ============================================================================
 //
+// v24: Servo mode enum (MEAN/TOTAL) replaces bool calibrate_ocxo_active.
+//
+//   calibrate_ocxo_active (bool) is replaced by calibrate_ocxo_mode
+//   (servo_mode_t enum).  MEAN targets Welford mean residual → 0.
+//   TOTAL targets cumulative campaign tick deficit → 0 (tau → 1.0).
+//
 // v23: 10 MHz single-edge QTimer1 migration.
 //
 //   GNSS_EDGE_DIVISOR eliminated.  QTimer1 now counts rising edges
@@ -151,7 +157,27 @@ extern ocxo_dac_state_t ocxo2_dac;
 
 static constexpr uint32_t DITHER_PERIOD = 1000;
 
-extern bool calibrate_ocxo_active;
+// ============================================================================
+// OCXO servo mode — campaign-level calibration strategy
+//
+//   OFF:   servo disabled
+//   MEAN:  target Welford mean residual → 0 (instantaneous PPB)
+//   TOTAL: target cumulative tick deficit → 0 (tau → 1.0)
+// ============================================================================
+
+enum class servo_mode_t : uint8_t {
+  OFF   = 0,
+  MEAN  = 1,
+  TOTAL = 2,
+};
+
+extern servo_mode_t calibrate_ocxo_mode;
+
+// Helper: returns the mode as a string for telemetry ("OFF", "MEAN", "TOTAL")
+const char* servo_mode_str(servo_mode_t mode);
+
+// Helper: parse from command arg string; returns OFF if unrecognized
+servo_mode_t servo_mode_parse(const char* s);
 
 static constexpr int32_t  SERVO_MAX_STEP       = 64;
 static constexpr uint32_t SERVO_SETTLE_SECONDS = 5;

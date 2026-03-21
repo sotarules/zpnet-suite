@@ -1363,7 +1363,7 @@ def _process_loop() -> None:
                             json.dumps({
                                 "ocxo1_dac": float(teensy_ocxo1_dac) if teensy_ocxo1_dac is not None else None,
                                 "ocxo2_dac": float(teensy_ocxo2_dac) if teensy_ocxo2_dac is not None else None,
-                                "calibrate_ocxo": bool(teensy_calibrate),
+                                "calibrate_ocxo": teensy_calibrate if teensy_calibrate and teensy_calibrate != "OFF" else None,
                             }),
                             campaign,
                         ),
@@ -1466,7 +1466,9 @@ def cmd_start(args: Optional[dict]) -> dict:
     location = current_location
     set_dac = args.get("set_dac")
     set_dac2 = args.get("set_dac2")
-    calibrate_ocxo = bool(args.get("calibrate_ocxo"))
+    calibrate_ocxo = args.get("calibrate_ocxo") or None
+    if calibrate_ocxo and calibrate_ocxo not in ("MEAN", "TOTAL"):
+        return {"success": False, "message": f"calibrate_ocxo must be 'MEAN' or 'TOTAL', got '{calibrate_ocxo}'"}
 
     # Read default DAC from config if not specified
     if set_dac is None or set_dac2 is None:
@@ -1494,7 +1496,7 @@ def cmd_start(args: Optional[dict]) -> dict:
     if set_dac2 is not None:
         campaign_payload["ocxo2_dac"] = float(set_dac2)
     if calibrate_ocxo:
-        campaign_payload["calibrate_ocxo"] = True
+        campaign_payload["calibrate_ocxo"] = calibrate_ocxo
 
     # --- Flash-cut preamble ---
     if flash_cut:
@@ -1559,7 +1561,7 @@ def cmd_start(args: Optional[dict]) -> dict:
     if set_dac2 is not None:
         teensy_args["set_dac2"] = str(set_dac2)
     if calibrate_ocxo:
-        teensy_args["calibrate_ocxo"] = "true"
+        teensy_args["calibrate_ocxo"] = calibrate_ocxo
 
     _request_teensy_start(campaign=campaign, pps_count=0, args=teensy_args)
     logging.info("📡 [start] @%s TEENSY START returned", system_time_z())
@@ -1936,13 +1938,13 @@ def _recover_campaign() -> None:
         teensy_args: Dict[str, Any] = {"campaign": campaign_name}
         recover_ocxo1_dac = campaign_payload.get("ocxo1_dac")
         recover_ocxo2_dac = campaign_payload.get("ocxo2_dac")
-        recover_calibrate = campaign_payload.get("calibrate_ocxo", False)
+        recover_calibrate = campaign_payload.get("calibrate_ocxo", "MEAN")
         if recover_ocxo1_dac is not None:
             teensy_args["set_dac"] = str(float(recover_ocxo1_dac))
         if recover_ocxo2_dac is not None:
             teensy_args["set_dac2"] = str(float(recover_ocxo2_dac))
         if recover_calibrate:
-            teensy_args["calibrate_ocxo"] = "true"
+            teensy_args["calibrate_ocxo"] = recover_calibrate
 
         logging.info("📡 [recovery/cold] @%s arming TEENSY START: pps_count=0", system_time_z())
         _request_teensy_start(campaign=campaign_name, pps_count=0, args=teensy_args)
@@ -2170,7 +2172,7 @@ def _recover_campaign() -> None:
     if recover_ocxo2_dac is not None:
         teensy_recover_args["set_dac2"] = str(float(recover_ocxo2_dac))
     if recover_calibrate:
-        teensy_recover_args["calibrate_ocxo"] = "true"
+        teensy_recover_args["calibrate_ocxo"] = recover_calibrate
 
     _request_teensy_recover(int(next_pps_count), teensy_recover_args)
 

@@ -155,7 +155,7 @@ def clocks_combined_readout() -> list[str]:
     except Exception:
         t = {}
 
-    cal = t.get("calibrate_ocxo", False)
+    cal = t.get("calibrate_ocxo", "OFF")
 
     # ==============================================================
     # Fetch baseline
@@ -168,7 +168,7 @@ def clocks_combined_readout() -> list[str]:
     # ==============================================================
     # Campaign header
     # ==============================================================
-    servo_str = "CALIBRATING" if cal else "IDLE"
+    servo_str = cal if cal and cal != "OFF" else "IDLE"
     baseline_str = f"BASELINE: #{baseline_id} ({baseline_campaign})" if baseline_id else "BASELINE: NONE"
 
     lines.append(
