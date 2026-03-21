@@ -1,5 +1,5 @@
 """
-ZPNet Metrics Readout Blocks — Dense Clocks Panel (v6)
+ZPNet Metrics Readout Blocks — Dense Clocks Panel (v7 GNSS_RAW)
 
 Designed for full-screen terminal display over SSH at 1080p.
 
@@ -9,6 +9,12 @@ Data sources:
   • Teensy CLOCKS REPORT → spin capture, ISR residuals, DWT internals,
     PPS diagnostics, servo state
   • Pi SYSTEM REPORT → GNSS, environment, power
+
+v7 changes:
+  • GNSS_RAW synthetic clock domain added right after GNSS row.
+    GNSS_RAW is a Pi-side clock synthesized from the GF-8802's
+    clock_drift_ppb (TPS1).  Full Welford stats (RES/MEAN/SD/N).
+  • Five clock domains: GNSS, GN_RAW, DWT, OCXO1, OCXO2.
 
 v6 changes:
   • DWT line: CYCLES/PPS → PREDICTED, DELTA_RAW → ACTUAL
@@ -52,7 +58,13 @@ def _get_clocks_baseline() -> dict | None:
 # Clock domains
 # ---------------------------------------------------------------------
 
-_CLOCK_DOMAINS = [("GNSS", "gnss"), ("DWT", "dwt"), ("OCXO1", "ocxo1"), ("OCXO2", "ocxo2")]
+_CLOCK_DOMAINS = [
+    ("GNSS", "gnss"),
+    ("GN_RAW", "gnss_raw"),
+    ("DWT", "dwt"),
+    ("OCXO1", "ocxo1"),
+    ("OCXO2", "ocxo2"),
+]
 
 
 # ---------------------------------------------------------------------
@@ -222,6 +234,38 @@ def clocks_combined_readout() -> list[str]:
         f"  │"
         f"{gnss_comp}"
         f"  │ stream={'OK' if gnss_blk.get('stream_valid', True) else 'BAD'}"
+    )
+
+    # GN_RAW row — GNSS_RAW synthetic clock (Pi-side Welford on drift_ppb)
+    gnss_raw_blk = r.get("gnss_raw", {})
+    gnss_raw_tau = gnss_raw_blk.get("tau")
+    gnss_raw_ppb = gnss_raw_blk.get("ppb")
+    gnss_raw_res = gnss_raw_blk.get("pred_residual")
+    gnss_raw_mean = gnss_raw_blk.get("pred_mean")
+    gnss_raw_sd = gnss_raw_blk.get("pred_stddev")
+    gnss_raw_n = gnss_raw_blk.get("pred_n")
+    gnss_raw_drift = gnss_raw_blk.get("drift_ppb")
+    gnss_raw_base = baseline_ppb.get("gnss_raw")
+    gnss_raw_now = gnss_raw_blk.get("ppb")
+
+    if gnss_raw_base is not None and gnss_raw_now is not None:
+        gnss_raw_delta = gnss_raw_now - gnss_raw_base
+        gnss_raw_comp = f"{gnss_raw_base:>10.3f}{gnss_raw_now:>10.3f}{gnss_raw_delta:>+10.3f}"
+    else:
+        gnss_raw_comp = f"{'---':>10}{'---':>10}{'---':>10}"
+
+    lines.append(
+        f"{'GN_RAW':<6}"
+        f"{_fmt(gnss_raw_tau, '>18.12f', 18)}"
+        f"{_fmt(gnss_raw_ppb, '>10.3f', 10)}"
+        f"{'---':>14}"
+        f"{_fmt(gnss_raw_res, '>6.1f', 6)}"
+        f"{_fmt(gnss_raw_mean, '>8.3f', 8)}"
+        f"{_fmt(gnss_raw_sd, '>8.3f', 8)}"
+        f"{_fmt(gnss_raw_n, '>6d', 6)}"
+        f"  │"
+        f"{gnss_raw_comp}"
+        f"  │"
     )
 
     # DWT row

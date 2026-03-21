@@ -11,10 +11,11 @@ Core contract (v2026-03+):
 
   Architecture:
     • Teensy owns: GNSS ns, DWT ns/cycles, OCXO1 ns, OCXO2 ns — in TIMEBASE_FRAGMENT
+    • Pi owns: GNSS_RAW ns (synthetic clock from GF-8802 clock drift) — in TIMEBASE
     • GNSS owns: GF-8802 discipline state — in GET_GNSS_INFO
     • CLOCKS owns: correlation, campaign lifecycle
 
-  Four clock domains: GNSS (reference), DWT, OCXO1, OCXO2.
+  Five clock domains: GNSS (reference), DWT, OCXO1, OCXO2, GNSS_RAW (synthetic).
 
   v9: Prediction-aware statistics.
 
@@ -283,6 +284,43 @@ def _gnss_canary_reset() -> None:
     _gnss_last_ns = 0
     _gnss_residual_valid = False
 
+# ---------------------------------------------------------------------
+# GNSS_RAW — synthetic clock from GF-8802 clock drift (TPS1)
+# ---------------------------------------------------------------------
+#
+# The GF-8802 reports its internal TCXO frequency deviation (drift_ppb)
+# every second via the CRW/TPS1 sentence.  We synthesize a virtual
+# clock by accumulating NS_PER_SECOND + drift_ppb each PPS.  This
+# clock represents what an undisciplined crystal in the same physical
+# environment experiences — the environmental forcing function made
+# visible as a clock domain.
+#
+# drift_ppb is the GNSS positioning engine's measurement of its own
+# 26 MHz TCXO error after internal servo correction.  It correlates
+# with temperature, satellite geometry, and multipath conditions.
+#
+# GNSS_RAW is Pi-only: it does not exist in TIMEBASE_FRAGMENT.
+#
+
+_gnss_raw_ns: float = 0.0
+_gnss_raw_n: int = 0
+_gnss_raw_valid: bool = False
+
+# Welford accumulator for GNSS_RAW drift_ppb residuals
+_gnss_raw_welford_n: int = 0
+_gnss_raw_welford_mean: float = 0.0
+_gnss_raw_welford_m2: float = 0.0
+
+def _gnss_raw_reset() -> None:
+    """Reset GNSS_RAW accumulator (on campaign start/stop/recover)."""
+    global _gnss_raw_ns, _gnss_raw_n, _gnss_raw_valid
+    global _gnss_raw_welford_n, _gnss_raw_welford_mean, _gnss_raw_welford_m2
+    _gnss_raw_ns = 0.0
+    _gnss_raw_n = 0
+    _gnss_raw_valid = False
+    _gnss_raw_welford_n = 0
+    _gnss_raw_welford_mean = 0.0
+    _gnss_raw_welford_m2 = 0.0
 
 # ---------------------------------------------------------------------
 # Local state (process lifetime)
@@ -947,6 +985,9 @@ def _build_clock_block(
     elif domain == "gnss":
         block["ppb"] = 0.0
         block["pps_residual"] = frag.get("gnss_pps_residual")
+    elif domain == "gnss_raw":
+        block["ppb"] = round(_compute_ppb(int(ns_now), int(gnss_ns)), 3) if gnss_ns else 0.0
+        block["drift_ppb"] = frag.get("gnss_raw_drift_ppb")
 
     return block
 
@@ -961,6 +1002,7 @@ def _build_report(
     dwt_ns = int(timebase.get("teensy_dwt_ns") or 0)
     ocxo1_ns = int(timebase.get("teensy_ocxo1_ns") or 0)
     ocxo2_ns = int(timebase.get("teensy_ocxo2_ns") or 0)
+    gnss_raw_ns = int(timebase.get("gnss_raw_ns") or 0)
 
     pps_count = timebase.get("pps_count")
     campaign_seconds = int(pps_count) if isinstance(pps_count, int) else (gnss_ns // NS_PER_SECOND if gnss_ns else 0)
@@ -984,6 +1026,15 @@ def _build_report(
         "dwt": _build_clock_block(dwt_ns, gnss_ns, frag, "dwt"),
         "ocxo1": _build_clock_block(ocxo1_ns, gnss_ns, frag, "ocxo1"),
         "ocxo2": _build_clock_block(ocxo2_ns, gnss_ns, frag, "ocxo2"),
+        "gnss_raw": {
+            "tau": timebase.get("stats", {}).get("gnss_raw", {}).get("tau"),
+            "ppb": timebase.get("stats", {}).get("gnss_raw", {}).get("ppb"),
+            "drift_ppb": timebase.get("gnss_raw_drift_ppb"),
+            "pred_residual": timebase.get("stats", {}).get("gnss_raw", {}).get("pred_residual"),
+            "pred_mean": timebase.get("stats", {}).get("gnss_raw", {}).get("pred_mean"),
+            "pred_stddev": timebase.get("stats", {}).get("gnss_raw", {}).get("pred_stddev"),
+            "pred_n": timebase.get("stats", {}).get("gnss_raw", {}).get("pred_n"),
+        },
 
         # DWT internals (from TIMEBASE record)
         "dwt_cycles_per_pps": timebase.get("dwt_cycles_per_pps"),
@@ -1116,12 +1167,9 @@ def _process_loop() -> None:
     Dedicated thread: pulls fragments from queue, decorates with
     environment and GNSS discipline data, builds TIMEBASE, persists.
     Runs forever.
-
-    v9: Prediction-aware.  Teensy prediction stats are passed through
-    as the authoritative interpolation uncertainty metrics.  Pi-side
-    DWT/OCXO1/OCXO2 Welford trackers removed.
     """
-    global _campaign_active, _armed_pps_count
+    global _campaign_active, _armed_pps_count, _gnss_raw_ns, _gnss_raw_n, _gnss_raw_valid
+    global _gnss_raw_welford_n, _gnss_raw_welford_mean, _gnss_raw_welford_m2
 
     logging.info("🚀 [clocks] processor thread started")
 
@@ -1211,6 +1259,35 @@ def _process_loop() -> None:
         # --- GNSS discipline snapshot (best-effort, never blocks TIMEBASE) ---
         gnss_info = _fetch_gnss_info()
 
+        # --- GNSS_RAW synthetic clock ---
+        gnss_raw_drift_ppb = None
+        if gnss_info and isinstance(gnss_info, dict):
+            v = gnss_info.get("clock_drift_ppb")
+            if v is not None:
+                try:
+                    v_f = float(v)
+                    if not math.isnan(v_f):
+                        gnss_raw_drift_ppb = v_f
+                except (ValueError, TypeError):
+                    pass
+
+        # Always accumulate one second; add drift correction when available
+        _gnss_raw_ns += NS_PER_SECOND + (gnss_raw_drift_ppb if gnss_raw_drift_ppb is not None else 0.0)
+        _gnss_raw_n += 1
+        _gnss_raw_valid = True
+        gnss_raw_ns_int = int(round(_gnss_raw_ns))
+        gnss_raw_ref_ns = _gnss_raw_n * NS_PER_SECOND
+
+        # Welford update on drift_ppb (treating it as the per-second residual)
+        gnss_raw_pred_residual = gnss_raw_drift_ppb if gnss_raw_drift_ppb is not None else 0.0
+        _gnss_raw_welford_n += 1
+        d1 = gnss_raw_pred_residual - _gnss_raw_welford_mean
+        _gnss_raw_welford_mean += d1 / _gnss_raw_welford_n
+        d2 = gnss_raw_pred_residual - _gnss_raw_welford_mean
+        _gnss_raw_welford_m2 += d1 * d2
+        gnss_raw_pred_stddev = math.sqrt(
+            _gnss_raw_welford_m2 / (_gnss_raw_welford_n - 1)) if _gnss_raw_welford_n >= 2 else 0.0
+
         # --- Campaign lookup ---
         row = _get_active_campaign()
         if row is None:
@@ -1240,6 +1317,10 @@ def _process_loop() -> None:
             "teensy_ocxo2_ns": frag.get("ocxo2_ns"),
 
             "teensy_pps_count": int(pps_count),
+
+            # GNSS_RAW synthetic clock (Pi-side, from GF-8802 clock drift)
+            "gnss_raw_ns": gnss_raw_ns_int,
+            "gnss_raw_drift_ppb": gnss_raw_drift_ppb,
 
             # Teensy ISR residuals (raw counts)
             "isr_residual_gnss": frag.get("isr_residual_gnss"),
@@ -1291,6 +1372,7 @@ def _process_loop() -> None:
 
             # GF-8802 discipline snapshot (correlated with this PPS edge)
             "gnss": gnss_info,
+            "gnss_raw_ref_ns": gnss_raw_ref_ns,
 
             # --- Stats block ---
             #
@@ -1334,6 +1416,15 @@ def _process_loop() -> None:
                     "pps_residual": frag.get("ocxo2_pps_residual"),
                     "tau": round(_compute_tau(ocxo2_ns, gnss_ns), 12) if gnss_ns else None,
                     "ppb": round(_compute_ppb(ocxo2_ns, gnss_ns), 3) if gnss_ns else None,
+                },
+                "gnss_raw": {
+                    "drift_ppb": gnss_raw_drift_ppb,
+                    "pred_residual": round(gnss_raw_pred_residual, 3),
+                    "pred_mean": round(_gnss_raw_welford_mean, 3),
+                    "pred_stddev": round(gnss_raw_pred_stddev, 3),
+                    "pred_n": _gnss_raw_welford_n,
+                    "tau": round(_compute_tau(gnss_raw_ns_int, gnss_raw_ref_ns), 12) if _gnss_raw_valid else None,
+                    "ppb": round(_compute_ppb(gnss_raw_ns_int, gnss_raw_ref_ns), 3) if _gnss_raw_valid else None,
                 },
             },
         }
@@ -1397,6 +1488,7 @@ def _reset_trackers() -> None:
     global _last_pps_count_seen
     _last_pps_count_seen = None
     _gnss_canary_reset()
+    _gnss_raw_reset()
 
 
 def _request_teensy_stop_best_effort() -> None:
@@ -1993,6 +2085,7 @@ def _recover_campaign() -> None:
     last_dwt_ns = int(last_tb.get("teensy_dwt_ns") or 0)
     last_ocxo1_ns = int(last_tb.get("teensy_ocxo1_ns") or 0)
     last_ocxo2_ns = int(last_tb.get("teensy_ocxo2_ns") or 0)
+    last_gnss_raw_ns = int(last_tb.get("gnss_raw_ns") or 0)
 
     last_gnss_time_str = last_tb.get("gnss_time_utc") or last_tb.get("system_time_utc") or system_time_z()
 
@@ -2105,6 +2198,7 @@ def _recover_campaign() -> None:
     projected_dwt_ns = projected_gnss_ns * last_dwt_ns // last_gnss_ns if last_gnss_ns > 0 else projected_gnss_ns
     projected_ocxo1_ns = projected_gnss_ns * last_ocxo1_ns // last_gnss_ns if (last_gnss_ns > 0 and last_ocxo1_ns > 0) else 0
     projected_ocxo2_ns = projected_gnss_ns * last_ocxo2_ns // last_gnss_ns if (last_gnss_ns > 0 and last_ocxo2_ns > 0) else 0
+    projected_gnss_raw_ns = projected_gnss_ns * last_gnss_raw_ns // last_gnss_ns if (last_gnss_ns > 0 and last_gnss_raw_ns > 0) else 0
 
     tau_dwt = last_dwt_ns / last_gnss_ns if last_gnss_ns > 0 else 1.0
     tau_ocxo1 = last_ocxo1_ns / last_gnss_ns if (last_gnss_ns > 0 and last_ocxo1_ns > 0) else 1.0
@@ -2205,6 +2299,11 @@ def _recover_campaign() -> None:
         logging.info("🧹 [recovery] drained %d fragments accumulated during sync wait", _drained_post)
 
     _reset_trackers()
+
+    # Seed GNSS_RAW accumulator from projected value
+    _gnss_raw_ns = float(projected_gnss_raw_ns)
+    _gnss_raw_valid = last_gnss_raw_ns > 0
+
     _campaign_active = True
 
     logging.info(
@@ -2283,7 +2382,7 @@ def cmd_set_baseline(args: Optional[dict]) -> Dict[str, Any]:
         return {"success": False, "message": f"Campaign {baseline_id} ('{row['campaign']}') has no report"}
 
     baseline_ppb = {}
-    for key in ("gnss", "dwt", "ocxo1", "ocxo2"):
+    for key in ("gnss", "gnss_raw", "dwt", "ocxo1", "ocxo2"):
         blk = report.get(key, {})
         ppb = blk.get("ppb")
         if ppb is not None:

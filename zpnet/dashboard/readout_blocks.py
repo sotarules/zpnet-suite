@@ -1,8 +1,16 @@
 """
-ZPNet Dashboard Readout Blocks — v9 Dual OCXO Edition
+ZPNet Dashboard Readout Blocks — v10 GNSS_RAW Edition
 
 All readouts are derived directly from the authoritative SYSTEM snapshot
 or from direct process queries.
+
+v10 changes:
+  • GNSS_RAW synthetic clock domain added to tau, comparison, and
+    prediction readouts.  GNSS_RAW is a Pi-side clock synthesized
+    from the GF-8802's clock_drift_ppb (TPS1), representing the
+    environmental forcing function on an undisciplined crystal.
+  • _CLOCK_DOMAINS now includes five domains: GNSS, DWT, OCXO1,
+    OCXO2, GNSS_RAW.
 
 v9 changes:
   • clocks_prediction_readout() displays Teensy prediction statistics
@@ -110,7 +118,21 @@ def gnss_report_readout() -> Generator[str, None, None]:
 # CLOCKS — shared helpers
 # ---------------------------------------------------------------------
 
-_CLOCK_DOMAINS = [("GNSS", "gnss"), ("DWT", "dwt"), ("OCXO1", "ocxo1"), ("OCXO2", "ocxo2")]
+# Five clock domains: GNSS (reference), GNSS_RAW (synthetic), DWT, OCXO1, OCXO2
+_CLOCK_DOMAINS = [
+    ("GNSS", "gnss"),
+    ("GN_RAW", "gnss_raw"),
+    ("DWT", "dwt"),
+    ("OCXO1", "ocxo1"),
+    ("OCXO2", "ocxo2"),
+]
+
+# Teensy-owned clock domains (have prediction stats)
+_TEENSY_CLOCK_DOMAINS = [
+    ("DWT", "dwt"),
+    ("OCXO1", "ocxo1"),
+    ("OCXO2", "ocxo2"),
+]
 
 
 def _get_clocks_baseline() -> dict | None:
@@ -140,7 +162,7 @@ def _clocks_header() -> tuple[dict | None, str]:
 
 
 # ---------------------------------------------------------------------
-# CLOCKS 1/4 — Tau
+# CLOCKS 1/5 — Tau
 # ---------------------------------------------------------------------
 
 def clocks_tau_readout() -> Generator[str, None, None]:
@@ -154,13 +176,16 @@ def clocks_tau_readout() -> Generator[str, None, None]:
 
     for name, key in _CLOCK_DOMAINS[1:]:
         blk = r.get(key, {})
-        tau = blk.get("tau", 0.0)
-        ppb = blk.get("ppb", 0.0)
-        yield f"{name:<6} {tau:>16.10f} {ppb:>10.3f}"
+        tau = blk.get("tau")
+        ppb = blk.get("ppb")
+        if tau is not None and ppb is not None:
+            yield f"{name:<6} {tau:>16.10f} {ppb:>10.3f}"
+        else:
+            yield f"{name:<6} {'---':>16} {'---':>10}"
 
 
 # ---------------------------------------------------------------------
-# CLOCKS 2/4 — Prediction Statistics (v8, replaces Welford readout)
+# CLOCKS 2/5 — Prediction Statistics (v8, replaces Welford readout)
 # ---------------------------------------------------------------------
 
 def clocks_prediction_readout() -> Generator[str, None, None]:
@@ -176,6 +201,9 @@ def clocks_prediction_readout() -> Generator[str, None, None]:
 
     GNSS is phase-coherent by definition (residual always 0), so
     we show the stream health canary instead.
+
+    GNSS_RAW shows drift_ppb (the instantaneous GF-8802 clock drift)
+    instead of prediction stats (it has no Teensy predictor).
     """
     r, hdr = _clocks_header()
     yield hdr
@@ -189,8 +217,19 @@ def clocks_prediction_readout() -> Generator[str, None, None]:
     gnss_res = gnss_blk.get("pps_residual", 0)
     yield f"{'GNSS':<6} {gnss_res:>6} {'---':>8} {'---':>8} {'---':>6}"
 
+    # GNSS_RAW — Pi-side Welford on drift_ppb
+    gnss_raw_blk = r.get("gnss_raw", {})
+    gnss_raw_n = gnss_raw_blk.get("pred_n")
+    if gnss_raw_n is not None and gnss_raw_n > 0:
+        gr_res = gnss_raw_blk.get("pred_residual", 0.0)
+        gr_mean = gnss_raw_blk.get("pred_mean", 0.0)
+        gr_sd = gnss_raw_blk.get("pred_stddev", 0.0)
+        yield f"{'GN_RAW':<6} {gr_res:>6.1f} {gr_mean:>8.3f} {gr_sd:>8.3f} {gnss_raw_n:>6}"
+    else:
+        yield f"{'GN_RAW':<6} {'---':>6} {'---':>8} {'---':>8} {'---':>6}"
+
     # DWT, OCXO1, OCXO2 — Teensy prediction stats
-    for name, key in _CLOCK_DOMAINS[1:]:
+    for name, key in _TEENSY_CLOCK_DOMAINS:
         blk = r.get(key, {})
         pred_n = blk.get("pred_n")
 
@@ -205,7 +244,7 @@ def clocks_prediction_readout() -> Generator[str, None, None]:
 
 
 # ---------------------------------------------------------------------
-# CLOCKS 3/4 — Comparison vs baseline
+# CLOCKS 3/5 — Comparison vs baseline
 # ---------------------------------------------------------------------
 
 def clocks_comparison_readout() -> Generator[str, None, None]:
@@ -240,7 +279,7 @@ def clocks_comparison_readout() -> Generator[str, None, None]:
 
 
 # ---------------------------------------------------------------------
-# CLOCKS 4/4 — OCXO Servo Status
+# CLOCKS 4/5 — OCXO Servo Status
 # ---------------------------------------------------------------------
 
 def clocks_servo_readout() -> Generator[str, None, None]:
@@ -269,6 +308,43 @@ def clocks_servo_readout() -> Generator[str, None, None]:
             yield f"{label:<6} DAC={dac:>10.3f}  ADJ={adj:>4}  RES={res_str}"
         else:
             yield f"{label:<6} ---"
+
+
+# ---------------------------------------------------------------------
+# CLOCKS 5/5 — GNSS_RAW detail
+# ---------------------------------------------------------------------
+
+def clocks_gnss_raw_readout() -> Generator[str, None, None]:
+    """
+    Display GNSS_RAW synthetic clock detail from the Pi CLOCKS report.
+    Shows the GF-8802 internal TCXO behavior as a clock domain.
+    """
+    r, hdr = _clocks_header()
+    yield hdr
+    if r is None:
+        return
+
+    yield "GNSS RAW CLOCK (GF-8802 TCXO drift)"
+
+    blk = r.get("gnss_raw", {})
+    tau = blk.get("tau")
+    ppb = blk.get("ppb")
+    drift = blk.get("drift_ppb")
+
+    if tau is not None:
+        yield f"  TAU:       {tau:.12f}"
+    else:
+        yield f"  TAU:       ---"
+
+    if ppb is not None:
+        yield f"  PPB:       {ppb:+.3f}"
+    else:
+        yield f"  PPB:       ---"
+
+    if drift is not None:
+        yield f"  DRIFT NOW: {drift:+.3f} ppb"
+    else:
+        yield f"  DRIFT NOW: ---"
 
 
 # ---------------------------------------------------------------------
