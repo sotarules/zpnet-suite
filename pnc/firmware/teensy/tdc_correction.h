@@ -98,9 +98,9 @@
 //
 // ============================================================================
 
-static constexpr uint32_t TDC_FIXED_OVERHEAD  = 48;   // min delta (nested ISR entry latency)
+static constexpr uint32_t TDC_FIXED_OVERHEAD  = 52;   // min delta (nested ISR entry latency)
 static constexpr uint32_t TDC_LOOP_CYCLES     = 1;    // cycles per loop iteration
-static constexpr uint32_t TDC_MAX_CORRECTION  = 32;
+static constexpr uint32_t TDC_MAX_CORRECTION  = 14;
 
 // ============================================================================
 // tdc_correct — apply TDC correction to a spin capture
