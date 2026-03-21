@@ -61,7 +61,6 @@ def analyze(campaign: str, limit: int = 20) -> None:
     print(f"  teensy_dwt_cycles:    {r0.get('teensy_dwt_cycles')}")
     print(f"  teensy_ocxo_ns:       {r0.get('teensy_ocxo_ns')}")
     print(f"  dwt_cyccnt_at_pps:    {r0.get('dwt_cyccnt_at_pps')}")
-    print(f"  gpt2_at_pps:          {r0.get('gpt2_at_pps')}")
     print(f"  dwt_cycles_per_pps:   {r0.get('dwt_cycles_per_pps')}")
     print()
 
