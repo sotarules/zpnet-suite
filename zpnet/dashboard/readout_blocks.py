@@ -253,8 +253,8 @@ def clocks_servo_readout() -> Generator[str, None, None]:
         yield "SERVO: UNAVAILABLE"
         return
 
-    cal = t.get("calibrate_ocxo", False)
-    yield f"SERVO: {'CALIBRATING' if cal else 'IDLE'}"
+    cal = t.get("calibrate_ocxo", "OFF")
+    yield f"SERVO: {cal if cal and cal != 'OFF' else 'IDLE'}"
 
     for label, dac_key, adj_key, res_key in [
         ("OCXO1", "ocxo1_dac", "ocxo1_servo_adjustments", "isr_residual_ocxo1"),

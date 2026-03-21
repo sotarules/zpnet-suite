@@ -745,13 +745,14 @@ def analyze_ocxo_servo(rows: List[Dict[str, Any]]) -> List[str]:
     """
     lines: List[str] = []
 
-    calibrating = False
+    servo_mode = None
     for row in rows:
-        if row.get("calibrate_ocxo"):
-            calibrating = True
+        mode = row.get("calibrate_ocxo")
+        if mode and mode != "OFF":
+            servo_mode = mode
             break
 
-    lines.append(f"  Calibration active: {'YES' if calibrating else 'NO'}")
+    lines.append(f"  Calibration: {servo_mode if servo_mode else 'NO'}")
 
     for label, dac_key, adj_key in [
         ("OCXO1", "ocxo1_dac", "ocxo1_servo_adjustments"),
