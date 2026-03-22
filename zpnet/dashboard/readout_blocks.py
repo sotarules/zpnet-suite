@@ -277,6 +277,21 @@ def clocks_comparison_readout() -> Generator[str, None, None]:
         else:
             yield f"{name:<6} {'---':>10} {'---':>10} {'---':>10}"
 
+    # DAC mean baseline comparison (TEMPEST DAC test)
+    baseline_dac_mean = baseline.get("baseline_dac_mean", {})
+    if baseline_dac_mean:
+        yield f"{'DAC':<6} {'BASE':>10} {'NOW':>10} {'DELTA':>10}"
+        for name, key in [("OCXO1", "ocxo1"), ("OCXO2", "ocxo2")]:
+            blk = r.get(key, {})
+            base_dac = baseline_dac_mean.get(key)
+            now_dac = blk.get("dac_mean")
+
+            if base_dac is not None and now_dac is not None:
+                delta = now_dac - base_dac
+                yield f"{name:<6} {base_dac:>10.3f} {now_dac:>10.3f} {delta:>+10.3f}"
+            else:
+                yield f"{name:<6} {'---':>10} {'---':>10} {'---':>10}"
+
 
 # ---------------------------------------------------------------------
 # CLOCKS 4/5 — OCXO Servo Status
@@ -309,6 +324,44 @@ def clocks_servo_readout() -> Generator[str, None, None]:
         else:
             yield f"{label:<6} ---"
 
+
+# ---------------------------------------------------------------------
+# CLOCKS — DAC Welford Statistics (TEMPEST DAC test)
+# ---------------------------------------------------------------------
+
+def clocks_dac_welford_readout() -> Generator[str, None, None]:
+    """
+    Display campaign-cumulative Welford statistics on OCXO DAC values.
+
+    These are the masthead facts for the TEMPEST DAC test: the true
+    campaign mean of each OCXO's DAC fractional value.  When both
+    means shift in tandem across campaigns under different environmental
+    conditions, even a tiny correlated shift is a candidate signal.
+    """
+    r, hdr = _clocks_header()
+    yield hdr
+    if r is None:
+        return
+
+    yield "DAC WELFORD (campaign cumulative)"
+    yield f"{'OCXO':<6} {'MEAN':>10} {'SD':>8} {'SE':>8} {'MIN':>10} {'MAX':>10} {'N':>6}"
+
+    for name, key in [("OCXO1", "ocxo1"), ("OCXO2", "ocxo2")]:
+        blk = r.get(key, {})
+        dac_n = blk.get("dac_n")
+
+        if dac_n is not None and dac_n > 0:
+            mean   = blk.get("dac_mean", 0.0)
+            stddev = blk.get("dac_stddev", 0.0)
+            stderr = blk.get("dac_stderr", 0.0)
+            mn     = blk.get("dac_min", 0.0)
+            mx     = blk.get("dac_max", 0.0)
+            yield (
+                f"{name:<6} {mean:>10.3f} {stddev:>8.3f} {stderr:>8.3f}"
+                f" {mn:>10.3f} {mx:>10.3f} {dac_n:>6}"
+            )
+        else:
+            yield f"{name:<6} {'---':>10} {'---':>8} {'---':>8} {'---':>10} {'---':>10} {'---':>6}"
 
 # ---------------------------------------------------------------------
 # CLOCKS 5/5 — GNSS_RAW detail

@@ -261,6 +261,31 @@ double prediction_stddev(const prediction_tracker_t& p);
 double prediction_stderr(const prediction_tracker_t& p);
 
 // ============================================================================
+// DAC Welford tracking — campaign-scoped cumulative statistics
+//
+// Tracks the servo's DAC output value (dac_fractional) every PPS second.
+// The mean is the true campaign mean — no windowing, no decay.
+// Used by the TEMPEST DAC test to detect environmental drift via
+// correlated DAC mean shifts across campaigns.
+// ============================================================================
+
+struct dac_welford_t {
+  uint64_t n;
+  double   mean;
+  double   m2;
+  double   min_val;
+  double   max_val;
+};
+
+extern dac_welford_t dac_welford_ocxo1;
+extern dac_welford_t dac_welford_ocxo2;
+
+void dac_welford_reset(dac_welford_t& w);
+void dac_welford_update(dac_welford_t& w, double value);
+double dac_welford_stddev(const dac_welford_t& w);
+double dac_welford_stderr(const dac_welford_t& w);
+
+// ============================================================================
 // Spin Capture — nano-precise DWT anchoring with shadow-write TDC
 //
 // Two distinct timeout failure modes:

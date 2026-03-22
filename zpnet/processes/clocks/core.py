@@ -968,6 +968,12 @@ def _build_clock_block(
         block["pred_n"] = frag.get("ocxo1_pred_n")
         block["delta_raw"] = frag.get("ocxo1_delta_raw")
         block["pps_residual"] = frag.get("ocxo1_pps_residual")
+        block["dac_n"] = frag.get("ocxo1_dac_n")
+        block["dac_mean"] = frag.get("ocxo1_dac_mean")
+        block["dac_stddev"] = frag.get("ocxo1_dac_stddev")
+        block["dac_stderr"] = frag.get("ocxo1_dac_stderr")
+        block["dac_min"] = frag.get("ocxo1_dac_min")
+        block["dac_max"] = frag.get("ocxo1_dac_max")
     elif domain == "ocxo2":
         delta = frag.get("ocxo2_delta_raw")
         if delta is not None:
@@ -982,6 +988,12 @@ def _build_clock_block(
         block["pred_n"] = frag.get("ocxo2_pred_n")
         block["delta_raw"] = frag.get("ocxo2_delta_raw")
         block["pps_residual"] = frag.get("ocxo2_pps_residual")
+        block["dac_n"] = frag.get("ocxo2_dac_n")
+        block["dac_mean"] = frag.get("ocxo2_dac_mean")
+        block["dac_stddev"] = frag.get("ocxo2_dac_stddev")
+        block["dac_stderr"] = frag.get("ocxo2_dac_stderr")
+        block["dac_min"] = frag.get("ocxo2_dac_min")
+        block["dac_max"] = frag.get("ocxo2_dac_max")
     elif domain == "gnss":
         block["ppb"] = 0.0
         block["pps_residual"] = frag.get("gnss_pps_residual")
@@ -1349,6 +1361,20 @@ def _process_loop() -> None:
             "calibrate_ocxo": frag.get("calibrate_ocxo"),
             "ocxo1_servo_adjustments": frag.get("ocxo1_servo_adjustments"),
             "ocxo2_servo_adjustments": frag.get("ocxo2_servo_adjustments"),
+
+            # DAC Welford stats (TEMPEST DAC test — campaign cumulative)
+            "ocxo1_dac_n": frag.get("ocxo1_dac_n"),
+            "ocxo1_dac_mean": frag.get("ocxo1_dac_mean"),
+            "ocxo1_dac_stddev": frag.get("ocxo1_dac_stddev"),
+            "ocxo1_dac_stderr": frag.get("ocxo1_dac_stderr"),
+            "ocxo1_dac_min": frag.get("ocxo1_dac_min"),
+            "ocxo1_dac_max": frag.get("ocxo1_dac_max"),
+            "ocxo2_dac_n": frag.get("ocxo2_dac_n"),
+            "ocxo2_dac_mean": frag.get("ocxo2_dac_mean"),
+            "ocxo2_dac_stddev": frag.get("ocxo2_dac_stddev"),
+            "ocxo2_dac_stderr": frag.get("ocxo2_dac_stderr"),
+            "ocxo2_dac_min": frag.get("ocxo2_dac_min"),
+            "ocxo2_dac_max": frag.get("ocxo2_dac_max"),
 
             # PPS rejection diagnostics
             "pps_rejected_total": frag.get("diag_pps_rejected_total"),
@@ -2331,6 +2357,7 @@ def _get_baseline_from_config() -> Optional[Dict[str, Any]]:
                 return {
                     "baseline_id": row["payload"]["baseline_id"],
                     "baseline_ppb": row["payload"].get("baseline_ppb", {}),
+                    "baseline_dac_mean": row["payload"].get("baseline_dac_mean", {}),
                     "baseline_campaign": row["payload"].get("baseline_campaign"),
                     "baseline_pps_n": row["payload"].get("baseline_pps_n"),
                 }
@@ -2391,9 +2418,18 @@ def cmd_set_baseline(args: Optional[dict]) -> Dict[str, Any]:
     if not baseline_ppb:
         return {"success": False, "message": f"Campaign {baseline_id} ('{row['campaign']}') report has no PPB data"}
 
+    # DAC mean baseline (TEMPEST DAC test)
+    baseline_dac_mean = {}
+    for key in ("ocxo1", "ocxo2"):
+        blk = report.get(key, {})
+        dac_mean = blk.get("dac_mean")
+        if dac_mean is not None:
+            baseline_dac_mean[key] = round(float(dac_mean), 6)
+
     baseline_blob = {
         "baseline_id": baseline_id,
         "baseline_ppb": baseline_ppb,
+        "baseline_dac_mean": baseline_dac_mean,    # ← add
         "baseline_campaign": row["campaign"],
         "baseline_pps_n": report.get("pps_count"),
     }
@@ -2563,6 +2599,7 @@ def cmd_baseline_info(_: Optional[dict]) -> Dict[str, Any]:
         "baseline_set": True,
         "baseline_id": baseline_id,
         "baseline_ppb": info.get("baseline_ppb", {}),
+        "baseline_dac_mean": info.get("baseline_dac_mean", {}),
         "baseline_campaign": info.get("baseline_campaign"),
         "baseline_pps_n": info.get("baseline_pps_n"),
     }

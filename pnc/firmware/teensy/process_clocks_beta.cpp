@@ -190,6 +190,42 @@ double prediction_stderr(const prediction_tracker_t& p) {
 }
 
 // ============================================================================
+// DAC Welford tracking — definitions
+//
+// Cumulative Welford's over dac_fractional, one sample per PPS second.
+// Campaign-scoped: reset on START and RECOVER.
+// ============================================================================
+
+dac_welford_t dac_welford_ocxo1 = {};
+dac_welford_t dac_welford_ocxo2 = {};
+
+void dac_welford_reset(dac_welford_t& w) {
+  w.n       = 0;
+  w.mean    = 0.0;
+  w.m2      = 0.0;
+  w.min_val = 1e30;
+  w.max_val = -1e30;
+}
+
+void dac_welford_update(dac_welford_t& w, double value) {
+  w.n++;
+  const double d1 = value - w.mean;
+  w.mean += d1 / (double)w.n;
+  const double d2 = value - w.mean;
+  w.m2 += d1 * d2;
+  if (value < w.min_val) w.min_val = value;
+  if (value > w.max_val) w.max_val = value;
+}
+
+double dac_welford_stddev(const dac_welford_t& w) {
+  return (w.n >= 2) ? sqrt(w.m2 / (double)(w.n - 1)) : 0.0;
+}
+
+double dac_welford_stderr(const dac_welford_t& w) {
+  return (w.n >= 2) ? sqrt(w.m2 / (double)(w.n - 1)) / sqrt((double)w.n) : 0.0;
+}
+
+// ============================================================================
 // 64-bit accumulators — definitions
 //
 // All three external clocks accumulate 10 MHz ticks directly.
@@ -247,6 +283,9 @@ void clocks_zero_all(void) {
 
   prediction_seed(pred_dwt,
     g_dwt_cal_valid ? g_dwt_cycles_per_gnss_s : DWT_EXPECTED_PER_PPS);
+
+  dac_welford_reset(dac_welford_ocxo1);
+  dac_welford_reset(dac_welford_ocxo2);
 
   isr_prev_dwt       = isr_snap_dwt;
   isr_prev_gnss      = isr_snap_gnss;
@@ -458,6 +497,9 @@ void clocks_beta_pps(void) {
     prediction_seed(pred_dwt,
       g_dwt_cal_valid ? g_dwt_cycles_per_gnss_s : DWT_EXPECTED_PER_PPS);
 
+    dac_welford_reset(dac_welford_ocxo1);
+    dac_welford_reset(dac_welford_ocxo2);
+
     isr_residual_valid = false;
     pps_fired          = true;
 
@@ -551,6 +593,10 @@ void clocks_beta_pps(void) {
 
     ocxo_calibration_servo();
 
+    // ── DAC Welford update (TEMPEST DAC test) ──
+    dac_welford_update(dac_welford_ocxo1, ocxo1_dac.dac_fractional);
+    dac_welford_update(dac_welford_ocxo2, ocxo2_dac.dac_fractional);
+
     // ── Build and publish TIMEBASE_FRAGMENT ──
     Payload p;
     p.add("campaign",         campaign_name);
@@ -600,6 +646,21 @@ void clocks_beta_pps(void) {
 
     p.add("ocxo1_dac",         ocxo1_dac.dac_fractional);
     p.add("ocxo2_dac",         ocxo2_dac.dac_fractional);
+
+    p.add("ocxo1_dac_n",      (int32_t)dac_welford_ocxo1.n);
+    p.add_fmt("ocxo1_dac_mean",   "%.6f", dac_welford_ocxo1.mean);
+    p.add_fmt("ocxo1_dac_stddev", "%.6f", dac_welford_stddev(dac_welford_ocxo1));
+    p.add_fmt("ocxo1_dac_stderr", "%.6f", dac_welford_stderr(dac_welford_ocxo1));
+    p.add_fmt("ocxo1_dac_min",    "%.6f", dac_welford_ocxo1.min_val);
+    p.add_fmt("ocxo1_dac_max",    "%.6f", dac_welford_ocxo1.max_val);
+
+    p.add("ocxo2_dac_n",      (int32_t)dac_welford_ocxo2.n);
+    p.add_fmt("ocxo2_dac_mean",   "%.6f", dac_welford_ocxo2.mean);
+    p.add_fmt("ocxo2_dac_stddev", "%.6f", dac_welford_stddev(dac_welford_ocxo2));
+    p.add_fmt("ocxo2_dac_stderr", "%.6f", dac_welford_stderr(dac_welford_ocxo2));
+    p.add_fmt("ocxo2_dac_min",    "%.6f", dac_welford_ocxo2.min_val);
+    p.add_fmt("ocxo2_dac_max",    "%.6f", dac_welford_ocxo2.max_val);
+
     p.add("calibrate_ocxo", servo_mode_str(calibrate_ocxo_mode));
     p.add("ocxo1_servo_adjustments", ocxo1_dac.servo_adjustments);
     p.add("ocxo2_servo_adjustments", ocxo2_dac.servo_adjustments);
@@ -764,6 +825,16 @@ static void report_prediction(Payload& p, const char* prefix, const prediction_t
   snprintf(key, sizeof(key), "%s_delta_raw",      prefix); p.add(key, t.prev_delta);
 }
 
+
+static void report_dac_welford(Payload& p, const char* prefix, const dac_welford_t& w) {
+  char key[48];
+  snprintf(key, sizeof(key), "%s_dac_n",      prefix); p.add(key, (int32_t)w.n);
+  snprintf(key, sizeof(key), "%s_dac_mean",    prefix); p.add_fmt(key, "%.6f", w.mean);
+  snprintf(key, sizeof(key), "%s_dac_stddev",  prefix); p.add_fmt(key, "%.6f", dac_welford_stddev(w));
+  snprintf(key, sizeof(key), "%s_dac_stderr",  prefix); p.add_fmt(key, "%.6f", dac_welford_stderr(w));
+  snprintf(key, sizeof(key), "%s_dac_min",     prefix); p.add_fmt(key, "%.6f", w.min_val);
+  snprintf(key, sizeof(key), "%s_dac_max",     prefix); p.add_fmt(key, "%.6f", w.max_val);
+}
 // ============================================================================
 // REPORT
 // ============================================================================
@@ -825,6 +896,9 @@ static Payload cmd_report(const Payload&) {
   report_prediction(p, "dwt",   pred_dwt);
   report_prediction(p, "ocxo1", pred_ocxo1);
   report_prediction(p, "ocxo2", pred_ocxo2);
+
+  report_dac_welford(p, "ocxo1", dac_welford_ocxo1);
+  report_dac_welford(p, "ocxo2", dac_welford_ocxo2);
 
   p.add("isr_residual_dwt",   isr_residual_dwt);
   p.add("isr_residual_gnss",  isr_residual_gnss);

@@ -343,7 +343,89 @@ def clocks_combined_readout() -> list[str]:
             f"{extra}"
         )
 
+    # ==============================================================
+    # DAC Welford — campaign-cumulative statistics (TEMPEST DAC test)
+    # ==============================================================
+    baseline_dac_mean = baseline.get("baseline_dac_mean", {}) if baseline else {}
+
+    lines.append(
+        f"{'':>6}"
+        f"{'':>18}"
+        f"{'':>10}"
+        f"{'':>14}"
+        f"{'':>6}"
+        f"{'':>8}"
+        f"{'':>8}"
+        f"{'':>6}"
+        f"  │"
+        f"{'':>10}"
+        f"{'':>10}"
+        f"{'':>10}"
+        f"  │"
+    )
+
+    lines.append(
+        f"{'DAC':<6}"
+        f"{'':>18}"
+        f"{'':>10}"
+        f"{'':>14}"
+        f"{'':>6}"
+        f"{'MEAN':>8}"
+        f"{'SD':>8}"
+        f"{'N':>6}"
+        f"  │"
+        f"{'BASE':>10}"
+        f"{'NOW':>10}"
+        f"{'DELTA':>10}"
+        f"  │"
+    )
+
+    for name, key in [("OCXO1", "ocxo1"), ("OCXO2", "ocxo2")]:
+        blk = r.get(key, {})
+        dac_n = blk.get("dac_n")
+        dac_mean = blk.get("dac_mean")
+        dac_sd = blk.get("dac_stddev")
+
+        base_dac = baseline_dac_mean.get(key)
+        if base_dac is not None and dac_mean is not None:
+            dac_delta = dac_mean - base_dac
+            dac_comp = f"{base_dac:>10.3f}{dac_mean:>10.3f}{dac_delta:>+10.3f}"
+        else:
+            dac_comp = f"{'---':>10}{'---':>10}{'---':>10}"
+
+        if dac_n is not None and dac_n > 0:
+            lines.append(
+                f"{name:<6}"
+                f"{'':>18}"
+                f"{'':>10}"
+                f"{'':>14}"
+                f"{'':>6}"
+                f"{dac_mean:>8.3f}"
+                f"{dac_sd:>8.3f}"
+                f"{dac_n:>6}"
+                f"  │"
+                f"{dac_comp}"
+                f"  │"
+            )
+        else:
+            lines.append(
+                f"{name:<6}"
+                f"{'':>18}"
+                f"{'':>10}"
+                f"{'':>14}"
+                f"{'':>6}"
+                f"{'---':>8}"
+                f"{'---':>8}"
+                f"{'---':>6}"
+                f"  │"
+                f"{dac_comp}"
+                f"  │"
+            )
+
     lines.append("")
+
+    # ==============================================================
+    # TIME — from Pi report dict (r)
 
     # ==============================================================
     # TIME — from Pi report dict (r)
