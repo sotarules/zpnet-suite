@@ -643,6 +643,10 @@ static void pps_isr(void) {
   const uint32_t snap_ocxo2 = GPT2_CNT;
   const uint32_t snap_gnss  = qtimer1_read_32();
 
+  // ── PPS relay pulse to Pi ──
+  digitalWriteFast(GNSS_PPS_RELAY, HIGH);
+  relay_arm_pending = true;
+
   // ── PPS edge validation — reject spurious edges ──
   //
   // At 10 MHz, elapsed between valid PPS edges should be exactly
@@ -682,10 +686,6 @@ static void pps_isr(void) {
   // ── Capture spin loop shadow before signaling pps_fired ──
   isr_captured_shadow_dwt = dispatch_shadow_dwt;
   pps_fired = true;
-
-  // ── PPS relay pulse to Pi ──
-  digitalWriteFast(GNSS_PPS_RELAY, HIGH);
-  relay_arm_pending = true;
 
   // ── ISR-level residuals ──
   //

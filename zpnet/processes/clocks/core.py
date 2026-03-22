@@ -2664,6 +2664,12 @@ def cmd_delete(args: Optional[dict]) -> Dict[str, Any]:
         "🗑️ [clocks] DELETE: campaign='%s' — %d campaign row(s), %d timebase row(s) deleted",
         campaign_name, camp_count, tb_count,
     )
+
+    server_args = {
+        "campaign": campaign_name
+    }
+    send_command(machine="SERVER", subsystem="SYSTEM", command="DELETE_CAMPAIGN", args=server_args)
+
     return {
         "success": True, "message": "OK",
         "payload": {
