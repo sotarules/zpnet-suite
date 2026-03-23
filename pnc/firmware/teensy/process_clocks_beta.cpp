@@ -1446,6 +1446,17 @@ static Payload cmd_interp_proof(const Payload& args) {
   return p;
 }
 
+static Payload cmd_set_dac(const Payload& args) {
+  double dac_val;
+  if (args.tryGetDouble("set_dac1", dac_val))  ocxo_dac_set(ocxo1_dac, dac_val);
+  if (args.tryGetDouble("set_dac2", dac_val))  ocxo_dac_set(ocxo2_dac, dac_val);
+
+  Payload p;
+  p.add("ocxo1_dac", ocxo1_dac.dac_fractional);
+  p.add("ocxo2_dac", ocxo2_dac.dac_fractional);
+  return p;
+}
+
 // ============================================================================
 // Process registration
 // ============================================================================
@@ -1459,6 +1470,7 @@ static const process_command_entry_t CLOCKS_COMMANDS[] = {
   { "WATCHDOG_TEST", cmd_watchdog_test },
   { "INTERP_TEST",  cmd_interp_test  },
   { "INTERP_PROOF", cmd_interp_proof },
+  { "SET_DAC",      cmd_set_dac      },
   { nullptr,        nullptr          }
 };
 

@@ -2847,6 +2847,33 @@ def run() -> None:
         "Subscriptions: TIMEBASE_FRAGMENT, WATCHDOG_ANOMALY."
     )
 
+    # Push calibrated DAC values to Teensy at boot — unconditional.
+    # The Teensy boots with compiled defaults (2048).  The SYSTEM config
+    # holds the MEAN DAC values from the last servo calibration.  Push
+    # them immediately so the OCXOs are at their calibrated voltage
+    # before any campaign starts.
+    try:
+        cfg = _get_system_config()
+        boot_dac1 = cfg.get("ocxo1_dac")
+        boot_dac2 = cfg.get("ocxo2_dac")
+        if boot_dac1 is not None or boot_dac2 is not None:
+            dac_args: Dict[str, Any] = {}
+            if boot_dac1 is not None:
+                dac_args["set_dac1"] = str(float(boot_dac1))
+            if boot_dac2 is not None:
+                dac_args["set_dac2"] = str(float(boot_dac2))
+            resp = send_command(
+                machine="TEENSY", subsystem="CLOCKS", command="SET_DAC", args=dac_args,
+            )
+            logging.info(
+                "🔧 [clocks] boot DAC push: ocxo1=%s ocxo2=%s resp=%s",
+                boot_dac1, boot_dac2, resp.get("message", "?"),
+            )
+        else:
+            logging.info("🔧 [clocks] no calibrated DAC values in SYSTEM config — Teensy keeps defaults")
+    except Exception:
+        logging.exception("⚠️ [clocks] boot DAC push failed (Teensy keeps defaults)")
+
     # Start processor thread
     threading.Thread(
         target=_process_loop,

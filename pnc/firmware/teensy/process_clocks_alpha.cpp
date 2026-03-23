@@ -610,14 +610,6 @@ static void pps_asap_callback(timepop_ctx_t*, void*) {
     isr_snap_gnss
   );
 
-  if (relay_arm_pending) {
-    relay_arm_pending = false;
-    if (!relay_timer_active) {
-      relay_timer_active = true;
-      timepop_arm(PPS_RELAY_OFF_NS, false, pps_relay_deassert, nullptr, "pps-relay-off");
-    }
-  }
-
   // ── Campaign-scoped processing (beta) ──
   clocks_beta_pps();
 
@@ -643,9 +635,12 @@ static void pps_isr(void) {
   const uint32_t snap_ocxo2 = GPT2_CNT;
   const uint32_t snap_gnss  = qtimer1_read_32();
 
-  // ── PPS relay pulse to Pi ──
+  // ── PPS relay pulse to Pi — unconditional, never gated ──
   digitalWriteFast(GNSS_PPS_RELAY, HIGH);
-  relay_arm_pending = true;
+  if (!relay_timer_active) {
+    relay_timer_active = true;
+    timepop_arm(PPS_RELAY_OFF_NS, false, pps_relay_deassert, nullptr, "pps-relay-off");
+  }
 
   // ── PPS edge validation — reject spurious edges ──
   //
