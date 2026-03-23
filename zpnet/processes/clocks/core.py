@@ -1477,8 +1477,10 @@ def _process_loop() -> None:
                         """,
                         (
                             json.dumps({
-                                "ocxo1_dac": float(teensy_ocxo1_dac) if teensy_ocxo1_dac is not None else None,
-                                "ocxo2_dac": float(teensy_ocxo2_dac) if teensy_ocxo2_dac is not None else None,
+                                "ocxo1_dac": float(frag["ocxo1_dac_mean"]) if frag.get(
+                                    "ocxo1_dac_mean") is not None else None,
+                                "ocxo2_dac": float(frag["ocxo2_dac_mean"]) if frag.get(
+                                    "ocxo2_dac_mean") is not None else None,
                                 "calibrate_ocxo": teensy_calibrate if teensy_calibrate and teensy_calibrate != "OFF" else None,
                             }),
                             campaign,
@@ -1499,7 +1501,10 @@ def _process_loop() -> None:
                         SET payload = payload || %s::jsonb
                         WHERE config_key = 'SYSTEM'
                         """,
-                        (json.dumps({"ocxo1_dac": float(teensy_ocxo1_dac), "ocxo2_dac": float(teensy_ocxo2_dac) if teensy_ocxo2_dac is not None else None}),),
+                        (json.dumps({
+                            "ocxo1_dac": float(frag["ocxo1_dac_mean"]) if frag.get("ocxo1_dac_mean") is not None else float(teensy_ocxo1_dac),
+                            "ocxo2_dac": float(frag["ocxo2_dac_mean"]) if frag.get("ocxo2_dac_mean") is not None else (float(teensy_ocxo2_dac) if teensy_ocxo2_dac is not None else None),
+                        }),),
                     )
             except Exception:
                 logging.exception("⚠️ [clocks] failed to persist OCXO DAC values to config (ignored)")
