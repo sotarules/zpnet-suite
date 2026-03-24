@@ -53,6 +53,13 @@
 #include <stdlib.h>
 #include <climits>
 
+
+// Dither control lives in alpha because the timer callback is always-on and
+// hardware-facing.  Beta owns the command surface.
+extern volatile bool g_ocxo_dither_enabled;
+void clocks_set_dither_enabled(bool enabled);
+bool clocks_dither_enabled(void);
+
 // ============================================================================
 // Campaign State — definitions
 // ============================================================================
@@ -670,6 +677,8 @@ void clocks_beta_pps(void) {
     p.add("ocxo2_dither_high", o2_dither_high);
     p.add("ocxo2_dither_low",  o2_dither_low);
 
+    p.add("dither", clocks_dither_enabled());
+
     p.add("diag_pps_rejected_total",     diag_pps_rejected_total);
     p.add("diag_pps_rejected_remainder", diag_pps_rejected_remainder);
 
@@ -913,6 +922,8 @@ static Payload cmd_report(const Payload&) {
   p.add("ocxo1_dither_low",  ocxo1_dac.dither_low_count);
   p.add("ocxo2_dither_high", ocxo2_dac.dither_high_count);
   p.add("ocxo2_dither_low",  ocxo2_dac.dither_low_count);
+
+  p.add("dither", clocks_dither_enabled());
 
   p.add("calibrate_ocxo", servo_mode_str(calibrate_ocxo_mode));
   p.add("ocxo1_servo_adjustments", ocxo1_dac.servo_adjustments);
@@ -1457,6 +1468,19 @@ static Payload cmd_set_dac(const Payload& args) {
   return p;
 }
 
+static Payload cmd_dither(const Payload& args) {
+  bool enabled = args.getBool("dither", true);
+  clocks_set_dither_enabled(enabled);
+
+  Payload p;
+  p.add("dither", clocks_dither_enabled());
+  p.add("ocxo1_dac", ocxo1_dac.dac_fractional);
+  p.add("ocxo2_dac", ocxo2_dac.dac_fractional);
+  p.add("ocxo1_dac_truncated", (uint32_t)ocxo1_dac.dac_fractional);
+  p.add("ocxo2_dac_truncated", (uint32_t)ocxo2_dac.dac_fractional);
+  return p;
+}
+
 // ============================================================================
 // Process registration
 // ============================================================================
@@ -1471,6 +1495,7 @@ static const process_command_entry_t CLOCKS_COMMANDS[] = {
   { "INTERP_TEST",  cmd_interp_test  },
   { "INTERP_PROOF", cmd_interp_proof },
   { "SET_DAC",      cmd_set_dac      },
+  { "DITHER",       cmd_dither       },
   { nullptr,        nullptr          }
 };
 

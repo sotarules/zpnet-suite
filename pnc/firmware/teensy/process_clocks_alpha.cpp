@@ -83,6 +83,30 @@ static constexpr int64_t SPIN_EARLY_NS = 5000LL;  // 5 µs — shadow loop needs
 static constexpr uint64_t OCXO_DITHER_NS   =     1000000ULL;  //   1 ms
 static constexpr uint64_t PPS_RELAY_OFF_NS  =   500000000ULL;  // 500 ms
 
+volatile bool g_ocxo_dither_enabled = true;
+
+static inline void ocxo_write_truncated_now(void) {
+  uint32_t o1 = (uint32_t)ocxo1_dac.dac_fractional;
+  uint32_t o2 = (uint32_t)ocxo2_dac.dac_fractional;
+
+  if (o1 > ocxo1_dac.dac_max) o1 = ocxo1_dac.dac_max;
+  if (o2 > ocxo2_dac.dac_max) o2 = ocxo2_dac.dac_max;
+
+  analogWrite(OCXO1_CTL_PIN, o1);
+  analogWrite(OCXO2_CTL_PIN, o2);
+}
+
+void clocks_set_dither_enabled(bool enabled) {
+  g_ocxo_dither_enabled = enabled;
+  if (!enabled) {
+    ocxo_write_truncated_now();
+  }
+}
+
+bool clocks_dither_enabled(void) {
+  return g_ocxo_dither_enabled;
+}
+
 // ============================================================================
 // PPS watchdog — anomaly thresholds
 // ============================================================================
@@ -771,6 +795,10 @@ static void ocxo_dither_one(ocxo_dac_state_t& s, int pin) {
 }
 
 static void ocxo_dither_cb(timepop_ctx_t*, void*) {
+  if (!g_ocxo_dither_enabled) {
+    return;
+  }
+
   ocxo_dither_one(ocxo1_dac, OCXO1_CTL_PIN);
   ocxo_dither_one(ocxo2_dac, OCXO2_CTL_PIN);
 }
@@ -799,6 +827,7 @@ void process_clocks_init(void) {
 
   ocxo_dac_set(ocxo1_dac, (double)OCXO1_DAC_DEFAULT);
   ocxo_dac_set(ocxo2_dac, (double)OCXO2_DAC_DEFAULT);
+  ocxo_write_truncated_now();
 
   timepop_arm(OCXO_DITHER_NS, true, ocxo_dither_cb, nullptr, "ocxo-dither");
 

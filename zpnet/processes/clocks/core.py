@@ -2813,6 +2813,75 @@ def cmd_set_dac(args: Optional[dict]) -> Dict[str, Any]:
     return {"success": True, "message": "OK", "payload": update_blob}
 
 
+def cmd_set_dither(args: Optional[dict]) -> Dict[str, Any]:
+    """
+    DITHER(dither)
+
+    Update the global OCXO dithering flag in the SYSTEM config record.
+    This is a system-level setting, not a campaign attribute.
+    """
+    if not args or "dither" not in args:
+        return {"success": False, "message": "DITHER requires 'dither' argument"}
+
+    raw = args["dither"]
+    if isinstance(raw, bool):
+        dither = raw
+    elif isinstance(raw, str):
+        lowered = raw.strip().lower()
+        if lowered in ("true", "1", "yes", "on"):
+            dither = True
+        elif lowered in ("false", "0", "no", "off"):
+            dither = False
+        else:
+            return {"success": False, "message": f"Invalid dither value: {raw}"}
+    else:
+        return {"success": False, "message": f"Invalid dither value: {raw}"}
+
+    update_blob = {"dither": dither}
+
+    try:
+        with open_db() as conn:
+            cur = conn.cursor()
+            cur.execute(
+                """
+                UPDATE config
+                SET payload = payload || %s::jsonb
+                WHERE config_key = 'SYSTEM'
+                """,
+                (json.dumps(update_blob),),
+            )
+            if cur.rowcount == 0:
+                return {"success": False, "message": "No SYSTEM config record found"}
+    except Exception as e:
+        logging.exception("❌ [clocks] DITHER failed")
+        return {"success": False, "message": str(e)}
+
+    try:
+        teensy_resp = send_command(
+            machine="TEENSY",
+            subsystem="CLOCKS",
+            command="DITHER",
+            args={"dither": dither},
+        )
+    except Exception as e:
+        logging.exception("⚠️ [clocks] DITHER persisted but Teensy update failed")
+        return {
+            "success": False,
+            "message": f"SYSTEM config updated but Teensy DITHER command failed: {e}",
+            "payload": update_blob,
+        }
+
+    logging.info("🔧 [clocks] DITHER: %s resp=%s", update_blob, teensy_resp.get("message", "?"))
+    return {
+        "success": True,
+        "message": "OK",
+        "payload": {
+            **update_blob,
+            "teensy_message": teensy_resp.get("message"),
+        },
+    }
+
+
 COMMANDS = {
     "START": cmd_start,
     "STOP": cmd_stop,
@@ -2821,6 +2890,7 @@ COMMANDS = {
     "CLEAR": cmd_clear,
     "DELETE": cmd_delete,
     "SET_DAC": cmd_set_dac,
+    "DITHER": cmd_set_dither,
     "SET_BASELINE": cmd_set_baseline,
     "BASELINE_INFO": cmd_baseline_info,
     "LIST_CAMPAIGNS": cmd_list_campaigns,
@@ -2842,18 +2912,34 @@ def run() -> None:
         "Pi-side Welford for DWT/OCXO1/OCXO2 removed. GNSS stream canary retained. "
         "Recovery: campaign deactivated + queue drained + soft-skip mismatch (≤5) + late reset. "
         "START while active performs seamless flash-cut to new campaign. "
-        "Commands: START, STOP, RESUME, REPORT, CLEAR, DELETE, SET_DAC, "
+        "Commands: START, STOP, RESUME, REPORT, CLEAR, DELETE, SET_DAC, DITHER, "
         "SET_BASELINE, BASELINE_INFO, LIST_CAMPAIGNS, CLOCKS_INFO. "
         "Subscriptions: TIMEBASE_FRAGMENT, WATCHDOG_ANOMALY."
     )
 
-    # Push calibrated DAC values to Teensy at boot — unconditional.
-    # The Teensy boots with compiled defaults (2048).  The SYSTEM config
-    # holds the MEAN DAC values from the last servo calibration.  Push
-    # them immediately so the OCXOs are at their calibrated voltage
-    # before any campaign starts.
+    # Foist global OCXO control configuration onto Teensy at boot.
+    # Dither is a system-level setting, not campaign state, so apply it
+    # before pushing calibrated DAC values. Then push the stored DACs so
+    # the Teensy comes up in the correct control state before any campaign
+    # starts or recovers.
     try:
         cfg = _get_system_config()
+
+        boot_dither = cfg.get("dither")
+        if boot_dither is not None:
+            dither_resp = send_command(
+                machine="TEENSY",
+                subsystem="CLOCKS",
+                command="DITHER",
+                args={"dither": bool(boot_dither)},
+            )
+            logging.info(
+                "🔧 [clocks] boot DITHER push: dither=%s resp=%s",
+                bool(boot_dither), dither_resp.get("message", "?"),
+            )
+        else:
+            logging.info("🔧 [clocks] no dither flag in SYSTEM config — Teensy keeps compiled default")
+
         boot_dac1 = cfg.get("ocxo1_dac")
         boot_dac2 = cfg.get("ocxo2_dac")
         if boot_dac1 is not None or boot_dac2 is not None:
@@ -2872,7 +2958,7 @@ def run() -> None:
         else:
             logging.info("🔧 [clocks] no calibrated DAC values in SYSTEM config — Teensy keeps defaults")
     except Exception:
-        logging.exception("⚠️ [clocks] boot DAC push failed (Teensy keeps defaults)")
+        logging.exception("⚠️ [clocks] boot control-state push failed (Teensy keeps defaults)")
 
     # Start processor thread
     threading.Thread(
