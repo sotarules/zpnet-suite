@@ -54,8 +54,26 @@ IO24 (GPIO24)     Orange        SCL2               Rail SCL2 (Orange)           
 
 
 /*=============================================================================
- (2) TEENSY 4.1 PIN ASSIGNMENTS — v15 Symmetric Production Clock Architecture
+ (2) TEENSY 4.1 PIN ASSIGNMENTS — v17 Software-Controlled DAC Reference
 -------------------------------------------------------------------------------
+
+v17 CHANGES (from v16):
+  • Pin 23 (DAC1) assigned as VREF source for both AD5693R DACs.
+    The Teensy's onboard 12-bit DAC generates the reference voltage,
+    allowing the servo control window to be tuned in software.
+    Both AD5693R VREF pins are wired to pin 23 (one wire each,
+    sharing the same terminal).
+  • AD5693R internal reference disabled; external reference from
+    pin 23 used instead.  At 1× gain, the DAC output spans
+    0 V to VREF, where VREF is software-controlled.
+  • Pin 23 removed from unassigned pool.
+
+v16 CHANGES (from v15):
+  • OCXO CTL pins 22 and 11 retired.  OCXO frequency control is now
+    performed by two AD5693R 16-bit I2C DACs on Bus 1 (0x4C, 0x4E).
+    The DAC VOUT pins connect directly to each OCXO CTL input via
+    short green wires.  PWM dithering is eliminated.
+  • Pins 22 and 11 return to the unassigned pool.
 
 v15 CHANGES (from v14):
   • GNSS moved fully onto QTimer1 production ownership.
@@ -74,9 +92,8 @@ GND           Black         GND                Battery branching ground         
 4             Green         GNSS_LOCK_IN       GF-8802 LOCK                         Lock status signal
 10            Twisted Pair  GNSS_10MHZ_IN      GF-8802 VCLOCK                       10 MHz reference (QTimer1 ch0+ch1 counter)
 14            Twisted Pair  OCXO2_10MHZ_IN     OCXO2                                GPT2 external clock
+23            Green         DAC_VREF_OUT       AD5693R VREF (both)                  Software-controlled reference voltage
 25            Twisted Pair  OCXO1_10MHZ_IN     OCXO1                                GPT1 external clock
-22            Green         OCXO1_CTL          OCXO1 CTL                            PWM 12-bit + dither
-11            Green         OCXO2_CTL          OCXO2 CTL                            PWM 12-bit + dither
 32            Orange        GNSS_PPS_RELAY     GPIO relay to Pi                     Splits to GPIO18 and GPIO25
 15            Yellow        PHOTODIODE_ADC     Photodiode output                    Analog input (ADC)
 34            Orange        PHOTODIODE_INT     Photodiode interrupt                 Digital interrupt
@@ -87,7 +104,7 @@ GND           Black         GND                Battery branching ground         
 
 -------------------------------------------------------------------------------
 Unassigned pins (available for future use):
-  5, 6, 7, 8, 12, 13
+  5, 6, 7, 8, 11, 12, 13, 22
 
 Timer hardware binding summary:
 
@@ -95,13 +112,16 @@ Timer hardware binding summary:
   Pin 14  →  GPT2 external clock        (OCXO2 10 MHz, single-edge, 32-bit)
   Pin 10  →  QTimer1 ch0+ch1 counter    (GNSS 10 MHz input, cascaded 32-bit)
   Pin 10  →  QTimer1 ch2 compare        (GNSS TimePop compare / interrupt path)
-  Pin 22  →  FlexPWM4 Module0           (OCXO1 CTL, analogWrite 12-bit + dither)
-  Pin 5   →  FlexPWM2 Module1 Channel A (OCXO2 CTL, analogWrite 12-bit + dither)
+  Pin 23  →  DAC1 analog output         (VREF for both AD5693R DACs)
 
 Notes:
 • QTimer1 ch2 compare matches only the low 16 bits in hardware; production
   TimePop qualifies the full 32-bit target in software before firing.
-• Pin 13 (LED_BUILTIN) reserved for fault Morse annunciator.
+• Pin 13 (LED_BUILTIN) reserved for fault Morse annunciator + PPS heartbeat.
+• Pin 23 (DAC1) is a true 12-bit DAC output (not PWM).  It drives the
+  external reference voltage for both AD5693R devices.  The reference
+  voltage can be adjusted in software to optimize 16-bit resolution
+  around the OCXO servo lock point.
 • STP shield drains at source end.
 =============================================================================*/
 
@@ -189,13 +209,26 @@ INA260        0x45      Bridged    Bridged    Power monitor — Teensy
  (8) I2C BUS 1 (SMBUS1) — SDA1 (Blue) / SCL1 (Yellow) — Active
 -------------------------------------------------------------------------------
 
-Device Type   Address   A0 Strap   A1 Strap   Function
----------------------------------------------------------------------------
-INA260        0x40      Open       Bridged    Power monitor — 3.3 V rail
-INA260        0x41      Bridged    Open       Power monitor — 5.0 V rail
-INA260        0x44      Open       Open       Power monitor — Battery
-BME280        0x76      Fixed      Fixed      Environmental sensor
-EV5491        0x66      Fixed      Fixed      Laser controller (I2C)
+Device Type   Address   A0 Strap   Function                    VDD     Wire Colors
+----------------------------------------------------------------------------------
+INA260        0x40      A1=Brdg   Power monitor — 3.3 V rail  3.3 V   Blk/Blu/Yel/Pur
+INA260        0x41      A0=Brdg   Power monitor — 5.0 V rail  3.3 V   Blk/Blu/Yel/Pur
+INA260        0x44      Default   Power monitor — Battery      3.3 V   Blk/Blu/Yel/Pur
+AD5693R       0x4C      A0=Low    OCXO1 DAC (16-bit)           5.0 V   Blk/Blu/Yel/Wht
+AD5693R       0x4E      A0=High   OCXO2 DAC (16-bit)           5.0 V   Blk/Blu/Yel/Wht
+BME280        0x76      Fixed     Environmental sensor         3.3 V   Blk/Blu/Yel/Pur
+EV5491        0x66      Fixed     Laser controller (I2C)       3.3 V   Blk/Blu/Yel/Pur
+
+Notes:
+• AD5693R devices use 5 V VDD (white wire).  Internal reference is
+  disabled; external reference voltage is supplied by Teensy pin 23
+  (DAC1, 12-bit true DAC).  At 1× gain, output spans 0 V to VREF.
+• AD5693R VOUT connects directly to OCXO CTL input via short green wire.
+• AD5693R VREF on both devices connects to Teensy pin 23 (one wire each,
+  shared terminal).
+• LDAC on both AD5693R breakouts is tied to GND (immediate update on write).
+• The software-controlled VREF allows the servo control window to be
+  optimized around the OCXO lock point for maximum 16-bit resolution.
 =============================================================================*/
 
 /*=============================================================================
@@ -203,12 +236,15 @@ EV5491        0x66      Fixed      Fixed      Laser controller (I2C)
 -------------------------------------------------------------------------------
 
   10 MHz output  →  Teensy pin 25 (GPT1) via STP
-  CTL input      →  Teensy pin 22 (PWM DAC, 12-bit + dither)
+  CTL input      ←  AD5693R 0x4C VOUT (green wire, direct)
+  VREF source    ←  Teensy pin 23 (DAC1, software-controlled)
   Power          →  Dedicated 5V domain
 
 GPT1, 32-bit, single-edge.  Shield drain at OCXO1 end.
 History: GPT1/pin25 → QTimer2/pin13 (LED conflict) → QTimer4/pin6
 (XBAR, no direct access) → GPT1/pin25 (final).
+CTL history: Teensy pin 22 (PWM 12-bit + dither) → AD5693R 0x4C (I2C 16-bit).
+VREF history: Internal 2.5 V → External from Teensy DAC1 pin 23.
 =============================================================================*/
 
 /*=============================================================================
@@ -216,42 +252,13 @@ History: GPT1/pin25 → QTimer2/pin13 (LED conflict) → QTimer4/pin6
 -------------------------------------------------------------------------------
 
   10 MHz output  →  Teensy pin 14 (GPT2) via STP
-  CTL input      →  Teensy pin 5 (PWM DAC, 12-bit + dither)
+  CTL input      ←  AD5693R 0x4E VOUT (green wire, direct)
+  VREF source    ←  Teensy pin 23 (DAC1, software-controlled)
   Power          →  Dedicated 5V domain
 
 GPT2, 32-bit, single-edge.  Symmetric with OCXO1.  Shield drain at OCXO2 end.
 Previously QTimer1/pin10 — moved to GPT2 to eliminate ±15,000 count
 phase aliasing artifacts from the earlier dual-edge OCXO experiment.
-=============================================================================*/
-
-/*=============================================================================
- (11) GNSS 10 MHz — GF-8802 BCLOCK
--------------------------------------------------------------------------------
-
-  10 MHz output  →  Teensy pin 10 (QTimer1) via STP
-  PPS output     →  Teensy pin 1
-  Lock signal    →  Teensy pin 4
-
-QTimer1 owns GNSS timing in production:
-  • ch0 + ch1 = cascaded 32-bit counter
-  • ch2       = TimePop compare / interrupt channel
-
-GNSS scheduling is therefore performed directly against the GNSS counter base,
-with low-word hardware compare and full 32-bit software qualification.
-=============================================================================*/
-
-/*=============================================================================
- (12) CLOCK DOMAIN SUMMARY — v15
--------------------------------------------------------------------------------
-
-Domain     Source             Timer HW                 Pin    Counting
----------------------------------------------------------------------------
-DWT        ARM Cortex-M7      DWT_CYCCNT                —     1008 MHz
-GNSS       GF-8802 BCLOCK     QTimer1 ch0+ch1 (+ ch2)   10    counter + compare path
-OCXO1      AOCJY1-A           GPT1                      25    single-edge (10 MHz)
-OCXO2      AOCJY1-A           GPT2                      14    single-edge (10 MHz)
-
-PPS ISR capture order: DWT → GPT1 → GPT2 → QTimer1.
-GNSS time = campaign_seconds × 1,000,000,000 (PPS-derived, exact).
-Both OCXOs: deterministic single-edge counting, no phase aliasing.
+CTL history: Teensy pin 5 (PWM 12-bit + dither) → AD5693R 0x4E (I2C 16-bit).
+VREF history: Internal 2.5 V → External from Teensy DAC1 pin 23.
 =============================================================================*/

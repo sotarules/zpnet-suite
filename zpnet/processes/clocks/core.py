@@ -2779,8 +2779,8 @@ def cmd_set_dac(args: Optional[dict]) -> Dict[str, Any]:
             dac1 = float(args["dac1"])
         except (ValueError, TypeError):
             return {"success": False, "message": f"Invalid dac1 value: {args['dac1']}"}
-        if dac1 < 0 or dac1 > 4095:
-            return {"success": False, "message": f"DAC1 value {dac1} out of range (0–4095)"}
+        if dac1 < 0 or dac1 > 65535:
+            return {"success": False, "message": f"DAC1 value {dac1} out of range (0–65535)"}
         update_blob["ocxo1_dac"] = dac1
 
     if "dac2" in args:
@@ -2788,8 +2788,8 @@ def cmd_set_dac(args: Optional[dict]) -> Dict[str, Any]:
             dac2 = float(args["dac2"])
         except (ValueError, TypeError):
             return {"success": False, "message": f"Invalid dac2 value: {args['dac2']}"}
-        if dac2 < 0 or dac2 > 4095:
-            return {"success": False, "message": f"DAC2 value {dac2} out of range (0–4095)"}
+        if dac2 < 0 or dac2 > 65535:
+            return {"success": False, "message": f"DAC2 value {dac2} out of range (0–65535)"}
         update_blob["ocxo2_dac"] = dac2
 
     try:
@@ -2890,7 +2890,6 @@ COMMANDS = {
     "CLEAR": cmd_clear,
     "DELETE": cmd_delete,
     "SET_DAC": cmd_set_dac,
-    "DITHER": cmd_set_dither,
     "SET_BASELINE": cmd_set_baseline,
     "BASELINE_INFO": cmd_baseline_info,
     "LIST_CAMPAIGNS": cmd_list_campaigns,
@@ -2924,21 +2923,6 @@ def run() -> None:
     # starts or recovers.
     try:
         cfg = _get_system_config()
-
-        boot_dither = cfg.get("dither")
-        if boot_dither is not None:
-            dither_resp = send_command(
-                machine="TEENSY",
-                subsystem="CLOCKS",
-                command="DITHER",
-                args={"dither": bool(boot_dither)},
-            )
-            logging.info(
-                "🔧 [clocks] boot DITHER push: dither=%s resp=%s",
-                bool(boot_dither), dither_resp.get("message", "?"),
-            )
-        else:
-            logging.info("🔧 [clocks] no dither flag in SYSTEM config — Teensy keeps compiled default")
 
         boot_dac1 = cfg.get("ocxo1_dac")
         boot_dac2 = cfg.get("ocxo2_dac")

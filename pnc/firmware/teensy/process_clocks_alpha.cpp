@@ -63,6 +63,7 @@
 #include "timepop.h"
 #include "config.h"
 #include "util.h"
+#include "ad5693r.h"
 
 #include <Arduino.h>
 #include "imxrt.h"
@@ -80,32 +81,7 @@ static constexpr int64_t SPIN_EARLY_NS = 5000LL;  // 5 µs — shadow loop needs
 // TimePop delay constants (nanoseconds)
 // ============================================================================
 
-static constexpr uint64_t OCXO_DITHER_NS   =     1000000ULL;  //   1 ms
 static constexpr uint64_t PPS_RELAY_OFF_NS  =   500000000ULL;  // 500 ms
-
-volatile bool g_ocxo_dither_enabled = true;
-
-static inline void ocxo_write_truncated_now(void) {
-  uint32_t o1 = (uint32_t)ocxo1_dac.dac_fractional;
-  uint32_t o2 = (uint32_t)ocxo2_dac.dac_fractional;
-
-  if (o1 > ocxo1_dac.dac_max) o1 = ocxo1_dac.dac_max;
-  if (o2 > ocxo2_dac.dac_max) o2 = ocxo2_dac.dac_max;
-
-  analogWrite(OCXO1_CTL_PIN, o1);
-  analogWrite(OCXO2_CTL_PIN, o2);
-}
-
-void clocks_set_dither_enabled(bool enabled) {
-  g_ocxo_dither_enabled = enabled;
-  if (!enabled) {
-    ocxo_write_truncated_now();
-  }
-}
-
-bool clocks_dither_enabled(void) {
-  return g_ocxo_dither_enabled;
-}
 
 // ============================================================================
 // PPS watchdog — anomaly thresholds
@@ -265,13 +241,13 @@ bool clocks_dwt_calibration_valid(void) {
 // ============================================================================
 
 ocxo_dac_state_t ocxo1_dac = {
-  (double)OCXO1_DAC_DEFAULT, OCXO1_DAC_MIN, OCXO1_DAC_MAX,
-  0, 0.0, 0, 0, 0, 0.0, 0, 0
+  (double)AD5693R_DAC_DEFAULT, 0, 65535,
+  0, 0.0, 0, 0
 };
 
 ocxo_dac_state_t ocxo2_dac = {
-  (double)OCXO2_DAC_DEFAULT, OCXO2_DAC_MIN, OCXO2_DAC_MAX,
-  0, 0.0, 0, 0, 0, 0.0, 0, 0
+  (double)AD5693R_DAC_DEFAULT, 0, 65535,
+  0, 0.0, 0, 0
 };
 
 servo_mode_t calibrate_ocxo_mode = servo_mode_t::OFF;
@@ -295,6 +271,11 @@ void ocxo_dac_set(ocxo_dac_state_t& s, double value) {
   if (value < (double)s.dac_min) value = (double)s.dac_min;
   if (value > (double)s.dac_max) value = (double)s.dac_max;
   s.dac_fractional = value;
+
+  // Write truncated integer to I2C DAC immediately
+  uint16_t hw_val = (uint16_t)value;
+  if (&s == &ocxo1_dac) ad5693r_write_ocxo1(hw_val);
+  else                  ad5693r_write_ocxo2(hw_val);
 }
 
 // ============================================================================
@@ -785,38 +766,6 @@ static void pps_isr(void) {
 }
 
 // ============================================================================
-// Dither callback — runs forever at 1 kHz, writes both OCXO PWM pins
-// ============================================================================
-
-static void ocxo_dither_one(ocxo_dac_state_t& s, int pin) {
-  uint32_t base = (uint32_t)s.dac_fractional;
-  double   frac = s.dac_fractional - (double)base;
-
-  s.dither_accum += frac;
-  uint32_t output;
-  if (s.dither_accum >= 1.0) {
-    s.dither_accum -= 1.0;
-    output = base + 1;
-    s.dither_high_count++;
-  } else {
-    output = base;
-    s.dither_low_count++;
-  }
-
-  if (output > s.dac_max) output = s.dac_max;
-  analogWrite(pin, output);
-}
-
-static void ocxo_dither_cb(timepop_ctx_t*, void*) {
-  if (!g_ocxo_dither_enabled) {
-    return;
-  }
-
-  ocxo_dither_one(ocxo1_dac, OCXO1_CTL_PIN);
-  ocxo_dither_one(ocxo2_dac, OCXO2_CTL_PIN);
-}
-
-// ============================================================================
 // Initialization — Phase 1 (hardware only, no TimePop dependency)
 // ============================================================================
 
@@ -836,13 +785,10 @@ void process_clocks_init(void) {
   time_init();
   timebase_init();
 
-  analogWriteResolution(12);
+  ad5693r_init();
 
-  ocxo_dac_set(ocxo1_dac, (double)OCXO1_DAC_DEFAULT);
-  ocxo_dac_set(ocxo2_dac, (double)OCXO2_DAC_DEFAULT);
-  ocxo_write_truncated_now();
-
-  timepop_arm(OCXO_DITHER_NS, true, ocxo_dither_cb, nullptr, "ocxo-dither");
+  ocxo_dac_set(ocxo1_dac, (double)AD5693R_DAC_DEFAULT);
+  ocxo_dac_set(ocxo2_dac, (double)AD5693R_DAC_DEFAULT);
 
   pinMode(GNSS_PPS_PIN,   INPUT);
   pinMode(GNSS_LOCK_PIN,  INPUT);

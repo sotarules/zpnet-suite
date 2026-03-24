@@ -123,7 +123,9 @@ I2C_SENSORS_BY_BUS = {
         0x41: "INA260 0x41 (5v Rail+",
         0x44: "INA260 0x44 (12v Rail)",
         0x66: "EV5491 0x66 (Laser Controller)",
-        0x76: "BME280 0x76 (Environment)"
+        0x76: "BME280 0x76 (Environment)",
+        0x4C: "AD5693R 0x4C (OCXO1 DAC)",
+        0x4E: "AD5693R 0x4E (OCXO2 DAC)",
         # 0x57 will appear via scan but is ignored (EEPROM)
     },
 

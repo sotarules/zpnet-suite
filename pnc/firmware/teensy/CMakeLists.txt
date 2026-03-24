@@ -81,6 +81,7 @@ set(ZPNET_SOURCES
     util.cpp
     teensy.ino
     time.cpp
+    ad5693r.cpp
 )
 
 set(ZPNET_HEADERS
@@ -110,6 +111,7 @@ set(ZPNET_HEADERS
     time.h
     tdc_correction.h
     isr_dwt_compensate.h
+    ad5693r.h
 )
 
 # -------------------------------------------------------------

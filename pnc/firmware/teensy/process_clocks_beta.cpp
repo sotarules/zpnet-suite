@@ -45,6 +45,7 @@
 #include "timepop.h"
 #include "config.h"
 #include "util.h"
+#include "ad5693r.h"
 
 #include <Arduino.h>
 #include "imxrt.h"
@@ -52,13 +53,6 @@
 #include <math.h>
 #include <stdlib.h>
 #include <climits>
-
-
-// Dither control lives in alpha because the timer callback is always-on and
-// hardware-facing.  Beta owns the command surface.
-extern volatile bool g_ocxo_dither_enabled;
-void clocks_set_dither_enabled(bool enabled);
-bool clocks_dither_enabled(void);
 
 // ============================================================================
 // Campaign State — definitions
@@ -577,16 +571,6 @@ void clocks_beta_pps(void) {
       pred_dwt.predicted_valid ? pred_dwt.predicted :
       (g_dwt_cal_valid ? g_dwt_cycles_per_gnss_s : DWT_EXPECTED_PER_PPS);
 
-    // Reset dither counters for this PPS interval (snapshot before reset)
-    const uint32_t o1_dither_high = ocxo1_dac.dither_high_count;
-    const uint32_t o1_dither_low  = ocxo1_dac.dither_low_count;
-    const uint32_t o2_dither_high = ocxo2_dac.dither_high_count;
-    const uint32_t o2_dither_low  = ocxo2_dac.dither_low_count;
-    ocxo1_dac.dither_high_count = 0;
-    ocxo1_dac.dither_low_count  = 0;
-    ocxo2_dac.dither_high_count = 0;
-    ocxo2_dac.dither_low_count  = 0;
-
     // ── Residual updates ──
     residual_update(residual_dwt,   pps_dwt_cycles,   DWT_EXPECTED_PER_PPS_I);
     residual_update(residual_gnss,  pps_gnss_ticks,   GNSS_EXPECTED_PER_PPS);
@@ -671,13 +655,6 @@ void clocks_beta_pps(void) {
     p.add("calibrate_ocxo", servo_mode_str(calibrate_ocxo_mode));
     p.add("ocxo1_servo_adjustments", ocxo1_dac.servo_adjustments);
     p.add("ocxo2_servo_adjustments", ocxo2_dac.servo_adjustments);
-
-    p.add("ocxo1_dither_high", o1_dither_high);
-    p.add("ocxo1_dither_low",  o1_dither_low);
-    p.add("ocxo2_dither_high", o2_dither_high);
-    p.add("ocxo2_dither_low",  o2_dither_low);
-
-    p.add("dither", clocks_dither_enabled());
 
     p.add("diag_pps_rejected_total",     diag_pps_rejected_total);
     p.add("diag_pps_rejected_remainder", diag_pps_rejected_remainder);
@@ -917,13 +894,6 @@ static Payload cmd_report(const Payload&) {
 
   p.add("ocxo1_dac",               ocxo1_dac.dac_fractional);
   p.add("ocxo2_dac",               ocxo2_dac.dac_fractional);
-
-  p.add("ocxo1_dither_high", ocxo1_dac.dither_high_count);
-  p.add("ocxo1_dither_low",  ocxo1_dac.dither_low_count);
-  p.add("ocxo2_dither_high", ocxo2_dac.dither_high_count);
-  p.add("ocxo2_dither_low",  ocxo2_dac.dither_low_count);
-
-  p.add("dither", clocks_dither_enabled());
 
   p.add("calibrate_ocxo", servo_mode_str(calibrate_ocxo_mode));
   p.add("ocxo1_servo_adjustments", ocxo1_dac.servo_adjustments);
@@ -1468,16 +1438,32 @@ static Payload cmd_set_dac(const Payload& args) {
   return p;
 }
 
-static Payload cmd_dither(const Payload& args) {
-  bool enabled = args.getBool("dither", true);
-  clocks_set_dither_enabled(enabled);
+static Payload cmd_dac_test(const Payload& args) {
+  uint8_t addr = AD5693R_ADDR_OCXO1;
+  const char* target = args.getString("target");
+  if (target && strcmp(target, "2") == 0) addr = AD5693R_ADDR_OCXO2;
 
   Payload p;
-  p.add("dither", clocks_dither_enabled());
-  p.add("ocxo1_dac", ocxo1_dac.dac_fractional);
-  p.add("ocxo2_dac", ocxo2_dac.dac_fractional);
-  p.add("ocxo1_dac_truncated", (uint32_t)ocxo1_dac.dac_fractional);
-  p.add("ocxo2_dac_truncated", (uint32_t)ocxo2_dac.dac_fractional);
+  p.add("addr", (int32_t)addr);
+
+  // Optional control register write
+  const char* ctrl_str = args.getString("ctrl");
+  if (ctrl_str) {
+    uint16_t ctrl = (uint16_t)strtoul(ctrl_str, nullptr, 0);
+    bool ctrl_ok = ad5693r_write_ctrl(addr, ctrl);
+    p.add("ctrl", (int32_t)ctrl);
+    p.add("ctrl_ack", ctrl_ok);
+  }
+
+  // Optional DAC value write
+  double dac_val;
+  if (args.tryGetDouble("value", dac_val)) {
+    uint16_t val = (uint16_t)dac_val;
+    bool val_ok = ad5693r_write(addr, val);
+    p.add("value", (int32_t)val);
+    p.add("value_ack", val_ok);
+  }
+
   return p;
 }
 
@@ -1495,7 +1481,7 @@ static const process_command_entry_t CLOCKS_COMMANDS[] = {
   { "INTERP_TEST",  cmd_interp_test  },
   { "INTERP_PROOF", cmd_interp_proof },
   { "SET_DAC",      cmd_set_dac      },
-  { "DITHER",       cmd_dither       },
+  { "DAC_TEST",     cmd_dac_test     },
   { nullptr,        nullptr          }
 };
 

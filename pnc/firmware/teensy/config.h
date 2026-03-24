@@ -152,19 +152,7 @@ static const int GNSS_PPS_RELAY = 32;
 // OCXO1_10MHZ_PIN:
 //   10 MHz output from OCXO1, counted by GPT1.
 //
-// OCXO1_CTL_PIN:
-//   PWM output (12-bit + dither) driving OCXO1 CTL input.
-//   Pin 22.
-//   0–3.3V for frequency trim.
-//   Positive pull slope: higher voltage = higher frequency.
-//
 static const int OCXO1_10MHZ_PIN = 25;
-static const int OCXO1_CTL_PIN   = 22;
-
-// OCXO1 DAC defaults
-static constexpr uint32_t OCXO1_DAC_DEFAULT = 2048;
-static constexpr uint32_t OCXO1_DAC_MIN     = 0;
-static constexpr uint32_t OCXO1_DAC_MAX     = 4095;
 
 // --------------------------------------------------------------
 // OCXO2 — AOCJY1-A #2 (second oscillator)
@@ -173,19 +161,7 @@ static constexpr uint32_t OCXO1_DAC_MAX     = 4095;
 // OCXO2_10MHZ_PIN:
 //   10 MHz output from OCXO2, counted by GPT2 on pin 14.
 //
-// OCXO2_CTL_PIN:
-//   PWM output (12-bit + dither) driving OCXO2 CTL input.
-//   Pin 5.
-//   0–3.3V for frequency trim.
-//   Positive pull slope: higher voltage = higher frequency.
-//
 static const int OCXO2_10MHZ_PIN = 14;
-static const int OCXO2_CTL_PIN   = 5;
-
-// OCXO2 DAC defaults (identical range to OCXO1)
-static constexpr uint32_t OCXO2_DAC_DEFAULT = 2048;
-static constexpr uint32_t OCXO2_DAC_MIN     = 0;
-static constexpr uint32_t OCXO2_DAC_MAX     = 4095;
 
 // --------------------------------------------------------------
 // QTimer1 cascade configuration

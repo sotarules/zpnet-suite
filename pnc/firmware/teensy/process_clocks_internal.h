@@ -139,13 +139,9 @@ extern volatile bool pps_fired;
 // ============================================================================
 
 struct ocxo_dac_state_t {
-  double   dac_fractional;
-  uint32_t dac_min;             // per-oscillator floor
-  uint32_t dac_max;             // per-oscillator ceiling
-  uint32_t dither_cycle;
-  double   dither_accum;
-  uint32_t dither_high_count;
-  uint32_t dither_low_count;
+  double   dac_fractional;      // servo works in double, truncated to uint16_t at I2C write
+  uint32_t dac_min;             // 0
+  uint32_t dac_max;             // 65535
   double   servo_last_step;
   double   servo_last_residual;
   uint32_t servo_settle_count;
@@ -154,8 +150,6 @@ struct ocxo_dac_state_t {
 
 extern ocxo_dac_state_t ocxo1_dac;
 extern ocxo_dac_state_t ocxo2_dac;
-
-static constexpr uint32_t DITHER_PERIOD = 1000;
 
 // ============================================================================
 // OCXO servo mode — campaign-level calibration strategy
