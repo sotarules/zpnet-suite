@@ -1,5 +1,5 @@
 """
-ZPNet Metrics Readout Blocks — Dense Clocks Panel (v7 GNSS_RAW)
+ZPNet Metrics Readout Blocks — Dense Clocks Panel (v8 DAC HW)
 
 Designed for full-screen terminal display over SSH at 1080p.
 
@@ -9,6 +9,13 @@ Data sources:
   • Teensy CLOCKS REPORT → spin capture, ISR residuals, DWT internals,
     PPS diagnostics, servo state
   • Pi SYSTEM REPORT → GNSS, environment, power
+
+v8 changes:
+  • OCXO EXTRA column now shows DAC= as the actual integer hardware
+    code written to the AD5693R (dac_hw), not the servo's fractional
+    accumulator.  The fractional value remains visible in the DAC
+    Welford MEAN column where it belongs.
+  • Pipe column separators removed for cleaner alignment.
 
 v7 changes:
   • GNSS_RAW synthetic clock domain added right after GNSS row.
@@ -203,11 +210,11 @@ def clocks_combined_readout() -> list[str]:
         f"{'MEAN':>8}"
         f"{'SD':>8}"
         f"{'N':>6}"
-        f"  │"
+        f"  "
         f"{'BASE':>10}"
         f"{'NOW':>10}"
         f"{'DELTA':>10}"
-        f"  │ EXTRA"
+        f"   EXTRA"
     )
 
     # GNSS row
@@ -231,9 +238,9 @@ def clocks_combined_readout() -> list[str]:
         f"{'---':>8}"
         f"{'---':>8}"
         f"{'---':>6}"
-        f"  │"
+        f"  "
         f"{gnss_comp}"
-        f"  │ stream={'OK' if gnss_blk.get('stream_valid', True) else 'BAD'}"
+        f"   stream={'OK' if gnss_blk.get('stream_valid', True) else 'BAD'}"
     )
 
     # GN_RAW row — GNSS_RAW synthetic clock (Pi-side Welford on drift_ppb)
@@ -263,9 +270,8 @@ def clocks_combined_readout() -> list[str]:
         f"{_fmt(gnss_raw_mean, '>8.3f', 8)}"
         f"{_fmt(gnss_raw_sd, '>8.3f', 8)}"
         f"{_fmt(gnss_raw_n, '>6d', 6)}"
-        f"  │"
+        f"  "
         f"{gnss_raw_comp}"
-        f"  │"
     )
 
     # DWT row
@@ -295,9 +301,8 @@ def clocks_combined_readout() -> list[str]:
         f"{_fmt(dwt_mean, '>8.3f', 8)}"
         f"{_fmt(dwt_sd, '>8.3f', 8)}"
         f"{_fmt(dwt_n, '>6d', 6)}"
-        f"  │"
+        f"  "
         f"{dwt_comp}"
-        f"  │"
     )
 
     # OCXO1 and OCXO2 rows
@@ -322,11 +327,13 @@ def clocks_combined_readout() -> list[str]:
         else:
             comp = f"{'---':>10}{'---':>10}{'---':>10}"
 
-        dac = t.get(dac_key)
+        dac_hw = t.get(dac_key.replace("_dac", "_dac_hw"))
         adj = t.get(adj_key, 0)
-        extra = (
-            f" DAC={dac:>10.3f} ADJ={adj:>4}" if dac is not None else ""
-        )
+        if dac_hw is not None:
+            dac_volts = dac_hw * 3.002 / 65535
+            extra = f"   DAC={dac_hw:>5d} {dac_volts:.5f}V ADJ={adj:>4}"
+        else:
+            extra = ""
 
         lines.append(
             f"{name:<6}"
@@ -337,9 +344,8 @@ def clocks_combined_readout() -> list[str]:
             f"{_fmt(mean, '>8.3f', 8)}"
             f"{_fmt(sd, '>8.3f', 8)}"
             f"{_fmt(pred_n, '>6d', 6)}"
-            f"  │"
+            f"  "
             f"{comp}"
-            f"  │"
             f"{extra}"
         )
 
@@ -348,21 +354,7 @@ def clocks_combined_readout() -> list[str]:
     # ==============================================================
     baseline_dac_mean = baseline.get("baseline_dac_mean", {}) if baseline else {}
 
-    lines.append(
-        f"{'':>6}"
-        f"{'':>18}"
-        f"{'':>10}"
-        f"{'':>14}"
-        f"{'':>6}"
-        f"{'':>8}"
-        f"{'':>8}"
-        f"{'':>6}"
-        f"  │"
-        f"{'':>10}"
-        f"{'':>10}"
-        f"{'':>10}"
-        f"  │"
-    )
+    lines.append("")
 
     lines.append(
         f"{'DAC':<6}"
@@ -373,11 +365,10 @@ def clocks_combined_readout() -> list[str]:
         f"{'MEAN':>8}"
         f"{'SD':>8}"
         f"{'N':>6}"
-        f"  │"
+        f"  "
         f"{'BASE':>10}"
         f"{'NOW':>10}"
         f"{'DELTA':>10}"
-        f"  │"
     )
 
     for name, key in [("OCXO1", "ocxo1"), ("OCXO2", "ocxo2")]:
@@ -403,9 +394,8 @@ def clocks_combined_readout() -> list[str]:
                 f"{dac_mean:>8.3f}"
                 f"{dac_sd:>8.3f}"
                 f"{dac_n:>6}"
-                f"  │"
+                f"  "
                 f"{dac_comp}"
-                f"  │"
             )
         else:
             lines.append(
@@ -417,15 +407,11 @@ def clocks_combined_readout() -> list[str]:
                 f"{'---':>8}"
                 f"{'---':>8}"
                 f"{'---':>6}"
-                f"  │"
+                f"  "
                 f"{dac_comp}"
-                f"  │"
             )
 
     lines.append("")
-
-    # ==============================================================
-    # TIME — from Pi report dict (r)
 
     # ==============================================================
     # TIME — from Pi report dict (r)

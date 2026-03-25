@@ -146,6 +146,7 @@ extern volatile bool pps_fired;
 
 struct ocxo_dac_state_t {
   double   dac_fractional;      // servo works in double, truncated to uint16_t at I2C write
+  uint16_t dac_hw_code;         // actual integer code last written to AD5693R
   uint32_t dac_min;             // 0
   uint32_t dac_max;             // 65535
   double   servo_last_step;

@@ -243,12 +243,12 @@ bool g_ad5693r_init_ok = false;
 // ============================================================================
 
 ocxo_dac_state_t ocxo1_dac = {
-  (double)AD5693R_DAC_DEFAULT, 0, 65535,
+  (double)AD5693R_DAC_DEFAULT, AD5693R_DAC_DEFAULT, 0, 65535,
   0, 0.0, 0, 0
 };
 
 ocxo_dac_state_t ocxo2_dac = {
-  (double)AD5693R_DAC_DEFAULT, 0, 65535,
+  (double)AD5693R_DAC_DEFAULT, AD5693R_DAC_DEFAULT, 0, 65535,
   0, 0.0, 0, 0
 };
 
@@ -273,14 +273,13 @@ void ocxo_dac_set(ocxo_dac_state_t& s, double value) {
   if (value < (double)s.dac_min) value = (double)s.dac_min;
   if (value > (double)s.dac_max) value = (double)s.dac_max;
   s.dac_fractional = value;
+  s.dac_hw_code = (uint16_t)value;
 
-  // Write truncated integer to I2C DAC immediately
-  uint16_t hw_val = (uint16_t)value;
   if (&s == &ocxo1_dac) {
-    ad5693r_write_input(AD5693R_ADDR_OCXO1, hw_val);
+    ad5693r_write_input(AD5693R_ADDR_OCXO1, s.dac_hw_code);
     ad5693r_update_dac(AD5693R_ADDR_OCXO1);
   } else {
-    ad5693r_write_input(AD5693R_ADDR_OCXO2, hw_val);
+    ad5693r_write_input(AD5693R_ADDR_OCXO2, s.dac_hw_code);
     ad5693r_update_dac(AD5693R_ADDR_OCXO2);
   }
 }

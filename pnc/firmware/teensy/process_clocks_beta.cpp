@@ -650,6 +650,8 @@ void clocks_beta_pps(void) {
 
     p.add("ocxo1_dac",         ocxo1_dac.dac_fractional);
     p.add("ocxo2_dac",         ocxo2_dac.dac_fractional);
+    p.add("ocxo1_dac_hw",      (int32_t)ocxo1_dac.dac_hw_code);
+    p.add("ocxo2_dac_hw",      (int32_t)ocxo2_dac.dac_hw_code);
 
     p.add("ocxo1_dac_n",      (int32_t)dac_welford_ocxo1.n);
     p.add_fmt("ocxo1_dac_mean",   "%.6f", dac_welford_ocxo1.mean);
@@ -907,6 +909,8 @@ static Payload cmd_report(const Payload&) {
 
   p.add("ocxo1_dac",               ocxo1_dac.dac_fractional);
   p.add("ocxo2_dac",               ocxo2_dac.dac_fractional);
+  p.add("ocxo1_dac_hw",            (int32_t)ocxo1_dac.dac_hw_code);
+  p.add("ocxo2_dac_hw",            (int32_t)ocxo2_dac.dac_hw_code);
 
   p.add("calibrate_ocxo", servo_mode_str(calibrate_ocxo_mode));
   p.add("ocxo1_servo_adjustments", ocxo1_dac.servo_adjustments);

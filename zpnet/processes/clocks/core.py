@@ -974,6 +974,7 @@ def _build_clock_block(
         block["dac_stderr"] = frag.get("ocxo1_dac_stderr")
         block["dac_min"] = frag.get("ocxo1_dac_min")
         block["dac_max"] = frag.get("ocxo1_dac_max")
+        block["dac_hw"] = frag.get("ocxo1_dac_hw")
     elif domain == "ocxo2":
         delta = frag.get("ocxo2_delta_raw")
         if delta is not None:
@@ -994,6 +995,7 @@ def _build_clock_block(
         block["dac_stderr"] = frag.get("ocxo2_dac_stderr")
         block["dac_min"] = frag.get("ocxo2_dac_min")
         block["dac_max"] = frag.get("ocxo2_dac_max")
+        block["dac_hw"] = frag.get("ocxo2_dac_hw")
     elif domain == "gnss":
         block["ppb"] = 0.0
         block["pps_residual"] = frag.get("gnss_pps_residual")
@@ -1358,6 +1360,8 @@ def _process_loop() -> None:
             # OCXO control state (both OCXOs)
             "ocxo1_dac": frag.get("ocxo1_dac"),
             "ocxo2_dac": frag.get("ocxo2_dac"),
+            "ocxo1_dac_hw": frag.get("ocxo1_dac_hw"),
+            "ocxo2_dac_hw": frag.get("ocxo2_dac_hw"),
             "calibrate_ocxo": frag.get("calibrate_ocxo"),
             "ocxo1_servo_adjustments": frag.get("ocxo1_servo_adjustments"),
             "ocxo2_servo_adjustments": frag.get("ocxo2_servo_adjustments"),
