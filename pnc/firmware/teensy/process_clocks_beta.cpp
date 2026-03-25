@@ -1467,6 +1467,40 @@ static Payload cmd_dac_test(const Payload& args) {
   return p;
 }
 
+static Payload cmd_dac_probe(const Payload& args) {
+  uint8_t addr = AD5693R_ADDR_OCXO1;
+  const char* target = args.getString("target");
+  if (target && strcmp(target, "2") == 0) addr = AD5693R_ADDR_OCXO2;
+
+  Payload p;
+  p.add("addr", (int32_t)addr);
+
+  const char* ctrl_str = args.getString("ctrl");
+  if (ctrl_str) {
+    uint16_t ctrl = (uint16_t)strtoul(ctrl_str, nullptr, 0);
+    bool ctrl_ok = ad5693r_write_ctrl(addr, ctrl);
+    p.add("ctrl", (int32_t)ctrl);
+    p.add("ctrl_ack", ctrl_ok);
+  }
+
+  double dac_val;
+  if (args.tryGetDouble("value", dac_val)) {
+    uint16_t val = (uint16_t)dac_val;
+    bool val_ok = ad5693r_write(addr, val);
+    p.add("value", (int32_t)val);
+    p.add("value_ack", val_ok);
+  }
+
+  uint16_t readback = 0;
+  bool rb_ok = ad5693r_read_input_register(addr, readback);
+  p.add("readback_ack", rb_ok);
+  if (rb_ok) {
+    p.add("readback", (int32_t)readback);
+  }
+
+  return p;
+}
+
 // ============================================================================
 // Process registration
 // ============================================================================
@@ -1482,6 +1516,7 @@ static const process_command_entry_t CLOCKS_COMMANDS[] = {
   { "INTERP_PROOF", cmd_interp_proof },
   { "SET_DAC",      cmd_set_dac      },
   { "DAC_TEST",     cmd_dac_test     },
+  { "DAC_PROBE",     cmd_dac_probe     },
   { nullptr,        nullptr          }
 };
 

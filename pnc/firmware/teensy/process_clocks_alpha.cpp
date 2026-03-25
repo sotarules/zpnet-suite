@@ -236,6 +236,8 @@ bool clocks_dwt_calibration_valid(void) {
   return g_dwt_cal_valid;
 }
 
+bool g_ad5693r_init_ok = false;
+
 // ============================================================================
 // OCXO DAC state — definitions
 // ============================================================================
@@ -274,8 +276,13 @@ void ocxo_dac_set(ocxo_dac_state_t& s, double value) {
 
   // Write truncated integer to I2C DAC immediately
   uint16_t hw_val = (uint16_t)value;
-  if (&s == &ocxo1_dac) ad5693r_write_ocxo1(hw_val);
-  else                  ad5693r_write_ocxo2(hw_val);
+  if (&s == &ocxo1_dac) {
+    ad5693r_write_input(AD5693R_ADDR_OCXO1, hw_val);
+    ad5693r_update_dac(AD5693R_ADDR_OCXO1);
+  } else {
+    ad5693r_write_input(AD5693R_ADDR_OCXO2, hw_val);
+    ad5693r_update_dac(AD5693R_ADDR_OCXO2);
+  }
 }
 
 // ============================================================================
@@ -284,16 +291,10 @@ void ocxo_dac_set(ocxo_dac_state_t& s, double value) {
 
 volatile bool relay_arm_pending  = false;
 volatile bool relay_timer_active = false;
-volatile bool led_timer_active = false;
 
 static void pps_relay_deassert(timepop_ctx_t*, void*) {
   digitalWriteFast(GNSS_PPS_RELAY, LOW);
   relay_timer_active = false;
-}
-
-static void pps_led_deassert(timepop_ctx_t*, void*) {
-  digitalWriteFast(LED_BUILTIN, LOW);
-  led_timer_active = false;
 }
 
 // ============================================================================
@@ -653,13 +654,6 @@ static void pps_isr(void) {
     timepop_arm(PPS_RELAY_OFF_NS, false, pps_relay_deassert, nullptr, "pps-relay-off");
   }
 
-  // ── Amber LED heartbeat — 50% duty cycle, synchronized to PPS ──
-  digitalWriteFast(LED_BUILTIN, HIGH);
-  if (!led_timer_active) {
-    led_timer_active = true;
-    timepop_arm(500000000ULL, false, pps_led_deassert, nullptr, "pps-led-off");
-  }
-
   // ── PPS edge validation — reject spurious edges ──
   //
   // At 10 MHz, elapsed between valid PPS edges should be exactly
@@ -785,7 +779,7 @@ void process_clocks_init(void) {
   time_init();
   timebase_init();
 
-  ad5693r_init();
+  g_ad5693r_init_ok = ad5693r_init();
 
   ocxo_dac_set(ocxo1_dac, (double)AD5693R_DAC_DEFAULT);
   ocxo_dac_set(ocxo2_dac, (double)AD5693R_DAC_DEFAULT);
@@ -794,9 +788,6 @@ void process_clocks_init(void) {
   pinMode(GNSS_LOCK_PIN,  INPUT);
   pinMode(GNSS_PPS_RELAY, OUTPUT);
   digitalWriteFast(GNSS_PPS_RELAY, LOW);
-
-  pinMode(LED_BUILTIN, OUTPUT);
-  digitalWriteFast(LED_BUILTIN, LOW);
 
   attachInterrupt(digitalPinToInterrupt(GNSS_PPS_PIN), pps_isr, RISING);
   NVIC_SET_PRIORITY(IRQ_GPIO6789, 0);

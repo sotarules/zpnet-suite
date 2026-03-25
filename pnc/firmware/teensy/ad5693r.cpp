@@ -6,75 +6,105 @@
 // ad5693r.cpp — AD5693R 16-Bit I2C DAC Driver
 // ============================================================================
 //
-// Minimal, defenseless driver.  All I2C failures propagate as
-// return values.  No retry logic, no exception handling.
+// Minimal, defenseless driver. All I2C failures propagate as
+// return values. No retry logic, no exception handling.
 //
 // Uses Wire (Bus 1, pins 18/19) — shared with INA260s, BME280,
 // and EV5491 laser controller.
 //
-// ============================================================================
-
-// Command bytes (AD5693R datasheet Table 12)
-static constexpr uint8_t CMD_WRITE_DAC_AND_INPUT = 0x30;
-static constexpr uint8_t CMD_WRITE_CONTROL       = 0x40;
-
-// Control register value:
-//   PD1:PD0  = 00  (normal mode)
-//   REF      = 1   (internal 2.5 V reference enabled)
-//   GAIN     = 1   (2× gain → 0–5 V output span)
+// This configuration targets EXTERNAL VREF operation.
 //
-//   Bits: [00] [1] [1] [0000000000]
-//   = 0x3000
-static constexpr uint16_t CONTROL_WORD = 0x3000;
+// AD5693R control register bits:
+//   D15 = RESET
+//   D14 = PD1
+//   D13 = PD0
+//   D12 = REF   (0 = internal ref enabled, 1 = internal ref disabled)
+//   D11 = GAIN  (0 = 1x, 1 = 2x)
+//
+// ============================================================================
+
+// Command bytes
+static constexpr uint8_t CMD_WRITE_INPUT_REG      = 0x10;
+static constexpr uint8_t CMD_UPDATE_DAC_REG       = 0x20;
+static constexpr uint8_t CMD_WRITE_DAC_AND_INPUT  = 0x30;
+static constexpr uint8_t CMD_WRITE_CONTROL        = 0x40;
 
 // ============================================================================
-// Low-level I2C write: command byte + 16-bit data
+// Low-level I2C helpers
 // ============================================================================
 
 static bool i2c_write_24(uint8_t addr, uint8_t cmd, uint16_t data) {
   Wire.beginTransmission(addr);
   Wire.write(cmd);
-  Wire.write((uint8_t)(data >> 8));    // MSB
-  Wire.write((uint8_t)(data & 0xFF));  // LSB
+  Wire.write((uint8_t)(data >> 8));
+  Wire.write((uint8_t)(data & 0xFF));
   return Wire.endTransmission() == 0;
 }
 
-// ============================================================================
-// Configure one DAC: internal ref, 2× gain, normal mode
-// ============================================================================
-
-bool ad5693r_write_ctrl(uint8_t addr, uint16_t control_word) {
-  return i2c_write_24(addr, CMD_WRITE_CONTROL, control_word);
-}
-
-static bool ad5693r_configure(uint8_t addr) {
-  return ad5693r_write_ctrl(addr, CONTROL_WORD);
-}
-
-// Software reset: command 0x60, data 0x0000
-static bool ad5693r_reset(uint8_t addr) {
-  return i2c_write_24(addr, 0x60, 0x0000);
+static bool i2c_write_cmd_only(uint8_t addr, uint8_t cmd) {
+  Wire.beginTransmission(addr);
+  Wire.write(cmd);
+  return Wire.endTransmission() == 0;
 }
 
 // ============================================================================
 // Public API
 // ============================================================================
 
-bool ad5693r_init(void) {
-  ad5693r_reset(AD5693R_ADDR_OCXO1);
-  ad5693r_reset(AD5693R_ADDR_OCXO2);
-  delay(1);  // allow POR to complete after soft reset
+bool ad5693r_write_ctrl(uint8_t addr, uint16_t control_word) {
+  return i2c_write_24(addr, CMD_WRITE_CONTROL, control_word);
+}
 
-  bool ok1 = ad5693r_configure(AD5693R_ADDR_OCXO1);
-  bool ok2 = ad5693r_configure(AD5693R_ADDR_OCXO2);
+bool ad5693r_write_input(uint8_t addr, uint16_t value) {
+  return i2c_write_24(addr, CMD_WRITE_INPUT_REG, value);
+}
 
-  // Write default (midscale) to both outputs
-  if (ok1) ad5693r_write(AD5693R_ADDR_OCXO1, AD5693R_DAC_DEFAULT);
-  if (ok2) ad5693r_write(AD5693R_ADDR_OCXO2, AD5693R_DAC_DEFAULT);
-
-  return ok1 && ok2;
+bool ad5693r_update_dac(uint8_t addr) {
+  return i2c_write_cmd_only(addr, CMD_UPDATE_DAC_REG);
 }
 
 bool ad5693r_write(uint8_t addr, uint16_t value) {
   return i2c_write_24(addr, CMD_WRITE_DAC_AND_INPUT, value);
+}
+
+bool ad5693r_read_input_register(uint8_t addr, uint16_t& out_value) {
+  Wire.requestFrom((int)addr, 2);
+  if (Wire.available() != 2) {
+    return false;
+  }
+
+  const uint8_t msb = Wire.read();
+  const uint8_t lsb = Wire.read();
+  out_value = ((uint16_t)msb << 8) | (uint16_t)lsb;
+  return true;
+}
+
+static bool ad5693r_configure(uint8_t addr) {
+  return ad5693r_write_ctrl(addr, AD5693R_CTRL_EXTERNAL_VREF_1X);
+}
+
+static bool ad5693r_prime_default(uint8_t addr) {
+  // Be explicit during bring-up:
+  //   1) write input register
+  //   2) force DAC update
+  //
+  // This avoids assuming that "write DAC and input" is behaving
+  // the way we think on the current hardware.
+  if (!ad5693r_write_input(addr, AD5693R_DAC_DEFAULT)) {
+    return false;
+  }
+  if (!ad5693r_update_dac(addr)) {
+    return false;
+  }
+  return true;
+}
+
+bool ad5693r_init(void) {
+  const bool ok1_cfg = ad5693r_configure(AD5693R_ADDR_OCXO1);
+  const bool ok2_cfg = ad5693r_configure(AD5693R_ADDR_OCXO2);
+
+  const bool ok1_val = ok1_cfg ? ad5693r_prime_default(AD5693R_ADDR_OCXO1) : false;
+  const bool ok2_val = ok2_cfg ? ad5693r_prime_default(AD5693R_ADDR_OCXO2) : false;
+
+  return ok1_cfg && ok2_cfg && ok1_val && ok2_val;
 }

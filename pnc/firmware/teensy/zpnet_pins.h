@@ -214,8 +214,8 @@ Device Type   Address   A0 Strap   Function                    VDD     Wire Colo
 INA260        0x40      A1=Brdg   Power monitor — 3.3 V rail  3.3 V   Blk/Blu/Yel/Pur
 INA260        0x41      A0=Brdg   Power monitor — 5.0 V rail  3.3 V   Blk/Blu/Yel/Pur
 INA260        0x44      Default   Power monitor — Battery      3.3 V   Blk/Blu/Yel/Pur
-AD5693R       0x4C      A0=Low    OCXO1 DAC (16-bit)           5.0 V   Blk/Blu/Yel/Wht
-AD5693R       0x4E      A0=High   OCXO2 DAC (16-bit)           5.0 V   Blk/Blu/Yel/Wht
+AD5693R       0x4E      A0=High   OCXO1 DAC (16-bit)           5.0 V   Blk/Blu/Yel/Wht
+AD5693R       0x4C      A0=Low    OCXO2 DAC (16-bit)           5.0 V   Blk/Blu/Yel/Wht
 BME280        0x76      Fixed     Environmental sensor         3.3 V   Blk/Blu/Yel/Pur
 EV5491        0x66      Fixed     Laser controller (I2C)       3.3 V   Blk/Blu/Yel/Pur
 
@@ -236,14 +236,14 @@ Notes:
 -------------------------------------------------------------------------------
 
   10 MHz output  →  Teensy pin 25 (GPT1) via STP
-  CTL input      ←  AD5693R 0x4C VOUT (green wire, direct)
+  CTL input      ←  AD5693R 0x4E VOUT (green wire, direct)
   VREF source    ←  Teensy pin 23 (DAC1, software-controlled)
   Power          →  Dedicated 5V domain
 
 GPT1, 32-bit, single-edge.  Shield drain at OCXO1 end.
 History: GPT1/pin25 → QTimer2/pin13 (LED conflict) → QTimer4/pin6
 (XBAR, no direct access) → GPT1/pin25 (final).
-CTL history: Teensy pin 22 (PWM 12-bit + dither) → AD5693R 0x4C (I2C 16-bit).
+CTL history: Teensy pin 22 (PWM 12-bit + dither) → AD5693R 0x4E (I2C 16-bit).
 VREF history: Internal 2.5 V → External from Teensy DAC1 pin 23.
 =============================================================================*/
 
@@ -252,13 +252,13 @@ VREF history: Internal 2.5 V → External from Teensy DAC1 pin 23.
 -------------------------------------------------------------------------------
 
   10 MHz output  →  Teensy pin 14 (GPT2) via STP
-  CTL input      ←  AD5693R 0x4E VOUT (green wire, direct)
+  CTL input      ←  AD5693R 0x4C VOUT (green wire, direct)
   VREF source    ←  Teensy pin 23 (DAC1, software-controlled)
   Power          →  Dedicated 5V domain
 
 GPT2, 32-bit, single-edge.  Symmetric with OCXO1.  Shield drain at OCXO2 end.
 Previously QTimer1/pin10 — moved to GPT2 to eliminate ±15,000 count
 phase aliasing artifacts from the earlier dual-edge OCXO experiment.
-CTL history: Teensy pin 5 (PWM 12-bit + dither) → AD5693R 0x4E (I2C 16-bit).
+CTL history: Teensy pin 5 (PWM 12-bit + dither) → AD5693R 0x4C (I2C 16-bit).
 VREF history: Internal 2.5 V → External from Teensy DAC1 pin 23.
 =============================================================================*/
