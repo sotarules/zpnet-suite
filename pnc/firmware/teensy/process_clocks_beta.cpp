@@ -282,6 +282,10 @@ void clocks_zero_all(void) {
   prediction_reset(pred_ocxo1);
   prediction_reset(pred_ocxo2);
 
+  // Reset PPS rejection state — pre-campaign noise must not carry over
+  diag_pps_reject_consecutive = 0;
+  isr_residual_valid = false;
+
   prediction_seed(pred_dwt,
     g_dwt_cal_valid ? g_dwt_cycles_per_gnss_s : DWT_EXPECTED_PER_PPS);
 
@@ -447,12 +451,13 @@ void clocks_watchdog_anomaly(const char* reason,
 
 void clocks_beta_pps(void) {
 
-  if (watchdog_anomaly_active) {
-    pps_scheduled = false;
-    return;
-  }
-
+  // ── Command requests override anomaly latch ──
+  // START/STOP/RECOVER are authoritative Pi-side directives.
+  // They must be processed even if watchdog_anomaly_active was
+  // re-latched by the ISR between the command handler clearing
+  // it and this callback firing.
   if (request_stop) {
+    watchdog_anomaly_active = false;
     campaign_state = clocks_campaign_state_t::STOPPED;
     request_stop   = false;
     pps_fired      = true;
@@ -462,6 +467,7 @@ void clocks_beta_pps(void) {
   }
 
   if (request_recover) {
+    watchdog_anomaly_active = false;
 
     timebase_invalidate();
 
@@ -503,6 +509,7 @@ void clocks_beta_pps(void) {
 
     isr_residual_valid = false;
     pps_fired          = true;
+    diag_pps_reject_consecutive = 0;
 
     campaign_state  = clocks_campaign_state_t::STARTED;
     request_recover = false;
@@ -512,9 +519,15 @@ void clocks_beta_pps(void) {
   }
 
   if (request_start) {
+    watchdog_anomaly_active = false;
     clocks_zero_all();
     campaign_state = clocks_campaign_state_t::STARTED;
     request_start  = false;
+    pps_scheduled = false;
+    return;
+  }
+
+  if (watchdog_anomaly_active) {
     pps_scheduled = false;
     return;
   }

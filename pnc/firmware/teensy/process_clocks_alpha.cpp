@@ -673,7 +673,8 @@ static void pps_isr(void) {
         diag_pps_reject_max_run = diag_pps_reject_consecutive;
       }
 
-      if (diag_pps_reject_consecutive >= PPS_REJECT_RECOVERY_THRESHOLD) {
+      if (diag_pps_reject_consecutive >= PPS_REJECT_RECOVERY_THRESHOLD
+          && campaign_state == clocks_campaign_state_t::STARTED) {
         diag_pps_reject_recoveries++;
         clocks_watchdog_anomaly(
           "pps_reject_threshold",
