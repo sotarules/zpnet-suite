@@ -84,8 +84,6 @@ void process_laser_init(void) {
   pinMode(LASER_MONITOR_PIN, INPUT);
   analogReadResolution(12);
 
-  Wire.begin();
-
   // Authoritative configuration
   i2c_write(REG_CTL0, SYSEN_BIT);
 

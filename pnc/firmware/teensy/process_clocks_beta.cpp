@@ -971,6 +971,8 @@ static Payload cmd_clocks_info(const Payload&) {
   p.add("watchdog_anomaly_detail3", watchdog_anomaly_detail3);
   p.add("watchdog_anomaly_trigger_dwt", watchdog_anomaly_trigger_dwt);
 
+  p.add("ad5693r_init_ok", g_ad5693r_init_ok);
+
   p.add("time_pps_count", time_pps_count());
 
   p.add("dwt_cycles_now", clocks_dwt_cycles_now());

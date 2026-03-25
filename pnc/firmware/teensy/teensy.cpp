@@ -24,6 +24,7 @@
 #include "process_performance.h"
 
 #include <Arduino.h>
+#include <Wire.h>
 
 // ============================================================================
 // DWT CLOCK DETERMINISM CONFIGURATION
@@ -250,6 +251,12 @@ void setup() {
 
   pinMode(LED_BUILTIN, OUTPUT);
   led_off();
+
+  // ----------------------------------------------------------
+  // Get I2C devices working
+  // ----------------------------------------------------------
+
+  Wire.begin();
 
   // ----------------------------------------------------------
   // Phase 1: Core instrumentation + hardware clocks
