@@ -2,6 +2,39 @@
 // process_clocks_alpha.cpp — Always-On Physics Layer
 // ============================================================================
 //
+// v25: OCXO per-second GNSS nanosecond measurement.
+//
+//   Building on v24's phase capture spin loops, v25 adds:
+//
+//   1. Deduced first-edge DWT: the captured edge (typically the 17th
+//      after PPS) is projected backwards by missed_ticks * dwt_per_tick
+//      to compute where the FIRST OCXO edge after PPS must have been.
+//      This removes ISR overhead variation from the measurement —
+//      the deduced timestamp is a fixed physical event regardless of
+//      how long the ISR housekeeping took.
+//
+//   2. Per-second differencing: the deduced first-edge DWT from the
+//      previous PPS is subtracted from this PPS's deduced first-edge
+//      DWT.  The delta in DWT cycles, converted to GNSS nanoseconds
+//      via the calibrated ratio, is how long the OCXO's 10,000,000
+//      ticks actually took.  Nominal is 1,000,000,000 ns.  The
+//      residual (delta - 1e9) is the per-second rate error in ns,
+//      which equals ppb by definition.
+//
+//   These two fields (ocxo1_gnss_ns_per_pps, ocxo2_gnss_ns_per_pps)
+//   are the gold measurement — published in TIMEBASE_FRAGMENT as
+//   first-class data alongside dwt_cycles_per_pps.
+//
+// v24: OCXO phase capture — DWT-interpolated edge timing.
+//
+//   After the PPS ISR completes its normal work (snapshots, residuals,
+//   shadow capture, watchdog), two sequential spin loops capture the
+//   exact DWT cycle count at the next GPT1 (OCXO1) and GPT2 (OCXO2)
+//   counter transitions.  Each spin is guaranteed ≤100 ns (one 10 MHz
+//   tick).  The DWT timestamps, combined with the known DWT-at-PPS,
+//   yield phase offsets in GNSS nanoseconds — the sub-tick position
+//   of each OCXO edge relative to PPS.
+//
 // v23: 10 MHz single-edge QTimer1 migration.
 //
 //   QTimer1 CH0 switched from CM(2) (dual-edge, 20 MHz) to CM(1)
@@ -343,6 +376,18 @@ volatile bool pps_fired = false;
 volatile bool pps_scheduled = false;
 
 // ============================================================================
+// OCXO phase capture — DWT-interpolated edge timing (v24/v25)
+//
+// v25 adds deduced first-edge projection and per-second differencing.
+// The deduced first-edge DWT is the captured edge projected backwards
+// by missed_ticks * dwt_cycles_per_tick, removing ISR overhead variation
+// from the measurement.  The per-second delta in GNSS nanoseconds is
+// the gold measurement: how long 10,000,000 OCXO ticks actually took.
+// ============================================================================
+
+ocxo_phase_capture_t ocxo_phase = {};
+
+// ============================================================================
 // Rolling 64-bit extensions
 // ============================================================================
 
@@ -631,6 +676,10 @@ static void pps_asap_callback(timepop_ctx_t*, void*) {
 // ============================================================================
 // PPS handling — ISR (minimum latency)
 //
+// v25: Deduced first-edge + per-second GNSS ns delta.
+// v24: OCXO phase capture spin loops added after normal ISR work.
+//      Two sequential spins (GPT1 then GPT2), each ≤100 ns.
+//
 // v23: ISR_GNSS_RAW_EXPECTED is now 10,000,000 (from internal.h).
 //      No code change here — the constant change propagates automatically.
 //
@@ -712,6 +761,124 @@ static void pps_isr(void) {
   isr_prev_gnss  = isr_snap_gnss  = snap_gnss;
   isr_prev_ocxo1 = isr_snap_ocxo1 = snap_ocxo1;
   isr_prev_ocxo2 = isr_snap_ocxo2 = snap_ocxo2;
+
+  // ── v24/v25: OCXO phase capture — spin on GPT edges ──
+  //
+  // Capture the DWT cycle count at the next GPT1 and GPT2 transitions.
+  // Each spin is guaranteed ≤100 ns (one 10 MHz tick period).
+  // We spin immediately after the ISR snapshot updates, before the
+  // PPS watchdog and ASAP callback scheduling, so the latency from
+  // PPS to spin entry is deterministic and minimal.
+  //
+  // v25: After capturing the observed edge, we project backwards by
+  // missed_ticks to deduce the DWT at the FIRST edge after PPS.
+  // This removes ISR overhead variation from the measurement.
+  // The DWT cycles per 10 MHz tick is g_dwt_cycles_per_gnss_s / 10e6,
+  // but we compute missed_ticks * g_dwt_cycles_per_gnss_s / 10e6
+  // as (missed_ticks * g_dwt_cycles_per_gnss_s) / 10000000 to stay
+  // in integer math.
+  //
+  // The per-second delta (gnss_ns_per_pps) is computed by differencing
+  // consecutive deduced first-edge DWT values and converting to GNSS ns.
+  {
+    const uint32_t dwt_at_pps = snap_dwt - ISR_ENTRY_DWT_CYCLES;
+    const uint32_t dwt_per_s = g_dwt_cycles_per_gnss_s;
+
+    // ── OCXO1: spin until GPT1_CNT changes ──
+    uint32_t ocxo1_first_edge_dwt;
+    {
+      const uint32_t gpt1_before = GPT1_CNT;
+      uint32_t dwt_shadow;
+      for (;;) {
+        dwt_shadow = DWT_CYCCNT;
+        if (GPT1_CNT != gpt1_before) break;
+      }
+      const uint32_t dwt_elapsed = dwt_shadow - dwt_at_pps;
+      const uint32_t elapsed_ns = (uint32_t)dwt_cycles_to_ns(dwt_elapsed);
+      const uint32_t missed_ticks = elapsed_ns / 100u;
+      const uint32_t phase_offset_ns = elapsed_ns - (missed_ticks * 100u);
+      const uint32_t edge_ns = (missed_ticks + 1u) * 100u;
+
+      // Deduced first-edge: project backwards from captured edge
+      const uint32_t backtrack_cycles = (uint32_t)(
+        (uint64_t)missed_ticks * (uint64_t)dwt_per_s / 10000000ULL
+      );
+      ocxo1_first_edge_dwt = dwt_shadow - backtrack_cycles;
+
+      ocxo_phase.ocxo1_dwt_at_edge = dwt_shadow;
+      ocxo_phase.ocxo1_dwt_elapsed = dwt_elapsed;
+      ocxo_phase.ocxo1_missed_ticks = missed_ticks;
+      ocxo_phase.ocxo1_phase_offset_ns = phase_offset_ns;
+      ocxo_phase.ocxo1_edge_ns = edge_ns;
+      ocxo_phase.ocxo1_first_edge_dwt = ocxo1_first_edge_dwt;
+    }
+
+    // ── OCXO2: spin until GPT2_CNT changes ──
+    uint32_t ocxo2_first_edge_dwt;
+    {
+      const uint32_t gpt2_before = GPT2_CNT;
+      uint32_t dwt_shadow;
+      for (;;) {
+        dwt_shadow = DWT_CYCCNT;
+        if (GPT2_CNT != gpt2_before) break;
+      }
+      const uint32_t dwt_elapsed = dwt_shadow - dwt_at_pps;
+      const uint32_t elapsed_ns = (uint32_t)dwt_cycles_to_ns(dwt_elapsed);
+      const uint32_t missed_ticks = elapsed_ns / 100u;
+      const uint32_t phase_offset_ns = elapsed_ns - (missed_ticks * 100u);
+      const uint32_t edge_ns = (missed_ticks + 1u) * 100u;
+
+      // Deduced first-edge: project backwards from captured edge
+      const uint32_t backtrack_cycles = (uint32_t)(
+        (uint64_t)missed_ticks * (uint64_t)dwt_per_s / 10000000ULL
+      );
+      ocxo2_first_edge_dwt = dwt_shadow - backtrack_cycles;
+
+      ocxo_phase.ocxo2_dwt_at_edge = dwt_shadow;
+      ocxo_phase.ocxo2_dwt_elapsed = dwt_elapsed;
+      ocxo_phase.ocxo2_missed_ticks = missed_ticks;
+      ocxo_phase.ocxo2_phase_offset_ns = phase_offset_ns;
+      ocxo_phase.ocxo2_edge_ns = edge_ns;
+      ocxo_phase.ocxo2_first_edge_dwt = ocxo2_first_edge_dwt;
+    }
+
+    // ── Per-second GNSS nanosecond delta (v25) ──
+    //
+    // Difference consecutive deduced first-edge DWT values, convert
+    // to GNSS nanoseconds.  This is how long 10,000,000 OCXO ticks
+    // took, measured with ~3 ns precision.  Nominal = 1,000,000,000.
+    if (ocxo_phase.has_prev && g_dwt_cal_valid) {
+      const uint32_t ocxo1_dwt_delta = ocxo1_first_edge_dwt - ocxo_phase.prev_ocxo1_first_edge_dwt;
+      const uint32_t ocxo2_dwt_delta = ocxo2_first_edge_dwt - ocxo_phase.prev_ocxo2_first_edge_dwt;
+
+      ocxo_phase.ocxo1_gnss_ns_per_pps = (int64_t)(
+        (uint64_t)ocxo1_dwt_delta * NS_PER_SECOND / (uint64_t)dwt_per_s
+      );
+      ocxo_phase.ocxo2_gnss_ns_per_pps = (int64_t)(
+        (uint64_t)ocxo2_dwt_delta * NS_PER_SECOND / (uint64_t)dwt_per_s
+      );
+
+      ocxo_phase.ocxo1_residual_ns = ocxo_phase.ocxo1_gnss_ns_per_pps - (int64_t)NS_PER_SECOND;
+      ocxo_phase.ocxo2_residual_ns = ocxo_phase.ocxo2_gnss_ns_per_pps - (int64_t)NS_PER_SECOND;
+
+      ocxo_phase.delta_valid = true;
+    } else {
+      ocxo_phase.ocxo1_gnss_ns_per_pps = 0;
+      ocxo_phase.ocxo2_gnss_ns_per_pps = 0;
+      ocxo_phase.ocxo1_residual_ns = 0;
+      ocxo_phase.ocxo2_residual_ns = 0;
+      ocxo_phase.delta_valid = false;
+    }
+
+    // Persist for next-second differencing
+    ocxo_phase.prev_ocxo1_first_edge_dwt = ocxo1_first_edge_dwt;
+    ocxo_phase.prev_ocxo2_first_edge_dwt = ocxo2_first_edge_dwt;
+    ocxo_phase.has_prev = true;
+
+    ocxo_phase.dwt_at_pps = dwt_at_pps;
+    ocxo_phase.valid = true;
+    ocxo_phase.captures++;
+  }
 
   // ── v16: PPS watchdog ──
   if (pps_scheduled) {

@@ -1117,6 +1117,32 @@ static Payload cmd_clocks_info(const Payload&) {
   p.add("qread_last_lo",          diag_qread_last_lo);
   p.add("qread_last_lo2",         diag_qread_last_lo2);
 
+  // ── OCXO phase capture (v24) ──
+  p.add("phase_valid",              (bool)ocxo_phase.valid);
+  p.add("phase_captures",          ocxo_phase.captures);
+  p.add("phase_dwt_at_pps",        ocxo_phase.dwt_at_pps);
+
+  p.add("phase_ocxo1_dwt_at_edge",     ocxo_phase.ocxo1_dwt_at_edge);
+  p.add("phase_ocxo1_dwt_elapsed",     ocxo_phase.ocxo1_dwt_elapsed);
+  p.add("phase_ocxo1_missed_ticks",    ocxo_phase.ocxo1_missed_ticks);
+  p.add("phase_ocxo1_phase_offset_ns", ocxo_phase.ocxo1_phase_offset_ns);
+  p.add("phase_ocxo1_edge_ns",         ocxo_phase.ocxo1_edge_ns);
+
+  p.add("phase_ocxo2_dwt_at_edge",     ocxo_phase.ocxo2_dwt_at_edge);
+  p.add("phase_ocxo2_dwt_elapsed",     ocxo_phase.ocxo2_dwt_elapsed);
+  p.add("phase_ocxo2_missed_ticks",    ocxo_phase.ocxo2_missed_ticks);
+  p.add("phase_ocxo2_phase_offset_ns", ocxo_phase.ocxo2_phase_offset_ns);
+  p.add("phase_ocxo2_edge_ns",         ocxo_phase.ocxo2_edge_ns);
+
+  // ── OCXO phase capture — deduced first-edge + delta (v25) ──
+  p.add("phase_ocxo1_first_edge_dwt",   ocxo_phase.ocxo1_first_edge_dwt);
+  p.add("phase_ocxo2_first_edge_dwt",   ocxo_phase.ocxo2_first_edge_dwt);
+  p.add("phase_delta_valid",            (bool)ocxo_phase.delta_valid);
+  p.add("phase_ocxo1_gnss_ns_per_pps",  ocxo_phase.ocxo1_gnss_ns_per_pps);
+  p.add("phase_ocxo2_gnss_ns_per_pps",  ocxo_phase.ocxo2_gnss_ns_per_pps);
+  p.add("phase_ocxo1_residual_ns",      ocxo_phase.ocxo1_residual_ns);
+  p.add("phase_ocxo2_residual_ns",      ocxo_phase.ocxo2_residual_ns);
+
   return p;
 }
 

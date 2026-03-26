@@ -334,6 +334,54 @@ struct spin_capture_t {
 extern spin_capture_t pps_spin;
 
 // ============================================================================
+// OCXO Phase Capture — DWT-interpolated edge timing (v24/v25)
+//
+// v25 adds deduced first-edge projection and per-second differencing.
+// The deduced first-edge DWT removes ISR overhead variation.
+// The gnss_ns_per_pps delta is the gold measurement: how long
+// 10,000,000 OCXO ticks took in GNSS nanoseconds.
+// ============================================================================
+
+struct ocxo_phase_capture_t {
+  // ── PPS anchor ──
+  uint32_t dwt_at_pps;               // DWT at PPS edge (ISR-compensated)
+
+  // ── OCXO1 (GPT1) ──
+  uint32_t ocxo1_dwt_at_edge;        // DWT when GPT1_CNT transitioned
+  uint32_t ocxo1_dwt_elapsed;        // DWT cycles from PPS to captured edge
+  uint32_t ocxo1_missed_ticks;       // inferred 10 MHz ticks missed
+  uint32_t ocxo1_phase_offset_ns;    // sub-tick residual (ns)
+  uint32_t ocxo1_edge_ns;            // total ns from PPS to edge
+  uint32_t ocxo1_first_edge_dwt;     // deduced DWT at first edge after PPS
+
+  // ── OCXO2 (GPT2) ──
+  uint32_t ocxo2_dwt_at_edge;
+  uint32_t ocxo2_dwt_elapsed;
+  uint32_t ocxo2_missed_ticks;
+  uint32_t ocxo2_phase_offset_ns;
+  uint32_t ocxo2_edge_ns;
+  uint32_t ocxo2_first_edge_dwt;
+
+  // ── Per-second differencing (v25) ──
+  uint32_t prev_ocxo1_first_edge_dwt;  // previous second's deduced first-edge
+  uint32_t prev_ocxo2_first_edge_dwt;
+  int64_t  ocxo1_gnss_ns_per_pps;      // GNSS ns for 10M OCXO1 ticks (nominal 1e9)
+  int64_t  ocxo2_gnss_ns_per_pps;      // GNSS ns for 10M OCXO2 ticks (nominal 1e9)
+  int64_t  ocxo1_residual_ns;          // ocxo1_gnss_ns_per_pps - 1,000,000,000
+  int64_t  ocxo2_residual_ns;          // ocxo2_gnss_ns_per_pps - 1,000,000,000
+  bool     has_prev;                    // true after first capture (need 2 for delta)
+  bool     delta_valid;                 // true when gnss_ns_per_pps values are valid
+
+  // ── Lifecycle ──
+  bool     valid;                      // true after first successful capture
+  uint32_t captures;                   // monotonic capture count
+};
+
+extern ocxo_phase_capture_t ocxo_phase;
+
+extern ocxo_phase_capture_t ocxo_phase;
+
+// ============================================================================
 // 64-bit accumulators (campaign-scoped)
 // ============================================================================
 
