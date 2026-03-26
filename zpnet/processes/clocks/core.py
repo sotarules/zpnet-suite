@@ -40,6 +40,8 @@ Core contract (v2026-03+):
       • DWT, OCXO1, and OCXO2 prediction stats are passed through from the
         Teensy fragment and persisted in TIMEBASE records.
       • Raw deltas (dwt_delta_raw, ocxo1_delta_raw, ocxo2_delta_raw) are persisted.
+      • OCXO phase facts (phase_offset_ns, edge_elapsed_ns, edge_gnss_ns,
+        gnss_ns_per_pps, residual_ns) are persisted verbatim from the Teensy.
       • Pi-side Welford residual trackers for DWT, OCXO1, OCXO2 are
         REMOVED — the Teensy's prediction stats are strictly
         superior and the Pi-side trackers were always second-hand.
@@ -975,6 +977,13 @@ def _build_clock_block(
         block["dac_min"] = frag.get("ocxo1_dac_min")
         block["dac_max"] = frag.get("ocxo1_dac_max")
         block["dac_hw"] = frag.get("ocxo1_dac_hw")
+        block["gnss_ns_per_pps"] = frag.get("ocxo1_gnss_ns_per_pps")
+        block["residual_ns"] = frag.get("ocxo1_residual_ns")
+        block["phase_offset_ns"] = frag.get("ocxo1_phase_offset_ns")
+        block["edge_elapsed_ns"] = frag.get("ocxo1_edge_elapsed_ns")
+        block["edge_gnss_ns"] = frag.get("ocxo1_edge_gnss_ns")
+        block["dac_before"] = frag.get("ocxo1_dac_before")
+        block["dac_after"] = frag.get("ocxo1_dac_after")
     elif domain == "ocxo2":
         delta = frag.get("ocxo2_delta_raw")
         if delta is not None:
@@ -996,6 +1005,13 @@ def _build_clock_block(
         block["dac_min"] = frag.get("ocxo2_dac_min")
         block["dac_max"] = frag.get("ocxo2_dac_max")
         block["dac_hw"] = frag.get("ocxo2_dac_hw")
+        block["gnss_ns_per_pps"] = frag.get("ocxo2_gnss_ns_per_pps")
+        block["residual_ns"] = frag.get("ocxo2_residual_ns")
+        block["phase_offset_ns"] = frag.get("ocxo2_phase_offset_ns")
+        block["edge_elapsed_ns"] = frag.get("ocxo2_edge_elapsed_ns")
+        block["edge_gnss_ns"] = frag.get("ocxo2_edge_gnss_ns")
+        block["dac_before"] = frag.get("ocxo2_dac_before")
+        block["dac_after"] = frag.get("ocxo2_dac_after")
     elif domain == "gnss":
         block["ppb"] = 0.0
         block["pps_residual"] = frag.get("gnss_pps_residual")
@@ -1034,6 +1050,13 @@ def _build_report(
         "teensy_dwt_cycles": timebase.get("teensy_dwt_cycles"),
         "teensy_ocxo1_ns": timebase.get("teensy_ocxo1_ns"),
         "teensy_ocxo2_ns": timebase.get("teensy_ocxo2_ns"),
+        "phase_residual_valid": timebase.get("phase_residual_valid"),
+        "ocxo1_phase_offset_ns": timebase.get("ocxo1_phase_offset_ns"),
+        "ocxo2_phase_offset_ns": timebase.get("ocxo2_phase_offset_ns"),
+        "ocxo1_edge_elapsed_ns": timebase.get("ocxo1_edge_elapsed_ns"),
+        "ocxo2_edge_elapsed_ns": timebase.get("ocxo2_edge_elapsed_ns"),
+        "ocxo1_edge_gnss_ns": timebase.get("ocxo1_edge_gnss_ns"),
+        "ocxo2_edge_gnss_ns": timebase.get("ocxo2_edge_gnss_ns"),
 
         # Clock domain blocks (tau, ppb, prediction stats)
         "gnss": _build_clock_block(gnss_ns, gnss_ns, frag, "gnss"),
@@ -1362,6 +1385,23 @@ def _process_loop() -> None:
             "ocxo2_dac": frag.get("ocxo2_dac"),
             "ocxo1_dac_hw": frag.get("ocxo1_dac_hw"),
             "ocxo2_dac_hw": frag.get("ocxo2_dac_hw"),
+
+            "ocxo1_gnss_ns_per_pps": frag.get("ocxo1_gnss_ns_per_pps"),
+            "ocxo2_gnss_ns_per_pps": frag.get("ocxo2_gnss_ns_per_pps"),
+            "ocxo1_residual_ns": frag.get("ocxo1_residual_ns"),
+            "ocxo2_residual_ns": frag.get("ocxo2_residual_ns"),
+            "ocxo1_phase_offset_ns": frag.get("ocxo1_phase_offset_ns"),
+            "ocxo2_phase_offset_ns": frag.get("ocxo2_phase_offset_ns"),
+            "ocxo1_edge_elapsed_ns": frag.get("ocxo1_edge_elapsed_ns"),
+            "ocxo2_edge_elapsed_ns": frag.get("ocxo2_edge_elapsed_ns"),
+            "ocxo1_edge_gnss_ns": frag.get("ocxo1_edge_gnss_ns"),
+            "ocxo2_edge_gnss_ns": frag.get("ocxo2_edge_gnss_ns"),
+            "phase_residual_valid": frag.get("phase_residual_valid"),
+            "ocxo1_dac_before": frag.get("ocxo1_dac_before"),
+            "ocxo1_dac_after": frag.get("ocxo1_dac_after"),
+            "ocxo2_dac_before": frag.get("ocxo2_dac_before"),
+            "ocxo2_dac_after": frag.get("ocxo2_dac_after"),
+
             "calibrate_ocxo": frag.get("calibrate_ocxo"),
             "ocxo1_servo_adjustments": frag.get("ocxo1_servo_adjustments"),
             "ocxo2_servo_adjustments": frag.get("ocxo2_servo_adjustments"),
@@ -1434,6 +1474,10 @@ def _process_loop() -> None:
                     "pred_n": frag.get("ocxo1_pred_n"),
                     "delta_raw": frag.get("ocxo1_delta_raw"),
                     "pps_residual": frag.get("ocxo1_pps_residual"),
+                    "phase_offset_ns": frag.get("ocxo1_phase_offset_ns"),
+                    "edge_elapsed_ns": frag.get("ocxo1_edge_elapsed_ns"),
+                    "edge_gnss_ns": frag.get("ocxo1_edge_gnss_ns"),
+                    "residual_ns": frag.get("ocxo1_residual_ns"),
                     "tau": round(_compute_tau(ocxo1_ns, gnss_ns), 12) if gnss_ns else None,
                     "ppb": round(_compute_ppb(ocxo1_ns, gnss_ns), 3) if gnss_ns else None,
                 },
@@ -1444,6 +1488,10 @@ def _process_loop() -> None:
                     "pred_n": frag.get("ocxo2_pred_n"),
                     "delta_raw": frag.get("ocxo2_delta_raw"),
                     "pps_residual": frag.get("ocxo2_pps_residual"),
+                    "phase_offset_ns": frag.get("ocxo2_phase_offset_ns"),
+                    "edge_elapsed_ns": frag.get("ocxo2_edge_elapsed_ns"),
+                    "edge_gnss_ns": frag.get("ocxo2_edge_gnss_ns"),
+                    "residual_ns": frag.get("ocxo2_residual_ns"),
                     "tau": round(_compute_tau(ocxo2_ns, gnss_ns), 12) if gnss_ns else None,
                     "ppb": round(_compute_ppb(ocxo2_ns, gnss_ns), 3) if gnss_ns else None,
                 },
@@ -1593,8 +1641,8 @@ def cmd_start(args: Optional[dict]) -> dict:
     set_dac1 = args.get("set_dac1")
     set_dac2 = args.get("set_dac2")
     calibrate_ocxo = args.get("calibrate_ocxo") or None
-    if calibrate_ocxo and calibrate_ocxo not in ("MEAN", "TOTAL"):
-        return {"success": False, "message": f"calibrate_ocxo must be 'MEAN' or 'TOTAL', got '{calibrate_ocxo}'"}
+    if calibrate_ocxo and calibrate_ocxo not in ("MEAN", "TOTAL", "NOW"):
+        return {"success": False, "message": f"calibrate_ocxo must be 'MEAN' 'TOTAL' or 'NOW', got '{calibrate_ocxo}'"}
 
     # Read default DAC from config if not specified
     if set_dac1 is None or set_dac2 is None:

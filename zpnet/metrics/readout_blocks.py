@@ -1,5 +1,5 @@
 """
-ZPNet Metrics Readout Blocks — Dense Clocks Panel (v8 DAC HW)
+ZPNet Metrics Readout Blocks — Dense Clocks Panel (v9 Phase Metrics)
 
 Designed for full-screen terminal display over SSH at 1080p.
 
@@ -9,6 +9,12 @@ Data sources:
   • Teensy CLOCKS REPORT → spin capture, ISR residuals, DWT internals,
     PPS diagnostics, servo state
   • Pi SYSTEM REPORT → GNSS, environment, power
+
+v9 changes:
+  • OCXO NOW-servo detail rows updated for the phase/edge model.
+  • Removed old missed-delta (MD) display from CAL rows.
+  • CAL rows now surface PHASE_NS and EDGE_GNSS instead of legacy MD.
+  • OCXO clock-domain EXTRA column now shows PHASE=, EDGE_NS=, and RES=.
 
 v8 changes:
   • OCXO EXTRA column now shows DAC= as the actual integer hardware
@@ -329,11 +335,22 @@ def clocks_combined_readout() -> list[str]:
 
         dac_hw = t.get(dac_key.replace("_dac", "_dac_hw"))
         adj = t.get(adj_key, 0)
+        phase_ns = blk.get("phase_offset_ns")
+        edge_ns = blk.get("edge_gnss_ns")
+        residual_ns = blk.get("residual_ns")
+
+        extra_parts = []
         if dac_hw is not None:
             dac_volts = dac_hw * 3.002 / 65535
-            extra = f"   DAC={dac_hw:>5d} {dac_volts:.5f}V ADJ={adj:>4}"
-        else:
-            extra = ""
+            extra_parts.append(f"DAC={dac_hw:>5d} {dac_volts:.5f}V")
+        if phase_ns is not None:
+            extra_parts.append(f"PHASE={phase_ns:>2d}ns")
+        if edge_ns is not None:
+            extra_parts.append(f"EDGE_NS={edge_ns}")
+        if residual_ns is not None:
+            extra_parts.append(f"RES={residual_ns:+d}ns")
+        extra_parts.append(f"ADJ={adj:>4}")
+        extra = "   " + " ".join(extra_parts)
 
         lines.append(
             f"{name:<6}"
@@ -412,6 +429,57 @@ def clocks_combined_readout() -> list[str]:
             )
 
     lines.append("")
+
+    # ==============================================================
+    # NOW servo — per-second calibration detail
+    # ==============================================================
+    if cal == "NOW":
+        vref = 3.002
+
+        lines.append(
+            f"{'CAL':<6}"
+            f"{'NS_PER_PPS':>14}"
+            f"{'RESIDUAL':>10}"
+            f"{'PHASE_NS':>10}"
+            f"  "
+            f"{'DAC_NOW':>8}"
+            f"{'V_NOW':>10}"
+            f"{'STEP':>6}"
+            f"{'DAC_NEW':>8}"
+            f"{'V_NEW':>10}"
+            f"  {'EDGE_GNSS':>20}"
+        )
+
+        for name, key in [("OCXO1", "ocxo1"), ("OCXO2", "ocxo2")]:
+            blk = r.get(key, {})
+            ns_per_pps = blk.get("gnss_ns_per_pps")
+            residual = blk.get("residual_ns")
+            phase_ns = blk.get("phase_offset_ns")
+            edge_gnss_ns = blk.get("edge_gnss_ns")
+            dac_before = blk.get("dac_before")
+            dac_after = blk.get("dac_after")
+
+            if ns_per_pps is not None and dac_before is not None and dac_after is not None:
+                step = dac_after - dac_before
+                v_before = dac_before * vref / 65535
+                v_after = dac_after * vref / 65535
+                lines.append(
+                    f"{name:<6}"
+                    f"{ns_per_pps:>14,}"
+                    f"{residual:>+10,}"
+                    f"{phase_ns:>10,}"
+                    f"  "
+                    f"{dac_before:>8}"
+                    f"{v_before:>10.5f}"
+                    f"{step:>+6}"
+                    f"{dac_after:>8}"
+                    f"{v_after:>10.5f}"
+                    f"  {edge_gnss_ns:>20,}"
+                )
+            else:
+                lines.append(f"{name:<6}  --- (waiting for phase capture)")
+
+        lines.append("")
 
     # ==============================================================
     # TIME — from Pi report dict (r)

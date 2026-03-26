@@ -278,6 +278,8 @@ void clocks_zero_all(void) {
   residual_reset(residual_ocxo1);
   residual_reset(residual_ocxo2);
 
+  ocxo_phase = {};
+
   prediction_reset(pred_dwt);
   prediction_reset(pred_ocxo1);
   prediction_reset(pred_ocxo2);
@@ -358,17 +360,68 @@ static void ocxo_servo_total(ocxo_dac_state_t& dac, uint64_t ocxo_ticks, uint64_
   dac.servo_settle_count = 0;
 }
 
+// NOW mode: phase-first per-second residual → 0
+//
+// Uses the authoritative per-second residual derived from consecutive absolute canonical edge timestamps.
+//
+// Beta computes the absolute GNSS nanosecond timestamp of the canonical
+// first post-PPS edge each second:
+//
+//   edge_gnss_ns = pps_gnss_ns + phase_offset_ns
+//
+// and then derives:
+//
+//   residual_ns = (edge_gnss_ns_this - edge_gnss_ns_prev) - 1e9
+//
+// Positive residual means the OCXO edge moved later (slow); negative
+// residual means the OCXO edge moved earlier (fast).
+//
+// The gain constant NOW_NS_PER_DAC_LSB is the empirical relationship
+// between one DAC code step and the resulting change in residual_ns.
+// Positive DAC voltage slows these OCXOs; negative DAC voltage speeds them.
+//
+// The servo applies a proportional correction every second with no
+// settle delay — the measurement is precise enough to act immediately.
+static constexpr double NOW_NS_PER_DAC_LSB = 10.0;
+static constexpr double NOW_MIN_RESIDUAL_NS = 5.0;
+
+static void ocxo_servo_now(ocxo_dac_state_t& dac, int64_t residual_ns) {
+  if (!ocxo_phase.residual_valid) return;
+  if (campaign_seconds < SERVO_MIN_SAMPLES) return;
+
+  double residual = (double)residual_ns;
+  dac.servo_last_residual = residual;
+
+  if (fabs(residual) < NOW_MIN_RESIDUAL_NS) return;
+
+  // Negative residual = OCXO fast = need to steer DAC down
+  // Positive residual = OCXO slow = need to steer DAC up
+  double step = -residual / NOW_NS_PER_DAC_LSB;
+
+  if (step >  (double)SERVO_MAX_STEP) step =  (double)SERVO_MAX_STEP;
+  if (step < -(double)SERVO_MAX_STEP) step = -(double)SERVO_MAX_STEP;
+
+  ocxo_dac_set(dac, dac.dac_fractional + step);
+
+  dac.servo_last_step = step;
+  dac.servo_adjustments++;
+}
+
 static void ocxo_calibration_servo(void) {
   if (calibrate_ocxo_mode == servo_mode_t::OFF) return;
 
   if (calibrate_ocxo_mode == servo_mode_t::MEAN) {
     ocxo_servo_mean(ocxo1_dac, residual_ocxo1);
     ocxo_servo_mean(ocxo2_dac, residual_ocxo2);
+  } else if (calibrate_ocxo_mode == servo_mode_t::NOW) {
+    ocxo_servo_now(ocxo1_dac, ocxo_phase.ocxo1_residual_ns);
+    ocxo_servo_now(ocxo2_dac, ocxo_phase.ocxo2_residual_ns);
   } else {
     ocxo_servo_total(ocxo1_dac, ocxo1_ticks_64, gnss_raw_64);
     ocxo_servo_total(ocxo2_dac, ocxo2_ticks_64, gnss_raw_64);
   }
 }
+
 // ============================================================================
 // Watchdog anomaly publication / stop helpers
 // ============================================================================
@@ -497,6 +550,8 @@ void clocks_beta_pps(void) {
     residual_reset(residual_ocxo1);
     residual_reset(residual_ocxo2);
 
+    ocxo_phase = {};
+
     prediction_reset(pred_dwt);
     prediction_reset(pred_ocxo1);
     prediction_reset(pred_ocxo2);
@@ -595,7 +650,45 @@ void clocks_beta_pps(void) {
     prediction_update(pred_ocxo1, ocxo1_delta);
     prediction_update(pred_ocxo2, ocxo2_delta);
 
+    // Snapshot DAC state before servo (for telemetry)
+    const uint16_t dac1_before = ocxo1_dac.dac_hw_code;
+    const uint16_t dac2_before = ocxo2_dac.dac_hw_code;
+
+    // ── Absolute GNSS timestamps for canonical first post-PPS OCXO edges ──
+    ocxo_phase.pps_gnss_ns = pps_gnss_ns;
+
+    ocxo_phase.ocxo1_edge_gnss_ns = pps_gnss_ns + (uint64_t)ocxo_phase.ocxo1_phase_offset_ns;
+    ocxo_phase.ocxo2_edge_gnss_ns = pps_gnss_ns + (uint64_t)ocxo_phase.ocxo2_phase_offset_ns;
+
+    if (ocxo_phase.captures >= 2 && ocxo_phase.prev_ocxo1_edge_gnss_ns != 0 && ocxo_phase.prev_ocxo2_edge_gnss_ns != 0) {
+      const int64_t ocxo1_gnss_ns_per_pps =
+        (int64_t)(ocxo_phase.ocxo1_edge_gnss_ns - ocxo_phase.prev_ocxo1_edge_gnss_ns);
+      const int64_t ocxo2_gnss_ns_per_pps =
+        (int64_t)(ocxo_phase.ocxo2_edge_gnss_ns - ocxo_phase.prev_ocxo2_edge_gnss_ns);
+
+      ocxo_phase.ocxo1_gnss_ns_per_pps = ocxo1_gnss_ns_per_pps;
+      ocxo_phase.ocxo2_gnss_ns_per_pps = ocxo2_gnss_ns_per_pps;
+      ocxo_phase.ocxo1_residual_ns = ocxo1_gnss_ns_per_pps - (int64_t)NS_PER_SECOND;
+      ocxo_phase.ocxo2_residual_ns = ocxo2_gnss_ns_per_pps - (int64_t)NS_PER_SECOND;
+      ocxo_phase.residual_valid = true;
+    } else {
+      ocxo_phase.ocxo1_gnss_ns_per_pps = 0;
+      ocxo_phase.ocxo2_gnss_ns_per_pps = 0;
+      ocxo_phase.ocxo1_residual_ns = 0;
+      ocxo_phase.ocxo2_residual_ns = 0;
+      ocxo_phase.residual_valid = false;
+    }
+
+    ocxo_phase.prev_ocxo1_edge_gnss_ns = ocxo_phase.ocxo1_edge_gnss_ns;
+    ocxo_phase.prev_ocxo2_edge_gnss_ns = ocxo_phase.ocxo2_edge_gnss_ns;
+
     ocxo_calibration_servo();
+
+    // Snapshot DAC state after servo (for telemetry)
+    ocxo_phase.ocxo1_dac_before = dac1_before;
+    ocxo_phase.ocxo1_dac_after  = ocxo1_dac.dac_hw_code;
+    ocxo_phase.ocxo2_dac_before = dac2_before;
+    ocxo_phase.ocxo2_dac_after  = ocxo2_dac.dac_hw_code;
 
     // ── DAC Welford update (TEMPEST DAC test) ──
     dac_welford_update(dac_welford_ocxo1, ocxo1_dac.dac_fractional);
@@ -652,6 +745,24 @@ void clocks_beta_pps(void) {
     p.add("ocxo2_dac",         ocxo2_dac.dac_fractional);
     p.add("ocxo1_dac_hw",      (int32_t)ocxo1_dac.dac_hw_code);
     p.add("ocxo2_dac_hw",      (int32_t)ocxo2_dac.dac_hw_code);
+
+    // ── Phase-first OCXO measurement (v26) ──
+    p.add("ocxo1_phase_offset_ns",   (int32_t)ocxo_phase.ocxo1_phase_offset_ns);
+    p.add("ocxo2_phase_offset_ns",   (int32_t)ocxo_phase.ocxo2_phase_offset_ns);
+    p.add("ocxo1_edge_elapsed_ns",   (int32_t)ocxo_phase.ocxo1_edge_elapsed_ns);
+    p.add("ocxo2_edge_elapsed_ns",   (int32_t)ocxo_phase.ocxo2_edge_elapsed_ns);
+    p.add("ocxo1_edge_gnss_ns",      ocxo_phase.ocxo1_edge_gnss_ns);
+    p.add("ocxo2_edge_gnss_ns",      ocxo_phase.ocxo2_edge_gnss_ns);
+    p.add("ocxo1_gnss_ns_per_pps",   ocxo_phase.ocxo1_gnss_ns_per_pps);
+    p.add("ocxo2_gnss_ns_per_pps",   ocxo_phase.ocxo2_gnss_ns_per_pps);
+    p.add("ocxo1_residual_ns",       ocxo_phase.ocxo1_residual_ns);
+    p.add("ocxo2_residual_ns",       ocxo_phase.ocxo2_residual_ns);
+    p.add("phase_residual_valid",    (bool)ocxo_phase.residual_valid);
+
+    p.add("ocxo1_dac_before",        (int32_t)ocxo_phase.ocxo1_dac_before);
+    p.add("ocxo1_dac_after",         (int32_t)ocxo_phase.ocxo1_dac_after);
+    p.add("ocxo2_dac_before",        (int32_t)ocxo_phase.ocxo2_dac_before);
+    p.add("ocxo2_dac_after",         (int32_t)ocxo_phase.ocxo2_dac_after);
 
     p.add("ocxo1_dac_n",      (int32_t)dac_welford_ocxo1.n);
     p.add_fmt("ocxo1_dac_mean",   "%.6f", dac_welford_ocxo1.mean);
@@ -1117,27 +1228,27 @@ static Payload cmd_clocks_info(const Payload&) {
   p.add("qread_last_lo",          diag_qread_last_lo);
   p.add("qread_last_lo2",         diag_qread_last_lo2);
 
-  // ── OCXO phase capture (v24) ──
-  p.add("phase_valid",              (bool)ocxo_phase.valid);
-  p.add("phase_captures",          ocxo_phase.captures);
-  p.add("phase_dwt_at_pps",        ocxo_phase.dwt_at_pps);
+  // ── OCXO phase capture (v26) ──
+  p.add("phase_valid",                  (bool)ocxo_phase.valid);
+  p.add("phase_captures",               ocxo_phase.captures);
+  p.add("phase_dwt_at_pps",             ocxo_phase.dwt_at_pps);
+  p.add("phase_pps_gnss_ns",            ocxo_phase.pps_gnss_ns);
 
-  p.add("phase_ocxo1_dwt_at_edge",     ocxo_phase.ocxo1_dwt_at_edge);
-  p.add("phase_ocxo1_dwt_elapsed",     ocxo_phase.ocxo1_dwt_elapsed);
-  p.add("phase_ocxo1_missed_ticks",    ocxo_phase.ocxo1_missed_ticks);
-  p.add("phase_ocxo1_phase_offset_ns", ocxo_phase.ocxo1_phase_offset_ns);
-  p.add("phase_ocxo1_edge_ns",         ocxo_phase.ocxo1_edge_ns);
+  p.add("phase_ocxo1_dwt_at_edge",      ocxo_phase.ocxo1_dwt_at_edge);
+  p.add("phase_ocxo1_dwt_elapsed",      ocxo_phase.ocxo1_dwt_elapsed);
+  p.add("phase_ocxo1_edge_elapsed_ns",  ocxo_phase.ocxo1_edge_elapsed_ns);
+  p.add("phase_ocxo1_phase_offset_ns",  ocxo_phase.ocxo1_phase_offset_ns);
+  p.add("phase_ocxo1_edge_gnss_ns",     ocxo_phase.ocxo1_edge_gnss_ns);
+  p.add("phase_prev_ocxo1_edge_gnss_ns",ocxo_phase.prev_ocxo1_edge_gnss_ns);
 
-  p.add("phase_ocxo2_dwt_at_edge",     ocxo_phase.ocxo2_dwt_at_edge);
-  p.add("phase_ocxo2_dwt_elapsed",     ocxo_phase.ocxo2_dwt_elapsed);
-  p.add("phase_ocxo2_missed_ticks",    ocxo_phase.ocxo2_missed_ticks);
-  p.add("phase_ocxo2_phase_offset_ns", ocxo_phase.ocxo2_phase_offset_ns);
-  p.add("phase_ocxo2_edge_ns",         ocxo_phase.ocxo2_edge_ns);
+  p.add("phase_ocxo2_dwt_at_edge",      ocxo_phase.ocxo2_dwt_at_edge);
+  p.add("phase_ocxo2_dwt_elapsed",      ocxo_phase.ocxo2_dwt_elapsed);
+  p.add("phase_ocxo2_edge_elapsed_ns",  ocxo_phase.ocxo2_edge_elapsed_ns);
+  p.add("phase_ocxo2_phase_offset_ns",  ocxo_phase.ocxo2_phase_offset_ns);
+  p.add("phase_ocxo2_edge_gnss_ns",     ocxo_phase.ocxo2_edge_gnss_ns);
+  p.add("phase_prev_ocxo2_edge_gnss_ns",ocxo_phase.prev_ocxo2_edge_gnss_ns);
 
-  // ── OCXO phase capture — deduced first-edge + delta (v25) ──
-  p.add("phase_ocxo1_first_edge_dwt",   ocxo_phase.ocxo1_first_edge_dwt);
-  p.add("phase_ocxo2_first_edge_dwt",   ocxo_phase.ocxo2_first_edge_dwt);
-  p.add("phase_delta_valid",            (bool)ocxo_phase.delta_valid);
+  p.add("phase_residual_valid",         (bool)ocxo_phase.residual_valid);
   p.add("phase_ocxo1_gnss_ns_per_pps",  ocxo_phase.ocxo1_gnss_ns_per_pps);
   p.add("phase_ocxo2_gnss_ns_per_pps",  ocxo_phase.ocxo2_gnss_ns_per_pps);
   p.add("phase_ocxo1_residual_ns",      ocxo_phase.ocxo1_residual_ns);
