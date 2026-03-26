@@ -172,11 +172,11 @@ enum class servo_mode_t : uint8_t {
   MEAN  = 1,
   TOTAL = 2,
   NOW   = 3,
-};;
+};
 
 extern servo_mode_t calibrate_ocxo_mode;
 
-// Helper: returns the mode as a string for telemetry ("OFF", "MEAN", "TOTAL")
+// Helper: returns the mode as a string for telemetry ("OFF", "MEAN", "TOTAL", "NOW")
 const char* servo_mode_str(servo_mode_t mode);
 
 // Helper: parse from command arg string; returns OFF if unrecognized
@@ -347,11 +347,15 @@ extern spin_capture_t pps_spin;
 //   phase_offset_ns  = phase of the canonical first edge from PPS
 //   edge_gnss_ns     = pps_gnss_ns + phase_offset_ns
 //
-// The authoritative per-second OCXO residual is then:
+// The authoritative per-second OCXO residual is:
 //
-//   residual_ns = (edge_gnss_ns_this - edge_gnss_ns_prev) - 1e9
+//   residual_ns = edge_elapsed_ns_this - edge_elapsed_ns_prev
 //
-// There is no longer any 100 ns ring-delta state in the model.
+// and therefore:
+//
+//   gnss_ns_per_pps = 1e9 + residual_ns
+//
+// edge_gnss_ns remains useful for diagnostics/display only.
 // ============================================================================
 
 struct ocxo_phase_capture_t {
@@ -359,38 +363,81 @@ struct ocxo_phase_capture_t {
   uint32_t dwt_at_pps;               // DWT at PPS edge (ISR-compensated)
   uint64_t pps_gnss_ns;              // absolute GNSS ns at this PPS (beta-owned)
 
-  // ── OCXO1 (GPT1) ──
-  uint32_t ocxo1_dwt_at_edge;        // DWT when first post-PPS GPT1 edge was observed
-  uint32_t ocxo1_dwt_elapsed;        // DWT cycles from PPS to observed edge
-  uint32_t ocxo1_edge_elapsed_ns;    // observed edge elapsed from PPS in ns
-  uint32_t ocxo1_phase_offset_ns;    // canonical first-edge phase from PPS (0..99)
-  uint64_t ocxo1_edge_gnss_ns;       // absolute GNSS ns of canonical first post-PPS edge
+  // ── OCXO1 phase #1 (first observed post-PPS edge) ──
+  uint32_t ocxo1_dwt_before;
+  uint32_t ocxo1_dwt_after;
+  uint32_t ocxo1_gpt_before;
+  uint32_t ocxo1_gpt_after;
+  uint32_t ocxo1_dwt_bracket_cycles;
+  uint32_t ocxo1_dwt_correction_cycles;
+  uint32_t ocxo1_dwt_at_edge;        // corrected DWT estimate for phase #1
+  uint32_t ocxo1_dwt_elapsed;
+  uint32_t ocxo1_edge_elapsed_ns;
+  uint32_t ocxo1_phase_offset_ns;
+  uint64_t ocxo1_edge_gnss_ns;
 
-  // ── OCXO2 (GPT2) ──
+  // ── OCXO1 phase #2 (second observed edge, one more 10 MHz window later) ──
+  uint32_t ocxo1_phase2_dwt_before;
+  uint32_t ocxo1_phase2_dwt_after;
+  uint32_t ocxo1_phase2_gpt_before;
+  uint32_t ocxo1_phase2_gpt_after;
+  uint32_t ocxo1_phase2_dwt_bracket_cycles;
+  uint32_t ocxo1_phase2_dwt_correction_cycles;
+  uint32_t ocxo1_phase2_dwt_at_edge;
+  uint32_t ocxo1_phase2_dwt_elapsed;
+  uint32_t ocxo1_phase2_edge_elapsed_ns;
+  uint32_t ocxo1_phase2_phase_offset_ns;
+  uint64_t ocxo1_phase2_edge_gnss_ns;
+  int32_t  ocxo1_phase_pair_delta_ns;
+
+  // ── OCXO2 phase #1 ──
+  uint32_t ocxo2_dwt_before;
+  uint32_t ocxo2_dwt_after;
+  uint32_t ocxo2_gpt_before;
+  uint32_t ocxo2_gpt_after;
+  uint32_t ocxo2_dwt_bracket_cycles;
+  uint32_t ocxo2_dwt_correction_cycles;
   uint32_t ocxo2_dwt_at_edge;
   uint32_t ocxo2_dwt_elapsed;
   uint32_t ocxo2_edge_elapsed_ns;
   uint32_t ocxo2_phase_offset_ns;
   uint64_t ocxo2_edge_gnss_ns;
 
-  // ── Per-second differencing ──
+  // ── OCXO2 phase #2 ──
+  uint32_t ocxo2_phase2_dwt_before;
+  uint32_t ocxo2_phase2_dwt_after;
+  uint32_t ocxo2_phase2_gpt_before;
+  uint32_t ocxo2_phase2_gpt_after;
+  uint32_t ocxo2_phase2_dwt_bracket_cycles;
+  uint32_t ocxo2_phase2_dwt_correction_cycles;
+  uint32_t ocxo2_phase2_dwt_at_edge;
+  uint32_t ocxo2_phase2_dwt_elapsed;
+  uint32_t ocxo2_phase2_edge_elapsed_ns;
+  uint32_t ocxo2_phase2_phase_offset_ns;
+  uint64_t ocxo2_phase2_edge_gnss_ns;
+  int32_t  ocxo2_phase_pair_delta_ns;
+
+  // ── Two-phase validation ──
+  bool     phase_pair_valid;         // true when phase #1 / phase #2 comparison is valid
+
+  // ── Per-second differencing (legacy downstream path; still published) ──
   uint64_t prev_ocxo1_edge_gnss_ns;
   uint64_t prev_ocxo2_edge_gnss_ns;
-  int64_t  ocxo1_gnss_ns_per_pps;    // absolute-edge delta across 10,000,000 ticks
+  int64_t  ocxo1_gnss_ns_per_pps;
   int64_t  ocxo2_gnss_ns_per_pps;
-  int64_t  ocxo1_residual_ns;        // ocxo*_gnss_ns_per_pps - 1e9
+  int64_t  ocxo1_residual_ns;
   int64_t  ocxo2_residual_ns;
-  bool     residual_valid;           // true when residual values are valid
+  bool     residual_valid;
 
   // ── Servo before/after snapshot (written by beta after servo runs) ──
-  uint16_t ocxo1_dac_before;         // DAC HW code before servo adjustment
-  uint16_t ocxo1_dac_after;          // DAC HW code after servo adjustment
+  uint16_t ocxo1_dac_before;
+  uint16_t ocxo1_dac_after;
   uint16_t ocxo2_dac_before;
   uint16_t ocxo2_dac_after;
 
   // ── Lifecycle ──
-  bool     valid;                    // true after first successful capture
-  uint32_t captures;                 // monotonic capture count
+  bool     valid;
+  uint32_t captures;
 };
 
 extern ocxo_phase_capture_t ocxo_phase;

@@ -659,6 +659,8 @@ void clocks_beta_pps(void) {
 
     ocxo_phase.ocxo1_edge_gnss_ns = pps_gnss_ns + (uint64_t)ocxo_phase.ocxo1_phase_offset_ns;
     ocxo_phase.ocxo2_edge_gnss_ns = pps_gnss_ns + (uint64_t)ocxo_phase.ocxo2_phase_offset_ns;
+    ocxo_phase.ocxo1_phase2_edge_gnss_ns = pps_gnss_ns + (uint64_t)ocxo_phase.ocxo1_phase2_phase_offset_ns;
+    ocxo_phase.ocxo2_phase2_edge_gnss_ns = pps_gnss_ns + (uint64_t)ocxo_phase.ocxo2_phase2_phase_offset_ns;
 
     if (ocxo_phase.captures >= 2 && ocxo_phase.prev_ocxo1_edge_gnss_ns != 0 && ocxo_phase.prev_ocxo2_edge_gnss_ns != 0) {
       const int64_t ocxo1_gnss_ns_per_pps =
@@ -753,11 +755,51 @@ void clocks_beta_pps(void) {
     p.add("ocxo2_edge_elapsed_ns",   (int32_t)ocxo_phase.ocxo2_edge_elapsed_ns);
     p.add("ocxo1_edge_gnss_ns",      ocxo_phase.ocxo1_edge_gnss_ns);
     p.add("ocxo2_edge_gnss_ns",      ocxo_phase.ocxo2_edge_gnss_ns);
-    p.add("ocxo1_gnss_ns_per_pps",   ocxo_phase.ocxo1_gnss_ns_per_pps);
-    p.add("ocxo2_gnss_ns_per_pps",   ocxo_phase.ocxo2_gnss_ns_per_pps);
-    p.add("ocxo1_residual_ns",       ocxo_phase.ocxo1_residual_ns);
-    p.add("ocxo2_residual_ns",       ocxo_phase.ocxo2_residual_ns);
-    p.add("phase_residual_valid",    (bool)ocxo_phase.residual_valid);
+    p.add("ocxo1_dwt_before",        ocxo_phase.ocxo1_dwt_before);
+    p.add("ocxo1_dwt_after",         ocxo_phase.ocxo1_dwt_after);
+    p.add("ocxo1_gpt_before",        ocxo_phase.ocxo1_gpt_before);
+    p.add("ocxo1_gpt_after",         ocxo_phase.ocxo1_gpt_after);
+    p.add("ocxo1_dwt_bracket_cycles",ocxo_phase.ocxo1_dwt_bracket_cycles);
+    p.add("ocxo1_dwt_correction_cycles", ocxo_phase.ocxo1_dwt_correction_cycles);
+    p.add("ocxo1_dwt_at_edge",       ocxo_phase.ocxo1_dwt_at_edge);
+    p.add("ocxo2_dwt_before",        ocxo_phase.ocxo2_dwt_before);
+    p.add("ocxo2_dwt_after",         ocxo_phase.ocxo2_dwt_after);
+    p.add("ocxo2_gpt_before",        ocxo_phase.ocxo2_gpt_before);
+    p.add("ocxo2_gpt_after",         ocxo_phase.ocxo2_gpt_after);
+    p.add("ocxo2_dwt_bracket_cycles",ocxo_phase.ocxo2_dwt_bracket_cycles);
+    p.add("ocxo2_dwt_correction_cycles", ocxo_phase.ocxo2_dwt_correction_cycles);
+    p.add("ocxo2_dwt_at_edge",       ocxo_phase.ocxo2_dwt_at_edge);
+
+    p.add("ocxo1_phase2_phase_offset_ns", (int32_t)ocxo_phase.ocxo1_phase2_phase_offset_ns);
+    p.add("ocxo1_phase2_edge_elapsed_ns", (int32_t)ocxo_phase.ocxo1_phase2_edge_elapsed_ns);
+    p.add("ocxo1_phase2_edge_gnss_ns",    ocxo_phase.ocxo1_phase2_edge_gnss_ns);
+    p.add("ocxo1_phase2_dwt_before",      ocxo_phase.ocxo1_phase2_dwt_before);
+    p.add("ocxo1_phase2_dwt_after",       ocxo_phase.ocxo1_phase2_dwt_after);
+    p.add("ocxo1_phase2_gpt_before",      ocxo_phase.ocxo1_phase2_gpt_before);
+    p.add("ocxo1_phase2_gpt_after",       ocxo_phase.ocxo1_phase2_gpt_after);
+    p.add("ocxo1_phase2_dwt_bracket_cycles", ocxo_phase.ocxo1_phase2_dwt_bracket_cycles);
+    p.add("ocxo1_phase2_dwt_correction_cycles", ocxo_phase.ocxo1_phase2_dwt_correction_cycles);
+    p.add("ocxo1_phase2_dwt_at_edge",     ocxo_phase.ocxo1_phase2_dwt_at_edge);
+    p.add("ocxo1_phase_pair_delta_ns",    ocxo_phase.ocxo1_phase_pair_delta_ns);
+
+    p.add("ocxo2_phase2_phase_offset_ns", (int32_t)ocxo_phase.ocxo2_phase2_phase_offset_ns);
+    p.add("ocxo2_phase2_edge_elapsed_ns", (int32_t)ocxo_phase.ocxo2_phase2_edge_elapsed_ns);
+    p.add("ocxo2_phase2_edge_gnss_ns",    ocxo_phase.ocxo2_phase2_edge_gnss_ns);
+    p.add("ocxo2_phase2_dwt_before",      ocxo_phase.ocxo2_phase2_dwt_before);
+    p.add("ocxo2_phase2_dwt_after",       ocxo_phase.ocxo2_phase2_dwt_after);
+    p.add("ocxo2_phase2_gpt_before",      ocxo_phase.ocxo2_phase2_gpt_before);
+    p.add("ocxo2_phase2_gpt_after",       ocxo_phase.ocxo2_phase2_gpt_after);
+    p.add("ocxo2_phase2_dwt_bracket_cycles", ocxo_phase.ocxo2_phase2_dwt_bracket_cycles);
+    p.add("ocxo2_phase2_dwt_correction_cycles", ocxo_phase.ocxo2_phase2_dwt_correction_cycles);
+    p.add("ocxo2_phase2_dwt_at_edge",     ocxo_phase.ocxo2_phase2_dwt_at_edge);
+    p.add("ocxo2_phase_pair_delta_ns",    ocxo_phase.ocxo2_phase_pair_delta_ns);
+
+    p.add("phase_pair_valid",      (bool)ocxo_phase.phase_pair_valid);
+    p.add("ocxo1_gnss_ns_per_pps", ocxo_phase.ocxo1_gnss_ns_per_pps);
+    p.add("ocxo2_gnss_ns_per_pps", ocxo_phase.ocxo2_gnss_ns_per_pps);
+    p.add("ocxo1_residual_ns",     ocxo_phase.ocxo1_residual_ns);
+    p.add("ocxo2_residual_ns",     ocxo_phase.ocxo2_residual_ns);
+    p.add("phase_residual_valid",  (bool)ocxo_phase.residual_valid);
 
     p.add("ocxo1_dac_before",        (int32_t)ocxo_phase.ocxo1_dac_before);
     p.add("ocxo1_dac_after",         (int32_t)ocxo_phase.ocxo1_dac_after);
@@ -1240,6 +1282,12 @@ static Payload cmd_clocks_info(const Payload&) {
   p.add("phase_ocxo1_phase_offset_ns",  ocxo_phase.ocxo1_phase_offset_ns);
   p.add("phase_ocxo1_edge_gnss_ns",     ocxo_phase.ocxo1_edge_gnss_ns);
   p.add("phase_prev_ocxo1_edge_gnss_ns",ocxo_phase.prev_ocxo1_edge_gnss_ns);
+  p.add("phase_ocxo1_dwt_before",        ocxo_phase.ocxo1_dwt_before);
+  p.add("phase_ocxo1_dwt_after",         ocxo_phase.ocxo1_dwt_after);
+  p.add("phase_ocxo1_gpt_before",        ocxo_phase.ocxo1_gpt_before);
+  p.add("phase_ocxo1_gpt_after",         ocxo_phase.ocxo1_gpt_after);
+  p.add("phase_ocxo1_dwt_bracket_cycles",ocxo_phase.ocxo1_dwt_bracket_cycles);
+  p.add("phase_ocxo1_dwt_correction_cycles",ocxo_phase.ocxo1_dwt_correction_cycles);
 
   p.add("phase_ocxo2_dwt_at_edge",      ocxo_phase.ocxo2_dwt_at_edge);
   p.add("phase_ocxo2_dwt_elapsed",      ocxo_phase.ocxo2_dwt_elapsed);
@@ -1247,6 +1295,35 @@ static Payload cmd_clocks_info(const Payload&) {
   p.add("phase_ocxo2_phase_offset_ns",  ocxo_phase.ocxo2_phase_offset_ns);
   p.add("phase_ocxo2_edge_gnss_ns",     ocxo_phase.ocxo2_edge_gnss_ns);
   p.add("phase_prev_ocxo2_edge_gnss_ns",ocxo_phase.prev_ocxo2_edge_gnss_ns);
+  p.add("phase_ocxo2_dwt_before",        ocxo_phase.ocxo2_dwt_before);
+  p.add("phase_ocxo2_dwt_after",         ocxo_phase.ocxo2_dwt_after);
+  p.add("phase_ocxo2_gpt_before",        ocxo_phase.ocxo2_gpt_before);
+  p.add("phase_ocxo2_gpt_after",         ocxo_phase.ocxo2_gpt_after);
+  p.add("phase_ocxo2_dwt_bracket_cycles",ocxo_phase.ocxo2_dwt_bracket_cycles);
+  p.add("phase_ocxo2_dwt_correction_cycles",ocxo_phase.ocxo2_dwt_correction_cycles);
+  p.add("phase_ocxo1_phase2_phase_offset_ns", ocxo_phase.ocxo1_phase2_phase_offset_ns);
+  p.add("phase_ocxo1_phase2_edge_elapsed_ns", ocxo_phase.ocxo1_phase2_edge_elapsed_ns);
+  p.add("phase_ocxo1_phase2_edge_gnss_ns",    ocxo_phase.ocxo1_phase2_edge_gnss_ns);
+  p.add("phase_ocxo1_phase2_dwt_before",      ocxo_phase.ocxo1_phase2_dwt_before);
+  p.add("phase_ocxo1_phase2_dwt_after",       ocxo_phase.ocxo1_phase2_dwt_after);
+  p.add("phase_ocxo1_phase2_gpt_before",      ocxo_phase.ocxo1_phase2_gpt_before);
+  p.add("phase_ocxo1_phase2_gpt_after",       ocxo_phase.ocxo1_phase2_gpt_after);
+  p.add("phase_ocxo1_phase2_dwt_bracket_cycles", ocxo_phase.ocxo1_phase2_dwt_bracket_cycles);
+  p.add("phase_ocxo1_phase2_dwt_correction_cycles", ocxo_phase.ocxo1_phase2_dwt_correction_cycles);
+  p.add("phase_ocxo1_phase2_dwt_at_edge",     ocxo_phase.ocxo1_phase2_dwt_at_edge);
+  p.add("phase_ocxo1_phase_pair_delta_ns",    ocxo_phase.ocxo1_phase_pair_delta_ns);
+  p.add("phase_ocxo2_phase2_phase_offset_ns", ocxo_phase.ocxo2_phase2_phase_offset_ns);
+  p.add("phase_ocxo2_phase2_edge_elapsed_ns", ocxo_phase.ocxo2_phase2_edge_elapsed_ns);
+  p.add("phase_ocxo2_phase2_edge_gnss_ns",    ocxo_phase.ocxo2_phase2_edge_gnss_ns);
+  p.add("phase_ocxo2_phase2_dwt_before",      ocxo_phase.ocxo2_phase2_dwt_before);
+  p.add("phase_ocxo2_phase2_dwt_after",       ocxo_phase.ocxo2_phase2_dwt_after);
+  p.add("phase_ocxo2_phase2_gpt_before",      ocxo_phase.ocxo2_phase2_gpt_before);
+  p.add("phase_ocxo2_phase2_gpt_after",       ocxo_phase.ocxo2_phase2_gpt_after);
+  p.add("phase_ocxo2_phase2_dwt_bracket_cycles", ocxo_phase.ocxo2_phase2_dwt_bracket_cycles);
+  p.add("phase_ocxo2_phase2_dwt_correction_cycles", ocxo_phase.ocxo2_phase2_dwt_correction_cycles);
+  p.add("phase_ocxo2_phase2_dwt_at_edge",     ocxo_phase.ocxo2_phase2_dwt_at_edge);
+  p.add("phase_ocxo2_phase_pair_delta_ns",    ocxo_phase.ocxo2_phase_pair_delta_ns);
+  p.add("phase_pair_valid",                   (bool)ocxo_phase.phase_pair_valid);
 
   p.add("phase_residual_valid",         (bool)ocxo_phase.residual_valid);
   p.add("phase_ocxo1_gnss_ns_per_pps",  ocxo_phase.ocxo1_gnss_ns_per_pps);
