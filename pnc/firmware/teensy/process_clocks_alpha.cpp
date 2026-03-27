@@ -9,13 +9,10 @@
 //   OCXO2. After the normal PPS housekeeping, alpha spins on each
 //   GPT counter until the next post-PPS edge is observed.
 //
-//   For each OCXO, alpha publishes two direct facts:
-//
-//     phase_offset_ns = elapsed_ns % 100
-//     edge_elapsed_ns = elapsed_ns
-//
-//   where elapsed_ns is the DWT-interpolated nanoseconds from PPS to
-//   the observed first post-PPS edge, and one 10 MHz tick = 100 ns.
+//   For each OCXO phase capture, alpha now publishes both raw and adjusted
+//   phase facts. The raw delimiter is dwt_before. Raw elapsed/phase are left
+//   innocent and unmodified; a bracket-class bias map then derives adjusted
+//   phase for servo/control use.
 //
 //   Beta then computes the absolute GNSS timestamp of that canonical edge:
 //
@@ -708,11 +705,14 @@ struct phase_capture_local_t {
   uint32_t gpt_before = 0;
   uint32_t gpt_after = 0;
   uint32_t dwt_bracket_cycles = 0;
-  uint32_t dwt_correction_cycles = 0;
-  uint32_t dwt_at_edge = 0;
+  uint32_t dwt_correction_cycles = 0;   // legacy field name; phase-domain bias lives below
+  uint32_t dwt_at_edge = 0;             // canonical raw delimiter DWT (currently dwt_before)
   uint32_t dwt_elapsed = 0;
-  uint32_t edge_elapsed_ns = 0;
-  uint32_t phase_offset_ns = 0;
+  uint32_t raw_elapsed_ns = 0;
+  uint32_t raw_phase_offset_ns = 0;
+  int32_t  phase_bias_ns = 0;
+  int32_t  adjusted_phase_signed_ns = 0;
+  uint32_t adjusted_phase_offset_ns = 0;
   bool valid = false;
 };
 
@@ -723,8 +723,15 @@ struct phase_harvest_state_t {
   phase_capture_local_t phase2 = {};
 };
 
+static inline uint32_t wrap_phase_0_99(int32_t ns) {
+  while (ns < 0) ns += 100;
+  while (ns >= 100) ns -= 100;
+  return (uint32_t)ns;
+}
+
 static inline void phase_capture_finalize(
   phase_capture_local_t& out,
+  uint8_t phase_ordinal,
   uint32_t dwt_at_pps,
   uint32_t dwt_before,
   uint32_t dwt_after,
@@ -736,11 +743,17 @@ static inline void phase_capture_finalize(
   out.gpt_before = gpt_before;
   out.gpt_after = gpt_after;
   out.dwt_bracket_cycles = dwt_after - dwt_before;
-  out.dwt_correction_cycles = out.dwt_bracket_cycles;
-  out.dwt_at_edge = dwt_after - out.dwt_correction_cycles;
+  out.dwt_correction_cycles = 0;      // legacy telemetry field; correction now happens in phase domain
+  out.dwt_at_edge = dwt_before;       // canonical raw delimiter
   out.dwt_elapsed = out.dwt_at_edge - dwt_at_pps;
-  out.edge_elapsed_ns = (uint32_t)dwt_cycles_to_ns(out.dwt_elapsed);
-  out.phase_offset_ns = out.edge_elapsed_ns % 100u;
+  out.raw_elapsed_ns = (uint32_t)dwt_cycles_to_ns(out.dwt_elapsed);
+  out.raw_phase_offset_ns = out.raw_elapsed_ns % 100u;
+  // Bias is phase-local and looked up from the shared bracket→bias maps in
+  // process_clocks_internal.h.  Phase #1 and phase #2 intentionally use
+  // separate tables because their capture topology differs.
+  out.phase_bias_ns = phase_bias_from_bracket_cycles(phase_ordinal, out.dwt_bracket_cycles);
+  out.adjusted_phase_signed_ns = (int32_t)out.raw_phase_offset_ns + out.phase_bias_ns;
+  out.adjusted_phase_offset_ns = wrap_phase_0_99(out.adjusted_phase_signed_ns);
   out.valid = true;
 }
 
@@ -757,8 +770,13 @@ static inline void phase_harvest_maybe_capture(
   phase_capture_local_t* slot =
     (state.captures_done == 0) ? &state.phase1 : &state.phase2;
 
-  phase_capture_finalize(*slot, dwt_at_pps, dwt_before, dwt_after,
-                         state.gpt_prev, gpt_now);
+  phase_capture_finalize(*slot,
+                         (state.captures_done == 0) ? 1u : 2u,
+                         dwt_at_pps,
+                         dwt_before,
+                         dwt_after,
+                         state.gpt_prev,
+                         gpt_now);
   state.gpt_prev = gpt_now;
   state.captures_done++;
 }
@@ -774,7 +792,10 @@ static inline void ocxo_phase_clear_measurements(void) {
   ocxo_phase.ocxo1_dwt_correction_cycles = 0;
   ocxo_phase.ocxo1_dwt_at_edge = 0;
   ocxo_phase.ocxo1_dwt_elapsed = 0;
-  ocxo_phase.ocxo1_edge_elapsed_ns = 0;
+  ocxo_phase.ocxo1_raw_elapsed_ns = 0;
+  ocxo_phase.ocxo1_raw_phase_offset_ns = 0;
+  ocxo_phase.ocxo1_phase_bias_ns = 0;
+  ocxo_phase.ocxo1_adjusted_phase_signed_ns = 0;
   ocxo_phase.ocxo1_phase_offset_ns = 0;
   ocxo_phase.ocxo1_edge_gnss_ns = 0;
 
@@ -786,10 +807,14 @@ static inline void ocxo_phase_clear_measurements(void) {
   ocxo_phase.ocxo1_phase2_dwt_correction_cycles = 0;
   ocxo_phase.ocxo1_phase2_dwt_at_edge = 0;
   ocxo_phase.ocxo1_phase2_dwt_elapsed = 0;
-  ocxo_phase.ocxo1_phase2_edge_elapsed_ns = 0;
+  ocxo_phase.ocxo1_phase2_raw_elapsed_ns = 0;
+  ocxo_phase.ocxo1_phase2_raw_phase_offset_ns = 0;
+  ocxo_phase.ocxo1_phase2_phase_bias_ns = 0;
+  ocxo_phase.ocxo1_phase2_adjusted_phase_signed_ns = 0;
   ocxo_phase.ocxo1_phase2_phase_offset_ns = 0;
   ocxo_phase.ocxo1_phase2_edge_gnss_ns = 0;
   ocxo_phase.ocxo1_phase_pair_delta_ns = 0;
+  ocxo_phase.ocxo1_adjusted_phase_pair_delta_ns = 0;
 
   ocxo_phase.ocxo2_dwt_before = 0;
   ocxo_phase.ocxo2_dwt_after = 0;
@@ -799,7 +824,10 @@ static inline void ocxo_phase_clear_measurements(void) {
   ocxo_phase.ocxo2_dwt_correction_cycles = 0;
   ocxo_phase.ocxo2_dwt_at_edge = 0;
   ocxo_phase.ocxo2_dwt_elapsed = 0;
-  ocxo_phase.ocxo2_edge_elapsed_ns = 0;
+  ocxo_phase.ocxo2_raw_elapsed_ns = 0;
+  ocxo_phase.ocxo2_raw_phase_offset_ns = 0;
+  ocxo_phase.ocxo2_phase_bias_ns = 0;
+  ocxo_phase.ocxo2_adjusted_phase_signed_ns = 0;
   ocxo_phase.ocxo2_phase_offset_ns = 0;
   ocxo_phase.ocxo2_edge_gnss_ns = 0;
 
@@ -811,10 +839,14 @@ static inline void ocxo_phase_clear_measurements(void) {
   ocxo_phase.ocxo2_phase2_dwt_correction_cycles = 0;
   ocxo_phase.ocxo2_phase2_dwt_at_edge = 0;
   ocxo_phase.ocxo2_phase2_dwt_elapsed = 0;
-  ocxo_phase.ocxo2_phase2_edge_elapsed_ns = 0;
+  ocxo_phase.ocxo2_phase2_raw_elapsed_ns = 0;
+  ocxo_phase.ocxo2_phase2_raw_phase_offset_ns = 0;
+  ocxo_phase.ocxo2_phase2_phase_bias_ns = 0;
+  ocxo_phase.ocxo2_phase2_adjusted_phase_signed_ns = 0;
   ocxo_phase.ocxo2_phase2_phase_offset_ns = 0;
   ocxo_phase.ocxo2_phase2_edge_gnss_ns = 0;
   ocxo_phase.ocxo2_phase_pair_delta_ns = 0;
+  ocxo_phase.ocxo2_adjusted_phase_pair_delta_ns = 0;
 
   ocxo_phase.phase_pair_valid = false;
   ocxo_phase.valid = false;
@@ -937,8 +969,11 @@ static void pps_isr(void)
       ocxo_phase.ocxo1_dwt_correction_cycles = o1.phase1.dwt_correction_cycles;
       ocxo_phase.ocxo1_dwt_at_edge           = o1.phase1.dwt_at_edge;
       ocxo_phase.ocxo1_dwt_elapsed           = o1.phase1.dwt_elapsed;
-      ocxo_phase.ocxo1_edge_elapsed_ns       = o1.phase1.edge_elapsed_ns;
-      ocxo_phase.ocxo1_phase_offset_ns       = o1.phase1.phase_offset_ns;
+      ocxo_phase.ocxo1_raw_elapsed_ns        = o1.phase1.raw_elapsed_ns;
+      ocxo_phase.ocxo1_raw_phase_offset_ns   = o1.phase1.raw_phase_offset_ns;
+      ocxo_phase.ocxo1_phase_bias_ns         = o1.phase1.phase_bias_ns;
+      ocxo_phase.ocxo1_adjusted_phase_signed_ns = o1.phase1.adjusted_phase_signed_ns;
+      ocxo_phase.ocxo1_phase_offset_ns       = o1.phase1.adjusted_phase_offset_ns;
     }
 
     if (o1.phase2.valid) {
@@ -950,12 +985,18 @@ static void pps_isr(void)
       ocxo_phase.ocxo1_phase2_dwt_correction_cycles = o1.phase2.dwt_correction_cycles;
       ocxo_phase.ocxo1_phase2_dwt_at_edge           = o1.phase2.dwt_at_edge;
       ocxo_phase.ocxo1_phase2_dwt_elapsed           = o1.phase2.dwt_elapsed;
-      ocxo_phase.ocxo1_phase2_edge_elapsed_ns       = o1.phase2.edge_elapsed_ns;
-      ocxo_phase.ocxo1_phase2_phase_offset_ns       = o1.phase2.phase_offset_ns;
+      ocxo_phase.ocxo1_phase2_raw_elapsed_ns        = o1.phase2.raw_elapsed_ns;
+      ocxo_phase.ocxo1_phase2_raw_phase_offset_ns   = o1.phase2.raw_phase_offset_ns;
+      ocxo_phase.ocxo1_phase2_phase_bias_ns         = o1.phase2.phase_bias_ns;
+      ocxo_phase.ocxo1_phase2_adjusted_phase_signed_ns = o1.phase2.adjusted_phase_signed_ns;
+      ocxo_phase.ocxo1_phase2_phase_offset_ns       = o1.phase2.adjusted_phase_offset_ns;
     }
 
     if (o1_ok) {
       ocxo_phase.ocxo1_phase_pair_delta_ns =
+        phase_wrap_delta_ns(ocxo_phase.ocxo1_raw_phase_offset_ns,
+                            ocxo_phase.ocxo1_phase2_raw_phase_offset_ns);
+      ocxo_phase.ocxo1_adjusted_phase_pair_delta_ns =
         phase_wrap_delta_ns(ocxo_phase.ocxo1_phase_offset_ns,
                             ocxo_phase.ocxo1_phase2_phase_offset_ns);
     }
@@ -969,8 +1010,11 @@ static void pps_isr(void)
       ocxo_phase.ocxo2_dwt_correction_cycles = o2.phase1.dwt_correction_cycles;
       ocxo_phase.ocxo2_dwt_at_edge           = o2.phase1.dwt_at_edge;
       ocxo_phase.ocxo2_dwt_elapsed           = o2.phase1.dwt_elapsed;
-      ocxo_phase.ocxo2_edge_elapsed_ns       = o2.phase1.edge_elapsed_ns;
-      ocxo_phase.ocxo2_phase_offset_ns       = o2.phase1.phase_offset_ns;
+      ocxo_phase.ocxo2_raw_elapsed_ns        = o2.phase1.raw_elapsed_ns;
+      ocxo_phase.ocxo2_raw_phase_offset_ns   = o2.phase1.raw_phase_offset_ns;
+      ocxo_phase.ocxo2_phase_bias_ns         = o2.phase1.phase_bias_ns;
+      ocxo_phase.ocxo2_adjusted_phase_signed_ns = o2.phase1.adjusted_phase_signed_ns;
+      ocxo_phase.ocxo2_phase_offset_ns       = o2.phase1.adjusted_phase_offset_ns;
     }
 
     if (o2.phase2.valid) {
@@ -982,12 +1026,18 @@ static void pps_isr(void)
       ocxo_phase.ocxo2_phase2_dwt_correction_cycles = o2.phase2.dwt_correction_cycles;
       ocxo_phase.ocxo2_phase2_dwt_at_edge           = o2.phase2.dwt_at_edge;
       ocxo_phase.ocxo2_phase2_dwt_elapsed           = o2.phase2.dwt_elapsed;
-      ocxo_phase.ocxo2_phase2_edge_elapsed_ns       = o2.phase2.edge_elapsed_ns;
-      ocxo_phase.ocxo2_phase2_phase_offset_ns       = o2.phase2.phase_offset_ns;
+      ocxo_phase.ocxo2_phase2_raw_elapsed_ns        = o2.phase2.raw_elapsed_ns;
+      ocxo_phase.ocxo2_phase2_raw_phase_offset_ns   = o2.phase2.raw_phase_offset_ns;
+      ocxo_phase.ocxo2_phase2_phase_bias_ns         = o2.phase2.phase_bias_ns;
+      ocxo_phase.ocxo2_phase2_adjusted_phase_signed_ns = o2.phase2.adjusted_phase_signed_ns;
+      ocxo_phase.ocxo2_phase2_phase_offset_ns       = o2.phase2.adjusted_phase_offset_ns;
     }
 
     if (o2_ok) {
       ocxo_phase.ocxo2_phase_pair_delta_ns =
+        phase_wrap_delta_ns(ocxo_phase.ocxo2_raw_phase_offset_ns,
+                            ocxo_phase.ocxo2_phase2_raw_phase_offset_ns);
+      ocxo_phase.ocxo2_adjusted_phase_pair_delta_ns =
         phase_wrap_delta_ns(ocxo_phase.ocxo2_phase_offset_ns,
                             ocxo_phase.ocxo2_phase2_phase_offset_ns);
     }

@@ -1,53 +1,57 @@
-
 from __future__ import annotations
 
 """
-ZPNet Edge TDC Analyzer — OCXO post-PPS edge bracket analyzer
+ZPNet EDGE TDC ANALYZER — RAW / ADJUSTED TWO-PHASE FORENSICS
 
-Analyzes the new OCXO edge bracket instrumentation captured in TIMEBASE
-to understand whether the polling loop brackets a unique 10 MHz edge.
+Purpose
+-------
+Analyze the newer OCXO phase-capture telemetry that records TWO observed
+post-PPS edges per OCXO, along with raw phase, adjusted phase, bias, and
+per-phase bracket topology.
 
-Key fields from TIMEBASE rows:
+This tool is meant to answer questions like:
+  * What bracket widths are we actually seeing for phase-1 and phase-2?
+  * Are the bracket topologies stable?
+  * What raw pair deltas (phase2 - phase1) occur for each topology?
+  * Is the bias map doing anything useful yet?
+  * Are raw and adjusted pair deltas collapsing or diverging?
 
-  ocxo1_dwt_before / ocxo1_dwt_after
-  ocxo1_gpt_before / ocxo1_gpt_after
+Fields consumed from TIMEBASE payloads
+--------------------------------------
+Phase 1 (OCXO1 example):
   ocxo1_dwt_bracket_cycles
-  ocxo1_edge_elapsed_ns
+  ocxo1_raw_elapsed_ns
+  ocxo1_raw_phase_offset_ns
+  ocxo1_phase_bias_ns
+  ocxo1_adjusted_phase_signed_ns
   ocxo1_phase_offset_ns
+
+Phase 2:
+  ocxo1_phase2_dwt_bracket_cycles
+  ocxo1_phase2_raw_elapsed_ns
+  ocxo1_phase2_raw_phase_offset_ns
+  ocxo1_phase2_phase_bias_ns
+  ocxo1_phase2_adjusted_phase_signed_ns
+  ocxo1_phase2_phase_offset_ns
+
+Pair diagnostics:
+  ocxo1_phase_pair_delta_ns
+  ocxo1_adjusted_phase_pair_delta_ns
+  phase_pair_valid
   ocxo1_residual_ns
 
-  ocxo2_dwt_before / ocxo2_dwt_after
-  ocxo2_gpt_before / ocxo2_gpt_after
-  ocxo2_dwt_bracket_cycles
-  ocxo2_edge_elapsed_ns
-  ocxo2_phase_offset_ns
-  ocxo2_residual_ns
-
-This tool:
-  1. Extracts per-OCXO bracket widths in DWT cycles / ns
-  2. Computes GPT deltas across the successful bracket
-  3. Builds bracket-width histograms
-  4. Reports how often the bracket spans >1 OCXO edge
-  5. Shows second-to-second stability of the observed elapsed time
-  6. Prints per-second detail rows for visual sanity checking
-
-Usage:
-    python -m zpnet.tests.edge_tdc_analyzer <campaign_name> [limit]
-    .zt edge_tdc_analyzer fix3
-    .zt edge_tdc_analyzer fix3 200
+Same field family exists for OCXO2.
 """
 
 import json
 import math
 import sys
 from collections import Counter
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from zpnet.shared.db import open_db
 
-DWT_FREQ_HZ = 1_008_000_000
 DWT_NS_PER_CYCLE = 125.0 / 126.0
-OCXO_PERIOD_NS = 100.0
 
 
 class Welford:
@@ -76,14 +80,10 @@ class Welford:
         return math.sqrt(self.m2 / (self.n - 1)) if self.n >= 2 else 0.0
 
     @property
-    def stderr(self) -> float:
-        return self.stddev / math.sqrt(self.n) if self.n >= 2 else 0.0
-
-    @property
     def range(self) -> float:
-        if self.min_val is not None and self.max_val is not None:
-            return self.max_val - self.min_val
-        return 0.0
+        if self.min_val is None or self.max_val is None:
+            return 0.0
+        return self.max_val - self.min_val
 
 
 def fetch_timebase(campaign: str) -> List[Dict[str, Any]]:
@@ -100,308 +100,331 @@ def fetch_timebase(campaign: str) -> List[Dict[str, Any]]:
         )
         rows = cur.fetchall()
 
-    result = []
+    result: List[Dict[str, Any]] = []
     for row in rows:
-        p = row["payload"]
-        if isinstance(p, str):
-            p = json.loads(p)
-        result.append(p)
-
+        payload = row["payload"]
+        if isinstance(payload, str):
+            payload = json.loads(payload)
+        result.append(payload)
     return result
 
 
-def find_clusters(values: List[int], min_count: int = 3) -> List[Tuple[int, int]]:
-    counter = Counter(values)
-    clusters = [(val, cnt) for val, cnt in counter.items() if cnt >= min_count]
-    clusters.sort(key=lambda x: x[0])
-    return clusters
+def to_stats(values: Sequence[int]) -> Welford:
+    w = Welford()
+    for v in values:
+        w.update(float(v))
+    return w
 
 
-def _histogram(values: List[int], title: str) -> None:
-    print("-" * 70)
+def print_stats_block(title: str, values: Sequence[int], unit: str = "", ns_from_cycles: bool = False) -> None:
+    print("-" * 78)
     print(title)
-    print("-" * 70)
+    print("-" * 78)
     print()
 
-    counter = Counter(values)
-    all_vals = sorted(counter.keys())
-    max_count = max(counter.values()) if counter else 1
-    bar_width = 50
-
-    last_val = None
-    for val in all_vals:
-        if last_val is not None and val - last_val > 3:
-            print(f"       │ {'':.<{bar_width}s}  ···")
-        cnt = counter[val]
-        bar_len = int((cnt / max_count) * bar_width)
-        bar = "█" * bar_len
-        pct = (cnt / len(values)) * 100
-        ns_val = val * DWT_NS_PER_CYCLE
-        print(f"  {val:4d} │ {bar:<{bar_width}s} {cnt:5d} ({pct:5.1f}%)  [{ns_val:6.1f} ns]")
-        last_val = val
-    print()
-
-
-def _analyze_ocxo(rows: List[Dict[str, Any]], key: str, limit: int = 0) -> None:
-    upper = key.upper()
-
-    brackets: List[int] = []
-    gpt_deltas: List[int] = []
-    elapsed_values: List[int] = []
-    residuals: List[int] = []
-    phases: List[int] = []
-    pps_values: List[int] = []
-
-    skipped_missing = 0
-
-    for r in rows:
-        if limit and len(brackets) >= limit:
-            break
-
-        dwt_before = r.get(f"{key}_dwt_before")
-        dwt_after = r.get(f"{key}_dwt_after")
-        gpt_before = r.get(f"{key}_gpt_before")
-        gpt_after = r.get(f"{key}_gpt_after")
-        bracket = r.get(f"{key}_dwt_bracket_cycles")
-        elapsed = r.get(f"{key}_edge_elapsed_ns")
-        phase = r.get(f"{key}_phase_offset_ns")
-        residual = r.get(f"{key}_residual_ns")
-        pps = r.get("pps_count", r.get("teensy_pps_count"))
-
-        if None in (dwt_before, dwt_after, gpt_before, gpt_after, bracket, elapsed, phase, residual, pps):
-            skipped_missing += 1
-            continue
-
-        brackets.append(int(bracket))
-        gpt_deltas.append(int(gpt_after) - int(gpt_before))
-        elapsed_values.append(int(elapsed))
-        phases.append(int(phase))
-        residuals.append(int(residual))
-        pps_values.append(int(pps))
-
-    print("=" * 70)
-    print(f"EDGE TDC ANALYZER — {upper}")
-    print("=" * 70)
-    print()
-    print(f"  Samples:               {len(brackets)}")
-    print(f"  Skipped missing:       {skipped_missing}")
-    print()
-
-    if len(brackets) < 3:
-        print("  Insufficient data")
+    if not values:
+        print("  no samples")
         print()
         return
 
-    w_bracket = Welford()
-    for b in brackets:
-        w_bracket.update(float(b))
+    w = to_stats(values)
+    min_v = int(w.min_val) if w.min_val is not None else 0
+    max_v = int(w.max_val) if w.max_val is not None else 0
 
-    mean_ns = w_bracket.mean * DWT_NS_PER_CYCLE
-    std_ns = w_bracket.stddev * DWT_NS_PER_CYCLE
-    min_br = int(w_bracket.min_val)
-    max_br = int(w_bracket.max_val)
-
-    print("-" * 70)
-    print("BRACKET WIDTH")
-    print("-" * 70)
-    print()
-    print(f"  n       = {w_bracket.n:,}")
-    print(f"  mean    = {w_bracket.mean:,.2f} cycles  ({mean_ns:,.1f} ns)")
-    print(f"  stddev  = {w_bracket.stddev:,.2f} cycles  ({std_ns:,.1f} ns)")
-    print(f"  min     = {min_br:,} cycles  ({min_br * DWT_NS_PER_CYCLE:.1f} ns)")
-    print(f"  max     = {max_br:,} cycles  ({max_br * DWT_NS_PER_CYCLE:.1f} ns)")
-    print(f"  range   = {int(w_bracket.range):,} cycles  ({w_bracket.range * DWT_NS_PER_CYCLE:,.1f} ns)")
-    print()
-
-    over_100ns = sum(1 for b in brackets if b * DWT_NS_PER_CYCLE >= OCXO_PERIOD_NS)
-    over_80ns = sum(1 for b in brackets if b * DWT_NS_PER_CYCLE >= 80.0)
-    print(f"  Brackets >= 80 ns:     {over_80ns}/{len(brackets)} ({100 * over_80ns / len(brackets):.1f}%)")
-    print(f"  Brackets >= 100 ns:    {over_100ns}/{len(brackets)} ({100 * over_100ns / len(brackets):.1f}%)")
-    print()
-
-    if over_100ns:
-        print("  Assessment: bracket sometimes spans a full 10 MHz period or more")
-    elif over_80ns:
-        print("  Assessment: bracket is often uncomfortably wide vs 100 ns OCXO period")
+    if ns_from_cycles:
+        print(f"  n       = {w.n:,}")
+        print(f"  mean    = {w.mean:,.2f} cycles  ({w.mean * DWT_NS_PER_CYCLE:,.1f} ns)")
+        print(f"  stddev  = {w.stddev:,.2f} cycles  ({w.stddev * DWT_NS_PER_CYCLE:,.1f} ns)")
+        print(f"  min     = {min_v:,} cycles  ({min_v * DWT_NS_PER_CYCLE:.1f} ns)")
+        print(f"  max     = {max_v:,} cycles  ({max_v * DWT_NS_PER_CYCLE:.1f} ns)")
+        print(f"  range   = {int(w.range):,} cycles  ({w.range * DWT_NS_PER_CYCLE:,.1f} ns)")
     else:
-        print("  Assessment: bracket is comfortably below one 10 MHz period")
+        suffix = f" {unit}" if unit else ""
+        sign = unit == "ns"
+        if sign:
+            print(f"  n       = {w.n:,}")
+            print(f"  mean    = {w.mean:,.2f}")
+            print(f"  stddev  = {w.stddev:,.2f}")
+            print(f"  min     = {min_v:+d}")
+            print(f"  max     = {max_v:+d}")
+            print(f"  range   = {int(w.range):,}")
+        else:
+            print(f"  n       = {w.n:,}")
+            print(f"  mean    = {w.mean:,.2f}{suffix}")
+            print(f"  stddev  = {w.stddev:,.2f}{suffix}")
+            print(f"  min     = {min_v}{suffix}")
+            print(f"  max     = {max_v}{suffix}")
+            print(f"  range   = {int(w.range)}{suffix}")
     print()
 
-    print("-" * 70)
-    print("GPT DELTA ACROSS BRACKET")
-    print("-" * 70)
-    print()
 
-    gpt_counter = Counter(gpt_deltas)
-    multi_edge = sum(1 for d in gpt_deltas if d > 1)
-    zero_edge = sum(1 for d in gpt_deltas if d <= 0)
-    for delta in sorted(gpt_counter.keys()):
-        cnt = gpt_counter[delta]
-        pct = 100.0 * cnt / len(gpt_deltas)
-        print(f"  delta {delta:>2d}: {cnt:>5d} ({pct:5.1f}%)")
+def histogram(values: Sequence[int], title: str, show_ns_for_cycles: bool = False) -> None:
+    print("-" * 78)
+    print(title)
+    print("-" * 78)
     print()
-    print(f"  GPT delta > 1:         {multi_edge}/{len(gpt_deltas)} ({100 * multi_edge / len(gpt_deltas):.1f}%)")
-    print(f"  GPT delta <= 0:        {zero_edge}/{len(gpt_deltas)} ({100 * zero_edge / len(gpt_deltas):.1f}%)")
-    print()
-
-    w_elapsed = Welford()
-    for e in elapsed_values:
-        w_elapsed.update(float(e))
-
-    w_resid = Welford()
-    for r in residuals:
-        w_resid.update(float(r))
-
-    print("-" * 70)
-    print("ELAPSED / RESIDUAL STABILITY")
-    print("-" * 70)
-    print()
-    print(f"  edge_elapsed_ns mean   = {w_elapsed.mean:,.2f} ns")
-    print(f"  edge_elapsed_ns stddev = {w_elapsed.stddev:,.2f} ns")
-    print(f"  edge_elapsed_ns range  = {int(w_elapsed.range):,} ns")
-    print()
-    print(f"  residual mean          = {w_resid.mean:+.2f} ns")
-    print(f"  residual stddev        = {w_resid.stddev:.2f} ns")
-    print(f"  residual min/max       = {int(w_resid.min_val):+d} / {int(w_resid.max_val):+d} ns")
-    print()
-
-    if len(elapsed_values) >= 2:
-        w_diff = Welford()
-        for i in range(1, len(elapsed_values)):
-            w_diff.update(float(elapsed_values[i] - elapsed_values[i - 1]))
-        print(f"  elapsed second-delta σ = {w_diff.stddev:.2f} ns")
-        print(f"  elapsed second-delta   = {int(w_diff.min_val):+d} .. {int(w_diff.max_val):+d} ns")
+    if not values:
+        print("  no samples")
         print()
+        return
 
-    _histogram(brackets, f"{upper} BRACKET HISTOGRAM (cycles)")
-
-    # Optional cluster analysis on bracket widths
-    min_hits = max(2, len(brackets) // 50)
-    clusters = find_clusters(brackets, min_count=min_hits)
-    print("-" * 70)
-    print("BRACKET CLUSTERS")
-    print("-" * 70)
+    counts = Counter(values)
+    ordered = sorted(counts.keys())
+    max_count = max(counts.values())
+    width = 48
+    last = None
+    for val in ordered:
+        if last is not None and val - last > 3:
+            print(f"       │ {'.' * width}  ···")
+        cnt = counts[val]
+        bar = "█" * max(1, int(round((cnt / max_count) * width))) if cnt else ""
+        pct = 100.0 * cnt / len(values)
+        if show_ns_for_cycles:
+            print(f"  {val:4d} │ {bar:<{width}s} {cnt:5d} ({pct:5.1f}%)  [{val * DWT_NS_PER_CYCLE:6.1f} ns]")
+        else:
+            print(f"  {val:4d} │ {bar:<{width}s} {cnt:5d} ({pct:5.1f}%)")
+        last = val
     print()
-    if clusters:
-        for val, cnt in clusters:
-            pct = 100.0 * cnt / len(brackets)
-            print(f"  {val:>4d} cycles ({val * DWT_NS_PER_CYCLE:6.1f} ns): {cnt:>5d} ({pct:5.1f}%)")
-    else:
-        print("  No stable bracket-width clusters found")
+
+
+def topology_histogram(pairs: Sequence[Tuple[int, int]], title: str) -> None:
+    print("-" * 78)
+    print(title)
+    print("-" * 78)
+    print()
+    if not pairs:
+        print("  no samples")
+        print()
+        return
+    counts = Counter(pairs)
+    total = len(pairs)
+    for (b1, b2), cnt in sorted(counts.items(), key=lambda kv: (-kv[1], kv[0])):
+        pct = 100.0 * cnt / total
+        print(
+            f"  ({b1:>3d}, {b2:>3d}) cycles  ({b1 * DWT_NS_PER_CYCLE:6.1f}, {b2 * DWT_NS_PER_CYCLE:6.1f} ns):"
+            f" {cnt:5d} ({pct:5.1f}%)"
+        )
     print()
 
-    print("-" * 70)
+
+def cluster_block(values: Sequence[int], title: str) -> None:
+    print("-" * 78)
+    print(title)
+    print("-" * 78)
+    print()
+    if not values:
+        print("  no samples")
+        print()
+        return
+    counts = Counter(values)
+    for val, cnt in sorted(counts.items()):
+        pct = 100.0 * cnt / len(values)
+        print(f"  {val:>4d} cycles ({val * DWT_NS_PER_CYCLE:6.1f} ns): {cnt:5d} ({pct:5.1f}%)")
+    print()
+
+
+def wrap_pair_delta(p1: int, p2: int) -> int:
+    d = int(p2) - int(p1)
+    if d > 50:
+        d -= 100
+    elif d < -50:
+        d += 100
+    return d
+
+
+def _payload_int(row: Dict[str, Any], field: str) -> Optional[int]:
+    value = row.get(field)
+    if value is None:
+        return None
+    return int(value)
+
+
+def analyze_ocxo(rows: List[Dict[str, Any]], key: str, limit: int = 0) -> None:
+    upper = key.upper()
+    samples: List[Dict[str, int]] = []
+    skipped = 0
+
+    required = [
+        f"{key}_raw_phase_offset_ns",
+        f"{key}_phase_offset_ns",
+        f"{key}_raw_elapsed_ns",
+        f"{key}_dwt_bracket_cycles",
+        f"{key}_phase_bias_ns",
+        f"{key}_phase2_raw_phase_offset_ns",
+        f"{key}_phase2_phase_offset_ns",
+        f"{key}_phase2_raw_elapsed_ns",
+        f"{key}_phase2_dwt_bracket_cycles",
+        f"{key}_phase2_phase_bias_ns",
+        f"{key}_phase_pair_delta_ns",
+        f"{key}_adjusted_phase_pair_delta_ns",
+        f"{key}_residual_ns",
+        "phase_pair_valid",
+    ]
+
+    for row in rows:
+        if limit and len(samples) >= limit:
+            break
+        vals: Dict[str, int] = {}
+        missing = False
+        for field in required:
+            if field == "phase_pair_valid":
+                if row.get(field) is None:
+                    missing = True
+                    break
+                vals[field] = 1 if bool(row.get(field)) else 0
+                continue
+            v = _payload_int(row, field)
+            if v is None:
+                missing = True
+                break
+            vals[field] = v
+        pps = _payload_int(row, "pps_count")
+        if pps is None:
+            pps = _payload_int(row, "teensy_pps_count")
+        if pps is None:
+            missing = True
+        else:
+            vals["pps_count"] = pps
+
+        if missing:
+            skipped += 1
+            continue
+        samples.append(vals)
+
+    print("=" * 78)
+    print(f"EDGE TDC ANALYZER — {upper}")
+    print("=" * 78)
+    print()
+    print(f"  Samples:               {len(samples)}")
+    print(f"  Skipped missing:       {skipped}")
+    print()
+
+    if not samples:
+        return
+
+    b1 = [s[f"{key}_dwt_bracket_cycles"] for s in samples]
+    b2 = [s[f"{key}_phase2_dwt_bracket_cycles"] for s in samples]
+    topo = list(zip(b1, b2))
+
+    r1 = [s[f"{key}_raw_phase_offset_ns"] for s in samples]
+    r2 = [s[f"{key}_phase2_raw_phase_offset_ns"] for s in samples]
+    a1 = [s[f"{key}_phase_offset_ns"] for s in samples]
+    a2 = [s[f"{key}_phase2_phase_offset_ns"] for s in samples]
+    e1 = [s[f"{key}_raw_elapsed_ns"] for s in samples]
+    e2 = [s[f"{key}_phase2_raw_elapsed_ns"] for s in samples]
+    x1 = [s[f"{key}_phase_bias_ns"] for s in samples]
+    x2 = [s[f"{key}_phase2_phase_bias_ns"] for s in samples]
+    d_raw = [s[f"{key}_phase_pair_delta_ns"] for s in samples]
+    d_adj = [s[f"{key}_adjusted_phase_pair_delta_ns"] for s in samples]
+    residuals = [s[f"{key}_residual_ns"] for s in samples]
+
+    print_stats_block("PHASE-1 BRACKET WIDTH", b1, ns_from_cycles=True)
+    print_stats_block("PHASE-2 BRACKET WIDTH", b2, ns_from_cycles=True)
+    histogram(b1, f"{upper} PHASE-1 BRACKET HISTOGRAM (cycles)", show_ns_for_cycles=True)
+    histogram(b2, f"{upper} PHASE-2 BRACKET HISTOGRAM (cycles)", show_ns_for_cycles=True)
+    topology_histogram(topo, "BRACKET TOPOLOGY PAIRS")
+    cluster_block(b1, "PHASE-1 BRACKET CLUSTERS")
+    cluster_block(b2, "PHASE-2 BRACKET CLUSTERS")
+
+    print_stats_block("RAW PHASE PAIR DELTA (phase2 - phase1)", d_raw, unit="ns")
+    histogram(d_raw, f"{upper} RAW PHASE PAIR DELTA HISTOGRAM (ns)")
+    print_stats_block("ADJUSTED PHASE PAIR DELTA (phase2 - phase1)", d_adj, unit="ns")
+    histogram(d_adj, f"{upper} ADJUSTED PHASE PAIR DELTA HISTOGRAM (ns)")
+
+    print_stats_block("PHASE-1 BIAS DISTRIBUTION", x1, unit="ns")
+    histogram(x1, f"{upper} PHASE-1 BIAS HISTOGRAM (ns)")
+    print_stats_block("PHASE-2 BIAS DISTRIBUTION", x2, unit="ns")
+    histogram(x2, f"{upper} PHASE-2 BIAS HISTOGRAM (ns)")
+
+    print_stats_block("RESIDUAL STABILITY", residuals, unit="ns")
+
+    print("-" * 78)
+    print("RAW ELAPSED STABILITY")
+    print("-" * 78)
+    print()
+    e1s = to_stats(e1)
+    e2s = to_stats(e2)
+    print(f"  phase1 elapsed mean    = {e1s.mean:,.2f} ns")
+    print(f"  phase1 elapsed stddev  = {e1s.stddev:,.2f} ns")
+    print(f"  phase1 elapsed range   = {int(e1s.range):,} ns")
+    print()
+    print(f"  phase2 elapsed mean    = {e2s.mean:,.2f} ns")
+    print(f"  phase2 elapsed stddev  = {e2s.stddev:,.2f} ns")
+    print(f"  phase2 elapsed range   = {int(e2s.range):,} ns")
+    print()
+
+    print("-" * 78)
     print("PER-SECOND DETAIL (first 30)")
-    print("-" * 70)
+    print("-" * 78)
     print()
     print(
-        f"  {'pps':>6s}  {'dwt_before':>12s}  {'dwt_after':>12s}  {'bracket':>8s}  "
-        f"{'gpt_before':>11s}  {'gpt_after':>10s}  {'gptΔ':>5s}  "
-        f"{'elapsed':>7s}  {'phase':>5s}  {'res':>5s}"
+        f"  {'pps':>6s}  {'R1':>4s} {'R2':>4s} {'ΔR':>5s}  {'A1':>4s} {'A2':>4s} {'ΔA':>5s}  "
+        f"{'E1':>6s} {'E2':>6s}  {'B1':>4s} {'B2':>4s}  {'X1':>4s} {'X2':>4s}  {'RES':>6s}  {'PAIR':>4s}"
     )
     print(
-        f"  {'─'*6}  {'─'*12}  {'─'*12}  {'─'*8}  "
-        f"{'─'*11}  {'─'*10}  {'─'*5}  {'─'*7}  {'─'*5}  {'─'*5}"
+        f"  {'─'*6}  {'─'*4} {'─'*4} {'─'*5}  {'─'*4} {'─'*4} {'─'*5}  "
+        f"{'─'*6} {'─'*6}  {'─'*4} {'─'*4}  {'─'*4} {'─'*4}  {'─'*6}  {'─'*4}"
     )
 
     shown = 0
-    for r in rows:
-        dwt_before = r.get(f"{key}_dwt_before")
-        dwt_after = r.get(f"{key}_dwt_after")
-        gpt_before = r.get(f"{key}_gpt_before")
-        gpt_after = r.get(f"{key}_gpt_after")
-        bracket = r.get(f"{key}_dwt_bracket_cycles")
-        elapsed = r.get(f"{key}_edge_elapsed_ns")
-        phase = r.get(f"{key}_phase_offset_ns")
-        residual = r.get(f"{key}_residual_ns")
-        pps = r.get("pps_count", r.get("teensy_pps_count"))
-
-        if None in (dwt_before, dwt_after, gpt_before, gpt_after, bracket, elapsed, phase, residual, pps):
-            continue
-
-        gpt_delta = int(gpt_after) - int(gpt_before)
-
+    for s in samples:
         print(
-            f"  {int(pps):>6d}  {int(dwt_before):>12d}  {int(dwt_after):>12d}  {int(bracket):>8d}  "
-            f"{int(gpt_before):>11d}  {int(gpt_after):>10d}  {gpt_delta:>+5d}  "
-            f"{int(elapsed):>7d}  {int(phase):>5d}  {int(residual):>+5d}"
+            f"  {s['pps_count']:>6d}  "
+            f"{s[f'{key}_raw_phase_offset_ns']:>4d} {s[f'{key}_phase2_raw_phase_offset_ns']:>4d} {s[f'{key}_phase_pair_delta_ns']:+5d}  "
+            f"{s[f'{key}_phase_offset_ns']:>4d} {s[f'{key}_phase2_phase_offset_ns']:>4d} {s[f'{key}_adjusted_phase_pair_delta_ns']:+5d}  "
+            f"{s[f'{key}_raw_elapsed_ns']:>6d} {s[f'{key}_phase2_raw_elapsed_ns']:>6d}  "
+            f"{s[f'{key}_dwt_bracket_cycles']:>4d} {s[f'{key}_phase2_dwt_bracket_cycles']:>4d}  "
+            f"{s[f'{key}_phase_bias_ns']:+4d} {s[f'{key}_phase2_phase_bias_ns']:+4d}  "
+            f"{s[f'{key}_residual_ns']:+6d}  {'YES' if s['phase_pair_valid'] else 'NO':>4s}"
         )
         shown += 1
         if shown >= 30:
-            remaining = len(brackets) - shown
-            if remaining > 0:
-                print(f"  ... {remaining} more rows ...")
+            rem = len(samples) - shown
+            if rem > 0:
+                print(f"  ... {rem} more rows ...")
             break
     print()
 
 
 def analyze(campaign: str, limit: int = 0) -> None:
     rows = fetch_timebase(campaign)
-
     if not rows:
         print(f"No TIMEBASE rows for campaign '{campaign}'")
         return
 
-    print("=" * 70)
+    print("=" * 78)
     print("ZPNet EDGE TDC ANALYZER")
     print(f"Campaign: {campaign}  ({len(rows)} TIMEBASE records)")
-    print("=" * 70)
+    print("=" * 78)
     print()
 
-    _analyze_ocxo(rows, "ocxo1", limit=limit)
-    _analyze_ocxo(rows, "ocxo2", limit=limit)
+    analyze_ocxo(rows, "ocxo1", limit=limit)
+    analyze_ocxo(rows, "ocxo2", limit=limit)
 
-    print("=" * 70)
+    print("=" * 78)
     print("SUMMARY")
-    print("=" * 70)
+    print("=" * 78)
     print()
     print("  Goal:")
-    print("    Determine whether the OCXO edge-detection bracket is narrow enough")
-    print("    to identify a unique 10 MHz edge after PPS.")
+    print("    Surface the new two-phase bracket topology and show how raw phase,")
+    print("    adjusted phase, and bias maps relate to the observed bracket classes.")
     print()
-    print("  Red flags:")
-    print("    - bracket >= 100 ns")
-    print("    - GPT delta > 1 inside a single bracket")
-    print("    - common-mode elapsed/residual swings across both OCXOs")
+    print("  Things to watch:")
+    print("    - phase-1 and phase-2 bracket clusters")
+    print("    - stable topology pairs such as (275,256) or (279,256)")
+    print("    - raw delta distribution vs adjusted delta distribution")
+    print("    - whether bias application collapses adjusted pair deltas")
     print()
-    print("  Good signs:")
-    print("    - narrow, stable bracket-width histogram")
-    print("    - GPT delta consistently == 1")
-    print("    - elapsed second-deltas stay small and boring")
-    print()
-    print("=" * 70)
+    print("=" * 78)
 
 
 def main() -> None:
     if len(sys.argv) < 2:
         print("Usage: edge_tdc_analyzer <campaign_name> [limit]")
-        print()
-        try:
-            with open_db(row_dict=True) as conn:
-                cur = conn.cursor()
-                cur.execute(
-                    """
-                    SELECT campaign, count(*) as cnt
-                    FROM timebase
-                    GROUP BY campaign
-                    ORDER BY max(ts) DESC
-                    LIMIT 10
-                    """
-                )
-                rows = cur.fetchall()
-            if rows:
-                print("Available campaigns:")
-                print(f"  {'CAMPAIGN':<20s} {'RECORDS':>8s}")
-                print(f"  {'─' * 20} {'─' * 8}")
-                for r in rows:
-                    print(f"  {r['campaign']:<20s} {r['cnt']:>8d}")
-        except Exception:
-            pass
         sys.exit(1)
-
     campaign = sys.argv[1]
-    limit_val = int(sys.argv[2]) if len(sys.argv) > 2 else 0
-    analyze(campaign, limit_val)
+    limit = int(sys.argv[2]) if len(sys.argv) > 2 else 0
+    analyze(campaign, limit)
 
 
 if __name__ == "__main__":

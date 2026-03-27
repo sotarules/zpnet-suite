@@ -335,6 +335,8 @@ def clocks_combined_readout() -> list[str]:
 
         dac_hw = t.get(dac_key.replace("_dac", "_dac_hw"))
         adj = t.get(adj_key, 0)
+        raw_phase_ns = blk.get("raw_phase_offset_ns")
+        phase_bias_ns = blk.get("phase_bias_ns")
         phase_ns = blk.get("phase_offset_ns")
         edge_ns = blk.get("edge_gnss_ns")
         residual_ns = blk.get("residual_ns")
@@ -343,6 +345,10 @@ def clocks_combined_readout() -> list[str]:
         if dac_hw is not None:
             dac_volts = dac_hw * 3.002 / 65535
             extra_parts.append(f"DAC={dac_hw:>5d} {dac_volts:.5f}V")
+        if raw_phase_ns is not None:
+            extra_parts.append(f"RAW={raw_phase_ns:>2d}ns")
+        if phase_bias_ns is not None:
+            extra_parts.append(f"BIAS={phase_bias_ns:+d}ns")
         if phase_ns is not None:
             extra_parts.append(f"PHASE={phase_ns:>2d}ns")
         if edge_ns is not None:
@@ -454,6 +460,8 @@ def clocks_combined_readout() -> list[str]:
             blk = r.get(key, {})
             ns_per_pps = blk.get("gnss_ns_per_pps")
             residual = blk.get("residual_ns")
+            raw_phase_ns = blk.get("raw_phase_offset_ns")
+            phase_bias_ns = blk.get("phase_bias_ns")
             phase_ns = blk.get("phase_offset_ns")
             edge_gnss_ns = blk.get("edge_gnss_ns")
             dac_before = blk.get("dac_before")
@@ -467,7 +475,9 @@ def clocks_combined_readout() -> list[str]:
                     f"{name:<6}"
                     f"{ns_per_pps:>14,}"
                     f"{residual:>+10,}"
-                    f"{phase_ns:>10,}"
+                    f"{raw_phase_ns:>8,}"
+                    f"{phase_bias_ns:>8,+}"
+                    f"{phase_ns:>8,}"
                     f"  "
                     f"{dac_before:>8}"
                     f"{v_before:>10.5f}"

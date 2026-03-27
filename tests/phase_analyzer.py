@@ -100,17 +100,19 @@ def _gpt_delta(row: Dict[str, Any], base: str) -> Any:
 def _header() -> str:
     return (
         f"{'PPS':>6}  {'GNSS_NS':>14}  "
-        f"{'O1_P1':>5} {'O1_P2':>5} {'O1_ΔP':>6}  "
+        f"{'O1_R1':>5} {'O1_R2':>5} {'O1_ΔR':>6}  "
+        f"{'O1_A1':>5} {'O1_A2':>5} {'O1_ΔA':>6}  "
         f"{'O1_E1':>6} {'O1_E2':>6}  "
         f"{'O1_B1':>5} {'O1_B2':>5}  "
         f"{'O1_G1':>5} {'O1_G2':>5}  "
-        f"{'O1_C1':>5} {'O1_C2':>5}  "
+        f"{'O1_X1':>5} {'O1_X2':>5}  "
         f"{'O1_RES':>7}  "
-        f"{'O2_P1':>5} {'O2_P2':>5} {'O2_ΔP':>6}  "
+        f"{'O2_R1':>5} {'O2_R2':>5} {'O2_ΔR':>6}  "
+        f"{'O2_A1':>5} {'O2_A2':>5} {'O2_ΔA':>6}  "
         f"{'O2_E1':>6} {'O2_E2':>6}  "
         f"{'O2_B1':>5} {'O2_B2':>5}  "
         f"{'O2_G1':>5} {'O2_G2':>5}  "
-        f"{'O2_C1':>5} {'O2_C2':>5}  "
+        f"{'O2_X1':>5} {'O2_X2':>5}  "
         f"{'O2_RES':>7}  "
         f"{'PAIR':>4}"
     )
@@ -120,29 +122,35 @@ def _row(row: Dict[str, Any]) -> str:
     return (
         f"{_fmt_int(row.get('pps_count')):>6}  "
         f"{_fmt_int(row.get('teensy_gnss_ns')):>14}  "
+        f"{_fmt_int(row.get('ocxo1_raw_phase_offset_ns')):>5} "
+        f"{_fmt_int(row.get('ocxo1_phase2_raw_phase_offset_ns')):>5} "
+        f"{_fmt_signed(row.get('ocxo1_phase_pair_delta_ns')):>6}  "
         f"{_fmt_int(row.get('ocxo1_phase_offset_ns')):>5} "
         f"{_fmt_int(row.get('ocxo1_phase2_phase_offset_ns')):>5} "
-        f"{_fmt_signed(row.get('ocxo1_phase_pair_delta_ns')):>6}  "
-        f"{_fmt_int(row.get('ocxo1_edge_elapsed_ns')):>6} "
-        f"{_fmt_int(row.get('ocxo1_phase2_edge_elapsed_ns')):>6}  "
+        f"{_fmt_signed(row.get('ocxo1_adjusted_phase_pair_delta_ns')):>6}  "
+        f"{_fmt_int(row.get('ocxo1_raw_elapsed_ns')):>6} "
+        f"{_fmt_int(row.get('ocxo1_phase2_raw_elapsed_ns')):>6}  "
         f"{_fmt_int(row.get('ocxo1_dwt_bracket_cycles')):>5} "
         f"{_fmt_int(row.get('ocxo1_phase2_dwt_bracket_cycles')):>5}  "
         f"{_fmt_signed(_gpt_delta(row, 'ocxo1')):>5} "
         f"{_fmt_signed(_gpt_delta(row, 'ocxo1_phase2')):>5}  "
-        f"{_fmt_int(row.get('ocxo1_dwt_correction_cycles')):>5} "
-        f"{_fmt_int(row.get('ocxo1_phase2_dwt_correction_cycles')):>5}  "
+        f"{_fmt_signed(row.get('ocxo1_phase_bias_ns')):>5} "
+        f"{_fmt_signed(row.get('ocxo1_phase2_phase_bias_ns')):>5}  "
         f"{_fmt_signed(row.get('ocxo1_residual_ns')):>7}  "
+        f"{_fmt_int(row.get('ocxo2_raw_phase_offset_ns')):>5} "
+        f"{_fmt_int(row.get('ocxo2_phase2_raw_phase_offset_ns')):>5} "
+        f"{_fmt_signed(row.get('ocxo2_phase_pair_delta_ns')):>6}  "
         f"{_fmt_int(row.get('ocxo2_phase_offset_ns')):>5} "
         f"{_fmt_int(row.get('ocxo2_phase2_phase_offset_ns')):>5} "
-        f"{_fmt_signed(row.get('ocxo2_phase_pair_delta_ns')):>6}  "
-        f"{_fmt_int(row.get('ocxo2_edge_elapsed_ns')):>6} "
-        f"{_fmt_int(row.get('ocxo2_phase2_edge_elapsed_ns')):>6}  "
+        f"{_fmt_signed(row.get('ocxo2_adjusted_phase_pair_delta_ns')):>6}  "
+        f"{_fmt_int(row.get('ocxo2_raw_elapsed_ns')):>6} "
+        f"{_fmt_int(row.get('ocxo2_phase2_raw_elapsed_ns')):>6}  "
         f"{_fmt_int(row.get('ocxo2_dwt_bracket_cycles')):>5} "
         f"{_fmt_int(row.get('ocxo2_phase2_dwt_bracket_cycles')):>5}  "
         f"{_fmt_signed(_gpt_delta(row, 'ocxo2')):>5} "
         f"{_fmt_signed(_gpt_delta(row, 'ocxo2_phase2')):>5}  "
-        f"{_fmt_int(row.get('ocxo2_dwt_correction_cycles')):>5} "
-        f"{_fmt_int(row.get('ocxo2_phase2_dwt_correction_cycles')):>5}  "
+        f"{_fmt_signed(row.get('ocxo2_phase_bias_ns')):>5} "
+        f"{_fmt_signed(row.get('ocxo2_phase2_phase_bias_ns')):>5}  "
         f"{_fmt_signed(row.get('ocxo2_residual_ns')):>7}  "
         f"{_fmt_pair_valid(row.get('phase_pair_valid')):>4}"
     )
@@ -159,7 +167,7 @@ def analyze(campaign: str, limit: int = 0) -> None:
     first = rows[0]
     last = rows[-1]
     print("=" * 220)
-    print("PHASE ANALYZER — TWO-PHASE VALIDATION")
+    print("PHASE ANALYZER — RAW/ADJUSTED TWO-PHASE VALIDATION")
     print("=" * 220)
     print(f"records:    {len(rows):,}")
     print(f"pps range:  {first.get('pps_count')} -> {last.get('pps_count')}")
