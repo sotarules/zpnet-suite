@@ -699,6 +699,127 @@ static inline int32_t phase_wrap_delta_ns(uint32_t a_ns, uint32_t b_ns) {
   return d;
 }
 
+
+static constexpr uint32_t OCXO_PHASE_CAPTURE_TIMEOUT_CYCLES = 4096;
+
+struct phase_capture_local_t {
+  uint32_t dwt_before = 0;
+  uint32_t dwt_after = 0;
+  uint32_t gpt_before = 0;
+  uint32_t gpt_after = 0;
+  uint32_t dwt_bracket_cycles = 0;
+  uint32_t dwt_correction_cycles = 0;
+  uint32_t dwt_at_edge = 0;
+  uint32_t dwt_elapsed = 0;
+  uint32_t edge_elapsed_ns = 0;
+  uint32_t phase_offset_ns = 0;
+  bool valid = false;
+};
+
+struct phase_harvest_state_t {
+  uint32_t gpt_prev = 0;
+  uint8_t captures_done = 0;
+  phase_capture_local_t phase1 = {};
+  phase_capture_local_t phase2 = {};
+};
+
+static inline void phase_capture_finalize(
+  phase_capture_local_t& out,
+  uint32_t dwt_at_pps,
+  uint32_t dwt_before,
+  uint32_t dwt_after,
+  uint32_t gpt_before,
+  uint32_t gpt_after
+) {
+  out.dwt_before = dwt_before;
+  out.dwt_after = dwt_after;
+  out.gpt_before = gpt_before;
+  out.gpt_after = gpt_after;
+  out.dwt_bracket_cycles = dwt_after - dwt_before;
+  out.dwt_correction_cycles = out.dwt_bracket_cycles;
+  out.dwt_at_edge = dwt_after - out.dwt_correction_cycles;
+  out.dwt_elapsed = out.dwt_at_edge - dwt_at_pps;
+  out.edge_elapsed_ns = (uint32_t)dwt_cycles_to_ns(out.dwt_elapsed);
+  out.phase_offset_ns = out.edge_elapsed_ns % 100u;
+  out.valid = true;
+}
+
+static inline void phase_harvest_maybe_capture(
+  phase_harvest_state_t& state,
+  uint32_t dwt_at_pps,
+  uint32_t dwt_before,
+  uint32_t dwt_after,
+  uint32_t gpt_now
+) {
+  if (state.captures_done >= 2) return;
+  if (gpt_now == state.gpt_prev) return;
+
+  phase_capture_local_t* slot =
+    (state.captures_done == 0) ? &state.phase1 : &state.phase2;
+
+  phase_capture_finalize(*slot, dwt_at_pps, dwt_before, dwt_after,
+                         state.gpt_prev, gpt_now);
+  state.gpt_prev = gpt_now;
+  state.captures_done++;
+}
+
+static inline void ocxo_phase_clear_measurements(void) {
+  ocxo_phase.dwt_at_pps = 0;
+
+  ocxo_phase.ocxo1_dwt_before = 0;
+  ocxo_phase.ocxo1_dwt_after = 0;
+  ocxo_phase.ocxo1_gpt_before = 0;
+  ocxo_phase.ocxo1_gpt_after = 0;
+  ocxo_phase.ocxo1_dwt_bracket_cycles = 0;
+  ocxo_phase.ocxo1_dwt_correction_cycles = 0;
+  ocxo_phase.ocxo1_dwt_at_edge = 0;
+  ocxo_phase.ocxo1_dwt_elapsed = 0;
+  ocxo_phase.ocxo1_edge_elapsed_ns = 0;
+  ocxo_phase.ocxo1_phase_offset_ns = 0;
+  ocxo_phase.ocxo1_edge_gnss_ns = 0;
+
+  ocxo_phase.ocxo1_phase2_dwt_before = 0;
+  ocxo_phase.ocxo1_phase2_dwt_after = 0;
+  ocxo_phase.ocxo1_phase2_gpt_before = 0;
+  ocxo_phase.ocxo1_phase2_gpt_after = 0;
+  ocxo_phase.ocxo1_phase2_dwt_bracket_cycles = 0;
+  ocxo_phase.ocxo1_phase2_dwt_correction_cycles = 0;
+  ocxo_phase.ocxo1_phase2_dwt_at_edge = 0;
+  ocxo_phase.ocxo1_phase2_dwt_elapsed = 0;
+  ocxo_phase.ocxo1_phase2_edge_elapsed_ns = 0;
+  ocxo_phase.ocxo1_phase2_phase_offset_ns = 0;
+  ocxo_phase.ocxo1_phase2_edge_gnss_ns = 0;
+  ocxo_phase.ocxo1_phase_pair_delta_ns = 0;
+
+  ocxo_phase.ocxo2_dwt_before = 0;
+  ocxo_phase.ocxo2_dwt_after = 0;
+  ocxo_phase.ocxo2_gpt_before = 0;
+  ocxo_phase.ocxo2_gpt_after = 0;
+  ocxo_phase.ocxo2_dwt_bracket_cycles = 0;
+  ocxo_phase.ocxo2_dwt_correction_cycles = 0;
+  ocxo_phase.ocxo2_dwt_at_edge = 0;
+  ocxo_phase.ocxo2_dwt_elapsed = 0;
+  ocxo_phase.ocxo2_edge_elapsed_ns = 0;
+  ocxo_phase.ocxo2_phase_offset_ns = 0;
+  ocxo_phase.ocxo2_edge_gnss_ns = 0;
+
+  ocxo_phase.ocxo2_phase2_dwt_before = 0;
+  ocxo_phase.ocxo2_phase2_dwt_after = 0;
+  ocxo_phase.ocxo2_phase2_gpt_before = 0;
+  ocxo_phase.ocxo2_phase2_gpt_after = 0;
+  ocxo_phase.ocxo2_phase2_dwt_bracket_cycles = 0;
+  ocxo_phase.ocxo2_phase2_dwt_correction_cycles = 0;
+  ocxo_phase.ocxo2_phase2_dwt_at_edge = 0;
+  ocxo_phase.ocxo2_phase2_dwt_elapsed = 0;
+  ocxo_phase.ocxo2_phase2_edge_elapsed_ns = 0;
+  ocxo_phase.ocxo2_phase2_phase_offset_ns = 0;
+  ocxo_phase.ocxo2_phase2_edge_gnss_ns = 0;
+  ocxo_phase.ocxo2_phase_pair_delta_ns = 0;
+
+  ocxo_phase.phase_pair_valid = false;
+  ocxo_phase.valid = false;
+}
+
 static void pps_isr(void)
 {
   const uint32_t snap_dwt   = DWT_CYCCNT;
@@ -773,180 +894,109 @@ static void pps_isr(void)
   isr_prev_ocxo1 = isr_snap_ocxo1 = snap_ocxo1;
   isr_prev_ocxo2 = isr_snap_ocxo2 = snap_ocxo2;
 
-  // ── v26: OCXO phase capture — first post-PPS edge ──
+  // ── v26: OCXO phase capture — first/second post-PPS edges (quasi-parallel) ──
   //
-  // Capture the DWT cycle count at the next GPT1 and GPT2 transitions.
-  // Each spin is guaranteed ≤100 ns (one 10 MHz tick period).
-  // The first-class observable is the OCXO phase offset from PPS:
-  //
-  //   phase_offset_ns = elapsed_ns mod 100
-  //
-  // Alpha owns the direct phase measurement. Beta computes absolute
-  // edge GNSS timestamps and per-second residuals from these facts.
+  // Harvest both OCXO counters inside one tight polling loop and stop as
+  // soon as both oscillators have phase #1 and phase #2. This keeps the
+  // capture primitive uniform and minimizes asymmetric ISR choreography.
   {
     const uint32_t dwt_at_pps = snap_dwt - ISR_ENTRY_DWT_CYCLES;
 
-    // Start each PPS with the current capture marked invalid until both
-    // two-phase sequences complete. This prevents stale forensic fields
-    // from masquerading as fresh data if we ever add an early-exit path.
-    ocxo_phase.phase_pair_valid = false;
-    ocxo_phase.valid = false;
+    ocxo_phase_clear_measurements();
 
-    // ── OCXO1: capture two consecutive observed GPT1 edges ──
-    {
-      uint32_t gpt1_before = GPT1_CNT;
+    phase_harvest_state_t o1 = {};
+    phase_harvest_state_t o2 = {};
 
-      // Phase #1
-      {
-        uint32_t dwt_before = 0;
-        uint32_t dwt_after  = 0;
-        uint32_t gpt1_after = gpt1_before;
+    o1.gpt_prev = GPT1_CNT;
+    o2.gpt_prev = GPT2_CNT;
 
-        for (;;) {
-          dwt_before = DWT_CYCCNT;
-          gpt1_after = GPT1_CNT;
-          dwt_after  = DWT_CYCCNT;
-          if (gpt1_after != gpt1_before) break;
-        }
+    const uint32_t harvest_start_dwt = DWT_CYCCNT;
 
-        const uint32_t dwt_bracket_cycles   = dwt_after - dwt_before;
-        const uint32_t dwt_correction_cycles = dwt_bracket_cycles;
-        const uint32_t dwt_at_edge          = dwt_after - dwt_correction_cycles;
-        const uint32_t dwt_elapsed          = dwt_at_edge - dwt_at_pps;
-        const uint32_t elapsed_ns           = (uint32_t)dwt_cycles_to_ns(dwt_elapsed);
-        const uint32_t phase_offset_ns      = elapsed_ns % 100u;
+    while ((o1.captures_done < 2 || o2.captures_done < 2) &&
+           (uint32_t)(DWT_CYCCNT - harvest_start_dwt) < OCXO_PHASE_CAPTURE_TIMEOUT_CYCLES) {
+      const uint32_t dwt_before = DWT_CYCCNT;
+      const uint32_t gpt1_now   = GPT1_CNT;
+      const uint32_t gpt2_now   = GPT2_CNT;
+      const uint32_t dwt_after  = DWT_CYCCNT;
 
-        ocxo_phase.ocxo1_dwt_before            = dwt_before;
-        ocxo_phase.ocxo1_dwt_after             = dwt_after;
-        ocxo_phase.ocxo1_gpt_before            = gpt1_before;
-        ocxo_phase.ocxo1_gpt_after             = gpt1_after;
-        ocxo_phase.ocxo1_dwt_bracket_cycles    = dwt_bracket_cycles;
-        ocxo_phase.ocxo1_dwt_correction_cycles = dwt_correction_cycles;
-        ocxo_phase.ocxo1_dwt_at_edge           = dwt_at_edge;
-        ocxo_phase.ocxo1_dwt_elapsed           = dwt_elapsed;
-        ocxo_phase.ocxo1_edge_elapsed_ns       = elapsed_ns;
-        ocxo_phase.ocxo1_phase_offset_ns       = phase_offset_ns;
+      phase_harvest_maybe_capture(o1, dwt_at_pps, dwt_before, dwt_after, gpt1_now);
+      phase_harvest_maybe_capture(o2, dwt_at_pps, dwt_before, dwt_after, gpt2_now);
+    }
 
-        gpt1_before = gpt1_after;
-      }
+    const bool o1_ok = (o1.captures_done == 2) && o1.phase1.valid && o1.phase2.valid;
+    const bool o2_ok = (o2.captures_done == 2) && o2.phase1.valid && o2.phase2.valid;
 
-      // Phase #2
-      {
-        uint32_t dwt_before = 0;
-        uint32_t dwt_after  = 0;
-        uint32_t gpt1_after = gpt1_before;
+    ocxo_phase.dwt_at_pps = dwt_at_pps;
 
-        for (;;) {
-          dwt_before = DWT_CYCCNT;
-          gpt1_after = GPT1_CNT;
-          dwt_after  = DWT_CYCCNT;
-          if (gpt1_after != gpt1_before) break;
-        }
+    if (o1.phase1.valid) {
+      ocxo_phase.ocxo1_dwt_before            = o1.phase1.dwt_before;
+      ocxo_phase.ocxo1_dwt_after             = o1.phase1.dwt_after;
+      ocxo_phase.ocxo1_gpt_before            = o1.phase1.gpt_before;
+      ocxo_phase.ocxo1_gpt_after             = o1.phase1.gpt_after;
+      ocxo_phase.ocxo1_dwt_bracket_cycles    = o1.phase1.dwt_bracket_cycles;
+      ocxo_phase.ocxo1_dwt_correction_cycles = o1.phase1.dwt_correction_cycles;
+      ocxo_phase.ocxo1_dwt_at_edge           = o1.phase1.dwt_at_edge;
+      ocxo_phase.ocxo1_dwt_elapsed           = o1.phase1.dwt_elapsed;
+      ocxo_phase.ocxo1_edge_elapsed_ns       = o1.phase1.edge_elapsed_ns;
+      ocxo_phase.ocxo1_phase_offset_ns       = o1.phase1.phase_offset_ns;
+    }
 
-        const uint32_t dwt_bracket_cycles   = dwt_after - dwt_before;
-        const uint32_t dwt_correction_cycles = dwt_bracket_cycles;
-        const uint32_t dwt_at_edge          = dwt_after - dwt_correction_cycles;
-        const uint32_t dwt_elapsed          = dwt_at_edge - dwt_at_pps;
-        const uint32_t elapsed_ns           = (uint32_t)dwt_cycles_to_ns(dwt_elapsed);
-        const uint32_t phase_offset_ns      = elapsed_ns % 100u;
+    if (o1.phase2.valid) {
+      ocxo_phase.ocxo1_phase2_dwt_before            = o1.phase2.dwt_before;
+      ocxo_phase.ocxo1_phase2_dwt_after             = o1.phase2.dwt_after;
+      ocxo_phase.ocxo1_phase2_gpt_before            = o1.phase2.gpt_before;
+      ocxo_phase.ocxo1_phase2_gpt_after             = o1.phase2.gpt_after;
+      ocxo_phase.ocxo1_phase2_dwt_bracket_cycles    = o1.phase2.dwt_bracket_cycles;
+      ocxo_phase.ocxo1_phase2_dwt_correction_cycles = o1.phase2.dwt_correction_cycles;
+      ocxo_phase.ocxo1_phase2_dwt_at_edge           = o1.phase2.dwt_at_edge;
+      ocxo_phase.ocxo1_phase2_dwt_elapsed           = o1.phase2.dwt_elapsed;
+      ocxo_phase.ocxo1_phase2_edge_elapsed_ns       = o1.phase2.edge_elapsed_ns;
+      ocxo_phase.ocxo1_phase2_phase_offset_ns       = o1.phase2.phase_offset_ns;
+    }
 
-        ocxo_phase.ocxo1_phase2_dwt_before            = dwt_before;
-        ocxo_phase.ocxo1_phase2_dwt_after             = dwt_after;
-        ocxo_phase.ocxo1_phase2_gpt_before            = gpt1_before;
-        ocxo_phase.ocxo1_phase2_gpt_after             = gpt1_after;
-        ocxo_phase.ocxo1_phase2_dwt_bracket_cycles    = dwt_bracket_cycles;
-        ocxo_phase.ocxo1_phase2_dwt_correction_cycles = dwt_correction_cycles;
-        ocxo_phase.ocxo1_phase2_dwt_at_edge           = dwt_at_edge;
-        ocxo_phase.ocxo1_phase2_dwt_elapsed           = dwt_elapsed;
-        ocxo_phase.ocxo1_phase2_edge_elapsed_ns       = elapsed_ns;
-        ocxo_phase.ocxo1_phase2_phase_offset_ns       = phase_offset_ns;
-      }
-
+    if (o1_ok) {
       ocxo_phase.ocxo1_phase_pair_delta_ns =
         phase_wrap_delta_ns(ocxo_phase.ocxo1_phase_offset_ns,
                             ocxo_phase.ocxo1_phase2_phase_offset_ns);
     }
 
-    // ── OCXO2: capture two consecutive observed GPT2 edges ──
-    {
-      uint32_t gpt2_before = GPT2_CNT;
+    if (o2.phase1.valid) {
+      ocxo_phase.ocxo2_dwt_before            = o2.phase1.dwt_before;
+      ocxo_phase.ocxo2_dwt_after             = o2.phase1.dwt_after;
+      ocxo_phase.ocxo2_gpt_before            = o2.phase1.gpt_before;
+      ocxo_phase.ocxo2_gpt_after             = o2.phase1.gpt_after;
+      ocxo_phase.ocxo2_dwt_bracket_cycles    = o2.phase1.dwt_bracket_cycles;
+      ocxo_phase.ocxo2_dwt_correction_cycles = o2.phase1.dwt_correction_cycles;
+      ocxo_phase.ocxo2_dwt_at_edge           = o2.phase1.dwt_at_edge;
+      ocxo_phase.ocxo2_dwt_elapsed           = o2.phase1.dwt_elapsed;
+      ocxo_phase.ocxo2_edge_elapsed_ns       = o2.phase1.edge_elapsed_ns;
+      ocxo_phase.ocxo2_phase_offset_ns       = o2.phase1.phase_offset_ns;
+    }
 
-      // Phase #1
-      {
-        uint32_t dwt_before = 0;
-        uint32_t dwt_after  = 0;
-        uint32_t gpt2_after = gpt2_before;
+    if (o2.phase2.valid) {
+      ocxo_phase.ocxo2_phase2_dwt_before            = o2.phase2.dwt_before;
+      ocxo_phase.ocxo2_phase2_dwt_after             = o2.phase2.dwt_after;
+      ocxo_phase.ocxo2_phase2_gpt_before            = o2.phase2.gpt_before;
+      ocxo_phase.ocxo2_phase2_gpt_after             = o2.phase2.gpt_after;
+      ocxo_phase.ocxo2_phase2_dwt_bracket_cycles    = o2.phase2.dwt_bracket_cycles;
+      ocxo_phase.ocxo2_phase2_dwt_correction_cycles = o2.phase2.dwt_correction_cycles;
+      ocxo_phase.ocxo2_phase2_dwt_at_edge           = o2.phase2.dwt_at_edge;
+      ocxo_phase.ocxo2_phase2_dwt_elapsed           = o2.phase2.dwt_elapsed;
+      ocxo_phase.ocxo2_phase2_edge_elapsed_ns       = o2.phase2.edge_elapsed_ns;
+      ocxo_phase.ocxo2_phase2_phase_offset_ns       = o2.phase2.phase_offset_ns;
+    }
 
-        for (;;) {
-          dwt_before = DWT_CYCCNT;
-          gpt2_after = GPT2_CNT;
-          dwt_after  = DWT_CYCCNT;
-          if (gpt2_after != gpt2_before) break;
-        }
-
-        const uint32_t dwt_bracket_cycles   = dwt_after - dwt_before;
-        const uint32_t dwt_correction_cycles = dwt_bracket_cycles;
-        const uint32_t dwt_at_edge          = dwt_after - dwt_correction_cycles;
-        const uint32_t dwt_elapsed          = dwt_at_edge - dwt_at_pps;
-        const uint32_t elapsed_ns           = (uint32_t)dwt_cycles_to_ns(dwt_elapsed);
-        const uint32_t phase_offset_ns      = elapsed_ns % 100u;
-
-        ocxo_phase.ocxo2_dwt_before            = dwt_before;
-        ocxo_phase.ocxo2_dwt_after             = dwt_after;
-        ocxo_phase.ocxo2_gpt_before            = gpt2_before;
-        ocxo_phase.ocxo2_gpt_after             = gpt2_after;
-        ocxo_phase.ocxo2_dwt_bracket_cycles    = dwt_bracket_cycles;
-        ocxo_phase.ocxo2_dwt_correction_cycles = dwt_correction_cycles;
-        ocxo_phase.ocxo2_dwt_at_edge           = dwt_at_edge;
-        ocxo_phase.ocxo2_dwt_elapsed           = dwt_elapsed;
-        ocxo_phase.ocxo2_edge_elapsed_ns       = elapsed_ns;
-        ocxo_phase.ocxo2_phase_offset_ns       = phase_offset_ns;
-
-        gpt2_before = gpt2_after;
-      }
-
-      // Phase #2
-      {
-        uint32_t dwt_before = 0;
-        uint32_t dwt_after  = 0;
-        uint32_t gpt2_after = gpt2_before;
-
-        for (;;) {
-          dwt_before = DWT_CYCCNT;
-          gpt2_after = GPT2_CNT;
-          dwt_after  = DWT_CYCCNT;
-          if (gpt2_after != gpt2_before) break;
-        }
-
-        const uint32_t dwt_bracket_cycles   = dwt_after - dwt_before;
-        const uint32_t dwt_correction_cycles = dwt_bracket_cycles;
-        const uint32_t dwt_at_edge          = dwt_after - dwt_correction_cycles;
-        const uint32_t dwt_elapsed          = dwt_at_edge - dwt_at_pps;
-        const uint32_t elapsed_ns           = (uint32_t)dwt_cycles_to_ns(dwt_elapsed);
-        const uint32_t phase_offset_ns      = elapsed_ns % 100u;
-
-        ocxo_phase.ocxo2_phase2_dwt_before            = dwt_before;
-        ocxo_phase.ocxo2_phase2_dwt_after             = dwt_after;
-        ocxo_phase.ocxo2_phase2_gpt_before            = gpt2_before;
-        ocxo_phase.ocxo2_phase2_gpt_after             = gpt2_after;
-        ocxo_phase.ocxo2_phase2_dwt_bracket_cycles    = dwt_bracket_cycles;
-        ocxo_phase.ocxo2_phase2_dwt_correction_cycles = dwt_correction_cycles;
-        ocxo_phase.ocxo2_phase2_dwt_at_edge           = dwt_at_edge;
-        ocxo_phase.ocxo2_phase2_dwt_elapsed           = dwt_elapsed;
-        ocxo_phase.ocxo2_phase2_edge_elapsed_ns       = elapsed_ns;
-        ocxo_phase.ocxo2_phase2_phase_offset_ns       = phase_offset_ns;
-      }
-
+    if (o2_ok) {
       ocxo_phase.ocxo2_phase_pair_delta_ns =
         phase_wrap_delta_ns(ocxo_phase.ocxo2_phase_offset_ns,
                             ocxo_phase.ocxo2_phase2_phase_offset_ns);
     }
 
-    ocxo_phase.phase_pair_valid = true;
-    ocxo_phase.dwt_at_pps = dwt_at_pps;
-    ocxo_phase.valid = true;
-    ocxo_phase.captures++;
-
+    ocxo_phase.phase_pair_valid = o1_ok && o2_ok;
+    ocxo_phase.valid = ocxo_phase.phase_pair_valid;
+    if (ocxo_phase.valid) {
+      ocxo_phase.captures++;
+    }
 
     // ── v16: PPS watchdog ──
     if (pps_scheduled) {
