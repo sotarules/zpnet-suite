@@ -979,35 +979,27 @@ def _build_clock_block(
         block["residual_ns"] = frag.get("ocxo1_residual_ns")
         block["dac_before"] = frag.get("ocxo1_dac_before")
         block["dac_after"] = frag.get("ocxo1_dac_after")
-        block["raw_phase_offset_ns"] = frag.get("ocxo1_raw_phase_offset_ns")
-        block["phase_bias_ns"] = frag.get("ocxo1_phase_bias_ns")
-        block["adjusted_phase_signed"] = frag.get("ocxo1_adjusted_phase_signed")
-        block["phase_offset_ns"] = frag.get("ocxo1_phase_offset_ns")
-        block["raw_elapsed_ns"] = frag.get("ocxo1_raw_elapsed_ns")
+        block["match_found"] = frag.get("ocxo1_match_found")
+        block["candidates_examined"] = frag.get("ocxo1_candidates_examined")
+        block["match_iteration_count"] = frag.get("ocxo1_match_iteration_count")
+        block["match_delta_ns"] = frag.get("ocxo1_match_delta_ns")
+        block["match_prev_phase_offset_ns"] = frag.get("ocxo1_match_prev_phase_offset_ns")
+        block["match_prev_raw_elapsed_ns"] = frag.get("ocxo1_match_prev_raw_elapsed_ns")
+        block["match_prev_dwt_bracket_cycles"] = frag.get("ocxo1_match_prev_dwt_bracket_cycles")
+        block["match_prev_dwt_before"] = frag.get("ocxo1_match_prev_dwt_before")
+        block["match_prev_dwt_after"] = frag.get("ocxo1_match_prev_dwt_after")
+        block["match_prev_gpt_before"] = frag.get("ocxo1_match_prev_gpt_before")
+        block["match_prev_gpt_after"] = frag.get("ocxo1_match_prev_gpt_after")
+        block["winner_phase_offset_ns"] = frag.get("ocxo1_winner_phase_offset_ns")
+        block["winner_raw_elapsed_ns"] = frag.get("ocxo1_winner_raw_elapsed_ns")
+        block["winner_dwt_bracket_cycles"] = frag.get("ocxo1_winner_dwt_bracket_cycles")
+        block["winner_dwt_before"] = frag.get("ocxo1_winner_dwt_before")
+        block["winner_dwt_after"] = frag.get("ocxo1_winner_dwt_after")
+        block["winner_gpt_before"] = frag.get("ocxo1_winner_gpt_before")
+        block["winner_gpt_after"] = frag.get("ocxo1_winner_gpt_after")
+        block["winner_dwt_at_edge"] = frag.get("ocxo1_winner_dwt_at_edge")
         block["edge_gnss_ns"] = frag.get("ocxo1_edge_gnss_ns")
-        block["dwt_before"] = frag.get("ocxo1_dwt_before")
-        block["dwt_after"] = frag.get("ocxo1_dwt_after")
-        block["gpt_before"] = frag.get("ocxo1_gpt_before")
-        block["gpt_after"] = frag.get("ocxo1_gpt_after")
-        block["dwt_bracket_cycles"] = frag.get("ocxo1_dwt_bracket_cycles")
-        block["dwt_correction_cycles"] = frag.get("ocxo1_dwt_correction_cycles")
-        block["dwt_at_edge"] = frag.get("ocxo1_dwt_at_edge")
-        block["phase2_raw_phase_offset_ns"] = frag.get("ocxo1_phase2_raw_phase_offset_ns")
-        block["phase2_bias_ns"] = frag.get("ocxo1_phase2_phase_bias_ns")
-        block["phase2_adjusted_phase_signed"] = frag.get("ocxo1_phase2_adjusted_phase_signed")
-        block["phase2_offset_ns"] = frag.get("ocxo1_phase2_phase_offset_ns")
-        block["phase2_raw_elapsed_ns"] = frag.get("ocxo1_phase2_raw_elapsed_ns")
-        block["phase2_edge_gnss_ns"] = frag.get("ocxo1_phase2_edge_gnss_ns")
-        block["phase2_dwt_before"] = frag.get("ocxo1_phase2_dwt_before")
-        block["phase2_dwt_after"] = frag.get("ocxo1_phase2_dwt_after")
-        block["phase2_gpt_before"] = frag.get("ocxo1_phase2_gpt_before")
-        block["phase2_gpt_after"] = frag.get("ocxo1_phase2_gpt_after")
-        block["phase2_dwt_bracket_cycles"] = frag.get("ocxo1_phase2_dwt_bracket_cycles")
-        block["phase2_dwt_correction_cycles"] = frag.get("ocxo1_phase2_dwt_correction_cycles")
-        block["phase2_dwt_at_edge"] = frag.get("ocxo1_phase2_dwt_at_edge")
-        block["phase_pair_delta_ns"] = frag.get("ocxo1_phase_pair_delta_ns")
-        block["adjusted_phase_pair_delta_ns"] = frag.get("ocxo1_adjusted_phase_pair_delta_ns")
-        block["phase_pair_valid"] = frag.get("phase_pair_valid")
+        block["phase_detector_valid"] = frag.get("phase_detector_valid")
     elif domain == "ocxo2":
         delta = frag.get("ocxo2_delta_raw")
         if delta is not None:
@@ -1033,35 +1025,27 @@ def _build_clock_block(
         block["residual_ns"] = frag.get("ocxo2_residual_ns")
         block["dac_before"] = frag.get("ocxo2_dac_before")
         block["dac_after"] = frag.get("ocxo2_dac_after")
-        block["raw_phase_offset_ns"] = frag.get("ocxo2_raw_phase_offset_ns")
-        block["phase_bias_ns"] = frag.get("ocxo2_phase_bias_ns")
-        block["adjusted_phase_signed"] = frag.get("ocxo2_adjusted_phase_signed")
-        block["phase_offset_ns"] = frag.get("ocxo2_phase_offset_ns")
-        block["raw_elapsed_ns"] = frag.get("ocxo2_raw_elapsed_ns")
+        block["match_found"] = frag.get("ocxo2_match_found")
+        block["candidates_examined"] = frag.get("ocxo2_candidates_examined")
+        block["match_iteration_count"] = frag.get("ocxo2_match_iteration_count")
+        block["match_delta_ns"] = frag.get("ocxo2_match_delta_ns")
+        block["match_prev_phase_offset_ns"] = frag.get("ocxo2_match_prev_phase_offset_ns")
+        block["match_prev_raw_elapsed_ns"] = frag.get("ocxo2_match_prev_raw_elapsed_ns")
+        block["match_prev_dwt_bracket_cycles"] = frag.get("ocxo2_match_prev_dwt_bracket_cycles")
+        block["match_prev_dwt_before"] = frag.get("ocxo2_match_prev_dwt_before")
+        block["match_prev_dwt_after"] = frag.get("ocxo2_match_prev_dwt_after")
+        block["match_prev_gpt_before"] = frag.get("ocxo2_match_prev_gpt_before")
+        block["match_prev_gpt_after"] = frag.get("ocxo2_match_prev_gpt_after")
+        block["winner_phase_offset_ns"] = frag.get("ocxo2_winner_phase_offset_ns")
+        block["winner_raw_elapsed_ns"] = frag.get("ocxo2_winner_raw_elapsed_ns")
+        block["winner_dwt_bracket_cycles"] = frag.get("ocxo2_winner_dwt_bracket_cycles")
+        block["winner_dwt_before"] = frag.get("ocxo2_winner_dwt_before")
+        block["winner_dwt_after"] = frag.get("ocxo2_winner_dwt_after")
+        block["winner_gpt_before"] = frag.get("ocxo2_winner_gpt_before")
+        block["winner_gpt_after"] = frag.get("ocxo2_winner_gpt_after")
+        block["winner_dwt_at_edge"] = frag.get("ocxo2_winner_dwt_at_edge")
         block["edge_gnss_ns"] = frag.get("ocxo2_edge_gnss_ns")
-        block["dwt_before"] = frag.get("ocxo2_dwt_before")
-        block["dwt_after"] = frag.get("ocxo2_dwt_after")
-        block["gpt_before"] = frag.get("ocxo2_gpt_before")
-        block["gpt_after"] = frag.get("ocxo2_gpt_after")
-        block["dwt_bracket_cycles"] = frag.get("ocxo2_dwt_bracket_cycles")
-        block["dwt_correction_cycles"] = frag.get("ocxo2_dwt_correction_cycles")
-        block["dwt_at_edge"] = frag.get("ocxo2_dwt_at_edge")
-        block["phase2_raw_phase_offset_ns"] = frag.get("ocxo2_phase2_raw_phase_offset_ns")
-        block["phase2_bias_ns"] = frag.get("ocxo2_phase2_phase_bias_ns")
-        block["phase2_adjusted_phase_signed"] = frag.get("ocxo2_phase2_adjusted_phase_signed")
-        block["phase2_offset_ns"] = frag.get("ocxo2_phase2_phase_offset_ns")
-        block["phase2_raw_elapsed_ns"] = frag.get("ocxo2_phase2_raw_elapsed_ns")
-        block["phase2_edge_gnss_ns"] = frag.get("ocxo2_phase2_edge_gnss_ns")
-        block["phase2_dwt_before"] = frag.get("ocxo2_phase2_dwt_before")
-        block["phase2_dwt_after"] = frag.get("ocxo2_phase2_dwt_after")
-        block["phase2_gpt_before"] = frag.get("ocxo2_phase2_gpt_before")
-        block["phase2_gpt_after"] = frag.get("ocxo2_phase2_gpt_after")
-        block["phase2_dwt_bracket_cycles"] = frag.get("ocxo2_phase2_dwt_bracket_cycles")
-        block["phase2_dwt_correction_cycles"] = frag.get("ocxo2_phase2_dwt_correction_cycles")
-        block["phase2_dwt_at_edge"] = frag.get("ocxo2_phase2_dwt_at_edge")
-        block["phase_pair_delta_ns"] = frag.get("ocxo2_phase_pair_delta_ns")
-        block["adjusted_phase_pair_delta_ns"] = frag.get("ocxo2_adjusted_phase_pair_delta_ns")
-        block["phase_pair_valid"] = frag.get("phase_pair_valid")
+        block["phase_detector_valid"] = frag.get("phase_detector_valid")
     elif domain == "gnss":
         block["ppb"] = 0.0
         block["pps_residual"] = frag.get("gnss_pps_residual")
@@ -1474,67 +1458,51 @@ def _process_loop() -> None:
             "spin_shadow_timed_out": frag.get("spin_shadow_timed_out"),
 
             # OCXO phase forensics (copied verbatim from TIMEBASE_FRAGMENT so they persist)
-            "ocxo1_raw_phase_offset_ns": frag.get("ocxo1_raw_phase_offset_ns"),
-            "ocxo1_phase_bias_ns": frag.get("ocxo1_phase_bias_ns"),
-            "ocxo1_adjusted_phase_signed": frag.get("ocxo1_adjusted_phase_signed"),
-            "ocxo1_phase_offset_ns": frag.get("ocxo1_phase_offset_ns"),
-            "ocxo1_raw_elapsed_ns": frag.get("ocxo1_raw_elapsed_ns"),
+            "phase_detector_valid": frag.get("phase_detector_valid"),
+            "phase_detector_limit": frag.get("phase_detector_limit"),
+            "phase_detector_timeout_cycles": frag.get("phase_detector_timeout_cycles"),
+
+            "ocxo1_match_found": frag.get("ocxo1_match_found"),
+            "ocxo1_candidates_examined": frag.get("ocxo1_candidates_examined"),
+            "ocxo1_match_iteration_count": frag.get("ocxo1_match_iteration_count"),
+            "ocxo1_match_delta_ns": frag.get("ocxo1_match_delta_ns"),
+            "ocxo1_match_prev_phase_offset_ns": frag.get("ocxo1_match_prev_phase_offset_ns"),
+            "ocxo1_match_prev_raw_elapsed_ns": frag.get("ocxo1_match_prev_raw_elapsed_ns"),
+            "ocxo1_match_prev_dwt_bracket_cycles": frag.get("ocxo1_match_prev_dwt_bracket_cycles"),
+            "ocxo1_match_prev_dwt_before": frag.get("ocxo1_match_prev_dwt_before"),
+            "ocxo1_match_prev_dwt_after": frag.get("ocxo1_match_prev_dwt_after"),
+            "ocxo1_match_prev_gpt_before": frag.get("ocxo1_match_prev_gpt_before"),
+            "ocxo1_match_prev_gpt_after": frag.get("ocxo1_match_prev_gpt_after"),
+            "ocxo1_winner_phase_offset_ns": frag.get("ocxo1_winner_phase_offset_ns"),
+            "ocxo1_winner_raw_elapsed_ns": frag.get("ocxo1_winner_raw_elapsed_ns"),
+            "ocxo1_winner_dwt_bracket_cycles": frag.get("ocxo1_winner_dwt_bracket_cycles"),
+            "ocxo1_winner_dwt_before": frag.get("ocxo1_winner_dwt_before"),
+            "ocxo1_winner_dwt_after": frag.get("ocxo1_winner_dwt_after"),
+            "ocxo1_winner_gpt_before": frag.get("ocxo1_winner_gpt_before"),
+            "ocxo1_winner_gpt_after": frag.get("ocxo1_winner_gpt_after"),
+            "ocxo1_winner_dwt_at_edge": frag.get("ocxo1_winner_dwt_at_edge"),
             "ocxo1_edge_gnss_ns": frag.get("ocxo1_edge_gnss_ns"),
-            "ocxo1_dwt_before": frag.get("ocxo1_dwt_before"),
-            "ocxo1_dwt_after": frag.get("ocxo1_dwt_after"),
-            "ocxo1_gpt_before": frag.get("ocxo1_gpt_before"),
-            "ocxo1_gpt_after": frag.get("ocxo1_gpt_after"),
-            "ocxo1_dwt_bracket_cycles": frag.get("ocxo1_dwt_bracket_cycles"),
-            "ocxo1_dwt_correction_cycles": frag.get("ocxo1_dwt_correction_cycles"),
-            "ocxo1_dwt_at_edge": frag.get("ocxo1_dwt_at_edge"),
 
-            "ocxo1_phase2_raw_phase_offset_ns": frag.get("ocxo1_phase2_raw_phase_offset_ns"),
-            "ocxo1_phase2_phase_bias_ns": frag.get("ocxo1_phase2_phase_bias_ns"),
-            "ocxo1_phase2_adjusted_phase_signed": frag.get("ocxo1_phase2_adjusted_phase_signed"),
-            "ocxo1_phase2_phase_offset_ns": frag.get("ocxo1_phase2_phase_offset_ns"),
-            "ocxo1_phase2_raw_elapsed_ns": frag.get("ocxo1_phase2_raw_elapsed_ns"),
-            "ocxo1_phase2_edge_gnss_ns": frag.get("ocxo1_phase2_edge_gnss_ns"),
-            "ocxo1_phase2_dwt_before": frag.get("ocxo1_phase2_dwt_before"),
-            "ocxo1_phase2_dwt_after": frag.get("ocxo1_phase2_dwt_after"),
-            "ocxo1_phase2_gpt_before": frag.get("ocxo1_phase2_gpt_before"),
-            "ocxo1_phase2_gpt_after": frag.get("ocxo1_phase2_gpt_after"),
-            "ocxo1_phase2_dwt_bracket_cycles": frag.get("ocxo1_phase2_dwt_bracket_cycles"),
-            "ocxo1_phase2_dwt_correction_cycles": frag.get("ocxo1_phase2_dwt_correction_cycles"),
-            "ocxo1_phase2_dwt_at_edge": frag.get("ocxo1_phase2_dwt_at_edge"),
-
-            "ocxo2_raw_phase_offset_ns": frag.get("ocxo2_raw_phase_offset_ns"),
-            "ocxo2_phase_bias_ns": frag.get("ocxo2_phase_bias_ns"),
-            "ocxo2_adjusted_phase_signed": frag.get("ocxo2_adjusted_phase_signed"),
-            "ocxo2_phase_offset_ns": frag.get("ocxo2_phase_offset_ns"),
-            "ocxo2_raw_elapsed_ns": frag.get("ocxo2_raw_elapsed_ns"),
+            "ocxo2_match_found": frag.get("ocxo2_match_found"),
+            "ocxo2_candidates_examined": frag.get("ocxo2_candidates_examined"),
+            "ocxo2_match_iteration_count": frag.get("ocxo2_match_iteration_count"),
+            "ocxo2_match_delta_ns": frag.get("ocxo2_match_delta_ns"),
+            "ocxo2_match_prev_phase_offset_ns": frag.get("ocxo2_match_prev_phase_offset_ns"),
+            "ocxo2_match_prev_raw_elapsed_ns": frag.get("ocxo2_match_prev_raw_elapsed_ns"),
+            "ocxo2_match_prev_dwt_bracket_cycles": frag.get("ocxo2_match_prev_dwt_bracket_cycles"),
+            "ocxo2_match_prev_dwt_before": frag.get("ocxo2_match_prev_dwt_before"),
+            "ocxo2_match_prev_dwt_after": frag.get("ocxo2_match_prev_dwt_after"),
+            "ocxo2_match_prev_gpt_before": frag.get("ocxo2_match_prev_gpt_before"),
+            "ocxo2_match_prev_gpt_after": frag.get("ocxo2_match_prev_gpt_after"),
+            "ocxo2_winner_phase_offset_ns": frag.get("ocxo2_winner_phase_offset_ns"),
+            "ocxo2_winner_raw_elapsed_ns": frag.get("ocxo2_winner_raw_elapsed_ns"),
+            "ocxo2_winner_dwt_bracket_cycles": frag.get("ocxo2_winner_dwt_bracket_cycles"),
+            "ocxo2_winner_dwt_before": frag.get("ocxo2_winner_dwt_before"),
+            "ocxo2_winner_dwt_after": frag.get("ocxo2_winner_dwt_after"),
+            "ocxo2_winner_gpt_before": frag.get("ocxo2_winner_gpt_before"),
+            "ocxo2_winner_gpt_after": frag.get("ocxo2_winner_gpt_after"),
+            "ocxo2_winner_dwt_at_edge": frag.get("ocxo2_winner_dwt_at_edge"),
             "ocxo2_edge_gnss_ns": frag.get("ocxo2_edge_gnss_ns"),
-            "ocxo2_dwt_before": frag.get("ocxo2_dwt_before"),
-            "ocxo2_dwt_after": frag.get("ocxo2_dwt_after"),
-            "ocxo2_gpt_before": frag.get("ocxo2_gpt_before"),
-            "ocxo2_gpt_after": frag.get("ocxo2_gpt_after"),
-            "ocxo2_dwt_bracket_cycles": frag.get("ocxo2_dwt_bracket_cycles"),
-            "ocxo2_dwt_correction_cycles": frag.get("ocxo2_dwt_correction_cycles"),
-            "ocxo2_dwt_at_edge": frag.get("ocxo2_dwt_at_edge"),
-
-            "ocxo2_phase2_raw_phase_offset_ns": frag.get("ocxo2_phase2_raw_phase_offset_ns"),
-            "ocxo2_phase2_phase_bias_ns": frag.get("ocxo2_phase2_phase_bias_ns"),
-            "ocxo2_phase2_adjusted_phase_signed": frag.get("ocxo2_phase2_adjusted_phase_signed"),
-            "ocxo2_phase2_phase_offset_ns": frag.get("ocxo2_phase2_phase_offset_ns"),
-            "ocxo2_phase2_raw_elapsed_ns": frag.get("ocxo2_phase2_raw_elapsed_ns"),
-            "ocxo2_phase2_edge_gnss_ns": frag.get("ocxo2_phase2_edge_gnss_ns"),
-            "ocxo2_phase2_dwt_before": frag.get("ocxo2_phase2_dwt_before"),
-            "ocxo2_phase2_dwt_after": frag.get("ocxo2_phase2_dwt_after"),
-            "ocxo2_phase2_gpt_before": frag.get("ocxo2_phase2_gpt_before"),
-            "ocxo2_phase2_gpt_after": frag.get("ocxo2_phase2_gpt_after"),
-            "ocxo2_phase2_dwt_bracket_cycles": frag.get("ocxo2_phase2_dwt_bracket_cycles"),
-            "ocxo2_phase2_dwt_correction_cycles": frag.get("ocxo2_phase2_dwt_correction_cycles"),
-            "ocxo2_phase2_dwt_at_edge": frag.get("ocxo2_phase2_dwt_at_edge"),
-
-            "ocxo1_phase_pair_delta_ns": frag.get("ocxo1_phase_pair_delta_ns"),
-            "ocxo1_adjusted_phase_pair_delta_ns": frag.get("ocxo1_adjusted_phase_pair_delta_ns"),
-            "ocxo2_phase_pair_delta_ns": frag.get("ocxo2_phase_pair_delta_ns"),
-            "ocxo2_adjusted_phase_pair_delta_ns": frag.get("ocxo2_adjusted_phase_pair_delta_ns"),
-            "phase_pair_valid": frag.get("phase_pair_valid"),
 
             # Environment snapshot (correlated with this PPS edge)
             "environment": env_snapshot,

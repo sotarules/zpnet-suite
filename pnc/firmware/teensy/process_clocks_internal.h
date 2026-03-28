@@ -49,78 +49,12 @@ static inline uint64_t dwt_cycles_to_ns(uint64_t cycles) {
   return (cycles * DWT_NS_NUM) / DWT_NS_DEN;
 }
 
-static inline uint64_t dwt_ns_to_cycles(uint64_t ns) {
+static inline uint64_t dwt_ns_to_cycles(uint64_t ns)
+{
   return (ns * DWT_NS_DEN) / DWT_NS_NUM;
 }
 
-
-// ============================================================================
-// OCXO phase bias maps (empirical, topology-driven)
-//
-// These literals intentionally live in the internal header so bracket/bias
-// tuning is centralized and visible.  Alpha uses these maps to translate a
-// raw bracket width (in DWT cycles) into a phase-domain bias (in ns).
-//
-// Design notes:
-//   - Classification stays in cycles because bracket topology is a DWT-loop
-//     phenomenon.
-//   - Bias is expressed in nanoseconds because phase math lives in GNSS ns.
-//   - Unknown bracket classes intentionally fall back to 0 ns so analyzer
-//     tooling can surface new modes without hiding them.
-//   - Arrays are used instead of switch statements so additional cases can be
-//     added without changing lookup structure.
-// ============================================================================
-
-struct phase_bias_rule_t {
-  uint32_t bracket_cycles;
-  int32_t  phase_bias_ns;
-};
-
-// Separate phase-local bias maps are intentional. Phase #1 and phase #2 are
-// observed under different loop geometry, so each phase gets its own bracket→bias
-// table. Arrays are open-ended: add more {cycles,bias_ns} pairs as new stable
-// modes emerge.
-static constexpr phase_bias_rule_t OCXO_PHASE1_BIAS_MAP[] = {
-  {274u,  0},
-  {278u, -4},
-};
-
-static constexpr phase_bias_rule_t OCXO_PHASE2_BIAS_MAP[] = {
-  {243u,  0},
-  {255u,  0},
-  {282u,  0},
-};
-
-static constexpr size_t OCXO_PHASE1_BIAS_MAP_COUNT =
-    sizeof(OCXO_PHASE1_BIAS_MAP) / sizeof(OCXO_PHASE1_BIAS_MAP[0]);
-static constexpr size_t OCXO_PHASE2_BIAS_MAP_COUNT =
-    sizeof(OCXO_PHASE2_BIAS_MAP) / sizeof(OCXO_PHASE2_BIAS_MAP[0]);
-
-static inline int32_t phase_bias_ns_lookup(const phase_bias_rule_t* rules,
-                                           size_t rule_count,
-                                           uint32_t bracket_cycles) {
-  for (size_t i = 0; i < rule_count; ++i) {
-    if (rules[i].bracket_cycles == bracket_cycles) {
-      return rules[i].phase_bias_ns;
-    }
-  }
-  return 0;
-}
-
-static inline int32_t phase_bias_from_bracket_cycles(uint8_t phase_ordinal,
-                                                     uint32_t bracket_cycles) {
-  if (phase_ordinal == 1u) {
-    return phase_bias_ns_lookup(OCXO_PHASE1_BIAS_MAP,
-                                OCXO_PHASE1_BIAS_MAP_COUNT,
-                                bracket_cycles);
-  }
-  if (phase_ordinal == 2u) {
-    return phase_bias_ns_lookup(OCXO_PHASE2_BIAS_MAP,
-                                OCXO_PHASE2_BIAS_MAP_COUNT,
-                                bracket_cycles);
-  }
-  return 0;
-}
+static constexpr uint32_t OCXO_PHASE_CAPTURE_TIMEOUT_CYCLES = 16384;  // ~16.3 µs at 1008 MHz
 
 // ============================================================================
 // Continuous DWT-to-GNSS Calibration (alpha-owned, beta-readable)
@@ -209,6 +143,19 @@ extern volatile uint32_t diag_qread_last_lo2;
 // ============================================================================
 
 extern volatile bool pps_fired;
+
+// ============================================================================
+// Phase detector diagnostics (alpha-owned, beta-readable)
+// ============================================================================
+
+extern volatile uint32_t diag_phase_ocxo1_successes;
+extern volatile uint32_t diag_phase_ocxo2_successes;
+extern volatile uint32_t diag_phase_ocxo1_failures;
+extern volatile uint32_t diag_phase_ocxo2_failures;
+extern volatile uint32_t diag_phase_ocxo1_last_iterations;
+extern volatile uint32_t diag_phase_ocxo2_last_iterations;
+extern volatile uint32_t diag_phase_ocxo1_high_water_iterations;
+extern volatile uint32_t diag_phase_ocxo2_high_water_iterations;
 
 // ============================================================================
 // OCXO DAC state — dual oscillator
@@ -406,115 +353,131 @@ struct spin_capture_t {
 extern spin_capture_t pps_spin;
 
 // ============================================================================
-// OCXO Phase Capture — raw first, adjusted second
+// Phase detector configuration
+// ============================================================================
+
+static constexpr uint32_t OCXO_PHASE_DETECTOR_LIMIT = 20;
+
+
+// ============================================================================
+// OCXO phase capture — generalized <n> detector with forensic stream capture
 //
-// Each PPS defines a canonical GNSS anchor. For each OCXO, alpha captures the
-// first two post-PPS 10 MHz edges and publishes a forensic record for both:
+// Model:
+//   - Alpha harvests up to OCXO_PHASE_DETECTOR_LIMIT candidates per OCXO
+//   - Each candidate is a phase-offset observation derived from the same loop
+//   - The detector accepts the first exact consecutive match
+//   - Winner + matching predecessor are surfaced as summary telemetry
+//   - Full candidate streams are retained for forensic inspection
 //
-//   1. Raw observables
-//      - dwt_before / dwt_after bracket in DWT cycles
-//      - raw_elapsed_ns = ns from PPS anchor to raw delimiter (dwt_before)
-//      - raw_phase_offset_ns = raw_elapsed_ns mod 100
-//
-//   2. Adjusted observables
-//      - phase_bias_ns = empirically derived bracket-topology bias
-//      - adjusted_phase_signed_ns = raw_phase_offset_ns + phase_bias_ns
-//      - phase_offset_ns = wrapped adjusted phase in [0, 99]
-//
-// The field names dwt_correction_cycles and dwt_at_edge are retained for
-// compatibility with existing telemetry/readout code. In the current model:
-//
-//   dwt_correction_cycles = legacy / forensic only
-//   dwt_at_edge           = canonical raw delimiter (currently dwt_before)
-//
-// Downstream residual math should treat phase_offset_ns as the authoritative
-// per-second adjusted phase for servo/control use, while preserving the raw
-// fields for forensics and analyzer work.
+// Notes:
+//   - This struct intentionally retires the old phase1/phase2 naming scheme
+//   - The candidate arrays are diagnostic only; they do not imply authority
+//   - Canonical edge/residual fields are only meaningful when detector_valid=true
 // ============================================================================
 
 struct ocxo_phase_capture_t {
   // ── PPS anchor ──
-  uint32_t dwt_at_pps;               // DWT at PPS edge (ISR-compensated)
-  uint64_t pps_gnss_ns;              // absolute GNSS ns at this PPS (beta-owned)
+  uint32_t dwt_at_pps;                    // DWT at PPS edge (ISR-compensated)
+  uint64_t pps_gnss_ns;                   // absolute GNSS ns at this PPS (beta-owned)
 
-  // ── OCXO1 phase #1 (first observed post-PPS edge) ──
-  uint32_t ocxo1_dwt_before;
-  uint32_t ocxo1_dwt_after;
-  uint32_t ocxo1_gpt_before;
-  uint32_t ocxo1_gpt_after;
-  uint32_t ocxo1_dwt_bracket_cycles;
-  uint32_t ocxo1_dwt_correction_cycles;      // legacy / forensic only
-  uint32_t ocxo1_dwt_at_edge;                // canonical raw delimiter (currently dwt_before)
-  uint32_t ocxo1_dwt_elapsed;                // legacy mirror of raw delimiter elapsed cycles
-  uint32_t ocxo1_raw_elapsed_ns;
-  uint32_t ocxo1_raw_phase_offset_ns;
-  int32_t  ocxo1_phase_bias_ns;
-  int32_t  ocxo1_adjusted_phase_signed_ns;
-  uint32_t ocxo1_phase_offset_ns;            // wrapped adjusted phase offset [0,99]
-  uint64_t ocxo1_edge_gnss_ns;               // pps_gnss_ns + adjusted phase offset
+  // ── Detector configuration snapshot ──
+  uint32_t detector_limit;                // usually OCXO_PHASE_DETECTOR_LIMIT
+  uint32_t detector_timeout_cycles;       // capture timeout budget used this PPS
 
-  // ── OCXO1 phase #2 (second observed edge, one more 10 MHz window later) ──
-  uint32_t ocxo1_phase2_dwt_before;
-  uint32_t ocxo1_phase2_dwt_after;
-  uint32_t ocxo1_phase2_gpt_before;
-  uint32_t ocxo1_phase2_gpt_after;
-  uint32_t ocxo1_phase2_dwt_bracket_cycles;
-  uint32_t ocxo1_phase2_dwt_correction_cycles;   // legacy / forensic only
-  uint32_t ocxo1_phase2_dwt_at_edge;             // canonical raw delimiter (currently dwt_before)
-  uint32_t ocxo1_phase2_dwt_elapsed;             // legacy mirror of raw delimiter elapsed cycles
-  uint32_t ocxo1_phase2_raw_elapsed_ns;
-  uint32_t ocxo1_phase2_raw_phase_offset_ns;
-  int32_t  ocxo1_phase2_phase_bias_ns;
-  int32_t  ocxo1_phase2_adjusted_phase_signed_ns;
-  uint32_t ocxo1_phase2_phase_offset_ns;         // wrapped adjusted phase offset [0,99]
-  uint64_t ocxo1_phase2_edge_gnss_ns;
-  int32_t  ocxo1_phase_pair_delta_ns;            // raw wrapped delta: phase2_raw - phase1_raw
-  int32_t  ocxo1_adjusted_phase_pair_delta_ns;   // adjusted wrapped delta: phase2_adj - phase1_adj
+  // ── Detector validity / lifecycle ──
+  bool     detector_valid;                // true when both OCXOs found an exact consecutive match
+  bool     valid;                         // canonical row validity
+  uint32_t captures;                      // successful detector captures
 
-  // ── OCXO2 phase #1 ──
-  uint32_t ocxo2_dwt_before;
-  uint32_t ocxo2_dwt_after;
-  uint32_t ocxo2_gpt_before;
-  uint32_t ocxo2_gpt_after;
-  uint32_t ocxo2_dwt_bracket_cycles;
-  uint32_t ocxo2_dwt_correction_cycles;      // legacy / forensic only
-  uint32_t ocxo2_dwt_at_edge;                // canonical raw delimiter (currently dwt_before)
-  uint32_t ocxo2_dwt_elapsed;                // legacy mirror of raw delimiter elapsed cycles
-  uint32_t ocxo2_raw_elapsed_ns;
-  uint32_t ocxo2_raw_phase_offset_ns;
-  int32_t  ocxo2_phase_bias_ns;
-  int32_t  ocxo2_adjusted_phase_signed_ns;
-  uint32_t ocxo2_phase_offset_ns;            // wrapped adjusted phase offset [0,99]
-  uint64_t ocxo2_edge_gnss_ns;               // pps_gnss_ns + adjusted phase offset
+  // ── OCXO1 detector summary ──
+  uint32_t ocxo1_candidates_examined;
+  bool     ocxo1_match_found;
+  uint32_t ocxo1_match_iteration_count;   // 1-based iteration where match completed
+  int32_t  ocxo1_match_delta_ns;          // winner - previous candidate (or last delta on failure)
 
-  // ── OCXO2 phase #2 ──
-  uint32_t ocxo2_phase2_dwt_before;
-  uint32_t ocxo2_phase2_dwt_after;
-  uint32_t ocxo2_phase2_gpt_before;
-  uint32_t ocxo2_phase2_gpt_after;
-  uint32_t ocxo2_phase2_dwt_bracket_cycles;
-  uint32_t ocxo2_phase2_dwt_correction_cycles;   // legacy / forensic only
-  uint32_t ocxo2_phase2_dwt_at_edge;             // canonical raw delimiter (currently dwt_before)
-  uint32_t ocxo2_phase2_dwt_elapsed;             // legacy mirror of raw delimiter elapsed cycles
-  uint32_t ocxo2_phase2_raw_elapsed_ns;
-  uint32_t ocxo2_phase2_raw_phase_offset_ns;
-  int32_t  ocxo2_phase2_phase_bias_ns;
-  int32_t  ocxo2_phase2_adjusted_phase_signed_ns;
-  uint32_t ocxo2_phase2_phase_offset_ns;         // wrapped adjusted phase offset [0,99]
-  uint64_t ocxo2_phase2_edge_gnss_ns;
-  int32_t  ocxo2_phase_pair_delta_ns;            // raw wrapped delta: phase2_raw - phase1_raw
-  int32_t  ocxo2_adjusted_phase_pair_delta_ns;   // adjusted wrapped delta: phase2_adj - phase1_adj
+  // previous candidate in the matching pair / last compared pair
+  uint32_t ocxo1_match_prev_dwt_before;
+  uint32_t ocxo1_match_prev_dwt_after;
+  uint32_t ocxo1_match_prev_gpt_before;
+  uint32_t ocxo1_match_prev_gpt_after;
+  uint32_t ocxo1_match_prev_dwt_bracket_cycles;
+  uint32_t ocxo1_match_prev_dwt_at_edge;
+  uint32_t ocxo1_match_prev_dwt_elapsed;
+  uint32_t ocxo1_match_prev_raw_elapsed_ns;
+  uint32_t ocxo1_match_prev_phase_offset_ns;
 
-  // ── Two-phase validation ──
-  bool     phase_pair_valid;         // true when phase #1 / phase #2 comparison is valid
+  // winning candidate
+  uint32_t ocxo1_winner_dwt_before;
+  uint32_t ocxo1_winner_dwt_after;
+  uint32_t ocxo1_winner_gpt_before;
+  uint32_t ocxo1_winner_gpt_after;
+  uint32_t ocxo1_winner_dwt_bracket_cycles;
+  uint32_t ocxo1_winner_dwt_at_edge;
+  uint32_t ocxo1_winner_dwt_elapsed;
+  uint32_t ocxo1_winner_raw_elapsed_ns;
+  uint32_t ocxo1_winner_phase_offset_ns;
 
-  // ── Per-second differencing (legacy downstream path; still published) ──
+  // ── OCXO2 detector summary ──
+  uint32_t ocxo2_candidates_examined;
+  bool     ocxo2_match_found;
+  uint32_t ocxo2_match_iteration_count;
+  int32_t  ocxo2_match_delta_ns;
+
+  uint32_t ocxo2_match_prev_dwt_before;
+  uint32_t ocxo2_match_prev_dwt_after;
+  uint32_t ocxo2_match_prev_gpt_before;
+  uint32_t ocxo2_match_prev_gpt_after;
+  uint32_t ocxo2_match_prev_dwt_bracket_cycles;
+  uint32_t ocxo2_match_prev_dwt_at_edge;
+  uint32_t ocxo2_match_prev_dwt_elapsed;
+  uint32_t ocxo2_match_prev_raw_elapsed_ns;
+  uint32_t ocxo2_match_prev_phase_offset_ns;
+
+  uint32_t ocxo2_winner_dwt_before;
+  uint32_t ocxo2_winner_dwt_after;
+  uint32_t ocxo2_winner_gpt_before;
+  uint32_t ocxo2_winner_gpt_after;
+  uint32_t ocxo2_winner_dwt_bracket_cycles;
+  uint32_t ocxo2_winner_dwt_at_edge;
+  uint32_t ocxo2_winner_dwt_elapsed;
+  uint32_t ocxo2_winner_raw_elapsed_ns;
+  uint32_t ocxo2_winner_phase_offset_ns;
+
+  // ── Full candidate-stream forensics (direct members; alpha currently expects these) ──
+  uint32_t ocxo1_candidate_phase_offset_ns[OCXO_PHASE_DETECTOR_LIMIT];
+  uint32_t ocxo1_candidate_raw_elapsed_ns[OCXO_PHASE_DETECTOR_LIMIT];
+  uint32_t ocxo1_candidate_dwt_bracket_cycles[OCXO_PHASE_DETECTOR_LIMIT];
+  uint32_t ocxo1_candidate_dwt_before[OCXO_PHASE_DETECTOR_LIMIT];
+  uint32_t ocxo1_candidate_dwt_after[OCXO_PHASE_DETECTOR_LIMIT];
+  uint32_t ocxo1_candidate_dwt_at_edge[OCXO_PHASE_DETECTOR_LIMIT];
+  uint32_t ocxo1_candidate_dwt_elapsed[OCXO_PHASE_DETECTOR_LIMIT];
+  uint32_t ocxo1_candidate_gpt_before[OCXO_PHASE_DETECTOR_LIMIT];
+  uint32_t ocxo1_candidate_gpt_after[OCXO_PHASE_DETECTOR_LIMIT];
+
+  uint32_t ocxo2_candidate_phase_offset_ns[OCXO_PHASE_DETECTOR_LIMIT];
+  uint32_t ocxo2_candidate_raw_elapsed_ns[OCXO_PHASE_DETECTOR_LIMIT];
+  uint32_t ocxo2_candidate_dwt_bracket_cycles[OCXO_PHASE_DETECTOR_LIMIT];
+  uint32_t ocxo2_candidate_dwt_before[OCXO_PHASE_DETECTOR_LIMIT];
+  uint32_t ocxo2_candidate_dwt_after[OCXO_PHASE_DETECTOR_LIMIT];
+  uint32_t ocxo2_candidate_dwt_at_edge[OCXO_PHASE_DETECTOR_LIMIT];
+  uint32_t ocxo2_candidate_dwt_elapsed[OCXO_PHASE_DETECTOR_LIMIT];
+  uint32_t ocxo2_candidate_gpt_before[OCXO_PHASE_DETECTOR_LIMIT];
+  uint32_t ocxo2_candidate_gpt_after[OCXO_PHASE_DETECTOR_LIMIT];
+
+  // ── Canonical absolute edge timestamps (winner projected into GNSS time) ──
+  uint64_t ocxo1_edge_gnss_ns;
+  uint64_t ocxo2_edge_gnss_ns;
+
+  // ── Per-second differencing ──
   uint64_t prev_ocxo1_edge_gnss_ns;
   uint64_t prev_ocxo2_edge_gnss_ns;
+
   int64_t  ocxo1_gnss_ns_per_pps;
   int64_t  ocxo2_gnss_ns_per_pps;
+
   int64_t  ocxo1_residual_ns;
   int64_t  ocxo2_residual_ns;
+
   bool     residual_valid;
 
   // ── Servo before/after snapshot (written by beta after servo runs) ──
@@ -522,10 +485,6 @@ struct ocxo_phase_capture_t {
   uint16_t ocxo1_dac_after;
   uint16_t ocxo2_dac_before;
   uint16_t ocxo2_dac_after;
-
-  // ── Lifecycle ──
-  bool     valid;
-  uint32_t captures;
 };
 
 extern ocxo_phase_capture_t ocxo_phase;

@@ -505,10 +505,6 @@ void clocks_watchdog_anomaly(const char* reason,
 void clocks_beta_pps(void) {
 
   // ── Command requests override anomaly latch ──
-  // START/STOP/RECOVER are authoritative Pi-side directives.
-  // They must be processed even if watchdog_anomaly_active was
-  // re-latched by the ISR between the command handler clearing
-  // it and this callback firing.
   if (request_stop) {
     watchdog_anomaly_active = false;
     campaign_state = clocks_campaign_state_t::STOPPED;
@@ -587,278 +583,335 @@ void clocks_beta_pps(void) {
     return;
   }
 
-  if (campaign_state == clocks_campaign_state_t::STARTED) {
+  if (campaign_state != clocks_campaign_state_t::STARTED) {
+    return;
+  }
 
-    if (!isr_residual_valid) {
-      isr_residual_valid = true;
-    }
+  if (!isr_residual_valid) {
+    isr_residual_valid = true;
+  }
 
-    pps_fired = false;
+  pps_fired = false;
 
-    // ── DWT ──
-    // TDC-corrected when spin capture succeeded; ISR-compensated fallback otherwise.
-    uint32_t dwt_raw_at_pps =
-      (pps_spin.valid && pps_spin.tdc_correction >= 0)
-        ? pps_spin.corrected_dwt
-        : (isr_snap_dwt - ISR_ENTRY_DWT_CYCLES);
-    uint32_t dwt_delta = dwt_raw_at_pps - prev_dwt_at_pps;
+  // ── DWT ──
+  uint32_t dwt_raw_at_pps =
+    (pps_spin.valid && pps_spin.tdc_correction >= 0)
+      ? pps_spin.corrected_dwt
+      : (isr_snap_dwt - ISR_ENTRY_DWT_CYCLES);
+  uint32_t dwt_delta = dwt_raw_at_pps - prev_dwt_at_pps;
 
-    dwt_cycles_64   += dwt_delta;
-    prev_dwt_at_pps  = dwt_raw_at_pps;
+  dwt_cycles_64    += dwt_delta;
+  prev_dwt_at_pps   = dwt_raw_at_pps;
 
-    const uint64_t pps_dwt_cycles = dwt_cycles_64;
-    const uint64_t pps_dwt_ns     = dwt_cycles_to_ns(pps_dwt_cycles);
+  const uint64_t pps_dwt_cycles = dwt_cycles_64;
+  const uint64_t pps_dwt_ns     = dwt_cycles_to_ns(pps_dwt_cycles);
 
-    // ── OCXO1: GPT1, single-edge, 32-bit delta ──
-    uint32_t ocxo1_delta = isr_snap_ocxo1 - prev_ocxo1_at_pps;
-    ocxo1_ticks_64    += ocxo1_delta;
-    prev_ocxo1_at_pps  = isr_snap_ocxo1;
+  // ── OCXO1 ──
+  uint32_t ocxo1_delta = isr_snap_ocxo1 - prev_ocxo1_at_pps;
+  ocxo1_ticks_64    += ocxo1_delta;
+  prev_ocxo1_at_pps  = isr_snap_ocxo1;
 
-    const uint64_t pps_ocxo1_ticks = ocxo1_ticks_64;
-    const uint64_t pps_ocxo1_ns    = pps_ocxo1_ticks * 100ull;
+  const uint64_t pps_ocxo1_ticks = ocxo1_ticks_64;
+  const uint64_t pps_ocxo1_ns    = pps_ocxo1_ticks * 100ull;
 
-    // ── OCXO2: GPT2, single-edge, 32-bit delta ──
-    uint32_t ocxo2_delta = isr_snap_ocxo2 - prev_ocxo2_at_pps;
-    ocxo2_ticks_64    += ocxo2_delta;
-    prev_ocxo2_at_pps  = isr_snap_ocxo2;
+  // ── OCXO2 ──
+  uint32_t ocxo2_delta = isr_snap_ocxo2 - prev_ocxo2_at_pps;
+  ocxo2_ticks_64    += ocxo2_delta;
+  prev_ocxo2_at_pps  = isr_snap_ocxo2;
 
-    const uint64_t pps_ocxo2_ticks = ocxo2_ticks_64;
-    const uint64_t pps_ocxo2_ns    = pps_ocxo2_ticks * 100ull;
+  const uint64_t pps_ocxo2_ticks = ocxo2_ticks_64;
+  const uint64_t pps_ocxo2_ns    = pps_ocxo2_ticks * 100ull;
 
-    // GNSS: QTimer1, single-edge 10 MHz, 32-bit delt
-    uint32_t gnss_raw_delta = isr_snap_gnss - prev_gnss_at_pps;
-    gnss_raw_64      += gnss_raw_delta;
-    prev_gnss_at_pps  = isr_snap_gnss;
+  // ── GNSS ──
+  uint32_t gnss_raw_delta = isr_snap_gnss - prev_gnss_at_pps;
+  gnss_raw_64      += gnss_raw_delta;
+  prev_gnss_at_pps  = isr_snap_gnss;
 
-    campaign_seconds++;
+  campaign_seconds++;
 
-    const uint64_t pps_gnss_ns    = campaign_seconds * NS_PER_SECOND;
-    const uint64_t pps_gnss_ticks = campaign_seconds * (uint64_t)TICKS_10MHZ_PER_SECOND;
+  const uint64_t pps_gnss_ns    = campaign_seconds * NS_PER_SECOND;
+  const uint64_t pps_gnss_ticks = campaign_seconds * (uint64_t)TICKS_10MHZ_PER_SECOND;
 
-    const uint32_t dwt_cycles_per_pps_snapshot =
-      pred_dwt.predicted_valid ? pred_dwt.predicted :
-      (g_dwt_cal_valid ? g_dwt_cycles_per_gnss_s : DWT_EXPECTED_PER_PPS);
+  const uint32_t dwt_cycles_per_pps_snapshot =
+    pred_dwt.predicted_valid ? pred_dwt.predicted :
+    (g_dwt_cal_valid ? g_dwt_cycles_per_gnss_s : DWT_EXPECTED_PER_PPS);
 
-    // ── Residual updates ──
-    residual_update(residual_dwt,   pps_dwt_cycles,   DWT_EXPECTED_PER_PPS_I);
-    residual_update(residual_gnss,  pps_gnss_ticks,   GNSS_EXPECTED_PER_PPS);
-    residual_update(residual_ocxo1, pps_ocxo1_ticks,  OCXO_EXPECTED_PER_PPS);
-    residual_update(residual_ocxo2, pps_ocxo2_ticks,  OCXO_EXPECTED_PER_PPS);
+  // ── Residual updates ──
+  residual_update(residual_dwt,   pps_dwt_cycles,   DWT_EXPECTED_PER_PPS_I);
+  residual_update(residual_gnss,  pps_gnss_ticks,   GNSS_EXPECTED_PER_PPS);
+  residual_update(residual_ocxo1, pps_ocxo1_ticks,  OCXO_EXPECTED_PER_PPS);
+  residual_update(residual_ocxo2, pps_ocxo2_ticks,  OCXO_EXPECTED_PER_PPS);
 
-    // ── Prediction tracking ──
-    prediction_update(pred_dwt,   dwt_delta);
-    prediction_update(pred_ocxo1, ocxo1_delta);
-    prediction_update(pred_ocxo2, ocxo2_delta);
+  // ── Prediction tracking ──
+  prediction_update(pred_dwt,   dwt_delta);
+  prediction_update(pred_ocxo1, ocxo1_delta);
+  prediction_update(pred_ocxo2, ocxo2_delta);
 
-    // Snapshot DAC state before servo (for telemetry)
-    const uint16_t dac1_before = ocxo1_dac.dac_hw_code;
-    const uint16_t dac2_before = ocxo2_dac.dac_hw_code;
+  // Snapshot DAC state before servo
+  const uint16_t dac1_before = ocxo1_dac.dac_hw_code;
+  const uint16_t dac2_before = ocxo2_dac.dac_hw_code;
 
-    // ── Absolute GNSS timestamps for canonical first post-PPS OCXO edges ──
-    ocxo_phase.pps_gnss_ns = pps_gnss_ns;
+  // ── Absolute GNSS timestamps for canonical winning OCXO edges ──
+  ocxo_phase.pps_gnss_ns = pps_gnss_ns;
 
-    ocxo_phase.ocxo1_edge_gnss_ns = pps_gnss_ns + (uint64_t)ocxo_phase.ocxo1_phase_offset_ns;
-    ocxo_phase.ocxo2_edge_gnss_ns = pps_gnss_ns + (uint64_t)ocxo_phase.ocxo2_phase_offset_ns;
-    ocxo_phase.ocxo1_phase2_edge_gnss_ns = pps_gnss_ns + (uint64_t)ocxo_phase.ocxo1_phase2_phase_offset_ns;
-    ocxo_phase.ocxo2_phase2_edge_gnss_ns = pps_gnss_ns + (uint64_t)ocxo_phase.ocxo2_phase2_phase_offset_ns;
+  if (ocxo_phase.detector_valid) {
+    ocxo_phase.ocxo1_edge_gnss_ns = pps_gnss_ns + (uint64_t)ocxo_phase.ocxo1_winner_phase_offset_ns;
+    ocxo_phase.ocxo2_edge_gnss_ns = pps_gnss_ns + (uint64_t)ocxo_phase.ocxo2_winner_phase_offset_ns;
+  } else {
+    ocxo_phase.ocxo1_edge_gnss_ns = 0;
+    ocxo_phase.ocxo2_edge_gnss_ns = 0;
+  }
 
-    if (ocxo_phase.captures >= 2 && ocxo_phase.prev_ocxo1_edge_gnss_ns != 0 && ocxo_phase.prev_ocxo2_edge_gnss_ns != 0) {
-      const int64_t ocxo1_gnss_ns_per_pps =
-        (int64_t)(ocxo_phase.ocxo1_edge_gnss_ns - ocxo_phase.prev_ocxo1_edge_gnss_ns);
-      const int64_t ocxo2_gnss_ns_per_pps =
-        (int64_t)(ocxo_phase.ocxo2_edge_gnss_ns - ocxo_phase.prev_ocxo2_edge_gnss_ns);
+  if (ocxo_phase.detector_valid &&
+      ocxo_phase.prev_ocxo1_edge_gnss_ns != 0 &&
+      ocxo_phase.prev_ocxo2_edge_gnss_ns != 0) {
+    const int64_t ocxo1_gnss_ns_per_pps =
+      (int64_t)(ocxo_phase.ocxo1_edge_gnss_ns - ocxo_phase.prev_ocxo1_edge_gnss_ns);
+    const int64_t ocxo2_gnss_ns_per_pps =
+      (int64_t)(ocxo_phase.ocxo2_edge_gnss_ns - ocxo_phase.prev_ocxo2_edge_gnss_ns);
 
-      ocxo_phase.ocxo1_gnss_ns_per_pps = ocxo1_gnss_ns_per_pps;
-      ocxo_phase.ocxo2_gnss_ns_per_pps = ocxo2_gnss_ns_per_pps;
-      ocxo_phase.ocxo1_residual_ns = ocxo1_gnss_ns_per_pps - (int64_t)NS_PER_SECOND;
-      ocxo_phase.ocxo2_residual_ns = ocxo2_gnss_ns_per_pps - (int64_t)NS_PER_SECOND;
-      ocxo_phase.residual_valid = true;
-    } else {
-      ocxo_phase.ocxo1_gnss_ns_per_pps = 0;
-      ocxo_phase.ocxo2_gnss_ns_per_pps = 0;
-      ocxo_phase.ocxo1_residual_ns = 0;
-      ocxo_phase.ocxo2_residual_ns = 0;
-      ocxo_phase.residual_valid = false;
-    }
+    ocxo_phase.ocxo1_gnss_ns_per_pps = ocxo1_gnss_ns_per_pps;
+    ocxo_phase.ocxo2_gnss_ns_per_pps = ocxo2_gnss_ns_per_pps;
+    ocxo_phase.ocxo1_residual_ns = ocxo1_gnss_ns_per_pps - (int64_t)NS_PER_SECOND;
+    ocxo_phase.ocxo2_residual_ns = ocxo2_gnss_ns_per_pps - (int64_t)NS_PER_SECOND;
+    ocxo_phase.residual_valid = true;
+  } else {
+    ocxo_phase.ocxo1_gnss_ns_per_pps = 0;
+    ocxo_phase.ocxo2_gnss_ns_per_pps = 0;
+    ocxo_phase.ocxo1_residual_ns = 0;
+    ocxo_phase.ocxo2_residual_ns = 0;
+    ocxo_phase.residual_valid = false;
+  }
 
+  if (ocxo_phase.detector_valid) {
     ocxo_phase.prev_ocxo1_edge_gnss_ns = ocxo_phase.ocxo1_edge_gnss_ns;
     ocxo_phase.prev_ocxo2_edge_gnss_ns = ocxo_phase.ocxo2_edge_gnss_ns;
-
-    ocxo_calibration_servo();
-
-    // Snapshot DAC state after servo (for telemetry)
-    ocxo_phase.ocxo1_dac_before = dac1_before;
-    ocxo_phase.ocxo1_dac_after  = ocxo1_dac.dac_hw_code;
-    ocxo_phase.ocxo2_dac_before = dac2_before;
-    ocxo_phase.ocxo2_dac_after  = ocxo2_dac.dac_hw_code;
-
-    // ── DAC Welford update (TEMPEST DAC test) ──
-    dac_welford_update(dac_welford_ocxo1, ocxo1_dac.dac_fractional);
-    dac_welford_update(dac_welford_ocxo2, ocxo2_dac.dac_fractional);
-
-    // ── Build and publish TIMEBASE_FRAGMENT ──
-    Payload p;
-    p.add("campaign",         campaign_name);
-
-    p.add("dwt_cycles",       pps_dwt_cycles);
-    p.add("dwt_ns",           pps_dwt_ns);
-    p.add("gnss_ns",          pps_gnss_ns);
-    p.add("ocxo1_ns",         pps_ocxo1_ns);
-    p.add("ocxo2_ns",         pps_ocxo2_ns);
-    p.add("teensy_pps_count", campaign_seconds);
-    p.add("gnss_lock",        digitalRead(GNSS_LOCK_PIN));
-    p.add("dwt_cyccnt_at_pps", (uint32_t)dwt_raw_at_pps);
-    p.add("qtimer_at_pps",    (uint32_t)isr_snap_gnss);
-
-    p.add("dwt_cycles_per_pps", (uint64_t)dwt_cycles_per_pps_snapshot);
-
-    p.add("dwt_delta_raw",    (uint64_t)dwt_delta);
-    p.add("ocxo1_delta_raw",  (uint64_t)ocxo1_delta);
-    p.add("ocxo2_delta_raw",  (uint64_t)ocxo2_delta);
-    p.add("gnss_raw_delta",   (uint64_t)gnss_raw_delta);
-
-    p.add("dwt_pps_residual",   residual_dwt.residual);
-    p.add("gnss_pps_residual",  residual_gnss.residual);
-    p.add("ocxo1_pps_residual", residual_ocxo1.residual);
-    p.add("ocxo2_pps_residual", residual_ocxo2.residual);
-
-    p.add("isr_residual_dwt",   isr_residual_dwt);
-    p.add("isr_residual_gnss",  isr_residual_gnss);
-    p.add("isr_residual_ocxo1", isr_residual_ocxo1);
-    p.add("isr_residual_ocxo2", isr_residual_ocxo2);
-    p.add("isr_residual_valid", isr_residual_valid);
-
-    p.add("dwt_pred_residual",  pred_dwt.pred_residual);
-    p.add("dwt_pred_mean",      pred_dwt.mean);
-    p.add("dwt_pred_stddev",    prediction_stddev(pred_dwt));
-    p.add("dwt_pred_n",         pred_dwt.n);
-
-    p.add("ocxo1_pred_residual", pred_ocxo1.pred_residual);
-    p.add("ocxo1_pred_mean",     pred_ocxo1.mean);
-    p.add("ocxo1_pred_stddev",   prediction_stddev(pred_ocxo1));
-    p.add("ocxo1_pred_n",        pred_ocxo1.n);
-
-    p.add("ocxo2_pred_residual", pred_ocxo2.pred_residual);
-    p.add("ocxo2_pred_mean",     pred_ocxo2.mean);
-    p.add("ocxo2_pred_stddev",   prediction_stddev(pred_ocxo2));
-    p.add("ocxo2_pred_n",        pred_ocxo2.n);
-
-    p.add("ocxo1_dac",         ocxo1_dac.dac_fractional);
-    p.add("ocxo2_dac",         ocxo2_dac.dac_fractional);
-    p.add("ocxo1_dac_hw",      (int32_t)ocxo1_dac.dac_hw_code);
-    p.add("ocxo2_dac_hw",      (int32_t)ocxo2_dac.dac_hw_code);
-
-    // ── Phase-first OCXO measurement (v26) ──
-    p.add("ocxo1_raw_phase_offset_ns",       (int32_t)ocxo_phase.ocxo1_raw_phase_offset_ns);
-    p.add("ocxo1_phase_bias_ns",             ocxo_phase.ocxo1_phase_bias_ns);
-    p.add("ocxo1_adjusted_phase_signed_ns",     ocxo_phase.ocxo1_adjusted_phase_signed_ns);
-    p.add("ocxo1_phase_offset_ns",           (int32_t)ocxo_phase.ocxo1_phase_offset_ns);
-    p.add("ocxo2_raw_phase_offset_ns",       (int32_t)ocxo_phase.ocxo2_raw_phase_offset_ns);
-    p.add("ocxo2_phase_bias_ns",             ocxo_phase.ocxo2_phase_bias_ns);
-    p.add("ocxo2_adjusted_phase_signed_ns",     ocxo_phase.ocxo2_adjusted_phase_signed_ns);
-    p.add("ocxo2_phase_offset_ns",           (int32_t)ocxo_phase.ocxo2_phase_offset_ns);
-    p.add("ocxo1_raw_elapsed_ns",            (int32_t)ocxo_phase.ocxo1_raw_elapsed_ns);
-    p.add("ocxo2_raw_elapsed_ns",            (int32_t)ocxo_phase.ocxo2_raw_elapsed_ns);
-    p.add("ocxo1_edge_gnss_ns",      ocxo_phase.ocxo1_edge_gnss_ns);
-    p.add("ocxo2_edge_gnss_ns",      ocxo_phase.ocxo2_edge_gnss_ns);
-    p.add("ocxo1_dwt_before",        ocxo_phase.ocxo1_dwt_before);
-    p.add("ocxo1_dwt_after",         ocxo_phase.ocxo1_dwt_after);
-    p.add("ocxo1_gpt_before",        ocxo_phase.ocxo1_gpt_before);
-    p.add("ocxo1_gpt_after",         ocxo_phase.ocxo1_gpt_after);
-    p.add("ocxo1_dwt_bracket_cycles",ocxo_phase.ocxo1_dwt_bracket_cycles);
-    p.add("ocxo1_dwt_correction_cycles", ocxo_phase.ocxo1_dwt_correction_cycles);
-    p.add("ocxo1_dwt_at_edge",       ocxo_phase.ocxo1_dwt_at_edge);
-    p.add("ocxo2_dwt_before",        ocxo_phase.ocxo2_dwt_before);
-    p.add("ocxo2_dwt_after",         ocxo_phase.ocxo2_dwt_after);
-    p.add("ocxo2_gpt_before",        ocxo_phase.ocxo2_gpt_before);
-    p.add("ocxo2_gpt_after",         ocxo_phase.ocxo2_gpt_after);
-    p.add("ocxo2_dwt_bracket_cycles",ocxo_phase.ocxo2_dwt_bracket_cycles);
-    p.add("ocxo2_dwt_correction_cycles", ocxo_phase.ocxo2_dwt_correction_cycles);
-    p.add("ocxo2_dwt_at_edge",       ocxo_phase.ocxo2_dwt_at_edge);
-
-    p.add("ocxo1_phase2_raw_phase_offset_ns", (int32_t)ocxo_phase.ocxo1_phase2_raw_phase_offset_ns);
-    p.add("ocxo1_phase2_phase_bias_ns",       ocxo_phase.ocxo1_phase2_phase_bias_ns);
-    p.add("ocxo1_phase2_adjusted_phase_signed_ns", ocxo_phase.ocxo1_phase2_adjusted_phase_signed_ns);
-    p.add("ocxo1_phase2_phase_offset_ns",     (int32_t)ocxo_phase.ocxo1_phase2_phase_offset_ns);
-    p.add("ocxo1_phase2_raw_elapsed_ns",      (int32_t)ocxo_phase.ocxo1_phase2_raw_elapsed_ns);
-    p.add("ocxo1_phase2_edge_gnss_ns",    ocxo_phase.ocxo1_phase2_edge_gnss_ns);
-    p.add("ocxo1_phase2_dwt_before",      ocxo_phase.ocxo1_phase2_dwt_before);
-    p.add("ocxo1_phase2_dwt_after",       ocxo_phase.ocxo1_phase2_dwt_after);
-    p.add("ocxo1_phase2_gpt_before",      ocxo_phase.ocxo1_phase2_gpt_before);
-    p.add("ocxo1_phase2_gpt_after",       ocxo_phase.ocxo1_phase2_gpt_after);
-    p.add("ocxo1_phase2_dwt_bracket_cycles", ocxo_phase.ocxo1_phase2_dwt_bracket_cycles);
-    p.add("ocxo1_phase2_dwt_correction_cycles", ocxo_phase.ocxo1_phase2_dwt_correction_cycles);
-    p.add("ocxo1_phase2_dwt_at_edge",     ocxo_phase.ocxo1_phase2_dwt_at_edge);
-    p.add("ocxo1_phase_pair_delta_ns",             ocxo_phase.ocxo1_phase_pair_delta_ns);
-    p.add("ocxo1_adjusted_phase_pair_delta_ns",    ocxo_phase.ocxo1_adjusted_phase_pair_delta_ns);
-
-    p.add("ocxo2_phase2_raw_phase_offset_ns", (int32_t)ocxo_phase.ocxo2_phase2_raw_phase_offset_ns);
-    p.add("ocxo2_phase2_phase_bias_ns",       ocxo_phase.ocxo2_phase2_phase_bias_ns);
-    p.add("ocxo2_phase2_adjusted_phase_signed_ns", ocxo_phase.ocxo2_phase2_adjusted_phase_signed_ns);
-    p.add("ocxo2_phase2_phase_offset_ns",     (int32_t)ocxo_phase.ocxo2_phase2_phase_offset_ns);
-    p.add("ocxo2_phase2_raw_elapsed_ns",      (int32_t)ocxo_phase.ocxo2_phase2_raw_elapsed_ns);
-    p.add("ocxo2_phase2_edge_gnss_ns",    ocxo_phase.ocxo2_phase2_edge_gnss_ns);
-    p.add("ocxo2_phase2_dwt_before",      ocxo_phase.ocxo2_phase2_dwt_before);
-    p.add("ocxo2_phase2_dwt_after",       ocxo_phase.ocxo2_phase2_dwt_after);
-    p.add("ocxo2_phase2_gpt_before",      ocxo_phase.ocxo2_phase2_gpt_before);
-    p.add("ocxo2_phase2_gpt_after",       ocxo_phase.ocxo2_phase2_gpt_after);
-    p.add("ocxo2_phase2_dwt_bracket_cycles", ocxo_phase.ocxo2_phase2_dwt_bracket_cycles);
-    p.add("ocxo2_phase2_dwt_correction_cycles", ocxo_phase.ocxo2_phase2_dwt_correction_cycles);
-    p.add("ocxo2_phase2_dwt_at_edge",     ocxo_phase.ocxo2_phase2_dwt_at_edge);
-    p.add("ocxo2_phase_pair_delta_ns",             ocxo_phase.ocxo2_phase_pair_delta_ns);
-    p.add("ocxo2_adjusted_phase_pair_delta_ns",    ocxo_phase.ocxo2_adjusted_phase_pair_delta_ns);
-
-    p.add("phase_pair_valid",      (bool)ocxo_phase.phase_pair_valid);
-    p.add("ocxo1_gnss_ns_per_pps", ocxo_phase.ocxo1_gnss_ns_per_pps);
-    p.add("ocxo2_gnss_ns_per_pps", ocxo_phase.ocxo2_gnss_ns_per_pps);
-    p.add("ocxo1_residual_ns",     ocxo_phase.ocxo1_residual_ns);
-    p.add("ocxo2_residual_ns",     ocxo_phase.ocxo2_residual_ns);
-    p.add("phase_residual_valid",  (bool)ocxo_phase.residual_valid);
-
-    p.add("ocxo1_dac_before",        (int32_t)ocxo_phase.ocxo1_dac_before);
-    p.add("ocxo1_dac_after",         (int32_t)ocxo_phase.ocxo1_dac_after);
-    p.add("ocxo2_dac_before",        (int32_t)ocxo_phase.ocxo2_dac_before);
-    p.add("ocxo2_dac_after",         (int32_t)ocxo_phase.ocxo2_dac_after);
-
-    p.add("ocxo1_dac_n",      (int32_t)dac_welford_ocxo1.n);
-    p.add_fmt("ocxo1_dac_mean",   "%.6f", dac_welford_ocxo1.mean);
-    p.add_fmt("ocxo1_dac_stddev", "%.6f", dac_welford_stddev(dac_welford_ocxo1));
-    p.add_fmt("ocxo1_dac_stderr", "%.6f", dac_welford_stderr(dac_welford_ocxo1));
-    p.add_fmt("ocxo1_dac_min",    "%.6f", dac_welford_ocxo1.min_val);
-    p.add_fmt("ocxo1_dac_max",    "%.6f", dac_welford_ocxo1.max_val);
-
-    p.add("ocxo2_dac_n",      (int32_t)dac_welford_ocxo2.n);
-    p.add_fmt("ocxo2_dac_mean",   "%.6f", dac_welford_ocxo2.mean);
-    p.add_fmt("ocxo2_dac_stddev", "%.6f", dac_welford_stddev(dac_welford_ocxo2));
-    p.add_fmt("ocxo2_dac_stderr", "%.6f", dac_welford_stderr(dac_welford_ocxo2));
-    p.add_fmt("ocxo2_dac_min",    "%.6f", dac_welford_ocxo2.min_val);
-    p.add_fmt("ocxo2_dac_max",    "%.6f", dac_welford_ocxo2.max_val);
-
-    p.add("calibrate_ocxo", servo_mode_str(calibrate_ocxo_mode));
-    p.add("ocxo1_servo_adjustments", ocxo1_dac.servo_adjustments);
-    p.add("ocxo2_servo_adjustments", ocxo2_dac.servo_adjustments);
-
-    p.add("diag_pps_rejected_total",     diag_pps_rejected_total);
-    p.add("diag_pps_rejected_remainder", diag_pps_rejected_remainder);
-
-    // Spin capture (subset — forensic, persisted in TIMEBASE)
-    p.add("spin_valid",             pps_spin.valid);
-    p.add("spin_approach_cycles",   pps_spin.approach_cycles);
-    p.add("spin_delta_cycles",      pps_spin.delta_cycles);
-    p.add("spin_error_cycles",      pps_spin.spin_error);
-    p.add("spin_isr_dwt",           pps_spin.isr_dwt);
-    p.add("spin_landed_dwt",        pps_spin.landed_dwt);
-    p.add("spin_shadow_dwt",        pps_spin.shadow_dwt);
-    p.add("spin_corrected_dwt",     pps_spin.corrected_dwt);
-    p.add("spin_tdc_correction",    pps_spin.tdc_correction);
-    p.add("spin_nano_timed_out",    pps_spin.nano_timed_out);
-    p.add("spin_shadow_timed_out",  pps_spin.shadow_timed_out);
-
-    p.add("dwt_cal_valid",     g_dwt_cal_valid);
-    p.add("dwt_cal_pps_count", g_dwt_cal_pps_count);
-
-    publish("TIMEBASE_FRAGMENT", p);
   }
+
+  ocxo_calibration_servo();
+
+  // Snapshot DAC state after servo
+  ocxo_phase.ocxo1_dac_before = dac1_before;
+  ocxo_phase.ocxo1_dac_after  = ocxo1_dac.dac_hw_code;
+  ocxo_phase.ocxo2_dac_before = dac2_before;
+  ocxo_phase.ocxo2_dac_after  = ocxo2_dac.dac_hw_code;
+
+  // ── DAC Welford ──
+  dac_welford_update(dac_welford_ocxo1, ocxo1_dac.dac_fractional);
+  dac_welford_update(dac_welford_ocxo2, ocxo2_dac.dac_fractional);
+
+  // ── Build and publish TIMEBASE_FRAGMENT ──
+  Payload p;
+  p.add("campaign",         campaign_name);
+
+  p.add("dwt_cycles",       pps_dwt_cycles);
+  p.add("dwt_ns",           pps_dwt_ns);
+  p.add("gnss_ns",          pps_gnss_ns);
+  p.add("ocxo1_ns",         pps_ocxo1_ns);
+  p.add("ocxo2_ns",         pps_ocxo2_ns);
+  p.add("teensy_pps_count", campaign_seconds);
+  p.add("gnss_lock",        digitalRead(GNSS_LOCK_PIN));
+  p.add("dwt_cyccnt_at_pps", (uint32_t)dwt_raw_at_pps);
+  p.add("qtimer_at_pps",    (uint32_t)isr_snap_gnss);
+
+  p.add("dwt_cycles_per_pps", (uint64_t)dwt_cycles_per_pps_snapshot);
+
+  p.add("dwt_delta_raw",    (uint64_t)dwt_delta);
+  p.add("ocxo1_delta_raw",  (uint64_t)ocxo1_delta);
+  p.add("ocxo2_delta_raw",  (uint64_t)ocxo2_delta);
+  p.add("gnss_raw_delta",   (uint64_t)gnss_raw_delta);
+
+  p.add("dwt_pps_residual",   residual_dwt.residual);
+  p.add("gnss_pps_residual",  residual_gnss.residual);
+  p.add("ocxo1_pps_residual", residual_ocxo1.residual);
+  p.add("ocxo2_pps_residual", residual_ocxo2.residual);
+
+  p.add("isr_residual_dwt",   isr_residual_dwt);
+  p.add("isr_residual_gnss",  isr_residual_gnss);
+  p.add("isr_residual_ocxo1", isr_residual_ocxo1);
+  p.add("isr_residual_ocxo2", isr_residual_ocxo2);
+  p.add("isr_residual_valid", isr_residual_valid);
+
+  p.add("dwt_pred_residual",  pred_dwt.pred_residual);
+  p.add("dwt_pred_mean",      pred_dwt.mean);
+  p.add("dwt_pred_stddev",    prediction_stddev(pred_dwt));
+  p.add("dwt_pred_n",         pred_dwt.n);
+
+  p.add("ocxo1_pred_residual", pred_ocxo1.pred_residual);
+  p.add("ocxo1_pred_mean",     pred_ocxo1.mean);
+  p.add("ocxo1_pred_stddev",   prediction_stddev(pred_ocxo1));
+  p.add("ocxo1_pred_n",        pred_ocxo1.n);
+
+  p.add("ocxo2_pred_residual", pred_ocxo2.pred_residual);
+  p.add("ocxo2_pred_mean",     pred_ocxo2.mean);
+  p.add("ocxo2_pred_stddev",   prediction_stddev(pred_ocxo2));
+  p.add("ocxo2_pred_n",        pred_ocxo2.n);
+
+  p.add("ocxo1_dac",         ocxo1_dac.dac_fractional);
+  p.add("ocxo2_dac",         ocxo2_dac.dac_fractional);
+  p.add("ocxo1_dac_hw",      (int32_t)ocxo1_dac.dac_hw_code);
+  p.add("ocxo2_dac_hw",      (int32_t)ocxo2_dac.dac_hw_code);
+
+  // ── Generalized phase detector summary ──
+  p.add("phase_detector_valid",  (bool)ocxo_phase.detector_valid);
+  p.add("phase_detector_limit",  (int32_t)ocxo_phase.detector_limit);
+  p.add("phase_detector_timeout_cycles", (int32_t)ocxo_phase.detector_timeout_cycles);
+
+  p.add("ocxo1_match_found",           (bool)ocxo_phase.ocxo1_match_found);
+  p.add("ocxo1_candidates_examined",   (int32_t)ocxo_phase.ocxo1_candidates_examined);
+  p.add("ocxo1_match_iteration_count", (int32_t)ocxo_phase.ocxo1_match_iteration_count);
+  p.add("ocxo1_match_delta_ns",        ocxo_phase.ocxo1_match_delta_ns);
+  p.add("ocxo1_match_prev_phase_offset_ns", (int32_t)ocxo_phase.ocxo1_match_prev_phase_offset_ns);
+  p.add("ocxo1_match_prev_raw_elapsed_ns",  (int32_t)ocxo_phase.ocxo1_match_prev_raw_elapsed_ns);
+  p.add("ocxo1_match_prev_dwt_bracket_cycles", (int32_t)ocxo_phase.ocxo1_match_prev_dwt_bracket_cycles);
+  p.add("ocxo1_match_prev_dwt_before", ocxo_phase.ocxo1_match_prev_dwt_before);
+  p.add("ocxo1_match_prev_dwt_after",  ocxo_phase.ocxo1_match_prev_dwt_after);
+  p.add("ocxo1_match_prev_dwt_at_edge", ocxo_phase.ocxo1_match_prev_dwt_at_edge);
+  p.add("ocxo1_match_prev_dwt_elapsed", ocxo_phase.ocxo1_match_prev_dwt_elapsed);
+  p.add("ocxo1_match_prev_gpt_before", ocxo_phase.ocxo1_match_prev_gpt_before);
+  p.add("ocxo1_match_prev_gpt_after",  ocxo_phase.ocxo1_match_prev_gpt_after);
+  p.add("ocxo1_winner_phase_offset_ns", (int32_t)ocxo_phase.ocxo1_winner_phase_offset_ns);
+  p.add("ocxo1_winner_raw_elapsed_ns",  (int32_t)ocxo_phase.ocxo1_winner_raw_elapsed_ns);
+  p.add("ocxo1_winner_dwt_bracket_cycles", (int32_t)ocxo_phase.ocxo1_winner_dwt_bracket_cycles);
+  p.add("ocxo1_winner_dwt_before", ocxo_phase.ocxo1_winner_dwt_before);
+  p.add("ocxo1_winner_dwt_after",  ocxo_phase.ocxo1_winner_dwt_after);
+  p.add("ocxo1_winner_dwt_at_edge", ocxo_phase.ocxo1_winner_dwt_at_edge);
+  p.add("ocxo1_winner_dwt_elapsed", ocxo_phase.ocxo1_winner_dwt_elapsed);
+  p.add("ocxo1_winner_gpt_before", ocxo_phase.ocxo1_winner_gpt_before);
+  p.add("ocxo1_winner_gpt_after",  ocxo_phase.ocxo1_winner_gpt_after);
+  p.add("ocxo1_edge_gnss_ns",      ocxo_phase.ocxo1_edge_gnss_ns);
+
+  p.add("ocxo2_match_found",           (bool)ocxo_phase.ocxo2_match_found);
+  p.add("ocxo2_candidates_examined",   (int32_t)ocxo_phase.ocxo2_candidates_examined);
+  p.add("ocxo2_match_iteration_count", (int32_t)ocxo_phase.ocxo2_match_iteration_count);
+  p.add("ocxo2_match_delta_ns",        ocxo_phase.ocxo2_match_delta_ns);
+  p.add("ocxo2_match_prev_phase_offset_ns", (int32_t)ocxo_phase.ocxo2_match_prev_phase_offset_ns);
+  p.add("ocxo2_match_prev_raw_elapsed_ns",  (int32_t)ocxo_phase.ocxo2_match_prev_raw_elapsed_ns);
+  p.add("ocxo2_match_prev_dwt_bracket_cycles", (int32_t)ocxo_phase.ocxo2_match_prev_dwt_bracket_cycles);
+  p.add("ocxo2_match_prev_dwt_before", ocxo_phase.ocxo2_match_prev_dwt_before);
+  p.add("ocxo2_match_prev_dwt_after",  ocxo_phase.ocxo2_match_prev_dwt_after);
+  p.add("ocxo2_match_prev_dwt_at_edge", ocxo_phase.ocxo2_match_prev_dwt_at_edge);
+  p.add("ocxo2_match_prev_dwt_elapsed", ocxo_phase.ocxo2_match_prev_dwt_elapsed);
+  p.add("ocxo2_match_prev_gpt_before", ocxo_phase.ocxo2_match_prev_gpt_before);
+  p.add("ocxo2_match_prev_gpt_after",  ocxo_phase.ocxo2_match_prev_gpt_after);
+  p.add("ocxo2_winner_phase_offset_ns", (int32_t)ocxo_phase.ocxo2_winner_phase_offset_ns);
+  p.add("ocxo2_winner_raw_elapsed_ns",  (int32_t)ocxo_phase.ocxo2_winner_raw_elapsed_ns);
+  p.add("ocxo2_winner_dwt_bracket_cycles", (int32_t)ocxo_phase.ocxo2_winner_dwt_bracket_cycles);
+  p.add("ocxo2_winner_dwt_before", ocxo_phase.ocxo2_winner_dwt_before);
+  p.add("ocxo2_winner_dwt_after",  ocxo_phase.ocxo2_winner_dwt_after);
+  p.add("ocxo2_winner_dwt_at_edge", ocxo_phase.ocxo2_winner_dwt_at_edge);
+  p.add("ocxo2_winner_dwt_elapsed", ocxo_phase.ocxo2_winner_dwt_elapsed);
+  p.add("ocxo2_winner_gpt_before", ocxo_phase.ocxo2_winner_gpt_before);
+  p.add("ocxo2_winner_gpt_after",  ocxo_phase.ocxo2_winner_gpt_after);
+  p.add("ocxo2_edge_gnss_ns",      ocxo_phase.ocxo2_edge_gnss_ns);
+
+  p.add("ocxo1_gnss_ns_per_pps", ocxo_phase.ocxo1_gnss_ns_per_pps);
+  p.add("ocxo2_gnss_ns_per_pps", ocxo_phase.ocxo2_gnss_ns_per_pps);
+  p.add("ocxo1_residual_ns",     ocxo_phase.ocxo1_residual_ns);
+  p.add("ocxo2_residual_ns",     ocxo_phase.ocxo2_residual_ns);
+  p.add("phase_residual_valid",  (bool)ocxo_phase.residual_valid);
+
+  p.add("ocxo1_dac_before",        (int32_t)ocxo_phase.ocxo1_dac_before);
+  p.add("ocxo1_dac_after",         (int32_t)ocxo_phase.ocxo1_dac_after);
+  p.add("ocxo2_dac_before",        (int32_t)ocxo_phase.ocxo2_dac_before);
+  p.add("ocxo2_dac_after",         (int32_t)ocxo_phase.ocxo2_dac_after);
+
+  // ── Candidate arrays for TIMEBASE persistence / analyzer use ──
+  for (uint32_t i = 0; i < OCXO_PHASE_DETECTOR_LIMIT; ++i) {
+    char key[64];
+
+    snprintf(key, sizeof(key), "ocxo1_candidate%u_phase_offset_ns", (unsigned)(i + 1));
+    p.add(key, (int32_t)ocxo_phase.ocxo1_candidate_phase_offset_ns[i]);
+
+    snprintf(key, sizeof(key), "ocxo1_candidate%u_raw_elapsed_ns", (unsigned)(i + 1));
+    p.add(key, (int32_t)ocxo_phase.ocxo1_candidate_raw_elapsed_ns[i]);
+
+    snprintf(key, sizeof(key), "ocxo1_candidate%u_dwt_bracket_cycles", (unsigned)(i + 1));
+    p.add(key, (int32_t)ocxo_phase.ocxo1_candidate_dwt_bracket_cycles[i]);
+
+    snprintf(key, sizeof(key), "ocxo1_candidate%u_dwt_before", (unsigned)(i + 1));
+    p.add(key, ocxo_phase.ocxo1_candidate_dwt_before[i]);
+
+    snprintf(key, sizeof(key), "ocxo1_candidate%u_dwt_after", (unsigned)(i + 1));
+    p.add(key, ocxo_phase.ocxo1_candidate_dwt_after[i]);
+
+    snprintf(key, sizeof(key), "ocxo1_candidate%u_dwt_at_edge", (unsigned)(i + 1));
+    p.add(key, ocxo_phase.ocxo1_candidate_dwt_at_edge[i]);
+
+    snprintf(key, sizeof(key), "ocxo1_candidate%u_dwt_elapsed", (unsigned)(i + 1));
+    p.add(key, ocxo_phase.ocxo1_candidate_dwt_elapsed[i]);
+
+    snprintf(key, sizeof(key), "ocxo1_candidate%u_gpt_before", (unsigned)(i + 1));
+    p.add(key, ocxo_phase.ocxo1_candidate_gpt_before[i]);
+
+    snprintf(key, sizeof(key), "ocxo1_candidate%u_gpt_after", (unsigned)(i + 1));
+    p.add(key, ocxo_phase.ocxo1_candidate_gpt_after[i]);
+
+    snprintf(key, sizeof(key), "ocxo2_candidate%u_phase_offset_ns", (unsigned)(i + 1));
+    p.add(key, (int32_t)ocxo_phase.ocxo2_candidate_phase_offset_ns[i]);
+
+    snprintf(key, sizeof(key), "ocxo2_candidate%u_raw_elapsed_ns", (unsigned)(i + 1));
+    p.add(key, (int32_t)ocxo_phase.ocxo2_candidate_raw_elapsed_ns[i]);
+
+    snprintf(key, sizeof(key), "ocxo2_candidate%u_dwt_bracket_cycles", (unsigned)(i + 1));
+    p.add(key, (int32_t)ocxo_phase.ocxo2_candidate_dwt_bracket_cycles[i]);
+
+    snprintf(key, sizeof(key), "ocxo2_candidate%u_dwt_before", (unsigned)(i + 1));
+    p.add(key, ocxo_phase.ocxo2_candidate_dwt_before[i]);
+
+    snprintf(key, sizeof(key), "ocxo2_candidate%u_dwt_after", (unsigned)(i + 1));
+    p.add(key, ocxo_phase.ocxo2_candidate_dwt_after[i]);
+
+    snprintf(key, sizeof(key), "ocxo2_candidate%u_dwt_at_edge", (unsigned)(i + 1));
+    p.add(key, ocxo_phase.ocxo2_candidate_dwt_at_edge[i]);
+
+    snprintf(key, sizeof(key), "ocxo2_candidate%u_dwt_elapsed", (unsigned)(i + 1));
+    p.add(key, ocxo_phase.ocxo2_candidate_dwt_elapsed[i]);
+
+    snprintf(key, sizeof(key), "ocxo2_candidate%u_gpt_before", (unsigned)(i + 1));
+    p.add(key, ocxo_phase.ocxo2_candidate_gpt_before[i]);
+
+    snprintf(key, sizeof(key), "ocxo2_candidate%u_gpt_after", (unsigned)(i + 1));
+    p.add(key, ocxo_phase.ocxo2_candidate_gpt_after[i]);
+  }
+
+  p.add("ocxo1_dac_n",      (int32_t)dac_welford_ocxo1.n);
+  p.add_fmt("ocxo1_dac_mean",   "%.6f", dac_welford_ocxo1.mean);
+  p.add_fmt("ocxo1_dac_stddev", "%.6f", dac_welford_stddev(dac_welford_ocxo1));
+  p.add_fmt("ocxo1_dac_stderr", "%.6f", dac_welford_stderr(dac_welford_ocxo1));
+  p.add_fmt("ocxo1_dac_min",    "%.6f", dac_welford_ocxo1.min_val);
+  p.add_fmt("ocxo1_dac_max",    "%.6f", dac_welford_ocxo1.max_val);
+
+  p.add("ocxo2_dac_n",      (int32_t)dac_welford_ocxo2.n);
+  p.add_fmt("ocxo2_dac_mean",   "%.6f", dac_welford_ocxo2.mean);
+  p.add_fmt("ocxo2_dac_stddev", "%.6f", dac_welford_stddev(dac_welford_ocxo2));
+  p.add_fmt("ocxo2_dac_stderr", "%.6f", dac_welford_stderr(dac_welford_ocxo2));
+  p.add_fmt("ocxo2_dac_min",    "%.6f", dac_welford_ocxo2.min_val);
+  p.add_fmt("ocxo2_dac_max",    "%.6f", dac_welford_ocxo2.max_val);
+
+  p.add("calibrate_ocxo", servo_mode_str(calibrate_ocxo_mode));
+  p.add("ocxo1_servo_adjustments", ocxo1_dac.servo_adjustments);
+  p.add("ocxo2_servo_adjustments", ocxo2_dac.servo_adjustments);
+
+  p.add("diag_pps_rejected_total",     diag_pps_rejected_total);
+  p.add("diag_pps_rejected_remainder", diag_pps_rejected_remainder);
+
+  p.add("spin_valid",             pps_spin.valid);
+  p.add("spin_approach_cycles",   pps_spin.approach_cycles);
+  p.add("spin_delta_cycles",      pps_spin.delta_cycles);
+  p.add("spin_error_cycles",      pps_spin.spin_error);
+  p.add("spin_isr_dwt",           pps_spin.isr_dwt);
+  p.add("spin_landed_dwt",        pps_spin.landed_dwt);
+  p.add("spin_shadow_dwt",        pps_spin.shadow_dwt);
+  p.add("spin_corrected_dwt",     pps_spin.corrected_dwt);
+  p.add("spin_tdc_correction",    pps_spin.tdc_correction);
+  p.add("spin_nano_timed_out",    pps_spin.nano_timed_out);
+  p.add("spin_shadow_timed_out",  pps_spin.shadow_timed_out);
+
+  p.add("dwt_cal_valid",     g_dwt_cal_valid);
+  p.add("dwt_cal_pps_count", g_dwt_cal_pps_count);
+
+  publish("TIMEBASE_FRAGMENT", p);
 }
 
 // ============================================================================
@@ -1165,7 +1218,6 @@ static Payload cmd_clocks_info(const Payload&) {
   p.add("ocxo1_ns_now",   clocks_ocxo1_ns_now());
   p.add("ocxo2_ns_now",   clocks_ocxo2_ns_now());
 
-  // ── Raw / rolling GNSS forensic surface ──
   p.add("gnss_raw_now",         gnss_raw_now);
   p.add("gnss_raw_64",          gnss_raw_64);
   p.add("gnss_ticks_64",        gnss_ticks_64_get());
@@ -1201,7 +1253,6 @@ static Payload cmd_clocks_info(const Payload&) {
   p.add("dwt_cal_valid",         g_dwt_cal_valid);
   p.add("dwt_cal_pps_count",     g_dwt_cal_pps_count);
 
-  // ── ISR PPS-edge forensics ──
   p.add("isr_snap_dwt",         isr_snap_dwt);
   p.add("isr_snap_gnss",        isr_snap_gnss);
   p.add("isr_snap_ocxo1",       isr_snap_ocxo1);
@@ -1218,14 +1269,12 @@ static Payload cmd_clocks_info(const Payload&) {
   p.add("isr_residual_ocxo1",   isr_residual_ocxo1);
   p.add("isr_residual_ocxo2",   isr_residual_ocxo2);
 
-  // ── PPS rejection diagnostics ──
   p.add("pps_rejected_total",      diag_pps_rejected_total);
   p.add("pps_rejected_remainder",  diag_pps_rejected_remainder);
   p.add("pps_reject_consecutive",  diag_pps_reject_consecutive);
   p.add("pps_reject_recoveries",   diag_pps_reject_recoveries);
   p.add("pps_reject_max_run",      diag_pps_reject_max_run);
 
-  // ── PPS ASAP pipeline diagnostics ──
   p.add("pps_scheduled_stuck",     diag_pps_scheduled_stuck);
   p.add("pps_watchdog_recoveries", diag_pps_watchdog_recoveries);
   p.add("pps_asap_arm_failures",   diag_pps_asap_arm_failures);
@@ -1235,12 +1284,6 @@ static Payload cmd_clocks_info(const Payload&) {
   p.add("pps_stuck_max",           diag_pps_stuck_max);
   p.add("pps_scheduled",           (bool)pps_scheduled);
 
-  // ── Spin capture forensics ──
-  //
-  // Two timeout classes:
-  //   nano_*   — TimePop nano-spin couldn't reach target DWT
-  //   shadow_* — shadow-write loop PPS never arrived
-  //
   p.add("spin_valid",             pps_spin.valid);
   p.add("spin_armed",             pps_spin.armed);
   p.add("spin_completed",         pps_spin.completed);
@@ -1254,28 +1297,20 @@ static Payload cmd_clocks_info(const Payload&) {
   p.add("spin_approach_cycles",   pps_spin.approach_cycles);
   p.add("spin_corrected_dwt",     pps_spin.corrected_dwt);
   p.add("spin_tdc_correction",    pps_spin.tdc_correction);
-
-  // Nano-spin timeout (couldn't reach target DWT)
   p.add("spin_nano_timed_out",    pps_spin.nano_timed_out);
   p.add("spin_nano_timeouts",     pps_spin.nano_timeouts);
-
-  // Shadow-loop timeout (PPS never arrived)
   p.add("spin_shadow_timed_out",  pps_spin.shadow_timed_out);
   p.add("spin_shadow_timeouts",   pps_spin.shadow_timeouts);
-
-  // Lifetime counters
   p.add("spin_arms",              pps_spin.arms);
   p.add("spin_arm_failures",      pps_spin.arm_failures);
   p.add("spin_completions",       pps_spin.completions);
   p.add("spin_misses",            pps_spin.misses);
 
-  // ── DEBUG: shadow capture forensics ──
   p.add("dbg_post_dwt",      dbg_post_loop_dwt);
   p.add("dbg_post_shadow",   dbg_post_loop_shadow);
   p.add("dbg_post_isr_cap",  dbg_post_loop_isr_cap);
   p.add("dbg_post_isr_snap", dbg_post_loop_isr_snap);
 
-  // ── QTimer1 read diagnostics ──
   p.add("qread_total",            diag_qread_total);
   p.add("qread_same_hi",          diag_qread_same_hi);
   p.add("qread_retry_hi_changed", diag_qread_retry_hi_changed);
@@ -1284,80 +1319,123 @@ static Payload cmd_clocks_info(const Payload&) {
   p.add("qread_last_lo",          diag_qread_last_lo);
   p.add("qread_last_lo2",         diag_qread_last_lo2);
 
-  // ── OCXO phase capture (v26) ──
-  p.add("phase_valid",                  (bool)ocxo_phase.valid);
-  p.add("phase_captures",               ocxo_phase.captures);
-  p.add("phase_dwt_at_pps",             ocxo_phase.dwt_at_pps);
-  p.add("phase_pps_gnss_ns",            ocxo_phase.pps_gnss_ns);
+  return p;
+}
 
-  p.add("phase_ocxo1_dwt_at_edge",      ocxo_phase.ocxo1_dwt_at_edge);
-  p.add("phase_ocxo1_dwt_elapsed",      ocxo_phase.ocxo1_dwt_elapsed);
-  p.add("phase_ocxo1_raw_elapsed_ns",      ocxo_phase.ocxo1_raw_elapsed_ns);
-  p.add("phase_ocxo1_raw_phase_offset_ns",  ocxo_phase.ocxo1_raw_phase_offset_ns);
-  p.add("phase_ocxo1_phase_bias_ns",        ocxo_phase.ocxo1_phase_bias_ns);
-  p.add("phase_ocxo1_adjusted_phase_signed",ocxo_phase.ocxo1_adjusted_phase_signed_ns);
-  p.add("phase_ocxo1_phase_offset_ns",      ocxo_phase.ocxo1_phase_offset_ns);
-  p.add("phase_ocxo1_edge_gnss_ns",     ocxo_phase.ocxo1_edge_gnss_ns);
-  p.add("phase_prev_ocxo1_edge_gnss_ns",ocxo_phase.prev_ocxo1_edge_gnss_ns);
-  p.add("phase_ocxo1_dwt_before",        ocxo_phase.ocxo1_dwt_before);
-  p.add("phase_ocxo1_dwt_after",         ocxo_phase.ocxo1_dwt_after);
-  p.add("phase_ocxo1_gpt_before",        ocxo_phase.ocxo1_gpt_before);
-  p.add("phase_ocxo1_gpt_after",         ocxo_phase.ocxo1_gpt_after);
-  p.add("phase_ocxo1_dwt_bracket_cycles",ocxo_phase.ocxo1_dwt_bracket_cycles);
-  p.add("phase_ocxo1_dwt_correction_cycles",ocxo_phase.ocxo1_dwt_correction_cycles);
+static Payload cmd_phase_info(const Payload&) {
+  Payload p;
 
-  p.add("phase_ocxo2_dwt_at_edge",      ocxo_phase.ocxo2_dwt_at_edge);
-  p.add("phase_ocxo2_dwt_elapsed",      ocxo_phase.ocxo2_dwt_elapsed);
-  p.add("phase_ocxo2_raw_elapsed_ns",      ocxo_phase.ocxo2_raw_elapsed_ns);
-  p.add("phase_ocxo2_raw_phase_offset_ns",  ocxo_phase.ocxo2_raw_phase_offset_ns);
-  p.add("phase_ocxo2_phase_bias_ns",        ocxo_phase.ocxo2_phase_bias_ns);
-  p.add("phase_ocxo2_adjusted_phase_signed",ocxo_phase.ocxo2_adjusted_phase_signed_ns);
-  p.add("phase_ocxo2_phase_offset_ns",      ocxo_phase.ocxo2_phase_offset_ns);
-  p.add("phase_ocxo2_edge_gnss_ns",     ocxo_phase.ocxo2_edge_gnss_ns);
-  p.add("phase_prev_ocxo2_edge_gnss_ns",ocxo_phase.prev_ocxo2_edge_gnss_ns);
-  p.add("phase_ocxo2_dwt_before",        ocxo_phase.ocxo2_dwt_before);
-  p.add("phase_ocxo2_dwt_after",         ocxo_phase.ocxo2_dwt_after);
-  p.add("phase_ocxo2_gpt_before",        ocxo_phase.ocxo2_gpt_before);
-  p.add("phase_ocxo2_gpt_after",         ocxo_phase.ocxo2_gpt_after);
-  p.add("phase_ocxo2_dwt_bracket_cycles",ocxo_phase.ocxo2_dwt_bracket_cycles);
-  p.add("phase_ocxo2_dwt_correction_cycles",ocxo_phase.ocxo2_dwt_correction_cycles);
-  p.add("phase_ocxo1_phase2_raw_phase_offset_ns", ocxo_phase.ocxo1_phase2_raw_phase_offset_ns);
-  p.add("phase_ocxo1_phase2_phase_bias_ns",       ocxo_phase.ocxo1_phase2_phase_bias_ns);
-  p.add("phase_ocxo1_phase2_adjusted_phase_signed", ocxo_phase.ocxo1_phase2_adjusted_phase_signed_ns);
-  p.add("phase_ocxo1_phase2_phase_offset_ns",     ocxo_phase.ocxo1_phase2_phase_offset_ns);
-  p.add("phase_ocxo1_phase2_raw_elapsed_ns",      ocxo_phase.ocxo1_phase2_raw_elapsed_ns);
-  p.add("phase_ocxo1_phase2_edge_gnss_ns",    ocxo_phase.ocxo1_phase2_edge_gnss_ns);
-  p.add("phase_ocxo1_phase2_dwt_before",      ocxo_phase.ocxo1_phase2_dwt_before);
-  p.add("phase_ocxo1_phase2_dwt_after",       ocxo_phase.ocxo1_phase2_dwt_after);
-  p.add("phase_ocxo1_phase2_gpt_before",      ocxo_phase.ocxo1_phase2_gpt_before);
-  p.add("phase_ocxo1_phase2_gpt_after",       ocxo_phase.ocxo1_phase2_gpt_after);
-  p.add("phase_ocxo1_phase2_dwt_bracket_cycles", ocxo_phase.ocxo1_phase2_dwt_bracket_cycles);
-  p.add("phase_ocxo1_phase2_dwt_correction_cycles", ocxo_phase.ocxo1_phase2_dwt_correction_cycles);
-  p.add("phase_ocxo1_phase2_dwt_at_edge",     ocxo_phase.ocxo1_phase2_dwt_at_edge);
-  p.add("phase_ocxo1_phase_pair_delta_ns",             ocxo_phase.ocxo1_phase_pair_delta_ns);
-  p.add("phase_ocxo1_adjusted_phase_pair_delta_ns",    ocxo_phase.ocxo1_adjusted_phase_pair_delta_ns);
-  p.add("phase_ocxo2_phase2_raw_phase_offset_ns", ocxo_phase.ocxo2_phase2_raw_phase_offset_ns);
-  p.add("phase_ocxo2_phase2_phase_bias_ns",       ocxo_phase.ocxo2_phase2_phase_bias_ns);
-  p.add("phase_ocxo2_phase2_adjusted_phase_signed", ocxo_phase.ocxo2_phase2_adjusted_phase_signed_ns);
-  p.add("phase_ocxo2_phase2_phase_offset_ns",     ocxo_phase.ocxo2_phase2_phase_offset_ns);
-  p.add("phase_ocxo2_phase2_raw_elapsed_ns",      ocxo_phase.ocxo2_phase2_raw_elapsed_ns);
-  p.add("phase_ocxo2_phase2_edge_gnss_ns",    ocxo_phase.ocxo2_phase2_edge_gnss_ns);
-  p.add("phase_ocxo2_phase2_dwt_before",      ocxo_phase.ocxo2_phase2_dwt_before);
-  p.add("phase_ocxo2_phase2_dwt_after",       ocxo_phase.ocxo2_phase2_dwt_after);
-  p.add("phase_ocxo2_phase2_gpt_before",      ocxo_phase.ocxo2_phase2_gpt_before);
-  p.add("phase_ocxo2_phase2_gpt_after",       ocxo_phase.ocxo2_phase2_gpt_after);
-  p.add("phase_ocxo2_phase2_dwt_bracket_cycles", ocxo_phase.ocxo2_phase2_dwt_bracket_cycles);
-  p.add("phase_ocxo2_phase2_dwt_correction_cycles", ocxo_phase.ocxo2_phase2_dwt_correction_cycles);
-  p.add("phase_ocxo2_phase2_dwt_at_edge",     ocxo_phase.ocxo2_phase2_dwt_at_edge);
-  p.add("phase_ocxo2_phase_pair_delta_ns",             ocxo_phase.ocxo2_phase_pair_delta_ns);
-  p.add("phase_ocxo2_adjusted_phase_pair_delta_ns",    ocxo_phase.ocxo2_adjusted_phase_pair_delta_ns);
-  p.add("phase_pair_valid",                   (bool)ocxo_phase.phase_pair_valid);
+  p.add("campaign_state",
+    campaign_state == clocks_campaign_state_t::STARTED ? "STARTED" : "STOPPED");
 
-  p.add("phase_residual_valid",         (bool)ocxo_phase.residual_valid);
-  p.add("phase_ocxo1_gnss_ns_per_pps",  ocxo_phase.ocxo1_gnss_ns_per_pps);
-  p.add("phase_ocxo2_gnss_ns_per_pps",  ocxo_phase.ocxo2_gnss_ns_per_pps);
-  p.add("phase_ocxo1_residual_ns",      ocxo_phase.ocxo1_residual_ns);
-  p.add("phase_ocxo2_residual_ns",      ocxo_phase.ocxo2_residual_ns);
+  p.add("campaign", campaign_name);
+  if (campaign_state == clocks_campaign_state_t::STARTED) {
+    p.add("campaign_seconds", campaign_seconds);
+  }
+
+  p.add("phase_valid",                   (bool)ocxo_phase.valid);
+  p.add("phase_captures",                ocxo_phase.captures);
+  p.add("phase_dwt_at_pps",              ocxo_phase.dwt_at_pps);
+  p.add("phase_pps_gnss_ns",             ocxo_phase.pps_gnss_ns);
+  p.add("phase_detector_valid",          (bool)ocxo_phase.detector_valid);
+  p.add("phase_detector_limit",          (int32_t)ocxo_phase.detector_limit);
+  p.add("phase_detector_timeout_cycles", (int32_t)ocxo_phase.detector_timeout_cycles);
+
+  p.add("phase_residual_valid",          (bool)ocxo_phase.residual_valid);
+  p.add("phase_ocxo1_gnss_ns_per_pps",   ocxo_phase.ocxo1_gnss_ns_per_pps);
+  p.add("phase_ocxo1_residual_ns",       ocxo_phase.ocxo1_residual_ns);
+  p.add("phase_prev_ocxo1_edge_gnss_ns", ocxo_phase.prev_ocxo1_edge_gnss_ns);
+
+  p.add("phase_diag_ocxo1_successes",             diag_phase_ocxo1_successes);
+  p.add("phase_diag_ocxo1_failures",              diag_phase_ocxo1_failures);
+  p.add("phase_diag_ocxo1_last_iterations",       diag_phase_ocxo1_last_iterations);
+  p.add("phase_diag_ocxo1_high_water_iterations", diag_phase_ocxo1_high_water_iterations);
+
+  // ── OCXO1 summary ──
+  p.add("phase_ocxo1_match_found",                   (bool)ocxo_phase.ocxo1_match_found);
+  p.add("phase_ocxo1_candidates_examined",           ocxo_phase.ocxo1_candidates_examined);
+  p.add("phase_ocxo1_match_iteration_count",         ocxo_phase.ocxo1_match_iteration_count);
+  p.add("phase_ocxo1_match_delta_ns",                ocxo_phase.ocxo1_match_delta_ns);
+  p.add("phase_ocxo1_match_prev_phase_offset_ns",    ocxo_phase.ocxo1_match_prev_phase_offset_ns);
+  p.add("phase_ocxo1_match_prev_raw_elapsed_ns",     ocxo_phase.ocxo1_match_prev_raw_elapsed_ns);
+  p.add("phase_ocxo1_match_prev_dwt_bracket_cycles", ocxo_phase.ocxo1_match_prev_dwt_bracket_cycles);
+  p.add("phase_ocxo1_match_prev_dwt_before",         ocxo_phase.ocxo1_match_prev_dwt_before);
+  p.add("phase_ocxo1_match_prev_dwt_after",          ocxo_phase.ocxo1_match_prev_dwt_after);
+  p.add("phase_ocxo1_match_prev_dwt_at_edge",        ocxo_phase.ocxo1_match_prev_dwt_at_edge);
+  p.add("phase_ocxo1_match_prev_dwt_elapsed",        ocxo_phase.ocxo1_match_prev_dwt_elapsed);
+  p.add("phase_ocxo1_match_prev_gpt_before",         ocxo_phase.ocxo1_match_prev_gpt_before);
+  p.add("phase_ocxo1_match_prev_gpt_after",          ocxo_phase.ocxo1_match_prev_gpt_after);
+  p.add("phase_ocxo1_winner_phase_offset_ns",        ocxo_phase.ocxo1_winner_phase_offset_ns);
+  p.add("phase_ocxo1_winner_raw_elapsed_ns",         ocxo_phase.ocxo1_winner_raw_elapsed_ns);
+  p.add("phase_ocxo1_winner_dwt_bracket_cycles",     ocxo_phase.ocxo1_winner_dwt_bracket_cycles);
+  p.add("phase_ocxo1_winner_dwt_before",             ocxo_phase.ocxo1_winner_dwt_before);
+  p.add("phase_ocxo1_winner_dwt_after",              ocxo_phase.ocxo1_winner_dwt_after);
+  p.add("phase_ocxo1_winner_dwt_at_edge",            ocxo_phase.ocxo1_winner_dwt_at_edge);
+  p.add("phase_ocxo1_winner_dwt_elapsed",            ocxo_phase.ocxo1_winner_dwt_elapsed);
+  p.add("phase_ocxo1_winner_gpt_before",             ocxo_phase.ocxo1_winner_gpt_before);
+  p.add("phase_ocxo1_winner_gpt_after",              ocxo_phase.ocxo1_winner_gpt_after);
+  p.add("phase_ocxo1_edge_gnss_ns",                  ocxo_phase.ocxo1_edge_gnss_ns);
+
+  // ── OCXO1 candidate cycle-only view (10 candidates) ──
+  p.add("phase_ocxo1_candidate01_dwt_bracket_cycles",  ocxo_phase.ocxo1_candidate_dwt_bracket_cycles[0]);
+  p.add("phase_ocxo1_candidate01_dwt_elapsed",         ocxo_phase.ocxo1_candidate_dwt_elapsed[0]);
+
+  p.add("phase_ocxo1_candidate02_dwt_bracket_cycles",  ocxo_phase.ocxo1_candidate_dwt_bracket_cycles[1]);
+  p.add("phase_ocxo1_candidate02_dwt_elapsed",         ocxo_phase.ocxo1_candidate_dwt_elapsed[1]);
+
+  p.add("phase_ocxo1_candidate03_dwt_bracket_cycles",  ocxo_phase.ocxo1_candidate_dwt_bracket_cycles[2]);
+  p.add("phase_ocxo1_candidate03_dwt_elapsed",         ocxo_phase.ocxo1_candidate_dwt_elapsed[2]);
+
+  p.add("phase_ocxo1_candidate04_dwt_bracket_cycles",  ocxo_phase.ocxo1_candidate_dwt_bracket_cycles[3]);
+  p.add("phase_ocxo1_candidate04_dwt_elapsed",         ocxo_phase.ocxo1_candidate_dwt_elapsed[3]);
+
+  p.add("phase_ocxo1_candidate05_dwt_bracket_cycles",  ocxo_phase.ocxo1_candidate_dwt_bracket_cycles[4]);
+  p.add("phase_ocxo1_candidate05_dwt_elapsed",         ocxo_phase.ocxo1_candidate_dwt_elapsed[4]);
+
+  p.add("phase_ocxo1_candidate06_dwt_bracket_cycles",  ocxo_phase.ocxo1_candidate_dwt_bracket_cycles[5]);
+  p.add("phase_ocxo1_candidate06_dwt_elapsed",         ocxo_phase.ocxo1_candidate_dwt_elapsed[5]);
+
+  p.add("phase_ocxo1_candidate07_dwt_bracket_cycles",  ocxo_phase.ocxo1_candidate_dwt_bracket_cycles[6]);
+  p.add("phase_ocxo1_candidate07_dwt_elapsed",         ocxo_phase.ocxo1_candidate_dwt_elapsed[6]);
+
+  p.add("phase_ocxo1_candidate08_dwt_bracket_cycles",  ocxo_phase.ocxo1_candidate_dwt_bracket_cycles[7]);
+  p.add("phase_ocxo1_candidate08_dwt_elapsed",         ocxo_phase.ocxo1_candidate_dwt_elapsed[7]);
+
+  p.add("phase_ocxo1_candidate09_dwt_bracket_cycles",  ocxo_phase.ocxo1_candidate_dwt_bracket_cycles[8]);
+  p.add("phase_ocxo1_candidate09_dwt_elapsed",         ocxo_phase.ocxo1_candidate_dwt_elapsed[8]);
+
+  p.add("phase_ocxo1_candidate10_dwt_bracket_cycles", ocxo_phase.ocxo1_candidate_dwt_bracket_cycles[9]);
+  p.add("phase_ocxo1_candidate10_dwt_elapsed",        ocxo_phase.ocxo1_candidate_dwt_elapsed[9]);
+
+  p.add("phase_ocxo1_candidate11_dwt_bracket_cycles", ocxo_phase.ocxo1_candidate_dwt_bracket_cycles[10]);
+  p.add("phase_ocxo1_candidate11_dwt_elapsed",        ocxo_phase.ocxo1_candidate_dwt_elapsed[10]);
+
+  p.add("phase_ocxo1_candidate12_dwt_bracket_cycles", ocxo_phase.ocxo1_candidate_dwt_bracket_cycles[11]);
+  p.add("phase_ocxo1_candidate12_dwt_elapsed",        ocxo_phase.ocxo1_candidate_dwt_elapsed[11]);
+
+  p.add("phase_ocxo1_candidate13_dwt_bracket_cycles", ocxo_phase.ocxo1_candidate_dwt_bracket_cycles[12]);
+  p.add("phase_ocxo1_candidate13_dwt_elapsed",        ocxo_phase.ocxo1_candidate_dwt_elapsed[12]);
+
+  p.add("phase_ocxo1_candidate14_dwt_bracket_cycles", ocxo_phase.ocxo1_candidate_dwt_bracket_cycles[13]);
+  p.add("phase_ocxo1_candidate14_dwt_elapsed",        ocxo_phase.ocxo1_candidate_dwt_elapsed[13]);
+
+  p.add("phase_ocxo1_candidate15_dwt_bracket_cycles", ocxo_phase.ocxo1_candidate_dwt_bracket_cycles[14]);
+  p.add("phase_ocxo1_candidate15_dwt_elapsed",        ocxo_phase.ocxo1_candidate_dwt_elapsed[14]);
+
+  p.add("phase_ocxo1_candidate16_dwt_bracket_cycles", ocxo_phase.ocxo1_candidate_dwt_bracket_cycles[15]);
+  p.add("phase_ocxo1_candidate16_dwt_elapsed",        ocxo_phase.ocxo1_candidate_dwt_elapsed[15]);
+
+  p.add("phase_ocxo1_candidate17_dwt_bracket_cycles", ocxo_phase.ocxo1_candidate_dwt_bracket_cycles[16]);
+  p.add("phase_ocxo1_candidate17_dwt_elapsed",        ocxo_phase.ocxo1_candidate_dwt_elapsed[16]);
+
+  p.add("phase_ocxo1_candidate18_dwt_bracket_cycles", ocxo_phase.ocxo1_candidate_dwt_bracket_cycles[17]);
+  p.add("phase_ocxo1_candidate18_dwt_elapsed",        ocxo_phase.ocxo1_candidate_dwt_elapsed[17]);
+
+  p.add("phase_ocxo1_candidate19_dwt_bracket_cycles", ocxo_phase.ocxo1_candidate_dwt_bracket_cycles[18]);
+  p.add("phase_ocxo1_candidate19_dwt_elapsed",        ocxo_phase.ocxo1_candidate_dwt_elapsed[18]);
+
+  p.add("phase_ocxo1_candidate20_dwt_bracket_cycles", ocxo_phase.ocxo1_candidate_dwt_bracket_cycles[19]);
+  p.add("phase_ocxo1_candidate20_dwt_elapsed",        ocxo_phase.ocxo1_candidate_dwt_elapsed[19]);
 
   return p;
 }
@@ -1772,12 +1850,13 @@ static const process_command_entry_t CLOCKS_COMMANDS[] = {
   { "RECOVER",      cmd_recover      },
   { "REPORT",       cmd_report       },
   { "CLOCKS_INFO",  cmd_clocks_info  },
-  { "WATCHDOG_TEST", cmd_watchdog_test },
+  { "PHASE_INFO",   cmd_phase_info   },
+  { "WATCHDOG_TEST",cmd_watchdog_test },
   { "INTERP_TEST",  cmd_interp_test  },
   { "INTERP_PROOF", cmd_interp_proof },
   { "SET_DAC",      cmd_set_dac      },
   { "DAC_TEST",     cmd_dac_test     },
-  { "DAC_PROBE",     cmd_dac_probe     },
+  { "DAC_PROBE",     cmd_dac_probe   },
   { nullptr,        nullptr          }
 };
 
