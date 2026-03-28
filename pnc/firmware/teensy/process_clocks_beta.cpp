@@ -1257,6 +1257,9 @@ static Payload cmd_phase_info(const Payload&) {
   p.add("phase_detector_valid", (bool)ocxo_phase.detector_valid);
   p.add("dwt_at_pps",          ocxo_phase.dwt_at_pps);
 
+  p.add("diag_gpt1_isr_fires", diag_gpt1_isr_fires);
+  p.add("diag_gpt2_isr_fires", diag_gpt2_isr_fires);
+
   p.add("ocxo1_captured",      (bool)ocxo_phase.ocxo1_captured);
   p.add("ocxo1_valid",         (bool)ocxo_phase.ocxo1_valid);
   p.add("ocxo1_isr_dwt",       ocxo_phase.ocxo1_isr_dwt);

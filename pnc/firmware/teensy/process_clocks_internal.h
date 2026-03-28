@@ -113,6 +113,9 @@ static constexpr uint32_t OCXO_PHASE_ARM_OFFSET_TICKS = 50;
 // PPS diagnostics (alpha-owned, beta-readable)
 // ============================================================================
 
+extern volatile uint32_t diag_gpt1_isr_fires;
+extern volatile uint32_t diag_gpt2_isr_fires;
+
 extern volatile uint32_t diag_pps_rejected_total;
 extern volatile uint32_t diag_pps_rejected_remainder;
 extern volatile uint32_t diag_pps_scheduled_stuck;

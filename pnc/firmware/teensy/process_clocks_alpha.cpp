@@ -404,6 +404,9 @@ volatile uint32_t diag_ocxo2_phase_misses   = 0;
 // ── Simplified phase result (computed in pps_asap_callback) ──
 ocxo_phase_capture_t ocxo_phase = {};
 
+volatile uint32_t diag_gpt1_isr_fires = 0;
+volatile uint32_t diag_gpt2_isr_fires = 0;
+
 // ============================================================================
 // GPT1 output-compare ISR — OCXO1 edge capture
 //
@@ -422,6 +425,7 @@ static void gpt1_phase_isr(void) {
   ocxo1_phase_isr_dwt     = dwt;
   ocxo1_phase_gpt_at_fire = gpt;
   ocxo1_phase_captured    = true;
+  diag_gpt1_isr_fires++;
 }
 
 // ============================================================================
@@ -438,6 +442,7 @@ static void gpt2_phase_isr(void) {
   ocxo2_phase_isr_dwt     = dwt;
   ocxo2_phase_gpt_at_fire = gpt;
   ocxo2_phase_captured    = true;
+  diag_gpt2_isr_fires++;
 }
 
 // ============================================================================
@@ -828,6 +833,19 @@ static void pps_isr(void)
 
   diag_pps_reject_consecutive = 0;
 
+  // ── v28: Arm GPT output compares for OCXO phase capture ──
+  // In pps_isr, in the GPT arming block:
+  ocxo1_phase_captured = false;
+  ocxo2_phase_captured = false;
+
+  GPT1_OCR1 = snap_ocxo1 + OCXO_PHASE_ARM_OFFSET_TICKS;
+  GPT1_SR   = GPT_SR_OF1;
+  GPT1_IR  |= GPT_IR_OF1IE;
+
+  GPT2_OCR1 = snap_ocxo2 + OCXO_PHASE_ARM_OFFSET_TICKS;
+  GPT2_SR   = GPT_SR_OF1;
+  GPT2_IR  |= GPT_IR_OF1IE;
+
   // ── Capture spin loop shadow before signaling pps_fired ──
   isr_captured_shadow_dwt = dispatch_shadow_dwt;
   pps_fired = true;
@@ -851,19 +869,7 @@ static void pps_isr(void)
   isr_prev_ocxo1 = isr_snap_ocxo1 = snap_ocxo1;
   isr_prev_ocxo2 = isr_snap_ocxo2 = snap_ocxo2;
 
-  // ── v28: Arm GPT output compares for OCXO phase capture ──
-  ocxo1_phase_captured = false;
-  ocxo2_phase_captured = false;
 
-  // GPT1 (OCXO1): arm OCR1, clear flag, enable interrupt
-  GPT1_OCR1 = snap_ocxo1 + OCXO_PHASE_ARM_OFFSET_TICKS;
-  GPT1_SR   = GPT_SR_OF1;
-  GPT1_IR  |= GPT_IR_OF1IE;
-
-  // GPT2 (OCXO2): arm OCR1, clear flag, enable interrupt
-  GPT2_OCR1 = snap_ocxo2 + OCXO_PHASE_ARM_OFFSET_TICKS;
-  GPT2_SR   = GPT_SR_OF1;
-  GPT2_IR  |= GPT_IR_OF1IE;
 
   // ── v16: PPS watchdog ──
   if (pps_scheduled) {
@@ -942,15 +948,17 @@ void process_clocks_init(void) {
   digitalWriteFast(GNSS_PPS_RELAY, LOW);
 
   // ── Install GPT ISR vectors for OCXO phase capture ──
-  GPT1_IR = 0;  // all GPT1 interrupts off
-  GPT2_IR = 0;  // all GPT2 interrupts off
+  GPT1_SR = 0x3F;
+  GPT2_SR = 0x3F;
+  GPT1_IR = 0;
+  GPT2_IR = 0;
 
   attachInterruptVector(IRQ_GPT1, gpt1_phase_isr);
-  NVIC_SET_PRIORITY(IRQ_GPT1, 0);
+  NVIC_SET_PRIORITY(IRQ_GPT1, 32);
   NVIC_ENABLE_IRQ(IRQ_GPT1);
 
   attachInterruptVector(IRQ_GPT2, gpt2_phase_isr);
-  NVIC_SET_PRIORITY(IRQ_GPT2, 0);
+  NVIC_SET_PRIORITY(IRQ_GPT2, 32);
   NVIC_ENABLE_IRQ(IRQ_GPT2);
 
   attachInterrupt(digitalPinToInterrupt(GNSS_PPS_PIN), pps_isr, RISING);
