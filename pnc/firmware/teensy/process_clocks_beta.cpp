@@ -816,65 +816,6 @@ void clocks_beta_pps(void) {
   p.add("ocxo2_dac_before",        (int32_t)ocxo_phase.ocxo2_dac_before);
   p.add("ocxo2_dac_after",         (int32_t)ocxo_phase.ocxo2_dac_after);
 
-  // ── Candidate arrays for TIMEBASE persistence / analyzer use ──
-  for (uint32_t i = 0; i < OCXO_PHASE_DETECTOR_LIMIT; ++i) {
-    char key[64];
-
-    snprintf(key, sizeof(key), "ocxo1_candidate%u_phase_offset_ns", (unsigned)(i + 1));
-    p.add(key, (int32_t)ocxo_phase.ocxo1_candidate_phase_offset_ns[i]);
-
-    snprintf(key, sizeof(key), "ocxo1_candidate%u_raw_elapsed_ns", (unsigned)(i + 1));
-    p.add(key, (int32_t)ocxo_phase.ocxo1_candidate_raw_elapsed_ns[i]);
-
-    snprintf(key, sizeof(key), "ocxo1_candidate%u_dwt_bracket_cycles", (unsigned)(i + 1));
-    p.add(key, (int32_t)ocxo_phase.ocxo1_candidate_dwt_bracket_cycles[i]);
-
-    snprintf(key, sizeof(key), "ocxo1_candidate%u_dwt_before", (unsigned)(i + 1));
-    p.add(key, ocxo_phase.ocxo1_candidate_dwt_before[i]);
-
-    snprintf(key, sizeof(key), "ocxo1_candidate%u_dwt_after", (unsigned)(i + 1));
-    p.add(key, ocxo_phase.ocxo1_candidate_dwt_after[i]);
-
-    snprintf(key, sizeof(key), "ocxo1_candidate%u_dwt_at_edge", (unsigned)(i + 1));
-    p.add(key, ocxo_phase.ocxo1_candidate_dwt_at_edge[i]);
-
-    snprintf(key, sizeof(key), "ocxo1_candidate%u_dwt_elapsed", (unsigned)(i + 1));
-    p.add(key, ocxo_phase.ocxo1_candidate_dwt_elapsed[i]);
-
-    snprintf(key, sizeof(key), "ocxo1_candidate%u_gpt_before", (unsigned)(i + 1));
-    p.add(key, ocxo_phase.ocxo1_candidate_gpt_before[i]);
-
-    snprintf(key, sizeof(key), "ocxo1_candidate%u_gpt_after", (unsigned)(i + 1));
-    p.add(key, ocxo_phase.ocxo1_candidate_gpt_after[i]);
-
-    snprintf(key, sizeof(key), "ocxo2_candidate%u_phase_offset_ns", (unsigned)(i + 1));
-    p.add(key, (int32_t)ocxo_phase.ocxo2_candidate_phase_offset_ns[i]);
-
-    snprintf(key, sizeof(key), "ocxo2_candidate%u_raw_elapsed_ns", (unsigned)(i + 1));
-    p.add(key, (int32_t)ocxo_phase.ocxo2_candidate_raw_elapsed_ns[i]);
-
-    snprintf(key, sizeof(key), "ocxo2_candidate%u_dwt_bracket_cycles", (unsigned)(i + 1));
-    p.add(key, (int32_t)ocxo_phase.ocxo2_candidate_dwt_bracket_cycles[i]);
-
-    snprintf(key, sizeof(key), "ocxo2_candidate%u_dwt_before", (unsigned)(i + 1));
-    p.add(key, ocxo_phase.ocxo2_candidate_dwt_before[i]);
-
-    snprintf(key, sizeof(key), "ocxo2_candidate%u_dwt_after", (unsigned)(i + 1));
-    p.add(key, ocxo_phase.ocxo2_candidate_dwt_after[i]);
-
-    snprintf(key, sizeof(key), "ocxo2_candidate%u_dwt_at_edge", (unsigned)(i + 1));
-    p.add(key, ocxo_phase.ocxo2_candidate_dwt_at_edge[i]);
-
-    snprintf(key, sizeof(key), "ocxo2_candidate%u_dwt_elapsed", (unsigned)(i + 1));
-    p.add(key, ocxo_phase.ocxo2_candidate_dwt_elapsed[i]);
-
-    snprintf(key, sizeof(key), "ocxo2_candidate%u_gpt_before", (unsigned)(i + 1));
-    p.add(key, ocxo_phase.ocxo2_candidate_gpt_before[i]);
-
-    snprintf(key, sizeof(key), "ocxo2_candidate%u_gpt_after", (unsigned)(i + 1));
-    p.add(key, ocxo_phase.ocxo2_candidate_gpt_after[i]);
-  }
-
   p.add("ocxo1_dac_n",      (int32_t)dac_welford_ocxo1.n);
   p.add_fmt("ocxo1_dac_mean",   "%.6f", dac_welford_ocxo1.mean);
   p.add_fmt("ocxo1_dac_stddev", "%.6f", dac_welford_stddev(dac_welford_ocxo1));
