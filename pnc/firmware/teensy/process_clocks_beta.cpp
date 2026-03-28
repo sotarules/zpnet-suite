@@ -1227,6 +1227,35 @@ static Payload cmd_clocks_info(const Payload&) {
   p.add("spin_completions",       pps_spin.completions);
   p.add("spin_misses",            pps_spin.misses);
 
+  p.add("spin_arm_calls",                 diag_spin_arm_calls);
+  p.add("spin_arm_skip_no_dwt_cal",       diag_spin_arm_skip_no_dwt_cal);
+  p.add("spin_arm_skip_time_invalid",     diag_spin_arm_skip_time_invalid);
+  p.add("spin_arm_skip_now_ns_invalid",   diag_spin_arm_skip_now_ns_invalid);
+  p.add("spin_arm_success",               diag_spin_arm_success);
+  p.add("spin_arm_last_dwt_cal_valid",    (bool)diag_spin_arm_last_dwt_cal_valid);
+  p.add("spin_arm_last_time_valid",       (bool)diag_spin_arm_last_time_valid);
+  p.add("spin_arm_last_now_ns",           diag_spin_arm_last_now_ns);
+  p.add("spin_arm_last_handle_valid",     (bool)diag_spin_arm_last_handle_valid);
+
+  p.add("spin_complete_calls",                diag_spin_complete_calls);
+  p.add("spin_complete_fail_not_armed",       diag_spin_complete_fail_not_armed);
+  p.add("spin_complete_fail_no_landed_dwt",   diag_spin_complete_fail_no_landed_dwt);
+  p.add("spin_complete_fail_nano_timeout",    diag_spin_complete_fail_nano_timeout);
+  p.add("spin_complete_fail_shadow_timeout",  diag_spin_complete_fail_shadow_timeout);
+  p.add("spin_complete_fail_bad_tdc",         diag_spin_complete_fail_bad_tdc);
+  p.add("spin_complete_success",              diag_spin_complete_success);
+  p.add("spin_complete_last_armed",           (bool)diag_spin_complete_last_armed);
+  p.add("spin_complete_last_landed_nonzero",  (bool)diag_spin_complete_last_landed_nonzero);
+  p.add("spin_complete_last_nano_timed_out",  (bool)diag_spin_complete_last_nano_timed_out);
+  p.add("spin_complete_last_shadow_timed_out",(bool)diag_spin_complete_last_shadow_timed_out);
+  p.add("spin_complete_last_valid",           (bool)diag_spin_complete_last_valid);
+  p.add("spin_complete_last_landed_dwt",      diag_spin_complete_last_landed_dwt);
+  p.add("spin_complete_last_shadow_dwt",      diag_spin_complete_last_shadow_dwt);
+  p.add("spin_complete_last_isr_dwt",         diag_spin_complete_last_isr_dwt);
+  p.add("spin_complete_last_delta_cycles",    diag_spin_complete_last_delta_cycles);
+  p.add("spin_complete_last_approach_cycles", diag_spin_complete_last_approach_cycles);
+  p.add("spin_complete_last_tdc_correction",  diag_spin_complete_last_tdc_correction);
+
   p.add("dbg_post_dwt",      dbg_post_loop_dwt);
   p.add("dbg_post_shadow",   dbg_post_loop_shadow);
   p.add("dbg_post_isr_cap",  dbg_post_loop_isr_cap);
