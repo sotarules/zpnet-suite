@@ -655,8 +655,8 @@ void clocks_beta_pps(void) {
   ocxo_phase.pps_gnss_ns = pps_gnss_ns;
 
   if (ocxo_phase.detector_valid) {
-    ocxo_phase.ocxo1_edge_gnss_ns = pps_gnss_ns + (uint64_t)ocxo_phase.ocxo1_winner_phase_offset_ns;
-    ocxo_phase.ocxo2_edge_gnss_ns = pps_gnss_ns + (uint64_t)ocxo_phase.ocxo2_winner_phase_offset_ns;
+    ocxo_phase.ocxo1_edge_gnss_ns = pps_gnss_ns + (uint64_t)ocxo_phase.ocxo1_phase_offset_ns;
+    ocxo_phase.ocxo2_edge_gnss_ns = pps_gnss_ns + (uint64_t)ocxo_phase.ocxo2_phase_offset_ns;
   } else {
     ocxo_phase.ocxo1_edge_gnss_ns = 0;
     ocxo_phase.ocxo2_edge_gnss_ns = 0;
@@ -752,58 +752,33 @@ void clocks_beta_pps(void) {
   p.add("ocxo1_dac_hw",      (int32_t)ocxo1_dac.dac_hw_code);
   p.add("ocxo2_dac_hw",      (int32_t)ocxo2_dac.dac_hw_code);
 
-  // ── Generalized phase detector summary ──
-  p.add("phase_detector_valid",  (bool)ocxo_phase.detector_valid);
-  p.add("phase_detector_limit",  (int32_t)ocxo_phase.detector_limit);
-  p.add("phase_detector_timeout_cycles", (int32_t)ocxo_phase.detector_timeout_cycles);
+  p.add("ocxo1_edge_gnss_ns",      ocxo_phase.ocxo1_edge_gnss_ns);
+  p.add("ocxo2_edge_gnss_ns",      ocxo_phase.ocxo2_edge_gnss_ns);
 
-  p.add("ocxo1_match_found",           (bool)ocxo_phase.ocxo1_match_found);
-  p.add("ocxo1_candidates_examined",   (int32_t)ocxo_phase.ocxo1_candidates_examined);
-  p.add("ocxo1_match_iteration_count", (int32_t)ocxo_phase.ocxo1_match_iteration_count);
-  p.add("ocxo1_match_delta_ns",        ocxo_phase.ocxo1_match_delta_ns);
-  p.add("ocxo1_match_prev_phase_offset_ns", (int32_t)ocxo_phase.ocxo1_match_prev_phase_offset_ns);
-  p.add("ocxo1_match_prev_raw_elapsed_ns",  (int32_t)ocxo_phase.ocxo1_match_prev_raw_elapsed_ns);
-  p.add("ocxo1_match_prev_dwt_bracket_cycles", (int32_t)ocxo_phase.ocxo1_match_prev_dwt_bracket_cycles);
-  p.add("ocxo1_match_prev_dwt_before", ocxo_phase.ocxo1_match_prev_dwt_before);
-  p.add("ocxo1_match_prev_dwt_after",  ocxo_phase.ocxo1_match_prev_dwt_after);
-  p.add("ocxo1_match_prev_dwt_at_edge", ocxo_phase.ocxo1_match_prev_dwt_at_edge);
-  p.add("ocxo1_match_prev_dwt_elapsed", ocxo_phase.ocxo1_match_prev_dwt_elapsed);
-  p.add("ocxo1_match_prev_gpt_before", ocxo_phase.ocxo1_match_prev_gpt_before);
-  p.add("ocxo1_match_prev_gpt_after",  ocxo_phase.ocxo1_match_prev_gpt_after);
-  p.add("ocxo1_winner_phase_offset_ns", (int32_t)ocxo_phase.ocxo1_winner_phase_offset_ns);
-  p.add("ocxo1_winner_raw_elapsed_ns",  (int32_t)ocxo_phase.ocxo1_winner_raw_elapsed_ns);
-  p.add("ocxo1_winner_dwt_bracket_cycles", (int32_t)ocxo_phase.ocxo1_winner_dwt_bracket_cycles);
-  p.add("ocxo1_winner_dwt_before", ocxo_phase.ocxo1_winner_dwt_before);
-  p.add("ocxo1_winner_dwt_after",  ocxo_phase.ocxo1_winner_dwt_after);
-  p.add("ocxo1_winner_dwt_at_edge", ocxo_phase.ocxo1_winner_dwt_at_edge);
-  p.add("ocxo1_winner_dwt_elapsed", ocxo_phase.ocxo1_winner_dwt_elapsed);
-  p.add("ocxo1_winner_gpt_before", ocxo_phase.ocxo1_winner_gpt_before);
-  p.add("ocxo1_winner_gpt_after",  ocxo_phase.ocxo1_winner_gpt_after);
+  p.add("phase_detector_valid",   (bool)ocxo_phase.detector_valid);
+
+  p.add("ocxo1_phase_captured",   (bool)ocxo_phase.ocxo1_captured);
+  p.add("ocxo1_phase_valid",      (bool)ocxo_phase.ocxo1_valid);
+  p.add("ocxo1_phase_isr_dwt",    ocxo_phase.ocxo1_isr_dwt);
+  p.add("ocxo1_phase_gpt_at_fire", ocxo_phase.ocxo1_gpt_at_fire);
+  p.add("ocxo1_phase_dwt_elapsed", ocxo_phase.ocxo1_dwt_elapsed);
+  p.add("ocxo1_phase_elapsed_ns",  ocxo_phase.ocxo1_elapsed_ns);
+  p.add("ocxo1_phase_offset_ns",   (int32_t)ocxo_phase.ocxo1_phase_offset_ns);
   p.add("ocxo1_edge_gnss_ns",      ocxo_phase.ocxo1_edge_gnss_ns);
 
-  p.add("ocxo2_match_found",           (bool)ocxo_phase.ocxo2_match_found);
-  p.add("ocxo2_candidates_examined",   (int32_t)ocxo_phase.ocxo2_candidates_examined);
-  p.add("ocxo2_match_iteration_count", (int32_t)ocxo_phase.ocxo2_match_iteration_count);
-  p.add("ocxo2_match_delta_ns",        ocxo_phase.ocxo2_match_delta_ns);
-  p.add("ocxo2_match_prev_phase_offset_ns", (int32_t)ocxo_phase.ocxo2_match_prev_phase_offset_ns);
-  p.add("ocxo2_match_prev_raw_elapsed_ns",  (int32_t)ocxo_phase.ocxo2_match_prev_raw_elapsed_ns);
-  p.add("ocxo2_match_prev_dwt_bracket_cycles", (int32_t)ocxo_phase.ocxo2_match_prev_dwt_bracket_cycles);
-  p.add("ocxo2_match_prev_dwt_before", ocxo_phase.ocxo2_match_prev_dwt_before);
-  p.add("ocxo2_match_prev_dwt_after",  ocxo_phase.ocxo2_match_prev_dwt_after);
-  p.add("ocxo2_match_prev_dwt_at_edge", ocxo_phase.ocxo2_match_prev_dwt_at_edge);
-  p.add("ocxo2_match_prev_dwt_elapsed", ocxo_phase.ocxo2_match_prev_dwt_elapsed);
-  p.add("ocxo2_match_prev_gpt_before", ocxo_phase.ocxo2_match_prev_gpt_before);
-  p.add("ocxo2_match_prev_gpt_after",  ocxo_phase.ocxo2_match_prev_gpt_after);
-  p.add("ocxo2_winner_phase_offset_ns", (int32_t)ocxo_phase.ocxo2_winner_phase_offset_ns);
-  p.add("ocxo2_winner_raw_elapsed_ns",  (int32_t)ocxo_phase.ocxo2_winner_raw_elapsed_ns);
-  p.add("ocxo2_winner_dwt_bracket_cycles", (int32_t)ocxo_phase.ocxo2_winner_dwt_bracket_cycles);
-  p.add("ocxo2_winner_dwt_before", ocxo_phase.ocxo2_winner_dwt_before);
-  p.add("ocxo2_winner_dwt_after",  ocxo_phase.ocxo2_winner_dwt_after);
-  p.add("ocxo2_winner_dwt_at_edge", ocxo_phase.ocxo2_winner_dwt_at_edge);
-  p.add("ocxo2_winner_dwt_elapsed", ocxo_phase.ocxo2_winner_dwt_elapsed);
-  p.add("ocxo2_winner_gpt_before", ocxo_phase.ocxo2_winner_gpt_before);
-  p.add("ocxo2_winner_gpt_after",  ocxo_phase.ocxo2_winner_gpt_after);
+  p.add("ocxo2_phase_captured",   (bool)ocxo_phase.ocxo2_captured);
+  p.add("ocxo2_phase_valid",      (bool)ocxo_phase.ocxo2_valid);
+  p.add("ocxo2_phase_isr_dwt",    ocxo_phase.ocxo2_isr_dwt);
+  p.add("ocxo2_phase_gpt_at_fire", ocxo_phase.ocxo2_gpt_at_fire);
+  p.add("ocxo2_phase_dwt_elapsed", ocxo_phase.ocxo2_dwt_elapsed);
+  p.add("ocxo2_phase_elapsed_ns",  ocxo_phase.ocxo2_elapsed_ns);
+  p.add("ocxo2_phase_offset_ns",   (int32_t)ocxo_phase.ocxo2_phase_offset_ns);
   p.add("ocxo2_edge_gnss_ns",      ocxo_phase.ocxo2_edge_gnss_ns);
+
+  p.add("diag_ocxo1_phase_captures", diag_ocxo1_phase_captures);
+  p.add("diag_ocxo1_phase_misses",   diag_ocxo1_phase_misses);
+  p.add("diag_ocxo2_phase_captures", diag_ocxo2_phase_captures);
+  p.add("diag_ocxo2_phase_misses",   diag_ocxo2_phase_misses);
 
   p.add("ocxo1_gnss_ns_per_pps", ocxo_phase.ocxo1_gnss_ns_per_pps);
   p.add("ocxo2_gnss_ns_per_pps", ocxo_phase.ocxo2_gnss_ns_per_pps);
@@ -1099,6 +1074,11 @@ static Payload cmd_report(const Payload&) {
     p.add("dwt_ppb", 0.0); p.add("ocxo1_ppb", 0.0); p.add("ocxo2_ppb", 0.0);
   }
 
+  p.add("diag_ocxo1_phase_captures", diag_ocxo1_phase_captures);
+  p.add("diag_ocxo1_phase_misses",   diag_ocxo1_phase_misses);
+  p.add("diag_ocxo2_phase_captures", diag_ocxo2_phase_captures);
+  p.add("diag_ocxo2_phase_misses",   diag_ocxo2_phase_misses);
+
   return p;
 }
 
@@ -1274,109 +1254,35 @@ static Payload cmd_phase_info(const Payload&) {
     p.add("campaign_seconds", campaign_seconds);
   }
 
-  p.add("phase_valid",                   (bool)ocxo_phase.valid);
-  p.add("phase_captures",                ocxo_phase.captures);
-  p.add("phase_dwt_at_pps",              ocxo_phase.dwt_at_pps);
-  p.add("phase_pps_gnss_ns",             ocxo_phase.pps_gnss_ns);
-  p.add("phase_detector_valid",          (bool)ocxo_phase.detector_valid);
-  p.add("phase_detector_limit",          (int32_t)ocxo_phase.detector_limit);
-  p.add("phase_detector_timeout_cycles", (int32_t)ocxo_phase.detector_timeout_cycles);
+  p.add("phase_detector_valid", (bool)ocxo_phase.detector_valid);
+  p.add("dwt_at_pps",          ocxo_phase.dwt_at_pps);
 
-  p.add("phase_residual_valid",          (bool)ocxo_phase.residual_valid);
-  p.add("phase_ocxo1_gnss_ns_per_pps",   ocxo_phase.ocxo1_gnss_ns_per_pps);
-  p.add("phase_ocxo1_residual_ns",       ocxo_phase.ocxo1_residual_ns);
-  p.add("phase_prev_ocxo1_edge_gnss_ns", ocxo_phase.prev_ocxo1_edge_gnss_ns);
+  p.add("ocxo1_captured",      (bool)ocxo_phase.ocxo1_captured);
+  p.add("ocxo1_valid",         (bool)ocxo_phase.ocxo1_valid);
+  p.add("ocxo1_isr_dwt",       ocxo_phase.ocxo1_isr_dwt);
+  p.add("ocxo1_gpt_at_fire",   ocxo_phase.ocxo1_gpt_at_fire);
+  p.add("ocxo1_dwt_elapsed",   ocxo_phase.ocxo1_dwt_elapsed);
+  p.add("ocxo1_elapsed_ns",    ocxo_phase.ocxo1_elapsed_ns);
+  p.add("ocxo1_phase_offset_ns", (int32_t)ocxo_phase.ocxo1_phase_offset_ns);
+  p.add("ocxo1_edge_gnss_ns",  ocxo_phase.ocxo1_edge_gnss_ns);
 
-  p.add("phase_diag_ocxo1_successes",             diag_phase_ocxo1_successes);
-  p.add("phase_diag_ocxo1_failures",              diag_phase_ocxo1_failures);
-  p.add("phase_diag_ocxo1_last_iterations",       diag_phase_ocxo1_last_iterations);
-  p.add("phase_diag_ocxo1_high_water_iterations", diag_phase_ocxo1_high_water_iterations);
+  p.add("ocxo2_captured",      (bool)ocxo_phase.ocxo2_captured);
+  p.add("ocxo2_valid",         (bool)ocxo_phase.ocxo2_valid);
+  p.add("ocxo2_isr_dwt",       ocxo_phase.ocxo2_isr_dwt);
+  p.add("ocxo2_gpt_at_fire",   ocxo_phase.ocxo2_gpt_at_fire);
+  p.add("ocxo2_dwt_elapsed",   ocxo_phase.ocxo2_dwt_elapsed);
+  p.add("ocxo2_elapsed_ns",    ocxo_phase.ocxo2_elapsed_ns);
+  p.add("ocxo2_phase_offset_ns", (int32_t)ocxo_phase.ocxo2_phase_offset_ns);
+  p.add("ocxo2_edge_gnss_ns",  ocxo_phase.ocxo2_edge_gnss_ns);
 
-  // ── OCXO1 summary ──
-  p.add("phase_ocxo1_match_found",                   (bool)ocxo_phase.ocxo1_match_found);
-  p.add("phase_ocxo1_candidates_examined",           ocxo_phase.ocxo1_candidates_examined);
-  p.add("phase_ocxo1_match_iteration_count",         ocxo_phase.ocxo1_match_iteration_count);
-  p.add("phase_ocxo1_match_delta_ns",                ocxo_phase.ocxo1_match_delta_ns);
-  p.add("phase_ocxo1_match_prev_phase_offset_ns",    ocxo_phase.ocxo1_match_prev_phase_offset_ns);
-  p.add("phase_ocxo1_match_prev_raw_elapsed_ns",     ocxo_phase.ocxo1_match_prev_raw_elapsed_ns);
-  p.add("phase_ocxo1_match_prev_dwt_bracket_cycles", ocxo_phase.ocxo1_match_prev_dwt_bracket_cycles);
-  p.add("phase_ocxo1_match_prev_dwt_before",         ocxo_phase.ocxo1_match_prev_dwt_before);
-  p.add("phase_ocxo1_match_prev_dwt_after",          ocxo_phase.ocxo1_match_prev_dwt_after);
-  p.add("phase_ocxo1_match_prev_dwt_at_edge",        ocxo_phase.ocxo1_match_prev_dwt_at_edge);
-  p.add("phase_ocxo1_match_prev_dwt_elapsed",        ocxo_phase.ocxo1_match_prev_dwt_elapsed);
-  p.add("phase_ocxo1_match_prev_gpt_before",         ocxo_phase.ocxo1_match_prev_gpt_before);
-  p.add("phase_ocxo1_match_prev_gpt_after",          ocxo_phase.ocxo1_match_prev_gpt_after);
-  p.add("phase_ocxo1_winner_phase_offset_ns",        ocxo_phase.ocxo1_winner_phase_offset_ns);
-  p.add("phase_ocxo1_winner_raw_elapsed_ns",         ocxo_phase.ocxo1_winner_raw_elapsed_ns);
-  p.add("phase_ocxo1_winner_dwt_bracket_cycles",     ocxo_phase.ocxo1_winner_dwt_bracket_cycles);
-  p.add("phase_ocxo1_winner_dwt_before",             ocxo_phase.ocxo1_winner_dwt_before);
-  p.add("phase_ocxo1_winner_dwt_after",              ocxo_phase.ocxo1_winner_dwt_after);
-  p.add("phase_ocxo1_winner_dwt_at_edge",            ocxo_phase.ocxo1_winner_dwt_at_edge);
-  p.add("phase_ocxo1_winner_dwt_elapsed",            ocxo_phase.ocxo1_winner_dwt_elapsed);
-  p.add("phase_ocxo1_winner_gpt_before",             ocxo_phase.ocxo1_winner_gpt_before);
-  p.add("phase_ocxo1_winner_gpt_after",              ocxo_phase.ocxo1_winner_gpt_after);
-  p.add("phase_ocxo1_edge_gnss_ns",                  ocxo_phase.ocxo1_edge_gnss_ns);
+  p.add("ocxo1_residual_ns",   ocxo_phase.ocxo1_residual_ns);
+  p.add("ocxo2_residual_ns",   ocxo_phase.ocxo2_residual_ns);
+  p.add("residual_valid",      (bool)ocxo_phase.residual_valid);
 
-  // ── OCXO1 candidate cycle-only view (10 candidates) ──
-  p.add("phase_ocxo1_candidate01_dwt_bracket_cycles",  ocxo_phase.ocxo1_candidate_dwt_bracket_cycles[0]);
-  p.add("phase_ocxo1_candidate01_dwt_elapsed",         ocxo_phase.ocxo1_candidate_dwt_elapsed[0]);
-
-  p.add("phase_ocxo1_candidate02_dwt_bracket_cycles",  ocxo_phase.ocxo1_candidate_dwt_bracket_cycles[1]);
-  p.add("phase_ocxo1_candidate02_dwt_elapsed",         ocxo_phase.ocxo1_candidate_dwt_elapsed[1]);
-
-  p.add("phase_ocxo1_candidate03_dwt_bracket_cycles",  ocxo_phase.ocxo1_candidate_dwt_bracket_cycles[2]);
-  p.add("phase_ocxo1_candidate03_dwt_elapsed",         ocxo_phase.ocxo1_candidate_dwt_elapsed[2]);
-
-  p.add("phase_ocxo1_candidate04_dwt_bracket_cycles",  ocxo_phase.ocxo1_candidate_dwt_bracket_cycles[3]);
-  p.add("phase_ocxo1_candidate04_dwt_elapsed",         ocxo_phase.ocxo1_candidate_dwt_elapsed[3]);
-
-  p.add("phase_ocxo1_candidate05_dwt_bracket_cycles",  ocxo_phase.ocxo1_candidate_dwt_bracket_cycles[4]);
-  p.add("phase_ocxo1_candidate05_dwt_elapsed",         ocxo_phase.ocxo1_candidate_dwt_elapsed[4]);
-
-  p.add("phase_ocxo1_candidate06_dwt_bracket_cycles",  ocxo_phase.ocxo1_candidate_dwt_bracket_cycles[5]);
-  p.add("phase_ocxo1_candidate06_dwt_elapsed",         ocxo_phase.ocxo1_candidate_dwt_elapsed[5]);
-
-  p.add("phase_ocxo1_candidate07_dwt_bracket_cycles",  ocxo_phase.ocxo1_candidate_dwt_bracket_cycles[6]);
-  p.add("phase_ocxo1_candidate07_dwt_elapsed",         ocxo_phase.ocxo1_candidate_dwt_elapsed[6]);
-
-  p.add("phase_ocxo1_candidate08_dwt_bracket_cycles",  ocxo_phase.ocxo1_candidate_dwt_bracket_cycles[7]);
-  p.add("phase_ocxo1_candidate08_dwt_elapsed",         ocxo_phase.ocxo1_candidate_dwt_elapsed[7]);
-
-  p.add("phase_ocxo1_candidate09_dwt_bracket_cycles",  ocxo_phase.ocxo1_candidate_dwt_bracket_cycles[8]);
-  p.add("phase_ocxo1_candidate09_dwt_elapsed",         ocxo_phase.ocxo1_candidate_dwt_elapsed[8]);
-
-  p.add("phase_ocxo1_candidate10_dwt_bracket_cycles", ocxo_phase.ocxo1_candidate_dwt_bracket_cycles[9]);
-  p.add("phase_ocxo1_candidate10_dwt_elapsed",        ocxo_phase.ocxo1_candidate_dwt_elapsed[9]);
-
-  p.add("phase_ocxo1_candidate11_dwt_bracket_cycles", ocxo_phase.ocxo1_candidate_dwt_bracket_cycles[10]);
-  p.add("phase_ocxo1_candidate11_dwt_elapsed",        ocxo_phase.ocxo1_candidate_dwt_elapsed[10]);
-
-  p.add("phase_ocxo1_candidate12_dwt_bracket_cycles", ocxo_phase.ocxo1_candidate_dwt_bracket_cycles[11]);
-  p.add("phase_ocxo1_candidate12_dwt_elapsed",        ocxo_phase.ocxo1_candidate_dwt_elapsed[11]);
-
-  p.add("phase_ocxo1_candidate13_dwt_bracket_cycles", ocxo_phase.ocxo1_candidate_dwt_bracket_cycles[12]);
-  p.add("phase_ocxo1_candidate13_dwt_elapsed",        ocxo_phase.ocxo1_candidate_dwt_elapsed[12]);
-
-  p.add("phase_ocxo1_candidate14_dwt_bracket_cycles", ocxo_phase.ocxo1_candidate_dwt_bracket_cycles[13]);
-  p.add("phase_ocxo1_candidate14_dwt_elapsed",        ocxo_phase.ocxo1_candidate_dwt_elapsed[13]);
-
-  p.add("phase_ocxo1_candidate15_dwt_bracket_cycles", ocxo_phase.ocxo1_candidate_dwt_bracket_cycles[14]);
-  p.add("phase_ocxo1_candidate15_dwt_elapsed",        ocxo_phase.ocxo1_candidate_dwt_elapsed[14]);
-
-  p.add("phase_ocxo1_candidate16_dwt_bracket_cycles", ocxo_phase.ocxo1_candidate_dwt_bracket_cycles[15]);
-  p.add("phase_ocxo1_candidate16_dwt_elapsed",        ocxo_phase.ocxo1_candidate_dwt_elapsed[15]);
-
-  p.add("phase_ocxo1_candidate17_dwt_bracket_cycles", ocxo_phase.ocxo1_candidate_dwt_bracket_cycles[16]);
-  p.add("phase_ocxo1_candidate17_dwt_elapsed",        ocxo_phase.ocxo1_candidate_dwt_elapsed[16]);
-
-  p.add("phase_ocxo1_candidate18_dwt_bracket_cycles", ocxo_phase.ocxo1_candidate_dwt_bracket_cycles[17]);
-  p.add("phase_ocxo1_candidate18_dwt_elapsed",        ocxo_phase.ocxo1_candidate_dwt_elapsed[17]);
-
-  p.add("phase_ocxo1_candidate19_dwt_bracket_cycles", ocxo_phase.ocxo1_candidate_dwt_bracket_cycles[18]);
-  p.add("phase_ocxo1_candidate19_dwt_elapsed",        ocxo_phase.ocxo1_candidate_dwt_elapsed[18]);
-
-  p.add("phase_ocxo1_candidate20_dwt_bracket_cycles", ocxo_phase.ocxo1_candidate_dwt_bracket_cycles[19]);
-  p.add("phase_ocxo1_candidate20_dwt_elapsed",        ocxo_phase.ocxo1_candidate_dwt_elapsed[19]);
+  p.add("captures_ocxo1",      diag_ocxo1_phase_captures);
+  p.add("misses_ocxo1",        diag_ocxo1_phase_misses);
+  p.add("captures_ocxo2",      diag_ocxo2_phase_captures);
+  p.add("misses_ocxo2",        diag_ocxo2_phase_misses);
 
   return p;
 }

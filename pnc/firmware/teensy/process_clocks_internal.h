@@ -54,8 +54,6 @@ static inline uint64_t dwt_ns_to_cycles(uint64_t ns)
   return (ns * DWT_NS_DEN) / DWT_NS_NUM;
 }
 
-static constexpr uint32_t OCXO_PHASE_CAPTURE_TIMEOUT_CYCLES = 16384;  // ~16.3 µs at 1008 MHz
-
 // ============================================================================
 // Continuous DWT-to-GNSS Calibration (alpha-owned, beta-readable)
 // ============================================================================
@@ -106,6 +104,11 @@ static constexpr uint32_t ISR_GNSS_RAW_EXPECTED = TICKS_10MHZ_PER_SECOND;
 static constexpr uint32_t ISR_OCXO1_EXPECTED = TICKS_10MHZ_PER_SECOND;
 static constexpr uint32_t ISR_OCXO2_EXPECTED = TICKS_10MHZ_PER_SECOND;
 
+// Ticks ahead of PPS snapshot to arm GPT output compare.
+// Must be large enough that the compare value is still in the future
+// when the PPS ISR finishes the arming writes (~280 ns / ~3 ticks).
+static constexpr uint32_t OCXO_PHASE_ARM_OFFSET_TICKS = 50;
+
 // ============================================================================
 // PPS diagnostics (alpha-owned, beta-readable)
 // ============================================================================
@@ -144,18 +147,11 @@ extern volatile uint32_t diag_qread_last_lo2;
 
 extern volatile bool pps_fired;
 
-// ============================================================================
-// Phase detector diagnostics (alpha-owned, beta-readable)
-// ============================================================================
-
-extern volatile uint32_t diag_phase_ocxo1_successes;
-extern volatile uint32_t diag_phase_ocxo2_successes;
-extern volatile uint32_t diag_phase_ocxo1_failures;
-extern volatile uint32_t diag_phase_ocxo2_failures;
-extern volatile uint32_t diag_phase_ocxo1_last_iterations;
-extern volatile uint32_t diag_phase_ocxo2_last_iterations;
-extern volatile uint32_t diag_phase_ocxo1_high_water_iterations;
-extern volatile uint32_t diag_phase_ocxo2_high_water_iterations;
+// ── Phase capture diagnostics (alpha-owned, beta-readable) ──
+extern volatile uint32_t diag_ocxo1_phase_captures;
+extern volatile uint32_t diag_ocxo2_phase_captures;
+extern volatile uint32_t diag_ocxo1_phase_misses;
+extern volatile uint32_t diag_ocxo2_phase_misses;
 
 // ============================================================================
 // OCXO DAC state — dual oscillator
@@ -353,134 +349,58 @@ struct spin_capture_t {
 extern spin_capture_t pps_spin;
 
 // ============================================================================
-// Phase detector configuration
-// ============================================================================
-
-static constexpr uint32_t OCXO_PHASE_DETECTOR_LIMIT = 20;
-
-
-// ============================================================================
-// OCXO phase capture — generalized <n> detector with forensic stream capture
+// OCXO phase capture — v28 GPT output-compare ISR architecture
 //
-// Model:
-//   - Alpha harvests up to OCXO_PHASE_DETECTOR_LIMIT candidates per OCXO
-//   - Each candidate is a phase-offset observation derived from the same loop
-//   - The detector accepts the first exact consecutive match
-//   - Winner + matching predecessor are surfaced as summary telemetry
-//   - Full candidate streams are retained for forensic inspection
+// Each GPT fires a one-shot output-compare ISR on the first OCXO
+// edge after PPS.  The ISR captures DWT_CYCCNT with deterministic,
+// characterizable latency (same mechanism as PPS ISR).
 //
-// Notes:
-//   - This struct intentionally retires the old phase1/phase2 naming scheme
-//   - The candidate arrays are diagnostic only; they do not imply authority
-//   - Canonical edge/residual fields are only meaningful when detector_valid=true
+// Phase offset = (dwt_at_ocxo_edge - dwt_at_pps_edge) → ns → % 100.
+//
+// Diagnostic fields (isr_dwt, gpt_at_fire, dwt_elapsed) enable ISR
+// latency histogram analysis via tdc_analyzer.
 // ============================================================================
 
 struct ocxo_phase_capture_t {
   // ── PPS anchor ──
-  uint32_t dwt_at_pps;                    // DWT at PPS edge (ISR-compensated)
-  uint64_t pps_gnss_ns;                   // absolute GNSS ns at this PPS (beta-owned)
+  uint32_t dwt_at_pps;               // best-available DWT at PPS edge
 
-  // ── Detector configuration snapshot ──
-  uint32_t detector_limit;                // usually OCXO_PHASE_DETECTOR_LIMIT
-  uint32_t detector_timeout_cycles;       // capture timeout budget used this PPS
+  // ── OCXO1 ISR capture ──
+  uint32_t ocxo1_isr_dwt;            // raw DWT_CYCCNT from GPT1 ISR
+  uint32_t ocxo1_gpt_at_fire;        // GPT1_CNT at ISR entry (diagnostic)
+  uint32_t ocxo1_dwt_elapsed;        // isr_dwt - ISR_ENTRY - dwt_at_pps
+  uint32_t ocxo1_elapsed_ns;         // dwt_elapsed converted via calibrated ratio
+  uint32_t ocxo1_phase_offset_ns;    // elapsed_ns % 100
+  bool     ocxo1_captured;           // GPT1 ISR fired successfully
+  bool     ocxo1_valid;              // phase computation completed
 
-  // ── Detector validity / lifecycle ──
-  bool     detector_valid;                // true when both OCXOs found an exact consecutive match
-  bool     valid;                         // canonical row validity
-  uint32_t captures;                      // successful detector captures
+  // ── OCXO2 ISR capture ──
+  uint32_t ocxo2_isr_dwt;            // raw DWT_CYCCNT from GPT2 ISR
+  uint32_t ocxo2_gpt_at_fire;        // GPT2_CNT at ISR entry (diagnostic)
+  uint32_t ocxo2_dwt_elapsed;        // isr_dwt - ISR_ENTRY - dwt_at_pps
+  uint32_t ocxo2_elapsed_ns;         // dwt_elapsed converted via calibrated ratio
+  uint32_t ocxo2_phase_offset_ns;    // elapsed_ns % 100
+  bool     ocxo2_captured;           // GPT2 ISR fired successfully
+  bool     ocxo2_valid;              // phase computation completed
 
-  // ── OCXO1 detector summary ──
-  uint32_t ocxo1_candidates_examined;
-  bool     ocxo1_match_found;
-  uint32_t ocxo1_match_iteration_count;   // 1-based iteration where match completed
-  int32_t  ocxo1_match_delta_ns;          // winner - previous candidate (or last delta on failure)
+  // ── Combined validity ──
+  bool     detector_valid;            // both OCXOs valid
 
-  // previous candidate in the matching pair / last compared pair
-  uint32_t ocxo1_match_prev_dwt_before;
-  uint32_t ocxo1_match_prev_dwt_after;
-  uint32_t ocxo1_match_prev_gpt_before;
-  uint32_t ocxo1_match_prev_gpt_after;
-  uint32_t ocxo1_match_prev_dwt_bracket_cycles;
-  uint32_t ocxo1_match_prev_dwt_at_edge;
-  uint32_t ocxo1_match_prev_dwt_elapsed;
-  uint32_t ocxo1_match_prev_raw_elapsed_ns;
-  uint32_t ocxo1_match_prev_phase_offset_ns;
-
-  // winning candidate
-  uint32_t ocxo1_winner_dwt_before;
-  uint32_t ocxo1_winner_dwt_after;
-  uint32_t ocxo1_winner_gpt_before;
-  uint32_t ocxo1_winner_gpt_after;
-  uint32_t ocxo1_winner_dwt_bracket_cycles;
-  uint32_t ocxo1_winner_dwt_at_edge;
-  uint32_t ocxo1_winner_dwt_elapsed;
-  uint32_t ocxo1_winner_raw_elapsed_ns;
-  uint32_t ocxo1_winner_phase_offset_ns;
-
-  // ── OCXO2 detector summary ──
-  uint32_t ocxo2_candidates_examined;
-  bool     ocxo2_match_found;
-  uint32_t ocxo2_match_iteration_count;
-  int32_t  ocxo2_match_delta_ns;
-
-  uint32_t ocxo2_match_prev_dwt_before;
-  uint32_t ocxo2_match_prev_dwt_after;
-  uint32_t ocxo2_match_prev_gpt_before;
-  uint32_t ocxo2_match_prev_gpt_after;
-  uint32_t ocxo2_match_prev_dwt_bracket_cycles;
-  uint32_t ocxo2_match_prev_dwt_at_edge;
-  uint32_t ocxo2_match_prev_dwt_elapsed;
-  uint32_t ocxo2_match_prev_raw_elapsed_ns;
-  uint32_t ocxo2_match_prev_phase_offset_ns;
-
-  uint32_t ocxo2_winner_dwt_before;
-  uint32_t ocxo2_winner_dwt_after;
-  uint32_t ocxo2_winner_gpt_before;
-  uint32_t ocxo2_winner_gpt_after;
-  uint32_t ocxo2_winner_dwt_bracket_cycles;
-  uint32_t ocxo2_winner_dwt_at_edge;
-  uint32_t ocxo2_winner_dwt_elapsed;
-  uint32_t ocxo2_winner_raw_elapsed_ns;
-  uint32_t ocxo2_winner_phase_offset_ns;
-
-  // ── Full candidate-stream forensics (direct members; alpha currently expects these) ──
-  uint32_t ocxo1_candidate_phase_offset_ns[OCXO_PHASE_DETECTOR_LIMIT];
-  uint32_t ocxo1_candidate_raw_elapsed_ns[OCXO_PHASE_DETECTOR_LIMIT];
-  uint32_t ocxo1_candidate_dwt_bracket_cycles[OCXO_PHASE_DETECTOR_LIMIT];
-  uint32_t ocxo1_candidate_dwt_before[OCXO_PHASE_DETECTOR_LIMIT];
-  uint32_t ocxo1_candidate_dwt_after[OCXO_PHASE_DETECTOR_LIMIT];
-  uint32_t ocxo1_candidate_dwt_at_edge[OCXO_PHASE_DETECTOR_LIMIT];
-  uint32_t ocxo1_candidate_dwt_elapsed[OCXO_PHASE_DETECTOR_LIMIT];
-  uint32_t ocxo1_candidate_gpt_before[OCXO_PHASE_DETECTOR_LIMIT];
-  uint32_t ocxo1_candidate_gpt_after[OCXO_PHASE_DETECTOR_LIMIT];
-
-  uint32_t ocxo2_candidate_phase_offset_ns[OCXO_PHASE_DETECTOR_LIMIT];
-  uint32_t ocxo2_candidate_raw_elapsed_ns[OCXO_PHASE_DETECTOR_LIMIT];
-  uint32_t ocxo2_candidate_dwt_bracket_cycles[OCXO_PHASE_DETECTOR_LIMIT];
-  uint32_t ocxo2_candidate_dwt_before[OCXO_PHASE_DETECTOR_LIMIT];
-  uint32_t ocxo2_candidate_dwt_after[OCXO_PHASE_DETECTOR_LIMIT];
-  uint32_t ocxo2_candidate_dwt_at_edge[OCXO_PHASE_DETECTOR_LIMIT];
-  uint32_t ocxo2_candidate_dwt_elapsed[OCXO_PHASE_DETECTOR_LIMIT];
-  uint32_t ocxo2_candidate_gpt_before[OCXO_PHASE_DETECTOR_LIMIT];
-  uint32_t ocxo2_candidate_gpt_after[OCXO_PHASE_DETECTOR_LIMIT];
-
-  // ── Canonical absolute edge timestamps (winner projected into GNSS time) ──
+  // ── Canonical absolute edge timestamps (beta-owned) ──
+  uint64_t pps_gnss_ns;
   uint64_t ocxo1_edge_gnss_ns;
   uint64_t ocxo2_edge_gnss_ns;
 
-  // ── Per-second differencing ──
+  // ── Per-second differencing (beta-owned) ──
   uint64_t prev_ocxo1_edge_gnss_ns;
   uint64_t prev_ocxo2_edge_gnss_ns;
-
   int64_t  ocxo1_gnss_ns_per_pps;
   int64_t  ocxo2_gnss_ns_per_pps;
-
   int64_t  ocxo1_residual_ns;
   int64_t  ocxo2_residual_ns;
-
   bool     residual_valid;
 
-  // ── Servo before/after snapshot (written by beta after servo runs) ──
+  // ── Servo before/after snapshot (beta-owned) ──
   uint16_t ocxo1_dac_before;
   uint16_t ocxo1_dac_after;
   uint16_t ocxo2_dac_before;
@@ -488,6 +408,14 @@ struct ocxo_phase_capture_t {
 };
 
 extern ocxo_phase_capture_t ocxo_phase;
+
+// ── GPT ISR capture state (alpha-owned, read by pps_asap_callback) ──
+extern volatile uint32_t ocxo1_phase_isr_dwt;
+extern volatile bool     ocxo1_phase_captured;
+extern volatile uint32_t ocxo1_phase_gpt_at_fire;
+extern volatile uint32_t ocxo2_phase_isr_dwt;
+extern volatile bool     ocxo2_phase_captured;
+extern volatile uint32_t ocxo2_phase_gpt_at_fire;
 
 // ============================================================================
 // 64-bit accumulators (campaign-scoped)

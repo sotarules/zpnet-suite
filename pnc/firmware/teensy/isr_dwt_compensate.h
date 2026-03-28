@@ -67,9 +67,14 @@
 // Calibrate using TIMEPOP DIAG: adjust until dwt_pred_mean ≈ 0.
 static constexpr uint32_t QTIMER1_CH2_ISR_ENTRY_DWT_CYCLES = 54;
 
-// GPT2 ISR entry latency — retained for PPS-path reference.
-// GPT2 is now dedicated to OCXO2 counting; no longer used for
-// TimePop compare.
+// GPT1 ISR entry latency — initial estimate matching GPT2.
+// Both are direct-vector GPT ISRs with identical dispatch paths.
+// Calibrate empirically via phase ISR histogram (tdc_analyzer pattern).
+static constexpr uint32_t GPT1_ISR_ENTRY_DWT_CYCLES = 49;
+
+// GPT2 ISR entry latency — v28 OCXO2 phase capture.
+// Originally measured during TimePop-on-GPT2 era; now used for
+// the OCXO2 output-compare phase ISR.  Calibrate via tdc_analyzer.
 static constexpr uint32_t GPT2_ISR_ENTRY_DWT_CYCLES = 49;
 
 // ============================================================================
@@ -106,7 +111,15 @@ static inline uint32_t dwt_at_qtimer1_ch2_compare(uint32_t isr_dwt_cyccnt) {
 }
 
 // ============================================================================
-// Convenience: GPT2 ISR (retained for reference)
+// Convenience: GPT2 ISR (OCXO1 phase capture)
+// ============================================================================
+
+static inline uint32_t dwt_at_gpt1_compare(uint32_t isr_dwt_cyccnt) {
+  return dwt_at_event(isr_dwt_cyccnt, GPT1_ISR_ENTRY_DWT_CYCLES);
+}
+
+// ============================================================================
+// Convenience: GPT2 ISR (OCXO2 phase capture)
 // ============================================================================
 
 static inline uint32_t dwt_at_gpt2_compare(uint32_t isr_dwt_cyccnt) {

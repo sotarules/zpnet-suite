@@ -1,5 +1,5 @@
 """
-ZPNet TDC Analyzer — v7 (TimePop v8.1 Priority Queue Edition)
+ZPNet TDC Analyzer — v8 (Fragment-aware Edition)
 
 Analyzes the PPS spin capture data to derive TDC correction constants
 at 1008 MHz for the nested ISR shadow-write architecture.
@@ -18,7 +18,7 @@ Architecture (v8.1):
   TimePop scheduler delivers sub-nanosecond GNSS-phase-locked precision).
   The shadow-write loop then runs until PPS arrives.
 
-Key fields from TIMEBASE rows:
+Key fields from TIMEBASE rows (inside fragment sub-dict for v28+ campaigns):
 
   spin_valid            — true if both spin and ISR captured successfully
   spin_delta_cycles     — isr_dwt - shadow_dwt (the TDC measurement)
@@ -122,6 +122,14 @@ def fetch_timebase(campaign: str) -> List[Dict[str, Any]]:
     return result
 
 
+def _frag(row: Dict[str, Any], key: str, default=None):
+    """Read a field from the fragment sub-dict, falling back to top-level."""
+    frag = row.get("fragment")
+    if frag and key in frag:
+        return frag[key]
+    return row.get(key, default)
+
+
 def find_clusters(
     values: List[int],
     min_count: int = 3,
@@ -144,7 +152,7 @@ def analyze(campaign: str, limit: int = 0) -> None:
         return
 
     print("=" * 70)
-    print(f"ZPNet TDC ANALYZER v7 — TimePop v8.1 Priority Queue Edition")
+    print(f"ZPNet TDC ANALYZER v8 — Fragment-aware Edition")
     print(f"Campaign: {campaign}  ({len(rows)} TIMEBASE records)")
     print("=" * 70)
     print()
@@ -163,7 +171,7 @@ def analyze(campaign: str, limit: int = 0) -> None:
         if limit and len(deltas) >= limit:
             break
 
-        valid = r.get("spin_valid")
+        valid = _frag(r, "spin_valid")
         if valid is None:
             skipped_no_field += 1
             continue
@@ -173,68 +181,68 @@ def analyze(campaign: str, limit: int = 0) -> None:
             continue
 
         # Check both timeout fields
-        if r.get("spin_nano_timed_out") or r.get("spin_shadow_timed_out"):
+        if _frag(r, "spin_nano_timed_out") or _frag(r, "spin_shadow_timed_out"):
             skipped_timeout += 1
             continue
 
-        delta = r.get("spin_delta_cycles")
+        delta = _frag(r, "spin_delta_cycles")
         if delta is None:
             skipped_no_field += 1
             continue
 
         deltas.append(int(delta))
 
-        err = r.get("spin_error_cycles")
+        err = _frag(r, "spin_error_cycles")
         if err is not None:
             spin_errors.append(int(err))
 
-        approach = r.get("spin_approach_cycles")
+        approach = _frag(r, "spin_approach_cycles")
         if approach is not None:
             approach_values.append(int(approach))
 
-        tdc = r.get("spin_tdc_correction")
-        if tdc is not None:
+        tdc = _frag(r, "spin_tdc_correction")
+        if tdc is not None and int(tdc) >= 0:
             tdc_corrections.append(int(tdc))
 
-    print(f"  Valid spin captures:    {len(deltas)}")
-    print(f"  Skipped (no fields):    {skipped_no_field}")
-    print(f"  Skipped (invalid):      {skipped_invalid}")
-    print(f"  Skipped (timeout):      {skipped_timeout}")
+    print(f"  Total TIMEBASE records:    {len(rows):,}")
+    print(f"  Valid spin captures:       {len(deltas):,}")
+    print(f"  Skipped (no field):        {skipped_no_field:,}")
+    print(f"  Skipped (invalid):         {skipped_invalid:,}")
+    print(f"  Skipped (timeout):         {skipped_timeout:,}")
     print()
 
-    if len(deltas) < 5:
-        print(f"  Insufficient data (need >= 5, have {len(deltas)})")
+    if not deltas:
+        print("  No valid spin deltas found — cannot analyze.")
         return
 
-    # ── Delta statistics (the TDC measurement) ──
-
-    print("-" * 70)
-    print("TDC DELTA STATISTICS (isr_dwt - shadow_dwt)")
-    print("-" * 70)
-    print()
+    # ── Delta statistics ──
 
     w_delta = Welford()
     for d in deltas:
         w_delta.update(float(d))
 
-    mean_ns = w_delta.mean * DWT_NS_PER_CYCLE
-    std_ns = w_delta.stddev * DWT_NS_PER_CYCLE
     min_delta = int(w_delta.min_val)
     max_delta = int(w_delta.max_val)
+    delta_range = max_delta - min_delta
+    std_ns = w_delta.stddev * DWT_NS_PER_CYCLE
 
+    print("-" * 70)
+    print("SPIN DELTA (isr_dwt - shadow_dwt)")
+    print("-" * 70)
+    print()
     print(f"  n       = {w_delta.n:,}")
-    print(f"  mean    = {w_delta.mean:,.2f} cycles  ({mean_ns:,.1f} ns)")
+    print(f"  mean    = {w_delta.mean:,.2f} cycles  ({w_delta.mean * DWT_NS_PER_CYCLE:,.1f} ns)")
     print(f"  stddev  = {w_delta.stddev:,.2f} cycles  ({std_ns:,.1f} ns)")
     print(f"  min     = {min_delta:,} cycles")
     print(f"  max     = {max_delta:,} cycles")
-    print(f"  range   = {int(w_delta.range):,} cycles  ({w_delta.range * DWT_NS_PER_CYCLE:,.1f} ns)")
+    print(f"  range   = {delta_range:,} cycles")
     print()
 
-    # ── DWT spin precision ──
+    # ── Spin error (DWT spin precision) ──
 
     if spin_errors:
         print("-" * 70)
-        print("DWT SPIN PRECISION (landed_dwt - target_dwt)")
+        print("SPIN ERROR (landed_dwt - target_dwt)")
         print("-" * 70)
         print()
 
@@ -406,8 +414,6 @@ def analyze(campaign: str, limit: int = 0) -> None:
     print("-" * 70)
     print()
 
-    delta_range = max_delta - min_delta
-
     print(f"  TDC_FIXED_OVERHEAD  = {min_delta}    // minimum observed delta")
     print(f"  TDC_LOOP_CYCLES     = 1     // 1 cycle per loop iteration at 1008 MHz")
     print(f"  TDC_MAX_CORRECTION  = {delta_range}    // max correction (delta range {min_delta}-{max_delta})")
@@ -469,13 +475,13 @@ def analyze(campaign: str, limit: int = 0) -> None:
 
     shown = 0
     for i, r in enumerate(rows):
-        if not r.get("spin_valid"):
+        if not _frag(r, "spin_valid"):
             continue
 
-        delta = r.get("spin_delta_cycles")
-        err = r.get("spin_error_cycles", 0)
-        approach = r.get("spin_approach_cycles", 0)
-        tdc = r.get("spin_tdc_correction", "?")
+        delta = _frag(r, "spin_delta_cycles")
+        err = _frag(r, "spin_error_cycles", 0)
+        approach = _frag(r, "spin_approach_cycles", 0)
+        tdc = _frag(r, "spin_tdc_correction", "?")
         pps = r.get("pps_count", r.get("teensy_pps_count", "?"))
 
         if delta is None:
@@ -547,6 +553,7 @@ def main():
                     SELECT campaign, count(*) as cnt,
                            count(*) FILTER (
                                WHERE (payload->>'spin_valid')::boolean = true
+                                  OR (payload->'fragment'->>'spin_valid')::boolean = true
                            ) as spin_valid
                     FROM timebase
                     GROUP BY campaign

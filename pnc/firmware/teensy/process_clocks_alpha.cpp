@@ -82,6 +82,7 @@
 // ============================================================================
 
 #include "tdc_correction.h"
+#include "isr_dwt_compensate.h"
 
 #include "process_clocks_internal.h"
 #include "process_clocks.h"
@@ -370,15 +371,6 @@ volatile uint32_t diag_pps_reject_consecutive  = 0;
 volatile uint32_t diag_pps_reject_recoveries   = 0;
 volatile uint32_t diag_pps_reject_max_run      = 0;
 
-volatile uint32_t diag_phase_ocxo1_successes = 0;
-volatile uint32_t diag_phase_ocxo2_successes = 0;
-volatile uint32_t diag_phase_ocxo1_failures = 0;
-volatile uint32_t diag_phase_ocxo2_failures = 0;
-volatile uint32_t diag_phase_ocxo1_last_iterations = 0;
-volatile uint32_t diag_phase_ocxo2_last_iterations = 0;
-volatile uint32_t diag_phase_ocxo1_high_water_iterations = 0;
-volatile uint32_t diag_phase_ocxo2_high_water_iterations = 0;
-
 // ============================================================================
 // PPS state
 // ============================================================================
@@ -387,14 +379,66 @@ volatile bool pps_fired = false;
 volatile bool pps_scheduled = false;
 
 // ============================================================================
-// OCXO phase capture — first post-PPS edge (v26)
+// OCXO phase capture — v28 GPT output-compare ISR architecture
 //
-// The first-class observable is the OCXO phase offset from PPS:
-// the nanoseconds from PPS to the first 10 MHz edge after PPS.
+// Each GPT fires a one-shot output-compare ISR on the first OCXO
+// edge after PPS.  The ISR captures DWT_CYCCNT with deterministic,
+// characterizable latency (same mechanism as PPS ISR).
 // ============================================================================
 
+// ── GPT ISR capture state ──
+volatile uint32_t ocxo1_phase_isr_dwt  = 0;
+volatile bool     ocxo1_phase_captured = false;
+volatile uint32_t ocxo1_phase_gpt_at_fire = 0;
+
+volatile uint32_t ocxo2_phase_isr_dwt  = 0;
+volatile bool     ocxo2_phase_captured = false;
+volatile uint32_t ocxo2_phase_gpt_at_fire = 0;
+
+// ── Phase capture diagnostics ──
+volatile uint32_t diag_ocxo1_phase_captures = 0;
+volatile uint32_t diag_ocxo2_phase_captures = 0;
+volatile uint32_t diag_ocxo1_phase_misses   = 0;
+volatile uint32_t diag_ocxo2_phase_misses   = 0;
+
+// ── Simplified phase result (computed in pps_asap_callback) ──
 ocxo_phase_capture_t ocxo_phase = {};
 
+// ============================================================================
+// GPT1 output-compare ISR — OCXO1 edge capture
+//
+// Fires once per PPS on the first OCXO1 edge at or after the armed
+// compare value.  DWT_CYCCNT is the very first instruction.
+// Priority 0 (same as PPS) — no nesting overhead.
+// ============================================================================
+
+static void gpt1_phase_isr(void) {
+  const uint32_t dwt = DWT_CYCCNT;
+  const uint32_t gpt = GPT1_CNT;
+
+  GPT1_SR = GPT_SR_OF1;       // clear output-compare 1 flag
+  GPT1_IR &= ~GPT_IR_OF1IE;   // disable compare interrupt (one-shot)
+
+  ocxo1_phase_isr_dwt     = dwt;
+  ocxo1_phase_gpt_at_fire = gpt;
+  ocxo1_phase_captured    = true;
+}
+
+// ============================================================================
+// GPT2 output-compare ISR — OCXO2 edge capture
+// ============================================================================
+
+static void gpt2_phase_isr(void) {
+  const uint32_t dwt = DWT_CYCCNT;
+  const uint32_t gpt = GPT2_CNT;
+
+  GPT2_SR = GPT_SR_OF1;
+  GPT2_IR &= ~GPT_IR_OF1IE;
+
+  ocxo2_phase_isr_dwt     = dwt;
+  ocxo2_phase_gpt_at_fire = gpt;
+  ocxo2_phase_captured    = true;
+}
 
 // ============================================================================
 // Rolling 64-bit extensions
@@ -678,196 +722,59 @@ static void pps_asap_callback(timepop_ctx_t*, void*) {
   // ── Campaign-scoped processing (beta) ──
   clocks_beta_pps();
 
+  // ── OCXO phase harvest (v28: ISR-captured DWT → phase offset) ──
+  {
+    ocxo_phase.dwt_at_pps = dwt_at_pps_edge;
+
+    if (ocxo1_phase_captured) {
+      ocxo_phase.ocxo1_isr_dwt     = ocxo1_phase_isr_dwt;
+      ocxo_phase.ocxo1_gpt_at_fire = ocxo1_phase_gpt_at_fire;
+      ocxo_phase.ocxo1_captured    = true;
+      diag_ocxo1_phase_captures++;
+
+      const uint32_t dwt_elapsed = ocxo1_phase_isr_dwt - GPT1_ISR_ENTRY_DWT_CYCLES - dwt_at_pps_edge;
+      if (g_dwt_cal_valid && g_dwt_cycles_per_gnss_s > 0) {
+        const uint32_t elapsed_ns = (uint32_t)(
+          (uint64_t)dwt_elapsed * NS_PER_SECOND / (uint64_t)g_dwt_cycles_per_gnss_s
+        );
+        ocxo_phase.ocxo1_dwt_elapsed = dwt_elapsed;
+        ocxo_phase.ocxo1_elapsed_ns  = elapsed_ns;
+        ocxo_phase.ocxo1_phase_offset_ns = elapsed_ns % 100u;
+        ocxo_phase.ocxo1_valid = true;
+      }
+    } else {
+      ocxo_phase.ocxo1_captured = false;
+      ocxo_phase.ocxo1_valid    = false;
+      diag_ocxo1_phase_misses++;
+    }
+
+    if (ocxo2_phase_captured) {
+      ocxo_phase.ocxo2_isr_dwt     = ocxo2_phase_isr_dwt;
+      ocxo_phase.ocxo2_gpt_at_fire = ocxo2_phase_gpt_at_fire;
+      ocxo_phase.ocxo2_captured    = true;
+      diag_ocxo2_phase_captures++;
+
+      const uint32_t dwt_elapsed = ocxo2_phase_isr_dwt - GPT2_ISR_ENTRY_DWT_CYCLES - dwt_at_pps_edge;
+      if (g_dwt_cal_valid && g_dwt_cycles_per_gnss_s > 0) {
+        const uint32_t elapsed_ns = (uint32_t)(
+          (uint64_t)dwt_elapsed * NS_PER_SECOND / (uint64_t)g_dwt_cycles_per_gnss_s
+        );
+        ocxo_phase.ocxo2_dwt_elapsed = dwt_elapsed;
+        ocxo_phase.ocxo2_elapsed_ns  = elapsed_ns;
+        ocxo_phase.ocxo2_phase_offset_ns = elapsed_ns % 100u;
+        ocxo_phase.ocxo2_valid = true;
+      }
+    } else {
+      ocxo_phase.ocxo2_captured = false;
+      ocxo_phase.ocxo2_valid    = false;
+      diag_ocxo2_phase_misses++;
+    }
+
+    ocxo_phase.detector_valid = ocxo_phase.ocxo1_valid && ocxo_phase.ocxo2_valid;
+  }
+
   diag_pps_asap_dispatched++;
   pps_scheduled = false;
-}
-
-// ============================================================================
-// PPS handling — ISR (minimum latency)
-//
-// v26: Phase-first OCXO measurement via first post-PPS edge.
-// v24: OCXO phase capture spin loops added after normal ISR work.
-//      Two sequential spins (GPT1 then GPT2), each ≤100 ns.
-//
-// v23: ISR_GNSS_RAW_EXPECTED is now 10,000,000 (from internal.h).
-//      No code change here — the constant change propagates automatically.
-//
-// v21: QTimer1 torn-read prevention via high-low-high pattern.
-// v22: Consecutive rejection anomaly threshold.
-// v18: Captures spin loop shadow before setting pps_fired.
-// ============================================================================
-
-static inline int32_t phase_wrap_delta_ns(uint32_t a_ns, uint32_t b_ns) {
-  int32_t d = (int32_t)b_ns - (int32_t)a_ns;
-  if (d > 50) d -= 100;
-  else if (d < -50) d += 100;
-  return d;
-}
-
-struct phase_capture_local_t {
-  uint32_t dwt_before = 0;
-  uint32_t dwt_after = 0;
-  uint32_t gpt_before = 0;
-  uint32_t gpt_after = 0;
-  uint32_t dwt_bracket_cycles = 0;
-  uint32_t dwt_at_edge = 0;
-  uint32_t dwt_elapsed = 0;
-  uint32_t raw_elapsed_ns = 0;
-  uint32_t phase_offset_ns = 0;
-  bool valid = false;
-};
-
-struct phase_detector_local_t {
-  uint32_t gpt_before = 0;
-  uint32_t candidates_examined = 0;
-  bool     match_found = false;
-
-  phase_capture_local_t prev = {};
-  phase_capture_local_t winner = {};
-
-  int32_t  match_delta_ns = 0;
-  uint32_t match_iteration_count = 0;
-
-  uint32_t candidate_phase_offset_ns[OCXO_PHASE_DETECTOR_LIMIT] = {};
-  uint32_t candidate_raw_elapsed_ns[OCXO_PHASE_DETECTOR_LIMIT] = {};
-  uint32_t candidate_dwt_bracket_cycles[OCXO_PHASE_DETECTOR_LIMIT] = {};
-  uint32_t candidate_dwt_before[OCXO_PHASE_DETECTOR_LIMIT] = {};
-  uint32_t candidate_dwt_after[OCXO_PHASE_DETECTOR_LIMIT] = {};
-  uint32_t candidate_dwt_at_edge[OCXO_PHASE_DETECTOR_LIMIT] = {};
-  uint32_t candidate_dwt_elapsed[OCXO_PHASE_DETECTOR_LIMIT] = {};
-  uint32_t candidate_gpt_before[OCXO_PHASE_DETECTOR_LIMIT] = {};
-  uint32_t candidate_gpt_after[OCXO_PHASE_DETECTOR_LIMIT] = {};
-};
-
-static inline void phase_capture_finalize(
-  phase_capture_local_t& out,
-  uint32_t dwt_at_pps,
-  uint32_t dwt_before,
-  uint32_t dwt_after,
-  uint32_t gpt_before,
-  uint32_t gpt_after
-) {
-  out.dwt_before = dwt_before;
-  out.dwt_after = dwt_after;
-  out.gpt_before = gpt_before;
-  out.gpt_after = gpt_after;
-  out.dwt_bracket_cycles = dwt_after - dwt_before;
-  out.dwt_at_edge = dwt_before;
-  out.dwt_elapsed = out.dwt_at_edge - dwt_at_pps;
-  out.raw_elapsed_ns = (uint32_t)dwt_cycles_to_ns(out.dwt_elapsed);
-  out.phase_offset_ns = out.raw_elapsed_ns % 100u;
-  out.valid = true;
-}
-
-static inline void phase_detector_consider(
-  phase_detector_local_t& state,
-  uint32_t dwt_at_pps,
-  uint32_t dwt_before,
-  uint32_t dwt_after,
-  uint32_t gpt_now
-) {
-  if (state.match_found) return;
-  if (state.candidates_examined >= OCXO_PHASE_DETECTOR_LIMIT) return;
-  if (gpt_now == state.gpt_before) return;
-
-  phase_capture_local_t candidate = {};
-  phase_capture_finalize(candidate, dwt_at_pps, dwt_before, dwt_after, state.gpt_before, gpt_now);
-
-  const uint32_t idx = state.candidates_examined;
-  state.candidate_phase_offset_ns[idx]    = candidate.phase_offset_ns;
-  state.candidate_raw_elapsed_ns[idx]     = candidate.raw_elapsed_ns;
-  state.candidate_dwt_bracket_cycles[idx] = candidate.dwt_bracket_cycles;
-  state.candidate_dwt_before[idx]         = candidate.dwt_before;
-  state.candidate_dwt_after[idx]          = candidate.dwt_after;
-  state.candidate_dwt_at_edge[idx]        = candidate.dwt_at_edge;
-  state.candidate_dwt_elapsed[idx]        = candidate.dwt_elapsed;
-  state.candidate_gpt_before[idx]         = candidate.gpt_before;
-  state.candidate_gpt_after[idx]          = candidate.gpt_after;
-  state.candidates_examined++;
-
-  if (state.candidates_examined >= 2) {
-    state.match_delta_ns = (int32_t)candidate.phase_offset_ns - (int32_t)state.prev.phase_offset_ns;
-    if (candidate.phase_offset_ns == state.prev.phase_offset_ns) {
-      state.match_found = true;
-      state.match_iteration_count = state.candidates_examined;
-      state.winner = candidate;
-    }
-  }
-
-  state.prev = candidate;
-  state.gpt_before = gpt_now;
-}
-
-static inline void ocxo_phase_clear_measurements(void) {
-  ocxo_phase = {};
-  ocxo_phase.detector_limit = OCXO_PHASE_DETECTOR_LIMIT;
-  ocxo_phase.detector_timeout_cycles = OCXO_PHASE_CAPTURE_TIMEOUT_CYCLES;
-}
-
-static inline void ocxo_phase_store_detector(
-  bool is_ocxo1,
-  const phase_detector_local_t& state
-) {
-  if (is_ocxo1) {
-    ocxo_phase.ocxo1_match_found = state.match_found;
-    ocxo_phase.ocxo1_candidates_examined = state.candidates_examined;
-    ocxo_phase.ocxo1_match_iteration_count = state.match_iteration_count;
-    ocxo_phase.ocxo1_match_delta_ns = state.match_delta_ns;
-
-    if (state.candidates_examined) {
-      ocxo_phase.ocxo1_match_prev_dwt_before = state.prev.dwt_before;
-      ocxo_phase.ocxo1_match_prev_dwt_after = state.prev.dwt_after;
-      ocxo_phase.ocxo1_match_prev_gpt_before = state.prev.gpt_before;
-      ocxo_phase.ocxo1_match_prev_gpt_after = state.prev.gpt_after;
-      ocxo_phase.ocxo1_match_prev_dwt_bracket_cycles = state.prev.dwt_bracket_cycles;
-      ocxo_phase.ocxo1_match_prev_dwt_at_edge = state.prev.dwt_at_edge;
-      ocxo_phase.ocxo1_match_prev_dwt_elapsed = state.prev.dwt_elapsed;
-      ocxo_phase.ocxo1_match_prev_raw_elapsed_ns = state.prev.raw_elapsed_ns;
-      ocxo_phase.ocxo1_match_prev_phase_offset_ns = state.prev.phase_offset_ns;
-    }
-
-    if (state.match_found) {
-      ocxo_phase.ocxo1_winner_dwt_before = state.winner.dwt_before;
-      ocxo_phase.ocxo1_winner_dwt_after = state.winner.dwt_after;
-      ocxo_phase.ocxo1_winner_gpt_before = state.winner.gpt_before;
-      ocxo_phase.ocxo1_winner_gpt_after = state.winner.gpt_after;
-      ocxo_phase.ocxo1_winner_dwt_bracket_cycles = state.winner.dwt_bracket_cycles;
-      ocxo_phase.ocxo1_winner_dwt_at_edge = state.winner.dwt_at_edge;
-      ocxo_phase.ocxo1_winner_dwt_elapsed = state.winner.dwt_elapsed;
-      ocxo_phase.ocxo1_winner_raw_elapsed_ns = state.winner.raw_elapsed_ns;
-      ocxo_phase.ocxo1_winner_phase_offset_ns = state.winner.phase_offset_ns;
-    }
-    return;
-  }
-
-  ocxo_phase.ocxo2_match_found = state.match_found;
-  ocxo_phase.ocxo2_candidates_examined = state.candidates_examined;
-  ocxo_phase.ocxo2_match_iteration_count = state.match_iteration_count;
-  ocxo_phase.ocxo2_match_delta_ns = state.match_delta_ns;
-
-  if (state.candidates_examined ) {
-    ocxo_phase.ocxo2_match_prev_dwt_before = state.prev.dwt_before;
-    ocxo_phase.ocxo2_match_prev_dwt_after = state.prev.dwt_after;
-    ocxo_phase.ocxo2_match_prev_gpt_before = state.prev.gpt_before;
-    ocxo_phase.ocxo2_match_prev_gpt_after = state.prev.gpt_after;
-    ocxo_phase.ocxo2_match_prev_dwt_bracket_cycles = state.prev.dwt_bracket_cycles;
-    ocxo_phase.ocxo2_match_prev_dwt_at_edge = state.prev.dwt_at_edge;
-    ocxo_phase.ocxo2_match_prev_dwt_elapsed = state.prev.dwt_elapsed;
-    ocxo_phase.ocxo2_match_prev_raw_elapsed_ns = state.prev.raw_elapsed_ns;
-    ocxo_phase.ocxo2_match_prev_phase_offset_ns = state.prev.phase_offset_ns;
-  }
-
-  if (state.match_found) {
-    ocxo_phase.ocxo2_winner_dwt_before = state.winner.dwt_before;
-    ocxo_phase.ocxo2_winner_dwt_after = state.winner.dwt_after;
-    ocxo_phase.ocxo2_winner_gpt_before = state.winner.gpt_before;
-    ocxo_phase.ocxo2_winner_gpt_after = state.winner.gpt_after;
-    ocxo_phase.ocxo2_winner_dwt_bracket_cycles = state.winner.dwt_bracket_cycles;
-    ocxo_phase.ocxo2_winner_dwt_at_edge = state.winner.dwt_at_edge;
-    ocxo_phase.ocxo2_winner_dwt_elapsed = state.winner.dwt_elapsed;
-    ocxo_phase.ocxo2_winner_raw_elapsed_ns = state.winner.raw_elapsed_ns;
-    ocxo_phase.ocxo2_winner_phase_offset_ns = state.winner.phase_offset_ns;
-  }
 }
 
 static void pps_isr(void)
@@ -944,167 +851,63 @@ static void pps_isr(void)
   isr_prev_ocxo1 = isr_snap_ocxo1 = snap_ocxo1;
   isr_prev_ocxo2 = isr_snap_ocxo2 = snap_ocxo2;
 
-  // ── v27: generalized <n> iteration phase detector ──
-  {
-    const uint32_t dwt_at_pps = snap_dwt - ISR_ENTRY_DWT_CYCLES;
+  // ── v28: Arm GPT output compares for OCXO phase capture ──
+  ocxo1_phase_captured = false;
+  ocxo2_phase_captured = false;
 
-    ocxo_phase_clear_measurements();
-    ocxo_phase.dwt_at_pps = dwt_at_pps;
+  // GPT1 (OCXO1): arm OCR1, clear flag, enable interrupt
+  GPT1_OCR1 = snap_ocxo1 + OCXO_PHASE_ARM_OFFSET_TICKS;
+  GPT1_SR   = GPT_SR_OF1;
+  GPT1_IR  |= GPT_IR_OF1IE;
 
-    phase_detector_local_t o1 = {};
-    phase_detector_local_t o2 = {};
+  // GPT2 (OCXO2): arm OCR1, clear flag, enable interrupt
+  GPT2_OCR1 = snap_ocxo2 + OCXO_PHASE_ARM_OFFSET_TICKS;
+  GPT2_SR   = GPT_SR_OF1;
+  GPT2_IR  |= GPT_IR_OF1IE;
 
-    o1.gpt_before = GPT1_CNT;
-    o2.gpt_before = GPT2_CNT;
+  // ── v16: PPS watchdog ──
+  if (pps_scheduled) {
+    diag_pps_scheduled_stuck++;
 
-    const uint32_t harvest_start_dwt = DWT_CYCCNT;
-
-    while (((!o1.match_found && o1.candidates_examined < OCXO_PHASE_DETECTOR_LIMIT) ||
-            (!o2.match_found && o2.candidates_examined < OCXO_PHASE_DETECTOR_LIMIT)) &&
-           (uint32_t)(DWT_CYCCNT - harvest_start_dwt) < OCXO_PHASE_CAPTURE_TIMEOUT_CYCLES) {
-
-      const uint32_t dwt_before = DWT_CYCCNT;
-      const uint32_t gpt1_now   = GPT1_CNT;
-      const uint32_t gpt2_now   = GPT2_CNT;
-      const uint32_t dwt_after  = DWT_CYCCNT;
-
-      phase_detector_consider(o1, dwt_at_pps, dwt_before, dwt_after, gpt1_now);
-      phase_detector_consider(o2, dwt_at_pps, dwt_before, dwt_after, gpt2_now);
+    if (diag_pps_scheduled_stuck == 1) {
+      diag_pps_stuck_since_dwt = snap_dwt;
     }
 
-    const uint32_t harvest_elapsed_cycles = (uint32_t)(DWT_CYCCNT - harvest_start_dwt);
-
-    // ── Detector summary diagnostics ──
-    diag_phase_ocxo1_last_iterations = o1.candidates_examined;
-    diag_phase_ocxo2_last_iterations = o2.candidates_examined;
-
-    if (o1.candidates_examined > diag_phase_ocxo1_high_water_iterations) {
-      diag_phase_ocxo1_high_water_iterations = o1.candidates_examined;
-    }
-    if (o2.candidates_examined > diag_phase_ocxo2_high_water_iterations) {
-      diag_phase_ocxo2_high_water_iterations = o2.candidates_examined;
+    if (diag_pps_scheduled_stuck > diag_pps_stuck_max) {
+      diag_pps_stuck_max = diag_pps_scheduled_stuck;
     }
 
-    if (o1.match_found) diag_phase_ocxo1_successes++;
-    else                diag_phase_ocxo1_failures++;
-
-    if (o2.match_found) diag_phase_ocxo2_successes++;
-    else                diag_phase_ocxo2_failures++;
-
-    // ── Existing detector summary projection ──
-    ocxo_phase_store_detector(true,  o1);
-    ocxo_phase_store_detector(false, o2);
-
-    // ── NEW: full candidate-stream diagnostics ──
-    ocxo_phase.detector_limit          = OCXO_PHASE_DETECTOR_LIMIT;
-    ocxo_phase.detector_timeout_cycles = OCXO_PHASE_CAPTURE_TIMEOUT_CYCLES;
-
-    for (uint32_t i = 0; i < OCXO_PHASE_DETECTOR_LIMIT; ++i) {
-      ocxo_phase.ocxo1_candidate_phase_offset_ns[i]    = 0;
-      ocxo_phase.ocxo1_candidate_raw_elapsed_ns[i]     = 0;
-      ocxo_phase.ocxo1_candidate_dwt_bracket_cycles[i] = 0;
-      ocxo_phase.ocxo1_candidate_dwt_before[i]         = 0;
-      ocxo_phase.ocxo1_candidate_dwt_after[i]          = 0;
-      ocxo_phase.ocxo1_candidate_dwt_at_edge[i]        = 0;
-      ocxo_phase.ocxo1_candidate_dwt_elapsed[i]        = 0;
-      ocxo_phase.ocxo1_candidate_gpt_before[i]         = 0;
-      ocxo_phase.ocxo1_candidate_gpt_after[i]          = 0;
-
-      ocxo_phase.ocxo2_candidate_phase_offset_ns[i]    = 0;
-      ocxo_phase.ocxo2_candidate_raw_elapsed_ns[i]     = 0;
-      ocxo_phase.ocxo2_candidate_dwt_bracket_cycles[i] = 0;
-      ocxo_phase.ocxo2_candidate_dwt_before[i]         = 0;
-      ocxo_phase.ocxo2_candidate_dwt_after[i]          = 0;
-      ocxo_phase.ocxo2_candidate_dwt_at_edge[i]        = 0;
-      ocxo_phase.ocxo2_candidate_dwt_elapsed[i]        = 0;
-      ocxo_phase.ocxo2_candidate_gpt_before[i]         = 0;
-      ocxo_phase.ocxo2_candidate_gpt_after[i]          = 0;
-    }
-
-    for (uint32_t i = 0; i < o1.candidates_examined && i < OCXO_PHASE_DETECTOR_LIMIT; ++i) {
-      ocxo_phase.ocxo1_candidate_phase_offset_ns[i]    = o1.candidate_phase_offset_ns[i];
-      ocxo_phase.ocxo1_candidate_raw_elapsed_ns[i]     = o1.candidate_raw_elapsed_ns[i];
-      ocxo_phase.ocxo1_candidate_dwt_bracket_cycles[i] = o1.candidate_dwt_bracket_cycles[i];
-      ocxo_phase.ocxo1_candidate_dwt_before[i]         = o1.candidate_dwt_before[i];
-      ocxo_phase.ocxo1_candidate_dwt_after[i]          = o1.candidate_dwt_after[i];
-      ocxo_phase.ocxo1_candidate_dwt_at_edge[i]        = o1.candidate_dwt_at_edge[i];
-      ocxo_phase.ocxo1_candidate_dwt_elapsed[i]        = o1.candidate_dwt_elapsed[i];
-      ocxo_phase.ocxo1_candidate_gpt_before[i]         = o1.candidate_gpt_before[i];
-      ocxo_phase.ocxo1_candidate_gpt_after[i]          = o1.candidate_gpt_after[i];
-    }
-
-    for (uint32_t i = 0; i < o2.candidates_examined && i < OCXO_PHASE_DETECTOR_LIMIT; ++i) {
-      ocxo_phase.ocxo2_candidate_phase_offset_ns[i]    = o2.candidate_phase_offset_ns[i];
-      ocxo_phase.ocxo2_candidate_raw_elapsed_ns[i]     = o2.candidate_raw_elapsed_ns[i];
-      ocxo_phase.ocxo2_candidate_dwt_bracket_cycles[i] = o2.candidate_dwt_bracket_cycles[i];
-      ocxo_phase.ocxo2_candidate_dwt_before[i]         = o2.candidate_dwt_before[i];
-      ocxo_phase.ocxo2_candidate_dwt_after[i]          = o2.candidate_dwt_after[i];
-      ocxo_phase.ocxo2_candidate_dwt_at_edge[i]        = o2.candidate_dwt_at_edge[i];
-      ocxo_phase.ocxo2_candidate_dwt_elapsed[i]        = o2.candidate_dwt_elapsed[i];
-      ocxo_phase.ocxo2_candidate_gpt_before[i]         = o2.candidate_gpt_before[i];
-      ocxo_phase.ocxo2_candidate_gpt_after[i]          = o2.candidate_gpt_after[i];
-    }
-
-    ocxo_phase.detector_valid = o1.match_found && o2.match_found;
-    ocxo_phase.valid          = ocxo_phase.detector_valid;
-
-    if (ocxo_phase.valid) {
-      ocxo_phase.captures++;
-    } else {
-      // ── Non-fatal forensics mode ──
-      // Preserve all diagnostics, do NOT watchdog, do NOT early-return.
-      // We want TIMEBASE / CLOCKS_INFO visibility into the candidate stream.
-      ocxo_phase.valid = false;
-
-      // Optional breadcrumb fields if you already have somewhere to put them:
-      // watchdog_anomaly_reason remains untouched here on purpose.
-      (void)harvest_elapsed_cycles;
-    }
-
-    // ── v16: PPS watchdog ──
-    if (pps_scheduled) {
-      diag_pps_scheduled_stuck++;
-
-      if (diag_pps_scheduled_stuck == 1) {
-        diag_pps_stuck_since_dwt = snap_dwt;
-      }
-
-      if (diag_pps_scheduled_stuck > diag_pps_stuck_max) {
-        diag_pps_stuck_max = diag_pps_scheduled_stuck;
-      }
-
-      if (diag_pps_scheduled_stuck < PPS_WATCHDOG_THRESHOLD) {
-        return;
-      }
-
-      diag_pps_watchdog_recoveries++;
-      clocks_watchdog_anomaly(
-        "pps_scheduled_stuck",
-        diag_pps_scheduled_stuck,
-        diag_pps_asap_armed,
-        diag_pps_asap_dispatched,
-        diag_pps_stuck_since_dwt
-      );
+    if (diag_pps_scheduled_stuck < PPS_WATCHDOG_THRESHOLD) {
       return;
-    } else {
-      diag_pps_scheduled_stuck = 0;
-      diag_pps_stuck_since_dwt = 0;
     }
 
-    pps_scheduled = true;
+    diag_pps_watchdog_recoveries++;
+    clocks_watchdog_anomaly(
+      "pps_scheduled_stuck",
+      diag_pps_scheduled_stuck,
+      diag_pps_asap_armed,
+      diag_pps_asap_dispatched,
+      diag_pps_stuck_since_dwt
+    );
+    return;
+  } else {
+    diag_pps_scheduled_stuck = 0;
+    diag_pps_stuck_since_dwt = 0;
+  }
 
-    // Mark first PPS seen for residual tracking on next edge.
-    if (!isr_residual_valid) {
-      isr_residual_valid = true;
-    }
+  pps_scheduled = true;
 
-    timepop_handle_t h = timepop_arm(0, false, pps_asap_callback, nullptr, "pps");
-    if (h == TIMEPOP_INVALID_HANDLE) {
-      pps_scheduled = false;
-      diag_pps_asap_arm_failures++;
-    } else {
-      diag_pps_asap_armed++;
-    }
+  // Mark first PPS seen for residual tracking on next edge.
+  if (!isr_residual_valid) {
+    isr_residual_valid = true;
+  }
+
+  timepop_handle_t h = timepop_arm(0, false, pps_asap_callback, nullptr, "pps");
+  if (h == TIMEPOP_INVALID_HANDLE) {
+    pps_scheduled = false;
+    diag_pps_asap_arm_failures++;
+  } else {
+    diag_pps_asap_armed++;
   }
 }
 
@@ -1137,6 +940,18 @@ void process_clocks_init(void) {
   pinMode(GNSS_LOCK_PIN,  INPUT);
   pinMode(GNSS_PPS_RELAY, OUTPUT);
   digitalWriteFast(GNSS_PPS_RELAY, LOW);
+
+  // ── Install GPT ISR vectors for OCXO phase capture ──
+  GPT1_IR = 0;  // all GPT1 interrupts off
+  GPT2_IR = 0;  // all GPT2 interrupts off
+
+  attachInterruptVector(IRQ_GPT1, gpt1_phase_isr);
+  NVIC_SET_PRIORITY(IRQ_GPT1, 0);
+  NVIC_ENABLE_IRQ(IRQ_GPT1);
+
+  attachInterruptVector(IRQ_GPT2, gpt2_phase_isr);
+  NVIC_SET_PRIORITY(IRQ_GPT2, 0);
+  NVIC_ENABLE_IRQ(IRQ_GPT2);
 
   attachInterrupt(digitalPinToInterrupt(GNSS_PPS_PIN), pps_isr, RISING);
   NVIC_SET_PRIORITY(IRQ_GPIO6789, 0);
