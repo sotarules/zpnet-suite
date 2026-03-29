@@ -12,7 +12,7 @@
 //   For each OCXO phase capture, alpha now publishes both raw and adjusted
 //   phase facts. The raw delimiter is dwt_before. Raw elapsed/phase are left
 //   innocent and unmodified; a bracket-class bias map then derives adjusted
-//   phase for servo/control use.1
+//   phase for servo/control use.
 //
 //   Beta then computes the absolute GNSS timestamp of that canonical edge:
 //
@@ -109,7 +109,7 @@
 // TimePop delay constants (nanoseconds)
 // ============================================================================
 
-static constexpr int64_t SPIN_EARLY_NS = 5000LL;  // 5 µs — shadow loop needs margin
+static constexpr int64_t SPIN_EARLY_NS = 10000LL;  // 5 µs — shadow loop needs margin
 
 // ============================================================================
 // TimePop delay constants (nanoseconds)
@@ -146,39 +146,6 @@ volatile uint32_t dbg_post_loop_dwt       = 0;
 volatile uint32_t dbg_post_loop_shadow    = 0;
 volatile uint32_t dbg_post_loop_isr_cap   = 0;
 volatile uint32_t dbg_post_loop_isr_snap  = 0;
-
-// ── Spin arm diagnostics ──
-volatile uint32_t diag_spin_arm_calls                = 0;
-volatile uint32_t diag_spin_arm_skip_no_dwt_cal      = 0;
-volatile uint32_t diag_spin_arm_skip_time_invalid    = 0;
-volatile uint32_t diag_spin_arm_skip_now_ns_invalid  = 0;
-volatile uint32_t diag_spin_arm_success              = 0;
-volatile bool     diag_spin_arm_last_dwt_cal_valid   = false;
-volatile bool     diag_spin_arm_last_time_valid      = false;
-volatile int64_t  diag_spin_arm_last_now_ns          = 0;
-volatile bool     diag_spin_arm_last_handle_valid    = false;
-
-// ── Spin complete diagnostics ──
-volatile uint32_t diag_spin_complete_calls                 = 0;
-volatile uint32_t diag_spin_complete_fail_not_armed        = 0;
-volatile uint32_t diag_spin_complete_fail_no_landed_dwt    = 0;
-volatile uint32_t diag_spin_complete_fail_nano_timeout     = 0;
-volatile uint32_t diag_spin_complete_fail_shadow_timeout   = 0;
-volatile uint32_t diag_spin_complete_fail_bad_tdc          = 0;
-volatile uint32_t diag_spin_complete_success               = 0;
-
-volatile bool     diag_spin_complete_last_armed            = false;
-volatile bool     diag_spin_complete_last_landed_nonzero   = false;
-volatile bool     diag_spin_complete_last_nano_timed_out   = false;
-volatile bool     diag_spin_complete_last_shadow_timed_out = false;
-volatile bool     diag_spin_complete_last_valid            = false;
-
-volatile uint32_t diag_spin_complete_last_landed_dwt       = 0;
-volatile uint32_t diag_spin_complete_last_shadow_dwt       = 0;
-volatile uint32_t diag_spin_complete_last_isr_dwt          = 0;
-volatile int32_t  diag_spin_complete_last_delta_cycles     = 0;
-volatile int32_t  diag_spin_complete_last_approach_cycles  = 0;
-volatile int32_t  diag_spin_complete_last_tdc_correction   = -1;
 
 spin_capture_t pps_spin = {};
 
@@ -221,32 +188,11 @@ static void pps_spin_callback(timepop_ctx_t* ctx, void*) {
 }
 
 static void pps_spin_arm(void) {
-  diag_spin_arm_calls++;
-  diag_spin_arm_last_dwt_cal_valid = g_dwt_cal_valid;
-  if (!g_dwt_cal_valid) {
-    diag_spin_arm_skip_no_dwt_cal++;
-    diag_spin_arm_last_time_valid = time_valid();
-    diag_spin_arm_last_now_ns = -1;
-    diag_spin_arm_last_handle_valid = false;
-    return;
-  }
-
-  const bool now_time_valid = time_valid();
-  diag_spin_arm_last_time_valid = now_time_valid;
-  if (!now_time_valid) {
-    diag_spin_arm_skip_time_invalid++;
-    diag_spin_arm_last_now_ns = -1;
-    diag_spin_arm_last_handle_valid = false;
-    return;
-  }
+  if (!g_dwt_cal_valid) return;
+  if (!time_valid()) return;
 
   int64_t now_ns = time_gnss_ns_now();
-  diag_spin_arm_last_now_ns = now_ns;
-  if (now_ns < 0) {
-    diag_spin_arm_skip_now_ns_invalid++;
-    diag_spin_arm_last_handle_valid = false;
-    return;
-  }
+  if (now_ns < 0) return;
 
   int64_t target_gnss_ns = now_ns + (int64_t)NS_PER_SECOND - SPIN_EARLY_NS;
   uint32_t target_dwt    = time_gnss_ns_to_dwt(target_gnss_ns);
@@ -267,66 +213,34 @@ static void pps_spin_arm(void) {
   );
 
   if (h == TIMEPOP_INVALID_HANDLE) {
-    diag_spin_arm_last_handle_valid = false;
     pps_spin.armed = false;
     pps_spin.arm_failures++;
   } else {
-    diag_spin_arm_last_handle_valid = true;
-    diag_spin_arm_success++;
     pps_spin.armed = true;
   }
 }
 
 static void pps_spin_complete(uint32_t isr_dwt_snap) {
-  diag_spin_complete_calls++;
-
-  diag_spin_complete_last_armed            = pps_spin.armed;
-  diag_spin_complete_last_landed_nonzero   = (pps_spin.landed_dwt != 0);
-  diag_spin_complete_last_nano_timed_out   = pps_spin.nano_timed_out;
-  diag_spin_complete_last_shadow_timed_out = pps_spin.shadow_timed_out;
-  diag_spin_complete_last_landed_dwt       = pps_spin.landed_dwt;
-  diag_spin_complete_last_shadow_dwt       = pps_spin.shadow_dwt;
-  diag_spin_complete_last_isr_dwt          = isr_dwt_snap;
-  diag_spin_complete_last_delta_cycles     = 0;
-  diag_spin_complete_last_approach_cycles  = 0;
-  diag_spin_complete_last_tdc_correction   = -1;
-  diag_spin_complete_last_valid            = false;
-
-  if (!pps_spin.armed) {
-    diag_spin_complete_fail_not_armed++;
+  if (!pps_spin.completed) {
     pps_spin.valid = false;
+    if (pps_spin.armed) {
+      pps_spin.misses++;
+      if (pps_spin.handle != TIMEPOP_INVALID_HANDLE) timepop_cancel(pps_spin.handle);
+    }
+    pps_spin.handle = TIMEPOP_INVALID_HANDLE;
     return;
   }
 
-  if (pps_spin.landed_dwt == 0) {
-    diag_spin_complete_fail_no_landed_dwt++;
-    pps_spin.valid = false;
-    pps_spin.misses++;
-    timepop_cancel_by_name("pps-spin");
-    pps_spin.armed = false;
-    return;
-  }
-
-  if (pps_spin.nano_timed_out) {
-    diag_spin_complete_fail_nano_timeout++;
+  if (pps_spin.nano_timed_out || pps_spin.shadow_timed_out) {
     pps_spin.valid = false;
     pps_spin.armed = false;
+    pps_spin.handle = TIMEPOP_INVALID_HANDLE;
     return;
   }
 
-  if (pps_spin.shadow_timed_out) {
-    diag_spin_complete_fail_shadow_timeout++;
-    pps_spin.valid = false;
-    pps_spin.armed = false;
-    return;
-  }
-
-  pps_spin.isr_dwt        = isr_dwt_snap;
-  pps_spin.delta_cycles   = (int32_t)(isr_dwt_snap - pps_spin.shadow_dwt);
-  pps_spin.approach_cycles = (int32_t)(isr_dwt_snap - pps_spin.landed_dwt);
-
-  diag_spin_complete_last_delta_cycles    = pps_spin.delta_cycles;
-  diag_spin_complete_last_approach_cycles = pps_spin.approach_cycles;
+  pps_spin.isr_dwt         = isr_dwt_snap;
+  pps_spin.delta_cycles     = (int32_t)(isr_dwt_snap - pps_spin.shadow_dwt);
+  pps_spin.approach_cycles  = (int32_t)(isr_dwt_snap - pps_spin.landed_dwt);
 
   int32_t correction = -1;
   pps_spin.corrected_dwt = tdc_correct(
@@ -335,19 +249,10 @@ static void pps_spin_complete(uint32_t isr_dwt_snap) {
     correction
   );
   pps_spin.tdc_correction = correction;
-  diag_spin_complete_last_tdc_correction = correction;
 
-  pps_spin.valid = (correction >= 0);
-  diag_spin_complete_last_valid = pps_spin.valid;
-
-  if (!pps_spin.valid) {
-    diag_spin_complete_fail_bad_tdc++;
-    pps_spin.misses++;
-  } else {
-    diag_spin_complete_success++;
-  }
-
-  pps_spin.armed = false;
+  pps_spin.valid  = (correction >= 0);
+  pps_spin.armed  = false;
+  pps_spin.handle = TIMEPOP_INVALID_HANDLE;
 }
 
 // ============================================================================

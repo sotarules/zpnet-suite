@@ -131,39 +131,6 @@ extern volatile uint32_t diag_pps_reject_consecutive;
 extern volatile uint32_t diag_pps_reject_recoveries;
 extern volatile uint32_t diag_pps_reject_max_run;
 
-// ── Spin arm diagnostics (alpha-owned, beta-readable) ──
-extern volatile uint32_t diag_spin_arm_calls;
-extern volatile uint32_t diag_spin_arm_skip_no_dwt_cal;
-extern volatile uint32_t diag_spin_arm_skip_time_invalid;
-extern volatile uint32_t diag_spin_arm_skip_now_ns_invalid;
-extern volatile uint32_t diag_spin_arm_success;
-extern volatile bool     diag_spin_arm_last_dwt_cal_valid;
-extern volatile bool     diag_spin_arm_last_time_valid;
-extern volatile int64_t  diag_spin_arm_last_now_ns;
-extern volatile bool     diag_spin_arm_last_handle_valid;
-
-// ── Spin complete diagnostics (alpha-owned, beta-readable) ──
-extern volatile uint32_t diag_spin_complete_calls;
-extern volatile uint32_t diag_spin_complete_fail_not_armed;
-extern volatile uint32_t diag_spin_complete_fail_no_landed_dwt;
-extern volatile uint32_t diag_spin_complete_fail_nano_timeout;
-extern volatile uint32_t diag_spin_complete_fail_shadow_timeout;
-extern volatile uint32_t diag_spin_complete_fail_bad_tdc;
-extern volatile uint32_t diag_spin_complete_success;
-
-extern volatile bool     diag_spin_complete_last_armed;
-extern volatile bool     diag_spin_complete_last_landed_nonzero;
-extern volatile bool     diag_spin_complete_last_nano_timed_out;
-extern volatile bool     diag_spin_complete_last_shadow_timed_out;
-extern volatile bool     diag_spin_complete_last_valid;
-
-extern volatile uint32_t diag_spin_complete_last_landed_dwt;
-extern volatile uint32_t diag_spin_complete_last_shadow_dwt;
-extern volatile uint32_t diag_spin_complete_last_isr_dwt;
-extern volatile int32_t  diag_spin_complete_last_delta_cycles;
-extern volatile int32_t  diag_spin_complete_last_approach_cycles;
-extern volatile int32_t  diag_spin_complete_last_tdc_correction;
-
 // ============================================================================
 // QTimer1 read diagnostics (alpha-owned, beta-readable)
 // ============================================================================
@@ -352,9 +319,10 @@ double dac_welford_stderr(const dac_welford_t& w);
 
 struct spin_capture_t {
   // ── Set by the arming code (scheduled context) ──
-  uint32_t  target_dwt;
-  int64_t   target_gnss_ns;
-  bool      armed;
+  uint32_t        target_dwt;
+  int64_t         target_gnss_ns;
+  bool            armed;
+  timepop_handle_t handle;
 
   // ── Set by the nano-spin callback (ISR context) ──
   uint32_t  landed_dwt;
