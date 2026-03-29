@@ -335,35 +335,33 @@ double dac_welford_stderr(const dac_welford_t& w);
 
 struct spin_capture_t {
   // ── Set by the arming code (scheduled context) ──
-  uint32_t        target_dwt;
-  int64_t         target_gnss_ns;
-  bool            armed;
+  uint32_t         target_dwt;
+  int64_t          target_gnss_ns;
+  bool             armed;
   timepop_handle_t handle;
 
   // ── Set by the nano-spin callback (ISR context) ──
-  uint32_t  landed_dwt;
-  int64_t   landed_gnss_ns;
-  int32_t   spin_error;
-  uint32_t  shadow_dwt;
-  bool      completed;
-  bool      nano_timed_out;
-  bool      shadow_timed_out;
+  uint32_t landed_dwt;
+  int64_t  landed_gnss_ns;
+  int32_t  spin_error;
+  uint32_t shadow_dwt;          // forensic only
+  bool     completed;
+  bool     nano_timed_out;
+  bool     shadow_timed_out;
 
   // ── Set by the edge handler (scheduled context) ──
-  uint32_t  isr_dwt;
-  int32_t   delta_cycles;
-  int32_t   approach_cycles;
-  uint32_t  corrected_dwt;
-  int32_t   tdc_correction;
-  bool      valid;
+  uint32_t isr_dwt;
+  int32_t  approach_cycles;
+  uint32_t edge_dwt;            // canonical PPS edge DWT
+  bool     valid;
 
   // ── Diagnostics (monotonic, never reset) ──
-  uint32_t  arms;
-  uint32_t  arm_failures;
-  uint32_t  completions;
-  uint32_t  nano_timeouts;
-  uint32_t  shadow_timeouts;
-  uint32_t  misses;
+  uint32_t arms;
+  uint32_t arm_failures;
+  uint32_t completions;
+  uint32_t nano_timeouts;
+  uint32_t shadow_timeouts;
+  uint32_t misses;
 };
 
 extern spin_capture_t pps_spin;
@@ -390,30 +388,30 @@ struct ocxo_phase_capture_t {
   // ── PPS anchor ──
   uint32_t dwt_at_pps;               // best-available DWT at PPS edge
 
-  // ── OCXO1 shadow-write TDC capture ──
+  // ── OCXO1 capture ──
   uint32_t ocxo1_isr_dwt;            // raw DWT_CYCCNT from GPT1 ISR
-  uint32_t ocxo1_shadow_dwt;         // shadow DWT captured by GPT1 ISR
-  int32_t  ocxo1_delta_cycles;       // isr_dwt - shadow_dwt (TDC measurement)
+  uint32_t ocxo1_shadow_dwt;         // shadow DWT captured by GPT1 ISR (forensic)
+  uint32_t ocxo1_edge_dwt;           // canonical OCXO1 edge DWT
   uint32_t ocxo1_gpt_at_fire;        // GPT1_CNT at ISR entry (diagnostic)
   uint32_t ocxo1_dwt_elapsed = 0;
   uint32_t ocxo1_elapsed_ns = 0;
-  uint32_t ocxo1_phase_offset_ns;    // elapsed_ns % 100
-  bool     ocxo1_captured;           // GPT1 ISR fired successfully
-  bool     ocxo1_valid;              // phase computation completed
+  uint32_t ocxo1_phase_offset_ns;
+  bool     ocxo1_captured;
+  bool     ocxo1_valid;
 
-  // ── OCXO2 shadow-write TDC capture ──
+  // ── OCXO2 capture ──
   uint32_t ocxo2_isr_dwt;            // raw DWT_CYCCNT from GPT2 ISR
-  uint32_t ocxo2_shadow_dwt;         // shadow DWT captured by GPT2 ISR
-  int32_t  ocxo2_delta_cycles;       // isr_dwt - shadow_dwt (TDC measurement)
+  uint32_t ocxo2_shadow_dwt;         // shadow DWT captured by GPT2 ISR (forensic)
+  uint32_t ocxo2_edge_dwt;           // canonical OCXO2 edge DWT
   uint32_t ocxo2_gpt_at_fire;        // GPT2_CNT at ISR entry (diagnostic)
   uint32_t ocxo2_dwt_elapsed = 0;
   uint32_t ocxo2_elapsed_ns = 0;
-  uint32_t ocxo2_phase_offset_ns;    // elapsed_ns % 100
-  bool     ocxo2_captured;           // GPT2 ISR fired successfully
-  bool     ocxo2_valid;              // phase computation completed
+  uint32_t ocxo2_phase_offset_ns;
+  bool     ocxo2_captured;
+  bool     ocxo2_valid;
 
   // ── Combined validity ──
-  bool     detector_valid;            // both OCXOs valid
+  bool     detector_valid;
 
   // ── Canonical absolute edge timestamps (beta-owned) ──
   uint64_t pps_gnss_ns;
@@ -563,3 +561,4 @@ void clocks_watchdog_anomaly(const char* reason,
 // ============================================================================
 
 void clocks_zero_all(void);
+

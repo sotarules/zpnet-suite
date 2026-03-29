@@ -255,9 +255,7 @@ void clocks_zero_all(void) {
   timebase_invalidate();
 
   dwt_cycles_64     = 0;
-  prev_dwt_at_pps   = (pps_spin.valid && pps_spin.tdc_correction >= 0)
-                        ? pps_spin.corrected_dwt
-                        : (isr_snap_dwt - TDC_FIXED_OVERHEAD);
+  prev_dwt_at_pps   = pps_dwt_at_edge(isr_snap_dwt);
 
   ocxo1_ticks_64    = 0;
   prev_ocxo1_at_pps = isr_snap_ocxo1;
@@ -523,9 +521,7 @@ void clocks_beta_pps(void) {
     timebase_invalidate();
 
     dwt_cycles_64     = dwt_ns_to_cycles(recover_dwt_ns);
-    prev_dwt_at_pps   = (pps_spin.valid && pps_spin.tdc_correction >= 0)
-                          ? pps_spin.corrected_dwt
-                          : (isr_snap_dwt - TDC_FIXED_OVERHEAD);
+    prev_dwt_at_pps   = pps_dwt_at_edge(isr_snap_dwt);
 
     ocxo1_ticks_64    = recover_ocxo1_ns / 100ull;
     prev_ocxo1_at_pps = isr_snap_ocxo1;
@@ -596,10 +592,7 @@ void clocks_beta_pps(void) {
   pps_fired = false;
 
   // ── DWT ──
-  uint32_t dwt_raw_at_pps =
-    (pps_spin.valid && pps_spin.tdc_correction >= 0)
-      ? pps_spin.corrected_dwt
-      : (isr_snap_dwt - TDC_FIXED_OVERHEAD);
+  uint32_t dwt_raw_at_pps = pps_dwt_at_edge(isr_snap_dwt);
   uint32_t dwt_delta = dwt_raw_at_pps - prev_dwt_at_pps;
 
   dwt_cycles_64    += dwt_delta;
@@ -656,25 +649,12 @@ void clocks_beta_pps(void) {
   // ── Absolute GNSS timestamps for canonical winning OCXO edges ──
   ocxo_phase.pps_gnss_ns = pps_gnss_ns;
 
-  int32_t ocxo1_tdc_applied = -1;
-  const uint32_t ocxo1_corrected_dwt = gpt_tdc_correct(
-    ocxo_phase.ocxo1_shadow_dwt,
-    ocxo_phase.ocxo1_isr_dwt,
-    ocxo_phase.ocxo1_delta_cycles,
-    ocxo1_tdc_applied
-  );
-
-  int32_t ocxo2_tdc_applied = -1;
-  const uint32_t ocxo2_corrected_dwt = gpt_tdc_correct(
-    ocxo_phase.ocxo2_shadow_dwt,
-    ocxo_phase.ocxo2_isr_dwt,
-    ocxo_phase.ocxo2_delta_cycles,
-    ocxo2_tdc_applied
-  );
+  const uint32_t ocxo1_edge_dwt = ocxo_phase.ocxo1_edge_dwt;
+  const uint32_t ocxo2_edge_dwt = ocxo_phase.ocxo2_edge_dwt;
 
   const bool ocxo1_edge_valid = ocxo_phase.ocxo1_captured &&
     ocxo_edge_dwt_to_gnss_ns(
-      ocxo1_corrected_dwt,
+      ocxo1_edge_dwt,
       pps_gnss_ns,
       dwt_raw_at_pps,
       dwt_cycles_per_pps_snapshot,
@@ -683,7 +663,7 @@ void clocks_beta_pps(void) {
 
   const bool ocxo2_edge_valid = ocxo_phase.ocxo2_captured &&
     ocxo_edge_dwt_to_gnss_ns(
-      ocxo2_corrected_dwt,
+      ocxo2_edge_dwt,
       pps_gnss_ns,
       dwt_raw_at_pps,
       dwt_cycles_per_pps_snapshot,
@@ -838,10 +818,10 @@ void clocks_beta_pps(void) {
   // Shadow-write TDC forensics (v29)
   p.add("ocxo1_phase_isr_dwt",      ocxo_phase.ocxo1_isr_dwt);
   p.add("ocxo1_phase_shadow_dwt",   ocxo_phase.ocxo1_shadow_dwt);
-  p.add("ocxo1_phase_delta_cycles", ocxo_phase.ocxo1_delta_cycles);
+  p.add("ocxo1_phase_edge_dwt",     ocxo_phase.ocxo1_edge_dwt);
   p.add("ocxo2_phase_isr_dwt",      ocxo_phase.ocxo2_isr_dwt);
   p.add("ocxo2_phase_shadow_dwt",   ocxo_phase.ocxo2_shadow_dwt);
-  p.add("ocxo2_phase_delta_cycles", ocxo_phase.ocxo2_delta_cycles);
+  p.add("ocxo2_phase_edge_dwt",     ocxo_phase.ocxo2_edge_dwt);
   p.add("diag_ocxo_phase_spin_timeouts", diag_ocxo_phase_spin_timeouts);
 
   p.add("ocxo1_dac_n",      (int32_t)dac_welford_ocxo1.n);
@@ -867,13 +847,11 @@ void clocks_beta_pps(void) {
 
   p.add("spin_valid",             pps_spin.valid);
   p.add("spin_approach_cycles",   pps_spin.approach_cycles);
-  p.add("spin_delta_cycles",      pps_spin.delta_cycles);
   p.add("spin_error_cycles",      pps_spin.spin_error);
   p.add("spin_isr_dwt",           pps_spin.isr_dwt);
   p.add("spin_landed_dwt",        pps_spin.landed_dwt);
   p.add("spin_shadow_dwt",        pps_spin.shadow_dwt);
-  p.add("spin_corrected_dwt",     pps_spin.corrected_dwt);
-  p.add("spin_tdc_correction",    pps_spin.tdc_correction);
+  p.add("spin_edge_dwt",          pps_spin.edge_dwt);
   p.add("spin_nano_timed_out",    pps_spin.nano_timed_out);
   p.add("spin_shadow_timed_out",  pps_spin.shadow_timed_out);
 
@@ -1278,10 +1256,8 @@ static Payload cmd_clocks_info(const Payload&) {
   p.add("spin_error_cycles",      pps_spin.spin_error);
   p.add("spin_shadow_dwt",        pps_spin.shadow_dwt);
   p.add("spin_isr_dwt",           pps_spin.isr_dwt);
-  p.add("spin_delta_cycles",      pps_spin.delta_cycles);
   p.add("spin_approach_cycles",   pps_spin.approach_cycles);
-  p.add("spin_corrected_dwt",     pps_spin.corrected_dwt);
-  p.add("spin_tdc_correction",    pps_spin.tdc_correction);
+  p.add("spin_edge_dwt",          pps_spin.edge_dwt);
   p.add("spin_nano_timed_out",    pps_spin.nano_timed_out);
   p.add("spin_nano_timeouts",     pps_spin.nano_timeouts);
   p.add("spin_shadow_timed_out",  pps_spin.shadow_timed_out);
@@ -1331,7 +1307,7 @@ static Payload cmd_phase_info(const Payload&) {
   p.add("ocxo1_isr_dwt",       ocxo_phase.ocxo1_isr_dwt);
   p.add("ocxo1_gpt_at_fire",   ocxo_phase.ocxo1_gpt_at_fire);
   p.add("ocxo1_shadow_dwt",    ocxo_phase.ocxo1_shadow_dwt);
-  p.add("ocxo1_delta_cycles",  ocxo_phase.ocxo1_delta_cycles);
+  p.add("ocxo1_edge_dwt",      ocxo_phase.ocxo1_edge_dwt);
   p.add("ocxo1_dwt_elapsed",   ocxo_phase.ocxo1_dwt_elapsed);
   p.add("ocxo1_elapsed_ns",    ocxo_phase.ocxo1_elapsed_ns);
   p.add("ocxo1_phase_offset_ns", (int32_t)ocxo_phase.ocxo1_phase_offset_ns);
@@ -1342,7 +1318,7 @@ static Payload cmd_phase_info(const Payload&) {
   p.add("ocxo2_isr_dwt",       ocxo_phase.ocxo2_isr_dwt);
   p.add("ocxo2_gpt_at_fire",   ocxo_phase.ocxo2_gpt_at_fire);
   p.add("ocxo2_shadow_dwt",    ocxo_phase.ocxo2_shadow_dwt);
-  p.add("ocxo2_delta_cycles",  ocxo_phase.ocxo2_delta_cycles);
+  p.add("ocxo2_edge_dwt",      ocxo_phase.ocxo2_edge_dwt);
   p.add("ocxo2_dwt_elapsed",   ocxo_phase.ocxo2_dwt_elapsed);
   p.add("ocxo2_elapsed_ns",    ocxo_phase.ocxo2_elapsed_ns);
   p.add("ocxo2_phase_offset_ns", (int32_t)ocxo_phase.ocxo2_phase_offset_ns);
@@ -1618,16 +1594,16 @@ static Payload cmd_interp_proof(const Payload& args) {
 
   int64_t error_b  = 0;
 
-  if (pps_spin.valid && pps_spin.tdc_correction >= 0) {
+  if (pps_spin.valid) {
     // spin_gnss is approximate: landed_gnss_ns is the time.h estimate
     // at spin landing, adjusted forward by the TDC correction.
     // A simpler and more robust approach: the spin landing is
     // (delta_cycles) DWT cycles before the ISR snapshot.
-    // The corrected_dwt is the true PPS-edge DWT.
-    // So the corrected anchor is: {frag_gnss_ns, corrected_dwt}
+    // The canonical edge_dwt is the true PPS-edge DWT.
+    // So the corrected anchor is: {frag_gnss_ns, edge_dwt}
     // — same GNSS time as the PPS edge, but a more precise DWT.
 
-    const uint32_t dwt_elapsed_b = dwt_now - pps_spin.corrected_dwt;
+    const uint32_t dwt_elapsed_b = dwt_now - pps_spin.edge_dwt;
     const uint64_t dwt_ns_into_second_b =
       (uint64_t)dwt_elapsed_b * 1000000000ULL / (uint64_t)frag_dwt_cycles_per_pps;
     const uint64_t interp_b = frag_gnss_ns + dwt_ns_into_second_b;
@@ -1799,3 +1775,4 @@ static const process_vtable_t CLOCKS_PROCESS = {
 void process_clocks_register(void) {
   process_register("CLOCKS", &CLOCKS_PROCESS);
 }
+

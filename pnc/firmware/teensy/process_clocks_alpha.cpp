@@ -209,19 +209,11 @@ static void pps_spin_complete(uint32_t isr_dwt_snap) {
     return;
   }
 
-  pps_spin.isr_dwt         = isr_dwt_snap;
-  pps_spin.delta_cycles     = (int32_t)(isr_dwt_snap - pps_spin.shadow_dwt);
-  pps_spin.approach_cycles  = (int32_t)(isr_dwt_snap - pps_spin.landed_dwt);
+  pps_spin.isr_dwt        = isr_dwt_snap;
+  pps_spin.approach_cycles = (int32_t)(isr_dwt_snap - pps_spin.landed_dwt);
+  pps_spin.edge_dwt       = pps_dwt_at_edge(isr_dwt_snap);
 
-  int32_t correction = -1;
-  pps_spin.corrected_dwt = tdc_correct(
-    pps_spin.shadow_dwt,
-    pps_spin.delta_cycles,
-    correction
-  );
-  pps_spin.tdc_correction = correction;
-
-  pps_spin.valid  = (correction >= 0);
+  pps_spin.valid  = true;
   pps_spin.armed  = false;
   pps_spin.handle = TIMEPOP_INVALID_HANDLE;
 }
@@ -386,6 +378,7 @@ volatile uint32_t diag_ocxo1_phase_captures = 0;
 volatile uint32_t diag_ocxo2_phase_captures = 0;
 volatile uint32_t diag_ocxo1_phase_misses   = 0;
 volatile uint32_t diag_ocxo2_phase_misses   = 0;
+
 
 // ── Phase spin diagnostics ──
 volatile uint32_t diag_ocxo_phase_spin_timeouts = 0;
@@ -688,17 +681,12 @@ uint64_t clocks_ocxo2_ns_now(void) {
 static void pps_asap_callback(timepop_ctx_t*, void*) {
 
   // ── Spin capture: complete the current capture, arm the next ──
-  // Must run FIRST so pps_spin.corrected_dwt is available for
+  // Must run FIRST so pps_spin.edge_dwt is available for
   // the calibration and time anchor blocks below.
   pps_spin_complete(isr_snap_dwt);
   pps_spin_arm();
 
-  // ── Best-available DWT at the true PPS edge ──
-  // TDC-corrected when spin capture succeeded; ISR-compensated fallback otherwise.
-  const uint32_t dwt_at_pps_edge =
-    (pps_spin.valid && pps_spin.tdc_correction >= 0)
-      ? pps_spin.corrected_dwt
-      : (isr_snap_dwt - TDC_FIXED_OVERHEAD);
+  const uint32_t dwt_at_pps_edge = pps_dwt_at_edge(isr_snap_dwt);
 
   // ── Continuous DWT calibration (always runs, campaign-independent) ──
   {
@@ -735,6 +723,8 @@ static void pps_asap_callback(timepop_ctx_t*, void*) {
 
     // Per-shot clean slate for beta-owned derived fields.
     ocxo_phase.pps_gnss_ns            = 0;
+    ocxo_phase.ocxo1_edge_dwt         = 0;
+    ocxo_phase.ocxo2_edge_dwt         = 0;
     ocxo_phase.ocxo1_edge_gnss_ns     = 0;
     ocxo_phase.ocxo2_edge_gnss_ns     = 0;
     ocxo_phase.ocxo1_gnss_ns_per_pps  = 0;
@@ -771,9 +761,8 @@ static void pps_asap_callback(timepop_ctx_t*, void*) {
     if (ocxo1_phase_captured && !spin_timed_out) {
       ocxo_phase.ocxo1_isr_dwt     = ocxo1_phase_isr_dwt;
       ocxo_phase.ocxo1_shadow_dwt  = ocxo1_phase_shadow_dwt;
+      ocxo_phase.ocxo1_edge_dwt    = gpt_dwt_at_edge(ocxo1_phase_isr_dwt);
       ocxo_phase.ocxo1_gpt_at_fire = ocxo1_phase_gpt_at_fire;
-      ocxo_phase.ocxo1_delta_cycles =
-        (int32_t)(ocxo1_phase_isr_dwt - ocxo1_phase_shadow_dwt);
       ocxo_phase.ocxo1_captured    = true;
       ocxo_phase.ocxo1_valid       = true;
 
@@ -788,9 +777,8 @@ static void pps_asap_callback(timepop_ctx_t*, void*) {
     if (ocxo2_phase_captured && !spin_timed_out) {
       ocxo_phase.ocxo2_isr_dwt     = ocxo2_phase_isr_dwt;
       ocxo_phase.ocxo2_shadow_dwt  = ocxo2_phase_shadow_dwt;
+      ocxo_phase.ocxo2_edge_dwt    = gpt_dwt_at_edge(ocxo2_phase_isr_dwt);
       ocxo_phase.ocxo2_gpt_at_fire = ocxo2_phase_gpt_at_fire;
-      ocxo_phase.ocxo2_delta_cycles =
-        (int32_t)(ocxo2_phase_isr_dwt - ocxo2_phase_shadow_dwt);
       ocxo_phase.ocxo2_captured    = true;
       ocxo_phase.ocxo2_valid       = true;
 
@@ -1002,3 +990,4 @@ void process_clocks_init(void) {
   attachInterrupt(digitalPinToInterrupt(GNSS_PPS_PIN), pps_isr, RISING);
   NVIC_SET_PRIORITY(IRQ_GPIO6789, 0);
 }
+
