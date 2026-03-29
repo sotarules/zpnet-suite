@@ -35,6 +35,8 @@
 
 #include "process_clocks_internal.h"
 #include "process_clocks.h"
+#include "isr_dwt_compensate.h"
+#include "tdc_correction.h"
 
 #include "debug.h"
 #include "timebase.h"
@@ -654,9 +656,25 @@ void clocks_beta_pps(void) {
   // ── Absolute GNSS timestamps for canonical winning OCXO edges ──
   ocxo_phase.pps_gnss_ns = pps_gnss_ns;
 
+  int32_t ocxo1_tdc_applied = -1;
+  const uint32_t ocxo1_corrected_dwt = gpt_tdc_correct(
+    ocxo_phase.ocxo1_shadow_dwt,
+    ocxo_phase.ocxo1_isr_dwt,
+    ocxo_phase.ocxo1_delta_cycles,
+    ocxo1_tdc_applied
+  );
+
+  int32_t ocxo2_tdc_applied = -1;
+  const uint32_t ocxo2_corrected_dwt = gpt_tdc_correct(
+    ocxo_phase.ocxo2_shadow_dwt,
+    ocxo_phase.ocxo2_isr_dwt,
+    ocxo_phase.ocxo2_delta_cycles,
+    ocxo2_tdc_applied
+  );
+
   const bool ocxo1_edge_valid = ocxo_phase.ocxo1_captured &&
     ocxo_edge_dwt_to_gnss_ns(
-      ocxo_phase.ocxo1_isr_dwt,
+      ocxo1_corrected_dwt,
       pps_gnss_ns,
       dwt_raw_at_pps,
       dwt_cycles_per_pps_snapshot,
@@ -665,7 +683,7 @@ void clocks_beta_pps(void) {
 
   const bool ocxo2_edge_valid = ocxo_phase.ocxo2_captured &&
     ocxo_edge_dwt_to_gnss_ns(
-      ocxo_phase.ocxo2_isr_dwt,
+      ocxo2_corrected_dwt,
       pps_gnss_ns,
       dwt_raw_at_pps,
       dwt_cycles_per_pps_snapshot,
@@ -816,6 +834,15 @@ void clocks_beta_pps(void) {
   p.add("ocxo1_dac_after",         (int32_t)ocxo_phase.ocxo1_dac_after);
   p.add("ocxo2_dac_before",        (int32_t)ocxo_phase.ocxo2_dac_before);
   p.add("ocxo2_dac_after",         (int32_t)ocxo_phase.ocxo2_dac_after);
+
+  // Shadow-write TDC forensics (v29)
+  p.add("ocxo1_phase_isr_dwt",      ocxo_phase.ocxo1_isr_dwt);
+  p.add("ocxo1_phase_shadow_dwt",   ocxo_phase.ocxo1_shadow_dwt);
+  p.add("ocxo1_phase_delta_cycles", ocxo_phase.ocxo1_delta_cycles);
+  p.add("ocxo2_phase_isr_dwt",      ocxo_phase.ocxo2_isr_dwt);
+  p.add("ocxo2_phase_shadow_dwt",   ocxo_phase.ocxo2_shadow_dwt);
+  p.add("ocxo2_phase_delta_cycles", ocxo_phase.ocxo2_delta_cycles);
+  p.add("diag_ocxo_phase_spin_timeouts", diag_ocxo_phase_spin_timeouts);
 
   p.add("ocxo1_dac_n",      (int32_t)dac_welford_ocxo1.n);
   p.add_fmt("ocxo1_dac_mean",   "%.6f", dac_welford_ocxo1.mean);
@@ -1264,6 +1291,8 @@ static Payload cmd_clocks_info(const Payload&) {
   p.add("spin_completions",       pps_spin.completions);
   p.add("spin_misses",            pps_spin.misses);
 
+  p.add("diag_ocxo_phase_spin_timeouts", diag_ocxo_phase_spin_timeouts);
+
   p.add("dbg_post_dwt",      dbg_post_loop_dwt);
   p.add("dbg_post_shadow",   dbg_post_loop_shadow);
   p.add("dbg_post_isr_cap",  dbg_post_loop_isr_cap);
@@ -1301,6 +1330,8 @@ static Payload cmd_phase_info(const Payload&) {
   p.add("ocxo1_valid",         (bool)ocxo_phase.ocxo1_valid);
   p.add("ocxo1_isr_dwt",       ocxo_phase.ocxo1_isr_dwt);
   p.add("ocxo1_gpt_at_fire",   ocxo_phase.ocxo1_gpt_at_fire);
+  p.add("ocxo1_shadow_dwt",    ocxo_phase.ocxo1_shadow_dwt);
+  p.add("ocxo1_delta_cycles",  ocxo_phase.ocxo1_delta_cycles);
   p.add("ocxo1_dwt_elapsed",   ocxo_phase.ocxo1_dwt_elapsed);
   p.add("ocxo1_elapsed_ns",    ocxo_phase.ocxo1_elapsed_ns);
   p.add("ocxo1_phase_offset_ns", (int32_t)ocxo_phase.ocxo1_phase_offset_ns);
@@ -1310,6 +1341,8 @@ static Payload cmd_phase_info(const Payload&) {
   p.add("ocxo2_valid",         (bool)ocxo_phase.ocxo2_valid);
   p.add("ocxo2_isr_dwt",       ocxo_phase.ocxo2_isr_dwt);
   p.add("ocxo2_gpt_at_fire",   ocxo_phase.ocxo2_gpt_at_fire);
+  p.add("ocxo2_shadow_dwt",    ocxo_phase.ocxo2_shadow_dwt);
+  p.add("ocxo2_delta_cycles",  ocxo_phase.ocxo2_delta_cycles);
   p.add("ocxo2_dwt_elapsed",   ocxo_phase.ocxo2_dwt_elapsed);
   p.add("ocxo2_elapsed_ns",    ocxo_phase.ocxo2_elapsed_ns);
   p.add("ocxo2_phase_offset_ns", (int32_t)ocxo_phase.ocxo2_phase_offset_ns);
@@ -1323,6 +1356,7 @@ static Payload cmd_phase_info(const Payload&) {
   p.add("misses_ocxo1",        diag_ocxo1_phase_misses);
   p.add("captures_ocxo2",      diag_ocxo2_phase_captures);
   p.add("misses_ocxo2",        diag_ocxo2_phase_misses);
+  p.add("diag_ocxo_phase_spin_timeouts", diag_ocxo_phase_spin_timeouts);
 
   return p;
 }

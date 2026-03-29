@@ -98,9 +98,9 @@
 //
 // ============================================================================
 
-static constexpr uint32_t TDC_FIXED_OVERHEAD  = 52;   // min delta (nested ISR entry latency)
+static constexpr uint32_t TDC_FIXED_OVERHEAD  = 48;   // min delta (nested ISR entry latency)
 static constexpr uint32_t TDC_LOOP_CYCLES     = 1;    // cycles per loop iteration
-static constexpr uint32_t TDC_MAX_CORRECTION  = 8;
+static constexpr uint32_t TDC_MAX_CORRECTION  = 12;
 
 // ============================================================================
 // tdc_correct — apply TDC correction to a spin capture
@@ -132,4 +132,75 @@ static inline uint32_t tdc_correct(
   // or an anomalous condition occurred.  Return uncorrected.
   correction_applied = -1;
   return shadow_dwt;
+}
+
+// ============================================================================
+// GPT Phase TDC — OCXO edge capture correction (non-nested ISR)
+// ============================================================================
+//
+// The GPT output-compare ISRs fire at priority 0 and preempt the
+// shadow-write loop running in scheduled context (pps_asap_callback).
+// This is a non-nested interrupt entry — no outer ISR frame to stack.
+//
+// The NVIC entry path is simpler than PPS (which nests from priority 16):
+//   - Save 8 core registers (exception frame)
+//   - Vector fetch + pipeline fill
+//   - First instruction (DWT_CYCCNT read)
+//
+// Empirical histogram (Alpha5 campaign, 784 samples):
+//
+//   delta range: [17, 25]  (9 values, same spread as PPS)
+//   The lower baseline (17 vs 48) reflects the absence of NVIC
+//   nesting overhead (~30 cycles saved).
+//
+// The correction formula is identical to PPS TDC:
+//
+//   edge_dwt = shadow_dwt + (delta - GPT_TDC_FIXED_OVERHEAD)
+//
+// Note: only valid for the OCXO that fires FIRST into the shadow loop.
+// The second OCXO's shadow is stale (captured before the first ISR ran),
+// so its delta includes the inter-edge gap (~400 cycles) and will
+// exceed GPT_TDC_MAX_CORRECTION.  The fallback for the second OCXO
+// uses isr_dwt - GPT_TDC_FIXED_OVERHEAD (fixed subtraction).
+//
+// ============================================================================
+
+static constexpr uint32_t GPT_TDC_FIXED_OVERHEAD  = 17;   // min delta (non-nested ISR entry)
+static constexpr uint32_t GPT_TDC_LOOP_CYCLES     = 1;    // cycles per loop iteration
+static constexpr uint32_t GPT_TDC_MAX_CORRECTION  = 8;    // max valid correction
+
+// ============================================================================
+// gpt_tdc_correct — apply TDC correction to a GPT phase capture
+//
+// Same contract as tdc_correct() but uses GPT-specific constants.
+//
+// Given the shadow DWT and the delta (isr_dwt - shadow_dwt),
+// returns the corrected DWT value at the actual OCXO edge.
+//
+// Returns the corrected DWT, or (isr_dwt - GPT_TDC_FIXED_OVERHEAD)
+// as fallback if the delta is outside the valid range (second-to-fire
+// OCXO, miss, or anomaly).
+//
+// The out parameter `correction_applied` receives the correction
+// in DWT cycles (0-8), or -1 if no correction was applied.
+// ============================================================================
+
+static inline uint32_t gpt_tdc_correct(
+  uint32_t shadow_dwt,
+  uint32_t isr_dwt,
+  int32_t  delta_cycles,
+  int32_t& correction_applied
+) {
+  const int32_t correction = delta_cycles - (int32_t)GPT_TDC_FIXED_OVERHEAD;
+
+  if (correction >= 0 && correction <= (int32_t)GPT_TDC_MAX_CORRECTION) {
+    // Delta is within the valid TDC window — apply correction.
+    correction_applied = correction;
+    return shadow_dwt + (uint32_t)correction;
+  }
+
+  // Delta outside valid range — second-to-fire OCXO, or anomaly.
+  // Fall back to fixed subtraction from ISR DWT.
+  correction_applied = -1;
+  return isr_dwt - GPT_TDC_FIXED_OVERHEAD;
 }

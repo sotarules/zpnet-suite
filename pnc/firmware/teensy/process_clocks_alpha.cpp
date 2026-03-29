@@ -2,77 +2,35 @@
 // process_clocks_alpha.cpp — Always-On Physics Layer
 // ============================================================================
 //
+// v29: OCXO phase capture — shadow-write TDC architecture.
+//
+//   Replaces the fixed ISR-latency-subtraction model (v28) with the
+//   same shadow-write TDC technique used for PPS edge capture.
+//
+//   The PPS ISR arms GPT1/GPT2 output compares with a generous offset
+//   (OCXO_PHASE_ARM_OFFSET_TICKS) so the compare fires AFTER the ASAP
+//   callback has started its shadow-write loop.  The ASAP callback
+//   spins a tight loop writing DWT_CYCCNT to a shared volatile until
+//   both GPT ISRs have fired (or timeout).
+//
+//   When each GPT ISR fires (priority 0 — no temporal conflict with
+//   PPS because the compare target is well after PPS), it captures
+//   both DWT_CYCCNT and the current shadow value.  The delta
+//   (isr_dwt - shadow_dwt) provides per-sample ISR latency
+//   characterization, enabling cycle-accurate TDC correction.
+//
+//   The arming MUST happen in pps_isr (not the ASAP callback) because
+//   the OCXO counters advance continuously — by the time the ASAP
+//   callback runs, snap_ocxo + 50 may already be in the past.
+//   The larger offset (150 ticks = 15 µs) ensures the compare fires
+//   after the ASAP callback has started the shadow loop (~2-3 µs
+//   after PPS).
+//
 // v26: OCXO phase-first capture.
-//
-//   The OCXO gold measurement is the phase offset of the FIRST
-//   10 MHz edge after PPS, captured once per second for OCXO1 and
-//   OCXO2. After the normal PPS housekeeping, alpha spins on each
-//   GPT counter until the next post-PPS edge is observed.
-//
-//   For each OCXO phase capture, alpha now publishes both raw and adjusted
-//   phase facts. The raw delimiter is dwt_before. Raw elapsed/phase are left
-//   innocent and unmodified; a bracket-class bias map then derives adjusted
-//   phase for servo/control use.
-//
-//   Beta then computes the absolute GNSS timestamp of that canonical edge:
-//
-//     edge_gnss_ns = pps_gnss_ns + phase_offset_ns
-//
-//   and the authoritative residual:
-//
-//     residual_ns = (edge_gnss_ns_this - edge_gnss_ns_prev) - 1e9
-//
-//   This removes the prior first-edge backtracking / missed-delta math
-//   and keeps alpha focused on direct measurement only.
-//
 // v24: OCXO phase capture — DWT-interpolated edge timing.
-//
-//   After the PPS ISR completes its normal work (snapshots, residuals,
-//   shadow capture, watchdog), two sequential spin loops capture the
-//   exact DWT cycle count at the next GPT1 (OCXO1) and GPT2 (OCXO2)
-//   counter transitions.  Each spin is guaranteed ≤100 ns (one 10 MHz
-//   tick).  The DWT timestamps, combined with the known DWT-at-PPS,
-//   yield phase offsets in GNSS nanoseconds — the sub-tick position
-//   of each OCXO edge relative to PPS.
-//
 // v23: 10 MHz single-edge QTimer1 migration.
-//
-//   QTimer1 CH0 switched from CM(2) (dual-edge, 20 MHz) to CM(1)
-//   (rising-edge only, 10 MHz).  The raw QTimer counter now runs at
-//   the native GNSS frequency — one tick = one GNSS cycle = 100 ns.
-//
-//   This eliminates the GNSS_EDGE_DIVISOR translation layer:
-//     - qtimer1_read_32() returns 10 MHz ticks directly
-//     - clocks_gnss_ticks_now() no longer divides by 2
-//     - ISR residual math uses ISR_GNSS_RAW_EXPECTED = 10,000,000
-//     - All clock domains (DWT, GNSS, OCXO1, OCXO2) are now in
-//       their natural units with no domain translation
-//
-//   CH1 remains CM(7) (cascade from CH0 overflow) — unchanged.
-//   CH2 is TimePop's dynamic compare scheduler (also CM=1, set by
-//   timepop_init()).  CH3 is unallocated.
-//
-//   32-bit counter wrap extends from ~214s to ~429s at 10 MHz.
-//
-// v21: QTimer1 torn-read prevention.
-//
-//   The GNSS VCLOCK counter is a cascaded 16-bit + 16-bit QTimer1.
-//   Reading channel 0 (low) and channel 1 (high) is not atomic — if
-//   the low counter rolls over between the two reads, the combined
-//   32-bit value can be off by up to 65,536 ticks.
-//
-//   This single bad read poisoned the PPS rejection check's
-//   isr_prev_gnss baseline, causing ALL subsequent PPS edges to be
-//   rejected permanently (diagnosed 2026-03-17 overnight stall).
-//
-//   Fix: read high-low-high.  If the two high reads differ, the
-//   low word rolled over — re-read it.  This eliminates the torn
-//   read at the source with ~2-3 ns of additional ISR latency.
-//
-//   Any watchdog-class anomaly now publishes WATCHDOG_ANOMALY and
-//   stops the campaign cleanly for Pi-side canonical recovery.
-//
 // v22: WATCHDOG_ANOMALY stop-and-yield architecture.
+// v21: QTimer1 torn-read prevention.
 // v19: Shadow-loop timeout protection + consistent timeout naming.
 // v18: Spin Capture with shadow-write loop — TDC at 1008 MHz.
 // v16: PPS watchdog — self-healing pps_scheduled stall.
@@ -134,6 +92,19 @@ static constexpr uint32_t PPS_REJECT_RECOVERY_THRESHOLD = 10;
 // ============================================================================
 
 static constexpr uint32_t SPIN_LOOP_TIMEOUT_CYCLES = 100800;  // 100 µs at 1008 MHz
+
+// ============================================================================
+// OCXO phase capture — shadow-write spin timeout
+//
+// The OCXO shadow loop runs in the ASAP callback waiting for GPT
+// ISRs that were armed by pps_isr.  The GPT compares fire at
+// snap_ocxo + OCXO_PHASE_ARM_OFFSET_TICKS (~15 µs after PPS).
+// The ASAP callback starts ~2-3 µs after PPS, so the shadow loop
+// runs for ~12-13 µs before the first GPT fires.  50 µs timeout
+// provides generous margin.
+// ============================================================================
+
+static constexpr uint32_t OCXO_PHASE_SPIN_TIMEOUT_CYCLES = 50400;  // 50 µs at 1008 MHz
 
 // ============================================================================
 // Spin Capture — nano-precise DWT anchoring with shadow-write TDC
@@ -382,27 +353,42 @@ volatile bool pps_fired = false;
 volatile bool pps_scheduled = false;
 
 // ============================================================================
-// OCXO phase capture — v28 GPT output-compare ISR architecture
+// OCXO phase capture — v29 shadow-write TDC architecture
 //
 // Each GPT fires a one-shot output-compare ISR on the first OCXO
-// edge after PPS.  The ISR captures DWT_CYCCNT with deterministic,
-// characterizable latency (same mechanism as PPS ISR).
+// edge after PPS.  The ISR captures DWT_CYCCNT and the current shadow
+// DWT value from the ASAP callback's shadow-write loop.  The delta
+// (isr_dwt - shadow_dwt) provides per-sample ISR latency for TDC
+// correction, identical to the PPS spin capture mechanism.
+//
+// GPT arming happens in pps_isr (while OCXO counters are close to
+// their snapshot values).  The shadow-write loop runs in the ASAP
+// callback.  The arm offset must be large enough that the compare
+// fires AFTER the ASAP callback has started the shadow loop.
 // ============================================================================
 
-// ── GPT ISR capture state ──
-volatile uint32_t ocxo1_phase_isr_dwt  = 0;
-volatile bool     ocxo1_phase_captured = false;
-volatile uint32_t ocxo1_phase_gpt_at_fire = 0;
+// ── Shared shadow variable for OCXO phase spin loop ──
+volatile uint32_t ocxo_phase_shadow_dwt = 0;
 
-volatile uint32_t ocxo2_phase_isr_dwt  = 0;
-volatile bool     ocxo2_phase_captured = false;
-volatile uint32_t ocxo2_phase_gpt_at_fire = 0;
+// ── GPT ISR capture state ──
+volatile uint32_t ocxo1_phase_isr_dwt      = 0;
+volatile uint32_t ocxo1_phase_shadow_dwt   = 0;
+volatile bool     ocxo1_phase_captured     = false;
+volatile uint32_t ocxo1_phase_gpt_at_fire  = 0;
+
+volatile uint32_t ocxo2_phase_isr_dwt      = 0;
+volatile uint32_t ocxo2_phase_shadow_dwt   = 0;
+volatile bool     ocxo2_phase_captured     = false;
+volatile uint32_t ocxo2_phase_gpt_at_fire  = 0;
 
 // ── Phase capture diagnostics ──
 volatile uint32_t diag_ocxo1_phase_captures = 0;
 volatile uint32_t diag_ocxo2_phase_captures = 0;
 volatile uint32_t diag_ocxo1_phase_misses   = 0;
 volatile uint32_t diag_ocxo2_phase_misses   = 0;
+
+// ── Phase spin diagnostics ──
+volatile uint32_t diag_ocxo_phase_spin_timeouts = 0;
 
 // ── Simplified phase result (computed in pps_asap_callback) ──
 ocxo_phase_capture_t ocxo_phase = {};
@@ -415,18 +401,19 @@ volatile uint32_t diag_gpt2_isr_fires = 0;
 //
 // Fires once per PPS on the first OCXO1 edge at or after the armed
 // compare value.  DWT_CYCCNT is the very first instruction.
-// Priority 0 (same as PPS) — no nesting overhead.
+// Priority 0 — no nesting overhead, no temporal conflict with PPS.
 // ============================================================================
 
 static void gpt1_phase_isr(void) {
   const uint32_t dwt_raw = DWT_CYCCNT;
-  const uint32_t dwt_event = dwt_at_gpt1_compare(dwt_raw);
-  const uint32_t gpt = GPT1_CNT;
+  const uint32_t shadow  = ocxo_phase_shadow_dwt;
+  const uint32_t gpt     = GPT1_CNT;
 
   GPT1_SR = GPT_SR_OF1;
   GPT1_IR &= ~GPT_IR_OF1IE;
 
-  ocxo1_phase_isr_dwt     = dwt_event;   // ✅ EVENT TIME (not ISR time)
+  ocxo1_phase_isr_dwt    = dwt_raw;
+  ocxo1_phase_shadow_dwt = shadow;
   ocxo1_phase_gpt_at_fire = gpt;
   ocxo1_phase_captured    = true;
 
@@ -439,13 +426,14 @@ static void gpt1_phase_isr(void) {
 
 static void gpt2_phase_isr(void) {
   const uint32_t dwt_raw = DWT_CYCCNT;
-  const uint32_t dwt_event = dwt_at_gpt2_compare(dwt_raw);
-  const uint32_t gpt = GPT2_CNT;
+  const uint32_t shadow  = ocxo_phase_shadow_dwt;
+  const uint32_t gpt     = GPT2_CNT;
 
   GPT2_SR = GPT_SR_OF1;
   GPT2_IR &= ~GPT_IR_OF1IE;
 
-  ocxo2_phase_isr_dwt     = dwt_event;   // ✅ EVENT TIME
+  ocxo2_phase_isr_dwt    = dwt_raw;
+  ocxo2_phase_shadow_dwt = shadow;
   ocxo2_phase_gpt_at_fire = gpt;
   ocxo2_phase_captured    = true;
 
@@ -731,17 +719,16 @@ static void pps_asap_callback(timepop_ctx_t*, void*) {
     isr_snap_gnss
   );
 
-  // ── OCXO phase harvest — event-time model (KRAKEN mode) ──
+  // ── OCXO phase capture — shadow-write TDC ──
   //
-  // Alpha responsibility:
-  //   - Capture event-corrected DWT timestamps
-  //   - DO NOT compute phase here
-  //   - DO NOT convert to GNSS here
+  // GPT output compares were armed by pps_isr with a generous offset.
+  // We now spin a shadow-write loop until both ISRs fire.  The GPT
+  // ISRs capture the shadow DWT alongside their own DWT read, giving
+  // us the before/after pair needed for TDC correction.
   //
-  // Beta will:
-  //   - Convert DWT → GNSS
-  //   - Compute phase offset
-  //   - Compute residuals
+  // This runs in scheduled context.  GPT ISRs at priority 0 preempt
+  // cleanly.  The arm offset guarantees the compares fire after
+  // this loop starts.
 
   {
     ocxo_phase.dwt_at_pps = dwt_at_pps_edge;
@@ -762,12 +749,31 @@ static void pps_asap_callback(timepop_ctx_t*, void*) {
     ocxo_phase.ocxo1_phase_offset_ns  = 0;
     ocxo_phase.ocxo2_phase_offset_ns  = 0;
 
-    // ─────────────────────────────────────────────
-    // OCXO1 — event capture
-    // ─────────────────────────────────────────────
-    if (ocxo1_phase_captured) {
-      ocxo_phase.ocxo1_isr_dwt     = ocxo1_phase_isr_dwt;   // already event-corrected
+    // ── Shadow-write spin loop — unified for both OCXOs ──
+    //
+    // Continuously write DWT_CYCCNT to the shared shadow variable.
+    // Each GPT ISR captures the shadow at preemption, giving us a
+    // before/after pair for TDC correction.  The loop terminates
+    // when both ISRs have fired, or on timeout.
+    const uint32_t spin_start = DWT_CYCCNT;
+    bool spin_timed_out = false;
+
+    while (!ocxo1_phase_captured || !ocxo2_phase_captured) {
+      ocxo_phase_shadow_dwt = DWT_CYCCNT;
+      if ((DWT_CYCCNT - spin_start) > OCXO_PHASE_SPIN_TIMEOUT_CYCLES) {
+        spin_timed_out = true;
+        diag_ocxo_phase_spin_timeouts++;
+        break;
+      }
+    }
+
+    // ── Harvest captures ──
+    if (ocxo1_phase_captured && !spin_timed_out) {
+      ocxo_phase.ocxo1_isr_dwt     = ocxo1_phase_isr_dwt;
+      ocxo_phase.ocxo1_shadow_dwt  = ocxo1_phase_shadow_dwt;
       ocxo_phase.ocxo1_gpt_at_fire = ocxo1_phase_gpt_at_fire;
+      ocxo_phase.ocxo1_delta_cycles =
+        (int32_t)(ocxo1_phase_isr_dwt - ocxo1_phase_shadow_dwt);
       ocxo_phase.ocxo1_captured    = true;
       ocxo_phase.ocxo1_valid       = true;
 
@@ -779,12 +785,12 @@ static void pps_asap_callback(timepop_ctx_t*, void*) {
       diag_ocxo1_phase_misses++;
     }
 
-    // ─────────────────────────────────────────────
-    // OCXO2 — event capture
-    // ─────────────────────────────────────────────
-    if (ocxo2_phase_captured) {
-      ocxo_phase.ocxo2_isr_dwt     = ocxo2_phase_isr_dwt;   // already event-corrected
+    if (ocxo2_phase_captured && !spin_timed_out) {
+      ocxo_phase.ocxo2_isr_dwt     = ocxo2_phase_isr_dwt;
+      ocxo_phase.ocxo2_shadow_dwt  = ocxo2_phase_shadow_dwt;
       ocxo_phase.ocxo2_gpt_at_fire = ocxo2_phase_gpt_at_fire;
+      ocxo_phase.ocxo2_delta_cycles =
+        (int32_t)(ocxo2_phase_isr_dwt - ocxo2_phase_shadow_dwt);
       ocxo_phase.ocxo2_captured    = true;
       ocxo_phase.ocxo2_valid       = true;
 
@@ -860,8 +866,13 @@ static void pps_isr(void)
 
   diag_pps_reject_consecutive = 0;
 
-  // ── v28: Arm GPT output compares for OCXO phase capture ──
-  // In pps_isr, in the GPT arming block:
+  // ── Arm GPT output compares for OCXO phase capture ──
+  //
+  // Must happen in PPS ISR while OCXO counters are close to their
+  // snapshot values.  The shadow-write loop runs later in the ASAP
+  // callback; the arm offset must be large enough that the compare
+  // fires AFTER the shadow loop starts (~2-3 µs dispatch latency
+  // + ~1 µs of ASAP callback preamble).
   ocxo1_phase_captured = false;
   ocxo2_phase_captured = false;
 
@@ -981,11 +992,11 @@ void process_clocks_init(void) {
   GPT2_IR = 0;
 
   attachInterruptVector(IRQ_GPT1, gpt1_phase_isr);
-  NVIC_SET_PRIORITY(IRQ_GPT1, 32);
+  NVIC_SET_PRIORITY(IRQ_GPT1, 0);
   NVIC_ENABLE_IRQ(IRQ_GPT1);
 
   attachInterruptVector(IRQ_GPT2, gpt2_phase_isr);
-  NVIC_SET_PRIORITY(IRQ_GPT2, 32);
+  NVIC_SET_PRIORITY(IRQ_GPT2, 0);
   NVIC_ENABLE_IRQ(IRQ_GPT2);
 
   attachInterrupt(digitalPinToInterrupt(GNSS_PPS_PIN), pps_isr, RISING);

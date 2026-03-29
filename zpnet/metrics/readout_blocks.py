@@ -1,14 +1,27 @@
 """
-ZPNet Metrics Readout Blocks — Dense Clocks Panel (v9 Phase Metrics)
+ZPNet Metrics Readout Blocks — Dense Clocks Panel (v10 Fragment-Aware)
 
 Designed for full-screen terminal display over SSH at 1080p.
 
 Data sources:
   • Pi CLOCKS REPORT → campaign payload with report dict (tau, ppb,
     prediction stats, timestamps, DWT clock blocks)
-  • Teensy CLOCKS REPORT → spin capture, ISR residuals, DWT internals,
-    PPS diagnostics, servo state
+  • The report dict now contains a 'fragment' sub-dict with the raw
+    TIMEBASE_FRAGMENT fields.  All spin, ISR, phase, and servo fields
+    live inside the fragment.
   • Pi SYSTEM REPORT → GNSS, environment, power
+
+v10 changes:
+  • Fragment-aware field access: all spin capture, ISR residual,
+    phase detector, and PPS diagnostic fields now read from the
+    'fragment' sub-dict inside the Pi report, falling back to
+    top-level for backward compatibility.
+  • OCXO EXTRA column updated for v29 shadow-write TDC phase model:
+    shows PHASE, EDGE_NS, RES, and TDC delta.
+  • NOW servo CAL section updated for phase-edge model (no more
+    match_prev / winner / iteration fields).
+  • PHASE section added: per-OCXO phase detector summary with
+    shadow TDC delta and GPT TDC correction visibility.
 
 v9 changes:
   • OCXO NOW-servo detail rows updated for the phase/edge model.
@@ -109,6 +122,24 @@ def _bool_str(value):
 
 
 # ---------------------------------------------------------------------
+# Fragment-aware field access
+# ---------------------------------------------------------------------
+
+def _frag(r: dict, key: str, default=None):
+    """
+    Read a field from the report dict, checking the fragment sub-dict
+    first (new TIMEBASE format), then top-level (backward compat).
+    """
+    frag = r.get("fragment")
+    if frag is not None:
+        val = frag.get(key)
+        if val is not None:
+            return val
+    val = r.get(key)
+    return val if val is not None else default
+
+
+# ---------------------------------------------------------------------
 # Status header — always visible on row 0
 # ---------------------------------------------------------------------
 
@@ -180,7 +211,7 @@ def clocks_combined_readout() -> list[str]:
     except Exception:
         t = {}
 
-    cal = t.get("calibrate_ocxo", "OFF")
+    cal = _frag(r, "calibrate_ocxo", t.get("calibrate_ocxo", "OFF"))
 
     # ==============================================================
     # Fetch baseline
@@ -333,29 +364,27 @@ def clocks_combined_readout() -> list[str]:
         else:
             comp = f"{'---':>10}{'---':>10}{'---':>10}"
 
-        dac_hw = t.get(dac_key.replace("_dac", "_dac_hw"))
-        adj = t.get(adj_key, 0)
-        phase_ns = blk.get("winner_phase_offset_ns")
-        prev_phase_ns = blk.get("match_prev_phase_offset_ns")
-        match_iter = blk.get("match_iteration_count")
-        edge_ns = blk.get("edge_gnss_ns")
-        residual_ns = blk.get("residual_ns")
+        # v10: read phase fields from fragment
+        dac_hw = _frag(r, f"{key}_dac_hw")
+        adj = _frag(r, f"{key}_servo_adjustments", 0)
+        phase_ns = _frag(r, f"{key}_phase_offset_ns")
+        edge_ns = _frag(r, f"{key}_edge_gnss_ns")
+        residual_ns = _frag(r, f"{key}_residual_ns")
+        phase_delta = _frag(r, f"{key}_phase_delta_cycles")
 
         extra_parts = []
         if dac_hw is not None:
-            dac_volts = dac_hw * 3.002 / 65535
-            extra_parts.append(f"DAC={dac_hw:>5d} {dac_volts:.5f}V")
-        if prev_phase_ns is not None:
-            extra_parts.append(f"PREV={prev_phase_ns:>2d}ns")
+            dac_volts = int(dac_hw) * 3.002 / 65535
+            extra_parts.append(f"DAC={int(dac_hw):>5d} {dac_volts:.5f}V")
         if phase_ns is not None:
-            extra_parts.append(f"PHASE={phase_ns:>2d}ns")
-        if match_iter is not None:
-            extra_parts.append(f"ITER={match_iter}")
+            extra_parts.append(f"φ={int(phase_ns):>2d}ns")
+        if phase_delta is not None:
+            extra_parts.append(f"Δ={int(phase_delta)}")
         if edge_ns is not None:
-            extra_parts.append(f"EDGE_NS={edge_ns}")
+            extra_parts.append(f"EDGE={int(edge_ns)}")
         if residual_ns is not None:
-            extra_parts.append(f"RES={residual_ns:+d}ns")
-        extra_parts.append(f"ADJ={adj:>4}")
+            extra_parts.append(f"RES={int(residual_ns):+d}ns")
+        extra_parts.append(f"ADJ={int(adj):>4}")
         extra = "   " + " ".join(extra_parts)
 
         lines.append(
@@ -446,9 +475,8 @@ def clocks_combined_readout() -> list[str]:
             f"{'CAL':<6}"
             f"{'NS_PER_PPS':>14}"
             f"{'RESIDUAL':>10}"
-            f"{'PREV_NS':>8}"
-            f"{'ITER':>8}"
             f"{'PHASE_NS':>8}"
+            f"{'Δ_TDC':>8}"
             f"  "
             f"{'DAC_NOW':>8}"
             f"{'V_NOW':>10}"
@@ -459,17 +487,22 @@ def clocks_combined_readout() -> list[str]:
         )
 
         for name, key in [("OCXO1", "ocxo1"), ("OCXO2", "ocxo2")]:
-            blk = r.get(key, {})
-            ns_per_pps = blk.get("gnss_ns_per_pps")
-            residual = blk.get("residual_ns")
-            prev_phase_ns = blk.get("match_prev_phase_offset_ns")
-            phase_ns = blk.get("winner_phase_offset_ns")
-            match_iter = blk.get("match_iteration_count")
-            edge_gnss_ns = blk.get("edge_gnss_ns")
-            dac_before = blk.get("dac_before")
-            dac_after = blk.get("dac_after")
+            ns_per_pps = _frag(r, f"{key}_gnss_ns_per_pps")
+            residual = _frag(r, f"{key}_residual_ns")
+            phase_ns = _frag(r, f"{key}_phase_offset_ns")
+            phase_delta = _frag(r, f"{key}_phase_delta_cycles")
+            edge_gnss_ns = _frag(r, f"{key}_edge_gnss_ns")
+            dac_before = _frag(r, f"{key}_dac_before")
+            dac_after = _frag(r, f"{key}_dac_after")
 
             if ns_per_pps is not None and dac_before is not None and dac_after is not None:
+                ns_per_pps = int(ns_per_pps)
+                residual = int(residual) if residual is not None else 0
+                phase_ns_v = int(phase_ns) if phase_ns is not None else 0
+                delta_v = int(phase_delta) if phase_delta is not None else 0
+                edge_gnss_ns = int(edge_gnss_ns) if edge_gnss_ns is not None else 0
+                dac_before = int(dac_before)
+                dac_after = int(dac_after)
                 step = dac_after - dac_before
                 v_before = dac_before * vref / 65535
                 v_after = dac_after * vref / 65535
@@ -477,9 +510,8 @@ def clocks_combined_readout() -> list[str]:
                     f"{name:<6}"
                     f"{ns_per_pps:>14,}"
                     f"{residual:>+10,}"
-                    f"{prev_phase_ns if prev_phase_ns is not None else 0:>8,}"
-                    f"{match_iter if match_iter is not None else 0:>8,}"
-                    f"{phase_ns if phase_ns is not None else 0:>8,}"
+                    f"{phase_ns_v:>8,}"
+                    f"{delta_v:>8,}"
                     f"  "
                     f"{dac_before:>8}"
                     f"{v_before:>10.5f}"
@@ -504,19 +536,9 @@ def clocks_combined_readout() -> list[str]:
 
     # ==============================================================
     # DWT — predicted vs actual, with PPS residual
-    #
-    # PREDICTED: dwt_cycles_per_pps — the random walk prediction for
-    #   the upcoming second (predicted = prev_delta).  This is what
-    #   the system expects the DWT counter to advance by in the next
-    #   PPS interval.
-    #
-    # ACTUAL: dwt.delta_raw — the measured DWT cycles for the last
-    #   completed second.
-    #
-    # The difference (ACTUAL - PREDICTED) is the prediction residual.
     # ==============================================================
-    dwt_cycles_per_pps = r.get("dwt_cycles_per_pps")
-    dwt_cyccnt_at_pps = r.get("dwt_cyccnt_at_pps")
+    dwt_cycles_per_pps = _frag(r, "dwt_cycles_per_pps")
+    dwt_cyccnt_at_pps = _frag(r, "dwt_cyccnt_at_pps")
     dwt_r_delta_raw = r.get("dwt", {}).get("delta_raw")
     dwt_r_pps_residual = r.get("dwt", {}).get("pps_residual")
 
@@ -529,7 +551,7 @@ def clocks_combined_readout() -> list[str]:
 
     # ── Crown jewels: authoritative 64-bit accumulators at last PPS ──
     dwt_cycles_64 = r.get("teensy_dwt_cycles")
-    gnss_ns_64 = n * 1_000_000_000 if n else None   # GNSS is phase-coherent: exactly n seconds
+    gnss_ns_64 = n * 1_000_000_000 if n else None
 
     lines.append(
         f"      DWT_CYCLES: {_comma_int(dwt_cycles_64, 20)}"
@@ -538,15 +560,15 @@ def clocks_combined_readout() -> list[str]:
     lines.append("")
 
     # ==============================================================
-    # SPIN & PPS — from Pi report dict (r)
+    # SPIN & PPS — from fragment (v10: fragment-aware)
     # ==============================================================
-    spin_valid = r.get("spin_valid")
-    spin_approach = r.get("spin_approach_cycles")
-    spin_delta = r.get("spin_delta_cycles")
-    spin_error = r.get("spin_error_cycles")
-    spin_tdc = r.get("spin_tdc_correction")
-    spin_nano_to = r.get("spin_nano_timed_out")
-    spin_shadow_to = r.get("spin_shadow_timed_out")
+    spin_valid = _frag(r, "spin_valid")
+    spin_approach = _frag(r, "spin_approach_cycles")
+    spin_delta = _frag(r, "spin_delta_cycles")
+    spin_error = _frag(r, "spin_error_cycles")
+    spin_tdc = _frag(r, "spin_tdc_correction")
+    spin_nano_to = _frag(r, "spin_nano_timed_out")
+    spin_shadow_to = _frag(r, "spin_shadow_timed_out")
 
     lines.append(
         f"SPIN  VALID: {_bool_str(spin_valid)}"
@@ -558,11 +580,26 @@ def clocks_combined_readout() -> list[str]:
         f"    SHADOW_TO: {_bool_str(spin_shadow_to)}"
     )
 
-    # ISR residuals — from Pi report dict
-    isr_gnss = r.get("isr_residual_gnss")
-    isr_dwt = r.get("isr_residual_dwt")
-    isr_ocxo1 = r.get("isr_residual_ocxo1")
-    isr_ocxo2 = r.get("isr_residual_ocxo2")
+    # OCXO phase TDC — from fragment
+    phase_valid = _frag(r, "phase_detector_valid")
+    ox1_delta = _frag(r, "ocxo1_phase_delta_cycles")
+    ox2_delta = _frag(r, "ocxo2_phase_delta_cycles")
+    ox1_phase = _frag(r, "ocxo1_phase_offset_ns")
+    ox2_phase = _frag(r, "ocxo2_phase_offset_ns")
+    spin_timeouts = _frag(r, "diag_ocxo_phase_spin_timeouts")
+
+    lines.append(
+        f"PHASE VALID: {_bool_str(phase_valid)}"
+        f"    OX1: φ={_fmt(ox1_phase, '>2d', 2)}ns Δ={_fmt(ox1_delta, '>4d', 4)}"
+        f"    OX2: φ={_fmt(ox2_phase, '>2d', 2)}ns Δ={_fmt(ox2_delta, '>4d', 4)}"
+        f"    SPIN_TO: {_fmt(spin_timeouts, '>4d', 4)}"
+    )
+
+    # ISR residuals — from fragment
+    isr_gnss = _frag(r, "isr_residual_gnss")
+    isr_dwt = _frag(r, "isr_residual_dwt")
+    isr_ocxo1 = _frag(r, "isr_residual_ocxo1")
+    isr_ocxo2 = _frag(r, "isr_residual_ocxo2")
 
     lines.append(
         f"ISR   GNSS: {_sign_int(isr_gnss, 6)}"
@@ -571,9 +608,9 @@ def clocks_combined_readout() -> list[str]:
         f"    OCXO2: {_sign_int(isr_ocxo2, 6)}"
     )
 
-    # PPS diagnostics — from Pi report dict
-    pps_rej_total = r.get("pps_rejected_total")
-    pps_rej_rem = r.get("pps_rejected_remainder")
+    # PPS diagnostics — from fragment
+    pps_rej_total = _frag(r, "diag_pps_rejected_total")
+    pps_rej_rem = _frag(r, "diag_pps_rejected_remainder")
 
     lines.append(
         f"PPS   REJECTED: {_fmt(pps_rej_total, '>4d', 4)}"

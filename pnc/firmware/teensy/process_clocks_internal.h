@@ -4,6 +4,17 @@
 // process_clocks_internal.h — Shared Internal State (Alpha ↔ Beta)
 // ============================================================================
 //
+// v29: OCXO phase capture — shadow-write TDC architecture.
+//
+//   ocxo_phase_capture_t gains shadow_dwt and delta_cycles fields for
+//   each OCXO, matching the PPS spin capture TDC pattern.  The GPT ISRs
+//   now capture the shared shadow DWT alongside their own DWT read.
+//   Beta uses the shadow-corrected DWT for edge timestamp computation.
+//
+//   New externs: ocxo_phase_shadow_dwt (shared shadow variable),
+//   ocxoN_phase_shadow_dwt (per-ISR shadow captures),
+//   diag_ocxo_phase_spin_timeouts.
+//
 // v24: Servo mode enum (MEAN/TOTAL) replaces bool calibrate_ocxo_active.
 //
 //   calibrate_ocxo_active (bool) is replaced by calibrate_ocxo_mode
@@ -106,9 +117,12 @@ static constexpr uint32_t ISR_OCXO1_EXPECTED = TICKS_10MHZ_PER_SECOND;
 static constexpr uint32_t ISR_OCXO2_EXPECTED = TICKS_10MHZ_PER_SECOND;
 
 // Ticks ahead of PPS snapshot to arm GPT output compare.
-// Must be large enough that the compare value is still in the future
-// when the PPS ISR finishes the arming writes (~280 ns / ~3 ticks).
-static constexpr uint32_t OCXO_PHASE_ARM_OFFSET_TICKS = 50;
+// Armed in pps_isr; must be large enough that the compare fires
+// AFTER the ASAP callback has started its shadow-write loop.
+// At 10 MHz, 150 ticks = 15 µs.  The ASAP callback starts ~2-3 µs
+// after PPS and reaches the shadow loop within ~1 µs, so 15 µs
+// provides comfortable margin.
+static constexpr uint32_t OCXO_PHASE_ARM_OFFSET_TICKS = 150;
 
 // ============================================================================
 // PPS diagnostics (alpha-owned, beta-readable)
@@ -156,6 +170,7 @@ extern volatile uint32_t diag_ocxo1_phase_captures;
 extern volatile uint32_t diag_ocxo2_phase_captures;
 extern volatile uint32_t diag_ocxo1_phase_misses;
 extern volatile uint32_t diag_ocxo2_phase_misses;
+extern volatile uint32_t diag_ocxo_phase_spin_timeouts;
 
 // ============================================================================
 // OCXO DAC state — dual oscillator
@@ -354,28 +369,31 @@ struct spin_capture_t {
 extern spin_capture_t pps_spin;
 
 // ============================================================================
-// OCXO phase capture — v28 GPT output-compare ISR architecture
+// OCXO phase capture — v29 shadow-write TDC architecture
 //
 // Each GPT fires a one-shot output-compare ISR on the first OCXO
-// edge after PPS.  The ISR captures DWT_CYCCNT with deterministic,
-// characterizable latency (same mechanism as PPS ISR).
+// edge after PPS.  The ISR captures DWT_CYCCNT and the current shadow
+// DWT from the ASAP callback's shadow-write loop.  The delta
+// (isr_dwt - shadow_dwt) provides per-sample ISR latency for TDC
+// correction, identical to the PPS spin capture mechanism.
 //
-// Beta converts the event-corrected DWT capture into canonical
+// Beta converts the shadow-corrected DWT capture into canonical
 // PPS-anchored GNSS nanoseconds, derives phase offset in [0,100), and
 // computes the authoritative per-second residual from consecutive edge
 // timestamps.
 //
-// Diagnostic fields (isr_dwt, gpt_at_fire) enable ISR latency histogram
-// analysis via tdc_analyzer.  Legacy elapsed fields remain for now but are
-// deprecated and should stay zero under the event-time model.
+// Diagnostic fields (isr_dwt, shadow_dwt, delta_cycles, gpt_at_fire)
+// enable ISR latency histogram analysis via gpt_phase_tdc analyzer.
 // ============================================================================
 
 struct ocxo_phase_capture_t {
   // ── PPS anchor ──
   uint32_t dwt_at_pps;               // best-available DWT at PPS edge
 
-  // ── OCXO1 ISR capture ──
+  // ── OCXO1 shadow-write TDC capture ──
   uint32_t ocxo1_isr_dwt;            // raw DWT_CYCCNT from GPT1 ISR
+  uint32_t ocxo1_shadow_dwt;         // shadow DWT captured by GPT1 ISR
+  int32_t  ocxo1_delta_cycles;       // isr_dwt - shadow_dwt (TDC measurement)
   uint32_t ocxo1_gpt_at_fire;        // GPT1_CNT at ISR entry (diagnostic)
   uint32_t ocxo1_dwt_elapsed = 0;
   uint32_t ocxo1_elapsed_ns = 0;
@@ -383,8 +401,10 @@ struct ocxo_phase_capture_t {
   bool     ocxo1_captured;           // GPT1 ISR fired successfully
   bool     ocxo1_valid;              // phase computation completed
 
-  // ── OCXO2 ISR capture ──
+  // ── OCXO2 shadow-write TDC capture ──
   uint32_t ocxo2_isr_dwt;            // raw DWT_CYCCNT from GPT2 ISR
+  uint32_t ocxo2_shadow_dwt;         // shadow DWT captured by GPT2 ISR
+  int32_t  ocxo2_delta_cycles;       // isr_dwt - shadow_dwt (TDC measurement)
   uint32_t ocxo2_gpt_at_fire;        // GPT2_CNT at ISR entry (diagnostic)
   uint32_t ocxo2_dwt_elapsed = 0;
   uint32_t ocxo2_elapsed_ns = 0;
@@ -419,10 +439,13 @@ struct ocxo_phase_capture_t {
 extern ocxo_phase_capture_t ocxo_phase;
 
 // ── GPT ISR capture state (alpha-owned, read by pps_asap_callback) ──
+extern volatile uint32_t ocxo_phase_shadow_dwt;    // shared shadow variable
 extern volatile uint32_t ocxo1_phase_isr_dwt;
+extern volatile uint32_t ocxo1_phase_shadow_dwt;   // shadow captured by GPT1 ISR
 extern volatile bool     ocxo1_phase_captured;
 extern volatile uint32_t ocxo1_phase_gpt_at_fire;
 extern volatile uint32_t ocxo2_phase_isr_dwt;
+extern volatile uint32_t ocxo2_phase_shadow_dwt;   // shadow captured by GPT2 ISR
 extern volatile bool     ocxo2_phase_captured;
 extern volatile uint32_t ocxo2_phase_gpt_at_fire;
 

@@ -70,12 +70,12 @@ static constexpr uint32_t QTIMER1_CH2_ISR_ENTRY_DWT_CYCLES = 54;
 // GPT1 ISR entry latency — initial estimate matching GPT2.
 // Both are direct-vector GPT ISRs with identical dispatch paths.
 // Calibrate empirically via phase ISR histogram (tdc_analyzer pattern).
-static constexpr uint32_t GPT1_ISR_ENTRY_DWT_CYCLES = 49;
+static constexpr uint32_t GPT1_ISR_ENTRY_DWT_CYCLES = 17;
 
 // GPT2 ISR entry latency — v28 OCXO2 phase capture.
 // Originally measured during TimePop-on-GPT2 era; now used for
 // the OCXO2 output-compare phase ISR.  Calibrate via tdc_analyzer.
-static constexpr uint32_t GPT2_ISR_ENTRY_DWT_CYCLES = 49;
+static constexpr uint32_t GPT2_ISR_ENTRY_DWT_CYCLES = 17;
 
 // ============================================================================
 // dwt_at_event — recover the DWT_CYCCNT at the actual hardware event
