@@ -419,15 +419,17 @@ volatile uint32_t diag_gpt2_isr_fires = 0;
 // ============================================================================
 
 static void gpt1_phase_isr(void) {
-  const uint32_t dwt = DWT_CYCCNT;
+  const uint32_t dwt_raw = DWT_CYCCNT;
+  const uint32_t dwt_event = dwt_at_gpt1_compare(dwt_raw);
   const uint32_t gpt = GPT1_CNT;
 
-  GPT1_SR = GPT_SR_OF1;       // clear output-compare 1 flag
-  GPT1_IR &= ~GPT_IR_OF1IE;   // disable compare interrupt (one-shot)
+  GPT1_SR = GPT_SR_OF1;
+  GPT1_IR &= ~GPT_IR_OF1IE;
 
-  ocxo1_phase_isr_dwt     = dwt;
+  ocxo1_phase_isr_dwt     = dwt_event;   // ✅ EVENT TIME (not ISR time)
   ocxo1_phase_gpt_at_fire = gpt;
   ocxo1_phase_captured    = true;
+
   diag_gpt1_isr_fires++;
 }
 
@@ -436,15 +438,17 @@ static void gpt1_phase_isr(void) {
 // ============================================================================
 
 static void gpt2_phase_isr(void) {
-  const uint32_t dwt = DWT_CYCCNT;
+  const uint32_t dwt_raw = DWT_CYCCNT;
+  const uint32_t dwt_event = dwt_at_gpt2_compare(dwt_raw);
   const uint32_t gpt = GPT2_CNT;
 
   GPT2_SR = GPT_SR_OF1;
   GPT2_IR &= ~GPT_IR_OF1IE;
 
-  ocxo2_phase_isr_dwt     = dwt;
+  ocxo2_phase_isr_dwt     = dwt_event;   // ✅ EVENT TIME
   ocxo2_phase_gpt_at_fire = gpt;
   ocxo2_phase_captured    = true;
+
   diag_gpt2_isr_fires++;
 }
 
@@ -730,55 +734,58 @@ static void pps_asap_callback(timepop_ctx_t*, void*) {
   // ── Campaign-scoped processing (beta) ──
   clocks_beta_pps();
 
-  // ── OCXO phase harvest (v28: ISR-captured DWT → phase offset) ──
+  // ── OCXO phase harvest — event-time model (KRAKEN mode) ──
+  //
+  // Alpha responsibility:
+  //   - Capture event-corrected DWT timestamps
+  //   - DO NOT compute phase here
+  //   - DO NOT convert to GNSS here
+  //
+  // Beta will:
+  //   - Convert DWT → GNSS
+  //   - Compute phase offset
+  //   - Compute residuals
+
   {
     ocxo_phase.dwt_at_pps = dwt_at_pps_edge;
 
+    // ─────────────────────────────────────────────
+    // OCXO1 — event capture
+    // ─────────────────────────────────────────────
     if (ocxo1_phase_captured) {
-      ocxo_phase.ocxo1_isr_dwt     = ocxo1_phase_isr_dwt;
+      ocxo_phase.ocxo1_isr_dwt     = ocxo1_phase_isr_dwt;   // already event-corrected
       ocxo_phase.ocxo1_gpt_at_fire = ocxo1_phase_gpt_at_fire;
       ocxo_phase.ocxo1_captured    = true;
-      diag_ocxo1_phase_captures++;
+      ocxo_phase.ocxo1_valid       = true;
 
-      const uint32_t dwt_elapsed = ocxo1_phase_isr_dwt - GPT1_ISR_ENTRY_DWT_CYCLES - dwt_at_pps_edge;
-      if (g_dwt_cal_valid && g_dwt_cycles_per_gnss_s > 0) {
-        const uint32_t elapsed_ns = (uint32_t)(
-          (uint64_t)dwt_elapsed * NS_PER_SECOND / (uint64_t)g_dwt_cycles_per_gnss_s
-        );
-        ocxo_phase.ocxo1_dwt_elapsed = dwt_elapsed;
-        ocxo_phase.ocxo1_elapsed_ns  = elapsed_ns;
-        ocxo_phase.ocxo1_phase_offset_ns = elapsed_ns % 100u;
-        ocxo_phase.ocxo1_valid = true;
-      }
+      diag_ocxo1_phase_captures++;
     } else {
       ocxo_phase.ocxo1_captured = false;
       ocxo_phase.ocxo1_valid    = false;
+
       diag_ocxo1_phase_misses++;
     }
 
+    // ─────────────────────────────────────────────
+    // OCXO2 — event capture
+    // ─────────────────────────────────────────────
     if (ocxo2_phase_captured) {
-      ocxo_phase.ocxo2_isr_dwt     = ocxo2_phase_isr_dwt;
+      ocxo_phase.ocxo2_isr_dwt     = ocxo2_phase_isr_dwt;   // already event-corrected
       ocxo_phase.ocxo2_gpt_at_fire = ocxo2_phase_gpt_at_fire;
       ocxo_phase.ocxo2_captured    = true;
-      diag_ocxo2_phase_captures++;
+      ocxo_phase.ocxo2_valid       = true;
 
-      const uint32_t dwt_elapsed = ocxo2_phase_isr_dwt - GPT2_ISR_ENTRY_DWT_CYCLES - dwt_at_pps_edge;
-      if (g_dwt_cal_valid && g_dwt_cycles_per_gnss_s > 0) {
-        const uint32_t elapsed_ns = (uint32_t)(
-          (uint64_t)dwt_elapsed * NS_PER_SECOND / (uint64_t)g_dwt_cycles_per_gnss_s
-        );
-        ocxo_phase.ocxo2_dwt_elapsed = dwt_elapsed;
-        ocxo_phase.ocxo2_elapsed_ns  = elapsed_ns;
-        ocxo_phase.ocxo2_phase_offset_ns = elapsed_ns % 100u;
-        ocxo_phase.ocxo2_valid = true;
-      }
+      diag_ocxo2_phase_captures++;
     } else {
       ocxo_phase.ocxo2_captured = false;
       ocxo_phase.ocxo2_valid    = false;
+
       diag_ocxo2_phase_misses++;
     }
 
-    ocxo_phase.detector_valid = ocxo_phase.ocxo1_valid && ocxo_phase.ocxo2_valid;
+    // Detector valid only if BOTH edges captured
+    ocxo_phase.detector_valid =
+      ocxo_phase.ocxo1_valid && ocxo_phase.ocxo2_valid;
   }
 
   diag_pps_asap_dispatched++;

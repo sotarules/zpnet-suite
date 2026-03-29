@@ -372,8 +372,8 @@ struct ocxo_phase_capture_t {
   // ── OCXO1 ISR capture ──
   uint32_t ocxo1_isr_dwt;            // raw DWT_CYCCNT from GPT1 ISR
   uint32_t ocxo1_gpt_at_fire;        // GPT1_CNT at ISR entry (diagnostic)
-  uint32_t ocxo1_dwt_elapsed;        // isr_dwt - ISR_ENTRY - dwt_at_pps
-  uint32_t ocxo1_elapsed_ns;         // dwt_elapsed converted via calibrated ratio
+  uint32_t ocxo1_dwt_elapsed = 0;
+  uint32_t ocxo1_elapsed_ns = 0;
   uint32_t ocxo1_phase_offset_ns;    // elapsed_ns % 100
   bool     ocxo1_captured;           // GPT1 ISR fired successfully
   bool     ocxo1_valid;              // phase computation completed
@@ -381,8 +381,8 @@ struct ocxo_phase_capture_t {
   // ── OCXO2 ISR capture ──
   uint32_t ocxo2_isr_dwt;            // raw DWT_CYCCNT from GPT2 ISR
   uint32_t ocxo2_gpt_at_fire;        // GPT2_CNT at ISR entry (diagnostic)
-  uint32_t ocxo2_dwt_elapsed;        // isr_dwt - ISR_ENTRY - dwt_at_pps
-  uint32_t ocxo2_elapsed_ns;         // dwt_elapsed converted via calibrated ratio
+  uint32_t ocxo2_dwt_elapsed = 0;
+  uint32_t ocxo2_elapsed_ns = 0;
   uint32_t ocxo2_phase_offset_ns;    // elapsed_ns % 100
   bool     ocxo2_captured;           // GPT2 ISR fired successfully
   bool     ocxo2_valid;              // phase computation completed

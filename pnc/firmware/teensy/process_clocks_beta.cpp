@@ -655,37 +655,44 @@ void clocks_beta_pps(void) {
   ocxo_phase.pps_gnss_ns = pps_gnss_ns;
 
   if (ocxo_phase.detector_valid) {
-    ocxo_phase.ocxo1_edge_gnss_ns = pps_gnss_ns + (uint64_t)ocxo_phase.ocxo1_phase_offset_ns;
-    ocxo_phase.ocxo2_edge_gnss_ns = pps_gnss_ns + (uint64_t)ocxo_phase.ocxo2_phase_offset_ns;
+
+    // ── Absolute edge timestamps from DWT → GNSS ──
+    int64_t edge_signed1 = time_dwt_to_gnss_ns(ocxo_phase.ocxo1_isr_dwt);
+
+    if (edge_signed1 < 0) {
+      ocxo_phase.ocxo1_valid = false;
+    } else {
+      ocxo_phase.ocxo1_edge_gnss_ns = (uint64_t)edge_signed1;
+    };
+
+    int64_t edge_signed2 = time_dwt_to_gnss_ns(ocxo_phase.ocxo2_isr_dwt);
+
+    if (edge_signed2 < 0) {
+      ocxo_phase.ocxo2_valid = false;
+    } else {
+      ocxo_phase.ocxo2_edge_gnss_ns = (uint64_t)edge_signed2;
+    }
+
+    // ── Phase offset = absolute difference from PPS ──
+    int64_t phase1 =
+      (int64_t)ocxo_phase.ocxo1_edge_gnss_ns - (int64_t)pps_gnss_ns;
+
+    int64_t phase2 =
+      (int64_t)ocxo_phase.ocxo2_edge_gnss_ns - (int64_t)pps_gnss_ns;
+
+    // Normalize to [0, 100 ns)
+    ocxo_phase.ocxo1_phase_offset_ns =
+      (int32_t)((phase1 % 100 + 100) % 100);
+
+    ocxo_phase.ocxo2_phase_offset_ns =
+      (int32_t)((phase2 % 100 + 100) % 100);
+
   } else {
     ocxo_phase.ocxo1_edge_gnss_ns = 0;
     ocxo_phase.ocxo2_edge_gnss_ns = 0;
-  }
 
-  if (ocxo_phase.detector_valid &&
-      ocxo_phase.prev_ocxo1_edge_gnss_ns != 0 &&
-      ocxo_phase.prev_ocxo2_edge_gnss_ns != 0) {
-    const int64_t ocxo1_gnss_ns_per_pps =
-      (int64_t)(ocxo_phase.ocxo1_edge_gnss_ns - ocxo_phase.prev_ocxo1_edge_gnss_ns);
-    const int64_t ocxo2_gnss_ns_per_pps =
-      (int64_t)(ocxo_phase.ocxo2_edge_gnss_ns - ocxo_phase.prev_ocxo2_edge_gnss_ns);
-
-    ocxo_phase.ocxo1_gnss_ns_per_pps = ocxo1_gnss_ns_per_pps;
-    ocxo_phase.ocxo2_gnss_ns_per_pps = ocxo2_gnss_ns_per_pps;
-    ocxo_phase.ocxo1_residual_ns = ocxo1_gnss_ns_per_pps - (int64_t)NS_PER_SECOND;
-    ocxo_phase.ocxo2_residual_ns = ocxo2_gnss_ns_per_pps - (int64_t)NS_PER_SECOND;
-    ocxo_phase.residual_valid = true;
-  } else {
-    ocxo_phase.ocxo1_gnss_ns_per_pps = 0;
-    ocxo_phase.ocxo2_gnss_ns_per_pps = 0;
-    ocxo_phase.ocxo1_residual_ns = 0;
-    ocxo_phase.ocxo2_residual_ns = 0;
-    ocxo_phase.residual_valid = false;
-  }
-
-  if (ocxo_phase.detector_valid) {
-    ocxo_phase.prev_ocxo1_edge_gnss_ns = ocxo_phase.ocxo1_edge_gnss_ns;
-    ocxo_phase.prev_ocxo2_edge_gnss_ns = ocxo_phase.ocxo2_edge_gnss_ns;
+    ocxo_phase.ocxo1_phase_offset_ns = 0;
+    ocxo_phase.ocxo2_phase_offset_ns = 0;
   }
 
   ocxo_calibration_servo();
@@ -752,39 +759,28 @@ void clocks_beta_pps(void) {
   p.add("ocxo1_dac_hw",      (int32_t)ocxo1_dac.dac_hw_code);
   p.add("ocxo2_dac_hw",      (int32_t)ocxo2_dac.dac_hw_code);
 
-  p.add("ocxo1_edge_gnss_ns",      ocxo_phase.ocxo1_edge_gnss_ns);
-  p.add("ocxo2_edge_gnss_ns",      ocxo_phase.ocxo2_edge_gnss_ns);
-
   p.add("phase_detector_valid",   (bool)ocxo_phase.detector_valid);
 
-  p.add("ocxo1_phase_captured",   (bool)ocxo_phase.ocxo1_captured);
-  p.add("ocxo1_phase_valid",      (bool)ocxo_phase.ocxo1_valid);
-  p.add("ocxo1_phase_isr_dwt",    ocxo_phase.ocxo1_isr_dwt);
-  p.add("ocxo1_phase_gpt_at_fire", ocxo_phase.ocxo1_gpt_at_fire);
-  p.add("ocxo1_phase_dwt_elapsed", ocxo_phase.ocxo1_dwt_elapsed);
-  p.add("ocxo1_phase_elapsed_ns",  ocxo_phase.ocxo1_elapsed_ns);
-  p.add("ocxo1_phase_offset_ns",   (int32_t)ocxo_phase.ocxo1_phase_offset_ns);
-  p.add("ocxo1_edge_gnss_ns",      ocxo_phase.ocxo1_edge_gnss_ns);
+  // ─────────────────────────────────────────────
+  // Phase — canonical record (NEW)
+  // ─────────────────────────────────────────────
 
-  p.add("ocxo2_phase_captured",   (bool)ocxo_phase.ocxo2_captured);
-  p.add("ocxo2_phase_valid",      (bool)ocxo_phase.ocxo2_valid);
-  p.add("ocxo2_phase_isr_dwt",    ocxo_phase.ocxo2_isr_dwt);
-  p.add("ocxo2_phase_gpt_at_fire", ocxo_phase.ocxo2_gpt_at_fire);
-  p.add("ocxo2_phase_dwt_elapsed", ocxo_phase.ocxo2_dwt_elapsed);
-  p.add("ocxo2_phase_elapsed_ns",  ocxo_phase.ocxo2_elapsed_ns);
-  p.add("ocxo2_phase_offset_ns",   (int32_t)ocxo_phase.ocxo2_phase_offset_ns);
-  p.add("ocxo2_edge_gnss_ns",      ocxo_phase.ocxo2_edge_gnss_ns);
+  // Absolute edge timestamps (GNSS domain)
+  p.add("ocxo1_edge_gnss_ns", ocxo_phase.ocxo1_edge_gnss_ns);
+  p.add("ocxo2_edge_gnss_ns", ocxo_phase.ocxo2_edge_gnss_ns);
 
-  p.add("diag_ocxo1_phase_captures", diag_ocxo1_phase_captures);
-  p.add("diag_ocxo1_phase_misses",   diag_ocxo1_phase_misses);
-  p.add("diag_ocxo2_phase_captures", diag_ocxo2_phase_captures);
-  p.add("diag_ocxo2_phase_misses",   diag_ocxo2_phase_misses);
+  // Phase offsets (0–100 ns)
+  p.add("ocxo1_phase_offset_ns", (int32_t)ocxo_phase.ocxo1_phase_offset_ns);
+  p.add("ocxo2_phase_offset_ns", (int32_t)ocxo_phase.ocxo2_phase_offset_ns);
 
+  // Per-second edge delta (ns)
   p.add("ocxo1_gnss_ns_per_pps", ocxo_phase.ocxo1_gnss_ns_per_pps);
   p.add("ocxo2_gnss_ns_per_pps", ocxo_phase.ocxo2_gnss_ns_per_pps);
-  p.add("ocxo1_residual_ns",     ocxo_phase.ocxo1_residual_ns);
-  p.add("ocxo2_residual_ns",     ocxo_phase.ocxo2_residual_ns);
-  p.add("phase_residual_valid",  (bool)ocxo_phase.residual_valid);
+
+  // Residuals (servo input)
+  p.add("ocxo1_residual_ns", ocxo_phase.ocxo1_residual_ns);
+  p.add("ocxo2_residual_ns", ocxo_phase.ocxo2_residual_ns);
+  p.add("phase_residual_valid", (bool)ocxo_phase.residual_valid);
 
   p.add("ocxo1_dac_before",        (int32_t)ocxo_phase.ocxo1_dac_before);
   p.add("ocxo1_dac_after",         (int32_t)ocxo_phase.ocxo1_dac_after);
@@ -979,6 +975,9 @@ static void report_dac_welford(Payload& p, const char* prefix, const dac_welford
 static Payload cmd_report(const Payload&) {
   Payload p;
 
+  // ─────────────────────────────────────────────
+  // Campaign state
+  // ─────────────────────────────────────────────
   p.add("campaign_state",
     campaign_state == clocks_campaign_state_t::STARTED ? "STARTED" : "STOPPED");
 
@@ -987,97 +986,104 @@ static Payload cmd_report(const Payload&) {
     p.add("campaign_seconds", campaign_seconds);
   }
 
-  p.add("watchdog_anomaly_active",  (bool)watchdog_anomaly_active);
-  p.add("watchdog_anomaly_pending", (bool)watchdog_anomaly_publish_pending);
-  p.add("watchdog_anomaly_sequence", watchdog_anomaly_sequence);
-  p.add("watchdog_anomaly_reason", watchdog_anomaly_reason);
-  p.add("watchdog_anomaly_detail0", watchdog_anomaly_detail0);
-  p.add("watchdog_anomaly_detail1", watchdog_anomaly_detail1);
-  p.add("watchdog_anomaly_detail2", watchdog_anomaly_detail2);
-  p.add("watchdog_anomaly_detail3", watchdog_anomaly_detail3);
-  p.add("watchdog_anomaly_trigger_dwt", watchdog_anomaly_trigger_dwt);
+  // ─────────────────────────────────────────────
+  // Core clocks (absolute)
+  // ─────────────────────────────────────────────
+  const uint64_t dwt_ns   = clocks_dwt_ns_now();
+  const uint64_t gnss_ns  = clocks_gnss_ns_now();
+  const uint64_t ocxo1_ns = clocks_ocxo1_ns_now();
+  const uint64_t ocxo2_ns = clocks_ocxo2_ns_now();
 
-  p.add("request_start",   request_start);
-  p.add("request_stop",    request_stop);
-  p.add("request_recover", request_recover);
-
-  const uint64_t dwt_cycles = clocks_dwt_cycles_now();
-  const uint64_t dwt_ns     = clocks_dwt_ns_now();
-  const uint64_t gnss_ns    = clocks_gnss_ns_now();
-  const uint64_t ocxo1_ns   = clocks_ocxo1_ns_now();
-  const uint64_t ocxo2_ns   = clocks_ocxo2_ns_now();
-
-  p.add("dwt_cycles_now", dwt_cycles);
   p.add("dwt_ns_now",     dwt_ns);
   p.add("gnss_ns_now",    gnss_ns);
   p.add("ocxo1_ns_now",   ocxo1_ns);
   p.add("ocxo2_ns_now",   ocxo2_ns);
   p.add("gnss_lock",      digitalRead(GNSS_LOCK_PIN));
 
-  const int64_t tb_gnss  = timebase_now_ns(timebase_domain_t::GNSS);
-  const int64_t tb_dwt   = timebase_now_ns(timebase_domain_t::DWT);
-  const int64_t tb_ocxo1 = timebase_now_ns(timebase_domain_t::OCXO1);
-  const int64_t tb_ocxo2 = timebase_now_ns(timebase_domain_t::OCXO2);
+  // ─────────────────────────────────────────────
+  // Phase detector — THE NEW TRUTH LAYER
+  // ─────────────────────────────────────────────
+  p.add("phase_detector_valid", (bool)ocxo_phase.detector_valid);
 
-  p.add("timebase_gnss_ns",  tb_gnss);
-  p.add("timebase_dwt_ns",   tb_dwt);
-  p.add("timebase_ocxo1_ns", tb_ocxo1);
-  p.add("timebase_ocxo2_ns", tb_ocxo2);
-  p.add("timebase_valid",    timebase_valid());
+  // Absolute edge timestamps (GNSS domain)
+  p.add("ocxo1_edge_gnss_ns", ocxo_phase.ocxo1_edge_gnss_ns);
+  p.add("ocxo2_edge_gnss_ns", ocxo_phase.ocxo2_edge_gnss_ns);
 
+  // Phase offsets (ns within 100 ns window)
+  p.add("ocxo1_phase_offset_ns", (int32_t)ocxo_phase.ocxo1_phase_offset_ns);
+  p.add("ocxo2_phase_offset_ns", (int32_t)ocxo_phase.ocxo2_phase_offset_ns);
+
+  // Per-second edge deltas
+  p.add("ocxo1_gnss_ns_per_pps", ocxo_phase.ocxo1_gnss_ns_per_pps);
+  p.add("ocxo2_gnss_ns_per_pps", ocxo_phase.ocxo2_gnss_ns_per_pps);
+
+  // Residuals — THIS IS THE SERVO INPUT
+  p.add("ocxo1_residual_ns", ocxo_phase.ocxo1_residual_ns);
+  p.add("ocxo2_residual_ns", ocxo_phase.ocxo2_residual_ns);
+  p.add("phase_residual_valid", (bool)ocxo_phase.residual_valid);
+
+  // Capture diagnostics (minimal)
+  p.add("ocxo1_phase_captured", (bool)ocxo_phase.ocxo1_captured);
+  p.add("ocxo2_phase_captured", (bool)ocxo_phase.ocxo2_captured);
+  p.add("diag_ocxo1_phase_captures", diag_ocxo1_phase_captures);
+  p.add("diag_ocxo1_phase_misses",   diag_ocxo1_phase_misses);
+  p.add("diag_ocxo2_phase_captures", diag_ocxo2_phase_captures);
+  p.add("diag_ocxo2_phase_misses",   diag_ocxo2_phase_misses);
+
+  // ─────────────────────────────────────────────
+  // PPS residuals (legacy but useful)
+  // ─────────────────────────────────────────────
   report_residual(p, "dwt",   residual_dwt);
   report_residual(p, "gnss",  residual_gnss);
   report_residual(p, "ocxo1", residual_ocxo1);
   report_residual(p, "ocxo2", residual_ocxo2);
 
+  // ─────────────────────────────────────────────
+  // Prediction (sanity / interpolation health)
+  // ─────────────────────────────────────────────
   report_prediction(p, "dwt",   pred_dwt);
   report_prediction(p, "ocxo1", pred_ocxo1);
   report_prediction(p, "ocxo2", pred_ocxo2);
 
-  report_dac_welford(p, "ocxo1", dac_welford_ocxo1);
-  report_dac_welford(p, "ocxo2", dac_welford_ocxo2);
-
-  p.add("isr_residual_dwt",   isr_residual_dwt);
-  p.add("isr_residual_gnss",  isr_residual_gnss);
-  p.add("isr_residual_ocxo1", isr_residual_ocxo1);
-  p.add("isr_residual_ocxo2", isr_residual_ocxo2);
-  p.add("isr_residual_valid", (bool)isr_residual_valid);
-
-  p.add("ocxo1_dac",               ocxo1_dac.dac_fractional);
-  p.add("ocxo2_dac",               ocxo2_dac.dac_fractional);
-  p.add("ocxo1_dac_hw",            (int32_t)ocxo1_dac.dac_hw_code);
-  p.add("ocxo2_dac_hw",            (int32_t)ocxo2_dac.dac_hw_code);
+  // ─────────────────────────────────────────────
+  // DAC / servo state
+  // ─────────────────────────────────────────────
+  p.add("ocxo1_dac",    ocxo1_dac.dac_fractional);
+  p.add("ocxo2_dac",    ocxo2_dac.dac_fractional);
+  p.add("ocxo1_dac_hw", (int32_t)ocxo1_dac.dac_hw_code);
+  p.add("ocxo2_dac_hw", (int32_t)ocxo2_dac.dac_hw_code);
 
   p.add("calibrate_ocxo", servo_mode_str(calibrate_ocxo_mode));
   p.add("ocxo1_servo_adjustments", ocxo1_dac.servo_adjustments);
   p.add("ocxo2_servo_adjustments", ocxo2_dac.servo_adjustments);
-  p.add("ocxo1_servo_last_step",   ocxo1_dac.servo_last_step);
-  p.add("ocxo2_servo_last_step",   ocxo2_dac.servo_last_step);
   p.add("ocxo1_servo_last_residual", ocxo1_dac.servo_last_residual);
   p.add("ocxo2_servo_last_residual", ocxo2_dac.servo_last_residual);
-  p.add("ocxo1_servo_settle_count",  ocxo1_dac.servo_settle_count);
-  p.add("ocxo2_servo_settle_count",  ocxo2_dac.servo_settle_count);
+  p.add("ocxo1_servo_last_step", ocxo1_dac.servo_last_step);
+  p.add("ocxo2_servo_last_step", ocxo2_dac.servo_last_step);
 
-  p.add("dwt_cal_cycles_per_s",  g_dwt_cycles_per_gnss_s);
-  p.add("dwt_cal_valid",         g_dwt_cal_valid);
-  p.add("dwt_cal_pps_count",     g_dwt_cal_pps_count);
+  // ─────────────────────────────────────────────
+  // Timebase (for cross-domain sanity)
+  // ─────────────────────────────────────────────
+  p.add("timebase_valid", timebase_valid());
+  p.add("timebase_gnss_ns",  timebase_now_ns(timebase_domain_t::GNSS));
+  p.add("timebase_dwt_ns",   timebase_now_ns(timebase_domain_t::DWT));
+  p.add("timebase_ocxo1_ns", timebase_now_ns(timebase_domain_t::OCXO1));
+  p.add("timebase_ocxo2_ns", timebase_now_ns(timebase_domain_t::OCXO2));
 
-  if (campaign_state == clocks_campaign_state_t::STARTED && gnss_ns > 0) {
-    p.add_fmt("tau_dwt",   "%.12f", (double)dwt_ns   / (double)gnss_ns);
-    p.add_fmt("tau_ocxo1", "%.12f", (double)ocxo1_ns / (double)gnss_ns);
-    p.add_fmt("tau_ocxo2", "%.12f", (double)ocxo2_ns / (double)gnss_ns);
-    p.add_fmt("dwt_ppb",   "%.3f", ((double)((int64_t)dwt_ns   - (int64_t)gnss_ns) / (double)gnss_ns) * 1e9);
-    p.add_fmt("ocxo1_ppb", "%.3f", ((double)((int64_t)ocxo1_ns - (int64_t)gnss_ns) / (double)gnss_ns) * 1e9);
-    p.add_fmt("ocxo2_ppb", "%.3f", ((double)((int64_t)ocxo2_ns - (int64_t)gnss_ns) / (double)gnss_ns) * 1e9);
-  } else {
-    p.add("tau_dwt", 0.0); p.add("tau_ocxo1", 0.0); p.add("tau_ocxo2", 0.0);
-    p.add("dwt_ppb", 0.0); p.add("ocxo1_ppb", 0.0); p.add("ocxo2_ppb", 0.0);
-  }
+  // ─────────────────────────────────────────────
+  // Calibration
+  // ─────────────────────────────────────────────
+  p.add("dwt_cal_valid",     g_dwt_cal_valid);
+  p.add("dwt_cal_cycles_per_s", g_dwt_cycles_per_gnss_s);
+  p.add("dwt_cal_pps_count", g_dwt_cal_pps_count);
 
-  p.add("diag_ocxo1_phase_captures", diag_ocxo1_phase_captures);
-  p.add("diag_ocxo1_phase_misses",   diag_ocxo1_phase_misses);
-  p.add("diag_ocxo2_phase_captures", diag_ocxo2_phase_captures);
-  p.add("diag_ocxo2_phase_misses",   diag_ocxo2_phase_misses);
+  // ─────────────────────────────────────────────
+  // Watchdog
+  // ─────────────────────────────────────────────
+  p.add("watchdog_anomaly_active",  (bool)watchdog_anomaly_active);
+  p.add("watchdog_anomaly_pending", (bool)watchdog_anomaly_publish_pending);
+  p.add("watchdog_anomaly_sequence", watchdog_anomaly_sequence);
+  p.add("watchdog_anomaly_reason", watchdog_anomaly_reason);
 
   return p;
 }
