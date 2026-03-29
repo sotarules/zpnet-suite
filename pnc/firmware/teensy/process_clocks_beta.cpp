@@ -257,7 +257,7 @@ void clocks_zero_all(void) {
   dwt_cycles_64     = 0;
   prev_dwt_at_pps   = (pps_spin.valid && pps_spin.tdc_correction >= 0)
                         ? pps_spin.corrected_dwt
-                        : (isr_snap_dwt - ISR_ENTRY_DWT_CYCLES);
+                        : (isr_snap_dwt - TDC_FIXED_OVERHEAD);
 
   ocxo1_ticks_64    = 0;
   prev_ocxo1_at_pps = isr_snap_ocxo1;
@@ -525,7 +525,7 @@ void clocks_beta_pps(void) {
     dwt_cycles_64     = dwt_ns_to_cycles(recover_dwt_ns);
     prev_dwt_at_pps   = (pps_spin.valid && pps_spin.tdc_correction >= 0)
                           ? pps_spin.corrected_dwt
-                          : (isr_snap_dwt - ISR_ENTRY_DWT_CYCLES);
+                          : (isr_snap_dwt - TDC_FIXED_OVERHEAD);
 
     ocxo1_ticks_64    = recover_ocxo1_ns / 100ull;
     prev_ocxo1_at_pps = isr_snap_ocxo1;
@@ -599,7 +599,7 @@ void clocks_beta_pps(void) {
   uint32_t dwt_raw_at_pps =
     (pps_spin.valid && pps_spin.tdc_correction >= 0)
       ? pps_spin.corrected_dwt
-      : (isr_snap_dwt - ISR_ENTRY_DWT_CYCLES);
+      : (isr_snap_dwt - TDC_FIXED_OVERHEAD);
   uint32_t dwt_delta = dwt_raw_at_pps - prev_dwt_at_pps;
 
   dwt_cycles_64    += dwt_delta;

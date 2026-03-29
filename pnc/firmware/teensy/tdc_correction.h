@@ -120,17 +120,20 @@ static inline uint32_t tdc_correct(
   int32_t  delta_cycles,
   int32_t& correction_applied
 ) {
-  const int32_t correction = delta_cycles - (int32_t)TDC_FIXED_OVERHEAD;
+  //const int32_t correction = delta_cycles - (int32_t)TDC_FIXED_OVERHEAD;
+  correction_applied = -1;
 
+  /*
   if (correction >= 0 && correction <= (int32_t)TDC_MAX_CORRECTION) {
     // Delta is within the valid TDC window — apply correction.
     correction_applied = correction;
     return shadow_dwt + (uint32_t)correction;
   }
+  */
 
   // Delta outside valid range — spin loop was not running at PPS,
   // or an anomalous condition occurred.  Return uncorrected.
-  correction_applied = -1;
+  // correction_applied = -1;
   return shadow_dwt;
 }
 

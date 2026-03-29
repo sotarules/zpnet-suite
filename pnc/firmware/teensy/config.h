@@ -74,33 +74,6 @@ static constexpr uint64_t DWT_NS_DEN = 126ULL;
 static constexpr uint32_t DWT_EXPECTED_PER_PPS = 1008000000U;
 
 // --------------------------------------------------------------
-// ARM Cortex-M7 ISR entry latency
-// --------------------------------------------------------------
-//
-// When a hardware interrupt fires (PPS edge, QTimer1 CH2 compare),
-// the ARM core saves registers and branches to the vector before
-// the ISR's first instruction executes.  The DWT_CYCCNT read in
-// the ISR is therefore late by this many DWT cycles.
-//
-// Measured empirically via tdc_analyzer over 23,170 PPS edges
-// (campaign Shakeout1, 6+ hours):
-//
-//   mean   = 52.00 cycles  (51.6 ns)
-//   stddev =  1.42 cycles  ( 1.4 ns)
-//   min    = 50 cycles, max = 54 cycles
-//   distribution: uniform across 50-54 (5 clusters, ~20% each)
-//
-// This constant is used to correct ISR-captured DWT values back
-// to the true event moment. It applies to:
-//   - PPS anchor (dwt_cyccnt_at_pps in TIMEBASE_FRAGMENT)
-//   - TimePop fire (fire_dwt_cyccnt in timepop_ctx_t)
-//   - Any future ISR-captured DWT timestamp (e.g., photon detector)
-//
-// At 52 cycles the maximum residual error is ±2 cycles (±2 ns).
-//
-static constexpr uint32_t ISR_ENTRY_DWT_CYCLES = 52;
-
-// --------------------------------------------------------------
 // Serial configuration
 // --------------------------------------------------------------
 static const unsigned long USB_SERIAL_BAUD = 115200;

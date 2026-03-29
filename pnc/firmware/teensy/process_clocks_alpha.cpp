@@ -698,7 +698,7 @@ static void pps_asap_callback(timepop_ctx_t*, void*) {
   const uint32_t dwt_at_pps_edge =
     (pps_spin.valid && pps_spin.tdc_correction >= 0)
       ? pps_spin.corrected_dwt
-      : (isr_snap_dwt - ISR_ENTRY_DWT_CYCLES);
+      : (isr_snap_dwt - TDC_FIXED_OVERHEAD);
 
   // ── Continuous DWT calibration (always runs, campaign-independent) ──
   {
