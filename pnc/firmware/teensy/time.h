@@ -83,6 +83,19 @@ int64_t time_gnss_ns_now(void);
 /// ISR-safe.
 int64_t time_dwt_to_gnss_ns(uint32_t dwt_cyccnt);
 
+/// Convert a DWT_CYCCNT to GNSS nanoseconds using an explicit anchor.
+///
+/// Same interpolation as time_dwt_to_gnss_ns(), but uses caller-provided
+/// anchor values instead of the live seqlock state.  For use when the
+/// caller has already captured a consistent snapshot of the anchor
+/// (e.g., during PPS processing or deterministic diagnostics).
+///
+/// Returns -1 if dwt_cycles_per_s is zero.
+int64_t time_dwt_to_gnss_ns(uint32_t dwt_cyccnt,
+                             uint32_t anchor_dwt_at_pps,
+                             uint32_t anchor_dwt_cycles_per_s,
+                             uint32_t anchor_pps_count);
+
 // ============================================================================
 // Core API — reverse (GNSS nanoseconds → DWT)
 // ============================================================================

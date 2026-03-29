@@ -213,6 +213,23 @@ int64_t time_dwt_to_gnss_ns(uint32_t dwt_cyccnt) {
   return interpolate_gnss_ns(s, dwt_elapsed);
 }
 
+int64_t time_dwt_to_gnss_ns(uint32_t dwt_cyccnt,
+                             uint32_t anchor_dwt_at_pps,
+                             uint32_t anchor_dwt_cycles_per_s,
+                             uint32_t anchor_pps_count) {
+  if (anchor_dwt_cycles_per_s == 0) return -1;
+
+  const uint32_t dwt_elapsed = dwt_cyccnt - anchor_dwt_at_pps;
+
+  const uint64_t ns_into_second =
+    ((uint64_t)dwt_elapsed * NS_PER_SEC + (uint64_t)anchor_dwt_cycles_per_s / 2)
+    / (uint64_t)anchor_dwt_cycles_per_s;
+
+  if (ns_into_second > MAX_AGE_NS) return -1;
+
+  return (int64_t)((uint64_t)(anchor_pps_count - 1) * NS_PER_SEC + ns_into_second);
+}
+
 // ============================================================================
 // Core API — reverse (GNSS nanoseconds → DWT)
 // ============================================================================

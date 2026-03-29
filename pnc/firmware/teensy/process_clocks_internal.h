@@ -26,6 +26,7 @@
 #include "config.h"
 #include "payload.h"
 #include "timepop.h"
+#include "time.h"
 
 #include <stdint.h>
 #include <stddef.h>
@@ -500,19 +501,6 @@ extern volatile uint32_t watchdog_anomaly_detail2;
 extern volatile uint32_t watchdog_anomaly_detail3;
 extern volatile uint32_t watchdog_anomaly_trigger_dwt;
 
-// ============================================================================
-// Shared PPS-anchored DWT → GNSS conversion helper
-//
-// Uses the same interpolation primitive as TIMEBASE, but wraps the signed
-// return contract so callers get a clean bool + out parameter and never
-// accidentally reinterpret -1 as a huge uint64_t timestamp.
-// ============================================================================
-
-int64_t timebase_gnss_ns_from_dwt(uint32_t dwt_now,
-                                  uint64_t frag_gnss_ns,
-                                  uint32_t frag_dwt_cyccnt_at_pps,
-                                  uint32_t frag_dwt_cycles_per_pps);
-
 static inline bool ocxo_edge_dwt_to_gnss_ns(
   uint32_t dwt_event,
   uint64_t pps_gnss_ns,
@@ -520,11 +508,11 @@ static inline bool ocxo_edge_dwt_to_gnss_ns(
   uint32_t dwt_cycles_per_pps,
   uint64_t& out_gnss_ns
 ) {
-  const int64_t edge_signed = timebase_gnss_ns_from_dwt(
-    dwt_event,
-    pps_gnss_ns,
-    dwt_at_pps,
-    dwt_cycles_per_pps
+  // pps_gnss_ns is (pps_count - 1) * 1e9, so pps_count = pps_gnss_ns / 1e9 + 1
+  const uint32_t pps_count = (uint32_t)(pps_gnss_ns / 1000000000ULL) + 1;
+
+  const int64_t edge_signed = time_dwt_to_gnss_ns(
+    dwt_event, dwt_at_pps, dwt_cycles_per_pps, pps_count
   );
 
   if (edge_signed < 0) {
