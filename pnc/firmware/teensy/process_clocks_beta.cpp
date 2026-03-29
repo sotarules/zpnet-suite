@@ -654,30 +654,33 @@ void clocks_beta_pps(void) {
   // ── Absolute GNSS timestamps for canonical winning OCXO edges ──
   ocxo_phase.pps_gnss_ns = pps_gnss_ns;
 
+  const bool ocxo1_edge_valid = ocxo_phase.ocxo1_captured &&
+    ocxo_edge_dwt_to_gnss_ns(
+      ocxo_phase.ocxo1_isr_dwt,
+      pps_gnss_ns,
+      dwt_raw_at_pps,
+      dwt_cycles_per_pps_snapshot,
+      ocxo_phase.ocxo1_edge_gnss_ns
+    );
+
+  const bool ocxo2_edge_valid = ocxo_phase.ocxo2_captured &&
+    ocxo_edge_dwt_to_gnss_ns(
+      ocxo_phase.ocxo2_isr_dwt,
+      pps_gnss_ns,
+      dwt_raw_at_pps,
+      dwt_cycles_per_pps_snapshot,
+      ocxo_phase.ocxo2_edge_gnss_ns
+    );
+
+  ocxo_phase.ocxo1_valid = ocxo1_edge_valid;
+  ocxo_phase.ocxo2_valid = ocxo2_edge_valid;
+  ocxo_phase.detector_valid = ocxo1_edge_valid && ocxo2_edge_valid;
+
   if (ocxo_phase.detector_valid) {
-
-    // ── Absolute edge timestamps from DWT → GNSS ──
-    int64_t edge_signed1 = time_dwt_to_gnss_ns(ocxo_phase.ocxo1_isr_dwt);
-
-    if (edge_signed1 < 0) {
-      ocxo_phase.ocxo1_valid = false;
-    } else {
-      ocxo_phase.ocxo1_edge_gnss_ns = (uint64_t)edge_signed1;
-    };
-
-    int64_t edge_signed2 = time_dwt_to_gnss_ns(ocxo_phase.ocxo2_isr_dwt);
-
-    if (edge_signed2 < 0) {
-      ocxo_phase.ocxo2_valid = false;
-    } else {
-      ocxo_phase.ocxo2_edge_gnss_ns = (uint64_t)edge_signed2;
-    }
-
-    // ── Phase offset = absolute difference from PPS ──
-    int64_t phase1 =
+    const int64_t phase1 =
       (int64_t)ocxo_phase.ocxo1_edge_gnss_ns - (int64_t)pps_gnss_ns;
 
-    int64_t phase2 =
+    const int64_t phase2 =
       (int64_t)ocxo_phase.ocxo2_edge_gnss_ns - (int64_t)pps_gnss_ns;
 
     // Normalize to [0, 100 ns)
@@ -687,12 +690,39 @@ void clocks_beta_pps(void) {
     ocxo_phase.ocxo2_phase_offset_ns =
       (int32_t)((phase2 % 100 + 100) % 100);
 
+    if (ocxo_phase.prev_ocxo1_edge_gnss_ns != 0 &&
+        ocxo_phase.prev_ocxo2_edge_gnss_ns != 0) {
+      ocxo_phase.ocxo1_gnss_ns_per_pps =
+        (int64_t)(ocxo_phase.ocxo1_edge_gnss_ns - ocxo_phase.prev_ocxo1_edge_gnss_ns);
+      ocxo_phase.ocxo2_gnss_ns_per_pps =
+        (int64_t)(ocxo_phase.ocxo2_edge_gnss_ns - ocxo_phase.prev_ocxo2_edge_gnss_ns);
+
+      ocxo_phase.ocxo1_residual_ns =
+        ocxo_phase.ocxo1_gnss_ns_per_pps - (int64_t)NS_PER_SECOND;
+      ocxo_phase.ocxo2_residual_ns =
+        ocxo_phase.ocxo2_gnss_ns_per_pps - (int64_t)NS_PER_SECOND;
+      ocxo_phase.residual_valid = true;
+    } else {
+      ocxo_phase.ocxo1_gnss_ns_per_pps = 0;
+      ocxo_phase.ocxo2_gnss_ns_per_pps = 0;
+      ocxo_phase.ocxo1_residual_ns = 0;
+      ocxo_phase.ocxo2_residual_ns = 0;
+      ocxo_phase.residual_valid = false;
+    }
+
+    ocxo_phase.prev_ocxo1_edge_gnss_ns = ocxo_phase.ocxo1_edge_gnss_ns;
+    ocxo_phase.prev_ocxo2_edge_gnss_ns = ocxo_phase.ocxo2_edge_gnss_ns;
+
   } else {
     ocxo_phase.ocxo1_edge_gnss_ns = 0;
     ocxo_phase.ocxo2_edge_gnss_ns = 0;
-
     ocxo_phase.ocxo1_phase_offset_ns = 0;
     ocxo_phase.ocxo2_phase_offset_ns = 0;
+    ocxo_phase.ocxo1_gnss_ns_per_pps = 0;
+    ocxo_phase.ocxo2_gnss_ns_per_pps = 0;
+    ocxo_phase.ocxo1_residual_ns = 0;
+    ocxo_phase.ocxo2_residual_ns = 0;
+    ocxo_phase.residual_valid = false;
   }
 
   ocxo_calibration_servo();

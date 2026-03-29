@@ -731,9 +731,6 @@ static void pps_asap_callback(timepop_ctx_t*, void*) {
     isr_snap_gnss
   );
 
-  // ── Campaign-scoped processing (beta) ──
-  clocks_beta_pps();
-
   // ── OCXO phase harvest — event-time model (KRAKEN mode) ──
   //
   // Alpha responsibility:
@@ -748,6 +745,22 @@ static void pps_asap_callback(timepop_ctx_t*, void*) {
 
   {
     ocxo_phase.dwt_at_pps = dwt_at_pps_edge;
+
+    // Per-shot clean slate for beta-owned derived fields.
+    ocxo_phase.pps_gnss_ns            = 0;
+    ocxo_phase.ocxo1_edge_gnss_ns     = 0;
+    ocxo_phase.ocxo2_edge_gnss_ns     = 0;
+    ocxo_phase.ocxo1_gnss_ns_per_pps  = 0;
+    ocxo_phase.ocxo2_gnss_ns_per_pps  = 0;
+    ocxo_phase.ocxo1_residual_ns      = 0;
+    ocxo_phase.ocxo2_residual_ns      = 0;
+    ocxo_phase.residual_valid         = false;
+    ocxo_phase.ocxo1_dwt_elapsed      = 0;
+    ocxo_phase.ocxo2_dwt_elapsed      = 0;
+    ocxo_phase.ocxo1_elapsed_ns       = 0;
+    ocxo_phase.ocxo2_elapsed_ns       = 0;
+    ocxo_phase.ocxo1_phase_offset_ns  = 0;
+    ocxo_phase.ocxo2_phase_offset_ns  = 0;
 
     // ─────────────────────────────────────────────
     // OCXO1 — event capture
@@ -787,6 +800,10 @@ static void pps_asap_callback(timepop_ctx_t*, void*) {
     ocxo_phase.detector_valid =
       ocxo_phase.ocxo1_valid && ocxo_phase.ocxo2_valid;
   }
+
+  // ── Campaign-scoped processing (beta) ──
+  // Must run AFTER phase harvest so beta consumes this PPS's edge captures.
+  clocks_beta_pps();
 
   diag_pps_asap_dispatched++;
   pps_scheduled = false;

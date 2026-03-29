@@ -359,10 +359,14 @@ extern spin_capture_t pps_spin;
 // edge after PPS.  The ISR captures DWT_CYCCNT with deterministic,
 // characterizable latency (same mechanism as PPS ISR).
 //
-// Phase offset = (dwt_at_ocxo_edge - dwt_at_pps_edge) → ns → % 100.
+// Beta converts the event-corrected DWT capture into canonical
+// PPS-anchored GNSS nanoseconds, derives phase offset in [0,100), and
+// computes the authoritative per-second residual from consecutive edge
+// timestamps.
 //
-// Diagnostic fields (isr_dwt, gpt_at_fire, dwt_elapsed) enable ISR
-// latency histogram analysis via tdc_analyzer.
+// Diagnostic fields (isr_dwt, gpt_at_fire) enable ISR latency histogram
+// analysis via tdc_analyzer.  Legacy elapsed fields remain for now but are
+// deprecated and should stay zero under the event-time model.
 // ============================================================================
 
 struct ocxo_phase_capture_t {
@@ -495,6 +499,42 @@ extern volatile uint32_t watchdog_anomaly_detail1;
 extern volatile uint32_t watchdog_anomaly_detail2;
 extern volatile uint32_t watchdog_anomaly_detail3;
 extern volatile uint32_t watchdog_anomaly_trigger_dwt;
+
+// ============================================================================
+// Shared PPS-anchored DWT → GNSS conversion helper
+//
+// Uses the same interpolation primitive as TIMEBASE, but wraps the signed
+// return contract so callers get a clean bool + out parameter and never
+// accidentally reinterpret -1 as a huge uint64_t timestamp.
+// ============================================================================
+
+int64_t timebase_gnss_ns_from_dwt(uint32_t dwt_now,
+                                  uint64_t frag_gnss_ns,
+                                  uint32_t frag_dwt_cyccnt_at_pps,
+                                  uint32_t frag_dwt_cycles_per_pps);
+
+static inline bool ocxo_edge_dwt_to_gnss_ns(
+  uint32_t dwt_event,
+  uint64_t pps_gnss_ns,
+  uint32_t dwt_at_pps,
+  uint32_t dwt_cycles_per_pps,
+  uint64_t& out_gnss_ns
+) {
+  const int64_t edge_signed = timebase_gnss_ns_from_dwt(
+    dwt_event,
+    pps_gnss_ns,
+    dwt_at_pps,
+    dwt_cycles_per_pps
+  );
+
+  if (edge_signed < 0) {
+    out_gnss_ns = 0;
+    return false;
+  }
+
+  out_gnss_ns = (uint64_t)edge_signed;
+  return true;
+}
 
 // ============================================================================
 // Beta entry points — called from alpha / commands
