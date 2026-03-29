@@ -858,6 +858,18 @@ void clocks_beta_pps(void) {
   p.add("dwt_cal_valid",     g_dwt_cal_valid);
   p.add("dwt_cal_pps_count", g_dwt_cal_pps_count);
 
+  // ── TIME_TEST self-audit ──
+  p.add("time_test_valid",            time_test.valid);
+  p.add("time_test_residual_ns",      time_test.residual_ns);
+  p.add("time_test_computed_gnss_ns", time_test.computed_gnss_ns);
+  p.add("time_test_vclock_gnss_ns",   time_test.vclock_gnss_ns);
+  p.add("time_test_isr_dwt",         time_test.isr_dwt);
+  p.add("time_test_edge_dwt",        time_test.edge_dwt);
+  p.add("time_test_vclock_at_fire",   time_test.vclock_at_fire);
+  p.add("time_test_tests_run",       time_test.tests_run);
+  p.add("time_test_tests_valid",     time_test.tests_valid);
+  p.add("time_test_tests_time_invalid", time_test.tests_time_invalid);
+
   publish("TIMEBASE_FRAGMENT", p);
 }
 
@@ -1327,6 +1339,23 @@ static Payload cmd_phase_info(const Payload&) {
   return p;
 }
 
+static Payload cmd_time_test(const Payload&) {
+  Payload p;
+  p.add("valid",              time_test.valid);
+  p.add("residual_ns",        time_test.residual_ns);
+  p.add("computed_gnss_ns",   time_test.computed_gnss_ns);
+  p.add("vclock_gnss_ns",     time_test.vclock_gnss_ns);
+  p.add("isr_dwt",           time_test.isr_dwt);
+  p.add("edge_dwt",          time_test.edge_dwt);
+  p.add("vclock_at_fire",     time_test.vclock_at_fire);
+  p.add("captured",           time_test.captured);
+  p.add("tests_run",         time_test.tests_run);
+  p.add("tests_valid",       time_test.tests_valid);
+  p.add("tests_time_invalid", time_test.tests_time_invalid);
+  p.add("ch3_isr_fires",     time_test.ch3_isr_fires);
+  return p;
+}
+
 static Payload cmd_set_dac(const Payload& args) {
   double dac_val;
   if (args.tryGetDouble("set_dac1", dac_val))  ocxo_dac_set(ocxo1_dac, dac_val);
@@ -1350,6 +1379,7 @@ static const process_command_entry_t CLOCKS_COMMANDS[] = {
   { "CLOCKS_INFO",  cmd_clocks_info  },
   { "PHASE_INFO",   cmd_phase_info   },
   { "WATCHDOG_TEST",cmd_watchdog_test },
+  { "TIME_TEST",    cmd_time_test    },
   { "SET_DAC",      cmd_set_dac      },
   { nullptr,        nullptr          }
 };

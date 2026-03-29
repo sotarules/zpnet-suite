@@ -999,6 +999,16 @@ static Payload cmd_diag_reset(const Payload&) {
 // ============================================================================
 
 static void qtimer1_irq_isr(void) {
+  // CH3 — TIME_TEST edge capture (one-shot, only when armed).
+  // CH3 is stopped (CM=0) between tests, so TCF1 is only set
+  // when actively armed.  Check both flag and enable as safety.
+  {
+    const uint16_t cs3 = IMXRT_TMR1.CH[3].CSCTRL;
+    if ((cs3 & TMR_CSCTRL_TCF1) && (cs3 & TMR_CSCTRL_TCF1EN)) {
+      time_test_ch3_isr();
+    }
+  }
+
   if (IMXRT_TMR1.CH[2].CSCTRL & TMR_CSCTRL_TCF1) {
     qtimer1_ch2_isr();
   }

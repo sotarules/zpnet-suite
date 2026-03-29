@@ -125,3 +125,19 @@ static inline uint32_t dwt_at_gpt1_compare(uint32_t isr_dwt_cyccnt) {
 static inline uint32_t dwt_at_gpt2_compare(uint32_t isr_dwt_cyccnt) {
   return dwt_at_event(isr_dwt_cyccnt, GPT2_ISR_ENTRY_DWT_CYCLES);
 }
+
+// ============================================================================
+// Convenience: QTimer1 CH3 compare ISR (TIME_TEST VCLOCK edge capture)
+//
+// CH3 is checked first in qtimer1_irq_isr, so the dispatch path is:
+//   NVIC + stacking (~20) + dispatcher prologue (~3) +
+//   CH3 flag load+test+branch (~4) + ch3 body entry (~2) = ~29 cycles.
+// Initial estimate: 29 cycles (~28.8 ns at 1008 MHz).
+// Calibrate empirically via TIME_TEST residual histogram.
+// ============================================================================
+
+static constexpr uint32_t QTIMER1_CH3_ISR_ENTRY_DWT_CYCLES = 29;
+
+static inline uint32_t dwt_at_qtimer1_ch3_compare(uint32_t isr_dwt_cyccnt) {
+  return dwt_at_event(isr_dwt_cyccnt, QTIMER1_CH3_ISR_ENTRY_DWT_CYCLES);
+}

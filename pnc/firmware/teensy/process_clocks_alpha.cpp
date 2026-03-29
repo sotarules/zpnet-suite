@@ -107,6 +107,20 @@ static constexpr uint32_t SPIN_LOOP_TIMEOUT_CYCLES = 100800;  // 100 µs at 1008
 static constexpr uint32_t OCXO_PHASE_SPIN_TIMEOUT_CYCLES = 50400;  // 50 µs at 1008 MHz
 
 // ============================================================================
+// TIME_TEST — random-delay VCLOCK edge capture for time audit
+//
+// TimePop schedules a callback at a random point within each second.
+// The callback arms CH3 to fire on the next VCLOCK edge, captures
+// DWT, reads QTimer1, and compares time_dwt_to_gnss_ns(edge_dwt)
+// against the QTimer-derived ground truth.
+//
+// Random delay range: 100 ms to 900 ms (avoids PPS neighborhood).
+// ============================================================================
+
+static constexpr uint64_t TIME_TEST_DELAY_MIN_NS = 100000000ULL;  // 100 ms
+static constexpr uint64_t TIME_TEST_DELAY_MAX_NS = 900000000ULL;  // 900 ms
+
+// ============================================================================
 // Spin Capture — nano-precise DWT anchoring with shadow-write TDC
 // ============================================================================
 
@@ -158,6 +172,84 @@ static void pps_spin_callback(timepop_ctx_t* ctx, void*) {
   dbg_post_loop_isr_snap = isr_snap_dwt;
 }
 
+// ============================================================================
+// TIME_TEST — TimePop callback + arming
+// ============================================================================
+
+static void time_test_callback(timepop_ctx_t*, void*) {
+
+  time_test.captured = false;
+
+  // CH3 is already counting in lockstep with CH0.
+  // Read CH3's own counter and set compare slightly ahead.
+  const uint16_t ch3_now = IMXRT_TMR1.CH[3].CNTR;
+  const uint16_t ch3_target_actual = ch3_now + 50;  // 5 µs ahead
+
+  IMXRT_TMR1.CH[3].CSCTRL  = 0;                    // clear flags
+  IMXRT_TMR1.CH[3].COMP1   = ch3_target_actual;
+  IMXRT_TMR1.CH[3].CMPLD1  = ch3_target_actual;
+  IMXRT_TMR1.CH[3].CSCTRL  = 0;                    // clear any flag set during COMP1 write
+  IMXRT_TMR1.CH[3].CSCTRL  = TMR_CSCTRL_TCF1EN;    // enable compare interrupt
+
+  // CH3 will fire within ~200 ns (2 VCLOCK edges).  ISR preempts
+  // scheduled context at priority 16.  We just return — the ISR
+  // will set captured = true and the data will be harvested by
+  // the validation logic below, which runs on the NEXT call to
+  // time_test_arm (next PPS second).
+
+  // However, we can also validate immediately if we spin briefly.
+  // At 10 MHz, 2 ticks = 200 ns = ~200 DWT cycles.  Trivial wait.
+  const uint32_t spin_start = DWT_CYCCNT;
+  while (!time_test.captured) {
+    if ((DWT_CYCCNT - spin_start) > 100800) break;  // 100 µs safety
+  }
+
+  if (!time_test.captured) return;
+
+  // ── Compute edge DWT and validate ──
+  time_test.edge_dwt = dwt_at_qtimer1_ch3_compare(time_test.isr_dwt);
+
+  int64_t computed = time_dwt_to_gnss_ns(time_test.edge_dwt);
+  if (computed < 0) {
+    time_test.valid = false;
+    time_test.tests_time_invalid++;
+    return;
+  }
+  time_test.computed_gnss_ns = computed;
+
+  // ── Ground truth: QTimer-derived GNSS nanosecond ──
+  // vclock_at_fire is the 32-bit QTimer1 value read in the CH3 ISR.
+  // The number of VCLOCK ticks since the last PPS edge:
+  //   ticks_since_pps = vclock_at_fire - qtimer_at_pps  (unsigned wrap-safe)
+  // Each tick = 100 ns.  GNSS ns = pps_gnss_ns + ticks_since_pps * 100.
+
+  time_anchor_snapshot_t snap = time_anchor_snapshot();
+  if (!snap.ok || !snap.valid) {
+    time_test.valid = false;
+    return;
+  }
+
+  uint32_t ticks_since_pps = time_test.vclock_at_fire - snap.qtimer_at_pps;
+  int64_t pps_gnss_ns = (int64_t)(snap.pps_count - 1) * 1000000000LL;
+  time_test.vclock_gnss_ns = pps_gnss_ns + (int64_t)ticks_since_pps * 100LL;
+
+  time_test.residual_ns = (int32_t)(time_test.computed_gnss_ns - time_test.vclock_gnss_ns);
+  time_test.valid = true;
+  time_test.tests_valid++;
+}
+
+static void time_test_arm(void) {
+  if (!g_dwt_cal_valid) return;
+  if (!time_valid()) return;
+
+  time_test.tests_run++;
+
+  // Random delay between 100 ms and 900 ms
+  uint64_t range = TIME_TEST_DELAY_MAX_NS - TIME_TEST_DELAY_MIN_NS;
+  uint64_t delay_ns = TIME_TEST_DELAY_MIN_NS + (random() % range);
+
+  timepop_arm(delay_ns, false, time_test_callback, nullptr, "time-test");
+}
 static void pps_spin_arm(void) {
   if (!g_dwt_cal_valid) return;
   if (!time_valid()) return;
@@ -388,6 +480,26 @@ ocxo_phase_capture_t ocxo_phase = {};
 
 volatile uint32_t diag_gpt1_isr_fires = 0;
 volatile uint32_t diag_gpt2_isr_fires = 0;
+
+// ============================================================================
+// TIME_TEST — state and CH3 ISR
+// ============================================================================
+
+time_test_capture_t time_test = {};
+
+void time_test_ch3_isr(void) {
+  const uint32_t dwt_raw   = DWT_CYCCNT;
+  const uint32_t vclock_32 = qtimer1_read_32();
+
+  // Disable interrupt and clear flags.  CH3 keeps counting (CM=1)
+  // so it stays in lockstep with CH0 for the next test.
+  IMXRT_TMR1.CH[3].CSCTRL  = 0;  // clear TCF1EN, TCF1, TCF2 in one write
+
+  time_test.isr_dwt        = dwt_raw;
+  time_test.vclock_at_fire = vclock_32;
+  time_test.captured       = true;
+  time_test.ch3_isr_fires++;
+}
 
 // ============================================================================
 // GPT1 output-compare ISR — OCXO1 edge capture
@@ -795,6 +907,9 @@ static void pps_asap_callback(timepop_ctx_t*, void*) {
       ocxo_phase.ocxo1_valid && ocxo_phase.ocxo2_valid;
   }
 
+  // ── TIME_TEST — continuous time_dwt_to_gnss validation ──
+  time_test_arm();
+
   // ── Campaign-scoped processing (beta) ──
   // Must run AFTER phase harvest so beta consumes this PPS's edge captures.
   clocks_beta_pps();
@@ -986,6 +1101,19 @@ void process_clocks_init(void) {
   attachInterruptVector(IRQ_GPT2, gpt2_phase_isr);
   NVIC_SET_PRIORITY(IRQ_GPT2, 0);
   NVIC_ENABLE_IRQ(IRQ_GPT2);
+
+  // ── CH3 setup for TIME_TEST — always counting, interrupt disabled ──
+  // CH3 counts the same VCLOCK signal as CH0 (CM=1, PCS=0).
+  // It free-runs continuously so its CNTR stays in lockstep with CH0.
+  // Only the compare interrupt (TCF1EN) is toggled per test.
+  IMXRT_TMR1.CH[3].CTRL   = 0;
+  IMXRT_TMR1.CH[3].CNTR   = IMXRT_TMR1.CH[0].CNTR;
+  IMXRT_TMR1.CH[3].LOAD   = 0;
+  IMXRT_TMR1.CH[3].COMP1  = 0xFFFF;
+  IMXRT_TMR1.CH[3].CMPLD1 = 0xFFFF;
+  IMXRT_TMR1.CH[3].SCTRL  = 0;
+  IMXRT_TMR1.CH[3].CSCTRL = 0;  // TCF1EN off — no interrupts until armed
+  IMXRT_TMR1.CH[3].CTRL   = TMR_CTRL_CM(1) | TMR_CTRL_PCS(0);  // start counting
 
   attachInterrupt(digitalPinToInterrupt(GNSS_PPS_PIN), pps_isr, RISING);
   NVIC_SET_PRIORITY(IRQ_GPIO6789, 0);

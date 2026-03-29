@@ -448,6 +448,53 @@ extern volatile bool     ocxo2_phase_captured;
 extern volatile uint32_t ocxo2_phase_gpt_at_fire;
 
 // ============================================================================
+// TIME_TEST — continuous self-audit of time_dwt_to_gnss_ns()
+//
+// Every second, alpha schedules a TimePop at a random delay within the
+// upcoming PPS second.  When it fires (scheduled context), it arms
+// QTimer1 CH3 to compare on the next VCLOCK edge.  CH3's ISR (priority
+// 16 via IRQ_QTIMER1) preempts scheduled context, captures DWT_CYCCNT,
+// and reads the QTimer1 32-bit counter.
+//
+// The captured DWT is corrected for ISR entry overhead and fed through
+// time_dwt_to_gnss_ns().  The result is compared against the QTimer1-
+// derived GNSS nanosecond (ground truth).  The residual validates the
+// entire timing chain.
+//
+// Architecture:
+//   - Alpha owns capture: arming, CH3 ISR, TimePop callback, validation
+//   - Beta reads time_test for TIMEBASE_FRAGMENT and TIME_TEST command
+//   - Campaign-independent (always runs)
+// ============================================================================
+
+struct time_test_capture_t {
+  // ── CH3 ISR capture (volatile: written by ISR, read by scheduled context) ──
+  volatile uint32_t isr_dwt;                // DWT_CYCCNT first instruction in CH3 ISR
+  volatile uint32_t vclock_at_fire;         // QTimer1 32-bit read in ISR
+  volatile bool     captured;               // CH3 ISR has fired — spin loop sentinel
+
+  // ── Derived (computed in scheduled context after capture) ──
+  uint32_t edge_dwt;               // isr_dwt - CH3 ISR overhead
+
+  // ── Validation ──
+  int64_t  computed_gnss_ns;       // time_dwt_to_gnss_ns(edge_dwt)
+  int64_t  vclock_gnss_ns;         // ground truth: QTimer-derived GNSS ns
+  int32_t  residual_ns;            // computed - vclock (the money number)
+  bool     valid;                  // entire chain succeeded
+
+  // ── Lifetime diagnostics (monotonic, never reset) ──
+  volatile uint32_t tests_run;
+  volatile uint32_t tests_valid;
+  volatile uint32_t tests_time_invalid;     // time_dwt_to_gnss_ns returned -1
+  volatile uint32_t ch3_isr_fires;          // total CH3 ISR entries
+};
+
+extern time_test_capture_t time_test;
+
+// CH3 ISR — called from qtimer1_irq_isr in process_timepop.cpp
+void time_test_ch3_isr(void);
+
+// ============================================================================
 // 64-bit accumulators (campaign-scoped)
 // ============================================================================
 

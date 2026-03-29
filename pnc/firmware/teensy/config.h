@@ -145,7 +145,7 @@ static const int OCXO2_10MHZ_PIN = 14;
 // ch0: primary external count source on pin 10 (GNSS 10 MHz, CM=1)
 // ch1: cascaded extension for 32-bit range (CM=7)
 // ch2: TimePop dynamic compare scheduler (priority queue, CM=1)
-// ch3: unallocated (available for future use)
+// ch3: TIME_TEST compare (VCLOCK edge capture for time audit)
 //
 // The raw QTimer count is in 10 MHz ticks (100 ns per tick).
 // No domain translation is required — one tick = one GNSS cycle.
