@@ -1100,30 +1100,12 @@ def _build_report(
             "pred_n": timebase.get("stats", {}).get("gnss_raw", {}).get("pred_n"),
         },
 
-        # DWT internals (from TIMEBASE record)
-        "dwt_cycles_per_pps": timebase.get("dwt_cycles_per_pps"),
-        "dwt_cyccnt_at_pps": timebase.get("dwt_cyccnt_at_pps"),
-
-        # ISR residuals — all four domains (from TIMEBASE record)
-        "isr_residual_gnss": timebase.get("isr_residual_gnss"),
-        "isr_residual_dwt": timebase.get("isr_residual_dwt"),
-        "isr_residual_ocxo1": timebase.get("isr_residual_ocxo1"),
-        "isr_residual_ocxo2": timebase.get("isr_residual_ocxo2"),
-
-        # Spin capture forensics (from TIMEBASE record)
-        "spin_valid": timebase.get("spin_valid"),
-        "spin_delta_cycles": timebase.get("spin_delta_cycles"),
-        "spin_error_cycles": timebase.get("spin_error_cycles"),
-        "spin_approach_cycles": timebase.get("spin_approach_cycles"),
-        "spin_tdc_correction": timebase.get("spin_tdc_correction"),
-        "spin_nano_timed_out": timebase.get("spin_nano_timed_out"),
-        "spin_shadow_timed_out": timebase.get("spin_shadow_timed_out"),
-
-        # PPS rejection diagnostics (from TIMEBASE record)
-        "pps_rejected_total": timebase.get("pps_rejected_total"),
-        "pps_rejected_remainder": timebase.get("pps_rejected_remainder"),
+        # Raw TIMEBASE_FRAGMENT — all firmware fields in their original form.
+        # Spin capture, ISR residuals, phase detector, PPS diagnostics,
+        # DWT internals, and any future fields are accessible here without
+        # requiring per-field extraction.
+        "fragment": frag,
     }
-
 
 # ---------------------------------------------------------------------
 # WATCHDOG_ANOMALY handler (PUBSUB — fast path)
