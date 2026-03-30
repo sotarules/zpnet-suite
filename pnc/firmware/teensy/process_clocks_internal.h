@@ -470,11 +470,13 @@ extern volatile uint32_t ocxo2_phase_gpt_at_fire;
 struct time_test_capture_t {
   // ── CH3 ISR capture (volatile: written by ISR, read by scheduled context) ──
   volatile uint32_t isr_dwt;                // DWT_CYCCNT first instruction in CH3 ISR
+  volatile uint32_t isr_shadow_dwt;         // shadow DWT captured by CH3 ISR at preemption
   volatile uint32_t vclock_at_fire;         // QTimer1 32-bit read in ISR
   volatile bool     captured;               // CH3 ISR has fired — spin loop sentinel
 
   // ── Derived (computed in scheduled context after capture) ──
   uint32_t edge_dwt;               // isr_dwt - CH3 ISR overhead
+  uint32_t isr_delta_cycles;       // isr_dwt - isr_shadow_dwt (ISR entry latency)
 
   // ── Validation ──
   int64_t  computed_gnss_ns;       // time_dwt_to_gnss_ns(edge_dwt)

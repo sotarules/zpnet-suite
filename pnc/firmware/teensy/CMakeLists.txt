@@ -110,8 +110,7 @@ set(ZPNET_HEADERS
     zpnet_pins.h
     time.h
     tdc_correction.h
-    isr_dwt_compensate.h
-    ad5693r.h
+        ad5693r.h
 )
 
 # -------------------------------------------------------------

@@ -40,7 +40,6 @@
 // ============================================================================
 
 #include "tdc_correction.h"
-#include "isr_dwt_compensate.h"
 
 #include "process_clocks_internal.h"
 #include "process_clocks.h"
@@ -134,6 +133,16 @@ volatile uint32_t dbg_post_loop_isr_snap  = 0;
 
 spin_capture_t pps_spin = {};
 
+// ============================================================================
+// TIME_TEST — state and CH3 ISR
+// ============================================================================
+
+time_test_capture_t time_test = {};
+
+// Shared shadow variable — written continuously by the spin loop,
+// read by CH3 ISR at preemption.  Must be volatile.
+static volatile uint32_t time_test_shadow_dwt = 0;
+
 static void pps_spin_callback(timepop_ctx_t* ctx, void*) {
   pps_spin.landed_dwt     = ctx->fire_dwt_cyccnt;
   pps_spin.landed_gnss_ns = ctx->fire_gnss_ns;
@@ -201,13 +210,14 @@ static void time_test_callback(timepop_ctx_t*, void*) {
   // At 10 MHz, 2 ticks = 200 ns = ~200 DWT cycles.  Trivial wait.
   const uint32_t spin_start = DWT_CYCCNT;
   while (!time_test.captured) {
+    time_test_shadow_dwt = DWT_CYCCNT;
     if ((DWT_CYCCNT - spin_start) > 100800) break;  // 100 µs safety
   }
 
   if (!time_test.captured) return;
 
-  // ── Compute edge DWT and validate ──
-  time_test.edge_dwt = dwt_at_qtimer1_ch3_compare(time_test.isr_dwt);
+  time_test.isr_delta_cycles = time_test.isr_dwt - time_test.isr_shadow_dwt;
+  time_test.edge_dwt = time_test_dwt_at_edge(time_test.isr_dwt);
 
   int64_t computed = time_dwt_to_gnss_ns(time_test.edge_dwt);
   if (computed < 0) {
@@ -481,14 +491,9 @@ ocxo_phase_capture_t ocxo_phase = {};
 volatile uint32_t diag_gpt1_isr_fires = 0;
 volatile uint32_t diag_gpt2_isr_fires = 0;
 
-// ============================================================================
-// TIME_TEST — state and CH3 ISR
-// ============================================================================
-
-time_test_capture_t time_test = {};
-
 void time_test_ch3_isr(void) {
   const uint32_t dwt_raw   = DWT_CYCCNT;
+  const uint32_t shadow    = time_test_shadow_dwt;
   const uint32_t vclock_32 = qtimer1_read_32();
 
   // Disable interrupt and clear flags.  CH3 keeps counting (CM=1)
@@ -496,6 +501,7 @@ void time_test_ch3_isr(void) {
   IMXRT_TMR1.CH[3].CSCTRL  = 0;  // clear TCF1EN, TCF1, TCF2 in one write
 
   time_test.isr_dwt        = dwt_raw;
+  time_test.isr_shadow_dwt = shadow;
   time_test.vclock_at_fire = vclock_32;
   time_test.captured       = true;
   time_test.ch3_isr_fires++;

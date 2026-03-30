@@ -35,7 +35,6 @@
 
 #include "process_clocks_internal.h"
 #include "process_clocks.h"
-#include "isr_dwt_compensate.h"
 #include "tdc_correction.h"
 
 #include "debug.h"
@@ -863,8 +862,12 @@ void clocks_beta_pps(void) {
   p.add("time_test_residual_ns",      time_test.residual_ns);
   p.add("time_test_computed_gnss_ns", time_test.computed_gnss_ns);
   p.add("time_test_vclock_gnss_ns",   time_test.vclock_gnss_ns);
+
   p.add("time_test_isr_dwt",         time_test.isr_dwt);
+  p.add("time_test_isr_shadow_dwt",  time_test.isr_shadow_dwt);
+  p.add("time_test_isr_delta_cycles", time_test.isr_delta_cycles);
   p.add("time_test_edge_dwt",        time_test.edge_dwt);
+
   p.add("time_test_vclock_at_fire",   time_test.vclock_at_fire);
   p.add("time_test_tests_run",       time_test.tests_run);
   p.add("time_test_tests_valid",     time_test.tests_valid);
@@ -1345,8 +1348,12 @@ static Payload cmd_time_test(const Payload&) {
   p.add("residual_ns",        time_test.residual_ns);
   p.add("computed_gnss_ns",   time_test.computed_gnss_ns);
   p.add("vclock_gnss_ns",     time_test.vclock_gnss_ns);
+
   p.add("isr_dwt",           time_test.isr_dwt);
+  p.add("isr_shadow_dwt",    time_test.isr_shadow_dwt);
+  p.add("isr_delta_cycles",  time_test.isr_delta_cycles);
   p.add("edge_dwt",          time_test.edge_dwt);
+
   p.add("vclock_at_fire",     time_test.vclock_at_fire);
   p.add("captured",           time_test.captured);
   p.add("tests_run",         time_test.tests_run);
