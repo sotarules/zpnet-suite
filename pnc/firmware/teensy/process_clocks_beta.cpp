@@ -869,9 +869,18 @@ void clocks_beta_pps(void) {
   p.add("time_test_edge_dwt",        time_test.edge_dwt);
 
   p.add("time_test_vclock_at_fire",   time_test.vclock_at_fire);
+  p.add("time_test_vclock_at_edge", time_test.vclock_at_edge);
   p.add("time_test_tests_run",       time_test.tests_run);
   p.add("time_test_tests_valid",     time_test.tests_valid);
   p.add("time_test_tests_time_invalid", time_test.tests_time_invalid);
+
+  p.add("time_test_diag_ticks_since_pps",  time_test.diag_ticks_since_pps);
+  p.add("time_test_diag_anchor_qtimer",    time_test.diag_anchor_qtimer);
+  p.add("time_test_diag_anchor_pps_count", time_test.diag_anchor_pps_count);
+
+  p.add("diag_pps_correct_dwt_ocxo1", diag_pps_correct_dwt_ocxo1);
+  p.add("diag_pps_correct_dwt_ocxo2", diag_pps_correct_dwt_ocxo2);
+  p.add("diag_pps_correct_dwt_gnss",  diag_pps_correct_dwt_gnss);
 
   publish("TIMEBASE_FRAGMENT", p);
 }
@@ -1355,11 +1364,23 @@ static Payload cmd_time_test(const Payload&) {
   p.add("edge_dwt",          time_test.edge_dwt);
 
   p.add("vclock_at_fire",     time_test.vclock_at_fire);
+  p.add("vclock_at_edge",    time_test.vclock_at_edge);
   p.add("captured",           time_test.captured);
   p.add("tests_run",         time_test.tests_run);
   p.add("tests_valid",       time_test.tests_valid);
   p.add("tests_time_invalid", time_test.tests_time_invalid);
   p.add("ch3_isr_fires",     time_test.ch3_isr_fires);
+
+  p.add("diag_ticks_since_pps",  time_test.diag_ticks_since_pps);
+  p.add("diag_anchor_qtimer",    time_test.diag_anchor_qtimer);
+  p.add("diag_anchor_pps_count", time_test.diag_anchor_pps_count);
+
+  p.add("diag_pps_correct_dwt_ocxo1", diag_pps_correct_dwt_ocxo1);
+  p.add("diag_pps_correct_dwt_ocxo2", diag_pps_correct_dwt_ocxo2);
+  p.add("diag_pps_correct_dwt_gnss",  diag_pps_correct_dwt_gnss);
+
+  p.add("isr_snap_dwt", isr_snap_dwt);
+
   return p;
 }
 

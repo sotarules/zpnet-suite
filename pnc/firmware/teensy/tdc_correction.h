@@ -1,5 +1,7 @@
 #pragma once
 
+#include <Arduino.h>
+#include <imxrt.h>
 #include <stdint.h>
 
 // ============================================================================
@@ -113,4 +115,23 @@ static inline uint32_t qtimer1_ch2_dwt_at_edge(uint32_t isr_dwt) {
 
 static inline uint32_t time_test_dwt_at_edge(uint32_t isr_dwt) {
   return isr_dwt - TIME_TEST_ISR_FIXED_OVERHEAD;
+}
+
+// ── PPS peripheral correction — recover 10 MHz tick at true PPS edge ──
+//
+// Every 10 MHz counter (QTimer, GPT1, GPT2) is read some number of
+// DWT cycles after the true PPS edge.  This function interrogates
+// DWT_CYCCNT, computes elapsed ticks since the base DWT capture
+// (first instruction in pps_isr), and subtracts them.
+//
+// At ~1.008 GHz DWT and 10 MHz VCLOCK, one tick ≈ 100.8 DWT cycles.
+// Using 101 as the divisor is conservative (never overcorrects).
+//
+// Must be called immediately after the peripheral register read.
+
+static inline uint32_t pps_correct_10mhz(uint32_t raw_value, uint32_t base_dwt, volatile uint32_t* diag_dwt) {
+  const uint32_t now = ARM_DWT_CYCCNT;
+  if (diag_dwt) *diag_dwt = now;
+  const uint32_t elapsed = now - base_dwt + PPS_ISR_FIXED_OVERHEAD;
+  return raw_value - (elapsed / 101);
 }

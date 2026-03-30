@@ -239,7 +239,13 @@ static void time_test_callback(timepop_ctx_t*, void*) {
     return;
   }
 
-  uint32_t ticks_since_pps = time_test.vclock_at_fire - snap.qtimer_at_pps;
+  time_test.diag_anchor_qtimer   = snap.qtimer_at_pps;
+  time_test.diag_anchor_pps_count = snap.pps_count;
+  time_test.diag_ticks_since_pps = time_test.vclock_at_edge - snap.qtimer_at_pps;
+
+  // Using the register truth vclock_at_edge from CH3 32-bit compare match:
+  uint32_t ticks_since_pps = time_test.vclock_at_edge - snap.qtimer_at_pps;
+
   int64_t pps_gnss_ns = (int64_t)(snap.pps_count - 1) * 1000000000LL;
   time_test.vclock_gnss_ns = pps_gnss_ns + (int64_t)ticks_since_pps * 100LL;
 
@@ -439,6 +445,10 @@ volatile uint32_t diag_pps_reject_consecutive  = 0;
 volatile uint32_t diag_pps_reject_recoveries   = 0;
 volatile uint32_t diag_pps_reject_max_run      = 0;
 
+volatile uint32_t diag_pps_correct_dwt_ocxo1 = 0;
+volatile uint32_t diag_pps_correct_dwt_ocxo2 = 0;
+volatile uint32_t diag_pps_correct_dwt_gnss  = 0;
+
 // ============================================================================
 // PPS state
 // ============================================================================
@@ -481,7 +491,6 @@ volatile uint32_t diag_ocxo2_phase_captures = 0;
 volatile uint32_t diag_ocxo1_phase_misses   = 0;
 volatile uint32_t diag_ocxo2_phase_misses   = 0;
 
-
 // ── Phase spin diagnostics ──
 volatile uint32_t diag_ocxo_phase_spin_timeouts = 0;
 
@@ -496,13 +505,15 @@ void time_test_ch3_isr(void) {
   const uint32_t shadow    = time_test_shadow_dwt;
   const uint32_t vclock_32 = qtimer1_read_32();
 
-  // Disable interrupt and clear flags.  CH3 keeps counting (CM=1)
-  // so it stays in lockstep with CH0 for the next test.
-  IMXRT_TMR1.CH[3].CSCTRL  = 0;  // clear TCF1EN, TCF1, TCF2 in one write
+  const uint16_t edge_lo   = IMXRT_TMR1.CH[3].COMP1;
+  const uint32_t vclock_edge = (vclock_32 & 0xFFFF0000u) | (uint32_t)edge_lo;
+
+  IMXRT_TMR1.CH[3].CSCTRL  = 0;
 
   time_test.isr_dwt        = dwt_raw;
   time_test.isr_shadow_dwt = shadow;
   time_test.vclock_at_fire = vclock_32;
+  time_test.vclock_at_edge = vclock_edge;
   time_test.captured       = true;
   time_test.ch3_isr_fires++;
 }
@@ -924,12 +935,12 @@ static void pps_asap_callback(timepop_ctx_t*, void*) {
   pps_scheduled = false;
 }
 
-static void pps_isr(void)
-{
+static void pps_isr(void)  {
+
   const uint32_t snap_dwt   = DWT_CYCCNT;
-  const uint32_t snap_ocxo1 = GPT1_CNT;
-  const uint32_t snap_ocxo2 = GPT2_CNT;
-  const uint32_t snap_gnss  = qtimer1_read_32();
+  const uint32_t snap_ocxo1 = pps_correct_10mhz(GPT1_CNT, snap_dwt, &diag_pps_correct_dwt_ocxo1);
+  const uint32_t snap_ocxo2 = pps_correct_10mhz(GPT2_CNT, snap_dwt, &diag_pps_correct_dwt_ocxo2);
+  const uint32_t snap_gnss  = pps_correct_10mhz(qtimer1_read_32(), snap_dwt, &diag_pps_correct_dwt_gnss);
 
   // ── PPS relay pulse to Pi — unconditional, never gated ──
   digitalWriteFast(GNSS_PPS_RELAY, HIGH);

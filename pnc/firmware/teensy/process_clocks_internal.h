@@ -146,6 +146,11 @@ extern volatile uint32_t diag_pps_reject_consecutive;
 extern volatile uint32_t diag_pps_reject_recoveries;
 extern volatile uint32_t diag_pps_reject_max_run;
 
+// Diagnostics for PPS ISR
+extern volatile uint32_t diag_pps_correct_dwt_ocxo1;
+extern volatile uint32_t diag_pps_correct_dwt_ocxo2;
+extern volatile uint32_t diag_pps_correct_dwt_gnss;
+
 // ============================================================================
 // QTimer1 read diagnostics (alpha-owned, beta-readable)
 // ============================================================================
@@ -472,6 +477,7 @@ struct time_test_capture_t {
   volatile uint32_t isr_dwt;                // DWT_CYCCNT first instruction in CH3 ISR
   volatile uint32_t isr_shadow_dwt;         // shadow DWT captured by CH3 ISR at preemption
   volatile uint32_t vclock_at_fire;         // QTimer1 32-bit read in ISR
+  volatile uint32_t vclock_at_edge;         // COMP1-based 32-bit VCLOCK at compare match
   volatile bool     captured;               // CH3 ISR has fired — spin loop sentinel
 
   // ── Derived (computed in scheduled context after capture) ──
@@ -489,6 +495,11 @@ struct time_test_capture_t {
   volatile uint32_t tests_valid;
   volatile uint32_t tests_time_invalid;     // time_dwt_to_gnss_ns returned -1
   volatile uint32_t ch3_isr_fires;          // total CH3 ISR entries
+
+  // Diagnostics
+  volatile uint32_t diag_ticks_since_pps;     // vclock_at_edge - qtimer_at_pps
+  volatile uint32_t diag_anchor_qtimer;       // qtimer_at_pps from snapshot
+  volatile uint32_t diag_anchor_pps_count;    // pps_count from snapshot
 };
 
 extern time_test_capture_t time_test;
