@@ -442,13 +442,13 @@ struct ocxo_phase_capture_t {
 extern ocxo_phase_capture_t ocxo_phase;
 
 // ── GPT ISR capture state (alpha-owned, read by pps_asap_callback) ──
-extern volatile uint32_t ocxo_phase_shadow_dwt;    // shared shadow variable
+extern volatile uint32_t ocxo_phase_shadow_dwt;
 extern volatile uint32_t ocxo1_phase_isr_dwt;
-extern volatile uint32_t ocxo1_phase_shadow_dwt;   // shadow captured by GPT1 ISR
+extern volatile uint32_t ocxo1_phase_shadow_dwt;
 extern volatile bool     ocxo1_phase_captured;
 extern volatile uint32_t ocxo1_phase_gpt_at_fire;
 extern volatile uint32_t ocxo2_phase_isr_dwt;
-extern volatile uint32_t ocxo2_phase_shadow_dwt;   // shadow captured by GPT2 ISR
+extern volatile uint32_t ocxo2_phase_shadow_dwt;
 extern volatile bool     ocxo2_phase_captured;
 extern volatile uint32_t ocxo2_phase_gpt_at_fire;
 
@@ -458,48 +458,37 @@ extern volatile uint32_t ocxo2_phase_gpt_at_fire;
 // Every second, alpha schedules a TimePop at a random delay within the
 // upcoming PPS second.  When it fires (scheduled context), it arms
 // QTimer1 CH3 to compare on the next VCLOCK edge.  CH3's ISR (priority
-// 16 via IRQ_QTIMER1) preempts scheduled context, captures DWT_CYCCNT,
-// and reads the QTimer1 32-bit counter.
+// 16 via IRQ_QTIMER1) now delegates normalized capture through the
+// generalized interrupt capture engine.
 //
-// The captured DWT is corrected for ISR entry overhead and fed through
-// time_dwt_to_gnss_ns().  The result is compared against the QTimer1-
-// derived GNSS nanosecond (ground truth).  The residual validates the
-// entire timing chain.
+// Alpha still owns the recurring schedule and ground-truth comparison;
+// the engine owns event-time normalization.
 //
-// Architecture:
-//   - Alpha owns capture: arming, CH3 ISR, TimePop callback, validation
-//   - Beta reads time_test for TIMEBASE_FRAGMENT and TIME_TEST command
-//   - Campaign-independent (always runs)
 // ============================================================================
 
 struct time_test_capture_t {
-  // ── CH3 ISR capture (volatile: written by ISR, read by scheduled context) ──
-  volatile uint32_t isr_dwt;                // DWT_CYCCNT first instruction in CH3 ISR
-  volatile uint32_t isr_shadow_dwt;         // shadow DWT captured by CH3 ISR at preemption
-  volatile uint32_t vclock_at_fire;         // QTimer1 32-bit read in ISR
-  volatile uint32_t vclock_at_edge;         // COMP1-based 32-bit VCLOCK at compare match
-  volatile bool     captured;               // CH3 ISR has fired — spin loop sentinel
+  volatile uint32_t isr_dwt;
+  volatile uint32_t isr_shadow_dwt;
+  volatile uint32_t vclock_at_fire;
+  volatile uint32_t vclock_at_edge;
+  volatile bool     captured;
 
-  // ── Derived (computed in scheduled context after capture) ──
-  uint32_t edge_dwt;               // isr_dwt - CH3 ISR overhead
-  uint32_t isr_delta_cycles;       // isr_dwt - isr_shadow_dwt (ISR entry latency)
+  uint32_t edge_dwt;
+  uint32_t isr_delta_cycles;
 
-  // ── Validation ──
-  int64_t  computed_gnss_ns;       // time_dwt_to_gnss_ns(edge_dwt)
-  int64_t  vclock_gnss_ns;         // ground truth: QTimer-derived GNSS ns
-  int32_t  residual_ns;            // computed - vclock (the money number)
-  bool     valid;                  // entire chain succeeded
+  int64_t  computed_gnss_ns;
+  int64_t  vclock_gnss_ns;
+  int32_t  residual_ns;
+  bool     valid;
 
-  // ── Lifetime diagnostics (monotonic, never reset) ──
   volatile uint32_t tests_run;
   volatile uint32_t tests_valid;
-  volatile uint32_t tests_time_invalid;     // time_dwt_to_gnss_ns returned -1
-  volatile uint32_t ch3_isr_fires;          // total CH3 ISR entries
+  volatile uint32_t tests_time_invalid;
+  volatile uint32_t ch3_isr_fires;
 
-  // Diagnostics
-  volatile uint32_t diag_ticks_since_pps;     // vclock_at_edge - qtimer_at_pps
-  volatile uint32_t diag_anchor_qtimer;       // qtimer_at_pps from snapshot
-  volatile uint32_t diag_anchor_pps_count;    // pps_count from snapshot
+  volatile uint32_t diag_ticks_since_pps;
+  volatile uint32_t diag_anchor_qtimer;
+  volatile uint32_t diag_anchor_pps_count;
 };
 
 extern time_test_capture_t time_test;
@@ -589,7 +578,6 @@ static inline bool ocxo_edge_dwt_to_gnss_ns(
   uint32_t dwt_cycles_per_pps,
   uint64_t& out_gnss_ns
 ) {
-  // pps_gnss_ns is (pps_count - 1) * 1e9, so pps_count = pps_gnss_ns / 1e9 + 1
   const uint32_t pps_count = (uint32_t)(pps_gnss_ns / 1000000000ULL) + 1;
 
   const int64_t edge_signed = time_dwt_to_gnss_ns(
@@ -621,4 +609,3 @@ void clocks_watchdog_anomaly(const char* reason,
 // ============================================================================
 
 void clocks_zero_all(void);
-

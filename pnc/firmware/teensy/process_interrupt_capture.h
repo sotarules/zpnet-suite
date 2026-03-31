@@ -66,10 +66,10 @@ struct interrupt_capture_raw_t {
   uint32_t dwt_isr_entry = 0;
   uint32_t dwt_after_capture = 0;
 
-  uint16_t counter16_at_event = 0;   // e.g. COMP1 low word or equivalent
+  uint16_t counter16_at_event = 0;
   uint16_t compare16 = 0;
 
-  uint32_t counter32_live = 0;       // live 32-bit counter read in ISR if available
+  uint32_t counter32_live = 0;
   uint32_t qtimer32_live = 0;
   uint32_t gpt_cnt_live = 0;
 
@@ -273,17 +273,14 @@ interrupt_capture_rearm_decision_t interrupt_capture_no_rearm(
 
 const char* interrupt_capture_class_str(interrupt_capture_class_t cls);
 
-// QTimer compare helpers
 uint32_t interrupt_capture_qtimer_counter32_at_event(const interrupt_capture_raw_t& raw,
                                                      interrupt_capture_diag_t* diag,
                                                      bool* out_valid);
 
-// GPT compare helpers
 uint32_t interrupt_capture_gpt_counter32_at_event(const interrupt_capture_raw_t& raw,
                                                   interrupt_capture_diag_t* diag,
                                                   bool* out_valid);
 
-// GPIO edge helpers — no canonical event counter by default
 uint32_t interrupt_capture_gpio_no_counter32(const interrupt_capture_raw_t& raw,
                                              interrupt_capture_diag_t* diag,
                                              bool* out_valid);

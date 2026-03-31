@@ -139,7 +139,7 @@ uint32_t interrupt_capture_gpt_counter32_at_event(const interrupt_capture_raw_t&
 interrupt_capture_engine_t::interrupt_capture_engine_t(
     const interrupt_capture_config_t& cfg)
     : cfg_(cfg) {
-  memset(&latency_, 0, sizeof(latency_));
+  latency_ = {};
   latency_.entry_latency_cycles_default = cfg.default_entry_latency_cycles;
   latency_.entry_latency_cycles_min = cfg.default_entry_latency_cycles;
   latency_.entry_latency_cycles_max = cfg.default_entry_latency_cycles;

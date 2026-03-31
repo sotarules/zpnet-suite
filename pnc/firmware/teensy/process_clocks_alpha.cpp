@@ -44,6 +44,7 @@
 #include "process_clocks_internal.h"
 #include "process_clocks.h"
 #include "process_timepop.h"
+#include "process_interrupt_capture.h"
 
 #include "debug.h"
 #include "timebase.h"
@@ -66,13 +67,13 @@
 // TimePop delay constants (nanoseconds)
 // ============================================================================
 
-static constexpr int64_t SPIN_EARLY_NS = 10000LL;  // 5 µs — shadow loop needs margin
+static constexpr int64_t SPIN_EARLY_NS = 10000LL;
 
 // ============================================================================
 // TimePop delay constants (nanoseconds)
 // ============================================================================
 
-static constexpr uint64_t PPS_RELAY_OFF_NS  =   500000000ULL;  // 500 ms
+static constexpr uint64_t PPS_RELAY_OFF_NS  =   500000000ULL;
 
 // ============================================================================
 // PPS watchdog — anomaly thresholds
@@ -90,34 +91,20 @@ static constexpr uint32_t PPS_REJECT_RECOVERY_THRESHOLD = 10;
 // Spin capture timeout — shadow-write loop safety net
 // ============================================================================
 
-static constexpr uint32_t SPIN_LOOP_TIMEOUT_CYCLES = 100800;  // 100 µs at 1008 MHz
+static constexpr uint32_t SPIN_LOOP_TIMEOUT_CYCLES = 100800;
 
 // ============================================================================
 // OCXO phase capture — shadow-write spin timeout
-//
-// The OCXO shadow loop runs in the ASAP callback waiting for GPT
-// ISRs that were armed by pps_isr.  The GPT compares fire at
-// snap_ocxo + OCXO_PHASE_ARM_OFFSET_TICKS (~15 µs after PPS).
-// The ASAP callback starts ~2-3 µs after PPS, so the shadow loop
-// runs for ~12-13 µs before the first GPT fires.  50 µs timeout
-// provides generous margin.
 // ============================================================================
 
-static constexpr uint32_t OCXO_PHASE_SPIN_TIMEOUT_CYCLES = 50400;  // 50 µs at 1008 MHz
+static constexpr uint32_t OCXO_PHASE_SPIN_TIMEOUT_CYCLES = 50400;
 
 // ============================================================================
 // TIME_TEST — random-delay VCLOCK edge capture for time audit
-//
-// TimePop schedules a callback at a random point within each second.
-// The callback arms CH3 to fire on the next VCLOCK edge, captures
-// DWT, reads QTimer1, and compares time_dwt_to_gnss_ns(edge_dwt)
-// against the QTimer-derived ground truth.
-//
-// Random delay range: 100 ms to 900 ms (avoids PPS neighborhood).
 // ============================================================================
 
-static constexpr uint64_t TIME_TEST_DELAY_MIN_NS = 100000000ULL;  // 100 ms
-static constexpr uint64_t TIME_TEST_DELAY_MAX_NS = 900000000ULL;  // 900 ms
+static constexpr uint64_t TIME_TEST_DELAY_MIN_NS = 100000000ULL;
+static constexpr uint64_t TIME_TEST_DELAY_MAX_NS = 900000000ULL;
 
 // ============================================================================
 // Spin Capture — nano-precise DWT anchoring with shadow-write TDC
@@ -134,14 +121,34 @@ volatile uint32_t dbg_post_loop_isr_snap  = 0;
 spin_capture_t pps_spin = {};
 
 // ============================================================================
-// TIME_TEST — state and CH3 ISR
+// TIME_TEST — state and interrupt capture engine integration
 // ============================================================================
 
 time_test_capture_t time_test = {};
 
-// Shared shadow variable — written continuously by the spin loop,
-// read by CH3 ISR at preemption.  Must be volatile.
 static volatile uint32_t time_test_shadow_dwt = 0;
+
+static void time_test_raw_capture(interrupt_capture_raw_t& out_raw);
+static void time_test_event_callback(const interrupt_capture_event_t& event,
+                                     const interrupt_capture_diag_t* diag);
+
+static interrupt_capture_config_t make_time_test_capture_config() {
+  interrupt_capture_config_t cfg {};
+  cfg.name = "time_test_capture";
+  cfg.cls = interrupt_capture_class_t::QTIMER_COMPARE;
+  cfg.rearm_mode = interrupt_capture_rearm_mode_t::NONE;
+  cfg.default_entry_latency_cycles = 0;
+  cfg.diagnostics_enabled = true;
+  cfg.raw_capture_fn = time_test_raw_capture;
+  cfg.counter32_at_event_fn = interrupt_capture_qtimer_counter32_at_event;
+  cfg.gnss_at_event_fn = interrupt_capture_default_gnss_projection;
+  cfg.callback_fn = time_test_event_callback;
+  cfg.rearm_fn = interrupt_capture_no_rearm;
+  cfg.spin_window_start_fn = interrupt_capture_default_spin_window;
+  return cfg;
+}
+
+static interrupt_capture_engine_t g_time_test_capture(make_time_test_capture_config());
 
 static void pps_spin_callback(timepop_ctx_t* ctx, void*) {
   pps_spin.landed_dwt     = ctx->fire_dwt_cyccnt;
@@ -174,11 +181,46 @@ static void pps_spin_callback(timepop_ctx_t* ctx, void*) {
   pps_spin.completed        = true;
   pps_spin.completions++;
 
-  // ── DEBUG: shadow capture forensics ──
-  dbg_post_loop_dwt     = DWT_CYCCNT;
-  dbg_post_loop_shadow  = dispatch_shadow_dwt;
-  dbg_post_loop_isr_cap = isr_captured_shadow_dwt;
+  dbg_post_loop_dwt      = DWT_CYCCNT;
+  dbg_post_loop_shadow   = dispatch_shadow_dwt;
+  dbg_post_loop_isr_cap  = isr_captured_shadow_dwt;
   dbg_post_loop_isr_snap = isr_snap_dwt;
+}
+
+// ============================================================================
+// TIME_TEST — interrupt capture engine plumbing
+// ============================================================================
+
+static void time_test_raw_capture(interrupt_capture_raw_t& out_raw) {
+  const uint32_t dwt_raw   = DWT_CYCCNT;
+  const uint32_t shadow    = time_test_shadow_dwt;
+  const uint32_t vclock_32 = qtimer1_read_32();
+
+  const uint16_t edge_lo = IMXRT_TMR1.CH[3].COMP1;
+
+  IMXRT_TMR1.CH[3].CSCTRL  = 0;
+
+  out_raw.dwt_isr_entry = dwt_raw;
+  out_raw.counter16_at_event = edge_lo;
+  out_raw.compare16 = edge_lo;
+  out_raw.counter32_live = vclock_32;
+  out_raw.qtimer32_live = vclock_32;
+  out_raw.irq_status = 0;
+  out_raw.irq_flags_cleared = 1u;
+
+  time_test.isr_shadow_dwt = shadow;
+}
+
+static void time_test_event_callback(const interrupt_capture_event_t& event,
+                                     const interrupt_capture_diag_t*) {
+  time_test.isr_dwt        = event.raw.dwt_isr_entry;
+  time_test.vclock_at_fire = event.raw.qtimer32_live;
+  time_test.vclock_at_edge = event.counter32_valid ? event.counter32_at_event : 0;
+  time_test.edge_dwt       = event.dwt_at_event;
+  time_test.computed_gnss_ns = event.gnss_valid ? (int64_t)event.gnss_ns_at_event : -1;
+  time_test.isr_delta_cycles = event.raw.dwt_isr_entry - time_test.isr_shadow_dwt;
+  time_test.captured = true;
+  time_test.ch3_isr_fires++;
 }
 
 // ============================================================================
@@ -188,50 +230,39 @@ static void pps_spin_callback(timepop_ctx_t* ctx, void*) {
 static void time_test_callback(timepop_ctx_t*, void*) {
 
   time_test.captured = false;
+  time_test.valid = false;
 
-  // CH3 is already counting in lockstep with CH0.
-  // Read CH3's own counter and set compare slightly ahead.
   const uint16_t ch3_now = IMXRT_TMR1.CH[3].CNTR;
-  const uint16_t ch3_target_actual = ch3_now + 50;  // 5 µs ahead
+  const uint16_t ch3_target_actual = ch3_now + 50;
 
-  IMXRT_TMR1.CH[3].CSCTRL  = 0;                    // clear flags
+  IMXRT_TMR1.CH[3].CSCTRL  = 0;
   IMXRT_TMR1.CH[3].COMP1   = ch3_target_actual;
   IMXRT_TMR1.CH[3].CMPLD1  = ch3_target_actual;
-  IMXRT_TMR1.CH[3].CSCTRL  = 0;                    // clear any flag set during COMP1 write
-  IMXRT_TMR1.CH[3].CSCTRL  = TMR_CSCTRL_TCF1EN;    // enable compare interrupt
+  IMXRT_TMR1.CH[3].CSCTRL  = 0;
+  IMXRT_TMR1.CH[3].CSCTRL  = TMR_CSCTRL_TCF1EN;
 
-  // CH3 will fire within ~200 ns (2 VCLOCK edges).  ISR preempts
-  // scheduled context at priority 16.  We just return — the ISR
-  // will set captured = true and the data will be harvested by
-  // the validation logic below, which runs on the NEXT call to
-  // time_test_arm (next PPS second).
+  const int64_t now_gnss_ns = time_gnss_ns_now();
+  if (now_gnss_ns >= 0) {
+    g_time_test_capture.arm((uint64_t)now_gnss_ns + 5000ULL, ch3_target_actual);
+  } else {
+    g_time_test_capture.disarm();
+  }
 
-  // However, we can also validate immediately if we spin briefly.
-  // At 10 MHz, 2 ticks = 200 ns = ~200 DWT cycles.  Trivial wait.
   const uint32_t spin_start = DWT_CYCCNT;
   while (!time_test.captured) {
     time_test_shadow_dwt = DWT_CYCCNT;
-    if ((DWT_CYCCNT - spin_start) > 100800) break;  // 100 µs safety
+    g_time_test_capture.spin_step();
+    if ((DWT_CYCCNT - spin_start) > 100800) break;
   }
 
+  g_time_test_capture.disarm();
+
   if (!time_test.captured) return;
-
-  time_test.isr_delta_cycles = time_test.isr_dwt - time_test.isr_shadow_dwt;
-  time_test.edge_dwt = time_test_dwt_at_edge(time_test.isr_dwt);
-
-  int64_t computed = time_dwt_to_gnss_ns(time_test.edge_dwt);
-  if (computed < 0) {
+  if (time_test.computed_gnss_ns < 0) {
     time_test.valid = false;
     time_test.tests_time_invalid++;
     return;
   }
-  time_test.computed_gnss_ns = computed;
-
-  // ── Ground truth: QTimer-derived GNSS nanosecond ──
-  // vclock_at_fire is the 32-bit QTimer1 value read in the CH3 ISR.
-  // The number of VCLOCK ticks since the last PPS edge:
-  //   ticks_since_pps = vclock_at_fire - qtimer_at_pps  (unsigned wrap-safe)
-  // Each tick = 100 ns.  GNSS ns = pps_gnss_ns + ticks_since_pps * 100.
 
   time_anchor_snapshot_t snap = time_anchor_snapshot();
   if (!snap.ok || !snap.valid) {
@@ -239,13 +270,11 @@ static void time_test_callback(timepop_ctx_t*, void*) {
     return;
   }
 
-  time_test.diag_anchor_qtimer   = snap.qtimer_at_pps;
+  time_test.diag_anchor_qtimer    = snap.qtimer_at_pps;
   time_test.diag_anchor_pps_count = snap.pps_count;
-  time_test.diag_ticks_since_pps = time_test.vclock_at_edge - snap.qtimer_at_pps;
+  time_test.diag_ticks_since_pps  = time_test.vclock_at_edge - snap.qtimer_at_pps;
 
-  // Using the register truth vclock_at_edge from CH3 32-bit compare match:
   uint32_t ticks_since_pps = time_test.vclock_at_edge - snap.qtimer_at_pps;
-
   int64_t pps_gnss_ns = (int64_t)(snap.pps_count - 1) * 1000000000LL;
   time_test.vclock_gnss_ns = pps_gnss_ns + (int64_t)ticks_since_pps * 100LL;
 
@@ -260,12 +289,12 @@ static void time_test_arm(void) {
 
   time_test.tests_run++;
 
-  // Random delay between 100 ms and 900 ms
   uint64_t range = TIME_TEST_DELAY_MAX_NS - TIME_TEST_DELAY_MIN_NS;
   uint64_t delay_ns = TIME_TEST_DELAY_MIN_NS + (random() % range);
 
   timepop_arm(delay_ns, false, time_test_callback, nullptr, "time-test");
 }
+
 static void pps_spin_arm(void) {
   if (!g_dwt_cal_valid) return;
   if (!time_valid()) return;
@@ -288,7 +317,7 @@ static void pps_spin_arm(void) {
   timepop_handle_t h = timepop_arm_ns(
       target_gnss_ns, target_dwt,
       pps_spin_callback, nullptr, "pps-spin",
-      true  // ISR callback: shadow-write loop must run in ISR context
+      true
   );
 
   if (h == TIMEPOP_INVALID_HANDLE) {
@@ -296,6 +325,7 @@ static void pps_spin_arm(void) {
     pps_spin.arm_failures++;
   } else {
     pps_spin.armed = true;
+    pps_spin.handle = h;
   }
 }
 
@@ -317,9 +347,9 @@ static void pps_spin_complete(uint32_t isr_dwt_snap) {
     return;
   }
 
-  pps_spin.isr_dwt        = isr_dwt_snap;
+  pps_spin.isr_dwt         = isr_dwt_snap;
   pps_spin.approach_cycles = (int32_t)(isr_dwt_snap - pps_spin.landed_dwt);
-  pps_spin.edge_dwt       = pps_dwt_at_edge(isr_dwt_snap);
+  pps_spin.edge_dwt        = pps_dwt_at_edge(isr_dwt_snap);
 
   pps_spin.valid  = true;
   pps_spin.armed  = false;
@@ -330,7 +360,7 @@ static void pps_spin_complete(uint32_t isr_dwt_snap) {
 // Continuous DWT-to-GNSS Calibration (campaign-independent)
 // ============================================================================
 
-volatile uint32_t  g_dwt_at_last_pps      = 0;
+volatile uint32_t  g_dwt_at_last_pps       = 0;
 volatile uint32_t  g_dwt_cycles_per_gnss_s = 0;
 volatile bool      g_dwt_cal_has_prev      = false;
 volatile bool      g_dwt_cal_valid         = false;
@@ -458,23 +488,10 @@ volatile bool pps_scheduled = false;
 
 // ============================================================================
 // OCXO phase capture — v29 shadow-write TDC architecture
-//
-// Each GPT fires a one-shot output-compare ISR on the first OCXO
-// edge after PPS.  The ISR captures DWT_CYCCNT and the current shadow
-// DWT value from the ASAP callback's shadow-write loop.  The delta
-// (isr_dwt - shadow_dwt) provides per-sample ISR latency for TDC
-// correction, identical to the PPS spin capture mechanism.
-//
-// GPT arming happens in pps_isr (while OCXO counters are close to
-// their snapshot values).  The shadow-write loop runs in the ASAP
-// callback.  The arm offset must be large enough that the compare
-// fires AFTER the ASAP callback has started the shadow loop.
 // ============================================================================
 
-// ── Shared shadow variable for OCXO phase spin loop ──
 volatile uint32_t ocxo_phase_shadow_dwt = 0;
 
-// ── GPT ISR capture state ──
 volatile uint32_t ocxo1_phase_isr_dwt      = 0;
 volatile uint32_t ocxo1_phase_shadow_dwt   = 0;
 volatile bool     ocxo1_phase_captured     = false;
@@ -485,45 +502,24 @@ volatile uint32_t ocxo2_phase_shadow_dwt   = 0;
 volatile bool     ocxo2_phase_captured     = false;
 volatile uint32_t ocxo2_phase_gpt_at_fire  = 0;
 
-// ── Phase capture diagnostics ──
 volatile uint32_t diag_ocxo1_phase_captures = 0;
 volatile uint32_t diag_ocxo2_phase_captures = 0;
 volatile uint32_t diag_ocxo1_phase_misses   = 0;
 volatile uint32_t diag_ocxo2_phase_misses   = 0;
 
-// ── Phase spin diagnostics ──
 volatile uint32_t diag_ocxo_phase_spin_timeouts = 0;
 
-// ── Simplified phase result (computed in pps_asap_callback) ──
 ocxo_phase_capture_t ocxo_phase = {};
 
 volatile uint32_t diag_gpt1_isr_fires = 0;
 volatile uint32_t diag_gpt2_isr_fires = 0;
 
 void time_test_ch3_isr(void) {
-  const uint32_t dwt_raw   = DWT_CYCCNT;
-  const uint32_t shadow    = time_test_shadow_dwt;
-  const uint32_t vclock_32 = qtimer1_read_32();
-
-  const uint16_t edge_lo   = IMXRT_TMR1.CH[3].COMP1;
-  const uint32_t vclock_edge = (vclock_32 & 0xFFFF0000u) | (uint32_t)edge_lo;
-
-  IMXRT_TMR1.CH[3].CSCTRL  = 0;
-
-  time_test.isr_dwt        = dwt_raw;
-  time_test.isr_shadow_dwt = shadow;
-  time_test.vclock_at_fire = vclock_32;
-  time_test.vclock_at_edge = vclock_edge;
-  time_test.captured       = true;
-  time_test.ch3_isr_fires++;
+  g_time_test_capture.handle_interrupt();
 }
 
 // ============================================================================
 // GPT1 output-compare ISR — OCXO1 edge capture
-//
-// Fires once per PPS on the first OCXO1 edge at or after the armed
-// compare value.  DWT_CYCCNT is the very first instruction.
-// Priority 0 — no nesting overhead, no temporal conflict with PPS.
 // ============================================================================
 
 static void gpt1_phase_isr(void) {
@@ -534,8 +530,8 @@ static void gpt1_phase_isr(void) {
   GPT1_SR = GPT_SR_OF1;
   GPT1_IR &= ~GPT_IR_OF1IE;
 
-  ocxo1_phase_isr_dwt    = dwt_raw;
-  ocxo1_phase_shadow_dwt = shadow;
+  ocxo1_phase_isr_dwt     = dwt_raw;
+  ocxo1_phase_shadow_dwt  = shadow;
   ocxo1_phase_gpt_at_fire = gpt;
   ocxo1_phase_captured    = true;
 
@@ -554,8 +550,8 @@ static void gpt2_phase_isr(void) {
   GPT2_SR = GPT_SR_OF1;
   GPT2_IR &= ~GPT_IR_OF1IE;
 
-  ocxo2_phase_isr_dwt    = dwt_raw;
-  ocxo2_phase_shadow_dwt = shadow;
+  ocxo2_phase_isr_dwt     = dwt_raw;
+  ocxo2_phase_shadow_dwt  = shadow;
   ocxo2_phase_gpt_at_fire = gpt;
   ocxo2_phase_captured    = true;
 
@@ -593,34 +589,6 @@ uint64_t clocks_dwt_ns_now(void) {
 
 // ============================================================================
 // GNSS VCLOCK (10 MHz external via QTimer1 ch0+ch1 — cascaded 32-bit)
-//
-// v23: Single-edge counting (CM=1, 10 MHz).
-//
-//   QTimer1 CH0 counts rising edges only of the GNSS 10 MHz signal.
-//   CH1 cascades from CH0 overflow to form a 32-bit counter.
-//   One tick = one GNSS cycle = 100 ns.
-//
-//   The raw counter value IS the 10 MHz tick count — no divisor needed.
-//   32-bit wrap: 429.5 seconds at 10 MHz.
-//
-// v21: Torn-read prevention.
-//
-//   QTimer1 channels 0 and 1 form a cascaded 32-bit counter, but
-//   reading two 16-bit registers is not atomic.  If the low counter
-//   (ch0) rolls over between reading ch1 (high) and ch0 (low), the
-//   combined value is off by up to 65,536 ticks.
-//
-//   The high-low-high pattern detects this: read the high word,
-//   then the low word, then the high word again.  If the two high
-//   reads differ, the low word rolled over — re-read it.  The
-//   second low read is consistent with the new (second) high value.
-//
-//   Cost: one extra 16-bit register read in the common case (~1 ns).
-//   In the rare rollover case, two extra reads (~2 ns).
-//
-//   This is called from the PPS ISR (priority 0) and from scheduled
-//   context (clocks_gnss_ticks_now, INTERP_PROOF, etc.).  Both
-//   contexts benefit from the protection.
 // ============================================================================
 
 static bool qtimer1_armed = false;
@@ -644,10 +612,10 @@ volatile uint32_t diag_qread_last_lo2 = 0;
 uint32_t qtimer1_read_32(void) {
   diag_qread_total++;
 
-  const uint16_t lo1 = IMXRT_TMR1.CH[0].CNTR;   // latches CH1.HOLD
+  const uint16_t lo1 = IMXRT_TMR1.CH[0].CNTR;
   const uint16_t hi1 = IMXRT_TMR1.CH[1].HOLD;
 
-  const uint16_t lo2 = IMXRT_TMR1.CH[0].CNTR;   // relatches CH1.HOLD
+  const uint16_t lo2 = IMXRT_TMR1.CH[0].CNTR;
   const uint16_t hi2 = IMXRT_TMR1.CH[1].HOLD;
 
   diag_qread_last_hi1 = hi1;
@@ -692,18 +660,12 @@ static void arm_qtimer1_external(void) {
   IMXRT_TMR1.CH[0].CMPLD1 = 0xFFFF;
   IMXRT_TMR1.CH[1].CMPLD1 = 0xFFFF;
 
-  // v23: CM(1) = count rising edges only = 10 MHz.
-  // Previously CM(2) = dual-edge = 20 MHz.
   IMXRT_TMR1.CH[0].CTRL = TMR_CTRL_CM(1) | TMR_CTRL_PCS(0);
   IMXRT_TMR1.CH[1].CTRL = TMR_CTRL_CM(7);
 
-  // CH0 and CH1 are passive counter channels only.  TimePop compare
-  // uses CH2.  CH3 is unallocated.  Keep CH0 compare interrupts
-  // disabled permanently so the 32-bit counter path remains sovereign.
   IMXRT_TMR1.CH[0].CSCTRL &= ~TMR_CSCTRL_TCF1EN;
   IMXRT_TMR1.CH[0].CSCTRL |=  TMR_CSCTRL_TCF1;
 
-  // CH1 is cascade-only — silence its compare and overflow alarms permanently.
   IMXRT_TMR1.CH[1].CSCTRL = 0;
   IMXRT_TMR1.CH[1].SCTRL  &= ~(TMR_SCTRL_TOFIE | TMR_SCTRL_IEF | TMR_SCTRL_IEFIE);
 
@@ -711,7 +673,6 @@ static void arm_qtimer1_external(void) {
   qtimer1_armed   = true;
 }
 
-// v23: Raw counter IS 10 MHz ticks — no divisor needed.
 uint64_t clocks_gnss_ticks_now(void) {
   uint32_t now = qtimer1_read_32();
   gnss_rolling_raw_64 += (uint32_t)(now - gnss_rolling_32);
@@ -809,15 +770,11 @@ uint64_t clocks_ocxo2_ns_now(void) {
 
 static void pps_asap_callback(timepop_ctx_t*, void*) {
 
-  // ── Spin capture: complete the current capture, arm the next ──
-  // Must run FIRST so pps_spin.edge_dwt is available for
-  // the calibration and time anchor blocks below.
   pps_spin_complete(isr_snap_dwt);
   pps_spin_arm();
 
   const uint32_t dwt_at_pps_edge = pps_dwt_at_edge(isr_snap_dwt);
 
-  // ── Continuous DWT calibration (always runs, campaign-independent) ──
   {
     if (g_dwt_cal_has_prev) {
       g_dwt_cycles_per_gnss_s = dwt_at_pps_edge - g_dwt_at_last_pps;
@@ -829,28 +786,15 @@ static void pps_asap_callback(timepop_ctx_t*, void*) {
     g_dwt_cal_pps_count++;
   }
 
-  // ── Universal GNSS time anchor (campaign-independent) ──
   time_pps_update(
     dwt_at_pps_edge,
     g_dwt_cal_valid ? g_dwt_cycles_per_gnss_s : 0,
     isr_snap_gnss
   );
 
-  // ── OCXO phase capture — shadow-write TDC ──
-  //
-  // GPT output compares were armed by pps_isr with a generous offset.
-  // We now spin a shadow-write loop until both ISRs fire.  The GPT
-  // ISRs capture the shadow DWT alongside their own DWT read, giving
-  // us the before/after pair needed for TDC correction.
-  //
-  // This runs in scheduled context.  GPT ISRs at priority 0 preempt
-  // cleanly.  The arm offset guarantees the compares fire after
-  // this loop starts.
-
   {
     ocxo_phase.dwt_at_pps = dwt_at_pps_edge;
 
-    // Per-shot clean slate for beta-owned derived fields.
     ocxo_phase.pps_gnss_ns            = 0;
     ocxo_phase.ocxo1_edge_dwt         = 0;
     ocxo_phase.ocxo2_edge_dwt         = 0;
@@ -868,12 +812,6 @@ static void pps_asap_callback(timepop_ctx_t*, void*) {
     ocxo_phase.ocxo1_phase_offset_ns  = 0;
     ocxo_phase.ocxo2_phase_offset_ns  = 0;
 
-    // ── Shadow-write spin loop — unified for both OCXOs ──
-    //
-    // Continuously write DWT_CYCCNT to the shared shadow variable.
-    // Each GPT ISR captures the shadow at preemption, giving us a
-    // before/after pair for TDC correction.  The loop terminates
-    // when both ISRs have fired, or on timeout.
     const uint32_t spin_start = DWT_CYCCNT;
     bool spin_timed_out = false;
 
@@ -886,7 +824,6 @@ static void pps_asap_callback(timepop_ctx_t*, void*) {
       }
     }
 
-    // ── Harvest captures ──
     if (ocxo1_phase_captured && !spin_timed_out) {
       ocxo_phase.ocxo1_isr_dwt     = ocxo1_phase_isr_dwt;
       ocxo_phase.ocxo1_shadow_dwt  = ocxo1_phase_shadow_dwt;
@@ -919,16 +856,12 @@ static void pps_asap_callback(timepop_ctx_t*, void*) {
       diag_ocxo2_phase_misses++;
     }
 
-    // Detector valid only if BOTH edges captured
     ocxo_phase.detector_valid =
       ocxo_phase.ocxo1_valid && ocxo_phase.ocxo2_valid;
   }
 
-  // ── TIME_TEST — continuous time_dwt_to_gnss validation ──
   time_test_arm();
 
-  // ── Campaign-scoped processing (beta) ──
-  // Must run AFTER phase harvest so beta consumes this PPS's edge captures.
   clocks_beta_pps();
 
   diag_pps_asap_dispatched++;
@@ -942,18 +875,12 @@ static void pps_isr(void)  {
   const uint32_t snap_ocxo2 = pps_correct_10mhz(GPT2_CNT, snap_dwt, &diag_pps_correct_dwt_ocxo2);
   const uint32_t snap_gnss  = pps_correct_10mhz(qtimer1_read_32(), snap_dwt, &diag_pps_correct_dwt_gnss);
 
-  // ── PPS relay pulse to Pi — unconditional, never gated ──
   digitalWriteFast(GNSS_PPS_RELAY, HIGH);
   if (!relay_timer_active) {
     relay_timer_active = true;
     timepop_arm(PPS_RELAY_OFF_NS, false, pps_relay_deassert, nullptr, "pps-relay-off");
   }
 
-  // ── PPS edge validation — reject spurious edges ──
-  //
-  // At 10 MHz, elapsed between valid PPS edges should be exactly
-  // 10,000,000 ± PPS_VCLOCK_TOLERANCE ticks.  Any remainder outside
-  // that window indicates a spurious interrupt, not a real PPS edge.
   if (isr_residual_valid) {
     uint32_t elapsed = snap_gnss - isr_prev_gnss;
     uint32_t remainder = elapsed % ISR_GNSS_RAW_EXPECTED;
@@ -986,13 +913,6 @@ static void pps_isr(void)  {
 
   diag_pps_reject_consecutive = 0;
 
-  // ── Arm GPT output compares for OCXO phase capture ──
-  //
-  // Must happen in PPS ISR while OCXO counters are close to their
-  // snapshot values.  The shadow-write loop runs later in the ASAP
-  // callback; the arm offset must be large enough that the compare
-  // fires AFTER the shadow loop starts (~2-3 µs dispatch latency
-  // + ~1 µs of ASAP callback preamble).
   ocxo1_phase_captured = false;
   ocxo2_phase_captured = false;
 
@@ -1004,17 +924,9 @@ static void pps_isr(void)  {
   GPT2_SR   = GPT_SR_OF1;
   GPT2_IR  |= GPT_IR_OF1IE;
 
-  // ── Capture spin loop shadow before signaling pps_fired ──
   isr_captured_shadow_dwt = dispatch_shadow_dwt;
   pps_fired = true;
 
-  // ── ISR-level residuals ──
-  //
-  // All residuals are now in native units:
-  //   DWT:   cycles  (expected ~1,008,000,000)
-  //   GNSS:  10 MHz ticks (expected 10,000,000)
-  //   OCXO1: 10 MHz ticks (expected 10,000,000)
-  //   OCXO2: 10 MHz ticks (expected 10,000,000)
   if (isr_residual_valid) {
     isr_residual_dwt   = (int32_t)(snap_dwt   - isr_prev_dwt)   - (int32_t)ISR_DWT_EXPECTED;
     isr_residual_gnss  = (int32_t)(snap_gnss  - isr_prev_gnss)  - (int32_t)ISR_GNSS_RAW_EXPECTED;
@@ -1027,9 +939,6 @@ static void pps_isr(void)  {
   isr_prev_ocxo1 = isr_snap_ocxo1 = snap_ocxo1;
   isr_prev_ocxo2 = isr_snap_ocxo2 = snap_ocxo2;
 
-
-
-  // ── v16: PPS watchdog ──
   if (pps_scheduled) {
     diag_pps_scheduled_stuck++;
 
@@ -1061,7 +970,6 @@ static void pps_isr(void)  {
 
   pps_scheduled = true;
 
-  // Mark first PPS seen for residual tracking on next edge.
   if (!isr_residual_valid) {
     isr_residual_valid = true;
   }
@@ -1081,9 +989,9 @@ static void pps_isr(void)  {
 
 void process_clocks_init_hardware(void) {
   dwt_enable();
-  arm_gpt1_external();      // OCXO1 10 MHz (GPT1, pin 25)
-  arm_gpt2_external();      // OCXO2 10 MHz (GPT2, pin 14)
-  arm_qtimer1_external();   // GNSS VCLOCK 10 MHz (QTimer1 ch0+ch1, pin 10)
+  arm_gpt1_external();
+  arm_gpt2_external();
+  arm_qtimer1_external();
 }
 
 // ============================================================================
@@ -1105,7 +1013,6 @@ void process_clocks_init(void) {
   pinMode(GNSS_PPS_RELAY, OUTPUT);
   digitalWriteFast(GNSS_PPS_RELAY, LOW);
 
-  // ── Install GPT ISR vectors for OCXO phase capture ──
   GPT1_SR = 0x3F;
   GPT2_SR = 0x3F;
   GPT1_IR = 0;
@@ -1119,20 +1026,15 @@ void process_clocks_init(void) {
   NVIC_SET_PRIORITY(IRQ_GPT2, 0);
   NVIC_ENABLE_IRQ(IRQ_GPT2);
 
-  // ── CH3 setup for TIME_TEST — always counting, interrupt disabled ──
-  // CH3 counts the same VCLOCK signal as CH0 (CM=1, PCS=0).
-  // It free-runs continuously so its CNTR stays in lockstep with CH0.
-  // Only the compare interrupt (TCF1EN) is toggled per test.
   IMXRT_TMR1.CH[3].CTRL   = 0;
   IMXRT_TMR1.CH[3].CNTR   = IMXRT_TMR1.CH[0].CNTR;
   IMXRT_TMR1.CH[3].LOAD   = 0;
   IMXRT_TMR1.CH[3].COMP1  = 0xFFFF;
   IMXRT_TMR1.CH[3].CMPLD1 = 0xFFFF;
   IMXRT_TMR1.CH[3].SCTRL  = 0;
-  IMXRT_TMR1.CH[3].CSCTRL = 0;  // TCF1EN off — no interrupts until armed
-  IMXRT_TMR1.CH[3].CTRL   = TMR_CTRL_CM(1) | TMR_CTRL_PCS(0);  // start counting
+  IMXRT_TMR1.CH[3].CSCTRL = 0;
+  IMXRT_TMR1.CH[3].CTRL   = TMR_CTRL_CM(1) | TMR_CTRL_PCS(0);
 
   attachInterrupt(digitalPinToInterrupt(GNSS_PPS_PIN), pps_isr, RISING);
   NVIC_SET_PRIORITY(IRQ_GPIO6789, 0);
 }
-
