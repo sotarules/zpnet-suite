@@ -396,42 +396,38 @@ extern volatile uint32_t ocxo2_phase_gpt_at_fire;
 // ============================================================================
 
 struct time_test_capture_t {
-  // Normalized canonical outputs
+  // Canonical outputs from process_interrupt
   bool     captured;
-  bool     valid;
-
   uint32_t dwt_at_event;
-  bool     dwt_valid;
-
   uint64_t gnss_ns_at_event;
-  bool     gnss_valid;
-
   uint32_t counter32_at_event;
-  bool     counter32_valid;
+  uint32_t dwt_event_correction_cycles;
 
-  uint32_t latency_cycles_used;
-
-  // Raw capture facts
-  uint32_t isr_dwt;
-  uint32_t raw_counter32_live;
-  uint16_t raw_counter16_at_event;
+  // Raw interrupt facts
+  uint32_t dwt_isr_entry_raw;
+  uint32_t dwt_after_capture;
   uint16_t raw_compare16;
+  uint16_t raw_verify_low16;
+  uint16_t raw_verify_high16;
 
-  // Generalized latency diagnostics
+  // Formal DWT / shadow diagnostics
   bool     shadow_valid;
   uint32_t shadow_dwt;
-  uint32_t delta_cycles;
+  uint32_t shadow_to_isr_entry_cycles;
+  uint32_t dwt_at_event_adjusted;
 
-  // Counter reconstruction diagnostics
-  uint32_t candidate_counter32_a;
-  uint32_t candidate_counter32_b;
-  bool     used_counter32_candidate_b;
-
-  // Latency selection diagnostics
-  uint32_t candidate_latency_default_cycles;
-  uint32_t candidate_latency_live_cycles;
+  // Correction diagnostics
+  uint32_t candidate_correction_default_cycles;
+  uint32_t candidate_correction_live_cycles;
+  uint32_t dwt_event_correction_cycles_diag;
   bool     used_live_profile;
   bool     used_default_profile;
+
+  // QTIMER verification diagnostics
+  uint16_t expected_low16;
+  uint16_t expected_high16;
+  bool     verify_high16_matches;
+  bool     verify_high16_is_previous;
 
   // TIME_TEST-specific derived ground truth
   int64_t  vclock_gnss_ns;
@@ -449,7 +445,8 @@ struct time_test_capture_t {
 
 extern time_test_capture_t time_test;
 
-void time_test_ch3_isr(void);
+// Shadow DWT continuously written by the TIME_TEST prespin loop.
+extern volatile uint32_t time_test_shadow_dwt;
 
 // ============================================================================
 // 64-bit accumulators (campaign-scoped)

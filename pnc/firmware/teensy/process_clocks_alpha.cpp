@@ -2,12 +2,11 @@
 // process_clocks_alpha.cpp — Always-On Physics Layer
 // ============================================================================
 
-#include "tdc_correction.h"
-
 #include "process_clocks_internal.h"
 #include "process_clocks.h"
 #include "process_timepop.h"
 #include "process_interrupt.h"
+#include "tdc_correction.h"
 
 #include "debug.h"
 #include "timebase.h"
@@ -61,36 +60,18 @@ spin_capture_t pps_spin = {};
 // ============================================================================
 
 time_test_capture_t time_test = {};
+volatile uint32_t time_test_shadow_dwt = 0;
+static volatile uint32_t time_test_next_counter32_target = 0;
 
-static volatile uint32_t time_test_shadow_dwt = 0;
-static volatile uint16_t time_test_ch3_target_actual = 0;
+// Forward
+static interrupt_next_target_t time_test_interrupt_event_handler(
+    const interrupt_event_t& event,
+    const interrupt_capture_diag_t* diag,
+    void* user_data);
 
-static void time_test_raw_capture(interrupt_capture_raw_t& out_raw,
-                                  interrupt_capture_diag_t* diag);
-static void time_test_event_callback(const interrupt_capture_event_t& event,
-                                     const interrupt_capture_diag_t* diag);
-static int64_t time_test_next_spin_delay(void* user_data,
-                                         const interrupt_capture_event_t* last_event,
-                                         const interrupt_capture_diag_t* last_diag);
-static bool time_test_arm_target(void* user_data, uint32_t* out_counter32_target);
-
-static interrupt_capture_handler_registration_t make_time_test_registration() {
-  interrupt_capture_handler_registration_t reg {};
-  reg.cfg.name = "time_test_capture";
-  reg.cfg.cls = interrupt_capture_class_t::QTIMER_COMPARE;
-  reg.cfg.rearm_mode = interrupt_capture_rearm_mode_t::ONE_SHOT;
-  reg.cfg.default_entry_latency_cycles = 0;
-  reg.cfg.diagnostics_enabled = true;
-  reg.cfg.raw_capture_fn = time_test_raw_capture;
-  reg.cfg.counter32_at_event_fn = interrupt_capture_qtimer_counter32_at_event;
-  reg.cfg.gnss_at_event_fn = interrupt_capture_default_gnss_projection;
-  reg.cfg.callback_fn = time_test_event_callback;
-  reg.cfg.rearm_fn = interrupt_capture_no_rearm;
-  reg.cfg.next_spin_delay_fn = time_test_next_spin_delay;
-  reg.cfg.arm_target_fn = time_test_arm_target;
-  reg.cfg.user_data = nullptr;
-  return reg;
-}
+// ============================================================================
+// PPS spin callback
+// ============================================================================
 
 static void pps_spin_callback(timepop_ctx_t* ctx, void*) {
   pps_spin.landed_dwt     = ctx->fire_dwt_cyccnt;
@@ -130,136 +111,69 @@ static void pps_spin_callback(timepop_ctx_t* ctx, void*) {
 }
 
 // ============================================================================
-// TIME_TEST — declarative handler policies
+// TIME_TEST — new subscriber callback
 // ============================================================================
 
-static int64_t time_test_next_spin_delay(void*,
-                                         const interrupt_capture_event_t*,
-                                         const interrupt_capture_diag_t*) {
-  // The scheduled test callback chooses when the next TIME_TEST opportunity
-  // occurs. The interrupt subsystem does not self-recur TIME_TEST at the
-  // handler level, so no additional pre-spin scheduling is requested here.
-  return -1;
-}
+static interrupt_next_target_t time_test_interrupt_event_handler(
+    const interrupt_event_t& event,
+    const interrupt_capture_diag_t* diag,
+    void*) {
 
-static bool time_test_arm_target(void*, uint32_t* out_counter32_target) {
-  const uint16_t ch3_now = IMXRT_TMR1.CH[3].CNTR;
-  const uint16_t ch3_target = ch3_now + 50;
+  time_test.captured                   = true;
+  time_test.dwt_at_event               = event.dwt_at_event;
+  time_test.gnss_ns_at_event           = event.gnss_ns_at_event;
+  time_test.counter32_at_event         = event.counter32_at_event;
+  time_test.dwt_event_correction_cycles = event.dwt_event_correction_cycles;
 
-  IMXRT_TMR1.CH[3].CSCTRL  = 0;
-  IMXRT_TMR1.CH[3].COMP1   = ch3_target;
-  IMXRT_TMR1.CH[3].CMPLD1  = ch3_target;
-  IMXRT_TMR1.CH[3].CSCTRL  = 0;
-  IMXRT_TMR1.CH[3].CSCTRL  = TMR_CSCTRL_TCF1EN;
-
-  time_test_ch3_target_actual = ch3_target;
-  if (out_counter32_target) *out_counter32_target = ch3_target;
-  return true;
-}
-
-static void time_test_raw_capture(interrupt_capture_raw_t& out_raw,
-                                  interrupt_capture_diag_t* diag) {
-  const uint32_t dwt_raw   = DWT_CYCCNT;
-  const uint32_t vclock_32 = qtimer1_read_32();
-
-  IMXRT_TMR1.CH[3].CSCTRL = 0;
-
-  out_raw.dwt_isr_entry      = dwt_raw;
-  out_raw.counter16_at_event = time_test_ch3_target_actual;
-  out_raw.compare16          = time_test_ch3_target_actual;
-  out_raw.counter32_live     = vclock_32;
-  out_raw.qtimer32_live      = vclock_32;
-  out_raw.irq_status         = 0;
-  out_raw.irq_flags_cleared  = 1u;
+  time_test.dwt_isr_entry_raw          = event.raw.dwt_isr_entry_raw;
+  time_test.dwt_after_capture          = event.raw.dwt_after_capture;
+  time_test.raw_compare16              = event.raw.compare16;
+  time_test.raw_verify_low16           = event.raw.verify_low16;
+  time_test.raw_verify_high16          = event.raw.verify_high16;
 
   if (diag) {
-    diag->shadow_dwt = time_test_shadow_dwt;
-    diag->shadow_valid = true;
-  }
-}
+    time_test.shadow_valid                     = diag->shadow_valid;
+    time_test.shadow_dwt                       = diag->shadow_dwt;
+    time_test.shadow_to_isr_entry_cycles       = diag->shadow_to_isr_entry_cycles;
+    time_test.dwt_at_event_adjusted            = diag->dwt_at_event_adjusted;
 
-static void time_test_event_callback(const interrupt_capture_event_t& event,
-                                     const interrupt_capture_diag_t* diag) {
-  time_test.captured           = true;
-  time_test.valid              = false;
+    time_test.candidate_correction_default_cycles = diag->candidate_correction_default_cycles;
+    time_test.candidate_correction_live_cycles    = diag->candidate_correction_live_cycles;
+    time_test.dwt_event_correction_cycles_diag    = diag->dwt_event_correction_cycles;
+    time_test.used_live_profile                   = diag->used_live_profile;
+    time_test.used_default_profile                = diag->used_default_profile;
 
-  time_test.dwt_at_event       = event.dwt_at_event;
-  time_test.dwt_valid          = event.dwt_valid;
-  time_test.gnss_ns_at_event   = event.gnss_ns_at_event;
-  time_test.gnss_valid         = event.gnss_valid;
-  time_test.counter32_at_event = event.counter32_at_event;
-  time_test.counter32_valid    = event.counter32_valid;
-  time_test.latency_cycles_used = event.latency_cycles_used;
-
-  time_test.isr_dwt                 = event.raw.dwt_isr_entry;
-  time_test.raw_counter32_live      = event.raw.counter32_live;
-  time_test.raw_counter16_at_event  = event.raw.counter16_at_event;
-  time_test.raw_compare16           = event.raw.compare16;
-
-  if (diag) {
-    time_test.shadow_valid = diag->shadow_valid;
-    time_test.shadow_dwt   = diag->shadow_dwt;
-    time_test.delta_cycles = diag->delta_cycles;
-
-    time_test.candidate_counter32_a = diag->candidate_counter32_a;
-    time_test.candidate_counter32_b = diag->candidate_counter32_b;
-    time_test.used_counter32_candidate_b = diag->used_counter32_candidate_b;
-
-    time_test.candidate_latency_default_cycles = diag->candidate_latency_default_cycles;
-    time_test.candidate_latency_live_cycles    = diag->candidate_latency_live_cycles;
-    time_test.used_live_profile                = diag->used_live_profile;
-    time_test.used_default_profile             = diag->used_default_profile;
+    time_test.expected_low16                 = diag->expected_low16;
+    time_test.expected_high16                = diag->expected_high16;
+    time_test.verify_high16_matches          = diag->verify_high16_matches;
+    time_test.verify_high16_is_previous      = diag->verify_high16_is_previous;
   } else {
     time_test.shadow_valid = false;
-    time_test.shadow_dwt   = 0;
-    time_test.delta_cycles = 0;
+    time_test.shadow_dwt = 0;
+    time_test.shadow_to_isr_entry_cycles = 0;
+    time_test.dwt_at_event_adjusted = 0;
 
-    time_test.candidate_counter32_a = 0;
-    time_test.candidate_counter32_b = 0;
-    time_test.used_counter32_candidate_b = false;
+    time_test.candidate_correction_default_cycles = 0;
+    time_test.candidate_correction_live_cycles = 0;
+    time_test.dwt_event_correction_cycles_diag = 0;
+    time_test.used_live_profile = false;
+    time_test.used_default_profile = false;
 
-    time_test.candidate_latency_default_cycles = 0;
-    time_test.candidate_latency_live_cycles    = 0;
-    time_test.used_live_profile                = false;
-    time_test.used_default_profile             = false;
+    time_test.expected_low16 = 0;
+    time_test.expected_high16 = 0;
+    time_test.verify_high16_matches = false;
+    time_test.verify_high16_is_previous = false;
   }
 
   time_test.ch3_isr_fires++;
-}
-
-// ============================================================================
-// TIME_TEST — TimePop callback + arming
-// ============================================================================
-
-static void time_test_callback(timepop_ctx_t*, void*) {
-  time_test.captured = false;
-  time_test.valid = false;
-
-  // Handler declaration already exists; just start the shadow loop and let the
-  // interrupt subsystem arm CH3 through its abstract arm_target_fn.
-  time_test_shadow_dwt = 0;
-
-  // The registered interrupt handler is one-shot and already active. Trigger
-  // its next cycle by asking it to start through the declarative registration
-  // path. In this first pass, we exploit hidden registration done at init and
-  // simply shadow until the IRQ arrives.
-  const uint32_t spin_start = DWT_CYCCNT;
-  while (!time_test.captured) {
-    time_test_shadow_dwt = DWT_CYCCNT;
-    if ((DWT_CYCCNT - spin_start) > 100800) break;
-  }
-
-  if (!time_test.captured) return;
-  if (!time_test.dwt_valid || !time_test.gnss_valid || !time_test.counter32_valid) {
-    time_test.valid = false;
-    time_test.tests_time_invalid++;
-    return;
-  }
 
   time_anchor_snapshot_t snap = time_anchor_snapshot();
   if (!snap.ok || !snap.valid) {
-    time_test.valid = false;
-    return;
+    time_test.tests_time_invalid++;
+    interrupt_next_target_t out {};
+    out.schedule_next = false;
+    out.target_gnss_ns = 0;
+    return out;
   }
 
   time_test.diag_anchor_qtimer    = snap.qtimer_at_pps;
@@ -272,9 +186,17 @@ static void time_test_callback(timepop_ctx_t*, void*) {
   time_test.vclock_gnss_ns = pps_gnss_ns + (int64_t)ticks_since_pps * 100LL;
   time_test.residual_ns = (int32_t)((int64_t)time_test.gnss_ns_at_event - time_test.vclock_gnss_ns);
 
-  time_test.valid = true;
   time_test.tests_valid++;
+
+  interrupt_next_target_t out {};
+  out.schedule_next = false;
+  out.target_gnss_ns = 0;
+  return out;
 }
+
+// ============================================================================
+// TIME_TEST — schedule a new one-shot request
+// ============================================================================
 
 static void time_test_arm(void) {
   if (!g_dwt_cal_valid) return;
@@ -285,7 +207,36 @@ static void time_test_arm(void) {
   uint64_t range = TIME_TEST_DELAY_MAX_NS - TIME_TEST_DELAY_MIN_NS;
   uint64_t delay_ns = TIME_TEST_DELAY_MIN_NS + (random() % range);
 
-  timepop_arm(delay_ns, false, time_test_callback, nullptr, "time-test");
+  int64_t now_ns = time_gnss_ns_now();
+  if (now_ns < 0) {
+    time_test.tests_time_invalid++;
+    return;
+  }
+
+  int64_t target_gnss_ns = now_ns + (int64_t)delay_ns;
+  uint32_t target_dwt = time_gnss_ns_to_dwt(target_gnss_ns);
+
+  time_anchor_snapshot_t snap = time_anchor_snapshot();
+  if (!snap.ok || !snap.valid) {
+    time_test.tests_time_invalid++;
+    return;
+  }
+
+  const uint64_t ns_since_pps = (uint64_t)(target_gnss_ns -
+      ((int64_t)(snap.pps_count - 1) * 1000000000LL));
+
+  const uint32_t ticks_since_pps = (uint32_t)(ns_since_pps / 100ULL);
+  time_test_next_counter32_target = snap.qtimer_at_pps + ticks_since_pps;
+
+  time_test_shadow_dwt = 0;
+  const uint32_t spin_start = DWT_CYCCNT;
+  while ((DWT_CYCCNT - spin_start) < 1000) {
+    time_test_shadow_dwt = DWT_CYCCNT;
+    break;
+  }
+
+  interrupt_schedule_target(interrupt_subscriber_kind_t::TIME_TEST,
+                            (uint64_t)target_gnss_ns);
 }
 
 static void pps_spin_arm(void) {
@@ -1011,18 +962,13 @@ void process_clocks_init(void) {
   NVIC_SET_PRIORITY(IRQ_GPT2, 0);
   NVIC_ENABLE_IRQ(IRQ_GPT2);
 
-  IMXRT_TMR1.CH[3].CTRL   = 0;
-  IMXRT_TMR1.CH[3].CNTR   = IMXRT_TMR1.CH[0].CNTR;
-  IMXRT_TMR1.CH[3].LOAD   = 0;
-  IMXRT_TMR1.CH[3].COMP1  = 0xFFFF;
-  IMXRT_TMR1.CH[3].CMPLD1 = 0xFFFF;
-  IMXRT_TMR1.CH[3].SCTRL  = 0;
-  IMXRT_TMR1.CH[3].CSCTRL = 0;
-  IMXRT_TMR1.CH[3].CTRL   = TMR_CTRL_CM(1) | TMR_CTRL_PCS(0);
-
   attachInterrupt(digitalPinToInterrupt(GNSS_PPS_PIN), pps_isr, RISING);
   NVIC_SET_PRIORITY(IRQ_GPIO6789, 0);
 
-  // Declarative TIME_TEST handler registration into shared interrupt subsystem
-  declareInterruptHandler(make_time_test_registration());
+  interrupt_subscription_t time_test_sub {};
+  time_test_sub.kind = interrupt_subscriber_kind_t::TIME_TEST;
+  time_test_sub.on_event = time_test_interrupt_event_handler;
+  time_test_sub.user_data = nullptr;
+  interrupt_subscribe(time_test_sub);
+  interrupt_start(interrupt_subscriber_kind_t::TIME_TEST);
 }

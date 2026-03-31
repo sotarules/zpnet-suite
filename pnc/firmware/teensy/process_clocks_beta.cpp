@@ -766,52 +766,44 @@ void clocks_beta_pps(void) {
   p.add("dwt_cal_pps_count", g_dwt_cal_pps_count);
 
   // TIME_TEST — anchored canonical last-capture record
-  p.add("time_test_captured",                time_test.captured);
-  p.add("time_test_valid",                   time_test.valid);
+  p.add("time_test_captured",                       time_test.captured);
+  p.add("time_test_dwt_at_event",                   time_test.dwt_at_event);
+  p.add("time_test_gnss_ns_at_event",               time_test.gnss_ns_at_event);
+  p.add("time_test_counter32_at_event",             time_test.counter32_at_event);
+  p.add("time_test_dwt_event_correction_cycles",    time_test.dwt_event_correction_cycles);
 
-  p.add("time_test_dwt_valid",               time_test.dwt_valid);
-  p.add("time_test_dwt_at_event",            time_test.dwt_at_event);
+  p.add("time_test_dwt_isr_entry_raw",              time_test.dwt_isr_entry_raw);
+  p.add("time_test_dwt_after_capture",              time_test.dwt_after_capture);
+  p.add("time_test_raw_compare16",                  (uint32_t)time_test.raw_compare16);
+  p.add("time_test_raw_verify_low16",               (uint32_t)time_test.raw_verify_low16);
+  p.add("time_test_raw_verify_high16",              (uint32_t)time_test.raw_verify_high16);
 
-  p.add("time_test_gnss_valid",              time_test.gnss_valid);
-  p.add("time_test_gnss_ns_at_event",        time_test.gnss_ns_at_event);
+  p.add("time_test_shadow_valid",                   time_test.shadow_valid);
+  p.add("time_test_shadow_dwt",                     time_test.shadow_dwt);
+  p.add("time_test_shadow_to_isr_entry_cycles",     time_test.shadow_to_isr_entry_cycles);
+  p.add("time_test_dwt_at_event_adjusted",          time_test.dwt_at_event_adjusted);
 
-  p.add("time_test_counter32_valid",         time_test.counter32_valid);
-  p.add("time_test_counter32_at_event",      time_test.counter32_at_event);
+  p.add("time_test_candidate_correction_default_cycles", time_test.candidate_correction_default_cycles);
+  p.add("time_test_candidate_correction_live_cycles",    time_test.candidate_correction_live_cycles);
+  p.add("time_test_dwt_event_correction_cycles_diag",    time_test.dwt_event_correction_cycles_diag);
+  p.add("time_test_used_live_profile",                    time_test.used_live_profile);
+  p.add("time_test_used_default_profile",                 time_test.used_default_profile);
 
-  p.add("time_test_latency_cycles_used",     time_test.latency_cycles_used);
+  p.add("time_test_expected_low16",                (uint32_t)time_test.expected_low16);
+  p.add("time_test_expected_high16",               (uint32_t)time_test.expected_high16);
+  p.add("time_test_verify_high16_matches",         time_test.verify_high16_matches);
+  p.add("time_test_verify_high16_is_previous",     time_test.verify_high16_is_previous);
 
-  p.add("time_test_isr_dwt",                 time_test.isr_dwt);
-  p.add("time_test_raw_counter32_live",      time_test.raw_counter32_live);
-  p.add("time_test_raw_counter16_at_event",  (uint32_t)time_test.raw_counter16_at_event);
-  p.add("time_test_raw_compare16",           (uint32_t)time_test.raw_compare16);
+  p.add("time_test_vclock_gnss_ns",                time_test.vclock_gnss_ns);
+  p.add("time_test_residual_ns",                   time_test.residual_ns);
+  p.add("time_test_diag_ticks_since_pps",          time_test.diag_ticks_since_pps);
+  p.add("time_test_diag_anchor_qtimer",            time_test.diag_anchor_qtimer);
+  p.add("time_test_diag_anchor_pps_count",         time_test.diag_anchor_pps_count);
 
-  p.add("time_test_shadow_valid",            time_test.shadow_valid);
-  p.add("time_test_shadow_dwt",              time_test.shadow_dwt);
-  p.add("time_test_delta_cycles",            time_test.delta_cycles);
-
-  p.add("time_test_candidate_counter32_a",   time_test.candidate_counter32_a);
-  p.add("time_test_candidate_counter32_b",   time_test.candidate_counter32_b);
-  p.add("time_test_used_counter32_candidate_b", time_test.used_counter32_candidate_b);
-
-  p.add("time_test_candidate_latency_default_cycles", time_test.candidate_latency_default_cycles);
-  p.add("time_test_candidate_latency_live_cycles",    time_test.candidate_latency_live_cycles);
-  p.add("time_test_used_live_profile",                time_test.used_live_profile);
-  p.add("time_test_used_default_profile",             time_test.used_default_profile);
-
-  p.add("time_test_vclock_gnss_ns",           time_test.vclock_gnss_ns);
-  p.add("time_test_residual_ns",              time_test.residual_ns);
-  p.add("time_test_diag_ticks_since_pps",     time_test.diag_ticks_since_pps);
-  p.add("time_test_diag_anchor_qtimer",       time_test.diag_anchor_qtimer);
-  p.add("time_test_diag_anchor_pps_count",    time_test.diag_anchor_pps_count);
-
-  p.add("time_test_tests_run",                time_test.tests_run);
-  p.add("time_test_tests_valid",              time_test.tests_valid);
-  p.add("time_test_tests_time_invalid",       time_test.tests_time_invalid);
-  p.add("time_test_ch3_isr_fires",            time_test.ch3_isr_fires);
-
-  p.add("diag_pps_correct_dwt_ocxo1", diag_pps_correct_dwt_ocxo1);
-  p.add("diag_pps_correct_dwt_ocxo2", diag_pps_correct_dwt_ocxo2);
-  p.add("diag_pps_correct_dwt_gnss",  diag_pps_correct_dwt_gnss);
+  p.add("time_test_tests_run",                     time_test.tests_run);
+  p.add("time_test_tests_valid",                   time_test.tests_valid);
+  p.add("time_test_tests_time_invalid",            time_test.tests_time_invalid);
+  p.add("time_test_ch3_isr_fires",                 time_test.ch3_isr_fires);
 
   publish("TIMEBASE_FRAGMENT", p);
 }
@@ -1177,48 +1169,44 @@ static Payload cmd_clocks_info(const Payload&) {
   p.add("qread_last_lo2",         diag_qread_last_lo2);
 
   // TIME_TEST — full anchored canonical record
-  p.add("time_test_captured",                time_test.captured);
-  p.add("time_test_valid",                   time_test.valid);
+  p.add("time_test_captured",                    time_test.captured);
+  p.add("time_test_dwt_at_event",                time_test.dwt_at_event);
+  p.add("time_test_gnss_ns_at_event",            time_test.gnss_ns_at_event);
+  p.add("time_test_counter32_at_event",          time_test.counter32_at_event);
+  p.add("time_test_dwt_event_correction_cycles", time_test.dwt_event_correction_cycles);
 
-  p.add("time_test_dwt_valid",               time_test.dwt_valid);
-  p.add("time_test_dwt_at_event",            time_test.dwt_at_event);
+  p.add("time_test_dwt_isr_entry_raw",           time_test.dwt_isr_entry_raw);
+  p.add("time_test_dwt_after_capture",           time_test.dwt_after_capture);
+  p.add("time_test_raw_compare16",               (uint32_t)time_test.raw_compare16);
+  p.add("time_test_raw_verify_low16",            (uint32_t)time_test.raw_verify_low16);
+  p.add("time_test_raw_verify_high16",           (uint32_t)time_test.raw_verify_high16);
 
-  p.add("time_test_gnss_valid",              time_test.gnss_valid);
-  p.add("time_test_gnss_ns_at_event",        time_test.gnss_ns_at_event);
+  p.add("time_test_shadow_valid",                time_test.shadow_valid);
+  p.add("time_test_shadow_dwt",                  time_test.shadow_dwt);
+  p.add("time_test_shadow_to_isr_entry_cycles",  time_test.shadow_to_isr_entry_cycles);
+  p.add("time_test_dwt_at_event_adjusted",       time_test.dwt_at_event_adjusted);
 
-  p.add("time_test_counter32_valid",         time_test.counter32_valid);
-  p.add("time_test_counter32_at_event",      time_test.counter32_at_event);
+  p.add("time_test_candidate_correction_default_cycles", time_test.candidate_correction_default_cycles);
+  p.add("time_test_candidate_correction_live_cycles",    time_test.candidate_correction_live_cycles);
+  p.add("time_test_dwt_event_correction_cycles_diag",    time_test.dwt_event_correction_cycles_diag);
+  p.add("time_test_used_live_profile",                   time_test.used_live_profile);
+  p.add("time_test_used_default_profile",                time_test.used_default_profile);
 
-  p.add("time_test_latency_cycles_used",     time_test.latency_cycles_used);
+  p.add("time_test_expected_low16",               (uint32_t)time_test.expected_low16);
+  p.add("time_test_expected_high16",              (uint32_t)time_test.expected_high16);
+  p.add("time_test_verify_high16_matches",        time_test.verify_high16_matches);
+  p.add("time_test_verify_high16_is_previous",    time_test.verify_high16_is_previous);
 
-  p.add("time_test_isr_dwt",                 time_test.isr_dwt);
-  p.add("time_test_raw_counter32_live",      time_test.raw_counter32_live);
-  p.add("time_test_raw_counter16_at_event",  (uint32_t)time_test.raw_counter16_at_event);
-  p.add("time_test_raw_compare16",           (uint32_t)time_test.raw_compare16);
+  p.add("time_test_vclock_gnss_ns",               time_test.vclock_gnss_ns);
+  p.add("time_test_residual_ns",                  time_test.residual_ns);
+  p.add("time_test_diag_ticks_since_pps",         time_test.diag_ticks_since_pps);
+  p.add("time_test_diag_anchor_qtimer",           time_test.diag_anchor_qtimer);
+  p.add("time_test_diag_anchor_pps_count",        time_test.diag_anchor_pps_count);
 
-  p.add("time_test_shadow_valid",            time_test.shadow_valid);
-  p.add("time_test_shadow_dwt",              time_test.shadow_dwt);
-  p.add("time_test_delta_cycles",            time_test.delta_cycles);
-
-  p.add("time_test_candidate_counter32_a",   time_test.candidate_counter32_a);
-  p.add("time_test_candidate_counter32_b",   time_test.candidate_counter32_b);
-  p.add("time_test_used_counter32_candidate_b", time_test.used_counter32_candidate_b);
-
-  p.add("time_test_candidate_latency_default_cycles", time_test.candidate_latency_default_cycles);
-  p.add("time_test_candidate_latency_live_cycles",    time_test.candidate_latency_live_cycles);
-  p.add("time_test_used_live_profile",                time_test.used_live_profile);
-  p.add("time_test_used_default_profile",             time_test.used_default_profile);
-
-  p.add("time_test_vclock_gnss_ns",           time_test.vclock_gnss_ns);
-  p.add("time_test_residual_ns",              time_test.residual_ns);
-  p.add("time_test_diag_ticks_since_pps",     time_test.diag_ticks_since_pps);
-  p.add("time_test_diag_anchor_qtimer",       time_test.diag_anchor_qtimer);
-  p.add("time_test_diag_anchor_pps_count",    time_test.diag_anchor_pps_count);
-
-  p.add("time_test_tests_run",                time_test.tests_run);
-  p.add("time_test_tests_valid",              time_test.tests_valid);
-  p.add("time_test_tests_time_invalid",       time_test.tests_time_invalid);
-  p.add("time_test_ch3_isr_fires",            time_test.ch3_isr_fires);
+  p.add("time_test_tests_run",                    time_test.tests_run);
+  p.add("time_test_tests_valid",                  time_test.tests_valid);
+  p.add("time_test_tests_time_invalid",           time_test.tests_time_invalid);
+  p.add("time_test_ch3_isr_fires",                time_test.ch3_isr_fires);
 
   return p;
 }
@@ -1278,52 +1266,44 @@ static Payload cmd_phase_info(const Payload&) {
 static Payload cmd_time_test(const Payload&) {
   Payload p;
 
-  p.add("captured",                time_test.captured);
-  p.add("valid",                   time_test.valid);
+  p.add("captured",                           time_test.captured);
+  p.add("dwt_at_event",                       time_test.dwt_at_event);
+  p.add("gnss_ns_at_event",                   time_test.gnss_ns_at_event);
+  p.add("counter32_at_event",                 time_test.counter32_at_event);
+  p.add("dwt_event_correction_cycles",        time_test.dwt_event_correction_cycles);
 
-  p.add("dwt_valid",               time_test.dwt_valid);
-  p.add("dwt_at_event",            time_test.dwt_at_event);
+  p.add("dwt_isr_entry_raw",                  time_test.dwt_isr_entry_raw);
+  p.add("dwt_after_capture",                  time_test.dwt_after_capture);
+  p.add("raw_compare16",                      (uint32_t)time_test.raw_compare16);
+  p.add("raw_verify_low16",                   (uint32_t)time_test.raw_verify_low16);
+  p.add("raw_verify_high16",                  (uint32_t)time_test.raw_verify_high16);
 
-  p.add("gnss_valid",              time_test.gnss_valid);
-  p.add("gnss_ns_at_event",        time_test.gnss_ns_at_event);
+  p.add("shadow_valid",                       time_test.shadow_valid);
+  p.add("shadow_dwt",                         time_test.shadow_dwt);
+  p.add("shadow_to_isr_entry_cycles",         time_test.shadow_to_isr_entry_cycles);
+  p.add("dwt_at_event_adjusted",              time_test.dwt_at_event_adjusted);
 
-  p.add("counter32_valid",         time_test.counter32_valid);
-  p.add("counter32_at_event",      time_test.counter32_at_event);
+  p.add("candidate_correction_default_cycles", time_test.candidate_correction_default_cycles);
+  p.add("candidate_correction_live_cycles",    time_test.candidate_correction_live_cycles);
+  p.add("dwt_event_correction_cycles_diag",    time_test.dwt_event_correction_cycles_diag);
+  p.add("used_live_profile",                   time_test.used_live_profile);
+  p.add("used_default_profile",                time_test.used_default_profile);
 
-  p.add("latency_cycles_used",     time_test.latency_cycles_used);
+  p.add("expected_low16",                     (uint32_t)time_test.expected_low16);
+  p.add("expected_high16",                    (uint32_t)time_test.expected_high16);
+  p.add("verify_high16_matches",              time_test.verify_high16_matches);
+  p.add("verify_high16_is_previous",          time_test.verify_high16_is_previous);
 
-  p.add("isr_dwt",                 time_test.isr_dwt);
-  p.add("raw_counter32_live",      time_test.raw_counter32_live);
-  p.add("raw_counter16_at_event",  (uint32_t)time_test.raw_counter16_at_event);
-  p.add("raw_compare16",           (uint32_t)time_test.raw_compare16);
+  p.add("vclock_gnss_ns",                     time_test.vclock_gnss_ns);
+  p.add("residual_ns",                        time_test.residual_ns);
+  p.add("diag_ticks_since_pps",               time_test.diag_ticks_since_pps);
+  p.add("diag_anchor_qtimer",                 time_test.diag_anchor_qtimer);
+  p.add("diag_anchor_pps_count",              time_test.diag_anchor_pps_count);
 
-  p.add("shadow_valid",            time_test.shadow_valid);
-  p.add("shadow_dwt",              time_test.shadow_dwt);
-  p.add("delta_cycles",            time_test.delta_cycles);
-
-  p.add("candidate_counter32_a",   time_test.candidate_counter32_a);
-  p.add("candidate_counter32_b",   time_test.candidate_counter32_b);
-  p.add("used_counter32_candidate_b", time_test.used_counter32_candidate_b);
-
-  p.add("candidate_latency_default_cycles", time_test.candidate_latency_default_cycles);
-  p.add("candidate_latency_live_cycles",    time_test.candidate_latency_live_cycles);
-  p.add("used_live_profile",                time_test.used_live_profile);
-  p.add("used_default_profile",             time_test.used_default_profile);
-
-  p.add("vclock_gnss_ns",           time_test.vclock_gnss_ns);
-  p.add("residual_ns",              time_test.residual_ns);
-  p.add("diag_ticks_since_pps",     time_test.diag_ticks_since_pps);
-  p.add("diag_anchor_qtimer",       time_test.diag_anchor_qtimer);
-  p.add("diag_anchor_pps_count",    time_test.diag_anchor_pps_count);
-
-  p.add("tests_run",                time_test.tests_run);
-  p.add("tests_valid",              time_test.tests_valid);
-  p.add("tests_time_invalid",       time_test.tests_time_invalid);
-  p.add("ch3_isr_fires",            time_test.ch3_isr_fires);
-
-  p.add("diag_pps_correct_dwt_ocxo1", diag_pps_correct_dwt_ocxo1);
-  p.add("diag_pps_correct_dwt_ocxo2", diag_pps_correct_dwt_ocxo2);
-  p.add("diag_pps_correct_dwt_gnss",  diag_pps_correct_dwt_gnss);
+  p.add("tests_run",                          time_test.tests_run);
+  p.add("tests_valid",                        time_test.tests_valid);
+  p.add("tests_time_invalid",                 time_test.tests_time_invalid);
+  p.add("ch3_isr_fires",                      time_test.ch3_isr_fires);
 
   p.add("isr_snap_dwt", isr_snap_dwt);
 
@@ -1346,16 +1326,16 @@ static Payload cmd_set_dac(const Payload& args) {
 // ============================================================================
 
 static const process_command_entry_t CLOCKS_COMMANDS[] = {
-  { "START",        cmd_start        },
-  { "STOP",         cmd_stop         },
-  { "RECOVER",      cmd_recover      },
-  { "REPORT",       cmd_report       },
-  { "CLOCKS_INFO",  cmd_clocks_info  },
-  { "PHASE_INFO",   cmd_phase_info   },
+  { "START",        cmd_start         },
+  { "STOP",         cmd_stop          },
+  { "RECOVER",      cmd_recover       },
+  { "REPORT",       cmd_report        },
+  { "CLOCKS_INFO",  cmd_clocks_info   },
+  { "PHASE_INFO",   cmd_phase_info    },
   { "WATCHDOG_TEST",cmd_watchdog_test },
-  { "TIME_TEST",    cmd_time_test    },
-  { "SET_DAC",      cmd_set_dac      },
-  { nullptr,        nullptr          }
+  { "TIME_TEST",    cmd_time_test     },
+  { "SET_DAC",      cmd_set_dac       },
+  { nullptr,        nullptr           }
 };
 
 static const process_subscription_entry_t CLOCKS_SUBSCRIPTIONS[] = {
