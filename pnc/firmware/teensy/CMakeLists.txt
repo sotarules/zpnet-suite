@@ -82,6 +82,7 @@ set(ZPNET_SOURCES
     teensy.ino
     time.cpp
     ad5693r.cpp
+    process_interrupt_capture.cpp
 )
 
 set(ZPNET_HEADERS
@@ -110,7 +111,8 @@ set(ZPNET_HEADERS
     zpnet_pins.h
     time.h
     tdc_correction.h
-        ad5693r.h
+    ad5693r.h
+    process_interrupt_capture.h
 )
 
 # -------------------------------------------------------------
