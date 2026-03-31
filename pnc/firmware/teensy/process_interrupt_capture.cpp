@@ -273,6 +273,25 @@ void interrupt_capture_engine_t::handle_interrupt() {
   diag.raw_compare16 = raw.compare16;
   diag.raw_counter32_live = raw.counter32_live;
 
+  // --------------------------------------------------------------------------
+  // Shadow / latency witness support
+  //
+  // The caller may optionally pre-populate these fields in diag from its raw
+  // capture function or via other class-local plumbing before returning.
+  //
+  // If shadow_valid is true, delta_cycles becomes the generalized quantity
+  // suitable for TIMEBASE emission and offline latency analysis:
+  //
+  //   delta_cycles = isr_dwt - shadow_dwt
+  //
+  // This supports the class-agnostic latency analyzer you described.
+  // --------------------------------------------------------------------------
+  if (diag.shadow_valid) {
+    diag.delta_cycles = raw.dwt_isr_entry - diag.shadow_dwt;
+  } else {
+    diag.delta_cycles = 0;
+  }
+
   const uint32_t latency_cycles = choose_entry_latency_cycles(raw, diag);
   const uint32_t dwt_at_event = raw.dwt_isr_entry - latency_cycles;
 

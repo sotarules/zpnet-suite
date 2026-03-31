@@ -1,37 +1,6 @@
 // ============================================================================
 // process_clocks_beta.cpp — Campaign Layer
 // ============================================================================
-//
-// v15: Random walk prediction model.
-//
-//   Empirical testing over 38,000+ seconds (Baseline4 campaign) showed
-//   that a random walk predictor (predicted = prev_delta) produces 1.67x
-//   lower prediction stddev than linear extrapolation (predicted =
-//   2*prev - prev_prev) for DWT.  For OCXOs the difference is negligible
-//   since their deltas are near-constant when servo-locked.
-//
-//   The random walk model assumes the crystal's current rate is the best
-//   estimate of its next rate.  Linear extrapolation assumes trends
-//   continue, but thermal drift is a random walk — when the trend
-//   reverses, the extrapolator overshoots in both directions.
-//
-//   Changes from v14:
-//     • prediction_tracker_t: prev_prev_delta removed
-//     • prediction_update(): predicted = prev_delta (random walk)
-//     • prediction_seed(): simplified, history_count = 2
-//     • Welford gate: history_count >= 2 (scores one second earlier)
-//     • prediction_reset(): prev_prev_delta removed
-//
-// v14: Symmetric GPT counting for both OCXOs.
-//
-//   OCXO1 on GPT1 (10 MHz single-edge, 32-bit native).
-//   OCXO2 on GPT2 (10 MHz single-edge, 32-bit native).
-//   GNSS  on QTimer1 (10 MHz single-edge, cascaded 32-bit).
-//
-//   All three 10 MHz domains accumulate ticks directly.
-//   No divisor or domain translation required.
-//
-// ============================================================================
 
 #include "process_clocks_internal.h"
 #include "process_clocks.h"
@@ -132,9 +101,6 @@ double residual_stderr(const pps_residual_t& r) {
 
 // ============================================================================
 // Random walk prediction tracking — definitions
-//
-// v15: Random walk model.  predicted = prev_delta.
-// Empirically 1.67x lower stddev than linear extrapolation for DWT.
 // ============================================================================
 
 prediction_tracker_t pred_dwt   = {};
@@ -160,7 +126,6 @@ void prediction_seed(prediction_tracker_t& p, uint32_t value) {
 }
 
 void prediction_update(prediction_tracker_t& p, uint32_t actual_delta) {
-  // Score the prediction if we have a valid one
   if (p.predicted_valid && p.history_count >= 2) {
     p.pred_residual = (int32_t)actual_delta - (int32_t)p.predicted;
     p.n++;
@@ -171,7 +136,6 @@ void prediction_update(prediction_tracker_t& p, uint32_t actual_delta) {
     p.m2 += d1 * d2;
   }
 
-  // Random walk: next prediction is this delta
   p.prev_delta = actual_delta;
   if (p.history_count < 255) p.history_count++;
 
@@ -193,9 +157,6 @@ double prediction_stderr(const prediction_tracker_t& p) {
 
 // ============================================================================
 // DAC Welford tracking — definitions
-//
-// Cumulative Welford's over dac_fractional, one sample per PPS second.
-// Campaign-scoped: reset on START and RECOVER.
 // ============================================================================
 
 dac_welford_t dac_welford_ocxo1 = {};
@@ -229,9 +190,6 @@ double dac_welford_stderr(const dac_welford_t& w) {
 
 // ============================================================================
 // 64-bit accumulators — definitions
-//
-// All three external clocks accumulate 10 MHz ticks directly.
-// GNSS: QTimer1 single-edge (v23), same as OCXOs on GPT.
 // ============================================================================
 
 uint64_t dwt_cycles_64     = 0;
@@ -278,12 +236,12 @@ void clocks_zero_all(void) {
   residual_reset(residual_ocxo2);
 
   ocxo_phase = {};
+  time_test = {};
 
   prediction_reset(pred_dwt);
   prediction_reset(pred_ocxo1);
   prediction_reset(pred_ocxo2);
 
-  // Reset PPS rejection state — pre-campaign noise must not carry over
   diag_pps_reject_consecutive = 0;
   isr_residual_valid = false;
 
@@ -306,7 +264,6 @@ void clocks_zero_all(void) {
 // OCXO calibration servo — unified for both OCXOs
 // ============================================================================
 
-// MEAN mode: target Welford mean residual → 0
 static void ocxo_servo_mean(ocxo_dac_state_t& dac, pps_residual_t& res) {
   if (res.n < SERVO_MIN_SAMPLES) return;
 
@@ -331,10 +288,6 @@ static void ocxo_servo_mean(ocxo_dac_state_t& dac, pps_residual_t& res) {
   residual_reset(res);
 }
 
-// TOTAL mode: target cumulative tick deficit → 0 (tau → 1.0)
-//
-// Error signal is (ocxo_ticks - gnss_ticks) in 10 MHz ticks.
-// Each tick = 100 ns.  Positive = OCXO ran fast, steer down.
 static void ocxo_servo_total(ocxo_dac_state_t& dac, uint64_t ocxo_ticks, uint64_t gnss_ticks) {
   if (campaign_seconds < SERVO_MIN_SAMPLES) return;
 
@@ -359,28 +312,6 @@ static void ocxo_servo_total(ocxo_dac_state_t& dac, uint64_t ocxo_ticks, uint64_
   dac.servo_settle_count = 0;
 }
 
-// NOW mode: phase-first per-second residual → 0
-//
-// Uses the authoritative per-second residual derived from consecutive absolute canonical edge timestamps.
-//
-// Beta computes the absolute GNSS nanosecond timestamp of the canonical
-// first post-PPS edge each second:
-//
-//   edge_gnss_ns = pps_gnss_ns + phase_offset_ns
-//
-// and then derives:
-//
-//   residual_ns = (edge_gnss_ns_this - edge_gnss_ns_prev) - 1e9
-//
-// Positive residual means the OCXO edge moved later (slow); negative
-// residual means the OCXO edge moved earlier (fast).
-//
-// The gain constant NOW_NS_PER_DAC_LSB is the empirical relationship
-// between one DAC code step and the resulting change in residual_ns.
-// Positive DAC voltage slows these OCXOs; negative DAC voltage speeds them.
-//
-// The servo applies a proportional correction every second with no
-// settle delay — the measurement is precise enough to act immediately.
 static constexpr double NOW_NS_PER_DAC_LSB = 10.0;
 static constexpr double NOW_MIN_RESIDUAL_NS = 5.0;
 
@@ -393,8 +324,6 @@ static void ocxo_servo_now(ocxo_dac_state_t& dac, int64_t residual_ns) {
 
   if (fabs(residual) < NOW_MIN_RESIDUAL_NS) return;
 
-  // Negative residual = OCXO fast = need to steer DAC down
-  // Positive residual = OCXO slow = need to steer DAC up
   double step = -residual / NOW_NS_PER_DAC_LSB;
 
   if (step >  (double)SERVO_MAX_STEP) step =  (double)SERVO_MAX_STEP;
@@ -503,7 +432,6 @@ void clocks_watchdog_anomaly(const char* reason,
 
 void clocks_beta_pps(void) {
 
-  // ── Command requests override anomaly latch ──
   if (request_stop) {
     watchdog_anomaly_active = false;
     campaign_state = clocks_campaign_state_t::STOPPED;
@@ -544,6 +472,7 @@ void clocks_beta_pps(void) {
     residual_reset(residual_ocxo2);
 
     ocxo_phase = {};
+    time_test = {};
 
     prediction_reset(pred_dwt);
     prediction_reset(pred_ocxo1);
@@ -590,7 +519,6 @@ void clocks_beta_pps(void) {
 
   pps_fired = false;
 
-  // ── DWT ──
   uint32_t dwt_raw_at_pps = pps_dwt_at_edge(isr_snap_dwt);
   uint32_t dwt_delta = dwt_raw_at_pps - prev_dwt_at_pps;
 
@@ -600,7 +528,6 @@ void clocks_beta_pps(void) {
   const uint64_t pps_dwt_cycles = dwt_cycles_64;
   const uint64_t pps_dwt_ns     = dwt_cycles_to_ns(pps_dwt_cycles);
 
-  // ── OCXO1 ──
   uint32_t ocxo1_delta = isr_snap_ocxo1 - prev_ocxo1_at_pps;
   ocxo1_ticks_64    += ocxo1_delta;
   prev_ocxo1_at_pps  = isr_snap_ocxo1;
@@ -608,7 +535,6 @@ void clocks_beta_pps(void) {
   const uint64_t pps_ocxo1_ticks = ocxo1_ticks_64;
   const uint64_t pps_ocxo1_ns    = pps_ocxo1_ticks * 100ull;
 
-  // ── OCXO2 ──
   uint32_t ocxo2_delta = isr_snap_ocxo2 - prev_ocxo2_at_pps;
   ocxo2_ticks_64    += ocxo2_delta;
   prev_ocxo2_at_pps  = isr_snap_ocxo2;
@@ -616,7 +542,6 @@ void clocks_beta_pps(void) {
   const uint64_t pps_ocxo2_ticks = ocxo2_ticks_64;
   const uint64_t pps_ocxo2_ns    = pps_ocxo2_ticks * 100ull;
 
-  // ── GNSS ──
   uint32_t gnss_raw_delta = isr_snap_gnss - prev_gnss_at_pps;
   gnss_raw_64      += gnss_raw_delta;
   prev_gnss_at_pps  = isr_snap_gnss;
@@ -630,22 +555,18 @@ void clocks_beta_pps(void) {
     pred_dwt.predicted_valid ? pred_dwt.predicted :
     (g_dwt_cal_valid ? g_dwt_cycles_per_gnss_s : DWT_EXPECTED_PER_PPS);
 
-  // ── Residual updates ──
   residual_update(residual_dwt,   pps_dwt_cycles,   DWT_EXPECTED_PER_PPS_I);
   residual_update(residual_gnss,  pps_gnss_ticks,   GNSS_EXPECTED_PER_PPS);
   residual_update(residual_ocxo1, pps_ocxo1_ticks,  OCXO_EXPECTED_PER_PPS);
   residual_update(residual_ocxo2, pps_ocxo2_ticks,  OCXO_EXPECTED_PER_PPS);
 
-  // ── Prediction tracking ──
   prediction_update(pred_dwt,   dwt_delta);
   prediction_update(pred_ocxo1, ocxo1_delta);
   prediction_update(pred_ocxo2, ocxo2_delta);
 
-  // Snapshot DAC state before servo
   const uint16_t dac1_before = ocxo1_dac.dac_hw_code;
   const uint16_t dac2_before = ocxo2_dac.dac_hw_code;
 
-  // ── Absolute GNSS timestamps for canonical winning OCXO edges ──
   ocxo_phase.pps_gnss_ns = pps_gnss_ns;
 
   const uint32_t ocxo1_edge_dwt = ocxo_phase.ocxo1_edge_dwt;
@@ -680,7 +601,6 @@ void clocks_beta_pps(void) {
     const int64_t phase2 =
       (int64_t)ocxo_phase.ocxo2_edge_gnss_ns - (int64_t)pps_gnss_ns;
 
-    // Normalize to [0, 100 ns)
     ocxo_phase.ocxo1_phase_offset_ns =
       (int32_t)((phase1 % 100 + 100) % 100);
 
@@ -724,17 +644,17 @@ void clocks_beta_pps(void) {
 
   ocxo_calibration_servo();
 
-  // Snapshot DAC state after servo
   ocxo_phase.ocxo1_dac_before = dac1_before;
   ocxo_phase.ocxo1_dac_after  = ocxo1_dac.dac_hw_code;
   ocxo_phase.ocxo2_dac_before = dac2_before;
   ocxo_phase.ocxo2_dac_after  = ocxo2_dac.dac_hw_code;
 
-  // ── DAC Welford ──
   dac_welford_update(dac_welford_ocxo1, ocxo1_dac.dac_fractional);
   dac_welford_update(dac_welford_ocxo2, ocxo2_dac.dac_fractional);
 
-  // ── Build and publish TIMEBASE_FRAGMENT ──
+  // --------------------------------------------------------------------------
+  // Build and publish TIMEBASE_FRAGMENT
+  // --------------------------------------------------------------------------
   Payload p;
   p.add("campaign",         campaign_name);
 
@@ -788,23 +708,12 @@ void clocks_beta_pps(void) {
 
   p.add("phase_detector_valid",   (bool)ocxo_phase.detector_valid);
 
-  // ─────────────────────────────────────────────
-  // Phase — canonical record (NEW)
-  // ─────────────────────────────────────────────
-
-  // Absolute edge timestamps (GNSS domain)
   p.add("ocxo1_edge_gnss_ns", ocxo_phase.ocxo1_edge_gnss_ns);
   p.add("ocxo2_edge_gnss_ns", ocxo_phase.ocxo2_edge_gnss_ns);
-
-  // Phase offsets (0–100 ns)
   p.add("ocxo1_phase_offset_ns", (int32_t)ocxo_phase.ocxo1_phase_offset_ns);
   p.add("ocxo2_phase_offset_ns", (int32_t)ocxo_phase.ocxo2_phase_offset_ns);
-
-  // Per-second edge delta (ns)
   p.add("ocxo1_gnss_ns_per_pps", ocxo_phase.ocxo1_gnss_ns_per_pps);
   p.add("ocxo2_gnss_ns_per_pps", ocxo_phase.ocxo2_gnss_ns_per_pps);
-
-  // Residuals (servo input)
   p.add("ocxo1_residual_ns", ocxo_phase.ocxo1_residual_ns);
   p.add("ocxo2_residual_ns", ocxo_phase.ocxo2_residual_ns);
   p.add("phase_residual_valid", (bool)ocxo_phase.residual_valid);
@@ -814,7 +723,6 @@ void clocks_beta_pps(void) {
   p.add("ocxo2_dac_before",        (int32_t)ocxo_phase.ocxo2_dac_before);
   p.add("ocxo2_dac_after",         (int32_t)ocxo_phase.ocxo2_dac_after);
 
-  // Shadow-write TDC forensics (v29)
   p.add("ocxo1_phase_isr_dwt",      ocxo_phase.ocxo1_isr_dwt);
   p.add("ocxo1_phase_shadow_dwt",   ocxo_phase.ocxo1_shadow_dwt);
   p.add("ocxo1_phase_edge_dwt",     ocxo_phase.ocxo1_edge_dwt);
@@ -857,26 +765,49 @@ void clocks_beta_pps(void) {
   p.add("dwt_cal_valid",     g_dwt_cal_valid);
   p.add("dwt_cal_pps_count", g_dwt_cal_pps_count);
 
-  // ── TIME_TEST self-audit ──
-  p.add("time_test_valid",            time_test.valid);
-  p.add("time_test_residual_ns",      time_test.residual_ns);
-  p.add("time_test_computed_gnss_ns", time_test.computed_gnss_ns);
-  p.add("time_test_vclock_gnss_ns",   time_test.vclock_gnss_ns);
+  // TIME_TEST — anchored canonical last-capture record
+  p.add("time_test_captured",                time_test.captured);
+  p.add("time_test_valid",                   time_test.valid);
 
-  p.add("time_test_isr_dwt",         time_test.isr_dwt);
-  p.add("time_test_isr_shadow_dwt",  time_test.isr_shadow_dwt);
-  p.add("time_test_isr_delta_cycles", time_test.isr_delta_cycles);
-  p.add("time_test_edge_dwt",        time_test.edge_dwt);
+  p.add("time_test_dwt_valid",               time_test.dwt_valid);
+  p.add("time_test_dwt_at_event",            time_test.dwt_at_event);
 
-  p.add("time_test_vclock_at_fire",   time_test.vclock_at_fire);
-  p.add("time_test_vclock_at_edge", time_test.vclock_at_edge);
-  p.add("time_test_tests_run",       time_test.tests_run);
-  p.add("time_test_tests_valid",     time_test.tests_valid);
-  p.add("time_test_tests_time_invalid", time_test.tests_time_invalid);
+  p.add("time_test_gnss_valid",              time_test.gnss_valid);
+  p.add("time_test_gnss_ns_at_event",        time_test.gnss_ns_at_event);
 
-  p.add("time_test_diag_ticks_since_pps",  time_test.diag_ticks_since_pps);
-  p.add("time_test_diag_anchor_qtimer",    time_test.diag_anchor_qtimer);
-  p.add("time_test_diag_anchor_pps_count", time_test.diag_anchor_pps_count);
+  p.add("time_test_counter32_valid",         time_test.counter32_valid);
+  p.add("time_test_counter32_at_event",      time_test.counter32_at_event);
+
+  p.add("time_test_latency_cycles_used",     time_test.latency_cycles_used);
+
+  p.add("time_test_isr_dwt",                 time_test.isr_dwt);
+  p.add("time_test_raw_counter32_live",      time_test.raw_counter32_live);
+  p.add("time_test_raw_counter16_at_event",  (uint32_t)time_test.raw_counter16_at_event);
+  p.add("time_test_raw_compare16",           (uint32_t)time_test.raw_compare16);
+
+  p.add("time_test_shadow_valid",            time_test.shadow_valid);
+  p.add("time_test_shadow_dwt",              time_test.shadow_dwt);
+  p.add("time_test_delta_cycles",            time_test.delta_cycles);
+
+  p.add("time_test_candidate_counter32_a",   time_test.candidate_counter32_a);
+  p.add("time_test_candidate_counter32_b",   time_test.candidate_counter32_b);
+  p.add("time_test_used_counter32_candidate_b", time_test.used_counter32_candidate_b);
+
+  p.add("time_test_candidate_latency_default_cycles", time_test.candidate_latency_default_cycles);
+  p.add("time_test_candidate_latency_live_cycles",    time_test.candidate_latency_live_cycles);
+  p.add("time_test_used_live_profile",                time_test.used_live_profile);
+  p.add("time_test_used_default_profile",             time_test.used_default_profile);
+
+  p.add("time_test_vclock_gnss_ns",           time_test.vclock_gnss_ns);
+  p.add("time_test_residual_ns",              time_test.residual_ns);
+  p.add("time_test_diag_ticks_since_pps",     time_test.diag_ticks_since_pps);
+  p.add("time_test_diag_anchor_qtimer",       time_test.diag_anchor_qtimer);
+  p.add("time_test_diag_anchor_pps_count",    time_test.diag_anchor_pps_count);
+
+  p.add("time_test_tests_run",                time_test.tests_run);
+  p.add("time_test_tests_valid",              time_test.tests_valid);
+  p.add("time_test_tests_time_invalid",       time_test.tests_time_invalid);
+  p.add("time_test_ch3_isr_fires",            time_test.ch3_isr_fires);
 
   p.add("diag_pps_correct_dwt_ocxo1", diag_pps_correct_dwt_ocxo1);
   p.add("diag_pps_correct_dwt_ocxo2", diag_pps_correct_dwt_ocxo2);
@@ -1024,9 +955,6 @@ static void report_prediction(Payload& p, const char* prefix, const prediction_t
 static Payload cmd_report(const Payload&) {
   Payload p;
 
-  // ─────────────────────────────────────────────
-  // Campaign state
-  // ─────────────────────────────────────────────
   p.add("campaign_state",
     campaign_state == clocks_campaign_state_t::STARTED ? "STARTED" : "STOPPED");
 
@@ -1035,9 +963,6 @@ static Payload cmd_report(const Payload&) {
     p.add("campaign_seconds", campaign_seconds);
   }
 
-  // ─────────────────────────────────────────────
-  // Core clocks (absolute)
-  // ─────────────────────────────────────────────
   const uint64_t dwt_ns   = clocks_dwt_ns_now();
   const uint64_t gnss_ns  = clocks_gnss_ns_now();
   const uint64_t ocxo1_ns = clocks_ocxo1_ns_now();
@@ -1049,29 +974,21 @@ static Payload cmd_report(const Payload&) {
   p.add("ocxo2_ns_now",   ocxo2_ns);
   p.add("gnss_lock",      digitalRead(GNSS_LOCK_PIN));
 
-  // ─────────────────────────────────────────────
-  // Phase detector — THE NEW TRUTH LAYER
-  // ─────────────────────────────────────────────
   p.add("phase_detector_valid", (bool)ocxo_phase.detector_valid);
 
-  // Absolute edge timestamps (GNSS domain)
   p.add("ocxo1_edge_gnss_ns", ocxo_phase.ocxo1_edge_gnss_ns);
   p.add("ocxo2_edge_gnss_ns", ocxo_phase.ocxo2_edge_gnss_ns);
 
-  // Phase offsets (ns within 100 ns window)
   p.add("ocxo1_phase_offset_ns", (int32_t)ocxo_phase.ocxo1_phase_offset_ns);
   p.add("ocxo2_phase_offset_ns", (int32_t)ocxo_phase.ocxo2_phase_offset_ns);
 
-  // Per-second edge deltas
   p.add("ocxo1_gnss_ns_per_pps", ocxo_phase.ocxo1_gnss_ns_per_pps);
   p.add("ocxo2_gnss_ns_per_pps", ocxo_phase.ocxo2_gnss_ns_per_pps);
 
-  // Residuals — THIS IS THE SERVO INPUT
   p.add("ocxo1_residual_ns", ocxo_phase.ocxo1_residual_ns);
   p.add("ocxo2_residual_ns", ocxo_phase.ocxo2_residual_ns);
   p.add("phase_residual_valid", (bool)ocxo_phase.residual_valid);
 
-  // Capture diagnostics (minimal)
   p.add("ocxo1_phase_captured", (bool)ocxo_phase.ocxo1_captured);
   p.add("ocxo2_phase_captured", (bool)ocxo_phase.ocxo2_captured);
   p.add("diag_ocxo1_phase_captures", diag_ocxo1_phase_captures);
@@ -1079,24 +996,15 @@ static Payload cmd_report(const Payload&) {
   p.add("diag_ocxo2_phase_captures", diag_ocxo2_phase_captures);
   p.add("diag_ocxo2_phase_misses",   diag_ocxo2_phase_misses);
 
-  // ─────────────────────────────────────────────
-  // PPS residuals (legacy but useful)
-  // ─────────────────────────────────────────────
   report_residual(p, "dwt",   residual_dwt);
   report_residual(p, "gnss",  residual_gnss);
   report_residual(p, "ocxo1", residual_ocxo1);
   report_residual(p, "ocxo2", residual_ocxo2);
 
-  // ─────────────────────────────────────────────
-  // Prediction (sanity / interpolation health)
-  // ─────────────────────────────────────────────
   report_prediction(p, "dwt",   pred_dwt);
   report_prediction(p, "ocxo1", pred_ocxo1);
   report_prediction(p, "ocxo2", pred_ocxo2);
 
-  // ─────────────────────────────────────────────
-  // DAC / servo state
-  // ─────────────────────────────────────────────
   p.add("ocxo1_dac",    ocxo1_dac.dac_fractional);
   p.add("ocxo2_dac",    ocxo2_dac.dac_fractional);
   p.add("ocxo1_dac_hw", (int32_t)ocxo1_dac.dac_hw_code);
@@ -1110,25 +1018,16 @@ static Payload cmd_report(const Payload&) {
   p.add("ocxo1_servo_last_step", ocxo1_dac.servo_last_step);
   p.add("ocxo2_servo_last_step", ocxo2_dac.servo_last_step);
 
-  // ─────────────────────────────────────────────
-  // Timebase (for cross-domain sanity)
-  // ─────────────────────────────────────────────
   p.add("timebase_valid", timebase_valid());
   p.add("timebase_gnss_ns",  timebase_now_ns(timebase_domain_t::GNSS));
   p.add("timebase_dwt_ns",   timebase_now_ns(timebase_domain_t::DWT));
   p.add("timebase_ocxo1_ns", timebase_now_ns(timebase_domain_t::OCXO1));
   p.add("timebase_ocxo2_ns", timebase_now_ns(timebase_domain_t::OCXO2));
 
-  // ─────────────────────────────────────────────
-  // Calibration
-  // ─────────────────────────────────────────────
   p.add("dwt_cal_valid",     g_dwt_cal_valid);
   p.add("dwt_cal_cycles_per_s", g_dwt_cycles_per_gnss_s);
   p.add("dwt_cal_pps_count", g_dwt_cal_pps_count);
 
-  // ─────────────────────────────────────────────
-  // Watchdog
-  // ─────────────────────────────────────────────
   p.add("watchdog_anomaly_active",  (bool)watchdog_anomaly_active);
   p.add("watchdog_anomaly_pending", (bool)watchdog_anomaly_publish_pending);
   p.add("watchdog_anomaly_sequence", watchdog_anomaly_sequence);
@@ -1138,26 +1037,7 @@ static Payload cmd_report(const Payload&) {
 }
 
 // ============================================================================
-// CLOCKS_INFO — forensic / diagnostic surface
-//
-// Added forensic fields:
-//   - time_pps_count
-//   - gnss_raw_now
-//   - gnss_raw_64
-//   - gnss_ticks_64
-//   - gnss_rolling_raw_64
-//   - gnss_rolling_32
-//   - gnss_raw_since_pps
-//   - isr_snap_*
-//   - isr_prev_*
-//   - isr_residual_valid
-//   - isr_residual_*
-//
-// Notes:
-//   - gnss_raw_now is the instantaneous qtimer1_read_32() raw value
-//   - gnss_raw_64 is the campaign-scoped accumulated raw GNSS count
-//   - gnss_ticks_64 is gnss_raw_64 (10 MHz, no divisor)
-//   - gnss_raw_since_pps is current raw delta from the most recent PPS snapshot
+// CLOCKS_INFO
 // ============================================================================
 
 static Payload cmd_clocks_info(const Payload&) {
@@ -1296,6 +1176,50 @@ static Payload cmd_clocks_info(const Payload&) {
   p.add("qread_last_lo",          diag_qread_last_lo);
   p.add("qread_last_lo2",         diag_qread_last_lo2);
 
+  // TIME_TEST — full anchored canonical record
+  p.add("time_test_captured",                time_test.captured);
+  p.add("time_test_valid",                   time_test.valid);
+
+  p.add("time_test_dwt_valid",               time_test.dwt_valid);
+  p.add("time_test_dwt_at_event",            time_test.dwt_at_event);
+
+  p.add("time_test_gnss_valid",              time_test.gnss_valid);
+  p.add("time_test_gnss_ns_at_event",        time_test.gnss_ns_at_event);
+
+  p.add("time_test_counter32_valid",         time_test.counter32_valid);
+  p.add("time_test_counter32_at_event",      time_test.counter32_at_event);
+
+  p.add("time_test_latency_cycles_used",     time_test.latency_cycles_used);
+
+  p.add("time_test_isr_dwt",                 time_test.isr_dwt);
+  p.add("time_test_raw_counter32_live",      time_test.raw_counter32_live);
+  p.add("time_test_raw_counter16_at_event",  (uint32_t)time_test.raw_counter16_at_event);
+  p.add("time_test_raw_compare16",           (uint32_t)time_test.raw_compare16);
+
+  p.add("time_test_shadow_valid",            time_test.shadow_valid);
+  p.add("time_test_shadow_dwt",              time_test.shadow_dwt);
+  p.add("time_test_delta_cycles",            time_test.delta_cycles);
+
+  p.add("time_test_candidate_counter32_a",   time_test.candidate_counter32_a);
+  p.add("time_test_candidate_counter32_b",   time_test.candidate_counter32_b);
+  p.add("time_test_used_counter32_candidate_b", time_test.used_counter32_candidate_b);
+
+  p.add("time_test_candidate_latency_default_cycles", time_test.candidate_latency_default_cycles);
+  p.add("time_test_candidate_latency_live_cycles",    time_test.candidate_latency_live_cycles);
+  p.add("time_test_used_live_profile",                time_test.used_live_profile);
+  p.add("time_test_used_default_profile",             time_test.used_default_profile);
+
+  p.add("time_test_vclock_gnss_ns",           time_test.vclock_gnss_ns);
+  p.add("time_test_residual_ns",              time_test.residual_ns);
+  p.add("time_test_diag_ticks_since_pps",     time_test.diag_ticks_since_pps);
+  p.add("time_test_diag_anchor_qtimer",       time_test.diag_anchor_qtimer);
+  p.add("time_test_diag_anchor_pps_count",    time_test.diag_anchor_pps_count);
+
+  p.add("time_test_tests_run",                time_test.tests_run);
+  p.add("time_test_tests_valid",              time_test.tests_valid);
+  p.add("time_test_tests_time_invalid",       time_test.tests_time_invalid);
+  p.add("time_test_ch3_isr_fires",            time_test.ch3_isr_fires);
+
   return p;
 }
 
@@ -1353,27 +1277,49 @@ static Payload cmd_phase_info(const Payload&) {
 
 static Payload cmd_time_test(const Payload&) {
   Payload p;
-  p.add("valid",              time_test.valid);
-  p.add("residual_ns",        time_test.residual_ns);
-  p.add("computed_gnss_ns",   time_test.computed_gnss_ns);
-  p.add("vclock_gnss_ns",     time_test.vclock_gnss_ns);
 
-  p.add("isr_dwt",           time_test.isr_dwt);
-  p.add("isr_shadow_dwt",    time_test.isr_shadow_dwt);
-  p.add("isr_delta_cycles",  time_test.isr_delta_cycles);
-  p.add("edge_dwt",          time_test.edge_dwt);
+  p.add("captured",                time_test.captured);
+  p.add("valid",                   time_test.valid);
 
-  p.add("vclock_at_fire",     time_test.vclock_at_fire);
-  p.add("vclock_at_edge",    time_test.vclock_at_edge);
-  p.add("captured",           time_test.captured);
-  p.add("tests_run",         time_test.tests_run);
-  p.add("tests_valid",       time_test.tests_valid);
-  p.add("tests_time_invalid", time_test.tests_time_invalid);
-  p.add("ch3_isr_fires",     time_test.ch3_isr_fires);
+  p.add("dwt_valid",               time_test.dwt_valid);
+  p.add("dwt_at_event",            time_test.dwt_at_event);
 
-  p.add("diag_ticks_since_pps",  time_test.diag_ticks_since_pps);
-  p.add("diag_anchor_qtimer",    time_test.diag_anchor_qtimer);
-  p.add("diag_anchor_pps_count", time_test.diag_anchor_pps_count);
+  p.add("gnss_valid",              time_test.gnss_valid);
+  p.add("gnss_ns_at_event",        time_test.gnss_ns_at_event);
+
+  p.add("counter32_valid",         time_test.counter32_valid);
+  p.add("counter32_at_event",      time_test.counter32_at_event);
+
+  p.add("latency_cycles_used",     time_test.latency_cycles_used);
+
+  p.add("isr_dwt",                 time_test.isr_dwt);
+  p.add("raw_counter32_live",      time_test.raw_counter32_live);
+  p.add("raw_counter16_at_event",  (uint32_t)time_test.raw_counter16_at_event);
+  p.add("raw_compare16",           (uint32_t)time_test.raw_compare16);
+
+  p.add("shadow_valid",            time_test.shadow_valid);
+  p.add("shadow_dwt",              time_test.shadow_dwt);
+  p.add("delta_cycles",            time_test.delta_cycles);
+
+  p.add("candidate_counter32_a",   time_test.candidate_counter32_a);
+  p.add("candidate_counter32_b",   time_test.candidate_counter32_b);
+  p.add("used_counter32_candidate_b", time_test.used_counter32_candidate_b);
+
+  p.add("candidate_latency_default_cycles", time_test.candidate_latency_default_cycles);
+  p.add("candidate_latency_live_cycles",    time_test.candidate_latency_live_cycles);
+  p.add("used_live_profile",                time_test.used_live_profile);
+  p.add("used_default_profile",             time_test.used_default_profile);
+
+  p.add("vclock_gnss_ns",           time_test.vclock_gnss_ns);
+  p.add("residual_ns",              time_test.residual_ns);
+  p.add("diag_ticks_since_pps",     time_test.diag_ticks_since_pps);
+  p.add("diag_anchor_qtimer",       time_test.diag_anchor_qtimer);
+  p.add("diag_anchor_pps_count",    time_test.diag_anchor_pps_count);
+
+  p.add("tests_run",                time_test.tests_run);
+  p.add("tests_valid",              time_test.tests_valid);
+  p.add("tests_time_invalid",       time_test.tests_time_invalid);
+  p.add("ch3_isr_fires",            time_test.ch3_isr_fires);
 
   p.add("diag_pps_correct_dwt_ocxo1", diag_pps_correct_dwt_ocxo1);
   p.add("diag_pps_correct_dwt_ocxo2", diag_pps_correct_dwt_ocxo2);

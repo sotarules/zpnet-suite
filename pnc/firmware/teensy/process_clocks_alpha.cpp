@@ -1,43 +1,6 @@
 // ============================================================================
 // process_clocks_alpha.cpp — Always-On Physics Layer
 // ============================================================================
-//
-// v29: OCXO phase capture — shadow-write TDC architecture.
-//
-//   Replaces the fixed ISR-latency-subtraction model (v28) with the
-//   same shadow-write TDC technique used for PPS edge capture.
-//
-//   The PPS ISR arms GPT1/GPT2 output compares with a generous offset
-//   (OCXO_PHASE_ARM_OFFSET_TICKS) so the compare fires AFTER the ASAP
-//   callback has started its shadow-write loop.  The ASAP callback
-//   spins a tight loop writing DWT_CYCCNT to a shared volatile until
-//   both GPT ISRs have fired (or timeout).
-//
-//   When each GPT ISR fires (priority 0 — no temporal conflict with
-//   PPS because the compare target is well after PPS), it captures
-//   both DWT_CYCCNT and the current shadow value.  The delta
-//   (isr_dwt - shadow_dwt) provides per-sample ISR latency
-//   characterization, enabling cycle-accurate TDC correction.
-//
-//   The arming MUST happen in pps_isr (not the ASAP callback) because
-//   the OCXO counters advance continuously — by the time the ASAP
-//   callback runs, snap_ocxo + 50 may already be in the past.
-//   The larger offset (150 ticks = 15 µs) ensures the compare fires
-//   after the ASAP callback has started the shadow loop (~2-3 µs
-//   after PPS).
-//
-// v26: OCXO phase-first capture.
-// v24: OCXO phase capture — DWT-interpolated edge timing.
-// v23: 10 MHz single-edge QTimer1 migration.
-// v22: WATCHDOG_ANOMALY stop-and-yield architecture.
-// v21: QTimer1 torn-read prevention.
-// v19: Shadow-loop timeout protection + consistent timeout naming.
-// v18: Spin Capture with shadow-write loop — TDC at 1008 MHz.
-// v16: PPS watchdog — self-healing pps_scheduled stall.
-// v15: DAC dither telemetry + random walk prediction model.
-// v14: Symmetric GPT architecture for both OCXOs.
-//
-// ============================================================================
 
 #include "tdc_correction.h"
 
@@ -68,40 +31,13 @@
 // ============================================================================
 
 static constexpr int64_t SPIN_EARLY_NS = 10000LL;
-
-// ============================================================================
-// TimePop delay constants (nanoseconds)
-// ============================================================================
-
-static constexpr uint64_t PPS_RELAY_OFF_NS  =   500000000ULL;
-
-// ============================================================================
-// PPS watchdog — anomaly thresholds
-// ============================================================================
+static constexpr uint64_t PPS_RELAY_OFF_NS  = 500000000ULL;
 
 static constexpr uint32_t PPS_WATCHDOG_THRESHOLD = 3;
-
-// ============================================================================
-// PPS rejection watchdog — consecutive rejection anomaly threshold
-// ============================================================================
-
 static constexpr uint32_t PPS_REJECT_RECOVERY_THRESHOLD = 10;
 
-// ============================================================================
-// Spin capture timeout — shadow-write loop safety net
-// ============================================================================
-
 static constexpr uint32_t SPIN_LOOP_TIMEOUT_CYCLES = 100800;
-
-// ============================================================================
-// OCXO phase capture — shadow-write spin timeout
-// ============================================================================
-
 static constexpr uint32_t OCXO_PHASE_SPIN_TIMEOUT_CYCLES = 50400;
-
-// ============================================================================
-// TIME_TEST — random-delay VCLOCK edge capture for time audit
-// ============================================================================
 
 static constexpr uint64_t TIME_TEST_DELAY_MIN_NS = 100000000ULL;
 static constexpr uint64_t TIME_TEST_DELAY_MAX_NS = 900000000ULL;
@@ -193,34 +129,71 @@ static void pps_spin_callback(timepop_ctx_t* ctx, void*) {
 
 static void time_test_raw_capture(interrupt_capture_raw_t& out_raw) {
   const uint32_t dwt_raw   = DWT_CYCCNT;
-  const uint32_t shadow    = time_test_shadow_dwt;
   const uint32_t vclock_32 = qtimer1_read_32();
+  const uint16_t edge_lo   = IMXRT_TMR1.CH[3].COMP1;
 
-  const uint16_t edge_lo = IMXRT_TMR1.CH[3].COMP1;
+  IMXRT_TMR1.CH[3].CSCTRL = 0;
 
-  IMXRT_TMR1.CH[3].CSCTRL  = 0;
-
-  out_raw.dwt_isr_entry = dwt_raw;
+  out_raw.dwt_isr_entry     = dwt_raw;
   out_raw.counter16_at_event = edge_lo;
-  out_raw.compare16 = edge_lo;
-  out_raw.counter32_live = vclock_32;
-  out_raw.qtimer32_live = vclock_32;
-  out_raw.irq_status = 0;
+  out_raw.compare16         = edge_lo;
+  out_raw.counter32_live    = vclock_32;
+  out_raw.qtimer32_live     = vclock_32;
+  out_raw.irq_status        = 0;
   out_raw.irq_flags_cleared = 1u;
-
-  time_test.isr_shadow_dwt = shadow;
 }
 
 static void time_test_event_callback(const interrupt_capture_event_t& event,
-                                     const interrupt_capture_diag_t*) {
-  time_test.isr_dwt        = event.raw.dwt_isr_entry;
-  time_test.vclock_at_fire = event.raw.qtimer32_live;
-  time_test.vclock_at_edge = event.counter32_valid ? event.counter32_at_event : 0;
-  time_test.edge_dwt       = event.dwt_at_event;
-  time_test.computed_gnss_ns = event.gnss_valid ? (int64_t)event.gnss_ns_at_event : -1;
-  time_test.isr_delta_cycles = event.raw.dwt_isr_entry - time_test.isr_shadow_dwt;
-  time_test.captured = true;
+                                     const interrupt_capture_diag_t* diag) {
+  time_test.captured           = true;
+  time_test.valid              = false;
+
+  time_test.dwt_at_event       = event.dwt_at_event;
+  time_test.dwt_valid          = event.dwt_valid;
+  time_test.gnss_ns_at_event   = event.gnss_ns_at_event;
+  time_test.gnss_valid         = event.gnss_valid;
+  time_test.counter32_at_event = event.counter32_at_event;
+  time_test.counter32_valid    = event.counter32_valid;
+  time_test.latency_cycles_used = event.latency_cycles_used;
+
+  time_test.isr_dwt            = event.raw.dwt_isr_entry;
+  time_test.raw_counter32_live = event.raw.counter32_live;
+  time_test.raw_counter16_at_event = event.raw.counter16_at_event;
+  time_test.raw_compare16      = event.raw.compare16;
+
+  if (diag) {
+    time_test.shadow_valid = diag->shadow_valid;
+    time_test.shadow_dwt   = diag->shadow_dwt;
+    time_test.delta_cycles = diag->delta_cycles;
+
+    time_test.candidate_counter32_a = diag->candidate_counter32_a;
+    time_test.candidate_counter32_b = diag->candidate_counter32_b;
+    time_test.used_counter32_candidate_b = diag->used_counter32_candidate_b;
+
+    time_test.candidate_latency_default_cycles = diag->candidate_latency_default_cycles;
+    time_test.candidate_latency_live_cycles    = diag->candidate_latency_live_cycles;
+    time_test.used_live_profile                = diag->used_live_profile;
+    time_test.used_default_profile             = diag->used_default_profile;
+  } else {
+    time_test.shadow_valid = false;
+    time_test.shadow_dwt   = 0;
+    time_test.delta_cycles = 0;
+
+    time_test.candidate_counter32_a = 0;
+    time_test.candidate_counter32_b = 0;
+    time_test.used_counter32_candidate_b = false;
+
+    time_test.candidate_latency_default_cycles = 0;
+    time_test.candidate_latency_live_cycles    = 0;
+    time_test.used_live_profile                = false;
+    time_test.used_default_profile             = false;
+  }
+
   time_test.ch3_isr_fires++;
+}
+
+void time_test_ch3_isr(void) {
+  g_time_test_capture.handle_interrupt();
 }
 
 // ============================================================================
@@ -258,7 +231,7 @@ static void time_test_callback(timepop_ctx_t*, void*) {
   g_time_test_capture.disarm();
 
   if (!time_test.captured) return;
-  if (time_test.computed_gnss_ns < 0) {
+  if (!time_test.dwt_valid || !time_test.gnss_valid || !time_test.counter32_valid) {
     time_test.valid = false;
     time_test.tests_time_invalid++;
     return;
@@ -272,13 +245,14 @@ static void time_test_callback(timepop_ctx_t*, void*) {
 
   time_test.diag_anchor_qtimer    = snap.qtimer_at_pps;
   time_test.diag_anchor_pps_count = snap.pps_count;
-  time_test.diag_ticks_since_pps  = time_test.vclock_at_edge - snap.qtimer_at_pps;
+  time_test.diag_ticks_since_pps  = time_test.counter32_at_event - snap.qtimer_at_pps;
 
-  uint32_t ticks_since_pps = time_test.vclock_at_edge - snap.qtimer_at_pps;
-  int64_t pps_gnss_ns = (int64_t)(snap.pps_count - 1) * 1000000000LL;
+  const uint32_t ticks_since_pps = time_test.counter32_at_event - snap.qtimer_at_pps;
+  const int64_t pps_gnss_ns = (int64_t)(snap.pps_count - 1) * 1000000000LL;
+
   time_test.vclock_gnss_ns = pps_gnss_ns + (int64_t)ticks_since_pps * 100LL;
+  time_test.residual_ns = (int32_t)((int64_t)time_test.gnss_ns_at_event - time_test.vclock_gnss_ns);
 
-  time_test.residual_ns = (int32_t)(time_test.computed_gnss_ns - time_test.vclock_gnss_ns);
   time_test.valid = true;
   time_test.tests_valid++;
 }
@@ -513,10 +487,6 @@ ocxo_phase_capture_t ocxo_phase = {};
 
 volatile uint32_t diag_gpt1_isr_fires = 0;
 volatile uint32_t diag_gpt2_isr_fires = 0;
-
-void time_test_ch3_isr(void) {
-  g_time_test_capture.handle_interrupt();
-}
 
 // ============================================================================
 // GPT1 output-compare ISR — OCXO1 edge capture

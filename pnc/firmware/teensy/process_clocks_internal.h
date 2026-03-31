@@ -108,20 +108,10 @@ extern volatile bool     isr_residual_valid;
 
 static constexpr uint32_t ISR_DWT_EXPECTED  = DWT_EXPECTED_PER_PPS;
 
-// v23: GNSS QTimer1 now counts rising edges only — 10 MHz.
-// Previously dual-edge (20 MHz) with GNSS_EDGE_DIVISOR = 2.
 static constexpr uint32_t ISR_GNSS_RAW_EXPECTED = TICKS_10MHZ_PER_SECOND;
-
-// Both OCXOs: GPT single-edge — 10 MHz expected
 static constexpr uint32_t ISR_OCXO1_EXPECTED = TICKS_10MHZ_PER_SECOND;
 static constexpr uint32_t ISR_OCXO2_EXPECTED = TICKS_10MHZ_PER_SECOND;
 
-// Ticks ahead of PPS snapshot to arm GPT output compare.
-// Armed in pps_isr; must be large enough that the compare fires
-// AFTER the ASAP callback has started its shadow-write loop.
-// At 10 MHz, 150 ticks = 15 µs.  The ASAP callback starts ~2-3 µs
-// after PPS and reaches the shadow loop within ~1 µs, so 15 µs
-// provides comfortable margin.
 static constexpr uint32_t OCXO_PHASE_ARM_OFFSET_TICKS = 150;
 
 // ============================================================================
@@ -141,12 +131,10 @@ extern volatile uint32_t diag_pps_asap_dispatched;
 extern volatile uint32_t diag_pps_stuck_since_dwt;
 extern volatile uint32_t diag_pps_stuck_max;
 
-// ── PPS rejection recovery diagnostics (v20) ──
 extern volatile uint32_t diag_pps_reject_consecutive;
 extern volatile uint32_t diag_pps_reject_recoveries;
 extern volatile uint32_t diag_pps_reject_max_run;
 
-// Diagnostics for PPS ISR
 extern volatile uint32_t diag_pps_correct_dwt_ocxo1;
 extern volatile uint32_t diag_pps_correct_dwt_ocxo2;
 extern volatile uint32_t diag_pps_correct_dwt_gnss;
@@ -170,7 +158,6 @@ extern volatile uint32_t diag_qread_last_lo2;
 
 extern volatile bool pps_fired;
 
-// ── Phase capture diagnostics (alpha-owned, beta-readable) ──
 extern volatile uint32_t diag_ocxo1_phase_captures;
 extern volatile uint32_t diag_ocxo2_phase_captures;
 extern volatile uint32_t diag_ocxo1_phase_misses;
@@ -182,10 +169,10 @@ extern volatile uint32_t diag_ocxo_phase_spin_timeouts;
 // ============================================================================
 
 struct ocxo_dac_state_t {
-  double   dac_fractional;      // servo works in double, truncated to uint16_t at I2C write
-  uint16_t dac_hw_code;         // actual integer code last written to AD5693R
-  uint32_t dac_min;             // 0
-  uint32_t dac_max;             // 65535
+  double   dac_fractional;
+  uint16_t dac_hw_code;
+  uint32_t dac_min;
+  uint32_t dac_max;
   double   servo_last_step;
   double   servo_last_residual;
   uint32_t servo_settle_count;
@@ -197,11 +184,6 @@ extern ocxo_dac_state_t ocxo2_dac;
 
 // ============================================================================
 // OCXO servo mode — campaign-level calibration strategy
-//
-//   OFF:   servo disabled
-//   MEAN:  target Welford mean residual → 0 (instantaneous PPB)
-//   TOTAL: target cumulative tick deficit → 0 (tau → 1.0)
-//   NOW:   phase-capture per-second residual → 0 (~3 ns resolution)
 // ============================================================================
 
 enum class servo_mode_t : uint8_t {
@@ -213,10 +195,7 @@ enum class servo_mode_t : uint8_t {
 
 extern servo_mode_t calibrate_ocxo_mode;
 
-// Helper: returns the mode as a string for telemetry ("OFF", "MEAN", "TOTAL", "NOW")
 const char* servo_mode_str(servo_mode_t mode);
-
-// Helper: parse from command arg string; returns OFF if unrecognized
 servo_mode_t servo_mode_parse(const char* s);
 
 static constexpr int32_t  SERVO_MAX_STEP       = 64;
@@ -302,11 +281,6 @@ double prediction_stderr(const prediction_tracker_t& p);
 
 // ============================================================================
 // DAC Welford tracking — campaign-scoped cumulative statistics
-//
-// Tracks the servo's DAC output value (dac_fractional) every PPS second.
-// The mean is the true campaign mean — no windowing, no decay.
-// Used by the TEMPEST DAC test to detect environmental drift via
-// correlated DAC mean shifts across campaigns.
 // ============================================================================
 
 struct dac_welford_t {
@@ -327,40 +301,27 @@ double dac_welford_stderr(const dac_welford_t& w);
 
 // ============================================================================
 // Spin Capture — nano-precise DWT anchoring with shadow-write TDC
-//
-// Two distinct timeout failure modes:
-//
-//   1. Nano-spin timeout: TimePop's DWT spin exceeded its budget.
-//      Fields: nano_timed_out (this cycle), nano_timeouts (lifetime count).
-//
-//   2. Shadow-loop timeout: shadow-write loop exceeded SPIN_LOOP_TIMEOUT_CYCLES.
-//      Fields: shadow_timed_out (this cycle), shadow_timeouts (lifetime).
-//
 // ============================================================================
 
 struct spin_capture_t {
-  // ── Set by the arming code (scheduled context) ──
   uint32_t         target_dwt;
   int64_t          target_gnss_ns;
   bool             armed;
   timepop_handle_t handle;
 
-  // ── Set by the nano-spin callback (ISR context) ──
   uint32_t landed_dwt;
   int64_t  landed_gnss_ns;
   int32_t  spin_error;
-  uint32_t shadow_dwt;          // forensic only
+  uint32_t shadow_dwt;
   bool     completed;
   bool     nano_timed_out;
   bool     shadow_timed_out;
 
-  // ── Set by the edge handler (scheduled context) ──
   uint32_t isr_dwt;
   int32_t  approach_cycles;
-  uint32_t edge_dwt;            // canonical PPS edge DWT
+  uint32_t edge_dwt;
   bool     valid;
 
-  // ── Diagnostics (monotonic, never reset) ──
   uint32_t arms;
   uint32_t arm_failures;
   uint32_t completions;
@@ -372,58 +333,38 @@ struct spin_capture_t {
 extern spin_capture_t pps_spin;
 
 // ============================================================================
-// OCXO phase capture — v29 shadow-write TDC architecture
-//
-// Each GPT fires a one-shot output-compare ISR on the first OCXO
-// edge after PPS.  The ISR captures DWT_CYCCNT and the current shadow
-// DWT from the ASAP callback's shadow-write loop.  The delta
-// (isr_dwt - shadow_dwt) provides per-sample ISR latency for TDC
-// correction, identical to the PPS spin capture mechanism.
-//
-// Beta converts the shadow-corrected DWT capture into canonical
-// PPS-anchored GNSS nanoseconds, derives phase offset in [0,100), and
-// computes the authoritative per-second residual from consecutive edge
-// timestamps.
-//
-// Diagnostic fields (isr_dwt, shadow_dwt, delta_cycles, gpt_at_fire)
-// enable ISR latency histogram analysis via gpt_phase_tdc analyzer.
+// OCXO phase capture
 // ============================================================================
 
 struct ocxo_phase_capture_t {
-  // ── PPS anchor ──
-  uint32_t dwt_at_pps;               // best-available DWT at PPS edge
+  uint32_t dwt_at_pps;
 
-  // ── OCXO1 capture ──
-  uint32_t ocxo1_isr_dwt;            // raw DWT_CYCCNT from GPT1 ISR
-  uint32_t ocxo1_shadow_dwt;         // shadow DWT captured by GPT1 ISR (forensic)
-  uint32_t ocxo1_edge_dwt;           // canonical OCXO1 edge DWT
-  uint32_t ocxo1_gpt_at_fire;        // GPT1_CNT at ISR entry (diagnostic)
+  uint32_t ocxo1_isr_dwt;
+  uint32_t ocxo1_shadow_dwt;
+  uint32_t ocxo1_edge_dwt;
+  uint32_t ocxo1_gpt_at_fire;
   uint32_t ocxo1_dwt_elapsed = 0;
   uint32_t ocxo1_elapsed_ns = 0;
   uint32_t ocxo1_phase_offset_ns;
   bool     ocxo1_captured;
   bool     ocxo1_valid;
 
-  // ── OCXO2 capture ──
-  uint32_t ocxo2_isr_dwt;            // raw DWT_CYCCNT from GPT2 ISR
-  uint32_t ocxo2_shadow_dwt;         // shadow DWT captured by GPT2 ISR (forensic)
-  uint32_t ocxo2_edge_dwt;           // canonical OCXO2 edge DWT
-  uint32_t ocxo2_gpt_at_fire;        // GPT2_CNT at ISR entry (diagnostic)
+  uint32_t ocxo2_isr_dwt;
+  uint32_t ocxo2_shadow_dwt;
+  uint32_t ocxo2_edge_dwt;
+  uint32_t ocxo2_gpt_at_fire;
   uint32_t ocxo2_dwt_elapsed = 0;
   uint32_t ocxo2_elapsed_ns = 0;
   uint32_t ocxo2_phase_offset_ns;
   bool     ocxo2_captured;
   bool     ocxo2_valid;
 
-  // ── Combined validity ──
   bool     detector_valid;
 
-  // ── Canonical absolute edge timestamps (beta-owned) ──
   uint64_t pps_gnss_ns;
   uint64_t ocxo1_edge_gnss_ns;
   uint64_t ocxo2_edge_gnss_ns;
 
-  // ── Per-second differencing (beta-owned) ──
   uint64_t prev_ocxo1_edge_gnss_ns;
   uint64_t prev_ocxo2_edge_gnss_ns;
   int64_t  ocxo1_gnss_ns_per_pps;
@@ -432,7 +373,6 @@ struct ocxo_phase_capture_t {
   int64_t  ocxo2_residual_ns;
   bool     residual_valid;
 
-  // ── Servo before/after snapshot (beta-owned) ──
   uint16_t ocxo1_dac_before;
   uint16_t ocxo1_dac_after;
   uint16_t ocxo2_dac_before;
@@ -441,7 +381,6 @@ struct ocxo_phase_capture_t {
 
 extern ocxo_phase_capture_t ocxo_phase;
 
-// ── GPT ISR capture state (alpha-owned, read by pps_asap_callback) ──
 extern volatile uint32_t ocxo_phase_shadow_dwt;
 extern volatile uint32_t ocxo1_phase_isr_dwt;
 extern volatile uint32_t ocxo1_phase_shadow_dwt;
@@ -453,47 +392,63 @@ extern volatile bool     ocxo2_phase_captured;
 extern volatile uint32_t ocxo2_phase_gpt_at_fire;
 
 // ============================================================================
-// TIME_TEST — continuous self-audit of time_dwt_to_gnss_ns()
-//
-// Every second, alpha schedules a TimePop at a random delay within the
-// upcoming PPS second.  When it fires (scheduled context), it arms
-// QTimer1 CH3 to compare on the next VCLOCK edge.  CH3's ISR (priority
-// 16 via IRQ_QTIMER1) now delegates normalized capture through the
-// generalized interrupt capture engine.
-//
-// Alpha still owns the recurring schedule and ground-truth comparison;
-// the engine owns event-time normalization.
-//
+// TIME_TEST — anchored last-capture diagnostics
 // ============================================================================
 
 struct time_test_capture_t {
-  volatile uint32_t isr_dwt;
-  volatile uint32_t isr_shadow_dwt;
-  volatile uint32_t vclock_at_fire;
-  volatile uint32_t vclock_at_edge;
-  volatile bool     captured;
-
-  uint32_t edge_dwt;
-  uint32_t isr_delta_cycles;
-
-  int64_t  computed_gnss_ns;
-  int64_t  vclock_gnss_ns;
-  int32_t  residual_ns;
+  // Normalized canonical outputs
+  bool     captured;
   bool     valid;
 
+  uint32_t dwt_at_event;
+  bool     dwt_valid;
+
+  uint64_t gnss_ns_at_event;
+  bool     gnss_valid;
+
+  uint32_t counter32_at_event;
+  bool     counter32_valid;
+
+  uint32_t latency_cycles_used;
+
+  // Raw capture facts
+  uint32_t isr_dwt;
+  uint32_t raw_counter32_live;
+  uint16_t raw_counter16_at_event;
+  uint16_t raw_compare16;
+
+  // Generalized latency diagnostics
+  bool     shadow_valid;
+  uint32_t shadow_dwt;
+  uint32_t delta_cycles;
+
+  // Counter reconstruction diagnostics
+  uint32_t candidate_counter32_a;
+  uint32_t candidate_counter32_b;
+  bool     used_counter32_candidate_b;
+
+  // Latency selection diagnostics
+  uint32_t candidate_latency_default_cycles;
+  uint32_t candidate_latency_live_cycles;
+  bool     used_live_profile;
+  bool     used_default_profile;
+
+  // TIME_TEST-specific derived ground truth
+  int64_t  vclock_gnss_ns;
+  int32_t  residual_ns;
+  uint32_t diag_ticks_since_pps;
+  uint32_t diag_anchor_qtimer;
+  uint32_t diag_anchor_pps_count;
+
+  // Lifetime counters
   volatile uint32_t tests_run;
   volatile uint32_t tests_valid;
   volatile uint32_t tests_time_invalid;
   volatile uint32_t ch3_isr_fires;
-
-  volatile uint32_t diag_ticks_since_pps;
-  volatile uint32_t diag_anchor_qtimer;
-  volatile uint32_t diag_anchor_pps_count;
 };
 
 extern time_test_capture_t time_test;
 
-// CH3 ISR — called from qtimer1_irq_isr in process_timepop.cpp
 void time_test_ch3_isr(void);
 
 // ============================================================================
@@ -512,7 +467,6 @@ extern uint32_t prev_ocxo2_at_pps;
 extern uint64_t gnss_raw_64;
 extern uint32_t prev_gnss_at_pps;
 
-// v23: gnss_raw_64 IS 10 MHz ticks — no divisor needed.
 inline uint64_t gnss_ticks_64_get(void) {
   return gnss_raw_64;
 }
@@ -594,7 +548,7 @@ static inline bool ocxo_edge_dwt_to_gnss_ns(
 }
 
 // ============================================================================
-// Beta entry points — called from alpha / commands
+// Beta entry points
 // ============================================================================
 
 void clocks_beta_pps(void);
@@ -605,7 +559,7 @@ void clocks_watchdog_anomaly(const char* reason,
                              uint32_t detail3 = 0);
 
 // ============================================================================
-// Zeroing (called by beta campaign commands, reads alpha ISR state)
+// Zeroing
 // ============================================================================
 
 void clocks_zero_all(void);

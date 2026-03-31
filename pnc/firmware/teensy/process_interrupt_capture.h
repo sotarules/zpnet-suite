@@ -105,6 +105,10 @@ struct interrupt_capture_latency_t {
 struct interrupt_capture_diag_t {
   bool enabled = false;
 
+  uint32_t shadow_dwt = 0;
+  bool     shadow_valid = false;
+  uint32_t delta_cycles = 0;
+
   uint32_t dwt_isr_entry = 0;
   uint32_t dwt_before_capture = 0;
   uint32_t dwt_after_capture = 0;
