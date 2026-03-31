@@ -1170,9 +1170,19 @@ def on_timebase_fragment(payload: Payload) -> None:
     frag = payload
 
     # --- Extract pps_count ---
-    teensy_pps_count_raw = frag.get("teensy_pps_count")
+    teensy_pps_count_raw = (
+        frag.get("teensy_pps_count")
+        if frag.get("teensy_pps_count") is not None
+        else frag.get("pps_count")
+    )
+
     if teensy_pps_count_raw is None:
         _diag["fragments_missing_teensy_pps_count"] += 1
+        logging.error(
+            "💥 [clocks] TIMEBASE_FRAGMENT missing pps count fields; keys=%s payload=%s",
+            sorted(list(frag.keys())),
+            frag,
+        )
         return
 
     try:

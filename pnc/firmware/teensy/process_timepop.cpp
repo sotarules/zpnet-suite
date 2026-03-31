@@ -1,31 +1,11 @@
 // ============================================================================
 // process_timepop.cpp — TimePop v8.1 (ISR Callback Facility)
 // ============================================================================
-//
-// v8.1: ISR callback facility for timepop_arm_ns.
-//
-//   Slots armed with isr_callback=true have their callback invoked
-//   directly in the CH2 ISR after the DWT spin lands.  This enables
-//   time-critical patterns like the PPS shadow-write loop, where the
-//   callback must be actively executing when an external interrupt
-//   (PPS) arrives.
-//
-//   All other slots continue through scheduled dispatch as in v8.0.
-//   Welford residual updates run in dispatch for both paths.
-//
-// v8.0: Priority queue with a single hardware comparator.
-//   [See full v8.0 changelog in git history]
-//
-//   Pin assignment:
-//     Pin 10 (GPIO_B0_00, ALT1) — QTimer1 CH0+CH1 — passive 32-bit (10 MHz)
-//     QTimer1 CH2              — dynamic compare (priority queue scheduler)
-//     QTimer1 CH3              — unallocated
-//
-// ============================================================================
 
 #include "timepop.h"
 #include "process_timepop.h"
 #include "process_clocks_internal.h"
+#include "process_interrupt.h"
 
 #include "publish.h"
 
@@ -124,7 +104,6 @@ struct timepop_slot_t {
   uint32_t            predicted_dwt;
   bool                prediction_valid;
 
-  // v8.1: ISR callback
   bool                isr_callback;
   bool                isr_callback_fired;
 
@@ -345,7 +324,6 @@ static void qtimer1_ch2_isr(void) {
     if (!slots[i].active || slots[i].expired) continue;
     if (!deadline_expired(slots[i].deadline, now)) continue;
 
-    // ── DWT fire moment determination ──
     uint32_t landed_dwt;
 
     if (slots[i].prediction_valid) {
@@ -367,7 +345,6 @@ static void qtimer1_ch2_isr(void) {
     slots[i].fire_gnss_ns = time_dwt_to_gnss_ns(landed_dwt);
     slot_capture(slots[i], now, landed_dwt, anchor);
 
-    // ── v8.1: ISR callback invocation ──
     slots[i].isr_callback_fired = false;
 
     if (slots[i].isr_callback) {
@@ -649,7 +626,6 @@ void timepop_dispatch(void) {
     if (!slots[i].active || !slots[i].expired) continue;
     slots[i].expired = false;
 
-    // ── ASAP ──
     if (slots[i].period_ns == 0 && !slots[i].recurring &&
         !slots[i].isr_callback_fired) {
 
@@ -670,14 +646,12 @@ void timepop_dispatch(void) {
       continue;
     }
 
-    // ── ISR-callback slot: callback already ran ──
     if (slots[i].isr_callback_fired) {
       slot_welford_update(slots[i]);
       slots[i].active = false;
       continue;
     }
 
-    // ── Timed (scheduled context callback) ──
     timepop_ctx_t ctx;
     slot_build_ctx(slots[i], ctx);
 
@@ -999,16 +973,11 @@ static Payload cmd_diag_reset(const Payload&) {
 // ============================================================================
 
 static void qtimer1_irq_isr(void) {
-  // CH3 — TIME_TEST edge capture (one-shot, only when armed).
-  // CH3 is stopped (CM=0) between tests, so TCF1 is only set
-  // when actively armed.  Check both flag and enable as safety.
-  {
-    const uint16_t cs3 = IMXRT_TMR1.CH[3].CSCTRL;
-    if ((cs3 & TMR_CSCTRL_TCF1) && (cs3 & TMR_CSCTRL_TCF1EN)) {
-      time_test_ch3_isr();
-    }
-  }
+  // First let shared interrupt-capture authority service its registered
+  // compare clients (e.g. TIME_TEST / future capture handlers).
+  process_interrupt_qtimer1_irq();
 
+  // Then let TimePop service CH2 as before.
   if (IMXRT_TMR1.CH[2].CSCTRL & TMR_CSCTRL_TCF1) {
     qtimer1_ch2_isr();
   }

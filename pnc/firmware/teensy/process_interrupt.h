@@ -1,38 +1,37 @@
 #pragma once
 
 // ============================================================================
-// process_interrupt_capture.h
+// process_interrupt.h
 // ============================================================================
 //
-// Generalized interrupt-time capture engine for timing-sensitive paths.
+// Shared interrupt-capture authority + declarative handler framework.
 //
-// This module normalizes timing truth in ISR context so callers do not need to
-// reconstruct it later from scattered snapshots and post-hoc correction.
+// This subsystem now owns:
 //
-// Canonical outputs per event:
-//   - dwt_at_event        : best reconstructed DWT cycle count at the event edge
-//   - gnss_ns_at_event    : best reconstructed GNSS nanosecond time at the event
-//   - counter32_at_event  : source-domain 32-bit event-aligned counter when valid
-//   - optional diagnostics: derivation/provenance used to produce the above
+//   1. Shared hardware IRQ authority for supported domains
+//   2. Declarative handler registration via declareInterruptHandler()
+//   3. Deterministic pre-spin scheduling via TimePop
+//   4. ISR-time normalization into canonical timing truth
+//   5. Process-facing diagnostics / REPORT surface
 //
-// Public abstraction boundary:
-//   Callers configure a capture class (GPIO edge, QTimer compare, GPT1 compare,
-//   GPT2 compare), arm targets where applicable, run the deterministic pre-spin,
-//   and consume normalized ISR-context callbacks.
+// Public usage pattern:
 //
-// The caller does NOT perform:
-//   - low/high-word reconstruction for event counters
-//   - ISR-latency correction
-//   - DWT-at-edge reconstruction
-//   - GNSS-at-edge projection
+//   process_interrupt_init();   // once at system init (e.g. teensy.cpp)
 //
-// Those all live here.
+//   interrupt_capture_handler_registration_t reg = {};
+//   reg.cfg = ...;
+//   declareInterruptHandler(reg);
+//
+// The user describes the interrupt in abstract terms. The subsystem owns
+// hardware registration, IRQ dispatch, pre-spin scheduling, and ISR-time
+// normalization.
 // ============================================================================
 
 #include <stdint.h>
 #include <stdbool.h>
 
 #include "process_clocks_internal.h"
+#include "timepop.h"
 
 // ============================================================================
 // Public enums
@@ -56,6 +55,14 @@ enum class interrupt_capture_rearm_mode_t : uint8_t {
   ONE_SHOT,
   PERIODIC,
   CALLBACK_DRIVEN,
+};
+
+enum class interrupt_capture_hw_domain_t : uint8_t {
+  NONE = 0,
+  QTIMER1,
+  GPT1,
+  GPT2,
+  GPIO6789,
 };
 
 // ============================================================================
@@ -170,7 +177,8 @@ struct interrupt_capture_rearm_decision_t {
 // ============================================================================
 
 using interrupt_capture_raw_fn =
-    void (*)(interrupt_capture_raw_t& out_raw);
+    void (*)(interrupt_capture_raw_t& out_raw,
+             interrupt_capture_diag_t* diag);
 
 using interrupt_capture_counter32_fn =
     uint32_t (*)(const interrupt_capture_raw_t& raw,
@@ -194,12 +202,17 @@ using interrupt_capture_rearm_fn =
     interrupt_capture_rearm_decision_t (*)(const interrupt_capture_event_t& event,
                                            const interrupt_capture_diag_t* diag);
 
-using interrupt_capture_spin_window_fn =
-    bool (*)(uint64_t now_gnss_ns,
-             uint64_t target_gnss_ns);
+using interrupt_capture_next_spin_delay_fn =
+    int64_t (*)(void* user_data,
+                const interrupt_capture_event_t* last_event,
+                const interrupt_capture_diag_t* last_diag);
+
+using interrupt_capture_arm_target_fn =
+    bool (*)(void* user_data,
+             uint32_t* out_counter32_target);
 
 // ============================================================================
-// User config
+// Declarative handler config
 // ============================================================================
 
 struct interrupt_capture_config_t {
@@ -215,26 +228,47 @@ struct interrupt_capture_config_t {
   interrupt_capture_gnss_fn gnss_at_event_fn = nullptr;
   interrupt_capture_callback_fn callback_fn = nullptr;
   interrupt_capture_rearm_fn rearm_fn = nullptr;
-  interrupt_capture_spin_window_fn spin_window_start_fn = nullptr;
+
+  // New abstraction: the caller forecasts when the next spin cycle begins.
+  // Return GNSS nanoseconds from NOW until the pre-spin should start.
+  // Return < 0 to suppress scheduling.
+  interrupt_capture_next_spin_delay_fn next_spin_delay_fn = nullptr;
+
+  // For timer-based handlers only: arm the underlying timer target.
+  // Return false if no target could be armed.
+  interrupt_capture_arm_target_fn arm_target_fn = nullptr;
+
+  void* user_data = nullptr;
 };
 
 // ============================================================================
-// Engine class
+// Runtime engine
 // ============================================================================
 
 class interrupt_capture_engine_t {
 public:
   explicit interrupt_capture_engine_t(const interrupt_capture_config_t& cfg);
 
-  void arm(uint64_t target_gnss_ns, uint32_t counter32_target = 0);
-  void disarm();
-  bool armed() const;
+  void start();
+  void stop();
 
-  void spin_step();
+  bool active() const;
+  bool waiting_for_interrupt() const;
+
+  void schedule_next_spin(const interrupt_capture_event_t* last_event,
+                          const interrupt_capture_diag_t* last_diag);
+
+  void run_spin_step();
   void handle_interrupt();
 
   const interrupt_capture_config_t& config() const;
   const interrupt_capture_latency_t& latency() const;
+
+  // Shared-authority dispatch helpers
+  bool matches_qtimer1_irq() const;
+  bool matches_gpt1_irq() const;
+  bool matches_gpt2_irq() const;
+  bool matches_gpio6789_irq() const;
 
 private:
   uint32_t choose_entry_latency_cycles(const interrupt_capture_raw_t& raw,
@@ -243,21 +277,48 @@ private:
   void rearm_from_isr(const interrupt_capture_event_t& event,
                       const interrupt_capture_diag_t* diag);
 
+  void on_spin_timepop();
+  static void spin_timepop_callback(timepop_ctx_t* ctx, void* user_data);
+
 private:
   interrupt_capture_config_t cfg_ {};
   interrupt_capture_latency_t latency_ {};
 
-  bool armed_ = false;
-  uint64_t next_target_gnss_ns_ = 0;
-  uint32_t next_counter32_target_ = 0;
+  bool active_ = false;
+  bool waiting_for_interrupt_ = false;
+  uint32_t armed_counter32_target_ = 0;
+  timepop_handle_t spin_handle_ = TIMEPOP_INVALID_HANDLE;
 };
 
 // ============================================================================
-// Helper functions / default policies
+// Registration object
 // ============================================================================
 
-bool interrupt_capture_default_spin_window(uint64_t now_gnss_ns,
-                                           uint64_t target_gnss_ns);
+struct interrupt_capture_handler_registration_t {
+  interrupt_capture_config_t cfg {};
+};
+
+// ============================================================================
+// Shared subsystem lifecycle / registration
+// ============================================================================
+
+void process_interrupt_init(void);
+void process_interrupt_register(void);
+
+// High-level declaration surface
+bool declareInterruptHandler(const interrupt_capture_handler_registration_t& reg);
+
+// Shared IRQ authority entry points
+void process_interrupt_qtimer1_irq(void);
+void process_interrupt_gpt1_irq(void);
+void process_interrupt_gpt2_irq(void);
+void process_interrupt_gpio6789_irq(void);
+
+// ============================================================================
+// Helper functions / defaults
+// ============================================================================
+
+const char* interrupt_capture_class_str(interrupt_capture_class_t cls);
 
 uint64_t interrupt_capture_default_gnss_projection(const interrupt_capture_raw_t& raw,
                                                    uint32_t dwt_at_event,
@@ -270,12 +331,6 @@ uint64_t interrupt_capture_default_gnss_projection(const interrupt_capture_raw_t
 interrupt_capture_rearm_decision_t interrupt_capture_no_rearm(
     const interrupt_capture_event_t& event,
     const interrupt_capture_diag_t* diag);
-
-// ============================================================================
-// Class helpers — used by callers to pick the right backend semantics
-// ============================================================================
-
-const char* interrupt_capture_class_str(interrupt_capture_class_t cls);
 
 uint32_t interrupt_capture_qtimer_counter32_at_event(const interrupt_capture_raw_t& raw,
                                                      interrupt_capture_diag_t* diag,

@@ -14,6 +14,7 @@
 #include "payload.h"
 #include "debug.h"
 
+#include "process_interrupt.h"
 #include "process_clocks.h"
 #include "process_events.h"
 #include "process_timepop.h"
@@ -334,6 +335,14 @@ void setup() {
   // ----------------------------------------------------------
   // Process registration
   // ----------------------------------------------------------
+
+  debug_log("boot", "process_interrupt_init");
+  process_interrupt_init();
+  debug_log("boot", "process_interrupt_init done");
+
+  debug_log("boot", "process_interrupt_register");
+  process_interrupt_register();
+  debug_log("boot", "process_interrupt_register done");
 
   debug_log("boot", "process_timepop_register");
   process_timepop_register();
