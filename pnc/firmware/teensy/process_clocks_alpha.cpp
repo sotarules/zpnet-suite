@@ -111,7 +111,7 @@ static void pps_spin_callback(timepop_ctx_t* ctx, void*) {
 }
 
 // ============================================================================
-// TIME_TEST — new subscriber callback
+// TIME_TEST — subscriber callback under process_interrupt authority
 // ============================================================================
 
 static interrupt_next_target_t time_test_interrupt_event_handler(
@@ -119,23 +119,23 @@ static interrupt_next_target_t time_test_interrupt_event_handler(
     const interrupt_capture_diag_t* diag,
     void*) {
 
-  time_test.captured                   = true;
-  time_test.dwt_at_event               = event.dwt_at_event;
-  time_test.gnss_ns_at_event           = event.gnss_ns_at_event;
-  time_test.counter32_at_event         = event.counter32_at_event;
+  time_test.captured                    = true;
+  time_test.dwt_at_event                = event.dwt_at_event;
+  time_test.gnss_ns_at_event            = event.gnss_ns_at_event;
+  time_test.counter32_at_event          = event.counter32_at_event;
   time_test.dwt_event_correction_cycles = event.dwt_event_correction_cycles;
 
-  time_test.dwt_isr_entry_raw          = event.raw.dwt_isr_entry_raw;
-  time_test.dwt_after_capture          = event.raw.dwt_after_capture;
-  time_test.raw_compare16              = event.raw.compare16;
-  time_test.raw_verify_low16           = event.raw.verify_low16;
-  time_test.raw_verify_high16          = event.raw.verify_high16;
+  time_test.dwt_isr_entry_raw           = event.raw.dwt_isr_entry_raw;
+  time_test.dwt_after_capture           = event.raw.dwt_after_capture;
+  time_test.raw_compare16               = event.raw.compare16;
+  time_test.raw_verify_low16            = event.raw.verify_low16;
+  time_test.raw_verify_high16           = event.raw.verify_high16;
 
   if (diag) {
-    time_test.shadow_valid                     = diag->shadow_valid;
-    time_test.shadow_dwt                       = diag->shadow_dwt;
-    time_test.shadow_to_isr_entry_cycles       = diag->shadow_to_isr_entry_cycles;
-    time_test.dwt_at_event_adjusted            = diag->dwt_at_event_adjusted;
+    time_test.shadow_valid                        = diag->shadow_valid;
+    time_test.shadow_dwt                          = diag->shadow_dwt;
+    time_test.shadow_to_isr_entry_cycles          = diag->shadow_to_isr_entry_cycles;
+    time_test.dwt_at_event_adjusted               = diag->dwt_at_event_adjusted;
 
     time_test.candidate_correction_default_cycles = diag->candidate_correction_default_cycles;
     time_test.candidate_correction_live_cycles    = diag->candidate_correction_live_cycles;
@@ -143,10 +143,10 @@ static interrupt_next_target_t time_test_interrupt_event_handler(
     time_test.used_live_profile                   = diag->used_live_profile;
     time_test.used_default_profile                = diag->used_default_profile;
 
-    time_test.expected_low16                 = diag->expected_low16;
-    time_test.expected_high16                = diag->expected_high16;
-    time_test.verify_high16_matches          = diag->verify_high16_matches;
-    time_test.verify_high16_is_previous      = diag->verify_high16_is_previous;
+    time_test.expected_low16                      = diag->expected_low16;
+    time_test.expected_high16                     = diag->expected_high16;
+    time_test.verify_high16_matches               = diag->verify_high16_matches;
+    time_test.verify_high16_is_previous           = diag->verify_high16_is_previous;
   } else {
     time_test.shadow_valid = false;
     time_test.shadow_dwt = 0;
@@ -235,9 +235,20 @@ static void time_test_arm(void) {
     break;
   }
 
+  // Minimal migration seam for the POC:
+  // CLOCKS still computes the sacred target, but process_interrupt now owns
+  // canonical event reconstruction and must be told the event-time counter.
+  interrupt_set_sacred_counter32_target(
+      interrupt_subscriber_kind_t::TIME_TEST,
+      time_test_next_counter32_target);
+
   interrupt_schedule_target(interrupt_subscriber_kind_t::TIME_TEST,
                             (uint64_t)target_gnss_ns);
 }
+
+// ============================================================================
+// PPS spin scheduling
+// ============================================================================
 
 static void pps_spin_arm(void) {
   if (!g_dwt_cal_valid) return;

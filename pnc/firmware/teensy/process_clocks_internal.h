@@ -4,30 +4,17 @@
 // process_clocks_internal.h — Shared Internal State (Alpha ↔ Beta)
 // ============================================================================
 //
+// v30: interrupt migration prep.
+//
+//   process_interrupt is now the target interrupt authority.  Clocks alpha
+//   remains partially transitional in this pass.  New / existing diagnostics
+//   should prefer canonical interrupt_event / interrupt_capture_diag fields
+//   where available, but legacy direct reads remain temporarily intact for
+//   PPS / OCXO migration safety.
+//
 // v29: OCXO phase capture — shadow-write TDC architecture.
-//
-//   ocxo_phase_capture_t gains shadow_dwt and delta_cycles fields for
-//   each OCXO, matching the PPS spin capture TDC pattern.  The GPT ISRs
-//   now capture the shared shadow DWT alongside their own DWT read.
-//   Beta uses the shadow-corrected DWT for edge timestamp computation.
-//
-//   New externs: ocxo_phase_shadow_dwt (shared shadow variable),
-//   ocxoN_phase_shadow_dwt (per-ISR shadow captures),
-//   diag_ocxo_phase_spin_timeouts.
-//
 // v24: Servo mode enum (MEAN/TOTAL) replaces bool calibrate_ocxo_active.
-//
-//   calibrate_ocxo_active (bool) is replaced by calibrate_ocxo_mode
-//   (servo_mode_t enum).  MEAN targets Welford mean residual → 0.
-//   TOTAL targets cumulative campaign tick deficit → 0 (tau → 1.0).
-//
 // v23: 10 MHz single-edge QTimer1 migration.
-//
-//   GNSS_EDGE_DIVISOR eliminated.  QTimer1 now counts rising edges
-//   only (CM=1, 10 MHz).  The raw counter IS the 10 MHz tick count.
-//   ISR_GNSS_RAW_EXPECTED = TICKS_10MHZ_PER_SECOND = 10,000,000.
-//   gnss_ticks_64_get() returns gnss_raw_64 directly.
-//
 // v20: PPS rejection recovery watchdog diagnostics.
 // v19: Spin capture with shadow-write TDC + timeout protection.
 // v14: Symmetric GPT architecture for both OCXOs.
@@ -416,6 +403,12 @@ struct time_test_capture_t {
   uint32_t shadow_to_isr_entry_cycles;
   uint32_t dwt_at_event_adjusted;
 
+  // Prespin / approach diagnostics
+  uint32_t approach_cycles;
+  uint32_t approach_ns;
+  bool     prespin_established;
+  bool     prespin_too_short;
+
   // Correction diagnostics
   uint32_t candidate_correction_default_cycles;
   uint32_t candidate_correction_live_cycles;
@@ -428,6 +421,9 @@ struct time_test_capture_t {
   uint16_t expected_high16;
   bool     verify_high16_matches;
   bool     verify_high16_is_previous;
+  bool     counter32_authoritative;
+  bool     gnss_projection_valid;
+  bool     verification_passed;
 
   // TIME_TEST-specific derived ground truth
   int64_t  vclock_gnss_ns;

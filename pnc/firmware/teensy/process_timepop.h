@@ -1,26 +1,27 @@
-#pragma once
-
 // ============================================================================
 // process_timepop.h
 // ============================================================================
 //
 // TimePop process interface.
 //
-// TimePop now owns:
+// TimePop owns:
 //   • priority-queue slot scheduling
 //   • queue prediction / nearest-deadline selection
 //   • deferred callback dispatch
 //   • instrumentation / reports
 //
-// TimePop no longer owns:
+// TimePop does not own:
 //   • QTIMER1 vector installation
 //   • QTIMER1 CH2 register bring-up
 //   • CH2 compare register twiddling
 //   • last-mile DWT spin
+//   • interrupt-latency canonicalization
 //
-// Those are now owned by process_interrupt.
+// Those are owned by process_interrupt.
 //
 // ============================================================================
+
+#pragma once
 
 #include "timepop.h"
 #include <stdint.h>

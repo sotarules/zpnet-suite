@@ -1,5 +1,5 @@
 // ============================================================================
-// process_timepop.cpp — TimePop v9.0 (shared interrupt authority)
+// process_timepop.cpp — TimePop v9.1 (shared interrupt authority)
 // ============================================================================
 
 #include "timepop.h"
@@ -118,8 +118,8 @@ static timepop_slot_t slots[MAX_SLOTS];
 static volatile bool  timepop_pending = false;
 static uint32_t       next_handle = 1;
 
-// Next full 32-bit target that TIMEPOP wants process_interrupt to arm.
-// This is the sacred event-time counter value for the next TIMEPOP compare.
+// Sacred event-time counter for the next TIMEPOP compare.
+// process_interrupt will use this as authoritative event counter truth.
 static volatile uint32_t g_timepop_next_counter32_target = 0;
 
 // ============================================================================
@@ -234,6 +234,14 @@ static bool request_interrupt_for_deadline(uint32_t deadline) {
   if (target_gnss_ns <= 0) return false;
 
   g_timepop_next_counter32_target = deadline;
+
+  // Minimal migration hook: TIMEPOP still knows the sacred full 32-bit compare
+  // target, but hands it to process_interrupt so that process_interrupt can own
+  // canonical event reconstruction.
+  if (!interrupt_set_sacred_counter32_target(interrupt_subscriber_kind_t::TIMEPOP,
+                                             deadline)) {
+    return false;
+  }
 
   diag_interrupt_schedule_requests++;
   if (!interrupt_schedule_target(interrupt_subscriber_kind_t::TIMEPOP,
@@ -426,6 +434,9 @@ static interrupt_next_target_t timepop_interrupt_event_handler(
   int64_t target_gnss_ns = 0;
   interrupt_next_target_t out {};
   if (deadline_to_gnss_target(next_deadline, target_gnss_ns) && target_gnss_ns > 0) {
+    // Minimal migration hook: hand the sacred target to process_interrupt.
+    interrupt_set_sacred_counter32_target(interrupt_subscriber_kind_t::TIMEPOP,
+                                          next_deadline);
     out.schedule_next = true;
     out.target_gnss_ns = (uint64_t)target_gnss_ns;
   } else {

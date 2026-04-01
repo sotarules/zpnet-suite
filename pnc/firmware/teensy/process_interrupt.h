@@ -1,27 +1,32 @@
-#pragma once
-
 // ============================================================================
 // process_interrupt.h
 // ============================================================================
 //
 // Shared interrupt authority + subscriber runtime.
 //
-// Philosophy:
-//   • Clients subscribe by known identity (kind), not by lane details.
+// Core laws:
+//   • Clients subscribe by logical identity (kind), never by lane details.
 //   • The interrupt subsystem owns provider/lane custody.
-//   • Clients supply one ISR-context callback.
-//   • Callback always receives canonical event + diag.
-//   • Callback returns the next absolute GNSS target time, or no-follow-on.
-//   • TimePop is used by the interrupt subsystem for pre-spin scheduling.
-//   • Required event fields are guaranteed by contract.
-//   • If the subsystem cannot produce a required field, that is an integrity
-//     failure and the design must be fixed.
-//   • For QTIMER compare subscribers, the authoritative counter value at event
-//     time is the full 32-bit target count that we armed.
-//   • Interrupt-time register reads are used only for verification and
-//     diagnostics, never to invent event time after the fact.
+//   • Every shared IRQ path captures DWT first. No exceptions.
+//   • Every deterministic prespin loop does only one thing:
+//       continuously shadow DWT until interrupted.
+//   • The callback contract is steeped in GNSS nanoseconds.
+//   • DWT remains available as the precision substrate for last-mile timing.
+//   • The callback always receives canonical event truth plus diagnostics.
+//   • Diagnostics are always available; clients never need private capture
+//     globals just to test the interrupt path.
+//   • Clients return the next exact interrupt time in absolute GNSS ns, or
+//     no-follow-on.
+//   • process_interrupt owns prespin lead policy. Clients do not compute it.
+//   • QTimer / GPT counters are authoritative only under interrupt custody;
+//     their event-time values are handed to clients on a silver platter.
+//   • Direct live register reads are verification / diagnostics only; they are
+//     never used to invent event time after the fact.
+//   • DWT and PPS are explicit special cases outside the general prohibition.
 //
 // ============================================================================
+
+#pragma once
 
 #include <stdint.h>
 #include <stdbool.h>
@@ -76,17 +81,21 @@ enum class interrupt_event_status_t : uint8_t {
 };
 
 // ============================================================================
-// Profiled latency for QTimer interrupts
+// Default correction constants (per-provider / lane defaults)
 // ============================================================================
+
 static constexpr uint32_t TDC_ISR_LATENCY_CYCLES_QTIMER = 54;
+
+// process_interrupt owns prespin lead. Clients specify exact target time only.
+static constexpr uint64_t INTERRUPT_PRESPIN_LEAD_NS_DEFAULT = 5000ULL;
 
 // ============================================================================
 // Raw capture — source-local hardware truth harvested in ISR context
 // ============================================================================
 
 struct interrupt_capture_raw_t {
-  // First-line ISR DWT captured at the shared IRQ entry point, before any other
-  // work in the software-controlled ISR path.
+  // First-line ISR DWT captured at the shared IRQ entry point, before any
+  // other work in the software-controlled ISR path.
   uint32_t dwt_isr_entry_raw = 0;
 
   // DWT after raw-capture harvesting, for instrumentation only.
@@ -95,7 +104,7 @@ struct interrupt_capture_raw_t {
   // Compare/event facts harvested in ISR context.
   uint16_t compare16 = 0;
 
-  // Verification registers harvested in ISR context.
+  // Verification registers harvested in ISR context only.
   uint16_t verify_low16 = 0;
   uint16_t verify_high16 = 0;
 
@@ -108,14 +117,17 @@ struct interrupt_capture_raw_t {
 // ============================================================================
 
 struct interrupt_capture_latency_t {
+  // Deterministic prespin loop state.
   uint32_t last_spin_dwt = 0;
   uint32_t prev_spin_dwt = 0;
 
+  // Formal DWT event correction.
   uint32_t dwt_event_correction_cycles = 0;
   uint32_t dwt_event_correction_cycles_default = 0;
   uint32_t dwt_event_correction_cycles_min = 0;
   uint32_t dwt_event_correction_cycles_max = 0;
 
+  // Welford tracking for live profile convergence.
   uint64_t sample_count = 0;
   double   mean_cycles = 0.0;
   double   m2_cycles = 0.0;
@@ -135,16 +147,21 @@ struct interrupt_capture_diag_t {
   interrupt_lane_t lane = interrupt_lane_t::NONE;
   interrupt_subscriber_kind_t kind = interrupt_subscriber_kind_t::NONE;
 
+  // Deterministic prespin / shadow facts.
   uint32_t shadow_dwt = 0;
   bool     shadow_valid = false;
 
-  // Delta between loop shadow DWT and first-line ISR DWT. This should always be
-  // tracked, even if later it converges to a tight constant.
+  // Delta between prespin shadow DWT and first-line ISR DWT.
   uint32_t shadow_to_isr_entry_cycles = 0;
 
+  // Convenience derivative for reporting / reasoning.
+  uint32_t approach_cycles = 0;
+
+  // Shared ISR prologue facts.
   uint32_t dwt_isr_entry_raw = 0;
   uint32_t dwt_after_capture = 0;
 
+  // Prespin loop continuity.
   uint32_t spin_last_dwt = 0;
   uint32_t spin_prev_dwt = 0;
 
@@ -155,6 +172,7 @@ struct interrupt_capture_diag_t {
   bool     used_live_profile = false;
   bool     used_default_profile = false;
 
+  // Canonical event outputs.
   uint32_t dwt_at_event_adjusted = 0;
   uint64_t gnss_ns_at_event = 0;
   uint32_t counter32_at_event = 0;
@@ -164,11 +182,17 @@ struct interrupt_capture_diag_t {
   uint16_t raw_verify_low16 = 0;
   uint16_t raw_verify_high16 = 0;
 
-  // QTIMER alias / neighborhood verification.
+  // Expected target neighborhood verification.
   uint16_t expected_low16 = 0;
   uint16_t expected_high16 = 0;
   bool     verify_high16_matches = false;
   bool     verify_high16_is_previous = false;
+
+  // Integrity / provenance flags.
+  bool counter32_authoritative = false;
+  bool gnss_projection_valid = false;
+  bool prespin_established = false;
+  bool verification_passed = false;
 };
 
 // ============================================================================
@@ -182,10 +206,10 @@ struct interrupt_event_t {
   interrupt_event_status_t status = interrupt_event_status_t::OK;
 
   // Fully adjusted event-time DWT, formally corrected before the callback sees
-  // it.
+  // it. This is the precision substrate.
   uint32_t dwt_at_event = 0;
 
-  // Best corresponding GNSS nanoseconds at event time.
+  // Best corresponding canonical GNSS nanoseconds at event time.
   uint64_t gnss_ns_at_event = 0;
 
   // Authoritative source counter value at event time.
@@ -235,11 +259,17 @@ bool interrupt_subscribe(const interrupt_subscription_t& sub);
 bool interrupt_start(interrupt_subscriber_kind_t kind);
 bool interrupt_stop(interrupt_subscriber_kind_t kind);
 
-// Used by known clients (e.g. TIME_TEST / TIMEPOP) to request a fresh cycle.
-// The target is the absolute GNSS time of the desired event.
-// The interrupt subsystem applies prespin lead internally.
+// The client supplies the exact desired event time in absolute GNSS ns.
+// process_interrupt owns prespin lead policy internally.
 bool interrupt_schedule_target(interrupt_subscriber_kind_t kind,
                                uint64_t target_gnss_ns);
+
+// Optional explicit sacred target injection for known subscribers that already
+// know the authoritative provider counter value at event time.
+// This keeps migration impact low while allowing process_interrupt to become
+// the canonical event-reconstruction layer.
+bool interrupt_set_sacred_counter32_target(interrupt_subscriber_kind_t kind,
+                                           uint32_t counter32_target);
 
 // ============================================================================
 // Shared IRQ authority entry points
@@ -265,11 +295,12 @@ const char* interrupt_lane_str(interrupt_lane_t lane);
 // Helper functions / defaults used internally and by known subscribers
 // ============================================================================
 
+// Canonical DWT->GNSS projection at an arbitrary DWT sample.
 uint64_t interrupt_capture_default_gnss_projection(uint32_t dwt_at_event_adjusted);
 
 // Formal DWT adjustment hook.
-// For now this may simply subtract a constant per provider/lane, but it is an
-// explicit, first-class step in the event reconstruction flow.
+// For now this subtracts a lane-specific default / live-profiled correction,
+// but it is an explicit first-class step in the event reconstruction flow.
 uint32_t interrupt_adjust_dwt_at_event(interrupt_subscriber_kind_t kind,
                                        interrupt_provider_kind_t provider,
                                        interrupt_lane_t lane,

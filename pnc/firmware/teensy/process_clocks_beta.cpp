@@ -824,7 +824,7 @@ static Payload cmd_start(const Payload& args) {
 
   double dac_val;
   if (args.tryGetDouble("set_dac1", dac_val))  ocxo_dac_set(ocxo1_dac, dac_val);
-  if (args.tryGetDouble("set_dac2", dac_val)) ocxo_dac_set(ocxo2_dac, dac_val);
+  if (args.tryGetDouble("set_dac2", dac_val))  ocxo_dac_set(ocxo2_dac, dac_val);
 
   calibrate_ocxo_mode = servo_mode_parse(args.getString("calibrate_ocxo"));
   if (calibrate_ocxo_mode != servo_mode_t::OFF) {
@@ -883,7 +883,7 @@ static Payload cmd_recover(const Payload& args) {
 
   double dac_val;
   if (args.tryGetDouble("set_dac1", dac_val))  ocxo_dac_set(ocxo1_dac, dac_val);
-  if (args.tryGetDouble("set_dac2", dac_val)) ocxo_dac_set(ocxo2_dac, dac_val);
+  if (args.tryGetDouble("set_dac2", dac_val))  ocxo_dac_set(ocxo2_dac, dac_val);
 
   calibrate_ocxo_mode = servo_mode_parse(args.getString("calibrate_ocxo"));
   if (calibrate_ocxo_mode != servo_mode_t::OFF) {
