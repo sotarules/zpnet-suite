@@ -53,6 +53,8 @@ void debug_send_framed(const char* payload, size_t payload_len);
 // Example: "111511"
 void debug_blink(const char* pattern);
 
+void debug_sleep_ms(uint32_t ms);
+
 // -----------------------------------------------------------------------------
 // Optional convenience macro
 // -----------------------------------------------------------------------------

@@ -162,6 +162,13 @@ static volatile uint32_t diag_interrupt_schedule_failures = 0;
 // Helpers
 // ============================================================================
 
+[[noreturn]] static void blink_probe_forever(void) {
+  pinMode(LED_BUILTIN, OUTPUT);
+  while (true) {
+    debug_blink("911411");
+  }
+}
+
 static inline void update_slot_high_water(void) {
   uint32_t active = 0;
   for (uint32_t i = 0; i < MAX_SLOTS; i++) {
@@ -451,6 +458,12 @@ static interrupt_next_target_t timepop_interrupt_event_handler(
 // Initialization
 // ============================================================================
 
+void timepop_bootstrap(void) {
+  noInterrupts();
+  schedule_next();
+  interrupts();
+}
+
 void timepop_init(void) {
   for (uint32_t i = 0; i < MAX_SLOTS; i++) slots[i] = {};
 
@@ -462,12 +475,13 @@ void timepop_init(void) {
   sub.on_event = timepop_interrupt_event_handler;
   sub.user_data = nullptr;
 
-  interrupt_subscribe(sub);
-  interrupt_start(interrupt_subscriber_kind_t::TIMEPOP);
+  if (!interrupt_subscribe(sub)) {
+    blink_probe_forever();
+  }
 
-  noInterrupts();
-  schedule_next();
-  interrupts();
+  if (!interrupt_start(interrupt_subscriber_kind_t::TIMEPOP)) {
+    blink_probe_forever();
+  }
 }
 
 // ============================================================================

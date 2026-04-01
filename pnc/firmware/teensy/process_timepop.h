@@ -26,5 +26,6 @@
 #include "timepop.h"
 #include <stdint.h>
 
+void timepop_bootstrap(void);
 void timepop_init(void);
 void process_timepop_register(void);

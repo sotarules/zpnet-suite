@@ -3,6 +3,7 @@
 // ============================================================================
 
 #include "process_interrupt.h"
+#include "debug.h"
 
 #include "time.h"
 #include "process.h"
@@ -25,10 +26,33 @@ static constexpr uint32_t MAX_INTERRUPT_SUBSCRIBERS = 8;
 // Hard-fail integrity trap
 // ============================================================================
 
-[[noreturn]]
-static void interrupt_integrity_trap(void) {
-  __builtin_trap();
-  while (true) { }
+[[noreturn]] static void interrupt_integrity_trap(uint32_t code) {
+  while (true) {
+    switch (code) {
+    case 1:  debug_blink("1"); break;
+    case 2:  debug_blink("11"); break;
+    case 3:  debug_blink("111"); break;
+    case 4:  debug_blink("1111"); break;
+    case 5:  debug_blink("11111"); break;
+    case 6:  debug_blink("111111"); break;
+    case 7:  debug_blink("1111111"); break;
+    case 8:  debug_blink("11111111"); break;
+    case 9:  debug_blink("111111111"); break;
+
+    case 10: debug_blink("41"); break;
+    case 11: debug_blink("411"); break;
+    case 12: debug_blink("4111"); break;
+    case 13: debug_blink("41111"); break;
+    case 14: debug_blink("411111"); break;
+
+    case 15: debug_blink("21"); break;
+    case 16: debug_blink("211"); break;
+    case 17: debug_blink("2111"); break;
+
+    default: debug_blink("911911"); break;
+    }
+    debug_sleep_ms(1500);
+  }
 }
 
 // ============================================================================
@@ -265,7 +289,7 @@ uint32_t interrupt_adjust_dwt_at_event(interrupt_subscriber_kind_t,
 
 uint64_t interrupt_capture_default_gnss_projection(uint32_t dwt_at_event_adjusted) {
   const int64_t gnss = time_dwt_to_gnss_ns(dwt_at_event_adjusted);
-  if (gnss < 0) interrupt_integrity_trap();
+  if (gnss < 0) interrupt_integrity_trap(1);
   return static_cast<uint64_t>(gnss);
 }
 
@@ -371,7 +395,7 @@ static bool qtimer1_ch2_arm_for_target(uint64_t,
                                        uint32_t* out_counter32_target,
                                        uint16_t* out_compare16) {
   interrupt_subscriber_runtime_t* rt = runtime_for(interrupt_subscriber_kind_t::TIMEPOP);
-  if (!rt) interrupt_integrity_trap();
+  if (!rt) interrupt_integrity_trap(2);
 
   const uint32_t target32 = rt->armed_counter32_target;
   const uint16_t target16 = (uint16_t)(target32 & 0xFFFFu);
@@ -387,7 +411,7 @@ static bool qtimer1_ch3_arm_for_target(uint64_t,
                                        uint32_t* out_counter32_target,
                                        uint16_t* out_compare16) {
   interrupt_subscriber_runtime_t* rt = runtime_for(interrupt_subscriber_kind_t::TIME_TEST);
-  if (!rt) interrupt_integrity_trap();
+  if (!rt) interrupt_integrity_trap(3);
 
   const uint32_t target32 = rt->armed_counter32_target;
   const uint16_t target16 = (uint16_t)(target32 & 0xFFFFu);
@@ -482,7 +506,7 @@ static void subscriber_timepop_callback(timepop_ctx_t*, void* user_data) {
                                             &armed_counter32_target,
                                             &armed_compare16)) {
     rt->provider_arm_failures++;
-    interrupt_integrity_trap();
+    interrupt_integrity_trap(4);
   }
 
   rt->arm_count++;
@@ -505,7 +529,7 @@ static void subscriber_schedule_prespin(interrupt_subscriber_runtime_t& rt) {
   const int64_t now_ns_signed = time_gnss_ns_now();
   if (now_ns_signed < 0) {
     rt.prespin_arm_failures++;
-    interrupt_integrity_trap();
+    interrupt_integrity_trap(5);
   }
 
   const uint64_t now_ns = (uint64_t)now_ns_signed;
@@ -525,7 +549,7 @@ static void subscriber_schedule_prespin(interrupt_subscriber_runtime_t& rt) {
                                   rt.desc->name ? rt.desc->name : "interrupt-prespin");
   if (rt.prespin_handle == TIMEPOP_INVALID_HANDLE) {
     rt.prespin_arm_failures++;
-    interrupt_integrity_trap();
+    interrupt_integrity_trap(6);
   }
 }
 
@@ -536,7 +560,7 @@ static void subscriber_schedule_prespin(interrupt_subscriber_runtime_t& rt) {
 static void subscriber_handle_interrupt(interrupt_subscriber_runtime_t& rt,
                                         uint32_t dwt_isr_entry_raw) {
   if (!rt.desc || !rt.sub.on_event) {
-    interrupt_integrity_trap();
+    interrupt_integrity_trap(7);
   }
 
   interrupt_capture_diag_t diag {};
@@ -550,7 +574,7 @@ static void subscriber_handle_interrupt(interrupt_subscriber_runtime_t& rt,
 
   interrupt_capture_raw_t raw {};
   if (!rt.desc->raw_capture_fn) {
-    interrupt_integrity_trap();
+    interrupt_integrity_trap(8);
   }
 
   rt.desc->raw_capture_fn(dwt_isr_entry_raw, raw, &diag);
@@ -579,14 +603,14 @@ static void subscriber_handle_interrupt(interrupt_subscriber_runtime_t& rt,
   diag.expected_high16 = expected_high16;
 
   if (raw.compare16 != expected_low16) {
-    interrupt_integrity_trap();
+    interrupt_integrity_trap(9);
   }
 
   diag.verify_high16_matches = (raw.verify_high16 == expected_high16);
   diag.verify_high16_is_previous = (raw.verify_high16 == (uint16_t)(expected_high16 - 1u));
 
   if (!diag.verify_high16_matches && !diag.verify_high16_is_previous) {
-    interrupt_integrity_trap();
+    interrupt_integrity_trap(10);
   }
   diag.verification_passed = true;
 
@@ -674,7 +698,7 @@ bool interrupt_subscribe(const interrupt_subscription_t& sub) {
 
   if (desc->provider_init_fn && !desc->provider_init_fn()) {
     rt.provider_init_failures++;
-    interrupt_integrity_trap();
+    interrupt_integrity_trap(11);
   }
 
   return true;
@@ -744,11 +768,19 @@ void process_interrupt_qtimer1_irq(void) {
 
   if (IMXRT_TMR1.CH[3].CSCTRL & TMR_CSCTRL_TCF1) {
     interrupt_subscriber_runtime_t* rt = runtime_for(interrupt_subscriber_kind_t::TIME_TEST);
-    if (rt && rt->active && rt->waiting_for_interrupt) {
-      subscriber_handle_interrupt(*rt, dwt_isr_entry_raw);
-      return;
+
+    if (!rt) {
+      interrupt_integrity_trap(15);
     }
-    interrupt_integrity_trap();
+    if (!rt->active) {
+      interrupt_integrity_trap(16);
+    }
+    if (!rt->waiting_for_interrupt) {
+      interrupt_integrity_trap(17);
+    }
+
+    subscriber_handle_interrupt(*rt, dwt_isr_entry_raw);
+    return;
   }
 
   if (IMXRT_TMR1.CH[2].CSCTRL & TMR_CSCTRL_TCF1) {
@@ -757,7 +789,7 @@ void process_interrupt_qtimer1_irq(void) {
       subscriber_handle_interrupt(*rt, dwt_isr_entry_raw);
       return;
     }
-    interrupt_integrity_trap();
+    interrupt_integrity_trap(13);
   }
 
   g_qtimer1_diag.dispatch_misses++;
@@ -789,9 +821,20 @@ void process_interrupt_init(void) {
     process_interrupt_qtimer1_irq();
   });
   NVIC_SET_PRIORITY(IRQ_QTIMER1, 16);
-  NVIC_ENABLE_IRQ(IRQ_QTIMER1);
 
+  // Do not enable the shared IRQ yet.
+  // Subscribers must be able to register first, and initial scheduling must
+  // establish waiting/armed state before QTIMER1 can legally fire.
   g_interrupt_hw_ready = true;
+}
+
+void process_interrupt_enable_irqs(void) {
+  if (!g_interrupt_hw_ready) {
+    interrupt_integrity_trap(14);
+  }
+
+  NVIC_DISABLE_IRQ(IRQ_QTIMER1);
+  NVIC_ENABLE_IRQ(IRQ_QTIMER1);
 }
 
 static Payload cmd_report(const Payload&) {

@@ -284,3 +284,7 @@ void debug_blink(const char* pattern) {
 
   dwt_delay_ms(PATTERN_GAP_MS);
 }
+
+void debug_sleep_ms(uint32_t ms) {
+  dwt_delay_ms(ms);
+}

@@ -266,13 +266,21 @@ void setup() {
   memory_info_init();
   cpu_usage_init();
 
-  // Start GPT2/GPT1/DWT hardware BEFORE TimePop.
-  // TimePop uses GPT2 output compare — the counter must be
-  // running before timepop_init() installs its ISR.
   process_clocks_init_hardware();
 
-  // Now TimePop can safely install its OCR1 compare on GPT2.
+  // Interrupt authority must exist before TIMEPOP subscribes,
+  // but the shared IRQ must not go live until TIMEPOP has completed
+  // subscription and initial scheduling.
+  process_interrupt_init();
+
+  // Now TIMEPOP can subscribe successfully.
   timepop_init();
+
+  // Only after TIMEPOP is subscribed and initial scheduling is established
+  // may the shared QTIMER1 IRQ become live.
+  process_interrupt_enable_irqs();
+
+  timepop_bootstrap();
 
   // ----------------------------------------------------------
   // Phase 2: Transport boundary comes alive
@@ -335,10 +343,6 @@ void setup() {
   // ----------------------------------------------------------
   // Process registration
   // ----------------------------------------------------------
-
-  debug_log("boot", "process_interrupt_init");
-  process_interrupt_init();
-  debug_log("boot", "process_interrupt_init done");
 
   debug_log("boot", "process_interrupt_register");
   process_interrupt_register();

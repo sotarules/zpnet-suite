@@ -285,6 +285,7 @@ void process_interrupt_gpio6789_irq(void);
 // ============================================================================
 
 void process_interrupt_init(void);
+void process_interrupt_enable_irqs(void);
 void process_interrupt_register(void);
 
 const char* interrupt_subscriber_kind_str(interrupt_subscriber_kind_t kind);
