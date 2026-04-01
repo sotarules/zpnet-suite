@@ -137,11 +137,7 @@ static interrupt_next_target_t time_test_interrupt_event_handler(
     time_test.shadow_to_isr_entry_cycles          = diag->shadow_to_isr_entry_cycles;
     time_test.dwt_at_event_adjusted               = diag->dwt_at_event_adjusted;
 
-    time_test.candidate_correction_default_cycles = diag->candidate_correction_default_cycles;
-    time_test.candidate_correction_live_cycles    = diag->candidate_correction_live_cycles;
     time_test.dwt_event_correction_cycles_diag    = diag->dwt_event_correction_cycles;
-    time_test.used_live_profile                   = diag->used_live_profile;
-    time_test.used_default_profile                = diag->used_default_profile;
 
     time_test.expected_low16                      = diag->expected_low16;
     time_test.expected_high16                     = diag->expected_high16;
@@ -153,11 +149,7 @@ static interrupt_next_target_t time_test_interrupt_event_handler(
     time_test.shadow_to_isr_entry_cycles = 0;
     time_test.dwt_at_event_adjusted = 0;
 
-    time_test.candidate_correction_default_cycles = 0;
-    time_test.candidate_correction_live_cycles = 0;
     time_test.dwt_event_correction_cycles_diag = 0;
-    time_test.used_live_profile = false;
-    time_test.used_default_profile = false;
 
     time_test.expected_low16 = 0;
     time_test.expected_high16 = 0;
@@ -214,7 +206,6 @@ static void time_test_arm(void) {
   }
 
   int64_t target_gnss_ns = now_ns + (int64_t)delay_ns;
-  uint32_t target_dwt = time_gnss_ns_to_dwt(target_gnss_ns);
 
   time_anchor_snapshot_t snap = time_anchor_snapshot();
   if (!snap.ok || !snap.valid) {

@@ -23,6 +23,8 @@
 //   • Direct live register reads are verification / diagnostics only; they are
 //     never used to invent event time after the fact.
 //   • DWT and PPS are explicit special cases outside the general prohibition.
+//   • process_interrupt owns the prespin shadow-write loop.  Clients never
+//     maintain their own shadow DWT globals.
 //
 // ============================================================================
 
@@ -31,7 +33,6 @@
 #include <stdint.h>
 #include <stdbool.h>
 
-#include "process_clocks_internal.h"
 #include "timepop.h"
 
 // ============================================================================
@@ -121,19 +122,22 @@ struct interrupt_capture_latency_t {
   uint32_t last_spin_dwt = 0;
   uint32_t prev_spin_dwt = 0;
 
-  // Formal DWT event correction.
+  // Formal DWT event correction applied for this event.
   uint32_t dwt_event_correction_cycles = 0;
-  uint32_t dwt_event_correction_cycles_default = 0;
-  uint32_t dwt_event_correction_cycles_min = 0;
-  uint32_t dwt_event_correction_cycles_max = 0;
 
-  // Welford tracking for live profile convergence.
+  // Static default correction from the descriptor.
+  uint32_t dwt_event_correction_cycles_default = 0;
+
+  // Welford tracking of shadow_to_isr_entry_cycles (ISR latency profile).
+  // This tracks the actual observed ISR entry latency across events,
+  // providing a live empirical profile of the interrupt path.
   uint64_t sample_count = 0;
   double   mean_cycles = 0.0;
   double   m2_cycles = 0.0;
+  uint32_t min_cycles = 0;
+  uint32_t max_cycles = 0;
 
   bool deterministic_spin_active = false;
-  bool live_profile_valid = false;
 };
 
 // ============================================================================
@@ -154,9 +158,6 @@ struct interrupt_capture_diag_t {
   // Delta between prespin shadow DWT and first-line ISR DWT.
   uint32_t shadow_to_isr_entry_cycles = 0;
 
-  // Convenience derivative for reporting / reasoning.
-  uint32_t approach_cycles = 0;
-
   // Shared ISR prologue facts.
   uint32_t dwt_isr_entry_raw = 0;
   uint32_t dwt_after_capture = 0;
@@ -167,10 +168,6 @@ struct interrupt_capture_diag_t {
 
   // Formal DWT event correction.
   uint32_t dwt_event_correction_cycles = 0;
-  uint32_t candidate_correction_default_cycles = 0;
-  uint32_t candidate_correction_live_cycles = 0;
-  bool     used_live_profile = false;
-  bool     used_default_profile = false;
 
   // Canonical event outputs.
   uint32_t dwt_at_event_adjusted = 0;
@@ -192,7 +189,11 @@ struct interrupt_capture_diag_t {
   bool counter32_authoritative = false;
   bool gnss_projection_valid = false;
   bool prespin_established = false;
-  bool verification_passed = false;
+
+  // Verification outcome — true only when live register values are
+  // consistent with the armed target.  False indicates a mismatch
+  // (event status will be HOLD).
+  bool verification_ok = false;
 };
 
 // ============================================================================
@@ -272,6 +273,17 @@ bool interrupt_set_sacred_counter32_target(interrupt_subscriber_kind_t kind,
                                            uint32_t counter32_target);
 
 // ============================================================================
+// Last event / diag access — read the persisted per-subscriber state
+//
+// Clients (e.g., beta reporting) can read the last event and diag for any
+// subscriber without maintaining their own parallel capture structs.
+// Returns nullptr if the subscriber has not yet fired.
+// ============================================================================
+
+const interrupt_event_t* interrupt_last_event(interrupt_subscriber_kind_t kind);
+const interrupt_capture_diag_t* interrupt_last_diag(interrupt_subscriber_kind_t kind);
+
+// ============================================================================
 // Shared IRQ authority entry points
 // ============================================================================
 
@@ -291,19 +303,3 @@ void process_interrupt_register(void);
 const char* interrupt_subscriber_kind_str(interrupt_subscriber_kind_t kind);
 const char* interrupt_provider_kind_str(interrupt_provider_kind_t provider);
 const char* interrupt_lane_str(interrupt_lane_t lane);
-
-// ============================================================================
-// Helper functions / defaults used internally and by known subscribers
-// ============================================================================
-
-// Canonical DWT->GNSS projection at an arbitrary DWT sample.
-uint64_t interrupt_capture_default_gnss_projection(uint32_t dwt_at_event_adjusted);
-
-// Formal DWT adjustment hook.
-// For now this subtracts a lane-specific default / live-profiled correction,
-// but it is an explicit first-class step in the event reconstruction flow.
-uint32_t interrupt_adjust_dwt_at_event(interrupt_subscriber_kind_t kind,
-                                       interrupt_provider_kind_t provider,
-                                       interrupt_lane_t lane,
-                                       uint32_t dwt_isr_entry_raw,
-                                       interrupt_capture_diag_t* diag);
