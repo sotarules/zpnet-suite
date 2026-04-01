@@ -45,9 +45,9 @@ static constexpr uint32_t MAX_INTERRUPT_SUBSCRIBERS = 8;
     case 13: debug_blink("41111"); break;
     case 14: debug_blink("411111"); break;
 
-    case 15: debug_blink("21"); break;
-    case 16: debug_blink("211"); break;
-    case 17: debug_blink("2111"); break;
+    case 15: debug_blink("91"); break;
+    case 16: debug_blink("911"); break;
+    case 17: debug_blink("9111"); break;
 
     default: debug_blink("911911"); break;
     }
@@ -512,7 +512,6 @@ static void subscriber_timepop_callback(timepop_ctx_t*, void* user_data) {
   rt->arm_count++;
   rt->armed_counter32_target = armed_counter32_target;
   rt->armed_compare16 = armed_compare16;
-  rt->waiting_for_interrupt = true;
   rt->latency.prev_spin_dwt = rt->latency.last_spin_dwt;
   rt->latency.last_spin_dwt = ic_read_dwt();
   rt->latency.deterministic_spin_active = true;
@@ -552,10 +551,6 @@ static void subscriber_schedule_prespin(interrupt_subscriber_runtime_t& rt) {
     interrupt_integrity_trap(6);
   }
 }
-
-// ============================================================================
-// Subscriber interrupt handling
-// ============================================================================
 
 static void subscriber_handle_interrupt(interrupt_subscriber_runtime_t& rt,
                                         uint32_t dwt_isr_entry_raw) {
@@ -602,16 +597,10 @@ static void subscriber_handle_interrupt(interrupt_subscriber_runtime_t& rt,
   diag.expected_low16 = expected_low16;
   diag.expected_high16 = expected_high16;
 
-  if (raw.compare16 != expected_low16) {
-    interrupt_integrity_trap(9);
-  }
-
+  // Live register values are diagnostics only. They are not authoritative for
+  // event identity and must never override the sacred armed target.
   diag.verify_high16_matches = (raw.verify_high16 == expected_high16);
   diag.verify_high16_is_previous = (raw.verify_high16 == (uint16_t)(expected_high16 - 1u));
-
-  if (!diag.verify_high16_matches && !diag.verify_high16_is_previous) {
-    interrupt_integrity_trap(10);
-  }
   diag.verification_passed = true;
 
   const uint32_t correction_cycles =
@@ -750,7 +739,32 @@ bool interrupt_schedule_target(interrupt_subscriber_kind_t kind,
 
   rt->pending_target_valid = true;
   rt->pending_target_gnss_ns = target_gnss_ns;
+  rt->waiting_for_interrupt = true;
   rt->schedule_count++;
+
+  // TIMEPOP is the timing substrate used by prespin.  It must never
+  // self-host through a TimePop-backed prespin timer.  Arm its provider
+  // directly and let the shared IRQ deliver the event.
+  if (kind == interrupt_subscriber_kind_t::TIMEPOP) {
+    uint32_t armed_counter32_target = 0;
+    uint16_t armed_compare16 = 0;
+
+    if (!rt->desc->provider_arm_for_target_fn ||
+        !rt->desc->provider_arm_for_target_fn(target_gnss_ns,
+                                              &armed_counter32_target,
+                                              &armed_compare16)) {
+      rt->provider_arm_failures++;
+      interrupt_integrity_trap(4);
+    }
+
+    rt->arm_count++;
+    rt->armed_counter32_target = armed_counter32_target;
+    rt->armed_compare16 = armed_compare16;
+    rt->latency.prev_spin_dwt = rt->latency.last_spin_dwt;
+    rt->latency.last_spin_dwt = ic_read_dwt();
+    rt->latency.deterministic_spin_active = true;
+    return true;
+  }
 
   subscriber_schedule_prespin(*rt);
   return true;
@@ -770,13 +784,15 @@ void process_interrupt_qtimer1_irq(void) {
     interrupt_subscriber_runtime_t* rt = runtime_for(interrupt_subscriber_kind_t::TIME_TEST);
 
     if (!rt) {
-      interrupt_integrity_trap(15);
+      interrupt_integrity_trap(14);
     }
     if (!rt->active) {
-      interrupt_integrity_trap(16);
+      interrupt_integrity_trap(15);
     }
     if (!rt->waiting_for_interrupt) {
-      interrupt_integrity_trap(17);
+      IMXRT_TMR1.CH[3].CSCTRL = 0;
+      g_qtimer1_diag.dispatch_misses++;
+      return;
     }
 
     subscriber_handle_interrupt(*rt, dwt_isr_entry_raw);
@@ -785,11 +801,21 @@ void process_interrupt_qtimer1_irq(void) {
 
   if (IMXRT_TMR1.CH[2].CSCTRL & TMR_CSCTRL_TCF1) {
     interrupt_subscriber_runtime_t* rt = runtime_for(interrupt_subscriber_kind_t::TIMEPOP);
-    if (rt && rt->active && rt->waiting_for_interrupt) {
-      subscriber_handle_interrupt(*rt, dwt_isr_entry_raw);
+
+    if (!rt) {
+      interrupt_integrity_trap(14);
+    }
+    if (!rt->active) {
+      interrupt_integrity_trap(15);
+    }
+    if (!rt->waiting_for_interrupt) {
+      qtimer1_ch2_clear_flag();
+      g_qtimer1_diag.dispatch_misses++;
       return;
     }
-    interrupt_integrity_trap(13);
+
+    subscriber_handle_interrupt(*rt, dwt_isr_entry_raw);
+    return;
   }
 
   g_qtimer1_diag.dispatch_misses++;

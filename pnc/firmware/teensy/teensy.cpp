@@ -273,8 +273,9 @@ void setup() {
   // subscription and initial scheduling.
   process_interrupt_init();
 
-  // Now TIMEPOP can subscribe successfully.
+  // Now TIMEPOP and TIME_TEST can subscribe successfully.
   timepop_init();
+  process_clocks_init();
 
   // Only after TIMEPOP is subscribed and initial scheduling is established
   // may the shared QTIMER1 IRQ become live.
@@ -351,10 +352,6 @@ void setup() {
   debug_log("boot", "process_timepop_register");
   process_timepop_register();
   debug_log("boot", "process_timepop_register done");
-
-  debug_log("boot", "process_clocks_init");
-  process_clocks_init();
-  debug_log("boot", "process_clocks_init done");
 
   debug_log("boot", "process_clocks_register");
   process_clocks_register();

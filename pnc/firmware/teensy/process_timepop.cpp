@@ -26,7 +26,7 @@
 // Constants — 10 MHz domain
 // ============================================================================
 
-static constexpr uint32_t MAX_SLOTS = 16;
+static constexpr uint32_t MAX_SLOTS = 64;
 static constexpr uint64_t NS_PER_TICK = 100ULL;
 static constexpr uint32_t MAX_DELAY_TICKS = 0x7FFFFFFFU;
 static constexpr uint32_t MIN_DELAY_TICKS = 2;
