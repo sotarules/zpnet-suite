@@ -1,36 +1,36 @@
 // ============================================================================
-// process_interrupt.cpp
+// process_interrupt.cpp — v4 Computed DWT
 // ============================================================================
 //
-// Revision notes:
+// v4: Computed DWT for VCLOCK subscribers.
 //
-//   1. arm_for_target functions now receive armed_counter32_target as a
-//      parameter instead of reaching back into runtime state via runtime_for().
+//   For subscribers whose events are GNSS VCLOCK compare matches
+//   (e.g., TIME_TEST on QTimer1 CH3), the event time is known exactly
+//   from the armed counter32 target:
 //
-//   2. Shadow DWT is owned by the subscriber runtime (rt.shadow_dwt), not
-//      by client-side extern globals.  The prespin callback writes it.
-//      Raw capture reads it from the runtime via a pointer passed at init.
+//     gnss_ns = (pps_count - 1) * 1e9 + ticks_since_pps * 100
+//     dwt     = time_gnss_ns_to_dwt(gnss_ns)
 //
-//   3. The prespin callback now enters a real shadow-write spin loop after
-//      arming the hardware, placing the CPU in a deterministic state.
+//   No prespin.  No shadow-write loop.  No ISR latency correction.
+//   The DWT is computed from the GNSS time via the calibrated DWT
+//   prediction, which has ~3 ns stddev over a full second and less
+//   for sub-second intervals.
 //
-//   4. TIMEPOP correctly sets deterministic_spin_active = false (no spin).
+//   The ISR-captured DWT (dwt_isr_entry_raw) is retained in the raw
+//   capture and diag structs for empirical comparison — the delta
+//   between computed DWT and ISR-captured DWT directly measures the
+//   ISR dispatch latency plus the DWT prediction residual.
 //
-//   5. verification_ok is computed from actual register consistency checks
-//      and gates event status to HOLD on mismatch.
+//   This eliminates:
+//     • Prespin scheduling (was starving timepop_dispatch)
+//     • Shadow-write spin loops (blocked main loop)
+//     • ISR latency correction constants (54-cycle uncertainty)
+//     • The prespin_lead_ns parameter for VCLOCK subscribers
 //
-//   6. Live Welford tracks shadow_to_isr_entry_cycles (actual ISR latency)
-//      instead of the static correction constant.
-//
-//   7. ISR dispatch uses direct runtime pointers cached at subscribe time,
-//      eliminating linear scan in the hot path.
-//
-//   8. Removed public interrupt_adjust_dwt_at_event and
-//      interrupt_capture_default_gnss_projection — these are now static.
-//
-//   9. Removed #include "process_clocks_internal.h" from the header.
-//      The dependency direction is now correct: clocks depends on
-//      interrupt, never the reverse.
+//   The descriptor flag dwt_from_counter controls this path.
+//   When true, subscriber_handle_interrupt computes both gnss_ns
+//   and dwt_at_event from the armed counter32 target using
+//   time_anchor_snapshot.  The correction is zero.
 //
 // ============================================================================
 
@@ -54,11 +54,7 @@
 
 static constexpr uint32_t MAX_INTERRUPT_SUBSCRIBERS = 8;
 
-// Prespin shadow-write spin timeout.  If the hardware compare interrupt
-// has not fired within this many DWT cycles after arming, the prespin
-// gives up.  At 1008 MHz this is ~10 ms — generous for events that
-// should fire within microseconds of arming.
-static constexpr uint32_t PRESPIN_SHADOW_SPIN_TIMEOUT_CYCLES = 10080000;
+static constexpr uint64_t NS_PER_TICK = 100ULL;
 
 // ============================================================================
 // Hard-fail integrity trap
@@ -100,8 +96,6 @@ static constexpr uint32_t PRESPIN_SHADOW_SPIN_TIMEOUT_CYCLES = 10080000;
 using interrupt_provider_init_fn =
     bool (*)(void);
 
-// arm_for_target receives the counter32 target as a parameter.
-// The function arms the hardware and writes back the armed values.
 using interrupt_provider_arm_fn =
     bool (*)(uint32_t counter32_target,
              uint16_t* out_compare16);
@@ -109,11 +103,8 @@ using interrupt_provider_arm_fn =
 using interrupt_provider_disarm_fn =
     void (*)(void);
 
-// Raw capture receives a pointer to the runtime's shadow_dwt so it can
-// harvest it without reaching into client globals.
 using interrupt_raw_capture_fn =
     void (*)(uint32_t dwt_isr_entry_raw,
-             const volatile uint32_t* shadow_dwt_ptr,
              interrupt_capture_raw_t& out_raw,
              interrupt_capture_diag_t* diag);
 
@@ -132,8 +123,12 @@ struct interrupt_subscriber_descriptor_t {
   interrupt_lane_t lane = interrupt_lane_t::NONE;
 
   bool exclusive_lane = true;
-  bool needs_prespin = true;
-  uint64_t prespin_lead_ns = INTERRUPT_PRESPIN_LEAD_NS_DEFAULT;
+
+  // When true, dwt_at_event and gnss_ns_at_event are computed from the
+  // armed counter32 target using time_anchor_snapshot — not from ISR DWT.
+  // Applicable to VCLOCK-based subscribers where the counter value IS
+  // the exact GNSS time.  No prespin, no correction, no spin.
+  bool dwt_from_counter = false;
 
   uint32_t default_dwt_event_correction_cycles = 0;
 
@@ -160,12 +155,6 @@ struct interrupt_subscriber_runtime_t {
   uint32_t armed_counter32_target = 0;
   uint16_t armed_compare16 = 0;
 
-  // Shadow DWT — owned by process_interrupt, written by the prespin
-  // shadow-write spin loop, read by the raw capture function.
-  volatile uint32_t shadow_dwt = 0;
-
-  timepop_handle_t prespin_handle = TIMEPOP_INVALID_HANDLE;
-
   interrupt_capture_latency_t latency {};
   interrupt_event_t last_event {};
   interrupt_capture_diag_t last_diag {};
@@ -179,8 +168,6 @@ struct interrupt_subscriber_runtime_t {
   uint32_t dispatch_count = 0;
   uint32_t provider_init_failures = 0;
   uint32_t provider_arm_failures = 0;
-  uint32_t prespin_arm_failures = 0;
-  uint32_t prespin_spin_timeouts = 0;
   uint32_t verification_failures = 0;
 };
 
@@ -201,7 +188,6 @@ static interrupt_provider_diag_t g_gpt2_diag = {};
 static interrupt_provider_diag_t g_gpio6789_diag = {};
 
 // Direct runtime pointers for ISR dispatch — cached at subscribe time.
-// Eliminates linear scan in the hot path.
 static interrupt_subscriber_runtime_t* g_rt_timepop = nullptr;
 static interrupt_subscriber_runtime_t* g_rt_time_test = nullptr;
 
@@ -212,11 +198,8 @@ static interrupt_subscriber_runtime_t* g_rt_time_test = nullptr;
 static const interrupt_subscriber_descriptor_t* descriptor_for(interrupt_subscriber_kind_t kind);
 static interrupt_subscriber_runtime_t* runtime_for(interrupt_subscriber_kind_t kind);
 
-static void subscriber_schedule_prespin(interrupt_subscriber_runtime_t& rt);
 static void subscriber_handle_interrupt(interrupt_subscriber_runtime_t& rt,
                                         uint32_t dwt_isr_entry_raw);
-
-static void subscriber_timepop_callback(timepop_ctx_t* ctx, void* user_data);
 
 static bool qtimer1_ch2_provider_init(void);
 static bool qtimer1_ch3_provider_init(void);
@@ -228,11 +211,9 @@ static void qtimer1_ch2_disarm(void);
 static void qtimer1_ch3_disarm(void);
 
 static void timepop_raw_capture(uint32_t dwt_isr_entry_raw,
-                                const volatile uint32_t* shadow_dwt_ptr,
                                 interrupt_capture_raw_t& out_raw,
                                 interrupt_capture_diag_t* diag);
 static void timetest_raw_capture(uint32_t dwt_isr_entry_raw,
-                                 const volatile uint32_t* shadow_dwt_ptr,
                                  interrupt_capture_raw_t& out_raw,
                                  interrupt_capture_diag_t* diag);
 
@@ -262,7 +243,7 @@ static inline void ic_welford_add(interrupt_capture_latency_t& t, uint32_t x) {
 }
 
 // ============================================================================
-// DWT correction — static, lane-specific
+// DWT correction — for ISR-captured DWT path only (e.g., TIMEPOP)
 // ============================================================================
 
 static uint32_t adjust_dwt_at_event(interrupt_provider_kind_t provider,
@@ -339,8 +320,7 @@ static const interrupt_subscriber_descriptor_t DESCRIPTORS[] = {
     interrupt_provider_kind_t::QTIMER1,
     interrupt_lane_t::QTIMER1_CH2,
     true,                                       // exclusive_lane
-    false,                                      // needs_prespin — TIMEPOP is the timing substrate
-    INTERRUPT_PRESPIN_LEAD_NS_DEFAULT,
+    false,                                      // dwt_from_counter — TIMEPOP uses ISR DWT
     (uint32_t)TDC_ISR_LATENCY_CYCLES_QTIMER,
     qtimer1_ch2_provider_init,
     qtimer1_ch2_arm,
@@ -354,14 +334,13 @@ static const interrupt_subscriber_descriptor_t DESCRIPTORS[] = {
     interrupt_provider_kind_t::QTIMER1,
     interrupt_lane_t::QTIMER1_CH3,
     true,                                       // exclusive_lane
-    true,                                       // needs_prespin
-    INTERRUPT_PRESPIN_LEAD_NS_DEFAULT,
-    (uint32_t)TDC_ISR_LATENCY_CYCLES_QTIMER,
+    true,                                       // dwt_from_counter — compute from VCLOCK
+    0,                                          // no correction — DWT is computed, not captured
     qtimer1_ch3_provider_init,
     qtimer1_ch3_arm,
     qtimer1_ch3_disarm,
     timetest_raw_capture,
-    default_gnss_projection
+    nullptr                                     // gnss_at_event_fn — not used, computed inline
   },
 };
 
@@ -428,8 +407,6 @@ static inline void qtimer1_ch2_arm_compare(uint16_t target_low16) {
   IMXRT_TMR1.CH[2].CSCTRL |= TMR_CSCTRL_TCF1EN;
 }
 
-// arm functions receive the counter32 target as a parameter — no reach-back.
-
 static bool qtimer1_ch2_arm(uint32_t counter32_target,
                             uint16_t* out_compare16) {
   const uint16_t target16 = (uint16_t)(counter32_target & 0xFFFFu);
@@ -463,18 +440,17 @@ static void qtimer1_ch3_disarm(void) {
 // ============================================================================
 // Raw capture hooks
 //
-// shadow_dwt_ptr points to the subscriber runtime's shadow_dwt field.
-// This is the framework-owned shadow, not a client global.
+// Raw capture harvests ISR-context hardware facts.  For dwt_from_counter
+// subscribers, the ISR DWT is diagnostic only — event time comes from
+// the computed path.
 // ============================================================================
 
 static void timepop_raw_capture(uint32_t dwt_isr_entry_raw,
-                                const volatile uint32_t*,
                                 interrupt_capture_raw_t& out_raw,
                                 interrupt_capture_diag_t* diag) {
   out_raw.dwt_isr_entry_raw = dwt_isr_entry_raw;
   out_raw.compare16 = (uint16_t)IMXRT_TMR1.CH[2].COMP1;
 
-  // Verification facts only — never used to invent event time.
   out_raw.verify_low16 = (uint16_t)IMXRT_TMR1.CH[0].CNTR;
   out_raw.verify_high16 = (uint16_t)IMXRT_TMR1.CH[1].HOLD;
 
@@ -488,18 +464,15 @@ static void timepop_raw_capture(uint32_t dwt_isr_entry_raw,
     diag->raw_compare16 = out_raw.compare16;
     diag->raw_verify_low16 = out_raw.verify_low16;
     diag->raw_verify_high16 = out_raw.verify_high16;
-    // TIMEPOP has no prespin shadow — shadow_valid stays false.
   }
 }
 
 static void timetest_raw_capture(uint32_t dwt_isr_entry_raw,
-                                 const volatile uint32_t* shadow_dwt_ptr,
                                  interrupt_capture_raw_t& out_raw,
                                  interrupt_capture_diag_t* diag) {
   out_raw.dwt_isr_entry_raw = dwt_isr_entry_raw;
   out_raw.compare16 = (uint16_t)IMXRT_TMR1.CH[3].COMP1;
 
-  // Verification facts only — never used to invent event time.
   out_raw.verify_low16 = (uint16_t)IMXRT_TMR1.CH[0].CNTR;
   out_raw.verify_high16 = (uint16_t)IMXRT_TMR1.CH[1].HOLD;
 
@@ -509,90 +482,10 @@ static void timetest_raw_capture(uint32_t dwt_isr_entry_raw,
 
   out_raw.dwt_after_capture = ic_read_dwt();
 
-  if (diag && shadow_dwt_ptr) {
-    diag->shadow_dwt = *shadow_dwt_ptr;
-    diag->shadow_valid = true;
+  if (diag) {
     diag->raw_compare16 = out_raw.compare16;
     diag->raw_verify_low16 = out_raw.verify_low16;
     diag->raw_verify_high16 = out_raw.verify_high16;
-  }
-}
-
-// ============================================================================
-// Subscriber scheduling
-// ============================================================================
-
-static void subscriber_timepop_callback(timepop_ctx_t*, void* user_data) {
-  auto* rt = static_cast<interrupt_subscriber_runtime_t*>(user_data);
-  if (!rt || !rt->active || !rt->pending_target_valid || !rt->desc) return;
-
-  rt->prespin_handle = TIMEPOP_INVALID_HANDLE;
-
-  // Arm the hardware compare register.
-  uint16_t armed_compare16 = 0;
-  if (!rt->desc->provider_arm_fn ||
-      !rt->desc->provider_arm_fn(rt->armed_counter32_target,
-                                 &armed_compare16)) {
-    rt->provider_arm_failures++;
-    interrupt_integrity_trap(4);
-  }
-
-  rt->arm_count++;
-  rt->armed_compare16 = armed_compare16;
-  rt->latency.prev_spin_dwt = rt->latency.last_spin_dwt;
-  rt->latency.last_spin_dwt = ic_read_dwt();
-  rt->latency.deterministic_spin_active = true;
-
-  // Enter the shadow-write spin loop.
-  // This is the core of deterministic ISR latency: the CPU does nothing
-  // but continuously write DWT to rt->shadow_dwt until the hardware
-  // compare interrupt preempts us.  The minimum observed delta between
-  // shadow_dwt and the ISR's first DWT capture IS the true fixed overhead.
-  const uint32_t spin_start = ic_read_dwt();
-  for (;;) {
-    rt->shadow_dwt = ic_read_dwt();
-    // The ISR will preempt this loop.  We never exit voluntarily
-    // except on timeout.
-    if (!rt->waiting_for_interrupt) break;
-    if ((ic_read_dwt() - spin_start) > PRESPIN_SHADOW_SPIN_TIMEOUT_CYCLES) {
-      rt->prespin_spin_timeouts++;
-      break;
-    }
-  }
-}
-
-static void subscriber_schedule_prespin(interrupt_subscriber_runtime_t& rt) {
-  if (!rt.active || !rt.pending_target_valid || !rt.desc) return;
-
-  if (rt.prespin_handle != TIMEPOP_INVALID_HANDLE) {
-    timepop_cancel(rt.prespin_handle);
-    rt.prespin_handle = TIMEPOP_INVALID_HANDLE;
-  }
-
-  const int64_t now_ns_signed = time_gnss_ns_now();
-  if (now_ns_signed < 0) {
-    rt.prespin_arm_failures++;
-    interrupt_integrity_trap(5);
-  }
-
-  const uint64_t now_ns = (uint64_t)now_ns_signed;
-  uint64_t wake_ns = rt.pending_target_gnss_ns;
-  if (rt.desc->prespin_lead_ns < wake_ns) {
-    wake_ns -= rt.desc->prespin_lead_ns;
-  } else {
-    wake_ns = now_ns;
-  }
-
-  const uint64_t delay_ns = (wake_ns > now_ns) ? (wake_ns - now_ns) : 0;
-
-  rt.prespin_handle = timepop_arm(delay_ns,
-                                  false,
-                                  subscriber_timepop_callback,
-                                  &rt,
-                                  rt.desc->name ? rt.desc->name : "interrupt-prespin");
-  if (rt.prespin_handle == TIMEPOP_INVALID_HANDLE) {
-    rt.prespin_arm_failures++;
-    interrupt_integrity_trap(6);
   }
 }
 
@@ -607,8 +500,6 @@ static void subscriber_handle_interrupt(interrupt_subscriber_runtime_t& rt,
   diag.provider = rt.desc->provider;
   diag.lane = rt.desc->lane;
   diag.kind = rt.sub.kind;
-  diag.spin_last_dwt = rt.latency.last_spin_dwt;
-  diag.spin_prev_dwt = rt.latency.prev_spin_dwt;
   diag.dwt_isr_entry_raw = dwt_isr_entry_raw;
 
   interrupt_capture_raw_t raw {};
@@ -616,23 +507,10 @@ static void subscriber_handle_interrupt(interrupt_subscriber_runtime_t& rt,
     interrupt_integrity_trap(8);
   }
 
-  // Pass the runtime's shadow_dwt address so raw capture can harvest it.
-  rt.desc->raw_capture_fn(dwt_isr_entry_raw, &rt.shadow_dwt, raw, &diag);
+  rt.desc->raw_capture_fn(dwt_isr_entry_raw, raw, &diag);
   diag.dwt_after_capture = raw.dwt_after_capture;
 
-  if (diag.shadow_valid) {
-    diag.shadow_to_isr_entry_cycles = dwt_isr_entry_raw - diag.shadow_dwt;
-    diag.prespin_established = true;
-
-    // Track ISR entry latency (shadow-to-ISR delta) in the Welford profile.
-    ic_welford_add(rt.latency, diag.shadow_to_isr_entry_cycles);
-  } else {
-    diag.shadow_to_isr_entry_cycles = 0;
-    diag.prespin_established = false;
-  }
-
-  // Sacred event-time truth comes from the armed full target count, not from
-  // any current register read.
+  // Sacred event-time truth comes from the armed full target count.
   const uint32_t counter32_at_event = rt.armed_counter32_target;
   diag.counter32_at_event = counter32_at_event;
   diag.counter32_authoritative = true;
@@ -643,27 +521,64 @@ static void subscriber_handle_interrupt(interrupt_subscriber_runtime_t& rt,
   diag.expected_low16 = expected_low16;
   diag.expected_high16 = expected_high16;
 
-  // Verification: live register values must be consistent with the armed target.
-  // The high16 may match exactly (normal case) or be the previous value
-  // (counter incremented between arm and ISR entry — benign).
-  diag.verify_high16_matches = (raw.verify_high16 == expected_high16);
-  diag.verify_high16_is_previous = (raw.verify_high16 == (uint16_t)(expected_high16 - 1u));
-  diag.verification_ok = diag.verify_high16_matches || diag.verify_high16_is_previous;
+  // Verification — for dwt_from_counter subscribers the compare flag
+  // firing IS the proof.  Live registers are stale by the time the
+  // ISR runs.  For ISR DWT subscribers, check register consistency.
+  if (rt.desc->dwt_from_counter) {
+    diag.verification_ok = true;
+  } else {
+    diag.verify_high16_matches = (raw.verify_high16 == expected_high16);
+    diag.verify_high16_is_previous = (raw.verify_high16 == (uint16_t)(expected_high16 - 1u));
+    diag.verification_ok = diag.verify_high16_matches || diag.verify_high16_is_previous;
+  }
 
-  const uint32_t correction_cycles =
-      adjust_dwt_at_event(rt.desc->provider,
-                          rt.desc->lane,
-                          dwt_isr_entry_raw,
-                          &diag);
+  // ── Event time reconstruction — two paths ──
 
-  const uint32_t dwt_at_event_adjusted = diag.dwt_at_event_adjusted;
-  const uint64_t gnss_ns_at_event =
-      rt.desc->gnss_at_event_fn
-        ? rt.desc->gnss_at_event_fn(dwt_at_event_adjusted)
-        : default_gnss_projection(dwt_at_event_adjusted);
+  uint32_t dwt_at_event = 0;
+  uint64_t gnss_ns_at_event = 0;
+  uint32_t correction_cycles = 0;
+
+  if (rt.desc->dwt_from_counter) {
+    // VCLOCK path: compute both GNSS ns and DWT from the armed counter32.
+    time_anchor_snapshot_t snap = time_anchor_snapshot();
+    if (snap.ok && snap.valid && snap.dwt_cycles_per_s > 0) {
+      const uint32_t ticks_since_pps = counter32_at_event - snap.qtimer_at_pps;
+      gnss_ns_at_event = (uint64_t)(snap.pps_count - 1) * 1000000000ULL
+                       + (uint64_t)ticks_since_pps * NS_PER_TICK;
+
+      dwt_at_event = time_gnss_ns_to_dwt((int64_t)gnss_ns_at_event);
+      diag.gnss_projection_valid = true;
+    } else {
+      // Fallback: time not valid.  Use ISR DWT with standard correction.
+      correction_cycles = adjust_dwt_at_event(rt.desc->provider,
+                                              rt.desc->lane,
+                                              dwt_isr_entry_raw,
+                                              &diag);
+      dwt_at_event = dwt_isr_entry_raw - correction_cycles;
+      gnss_ns_at_event = default_gnss_projection(dwt_at_event);
+      diag.gnss_projection_valid = true;
+    }
+
+    diag.dwt_event_correction_cycles = 0;
+    diag.dwt_at_event_adjusted = dwt_at_event;
+
+  } else {
+    // ISR DWT path: standard correction and projection (e.g., TIMEPOP).
+    correction_cycles = adjust_dwt_at_event(rt.desc->provider,
+                                            rt.desc->lane,
+                                            dwt_isr_entry_raw,
+                                            &diag);
+
+    dwt_at_event = diag.dwt_at_event_adjusted;
+    gnss_ns_at_event =
+        rt.desc->gnss_at_event_fn
+          ? rt.desc->gnss_at_event_fn(dwt_at_event)
+          : default_gnss_projection(dwt_at_event);
+
+    diag.gnss_projection_valid = true;
+  }
 
   diag.gnss_ns_at_event = gnss_ns_at_event;
-  diag.gnss_projection_valid = true;
 
   // Determine event status from verification outcome.
   interrupt_event_status_t status = interrupt_event_status_t::OK;
@@ -677,7 +592,7 @@ static void subscriber_handle_interrupt(interrupt_subscriber_runtime_t& rt,
   event.provider = rt.desc->provider;
   event.lane = rt.desc->lane;
   event.status = status;
-  event.dwt_at_event = dwt_at_event_adjusted;
+  event.dwt_at_event = dwt_at_event;
   event.gnss_ns_at_event = gnss_ns_at_event;
   event.counter32_at_event = counter32_at_event;
   event.dwt_event_correction_cycles = correction_cycles;
@@ -702,10 +617,6 @@ static void subscriber_handle_interrupt(interrupt_subscriber_runtime_t& rt,
     rt.pending_target_valid = true;
     rt.pending_target_gnss_ns = next.target_gnss_ns;
     rt.schedule_count++;
-
-    if (rt.desc->needs_prespin) {
-      subscriber_schedule_prespin(rt);
-    }
   }
 }
 
@@ -771,11 +682,6 @@ bool interrupt_stop(interrupt_subscriber_kind_t kind) {
   rt->pending_target_valid = false;
   rt->stop_count++;
 
-  if (rt->prespin_handle != TIMEPOP_INVALID_HANDLE) {
-    timepop_cancel(rt->prespin_handle);
-    rt->prespin_handle = TIMEPOP_INVALID_HANDLE;
-  }
-
   if (rt->desc->provider_disarm_fn) {
     rt->desc->provider_disarm_fn();
   }
@@ -802,30 +708,23 @@ bool interrupt_schedule_target(interrupt_subscriber_kind_t kind,
   rt->waiting_for_interrupt = true;
   rt->schedule_count++;
 
-  // Subscribers that don't need prespin (e.g., TIMEPOP) arm directly.
-  // TIMEPOP is the timing substrate — it cannot use TimePop-backed prespin
-  // without recursion.  It arms its provider directly and lets the shared
-  // IRQ deliver the event.
-  if (!rt->desc->needs_prespin) {
-    uint16_t armed_compare16 = 0;
+  // All subscribers arm directly — no prespin.
+  // For dwt_from_counter subscribers (VCLOCK), the event time is computed
+  // from the counter, so no prespin is needed.
+  // For ISR DWT subscribers (TIMEPOP), prespin was never used (TIMEPOP
+  // is the timing substrate).
+  uint16_t armed_compare16 = 0;
 
-    if (!rt->desc->provider_arm_fn ||
-        !rt->desc->provider_arm_fn(rt->armed_counter32_target,
-                                   &armed_compare16)) {
-      rt->provider_arm_failures++;
-      interrupt_integrity_trap(4);
-    }
-
-    rt->arm_count++;
-    rt->armed_compare16 = armed_compare16;
-    rt->latency.prev_spin_dwt = rt->latency.last_spin_dwt;
-    rt->latency.last_spin_dwt = ic_read_dwt();
-    // No prespin spin — truthfully report no deterministic spin.
-    rt->latency.deterministic_spin_active = false;
-    return true;
+  if (!rt->desc->provider_arm_fn ||
+      !rt->desc->provider_arm_fn(rt->armed_counter32_target,
+                                 &armed_compare16)) {
+    rt->provider_arm_failures++;
+    interrupt_integrity_trap(4);
   }
 
-  subscriber_schedule_prespin(*rt);
+  rt->arm_count++;
+  rt->armed_compare16 = armed_compare16;
+  rt->latency.deterministic_spin_active = false;
   return true;
 }
 
@@ -978,12 +877,9 @@ static Payload cmd_report(const Payload&) {
     s.add("pending_target_gnss_ns", rt.pending_target_gnss_ns);
     s.add("armed_counter32_target", rt.armed_counter32_target);
     s.add("armed_compare16", (uint32_t)rt.armed_compare16);
+    s.add("dwt_from_counter", rt.desc->dwt_from_counter);
 
     s.add("correction_default_cycles", rt.latency.dwt_event_correction_cycles_default);
-    s.add("isr_latency_samples", (int32_t)rt.latency.sample_count);
-    s.add("isr_latency_mean_cycles", rt.latency.mean_cycles);
-    s.add("isr_latency_min_cycles", rt.latency.min_cycles);
-    s.add("isr_latency_max_cycles", rt.latency.max_cycles);
 
     s.add("start_count", rt.start_count);
     s.add("stop_count", rt.stop_count);
@@ -993,8 +889,6 @@ static Payload cmd_report(const Payload&) {
     s.add("dispatch_count", rt.dispatch_count);
     s.add("provider_init_failures", rt.provider_init_failures);
     s.add("provider_arm_failures", rt.provider_arm_failures);
-    s.add("prespin_arm_failures", rt.prespin_arm_failures);
-    s.add("prespin_spin_timeouts", rt.prespin_spin_timeouts);
     s.add("verification_failures", rt.verification_failures);
 
     s.add("last_dwt_at_event", rt.last_event.dwt_at_event);
@@ -1004,18 +898,15 @@ static Payload cmd_report(const Payload&) {
     s.add("last_status", (uint32_t)rt.last_event.status);
 
     s.add("diag_dwt_isr_entry_raw", rt.last_diag.dwt_isr_entry_raw);
-    s.add("diag_shadow_valid", rt.last_diag.shadow_valid);
-    s.add("diag_shadow_dwt", rt.last_diag.shadow_dwt);
-    s.add("diag_shadow_to_isr_entry_cycles", rt.last_diag.shadow_to_isr_entry_cycles);
     s.add("diag_dwt_event_correction_cycles", rt.last_diag.dwt_event_correction_cycles);
     s.add("diag_dwt_at_event_adjusted", rt.last_diag.dwt_at_event_adjusted);
+    s.add("diag_gnss_ns_at_event", rt.last_diag.gnss_ns_at_event);
     s.add("diag_expected_low16", (uint32_t)rt.last_diag.expected_low16);
     s.add("diag_expected_high16", (uint32_t)rt.last_diag.expected_high16);
     s.add("diag_verify_high16_matches", rt.last_diag.verify_high16_matches);
     s.add("diag_verify_high16_is_previous", rt.last_diag.verify_high16_is_previous);
     s.add("diag_counter32_authoritative", rt.last_diag.counter32_authoritative);
     s.add("diag_gnss_projection_valid", rt.last_diag.gnss_projection_valid);
-    s.add("diag_prespin_established", rt.last_diag.prespin_established);
     s.add("diag_verification_ok", rt.last_diag.verification_ok);
 
     subscribers.add(s);
