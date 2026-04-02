@@ -45,7 +45,7 @@ static bool system_bootloader = false;
 // Terminal helpers
 // ================================================================
 
-static void enter_bootloader_cb(timepop_ctx_t*, void*) {
+static void enter_bootloader_cb(timepop_ctx_t*, timepop_diag_t*, void*) {
 
   // Idempotent, higher priority than shutdown
   if (system_bootloader) {

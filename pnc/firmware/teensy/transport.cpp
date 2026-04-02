@@ -186,7 +186,7 @@ void transport_register_receive_callback(
 // TX Pump (TIMEPOP-driven, single writer)
 // =============================================================
 
-static void transport_tx_pump(timepop_ctx_t*, void*) {
+static void transport_tx_pump(timepop_ctx_t*, timepop_diag_t*, void*) {
 
   if (tx_job_count == 0)
     return;
@@ -521,7 +521,7 @@ static void rx_serial_tick() {
 // RX Poll (timepop)
 // =============================================================
 
-static void transport_rx_tick(timepop_ctx_t*, void*) {
+static void transport_rx_tick(timepop_ctx_t*, timepop_diag_t*, void*) {
 
 #if defined(ZPNET_TRANSPORT_SELECTED_HID)
   rx_hid_tick();

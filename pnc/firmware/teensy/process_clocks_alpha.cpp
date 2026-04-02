@@ -73,17 +73,10 @@ static interrupt_next_target_t time_test_interrupt_event_handler(
 // PPS spin callback
 // ============================================================================
 
-static void pps_spin_callback(timepop_ctx_t* ctx, void*) {
-  pps_spin.landed_dwt     = ctx->fire_dwt_cyccnt;
+static void pps_spin_callback(timepop_ctx_t* ctx, timepop_diag_t* diag, void*) {
+  pps_spin.landed_dwt     = diag ? diag->dwt_at_fire : 0;
   pps_spin.landed_gnss_ns = ctx->fire_gnss_ns;
-  pps_spin.spin_error     = (int32_t)(ctx->fire_dwt_cyccnt - pps_spin.target_dwt);
-
-  if (ctx->nano_timeout) {
-    pps_spin.nano_timed_out = true;
-    pps_spin.nano_timeouts++;
-    pps_spin.completed = true;
-    return;
-  }
+  pps_spin.spin_error     = diag ? diag->spin_error_cycles : 0;
 
   pps_spin.nano_timed_out = false;
 
@@ -377,7 +370,7 @@ void ocxo_dac_set(ocxo_dac_state_t& s, double value) {
 volatile bool relay_arm_pending  = false;
 volatile bool relay_timer_active = false;
 
-static void pps_relay_deassert(timepop_ctx_t*, void*) {
+static void pps_relay_deassert(timepop_ctx_t*, timepop_diag_t*, void*) {
   digitalWriteFast(GNSS_PPS_RELAY, LOW);
   relay_timer_active = false;
 }
@@ -706,7 +699,7 @@ uint64_t clocks_ocxo2_ns_now(void) {
 // PPS handling — deferred ASAP callback (scheduled context)
 // ============================================================================
 
-static void pps_asap_callback(timepop_ctx_t*, void*) {
+static void pps_asap_callback(timepop_ctx_t*, timepop_diag_t*, void*) {
 
   pps_spin_complete(isr_snap_dwt);
   pps_spin_arm();

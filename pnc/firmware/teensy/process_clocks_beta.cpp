@@ -365,7 +365,7 @@ static void clocks_force_stop_campaign(void) {
   timebase_invalidate();
 }
 
-static void clocks_watchdog_anomaly_callback(timepop_ctx_t*, void*) {
+static void clocks_watchdog_anomaly_callback(timepop_ctx_t*, timepop_diag_t*, void*) {
   if (!watchdog_anomaly_publish_pending) {
     clocks_force_stop_campaign();
     return;

@@ -50,7 +50,7 @@ void cpu_usage_init(void) {
 // CPU usage sampler (TimePop recurring task)
 // ------------------------------------------------------------
 
-static void cpu_usage_tick(timepop_ctx_t* timer, void* /*user*/) {
+static void cpu_usage_tick(timepop_ctx_t*, timepop_diag_t*, void*) {
   cpu_usage_sample();
 }
 

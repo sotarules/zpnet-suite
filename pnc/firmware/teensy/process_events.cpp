@@ -104,7 +104,7 @@ void emit_system_error(
   enqueueEvent("SYSTEM_ERROR", ev);
 }
 
-static void publish_events(timepop_ctx_t*, void*) {
+static void publish_events(timepop_ctx_t*, timepop_diag_t*, void*) {
 
   if (evt_count == 0) {
     return;
