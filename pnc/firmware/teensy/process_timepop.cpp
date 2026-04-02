@@ -1,11 +1,31 @@
 // ============================================================================
-// process_timepop.cpp — TimePop v9.1 (shared interrupt authority)
+// process_timepop.cpp — TimePop v8.1 (ISR Callback Facility)
+// ============================================================================
+//
+// v8.1: ISR callback facility for timepop_arm_ns.
+//
+//   Slots armed with isr_callback=true have their callback invoked
+//   directly in the CH2 ISR after the DWT spin lands.  This enables
+//   time-critical patterns like the PPS shadow-write loop, where the
+//   callback must be actively executing when an external interrupt
+//   (PPS) arrives.
+//
+//   All other slots continue through scheduled dispatch as in v8.0.
+//   Welford residual updates run in dispatch for both paths.
+//
+// v8.0: Priority queue with a single hardware comparator.
+//   [See full v8.0 changelog in git history]
+//
+//   Pin assignment:
+//     Pin 10 (GPIO_B0_00, ALT1) — QTimer1 CH0+CH1 — passive 32-bit (10 MHz)
+//     QTimer1 CH2              — dynamic compare (priority queue scheduler)
+//     QTimer1 CH3              — unallocated
+//
 // ============================================================================
 
 #include "timepop.h"
 #include "process_timepop.h"
 #include "process_clocks_internal.h"
-#include "process_interrupt.h"
 
 #include "publish.h"
 
@@ -26,11 +46,12 @@
 // Constants — 10 MHz domain
 // ============================================================================
 
-static constexpr uint32_t MAX_SLOTS = 64;
+static constexpr uint32_t MAX_SLOTS = 16;
 static constexpr uint64_t NS_PER_TICK = 100ULL;
 static constexpr uint32_t MAX_DELAY_TICKS = 0x7FFFFFFFU;
 static constexpr uint32_t MIN_DELAY_TICKS = 2;
 static constexpr uint32_t HEARTBEAT_TICKS = 10000;
+static constexpr uint32_t DWT_SPIN_MAX_CYCLES = 110;
 static constexpr uint32_t PREDICT_MAX_QTIMER_ELAPSED = 15000000U;
 
 // ============================================================================
@@ -102,6 +123,7 @@ struct timepop_slot_t {
   uint32_t            predicted_dwt;
   bool                prediction_valid;
 
+  // v8.1: ISR callback
   bool                isr_callback;
   bool                isr_callback_fired;
 
@@ -117,10 +139,6 @@ struct timepop_slot_t {
 static timepop_slot_t slots[MAX_SLOTS];
 static volatile bool  timepop_pending = false;
 static uint32_t       next_handle = 1;
-
-// Sacred event-time counter for the next TIMEPOP compare.
-// process_interrupt will use this as authoritative event counter truth.
-static volatile uint32_t g_timepop_next_counter32_target = 0;
 
 // ============================================================================
 // Diagnostics
@@ -155,19 +173,16 @@ static volatile uint32_t diag_heartbeat_rearms   = 0;
 static volatile uint32_t diag_race_recoveries    = 0;
 static volatile uint32_t diag_isr_callbacks      = 0;
 
-static volatile uint32_t diag_interrupt_schedule_requests = 0;
-static volatile uint32_t diag_interrupt_schedule_failures = 0;
+// ============================================================================
+// Forward declarations
+// ============================================================================
+
+static void qtimer1_irq_isr(void);
+static void schedule_next(void);
 
 // ============================================================================
 // Helpers
 // ============================================================================
-
-[[noreturn]] static void blink_probe_forever(void) {
-  pinMode(LED_BUILTIN, OUTPUT);
-  while (true) {
-    debug_blink("911411");
-  }
-}
 
 static inline void update_slot_high_water(void) {
   uint32_t active = 0;
@@ -195,69 +210,29 @@ static uint32_t predict_dwt_at_deadline(uint32_t deadline, bool& valid) {
   time_anchor_snapshot_t snap = time_anchor_snapshot();
   if (!snap.ok || !snap.valid) return 0;
   if (snap.dwt_cycles_per_s == 0) return 0;
-
   const uint32_t qtimer_elapsed = deadline - snap.qtimer_at_pps;
   if (qtimer_elapsed > PREDICT_MAX_QTIMER_ELAPSED) return 0;
-
   const uint64_t ns_elapsed = (uint64_t)qtimer_elapsed * NS_PER_TICK;
   const uint64_t dwt_elapsed =
     (ns_elapsed * (uint64_t)snap.dwt_cycles_per_s + 500000000ULL) / 1000000000ULL;
-
   valid = true;
   return snap.dwt_at_pps + (uint32_t)dwt_elapsed;
 }
 
-static bool deadline_to_gnss_target(uint32_t deadline, int64_t& out_target_gnss_ns) {
-  time_anchor_snapshot_t snap = time_anchor_snapshot();
-  if (!snap.ok || !snap.valid) return false;
+// ============================================================================
+// CH2 compare management
+// ============================================================================
 
-  const uint32_t qtimer_elapsed = deadline - snap.qtimer_at_pps;
-  const int64_t epoch_ns = (int64_t)(snap.pps_count - 1) * (int64_t)1000000000LL;
-  out_target_gnss_ns = epoch_ns + (int64_t)((uint64_t)qtimer_elapsed * NS_PER_TICK);
-  return true;
+static inline void ch2_clear_flag(void) {
+  IMXRT_TMR1.CH[2].CSCTRL &= ~(TMR_CSCTRL_TCF1 | TMR_CSCTRL_TCF2);
 }
 
-// ============================================================================
-// Forward declarations
-// ============================================================================
-
-static void schedule_next(void);
-
-static interrupt_next_target_t timepop_interrupt_event_handler(
-    const interrupt_event_t& event,
-    const interrupt_capture_diag_t* diag,
-    void* user_data);
-
-// ============================================================================
-// Shared interrupt scheduling
-// ============================================================================
-
-static bool request_interrupt_for_deadline(uint32_t deadline) {
-  int64_t target_gnss_ns = 0;
-  if (!deadline_to_gnss_target(deadline, target_gnss_ns)) {
-    return false;
-  }
-
-  if (target_gnss_ns <= 0) return false;
-
-  g_timepop_next_counter32_target = deadline;
-
-  // Minimal migration hook: TIMEPOP still knows the sacred full 32-bit compare
-  // target, but hands it to process_interrupt so that process_interrupt can own
-  // canonical event reconstruction.
-  if (!interrupt_set_sacred_counter32_target(interrupt_subscriber_kind_t::TIMEPOP,
-                                             deadline)) {
-    return false;
-  }
-
-  diag_interrupt_schedule_requests++;
-  if (!interrupt_schedule_target(interrupt_subscriber_kind_t::TIMEPOP,
-                                 (uint64_t)target_gnss_ns)) {
-    diag_interrupt_schedule_failures++;
-    return false;
-  }
-
-  return true;
+static inline void ch2_arm_compare(uint16_t target_low16) {
+  ch2_clear_flag();
+  IMXRT_TMR1.CH[2].COMP1  = target_low16;
+  IMXRT_TMR1.CH[2].CMPLD1 = target_low16;
+  ch2_clear_flag();
+  IMXRT_TMR1.CH[2].CSCTRL |= TMR_CSCTRL_TCF1EN;
 }
 
 // ============================================================================
@@ -271,14 +246,12 @@ static void schedule_next(void) {
 
   for (uint32_t i = 0; i < MAX_SLOTS; i++) {
     if (!slots[i].active || slots[i].expired) continue;
-
     if (deadline_expired(slots[i].deadline, now)) {
       slots[i].expired = true;
       expired_count++;
       timepop_pending = true;
       continue;
     }
-
     if (!found || ((slots[i].deadline - now) < (soonest - now))) {
       soonest = slots[i].deadline;
       found = true;
@@ -299,14 +272,11 @@ static void schedule_next(void) {
     }
   }
 
+  ch2_arm_compare((uint16_t)(target & 0xFFFF));
   diag_rearm_count++;
 
-  if (!request_interrupt_for_deadline(target)) {
-    phantom_count++;
-  }
-
-  const uint16_t cntr = (uint16_t)(now & 0xFFFFu);
-  const uint16_t comp = (uint16_t)(target & 0xFFFFu);
+  const uint16_t cntr = IMXRT_TMR1.CH[2].CNTR;
+  const uint16_t comp = (uint16_t)(target & 0xFFFF);
   const uint16_t distance_16 = comp - cntr;
 
   if (distance_16 > 0x8000u) {
@@ -330,15 +300,11 @@ static void schedule_next(void) {
 // ============================================================================
 
 static inline void slot_capture(
-  timepop_slot_t& slot,
-  uint32_t fire_vclock_raw,
-  uint32_t fire_dwt_cyccnt,
-  int64_t fire_gnss_ns,
-  const time_anchor_snapshot_t& snap
+  timepop_slot_t& slot, uint32_t fire_vclock_raw,
+  uint32_t fire_dwt_cyccnt, const time_anchor_snapshot_t& snap
 ) {
   slot.fire_vclock_raw         = fire_vclock_raw;
   slot.fire_dwt_cyccnt         = fire_dwt_cyccnt;
-  slot.fire_gnss_ns            = fire_gnss_ns;
   slot.anchor_dwt_at_pps       = snap.dwt_at_pps;
   slot.anchor_dwt_cycles_per_s = snap.dwt_cycles_per_s;
   slot.anchor_qtimer_at_pps    = snap.qtimer_at_pps;
@@ -347,8 +313,7 @@ static inline void slot_capture(
 }
 
 static inline void slot_build_ctx(
-  const timepop_slot_t& slot,
-  timepop_ctx_t& ctx
+  const timepop_slot_t& slot, timepop_ctx_t& ctx
 ) {
   ctx.handle          = slot.handle;
   ctx.fire_vclock_raw = slot.fire_vclock_raw;
@@ -361,18 +326,17 @@ static inline void slot_build_ctx(
 }
 
 // ============================================================================
-// TIMEPOP subscriber callback under shared interrupt authority
+// QTimer1 CH2 ISR — priority queue scheduler
 // ============================================================================
 
-static interrupt_next_target_t timepop_interrupt_event_handler(
-    const interrupt_event_t& event,
-    const interrupt_capture_diag_t*,
-    void*) {
+static void qtimer1_ch2_isr(void) {
 
-  diag_isr_count++;
-
-  const uint32_t now = event.counter32_at_event;
+  const uint32_t dwt_entry = ARM_DWT_CYCCNT;
+  const uint32_t now       = qtimer1_read_32();
   const time_anchor_snapshot_t anchor = time_anchor_snapshot();
+
+  ch2_clear_flag();
+  diag_isr_count++;
 
   bool any_expired = false;
 
@@ -380,12 +344,29 @@ static interrupt_next_target_t timepop_interrupt_event_handler(
     if (!slots[i].active || slots[i].expired) continue;
     if (!deadline_expired(slots[i].deadline, now)) continue;
 
-    slot_capture(slots[i],
-                 now,
-                 event.dwt_at_event,
-                 (int64_t)event.gnss_ns_at_event,
-                 anchor);
+    // ── DWT fire moment determination ──
+    uint32_t landed_dwt;
 
+    if (slots[i].prediction_valid) {
+      const uint32_t target_dwt = slots[i].predicted_dwt;
+
+      if ((int32_t)(target_dwt - dwt_entry) > 0) {
+        const uint32_t spin_start = ARM_DWT_CYCCNT;
+        while ((int32_t)(target_dwt - ARM_DWT_CYCCNT) > 0) {
+          if ((ARM_DWT_CYCCNT - spin_start) > DWT_SPIN_MAX_CYCLES) break;
+        }
+        landed_dwt = ARM_DWT_CYCCNT;
+      } else {
+        landed_dwt = target_dwt;
+      }
+    } else {
+      landed_dwt = dwt_entry;
+    }
+
+    slots[i].fire_gnss_ns = time_dwt_to_gnss_ns(landed_dwt);
+    slot_capture(slots[i], now, landed_dwt, anchor);
+
+    // ── v8.1: ISR callback invocation ──
     slots[i].isr_callback_fired = false;
 
     if (slots[i].isr_callback) {
@@ -408,61 +389,12 @@ static interrupt_next_target_t timepop_interrupt_event_handler(
     phantom_count++;
   }
 
-  uint32_t vnow = now;
-  uint32_t soonest = 0;
-  bool found = false;
-
-  for (uint32_t i = 0; i < MAX_SLOTS; i++) {
-    if (!slots[i].active || slots[i].expired) continue;
-    if (deadline_expired(slots[i].deadline, vnow)) continue;
-
-    if (!found || ((slots[i].deadline - vnow) < (soonest - vnow))) {
-      soonest = slots[i].deadline;
-      found = true;
-    }
-  }
-
-  uint32_t next_deadline;
-  if (!found) {
-    next_deadline = vnow + HEARTBEAT_TICKS;
-    diag_heartbeat_rearms++;
-  } else {
-    uint32_t distance = soonest - vnow;
-    if (distance > HEARTBEAT_TICKS) {
-      next_deadline = vnow + HEARTBEAT_TICKS;
-      diag_heartbeat_rearms++;
-    } else {
-      next_deadline = soonest;
-    }
-  }
-
-  g_timepop_next_counter32_target = next_deadline;
-
-  int64_t target_gnss_ns = 0;
-  interrupt_next_target_t out {};
-  if (deadline_to_gnss_target(next_deadline, target_gnss_ns) && target_gnss_ns > 0) {
-    // Minimal migration hook: hand the sacred target to process_interrupt.
-    interrupt_set_sacred_counter32_target(interrupt_subscriber_kind_t::TIMEPOP,
-                                          next_deadline);
-    out.schedule_next = true;
-    out.target_gnss_ns = (uint64_t)target_gnss_ns;
-  } else {
-    out.schedule_next = false;
-    out.target_gnss_ns = 0;
-  }
-
-  return out;
+  schedule_next();
 }
 
 // ============================================================================
 // Initialization
 // ============================================================================
-
-void timepop_bootstrap(void) {
-  noInterrupts();
-  schedule_next();
-  interrupts();
-}
 
 void timepop_init(void) {
   for (uint32_t i = 0; i < MAX_SLOTS; i++) slots[i] = {};
@@ -470,18 +402,22 @@ void timepop_init(void) {
   welford_dwt_prediction.reset();
   welford_gnss_now.reset();
 
-  interrupt_subscription_t sub {};
-  sub.kind = interrupt_subscriber_kind_t::TIMEPOP;
-  sub.on_event = timepop_interrupt_event_handler;
-  sub.user_data = nullptr;
+  IMXRT_TMR1.CH[2].CTRL   = 0;
+  IMXRT_TMR1.CH[2].CNTR   = 0;
+  IMXRT_TMR1.CH[2].LOAD   = 0;
+  IMXRT_TMR1.CH[2].COMP1  = 0xFFFF;
+  IMXRT_TMR1.CH[2].CMPLD1 = 0xFFFF;
+  IMXRT_TMR1.CH[2].SCTRL  = 0;
+  IMXRT_TMR1.CH[2].CSCTRL = TMR_CSCTRL_TCF1EN;
+  IMXRT_TMR1.CH[2].CTRL   = TMR_CTRL_CM(1) | TMR_CTRL_PCS(0);
 
-  if (!interrupt_subscribe(sub)) {
-    blink_probe_forever();
-  }
+  attachInterruptVector(IRQ_QTIMER1, qtimer1_irq_isr);
+  NVIC_SET_PRIORITY(IRQ_QTIMER1, 16);
+  NVIC_ENABLE_IRQ(IRQ_QTIMER1);
 
-  if (!interrupt_start(interrupt_subscriber_kind_t::TIMEPOP)) {
-    blink_probe_forever();
-  }
+  noInterrupts();
+  schedule_next();
+  interrupts();
 }
 
 // ============================================================================
@@ -712,6 +648,7 @@ void timepop_dispatch(void) {
     if (!slots[i].active || !slots[i].expired) continue;
     slots[i].expired = false;
 
+    // ── ASAP ──
     if (slots[i].period_ns == 0 && !slots[i].recurring &&
         !slots[i].isr_callback_fired) {
 
@@ -732,12 +669,14 @@ void timepop_dispatch(void) {
       continue;
     }
 
+    // ── ISR-callback slot: callback already ran ──
     if (slots[i].isr_callback_fired) {
       slot_welford_update(slots[i]);
       slots[i].active = false;
       continue;
     }
 
+    // ── Timed (scheduled context callback) ──
     timepop_ctx_t ctx;
     slot_build_ctx(slots[i], ctx);
 
@@ -922,7 +861,7 @@ static Payload cmd_ns_test(const Payload& args) {
 
   timepop_handle_t h = timepop_arm_ns(
     target_gnss_ns, target_dwt,
-    ns_test_timer_callback, nullptr, "ns-test", false
+    ns_test_timer_callback, nullptr, "ns-test"
   );
   if (h == TIMEPOP_INVALID_HANDLE) { resp.add("error", "arm_ns failed"); return resp; }
 
@@ -976,9 +915,9 @@ static Payload cmd_report(const Payload&) {
   out.add("gnss_now_n",       (int32_t)welford_gnss_now.n);
   out.add("gnss_now_stddev",  welford_gnss_now.stddev());
 
-  out.add("interrupt_schedule_requests", diag_interrupt_schedule_requests);
-  out.add("interrupt_schedule_failures", diag_interrupt_schedule_failures);
-  out.add("next_counter32_target", g_timepop_next_counter32_target);
+  out.add("qtmr1_ch2_cntr",   (uint32_t)IMXRT_TMR1.CH[2].CNTR);
+  out.add("qtmr1_ch2_comp1",  (uint32_t)IMXRT_TMR1.CH[2].COMP1);
+  out.add("qtmr1_ch2_csctrl", (uint32_t)IMXRT_TMR1.CH[2].CSCTRL);
 
   PayloadArray timers;
   for (uint32_t i = 0; i < MAX_SLOTS; i++) {
@@ -1055,6 +994,16 @@ static Payload cmd_diag_reset(const Payload&) {
 }
 
 // ============================================================================
+// QTimer1 ISR
+// ============================================================================
+
+static void qtimer1_irq_isr(void) {
+  if (IMXRT_TMR1.CH[2].CSCTRL & TMR_CSCTRL_TCF1) {
+    qtimer1_ch2_isr();
+  }
+}
+
+// ============================================================================
 // Process registration
 // ============================================================================
 
@@ -1064,7 +1013,7 @@ static const process_command_entry_t TIMEPOP_COMMANDS[] = {
   { "DIAG_RESET",  cmd_diag_reset  },
   { "TEST",        cmd_test        },
   { "NS_TEST",     cmd_ns_test     },
-  { nullptr,       nullptr         }
+  { nullptr,       nullptr }
 };
 
 static const process_vtable_t TIMEPOP_PROCESS = {

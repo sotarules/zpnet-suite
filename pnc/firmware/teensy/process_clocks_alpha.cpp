@@ -798,7 +798,8 @@ static void pps_asap_callback(timepop_ctx_t*, void*) {
       ocxo_phase.ocxo1_valid && ocxo_phase.ocxo2_valid;
   }
 
-  time_test_arm();
+  // MULE commented out
+  // time_test_arm();
 
   clocks_beta_pps();
 
