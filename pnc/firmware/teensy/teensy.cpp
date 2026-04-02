@@ -337,7 +337,7 @@ void setup() {
   // ----------------------------------------------------------
 
   debug_log("boot", "process_interrupt_init");
-  //process_interrupt_init();
+  process_interrupt_init();
   debug_log("boot", "process_interrupt_init done");
 
   debug_log("boot", "process_interrupt_register");

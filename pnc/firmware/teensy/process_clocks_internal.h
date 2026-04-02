@@ -368,6 +368,29 @@ struct ocxo_phase_capture_t {
 
 extern ocxo_phase_capture_t ocxo_phase;
 
+// Add after the existing ocxo_phase_capture_t or wherever appropriate:
+
+struct ocxo_boundary_state_t {
+  // OCXO1
+  uint64_t  ocxo1_last_gnss_ns;
+  uint64_t  ocxo1_prev_gnss_ns;
+  uint32_t  ocxo1_second_count;
+  int64_t   ocxo1_period_ns;           // gnss_ns[n] - gnss_ns[n-1] (should be ~1e9)
+  int64_t   ocxo1_phase_offset_ns;     // gnss_ns - second_count * 1e9
+
+  // OCXO2
+  uint64_t  ocxo2_last_gnss_ns;
+  uint64_t  ocxo2_prev_gnss_ns;
+  uint32_t  ocxo2_second_count;
+  int64_t   ocxo2_period_ns;
+  int64_t   ocxo2_phase_offset_ns;
+
+  bool      ocxo1_valid;
+  bool      ocxo2_valid;
+};
+
+extern ocxo_boundary_state_t ocxo_boundary;
+
 extern volatile uint32_t ocxo_phase_shadow_dwt;
 extern volatile uint32_t ocxo1_phase_isr_dwt;
 extern volatile uint32_t ocxo1_phase_shadow_dwt;

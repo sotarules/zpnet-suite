@@ -288,8 +288,8 @@ const interrupt_capture_diag_t* interrupt_last_diag(interrupt_subscriber_kind_t 
 // ============================================================================
 
 void process_interrupt_qtimer1_irq(void);
-void process_interrupt_gpt1_irq(void);
-void process_interrupt_gpt2_irq(void);
+void process_interrupt_gpt1_irq(uint32_t dwt_isr_entry_raw);
+void process_interrupt_gpt2_irq(uint32_t dwt_isr_entry_raw);
 void process_interrupt_gpio6789_irq(void);
 
 // ============================================================================

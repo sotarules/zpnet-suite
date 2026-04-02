@@ -1,27 +1,21 @@
 // ============================================================================
-// process_interrupt.cpp — v5 TimePop fallback
+// process_interrupt.cpp — v6.1 GPT OCXO second-boundary (OCR3)
 // ============================================================================
 //
-// v5: TimePop is a peer, not a subscriber.
+// GPT1/GPT2 for OCXO second-boundary events using output compare 3.
 //
-//   process_interrupt owns the shared QTimer1 vector and dispatches
-//   CH3 through the subscription model (for TIME_TEST and future
-//   VCLOCK subscribers).
+// OCR1 is reserved for the existing PPS phase capture system (one-shot,
+// armed by pps_isr, consumed by gpt1/2_phase_isr).  We use OCR3 to
+// avoid any conflict.
 //
-//   CH2 fires are delegated directly to TimePop's own ISR function
-//   (timepop_ch2_isr) with zero intermediate layer.  TimePop owns
-//   CH2 hardware arming, slot scanning, and deadline scheduling
-//   internally — exactly as it did before process_interrupt existed.
+// GPT runs in free-running mode (FRR=1), so the counter never resets.
+// OCR3 fires when counter == OCR3 value.  The ISR advances OCR3 by
+// OCXO_COUNTS_PER_SECOND for the next second boundary.
 //
-//   This eliminates the subscription overhead that was causing
-//   dispatch starvation: event reconstruction, diag struct assembly,
-//   verification, GNSS projection, and struct copying ran on every
-//   CH2 heartbeat fire (~460/sec) even though TimePop only needed
-//   counter32 and DWT.
-//
-//   The subscriber model remains for CH3 (TIME_TEST) with computed
-//   DWT from VCLOCK counter, and will extend to future subscribers
-//   (PPS, OCXO, PHOTODIODE) on GPT/GPIO lanes.
+// The existing GPT ISR vectors (gpt1_phase_isr, gpt2_phase_isr) are
+// owned by process_clocks_alpha.  They check the OF3 flag and call
+// process_interrupt_gpt1_irq / gpt2_irq, passing the DWT they already
+// captured as their first ISR instruction.
 //
 // ============================================================================
 
@@ -31,8 +25,7 @@
 #include "time.h"
 #include "process.h"
 #include "payload.h"
-#include "process_timepop.h"
-#include "timepop.h"
+#include "tdc_correction.h"
 
 #include <Arduino.h>
 #include "imxrt.h"
@@ -40,12 +33,13 @@
 #include <string.h>
 
 // ============================================================================
-// Constants / limits
+// Constants
 // ============================================================================
 
 static constexpr uint32_t MAX_INTERRUPT_SUBSCRIBERS = 8;
 
-static constexpr uint64_t NS_PER_TICK = 100ULL;
+// OCXO second boundary: 10,000,000 counts at ~10 MHz.
+static constexpr uint32_t OCXO_COUNTS_PER_SECOND = 10000000;
 
 // ============================================================================
 // Hard-fail integrity trap
@@ -81,29 +75,7 @@ static constexpr uint64_t NS_PER_TICK = 100ULL;
 }
 
 // ============================================================================
-// Internal callback types for known subscriber descriptors
-// ============================================================================
-
-using interrupt_provider_init_fn =
-    bool (*)(void);
-
-using interrupt_provider_arm_fn =
-    bool (*)(uint32_t counter32_target,
-             uint16_t* out_compare16);
-
-using interrupt_provider_disarm_fn =
-    void (*)(void);
-
-using interrupt_raw_capture_fn =
-    void (*)(uint32_t dwt_isr_entry_raw,
-             interrupt_capture_raw_t& out_raw,
-             interrupt_capture_diag_t* diag);
-
-using interrupt_gnss_fn =
-    uint64_t (*)(uint32_t dwt_at_event_adjusted);
-
-// ============================================================================
-// Descriptor + runtime state
+// Subscriber descriptor + runtime state
 // ============================================================================
 
 struct interrupt_subscriber_descriptor_t {
@@ -113,17 +85,7 @@ struct interrupt_subscriber_descriptor_t {
   interrupt_provider_kind_t provider = interrupt_provider_kind_t::NONE;
   interrupt_lane_t lane = interrupt_lane_t::NONE;
 
-  bool exclusive_lane = true;
-  bool dwt_from_counter = false;
-
-  uint32_t default_dwt_event_correction_cycles = 0;
-
-  interrupt_provider_init_fn provider_init_fn = nullptr;
-  interrupt_provider_arm_fn provider_arm_fn = nullptr;
-  interrupt_provider_disarm_fn provider_disarm_fn = nullptr;
-
-  interrupt_raw_capture_fn raw_capture_fn = nullptr;
-  interrupt_gnss_fn gnss_at_event_fn = nullptr;
+  uint32_t isr_overhead_cycles = 0;
 };
 
 struct interrupt_subscriber_runtime_t {
@@ -132,35 +94,30 @@ struct interrupt_subscriber_runtime_t {
 
   bool subscribed = false;
   bool active = false;
-  bool waiting_for_interrupt = false;
-  bool pending_target_valid = false;
 
-  uint64_t pending_target_gnss_ns = 0;
+  // OCR3 tracking — the next compare value for continuous fire.
+  uint32_t next_ocr3 = 0;
 
-  uint32_t armed_counter32_target = 0;
-  uint16_t armed_compare16 = 0;
-
-  interrupt_capture_latency_t latency {};
+  // Last event delivered to the subscriber.
   interrupt_event_t last_event {};
-  interrupt_capture_diag_t last_diag {};
   bool has_fired = false;
 
+  // Counters.
   uint32_t start_count = 0;
   uint32_t stop_count = 0;
-  uint32_t schedule_count = 0;
-  uint32_t arm_count = 0;
   uint32_t irq_count = 0;
   uint32_t dispatch_count = 0;
-  uint32_t provider_init_failures = 0;
-  uint32_t provider_arm_failures = 0;
-  uint32_t verification_failures = 0;
+  uint32_t ocxo_second_count = 0;
 };
+
+// ============================================================================
+// Provider diagnostics
+// ============================================================================
 
 struct interrupt_provider_diag_t {
   uint32_t irq_count = 0;
-  uint32_t dispatch_misses = 0;
-  uint32_t init_count = 0;
-  uint32_t ch2_delegated = 0;
+  uint32_t dispatch_count = 0;
+  uint32_t miss_count = 0;
 };
 
 static interrupt_subscriber_runtime_t g_subscribers[MAX_INTERRUPT_SUBSCRIBERS] = {};
@@ -168,81 +125,53 @@ static uint32_t g_subscriber_count = 0;
 
 static bool g_interrupt_hw_ready = false;
 
-static interrupt_provider_diag_t g_qtimer1_diag = {};
 static interrupt_provider_diag_t g_gpt1_diag = {};
 static interrupt_provider_diag_t g_gpt2_diag = {};
-static interrupt_provider_diag_t g_gpio6789_diag = {};
 
-// Direct runtime pointer for CH3 subscriber (TIME_TEST).
-// CH2 is delegated to TimePop directly — no subscriber runtime.
-static interrupt_subscriber_runtime_t* g_rt_time_test = nullptr;
-
-// ============================================================================
-// Forward declarations
-// ============================================================================
-
-static const interrupt_subscriber_descriptor_t* descriptor_for(interrupt_subscriber_kind_t kind);
-static interrupt_subscriber_runtime_t* runtime_for(interrupt_subscriber_kind_t kind);
-
-static void subscriber_handle_interrupt(interrupt_subscriber_runtime_t& rt,
-                                        uint32_t dwt_isr_entry_raw);
-
-static bool qtimer1_ch3_provider_init(void);
-static bool qtimer1_ch3_arm(uint32_t counter32_target, uint16_t* out_compare16);
-static void qtimer1_ch3_disarm(void);
-
-static void timetest_raw_capture(uint32_t dwt_isr_entry_raw,
-                                 interrupt_capture_raw_t& out_raw,
-                                 interrupt_capture_diag_t* diag);
+// Direct runtime pointers for ISR dispatch — cached at subscribe time.
+static interrupt_subscriber_runtime_t* g_rt_ocxo1 = nullptr;
+static interrupt_subscriber_runtime_t* g_rt_ocxo2 = nullptr;
 
 // ============================================================================
-// Local helpers
+// Subscriber descriptors
 // ============================================================================
 
-static inline void ic_welford_add(interrupt_capture_latency_t& t, uint32_t x) {
-  const double xd = static_cast<double>(x);
-  t.sample_count += 1;
-  const double delta = xd - t.mean_cycles;
-  t.mean_cycles += delta / static_cast<double>(t.sample_count);
-  const double delta2 = xd - t.mean_cycles;
-  t.m2_cycles += delta * delta2;
+static const interrupt_subscriber_descriptor_t DESCRIPTORS[] = {
+  {
+    interrupt_subscriber_kind_t::OCXO1,
+    "OCXO1",
+    interrupt_provider_kind_t::GPT1,
+    interrupt_lane_t::GPT1_COMPARE1,
+    GPT_ISR_FIXED_OVERHEAD,
+  },
+  {
+    interrupt_subscriber_kind_t::OCXO2,
+    "OCXO2",
+    interrupt_provider_kind_t::GPT2,
+    interrupt_lane_t::GPT2_COMPARE1,
+    GPT_ISR_FIXED_OVERHEAD,
+  },
+};
 
-  if (t.sample_count == 1) {
-    t.min_cycles = x;
-    t.max_cycles = x;
-  } else {
-    if (x < t.min_cycles) t.min_cycles = x;
-    if (x > t.max_cycles) t.max_cycles = x;
+// ============================================================================
+// Descriptor / runtime lookup
+// ============================================================================
+
+static const interrupt_subscriber_descriptor_t* descriptor_for(interrupt_subscriber_kind_t kind) {
+  for (uint32_t i = 0; i < (sizeof(DESCRIPTORS) / sizeof(DESCRIPTORS[0])); i++) {
+    if (DESCRIPTORS[i].kind == kind) return &DESCRIPTORS[i];
   }
+  return nullptr;
 }
 
-// ============================================================================
-// DWT correction — for ISR-captured DWT path only
-// ============================================================================
-
-static uint32_t adjust_dwt_at_event(interrupt_provider_kind_t provider,
-                                    interrupt_lane_t lane,
-                                    uint32_t dwt_isr_entry_raw,
-                                    interrupt_capture_diag_t* diag) {
-  uint32_t correction_cycles = 0;
-
-  if (provider == interrupt_provider_kind_t::QTIMER1 &&
-      (lane == interrupt_lane_t::QTIMER1_CH2 || lane == interrupt_lane_t::QTIMER1_CH3)) {
-    correction_cycles = (uint32_t)TDC_ISR_LATENCY_CYCLES_QTIMER;
+static interrupt_subscriber_runtime_t* runtime_for(interrupt_subscriber_kind_t kind) {
+  for (uint32_t i = 0; i < g_subscriber_count; i++) {
+    if (g_subscribers[i].subscribed &&
+        g_subscribers[i].sub.kind == kind) {
+      return &g_subscribers[i];
+    }
   }
-
-  if (diag) {
-    diag->dwt_event_correction_cycles = correction_cycles;
-    diag->dwt_at_event_adjusted = dwt_isr_entry_raw - correction_cycles;
-  }
-
-  return correction_cycles;
-}
-
-static uint64_t default_gnss_projection(uint32_t dwt_at_event_adjusted) {
-  const int64_t gnss = time_dwt_to_gnss_ns(dwt_at_event_adjusted);
-  if (gnss < 0) interrupt_integrity_trap(1);
-  return static_cast<uint64_t>(gnss);
+  return nullptr;
 }
 
 // ============================================================================
@@ -284,234 +213,94 @@ const char* interrupt_lane_str(interrupt_lane_t lane) {
 }
 
 // ============================================================================
-// Known subscriber descriptors — CH3 only (TimePop is not a subscriber)
+// Event reconstruction — GPT OCXO second-boundary
 // ============================================================================
 
-static const interrupt_subscriber_descriptor_t DESCRIPTORS[] = {
-  {
-    interrupt_subscriber_kind_t::TIME_TEST,
-    "TIME_TEST",
-    interrupt_provider_kind_t::QTIMER1,
-    interrupt_lane_t::QTIMER1_CH3,
-    true,                                       // exclusive_lane
-    true,                                       // dwt_from_counter — compute from VCLOCK
-    0,                                          // no correction — DWT is computed, not captured
-    qtimer1_ch3_provider_init,
-    qtimer1_ch3_arm,
-    qtimer1_ch3_disarm,
-    timetest_raw_capture,
-    nullptr                                     // gnss_at_event_fn — not used, computed inline
-  },
-};
+static void gpt_handle_ocxo_event(interrupt_subscriber_runtime_t& rt,
+                                  uint32_t dwt_isr_entry_raw) {
+  if (!rt.desc || !rt.sub.on_event) return;
 
-// ============================================================================
-// Descriptor / runtime lookup
-// ============================================================================
+  const uint32_t correction = rt.desc->isr_overhead_cycles;
+  const uint32_t dwt_at_event = dwt_isr_entry_raw - correction;
 
-static const interrupt_subscriber_descriptor_t* descriptor_for(interrupt_subscriber_kind_t kind) {
-  for (uint32_t i = 0; i < (sizeof(DESCRIPTORS) / sizeof(DESCRIPTORS[0])); i++) {
-    if (DESCRIPTORS[i].kind == kind) return &DESCRIPTORS[i];
-  }
-  return nullptr;
-}
+  const int64_t gnss_ns_signed = time_dwt_to_gnss_ns(dwt_at_event);
 
-static interrupt_subscriber_runtime_t* runtime_for(interrupt_subscriber_kind_t kind) {
-  for (uint32_t i = 0; i < g_subscriber_count; i++) {
-    if (g_subscribers[i].subscribed &&
-        g_subscribers[i].sub.kind == kind) {
-      return &g_subscribers[i];
-    }
-  }
-  return nullptr;
-}
-
-// ============================================================================
-// Provider init / arm / disarm — QTIMER1 CH3 only
-// ============================================================================
-
-static bool qtimer1_ch3_provider_init(void) {
-  IMXRT_TMR1.CH[3].CTRL   = 0;
-  IMXRT_TMR1.CH[3].CNTR   = IMXRT_TMR1.CH[0].CNTR;
-  IMXRT_TMR1.CH[3].LOAD   = 0;
-  IMXRT_TMR1.CH[3].COMP1  = 0xFFFF;
-  IMXRT_TMR1.CH[3].CMPLD1 = 0xFFFF;
-  IMXRT_TMR1.CH[3].SCTRL  = 0;
-  IMXRT_TMR1.CH[3].CSCTRL = 0;
-  IMXRT_TMR1.CH[3].CTRL   = TMR_CTRL_CM(1) | TMR_CTRL_PCS(0);
-  g_qtimer1_diag.init_count++;
-  return true;
-}
-
-static bool qtimer1_ch3_arm(uint32_t counter32_target,
-                            uint16_t* out_compare16) {
-  const uint16_t target16 = (uint16_t)(counter32_target & 0xFFFFu);
-
-  IMXRT_TMR1.CH[3].CSCTRL = 0;
-  IMXRT_TMR1.CH[3].COMP1  = target16;
-  IMXRT_TMR1.CH[3].CMPLD1 = target16;
-  IMXRT_TMR1.CH[3].CSCTRL = 0;
-  IMXRT_TMR1.CH[3].CSCTRL = TMR_CSCTRL_TCF1EN;
-
-  if (out_compare16) *out_compare16 = target16;
-  return true;
-}
-
-static void qtimer1_ch3_disarm(void) {
-  IMXRT_TMR1.CH[3].CSCTRL &= ~TMR_CSCTRL_TCF1EN;
-}
-
-// ============================================================================
-// Raw capture — TIME_TEST
-// ============================================================================
-
-static void timetest_raw_capture(uint32_t dwt_isr_entry_raw,
-                                 interrupt_capture_raw_t& out_raw,
-                                 interrupt_capture_diag_t* diag) {
-  out_raw.dwt_isr_entry_raw = dwt_isr_entry_raw;
-  out_raw.compare16 = (uint16_t)IMXRT_TMR1.CH[3].COMP1;
-
-  out_raw.verify_low16 = (uint16_t)IMXRT_TMR1.CH[0].CNTR;
-  out_raw.verify_high16 = (uint16_t)IMXRT_TMR1.CH[1].HOLD;
-
-  out_raw.irq_status = IMXRT_TMR1.CH[3].CSCTRL;
-  IMXRT_TMR1.CH[3].CSCTRL = 0;
-  out_raw.irq_flags_cleared = 1u;
-
-  out_raw.dwt_after_capture = ARM_DWT_CYCCNT;
-
-  if (diag) {
-    diag->raw_compare16 = out_raw.compare16;
-    diag->raw_verify_low16 = out_raw.verify_low16;
-    diag->raw_verify_high16 = out_raw.verify_high16;
-  }
-}
-
-// ============================================================================
-// Event reconstruction — subscriber path (CH3 only)
-// ============================================================================
-
-static void subscriber_handle_interrupt(interrupt_subscriber_runtime_t& rt,
-                                        uint32_t dwt_isr_entry_raw) {
-  if (!rt.desc || !rt.sub.on_event) {
-    interrupt_integrity_trap(7);
-  }
-
-  interrupt_capture_diag_t diag {};
-  diag.enabled = true;
-  diag.provider = rt.desc->provider;
-  diag.lane = rt.desc->lane;
-  diag.kind = rt.sub.kind;
-  diag.dwt_isr_entry_raw = dwt_isr_entry_raw;
-
-  interrupt_capture_raw_t raw {};
-  if (!rt.desc->raw_capture_fn) {
-    interrupt_integrity_trap(8);
-  }
-
-  rt.desc->raw_capture_fn(dwt_isr_entry_raw, raw, &diag);
-  diag.dwt_after_capture = raw.dwt_after_capture;
-
-  const uint32_t counter32_at_event = rt.armed_counter32_target;
-  diag.counter32_at_event = counter32_at_event;
-  diag.counter32_authoritative = true;
-
-  const uint16_t expected_low16 = (uint16_t)(counter32_at_event & 0xFFFFu);
-  const uint16_t expected_high16 = (uint16_t)((counter32_at_event >> 16) & 0xFFFFu);
-
-  diag.expected_low16 = expected_low16;
-  diag.expected_high16 = expected_high16;
-
-  // For dwt_from_counter subscribers the compare flag IS the proof.
-  if (rt.desc->dwt_from_counter) {
-    diag.verification_ok = true;
-  } else {
-    diag.verify_high16_matches = (raw.verify_high16 == expected_high16);
-    diag.verify_high16_is_previous = (raw.verify_high16 == (uint16_t)(expected_high16 - 1u));
-    diag.verification_ok = diag.verify_high16_matches || diag.verify_high16_is_previous;
-  }
-
-  // ── Event time reconstruction ──
-
-  uint32_t dwt_at_event = 0;
-  uint64_t gnss_ns_at_event = 0;
-  uint32_t correction_cycles = 0;
-
-  if (rt.desc->dwt_from_counter) {
-    time_anchor_snapshot_t snap = time_anchor_snapshot();
-    if (snap.ok && snap.valid && snap.dwt_cycles_per_s > 0) {
-      const uint32_t ticks_since_pps = counter32_at_event - snap.qtimer_at_pps;
-      gnss_ns_at_event = (uint64_t)(snap.pps_count - 1) * 1000000000ULL
-                       + (uint64_t)ticks_since_pps * NS_PER_TICK;
-
-      dwt_at_event = time_gnss_ns_to_dwt((int64_t)gnss_ns_at_event);
-      diag.gnss_projection_valid = true;
-    } else {
-      correction_cycles = adjust_dwt_at_event(rt.desc->provider,
-                                              rt.desc->lane,
-                                              dwt_isr_entry_raw,
-                                              &diag);
-      dwt_at_event = dwt_isr_entry_raw - correction_cycles;
-      gnss_ns_at_event = default_gnss_projection(dwt_at_event);
-      diag.gnss_projection_valid = true;
-    }
-
-    diag.dwt_event_correction_cycles = 0;
-    diag.dwt_at_event_adjusted = dwt_at_event;
-
-  } else {
-    correction_cycles = adjust_dwt_at_event(rt.desc->provider,
-                                            rt.desc->lane,
-                                            dwt_isr_entry_raw,
-                                            &diag);
-
-    dwt_at_event = diag.dwt_at_event_adjusted;
-    gnss_ns_at_event =
-        rt.desc->gnss_at_event_fn
-          ? rt.desc->gnss_at_event_fn(dwt_at_event)
-          : default_gnss_projection(dwt_at_event);
-
-    diag.gnss_projection_valid = true;
-  }
-
-  diag.gnss_ns_at_event = gnss_ns_at_event;
-
-  interrupt_event_status_t status = interrupt_event_status_t::OK;
-  if (!diag.verification_ok) {
-    status = interrupt_event_status_t::HOLD;
-    rt.verification_failures++;
-  }
+  rt.ocxo_second_count++;
 
   interrupt_event_t event {};
-  event.kind = rt.sub.kind;
+  event.kind = rt.desc->kind;
   event.provider = rt.desc->provider;
   event.lane = rt.desc->lane;
-  event.status = status;
   event.dwt_at_event = dwt_at_event;
-  event.gnss_ns_at_event = gnss_ns_at_event;
-  event.counter32_at_event = counter32_at_event;
-  event.dwt_event_correction_cycles = correction_cycles;
-  event.raw = raw;
-  event.latency = rt.latency;
-  event.latency.dwt_event_correction_cycles = correction_cycles;
+  event.dwt_event_correction_cycles = correction;
+  event.counter32_at_event = rt.ocxo_second_count;
+
+  if (gnss_ns_signed >= 0) {
+    event.gnss_ns_at_event = (uint64_t)gnss_ns_signed;
+    event.status = interrupt_event_status_t::OK;
+  } else {
+    event.gnss_ns_at_event = 0;
+    event.status = interrupt_event_status_t::HOLD;
+  }
 
   rt.last_event = event;
-  rt.last_diag = diag;
   rt.has_fired = true;
   rt.irq_count++;
   rt.dispatch_count++;
 
-  interrupt_next_target_t next =
-      rt.sub.on_event(event, &rt.last_diag, rt.sub.user_data);
+  rt.sub.on_event(event, nullptr, rt.sub.user_data);
+}
 
-  rt.waiting_for_interrupt = false;
-  rt.pending_target_valid = false;
-  rt.latency.deterministic_spin_active = false;
+// ============================================================================
+// GPT1 ISR entry — called from gpt1_phase_isr when OF3 is set
+// ============================================================================
 
-  if (next.schedule_next) {
-    rt.pending_target_valid = true;
-    rt.pending_target_gnss_ns = next.target_gnss_ns;
-    rt.schedule_count++;
+void process_interrupt_gpt1_irq(uint32_t dwt_isr_entry_raw) {
+  g_gpt1_diag.irq_count++;
+
+  if (!(GPT1_SR & GPT_SR_OF3)) {
+    g_gpt1_diag.miss_count++;
+    return;
   }
+
+  // Clear OF3 flag.
+  GPT1_SR = GPT_SR_OF3;
+
+  g_gpt1_diag.dispatch_count++;
+
+  interrupt_subscriber_runtime_t* rt = g_rt_ocxo1;
+  if (!rt || !rt->active) return;
+
+  // Advance OCR3 for next second boundary.
+  rt->next_ocr3 += OCXO_COUNTS_PER_SECOND;
+  GPT1_OCR3 = rt->next_ocr3;
+
+  gpt_handle_ocxo_event(*rt, dwt_isr_entry_raw);
+}
+
+// ============================================================================
+// GPT2 ISR entry — called from gpt2_phase_isr when OF3 is set
+// ============================================================================
+
+void process_interrupt_gpt2_irq(uint32_t dwt_isr_entry_raw) {
+  g_gpt2_diag.irq_count++;
+
+  if (!(GPT2_SR & GPT_SR_OF3)) {
+    g_gpt2_diag.miss_count++;
+    return;
+  }
+
+  GPT2_SR = GPT_SR_OF3;
+
+  g_gpt2_diag.dispatch_count++;
+
+  interrupt_subscriber_runtime_t* rt = g_rt_ocxo2;
+  if (!rt || !rt->active) return;
+
+  rt->next_ocr3 += OCXO_COUNTS_PER_SECOND;
+  GPT2_OCR3 = rt->next_ocr3;
+
+  gpt_handle_ocxo_event(*rt, dwt_isr_entry_raw);
 }
 
 // ============================================================================
@@ -541,15 +330,11 @@ bool interrupt_subscribe(const interrupt_subscription_t& sub) {
   rt.desc = desc;
   rt.sub = sub;
   rt.subscribed = true;
-  rt.latency.dwt_event_correction_cycles_default = desc->default_dwt_event_correction_cycles;
 
-  if (desc->provider_init_fn && !desc->provider_init_fn()) {
-    rt.provider_init_failures++;
-    interrupt_integrity_trap(11);
-  }
-
-  if (sub.kind == interrupt_subscriber_kind_t::TIME_TEST) {
-    g_rt_time_test = &rt;
+  if (sub.kind == interrupt_subscriber_kind_t::OCXO1) {
+    g_rt_ocxo1 = &rt;
+  } else if (sub.kind == interrupt_subscriber_kind_t::OCXO2) {
+    g_rt_ocxo2 = &rt;
   }
 
   return true;
@@ -561,6 +346,23 @@ bool interrupt_start(interrupt_subscriber_kind_t kind) {
 
   rt->active = true;
   rt->start_count++;
+
+  // Read the current GPT counter and set OCR3 to the next second boundary.
+  // This ensures the first fire happens within one OCXO-second of start.
+  if (kind == interrupt_subscriber_kind_t::OCXO1) {
+    uint32_t now = GPT1_CNT;
+    rt->next_ocr3 = now + OCXO_COUNTS_PER_SECOND;
+    GPT1_OCR3 = rt->next_ocr3;
+    GPT1_SR = GPT_SR_OF3;                     // clear any stale flag
+    GPT1_IR |= GPT_IR_OF3IE;                  // enable output compare 3 interrupt
+  } else if (kind == interrupt_subscriber_kind_t::OCXO2) {
+    uint32_t now = GPT2_CNT;
+    rt->next_ocr3 = now + OCXO_COUNTS_PER_SECOND;
+    GPT2_OCR3 = rt->next_ocr3;
+    GPT2_SR = GPT_SR_OF3;
+    GPT2_IR |= GPT_IR_OF3IE;
+  }
+
   return true;
 }
 
@@ -569,53 +371,19 @@ bool interrupt_stop(interrupt_subscriber_kind_t kind) {
   if (!rt || !rt->desc) return false;
 
   rt->active = false;
-  rt->waiting_for_interrupt = false;
-  rt->pending_target_valid = false;
   rt->stop_count++;
 
-  if (rt->desc->provider_disarm_fn) {
-    rt->desc->provider_disarm_fn();
+  if (kind == interrupt_subscriber_kind_t::OCXO1) {
+    GPT1_IR &= ~GPT_IR_OF3IE;
+  } else if (kind == interrupt_subscriber_kind_t::OCXO2) {
+    GPT2_IR &= ~GPT_IR_OF3IE;
   }
 
-  return true;
-}
-
-bool interrupt_set_sacred_counter32_target(interrupt_subscriber_kind_t kind,
-                                           uint32_t counter32_target) {
-  interrupt_subscriber_runtime_t* rt = runtime_for(kind);
-  if (!rt || !rt->desc) return false;
-  rt->armed_counter32_target = counter32_target;
-  rt->armed_compare16 = (uint16_t)(counter32_target & 0xFFFFu);
-  return true;
-}
-
-bool interrupt_schedule_target(interrupt_subscriber_kind_t kind,
-                               uint64_t target_gnss_ns) {
-  interrupt_subscriber_runtime_t* rt = runtime_for(kind);
-  if (!rt || !rt->desc || !rt->active) return false;
-
-  rt->pending_target_valid = true;
-  rt->pending_target_gnss_ns = target_gnss_ns;
-  rt->waiting_for_interrupt = true;
-  rt->schedule_count++;
-
-  uint16_t armed_compare16 = 0;
-
-  if (!rt->desc->provider_arm_fn ||
-      !rt->desc->provider_arm_fn(rt->armed_counter32_target,
-                                 &armed_compare16)) {
-    rt->provider_arm_failures++;
-    interrupt_integrity_trap(4);
-  }
-
-  rt->arm_count++;
-  rt->armed_compare16 = armed_compare16;
-  rt->latency.deterministic_spin_active = false;
   return true;
 }
 
 // ============================================================================
-// Last event / diag accessors
+// Last event accessor
 // ============================================================================
 
 const interrupt_event_t* interrupt_last_event(interrupt_subscriber_kind_t kind) {
@@ -624,89 +392,13 @@ const interrupt_event_t* interrupt_last_event(interrupt_subscriber_kind_t kind) 
   return &rt->last_event;
 }
 
-const interrupt_capture_diag_t* interrupt_last_diag(interrupt_subscriber_kind_t kind) {
-  interrupt_subscriber_runtime_t* rt = runtime_for(kind);
-  if (!rt || !rt->has_fired) return nullptr;
-  return &rt->last_diag;
-}
-
-// ============================================================================
-// Shared IRQ authority
-//
-// process_interrupt owns the QTimer1 vector.
-// CH3 is dispatched through the subscriber model (TIME_TEST).
-// CH2 is delegated directly to TimePop's internal ISR — no
-// subscription, no event reconstruction, no intermediate layer.
-// ============================================================================
-
-void process_interrupt_qtimer1_irq(void) {
-  // DWT must be the absolute first instruction. No helpers, no
-  // function calls, no indirection.  Direct register read.
-  const uint32_t dwt_isr_entry_raw = ARM_DWT_CYCCNT;
-
-  g_qtimer1_diag.irq_count++;
-
-  // ── CH3: TIME_TEST (subscriber path) ──
-
-  if (IMXRT_TMR1.CH[3].CSCTRL & TMR_CSCTRL_TCF1) {
-    interrupt_subscriber_runtime_t* rt = g_rt_time_test;
-
-    if (!rt) {
-      interrupt_integrity_trap(14);
-    }
-    if (!rt->active) {
-      interrupt_integrity_trap(15);
-    }
-    if (!rt->waiting_for_interrupt) {
-      IMXRT_TMR1.CH[3].CSCTRL = 0;
-      g_qtimer1_diag.dispatch_misses++;
-      return;
-    }
-
-    subscriber_handle_interrupt(*rt, dwt_isr_entry_raw);
-    return;
-  }
-
-  g_qtimer1_diag.dispatch_misses++;
-}
-
-void process_interrupt_gpt1_irq(void) {
-  g_gpt1_diag.irq_count++;
-  g_gpt1_diag.dispatch_misses++;
-}
-
-void process_interrupt_gpt2_irq(void) {
-  g_gpt2_diag.irq_count++;
-  g_gpt2_diag.dispatch_misses++;
-}
-
-void process_interrupt_gpio6789_irq(void) {
-  g_gpio6789_diag.irq_count++;
-  g_gpio6789_diag.dispatch_misses++;
-}
-
 // ============================================================================
 // Init / process registration
 // ============================================================================
 
 void process_interrupt_init(void) {
   if (g_interrupt_hw_ready) return;
-
-  attachInterruptVector(IRQ_QTIMER1, []() {
-    process_interrupt_qtimer1_irq();
-  });
-  NVIC_SET_PRIORITY(IRQ_QTIMER1, 16);
-
   g_interrupt_hw_ready = true;
-}
-
-void process_interrupt_enable_irqs(void) {
-  if (!g_interrupt_hw_ready) {
-    interrupt_integrity_trap(14);
-  }
-
-  NVIC_DISABLE_IRQ(IRQ_QTIMER1);
-  NVIC_ENABLE_IRQ(IRQ_QTIMER1);
 }
 
 static Payload cmd_report(const Payload&) {
@@ -715,22 +407,13 @@ static Payload cmd_report(const Payload&) {
   p.add("hardware_ready", g_interrupt_hw_ready);
   p.add("subscriber_count", g_subscriber_count);
 
-  p.add("qtimer1_irq_count", g_qtimer1_diag.irq_count);
-  p.add("qtimer1_dispatch_misses", g_qtimer1_diag.dispatch_misses);
-  p.add("qtimer1_ch2_delegated", g_qtimer1_diag.ch2_delegated);
-  p.add("qtimer1_init_count", g_qtimer1_diag.init_count);
-
   p.add("gpt1_irq_count", g_gpt1_diag.irq_count);
-  p.add("gpt1_dispatch_misses", g_gpt1_diag.dispatch_misses);
-  p.add("gpt1_init_count", g_gpt1_diag.init_count);
+  p.add("gpt1_dispatch_count", g_gpt1_diag.dispatch_count);
+  p.add("gpt1_miss_count", g_gpt1_diag.miss_count);
 
   p.add("gpt2_irq_count", g_gpt2_diag.irq_count);
-  p.add("gpt2_dispatch_misses", g_gpt2_diag.dispatch_misses);
-  p.add("gpt2_init_count", g_gpt2_diag.init_count);
-
-  p.add("gpio6789_irq_count", g_gpio6789_diag.irq_count);
-  p.add("gpio6789_dispatch_misses", g_gpio6789_diag.dispatch_misses);
-  p.add("gpio6789_init_count", g_gpio6789_diag.init_count);
+  p.add("gpt2_dispatch_count", g_gpt2_diag.dispatch_count);
+  p.add("gpt2_miss_count", g_gpt2_diag.miss_count);
 
   PayloadArray subscribers;
   for (uint32_t i = 0; i < g_subscriber_count; i++) {
@@ -743,42 +426,18 @@ static Payload cmd_report(const Payload&) {
     s.add("provider", interrupt_provider_kind_str(rt.desc->provider));
     s.add("lane", interrupt_lane_str(rt.desc->lane));
     s.add("active", rt.active);
-    s.add("waiting_for_interrupt", rt.waiting_for_interrupt);
-    s.add("pending_target_valid", rt.pending_target_valid);
-    s.add("pending_target_gnss_ns", rt.pending_target_gnss_ns);
-    s.add("armed_counter32_target", rt.armed_counter32_target);
-    s.add("armed_compare16", (uint32_t)rt.armed_compare16);
-    s.add("dwt_from_counter", rt.desc->dwt_from_counter);
-
-    s.add("correction_default_cycles", rt.latency.dwt_event_correction_cycles_default);
 
     s.add("start_count", rt.start_count);
     s.add("stop_count", rt.stop_count);
-    s.add("schedule_count", rt.schedule_count);
-    s.add("arm_count", rt.arm_count);
     s.add("irq_count", rt.irq_count);
     s.add("dispatch_count", rt.dispatch_count);
-    s.add("provider_init_failures", rt.provider_init_failures);
-    s.add("provider_arm_failures", rt.provider_arm_failures);
-    s.add("verification_failures", rt.verification_failures);
+    s.add("ocxo_second_count", rt.ocxo_second_count);
+    s.add("next_ocr3", rt.next_ocr3);
 
     s.add("last_dwt_at_event", rt.last_event.dwt_at_event);
     s.add("last_gnss_ns_at_event", rt.last_event.gnss_ns_at_event);
-    s.add("last_counter32_at_event", rt.last_event.counter32_at_event);
-    s.add("last_dwt_event_correction_cycles", rt.last_event.dwt_event_correction_cycles);
+    s.add("last_correction_cycles", rt.last_event.dwt_event_correction_cycles);
     s.add("last_status", (uint32_t)rt.last_event.status);
-
-    s.add("diag_dwt_isr_entry_raw", rt.last_diag.dwt_isr_entry_raw);
-    s.add("diag_dwt_event_correction_cycles", rt.last_diag.dwt_event_correction_cycles);
-    s.add("diag_dwt_at_event_adjusted", rt.last_diag.dwt_at_event_adjusted);
-    s.add("diag_gnss_ns_at_event", rt.last_diag.gnss_ns_at_event);
-    s.add("diag_expected_low16", (uint32_t)rt.last_diag.expected_low16);
-    s.add("diag_expected_high16", (uint32_t)rt.last_diag.expected_high16);
-    s.add("diag_verify_high16_matches", rt.last_diag.verify_high16_matches);
-    s.add("diag_verify_high16_is_previous", rt.last_diag.verify_high16_is_previous);
-    s.add("diag_counter32_authoritative", rt.last_diag.counter32_authoritative);
-    s.add("diag_gnss_projection_valid", rt.last_diag.gnss_projection_valid);
-    s.add("diag_verification_ok", rt.last_diag.verification_ok);
 
     subscribers.add(s);
   }

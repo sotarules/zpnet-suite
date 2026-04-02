@@ -977,6 +977,19 @@ static Payload cmd_report(const Payload&) {
   p.add("ocxo1_gnss_ns_per_pps", ocxo_phase.ocxo1_gnss_ns_per_pps);
   p.add("ocxo2_gnss_ns_per_pps", ocxo_phase.ocxo2_gnss_ns_per_pps);
 
+  // OCXO second-boundary measurement (process_interrupt driven)
+  p.add("boundary_ocxo1_valid",           (bool)ocxo_boundary.ocxo1_valid);
+  p.add("boundary_ocxo1_last_gnss_ns",    ocxo_boundary.ocxo1_last_gnss_ns);
+  p.add("boundary_ocxo1_period_ns",       ocxo_boundary.ocxo1_period_ns);
+  p.add("boundary_ocxo1_phase_offset_ns", ocxo_boundary.ocxo1_phase_offset_ns);
+  p.add("boundary_ocxo1_second_count",    ocxo_boundary.ocxo1_second_count);
+
+  p.add("boundary_ocxo2_valid",           (bool)ocxo_boundary.ocxo2_valid);
+  p.add("boundary_ocxo2_last_gnss_ns",    ocxo_boundary.ocxo2_last_gnss_ns);
+  p.add("boundary_ocxo2_period_ns",       ocxo_boundary.ocxo2_period_ns);
+  p.add("boundary_ocxo2_phase_offset_ns", ocxo_boundary.ocxo2_phase_offset_ns);
+  p.add("boundary_ocxo2_second_count",    ocxo_boundary.ocxo2_second_count);
+
   p.add("ocxo1_residual_ns", ocxo_phase.ocxo1_residual_ns);
   p.add("ocxo2_residual_ns", ocxo_phase.ocxo2_residual_ns);
   p.add("phase_residual_valid", (bool)ocxo_phase.residual_valid);

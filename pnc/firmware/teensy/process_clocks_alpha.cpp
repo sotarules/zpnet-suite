@@ -450,6 +450,68 @@ volatile uint32_t diag_ocxo_phase_spin_timeouts = 0;
 
 ocxo_phase_capture_t ocxo_phase = {};
 
+// ============================================================================
+// OCXO second-boundary state (process_interrupt driven)
+// ============================================================================
+
+ocxo_boundary_state_t ocxo_boundary = {};
+
+static interrupt_next_target_t ocxo1_boundary_callback(
+    const interrupt_event_t& event,
+    const interrupt_capture_diag_t*,
+    void*) {
+
+  if (event.status != interrupt_event_status_t::OK) {
+    interrupt_next_target_t out {};
+    return out;
+  }
+
+  ocxo_boundary.ocxo1_prev_gnss_ns = ocxo_boundary.ocxo1_last_gnss_ns;
+  ocxo_boundary.ocxo1_last_gnss_ns = event.gnss_ns_at_event;
+  ocxo_boundary.ocxo1_second_count = event.counter32_at_event;
+
+  if (ocxo_boundary.ocxo1_prev_gnss_ns > 0) {
+    ocxo_boundary.ocxo1_period_ns =
+        (int64_t)event.gnss_ns_at_event - (int64_t)ocxo_boundary.ocxo1_prev_gnss_ns;
+    ocxo_boundary.ocxo1_valid = true;
+  }
+
+  ocxo_boundary.ocxo1_phase_offset_ns =
+      (int64_t)event.gnss_ns_at_event
+    - (int64_t)ocxo_boundary.ocxo1_second_count * (int64_t)1000000000LL;
+
+  interrupt_next_target_t out {};
+  return out;
+}
+
+static interrupt_next_target_t ocxo2_boundary_callback(
+    const interrupt_event_t& event,
+    const interrupt_capture_diag_t*,
+    void*) {
+
+  if (event.status != interrupt_event_status_t::OK) {
+    interrupt_next_target_t out {};
+    return out;
+  }
+
+  ocxo_boundary.ocxo2_prev_gnss_ns = ocxo_boundary.ocxo2_last_gnss_ns;
+  ocxo_boundary.ocxo2_last_gnss_ns = event.gnss_ns_at_event;
+  ocxo_boundary.ocxo2_second_count = event.counter32_at_event;
+
+  if (ocxo_boundary.ocxo2_prev_gnss_ns > 0) {
+    ocxo_boundary.ocxo2_period_ns =
+        (int64_t)event.gnss_ns_at_event - (int64_t)ocxo_boundary.ocxo2_prev_gnss_ns;
+    ocxo_boundary.ocxo2_valid = true;
+  }
+
+  ocxo_boundary.ocxo2_phase_offset_ns =
+      (int64_t)event.gnss_ns_at_event
+    - (int64_t)ocxo_boundary.ocxo2_second_count * (int64_t)1000000000LL;
+
+  interrupt_next_target_t out {};
+  return out;
+}
+
 volatile uint32_t diag_gpt1_isr_fires = 0;
 volatile uint32_t diag_gpt2_isr_fires = 0;
 
@@ -462,15 +524,23 @@ static void gpt1_phase_isr(void) {
   const uint32_t shadow  = ocxo_phase_shadow_dwt;
   const uint32_t gpt     = GPT1_CNT;
 
-  GPT1_SR = GPT_SR_OF1;
-  GPT1_IR &= ~GPT_IR_OF1IE;
+  // OF1 — PPS phase capture (existing, one-shot)
+  if (GPT1_SR & GPT_SR_OF1) {
+    GPT1_SR = GPT_SR_OF1;
+    GPT1_IR &= ~GPT_IR_OF1IE;
 
-  ocxo1_phase_isr_dwt     = dwt_raw;
-  ocxo1_phase_shadow_dwt  = shadow;
-  ocxo1_phase_gpt_at_fire = gpt;
-  ocxo1_phase_captured    = true;
+    ocxo1_phase_isr_dwt     = dwt_raw;
+    ocxo1_phase_shadow_dwt  = shadow;
+    ocxo1_phase_gpt_at_fire = gpt;
+    ocxo1_phase_captured    = true;
 
-  diag_gpt1_isr_fires++;
+    diag_gpt1_isr_fires++;
+  }
+
+  // OF3 — OCXO second-boundary (continuous, process_interrupt)
+  if (GPT1_SR & GPT_SR_OF3) {
+    process_interrupt_gpt1_irq(dwt_raw);
+  }
 }
 
 static void gpt2_phase_isr(void) {
@@ -478,15 +548,21 @@ static void gpt2_phase_isr(void) {
   const uint32_t shadow  = ocxo_phase_shadow_dwt;
   const uint32_t gpt     = GPT2_CNT;
 
-  GPT2_SR = GPT_SR_OF1;
-  GPT2_IR &= ~GPT_IR_OF1IE;
+  if (GPT2_SR & GPT_SR_OF1) {
+    GPT2_SR = GPT_SR_OF1;
+    GPT2_IR &= ~GPT_IR_OF1IE;
 
-  ocxo2_phase_isr_dwt     = dwt_raw;
-  ocxo2_phase_shadow_dwt  = shadow;
-  ocxo2_phase_gpt_at_fire = gpt;
-  ocxo2_phase_captured    = true;
+    ocxo2_phase_isr_dwt     = dwt_raw;
+    ocxo2_phase_shadow_dwt  = shadow;
+    ocxo2_phase_gpt_at_fire = gpt;
+    ocxo2_phase_captured    = true;
 
-  diag_gpt2_isr_fires++;
+    diag_gpt2_isr_fires++;
+  }
+
+  if (GPT2_SR & GPT_SR_OF3) {
+    process_interrupt_gpt2_irq(dwt_raw);
+  }
 }
 
 // ============================================================================
@@ -961,10 +1037,18 @@ void process_clocks_init(void) {
   attachInterrupt(digitalPinToInterrupt(GNSS_PPS_PIN), pps_isr, RISING);
   NVIC_SET_PRIORITY(IRQ_GPIO6789, 0);
 
-  interrupt_subscription_t time_test_sub {};
-  time_test_sub.kind = interrupt_subscriber_kind_t::TIME_TEST;
-  time_test_sub.on_event = time_test_interrupt_event_handler;
-  time_test_sub.user_data = nullptr;
-  interrupt_subscribe(time_test_sub);
-  interrupt_start(interrupt_subscriber_kind_t::TIME_TEST);
+  // OCXO second-boundary subscribers
+  interrupt_subscription_t ocxo1_sub {};
+  ocxo1_sub.kind = interrupt_subscriber_kind_t::OCXO1;
+  ocxo1_sub.on_event = ocxo1_boundary_callback;
+  ocxo1_sub.user_data = nullptr;
+  interrupt_subscribe(ocxo1_sub);
+  interrupt_start(interrupt_subscriber_kind_t::OCXO1);
+
+  interrupt_subscription_t ocxo2_sub {};
+  ocxo2_sub.kind = interrupt_subscriber_kind_t::OCXO2;
+  ocxo2_sub.on_event = ocxo2_boundary_callback;
+  ocxo2_sub.user_data = nullptr;
+  interrupt_subscribe(ocxo2_sub);
+  interrupt_start(interrupt_subscriber_kind_t::OCXO2);
 }
