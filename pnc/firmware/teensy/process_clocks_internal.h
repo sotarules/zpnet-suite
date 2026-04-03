@@ -1,37 +1,37 @@
-#pragma once
-
 // ============================================================================
 // process_clocks_internal.h — Shared Internal State (Alpha ↔ Beta)
 // ============================================================================
 //
-// v30: interrupt migration prep.
+// Nanosecond-first clock model.
 //
-//   process_interrupt is now the target interrupt authority.  Clocks alpha
-//   remains partially transitional in this pass.  New / existing diagnostics
-//   should prefer canonical interrupt_event / interrupt_capture_diag fields
-//   where available, but legacy direct reads remain temporarily intact for
-//   PPS / OCXO migration safety.
+// Core intent:
 //
-// v29: OCXO phase capture — shadow-write TDC architecture.
-// v24: Servo mode enum (MEAN/TOTAL) replaces bool calibrate_ocxo_active.
-// v23: 10 MHz single-edge QTimer1 migration.
-// v20: PPS rejection recovery watchdog diagnostics.
-// v19: Spin capture with shadow-write TDC + timeout protection.
-// v14: Symmetric GPT architecture for both OCXOs.
+//   • GNSS nanoseconds are the canonical public truth.
+//   • DWT remains the bridge substrate and is the only clock with a live
+//     next-second adjustment term.
+//   • OCXO1 / OCXO2 are modeled by:
+//       - last observed edge in GNSS ns
+//       - last observed local nanosecond count at that edge
+//       - predicted local nanoseconds per GNSS second
+//   • PPS computes the canonical at-PPS values that feed TIMEBASE and now().
+//   • Diagnostics belong in process_interrupt and reports, not in sacred state.
 //
 // ============================================================================
 
+#pragma once
+
 #include "config.h"
 #include "payload.h"
-#include "timepop.h"
 #include "time.h"
+#include "process_interrupt.h"
 
 #include <stdint.h>
 #include <stddef.h>
 #include <math.h>
+#include <stdio.h>
 
 // ============================================================================
-// DWT register defines (needed by both alpha and beta)
+// DWT register defines
 // ============================================================================
 
 #define DEMCR               (*(volatile uint32_t *)0xE000EDFC)
@@ -48,108 +48,118 @@ static inline uint64_t dwt_cycles_to_ns(uint64_t cycles) {
   return (cycles * DWT_NS_NUM) / DWT_NS_DEN;
 }
 
-static inline uint64_t dwt_ns_to_cycles(uint64_t ns)
-{
+static inline uint64_t dwt_ns_to_cycles(uint64_t ns) {
   return (ns * DWT_NS_DEN) / DWT_NS_NUM;
 }
 
 // ============================================================================
-// Continuous DWT-to-GNSS Calibration (alpha-owned, beta-readable)
+// Always-on DWT↔GNSS anchor state (alpha-owned, beta-readable)
 // ============================================================================
 
-extern volatile uint32_t  g_dwt_at_last_pps;
-extern volatile uint32_t  g_dwt_cycles_per_gnss_s;
-extern volatile bool      g_dwt_cal_has_prev;
-extern volatile bool      g_dwt_cal_valid;
-extern volatile uint64_t  g_dwt_cal_pps_count;
+extern volatile uint64_t g_gnss_ns_count_at_pps;
+
+extern volatile uint32_t g_dwt_cycle_count_at_pps;
+extern volatile uint32_t g_dwt_cycle_count_next_second_prediction;
+extern volatile int32_t  g_dwt_cycle_count_next_second_adjustment;
+extern volatile uint64_t g_dwt_model_pps_count;
+
+// ============================================================================
+// OCXO canonical state (alpha-owned, beta-readable)
+// ============================================================================
+
+struct ocxo_clock_state_t {
+  volatile uint64_t gnss_ns_at_edge;
+  volatile uint64_t ns_count_at_edge;
+  volatile uint64_t ns_count_next_second_prediction;
+  volatile uint64_t ns_count_at_pps;
+};
+
+extern ocxo_clock_state_t g_ocxo1_clock;
+extern ocxo_clock_state_t g_ocxo2_clock;
+
+// ============================================================================
+// Lightweight measurement state
+// ============================================================================
+
+struct ocxo_measurement_t {
+  volatile int64_t  second_residual_ns;
+  volatile uint64_t prev_gnss_ns_at_edge;
+};
+
+extern ocxo_measurement_t g_ocxo1_measurement;
+extern ocxo_measurement_t g_ocxo2_measurement;
+
+// ============================================================================
+// Interrupt diag snapshots (alpha-owned, beta-readable)
+// ============================================================================
+
+extern interrupt_capture_diag_t g_pps_interrupt_diag;
+extern interrupt_capture_diag_t g_ocxo1_interrupt_diag;
+extern interrupt_capture_diag_t g_ocxo2_interrupt_diag;
+
+static inline void clocks_capture_interrupt_diag(interrupt_capture_diag_t& dst,
+                                                 const interrupt_capture_diag_t* src) {
+  if (!src) {
+    dst = interrupt_capture_diag_t{};
+    dst.enabled = false;
+    return;
+  }
+  dst = *src;
+}
+
+static inline void clocks_payload_add_interrupt_diag(Payload& p,
+                                                     const char* prefix,
+                                                     const interrupt_capture_diag_t& diag) {
+  char key[96];
+
+  auto add_u32 = [&](const char* suffix, uint32_t value) {
+    snprintf(key, sizeof(key), "%s_%s", prefix, suffix);
+    p.add(key, value);
+  };
+
+  auto add_u64 = [&](const char* suffix, uint64_t value) {
+    snprintf(key, sizeof(key), "%s_%s", prefix, suffix);
+    p.add(key, value);
+  };
+
+  auto add_bool = [&](const char* suffix, bool value) {
+    snprintf(key, sizeof(key), "%s_%s", prefix, suffix);
+    p.add(key, value);
+  };
+
+  add_bool("enabled", diag.enabled);
+
+  add_u32("provider", (uint32_t)diag.provider);
+  add_u32("lane", (uint32_t)diag.lane);
+  add_u32("kind", (uint32_t)diag.kind);
+
+  add_u64("prespin_target_gnss_ns", diag.prespin_target_gnss_ns);
+  add_u64("event_target_gnss_ns", diag.event_target_gnss_ns);
+
+  add_bool("prespin_active", diag.prespin_active);
+  add_bool("prespin_fired", diag.prespin_fired);
+  add_bool("prespin_timed_out", diag.prespin_timed_out);
+
+  add_u32("shadow_dwt", diag.shadow_dwt);
+  add_u32("dwt_isr_entry_raw", diag.dwt_isr_entry_raw);
+  add_u32("approach_cycles", diag.approach_cycles);
+
+  add_u32("dwt_at_event_adjusted", diag.dwt_at_event_adjusted);
+  add_u64("gnss_ns_at_event", diag.gnss_ns_at_event);
+  add_u32("counter32_at_event", diag.counter32_at_event);
+  add_u32("dwt_event_correction_cycles", diag.dwt_event_correction_cycles);
+
+  add_u32("prespin_arm_count", diag.prespin_arm_count);
+  add_u32("prespin_complete_count", diag.prespin_complete_count);
+  add_u32("prespin_timeout_count", diag.prespin_timeout_count);
+  add_u32("anomaly_count", diag.anomaly_count);
+}
 
 // ============================================================================
 // AD5693R init
 // ============================================================================
 
 extern bool g_ad5693r_init_ok;
-
-// ============================================================================
-// ISR-level hardware snapshots (alpha-owned, beta-readable)
-// ============================================================================
-
-extern volatile uint32_t isr_snap_dwt;
-extern volatile uint32_t isr_snap_gnss;
-extern volatile uint32_t isr_snap_ocxo1;
-extern volatile uint32_t isr_snap_ocxo2;
-
-extern volatile uint32_t isr_prev_dwt;
-extern volatile uint32_t isr_prev_gnss;
-extern volatile uint32_t isr_prev_ocxo1;
-extern volatile uint32_t isr_prev_ocxo2;
-
-extern volatile int32_t  isr_residual_dwt;
-extern volatile int32_t  isr_residual_gnss;
-extern volatile int32_t  isr_residual_ocxo1;
-extern volatile int32_t  isr_residual_ocxo2;
-extern volatile bool     isr_residual_valid;
-
-// ============================================================================
-// ISR constants
-// ============================================================================
-
-static constexpr uint32_t ISR_DWT_EXPECTED  = DWT_EXPECTED_PER_PPS;
-
-static constexpr uint32_t ISR_GNSS_RAW_EXPECTED = TICKS_10MHZ_PER_SECOND;
-static constexpr uint32_t ISR_OCXO1_EXPECTED = TICKS_10MHZ_PER_SECOND;
-static constexpr uint32_t ISR_OCXO2_EXPECTED = TICKS_10MHZ_PER_SECOND;
-
-static constexpr uint32_t OCXO_PHASE_ARM_OFFSET_TICKS = 150;
-
-// ============================================================================
-// PPS diagnostics (alpha-owned, beta-readable)
-// ============================================================================
-
-extern volatile uint32_t diag_gpt1_isr_fires;
-extern volatile uint32_t diag_gpt2_isr_fires;
-
-extern volatile uint32_t diag_pps_rejected_total;
-extern volatile uint32_t diag_pps_rejected_remainder;
-extern volatile uint32_t diag_pps_scheduled_stuck;
-extern volatile uint32_t diag_pps_watchdog_recoveries;
-extern volatile uint32_t diag_pps_asap_arm_failures;
-extern volatile uint32_t diag_pps_asap_armed;
-extern volatile uint32_t diag_pps_asap_dispatched;
-extern volatile uint32_t diag_pps_stuck_since_dwt;
-extern volatile uint32_t diag_pps_stuck_max;
-
-extern volatile uint32_t diag_pps_reject_consecutive;
-extern volatile uint32_t diag_pps_reject_recoveries;
-extern volatile uint32_t diag_pps_reject_max_run;
-
-extern volatile uint32_t diag_pps_correct_dwt_ocxo1;
-extern volatile uint32_t diag_pps_correct_dwt_ocxo2;
-extern volatile uint32_t diag_pps_correct_dwt_gnss;
-
-// ============================================================================
-// QTimer1 read diagnostics (alpha-owned, beta-readable)
-// ============================================================================
-
-extern volatile uint32_t diag_qread_total;
-extern volatile uint32_t diag_qread_same_hi;
-extern volatile uint32_t diag_qread_retry_hi_changed;
-
-extern volatile uint32_t diag_qread_last_hi1;
-extern volatile uint32_t diag_qread_last_hi2;
-extern volatile uint32_t diag_qread_last_lo;
-extern volatile uint32_t diag_qread_last_lo2;
-
-// ============================================================================
-// PPS state
-// ============================================================================
-
-extern volatile bool pps_fired;
-
-extern volatile uint32_t diag_ocxo1_phase_captures;
-extern volatile uint32_t diag_ocxo2_phase_captures;
-extern volatile uint32_t diag_ocxo1_phase_misses;
-extern volatile uint32_t diag_ocxo2_phase_misses;
-extern volatile uint32_t diag_ocxo_phase_spin_timeouts;
 
 // ============================================================================
 // OCXO DAC state — dual oscillator
@@ -170,7 +180,7 @@ extern ocxo_dac_state_t ocxo1_dac;
 extern ocxo_dac_state_t ocxo2_dac;
 
 // ============================================================================
-// OCXO servo mode — campaign-level calibration strategy
+// OCXO servo mode
 // ============================================================================
 
 enum class servo_mode_t : uint8_t {
@@ -192,7 +202,7 @@ static constexpr uint32_t SERVO_MIN_SAMPLES    = 10;
 void ocxo_dac_set(ocxo_dac_state_t& s, double value);
 
 // ============================================================================
-// Campaign state (beta-owned, alpha-readable for ns_now guards)
+// Campaign state
 // ============================================================================
 
 enum class clocks_campaign_state_t {
@@ -207,6 +217,7 @@ extern uint64_t campaign_seconds;
 extern volatile bool request_start;
 extern volatile bool request_stop;
 extern volatile bool request_recover;
+extern volatile bool request_zero;
 
 extern uint64_t recover_dwt_ns;
 extern uint64_t recover_gnss_ns;
@@ -214,60 +225,27 @@ extern uint64_t recover_ocxo1_ns;
 extern uint64_t recover_ocxo2_ns;
 
 // ============================================================================
-// PPS residual tracking — Welford's, callback-level
+// Minimal residual tracking
 // ============================================================================
 
-static constexpr int64_t DWT_EXPECTED_PER_PPS_I = (int64_t)DWT_EXPECTED_PER_PPS;
-static constexpr int64_t GNSS_EXPECTED_PER_PPS  = (int64_t)TICKS_10MHZ_PER_SECOND;
-static constexpr int64_t OCXO_EXPECTED_PER_PPS  = (int64_t)TICKS_10MHZ_PER_SECOND;
-
 struct pps_residual_t {
-  uint64_t ticks_at_last_pps;
-  int64_t  delta;
   int64_t  residual;
-  bool     valid;
   uint64_t n;
   double   mean;
   double   m2;
 };
 
 extern pps_residual_t residual_dwt;
-extern pps_residual_t residual_gnss;
 extern pps_residual_t residual_ocxo1;
 extern pps_residual_t residual_ocxo2;
 
 void residual_reset(pps_residual_t& r);
-void residual_update(pps_residual_t& r, uint64_t ticks_now, int64_t expected);
+void residual_update_sample(pps_residual_t& r, int64_t residual);
 double residual_stddev(const pps_residual_t& r);
 double residual_stderr(const pps_residual_t& r);
 
 // ============================================================================
-// Trend-aware prediction tracking
-// ============================================================================
-
-struct prediction_tracker_t {
-  uint32_t prev_delta;
-  uint32_t predicted;
-  int32_t  pred_residual;
-  uint8_t  history_count;
-  bool     predicted_valid;
-  uint64_t n;
-  double   mean;
-  double   m2;
-};
-
-extern prediction_tracker_t pred_dwt;
-extern prediction_tracker_t pred_ocxo1;
-extern prediction_tracker_t pred_ocxo2;
-
-void prediction_reset(prediction_tracker_t& p);
-void prediction_seed(prediction_tracker_t& p, uint32_t value);
-void prediction_update(prediction_tracker_t& p, uint32_t actual_delta);
-double prediction_stddev(const prediction_tracker_t& p);
-double prediction_stderr(const prediction_tracker_t& p);
-
-// ============================================================================
-// DAC Welford tracking — campaign-scoped cumulative statistics
+// DAC Welford tracking
 // ============================================================================
 
 struct dac_welford_t {
@@ -287,208 +265,7 @@ double dac_welford_stddev(const dac_welford_t& w);
 double dac_welford_stderr(const dac_welford_t& w);
 
 // ============================================================================
-// Spin Capture — nano-precise DWT anchoring with shadow-write TDC
-// ============================================================================
-
-struct spin_capture_t {
-  uint32_t         target_dwt;
-  int64_t          target_gnss_ns;
-  bool             armed;
-  timepop_handle_t handle;
-
-  uint32_t landed_dwt;
-  int64_t  landed_gnss_ns;
-  int32_t  spin_error;
-  uint32_t shadow_dwt;
-  bool     completed;
-  bool     nano_timed_out;
-  bool     shadow_timed_out;
-
-  uint32_t isr_dwt;
-  int32_t  approach_cycles;
-  uint32_t edge_dwt;
-  bool     valid;
-
-  uint32_t arms;
-  uint32_t arm_failures;
-  uint32_t completions;
-  uint32_t nano_timeouts;
-  uint32_t shadow_timeouts;
-  uint32_t misses;
-};
-
-extern spin_capture_t pps_spin;
-
-// ============================================================================
-// OCXO phase capture
-// ============================================================================
-
-struct ocxo_phase_capture_t {
-  uint32_t dwt_at_pps;
-
-  uint32_t ocxo1_isr_dwt;
-  uint32_t ocxo1_shadow_dwt;
-  uint32_t ocxo1_edge_dwt;
-  uint32_t ocxo1_gpt_at_fire;
-  uint32_t ocxo1_dwt_elapsed = 0;
-  uint32_t ocxo1_elapsed_ns = 0;
-  uint32_t ocxo1_phase_offset_ns;
-  bool     ocxo1_captured;
-  bool     ocxo1_valid;
-
-  uint32_t ocxo2_isr_dwt;
-  uint32_t ocxo2_shadow_dwt;
-  uint32_t ocxo2_edge_dwt;
-  uint32_t ocxo2_gpt_at_fire;
-  uint32_t ocxo2_dwt_elapsed = 0;
-  uint32_t ocxo2_elapsed_ns = 0;
-  uint32_t ocxo2_phase_offset_ns;
-  bool     ocxo2_captured;
-  bool     ocxo2_valid;
-
-  bool     detector_valid;
-
-  uint64_t pps_gnss_ns;
-  uint64_t ocxo1_edge_gnss_ns;
-  uint64_t ocxo2_edge_gnss_ns;
-
-  uint64_t prev_ocxo1_edge_gnss_ns;
-  uint64_t prev_ocxo2_edge_gnss_ns;
-  int64_t  ocxo1_gnss_ns_per_pps;
-  int64_t  ocxo2_gnss_ns_per_pps;
-  int64_t  ocxo1_residual_ns;
-  int64_t  ocxo2_residual_ns;
-  bool     residual_valid;
-
-  uint16_t ocxo1_dac_before;
-  uint16_t ocxo1_dac_after;
-  uint16_t ocxo2_dac_before;
-  uint16_t ocxo2_dac_after;
-};
-
-extern ocxo_phase_capture_t ocxo_phase;
-
-// Add after the existing ocxo_phase_capture_t or wherever appropriate:
-
-struct ocxo_boundary_state_t {
-  // OCXO1
-  uint64_t  ocxo1_last_gnss_ns;
-  uint64_t  ocxo1_prev_gnss_ns;
-  uint32_t  ocxo1_second_count;
-  int64_t   ocxo1_period_ns;           // gnss_ns[n] - gnss_ns[n-1] (should be ~1e9)
-  int64_t   ocxo1_phase_offset_ns;     // gnss_ns - second_count * 1e9
-
-  // OCXO2
-  uint64_t  ocxo2_last_gnss_ns;
-  uint64_t  ocxo2_prev_gnss_ns;
-  uint32_t  ocxo2_second_count;
-  int64_t   ocxo2_period_ns;
-  int64_t   ocxo2_phase_offset_ns;
-
-  bool      ocxo1_valid;
-  bool      ocxo2_valid;
-};
-
-extern ocxo_boundary_state_t ocxo_boundary;
-
-extern volatile uint32_t ocxo_phase_shadow_dwt;
-extern volatile uint32_t ocxo1_phase_isr_dwt;
-extern volatile uint32_t ocxo1_phase_shadow_dwt;
-extern volatile bool     ocxo1_phase_captured;
-extern volatile uint32_t ocxo1_phase_gpt_at_fire;
-extern volatile uint32_t ocxo2_phase_isr_dwt;
-extern volatile uint32_t ocxo2_phase_shadow_dwt;
-extern volatile bool     ocxo2_phase_captured;
-extern volatile uint32_t ocxo2_phase_gpt_at_fire;
-
-// ============================================================================
-// TIME_TEST — anchored last-capture diagnostics
-// ============================================================================
-
-struct time_test_capture_t {
-  // Canonical outputs from process_interrupt
-  bool     captured;
-  uint32_t dwt_at_event;
-  uint64_t gnss_ns_at_event;
-  uint32_t counter32_at_event;
-  uint32_t dwt_event_correction_cycles;
-
-  // Raw interrupt facts
-  uint32_t dwt_isr_entry_raw;
-  uint32_t dwt_after_capture;
-  uint16_t raw_compare16;
-  uint16_t raw_verify_low16;
-  uint16_t raw_verify_high16;
-
-  // Formal DWT / shadow diagnostics
-  bool     shadow_valid;
-  uint32_t shadow_dwt;
-  uint32_t shadow_to_isr_entry_cycles;
-  uint32_t dwt_at_event_adjusted;
-
-  // Prespin / approach diagnostics
-  uint32_t approach_cycles;
-  uint32_t approach_ns;
-  bool     prespin_established;
-  bool     prespin_too_short;
-
-  // Correction diagnostics
-  uint32_t candidate_correction_default_cycles;
-  uint32_t candidate_correction_live_cycles;
-  uint32_t dwt_event_correction_cycles_diag;
-  bool     used_live_profile;
-  bool     used_default_profile;
-
-  // QTIMER verification diagnostics
-  uint16_t expected_low16;
-  uint16_t expected_high16;
-  bool     verify_high16_matches;
-  bool     verify_high16_is_previous;
-  bool     counter32_authoritative;
-  bool     gnss_projection_valid;
-  bool     verification_passed;
-
-  // TIME_TEST-specific derived ground truth
-  int64_t  vclock_gnss_ns;
-  int32_t  residual_ns;
-  uint32_t diag_ticks_since_pps;
-  uint32_t diag_anchor_qtimer;
-  uint32_t diag_anchor_pps_count;
-
-  // Lifetime counters
-  volatile uint32_t tests_run;
-  volatile uint32_t tests_valid;
-  volatile uint32_t tests_time_invalid;
-  volatile uint32_t ch3_isr_fires;
-};
-
-extern time_test_capture_t time_test;
-
-// Shadow DWT continuously written by the TIME_TEST prespin loop.
-extern volatile uint32_t time_test_shadow_dwt;
-
-// ============================================================================
-// 64-bit accumulators (campaign-scoped)
-// ============================================================================
-
-extern uint64_t dwt_cycles_64;
-extern uint32_t prev_dwt_at_pps;
-
-extern uint64_t ocxo1_ticks_64;
-extern uint32_t prev_ocxo1_at_pps;
-
-extern uint64_t ocxo2_ticks_64;
-extern uint32_t prev_ocxo2_at_pps;
-
-extern uint64_t gnss_raw_64;
-extern uint32_t prev_gnss_at_pps;
-
-inline uint64_t gnss_ticks_64_get(void) {
-  return gnss_raw_64;
-}
-
-// ============================================================================
-// Rolling 64-bit extensions
+// Rolling counters / always-on helpers
 // ============================================================================
 
 extern uint64_t dwt_rolling_64;
@@ -504,31 +281,31 @@ extern uint64_t ocxo2_rolling_64;
 extern uint32_t ocxo2_rolling_32;
 
 // ============================================================================
-// QTimer1 read helper (alpha-owned hardware, used for GNSS)
+// Campaign-scoped accumulators
+// ============================================================================
+
+extern uint64_t dwt_cycles_64;
+extern uint64_t gnss_raw_64;
+extern uint64_t ocxo1_ticks_64;
+extern uint64_t ocxo2_ticks_64;
+
+// ============================================================================
+// QTimer1 read helper (clocks-owned helper for GNSS live reads)
 // ============================================================================
 
 uint32_t qtimer1_read_32(void);
 
 // ============================================================================
-// Relay state (alpha-owned)
+// Simple helpers
 // ============================================================================
 
-extern volatile bool relay_arm_pending;
-extern volatile bool relay_timer_active;
-
-extern volatile uint32_t dbg_post_loop_dwt;
-extern volatile uint32_t dbg_post_loop_shadow;
-extern volatile uint32_t dbg_post_loop_isr_cap;
-extern volatile uint32_t dbg_post_loop_isr_snap;
+static inline uint32_t dwt_effective_cycles_per_second(void) {
+  return (uint32_t)((int64_t)g_dwt_cycle_count_next_second_prediction +
+                    (int64_t)g_dwt_cycle_count_next_second_adjustment);
+}
 
 // ============================================================================
-// PPS callback scheduling (alpha-owned)
-// ============================================================================
-
-extern volatile bool pps_scheduled;
-
-// ============================================================================
-// Watchdog anomaly latch (beta-owned, alpha-readable)
+// Watchdog anomaly latch
 // ============================================================================
 
 extern volatile bool     watchdog_anomaly_active;
@@ -540,28 +317,6 @@ extern volatile uint32_t watchdog_anomaly_detail1;
 extern volatile uint32_t watchdog_anomaly_detail2;
 extern volatile uint32_t watchdog_anomaly_detail3;
 extern volatile uint32_t watchdog_anomaly_trigger_dwt;
-
-static inline bool ocxo_edge_dwt_to_gnss_ns(
-  uint32_t dwt_event,
-  uint64_t pps_gnss_ns,
-  uint32_t dwt_at_pps,
-  uint32_t dwt_cycles_per_pps,
-  uint64_t& out_gnss_ns
-) {
-  const uint32_t pps_count = (uint32_t)(pps_gnss_ns / 1000000000ULL) + 1;
-
-  const int64_t edge_signed = time_dwt_to_gnss_ns(
-    dwt_event, dwt_at_pps, dwt_cycles_per_pps, pps_count
-  );
-
-  if (edge_signed < 0) {
-    out_gnss_ns = 0;
-    return false;
-  }
-
-  out_gnss_ns = (uint64_t)edge_signed;
-  return true;
-}
 
 // ============================================================================
 // Beta entry points

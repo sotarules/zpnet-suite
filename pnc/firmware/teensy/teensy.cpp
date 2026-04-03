@@ -220,17 +220,22 @@ void UsageFault_Handler(void) { fault_morse_usagefault(); }
 //
 // Boot order is critical.  The dependency chain is:
 //
-//   1. maximize_dwt_determinism()     — CPU clock, DWT counter
-//   2. memory_info_init()             — stack sentinel painting
-//   3. cpu_usage_init()               — DWT accounting baseline
-//   4. process_clocks_init_hardware() — starts GPT2 (GNSS 10 MHz),
-//                                       GPT1 (OCXO), DWT
-//   5. timepop_init()                 — installs GPT2 OCR1 ISR
-//                                       (GPT2 MUST be running)
-//   6. transport_init()               — arms RX/TX timers
-//                                       (TimePop MUST be ready)
-//   7. debug_init()                   — transport-routed logging
-//   8. process framework + subsystems — everything else
+//   1. maximize_dwt_determinism()        — CPU clock, DWT counter
+//   2. memory_info_init()                — stack sentinel painting
+//   3. cpu_usage_init()                  — DWT accounting baseline
+//   4. process_interrupt_init_hardware() — starts GPT1 (OCXO1), GPT2 (OCXO2)
+//   5. process_clocks_init_hardware()    — DWT enable, rolling baselines
+//   6. timepop_init()                    — QTimer1 compare scheduler
+//                                          (QTimer1 MUST be running)
+//   7. transport_init()                  — arms RX/TX timers
+//                                          (TimePop MUST be ready)
+//   8. debug_init()                      — transport-routed logging
+//   9. process framework + subsystems    — everything else
+//  10. process_interrupt_init()          — runtime slots, descriptor wiring
+//  11. process_interrupt_enable_irqs()   — ISR vectors + NVIC enable
+//                                          (hardware interrupts go live)
+//  12. process_clocks_init()             — PPS/OCXO subscribe + start,
+//                                          DACs, relay pins
 //
 // ============================================================================
 
@@ -260,18 +265,20 @@ void setup() {
   Wire.begin();
 
   // ----------------------------------------------------------
-  // Phase 1: Core instrumentation + hardware clocks
+  // Phase 1: Core instrumentation + early timing hardware
   // ----------------------------------------------------------
 
   memory_info_init();
   cpu_usage_init();
 
-  // Start GPT2/GPT1/DWT hardware BEFORE TimePop.
-  // TimePop uses GPT2 output compare — the counter must be
-  // running before timepop_init() installs its ISR.
+  // process_interrupt owns GPT1/GPT2 provider hardware.
+  process_interrupt_init_hardware();
+
+  // clocks owns DWT-local initialization + rolling baselines.
+  // GPT1/GPT2 must already be running (seeded by process_interrupt above).
   process_clocks_init_hardware();
 
-  // Now TimePop can safely install its OCR1 compare on GPT2.
+  // TimePop owns QTimer1 and must come after early timing substrate is alive.
   timepop_init();
 
   // ----------------------------------------------------------
@@ -333,16 +340,26 @@ void setup() {
   debug_log("boot", "enqueue TEENSY_BOOT done");
 
   // ----------------------------------------------------------
-  // Process registration
+  // Interrupt subsystem — runtime + ISR vectors
   // ----------------------------------------------------------
 
   debug_log("boot", "process_interrupt_init");
   process_interrupt_init();
   debug_log("boot", "process_interrupt_init done");
 
+  debug_log("boot", "process_interrupt_enable_irqs");
+  process_interrupt_enable_irqs();
+  debug_log("boot", "process_interrupt_enable_irqs done");
+
   debug_log("boot", "process_interrupt_register");
   process_interrupt_register();
   debug_log("boot", "process_interrupt_register done");
+
+  // ----------------------------------------------------------
+  // Clocks subsystem — subscribes to interrupt events,
+  // starts PPS/OCXO1/OCXO2, configures DACs and relay pins.
+  // Must come after ISR vectors are live.
+  // ----------------------------------------------------------
 
   debug_log("boot", "process_timepop_register");
   process_timepop_register();
@@ -355,6 +372,10 @@ void setup() {
   debug_log("boot", "process_clocks_register");
   process_clocks_register();
   debug_log("boot", "process_clocks_register done");
+
+  // ----------------------------------------------------------
+  // Remaining subsystems
+  // ----------------------------------------------------------
 
   debug_log("boot", "process_laser_init");
   process_laser_init();
