@@ -8,25 +8,23 @@
 //
 // Core laws:
 //
-//   • Clients subscribe by logical identity (kind), never by lane details.
-//   • The interrupt subsystem owns provider/lane custody.
-//   • The interrupt subsystem owns all ISR vectors (GPT1, GPT2, GPIO6789).
+//   • Clients subscribe by logical identity (kind), never by provider details.
+//   • process_interrupt owns provider custody and ISR vectors.
 //   • ARM_DWT_CYCCNT is captured as the first instruction in every ISR.
-//   • The callback contract is steeped in GNSS nanoseconds.
-//   • DWT remains available as the precision substrate for last-mile timing.
-//   • The callback always receives canonical event truth plus diagnostics.
-//   • Diagnostics are always available; clients never need private capture
-//     globals just to test the interrupt path.
-//   • TimePop owns QTimer1. process_interrupt owns GPT1/GPT2 provider custody.
+//   • The callback contract is expressed in canonical event truth.
+//   • GNSS nanoseconds are the public timing language of the subsystem.
+//   • DWT remains the precision substrate for capture and diagnostics.
 //   • Pre-spin is an integral part of interrupt handling for PPS / OCXO1 / OCXO2.
 //   • process_interrupt owns the pre-spin shadow-write loop and scheduling.
-//   • There is no best-effort fallback if pre-spin is missing or times out.
+//   • TimePop owns QTimer1. process_interrupt owns GPT1/GPT2 provider custody.
+//   • Diagnostics are always available to clients through the callback contract.
+//   • There is no best-effort reconstruction path if sacred capture facts are absent.
 //
 // Lifecycle:
 //
 //   1. process_interrupt_init_hardware() — GPT clock gates, pin mux, enable
-//   2. process_interrupt_init()          — runtime slots, descriptor wiring
-//   3. process_interrupt_enable_irqs()   — ISR vectors + NVIC enable
+//   2. process_interrupt_init()          — runtime slot creation, descriptor wiring
+//   3. process_interrupt_enable_irqs()   — ISR vector installation + NVIC enable
 //   4. interrupt_subscribe() / start()   — client wiring + activation
 //
 // ============================================================================
@@ -77,7 +75,26 @@ enum class interrupt_event_status_t : uint8_t {
 };
 
 // ============================================================================
-// Event + diag
+// Canonical interrupt event
+// ============================================================================
+//
+// This is the authoritative event truth handed forward from the interrupt
+// boundary. It describes what happened, when it happened, and what provider
+// produced it.
+//
+// Fields:
+//   dwt_at_event:
+//     DWT cycle count at the event boundary after fixed-overhead correction.
+//
+//   gnss_ns_at_event:
+//     Absolute GNSS nanosecond at the event boundary when known.
+//
+//   counter32_at_event:
+//     Logical event count or provider-side second-count index.
+//
+//   dwt_event_correction_cycles:
+//     Fixed correction applied to ISR-entry DWT to derive dwt_at_event.
+//
 // ============================================================================
 
 struct interrupt_event_t {
@@ -90,11 +107,31 @@ struct interrupt_event_t {
   uint64_t gnss_ns_at_event = 0;
 
   // For PPS this is the PPS count since runtime start.
-  // For OCXO second-boundary subscribers this is the second-count index since start.
+  // For OCXO second-boundary subscribers this is the second-count index
+  // since runtime start.
   uint32_t counter32_at_event = 0;
 
   uint32_t dwt_event_correction_cycles = 0;
 };
+
+// ============================================================================
+// Optional capture diagnostics
+// ============================================================================
+//
+// This block provides capture-path diagnostics for clients that need to inspect
+// pre-spin behavior or ISR-side timing detail.
+//
+// Terminology:
+//   approach_cycles:
+//     Total cycles from pre-spin start until interrupt fire.
+//
+//   shadow_to_isr_cycles:
+//     Cycles from the final shadow DWT sample to ISR entry.
+//
+// These are not interchangeable. approach_cycles is the schedule-tuning metric.
+// shadow_to_isr_cycles is the tail-latency metric.
+//
+// ============================================================================
 
 struct interrupt_capture_diag_t {
   bool enabled = true;
@@ -112,7 +149,12 @@ struct interrupt_capture_diag_t {
 
   uint32_t shadow_dwt = 0;
   uint32_t dwt_isr_entry_raw = 0;
+
+  // Total prespin runtime until interrupt fire.
   uint32_t approach_cycles = 0;
+
+  // Tail distance from last shadow-write sample to ISR entry.
+  uint32_t shadow_to_isr_cycles = 0;
 
   uint32_t dwt_at_event_adjusted = 0;
   uint64_t gnss_ns_at_event = 0;
@@ -126,7 +168,14 @@ struct interrupt_capture_diag_t {
 };
 
 // ============================================================================
-// Subscriber callback signature (ISR context)
+// Subscriber callback signature
+// ============================================================================
+//
+// Callbacks receive canonical event truth plus optional diagnostics.
+//
+// The event is the authoritative fact.
+// The diagnostic block is supplemental.
+//
 // ============================================================================
 
 using interrupt_subscriber_event_fn =
@@ -151,14 +200,15 @@ struct interrupt_subscription_t {
 /// Phase 1: GPT clock gates, pin mux, timer enable. Call early in boot.
 void process_interrupt_init_hardware(void);
 
-/// Phase 2: Runtime slot creation, descriptor wiring.
+/// Phase 2: Runtime slot creation and descriptor wiring.
 void process_interrupt_init(void);
 
-/// Phase 3: ISR vector installation + NVIC enable. Call after TimePop
-/// and transport are alive. This is the moment hardware interrupts go live.
+/// Phase 3: ISR vector installation + NVIC enable. Call only after TimePop
+/// and other core infrastructure are alive. This is the moment interrupts
+/// become live.
 void process_interrupt_enable_irqs(void);
 
-/// Process framework registration (REPORT command).
+/// Process-framework registration (REPORT command).
 void process_interrupt_register(void);
 
 // ============================================================================
@@ -177,7 +227,11 @@ const interrupt_event_t* interrupt_last_event(interrupt_subscriber_kind_t kind);
 const interrupt_capture_diag_t* interrupt_last_diag(interrupt_subscriber_kind_t kind);
 
 // ============================================================================
-// Shared IRQ authority entry points (internal — called from owned ISR vectors)
+// Shared IRQ authority entry points
+// ============================================================================
+//
+// These are called only from process_interrupt-owned ISR vectors.
+//
 // ============================================================================
 
 void process_interrupt_gpio6789_irq(uint32_t dwt_isr_entry_raw);
@@ -185,7 +239,7 @@ void process_interrupt_gpt1_irq(uint32_t dwt_isr_entry_raw);
 void process_interrupt_gpt2_irq(uint32_t dwt_isr_entry_raw);
 
 // ============================================================================
-// Provider ownership helpers exposed for clocks when needed
+// Provider ownership helpers exposed to other subsystems when needed
 // ============================================================================
 
 uint32_t interrupt_gpt1_counter_now(void);

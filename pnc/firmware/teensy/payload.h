@@ -37,6 +37,14 @@
     Returning a Payload from a function transfers arena ownership
     with zero copying — just pointer swap.
 
+  SERIALIZATION CONTRACT:
+
+    • write_json() returns bytes written (excluding NUL) on success
+    • write_json() returns 0 on overflow or failure
+    • write_json() does NOT synthesize fallback JSON
+    • callers that care about overflow semantics must handle write_json()==0
+      at the appropriate architectural layer
+
   ============================================================================
 */
 
@@ -127,14 +135,21 @@ public:
     /*
       Primary serialization API.
       Write JSON into caller-provided buffer.
-      Returns bytes written (excluding NUL), or 0 on overflow.
-      Buffer is always NUL-terminated on success.
+
+      Returns:
+        > 0 : bytes written (excluding NUL)
+          0 : overflow or serialization failure
+
+      The buffer is NUL-terminated on success.
+      On failure, callers must not assume any particular JSON fallback shape.
     */
     size_t write_json(char* buf, size_t buf_size) const;
 
     /*
       Legacy convenience wrapper.
       Heap-allocates a String. Use for debug/logging only.
+
+      On serialization failure, returns "{}".
     */
     String to_json() const;
 
@@ -153,7 +168,6 @@ public:
     void add(const char* key, float value);
     void add(const char* key, double value);
 
-    // Catch-all for signed integral types not covered above.
     template <typename T>
     typename std::enable_if<
         std::is_integral<T>::value &&
@@ -163,7 +177,6 @@ public:
         add(key, (int64_t)value);
     }
 
-    // Catch-all for unsigned integral types not covered above.
     template <typename T>
     typename std::enable_if<
         std::is_integral<T>::value &&
@@ -233,18 +246,14 @@ public:
 
     static constexpr size_t MAX_ENTRIES   = 256;
     static constexpr size_t ARENA_INITIAL = 512;
-    static constexpr size_t ARENA_MAX     = 8192;
+    static constexpr size_t ARENA_MAX     = 12288;
 
-static_assert(
-    ARENA_MAX <= UINT16_MAX,
-    "Payload ARENA_MAX exceeds uint16_t offset capacity"
-);
+    static_assert(
+        ARENA_MAX <= UINT16_MAX,
+        "Payload ARENA_MAX exceeds uint16_t offset capacity"
+    );
 
 private:
-    // -----------------------------------------------------------------
-    // Entry: 8 bytes each (offsets into arena)
-    // -----------------------------------------------------------------
-
     struct Entry {
         uint16_t key_off;
         uint16_t val_off;
@@ -256,36 +265,20 @@ private:
     Entry  _entries[MAX_ENTRIES];
     size_t _count;
 
-    // -----------------------------------------------------------------
-    // Arena: single heap-allocated buffer for all string data
-    // -----------------------------------------------------------------
-
     char*  _arena;
     size_t _arena_used;
     size_t _arena_cap;
 
-    // -----------------------------------------------------------------
-    // Internal helpers
-    // -----------------------------------------------------------------
-
-    // Append a NUL-terminated string to the arena.
-    // Returns offset of the stored string, or UINT16_MAX on failure.
     uint16_t _put(const char* str, size_t len);
     uint16_t _put(const char* str);
 
-    // Ensure arena has room for `additional` more bytes.
     bool _ensure(size_t additional);
 
-    // Get pointer to string at arena offset.
     const char* _at(uint16_t offset) const;
-
-    // Find entry by key.
     const Entry* _find(const char* key) const;
 
-    // Add a pre-formatted string value with given kind.
     void _add_entry(const char* key, const char* value, size_t value_len, char kind);
 };
-
 
 // ============================================================================
 // PayloadArray — JSON array of Payload objects
@@ -308,11 +301,9 @@ public:
     Payload get(size_t idx) const;
 
 private:
-    // Serialized form (builder path)
     String _buf;
     bool   _first;
 
-    // Parsed form
     static constexpr size_t MAX_ITEMS = 16;
     Payload _items[MAX_ITEMS];
     size_t  _item_count;

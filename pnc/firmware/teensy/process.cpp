@@ -19,7 +19,7 @@
 #include "process.h"
 #include "transport.h"
 #include "debug.h"
-#include "process_pubsub.h"   // <-- subscription access
+#include "process_pubsub.h"
 
 #include <Arduino.h>
 #include <string.h>
@@ -29,6 +29,7 @@
 // ============================================================================
 
 static constexpr size_t MAX_PROCESSES = 30;
+static constexpr size_t RESPONSE_PREFLIGHT_JSON_MAX = 6144;
 
 // ============================================================================
 // Registry Entry
@@ -49,26 +50,6 @@ static size_t registry_count = 0;
 // ============================================================================
 // RPC Pipeline Counters
 // ============================================================================
-//
-// These counters track the full lifecycle of every request/response
-// command that enters the system. They are monotonic and never reset.
-//
-// The pipeline stages are:
-//
-//   received → (routed | error_missing_fields
-//                       | error_unknown_subsystem
-//                       | error_unknown_command)
-//   routed   → handler_invoked → handler_completed
-//   handler_completed → response_sent
-//
-// Invariants (healthy system):
-//   received == routed + error_missing_fields
-//                      + error_unknown_subsystem
-//                      + error_unknown_command
-//   routed == handler_invoked
-//   handler_invoked == handler_completed  (no stuck handlers)
-//   handler_completed == response_sent    (no lost responses)
-//
 
 static volatile uint32_t rpc_received              = 0;
 static volatile uint32_t rpc_routed                = 0;
@@ -80,7 +61,6 @@ static volatile uint32_t rpc_error_unknown_subsys  = 0;
 static volatile uint32_t rpc_error_unknown_command = 0;
 static volatile uint32_t rpc_error_response_sent   = 0;
 
-// Pub/sub dispatch counter
 static volatile uint32_t ps_dispatched             = 0;
 
 // ============================================================================
@@ -127,6 +107,40 @@ static Payload make_error_payload(const char* msg) {
     Payload p;
     p.add("error", msg ? msg : "unknown error");
     return p;
+}
+
+static void copy_request_metadata_into_response(const Payload& request, Payload& response) {
+    if (request.has("req_id")) {
+        response.add("req_id", request.getUInt("req_id"));
+    }
+
+    if (request.has("req_ts_ms")) {
+        response.add("req_ts_ms", request.getUInt("req_ts_ms"));
+    }
+}
+
+static void send_overflow_response(const Payload& request) {
+    Payload response;
+    copy_request_metadata_into_response(request, response);
+    response.add("success", false);
+    response.add("message", "OVERFLOW");
+    response.add_object("payload", make_error_payload("payload_overflow"));
+    transport_send(TRAFFIC_REQUEST_RESPONSE, response);
+    rpc_error_response_sent++;
+}
+
+static bool response_serializes(const Payload& response) {
+    char local_buf[RESPONSE_PREFLIGHT_JSON_MAX];
+    return response.write_json(local_buf, sizeof(local_buf)) > 0;
+}
+
+static void send_response_or_overflow(const Payload& request, const Payload& response) {
+    if (!response_serializes(response)) {
+        send_overflow_response(request);
+        return;
+    }
+
+    transport_send(TRAFFIC_REQUEST_RESPONSE, response);
 }
 
 // ============================================================================
@@ -206,14 +220,7 @@ void process_command(const Payload& request) {
     rpc_received++;
 
     Payload response;
-
-    if (request.has("req_id")) {
-        response.add("req_id", request.getUInt("req_id"));
-    }
-
-    if (request.has("req_ts_ms")) {
-        response.add("req_ts_ms", request.getUInt("req_ts_ms"));
-    }
+    copy_request_metadata_into_response(request, response);
 
     const char* subsystem_c = request.getString("subsystem");
     const char* command_c   = request.getString("command");
@@ -226,8 +233,7 @@ void process_command(const Payload& request) {
         response.add("message", "BAD");
         response.add_object("payload",
                             make_error_payload("missing routing fields"));
-        transport_send(TRAFFIC_REQUEST_RESPONSE, response);
-        rpc_error_response_sent++;
+        send_response_or_overflow(request, response);
         return;
     }
 
@@ -240,8 +246,7 @@ void process_command(const Payload& request) {
         response.add("message", "BAD");
         response.add_object("payload",
                             make_error_payload("unknown subsystem"));
-        transport_send(TRAFFIC_REQUEST_RESPONSE, response);
-        rpc_error_response_sent++;
+        send_response_or_overflow(request, response);
         return;
     }
 
@@ -256,8 +261,7 @@ void process_command(const Payload& request) {
         response.add("message", "BAD");
         response.add_object("payload",
                             make_error_payload("unknown command"));
-        transport_send(TRAFFIC_REQUEST_RESPONSE, response);
-        rpc_error_response_sent++;
+        send_response_or_overflow(request, response);
         return;
     }
 
@@ -280,10 +284,7 @@ void process_command(const Payload& request) {
     response.add("message", "OK");
     response.add_object("payload", payload);
 
-    transport_send(
-        TRAFFIC_REQUEST_RESPONSE,
-        response
-    );
+    send_response_or_overflow(request, response);
 
     rpc_response_sent++;
 }
@@ -310,10 +311,6 @@ void process_get_rpc_info(process_rpc_info_t* out) {
 // ============================================================================
 // PUB / SUB Dispatch — delegated to PUBSUB
 // ============================================================================
-//
-// All subscription truth and fan-out logic lives in PUBSUB.
-// This function is now a thin semantic delegate only.
-//
 
 void process_publish_dispatch(
     const char* topic,
@@ -323,6 +320,5 @@ void process_publish_dispatch(
 
     ps_dispatched++;
 
-    // Delegate entirely to PUBSUB
     process_pubsub_fanout(topic, payload);
 }

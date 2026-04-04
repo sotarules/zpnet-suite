@@ -43,7 +43,6 @@ static inline void payload_mark_constructed() {
 static inline void payload_mark_destroyed() {
     g_payload_instances_destroyed++;
 
-    // Guard against underflow (should never happen)
     if (g_payload_alive_now > 0) {
         g_payload_alive_now--;
     }
@@ -81,7 +80,6 @@ Payload::Payload(Payload&& other) noexcept
 
     memcpy(_entries, other._entries, _count * sizeof(Entry));
 
-    // Donor is now empty — no dangling free
     other._arena      = nullptr;
     other._arena_used = 0;
     other._arena_cap  = 0;
@@ -116,7 +114,7 @@ Payload::Payload(const Payload& other)
     : _count(other._count)
     , _arena(nullptr)
     , _arena_used(other._arena_used)
-    , _arena_cap(other._arena_used)  // trim to used size
+    , _arena_cap(other._arena_used)
 {
     payload_mark_constructed();
 
@@ -127,7 +125,6 @@ Payload::Payload(const Payload& other)
         if (_arena) {
             memcpy(_arena, other._arena, _arena_used);
         } else {
-            // Allocation failure: reset to empty
             _count      = 0;
             _arena_used = 0;
             _arena_cap  = 0;
@@ -143,7 +140,7 @@ Payload& Payload::operator=(const Payload& other) {
 
     _count      = other._count;
     _arena_used = other._arena_used;
-    _arena_cap  = other._arena_used;  // trim
+    _arena_cap  = other._arena_used;
 
     memcpy(_entries, other._entries, _count * sizeof(Entry));
 
@@ -168,7 +165,6 @@ Payload& Payload::operator=(const Payload& other) {
 void Payload::clear() {
     _count      = 0;
     _arena_used = 0;
-    // Keep arena allocation for reuse — don't free
 }
 
 bool Payload::empty() const {
@@ -176,7 +172,7 @@ bool Payload::empty() const {
 }
 
 Payload Payload::clone() const {
-    return Payload(*this);  // uses copy constructor
+    return Payload(*this);
 }
 
 // ============================================================================
@@ -211,7 +207,6 @@ bool Payload::_ensure(size_t additional) {
 }
 
 uint16_t Payload::_put(const char* str, size_t len) {
-
     if (!_ensure(len + 1)) return UINT16_MAX;
 
     if (_arena_used + len + 1 > UINT16_MAX) {
@@ -224,14 +219,12 @@ uint16_t Payload::_put(const char* str, size_t len) {
     _arena[_arena_used + len] = '\0';
     _arena_used += len + 1;
 
-    // Global high-water update
     if (_arena_used > g_payload_arena_high_water_global) {
         g_payload_arena_high_water_global = _arena_used;
     }
 
     return offset;
 }
-
 
 uint16_t Payload::_put(const char* str) {
     if (!str) str = "";
@@ -257,7 +250,6 @@ const Payload::Entry* Payload::_find(const char* key) const {
 // ============================================================================
 
 void Payload::_add_entry(const char* key, const char* value, size_t value_len, char kind) {
-
     if (_count >= MAX_ENTRIES) {
         g_payload_entry_overflow++;
         return;
@@ -281,7 +273,6 @@ void Payload::_add_entry(const char* key, const char* value, size_t value_len, c
         g_payload_entry_high_water_global = _count;
     }
 }
-
 
 // ============================================================================
 // Semantic construction
@@ -355,7 +346,6 @@ void Payload::add_fmt(const char* key, const char* fmt, ...) {
 void Payload::add_object(const char* key, const Payload& obj) {
     if (_count >= MAX_ENTRIES) return;
 
-    // Serialize the nested object into scratch, then copy to arena
     char local_buf[ARENA_MAX];
     size_t json_len = obj.write_json(local_buf, sizeof(local_buf));
 
@@ -384,7 +374,6 @@ void Payload::add_raw_object(const char* key, const char* raw_json_object) {
 
 size_t Payload::write_json(char* buf, size_t buf_size) const {
     if (!buf || buf_size < 3) {
-        // Minimum: "{}\0"
         if (buf && buf_size > 0) buf[0] = '\0';
         return 0;
     }
@@ -392,12 +381,8 @@ size_t Payload::write_json(char* buf, size_t buf_size) const {
     size_t pos = 0;
     bool overflow = false;
 
-    // -----------------------------------------------------------
-    // Local append helpers
-    // -----------------------------------------------------------
-
     auto remaining = [&]() -> size_t {
-        return buf_size - pos - 1;  // reserve 1 for NUL
+        return buf_size - pos - 1;
     };
 
     auto append_char = [&](char c) {
@@ -422,20 +407,16 @@ size_t Payload::write_json(char* buf, size_t buf_size) const {
         while (*s) {
             char c = *s++;
             switch (c) {
-                case '"': append_str("\\\"", 2); break;
+                case '\"': append_str("\\\"", 2); break;
                 case '\\': append_str("\\\\", 2); break;
                 case '\n': append_str("\\n", 2);  break;
                 case '\r': append_str("\\r", 2);  break;
                 case '\t': append_str("\\t", 2);  break;
-                default:   append_char(c);         break;
+                default:   append_char(c);        break;
             }
             if (overflow) return;
         }
     };
-
-    // -----------------------------------------------------------
-    // Serialize
-    // -----------------------------------------------------------
 
     append_char('{');
 
@@ -446,30 +427,25 @@ size_t Payload::write_json(char* buf, size_t buf_size) const {
         const char* key = _at(e.key_off);
         const char* val = _at(e.val_off);
 
-        // Key
-        append_char('"');
+        append_char('\"');
         append_escaped(key);
         append_str("\":", 2);
 
         if (overflow) break;
 
-        // Value
         switch (e.kind) {
             case 'p': {
-                // Detect booleans and numbers to emit unquoted
                 if (strcmp(val, "true") == 0 || strcmp(val, "false") == 0) {
                     append(val);
                 } else {
                     char* end = nullptr;
                     strtod(val, &end);
                     if (val[0] != '\0' && end && *end == '\0') {
-                        // Numeric — emit raw
                         append(val);
                     } else {
-                        // String — emit quoted
-                        append_char('"');
+                        append_char('\"');
                         append_escaped(val);
-                        append_char('"');
+                        append_char('\"');
                     }
                 }
                 break;
@@ -477,7 +453,6 @@ size_t Payload::write_json(char* buf, size_t buf_size) const {
 
             case 'o':
             case 'a':
-                // Already valid JSON — emit verbatim
                 append_str(val, e.val_len);
                 break;
 
@@ -490,14 +465,6 @@ size_t Payload::write_json(char* buf, size_t buf_size) const {
     append_char('}');
 
     if (overflow) {
-        // Overflow fallback: emit error object
-        const char* err = "{\"error\":\"payload_overflow\"}";
-        size_t err_len = strlen(err);
-        if (err_len < buf_size) {
-            memcpy(buf, err, err_len);
-            buf[err_len] = '\0';
-            return err_len;
-        }
         buf[0] = '\0';
         return 0;
     }
@@ -508,7 +475,10 @@ size_t Payload::write_json(char* buf, size_t buf_size) const {
 
 String Payload::to_json() const {
     char local_buf[4096];
-    write_json(local_buf, sizeof(local_buf));
+    size_t json_len = write_json(local_buf, sizeof(local_buf));
+    if (json_len == 0) {
+        return String("{}");
+    }
     return String(local_buf);
 }
 
@@ -527,28 +497,24 @@ bool Payload::parseJSON(const uint8_t* data, size_t len) {
 
     while (i < len && _count < MAX_ENTRIES) {
 
-        // Find opening quote of key
-        while (i < len && data[i] != '"') i++;
+        while (i < len && data[i] != '\"') i++;
         if (i >= len) break;
 
         size_t key_start = ++i;
-        while (i < len && data[i] != '"') i++;
+        while (i < len && data[i] != '\"') i++;
         if (i >= len) break;
 
         size_t key_len = i - key_start;
-        i++;  // skip closing quote
+        i++;
 
-        // Find colon
         while (i < len && data[i] != ':') i++;
         if (i >= len) break;
-        i++;  // skip colon
+        i++;
 
-        // Skip whitespace
         while (i < len && (data[i] == ' ' || data[i] == '\t' ||
                            data[i] == '\n' || data[i] == '\r')) i++;
         if (i >= len) break;
 
-        // Determine value kind
         char kind =
             data[i] == '{' ? 'o' :
             data[i] == '[' ? 'a' :
@@ -557,10 +523,8 @@ bool Payload::parseJSON(const uint8_t* data, size_t len) {
         size_t value_start = i;
 
         if (kind == 'p') {
-            // Primitive: scan to comma or closing brace
             while (i < len && data[i] != ',' && data[i] != '}') i++;
         } else {
-            // Object or array: balanced brace/bracket scan
             int depth = 0;
             do {
                 if (data[i] == '{' || data[i] == '[') depth++;
@@ -571,7 +535,6 @@ bool Payload::parseJSON(const uint8_t* data, size_t len) {
 
         size_t value_len = i - value_start;
 
-        // Trim trailing whitespace from primitive values
         if (kind == 'p') {
             while (value_len > 0 &&
                    (data[value_start + value_len - 1] == ' ' ||
@@ -582,21 +545,18 @@ bool Payload::parseJSON(const uint8_t* data, size_t len) {
             }
         }
 
-        // Store key in arena
         uint16_t k_off = _put((const char*)(data + key_start), key_len);
         if (k_off == UINT16_MAX) break;
 
-        // For primitive strings, strip surrounding quotes
         const char* val_ptr = (const char*)(data + value_start);
         size_t      val_len = value_len;
 
         if (kind == 'p' && val_len >= 2 &&
-            val_ptr[0] == '"' && val_ptr[val_len - 1] == '"') {
+            val_ptr[0] == '\"' && val_ptr[val_len - 1] == '\"') {
             val_ptr++;
             val_len -= 2;
         }
 
-        // Store value in arena
         uint16_t v_off = _put(val_ptr, val_len);
         if (v_off == UINT16_MAX) break;
 
@@ -608,7 +568,6 @@ bool Payload::parseJSON(const uint8_t* data, size_t len) {
             0
         };
 
-        // Skip comma
         if (i < len && data[i] == ',') i++;
     }
 
@@ -823,7 +782,7 @@ size_t PayloadArrayView::size() const {
     for (size_t i = 0; i < _len; i++) {
         char c = _json[i];
 
-        if (c == '"' && (i == 0 || _json[i - 1] != '\\')) {
+        if (c == '\"' && (i == 0 || _json[i - 1] != '\\')) {
             in_string = !in_string;
         }
         if (in_string) continue;
@@ -848,7 +807,7 @@ Payload PayloadArrayView::get(size_t index) const {
     for (size_t i = 1; i < _len; i++) {
         char c = _json[i];
 
-        if (c == '"' && _json[i - 1] != '\\') {
+        if (c == '\"' && _json[i - 1] != '\\') {
             in_string = !in_string;
         }
         if (in_string) continue;
@@ -960,30 +919,14 @@ void payload_get_info(payload_info_t* out)
 {
     if (!out) return;
 
-    // ----------------------------------------------------------
-    // Lifetime totals
-    // ----------------------------------------------------------
-
     out->instances_constructed = g_payload_instances_constructed;
     out->instances_destroyed   = g_payload_instances_destroyed;
-
-    // ----------------------------------------------------------
-    // Live instance tracking (invariant support)
-    // ----------------------------------------------------------
 
     out->alive_now             = g_payload_alive_now;
     out->alive_high_water      = g_payload_alive_high_water;
 
-    // ----------------------------------------------------------
-    // Arena behavior
-    // ----------------------------------------------------------
-
     out->arena_alloc_fail      = g_payload_arena_alloc_fail;
     out->arena_high_water      = g_payload_arena_high_water_global;
-
-    // ----------------------------------------------------------
-    // Entry behavior
-    // ----------------------------------------------------------
 
     out->entry_overflow        = g_payload_entry_overflow;
     out->entry_high_water      = g_payload_entry_high_water_global;

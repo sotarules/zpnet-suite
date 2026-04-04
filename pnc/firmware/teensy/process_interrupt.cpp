@@ -15,13 +15,21 @@
 //   • Event reconstruction (DWT correction, GNSS ns projection)
 //   • Subscriber dispatch with canonical event + diagnostics
 //
-// TimePop owns QTimer1.  process_interrupt does not touch QTimer1.
+// Terminology:
+//   • approach_cycles      = total cycles from pre-spin start until interrupt fire
+//   • shadow_to_isr_cycles = cycles from final shadow DWT sample to ISR entry
+//
+// Scheduling intent:
+//   • PPS pre-spin is armed absolutely in GNSS nanoseconds.
+//   • OCXO1 / OCXO2 pre-spin remain relative for now.
+//
+// TimePop owns QTimer1. process_interrupt does not touch QTimer1.
 //
 // OCR1 is reserved for any existing PPS phase capture system if present.
 // OCR3 is used for OCXO second-boundary scheduling to avoid conflict.
 //
 // GPT runs in free-running mode (FRR=1), so the counter never resets.
-// OCR3 fires when counter == OCR3 value.  The ISR advances OCR3 by
+// OCR3 fires when counter == OCR3 value. The ISR advances OCR3 by
 // OCXO_COUNTS_PER_SECOND for the next second boundary.
 //
 // Lifecycle:
@@ -54,10 +62,9 @@
 static constexpr uint32_t MAX_INTERRUPT_SUBSCRIBERS = 8;
 static constexpr uint32_t OCXO_COUNTS_PER_SECOND = 10000000;
 
-static constexpr uint64_t NS_PER_SECOND_U64       = 1000000000ULL;
-static constexpr uint64_t PRESPIN_LEAD_NS         = 5000ULL;     // 5 µs
-static constexpr uint64_t PRESPIN_DELAY_NS        = NS_PER_SECOND_U64 - PRESPIN_LEAD_NS;
-static constexpr uint32_t PRESPIN_TIMEOUT_CYCLES  = 100800;      // ~100 µs @ 1.008 GHz
+static constexpr uint64_t NS_PER_SECOND_U64      = 1000000000ULL;
+static constexpr uint64_t PRESPIN_LEAD_NS        = 5000ULL;      // 5 µs
+static constexpr uint32_t PRESPIN_TIMEOUT_CYCLES = 100800;       // ~100 µs @ 1.008 GHz
 
 // These values are intentionally separate. PPS is empirically ~48 cycles.
 // GPT continues to use the profiled fixed-overhead constant.
@@ -77,6 +84,7 @@ struct interrupt_subscriber_descriptor_t {
   uint32_t isr_overhead_cycles = 0;
   uint64_t period_ns = 0;
   bool     uses_prespin = false;
+  bool     prespin_absolute_gnss = false;
 };
 
 struct prespin_state_t {
@@ -84,6 +92,7 @@ struct prespin_state_t {
   volatile bool fired = false;
   volatile bool timed_out = false;
 
+  volatile uint32_t prespin_start_dwt = 0;
   volatile uint32_t shadow_dwt = 0;
   volatile uint32_t dwt_isr_entry_raw = 0;
 
@@ -96,6 +105,13 @@ struct prespin_state_t {
   uint32_t complete_count = 0;
   uint32_t timeout_count = 0;
   uint32_t anomaly_count = 0;
+
+  // Instrumentation for schedule/arm timing analysis.
+  uint64_t last_schedule_now_gnss_ns = 0;
+  uint64_t last_schedule_delay_ns = 0;
+  int64_t  last_prespin_margin_ns = 0;
+  uint64_t last_schedule_event_target_gnss_ns = 0;
+  uint64_t last_schedule_prespin_target_gnss_ns = 0;
 };
 
 struct interrupt_subscriber_runtime_t {
@@ -173,6 +189,7 @@ static const interrupt_subscriber_descriptor_t DESCRIPTORS[] = {
     PPS_ISR_FIXED_OVERHEAD_CYCLES,
     NS_PER_SECOND_U64,
     true,
+    true,
   },
   {
     interrupt_subscriber_kind_t::OCXO1,
@@ -182,6 +199,7 @@ static const interrupt_subscriber_descriptor_t DESCRIPTORS[] = {
     GPT_ISR_FIXED_OVERHEAD,
     NS_PER_SECOND_U64,
     true,
+    false,
   },
   {
     interrupt_subscriber_kind_t::OCXO2,
@@ -191,6 +209,7 @@ static const interrupt_subscriber_descriptor_t DESCRIPTORS[] = {
     GPT_ISR_FIXED_OVERHEAD,
     NS_PER_SECOND_U64,
     true,
+    false,
   },
 };
 
@@ -305,8 +324,9 @@ uint32_t interrupt_gpt2_counter_now(void) {
 // ============================================================================
 //
 // ARM_DWT_CYCCNT is captured as the very first assignment statement.
-// No other work precedes it.  This is the sacred first instruction.
+// No other work precedes it. This is the sacred first instruction.
 //
+// ============================================================================
 
 static void pps_gpio_isr(void) {
   const uint32_t dwt_raw = ARM_DWT_CYCCNT;
@@ -316,20 +336,16 @@ static void pps_gpio_isr(void) {
 static void gpt1_isr(void) {
   const uint32_t dwt_raw = ARM_DWT_CYCCNT;
 
-  // OF3 — OCXO1 second-boundary (process_interrupt authority)
   if (GPT1_SR & GPT_SR_OF3) {
     process_interrupt_gpt1_irq(dwt_raw);
   }
 
-  // OF1 — reserved for PPS phase capture if present.
-  // If OF1 handling is needed, it would be added here with its own
-  // dispatch, still using the same dwt_raw captured above.
+  // OF1 reserved for other GPT1 users if needed later.
 }
 
 static void gpt2_isr(void) {
   const uint32_t dwt_raw = ARM_DWT_CYCCNT;
 
-  // OF3 — OCXO2 second-boundary (process_interrupt authority)
   if (GPT2_SR & GPT_SR_OF3) {
     process_interrupt_gpt2_irq(dwt_raw);
   }
@@ -365,13 +381,14 @@ static void prespin_timepop_callback(timepop_ctx_t*,
   ps.active = true;
   ps.fired = false;
   ps.timed_out = false;
+  ps.prespin_start_dwt = 0;
   ps.shadow_dwt = 0;
   ps.dwt_isr_entry_raw = 0;
   ps.arm_count++;
 
-  const uint32_t spin_start = ARM_DWT_CYCCNT;
+  const uint32_t prespin_start_dwt = ARM_DWT_CYCCNT;
+  ps.prespin_start_dwt = prespin_start_dwt;
 
-  // Classic iconic loop: keep shadow-writing DWT until interrupt hits.
   for (;;) {
     ps.shadow_dwt = ARM_DWT_CYCCNT;
 
@@ -381,7 +398,7 @@ static void prespin_timepop_callback(timepop_ctx_t*,
       return;
     }
 
-    if ((ARM_DWT_CYCCNT - spin_start) > PRESPIN_TIMEOUT_CYCLES) {
+    if ((ARM_DWT_CYCCNT - prespin_start_dwt) > PRESPIN_TIMEOUT_CYCLES) {
       ps.timed_out = true;
       ps.timeout_count++;
       ps.active = false;
@@ -398,7 +415,7 @@ static void prespin_timepop_callback(timepop_ctx_t*,
 }
 
 static uint64_t current_gnss_now_for_schedule(void) {
-  const int64_t gnss_ns_signed = time_dwt_to_gnss_ns(ARM_DWT_CYCCNT);
+  const int64_t gnss_ns_signed = time_gnss_ns_now();
   return (gnss_ns_signed >= 0) ? (uint64_t)gnss_ns_signed : 0ULL;
 }
 
@@ -415,8 +432,48 @@ static void schedule_next_prespin(interrupt_subscriber_runtime_t& rt,
           ? (event_target_gnss_ns - PRESPIN_LEAD_NS)
           : 0;
 
-  uint64_t now_gnss_ns = current_gnss_now_for_schedule();
+  ps.last_schedule_event_target_gnss_ns = ps.event_target_gnss_ns;
+  ps.last_schedule_prespin_target_gnss_ns = ps.prespin_target_gnss_ns;
+
+  if (rt.desc->prespin_absolute_gnss) {
+    const uint64_t now_gnss_ns = current_gnss_now_for_schedule();
+    ps.last_schedule_now_gnss_ns = now_gnss_ns;
+    ps.last_schedule_delay_ns =
+        (ps.prespin_target_gnss_ns > now_gnss_ns)
+            ? (ps.prespin_target_gnss_ns - now_gnss_ns)
+            : 0;
+    ps.last_prespin_margin_ns =
+        (int64_t)ps.prespin_target_gnss_ns - (int64_t)now_gnss_ns;
+
+    timepop_handle_t h =
+        timepop_arm_at((int64_t)ps.prespin_target_gnss_ns,
+                       false,
+                       prespin_timepop_callback,
+                       &rt,
+                       rt.desc->name);
+
+    if (h == TIMEPOP_INVALID_HANDLE) {
+      ps.anomaly_count++;
+      record_anomaly(g_anomaly_diag.prespin_arm_failed,
+                     rt.desc->kind,
+                     (uint32_t)(ps.prespin_target_gnss_ns & 0xFFFFFFFFu),
+                     (uint32_t)(ps.prespin_target_gnss_ns >> 32),
+                     ps.arm_count);
+      return;
+    }
+
+    ps.handle = h;
+    return;
+  }
+
+  const uint64_t now_gnss_ns = current_gnss_now_for_schedule();
+  ps.last_schedule_now_gnss_ns = now_gnss_ns;
+
   if (now_gnss_ns == 0 || ps.prespin_target_gnss_ns <= now_gnss_ns) {
+    ps.last_schedule_delay_ns = 0;
+    ps.last_prespin_margin_ns =
+        (int64_t)ps.prespin_target_gnss_ns - (int64_t)now_gnss_ns;
+
     ps.anomaly_count++;
     record_anomaly(g_anomaly_diag.prespin_arm_failed,
                    rt.desc->kind,
@@ -427,6 +484,9 @@ static void schedule_next_prespin(interrupt_subscriber_runtime_t& rt,
   }
 
   uint64_t delay_ns = ps.prespin_target_gnss_ns - now_gnss_ns;
+  ps.last_schedule_delay_ns = delay_ns;
+  ps.last_prespin_margin_ns =
+      (int64_t)ps.prespin_target_gnss_ns - (int64_t)now_gnss_ns;
 
   timepop_handle_t h =
       timepop_arm(delay_ns, false, prespin_timepop_callback, &rt, rt.desc->name);
@@ -452,7 +512,8 @@ static void fill_diag(interrupt_subscriber_runtime_t& rt,
                       interrupt_capture_diag_t& diag,
                       const interrupt_event_t& event,
                       uint32_t dwt_isr_entry_raw,
-                      uint32_t approach_cycles) {
+                      uint32_t approach_cycles,
+                      uint32_t shadow_to_isr_cycles) {
   diag.provider = rt.desc->provider;
   diag.lane = rt.desc->lane;
   diag.kind = rt.desc->kind;
@@ -467,6 +528,7 @@ static void fill_diag(interrupt_subscriber_runtime_t& rt,
   diag.shadow_dwt = rt.prespin.shadow_dwt;
   diag.dwt_isr_entry_raw = dwt_isr_entry_raw;
   diag.approach_cycles = approach_cycles;
+  diag.shadow_to_isr_cycles = shadow_to_isr_cycles;
 
   diag.dwt_at_event_adjusted = event.dwt_at_event;
   diag.gnss_ns_at_event = event.gnss_ns_at_event;
@@ -490,7 +552,6 @@ static void deferred_dispatch_callback(timepop_ctx_t*, timepop_diag_t*, void* us
 
   maybe_dispatch_event(*rt);
 
-  // Rearm next prespin from scheduled context.
   if (rt->desc && rt->has_fired) {
     schedule_next_prespin(*rt, rt->last_event.gnss_ns_at_event + rt->desc->period_ns);
   }
@@ -507,8 +568,8 @@ static void handle_event_common(interrupt_subscriber_runtime_t& rt,
 
   prespin_state_t& ps = rt.prespin;
 
-  bool have_prespin = false;
   uint32_t approach_cycles = 0;
+  uint32_t shadow_to_isr_cycles = 0;
 
   if (rt.desc->uses_prespin) {
     if (!ps.active) {
@@ -530,8 +591,11 @@ static void handle_event_common(interrupt_subscriber_runtime_t& rt,
                        ps.arm_count,
                        ps.complete_count);
       } else {
-        have_prespin = true;
-        approach_cycles = dwt_isr_entry_raw - ps.shadow_dwt;
+        shadow_to_isr_cycles = dwt_isr_entry_raw - ps.shadow_dwt;
+      }
+
+      if (ps.prespin_start_dwt != 0) {
+        approach_cycles = dwt_isr_entry_raw - ps.prespin_start_dwt;
       }
     }
   }
@@ -564,7 +628,7 @@ static void handle_event_common(interrupt_subscriber_runtime_t& rt,
   }
 
   interrupt_capture_diag_t diag {};
-  fill_diag(rt, diag, event, dwt_isr_entry_raw, approach_cycles);
+  fill_diag(rt, diag, event, dwt_isr_entry_raw, approach_cycles, shadow_to_isr_cycles);
 
   rt.last_event = event;
   rt.last_diag = diag;
@@ -573,9 +637,6 @@ static void handle_event_common(interrupt_subscriber_runtime_t& rt,
   rt.dispatch_count++;
   rt.event_count++;
 
-  // Subscriber dispatch happens in scheduled context when the prespin
-  // callback sees ps.fired and exits the spin loop.  We do NOT call
-  // the subscriber from ISR context.
   timepop_arm(0, false, deferred_dispatch_callback, &rt, rt.desc->name);
 }
 
@@ -679,7 +740,14 @@ bool interrupt_start(interrupt_subscriber_kind_t kind) {
   rt->start_count++;
 
   if (kind == interrupt_subscriber_kind_t::PPS) {
-    schedule_next_prespin(*rt, current_gnss_now_for_schedule() + NS_PER_SECOND_U64);
+    if (g_rt_pps && g_rt_pps->event_count == 0) {
+      const uint64_t now_gnss_ns = current_gnss_now_for_schedule();
+      if (now_gnss_ns > 0) {
+        const uint64_t next_pps_gnss_ns =
+            ((now_gnss_ns / NS_PER_SECOND_U64) + 1ULL) * NS_PER_SECOND_U64;
+        schedule_next_prespin(*rt, next_pps_gnss_ns);
+      }
+    }
     return true;
   }
 
@@ -712,6 +780,11 @@ bool interrupt_stop(interrupt_subscriber_kind_t kind) {
 
   rt->active = false;
   rt->stop_count++;
+
+  if (rt->prespin.handle != TIMEPOP_INVALID_HANDLE) {
+    timepop_cancel(rt->prespin.handle);
+    rt->prespin.handle = TIMEPOP_INVALID_HANDLE;
+  }
 
   if (kind == interrupt_subscriber_kind_t::OCXO1) {
     GPT1_IR &= ~GPT_IR_OF3IE;
@@ -784,24 +857,14 @@ void process_interrupt_init(void) {
 // Initialization — Phase 3: ISR vector installation + NVIC enable
 // ============================================================================
 //
-// This is the moment hardware interrupts become live.  Everything upstream
+// This is the moment hardware interrupts become live. Everything upstream
 // (GPT counters, runtime slots, TimePop scheduler) must already be alive.
 //
-// All three providers are armed here:
-//   • GPT1 — ISR vector + priority (OF3 interrupt enabled later by
-//            interrupt_start(OCXO1))
-//   • GPT2 — ISR vector + priority (OF3 interrupt enabled later by
-//            interrupt_start(OCXO2))
-//   • GPIO6789 — PPS rising edge via attachInterrupt + priority
-//
-// GPT status registers are cleared and interrupt-enable registers zeroed
-// to ensure no stale flags cause spurious fires on NVIC enable.
-//
+// ============================================================================
 
 void process_interrupt_enable_irqs(void) {
   if (g_interrupt_irqs_enabled) return;
 
-  // --- GPT1 : clear all flags, disable all interrupt sources ---
   GPT1_SR = 0x3F;
   GPT1_IR = 0;
 
@@ -809,7 +872,6 @@ void process_interrupt_enable_irqs(void) {
   NVIC_SET_PRIORITY(IRQ_GPT1, 0);
   NVIC_ENABLE_IRQ(IRQ_GPT1);
 
-  // --- GPT2: clear all flags, disable all interrupt sources ---
   GPT2_SR = 0x3F;
   GPT2_IR = 0;
 
@@ -817,7 +879,6 @@ void process_interrupt_enable_irqs(void) {
   NVIC_SET_PRIORITY(IRQ_GPT2, 0);
   NVIC_ENABLE_IRQ(IRQ_GPT2);
 
-  // --- GPIO6789: PPS rising edge ---
   pinMode(GNSS_PPS_PIN, INPUT);
   attachInterrupt(digitalPinToInterrupt(GNSS_PPS_PIN), pps_gpio_isr, RISING);
   NVIC_SET_PRIORITY(IRQ_GPIO6789, 0);
@@ -888,12 +949,22 @@ static Payload cmd_report(const Payload&) {
     s.add("prespin_timed_out", rt.prespin.timed_out);
     s.add("prespin_target_gnss_ns", rt.prespin.prespin_target_gnss_ns);
     s.add("event_target_gnss_ns", rt.prespin.event_target_gnss_ns);
+    s.add("prespin_start_dwt", rt.prespin.prespin_start_dwt);
     s.add("shadow_dwt", rt.prespin.shadow_dwt);
     s.add("dwt_isr_entry_raw", rt.prespin.dwt_isr_entry_raw);
     s.add("prespin_arm_count", rt.prespin.arm_count);
     s.add("prespin_complete_count", rt.prespin.complete_count);
     s.add("prespin_timeout_count", rt.prespin.timeout_count);
     s.add("anomaly_count", rt.prespin.anomaly_count);
+
+    s.add("last_schedule_now_gnss_ns", rt.prespin.last_schedule_now_gnss_ns);
+    s.add("last_schedule_delay_ns", rt.prespin.last_schedule_delay_ns);
+    s.add("last_prespin_margin_ns", rt.prespin.last_prespin_margin_ns);
+    s.add("last_schedule_event_target_gnss_ns", rt.prespin.last_schedule_event_target_gnss_ns);
+    s.add("last_schedule_prespin_target_gnss_ns", rt.prespin.last_schedule_prespin_target_gnss_ns);
+
+    s.add("last_approach_cycles", rt.last_diag.approach_cycles);
+    s.add("last_shadow_to_isr_cycles", rt.last_diag.shadow_to_isr_cycles);
 
     s.add("last_dwt_at_event", rt.last_event.dwt_at_event);
     s.add("last_gnss_ns_at_event", rt.last_event.gnss_ns_at_event);
