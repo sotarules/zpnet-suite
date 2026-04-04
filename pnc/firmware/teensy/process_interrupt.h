@@ -20,6 +20,15 @@
 //   • Diagnostics are always available to clients through the callback contract.
 //   • There is no best-effort reconstruction path if sacred capture facts are absent.
 //
+// PPS drumbeat laws:
+//
+//   • PPS pre-spin is a system-level drumbeat, not a campaign feature.
+//   • PPS drumbeat scheduling is geared from a sacred PPS baseline, not chained
+//     from callback timing.
+//   • ZERO is a request, not an immediate action.
+//   • ZERO is consummated only on a PPS edge.
+//   • That PPS edge becomes the new PPS drumbeat baseline.
+//
 // Lifecycle:
 //
 //   1. process_interrupt_init_hardware() — GPT clock gates, pin mux, enable
@@ -77,25 +86,6 @@ enum class interrupt_event_status_t : uint8_t {
 // ============================================================================
 // Canonical interrupt event
 // ============================================================================
-//
-// This is the authoritative event truth handed forward from the interrupt
-// boundary. It describes what happened, when it happened, and what provider
-// produced it.
-//
-// Fields:
-//   dwt_at_event:
-//     DWT cycle count at the event boundary after fixed-overhead correction.
-//
-//   gnss_ns_at_event:
-//     Absolute GNSS nanosecond at the event boundary when known.
-//
-//   counter32_at_event:
-//     Logical event count or provider-side second-count index.
-//
-//   dwt_event_correction_cycles:
-//     Fixed correction applied to ISR-entry DWT to derive dwt_at_event.
-//
-// ============================================================================
 
 struct interrupt_event_t {
   interrupt_subscriber_kind_t kind = interrupt_subscriber_kind_t::NONE;
@@ -116,21 +106,6 @@ struct interrupt_event_t {
 
 // ============================================================================
 // Optional capture diagnostics
-// ============================================================================
-//
-// This block provides capture-path diagnostics for clients that need to inspect
-// pre-spin behavior or ISR-side timing detail.
-//
-// Terminology:
-//   approach_cycles:
-//     Total cycles from pre-spin start until interrupt fire.
-//
-//   shadow_to_isr_cycles:
-//     Cycles from the final shadow DWT sample to ISR entry.
-//
-// These are not interchangeable. approach_cycles is the schedule-tuning metric.
-// shadow_to_isr_cycles is the tail-latency metric.
-//
 // ============================================================================
 
 struct interrupt_capture_diag_t {
@@ -170,13 +145,6 @@ struct interrupt_capture_diag_t {
 // ============================================================================
 // Subscriber callback signature
 // ============================================================================
-//
-// Callbacks receive canonical event truth plus optional diagnostics.
-//
-// The event is the authoritative fact.
-// The diagnostic block is supplemental.
-//
-// ============================================================================
 
 using interrupt_subscriber_event_fn =
     void (*)(const interrupt_event_t& event,
@@ -197,18 +165,9 @@ struct interrupt_subscription_t {
 // Subsystem lifecycle
 // ============================================================================
 
-/// Phase 1: GPT clock gates, pin mux, timer enable. Call early in boot.
 void process_interrupt_init_hardware(void);
-
-/// Phase 2: Runtime slot creation and descriptor wiring.
 void process_interrupt_init(void);
-
-/// Phase 3: ISR vector installation + NVIC enable. Call only after TimePop
-/// and other core infrastructure are alive. This is the moment interrupts
-/// become live.
 void process_interrupt_enable_irqs(void);
-
-/// Process-framework registration (REPORT command).
 void process_interrupt_register(void);
 
 // ============================================================================
@@ -220,6 +179,18 @@ bool interrupt_start(interrupt_subscriber_kind_t kind);
 bool interrupt_stop(interrupt_subscriber_kind_t kind);
 
 // ============================================================================
+// PPS drumbeat control
+// ============================================================================
+//
+// ZERO is latched and consummated only on a PPS edge. The next PPS edge after
+// this request becomes the new PPS drumbeat baseline and restarts the geared
+// PPS pre-spin schedule from that sacred edge.
+//
+
+void interrupt_request_pps_zero(void);
+bool interrupt_pps_zero_pending(void);
+
+// ============================================================================
 // Last event / diag access
 // ============================================================================
 
@@ -228,10 +199,6 @@ const interrupt_capture_diag_t* interrupt_last_diag(interrupt_subscriber_kind_t 
 
 // ============================================================================
 // Shared IRQ authority entry points
-// ============================================================================
-//
-// These are called only from process_interrupt-owned ISR vectors.
-//
 // ============================================================================
 
 void process_interrupt_gpio6789_irq(uint32_t dwt_isr_entry_raw);

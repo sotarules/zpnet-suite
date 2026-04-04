@@ -30,7 +30,15 @@
 //      boundary it wants. This avoids "whenever I happened to ask" timing
 //      leakage in the caller.
 //
-//   3. Caller-owned exact target scheduling
+//   3. Anchor-relative GNSS scheduling
+//        timepop_arm_from_anchor(anchor_gnss_ns, offset_gnss_ns, ...)
+//
+//      Use this when the caller has a sacred recurrence anchor and wants the
+//      target to be derived from that anchor plus a relative offset, rather
+//      than from dispatch-time "now". This is the correct path for recurring
+//      phase-locked work such as PPS pre-spin.
+//
+//   4. Caller-owned exact target scheduling
 //        timepop_arm_ns(target_gnss_ns, target_dwt, ...)
 //
 //      Use this when the caller owns both the GNSS target and the DWT target
@@ -186,6 +194,39 @@ timepop_handle_t timepop_arm(
 
 timepop_handle_t timepop_arm_at(
   int64_t             target_gnss_ns,
+  bool                recurring,
+  timepop_callback_t  callback,
+  void*               user_data,
+  const char*         name
+);
+
+// ============================================================================
+// Anchor-relative GNSS scheduling
+// ============================================================================
+//
+// Arms a timer using:
+//
+//   target_gnss_ns = anchor_gnss_ns + offset_gnss_ns
+//
+// This preserves sacred recurrence phase because the caller supplies the
+// recurrence anchor explicitly instead of deriving the next target from "now".
+//
+// Typical use:
+//   PPS prespin for the next second:
+//     anchor_gnss_ns = last PPS edge
+//     offset_gnss_ns = 1_000_000_000 - 5_000
+//
+// recurring:
+//   Reserved for future use. Anchor-relative timers are currently expected to
+//   be one-shot unless the implementation explicitly documents recurrence.
+//
+// Returns TIMEPOP_INVALID_HANDLE on failure.
+//
+// ============================================================================
+
+timepop_handle_t timepop_arm_from_anchor(
+  int64_t             anchor_gnss_ns,
+  int64_t             offset_gnss_ns,
   bool                recurring,
   timepop_callback_t  callback,
   void*               user_data,

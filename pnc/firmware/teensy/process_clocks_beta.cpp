@@ -44,6 +44,8 @@ uint64_t recover_gnss_ns  = 0;
 uint64_t recover_ocxo1_ns = 0;
 uint64_t recover_ocxo2_ns = 0;
 
+static volatile bool zero_handshake_in_flight = false;
+
 volatile bool     watchdog_anomaly_active          = false;
 volatile bool     watchdog_anomaly_publish_pending = false;
 volatile uint32_t watchdog_anomaly_sequence        = 0;
@@ -268,6 +270,7 @@ static void clocks_force_stop_campaign(void) {
   request_stop = false;
   request_recover = false;
   request_zero = false;
+  zero_handshake_in_flight = false;
   calibrate_ocxo_mode = servo_mode_t::OFF;
   timebase_invalidate();
 }
@@ -324,13 +327,76 @@ void clocks_watchdog_anomaly(const char* reason,
 // ============================================================================
 // clocks_beta_pps
 // ============================================================================
+//
+// Unified request contract:
+//
+//   • every request_foo is a latched intent
+//   • consummated only by the lawful boundary handler
+//   • cleared only after the transition has actually occurred
+//
+// request_zero:
+//   sacred PPS-boundary contract via interrupt_request_pps_zero()
+//
+// request_start:
+//   waits for the same sacred zero/reset contract to complete before campaign
+//   actually becomes STARTED
+//
+// request_stop:
+//   consummated on this lawful PPS callback turn
+//
+// request_recover:
+//   consummated on this lawful PPS callback turn
+//
+// ============================================================================
 
 void clocks_beta_pps(void) {
-  if (request_zero) {
+  // --------------------------------------------------------------------------
+  // ZERO / START sacred PPS-boundary handshake
+  // --------------------------------------------------------------------------
+  //
+  // Handshake states:
+  //
+  //   zero_handshake_in_flight == false
+  //     → clocks layer has not yet asked interrupt layer to perform sacred PPS zero
+  //
+  //   zero_handshake_in_flight == true
+  //     → clocks layer has asked, and is now waiting for interrupt layer to
+  //       consummate that request on a PPS edge and clear its pending flag
+  //
+  // Completion:
+  //   once interrupt_pps_zero_pending() becomes false again, the interrupt
+  //   layer has completed the sacred PPS-boundary reset and restarted its
+  //   geared PPS drumbeat. We then zero local clocks state here.
+  //
+  // --------------------------------------------------------------------------
+
+  if (request_zero || request_start) {
+    if (!zero_handshake_in_flight) {
+      interrupt_request_pps_zero();
+      zero_handshake_in_flight = true;
+      return;
+    }
+
+    if (interrupt_pps_zero_pending()) {
+      return;
+    }
+
     clocks_zero_all();
+    zero_handshake_in_flight = false;
     request_zero = false;
+
+    if (request_start) {
+      watchdog_anomaly_active = false;
+      campaign_state = clocks_campaign_state_t::STARTED;
+      request_start = false;
+    }
+
+    return;
   }
 
+  // --------------------------------------------------------------------------
+  // STOP — lawful PPS callback-turn consummation
+  // --------------------------------------------------------------------------
   if (request_stop) {
     watchdog_anomaly_active = false;
     campaign_state = clocks_campaign_state_t::STOPPED;
@@ -340,6 +406,9 @@ void clocks_beta_pps(void) {
     return;
   }
 
+  // --------------------------------------------------------------------------
+  // RECOVER — lawful PPS callback-turn consummation
+  // --------------------------------------------------------------------------
   if (request_recover) {
     watchdog_anomaly_active = false;
 
@@ -355,13 +424,9 @@ void clocks_beta_pps(void) {
     return;
   }
 
-  if (request_start) {
-    watchdog_anomaly_active = false;
-    clocks_zero_all();
-    campaign_state = clocks_campaign_state_t::STARTED;
-    request_start = false;
-  }
-
+  // --------------------------------------------------------------------------
+  // Watchdog / campaign gating
+  // --------------------------------------------------------------------------
   if (watchdog_anomaly_active) {
     return;
   }
@@ -370,6 +435,9 @@ void clocks_beta_pps(void) {
     return;
   }
 
+  // --------------------------------------------------------------------------
+  // Normal started-campaign PPS work
+  // --------------------------------------------------------------------------
   campaign_seconds++;
 
   dwt_cycles_64  = (uint64_t)g_dwt_cycle_count_at_pps;
@@ -454,6 +522,7 @@ static Payload cmd_start(const Payload& args) {
 
   request_start = true;
   request_stop = false;
+  request_recover = false;
 
   Payload p;
   p.add("status", "start_requested");
@@ -518,6 +587,13 @@ static Payload cmd_report(const Payload&) {
         campaign_state == clocks_campaign_state_t::STARTED ? "STARTED" : "STOPPED");
   p.add("campaign", campaign_name);
   p.add("campaign_seconds", campaign_seconds);
+
+  p.add("request_start", request_start);
+  p.add("request_stop", request_stop);
+  p.add("request_recover", request_recover);
+  p.add("request_zero", request_zero);
+  p.add("zero_handshake_in_flight", zero_handshake_in_flight);
+  p.add("interrupt_pps_zero_pending", interrupt_pps_zero_pending());
 
   p.add("gnss_ns_count_at_pps", g_gnss_ns_count_at_pps);
 

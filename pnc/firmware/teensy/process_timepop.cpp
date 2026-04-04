@@ -10,9 +10,10 @@
 //   • QTimer1 CH2 is the dynamic compare scheduler
 //
 // Scheduling modes:
-//   • relative scheduling     — timepop_arm(delay_gnss_ns, ...)
-//   • absolute scheduling     — timepop_arm_at(target_gnss_ns, ...)
-//   • caller-owned exact path — timepop_arm_ns(target_gnss_ns, target_dwt, ...)
+//   • relative scheduling        — timepop_arm(delay_gnss_ns, ...)
+//   • absolute scheduling        — timepop_arm_at(target_gnss_ns, ...)
+//   • anchor-relative scheduling — timepop_arm_from_anchor(anchor_gnss_ns, offset_gnss_ns, ...)
+//   • caller-owned exact path    — timepop_arm_ns(target_gnss_ns, target_dwt, ...)
 //
 // fire_gnss_ns is computed from VCLOCK arithmetic:
 //   gnss_ns = (pps_count - 1) * 1e9 + (fire_vclock_raw - qtimer_at_pps) * 100
@@ -51,50 +52,6 @@ static constexpr uint32_t MIN_DELAY_TICKS = 2;
 static constexpr uint32_t HEARTBEAT_TICKS = 10000;
 static constexpr uint32_t DWT_SPIN_MAX_CYCLES = 110;
 static constexpr uint32_t PREDICT_MAX_QTIMER_ELAPSED = 15000000U;
-
-// ============================================================================
-// Welford accumulator
-// ============================================================================
-
-struct welford_t {
-  int64_t  n;
-  double   mean;
-  double   m2;
-  int64_t  min_val;
-  int64_t  max_val;
-  int32_t  outside_100ns;
-  int64_t  last_residual;
-
-  void reset(void) {
-    n = 0;
-    mean = 0.0;
-    m2 = 0.0;
-    min_val = INT64_MAX;
-    max_val = INT64_MIN;
-    outside_100ns = 0;
-    last_residual = 0;
-  }
-
-  void update(int64_t residual) {
-    n++;
-    const double x = (double)residual;
-    const double d1 = x - mean;
-    mean += d1 / (double)n;
-    m2 += (x - mean) * d1;
-    if (residual < min_val) min_val = residual;
-    if (residual > max_val) max_val = residual;
-    if (residual > 100 || residual < -100) outside_100ns++;
-    last_residual = residual;
-  }
-
-  double stddev(void) const {
-    return (n >= 2) ? sqrt(m2 / (double)(n - 1)) : 0.0;
-  }
-
-  double stderr_val(void) const {
-    return (n >= 2) ? stddev() / sqrt((double)n) : 0.0;
-  }
-};
 
 // ============================================================================
 // Slot
@@ -159,8 +116,9 @@ static volatile uint32_t isr_fire_count     = 0;
 static volatile uint32_t expired_count      = 0;
 static volatile uint32_t phantom_count      = 0;
 
-static volatile uint32_t diag_slots_high_water  = 0;
-static volatile uint32_t diag_arm_failures      = 0;
+static volatile uint32_t diag_slots_high_water   = 0;
+static volatile uint32_t diag_arm_failures       = 0;
+static volatile uint32_t diag_named_replacements = 0;
 
 static volatile uint32_t diag_asap_armed             = 0;
 static volatile uint32_t diag_asap_dispatched         = 0;
@@ -171,12 +129,6 @@ static volatile const char* diag_asap_last_armed_name = nullptr;
 
 static volatile uint32_t diag_dispatch_calls     = 0;
 static volatile uint32_t diag_dispatch_callbacks = 0;
-
-static welford_t welford_gnss_residual = {};
-static welford_t welford_dwt_crosscheck = {};
-
-static volatile uint32_t diag_prediction_samples = 0;
-static volatile uint32_t diag_prediction_skipped = 0;
 
 static volatile uint32_t diag_isr_count          = 0;
 static volatile uint32_t diag_rearm_count        = 0;
@@ -287,6 +239,29 @@ static uint32_t predict_dwt_at_deadline(uint32_t deadline, bool& valid) {
 
   valid = true;
   return snap.dwt_at_pps + (uint32_t)dwt_elapsed;
+}
+
+// ============================================================================
+// Named singleton replacement
+// ============================================================================
+
+static bool retire_existing_named_slots(const char* name) {
+  if (!name || !*name) return false;
+
+  bool retired_any = false;
+
+  for (uint32_t i = 0; i < MAX_SLOTS; i++) {
+    if (!slots[i].active) continue;
+    if (!slots[i].name) continue;
+    if (strcmp(slots[i].name, name) != 0) continue;
+
+    slots[i].active = false;
+    slots[i].expired = false;
+    retired_any = true;
+    diag_named_replacements++;
+  }
+
+  return retired_any;
 }
 
 // ============================================================================
@@ -498,11 +473,6 @@ static void qtimer1_ch2_isr(void) {
 // ============================================================================
 
 static void qtimer1_init_vclock_base(void) {
-  // QTimer1 CH0+CH1 — passive 32-bit GNSS counter (10 MHz on pin 10 / GPIO_B0_00 ALT1)
-  // CH0 is the low word driven directly from the external 10 MHz clock.
-  // CH1 is the cascade companion — counts CH0 overflows via CM(7).
-  // Together they form the 32-bit VCLOCK that is the sovereign time substrate.
-
   CCM_CCGR6 |= CCM_CCGR6_QTIMER1(CCM_CCGR_ON);
 
   *(portConfigRegister(10)) = 1;
@@ -555,9 +525,6 @@ static void qtimer1_init_ch2_scheduler(void) {
 void timepop_init(void) {
   for (uint32_t i = 0; i < MAX_SLOTS; i++) slots[i] = {};
 
-  welford_gnss_residual.reset();
-  welford_dwt_crosscheck.reset();
-
   qtimer1_init_vclock_base();
   qtimer1_init_ch2_scheduler();
 
@@ -607,6 +574,12 @@ static timepop_handle_t arm_common_relative_or_absolute(
   }
 
   noInterrupts();
+
+  const bool retired_named = retire_existing_named_slots(name);
+  if (retired_named) {
+    diag_schedule_next_calls_from_other++;
+    schedule_next();
+  }
 
   for (uint32_t i = 0; i < MAX_SLOTS; i++) {
     if (slots[i].active) continue;
@@ -717,6 +690,36 @@ timepop_handle_t timepop_arm_at(
 }
 
 // ============================================================================
+// Arm — anchor-relative GNSS scheduling
+// ============================================================================
+
+timepop_handle_t timepop_arm_from_anchor(
+  int64_t             anchor_gnss_ns,
+  int64_t             offset_gnss_ns,
+  bool                recurring,
+  timepop_callback_t  callback,
+  void*               user_data,
+  const char*         name
+) {
+  if (!callback) return TIMEPOP_INVALID_HANDLE;
+  if (anchor_gnss_ns <= 0) return TIMEPOP_INVALID_HANDLE;
+
+  const int64_t target_gnss_ns = anchor_gnss_ns + offset_gnss_ns;
+  if (target_gnss_ns <= 0) return TIMEPOP_INVALID_HANDLE;
+  if (target_gnss_ns <= anchor_gnss_ns && offset_gnss_ns > 0) {
+    return TIMEPOP_INVALID_HANDLE;
+  }
+
+  return timepop_arm_at(
+    target_gnss_ns,
+    recurring,
+    callback,
+    user_data,
+    name
+  );
+}
+
+// ============================================================================
 // Arm — caller-owned exact target path
 // ============================================================================
 
@@ -744,6 +747,12 @@ timepop_handle_t timepop_arm_ns(
   const uint32_t vclock_deadline = now + delay_ticks;
 
   noInterrupts();
+
+  const bool retired_named = retire_existing_named_slots(name);
+  if (retired_named) {
+    diag_schedule_next_calls_from_other++;
+    schedule_next();
+  }
 
   for (uint32_t i = 0; i < MAX_SLOTS; i++) {
     if (slots[i].active) continue;
@@ -830,64 +839,10 @@ uint32_t timepop_cancel_by_name(const char* name) {
 }
 
 // ============================================================================
-// NS_TEST — deferred event emission
-// ============================================================================
-
-static volatile bool ns_test_result_ready = false;
-static Payload       ns_test_result_ev;
-
-static void emit_deferred_ns_test(void) {
-  if (!ns_test_result_ready) return;
-  ns_test_result_ready = false;
-  enqueueEvent("TIMEPOP_NS_TEST", ns_test_result_ev);
-  ns_test_result_ev.clear();
-}
-
-// ============================================================================
-// Slot-level Welford update — GNSS domain
-// ============================================================================
-
-static void slot_welford_update(const timepop_slot_t& slot) {
-
-  if (!slot.prediction_valid || slot.target_gnss_ns <= 0) {
-    diag_prediction_skipped++;
-    return;
-  }
-
-  if (slot.fire_gnss_ns <= 0) {
-    diag_prediction_skipped++;
-    return;
-  }
-
-  const int64_t gnss_residual = slot.fire_gnss_ns - slot.target_gnss_ns;
-  welford_gnss_residual.update(gnss_residual);
-
-  if (slot.anchor_valid && slot.anchor_dwt_cycles_per_s > 0 &&
-      slot.anchor_pps_count >= 2) {
-
-    const uint32_t dwt_elapsed = slot.fire_dwt_cyccnt - slot.anchor_dwt_at_pps;
-    const uint64_t dwt_ns_into_second =
-      ((uint64_t)dwt_elapsed * 1000000000ULL + (uint64_t)slot.anchor_dwt_cycles_per_s / 2)
-      / (uint64_t)slot.anchor_dwt_cycles_per_s;
-
-    const int64_t epoch_ns = (int64_t)(slot.anchor_pps_count - 1) * (int64_t)1000000000LL;
-    const int64_t dwt_gnss_ns = epoch_ns + (int64_t)dwt_ns_into_second;
-
-    const int64_t crosscheck_residual = dwt_gnss_ns - slot.fire_gnss_ns;
-    welford_dwt_crosscheck.update(crosscheck_residual);
-  }
-
-  diag_prediction_samples++;
-}
-
-// ============================================================================
 // Dispatch
 // ============================================================================
 
 void timepop_dispatch(void) {
-
-  emit_deferred_ns_test();
-
   if (!timepop_pending) return;
   timepop_pending = false;
   diag_dispatch_calls++;
@@ -917,7 +872,6 @@ void timepop_dispatch(void) {
       diag_dispatch_callbacks++;
       diag_asap_dispatched++;
       diag_asap_last_dispatch_dwt = end;
-      diag_prediction_skipped++;
 
       slots[i].active = false;
       continue;
@@ -925,7 +879,6 @@ void timepop_dispatch(void) {
 
     // ── ISR-callback slot: callback already ran in ISR context ──
     if (slots[i].isr_callback_fired) {
-      slot_welford_update(slots[i]);
       slots[i].active = false;
       continue;
     }
@@ -943,13 +896,10 @@ void timepop_dispatch(void) {
 
     cpu_usage_account_busy(end - start);
     diag_dispatch_callbacks++;
-    slot_welford_update(slots[i]);
 
     // ── Recurring rearm ──
     if (slots[i].recurring) {
       if (slots[i].is_absolute) {
-        // Absolute recurring semantics are intentionally not auto-rearmed
-        // in this revision. Caller can re-arm explicitly with a new target.
         slots[i].active = false;
       } else if (slots[i].period_ticks == 0) {
         slots[i].active = false;
@@ -1002,195 +952,6 @@ uint32_t timepop_active_count(void) {
 }
 
 // ============================================================================
-// TEST command
-// ============================================================================
-
-struct test_context_t {
-  int64_t  arm_gnss_ns;
-  uint64_t requested_ns;
-  uint32_t arm_pps_count;
-};
-
-static test_context_t test_ctx = {};
-static volatile bool  test_in_flight = false;
-
-static void test_timer_callback(timepop_ctx_t* ctx, timepop_diag_t*, void*) {
-  uint32_t cb_vclock = qtimer1_read_32_local();
-  int64_t end_gnss_ns = time_gnss_ns_now();
-
-  int64_t measured_ns = -1;
-  if (test_ctx.arm_gnss_ns >= 0 && end_gnss_ns >= 0) {
-    measured_ns = end_gnss_ns - test_ctx.arm_gnss_ns;
-  }
-
-  int64_t error_ns = -1;
-  if (measured_ns >= 0) {
-    error_ns = measured_ns - (int64_t)test_ctx.requested_ns;
-  }
-
-  int32_t dispatch_ns =
-    (int32_t)(cb_vclock - ctx->fire_vclock_raw) * (int32_t)NS_PER_TICK;
-
-  uint32_t end_pps = time_pps_count();
-
-  Payload ev;
-  ev.add("err",         error_ns);
-  ev.add("meas",        measured_ns);
-  ev.add("req",         test_ctx.requested_ns);
-  ev.add("fire_gnss_error_ns", ctx->fire_gnss_error_ns);
-  ev.add("dispatch_ns", dispatch_ns);
-  ev.add("arm_pps",     test_ctx.arm_pps_count);
-  ev.add("end_pps",     end_pps);
-  ev.add("pps_x",       (int32_t)(end_pps - test_ctx.arm_pps_count));
-  ev.add("time_valid",  time_valid());
-
-  enqueueEvent("TIMEPOP_TEST", ev);
-  test_in_flight = false;
-}
-
-static Payload cmd_test(const Payload& args) {
-  Payload resp;
-  if (test_in_flight) {
-    resp.add("error", "test already in flight");
-    return resp;
-  }
-  if (!args.has("ns")) {
-    resp.add("error", "specify ns=<nanoseconds>");
-    return resp;
-  }
-
-  uint64_t ns_val = args.getUInt64("ns", 0);
-  if (ns_val == 0) {
-    resp.add("error", "ns must be > 0");
-    return resp;
-  }
-
-  int64_t arm_gnss = time_gnss_ns_now();
-  if (arm_gnss < 0) {
-    resp.add("error", "time not valid (need PPS lock)");
-    return resp;
-  }
-
-  test_ctx = {};
-  test_ctx.arm_gnss_ns   = arm_gnss;
-  test_ctx.requested_ns  = ns_val;
-  test_ctx.arm_pps_count = time_pps_count();
-
-  timepop_handle_t h = timepop_arm(ns_val, false, test_timer_callback, nullptr, "test");
-  if (h == TIMEPOP_INVALID_HANDLE) {
-    resp.add("error", "arm failed");
-    return resp;
-  }
-
-  test_in_flight = true;
-  resp.add("status", "armed");
-  resp.add("req",    ns_val);
-  return resp;
-}
-
-// ============================================================================
-// NS_TEST
-// ============================================================================
-
-struct ns_test_context_t {
-  int64_t  arm_gnss_ns;
-  uint64_t requested_ns;
-  int64_t  target_gnss_ns;
-  uint32_t target_dwt;
-  uint32_t arm_dwt;
-  uint32_t arm_vclock_raw;
-};
-
-static ns_test_context_t ns_test_ctx = {};
-static volatile bool     ns_test_in_flight = false;
-
-static void ns_test_timer_callback(timepop_ctx_t* ctx, timepop_diag_t* diag, void*) {
-  int64_t expected_ns = ns_test_ctx.target_gnss_ns;
-  int64_t error_ns =
-    (ctx->fire_gnss_ns >= 0) ? (ctx->fire_gnss_ns - expected_ns) : -1;
-
-  uint32_t qtimer_elapsed = ctx->fire_vclock_raw - ns_test_ctx.arm_vclock_raw;
-
-  Payload ev;
-  ev.add("err",       error_ns);
-  ev.add("expected",  expected_ns);
-  ev.add("actual",    ctx->fire_gnss_ns);
-  ev.add("qtimer_elapsed", qtimer_elapsed);
-  ev.add("req",       ns_test_ctx.requested_ns);
-  ev.add("fire_gnss_error_ns", ctx->fire_gnss_error_ns);
-
-  if (diag) {
-    ev.add("dwt_at_fire",       diag->dwt_at_fire);
-    ev.add("spin_error_cycles", diag->spin_error_cycles);
-    ev.add("prediction_valid",  diag->prediction_valid);
-  }
-
-  ns_test_result_ev = ev;
-  ns_test_result_ready = true;
-  ns_test_in_flight = false;
-}
-
-static Payload cmd_ns_test(const Payload& args) {
-  Payload resp;
-  if (ns_test_in_flight) {
-    resp.add("error", "test already in flight");
-    return resp;
-  }
-  if (!args.has("ns")) {
-    resp.add("error", "specify ns=<nanoseconds>");
-    return resp;
-  }
-
-  uint64_t ns_val = args.getUInt64("ns", 0);
-  if (ns_val == 0) {
-    resp.add("error", "ns must be > 0");
-    return resp;
-  }
-  if (!time_valid()) {
-    resp.add("error", "time not valid");
-    return resp;
-  }
-
-  uint32_t arm_dwt  = ARM_DWT_CYCCNT;
-  uint32_t arm_vclock_raw = qtimer1_read_32_local();
-  int64_t  arm_gnss = time_gnss_ns_now();
-  if (arm_gnss < 0) {
-    resp.add("error", "time_gnss_ns_now failed");
-    return resp;
-  }
-
-  int64_t  target_gnss_ns = arm_gnss + (int64_t)ns_val;
-  uint32_t target_dwt     = time_gnss_ns_to_dwt(target_gnss_ns);
-
-  ns_test_ctx = {};
-  ns_test_ctx.arm_gnss_ns    = arm_gnss;
-  ns_test_ctx.requested_ns   = ns_val;
-  ns_test_ctx.target_gnss_ns = target_gnss_ns;
-  ns_test_ctx.target_dwt     = target_dwt;
-  ns_test_ctx.arm_dwt        = arm_dwt;
-  ns_test_ctx.arm_vclock_raw = arm_vclock_raw;
-
-  timepop_handle_t h = timepop_arm_ns(
-    target_gnss_ns,
-    target_dwt,
-    ns_test_timer_callback,
-    nullptr,
-    "ns-test"
-  );
-  if (h == TIMEPOP_INVALID_HANDLE) {
-    resp.add("error", "arm_ns failed");
-    return resp;
-  }
-
-  ns_test_in_flight = true;
-  resp.add("status", "armed");
-  resp.add("req",    ns_val);
-  resp.add("target_gnss_ns", target_gnss_ns);
-  resp.add("target_dwt",     target_dwt);
-  return resp;
-}
-
-// ============================================================================
 // REPORT
 // ============================================================================
 
@@ -1206,15 +967,14 @@ static Payload cmd_report(const Payload&) {
   out.add("race_recoveries",   diag_race_recoveries);
   out.add("expired",           expired_count);
   out.add("vclock_raw_now",    vclock_count());
-  out.add("test_in_flight",    test_in_flight);
-  out.add("ns_test_in_flight", ns_test_in_flight);
   out.add("time_valid",        time_valid());
   out.add("time_pps_count",    time_pps_count());
 
-  out.add("slots_active_now",  timepop_active_count());
-  out.add("slots_high_water",  diag_slots_high_water);
-  out.add("slots_max",         (uint32_t)MAX_SLOTS);
-  out.add("arm_failures",      diag_arm_failures);
+  out.add("slots_active_now",   timepop_active_count());
+  out.add("slots_high_water",   diag_slots_high_water);
+  out.add("slots_max",          (uint32_t)MAX_SLOTS);
+  out.add("arm_failures",       diag_arm_failures);
+  out.add("named_replacements", diag_named_replacements);
 
   out.add("asap_armed",             diag_asap_armed);
   out.add("asap_dispatched",        diag_asap_dispatched);
@@ -1226,14 +986,6 @@ static Payload cmd_report(const Payload&) {
 
   out.add("dispatch_calls",     diag_dispatch_calls);
   out.add("dispatch_callbacks", diag_dispatch_callbacks);
-
-  out.add("gnss_residual_n",       (int32_t)welford_gnss_residual.n);
-  out.add("gnss_residual_stddev",  welford_gnss_residual.stddev());
-  out.add("dwt_crosscheck_n",      (int32_t)welford_dwt_crosscheck.n);
-  out.add("dwt_crosscheck_stddev", welford_dwt_crosscheck.stddev());
-
-  out.add("prediction_samples", diag_prediction_samples);
-  out.add("prediction_skipped", diag_prediction_skipped);
 
   out.add("schedule_next_calls_total",         diag_schedule_next_calls_total);
   out.add("schedule_next_calls_from_dispatch", diag_schedule_next_calls_from_dispatch);
@@ -1286,60 +1038,6 @@ static Payload cmd_report(const Payload&) {
 }
 
 // ============================================================================
-// DIAG
-// ============================================================================
-
-static void report_welford(Payload& out, const char* prefix, const welford_t& w) {
-  char key[64];
-  snprintf(key, sizeof(key), "%s_n", prefix);      out.add(key, (int32_t)w.n);
-  snprintf(key, sizeof(key), "%s_mean", prefix);   out.add(key, w.mean);
-  snprintf(key, sizeof(key), "%s_stddev", prefix); out.add(key, w.stddev());
-  snprintf(key, sizeof(key), "%s_stderr", prefix); out.add(key, w.stderr_val());
-  snprintf(key, sizeof(key), "%s_min", prefix);    out.add(key, (w.n > 0) ? w.min_val : (int64_t)0);
-  snprintf(key, sizeof(key), "%s_max", prefix);    out.add(key, (w.n > 0) ? w.max_val : (int64_t)0);
-  snprintf(key, sizeof(key), "%s_out100", prefix); out.add(key, w.outside_100ns);
-  snprintf(key, sizeof(key), "%s_last", prefix);   out.add(key, w.last_residual);
-}
-
-static Payload cmd_diag(const Payload&) {
-  Payload out;
-
-  report_welford(out, "gnss_residual",  welford_gnss_residual);
-  report_welford(out, "dwt_crosscheck", welford_dwt_crosscheck);
-
-  out.add("prediction_samples", diag_prediction_samples);
-  out.add("prediction_skipped", diag_prediction_skipped);
-
-  out.add("time_valid",     time_valid());
-  out.add("time_pps_count", time_pps_count());
-
-  time_anchor_snapshot_t snap = time_anchor_snapshot();
-  out.add("anchor_ok",               snap.ok);
-  out.add("anchor_valid",            snap.valid);
-  out.add("anchor_dwt_at_pps",       snap.dwt_at_pps);
-  out.add("anchor_dwt_cycles_per_s", snap.dwt_cycles_per_s);
-  out.add("anchor_qtimer_at_pps",    snap.qtimer_at_pps);
-  out.add("anchor_pps_count",        snap.pps_count);
-
-  return out;
-}
-
-// ============================================================================
-// DIAG_RESET
-// ============================================================================
-
-static Payload cmd_diag_reset(const Payload&) {
-  welford_gnss_residual.reset();
-  welford_dwt_crosscheck.reset();
-  diag_prediction_samples = 0;
-  diag_prediction_skipped = 0;
-
-  Payload out;
-  out.add("status", "reset");
-  return out;
-}
-
-// ============================================================================
 // QTimer1 ISR
 // ============================================================================
 
@@ -1355,10 +1053,6 @@ static void qtimer1_irq_isr(void) {
 
 static const process_command_entry_t TIMEPOP_COMMANDS[] = {
   { "REPORT",      cmd_report      },
-  { "DIAG",        cmd_diag        },
-  { "DIAG_RESET",  cmd_diag_reset  },
-  { "TEST",        cmd_test        },
-  { "NS_TEST",     cmd_ns_test     },
   { nullptr,       nullptr         }
 };
 

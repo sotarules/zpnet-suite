@@ -14,14 +14,17 @@
 //   • Pre-spin shadow-write loops for PPS / OCXO1 / OCXO2
 //   • Event reconstruction (DWT correction, GNSS ns projection)
 //   • Subscriber dispatch with canonical event + diagnostics
+//   • PPS geared drumbeat scheduling from sacred PPS baseline
+//   • PPS ZERO-request latching and sacred edge consummation
 //
 // Terminology:
 //   • approach_cycles      = total cycles from pre-spin start until interrupt fire
 //   • shadow_to_isr_cycles = cycles from final shadow DWT sample to ISR entry
 //
 // Scheduling intent:
-//   • PPS pre-spin is armed absolutely in GNSS nanoseconds.
-//   • OCXO1 / OCXO2 pre-spin remain relative for now.
+//   • PPS pre-spin is a geared drumbeat from a sacred PPS baseline.
+//   • ZERO is consummated only on a PPS edge and restarts that drumbeat.
+//   • OCXO1 / OCXO2 pre-spin remain event-anchored / drift-aware for now.
 //
 // TimePop owns QTimer1. process_interrupt does not touch QTimer1.
 //
@@ -36,8 +39,6 @@
 //   1. process_interrupt_init_hardware() — GPT clock gates, pin mux, timer enable
 //   2. process_interrupt_init()          — runtime slots, descriptor wiring
 //   3. process_interrupt_enable_irqs()   — ISR vector installation + NVIC enable
-//      (must be called AFTER TimePop and transport are alive, so that ISRs
-//       firing immediately have a working infrastructure underneath them)
 //   4. interrupt_subscribe() / interrupt_start() — client wiring + activation
 //
 // ============================================================================
@@ -135,6 +136,24 @@ struct interrupt_subscriber_runtime_t {
 
   prespin_state_t prespin {};
 };
+
+// ============================================================================
+// PPS drumbeat state
+// ============================================================================
+
+struct pps_drumbeat_state_t {
+  bool     initialized = false;
+  bool     zero_pending = false;
+
+  uint64_t baseline_gnss_ns = 0;
+  uint64_t next_event_target_gnss_ns = 0;
+  uint64_t next_prespin_target_gnss_ns = 0;
+
+  uint64_t next_index = 0;
+  uint32_t generation = 0;
+};
+
+static pps_drumbeat_state_t g_pps_drumbeat = {};
 
 // ============================================================================
 // Provider diagnostics
@@ -322,11 +341,6 @@ uint32_t interrupt_gpt2_counter_now(void) {
 // ============================================================================
 // ISR vectors — owned by process_interrupt
 // ============================================================================
-//
-// ARM_DWT_CYCCNT is captured as the very first assignment statement.
-// No other work precedes it. This is the sacred first instruction.
-//
-// ============================================================================
 
 static void pps_gpio_isr(void) {
   const uint32_t dwt_raw = ARM_DWT_CYCCNT;
@@ -358,6 +372,10 @@ static void gpt2_isr(void) {
 static void schedule_next_prespin(interrupt_subscriber_runtime_t& rt,
                                   uint64_t event_target_gnss_ns);
 static void maybe_dispatch_event(interrupt_subscriber_runtime_t& rt);
+static void pps_drumbeat_schedule_from_target(interrupt_subscriber_runtime_t& rt,
+                                              uint64_t event_target_gnss_ns);
+static void pps_drumbeat_bootstrap(interrupt_subscriber_runtime_t& rt);
+static void pps_drumbeat_consume_edge(interrupt_subscriber_runtime_t& rt);
 
 // ============================================================================
 // Pre-spin scheduling + execution
@@ -378,6 +396,7 @@ static void prespin_timepop_callback(timepop_ctx_t*,
   }
 
   prespin_state_t& ps = rt->prespin;
+  ps.handle = TIMEPOP_INVALID_HANDLE;
   ps.active = true;
   ps.fired = false;
   ps.timed_out = false;
@@ -505,6 +524,61 @@ static void schedule_next_prespin(interrupt_subscriber_runtime_t& rt,
 }
 
 // ============================================================================
+// PPS drumbeat helpers
+// ============================================================================
+
+static void pps_drumbeat_schedule_from_target(interrupt_subscriber_runtime_t& rt,
+                                              uint64_t event_target_gnss_ns) {
+  g_pps_drumbeat.next_event_target_gnss_ns = event_target_gnss_ns;
+  g_pps_drumbeat.next_prespin_target_gnss_ns =
+      (event_target_gnss_ns >= PRESPIN_LEAD_NS)
+          ? (event_target_gnss_ns - PRESPIN_LEAD_NS)
+          : 0ULL;
+
+  schedule_next_prespin(rt, event_target_gnss_ns);
+}
+
+static void pps_drumbeat_bootstrap(interrupt_subscriber_runtime_t& rt) {
+  const uint64_t now_gnss_ns = current_gnss_now_for_schedule();
+  if (now_gnss_ns == 0) return;
+
+  const uint64_t next_pps_gnss_ns =
+      ((now_gnss_ns / NS_PER_SECOND_U64) + 1ULL) * NS_PER_SECOND_U64;
+
+  if (!g_pps_drumbeat.initialized) {
+    g_pps_drumbeat.baseline_gnss_ns = next_pps_gnss_ns;
+    g_pps_drumbeat.next_index = 1;
+    g_pps_drumbeat.generation = 1;
+    g_pps_drumbeat.initialized = true;
+  }
+
+  pps_drumbeat_schedule_from_target(rt, next_pps_gnss_ns);
+}
+
+static void pps_drumbeat_consume_edge(interrupt_subscriber_runtime_t& rt) {
+  if (!rt.has_fired) return;
+
+  const uint64_t pps_edge_gnss_ns = rt.last_event.gnss_ns_at_event;
+  if (pps_edge_gnss_ns == 0) return;
+
+  if (!g_pps_drumbeat.initialized || g_pps_drumbeat.zero_pending) {
+    g_pps_drumbeat.initialized = true;
+    g_pps_drumbeat.zero_pending = false;
+    g_pps_drumbeat.baseline_gnss_ns = pps_edge_gnss_ns;
+    g_pps_drumbeat.next_index = 1;
+    g_pps_drumbeat.generation++;
+  } else {
+    g_pps_drumbeat.next_index++;
+  }
+
+  const uint64_t next_event_target_gnss_ns =
+      g_pps_drumbeat.baseline_gnss_ns +
+      (g_pps_drumbeat.next_index * NS_PER_SECOND_U64);
+
+  pps_drumbeat_schedule_from_target(rt, next_event_target_gnss_ns);
+}
+
+// ============================================================================
 // Event reconstruction + dispatch
 // ============================================================================
 
@@ -552,9 +626,8 @@ static void deferred_dispatch_callback(timepop_ctx_t*, timepop_diag_t*, void* us
 
   maybe_dispatch_event(*rt);
 
-  if (rt->desc && rt->has_fired) {
-    schedule_next_prespin(*rt, rt->last_event.gnss_ns_at_event + rt->desc->period_ns);
-  }
+  // PPS drumbeat progression is not chained here.
+  // OCXO drift-aware scheduling remains outside the PPS drumbeat model.
 }
 
 static void handle_event_common(interrupt_subscriber_runtime_t& rt,
@@ -636,6 +709,10 @@ static void handle_event_common(interrupt_subscriber_runtime_t& rt,
   rt.irq_count++;
   rt.dispatch_count++;
   rt.event_count++;
+
+  if (rt.desc->kind == interrupt_subscriber_kind_t::PPS) {
+    pps_drumbeat_consume_edge(rt);
+  }
 
   timepop_arm(0, false, deferred_dispatch_callback, &rt, rt.desc->name);
 }
@@ -733,6 +810,7 @@ bool interrupt_subscribe(const interrupt_subscription_t& sub) {
 }
 
 bool interrupt_start(interrupt_subscriber_kind_t kind) {
+
   interrupt_subscriber_runtime_t* rt = runtime_for(kind);
   if (!rt || !rt->desc) return false;
 
@@ -740,14 +818,13 @@ bool interrupt_start(interrupt_subscriber_kind_t kind) {
   rt->start_count++;
 
   if (kind == interrupt_subscriber_kind_t::PPS) {
-    if (g_rt_pps && g_rt_pps->event_count == 0) {
       const uint64_t now_gnss_ns = current_gnss_now_for_schedule();
-      if (now_gnss_ns > 0) {
-        const uint64_t next_pps_gnss_ns =
-            ((now_gnss_ns / NS_PER_SECOND_U64) + 1ULL) * NS_PER_SECOND_U64;
-        schedule_next_prespin(*rt, next_pps_gnss_ns);
-      }
-    }
+
+  debug_log("pps.start", "requested");
+  debug_log("pps.start.now_lo", (uint32_t)(now_gnss_ns & 0xFFFFFFFFu));
+  debug_log("pps.start.now_hi", (uint32_t)(now_gnss_ns >> 32));
+
+    pps_drumbeat_bootstrap(*rt);
     return true;
   }
 
@@ -793,6 +870,18 @@ bool interrupt_stop(interrupt_subscriber_kind_t kind) {
   }
 
   return true;
+}
+
+// ============================================================================
+// PPS drumbeat control
+// ============================================================================
+
+void interrupt_request_pps_zero(void) {
+  g_pps_drumbeat.zero_pending = true;
+}
+
+bool interrupt_pps_zero_pending(void) {
+  return g_pps_drumbeat.zero_pending;
 }
 
 // ============================================================================
@@ -850,16 +939,12 @@ void process_interrupt_init(void) {
     }
   }
 
+  g_pps_drumbeat = {};
   g_interrupt_runtime_ready = true;
 }
 
 // ============================================================================
 // Initialization — Phase 3: ISR vector installation + NVIC enable
-// ============================================================================
-//
-// This is the moment hardware interrupts become live. Everything upstream
-// (GPT counters, runtime slots, TimePop scheduler) must already be alive.
-//
 // ============================================================================
 
 void process_interrupt_enable_irqs(void) {
@@ -909,6 +994,14 @@ static Payload cmd_report(const Payload&) {
   p.add("gpt2_irq_count", g_gpt2_diag.irq_count);
   p.add("gpt2_dispatch_count", g_gpt2_diag.dispatch_count);
   p.add("gpt2_miss_count", g_gpt2_diag.miss_count);
+
+  p.add("pps_drumbeat_initialized", g_pps_drumbeat.initialized);
+  p.add("pps_zero_pending", g_pps_drumbeat.zero_pending);
+  p.add("pps_baseline_gnss_ns", g_pps_drumbeat.baseline_gnss_ns);
+  p.add("pps_next_event_target_gnss_ns", g_pps_drumbeat.next_event_target_gnss_ns);
+  p.add("pps_next_prespin_target_gnss_ns", g_pps_drumbeat.next_prespin_target_gnss_ns);
+  p.add("pps_next_index", g_pps_drumbeat.next_index);
+  p.add("pps_generation", g_pps_drumbeat.generation);
 
   p.add("anomaly_prespin_null_runtime", g_anomaly_diag.prespin_null_runtime);
   p.add("anomaly_prespin_arm_failed", g_anomaly_diag.prespin_arm_failed);
