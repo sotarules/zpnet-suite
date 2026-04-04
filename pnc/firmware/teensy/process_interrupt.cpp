@@ -491,10 +491,9 @@ static void deferred_dispatch_callback(timepop_ctx_t*, timepop_diag_t*, void* us
   maybe_dispatch_event(*rt);
 
   // Rearm next prespin from scheduled context.
-  // MULE
-  //if (rt->desc && rt->has_fired) {
-  //  schedule_next_prespin(*rt, rt->last_event.gnss_ns_at_event + rt->desc->period_ns);
-  //}
+  if (rt->desc && rt->has_fired) {
+    schedule_next_prespin(*rt, rt->last_event.gnss_ns_at_event + rt->desc->period_ns);
+  }
 }
 
 static void handle_event_common(interrupt_subscriber_runtime_t& rt,
@@ -539,8 +538,14 @@ static void handle_event_common(interrupt_subscriber_runtime_t& rt,
 
   const uint32_t correction = rt.desc->isr_overhead_cycles;
   const uint32_t dwt_at_event = dwt_isr_entry_raw - correction;
-  const int64_t gnss_ns_signed = time_dwt_to_gnss_ns(dwt_at_event);
 
+  int64_t gnss_ns_signed;
+
+  if (rt.desc->kind == interrupt_subscriber_kind_t::PPS) {
+    gnss_ns_signed = (int64_t)(rt.event_count + 1) * 1000000000LL - 1;
+  } else {
+    gnss_ns_signed = time_dwt_to_gnss_ns(dwt_at_event);
+  }
 
   interrupt_event_t event {};
   event.kind = rt.desc->kind;
@@ -674,8 +679,7 @@ bool interrupt_start(interrupt_subscriber_kind_t kind) {
   rt->start_count++;
 
   if (kind == interrupt_subscriber_kind_t::PPS) {
-    //schedule_next_prespin(*rt, current_gnss_now_for_schedule() + NS_PER_SECOND_U64);
-    // MULE
+    schedule_next_prespin(*rt, current_gnss_now_for_schedule() + NS_PER_SECOND_U64);
     return true;
   }
 

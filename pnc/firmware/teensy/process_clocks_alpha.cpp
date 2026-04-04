@@ -289,10 +289,11 @@ static void pps_callback(
     g_ocxo2_clock.ns_count_at_pps = 0;
   }
 
-  //time_pps_update(
-  //    g_dwt_cycle_count_at_pps,
-  //    dwt_effective_cycles_per_second(),
-  //    (uint32_t)(g_gnss_ns_count_at_pps / 100ULL));
+  // MULE: HISTORICAL HOTSPOT BELOW (TIMEPOP):
+  time_pps_update(
+    g_dwt_cycle_count_at_pps,
+    dwt_effective_cycles_per_second(),
+    (uint32_t)(g_gnss_ns_count_at_pps / 100ULL));
 
   if (campaign_state == clocks_campaign_state_t::STARTED || request_start || request_stop || request_recover || request_zero) {
     clocks_beta_pps();
@@ -394,7 +395,6 @@ void process_clocks_init(void) {
   interrupt_subscribe(pps_sub);
   interrupt_start(interrupt_subscriber_kind_t::PPS);
 
-  /* MULE COMMENT
   interrupt_subscription_t ocxo1_sub {};
   ocxo1_sub.kind = interrupt_subscriber_kind_t::OCXO1;
   ocxo1_sub.on_event = ocxo1_callback;
@@ -408,8 +408,6 @@ void process_clocks_init(void) {
   ocxo2_sub.user_data = nullptr;
   interrupt_subscribe(ocxo2_sub);
   interrupt_start(interrupt_subscriber_kind_t::OCXO2);
-  */
 
-  // MULE
-  //timepop_arm(DWT_ADJUST_TIMER_NS, true, dwt_adjustment_timer_callback, nullptr, "dwt-adjust");
+  timepop_arm(DWT_ADJUST_TIMER_NS, true, dwt_adjustment_timer_callback, nullptr, "dwt-adjust");
 }

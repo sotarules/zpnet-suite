@@ -274,12 +274,11 @@ void setup() {
   // process_interrupt owns GPT1/GPT2 provider hardware.
   process_interrupt_init_hardware();
 
+  timepop_init();
+
   // clocks owns DWT-local initialization + rolling baselines.
   // GPT1/GPT2 must already be running (seeded by process_interrupt above).
   process_clocks_init_hardware();
-
-  // TimePop owns QTimer1 and must come after early timing substrate is alive.
-  timepop_init();
 
   // ----------------------------------------------------------
   // Phase 2: Transport boundary comes alive
