@@ -26,7 +26,8 @@
 //   • ZERO is consummated only on a PPS edge and restarts that drumbeat.
 //   • Before the first lawful PPS edge, there is no sacred drumbeat baseline yet.
 //   • PPS critical scheduling must not interrogate ambient "now" time.
-//   • OCXO1 / OCXO2 pre-spin remain event-anchored / drift-aware for now.
+//   • OCXO1 / OCXO2 pre-spin are event-anchored and rescheduled from the just-
+//     consummated OCXO edge, analogous to PPS drumbeat rescheduling.
 //
 // TimePop owns QTimer1. process_interrupt does not touch QTimer1.
 //
@@ -91,13 +92,9 @@ struct interrupt_subscriber_descriptor_t {
 };
 
 struct prespin_state_t {
+  // active means only one thing:
+  // the pre-spin loop is currently in progress for this clock.
   volatile bool active = false;
-  volatile bool fired = false;
-  volatile bool timed_out = false;
-
-  volatile uint32_t prespin_start_dwt = 0;
-  volatile uint32_t shadow_dwt = 0;
-  volatile uint32_t dwt_isr_entry_raw = 0;
 
   uint64_t event_target_gnss_ns = 0;
   uint64_t prespin_target_gnss_ns = 0;
@@ -138,6 +135,31 @@ struct interrupt_subscriber_runtime_t {
 
   prespin_state_t prespin {};
 };
+
+// ============================================================================
+// Dedicated flat per-clock prespin capture lanes
+// ============================================================================
+
+// PPS lane
+static volatile uint32_t g_pps_prespin_start_dwt = 0;
+static volatile uint32_t g_pps_shadow_dwt        = 0;
+static volatile uint32_t g_pps_dwt_isr_entry_raw = 0;
+static volatile bool     g_pps_prespin_fired     = false;
+static volatile bool     g_pps_prespin_timed_out = false;
+
+// OCXO1 lane
+static volatile uint32_t g_ocxo1_prespin_start_dwt = 0;
+static volatile uint32_t g_ocxo1_shadow_dwt        = 0;
+static volatile uint32_t g_ocxo1_dwt_isr_entry_raw = 0;
+static volatile bool     g_ocxo1_prespin_fired     = false;
+static volatile bool     g_ocxo1_prespin_timed_out = false;
+
+// OCXO2 lane
+static volatile uint32_t g_ocxo2_prespin_start_dwt = 0;
+static volatile uint32_t g_ocxo2_shadow_dwt        = 0;
+static volatile uint32_t g_ocxo2_dwt_isr_entry_raw = 0;
+static volatile bool     g_ocxo2_prespin_fired     = false;
+static volatile bool     g_ocxo2_prespin_timed_out = false;
 
 // ============================================================================
 // PPS drumbeat state
@@ -245,6 +267,72 @@ static interrupt_subscriber_runtime_t* runtime_for(interrupt_subscriber_kind_t k
     }
   }
   return nullptr;
+}
+
+// ============================================================================
+// Flat capture helpers
+// ============================================================================
+
+struct frozen_capture_t {
+  uint32_t prespin_start_dwt = 0;
+  uint32_t shadow_dwt = 0;
+  uint32_t dwt_isr_entry_raw = 0;
+  bool fired = false;
+  bool timed_out = false;
+};
+
+static inline void clear_pps_capture_lane() {
+  g_pps_prespin_start_dwt = 0;
+  g_pps_shadow_dwt = 0;
+  g_pps_dwt_isr_entry_raw = 0;
+  g_pps_prespin_fired = false;
+  g_pps_prespin_timed_out = false;
+}
+
+static inline void clear_ocxo1_capture_lane() {
+  g_ocxo1_prespin_start_dwt = 0;
+  g_ocxo1_shadow_dwt = 0;
+  g_ocxo1_dwt_isr_entry_raw = 0;
+  g_ocxo1_prespin_fired = false;
+  g_ocxo1_prespin_timed_out = false;
+}
+
+static inline void clear_ocxo2_capture_lane() {
+  g_ocxo2_prespin_start_dwt = 0;
+  g_ocxo2_shadow_dwt = 0;
+  g_ocxo2_dwt_isr_entry_raw = 0;
+  g_ocxo2_prespin_fired = false;
+  g_ocxo2_prespin_timed_out = false;
+}
+
+static inline frozen_capture_t freeze_pps_capture_lane() {
+  frozen_capture_t cap;
+  cap.prespin_start_dwt = g_pps_prespin_start_dwt;
+  cap.shadow_dwt = g_pps_shadow_dwt;
+  cap.dwt_isr_entry_raw = g_pps_dwt_isr_entry_raw;
+  cap.fired = g_pps_prespin_fired;
+  cap.timed_out = g_pps_prespin_timed_out;
+  return cap;
+}
+
+static inline frozen_capture_t freeze_ocxo1_capture_lane() {
+  frozen_capture_t cap;
+  cap.prespin_start_dwt = g_ocxo1_prespin_start_dwt;
+  cap.shadow_dwt = g_ocxo1_shadow_dwt;
+  cap.dwt_isr_entry_raw = g_ocxo1_dwt_isr_entry_raw;
+  cap.fired = g_ocxo1_prespin_fired;
+  cap.timed_out = g_ocxo1_prespin_timed_out;
+  return cap;
+}
+
+static inline frozen_capture_t freeze_ocxo2_capture_lane() {
+  frozen_capture_t cap;
+  cap.prespin_start_dwt = g_ocxo2_prespin_start_dwt;
+  cap.shadow_dwt = g_ocxo2_shadow_dwt;
+  cap.dwt_isr_entry_raw = g_ocxo2_dwt_isr_entry_raw;
+  cap.fired = g_ocxo2_prespin_fired;
+  cap.timed_out = g_ocxo2_prespin_timed_out;
+  return cap;
 }
 
 // ============================================================================
@@ -369,19 +457,19 @@ static void gpt2_isr(void) {
 
 static const char* prespin_timer_name(interrupt_subscriber_kind_t kind) {
   switch (kind) {
-  case interrupt_subscriber_kind_t::PPS:   return "PPS_PRESPIN";
-  case interrupt_subscriber_kind_t::OCXO1: return "OCXO1_PRESPIN";
-  case interrupt_subscriber_kind_t::OCXO2: return "OCXO2_PRESPIN";
-  default:                                 return "";
+    case interrupt_subscriber_kind_t::PPS:   return "PPS_PRESPIN";
+    case interrupt_subscriber_kind_t::OCXO1: return "OCXO1_PRESPIN";
+    case interrupt_subscriber_kind_t::OCXO2: return "OCXO2_PRESPIN";
+    default:                                 return "";
   }
 }
 
 static const char* dispatch_timer_name(interrupt_subscriber_kind_t kind) {
   switch (kind) {
-  case interrupt_subscriber_kind_t::PPS:   return "PPS_DISPATCH";
-  case interrupt_subscriber_kind_t::OCXO1: return "OCXO1_DISPATCH";
-  case interrupt_subscriber_kind_t::OCXO2: return "OCXO2_DISPATCH";
-  default:                                 return "";
+    case interrupt_subscriber_kind_t::PPS:   return "PPS_DISPATCH";
+    case interrupt_subscriber_kind_t::OCXO1: return "OCXO1_DISPATCH";
+    case interrupt_subscriber_kind_t::OCXO2: return "OCXO2_DISPATCH";
+    default:                                 return "";
   }
 }
 
@@ -389,26 +477,25 @@ static const char* dispatch_timer_name(interrupt_subscriber_kind_t kind) {
 // Forward declarations
 // ============================================================================
 
-static void schedule_next_prespin(interrupt_subscriber_runtime_t& rt,
-                                  uint64_t event_target_gnss_ns);
-static void schedule_next_prespin_from_anchor(interrupt_subscriber_runtime_t& rt,
-                                              uint64_t anchor_gnss_ns,
-                                              uint64_t offset_gnss_ns);
 static void maybe_dispatch_event(interrupt_subscriber_runtime_t& rt);
-static void pps_drumbeat_schedule_from_target(interrupt_subscriber_runtime_t& rt,
-                                              uint64_t event_target_gnss_ns);
+
 static void pps_drumbeat_schedule_from_edge(interrupt_subscriber_runtime_t& rt,
                                             uint64_t pps_edge_gnss_ns);
+static void ocxo1_schedule_from_edge(interrupt_subscriber_runtime_t& rt,
+                                     uint64_t edge_gnss_ns);
+static void ocxo2_schedule_from_edge(interrupt_subscriber_runtime_t& rt,
+                                     uint64_t edge_gnss_ns);
+
 static void pps_drumbeat_bootstrap(interrupt_subscriber_runtime_t& rt);
 static void pps_drumbeat_consume_edge(interrupt_subscriber_runtime_t& rt);
 
 // ============================================================================
-// Pre-spin scheduling + execution
+// Per-clock prespin callbacks — flat redundant hot paths
 // ============================================================================
 
-static void prespin_timepop_callback(timepop_ctx_t*,
-                                     timepop_diag_t*,
-                                     void* user_data) {
+static void pps_prespin_timepop_callback(timepop_ctx_t*,
+                                         timepop_diag_t*,
+                                         void* user_data) {
   auto* rt = static_cast<interrupt_subscriber_runtime_t*>(user_data);
   if (!rt || !rt->desc) {
     record_anomaly(g_anomaly_diag.prespin_null_runtime,
@@ -423,34 +510,31 @@ static void prespin_timepop_callback(timepop_ctx_t*,
   prespin_state_t& ps = rt->prespin;
   ps.handle = TIMEPOP_INVALID_HANDLE;
   ps.active = true;
-  ps.fired = false;
-  ps.timed_out = false;
-  ps.prespin_start_dwt = 0;
-  ps.shadow_dwt = 0;
-  ps.dwt_isr_entry_raw = 0;
+
+  clear_pps_capture_lane();
   ps.arm_count++;
 
   const uint32_t prespin_start_dwt = ARM_DWT_CYCCNT;
-  ps.prespin_start_dwt = prespin_start_dwt;
+  g_pps_prespin_start_dwt = prespin_start_dwt;
 
   for (;;) {
-    ps.shadow_dwt = ARM_DWT_CYCCNT;
+    g_pps_shadow_dwt = ARM_DWT_CYCCNT;
 
-    if (ps.fired) {
+    if (g_pps_prespin_fired) {
       ps.complete_count++;
       ps.active = false;
       return;
     }
 
     if ((ARM_DWT_CYCCNT - prespin_start_dwt) > PRESPIN_TIMEOUT_CYCLES) {
-      ps.timed_out = true;
+      g_pps_prespin_timed_out = true;
       ps.timeout_count++;
       ps.active = false;
       ps.anomaly_count++;
 
       record_anomaly(g_anomaly_diag.prespin_timeout,
-                     rt->desc->kind,
-                     ps.shadow_dwt,
+                     interrupt_subscriber_kind_t::PPS,
+                     g_pps_shadow_dwt,
                      ps.arm_count,
                      ps.timeout_count);
       return;
@@ -458,13 +542,115 @@ static void prespin_timepop_callback(timepop_ctx_t*,
   }
 }
 
+static void ocxo1_prespin_timepop_callback(timepop_ctx_t*,
+                                           timepop_diag_t*,
+                                           void* user_data) {
+  auto* rt = static_cast<interrupt_subscriber_runtime_t*>(user_data);
+  if (!rt || !rt->desc) {
+    record_anomaly(g_anomaly_diag.prespin_null_runtime,
+                   interrupt_subscriber_kind_t::NONE);
+    return;
+  }
+
+  if (!rt->active) {
+    return;
+  }
+
+  prespin_state_t& ps = rt->prespin;
+  ps.handle = TIMEPOP_INVALID_HANDLE;
+  ps.active = true;
+
+  clear_ocxo1_capture_lane();
+  ps.arm_count++;
+
+  const uint32_t prespin_start_dwt = ARM_DWT_CYCCNT;
+  g_ocxo1_prespin_start_dwt = prespin_start_dwt;
+
+  for (;;) {
+    g_ocxo1_shadow_dwt = ARM_DWT_CYCCNT;
+
+    if (g_ocxo1_prespin_fired) {
+      ps.complete_count++;
+      ps.active = false;
+      return;
+    }
+
+    if ((ARM_DWT_CYCCNT - prespin_start_dwt) > PRESPIN_TIMEOUT_CYCLES) {
+      g_ocxo1_prespin_timed_out = true;
+      ps.timeout_count++;
+      ps.active = false;
+      ps.anomaly_count++;
+
+      record_anomaly(g_anomaly_diag.prespin_timeout,
+                     interrupt_subscriber_kind_t::OCXO1,
+                     g_ocxo1_shadow_dwt,
+                     ps.arm_count,
+                     ps.timeout_count);
+      return;
+    }
+  }
+}
+
+static void ocxo2_prespin_timepop_callback(timepop_ctx_t*,
+                                           timepop_diag_t*,
+                                           void* user_data) {
+  auto* rt = static_cast<interrupt_subscriber_runtime_t*>(user_data);
+  if (!rt || !rt->desc) {
+    record_anomaly(g_anomaly_diag.prespin_null_runtime,
+                   interrupt_subscriber_kind_t::NONE);
+    return;
+  }
+
+  if (!rt->active) {
+    return;
+  }
+
+  prespin_state_t& ps = rt->prespin;
+  ps.handle = TIMEPOP_INVALID_HANDLE;
+  ps.active = true;
+
+  clear_ocxo2_capture_lane();
+  ps.arm_count++;
+
+  const uint32_t prespin_start_dwt = ARM_DWT_CYCCNT;
+  g_ocxo2_prespin_start_dwt = prespin_start_dwt;
+
+  for (;;) {
+    g_ocxo2_shadow_dwt = ARM_DWT_CYCCNT;
+
+    if (g_ocxo2_prespin_fired) {
+      ps.complete_count++;
+      ps.active = false;
+      return;
+    }
+
+    if ((ARM_DWT_CYCCNT - prespin_start_dwt) > PRESPIN_TIMEOUT_CYCLES) {
+      g_ocxo2_prespin_timed_out = true;
+      ps.timeout_count++;
+      ps.active = false;
+      ps.anomaly_count++;
+
+      record_anomaly(g_anomaly_diag.prespin_timeout,
+                     interrupt_subscriber_kind_t::OCXO2,
+                     g_ocxo2_shadow_dwt,
+                     ps.arm_count,
+                     ps.timeout_count);
+      return;
+    }
+  }
+}
+
+// ============================================================================
+// Scheduling helpers — per-clock callback binding
+// ============================================================================
+
 static uint64_t current_gnss_now_for_schedule(void) {
   const int64_t gnss_ns_signed = time_gnss_ns_now();
   return (gnss_ns_signed >= 0) ? (uint64_t)gnss_ns_signed : 0ULL;
 }
 
-static void schedule_next_prespin(interrupt_subscriber_runtime_t& rt,
-                                  uint64_t event_target_gnss_ns) {
+static void pps_schedule_next_prespin(interrupt_subscriber_runtime_t& rt,
+                                      uint64_t event_target_gnss_ns) {
   if (!rt.desc || !rt.desc->uses_prespin) return;
   if (!rt.active) return;
 
@@ -474,76 +660,30 @@ static void schedule_next_prespin(interrupt_subscriber_runtime_t& rt,
   ps.prespin_target_gnss_ns =
       (event_target_gnss_ns >= PRESPIN_LEAD_NS)
           ? (event_target_gnss_ns - PRESPIN_LEAD_NS)
-          : 0;
+          : 0ULL;
 
   ps.last_schedule_event_target_gnss_ns = ps.event_target_gnss_ns;
   ps.last_schedule_prespin_target_gnss_ns = ps.prespin_target_gnss_ns;
-
-  if (rt.desc->prespin_absolute_gnss) {
-    // PPS absolute scheduling should normally use the anchor-relative helper
-    // below, not this ambient-now path. Keep this for generic absolute users.
-    const uint64_t now_gnss_ns = current_gnss_now_for_schedule();
-    ps.last_schedule_now_gnss_ns = now_gnss_ns;
-    ps.last_schedule_delay_ns =
-        (ps.prespin_target_gnss_ns > now_gnss_ns)
-            ? (ps.prespin_target_gnss_ns - now_gnss_ns)
-            : 0;
-    ps.last_prespin_margin_ns =
-        (int64_t)ps.prespin_target_gnss_ns - (int64_t)now_gnss_ns;
-
-    timepop_handle_t h =
-        timepop_arm_at((int64_t)ps.prespin_target_gnss_ns,
-                       false,
-                       prespin_timepop_callback,
-                       &rt,
-                       prespin_timer_name(rt.desc->kind));
-
-    if (h == TIMEPOP_INVALID_HANDLE) {
-      ps.anomaly_count++;
-      record_anomaly(g_anomaly_diag.prespin_arm_failed,
-                     rt.desc->kind,
-                     (uint32_t)(ps.prespin_target_gnss_ns & 0xFFFFFFFFu),
-                     (uint32_t)(ps.prespin_target_gnss_ns >> 32),
-                     ps.arm_count);
-      return;
-    }
-
-    ps.handle = h;
-    return;
-  }
-
-  const uint64_t now_gnss_ns = current_gnss_now_for_schedule();
-  ps.last_schedule_now_gnss_ns = now_gnss_ns;
-
-  if (now_gnss_ns == 0 || ps.prespin_target_gnss_ns <= now_gnss_ns) {
-    ps.last_schedule_delay_ns = 0;
-    ps.last_prespin_margin_ns =
-        (int64_t)ps.prespin_target_gnss_ns - (int64_t)now_gnss_ns;
-
-    ps.anomaly_count++;
-    record_anomaly(g_anomaly_diag.prespin_arm_failed,
-                   rt.desc->kind,
-                   (uint32_t)(ps.prespin_target_gnss_ns & 0xFFFFFFFFu),
-                   (uint32_t)(ps.prespin_target_gnss_ns >> 32),
-                   (uint32_t)(now_gnss_ns & 0xFFFFFFFFu));
-    return;
-  }
-
-  uint64_t delay_ns = ps.prespin_target_gnss_ns - now_gnss_ns;
-  ps.last_schedule_delay_ns = delay_ns;
+  ps.last_schedule_now_gnss_ns = current_gnss_now_for_schedule();
+  ps.last_schedule_delay_ns = ps.last_schedule_now_gnss_ns > 0
+      ? (ps.prespin_target_gnss_ns - ps.last_schedule_now_gnss_ns)
+      : 0;
   ps.last_prespin_margin_ns =
-      (int64_t)ps.prespin_target_gnss_ns - (int64_t)now_gnss_ns;
+      (int64_t)ps.prespin_target_gnss_ns - (int64_t)ps.last_schedule_now_gnss_ns;
 
   timepop_handle_t h =
-      timepop_arm(delay_ns, false, prespin_timepop_callback, &rt,
-                  prespin_timer_name(rt.desc->kind));
+      timepop_arm_at((int64_t)ps.prespin_target_gnss_ns,
+                     false,
+                     pps_prespin_timepop_callback,
+                     &rt,
+                     "PPS_PRESPIN");
 
   if (h == TIMEPOP_INVALID_HANDLE) {
     ps.anomaly_count++;
     record_anomaly(g_anomaly_diag.prespin_arm_failed,
-                   rt.desc->kind,
-                   (uint32_t)(event_target_gnss_ns & 0xFFFFFFFFu),
-                   (uint32_t)(event_target_gnss_ns >> 32),
+                   interrupt_subscriber_kind_t::PPS,
+                   (uint32_t)(ps.prespin_target_gnss_ns & 0xFFFFFFFFu),
+                   (uint32_t)(ps.prespin_target_gnss_ns >> 32),
                    ps.arm_count);
     return;
   }
@@ -551,9 +691,9 @@ static void schedule_next_prespin(interrupt_subscriber_runtime_t& rt,
   ps.handle = h;
 }
 
-static void schedule_next_prespin_from_anchor(interrupt_subscriber_runtime_t& rt,
-                                              uint64_t anchor_gnss_ns,
-                                              uint64_t offset_gnss_ns) {
+static void pps_schedule_next_prespin_from_anchor(interrupt_subscriber_runtime_t& rt,
+                                                  uint64_t anchor_gnss_ns,
+                                                  uint64_t offset_gnss_ns) {
   if (!rt.desc || !rt.desc->uses_prespin) return;
   if (!rt.active) return;
 
@@ -575,14 +715,96 @@ static void schedule_next_prespin_from_anchor(interrupt_subscriber_runtime_t& rt
       timepop_arm_from_anchor((int64_t)anchor_gnss_ns,
                               (int64_t)(offset_gnss_ns - PRESPIN_LEAD_NS),
                               false,
-                              prespin_timepop_callback,
+                              pps_prespin_timepop_callback,
                               &rt,
-                              prespin_timer_name(rt.desc->kind));
+                              "PPS_PRESPIN");
 
   if (h == TIMEPOP_INVALID_HANDLE) {
     ps.anomaly_count++;
     record_anomaly(g_anomaly_diag.prespin_arm_failed,
-                   rt.desc->kind,
+                   interrupt_subscriber_kind_t::PPS,
+                   (uint32_t)(ps.prespin_target_gnss_ns & 0xFFFFFFFFu),
+                   (uint32_t)(ps.prespin_target_gnss_ns >> 32),
+                   ps.arm_count);
+    return;
+  }
+
+  ps.handle = h;
+}
+
+static void ocxo1_schedule_next_prespin_from_anchor(interrupt_subscriber_runtime_t& rt,
+                                                    uint64_t anchor_gnss_ns,
+                                                    uint64_t offset_gnss_ns) {
+  if (!rt.desc || !rt.desc->uses_prespin) return;
+  if (!rt.active) return;
+
+  prespin_state_t& ps = rt.prespin;
+
+  ps.event_target_gnss_ns = anchor_gnss_ns + offset_gnss_ns;
+  ps.prespin_target_gnss_ns =
+      (ps.event_target_gnss_ns >= PRESPIN_LEAD_NS)
+          ? (ps.event_target_gnss_ns - PRESPIN_LEAD_NS)
+          : 0ULL;
+
+  ps.last_schedule_event_target_gnss_ns = ps.event_target_gnss_ns;
+  ps.last_schedule_prespin_target_gnss_ns = ps.prespin_target_gnss_ns;
+  ps.last_schedule_now_gnss_ns = anchor_gnss_ns;
+  ps.last_schedule_delay_ns = offset_gnss_ns - PRESPIN_LEAD_NS;
+  ps.last_prespin_margin_ns = (int64_t)(offset_gnss_ns - PRESPIN_LEAD_NS);
+
+  timepop_handle_t h =
+      timepop_arm_from_anchor((int64_t)anchor_gnss_ns,
+                              (int64_t)(offset_gnss_ns - PRESPIN_LEAD_NS),
+                              false,
+                              ocxo1_prespin_timepop_callback,
+                              &rt,
+                              "OCXO1_PRESPIN");
+
+  if (h == TIMEPOP_INVALID_HANDLE) {
+    ps.anomaly_count++;
+    record_anomaly(g_anomaly_diag.prespin_arm_failed,
+                   interrupt_subscriber_kind_t::OCXO1,
+                   (uint32_t)(ps.prespin_target_gnss_ns & 0xFFFFFFFFu),
+                   (uint32_t)(ps.prespin_target_gnss_ns >> 32),
+                   ps.arm_count);
+    return;
+  }
+
+  ps.handle = h;
+}
+
+static void ocxo2_schedule_next_prespin_from_anchor(interrupt_subscriber_runtime_t& rt,
+                                                    uint64_t anchor_gnss_ns,
+                                                    uint64_t offset_gnss_ns) {
+  if (!rt.desc || !rt.desc->uses_prespin) return;
+  if (!rt.active) return;
+
+  prespin_state_t& ps = rt.prespin;
+
+  ps.event_target_gnss_ns = anchor_gnss_ns + offset_gnss_ns;
+  ps.prespin_target_gnss_ns =
+      (ps.event_target_gnss_ns >= PRESPIN_LEAD_NS)
+          ? (ps.event_target_gnss_ns - PRESPIN_LEAD_NS)
+          : 0ULL;
+
+  ps.last_schedule_event_target_gnss_ns = ps.event_target_gnss_ns;
+  ps.last_schedule_prespin_target_gnss_ns = ps.prespin_target_gnss_ns;
+  ps.last_schedule_now_gnss_ns = anchor_gnss_ns;
+  ps.last_schedule_delay_ns = offset_gnss_ns - PRESPIN_LEAD_NS;
+  ps.last_prespin_margin_ns = (int64_t)(offset_gnss_ns - PRESPIN_LEAD_NS);
+
+  timepop_handle_t h =
+      timepop_arm_from_anchor((int64_t)anchor_gnss_ns,
+                              (int64_t)(offset_gnss_ns - PRESPIN_LEAD_NS),
+                              false,
+                              ocxo2_prespin_timepop_callback,
+                              &rt,
+                              "OCXO2_PRESPIN");
+
+  if (h == TIMEPOP_INVALID_HANDLE) {
+    ps.anomaly_count++;
+    record_anomaly(g_anomaly_diag.prespin_arm_failed,
+                   interrupt_subscriber_kind_t::OCXO2,
                    (uint32_t)(ps.prespin_target_gnss_ns & 0xFFFFFFFFu),
                    (uint32_t)(ps.prespin_target_gnss_ns >> 32),
                    ps.arm_count);
@@ -593,19 +815,8 @@ static void schedule_next_prespin_from_anchor(interrupt_subscriber_runtime_t& rt
 }
 
 // ============================================================================
-// PPS drumbeat helpers
+// PPS / OCXO scheduling progression
 // ============================================================================
-
-static void pps_drumbeat_schedule_from_target(interrupt_subscriber_runtime_t& rt,
-                                              uint64_t event_target_gnss_ns) {
-  g_pps_drumbeat.next_event_target_gnss_ns = event_target_gnss_ns;
-  g_pps_drumbeat.next_prespin_target_gnss_ns =
-      (event_target_gnss_ns >= PRESPIN_LEAD_NS)
-          ? (event_target_gnss_ns - PRESPIN_LEAD_NS)
-          : 0ULL;
-
-  schedule_next_prespin(rt, event_target_gnss_ns);
-}
 
 static void pps_drumbeat_schedule_from_edge(interrupt_subscriber_runtime_t& rt,
                                             uint64_t pps_edge_gnss_ns) {
@@ -617,17 +828,24 @@ static void pps_drumbeat_schedule_from_edge(interrupt_subscriber_runtime_t& rt,
           ? (next_event_target_gnss_ns - PRESPIN_LEAD_NS)
           : 0ULL;
 
-  // Sacred PPS path: next prespin is derived from the just-consummated PPS edge,
-  // not from interrogating ambient current time.
-  schedule_next_prespin_from_anchor(rt, pps_edge_gnss_ns, NS_PER_SECOND_U64);
+  pps_schedule_next_prespin_from_anchor(rt, pps_edge_gnss_ns, NS_PER_SECOND_U64);
+}
+
+static void ocxo1_schedule_from_edge(interrupt_subscriber_runtime_t& rt,
+                                     uint64_t edge_gnss_ns) {
+  if (edge_gnss_ns == 0) return;
+  ocxo1_schedule_next_prespin_from_anchor(rt, edge_gnss_ns, NS_PER_SECOND_U64);
+}
+
+static void ocxo2_schedule_from_edge(interrupt_subscriber_runtime_t& rt,
+                                     uint64_t edge_gnss_ns) {
+  if (edge_gnss_ns == 0) return;
+  ocxo2_schedule_next_prespin_from_anchor(rt, edge_gnss_ns, NS_PER_SECOND_U64);
 }
 
 static void pps_drumbeat_bootstrap(interrupt_subscriber_runtime_t& rt) {
   (void)rt;
 
-  // Bootstrap does not invent a sacred baseline and does not schedule
-  // a synthetic first tooth. The PPS drumbeat begins only from an actual,
-  // consummated PPS edge. ZERO may already be pending before that first edge.
   g_pps_drumbeat.next_event_target_gnss_ns = 0;
   g_pps_drumbeat.next_prespin_target_gnss_ns = 0;
 
@@ -659,15 +877,16 @@ static void pps_drumbeat_consume_edge(interrupt_subscriber_runtime_t& rt) {
 }
 
 // ============================================================================
-// Event reconstruction + dispatch
+// Event reconstruction helpers — flat redundant per-clock
 // ============================================================================
 
-static void fill_diag(interrupt_subscriber_runtime_t& rt,
-                      interrupt_capture_diag_t& diag,
-                      const interrupt_event_t& event,
-                      uint32_t dwt_isr_entry_raw,
-                      uint32_t approach_cycles,
-                      uint32_t shadow_to_isr_cycles) {
+static void fill_diag_common(interrupt_subscriber_runtime_t& rt,
+                             interrupt_capture_diag_t& diag,
+                             const interrupt_event_t& event,
+                             uint32_t dwt_isr_entry_raw,
+                             uint32_t approach_cycles,
+                             uint32_t shadow_to_isr_cycles,
+                             const frozen_capture_t& cap) {
   diag.provider = rt.desc->provider;
   diag.lane = rt.desc->lane;
   diag.kind = rt.desc->kind;
@@ -676,10 +895,10 @@ static void fill_diag(interrupt_subscriber_runtime_t& rt,
   diag.event_target_gnss_ns = rt.prespin.event_target_gnss_ns;
 
   diag.prespin_active = rt.prespin.active;
-  diag.prespin_fired = rt.prespin.fired;
-  diag.prespin_timed_out = rt.prespin.timed_out;
+  diag.prespin_fired = cap.fired;
+  diag.prespin_timed_out = cap.timed_out;
 
-  diag.shadow_dwt = rt.prespin.shadow_dwt;
+  diag.shadow_dwt = cap.shadow_dwt;
   diag.dwt_isr_entry_raw = dwt_isr_entry_raw;
   diag.approach_cycles = approach_cycles;
   diag.shadow_to_isr_cycles = shadow_to_isr_cycles;
@@ -705,70 +924,125 @@ static void deferred_dispatch_callback(timepop_ctx_t*, timepop_diag_t*, void* us
   if (!rt) return;
 
   maybe_dispatch_event(*rt);
-
-  // PPS drumbeat progression is not chained here.
-  // OCXO drift-aware scheduling remains outside the PPS drumbeat model.
 }
 
-static void handle_event_common(interrupt_subscriber_runtime_t& rt,
-                                uint32_t dwt_isr_entry_raw,
-                                uint32_t counter32_at_event) {
-  if (!rt.desc) {
-    record_anomaly(g_anomaly_diag.null_desc,
-                   interrupt_subscriber_kind_t::NONE);
-    return;
-  }
-
+static void handle_pps_event(interrupt_subscriber_runtime_t& rt,
+                             uint32_t dwt_isr_entry_raw,
+                             uint32_t counter32_at_event) {
   prespin_state_t& ps = rt.prespin;
+
+  g_pps_prespin_fired = true;
+  g_pps_dwt_isr_entry_raw = dwt_isr_entry_raw;
+
+  frozen_capture_t cap = freeze_pps_capture_lane();
+  cap.fired = true;
+  cap.dwt_isr_entry_raw = dwt_isr_entry_raw;
 
   uint32_t approach_cycles = 0;
   uint32_t shadow_to_isr_cycles = 0;
 
-  if (rt.desc->uses_prespin) {
-    if (!ps.active) {
-      ps.anomaly_count++;
-      record_anomaly(g_anomaly_diag.no_prespin_active,
-                     rt.desc->kind,
-                     dwt_isr_entry_raw,
-                     ps.shadow_dwt,
-                     ps.arm_count);
-    } else {
-      ps.fired = true;
-      ps.dwt_isr_entry_raw = dwt_isr_entry_raw;
-
-      if (ps.shadow_dwt == 0) {
-        ps.anomaly_count++;
-        record_anomaly(g_anomaly_diag.no_shadow_dwt,
-                       rt.desc->kind,
-                       dwt_isr_entry_raw,
-                       ps.arm_count,
-                       ps.complete_count);
-      } else {
-        shadow_to_isr_cycles = dwt_isr_entry_raw - ps.shadow_dwt;
-      }
-
-      if (ps.prespin_start_dwt != 0) {
-        approach_cycles = dwt_isr_entry_raw - ps.prespin_start_dwt;
-      }
-    }
+  if (g_pps_prespin_start_dwt != 0) {
+    approach_cycles = dwt_isr_entry_raw - cap.prespin_start_dwt;
   }
 
-  const uint32_t correction = rt.desc->isr_overhead_cycles;
+  if (cap.shadow_dwt != 0) {
+    shadow_to_isr_cycles = dwt_isr_entry_raw - cap.shadow_dwt;
+  } else {
+    ps.anomaly_count++;
+    record_anomaly(g_anomaly_diag.no_shadow_dwt,
+                   interrupt_subscriber_kind_t::PPS,
+                   dwt_isr_entry_raw,
+                   ps.arm_count,
+                   ps.complete_count);
+  }
+
+  if (!ps.active && cap.prespin_start_dwt == 0 && cap.shadow_dwt == 0) {
+    ps.anomaly_count++;
+    record_anomaly(g_anomaly_diag.no_prespin_active,
+                   interrupt_subscriber_kind_t::PPS,
+                   dwt_isr_entry_raw,
+                   cap.shadow_dwt,
+                   ps.arm_count);
+  }
+
+  const uint32_t correction = PPS_ISR_FIXED_OVERHEAD_CYCLES;
   const uint32_t dwt_at_event = dwt_isr_entry_raw - correction;
 
-  int64_t gnss_ns_signed;
-
-  if (rt.desc->kind == interrupt_subscriber_kind_t::PPS) {
-    const int64_t pps_index = (int64_t)rt.event_count;
-    gnss_ns_signed = pps_index * 1000000000LL;
-  } else {
-    gnss_ns_signed = time_dwt_to_gnss_ns(dwt_at_event);
-  }
+  const int64_t pps_index = (int64_t)rt.event_count;
+  const int64_t gnss_ns_signed = pps_index * 1000000000LL;
 
   interrupt_event_t event {};
-  event.kind = rt.desc->kind;
-  event.provider = rt.desc->provider;
-  event.lane = rt.desc->lane;
+  event.kind = interrupt_subscriber_kind_t::PPS;
+  event.provider = interrupt_provider_kind_t::GPIO6789;
+  event.lane = interrupt_lane_t::GPIO_EDGE;
+  event.dwt_at_event = dwt_at_event;
+  event.counter32_at_event = counter32_at_event;
+  event.dwt_event_correction_cycles = correction;
+  event.gnss_ns_at_event = (uint64_t)gnss_ns_signed;
+  event.status = interrupt_event_status_t::OK;
+
+  interrupt_capture_diag_t diag {};
+  fill_diag_common(rt, diag, event, dwt_isr_entry_raw, approach_cycles, shadow_to_isr_cycles, cap);
+
+  rt.last_event = event;
+  rt.last_diag = diag;
+  rt.has_fired = true;
+  rt.irq_count++;
+  rt.dispatch_count++;
+  rt.event_count++;
+
+  pps_drumbeat_consume_edge(rt);
+
+  timepop_arm(0, false, deferred_dispatch_callback, &rt, "PPS_DISPATCH");
+}
+
+static void handle_ocxo1_event(interrupt_subscriber_runtime_t& rt,
+                               uint32_t dwt_isr_entry_raw,
+                               uint32_t counter32_at_event) {
+  prespin_state_t& ps = rt.prespin;
+
+  g_ocxo1_prespin_fired = true;
+  g_ocxo1_dwt_isr_entry_raw = dwt_isr_entry_raw;
+
+  frozen_capture_t cap = freeze_ocxo1_capture_lane();
+  cap.fired = true;
+  cap.dwt_isr_entry_raw = dwt_isr_entry_raw;
+
+  uint32_t approach_cycles = 0;
+  uint32_t shadow_to_isr_cycles = 0;
+
+  if (g_ocxo1_prespin_start_dwt != 0) {
+    approach_cycles = dwt_isr_entry_raw - cap.prespin_start_dwt;
+  }
+
+  if (cap.shadow_dwt != 0) {
+    shadow_to_isr_cycles = dwt_isr_entry_raw - cap.shadow_dwt;
+  } else {
+    ps.anomaly_count++;
+    record_anomaly(g_anomaly_diag.no_shadow_dwt,
+                   interrupt_subscriber_kind_t::OCXO1,
+                   dwt_isr_entry_raw,
+                   ps.arm_count,
+                   ps.complete_count);
+  }
+
+  if (!ps.active && cap.prespin_start_dwt == 0 && cap.shadow_dwt == 0) {
+    ps.anomaly_count++;
+    record_anomaly(g_anomaly_diag.no_prespin_active,
+                   interrupt_subscriber_kind_t::OCXO1,
+                   dwt_isr_entry_raw,
+                   cap.shadow_dwt,
+                   ps.arm_count);
+  }
+
+  const uint32_t correction = GPT_ISR_FIXED_OVERHEAD;
+  const uint32_t dwt_at_event = dwt_isr_entry_raw - correction;
+  const int64_t gnss_ns_signed = time_dwt_to_gnss_ns(dwt_at_event);
+
+  interrupt_event_t event {};
+  event.kind = interrupt_subscriber_kind_t::OCXO1;
+  event.provider = interrupt_provider_kind_t::GPT1;
+  event.lane = interrupt_lane_t::GPT1_COMPARE3;
   event.dwt_at_event = dwt_at_event;
   event.counter32_at_event = counter32_at_event;
   event.dwt_event_correction_cycles = correction;
@@ -782,7 +1056,7 @@ static void handle_event_common(interrupt_subscriber_runtime_t& rt,
   }
 
   interrupt_capture_diag_t diag {};
-  fill_diag(rt, diag, event, dwt_isr_entry_raw, approach_cycles, shadow_to_isr_cycles);
+  fill_diag_common(rt, diag, event, dwt_isr_entry_raw, approach_cycles, shadow_to_isr_cycles, cap);
 
   rt.last_event = event;
   rt.last_diag = diag;
@@ -791,12 +1065,83 @@ static void handle_event_common(interrupt_subscriber_runtime_t& rt,
   rt.dispatch_count++;
   rt.event_count++;
 
-  if (rt.desc->kind == interrupt_subscriber_kind_t::PPS) {
-    pps_drumbeat_consume_edge(rt);
+  ocxo1_schedule_from_edge(rt, event.gnss_ns_at_event);
+
+  timepop_arm(0, false, deferred_dispatch_callback, &rt, "OCXO1_DISPATCH");
+}
+
+static void handle_ocxo2_event(interrupt_subscriber_runtime_t& rt,
+                               uint32_t dwt_isr_entry_raw,
+                               uint32_t counter32_at_event) {
+  prespin_state_t& ps = rt.prespin;
+
+  g_ocxo2_prespin_fired = true;
+  g_ocxo2_dwt_isr_entry_raw = dwt_isr_entry_raw;
+
+  frozen_capture_t cap = freeze_ocxo2_capture_lane();
+  cap.fired = true;
+  cap.dwt_isr_entry_raw = dwt_isr_entry_raw;
+
+  uint32_t approach_cycles = 0;
+  uint32_t shadow_to_isr_cycles = 0;
+
+  if (g_ocxo2_prespin_start_dwt != 0) {
+    approach_cycles = dwt_isr_entry_raw - cap.prespin_start_dwt;
   }
 
-  timepop_arm(0, false, deferred_dispatch_callback, &rt,
-              dispatch_timer_name(rt.desc->kind));
+  if (cap.shadow_dwt != 0) {
+    shadow_to_isr_cycles = dwt_isr_entry_raw - cap.shadow_dwt;
+  } else {
+    ps.anomaly_count++;
+    record_anomaly(g_anomaly_diag.no_shadow_dwt,
+                   interrupt_subscriber_kind_t::OCXO2,
+                   dwt_isr_entry_raw,
+                   ps.arm_count,
+                   ps.complete_count);
+  }
+
+  if (!ps.active && cap.prespin_start_dwt == 0 && cap.shadow_dwt == 0) {
+    ps.anomaly_count++;
+    record_anomaly(g_anomaly_diag.no_prespin_active,
+                   interrupt_subscriber_kind_t::OCXO2,
+                   dwt_isr_entry_raw,
+                   cap.shadow_dwt,
+                   ps.arm_count);
+  }
+
+  const uint32_t correction = GPT_ISR_FIXED_OVERHEAD;
+  const uint32_t dwt_at_event = dwt_isr_entry_raw - correction;
+  const int64_t gnss_ns_signed = time_dwt_to_gnss_ns(dwt_at_event);
+
+  interrupt_event_t event {};
+  event.kind = interrupt_subscriber_kind_t::OCXO2;
+  event.provider = interrupt_provider_kind_t::GPT2;
+  event.lane = interrupt_lane_t::GPT2_COMPARE3;
+  event.dwt_at_event = dwt_at_event;
+  event.counter32_at_event = counter32_at_event;
+  event.dwt_event_correction_cycles = correction;
+
+  if (gnss_ns_signed >= 0) {
+    event.gnss_ns_at_event = (uint64_t)gnss_ns_signed;
+    event.status = interrupt_event_status_t::OK;
+  } else {
+    event.gnss_ns_at_event = 0;
+    event.status = interrupt_event_status_t::HOLD;
+  }
+
+  interrupt_capture_diag_t diag {};
+  fill_diag_common(rt, diag, event, dwt_isr_entry_raw, approach_cycles, shadow_to_isr_cycles, cap);
+
+  rt.last_event = event;
+  rt.last_diag = diag;
+  rt.has_fired = true;
+  rt.irq_count++;
+  rt.dispatch_count++;
+  rt.event_count++;
+
+  ocxo2_schedule_from_edge(rt, event.gnss_ns_at_event);
+
+  timepop_arm(0, false, deferred_dispatch_callback, &rt, "OCXO2_DISPATCH");
 }
 
 // ============================================================================
@@ -815,7 +1160,7 @@ void process_interrupt_gpio6789_irq(uint32_t dwt_isr_entry_raw) {
   g_gpio_diag.dispatch_count++;
 
   const uint32_t next_pps_count = rt->event_count + 1;
-  handle_event_common(*rt, dwt_isr_entry_raw, next_pps_count);
+  handle_pps_event(*rt, dwt_isr_entry_raw, next_pps_count);
 }
 
 // ============================================================================
@@ -843,7 +1188,7 @@ void process_interrupt_gpt1_irq(uint32_t dwt_isr_entry_raw) {
   GPT1_OCR3 = rt->next_ocr3;
 
   const uint32_t next_count = rt->event_count + 1;
-  handle_event_common(*rt, dwt_isr_entry_raw, next_count);
+  handle_ocxo1_event(*rt, dwt_isr_entry_raw, next_count);
 }
 
 // ============================================================================
@@ -871,7 +1216,7 @@ void process_interrupt_gpt2_irq(uint32_t dwt_isr_entry_raw) {
   GPT2_OCR3 = rt->next_ocr3;
 
   const uint32_t next_count = rt->event_count + 1;
-  handle_event_common(*rt, dwt_isr_entry_raw, next_count);
+  handle_ocxo2_event(*rt, dwt_isr_entry_raw, next_count);
 }
 
 // ============================================================================
@@ -899,6 +1244,8 @@ bool interrupt_start(interrupt_subscriber_kind_t kind) {
   rt->start_count++;
 
   if (kind == interrupt_subscriber_kind_t::PPS) {
+    clear_pps_capture_lane();
+
     const uint64_t now_gnss_ns = current_gnss_now_for_schedule();
 
     debug_log("pps.start", "requested");
@@ -910,22 +1257,24 @@ bool interrupt_start(interrupt_subscriber_kind_t kind) {
   }
 
   if (kind == interrupt_subscriber_kind_t::OCXO1) {
+    clear_ocxo1_capture_lane();
+
     uint32_t now = GPT1_CNT;
     rt->next_ocr3 = now + OCXO_COUNTS_PER_SECOND;
     GPT1_OCR3 = rt->next_ocr3;
     GPT1_SR = GPT_SR_OF3;
     GPT1_IR |= GPT_IR_OF3IE;
-    schedule_next_prespin(*rt, current_gnss_now_for_schedule() + NS_PER_SECOND_U64);
     return true;
   }
 
   if (kind == interrupt_subscriber_kind_t::OCXO2) {
+    clear_ocxo2_capture_lane();
+
     uint32_t now = GPT2_CNT;
     rt->next_ocr3 = now + OCXO_COUNTS_PER_SECOND;
     GPT2_OCR3 = rt->next_ocr3;
     GPT2_SR = GPT_SR_OF3;
     GPT2_IR |= GPT_IR_OF3IE;
-    schedule_next_prespin(*rt, current_gnss_now_for_schedule() + NS_PER_SECOND_U64);
     return true;
   }
 
@@ -944,9 +1293,15 @@ bool interrupt_stop(interrupt_subscriber_kind_t kind) {
     rt->prespin.handle = TIMEPOP_INVALID_HANDLE;
   }
 
-  if (kind == interrupt_subscriber_kind_t::OCXO1) {
+  rt->prespin.active = false;
+
+  if (kind == interrupt_subscriber_kind_t::PPS) {
+    clear_pps_capture_lane();
+  } else if (kind == interrupt_subscriber_kind_t::OCXO1) {
+    clear_ocxo1_capture_lane();
     GPT1_IR &= ~GPT_IR_OF3IE;
   } else if (kind == interrupt_subscriber_kind_t::OCXO2) {
+    clear_ocxo2_capture_lane();
     GPT2_IR &= ~GPT_IR_OF3IE;
   }
 
@@ -1019,6 +1374,10 @@ void process_interrupt_init(void) {
       g_rt_ocxo2 = &rt;
     }
   }
+
+  clear_pps_capture_lane();
+  clear_ocxo1_capture_lane();
+  clear_ocxo2_capture_lane();
 
   g_pps_drumbeat = {};
   g_interrupt_runtime_ready = true;
@@ -1118,14 +1477,31 @@ static Payload cmd_report(const Payload&) {
 
     s.add("next_ocr3", rt.next_ocr3);
 
-    s.add("prespin_active", rt.prespin.active);
-    s.add("prespin_fired", rt.prespin.fired);
-    s.add("prespin_timed_out", rt.prespin.timed_out);
+    if (rt.desc->kind == interrupt_subscriber_kind_t::PPS) {
+      s.add("prespin_active", rt.prespin.active);
+      s.add("prespin_fired", g_pps_prespin_fired);
+      s.add("prespin_timed_out", g_pps_prespin_timed_out);
+      s.add("prespin_start_dwt", g_pps_prespin_start_dwt);
+      s.add("shadow_dwt", g_pps_shadow_dwt);
+      s.add("dwt_isr_entry_raw", g_pps_dwt_isr_entry_raw);
+    } else if (rt.desc->kind == interrupt_subscriber_kind_t::OCXO1) {
+      s.add("prespin_active", rt.prespin.active);
+      s.add("prespin_fired", g_ocxo1_prespin_fired);
+      s.add("prespin_timed_out", g_ocxo1_prespin_timed_out);
+      s.add("prespin_start_dwt", g_ocxo1_prespin_start_dwt);
+      s.add("shadow_dwt", g_ocxo1_shadow_dwt);
+      s.add("dwt_isr_entry_raw", g_ocxo1_dwt_isr_entry_raw);
+    } else if (rt.desc->kind == interrupt_subscriber_kind_t::OCXO2) {
+      s.add("prespin_active", rt.prespin.active);
+      s.add("prespin_fired", g_ocxo2_prespin_fired);
+      s.add("prespin_timed_out", g_ocxo2_prespin_timed_out);
+      s.add("prespin_start_dwt", g_ocxo2_prespin_start_dwt);
+      s.add("shadow_dwt", g_ocxo2_shadow_dwt);
+      s.add("dwt_isr_entry_raw", g_ocxo2_dwt_isr_entry_raw);
+    }
+
     s.add("prespin_target_gnss_ns", rt.prespin.prespin_target_gnss_ns);
     s.add("event_target_gnss_ns", rt.prespin.event_target_gnss_ns);
-    s.add("prespin_start_dwt", rt.prespin.prespin_start_dwt);
-    s.add("shadow_dwt", rt.prespin.shadow_dwt);
-    s.add("dwt_isr_entry_raw", rt.prespin.dwt_isr_entry_raw);
     s.add("prespin_arm_count", rt.prespin.arm_count);
     s.add("prespin_complete_count", rt.prespin.complete_count);
     s.add("prespin_timeout_count", rt.prespin.timeout_count);
