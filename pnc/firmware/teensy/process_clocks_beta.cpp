@@ -128,6 +128,12 @@ double dac_welford_stderr(const dac_welford_t& w) {
 // ============================================================================
 // Zeroing
 // ============================================================================
+//
+// IMPORTANT:
+// Canonical always-on physics clocks are no longer zeroed here.
+// Alpha owns epoch installation on the lawful PPS edge.
+// Beta zeroing is campaign-layer reset only.
+//
 
 void clocks_zero_all(void) {
   timebase_invalidate();
@@ -145,33 +151,6 @@ void clocks_zero_all(void) {
 
   dac_welford_reset(dac_welford_ocxo1);
   dac_welford_reset(dac_welford_ocxo2);
-
-  g_gnss_ns_count_at_pps = 0;
-  g_dwt_cycle_count_at_pps = DWT_CYCCNT;
-  g_dwt_cycle_count_next_second_prediction = DWT_EXPECTED_PER_PPS;
-  g_dwt_cycle_count_next_second_adjustment = 0;
-  g_dwt_model_pps_count = 0;
-
-  g_ocxo1_clock = {};
-  g_ocxo2_clock = {};
-  g_ocxo1_measurement = {};
-  g_ocxo2_measurement = {};
-
-  g_pps_interrupt_diag = {};
-  g_ocxo1_interrupt_diag = {};
-  g_ocxo2_interrupt_diag = {};
-
-  dwt_rolling_64 = 0;
-  dwt_rolling_32 = DWT_CYCCNT;
-
-  gnss_rolling_raw_64 = 0;
-  gnss_rolling_32 = qtimer1_read_32();
-
-  ocxo1_rolling_64 = 0;
-  ocxo1_rolling_32 = interrupt_gpt1_counter_now();
-
-  ocxo2_rolling_64 = 0;
-  ocxo2_rolling_32 = interrupt_gpt2_counter_now();
 }
 
 // ============================================================================
@@ -341,7 +320,7 @@ void clocks_watchdog_anomaly(const char* reason,
 //   sacred PPS-boundary contract via interrupt_request_pps_zero()
 //
 // request_start:
-//   waits for the same sacred zero/reset contract to complete before campaign
+//   piggybacks on the same sacred zero/reset contract before the campaign
 //   actually becomes STARTED
 //
 // request_stop:
@@ -350,11 +329,13 @@ void clocks_watchdog_anomaly(const char* reason,
 // request_recover:
 //   consummated on this lawful PPS callback turn
 //
-// Important with the new interrupt PPS model:
-//   • interrupt_start(PPS) no longer invents a synthetic first tooth
-//   • the interrupt layer only establishes its PPS drumbeat from an actual PPS edge
-//   • therefore this clocks layer must treat handshake completion as:
-//       "interrupt consumed a real PPS edge and cleared zero_pending"
+// Important with the alpha epoch model:
+//
+//   • alpha now owns canonical epoch installation on the lawful PPS edge
+//   • beta no longer tries to zero the always-on physics clocks directly
+//   • handshake completion means:
+//       "interrupt consummated PPS zero on a real PPS edge, and alpha
+//        installed the new canonical epoch on that same lawful turn"
 //
 // ============================================================================
 
@@ -362,24 +343,6 @@ void clocks_beta_pps(void) {
   // --------------------------------------------------------------------------
   // ZERO / START sacred PPS-boundary handshake
   // --------------------------------------------------------------------------
-  //
-  // Handshake states:
-  //
-  //   zero_handshake_in_flight == false
-  //     → clocks layer has not yet asked interrupt layer to perform sacred PPS zero
-  //
-  //   zero_handshake_in_flight == true
-  //     → clocks layer has asked, and is now waiting for interrupt layer to
-  //       consummate that request on a real PPS edge and clear its pending flag
-  //
-  // Completion:
-  //   once interrupt_pps_zero_pending() becomes false again, the interrupt
-  //   layer has completed the sacred PPS-boundary reset on an actual PPS edge
-  //   and restarted its geared PPS drumbeat from that edge. We then zero local
-  //   clocks state here, on this same lawful PPS callback turn.
-  //
-  // --------------------------------------------------------------------------
-
   if (request_zero || request_start) {
     if (!zero_handshake_in_flight) {
       interrupt_request_pps_zero();
@@ -391,8 +354,9 @@ void clocks_beta_pps(void) {
       return;
     }
 
-    // Sacred PPS zero has now been consummated by interrupt on a real PPS edge.
-    // This is the lawful moment to zero the local campaign-layer state.
+    // Sacred PPS zero has now been consummated on a real PPS edge.
+    // Alpha has already installed the new canonical epoch.
+    // This is the lawful moment to reset campaign-layer state only.
     clocks_zero_all();
 
     zero_handshake_in_flight = false;

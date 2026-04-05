@@ -6,47 +6,46 @@
 //
 // State model:
 //
-//   The PPS callback in process_clocks_alpha.cpp calls time_pps_update()
-//   on every PPS edge.  This advances the anchor:
+//   The PPS callback in process_clocks_alpha.cpp calls either:
 //
-//     Call 1 (first PPS):
-//       - dwt_at_pps recorded, pps_count = 1 ("one PPS seen")
-//       - dwt_cycles_per_s is 0 (no prior second to measure)
-//       - NOT YET VALID — we have an anchor but no rate
+//     • time_pps_epoch_reset()
+//         when a lawful PPS edge becomes the new sacred epoch origin
 //
-//     Call 2 (second PPS):
-//       - dwt_at_pps updated, dwt_cycles_per_s is now the first real delta
-//       - pps_count = 2 ("two PPS edges seen, one complete second")
-//       - VALID — time_gnss_ns_now() can interpolate
+//     • time_pps_update()
+//         for ordinary PPS advancement within the current epoch
 //
-//     Call N:
-//       - pps_count = N
-//       - anchor and rate advance each second
+//   Epoch semantics:
 //
-//   Between PPS edges, time_gnss_ns_now() reads DWT_CYCCNT and
-//   interpolates:
+//     Call time_pps_epoch_reset() on a consummating PPS edge:
+//       - dwt_at_pps recorded
+//       - qtimer_at_pps recorded
+//       - pps_count = 1
+//       - dwt_cycles_per_s = 0
+//       - valid = false
+//       - local GNSS coordinate origin is restarted at this PPS edge
+//
+//     Next call to time_pps_update() on the following PPS edge:
+//       - pps_count = 2
+//       - dwt_cycles_per_s is now the first real delta
+//       - valid = true
+//
+//     Subsequent calls:
+//       - pps_count increments
+//       - local time remains zero-based within the current epoch
+//
+//   Between PPS edges, time_gnss_ns_now() reads DWT_CYCCNT and interpolates:
 //
 //     gnss_ns = (pps_count - 1) * 1,000,000,000
 //             + (DWT_CYCCNT - dwt_at_pps) * 1,000,000,000 / dwt_cycles_per_s
 //
-//   pps_count is "PPS edges seen" (1-indexed).  Completed seconds
-//   is pps_count - 1.  After PPS #2: pps_count=2, completed=1,
-//   total at edge = 1,000,000,000.  Correct.
-//
-// Reverse conversion (GNSS ns → DWT):
-//
-//   target_gnss_ns → how many nanoseconds into the current second?
-//     ns_into_second = target_gnss_ns - (pps_count - 1) * 1e9
-//   Convert to DWT cycles:
-//     dwt_elapsed = ns_into_second * dwt_cycles_per_s / 1e9
-//   Add to PPS anchor:
-//     target_dwt = dwt_at_pps + dwt_elapsed
+//   pps_count is "PPS edges seen in current epoch" (1-indexed).
+//   Completed seconds is pps_count - 1.
 //
 // Torn-read protection:
 //
-//   Seqlock pattern.  The writer (time_pps_update) increments seq
-//   before and after the write, with DMB barriers.  Readers retry
-//   if seq changed during the read or if seq is odd (write in progress).
+//   Seqlock pattern. The writer increments seq before and after the write,
+//   with DMB barriers. Readers retry if seq changed during the read or if
+//   seq is odd (write in progress).
 //
 // ============================================================================
 
@@ -64,20 +63,19 @@ static constexpr uint64_t NS_PER_SEC = 1000000000ULL;
 
 // Staleness guard: if DWT_CYCCNT has advanced more than this many
 // nanoseconds beyond the anchor, the anchor is considered stale.
-// 3 seconds matches TIMEBASE_MAX_FRAGMENT_AGE_NS in timebase.cpp.
 static constexpr uint64_t MAX_AGE_NS = 3000000000ULL;
 
 // ============================================================================
-// Anchor state (written by time_pps_update, read by time_gnss_ns_now)
+// Anchor state (written by PPS callback, read by time readers)
 // ============================================================================
 
 struct time_anchor_t {
-  volatile uint32_t seq;              // seqlock sequence number
-  volatile uint32_t dwt_at_pps;       // DWT_CYCCNT at most recent PPS edge
-  volatile uint32_t dwt_cycles_per_s; // DWT cycles in the prior GNSS second
-  volatile uint32_t qtimer_at_pps;      // QTimer1 raw counter at most recent PPS edge
-  volatile uint32_t pps_count;        // PPS edges seen (1 = first PPS, 2 = first complete second)
-  volatile bool     valid;            // true after second PPS (rate available)
+  volatile uint32_t seq;
+  volatile uint32_t dwt_at_pps;
+  volatile uint32_t dwt_cycles_per_s;
+  volatile uint32_t qtimer_at_pps;
+  volatile uint32_t pps_count;
+  volatile bool     valid;
 };
 
 static time_anchor_t anchor = {};
@@ -91,23 +89,42 @@ static inline void dmb(void) {
 }
 
 // ============================================================================
-// Writer — called from PPS callback in process_clocks_alpha.cpp
+// Writer helpers
 // ============================================================================
 
-void time_pps_update(uint32_t dwt_at_pps, uint32_t dwt_cycles_per_s, uint32_t qtimer_at_pps) {
-
+void time_pps_epoch_reset(uint32_t dwt_at_pps, uint32_t qtimer_at_pps) {
   anchor.seq++;
   dmb();
 
-  if (!anchor.valid && anchor.pps_count == 0) {
+  anchor.dwt_at_pps       = dwt_at_pps;
+  anchor.dwt_cycles_per_s = 0;
+  anchor.qtimer_at_pps    = qtimer_at_pps;
+  anchor.pps_count        = 1;
+  anchor.valid            = false;
+
+  dmb();
+  anchor.seq++;
+}
+
+void time_pps_update(uint32_t dwt_at_pps,
+                     uint32_t dwt_cycles_per_s,
+                     uint32_t qtimer_at_pps) {
+  anchor.seq++;
+  dmb();
+
+  if (anchor.pps_count == 0) {
+    // First-ever PPS after cold init with no explicit epoch reset yet.
+    // This preserves historical startup behavior while still allowing
+    // later explicit epoch resets.
     anchor.dwt_at_pps       = dwt_at_pps;
     anchor.dwt_cycles_per_s = 0;
-    anchor.qtimer_at_pps      = qtimer_at_pps;
+    anchor.qtimer_at_pps    = qtimer_at_pps;
     anchor.pps_count        = 1;
+    anchor.valid            = false;
   } else {
     anchor.dwt_at_pps       = dwt_at_pps;
     anchor.dwt_cycles_per_s = dwt_cycles_per_s;
-    anchor.qtimer_at_pps      = qtimer_at_pps;
+    anchor.qtimer_at_pps    = qtimer_at_pps;
     anchor.pps_count++;
 
     if (dwt_cycles_per_s > 0) {
@@ -142,7 +159,7 @@ static time_snapshot_t read_anchor(void) {
 
     s.dwt_at_pps       = anchor.dwt_at_pps;
     s.dwt_cycles_per_s = anchor.dwt_cycles_per_s;
-    s.qtimer_at_pps      = anchor.qtimer_at_pps;
+    s.qtimer_at_pps    = anchor.qtimer_at_pps;
     s.pps_count        = anchor.pps_count;
     s.valid            = anchor.valid;
 
@@ -167,7 +184,7 @@ time_anchor_snapshot_t time_anchor_snapshot(void) {
   time_anchor_snapshot_t pub = {};
   pub.dwt_at_pps       = s.dwt_at_pps;
   pub.dwt_cycles_per_s = s.dwt_cycles_per_s;
-  pub.qtimer_at_pps      = s.qtimer_at_pps;
+  pub.qtimer_at_pps    = s.qtimer_at_pps;
   pub.pps_count        = s.pps_count;
   pub.valid            = s.valid;
   pub.ok               = s.ok;
@@ -175,10 +192,11 @@ time_anchor_snapshot_t time_anchor_snapshot(void) {
 }
 
 // ============================================================================
-// Internal helper — DWT elapsed to GNSS nanoseconds (shared by forward APIs)
+// Internal helper — DWT elapsed to GNSS nanoseconds
 // ============================================================================
 
-static inline int64_t interpolate_gnss_ns(const time_snapshot_t& s, uint32_t dwt_elapsed) {
+static inline int64_t interpolate_gnss_ns(const time_snapshot_t& s,
+                                          uint32_t dwt_elapsed) {
   const uint64_t ns_into_second =
     ((uint64_t)dwt_elapsed * NS_PER_SEC + (uint64_t)s.dwt_cycles_per_s / 2)
     / (uint64_t)s.dwt_cycles_per_s;
@@ -209,15 +227,15 @@ int64_t time_dwt_to_gnss_ns(uint32_t dwt_cyccnt) {
   if (s.dwt_cycles_per_s == 0) return -1;
 
   const uint32_t dwt_elapsed = dwt_cyccnt - s.dwt_at_pps;
-
   return interpolate_gnss_ns(s, dwt_elapsed);
 }
 
 int64_t time_dwt_to_gnss_ns(uint32_t dwt_cyccnt,
-                             uint32_t anchor_dwt_at_pps,
-                             uint32_t anchor_dwt_cycles_per_s,
-                             uint32_t anchor_pps_count) {
+                            uint32_t anchor_dwt_at_pps,
+                            uint32_t anchor_dwt_cycles_per_s,
+                            uint32_t anchor_pps_count) {
   if (anchor_dwt_cycles_per_s == 0) return -1;
+  if (anchor_pps_count == 0) return -1;
 
   const uint32_t dwt_elapsed = dwt_cyccnt - anchor_dwt_at_pps;
 
@@ -238,9 +256,11 @@ uint32_t time_gnss_ns_to_dwt(int64_t gnss_ns) {
   time_snapshot_t s = read_anchor();
   if (!s.ok || !s.valid) return 0;
   if (s.dwt_cycles_per_s == 0) return 0;
+  if (gnss_ns < 0) return 0;
 
   const int64_t anchor_ns = (int64_t)(s.pps_count - 1) * (int64_t)NS_PER_SEC;
   const int64_t ns_into_second = gnss_ns - anchor_ns;
+  if (ns_into_second < 0) return 0;
 
   const uint32_t dwt_elapsed =
     (uint32_t)(((uint64_t)ns_into_second * (uint64_t)s.dwt_cycles_per_s + NS_PER_SEC / 2)

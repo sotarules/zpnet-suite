@@ -25,6 +25,7 @@
 //   • PPS pre-spin is a geared drumbeat from actual consummated PPS edges.
 //   • ZERO is consummated only on a PPS edge and restarts that drumbeat.
 //   • Before the first lawful PPS edge, there is no sacred drumbeat baseline yet.
+//   • PPS critical scheduling must not interrogate ambient "now" time.
 //   • OCXO1 / OCXO2 pre-spin remain event-anchored / drift-aware for now.
 //
 // TimePop owns QTimer1. process_interrupt does not touch QTimer1.
@@ -372,9 +373,14 @@ static void gpt2_isr(void) {
 
 static void schedule_next_prespin(interrupt_subscriber_runtime_t& rt,
                                   uint64_t event_target_gnss_ns);
+static void schedule_next_prespin_from_anchor(interrupt_subscriber_runtime_t& rt,
+                                              uint64_t anchor_gnss_ns,
+                                              uint64_t offset_gnss_ns);
 static void maybe_dispatch_event(interrupt_subscriber_runtime_t& rt);
 static void pps_drumbeat_schedule_from_target(interrupt_subscriber_runtime_t& rt,
                                               uint64_t event_target_gnss_ns);
+static void pps_drumbeat_schedule_from_edge(interrupt_subscriber_runtime_t& rt,
+                                            uint64_t pps_edge_gnss_ns);
 static void pps_drumbeat_bootstrap(interrupt_subscriber_runtime_t& rt);
 static void pps_drumbeat_consume_edge(interrupt_subscriber_runtime_t& rt);
 
@@ -456,6 +462,8 @@ static void schedule_next_prespin(interrupt_subscriber_runtime_t& rt,
   ps.last_schedule_prespin_target_gnss_ns = ps.prespin_target_gnss_ns;
 
   if (rt.desc->prespin_absolute_gnss) {
+    // PPS absolute scheduling should normally use the anchor-relative helper
+    // below, not this ambient-now path. Keep this for generic absolute users.
     const uint64_t now_gnss_ns = current_gnss_now_for_schedule();
     ps.last_schedule_now_gnss_ns = now_gnss_ns;
     ps.last_schedule_delay_ns =
@@ -524,6 +532,47 @@ static void schedule_next_prespin(interrupt_subscriber_runtime_t& rt,
   ps.handle = h;
 }
 
+static void schedule_next_prespin_from_anchor(interrupt_subscriber_runtime_t& rt,
+                                              uint64_t anchor_gnss_ns,
+                                              uint64_t offset_gnss_ns) {
+  if (!rt.desc || !rt.desc->uses_prespin) return;
+  if (!rt.active) return;
+
+  prespin_state_t& ps = rt.prespin;
+
+  ps.event_target_gnss_ns = anchor_gnss_ns + offset_gnss_ns;
+  ps.prespin_target_gnss_ns =
+      (ps.event_target_gnss_ns >= PRESPIN_LEAD_NS)
+          ? (ps.event_target_gnss_ns - PRESPIN_LEAD_NS)
+          : 0ULL;
+
+  ps.last_schedule_event_target_gnss_ns = ps.event_target_gnss_ns;
+  ps.last_schedule_prespin_target_gnss_ns = ps.prespin_target_gnss_ns;
+  ps.last_schedule_now_gnss_ns = anchor_gnss_ns;
+  ps.last_schedule_delay_ns = offset_gnss_ns - PRESPIN_LEAD_NS;
+  ps.last_prespin_margin_ns = (int64_t)(offset_gnss_ns - PRESPIN_LEAD_NS);
+
+  timepop_handle_t h =
+      timepop_arm_from_anchor((int64_t)anchor_gnss_ns,
+                              (int64_t)(offset_gnss_ns - PRESPIN_LEAD_NS),
+                              false,
+                              prespin_timepop_callback,
+                              &rt,
+                              rt.desc->name);
+
+  if (h == TIMEPOP_INVALID_HANDLE) {
+    ps.anomaly_count++;
+    record_anomaly(g_anomaly_diag.prespin_arm_failed,
+                   rt.desc->kind,
+                   (uint32_t)(ps.prespin_target_gnss_ns & 0xFFFFFFFFu),
+                   (uint32_t)(ps.prespin_target_gnss_ns >> 32),
+                   ps.arm_count);
+    return;
+  }
+
+  ps.handle = h;
+}
+
 // ============================================================================
 // PPS drumbeat helpers
 // ============================================================================
@@ -537,6 +586,21 @@ static void pps_drumbeat_schedule_from_target(interrupt_subscriber_runtime_t& rt
           : 0ULL;
 
   schedule_next_prespin(rt, event_target_gnss_ns);
+}
+
+static void pps_drumbeat_schedule_from_edge(interrupt_subscriber_runtime_t& rt,
+                                            uint64_t pps_edge_gnss_ns) {
+  const uint64_t next_event_target_gnss_ns = pps_edge_gnss_ns + NS_PER_SECOND_U64;
+
+  g_pps_drumbeat.next_event_target_gnss_ns = next_event_target_gnss_ns;
+  g_pps_drumbeat.next_prespin_target_gnss_ns =
+      (next_event_target_gnss_ns >= PRESPIN_LEAD_NS)
+          ? (next_event_target_gnss_ns - PRESPIN_LEAD_NS)
+          : 0ULL;
+
+  // Sacred PPS path: next prespin is derived from the just-consummated PPS edge,
+  // not from interrogating ambient current time.
+  schedule_next_prespin_from_anchor(rt, pps_edge_gnss_ns, NS_PER_SECOND_U64);
 }
 
 static void pps_drumbeat_bootstrap(interrupt_subscriber_runtime_t& rt) {
@@ -572,10 +636,7 @@ static void pps_drumbeat_consume_edge(interrupt_subscriber_runtime_t& rt) {
     g_pps_drumbeat.generation++;
   }
 
-  const uint64_t next_event_target_gnss_ns =
-      pps_edge_gnss_ns + NS_PER_SECOND_U64;
-
-  pps_drumbeat_schedule_from_target(rt, next_event_target_gnss_ns);
+  pps_drumbeat_schedule_from_edge(rt, pps_edge_gnss_ns);
 }
 
 // ============================================================================
@@ -810,7 +871,6 @@ bool interrupt_subscribe(const interrupt_subscription_t& sub) {
 }
 
 bool interrupt_start(interrupt_subscriber_kind_t kind) {
-
   interrupt_subscriber_runtime_t* rt = runtime_for(kind);
   if (!rt || !rt->desc) return false;
 

@@ -30,6 +30,7 @@
 static constexpr uint64_t PPS_RELAY_OFF_NS    = 500000000ULL;
 static constexpr uint64_t DWT_ADJUST_TIMER_NS = 100000ULL; // 10 kHz
 static constexpr int64_t  DWT_ADJUST_THRESHOLD_NS = 2LL;
+static constexpr uint64_t NS_PER_SECOND_U64   = 1000000000ULL;
 
 // ============================================================================
 // Always-on state
@@ -53,6 +54,39 @@ interrupt_capture_diag_t g_ocxo1_interrupt_diag = {};
 interrupt_capture_diag_t g_ocxo2_interrupt_diag = {};
 
 bool g_ad5693r_init_ok = false;
+
+// ============================================================================
+// Alpha epoch state
+// ============================================================================
+//
+// This is the canonical zero-based epoch for the always-on physics layer.
+// It is established only on a lawful PPS edge.
+//
+// The physical raw values captured here are not themselves the canonical
+// clocks; they are the shared boundary facts from which the canonical
+// synthetic clocks are defined.
+//
+
+enum class clocks_epoch_reason_t : uint8_t {
+  NONE   = 0,
+  INIT   = 1,
+  ZERO   = 2,
+  START  = 3,
+};
+
+static volatile bool g_epoch_pending = false;
+static volatile bool g_epoch_initialized = false;
+static volatile uint32_t g_epoch_generation = 0;
+static volatile clocks_epoch_reason_t g_epoch_reason = clocks_epoch_reason_t::NONE;
+
+// Raw physical anchors captured at the consummating PPS boundary.
+static volatile uint32_t g_epoch_dwt_at_pps = 0;
+static volatile uint32_t g_epoch_qtimer_at_pps = 0;
+static volatile uint32_t g_epoch_ocxo1_counter_at_epoch = 0;
+static volatile uint32_t g_epoch_ocxo2_counter_at_epoch = 0;
+
+// Canonical PPS count within current epoch (0 at epoch PPS, then 1, 2, 3...).
+static volatile uint64_t g_epoch_pps_index = 0;
 
 // ============================================================================
 // DAC state
@@ -163,6 +197,12 @@ uint64_t clocks_dwt_ns_now(void) {
 // ============================================================================
 // GNSS live reads — TimePop owns QTimer1, clocks just reads it
 // ============================================================================
+//
+// NOTE:
+// Live reads here remain for non-sacred helper paths / rolling extensions.
+// They must not be used to define a new epoch.
+// Epoch truth is established only from the consummating PPS boundary.
+//
 
 uint32_t qtimer1_read_32(void) {
   const uint16_t lo1 = IMXRT_TMR1.CH[0].CNTR;
@@ -215,11 +255,80 @@ uint64_t clocks_ocxo2_ns_now(void) {
 }
 
 // ============================================================================
+// Epoch helpers
+// ============================================================================
+
+static void alpha_request_epoch_zero(clocks_epoch_reason_t reason) {
+  g_epoch_pending = true;
+  g_epoch_reason = reason;
+}
+
+static void alpha_reset_canonical_clock_state_for_new_epoch(void) {
+  g_gnss_ns_count_at_pps = 0;
+
+  g_dwt_cycle_count_at_pps = 0;
+  g_dwt_cycle_count_next_second_prediction = DWT_EXPECTED_PER_PPS;
+  g_dwt_cycle_count_next_second_adjustment = 0;
+  g_dwt_model_pps_count = 0;
+
+  g_ocxo1_clock = {};
+  g_ocxo2_clock = {};
+
+  g_ocxo1_measurement = {};
+  g_ocxo2_measurement = {};
+
+  g_pps_interrupt_diag = {};
+  g_ocxo1_interrupt_diag = {};
+  g_ocxo2_interrupt_diag = {};
+
+  dwt_cycles_64  = 0;
+  gnss_raw_64    = 0;
+  ocxo1_ticks_64 = 0;
+  ocxo2_ticks_64 = 0;
+}
+
+static void alpha_install_new_epoch_from_pps(const interrupt_event_t& pps_event) {
+  g_epoch_initialized = true;
+  g_epoch_pending = false;
+  g_epoch_generation++;
+  g_epoch_pps_index = 0;
+
+  g_epoch_dwt_at_pps = pps_event.dwt_at_event;
+  g_epoch_qtimer_at_pps = qtimer1_read_32();
+
+  // Capture OCXO physical counters in the same narrow PPS-boundary handling
+  // window. These are raw physical anchors, not canonical clock values.
+  g_epoch_ocxo1_counter_at_epoch = interrupt_gpt1_counter_now();
+  g_epoch_ocxo2_counter_at_epoch = interrupt_gpt2_counter_now();
+
+  alpha_reset_canonical_clock_state_for_new_epoch();
+
+  // Canonical PPS-origin values are zero at the epoch edge.
+  g_gnss_ns_count_at_pps = 0;
+  g_dwt_cycle_count_at_pps = pps_event.dwt_at_event;
+  g_dwt_model_pps_count = 0;
+
+  g_ocxo1_clock.gnss_ns_at_edge = 0;
+  g_ocxo1_clock.ns_count_at_edge = 0;
+  g_ocxo1_clock.ns_count_next_second_prediction = NS_PER_SECOND_U64;
+  g_ocxo1_clock.ns_count_at_pps = 0;
+
+  g_ocxo2_clock.gnss_ns_at_edge = 0;
+  g_ocxo2_clock.ns_count_at_edge = 0;
+  g_ocxo2_clock.ns_count_next_second_prediction = NS_PER_SECOND_U64;
+  g_ocxo2_clock.ns_count_at_pps = 0;
+
+  // Restart the universal local time epoch at this lawful PPS edge.
+  time_pps_epoch_reset(pps_event.dwt_at_event, g_epoch_qtimer_at_pps);
+}
+
+// ============================================================================
 // Helper: derive DWT adjustment at 10 kHz
 // ============================================================================
 
 static void dwt_adjustment_timer_callback(timepop_ctx_t* ctx, timepop_diag_t*, void*) {
   if (g_gnss_ns_count_at_pps == 0) return;
+  if (!time_valid()) return;
 
   const uint32_t current_dwt = DWT_CYCCNT;
   const uint64_t elapsed_gnss_ns = ctx->fire_gnss_ns - g_gnss_ns_count_at_pps;
@@ -259,7 +368,33 @@ static void pps_callback(
 
   clocks_capture_interrupt_diag(g_pps_interrupt_diag, diag);
 
-  g_gnss_ns_count_at_pps = event.gnss_ns_at_event;
+  // --------------------------------------------------------------------------
+  // Epoch establishment — only on a lawful PPS edge
+  // --------------------------------------------------------------------------
+  if (!g_epoch_initialized || g_epoch_pending) {
+    alpha_install_new_epoch_from_pps(event);
+
+    prev_dwt_pps = event.dwt_at_event;
+
+    if (campaign_state == clocks_campaign_state_t::STARTED ||
+        request_start || request_stop || request_recover || request_zero) {
+      clocks_beta_pps();
+    }
+
+    digitalWriteFast(GNSS_PPS_RELAY, HIGH);
+
+    if (!relay_timer_active) {
+      relay_timer_active = true;
+      timepop_arm(PPS_RELAY_OFF_NS, false, pps_relay_deassert, nullptr, "pps-relay-off");
+    }
+    return;
+  }
+
+  // --------------------------------------------------------------------------
+  // Normal PPS advancement within current epoch
+  // --------------------------------------------------------------------------
+  g_epoch_pps_index++;
+  g_gnss_ns_count_at_pps = g_epoch_pps_index * NS_PER_SECOND_U64;
   g_dwt_cycle_count_at_pps = event.dwt_at_event;
 
   if (g_dwt_model_pps_count > 0) {
@@ -271,7 +406,7 @@ static void pps_callback(
   g_dwt_cycle_count_next_second_adjustment = 0;
   g_dwt_model_pps_count++;
 
-  if (g_ocxo1_clock.gnss_ns_at_edge != 0) {
+  if (g_ocxo1_clock.gnss_ns_at_edge != 0 || g_ocxo1_measurement.prev_gnss_ns_at_edge == 0) {
     const uint64_t gnss_since = g_gnss_ns_count_at_pps - g_ocxo1_clock.gnss_ns_at_edge;
     g_ocxo1_clock.ns_count_at_pps =
         g_ocxo1_clock.ns_count_at_edge +
@@ -280,7 +415,7 @@ static void pps_callback(
     g_ocxo1_clock.ns_count_at_pps = 0;
   }
 
-  if (g_ocxo2_clock.gnss_ns_at_edge != 0) {
+  if (g_ocxo2_clock.gnss_ns_at_edge != 0 || g_ocxo2_measurement.prev_gnss_ns_at_edge == 0) {
     const uint64_t gnss_since = g_gnss_ns_count_at_pps - g_ocxo2_clock.gnss_ns_at_edge;
     g_ocxo2_clock.ns_count_at_pps =
         g_ocxo2_clock.ns_count_at_edge +
@@ -289,13 +424,13 @@ static void pps_callback(
     g_ocxo2_clock.ns_count_at_pps = 0;
   }
 
-  // MULE: HISTORICAL HOTSPOT BELOW (TIMEPOP):
   time_pps_update(
     g_dwt_cycle_count_at_pps,
     dwt_effective_cycles_per_second(),
-    (uint32_t)(g_gnss_ns_count_at_pps / 100ULL));
+    qtimer1_read_32());
 
-  if (campaign_state == clocks_campaign_state_t::STARTED || request_start || request_stop || request_recover || request_zero) {
+  if (campaign_state == clocks_campaign_state_t::STARTED ||
+      request_start || request_stop || request_recover || request_zero) {
     clocks_beta_pps();
   }
 
@@ -314,6 +449,7 @@ static void ocxo1_callback(
 
   clocks_capture_interrupt_diag(g_ocxo1_interrupt_diag, diag);
 
+  // Canonical GNSS epoch is local and zero-based.
   g_ocxo1_clock.gnss_ns_at_edge = event.gnss_ns_at_event;
   g_ocxo1_clock.ns_count_at_edge = (uint64_t)event.counter32_at_event * 100ULL;
 
@@ -364,8 +500,7 @@ static void ocxo2_callback(
 void process_clocks_init_hardware(void) {
   dwt_enable();
 
-  // TimePop owns QTimer1, so clocks hardware init no longer touches it.
-  // Capture the current values for rolling extensions.
+  // Capture current values only for rolling extensions / non-sacred helpers.
   gnss_rolling_32 = qtimer1_read_32();
   ocxo1_rolling_32 = interrupt_gpt1_counter_now();
   ocxo2_rolling_32 = interrupt_gpt2_counter_now();
@@ -378,6 +513,9 @@ void process_clocks_init_hardware(void) {
 void process_clocks_init(void) {
   time_init();
   timebase_init();
+
+  // Startup uses the same sacred epoch model as ZERO/START.
+  alpha_request_epoch_zero(clocks_epoch_reason_t::INIT);
 
   g_ad5693r_init_ok = ad5693r_init();
 

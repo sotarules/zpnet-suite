@@ -43,8 +43,7 @@
 //
 // 3. F_CPU_ACTUAL is updated automatically by set_arm_clock().
 //    All downstream code that uses F_CPU_ACTUAL will pick up the
-//    new frequency.  Hardcoded 600 MHz constants (e.g. in
-//    process_clocks.cpp) must be updated separately.
+//    new frequency.
 //
 // THERMAL NOTE:
 //    1.008 GHz + heatsink = safe continuous operation.
@@ -53,9 +52,6 @@
 // DWT NS CONVERSION NOTE:
 //    At 600 MHz: 1 cycle = 5/3 ns (exact)
 //    At 1008 MHz: 1 cycle = 125/126 ns (exact rational, ~0.9921 ns)
-//
-//    The existing (cycles * 5) / 3 conversion in process_clocks.cpp
-//    MUST be updated.  See DWT_NS_NUM / DWT_NS_DEN in config.h.
 //
 // ============================================================================
 
@@ -66,46 +62,17 @@ static void maximize_dwt_determinism(void) {
 
   // ----------------------------------------------------------
   // 1. Overclock to 1.008 GHz
-  //
-  // set_arm_clock() handles:
-  //   • PLL1 (ARM_PLL) reconfiguration
-  //   • DCDC target voltage increase for stable 1 GHz operation
-  //   • F_CPU_ACTUAL global variable update
-  //   • AHB/IPG clock divider adjustment
-  //
-  // The DWT cycle counter (DWT_CYCCNT) ticks at the core clock
-  // rate, so this immediately gives us ~1 ns resolution.
   // ----------------------------------------------------------
-
   set_arm_clock(1008000000);
 
   // ----------------------------------------------------------
   // 2. Disable ARM sleep modes
-  //
-  // The Cortex-M7 System Control Register (SCR) has two bits
-  // that can gate the core clock:
-  //
-  //   SLEEPONEXIT — enter sleep automatically on ISR return
-  //   SLEEPDEEP   — enter deep sleep on WFI/WFE
-  //
-  // When the core clock is gated, DWT_CYCCNT stops counting.
-  // This introduces non-deterministic gaps in the cycle counter
-  // that appear as timing jitter.
-  //
-  // Clearing both bits ensures the core clock runs continuously.
-  // This wastes power but that's irrelevant for our use case.
   // ----------------------------------------------------------
-
   SCB_SCR &= ~(SCB_SCR_SLEEPONEXIT | SCB_SCR_SLEEPDEEP);
 
   // ----------------------------------------------------------
   // 3. Verify DWT is enabled and running
-  //
-  // This is belt-and-suspenders — process_clocks_init_hardware()
-  // also enables DWT.  But we want the counter running from the
-  // earliest possible moment.
   // ----------------------------------------------------------
-
   ARM_DEMCR |= ARM_DEMCR_TRCENA;
   ARM_DWT_CTRL |= ARM_DWT_CTRL_CYCCNTENA;
 }
@@ -134,7 +101,6 @@ static inline void led_off() { digitalWrite(LED_BUILTIN, LOW);  }
 static void dwt_spin_ms(uint32_t ms) {
   if (ms == 0) return;
 
-  // Ensure DWT is running (may be called before maximize_dwt_determinism)
   ARM_DEMCR |= ARM_DEMCR_TRCENA;
   ARM_DWT_CTRL |= ARM_DWT_CTRL_CYCCNTENA;
 
@@ -207,7 +173,7 @@ static void fault_morse_usagefault() {
 
 extern "C" {
 
-void HardFault_Handler(void)   { fault_morse_hardfault(); }
+void HardFault_Handler(void)  { fault_morse_hardfault(); }
 void MemManage_Handler(void)  { fault_morse_memmanage(); }
 void BusFault_Handler(void)   { fault_morse_busfault(); }
 void UsageFault_Handler(void) { fault_morse_usagefault(); }
@@ -218,24 +184,28 @@ void UsageFault_Handler(void) { fault_morse_usagefault(); }
 // ZPNet Runtime Initialization
 // ============================================================================
 //
-// Boot order is critical.  The dependency chain is:
+// Boot order is critical. The dependency chain is:
 //
 //   1. maximize_dwt_determinism()        — CPU clock, DWT counter
 //   2. memory_info_init()                — stack sentinel painting
 //   3. cpu_usage_init()                  — DWT accounting baseline
 //   4. process_interrupt_init_hardware() — starts GPT1 (OCXO1), GPT2 (OCXO2)
-//   5. process_clocks_init_hardware()    — DWT enable, rolling baselines
-//   6. timepop_init()                    — QTimer1 compare scheduler
-//                                          (QTimer1 MUST be running)
+//   5. timepop_init()                    — QTimer1 compare scheduler
+//   6. process_clocks_init_hardware()    — DWT enable, rolling helper baselines
 //   7. transport_init()                  — arms RX/TX timers
-//                                          (TimePop MUST be ready)
 //   8. debug_init()                      — transport-routed logging
 //   9. process framework + subsystems    — everything else
 //  10. process_interrupt_init()          — runtime slots, descriptor wiring
 //  11. process_interrupt_enable_irqs()   — ISR vectors + NVIC enable
-//                                          (hardware interrupts go live)
-//  12. process_clocks_init()             — PPS/OCXO subscribe + start,
-//                                          DACs, relay pins
+//  12. process_clocks_init()             — subscribes PPS/OCXO, requests
+//                                          startup epoch zero, starts providers
+//
+// Sacred epoch note:
+//
+//   Startup zero is not a special one-off regime.
+//   The clocks subsystem requests a normal epoch zero during init, and the
+//   first lawful PPS edge consummates it exactly the same way as explicit
+//   ZERO and START piggybacked-on-zero do later.
 //
 // ============================================================================
 
@@ -247,10 +217,7 @@ void setup() {
 
   delay(100);            // USB settle (not relied upon for faults)
 
-  // *** DWT DETERMINISM: overclock + disable sleep FIRST ***
-  // This must happen before ANY timing-sensitive initialization.
-  // set_arm_clock() adjusts PLL1 and DCDC voltage.
-  // All subsequent code runs at 1.008 GHz.
+  // DWT determinism first.
   maximize_dwt_determinism();
 
   debug_blink("911");    // unconditional startup indicator (LED-only)
@@ -274,10 +241,13 @@ void setup() {
   // process_interrupt owns GPT1/GPT2 provider hardware.
   process_interrupt_init_hardware();
 
+  // TimePop owns QTimer1 and must be ready before any subsystem that relies
+  // on timed callbacks or named singleton timer replacement.
   timepop_init();
 
-  // clocks owns DWT-local initialization + rolling baselines.
-  // GPT1/GPT2 must already be running (seeded by process_interrupt above).
+  // clocks owns DWT-local init and helper rolling baselines.
+  // These helper baselines are not sacred epoch truth; startup epoch zero
+  // will be established later on the first lawful PPS edge.
   process_clocks_init_hardware();
 
   // ----------------------------------------------------------
@@ -303,8 +273,6 @@ void setup() {
   debug_init();
 
   debug_log("boot", "setup begin");
-
-  // Log clock configuration for forensic verification
   debug_log("boot.cpu_mhz", (uint32_t)(F_CPU_ACTUAL / 1000000UL));
 
   // ----------------------------------------------------------
@@ -355,14 +323,26 @@ void setup() {
   debug_log("boot", "process_interrupt_register done");
 
   // ----------------------------------------------------------
-  // Clocks subsystem — subscribes to interrupt events,
-  // starts PPS/OCXO1/OCXO2, configures DACs and relay pins.
-  // Must come after ISR vectors are live.
+  // TimePop process registration
   // ----------------------------------------------------------
 
   debug_log("boot", "process_timepop_register");
   process_timepop_register();
   debug_log("boot", "process_timepop_register done");
+
+  // ----------------------------------------------------------
+  // Clocks subsystem
+  // ----------------------------------------------------------
+  //
+  // process_clocks_init():
+  //   • initializes time/timebase
+  //   • subscribes PPS/OCXO interrupt consumers
+  //   • requests startup epoch zero
+  //   • starts PPS/OCXO providers
+  //
+  // The first lawful PPS edge after this point establishes canonical zero
+  // for the nanosecond clocks.
+  // ----------------------------------------------------------
 
   debug_log("boot", "process_clocks_init");
   process_clocks_init();
