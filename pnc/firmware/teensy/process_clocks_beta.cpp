@@ -44,6 +44,9 @@ uint64_t recover_gnss_ns  = 0;
 uint64_t recover_ocxo1_ns = 0;
 uint64_t recover_ocxo2_ns = 0;
 
+// Sacred PPS-boundary handshake state.
+// True means clocks has asked interrupt to consummate PPS ZERO on a real PPS
+// edge and is now waiting for interrupt_pps_zero_pending() to fall false.
 static volatile bool zero_handshake_in_flight = false;
 
 volatile bool     watchdog_anomaly_active          = false;
@@ -347,6 +350,12 @@ void clocks_watchdog_anomaly(const char* reason,
 // request_recover:
 //   consummated on this lawful PPS callback turn
 //
+// Important with the new interrupt PPS model:
+//   • interrupt_start(PPS) no longer invents a synthetic first tooth
+//   • the interrupt layer only establishes its PPS drumbeat from an actual PPS edge
+//   • therefore this clocks layer must treat handshake completion as:
+//       "interrupt consumed a real PPS edge and cleared zero_pending"
+//
 // ============================================================================
 
 void clocks_beta_pps(void) {
@@ -361,12 +370,13 @@ void clocks_beta_pps(void) {
   //
   //   zero_handshake_in_flight == true
   //     → clocks layer has asked, and is now waiting for interrupt layer to
-  //       consummate that request on a PPS edge and clear its pending flag
+  //       consummate that request on a real PPS edge and clear its pending flag
   //
   // Completion:
   //   once interrupt_pps_zero_pending() becomes false again, the interrupt
-  //   layer has completed the sacred PPS-boundary reset and restarted its
-  //   geared PPS drumbeat. We then zero local clocks state here.
+  //   layer has completed the sacred PPS-boundary reset on an actual PPS edge
+  //   and restarted its geared PPS drumbeat from that edge. We then zero local
+  //   clocks state here, on this same lawful PPS callback turn.
   //
   // --------------------------------------------------------------------------
 
@@ -381,7 +391,10 @@ void clocks_beta_pps(void) {
       return;
     }
 
+    // Sacred PPS zero has now been consummated by interrupt on a real PPS edge.
+    // This is the lawful moment to zero the local campaign-layer state.
     clocks_zero_all();
+
     zero_handshake_in_flight = false;
     request_zero = false;
 
@@ -401,6 +414,8 @@ void clocks_beta_pps(void) {
     watchdog_anomaly_active = false;
     campaign_state = clocks_campaign_state_t::STOPPED;
     request_stop = false;
+    request_zero = false;
+    zero_handshake_in_flight = false;
     calibrate_ocxo_mode = servo_mode_t::OFF;
     timebase_invalidate();
     return;
@@ -411,6 +426,9 @@ void clocks_beta_pps(void) {
   // --------------------------------------------------------------------------
   if (request_recover) {
     watchdog_anomaly_active = false;
+
+    request_zero = false;
+    zero_handshake_in_flight = false;
 
     dwt_cycles_64  = dwt_ns_to_cycles(recover_dwt_ns);
     gnss_raw_64    = recover_gnss_ns / 100ull;
@@ -535,6 +553,7 @@ static Payload cmd_start(const Payload& args) {
 static Payload cmd_stop(const Payload&) {
   request_stop = true;
   request_start = false;
+  request_zero = false;
   Payload p;
   p.add("status", "stop_requested");
   return p;
@@ -542,6 +561,10 @@ static Payload cmd_stop(const Payload&) {
 
 static Payload cmd_zero(const Payload&) {
   request_zero = true;
+  request_start = false;
+  request_stop = false;
+  request_recover = false;
+
   Payload p;
   p.add("status", "zero_requested");
   return p;
@@ -567,6 +590,7 @@ static Payload cmd_recover(const Payload& args) {
   request_recover = true;
   request_start   = false;
   request_stop    = false;
+  request_zero    = false;
 
   Payload p;
   p.add("status", "recover_requested");

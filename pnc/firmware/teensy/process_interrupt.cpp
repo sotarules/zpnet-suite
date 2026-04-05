@@ -22,8 +22,9 @@
 //   • shadow_to_isr_cycles = cycles from final shadow DWT sample to ISR entry
 //
 // Scheduling intent:
-//   • PPS pre-spin is a geared drumbeat from a sacred PPS baseline.
+//   • PPS pre-spin is a geared drumbeat from actual consummated PPS edges.
 //   • ZERO is consummated only on a PPS edge and restarts that drumbeat.
+//   • Before the first lawful PPS edge, there is no sacred drumbeat baseline yet.
 //   • OCXO1 / OCXO2 pre-spin remain event-anchored / drift-aware for now.
 //
 // TimePop owns QTimer1. process_interrupt does not touch QTimer1.
@@ -539,20 +540,18 @@ static void pps_drumbeat_schedule_from_target(interrupt_subscriber_runtime_t& rt
 }
 
 static void pps_drumbeat_bootstrap(interrupt_subscriber_runtime_t& rt) {
-  const uint64_t now_gnss_ns = current_gnss_now_for_schedule();
-  if (now_gnss_ns == 0) return;
+  (void)rt;
 
-  const uint64_t next_pps_gnss_ns =
-      ((now_gnss_ns / NS_PER_SECOND_U64) + 1ULL) * NS_PER_SECOND_U64;
+  // Bootstrap does not invent a sacred baseline and does not schedule
+  // a synthetic first tooth. The PPS drumbeat begins only from an actual,
+  // consummated PPS edge. ZERO may already be pending before that first edge.
+  g_pps_drumbeat.next_event_target_gnss_ns = 0;
+  g_pps_drumbeat.next_prespin_target_gnss_ns = 0;
 
   if (!g_pps_drumbeat.initialized) {
-    g_pps_drumbeat.baseline_gnss_ns = next_pps_gnss_ns;
-    g_pps_drumbeat.next_index = 1;
-    g_pps_drumbeat.generation = 1;
-    g_pps_drumbeat.initialized = true;
+    g_pps_drumbeat.baseline_gnss_ns = 0;
+    g_pps_drumbeat.next_index = 0;
   }
-
-  pps_drumbeat_schedule_from_target(rt, next_pps_gnss_ns);
 }
 
 static void pps_drumbeat_consume_edge(interrupt_subscriber_runtime_t& rt) {
@@ -561,19 +560,20 @@ static void pps_drumbeat_consume_edge(interrupt_subscriber_runtime_t& rt) {
   const uint64_t pps_edge_gnss_ns = rt.last_event.gnss_ns_at_event;
   if (pps_edge_gnss_ns == 0) return;
 
-  if (!g_pps_drumbeat.initialized || g_pps_drumbeat.zero_pending) {
-    g_pps_drumbeat.initialized = true;
-    g_pps_drumbeat.zero_pending = false;
-    g_pps_drumbeat.baseline_gnss_ns = pps_edge_gnss_ns;
-    g_pps_drumbeat.next_index = 1;
+  const bool establishing_baseline =
+      !g_pps_drumbeat.initialized || g_pps_drumbeat.zero_pending;
+
+  g_pps_drumbeat.initialized = true;
+  g_pps_drumbeat.zero_pending = false;
+  g_pps_drumbeat.baseline_gnss_ns = pps_edge_gnss_ns;
+  g_pps_drumbeat.next_index = 1;
+
+  if (establishing_baseline) {
     g_pps_drumbeat.generation++;
-  } else {
-    g_pps_drumbeat.next_index++;
   }
 
   const uint64_t next_event_target_gnss_ns =
-      g_pps_drumbeat.baseline_gnss_ns +
-      (g_pps_drumbeat.next_index * NS_PER_SECOND_U64);
+      pps_edge_gnss_ns + NS_PER_SECOND_U64;
 
   pps_drumbeat_schedule_from_target(rt, next_event_target_gnss_ns);
 }
@@ -818,11 +818,11 @@ bool interrupt_start(interrupt_subscriber_kind_t kind) {
   rt->start_count++;
 
   if (kind == interrupt_subscriber_kind_t::PPS) {
-      const uint64_t now_gnss_ns = current_gnss_now_for_schedule();
+    const uint64_t now_gnss_ns = current_gnss_now_for_schedule();
 
-  debug_log("pps.start", "requested");
-  debug_log("pps.start.now_lo", (uint32_t)(now_gnss_ns & 0xFFFFFFFFu));
-  debug_log("pps.start.now_hi", (uint32_t)(now_gnss_ns >> 32));
+    debug_log("pps.start", "requested");
+    debug_log("pps.start.now_lo", (uint32_t)(now_gnss_ns & 0xFFFFFFFFu));
+    debug_log("pps.start.now_hi", (uint32_t)(now_gnss_ns >> 32));
 
     pps_drumbeat_bootstrap(*rt);
     return true;
