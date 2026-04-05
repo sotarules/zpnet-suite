@@ -367,6 +367,24 @@ static void gpt2_isr(void) {
   }
 }
 
+static const char* prespin_timer_name(interrupt_subscriber_kind_t kind) {
+  switch (kind) {
+  case interrupt_subscriber_kind_t::PPS:   return "PPS_PRESPIN";
+  case interrupt_subscriber_kind_t::OCXO1: return "OCXO1_PRESPIN";
+  case interrupt_subscriber_kind_t::OCXO2: return "OCXO2_PRESPIN";
+  default:                                 return "";
+  }
+}
+
+static const char* dispatch_timer_name(interrupt_subscriber_kind_t kind) {
+  switch (kind) {
+  case interrupt_subscriber_kind_t::PPS:   return "PPS_DISPATCH";
+  case interrupt_subscriber_kind_t::OCXO1: return "OCXO1_DISPATCH";
+  case interrupt_subscriber_kind_t::OCXO2: return "OCXO2_DISPATCH";
+  default:                                 return "";
+  }
+}
+
 // ============================================================================
 // Forward declarations
 // ============================================================================
@@ -478,7 +496,7 @@ static void schedule_next_prespin(interrupt_subscriber_runtime_t& rt,
                        false,
                        prespin_timepop_callback,
                        &rt,
-                       rt.desc->name);
+                       prespin_timer_name(rt.desc->kind));
 
     if (h == TIMEPOP_INVALID_HANDLE) {
       ps.anomaly_count++;
@@ -517,7 +535,8 @@ static void schedule_next_prespin(interrupt_subscriber_runtime_t& rt,
       (int64_t)ps.prespin_target_gnss_ns - (int64_t)now_gnss_ns;
 
   timepop_handle_t h =
-      timepop_arm(delay_ns, false, prespin_timepop_callback, &rt, rt.desc->name);
+      timepop_arm(delay_ns, false, prespin_timepop_callback, &rt,
+                  prespin_timer_name(rt.desc->kind));
 
   if (h == TIMEPOP_INVALID_HANDLE) {
     ps.anomaly_count++;
@@ -558,7 +577,7 @@ static void schedule_next_prespin_from_anchor(interrupt_subscriber_runtime_t& rt
                               false,
                               prespin_timepop_callback,
                               &rt,
-                              rt.desc->name);
+                              prespin_timer_name(rt.desc->kind));
 
   if (h == TIMEPOP_INVALID_HANDLE) {
     ps.anomaly_count++;
@@ -740,7 +759,8 @@ static void handle_event_common(interrupt_subscriber_runtime_t& rt,
   int64_t gnss_ns_signed;
 
   if (rt.desc->kind == interrupt_subscriber_kind_t::PPS) {
-    gnss_ns_signed = (int64_t)(rt.event_count + 1) * 1000000000LL - 1;
+    const int64_t pps_index = (int64_t)rt.event_count;
+    gnss_ns_signed = pps_index * 1000000000LL;
   } else {
     gnss_ns_signed = time_dwt_to_gnss_ns(dwt_at_event);
   }
@@ -775,7 +795,8 @@ static void handle_event_common(interrupt_subscriber_runtime_t& rt,
     pps_drumbeat_consume_edge(rt);
   }
 
-  timepop_arm(0, false, deferred_dispatch_callback, &rt, rt.desc->name);
+  timepop_arm(0, false, deferred_dispatch_callback, &rt,
+              dispatch_timer_name(rt.desc->kind));
 }
 
 // ============================================================================
