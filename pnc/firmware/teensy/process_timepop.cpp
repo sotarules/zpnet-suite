@@ -21,6 +21,22 @@
 // DWT is not the authoritative time base here.
 // DWT is diagnostic / cross-check material.
 //
+// Scheduling philosophy — gears, not rubber bands:
+//
+//   Absolute and anchor-relative scheduling NEVER ask "what time is it now?"
+//   Instead, deadlines are computed from the time anchor via pure arithmetic:
+//
+//     anchor_pps_gnss_ns = (pps_count - 1) * 1,000,000,000
+//     ticks_from_anchor  = (target_gnss_ns - anchor_pps_gnss_ns) / 100
+//     deadline           = qtimer_at_pps + ticks_from_anchor
+//
+//   This is possible because VCLOCK is phase-locked to GNSS.  The counter
+//   IS the clock — reading it to compute a deadline introduces jitter that
+//   pure arithmetic avoids.
+//
+//   Only relative scheduling ("fire N ns from now") reads the ambient counter,
+//   because "from now" inherently requires knowing "now."
+//
 // ============================================================================
 
 #include "timepop.h"
@@ -161,6 +177,14 @@ static inline void update_slot_high_water(void) {
 
 // QTimer1 CH0+CH1 32-bit read, instrumented locally in TimePop.
 // CH0 is low 16 bits, CH1 HOLD is high 16 bits of the cascaded counter.
+//
+// This read is used ONLY in contexts where ambient time is genuinely needed:
+//   • schedule_next() — must compare deadlines against the current counter
+//   • relative scheduling — "from now" inherently requires knowing "now"
+//   • recurring timer catch-up — relative timers that fell behind
+//
+// Absolute and anchor-relative scheduling NEVER call this function.
+// Their deadlines are computed from the time anchor via pure arithmetic.
 static volatile uint32_t diag_qread_total = 0;
 static volatile uint32_t diag_qread_same_hi = 0;
 static volatile uint32_t diag_qread_retry_hi_changed = 0;
@@ -242,6 +266,38 @@ static uint32_t predict_dwt_at_deadline(uint32_t deadline, bool& valid) {
 }
 
 // ============================================================================
+// Absolute GNSS nanosecond → VCLOCK deadline (pure arithmetic)
+// ============================================================================
+//
+// Converts a target GNSS nanosecond to a VCLOCK deadline using the time
+// anchor.  No ambient counter read.  No "what time is it now?"
+//
+// The arithmetic:
+//   anchor_pps_gnss_ns = (pps_count - 1) * 1,000,000,000
+//   ns_from_anchor     = target_gnss_ns - anchor_pps_gnss_ns
+//   ticks_from_anchor  = ns_from_anchor / 100
+//   deadline           = qtimer_at_pps + ticks_from_anchor
+//
+// Returns true if the conversion succeeded (anchor valid, target in range).
+// On success, writes the VCLOCK deadline to *out_deadline.
+
+static bool gnss_ns_to_vclock_deadline(int64_t target_gnss_ns,
+                                       const time_anchor_snapshot_t& snap,
+                                       uint32_t& out_deadline) {
+  if (!snap.ok || !snap.valid || snap.pps_count < 1) return false;
+
+  const int64_t anchor_pps_gnss_ns =
+    (int64_t)(snap.pps_count - 1) * (int64_t)1000000000LL;
+
+  const int64_t ns_from_anchor = target_gnss_ns - anchor_pps_gnss_ns;
+
+  const uint32_t ticks_from_anchor = (uint32_t)((uint64_t)ns_from_anchor / NS_PER_TICK);
+
+  out_deadline = snap.qtimer_at_pps + ticks_from_anchor;
+  return true;
+}
+
+// ============================================================================
 // Named singleton replacement
 // ============================================================================
 
@@ -297,6 +353,11 @@ static inline void ch2_arm_compare(uint16_t target_low16) {
 // ============================================================================
 // schedule_next
 // ============================================================================
+//
+// This is the ONE place in TimePop that legitimately reads the ambient
+// VCLOCK counter.  It must compare deadlines against the current counter
+// to determine which slots have expired and how far away the nearest
+// deadline is.  This is the heartbeat polling loop.
 
 static void schedule_next(void) {
   diag_schedule_next_calls_total++;
@@ -539,13 +600,14 @@ void timepop_init(void) {
 }
 
 // ============================================================================
-// Common arming helper — relative or absolute
+// Arm — relative scheduling ("from now")
 // ============================================================================
+//
+// This is the ONLY arming path that reads the ambient VCLOCK counter,
+// because "from now" inherently requires knowing "now."
 
-static timepop_handle_t arm_common_relative_or_absolute(
+timepop_handle_t timepop_arm(
   uint64_t            delay_gnss_ns,
-  int64_t             absolute_target_gnss_ns,
-  bool                use_absolute_target,
   bool                recurring,
   timepop_callback_t  callback,
   void*               user_data,
@@ -553,25 +615,7 @@ static timepop_handle_t arm_common_relative_or_absolute(
 ) {
   if (!callback) return TIMEPOP_INVALID_HANDLE;
 
-  const bool is_asap = (!use_absolute_target && delay_gnss_ns == 0);
-
-  uint32_t ticks = 0;
-  int64_t resolved_target_gnss_ns = -1;
-
-  if (use_absolute_target) {
-    const int64_t now_gnss_ns = time_gnss_ns_now();
-    if (now_gnss_ns < 0) return TIMEPOP_INVALID_HANDLE;
-    if (absolute_target_gnss_ns <= now_gnss_ns) return TIMEPOP_INVALID_HANDLE;
-
-    resolved_target_gnss_ns = absolute_target_gnss_ns;
-
-    const uint64_t effective_delay_gnss_ns =
-      (uint64_t)(absolute_target_gnss_ns - now_gnss_ns);
-
-    ticks = ns_to_ticks(effective_delay_gnss_ns);
-  } else if (!is_asap) {
-    ticks = ns_to_ticks(delay_gnss_ns);
-  }
+  const bool is_asap = (delay_gnss_ns == 0);
 
   noInterrupts();
 
@@ -591,15 +635,14 @@ static timepop_handle_t arm_common_relative_or_absolute(
     slots[i].active       = true;
     slots[i].expired      = is_asap;
     slots[i].recurring    = recurring;
-    slots[i].is_absolute  = use_absolute_target;
+    slots[i].is_absolute  = false;
     slots[i].handle       = h;
     slots[i].period_ns    = delay_gnss_ns;
-    slots[i].period_ticks = ticks;
     slots[i].callback     = callback;
     slots[i].user_data    = user_data;
     slots[i].name         = name;
     slots[i].fire_gnss_ns = -1;
-    slots[i].target_gnss_ns = resolved_target_gnss_ns;
+    slots[i].target_gnss_ns = -1;
     slots[i].isr_callback = false;
     slots[i].recurring_rearmed_count = 0;
     slots[i].recurring_immediate_expire_count = 0;
@@ -611,6 +654,7 @@ static timepop_handle_t arm_common_relative_or_absolute(
 
     if (is_asap) {
       slots[i].deadline = 0;
+      slots[i].period_ticks = 0;
       slots[i].prediction_valid = false;
       slots[i].predicted_dwt    = 0;
       timepop_pending = true;
@@ -618,17 +662,21 @@ static timepop_handle_t arm_common_relative_or_absolute(
       diag_asap_last_armed_dwt  = ARM_DWT_CYCCNT;
       diag_asap_last_armed_name = name;
     } else {
+      const uint32_t ticks = ns_to_ticks(delay_gnss_ns);
+      slots[i].period_ticks = ticks;
+
+      // Relative scheduling: "from now" requires reading the counter.
       const uint32_t now = vclock_count();
       slots[i].deadline = now + ticks;
+      slots[i].arm_vclock_raw = now;
+      slots[i].arm_delta_ticks = ticks;
+
       slots[i].predicted_dwt = predict_dwt_at_deadline(
         slots[i].deadline, slots[i].prediction_valid);
 
-      if (slots[i].prediction_valid && slots[i].target_gnss_ns <= 0) {
+      if (slots[i].prediction_valid) {
         slots[i].target_gnss_ns = time_dwt_to_gnss_ns(slots[i].predicted_dwt);
       }
-
-      slots[i].arm_vclock_raw = now;
-      slots[i].arm_delta_ticks = ticks;
 
       diag_schedule_next_calls_from_other++;
       schedule_next();
@@ -646,30 +694,13 @@ static timepop_handle_t arm_common_relative_or_absolute(
 }
 
 // ============================================================================
-// Arm — relative scheduling
+// Arm — absolute scheduling (deterministic, no ambient "now")
 // ============================================================================
-
-timepop_handle_t timepop_arm(
-  uint64_t            delay_gnss_ns,
-  bool                recurring,
-  timepop_callback_t  callback,
-  void*               user_data,
-  const char*         name
-) {
-  return arm_common_relative_or_absolute(
-    delay_gnss_ns,
-    -1,
-    false,
-    recurring,
-    callback,
-    user_data,
-    name
-  );
-}
-
-// ============================================================================
-// Arm — absolute scheduling
-// ============================================================================
+//
+// Converts the target GNSS nanosecond to a VCLOCK deadline using the time
+// anchor via pure arithmetic.  No call to vclock_count().  No call to
+// time_gnss_ns_now().  The deadline is geared from the anchor, not measured
+// from ambient time.
 
 timepop_handle_t timepop_arm_at(
   int64_t             target_gnss_ns,
@@ -678,15 +709,66 @@ timepop_handle_t timepop_arm_at(
   void*               user_data,
   const char*         name
 ) {
-  return arm_common_relative_or_absolute(
-    0,
-    target_gnss_ns,
-    true,
-    recurring,
-    callback,
-    user_data,
-    name
-  );
+  if (!callback) return TIMEPOP_INVALID_HANDLE;
+  if (target_gnss_ns <= 0) return TIMEPOP_INVALID_HANDLE;
+
+  const time_anchor_snapshot_t snap = time_anchor_snapshot();
+
+  uint32_t deadline = 0;
+  if (!gnss_ns_to_vclock_deadline(target_gnss_ns, snap, deadline)) {
+    return TIMEPOP_INVALID_HANDLE;
+  }
+
+  noInterrupts();
+
+  const bool retired_named = retire_existing_named_slots(name);
+  if (retired_named) {
+    diag_schedule_next_calls_from_other++;
+    schedule_next();
+  }
+
+  for (uint32_t i = 0; i < MAX_SLOTS; i++) {
+    if (slots[i].active) continue;
+
+    timepop_handle_t h = next_handle++;
+    if (next_handle == TIMEPOP_INVALID_HANDLE) next_handle = 1;
+
+    slots[i] = {};
+    slots[i].active       = true;
+    slots[i].expired      = false;
+    slots[i].recurring    = recurring;
+    slots[i].is_absolute  = true;
+    slots[i].handle       = h;
+    slots[i].period_ns    = 0;
+    slots[i].period_ticks = 0;
+    slots[i].deadline     = deadline;
+    slots[i].target_gnss_ns = target_gnss_ns;
+    slots[i].callback     = callback;
+    slots[i].user_data    = user_data;
+    slots[i].name         = name;
+    slots[i].fire_gnss_ns = -1;
+    slots[i].isr_callback = false;
+    slots[i].recurring_rearmed_count = 0;
+    slots[i].recurring_immediate_expire_count = 0;
+    slots[i].recurring_catchup_count = 0;
+    slots[i].arm_vclock_raw = deadline;
+    slots[i].arm_delta_ticks = 0;
+    slots[i].first_expire_now = 0;
+    slots[i].first_expire_recorded = false;
+
+    slots[i].predicted_dwt = predict_dwt_at_deadline(
+      deadline, slots[i].prediction_valid);
+
+    diag_schedule_next_calls_from_other++;
+    schedule_next();
+    update_slot_high_water();
+    interrupts();
+    return h;
+  }
+
+  diag_arm_failures++;
+  interrupts();
+  return TIMEPOP_INVALID_HANDLE;
 }
 
 // ============================================================================
@@ -720,8 +802,11 @@ timepop_handle_t timepop_arm_from_anchor(
 }
 
 // ============================================================================
-// Arm — caller-owned exact target path
+// Arm — caller-owned exact target path (deterministic, no ambient "now")
 // ============================================================================
+//
+// The caller provides both the GNSS nanosecond target and the DWT prediction.
+// The VCLOCK deadline is computed from the time anchor — no ambient read.
 
 timepop_handle_t timepop_arm_ns(
   int64_t             target_gnss_ns,
@@ -734,17 +819,12 @@ timepop_handle_t timepop_arm_ns(
   if (!callback) return TIMEPOP_INVALID_HANDLE;
   if (target_gnss_ns <= 0) return TIMEPOP_INVALID_HANDLE;
 
-  int64_t now_gnss_ns = time_gnss_ns_now();
-  if (now_gnss_ns < 0) return TIMEPOP_INVALID_HANDLE;
+  const time_anchor_snapshot_t snap = time_anchor_snapshot();
 
-  int64_t delay_gnss_ns = target_gnss_ns - now_gnss_ns;
-  if (delay_gnss_ns <= 0) return TIMEPOP_INVALID_HANDLE;
-
-  uint32_t delay_ticks = ns_to_ticks((uint64_t)delay_gnss_ns);
-  if (delay_ticks < MIN_DELAY_TICKS) delay_ticks = MIN_DELAY_TICKS;
-
-  const uint32_t now = vclock_count();
-  const uint32_t vclock_deadline = now + delay_ticks;
+  uint32_t deadline = 0;
+  if (!gnss_ns_to_vclock_deadline(target_gnss_ns, snap, deadline)) {
+    return TIMEPOP_INVALID_HANDLE;
+  }
 
   noInterrupts();
 
@@ -768,7 +848,7 @@ timepop_handle_t timepop_arm_ns(
     slots[i].handle         = h;
     slots[i].period_ns      = 0;
     slots[i].period_ticks   = 0;
-    slots[i].deadline       = vclock_deadline;
+    slots[i].deadline       = deadline;
     slots[i].target_gnss_ns = target_gnss_ns;
     slots[i].callback       = callback;
     slots[i].user_data      = user_data;
@@ -778,8 +858,8 @@ timepop_handle_t timepop_arm_ns(
     slots[i].recurring_rearmed_count = 0;
     slots[i].recurring_immediate_expire_count = 0;
     slots[i].recurring_catchup_count = 0;
-    slots[i].arm_vclock_raw = now;
-    slots[i].arm_delta_ticks = delay_ticks;
+    slots[i].arm_vclock_raw = deadline;
+    slots[i].arm_delta_ticks = 0;
     slots[i].first_expire_now = 0;
     slots[i].first_expire_recorded = false;
 
@@ -900,13 +980,19 @@ void timepop_dispatch(void) {
     // ── Recurring rearm ──
     if (slots[i].recurring) {
       if (slots[i].is_absolute) {
+        // Absolute timers are one-shot by nature — the caller reschedules
+        // from the just-consummated event with fresh anchor arithmetic.
         slots[i].active = false;
       } else if (slots[i].period_ticks == 0) {
         slots[i].active = false;
       } else {
+        // Relative recurring: advance deadline by one period.
         slots[i].deadline += slots[i].period_ticks;
         slots[i].recurring_rearmed_count++;
 
+        // Catch-up: if we fell behind, skip forward.
+        // This is the only place in dispatch that reads ambient time,
+        // and it's legitimate — we need to know if we're behind.
         uint32_t now = vclock_count();
         if (deadline_expired(slots[i].deadline, now)) {
           slots[i].recurring_immediate_expire_count++;
