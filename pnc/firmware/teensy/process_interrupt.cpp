@@ -508,10 +508,10 @@ static void prespin_register_callback(timepop_ctx_t*,
 
   // Arm the shared spin loop.  Named singleton replacement ensures
   // only one fires per dispatch pass, after all registers complete.
-  //timepop_arm(0, false, prespin_spin_callback, nullptr, "PRESPIN_SPIN");
+  timepop_arm_alap(interrupt_prespin_service, nullptr, "PRESPIN_SPIN");
 }
 
-void interrupt_prespin_service(void) {
+void interrupt_prespin_service(timepop_ctx_t*, timepop_diag_t*, void*) {
   if (g_prespin_responsibility_count <= 0) return;
   if (g_prespin_spinning) return;
 
@@ -835,8 +835,7 @@ static void handle_event(interrupt_subscriber_runtime_t& rt,
   rt.event_count++;
 
   // Deferred dispatch handles subscriber delivery AND prespin scheduling.
-  timepop_arm(0, false, deferred_dispatch_callback, &rt,
-              dispatch_timer_name(rt.desc->kind));
+  timepop_arm_asap(deferred_dispatch_callback, &rt, dispatch_timer_name(rt.desc->kind));
 }
 
 // ============================================================================

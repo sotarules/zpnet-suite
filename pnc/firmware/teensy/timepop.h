@@ -23,14 +23,26 @@
 //      Use this when the caller only cares about "fire after this delay."
 //      Typical examples: serial RX/TX pacing, generic housekeeping timers.
 //
-//   2. Absolute GNSS scheduling
+//   2. Scheduled-context ASAP dispatch
+//        timepop_arm_asap(...)
+//
+//      Use this when the caller wants to escape into scheduled context at the
+//      front of the next dispatch pass. This is not a timed timer.
+//
+//   3. Scheduled-context ALAP dispatch
+//        timepop_arm_alap(...)
+//
+//      Use this when the caller wants to escape into scheduled context at the
+//      tail of the current/next dispatch pass. This is not a timed timer.
+//
+//   4. Absolute GNSS scheduling
 //        timepop_arm_at(target_gnss_ns, ...)
 //
 //      Use this when the caller already knows the exact GNSS nanosecond
 //      boundary it wants. This avoids "whenever I happened to ask" timing
 //      leakage in the caller.
 //
-//   3. Anchor-relative GNSS scheduling
+//   5. Anchor-relative GNSS scheduling
 //        timepop_arm_from_anchor(anchor_gnss_ns, offset_gnss_ns, ...)
 //
 //      Use this when the caller has a sacred recurrence anchor and wants the
@@ -38,17 +50,17 @@
 //      than from dispatch-time "now". This is the correct path for recurring
 //      phase-locked work such as PPS pre-spin.
 //
-//   4. Caller-owned exact target scheduling
+//   6. Caller-owned exact target scheduling
 //        timepop_arm_ns(target_gnss_ns, target_dwt, ...)
 //
 //      Use this when the caller owns both the GNSS target and the DWT target
 //      and wants the full nano-precise path, optionally with ISR callback.
 //
 // TimePop owns:
-//   • slot scheduling
+//   • timed slot scheduling
+//   • deferred ASAP/ALAP scheduled-context dispatch
 //   • next-deadline selection
 //   • CH2 compare arming
-//   • deferred scheduled-context callback dispatch
 //   • timer diagnostics
 //
 // TimePop does not own:
@@ -104,7 +116,7 @@ typedef struct timepop_ctx_t {
 // ============================================================================
 //
 // Populated for timed callbacks and ISR callbacks.
-// Null for ASAP scheduled-context dispatch.
+// Null for ASAP/ALAP scheduled-context dispatch.
 //
 // This block is diagnostic only. It is not the authoritative timer result.
 // The authoritative result is timepop_ctx_t.
@@ -153,9 +165,6 @@ typedef void (*timepop_callback_t)(
 // delay_gnss_ns:
 //   Delay in GNSS nanoseconds from "now".
 //
-//   delay_gnss_ns == 0 means ASAP scheduled-context dispatch.
-//   ASAP does not enter the timed ISR path.
-//
 // recurring:
 //   If true, the timer rearms automatically using the same relative period.
 //
@@ -166,6 +175,42 @@ typedef void (*timepop_callback_t)(
 timepop_handle_t timepop_arm(
   uint64_t            delay_gnss_ns,
   bool                recurring,
+  timepop_callback_t  callback,
+  void*               user_data,
+  const char*         name
+);
+
+
+// ============================================================================
+// Scheduled-context ASAP dispatch
+// ============================================================================
+//
+// Arms a one-shot scheduled-context callback at the front of the next dispatch
+// pass. This is not a timed timer and does not enter the timed ISR path.
+//
+// Returns TIMEPOP_INVALID_HANDLE on failure.
+//
+// ============================================================================
+
+timepop_handle_t timepop_arm_asap(
+  timepop_callback_t  callback,
+  void*               user_data,
+  const char*         name
+);
+
+// ============================================================================
+// Scheduled-context ALAP dispatch
+// ============================================================================
+//
+// Arms a one-shot scheduled-context callback at the tail of the current/next
+// dispatch pass. This is not a timed timer and does not enter the timed ISR
+// path.
+//
+// Returns TIMEPOP_INVALID_HANDLE on failure.
+//
+// ============================================================================
+
+timepop_handle_t timepop_arm_alap(
   timepop_callback_t  callback,
   void*               user_data,
   const char*         name

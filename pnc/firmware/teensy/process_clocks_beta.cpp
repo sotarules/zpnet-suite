@@ -299,7 +299,9 @@ void clocks_watchdog_anomaly(const char* reason,
 
   watchdog_anomaly_active = true;
 
-  timepop_handle_t h = timepop_arm(0, false, clocks_watchdog_anomaly_callback, nullptr, "clocks-anomaly");
+  timepop_handle_t h =
+      timepop_arm_asap(clocks_watchdog_anomaly_callback, nullptr, "clocks-anomaly");
+
   if (h == TIMEPOP_INVALID_HANDLE) {
     watchdog_anomaly_publish_pending = false;
     clocks_force_stop_campaign();

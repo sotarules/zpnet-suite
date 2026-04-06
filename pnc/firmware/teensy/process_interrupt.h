@@ -40,10 +40,12 @@
 
 #pragma once
 
+#include "timepop.h"
+
 #include <stdint.h>
 #include <stdbool.h>
 
-void interrupt_prespin_service(void);
+void interrupt_prespin_service(timepop_ctx_t*, timepop_diag_t*, void*);
 
 // ============================================================================
 // Subscriber identities (logical clients)
