@@ -140,10 +140,10 @@ void clocks_zero_all(void) {
 
   campaign_seconds = 0;
 
-  dwt_cycles_64  = 0;
-  gnss_raw_64    = 0;
-  ocxo1_ticks_64 = 0;
-  ocxo2_ticks_64 = 0;
+  dwt_cycle_count_total = 0;
+  gnss_raw_64           = 0;
+  ocxo1_ticks_64        = 0;
+  ocxo2_ticks_64        = 0;
 
   residual_reset(residual_dwt);
   residual_reset(residual_ocxo1);
@@ -406,10 +406,10 @@ void clocks_beta_pps(void) {
     request_zero = false;
     zero_handshake_in_flight = false;
 
-    dwt_cycles_64  = dwt_ns_to_cycles(recover_dwt_ns);
-    gnss_raw_64    = recover_gnss_ns / 100ull;
-    ocxo1_ticks_64 = recover_ocxo1_ns / 100ull;
-    ocxo2_ticks_64 = recover_ocxo2_ns / 100ull;
+    dwt_cycle_count_total = dwt_ns_to_cycles(recover_dwt_ns);
+    gnss_raw_64           = recover_gnss_ns / 100ull;
+    ocxo1_ticks_64        = recover_ocxo1_ns / 100ull;
+    ocxo2_ticks_64        = recover_ocxo2_ns / 100ull;
 
     campaign_seconds = recover_gnss_ns / 1000000000ull;
 
@@ -435,10 +435,10 @@ void clocks_beta_pps(void) {
   campaign_seconds++;
 
   // Campaign accumulators — all derived from ISR-captured facts.
-  dwt_cycles_64  = (uint64_t)g_dwt_cycle_count_at_pps;
-  gnss_raw_64    = g_gnss_ns_count_at_pps / 100ull;
-  ocxo1_ticks_64 = g_ocxo1_clock.ns_count_at_pps / 100ull;
-  ocxo2_ticks_64 = g_ocxo2_clock.ns_count_at_pps / 100ull;
+  dwt_cycle_count_total = g_dwt_cycle_count_total;
+  gnss_raw_64           = g_gnss_ns_count_at_pps / 100ull;
+  ocxo1_ticks_64        = g_ocxo1_clock.ns_count_at_pps / 100ull;
+  ocxo2_ticks_64        = g_ocxo2_clock.ns_count_at_pps / 100ull;
 
   residual_update_sample(
       residual_dwt,
@@ -461,24 +461,22 @@ void clocks_beta_pps(void) {
   p.add("campaign", campaign_name);
 
   p.add("gnss_ns",  g_gnss_ns_count_at_pps);
-  p.add("dwt_ns",   dwt_cycles_to_ns((uint64_t)g_dwt_cycle_count_at_pps));
   p.add("ocxo1_ns", g_ocxo1_clock.ns_count_at_pps);
   p.add("ocxo2_ns", g_ocxo2_clock.ns_count_at_pps);
 
   p.add("teensy_pps_count", campaign_seconds);
 
   p.add("dwt_cycle_count_at_pps", g_dwt_cycle_count_at_pps);
+  p.add("dwt_cycle_count_total", g_dwt_cycle_count_total);
   p.add("dwt_cycle_count_next_second_prediction", g_dwt_cycle_count_next_second_prediction);
   p.add("dwt_cycle_count_next_second_adjustment", g_dwt_cycle_count_next_second_adjustment);
 
   p.add("ocxo1_gnss_ns_at_edge", g_ocxo1_clock.gnss_ns_at_edge);
   p.add("ocxo1_ns_count_at_edge", g_ocxo1_clock.ns_count_at_edge);
-  p.add("ocxo1_ns_count_next_second_prediction", g_ocxo1_clock.ns_count_next_second_prediction);
   p.add("ocxo1_ns_count_at_pps", g_ocxo1_clock.ns_count_at_pps);
 
   p.add("ocxo2_gnss_ns_at_edge", g_ocxo2_clock.gnss_ns_at_edge);
   p.add("ocxo2_ns_count_at_edge", g_ocxo2_clock.ns_count_at_edge);
-  p.add("ocxo2_ns_count_next_second_prediction", g_ocxo2_clock.ns_count_next_second_prediction);
   p.add("ocxo2_ns_count_at_pps", g_ocxo2_clock.ns_count_at_pps);
 
   p.add("ocxo1_second_residual_ns", g_ocxo1_measurement.second_residual_ns);
@@ -599,6 +597,7 @@ static Payload cmd_report(const Payload&) {
   p.add("gnss_ns_count_at_pps", g_gnss_ns_count_at_pps);
 
   p.add("dwt_cycle_count_at_pps", g_dwt_cycle_count_at_pps);
+  p.add("dwt_cycle_count_total", g_dwt_cycle_count_total);
   p.add("dwt_cycle_count_next_second_prediction", g_dwt_cycle_count_next_second_prediction);
   p.add("dwt_cycle_count_next_second_adjustment", g_dwt_cycle_count_next_second_adjustment);
   p.add("dwt_model_pps_count", g_dwt_model_pps_count);
@@ -607,12 +606,10 @@ static Payload cmd_report(const Payload&) {
 
   p.add("ocxo1_gnss_ns_at_edge", g_ocxo1_clock.gnss_ns_at_edge);
   p.add("ocxo1_ns_count_at_edge", g_ocxo1_clock.ns_count_at_edge);
-  p.add("ocxo1_ns_count_next_second_prediction", g_ocxo1_clock.ns_count_next_second_prediction);
   p.add("ocxo1_ns_count_at_pps", g_ocxo1_clock.ns_count_at_pps);
 
   p.add("ocxo2_gnss_ns_at_edge", g_ocxo2_clock.gnss_ns_at_edge);
   p.add("ocxo2_ns_count_at_edge", g_ocxo2_clock.ns_count_at_edge);
-  p.add("ocxo2_ns_count_next_second_prediction", g_ocxo2_clock.ns_count_next_second_prediction);
   p.add("ocxo2_ns_count_at_pps", g_ocxo2_clock.ns_count_at_pps);
 
   p.add("ocxo1_second_residual_ns", g_ocxo1_measurement.second_residual_ns);

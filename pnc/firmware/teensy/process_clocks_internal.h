@@ -12,7 +12,6 @@
 //   • OCXO1 / OCXO2 are modeled by:
 //       - last observed edge in GNSS ns
 //       - last observed local nanosecond count at that edge
-//       - predicted local nanoseconds per GNSS second
 //   • PPS computes the canonical at-PPS values that feed TIMEBASE and now().
 //   • Diagnostics belong in process_interrupt and reports, not in sacred state.
 //
@@ -75,6 +74,7 @@ static inline uint64_t dwt_ns_to_cycles(uint64_t ns) {
 extern volatile uint64_t g_gnss_ns_count_at_pps;
 
 extern volatile uint32_t g_dwt_cycle_count_at_pps;
+extern volatile uint64_t g_dwt_cycle_count_total;
 extern volatile uint32_t g_dwt_cycle_count_next_second_prediction;
 extern volatile int32_t  g_dwt_cycle_count_next_second_adjustment;
 extern volatile uint64_t g_dwt_model_pps_count;
@@ -90,7 +90,6 @@ extern volatile uint32_t g_qtimer_at_pps;
 struct ocxo_clock_state_t {
   volatile uint64_t gnss_ns_at_edge;
   volatile uint64_t ns_count_at_edge;
-  volatile uint64_t ns_count_next_second_prediction;
   volatile uint64_t ns_count_at_pps;
 };
 
@@ -288,7 +287,7 @@ double dac_welford_stderr(const dac_welford_t& w);
 // Campaign-scoped accumulators
 // ============================================================================
 
-extern uint64_t dwt_cycles_64;
+extern uint64_t dwt_cycle_count_total;
 extern uint64_t gnss_raw_64;
 extern uint64_t ocxo1_ticks_64;
 extern uint64_t ocxo2_ticks_64;

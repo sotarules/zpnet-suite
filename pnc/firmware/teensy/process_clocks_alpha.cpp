@@ -56,6 +56,7 @@ static constexpr uint64_t NS_PER_SECOND_U64   = 1000000000ULL;
 volatile uint64_t g_gnss_ns_count_at_pps = 0;
 
 volatile uint32_t g_dwt_cycle_count_at_pps = 0;
+volatile uint64_t g_dwt_cycle_count_total = 0;
 volatile uint32_t g_dwt_cycle_count_next_second_prediction = DWT_EXPECTED_PER_PPS;
 volatile int32_t  g_dwt_cycle_count_next_second_adjustment = 0;
 volatile uint64_t g_dwt_model_pps_count = 0;
@@ -160,10 +161,10 @@ void ocxo_dac_set(ocxo_dac_state_t& s, double value) {
 // Campaign accumulators
 // ============================================================================
 
-uint64_t dwt_cycles_64  = 0;
-uint64_t gnss_raw_64    = 0;
-uint64_t ocxo1_ticks_64 = 0;
-uint64_t ocxo2_ticks_64 = 0;
+uint64_t dwt_cycle_count_total = 0;
+uint64_t gnss_raw_64           = 0;
+uint64_t ocxo1_ticks_64        = 0;
+uint64_t ocxo2_ticks_64        = 0;
 
 // ============================================================================
 // Relay state
@@ -225,6 +226,7 @@ static void alpha_reset_canonical_clock_state_for_new_epoch(void) {
   g_gnss_ns_count_at_pps = 0;
 
   g_dwt_cycle_count_at_pps = 0;
+  g_dwt_cycle_count_total = 0;
   g_dwt_cycle_count_next_second_prediction = DWT_EXPECTED_PER_PPS;
   g_dwt_cycle_count_next_second_adjustment = 0;
   g_dwt_model_pps_count = 0;
@@ -240,10 +242,10 @@ static void alpha_reset_canonical_clock_state_for_new_epoch(void) {
   g_ocxo1_interrupt_diag = {};
   g_ocxo2_interrupt_diag = {};
 
-  dwt_cycles_64  = 0;
-  gnss_raw_64    = 0;
-  ocxo1_ticks_64 = 0;
-  ocxo2_ticks_64 = 0;
+  dwt_cycle_count_total = 0;
+  gnss_raw_64           = 0;
+  ocxo1_ticks_64        = 0;
+  ocxo2_ticks_64        = 0;
 }
 
 static void alpha_install_new_epoch_from_pps(const interrupt_event_t& pps_event) {
@@ -263,17 +265,16 @@ static void alpha_install_new_epoch_from_pps(const interrupt_event_t& pps_event)
   // Canonical PPS-origin values are zero at the epoch edge.
   g_gnss_ns_count_at_pps = 0;
   g_dwt_cycle_count_at_pps = pps_event.dwt_at_event;
+  g_dwt_cycle_count_total = 0;
   g_dwt_model_pps_count = 0;
   g_qtimer_at_pps = g_epoch_qtimer_at_pps;
 
   g_ocxo1_clock.gnss_ns_at_edge = 0;
   g_ocxo1_clock.ns_count_at_edge = 0;
-  g_ocxo1_clock.ns_count_next_second_prediction = NS_PER_SECOND_U64;
   g_ocxo1_clock.ns_count_at_pps = 0;
 
   g_ocxo2_clock.gnss_ns_at_edge = 0;
   g_ocxo2_clock.ns_count_at_edge = 0;
-  g_ocxo2_clock.ns_count_next_second_prediction = NS_PER_SECOND_U64;
   g_ocxo2_clock.ns_count_at_pps = 0;
 
   // Restart the universal local time epoch at this lawful PPS edge.
@@ -365,9 +366,13 @@ static void pps_callback(
   // ticks elapse between consecutive PPS edges by definition.
   g_qtimer_at_pps += TICKS_10MHZ_PER_SECOND;
 
-  if (g_dwt_model_pps_count > 0) {
-    const uint32_t actual_delta = event.dwt_at_event - prev_dwt_pps;
-    g_dwt_cycle_count_next_second_prediction = actual_delta;
+  {
+    const uint32_t delta32 = event.dwt_at_event - prev_dwt_pps;
+    g_dwt_cycle_count_total += (uint64_t)delta32;
+
+    if (g_dwt_model_pps_count > 0) {
+      g_dwt_cycle_count_next_second_prediction = delta32;
+    }
   }
 
   prev_dwt_pps = event.dwt_at_event;
@@ -438,10 +443,8 @@ static void ocxo1_callback(
         (int64_t)g_ocxo1_clock.gnss_ns_at_edge -
         (int64_t)g_ocxo1_measurement.prev_gnss_ns_at_edge;
 
-    g_ocxo1_clock.ns_count_next_second_prediction = (uint64_t)period_ns;
     g_ocxo1_measurement.second_residual_ns = period_ns - 1000000000LL;
   } else {
-    g_ocxo1_clock.ns_count_next_second_prediction = 1000000000ULL;
     g_ocxo1_measurement.second_residual_ns = 0;
   }
 
@@ -463,10 +466,8 @@ static void ocxo2_callback(
         (int64_t)g_ocxo2_clock.gnss_ns_at_edge -
         (int64_t)g_ocxo2_measurement.prev_gnss_ns_at_edge;
 
-    g_ocxo2_clock.ns_count_next_second_prediction = (uint64_t)period_ns;
     g_ocxo2_measurement.second_residual_ns = period_ns - 1000000000LL;
   } else {
-    g_ocxo2_clock.ns_count_next_second_prediction = 1000000000ULL;
     g_ocxo2_measurement.second_residual_ns = 0;
   }
 
