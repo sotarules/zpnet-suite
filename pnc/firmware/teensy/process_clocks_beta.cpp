@@ -157,18 +157,21 @@ void clocks_zero_all(void) {
 // Servo logic
 // ============================================================================
 
-static void ocxo_servo_mean(ocxo_dac_state_t& dac, pps_residual_t& res) {
-  if (res.n < SERVO_MIN_SAMPLES) return;
+static void ocxo_servo_mean(ocxo_dac_state_t& dac, pps_residual_t& per_second_residuals) {
+  if (per_second_residuals.n < SERVO_MIN_SAMPLES) return;
 
   dac.servo_settle_count++;
   if (dac.servo_settle_count < SERVO_SETTLE_SECONDS) return;
 
-  double mean_residual = res.mean;
-  dac.servo_last_residual = mean_residual;
+  const double mean_residual_ns = per_second_residuals.mean;
+  dac.servo_last_residual = mean_residual_ns;
 
-  if (fabs(mean_residual) < 0.01) return;
+  if (fabs(mean_residual_ns) < 0.01) return;
 
-  double step = -mean_residual * 0.1;
+  // Per-second residuals are now in full nanoseconds, so use a much gentler
+  // control law than the legacy surrogate signal. The sign here is chosen so
+  // that negative residuals move DAC downward rather than rail upward.
+  double step = mean_residual_ns * 0.01;
   if (step >  (double)SERVO_MAX_STEP) step =  (double)SERVO_MAX_STEP;
   if (step < -(double)SERVO_MAX_STEP) step = -(double)SERVO_MAX_STEP;
 
@@ -178,7 +181,7 @@ static void ocxo_servo_mean(ocxo_dac_state_t& dac, pps_residual_t& res) {
   dac.servo_adjustments++;
   dac.servo_settle_count = 0;
 
-  residual_reset(res);
+  residual_reset(per_second_residuals);
 }
 
 static void ocxo_servo_total(ocxo_dac_state_t& dac, uint64_t ocxo_ns, uint64_t gnss_ns) {
@@ -205,19 +208,22 @@ static void ocxo_servo_total(ocxo_dac_state_t& dac, uint64_t ocxo_ns, uint64_t g
   dac.servo_settle_count = 0;
 }
 
-static constexpr double NOW_NS_PER_DAC_LSB = 10.0;
+static constexpr double NOW_NS_PER_DAC_LSB = 100.0;
 static constexpr double NOW_MIN_RESIDUAL_NS = 5.0;
 
-static void ocxo_servo_now(ocxo_dac_state_t& dac, int64_t residual_ns) {
+static void ocxo_servo_now(ocxo_dac_state_t& dac, int64_t per_second_residual_ns) {
   if (campaign_seconds < SERVO_MIN_SAMPLES) return;
-  if (residual_ns == 0) return;
+  if (per_second_residual_ns == 0) return;
 
-  double residual = (double)residual_ns;
-  dac.servo_last_residual = residual;
+  const double residual_ns = (double)per_second_residual_ns;
+  dac.servo_last_residual = residual_ns;
 
-  if (fabs(residual) < NOW_MIN_RESIDUAL_NS) return;
+  if (fabs(residual_ns) < NOW_MIN_RESIDUAL_NS) return;
 
-  double step = -residual / NOW_NS_PER_DAC_LSB;
+  // Per-second OCXO residual is authoritative. Use conservative gain for the
+  // first hardware pass and choose polarity so negative residuals do not drive
+  // DAC monotonically upward.
+  double step = residual_ns / NOW_NS_PER_DAC_LSB;
   if (step >  (double)SERVO_MAX_STEP) step =  (double)SERVO_MAX_STEP;
   if (step < -(double)SERVO_MAX_STEP) step = -(double)SERVO_MAX_STEP;
 
@@ -230,6 +236,10 @@ static void ocxo_servo_now(ocxo_dac_state_t& dac, int64_t residual_ns) {
 static void ocxo_calibration_servo(void) {
   if (calibrate_ocxo_mode == servo_mode_t::OFF) return;
 
+  // Servo mode semantics:
+  //   MEAN  = Welford mean of the per-second OCXO residual stream
+  //   NOW   = immediate per-second OCXO residual
+  //   TOTAL = cumulative OCXO-vs-GNSS divergence at PPS
   if (calibrate_ocxo_mode == servo_mode_t::MEAN) {
     ocxo_servo_mean(ocxo1_dac, residual_ocxo1);
     ocxo_servo_mean(ocxo2_dac, residual_ocxo2);
@@ -435,11 +445,11 @@ void clocks_beta_pps(void) {
       (int64_t)dwt_effective_cycles_per_second() - (int64_t)DWT_EXPECTED_PER_PPS);
 
   if (g_ocxo1_measurement.prev_gnss_ns_at_edge != 0) {
-    residual_update_sample(residual_ocxo1, g_ocxo1_measurement.second_residual_ns / 100);
+    residual_update_sample(residual_ocxo1, g_ocxo1_measurement.second_residual_ns);
   }
 
   if (g_ocxo2_measurement.prev_gnss_ns_at_edge != 0) {
-    residual_update_sample(residual_ocxo2, g_ocxo2_measurement.second_residual_ns / 100);
+    residual_update_sample(residual_ocxo2, g_ocxo2_measurement.second_residual_ns);
   }
 
   ocxo_calibration_servo();
