@@ -403,6 +403,13 @@ static void pps_callback(
     clocks_beta_pps();
   }
 
+  // If beta just initiated a zero handshake, request alpha epoch reset.
+  // This must be checked AFTER clocks_beta_pps() so beta has had a chance
+  // to call interrupt_request_pps_zero() on this turn.
+  if (request_zero && !g_epoch_pending) {
+    alpha_request_epoch_zero(clocks_epoch_reason_t::ZERO);
+  }
+
   digitalWriteFast(GNSS_PPS_RELAY, HIGH);
 
   if (!relay_timer_active) {
