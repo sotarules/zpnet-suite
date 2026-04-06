@@ -16,6 +16,22 @@
 //   • PPS computes the canonical at-PPS values that feed TIMEBASE and now().
 //   • Diagnostics belong in process_interrupt and reports, not in sacred state.
 //
+// Time source discipline — gears, not rubber bands:
+//
+//   All time values in the clocks subsystem are derived from ISR-captured
+//   facts (DWT at event, GNSS ns at event, counter32 at event) or from
+//   pure arithmetic on those facts.  No live counter reads are used for
+//   canonical state or scheduling.
+//
+//   The sole exception is the DWT adjustment timer, which reads DWT_CYCCNT
+//   directly at 10 kHz to calibrate the DWT rate prediction mid-second.
+//   This is a legitimate real-time feedback loop operating on the DWT
+//   bridge substrate, not a canonical time source.
+//
+//   The QTimer value for time_pps_update() is computed as:
+//     qtimer_at_pps += TICKS_10MHZ_PER_SECOND
+//   Pure arithmetic from the epoch anchor.  No live QTimer read.
+//
 // ============================================================================
 
 #pragma once
@@ -62,6 +78,10 @@ extern volatile uint32_t g_dwt_cycle_count_at_pps;
 extern volatile uint32_t g_dwt_cycle_count_next_second_prediction;
 extern volatile int32_t  g_dwt_cycle_count_next_second_adjustment;
 extern volatile uint64_t g_dwt_model_pps_count;
+
+// Geared QTimer tracking — advanced by TICKS_10MHZ_PER_SECOND each PPS,
+// never read from hardware after epoch installation.
+extern volatile uint32_t g_qtimer_at_pps;
 
 // ============================================================================
 // OCXO canonical state (alpha-owned, beta-readable)
@@ -265,22 +285,6 @@ double dac_welford_stddev(const dac_welford_t& w);
 double dac_welford_stderr(const dac_welford_t& w);
 
 // ============================================================================
-// Rolling counters / always-on helpers
-// ============================================================================
-
-extern uint64_t dwt_rolling_64;
-extern uint32_t dwt_rolling_32;
-
-extern uint64_t gnss_rolling_raw_64;
-extern uint32_t gnss_rolling_32;
-
-extern uint64_t ocxo1_rolling_64;
-extern uint32_t ocxo1_rolling_32;
-
-extern uint64_t ocxo2_rolling_64;
-extern uint32_t ocxo2_rolling_32;
-
-// ============================================================================
 // Campaign-scoped accumulators
 // ============================================================================
 
@@ -288,12 +292,6 @@ extern uint64_t dwt_cycles_64;
 extern uint64_t gnss_raw_64;
 extern uint64_t ocxo1_ticks_64;
 extern uint64_t ocxo2_ticks_64;
-
-// ============================================================================
-// QTimer1 read helper (clocks-owned helper for GNSS live reads)
-// ============================================================================
-
-uint32_t qtimer1_read_32(void);
 
 // ============================================================================
 // Simple helpers

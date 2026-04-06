@@ -422,6 +422,7 @@ void clocks_beta_pps(void) {
   // --------------------------------------------------------------------------
   campaign_seconds++;
 
+  // Campaign accumulators — all derived from ISR-captured facts.
   dwt_cycles_64  = (uint64_t)g_dwt_cycle_count_at_pps;
   gnss_raw_64    = g_gnss_ns_count_at_pps / 100ull;
   ocxo1_ticks_64 = g_ocxo1_clock.ns_count_at_pps / 100ull;
@@ -589,6 +590,8 @@ static Payload cmd_report(const Payload&) {
   p.add("dwt_cycle_count_next_second_prediction", g_dwt_cycle_count_next_second_prediction);
   p.add("dwt_cycle_count_next_second_adjustment", g_dwt_cycle_count_next_second_adjustment);
   p.add("dwt_model_pps_count", g_dwt_model_pps_count);
+
+  p.add("qtimer_at_pps", g_qtimer_at_pps);
 
   p.add("ocxo1_gnss_ns_at_edge", g_ocxo1_clock.gnss_ns_at_edge);
   p.add("ocxo1_ns_count_at_edge", g_ocxo1_clock.ns_count_at_edge);

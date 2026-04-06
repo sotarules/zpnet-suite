@@ -1,5 +1,5 @@
 // ============================================================================
-// process_interrupt.cpp — provider authority + integral pre-spin
+// process_interrupt.cpp — provider authority + shared pre-spin
 // ============================================================================
 //
 // process_interrupt is the sole authority for all precision interrupt hardware.
@@ -11,7 +11,7 @@
 //   • All ISR vectors capture ARM_DWT_CYCCNT as their first instruction
 //
 // Owned machinery:
-//   • Pre-spin shadow-write loop (unified across all clocks)
+//   • Shared pre-spin shadow-write loop with responsibility counter
 //   • Event reconstruction (DWT correction, GNSS ns projection)
 //   • Subscriber dispatch with canonical event + diagnostics
 //   • PPS geared drumbeat scheduling from sacred PPS baseline
@@ -21,17 +21,32 @@
 //   • approach_cycles      = total cycles from pre-spin start until interrupt fire
 //   • shadow_to_isr_cycles = cycles from final shadow DWT sample to ISR entry
 //
-// Prespin architecture:
-//   • The prespin volatile state (shadow_dwt, fired, timed_out, start_dwt) lives
-//     directly in prespin_state_t, which is part of the subscriber runtime struct.
-//   • The prespin spin loop operates through hoisted volatile pointers to these
-//     fields, producing identical disassembly to flat global variables.
-//   • The ISR signals the loop by writing the fired flag directly in the runtime.
-//   • No per-clock globals exist.  The runtime struct IS the communication channel.
+// Shared prespin architecture:
+//
+//   One shared shadow DWT serves all clocks.  A responsibility counter tracks
+//   how many clocks are waiting for edges.
+//
+//   Prespin callbacks run in scheduled context (normal TimePop dispatch).
+//   Each callback increments the responsibility counter and arms a named
+//   ASAP timer ("PRESPIN_SPIN").  Named singleton replacement ensures only
+//   one spin callback fires per dispatch pass, regardless of how many clocks
+//   registered.  By the time the spin callback runs, all pending register
+//   callbacks have already incremented the counter.
+//
+//   The spin loop runs in scheduled context from the ASAP callback.
+//   Edge ISRs (priority 0) preempt it, decrement the counter, and
+//   snapshot the shared shadow DWT into the per-clock runtime.
+//
+//   If the spin loop is preempted by non-edge activity (transport, other
+//   timers), the shadow becomes momentarily stale.  This increases
+//   shadow_to_isr_cycles for that event.  The correct TDC offset is the
+//   MINIMUM shadow_to_isr_cycles across many events — outliers caused by
+//   preemption are noise, not signal.
 //
 // ISR vs scheduled context:
 //   • The ISR (priority 0) handles ONLY time-critical work:
-//     - DWT capture and prespin signaling (fired flag)
+//     - DWT capture and responsibility counter decrement
+//     - Prespin snapshot into per-clock runtime
 //     - Event construction (DWT correction, GNSS ns projection)
 //     - GPT OCR3 advancement (must happen before next edge)
 //     - Counter updates (irq_count, dispatch_count, event_count)
@@ -89,12 +104,29 @@ static constexpr uint32_t MAX_INTERRUPT_SUBSCRIBERS = 8;
 static constexpr uint32_t OCXO_COUNTS_PER_SECOND = 10000000;
 
 static constexpr uint64_t NS_PER_SECOND_U64      = 1000000000ULL;
-static constexpr uint64_t PRESPIN_LEAD_NS        = 50000ULL;     // 50 µs
+static constexpr uint64_t PRESPIN_LEAD_NS        = 10000ULL;     // 10 µs
 static constexpr uint32_t PRESPIN_TIMEOUT_CYCLES = 100800;       // ~100 µs @ 1.008 GHz
 
 // These values are intentionally separate. PPS is empirically ~48 cycles.
 // GPT continues to use the profiled fixed-overhead constant.
 static constexpr uint32_t PPS_ISR_FIXED_OVERHEAD_CYCLES = 48;
+
+// ============================================================================
+// Shared prespin state — responsibility counter architecture
+// ============================================================================
+//
+// One shadow DWT serves all clocks.  The spin loop writes it continuously.
+// Edge ISRs (priority 0) preempt the loop, read the shadow, and decrement
+// the responsibility counter.  The loop exits when the counter reaches 0.
+//
+// Prespin register callbacks (scheduled context) increment the counter
+// and arm a named ASAP timer ("PRESPIN_SPIN").  Named singleton replacement
+// ensures only one spin callback fires.  The spin runs from that callback.
+
+static volatile uint32_t g_prespin_shadow_dwt = 0;
+static volatile uint32_t g_prespin_start_dwt = 0;
+static volatile int32_t  g_prespin_responsibility_count = 0;
+static volatile bool     g_prespin_spinning = false;
 
 // ============================================================================
 // Subscriber descriptor + runtime state
@@ -114,22 +146,9 @@ struct interrupt_subscriber_descriptor_t {
 };
 
 struct prespin_state_t {
-  // ── Volatile ISR/prespin communication fields ──
-  //
-  // These are the real-time channel between the prespin spin loop and the ISR.
-  // The spin loop writes shadow_dwt continuously; the ISR sets fired to signal
-  // loop exit.
-  //
-  // These fields live in the runtime struct rather than as flat globals.
-  // The spin loop operates through hoisted volatile pointers to produce
-  // identical disassembly to flat memory stores.
-  volatile uint32_t shadow_dwt = 0;
-  volatile uint32_t start_dwt = 0;
-  volatile bool     fired = false;
-  volatile bool     timed_out = false;
-
-  // active means only one thing:
-  // the pre-spin loop is currently in progress for this clock.
+  // active means this clock has requested prespin service.
+  // Set when the prespin callback increments the responsibility counter.
+  // Cleared when the edge ISR fires and snapshots the result.
   volatile bool active = false;
 
   uint64_t event_target_gnss_ns = 0;
@@ -151,9 +170,8 @@ struct prespin_state_t {
 
   // ISR-snapshot fields.
   //
-  // The ISR reads the volatile fields above and stores the values here
-  // for downstream math, diagnostics, and REPORT.  After the ISR writes
-  // these, the volatile fields may be overwritten by the next prespin cycle.
+  // The edge ISR reads the shared shadow DWT and stores values here
+  // for downstream math, diagnostics, and REPORT.
   uint32_t snap_start_dwt = 0;
   uint32_t snap_shadow_dwt = 0;
   uint32_t snap_dwt_isr_entry_raw = 0;
@@ -289,18 +307,6 @@ static interrupt_subscriber_runtime_t* runtime_for(interrupt_subscriber_kind_t k
     }
   }
   return nullptr;
-}
-
-// ============================================================================
-// Prespin reset
-// ============================================================================
-clear
-
-static inline void prespin_clear(prespin_state_t& ps) {
-  ps.shadow_dwt = 0;
-  ps.start_dwt = 0;
-  ps.fired = false;
-  ps.timed_out = false;
 }
 
 // ============================================================================
@@ -458,22 +464,24 @@ static void pps_drumbeat_bootstrap(interrupt_subscriber_runtime_t& rt);
 static void pps_drumbeat_consume_edge(interrupt_subscriber_runtime_t& rt);
 
 // ============================================================================
-// Unified prespin callback
+// Prespin registration callback — scheduled context
 // ============================================================================
 //
-// One callback for all clocks.  The spin loop operates through hoisted
-// volatile pointers — the compiler resolves the struct offset once outside
-// the loop, and the inner loop becomes flat volatile stores/loads identical
-// in disassembly to flat global variables.
+// This runs from timepop_dispatch() in the main loop.  It does NOT spin.
+// It registers this clock as needing prespin service by incrementing the
+// shared responsibility counter, then arms a named ASAP timer to start
+// the spin loop.
 //
-// The inner loop is sacred:
-//   *shadow = ARM_DWT_CYCCNT;   // one STR to a resolved address
-//   if (*fired) break;          // one LDR + branch
-//   timeout check               // SUB + CMP + branch
+// Named singleton replacement ("PRESPIN_SPIN") ensures that if multiple
+// clocks register in the same dispatch pass, only one spin callback fires.
+// By the time it runs, all registers have completed and the counter
+// reflects the total number of clients waiting.
 
-static void prespin_timepop_callback(timepop_ctx_t*,
-                                     timepop_diag_t*,
-                                     void* user_data) {
+static void prespin_spin_callback(timepop_ctx_t*, timepop_diag_t*, void*);
+
+static void prespin_register_callback(timepop_ctx_t*,
+                                      timepop_diag_t*,
+                                      void* user_data) {
   auto* rt = static_cast<interrupt_subscriber_runtime_t*>(user_data);
   if (!rt || !rt->desc) {
     record_anomaly(g_anomaly_diag.prespin_null_runtime,
@@ -487,41 +495,87 @@ static void prespin_timepop_callback(timepop_ctx_t*,
 
   prespin_state_t& ps = rt->prespin;
   ps.handle = TIMEPOP_INVALID_HANDLE;
-
-  prespin_clear(ps);
   ps.active = true;
   ps.arm_count++;
 
-  // Hoist volatile pointers outside the loop.
-  // The compiler resolves &ps.shadow_dwt and &ps.fired to fixed addresses
-  // (base + offset), then the inner loop operates through these pointers
-  // with identical instruction count to flat global stores/loads.
-  volatile uint32_t* const shadow = &ps.shadow_dwt;
-  volatile bool*     const fired  = &ps.fired;
+  // Clear this clock's snapshot fields for the new cycle.
+  ps.snap_start_dwt = 0;
+  ps.snap_shadow_dwt = 0;
+  ps.snap_dwt_isr_entry_raw = 0;
+  ps.snap_fired = false;
+  ps.snap_timed_out = false;
+
+  // Register for prespin service.
+  g_prespin_responsibility_count++;
+
+  // Arm the shared spin loop.  Named singleton replacement ensures
+  // only one fires per dispatch pass, after all registers complete.
+  timepop_arm(0, false, prespin_spin_callback, nullptr, "PRESPIN_SPIN");
+}
+
+// ============================================================================
+// Prespin spin loop — ASAP callback (scheduled context)
+// ============================================================================
+//
+// This is the sacred spin loop.  It runs in scheduled context, dispatched
+// via a named ASAP timer ("PRESPIN_SPIN") armed by prespin register callbacks.
+//
+// Named singleton replacement ensures only one spin callback fires per
+// dispatch pass, regardless of how many clocks registered.  By the time
+// this runs, all pending register callbacks have already incremented the
+// responsibility counter.
+//
+// Edge ISRs (priority 0) preempt this loop, snapshot the shadow, and
+// decrement the counter.  The loop exits when count reaches 0 or timeout.
+//
+// If preempted by non-edge activity (transport, other timers), the shadow
+// becomes momentarily stale.  This produces an outlier in shadow_to_isr_cycles.
+// The correct TDC offset is the MINIMUM across many events — outliers are
+// noise, not signal.
+
+static void prespin_spin_callback(timepop_ctx_t*, timepop_diag_t*, void*) {
+  if (g_prespin_responsibility_count <= 0) return;
+  if (g_prespin_spinning) return;
+
+  g_prespin_spinning = true;
 
   const uint32_t loop_start_dwt = ARM_DWT_CYCCNT;
-  ps.start_dwt = loop_start_dwt;
+  g_prespin_start_dwt = loop_start_dwt;
+
+  volatile uint32_t* const shadow = &g_prespin_shadow_dwt;
+  volatile int32_t*  const count  = &g_prespin_responsibility_count;
 
   for (;;) {
     *shadow = ARM_DWT_CYCCNT;
 
-    if (*fired) {
-      ps.complete_count++;
-      ps.active = false;
+    if (*count <= 0) {
+      g_prespin_spinning = false;
       return;
     }
 
     if ((ARM_DWT_CYCCNT - loop_start_dwt) > PRESPIN_TIMEOUT_CYCLES) {
-      ps.timed_out = true;
-      ps.timeout_count++;
-      ps.active = false;
-      ps.anomaly_count++;
+      g_prespin_responsibility_count = 0;
+      g_prespin_spinning = false;
 
-      record_anomaly(g_anomaly_diag.prespin_timeout,
-                     rt->desc->kind,
-                     (uint32_t)ps.shadow_dwt,
-                     ps.arm_count,
-                     ps.timeout_count);
+      // Mark all still-waiting clients as timed out.
+      for (uint32_t i = 0; i < g_subscriber_count; i++) {
+        interrupt_subscriber_runtime_t& sub = g_subscribers[i];
+        if (!sub.desc || !sub.desc->uses_prespin) continue;
+        if (!sub.prespin.active) continue;
+
+        sub.prespin.snap_timed_out = true;
+        sub.prespin.snap_start_dwt = loop_start_dwt;
+        sub.prespin.snap_shadow_dwt = g_prespin_shadow_dwt;
+        sub.prespin.timeout_count++;
+        sub.prespin.anomaly_count++;
+        sub.prespin.active = false;
+
+        record_anomaly(g_anomaly_diag.prespin_timeout,
+                       sub.desc->kind,
+                       g_prespin_shadow_dwt,
+                       sub.prespin.arm_count,
+                       sub.prespin.timeout_count);
+      }
       return;
     }
   }
@@ -559,7 +613,7 @@ static void schedule_next_prespin_from_anchor(interrupt_subscriber_runtime_t& rt
       timepop_arm_from_anchor((int64_t)anchor_gnss_ns,
                               (int64_t)(offset_gnss_ns - PRESPIN_LEAD_NS),
                               false,
-                              prespin_timepop_callback,
+                              prespin_register_callback,
                               &rt,
                               prespin_timer_name(rt.desc->kind));
 
@@ -707,8 +761,8 @@ static void deferred_dispatch_callback(timepop_ctx_t*, timepop_diag_t*, void* us
 // ============================================================================
 //
 // This function runs at the highest interrupt priority.  It handles:
-//   • Prespin signaling (fired flag in the runtime struct)
-//   • ISR snapshot of volatile prespin fields
+//   • Responsibility counter decrement
+//   • Prespin snapshot from shared shadow into per-clock runtime
 //   • DWT correction and event construction
 //   • Counter updates
 //   • Deferred dispatch arming (zero-delay ASAP timer)
@@ -721,16 +775,20 @@ static void handle_event(interrupt_subscriber_runtime_t& rt,
                          uint32_t counter32_at_event) {
   prespin_state_t& ps = rt.prespin;
 
-  // Signal the prespin loop to exit.
-  ps.fired = true;
+  // Decrement the shared responsibility counter.
+  // This signals the spin loop that one client has been served.
+  if (ps.active) {
+    g_prespin_responsibility_count--;
+    ps.active = false;
+    ps.complete_count++;
+  }
 
-  // Snapshot the volatile prespin fields for downstream use.
-  // After this, the volatile fields may be overwritten by the next prespin.
-  ps.snap_start_dwt = ps.start_dwt;
-  ps.snap_shadow_dwt = ps.shadow_dwt;
+  // Snapshot the shared prespin state into per-clock fields.
+  ps.snap_start_dwt = g_prespin_start_dwt;
+  ps.snap_shadow_dwt = g_prespin_shadow_dwt;
   ps.snap_dwt_isr_entry_raw = dwt_isr_entry_raw;
   ps.snap_fired = true;
-  ps.snap_timed_out = ps.timed_out;
+  ps.snap_timed_out = false;
 
   uint32_t approach_cycles = 0;
   uint32_t shadow_to_isr_cycles = 0;
@@ -750,7 +808,7 @@ static void handle_event(interrupt_subscriber_runtime_t& rt,
                    ps.complete_count);
   }
 
-  if (!ps.active && ps.snap_start_dwt == 0 && ps.snap_shadow_dwt == 0) {
+  if (!g_prespin_spinning && ps.snap_start_dwt == 0 && ps.snap_shadow_dwt == 0) {
     ps.anomaly_count++;
     record_anomaly(g_anomaly_diag.no_prespin_active,
                    rt.desc->kind,
@@ -902,7 +960,7 @@ bool interrupt_start(interrupt_subscriber_kind_t kind) {
   rt->active = true;
   rt->start_count++;
 
-  prespin_clear(rt->prespin);
+  rt->prespin.active = false;
 
   if (kind == interrupt_subscriber_kind_t::PPS) {
     debug_log("pps.start", "requested");
@@ -944,7 +1002,6 @@ bool interrupt_stop(interrupt_subscriber_kind_t kind) {
   }
 
   rt->prespin.active = false;
-  prespin_clear(rt->prespin);
 
   if (kind == interrupt_subscriber_kind_t::OCXO1) {
     GPT1_IR &= ~GPT_IR_OF3IE;
@@ -1022,6 +1079,11 @@ void process_interrupt_init(void) {
     }
   }
 
+  g_prespin_shadow_dwt = 0;
+  g_prespin_start_dwt = 0;
+  g_prespin_responsibility_count = 0;
+  g_prespin_spinning = false;
+
   g_pps_drumbeat = {};
   g_interrupt_runtime_ready = true;
 }
@@ -1086,6 +1148,9 @@ static Payload cmd_report(const Payload&) {
   p.add("pps_next_index", g_pps_drumbeat.next_index);
   p.add("pps_generation", g_pps_drumbeat.generation);
 
+  p.add("prespin_responsibility_count", g_prespin_responsibility_count);
+  p.add("prespin_spinning", g_prespin_spinning);
+
   p.add("anomaly_prespin_null_runtime", g_anomaly_diag.prespin_null_runtime);
   p.add("anomaly_prespin_arm_failed", g_anomaly_diag.prespin_arm_failed);
   p.add("anomaly_prespin_timeout", g_anomaly_diag.prespin_timeout);
@@ -1120,7 +1185,7 @@ static Payload cmd_report(const Payload&) {
 
     s.add("next_ocr3", rt.next_ocr3);
 
-    // Prespin facts — ISR snapshots, not live volatile fields.
+    // Prespin facts — ISR snapshots.
     s.add("prespin_active", rt.prespin.active);
     s.add("prespin_fired", rt.prespin.snap_fired);
     s.add("prespin_timed_out", rt.prespin.snap_timed_out);

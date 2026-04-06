@@ -1,6 +1,23 @@
 // ============================================================================
 // process_clocks_alpha.cpp — Always-On Physics Layer
 // ============================================================================
+//
+// Time source discipline — gears, not rubber bands:
+//
+//   All canonical time values are derived from ISR-captured facts or from
+//   pure arithmetic on those facts.  No live counter reads are used for
+//   canonical state.
+//
+//   The QTimer value for time_pps_update() is geared:
+//     g_qtimer_at_pps += TICKS_10MHZ_PER_SECOND
+//   The VCLOCK runs on the GNSS 10 MHz input, so this is exact by definition.
+//   The initial QTimer value is captured once at epoch installation — the
+//   sole live QTimer read, a boot-time boundary crossing.
+//
+//   The DWT adjustment timer reads DWT_CYCCNT directly at 10 kHz.  This is
+//   a legitimate real-time feedback loop on the DWT bridge substrate.
+//
+// ============================================================================
 
 #include "process_clocks_internal.h"
 #include "process_clocks.h"
@@ -43,6 +60,11 @@ volatile uint32_t g_dwt_cycle_count_next_second_prediction = DWT_EXPECTED_PER_PP
 volatile int32_t  g_dwt_cycle_count_next_second_adjustment = 0;
 volatile uint64_t g_dwt_model_pps_count = 0;
 
+// Geared QTimer — advanced by TICKS_10MHZ_PER_SECOND each PPS.
+// Initialized once from a live read at epoch installation, then
+// pure arithmetic thereafter.  Never read from hardware again.
+volatile uint32_t g_qtimer_at_pps = 0;
+
 ocxo_clock_state_t g_ocxo1_clock = {};
 ocxo_clock_state_t g_ocxo2_clock = {};
 
@@ -82,8 +104,6 @@ static volatile clocks_epoch_reason_t g_epoch_reason = clocks_epoch_reason_t::NO
 // Raw physical anchors captured at the consummating PPS boundary.
 static volatile uint32_t g_epoch_dwt_at_pps = 0;
 static volatile uint32_t g_epoch_qtimer_at_pps = 0;
-static volatile uint32_t g_epoch_ocxo1_counter_at_epoch = 0;
-static volatile uint32_t g_epoch_ocxo2_counter_at_epoch = 0;
 
 // Canonical PPS count within current epoch (0 at epoch PPS, then 1, 2, 3...).
 static volatile uint64_t g_epoch_pps_index = 0;
@@ -137,22 +157,6 @@ void ocxo_dac_set(ocxo_dac_state_t& s, double value) {
 }
 
 // ============================================================================
-// Rolling counters
-// ============================================================================
-
-uint64_t dwt_rolling_64  = 0;
-uint32_t dwt_rolling_32  = 0;
-
-uint64_t gnss_rolling_raw_64 = 0;
-uint32_t gnss_rolling_32 = 0;
-
-uint64_t ocxo1_rolling_64 = 0;
-uint32_t ocxo1_rolling_32 = 0;
-
-uint64_t ocxo2_rolling_64 = 0;
-uint32_t ocxo2_rolling_32 = 0;
-
-// ============================================================================
 // Campaign accumulators
 // ============================================================================
 
@@ -180,31 +184,22 @@ static inline void dwt_enable(void) {
   DEMCR |= DEMCR_TRCENA;
   DWT_CYCCNT = 0;
   DWT_CTRL |= DWT_CTRL_CYCCNTENA;
-  dwt_rolling_32 = DWT_CYCCNT;
-}
-
-uint64_t clocks_dwt_cycles_now(void) {
-  uint32_t now = DWT_CYCCNT;
-  dwt_rolling_64 += (uint32_t)(now - dwt_rolling_32);
-  dwt_rolling_32 = now;
-  return dwt_rolling_64;
-}
-
-uint64_t clocks_dwt_ns_now(void) {
-  return dwt_cycles_to_ns(clocks_dwt_cycles_now());
 }
 
 // ============================================================================
-// GNSS live reads — TimePop owns QTimer1, clocks just reads it
+// QTimer1 read — boot-time boundary crossing ONLY
 // ============================================================================
 //
-// NOTE:
-// Live reads here remain for non-sacred helper paths / rolling extensions.
-// They must not be used to define a new epoch.
-// Epoch truth is established only from the consummating PPS boundary.
+// This function reads the live QTimer1 cascaded 32-bit counter.
+// It is called ONCE at epoch installation to establish the initial
+// geared QTimer anchor.  After that, g_qtimer_at_pps is advanced
+// by TICKS_10MHZ_PER_SECOND each PPS — pure arithmetic, no read.
 //
+// This is a boundary crossing in the ZPNet Standards sense:
+// the QTimer hardware is an unowned external system at boot time,
+// before the geared model takes over.
 
-uint32_t qtimer1_read_32(void) {
+static uint32_t qtimer1_read_32_once(void) {
   const uint16_t lo1 = IMXRT_TMR1.CH[0].CNTR;
   const uint16_t hi1 = IMXRT_TMR1.CH[1].HOLD;
 
@@ -215,43 +210,6 @@ uint32_t qtimer1_read_32(void) {
     return ((uint32_t)hi2 << 16) | (uint32_t)lo2;
   }
   return ((uint32_t)hi1 << 16) | (uint32_t)lo1;
-}
-
-uint64_t clocks_gnss_ticks_now(void) {
-  uint32_t now = qtimer1_read_32();
-  gnss_rolling_raw_64 += (uint32_t)(now - gnss_rolling_32);
-  gnss_rolling_32 = now;
-  return gnss_rolling_raw_64;
-}
-
-uint64_t clocks_gnss_ns_now(void) {
-  return clocks_gnss_ticks_now() * 100ull;
-}
-
-// ============================================================================
-// OCXO live reads — provider owned by process_interrupt
-// ============================================================================
-
-uint64_t clocks_ocxo1_ticks_now(void) {
-  uint32_t now = interrupt_gpt1_counter_now();
-  ocxo1_rolling_64 += (uint32_t)(now - ocxo1_rolling_32);
-  ocxo1_rolling_32 = now;
-  return ocxo1_rolling_64;
-}
-
-uint64_t clocks_ocxo1_ns_now(void) {
-  return clocks_ocxo1_ticks_now() * 100ull;
-}
-
-uint64_t clocks_ocxo2_ticks_now(void) {
-  uint32_t now = interrupt_gpt2_counter_now();
-  ocxo2_rolling_64 += (uint32_t)(now - ocxo2_rolling_32);
-  ocxo2_rolling_32 = now;
-  return ocxo2_rolling_64;
-}
-
-uint64_t clocks_ocxo2_ns_now(void) {
-  return clocks_ocxo2_ticks_now() * 100ull;
 }
 
 // ============================================================================
@@ -270,6 +228,7 @@ static void alpha_reset_canonical_clock_state_for_new_epoch(void) {
   g_dwt_cycle_count_next_second_prediction = DWT_EXPECTED_PER_PPS;
   g_dwt_cycle_count_next_second_adjustment = 0;
   g_dwt_model_pps_count = 0;
+  g_qtimer_at_pps = 0;
 
   g_ocxo1_clock = {};
   g_ocxo2_clock = {};
@@ -294,12 +253,10 @@ static void alpha_install_new_epoch_from_pps(const interrupt_event_t& pps_event)
   g_epoch_pps_index = 0;
 
   g_epoch_dwt_at_pps = pps_event.dwt_at_event;
-  g_epoch_qtimer_at_pps = qtimer1_read_32();
 
-  // Capture OCXO physical counters in the same narrow PPS-boundary handling
-  // window. These are raw physical anchors, not canonical clock values.
-  g_epoch_ocxo1_counter_at_epoch = interrupt_gpt1_counter_now();
-  g_epoch_ocxo2_counter_at_epoch = interrupt_gpt2_counter_now();
+  // The sole live QTimer read — boot-time boundary crossing.
+  // After this, g_qtimer_at_pps is advanced by pure arithmetic.
+  g_epoch_qtimer_at_pps = qtimer1_read_32_once();
 
   alpha_reset_canonical_clock_state_for_new_epoch();
 
@@ -307,6 +264,7 @@ static void alpha_install_new_epoch_from_pps(const interrupt_event_t& pps_event)
   g_gnss_ns_count_at_pps = 0;
   g_dwt_cycle_count_at_pps = pps_event.dwt_at_event;
   g_dwt_model_pps_count = 0;
+  g_qtimer_at_pps = g_epoch_qtimer_at_pps;
 
   g_ocxo1_clock.gnss_ns_at_edge = 0;
   g_ocxo1_clock.ns_count_at_edge = 0;
@@ -325,6 +283,11 @@ static void alpha_install_new_epoch_from_pps(const interrupt_event_t& pps_event)
 // ============================================================================
 // Helper: derive DWT adjustment at 10 kHz
 // ============================================================================
+//
+// This reads DWT_CYCCNT directly — a legitimate real-time feedback loop
+// on the DWT bridge substrate.  The DWT is not a canonical time source;
+// it is the interpolation substrate between PPS edges, and this timer
+// keeps the interpolation rate prediction accurate mid-second.
 
 static void dwt_adjustment_timer_callback(timepop_ctx_t* ctx, timepop_diag_t*, void*) {
   if (g_gnss_ns_count_at_pps == 0) return;
@@ -397,6 +360,11 @@ static void pps_callback(
   g_gnss_ns_count_at_pps = g_epoch_pps_index * NS_PER_SECOND_U64;
   g_dwt_cycle_count_at_pps = event.dwt_at_event;
 
+  // Geared QTimer — pure arithmetic, no live read.
+  // VCLOCK runs on the GNSS 10 MHz input, so exactly TICKS_10MHZ_PER_SECOND
+  // ticks elapse between consecutive PPS edges by definition.
+  g_qtimer_at_pps += TICKS_10MHZ_PER_SECOND;
+
   if (g_dwt_model_pps_count > 0) {
     const uint32_t actual_delta = event.dwt_at_event - prev_dwt_pps;
     g_dwt_cycle_count_next_second_prediction = actual_delta;
@@ -424,10 +392,11 @@ static void pps_callback(
     g_ocxo2_clock.ns_count_at_pps = 0;
   }
 
+  // Update the universal time anchor — geared QTimer, ISR-captured DWT.
   time_pps_update(
     g_dwt_cycle_count_at_pps,
     dwt_effective_cycles_per_second(),
-    qtimer1_read_32());
+    g_qtimer_at_pps);
 
   if (campaign_state == clocks_campaign_state_t::STARTED ||
       request_start || request_stop || request_recover || request_zero) {
@@ -499,11 +468,6 @@ static void ocxo2_callback(
 
 void process_clocks_init_hardware(void) {
   dwt_enable();
-
-  // Capture current values only for rolling extensions / non-sacred helpers.
-  gnss_rolling_32 = qtimer1_read_32();
-  ocxo1_rolling_32 = interrupt_gpt1_counter_now();
-  ocxo2_rolling_32 = interrupt_gpt2_counter_now();
 }
 
 // ============================================================================
