@@ -426,6 +426,10 @@ static void ocxo1_callback(
   clocks_capture_interrupt_diag(g_ocxo1_interrupt_diag, diag);
 
   // Canonical GNSS epoch is local and zero-based.
+  //
+  // The OCXO nanosecond count at edge is not interrogated from hardware.
+  // It is known by contract because process_interrupt armed OCR3 to fire on
+  // a specific 10 MHz count and supplies that just-matched count here.
   g_ocxo1_clock.gnss_ns_at_edge = event.gnss_ns_at_event;
   g_ocxo1_clock.ns_count_at_edge = (uint64_t)event.counter32_at_event * 100ULL;
 
@@ -451,6 +455,8 @@ static void ocxo2_callback(
 
   clocks_capture_interrupt_diag(g_ocxo2_interrupt_diag, diag);
 
+  // The OCXO nanosecond count at edge is the just-matched OCR3 count supplied
+  // by process_interrupt, expressed in nanoseconds.
   g_ocxo2_clock.gnss_ns_at_edge = event.gnss_ns_at_event;
   g_ocxo2_clock.ns_count_at_edge = (uint64_t)event.counter32_at_event * 100ULL;
 

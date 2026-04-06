@@ -878,11 +878,15 @@ void process_interrupt_gpt1_irq(uint32_t dwt_isr_entry_raw) {
 
   g_gpt1_diag.dispatch_count++;
 
+  // The canonical OCXO count at edge is the match value we armed, not an
+  // interrogated "now" value and not the event ordinal. GPT OCR3 just fired
+  // because the counter reached this value.
+  const uint32_t matched_count = rt->next_ocr3;
+
   rt->next_ocr3 += OCXO_COUNTS_PER_SECOND;
   GPT1_OCR3 = rt->next_ocr3;
 
-  const uint32_t next_count = rt->event_count + 1;
-  handle_event(*rt, dwt_isr_entry_raw, next_count);
+  handle_event(*rt, dwt_isr_entry_raw, matched_count);
 }
 
 // ============================================================================
@@ -906,11 +910,15 @@ void process_interrupt_gpt2_irq(uint32_t dwt_isr_entry_raw) {
 
   g_gpt2_diag.dispatch_count++;
 
+  // The canonical OCXO count at edge is the match value we armed, not an
+  // interrogated "now" value and not the event ordinal. GPT OCR3 just fired
+  // because the counter reached this value.
+  const uint32_t matched_count = rt->next_ocr3;
+
   rt->next_ocr3 += OCXO_COUNTS_PER_SECOND;
   GPT2_OCR3 = rt->next_ocr3;
 
-  const uint32_t next_count = rt->event_count + 1;
-  handle_event(*rt, dwt_isr_entry_raw, next_count);
+  handle_event(*rt, dwt_isr_entry_raw, matched_count);
 }
 
 // ============================================================================
