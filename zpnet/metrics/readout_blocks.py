@@ -128,6 +128,14 @@ def _bool_str(value):
     return "YES" if value else "NO"
 
 
+def _safe_lines(fn):
+    try:
+        return fn()
+    except Exception as e:
+        return [f"ERROR: {e}"]
+
+
+
 # ---------------------------------------------------------------------
 # Fragment-aware field access
 # ---------------------------------------------------------------------
@@ -269,7 +277,7 @@ def clocks_combined_readout() -> list[str]:
 
     if gnss_base is not None and gnss_now is not None:
         gnss_delta = gnss_now - gnss_base
-        gnss_comp = f"{gnss_base:>10.3f}{gnss_now:>10.3f}{gnss_delta:>+10.3f}"
+        gnss_comp = f"{_fmt(gnss_base, '>10.3f', 10)}{_fmt(gnss_now, '>10.3f', 10)}{_fmt(gnss_delta, '>+10.3f', 10)}"
     else:
         gnss_comp = f"{'---':>10}{'---':>10}{'---':>10}"
 
@@ -278,7 +286,7 @@ def clocks_combined_readout() -> list[str]:
         f"{'1.000000000000':>18}"
         f"{'0.000':>10}"
         f"{'---':>14}"
-        f"{gnss_res:>6}"
+        f"{_fmt(gnss_res, '>6d', 6)}"
         f" "
         f"{'---':>8}"
         f"{'---':>8}"
@@ -302,7 +310,7 @@ def clocks_combined_readout() -> list[str]:
 
     if gnss_raw_base is not None and gnss_raw_now is not None:
         gnss_raw_delta = gnss_raw_now - gnss_raw_base
-        gnss_raw_comp = f"{gnss_raw_base:>10.3f}{gnss_raw_now:>10.3f}{gnss_raw_delta:>+10.3f}"
+        gnss_raw_comp = f"{_fmt(gnss_raw_base, '>10.3f', 10)}{_fmt(gnss_raw_now, '>10.3f', 10)}{_fmt(gnss_raw_delta, '>+10.3f', 10)}"
     else:
         gnss_raw_comp = f"{'---':>10}{'---':>10}{'---':>10}"
 
@@ -334,14 +342,14 @@ def clocks_combined_readout() -> list[str]:
 
     if dwt_base is not None and dwt_now is not None:
         dwt_delta = dwt_now - dwt_base
-        dwt_comp = f"{dwt_base:>10.3f}{dwt_now:>10.3f}{dwt_delta:>+10.3f}"
+        dwt_comp = f"{_fmt(dwt_base, '>10.3f', 10)}{_fmt(dwt_now, '>10.3f', 10)}{_fmt(dwt_delta, '>+10.3f', 10)}"
     else:
         dwt_comp = f"{'---':>10}{'---':>10}{'---':>10}"
 
     lines.append(
         f"{'DWT':<6}"
-        f"{dwt_tau:>18.12f}"
-        f"{dwt_ppb:>10.3f}"
+        f"{_fmt(dwt_tau, '>18.12f', 18)}"
+        f"{_fmt(dwt_ppb, '>10.3f', 10)}"
         f"{_comma_int(dwt_raw, 14)}"
         f"{_sign_int(dwt_res, 6)}"
         f" "
@@ -370,33 +378,38 @@ def clocks_combined_readout() -> list[str]:
 
         if base_ppb is not None and now_ppb is not None:
             delta = now_ppb - base_ppb
-            comp = f"{base_ppb:>10.3f}{now_ppb:>10.3f}{delta:>+10.3f}"
+            comp = f"{_fmt(base_ppb, '>10.3f', 10)}{_fmt(now_ppb, '>10.3f', 10)}{_fmt(delta, '>+10.3f', 10)}"
         else:
             comp = f"{'---':>10}{'---':>10}{'---':>10}"
 
-        # v10: read phase fields from fragment
-        dac_hw = _frag(r, f"{key}_dac_hw")
-        adj = _frag(r, f"{key}_servo_adjustments", 0)
-        phase_ns = _frag(r, f"{key}_phase_offset_ns")
-        edge_ns = _frag(r, f"{key}_edge_gnss_ns")
-        residual_ns = _frag(r, f"{key}_residual_ns")
+        # New fragment/report shape: surface DAC, edge time, PPS count, prediction, and per-second residual.
+        dac_now = blk.get("dac", _frag(r, f"{key}_dac"))
+        gnss_ns_at_edge = blk.get("gnss_ns_at_edge", _frag(r, f"{key}_gnss_ns_at_edge"))
+        ns_count_at_edge = blk.get("ns_count_at_edge", _frag(r, f"{key}_ns_count_at_edge"))
+        ns_count_at_pps = blk.get("ns_count_at_pps", _frag(r, f"{key}_ns_count_at_pps"))
+        next_pred = blk.get("ns_count_next_second_prediction", _frag(r, f"{key}_ns_count_next_second_prediction"))
+        residual_ns = blk.get("second_residual_ns", _frag(r, f"{key}_second_residual_ns"))
         extra_parts = []
-        if dac_hw is not None:
-            dac_volts = int(dac_hw) * 3.002 / 65535
-            extra_parts.append(f"DAC={int(dac_hw):>5d} {dac_volts:.5f}V")
-        if phase_ns is not None:
-            extra_parts.append(f"φ={int(phase_ns):>2d}ns")
-        if edge_ns is not None:
-            extra_parts.append(f"EDGE={int(edge_ns)}")
+        if dac_now is not None:
+            dac_now_f = float(dac_now)
+            dac_volts = dac_now_f * 3.002 / 65535.0
+            extra_parts.append(f"DAC={dac_now_f:>9.3f} {dac_volts:.5f}V")
+        if gnss_ns_at_edge is not None:
+            extra_parts.append(f"EDGE={int(gnss_ns_at_edge)}")
+        if ns_count_at_edge is not None:
+            extra_parts.append(f"EDGE_NS={int(ns_count_at_edge)}")
+        if next_pred is not None:
+            extra_parts.append(f"PRED={int(next_pred)}")
         if residual_ns is not None:
             extra_parts.append(f"RES={int(residual_ns):+d}ns")
-        extra_parts.append(f"ADJ={int(adj):>4}")
+        if ns_count_at_pps is not None:
+            extra_parts.append(f"PPS_NS={int(ns_count_at_pps)}")
         extra = "   " + " ".join(extra_parts)
 
         lines.append(
             f"{name:<6}"
-            f"{tau:>18.12f}"
-            f"{ppb:>10.3f}"
+            f"{_fmt(tau, '>18.12f', 18)}"
+            f"{_fmt(ppb, '>10.3f', 10)}"
             f"{_comma_int(raw, 14)}"
             f"{_sign_int(res, 6)}"
             f" "
@@ -439,7 +452,7 @@ def clocks_combined_readout() -> list[str]:
         base_dac = baseline_dac_mean.get(key)
         if base_dac is not None and dac_mean is not None:
             dac_delta = dac_mean - base_dac
-            dac_comp = f"{base_dac:>10.3f}{dac_mean:>10.3f}{dac_delta:>+10.3f}"
+            dac_comp = f"{_fmt(base_dac, '>10.3f', 10)}{_fmt(dac_mean, '>10.3f', 10)}{_fmt(dac_delta, '>+10.3f', 10)}"
         else:
             dac_comp = f"{'---':>10}{'---':>10}{'---':>10}"
 
@@ -450,8 +463,8 @@ def clocks_combined_readout() -> list[str]:
                 f"{'':>10}"
                 f"{'':>14}"
                 f"{'':>6}"
-                f"{dac_mean:>9.3f}"
-                f"{dac_sd:>8.3f}"
+                f"{_fmt(dac_mean, '>9.3f', 9)}"
+                f"{_fmt(dac_sd, '>8.3f', 8)}"
                 f"{dac_n:>6}"
                 f"  "
                 f"{dac_comp}"
@@ -480,51 +493,38 @@ def clocks_combined_readout() -> list[str]:
 
         lines.append(
             f"{'CAL':<6}"
-            f"{'NS_PER_PPS':>14}"
-            f"{'RESIDUAL':>10}"
-            f"{'PHASE_NS':>8}"
+            f"{'SEC_RES':>12}"
+            f"{'PRED_NS':>14}"
+            f"{'EDGE_GNSS':>20}"
             f"  "
-            f"{'DAC_NOW':>8}"
-            f"{'V_NOW':>10}"
-            f"{'STEP':>6}"
-            f"{'DAC_NEW':>8}"
-            f"{'V_NEW':>10}"
-            f"  {'EDGE_GNSS':>20}"
+            f"{'DAC':>10}"
+            f"{'V_OUT':>10}"
+            f"{'PPS_NS':>16}"
         )
 
         for name, key in [("OCXO1", "ocxo1"), ("OCXO2", "ocxo2")]:
-            ns_per_pps = _frag(r, f"{key}_gnss_ns_per_pps")
-            residual = _frag(r, f"{key}_residual_ns")
-            phase_ns = _frag(r, f"{key}_phase_offset_ns")
-            edge_gnss_ns = _frag(r, f"{key}_edge_gnss_ns")
-            dac_before = _frag(r, f"{key}_dac_before")
-            dac_after = _frag(r, f"{key}_dac_after")
+            blk = r.get(key, {})
+            residual = blk.get("second_residual_ns")
+            pred_ns = blk.get("ns_count_next_second_prediction")
+            edge_gnss_ns = blk.get("gnss_ns_at_edge")
+            dac_now = blk.get("dac")
+            pps_ns = blk.get("ns_count_at_pps")
 
-            if ns_per_pps is not None and dac_before is not None and dac_after is not None:
-                ns_per_pps = int(ns_per_pps)
-                residual = int(residual) if residual is not None else 0
-                phase_ns_v = int(phase_ns) if phase_ns is not None else 0
-                edge_gnss_ns = int(edge_gnss_ns) if edge_gnss_ns is not None else 0
-                dac_before = int(dac_before)
-                dac_after = int(dac_after)
-                step = dac_after - dac_before
-                v_before = dac_before * vref / 65535
-                v_after = dac_after * vref / 65535
+            if residual is not None or pred_ns is not None or edge_gnss_ns is not None:
+                dac_now_f = float(dac_now) if dac_now is not None else None
+                v_now = (dac_now_f * vref / 65535.0) if dac_now_f is not None else None
                 lines.append(
                     f"{name:<6}"
-                    f"{ns_per_pps:>14,}"
-                    f"{residual:>+10,}"
-                    f"{phase_ns_v:>8,}"
+                    f"{_sign_int(residual, 12)}"
+                    f"{_comma_int(pred_ns, 14)}"
+                    f"{_comma_int(edge_gnss_ns, 20)}"
                     f"  "
-                    f"{dac_before:>8}"
-                    f"{v_before:>10.5f}"
-                    f"{step:>+6}"
-                    f"{dac_after:>8}"
-                    f"{v_after:>10.5f}"
-                    f"  {edge_gnss_ns:>20,}"
+                    f"{_fmt(dac_now_f, '>10.3f', 10)}"
+                    f"{_fmt(v_now, '>10.5f', 10)}"
+                    f"{_comma_int(pps_ns, 16)}"
                 )
             else:
-                lines.append(f"{name:<6}  --- (waiting for phase capture)")
+                lines.append(f"{name:<6}  --- (waiting for residual stream)")
 
         lines.append("")
 
@@ -540,8 +540,8 @@ def clocks_combined_readout() -> list[str]:
     # ==============================================================
     # DWT — predicted vs actual, with PPS residual
     # ==============================================================
-    dwt_cycles_per_pps = _frag(r, "dwt_cycles_per_pps")
-    dwt_cyccnt_at_pps = _frag(r, "dwt_cyccnt_at_pps")
+    dwt_cycles_per_pps = r.get("dwt", {}).get("next_second_prediction", _frag(r, "dwt_cycle_count_next_second_prediction"))
+    dwt_cyccnt_at_pps = _frag(r, "dwt_cycle_count_at_pps")
     dwt_r_delta_raw = r.get("dwt", {}).get("delta_raw")
     dwt_r_pps_residual = r.get("dwt", {}).get("pps_residual")
 
@@ -568,55 +568,33 @@ def clocks_combined_readout() -> list[str]:
     lines.append("")
 
     # ==============================================================
-    # SPIN & PPS — from fragment (v10: fragment-aware)
+    # INTERRUPT diagnostics — from fragment
     # ==============================================================
-    spin_valid = _frag(r, "spin_valid")
-    spin_approach = _frag(r, "spin_approach_cycles")
-    spin_nano_to = _frag(r, "spin_nano_timed_out")
-    spin_shadow_to = _frag(r, "spin_shadow_timed_out")
-
     lines.append(
-        f"SPIN  VALID: {_bool_str(spin_valid)}"
-        f"    APPROACH: {_comma_int(spin_approach, 8)}"
-        f"    NANO_TO: {_bool_str(spin_nano_to)}"
-        f"    SHADOW_TO: {_bool_str(spin_shadow_to)}"
+        f"DIAG  "
+        f"PPS app={_comma_int(_frag(r, 'pps_diag_approach_cycles'), 6)}"
+        f" sh={_comma_int(_frag(r, 'pps_diag_shadow_dwt'), 10)}"
+        f" an={_comma_int(_frag(r, 'pps_diag_anomaly_count'), 4)}"
+        f"    "
+        f"OX1 app={_comma_int(_frag(r, 'ocxo1_diag_approach_cycles'), 6)}"
+        f" sh={_comma_int(_frag(r, 'ocxo1_diag_shadow_dwt'), 10)}"
+        f" an={_comma_int(_frag(r, 'ocxo1_diag_anomaly_count'), 4)}"
+        f"    "
+        f"OX2 app={_comma_int(_frag(r, 'ocxo2_diag_approach_cycles'), 6)}"
+        f" sh={_comma_int(_frag(r, 'ocxo2_diag_shadow_dwt'), 10)}"
+        f" an={_comma_int(_frag(r, 'ocxo2_diag_anomaly_count'), 4)}"
     )
-
-    # OCXO phase TDC — from fragment
-    phase_valid = _frag(r, "phase_detector_valid")
-    ox1_phase = _frag(r, "ocxo1_phase_offset_ns")
-    ox2_phase = _frag(r, "ocxo2_phase_offset_ns")
-    spin_timeouts = _frag(r, "diag_ocxo_phase_spin_timeouts")
-
     lines.append(
-        f"PHASE VALID: {_bool_str(phase_valid)}"
-        f"    OX1: φ={_fmt(ox1_phase, '>2d', 2)}ns"
-        f"    OX2: φ={_fmt(ox2_phase, '>2d', 2)}ns"
-        f"    SPIN_TO: {_fmt(spin_timeouts, '>4d', 4)}"
+        f"PRE   "
+        f"PPS arm={_comma_int(_frag(r, 'pps_diag_prespin_arm_count'), 6)}"
+        f" to={_comma_int(_frag(r, 'pps_diag_prespin_timeout_count'), 4)}"
+        f"    "
+        f"OX1 arm={_comma_int(_frag(r, 'ocxo1_diag_prespin_arm_count'), 6)}"
+        f" to={_comma_int(_frag(r, 'ocxo1_diag_prespin_timeout_count'), 4)}"
+        f"    "
+        f"OX2 arm={_comma_int(_frag(r, 'ocxo2_diag_prespin_arm_count'), 6)}"
+        f" to={_comma_int(_frag(r, 'ocxo2_diag_prespin_timeout_count'), 4)}"
     )
-
-    # ISR residuals — from fragment
-    isr_gnss = _frag(r, "isr_residual_gnss")
-    isr_dwt = _frag(r, "isr_residual_dwt")
-    isr_ocxo1 = _frag(r, "isr_residual_ocxo1")
-    isr_ocxo2 = _frag(r, "isr_residual_ocxo2")
-
-    lines.append(
-        f"ISR   GNSS: {_sign_int(isr_gnss, 6)}"
-        f"    DWT: {_sign_int(isr_dwt, 6)}"
-        f"    OCXO1: {_sign_int(isr_ocxo1, 6)}"
-        f"    OCXO2: {_sign_int(isr_ocxo2, 6)}"
-    )
-
-    # PPS diagnostics — from fragment
-    pps_rej_total = _frag(r, "diag_pps_rejected_total")
-    pps_rej_rem = _frag(r, "diag_pps_rejected_remainder")
-
-    lines.append(
-        f"PPS   REJECTED: {_fmt(pps_rej_total, '>4d', 4)}"
-        f"    REMAINDER: {_fmt(pps_rej_rem, '>4d', 4)}"
-    )
-
     lines.append("")
 
     # ==============================================================
@@ -746,5 +724,5 @@ def clocks_combined_readout() -> list[str]:
 # ---------------------------------------------------------------------
 
 READOUTS = [
-    ("CLOCKS", clocks_combined_readout),
+    ("CLOCKS", lambda: _safe_lines(clocks_combined_readout)),
 ]

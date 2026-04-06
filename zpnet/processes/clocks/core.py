@@ -928,40 +928,41 @@ def _build_clock_block(
     """
     Build a clock domain block for the campaign report.
 
-    tau is cumulative (total clock ns / total GNSS ns).
-    ppb is instantaneous (per-second delta vs nominal).
-    Prediction stats from Teensy are authoritative.
-
-    Args:
-        ns_now: cumulative nanoseconds in this domain
-        gnss_ns: cumulative GNSS nanoseconds (reference)
-        frag: the raw TIMEBASE_FRAGMENT payload
-        domain: "gnss", "dwt", "ocxo1", or "ocxo2"
+    This is intentionally compatibility-oriented: it tolerates both the
+    legacy TIMEBASE_FRAGMENT shape and the newer phase/edge-oriented shape
+    emitted by the Teensy clocks revamp.
     """
     block: Dict[str, Any] = {
         "ns_now": int(ns_now),
-        "tau": round(_compute_tau(int(ns_now), int(gnss_ns)), 12),
+        "tau": round(_compute_tau(int(ns_now), int(gnss_ns)), 12) if gnss_ns else 0.0,
     }
 
-    # Instantaneous PPB from per-second raw deltas
     if domain == "dwt":
+        # Legacy-compatible DWT fields
         delta = frag.get("dwt_delta_raw")
-        if delta is not None:
-            block["ppb"] = round(((int(delta) - 1_008_000_000) / 1_008_000_000) * 1e9, 3)
-        else:
-            block["ppb"] = 0.0
+        block["ppb"] = round(((int(delta) - 1_008_000_000) / 1_008_000_000) * 1e9, 3) if delta is not None else 0.0
         block["pred_residual"] = frag.get("dwt_pred_residual")
         block["pred_mean"] = frag.get("dwt_pred_mean")
         block["pred_stddev"] = frag.get("dwt_pred_stddev")
         block["pred_n"] = frag.get("dwt_pred_n")
         block["delta_raw"] = frag.get("dwt_delta_raw")
         block["pps_residual"] = frag.get("dwt_pps_residual")
+        block["cycles_at_pps"] = frag.get("dwt_cycle_count_at_pps")
+        block["next_second_prediction"] = frag.get("dwt_cycle_count_next_second_prediction")
+        block["next_second_adjustment"] = frag.get("dwt_cycle_count_next_second_adjustment")
+
     elif domain == "ocxo1":
-        delta = frag.get("ocxo1_delta_raw")
-        if delta is not None:
-            block["ppb"] = round(_compute_ppb(int(ns_now), int(gnss_ns)), 3)
-        else:
-            block["ppb"] = 0.0
+        # New authoritative fields
+        second_residual_ns = frag.get("ocxo1_second_residual_ns")
+        block["ppb"] = round(float(second_residual_ns), 3) if second_residual_ns is not None else 0.0
+        block["second_residual_ns"] = second_residual_ns
+        block["gnss_ns_at_edge"] = frag.get("ocxo1_gnss_ns_at_edge")
+        block["ns_count_at_edge"] = frag.get("ocxo1_ns_count_at_edge")
+        block["ns_count_at_pps"] = frag.get("ocxo1_ns_count_at_pps")
+        block["ns_count_next_second_prediction"] = frag.get("ocxo1_ns_count_next_second_prediction")
+        block["dac"] = frag.get("ocxo1_dac")
+
+        # Legacy-compatible pass-throughs if present
         block["pred_residual"] = frag.get("ocxo1_pred_residual")
         block["pred_mean"] = frag.get("ocxo1_pred_mean")
         block["pred_stddev"] = frag.get("ocxo1_pred_stddev")
@@ -975,39 +976,17 @@ def _build_clock_block(
         block["dac_min"] = frag.get("ocxo1_dac_min")
         block["dac_max"] = frag.get("ocxo1_dac_max")
         block["dac_hw"] = frag.get("ocxo1_dac_hw")
-        block["gnss_ns_per_pps"] = frag.get("ocxo1_gnss_ns_per_pps")
-        block["residual_ns"] = frag.get("ocxo1_residual_ns")
-        block["dac_before"] = frag.get("ocxo1_dac_before")
-        block["dac_after"] = frag.get("ocxo1_dac_after")
-        block["match_found"] = frag.get("ocxo1_match_found")
-        block["candidates_examined"] = frag.get("ocxo1_candidates_examined")
-        block["match_iteration_count"] = frag.get("ocxo1_match_iteration_count")
-        block["match_delta_ns"] = frag.get("ocxo1_match_delta_ns")
-        block["match_prev_phase_offset_ns"] = frag.get("ocxo1_match_prev_phase_offset_ns")
-        block["match_prev_raw_elapsed_ns"] = frag.get("ocxo1_match_prev_raw_elapsed_ns")
-        block["match_prev_dwt_bracket_cycles"] = frag.get("ocxo1_match_prev_dwt_bracket_cycles")
-        block["match_prev_dwt_before"] = frag.get("ocxo1_match_prev_dwt_before")
-        block["match_prev_dwt_after"] = frag.get("ocxo1_match_prev_dwt_after")
-        block["match_prev_gpt_before"] = frag.get("ocxo1_match_prev_gpt_before")
-        block["match_prev_gpt_after"] = frag.get("ocxo1_match_prev_gpt_after")
-        block["winner_phase_offset_ns"] = frag.get("ocxo1_winner_phase_offset_ns")
-        block["winner_raw_elapsed_ns"] = frag.get("ocxo1_winner_raw_elapsed_ns")
-        block["winner_dwt_bracket_cycles"] = frag.get("ocxo1_winner_dwt_bracket_cycles")
-        block["winner_dwt_before"] = frag.get("ocxo1_winner_dwt_before")
-        block["winner_dwt_after"] = frag.get("ocxo1_winner_dwt_after")
-        block["winner_gpt_before"] = frag.get("ocxo1_winner_gpt_before")
-        block["winner_gpt_after"] = frag.get("ocxo1_winner_gpt_after")
-        block["winner_dwt_at_edge"] = frag.get("ocxo1_winner_dwt_at_edge")
-        block["edge_gnss_ns"] = frag.get("ocxo1_edge_gnss_ns")
-        block["phase_detector_valid"] = frag.get("phase_detector_valid")
+
     elif domain == "ocxo2":
-        delta = frag.get("ocxo2_delta_raw")
-        if delta is not None:
-            # ocxo2_delta_raw is in 20 MHz space (QTimer both edges)
-            # Convert to 10 MHz equivalent for PPB calculation
-            block["ppb"] = round(_compute_ppb(int(ns_now), int(gnss_ns)), 3)
-        else:
-            block["ppb"] = 0.0
+        second_residual_ns = frag.get("ocxo2_second_residual_ns")
+        block["ppb"] = round(float(second_residual_ns), 3) if second_residual_ns is not None else 0.0
+        block["second_residual_ns"] = second_residual_ns
+        block["gnss_ns_at_edge"] = frag.get("ocxo2_gnss_ns_at_edge")
+        block["ns_count_at_edge"] = frag.get("ocxo2_ns_count_at_edge")
+        block["ns_count_at_pps"] = frag.get("ocxo2_ns_count_at_pps")
+        block["ns_count_next_second_prediction"] = frag.get("ocxo2_ns_count_next_second_prediction")
+        block["dac"] = frag.get("ocxo2_dac")
+
         block["pred_residual"] = frag.get("ocxo2_pred_residual")
         block["pred_mean"] = frag.get("ocxo2_pred_mean")
         block["pred_stddev"] = frag.get("ocxo2_pred_stddev")
@@ -1021,34 +1000,11 @@ def _build_clock_block(
         block["dac_min"] = frag.get("ocxo2_dac_min")
         block["dac_max"] = frag.get("ocxo2_dac_max")
         block["dac_hw"] = frag.get("ocxo2_dac_hw")
-        block["gnss_ns_per_pps"] = frag.get("ocxo2_gnss_ns_per_pps")
-        block["residual_ns"] = frag.get("ocxo2_residual_ns")
-        block["dac_before"] = frag.get("ocxo2_dac_before")
-        block["dac_after"] = frag.get("ocxo2_dac_after")
-        block["match_found"] = frag.get("ocxo2_match_found")
-        block["candidates_examined"] = frag.get("ocxo2_candidates_examined")
-        block["match_iteration_count"] = frag.get("ocxo2_match_iteration_count")
-        block["match_delta_ns"] = frag.get("ocxo2_match_delta_ns")
-        block["match_prev_phase_offset_ns"] = frag.get("ocxo2_match_prev_phase_offset_ns")
-        block["match_prev_raw_elapsed_ns"] = frag.get("ocxo2_match_prev_raw_elapsed_ns")
-        block["match_prev_dwt_bracket_cycles"] = frag.get("ocxo2_match_prev_dwt_bracket_cycles")
-        block["match_prev_dwt_before"] = frag.get("ocxo2_match_prev_dwt_before")
-        block["match_prev_dwt_after"] = frag.get("ocxo2_match_prev_dwt_after")
-        block["match_prev_gpt_before"] = frag.get("ocxo2_match_prev_gpt_before")
-        block["match_prev_gpt_after"] = frag.get("ocxo2_match_prev_gpt_after")
-        block["winner_phase_offset_ns"] = frag.get("ocxo2_winner_phase_offset_ns")
-        block["winner_raw_elapsed_ns"] = frag.get("ocxo2_winner_raw_elapsed_ns")
-        block["winner_dwt_bracket_cycles"] = frag.get("ocxo2_winner_dwt_bracket_cycles")
-        block["winner_dwt_before"] = frag.get("ocxo2_winner_dwt_before")
-        block["winner_dwt_after"] = frag.get("ocxo2_winner_dwt_after")
-        block["winner_gpt_before"] = frag.get("ocxo2_winner_gpt_before")
-        block["winner_gpt_after"] = frag.get("ocxo2_winner_gpt_after")
-        block["winner_dwt_at_edge"] = frag.get("ocxo2_winner_dwt_at_edge")
-        block["edge_gnss_ns"] = frag.get("ocxo2_edge_gnss_ns")
-        block["phase_detector_valid"] = frag.get("phase_detector_valid")
+
     elif domain == "gnss":
         block["ppb"] = 0.0
         block["pps_residual"] = frag.get("gnss_pps_residual")
+
     elif domain == "gnss_raw":
         block["ppb"] = round(_compute_ppb(int(ns_now), int(gnss_ns)), 3) if gnss_ns else 0.0
         block["drift_ppb"] = frag.get("gnss_raw_drift_ppb")
@@ -1062,6 +1018,15 @@ def _build_report(
     timebase: Dict[str, Any],
     frag: Dict[str, Any],
 ) -> Dict[str, Any]:
+    """
+    Build the denormalized active-campaign report from the immutable
+    TIMEBASE row plus the raw TIMEBASE_FRAGMENT payload.
+
+    Compatibility note:
+      The new Teensy clocks revamp changed OCXO and DWT field names.
+      This report builder tolerates both the legacy and current fragment
+      formats, preferring the new authoritative names when present.
+    """
     gnss_ns = int(timebase.get("teensy_gnss_ns") or 0)
     dwt_ns = int(timebase.get("teensy_dwt_ns") or 0)
     ocxo1_ns = int(timebase.get("teensy_ocxo1_ns") or 0)
@@ -1069,9 +1034,13 @@ def _build_report(
     gnss_raw_ns = int(timebase.get("gnss_raw_ns") or 0)
 
     pps_count = timebase.get("pps_count")
-    campaign_seconds = int(pps_count) if isinstance(pps_count, int) else (gnss_ns // NS_PER_SECOND if gnss_ns else 0)
+    campaign_seconds = (
+        int(pps_count)
+        if isinstance(pps_count, int)
+        else (gnss_ns // NS_PER_SECOND if gnss_ns else 0)
+    )
 
-    return {
+    report: Dict[str, Any] = {
         "campaign": campaign_name,
         "campaign_state": "STARTED",
         "campaign_seconds": int(campaign_seconds),
@@ -1081,16 +1050,20 @@ def _build_report(
         "system_time_utc": timebase.get("system_time_utc"),
         "pps_count": int(timebase.get("pps_count") or 0),
 
+        # Top-level Teensy values carried into TIMEBASE
         "teensy_dwt_cycles": timebase.get("teensy_dwt_cycles"),
+        "teensy_dwt_ns": timebase.get("teensy_dwt_ns"),
+        "teensy_gnss_ns": timebase.get("teensy_gnss_ns"),
         "teensy_ocxo1_ns": timebase.get("teensy_ocxo1_ns"),
         "teensy_ocxo2_ns": timebase.get("teensy_ocxo2_ns"),
 
-        # Clock domain blocks (tau, ppb, prediction stats)
+        # Clock domain blocks
         "gnss": _build_clock_block(gnss_ns, gnss_ns, frag, "gnss"),
         "dwt": _build_clock_block(dwt_ns, gnss_ns, frag, "dwt"),
         "ocxo1": _build_clock_block(ocxo1_ns, gnss_ns, frag, "ocxo1"),
         "ocxo2": _build_clock_block(ocxo2_ns, gnss_ns, frag, "ocxo2"),
         "gnss_raw": {
+            "ns_now": int(gnss_raw_ns),
             "tau": timebase.get("stats", {}).get("gnss_raw", {}).get("tau"),
             "ppb": timebase.get("stats", {}).get("gnss_raw", {}).get("ppb"),
             "drift_ppb": timebase.get("gnss_raw_drift_ppb"),
@@ -1100,12 +1073,11 @@ def _build_report(
             "pred_n": timebase.get("stats", {}).get("gnss_raw", {}).get("pred_n"),
         },
 
-        # Raw TIMEBASE_FRAGMENT — all firmware fields in their original form.
-        # Spin capture, ISR residuals, phase detector, PPS diagnostics,
-        # DWT internals, and any future fields are accessible here without
-        # requiring per-field extraction.
+        # Raw fragment retained whole for dashboards / inspection
         "fragment": frag,
     }
+
+    return report
 
 # ---------------------------------------------------------------------
 # WATCHDOG_ANOMALY handler (PUBSUB — fast path)
@@ -1303,8 +1275,8 @@ def _process_loop() -> None:
 
         gnss_ns = int(frag.get("gnss_ns") or 0)
         dwt_ns = int(frag.get("dwt_ns") or 0)
-        ocxo1_ns = int(frag.get("ocxo1_ns") or 0)
-        ocxo2_ns = int(frag.get("ocxo2_ns") or 0)
+        ocxo1_ns = int((frag.get("ocxo1_ns_count_at_pps") if frag.get("ocxo1_ns_count_at_pps") is not None else frag.get("ocxo1_ns")) or 0)
+        ocxo2_ns = int((frag.get("ocxo2_ns_count_at_pps") if frag.get("ocxo2_ns_count_at_pps") is not None else frag.get("ocxo2_ns")) or 0)
 
         # --- GNSS stream health canary (Pi-side only) ---
         gnss_canary = _gnss_canary_update(gnss_ns) if gnss_ns > 0 else {"stream_valid": False, "residual": 0}
@@ -1366,7 +1338,7 @@ def _process_loop() -> None:
             "pps_count": int(pps_count),
 
             # Teensy authoritative clock state
-            "teensy_dwt_cycles": frag["dwt_cycles"],
+            "teensy_dwt_cycles": frag.get("dwt_cycles", frag.get("dwt_cycle_count_at_pps")),
             "teensy_dwt_ns": frag["dwt_ns"],
             "teensy_gnss_ns": frag["gnss_ns"],
             "teensy_ocxo1_ns": frag.get("ocxo1_ns"),
@@ -1487,9 +1459,9 @@ def _process_loop() -> None:
                         (
                             json.dumps({
                                 "ocxo1_dac": float(frag["ocxo1_dac_mean"]) if frag.get(
-                                    "ocxo1_dac_mean") is not None else None,
+                                    "ocxo1_dac_mean") is not None else (float(teensy_ocxo1_dac) if teensy_ocxo1_dac is not None else None),
                                 "ocxo2_dac": float(frag["ocxo2_dac_mean"]) if frag.get(
-                                    "ocxo2_dac_mean") is not None else None,
+                                    "ocxo2_dac_mean") is not None else (float(teensy_ocxo2_dac) if teensy_ocxo2_dac is not None else None),
                                 "calibrate_ocxo": teensy_calibrate if teensy_calibrate and teensy_calibrate != "OFF" else None,
                             }),
                             campaign,
@@ -1701,7 +1673,7 @@ def cmd_start(args: Optional[dict]) -> dict:
     logging.info("📡 [start] @%s waiting for sync fragment (pps_count=0)...", system_time_z())
 
     try:
-        frag0, waited_s = _end_sync_wait()
+        frag0, waited_s = _end_sync_wait(timeout_s=SYNC_RECOVER_TIMEOUT_S)
     except Exception:
         return {"success": False, "message": "HARD FAULT during START sync (see logs/diag)"}
 
@@ -2899,6 +2871,7 @@ COMMANDS = {
     "CLEAR": cmd_clear,
     "DELETE": cmd_delete,
     "SET_DAC": cmd_set_dac,
+    "DITHER": cmd_set_dither,
     "SET_BASELINE": cmd_set_baseline,
     "BASELINE_INFO": cmd_baseline_info,
     "LIST_CAMPAIGNS": cmd_list_campaigns,
