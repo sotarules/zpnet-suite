@@ -43,6 +43,8 @@
 #include <stdint.h>
 #include <stdbool.h>
 
+void interrupt_prespin_service(void);
+
 // ============================================================================
 // Subscriber identities (logical clients)
 // ============================================================================

@@ -401,4 +401,5 @@ void setup() {
 
 void loop() {
   timepop_dispatch();
+  interrupt_prespin_service();
 }

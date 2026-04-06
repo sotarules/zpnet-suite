@@ -477,8 +477,6 @@ static void pps_drumbeat_consume_edge(interrupt_subscriber_runtime_t& rt);
 // By the time it runs, all registers have completed and the counter
 // reflects the total number of clients waiting.
 
-static void prespin_spin_callback(timepop_ctx_t*, timepop_diag_t*, void*);
-
 static void prespin_register_callback(timepop_ctx_t*,
                                       timepop_diag_t*,
                                       void* user_data) {
@@ -510,30 +508,10 @@ static void prespin_register_callback(timepop_ctx_t*,
 
   // Arm the shared spin loop.  Named singleton replacement ensures
   // only one fires per dispatch pass, after all registers complete.
-  timepop_arm(0, false, prespin_spin_callback, nullptr, "PRESPIN_SPIN");
+  //timepop_arm(0, false, prespin_spin_callback, nullptr, "PRESPIN_SPIN");
 }
 
-// ============================================================================
-// Prespin spin loop — ASAP callback (scheduled context)
-// ============================================================================
-//
-// This is the sacred spin loop.  It runs in scheduled context, dispatched
-// via a named ASAP timer ("PRESPIN_SPIN") armed by prespin register callbacks.
-//
-// Named singleton replacement ensures only one spin callback fires per
-// dispatch pass, regardless of how many clocks registered.  By the time
-// this runs, all pending register callbacks have already incremented the
-// responsibility counter.
-//
-// Edge ISRs (priority 0) preempt this loop, snapshot the shadow, and
-// decrement the counter.  The loop exits when count reaches 0 or timeout.
-//
-// If preempted by non-edge activity (transport, other timers), the shadow
-// becomes momentarily stale.  This produces an outlier in shadow_to_isr_cycles.
-// The correct TDC offset is the MINIMUM across many events — outliers are
-// noise, not signal.
-
-static void prespin_spin_callback(timepop_ctx_t*, timepop_diag_t*, void*) {
+void interrupt_prespin_service(void) {
   if (g_prespin_responsibility_count <= 0) return;
   if (g_prespin_spinning) return;
 
