@@ -375,19 +375,23 @@ static void pps_callback(
   g_dwt_model_pps_count++;
 
   if (g_ocxo1_clock.gnss_ns_at_edge != 0 || g_ocxo1_measurement.prev_gnss_ns_at_edge == 0) {
-    const uint64_t gnss_since = g_gnss_ns_count_at_pps - g_ocxo1_clock.gnss_ns_at_edge;
+    // OCXO edge counts are treated as round-second OCXO boundaries.
+    // The GNSS timestamp at that edge expresses phase offset relative to PPS.
+    // Mirror that offset back from the OCXO edge to infer the OCXO count at PPS.
+    const int64_t phase_offset_ns =
+        (int64_t)g_ocxo1_clock.gnss_ns_at_edge - (int64_t)g_gnss_ns_count_at_pps;
     g_ocxo1_clock.ns_count_at_pps =
-        g_ocxo1_clock.ns_count_at_edge +
-        (gnss_since * g_ocxo1_clock.ns_count_next_second_prediction) / 1000000000ULL;
+        (uint64_t)((int64_t)g_ocxo1_clock.ns_count_at_edge - phase_offset_ns);
   } else {
     g_ocxo1_clock.ns_count_at_pps = 0;
   }
 
   if (g_ocxo2_clock.gnss_ns_at_edge != 0 || g_ocxo2_measurement.prev_gnss_ns_at_edge == 0) {
-    const uint64_t gnss_since = g_gnss_ns_count_at_pps - g_ocxo2_clock.gnss_ns_at_edge;
+    // Mirror the GNSS-side phase offset from the OCXO edge back to PPS.
+    const int64_t phase_offset_ns =
+        (int64_t)g_ocxo2_clock.gnss_ns_at_edge - (int64_t)g_gnss_ns_count_at_pps;
     g_ocxo2_clock.ns_count_at_pps =
-        g_ocxo2_clock.ns_count_at_edge +
-        (gnss_since * g_ocxo2_clock.ns_count_next_second_prediction) / 1000000000ULL;
+        (uint64_t)((int64_t)g_ocxo2_clock.ns_count_at_edge - phase_offset_ns);
   } else {
     g_ocxo2_clock.ns_count_at_pps = 0;
   }
@@ -426,10 +430,6 @@ static void ocxo1_callback(
   clocks_capture_interrupt_diag(g_ocxo1_interrupt_diag, diag);
 
   // Canonical GNSS epoch is local and zero-based.
-  //
-  // The OCXO nanosecond count at edge is not interrogated from hardware.
-  // It is known by contract because process_interrupt armed OCR3 to fire on
-  // a specific 10 MHz count and supplies that just-matched count here.
   g_ocxo1_clock.gnss_ns_at_edge = event.gnss_ns_at_event;
   g_ocxo1_clock.ns_count_at_edge = (uint64_t)event.counter32_at_event * 100ULL;
 
@@ -455,8 +455,6 @@ static void ocxo2_callback(
 
   clocks_capture_interrupt_diag(g_ocxo2_interrupt_diag, diag);
 
-  // The OCXO nanosecond count at edge is the just-matched OCR3 count supplied
-  // by process_interrupt, expressed in nanoseconds.
   g_ocxo2_clock.gnss_ns_at_edge = event.gnss_ns_at_event;
   g_ocxo2_clock.ns_count_at_edge = (uint64_t)event.counter32_at_event * 100ULL;
 
