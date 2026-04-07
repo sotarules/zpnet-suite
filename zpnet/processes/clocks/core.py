@@ -928,9 +928,8 @@ def _build_clock_block(
     """
     Build a clock domain block for the campaign report.
 
-    This is intentionally compatibility-oriented: it tolerates both the
-    legacy TIMEBASE_FRAGMENT shape and the newer phase/edge-oriented shape
-    emitted by the Teensy clocks revamp.
+    Compatibility-oriented: tolerate legacy and current TIMEBASE_FRAGMENT
+    shapes, but prefer the current authoritative fields.
     """
     block: Dict[str, Any] = {
         "ns_now": int(ns_now),
@@ -938,68 +937,40 @@ def _build_clock_block(
     }
 
     if domain == "dwt":
-        # Legacy-compatible DWT fields
-        delta = frag.get("dwt_delta_raw")
-        block["ppb"] = round(((int(delta) - 1_008_000_000) / 1_008_000_000) * 1e9, 3) if delta is not None else 0.0
-        block["pred_residual"] = frag.get("dwt_pred_residual")
-        block["pred_mean"] = frag.get("dwt_pred_mean")
-        block["pred_stddev"] = frag.get("dwt_pred_stddev")
-        block["pred_n"] = frag.get("dwt_pred_n")
-        block["delta_raw"] = frag.get("dwt_delta_raw")
-        block["pps_residual"] = frag.get("dwt_pps_residual")
-        block["cycles_at_pps"] = frag.get("dwt_cycle_count_at_pps")
+        between_pps = frag.get("dwt_cycle_count_between_pps")
+        block["ppb"] = (
+            round(((int(between_pps) - 1_008_000_000) / 1_008_000_000) * 1e9, 3)
+            if between_pps is not None else 0.0
+        )
+        block["cycle_count_at_pps"] = frag.get("dwt_cycle_count_at_pps")
+        block["cycle_count_total"] = frag.get("dwt_cycle_count_total")
+        block["cycle_count_between_pps"] = between_pps
         block["next_second_prediction"] = frag.get("dwt_cycle_count_next_second_prediction")
         block["next_second_adjustment"] = frag.get("dwt_cycle_count_next_second_adjustment")
 
     elif domain == "ocxo1":
-        # New authoritative fields
         second_residual_ns = frag.get("ocxo1_second_residual_ns")
         block["ppb"] = round(float(second_residual_ns), 3) if second_residual_ns is not None else 0.0
         block["second_residual_ns"] = second_residual_ns
         block["gnss_ns_at_edge"] = frag.get("ocxo1_gnss_ns_at_edge")
+        block["gnss_ns_between_edges"] = frag.get("ocxo1_gnss_ns_between_edges")
+        block["dwt_at_edge"] = frag.get("ocxo1_dwt_at_edge")
+        block["dwt_cycles_between_edges"] = frag.get("ocxo1_dwt_cycles_between_edges")
         block["ns_count_at_edge"] = frag.get("ocxo1_ns_count_at_edge")
         block["ns_count_at_pps"] = frag.get("ocxo1_ns_count_at_pps")
-        block["ns_count_next_second_prediction"] = frag.get("ocxo1_ns_count_next_second_prediction")
         block["dac"] = frag.get("ocxo1_dac")
-
-        # Legacy-compatible pass-throughs if present
-        block["pred_residual"] = frag.get("ocxo1_pred_residual")
-        block["pred_mean"] = frag.get("ocxo1_pred_mean")
-        block["pred_stddev"] = frag.get("ocxo1_pred_stddev")
-        block["pred_n"] = frag.get("ocxo1_pred_n")
-        block["delta_raw"] = frag.get("ocxo1_delta_raw")
-        block["pps_residual"] = frag.get("ocxo1_pps_residual")
-        block["dac_n"] = frag.get("ocxo1_dac_n")
-        block["dac_mean"] = frag.get("ocxo1_dac_mean")
-        block["dac_stddev"] = frag.get("ocxo1_dac_stddev")
-        block["dac_stderr"] = frag.get("ocxo1_dac_stderr")
-        block["dac_min"] = frag.get("ocxo1_dac_min")
-        block["dac_max"] = frag.get("ocxo1_dac_max")
-        block["dac_hw"] = frag.get("ocxo1_dac_hw")
 
     elif domain == "ocxo2":
         second_residual_ns = frag.get("ocxo2_second_residual_ns")
         block["ppb"] = round(float(second_residual_ns), 3) if second_residual_ns is not None else 0.0
         block["second_residual_ns"] = second_residual_ns
         block["gnss_ns_at_edge"] = frag.get("ocxo2_gnss_ns_at_edge")
+        block["gnss_ns_between_edges"] = frag.get("ocxo2_gnss_ns_between_edges")
+        block["dwt_at_edge"] = frag.get("ocxo2_dwt_at_edge")
+        block["dwt_cycles_between_edges"] = frag.get("ocxo2_dwt_cycles_between_edges")
         block["ns_count_at_edge"] = frag.get("ocxo2_ns_count_at_edge")
         block["ns_count_at_pps"] = frag.get("ocxo2_ns_count_at_pps")
-        block["ns_count_next_second_prediction"] = frag.get("ocxo2_ns_count_next_second_prediction")
         block["dac"] = frag.get("ocxo2_dac")
-
-        block["pred_residual"] = frag.get("ocxo2_pred_residual")
-        block["pred_mean"] = frag.get("ocxo2_pred_mean")
-        block["pred_stddev"] = frag.get("ocxo2_pred_stddev")
-        block["pred_n"] = frag.get("ocxo2_pred_n")
-        block["delta_raw"] = frag.get("ocxo2_delta_raw")
-        block["pps_residual"] = frag.get("ocxo2_pps_residual")
-        block["dac_n"] = frag.get("ocxo2_dac_n")
-        block["dac_mean"] = frag.get("ocxo2_dac_mean")
-        block["dac_stddev"] = frag.get("ocxo2_dac_stddev")
-        block["dac_stderr"] = frag.get("ocxo2_dac_stderr")
-        block["dac_min"] = frag.get("ocxo2_dac_min")
-        block["dac_max"] = frag.get("ocxo2_dac_max")
-        block["dac_hw"] = frag.get("ocxo2_dac_hw")
 
     elif domain == "gnss":
         block["ppb"] = 0.0
@@ -1028,7 +999,7 @@ def _build_report(
       formats, preferring the new authoritative names when present.
     """
     gnss_ns = int(timebase.get("teensy_gnss_ns") or 0)
-    dwt_ns = int(timebase.get("teensy_dwt_ns") or 0)
+    dwt_cycles = int(timebase.get("teensy_dwt_cycles") or 0)
     ocxo1_ns = int(timebase.get("teensy_ocxo1_ns") or 0)
     ocxo2_ns = int(timebase.get("teensy_ocxo2_ns") or 0)
     gnss_raw_ns = int(timebase.get("gnss_raw_ns") or 0)
@@ -1052,14 +1023,13 @@ def _build_report(
 
         # Top-level Teensy values carried into TIMEBASE
         "teensy_dwt_cycles": timebase.get("teensy_dwt_cycles"),
-        "teensy_dwt_ns": timebase.get("teensy_dwt_ns"),
         "teensy_gnss_ns": timebase.get("teensy_gnss_ns"),
         "teensy_ocxo1_ns": timebase.get("teensy_ocxo1_ns"),
         "teensy_ocxo2_ns": timebase.get("teensy_ocxo2_ns"),
 
         # Clock domain blocks
         "gnss": _build_clock_block(gnss_ns, gnss_ns, frag, "gnss"),
-        "dwt": _build_clock_block(dwt_ns, gnss_ns, frag, "dwt"),
+        "dwt": _build_clock_block(dwt_cycles, dwt_cycles, frag, "dwt"),
         "ocxo1": _build_clock_block(ocxo1_ns, gnss_ns, frag, "ocxo1"),
         "ocxo2": _build_clock_block(ocxo2_ns, gnss_ns, frag, "ocxo2"),
         "gnss_raw": {
@@ -1274,7 +1244,7 @@ def _process_loop() -> None:
         system_time_str = system_time_utc.isoformat(timespec="microseconds")
 
         gnss_ns = int(frag.get("gnss_ns") or 0)
-        dwt_ns = int(frag.get("dwt_ns") or 0)
+        dwt_cycles = int((frag.get("dwt_cycle_count_total") if frag.get("dwt_cycle_count_total") is not None else frag.get("dwt_cycle_count_at_pps")) or 0)
         ocxo1_ns = int((frag.get("ocxo1_ns_count_at_pps") if frag.get("ocxo1_ns_count_at_pps") is not None else frag.get("ocxo1_ns")) or 0)
         ocxo2_ns = int((frag.get("ocxo2_ns_count_at_pps") if frag.get("ocxo2_ns_count_at_pps") is not None else frag.get("ocxo2_ns")) or 0)
 
@@ -1338,8 +1308,7 @@ def _process_loop() -> None:
             "pps_count": int(pps_count),
 
             # Teensy authoritative clock state
-            "teensy_dwt_cycles": frag.get("dwt_cycles", frag.get("dwt_cycle_count_at_pps")),
-            "teensy_dwt_ns": frag["dwt_ns"],
+            "teensy_dwt_cycles": frag.get("dwt_cycle_count_total", frag.get("dwt_cycle_count_at_pps")),
             "teensy_gnss_ns": frag["gnss_ns"],
             "teensy_ocxo1_ns": frag.get("ocxo1_ns"),
             "teensy_ocxo2_ns": frag.get("ocxo2_ns"),
@@ -1395,32 +1364,23 @@ def _process_loop() -> None:
                     "ppb": round(_compute_ppb(gnss_ns, gnss_ns), 3) if gnss_ns else None,
                 },
                 "dwt": {
-                    "pred_residual": frag.get("dwt_pred_residual"),
-                    "pred_mean": frag.get("dwt_pred_mean"),
-                    "pred_stddev": frag.get("dwt_pred_stddev"),
-                    "pred_n": frag.get("dwt_pred_n"),
-                    "delta_raw": frag.get("dwt_delta_raw"),
-                    "pps_residual": frag.get("dwt_pps_residual"),
-                    "tau": round(_compute_tau(dwt_ns, gnss_ns), 12) if gnss_ns else None,
-                    "ppb": round(_compute_ppb(dwt_ns, gnss_ns), 3) if gnss_ns else None,
+                    "cycle_count_between_pps": frag.get("dwt_cycle_count_between_pps"),
+                    "tau": round(_compute_tau(dwt_cycles, dwt_cycles), 12) if dwt_cycles else None,
+                    "ppb": 0.0,
                 },
                 "ocxo1": {
-                    "pred_residual": frag.get("ocxo1_pred_residual"),
-                    "pred_mean": frag.get("ocxo1_pred_mean"),
-                    "pred_stddev": frag.get("ocxo1_pred_stddev"),
-                    "pred_n": frag.get("ocxo1_pred_n"),
-                    "delta_raw": frag.get("ocxo1_delta_raw"),
-                    "pps_residual": frag.get("ocxo1_pps_residual"),
+                    "second_residual_ns": frag.get("ocxo1_second_residual_ns"),
+                    "gnss_ns_between_edges": frag.get("ocxo1_gnss_ns_between_edges"),
+                    "dwt_at_edge": frag.get("ocxo1_dwt_at_edge"),
+                    "dwt_cycles_between_edges": frag.get("ocxo1_dwt_cycles_between_edges"),
                     "tau": round(_compute_tau(ocxo1_ns, gnss_ns), 12) if gnss_ns else None,
                     "ppb": round(_compute_ppb(ocxo1_ns, gnss_ns), 3) if gnss_ns else None,
                 },
                 "ocxo2": {
-                    "pred_residual": frag.get("ocxo2_pred_residual"),
-                    "pred_mean": frag.get("ocxo2_pred_mean"),
-                    "pred_stddev": frag.get("ocxo2_pred_stddev"),
-                    "pred_n": frag.get("ocxo2_pred_n"),
-                    "delta_raw": frag.get("ocxo2_delta_raw"),
-                    "pps_residual": frag.get("ocxo2_pps_residual"),
+                    "second_residual_ns": frag.get("ocxo2_second_residual_ns"),
+                    "gnss_ns_between_edges": frag.get("ocxo2_gnss_ns_between_edges"),
+                    "dwt_at_edge": frag.get("ocxo2_dwt_at_edge"),
+                    "dwt_cycles_between_edges": frag.get("ocxo2_dwt_cycles_between_edges"),
                     "tau": round(_compute_tau(ocxo2_ns, gnss_ns), 12) if gnss_ns else None,
                     "ppb": round(_compute_ppb(ocxo2_ns, gnss_ns), 3) if gnss_ns else None,
                 },
