@@ -57,7 +57,7 @@ volatile uint32_t watchdog_anomaly_detail3         = 0;
 volatile uint32_t watchdog_anomaly_trigger_dwt     = 0;
 
 // ============================================================================
-// Residual tracking
+// Residual tracking (per-second Welford on residuals)
 // ============================================================================
 
 pps_residual_t residual_dwt   = {};
@@ -120,6 +120,26 @@ double dac_welford_stddev(const dac_welford_t& w) {
 
 double dac_welford_stderr(const dac_welford_t& w) {
   return (w.n >= 2) ? sqrt(w.m2 / (double)(w.n - 1)) / sqrt((double)w.n) : 0.0;
+}
+
+// ============================================================================
+// Cumulative PPB helpers
+// ============================================================================
+//
+// Cumulative PPB is the campaign-total clock error expressed as parts per
+// billion.  It is derived from the ratio of the clock's total nanoseconds
+// to GNSS total nanoseconds:
+//
+//   ppb = ((clock_ns - gnss_ns) / gnss_ns) * 1e9
+//
+// For DWT, clock_ns is dwt_cycles_to_ns(dwt_cycle_count_total).
+// For OCXO1/2, clock_ns is ns_count_at_pps.
+//
+// These are computed at publication time — no accumulator needed.
+
+static double compute_cumulative_ppb(uint64_t clock_ns, uint64_t gnss_ns) {
+  if (gnss_ns == 0) return 0.0;
+  return ((double)((int64_t)clock_ns - (int64_t)gnss_ns) / (double)gnss_ns) * 1e9;
 }
 
 // ============================================================================
@@ -373,6 +393,8 @@ void clocks_beta_pps(void) {
   ocxo1_ticks_64        = g_ocxo1_clock.ns_count_at_pps / 100ull;
   ocxo2_ticks_64        = g_ocxo2_clock.ns_count_at_pps / 100ull;
 
+  // ── Per-second residual Welford updates ──
+
   residual_update_sample(
       residual_dwt,
       (int64_t)dwt_effective_cycles_per_second() - (int64_t)DWT_EXPECTED_PER_PPS);
@@ -390,10 +412,21 @@ void clocks_beta_pps(void) {
   dac_welford_update(dac_welford_ocxo1, ocxo1_dac.dac_fractional);
   dac_welford_update(dac_welford_ocxo2, ocxo2_dac.dac_fractional);
 
+  // ── Compute cumulative PPB at publication time ──
+
+  const uint64_t gnss_ns = g_gnss_ns_count_at_pps;
+  const uint64_t dwt_ns  = dwt_cycles_to_ns(g_dwt_cycle_count_total);
+
+  const double dwt_cumulative_ppb   = compute_cumulative_ppb(dwt_ns, gnss_ns);
+  const double ocxo1_cumulative_ppb = compute_cumulative_ppb(g_ocxo1_clock.ns_count_at_pps, gnss_ns);
+  const double ocxo2_cumulative_ppb = compute_cumulative_ppb(g_ocxo2_clock.ns_count_at_pps, gnss_ns);
+
+  // ── Build TIMEBASE_FRAGMENT payload ──
+
   Payload p;
   p.add("campaign", campaign_name);
 
-  p.add("gnss_ns",  g_gnss_ns_count_at_pps);
+  p.add("gnss_ns",  gnss_ns);
   p.add("ocxo1_ns", g_ocxo1_clock.ns_count_at_pps);
   p.add("ocxo2_ns", g_ocxo2_clock.ns_count_at_pps);
 
@@ -425,6 +458,40 @@ void clocks_beta_pps(void) {
   p.add("ocxo1_dac", ocxo1_dac.dac_fractional);
   p.add("ocxo2_dac", ocxo2_dac.dac_fractional);
   p.add("calibrate_ocxo", servo_mode_str(calibrate_ocxo_mode));
+
+  // ── Cumulative PPB (campaign-total clock error vs GNSS) ──
+
+  p.add("dwt_cumulative_ppb",   dwt_cumulative_ppb);
+  p.add("ocxo1_cumulative_ppb", ocxo1_cumulative_ppb);
+  p.add("ocxo2_cumulative_ppb", ocxo2_cumulative_ppb);
+
+  // ── Per-second residual Welford statistics ──
+
+  p.add("dwt_residual_mean",   residual_dwt.mean);
+  p.add("dwt_residual_stddev", residual_stddev(residual_dwt));
+  p.add("dwt_residual_n",      residual_dwt.n);
+
+  p.add("ocxo1_residual_mean",   residual_ocxo1.mean);
+  p.add("ocxo1_residual_stddev", residual_stddev(residual_ocxo1));
+  p.add("ocxo1_residual_n",      residual_ocxo1.n);
+
+  p.add("ocxo2_residual_mean",   residual_ocxo2.mean);
+  p.add("ocxo2_residual_stddev", residual_stddev(residual_ocxo2));
+  p.add("ocxo2_residual_n",      residual_ocxo2.n);
+
+  // ── DAC Welford statistics ──
+
+  p.add("dac_ocxo1_mean",   dac_welford_ocxo1.mean);
+  p.add("dac_ocxo1_stddev", dac_welford_stddev(dac_welford_ocxo1));
+  p.add("dac_ocxo1_stderr", dac_welford_stderr(dac_welford_ocxo1));
+  p.add("dac_ocxo1_n",      dac_welford_ocxo1.n);
+
+  p.add("dac_ocxo2_mean",   dac_welford_ocxo2.mean);
+  p.add("dac_ocxo2_stddev", dac_welford_stddev(dac_welford_ocxo2));
+  p.add("dac_ocxo2_stderr", dac_welford_stderr(dac_welford_ocxo2));
+  p.add("dac_ocxo2_n",      dac_welford_ocxo2.n);
+
+  // ── Interrupt diagnostics ──
 
   clocks_payload_add_interrupt_diag(p, "pps_diag", g_pps_interrupt_diag);
   clocks_payload_add_interrupt_diag(p, "ocxo1_diag", g_ocxo1_interrupt_diag);
