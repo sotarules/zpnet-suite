@@ -168,9 +168,6 @@ static void ocxo_servo_mean(ocxo_dac_state_t& dac, pps_residual_t& per_second_re
 
   if (fabs(mean_residual_ns) < 0.01) return;
 
-  // Per-second residuals are now in full nanoseconds, so use a much gentler
-  // control law than the legacy surrogate signal. The sign here is chosen so
-  // that negative residuals move DAC downward rather than rail upward.
   double step = mean_residual_ns * 0.01;
   if (step >  (double)SERVO_MAX_STEP) step =  (double)SERVO_MAX_STEP;
   if (step < -(double)SERVO_MAX_STEP) step = -(double)SERVO_MAX_STEP;
@@ -220,9 +217,6 @@ static void ocxo_servo_now(ocxo_dac_state_t& dac, int64_t per_second_residual_ns
 
   if (fabs(residual_ns) < NOW_MIN_RESIDUAL_NS) return;
 
-  // Per-second OCXO residual is authoritative. Use conservative gain for the
-  // first hardware pass and choose polarity so negative residuals do not drive
-  // DAC monotonically upward.
   double step = residual_ns / NOW_NS_PER_DAC_LSB;
   if (step >  (double)SERVO_MAX_STEP) step =  (double)SERVO_MAX_STEP;
   if (step < -(double)SERVO_MAX_STEP) step = -(double)SERVO_MAX_STEP;
@@ -236,10 +230,6 @@ static void ocxo_servo_now(ocxo_dac_state_t& dac, int64_t per_second_residual_ns
 static void ocxo_calibration_servo(void) {
   if (calibrate_ocxo_mode == servo_mode_t::OFF) return;
 
-  // Servo mode semantics:
-  //   MEAN  = Welford mean of the per-second OCXO residual stream
-  //   NOW   = immediate per-second OCXO residual
-  //   TOTAL = cumulative OCXO-vs-GNSS divergence at PPS
   if (calibrate_ocxo_mode == servo_mode_t::MEAN) {
     ocxo_servo_mean(ocxo1_dac, residual_ocxo1);
     ocxo_servo_mean(ocxo2_dac, residual_ocxo2);
@@ -321,40 +311,8 @@ void clocks_watchdog_anomaly(const char* reason,
 // ============================================================================
 // clocks_beta_pps
 // ============================================================================
-//
-// Unified request contract:
-//
-//   • every request_foo is a latched intent
-//   • consummated only by the lawful boundary handler
-//   • cleared only after the transition has actually occurred
-//
-// request_zero:
-//   sacred PPS-boundary contract via interrupt_request_pps_zero()
-//
-// request_start:
-//   piggybacks on the same sacred zero/reset contract before the campaign
-//   actually becomes STARTED
-//
-// request_stop:
-//   consummated on this lawful PPS callback turn
-//
-// request_recover:
-//   consummated on this lawful PPS callback turn
-//
-// Important with the alpha epoch model:
-//
-//   • alpha now owns canonical epoch installation on the lawful PPS edge
-//   • beta no longer tries to zero the always-on physics clocks directly
-//   • handshake completion means:
-//       "interrupt consummated PPS zero on a real PPS edge, and alpha
-//        installed the new canonical epoch on that same lawful turn"
-//
-// ============================================================================
 
 void clocks_beta_pps(void) {
-  // --------------------------------------------------------------------------
-  // ZERO / START sacred PPS-boundary handshake
-  // --------------------------------------------------------------------------
   if (request_zero || request_start) {
     if (!zero_handshake_in_flight) {
       interrupt_request_pps_zero();
@@ -366,9 +324,6 @@ void clocks_beta_pps(void) {
       return;
     }
 
-    // Sacred PPS zero has now been consummated on a real PPS edge.
-    // Alpha has already installed the new canonical epoch.
-    // This is the lawful moment to reset campaign-layer state only.
     clocks_zero_all();
 
     zero_handshake_in_flight = false;
@@ -383,9 +338,6 @@ void clocks_beta_pps(void) {
     return;
   }
 
-  // --------------------------------------------------------------------------
-  // STOP — lawful PPS callback-turn consummation
-  // --------------------------------------------------------------------------
   if (request_stop) {
     watchdog_anomaly_active = false;
     campaign_state = clocks_campaign_state_t::STOPPED;
@@ -397,9 +349,6 @@ void clocks_beta_pps(void) {
     return;
   }
 
-  // --------------------------------------------------------------------------
-  // RECOVER — lawful PPS callback-turn consummation
-  // --------------------------------------------------------------------------
   if (request_recover) {
     watchdog_anomaly_active = false;
 
@@ -418,9 +367,6 @@ void clocks_beta_pps(void) {
     return;
   }
 
-  // --------------------------------------------------------------------------
-  // Watchdog / campaign gating
-  // --------------------------------------------------------------------------
   if (watchdog_anomaly_active) {
     return;
   }
@@ -429,12 +375,8 @@ void clocks_beta_pps(void) {
     return;
   }
 
-  // --------------------------------------------------------------------------
-  // Normal started-campaign PPS work
-  // --------------------------------------------------------------------------
   campaign_seconds++;
 
-  // Campaign accumulators — all derived from ISR-captured facts.
   dwt_cycle_count_total = g_dwt_cycle_count_total;
   gnss_raw_64           = g_gnss_ns_count_at_pps / 100ull;
   ocxo1_ticks_64        = g_ocxo1_clock.ns_count_at_pps / 100ull;
@@ -468,14 +410,17 @@ void clocks_beta_pps(void) {
 
   p.add("dwt_cycle_count_at_pps", g_dwt_cycle_count_at_pps);
   p.add("dwt_cycle_count_total", g_dwt_cycle_count_total);
+  p.add("dwt_cycle_count_between_pps", g_dwt_cycle_count_between_pps);
   p.add("dwt_cycle_count_next_second_prediction", g_dwt_cycle_count_next_second_prediction);
   p.add("dwt_cycle_count_next_second_adjustment", g_dwt_cycle_count_next_second_adjustment);
 
   p.add("ocxo1_gnss_ns_at_edge", g_ocxo1_clock.gnss_ns_at_edge);
+  p.add("ocxo1_gnss_ns_between_edges", g_ocxo1_measurement.gnss_ns_between_edges);
   p.add("ocxo1_ns_count_at_edge", g_ocxo1_clock.ns_count_at_edge);
   p.add("ocxo1_ns_count_at_pps", g_ocxo1_clock.ns_count_at_pps);
 
   p.add("ocxo2_gnss_ns_at_edge", g_ocxo2_clock.gnss_ns_at_edge);
+  p.add("ocxo2_gnss_ns_between_edges", g_ocxo2_measurement.gnss_ns_between_edges);
   p.add("ocxo2_ns_count_at_edge", g_ocxo2_clock.ns_count_at_edge);
   p.add("ocxo2_ns_count_at_pps", g_ocxo2_clock.ns_count_at_pps);
 
@@ -598,6 +543,7 @@ static Payload cmd_report(const Payload&) {
 
   p.add("dwt_cycle_count_at_pps", g_dwt_cycle_count_at_pps);
   p.add("dwt_cycle_count_total", g_dwt_cycle_count_total);
+  p.add("dwt_cycle_count_between_pps", g_dwt_cycle_count_between_pps);
   p.add("dwt_cycle_count_next_second_prediction", g_dwt_cycle_count_next_second_prediction);
   p.add("dwt_cycle_count_next_second_adjustment", g_dwt_cycle_count_next_second_adjustment);
   p.add("dwt_model_pps_count", g_dwt_model_pps_count);
@@ -605,10 +551,12 @@ static Payload cmd_report(const Payload&) {
   p.add("qtimer_at_pps", g_qtimer_at_pps);
 
   p.add("ocxo1_gnss_ns_at_edge", g_ocxo1_clock.gnss_ns_at_edge);
+  p.add("ocxo1_gnss_ns_between_edges", g_ocxo1_measurement.gnss_ns_between_edges);
   p.add("ocxo1_ns_count_at_edge", g_ocxo1_clock.ns_count_at_edge);
   p.add("ocxo1_ns_count_at_pps", g_ocxo1_clock.ns_count_at_pps);
 
   p.add("ocxo2_gnss_ns_at_edge", g_ocxo2_clock.gnss_ns_at_edge);
+  p.add("ocxo2_gnss_ns_between_edges", g_ocxo2_measurement.gnss_ns_between_edges);
   p.add("ocxo2_ns_count_at_edge", g_ocxo2_clock.ns_count_at_edge);
   p.add("ocxo2_ns_count_at_pps", g_ocxo2_clock.ns_count_at_pps);
 
@@ -618,12 +566,6 @@ static Payload cmd_report(const Payload&) {
   p.add("ocxo1_dac", ocxo1_dac.dac_fractional);
   p.add("ocxo2_dac", ocxo2_dac.dac_fractional);
   p.add("calibrate_ocxo", servo_mode_str(calibrate_ocxo_mode));
-
-  p.add("timebase_valid", timebase_valid());
-  p.add("timebase_gnss_ns",  timebase_now_ns(timebase_domain_t::GNSS));
-  p.add("timebase_dwt_ns",   timebase_now_ns(timebase_domain_t::DWT));
-  p.add("timebase_ocxo1_ns", timebase_now_ns(timebase_domain_t::OCXO1));
-  p.add("timebase_ocxo2_ns", timebase_now_ns(timebase_domain_t::OCXO2));
 
   return p;
 }

@@ -57,6 +57,7 @@ volatile uint64_t g_gnss_ns_count_at_pps = 0;
 
 volatile uint32_t g_dwt_cycle_count_at_pps = 0;
 volatile uint64_t g_dwt_cycle_count_total = 0;
+volatile uint32_t g_dwt_cycle_count_between_pps = 0;
 volatile uint32_t g_dwt_cycle_count_next_second_prediction = DWT_EXPECTED_PER_PPS;
 volatile int32_t  g_dwt_cycle_count_next_second_adjustment = 0;
 volatile uint64_t g_dwt_model_pps_count = 0;
@@ -222,11 +223,20 @@ static void alpha_request_epoch_zero(clocks_epoch_reason_t reason) {
   g_epoch_reason = reason;
 }
 
+static inline bool alpha_ocxo_edges_are_canonical(void) {
+  // OCXO edges are not canonically meaningful until a lawful PPS edge has
+  // established the current epoch. This naturally harmonizes with ZERO:
+  // request_zero causes a fresh epoch to be installed on the next lawful PPS,
+  // and until that happens, OCXO edges are ignored for canonical alpha state.
+  return g_epoch_initialized && !g_epoch_pending;
+}
+
 static void alpha_reset_canonical_clock_state_for_new_epoch(void) {
   g_gnss_ns_count_at_pps = 0;
 
   g_dwt_cycle_count_at_pps = 0;
   g_dwt_cycle_count_total = 0;
+  g_dwt_cycle_count_between_pps = 0;
   g_dwt_cycle_count_next_second_prediction = DWT_EXPECTED_PER_PPS;
   g_dwt_cycle_count_next_second_adjustment = 0;
   g_dwt_model_pps_count = 0;
@@ -266,6 +276,7 @@ static void alpha_install_new_epoch_from_pps(const interrupt_event_t& pps_event)
   g_gnss_ns_count_at_pps = 0;
   g_dwt_cycle_count_at_pps = pps_event.dwt_at_event;
   g_dwt_cycle_count_total = 0;
+  g_dwt_cycle_count_between_pps = 0;
   g_dwt_model_pps_count = 0;
   g_qtimer_at_pps = g_epoch_qtimer_at_pps;
 
@@ -369,6 +380,7 @@ static void pps_callback(
   {
     const uint32_t delta32 = event.dwt_at_event - prev_dwt_pps;
     g_dwt_cycle_count_total += (uint64_t)delta32;
+    g_dwt_cycle_count_between_pps = delta32;
 
     if (g_dwt_model_pps_count > 0) {
       g_dwt_cycle_count_next_second_prediction = delta32;
@@ -380,9 +392,8 @@ static void pps_callback(
   g_dwt_model_pps_count++;
 
   if (g_ocxo1_clock.gnss_ns_at_edge != 0 || g_ocxo1_measurement.prev_gnss_ns_at_edge == 0) {
-    // OCXO edge counts are treated as round-second OCXO boundaries.
-    // The GNSS timestamp at that edge expresses phase offset relative to PPS.
-    // Mirror that offset back from the OCXO edge to infer the OCXO count at PPS.
+    // Mirror the synthetic OCXO edge count back to PPS using the GNSS-side
+    // phase offset of the just-captured OCXO edge.
     const int64_t phase_offset_ns =
         (int64_t)g_ocxo1_clock.gnss_ns_at_edge - (int64_t)g_gnss_ns_count_at_pps;
     g_ocxo1_clock.ns_count_at_pps =
@@ -392,7 +403,6 @@ static void pps_callback(
   }
 
   if (g_ocxo2_clock.gnss_ns_at_edge != 0 || g_ocxo2_measurement.prev_gnss_ns_at_edge == 0) {
-    // Mirror the GNSS-side phase offset from the OCXO edge back to PPS.
     const int64_t phase_offset_ns =
         (int64_t)g_ocxo2_clock.gnss_ns_at_edge - (int64_t)g_gnss_ns_count_at_pps;
     g_ocxo2_clock.ns_count_at_pps =
@@ -432,23 +442,42 @@ static void ocxo1_callback(
     const interrupt_capture_diag_t* diag,
     void*) {
 
+  static uint32_t prev_counter32 = 0;
+
   clocks_capture_interrupt_diag(g_ocxo1_interrupt_diag, diag);
 
-  // Canonical GNSS epoch is local and zero-based.
-  g_ocxo1_clock.gnss_ns_at_edge = event.gnss_ns_at_event;
-  g_ocxo1_clock.ns_count_at_edge = (uint64_t)event.counter32_at_event * 100ULL;
-
-  if (g_ocxo1_measurement.prev_gnss_ns_at_edge != 0) {
-    const int64_t period_ns =
-        (int64_t)g_ocxo1_clock.gnss_ns_at_edge -
-        (int64_t)g_ocxo1_measurement.prev_gnss_ns_at_edge;
-
-    g_ocxo1_measurement.second_residual_ns = period_ns - 1000000000LL;
-  } else {
-    g_ocxo1_measurement.second_residual_ns = 0;
+  if (!alpha_ocxo_edges_are_canonical()) {
+    return;
   }
 
-  g_ocxo1_measurement.prev_gnss_ns_at_edge = g_ocxo1_clock.gnss_ns_at_edge;
+  const uint32_t raw_counter32 = event.counter32_at_event;
+  const uint64_t gnss_ns_at_edge = event.gnss_ns_at_event;
+
+  g_ocxo1_clock.gnss_ns_at_edge = gnss_ns_at_edge;
+
+  if (g_ocxo1_measurement.prev_gnss_ns_at_edge == 0) {
+    // First canonical OCXO edge of this epoch. Seed the synthetic OCXO clock
+    // directly from GNSS so the OCXO synthetic lineage starts in the lawful
+    // epoch frame rather than from raw GPT counter space.
+    g_ocxo1_clock.ns_count_at_edge = gnss_ns_at_edge;
+    g_ocxo1_measurement.gnss_ns_between_edges = 0;
+    g_ocxo1_measurement.second_residual_ns = 0;
+  } else {
+    const uint32_t delta32 = raw_counter32 - prev_counter32;
+    const uint64_t delta_ns = (uint64_t)delta32 * 100ULL;
+
+    g_ocxo1_clock.ns_count_at_edge += delta_ns;
+
+    const uint64_t gnss_ns_between_edges =
+        gnss_ns_at_edge - g_ocxo1_measurement.prev_gnss_ns_at_edge;
+
+    g_ocxo1_measurement.gnss_ns_between_edges = gnss_ns_between_edges;
+    g_ocxo1_measurement.second_residual_ns =
+        (int64_t)NS_PER_SECOND_U64 - (int64_t)gnss_ns_between_edges;
+  }
+
+  prev_counter32 = raw_counter32;
+  g_ocxo1_measurement.prev_gnss_ns_at_edge = gnss_ns_at_edge;
 }
 
 static void ocxo2_callback(
@@ -456,22 +485,39 @@ static void ocxo2_callback(
     const interrupt_capture_diag_t* diag,
     void*) {
 
+  static uint32_t prev_counter32 = 0;
+
   clocks_capture_interrupt_diag(g_ocxo2_interrupt_diag, diag);
 
-  g_ocxo2_clock.gnss_ns_at_edge = event.gnss_ns_at_event;
-  g_ocxo2_clock.ns_count_at_edge = (uint64_t)event.counter32_at_event * 100ULL;
-
-  if (g_ocxo2_measurement.prev_gnss_ns_at_edge != 0) {
-    const int64_t period_ns =
-        (int64_t)g_ocxo2_clock.gnss_ns_at_edge -
-        (int64_t)g_ocxo2_measurement.prev_gnss_ns_at_edge;
-
-    g_ocxo2_measurement.second_residual_ns = period_ns - 1000000000LL;
-  } else {
-    g_ocxo2_measurement.second_residual_ns = 0;
+  if (!alpha_ocxo_edges_are_canonical()) {
+    return;
   }
 
-  g_ocxo2_measurement.prev_gnss_ns_at_edge = g_ocxo2_clock.gnss_ns_at_edge;
+  const uint32_t raw_counter32 = event.counter32_at_event;
+  const uint64_t gnss_ns_at_edge = event.gnss_ns_at_event;
+
+  g_ocxo2_clock.gnss_ns_at_edge = gnss_ns_at_edge;
+
+  if (g_ocxo2_measurement.prev_gnss_ns_at_edge == 0) {
+    g_ocxo2_clock.ns_count_at_edge = gnss_ns_at_edge;
+    g_ocxo2_measurement.gnss_ns_between_edges = 0;
+    g_ocxo2_measurement.second_residual_ns = 0;
+  } else {
+    const uint32_t delta32 = raw_counter32 - prev_counter32;
+    const uint64_t delta_ns = (uint64_t)delta32 * 100ULL;
+
+    g_ocxo2_clock.ns_count_at_edge += delta_ns;
+
+    const uint64_t gnss_ns_between_edges =
+        gnss_ns_at_edge - g_ocxo2_measurement.prev_gnss_ns_at_edge;
+
+    g_ocxo2_measurement.gnss_ns_between_edges = gnss_ns_between_edges;
+    g_ocxo2_measurement.second_residual_ns =
+        (int64_t)NS_PER_SECOND_U64 - (int64_t)gnss_ns_between_edges;
+  }
+
+  prev_counter32 = raw_counter32;
+  g_ocxo2_measurement.prev_gnss_ns_at_edge = gnss_ns_at_edge;
 }
 
 // ============================================================================

@@ -74,6 +74,7 @@ static inline uint64_t dwt_ns_to_cycles(uint64_t ns) {
 extern volatile uint64_t g_gnss_ns_count_at_pps;
 
 extern volatile uint32_t g_dwt_cycle_count_at_pps;
+extern volatile uint32_t g_dwt_cycle_count_between_pps;
 extern volatile uint64_t g_dwt_cycle_count_total;
 extern volatile uint32_t g_dwt_cycle_count_next_second_prediction;
 extern volatile int32_t  g_dwt_cycle_count_next_second_adjustment;
@@ -102,6 +103,7 @@ extern ocxo_clock_state_t g_ocxo2_clock;
 
 struct ocxo_measurement_t {
   volatile int64_t  second_residual_ns;
+  volatile uint64_t gnss_ns_between_edges;
   volatile uint64_t prev_gnss_ns_at_edge;
 };
 
