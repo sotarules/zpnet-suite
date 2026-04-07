@@ -1,22 +1,30 @@
 """
-ZPNet Raw Cycles — v5 DWT Prediction Residual Monitor
+ZPNet Raw Cycles — v6 Fragment-Aware DWT + OCXO Prediction Monitor
 
-One row per second showing the DWT random walk prediction quality:
+One row per second showing DWT and OCXO edge timing:
 
-    predicted   = dwt_cycles_per_pps  (Teensy: prev_delta)
-    actual      = dwt_delta_raw       (Teensy: measured this second)
+    predicted   = fragment.dwt_cycle_count_next_second_prediction
+    actual      = fragment.dwt_cycle_count_between_pps
     residual    = actual - predicted
 
-Running Welford statistics (mean, stddev, stderr) accumulate across
-the campaign, reset on recovery gaps.
+Also shows OCXO1/OCXO2 dwt_cycles_between_edges to surface the
+42-cycle quantization artifact under investigation.
 
-The prediction residual stddev is the authoritative interpolation
-uncertainty for sub-second DWT time.
+Running Welford statistics accumulate across the campaign, reset
+on recovery gaps.
+
+v6 changes:
+  - Fragment-aware: reads all fields from the 'fragment' sub-dict
+    inside the TIMEBASE payload (v2026-04+ format).
+  - Falls back to top-level fields for backward compatibility with
+    pre-fragment TIMEBASE records.
+  - OCXO1/OCXO2 DWT delta columns added for quantization forensics.
+  - Separate Welford trackers for DWT, OCXO1, and OCXO2 deltas.
 
 Usage:
     python -m zpnet.tests.raw_cycles <campaign_name> [limit]
-    .zt raw_cycles Baseline8
-    .zt raw_cycles Baseline8 50
+    .zt raw_cycles Phase2
+    .zt raw_cycles Phase2 50
 """
 
 from __future__ import annotations
@@ -60,6 +68,20 @@ class Welford:
         self.n = 0
         self.mean = 0.0
         self.m2 = 0.0
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Fragment-aware field access
+# ─────────────────────────────────────────────────────────────────────
+
+def _frag(rec: Dict[str, Any], key: str) -> Any:
+    """Read a field from the fragment sub-dict, fall back to top-level."""
+    frag = rec.get("fragment")
+    if isinstance(frag, dict):
+        v = frag.get(key)
+        if v is not None:
+            return v
+    return rec.get(key)
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -112,7 +134,10 @@ def analyze(campaign: str, limit: int = 0) -> None:
         f"  {'residual':>9s}"
         f"  {'mean':>8s}"
         f"  {'stddev':>8s}"
-        f"  {'stderr':>8s}"
+        f"  {'o1_dwt':>14s}"
+        f"  {'o2_dwt':>14s}"
+        f"  {'o1-pps':>9s}"
+        f"  {'o2-pps':>9s}"
     )
     print(
         f"  {'─' * 5}"
@@ -121,22 +146,23 @@ def analyze(campaign: str, limit: int = 0) -> None:
         f"  {'─' * 9}"
         f"  {'─' * 8}"
         f"  {'─' * 8}"
-        f"  {'─' * 8}"
+        f"  {'─' * 14}"
+        f"  {'─' * 14}"
+        f"  {'─' * 9}"
+        f"  {'─' * 9}"
     )
 
-    w = Welford()
+    w_dwt = Welford()
+    w_o1 = Welford()
+    w_o2 = Welford()
     count = 0
     gaps = 0
     prev_pps: Optional[int] = None
 
     for rec in rows:
         pps = rec.get("pps_count")
-        predicted = rec.get("dwt_cycles_per_pps")
-        actual = rec.get("dwt_delta_raw")
-
         if pps is None:
             continue
-
         pps = int(pps)
 
         # Gap detection — reset Welford on non-consecutive PPS
@@ -144,54 +170,129 @@ def analyze(campaign: str, limit: int = 0) -> None:
             skipped = pps - prev_pps - 1
             gaps += 1
             print(f"  {'':>5s}  --- gap {prev_pps} → {pps} ({skipped}s lost, stats reset) ---")
-            w.reset()
+            w_dwt.reset()
+            w_o1.reset()
+            w_o2.reset()
 
         prev_pps = pps
 
-        # Both fields required for a meaningful row
-        if predicted is None or actual is None:
-            continue
+        # DWT fields — fragment-aware with fallback
+        predicted = _frag(rec, "dwt_cycle_count_next_second_prediction")
+        actual = _frag(rec, "dwt_cycle_count_between_pps")
 
-        predicted = int(predicted)
-        actual = int(actual)
-        residual = actual - predicted
+        # Legacy fallback for pre-fragment records
+        if predicted is None:
+            predicted = rec.get("dwt_cycles_per_pps")
+        if actual is None:
+            actual = rec.get("dwt_delta_raw")
 
-        w.update(float(residual))
+        # OCXO DWT deltas from fragment
+        o1_dwt = _frag(rec, "ocxo1_dwt_cycles_between_edges")
+        o2_dwt = _frag(rec, "ocxo2_dwt_cycles_between_edges")
 
-        mean_str = f"{w.mean:>+8.1f}" if w.n >= 1 else f"{'---':>8s}"
-        sd_str = f"{w.stddev:>8.1f}" if w.n >= 2 else f"{'---':>8s}"
-        se_str = f"{w.stderr:>8.3f}" if w.n >= 2 else f"{'---':>8s}"
+        # DWT prediction residual
+        if predicted is not None and actual is not None:
+            predicted = int(predicted)
+            actual = int(actual)
+            residual = actual - predicted
+            w_dwt.update(float(residual))
+
+            res_str = f"{residual:>+9d}"
+            mean_str = f"{w_dwt.mean:>+8.1f}" if w_dwt.n >= 1 else f"{'---':>8s}"
+            sd_str = f"{w_dwt.stddev:>8.1f}" if w_dwt.n >= 2 else f"{'---':>8s}"
+        else:
+            actual = None
+            res_str = f"{'---':>9s}"
+            mean_str = f"{'---':>8s}"
+            sd_str = f"{'---':>8s}"
+
+        # OCXO delta vs PPS delta (shows quantization offset)
+        if o1_dwt is not None:
+            o1_dwt = int(o1_dwt)
+            w_o1.update(float(o1_dwt))
+        if o2_dwt is not None:
+            o2_dwt = int(o2_dwt)
+            w_o2.update(float(o2_dwt))
+
+        o1_diff = o1_dwt - actual if (o1_dwt is not None and actual is not None) else None
+        o2_diff = o2_dwt - actual if (o2_dwt is not None and actual is not None) else None
 
         print(
             f"  {pps:>5d}"
-            f"  {predicted:>14,}"
-            f"  {actual:>14,}"
-            f"  {residual:>+9d}"
+            f"  {predicted:>14,}" if predicted is not None else f"  {'---':>14s}",
+            end=""
+        )
+        print(
+            f"  {actual:>14,}" if actual is not None else f"  {'---':>14s}",
+            end=""
+        )
+        print(
+            f"  {res_str}"
             f"  {mean_str}"
-            f"  {sd_str}"
-            f"  {se_str}"
+            f"  {sd_str}",
+            end=""
+        )
+        print(
+            f"  {o1_dwt:>14,}" if o1_dwt is not None else f"  {'---':>14s}",
+            end=""
+        )
+        print(
+            f"  {o2_dwt:>14,}" if o2_dwt is not None else f"  {'---':>14s}",
+            end=""
+        )
+        print(
+            f"  {o1_diff:>+9d}" if o1_diff is not None else f"  {'---':>9s}",
+            end=""
+        )
+        print(
+            f"  {o2_diff:>+9d}" if o2_diff is not None else f"  {'---':>9s}"
         )
 
         count += 1
         if limit and count >= limit:
             break
 
-    # Summary
+    # ── Summary ──
     print()
     print(f"  {count} rows, {gaps} recovery gap(s)")
     print()
 
-    if w.n >= 2:
-        pred_ns = w.stddev * (125.0 / 126.0)
+    if w_dwt.n >= 2:
+        pred_ns = w_dwt.stddev * (125.0 / 126.0)
         print(f"  DWT prediction residual (actual - predicted):")
-        print(f"    n       = {w.n:,}")
-        print(f"    mean    = {w.mean:+.2f} cycles")
-        print(f"    stddev  = {w.stddev:.2f} cycles")
-        print(f"    stderr  = {w.stderr:.3f} cycles")
+        print(f"    n       = {w_dwt.n:,}")
+        print(f"    mean    = {w_dwt.mean:+.2f} cycles")
+        print(f"    stddev  = {w_dwt.stddev:.2f} cycles")
+        print(f"    stderr  = {w_dwt.stderr:.3f} cycles")
+        print(f"    1σ interpolation uncertainty = {pred_ns:.1f} ns")
         print()
-        print(f"  Interpolation bound:")
-        print(f"    1σ prediction uncertainty = {pred_ns:.1f} ns")
-        print(f"    This is the authoritative sub-second interpolation error.")
+
+    if w_o1.n >= 2:
+        print(f"  OCXO1 DWT cycles between edges:")
+        print(f"    n       = {w_o1.n:,}")
+        print(f"    mean    = {w_o1.mean:,.2f}")
+        print(f"    stddev  = {w_o1.stddev:.2f} cycles")
+        print(f"    range   = {w_o1.mean - 3*w_o1.stddev:,.0f} .. {w_o1.mean + 3*w_o1.stddev:,.0f} (3σ)")
+        print()
+
+    if w_o2.n >= 2:
+        print(f"  OCXO2 DWT cycles between edges:")
+        print(f"    n       = {w_o2.n:,}")
+        print(f"    mean    = {w_o2.mean:,.2f}")
+        print(f"    stddev  = {w_o2.stddev:.2f} cycles")
+        print(f"    range   = {w_o2.mean - 3*w_o2.stddev:,.0f} .. {w_o2.mean + 3*w_o2.stddev:,.0f} (3σ)")
+        print()
+
+    # ── Quantization summary ──
+    if w_o1.n >= 10 and w_dwt.n >= 10:
+        print(f"  Quantization analysis:")
+        print(f"    DWT PPS stddev:   {w_dwt.stddev:.2f} cycles")
+        print(f"    OCXO1 edge stddev: {w_o1.stddev:.2f} cycles")
+        print(f"    OCXO2 edge stddev: {w_o2.stddev:.2f} cycles")
+        if w_o1.stddev > 15:
+            print(f"    ⚠ OCXO1 bimodal regime likely (stddev >> DWT noise)")
+        if w_o2.stddev > 15:
+            print(f"    ⚠ OCXO2 bimodal regime likely (stddev >> DWT noise)")
         print()
 
 

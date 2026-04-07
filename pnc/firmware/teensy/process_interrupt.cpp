@@ -199,6 +199,11 @@ struct interrupt_subscriber_runtime_t {
   uint32_t event_count = 0;
 
   prespin_state_t prespin {};
+
+  // ── Per-subscriber forensic state for DWT delta investigation ──
+  uint32_t forensic_prev_dwt_isr_entry_raw = 0;
+  uint32_t forensic_prev_dwt_at_event = 0;
+  bool     forensic_prev_valid = false;
 };
 
 // ============================================================================
@@ -703,6 +708,26 @@ static void fill_diag_common(interrupt_subscriber_runtime_t& rt,
   diag.prespin_complete_count = rt.prespin.complete_count;
   diag.prespin_timeout_count = rt.prespin.timeout_count;
   diag.anomaly_count = rt.prespin.anomaly_count;
+
+  // ── Forensic delta fields ──
+  diag.prev_valid = rt.forensic_prev_valid;
+
+  if (rt.forensic_prev_valid) {
+    diag.prev_dwt_isr_entry_raw = rt.forensic_prev_dwt_isr_entry_raw;
+    diag.prev_dwt_at_event_adjusted = rt.forensic_prev_dwt_at_event;
+    diag.dwt_delta_raw = dwt_isr_entry_raw - rt.forensic_prev_dwt_isr_entry_raw;
+    diag.dwt_delta_adjusted = event.dwt_at_event - rt.forensic_prev_dwt_at_event;
+  } else {
+    diag.prev_dwt_isr_entry_raw = 0;
+    diag.prev_dwt_at_event_adjusted = 0;
+    diag.dwt_delta_raw = 0;
+    diag.dwt_delta_adjusted = 0;
+  }
+
+  // Update forensic state for the next edge.
+  rt.forensic_prev_dwt_isr_entry_raw = dwt_isr_entry_raw;
+  rt.forensic_prev_dwt_at_event = event.dwt_at_event;
+  rt.forensic_prev_valid = true;
 }
 
 // ============================================================================
@@ -946,6 +971,11 @@ bool interrupt_start(interrupt_subscriber_kind_t kind) {
   rt->start_count++;
 
   rt->prespin.active = false;
+
+  // Reset forensic state on start.
+  rt->forensic_prev_valid = false;
+  rt->forensic_prev_dwt_isr_entry_raw = 0;
+  rt->forensic_prev_dwt_at_event = 0;
 
   if (kind == interrupt_subscriber_kind_t::PPS) {
     debug_log("pps.start", "requested");
@@ -1200,10 +1230,31 @@ static Payload cmd_report(const Payload&) {
     s.add("last_correction_cycles", rt.last_event.dwt_event_correction_cycles);
     s.add("last_status", (uint32_t)rt.last_event.status);
 
+    // ── Forensic delta fields ──
+    s.add("forensic_prev_valid", rt.last_diag.prev_valid);
+    s.add("forensic_prev_dwt_isr_entry_raw", rt.last_diag.prev_dwt_isr_entry_raw);
+    s.add("forensic_prev_dwt_at_event_adjusted", rt.last_diag.prev_dwt_at_event_adjusted);
+    s.add("forensic_dwt_delta_raw", rt.last_diag.dwt_delta_raw);
+    s.add("forensic_dwt_delta_adjusted", rt.last_diag.dwt_delta_adjusted);
+
     subscribers.add(s);
   }
 
   p.add_array("subscribers", subscribers);
+
+  // ── Clock domain forensics ──
+  const uint32_t cbcdr = CCM_CBCDR;
+  const uint32_t ipg_div = ((cbcdr >> 8) & 0x3) + 1;   // IPG_PODF: bits 9:8
+  const uint32_t ahb_div = ((cbcdr >> 10) & 0x7) + 1;  // AHB_PODF: bits 12:10
+  const uint32_t periph_clk2_div = ((cbcdr >> 27) & 0x7) + 1;
+  p.add("ccm_cbcdr_raw", cbcdr);
+  p.add("ipg_podf", ipg_div);
+  p.add("ahb_podf", ahb_div);
+  p.add("periph_clk2_podf", periph_clk2_div);
+  p.add("f_cpu", (uint32_t)F_CPU);
+  p.add("ipg_freq_hz", (uint32_t)(F_CPU / ahb_div / ipg_div));
+  p.add("dwt_cycles_per_ipg_tick", ahb_div * ipg_div);
+
   return p;
 }
 

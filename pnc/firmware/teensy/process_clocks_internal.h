@@ -146,6 +146,12 @@ static inline void clocks_payload_add_interrupt_diag(Payload& p,
   add_u32("prespin_complete_count", diag.prespin_complete_count);
   add_u32("prespin_timeout_count", diag.prespin_timeout_count);
   add_u32("anomaly_count", diag.anomaly_count);
+
+  add_bool("prev_valid", diag.prev_valid);
+  add_u32("prev_dwt_isr_entry_raw", diag.prev_dwt_isr_entry_raw);
+  add_u32("prev_dwt_at_event_adjusted", diag.prev_dwt_at_event_adjusted);
+  add_u32("dwt_delta_raw", diag.dwt_delta_raw);
+  add_u32("dwt_delta_adjusted", diag.dwt_delta_adjusted);
 }
 
 // ============================================================================

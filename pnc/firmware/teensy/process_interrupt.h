@@ -144,6 +144,24 @@ struct interrupt_capture_diag_t {
   uint32_t prespin_complete_count = 0;
   uint32_t prespin_timeout_count = 0;
   uint32_t anomaly_count = 0;
+
+  // ── Forensic fields for DWT quantization investigation ──
+  //
+  // These fields capture the previous edge's DWT values so that the
+  // delta can be independently verified on the Pi side without relying
+  // on the alpha callback's subtraction.
+  //
+  // If dwt_delta_direct (raw[n] - raw[n-1]) is a multiple of 42 but
+  // the individual raw values are NOT on a 42-cycle grid, the
+  // quantization is being introduced by something other than the
+  // DWT capture.  If the raw delta IS a multiple of 42, the GPT
+  // compare-match is quantizing the DWT capture moment.
+
+  uint32_t prev_dwt_isr_entry_raw = 0;     // raw DWT from previous edge
+  uint32_t prev_dwt_at_event_adjusted = 0;  // corrected DWT from previous edge
+  uint32_t dwt_delta_raw = 0;               // dwt_isr_entry_raw - prev_dwt_isr_entry_raw
+  uint32_t dwt_delta_adjusted = 0;          // dwt_at_event - prev_dwt_at_event
+  bool     prev_valid = false;              // true after first edge (prev values meaningful)
 };
 
 // ============================================================================
