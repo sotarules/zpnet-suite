@@ -44,9 +44,6 @@ uint64_t recover_gnss_ns  = 0;
 uint64_t recover_ocxo1_ns = 0;
 uint64_t recover_ocxo2_ns = 0;
 
-// Sacred PPS-boundary handshake state.
-// True means clocks has asked interrupt to consummate PPS ZERO on a real PPS
-// edge and is now waiting for interrupt_pps_zero_pending() to fall false.
 static volatile bool zero_handshake_in_flight = false;
 
 volatile bool     watchdog_anomaly_active          = false;
@@ -128,12 +125,6 @@ double dac_welford_stderr(const dac_welford_t& w) {
 // ============================================================================
 // Zeroing
 // ============================================================================
-//
-// IMPORTANT:
-// Canonical always-on physics clocks are no longer zeroed here.
-// Alpha owns epoch installation on the lawful PPS edge.
-// Beta zeroing is campaign-layer reset only.
-//
 
 void clocks_zero_all(void) {
   timebase_invalidate();
@@ -416,11 +407,15 @@ void clocks_beta_pps(void) {
 
   p.add("ocxo1_gnss_ns_at_edge", g_ocxo1_clock.gnss_ns_at_edge);
   p.add("ocxo1_gnss_ns_between_edges", g_ocxo1_measurement.gnss_ns_between_edges);
+  p.add("ocxo1_dwt_at_edge", g_ocxo1_measurement.dwt_at_edge);
+  p.add("ocxo1_dwt_cycles_between_edges", g_ocxo1_measurement.dwt_cycles_between_edges);
   p.add("ocxo1_ns_count_at_edge", g_ocxo1_clock.ns_count_at_edge);
   p.add("ocxo1_ns_count_at_pps", g_ocxo1_clock.ns_count_at_pps);
 
   p.add("ocxo2_gnss_ns_at_edge", g_ocxo2_clock.gnss_ns_at_edge);
   p.add("ocxo2_gnss_ns_between_edges", g_ocxo2_measurement.gnss_ns_between_edges);
+  p.add("ocxo2_dwt_at_edge", g_ocxo2_measurement.dwt_at_edge);
+  p.add("ocxo2_dwt_cycles_between_edges", g_ocxo2_measurement.dwt_cycles_between_edges);
   p.add("ocxo2_ns_count_at_edge", g_ocxo2_clock.ns_count_at_edge);
   p.add("ocxo2_ns_count_at_pps", g_ocxo2_clock.ns_count_at_pps);
 
@@ -552,11 +547,15 @@ static Payload cmd_report(const Payload&) {
 
   p.add("ocxo1_gnss_ns_at_edge", g_ocxo1_clock.gnss_ns_at_edge);
   p.add("ocxo1_gnss_ns_between_edges", g_ocxo1_measurement.gnss_ns_between_edges);
+  p.add("ocxo1_dwt_at_edge", g_ocxo1_measurement.dwt_at_edge);
+  p.add("ocxo1_dwt_cycles_between_edges", g_ocxo1_measurement.dwt_cycles_between_edges);
   p.add("ocxo1_ns_count_at_edge", g_ocxo1_clock.ns_count_at_edge);
   p.add("ocxo1_ns_count_at_pps", g_ocxo1_clock.ns_count_at_pps);
 
   p.add("ocxo2_gnss_ns_at_edge", g_ocxo2_clock.gnss_ns_at_edge);
   p.add("ocxo2_gnss_ns_between_edges", g_ocxo2_measurement.gnss_ns_between_edges);
+  p.add("ocxo2_dwt_at_edge", g_ocxo2_measurement.dwt_at_edge);
+  p.add("ocxo2_dwt_cycles_between_edges", g_ocxo2_measurement.dwt_cycles_between_edges);
   p.add("ocxo2_ns_count_at_edge", g_ocxo2_clock.ns_count_at_edge);
   p.add("ocxo2_ns_count_at_pps", g_ocxo2_clock.ns_count_at_pps);
 

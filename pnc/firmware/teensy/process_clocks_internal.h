@@ -1,37 +1,6 @@
 // ============================================================================
 // process_clocks_internal.h — Shared Internal State (Alpha ↔ Beta)
 // ============================================================================
-//
-// Nanosecond-first clock model.
-//
-// Core intent:
-//
-//   • GNSS nanoseconds are the canonical public truth.
-//   • DWT remains the bridge substrate and is the only clock with a live
-//     next-second adjustment term.
-//   • OCXO1 / OCXO2 are modeled by:
-//       - last observed edge in GNSS ns
-//       - last observed local nanosecond count at that edge
-//   • PPS computes the canonical at-PPS values that feed TIMEBASE and now().
-//   • Diagnostics belong in process_interrupt and reports, not in sacred state.
-//
-// Time source discipline — gears, not rubber bands:
-//
-//   All time values in the clocks subsystem are derived from ISR-captured
-//   facts (DWT at event, GNSS ns at event, counter32 at event) or from
-//   pure arithmetic on those facts.  No live counter reads are used for
-//   canonical state or scheduling.
-//
-//   The sole exception is the DWT adjustment timer, which reads DWT_CYCCNT
-//   directly at 10 kHz to calibrate the DWT rate prediction mid-second.
-//   This is a legitimate real-time feedback loop operating on the DWT
-//   bridge substrate, not a canonical time source.
-//
-//   The QTimer value for time_pps_update() is computed as:
-//     qtimer_at_pps += TICKS_10MHZ_PER_SECOND
-//   Pure arithmetic from the epoch anchor.  No live QTimer read.
-//
-// ============================================================================
 
 #pragma once
 
@@ -74,8 +43,8 @@ static inline uint64_t dwt_ns_to_cycles(uint64_t ns) {
 extern volatile uint64_t g_gnss_ns_count_at_pps;
 
 extern volatile uint32_t g_dwt_cycle_count_at_pps;
-extern volatile uint32_t g_dwt_cycle_count_between_pps;
 extern volatile uint64_t g_dwt_cycle_count_total;
+extern volatile uint32_t g_dwt_cycle_count_between_pps;
 extern volatile uint32_t g_dwt_cycle_count_next_second_prediction;
 extern volatile int32_t  g_dwt_cycle_count_next_second_adjustment;
 extern volatile uint64_t g_dwt_model_pps_count;
@@ -104,7 +73,10 @@ extern ocxo_clock_state_t g_ocxo2_clock;
 struct ocxo_measurement_t {
   volatile int64_t  second_residual_ns;
   volatile uint64_t gnss_ns_between_edges;
+  volatile uint32_t dwt_at_edge;
+  volatile uint32_t dwt_cycles_between_edges;
   volatile uint64_t prev_gnss_ns_at_edge;
+  volatile uint32_t prev_dwt_at_edge;
 };
 
 extern ocxo_measurement_t g_ocxo1_measurement;

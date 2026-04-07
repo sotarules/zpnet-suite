@@ -224,10 +224,6 @@ static void alpha_request_epoch_zero(clocks_epoch_reason_t reason) {
 }
 
 static inline bool alpha_ocxo_edges_are_canonical(void) {
-  // OCXO edges are not canonically meaningful until a lawful PPS edge has
-  // established the current epoch. This naturally harmonizes with ZERO:
-  // request_zero causes a fresh epoch to be installed on the next lawful PPS,
-  // and until that happens, OCXO edges are ignored for canonical alpha state.
   return g_epoch_initialized && !g_epoch_pending;
 }
 
@@ -266,13 +262,10 @@ static void alpha_install_new_epoch_from_pps(const interrupt_event_t& pps_event)
 
   g_epoch_dwt_at_pps = pps_event.dwt_at_event;
 
-  // The sole live QTimer read — boot-time boundary crossing.
-  // After this, g_qtimer_at_pps is advanced by pure arithmetic.
   g_epoch_qtimer_at_pps = qtimer1_read_32_once();
 
   alpha_reset_canonical_clock_state_for_new_epoch();
 
-  // Canonical PPS-origin values are zero at the epoch edge.
   g_gnss_ns_count_at_pps = 0;
   g_dwt_cycle_count_at_pps = pps_event.dwt_at_event;
   g_dwt_cycle_count_total = 0;
@@ -288,18 +281,12 @@ static void alpha_install_new_epoch_from_pps(const interrupt_event_t& pps_event)
   g_ocxo2_clock.ns_count_at_edge = 0;
   g_ocxo2_clock.ns_count_at_pps = 0;
 
-  // Restart the universal local time epoch at this lawful PPS edge.
   time_pps_epoch_reset(pps_event.dwt_at_event, g_epoch_qtimer_at_pps);
 }
 
 // ============================================================================
 // Helper: derive DWT adjustment at 10 kHz
 // ============================================================================
-//
-// This reads DWT_CYCCNT directly — a legitimate real-time feedback loop
-// on the DWT bridge substrate.  The DWT is not a canonical time source;
-// it is the interpolation substrate between PPS edges, and this timer
-// keeps the interpolation rate prediction accurate mid-second.
 
 static void dwt_adjustment_timer_callback(timepop_ctx_t* ctx, timepop_diag_t*, void*) {
   if (g_gnss_ns_count_at_pps == 0) return;
@@ -343,9 +330,6 @@ static void pps_callback(
 
   clocks_capture_interrupt_diag(g_pps_interrupt_diag, diag);
 
-  // --------------------------------------------------------------------------
-  // Epoch establishment — only on a lawful PPS edge
-  // --------------------------------------------------------------------------
   if (!g_epoch_initialized || g_epoch_pending) {
     alpha_install_new_epoch_from_pps(event);
 
@@ -365,16 +349,10 @@ static void pps_callback(
     return;
   }
 
-  // --------------------------------------------------------------------------
-  // Normal PPS advancement within current epoch
-  // --------------------------------------------------------------------------
   g_epoch_pps_index++;
   g_gnss_ns_count_at_pps = g_epoch_pps_index * NS_PER_SECOND_U64;
   g_dwt_cycle_count_at_pps = event.dwt_at_event;
 
-  // Geared QTimer — pure arithmetic, no live read.
-  // VCLOCK runs on the GNSS 10 MHz input, so exactly TICKS_10MHZ_PER_SECOND
-  // ticks elapse between consecutive PPS edges by definition.
   g_qtimer_at_pps += TICKS_10MHZ_PER_SECOND;
 
   {
@@ -392,8 +370,6 @@ static void pps_callback(
   g_dwt_model_pps_count++;
 
   if (g_ocxo1_clock.gnss_ns_at_edge != 0 || g_ocxo1_measurement.prev_gnss_ns_at_edge == 0) {
-    // Mirror the synthetic OCXO edge count back to PPS using the GNSS-side
-    // phase offset of the just-captured OCXO edge.
     const int64_t phase_offset_ns =
         (int64_t)g_ocxo1_clock.gnss_ns_at_edge - (int64_t)g_gnss_ns_count_at_pps;
     g_ocxo1_clock.ns_count_at_pps =
@@ -411,7 +387,6 @@ static void pps_callback(
     g_ocxo2_clock.ns_count_at_pps = 0;
   }
 
-  // Update the universal time anchor — geared QTimer, ISR-captured DWT.
   time_pps_update(
     g_dwt_cycle_count_at_pps,
     dwt_effective_cycles_per_second(),
@@ -422,9 +397,6 @@ static void pps_callback(
     clocks_beta_pps();
   }
 
-  // If beta just initiated a zero handshake, request alpha epoch reset.
-  // This must be checked AFTER clocks_beta_pps() so beta has had a chance
-  // to call interrupt_request_pps_zero() on this turn.
   if (request_zero && !g_epoch_pending) {
     alpha_request_epoch_zero(clocks_epoch_reason_t::ZERO);
   }
@@ -451,16 +423,16 @@ static void ocxo1_callback(
   }
 
   const uint32_t raw_counter32 = event.counter32_at_event;
+  const uint32_t dwt_at_edge = event.dwt_at_event;
   const uint64_t gnss_ns_at_edge = event.gnss_ns_at_event;
 
   g_ocxo1_clock.gnss_ns_at_edge = gnss_ns_at_edge;
+  g_ocxo1_measurement.dwt_at_edge = dwt_at_edge;
 
   if (g_ocxo1_measurement.prev_gnss_ns_at_edge == 0) {
-    // First canonical OCXO edge of this epoch. Seed the synthetic OCXO clock
-    // directly from GNSS so the OCXO synthetic lineage starts in the lawful
-    // epoch frame rather than from raw GPT counter space.
     g_ocxo1_clock.ns_count_at_edge = gnss_ns_at_edge;
     g_ocxo1_measurement.gnss_ns_between_edges = 0;
+    g_ocxo1_measurement.dwt_cycles_between_edges = 0;
     g_ocxo1_measurement.second_residual_ns = 0;
   } else {
     const uint32_t delta32 = raw_counter32 - prev_counter32;
@@ -471,13 +443,18 @@ static void ocxo1_callback(
     const uint64_t gnss_ns_between_edges =
         gnss_ns_at_edge - g_ocxo1_measurement.prev_gnss_ns_at_edge;
 
+    const uint32_t dwt_cycles_between_edges =
+        dwt_at_edge - g_ocxo1_measurement.prev_dwt_at_edge;
+
     g_ocxo1_measurement.gnss_ns_between_edges = gnss_ns_between_edges;
+    g_ocxo1_measurement.dwt_cycles_between_edges = dwt_cycles_between_edges;
     g_ocxo1_measurement.second_residual_ns =
         (int64_t)NS_PER_SECOND_U64 - (int64_t)gnss_ns_between_edges;
   }
 
   prev_counter32 = raw_counter32;
   g_ocxo1_measurement.prev_gnss_ns_at_edge = gnss_ns_at_edge;
+  g_ocxo1_measurement.prev_dwt_at_edge = dwt_at_edge;
 }
 
 static void ocxo2_callback(
@@ -494,13 +471,16 @@ static void ocxo2_callback(
   }
 
   const uint32_t raw_counter32 = event.counter32_at_event;
+  const uint32_t dwt_at_edge = event.dwt_at_event;
   const uint64_t gnss_ns_at_edge = event.gnss_ns_at_event;
 
   g_ocxo2_clock.gnss_ns_at_edge = gnss_ns_at_edge;
+  g_ocxo2_measurement.dwt_at_edge = dwt_at_edge;
 
   if (g_ocxo2_measurement.prev_gnss_ns_at_edge == 0) {
     g_ocxo2_clock.ns_count_at_edge = gnss_ns_at_edge;
     g_ocxo2_measurement.gnss_ns_between_edges = 0;
+    g_ocxo2_measurement.dwt_cycles_between_edges = 0;
     g_ocxo2_measurement.second_residual_ns = 0;
   } else {
     const uint32_t delta32 = raw_counter32 - prev_counter32;
@@ -511,13 +491,18 @@ static void ocxo2_callback(
     const uint64_t gnss_ns_between_edges =
         gnss_ns_at_edge - g_ocxo2_measurement.prev_gnss_ns_at_edge;
 
+    const uint32_t dwt_cycles_between_edges =
+        dwt_at_edge - g_ocxo2_measurement.prev_dwt_at_edge;
+
     g_ocxo2_measurement.gnss_ns_between_edges = gnss_ns_between_edges;
+    g_ocxo2_measurement.dwt_cycles_between_edges = dwt_cycles_between_edges;
     g_ocxo2_measurement.second_residual_ns =
         (int64_t)NS_PER_SECOND_U64 - (int64_t)gnss_ns_between_edges;
   }
 
   prev_counter32 = raw_counter32;
   g_ocxo2_measurement.prev_gnss_ns_at_edge = gnss_ns_at_edge;
+  g_ocxo2_measurement.prev_dwt_at_edge = dwt_at_edge;
 }
 
 // ============================================================================
@@ -536,7 +521,6 @@ void process_clocks_init(void) {
   time_init();
   timebase_init();
 
-  // Startup uses the same sacred epoch model as ZERO/START.
   alpha_request_epoch_zero(clocks_epoch_reason_t::INIT);
 
   g_ad5693r_init_ok = ad5693r_init();
