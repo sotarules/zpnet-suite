@@ -13,6 +13,7 @@
 // Owned machinery:
 //   • Shared pre-spin shadow-write loop with responsibility counter
 //   • Event reconstruction (DWT correction, GNSS ns projection)
+//   • OCXO quantization discovery + best-estimate event reconstruction
 //   • Subscriber dispatch with canonical event + diagnostics
 //   • PPS geared drumbeat scheduling from sacred PPS baseline
 //   • PPS ZERO-request latching and sacred edge consummation
@@ -96,6 +97,8 @@
 #include <Arduino.h>
 #include "imxrt.h"
 
+#include <math.h>
+
 // ============================================================================
 // Constants
 // ============================================================================
@@ -111,17 +114,20 @@ static constexpr uint32_t PRESPIN_TIMEOUT_CYCLES = 100800;       // ~100 µs @ 1
 // GPT continues to use the profiled fixed-overhead constant.
 static constexpr uint32_t PPS_ISR_FIXED_OVERHEAD_CYCLES = 48;
 
+// Runtime quantization-model policy.
+// These are discovery / estimator policy knobs, not discovered hardware constants.
+static constexpr uint32_t DEQUANT_MAX_BUCKETS = 8;
+static constexpr uint32_t DEQUANT_MIN_CONFIDENCE = 12;
+static constexpr uint32_t DEQUANT_MIN_DISTINCT_BUCKETS = 3;
+
+// Drop-dead-dumb mean window knob.
+// Change this for testing.
+// 8 or 16 are the intended test values.
+static constexpr uint32_t DEQUANT_MEAN_WINDOW = 8;
+
 // ============================================================================
 // Shared prespin state — responsibility counter architecture
 // ============================================================================
-//
-// One shadow DWT serves all clocks.  The spin loop writes it continuously.
-// Edge ISRs (priority 0) preempt the loop, read the shadow, and decrement
-// the responsibility counter.  The loop exits when the counter reaches 0.
-//
-// Prespin register callbacks (scheduled context) increment the counter
-// and arm a named ASAP timer ("PRESPIN_SPIN").  Named singleton replacement
-// ensures only one spin callback fires.  The spin runs from that callback.
 
 static volatile uint32_t g_prespin_shadow_dwt = 0;
 static volatile uint32_t g_prespin_start_dwt = 0;
@@ -146,9 +152,6 @@ struct interrupt_subscriber_descriptor_t {
 };
 
 struct prespin_state_t {
-  // active means this clock has requested prespin service.
-  // Set when the prespin callback increments the responsibility counter.
-  // Cleared when the edge ISR fires and snapshots the result.
   volatile bool active = false;
 
   uint64_t event_target_gnss_ns = 0;
@@ -161,22 +164,50 @@ struct prespin_state_t {
   uint32_t timeout_count = 0;
   uint32_t anomaly_count = 0;
 
-  // Instrumentation for schedule/arm timing analysis.
   uint64_t last_schedule_now_gnss_ns = 0;
   uint64_t last_schedule_delay_ns = 0;
   int64_t  last_prespin_margin_ns = 0;
   uint64_t last_schedule_event_target_gnss_ns = 0;
   uint64_t last_schedule_prespin_target_gnss_ns = 0;
 
-  // ISR-snapshot fields.
-  //
-  // The edge ISR reads the shared shadow DWT and stores values here
-  // for downstream math, diagnostics, and REPORT.
   uint32_t snap_start_dwt = 0;
   uint32_t snap_shadow_dwt = 0;
   uint32_t snap_dwt_isr_entry_raw = 0;
   bool     snap_fired = false;
   bool     snap_timed_out = false;
+};
+
+struct interrupt_dequant_state_t {
+  bool initialized = false;
+  bool quantization_detected = false;
+  bool dequant_enabled = false;
+
+  uint32_t inferred_bucket_cycles = 0;
+  uint32_t confidence = 0;
+
+  uint32_t bucket_value[DEQUANT_MAX_BUCKETS] = {};
+  uint32_t bucket_hits[DEQUANT_MAX_BUCKETS] = {};
+  uint32_t bucket_count = 0;
+
+  // Fixed-window dumb mean over recent OBSERVED deltas.
+  uint32_t recent_delta[DEQUANT_MEAN_WINDOW] = {};
+  uint32_t recent_count = 0;
+  uint32_t recent_head = 0;
+
+  uint32_t last_observed_dwt_at_event = 0;
+  uint32_t last_best_dwt_at_event = 0;
+  uint32_t last_observed_delta_cycles = 0;
+  uint32_t last_best_delta_cycles = 0;
+  uint32_t last_bucket_value = 0;
+
+  uint32_t bucket_same_count = 0;
+  uint32_t bucket_change_count = 0;
+
+  double   estimated_delta_cycles = 0.0;
+  double   estimated_dwt_at_event = 0.0;
+
+  int32_t  last_innovation_cycles = 0;
+  double   last_applied_correction_cycles = 0.0;
 };
 
 struct interrupt_subscriber_runtime_t {
@@ -199,10 +230,11 @@ struct interrupt_subscriber_runtime_t {
   uint32_t event_count = 0;
 
   prespin_state_t prespin {};
+  interrupt_dequant_state_t dequant {};
 
-  // ── Per-subscriber forensic state for DWT delta investigation ──
   uint32_t forensic_prev_dwt_isr_entry_raw = 0;
-  uint32_t forensic_prev_dwt_at_event = 0;
+  uint32_t forensic_prev_dwt_at_event_observed = 0;
+  uint32_t forensic_prev_dwt_at_event_best = 0;
   bool     forensic_prev_valid = false;
 };
 
@@ -408,22 +440,202 @@ uint32_t interrupt_gpt2_counter_now(void) {
 }
 
 // ============================================================================
-// ISR vectors — owned by process_interrupt
+// Quantization model helpers
 // ============================================================================
 
-// GPIO6/7/8/9 share a single NVIC vector.  The Teensyduino attachInterrupt()
-// framework dispatches to per-pin callbacks, so no status register check is
-// needed here — if we're called, it's our pin.
+static void dequant_reset(interrupt_dequant_state_t& dq) {
+  dq = interrupt_dequant_state_t{};
+}
+
+static void dequant_insert_or_bump_bucket(interrupt_dequant_state_t& dq,
+                                          uint32_t observed_delta_cycles) {
+  for (uint32_t i = 0; i < dq.bucket_count; i++) {
+    if (dq.bucket_value[i] == observed_delta_cycles) {
+      dq.bucket_hits[i]++;
+      return;
+    }
+  }
+
+  if (dq.bucket_count < DEQUANT_MAX_BUCKETS) {
+    dq.bucket_value[dq.bucket_count] = observed_delta_cycles;
+    dq.bucket_hits[dq.bucket_count] = 1;
+    dq.bucket_count++;
+    return;
+  }
+
+  uint32_t min_i = 0;
+  for (uint32_t i = 1; i < dq.bucket_count; i++) {
+    if (dq.bucket_hits[i] < dq.bucket_hits[min_i]) {
+      min_i = i;
+    }
+  }
+
+  if (dq.bucket_hits[min_i] <= 1) {
+    dq.bucket_value[min_i] = observed_delta_cycles;
+    dq.bucket_hits[min_i] = 1;
+  } else {
+    dq.bucket_hits[min_i]--;
+  }
+}
+
+static void dequant_sort_buckets(interrupt_dequant_state_t& dq) {
+  for (uint32_t i = 0; i < dq.bucket_count; i++) {
+    for (uint32_t j = i + 1; j < dq.bucket_count; j++) {
+      if (dq.bucket_value[j] < dq.bucket_value[i]) {
+        const uint32_t tv = dq.bucket_value[i];
+        const uint32_t th = dq.bucket_hits[i];
+        dq.bucket_value[i] = dq.bucket_value[j];
+        dq.bucket_hits[i] = dq.bucket_hits[j];
+        dq.bucket_value[j] = tv;
+        dq.bucket_hits[j] = th;
+      }
+    }
+  }
+}
+
+static void dequant_update_detected_lattice(interrupt_dequant_state_t& dq) {
+  dq.quantization_detected = false;
+  dq.dequant_enabled = false;
+  dq.inferred_bucket_cycles = 0;
+
+  if (dq.bucket_count < DEQUANT_MIN_DISTINCT_BUCKETS) {
+    return;
+  }
+
+  dequant_sort_buckets(dq);
+
+  uint32_t diff_value[DEQUANT_MAX_BUCKETS] = {};
+  uint32_t diff_weight[DEQUANT_MAX_BUCKETS] = {};
+  uint32_t diff_count = 0;
+
+  for (uint32_t i = 1; i < dq.bucket_count; i++) {
+    const uint32_t d = dq.bucket_value[i] - dq.bucket_value[i - 1];
+    if (d == 0) continue;
+
+    bool found = false;
+    for (uint32_t j = 0; j < diff_count; j++) {
+      if (diff_value[j] == d) {
+        diff_weight[j] += dq.bucket_hits[i - 1] + dq.bucket_hits[i];
+        found = true;
+        break;
+      }
+    }
+
+    if (!found && diff_count < DEQUANT_MAX_BUCKETS) {
+      diff_value[diff_count] = d;
+      diff_weight[diff_count] = dq.bucket_hits[i - 1] + dq.bucket_hits[i];
+      diff_count++;
+    }
+  }
+
+  if (diff_count == 0) {
+    return;
+  }
+
+  uint32_t best_i = 0;
+  for (uint32_t i = 1; i < diff_count; i++) {
+    if (diff_weight[i] > diff_weight[best_i]) {
+      best_i = i;
+    }
+  }
+
+  dq.inferred_bucket_cycles = diff_value[best_i];
+  dq.quantization_detected = (dq.inferred_bucket_cycles != 0);
+  dq.dequant_enabled = dq.quantization_detected && (dq.confidence >= DEQUANT_MIN_CONFIDENCE);
+}
+
+static void dequant_push_recent_delta(interrupt_dequant_state_t& dq,
+                                      uint32_t observed_delta_cycles) {
+  dq.recent_delta[dq.recent_head] = observed_delta_cycles;
+  dq.recent_head = (dq.recent_head + 1) % DEQUANT_MEAN_WINDOW;
+  if (dq.recent_count < DEQUANT_MEAN_WINDOW) {
+    dq.recent_count++;
+  }
+}
+
+static double dequant_recent_mean(const interrupt_dequant_state_t& dq,
+                                  uint32_t fallback_delta_cycles) {
+  if (dq.recent_count == 0) {
+    return (double)fallback_delta_cycles;
+  }
+
+  uint64_t sum = 0;
+  for (uint32_t i = 0; i < dq.recent_count; i++) {
+    sum += (uint64_t)dq.recent_delta[i];
+  }
+
+  return (double)sum / (double)dq.recent_count;
+}
+
+static uint32_t dequant_update_and_get_best_dwt(interrupt_subscriber_runtime_t& rt,
+                                                uint32_t observed_dwt_at_event) {
+  interrupt_dequant_state_t& dq = rt.dequant;
+
+  if (!dq.initialized) {
+    dq.initialized = true;
+    dq.last_observed_dwt_at_event = observed_dwt_at_event;
+    dq.last_best_dwt_at_event = observed_dwt_at_event;
+    dq.estimated_dwt_at_event = (double)observed_dwt_at_event;
+    dq.estimated_delta_cycles = 0.0;
+    dq.last_observed_delta_cycles = 0;
+    dq.last_best_delta_cycles = 0;
+    dq.last_bucket_value = 0;
+    dq.last_innovation_cycles = 0;
+    dq.last_applied_correction_cycles = 0.0;
+    return observed_dwt_at_event;
+  }
+
+  const uint32_t observed_delta_cycles = observed_dwt_at_event - dq.last_observed_dwt_at_event;
+  dq.last_observed_delta_cycles = observed_delta_cycles;
+
+  if (dq.last_bucket_value == observed_delta_cycles) {
+    dq.bucket_same_count++;
+  } else {
+    dq.bucket_change_count++;
+    dq.last_bucket_value = observed_delta_cycles;
+  }
+
+  dequant_insert_or_bump_bucket(dq, observed_delta_cycles);
+  dq.confidence++;
+  dequant_update_detected_lattice(dq);
+  dequant_push_recent_delta(dq, observed_delta_cycles);
+
+  if (!dq.dequant_enabled) {
+    dq.estimated_delta_cycles = (double)observed_delta_cycles;
+    dq.estimated_dwt_at_event = (double)observed_dwt_at_event;
+    dq.last_best_delta_cycles = observed_delta_cycles;
+    dq.last_best_dwt_at_event = observed_dwt_at_event;
+    dq.last_observed_dwt_at_event = observed_dwt_at_event;
+    dq.last_innovation_cycles = 0;
+    dq.last_applied_correction_cycles = 0.0;
+    return observed_dwt_at_event;
+  }
+
+  const double mean_delta_cycles = dequant_recent_mean(dq, observed_delta_cycles);
+  const uint32_t best_dwt_u32 =
+      dq.last_best_dwt_at_event + (uint32_t) llround(mean_delta_cycles);
+
+  dq.estimated_delta_cycles = mean_delta_cycles;
+  dq.estimated_dwt_at_event = (double)best_dwt_u32;
+  dq.last_best_delta_cycles = best_dwt_u32 - dq.last_best_dwt_at_event;
+  dq.last_best_dwt_at_event = best_dwt_u32;
+  dq.last_observed_dwt_at_event = observed_dwt_at_event;
+  dq.last_innovation_cycles =
+      (int32_t)observed_delta_cycles - (int32_t) llround(mean_delta_cycles);
+  dq.last_applied_correction_cycles =
+      mean_delta_cycles - (double)observed_delta_cycles;
+
+  return best_dwt_u32;
+}
+
+// ============================================================================
+// ISR vectors — owned by process_interrupt
+// ============================================================================
 
 static void pps_gpio_isr(void) {
   const uint32_t dwt_raw = ARM_DWT_CYCCNT;
   process_interrupt_gpio6789_irq(dwt_raw);
 }
-
-// GPT has three output-compare channels (OCR1/OCR2/OCR3) sharing a single
-// IRQ vector.  Only OCR3 is currently enabled, so this check is technically
-// redundant — but it costs ~2 cycles after DWT capture and future-proofs
-// the ISR if OCR1 or OCR2 are ever enabled for other purposes.
 
 static void gpt1_isr(void) {
   const uint32_t dwt_raw = ARM_DWT_CYCCNT;
@@ -471,16 +683,6 @@ static void pps_drumbeat_consume_edge(interrupt_subscriber_runtime_t& rt);
 // ============================================================================
 // Prespin registration callback — scheduled context
 // ============================================================================
-//
-// This runs from timepop_dispatch() in the main loop.  It does NOT spin.
-// It registers this clock as needing prespin service by incrementing the
-// shared responsibility counter, then arms a named ASAP timer to start
-// the spin loop.
-//
-// Named singleton replacement ("PRESPIN_SPIN") ensures that if multiple
-// clocks register in the same dispatch pass, only one spin callback fires.
-// By the time it runs, all registers have completed and the counter
-// reflects the total number of clients waiting.
 
 static void prespin_register_callback(timepop_ctx_t*,
                                       timepop_diag_t*,
@@ -501,18 +703,14 @@ static void prespin_register_callback(timepop_ctx_t*,
   ps.active = true;
   ps.arm_count++;
 
-  // Clear this clock's snapshot fields for the new cycle.
   ps.snap_start_dwt = 0;
   ps.snap_shadow_dwt = 0;
   ps.snap_dwt_isr_entry_raw = 0;
   ps.snap_fired = false;
   ps.snap_timed_out = false;
 
-  // Register for prespin service.
   g_prespin_responsibility_count++;
 
-  // Arm the shared spin loop.  Named singleton replacement ensures
-  // only one fires per dispatch pass, after all registers complete.
   timepop_arm_alap(interrupt_prespin_service, nullptr, "PRESPIN_SPIN");
 }
 
@@ -540,7 +738,6 @@ void interrupt_prespin_service(timepop_ctx_t*, timepop_diag_t*, void*) {
       g_prespin_responsibility_count = 0;
       g_prespin_spinning = false;
 
-      // Mark all still-waiting clients as timed out.
       for (uint32_t i = 0; i < g_subscriber_count; i++) {
         interrupt_subscriber_runtime_t& sub = g_subscribers[i];
         if (!sub.desc || !sub.desc->uses_prespin) continue;
@@ -567,10 +764,6 @@ void interrupt_prespin_service(timepop_ctx_t*, timepop_diag_t*, void*) {
 // ============================================================================
 // Unified scheduling helper
 // ============================================================================
-//
-// Arms the next prespin timer for any clock.
-// Runs in SCHEDULED CONTEXT (deferred dispatch), never in ISR context.
-// Deadlines are computed by TimePop from the time anchor via pure arithmetic.
 
 static void schedule_next_prespin_from_anchor(interrupt_subscriber_runtime_t& rt,
                                               uint64_t anchor_gnss_ns,
@@ -616,10 +809,6 @@ static void schedule_next_prespin_from_anchor(interrupt_subscriber_runtime_t& rt
 // ============================================================================
 // PPS / OCXO scheduling progression
 // ============================================================================
-//
-// These functions run in SCHEDULED CONTEXT (deferred dispatch).
-// They compute the next prespin target from the just-consummated edge
-// and arm the timer via anchor-relative arithmetic.
 
 static void pps_drumbeat_schedule_from_edge(interrupt_subscriber_runtime_t& rt,
                                             uint64_t pps_edge_gnss_ns) {
@@ -681,6 +870,10 @@ static void fill_diag_common(interrupt_subscriber_runtime_t& rt,
                              interrupt_capture_diag_t& diag,
                              const interrupt_event_t& event,
                              uint32_t dwt_isr_entry_raw,
+                             uint32_t observed_dwt_at_event,
+                             uint64_t observed_gnss_ns_at_event,
+                             uint32_t best_dwt_at_event,
+                             uint64_t best_gnss_ns_at_event,
                              uint32_t approach_cycles,
                              uint32_t shadow_to_isr_cycles) {
   diag.provider = rt.desc->provider;
@@ -699,8 +892,15 @@ static void fill_diag_common(interrupt_subscriber_runtime_t& rt,
   diag.approach_cycles = approach_cycles;
   diag.shadow_to_isr_cycles = shadow_to_isr_cycles;
 
-  diag.dwt_at_event_adjusted = event.dwt_at_event;
-  diag.gnss_ns_at_event = event.gnss_ns_at_event;
+  diag.dwt_at_event_observed = observed_dwt_at_event;
+  diag.gnss_ns_at_event_observed = observed_gnss_ns_at_event;
+
+  diag.dwt_at_event_adjusted = observed_dwt_at_event;  // backward-compat mirror
+  diag.gnss_ns_at_event = observed_gnss_ns_at_event;   // backward-compat mirror
+
+  diag.dwt_at_event_best = best_dwt_at_event;
+  diag.gnss_ns_at_event_best = best_gnss_ns_at_event;
+
   diag.counter32_at_event = event.counter32_at_event;
   diag.dwt_event_correction_cycles = event.dwt_event_correction_cycles;
 
@@ -709,35 +909,59 @@ static void fill_diag_common(interrupt_subscriber_runtime_t& rt,
   diag.prespin_timeout_count = rt.prespin.timeout_count;
   diag.anomaly_count = rt.prespin.anomaly_count;
 
-  // ── Forensic delta fields ──
   diag.prev_valid = rt.forensic_prev_valid;
 
   if (rt.forensic_prev_valid) {
     diag.prev_dwt_isr_entry_raw = rt.forensic_prev_dwt_isr_entry_raw;
-    diag.prev_dwt_at_event_adjusted = rt.forensic_prev_dwt_at_event;
+    diag.prev_dwt_at_event_observed = rt.forensic_prev_dwt_at_event_observed;
+    diag.prev_dwt_at_event_adjusted = rt.forensic_prev_dwt_at_event_observed; // mirror
+    diag.prev_dwt_at_event_best = rt.forensic_prev_dwt_at_event_best;
+
     diag.dwt_delta_raw = dwt_isr_entry_raw - rt.forensic_prev_dwt_isr_entry_raw;
-    diag.dwt_delta_adjusted = event.dwt_at_event - rt.forensic_prev_dwt_at_event;
+    diag.dwt_delta_observed = observed_dwt_at_event - rt.forensic_prev_dwt_at_event_observed;
+    diag.dwt_delta_adjusted = diag.dwt_delta_observed; // mirror
+    diag.dwt_delta_best = best_dwt_at_event - rt.forensic_prev_dwt_at_event_best;
   } else {
     diag.prev_dwt_isr_entry_raw = 0;
+    diag.prev_dwt_at_event_observed = 0;
     diag.prev_dwt_at_event_adjusted = 0;
+    diag.prev_dwt_at_event_best = 0;
     diag.dwt_delta_raw = 0;
+    diag.dwt_delta_observed = 0;
     diag.dwt_delta_adjusted = 0;
+    diag.dwt_delta_best = 0;
   }
 
-  // Update forensic state for the next edge.
+  if (rt.desc->kind == interrupt_subscriber_kind_t::OCXO1 ||
+      rt.desc->kind == interrupt_subscriber_kind_t::OCXO2) {
+    const interrupt_dequant_state_t& dq = rt.dequant;
+    diag.quantization_detected = dq.quantization_detected;
+    diag.dequant_enabled = dq.dequant_enabled;
+    diag.dequant_initialized = dq.initialized;
+    diag.dequant_bucket_cycles = dq.inferred_bucket_cycles;
+    diag.dequant_confidence = dq.confidence;
+    diag.dequant_estimated_delta_cycles = dq.estimated_delta_cycles;
+    diag.dequant_innovation_cycles = dq.last_innovation_cycles;
+    diag.dequant_applied_correction_cycles = dq.last_applied_correction_cycles;
+    diag.dequant_bucket_same_count = dq.bucket_same_count;
+    diag.dequant_bucket_change_count = dq.bucket_change_count;
+    diag.dequant_bucket_count = dq.bucket_count;
+
+    for (uint32_t i = 0; i < interrupt_capture_diag_t::MAX_DIAG_BUCKETS; i++) {
+      diag.dequant_bucket_value[i] = (i < dq.bucket_count) ? dq.bucket_value[i] : 0;
+      diag.dequant_bucket_hits[i] = (i < dq.bucket_count) ? dq.bucket_hits[i] : 0;
+    }
+  }
+
   rt.forensic_prev_dwt_isr_entry_raw = dwt_isr_entry_raw;
-  rt.forensic_prev_dwt_at_event = event.dwt_at_event;
+  rt.forensic_prev_dwt_at_event_observed = observed_dwt_at_event;
+  rt.forensic_prev_dwt_at_event_best = best_dwt_at_event;
   rt.forensic_prev_valid = true;
 }
 
 // ============================================================================
 // Deferred dispatch — scheduled context
 // ============================================================================
-//
-// This callback runs in scheduled context (via timepop_dispatch in the main
-// loop).  It handles everything that does NOT need ISR timing:
-//   1. Subscriber event delivery
-//   2. Next prespin scheduling (geared from the just-consummated edge)
 
 static void maybe_dispatch_event(interrupt_subscriber_runtime_t& rt) {
   if (!rt.subscribed || !rt.sub.on_event) return;
@@ -748,10 +972,8 @@ static void deferred_dispatch_callback(timepop_ctx_t*, timepop_diag_t*, void* us
   auto* rt = static_cast<interrupt_subscriber_runtime_t*>(user_data);
   if (!rt || !rt->desc) return;
 
-  // 1. Deliver the event to the subscriber.
   maybe_dispatch_event(*rt);
 
-  // 2. Schedule the next prespin from the just-consummated edge.
   if (rt->desc->kind == interrupt_subscriber_kind_t::PPS) {
     pps_drumbeat_consume_edge(*rt);
   } else {
@@ -762,31 +984,18 @@ static void deferred_dispatch_callback(timepop_ctx_t*, timepop_diag_t*, void* us
 // ============================================================================
 // Unified ISR event handler — priority 0, time-critical work ONLY
 // ============================================================================
-//
-// This function runs at the highest interrupt priority.  It handles:
-//   • Responsibility counter decrement
-//   • Prespin snapshot from shared shadow into per-clock runtime
-//   • DWT correction and event construction
-//   • Counter updates
-//   • Deferred dispatch arming (zero-delay ASAP timer)
-//
-// It does NOT call any scheduling functions.  All scheduling happens
-// in the deferred dispatch callback above.
 
 static void handle_event(interrupt_subscriber_runtime_t& rt,
                          uint32_t dwt_isr_entry_raw,
                          uint32_t counter32_at_event) {
   prespin_state_t& ps = rt.prespin;
 
-  // Decrement the shared responsibility counter.
-  // This signals the spin loop that one client has been served.
   if (ps.active) {
     g_prespin_responsibility_count--;
     ps.active = false;
     ps.complete_count++;
   }
 
-  // Snapshot the shared prespin state into per-clock fields.
   ps.snap_start_dwt = g_prespin_start_dwt;
   ps.snap_shadow_dwt = g_prespin_shadow_dwt;
   ps.snap_dwt_isr_entry_raw = dwt_isr_entry_raw;
@@ -820,37 +1029,58 @@ static void handle_event(interrupt_subscriber_runtime_t& rt,
                    ps.arm_count);
   }
 
-  // DWT correction and GNSS ns computation.
   const uint32_t correction = rt.desc->isr_overhead_cycles;
-  const uint32_t dwt_at_event = dwt_isr_entry_raw - correction;
+  const uint32_t observed_dwt_at_event = dwt_isr_entry_raw - correction;
 
   interrupt_event_t event {};
   event.kind = rt.desc->kind;
   event.provider = rt.desc->provider;
   event.lane = rt.desc->lane;
-  event.dwt_at_event = dwt_at_event;
   event.counter32_at_event = counter32_at_event;
   event.dwt_event_correction_cycles = correction;
 
+  uint32_t best_dwt_at_event = observed_dwt_at_event;
+  uint64_t observed_gnss_ns_at_event = 0;
+  uint64_t best_gnss_ns_at_event = 0;
+
   if (rt.desc->kind == interrupt_subscriber_kind_t::PPS) {
-    // PPS: GNSS ns is index-based (integer seconds from epoch).
     const int64_t pps_index = (int64_t)rt.event_count;
-    event.gnss_ns_at_event = (uint64_t)(pps_index * 1000000000LL);
+    observed_gnss_ns_at_event = (uint64_t)(pps_index * 1000000000LL);
+    best_gnss_ns_at_event = observed_gnss_ns_at_event;
+    best_dwt_at_event = observed_dwt_at_event;
     event.status = interrupt_event_status_t::OK;
   } else {
-    // OCXO: GNSS ns is DWT-interpolated from the time anchor.
-    const int64_t gnss_ns_signed = time_dwt_to_gnss_ns(dwt_at_event);
-    if (gnss_ns_signed >= 0) {
-      event.gnss_ns_at_event = (uint64_t)gnss_ns_signed;
+    const int64_t observed_gnss_ns_signed = time_dwt_to_gnss_ns(observed_dwt_at_event);
+    if (observed_gnss_ns_signed >= 0) {
+      observed_gnss_ns_at_event = (uint64_t)observed_gnss_ns_signed;
+    }
+
+    best_dwt_at_event = dequant_update_and_get_best_dwt(rt, observed_dwt_at_event);
+
+    const int64_t best_gnss_ns_signed = time_dwt_to_gnss_ns(best_dwt_at_event);
+    if (best_gnss_ns_signed >= 0) {
+      best_gnss_ns_at_event = (uint64_t)best_gnss_ns_signed;
       event.status = interrupt_event_status_t::OK;
     } else {
-      event.gnss_ns_at_event = 0;
+      best_gnss_ns_at_event = 0;
       event.status = interrupt_event_status_t::HOLD;
     }
   }
 
+  event.dwt_at_event = best_dwt_at_event;
+  event.gnss_ns_at_event = best_gnss_ns_at_event;
+
   interrupt_capture_diag_t diag {};
-  fill_diag_common(rt, diag, event, dwt_isr_entry_raw, approach_cycles, shadow_to_isr_cycles);
+  fill_diag_common(rt,
+                   diag,
+                   event,
+                   dwt_isr_entry_raw,
+                   observed_dwt_at_event,
+                   observed_gnss_ns_at_event,
+                   best_dwt_at_event,
+                   best_gnss_ns_at_event,
+                   approach_cycles,
+                   shadow_to_isr_cycles);
 
   rt.last_event = event;
   rt.last_diag = diag;
@@ -859,7 +1089,6 @@ static void handle_event(interrupt_subscriber_runtime_t& rt,
   rt.dispatch_count++;
   rt.event_count++;
 
-  // Deferred dispatch handles subscriber delivery AND prespin scheduling.
   timepop_arm_asap(deferred_dispatch_callback, &rt, dispatch_timer_name(rt.desc->kind));
 }
 
@@ -903,9 +1132,6 @@ void process_interrupt_gpt1_irq(uint32_t dwt_isr_entry_raw) {
 
   g_gpt1_diag.dispatch_count++;
 
-  // The canonical OCXO count at edge is the match value we armed, not an
-  // interrogated "now" value and not the event ordinal. GPT OCR3 just fired
-  // because the counter reached this value.
   const uint32_t matched_count = rt->next_ocr3;
 
   rt->next_ocr3 += OCXO_COUNTS_PER_SECOND;
@@ -935,9 +1161,6 @@ void process_interrupt_gpt2_irq(uint32_t dwt_isr_entry_raw) {
 
   g_gpt2_diag.dispatch_count++;
 
-  // The canonical OCXO count at edge is the match value we armed, not an
-  // interrogated "now" value and not the event ordinal. GPT OCR3 just fired
-  // because the counter reached this value.
   const uint32_t matched_count = rt->next_ocr3;
 
   rt->next_ocr3 += OCXO_COUNTS_PER_SECOND;
@@ -972,10 +1195,11 @@ bool interrupt_start(interrupt_subscriber_kind_t kind) {
 
   rt->prespin.active = false;
 
-  // Reset forensic state on start.
   rt->forensic_prev_valid = false;
   rt->forensic_prev_dwt_isr_entry_raw = 0;
-  rt->forensic_prev_dwt_at_event = 0;
+  rt->forensic_prev_dwt_at_event_observed = 0;
+  rt->forensic_prev_dwt_at_event_best = 0;
+  dequant_reset(rt->dequant);
 
   if (kind == interrupt_subscriber_kind_t::PPS) {
     debug_log("pps.start", "requested");
@@ -1200,7 +1424,6 @@ static Payload cmd_report(const Payload&) {
 
     s.add("next_ocr3", rt.next_ocr3);
 
-    // Prespin facts — ISR snapshots.
     s.add("prespin_active", rt.prespin.active);
     s.add("prespin_fired", rt.prespin.snap_fired);
     s.add("prespin_timed_out", rt.prespin.snap_timed_out);
@@ -1224,28 +1447,38 @@ static Payload cmd_report(const Payload&) {
     s.add("last_approach_cycles", rt.last_diag.approach_cycles);
     s.add("last_shadow_to_isr_cycles", rt.last_diag.shadow_to_isr_cycles);
 
-    s.add("last_dwt_at_event", rt.last_event.dwt_at_event);
-    s.add("last_gnss_ns_at_event", rt.last_event.gnss_ns_at_event);
+    s.add("last_dwt_at_event_best", rt.last_event.dwt_at_event);
+    s.add("last_gnss_ns_at_event_best", rt.last_event.gnss_ns_at_event);
     s.add("last_counter32_at_event", rt.last_event.counter32_at_event);
     s.add("last_correction_cycles", rt.last_event.dwt_event_correction_cycles);
     s.add("last_status", (uint32_t)rt.last_event.status);
 
-    // ── Forensic delta fields ──
-    s.add("forensic_prev_valid", rt.last_diag.prev_valid);
-    s.add("forensic_prev_dwt_isr_entry_raw", rt.last_diag.prev_dwt_isr_entry_raw);
-    s.add("forensic_prev_dwt_at_event_adjusted", rt.last_diag.prev_dwt_at_event_adjusted);
-    s.add("forensic_dwt_delta_raw", rt.last_diag.dwt_delta_raw);
-    s.add("forensic_dwt_delta_adjusted", rt.last_diag.dwt_delta_adjusted);
+    s.add("diag_dwt_at_event_observed", rt.last_diag.dwt_at_event_observed);
+    s.add("diag_gnss_ns_at_event_observed", rt.last_diag.gnss_ns_at_event_observed);
+    s.add("diag_dwt_at_event_best", rt.last_diag.dwt_at_event_best);
+    s.add("diag_gnss_ns_at_event_best", rt.last_diag.gnss_ns_at_event_best);
+
+    s.add("diag_dwt_delta_raw", rt.last_diag.dwt_delta_raw);
+    s.add("diag_dwt_delta_observed", rt.last_diag.dwt_delta_observed);
+    s.add("diag_dwt_delta_best", rt.last_diag.dwt_delta_best);
+
+    s.add("diag_quantization_detected", rt.last_diag.quantization_detected);
+    s.add("diag_dequant_enabled", rt.last_diag.dequant_enabled);
+    s.add("diag_dequant_initialized", rt.last_diag.dequant_initialized);
+    s.add("diag_dequant_bucket_cycles", rt.last_diag.dequant_bucket_cycles);
+    s.add("diag_dequant_confidence", rt.last_diag.dequant_confidence);
+    s.add("diag_dequant_innovation_cycles", rt.last_diag.dequant_innovation_cycles);
+    s.add("diag_dequant_applied_correction_cycles", rt.last_diag.dequant_applied_correction_cycles);
+    s.add("diag_dequant_estimated_delta_cycles", rt.last_diag.dequant_estimated_delta_cycles);
 
     subscribers.add(s);
   }
 
   p.add_array("subscribers", subscribers);
 
-  // ── Clock domain forensics ──
   const uint32_t cbcdr = CCM_CBCDR;
-  const uint32_t ipg_div = ((cbcdr >> 8) & 0x3) + 1;   // IPG_PODF: bits 9:8
-  const uint32_t ahb_div = ((cbcdr >> 10) & 0x7) + 1;  // AHB_PODF: bits 12:10
+  const uint32_t ipg_div = ((cbcdr >> 8) & 0x3) + 1;
+  const uint32_t ahb_div = ((cbcdr >> 10) & 0x7) + 1;
   const uint32_t periph_clk2_div = ((cbcdr >> 27) & 0x7) + 1;
   p.add("ccm_cbcdr_raw", cbcdr);
   p.add("ipg_podf", ipg_div);

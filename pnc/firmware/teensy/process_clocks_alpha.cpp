@@ -17,6 +17,12 @@
 //   The DWT adjustment timer reads DWT_CYCCNT directly at 10 kHz.  This is
 //   a legitimate real-time feedback loop on the DWT bridge substrate.
 //
+// Note:
+//
+//   For OCXO events, process_interrupt now publishes BEST ESTIMATE event truth.
+//   clocks_alpha therefore consumes canonical event timing directly and should
+//   not mine diagnostic payloads to reconstruct hardware-path quirks.
+//
 // ============================================================================
 
 #include "process_clocks_internal.h"
@@ -62,9 +68,6 @@ volatile uint32_t g_dwt_cycle_count_next_second_prediction = DWT_EXPECTED_PER_PP
 volatile int32_t  g_dwt_cycle_count_next_second_adjustment = 0;
 volatile uint64_t g_dwt_model_pps_count = 0;
 
-// Geared QTimer — advanced by TICKS_10MHZ_PER_SECOND each PPS.
-// Initialized once from a live read at epoch installation, then
-// pure arithmetic thereafter.  Never read from hardware again.
 volatile uint32_t g_qtimer_at_pps = 0;
 
 ocxo_clock_state_t g_ocxo1_clock = {};
@@ -82,14 +85,6 @@ bool g_ad5693r_init_ok = false;
 // ============================================================================
 // Alpha epoch state
 // ============================================================================
-//
-// This is the canonical zero-based epoch for the always-on physics layer.
-// It is established only on a lawful PPS edge.
-//
-// The physical raw values captured here are not themselves the canonical
-// clocks; they are the shared boundary facts from which the canonical
-// synthetic clocks are defined.
-//
 
 enum class clocks_epoch_reason_t : uint8_t {
   NONE   = 0,
@@ -103,11 +98,9 @@ static volatile bool g_epoch_initialized = false;
 static volatile uint32_t g_epoch_generation = 0;
 static volatile clocks_epoch_reason_t g_epoch_reason = clocks_epoch_reason_t::NONE;
 
-// Raw physical anchors captured at the consummating PPS boundary.
 static volatile uint32_t g_epoch_dwt_at_pps = 0;
 static volatile uint32_t g_epoch_qtimer_at_pps = 0;
 
-// Canonical PPS count within current epoch (0 at epoch PPS, then 1, 2, 3...).
 static volatile uint64_t g_epoch_pps_index = 0;
 
 // ============================================================================
@@ -191,15 +184,6 @@ static inline void dwt_enable(void) {
 // ============================================================================
 // QTimer1 read — boot-time boundary crossing ONLY
 // ============================================================================
-//
-// This function reads the live QTimer1 cascaded 32-bit counter.
-// It is called ONCE at epoch installation to establish the initial
-// geared QTimer anchor.  After that, g_qtimer_at_pps is advanced
-// by TICKS_10MHZ_PER_SECOND each PPS — pure arithmetic, no read.
-//
-// This is a boundary crossing in the ZPNet Standards sense:
-// the QTimer hardware is an unowned external system at boot time,
-// before the geared model takes over.
 
 static uint32_t qtimer1_read_32_once(void) {
   const uint16_t lo1 = IMXRT_TMR1.CH[0].CNTR;
@@ -261,7 +245,6 @@ static void alpha_install_new_epoch_from_pps(const interrupt_event_t& pps_event)
   g_epoch_pps_index = 0;
 
   g_epoch_dwt_at_pps = pps_event.dwt_at_event;
-
   g_epoch_qtimer_at_pps = qtimer1_read_32_once();
 
   alpha_reset_canonical_clock_state_for_new_epoch();
@@ -423,8 +406,8 @@ static void ocxo1_callback(
   }
 
   const uint32_t raw_counter32 = event.counter32_at_event;
-  const uint32_t dwt_at_edge = event.dwt_at_event;
-  const uint64_t gnss_ns_at_edge = event.gnss_ns_at_event;
+  const uint32_t dwt_at_edge = event.dwt_at_event;          // BEST ESTIMATE from process_interrupt
+  const uint64_t gnss_ns_at_edge = event.gnss_ns_at_event;  // BEST ESTIMATE from process_interrupt
 
   g_ocxo1_clock.gnss_ns_at_edge = gnss_ns_at_edge;
   g_ocxo1_measurement.dwt_at_edge = dwt_at_edge;
@@ -471,8 +454,8 @@ static void ocxo2_callback(
   }
 
   const uint32_t raw_counter32 = event.counter32_at_event;
-  const uint32_t dwt_at_edge = event.dwt_at_event;
-  const uint64_t gnss_ns_at_edge = event.gnss_ns_at_event;
+  const uint32_t dwt_at_edge = event.dwt_at_event;          // BEST ESTIMATE from process_interrupt
+  const uint64_t gnss_ns_at_edge = event.gnss_ns_at_event;  // BEST ESTIMATE from process_interrupt
 
   g_ocxo2_clock.gnss_ns_at_edge = gnss_ns_at_edge;
   g_ocxo2_measurement.dwt_at_edge = dwt_at_edge;

@@ -69,6 +69,10 @@ extern ocxo_clock_state_t g_ocxo2_clock;
 // ============================================================================
 // Lightweight measurement state
 // ============================================================================
+//
+// These fields are now fed from process_interrupt's BEST ESTIMATE event truth,
+// not necessarily from the literal admitted raw GPT bucket timing.
+//
 
 struct ocxo_measurement_t {
   volatile int64_t  second_residual_ns;
@@ -136,9 +140,16 @@ static inline void clocks_payload_add_interrupt_diag(Payload& p,
   add_u32("shadow_dwt", diag.shadow_dwt);
   add_u32("dwt_isr_entry_raw", diag.dwt_isr_entry_raw);
   add_u32("approach_cycles", diag.approach_cycles);
+  add_u32("shadow_to_isr_cycles", diag.shadow_to_isr_cycles);
 
-  add_u32("dwt_at_event_adjusted", diag.dwt_at_event_adjusted);
-  add_u64("gnss_ns_at_event", diag.gnss_ns_at_event);
+  // Observed truth
+  add_u32("dwt_at_event_observed", diag.dwt_at_event_observed);
+  add_u64("gnss_ns_at_event_observed", diag.gnss_ns_at_event_observed);
+
+  // Canonical best-estimate truth
+  add_u32("dwt_at_event_best", diag.dwt_at_event_best);
+  add_u64("gnss_ns_at_event_best", diag.gnss_ns_at_event_best);
+
   add_u32("counter32_at_event", diag.counter32_at_event);
   add_u32("dwt_event_correction_cycles", diag.dwt_event_correction_cycles);
 
@@ -149,9 +160,20 @@ static inline void clocks_payload_add_interrupt_diag(Payload& p,
 
   add_bool("prev_valid", diag.prev_valid);
   add_u32("prev_dwt_isr_entry_raw", diag.prev_dwt_isr_entry_raw);
-  add_u32("prev_dwt_at_event_adjusted", diag.prev_dwt_at_event_adjusted);
+  add_u32("prev_dwt_at_event_observed", diag.prev_dwt_at_event_observed);
+  add_u32("prev_dwt_at_event_best", diag.prev_dwt_at_event_best);
+
   add_u32("dwt_delta_raw", diag.dwt_delta_raw);
-  add_u32("dwt_delta_adjusted", diag.dwt_delta_adjusted);
+  add_u32("dwt_delta_observed", diag.dwt_delta_observed);
+  add_u32("dwt_delta_best", diag.dwt_delta_best);
+
+  add_bool("quantization_detected", diag.quantization_detected);
+  add_bool("dequant_enabled", diag.dequant_enabled);
+  add_bool("dequant_initialized", diag.dequant_initialized);
+
+  add_u32("dequant_bucket_cycles", diag.dequant_bucket_cycles);
+  add_u32("dequant_confidence", diag.dequant_confidence);
+  add_u32("dequant_innovation_cycles", (uint32_t)diag.dequant_innovation_cycles);
 }
 
 // ============================================================================

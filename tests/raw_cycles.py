@@ -1,24 +1,14 @@
 """
-ZPNet Raw Cycles — v8 Payload-Matched Quantization Monitor
+ZPNet Raw Cycles — v9 Best-Estimate vs Observed OCXO Timing Monitor
 
-This version is aligned to the actual TIMEBASE fragment fields observed in
-current records.
+This version is aligned to the post-mitigation TIMEBASE fragment.
 
 Primary goals:
   1. Verify PPS DWT prediction remains clean.
-  2. Compare OCXO alpha deltas vs diagnostic raw/adjusted ISR deltas.
-  3. Surface mod-42 residue patterns directly in the report.
-  4. Compute shadow_to_isr_cycles from:
-         diag_dwt_isr_entry_raw - diag_shadow_dwt
-     since that field is not stored explicitly.
-
-Observed payload field names:
-  ocxo1_diag_dwt_delta_raw
-  ocxo1_diag_dwt_delta_adjusted
-  ocxo1_diag_dwt_isr_entry_raw
-  ocxo1_diag_shadow_dwt
-  ocxo1_diag_approach_cycles
-  ... and the analogous ocxo2 / pps fields.
+  2. Compare OCXO observed/raw deltas vs canonical best-estimate deltas.
+  3. Show whether the best-estimate path escapes the 42-cycle lattice.
+  4. Quantify improvement in GNSS interval residuals and DWT interval smoothness.
+  5. Surface dequantizer state: enabled, inferred bucket size, confidence.
 
 Usage:
     python -m zpnet.tests.raw_cycles <campaign_name> [limit]
@@ -208,66 +198,74 @@ def analyze(campaign: str, limit: int = 0) -> None:
         f"  {'pred':>12s}"
         f"  {'act':>12s}"
         f"  {'res':>7s}"
-        f"  {'m42':>4s}"
-        f"  {'o1':>12s}"
-        f"  {'r1':>12s}"
-        f"  {'a1':>12s}"
-        f"  {'m1':>4s}"
-        f"  {'s1':>4s}"
-        f"  {'ap1':>5s}"
-        f"  {'o2':>12s}"
-        f"  {'r2':>12s}"
-        f"  {'a2':>12s}"
-        f"  {'m2':>4s}"
-        f"  {'s2':>4s}"
-        f"  {'ap2':>5s}"
+        f"  {'o1_obs':>12s}"
+        f"  {'o1_best':>12s}"
+        f"  {'mO1':>4s}"
+        f"  {'mB1':>4s}"
+        f"  {'ns1':>6s}"
+        f"  {'dq1':>3s}"
+        f"  {'b1':>4s}"
+        f"  {'c1':>4s}"
+        f"  {'o2_obs':>12s}"
+        f"  {'o2_best':>12s}"
+        f"  {'mO2':>4s}"
+        f"  {'mB2':>4s}"
+        f"  {'ns2':>6s}"
+        f"  {'dq2':>3s}"
+        f"  {'b2':>4s}"
+        f"  {'c2':>4s}"
     )
     print(
         f"  {'─' * 5}"
         f"  {'─' * 12}"
         f"  {'─' * 12}"
         f"  {'─' * 7}"
-        f"  {'─' * 4}"
-        f"  {'─' * 12}"
-        f"  {'─' * 12}"
-        f"  {'─' * 12}"
-        f"  {'─' * 4}"
-        f"  {'─' * 4}"
-        f"  {'─' * 5}"
-        f"  {'─' * 12}"
         f"  {'─' * 12}"
         f"  {'─' * 12}"
         f"  {'─' * 4}"
         f"  {'─' * 4}"
-        f"  {'─' * 5}"
+        f"  {'─' * 6}"
+        f"  {'─' * 3}"
+        f"  {'─' * 4}"
+        f"  {'─' * 4}"
+        f"  {'─' * 12}"
+        f"  {'─' * 12}"
+        f"  {'─' * 4}"
+        f"  {'─' * 4}"
+        f"  {'─' * 6}"
+        f"  {'─' * 3}"
+        f"  {'─' * 4}"
+        f"  {'─' * 4}"
     )
 
     w_dwt = Welford()
-    w_o1 = Welford()
-    w_o2 = Welford()
-    w_r1 = Welford()
-    w_a1 = Welford()
-    w_r2 = Welford()
-    w_a2 = Welford()
+
+    w_o1_obs = Welford()
+    w_o1_best = Welford()
+    w_o2_obs = Welford()
+    w_o2_best = Welford()
+
+    w_o1_ns = Welford()
+    w_o2_ns = Welford()
+
     w_s1 = Welford()
     w_s2 = Welford()
     w_ap1 = Welford()
     w_ap2 = Welford()
 
-    buckets_o1: Counter[int] = Counter()
-    buckets_o2: Counter[int] = Counter()
-    buckets_r1: Counter[int] = Counter()
-    buckets_a1: Counter[int] = Counter()
-    buckets_r2: Counter[int] = Counter()
-    buckets_a2: Counter[int] = Counter()
+    buckets_o1_obs: Counter[int] = Counter()
+    buckets_o1_best: Counter[int] = Counter()
+    buckets_o2_obs: Counter[int] = Counter()
+    buckets_o2_best: Counter[int] = Counter()
 
     residues_pps: Counter[int] = Counter()
-    residues_o1: Counter[int] = Counter()
-    residues_r1: Counter[int] = Counter()
-    residues_a1: Counter[int] = Counter()
-    residues_o2: Counter[int] = Counter()
-    residues_r2: Counter[int] = Counter()
-    residues_a2: Counter[int] = Counter()
+    residues_o1_obs: Counter[int] = Counter()
+    residues_o1_best: Counter[int] = Counter()
+    residues_o2_obs: Counter[int] = Counter()
+    residues_o2_best: Counter[int] = Counter()
+
+    dequant_bucket_counts_1: Counter[int] = Counter()
+    dequant_bucket_counts_2: Counter[int] = Counter()
 
     count = 0
     gaps = 0
@@ -283,7 +281,7 @@ def analyze(campaign: str, limit: int = 0) -> None:
             skipped = pps - prev_pps - 1
             gaps += 1
             print(f"  {'':>5s}  --- gap {prev_pps} → {pps} ({skipped}s lost, stats reset) ---")
-            for w in (w_dwt, w_o1, w_o2, w_r1, w_a1, w_r2, w_a2, w_s1, w_s2, w_ap1, w_ap2):
+            for w in (w_dwt, w_o1_obs, w_o1_best, w_o2_obs, w_o2_best, w_o1_ns, w_o2_ns, w_s1, w_s2, w_ap1, w_ap2):
                 w.reset()
 
         prev_pps = pps
@@ -296,17 +294,23 @@ def analyze(campaign: str, limit: int = 0) -> None:
         if actual is None:
             actual = _as_int(rec.get("dwt_delta_raw"))
 
-        o1 = _as_int(_frag(rec, "ocxo1_dwt_cycles_between_edges"))
-        o2 = _as_int(_frag(rec, "ocxo2_dwt_cycles_between_edges"))
+        o1_obs = _diag_field(rec, "ocxo1", "diag_dwt_delta_observed")
+        o1_best = _diag_field(rec, "ocxo1", "diag_dwt_delta_best")
+        o2_obs = _diag_field(rec, "ocxo2", "diag_dwt_delta_observed")
+        o2_best = _diag_field(rec, "ocxo2", "diag_dwt_delta_best")
 
-        r1 = _diag_field(rec, "ocxo1", "diag_dwt_delta_raw")
-        a1 = _diag_field(rec, "ocxo1", "diag_dwt_delta_adjusted")
-        r2 = _diag_field(rec, "ocxo2", "diag_dwt_delta_raw")
-        a2 = _diag_field(rec, "ocxo2", "diag_dwt_delta_adjusted")
+        ns1 = _as_int(_frag(rec, "ocxo1_second_residual_ns"))
+        ns2 = _as_int(_frag(rec, "ocxo2_second_residual_ns"))
+
+        dq1 = _frag(rec, "ocxo1_diag_dequant_enabled")
+        dq2 = _frag(rec, "ocxo2_diag_dequant_enabled")
+        b1 = _diag_field(rec, "ocxo1", "diag_dequant_bucket_cycles")
+        b2 = _diag_field(rec, "ocxo2", "diag_dequant_bucket_cycles")
+        c1 = _diag_field(rec, "ocxo1", "diag_dequant_confidence")
+        c2 = _diag_field(rec, "ocxo2", "diag_dequant_confidence")
 
         s1 = _shadow_to_isr(rec, "ocxo1")
         s2 = _shadow_to_isr(rec, "ocxo2")
-
         ap1 = _diag_field(rec, "ocxo1", "diag_approach_cycles")
         ap2 = _diag_field(rec, "ocxo2", "diag_approach_cycles")
 
@@ -316,35 +320,30 @@ def analyze(campaign: str, limit: int = 0) -> None:
             w_dwt.update(float(residual))
             residues_pps[_mod(actual)] += 1
 
-        if o1 is not None:
-            w_o1.update(float(o1))
-            buckets_o1[o1] += 1
-            residues_o1[_mod(o1)] += 1
+        if o1_obs is not None:
+            w_o1_obs.update(float(o1_obs))
+            buckets_o1_obs[o1_obs] += 1
+            residues_o1_obs[_mod(o1_obs)] += 1
 
-        if o2 is not None:
-            w_o2.update(float(o2))
-            buckets_o2[o2] += 1
-            residues_o2[_mod(o2)] += 1
+        if o1_best is not None:
+            w_o1_best.update(float(o1_best))
+            buckets_o1_best[o1_best] += 1
+            residues_o1_best[_mod(o1_best)] += 1
 
-        if r1 is not None:
-            w_r1.update(float(r1))
-            buckets_r1[r1] += 1
-            residues_r1[_mod(r1)] += 1
+        if o2_obs is not None:
+            w_o2_obs.update(float(o2_obs))
+            buckets_o2_obs[o2_obs] += 1
+            residues_o2_obs[_mod(o2_obs)] += 1
 
-        if a1 is not None:
-            w_a1.update(float(a1))
-            buckets_a1[a1] += 1
-            residues_a1[_mod(a1)] += 1
+        if o2_best is not None:
+            w_o2_best.update(float(o2_best))
+            buckets_o2_best[o2_best] += 1
+            residues_o2_best[_mod(o2_best)] += 1
 
-        if r2 is not None:
-            w_r2.update(float(r2))
-            buckets_r2[r2] += 1
-            residues_r2[_mod(r2)] += 1
-
-        if a2 is not None:
-            w_a2.update(float(a2))
-            buckets_a2[a2] += 1
-            residues_a2[_mod(a2)] += 1
+        if ns1 is not None:
+            w_o1_ns.update(float(ns1))
+        if ns2 is not None:
+            w_o2_ns.update(float(ns2))
 
         if s1 is not None:
             w_s1.update(float(s1))
@@ -356,24 +355,35 @@ def analyze(campaign: str, limit: int = 0) -> None:
         if ap2 is not None:
             w_ap2.update(float(ap2))
 
+        if b1 is not None:
+            dequant_bucket_counts_1[b1] += 1
+        if b2 is not None:
+            dequant_bucket_counts_2[b2] += 1
+
+        dq1s = "Y" if dq1 is True else "N"
+        dq2s = "Y" if dq2 is True else "N"
+
         print(
             f"  {pps:>5d}"
             f"  {_fmt_int(predicted, 12)}"
             f"  {_fmt_int(actual, 12)}"
             f"  {_fmt_int(residual, 7, signed=True)}"
-            f"  {_fmt_int(_mod(actual), 4)}"
-            f"  {_fmt_int(o1, 12)}"
-            f"  {_fmt_int(r1, 12)}"
-            f"  {_fmt_int(a1, 12)}"
-            f"  {_fmt_int(_mod(a1), 4)}"
-            f"  {_fmt_int(s1, 4)}"
-            f"  {_fmt_int(ap1, 5)}"
-            f"  {_fmt_int(o2, 12)}"
-            f"  {_fmt_int(r2, 12)}"
-            f"  {_fmt_int(a2, 12)}"
-            f"  {_fmt_int(_mod(a2), 4)}"
-            f"  {_fmt_int(s2, 4)}"
-            f"  {_fmt_int(ap2, 5)}"
+            f"  {_fmt_int(o1_obs, 12)}"
+            f"  {_fmt_int(o1_best, 12)}"
+            f"  {_fmt_int(_mod(o1_obs), 4)}"
+            f"  {_fmt_int(_mod(o1_best), 4)}"
+            f"  {_fmt_int(ns1, 6, signed=True)}"
+            f"  {dq1s:>3s}"
+            f"  {_fmt_int(b1, 4)}"
+            f"  {_fmt_int(c1, 4)}"
+            f"  {_fmt_int(o2_obs, 12)}"
+            f"  {_fmt_int(o2_best, 12)}"
+            f"  {_fmt_int(_mod(o2_obs), 4)}"
+            f"  {_fmt_int(_mod(o2_best), 4)}"
+            f"  {_fmt_int(ns2, 6, signed=True)}"
+            f"  {dq2s:>3s}"
+            f"  {_fmt_int(b2, 4)}"
+            f"  {_fmt_int(c2, 4)}"
         )
 
         count += 1
@@ -394,22 +404,22 @@ def analyze(campaign: str, limit: int = 0) -> None:
         print(f"    1σ interpolation uncertainty = {pred_ns:.2f} ns")
         print()
 
-    def print_series(name: str, w: Welford) -> None:
+    def print_series(name: str, w: Welford, unit: str = "cycles") -> None:
         if w.n < 2:
             return
         print(f"  {name}:")
         print(f"    n       = {w.n:,}")
-        print(f"    mean    = {w.mean:,.2f}")
-        print(f"    stddev  = {w.stddev:.2f}")
+        print(f"    mean    = {w.mean:,.2f} {unit}")
+        print(f"    stddev  = {w.stddev:.2f} {unit}")
         print(f"    min/max = {w.min_val:,.0f} .. {w.max_val:,.0f}")
         print()
 
-    print_series("OCXO1 alpha delta", w_o1)
-    print_series("OCXO1 raw diagnostic delta", w_r1)
-    print_series("OCXO1 adjusted diagnostic delta", w_a1)
-    print_series("OCXO2 alpha delta", w_o2)
-    print_series("OCXO2 raw diagnostic delta", w_r2)
-    print_series("OCXO2 adjusted diagnostic delta", w_a2)
+    print_series("OCXO1 observed delta", w_o1_obs)
+    print_series("OCXO1 best delta", w_o1_best)
+    print_series("OCXO2 observed delta", w_o2_obs)
+    print_series("OCXO2 best delta", w_o2_best)
+    print_series("OCXO1 second residual", w_o1_ns, "ns")
+    print_series("OCXO2 second residual", w_o2_ns, "ns")
     print_series("OCXO1 shadow_to_isr_cycles", w_s1)
     print_series("OCXO2 shadow_to_isr_cycles", w_s2)
     print_series("OCXO1 approach_cycles", w_ap1)
@@ -417,44 +427,39 @@ def analyze(campaign: str, limit: int = 0) -> None:
 
     print("  Residue summaries:")
     _residue_summary("PPS actual", residues_pps)
-    _residue_summary("OCXO1 alpha", residues_o1)
-    _residue_summary("OCXO1 raw diagnostic", residues_r1)
-    _residue_summary("OCXO1 adjusted diagnostic", residues_a1)
-    _residue_summary("OCXO2 alpha", residues_o2)
-    _residue_summary("OCXO2 raw diagnostic", residues_r2)
-    _residue_summary("OCXO2 adjusted diagnostic", residues_a2)
+    _residue_summary("OCXO1 observed", residues_o1_obs)
+    _residue_summary("OCXO1 best", residues_o1_best)
+    _residue_summary("OCXO2 observed", residues_o2_obs)
+    _residue_summary("OCXO2 best", residues_o2_best)
 
     print("  Dominant bucket summaries:")
-    _bucket_summary("OCXO1 alpha buckets", buckets_o1)
-    _bucket_summary("OCXO1 raw diagnostic buckets", buckets_r1)
-    _bucket_summary("OCXO1 adjusted diagnostic buckets", buckets_a1)
-    _bucket_summary("OCXO2 alpha buckets", buckets_o2)
-    _bucket_summary("OCXO2 raw diagnostic buckets", buckets_r2)
-    _bucket_summary("OCXO2 adjusted diagnostic buckets", buckets_a2)
+    _bucket_summary("OCXO1 observed buckets", buckets_o1_obs)
+    _bucket_summary("OCXO1 best buckets", buckets_o1_best)
+    _bucket_summary("OCXO2 observed buckets", buckets_o2_obs)
+    _bucket_summary("OCXO2 best buckets", buckets_o2_best)
 
-    if w_o1.n >= 10 and w_dwt.n >= 10:
-        print("  Quantization analysis:")
-        print(f"    PPS DWT stddev:       {w_dwt.stddev:.2f} cycles")
-        print(f"    OCXO1 alpha stddev:   {w_o1.stddev:.2f} cycles")
-        print(f"    OCXO1 raw stddev:     {w_r1.stddev:.2f} cycles" if w_r1.n >= 2 else "    OCXO1 raw stddev:     ---")
-        print(f"    OCXO1 adjusted stddev:{w_a1.stddev:.2f} cycles" if w_a1.n >= 2 else "    OCXO1 adjusted stddev:---")
-        print(f"    OCXO2 alpha stddev:   {w_o2.stddev:.2f} cycles")
-        print(f"    OCXO2 raw stddev:     {w_r2.stddev:.2f} cycles" if w_r2.n >= 2 else "    OCXO2 raw stddev:     ---")
-        print(f"    OCXO2 adjusted stddev:{w_a2.stddev:.2f} cycles" if w_a2.n >= 2 else "    OCXO2 adjusted stddev:---")
+    print("  Dequantizer inferred bucket counts:")
+    _bucket_summary("OCXO1 inferred bucket size", dequant_bucket_counts_1)
+    _bucket_summary("OCXO2 inferred bucket size", dequant_bucket_counts_2)
 
-        if w_o1.stddev > 15:
-            print("    ⚠ OCXO1 bucketed / multimodal regime likely")
-        if w_o2.stddev > 15:
-            print("    ⚠ OCXO2 bucketed / multimodal regime likely")
+    if w_o1_obs.n >= 10 and w_o1_best.n >= 10:
+        print("  Dequantization analysis:")
+        print(f"    OCXO1 observed stddev: {w_o1_obs.stddev:.2f} cycles")
+        print(f"    OCXO1 best stddev:     {w_o1_best.stddev:.2f} cycles")
+        print(f"    OCXO2 observed stddev: {w_o2_obs.stddev:.2f} cycles")
+        print(f"    OCXO2 best stddev:     {w_o2_best.stddev:.2f} cycles")
+        print(f"    OCXO1 residual stddev: {w_o1_ns.stddev:.2f} ns" if w_o1_ns.n >= 2 else "    OCXO1 residual stddev: ---")
+        print(f"    OCXO2 residual stddev: {w_o2_ns.stddev:.2f} ns" if w_o2_ns.n >= 2 else "    OCXO2 residual stddev: ---")
 
-        if w_r1.n >= 2 and w_a1.n >= 2:
-            same1 = abs(w_r1.mean - w_a1.mean) < 1e-9 and abs(w_r1.stddev - w_a1.stddev) < 1e-9
-            if same1:
-                print("    ✓ OCXO1 raw and adjusted deltas are numerically identical")
-        if w_r2.n >= 2 and w_a2.n >= 2:
-            same2 = abs(w_r2.mean - w_a2.mean) < 1e-9 and abs(w_r2.stddev - w_a2.stddev) < 1e-9
-            if same2:
-                print("    ✓ OCXO2 raw and adjusted deltas are numerically identical")
+        if len(residues_o1_obs) == 1 and 0 in residues_o1_obs:
+            print("    ✓ OCXO1 observed path remains locked to lattice")
+        if len(residues_o1_best) > 1 or 0 not in residues_o1_best:
+            print("    ✓ OCXO1 best path escapes pure lattice locking")
+
+        if len(residues_o2_obs) == 1 and 0 in residues_o2_obs:
+            print("    ✓ OCXO2 observed path remains locked to lattice")
+        if len(residues_o2_best) > 1 or 0 not in residues_o2_best:
+            print("    ✓ OCXO2 best path escapes pure lattice locking")
         print()
 
 
