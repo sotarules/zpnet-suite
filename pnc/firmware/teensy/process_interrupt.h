@@ -90,21 +90,6 @@ enum class interrupt_event_status_t : uint8_t {
 // ============================================================================
 // Canonical interrupt event
 // ============================================================================
-//
-// Public contract:
-//   • PPS events publish direct canonical truth.
-//   • OCXO events publish process_interrupt's BEST ESTIMATE of event time.
-//   • Raw admitted truth remains available in diagnostics.
-//
-// Therefore, for OCXO subscribers:
-//
-//   dwt_at_event
-//   gnss_ns_at_event
-//
-// are no longer guaranteed to be the literal bucketed raw observation.
-// They are the best canonical event reconstruction that process_interrupt
-// can presently provide.
-//
 
 struct interrupt_event_t {
   interrupt_subscriber_kind_t kind = interrupt_subscriber_kind_t::NONE;
@@ -112,31 +97,20 @@ struct interrupt_event_t {
   interrupt_lane_t lane = interrupt_lane_t::NONE;
   interrupt_event_status_t status = interrupt_event_status_t::OK;
 
-  // Canonical BEST estimate of event DWT.
   uint32_t dwt_at_event = 0;
-
-  // Canonical BEST estimate of event time in GNSS nanoseconds.
   uint64_t gnss_ns_at_event = 0;
 
   // For PPS this is the PPS count since runtime start.
-  // For OCXO second-boundary subscribers this is the canonical second-count
-  // index / matched compare count surfaced by the provider path.
+  // For OCXO second-boundary subscribers this is the second-count index
+  // since runtime start.
   uint32_t counter32_at_event = 0;
 
-  // Fixed ISR-entry correction that produced the observed DWT-at-event
-  // candidate before any higher-level dequantization / smoothing.
   uint32_t dwt_event_correction_cycles = 0;
 };
 
 // ============================================================================
 // Optional capture diagnostics
 // ============================================================================
-//
-// Philosophy:
-//   • Diagnostics preserve the raw admitted truth AND the reconstructed truth.
-//   • Clients should never need diagnostics to use the API correctly.
-//   • Diagnostics exist so we can audit the estimator and avoid self-deception.
-//
 
 struct interrupt_capture_diag_t {
   bool enabled = true;
@@ -158,111 +132,18 @@ struct interrupt_capture_diag_t {
   // Total prespin runtime until interrupt fire.
   uint32_t approach_cycles = 0;
 
-  // Tail distance from final shadow-write sample to ISR entry.
+  // Tail distance from last shadow-write sample to ISR entry.
   uint32_t shadow_to_isr_cycles = 0;
 
-  // --------------------------------------------------------------------------
-  // Raw admitted / observed truth
-  // --------------------------------------------------------------------------
-
-  // Observed DWT-at-event after the fixed ISR-entry correction only.
-  uint32_t dwt_at_event_observed = 0;
-
-  // Observed GNSS nanoseconds computed directly from observed DWT-at-event.
-  uint64_t gnss_ns_at_event_observed = 0;
-
-  // Previous naming retained for backward compatibility with existing tooling.
-  // This mirrors dwt_at_event_observed.
   uint32_t dwt_at_event_adjusted = 0;
-
-  // Previous naming retained for backward compatibility with existing tooling.
-  // This mirrors gnss_ns_at_event_observed.
   uint64_t gnss_ns_at_event = 0;
-
   uint32_t counter32_at_event = 0;
   uint32_t dwt_event_correction_cycles = 0;
-
-  // --------------------------------------------------------------------------
-  // Canonical best-estimate truth
-  // --------------------------------------------------------------------------
-
-  uint32_t dwt_at_event_best = 0;
-  uint64_t gnss_ns_at_event_best = 0;
-
-  // --------------------------------------------------------------------------
-  // Prespin / anomaly bookkeeping
-  // --------------------------------------------------------------------------
 
   uint32_t prespin_arm_count = 0;
   uint32_t prespin_complete_count = 0;
   uint32_t prespin_timeout_count = 0;
   uint32_t anomaly_count = 0;
-
-  // --------------------------------------------------------------------------
-  // Forensic delta fields
-  // --------------------------------------------------------------------------
-  //
-  // These preserve the direct event-to-event deltas from the provider path.
-  // In the current investigation these have proven that the OCXO bucketization
-  // is already present upstream of clocks_alpha.
-  //
-
-  uint32_t prev_dwt_isr_entry_raw = 0;
-  uint32_t prev_dwt_at_event_observed = 0;
-  uint32_t prev_dwt_at_event_adjusted = 0;   // backward-compat mirror
-  uint32_t prev_dwt_at_event_best = 0;
-  bool     prev_valid = false;
-
-  // Raw ISR-entry delta.
-  uint32_t dwt_delta_raw = 0;
-
-  // Observed / adjusted delta after fixed-overhead subtraction only.
-  uint32_t dwt_delta_observed = 0;
-  uint32_t dwt_delta_adjusted = 0;           // backward-compat mirror
-
-  // Canonical best-estimate delta after quantization mitigation.
-  uint32_t dwt_delta_best = 0;
-
-  // --------------------------------------------------------------------------
-  // Runtime quantization-model / dequantization audit
-  // --------------------------------------------------------------------------
-
-  // True when process_interrupt believes this subscriber path exhibits a
-  // discoverable discrete-lattice admission structure.
-  bool quantization_detected = false;
-
-  // True when process_interrupt is actively using the model to publish
-  // best-estimate OCXO event timing.
-  bool dequant_enabled = false;
-
-  // True after the per-subscriber dequantization state has been initialized.
-  bool dequant_initialized = false;
-
-  // Inferred lattice step in DWT cycles discovered at runtime.
-  uint32_t dequant_bucket_cycles = 0;
-
-  // Confidence score / hit count supporting the current inferred lattice.
-  uint32_t dequant_confidence = 0;
-
-  // Best floating estimate of the underlying one-second delta.
-  double   dequant_estimated_delta_cycles = 0.0;
-
-  // Innovation between observed bucketed timing and the predicted latent timing.
-  int32_t  dequant_innovation_cycles = 0;
-
-  // Correction actually applied this event to the predicted latent timing.
-  double   dequant_applied_correction_cycles = 0.0;
-
-  // Bucket transition bookkeeping.
-  uint32_t dequant_bucket_same_count = 0;
-  uint32_t dequant_bucket_change_count = 0;
-
-  // Recent / dominant discovered bucket centers, smallest-to-largest order.
-  // These are diagnostic only; unused slots are zero.
-  static constexpr uint32_t MAX_DIAG_BUCKETS = 8;
-  uint32_t dequant_bucket_value[MAX_DIAG_BUCKETS] = {};
-  uint32_t dequant_bucket_hits[MAX_DIAG_BUCKETS] = {};
-  uint32_t dequant_bucket_count = 0;
 };
 
 // ============================================================================
