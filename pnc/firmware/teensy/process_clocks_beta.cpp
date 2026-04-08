@@ -415,11 +415,17 @@ void clocks_beta_pps(void) {
   // ── Compute cumulative PPB at publication time ──
 
   const uint64_t gnss_ns = g_gnss_ns_count_at_pps;
-  const uint64_t dwt_ns  = dwt_cycles_to_ns(g_dwt_cycle_count_total);
 
-  const double dwt_cumulative_ppb   = compute_cumulative_ppb(dwt_ns, gnss_ns);
-  const double ocxo1_cumulative_ppb = compute_cumulative_ppb(g_ocxo1_clock.ns_count_at_pps, gnss_ns);
-  const double ocxo2_cumulative_ppb = compute_cumulative_ppb(g_ocxo2_clock.ns_count_at_pps, gnss_ns);
+  // Campaign accumulators survive recovery; alpha's epoch state does not.
+  // Use the campaign accumulators for cumulative PPB so recovery is seamless.
+  const uint64_t campaign_gnss_ns  = gnss_raw_64 * 100ull;
+  const uint64_t campaign_dwt_ns   = dwt_cycles_to_ns(dwt_cycle_count_total);
+  const uint64_t campaign_ocxo1_ns = ocxo1_ticks_64 * 100ull;
+  const uint64_t campaign_ocxo2_ns = ocxo2_ticks_64 * 100ull;
+
+  const double dwt_cumulative_ppb   = compute_cumulative_ppb(campaign_dwt_ns, campaign_gnss_ns);
+  const double ocxo1_cumulative_ppb = compute_cumulative_ppb(campaign_ocxo1_ns, campaign_gnss_ns);
+  const double ocxo2_cumulative_ppb = compute_cumulative_ppb(campaign_ocxo2_ns, campaign_gnss_ns);
 
   // ── Build TIMEBASE_FRAGMENT payload ──
 
