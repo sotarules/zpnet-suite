@@ -1,5 +1,5 @@
 // ============================================================================
-// process_interrupt.h
+// process_interrupt.h (QTimer version — v18)
 // ============================================================================
 //
 // Shared interrupt authority + subscriber runtime.
@@ -16,22 +16,37 @@
 //   • DWT remains the precision substrate for capture and diagnostics.
 //   • Pre-spin is an integral part of interrupt handling for PPS / OCXO1 / OCXO2.
 //   • process_interrupt owns the pre-spin shadow-write loop and scheduling.
-//   • TimePop owns QTimer1. process_interrupt owns GPT1/GPT2 provider custody.
+//   • TimePop owns QTimer1. process_interrupt owns QTimer3 CH2+CH3.
 //   • Diagnostics are always available to clients through the callback contract.
-//   • There is no best-effort reconstruction path if sacred capture facts are absent.
 //
-// PPS drumbeat laws:
+// Provider hardware (v18 — QTimer migration):
 //
-//   • PPS pre-spin is a system-level drumbeat, not a campaign feature.
-//   • PPS drumbeat scheduling is geared from a sacred PPS baseline, not chained
-//     from callback timing.
-//   • ZERO is a request, not an immediate action.
-//   • ZERO is consummated only on a PPS edge.
-//   • That PPS edge becomes the new PPS drumbeat baseline.
+//   • QTimer3 CH2  — OCXO1 10 MHz external clock on pin 14 (GPIO_AD_B1_02)
+//   • QTimer3 CH3  — OCXO2 10 MHz external clock on pin 15 (GPIO_AD_B1_03)
+//   • GPIO6789     — PPS rising edge on pin 1
+//
+//   QTimer1 remains owned by TimePop (GNSS VCLOCK + scheduler).
+//   QTimer2 is untouched.
+//   Pin 13 (LED_BUILTIN) is preserved for fault Morse annunciator.
+//
+// Pin-to-QTimer mapping (verified from core_pins.h / i.MX RT1062 RM):
+//
+//   Pin 14 = GPIO_AD_B1_02 → ALT1 = QTIMER3_TIMER2 (CH2)  → PCS(2)
+//   Pin 15 = GPIO_AD_B1_03 → ALT1 = QTIMER3_TIMER3 (CH3)  → PCS(3)
+//
+//   Pin 11 = GPIO_B0_02    → ALT1 = QTIMER1_TIMER2 (CH2) — TimePop compare.
+//   DO NOT use pin 11 for OCXO input.
+//
+// ISR architecture:
+//
+//   Both OCXO channels share a single NVIC vector (IRQ_QTIMER3).
+//   The ISR captures DWT_CYCCNT as its first instruction, then checks
+//   status flags to determine which channel(s) fired.  This is the same
+//   dispatcher pattern used by TimePop's qtimer1_irq_isr.
 //
 // Lifecycle:
 //
-//   1. process_interrupt_init_hardware() — GPT clock gates, pin mux, enable
+//   1. process_interrupt_init_hardware() — QTimer3 clock gate, pin mux, enable
 //   2. process_interrupt_init()          — runtime slot creation, descriptor wiring
 //   3. process_interrupt_enable_irqs()   — ISR vector installation + NVIC enable
 //   4. interrupt_subscribe() / start()   — client wiring + activation
@@ -41,14 +56,13 @@
 #pragma once
 
 #include "timepop.h"
-
 #include <stdint.h>
 #include <stdbool.h>
 
 void interrupt_prespin_service(timepop_ctx_t*, timepop_diag_t*, void*);
 
 // ============================================================================
-// Subscriber identities (logical clients)
+// Subscriber identities
 // ============================================================================
 
 enum class interrupt_subscriber_kind_t : uint8_t {
@@ -60,25 +74,24 @@ enum class interrupt_subscriber_kind_t : uint8_t {
 };
 
 // ============================================================================
-// Internal provider / lane identities
+// Provider identities
 // ============================================================================
 
 enum class interrupt_provider_kind_t : uint8_t {
   NONE = 0,
-  GPT1,
-  GPT2,
+  QTIMER3,
   GPIO6789,
 };
 
 enum class interrupt_lane_t : uint8_t {
   NONE = 0,
-  GPT1_COMPARE3,
-  GPT2_COMPARE3,
+  QTIMER3_CH2_COMP,    // OCXO1 on QTimer3 channel 2
+  QTIMER3_CH3_COMP,    // OCXO2 on QTimer3 channel 3
   GPIO_EDGE,
 };
 
 // ============================================================================
-// Canonical event status
+// Event + diagnostics
 // ============================================================================
 
 enum class interrupt_event_status_t : uint8_t {
@@ -86,10 +99,6 @@ enum class interrupt_event_status_t : uint8_t {
   HOLD,
   FAULT,
 };
-
-// ============================================================================
-// Canonical interrupt event
-// ============================================================================
 
 struct interrupt_event_t {
   interrupt_subscriber_kind_t kind = interrupt_subscriber_kind_t::NONE;
@@ -99,18 +108,9 @@ struct interrupt_event_t {
 
   uint32_t dwt_at_event = 0;
   uint64_t gnss_ns_at_event = 0;
-
-  // For PPS this is the PPS count since runtime start.
-  // For OCXO second-boundary subscribers this is the second-count index
-  // since runtime start.
   uint32_t counter32_at_event = 0;
-
   uint32_t dwt_event_correction_cycles = 0;
 };
-
-// ============================================================================
-// Optional capture diagnostics
-// ============================================================================
 
 struct interrupt_capture_diag_t {
   bool enabled = true;
@@ -129,10 +129,7 @@ struct interrupt_capture_diag_t {
   uint32_t shadow_dwt = 0;
   uint32_t dwt_isr_entry_raw = 0;
 
-  // Total prespin runtime until interrupt fire.
   uint32_t approach_cycles = 0;
-
-  // Tail distance from last shadow-write sample to ISR entry.
   uint32_t shadow_to_isr_cycles = 0;
 
   uint32_t dwt_at_event_adjusted = 0;
@@ -185,11 +182,6 @@ bool interrupt_stop(interrupt_subscriber_kind_t kind);
 // ============================================================================
 // PPS drumbeat control
 // ============================================================================
-//
-// ZERO is latched and consummated only on a PPS edge. The next PPS edge after
-// this request becomes the new PPS drumbeat baseline and restarts the geared
-// PPS pre-spin schedule from that sacred edge.
-//
 
 void interrupt_request_pps_zero(void);
 bool interrupt_pps_zero_pending(void);
@@ -206,15 +198,15 @@ const interrupt_capture_diag_t* interrupt_last_diag(interrupt_subscriber_kind_t 
 // ============================================================================
 
 void process_interrupt_gpio6789_irq(uint32_t dwt_isr_entry_raw);
-void process_interrupt_gpt1_irq(uint32_t dwt_isr_entry_raw);
-void process_interrupt_gpt2_irq(uint32_t dwt_isr_entry_raw);
+void process_interrupt_qtimer3_ch2_irq(uint32_t dwt_isr_entry_raw);
+void process_interrupt_qtimer3_ch3_irq(uint32_t dwt_isr_entry_raw);
 
 // ============================================================================
-// Provider ownership helpers exposed to other subsystems when needed
+// Counter access — 16-bit raw reads (for diagnostics only)
 // ============================================================================
 
-uint32_t interrupt_gpt1_counter_now(void);
-uint32_t interrupt_gpt2_counter_now(void);
+uint16_t interrupt_qtimer3_ch2_counter_now(void);
+uint16_t interrupt_qtimer3_ch3_counter_now(void);
 
 // ============================================================================
 // Helper strings

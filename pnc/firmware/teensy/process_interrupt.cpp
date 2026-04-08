@@ -1,13 +1,13 @@
 // ============================================================================
-// process_interrupt.cpp — provider authority + shared pre-spin
+// process_interrupt.cpp — provider authority + shared pre-spin (QTimer v18)
 // ============================================================================
 //
 // process_interrupt is the sole authority for all precision interrupt hardware.
 //
 // Owned hardware:
-//   • GPT1 external clock (OCXO1 10 MHz) — timer bring-up, ISR vector, OCR3
-//   • GPT2 external clock (OCXO2 10 MHz) — timer bring-up, ISR vector, OCR3
-//   • GPIO6789 (PPS rising edge) — attachInterrupt, ISR vector
+//   • QTimer3 CH2 (OCXO1 10 MHz) — pin 14, timer bring-up, ISR, compare
+//   • QTimer3 CH3 (OCXO2 10 MHz) — pin 15, timer bring-up, ISR, compare
+//   • GPIO6789 (PPS rising edge)  — pin 1, attachInterrupt, ISR vector
 //   • All ISR vectors capture ARM_DWT_CYCCNT as their first instruction
 //
 // Owned machinery:
@@ -16,6 +16,27 @@
 //   • Subscriber dispatch with canonical event + diagnostics
 //   • PPS geared drumbeat scheduling from sacred PPS baseline
 //   • PPS ZERO-request latching and sacred edge consummation
+//
+// QTimer register setup mirrors TimePop's proven QTimer1 configuration:
+//
+//   • No TMR_CTRL_LENGTH — counter free-runs through full 16-bit range
+//   • COMP1 = 0xFFFF, CMPLD1 = 0xFFFF — wraps naturally at 65535→0
+//   • CM(1) = count rising edges of primary source
+//   • PCS(n) = select the channel's own external pin input
+//   • Compare interrupt via SCTRL TCF / TCFIE (match on COMP1 value)
+//   • Software tracks full 16-bit COMP1 target for one-second boundaries
+//
+// Pin-to-QTimer mapping:
+//
+//   Pin 14 = GPIO_AD_B1_02 → ALT1 = QTIMER3_TIMER2 (CH2) → PCS(2)
+//   Pin 15 = GPIO_AD_B1_03 → ALT1 = QTIMER3_TIMER3 (CH3) → PCS(3)
+//
+// ISR architecture:
+//
+//   Both OCXO channels share IRQ_QTIMER3.  The ISR captures DWT first,
+//   then checks SCTRL TCF flags on CH2 and CH3 to dispatch.
+//
+// TimePop owns QTimer1. process_interrupt does not touch QTimer1.
 //
 // Terminology:
 //   • approach_cycles      = total cycles from pre-spin start until interrupt fire
@@ -48,7 +69,7 @@
 //     - DWT capture and responsibility counter decrement
 //     - Prespin snapshot into per-clock runtime
 //     - Event construction (DWT correction, GNSS ns projection)
-//     - GPT OCR3 advancement (must happen before next edge)
+//     - QTimer COMP1 advancement (must happen before next edge)
 //     - Counter updates (irq_count, dispatch_count, event_count)
 //   • Everything else runs in scheduled context via deferred dispatch:
 //     - Subscriber event callbacks
@@ -66,17 +87,8 @@
 //   • OCXO1 / OCXO2 pre-spin are event-anchored and rescheduled from the just-
 //     consummated OCXO edge, analogous to PPS drumbeat rescheduling.
 //
-// TimePop owns QTimer1. process_interrupt does not touch QTimer1.
-//
-// OCR1 is reserved for any existing PPS phase capture system if present.
-// OCR3 is used for OCXO second-boundary scheduling to avoid conflict.
-//
-// GPT runs in free-running mode (FRR=1), so the counter never resets.
-// OCR3 fires when counter == OCR3 value. The ISR advances OCR3 by
-// OCXO_COUNTS_PER_SECOND for the next second boundary.
-//
 // Lifecycle:
-//   1. process_interrupt_init_hardware() — GPT clock gates, pin mux, timer enable
+//   1. process_interrupt_init_hardware() — QTimer3 clock gate, pin mux, timer enable
 //   2. process_interrupt_init()          — runtime slots, descriptor wiring
 //   3. process_interrupt_enable_irqs()   — ISR vector installation + NVIC enable
 //   4. interrupt_subscribe() / interrupt_start() — client wiring + activation
@@ -107,21 +119,25 @@ static constexpr uint64_t NS_PER_SECOND_U64      = 1000000000ULL;
 static constexpr uint64_t PRESPIN_LEAD_NS        = 10000ULL;     // 10 µs
 static constexpr uint32_t PRESPIN_TIMEOUT_CYCLES = 100800;       // ~100 µs @ 1.008 GHz
 
-// These values are intentionally separate. PPS is empirically ~48 cycles.
-// GPT continues to use the profiled fixed-overhead constant.
+// PPS is empirically ~48 cycles (GPIO direct vector, priority 0).
 static constexpr uint32_t PPS_ISR_FIXED_OVERHEAD_CYCLES = 48;
+
+// ============================================================================
+// Pin assignments — authoritative for process_interrupt
+// ============================================================================
+//
+// These must match config.h and zpnet_pins.h.
+//
+// Pin 14 = GPIO_AD_B1_02 → ALT1 = QTIMER3_TIMER2 (CH2) — OCXO1
+// Pin 15 = GPIO_AD_B1_03 → ALT1 = QTIMER3_TIMER3 (CH3) — OCXO2
+//
+
+static constexpr int OCXO1_PIN = 14;   // QTimer3 CH2
+static constexpr int OCXO2_PIN = 15;   // QTimer3 CH3
 
 // ============================================================================
 // Shared prespin state — responsibility counter architecture
 // ============================================================================
-//
-// One shadow DWT serves all clocks.  The spin loop writes it continuously.
-// Edge ISRs (priority 0) preempt the loop, read the shadow, and decrement
-// the responsibility counter.  The loop exits when the counter reaches 0.
-//
-// Prespin register callbacks (scheduled context) increment the counter
-// and arm a named ASAP timer ("PRESPIN_SPIN").  Named singleton replacement
-// ensures only one spin callback fires.  The spin runs from that callback.
 
 static volatile uint32_t g_prespin_shadow_dwt = 0;
 static volatile uint32_t g_prespin_start_dwt = 0;
@@ -146,9 +162,6 @@ struct interrupt_subscriber_descriptor_t {
 };
 
 struct prespin_state_t {
-  // active means this clock has requested prespin service.
-  // Set when the prespin callback increments the responsibility counter.
-  // Cleared when the edge ISR fires and snapshots the result.
   volatile bool active = false;
 
   uint64_t event_target_gnss_ns = 0;
@@ -161,17 +174,12 @@ struct prespin_state_t {
   uint32_t timeout_count = 0;
   uint32_t anomaly_count = 0;
 
-  // Instrumentation for schedule/arm timing analysis.
   uint64_t last_schedule_now_gnss_ns = 0;
   uint64_t last_schedule_delay_ns = 0;
   int64_t  last_prespin_margin_ns = 0;
   uint64_t last_schedule_event_target_gnss_ns = 0;
   uint64_t last_schedule_prespin_target_gnss_ns = 0;
 
-  // ISR-snapshot fields.
-  //
-  // The edge ISR reads the shared shadow DWT and stores values here
-  // for downstream math, diagnostics, and REPORT.
   uint32_t snap_start_dwt = 0;
   uint32_t snap_shadow_dwt = 0;
   uint32_t snap_dwt_isr_entry_raw = 0;
@@ -186,7 +194,14 @@ struct interrupt_subscriber_runtime_t {
   bool subscribed = false;
   bool active = false;
 
-  uint32_t next_ocr3 = 0;
+  // Software-tracked 16-bit compare target for next second boundary.
+  // Advances by OCXO_COUNTS_PER_SECOND (mod 65536) each second.
+  uint16_t next_comp = 0;
+
+  // Software-accumulated 32-bit event counter (for counter32_at_event).
+  // This is the total OCXO tick count at the last compare match,
+  // reconstructed from the known COMP1 values we programmed.
+  uint32_t next_match_total = 0;
 
   interrupt_event_t last_event {};
   interrupt_capture_diag_t last_diag {};
@@ -251,8 +266,8 @@ static bool g_interrupt_runtime_ready = false;
 static bool g_interrupt_irqs_enabled = false;
 
 static interrupt_provider_diag_t g_gpio_diag = {};
-static interrupt_provider_diag_t g_gpt1_diag = {};
-static interrupt_provider_diag_t g_gpt2_diag = {};
+static interrupt_provider_diag_t g_qtimer3_ch2_diag = {};
+static interrupt_provider_diag_t g_qtimer3_ch3_diag = {};
 static interrupt_anomaly_diag_t g_anomaly_diag = {};
 
 static interrupt_subscriber_runtime_t* g_rt_pps   = nullptr;
@@ -277,9 +292,9 @@ static const interrupt_subscriber_descriptor_t DESCRIPTORS[] = {
   {
     interrupt_subscriber_kind_t::OCXO1,
     "OCXO1",
-    interrupt_provider_kind_t::GPT1,
-    interrupt_lane_t::GPT1_COMPARE3,
-    GPT_ISR_FIXED_OVERHEAD,
+    interrupt_provider_kind_t::QTIMER3,
+    interrupt_lane_t::QTIMER3_CH2_COMP,
+    QTIMER_ISR_FIXED_OVERHEAD,
     NS_PER_SECOND_U64,
     true,
     false,
@@ -287,9 +302,9 @@ static const interrupt_subscriber_descriptor_t DESCRIPTORS[] = {
   {
     interrupt_subscriber_kind_t::OCXO2,
     "OCXO2",
-    interrupt_provider_kind_t::GPT2,
-    interrupt_lane_t::GPT2_COMPARE3,
-    GPT_ISR_FIXED_OVERHEAD,
+    interrupt_provider_kind_t::QTIMER3,
+    interrupt_lane_t::QTIMER3_CH3_COMP,
+    QTIMER_ISR_FIXED_OVERHEAD,
     NS_PER_SECOND_U64,
     true,
     false,
@@ -331,75 +346,119 @@ static void record_anomaly(uint32_t& counter,
 
 const char* interrupt_subscriber_kind_str(interrupt_subscriber_kind_t kind) {
   switch (kind) {
-    case interrupt_subscriber_kind_t::PPS:       return "PPS";
-    case interrupt_subscriber_kind_t::OCXO1:     return "OCXO1";
-    case interrupt_subscriber_kind_t::OCXO2:     return "OCXO2";
-    case interrupt_subscriber_kind_t::TIME_TEST: return "TIME_TEST";
-    default:                                     return "NONE";
+  case interrupt_subscriber_kind_t::PPS:       return "PPS";
+  case interrupt_subscriber_kind_t::OCXO1:     return "OCXO1";
+  case interrupt_subscriber_kind_t::OCXO2:     return "OCXO2";
+  case interrupt_subscriber_kind_t::TIME_TEST: return "TIME_TEST";
+  default:                                     return "NONE";
   }
 }
 
 const char* interrupt_provider_kind_str(interrupt_provider_kind_t provider) {
   switch (provider) {
-    case interrupt_provider_kind_t::GPT1:     return "GPT1";
-    case interrupt_provider_kind_t::GPT2:     return "GPT2";
-    case interrupt_provider_kind_t::GPIO6789: return "GPIO6789";
-    default:                                  return "NONE";
+  case interrupt_provider_kind_t::QTIMER3:   return "QTIMER3";
+  case interrupt_provider_kind_t::GPIO6789:  return "GPIO6789";
+  default:                                   return "NONE";
   }
 }
 
 const char* interrupt_lane_str(interrupt_lane_t lane) {
   switch (lane) {
-    case interrupt_lane_t::GPT1_COMPARE3: return "GPT1_COMPARE3";
-    case interrupt_lane_t::GPT2_COMPARE3: return "GPT2_COMPARE3";
-    case interrupt_lane_t::GPIO_EDGE:     return "GPIO_EDGE";
-    default:                              return "NONE";
+  case interrupt_lane_t::QTIMER3_CH2_COMP: return "QTIMER3_CH2_COMP";
+  case interrupt_lane_t::QTIMER3_CH3_COMP: return "QTIMER3_CH3_COMP";
+  case interrupt_lane_t::GPIO_EDGE:        return "GPIO_EDGE";
+  default:                                 return "NONE";
   }
 }
 
 // ============================================================================
-// GPT hardware bring-up (provider custody)
+// QTimer3 hardware bring-up (provider custody)
 // ============================================================================
+//
+// Register setup mirrors TimePop's proven QTimer1 configuration:
+//
+//   • No TMR_CTRL_LENGTH — counter free-runs, wraps at 0xFFFF→0
+//   • COMP1 = 0xFFFF, CMPLD1 = 0xFFFF — natural 16-bit wrap
+//   • CM(1) = count rising edges of primary source
+//   • PCS(n) = channel n's external pin input
+//
+// QTimer PCS (Primary Count Source) for external pin routing:
+//
+//   Each QTimer channel's external pin maps to PCS equal to the channel
+//   number.  This is the same convention as QTimer1 where pin 10 feeds
+//   CH0 via PCS(0).
+//
+//   Pin 14 = QTIMER3_TIMER2 → CH2 → PCS(2)
+//   Pin 15 = QTIMER3_TIMER3 → CH3 → PCS(3)
+//
+// IOMUX:
+//
+//   portConfigRegister(pin) = 1 selects ALT1 for both AD_B1 pads,
+//   which routes to QTIMER3_TIMERn.
+//
+// Pad configuration includes hysteresis + pull-up for clean edge
+// detection on the 10 MHz square wave, matching TimePop's pin 10 setup.
+//
 
-static inline void enable_gpt1(void) {
-  CCM_CCGR1 |= CCM_CCGR1_GPT1_BUS(CCM_CCGR_ON);
-}
+static void arm_qtimer3_ocxo_channels(void) {
+  // Enable QTimer3 clock gate
+  CCM_CCGR6 |= CCM_CCGR6_QTIMER3(CCM_CCGR_ON);
 
-static inline void enable_gpt2(void) {
-  CCM_CCGR0 |= CCM_CCGR0_GPT2_BUS(CCM_CCGR_ON);
-}
-
-static void arm_gpt1_external(void) {
-  enable_gpt1();
-  *(portConfigRegister(OCXO1_10MHZ_PIN)) = 1;
-  GPT1_CR = 0;
-  GPT1_SR = 0x3F;
-  GPT1_PR = 0;
-  GPT1_CR = GPT_CR_CLKSRC(3) | GPT_CR_FRR;
-  GPT1_OCR3 = 0;
-  GPT1_CR |= GPT_CR_EN;
-}
-
-static void arm_gpt2_external(void) {
-  enable_gpt2();
-  IOMUXC_SW_MUX_CTL_PAD_GPIO_AD_B1_02 = 8;
+  // ── Pin 14 → QTimer3 CH2 (OCXO1) ──
+  //
+  // GPIO_AD_B1_02: ALT1 = QTIMER3_TIMER2
+  *(portConfigRegister(OCXO1_PIN)) = 1;   // ALT1
   IOMUXC_SW_PAD_CTL_PAD_GPIO_AD_B1_02 =
       IOMUXC_PAD_HYS | IOMUXC_PAD_PKE | IOMUXC_PAD_PUE | IOMUXC_PAD_DSE(4);
-  IOMUXC_GPT2_IPP_IND_CLKIN_SELECT_INPUT = 1;
-  GPT2_CR = 0;
-  GPT2_SR = 0x3F;
-  GPT2_PR = 0;
-  GPT2_CR = GPT_CR_CLKSRC(3) | GPT_CR_FRR;
-  GPT2_OCR3 = 0;
-  GPT2_CR |= GPT_CR_EN;
+
+  // ── Pin 15 → QTimer3 CH3 (OCXO2) ──
+  //
+  // GPIO_AD_B1_03: ALT1 = QTIMER3_TIMER3
+  *(portConfigRegister(OCXO2_PIN)) = 1;   // ALT1
+  IOMUXC_SW_PAD_CTL_PAD_GPIO_AD_B1_03 =
+      IOMUXC_PAD_HYS | IOMUXC_PAD_PKE | IOMUXC_PAD_PUE | IOMUXC_PAD_DSE(4);
+
+  // Daisy-chain input select: tell QTimer3 to listen to these specific pads
+  IOMUXC_QTIMER3_TIMER2_SELECT_INPUT = 1;  // select GPIO_AD_B1_02 for TIMER2
+  IOMUXC_QTIMER3_TIMER3_SELECT_INPUT = 1;  // select GPIO_AD_B1_03 for TIMER3
+
+  // ── QTimer3 CH2 — OCXO1 counter ──
+  //
+  // Mirrors QTimer1 CH0 setup from TimePop:
+  //   - Free-running (no LENGTH bit)
+  //   - COMP1/CMPLD1 = 0xFFFF for natural 16-bit wrap
+  //   - CM(1) = count rising edges of primary source
+  //   - PCS(2) = channel 2's external pin input
+  //
+  IMXRT_TMR3.CH[2].CTRL   = 0;
+  IMXRT_TMR3.CH[2].SCTRL  = 0;
+  IMXRT_TMR3.CH[2].CSCTRL = 0;
+  IMXRT_TMR3.CH[2].LOAD   = 0;
+  IMXRT_TMR3.CH[2].CNTR   = 0;
+  IMXRT_TMR3.CH[2].COMP1  = 0xFFFF;
+  IMXRT_TMR3.CH[2].CMPLD1 = 0xFFFF;
+  IMXRT_TMR3.CH[2].CTRL   = TMR_CTRL_CM(1) | TMR_CTRL_PCS(2);
+
+  // ── QTimer3 CH3 — OCXO2 counter ──
+  //
+  // Same configuration, PCS(3) for channel 3's external pin input.
+  //
+  IMXRT_TMR3.CH[3].CTRL   = 0;
+  IMXRT_TMR3.CH[3].SCTRL  = 0;
+  IMXRT_TMR3.CH[3].CSCTRL = 0;
+  IMXRT_TMR3.CH[3].LOAD   = 0;
+  IMXRT_TMR3.CH[3].CNTR   = 0;
+  IMXRT_TMR3.CH[3].COMP1  = 0xFFFF;
+  IMXRT_TMR3.CH[3].CMPLD1 = 0xFFFF;
+  IMXRT_TMR3.CH[3].CTRL   = TMR_CTRL_CM(1) | TMR_CTRL_PCS(3);
 }
 
-uint32_t interrupt_gpt1_counter_now(void) {
-  return GPT1_CNT;
+uint16_t interrupt_qtimer3_ch2_counter_now(void) {
+  return IMXRT_TMR3.CH[2].CNTR;
 }
 
-uint32_t interrupt_gpt2_counter_now(void) {
-  return GPT2_CNT;
+uint16_t interrupt_qtimer3_ch3_counter_now(void) {
+  return IMXRT_TMR3.CH[3].CNTR;
 }
 
 // ============================================================================
@@ -415,24 +474,24 @@ static void pps_gpio_isr(void) {
   process_interrupt_gpio6789_irq(dwt_raw);
 }
 
-// GPT has three output-compare channels (OCR1/OCR2/OCR3) sharing a single
-// IRQ vector.  Only OCR3 is currently enabled, so this check is technically
-// redundant — but it costs ~2 cycles after DWT capture and future-proofs
-// the ISR if OCR1 or OCR2 are ever enabled for other purposes.
+// QTimer3 ISR dispatcher — both OCXO channels share this vector.
+// DWT is captured once at entry.  Flag checks determine which
+// channel(s) fired.  This is the same pattern as TimePop's
+// qtimer1_irq_isr that dispatches between CH2 and CH3.
+//
+// We check CH2 first (OCXO1), then CH3 (OCXO2).
+// If both fire simultaneously, CH2 gets the exact DWT and CH3
+// gets a slightly stale one — the prespin shadow compensates.
 
-static void gpt1_isr(void) {
+static void qtimer3_isr(void) {
   const uint32_t dwt_raw = ARM_DWT_CYCCNT;
 
-  if (GPT1_SR & GPT_SR_OF3) {
-    process_interrupt_gpt1_irq(dwt_raw);
+  if (IMXRT_TMR3.CH[2].SCTRL & TMR_SCTRL_TCF) {
+    process_interrupt_qtimer3_ch2_irq(dwt_raw);
   }
-}
 
-static void gpt2_isr(void) {
-  const uint32_t dwt_raw = ARM_DWT_CYCCNT;
-
-  if (GPT2_SR & GPT_SR_OF3) {
-    process_interrupt_gpt2_irq(dwt_raw);
+  if (IMXRT_TMR3.CH[3].SCTRL & TMR_SCTRL_TCF) {
+    process_interrupt_qtimer3_ch3_irq(dwt_raw);
   }
 }
 
@@ -466,16 +525,6 @@ static void pps_drumbeat_consume_edge(interrupt_subscriber_runtime_t& rt);
 // ============================================================================
 // Prespin registration callback — scheduled context
 // ============================================================================
-//
-// This runs from timepop_dispatch() in the main loop.  It does NOT spin.
-// It registers this clock as needing prespin service by incrementing the
-// shared responsibility counter, then arms a named ASAP timer to start
-// the spin loop.
-//
-// Named singleton replacement ("PRESPIN_SPIN") ensures that if multiple
-// clocks register in the same dispatch pass, only one spin callback fires.
-// By the time it runs, all registers have completed and the counter
-// reflects the total number of clients waiting.
 
 static void prespin_register_callback(timepop_ctx_t*,
                                       timepop_diag_t*,
@@ -496,18 +545,14 @@ static void prespin_register_callback(timepop_ctx_t*,
   ps.active = true;
   ps.arm_count++;
 
-  // Clear this clock's snapshot fields for the new cycle.
   ps.snap_start_dwt = 0;
   ps.snap_shadow_dwt = 0;
   ps.snap_dwt_isr_entry_raw = 0;
   ps.snap_fired = false;
   ps.snap_timed_out = false;
 
-  // Register for prespin service.
   g_prespin_responsibility_count++;
 
-  // Arm the shared spin loop.  Named singleton replacement ensures
-  // only one fires per dispatch pass, after all registers complete.
   timepop_arm_alap(interrupt_prespin_service, nullptr, "PRESPIN_SPIN");
 }
 
@@ -535,7 +580,6 @@ void interrupt_prespin_service(timepop_ctx_t*, timepop_diag_t*, void*) {
       g_prespin_responsibility_count = 0;
       g_prespin_spinning = false;
 
-      // Mark all still-waiting clients as timed out.
       for (uint32_t i = 0; i < g_subscriber_count; i++) {
         interrupt_subscriber_runtime_t& sub = g_subscribers[i];
         if (!sub.desc || !sub.desc->uses_prespin) continue;
@@ -562,10 +606,6 @@ void interrupt_prespin_service(timepop_ctx_t*, timepop_diag_t*, void*) {
 // ============================================================================
 // Unified scheduling helper
 // ============================================================================
-//
-// Arms the next prespin timer for any clock.
-// Runs in SCHEDULED CONTEXT (deferred dispatch), never in ISR context.
-// Deadlines are computed by TimePop from the time anchor via pure arithmetic.
 
 static void schedule_next_prespin_from_anchor(interrupt_subscriber_runtime_t& rt,
                                               uint64_t anchor_gnss_ns,
@@ -611,10 +651,6 @@ static void schedule_next_prespin_from_anchor(interrupt_subscriber_runtime_t& rt
 // ============================================================================
 // PPS / OCXO scheduling progression
 // ============================================================================
-//
-// These functions run in SCHEDULED CONTEXT (deferred dispatch).
-// They compute the next prespin target from the just-consummated edge
-// and arm the timer via anchor-relative arithmetic.
 
 static void pps_drumbeat_schedule_from_edge(interrupt_subscriber_runtime_t& rt,
                                             uint64_t pps_edge_gnss_ns) {
@@ -708,11 +744,6 @@ static void fill_diag_common(interrupt_subscriber_runtime_t& rt,
 // ============================================================================
 // Deferred dispatch — scheduled context
 // ============================================================================
-//
-// This callback runs in scheduled context (via timepop_dispatch in the main
-// loop).  It handles everything that does NOT need ISR timing:
-//   1. Subscriber event delivery
-//   2. Next prespin scheduling (geared from the just-consummated edge)
 
 static void maybe_dispatch_event(interrupt_subscriber_runtime_t& rt) {
   if (!rt.subscribed || !rt.sub.on_event) return;
@@ -723,10 +754,8 @@ static void deferred_dispatch_callback(timepop_ctx_t*, timepop_diag_t*, void* us
   auto* rt = static_cast<interrupt_subscriber_runtime_t*>(user_data);
   if (!rt || !rt->desc) return;
 
-  // 1. Deliver the event to the subscriber.
   maybe_dispatch_event(*rt);
 
-  // 2. Schedule the next prespin from the just-consummated edge.
   if (rt->desc->kind == interrupt_subscriber_kind_t::PPS) {
     pps_drumbeat_consume_edge(*rt);
   } else {
@@ -737,31 +766,18 @@ static void deferred_dispatch_callback(timepop_ctx_t*, timepop_diag_t*, void* us
 // ============================================================================
 // Unified ISR event handler — priority 0, time-critical work ONLY
 // ============================================================================
-//
-// This function runs at the highest interrupt priority.  It handles:
-//   • Responsibility counter decrement
-//   • Prespin snapshot from shared shadow into per-clock runtime
-//   • DWT correction and event construction
-//   • Counter updates
-//   • Deferred dispatch arming (zero-delay ASAP timer)
-//
-// It does NOT call any scheduling functions.  All scheduling happens
-// in the deferred dispatch callback above.
 
 static void handle_event(interrupt_subscriber_runtime_t& rt,
                          uint32_t dwt_isr_entry_raw,
                          uint32_t counter32_at_event) {
   prespin_state_t& ps = rt.prespin;
 
-  // Decrement the shared responsibility counter.
-  // This signals the spin loop that one client has been served.
   if (ps.active) {
     g_prespin_responsibility_count--;
     ps.active = false;
     ps.complete_count++;
   }
 
-  // Snapshot the shared prespin state into per-clock fields.
   ps.snap_start_dwt = g_prespin_start_dwt;
   ps.snap_shadow_dwt = g_prespin_shadow_dwt;
   ps.snap_dwt_isr_entry_raw = dwt_isr_entry_raw;
@@ -795,7 +811,6 @@ static void handle_event(interrupt_subscriber_runtime_t& rt,
                    ps.arm_count);
   }
 
-  // DWT correction and GNSS ns computation.
   const uint32_t correction = rt.desc->isr_overhead_cycles;
   const uint32_t dwt_at_event = dwt_isr_entry_raw - correction;
 
@@ -808,12 +823,10 @@ static void handle_event(interrupt_subscriber_runtime_t& rt,
   event.dwt_event_correction_cycles = correction;
 
   if (rt.desc->kind == interrupt_subscriber_kind_t::PPS) {
-    // PPS: GNSS ns is index-based (integer seconds from epoch).
     const int64_t pps_index = (int64_t)rt.event_count;
     event.gnss_ns_at_event = (uint64_t)(pps_index * 1000000000LL);
     event.status = interrupt_event_status_t::OK;
   } else {
-    // OCXO: GNSS ns is DWT-interpolated from the time anchor.
     const int64_t gnss_ns_signed = time_dwt_to_gnss_ns(dwt_at_event);
     if (gnss_ns_signed >= 0) {
       event.gnss_ns_at_event = (uint64_t)gnss_ns_signed;
@@ -834,7 +847,6 @@ static void handle_event(interrupt_subscriber_runtime_t& rt,
   rt.dispatch_count++;
   rt.event_count++;
 
-  // Deferred dispatch handles subscriber delivery AND prespin scheduling.
   timepop_arm_asap(deferred_dispatch_callback, &rt, dispatch_timer_name(rt.desc->kind));
 }
 
@@ -858,67 +870,71 @@ void process_interrupt_gpio6789_irq(uint32_t dwt_isr_entry_raw) {
 }
 
 // ============================================================================
-// GPT1 ISR entry
+// QTimer3 CH2 ISR entry — OCXO1
 // ============================================================================
+//
+// The 16-bit counter free-runs.  COMP1 fires when counter == COMP1 value.
+// We use SCTRL TCF/TCFIE for the compare interrupt (not CSCTRL TCF1).
+//
+// next_comp tracks the 16-bit compare target.  next_match_total tracks
+// the software-accumulated 32-bit total tick count at the match point.
+// These advance by OCXO_COUNTS_PER_SECOND each second, wrapping the
+// 16-bit compare naturally.
+//
 
-void process_interrupt_gpt1_irq(uint32_t dwt_isr_entry_raw) {
-  g_gpt1_diag.irq_count++;
+void process_interrupt_qtimer3_ch2_irq(uint32_t dwt_raw) {
+  g_qtimer3_ch2_diag.irq_count++;
 
-  if (!(GPT1_SR & GPT_SR_OF3)) {
-    g_gpt1_diag.miss_count++;
-    return;
-  }
+  // Clear the compare flag
+  IMXRT_TMR3.CH[2].SCTRL &= ~TMR_SCTRL_TCF;
 
-  GPT1_SR = GPT_SR_OF3;
-
-  interrupt_subscriber_runtime_t* rt = g_rt_ocxo1;
+  auto* rt = g_rt_ocxo1;
   if (!rt || !rt->active) {
+    g_qtimer3_ch2_diag.miss_count++;
     return;
   }
 
-  g_gpt1_diag.dispatch_count++;
+  g_qtimer3_ch2_diag.dispatch_count++;
 
-  // The canonical OCXO count at edge is the match value we armed, not an
-  // interrogated "now" value and not the event ordinal. GPT OCR3 just fired
-  // because the counter reached this value.
-  const uint32_t matched_count = rt->next_ocr3;
+  // The canonical OCXO count at this edge is the match total we computed
+  // when we armed this compare — not a live counter read.
+  const uint32_t matched_total = rt->next_match_total;
 
-  rt->next_ocr3 += OCXO_COUNTS_PER_SECOND;
-  GPT1_OCR3 = rt->next_ocr3;
+  // Advance for the next second boundary
+  rt->next_match_total += OCXO_COUNTS_PER_SECOND;
+  rt->next_comp += (uint16_t)OCXO_COUNTS_PER_SECOND;
+  IMXRT_TMR3.CH[2].COMP1 = rt->next_comp;
+  IMXRT_TMR3.CH[2].CMPLD1 = rt->next_comp;
 
-  handle_event(*rt, dwt_isr_entry_raw, matched_count);
+  handle_event(*rt, dwt_raw, matched_total);
 }
 
 // ============================================================================
-// GPT2 ISR entry
+// QTimer3 CH3 ISR entry — OCXO2
 // ============================================================================
 
-void process_interrupt_gpt2_irq(uint32_t dwt_isr_entry_raw) {
-  g_gpt2_diag.irq_count++;
+void process_interrupt_qtimer3_ch3_irq(uint32_t dwt_raw) {
+  g_qtimer3_ch3_diag.irq_count++;
 
-  if (!(GPT2_SR & GPT_SR_OF3)) {
-    g_gpt2_diag.miss_count++;
-    return;
-  }
+  // Clear the compare flag
+  IMXRT_TMR3.CH[3].SCTRL &= ~TMR_SCTRL_TCF;
 
-  GPT2_SR = GPT_SR_OF3;
-
-  interrupt_subscriber_runtime_t* rt = g_rt_ocxo2;
+  auto* rt = g_rt_ocxo2;
   if (!rt || !rt->active) {
+    g_qtimer3_ch3_diag.miss_count++;
     return;
   }
 
-  g_gpt2_diag.dispatch_count++;
+  g_qtimer3_ch3_diag.dispatch_count++;
 
-  // The canonical OCXO count at edge is the match value we armed, not an
-  // interrogated "now" value and not the event ordinal. GPT OCR3 just fired
-  // because the counter reached this value.
-  const uint32_t matched_count = rt->next_ocr3;
+  const uint32_t matched_total = rt->next_match_total;
 
-  rt->next_ocr3 += OCXO_COUNTS_PER_SECOND;
-  GPT2_OCR3 = rt->next_ocr3;
+  rt->next_match_total += OCXO_COUNTS_PER_SECOND;
+  rt->next_comp += (uint16_t)OCXO_COUNTS_PER_SECOND;
+  IMXRT_TMR3.CH[3].COMP1 = rt->next_comp;
+  IMXRT_TMR3.CH[3].CMPLD1 = rt->next_comp;
 
-  handle_event(*rt, dwt_isr_entry_raw, matched_count);
+  handle_event(*rt, dwt_raw, matched_total);
 }
 
 // ============================================================================
@@ -944,7 +960,6 @@ bool interrupt_start(interrupt_subscriber_kind_t kind) {
 
   rt->active = true;
   rt->start_count++;
-
   rt->prespin.active = false;
 
   if (kind == interrupt_subscriber_kind_t::PPS) {
@@ -954,20 +969,28 @@ bool interrupt_start(interrupt_subscriber_kind_t kind) {
   }
 
   if (kind == interrupt_subscriber_kind_t::OCXO1) {
-    uint32_t now = GPT1_CNT;
-    rt->next_ocr3 = now + OCXO_COUNTS_PER_SECOND;
-    GPT1_OCR3 = rt->next_ocr3;
-    GPT1_SR = GPT_SR_OF3;
-    GPT1_IR |= GPT_IR_OF3IE;
+    // Read current 16-bit counter, compute first compare target
+    uint16_t now16 = IMXRT_TMR3.CH[2].CNTR;
+    rt->next_comp = now16 + (uint16_t)OCXO_COUNTS_PER_SECOND;
+    rt->next_match_total = OCXO_COUNTS_PER_SECOND;
+
+    // Arm the compare
+    IMXRT_TMR3.CH[2].SCTRL &= ~TMR_SCTRL_TCF;       // clear pending flag
+    IMXRT_TMR3.CH[2].COMP1  = rt->next_comp;
+    IMXRT_TMR3.CH[2].CMPLD1 = rt->next_comp;
+    IMXRT_TMR3.CH[2].SCTRL |= TMR_SCTRL_TCFIE;      // enable compare interrupt
     return true;
   }
 
   if (kind == interrupt_subscriber_kind_t::OCXO2) {
-    uint32_t now = GPT2_CNT;
-    rt->next_ocr3 = now + OCXO_COUNTS_PER_SECOND;
-    GPT2_OCR3 = rt->next_ocr3;
-    GPT2_SR = GPT_SR_OF3;
-    GPT2_IR |= GPT_IR_OF3IE;
+    uint16_t now16 = IMXRT_TMR3.CH[3].CNTR;
+    rt->next_comp = now16 + (uint16_t)OCXO_COUNTS_PER_SECOND;
+    rt->next_match_total = OCXO_COUNTS_PER_SECOND;
+
+    IMXRT_TMR3.CH[3].SCTRL &= ~TMR_SCTRL_TCF;
+    IMXRT_TMR3.CH[3].COMP1  = rt->next_comp;
+    IMXRT_TMR3.CH[3].CMPLD1 = rt->next_comp;
+    IMXRT_TMR3.CH[3].SCTRL |= TMR_SCTRL_TCFIE;
     return true;
   }
 
@@ -989,9 +1012,9 @@ bool interrupt_stop(interrupt_subscriber_kind_t kind) {
   rt->prespin.active = false;
 
   if (kind == interrupt_subscriber_kind_t::OCXO1) {
-    GPT1_IR &= ~GPT_IR_OF3IE;
+    IMXRT_TMR3.CH[2].SCTRL &= ~TMR_SCTRL_TCFIE;
   } else if (kind == interrupt_subscriber_kind_t::OCXO2) {
-    GPT2_IR &= ~GPT_IR_OF3IE;
+    IMXRT_TMR3.CH[3].SCTRL &= ~TMR_SCTRL_TCFIE;
   }
 
   return true;
@@ -1032,8 +1055,7 @@ const interrupt_capture_diag_t* interrupt_last_diag(interrupt_subscriber_kind_t 
 void process_interrupt_init_hardware(void) {
   if (g_interrupt_hw_ready) return;
 
-  arm_gpt1_external();
-  arm_gpt2_external();
+  arm_qtimer3_ocxo_channels();
 
   g_interrupt_hw_ready = true;
 }
@@ -1080,20 +1102,19 @@ void process_interrupt_init(void) {
 void process_interrupt_enable_irqs(void) {
   if (g_interrupt_irqs_enabled) return;
 
-  GPT1_SR = 0x3F;
-  GPT1_IR = 0;
+  // ── QTimer3 — shared vector for CH2 (OCXO1) + CH3 (OCXO2) ──
+  //
+  // Clear any pending status flags before enabling.
+  // Do NOT enable compare interrupts here — that happens in interrupt_start().
+  //
+  IMXRT_TMR3.CH[2].SCTRL &= ~(TMR_SCTRL_TCF | TMR_SCTRL_TCFIE);
+  IMXRT_TMR3.CH[3].SCTRL &= ~(TMR_SCTRL_TCF | TMR_SCTRL_TCFIE);
 
-  attachInterruptVector(IRQ_GPT1, gpt1_isr);
-  NVIC_SET_PRIORITY(IRQ_GPT1, 0);
-  NVIC_ENABLE_IRQ(IRQ_GPT1);
+  attachInterruptVector(IRQ_QTIMER3, qtimer3_isr);
+  NVIC_SET_PRIORITY(IRQ_QTIMER3, 0);
+  NVIC_ENABLE_IRQ(IRQ_QTIMER3);
 
-  GPT2_SR = 0x3F;
-  GPT2_IR = 0;
-
-  attachInterruptVector(IRQ_GPT2, gpt2_isr);
-  NVIC_SET_PRIORITY(IRQ_GPT2, 0);
-  NVIC_ENABLE_IRQ(IRQ_GPT2);
-
+  // ── GPIO6789 — PPS ──
   pinMode(GNSS_PPS_PIN, INPUT);
   attachInterrupt(digitalPinToInterrupt(GNSS_PPS_PIN), pps_gpio_isr, RISING);
   NVIC_SET_PRIORITY(IRQ_GPIO6789, 0);
@@ -1117,13 +1138,13 @@ static Payload cmd_report(const Payload&) {
   p.add("gpio_dispatch_count", g_gpio_diag.dispatch_count);
   p.add("gpio_miss_count", g_gpio_diag.miss_count);
 
-  p.add("gpt1_irq_count", g_gpt1_diag.irq_count);
-  p.add("gpt1_dispatch_count", g_gpt1_diag.dispatch_count);
-  p.add("gpt1_miss_count", g_gpt1_diag.miss_count);
+  p.add("qtimer3_ch2_irq_count", g_qtimer3_ch2_diag.irq_count);
+  p.add("qtimer3_ch2_dispatch_count", g_qtimer3_ch2_diag.dispatch_count);
+  p.add("qtimer3_ch2_miss_count", g_qtimer3_ch2_diag.miss_count);
 
-  p.add("gpt2_irq_count", g_gpt2_diag.irq_count);
-  p.add("gpt2_dispatch_count", g_gpt2_diag.dispatch_count);
-  p.add("gpt2_miss_count", g_gpt2_diag.miss_count);
+  p.add("qtimer3_ch3_irq_count", g_qtimer3_ch3_diag.irq_count);
+  p.add("qtimer3_ch3_dispatch_count", g_qtimer3_ch3_diag.dispatch_count);
+  p.add("qtimer3_ch3_miss_count", g_qtimer3_ch3_diag.miss_count);
 
   p.add("pps_drumbeat_initialized", g_pps_drumbeat.initialized);
   p.add("pps_zero_pending", g_pps_drumbeat.zero_pending);
@@ -1148,6 +1169,10 @@ static Payload cmd_report(const Payload&) {
   p.add("anomaly_last_detail1", g_anomaly_diag.last_detail1);
   p.add("anomaly_last_detail2", g_anomaly_diag.last_detail2);
 
+  // Live 16-bit counter reads for diagnostic verification
+  p.add("qtimer3_ch2_cntr_now", (uint32_t)IMXRT_TMR3.CH[2].CNTR);
+  p.add("qtimer3_ch3_cntr_now", (uint32_t)IMXRT_TMR3.CH[3].CNTR);
+
   PayloadArray subscribers;
   for (uint32_t i = 0; i < g_subscriber_count; i++) {
     const interrupt_subscriber_runtime_t& rt = g_subscribers[i];
@@ -1168,7 +1193,8 @@ static Payload cmd_report(const Payload&) {
     s.add("dispatch_count", rt.dispatch_count);
     s.add("event_count", rt.event_count);
 
-    s.add("next_ocr3", rt.next_ocr3);
+    s.add("next_comp", (uint32_t)rt.next_comp);
+    s.add("next_match_total", rt.next_match_total);
 
     // Prespin facts — ISR snapshots.
     s.add("prespin_active", rt.prespin.active);

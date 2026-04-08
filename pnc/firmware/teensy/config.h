@@ -96,7 +96,7 @@ static const int LASER_MONITOR_PIN  = 20;
 //   Continuous analog voltage while light is present
 //
 static const int PHOTODIODE_EDGE_PIN   = 34;
-static const int PHOTODIODE_ANALOG_PIN = 15;
+static const int PHOTODIODE_ANALOG_PIN = 22;
 
 // --------------------------------------------------------------
 // GNSS timing pins
