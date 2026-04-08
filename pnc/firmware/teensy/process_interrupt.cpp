@@ -1,5 +1,5 @@
 // ============================================================================
-// process_interrupt.cpp — provider authority + shared pre-spin (QTimer v18)
+// process_interrupt.cpp — provider authority + shared pre-spin (QTimer v19)
 // ============================================================================
 //
 // process_interrupt is the sole authority for all precision interrupt hardware.
@@ -25,6 +25,23 @@
 //   • PCS(n) = select the channel's own external pin input
 //   • Compare interrupt via SCTRL TCF / TCFIE (match on COMP1 value)
 //   • Software tracks full 16-bit COMP1 target for one-second boundaries
+//
+// 16-bit windowing (v19):
+//
+//   QTimer3 CH2 and CH3 are standalone 16-bit counters (no cascade partner).
+//   At 10 MHz, the 16-bit counter wraps ~152 times per second.  COMP1
+//   fires on every wrap that hits the target value — ~152 times per second,
+//   not once.  Only one of those matches is the true one-second boundary.
+//
+//   To discriminate, each OCXO channel maintains a software 32-bit counter
+//   accumulated from 16-bit CNTR deltas at every compare hit.  The ISR
+//   checks whether the software counter has reached the 32-bit target
+//   (next_match_total) before accepting the event.  This mirrors TimePop's
+//   pattern where the CH2 compare is a hardware trigger and the ISR
+//   verifies the full 32-bit deadline before declaring expiry.
+//
+//   Spurious matches (~151/sec per OCXO) are rejected and counted in
+//   spurious_count for diagnostic observability.
 //
 // Pin-to-QTimer mapping:
 //
@@ -59,25 +76,7 @@
 //   snapshot the shared shadow DWT into the per-clock runtime.
 //
 //   If the spin loop is preempted by non-edge activity (transport, other
-//   timers), the shadow becomes momentarily stale.  This increases
-//   shadow_to_isr_cycles for that event.  The correct TDC offset is the
-//   MINIMUM shadow_to_isr_cycles across many events — outliers caused by
-//   preemption are noise, not signal.
-//
-// ISR vs scheduled context:
-//   • The ISR (priority 0) handles ONLY time-critical work:
-//     - DWT capture and responsibility counter decrement
-//     - Prespin snapshot into per-clock runtime
-//     - Event construction (DWT correction, GNSS ns projection)
-//     - QTimer COMP1 advancement (must happen before next edge)
-//     - Counter updates (irq_count, dispatch_count, event_count)
-//   • Everything else runs in scheduled context via deferred dispatch:
-//     - Subscriber event callbacks
-//     - PPS drumbeat scheduling for next prespin
-//     - OCXO prespin scheduling for next edge
-//   • This separation is possible because geared scheduling computes
-//     deadlines from the time anchor via pure arithmetic — the arm call
-//     can happen at any point within the second without loss of precision.
+//   timers), the shadow becomes momentarily stale.
 //
 // Scheduling intent:
 //   • PPS pre-spin is a geared drumbeat from actual consummated PPS edges.
@@ -199,9 +198,24 @@ struct interrupt_subscriber_runtime_t {
   uint16_t next_comp = 0;
 
   // Software-accumulated 32-bit event counter (for counter32_at_event).
-  // This is the total OCXO tick count at the last compare match,
+  // This is the total OCXO tick count at the next one-second boundary,
   // reconstructed from the known COMP1 values we programmed.
   uint32_t next_match_total = 0;
+
+  // ── Software 32-bit counter (v19 windowing) ──
+  //
+  // The 16-bit QTimer counter wraps ~152 times per second at 10 MHz.
+  // COMP1 fires on every wrap that hits the target — not just the one-second
+  // boundary.  To discriminate, we accumulate 16-bit CNTR deltas into a
+  // monotonic 32-bit running total and compare against next_match_total.
+  //
+  // This mirrors TimePop's pattern: hardware fires on low-16 match,
+  // software verifies the full 32-bit position before accepting.
+  //
+  uint16_t last_cntr = 0;         // last CNTR value seen in ISR
+  uint32_t running_total = 0;     // software 32-bit tick counter
+  uint32_t spurious_count = 0;    // ISR hits rejected by windowing
+  bool first_after_accept = false; // true on first ISR hit after COMP1 reprogrammed
 
   interrupt_event_t last_event {};
   interrupt_capture_diag_t last_diag {};
@@ -870,16 +884,19 @@ void process_interrupt_gpio6789_irq(uint32_t dwt_isr_entry_raw) {
 }
 
 // ============================================================================
-// QTimer3 CH2 ISR entry — OCXO1
+// QTimer3 CH2 ISR entry — OCXO1 (v19 windowed)
 // ============================================================================
 //
-// The 16-bit counter free-runs.  COMP1 fires when counter == COMP1 value.
-// We use SCTRL TCF/TCFIE for the compare interrupt (not CSCTRL TCF1).
+// The 16-bit counter free-runs at 10 MHz.  COMP1 fires when
+// counter == COMP1 value, which happens ~152 times per second
+// (once per 65536-tick wrap).  Only one of those is the true
+// one-second boundary at 10,000,000 ticks.
 //
-// next_comp tracks the 16-bit compare target.  next_match_total tracks
-// the software-accumulated 32-bit total tick count at the match point.
-// These advance by OCXO_COUNTS_PER_SECOND each second, wrapping the
-// 16-bit compare naturally.
+// Software 32-bit windowing (mirrors TimePop pattern):
+//   1. Read CNTR
+//   2. Accumulate 16-bit delta into running_total
+//   3. If running_total < next_match_total → spurious, return
+//   4. Otherwise → accept, advance targets, dispatch
 //
 
 void process_interrupt_qtimer3_ch2_irq(uint32_t dwt_raw) {
@@ -894,6 +911,22 @@ void process_interrupt_qtimer3_ch2_irq(uint32_t dwt_raw) {
     return;
   }
 
+  // ── Synthetic 32-bit counter ──
+  // First hit after COMP1 reprogrammed: short wrap (38,528 ticks).
+  // All subsequent hits: full wrap (65,536 ticks).
+  if (rt->first_after_accept) {
+    rt->running_total += (uint16_t)OCXO_COUNTS_PER_SECOND;
+    rt->first_after_accept = false;
+  } else {
+    rt->running_total += 65536;
+  }
+
+  // ── Windowing check: has the 32-bit target been reached? ──
+  if (rt->running_total < rt->next_match_total) {
+    rt->spurious_count++;
+    return;
+  }
+
   g_qtimer3_ch2_diag.dispatch_count++;
 
   // The canonical OCXO count at this edge is the match total we computed
@@ -903,14 +936,18 @@ void process_interrupt_qtimer3_ch2_irq(uint32_t dwt_raw) {
   // Advance for the next second boundary
   rt->next_match_total += OCXO_COUNTS_PER_SECOND;
   rt->next_comp += (uint16_t)OCXO_COUNTS_PER_SECOND;
+
   IMXRT_TMR3.CH[2].COMP1 = rt->next_comp;
   IMXRT_TMR3.CH[2].CMPLD1 = rt->next_comp;
+  rt->first_after_accept = true;
 
   handle_event(*rt, dwt_raw, matched_total);
+
+  rt->last_cntr = IMXRT_TMR3.CH[2].CNTR;
 }
 
 // ============================================================================
-// QTimer3 CH3 ISR entry — OCXO2
+// QTimer3 CH3 ISR entry — OCXO2 (v19 windowed)
 // ============================================================================
 
 void process_interrupt_qtimer3_ch3_irq(uint32_t dwt_raw) {
@@ -925,16 +962,39 @@ void process_interrupt_qtimer3_ch3_irq(uint32_t dwt_raw) {
     return;
   }
 
+  // ── Synthetic 32-bit counter ──
+  // First hit after COMP1 reprogrammed: short wrap (38,528 ticks).
+  // All subsequent hits: full wrap (65,536 ticks).
+  if (rt->first_after_accept) {
+    rt->running_total += (uint16_t)OCXO_COUNTS_PER_SECOND;
+    rt->first_after_accept = false;
+  } else {
+    rt->running_total += 65536;
+  }
+
+  // ── Windowing check: has the 32-bit target been reached? ──
+  if (rt->running_total < rt->next_match_total) {
+    rt->spurious_count++;
+    return;
+  }
+
   g_qtimer3_ch3_diag.dispatch_count++;
 
+  // The canonical OCXO count at this edge is the match total we computed
+  // when we armed this compare — not a live counter read.
   const uint32_t matched_total = rt->next_match_total;
 
+  // Advance for the next second boundary
   rt->next_match_total += OCXO_COUNTS_PER_SECOND;
   rt->next_comp += (uint16_t)OCXO_COUNTS_PER_SECOND;
-  IMXRT_TMR3.CH[3].COMP1 = rt->next_comp;
-  IMXRT_TMR3.CH[3].CMPLD1 = rt->next_comp;
+
+  IMXRT_TMR3.CH[2].COMP1 = rt->next_comp;
+  IMXRT_TMR3.CH[2].CMPLD1 = rt->next_comp;
+  rt->first_after_accept = true;
 
   handle_event(*rt, dwt_raw, matched_total);
+
+  rt->last_cntr = IMXRT_TMR3.CH[3].CNTR;
 }
 
 // ============================================================================
@@ -971,6 +1031,10 @@ bool interrupt_start(interrupt_subscriber_kind_t kind) {
   if (kind == interrupt_subscriber_kind_t::OCXO1) {
     // Read current 16-bit counter, compute first compare target
     uint16_t now16 = IMXRT_TMR3.CH[2].CNTR;
+    rt->last_cntr = now16;
+    rt->running_total = 0;
+    rt->spurious_count = 0;
+    rt->first_after_accept = true;
     rt->next_comp = now16 + (uint16_t)OCXO_COUNTS_PER_SECOND;
     rt->next_match_total = OCXO_COUNTS_PER_SECOND;
 
@@ -984,6 +1048,10 @@ bool interrupt_start(interrupt_subscriber_kind_t kind) {
 
   if (kind == interrupt_subscriber_kind_t::OCXO2) {
     uint16_t now16 = IMXRT_TMR3.CH[3].CNTR;
+    rt->last_cntr = now16;
+    rt->running_total = 0;
+    rt->spurious_count = 0;
+    rt->first_after_accept = true;
     rt->next_comp = now16 + (uint16_t)OCXO_COUNTS_PER_SECOND;
     rt->next_match_total = OCXO_COUNTS_PER_SECOND;
 
@@ -1195,6 +1263,11 @@ static Payload cmd_report(const Payload&) {
 
     s.add("next_comp", (uint32_t)rt.next_comp);
     s.add("next_match_total", rt.next_match_total);
+
+    // v19 windowing diagnostics
+    s.add("running_total", rt.running_total);
+    s.add("last_cntr", (uint32_t)rt.last_cntr);
+    s.add("spurious_count", rt.spurious_count);
 
     // Prespin facts — ISR snapshots.
     s.add("prespin_active", rt.prespin.active);
