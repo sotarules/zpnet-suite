@@ -1,34 +1,30 @@
 // ============================================================================
-// process_interrupt.cpp — provider authority + shared pre-spin (QTimer v19)
+// process_interrupt.cpp — provider authority + shared pre-spin (QTimer v20)
 // ============================================================================
 //
 // process_interrupt is the sole authority for all precision interrupt hardware.
 //
-// Owned hardware:
-//   • QTimer3 CH2 (OCXO1 10 MHz) — pin 14, timer bring-up, ISR, compare
-//   • QTimer3 CH3 (OCXO2 10 MHz) — pin 15, timer bring-up, ISR, compare
-//   • GPIO6789 (PPS rising edge)  — pin 1, attachInterrupt, ISR vector
-//   • All ISR vectors capture ARM_DWT_CYCCNT as their first instruction
+// Final timing architecture:
 //
-// Owned machinery:
-//   • Shared pre-spin shadow-write loop with responsibility counter
-//   • Event reconstruction (DWT correction, GNSS ns projection)
-//   • Subscriber dispatch with canonical event + diagnostics
-//   • PPS geared drumbeat scheduling from sacred PPS baseline
-//   • PPS ZERO-request latching and sacred edge consummation
+//   • QTimer1 CH0+CH1 — GNSS VCLOCK 10 MHz on pin 10 (capture-only from here)
+//   • QTimer2 CH0+CH1 — OCXO1 10 MHz on pin 2
+//   • QTimer3 CH0+CH1 — OCXO2 10 MHz on pin 4
+//   • GPIO6789        — PPS rising edge on pin 1
 //
-// QTimer register setup mirrors TimePop's proven QTimer1 configuration:
+// Core laws:
 //
-//   • No TMR_CTRL_LENGTH — counter free-runs through full 16-bit range
-//   • COMP1 = 0xFFFF, CMPLD1 = 0xFFFF — wraps naturally at 65535→0
-//   • CM(1) = count rising edges of primary source
-//   • PCS(n) = select the channel's own external pin input
-//   • Compare interrupt via SCTRL TCF / TCFIE (match on COMP1 value)
-//   • Software tracks full 16-bit COMP1 target for one-second boundaries
+//   • All three 10 MHz domains use the same hardware model:
+//       CH0 primary external input + CH1 cascade = 32-bit free-running counter
 //
-// TimePop owns QTimer1. process_interrupt does not touch QTimer1, except
-// for a torn-read-safe snapshot used to capture the PPS-aligned VCLOCK fact
-// at the PPS boundary itself.
+//   • PPS remains special:
+//       DWT is captured as the first instruction in the ISR and QTimer1 is
+//       sampled in the PPS ISR to obtain the lawful VCLOCK fact for that edge.
+//
+//   • process_timepop remains standalone and continues to own QTimer1 CH2.
+//     process_interrupt must not depend on TimePop for its own core mechanics.
+//
+//   • Compare / rollover / initialization logic for the OCXO clocks is shared
+//     through one parameterized runtime structure and helper set.
 //
 // ============================================================================
 
@@ -50,7 +46,7 @@
 // ============================================================================
 
 static constexpr uint32_t MAX_INTERRUPT_SUBSCRIBERS = 8;
-static constexpr uint32_t OCXO_COUNTS_PER_SECOND = 10000000;
+static constexpr uint32_t CLOCK_COUNTS_PER_SECOND   = 10000000U;
 
 static constexpr uint64_t NS_PER_SECOND_U64      = 1000000000ULL;
 static constexpr uint64_t PRESPIN_LEAD_NS        = 10000ULL;
@@ -62,8 +58,8 @@ static constexpr uint32_t PPS_ISR_FIXED_OVERHEAD_CYCLES = 48;
 // Pin assignments — authoritative for process_interrupt
 // ============================================================================
 
-static constexpr int OCXO1_PIN = 14;
-static constexpr int OCXO2_PIN = 15;
+static constexpr int OCXO1_PIN = 2;
+static constexpr int OCXO2_PIN = 4;
 
 // ============================================================================
 // Shared prespin state — responsibility counter architecture
@@ -77,6 +73,11 @@ static volatile bool     g_prespin_spinning = false;
 // ============================================================================
 // QTimer1 PPS-aligned VCLOCK capture
 // ============================================================================
+//
+// QTimer1 belongs to TimePop for scheduling, but PPS needs a lawful VCLOCK fact
+// corresponding to the PPS boundary itself. This torn-read-safe helper is used
+// only for that PPS capture.
+//
 
 static uint32_t qtimer1_read_32_for_pps_capture(void) {
   const uint16_t lo1 = IMXRT_TMR1.CH[0].CNTR;
@@ -90,6 +91,57 @@ static uint32_t qtimer1_read_32_for_pps_capture(void) {
   }
   return ((uint32_t)hi1 << 16) | (uint32_t)lo1;
 }
+
+// ============================================================================
+// Shared 32-bit cascaded QTimer clock runtime
+// ============================================================================
+
+enum class qtimer_clock_kind_t : uint8_t {
+  NONE = 0,
+  VCLOCK,
+  OCXO1,
+  OCXO2,
+};
+
+struct qtimer_cascade_hw_t {
+  IMXRT_TMR_t* module = nullptr;
+  uint8_t      ch0 = 0;
+  uint8_t      ch1 = 0;
+  IRQ_NUMBER_t irq = IRQ_QTIMER2;
+  int          input_pin = -1;
+  uint8_t      pcs = 0;
+
+  // Optional compare channel for one-second event generation.
+  // For cascaded OCXO domains we use CH2 compare on the same module.
+  uint8_t      compare_ch = 2;
+};
+
+struct qtimer_cascade_runtime_t {
+  qtimer_clock_kind_t kind = qtimer_clock_kind_t::NONE;
+  const char*         name = nullptr;
+  qtimer_cascade_hw_t hw {};
+
+  bool     initialized = false;
+  bool     active = false;
+
+  // Next 32-bit one-second match target in the clock’s own 10 MHz domain.
+  uint32_t next_match_total = 0;
+
+  // Low-16 target currently programmed into compare channel.
+  uint16_t next_compare_low16 = 0;
+
+  // Diagnostics
+  uint32_t irq_count = 0;
+  uint32_t dispatch_count = 0;
+  uint32_t miss_count = 0;
+  uint32_t start_count = 0;
+  uint32_t stop_count = 0;
+  uint32_t event_count = 0;
+
+  interrupt_event_t last_event {};
+  interrupt_capture_diag_t last_diag {};
+  bool has_fired = false;
+};
 
 // ============================================================================
 // Subscriber descriptor + runtime state
@@ -106,6 +158,8 @@ struct interrupt_subscriber_descriptor_t {
   uint64_t period_ns = 0;
   bool     uses_prespin = false;
   bool     prespin_absolute_gnss = false;
+
+  qtimer_clock_kind_t clock_kind = qtimer_clock_kind_t::NONE;
 };
 
 struct prespin_state_t {
@@ -140,14 +194,6 @@ struct interrupt_subscriber_runtime_t {
 
   bool subscribed = false;
   bool active = false;
-
-  uint16_t next_comp = 0;
-  uint32_t next_match_total = 0;
-
-  uint16_t last_cntr = 0;
-  uint32_t running_total = 0;
-  uint32_t spurious_count = 0;
-  bool first_after_accept = false;
 
   interrupt_event_t last_event {};
   interrupt_capture_diag_t last_diag {};
@@ -212,13 +258,15 @@ static bool g_interrupt_runtime_ready = false;
 static bool g_interrupt_irqs_enabled = false;
 
 static interrupt_provider_diag_t g_gpio_diag = {};
-static interrupt_provider_diag_t g_qtimer3_ch2_diag = {};
-static interrupt_provider_diag_t g_qtimer3_ch3_diag = {};
 static interrupt_anomaly_diag_t g_anomaly_diag = {};
 
 static interrupt_subscriber_runtime_t* g_rt_pps   = nullptr;
 static interrupt_subscriber_runtime_t* g_rt_ocxo1 = nullptr;
 static interrupt_subscriber_runtime_t* g_rt_ocxo2 = nullptr;
+
+// Shared OCXO cascade runtimes.
+static qtimer_cascade_runtime_t g_clock_ocxo1 = {};
+static qtimer_cascade_runtime_t g_clock_ocxo2 = {};
 
 // ============================================================================
 // Subscriber descriptors
@@ -234,6 +282,7 @@ static const interrupt_subscriber_descriptor_t DESCRIPTORS[] = {
     NS_PER_SECOND_U64,
     true,
     true,
+    qtimer_clock_kind_t::VCLOCK,
   },
   {
     interrupt_subscriber_kind_t::OCXO1,
@@ -244,6 +293,7 @@ static const interrupt_subscriber_descriptor_t DESCRIPTORS[] = {
     NS_PER_SECOND_U64,
     true,
     false,
+    qtimer_clock_kind_t::OCXO1,
   },
   {
     interrupt_subscriber_kind_t::OCXO2,
@@ -254,6 +304,7 @@ static const interrupt_subscriber_descriptor_t DESCRIPTORS[] = {
     NS_PER_SECOND_U64,
     true,
     false,
+    qtimer_clock_kind_t::OCXO2,
   },
 };
 
@@ -268,6 +319,14 @@ static interrupt_subscriber_runtime_t* runtime_for(interrupt_subscriber_kind_t k
     }
   }
   return nullptr;
+}
+
+static qtimer_cascade_runtime_t* clock_runtime_for(qtimer_clock_kind_t kind) {
+  switch (kind) {
+    case qtimer_clock_kind_t::OCXO1: return &g_clock_ocxo1;
+    case qtimer_clock_kind_t::OCXO2: return &g_clock_ocxo2;
+    default: return nullptr;
+  }
 }
 
 // ============================================================================
@@ -318,48 +377,132 @@ const char* interrupt_lane_str(interrupt_lane_t lane) {
 }
 
 // ============================================================================
-// QTimer3 hardware bring-up (provider custody)
+// QTimer cascade helpers
 // ============================================================================
+//
+// These helpers mirror the proven TimePop pattern:
+//
+//   CH0 = primary external 10 MHz count source
+//   CH1 = cascade extension
+//   CH2 = one-second compare trigger
+//
+// The compare fires whenever low16 == programmed COMP1, and software verifies
+// the full 32-bit counter before accepting the event.
+//
 
-static void arm_qtimer3_ocxo_channels(void) {
-  CCM_CCGR6 |= CCM_CCGR6_QTIMER3(CCM_CCGR_ON);
+static uint32_t qtimer_cascade_read_32(IMXRT_TMR_t* module, uint8_t ch0, uint8_t ch1) {
+  const uint16_t lo1 = module->CH[ch0].CNTR;
+  const uint16_t hi1 = module->CH[ch1].HOLD;
 
-  *(portConfigRegister(OCXO1_PIN)) = 1;
-  IOMUXC_SW_PAD_CTL_PAD_GPIO_AD_B1_02 =
-      IOMUXC_PAD_HYS | IOMUXC_PAD_PKE | IOMUXC_PAD_PUE | IOMUXC_PAD_DSE(4);
+  const uint16_t lo2 = module->CH[ch0].CNTR;
+  const uint16_t hi2 = module->CH[ch1].HOLD;
 
-  *(portConfigRegister(OCXO2_PIN)) = 1;
-  IOMUXC_SW_PAD_CTL_PAD_GPIO_AD_B1_03 =
-      IOMUXC_PAD_HYS | IOMUXC_PAD_PKE | IOMUXC_PAD_PUE | IOMUXC_PAD_DSE(4);
-
-  IOMUXC_QTIMER3_TIMER2_SELECT_INPUT = 1;
-  IOMUXC_QTIMER3_TIMER3_SELECT_INPUT = 1;
-
-  IMXRT_TMR3.CH[2].CTRL   = 0;
-  IMXRT_TMR3.CH[2].SCTRL  = 0;
-  IMXRT_TMR3.CH[2].CSCTRL = 0;
-  IMXRT_TMR3.CH[2].LOAD   = 0;
-  IMXRT_TMR3.CH[2].CNTR   = 0;
-  IMXRT_TMR3.CH[2].COMP1  = 0xFFFF;
-  IMXRT_TMR3.CH[2].CMPLD1 = 0xFFFF;
-  IMXRT_TMR3.CH[2].CTRL   = TMR_CTRL_CM(1) | TMR_CTRL_PCS(2);
-
-  IMXRT_TMR3.CH[3].CTRL   = 0;
-  IMXRT_TMR3.CH[3].SCTRL  = 0;
-  IMXRT_TMR3.CH[3].CSCTRL = 0;
-  IMXRT_TMR3.CH[3].LOAD   = 0;
-  IMXRT_TMR3.CH[3].CNTR   = 0;
-  IMXRT_TMR3.CH[3].COMP1  = 0xFFFF;
-  IMXRT_TMR3.CH[3].CMPLD1 = 0xFFFF;
-  IMXRT_TMR3.CH[3].CTRL   = TMR_CTRL_CM(1) | TMR_CTRL_PCS(3);
+  if (hi1 != hi2) {
+    return ((uint32_t)hi2 << 16) | (uint32_t)lo2;
+  }
+  return ((uint32_t)hi1 << 16) | (uint32_t)lo1;
 }
 
-uint16_t interrupt_qtimer3_ch2_counter_now(void) {
-  return IMXRT_TMR3.CH[2].CNTR;
+static void qtimer_cascade_clear_compare_flag(qtimer_cascade_runtime_t& clock) {
+  clock.hw.module->CH[clock.hw.compare_ch].CSCTRL &= ~(TMR_CSCTRL_TCF1 | TMR_CSCTRL_TCF2);
 }
 
-uint16_t interrupt_qtimer3_ch3_counter_now(void) {
-  return IMXRT_TMR3.CH[3].CNTR;
+static void qtimer_cascade_program_compare(qtimer_cascade_runtime_t& clock, uint16_t target_low16) {
+  qtimer_cascade_clear_compare_flag(clock);
+  clock.hw.module->CH[clock.hw.compare_ch].COMP1  = target_low16;
+  clock.hw.module->CH[clock.hw.compare_ch].CMPLD1 = target_low16;
+  qtimer_cascade_clear_compare_flag(clock);
+  clock.hw.module->CH[clock.hw.compare_ch].CSCTRL |= TMR_CSCTRL_TCF1EN;
+}
+
+static void qtimer_cascade_disable_compare(qtimer_cascade_runtime_t& clock) {
+  clock.hw.module->CH[clock.hw.compare_ch].CSCTRL &= ~TMR_CSCTRL_TCF1EN;
+  qtimer_cascade_clear_compare_flag(clock);
+}
+
+static void qtimer_cascade_init_hardware(qtimer_cascade_runtime_t& clock) {
+  if (!clock.hw.module) return;
+
+  if (clock.kind == qtimer_clock_kind_t::OCXO1) {
+    CCM_CCGR6 |= CCM_CCGR6_QTIMER2(CCM_CCGR_ON);
+  } else if (clock.kind == qtimer_clock_kind_t::OCXO2) {
+    CCM_CCGR6 |= CCM_CCGR6_QTIMER3(CCM_CCGR_ON);
+  }
+
+  *(portConfigRegister(clock.hw.input_pin)) = 1;
+
+  // NOTE:
+  // Exact pad / daisy symbols depend on the final chosen pins on Teensy 4.1.
+  // These placeholders are intentionally centralized so the architecture is
+  // cleanly expressed in one place. Final build-check may require symbol-name
+  // correction to match the exact pad routed to QTimer2/QTimer3 CH0.
+  if (clock.kind == qtimer_clock_kind_t::OCXO1) {
+    // pin 2 → QTimer2 CH0 external input
+    // TODO: verify exact PAD + SELECT_INPUT symbol names in build environment
+  } else if (clock.kind == qtimer_clock_kind_t::OCXO2) {
+    // pin 4 → QTimer3 CH0 external input
+    // TODO: verify exact PAD + SELECT_INPUT symbol names in build environment
+  }
+
+  // CH0: primary external count source
+  clock.hw.module->CH[clock.hw.ch0].CTRL   = 0;
+  clock.hw.module->CH[clock.hw.ch0].SCTRL  = 0;
+  clock.hw.module->CH[clock.hw.ch0].CSCTRL = 0;
+  clock.hw.module->CH[clock.hw.ch0].LOAD   = 0;
+  clock.hw.module->CH[clock.hw.ch0].CNTR   = 0;
+  clock.hw.module->CH[clock.hw.ch0].COMP1  = 0xFFFF;
+  clock.hw.module->CH[clock.hw.ch0].CMPLD1 = 0xFFFF;
+  clock.hw.module->CH[clock.hw.ch0].CTRL   = TMR_CTRL_CM(1) | TMR_CTRL_PCS(clock.hw.pcs);
+
+  // CH1: cascade extension
+  clock.hw.module->CH[clock.hw.ch1].CTRL   = 0;
+  clock.hw.module->CH[clock.hw.ch1].SCTRL  = 0;
+  clock.hw.module->CH[clock.hw.ch1].CSCTRL = 0;
+  clock.hw.module->CH[clock.hw.ch1].LOAD   = 0;
+  clock.hw.module->CH[clock.hw.ch1].CNTR   = 0;
+  clock.hw.module->CH[clock.hw.ch1].COMP1  = 0xFFFF;
+  clock.hw.module->CH[clock.hw.ch1].CMPLD1 = 0xFFFF;
+  clock.hw.module->CH[clock.hw.ch1].CTRL   = TMR_CTRL_CM(7);
+
+  // CH2: compare scheduler for one-second boundaries
+  clock.hw.module->CH[clock.hw.compare_ch].CTRL   = 0;
+  clock.hw.module->CH[clock.hw.compare_ch].SCTRL  = 0;
+  clock.hw.module->CH[clock.hw.compare_ch].CSCTRL = 0;
+  clock.hw.module->CH[clock.hw.compare_ch].LOAD   = 0;
+  clock.hw.module->CH[clock.hw.compare_ch].CNTR   = 0;
+  clock.hw.module->CH[clock.hw.compare_ch].COMP1  = 0xFFFF;
+  clock.hw.module->CH[clock.hw.compare_ch].CMPLD1 = 0xFFFF;
+
+  // Compare channel counts the same primary source as CH0.
+  clock.hw.module->CH[clock.hw.compare_ch].CTRL   = TMR_CTRL_CM(1) | TMR_CTRL_PCS(clock.hw.pcs);
+  qtimer_cascade_disable_compare(clock);
+
+  clock.initialized = true;
+}
+
+static void qtimer_cascade_arm_first_second(qtimer_cascade_runtime_t& clock) {
+  const uint32_t now32 = qtimer_cascade_read_32(clock.hw.module, clock.hw.ch0, clock.hw.ch1);
+
+  clock.next_match_total = now32 + CLOCK_COUNTS_PER_SECOND;
+  clock.next_compare_low16 = (uint16_t)(clock.next_match_total & 0xFFFFu);
+
+  qtimer_cascade_program_compare(clock, clock.next_compare_low16);
+  clock.active = true;
+  clock.start_count++;
+}
+
+static bool qtimer_cascade_match_due(qtimer_cascade_runtime_t& clock,
+                                     uint32_t now32,
+                                     uint32_t& matched_total) {
+  if (now32 < clock.next_match_total) {
+    return false;
+  }
+
+  matched_total = clock.next_match_total;
+  clock.next_match_total += CLOCK_COUNTS_PER_SECOND;
+  clock.next_compare_low16 = (uint16_t)(clock.next_match_total & 0xFFFFu);
+  qtimer_cascade_program_compare(clock, clock.next_compare_low16);
+  return true;
 }
 
 // ============================================================================
@@ -371,14 +514,18 @@ static void pps_gpio_isr(void) {
   process_interrupt_gpio6789_irq(dwt_raw);
 }
 
-static void qtimer3_isr(void) {
+static void qtimer2_isr(void) {
   const uint32_t dwt_raw = ARM_DWT_CYCCNT;
-
-  if (IMXRT_TMR3.CH[2].SCTRL & TMR_SCTRL_TCF) {
+  if (g_clock_ocxo1.hw.module &&
+      (g_clock_ocxo1.hw.module->CH[g_clock_ocxo1.hw.compare_ch].CSCTRL & TMR_CSCTRL_TCF1)) {
     process_interrupt_qtimer3_ch2_irq(dwt_raw);
   }
+}
 
-  if (IMXRT_TMR3.CH[3].SCTRL & TMR_SCTRL_TCF) {
+static void qtimer3_isr(void) {
+  const uint32_t dwt_raw = ARM_DWT_CYCCNT;
+  if (g_clock_ocxo2.hw.module &&
+      (g_clock_ocxo2.hw.module->CH[g_clock_ocxo2.hw.compare_ch].CSCTRL & TMR_CSCTRL_TCF1)) {
     process_interrupt_qtimer3_ch3_irq(dwt_raw);
   }
 }
@@ -739,6 +886,34 @@ static void handle_event(interrupt_subscriber_runtime_t& rt,
 }
 
 // ============================================================================
+// Shared OCXO compare ISR path
+// ============================================================================
+
+static void handle_cascade_clock_irq(qtimer_cascade_runtime_t& clock,
+                                     interrupt_subscriber_runtime_t& rt,
+                                     uint32_t dwt_raw) {
+  clock.irq_count++;
+
+  qtimer_cascade_clear_compare_flag(clock);
+
+  if (!clock.active || !rt.active) {
+    clock.miss_count++;
+    return;
+  }
+
+  const uint32_t now32 = qtimer_cascade_read_32(clock.hw.module, clock.hw.ch0, clock.hw.ch1);
+
+  uint32_t matched_total = 0;
+  if (!qtimer_cascade_match_due(clock, now32, matched_total)) {
+    return;
+  }
+
+  clock.dispatch_count++;
+  handle_event(rt, dwt_raw, matched_total);
+  clock.event_count++;
+}
+
+// ============================================================================
 // GPIO / PPS ISR entry
 // ============================================================================
 
@@ -758,89 +933,17 @@ void process_interrupt_gpio6789_irq(uint32_t dwt_isr_entry_raw) {
 }
 
 // ============================================================================
-// QTimer3 CH2 ISR entry — OCXO1 (v19 windowed)
+// QTimer compare ISR entries — OCXO1 / OCXO2
 // ============================================================================
 
 void process_interrupt_qtimer3_ch2_irq(uint32_t dwt_raw) {
-  g_qtimer3_ch2_diag.irq_count++;
-
-  IMXRT_TMR3.CH[2].SCTRL &= ~TMR_SCTRL_TCF;
-
-  auto* rt = g_rt_ocxo1;
-  if (!rt || !rt->active) {
-    g_qtimer3_ch2_diag.miss_count++;
-    return;
-  }
-
-  if (rt->first_after_accept) {
-    rt->running_total += (uint16_t)OCXO_COUNTS_PER_SECOND;
-    rt->first_after_accept = false;
-  } else {
-    rt->running_total += 65536;
-  }
-
-  if (rt->running_total < rt->next_match_total) {
-    rt->spurious_count++;
-    return;
-  }
-
-  g_qtimer3_ch2_diag.dispatch_count++;
-
-  const uint32_t matched_total = rt->next_match_total;
-
-  rt->next_match_total += OCXO_COUNTS_PER_SECOND;
-  rt->next_comp += (uint16_t)OCXO_COUNTS_PER_SECOND;
-
-  IMXRT_TMR3.CH[2].COMP1 = rt->next_comp;
-  IMXRT_TMR3.CH[2].CMPLD1 = rt->next_comp;
-  rt->first_after_accept = true;
-
-  handle_event(*rt, dwt_raw, matched_total);
-
-  rt->last_cntr = IMXRT_TMR3.CH[2].CNTR;
+  if (!g_rt_ocxo1) return;
+  handle_cascade_clock_irq(g_clock_ocxo1, *g_rt_ocxo1, dwt_raw);
 }
 
-// ============================================================================
-// QTimer3 CH3 ISR entry — OCXO2 (v19 windowed)
-// ============================================================================
-
 void process_interrupt_qtimer3_ch3_irq(uint32_t dwt_raw) {
-  g_qtimer3_ch3_diag.irq_count++;
-
-  IMXRT_TMR3.CH[3].SCTRL &= ~TMR_SCTRL_TCF;
-
-  auto* rt = g_rt_ocxo2;
-  if (!rt || !rt->active) {
-    g_qtimer3_ch3_diag.miss_count++;
-    return;
-  }
-
-  if (rt->first_after_accept) {
-    rt->running_total += (uint16_t)OCXO_COUNTS_PER_SECOND;
-    rt->first_after_accept = false;
-  } else {
-    rt->running_total += 65536;
-  }
-
-  if (rt->running_total < rt->next_match_total) {
-    rt->spurious_count++;
-    return;
-  }
-
-  g_qtimer3_ch3_diag.dispatch_count++;
-
-  const uint32_t matched_total = rt->next_match_total;
-
-  rt->next_match_total += OCXO_COUNTS_PER_SECOND;
-  rt->next_comp += (uint16_t)OCXO_COUNTS_PER_SECOND;
-
-  IMXRT_TMR3.CH[3].COMP1 = rt->next_comp;
-  IMXRT_TMR3.CH[3].CMPLD1 = rt->next_comp;
-  rt->first_after_accept = true;
-
-  handle_event(*rt, dwt_raw, matched_total);
-
-  rt->last_cntr = IMXRT_TMR3.CH[3].CNTR;
+  if (!g_rt_ocxo2) return;
+  handle_cascade_clock_irq(g_clock_ocxo2, *g_rt_ocxo2, dwt_raw);
 }
 
 // ============================================================================
@@ -874,39 +977,13 @@ bool interrupt_start(interrupt_subscriber_kind_t kind) {
     return true;
   }
 
-  if (kind == interrupt_subscriber_kind_t::OCXO1) {
-    uint16_t now16 = IMXRT_TMR3.CH[2].CNTR;
-    rt->last_cntr = now16;
-    rt->running_total = 0;
-    rt->spurious_count = 0;
-    rt->first_after_accept = true;
-    rt->next_comp = now16 + (uint16_t)OCXO_COUNTS_PER_SECOND;
-    rt->next_match_total = OCXO_COUNTS_PER_SECOND;
-
-    IMXRT_TMR3.CH[2].SCTRL &= ~TMR_SCTRL_TCF;
-    IMXRT_TMR3.CH[2].COMP1  = rt->next_comp;
-    IMXRT_TMR3.CH[2].CMPLD1 = rt->next_comp;
-    IMXRT_TMR3.CH[2].SCTRL |= TMR_SCTRL_TCFIE;
-    return true;
+  qtimer_cascade_runtime_t* clock = clock_runtime_for(rt->desc->clock_kind);
+  if (!clock || !clock->initialized) {
+    return false;
   }
 
-  if (kind == interrupt_subscriber_kind_t::OCXO2) {
-    uint16_t now16 = IMXRT_TMR3.CH[3].CNTR;
-    rt->last_cntr = now16;
-    rt->running_total = 0;
-    rt->spurious_count = 0;
-    rt->first_after_accept = true;
-    rt->next_comp = now16 + (uint16_t)OCXO_COUNTS_PER_SECOND;
-    rt->next_match_total = OCXO_COUNTS_PER_SECOND;
-
-    IMXRT_TMR3.CH[3].SCTRL &= ~TMR_SCTRL_TCF;
-    IMXRT_TMR3.CH[3].COMP1  = rt->next_comp;
-    IMXRT_TMR3.CH[3].CMPLD1 = rt->next_comp;
-    IMXRT_TMR3.CH[3].SCTRL |= TMR_SCTRL_TCFIE;
-    return true;
-  }
-
-  return false;
+  qtimer_cascade_arm_first_second(*clock);
+  return true;
 }
 
 bool interrupt_stop(interrupt_subscriber_kind_t kind) {
@@ -923,10 +1000,11 @@ bool interrupt_stop(interrupt_subscriber_kind_t kind) {
 
   rt->prespin.active = false;
 
-  if (kind == interrupt_subscriber_kind_t::OCXO1) {
-    IMXRT_TMR3.CH[2].SCTRL &= ~TMR_SCTRL_TCFIE;
-  } else if (kind == interrupt_subscriber_kind_t::OCXO2) {
-    IMXRT_TMR3.CH[3].SCTRL &= ~TMR_SCTRL_TCFIE;
+  qtimer_cascade_runtime_t* clock = clock_runtime_for(rt->desc->clock_kind);
+  if (clock) {
+    clock->active = false;
+    clock->stop_count++;
+    qtimer_cascade_disable_compare(*clock);
   }
 
   return true;
@@ -967,7 +1045,28 @@ const interrupt_capture_diag_t* interrupt_last_diag(interrupt_subscriber_kind_t 
 void process_interrupt_init_hardware(void) {
   if (g_interrupt_hw_ready) return;
 
-  arm_qtimer3_ocxo_channels();
+  g_clock_ocxo1.kind = qtimer_clock_kind_t::OCXO1;
+  g_clock_ocxo1.name = "OCXO1";
+  g_clock_ocxo1.hw.module = &IMXRT_TMR2;
+  g_clock_ocxo1.hw.ch0 = 0;
+  g_clock_ocxo1.hw.ch1 = 1;
+  g_clock_ocxo1.hw.compare_ch = 2;
+  g_clock_ocxo1.hw.irq = IRQ_QTIMER2;
+  g_clock_ocxo1.hw.input_pin = OCXO1_PIN;
+  g_clock_ocxo1.hw.pcs = 0;
+
+  g_clock_ocxo2.kind = qtimer_clock_kind_t::OCXO2;
+  g_clock_ocxo2.name = "OCXO2";
+  g_clock_ocxo2.hw.module = &IMXRT_TMR3;
+  g_clock_ocxo2.hw.ch0 = 0;
+  g_clock_ocxo2.hw.ch1 = 1;
+  g_clock_ocxo2.hw.compare_ch = 2;
+  g_clock_ocxo2.hw.irq = IRQ_QTIMER3;
+  g_clock_ocxo2.hw.input_pin = OCXO2_PIN;
+  g_clock_ocxo2.hw.pcs = 0;
+
+  qtimer_cascade_init_hardware(g_clock_ocxo1);
+  qtimer_cascade_init_hardware(g_clock_ocxo2);
 
   g_interrupt_hw_ready = true;
 }
@@ -1014,8 +1113,9 @@ void process_interrupt_init(void) {
 void process_interrupt_enable_irqs(void) {
   if (g_interrupt_irqs_enabled) return;
 
-  IMXRT_TMR3.CH[2].SCTRL &= ~(TMR_SCTRL_TCF | TMR_SCTRL_TCFIE);
-  IMXRT_TMR3.CH[3].SCTRL &= ~(TMR_SCTRL_TCF | TMR_SCTRL_TCFIE);
+  attachInterruptVector(IRQ_QTIMER2, qtimer2_isr);
+  NVIC_SET_PRIORITY(IRQ_QTIMER2, 0);
+  NVIC_ENABLE_IRQ(IRQ_QTIMER2);
 
   attachInterruptVector(IRQ_QTIMER3, qtimer3_isr);
   NVIC_SET_PRIORITY(IRQ_QTIMER3, 0);
@@ -1044,14 +1144,6 @@ static Payload cmd_report(const Payload&) {
   p.add("gpio_dispatch_count", g_gpio_diag.dispatch_count);
   p.add("gpio_miss_count", g_gpio_diag.miss_count);
 
-  p.add("qtimer3_ch2_irq_count", g_qtimer3_ch2_diag.irq_count);
-  p.add("qtimer3_ch2_dispatch_count", g_qtimer3_ch2_diag.dispatch_count);
-  p.add("qtimer3_ch2_miss_count", g_qtimer3_ch2_diag.miss_count);
-
-  p.add("qtimer3_ch3_irq_count", g_qtimer3_ch3_diag.irq_count);
-  p.add("qtimer3_ch3_dispatch_count", g_qtimer3_ch3_diag.dispatch_count);
-  p.add("qtimer3_ch3_miss_count", g_qtimer3_ch3_diag.miss_count);
-
   p.add("pps_drumbeat_initialized", g_pps_drumbeat.initialized);
   p.add("pps_zero_pending", g_pps_drumbeat.zero_pending);
   p.add("pps_baseline_gnss_ns", g_pps_drumbeat.baseline_gnss_ns);
@@ -1075,9 +1167,6 @@ static Payload cmd_report(const Payload&) {
   p.add("anomaly_last_detail1", g_anomaly_diag.last_detail1);
   p.add("anomaly_last_detail2", g_anomaly_diag.last_detail2);
 
-  p.add("qtimer3_ch2_cntr_now", (uint32_t)IMXRT_TMR3.CH[2].CNTR);
-  p.add("qtimer3_ch3_cntr_now", (uint32_t)IMXRT_TMR3.CH[3].CNTR);
-
   PayloadArray subscribers;
   for (uint32_t i = 0; i < g_subscriber_count; i++) {
     const interrupt_subscriber_runtime_t& rt = g_subscribers[i];
@@ -1097,13 +1186,6 @@ static Payload cmd_report(const Payload&) {
     s.add("irq_count", rt.irq_count);
     s.add("dispatch_count", rt.dispatch_count);
     s.add("event_count", rt.event_count);
-
-    s.add("next_comp", (uint32_t)rt.next_comp);
-    s.add("next_match_total", rt.next_match_total);
-
-    s.add("running_total", rt.running_total);
-    s.add("last_cntr", (uint32_t)rt.last_cntr);
-    s.add("spurious_count", rt.spurious_count);
 
     s.add("prespin_active", rt.prespin.active);
     s.add("prespin_fired", rt.prespin.snap_fired);
@@ -1138,6 +1220,29 @@ static Payload cmd_report(const Payload&) {
   }
 
   p.add_array("subscribers", subscribers);
+
+  PayloadArray clocks;
+  auto add_clock = [&](const qtimer_cascade_runtime_t& clock) {
+    Payload c;
+    c.add("name", clock.name ? clock.name : "");
+    c.add("active", clock.active);
+    c.add("initialized", clock.initialized);
+    c.add("start_count", clock.start_count);
+    c.add("stop_count", clock.stop_count);
+    c.add("irq_count", clock.irq_count);
+    c.add("dispatch_count", clock.dispatch_count);
+    c.add("miss_count", clock.miss_count);
+    c.add("event_count", clock.event_count);
+    c.add("next_match_total", clock.next_match_total);
+    c.add("next_compare_low16", (uint32_t)clock.next_compare_low16);
+    c.add("counter32_now", qtimer_cascade_read_32(clock.hw.module, clock.hw.ch0, clock.hw.ch1));
+    clocks.add(c);
+  };
+
+  add_clock(g_clock_ocxo1);
+  add_clock(g_clock_ocxo2);
+  p.add_array("cascaded_clocks", clocks);
+
   return p;
 }
 
