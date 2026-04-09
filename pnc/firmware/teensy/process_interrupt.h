@@ -1,5 +1,5 @@
 // ============================================================================
-// process_interrupt.h (QTimer version — v18)
+// process_interrupt.h (QTimer version — v21)
 // ============================================================================
 //
 // Shared interrupt authority + subscriber runtime.
@@ -19,34 +19,43 @@
 //   • TimePop owns QTimer1. process_interrupt owns QTimer3 CH2+CH3.
 //   • Diagnostics are always available to clients through the callback contract.
 //
-// Provider hardware (v18 — QTimer migration):
+// Corrected provider model:
 //
-//   • QTimer3 CH2  — OCXO1 10 MHz external clock on pin 14 (GPIO_AD_B1_02)
-//   • QTimer3 CH3  — OCXO2 10 MHz external clock on pin 15 (GPIO_AD_B1_03)
+//   • QTimer3 CH2  — OCXO1 10 MHz external clock on pin 14
+//   • QTimer3 CH3  — OCXO2 10 MHz external clock on pin 15
 //   • GPIO6789     — PPS rising edge on pin 1
 //
 //   QTimer1 remains owned by TimePop (GNSS VCLOCK + scheduler).
 //   QTimer2 is untouched.
 //   Pin 13 (LED_BUILTIN) is preserved for fault Morse annunciator.
 //
-// Pin-to-QTimer mapping (verified from core_pins.h / i.MX RT1062 RM):
+// Important architectural correction:
 //
-//   Pin 14 = GPIO_AD_B1_02 → ALT1 = QTIMER3_TIMER2 (CH2)  → PCS(2)
-//   Pin 15 = GPIO_AD_B1_03 → ALT1 = QTIMER3_TIMER3 (CH3)  → PCS(3)
+//   QTimer3 CH2 and CH3 are treated as 16-bit cadence lanes, NOT as free-running
+//   32-bit OCXO clocks.  No canonical OCXO time is obtained by reading those
+//   counters live.  Instead:
 //
-//   Pin 11 = GPIO_B0_02    → ALT1 = QTIMER1_TIMER2 (CH2) — TimePop compare.
-//   DO NOT use pin 11 for OCXO input.
+//     • lawful compare interrupts define event truth
+//     • DWT captures the event in ISR context
+//     • GNSS nanoseconds are reconstructed mathematically from the DWT bridge
+//     • counter32_at_event is a software-reconstructed logical OCXO count at the
+//       lawful one-second edge, not a raw hardware 32-bit counter read
+//
+// Pin-to-QTimer mapping:
+//
+//   • Pin 14 → QTIMER3_TIMER2 (CH2)
+//   • Pin 15 → QTIMER3_TIMER3 (CH3)
 //
 // ISR architecture:
 //
 //   Both OCXO channels share a single NVIC vector (IRQ_QTIMER3).
 //   The ISR captures DWT_CYCCNT as its first instruction, then checks
-//   status flags to determine which channel(s) fired.  This is the same
-//   dispatcher pattern used by TimePop's qtimer1_irq_isr.
+//   status flags to determine which channel(s) fired.  This mirrors the
+//   shared-dispatch pattern used elsewhere in the timing subsystem.
 //
 // Lifecycle:
 //
-//   1. process_interrupt_init_hardware() — QTimer3 clock gate, pin mux, enable
+//   1. process_interrupt_init_hardware() — QTimer3 clock gate, pin mux, bring-up
 //   2. process_interrupt_init()          — runtime slot creation, descriptor wiring
 //   3. process_interrupt_enable_irqs()   — ISR vector installation + NVIC enable
 //   4. interrupt_subscribe() / start()   — client wiring + activation
@@ -106,9 +115,22 @@ struct interrupt_event_t {
   interrupt_lane_t lane = interrupt_lane_t::NONE;
   interrupt_event_status_t status = interrupt_event_status_t::OK;
 
+  // DWT cycle count reconstructed to the actual event boundary by applying the
+  // fixed ISR overhead correction to the raw ISR-entry capture.
   uint32_t dwt_at_event = 0;
+
+  // GNSS nanosecond corresponding to dwt_at_event via the canonical DWT↔GNSS bridge.
   uint64_t gnss_ns_at_event = 0;
+
+  // For PPS:
+  //   Raw 32-bit QTimer1 VCLOCK value captured at the lawful PPS edge.
+  //
+  // For OCXO1 / OCXO2:
+  //   Software-reconstructed logical OCXO count at the lawful one-second edge.
+  //   This is NOT a live 32-bit hardware counter read from QTimer3.
   uint32_t counter32_at_event = 0;
+
+  // Fixed cycle correction subtracted from dwt_isr_entry_raw to obtain dwt_at_event.
   uint32_t dwt_event_correction_cycles = 0;
 };
 
@@ -119,14 +141,20 @@ struct interrupt_capture_diag_t {
   interrupt_lane_t lane = interrupt_lane_t::NONE;
   interrupt_subscriber_kind_t kind = interrupt_subscriber_kind_t::NONE;
 
+  // Scheduled prespin target for this event in GNSS nanoseconds.
   uint64_t prespin_target_gnss_ns = 0;
+
+  // Intended event boundary for this event in GNSS nanoseconds.
   uint64_t event_target_gnss_ns = 0;
 
   bool prespin_active = false;
   bool prespin_fired = false;
   bool prespin_timed_out = false;
 
+  // Last DWT value written by the prespin shadow loop.
   uint32_t shadow_dwt = 0;
+
+  // First DWT capture taken on ISR entry.
   uint32_t dwt_isr_entry_raw = 0;
 
   uint32_t approach_cycles = 0;
@@ -202,8 +230,12 @@ void process_interrupt_qtimer3_ch2_irq(uint32_t dwt_isr_entry_raw);
 void process_interrupt_qtimer3_ch3_irq(uint32_t dwt_isr_entry_raw);
 
 // ============================================================================
-// Counter access — 16-bit raw reads (for diagnostics only)
+// Counter access — 16-bit raw reads (diagnostics only)
 // ============================================================================
+//
+// These are raw hardware reads from QTimer3 CH2 / CH3 and are never canonical
+// timing truth. They exist only for instrumentation, reporting, and sanity checks.
+//
 
 uint16_t interrupt_qtimer3_ch2_counter_now(void);
 uint16_t interrupt_qtimer3_ch3_counter_now(void);

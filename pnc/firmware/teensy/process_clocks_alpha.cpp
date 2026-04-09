@@ -86,6 +86,24 @@ interrupt_capture_diag_t g_ocxo2_interrupt_diag = {};
 bool g_ad5693r_init_ok = false;
 
 // ============================================================================
+// OCXO viability diagnostics
+// ============================================================================
+
+static constexpr int64_t OCXO_VIABILITY_TOLERANCE_NS = 500LL;
+
+volatile uint32_t g_ocxo1_viability_checks = 0;
+volatile uint32_t g_ocxo1_viability_mismatches = 0;
+volatile int64_t  g_ocxo1_viability_last_expected_gnss_ns = -1;
+volatile int64_t  g_ocxo1_viability_last_actual_gnss_ns = -1;
+volatile int64_t  g_ocxo1_viability_last_error_ns = 0;
+
+volatile uint32_t g_ocxo2_viability_checks = 0;
+volatile uint32_t g_ocxo2_viability_mismatches = 0;
+volatile int64_t  g_ocxo2_viability_last_expected_gnss_ns = -1;
+volatile int64_t  g_ocxo2_viability_last_actual_gnss_ns = -1;
+volatile int64_t  g_ocxo2_viability_last_error_ns = 0;
+
+// ============================================================================
 // Alpha epoch state
 // ============================================================================
 //
@@ -228,6 +246,18 @@ static void alpha_reset_canonical_clock_state_for_new_epoch(void) {
   g_ocxo1_interrupt_diag = {};
   g_ocxo2_interrupt_diag = {};
 
+  g_ocxo1_viability_checks = 0;
+  g_ocxo1_viability_mismatches = 0;
+  g_ocxo1_viability_last_expected_gnss_ns = -1;
+  g_ocxo1_viability_last_actual_gnss_ns = -1;
+  g_ocxo1_viability_last_error_ns = 0;
+
+  g_ocxo2_viability_checks = 0;
+  g_ocxo2_viability_mismatches = 0;
+  g_ocxo2_viability_last_expected_gnss_ns = -1;
+  g_ocxo2_viability_last_actual_gnss_ns = -1;
+  g_ocxo2_viability_last_error_ns = 0;
+
   dwt_cycle_count_total = 0;
   gnss_raw_64           = 0;
   ocxo1_ticks_64        = 0;
@@ -293,6 +323,29 @@ static void dwt_adjustment_timer_callback(timepop_ctx_t* ctx, timepop_diag_t*, v
 
     g_dwt_cycle_count_next_second_adjustment =
         (int32_t)(candidate_total - (int64_t)g_dwt_cycle_count_next_second_prediction);
+  }
+}
+
+// ============================================================================
+// OCXO viability audit
+// ============================================================================
+
+static inline void ocxo_viability_update(volatile uint32_t& checks,
+                                         volatile uint32_t& mismatches,
+                                         volatile int64_t& last_expected_gnss_ns,
+                                         volatile int64_t& last_actual_gnss_ns,
+                                         volatile int64_t& last_error_ns,
+                                         uint64_t expected_gnss_ns,
+                                         uint64_t actual_gnss_ns) {
+  checks++;
+  last_expected_gnss_ns = (int64_t)expected_gnss_ns;
+  last_actual_gnss_ns = (int64_t)actual_gnss_ns;
+
+  const int64_t error_ns = (int64_t)expected_gnss_ns - (int64_t)actual_gnss_ns;
+  last_error_ns = error_ns;
+
+  if (llabs(error_ns) > OCXO_VIABILITY_TOLERANCE_NS) {
+    mismatches++;
   }
 }
 
@@ -429,6 +482,15 @@ static void ocxo1_callback(
     g_ocxo1_measurement.dwt_cycles_between_edges = dwt_cycles_between_edges;
     g_ocxo1_measurement.second_residual_ns =
         (int64_t)NS_PER_SECOND_U64 - (int64_t)gnss_ns_between_edges;
+
+    ocxo_viability_update(
+        g_ocxo1_viability_checks,
+        g_ocxo1_viability_mismatches,
+        g_ocxo1_viability_last_expected_gnss_ns,
+        g_ocxo1_viability_last_actual_gnss_ns,
+        g_ocxo1_viability_last_error_ns,
+        g_ocxo1_clock.ns_count_at_edge,
+        gnss_ns_at_edge);
   }
 
   prev_counter32 = raw_counter32;
@@ -477,6 +539,15 @@ static void ocxo2_callback(
     g_ocxo2_measurement.dwt_cycles_between_edges = dwt_cycles_between_edges;
     g_ocxo2_measurement.second_residual_ns =
         (int64_t)NS_PER_SECOND_U64 - (int64_t)gnss_ns_between_edges;
+
+    ocxo_viability_update(
+        g_ocxo2_viability_checks,
+        g_ocxo2_viability_mismatches,
+        g_ocxo2_viability_last_expected_gnss_ns,
+        g_ocxo2_viability_last_actual_gnss_ns,
+        g_ocxo2_viability_last_error_ns,
+        g_ocxo2_clock.ns_count_at_edge,
+        gnss_ns_at_edge);
   }
 
   prev_counter32 = raw_counter32;

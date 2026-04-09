@@ -1,30 +1,49 @@
 // ============================================================================
-// process_interrupt.cpp — provider authority + shared pre-spin (QTimer v20)
+// process_interrupt.cpp — provider authority + shared pre-spin (QTimer v21)
 // ============================================================================
 //
 // process_interrupt is the sole authority for all precision interrupt hardware.
 //
-// Final timing architecture:
+// Corrected timing architecture:
 //
 //   • QTimer1 CH0+CH1 — GNSS VCLOCK 10 MHz on pin 10 (capture-only from here)
-//   • QTimer2 CH0+CH1 — OCXO1 10 MHz on pin 2
-//   • QTimer3 CH0+CH1 — OCXO2 10 MHz on pin 4
+//   • QTimer3 CH2     — OCXO1 10 MHz external clock on pin 14 (16-bit)
+//   • QTimer3 CH3     — OCXO2 10 MHz external clock on pin 15 (16-bit)
 //   • GPIO6789        — PPS rising edge on pin 1
 //
 // Core laws:
 //
-//   • All three 10 MHz domains use the same hardware model:
-//       CH0 primary external input + CH1 cascade = 32-bit free-running counter
+//   • NEVER read a clock to know what time it is.
+//   • Interrupts are the sole lawful timing truth.
+//   • DWT is the precision substrate.
+//   • GNSS nanoseconds are the public timing language.
+//   • process_interrupt owns provider custody, ISR vectors, pre-spin,
+//     and canonical event reconstruction.
+//   • TimePop owns QTimer1 scheduling and remains independent.
+//   • OCXO QTimer3 channels are 16-bit only, so one-second OCXO events are
+//     reconstructed in software from lawful compare interrupts.
+//   • The exported OCXO counter32_at_event is NOT a live hardware readout.
+//     It is a software-extended logical count derived strictly from interrupts.
 //
-//   • PPS remains special:
-//       DWT is captured as the first instruction in the ISR and QTimer1 is
-//       sampled in the PPS ISR to obtain the lawful VCLOCK fact for that edge.
+// 16-bit OCXO reconstruction model:
 //
-//   • process_timepop remains standalone and continues to own QTimer1 CH2.
-//     process_interrupt must not depend on TimePop for its own core mechanics.
+//   One second at 10 MHz = 10,000,000 counts
+//                        = 152 * 65536 + 38528
 //
-//   • Compare / rollover / initialization logic for the OCXO clocks is shared
-//     through one parameterized runtime structure and helper set.
+//   Therefore, for each OCXO lane:
+//
+//     • We choose a target low16 value.
+//     • That target is seen once after 38,528 counts, then once every 65,536
+//       counts thereafter.
+//     • The 153rd lawful compare hit is exactly one OCXO second after the
+//       prior second edge.
+//     • Only THAT hit is published as an OCXO event.
+//     • Intermediate compare hits are internal cadence only.
+//
+//   This preserves the doctrinal rule:
+//
+//     no ambient OCXO clock reads for truth;
+//     only interrupt facts plus math.
 //
 // ============================================================================
 
@@ -46,7 +65,6 @@
 // ============================================================================
 
 static constexpr uint32_t MAX_INTERRUPT_SUBSCRIBERS = 8;
-static constexpr uint32_t CLOCK_COUNTS_PER_SECOND   = 10000000U;
 
 static constexpr uint64_t NS_PER_SECOND_U64      = 1000000000ULL;
 static constexpr uint64_t PRESPIN_LEAD_NS        = 10000ULL;
@@ -54,12 +72,21 @@ static constexpr uint32_t PRESPIN_TIMEOUT_CYCLES = 100800;
 
 static constexpr uint32_t PPS_ISR_FIXED_OVERHEAD_CYCLES = 48;
 
+// OCXO second decomposition in 16-bit QTimer domain.
+static constexpr uint32_t OCXO_COUNTS_PER_SECOND = 10000000U;
+static constexpr uint32_t QTIMER16_MODULUS       = 65536U;
+static constexpr uint32_t OCXO_SECOND_WHOLE_WRAPS = OCXO_COUNTS_PER_SECOND / QTIMER16_MODULUS; // 152
+static constexpr uint32_t OCXO_SECOND_REMAINDER   = OCXO_COUNTS_PER_SECOND % QTIMER16_MODULUS; // 38528
+
+static_assert(OCXO_SECOND_WHOLE_WRAPS == 152, "Unexpected OCXO whole-wrap decomposition");
+static_assert(OCXO_SECOND_REMAINDER   == 38528, "Unexpected OCXO remainder decomposition");
+
 // ============================================================================
 // Pin assignments — authoritative for process_interrupt
 // ============================================================================
 
-static constexpr int OCXO1_PIN = 2;
-static constexpr int OCXO2_PIN = 4;
+static constexpr int OCXO1_PIN = 14;
+static constexpr int OCXO2_PIN = 15;
 
 // ============================================================================
 // Shared prespin state — responsibility counter architecture
@@ -93,7 +120,7 @@ static uint32_t qtimer1_read_32_for_pps_capture(void) {
 }
 
 // ============================================================================
-// Shared 32-bit cascaded QTimer clock runtime
+// 16-bit OCXO QTimer runtime
 // ============================================================================
 
 enum class qtimer_clock_kind_t : uint8_t {
@@ -103,32 +130,39 @@ enum class qtimer_clock_kind_t : uint8_t {
   OCXO2,
 };
 
-struct qtimer_cascade_hw_t {
+struct qtimer16_ocxo_hw_t {
   IMXRT_TMR_t* module = nullptr;
-  uint8_t      ch0 = 0;
-  uint8_t      ch1 = 0;
-  IRQ_NUMBER_t irq = IRQ_QTIMER2;
+  uint8_t      channel = 0;
+  IRQ_NUMBER_t irq = IRQ_QTIMER3;
   int          input_pin = -1;
   uint8_t      pcs = 0;
-
-  // Optional compare channel for one-second event generation.
-  // For cascaded OCXO domains we use CH2 compare on the same module.
-  uint8_t      compare_ch = 2;
 };
 
-struct qtimer_cascade_runtime_t {
+struct qtimer16_ocxo_runtime_t {
   qtimer_clock_kind_t kind = qtimer_clock_kind_t::NONE;
   const char*         name = nullptr;
-  qtimer_cascade_hw_t hw {};
+  qtimer16_ocxo_hw_t  hw {};
 
   bool     initialized = false;
   bool     active = false;
 
-  // Next 32-bit one-second match target in the clock’s own 10 MHz domain.
-  uint32_t next_match_total = 0;
+  // Bootstrap state.
+  bool     phase_bootstrapped = false;
 
-  // Low-16 target currently programmed into compare channel.
-  uint16_t next_compare_low16 = 0;
+  // Current second-edge target low16.
+  uint16_t second_target_low16 = 0;
+
+  // Number of lawful compare hits seen since the current second target
+  // was established.  The first hit occurs after remainder counts,
+  // then each additional hit occurs one full 16-bit wrap later.
+  uint32_t cadence_hit_index = 0;
+
+  // Software-extended logical total in the OCXO clock domain.
+  // This increments by exactly 10,000,000 per lawful one-second edge.
+  uint32_t logical_count32_at_last_second_edge = 0;
+
+  // Last raw 16-bit counter snapshot captured at interrupt time.
+  uint16_t last_counter16_at_irq = 0;
 
   // Diagnostics
   uint32_t irq_count = 0;
@@ -138,9 +172,14 @@ struct qtimer_cascade_runtime_t {
   uint32_t stop_count = 0;
   uint32_t event_count = 0;
 
-  interrupt_event_t last_event {};
-  interrupt_capture_diag_t last_diag {};
-  bool has_fired = false;
+  uint32_t bootstrap_count = 0;
+  uint32_t cadence_hits_total = 0;
+  uint32_t cadence_hits_since_second = 0;
+  uint32_t bootstrap_arm_failures = 0;
+
+  uint16_t last_programmed_compare = 0;
+  uint16_t last_initial_counter16 = 0;
+  uint16_t last_second_target_low16 = 0;
 };
 
 // ============================================================================
@@ -244,6 +283,9 @@ struct interrupt_anomaly_diag_t {
   uint32_t no_shadow_dwt = 0;
   uint32_t null_desc = 0;
 
+  uint32_t ocxo_bad_channel = 0;
+  uint32_t ocxo_spurious_irq = 0;
+
   uint32_t last_kind = 0;
   uint32_t last_detail0 = 0;
   uint32_t last_detail1 = 0;
@@ -264,9 +306,9 @@ static interrupt_subscriber_runtime_t* g_rt_pps   = nullptr;
 static interrupt_subscriber_runtime_t* g_rt_ocxo1 = nullptr;
 static interrupt_subscriber_runtime_t* g_rt_ocxo2 = nullptr;
 
-// Shared OCXO cascade runtimes.
-static qtimer_cascade_runtime_t g_clock_ocxo1 = {};
-static qtimer_cascade_runtime_t g_clock_ocxo2 = {};
+// Shared OCXO runtimes — both lanes live on QTIMER3.
+static qtimer16_ocxo_runtime_t g_clock_ocxo1 = {};
+static qtimer16_ocxo_runtime_t g_clock_ocxo2 = {};
 
 // ============================================================================
 // Subscriber descriptors
@@ -321,7 +363,7 @@ static interrupt_subscriber_runtime_t* runtime_for(interrupt_subscriber_kind_t k
   return nullptr;
 }
 
-static qtimer_cascade_runtime_t* clock_runtime_for(qtimer_clock_kind_t kind) {
+static qtimer16_ocxo_runtime_t* ocxo_clock_runtime_for(qtimer_clock_kind_t kind) {
   switch (kind) {
     case qtimer_clock_kind_t::OCXO1: return &g_clock_ocxo1;
     case qtimer_clock_kind_t::OCXO2: return &g_clock_ocxo2;
@@ -377,131 +419,113 @@ const char* interrupt_lane_str(interrupt_lane_t lane) {
 }
 
 // ============================================================================
-// QTimer cascade helpers
+// Raw 16-bit counter reads — diagnostics only
 // ============================================================================
+
+uint16_t interrupt_qtimer3_ch2_counter_now(void) {
+  return IMXRT_TMR3.CH[2].CNTR;
+}
+
+uint16_t interrupt_qtimer3_ch3_counter_now(void) {
+  return IMXRT_TMR3.CH[3].CNTR;
+}
+
+// ============================================================================
+// QTimer3 16-bit OCXO helpers
+// ============================================================================
+
+static inline void qtimer3_clear_compare_flag(uint8_t ch) {
+  IMXRT_TMR3.CH[ch].CSCTRL &= ~(TMR_CSCTRL_TCF1 | TMR_CSCTRL_TCF2);
+}
+
+static inline void qtimer3_program_compare(uint8_t ch, uint16_t target_low16) {
+  qtimer3_clear_compare_flag(ch);
+  IMXRT_TMR3.CH[ch].COMP1  = target_low16;
+  IMXRT_TMR3.CH[ch].CMPLD1 = target_low16;
+  qtimer3_clear_compare_flag(ch);
+  IMXRT_TMR3.CH[ch].CSCTRL |= TMR_CSCTRL_TCF1EN;
+}
+
+static inline void qtimer3_disable_compare(uint8_t ch) {
+  IMXRT_TMR3.CH[ch].CSCTRL &= ~TMR_CSCTRL_TCF1EN;
+  qtimer3_clear_compare_flag(ch);
+}
+
+// Bootstrap rule:
 //
-// These helpers mirror the proven TimePop pattern:
+// We permit exactly one ambient 16-bit read at START, not as a timing truth,
+// but only to seed the compare cadence.  No measurement is ever taken from
+// that read.  The first lawful OCXO second edge remains interrupt-defined.
 //
-//   CH0 = primary external 10 MHz count source
-//   CH1 = cascade extension
-//   CH2 = one-second compare trigger
+// The chosen second target low16 is:
 //
-// The compare fires whenever low16 == programmed COMP1, and software verifies
-// the full 32-bit counter before accepting the event.
+//   current_low16 + OCXO_SECOND_REMAINDER
 //
+// This causes the first cadence hit after remainder counts, then one hit per
+// full wrap thereafter.  The 153rd hit is exactly one second later.
+//
+static void qtimer16_ocxo_arm_bootstrap(qtimer16_ocxo_runtime_t& clock) {
+  const uint16_t now16 = clock.hw.module->CH[clock.hw.channel].CNTR;
 
-static uint32_t qtimer_cascade_read_32(IMXRT_TMR_t* module, uint8_t ch0, uint8_t ch1) {
-  const uint16_t lo1 = module->CH[ch0].CNTR;
-  const uint16_t hi1 = module->CH[ch1].HOLD;
+  clock.phase_bootstrapped = true;
+  clock.bootstrap_count++;
+  clock.cadence_hit_index = 0;
+  clock.cadence_hits_since_second = 0;
+  clock.last_initial_counter16 = now16;
 
-  const uint16_t lo2 = module->CH[ch0].CNTR;
-  const uint16_t hi2 = module->CH[ch1].HOLD;
+  clock.second_target_low16 = (uint16_t)(now16 + (uint16_t)OCXO_SECOND_REMAINDER);
+  clock.last_second_target_low16 = clock.second_target_low16;
+  clock.last_programmed_compare = clock.second_target_low16;
 
-  if (hi1 != hi2) {
-    return ((uint32_t)hi2 << 16) | (uint32_t)lo2;
-  }
-  return ((uint32_t)hi1 << 16) | (uint32_t)lo1;
+  qtimer3_program_compare(clock.hw.channel, clock.second_target_low16);
 }
 
-static void qtimer_cascade_clear_compare_flag(qtimer_cascade_runtime_t& clock) {
-  clock.hw.module->CH[clock.hw.compare_ch].CSCTRL &= ~(TMR_CSCTRL_TCF1 | TMR_CSCTRL_TCF2);
+static void qtimer16_ocxo_advance_to_next_second_target(qtimer16_ocxo_runtime_t& clock) {
+  clock.second_target_low16 =
+      (uint16_t)(clock.second_target_low16 + (uint16_t)OCXO_SECOND_REMAINDER);
+  clock.last_second_target_low16 = clock.second_target_low16;
+  clock.last_programmed_compare = clock.second_target_low16;
+
+  qtimer3_program_compare(clock.hw.channel, clock.second_target_low16);
 }
 
-static void qtimer_cascade_program_compare(qtimer_cascade_runtime_t& clock, uint16_t target_low16) {
-  qtimer_cascade_clear_compare_flag(clock);
-  clock.hw.module->CH[clock.hw.compare_ch].COMP1  = target_low16;
-  clock.hw.module->CH[clock.hw.compare_ch].CMPLD1 = target_low16;
-  qtimer_cascade_clear_compare_flag(clock);
-  clock.hw.module->CH[clock.hw.compare_ch].CSCTRL |= TMR_CSCTRL_TCF1EN;
+static void qtimer16_ocxo_rearm_same_second_target(qtimer16_ocxo_runtime_t& clock) {
+  clock.last_programmed_compare = clock.second_target_low16;
+  qtimer3_program_compare(clock.hw.channel, clock.second_target_low16);
 }
 
-static void qtimer_cascade_disable_compare(qtimer_cascade_runtime_t& clock) {
-  clock.hw.module->CH[clock.hw.compare_ch].CSCTRL &= ~TMR_CSCTRL_TCF1EN;
-  qtimer_cascade_clear_compare_flag(clock);
-}
+// Returns true only when this cadence hit is the lawful OCXO one-second edge.
+static bool qtimer16_ocxo_consume_cadence_irq(qtimer16_ocxo_runtime_t& clock,
+                                              uint16_t counter16_snapshot,
+                                              uint32_t& logical_counter32_at_event) {
+  clock.last_counter16_at_irq = counter16_snapshot;
+  clock.cadence_hits_total++;
+  clock.cadence_hits_since_second++;
+  clock.cadence_hit_index++;
 
-static void qtimer_cascade_init_hardware(qtimer_cascade_runtime_t& clock) {
-  if (!clock.hw.module) return;
-
-  if (clock.kind == qtimer_clock_kind_t::OCXO1) {
-    CCM_CCGR6 |= CCM_CCGR6_QTIMER2(CCM_CCGR_ON);
-  } else if (clock.kind == qtimer_clock_kind_t::OCXO2) {
-    CCM_CCGR6 |= CCM_CCGR6_QTIMER3(CCM_CCGR_ON);
-  }
-
-  *(portConfigRegister(clock.hw.input_pin)) = 1;
-
-  // NOTE:
-  // Exact pad / daisy symbols depend on the final chosen pins on Teensy 4.1.
-  // These placeholders are intentionally centralized so the architecture is
-  // cleanly expressed in one place. Final build-check may require symbol-name
-  // correction to match the exact pad routed to QTimer2/QTimer3 CH0.
-  if (clock.kind == qtimer_clock_kind_t::OCXO1) {
-    // pin 2 → QTimer2 CH0 external input
-    // TODO: verify exact PAD + SELECT_INPUT symbol names in build environment
-  } else if (clock.kind == qtimer_clock_kind_t::OCXO2) {
-    // pin 4 → QTimer3 CH0 external input
-    // TODO: verify exact PAD + SELECT_INPUT symbol names in build environment
-  }
-
-  // CH0: primary external count source
-  clock.hw.module->CH[clock.hw.ch0].CTRL   = 0;
-  clock.hw.module->CH[clock.hw.ch0].SCTRL  = 0;
-  clock.hw.module->CH[clock.hw.ch0].CSCTRL = 0;
-  clock.hw.module->CH[clock.hw.ch0].LOAD   = 0;
-  clock.hw.module->CH[clock.hw.ch0].CNTR   = 0;
-  clock.hw.module->CH[clock.hw.ch0].COMP1  = 0xFFFF;
-  clock.hw.module->CH[clock.hw.ch0].CMPLD1 = 0xFFFF;
-  clock.hw.module->CH[clock.hw.ch0].CTRL   = TMR_CTRL_CM(1) | TMR_CTRL_PCS(clock.hw.pcs);
-
-  // CH1: cascade extension
-  clock.hw.module->CH[clock.hw.ch1].CTRL   = 0;
-  clock.hw.module->CH[clock.hw.ch1].SCTRL  = 0;
-  clock.hw.module->CH[clock.hw.ch1].CSCTRL = 0;
-  clock.hw.module->CH[clock.hw.ch1].LOAD   = 0;
-  clock.hw.module->CH[clock.hw.ch1].CNTR   = 0;
-  clock.hw.module->CH[clock.hw.ch1].COMP1  = 0xFFFF;
-  clock.hw.module->CH[clock.hw.ch1].CMPLD1 = 0xFFFF;
-  clock.hw.module->CH[clock.hw.ch1].CTRL   = TMR_CTRL_CM(7);
-
-  // CH2: compare scheduler for one-second boundaries
-  clock.hw.module->CH[clock.hw.compare_ch].CTRL   = 0;
-  clock.hw.module->CH[clock.hw.compare_ch].SCTRL  = 0;
-  clock.hw.module->CH[clock.hw.compare_ch].CSCTRL = 0;
-  clock.hw.module->CH[clock.hw.compare_ch].LOAD   = 0;
-  clock.hw.module->CH[clock.hw.compare_ch].CNTR   = 0;
-  clock.hw.module->CH[clock.hw.compare_ch].COMP1  = 0xFFFF;
-  clock.hw.module->CH[clock.hw.compare_ch].CMPLD1 = 0xFFFF;
-
-  // Compare channel counts the same primary source as CH0.
-  clock.hw.module->CH[clock.hw.compare_ch].CTRL   = TMR_CTRL_CM(1) | TMR_CTRL_PCS(clock.hw.pcs);
-  qtimer_cascade_disable_compare(clock);
-
-  clock.initialized = true;
-}
-
-static void qtimer_cascade_arm_first_second(qtimer_cascade_runtime_t& clock) {
-  const uint32_t now32 = qtimer_cascade_read_32(clock.hw.module, clock.hw.ch0, clock.hw.ch1);
-
-  clock.next_match_total = now32 + CLOCK_COUNTS_PER_SECOND;
-  clock.next_compare_low16 = (uint16_t)(clock.next_match_total & 0xFFFFu);
-
-  qtimer_cascade_program_compare(clock, clock.next_compare_low16);
-  clock.active = true;
-  clock.start_count++;
-}
-
-static bool qtimer_cascade_match_due(qtimer_cascade_runtime_t& clock,
-                                     uint32_t now32,
-                                     uint32_t& matched_total) {
-  if (now32 < clock.next_match_total) {
+  // Cadence hit numbering:
+  //
+  //   1   = remainder hit
+  //   2..153 = each additional full-wrap revisit of same target low16
+  //
+  // The 153rd lawful hit is one full OCXO second from the prior second edge.
+  //
+  // Since whole wraps = 152, the second edge is cadence_hit_index == 153.
+  //
+  if (clock.cadence_hit_index < (OCXO_SECOND_WHOLE_WRAPS + 1U)) {
+    qtimer16_ocxo_rearm_same_second_target(clock);
     return false;
   }
 
-  matched_total = clock.next_match_total;
-  clock.next_match_total += CLOCK_COUNTS_PER_SECOND;
-  clock.next_compare_low16 = (uint16_t)(clock.next_match_total & 0xFFFFu);
-  qtimer_cascade_program_compare(clock, clock.next_compare_low16);
+  // Lawful one-second edge.
+  clock.logical_count32_at_last_second_edge += OCXO_COUNTS_PER_SECOND;
+  logical_counter32_at_event = clock.logical_count32_at_last_second_edge;
+
+  clock.event_count++;
+  clock.cadence_hit_index = 0;
+  clock.cadence_hits_since_second = 0;
+
+  qtimer16_ocxo_advance_to_next_second_target(clock);
   return true;
 }
 
@@ -514,18 +538,14 @@ static void pps_gpio_isr(void) {
   process_interrupt_gpio6789_irq(dwt_raw);
 }
 
-static void qtimer2_isr(void) {
-  const uint32_t dwt_raw = ARM_DWT_CYCCNT;
-  if (g_clock_ocxo1.hw.module &&
-      (g_clock_ocxo1.hw.module->CH[g_clock_ocxo1.hw.compare_ch].CSCTRL & TMR_CSCTRL_TCF1)) {
-    process_interrupt_qtimer3_ch2_irq(dwt_raw);
-  }
-}
-
 static void qtimer3_isr(void) {
   const uint32_t dwt_raw = ARM_DWT_CYCCNT;
-  if (g_clock_ocxo2.hw.module &&
-      (g_clock_ocxo2.hw.module->CH[g_clock_ocxo2.hw.compare_ch].CSCTRL & TMR_CSCTRL_TCF1)) {
+
+  if (IMXRT_TMR3.CH[2].CSCTRL & TMR_CSCTRL_TCF1) {
+    process_interrupt_qtimer3_ch2_irq(dwt_raw);
+  }
+
+  if (IMXRT_TMR3.CH[3].CSCTRL & TMR_CSCTRL_TCF1) {
     process_interrupt_qtimer3_ch3_irq(dwt_raw);
   }
 }
@@ -886,31 +906,45 @@ static void handle_event(interrupt_subscriber_runtime_t& rt,
 }
 
 // ============================================================================
-// Shared OCXO compare ISR path
+// Shared OCXO compare ISR path — 16-bit cadence engine
 // ============================================================================
 
-static void handle_cascade_clock_irq(qtimer_cascade_runtime_t& clock,
+static void handle_ocxo_qtimer16_irq(qtimer16_ocxo_runtime_t& clock,
                                      interrupt_subscriber_runtime_t& rt,
                                      uint32_t dwt_raw) {
   clock.irq_count++;
 
-  qtimer_cascade_clear_compare_flag(clock);
+  qtimer3_clear_compare_flag(clock.hw.channel);
 
   if (!clock.active || !rt.active) {
     clock.miss_count++;
     return;
   }
 
-  const uint32_t now32 = qtimer_cascade_read_32(clock.hw.module, clock.hw.ch0, clock.hw.ch1);
+  const uint16_t counter16_snapshot = clock.hw.module->CH[clock.hw.channel].CNTR;
 
-  uint32_t matched_total = 0;
-  if (!qtimer_cascade_match_due(clock, now32, matched_total)) {
+  if (!clock.phase_bootstrapped) {
+    record_anomaly(g_anomaly_diag.ocxo_bad_channel,
+                   rt.desc->kind,
+                   clock.hw.channel,
+                   counter16_snapshot,
+                   0);
+    clock.miss_count++;
+    return;
+  }
+
+  uint32_t logical_counter32_at_event = 0;
+  const bool is_second_edge =
+      qtimer16_ocxo_consume_cadence_irq(clock,
+                                        counter16_snapshot,
+                                        logical_counter32_at_event);
+
+  if (!is_second_edge) {
     return;
   }
 
   clock.dispatch_count++;
-  handle_event(rt, dwt_raw, matched_total);
-  clock.event_count++;
+  handle_event(rt, dwt_raw, logical_counter32_at_event);
 }
 
 // ============================================================================
@@ -918,6 +952,9 @@ static void handle_cascade_clock_irq(qtimer_cascade_runtime_t& clock,
 // ============================================================================
 
 void process_interrupt_gpio6789_irq(uint32_t dwt_isr_entry_raw) {
+
+  const uint32_t pps_qtimer_at_edge = qtimer1_read_32_for_pps_capture();
+
   g_gpio_diag.irq_count++;
 
   interrupt_subscriber_runtime_t* rt = g_rt_pps;
@@ -928,7 +965,6 @@ void process_interrupt_gpio6789_irq(uint32_t dwt_isr_entry_raw) {
 
   g_gpio_diag.dispatch_count++;
 
-  const uint32_t pps_qtimer_at_edge = qtimer1_read_32_for_pps_capture();
   handle_event(*rt, dwt_isr_entry_raw, pps_qtimer_at_edge);
 }
 
@@ -938,12 +974,12 @@ void process_interrupt_gpio6789_irq(uint32_t dwt_isr_entry_raw) {
 
 void process_interrupt_qtimer3_ch2_irq(uint32_t dwt_raw) {
   if (!g_rt_ocxo1) return;
-  handle_cascade_clock_irq(g_clock_ocxo1, *g_rt_ocxo1, dwt_raw);
+  handle_ocxo_qtimer16_irq(g_clock_ocxo1, *g_rt_ocxo1, dwt_raw);
 }
 
 void process_interrupt_qtimer3_ch3_irq(uint32_t dwt_raw) {
   if (!g_rt_ocxo2) return;
-  handle_cascade_clock_irq(g_clock_ocxo2, *g_rt_ocxo2, dwt_raw);
+  handle_ocxo_qtimer16_irq(g_clock_ocxo2, *g_rt_ocxo2, dwt_raw);
 }
 
 // ============================================================================
@@ -977,12 +1013,19 @@ bool interrupt_start(interrupt_subscriber_kind_t kind) {
     return true;
   }
 
-  qtimer_cascade_runtime_t* clock = clock_runtime_for(rt->desc->clock_kind);
+  qtimer16_ocxo_runtime_t* clock = ocxo_clock_runtime_for(rt->desc->clock_kind);
   if (!clock || !clock->initialized) {
     return false;
   }
 
-  qtimer_cascade_arm_first_second(*clock);
+  clock->active = true;
+  clock->start_count++;
+  clock->logical_count32_at_last_second_edge = 0;
+  clock->phase_bootstrapped = false;
+  clock->cadence_hit_index = 0;
+  clock->cadence_hits_since_second = 0;
+
+  qtimer16_ocxo_arm_bootstrap(*clock);
   return true;
 }
 
@@ -1000,11 +1043,11 @@ bool interrupt_stop(interrupt_subscriber_kind_t kind) {
 
   rt->prespin.active = false;
 
-  qtimer_cascade_runtime_t* clock = clock_runtime_for(rt->desc->clock_kind);
+  qtimer16_ocxo_runtime_t* clock = ocxo_clock_runtime_for(rt->desc->clock_kind);
   if (clock) {
     clock->active = false;
     clock->stop_count++;
-    qtimer_cascade_disable_compare(*clock);
+    qtimer3_disable_compare(clock->hw.channel);
   }
 
   return true;
@@ -1047,26 +1090,54 @@ void process_interrupt_init_hardware(void) {
 
   g_clock_ocxo1.kind = qtimer_clock_kind_t::OCXO1;
   g_clock_ocxo1.name = "OCXO1";
-  g_clock_ocxo1.hw.module = &IMXRT_TMR2;
-  g_clock_ocxo1.hw.ch0 = 0;
-  g_clock_ocxo1.hw.ch1 = 1;
-  g_clock_ocxo1.hw.compare_ch = 2;
-  g_clock_ocxo1.hw.irq = IRQ_QTIMER2;
+  g_clock_ocxo1.hw.module = &IMXRT_TMR3;
+  g_clock_ocxo1.hw.channel = 2;
+  g_clock_ocxo1.hw.irq = IRQ_QTIMER3;
   g_clock_ocxo1.hw.input_pin = OCXO1_PIN;
-  g_clock_ocxo1.hw.pcs = 0;
+  g_clock_ocxo1.hw.pcs = 2;
 
   g_clock_ocxo2.kind = qtimer_clock_kind_t::OCXO2;
   g_clock_ocxo2.name = "OCXO2";
   g_clock_ocxo2.hw.module = &IMXRT_TMR3;
-  g_clock_ocxo2.hw.ch0 = 0;
-  g_clock_ocxo2.hw.ch1 = 1;
-  g_clock_ocxo2.hw.compare_ch = 2;
+  g_clock_ocxo2.hw.channel = 3;
   g_clock_ocxo2.hw.irq = IRQ_QTIMER3;
   g_clock_ocxo2.hw.input_pin = OCXO2_PIN;
-  g_clock_ocxo2.hw.pcs = 0;
+  g_clock_ocxo2.hw.pcs = 3;
 
-  qtimer_cascade_init_hardware(g_clock_ocxo1);
-  qtimer_cascade_init_hardware(g_clock_ocxo2);
+  CCM_CCGR6 |= CCM_CCGR6_QTIMER3(CCM_CCGR_ON);
+
+  // Pin mux + input select:
+  //   pin 14 -> QTIMER3_TIMER2  (ALT1, SELECT_INPUT = 1)
+  //   pin 15 -> QTIMER3_TIMER3  (ALT1, SELECT_INPUT = 1)
+  *(portConfigRegister(OCXO1_PIN)) = 1;
+  *(portConfigRegister(OCXO2_PIN)) = 1;
+  IOMUXC_QTIMER3_TIMER2_SELECT_INPUT = 1;
+  IOMUXC_QTIMER3_TIMER3_SELECT_INPUT = 1;
+
+  // CH2 — OCXO1 10 MHz external count source
+  IMXRT_TMR3.CH[2].CTRL   = 0;
+  IMXRT_TMR3.CH[2].SCTRL  = 0;
+  IMXRT_TMR3.CH[2].CSCTRL = 0;
+  IMXRT_TMR3.CH[2].LOAD   = 0;
+  IMXRT_TMR3.CH[2].CNTR   = 0;
+  IMXRT_TMR3.CH[2].COMP1  = 0xFFFF;
+  IMXRT_TMR3.CH[2].CMPLD1 = 0xFFFF;
+  IMXRT_TMR3.CH[2].CTRL   = TMR_CTRL_CM(1) | TMR_CTRL_PCS(g_clock_ocxo1.hw.pcs);
+  qtimer3_disable_compare(2);
+
+  // CH3 — OCXO2 10 MHz external count source
+  IMXRT_TMR3.CH[3].CTRL   = 0;
+  IMXRT_TMR3.CH[3].SCTRL  = 0;
+  IMXRT_TMR3.CH[3].CSCTRL = 0;
+  IMXRT_TMR3.CH[3].LOAD   = 0;
+  IMXRT_TMR3.CH[3].CNTR   = 0;
+  IMXRT_TMR3.CH[3].COMP1  = 0xFFFF;
+  IMXRT_TMR3.CH[3].CMPLD1 = 0xFFFF;
+  IMXRT_TMR3.CH[3].CTRL   = TMR_CTRL_CM(1) | TMR_CTRL_PCS(g_clock_ocxo2.hw.pcs);
+  qtimer3_disable_compare(3);
+
+  g_clock_ocxo1.initialized = true;
+  g_clock_ocxo2.initialized = true;
 
   g_interrupt_hw_ready = true;
 }
@@ -1113,10 +1184,6 @@ void process_interrupt_init(void) {
 void process_interrupt_enable_irqs(void) {
   if (g_interrupt_irqs_enabled) return;
 
-  attachInterruptVector(IRQ_QTIMER2, qtimer2_isr);
-  NVIC_SET_PRIORITY(IRQ_QTIMER2, 0);
-  NVIC_ENABLE_IRQ(IRQ_QTIMER2);
-
   attachInterruptVector(IRQ_QTIMER3, qtimer3_isr);
   NVIC_SET_PRIORITY(IRQ_QTIMER3, 0);
   NVIC_ENABLE_IRQ(IRQ_QTIMER3);
@@ -1161,6 +1228,8 @@ static Payload cmd_report(const Payload&) {
   p.add("anomaly_no_prespin_active", g_anomaly_diag.no_prespin_active);
   p.add("anomaly_no_shadow_dwt", g_anomaly_diag.no_shadow_dwt);
   p.add("anomaly_null_desc", g_anomaly_diag.null_desc);
+  p.add("anomaly_ocxo_bad_channel", g_anomaly_diag.ocxo_bad_channel);
+  p.add("anomaly_ocxo_spurious_irq", g_anomaly_diag.ocxo_spurious_irq);
 
   p.add("anomaly_last_kind", g_anomaly_diag.last_kind);
   p.add("anomaly_last_detail0", g_anomaly_diag.last_detail0);
@@ -1221,8 +1290,8 @@ static Payload cmd_report(const Payload&) {
 
   p.add_array("subscribers", subscribers);
 
-  PayloadArray clocks;
-  auto add_clock = [&](const qtimer_cascade_runtime_t& clock) {
+  PayloadArray ocxo_clocks;
+  auto add_ocxo_clock = [&](const qtimer16_ocxo_runtime_t& clock) {
     Payload c;
     c.add("name", clock.name ? clock.name : "");
     c.add("active", clock.active);
@@ -1233,15 +1302,26 @@ static Payload cmd_report(const Payload&) {
     c.add("dispatch_count", clock.dispatch_count);
     c.add("miss_count", clock.miss_count);
     c.add("event_count", clock.event_count);
-    c.add("next_match_total", clock.next_match_total);
-    c.add("next_compare_low16", (uint32_t)clock.next_compare_low16);
-    c.add("counter32_now", qtimer_cascade_read_32(clock.hw.module, clock.hw.ch0, clock.hw.ch1));
-    clocks.add(c);
+    c.add("bootstrap_count", clock.bootstrap_count);
+    c.add("bootstrap_arm_failures", clock.bootstrap_arm_failures);
+    c.add("phase_bootstrapped", clock.phase_bootstrapped);
+    c.add("cadence_hit_index", clock.cadence_hit_index);
+    c.add("cadence_hits_total", clock.cadence_hits_total);
+    c.add("cadence_hits_since_second", clock.cadence_hits_since_second);
+    c.add("logical_count32_at_last_second_edge", clock.logical_count32_at_last_second_edge);
+    c.add("last_counter16_at_irq", (uint32_t)clock.last_counter16_at_irq);
+    c.add("last_programmed_compare", (uint32_t)clock.last_programmed_compare);
+    c.add("last_initial_counter16", (uint32_t)clock.last_initial_counter16);
+    c.add("last_second_target_low16", (uint32_t)clock.last_second_target_low16);
+    c.add("counter16_now", (uint32_t)clock.hw.module->CH[clock.hw.channel].CNTR);
+    c.add("comp1_now", (uint32_t)clock.hw.module->CH[clock.hw.channel].COMP1);
+    c.add("csctrl_now", (uint32_t)clock.hw.module->CH[clock.hw.channel].CSCTRL);
+    ocxo_clocks.add(c);
   };
 
-  add_clock(g_clock_ocxo1);
-  add_clock(g_clock_ocxo2);
-  p.add_array("cascaded_clocks", clocks);
+  add_ocxo_clock(g_clock_ocxo1);
+  add_ocxo_clock(g_clock_ocxo2);
+  p.add_array("ocxo_qtimer16_clocks", ocxo_clocks);
 
   return p;
 }
