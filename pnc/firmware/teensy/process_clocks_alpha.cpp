@@ -11,8 +11,15 @@
 //   The QTimer value for time_pps_update() is geared:
 //     g_qtimer_at_pps += TICKS_10MHZ_PER_SECOND
 //   The VCLOCK runs on the GNSS 10 MHz input, so this is exact by definition.
-//   The initial QTimer value is captured once at epoch installation — the
-//   sole live QTimer read, a boot-time boundary crossing.
+//
+//   Epoch installation uses the PPS event contract supplied by
+//   process_interrupt.  The consummating PPS event carries both:
+//
+//     • dwt_at_event      — reconstructed DWT time of the PPS edge
+//     • counter32_at_event — VCLOCK position corresponding to that same edge
+//
+//   No ambient QTimer read is permitted at epoch installation, because that
+//   would bless a later instant as though it were the PPS boundary.
 //
 //   The DWT adjustment timer reads DWT_CYCCNT directly at 10 kHz.  This is
 //   a legitimate real-time feedback loop on the DWT bridge substrate.
@@ -63,8 +70,7 @@ volatile int32_t  g_dwt_cycle_count_next_second_adjustment = 0;
 volatile uint64_t g_dwt_model_pps_count = 0;
 
 // Geared QTimer — advanced by TICKS_10MHZ_PER_SECOND each PPS.
-// Initialized once from a live read at epoch installation, then
-// pure arithmetic thereafter.  Never read from hardware again.
+// Never read from hardware for canonical state.
 volatile uint32_t g_qtimer_at_pps = 0;
 
 ocxo_clock_state_t g_ocxo1_clock = {};
@@ -189,32 +195,6 @@ static inline void dwt_enable(void) {
 }
 
 // ============================================================================
-// QTimer1 read — boot-time boundary crossing ONLY
-// ============================================================================
-//
-// This function reads the live QTimer1 cascaded 32-bit counter.
-// It is called ONCE at epoch installation to establish the initial
-// geared QTimer anchor.  After that, g_qtimer_at_pps is advanced
-// by TICKS_10MHZ_PER_SECOND each PPS — pure arithmetic, no read.
-//
-// This is a boundary crossing in the ZPNet Standards sense:
-// the QTimer hardware is an unowned external system at boot time,
-// before the geared model takes over.
-
-static uint32_t qtimer1_read_32_once(void) {
-  const uint16_t lo1 = IMXRT_TMR1.CH[0].CNTR;
-  const uint16_t hi1 = IMXRT_TMR1.CH[1].HOLD;
-
-  const uint16_t lo2 = IMXRT_TMR1.CH[0].CNTR;
-  const uint16_t hi2 = IMXRT_TMR1.CH[1].HOLD;
-
-  if (hi1 != hi2) {
-    return ((uint32_t)hi2 << 16) | (uint32_t)lo2;
-  }
-  return ((uint32_t)hi1 << 16) | (uint32_t)lo1;
-}
-
-// ============================================================================
 // Epoch helpers
 // ============================================================================
 
@@ -261,8 +241,7 @@ static void alpha_install_new_epoch_from_pps(const interrupt_event_t& pps_event)
   g_epoch_pps_index = 0;
 
   g_epoch_dwt_at_pps = pps_event.dwt_at_event;
-
-  g_epoch_qtimer_at_pps = qtimer1_read_32_once();
+  g_epoch_qtimer_at_pps = pps_event.counter32_at_event;
 
   alpha_reset_canonical_clock_state_for_new_epoch();
 

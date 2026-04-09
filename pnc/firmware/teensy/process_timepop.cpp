@@ -39,6 +39,18 @@
 //   Only relative scheduling ("fire N ns from now") reads the ambient counter,
 //   because "from now" inherently requires knowing "now."
 //
+// VCLOCK viability audit:
+//
+//   TimePop continuously self-audits VCLOCK reasonableness during dispatch.
+//   The audit compares:
+//
+//     • expected_gnss_ns = VCLOCK arithmetic from the current anchor
+//     • actual_gnss_ns   = canonical shared time model (time_gnss_ns_now())
+//
+//   If the absolute error exceeds VCLOCK_VIABILITY_TOLERANCE_NS, the subsystem
+//   records the two comparison values and increments a mismatch counter.
+//   Matching checks are silent.
+//
 // ============================================================================
 
 #include "timepop.h"
@@ -72,6 +84,7 @@ static constexpr uint32_t MIN_DELAY_TICKS = 2;
 static constexpr uint32_t HEARTBEAT_TICKS = 10000;
 static constexpr uint32_t DWT_SPIN_MAX_CYCLES = 110;
 static constexpr uint32_t PREDICT_MAX_QTIMER_ELAPSED = 15000000U;
+static constexpr int64_t  VCLOCK_VIABILITY_TOLERANCE_NS = 100LL;
 
 // ============================================================================
 // Slot
@@ -153,18 +166,18 @@ static volatile uint32_t diag_alap_slots_high_water   = 0;
 static volatile uint32_t diag_arm_failures            = 0;
 static volatile uint32_t diag_named_replacements      = 0;
 
-static volatile uint32_t diag_asap_armed             = 0;
-static volatile uint32_t diag_asap_dispatched        = 0;
-static volatile uint32_t diag_asap_arm_failures      = 0;
-static volatile uint32_t diag_asap_last_armed_dwt    = 0;
-static volatile uint32_t diag_asap_last_dispatch_dwt = 0;
+static volatile uint32_t diag_asap_armed              = 0;
+static volatile uint32_t diag_asap_dispatched         = 0;
+static volatile uint32_t diag_asap_arm_failures       = 0;
+static volatile uint32_t diag_asap_last_armed_dwt     = 0;
+static volatile uint32_t diag_asap_last_dispatch_dwt  = 0;
 static volatile const char* diag_asap_last_armed_name = nullptr;
 
-static volatile uint32_t diag_alap_armed             = 0;
-static volatile uint32_t diag_alap_dispatched        = 0;
-static volatile uint32_t diag_alap_arm_failures      = 0;
-static volatile uint32_t diag_alap_last_armed_dwt    = 0;
-static volatile uint32_t diag_alap_last_dispatch_dwt = 0;
+static volatile uint32_t diag_alap_armed              = 0;
+static volatile uint32_t diag_alap_dispatched         = 0;
+static volatile uint32_t diag_alap_arm_failures       = 0;
+static volatile uint32_t diag_alap_last_armed_dwt     = 0;
+static volatile uint32_t diag_alap_last_dispatch_dwt  = 0;
 static volatile const char* diag_alap_last_armed_name = nullptr;
 
 static volatile uint32_t diag_dispatch_calls     = 0;
@@ -179,6 +192,13 @@ static volatile uint32_t diag_isr_callbacks      = 0;
 static volatile uint32_t diag_schedule_next_calls_total = 0;
 static volatile uint32_t diag_schedule_next_calls_from_dispatch = 0;
 static volatile uint32_t diag_schedule_next_calls_from_other = 0;
+
+// VCLOCK viability diagnostics
+static volatile uint32_t diag_vclock_viability_checks = 0;
+static volatile uint32_t diag_vclock_viability_mismatches = 0;
+static volatile int64_t  diag_vclock_viability_last_expected_gnss_ns = -1;
+static volatile int64_t  diag_vclock_viability_last_actual_gnss_ns = -1;
+static volatile int64_t  diag_vclock_viability_last_error_ns = 0;
 
 // ============================================================================
 // Forward declarations
@@ -217,6 +237,7 @@ static inline void update_deferred_high_water(deferred_slot_t* slots_buf,
 //   • schedule_next() — must compare deadlines against the current counter
 //   • relative scheduling — "from now" inherently requires knowing "now"
 //   • recurring timer catch-up — relative timers that fell behind
+//   • VCLOCK viability audit — TimePop self-check against canonical time
 //
 // Absolute and anchor-relative scheduling NEVER call this function.
 // Their deadlines are computed from the time anchor via pure arithmetic.
@@ -387,6 +408,35 @@ static int64_t vclock_to_gnss_ns(uint32_t vclock_raw,
 
   return (int64_t)(snap.pps_count - 1) * (int64_t)1000000000LL
        + (int64_t)((uint64_t)ticks_since_pps * NS_PER_TICK);
+}
+
+// ============================================================================
+// VCLOCK viability audit
+// ============================================================================
+
+static void vclock_viability_audit(void) {
+  const time_anchor_snapshot_t snap = time_anchor_snapshot();
+  if (!snap.ok || !snap.valid) return;
+  if (snap.dwt_cycles_per_s == 0) return;
+
+  const uint32_t vclock_now = qtimer1_read_32_local();
+  const int64_t expected_gnss_ns = vclock_to_gnss_ns(vclock_now, snap);
+  if (expected_gnss_ns < 0) return;
+
+  const int64_t actual_gnss_ns = time_gnss_ns_now();
+  if (actual_gnss_ns < 0) return;
+
+  diag_vclock_viability_checks++;
+
+  const int64_t error_ns = expected_gnss_ns - actual_gnss_ns;
+  if (llabs(error_ns) <= VCLOCK_VIABILITY_TOLERANCE_NS) {
+    return;
+  }
+
+  diag_vclock_viability_mismatches++;
+  diag_vclock_viability_last_expected_gnss_ns = expected_gnss_ns;
+  diag_vclock_viability_last_actual_gnss_ns = actual_gnss_ns;
+  diag_vclock_viability_last_error_ns = error_ns;
 }
 
 // ============================================================================
@@ -728,6 +778,12 @@ void timepop_init(void) {
   for (uint32_t i = 0; i < MAX_SLOTS; i++) slots[i] = {};
   for (uint32_t i = 0; i < MAX_ASAP_SLOTS; i++) asap_slots[i] = {};
   for (uint32_t i = 0; i < MAX_ALAP_SLOTS; i++) alap_slots[i] = {};
+
+  diag_vclock_viability_checks = 0;
+  diag_vclock_viability_mismatches = 0;
+  diag_vclock_viability_last_expected_gnss_ns = -1;
+  diag_vclock_viability_last_actual_gnss_ns = -1;
+  diag_vclock_viability_last_error_ns = 0;
 
   qtimer1_init_vclock_base();
   qtimer1_init_ch2_scheduler();
@@ -1117,6 +1173,8 @@ void timepop_dispatch(void) {
   timepop_pending = false;
   diag_dispatch_calls++;
 
+  vclock_viability_audit();
+
   dispatch_deferred_phase(asap_slots,
                           MAX_ASAP_SLOTS,
                           diag_asap_dispatched,
@@ -1241,6 +1299,13 @@ static Payload cmd_report(const Payload&) {
   out.add("vclock_raw_now",    vclock_count());
   out.add("time_valid",        time_valid());
   out.add("time_pps_count",    time_pps_count());
+
+  out.add("vclock_viability_tolerance_ns",      (int64_t)VCLOCK_VIABILITY_TOLERANCE_NS);
+  out.add("vclock_viability_checks",            diag_vclock_viability_checks);
+  out.add("vclock_viability_mismatches",        diag_vclock_viability_mismatches);
+  out.add("vclock_viability_last_expected_gnss_ns", diag_vclock_viability_last_expected_gnss_ns);
+  out.add("vclock_viability_last_actual_gnss_ns",   diag_vclock_viability_last_actual_gnss_ns);
+  out.add("vclock_viability_last_error_ns",         diag_vclock_viability_last_error_ns);
 
   out.add("slots_active_now",    timepop_active_count());
   out.add("slots_high_water",     diag_slots_high_water);

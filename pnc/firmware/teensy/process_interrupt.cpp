@@ -26,71 +26,9 @@
 //   • Compare interrupt via SCTRL TCF / TCFIE (match on COMP1 value)
 //   • Software tracks full 16-bit COMP1 target for one-second boundaries
 //
-// 16-bit windowing (v19):
-//
-//   QTimer3 CH2 and CH3 are standalone 16-bit counters (no cascade partner).
-//   At 10 MHz, the 16-bit counter wraps ~152 times per second.  COMP1
-//   fires on every wrap that hits the target value — ~152 times per second,
-//   not once.  Only one of those matches is the true one-second boundary.
-//
-//   To discriminate, each OCXO channel maintains a software 32-bit counter
-//   accumulated from 16-bit CNTR deltas at every compare hit.  The ISR
-//   checks whether the software counter has reached the 32-bit target
-//   (next_match_total) before accepting the event.  This mirrors TimePop's
-//   pattern where the CH2 compare is a hardware trigger and the ISR
-//   verifies the full 32-bit deadline before declaring expiry.
-//
-//   Spurious matches (~151/sec per OCXO) are rejected and counted in
-//   spurious_count for diagnostic observability.
-//
-// Pin-to-QTimer mapping:
-//
-//   Pin 14 = GPIO_AD_B1_02 → ALT1 = QTIMER3_TIMER2 (CH2) → PCS(2)
-//   Pin 15 = GPIO_AD_B1_03 → ALT1 = QTIMER3_TIMER3 (CH3) → PCS(3)
-//
-// ISR architecture:
-//
-//   Both OCXO channels share IRQ_QTIMER3.  The ISR captures DWT first,
-//   then checks SCTRL TCF flags on CH2 and CH3 to dispatch.
-//
-// TimePop owns QTimer1. process_interrupt does not touch QTimer1.
-//
-// Terminology:
-//   • approach_cycles      = total cycles from pre-spin start until interrupt fire
-//   • shadow_to_isr_cycles = cycles from final shadow DWT sample to ISR entry
-//
-// Shared prespin architecture:
-//
-//   One shared shadow DWT serves all clocks.  A responsibility counter tracks
-//   how many clocks are waiting for edges.
-//
-//   Prespin callbacks run in scheduled context (normal TimePop dispatch).
-//   Each callback increments the responsibility counter and arms a named
-//   ASAP timer ("PRESPIN_SPIN").  Named singleton replacement ensures only
-//   one spin callback fires per dispatch pass, regardless of how many clocks
-//   registered.  By the time the spin callback runs, all pending register
-//   callbacks have already incremented the counter.
-//
-//   The spin loop runs in scheduled context from the ASAP callback.
-//   Edge ISRs (priority 0) preempt it, decrement the counter, and
-//   snapshot the shared shadow DWT into the per-clock runtime.
-//
-//   If the spin loop is preempted by non-edge activity (transport, other
-//   timers), the shadow becomes momentarily stale.
-//
-// Scheduling intent:
-//   • PPS pre-spin is a geared drumbeat from actual consummated PPS edges.
-//   • ZERO is consummated only on a PPS edge and restarts that drumbeat.
-//   • Before the first lawful PPS edge, there is no sacred drumbeat baseline yet.
-//   • PPS critical scheduling must not interrogate ambient "now" time.
-//   • OCXO1 / OCXO2 pre-spin are event-anchored and rescheduled from the just-
-//     consummated OCXO edge, analogous to PPS drumbeat rescheduling.
-//
-// Lifecycle:
-//   1. process_interrupt_init_hardware() — QTimer3 clock gate, pin mux, timer enable
-//   2. process_interrupt_init()          — runtime slots, descriptor wiring
-//   3. process_interrupt_enable_irqs()   — ISR vector installation + NVIC enable
-//   4. interrupt_subscribe() / interrupt_start() — client wiring + activation
+// TimePop owns QTimer1. process_interrupt does not touch QTimer1, except
+// for a torn-read-safe snapshot used to capture the PPS-aligned VCLOCK fact
+// at the PPS boundary itself.
 //
 // ============================================================================
 
@@ -115,24 +53,17 @@ static constexpr uint32_t MAX_INTERRUPT_SUBSCRIBERS = 8;
 static constexpr uint32_t OCXO_COUNTS_PER_SECOND = 10000000;
 
 static constexpr uint64_t NS_PER_SECOND_U64      = 1000000000ULL;
-static constexpr uint64_t PRESPIN_LEAD_NS        = 10000ULL;     // 10 µs
-static constexpr uint32_t PRESPIN_TIMEOUT_CYCLES = 100800;       // ~100 µs @ 1.008 GHz
+static constexpr uint64_t PRESPIN_LEAD_NS        = 10000ULL;
+static constexpr uint32_t PRESPIN_TIMEOUT_CYCLES = 100800;
 
-// PPS is empirically ~48 cycles (GPIO direct vector, priority 0).
 static constexpr uint32_t PPS_ISR_FIXED_OVERHEAD_CYCLES = 48;
 
 // ============================================================================
 // Pin assignments — authoritative for process_interrupt
 // ============================================================================
-//
-// These must match config.h and zpnet_pins.h.
-//
-// Pin 14 = GPIO_AD_B1_02 → ALT1 = QTIMER3_TIMER2 (CH2) — OCXO1
-// Pin 15 = GPIO_AD_B1_03 → ALT1 = QTIMER3_TIMER3 (CH3) — OCXO2
-//
 
-static constexpr int OCXO1_PIN = 14;   // QTimer3 CH2
-static constexpr int OCXO2_PIN = 15;   // QTimer3 CH3
+static constexpr int OCXO1_PIN = 14;
+static constexpr int OCXO2_PIN = 15;
 
 // ============================================================================
 // Shared prespin state — responsibility counter architecture
@@ -142,6 +73,23 @@ static volatile uint32_t g_prespin_shadow_dwt = 0;
 static volatile uint32_t g_prespin_start_dwt = 0;
 static volatile int32_t  g_prespin_responsibility_count = 0;
 static volatile bool     g_prespin_spinning = false;
+
+// ============================================================================
+// QTimer1 PPS-aligned VCLOCK capture
+// ============================================================================
+
+static uint32_t qtimer1_read_32_for_pps_capture(void) {
+  const uint16_t lo1 = IMXRT_TMR1.CH[0].CNTR;
+  const uint16_t hi1 = IMXRT_TMR1.CH[1].HOLD;
+
+  const uint16_t lo2 = IMXRT_TMR1.CH[0].CNTR;
+  const uint16_t hi2 = IMXRT_TMR1.CH[1].HOLD;
+
+  if (hi1 != hi2) {
+    return ((uint32_t)hi2 << 16) | (uint32_t)lo2;
+  }
+  return ((uint32_t)hi1 << 16) | (uint32_t)lo1;
+}
 
 // ============================================================================
 // Subscriber descriptor + runtime state
@@ -193,29 +141,13 @@ struct interrupt_subscriber_runtime_t {
   bool subscribed = false;
   bool active = false;
 
-  // Software-tracked 16-bit compare target for next second boundary.
-  // Advances by OCXO_COUNTS_PER_SECOND (mod 65536) each second.
   uint16_t next_comp = 0;
-
-  // Software-accumulated 32-bit event counter (for counter32_at_event).
-  // This is the total OCXO tick count at the next one-second boundary,
-  // reconstructed from the known COMP1 values we programmed.
   uint32_t next_match_total = 0;
 
-  // ── Software 32-bit counter (v19 windowing) ──
-  //
-  // The 16-bit QTimer counter wraps ~152 times per second at 10 MHz.
-  // COMP1 fires on every wrap that hits the target — not just the one-second
-  // boundary.  To discriminate, we accumulate 16-bit CNTR deltas into a
-  // monotonic 32-bit running total and compare against next_match_total.
-  //
-  // This mirrors TimePop's pattern: hardware fires on low-16 match,
-  // software verifies the full 32-bit position before accepting.
-  //
-  uint16_t last_cntr = 0;         // last CNTR value seen in ISR
-  uint32_t running_total = 0;     // software 32-bit tick counter
-  uint32_t spurious_count = 0;    // ISR hits rejected by windowing
-  bool first_after_accept = false; // true on first ISR hit after COMP1 reprogrammed
+  uint16_t last_cntr = 0;
+  uint32_t running_total = 0;
+  uint32_t spurious_count = 0;
+  bool first_after_accept = false;
 
   interrupt_event_t last_event {};
   interrupt_capture_diag_t last_diag {};
@@ -388,62 +320,21 @@ const char* interrupt_lane_str(interrupt_lane_t lane) {
 // ============================================================================
 // QTimer3 hardware bring-up (provider custody)
 // ============================================================================
-//
-// Register setup mirrors TimePop's proven QTimer1 configuration:
-//
-//   • No TMR_CTRL_LENGTH — counter free-runs, wraps at 0xFFFF→0
-//   • COMP1 = 0xFFFF, CMPLD1 = 0xFFFF — natural 16-bit wrap
-//   • CM(1) = count rising edges of primary source
-//   • PCS(n) = channel n's external pin input
-//
-// QTimer PCS (Primary Count Source) for external pin routing:
-//
-//   Each QTimer channel's external pin maps to PCS equal to the channel
-//   number.  This is the same convention as QTimer1 where pin 10 feeds
-//   CH0 via PCS(0).
-//
-//   Pin 14 = QTIMER3_TIMER2 → CH2 → PCS(2)
-//   Pin 15 = QTIMER3_TIMER3 → CH3 → PCS(3)
-//
-// IOMUX:
-//
-//   portConfigRegister(pin) = 1 selects ALT1 for both AD_B1 pads,
-//   which routes to QTIMER3_TIMERn.
-//
-// Pad configuration includes hysteresis + pull-up for clean edge
-// detection on the 10 MHz square wave, matching TimePop's pin 10 setup.
-//
 
 static void arm_qtimer3_ocxo_channels(void) {
-  // Enable QTimer3 clock gate
   CCM_CCGR6 |= CCM_CCGR6_QTIMER3(CCM_CCGR_ON);
 
-  // ── Pin 14 → QTimer3 CH2 (OCXO1) ──
-  //
-  // GPIO_AD_B1_02: ALT1 = QTIMER3_TIMER2
-  *(portConfigRegister(OCXO1_PIN)) = 1;   // ALT1
+  *(portConfigRegister(OCXO1_PIN)) = 1;
   IOMUXC_SW_PAD_CTL_PAD_GPIO_AD_B1_02 =
       IOMUXC_PAD_HYS | IOMUXC_PAD_PKE | IOMUXC_PAD_PUE | IOMUXC_PAD_DSE(4);
 
-  // ── Pin 15 → QTimer3 CH3 (OCXO2) ──
-  //
-  // GPIO_AD_B1_03: ALT1 = QTIMER3_TIMER3
-  *(portConfigRegister(OCXO2_PIN)) = 1;   // ALT1
+  *(portConfigRegister(OCXO2_PIN)) = 1;
   IOMUXC_SW_PAD_CTL_PAD_GPIO_AD_B1_03 =
       IOMUXC_PAD_HYS | IOMUXC_PAD_PKE | IOMUXC_PAD_PUE | IOMUXC_PAD_DSE(4);
 
-  // Daisy-chain input select: tell QTimer3 to listen to these specific pads
-  IOMUXC_QTIMER3_TIMER2_SELECT_INPUT = 1;  // select GPIO_AD_B1_02 for TIMER2
-  IOMUXC_QTIMER3_TIMER3_SELECT_INPUT = 1;  // select GPIO_AD_B1_03 for TIMER3
+  IOMUXC_QTIMER3_TIMER2_SELECT_INPUT = 1;
+  IOMUXC_QTIMER3_TIMER3_SELECT_INPUT = 1;
 
-  // ── QTimer3 CH2 — OCXO1 counter ──
-  //
-  // Mirrors QTimer1 CH0 setup from TimePop:
-  //   - Free-running (no LENGTH bit)
-  //   - COMP1/CMPLD1 = 0xFFFF for natural 16-bit wrap
-  //   - CM(1) = count rising edges of primary source
-  //   - PCS(2) = channel 2's external pin input
-  //
   IMXRT_TMR3.CH[2].CTRL   = 0;
   IMXRT_TMR3.CH[2].SCTRL  = 0;
   IMXRT_TMR3.CH[2].CSCTRL = 0;
@@ -453,10 +344,6 @@ static void arm_qtimer3_ocxo_channels(void) {
   IMXRT_TMR3.CH[2].CMPLD1 = 0xFFFF;
   IMXRT_TMR3.CH[2].CTRL   = TMR_CTRL_CM(1) | TMR_CTRL_PCS(2);
 
-  // ── QTimer3 CH3 — OCXO2 counter ──
-  //
-  // Same configuration, PCS(3) for channel 3's external pin input.
-  //
   IMXRT_TMR3.CH[3].CTRL   = 0;
   IMXRT_TMR3.CH[3].SCTRL  = 0;
   IMXRT_TMR3.CH[3].CSCTRL = 0;
@@ -479,23 +366,10 @@ uint16_t interrupt_qtimer3_ch3_counter_now(void) {
 // ISR vectors — owned by process_interrupt
 // ============================================================================
 
-// GPIO6/7/8/9 share a single NVIC vector.  The Teensyduino attachInterrupt()
-// framework dispatches to per-pin callbacks, so no status register check is
-// needed here — if we're called, it's our pin.
-
 static void pps_gpio_isr(void) {
   const uint32_t dwt_raw = ARM_DWT_CYCCNT;
   process_interrupt_gpio6789_irq(dwt_raw);
 }
-
-// QTimer3 ISR dispatcher — both OCXO channels share this vector.
-// DWT is captured once at entry.  Flag checks determine which
-// channel(s) fired.  This is the same pattern as TimePop's
-// qtimer1_irq_isr that dispatches between CH2 and CH3.
-//
-// We check CH2 first (OCXO1), then CH3 (OCXO2).
-// If both fire simultaneously, CH2 gets the exact DWT and CH3
-// gets a slightly stale one — the prespin shadow compensates.
 
 static void qtimer3_isr(void) {
   const uint32_t dwt_raw = ARM_DWT_CYCCNT;
@@ -879,30 +753,17 @@ void process_interrupt_gpio6789_irq(uint32_t dwt_isr_entry_raw) {
 
   g_gpio_diag.dispatch_count++;
 
-  const uint32_t next_pps_count = rt->event_count + 1;
-  handle_event(*rt, dwt_isr_entry_raw, next_pps_count);
+  const uint32_t pps_qtimer_at_edge = qtimer1_read_32_for_pps_capture();
+  handle_event(*rt, dwt_isr_entry_raw, pps_qtimer_at_edge);
 }
 
 // ============================================================================
 // QTimer3 CH2 ISR entry — OCXO1 (v19 windowed)
 // ============================================================================
-//
-// The 16-bit counter free-runs at 10 MHz.  COMP1 fires when
-// counter == COMP1 value, which happens ~152 times per second
-// (once per 65536-tick wrap).  Only one of those is the true
-// one-second boundary at 10,000,000 ticks.
-//
-// Software 32-bit windowing (mirrors TimePop pattern):
-//   1. Read CNTR
-//   2. Accumulate 16-bit delta into running_total
-//   3. If running_total < next_match_total → spurious, return
-//   4. Otherwise → accept, advance targets, dispatch
-//
 
 void process_interrupt_qtimer3_ch2_irq(uint32_t dwt_raw) {
   g_qtimer3_ch2_diag.irq_count++;
 
-  // Clear the compare flag
   IMXRT_TMR3.CH[2].SCTRL &= ~TMR_SCTRL_TCF;
 
   auto* rt = g_rt_ocxo1;
@@ -911,9 +772,6 @@ void process_interrupt_qtimer3_ch2_irq(uint32_t dwt_raw) {
     return;
   }
 
-  // ── Synthetic 32-bit counter ──
-  // First hit after COMP1 reprogrammed: short wrap (38,528 ticks).
-  // All subsequent hits: full wrap (65,536 ticks).
   if (rt->first_after_accept) {
     rt->running_total += (uint16_t)OCXO_COUNTS_PER_SECOND;
     rt->first_after_accept = false;
@@ -921,7 +779,6 @@ void process_interrupt_qtimer3_ch2_irq(uint32_t dwt_raw) {
     rt->running_total += 65536;
   }
 
-  // ── Windowing check: has the 32-bit target been reached? ──
   if (rt->running_total < rt->next_match_total) {
     rt->spurious_count++;
     return;
@@ -929,11 +786,8 @@ void process_interrupt_qtimer3_ch2_irq(uint32_t dwt_raw) {
 
   g_qtimer3_ch2_diag.dispatch_count++;
 
-  // The canonical OCXO count at this edge is the match total we computed
-  // when we armed this compare — not a live counter read.
   const uint32_t matched_total = rt->next_match_total;
 
-  // Advance for the next second boundary
   rt->next_match_total += OCXO_COUNTS_PER_SECOND;
   rt->next_comp += (uint16_t)OCXO_COUNTS_PER_SECOND;
 
@@ -953,7 +807,6 @@ void process_interrupt_qtimer3_ch2_irq(uint32_t dwt_raw) {
 void process_interrupt_qtimer3_ch3_irq(uint32_t dwt_raw) {
   g_qtimer3_ch3_diag.irq_count++;
 
-  // Clear the compare flag
   IMXRT_TMR3.CH[3].SCTRL &= ~TMR_SCTRL_TCF;
 
   auto* rt = g_rt_ocxo2;
@@ -962,9 +815,6 @@ void process_interrupt_qtimer3_ch3_irq(uint32_t dwt_raw) {
     return;
   }
 
-  // ── Synthetic 32-bit counter ──
-  // First hit after COMP1 reprogrammed: short wrap (38,528 ticks).
-  // All subsequent hits: full wrap (65,536 ticks).
   if (rt->first_after_accept) {
     rt->running_total += (uint16_t)OCXO_COUNTS_PER_SECOND;
     rt->first_after_accept = false;
@@ -972,7 +822,6 @@ void process_interrupt_qtimer3_ch3_irq(uint32_t dwt_raw) {
     rt->running_total += 65536;
   }
 
-  // ── Windowing check: has the 32-bit target been reached? ──
   if (rt->running_total < rt->next_match_total) {
     rt->spurious_count++;
     return;
@@ -980,16 +829,13 @@ void process_interrupt_qtimer3_ch3_irq(uint32_t dwt_raw) {
 
   g_qtimer3_ch3_diag.dispatch_count++;
 
-  // The canonical OCXO count at this edge is the match total we computed
-  // when we armed this compare — not a live counter read.
   const uint32_t matched_total = rt->next_match_total;
 
-  // Advance for the next second boundary
   rt->next_match_total += OCXO_COUNTS_PER_SECOND;
   rt->next_comp += (uint16_t)OCXO_COUNTS_PER_SECOND;
 
-  IMXRT_TMR3.CH[2].COMP1 = rt->next_comp;
-  IMXRT_TMR3.CH[2].CMPLD1 = rt->next_comp;
+  IMXRT_TMR3.CH[3].COMP1 = rt->next_comp;
+  IMXRT_TMR3.CH[3].CMPLD1 = rt->next_comp;
   rt->first_after_accept = true;
 
   handle_event(*rt, dwt_raw, matched_total);
@@ -1029,7 +875,6 @@ bool interrupt_start(interrupt_subscriber_kind_t kind) {
   }
 
   if (kind == interrupt_subscriber_kind_t::OCXO1) {
-    // Read current 16-bit counter, compute first compare target
     uint16_t now16 = IMXRT_TMR3.CH[2].CNTR;
     rt->last_cntr = now16;
     rt->running_total = 0;
@@ -1038,11 +883,10 @@ bool interrupt_start(interrupt_subscriber_kind_t kind) {
     rt->next_comp = now16 + (uint16_t)OCXO_COUNTS_PER_SECOND;
     rt->next_match_total = OCXO_COUNTS_PER_SECOND;
 
-    // Arm the compare
-    IMXRT_TMR3.CH[2].SCTRL &= ~TMR_SCTRL_TCF;       // clear pending flag
+    IMXRT_TMR3.CH[2].SCTRL &= ~TMR_SCTRL_TCF;
     IMXRT_TMR3.CH[2].COMP1  = rt->next_comp;
     IMXRT_TMR3.CH[2].CMPLD1 = rt->next_comp;
-    IMXRT_TMR3.CH[2].SCTRL |= TMR_SCTRL_TCFIE;      // enable compare interrupt
+    IMXRT_TMR3.CH[2].SCTRL |= TMR_SCTRL_TCFIE;
     return true;
   }
 
@@ -1170,11 +1014,6 @@ void process_interrupt_init(void) {
 void process_interrupt_enable_irqs(void) {
   if (g_interrupt_irqs_enabled) return;
 
-  // ── QTimer3 — shared vector for CH2 (OCXO1) + CH3 (OCXO2) ──
-  //
-  // Clear any pending status flags before enabling.
-  // Do NOT enable compare interrupts here — that happens in interrupt_start().
-  //
   IMXRT_TMR3.CH[2].SCTRL &= ~(TMR_SCTRL_TCF | TMR_SCTRL_TCFIE);
   IMXRT_TMR3.CH[3].SCTRL &= ~(TMR_SCTRL_TCF | TMR_SCTRL_TCFIE);
 
@@ -1182,7 +1021,6 @@ void process_interrupt_enable_irqs(void) {
   NVIC_SET_PRIORITY(IRQ_QTIMER3, 0);
   NVIC_ENABLE_IRQ(IRQ_QTIMER3);
 
-  // ── GPIO6789 — PPS ──
   pinMode(GNSS_PPS_PIN, INPUT);
   attachInterrupt(digitalPinToInterrupt(GNSS_PPS_PIN), pps_gpio_isr, RISING);
   NVIC_SET_PRIORITY(IRQ_GPIO6789, 0);
@@ -1237,7 +1075,6 @@ static Payload cmd_report(const Payload&) {
   p.add("anomaly_last_detail1", g_anomaly_diag.last_detail1);
   p.add("anomaly_last_detail2", g_anomaly_diag.last_detail2);
 
-  // Live 16-bit counter reads for diagnostic verification
   p.add("qtimer3_ch2_cntr_now", (uint32_t)IMXRT_TMR3.CH[2].CNTR);
   p.add("qtimer3_ch3_cntr_now", (uint32_t)IMXRT_TMR3.CH[3].CNTR);
 
@@ -1264,12 +1101,10 @@ static Payload cmd_report(const Payload&) {
     s.add("next_comp", (uint32_t)rt.next_comp);
     s.add("next_match_total", rt.next_match_total);
 
-    // v19 windowing diagnostics
     s.add("running_total", rt.running_total);
     s.add("last_cntr", (uint32_t)rt.last_cntr);
     s.add("spurious_count", rt.spurious_count);
 
-    // Prespin facts — ISR snapshots.
     s.add("prespin_active", rt.prespin.active);
     s.add("prespin_fired", rt.prespin.snap_fired);
     s.add("prespin_timed_out", rt.prespin.snap_timed_out);
