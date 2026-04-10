@@ -24,6 +24,17 @@
 //   The DWT adjustment timer reads DWT_CYCCNT directly at 10 kHz.  This is
 //   a legitimate real-time feedback loop on the DWT bridge substrate.
 //
+// Smart-zero OCXO phase model:
+//
+//   OCXO ns_count_at_edge is a pure OCXO-domain counter that advances by
+//   exactly 1,000,000,000 per lawful one-second OCXO edge.  It does not
+//   incorporate GNSS measurements.  Phase offset is the cumulative
+//   difference: gnss_ns_at_edge - ns_count_at_edge.
+//
+//   Per-window viability checks whether each GNSS-measured OCXO second
+//   approximates 1e9 ns.  This replaces the old cumulative viability
+//   audit, which was answering the wrong question.
+//
 // ============================================================================
 
 #include "process_clocks_internal.h"
@@ -84,24 +95,6 @@ interrupt_capture_diag_t g_ocxo1_interrupt_diag = {};
 interrupt_capture_diag_t g_ocxo2_interrupt_diag = {};
 
 bool g_ad5693r_init_ok = false;
-
-// ============================================================================
-// OCXO viability diagnostics
-// ============================================================================
-
-static constexpr int64_t OCXO_VIABILITY_TOLERANCE_NS = 500LL;
-
-volatile uint32_t g_ocxo1_viability_checks = 0;
-volatile uint32_t g_ocxo1_viability_mismatches = 0;
-volatile int64_t  g_ocxo1_viability_last_expected_gnss_ns = -1;
-volatile int64_t  g_ocxo1_viability_last_actual_gnss_ns = -1;
-volatile int64_t  g_ocxo1_viability_last_error_ns = 0;
-
-volatile uint32_t g_ocxo2_viability_checks = 0;
-volatile uint32_t g_ocxo2_viability_mismatches = 0;
-volatile int64_t  g_ocxo2_viability_last_expected_gnss_ns = -1;
-volatile int64_t  g_ocxo2_viability_last_actual_gnss_ns = -1;
-volatile int64_t  g_ocxo2_viability_last_error_ns = 0;
 
 // ============================================================================
 // Alpha epoch state
@@ -246,18 +239,6 @@ static void alpha_reset_canonical_clock_state_for_new_epoch(void) {
   g_ocxo1_interrupt_diag = {};
   g_ocxo2_interrupt_diag = {};
 
-  g_ocxo1_viability_checks = 0;
-  g_ocxo1_viability_mismatches = 0;
-  g_ocxo1_viability_last_expected_gnss_ns = -1;
-  g_ocxo1_viability_last_actual_gnss_ns = -1;
-  g_ocxo1_viability_last_error_ns = 0;
-
-  g_ocxo2_viability_checks = 0;
-  g_ocxo2_viability_mismatches = 0;
-  g_ocxo2_viability_last_expected_gnss_ns = -1;
-  g_ocxo2_viability_last_actual_gnss_ns = -1;
-  g_ocxo2_viability_last_error_ns = 0;
-
   dwt_cycle_count_total = 0;
   gnss_raw_64           = 0;
   ocxo1_ticks_64        = 0;
@@ -282,13 +263,9 @@ static void alpha_install_new_epoch_from_pps(const interrupt_event_t& pps_event)
   g_dwt_model_pps_count = 0;
   g_qtimer_at_pps = g_epoch_qtimer_at_pps;
 
-  g_ocxo1_clock.gnss_ns_at_edge = 0;
-  g_ocxo1_clock.ns_count_at_edge = 0;
-  g_ocxo1_clock.ns_count_at_pps = 0;
-
-  g_ocxo2_clock.gnss_ns_at_edge = 0;
-  g_ocxo2_clock.ns_count_at_edge = 0;
-  g_ocxo2_clock.ns_count_at_pps = 0;
+  // OCXO smart-zero: aggregate reset already zeroed g_ocxo1_clock and
+  // g_ocxo2_clock via = {}.  zero_established starts false.  The first
+  // post-epoch OCXO one-second edge will seed the phase offset ledger.
 
   time_pps_epoch_reset(pps_event.dwt_at_event, g_epoch_qtimer_at_pps);
 }
@@ -323,29 +300,6 @@ static void dwt_adjustment_timer_callback(timepop_ctx_t* ctx, timepop_diag_t*, v
 
     g_dwt_cycle_count_next_second_adjustment =
         (int32_t)(candidate_total - (int64_t)g_dwt_cycle_count_next_second_prediction);
-  }
-}
-
-// ============================================================================
-// OCXO viability audit
-// ============================================================================
-
-static inline void ocxo_viability_update(volatile uint32_t& checks,
-                                         volatile uint32_t& mismatches,
-                                         volatile int64_t& last_expected_gnss_ns,
-                                         volatile int64_t& last_actual_gnss_ns,
-                                         volatile int64_t& last_error_ns,
-                                         uint64_t expected_gnss_ns,
-                                         uint64_t actual_gnss_ns) {
-  checks++;
-  last_expected_gnss_ns = (int64_t)expected_gnss_ns;
-  last_actual_gnss_ns = (int64_t)actual_gnss_ns;
-
-  const int64_t error_ns = (int64_t)expected_gnss_ns - (int64_t)actual_gnss_ns;
-  last_error_ns = error_ns;
-
-  if (llabs(error_ns) > OCXO_VIABILITY_TOLERANCE_NS) {
-    mismatches++;
   }
 }
 
@@ -401,20 +355,23 @@ static void pps_callback(
   g_dwt_cycle_count_next_second_adjustment = 0;
   g_dwt_model_pps_count++;
 
-  if (g_ocxo1_clock.gnss_ns_at_edge != 0 || g_ocxo1_measurement.prev_gnss_ns_at_edge == 0) {
-    const int64_t phase_offset_ns =
-        (int64_t)g_ocxo1_clock.gnss_ns_at_edge - (int64_t)g_gnss_ns_count_at_pps;
+  // Project OCXO ns to PPS boundary using the phase offset ledger.
+  //
+  //   ns_count_at_pps = gnss_ns_at_pps - phase_offset_ns
+  //
+  // This gives the OCXO's own ns total, projected to the PPS instant
+  // via the last-known cumulative phase relationship.
+
+  if (g_ocxo1_clock.zero_established) {
     g_ocxo1_clock.ns_count_at_pps =
-        (uint64_t)((int64_t)g_ocxo1_clock.ns_count_at_edge - phase_offset_ns);
+        (uint64_t)((int64_t)g_gnss_ns_count_at_pps - g_ocxo1_clock.phase_offset_ns);
   } else {
     g_ocxo1_clock.ns_count_at_pps = 0;
   }
 
-  if (g_ocxo2_clock.gnss_ns_at_edge != 0 || g_ocxo2_measurement.prev_gnss_ns_at_edge == 0) {
-    const int64_t phase_offset_ns =
-        (int64_t)g_ocxo2_clock.gnss_ns_at_edge - (int64_t)g_gnss_ns_count_at_pps;
+  if (g_ocxo2_clock.zero_established) {
     g_ocxo2_clock.ns_count_at_pps =
-        (uint64_t)((int64_t)g_ocxo2_clock.ns_count_at_edge - phase_offset_ns);
+        (uint64_t)((int64_t)g_gnss_ns_count_at_pps - g_ocxo2_clock.phase_offset_ns);
   } else {
     g_ocxo2_clock.ns_count_at_pps = 0;
   }
@@ -462,19 +419,32 @@ static void ocxo1_callback(
   g_ocxo1_measurement.dwt_at_edge = dwt_at_edge;
 
   if (g_ocxo1_measurement.prev_gnss_ns_at_edge == 0) {
-    g_ocxo1_clock.ns_count_at_edge = gnss_ns_at_edge;
+    // ── First one-second OCXO edge after epoch zero ──
+    //
+    // The OCXO has counted exactly 10,000,000 ticks since PPS zero.
+    // In the OCXO's own domain, that is exactly 1,000,000,000 ns.
+    // The GNSS measurement of this edge seeds the phase offset ledger.
+
+    g_ocxo1_clock.ns_count_at_edge = NS_PER_SECOND_U64;
+    g_ocxo1_clock.phase_offset_ns =
+        (int64_t)gnss_ns_at_edge - (int64_t)NS_PER_SECOND_U64;
+    g_ocxo1_clock.zero_established = true;
+
     g_ocxo1_measurement.gnss_ns_between_edges = 0;
     g_ocxo1_measurement.dwt_cycles_between_edges = 0;
     g_ocxo1_measurement.second_residual_ns = 0;
   } else {
-    const uint32_t delta32 = raw_counter32 - prev_counter32;
-    const uint64_t delta_ns = (uint64_t)delta32 * 100ULL;
+    // ── Subsequent one-second OCXO edges ──
+    //
+    // OCXO ns advances deterministically by 1e9 per OCXO second.
+    // Phase offset is the cumulative GNSS-vs-OCXO difference.
 
-    g_ocxo1_clock.ns_count_at_edge += delta_ns;
+    g_ocxo1_clock.ns_count_at_edge += NS_PER_SECOND_U64;
+    g_ocxo1_clock.phase_offset_ns =
+        (int64_t)gnss_ns_at_edge - (int64_t)g_ocxo1_clock.ns_count_at_edge;
 
     const uint64_t gnss_ns_between_edges =
         gnss_ns_at_edge - g_ocxo1_measurement.prev_gnss_ns_at_edge;
-
     const uint32_t dwt_cycles_between_edges =
         dwt_at_edge - g_ocxo1_measurement.prev_dwt_at_edge;
 
@@ -483,14 +453,15 @@ static void ocxo1_callback(
     g_ocxo1_measurement.second_residual_ns =
         (int64_t)NS_PER_SECOND_U64 - (int64_t)gnss_ns_between_edges;
 
-    ocxo_viability_update(
-        g_ocxo1_viability_checks,
-        g_ocxo1_viability_mismatches,
-        g_ocxo1_viability_last_expected_gnss_ns,
-        g_ocxo1_viability_last_actual_gnss_ns,
-        g_ocxo1_viability_last_error_ns,
-        g_ocxo1_clock.ns_count_at_edge,
-        gnss_ns_at_edge);
+    // Per-window viability audit: did this OCXO second approximate 1e9 ns?
+    g_ocxo1_clock.window_expected_ns = (int64_t)NS_PER_SECOND_U64;
+    g_ocxo1_clock.window_actual_ns = (int64_t)gnss_ns_between_edges;
+    g_ocxo1_clock.window_error_ns =
+        (int64_t)gnss_ns_between_edges - (int64_t)NS_PER_SECOND_U64;
+    g_ocxo1_clock.window_checks++;
+    if (llabs(g_ocxo1_clock.window_error_ns) > OCXO_WINDOW_TOLERANCE_NS) {
+      g_ocxo1_clock.window_mismatches++;
+    }
   }
 
   prev_counter32 = raw_counter32;
@@ -519,19 +490,21 @@ static void ocxo2_callback(
   g_ocxo2_measurement.dwt_at_edge = dwt_at_edge;
 
   if (g_ocxo2_measurement.prev_gnss_ns_at_edge == 0) {
-    g_ocxo2_clock.ns_count_at_edge = gnss_ns_at_edge;
+    g_ocxo2_clock.ns_count_at_edge = NS_PER_SECOND_U64;
+    g_ocxo2_clock.phase_offset_ns =
+        (int64_t)gnss_ns_at_edge - (int64_t)NS_PER_SECOND_U64;
+    g_ocxo2_clock.zero_established = true;
+
     g_ocxo2_measurement.gnss_ns_between_edges = 0;
     g_ocxo2_measurement.dwt_cycles_between_edges = 0;
     g_ocxo2_measurement.second_residual_ns = 0;
   } else {
-    const uint32_t delta32 = raw_counter32 - prev_counter32;
-    const uint64_t delta_ns = (uint64_t)delta32 * 100ULL;
-
-    g_ocxo2_clock.ns_count_at_edge += delta_ns;
+    g_ocxo2_clock.ns_count_at_edge += NS_PER_SECOND_U64;
+    g_ocxo2_clock.phase_offset_ns =
+        (int64_t)gnss_ns_at_edge - (int64_t)g_ocxo2_clock.ns_count_at_edge;
 
     const uint64_t gnss_ns_between_edges =
         gnss_ns_at_edge - g_ocxo2_measurement.prev_gnss_ns_at_edge;
-
     const uint32_t dwt_cycles_between_edges =
         dwt_at_edge - g_ocxo2_measurement.prev_dwt_at_edge;
 
@@ -540,14 +513,14 @@ static void ocxo2_callback(
     g_ocxo2_measurement.second_residual_ns =
         (int64_t)NS_PER_SECOND_U64 - (int64_t)gnss_ns_between_edges;
 
-    ocxo_viability_update(
-        g_ocxo2_viability_checks,
-        g_ocxo2_viability_mismatches,
-        g_ocxo2_viability_last_expected_gnss_ns,
-        g_ocxo2_viability_last_actual_gnss_ns,
-        g_ocxo2_viability_last_error_ns,
-        g_ocxo2_clock.ns_count_at_edge,
-        gnss_ns_at_edge);
+    g_ocxo2_clock.window_expected_ns = (int64_t)NS_PER_SECOND_U64;
+    g_ocxo2_clock.window_actual_ns = (int64_t)gnss_ns_between_edges;
+    g_ocxo2_clock.window_error_ns =
+        (int64_t)gnss_ns_between_edges - (int64_t)NS_PER_SECOND_U64;
+    g_ocxo2_clock.window_checks++;
+    if (llabs(g_ocxo2_clock.window_error_ns) > OCXO_WINDOW_TOLERANCE_NS) {
+      g_ocxo2_clock.window_mismatches++;
+    }
   }
 
   prev_counter32 = raw_counter32;

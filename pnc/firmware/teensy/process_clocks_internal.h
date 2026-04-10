@@ -56,11 +56,57 @@ extern volatile uint32_t g_qtimer_at_pps;
 // ============================================================================
 // OCXO canonical state (alpha-owned, beta-readable)
 // ============================================================================
+//
+// Smart-zero phase model:
+//
+//   ns_count_at_edge is a pure OCXO-domain counter.  It starts at 0 on
+//   epoch zero and advances by exactly NS_PER_SECOND (1,000,000,000)
+//   per lawful one-second OCXO edge.  It does NOT incorporate GNSS
+//   measurements — it is the OCXO's own time.
+//
+//   gnss_ns_at_edge is the GNSS nanosecond at the most recent lawful
+//   OCXO edge, measured via DWT interpolation.
+//
+//   phase_offset_ns = gnss_ns_at_edge - ns_count_at_edge
+//
+//   This is the canonical cumulative phase relationship, intentionally
+//   unwrapped.  Positive means GNSS is ahead (OCXO running slow).
+//
+//   Per-window viability checks whether each GNSS-measured OCXO second
+//   approximates 1,000,000,000 ns.  This is a correctness check on the
+//   QTimer cadence reconstruction, not a cumulative drift accumulator.
+//
+
+static constexpr int64_t OCXO_WINDOW_TOLERANCE_NS = 500LL;
 
 struct ocxo_clock_state_t {
-  volatile uint64_t gnss_ns_at_edge;
+  // OCXO-domain nanosecond total.
+  // Starts at 0 on epoch zero.  Advances by exactly 1e9 per lawful
+  // one-second OCXO edge.  Pure OCXO counter — no GNSS measurements.
   volatile uint64_t ns_count_at_edge;
+
+  // GNSS nanosecond at the most recent lawful one-second OCXO edge.
+  volatile uint64_t gnss_ns_at_edge;
+
+  // OCXO ns projected to PPS boundary (for TIMEBASE_FRAGMENT).
   volatile uint64_t ns_count_at_pps;
+
+  // Cumulative phase offset in GNSS nanoseconds:
+  //   phase_offset_ns = gnss_ns_at_edge - ns_count_at_edge
+  //
+  // Intentionally unwrapped — may grow to µs, ms, or more.
+  volatile int64_t phase_offset_ns;
+
+  // True once the first post-epoch OCXO one-second edge has been
+  // processed and the phase offset ledger is seeded.
+  volatile bool zero_established;
+
+  // Per-window viability audit.
+  volatile uint32_t window_checks;
+  volatile uint32_t window_mismatches;
+  volatile int64_t  window_expected_ns;   // always 1e9
+  volatile int64_t  window_actual_ns;     // gnss_ns_between_edges
+  volatile int64_t  window_error_ns;      // actual - expected
 };
 
 extern ocxo_clock_state_t g_ocxo1_clock;

@@ -24,19 +24,6 @@
 #include <stdlib.h>
 #include <climits>
 
-// OCXO viability diagnostics are owned by process_clocks_alpha.cpp.
-extern volatile uint32_t g_ocxo1_viability_checks;
-extern volatile uint32_t g_ocxo1_viability_mismatches;
-extern volatile int64_t  g_ocxo1_viability_last_expected_gnss_ns;
-extern volatile int64_t  g_ocxo1_viability_last_actual_gnss_ns;
-extern volatile int64_t  g_ocxo1_viability_last_error_ns;
-
-extern volatile uint32_t g_ocxo2_viability_checks;
-extern volatile uint32_t g_ocxo2_viability_mismatches;
-extern volatile int64_t  g_ocxo2_viability_last_expected_gnss_ns;
-extern volatile int64_t  g_ocxo2_viability_last_actual_gnss_ns;
-extern volatile int64_t  g_ocxo2_viability_last_error_ns;
-
 // ============================================================================
 // Campaign State — definitions
 // ============================================================================
@@ -435,19 +422,20 @@ void clocks_beta_pps(void) {
   p.add("ocxo1_second_residual_ns", g_ocxo1_measurement.second_residual_ns);
   p.add("ocxo2_second_residual_ns", g_ocxo2_measurement.second_residual_ns);
 
-  p.add("ocxo1_viability_tolerance_ns", (int64_t)500);
-  p.add("ocxo1_viability_checks", g_ocxo1_viability_checks);
-  p.add("ocxo1_viability_mismatches", g_ocxo1_viability_mismatches);
-  p.add("ocxo1_viability_last_expected_gnss_ns", g_ocxo1_viability_last_expected_gnss_ns);
-  p.add("ocxo1_viability_last_actual_gnss_ns", g_ocxo1_viability_last_actual_gnss_ns);
-  p.add("ocxo1_viability_last_error_ns", g_ocxo1_viability_last_error_ns);
+  // Smart-zero phase offset (cumulative, unwrapped)
+  p.add("ocxo1_phase_offset_ns", g_ocxo1_clock.phase_offset_ns);
+  p.add("ocxo1_zero_established", g_ocxo1_clock.zero_established);
+  p.add("ocxo2_phase_offset_ns", g_ocxo2_clock.phase_offset_ns);
+  p.add("ocxo2_zero_established", g_ocxo2_clock.zero_established);
 
-  p.add("ocxo2_viability_tolerance_ns", (int64_t)500);
-  p.add("ocxo2_viability_checks", g_ocxo2_viability_checks);
-  p.add("ocxo2_viability_mismatches", g_ocxo2_viability_mismatches);
-  p.add("ocxo2_viability_last_expected_gnss_ns", g_ocxo2_viability_last_expected_gnss_ns);
-  p.add("ocxo2_viability_last_actual_gnss_ns", g_ocxo2_viability_last_actual_gnss_ns);
-  p.add("ocxo2_viability_last_error_ns", g_ocxo2_viability_last_error_ns);
+  // Per-window viability (replaces cumulative viability)
+  p.add("ocxo1_window_checks", g_ocxo1_clock.window_checks);
+  p.add("ocxo1_window_mismatches", g_ocxo1_clock.window_mismatches);
+  p.add("ocxo1_window_error_ns", g_ocxo1_clock.window_error_ns);
+
+  p.add("ocxo2_window_checks", g_ocxo2_clock.window_checks);
+  p.add("ocxo2_window_mismatches", g_ocxo2_clock.window_mismatches);
+  p.add("ocxo2_window_error_ns", g_ocxo2_clock.window_error_ns);
 
   p.add("ocxo1_dac", ocxo1_dac.dac_fractional);
   p.add("ocxo2_dac", ocxo2_dac.dac_fractional);
@@ -589,19 +577,19 @@ static Payload cmd_report(const Payload&) {
   p.add("ocxo1_second_residual_ns", g_ocxo1_measurement.second_residual_ns);
   p.add("ocxo2_second_residual_ns", g_ocxo2_measurement.second_residual_ns);
 
-  p.add("ocxo1_viability_tolerance_ns", (int64_t)500);
-  p.add("ocxo1_viability_checks", g_ocxo1_viability_checks);
-  p.add("ocxo1_viability_mismatches", g_ocxo1_viability_mismatches);
-  p.add("ocxo1_viability_last_expected_gnss_ns", g_ocxo1_viability_last_expected_gnss_ns);
-  p.add("ocxo1_viability_last_actual_gnss_ns", g_ocxo1_viability_last_actual_gnss_ns);
-  p.add("ocxo1_viability_last_error_ns", g_ocxo1_viability_last_error_ns);
+  // Smart-zero phase offset (cumulative, unwrapped)
+  p.add("ocxo1_phase_offset_ns", g_ocxo1_clock.phase_offset_ns);
+  p.add("ocxo1_zero_established", g_ocxo1_clock.zero_established);
+  p.add("ocxo2_phase_offset_ns", g_ocxo2_clock.phase_offset_ns);
+  p.add("ocxo2_zero_established", g_ocxo2_clock.zero_established);
 
-  p.add("ocxo2_viability_tolerance_ns", (int64_t)500);
-  p.add("ocxo2_viability_checks", g_ocxo2_viability_checks);
-  p.add("ocxo2_viability_mismatches", g_ocxo2_viability_mismatches);
-  p.add("ocxo2_viability_last_expected_gnss_ns", g_ocxo2_viability_last_expected_gnss_ns);
-  p.add("ocxo2_viability_last_actual_gnss_ns", g_ocxo2_viability_last_actual_gnss_ns);
-  p.add("ocxo2_viability_last_error_ns", g_ocxo2_viability_last_error_ns);
+  // Per-window viability
+  p.add("ocxo1_window_checks", g_ocxo1_clock.window_checks);
+  p.add("ocxo1_window_mismatches", g_ocxo1_clock.window_mismatches);
+  p.add("ocxo1_window_error_ns", g_ocxo1_clock.window_error_ns);
+  p.add("ocxo2_window_checks", g_ocxo2_clock.window_checks);
+  p.add("ocxo2_window_mismatches", g_ocxo2_clock.window_mismatches);
+  p.add("ocxo2_window_error_ns", g_ocxo2_clock.window_error_ns);
 
   p.add("ocxo1_dac", ocxo1_dac.dac_fractional);
   p.add("ocxo2_dac", ocxo2_dac.dac_fractional);

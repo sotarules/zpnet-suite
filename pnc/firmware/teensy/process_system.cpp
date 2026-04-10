@@ -54,19 +54,6 @@ static void enter_bootloader_cb(timepop_ctx_t*, timepop_diag_t*, void*) {
 
   system_bootloader = true;
 
-  // Best-effort observability
-  {
-    Payload ev;
-    ev.add("status", "ENTERING");
-    enqueueEvent("SYSTEM_BOOTLOADER", ev);
-  }
-
-  // Allow event bus to drain
-  delay(10);
-
-  // Visible debug pattern
-  debug_blink("911");
-
   // Irreversible transition
   enter_bootloader_cleanly();
 
