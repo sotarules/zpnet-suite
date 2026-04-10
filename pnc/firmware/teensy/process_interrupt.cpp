@@ -1,5 +1,5 @@
 // ============================================================================
-// process_interrupt.cpp — provider authority + shared pre-spin (QTimer v21)
+// process_interrupt.cpp — provider authority + shared pre-spin (QTimer v22)
 // ============================================================================
 //
 // process_interrupt is the sole authority for all precision interrupt hardware.
@@ -44,6 +44,22 @@
 //
 //     no ambient OCXO clock reads for truth;
 //     only interrupt facts plus math.
+//
+// Prespin architecture (v22 — ISR-context spinning):
+//
+//   The prespin shadow-write loop now runs directly in TimePop ISR context
+//   (priority 16) via timepop_arm_ns(..., isr_callback=true).  This
+//   eliminates the two-hop indirection (scheduled callback → ALAP dispatch)
+//   that caused OCXO1 prespin scheduling failures.
+//
+//   Priority 0 ISRs (PPS GPIO, QTimer3 OCXO compare) preempt the priority 16
+//   spin loop via NVIC nesting, capture the shadow DWT value, and decrement
+//   the shared responsibility counter.  The spin loop exits immediately
+//   when the counter reaches zero.
+//
+//   The shared responsibility counter architecture is preserved: if multiple
+//   prespin slots happen to fire in the same TimePop ISR pass, the first
+//   starts the spin and subsequent ones piggyback via the counter.
 //
 // ============================================================================
 
@@ -578,12 +594,25 @@ static void pps_drumbeat_bootstrap(interrupt_subscriber_runtime_t& rt);
 static void pps_drumbeat_consume_edge(interrupt_subscriber_runtime_t& rt);
 
 // ============================================================================
-// Prespin registration callback — scheduled context
+// Prespin ISR callback — runs directly in TimePop ISR context (priority 16)
 // ============================================================================
+//
+// This callback fires from TimePop's QTimer1 CH2 ISR at NVIC priority 16.
+// It registers the prespin state and then spins directly, writing DWT
+// shadow values continuously.
+//
+// Priority 0 ISRs (PPS GPIO, QTimer3 OCXO compare) preempt this via NVIC
+// nesting, capture the shadow DWT, and decrement the responsibility counter.
+// The spin loop exits as soon as the counter reaches zero.
+//
+// If a spin loop is already running (from another prespin that fired in the
+// same TimePop ISR pass), this callback piggybacks on it via the shared
+// responsibility counter and returns immediately.
+//
 
-static void prespin_register_callback(timepop_ctx_t*,
-                                      timepop_diag_t*,
-                                      void* user_data) {
+static void prespin_isr_callback(timepop_ctx_t*,
+                                 timepop_diag_t*,
+                                 void* user_data) {
   auto* rt = static_cast<interrupt_subscriber_runtime_t*>(user_data);
   if (!rt || !rt->desc) {
     record_anomaly(g_anomaly_diag.prespin_null_runtime,
@@ -608,13 +637,12 @@ static void prespin_register_callback(timepop_ctx_t*,
 
   g_prespin_responsibility_count++;
 
-  timepop_arm_alap(interrupt_prespin_service, nullptr, "PRESPIN_SPIN");
-}
-
-void interrupt_prespin_service(timepop_ctx_t*, timepop_diag_t*, void*) {
-  if (g_prespin_responsibility_count <= 0) return;
+  // If another prespin is already spinning, piggyback on it.
+  // The shared responsibility counter ensures the active spin loop
+  // will continue until all subscribers' edges have fired.
   if (g_prespin_spinning) return;
 
+  // Start the shadow-write spin loop directly in ISR context.
   g_prespin_spinning = true;
 
   const uint32_t loop_start_dwt = ARM_DWT_CYCCNT;
@@ -659,8 +687,29 @@ void interrupt_prespin_service(timepop_ctx_t*, timepop_diag_t*, void*) {
 }
 
 // ============================================================================
+// Legacy prespin service — retained for API compatibility
+// ============================================================================
+//
+// interrupt_prespin_service is declared in process_interrupt.h as a public
+// function.  It is no longer used as the primary prespin path (v22 uses
+// prespin_isr_callback directly in ISR context), but is retained so that
+// the header contract is not broken.
+//
+
+void interrupt_prespin_service(timepop_ctx_t*, timepop_diag_t*, void*) {
+  // v22: prespin now runs directly from prespin_isr_callback in ISR context.
+  // This function is retained for header compatibility but is not called.
+}
+
+// ============================================================================
 // Unified scheduling helper
 // ============================================================================
+//
+// v22: uses timepop_arm_ns with isr_callback=true so the prespin spin loop
+// runs directly in TimePop ISR context (priority 16).  This eliminates the
+// two-hop indirection (scheduled callback → ALAP dispatch → loop() spin)
+// that caused OCXO1 prespin scheduling failures.
+//
 
 static void schedule_next_prespin_from_anchor(interrupt_subscriber_runtime_t& rt,
                                               uint64_t anchor_gnss_ns,
@@ -682,13 +731,16 @@ static void schedule_next_prespin_from_anchor(interrupt_subscriber_runtime_t& rt
   ps.last_schedule_delay_ns = offset_gnss_ns - PRESPIN_LEAD_NS;
   ps.last_prespin_margin_ns = (int64_t)(offset_gnss_ns - PRESPIN_LEAD_NS);
 
+  // Arm via timepop_arm_ns with ISR callback.
+  // target_dwt = 0: we do not want TimePop to DWT-spin to a predicted landing
+  // point.  Our callback runs its own shadow-write spin loop.
   timepop_handle_t h =
-      timepop_arm_from_anchor((int64_t)anchor_gnss_ns,
-                              (int64_t)(offset_gnss_ns - PRESPIN_LEAD_NS),
-                              false,
-                              prespin_register_callback,
-                              &rt,
-                              prespin_timer_name(rt.desc->kind));
+      timepop_arm_ns((int64_t)ps.prespin_target_gnss_ns,
+                     0,
+                     prespin_isr_callback,
+                     &rt,
+                     prespin_timer_name(rt.desc->kind),
+                     true);
 
   if (h == TIMEPOP_INVALID_HANDLE) {
     ps.anomaly_count++;
