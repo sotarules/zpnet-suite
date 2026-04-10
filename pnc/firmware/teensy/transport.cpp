@@ -41,8 +41,7 @@ static constexpr uint64_t TRANSPORT_RX_POLL_NS = 1000000ULL;  // 1 millisecond
 static constexpr uint64_t TRANSPORT_TX_POLL_NS = 1000000ULL;  // 1 millisecond
 
 static constexpr size_t TRANSPORT_BLOCK_SIZE = 64;
-static constexpr size_t RX_BUF_MAX           = 4096;
-static constexpr size_t LOCAL_BUF_MAX        = 6144;
+static constexpr size_t RX_BUF_MAX           = TRANSPORT_MAX_MESSAGE + 64;
 
 // TX job queue depth
 static constexpr size_t TX_JOB_MAX = 64;
@@ -103,7 +102,7 @@ static volatile uint32_t tx_bytes_sent     = 0;
 
 // Failure counters
 static volatile uint32_t tx_alloc_fail     = 0;  // malloc returned null
-static volatile uint32_t tx_budget_fail    = 0;  // budget cap exceeded
+static volatile uint32_t tx_budget_fail    = 0;  // budget cap exceeded / size exceeded
 static volatile uint32_t tx_queue_full     = 0;  // job ring full
 static volatile uint32_t tx_rr_drop_count  = 0;  // RR messages dropped (any reason)
 
@@ -256,14 +255,26 @@ static void transport_tx_pump(timepop_ctx_t*, timepop_diag_t*, void*) {
 void transport_send(uint8_t traffic, const Payload& payload) {
 
   // --------------------------------------------------------
-  // 1. Serialize to stack buffer
+  // 1. Serialize dynamically
   // --------------------------------------------------------
 
-  char local_buf[LOCAL_BUF_MAX];
-  size_t json_len = payload.write_json(local_buf, sizeof(local_buf));
-
-  if (json_len == 0)
+  String json = payload.to_json();
+  if (json.length() == 0) {
     return;
+  }
+
+  if (!payload.empty() && json == "{}") {
+    return;
+  }
+
+  const size_t json_len = json.length();
+  if (json_len > TRANSPORT_MAX_MESSAGE) {
+    tx_budget_fail++;
+    if (traffic == TRAFFIC_REQUEST_RESPONSE) {
+      tx_rr_drop_count++;
+    }
+    return;
+  }
 
   // --------------------------------------------------------
   // 2. Compute framed message size
@@ -320,7 +331,7 @@ void transport_send(uint8_t traffic, const Payload& payload) {
   // --------------------------------------------------------
 
   memcpy(data, header, header_len);
-  memcpy(data + header_len, local_buf, json_len);
+  memcpy(data + header_len, json.c_str(), json_len);
   memcpy(data + header_len + json_len, ETX_SEQ, ETX_LEN);
 
   // --------------------------------------------------------

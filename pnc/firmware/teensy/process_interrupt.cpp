@@ -59,6 +59,15 @@
 //   PRESPIN_LEAD_NS is temporarily widened to 100 us to help characterize
 //   OCXO1 without starving the spin loop.
 //
+// OCXO next-second prediction (v24):
+//
+//   For OCXO1 / OCXO2 only, process_interrupt now tracks the last measured
+//   lawful OCXO second in GNSS nanoseconds and uses that exact last-second
+//   experience as the prediction for the next OCXO second.
+//
+//   This prediction is used ONLY for prespin scheduling. It is not canonical
+//   timing truth and is not to be used for OCXO residual calculation.
+//
 // ============================================================================
 
 #include "process_interrupt.h"
@@ -239,6 +248,14 @@ struct prespin_state_t {
   uint64_t max_late_after_timeout_overage_ns = 0;
 };
 
+struct ocxo_prediction_state_t {
+  bool     valid = false;
+  uint64_t next_second_prediction_gnss_ns = 0;
+  uint64_t last_measured_second_gnss_ns = 0;
+  uint64_t previous_edge_gnss_ns = 0;
+  uint32_t update_count = 0;
+};
+
 struct interrupt_subscriber_runtime_t {
   const interrupt_subscriber_descriptor_t* desc = nullptr;
   interrupt_subscription_t sub {};
@@ -257,6 +274,7 @@ struct interrupt_subscriber_runtime_t {
   uint32_t event_count = 0;
 
   prespin_state_t prespin {};
+  ocxo_prediction_state_t ocxo_prediction {};
 };
 
 struct pps_drumbeat_state_t {
@@ -633,10 +651,42 @@ static void pps_drumbeat_schedule_from_edge(interrupt_subscriber_runtime_t& rt,
   schedule_next_prespin_from_anchor(rt, pps_edge_gnss_ns, NS_PER_SECOND_U64);
 }
 
+static void clear_prespin_schedule_state(interrupt_subscriber_runtime_t& rt) {
+  if (rt.prespin.handle != TIMEPOP_INVALID_HANDLE) {
+    timepop_cancel(rt.prespin.handle);
+    rt.prespin.handle = TIMEPOP_INVALID_HANDLE;
+  }
+
+  rt.prespin.event_target_gnss_ns = 0;
+  rt.prespin.prespin_target_gnss_ns = 0;
+  rt.prespin.last_schedule_now_gnss_ns = 0;
+  rt.prespin.last_schedule_delay_ns = 0;
+  rt.prespin.last_prespin_margin_ns = 0;
+  rt.prespin.last_schedule_event_target_gnss_ns = 0;
+  rt.prespin.last_schedule_prespin_target_gnss_ns = 0;
+}
+
 static void schedule_ocxo_from_edge(interrupt_subscriber_runtime_t& rt,
                                     uint64_t edge_gnss_ns) {
   if (edge_gnss_ns == 0) return;
-  schedule_next_prespin_from_anchor(rt, edge_gnss_ns, NS_PER_SECOND_U64);
+
+  ocxo_prediction_state_t& pred = rt.ocxo_prediction;
+
+  if (pred.previous_edge_gnss_ns != 0 && edge_gnss_ns > pred.previous_edge_gnss_ns) {
+    pred.last_measured_second_gnss_ns = edge_gnss_ns - pred.previous_edge_gnss_ns;
+    pred.next_second_prediction_gnss_ns = pred.last_measured_second_gnss_ns;
+    pred.valid = true;
+    pred.update_count++;
+  }
+
+  pred.previous_edge_gnss_ns = edge_gnss_ns;
+
+  if (!pred.valid || pred.next_second_prediction_gnss_ns == 0) {
+    clear_prespin_schedule_state(rt);
+    return;
+  }
+
+  schedule_next_prespin_from_anchor(rt, edge_gnss_ns, pred.next_second_prediction_gnss_ns);
 }
 
 static void pps_drumbeat_bootstrap(interrupt_subscriber_runtime_t&) {
@@ -742,12 +792,16 @@ static void handle_event(interrupt_subscriber_runtime_t& rt,
   ps.snap_timed_out = false;
   ps.snap_timeout_elapsed_cycles = 0;
 
+  const bool prespin_expected =
+      (rt.desc->kind == interrupt_subscriber_kind_t::PPS) ||
+      rt.ocxo_prediction.valid;
+
   uint32_t approach_cycles = 0;
   uint32_t shadow_to_isr_cycles = 0;
   if (ps.snap_start_dwt != 0) approach_cycles = dwt_isr_entry_raw - ps.snap_start_dwt;
   if (ps.snap_shadow_dwt != 0) {
     shadow_to_isr_cycles = dwt_isr_entry_raw - ps.snap_shadow_dwt;
-  } else {
+  } else if (prespin_expected) {
     ps.anomaly_count++;
     record_anomaly(g_anomaly_diag.no_shadow_dwt,
                    rt.desc->kind,
@@ -756,7 +810,7 @@ static void handle_event(interrupt_subscriber_runtime_t& rt,
                    ps.complete_count);
   }
 
-  if (!g_prespin_spinning && ps.snap_start_dwt == 0 && ps.snap_shadow_dwt == 0) {
+  if (prespin_expected && !g_prespin_spinning && ps.snap_start_dwt == 0 && ps.snap_shadow_dwt == 0) {
     ps.anomaly_count++;
     record_anomaly(g_anomaly_diag.no_prespin_active,
                    rt.desc->kind,
@@ -892,6 +946,8 @@ bool interrupt_start(interrupt_subscriber_kind_t kind) {
   rt->active = true;
   rt->start_count++;
   rt->prespin.active = false;
+  rt->ocxo_prediction = {};
+  clear_prespin_schedule_state(*rt);
 
   if (kind == interrupt_subscriber_kind_t::PPS) {
     debug_log("pps.start", "requested");
@@ -924,6 +980,8 @@ bool interrupt_stop(interrupt_subscriber_kind_t kind) {
     rt->prespin.handle = TIMEPOP_INVALID_HANDLE;
   }
   rt->prespin.active = false;
+  rt->ocxo_prediction = {};
+  clear_prespin_schedule_state(*rt);
 
   qtimer16_ocxo_runtime_t* clock = ocxo_clock_runtime_for(rt->desc->clock_kind);
   if (clock) {
@@ -1068,6 +1126,15 @@ static Payload cmd_report(const Payload&) {
   p.add("pps_next_index", g_pps_drumbeat.next_index);
   p.add("pps_generation", g_pps_drumbeat.generation);
 
+  p.add("ocxo1_next_second_prediction_valid", g_rt_ocxo1 ? g_rt_ocxo1->ocxo_prediction.valid : false);
+  p.add("ocxo1_next_second_prediction_gnss_ns", g_rt_ocxo1 ? g_rt_ocxo1->ocxo_prediction.next_second_prediction_gnss_ns : 0ULL);
+  p.add("ocxo1_last_measured_second_gnss_ns", g_rt_ocxo1 ? g_rt_ocxo1->ocxo_prediction.last_measured_second_gnss_ns : 0ULL);
+  p.add("ocxo1_prediction_update_count", g_rt_ocxo1 ? g_rt_ocxo1->ocxo_prediction.update_count : 0U);
+  p.add("ocxo2_next_second_prediction_valid", g_rt_ocxo2 ? g_rt_ocxo2->ocxo_prediction.valid : false);
+  p.add("ocxo2_next_second_prediction_gnss_ns", g_rt_ocxo2 ? g_rt_ocxo2->ocxo_prediction.next_second_prediction_gnss_ns : 0ULL);
+  p.add("ocxo2_last_measured_second_gnss_ns", g_rt_ocxo2 ? g_rt_ocxo2->ocxo_prediction.last_measured_second_gnss_ns : 0ULL);
+  p.add("ocxo2_prediction_update_count", g_rt_ocxo2 ? g_rt_ocxo2->ocxo_prediction.update_count : 0U);
+
   p.add("prespin_lead_ns", (uint64_t)PRESPIN_LEAD_NS);
   p.add("prespin_timeout_cycles", PRESPIN_TIMEOUT_CYCLES);
   p.add("prespin_responsibility_count", g_prespin_responsibility_count);
@@ -1127,6 +1194,12 @@ static Payload cmd_report(const Payload&) {
     s.add("max_late_after_timeout_overage_ns", rt.prespin.max_late_after_timeout_overage_ns);
     s.add("anomaly_count", rt.prespin.anomaly_count);
 
+    s.add("ocxo_prediction_valid", rt.ocxo_prediction.valid);
+    s.add("ocxo_next_second_prediction_gnss_ns", rt.ocxo_prediction.next_second_prediction_gnss_ns);
+    s.add("ocxo_last_measured_second_gnss_ns", rt.ocxo_prediction.last_measured_second_gnss_ns);
+    s.add("ocxo_prediction_previous_edge_gnss_ns", rt.ocxo_prediction.previous_edge_gnss_ns);
+    s.add("ocxo_prediction_update_count", rt.ocxo_prediction.update_count);
+
     s.add("last_schedule_now_gnss_ns", rt.prespin.last_schedule_now_gnss_ns);
     s.add("last_schedule_delay_ns", rt.prespin.last_schedule_delay_ns);
     s.add("last_prespin_margin_ns", rt.prespin.last_prespin_margin_ns);
@@ -1152,6 +1225,14 @@ static Payload cmd_report(const Payload&) {
     Payload c;
     c.add("name", clock.name ? clock.name : "");
     c.add("active", clock.active);
+
+    const interrupt_subscriber_runtime_t* rt = nullptr;
+    if (clock.kind == qtimer_clock_kind_t::OCXO1) rt = g_rt_ocxo1;
+    if (clock.kind == qtimer_clock_kind_t::OCXO2) rt = g_rt_ocxo2;
+    c.add("next_second_prediction_valid", rt ? rt->ocxo_prediction.valid : false);
+    c.add("next_second_prediction_gnss_ns", rt ? rt->ocxo_prediction.next_second_prediction_gnss_ns : 0ULL);
+    c.add("last_measured_second_gnss_ns", rt ? rt->ocxo_prediction.last_measured_second_gnss_ns : 0ULL);
+    c.add("prediction_update_count", rt ? rt->ocxo_prediction.update_count : 0U);
     c.add("initialized", clock.initialized);
     c.add("start_count", clock.start_count);
     c.add("stop_count", clock.stop_count);

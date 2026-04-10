@@ -1,5 +1,5 @@
 // ============================================================================
-// process_interrupt.h (QTimer version — v21)
+// process_interrupt.h (QTimer version — v24)
 // ============================================================================
 //
 // Shared interrupt authority + subscriber runtime.
@@ -18,6 +18,19 @@
 //   • process_interrupt owns the pre-spin shadow-write loop and scheduling.
 //   • TimePop owns QTimer1. process_interrupt owns QTimer3 CH2+CH3.
 //   • Diagnostics are always available to clients through the callback contract.
+//
+// OCXO next-second prediction:
+//
+//   process_interrupt maintains a per-OCXO prediction expressed in GNSS
+//   nanoseconds. The predictor is intentionally simple: last lawful measured
+//   OCXO second is used as the next-second prediction.
+//
+//   This prediction exists ONLY to place the OCXO prespin window. It is not
+//   canonical timing truth and must not be used for OCXO residual math.
+//
+//   Prespin for OCXO1 / OCXO2 is gated on prediction validity. Until a lawful
+//   measured OCXO second is available, OCXO events use only the fixed ISR
+//   overhead correction path with no prespin anomaly penalty.
 //
 // Corrected provider model:
 //

@@ -141,7 +141,9 @@ target_compile_definitions(zpnet_teensy_index PRIVATE
     TEENSYDUINO=160
     ARDUINO_TEENSY41
     __IMXRT1062__
-    F_CPU=600000000
+    F_CPU=1008000000
+    F_CPU_ACTUAL=1008000000
+    USB_SERIAL
 )
 
 # -------------------------------------------------------------

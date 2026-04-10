@@ -346,14 +346,25 @@ void Payload::add_fmt(const char* key, const char* fmt, ...) {
 void Payload::add_object(const char* key, const Payload& obj) {
     if (_count >= MAX_ENTRIES) return;
 
-    char local_buf[ARENA_MAX];
-    size_t json_len = obj.write_json(local_buf, sizeof(local_buf));
+    size_t buf_size = (obj._arena_used * 2) + (obj._count * 32) + 64;
+    if (buf_size < 256) buf_size = 256;
+    if (buf_size > ARENA_MAX) buf_size = ARENA_MAX;
+
+    char* json_buf = (char*)malloc(buf_size);
+    if (!json_buf) {
+        _add_entry(key, "{}", 2, 'o');
+        return;
+    }
+
+    size_t json_len = obj.write_json(json_buf, buf_size);
 
     if (json_len == 0) {
         _add_entry(key, "{}", 2, 'o');
     } else {
-        _add_entry(key, local_buf, json_len, 'o');
+        _add_entry(key, json_buf, json_len, 'o');
     }
+
+    free(json_buf);
 }
 
 void Payload::add_array(const char* key, const PayloadArray& arr) {
@@ -474,12 +485,24 @@ size_t Payload::write_json(char* buf, size_t buf_size) const {
 }
 
 String Payload::to_json() const {
-    char local_buf[4096];
-    size_t json_len = write_json(local_buf, sizeof(local_buf));
-    if (json_len == 0) {
+    size_t buf_size = (_arena_used * 2) + (_count * 32) + 64;
+    if (buf_size < 256) buf_size = 256;
+    if (buf_size > ARENA_MAX) buf_size = ARENA_MAX;
+
+    char* json_buf = (char*)malloc(buf_size);
+    if (!json_buf) {
         return String("{}");
     }
-    return String(local_buf);
+
+    size_t json_len = write_json(json_buf, buf_size);
+    if (json_len == 0) {
+        free(json_buf);
+        return String("{}");
+    }
+
+    String out(json_buf);
+    free(json_buf);
+    return out;
 }
 
 // ============================================================================

@@ -53,7 +53,7 @@
 // Transport limits (authoritative)
 // =============================================================
 
-static constexpr size_t TRANSPORT_MAX_MESSAGE = 10 * 1024;
+static constexpr size_t TRANSPORT_MAX_MESSAGE = 32 * 1024;
 
 
 // =============================================================

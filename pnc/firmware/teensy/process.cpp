@@ -29,7 +29,6 @@
 // ============================================================================
 
 static constexpr size_t MAX_PROCESSES = 30;
-static constexpr size_t RESPONSE_PREFLIGHT_JSON_MAX = 6144;
 
 // ============================================================================
 // Registry Entry
@@ -130,8 +129,20 @@ static void send_overflow_response(const Payload& request) {
 }
 
 static bool response_serializes(const Payload& response) {
-    char local_buf[RESPONSE_PREFLIGHT_JSON_MAX];
-    return response.write_json(local_buf, sizeof(local_buf)) > 0;
+    if (response.empty()) {
+        return true;
+    }
+
+    String json = response.to_json();
+    if (json.length() == 0) {
+        return false;
+    }
+
+    if (json == "{}") {
+        return false;
+    }
+
+    return json.length() <= TRANSPORT_MAX_MESSAGE;
 }
 
 static void send_response_or_overflow(const Payload& request, const Payload& response) {
