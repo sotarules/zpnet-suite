@@ -272,6 +272,8 @@ struct pps_residual_t {
   uint64_t n;
   double   mean;
   double   m2;
+  double   min_val;
+  double   max_val;
 };
 
 extern pps_residual_t residual_dwt;

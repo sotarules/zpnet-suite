@@ -46,6 +46,9 @@ uint64_t recover_ocxo2_ns = 0;
 
 static volatile bool zero_handshake_in_flight = false;
 
+// Most recently published TIMEBASE_FRAGMENT, retained for cmd_report.
+static Payload g_last_fragment;
+
 volatile bool     watchdog_anomaly_active          = false;
 volatile bool     watchdog_anomaly_publish_pending = false;
 volatile uint32_t watchdog_anomaly_sequence        = 0;
@@ -69,6 +72,8 @@ void residual_reset(pps_residual_t& r) {
   r.n = 0;
   r.mean = 0.0;
   r.m2 = 0.0;
+  r.min_val = 1e30;
+  r.max_val = -1e30;
 }
 
 void residual_update_sample(pps_residual_t& r, int64_t residual) {
@@ -79,6 +84,8 @@ void residual_update_sample(pps_residual_t& r, int64_t residual) {
   r.mean += d1 / (double)r.n;
   const double d2 = x - r.mean;
   r.m2 += d1 * d2;
+  if (x < r.min_val) r.min_val = x;
+  if (x > r.max_val) r.max_val = x;
 }
 
 double residual_stddev(const pps_residual_t& r) {
@@ -410,6 +417,8 @@ void clocks_beta_pps(void) {
   p.add("dwt_cycle_count_between_pps", g_dwt_cycle_count_between_pps);
   p.add("dwt_cycle_count_next_second_prediction", g_dwt_cycle_count_next_second_prediction);
   p.add("dwt_cycle_count_next_second_adjustment", g_dwt_cycle_count_next_second_adjustment);
+  p.add("dwt_model_pps_count", g_dwt_model_pps_count);
+  p.add("qtimer_at_pps", g_qtimer_at_pps);
 
   p.add("ocxo1_gnss_ns_at_edge", g_ocxo1_clock.gnss_ns_at_edge);
   p.add("ocxo1_gnss_ns_between_edges", g_ocxo1_measurement.gnss_ns_between_edges);
@@ -451,6 +460,90 @@ void clocks_beta_pps(void) {
   clocks_payload_add_interrupt_diag(p, "ocxo1_diag", g_ocxo1_interrupt_diag);
   clocks_payload_add_interrupt_diag(p, "ocxo2_diag", g_ocxo2_interrupt_diag);
 
+  // Campaign-cumulative tau and ppb for all clock domains.
+  //
+  // Tau is the dimensionless rate ratio of each clock relative to GNSS.
+  // A perfect clock has tau = 1.0 and ppb = 0.
+  //
+  // These are derived from the Welford mean of per-second residuals,
+  // which measures rate directly without initial-phase-offset contamination.
+  //
+  // DWT residual is in cycles: ppb = mean_cycles / DWT_EXPECTED * 1e9
+  // OCXO residual is in ns:   ppb = mean_ns  (since 1 ppb = 1 ns/s)
+
+  if (residual_dwt.n > 0) {
+    const double dwt_ppb_val = residual_dwt.mean / (double)DWT_EXPECTED_PER_PPS * 1e9;
+    const double dwt_tau_val = 1.0 + dwt_ppb_val / 1e9;
+    p.add("dwt_tau", dwt_tau_val, 12);
+    p.add("dwt_ppb", dwt_ppb_val, 3);
+  }
+
+  if (residual_ocxo1.n > 0) {
+    const double ocxo1_ppb_val = residual_ocxo1.mean;
+    const double ocxo1_tau_val = 1.0 + ocxo1_ppb_val / 1e9;
+    p.add("ocxo1_tau", ocxo1_tau_val, 12);
+    p.add("ocxo1_ppb", ocxo1_ppb_val, 3);
+  }
+
+  if (residual_ocxo2.n > 0) {
+    const double ocxo2_ppb_val = residual_ocxo2.mean;
+    const double ocxo2_tau_val = 1.0 + ocxo2_ppb_val / 1e9;
+    p.add("ocxo2_tau", ocxo2_tau_val, 12);
+    p.add("ocxo2_ppb", ocxo2_ppb_val, 3);
+  }
+
+  // ── Campaign-cumulative Welford statistics ──
+  //
+  // Three residual Welfords (per-second clock error):
+  //   dwt_welford_*    — DWT cycles residual (cycles above/below DWT_EXPECTED_PER_PPS)
+  //   ocxo1_welford_*  — OCXO1 second residual (ns, = ppb)
+  //   ocxo2_welford_*  — OCXO2 second residual (ns, = ppb)
+  //
+  // Two DAC Welfords (servo effort — the TEMPEST instrument):
+  //   ocxo1_dac_welford_*  — OCXO1 DAC fractional value
+  //   ocxo2_dac_welford_*  — OCXO2 DAC fractional value
+
+  // DWT residual Welford (cycles)
+  p.add("dwt_welford_n", residual_dwt.n);
+  p.add("dwt_welford_mean", residual_dwt.mean, 3);
+  p.add("dwt_welford_stddev", residual_stddev(residual_dwt), 3);
+  p.add("dwt_welford_stderr", residual_stderr(residual_dwt), 3);
+  p.add("dwt_welford_min", residual_dwt.min_val, 3);
+  p.add("dwt_welford_max", residual_dwt.max_val, 3);
+
+  // OCXO1 residual Welford (ns)
+  p.add("ocxo1_welford_n", residual_ocxo1.n);
+  p.add("ocxo1_welford_mean", residual_ocxo1.mean, 3);
+  p.add("ocxo1_welford_stddev", residual_stddev(residual_ocxo1), 3);
+  p.add("ocxo1_welford_stderr", residual_stderr(residual_ocxo1), 3);
+  p.add("ocxo1_welford_min", residual_ocxo1.min_val, 3);
+  p.add("ocxo1_welford_max", residual_ocxo1.max_val, 3);
+
+  // OCXO2 residual Welford (ns)
+  p.add("ocxo2_welford_n", residual_ocxo2.n);
+  p.add("ocxo2_welford_mean", residual_ocxo2.mean, 3);
+  p.add("ocxo2_welford_stddev", residual_stddev(residual_ocxo2), 3);
+  p.add("ocxo2_welford_stderr", residual_stderr(residual_ocxo2), 3);
+  p.add("ocxo2_welford_min", residual_ocxo2.min_val, 3);
+  p.add("ocxo2_welford_max", residual_ocxo2.max_val, 3);
+
+  // OCXO1 DAC Welford
+  p.add("ocxo1_dac_welford_n", dac_welford_ocxo1.n);
+  p.add("ocxo1_dac_welford_mean", dac_welford_ocxo1.mean, 6);
+  p.add("ocxo1_dac_welford_stddev", dac_welford_stddev(dac_welford_ocxo1), 6);
+  p.add("ocxo1_dac_welford_stderr", dac_welford_stderr(dac_welford_ocxo1), 6);
+  p.add("ocxo1_dac_welford_min", dac_welford_ocxo1.min_val, 6);
+  p.add("ocxo1_dac_welford_max", dac_welford_ocxo1.max_val, 6);
+
+  // OCXO2 DAC Welford
+  p.add("ocxo2_dac_welford_n", dac_welford_ocxo2.n);
+  p.add("ocxo2_dac_welford_mean", dac_welford_ocxo2.mean, 6);
+  p.add("ocxo2_dac_welford_stddev", dac_welford_stddev(dac_welford_ocxo2), 6);
+  p.add("ocxo2_dac_welford_stderr", dac_welford_stderr(dac_welford_ocxo2), 6);
+  p.add("ocxo2_dac_welford_min", dac_welford_ocxo2.min_val, 6);
+  p.add("ocxo2_dac_welford_max", dac_welford_ocxo2.max_val, 6);
+
+  g_last_fragment = p;
   publish("TIMEBASE_FRAGMENT", p);
 }
 
@@ -541,65 +634,19 @@ static Payload cmd_watchdog_test(const Payload&) {
 }
 
 static Payload cmd_report(const Payload&) {
-  Payload p;
+  // The CLOCKS report IS the most recent TIMEBASE_FRAGMENT,
+  // augmented with live process state for debugging.
+
+  Payload p = g_last_fragment.clone();
 
   p.add("campaign_state",
         campaign_state == clocks_campaign_state_t::STARTED ? "STARTED" : "STOPPED");
-  p.add("campaign", campaign_name);
-  p.add("campaign_seconds", campaign_seconds);
-
   p.add("request_start", request_start);
   p.add("request_stop", request_stop);
   p.add("request_recover", request_recover);
   p.add("request_zero", request_zero);
   p.add("zero_handshake_in_flight", zero_handshake_in_flight);
   p.add("interrupt_pps_zero_pending", interrupt_pps_zero_pending());
-
-  p.add("gnss_ns_count_at_pps", g_gnss_ns_count_at_pps);
-
-  p.add("dwt_cycle_count_at_pps", g_dwt_cycle_count_at_pps);
-  p.add("dwt_cycle_count_total", g_dwt_cycle_count_total);
-  p.add("dwt_cycle_count_between_pps", g_dwt_cycle_count_between_pps);
-  p.add("dwt_cycle_count_next_second_prediction", g_dwt_cycle_count_next_second_prediction);
-  p.add("dwt_cycle_count_next_second_adjustment", g_dwt_cycle_count_next_second_adjustment);
-  p.add("dwt_model_pps_count", g_dwt_model_pps_count);
-
-  p.add("qtimer_at_pps", g_qtimer_at_pps);
-
-  p.add("ocxo1_gnss_ns_at_edge", g_ocxo1_clock.gnss_ns_at_edge);
-  p.add("ocxo1_gnss_ns_between_edges", g_ocxo1_measurement.gnss_ns_between_edges);
-  p.add("ocxo1_dwt_at_edge", g_ocxo1_measurement.dwt_at_edge);
-  p.add("ocxo1_dwt_cycles_between_edges", g_ocxo1_measurement.dwt_cycles_between_edges);
-  p.add("ocxo1_ns_count_at_edge", g_ocxo1_clock.ns_count_at_edge);
-  p.add("ocxo1_ns_count_at_pps", g_ocxo1_clock.ns_count_at_pps);
-
-  p.add("ocxo2_gnss_ns_at_edge", g_ocxo2_clock.gnss_ns_at_edge);
-  p.add("ocxo2_gnss_ns_between_edges", g_ocxo2_measurement.gnss_ns_between_edges);
-  p.add("ocxo2_dwt_at_edge", g_ocxo2_measurement.dwt_at_edge);
-  p.add("ocxo2_dwt_cycles_between_edges", g_ocxo2_measurement.dwt_cycles_between_edges);
-  p.add("ocxo2_ns_count_at_edge", g_ocxo2_clock.ns_count_at_edge);
-  p.add("ocxo2_ns_count_at_pps", g_ocxo2_clock.ns_count_at_pps);
-
-  p.add("ocxo1_second_residual_ns", g_ocxo1_measurement.second_residual_ns);
-  p.add("ocxo2_second_residual_ns", g_ocxo2_measurement.second_residual_ns);
-
-  // Smart-zero phase offset (cumulative, unwrapped)
-  p.add("ocxo1_phase_offset_ns", g_ocxo1_clock.phase_offset_ns);
-  p.add("ocxo1_zero_established", g_ocxo1_clock.zero_established);
-  p.add("ocxo2_phase_offset_ns", g_ocxo2_clock.phase_offset_ns);
-  p.add("ocxo2_zero_established", g_ocxo2_clock.zero_established);
-
-  // Per-window viability
-  p.add("ocxo1_window_checks", g_ocxo1_clock.window_checks);
-  p.add("ocxo1_window_mismatches", g_ocxo1_clock.window_mismatches);
-  p.add("ocxo1_window_error_ns", g_ocxo1_clock.window_error_ns);
-  p.add("ocxo2_window_checks", g_ocxo2_clock.window_checks);
-  p.add("ocxo2_window_mismatches", g_ocxo2_clock.window_mismatches);
-  p.add("ocxo2_window_error_ns", g_ocxo2_clock.window_error_ns);
-
-  p.add("ocxo1_dac", ocxo1_dac.dac_fractional);
-  p.add("ocxo2_dac", ocxo2_dac.dac_fractional);
-  p.add("calibrate_ocxo", servo_mode_str(calibrate_ocxo_mode));
 
   return p;
 }

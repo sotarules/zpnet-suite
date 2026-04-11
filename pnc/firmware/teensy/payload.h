@@ -167,6 +167,7 @@ public:
     void add(const char* key, bool value);
     void add(const char* key, float value);
     void add(const char* key, double value);
+    void add(const char* key, double value, int precision);
 
     template <typename T>
     typename std::enable_if<

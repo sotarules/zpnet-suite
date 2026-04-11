@@ -328,6 +328,14 @@ void Payload::add(const char* key, double value) {
     _add_entry(key, tmp, (size_t)n, 'p');
 }
 
+void Payload::add(const char* key, double value, int precision) {
+    char fmt[16];
+    snprintf(fmt, sizeof(fmt), "%%.%df", precision);
+    char tmp[48];
+    int n = snprintf(tmp, sizeof(tmp), fmt, value);
+    _add_entry(key, tmp, (size_t)n, 'p');
+}
+
 void Payload::add_fmt(const char* key, const char* fmt, ...) {
     if (_count >= MAX_ENTRIES) return;
 
