@@ -159,7 +159,10 @@ static void ocxo_servo_mean(ocxo_dac_state_t& dac, pps_residual_t& per_second_re
 
   if (fabs(mean_residual_ns) < 0.01) return;
 
-  double step = mean_residual_ns * 0.01;
+  // AOCJY1 frequency pull slope is positive: higher control voltage
+  // produces higher frequency. Therefore positive residual (clock fast)
+  // must LOWER the DAC, and negative residual (clock slow) must RAISE it.
+  double step = -mean_residual_ns * 0.01;
   if (step >  (double)SERVO_MAX_STEP) step =  (double)SERVO_MAX_STEP;
   if (step < -(double)SERVO_MAX_STEP) step = -(double)SERVO_MAX_STEP;
 
@@ -208,7 +211,10 @@ static void ocxo_servo_now(ocxo_dac_state_t& dac, int64_t per_second_residual_ns
 
   if (fabs(residual_ns) < NOW_MIN_RESIDUAL_NS) return;
 
-  double step = residual_ns / NOW_NS_PER_DAC_LSB;
+  // AOCJY1 frequency pull slope is positive: higher control voltage
+  // produces higher frequency. Therefore positive residual (clock fast)
+  // must LOWER the DAC, and negative residual (clock slow) must RAISE it.
+  double step = -residual_ns / NOW_NS_PER_DAC_LSB;
   if (step >  (double)SERVO_MAX_STEP) step =  (double)SERVO_MAX_STEP;
   if (step < -(double)SERVO_MAX_STEP) step = -(double)SERVO_MAX_STEP;
 
