@@ -90,10 +90,8 @@
 static constexpr uint32_t MAX_INTERRUPT_SUBSCRIBERS = 8;
 
 static constexpr uint64_t NS_PER_SECOND_U64      = 1000000000ULL;
-static constexpr uint64_t PRESPIN_LEAD_NS        = 100000ULL;
-static constexpr uint32_t PRESPIN_TIMEOUT_CYCLES = 180000;
-
-static constexpr uint32_t PPS_ISR_FIXED_OVERHEAD_CYCLES = 48;
+static constexpr uint64_t PRESPIN_LEAD_NS        = 10000ULL;
+static constexpr uint32_t PRESPIN_TIMEOUT_CYCLES = 18000;
 
 static inline uint64_t dwt_cycles_to_ns_runtime(uint32_t cycles) {
   const uint32_t f = F_CPU_ACTUAL ? F_CPU_ACTUAL : 1008000000U;
@@ -334,7 +332,7 @@ static const interrupt_subscriber_descriptor_t DESCRIPTORS[] = {
     "PPS",
     interrupt_provider_kind_t::GPIO6789,
     interrupt_lane_t::GPIO_EDGE,
-    PPS_ISR_FIXED_OVERHEAD_CYCLES,
+    PPS_ISR_FIXED_OVERHEAD,
     NS_PER_SECOND_U64,
     true,
     true,

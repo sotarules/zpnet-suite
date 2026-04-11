@@ -1,22 +1,26 @@
 """
 ZPNet Metrics Readout Blocks — Dense Clocks Panel
 
-Adjusted rules:
-  • TAU = cumulative total for the campaign
-  • PPB = cumulative total for the campaign
-  • RES = latest single-second residual
-  • DWT TAU = total DWT ns / total nominal GNSS ns
-    where nominal DWT second is 1,008,000,000 cycles/sec
+Data source:
+  The Pi CLOCKS report IS the most recent TIMEBASE record plus
+  campaign_state.  All clock data lives in the fragment sub-dict
+  (Teensy-authoritative).  Pi-side synthetic clocks live in
+  extra_clocks.
 
-Current report contract used by this panel:
-  • PI report.<clock>.ppb is authoritative cumulative PPB for campaign clocks
-  • PI report.<clock>.tau is ignored for clocks known to be wrong upstream
-  • TAU is derived from cumulative PPB as: 1.0 + ppb / 1e9
+Column layout (CLK rows):
+  NAME   VALUE (ns or cycles)   TAU   PPB   RAW   RES   MEAN   SD   N   BASE   NOW   DELTA
+
+Column layout (DAC rows):
+  NAME   DAC_VALUE VOLTAGE   (blanks)   MEAN   SD   N   BASE   NOW   DELTA
+
+Column layout (INT rows):
+  NAME   APPROACH   SH→ISR   CORR   DWT_EDGE   GNSS_NS_EDGE   COUNTER   ARM   OK   TO   AN
 """
 
 from zpnet.processes.processes import send_command
 
 DWT_EXPECTED_PER_PPS = 1_008_000_000
+VREF = 3.002
 
 
 # ---------------------------------------------------------------------
@@ -25,10 +29,6 @@ DWT_EXPECTED_PER_PPS = 1_008_000_000
 
 def _get_system_snapshot() -> dict:
     return send_command(machine="PI", subsystem="SYSTEM", command="REPORT")["payload"]
-
-
-def _get_teensy_clocks_report() -> dict:
-    return send_command(machine="TEENSY", subsystem="CLOCKS", command="REPORT")["payload"]
 
 
 def _get_pi_clocks_report() -> dict:
@@ -86,6 +86,15 @@ def _frag(r: dict, key: str, default=None):
     return val if val is not None else default
 
 
+def _extra(r: dict, key: str, default=None):
+    ec = r.get("extra_clocks")
+    if isinstance(ec, dict):
+        val = ec.get(key)
+        if val is not None:
+            return val
+    return default
+
+
 def _to_float(v):
     if v is None:
         return None
@@ -102,18 +111,6 @@ def _to_int(v):
         return int(v)
     except Exception:
         return None
-
-
-def _tau_to_ppb(tau):
-    if tau is None:
-        return None
-    return (float(tau) - 1.0) * 1_000_000_000.0
-
-
-def _ppb_to_tau(ppb):
-    if ppb is None:
-        return None
-    return 1.0 + (float(ppb) / 1_000_000_000.0)
 
 
 # ---------------------------------------------------------------------
@@ -156,32 +153,18 @@ def status_header() -> str:
 
 
 # ---------------------------------------------------------------------
-# Cumulative tau helpers
+# Baseline comparison helper
 # ---------------------------------------------------------------------
 
-def _cum_tau_gnss():
-    return 1.0
-
-
-def _cum_tau_from_report_block(block: dict):
-    return _to_float(block.get("tau"))
-
-
-def _cum_tau_dwt(r: dict):
-    total_cycles = _to_int(r.get("teensy_dwt_cycles")) or _to_int(_frag(r, "dwt_cycle_count_total"))
-    gnss_ns = _to_int(r.get("teensy_gnss_ns")) or _to_int(_frag(r, "gnss_ns"))
-    if total_cycles is None or gnss_ns in (None, 0):
-        return None
-    dwt_ns_total = total_cycles * 1_000_000_000.0 / DWT_EXPECTED_PER_PPS
-    return dwt_ns_total / float(gnss_ns)
-
-
-def _cum_tau_ocxo(r: dict, key: str):
-    ocxo_ns = _to_int(r.get(f"teensy_{key}_ns")) or _to_int(_frag(r, f"{key}_ns_count_at_pps"))
-    gnss_ns = _to_int(r.get("teensy_gnss_ns")) or _to_int(_frag(r, "gnss_ns"))
-    if ocxo_ns is None or gnss_ns in (None, 0):
-        return None
-    return float(ocxo_ns) / float(gnss_ns)
+def _baseline_comp(base_val, now_val):
+    if base_val is not None and now_val is not None:
+        delta = float(now_val) - float(base_val)
+        return (
+            f"{_fmt(base_val, '>10.3f', 10)}"
+            f"{_fmt(now_val, '>10.3f', 10)}"
+            f"{_fmt(delta, '>+10.3f', 10)}"
+        )
+    return f"{'---':>10}{'---':>10}{'---':>10}"
 
 
 # ---------------------------------------------------------------------
@@ -206,12 +189,7 @@ def clocks_combined_readout() -> list[str]:
     elapsed = r.get("campaign_elapsed", "00:00:00")
     n = r.get("pps_count", 0)
 
-    try:
-        t = _get_teensy_clocks_report()
-    except Exception:
-        t = {}
-
-    cal = _frag(r, "calibrate_ocxo", t.get("calibrate_ocxo", "OFF"))
+    cal = _frag(r, "calibrate_ocxo", "OFF")
 
     baseline = _get_clocks_baseline()
     baseline_ppb = baseline.get("baseline_ppb", {}) if baseline else {}
@@ -228,217 +206,224 @@ def clocks_combined_readout() -> list[str]:
     )
     lines.append("")
 
+    # ── Column widths ──
+    W_NAME  = 6
+    W_VALUE = 20
+    W_TAU   = 18
+    W_PPB   = 10
+    W_RAW   = 14
+    W_RES   = 8
+    W_MEAN  = 10
+    W_SD    = 8
+    W_N     = 6
+    W_BASE  = 10
+    W_NOW   = 10
+    W_DELTA = 10
+
+    # ── CLK header ──
     lines.append(
-        f"{'CLK':<6}"
-        f"{'TAU':>18}"
-        f"{'PPB':>10}"
-        f"{'RAW':>14}"
-        f"{'RES':>8}"
-        f"{'MEAN':>10}"
-        f"{'SD':>8}"
-        f"{'N':>6}"
+        f"{'CLK':<{W_NAME}}"
+        f"{'VALUE':>{W_VALUE}}"
+        f"{'TAU':>{W_TAU}}"
+        f"{'PPB':>{W_PPB}}"
+        f"{'RAW':>{W_RAW}}"
+        f"{'RES':>{W_RES}}"
+        f"{'MEAN':>{W_MEAN}}"
+        f"{'SD':>{W_SD}}"
+        f"{'N':>{W_N}}"
         f"  "
-        f"{'BASE':>10}"
-        f"{'NOW':>10}"
-        f"{'DELTA':>10}"
-        f"   EXTRA"
+        f"{'BASE':>{W_BASE}}"
+        f"{'NOW':>{W_NOW}}"
+        f"{'DELTA':>{W_DELTA}}"
     )
 
-    # GNSS
-    gnss_blk = r.get("gnss", {})
-    gnss_tau = _cum_tau_gnss()
-    gnss_ppb = _tau_to_ppb(gnss_tau)
-    gnss_res = gnss_blk.get("residual")
-    gnss_mean = None
-    gnss_sd = None
-    gnss_n = None
-    gnss_base = baseline_ppb.get("gnss")
-    gnss_now = gnss_ppb
-    if gnss_base is not None and gnss_now is not None:
-        gnss_delta = gnss_now - gnss_base
-        gnss_comp = (
-            f"{_fmt(gnss_base, '>10.3f', 10)}"
-            f"{_fmt(gnss_now, '>10.3f', 10)}"
-            f"{_fmt(gnss_delta, '>+10.3f', 10)}"
-        )
-    else:
-        gnss_comp = f"{'---':>10}{'---':>10}{'---':>10}"
+    # ── GNSS ──
+    gnss_ns = _to_int(_frag(r, "gnss_ns"))
+    gnss_tau = 1.0
+    gnss_ppb = 0.0
     lines.append(
-        f"{'GNSS':<6}"
-        f"{_fmt(gnss_tau, '>18.12f', 18)}"
-        f"{_fmt(gnss_ppb, '>10.3f', 10)}"
-        f"{'---':>14}"
-        f"{_fmt(gnss_res, '>8d', 8)}"
-        f"{_fmt(gnss_mean, '>10.3f', 10)}"
-        f"{_fmt(gnss_sd, '>8.3f', 8)}"
-        f"{_fmt(gnss_n, '>6d', 6)}"
-        f"  {gnss_comp}"
-        f"   stream={'OK' if gnss_blk.get('stream_valid', True) else 'BAD'}"
+        f"{'GNSS':<{W_NAME}}"
+        f"{_comma_int(gnss_ns, W_VALUE)}"
+        f"{_fmt(gnss_tau, f'>{W_TAU}.12f', W_TAU)}"
+        f"{_fmt(gnss_ppb, f'>{W_PPB}.3f', W_PPB)}"
+        f"{'---':>{W_RAW}}"
+        f"{'---':>{W_RES}}"
+        f"{'---':>{W_MEAN}}"
+        f"{'---':>{W_SD}}"
+        f"{'---':>{W_N}}"
+        f"  {_baseline_comp(baseline_ppb.get('gnss'), gnss_ppb)}"
     )
 
-    # GNSS_RAW
-    gnss_raw_blk = r.get("gnss_raw", {})
-    gnss_raw_ppb = _to_float(gnss_raw_blk.get('ppb'))
-    gnss_raw_tau = _ppb_to_tau(gnss_raw_ppb) if gnss_raw_ppb is not None else _cum_tau_from_report_block(gnss_raw_blk)
-    gnss_raw_res = gnss_raw_blk.get("pred_residual")
-    gnss_raw_mean = gnss_raw_blk.get("pred_mean")
-    gnss_raw_sd = gnss_raw_blk.get("pred_stddev")
-    gnss_raw_n = gnss_raw_blk.get("pred_n")
-    gnss_raw_base = baseline_ppb.get("gnss_raw")
-    gnss_raw_now = gnss_raw_ppb
-    if gnss_raw_base is not None and gnss_raw_now is not None:
-        gnss_raw_delta = gnss_raw_now - gnss_raw_base
-        gnss_raw_comp = (
-            f"{_fmt(gnss_raw_base, '>10.3f', 10)}"
-            f"{_fmt(gnss_raw_now, '>10.3f', 10)}"
-            f"{_fmt(gnss_raw_delta, '>+10.3f', 10)}"
-        )
-    else:
-        gnss_raw_comp = f"{'---':>10}{'---':>10}{'---':>10}"
+    # ── GNSS_RAW ──
+    gnss_raw_ns = _to_int(_extra(r, "gnss_raw_ns"))
+    gnss_raw_tau = _to_float(_extra(r, "gnss_raw_tau"))
+    gnss_raw_ppb = _to_float(_extra(r, "gnss_raw_ppb"))
+    gnss_raw_res = _to_float(_extra(r, "gnss_raw_drift_ppb"))
+    gnss_raw_mean = _to_float(_extra(r, "gnss_raw_welford_mean"))
+    gnss_raw_sd = _to_float(_extra(r, "gnss_raw_welford_stddev"))
+    gnss_raw_n = _to_int(_extra(r, "gnss_raw_welford_n"))
     lines.append(
-        f"{'GN_RAW':<6}"
-        f"{_fmt(gnss_raw_tau, '>18.12f', 18)}"
-        f"{_fmt(gnss_raw_ppb, '>10.3f', 10)}"
-        f"{'---':>14}"
-        f"{_fmt(gnss_raw_res, '>8.1f', 8)}"
-        f"{_fmt(gnss_raw_mean, '>10.3f', 10)}"
-        f"{_fmt(gnss_raw_sd, '>8.3f', 8)}"
-        f"{_fmt(gnss_raw_n, '>6d', 6)}"
-        f"  {gnss_raw_comp}"
+        f"{'GN_RAW':<{W_NAME}}"
+        f"{_comma_int(gnss_raw_ns, W_VALUE)}"
+        f"{_fmt(gnss_raw_tau, f'>{W_TAU}.12f', W_TAU)}"
+        f"{_fmt(gnss_raw_ppb, f'>{W_PPB}.3f', W_PPB)}"
+        f"{'---':>{W_RAW}}"
+        f"{_fmt(gnss_raw_res, f'>{W_RES}.1f', W_RES)}"
+        f"{_fmt(gnss_raw_mean, f'>{W_MEAN}.3f', W_MEAN)}"
+        f"{_fmt(gnss_raw_sd, f'>{W_SD}.3f', W_SD)}"
+        f"{_fmt(gnss_raw_n, f'>{W_N}d', W_N)}"
+        f"  {_baseline_comp(baseline_ppb.get('gnss_raw'), gnss_raw_ppb)}"
     )
 
-    # DWT
-    dwt_blk = r.get('dwt', {})
-    dwt_ppb = _to_float(dwt_blk.get('ppb'))
-    dwt_tau = _ppb_to_tau(dwt_ppb) if dwt_ppb is not None else _cum_tau_dwt(r)
+    # ── DWT ──
+    dwt_total = _to_int(_frag(r, "dwt_cycle_count_total"))
+    dwt_tau = _to_float(_frag(r, "dwt_tau"))
+    dwt_ppb = _to_float(_frag(r, "dwt_ppb"))
     dwt_raw = _to_int(_frag(r, "dwt_cycle_count_between_pps"))
     dwt_res = dwt_raw - DWT_EXPECTED_PER_PPS if dwt_raw is not None else None
-    dwt_mean = _to_float(_frag(r, "dwt_residual_mean"))
-    dwt_sd = _to_float(_frag(r, "dwt_residual_stddev"))
-    dwt_n = _to_int(_frag(r, "dwt_residual_n"))
-    dwt_base = baseline_ppb.get("dwt")
-    dwt_now = dwt_ppb
-    if dwt_base is not None and dwt_now is not None:
-        dwt_delta = dwt_now - dwt_base
-        dwt_comp = (
-            f"{_fmt(dwt_base, '>10.3f', 10)}"
-            f"{_fmt(dwt_now, '>10.3f', 10)}"
-            f"{_fmt(dwt_delta, '>+10.3f', 10)}"
-        )
-    else:
-        dwt_comp = f"{'---':>10}{'---':>10}{'---':>10}"
+    dwt_mean = _to_float(_frag(r, "dwt_welford_mean"))
+    dwt_sd = _to_float(_frag(r, "dwt_welford_stddev"))
+    dwt_n = _to_int(_frag(r, "dwt_welford_n"))
     lines.append(
-        f"{'DWT':<6}"
-        f"{_fmt(dwt_tau, '>18.12f', 18)}"
-        f"{_fmt(dwt_ppb, '>10.3f', 10)}"
-        f"{_comma_int(dwt_raw, 14)}"
-        f"{_sign_int(dwt_res, 8)}"
-        f"{_fmt(dwt_mean, '>10.3f', 10)}"
-        f"{_fmt(dwt_sd, '>8.3f', 8)}"
-        f"{_fmt(dwt_n, '>6d', 6)}"
-        f"  {dwt_comp}"
+        f"{'DWT':<{W_NAME}}"
+        f"{_comma_int(dwt_total, W_VALUE)}"
+        f"{_fmt(dwt_tau, f'>{W_TAU}.12f', W_TAU)}"
+        f"{_fmt(dwt_ppb, f'>{W_PPB}.3f', W_PPB)}"
+        f"{_comma_int(dwt_raw, W_RAW)}"
+        f"{_sign_int(dwt_res, W_RES)}"
+        f"{_fmt(dwt_mean, f'>{W_MEAN}.3f', W_MEAN)}"
+        f"{_fmt(dwt_sd, f'>{W_SD}.3f', W_SD)}"
+        f"{_fmt(dwt_n, f'>{W_N}d', W_N)}"
+        f"  {_baseline_comp(baseline_ppb.get('dwt'), dwt_ppb)}"
     )
 
-    # OCXO rows
+    # ── OCXO1, OCXO2 ──
     for name, key in [("OCXO1", "ocxo1"), ("OCXO2", "ocxo2")]:
-        blk = r.get(key, {})
-        ppb = _to_float(blk.get('ppb'))
-        tau = _ppb_to_tau(ppb) if ppb is not None else _cum_tau_ocxo(r, key)
-        raw = blk.get("dwt_cycles_between_edges", _frag(r, f"{key}_dwt_cycles_between_edges"))
-        res = blk.get("second_residual_ns", _frag(r, f"{key}_second_residual_ns"))
-        mean_frag = _frag(r, f"{key}_residual_mean")
-        sd_frag = _frag(r, f"{key}_residual_stddev")
-        n_frag = _frag(r, f"{key}_residual_n")
-        mean = float(mean_frag) if mean_frag is not None else blk.get("pred_mean")
-        sd = float(sd_frag) if sd_frag is not None else blk.get("pred_stddev")
-        pred_n = int(n_frag) if n_frag is not None else blk.get("pred_n")
-        base_ppb = baseline_ppb.get(key)
-        now_ppb = ppb
-        if base_ppb is not None and now_ppb is not None:
-            delta = now_ppb - base_ppb
-            comp = (
-                f"{_fmt(base_ppb, '>10.3f', 10)}"
-                f"{_fmt(now_ppb, '>10.3f', 10)}"
-                f"{_fmt(delta, '>+10.3f', 10)}"
-            )
-        else:
-            comp = f"{'---':>10}{'---':>10}{'---':>10}"
-        dac_now = blk.get("dac", _frag(r, f"{key}_dac"))
-        if dac_now is not None:
-            dac_now_f = float(dac_now)
-            dac_volts = dac_now_f * 3.002 / 65535.0
-            extra = f"   DAC={dac_now_f:>9.3f} {dac_volts:.5f}V"
-        else:
-            extra = ""
+        ocxo_ns = _to_int(_frag(r, f"{key}_ns"))
+        tau = _to_float(_frag(r, f"{key}_tau"))
+        ppb = _to_float(_frag(r, f"{key}_ppb"))
+        raw = _to_int(_frag(r, f"{key}_gnss_ns_between_edges"))
+        res = _to_int(_frag(r, f"{key}_second_residual_ns"))
+        mean = _to_float(_frag(r, f"{key}_welford_mean"))
+        sd = _to_float(_frag(r, f"{key}_welford_stddev"))
+        wn = _to_int(_frag(r, f"{key}_welford_n"))
         lines.append(
-            f"{name:<6}"
-            f"{_fmt(tau, '>18.12f', 18)}"
-            f"{_fmt(ppb, '>10.3f', 10)}"
-            f"{_comma_int(raw, 14)}"
-            f"{_sign_int(res, 8)}"
-            f"{_fmt(mean, '>10.3f', 10)}"
-            f"{_fmt(sd, '>8.3f', 8)}"
-            f"{_fmt(pred_n, '>6d', 6)}"
-            f"  {comp}{extra}"
+            f"{name:<{W_NAME}}"
+            f"{_comma_int(ocxo_ns, W_VALUE)}"
+            f"{_fmt(tau, f'>{W_TAU}.12f', W_TAU)}"
+            f"{_fmt(ppb, f'>{W_PPB}.3f', W_PPB)}"
+            f"{_comma_int(raw, W_RAW)}"
+            f"{_sign_int(res, W_RES)}"
+            f"{_fmt(mean, f'>{W_MEAN}.3f', W_MEAN)}"
+            f"{_fmt(sd, f'>{W_SD}.3f', W_SD)}"
+            f"{_fmt(wn, f'>{W_N}d', W_N)}"
+            f"  {_baseline_comp(baseline_ppb.get(key), ppb)}"
         )
 
-    # DAC Welford
+    # ── DAC Welford ──
     baseline_dac_mean = baseline.get("baseline_dac_mean", {}) if baseline else {}
     lines.append("")
     lines.append(
-        f"{'DAC':<6}"
-        f"{'':>18}"
-        f"{'':>10}"
-        f"{'':>14}"
-        f"{'':>8}"
-        f"{'MEAN':>10}"
-        f"{'SD':>8}"
-        f"{'N':>6}"
+        f"{'DAC':<{W_NAME}}"
+        f"{'':>{W_VALUE}}"
+        f"{'':>{W_TAU}}"
+        f"{'':>{W_PPB}}"
+        f"{'':>{W_RAW}}"
+        f"{'':>{W_RES}}"
+        f"{'MEAN':>{W_MEAN}}"
+        f"{'SD':>{W_SD}}"
+        f"{'N':>{W_N}}"
         f"  "
-        f"{'BASE':>10}"
-        f"{'NOW':>10}"
-        f"{'DELTA':>10}"
+        f"{'BASE':>{W_BASE}}"
+        f"{'NOW':>{W_NOW}}"
+        f"{'DELTA':>{W_DELTA}}"
     )
     for name, key in [("OCXO1", "ocxo1"), ("OCXO2", "ocxo2")]:
-        blk = r.get(key, {})
-        dac_mean_frag = _frag(r, f"dac_{key}_mean")
-        dac_sd_frag = _frag(r, f"dac_{key}_stddev")
-        dac_n_frag = _frag(r, f"dac_{key}_n")
-        dac_mean = float(dac_mean_frag) if dac_mean_frag is not None else blk.get("dac_mean")
-        dac_sd = float(dac_sd_frag) if dac_sd_frag is not None else blk.get("dac_stddev")
-        dac_n = int(dac_n_frag) if dac_n_frag is not None else blk.get("dac_n")
-        current_dac = dac_mean if dac_mean is not None else blk.get("dac", _frag(r, f"{key}_dac"))
-        base_dac = baseline_dac_mean.get(key)
-        if base_dac is not None and current_dac is not None:
-            dac_delta = float(current_dac) - float(base_dac)
-            dac_comp = (
-                f"{_fmt(base_dac, '>10.3f', 10)}"
-                f"{_fmt(current_dac, '>10.3f', 10)}"
-                f"{_fmt(dac_delta, '>+10.3f', 10)}"
-            )
+        dac_now = _to_float(_frag(r, f"{key}_dac"))
+        dac_volts = (dac_now * VREF / 65535.0) if dac_now is not None else None
+        if dac_now is not None:
+            dac_label = f"{dac_now:>.3f} {dac_volts:.5f}V"
         else:
-            dac_comp = f"{'---':>10}{'---':>10}{'---':>10}"
+            dac_label = "---"
+        dac_mean = _to_float(_frag(r, f"{key}_dac_welford_mean"))
+        dac_sd = _to_float(_frag(r, f"{key}_dac_welford_stddev"))
+        dac_n = _to_int(_frag(r, f"{key}_dac_welford_n"))
+        base_dac = baseline_dac_mean.get(key)
+        now_dac = dac_mean if dac_mean is not None else dac_now
         lines.append(
-            f"{name:<6}"
-            f"{'':>18}"
-            f"{'':>10}"
-            f"{'':>14}"
-            f"{'':>8}"
-            f"{_fmt(dac_mean, '>10.3f', 10)}"
-            f"{_fmt(dac_sd, '>8.3f', 8)}"
-            f"{_fmt(dac_n, '>6d', 6)}"
-            f"  {dac_comp}"
+            f"{name:<{W_NAME}}"
+            f"{dac_label:>{W_VALUE}}"
+            f"{'':>{W_TAU}}"
+            f"{'':>{W_PPB}}"
+            f"{'':>{W_RAW}}"
+            f"{'':>{W_RES}}"
+            f"{_fmt(dac_mean, f'>{W_MEAN}.3f', W_MEAN)}"
+            f"{_fmt(dac_sd, f'>{W_SD}.3f', W_SD)}"
+            f"{_fmt(dac_n, f'>{W_N}d', W_N)}"
+            f"  {_baseline_comp(base_dac, now_dac)}"
         )
 
+    # ── Interrupt diagnostics ──
+    #
+    # One row per interrupt subscriber (PPS, OCXO1, OCXO2) showing the
+    # TDC pipeline: approach → shadow → ISR entry → correction → edge.
+    #
+    lines.append("")
+    lines.append(
+        f"{'INT':<6}"
+        f"{'APPROACH':>10}"
+        f"{'SH→ISR':>8}"
+        f"{'CORR':>6}"
+        f"{'DWT_EDGE':>14}"
+        f"{'GNSS_NS_EDGE':>22}"
+        f"{'COUNTER':>14}"
+        f"{'ARM':>8}"
+        f"{'OK':>8}"
+        f"{'TO':>6}"
+        f"{'AN':>6}"
+    )
+    int_clocks = [
+        ("PPS",   "pps_diag"),
+        ("OCXO1", "ocxo1_diag"),
+        ("OCXO2", "ocxo2_diag"),
+    ]
+    for name, prefix in int_clocks:
+        approach   = _to_int(_frag(r, f"{prefix}_approach_cycles"))
+        isr_raw    = _to_int(_frag(r, f"{prefix}_dwt_isr_entry_raw"))
+        shadow     = _to_int(_frag(r, f"{prefix}_shadow_dwt"))
+        corr       = _to_int(_frag(r, f"{prefix}_dwt_event_correction_cycles"))
+        dwt_edge   = _to_int(_frag(r, f"{prefix}_dwt_at_event_adjusted"))
+        gnss_edge  = _to_int(_frag(r, f"{prefix}_gnss_ns_at_event"))
+        counter    = _to_int(_frag(r, f"{prefix}_counter32_at_event"))
+        arm        = _to_int(_frag(r, f"{prefix}_prespin_arm_count"))
+        complete   = _to_int(_frag(r, f"{prefix}_prespin_complete_count"))
+        timeout    = _to_int(_frag(r, f"{prefix}_prespin_timeout_count"))
+        anomaly    = _to_int(_frag(r, f"{prefix}_anomaly_count"))
+
+        sh_to_isr = None
+        if isr_raw is not None and shadow is not None:
+            sh_to_isr = isr_raw - shadow
+
+        lines.append(
+            f"{name:<6}"
+            f"{_comma_int(approach, 10)}"
+            f"{_fmt(sh_to_isr, f'>8d', 8)}"
+            f"{_fmt(corr, f'>6d', 6)}"
+            f"{_comma_int(dwt_edge, 14)}"
+            f"{_comma_int(gnss_edge, 22)}"
+            f"{_comma_int(counter, 14)}"
+            f"{_comma_int(arm, 8)}"
+            f"{_comma_int(complete, 8)}"
+            f"{_comma_int(timeout, 6)}"
+            f"{_comma_int(anomaly, 6)}"
+        )
     lines.append("")
 
-    # NOW servo detail
+    # ── NOW servo detail ──
     if cal == "NOW":
-        vref = 3.002
         lines.append(
             f"{'CAL':<6}"
             f"{'SEC_RES':>12}"
-            f"{'PRED_NS':>14}"
             f"{'EDGE_GNSS':>20}"
             f"  "
             f"{'DAC':>10}"
@@ -447,16 +432,14 @@ def clocks_combined_readout() -> list[str]:
         )
         for name, key in [("OCXO1", "ocxo1"), ("OCXO2", "ocxo2")]:
             residual = _frag(r, f"{key}_second_residual_ns")
-            pred_ns = _frag(r, f"{key}_ns_count_next_second_prediction")
             edge_gnss_ns = _frag(r, f"{key}_gnss_ns_at_edge")
             dac_now = _frag(r, f"{key}_dac")
             pps_ns = _frag(r, f"{key}_ns_count_at_pps")
             dac_now_f = float(dac_now) if dac_now is not None else None
-            v_now = (dac_now_f * vref / 65535.0) if dac_now_f is not None else None
+            v_now = (dac_now_f * VREF / 65535.0) if dac_now_f is not None else None
             lines.append(
                 f"{name:<6}"
                 f"{_sign_int(residual, 12)}"
-                f"{_comma_int(pred_ns, 14)}"
                 f"{_comma_int(edge_gnss_ns, 20)}"
                 f"  "
                 f"{_fmt(dac_now_f, '>10.3f', 10)}"
@@ -465,24 +448,24 @@ def clocks_combined_readout() -> list[str]:
             )
         lines.append("")
 
+    # ── Time ──
     gnss_time = r.get("gnss_time_utc", "---")
     system_time = r.get("system_time_utc", "---")
     lines.append(f"TIME  GNSS: {gnss_time}    SYSTEM: {system_time}")
     lines.append("")
 
+    # ── DWT detail ──
     dwt_pred = _frag(r, "dwt_cycle_count_next_second_prediction")
     dwt_actual = _frag(r, "dwt_cycle_count_between_pps")
-    dwt_pps_residual = _frag(r, "dwt_pps_residual")
     dwt_cyccnt_at_pps = _frag(r, "dwt_cycle_count_at_pps")
-    dwt_cycles_64 = r.get("teensy_dwt_cycles")
-    gnss_ns_64 = r.get("teensy_gnss_ns")
+    dwt_cycles_64 = _frag(r, "dwt_cycle_count_total")
+    gnss_ns_64 = _frag(r, "gnss_ns")
     dwt_label_w = 12
     dwt_num_w = 20
     lines.append(
         f"DWT   "
         f"{'PREDICTED:':>{dwt_label_w}} {_comma_int(dwt_pred, dwt_num_w)}"
         f"    {'ACTUAL:':<{dwt_label_w}} {_comma_int(dwt_actual, dwt_num_w)}"
-        f"    {'PPS_RESIDUAL:':>13} {_sign_int(dwt_pps_residual, 6)}"
         f"    {'CYCCNT@PPS:':>11} {_comma_int(dwt_cyccnt_at_pps, 14)}"
     )
     lines.append(
@@ -492,33 +475,7 @@ def clocks_combined_readout() -> list[str]:
     )
     lines.append("")
 
-    lines.append(
-        f"DIAG  "
-        f"PPS app={_comma_int(_frag(r, 'pps_diag_approach_cycles'), 6)}"
-        f" sh={_comma_int(_frag(r, 'pps_diag_shadow_dwt'), 10)}"
-        f" an={_comma_int(_frag(r, 'pps_diag_anomaly_count'), 4)}"
-        f"    "
-        f"OX1 app={_comma_int(_frag(r, 'ocxo1_diag_approach_cycles'), 6)}"
-        f" sh={_comma_int(_frag(r, 'ocxo1_diag_shadow_dwt'), 10)}"
-        f" an={_comma_int(_frag(r, 'ocxo1_diag_anomaly_count'), 4)}"
-        f"    "
-        f"OX2 app={_comma_int(_frag(r, 'ocxo2_diag_approach_cycles'), 6)}"
-        f" sh={_comma_int(_frag(r, 'ocxo2_diag_shadow_dwt'), 10)}"
-        f" an={_comma_int(_frag(r, 'ocxo2_diag_anomaly_count'), 4)}"
-    )
-    lines.append(
-        f"PRE   "
-        f"PPS arm={_comma_int(_frag(r, 'pps_diag_prespin_arm_count'), 6)}"
-        f" to={_comma_int(_frag(r, 'pps_diag_prespin_timeout_count'), 4)}"
-        f"    "
-        f"OX1 arm={_comma_int(_frag(r, 'ocxo1_diag_prespin_arm_count'), 6)}"
-        f" to={_comma_int(_frag(r, 'ocxo1_diag_prespin_timeout_count'), 4)}"
-        f"    "
-        f"OX2 arm={_comma_int(_frag(r, 'ocxo2_diag_prespin_arm_count'), 6)}"
-        f" to={_comma_int(_frag(r, 'ocxo2_diag_prespin_timeout_count'), 4)}"
-    )
-    lines.append("")
-
+    # ── GNSS status ──
     try:
         snapshot = _get_system_snapshot()
     except Exception:
@@ -560,6 +517,7 @@ def clocks_combined_readout() -> list[str]:
     lines.append(gnss_line)
     lines.append("")
 
+    # ── Environment ──
     env = snapshot.get("environment", {})
     pi_data = snapshot.get("pi", {})
     teensy_data = snapshot.get("teensy", {})
@@ -585,6 +543,7 @@ def clocks_combined_readout() -> list[str]:
     lines.append("ENV   " + "  ".join(env_parts))
     lines.append("")
 
+    # ── Power ──
     power = snapshot.get("power", {})
     def _find_rail(label_match: str):
         for bus_key, devices in power.items():
