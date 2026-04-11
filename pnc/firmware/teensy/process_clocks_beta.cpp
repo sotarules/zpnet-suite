@@ -129,6 +129,27 @@ double dac_welford_stderr(const dac_welford_t& w) {
   return (w.n >= 2) ? sqrt(w.m2 / (double)(w.n - 1)) / sqrt((double)w.n) : 0.0;
 }
 
+// ── NOW servo (short-window) ──
+
+static constexpr uint32_t NOW_WINDOW_SIZE = 5;
+static constexpr double   NOW_NS_PER_DAC_LSB = 100.0;
+static constexpr double   NOW_MIN_RESIDUAL_NS = 5.0;
+
+struct now_window_t {
+  int64_t  samples[NOW_WINDOW_SIZE];
+  uint32_t count;
+  uint32_t head;
+};
+
+static now_window_t g_now_window_ocxo1 = {};
+static now_window_t g_now_window_ocxo2 = {};
+
+static void now_window_reset(now_window_t& w) {
+  for (uint32_t i = 0; i < NOW_WINDOW_SIZE; i++) w.samples[i] = 0;
+  w.count = 0;
+  w.head = 0;
+}
+
 // ============================================================================
 // Zeroing
 // ============================================================================
@@ -149,53 +170,42 @@ void clocks_zero_all(void) {
 
   dac_welford_reset(dac_welford_ocxo1);
   dac_welford_reset(dac_welford_ocxo2);
+
+  now_window_reset(g_now_window_ocxo1);
+  now_window_reset(g_now_window_ocxo2);
 }
 
 // ============================================================================
 // Servo logic
 // ============================================================================
+//
+// TOTAL: drives campaign-wide PPB (= Welford mean of per-second residuals)
+//        toward zero.  The Welford mean is never reset — its natural inertia
+//        provides automatic damping as N grows.
+//
+// NOW:   drives the mean of the last NOW_WINDOW_SIZE per-second residuals
+//        toward zero.  More responsive than TOTAL, but still smoothed
+//        over a short window to avoid single-sample jitter.
+//
+// Both modes use the same sign convention:
+//   Positive residual = clock fast → lower DAC
+//   Negative residual = clock slow → raise DAC
+//
 
-static void ocxo_servo_mean(ocxo_dac_state_t& dac, pps_residual_t& per_second_residuals) {
-  if (per_second_residuals.n < SERVO_MIN_SAMPLES) return;
+// ── TOTAL servo ──
 
-  dac.servo_settle_count++;
-  if (dac.servo_settle_count < SERVO_SETTLE_SECONDS) return;
-
-  const double mean_residual_ns = per_second_residuals.mean;
-  dac.servo_last_residual = mean_residual_ns;
-
-  if (fabs(mean_residual_ns) < 0.01) return;
-
-  // AOCJY1 frequency pull slope is positive: higher control voltage
-  // produces higher frequency. Therefore positive residual (clock fast)
-  // must LOWER the DAC, and negative residual (clock slow) must RAISE it.
-  double step = -mean_residual_ns * 0.01;
-  if (step >  (double)SERVO_MAX_STEP) step =  (double)SERVO_MAX_STEP;
-  if (step < -(double)SERVO_MAX_STEP) step = -(double)SERVO_MAX_STEP;
-
-  ocxo_dac_set(dac, dac.dac_fractional + step);
-
-  dac.servo_last_step = step;
-  dac.servo_adjustments++;
-  dac.servo_settle_count = 0;
-
-  residual_reset(per_second_residuals);
-}
-
-static void ocxo_servo_total(ocxo_dac_state_t& dac, uint64_t ocxo_ns, uint64_t gnss_ns) {
-  if (campaign_seconds < SERVO_MIN_SAMPLES) return;
+static void ocxo_servo_total(ocxo_dac_state_t& dac, const pps_residual_t& residuals) {
+  if (residuals.n < SERVO_MIN_SAMPLES) return;
 
   dac.servo_settle_count++;
   if (dac.servo_settle_count < SERVO_SETTLE_SECONDS) return;
 
-  double total_error = (double)((int64_t)ocxo_ns - (int64_t)gnss_ns);
-  dac.servo_last_residual = total_error;
+  const double ppb = residuals.mean;
+  dac.servo_last_residual = ppb;
 
-  double rate_error = total_error / (double)campaign_seconds;
+  if (fabs(ppb) < 0.1) return;
 
-  if (fabs(rate_error) < 1e-6) return;
-
-  double step = -rate_error * 0.05;
+  double step = -ppb * 0.05;
   if (step >  (double)SERVO_MAX_STEP) step =  (double)SERVO_MAX_STEP;
   if (step < -(double)SERVO_MAX_STEP) step = -(double)SERVO_MAX_STEP;
 
@@ -206,22 +216,29 @@ static void ocxo_servo_total(ocxo_dac_state_t& dac, uint64_t ocxo_ns, uint64_t g
   dac.servo_settle_count = 0;
 }
 
-static constexpr double NOW_NS_PER_DAC_LSB = 100.0;
-static constexpr double NOW_MIN_RESIDUAL_NS = 5.0;
+static void now_window_push(now_window_t& w, int64_t sample) {
+  w.samples[w.head] = sample;
+  w.head = (w.head + 1) % NOW_WINDOW_SIZE;
+  if (w.count < NOW_WINDOW_SIZE) w.count++;
+}
 
-static void ocxo_servo_now(ocxo_dac_state_t& dac, int64_t per_second_residual_ns) {
+static double now_window_mean(const now_window_t& w) {
+  if (w.count == 0) return 0.0;
+  double sum = 0.0;
+  for (uint32_t i = 0; i < w.count; i++) sum += (double)w.samples[i];
+  return sum / (double)w.count;
+}
+
+static void ocxo_servo_now(ocxo_dac_state_t& dac, const now_window_t& window) {
+  if (window.count < NOW_WINDOW_SIZE) return;
   if (campaign_seconds < SERVO_MIN_SAMPLES) return;
-  if (per_second_residual_ns == 0) return;
 
-  const double residual_ns = (double)per_second_residual_ns;
-  dac.servo_last_residual = residual_ns;
+  const double mean_ns = now_window_mean(window);
+  dac.servo_last_residual = mean_ns;
 
-  if (fabs(residual_ns) < NOW_MIN_RESIDUAL_NS) return;
+  if (fabs(mean_ns) < NOW_MIN_RESIDUAL_NS) return;
 
-  // AOCJY1 frequency pull slope is positive: higher control voltage
-  // produces higher frequency. Therefore positive residual (clock fast)
-  // must LOWER the DAC, and negative residual (clock slow) must RAISE it.
-  double step = -residual_ns / NOW_NS_PER_DAC_LSB;
+  double step = -mean_ns / NOW_NS_PER_DAC_LSB;
   if (step >  (double)SERVO_MAX_STEP) step =  (double)SERVO_MAX_STEP;
   if (step < -(double)SERVO_MAX_STEP) step = -(double)SERVO_MAX_STEP;
 
@@ -234,15 +251,12 @@ static void ocxo_servo_now(ocxo_dac_state_t& dac, int64_t per_second_residual_ns
 static void ocxo_calibration_servo(void) {
   if (calibrate_ocxo_mode == servo_mode_t::OFF) return;
 
-  if (calibrate_ocxo_mode == servo_mode_t::MEAN) {
-    ocxo_servo_mean(ocxo1_dac, residual_ocxo1);
-    ocxo_servo_mean(ocxo2_dac, residual_ocxo2);
-  } else if (calibrate_ocxo_mode == servo_mode_t::NOW) {
-    ocxo_servo_now(ocxo1_dac, g_ocxo1_measurement.second_residual_ns);
-    ocxo_servo_now(ocxo2_dac, g_ocxo2_measurement.second_residual_ns);
+  if (calibrate_ocxo_mode == servo_mode_t::NOW) {
+    ocxo_servo_now(ocxo1_dac, g_now_window_ocxo1);
+    ocxo_servo_now(ocxo2_dac, g_now_window_ocxo2);
   } else {
-    ocxo_servo_total(ocxo1_dac, g_ocxo1_clock.ns_count_at_pps, g_gnss_ns_count_at_pps);
-    ocxo_servo_total(ocxo2_dac, g_ocxo2_clock.ns_count_at_pps, g_gnss_ns_count_at_pps);
+    ocxo_servo_total(ocxo1_dac, residual_ocxo1);
+    ocxo_servo_total(ocxo2_dac, residual_ocxo2);
   }
 }
 
@@ -392,10 +406,12 @@ void clocks_beta_pps(void) {
 
   if (g_ocxo1_measurement.prev_gnss_ns_at_edge != 0) {
     residual_update_sample(residual_ocxo1, g_ocxo1_measurement.second_residual_ns);
+    now_window_push(g_now_window_ocxo1, g_ocxo1_measurement.second_residual_ns);
   }
 
   if (g_ocxo2_measurement.prev_gnss_ns_at_edge != 0) {
     residual_update_sample(residual_ocxo2, g_ocxo2_measurement.second_residual_ns);
+    now_window_push(g_now_window_ocxo2, g_ocxo2_measurement.second_residual_ns);
   }
 
   ocxo_calibration_servo();
