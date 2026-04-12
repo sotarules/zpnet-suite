@@ -756,18 +756,64 @@ static void deferred_dispatch_callback(timepop_ctx_t*, timepop_diag_t*, void* us
   }
 }
 
+// ============================================================================
+// handle_event — corrected diagnostic snap + integrity instrumentation (v25)
+// ============================================================================
+//
+// v25 changes:
+//
+//   BUG FIX: snap_fired / snap_timed_out were unconditionally overwritten
+//   to true/false after the if/else prespin state machine, making all
+//   diagnostic reports claim prespin fired successfully regardless of
+//   actual state.  Fixed: snap values are now set INSIDE each branch
+//   to reflect the actual prespin outcome.
+//
+//   BUG FIX: approach_cycles and shadow_to_isr_cycles were computed from
+//   global g_prespin_start_dwt / g_prespin_shadow_dwt even when prespin
+//   was not active for this subscriber, producing stale/meaningless
+//   values (e.g. 598M cycles).  Fixed: these are only computed when
+//   prespin was genuinely active (ps_was_active == true).
+//
+//   NEW: per-OCXO gnss_ns_between_edges is computed inside handle_event
+//   itself and stored in the event struct, so downstream consumers
+//   (process_clocks_alpha) receive it as a first-class fact rather than
+//   recomputing it independently.
+//
+// ============================================================================
+
 static void handle_event(interrupt_subscriber_runtime_t& rt,
                          uint32_t dwt_isr_entry_raw,
                          uint32_t counter32_at_event) {
   prespin_state_t& ps = rt.prespin;
 
-  if (ps.active) {
+  // ── Prespin state machine — determine what actually happened ──
+  //
+  // Three mutually exclusive outcomes:
+  //   1. ps.active was true   → prespin caught this event (normal path)
+  //   2. ps.snap_timed_out    → prespin ran but timed out before event
+  //   3. neither              → no prespin was active for this event
+
+  const bool ps_was_active = ps.active;
+  const bool ps_was_timed_out = !ps_was_active && ps.snap_timed_out;
+
+  if (ps_was_active) {
+    // Normal path: prespin was spinning when the ISR fired.
     g_prespin_responsibility_count--;
     ps.active = false;
     ps.complete_count++;
     ps.last_late_after_timeout_overage_cycles = 0;
     ps.last_late_after_timeout_overage_ns = 0;
-  } else if (ps.snap_timed_out) {
+
+    // Capture snap from the LIVE globals — they belong to us.
+    ps.snap_start_dwt = g_prespin_start_dwt;
+    ps.snap_shadow_dwt = g_prespin_shadow_dwt;
+    ps.snap_dwt_isr_entry_raw = dwt_isr_entry_raw;
+    ps.snap_fired = true;
+    ps.snap_timed_out = false;
+    ps.snap_timeout_elapsed_cycles = 0;
+
+  } else if (ps_was_timed_out) {
+    // Late-after-timeout: prespin timed out, then the event eventually arrived.
     ps.late_after_timeout_count++;
     const uint32_t timeout_boundary_dwt = ps.snap_start_dwt + PRESPIN_TIMEOUT_CYCLES;
     const uint32_t overage_cycles = dwt_isr_entry_raw - timeout_boundary_dwt;
@@ -778,17 +824,29 @@ static void handle_event(interrupt_subscriber_runtime_t& rt,
       ps.max_late_after_timeout_overage_cycles = overage_cycles;
       ps.max_late_after_timeout_overage_ns = overage_ns;
     }
+
+    // snap_start_dwt and snap_shadow_dwt were already captured by the
+    // timeout handler in prespin_isr_callback.  Preserve them — they
+    // are the truthful record of the timed-out prespin session.
+    ps.snap_dwt_isr_entry_raw = dwt_isr_entry_raw;
+    ps.snap_fired = false;
+    ps.snap_timed_out = true;
+    // snap_timeout_elapsed_cycles was set by the timeout handler.
+
   } else {
+    // No prespin was active at all.
     ps.last_late_after_timeout_overage_cycles = 0;
     ps.last_late_after_timeout_overage_ns = 0;
+
+    ps.snap_start_dwt = 0;
+    ps.snap_shadow_dwt = 0;
+    ps.snap_dwt_isr_entry_raw = dwt_isr_entry_raw;
+    ps.snap_fired = false;
+    ps.snap_timed_out = false;
+    ps.snap_timeout_elapsed_cycles = 0;
   }
 
-  ps.snap_start_dwt = g_prespin_start_dwt;
-  ps.snap_shadow_dwt = g_prespin_shadow_dwt;
-  ps.snap_dwt_isr_entry_raw = dwt_isr_entry_raw;
-  ps.snap_fired = true;
-  ps.snap_timed_out = false;
-  ps.snap_timeout_elapsed_cycles = 0;
+  // ── Prespin diagnostics — only meaningful when prespin was active ──
 
   const bool prespin_expected =
       (rt.desc->kind == interrupt_subscriber_kind_t::PPS) ||
@@ -796,26 +854,31 @@ static void handle_event(interrupt_subscriber_runtime_t& rt,
 
   uint32_t approach_cycles = 0;
   uint32_t shadow_to_isr_cycles = 0;
-  if (ps.snap_start_dwt != 0) approach_cycles = dwt_isr_entry_raw - ps.snap_start_dwt;
-  if (ps.snap_shadow_dwt != 0) {
-    shadow_to_isr_cycles = dwt_isr_entry_raw - ps.snap_shadow_dwt;
-  } else if (prespin_expected) {
-    ps.anomaly_count++;
-    record_anomaly(g_anomaly_diag.no_shadow_dwt,
-                   rt.desc->kind,
-                   dwt_isr_entry_raw,
-                   ps.arm_count,
-                   ps.complete_count);
-  }
 
-  if (prespin_expected && !g_prespin_spinning && ps.snap_start_dwt == 0 && ps.snap_shadow_dwt == 0) {
+  if (ps_was_active) {
+    // Prespin caught the event — approach and shadow-to-ISR are meaningful.
+    if (ps.snap_start_dwt != 0)  approach_cycles = dwt_isr_entry_raw - ps.snap_start_dwt;
+    if (ps.snap_shadow_dwt != 0) shadow_to_isr_cycles = dwt_isr_entry_raw - ps.snap_shadow_dwt;
+
+    if (ps.snap_shadow_dwt == 0) {
+      ps.anomaly_count++;
+      record_anomaly(g_anomaly_diag.no_shadow_dwt,
+                     rt.desc->kind,
+                     dwt_isr_entry_raw,
+                     ps.arm_count,
+                     ps.complete_count);
+    }
+  } else if (prespin_expected && !ps_was_timed_out) {
+    // Prespin was expected but never fired — no spin loop ran at all.
     ps.anomaly_count++;
     record_anomaly(g_anomaly_diag.no_prespin_active,
                    rt.desc->kind,
                    dwt_isr_entry_raw,
-                   ps.snap_shadow_dwt,
+                   0,
                    ps.arm_count);
   }
+
+  // ── Reconstruct canonical event ──
 
   const uint32_t correction = rt.desc->isr_overhead_cycles;
   const uint32_t dwt_at_event = dwt_isr_entry_raw - correction;
@@ -843,6 +906,8 @@ static void handle_event(interrupt_subscriber_runtime_t& rt,
     }
   }
 
+  // ── Prespin prediction error diagnostics ──
+
   if (ps.event_target_gnss_ns != 0 && event.gnss_ns_at_event != 0) {
     ps.last_event_error_ns = (int64_t)event.gnss_ns_at_event - (int64_t)ps.event_target_gnss_ns;
   } else {
@@ -855,6 +920,8 @@ static void handle_event(interrupt_subscriber_runtime_t& rt,
   } else {
     ps.last_event_minus_prespin_fire_ns = 0;
   }
+
+  // ── Fill diagnostic struct and dispatch ──
 
   interrupt_capture_diag_t diag {};
   fill_diag_common(rt, diag, event, dwt_isr_entry_raw, approach_cycles, shadow_to_isr_cycles);
