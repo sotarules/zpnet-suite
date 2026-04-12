@@ -107,6 +107,24 @@ static constexpr uint32_t OCXO_SECOND_REMAINDER   = OCXO_COUNTS_PER_SECOND % QTI
 static_assert(OCXO_SECOND_WHOLE_WRAPS == 152, "Unexpected OCXO whole-wrap decomposition");
 static_assert(OCXO_SECOND_REMAINDER   == 38528, "Unexpected OCXO remainder decomposition");
 
+static constexpr uint32_t EDGEKEEPER_CADENCE_INDEX_TOLERANCE = 1;
+static constexpr int64_t  EDGEKEEPER_EDGE_WINDOW_NS = 100000LL;
+
+// EdgeKeeper cadence thresholds within one OCXO second.
+// Hit n occurs at remainder + (n-1)*65536 counts, for n=1..153.
+static inline uint32_t edgekeeper_cadence_index_from_counts(uint32_t counts) {
+  if (counts < OCXO_SECOND_REMAINDER) return 0;
+  const uint32_t idx = 1U + ((counts - OCXO_SECOND_REMAINDER) / QTIMER16_MODULUS);
+  return (idx > (OCXO_SECOND_WHOLE_WRAPS + 1U)) ? (OCXO_SECOND_WHOLE_WRAPS + 1U) : idx;
+}
+
+static inline uint32_t edgekeeper_counts_for_cadence_index(uint32_t idx) {
+  if (idx == 0) return 0;
+  if (idx > (OCXO_SECOND_WHOLE_WRAPS + 1U)) idx = (OCXO_SECOND_WHOLE_WRAPS + 1U);
+  return OCXO_SECOND_REMAINDER + ((idx - 1U) * QTIMER16_MODULUS);
+}
+
+
 // ============================================================================
 // Pin assignments — authoritative for process_interrupt
 // ============================================================================
@@ -267,6 +285,45 @@ struct ocxo_prediction_state_t {
   uint32_t update_count = 0;
 };
 
+
+struct edgekeeper_state_t {
+  bool     epoch_valid = false;
+  uint64_t epoch_base_gnss_ns = 0;
+  uint32_t epoch_base_dwt = 0;
+  uint64_t epoch_predicted_second_ns = 0;
+  uint32_t epoch_generation = 0;
+
+  uint32_t last_expected_cadence_index = 0;
+  uint32_t last_observed_cadence_index = 0;
+  int32_t  last_cadence_delta = 0;
+  int64_t  last_phase_error_ns = 0;
+  uint16_t last_counter16_snapshot = 0;
+
+  uint32_t samples_total = 0;
+  uint32_t samples_good = 0;
+  uint32_t samples_missing = 0;
+  uint32_t samples_spurious = 0;
+  uint32_t samples_ambiguous = 0;
+
+  uint32_t window_samples_total = 0;
+  uint32_t window_samples_good = 0;
+  uint32_t window_samples_missing = 0;
+  uint32_t window_samples_spurious = 0;
+  uint32_t window_samples_ambiguous = 0;
+
+  uint32_t edge_good_count = 0;
+  uint32_t edge_missing_count = 0;
+  uint32_t edge_spurious_count = 0;
+  uint32_t edge_ambiguous_count = 0;
+  uint32_t edge_corrected_count = 0;
+
+  int64_t  last_raw_edge_error_ns = 0;
+  int64_t  last_corrected_edge_error_ns = 0;
+  uint64_t last_predicted_edge_gnss_ns = 0;
+  uint64_t last_observed_edge_gnss_ns = 0;
+  uint64_t last_corrected_edge_gnss_ns = 0;
+};
+
 struct interrupt_subscriber_runtime_t {
   const interrupt_subscriber_descriptor_t* desc = nullptr;
   interrupt_subscription_t sub {};
@@ -286,6 +343,7 @@ struct interrupt_subscriber_runtime_t {
 
   prespin_state_t prespin {};
   ocxo_prediction_state_t ocxo_prediction {};
+  edgekeeper_state_t edgekeeper {};
 };
 
 struct pps_drumbeat_state_t {
@@ -509,6 +567,144 @@ static void qtimer3_isr(void) {
   const uint32_t dwt_raw = ARM_DWT_CYCCNT;
   if (IMXRT_TMR3.CH[2].CSCTRL & TMR_CSCTRL_TCF1) process_interrupt_qtimer3_ch2_irq(dwt_raw);
   if (IMXRT_TMR3.CH[3].CSCTRL & TMR_CSCTRL_TCF1) process_interrupt_qtimer3_ch3_irq(dwt_raw);
+}
+
+
+static void edgekeeper_reset_window(edgekeeper_state_t& ek) {
+  ek.window_samples_total = 0;
+  ek.window_samples_good = 0;
+  ek.window_samples_missing = 0;
+  ek.window_samples_spurious = 0;
+  ek.window_samples_ambiguous = 0;
+}
+
+static void edgekeeper_begin_ocxo_epoch(interrupt_subscriber_runtime_t& rt,
+                                        uint64_t edge_gnss_ns,
+                                        uint32_t dwt_at_edge) {
+  edgekeeper_state_t& ek = rt.edgekeeper;
+  edgekeeper_reset_window(ek);
+  ek.epoch_generation++;
+  ek.epoch_base_gnss_ns = edge_gnss_ns;
+  ek.epoch_base_dwt = dwt_at_edge;
+  ek.epoch_predicted_second_ns = rt.ocxo_prediction.next_second_prediction_gnss_ns;
+  ek.epoch_valid = rt.ocxo_prediction.valid && ek.epoch_predicted_second_ns != 0;
+  ek.last_expected_cadence_index = 0;
+  ek.last_observed_cadence_index = 0;
+  ek.last_cadence_delta = 0;
+  ek.last_phase_error_ns = 0;
+  ek.last_counter16_snapshot = 0;
+}
+
+static void edgekeeper_sample_cadence(interrupt_subscriber_runtime_t& rt,
+                                      const qtimer16_ocxo_runtime_t& clock,
+                                      uint32_t dwt_raw,
+                                      uint16_t counter16_snapshot) {
+  edgekeeper_state_t& ek = rt.edgekeeper;
+  ek.samples_total++;
+  ek.window_samples_total++;
+  ek.last_counter16_snapshot = counter16_snapshot;
+
+  if (!ek.epoch_valid || ek.epoch_predicted_second_ns == 0) {
+    ek.samples_ambiguous++;
+    ek.window_samples_ambiguous++;
+    return;
+  }
+
+  const uint32_t dwt_at_cadence = dwt_raw - rt.desc->isr_overhead_cycles;
+  const int64_t gnss_ns_signed = time_dwt_to_gnss_ns(dwt_at_cadence);
+  if (gnss_ns_signed < 0) {
+    ek.samples_ambiguous++;
+    ek.window_samples_ambiguous++;
+    return;
+  }
+
+  const uint64_t gnss_ns_at_cadence = (uint64_t)gnss_ns_signed;
+  if (gnss_ns_at_cadence < ek.epoch_base_gnss_ns) {
+    ek.samples_ambiguous++;
+    ek.window_samples_ambiguous++;
+    return;
+  }
+
+  uint64_t elapsed_ns = gnss_ns_at_cadence - ek.epoch_base_gnss_ns;
+  if (elapsed_ns > ek.epoch_predicted_second_ns) elapsed_ns = ek.epoch_predicted_second_ns;
+
+  const uint64_t pred_counts64 =
+      ((uint64_t)elapsed_ns * (uint64_t)OCXO_COUNTS_PER_SECOND + ek.epoch_predicted_second_ns / 2ULL) /
+      ek.epoch_predicted_second_ns;
+  const uint32_t predicted_counts =
+      (pred_counts64 > (uint64_t)OCXO_COUNTS_PER_SECOND) ? OCXO_COUNTS_PER_SECOND : (uint32_t)pred_counts64;
+
+  const uint32_t expected_idx = edgekeeper_cadence_index_from_counts(predicted_counts);
+  const uint32_t observed_idx = clock.cadence_hit_index + 1U;
+  const int32_t cadence_delta = (int32_t)observed_idx - (int32_t)expected_idx;
+
+  ek.last_expected_cadence_index = expected_idx;
+  ek.last_observed_cadence_index = observed_idx;
+  ek.last_cadence_delta = cadence_delta;
+
+  const uint32_t observed_counts = edgekeeper_counts_for_cadence_index(observed_idx);
+  const int64_t count_error = (int64_t)observed_counts - (int64_t)predicted_counts;
+  ek.last_phase_error_ns =
+      (int64_t)((count_error * (int64_t)ek.epoch_predicted_second_ns) / (int64_t)OCXO_COUNTS_PER_SECOND);
+
+  if (cadence_delta < -(int32_t)EDGEKEEPER_CADENCE_INDEX_TOLERANCE) {
+    ek.samples_missing++;
+    ek.window_samples_missing++;
+  } else if (cadence_delta > (int32_t)EDGEKEEPER_CADENCE_INDEX_TOLERANCE) {
+    ek.samples_spurious++;
+    ek.window_samples_spurious++;
+  } else {
+    ek.samples_good++;
+    ek.window_samples_good++;
+  }
+}
+
+static void edgekeeper_finalize_ocxo_edge(interrupt_subscriber_runtime_t& rt,
+                                          interrupt_event_t& event) {
+  edgekeeper_state_t& ek = rt.edgekeeper;
+  ek.last_predicted_edge_gnss_ns = 0;
+  ek.last_observed_edge_gnss_ns = event.gnss_ns_at_event;
+  ek.last_corrected_edge_gnss_ns = event.gnss_ns_at_event;
+  ek.last_raw_edge_error_ns = 0;
+  ek.last_corrected_edge_error_ns = 0;
+
+  if (!ek.epoch_valid || ek.epoch_predicted_second_ns == 0 || ek.epoch_base_gnss_ns == 0 || event.gnss_ns_at_event == 0) {
+    ek.edge_ambiguous_count++;
+    return;
+  }
+
+  const uint64_t predicted_edge_gnss_ns = ek.epoch_base_gnss_ns + ek.epoch_predicted_second_ns;
+  ek.last_predicted_edge_gnss_ns = predicted_edge_gnss_ns;
+
+  const int64_t raw_error_ns = (int64_t)event.gnss_ns_at_event - (int64_t)predicted_edge_gnss_ns;
+  ek.last_raw_edge_error_ns = raw_error_ns;
+
+  const int64_t second_ns = (int64_t)ek.epoch_predicted_second_ns;
+
+  bool corrected = false;
+  if (llabs(raw_error_ns) <= EDGEKEEPER_EDGE_WINDOW_NS) {
+    ek.edge_good_count++;
+  } else if (llabs(raw_error_ns - second_ns) <= EDGEKEEPER_EDGE_WINDOW_NS) {
+    ek.edge_missing_count++;
+    corrected = true;
+  } else if (llabs(raw_error_ns + second_ns) <= EDGEKEEPER_EDGE_WINDOW_NS) {
+    ek.edge_spurious_count++;
+    corrected = true;
+  } else {
+    ek.edge_ambiguous_count++;
+  }
+
+  if (corrected) {
+    event.gnss_ns_at_event = predicted_edge_gnss_ns;
+    const uint32_t predicted_dwt = time_gnss_ns_to_dwt((int64_t)predicted_edge_gnss_ns);
+    if (predicted_dwt != 0) {
+      event.dwt_at_event = predicted_dwt;
+    }
+    ek.edge_corrected_count++;
+    ek.last_corrected_edge_gnss_ns = event.gnss_ns_at_event;
+  }
+
+  ek.last_corrected_edge_error_ns = (int64_t)event.gnss_ns_at_event - (int64_t)predicted_edge_gnss_ns;
 }
 
 static const char* prespin_timer_name(interrupt_subscriber_kind_t kind) {
@@ -794,6 +990,7 @@ static void deferred_dispatch_callback(timepop_ctx_t*, timepop_diag_t*, void* us
     pps_drumbeat_consume_edge(*rt);
   } else {
     schedule_ocxo_from_edge(*rt, rt->last_event.gnss_ns_at_event);
+    edgekeeper_begin_ocxo_epoch(*rt, rt->last_event.gnss_ns_at_event, rt->last_event.dwt_at_event);
   }
 }
 
@@ -947,6 +1144,7 @@ static void handle_event(interrupt_subscriber_runtime_t& rt,
       event.gnss_ns_at_event = 0;
       event.status = interrupt_event_status_t::HOLD;
     }
+    edgekeeper_finalize_ocxo_edge(rt, event);
   }
 
   // ── Prespin prediction error diagnostics ──
@@ -1000,6 +1198,8 @@ static void handle_ocxo_qtimer16_irq(qtimer16_ocxo_runtime_t& clock,
     clock.miss_count++;
     return;
   }
+
+  edgekeeper_sample_cadence(rt, clock, dwt_raw, counter16_snapshot);
 
   uint32_t logical_counter32_at_event = 0;
   const bool is_second_edge = qtimer16_ocxo_consume_cadence_irq(clock,
@@ -1055,6 +1255,7 @@ bool interrupt_start(interrupt_subscriber_kind_t kind) {
   rt->start_count++;
   rt->prespin.active = false;
   rt->ocxo_prediction = {};
+  rt->edgekeeper = {};
   clear_prespin_schedule_state(*rt);
 
   if (kind == interrupt_subscriber_kind_t::PPS) {
@@ -1089,6 +1290,7 @@ bool interrupt_stop(interrupt_subscriber_kind_t kind) {
   }
   rt->prespin.active = false;
   rt->ocxo_prediction = {};
+  rt->edgekeeper = {};
   clear_prespin_schedule_state(*rt);
 
   qtimer16_ocxo_runtime_t* clock = ocxo_clock_runtime_for(rt->desc->clock_kind);
@@ -1231,7 +1433,6 @@ static Payload cmd_report(const Payload&) {
   p.add("pps_baseline_gnss_ns", g_pps_drumbeat.baseline_gnss_ns);
   p.add("pps_next_event_target_gnss_ns", g_pps_drumbeat.next_event_target_gnss_ns);
   p.add("pps_next_prespin_target_gnss_ns", g_pps_drumbeat.next_prespin_target_gnss_ns);
-  p.add("pps_next_index", g_pps_drumbeat.next_index);
   p.add("pps_generation", g_pps_drumbeat.generation);
 
   p.add("ocxo1_next_second_prediction_valid", g_rt_ocxo1 ? g_rt_ocxo1->ocxo_prediction.valid : false);
@@ -1271,112 +1472,65 @@ static Payload cmd_report(const Payload&) {
     Payload s;
     s.add("slot", i);
     s.add("kind", interrupt_subscriber_kind_str(rt.desc->kind));
-    s.add("provider", interrupt_provider_kind_str(rt.desc->provider));
-    s.add("lane", interrupt_lane_str(rt.desc->lane));
-    s.add("subscribed", rt.subscribed);
     s.add("active", rt.active);
-    s.add("start_count", rt.start_count);
-    s.add("stop_count", rt.stop_count);
+    s.add("subscribed", rt.subscribed);
     s.add("irq_count", rt.irq_count);
     s.add("dispatch_count", rt.dispatch_count);
     s.add("event_count", rt.event_count);
 
-    s.add("prespin_active", rt.prespin.active);
-    s.add("prespin_fired", rt.prespin.snap_fired);
-    s.add("prespin_timed_out", rt.prespin.snap_timed_out);
-    s.add("prespin_start_dwt", rt.prespin.snap_start_dwt);
-    s.add("shadow_dwt", rt.prespin.snap_shadow_dwt);
-    s.add("dwt_isr_entry_raw", rt.prespin.snap_dwt_isr_entry_raw);
-    s.add("prespin_fire_gnss_ns", rt.prespin.snap_prespin_fire_gnss_ns);
-    s.add("prespin_fire_dwt", rt.prespin.snap_prespin_fire_dwt);
-    s.add("prespin_timeout_elapsed_cycles", rt.prespin.snap_timeout_elapsed_cycles);
-
-    s.add("prespin_target_gnss_ns", rt.prespin.prespin_target_gnss_ns);
-    s.add("event_target_gnss_ns", rt.prespin.event_target_gnss_ns);
     s.add("prespin_arm_count", rt.prespin.arm_count);
     s.add("prespin_complete_count", rt.prespin.complete_count);
     s.add("prespin_timeout_count", rt.prespin.timeout_count);
     s.add("prespin_stale_callback_count", rt.prespin.stale_callback_count);
-    s.add("prespin_next_schedule_generation", rt.prespin.next_schedule_generation);
-    s.add("prespin_scheduled_generation", rt.prespin.scheduled_generation);
     s.add("prespin_armed_generation", rt.prespin.armed_generation);
-    s.add("prespin_snap_generation", rt.prespin.snap_generation);
     s.add("prespin_last_completed_generation", rt.prespin.last_completed_generation);
     s.add("prespin_last_timeout_generation", rt.prespin.last_timeout_generation);
     s.add("prespin_last_late_after_timeout_generation", rt.prespin.last_late_after_timeout_generation);
     s.add("late_after_timeout_count", rt.prespin.late_after_timeout_count);
-    s.add("last_late_after_timeout_overage_cycles", rt.prespin.last_late_after_timeout_overage_cycles);
-    s.add("last_late_after_timeout_overage_ns", rt.prespin.last_late_after_timeout_overage_ns);
-    s.add("max_late_after_timeout_overage_cycles", rt.prespin.max_late_after_timeout_overage_cycles);
-    s.add("max_late_after_timeout_overage_ns", rt.prespin.max_late_after_timeout_overage_ns);
     s.add("anomaly_count", rt.prespin.anomaly_count);
 
     s.add("ocxo_prediction_valid", rt.ocxo_prediction.valid);
     s.add("ocxo_next_second_prediction_gnss_ns", rt.ocxo_prediction.next_second_prediction_gnss_ns);
     s.add("ocxo_last_measured_second_gnss_ns", rt.ocxo_prediction.last_measured_second_gnss_ns);
-    s.add("ocxo_prediction_previous_edge_gnss_ns", rt.ocxo_prediction.previous_edge_gnss_ns);
     s.add("ocxo_prediction_update_count", rt.ocxo_prediction.update_count);
 
-    s.add("last_schedule_now_gnss_ns", rt.prespin.last_schedule_now_gnss_ns);
-    s.add("last_schedule_delay_ns", rt.prespin.last_schedule_delay_ns);
-    s.add("last_prespin_margin_ns", rt.prespin.last_prespin_margin_ns);
-    s.add("last_schedule_event_target_gnss_ns", rt.prespin.last_schedule_event_target_gnss_ns);
-    s.add("last_schedule_prespin_target_gnss_ns", rt.prespin.last_schedule_prespin_target_gnss_ns);
+    s.add("edgekeeper_epoch_valid", rt.edgekeeper.epoch_valid);
+    s.add("edgekeeper_epoch_generation", rt.edgekeeper.epoch_generation);
+    s.add("edgekeeper_epoch_predicted_second_ns", rt.edgekeeper.epoch_predicted_second_ns);
+    s.add("edgekeeper_last_expected_cadence_index", rt.edgekeeper.last_expected_cadence_index);
+    s.add("edgekeeper_last_observed_cadence_index", rt.edgekeeper.last_observed_cadence_index);
+    s.add("edgekeeper_last_cadence_delta", rt.edgekeeper.last_cadence_delta);
+    s.add("edgekeeper_last_phase_error_ns", rt.edgekeeper.last_phase_error_ns);
 
-    s.add("last_approach_cycles", rt.last_diag.approach_cycles);
-    s.add("last_shadow_to_isr_cycles", rt.last_diag.shadow_to_isr_cycles);
+    s.add("edgekeeper_samples_total", rt.edgekeeper.samples_total);
+    s.add("edgekeeper_samples_good", rt.edgekeeper.samples_good);
+    s.add("edgekeeper_samples_missing", rt.edgekeeper.samples_missing);
+    s.add("edgekeeper_samples_spurious", rt.edgekeeper.samples_spurious);
+    s.add("edgekeeper_samples_ambiguous", rt.edgekeeper.samples_ambiguous);
+
+    s.add("edgekeeper_edge_good_count", rt.edgekeeper.edge_good_count);
+    s.add("edgekeeper_edge_missing_count", rt.edgekeeper.edge_missing_count);
+    s.add("edgekeeper_edge_spurious_count", rt.edgekeeper.edge_spurious_count);
+    s.add("edgekeeper_edge_ambiguous_count", rt.edgekeeper.edge_ambiguous_count);
+    s.add("edgekeeper_edge_corrected_count", rt.edgekeeper.edge_corrected_count);
+
+    s.add("edgekeeper_last_predicted_edge_gnss_ns", rt.edgekeeper.last_predicted_edge_gnss_ns);
+    s.add("edgekeeper_last_observed_edge_gnss_ns", rt.edgekeeper.last_observed_edge_gnss_ns);
+    s.add("edgekeeper_last_corrected_edge_gnss_ns", rt.edgekeeper.last_corrected_edge_gnss_ns);
+    s.add("edgekeeper_last_raw_edge_error_ns", rt.edgekeeper.last_raw_edge_error_ns);
+    s.add("edgekeeper_last_corrected_edge_error_ns", rt.edgekeeper.last_corrected_edge_error_ns);
+
+    s.add("event_target_gnss_ns", rt.prespin.event_target_gnss_ns);
+    s.add("prespin_target_gnss_ns", rt.prespin.prespin_target_gnss_ns);
     s.add("last_event_error_ns", rt.prespin.last_event_error_ns);
     s.add("last_event_minus_prespin_fire_ns", rt.prespin.last_event_minus_prespin_fire_ns);
 
-    s.add("last_dwt_at_event", rt.last_event.dwt_at_event);
     s.add("last_gnss_ns_at_event", rt.last_event.gnss_ns_at_event);
     s.add("last_counter32_at_event", rt.last_event.counter32_at_event);
-    s.add("last_correction_cycles", rt.last_event.dwt_event_correction_cycles);
     s.add("last_status", (uint32_t)rt.last_event.status);
     subscribers.add(s);
   }
   p.add_array("subscribers", subscribers);
-
-  PayloadArray ocxo_clocks;
-  auto add_ocxo_clock = [&](const qtimer16_ocxo_runtime_t& clock) {
-    Payload c;
-    c.add("name", clock.name ? clock.name : "");
-    c.add("active", clock.active);
-
-    const interrupt_subscriber_runtime_t* rt = nullptr;
-    if (clock.kind == qtimer_clock_kind_t::OCXO1) rt = g_rt_ocxo1;
-    if (clock.kind == qtimer_clock_kind_t::OCXO2) rt = g_rt_ocxo2;
-    c.add("next_second_prediction_valid", rt ? rt->ocxo_prediction.valid : false);
-    c.add("next_second_prediction_gnss_ns", rt ? rt->ocxo_prediction.next_second_prediction_gnss_ns : 0ULL);
-    c.add("last_measured_second_gnss_ns", rt ? rt->ocxo_prediction.last_measured_second_gnss_ns : 0ULL);
-    c.add("prediction_update_count", rt ? rt->ocxo_prediction.update_count : 0U);
-    c.add("initialized", clock.initialized);
-    c.add("start_count", clock.start_count);
-    c.add("stop_count", clock.stop_count);
-    c.add("irq_count", clock.irq_count);
-    c.add("dispatch_count", clock.dispatch_count);
-    c.add("miss_count", clock.miss_count);
-    c.add("event_count", clock.event_count);
-    c.add("bootstrap_count", clock.bootstrap_count);
-    c.add("bootstrap_arm_failures", clock.bootstrap_arm_failures);
-    c.add("phase_bootstrapped", clock.phase_bootstrapped);
-    c.add("cadence_hit_index", clock.cadence_hit_index);
-    c.add("cadence_hits_total", clock.cadence_hits_total);
-    c.add("cadence_hits_since_second", clock.cadence_hits_since_second);
-    c.add("logical_count32_at_last_second_edge", clock.logical_count32_at_last_second_edge);
-    c.add("last_counter16_at_irq", (uint32_t)clock.last_counter16_at_irq);
-    c.add("last_programmed_compare", (uint32_t)clock.last_programmed_compare);
-    c.add("last_initial_counter16", (uint32_t)clock.last_initial_counter16);
-    c.add("last_second_target_low16", (uint32_t)clock.last_second_target_low16);
-    c.add("counter16_now", (uint32_t)clock.hw.module->CH[clock.hw.channel].CNTR);
-    c.add("comp1_now", (uint32_t)clock.hw.module->CH[clock.hw.channel].COMP1);
-    c.add("csctrl_now", (uint32_t)clock.hw.module->CH[clock.hw.channel].CSCTRL);
-    ocxo_clocks.add(c);
-  };
-
-  add_ocxo_clock(g_clock_ocxo1);
-  add_ocxo_clock(g_clock_ocxo2);
-  p.add_array("ocxo_qtimer16_clocks", ocxo_clocks);
 
   return p;
 }
