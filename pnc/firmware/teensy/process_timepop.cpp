@@ -39,17 +39,19 @@
 //   Only relative scheduling ("fire N ns from now") reads the ambient counter,
 //   because "from now" inherently requires knowing "now."
 //
-// VCLOCK viability audit:
+// Dispatch timing audit:
 //
-//   TimePop continuously self-audits VCLOCK reasonableness during dispatch.
-//   The audit compares:
+//   TimePop now validates actual dispatch timing directly in the ISR path.
+//   For slots that carry a concrete GNSS target, the subsystem captures
+//   ARM_DWT_CYCCNT as the first ISR instruction, subtracts a fixed compare-path
+//   correction, converts the corrected DWT value to GNSS nanoseconds, and
+//   compares that value against the slot's scheduled GNSS target.
 //
-//     • expected_gnss_ns = VCLOCK arithmetic from the current anchor
-//     • actual_gnss_ns   = canonical shared time model (time_gnss_ns_now())
+//   This answers the sharper question:
 //
-//   If the absolute error exceeds VCLOCK_VIABILITY_TOLERANCE_NS, the subsystem
-//   records the two comparison values and increments a mismatch counter.
-//   Matching checks are silent.
+//     "Did TimePop fire this event at the GNSS time it was supposed to?"
+//
+//   rather than the older broad VCLOCK viability question.
 //
 // ============================================================================
 
@@ -84,7 +86,8 @@ static constexpr uint32_t MIN_DELAY_TICKS = 2;
 static constexpr uint32_t HEARTBEAT_TICKS = 10000;
 static constexpr uint32_t DWT_SPIN_MAX_CYCLES = 110;
 static constexpr uint32_t PREDICT_MAX_QTIMER_ELAPSED = 15000000U;
-static constexpr int64_t  VCLOCK_VIABILITY_TOLERANCE_NS = 100LL;
+static constexpr uint32_t TIMEPOP_ISR_EVENT_CORRECTION_CYCLES = 16U;
+static constexpr int64_t  TIMEPOP_DISPATCH_GNSS_TOLERANCE_NS = 100LL;
 
 // ============================================================================
 // Slot
@@ -199,12 +202,15 @@ static volatile uint32_t diag_schedule_next_calls_total = 0;
 static volatile uint32_t diag_schedule_next_calls_from_dispatch = 0;
 static volatile uint32_t diag_schedule_next_calls_from_other = 0;
 
-// VCLOCK viability diagnostics
-static volatile uint32_t diag_vclock_viability_checks = 0;
-static volatile uint32_t diag_vclock_viability_mismatches = 0;
-static volatile int64_t  diag_vclock_viability_last_expected_gnss_ns = -1;
-static volatile int64_t  diag_vclock_viability_last_actual_gnss_ns = -1;
-static volatile int64_t  diag_vclock_viability_last_error_ns = 0;
+// Dispatch timing diagnostics
+static volatile uint32_t diag_dispatch_gnss_checks = 0;
+static volatile uint32_t diag_dispatch_gnss_mismatches = 0;
+static volatile uint32_t diag_dispatch_gnss_skipped_no_target = 0;
+static volatile uint32_t diag_dispatch_gnss_skipped_invalid_time = 0;
+static volatile int64_t  diag_dispatch_gnss_last_target_ns = -1;
+static volatile int64_t  diag_dispatch_gnss_last_actual_ns = -1;
+static volatile int64_t  diag_dispatch_gnss_last_error_ns = 0;
+static volatile uint64_t diag_dispatch_gnss_max_abs_error_ns = 0;
 
 static volatile uint32_t diag_deadline_negative_offset = 0;
 static volatile int64_t  diag_deadline_last_target_gnss_ns = -1;
@@ -248,8 +254,7 @@ static inline void update_deferred_high_water(deferred_slot_t* slots_buf,
 //   • schedule_next() — must compare deadlines against the current counter
 //   • relative scheduling — "from now" inherently requires knowing "now"
 //   • recurring timer catch-up — relative timers that fell behind
-//   • VCLOCK viability audit — TimePop self-check against canonical time
-//
+// //
 // Absolute and anchor-relative scheduling NEVER call this function.
 // Their deadlines are computed from the time anchor via pure arithmetic.
 static volatile uint32_t diag_qread_total = 0;
@@ -453,32 +458,37 @@ static int64_t vclock_to_gnss_ns(uint32_t vclock_raw,
 }
 
 // ============================================================================
-// VCLOCK viability audit
+// Dispatch timing validation
 // ============================================================================
 
-static void vclock_viability_audit(void) {
-  const time_anchor_snapshot_t snap = time_anchor_snapshot();
-  if (!snap.ok || !snap.valid) return;
-  if (snap.dwt_cycles_per_s == 0) return;
-
-  const uint32_t vclock_now = qtimer1_read_32_local();
-  const int64_t expected_gnss_ns = vclock_to_gnss_ns(vclock_now, snap);
-  if (expected_gnss_ns < 0) return;
-
-  const int64_t actual_gnss_ns = time_gnss_ns_now();
-  if (actual_gnss_ns < 0) return;
-
-  diag_vclock_viability_checks++;
-
-  const int64_t error_ns = expected_gnss_ns - actual_gnss_ns;
-  if (llabs(error_ns) <= VCLOCK_VIABILITY_TOLERANCE_NS) {
+static inline void validate_dispatch_against_dwt(const timepop_slot_t& slot,
+                                                 uint32_t dwt_at_compare_event) {
+  if (slot.target_gnss_ns < 0) {
+    diag_dispatch_gnss_skipped_no_target++;
     return;
   }
 
-  diag_vclock_viability_mismatches++;
-  diag_vclock_viability_last_expected_gnss_ns = expected_gnss_ns;
-  diag_vclock_viability_last_actual_gnss_ns = actual_gnss_ns;
-  diag_vclock_viability_last_error_ns = error_ns;
+  const int64_t actual_gnss_ns = time_dwt_to_gnss_ns(dwt_at_compare_event);
+  if (actual_gnss_ns < 0) {
+    diag_dispatch_gnss_skipped_invalid_time++;
+    return;
+  }
+
+  diag_dispatch_gnss_checks++;
+  diag_dispatch_gnss_last_target_ns = slot.target_gnss_ns;
+  diag_dispatch_gnss_last_actual_ns = actual_gnss_ns;
+
+  const int64_t error_ns = actual_gnss_ns - slot.target_gnss_ns;
+  diag_dispatch_gnss_last_error_ns = error_ns;
+
+  const uint64_t abs_error_ns = (uint64_t)llabs(error_ns);
+  if (abs_error_ns > diag_dispatch_gnss_max_abs_error_ns) {
+    diag_dispatch_gnss_max_abs_error_ns = abs_error_ns;
+  }
+
+  if (abs_error_ns > (uint64_t)TIMEPOP_DISPATCH_GNSS_TOLERANCE_NS) {
+    diag_dispatch_gnss_mismatches++;
+  }
 }
 
 // ============================================================================
@@ -612,6 +622,7 @@ static inline void slot_build_diag(
 static void qtimer1_ch2_isr(void) {
 
   const uint32_t dwt_entry = ARM_DWT_CYCCNT;
+  const uint32_t dwt_at_compare_event = dwt_entry - TIMEPOP_ISR_EVENT_CORRECTION_CYCLES;
   const uint32_t now       = qtimer1_read_32_local();
   const time_anchor_snapshot_t anchor = time_anchor_snapshot();
 
@@ -625,6 +636,8 @@ static void qtimer1_ch2_isr(void) {
   for (uint32_t i = 0; i < MAX_SLOTS; i++) {
     if (!slots[i].active || slots[i].expired) continue;
     if (!deadline_expired(slots[i].deadline, now)) continue;
+
+    validate_dispatch_against_dwt(slots[i], dwt_at_compare_event);
 
     uint32_t landed_dwt;
 
@@ -821,11 +834,14 @@ void timepop_init(void) {
   for (uint32_t i = 0; i < MAX_ASAP_SLOTS; i++) asap_slots[i] = {};
   for (uint32_t i = 0; i < MAX_ALAP_SLOTS; i++) alap_slots[i] = {};
 
-  diag_vclock_viability_checks = 0;
-  diag_vclock_viability_mismatches = 0;
-  diag_vclock_viability_last_expected_gnss_ns = -1;
-  diag_vclock_viability_last_actual_gnss_ns = -1;
-  diag_vclock_viability_last_error_ns = 0;
+  diag_dispatch_gnss_checks = 0;
+  diag_dispatch_gnss_mismatches = 0;
+  diag_dispatch_gnss_skipped_no_target = 0;
+  diag_dispatch_gnss_skipped_invalid_time = 0;
+  diag_dispatch_gnss_last_target_ns = -1;
+  diag_dispatch_gnss_last_actual_ns = -1;
+  diag_dispatch_gnss_last_error_ns = 0;
+  diag_dispatch_gnss_max_abs_error_ns = 0;
   diag_deadline_negative_offset = 0;
   diag_deadline_last_target_gnss_ns = -1;
   diag_deadline_last_anchor_pps_gnss_ns = -1;
@@ -1225,8 +1241,6 @@ void timepop_dispatch(void) {
   timepop_pending = false;
   diag_dispatch_calls++;
 
-  vclock_viability_audit();
-
   dispatch_deferred_phase(asap_slots,
                           MAX_ASAP_SLOTS,
                           diag_asap_dispatched,
@@ -1352,12 +1366,16 @@ static Payload cmd_report(const Payload&) {
   out.add("time_valid",        time_valid());
   out.add("time_pps_count",    time_pps_count());
 
-  out.add("vclock_viability_tolerance_ns",      (int64_t)VCLOCK_VIABILITY_TOLERANCE_NS);
-  out.add("vclock_viability_checks",            diag_vclock_viability_checks);
-  out.add("vclock_viability_mismatches",        diag_vclock_viability_mismatches);
-  out.add("vclock_viability_last_expected_gnss_ns", diag_vclock_viability_last_expected_gnss_ns);
-  out.add("vclock_viability_last_actual_gnss_ns",   diag_vclock_viability_last_actual_gnss_ns);
-  out.add("vclock_viability_last_error_ns",         diag_vclock_viability_last_error_ns);
+  out.add("dispatch_gnss_tolerance_ns",        (int64_t)TIMEPOP_DISPATCH_GNSS_TOLERANCE_NS);
+  out.add("dispatch_gnss_checks",              diag_dispatch_gnss_checks);
+  out.add("dispatch_gnss_mismatches",          diag_dispatch_gnss_mismatches);
+  out.add("dispatch_gnss_skipped_no_target",   diag_dispatch_gnss_skipped_no_target);
+  out.add("dispatch_gnss_skipped_invalid_time",diag_dispatch_gnss_skipped_invalid_time);
+  out.add("dispatch_gnss_last_target_ns",      diag_dispatch_gnss_last_target_ns);
+  out.add("dispatch_gnss_last_actual_ns",      diag_dispatch_gnss_last_actual_ns);
+  out.add("dispatch_gnss_last_error_ns",       diag_dispatch_gnss_last_error_ns);
+  out.add("dispatch_gnss_max_abs_error_ns",    diag_dispatch_gnss_max_abs_error_ns);
+  out.add("dispatch_dwt_correction_cycles",    (uint32_t)TIMEPOP_ISR_EVENT_CORRECTION_CYCLES);
 
   out.add("slots_active_now",    timepop_active_count());
   out.add("slots_high_water",     diag_slots_high_water);
