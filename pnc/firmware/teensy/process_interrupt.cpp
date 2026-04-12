@@ -140,6 +140,10 @@ static uint32_t qtimer1_read_32_for_pps_capture(void) {
   return ((uint32_t)hi1 << 16) | (uint32_t)lo1;
 }
 
+uint32_t interrupt_qtimer1_counter32_now(void) {
+  return qtimer1_read_32_for_pps_capture();
+}
+
 // ============================================================================
 // 16-bit OCXO QTimer runtime
 // ============================================================================

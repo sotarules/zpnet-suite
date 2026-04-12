@@ -83,6 +83,10 @@ volatile uint64_t g_dwt_model_pps_count = 0;
 // Geared QTimer — advanced by TICKS_10MHZ_PER_SECOND each PPS.
 // Never read from hardware for canonical state.
 volatile uint32_t g_qtimer_at_pps = 0;
+volatile uint32_t g_last_pps_event_counter32_at_event = 0;
+
+volatile int32_t g_last_pps_live_qtimer_minus_geared = 0;
+volatile uint32_t g_last_pps_live_qtimer_read = 0;
 
 ocxo_clock_state_t g_ocxo1_clock = {};
 ocxo_clock_state_t g_ocxo2_clock = {};
@@ -95,6 +99,9 @@ interrupt_capture_diag_t g_ocxo1_interrupt_diag = {};
 interrupt_capture_diag_t g_ocxo2_interrupt_diag = {};
 
 bool g_ad5693r_init_ok = false;
+
+volatile uint32_t g_epoch_live_qtimer_read = 0;
+volatile int32_t  g_epoch_live_qtimer_minus_event = 0;
 
 // ============================================================================
 // Alpha epoch state
@@ -253,6 +260,10 @@ static void alpha_install_new_epoch_from_pps(const interrupt_event_t& pps_event)
   g_epoch_dwt_at_pps = pps_event.dwt_at_event;
   g_epoch_qtimer_at_pps = pps_event.counter32_at_event;
 
+  const uint32_t live_qtimer_now = interrupt_qtimer1_counter32_now();   // or equivalent helper
+  g_epoch_live_qtimer_read = live_qtimer_now;
+  g_epoch_live_qtimer_minus_event = (int32_t)(live_qtimer_now - pps_event.counter32_at_event);
+
   alpha_reset_canonical_clock_state_for_new_epoch();
 
   g_gnss_ns_count_at_pps = 0;
@@ -314,6 +325,7 @@ static void pps_callback(
   static uint32_t prev_dwt_pps = 0;
 
   clocks_capture_interrupt_diag(g_pps_interrupt_diag, diag);
+  g_last_pps_event_counter32_at_event = event.counter32_at_event;
 
   if (!g_epoch_initialized || g_epoch_pending) {
     alpha_install_new_epoch_from_pps(event);
@@ -339,6 +351,10 @@ static void pps_callback(
   g_dwt_cycle_count_at_pps = event.dwt_at_event;
 
   g_qtimer_at_pps += TICKS_10MHZ_PER_SECOND;
+
+  const uint32_t live_qtimer_now = interrupt_qtimer1_counter32_now();   // same helper
+  g_last_pps_live_qtimer_read = live_qtimer_now;
+  g_last_pps_live_qtimer_minus_geared = (int32_t)(live_qtimer_now - g_qtimer_at_pps);
 
   {
     const uint32_t delta32 = event.dwt_at_event - prev_dwt_pps;

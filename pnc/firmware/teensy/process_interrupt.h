@@ -260,3 +260,5 @@ uint16_t interrupt_qtimer3_ch3_counter_now(void);
 const char* interrupt_subscriber_kind_str(interrupt_subscriber_kind_t kind);
 const char* interrupt_provider_kind_str(interrupt_provider_kind_t provider);
 const char* interrupt_lane_str(interrupt_lane_t lane);
+
+uint32_t interrupt_qtimer1_counter32_now(void);

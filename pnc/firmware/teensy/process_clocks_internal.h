@@ -53,6 +53,11 @@ extern volatile uint64_t g_dwt_model_pps_count;
 // never read from hardware after epoch installation.
 extern volatile uint32_t g_qtimer_at_pps;
 
+extern volatile uint32_t g_last_pps_event_counter32_at_event;
+
+extern volatile int32_t g_last_pps_live_qtimer_minus_geared;
+extern volatile uint32_t g_last_pps_live_qtimer_read;
+
 // ============================================================================
 // OCXO canonical state (alpha-owned, beta-readable)
 // ============================================================================

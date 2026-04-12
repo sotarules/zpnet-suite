@@ -200,6 +200,11 @@ static volatile int64_t  diag_vclock_viability_last_expected_gnss_ns = -1;
 static volatile int64_t  diag_vclock_viability_last_actual_gnss_ns = -1;
 static volatile int64_t  diag_vclock_viability_last_error_ns = 0;
 
+static volatile uint32_t diag_deadline_negative_offset = 0;
+static volatile int64_t  diag_deadline_last_target_gnss_ns = -1;
+static volatile int64_t  diag_deadline_last_anchor_pps_gnss_ns = -1;
+static volatile int64_t  diag_deadline_last_ns_from_anchor = 0;
+
 // ============================================================================
 // Forward declarations
 // ============================================================================
@@ -336,7 +341,6 @@ static uint32_t predict_dwt_at_deadline(uint32_t deadline, bool& valid) {
 //
 // Returns true if the conversion succeeded (anchor valid, target in range).
 // On success, writes the VCLOCK deadline to *out_deadline.
-
 static bool gnss_ns_to_vclock_deadline(int64_t target_gnss_ns,
                                        const time_anchor_snapshot_t& snap,
                                        uint32_t& out_deadline) {
@@ -347,9 +351,21 @@ static bool gnss_ns_to_vclock_deadline(int64_t target_gnss_ns,
 
   const int64_t ns_from_anchor = target_gnss_ns - anchor_pps_gnss_ns;
 
-  const uint32_t ticks_from_anchor = (uint32_t)((uint64_t)ns_from_anchor / NS_PER_TICK);
+  diag_deadline_last_target_gnss_ns = target_gnss_ns;
+  diag_deadline_last_anchor_pps_gnss_ns = anchor_pps_gnss_ns;
+  diag_deadline_last_ns_from_anchor = ns_from_anchor;
 
-  out_deadline = snap.qtimer_at_pps + ticks_from_anchor;
+  if (ns_from_anchor < 0) {
+    diag_deadline_negative_offset++;
+    return false;
+  }
+
+  const uint64_t ticks64 = (uint64_t)ns_from_anchor / NS_PER_TICK;
+  if (ticks64 > 0xFFFFFFFFULL) {
+    return false;
+  }
+
+  out_deadline = snap.qtimer_at_pps + (uint32_t)ticks64;
   return true;
 }
 

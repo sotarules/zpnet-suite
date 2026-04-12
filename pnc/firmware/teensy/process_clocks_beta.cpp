@@ -435,6 +435,7 @@ void clocks_beta_pps(void) {
   p.add("dwt_cycle_count_next_second_adjustment", g_dwt_cycle_count_next_second_adjustment);
   p.add("dwt_model_pps_count", g_dwt_model_pps_count);
   p.add("qtimer_at_pps", g_qtimer_at_pps);
+  p.add("pps_event_counter32_at_event", g_last_pps_event_counter32_at_event);
 
   p.add("ocxo1_gnss_ns_at_edge", g_ocxo1_clock.gnss_ns_at_edge);
   p.add("ocxo1_gnss_ns_between_edges", g_ocxo1_measurement.gnss_ns_between_edges);
@@ -558,6 +559,17 @@ void clocks_beta_pps(void) {
   p.add("ocxo2_dac_welford_stderr", dac_welford_stderr(dac_welford_ocxo2), 6);
   p.add("ocxo2_dac_welford_min", dac_welford_ocxo2.min_val, 6);
   p.add("ocxo2_dac_welford_max", dac_welford_ocxo2.max_val, 6);
+
+  const time_anchor_snapshot_t snap = time_anchor_snapshot();
+  p.add("time_anchor_ok", snap.ok);
+  p.add("time_anchor_valid", snap.valid);
+  p.add("time_anchor_pps_count", snap.pps_count);
+  p.add("time_anchor_qtimer_at_pps", snap.qtimer_at_pps);
+  p.add("time_anchor_dwt_at_pps", snap.dwt_at_pps);
+  p.add("time_anchor_dwt_cycles_per_s", snap.dwt_cycles_per_s);
+
+  p.add("last_pps_live_qtimer_read", g_last_pps_live_qtimer_read);
+  p.add("last_pps_live_qtimer_minus_geared", g_last_pps_live_qtimer_minus_geared);
 
   g_last_fragment = p;
   publish("TIMEBASE_FRAGMENT", p);
