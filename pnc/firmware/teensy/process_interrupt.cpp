@@ -226,6 +226,15 @@ struct prespin_state_t {
   uint32_t timeout_count = 0;
   uint32_t anomaly_count = 0;
   uint32_t late_after_timeout_count = 0;
+  uint32_t stale_callback_count = 0;
+
+  uint32_t next_schedule_generation = 1;
+  uint32_t scheduled_generation = 0;
+  uint32_t armed_generation = 0;
+  uint32_t snap_generation = 0;
+  uint32_t last_completed_generation = 0;
+  uint32_t last_timeout_generation = 0;
+  uint32_t last_late_after_timeout_generation = 0;
 
   uint64_t last_schedule_now_gnss_ns = 0;
   uint64_t last_schedule_delay_ns = 0;
@@ -301,6 +310,7 @@ struct interrupt_anomaly_diag_t {
   uint32_t prespin_null_runtime = 0;
   uint32_t prespin_arm_failed = 0;
   uint32_t prespin_timeout = 0;
+  uint32_t prespin_stale_callback = 0;
   uint32_t no_prespin_active = 0;
   uint32_t no_shadow_dwt = 0;
   uint32_t null_desc = 0;
@@ -535,9 +545,25 @@ static void prespin_isr_callback(timepop_ctx_t* ctx,
   if (!rt->active) return;
 
   prespin_state_t& ps = rt->prespin;
+
+  const timepop_handle_t callback_handle = ctx ? ctx->handle : TIMEPOP_INVALID_HANDLE;
+  if (ps.handle == TIMEPOP_INVALID_HANDLE ||
+      callback_handle == TIMEPOP_INVALID_HANDLE ||
+      callback_handle != ps.handle) {
+    ps.stale_callback_count++;
+    record_anomaly(g_anomaly_diag.prespin_stale_callback,
+                   rt->desc->kind,
+                   (uint32_t)callback_handle,
+                   (uint32_t)ps.handle,
+                   ps.scheduled_generation);
+    return;
+  }
+
   ps.handle = TIMEPOP_INVALID_HANDLE;
   ps.active = true;
   ps.arm_count++;
+  ps.armed_generation = ps.scheduled_generation;
+  ps.snap_generation = ps.armed_generation;
 
   ps.snap_start_dwt = 0;
   ps.snap_shadow_dwt = 0;
@@ -583,6 +609,7 @@ static void prespin_isr_callback(timepop_ctx_t* ctx,
         sub.prespin.snap_timeout_elapsed_cycles = ARM_DWT_CYCCNT - loop_start_dwt;
         sub.prespin.timeout_count++;
         sub.prespin.anomaly_count++;
+        sub.prespin.last_timeout_generation = sub.prespin.snap_generation;
         sub.prespin.active = false;
 
         record_anomaly(g_anomaly_diag.prespin_timeout,
@@ -607,6 +634,13 @@ static void schedule_next_prespin_from_anchor(interrupt_subscriber_runtime_t& rt
   if (!rt.active) return;
 
   prespin_state_t& ps = rt.prespin;
+
+  if (ps.handle != TIMEPOP_INVALID_HANDLE) {
+    timepop_cancel(ps.handle);
+    ps.handle = TIMEPOP_INVALID_HANDLE;
+  }
+  ps.active = false;
+
   ps.event_target_gnss_ns = anchor_gnss_ns + offset_gnss_ns;
   ps.prespin_target_gnss_ns =
       (ps.event_target_gnss_ns >= PRESPIN_LEAD_NS)
@@ -618,6 +652,7 @@ static void schedule_next_prespin_from_anchor(interrupt_subscriber_runtime_t& rt
   ps.last_schedule_now_gnss_ns = anchor_gnss_ns;
   ps.last_schedule_delay_ns = offset_gnss_ns - PRESPIN_LEAD_NS;
   ps.last_prespin_margin_ns = (int64_t)(offset_gnss_ns - PRESPIN_LEAD_NS);
+  ps.scheduled_generation = ps.next_schedule_generation++;
 
   timepop_handle_t h =
       timepop_arm_ns((int64_t)ps.prespin_target_gnss_ns,
@@ -633,7 +668,7 @@ static void schedule_next_prespin_from_anchor(interrupt_subscriber_runtime_t& rt
                    rt.desc->kind,
                    (uint32_t)(ps.prespin_target_gnss_ns & 0xFFFFFFFFu),
                    (uint32_t)(ps.prespin_target_gnss_ns >> 32),
-                   ps.arm_count);
+                   ps.scheduled_generation);
     return;
   }
 
@@ -659,6 +694,7 @@ static void clear_prespin_schedule_state(interrupt_subscriber_runtime_t& rt) {
     rt.prespin.handle = TIMEPOP_INVALID_HANDLE;
   }
 
+  rt.prespin.active = false;
   rt.prespin.event_target_gnss_ns = 0;
   rt.prespin.prespin_target_gnss_ns = 0;
   rt.prespin.last_schedule_now_gnss_ns = 0;
@@ -666,6 +702,7 @@ static void clear_prespin_schedule_state(interrupt_subscriber_runtime_t& rt) {
   rt.prespin.last_prespin_margin_ns = 0;
   rt.prespin.last_schedule_event_target_gnss_ns = 0;
   rt.prespin.last_schedule_prespin_target_gnss_ns = 0;
+  rt.prespin.scheduled_generation = 0;
 }
 
 static void schedule_ocxo_from_edge(interrupt_subscriber_runtime_t& rt,
@@ -815,6 +852,7 @@ static void handle_event(interrupt_subscriber_runtime_t& rt,
     ps.snap_fired = true;
     ps.snap_timed_out = false;
     ps.snap_timeout_elapsed_cycles = 0;
+    ps.last_completed_generation = ps.snap_generation;
 
   } else if (ps_was_timed_out) {
     // Late-after-timeout: prespin timed out, then the event eventually arrived.
@@ -836,6 +874,7 @@ static void handle_event(interrupt_subscriber_runtime_t& rt,
     ps.snap_fired = false;
     ps.snap_timed_out = true;
     // snap_timeout_elapsed_cycles was set by the timeout handler.
+    ps.last_late_after_timeout_generation = ps.snap_generation;
 
   } else {
     // No prespin was active at all.
@@ -1212,6 +1251,7 @@ static Payload cmd_report(const Payload&) {
   p.add("anomaly_prespin_null_runtime", g_anomaly_diag.prespin_null_runtime);
   p.add("anomaly_prespin_arm_failed", g_anomaly_diag.prespin_arm_failed);
   p.add("anomaly_prespin_timeout", g_anomaly_diag.prespin_timeout);
+  p.add("anomaly_prespin_stale_callback", g_anomaly_diag.prespin_stale_callback);
   p.add("anomaly_no_prespin_active", g_anomaly_diag.no_prespin_active);
   p.add("anomaly_no_shadow_dwt", g_anomaly_diag.no_shadow_dwt);
   p.add("anomaly_null_desc", g_anomaly_diag.null_desc);
@@ -1256,6 +1296,14 @@ static Payload cmd_report(const Payload&) {
     s.add("prespin_arm_count", rt.prespin.arm_count);
     s.add("prespin_complete_count", rt.prespin.complete_count);
     s.add("prespin_timeout_count", rt.prespin.timeout_count);
+    s.add("prespin_stale_callback_count", rt.prespin.stale_callback_count);
+    s.add("prespin_next_schedule_generation", rt.prespin.next_schedule_generation);
+    s.add("prespin_scheduled_generation", rt.prespin.scheduled_generation);
+    s.add("prespin_armed_generation", rt.prespin.armed_generation);
+    s.add("prespin_snap_generation", rt.prespin.snap_generation);
+    s.add("prespin_last_completed_generation", rt.prespin.last_completed_generation);
+    s.add("prespin_last_timeout_generation", rt.prespin.last_timeout_generation);
+    s.add("prespin_last_late_after_timeout_generation", rt.prespin.last_late_after_timeout_generation);
     s.add("late_after_timeout_count", rt.prespin.late_after_timeout_count);
     s.add("last_late_after_timeout_overage_cycles", rt.prespin.last_late_after_timeout_overage_cycles);
     s.add("last_late_after_timeout_overage_ns", rt.prespin.last_late_after_timeout_overage_ns);

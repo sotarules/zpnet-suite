@@ -165,6 +165,12 @@ static volatile uint32_t diag_asap_slots_high_water   = 0;
 static volatile uint32_t diag_alap_slots_high_water   = 0;
 static volatile uint32_t diag_arm_failures            = 0;
 static volatile uint32_t diag_named_replacements      = 0;
+static volatile uint32_t diag_named_replacements_pps_prespin = 0;
+static volatile uint32_t diag_named_replacements_ocxo1_prespin = 0;
+static volatile uint32_t diag_named_replacements_ocxo2_prespin = 0;
+static volatile uint32_t diag_named_replacements_pps_dispatch = 0;
+static volatile uint32_t diag_named_replacements_ocxo1_dispatch = 0;
+static volatile uint32_t diag_named_replacements_ocxo2_dispatch = 0;
 
 static volatile uint32_t diag_asap_armed              = 0;
 static volatile uint32_t diag_asap_dispatched         = 0;
@@ -373,6 +379,23 @@ static bool gnss_ns_to_vclock_deadline(int64_t target_gnss_ns,
 // Named singleton replacement
 // ============================================================================
 
+static inline void note_named_replacement(const char* name) {
+  if (!name || !*name) return;
+  if (strcmp(name, "PPS_PRESPIN") == 0) {
+    diag_named_replacements_pps_prespin++;
+  } else if (strcmp(name, "OCXO1_PRESPIN") == 0) {
+    diag_named_replacements_ocxo1_prespin++;
+  } else if (strcmp(name, "OCXO2_PRESPIN") == 0) {
+    diag_named_replacements_ocxo2_prespin++;
+  } else if (strcmp(name, "PPS_DISPATCH") == 0) {
+    diag_named_replacements_pps_dispatch++;
+  } else if (strcmp(name, "OCXO1_DISPATCH") == 0) {
+    diag_named_replacements_ocxo1_dispatch++;
+  } else if (strcmp(name, "OCXO2_DISPATCH") == 0) {
+    diag_named_replacements_ocxo2_dispatch++;
+  }
+}
+
 static bool retire_existing_named_slots(const char* name) {
   if (!name || !*name) return false;
 
@@ -387,6 +410,7 @@ static bool retire_existing_named_slots(const char* name) {
     slots[i].expired = false;
     retired_any = true;
     diag_named_replacements++;
+    note_named_replacement(name);
   }
 
   for (uint32_t i = 0; i < MAX_ASAP_SLOTS; i++) {
@@ -397,6 +421,7 @@ static bool retire_existing_named_slots(const char* name) {
     asap_slots[i].active = false;
     retired_any = true;
     diag_named_replacements++;
+    note_named_replacement(name);
   }
 
   for (uint32_t i = 0; i < MAX_ALAP_SLOTS; i++) {
@@ -407,6 +432,7 @@ static bool retire_existing_named_slots(const char* name) {
     alap_slots[i].active = false;
     retired_any = true;
     diag_named_replacements++;
+    note_named_replacement(name);
   }
 
   return retired_any;
@@ -800,6 +826,16 @@ void timepop_init(void) {
   diag_vclock_viability_last_expected_gnss_ns = -1;
   diag_vclock_viability_last_actual_gnss_ns = -1;
   diag_vclock_viability_last_error_ns = 0;
+  diag_deadline_negative_offset = 0;
+  diag_deadline_last_target_gnss_ns = -1;
+  diag_deadline_last_anchor_pps_gnss_ns = -1;
+  diag_deadline_last_ns_from_anchor = 0;
+  diag_named_replacements_pps_prespin = 0;
+  diag_named_replacements_ocxo1_prespin = 0;
+  diag_named_replacements_ocxo2_prespin = 0;
+  diag_named_replacements_pps_dispatch = 0;
+  diag_named_replacements_ocxo1_dispatch = 0;
+  diag_named_replacements_ocxo2_dispatch = 0;
 
   qtimer1_init_vclock_base();
   qtimer1_init_ch2_scheduler();
@@ -1332,6 +1368,17 @@ static Payload cmd_report(const Payload&) {
   out.add("alap_slots_max",       (uint32_t)MAX_ALAP_SLOTS);
   out.add("arm_failures",         diag_arm_failures);
   out.add("named_replacements",   diag_named_replacements);
+  out.add("named_replacements_pps_prespin", diag_named_replacements_pps_prespin);
+  out.add("named_replacements_ocxo1_prespin", diag_named_replacements_ocxo1_prespin);
+  out.add("named_replacements_ocxo2_prespin", diag_named_replacements_ocxo2_prespin);
+  out.add("named_replacements_pps_dispatch", diag_named_replacements_pps_dispatch);
+  out.add("named_replacements_ocxo1_dispatch", diag_named_replacements_ocxo1_dispatch);
+  out.add("named_replacements_ocxo2_dispatch", diag_named_replacements_ocxo2_dispatch);
+
+  out.add("deadline_negative_offset", diag_deadline_negative_offset);
+  out.add("deadline_last_target_gnss_ns", diag_deadline_last_target_gnss_ns);
+  out.add("deadline_last_anchor_pps_gnss_ns", diag_deadline_last_anchor_pps_gnss_ns);
+  out.add("deadline_last_ns_from_anchor", diag_deadline_last_ns_from_anchor);
 
   out.add("asap_armed",             diag_asap_armed);
   out.add("asap_dispatched",        diag_asap_dispatched);
