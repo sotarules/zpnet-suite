@@ -41,17 +41,31 @@
 //
 // Dispatch timing audit:
 //
-//   TimePop now validates actual dispatch timing directly in the ISR path.
-//   For slots that carry a concrete GNSS target, the subsystem captures
-//   ARM_DWT_CYCCNT as the first ISR instruction, subtracts a fixed compare-path
-//   correction, converts the corrected DWT value to GNSS nanoseconds, and
-//   compares that value against the slot's scheduled GNSS target.
+//   TimePop validates actual dispatch timing in the ISR using two independent
+//   domains:
 //
-//   This answers the sharper question:
+//   1. DWT-domain: captures ARM_DWT_CYCCNT, subtracts fixed ISR overhead,
+//      converts to GNSS ns via the DWT bridge, compares against target.
 //
-//     "Did TimePop fire this event at the GNSS time it was supposed to?"
+//   2. VCLOCK-domain: reads the VCLOCK counter (CH0+CH1), converts to GNSS ns
+//      via VCLOCK arithmetic, compares against target.  This is self-consistent
+//      with how the deadline was scheduled and reveals any CH2/CH0 phase offset.
 //
-//   rather than the older broad VCLOCK viability question.
+//   If the DWT domain shows ~585 ns error but the VCLOCK domain shows ~600 ns,
+//   the cause is a boot-time initialization offset between CH0 and CH2 — both
+//   count the same 10 MHz clock but CH0 was enabled first.
+//
+// CH2/CH0 initialization offset:
+//
+//   CH0 and CH2 both count the GNSS 10 MHz clock (CM=1, PCS=0) but are enabled
+//   in separate init functions.  Between CH0's enable (in qtimer1_init_vclock_base)
+//   and CH2's enable (in qtimer1_init_ch2_scheduler), peripheral register writes
+//   for CH1 setup consume several VCLOCK ticks.  This creates a permanent phase
+//   offset: CH2 lags CH0 by a small number of ticks.
+//
+//   Since deadlines are computed from CH0+CH1 but the compare fires on CH2, every
+//   compare fires late by the offset.  The fix (once confirmed) is to synchronize
+//   CH2 to CH0 at init time.
 //
 // ============================================================================
 
@@ -202,7 +216,7 @@ static volatile uint32_t diag_schedule_next_calls_total = 0;
 static volatile uint32_t diag_schedule_next_calls_from_dispatch = 0;
 static volatile uint32_t diag_schedule_next_calls_from_other = 0;
 
-// Dispatch timing diagnostics
+// DWT-domain dispatch timing diagnostics
 static volatile uint32_t diag_dispatch_gnss_checks = 0;
 static volatile uint32_t diag_dispatch_gnss_mismatches = 0;
 static volatile uint32_t diag_dispatch_gnss_skipped_no_target = 0;
@@ -212,10 +226,21 @@ static volatile int64_t  diag_dispatch_gnss_last_actual_ns = -1;
 static volatile int64_t  diag_dispatch_gnss_last_error_ns = 0;
 static volatile uint64_t diag_dispatch_gnss_max_abs_error_ns = 0;
 
+// VCLOCK-domain dispatch timing diagnostics
+static volatile uint32_t diag_dispatch_vclock_checks = 0;
+static volatile uint32_t diag_dispatch_vclock_mismatches = 0;
+static volatile int64_t  diag_dispatch_vclock_last_error_ns = 0;
+static volatile uint64_t diag_dispatch_vclock_max_abs_error_ns = 0;
+static volatile int32_t  diag_dispatch_vclock_last_ticks_late = 0;
+
 static volatile uint32_t diag_deadline_negative_offset = 0;
 static volatile int64_t  diag_deadline_last_target_gnss_ns = -1;
 static volatile int64_t  diag_deadline_last_anchor_pps_gnss_ns = -1;
 static volatile int64_t  diag_deadline_last_ns_from_anchor = 0;
+
+// CH2/CH0 offset diagnostics
+static volatile int16_t  diag_ch2_ch0_offset_at_init = 0;
+static volatile int16_t  diag_ch2_ch0_offset_last_isr = 0;
 
 // ============================================================================
 // Forward declarations
@@ -458,7 +483,7 @@ static int64_t vclock_to_gnss_ns(uint32_t vclock_raw,
 }
 
 // ============================================================================
-// Dispatch timing validation
+// Dispatch timing validation — DWT domain
 // ============================================================================
 
 static inline void validate_dispatch_against_dwt(const timepop_slot_t& slot,
@@ -488,6 +513,44 @@ static inline void validate_dispatch_against_dwt(const timepop_slot_t& slot,
 
   if (abs_error_ns > (uint64_t)TIMEPOP_DISPATCH_GNSS_TOLERANCE_NS) {
     diag_dispatch_gnss_mismatches++;
+  }
+}
+
+// ============================================================================
+// Dispatch timing validation — VCLOCK domain
+// ============================================================================
+//
+// This validates in the same domain the scheduling operates in.
+// gnss_ns_at_isr is computed from the VCLOCK counter (CH0+CH1) via
+// pure arithmetic.  target_gnss_ns was computed from the same anchor
+// via the same arithmetic.
+//
+// If CH2 is phase-offset from CH0, the compare fires late, and this
+// validation will show the offset in multiples of 100 ns (VCLOCK ticks).
+//
+
+static inline void validate_dispatch_against_vclock(const timepop_slot_t& slot,
+                                                    int64_t gnss_ns_at_isr,
+                                                    uint32_t now,
+                                                    uint32_t deadline) {
+  if (slot.target_gnss_ns < 0) return;
+  if (gnss_ns_at_isr < 0) return;
+
+  diag_dispatch_vclock_checks++;
+
+  const int64_t error_ns = gnss_ns_at_isr - slot.target_gnss_ns;
+  diag_dispatch_vclock_last_error_ns = error_ns;
+
+  // Also record the raw tick lateness — this is the most direct measurement.
+  diag_dispatch_vclock_last_ticks_late = (int32_t)(now - deadline);
+
+  const uint64_t abs_error_ns = (uint64_t)llabs(error_ns);
+  if (abs_error_ns > diag_dispatch_vclock_max_abs_error_ns) {
+    diag_dispatch_vclock_max_abs_error_ns = abs_error_ns;
+  }
+
+  if (abs_error_ns > (uint64_t)TIMEPOP_DISPATCH_GNSS_TOLERANCE_NS) {
+    diag_dispatch_vclock_mismatches++;
   }
 }
 
@@ -619,15 +682,19 @@ static inline void slot_build_diag(
 // QTimer1 CH2 ISR — priority queue scheduler
 // ============================================================================
 
-static void qtimer1_ch2_isr(void) {
+static void qtimer1_ch2_isr(uint32_t dwt_entry) {
 
-  const uint32_t dwt_entry = ARM_DWT_CYCCNT;
   const uint32_t dwt_at_compare_event = dwt_entry - TIMEPOP_ISR_EVENT_CORRECTION_CYCLES;
   const uint32_t now       = qtimer1_read_32_local();
   const time_anchor_snapshot_t anchor = time_anchor_snapshot();
 
   ch2_clear_flag();
   diag_isr_count++;
+
+  // Capture CH2/CH0 offset every ISR pass — direct evidence of phase skew.
+  const uint16_t ch0_low16 = (uint16_t)(now & 0xFFFF);
+  const uint16_t ch2_cntr  = IMXRT_TMR1.CH[2].CNTR;
+  diag_ch2_ch0_offset_last_isr = (int16_t)(ch0_low16 - ch2_cntr);
 
   const int64_t gnss_ns_at_isr = vclock_to_gnss_ns(now, anchor);
 
@@ -638,6 +705,7 @@ static void qtimer1_ch2_isr(void) {
     if (!deadline_expired(slots[i].deadline, now)) continue;
 
     validate_dispatch_against_dwt(slots[i], dwt_at_compare_event);
+    validate_dispatch_against_vclock(slots[i], gnss_ns_at_isr, now, slots[i].deadline);
 
     uint32_t landed_dwt;
 
@@ -816,7 +884,7 @@ static void qtimer1_init_vclock_base(void) {
 
 static void qtimer1_init_ch2_scheduler(void) {
   IMXRT_TMR1.CH[2].CTRL   = 0;
-  IMXRT_TMR1.CH[2].CNTR   = 0;
+  IMXRT_TMR1.CH[2].CNTR   = IMXRT_TMR1.CH[0].CNTR;   // sync to CH0 while stopped
   IMXRT_TMR1.CH[2].LOAD   = 0;
   IMXRT_TMR1.CH[2].COMP1  = 0xFFFF;
   IMXRT_TMR1.CH[2].CMPLD1 = 0xFFFF;
@@ -842,6 +910,13 @@ void timepop_init(void) {
   diag_dispatch_gnss_last_actual_ns = -1;
   diag_dispatch_gnss_last_error_ns = 0;
   diag_dispatch_gnss_max_abs_error_ns = 0;
+
+  diag_dispatch_vclock_checks = 0;
+  diag_dispatch_vclock_mismatches = 0;
+  diag_dispatch_vclock_last_error_ns = 0;
+  diag_dispatch_vclock_max_abs_error_ns = 0;
+  diag_dispatch_vclock_last_ticks_late = 0;
+
   diag_deadline_negative_offset = 0;
   diag_deadline_last_target_gnss_ns = -1;
   diag_deadline_last_anchor_pps_gnss_ns = -1;
@@ -853,8 +928,23 @@ void timepop_init(void) {
   diag_named_replacements_ocxo1_dispatch = 0;
   diag_named_replacements_ocxo2_dispatch = 0;
 
+  diag_ch2_ch0_offset_at_init = 0;
+  diag_ch2_ch0_offset_last_isr = 0;
+
   qtimer1_init_vclock_base();
   qtimer1_init_ch2_scheduler();
+
+  // ── Measure the CH2/CH0 phase offset immediately after both are running ──
+  //
+  // CH0 was enabled in qtimer1_init_vclock_base(), CH2 was enabled in
+  // qtimer1_init_ch2_scheduler().  Any ticks that elapsed between the two
+  // enables are now baked into a permanent phase offset.  Read both counters
+  // back-to-back to capture it.
+  {
+    const uint16_t ch0_snap = IMXRT_TMR1.CH[0].CNTR;
+    const uint16_t ch2_snap = IMXRT_TMR1.CH[2].CNTR;
+    diag_ch2_ch0_offset_at_init = (int16_t)(ch0_snap - ch2_snap);
+  }
 
   attachInterruptVector(IRQ_QTIMER1, qtimer1_irq_isr);
   NVIC_SET_PRIORITY(IRQ_QTIMER1, 16);
@@ -1366,6 +1456,7 @@ static Payload cmd_report(const Payload&) {
   out.add("time_valid",        time_valid());
   out.add("time_pps_count",    time_pps_count());
 
+  // ── DWT-domain dispatch validation ──
   out.add("dispatch_gnss_tolerance_ns",        (int64_t)TIMEPOP_DISPATCH_GNSS_TOLERANCE_NS);
   out.add("dispatch_gnss_checks",              diag_dispatch_gnss_checks);
   out.add("dispatch_gnss_mismatches",          diag_dispatch_gnss_mismatches);
@@ -1376,6 +1467,17 @@ static Payload cmd_report(const Payload&) {
   out.add("dispatch_gnss_last_error_ns",       diag_dispatch_gnss_last_error_ns);
   out.add("dispatch_gnss_max_abs_error_ns",    diag_dispatch_gnss_max_abs_error_ns);
   out.add("dispatch_dwt_correction_cycles",    (uint32_t)TIMEPOP_ISR_EVENT_CORRECTION_CYCLES);
+
+  // ── VCLOCK-domain dispatch validation ──
+  out.add("dispatch_vclock_checks",            diag_dispatch_vclock_checks);
+  out.add("dispatch_vclock_mismatches",        diag_dispatch_vclock_mismatches);
+  out.add("dispatch_vclock_last_error_ns",     diag_dispatch_vclock_last_error_ns);
+  out.add("dispatch_vclock_max_abs_error_ns",  diag_dispatch_vclock_max_abs_error_ns);
+  out.add("dispatch_vclock_last_ticks_late",   diag_dispatch_vclock_last_ticks_late);
+
+  // ── CH2/CH0 phase offset ──
+  out.add("ch2_ch0_offset_at_init",            (int32_t)diag_ch2_ch0_offset_at_init);
+  out.add("ch2_ch0_offset_last_isr",           (int32_t)diag_ch2_ch0_offset_last_isr);
 
   out.add("slots_active_now",    timepop_active_count());
   out.add("slots_high_water",     diag_slots_high_water);
@@ -1471,8 +1573,9 @@ static Payload cmd_report(const Payload&) {
 // ============================================================================
 
 static void qtimer1_irq_isr(void) {
+  const uint32_t dwt_raw = ARM_DWT_CYCCNT;           // FIRST instruction
   if (IMXRT_TMR1.CH[2].CSCTRL & TMR_CSCTRL_TCF1) {
-    qtimer1_ch2_isr();
+    qtimer1_ch2_isr(dwt_raw);                          // pass it down
   }
 }
 

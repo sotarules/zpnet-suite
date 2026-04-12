@@ -68,6 +68,23 @@
 //   This prediction is used ONLY for prespin scheduling. It is not canonical
 //   timing truth and is not to be used for OCXO residual calculation.
 //
+// DWT bridge validation (v26):
+//
+//   At each PPS edge, handle_event calls time_dwt_to_gnss_ns(dwt_at_event)
+//   and compares the result against the known-true GNSS nanosecond at the
+//   PPS boundary.  This is the definitive acid test of the DWT-to-GNSS
+//   bridge because:
+//
+//     • dwt_at_event is prespin-corrected to single-nanosecond precision
+//     • the true GNSS time is known by definition (integer second boundary)
+//     • the bridge is using the prior second's calibration constants
+//     • ISR latency is completely eliminated by prespin
+//
+//   If the bridge error is ~580 ns here, the discrepancy observed in
+//   TimePop dispatch validation is in the bridge math, not ISR latency.
+//   If the bridge error is ~0 ns here, the TimePop discrepancy is in
+//   the dispatch path.
+//
 // ============================================================================
 
 #include "process_interrupt.h"
@@ -92,6 +109,8 @@ static constexpr uint32_t MAX_INTERRUPT_SUBSCRIBERS = 8;
 static constexpr uint64_t NS_PER_SECOND_U64      = 1000000000ULL;
 static constexpr uint64_t PRESPIN_LEAD_NS        = 10000ULL;
 static constexpr uint32_t PRESPIN_TIMEOUT_CYCLES = 18000;
+
+static constexpr int64_t BRIDGE_VALIDATION_TOLERANCE_NS = 100LL;
 
 static inline uint64_t dwt_cycles_to_ns_runtime(uint32_t cycles) {
   const uint32_t f = F_CPU_ACTUAL ? F_CPU_ACTUAL : 1008000000U;
@@ -140,6 +159,32 @@ static volatile uint32_t g_prespin_shadow_dwt = 0;
 static volatile uint32_t g_prespin_start_dwt = 0;
 static volatile int32_t  g_prespin_responsibility_count = 0;
 static volatile bool     g_prespin_spinning = false;
+
+// ============================================================================
+// DWT bridge validation state
+// ============================================================================
+//
+// At each PPS edge, we ask time_dwt_to_gnss_ns() what it thinks the GNSS
+// nanosecond is for the prespin-corrected dwt_at_event, and compare against
+// the known-true GNSS time at the PPS boundary.
+//
+// This runs in ISR context where the time anchor still holds the PREVIOUS
+// second's calibration — the bridge must extrapolate across a full second
+// to reach the current PPS edge.  Any systematic error in the bridge math
+// will appear as a stable bias here.
+//
+
+struct bridge_validation_state_t {
+  uint32_t checks = 0;
+  uint32_t within_tolerance = 0;
+  uint32_t outside_tolerance = 0;
+  uint32_t skipped_invalid = 0;
+  int64_t  last_error_ns = 0;
+};
+
+static bridge_validation_state_t g_bridge_pps = {};
+static bridge_validation_state_t g_bridge_ocxo1 = {};
+static bridge_validation_state_t g_bridge_ocxo2 = {};
 
 // ============================================================================
 // QTimer1 PPS-aligned VCLOCK capture
@@ -995,6 +1040,43 @@ static void deferred_dispatch_callback(timepop_ctx_t*, timepop_diag_t*, void* us
 }
 
 // ============================================================================
+// DWT bridge validation helper
+// ============================================================================
+//
+// Validates time_dwt_to_gnss_ns() against a known-true GNSS nanosecond.
+//
+// For PPS events: the true GNSS time is the exact integer second boundary,
+// and dwt_at_event is prespin-corrected — ISR latency is eliminated.
+// The bridge is using the PREVIOUS second's calibration (time_pps_update
+// has not been called yet), so any systematic error in the bridge math
+// will appear as a stable bias.
+//
+// For OCXO events: the true GNSS time is the bridge-computed value
+// (gnss_ns_at_event), so this is a self-consistency check using the
+// anchor snapshot at the moment of the event.
+//
+
+static void bridge_validate(bridge_validation_state_t& bv,
+                            uint32_t dwt_at_event,
+                            uint64_t true_gnss_ns) {
+  const int64_t bridge_gnss_ns = time_dwt_to_gnss_ns(dwt_at_event);
+  if (bridge_gnss_ns < 0) {
+    bv.skipped_invalid++;
+    return;
+  }
+
+  bv.checks++;
+  const int64_t error_ns = bridge_gnss_ns - (int64_t)true_gnss_ns;
+  bv.last_error_ns = error_ns;
+
+  if (llabs(error_ns) <= BRIDGE_VALIDATION_TOLERANCE_NS) {
+    bv.within_tolerance++;
+  } else {
+    bv.outside_tolerance++;
+  }
+}
+
+// ============================================================================
 // handle_event — corrected diagnostic snap + integrity instrumentation (v25)
 // ============================================================================
 //
@@ -1016,6 +1098,13 @@ static void deferred_dispatch_callback(timepop_ctx_t*, timepop_diag_t*, void* us
 //   itself and stored in the event struct, so downstream consumers
 //   (process_clocks_alpha) receive it as a first-class fact rather than
 //   recomputing it independently.
+//
+// v26 changes:
+//
+//   NEW: DWT bridge validation at PPS boundary.  After reconstructing
+//   the canonical event, calls time_dwt_to_gnss_ns(dwt_at_event) and
+//   compares against the known-true GNSS nanosecond.  Counts hits
+//   within/outside 100 ns tolerance and records the last error.
 //
 // ============================================================================
 
@@ -1135,6 +1224,21 @@ static void handle_event(interrupt_subscriber_runtime_t& rt,
     const int64_t pps_index = (int64_t)rt.event_count;
     event.gnss_ns_at_event = (uint64_t)(pps_index * 1000000000LL);
     event.status = interrupt_event_status_t::OK;
+
+    // ── DWT bridge validation at PPS boundary ──
+    //
+    // The true GNSS nanosecond is the integer second boundary we just
+    // computed above.  dwt_at_event is prespin-corrected.  The time
+    // anchor still holds the PREVIOUS second's calibration because
+    // time_pps_update() has not been called yet (that happens later
+    // in deferred_dispatch_callback → pps_callback → time_pps_update).
+    //
+    // This is the definitive test: if the bridge shows ~580 ns error
+    // here, the discrepancy is in the bridge math.  If ~0 ns, the
+    // TimePop dispatch error is elsewhere.
+
+    bridge_validate(g_bridge_pps, dwt_at_event, event.gnss_ns_at_event);
+
   } else {
     const int64_t gnss_ns_signed = time_dwt_to_gnss_ns(dwt_at_event);
     if (gnss_ns_signed >= 0) {
@@ -1399,6 +1503,11 @@ void process_interrupt_init(void) {
   g_prespin_spinning = false;
 
   g_pps_drumbeat = {};
+
+  g_bridge_pps = {};
+  g_bridge_ocxo1 = {};
+  g_bridge_ocxo2 = {};
+
   g_interrupt_runtime_ready = true;
 }
 
@@ -1414,6 +1523,32 @@ void process_interrupt_enable_irqs(void) {
   NVIC_SET_PRIORITY(IRQ_GPIO6789, 0);
 
   g_interrupt_irqs_enabled = true;
+}
+
+// ============================================================================
+// Report helper — emit bridge validation block
+// ============================================================================
+
+static void report_add_bridge_validation(Payload& p,
+                                         const char* prefix,
+                                         const bridge_validation_state_t& bv) {
+  char key[64];
+
+  auto add_u32 = [&](const char* suffix, uint32_t value) {
+    snprintf(key, sizeof(key), "%s_%s", prefix, suffix);
+    p.add(key, value);
+  };
+
+  auto add_i64 = [&](const char* suffix, int64_t value) {
+    snprintf(key, sizeof(key), "%s_%s", prefix, suffix);
+    p.add(key, value);
+  };
+
+  add_u32("checks", bv.checks);
+  add_u32("within_tolerance", bv.within_tolerance);
+  add_u32("outside_tolerance", bv.outside_tolerance);
+  add_u32("skipped_invalid", bv.skipped_invalid);
+  add_i64("last_error_ns", bv.last_error_ns);
 }
 
 static Payload cmd_report(const Payload&) {
@@ -1463,6 +1598,10 @@ static Payload cmd_report(const Payload&) {
   p.add("anomaly_last_detail0", g_anomaly_diag.last_detail0);
   p.add("anomaly_last_detail1", g_anomaly_diag.last_detail1);
   p.add("anomaly_last_detail2", g_anomaly_diag.last_detail2);
+
+  // ── DWT bridge validation ──
+
+  report_add_bridge_validation(p, "bridge_pps", g_bridge_pps);
 
   PayloadArray subscribers;
   for (uint32_t i = 0; i < g_subscriber_count; i++) {
