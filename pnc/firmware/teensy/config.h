@@ -164,8 +164,8 @@ static constexpr uint32_t QTIMER1_CH0_MASK = 0xFFFF;
 // -------   -------------   ---   --------------------   ----------
 // DWT       ARM_DWT_CYCCNT   —    CPU core (1008 MHz)    ~1 ns
 // GNSS      QTimer1 ch0+1    10   GF-8802 VCLOCK 10 MHz  100 ns
-// OCXO1     GPT1             25   AOCJY1-A #1   10 MHz   100 ns
-// OCXO2     GPT2             14   AOCJY1-A #2   10 MHz   100 ns
+// OCXO1     QTimer3 ch2      14   AOCJY1-A #1   10 MHz   100 ns
+// OCXO2     QTimer3 ch3      15   AOCJY1-A #2   10 MHz   100 ns
 //
 // All timing domains free-run continuously.
 // All are captured simultaneously in the PPS ISR.
