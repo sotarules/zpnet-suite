@@ -140,12 +140,14 @@ static volatile uint64_t g_epoch_pps_index = 0;
 
 ocxo_dac_state_t ocxo1_dac = {
   (double)AD5693R_DAC_DEFAULT, AD5693R_DAC_DEFAULT, 0, 65535,
-  0, 0.0, 0, 0
+  0, 0.0, 0, 0,
+  false, 0.0, 0.0, 0.0, 0.0, 0
 };
 
 ocxo_dac_state_t ocxo2_dac = {
   (double)AD5693R_DAC_DEFAULT, AD5693R_DAC_DEFAULT, 0, 65535,
-  0, 0.0, 0, 0
+  0, 0.0, 0, 0,
+  false, 0.0, 0.0, 0.0, 0.0, 0
 };
 
 servo_mode_t calibrate_ocxo_mode = servo_mode_t::OFF;
@@ -164,6 +166,19 @@ servo_mode_t servo_mode_parse(const char* s) {
   if (strcmp(s, "MEAN")  == 0) return servo_mode_t::TOTAL;  // legacy compat
   if (strcmp(s, "NOW")   == 0) return servo_mode_t::NOW;
   return servo_mode_t::OFF;
+}
+
+void ocxo_dac_predictor_reset(ocxo_dac_state_t& s) {
+  s.servo_last_step = 0.0;
+  s.servo_last_residual = 0.0;
+  s.servo_settle_count = 0;
+  s.servo_adjustments = 0;
+  s.servo_predictor_initialized = false;
+  s.servo_last_raw_residual = 0.0;
+  s.servo_filtered_residual = 0.0;
+  s.servo_filtered_slope = 0.0;
+  s.servo_predicted_residual = 0.0;
+  s.servo_predictor_updates = 0;
 }
 
 void ocxo_dac_set(ocxo_dac_state_t& s, double value) {

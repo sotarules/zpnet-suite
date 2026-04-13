@@ -214,10 +214,19 @@ struct ocxo_dac_state_t {
   uint16_t dac_hw_code;
   uint32_t dac_min;
   uint32_t dac_max;
+
   double   servo_last_step;
   double   servo_last_residual;
   uint32_t servo_settle_count;
   uint32_t servo_adjustments;
+
+  // Predictive servo state.
+  bool     servo_predictor_initialized;
+  double   servo_last_raw_residual;
+  double   servo_filtered_residual;
+  double   servo_filtered_slope;
+  double   servo_predicted_residual;
+  uint32_t servo_predictor_updates;
 };
 
 extern ocxo_dac_state_t ocxo1_dac;
@@ -243,6 +252,7 @@ static constexpr uint32_t SERVO_SETTLE_SECONDS = 5;
 static constexpr uint32_t SERVO_MIN_SAMPLES    = 10;
 
 void ocxo_dac_set(ocxo_dac_state_t& s, double value);
+void ocxo_dac_predictor_reset(ocxo_dac_state_t& s);
 
 // ============================================================================
 // Campaign state

@@ -129,11 +129,27 @@ double dac_welford_stderr(const dac_welford_t& w) {
   return (w.n >= 2) ? sqrt(w.m2 / (double)(w.n - 1)) / sqrt((double)w.n) : 0.0;
 }
 
-// ── NOW servo (short-window) ──
+// ── Predictive servo tuning ──
+//
+// Both TOTAL and NOW drive a filtered residual *and* a filtered mean slope
+// toward zero.  The controller projects a short horizon into the future and
+// adjusts the DAC toward that projected residual rather than reacting only to
+// the current residual.
+//
 
 static constexpr uint32_t NOW_WINDOW_SIZE = 5;
-static constexpr double   NOW_NS_PER_DAC_LSB = 100.0;
-static constexpr double   NOW_MIN_RESIDUAL_NS = 5.0;
+
+static constexpr double SERVO_NS_PER_DAC_LSB = 100.0;
+static constexpr double SERVO_MIN_RESIDUAL_NS = 5.0;
+static constexpr double SERVO_MIN_PREDICTED_NS = 2.0;
+
+static constexpr double SERVO_TOTAL_RESIDUAL_ALPHA = 0.08;
+static constexpr double SERVO_TOTAL_SLOPE_ALPHA    = 0.12;
+static constexpr double SERVO_TOTAL_HORIZON_S      = 8.0;
+
+static constexpr double SERVO_NOW_RESIDUAL_ALPHA = 0.25;
+static constexpr double SERVO_NOW_SLOPE_ALPHA    = 0.35;
+static constexpr double SERVO_NOW_HORIZON_S      = 3.0;
 
 struct now_window_t {
   int64_t  samples[NOW_WINDOW_SIZE];
@@ -171,6 +187,9 @@ void clocks_zero_all(void) {
   dac_welford_reset(dac_welford_ocxo1);
   dac_welford_reset(dac_welford_ocxo2);
 
+  ocxo_dac_predictor_reset(ocxo1_dac);
+  ocxo_dac_predictor_reset(ocxo2_dac);
+
   now_window_reset(g_now_window_ocxo1);
   now_window_reset(g_now_window_ocxo2);
 }
@@ -179,47 +198,70 @@ void clocks_zero_all(void) {
 // Servo logic
 // ============================================================================
 //
-// TOTAL: drives campaign-wide PPB (= Welford mean of per-second residuals)
-//        toward zero.  The Welford mean is never reset — its natural inertia
-//        provides automatic damping as N grows.
+// TOTAL: uses the campaign-wide residual mean as the residual signal.
+// NOW:   uses the mean of the recent NOW window as the residual signal.
 //
-// NOW:   drives the mean of the last NOW_WINDOW_SIZE per-second residuals
-//        toward zero.  More responsive than TOTAL, but still smoothed
-//        over a short window to avoid single-sample jitter.
+// Both modes use the same predictive controller:
+//   1. low-pass filter the residual signal
+//   2. low-pass filter the per-second slope of that residual
+//   3. project a short horizon into the future
+//   4. drive the projected residual toward zero
 //
-// Both modes use the same sign convention:
+// Sign convention:
 //   Positive residual = clock fast → lower DAC
 //   Negative residual = clock slow → raise DAC
 //
 
-// ── TOTAL servo ──
+static void ocxo_servo_predictive(ocxo_dac_state_t& dac,
+                                  double residual_signal_ns,
+                                  double residual_alpha,
+                                  double slope_alpha,
+                                  double horizon_s) {
+  dac.servo_last_residual = residual_signal_ns;
 
-static void ocxo_servo_total(ocxo_dac_state_t& dac, const pps_residual_t& residuals) {
-  if (residuals.n < SERVO_MIN_SAMPLES) return;
+  if (!dac.servo_predictor_initialized) {
+    dac.servo_predictor_initialized = true;
+    dac.servo_last_raw_residual = residual_signal_ns;
+    dac.servo_filtered_residual = residual_signal_ns;
+    dac.servo_filtered_slope = 0.0;
+    dac.servo_predicted_residual = residual_signal_ns;
+    dac.servo_predictor_updates = 1;
+    return;
+  }
 
-  dac.servo_settle_count++;
-  if (dac.servo_settle_count < SERVO_SETTLE_SECONDS) return;
+  const double raw_slope = residual_signal_ns - dac.servo_last_raw_residual;
+  dac.servo_last_raw_residual = residual_signal_ns;
 
-  const double ppb = residuals.mean;
-  dac.servo_last_residual = ppb;
+  dac.servo_filtered_residual =
+      (1.0 - residual_alpha) * dac.servo_filtered_residual +
+      residual_alpha * residual_signal_ns;
 
-  if (fabs(ppb) < 0.1) return;
+  dac.servo_filtered_slope =
+      (1.0 - slope_alpha) * dac.servo_filtered_slope +
+      slope_alpha * raw_slope;
 
-  double step = -ppb * 0.05;
+  dac.servo_predicted_residual =
+      dac.servo_filtered_residual + dac.servo_filtered_slope * horizon_s;
+
+  dac.servo_predictor_updates++;
+
+  if (fabs(dac.servo_filtered_residual) < SERVO_MIN_RESIDUAL_NS &&
+      fabs(dac.servo_predicted_residual) < SERVO_MIN_PREDICTED_NS) {
+    return;
+  }
+
+  double step = -dac.servo_predicted_residual / SERVO_NS_PER_DAC_LSB;
   if (step >  (double)SERVO_MAX_STEP) step =  (double)SERVO_MAX_STEP;
   if (step < -(double)SERVO_MAX_STEP) step = -(double)SERVO_MAX_STEP;
 
-  ocxo_dac_set(dac, dac.dac_fractional + step);
+  if (fabs(step) < 1.0) {
+    // Do not thrash the DAC for sub-LSB fractional intent.
+    return;
+  }
 
+  ocxo_dac_set(dac, dac.dac_fractional + step);
   dac.servo_last_step = step;
   dac.servo_adjustments++;
-  dac.servo_settle_count = 0;
-}
-
-static void now_window_push(now_window_t& w, int64_t sample) {
-  w.samples[w.head] = sample;
-  w.head = (w.head + 1) % NOW_WINDOW_SIZE;
-  if (w.count < NOW_WINDOW_SIZE) w.count++;
 }
 
 static double now_window_mean(const now_window_t& w) {
@@ -229,23 +271,36 @@ static double now_window_mean(const now_window_t& w) {
   return sum / (double)w.count;
 }
 
+static void now_window_push(now_window_t& w, int64_t sample) {
+  w.samples[w.head] = sample;
+  w.head = (w.head + 1) % NOW_WINDOW_SIZE;
+  if (w.count < NOW_WINDOW_SIZE) w.count++;
+}
+
+static void ocxo_servo_total(ocxo_dac_state_t& dac, const pps_residual_t& residuals) {
+  if (residuals.n < SERVO_MIN_SAMPLES) return;
+
+  dac.servo_settle_count++;
+  if (dac.servo_settle_count < SERVO_SETTLE_SECONDS) return;
+
+  ocxo_servo_predictive(dac,
+                        residuals.mean,
+                        SERVO_TOTAL_RESIDUAL_ALPHA,
+                        SERVO_TOTAL_SLOPE_ALPHA,
+                        SERVO_TOTAL_HORIZON_S);
+
+  dac.servo_settle_count = 0;
+}
+
 static void ocxo_servo_now(ocxo_dac_state_t& dac, const now_window_t& window) {
   if (window.count < NOW_WINDOW_SIZE) return;
   if (campaign_seconds < SERVO_MIN_SAMPLES) return;
 
-  const double mean_ns = now_window_mean(window);
-  dac.servo_last_residual = mean_ns;
-
-  if (fabs(mean_ns) < NOW_MIN_RESIDUAL_NS) return;
-
-  double step = -mean_ns / NOW_NS_PER_DAC_LSB;
-  if (step >  (double)SERVO_MAX_STEP) step =  (double)SERVO_MAX_STEP;
-  if (step < -(double)SERVO_MAX_STEP) step = -(double)SERVO_MAX_STEP;
-
-  ocxo_dac_set(dac, dac.dac_fractional + step);
-
-  dac.servo_last_step = step;
-  dac.servo_adjustments++;
+  ocxo_servo_predictive(dac,
+                        now_window_mean(window),
+                        SERVO_NOW_RESIDUAL_ALPHA,
+                        SERVO_NOW_SLOPE_ALPHA,
+                        SERVO_NOW_HORIZON_S);
 }
 
 static void ocxo_calibration_servo(void) {
@@ -473,6 +528,18 @@ void clocks_beta_pps(void) {
   p.add("ocxo2_dac", ocxo2_dac.dac_fractional);
   p.add("calibrate_ocxo", servo_mode_str(calibrate_ocxo_mode));
 
+  p.add("ocxo1_servo_filtered_residual_ns", ocxo1_dac.servo_filtered_residual, 6);
+  p.add("ocxo1_servo_filtered_slope_ns_per_s", ocxo1_dac.servo_filtered_slope, 6);
+  p.add("ocxo1_servo_predicted_residual_ns", ocxo1_dac.servo_predicted_residual, 6);
+  p.add("ocxo1_servo_predictor_updates", ocxo1_dac.servo_predictor_updates);
+  p.add("ocxo1_servo_last_step", ocxo1_dac.servo_last_step, 6);
+
+  p.add("ocxo2_servo_filtered_residual_ns", ocxo2_dac.servo_filtered_residual, 6);
+  p.add("ocxo2_servo_filtered_slope_ns_per_s", ocxo2_dac.servo_filtered_slope, 6);
+  p.add("ocxo2_servo_predicted_residual_ns", ocxo2_dac.servo_predicted_residual, 6);
+  p.add("ocxo2_servo_predictor_updates", ocxo2_dac.servo_predictor_updates);
+  p.add("ocxo2_servo_last_step", ocxo2_dac.servo_last_step, 6);
+
   clocks_payload_add_interrupt_diag(p, "pps_diag", g_pps_interrupt_diag);
   clocks_payload_add_interrupt_diag(p, "ocxo1_diag", g_ocxo1_interrupt_diag);
   clocks_payload_add_interrupt_diag(p, "ocxo2_diag", g_ocxo2_interrupt_diag);
@@ -594,6 +661,9 @@ static Payload cmd_start(const Payload& args) {
   if (args.tryGetDouble("set_dac2", dac_val)) ocxo_dac_set(ocxo2_dac, dac_val);
 
   calibrate_ocxo_mode = servo_mode_parse(args.getString("calibrate_ocxo"));
+
+  ocxo_dac_predictor_reset(ocxo1_dac);
+  ocxo_dac_predictor_reset(ocxo2_dac);
 
   request_start = true;
   request_stop = false;
