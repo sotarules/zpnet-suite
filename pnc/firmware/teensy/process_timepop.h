@@ -9,7 +9,7 @@
 //   • queue prediction / nearest-deadline selection
 //   • deferred callback dispatch
 //   • instrumentation / reports
-//   • opt-in internal VCLOCK edge characterization
+//   • always-on internal VCLOCK edge characterization
 //
 // TimePop does not own:
 //   • QTIMER1 vector installation

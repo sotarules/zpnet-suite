@@ -62,7 +62,7 @@
 //   • next-deadline selection
 //   • CH2 compare arming
 //   • timer diagnostics
-//   • opt-in internal scheduler-path characterization
+//   • always-on internal scheduler-path characterization
 //
 // TimePop does not own:
 //   • interrupt-latency canonicalization
@@ -167,7 +167,11 @@ typedef void (*timepop_callback_t)(
 //   Delay in GNSS nanoseconds from "now".
 //
 // recurring:
-//   If true, the timer rearms automatically using the same relative period.
+//   If true, TimePop rearms the timer using absolute GNSS-series semantics
+//   when a lawful anchor is available. For example, a 1 ms recurring timer
+//   lands on exact 1 ms VCLOCK/GNSS grid boundaries rather than drifting
+//   relative to its prior callback. If no lawful anchor exists yet, TimePop
+//   falls back to ordinary relative recurrence until one does.
 //
 // Returns TIMEPOP_INVALID_HANDLE on failure.
 //
@@ -227,9 +231,8 @@ timepop_handle_t timepop_arm_alap(
 //   Absolute GNSS nanosecond at which the timer should fire.
 //
 // recurring:
-//   Reserved for future use. In the current design, absolute timers are
-//   expected to be one-shot unless the implementation explicitly documents
-//   recurring absolute semantics.
+//   Public absolute timers remain one-shot unless a future API supplies an
+//   explicit absolute recurrence period.
 //
 // This API is intended for callers that already know the exact target
 // boundary and want to avoid caller-side relative scheduling jitter.
@@ -263,8 +266,8 @@ timepop_handle_t timepop_arm_at(
 //     offset_gnss_ns = 1_000_000_000 - 5_000
 //
 // recurring:
-//   Reserved for future use. Anchor-relative timers are currently expected to
-//   be one-shot unless the implementation explicitly documents recurrence.
+//   If true, the timer rearms as an absolute 1-second series preserving the
+//   supplied anchor-relative phase.
 //
 // Returns TIMEPOP_INVALID_HANDLE on failure.
 //

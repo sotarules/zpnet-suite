@@ -89,12 +89,18 @@
 #include <math.h>
 #include <climits>
 
+// ============================================================================
+// Forward declarations
+// ============================================================================
 
 static inline bool deadline_expired(uint32_t deadline, uint32_t now);
 static inline uint32_t vclock_count(void);
 static bool gnss_ns_to_vclock_deadline(int64_t target_gnss_ns,
                                        const time_anchor_snapshot_t& snap,
                                        uint32_t& out_deadline);
+static inline uint32_t qtimer1_read_32_local(void);
+static int64_t vclock_to_gnss_ns(uint32_t vclock_raw,
+                                 const time_anchor_snapshot_t& snap);
 
 // ============================================================================
 // Constants — 10 MHz domain
@@ -113,6 +119,8 @@ static constexpr int64_t  TIMEPOP_DISPATCH_GNSS_TOLERANCE_NS = 100LL;
 static constexpr uint64_t SMARTPOP_EARLY_WAKE_NS = 1000ULL;
 static constexpr uint32_t SMARTPOP_SPIN_MAX_CYCLES = 3000U;
 static constexpr uint32_t SMARTPOP_MIN_MARGIN_CYCLES = 64U;
+static constexpr int64_t  VCLOCK_MONITOR_OFFSET_NS = 1000000LL;
+static constexpr const char* VCLOCK_MONITOR_NAME = "VCLOCK_MONITOR";
 
 static inline uint32_t ns_to_dwt_cycles_runtime(uint64_t ns) {
   const uint32_t f = F_CPU_ACTUAL ? F_CPU_ACTUAL : 1008000000U;
@@ -150,11 +158,19 @@ static inline bool is_monitored_name(const char* name) {
 // Slot
 // ============================================================================
 
+enum class timepop_recurrence_mode_t : uint8_t {
+  NONE = 0,
+  RELATIVE = 1,
+  ABSOLUTE = 2,
+};
+
 struct timepop_slot_t {
   bool                active;
   bool                expired;
   bool                recurring;
   bool                is_absolute;
+  timepop_recurrence_mode_t recurrence_mode;
+
 
   timepop_handle_t    handle;
   uint32_t            deadline;
@@ -190,6 +206,8 @@ struct timepop_slot_t {
   uint32_t            recurring_rearmed_count;
   uint32_t            recurring_immediate_expire_count;
   uint32_t            recurring_catchup_count;
+  int64_t             recurring_base_gnss_ns;
+  uint64_t            recurring_period_gnss_ns;
 
   uint32_t            arm_vclock_raw;
   uint32_t            arm_delta_ticks;
@@ -331,15 +349,15 @@ static volatile int64_t  diag_deadline_last_anchor_pps_gnss_ns = -1;
 static volatile int64_t  diag_deadline_last_ns_from_anchor = 0;
 
 
+
 struct vclock_edge_monitor_state_t {
-  bool     enabled = false;             // opt-in only
-  bool     armed = false;               // one-shot armed against CH2
-  uint32_t deadline = 0;                // VCLOCK deadline for the probe
-  int64_t  target_gnss_ns = -1;         // exact GNSS second boundary being probed
+  bool     enabled = true;              // always-on internal monitor
+  bool     armed = false;               // true once the recurring slot has been bootstrapped
+  timepop_handle_t handle = TIMEPOP_INVALID_HANDLE;
+  int64_t  target_gnss_ns = -1;         // most recent/current recurring target (PPS + 1 ms)
 
   uint32_t captures = 0;
   uint32_t arm_count = 0;
-  uint32_t cancel_count = 0;
   uint32_t arm_failures = 0;
   uint32_t skipped_invalid_anchor = 0;
 
@@ -353,14 +371,10 @@ struct vclock_edge_monitor_state_t {
   int64_t  last_ch0_ch1_gnss_ns = -1;
   int64_t  last_ch0_ch1_minus_target_ns = 0;
 
-  // PPS-side GNSS nanoseconds corresponding to the correlated PPS edge.
-  int64_t  last_pps_gnss_ns = -1;
-
-  // Correlation against the corresponding PPS edge is computed lazily from the
-  // current time anchor.  When valid, target_gnss_ns equals the most recent PPS
-  // boundary represented by the anchor.
+  // Correlation against the corresponding PPS edge.
   bool     last_correlation_valid = false;
   uint32_t last_pps_dwt_at_edge = 0;
+  int64_t  last_pps_gnss_ns = -1;
   int32_t  last_vclock_minus_pps_cycles = 0;
   int64_t  last_vclock_minus_pps_ns = 0;
 };
@@ -382,7 +396,9 @@ static void vclock_edge_monitor_refresh_correlation(void) {
   const time_anchor_snapshot_t snap = time_anchor_snapshot();
   const int64_t latest_pps_gnss_ns = time_anchor_latest_pps_gnss_ns(snap);
   if (latest_pps_gnss_ns < 0) return;
-  if (latest_pps_gnss_ns != g_vclock_edge_monitor.target_gnss_ns) return;
+
+  const int64_t expected_pps_gnss_ns = g_vclock_edge_monitor.target_gnss_ns - VCLOCK_MONITOR_OFFSET_NS;
+  if (latest_pps_gnss_ns != expected_pps_gnss_ns) return;
 
   g_vclock_edge_monitor.last_pps_gnss_ns = latest_pps_gnss_ns;
   g_vclock_edge_monitor.last_pps_dwt_at_edge = snap.dwt_at_pps;
@@ -393,50 +409,37 @@ static void vclock_edge_monitor_refresh_correlation(void) {
   g_vclock_edge_monitor.last_correlation_valid = true;
 }
 
-static bool vclock_edge_monitor_arm_once_internal(void) {
-  const time_anchor_snapshot_t snap = time_anchor_snapshot();
-  if (!snap.ok || !snap.valid || snap.pps_count < 1) {
-    g_vclock_edge_monitor.arm_failures++;
-    g_vclock_edge_monitor.skipped_invalid_anchor++;
-    return false;
-  }
+static void vclock_monitor_callback(timepop_ctx_t* ctx,
+                                    timepop_diag_t* diag,
+                                    void*) {
+  const time_anchor_snapshot_t anchor = time_anchor_snapshot();
 
-  const int64_t target_gnss_ns = (int64_t)snap.pps_count * (int64_t)1000000000LL;
+  const uint32_t fire_vclock_raw = ctx ? ctx->fire_vclock_raw : 0;
+  const int64_t fire_gnss_ns = ctx ? ctx->fire_gnss_ns : -1;
+  const uint32_t dwt_isr_entry_raw = diag ? diag->dwt_at_isr_entry : 0;
+  const uint32_t dwt_at_edge =
+      dwt_isr_entry_raw ? (dwt_isr_entry_raw - QTIMER_ISR_FIXED_OVERHEAD) : 0;
 
-  uint32_t deadline = 0;
-  if (!gnss_ns_to_vclock_deadline(target_gnss_ns, snap, deadline)) {
-    g_vclock_edge_monitor.arm_failures++;
-    return false;
-  }
+  const uint32_t ch0_ch1_vclock_raw = qtimer1_read_32_local();
+  const int64_t ch0_ch1_gnss_ns = vclock_to_gnss_ns(ch0_ch1_vclock_raw, anchor);
 
-  const uint32_t now = vclock_count();
-  if (deadline_expired(deadline, now)) {
-    g_vclock_edge_monitor.arm_failures++;
-    return false;
-  }
+  g_vclock_edge_monitor.last_fire_vclock_raw = fire_vclock_raw;
+  g_vclock_edge_monitor.last_fire_gnss_ns = fire_gnss_ns;
+  g_vclock_edge_monitor.last_dwt_isr_entry_raw = dwt_isr_entry_raw;
+  g_vclock_edge_monitor.last_dwt_at_edge = dwt_at_edge;
 
-  g_vclock_edge_monitor.enabled = true;
-  g_vclock_edge_monitor.armed = true;
-  g_vclock_edge_monitor.deadline = deadline;
-  g_vclock_edge_monitor.target_gnss_ns = target_gnss_ns;
-  g_vclock_edge_monitor.arm_count++;
-  g_vclock_edge_monitor.last_correlation_valid = false;
+  g_vclock_edge_monitor.last_ch0_ch1_vclock_raw = ch0_ch1_vclock_raw;
+  g_vclock_edge_monitor.last_ch0_ch1_gnss_ns = ch0_ch1_gnss_ns;
+  g_vclock_edge_monitor.last_ch0_ch1_minus_target_ns =
+      (ch0_ch1_gnss_ns >= 0 && g_vclock_edge_monitor.target_gnss_ns >= 0)
+          ? (ch0_ch1_gnss_ns - g_vclock_edge_monitor.target_gnss_ns)
+          : 0;
 
-  return true;
-}
-
-static void vclock_edge_monitor_cancel_internal(void) {
-  if (g_vclock_edge_monitor.armed) {
-    g_vclock_edge_monitor.cancel_count++;
-  }
-  g_vclock_edge_monitor.enabled = false;
-  g_vclock_edge_monitor.armed = false;
-  g_vclock_edge_monitor.deadline = 0;
-  g_vclock_edge_monitor.target_gnss_ns = -1;
+  g_vclock_edge_monitor.captures++;
   g_vclock_edge_monitor.last_pps_gnss_ns = -1;
   g_vclock_edge_monitor.last_correlation_valid = false;
+  vclock_edge_monitor_refresh_correlation();
 }
-
 
 // ============================================================================
 // Forward declarations
@@ -444,6 +447,16 @@ static void vclock_edge_monitor_cancel_internal(void) {
 
 static void qtimer1_irq_isr(void);
 static void schedule_next(void);
+static timepop_handle_t arm_absolute_slot_internal(
+  int64_t             target_gnss_ns,
+  bool                recurring,
+  uint64_t            recurring_period_gnss_ns,
+  timepop_callback_t  callback,
+  void*               user_data,
+  const char*         name,
+  bool                isr_callback,
+  uint32_t            target_dwt = 0);
+static bool vclock_edge_monitor_bootstrap(void);
 
 // ============================================================================
 // Helpers
@@ -855,14 +868,6 @@ static void schedule_next(void) {
     }
   }
 
-  if (g_vclock_edge_monitor.enabled && g_vclock_edge_monitor.armed) {
-    if (!deadline_expired(g_vclock_edge_monitor.deadline, now)) {
-      if (!found || ((g_vclock_edge_monitor.deadline - now) < (soonest - now))) {
-        soonest = g_vclock_edge_monitor.deadline;
-        found = true;
-      }
-    }
-  }
 
   uint32_t target;
   if (!found) {
@@ -951,31 +956,6 @@ static void qtimer1_ch2_isr(uint32_t dwt_entry) {
   const int64_t gnss_ns_at_isr = vclock_to_gnss_ns(now, anchor);
 
   bool any_expired = false;
-  bool monitor_fired = false;
-
-  if (g_vclock_edge_monitor.enabled && g_vclock_edge_monitor.armed &&
-      deadline_expired(g_vclock_edge_monitor.deadline, now)) {
-    const uint32_t ch0_ch1_vclock_raw = qtimer1_read_32_local();
-    const int64_t ch0_ch1_gnss_ns = vclock_to_gnss_ns(ch0_ch1_vclock_raw, anchor);
-
-    g_vclock_edge_monitor.last_fire_vclock_raw = now;
-    g_vclock_edge_monitor.last_fire_gnss_ns = gnss_ns_at_isr;
-    g_vclock_edge_monitor.last_dwt_isr_entry_raw = dwt_entry;
-    g_vclock_edge_monitor.last_dwt_at_edge = dwt_entry - QTIMER_ISR_FIXED_OVERHEAD;
-    g_vclock_edge_monitor.last_ch0_ch1_vclock_raw = ch0_ch1_vclock_raw;
-    g_vclock_edge_monitor.last_ch0_ch1_gnss_ns = ch0_ch1_gnss_ns;
-    g_vclock_edge_monitor.last_ch0_ch1_minus_target_ns =
-        (ch0_ch1_gnss_ns >= 0 && g_vclock_edge_monitor.target_gnss_ns >= 0)
-            ? (ch0_ch1_gnss_ns - g_vclock_edge_monitor.target_gnss_ns)
-            : 0;
-    g_vclock_edge_monitor.captures++;
-    g_vclock_edge_monitor.armed = false;
-    g_vclock_edge_monitor.deadline = 0;
-    g_vclock_edge_monitor.last_pps_gnss_ns = -1;
-    g_vclock_edge_monitor.last_correlation_valid = false;
-    vclock_edge_monitor_refresh_correlation();
-    monitor_fired = true;
-  }
 
   for (uint32_t i = 0; i < MAX_SLOTS; i++) {
     if (!slots[i].active || slots[i].expired) continue;
@@ -1076,7 +1056,7 @@ static void qtimer1_ch2_isr(uint32_t dwt_entry) {
   if (any_expired) {
     isr_fire_count++;
     timepop_pending = true;
-  } else if (!monitor_fired) {
+  } else {
     phantom_count++;
   }
 
@@ -1297,6 +1277,7 @@ void timepop_init(void) {
   diag_named_replacements_ocxo2_dispatch = 0;
 
   g_vclock_edge_monitor = {};
+  g_vclock_edge_monitor.enabled = true;
 
   qtimer1_init_vclock_base();
   qtimer1_init_ch2_scheduler();
@@ -1309,6 +1290,126 @@ void timepop_init(void) {
   diag_schedule_next_calls_from_other++;
   schedule_next();
   interrupts();
+}
+
+static timepop_handle_t arm_absolute_slot_internal(
+  int64_t             target_gnss_ns,
+  bool                recurring,
+  uint64_t            recurring_period_gnss_ns,
+  timepop_callback_t  callback,
+  void*               user_data,
+  const char*         name,
+  bool                isr_callback,
+  uint32_t            target_dwt
+) {
+  if (!callback) return TIMEPOP_INVALID_HANDLE;
+  if (target_gnss_ns <= 0) return TIMEPOP_INVALID_HANDLE;
+
+  const time_anchor_snapshot_t snap = time_anchor_snapshot();
+  uint32_t deadline = 0;
+  if (!gnss_ns_to_vclock_deadline(target_gnss_ns, snap, deadline)) {
+    return TIMEPOP_INVALID_HANDLE;
+  }
+
+  noInterrupts();
+
+  const bool retired_named = retire_existing_named_slots(name);
+  if (retired_named) {
+    diag_schedule_next_calls_from_other++;
+    schedule_next();
+  }
+
+  for (uint32_t i = 0; i < MAX_SLOTS; i++) {
+    if (slots[i].active) continue;
+
+    timepop_handle_t h = next_handle++;
+    if (next_handle == TIMEPOP_INVALID_HANDLE) next_handle = 1;
+
+    slots[i] = {};
+    slots[i].active         = true;
+    slots[i].expired        = false;
+    slots[i].recurring      = recurring;
+    slots[i].is_absolute    = true;
+    slots[i].recurrence_mode =
+        (recurring && recurring_period_gnss_ns > 0)
+            ? timepop_recurrence_mode_t::ABSOLUTE
+            : timepop_recurrence_mode_t::NONE;
+    slots[i].handle         = h;
+    slots[i].period_ns      = recurring_period_gnss_ns;
+    slots[i].period_ticks   = (recurring_period_gnss_ns > 0) ? ns_to_ticks(recurring_period_gnss_ns) : 0;
+    slots[i].deadline       = deadline;
+    slots[i].target_gnss_ns = target_gnss_ns;
+    slots[i].callback       = callback;
+    slots[i].user_data      = user_data;
+    slots[i].name           = name;
+    slots[i].fire_gnss_ns   = -1;
+    slots[i].isr_callback   = isr_callback;
+    slots[i].recurring_rearmed_count = 0;
+    slots[i].recurring_immediate_expire_count = 0;
+    slots[i].recurring_catchup_count = 0;
+    slots[i].recurring_base_gnss_ns = target_gnss_ns;
+    slots[i].recurring_period_gnss_ns = recurring_period_gnss_ns;
+    slots[i].arm_vclock_raw = deadline;
+    slots[i].arm_delta_ticks = 0;
+    slots[i].first_expire_now = 0;
+    slots[i].first_expire_recorded = false;
+
+    if (target_dwt != 0) {
+      slots[i].predicted_dwt    = target_dwt;
+      slots[i].prediction_valid = true;
+    } else {
+      slots[i].predicted_dwt = predict_dwt_at_deadline(deadline, slots[i].prediction_valid);
+    }
+
+    smartpop_prepare_slot(slots[i]);
+
+    diag_schedule_next_calls_from_other++;
+    schedule_next();
+    update_slot_high_water();
+    interrupts();
+    return h;
+  }
+
+  diag_arm_failures++;
+  interrupts();
+  return TIMEPOP_INVALID_HANDLE;
+}
+
+static bool vclock_edge_monitor_bootstrap(void) {
+  if (!g_vclock_edge_monitor.enabled) return false;
+  if (g_vclock_edge_monitor.armed && g_vclock_edge_monitor.handle != TIMEPOP_INVALID_HANDLE) return true;
+  if (!time_valid()) return false;
+
+  const time_anchor_snapshot_t snap = time_anchor_snapshot();
+  const int64_t latest_pps_gnss_ns = time_anchor_latest_pps_gnss_ns(snap);
+  if (latest_pps_gnss_ns < 0) return false;
+
+  int64_t target_gnss_ns = latest_pps_gnss_ns + VCLOCK_MONITOR_OFFSET_NS;
+  const int64_t now_gnss_ns = time_gnss_ns_now();
+  if (now_gnss_ns >= 0 && now_gnss_ns >= target_gnss_ns) {
+    target_gnss_ns += 1000000000LL;
+  }
+
+  const uint32_t target_dwt = time_gnss_ns_to_dwt(target_gnss_ns);
+  const timepop_handle_t h =
+      arm_absolute_slot_internal(target_gnss_ns,
+                                 true,
+                                 1000000000ULL,
+                                 vclock_monitor_callback,
+                                 nullptr,
+                                 VCLOCK_MONITOR_NAME,
+                                 true,
+                                 target_dwt);
+  if (h == TIMEPOP_INVALID_HANDLE) {
+    g_vclock_edge_monitor.arm_failures++;
+    return false;
+  }
+
+  g_vclock_edge_monitor.handle = h;
+  g_vclock_edge_monitor.armed = true;
+  g_vclock_edge_monitor.target_gnss_ns = target_gnss_ns;
+  g_vclock_edge_monitor.arm_count++;
+  return true;
 }
 
 // ============================================================================
@@ -1346,6 +1447,7 @@ timepop_handle_t timepop_arm(
     slots[i].expired      = false;
     slots[i].recurring    = recurring;
     slots[i].is_absolute  = false;
+    slots[i].recurrence_mode = timepop_recurrence_mode_t::NONE;
     slots[i].handle       = h;
     slots[i].period_ns    = delay_gnss_ns;
     slots[i].callback     = callback;
@@ -1357,6 +1459,8 @@ timepop_handle_t timepop_arm(
     slots[i].recurring_rearmed_count = 0;
     slots[i].recurring_immediate_expire_count = 0;
     slots[i].recurring_catchup_count = 0;
+    slots[i].recurring_base_gnss_ns = 0;
+    slots[i].recurring_period_gnss_ns = 0;
     slots[i].arm_vclock_raw = 0;
     slots[i].arm_delta_ticks = 0;
     slots[i].first_expire_now = 0;
@@ -1371,10 +1475,41 @@ timepop_handle_t timepop_arm(
     slots[i].arm_vclock_raw = now;
     slots[i].arm_delta_ticks = ticks;
 
+    if (recurring) {
+      const time_anchor_snapshot_t snap = time_anchor_snapshot();
+      const int64_t latest_pps_gnss_ns = time_anchor_latest_pps_gnss_ns(snap);
+      const int64_t now_gnss_ns = time_gnss_ns_now();
+
+      if (latest_pps_gnss_ns >= 0 && now_gnss_ns >= 0 && delay_gnss_ns > 0) {
+        const uint64_t period_ns = delay_gnss_ns;
+        const int64_t ns_since_anchor = now_gnss_ns - latest_pps_gnss_ns;
+        uint64_t steps = 1;
+        if (ns_since_anchor >= 0) {
+          steps = (uint64_t)(ns_since_anchor / (int64_t)period_ns) + 1ULL;
+        }
+        const int64_t target_gnss_ns = latest_pps_gnss_ns + (int64_t)(steps * period_ns);
+        uint32_t deadline_abs = 0;
+        if (gnss_ns_to_vclock_deadline(target_gnss_ns, snap, deadline_abs)) {
+          slots[i].is_absolute = true;
+          slots[i].recurrence_mode = timepop_recurrence_mode_t::ABSOLUTE;
+          slots[i].recurring_base_gnss_ns = latest_pps_gnss_ns + (int64_t)period_ns;
+          slots[i].recurring_period_gnss_ns = period_ns;
+          slots[i].target_gnss_ns = target_gnss_ns;
+          slots[i].deadline = deadline_abs;
+        } else {
+          slots[i].recurrence_mode = timepop_recurrence_mode_t::RELATIVE;
+          slots[i].recurring_period_gnss_ns = delay_gnss_ns;
+        }
+      } else {
+        slots[i].recurrence_mode = timepop_recurrence_mode_t::RELATIVE;
+        slots[i].recurring_period_gnss_ns = delay_gnss_ns;
+      }
+    }
+
     slots[i].predicted_dwt = predict_dwt_at_deadline(
       slots[i].deadline, slots[i].prediction_valid);
 
-    if (slots[i].prediction_valid) {
+    if (slots[i].prediction_valid && slots[i].target_gnss_ns < 0) {
       slots[i].target_gnss_ns = time_dwt_to_gnss_ns(slots[i].predicted_dwt);
     }
 
@@ -1443,68 +1578,17 @@ timepop_handle_t timepop_arm_at(
   void*               user_data,
   const char*         name
 ) {
-  if (!callback) return TIMEPOP_INVALID_HANDLE;
-  if (target_gnss_ns <= 0) return TIMEPOP_INVALID_HANDLE;
-
-  const time_anchor_snapshot_t snap = time_anchor_snapshot();
-
-  uint32_t deadline = 0;
-  if (!gnss_ns_to_vclock_deadline(target_gnss_ns, snap, deadline)) {
-    return TIMEPOP_INVALID_HANDLE;
-  }
-
-  noInterrupts();
-
-  const bool retired_named = retire_existing_named_slots(name);
-  if (retired_named) {
-    diag_schedule_next_calls_from_other++;
-    schedule_next();
-  }
-
-  for (uint32_t i = 0; i < MAX_SLOTS; i++) {
-    if (slots[i].active) continue;
-
-    timepop_handle_t h = next_handle++;
-    if (next_handle == TIMEPOP_INVALID_HANDLE) next_handle = 1;
-
-    slots[i] = {};
-    slots[i].active       = true;
-    slots[i].expired      = false;
-    slots[i].recurring    = recurring;
-    slots[i].is_absolute  = true;
-    slots[i].handle       = h;
-    slots[i].period_ns    = 0;
-    slots[i].period_ticks = 0;
-    slots[i].deadline     = deadline;
-    slots[i].target_gnss_ns = target_gnss_ns;
-    slots[i].callback     = callback;
-    slots[i].user_data    = user_data;
-    slots[i].name         = name;
-    slots[i].fire_gnss_ns = -1;
-    slots[i].isr_callback = false;
-    slots[i].recurring_rearmed_count = 0;
-    slots[i].recurring_immediate_expire_count = 0;
-    slots[i].recurring_catchup_count = 0;
-    slots[i].arm_vclock_raw = deadline;
-    slots[i].arm_delta_ticks = 0;
-    slots[i].first_expire_now = 0;
-    slots[i].first_expire_recorded = false;
-
-    slots[i].predicted_dwt = predict_dwt_at_deadline(
-      deadline, slots[i].prediction_valid);
-
-    smartpop_prepare_slot(slots[i]);
-
-    diag_schedule_next_calls_from_other++;
-    schedule_next();
-    update_slot_high_water();
-    interrupts();
-    return h;
-  }
-
-  diag_arm_failures++;
-  interrupts();
-  return TIMEPOP_INVALID_HANDLE;
+  // Public absolute timers remain one-shot unless a future API supplies an
+  // explicit absolute recurrence period.
+  (void)recurring;
+  return arm_absolute_slot_internal(target_gnss_ns,
+                                    false,
+                                    0,
+                                    callback,
+                                    user_data,
+                                    name,
+                                    false,
+                                    0);
 }
 
 // ============================================================================
@@ -1528,13 +1612,14 @@ timepop_handle_t timepop_arm_from_anchor(
     return TIMEPOP_INVALID_HANDLE;
   }
 
-  return timepop_arm_at(
-    target_gnss_ns,
-    recurring,
-    callback,
-    user_data,
-    name
-  );
+  return arm_absolute_slot_internal(target_gnss_ns,
+                                    recurring,
+                                    recurring ? 1000000000ULL : 0ULL,
+                                    callback,
+                                    user_data,
+                                    name,
+                                    false,
+                                    0);
 }
 
 // ============================================================================
@@ -1552,76 +1637,14 @@ timepop_handle_t timepop_arm_ns(
   const char*         name,
   bool                isr_callback
 ) {
-  if (!callback) return TIMEPOP_INVALID_HANDLE;
-  if (target_gnss_ns <= 0) return TIMEPOP_INVALID_HANDLE;
-
-  const time_anchor_snapshot_t snap = time_anchor_snapshot();
-
-  uint32_t deadline = 0;
-  if (!gnss_ns_to_vclock_deadline(target_gnss_ns, snap, deadline)) {
-    return TIMEPOP_INVALID_HANDLE;
-  }
-
-  noInterrupts();
-
-  const bool retired_named = retire_existing_named_slots(name);
-  if (retired_named) {
-    diag_schedule_next_calls_from_other++;
-    schedule_next();
-  }
-
-  for (uint32_t i = 0; i < MAX_SLOTS; i++) {
-    if (slots[i].active) continue;
-
-    timepop_handle_t h = next_handle++;
-    if (next_handle == TIMEPOP_INVALID_HANDLE) next_handle = 1;
-
-    slots[i] = {};
-    slots[i].active         = true;
-    slots[i].expired        = false;
-    slots[i].recurring      = false;
-    slots[i].is_absolute    = true;
-    slots[i].handle         = h;
-    slots[i].period_ns      = 0;
-    slots[i].period_ticks   = 0;
-    slots[i].deadline       = deadline;
-    slots[i].target_gnss_ns = target_gnss_ns;
-    slots[i].callback       = callback;
-    slots[i].user_data      = user_data;
-    slots[i].name           = name;
-    slots[i].fire_gnss_ns   = -1;
-    slots[i].isr_callback   = isr_callback;
-    slots[i].recurring_rearmed_count = 0;
-    slots[i].recurring_immediate_expire_count = 0;
-    slots[i].recurring_catchup_count = 0;
-    slots[i].arm_vclock_raw = deadline;
-    slots[i].arm_delta_ticks = 0;
-    slots[i].first_expire_now = 0;
-    slots[i].first_expire_recorded = false;
-
-    if (target_dwt != 0) {
-      slots[i].predicted_dwt    = target_dwt;
-      slots[i].prediction_valid = true;
-    } else {
-      slots[i].predicted_dwt = predict_dwt_at_deadline(
-        deadline, slots[i].prediction_valid);
-      if (slots[i].prediction_valid) {
-        slots[i].target_gnss_ns = target_gnss_ns;
-      }
-    }
-
-    smartpop_prepare_slot(slots[i]);
-
-    diag_schedule_next_calls_from_other++;
-    schedule_next();
-    update_slot_high_water();
-    interrupts();
-    return h;
-  }
-
-  diag_arm_failures++;
-  interrupts();
-  return TIMEPOP_INVALID_HANDLE;
+  return arm_absolute_slot_internal(target_gnss_ns,
+                                    false,
+                                    0,
+                                    callback,
+                                    user_data,
+                                    name,
+                                    isr_callback,
+                                    target_dwt);
 }
 
 // ============================================================================
@@ -1700,6 +1723,12 @@ void timepop_dispatch(void) {
   timepop_pending = false;
   diag_dispatch_calls++;
 
+  if (g_vclock_edge_monitor.enabled && !g_vclock_edge_monitor.armed) {
+    noInterrupts();
+    (void)vclock_edge_monitor_bootstrap();
+    interrupts();
+  }
+
   dispatch_deferred_phase(asap_slots,
                           MAX_ASAP_SLOTS,
                           diag_asap_dispatched,
@@ -1712,32 +1741,61 @@ void timepop_dispatch(void) {
     if (!slots[i].active || !slots[i].expired) continue;
     slots[i].expired = false;
 
-    // ── ISR-callback slot: callback already ran in ISR context ──
-    if (slots[i].isr_callback_fired) {
-      slots[i].active = false;
-      continue;
+    const bool callback_already_ran = slots[i].isr_callback_fired;
+    slots[i].isr_callback_fired = false;
+
+    if (!callback_already_ran) {
+      // ── Timed scheduled-context callback ──
+      timepop_ctx_t ctx;
+      slot_build_ctx(slots[i], ctx);
+
+      timepop_diag_t diag;
+      slot_build_diag(slots[i], 0, diag);
+
+      uint32_t start = ARM_DWT_CYCCNT;
+      slots[i].callback(&ctx, &diag, slots[i].user_data);
+      uint32_t end   = ARM_DWT_CYCCNT;
+
+      cpu_usage_account_busy(end - start);
+      diag_dispatch_callbacks++;
     }
-
-    // ── Timed scheduled-context callback ──
-    timepop_ctx_t ctx;
-    slot_build_ctx(slots[i], ctx);
-
-    timepop_diag_t diag;
-    slot_build_diag(slots[i], 0, diag);
-
-    uint32_t start = ARM_DWT_CYCCNT;
-    slots[i].callback(&ctx, &diag, slots[i].user_data);
-    uint32_t end   = ARM_DWT_CYCCNT;
-
-    cpu_usage_account_busy(end - start);
-    diag_dispatch_callbacks++;
 
     // ── Recurring rearm ──
     if (slots[i].recurring) {
-      if (slots[i].is_absolute) {
-        // Absolute timers are one-shot by nature — the caller reschedules
-        // from the just-consummated event with fresh anchor arithmetic.
-        slots[i].active = false;
+      if (slots[i].recurrence_mode == timepop_recurrence_mode_t::ABSOLUTE &&
+          slots[i].recurring_period_gnss_ns > 0 &&
+          slots[i].target_gnss_ns > 0) {
+        int64_t next_target_gnss_ns = slots[i].target_gnss_ns + (int64_t)slots[i].recurring_period_gnss_ns;
+        const int64_t now_gnss_ns = time_gnss_ns_now();
+        if (now_gnss_ns >= 0 && next_target_gnss_ns <= now_gnss_ns) {
+          const uint64_t missed =
+              (uint64_t)((now_gnss_ns - next_target_gnss_ns) / (int64_t)slots[i].recurring_period_gnss_ns) + 1ULL;
+          next_target_gnss_ns += (int64_t)(missed * slots[i].recurring_period_gnss_ns);
+          slots[i].recurring_immediate_expire_count++;
+          slots[i].recurring_catchup_count += (uint32_t)missed;
+        }
+
+        const time_anchor_snapshot_t snap = time_anchor_snapshot();
+        uint32_t next_deadline = 0;
+        if (!gnss_ns_to_vclock_deadline(next_target_gnss_ns, snap, next_deadline)) {
+          slots[i].active = false;
+        } else {
+          slots[i].target_gnss_ns = next_target_gnss_ns;
+          slots[i].deadline = next_deadline;
+          slots[i].recurring_rearmed_count++;
+          slots[i].predicted_dwt = predict_dwt_at_deadline(
+            slots[i].deadline, slots[i].prediction_valid);
+          smartpop_prepare_slot(slots[i]);
+          slots[i].expired = false;
+          if (slots[i].name && strcmp(slots[i].name, VCLOCK_MONITOR_NAME) == 0) {
+            g_vclock_edge_monitor.armed = true;
+            g_vclock_edge_monitor.handle = slots[i].handle;
+            g_vclock_edge_monitor.target_gnss_ns = slots[i].target_gnss_ns;
+          }
+          noInterrupts();
+          schedule_next();
+          interrupts();
+        }
       } else if (slots[i].period_ticks == 0) {
         slots[i].active = false;
       } else {
@@ -1769,6 +1827,10 @@ void timepop_dispatch(void) {
       }
     } else {
       slots[i].active = false;
+      if (slots[i].name && strcmp(slots[i].name, VCLOCK_MONITOR_NAME) == 0) {
+        g_vclock_edge_monitor.armed = false;
+        g_vclock_edge_monitor.handle = TIMEPOP_INVALID_HANDLE;
+      }
     }
   }
 
@@ -1945,7 +2007,6 @@ vclock_edge_monitor_refresh_correlation();
 out.add("vclock_edge_monitor_enabled", g_vclock_edge_monitor.enabled);
 out.add("vclock_edge_monitor_armed", g_vclock_edge_monitor.armed);
 out.add("vclock_edge_monitor_arm_count", g_vclock_edge_monitor.arm_count);
-out.add("vclock_edge_monitor_cancel_count", g_vclock_edge_monitor.cancel_count);
 out.add("vclock_edge_monitor_arm_failures", g_vclock_edge_monitor.arm_failures);
 out.add("vclock_edge_monitor_skipped_invalid_anchor", g_vclock_edge_monitor.skipped_invalid_anchor);
 out.add("vclock_edge_monitor_captures", g_vclock_edge_monitor.captures);
@@ -2009,45 +2070,8 @@ static void qtimer1_irq_isr(void) {
 }
 
 
-static Payload cmd_vclock_monitor_once(const Payload&) {
-  Payload out;
-  noInterrupts();
-  const bool ok = vclock_edge_monitor_arm_once_internal();
-  if (ok) {
-    diag_schedule_next_calls_from_other++;
-    schedule_next();
-  }
-  interrupts();
-
-  out.add("status", ok ? "vclock_monitor_armed" : "vclock_monitor_arm_failed");
-  out.add("vclock_edge_monitor_enabled", g_vclock_edge_monitor.enabled);
-  out.add("vclock_edge_monitor_armed", g_vclock_edge_monitor.armed);
-  out.add("vclock_edge_monitor_target_gnss_ns", g_vclock_edge_monitor.target_gnss_ns);
-  return out;
-}
-
-static Payload cmd_vclock_monitor_cancel(const Payload&) {
-  Payload out;
-  noInterrupts();
-  vclock_edge_monitor_cancel_internal();
-  diag_schedule_next_calls_from_other++;
-  schedule_next();
-  interrupts();
-
-  out.add("status", "vclock_monitor_cancelled");
-  out.add("vclock_edge_monitor_enabled", g_vclock_edge_monitor.enabled);
-  out.add("vclock_edge_monitor_armed", g_vclock_edge_monitor.armed);
-  return out;
-}
-
-// ============================================================================
-// Process registration
-// ============================================================================
-
 static const process_command_entry_t TIMEPOP_COMMANDS[] = {
   { "REPORT",                 cmd_report                 },
-  { "VCLOCK_MONITOR_ONCE",    cmd_vclock_monitor_once    },
-  { "VCLOCK_MONITOR_CANCEL",  cmd_vclock_monitor_cancel  },
   { nullptr,                  nullptr                    }
 };
 
