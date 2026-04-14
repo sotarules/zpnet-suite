@@ -1,5 +1,5 @@
 // ============================================================================
-// process_interrupt.cpp — provider authority + shared pre-spin (QTimer v23)
+// process_interrupt.cpp — provider authority + shared pre-spin (QTimer v27)
 // ============================================================================
 //
 // process_interrupt is the sole authority for all precision interrupt hardware.
@@ -180,6 +180,20 @@ struct bridge_validation_state_t {
   uint32_t outside_tolerance = 0;
   uint32_t skipped_invalid = 0;
   int64_t  last_error_ns = 0;
+};
+
+struct bridge_observation_t {
+  bool     valid = false;
+  bool     within_tolerance = false;
+  bool     skipped_invalid = false;
+  bool     used_prediction = false;
+
+  uint64_t gnss_ns_raw = 0;
+  uint64_t gnss_ns_target = 0;
+  uint64_t gnss_ns_final = 0;
+
+  int64_t  raw_error_ns = 0;
+  int64_t  final_error_ns = 0;
 };
 
 static bridge_validation_state_t g_bridge_pps = {};
@@ -996,6 +1010,7 @@ static void pps_drumbeat_consume_edge(interrupt_subscriber_runtime_t& rt) {
 static void fill_diag_common(interrupt_subscriber_runtime_t& rt,
                              interrupt_capture_diag_t& diag,
                              const interrupt_event_t& event,
+                             const bridge_observation_t& bridge,
                              uint32_t dwt_isr_entry_raw,
                              uint32_t approach_cycles,
                              uint32_t shadow_to_isr_cycles) {
@@ -1011,10 +1026,23 @@ static void fill_diag_common(interrupt_subscriber_runtime_t& rt,
   diag.dwt_isr_entry_raw = dwt_isr_entry_raw;
   diag.approach_cycles = approach_cycles;
   diag.shadow_to_isr_cycles = shadow_to_isr_cycles;
+  diag.dwt_at_event = event.dwt_at_event;
   diag.dwt_at_event_adjusted = event.dwt_at_event;
+  diag.gnss_ns_at_event_raw = bridge.gnss_ns_raw;
+  diag.gnss_ns_at_event_final = event.gnss_ns_at_event;
   diag.gnss_ns_at_event = event.gnss_ns_at_event;
+  diag.gnss_ns_at_event_delta = (int64_t)event.gnss_ns_at_event - (int64_t)bridge.gnss_ns_raw;
   diag.counter32_at_event = event.counter32_at_event;
   diag.dwt_event_correction_cycles = event.dwt_event_correction_cycles;
+  diag.bridge_valid = bridge.valid;
+  diag.bridge_within_tolerance = bridge.within_tolerance;
+  diag.bridge_skipped_invalid = bridge.skipped_invalid;
+  diag.bridge_used_prediction = bridge.used_prediction;
+  diag.bridge_gnss_ns_raw = bridge.gnss_ns_raw;
+  diag.bridge_gnss_ns_target = bridge.gnss_ns_target;
+  diag.bridge_gnss_ns_final = bridge.gnss_ns_final;
+  diag.bridge_raw_error_ns = bridge.raw_error_ns;
+  diag.bridge_final_error_ns = bridge.final_error_ns;
   diag.prespin_arm_count = rt.prespin.arm_count;
   diag.prespin_complete_count = rt.prespin.complete_count;
   diag.prespin_timeout_count = rt.prespin.timeout_count;
@@ -1056,24 +1084,60 @@ static void deferred_dispatch_callback(timepop_ctx_t*, timepop_diag_t*, void* us
 // anchor snapshot at the moment of the event.
 //
 
-static void bridge_validate(bridge_validation_state_t& bv,
-                            uint32_t dwt_at_event,
-                            uint64_t true_gnss_ns) {
+static bridge_observation_t bridge_validate(bridge_validation_state_t& bv,
+                                          uint32_t dwt_at_event,
+                                          uint64_t true_gnss_ns) {
+  bridge_observation_t obs {};
+  obs.gnss_ns_target = true_gnss_ns;
+  obs.gnss_ns_final = true_gnss_ns;
+
   const int64_t bridge_gnss_ns = time_dwt_to_gnss_ns(dwt_at_event);
   if (bridge_gnss_ns < 0) {
     bv.skipped_invalid++;
-    return;
+    obs.skipped_invalid = true;
+    return obs;
   }
 
-  bv.checks++;
-  const int64_t error_ns = bridge_gnss_ns - (int64_t)true_gnss_ns;
-  bv.last_error_ns = error_ns;
+  obs.valid = true;
+  obs.gnss_ns_raw = (uint64_t)bridge_gnss_ns;
+  obs.raw_error_ns = bridge_gnss_ns - (int64_t)true_gnss_ns;
+  obs.final_error_ns = 0;
 
-  if (llabs(error_ns) <= BRIDGE_VALIDATION_TOLERANCE_NS) {
+  bv.checks++;
+  bv.last_error_ns = obs.raw_error_ns;
+
+  if (llabs(obs.raw_error_ns) <= BRIDGE_VALIDATION_TOLERANCE_NS) {
     bv.within_tolerance++;
+    obs.within_tolerance = true;
   } else {
     bv.outside_tolerance++;
   }
+
+  return obs;
+}
+
+
+static bridge_observation_t build_ocxo_bridge_observation(const interrupt_event_t& event,
+                                                   uint64_t raw_gnss_ns,
+                                                   const edgekeeper_state_t& ek) {
+  bridge_observation_t obs {};
+  obs.valid = (raw_gnss_ns != 0);
+  obs.gnss_ns_raw = raw_gnss_ns;
+  obs.gnss_ns_final = event.gnss_ns_at_event;
+  obs.used_prediction = (raw_gnss_ns != 0 && event.gnss_ns_at_event != raw_gnss_ns);
+
+  if (ek.last_predicted_edge_gnss_ns != 0) {
+    obs.gnss_ns_target = ek.last_predicted_edge_gnss_ns;
+    if (raw_gnss_ns != 0) {
+      obs.raw_error_ns = (int64_t)raw_gnss_ns - (int64_t)obs.gnss_ns_target;
+    }
+    if (event.gnss_ns_at_event != 0) {
+      obs.final_error_ns = (int64_t)event.gnss_ns_at_event - (int64_t)obs.gnss_ns_target;
+      obs.within_tolerance = (llabs(obs.final_error_ns) <= EDGEKEEPER_EDGE_WINDOW_NS);
+    }
+  }
+
+  return obs;
 }
 
 // ============================================================================
@@ -1213,6 +1277,7 @@ static void handle_event(interrupt_subscriber_runtime_t& rt,
   const uint32_t dwt_at_event = dwt_isr_entry_raw - correction;
 
   interrupt_event_t event {};
+  bridge_observation_t bridge_obs {};
   event.kind = rt.desc->kind;
   event.provider = rt.desc->provider;
   event.lane = rt.desc->lane;
@@ -1237,18 +1302,20 @@ static void handle_event(interrupt_subscriber_runtime_t& rt,
     // here, the discrepancy is in the bridge math.  If ~0 ns, the
     // TimePop dispatch error is elsewhere.
 
-    bridge_validate(g_bridge_pps, dwt_at_event, event.gnss_ns_at_event);
+    bridge_obs = bridge_validate(g_bridge_pps, dwt_at_event, event.gnss_ns_at_event);
 
   } else {
     const int64_t gnss_ns_signed = time_dwt_to_gnss_ns(dwt_at_event);
+    const uint64_t raw_gnss_ns = (gnss_ns_signed >= 0) ? (uint64_t)gnss_ns_signed : 0ULL;
     if (gnss_ns_signed >= 0) {
-      event.gnss_ns_at_event = (uint64_t)gnss_ns_signed;
+      event.gnss_ns_at_event = raw_gnss_ns;
       event.status = interrupt_event_status_t::OK;
     } else {
       event.gnss_ns_at_event = 0;
       event.status = interrupt_event_status_t::HOLD;
     }
     edgekeeper_finalize_ocxo_edge(rt, event);
+    bridge_obs = build_ocxo_bridge_observation(event, raw_gnss_ns, rt.edgekeeper);
   }
 
   // ── Prespin prediction error diagnostics ──
@@ -1269,7 +1336,7 @@ static void handle_event(interrupt_subscriber_runtime_t& rt,
   // ── Fill diagnostic struct and dispatch ──
 
   interrupt_capture_diag_t diag {};
-  fill_diag_common(rt, diag, event, dwt_isr_entry_raw, approach_cycles, shadow_to_isr_cycles);
+  fill_diag_common(rt, diag, event, bridge_obs, dwt_isr_entry_raw, approach_cycles, shadow_to_isr_cycles);
 
   rt.last_event = event;
   rt.last_diag = diag;
@@ -1667,6 +1734,17 @@ static Payload cmd_report(const Payload&) {
     s.add("last_gnss_ns_at_event", rt.last_event.gnss_ns_at_event);
     s.add("last_counter32_at_event", rt.last_event.counter32_at_event);
     s.add("last_status", (uint32_t)rt.last_event.status);
+
+    s.add("bridge_valid", rt.last_diag.bridge_valid);
+    s.add("bridge_within_tolerance", rt.last_diag.bridge_within_tolerance);
+    s.add("bridge_skipped_invalid", rt.last_diag.bridge_skipped_invalid);
+    s.add("bridge_used_prediction", rt.last_diag.bridge_used_prediction);
+    s.add("bridge_gnss_ns_raw", rt.last_diag.bridge_gnss_ns_raw);
+    s.add("bridge_gnss_ns_target", rt.last_diag.bridge_gnss_ns_target);
+    s.add("bridge_gnss_ns_final", rt.last_diag.bridge_gnss_ns_final);
+    s.add("bridge_raw_error_ns", rt.last_diag.bridge_raw_error_ns);
+    s.add("bridge_final_error_ns", rt.last_diag.bridge_final_error_ns);
+
     subscribers.add(s);
   }
   p.add_array("subscribers", subscribers);

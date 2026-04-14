@@ -1,5 +1,5 @@
 // ============================================================================
-// process_interrupt.h (QTimer version — v24)
+// process_interrupt.h (QTimer version — v27)
 // ============================================================================
 //
 // Shared interrupt authority + subscriber runtime.
@@ -173,10 +173,42 @@ struct interrupt_capture_diag_t {
   uint32_t approach_cycles = 0;
   uint32_t shadow_to_isr_cycles = 0;
 
+  // Canonical reconstructed event boundary in DWT cycles.
+  uint32_t dwt_at_event = 0;
+
+  // Backward-compatible alias of dwt_at_event for existing clients.
   uint32_t dwt_at_event_adjusted = 0;
+
+  // Raw bridge projection from dwt_at_event into GNSS nanoseconds.
+  // For PPS this is the bridge prediction under acid test.
+  // For OCXO lanes this is the raw bridge estimate before any EdgeKeeper correction.
+  uint64_t gnss_ns_at_event_raw = 0;
+
+  // Final accepted event GNSS nanosecond exposed to downstream clients.
+  uint64_t gnss_ns_at_event_final = 0;
+
+  // Backward-compatible alias of gnss_ns_at_event_final.
   uint64_t gnss_ns_at_event = 0;
+
+  // final - raw; non-zero means the event GNSS time was corrected after the raw bridge step.
+  int64_t gnss_ns_at_event_delta = 0;
+
   uint32_t counter32_at_event = 0;
   uint32_t dwt_event_correction_cycles = 0;
+
+  // Bridge/reconciliation instrumentation.
+  bool bridge_valid = false;
+  bool bridge_within_tolerance = false;
+  bool bridge_skipped_invalid = false;
+  bool bridge_used_prediction = false;
+
+  // For PPS: bridge_gnss_ns_target is the known-true integer-second boundary.
+  // For OCXO: bridge_gnss_ns_target is the EdgeKeeper predicted edge time when available.
+  uint64_t bridge_gnss_ns_raw = 0;
+  uint64_t bridge_gnss_ns_target = 0;
+  uint64_t bridge_gnss_ns_final = 0;
+  int64_t bridge_raw_error_ns = 0;
+  int64_t bridge_final_error_ns = 0;
 
   uint32_t prespin_arm_count = 0;
   uint32_t prespin_complete_count = 0;

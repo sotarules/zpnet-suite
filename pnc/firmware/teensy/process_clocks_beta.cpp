@@ -129,6 +129,50 @@ double dac_welford_stderr(const dac_welford_t& w) {
   return (w.n >= 2) ? sqrt(w.m2 / (double)(w.n - 1)) / sqrt((double)w.n) : 0.0;
 }
 
+
+static void clocks_payload_add_interrupt_bridge_diag(Payload& p,
+                                                     const char* prefix,
+                                                     const interrupt_capture_diag_t& diag) {
+  char key[96];
+
+  auto add_bool = [&](const char* suffix, bool value) {
+    snprintf(key, sizeof(key), "%s_%s", prefix, suffix);
+    p.add(key, value);
+  };
+
+  auto add_u32 = [&](const char* suffix, uint32_t value) {
+    snprintf(key, sizeof(key), "%s_%s", prefix, suffix);
+    p.add(key, value);
+  };
+
+  auto add_u64 = [&](const char* suffix, uint64_t value) {
+    snprintf(key, sizeof(key), "%s_%s", prefix, suffix);
+    p.add(key, value);
+  };
+
+  auto add_i64 = [&](const char* suffix, int64_t value) {
+    snprintf(key, sizeof(key), "%s_%s", prefix, suffix);
+    p.add(key, value);
+  };
+
+  // Canonical reconstructed event facts and bridge/reconciliation diagnostics.
+  add_u32("dwt_at_event", diag.dwt_at_event);
+  add_u64("gnss_ns_at_event_raw", diag.gnss_ns_at_event_raw);
+  add_u64("gnss_ns_at_event_final", diag.gnss_ns_at_event_final);
+  add_i64("gnss_ns_at_event_delta", diag.gnss_ns_at_event_delta);
+
+  add_bool("bridge_valid", diag.bridge_valid);
+  add_bool("bridge_within_tolerance", diag.bridge_within_tolerance);
+  add_bool("bridge_skipped_invalid", diag.bridge_skipped_invalid);
+  add_bool("bridge_used_prediction", diag.bridge_used_prediction);
+
+  add_u64("bridge_gnss_ns_raw", diag.bridge_gnss_ns_raw);
+  add_u64("bridge_gnss_ns_target", diag.bridge_gnss_ns_target);
+  add_u64("bridge_gnss_ns_final", diag.bridge_gnss_ns_final);
+  add_i64("bridge_raw_error_ns", diag.bridge_raw_error_ns);
+  add_i64("bridge_final_error_ns", diag.bridge_final_error_ns);
+}
+
 // ── Predictive servo tuning ──
 //
 // Both TOTAL and NOW drive a filtered residual *and* a filtered mean slope
@@ -541,8 +585,13 @@ void clocks_beta_pps(void) {
   p.add("ocxo2_servo_last_step", ocxo2_dac.servo_last_step, 6);
 
   clocks_payload_add_interrupt_diag(p, "pps_diag", g_pps_interrupt_diag);
+  clocks_payload_add_interrupt_bridge_diag(p, "pps_diag", g_pps_interrupt_diag);
+
   clocks_payload_add_interrupt_diag(p, "ocxo1_diag", g_ocxo1_interrupt_diag);
+  clocks_payload_add_interrupt_bridge_diag(p, "ocxo1_diag", g_ocxo1_interrupt_diag);
+
   clocks_payload_add_interrupt_diag(p, "ocxo2_diag", g_ocxo2_interrupt_diag);
+  clocks_payload_add_interrupt_bridge_diag(p, "ocxo2_diag", g_ocxo2_interrupt_diag);
 
   // Campaign-cumulative tau and ppb for all clock domains.
   //

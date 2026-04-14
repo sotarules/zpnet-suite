@@ -339,7 +339,8 @@ static void pps_callback(
 
   static uint32_t prev_dwt_pps = 0;
 
-  clocks_capture_interrupt_diag(g_pps_interrupt_diag, diag);
+  if (diag) g_pps_interrupt_diag = *diag;
+  else g_pps_interrupt_diag = {};
   g_last_pps_event_counter32_at_event = event.counter32_at_event;
 
   if (!g_epoch_initialized || g_epoch_pending) {
@@ -433,15 +434,13 @@ static void ocxo1_callback(
     const interrupt_capture_diag_t* diag,
     void*) {
 
-  static uint32_t prev_counter32 = 0;
-
-  clocks_capture_interrupt_diag(g_ocxo1_interrupt_diag, diag);
+  if (diag) g_ocxo1_interrupt_diag = *diag;
+  else g_ocxo1_interrupt_diag = {};
 
   if (!alpha_ocxo_edges_are_canonical()) {
     return;
   }
 
-  const uint32_t raw_counter32 = event.counter32_at_event;
   const uint32_t dwt_at_edge = event.dwt_at_event;
   const uint64_t gnss_ns_at_edge = event.gnss_ns_at_event;
 
@@ -494,7 +493,6 @@ static void ocxo1_callback(
     }
   }
 
-  prev_counter32 = raw_counter32;
   g_ocxo1_measurement.prev_gnss_ns_at_edge = gnss_ns_at_edge;
   g_ocxo1_measurement.prev_dwt_at_edge = dwt_at_edge;
 }
@@ -504,15 +502,13 @@ static void ocxo2_callback(
     const interrupt_capture_diag_t* diag,
     void*) {
 
-  static uint32_t prev_counter32 = 0;
-
-  clocks_capture_interrupt_diag(g_ocxo2_interrupt_diag, diag);
+  if (diag) g_ocxo2_interrupt_diag = *diag;
+  else g_ocxo2_interrupt_diag = {};
 
   if (!alpha_ocxo_edges_are_canonical()) {
     return;
   }
 
-  const uint32_t raw_counter32 = event.counter32_at_event;
   const uint32_t dwt_at_edge = event.dwt_at_event;
   const uint64_t gnss_ns_at_edge = event.gnss_ns_at_event;
 
@@ -553,7 +549,6 @@ static void ocxo2_callback(
     }
   }
 
-  prev_counter32 = raw_counter32;
   g_ocxo2_measurement.prev_gnss_ns_at_edge = gnss_ns_at_edge;
   g_ocxo2_measurement.prev_dwt_at_edge = dwt_at_edge;
 }
