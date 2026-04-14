@@ -365,6 +365,10 @@ struct vclock_edge_monitor_state_t {
   int64_t  last_fire_gnss_ns = -1;
   uint32_t last_dwt_isr_entry_raw = 0;
   uint32_t last_dwt_at_edge = 0;
+  int64_t  last_isr_entry_gnss_ns = -1;
+  int64_t  last_isr_entry_minus_target_ns = 0;
+  int64_t  last_dwt_at_edge_gnss_ns = -1;
+  int64_t  last_dwt_at_edge_minus_target_ns = 0;
 
   // Immediate CH0+CH1 sanity-check read captured at monitor fire time.
   uint32_t last_ch0_ch1_vclock_raw = 0;
@@ -377,6 +381,9 @@ struct vclock_edge_monitor_state_t {
   int64_t  last_pps_gnss_ns = -1;
   int32_t  last_vclock_minus_pps_cycles = 0;
   int64_t  last_vclock_minus_pps_ns = 0;
+
+  int64_t last_target_gnss_ns = -1;   // target for the completed capture
+  int64_t next_target_gnss_ns = -1;   // target for the next armed occurrence
 };
 
 static vclock_edge_monitor_state_t g_vclock_edge_monitor = {};
@@ -420,13 +427,40 @@ static void vclock_monitor_callback(timepop_ctx_t* ctx,
   const uint32_t dwt_at_edge =
       dwt_isr_entry_raw ? (dwt_isr_entry_raw - QTIMER_ISR_FIXED_OVERHEAD) : 0;
 
+  const int64_t isr_entry_gnss_ns =
+      (diag && diag->anchor_valid)
+          ? time_dwt_to_gnss_ns(dwt_isr_entry_raw,
+                                diag->anchor_dwt_at_pps,
+                                diag->anchor_dwt_cycles_per_s,
+                                diag->anchor_pps_count)
+          : -1;
+  const int64_t dwt_at_edge_gnss_ns =
+      (diag && diag->anchor_valid)
+          ? time_dwt_to_gnss_ns(dwt_at_edge,
+                                diag->anchor_dwt_at_pps,
+                                diag->anchor_dwt_cycles_per_s,
+                                diag->anchor_pps_count)
+          : -1;
+
   const uint32_t ch0_ch1_vclock_raw = qtimer1_read_32_local();
   const int64_t ch0_ch1_gnss_ns = vclock_to_gnss_ns(ch0_ch1_vclock_raw, anchor);
 
+
+  g_vclock_edge_monitor.last_target_gnss_ns = g_vclock_edge_monitor.next_target_gnss_ns;
   g_vclock_edge_monitor.last_fire_vclock_raw = fire_vclock_raw;
   g_vclock_edge_monitor.last_fire_gnss_ns = fire_gnss_ns;
   g_vclock_edge_monitor.last_dwt_isr_entry_raw = dwt_isr_entry_raw;
   g_vclock_edge_monitor.last_dwt_at_edge = dwt_at_edge;
+  g_vclock_edge_monitor.last_isr_entry_gnss_ns = isr_entry_gnss_ns;
+  g_vclock_edge_monitor.last_isr_entry_minus_target_ns =
+      (isr_entry_gnss_ns >= 0 && g_vclock_edge_monitor.last_target_gnss_ns >= 0)
+          ? (isr_entry_gnss_ns - g_vclock_edge_monitor.last_target_gnss_ns)
+          : 0;
+  g_vclock_edge_monitor.last_dwt_at_edge_gnss_ns = dwt_at_edge_gnss_ns;
+  g_vclock_edge_monitor.last_dwt_at_edge_minus_target_ns =
+      (dwt_at_edge_gnss_ns >= 0 && g_vclock_edge_monitor.last_target_gnss_ns >= 0)
+          ? (dwt_at_edge_gnss_ns - g_vclock_edge_monitor.last_target_gnss_ns)
+          : 0;
 
   g_vclock_edge_monitor.last_ch0_ch1_vclock_raw = ch0_ch1_vclock_raw;
   g_vclock_edge_monitor.last_ch0_ch1_gnss_ns = ch0_ch1_gnss_ns;
@@ -438,6 +472,7 @@ static void vclock_monitor_callback(timepop_ctx_t* ctx,
   g_vclock_edge_monitor.captures++;
   g_vclock_edge_monitor.last_pps_gnss_ns = -1;
   g_vclock_edge_monitor.last_correlation_valid = false;
+
   vclock_edge_monitor_refresh_correlation();
 }
 
