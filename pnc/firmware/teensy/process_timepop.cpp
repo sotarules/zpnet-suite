@@ -71,6 +71,7 @@
 
 #include "timepop.h"
 #include "process_timepop.h"
+#include "tdc_correction.h"
 
 #include "publish.h"
 
@@ -80,12 +81,20 @@
 #include "payload.h"
 #include "cpu_usage.h"
 #include "time.h"
+#include "config.h"
 
 #include <Arduino.h>
 #include "imxrt.h"
 #include <string.h>
 #include <math.h>
 #include <climits>
+
+
+static inline bool deadline_expired(uint32_t deadline, uint32_t now);
+static inline uint32_t vclock_count(void);
+static bool gnss_ns_to_vclock_deadline(int64_t target_gnss_ns,
+                                       const time_anchor_snapshot_t& snap,
+                                       uint32_t& out_deadline);
 
 // ============================================================================
 // Constants — 10 MHz domain
@@ -320,6 +329,114 @@ static volatile uint32_t diag_deadline_negative_offset = 0;
 static volatile int64_t  diag_deadline_last_target_gnss_ns = -1;
 static volatile int64_t  diag_deadline_last_anchor_pps_gnss_ns = -1;
 static volatile int64_t  diag_deadline_last_ns_from_anchor = 0;
+
+
+struct vclock_edge_monitor_state_t {
+  bool     enabled = false;             // opt-in only
+  bool     armed = false;               // one-shot armed against CH2
+  uint32_t deadline = 0;                // VCLOCK deadline for the probe
+  int64_t  target_gnss_ns = -1;         // exact GNSS second boundary being probed
+
+  uint32_t captures = 0;
+  uint32_t arm_count = 0;
+  uint32_t cancel_count = 0;
+  uint32_t arm_failures = 0;
+  uint32_t skipped_invalid_anchor = 0;
+
+  uint32_t last_fire_vclock_raw = 0;
+  int64_t  last_fire_gnss_ns = -1;
+  uint32_t last_dwt_isr_entry_raw = 0;
+  uint32_t last_dwt_at_edge = 0;
+
+  // Immediate CH0+CH1 sanity-check read captured at monitor fire time.
+  uint32_t last_ch0_ch1_vclock_raw = 0;
+  int64_t  last_ch0_ch1_gnss_ns = -1;
+  int64_t  last_ch0_ch1_minus_target_ns = 0;
+
+  // PPS-side GNSS nanoseconds corresponding to the correlated PPS edge.
+  int64_t  last_pps_gnss_ns = -1;
+
+  // Correlation against the corresponding PPS edge is computed lazily from the
+  // current time anchor.  When valid, target_gnss_ns equals the most recent PPS
+  // boundary represented by the anchor.
+  bool     last_correlation_valid = false;
+  uint32_t last_pps_dwt_at_edge = 0;
+  int32_t  last_vclock_minus_pps_cycles = 0;
+  int64_t  last_vclock_minus_pps_ns = 0;
+};
+
+static vclock_edge_monitor_state_t g_vclock_edge_monitor = {};
+
+static inline int64_t time_anchor_latest_pps_gnss_ns(const time_anchor_snapshot_t& snap) {
+  if (!snap.ok || !snap.valid || snap.pps_count < 1) return -1;
+  return (int64_t)(snap.pps_count - 1) * (int64_t)1000000000LL;
+}
+
+static void vclock_edge_monitor_refresh_correlation(void) {
+  g_vclock_edge_monitor.last_correlation_valid = false;
+
+  if (!g_vclock_edge_monitor.enabled) return;
+  if (g_vclock_edge_monitor.last_dwt_at_edge == 0) return;
+  if (g_vclock_edge_monitor.target_gnss_ns < 0) return;
+
+  const time_anchor_snapshot_t snap = time_anchor_snapshot();
+  const int64_t latest_pps_gnss_ns = time_anchor_latest_pps_gnss_ns(snap);
+  if (latest_pps_gnss_ns < 0) return;
+  if (latest_pps_gnss_ns != g_vclock_edge_monitor.target_gnss_ns) return;
+
+  g_vclock_edge_monitor.last_pps_gnss_ns = latest_pps_gnss_ns;
+  g_vclock_edge_monitor.last_pps_dwt_at_edge = snap.dwt_at_pps;
+  g_vclock_edge_monitor.last_vclock_minus_pps_cycles =
+      (int32_t)(g_vclock_edge_monitor.last_dwt_at_edge - snap.dwt_at_pps);
+  g_vclock_edge_monitor.last_vclock_minus_pps_ns =
+      (int64_t)g_vclock_edge_monitor.last_vclock_minus_pps_cycles;
+  g_vclock_edge_monitor.last_correlation_valid = true;
+}
+
+static bool vclock_edge_monitor_arm_once_internal(void) {
+  const time_anchor_snapshot_t snap = time_anchor_snapshot();
+  if (!snap.ok || !snap.valid || snap.pps_count < 1) {
+    g_vclock_edge_monitor.arm_failures++;
+    g_vclock_edge_monitor.skipped_invalid_anchor++;
+    return false;
+  }
+
+  const int64_t target_gnss_ns = (int64_t)snap.pps_count * (int64_t)1000000000LL;
+
+  uint32_t deadline = 0;
+  if (!gnss_ns_to_vclock_deadline(target_gnss_ns, snap, deadline)) {
+    g_vclock_edge_monitor.arm_failures++;
+    return false;
+  }
+
+  const uint32_t now = vclock_count();
+  if (deadline_expired(deadline, now)) {
+    g_vclock_edge_monitor.arm_failures++;
+    return false;
+  }
+
+  g_vclock_edge_monitor.enabled = true;
+  g_vclock_edge_monitor.armed = true;
+  g_vclock_edge_monitor.deadline = deadline;
+  g_vclock_edge_monitor.target_gnss_ns = target_gnss_ns;
+  g_vclock_edge_monitor.arm_count++;
+  g_vclock_edge_monitor.last_correlation_valid = false;
+
+  return true;
+}
+
+static void vclock_edge_monitor_cancel_internal(void) {
+  if (g_vclock_edge_monitor.armed) {
+    g_vclock_edge_monitor.cancel_count++;
+  }
+  g_vclock_edge_monitor.enabled = false;
+  g_vclock_edge_monitor.armed = false;
+  g_vclock_edge_monitor.deadline = 0;
+  g_vclock_edge_monitor.target_gnss_ns = -1;
+  g_vclock_edge_monitor.last_pps_gnss_ns = -1;
+  g_vclock_edge_monitor.last_correlation_valid = false;
+}
+
 
 // ============================================================================
 // Forward declarations
@@ -738,6 +855,15 @@ static void schedule_next(void) {
     }
   }
 
+  if (g_vclock_edge_monitor.enabled && g_vclock_edge_monitor.armed) {
+    if (!deadline_expired(g_vclock_edge_monitor.deadline, now)) {
+      if (!found || ((g_vclock_edge_monitor.deadline - now) < (soonest - now))) {
+        soonest = g_vclock_edge_monitor.deadline;
+        found = true;
+      }
+    }
+  }
+
   uint32_t target;
   if (!found) {
     target = now + HEARTBEAT_TICKS;
@@ -825,6 +951,31 @@ static void qtimer1_ch2_isr(uint32_t dwt_entry) {
   const int64_t gnss_ns_at_isr = vclock_to_gnss_ns(now, anchor);
 
   bool any_expired = false;
+  bool monitor_fired = false;
+
+  if (g_vclock_edge_monitor.enabled && g_vclock_edge_monitor.armed &&
+      deadline_expired(g_vclock_edge_monitor.deadline, now)) {
+    const uint32_t ch0_ch1_vclock_raw = qtimer1_read_32_local();
+    const int64_t ch0_ch1_gnss_ns = vclock_to_gnss_ns(ch0_ch1_vclock_raw, anchor);
+
+    g_vclock_edge_monitor.last_fire_vclock_raw = now;
+    g_vclock_edge_monitor.last_fire_gnss_ns = gnss_ns_at_isr;
+    g_vclock_edge_monitor.last_dwt_isr_entry_raw = dwt_entry;
+    g_vclock_edge_monitor.last_dwt_at_edge = dwt_entry - QTIMER_ISR_FIXED_OVERHEAD;
+    g_vclock_edge_monitor.last_ch0_ch1_vclock_raw = ch0_ch1_vclock_raw;
+    g_vclock_edge_monitor.last_ch0_ch1_gnss_ns = ch0_ch1_gnss_ns;
+    g_vclock_edge_monitor.last_ch0_ch1_minus_target_ns =
+        (ch0_ch1_gnss_ns >= 0 && g_vclock_edge_monitor.target_gnss_ns >= 0)
+            ? (ch0_ch1_gnss_ns - g_vclock_edge_monitor.target_gnss_ns)
+            : 0;
+    g_vclock_edge_monitor.captures++;
+    g_vclock_edge_monitor.armed = false;
+    g_vclock_edge_monitor.deadline = 0;
+    g_vclock_edge_monitor.last_pps_gnss_ns = -1;
+    g_vclock_edge_monitor.last_correlation_valid = false;
+    vclock_edge_monitor_refresh_correlation();
+    monitor_fired = true;
+  }
 
   for (uint32_t i = 0; i < MAX_SLOTS; i++) {
     if (!slots[i].active || slots[i].expired) continue;
@@ -925,7 +1076,7 @@ static void qtimer1_ch2_isr(uint32_t dwt_entry) {
   if (any_expired) {
     isr_fire_count++;
     timepop_pending = true;
-  } else {
+  } else if (!monitor_fired) {
     phantom_count++;
   }
 
@@ -1144,6 +1295,8 @@ void timepop_init(void) {
   diag_named_replacements_pps_dispatch = 0;
   diag_named_replacements_ocxo1_dispatch = 0;
   diag_named_replacements_ocxo2_dispatch = 0;
+
+  g_vclock_edge_monitor = {};
 
   qtimer1_init_vclock_base();
   qtimer1_init_ch2_scheduler();
@@ -1788,6 +1941,28 @@ static Payload cmd_report(const Payload&) {
   out.add("qtmr1_ch2_comp1",  (uint32_t)IMXRT_TMR1.CH[2].COMP1);
   out.add("qtmr1_ch2_csctrl", (uint32_t)IMXRT_TMR1.CH[2].CSCTRL);
 
+vclock_edge_monitor_refresh_correlation();
+out.add("vclock_edge_monitor_enabled", g_vclock_edge_monitor.enabled);
+out.add("vclock_edge_monitor_armed", g_vclock_edge_monitor.armed);
+out.add("vclock_edge_monitor_arm_count", g_vclock_edge_monitor.arm_count);
+out.add("vclock_edge_monitor_cancel_count", g_vclock_edge_monitor.cancel_count);
+out.add("vclock_edge_monitor_arm_failures", g_vclock_edge_monitor.arm_failures);
+out.add("vclock_edge_monitor_skipped_invalid_anchor", g_vclock_edge_monitor.skipped_invalid_anchor);
+out.add("vclock_edge_monitor_captures", g_vclock_edge_monitor.captures);
+out.add("vclock_edge_monitor_target_gnss_ns", g_vclock_edge_monitor.target_gnss_ns);
+out.add("vclock_edge_monitor_last_fire_vclock_raw", g_vclock_edge_monitor.last_fire_vclock_raw);
+out.add("vclock_edge_monitor_last_fire_gnss_ns", g_vclock_edge_monitor.last_fire_gnss_ns);
+out.add("vclock_edge_monitor_last_dwt_isr_entry_raw", g_vclock_edge_monitor.last_dwt_isr_entry_raw);
+out.add("vclock_edge_monitor_last_dwt_at_edge", g_vclock_edge_monitor.last_dwt_at_edge);
+out.add("vclock_edge_monitor_last_ch0_ch1_vclock_raw", g_vclock_edge_monitor.last_ch0_ch1_vclock_raw);
+out.add("vclock_edge_monitor_last_ch0_ch1_gnss_ns", g_vclock_edge_monitor.last_ch0_ch1_gnss_ns);
+out.add("vclock_edge_monitor_last_ch0_ch1_minus_target_ns", g_vclock_edge_monitor.last_ch0_ch1_minus_target_ns);
+out.add("vclock_edge_monitor_last_pps_gnss_ns", g_vclock_edge_monitor.last_pps_gnss_ns);
+out.add("vclock_edge_monitor_last_pps_dwt_at_edge", g_vclock_edge_monitor.last_pps_dwt_at_edge);
+out.add("vclock_edge_monitor_last_correlation_valid", g_vclock_edge_monitor.last_correlation_valid);
+out.add("vclock_edge_monitor_last_vclock_minus_pps_cycles", g_vclock_edge_monitor.last_vclock_minus_pps_cycles);
+out.add("vclock_edge_monitor_last_vclock_minus_pps_ns", g_vclock_edge_monitor.last_vclock_minus_pps_ns);
+
   PayloadArray timers;
   for (uint32_t i = 0; i < MAX_SLOTS; i++) {
     if (!slots[i].active) continue;
@@ -1833,13 +2008,47 @@ static void qtimer1_irq_isr(void) {
   }
 }
 
+
+static Payload cmd_vclock_monitor_once(const Payload&) {
+  Payload out;
+  noInterrupts();
+  const bool ok = vclock_edge_monitor_arm_once_internal();
+  if (ok) {
+    diag_schedule_next_calls_from_other++;
+    schedule_next();
+  }
+  interrupts();
+
+  out.add("status", ok ? "vclock_monitor_armed" : "vclock_monitor_arm_failed");
+  out.add("vclock_edge_monitor_enabled", g_vclock_edge_monitor.enabled);
+  out.add("vclock_edge_monitor_armed", g_vclock_edge_monitor.armed);
+  out.add("vclock_edge_monitor_target_gnss_ns", g_vclock_edge_monitor.target_gnss_ns);
+  return out;
+}
+
+static Payload cmd_vclock_monitor_cancel(const Payload&) {
+  Payload out;
+  noInterrupts();
+  vclock_edge_monitor_cancel_internal();
+  diag_schedule_next_calls_from_other++;
+  schedule_next();
+  interrupts();
+
+  out.add("status", "vclock_monitor_cancelled");
+  out.add("vclock_edge_monitor_enabled", g_vclock_edge_monitor.enabled);
+  out.add("vclock_edge_monitor_armed", g_vclock_edge_monitor.armed);
+  return out;
+}
+
 // ============================================================================
 // Process registration
 // ============================================================================
 
 static const process_command_entry_t TIMEPOP_COMMANDS[] = {
-  { "REPORT",      cmd_report      },
-  { nullptr,       nullptr         }
+  { "REPORT",                 cmd_report                 },
+  { "VCLOCK_MONITOR_ONCE",    cmd_vclock_monitor_once    },
+  { "VCLOCK_MONITOR_CANCEL",  cmd_vclock_monitor_cancel  },
+  { nullptr,                  nullptr                    }
 };
 
 static const process_vtable_t TIMEPOP_PROCESS = {

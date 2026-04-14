@@ -62,6 +62,7 @@
 //   • next-deadline selection
 //   • CH2 compare arming
 //   • timer diagnostics
+//   • opt-in internal scheduler-path characterization
 //
 // TimePop does not own:
 //   • interrupt-latency canonicalization
