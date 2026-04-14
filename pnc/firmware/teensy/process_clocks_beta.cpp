@@ -64,6 +64,7 @@ volatile uint32_t watchdog_anomaly_trigger_dwt     = 0;
 // ============================================================================
 
 pps_residual_t residual_dwt   = {};
+pps_residual_t residual_vclock = {};
 pps_residual_t residual_ocxo1 = {};
 pps_residual_t residual_ocxo2 = {};
 
@@ -225,6 +226,7 @@ void clocks_zero_all(void) {
   ocxo2_ticks_64        = 0;
 
   residual_reset(residual_dwt);
+  residual_reset(residual_vclock);
   residual_reset(residual_ocxo1);
   residual_reset(residual_ocxo2);
 
@@ -503,6 +505,10 @@ void clocks_beta_pps(void) {
       residual_dwt,
       (int64_t)dwt_effective_cycles_per_second() - (int64_t)DWT_EXPECTED_PER_PPS);
 
+  if (g_vclock_measurement.prev_counter32_at_pps_event != 0) {
+    residual_update_sample(residual_vclock, g_vclock_measurement.second_residual_ns);
+  }
+
   if (g_ocxo1_measurement.prev_gnss_ns_at_edge != 0) {
     residual_update_sample(residual_ocxo1, g_ocxo1_measurement.second_residual_ns);
     now_window_push(g_now_window_ocxo1, g_ocxo1_measurement.second_residual_ns);
@@ -535,6 +541,16 @@ void clocks_beta_pps(void) {
   p.add("dwt_model_pps_count", g_dwt_model_pps_count);
   p.add("qtimer_at_pps", g_qtimer_at_pps);
   p.add("pps_event_counter32_at_event", g_last_pps_event_counter32_at_event);
+
+  p.add("vclock_counter32_at_pps_event", g_vclock_clock.counter32_at_pps_event);
+  p.add("vclock_counter32_at_pps_expected", g_vclock_clock.counter32_at_pps_expected);
+  p.add("vclock_counter32_error_at_pps", g_vclock_clock.counter32_error_at_pps);
+  p.add("vclock_ticks_between_pps", g_vclock_measurement.ticks_between_pps);
+  p.add("vclock_ns_between_pps", g_vclock_measurement.ns_between_pps);
+  p.add("vclock_ns", g_vclock_clock.ns_count_at_pps);
+  p.add("vclock_ns_expected", g_vclock_clock.ns_count_expected_at_pps);
+  p.add("vclock_second_residual_ns", g_vclock_measurement.second_residual_ns);
+  p.add("vclock_zero_established", g_vclock_clock.zero_established);
 
   p.add("ocxo1_gnss_ns_at_edge", g_ocxo1_clock.gnss_ns_at_edge);
   p.add("ocxo1_gnss_ns_between_edges", g_ocxo1_measurement.gnss_ns_between_edges);
@@ -611,6 +627,13 @@ void clocks_beta_pps(void) {
     p.add("dwt_ppb", dwt_ppb_val, 3);
   }
 
+  if (residual_vclock.n > 0) {
+    const double vclock_ppb_val = residual_vclock.mean;
+    const double vclock_tau_val = 1.0 + vclock_ppb_val / 1e9;
+    p.add("vclock_tau", vclock_tau_val, 12);
+    p.add("vclock_ppb", vclock_ppb_val, 3);
+  }
+
   if (residual_ocxo1.n > 0) {
     const double ocxo1_ppb_val = residual_ocxo1.mean;
     const double ocxo1_tau_val = 1.0 + ocxo1_ppb_val / 1e9;
@@ -643,6 +666,14 @@ void clocks_beta_pps(void) {
   p.add("dwt_welford_stderr", residual_stderr(residual_dwt), 3);
   p.add("dwt_welford_min", residual_dwt.min_val, 3);
   p.add("dwt_welford_max", residual_dwt.max_val, 3);
+
+  // VCLOCK residual Welford (ns)
+  p.add("vclock_welford_n", residual_vclock.n);
+  p.add("vclock_welford_mean", residual_vclock.mean, 3);
+  p.add("vclock_welford_stddev", residual_stddev(residual_vclock), 3);
+  p.add("vclock_welford_stderr", residual_stderr(residual_vclock), 3);
+  p.add("vclock_welford_min", residual_vclock.min_val, 3);
+  p.add("vclock_welford_max", residual_vclock.max_val, 3);
 
   // OCXO1 residual Welford (ns)
   p.add("ocxo1_welford_n", residual_ocxo1.n);

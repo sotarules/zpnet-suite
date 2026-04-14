@@ -80,13 +80,17 @@ volatile uint32_t g_dwt_cycle_count_next_second_prediction = DWT_EXPECTED_PER_PP
 volatile int32_t  g_dwt_cycle_count_next_second_adjustment = 0;
 volatile uint64_t g_dwt_model_pps_count = 0;
 
-// Geared QTimer — advanced by TICKS_10MHZ_PER_SECOND each PPS.
-// Never read from hardware for canonical state.
+// Lawful VCLOCK anchor captured at each PPS event.
+// Unlike the historical geared follower, this is now the actual event-carried
+// CH0/CH1 position corresponding to the PPS boundary.
 volatile uint32_t g_qtimer_at_pps = 0;
 volatile uint32_t g_last_pps_event_counter32_at_event = 0;
 
 volatile int32_t g_last_pps_live_qtimer_minus_geared = 0;
 volatile uint32_t g_last_pps_live_qtimer_read = 0;
+
+vclock_clock_state_t g_vclock_clock = {};
+vclock_measurement_t g_vclock_measurement = {};
 
 ocxo_clock_state_t g_ocxo1_clock = {};
 ocxo_clock_state_t g_ocxo2_clock = {};
@@ -249,6 +253,8 @@ static void alpha_reset_canonical_clock_state_for_new_epoch(void) {
   g_dwt_cycle_count_next_second_adjustment = 0;
   g_dwt_model_pps_count = 0;
   g_qtimer_at_pps = 0;
+  g_vclock_clock = {};
+  g_vclock_measurement = {};
 
   g_ocxo1_clock = {};
   g_ocxo2_clock = {};
@@ -287,6 +293,18 @@ static void alpha_install_new_epoch_from_pps(const interrupt_event_t& pps_event)
   g_dwt_cycle_count_between_pps = 0;
   g_dwt_model_pps_count = 0;
   g_qtimer_at_pps = g_epoch_qtimer_at_pps;
+
+  g_vclock_clock.counter32_at_pps_event = pps_event.counter32_at_event;
+  g_vclock_clock.counter32_at_pps_expected = pps_event.counter32_at_event;
+  g_vclock_clock.counter32_error_at_pps = 0;
+  g_vclock_clock.ns_count_at_pps = 0;
+  g_vclock_clock.ns_count_expected_at_pps = 0;
+  g_vclock_clock.zero_established = true;
+
+  g_vclock_measurement.ticks_between_pps = 0;
+  g_vclock_measurement.ns_between_pps = 0;
+  g_vclock_measurement.second_residual_ns = 0;
+  g_vclock_measurement.prev_counter32_at_pps_event = pps_event.counter32_at_event;
 
   // OCXO smart-zero: aggregate reset already zeroed g_ocxo1_clock and
   // g_ocxo2_clock via = {}.  zero_established starts false.  The first
@@ -366,11 +384,41 @@ static void pps_callback(
   g_gnss_ns_count_at_pps = g_epoch_pps_index * NS_PER_SECOND_U64;
   g_dwt_cycle_count_at_pps = event.dwt_at_event;
 
-  g_qtimer_at_pps += TICKS_10MHZ_PER_SECOND;
+  // VCLOCK is now tracked on two rails:
+  //   1) actual lawful CH0/CH1 position carried by the PPS event
+  //   2) synthetic/geared expectation advanced by exactly 10,000,000 ticks
+  const uint32_t actual_qtimer_at_pps = event.counter32_at_event;
+  const uint32_t expected_qtimer_at_pps =
+      g_vclock_clock.zero_established
+          ? (g_vclock_clock.counter32_at_pps_expected + TICKS_10MHZ_PER_SECOND)
+          : actual_qtimer_at_pps;
+
+  g_qtimer_at_pps = actual_qtimer_at_pps;
+  g_vclock_clock.counter32_at_pps_event = actual_qtimer_at_pps;
+  g_vclock_clock.counter32_at_pps_expected = expected_qtimer_at_pps;
+  g_vclock_clock.counter32_error_at_pps =
+      (int32_t)(actual_qtimer_at_pps - expected_qtimer_at_pps);
+
+  if (g_vclock_measurement.prev_counter32_at_pps_event != 0) {
+    const uint32_t ticks_between_pps =
+        actual_qtimer_at_pps - g_vclock_measurement.prev_counter32_at_pps_event;
+    const uint64_t ns_between_pps = (uint64_t)ticks_between_pps * 100ULL;
+
+    g_vclock_measurement.ticks_between_pps = ticks_between_pps;
+    g_vclock_measurement.ns_between_pps = ns_between_pps;
+    g_vclock_measurement.second_residual_ns =
+        (int64_t)NS_PER_SECOND_U64 - (int64_t)ns_between_pps;
+
+    g_vclock_clock.ns_count_at_pps += ns_between_pps;
+    g_vclock_clock.ns_count_expected_at_pps += NS_PER_SECOND_U64;
+  }
+
+  g_vclock_measurement.prev_counter32_at_pps_event = actual_qtimer_at_pps;
+  g_vclock_clock.zero_established = true;
 
   const uint32_t live_qtimer_now = interrupt_qtimer1_counter32_now();   // same helper
   g_last_pps_live_qtimer_read = live_qtimer_now;
-  g_last_pps_live_qtimer_minus_geared = (int32_t)(live_qtimer_now - g_qtimer_at_pps);
+  g_last_pps_live_qtimer_minus_geared = (int32_t)(live_qtimer_now - expected_qtimer_at_pps);
 
   {
     const uint32_t delta32 = event.dwt_at_event - prev_dwt_pps;

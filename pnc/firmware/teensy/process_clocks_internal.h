@@ -49,14 +49,62 @@ extern volatile uint32_t g_dwt_cycle_count_next_second_prediction;
 extern volatile int32_t  g_dwt_cycle_count_next_second_adjustment;
 extern volatile uint64_t g_dwt_model_pps_count;
 
-// Geared QTimer tracking — advanced by TICKS_10MHZ_PER_SECOND each PPS,
-// never read from hardware after epoch installation.
+// Lawful VCLOCK anchor captured at each PPS event.
+// This is the actual CH0/CH1 counter value carried by the PPS interrupt event.
 extern volatile uint32_t g_qtimer_at_pps;
 
+// Legacy / reconciliation diagnostics.
 extern volatile uint32_t g_last_pps_event_counter32_at_event;
-
 extern volatile int32_t g_last_pps_live_qtimer_minus_geared;
 extern volatile uint32_t g_last_pps_live_qtimer_read;
+
+// ============================================================================
+// VCLOCK canonical state (alpha-owned, beta-readable)
+// ============================================================================
+//
+// VCLOCK is the GNSS 10 MHz counter domain used by TimePop.  It is now treated
+// as a formally visible clock domain in CLOCKS, separate from the PPS/GNSS
+// nanosecond coordinate.  PPS remains the sovereign second boundary.  VCLOCK is
+// the lawful 10 MHz position measured at that boundary.
+//
+// counter32_at_pps_event:
+//   Actual CH0+CH1 value carried by the lawful PPS event.
+//
+// counter32_at_pps_expected:
+//   Synthetic/geared expectation advanced by exactly 10,000,000 ticks per PPS.
+//   This remains diagnostic only.
+//
+// counter32_error_at_pps:
+//   Actual minus expected, in VCLOCK ticks (100 ns units).
+//
+// ns_count_at_pps:
+//   Cumulative VCLOCK nanoseconds within the current epoch, derived from actual
+//   observed ticks between successive PPS events.
+//
+// ns_count_expected_at_pps:
+//   Cumulative synthetic/geared VCLOCK nanoseconds within the current epoch.
+//   Diagnostic only.
+//
+struct vclock_clock_state_t {
+  volatile uint32_t counter32_at_pps_event;
+  volatile uint32_t counter32_at_pps_expected;
+  volatile int32_t  counter32_error_at_pps;
+
+  volatile uint64_t ns_count_at_pps;
+  volatile uint64_t ns_count_expected_at_pps;
+
+  volatile bool zero_established;
+};
+
+struct vclock_measurement_t {
+  volatile uint32_t ticks_between_pps;
+  volatile uint64_t ns_between_pps;
+  volatile int64_t  second_residual_ns;
+  volatile uint32_t prev_counter32_at_pps_event;
+};
+
+extern vclock_clock_state_t g_vclock_clock;
+extern vclock_measurement_t g_vclock_measurement;
 
 // ============================================================================
 // OCXO canonical state (alpha-owned, beta-readable)
@@ -291,6 +339,7 @@ struct pps_residual_t {
 };
 
 extern pps_residual_t residual_dwt;
+extern pps_residual_t residual_vclock;
 extern pps_residual_t residual_ocxo1;
 extern pps_residual_t residual_ocxo2;
 
