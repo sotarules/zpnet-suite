@@ -6,17 +6,16 @@
 //
 // TimePop owns:
 //   • priority-queue slot scheduling
-//   • queue prediction / nearest-deadline selection
+//   • absolute recurring series
+//   • Spin-Dry early-wake / landing for VCLOCK scheduling
 //   • deferred callback dispatch
 //   • instrumentation / reports
-//   • always-on internal VCLOCK edge characterization
+//   • always-on internal VCLOCK monitor
 //
 // TimePop does not own:
-//   • QTIMER1 vector installation
-//   • QTIMER1 CH2 register bring-up
-//   • CH2 compare register twiddling
-//   • last-mile DWT spin
-//   • interrupt-latency canonicalization
+//   • PPS/GPIO interrupt custody
+//   • OCXO interrupt custody
+//   • raw interrupt normalization
 //
 // Those are owned by process_interrupt.
 //

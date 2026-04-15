@@ -1,101 +1,25 @@
 // ============================================================================
-// process_interrupt.cpp — provider authority + shared pre-spin (QTimer v27)
+// process_interrupt.cpp — simplified interrupt normalization shell
 // ============================================================================
 //
-// process_interrupt is the sole authority for all precision interrupt hardware.
+// This file intentionally stops trying to solve interrupt latency.
+// PPS/DWT is the yardstick; VCLOCK/TimePop owns Spin-Dry for scheduler truth.
+// Here we simply capture ISR-entry DWT, normalize to GNSS nanoseconds, and
+// forward lawful event facts to subscribers.
 //
-// Corrected timing architecture:
-//
-//   • QTimer1 CH0+CH1 — GNSS VCLOCK 10 MHz on pin 10 (capture-only from here)
-//   • QTimer3 CH2     — OCXO1 10 MHz external clock on pin 14 (16-bit)
-//   • QTimer3 CH3     — OCXO2 10 MHz external clock on pin 15 (16-bit)
-//   • GPIO6789        — PPS rising edge on pin 1
-//
-// Core laws:
-//
-//   • NEVER read a clock to know what time it is.
-//   • Interrupts are the sole lawful timing truth.
-//   • DWT is the precision substrate.
-//   • GNSS nanoseconds are the public timing language.
-//   • process_interrupt owns provider custody, ISR vectors, pre-spin,
-//     and canonical event reconstruction.
-//   • TimePop owns QTimer1 scheduling and remains independent.
-//   • OCXO QTimer3 channels are 16-bit only, so one-second OCXO events are
-//     reconstructed in software from lawful compare interrupts.
-//   • The exported OCXO counter32_at_event is NOT a live hardware readout.
-//     It is a software-extended logical count derived strictly from interrupts.
-//
-// 16-bit OCXO reconstruction model:
-//
-//   One second at 10 MHz = 10,000,000 counts
-//                        = 152 * 65536 + 38528
-//
-//   Therefore, for each OCXO lane:
-//
-//     • We choose a target low16 value.
-//     • That target is seen once after 38,528 counts, then once every 65,536
-//       counts thereafter.
-//     • The 153rd lawful compare hit is exactly one OCXO second after the
-//       prior second edge.
-//     • Only THAT hit is published as an OCXO event.
-//     • Intermediate compare hits are internal cadence only.
-//
-//   This preserves the doctrinal rule:
-//
-//     no ambient OCXO clock reads for truth;
-//     only interrupt facts plus math.
-//
-// Prespin architecture (v23 — widened trap + direct diagnostics):
-//
-//   The prespin shadow-write loop runs directly in TimePop ISR context
-//   (priority 16) via timepop_arm_ns(..., isr_callback=true).
-//
-//   Additional diagnostics now capture:
-//     • the actual GNSS/DWT moment prespin began
-//     • the event prediction error (actual event GNSS - target GNSS)
-//     • the distance from prespin fire to actual event
-//     • count of events that arrived after a prior prespin timeout
-//
-//   PRESPIN_LEAD_NS is temporarily widened to 100 us to help characterize
-//   OCXO1 without starving the spin loop.
-//
-// OCXO next-second prediction (v24):
-//
-//   For OCXO1 / OCXO2 only, process_interrupt now tracks the last measured
-//   lawful OCXO second in GNSS nanoseconds and uses that exact last-second
-//   experience as the prediction for the next OCXO second.
-//
-//   This prediction is used ONLY for prespin scheduling. It is not canonical
-//   timing truth and is not to be used for OCXO residual calculation.
-//
-// DWT bridge validation (v26):
-//
-//   At each PPS edge, handle_event calls time_dwt_to_gnss_ns(dwt_at_event)
-//   and compares the result against the known-true GNSS nanosecond at the
-//   PPS boundary.  This is the definitive acid test of the DWT-to-GNSS
-//   bridge because:
-//
-//     • dwt_at_event is prespin-corrected to single-nanosecond precision
-//     • the true GNSS time is known by definition (integer second boundary)
-//     • the bridge is using the prior second's calibration constants
-//     • ISR latency is completely eliminated by prespin
-//
-//   If the bridge error is ~580 ns here, the discrepancy observed in
-//   TimePop dispatch validation is in the bridge math, not ISR latency.
-//   If the bridge error is ~0 ns here, the TimePop discrepancy is in
-//   the dispatch path.
+// OCXO QTimer3 channels remain 16-bit cadence lanes. One-second OCXO events are
+// reconstructed in software by counting lawful compare hits.
 //
 // ============================================================================
 
 #include "process_interrupt.h"
-#include "debug.h"
-#include "config.h"
 
-#include "time.h"
-#include "timepop.h"
+#include "config.h"
+#include "debug.h"
 #include "process.h"
 #include "payload.h"
-#include "tdc_correction.h"
+#include "time.h"
+#include "timepop.h"
 
 #include <Arduino.h>
 #include "imxrt.h"
@@ -105,124 +29,26 @@
 // ============================================================================
 
 static constexpr uint32_t MAX_INTERRUPT_SUBSCRIBERS = 8;
+static constexpr uint64_t NS_PER_SECOND_U64 = 1000000000ULL;
 
-static constexpr uint64_t NS_PER_SECOND_U64      = 1000000000ULL;
-static constexpr uint64_t PRESPIN_LEAD_NS        = 10000ULL;
-static constexpr uint32_t PRESPIN_TIMEOUT_CYCLES = 18000;
-
-static constexpr int64_t BRIDGE_VALIDATION_TOLERANCE_NS = 100LL;
-
-static inline uint64_t dwt_cycles_to_ns_runtime(uint32_t cycles) {
-  const uint32_t f = F_CPU_ACTUAL ? F_CPU_ACTUAL : 1008000000U;
-  return ((uint64_t)cycles * 1000000000ULL + (uint64_t)f / 2ULL) / (uint64_t)f;
-}
-
-// OCXO second decomposition in 16-bit QTimer domain.
+// One second at 10 MHz = 10,000,000 counts = 152 * 65536 + 38528
 static constexpr uint32_t OCXO_COUNTS_PER_SECOND  = 10000000U;
 static constexpr uint32_t QTIMER16_MODULUS        = 65536U;
 static constexpr uint32_t OCXO_SECOND_WHOLE_WRAPS = OCXO_COUNTS_PER_SECOND / QTIMER16_MODULUS; // 152
 static constexpr uint32_t OCXO_SECOND_REMAINDER   = OCXO_COUNTS_PER_SECOND % QTIMER16_MODULUS; // 38528
 
-static_assert(OCXO_SECOND_WHOLE_WRAPS == 152, "Unexpected OCXO whole-wrap decomposition");
+static_assert(OCXO_SECOND_WHOLE_WRAPS == 152, "Unexpected OCXO wrap decomposition");
 static_assert(OCXO_SECOND_REMAINDER   == 38528, "Unexpected OCXO remainder decomposition");
 
-static constexpr uint32_t EDGEKEEPER_CADENCE_INDEX_TOLERANCE = 1;
-static constexpr int64_t  EDGEKEEPER_EDGE_WINDOW_NS = 100000LL;
-
-// EdgeKeeper cadence thresholds within one OCXO second.
-// Hit n occurs at remainder + (n-1)*65536 counts, for n=1..153.
-static inline uint32_t edgekeeper_cadence_index_from_counts(uint32_t counts) {
-  if (counts < OCXO_SECOND_REMAINDER) return 0;
-  const uint32_t idx = 1U + ((counts - OCXO_SECOND_REMAINDER) / QTIMER16_MODULUS);
-  return (idx > (OCXO_SECOND_WHOLE_WRAPS + 1U)) ? (OCXO_SECOND_WHOLE_WRAPS + 1U) : idx;
-}
-
-static inline uint32_t edgekeeper_counts_for_cadence_index(uint32_t idx) {
-  if (idx == 0) return 0;
-  if (idx > (OCXO_SECOND_WHOLE_WRAPS + 1U)) idx = (OCXO_SECOND_WHOLE_WRAPS + 1U);
-  return OCXO_SECOND_REMAINDER + ((idx - 1U) * QTIMER16_MODULUS);
-}
-
-
 // ============================================================================
-// Pin assignments — authoritative for process_interrupt
+// Pin assignments
 // ============================================================================
 
 static constexpr int OCXO1_PIN = 14;
 static constexpr int OCXO2_PIN = 15;
 
 // ============================================================================
-// Shared prespin state — responsibility counter architecture
-// ============================================================================
-
-static volatile uint32_t g_prespin_shadow_dwt = 0;
-static volatile uint32_t g_prespin_start_dwt = 0;
-static volatile int32_t  g_prespin_responsibility_count = 0;
-static volatile bool     g_prespin_spinning = false;
-
-// ============================================================================
-// DWT bridge validation state
-// ============================================================================
-//
-// At each PPS edge, we ask time_dwt_to_gnss_ns() what it thinks the GNSS
-// nanosecond is for the prespin-corrected dwt_at_event, and compare against
-// the known-true GNSS time at the PPS boundary.
-//
-// This runs in ISR context where the time anchor still holds the PREVIOUS
-// second's calibration — the bridge must extrapolate across a full second
-// to reach the current PPS edge.  Any systematic error in the bridge math
-// will appear as a stable bias here.
-//
-
-struct bridge_validation_state_t {
-  uint32_t checks = 0;
-  uint32_t within_tolerance = 0;
-  uint32_t outside_tolerance = 0;
-  uint32_t skipped_invalid = 0;
-  int64_t  last_error_ns = 0;
-};
-
-struct bridge_observation_t {
-  bool     valid = false;
-  bool     within_tolerance = false;
-  bool     skipped_invalid = false;
-  bool     used_prediction = false;
-
-  uint64_t gnss_ns_raw = 0;
-  uint64_t gnss_ns_target = 0;
-  uint64_t gnss_ns_final = 0;
-
-  int64_t  raw_error_ns = 0;
-  int64_t  final_error_ns = 0;
-};
-
-static bridge_validation_state_t g_bridge_pps = {};
-static bridge_validation_state_t g_bridge_ocxo1 = {};
-static bridge_validation_state_t g_bridge_ocxo2 = {};
-
-// ============================================================================
-// QTimer1 PPS-aligned VCLOCK capture
-// ============================================================================
-
-static uint32_t qtimer1_read_32_for_pps_capture(void) {
-  const uint16_t lo1 = IMXRT_TMR1.CH[0].CNTR;
-  const uint16_t hi1 = IMXRT_TMR1.CH[1].HOLD;
-
-  const uint16_t lo2 = IMXRT_TMR1.CH[0].CNTR;
-  const uint16_t hi2 = IMXRT_TMR1.CH[1].HOLD;
-
-  if (hi1 != hi2) {
-    return ((uint32_t)hi2 << 16) | (uint32_t)lo2;
-  }
-  return ((uint32_t)hi1 << 16) | (uint32_t)lo1;
-}
-
-uint32_t interrupt_qtimer1_counter32_now(void) {
-  return qtimer1_read_32_for_pps_capture();
-}
-
-// ============================================================================
-// 16-bit OCXO QTimer runtime
+// Runtime types
 // ============================================================================
 
 enum class qtimer_clock_kind_t : uint8_t {
@@ -264,16 +90,10 @@ struct qtimer16_ocxo_runtime_t {
   uint32_t bootstrap_count = 0;
   uint32_t cadence_hits_total = 0;
   uint32_t cadence_hits_since_second = 0;
-  uint32_t bootstrap_arm_failures = 0;
-
   uint16_t last_programmed_compare = 0;
   uint16_t last_initial_counter16 = 0;
   uint16_t last_second_target_low16 = 0;
 };
-
-// ============================================================================
-// Subscriber descriptor + runtime state
-// ============================================================================
 
 struct interrupt_subscriber_descriptor_t {
   interrupt_subscriber_kind_t kind = interrupt_subscriber_kind_t::NONE;
@@ -282,105 +102,7 @@ struct interrupt_subscriber_descriptor_t {
   interrupt_provider_kind_t provider = interrupt_provider_kind_t::NONE;
   interrupt_lane_t lane = interrupt_lane_t::NONE;
 
-  uint32_t isr_overhead_cycles = 0;
-  uint64_t period_ns = 0;
-  bool     uses_prespin = false;
-  bool     prespin_absolute_gnss = false;
-
   qtimer_clock_kind_t clock_kind = qtimer_clock_kind_t::NONE;
-};
-
-struct prespin_state_t {
-  volatile bool active = false;
-
-  uint64_t event_target_gnss_ns = 0;
-  uint64_t prespin_target_gnss_ns = 0;
-
-  timepop_handle_t handle = TIMEPOP_INVALID_HANDLE;
-
-  uint32_t arm_count = 0;
-  uint32_t complete_count = 0;
-  uint32_t timeout_count = 0;
-  uint32_t anomaly_count = 0;
-  uint32_t late_after_timeout_count = 0;
-  uint32_t stale_callback_count = 0;
-
-  uint32_t next_schedule_generation = 1;
-  uint32_t scheduled_generation = 0;
-  uint32_t armed_generation = 0;
-  uint32_t snap_generation = 0;
-  uint32_t last_completed_generation = 0;
-  uint32_t last_timeout_generation = 0;
-  uint32_t last_late_after_timeout_generation = 0;
-
-  uint64_t last_schedule_now_gnss_ns = 0;
-  uint64_t last_schedule_delay_ns = 0;
-  int64_t  last_prespin_margin_ns = 0;
-  uint64_t last_schedule_event_target_gnss_ns = 0;
-  uint64_t last_schedule_prespin_target_gnss_ns = 0;
-
-  uint32_t snap_start_dwt = 0;
-  uint32_t snap_shadow_dwt = 0;
-  uint32_t snap_dwt_isr_entry_raw = 0;
-  uint64_t snap_prespin_fire_gnss_ns = 0;
-  uint32_t snap_prespin_fire_dwt = 0;
-  bool     snap_fired = false;
-  bool     snap_timed_out = false;
-  uint32_t snap_timeout_elapsed_cycles = 0;
-
-  int64_t  last_event_error_ns = 0;
-  int64_t  last_event_minus_prespin_fire_ns = 0;
-  uint32_t last_late_after_timeout_overage_cycles = 0;
-  uint64_t last_late_after_timeout_overage_ns = 0;
-  uint32_t max_late_after_timeout_overage_cycles = 0;
-  uint64_t max_late_after_timeout_overage_ns = 0;
-};
-
-struct ocxo_prediction_state_t {
-  bool     valid = false;
-  uint64_t next_second_prediction_gnss_ns = 0;
-  uint64_t last_measured_second_gnss_ns = 0;
-  uint64_t previous_edge_gnss_ns = 0;
-  uint32_t update_count = 0;
-};
-
-
-struct edgekeeper_state_t {
-  bool     epoch_valid = false;
-  uint64_t epoch_base_gnss_ns = 0;
-  uint32_t epoch_base_dwt = 0;
-  uint64_t epoch_predicted_second_ns = 0;
-  uint32_t epoch_generation = 0;
-
-  uint32_t last_expected_cadence_index = 0;
-  uint32_t last_observed_cadence_index = 0;
-  int32_t  last_cadence_delta = 0;
-  int64_t  last_phase_error_ns = 0;
-  uint16_t last_counter16_snapshot = 0;
-
-  uint32_t samples_total = 0;
-  uint32_t samples_good = 0;
-  uint32_t samples_missing = 0;
-  uint32_t samples_spurious = 0;
-  uint32_t samples_ambiguous = 0;
-
-  uint32_t window_samples_total = 0;
-  uint32_t window_samples_good = 0;
-  uint32_t window_samples_missing = 0;
-  uint32_t window_samples_spurious = 0;
-  uint32_t window_samples_ambiguous = 0;
-
-  uint32_t edge_good_count = 0;
-  uint32_t edge_missing_count = 0;
-  uint32_t edge_spurious_count = 0;
-  uint32_t edge_ambiguous_count = 0;
-  uint32_t edge_corrected_count = 0;
-
-  int64_t  last_raw_edge_error_ns = 0;
-  int64_t  last_corrected_edge_error_ns = 0;
-  uint64_t last_predicted_edge_gnss_ns = 0;
-  uint64_t last_observed_edge_gnss_ns = 0;
-  uint64_t last_corrected_edge_gnss_ns = 0;
 };
 
 struct interrupt_subscriber_runtime_t {
@@ -399,45 +121,12 @@ struct interrupt_subscriber_runtime_t {
   uint32_t irq_count = 0;
   uint32_t dispatch_count = 0;
   uint32_t event_count = 0;
-
-  prespin_state_t prespin {};
-  ocxo_prediction_state_t ocxo_prediction {};
-  edgekeeper_state_t edgekeeper {};
 };
-
-struct pps_drumbeat_state_t {
-  bool     initialized = false;
-  bool     zero_pending = false;
-  uint64_t baseline_gnss_ns = 0;
-  uint64_t next_event_target_gnss_ns = 0;
-  uint64_t next_prespin_target_gnss_ns = 0;
-  uint64_t next_index = 0;
-  uint32_t generation = 0;
-};
-
-static pps_drumbeat_state_t g_pps_drumbeat = {};
 
 struct interrupt_provider_diag_t {
   uint32_t irq_count = 0;
   uint32_t dispatch_count = 0;
   uint32_t miss_count = 0;
-};
-
-struct interrupt_anomaly_diag_t {
-  uint32_t prespin_null_runtime = 0;
-  uint32_t prespin_arm_failed = 0;
-  uint32_t prespin_timeout = 0;
-  uint32_t prespin_stale_callback = 0;
-  uint32_t no_prespin_active = 0;
-  uint32_t no_shadow_dwt = 0;
-  uint32_t null_desc = 0;
-  uint32_t ocxo_bad_channel = 0;
-  uint32_t ocxo_spurious_irq = 0;
-
-  uint32_t last_kind = 0;
-  uint32_t last_detail0 = 0;
-  uint32_t last_detail1 = 0;
-  uint32_t last_detail2 = 0;
 };
 
 static interrupt_subscriber_runtime_t g_subscribers[MAX_INTERRUPT_SUBSCRIBERS] = {};
@@ -446,9 +135,9 @@ static uint32_t g_subscriber_count = 0;
 static bool g_interrupt_hw_ready = false;
 static bool g_interrupt_runtime_ready = false;
 static bool g_interrupt_irqs_enabled = false;
+static volatile bool g_pps_zero_pending = false;
 
 static interrupt_provider_diag_t g_gpio_diag = {};
-static interrupt_anomaly_diag_t g_anomaly_diag = {};
 
 static interrupt_subscriber_runtime_t* g_rt_pps   = nullptr;
 static interrupt_subscriber_runtime_t* g_rt_ocxo1 = nullptr;
@@ -458,67 +147,14 @@ static qtimer16_ocxo_runtime_t g_clock_ocxo1 = {};
 static qtimer16_ocxo_runtime_t g_clock_ocxo2 = {};
 
 static const interrupt_subscriber_descriptor_t DESCRIPTORS[] = {
-  {
-    interrupt_subscriber_kind_t::PPS,
-    "PPS",
-    interrupt_provider_kind_t::GPIO6789,
-    interrupt_lane_t::GPIO_EDGE,
-    PPS_ISR_FIXED_OVERHEAD,
-    NS_PER_SECOND_U64,
-    true,
-    true,
-    qtimer_clock_kind_t::VCLOCK,
-  },
-  {
-    interrupt_subscriber_kind_t::OCXO1,
-    "OCXO1",
-    interrupt_provider_kind_t::QTIMER3,
-    interrupt_lane_t::QTIMER3_CH2_COMP,
-    QTIMER_ISR_FIXED_OVERHEAD,
-    NS_PER_SECOND_U64,
-    true,
-    false,
-    qtimer_clock_kind_t::OCXO1,
-  },
-  {
-    interrupt_subscriber_kind_t::OCXO2,
-    "OCXO2",
-    interrupt_provider_kind_t::QTIMER3,
-    interrupt_lane_t::QTIMER3_CH3_COMP,
-    QTIMER_ISR_FIXED_OVERHEAD,
-    NS_PER_SECOND_U64,
-    true,
-    false,
-    qtimer_clock_kind_t::OCXO2,
-  },
+  { interrupt_subscriber_kind_t::PPS,   "PPS",   interrupt_provider_kind_t::GPIO6789, interrupt_lane_t::GPIO_EDGE,        qtimer_clock_kind_t::VCLOCK },
+  { interrupt_subscriber_kind_t::OCXO1, "OCXO1", interrupt_provider_kind_t::QTIMER3,  interrupt_lane_t::QTIMER3_CH2_COMP, qtimer_clock_kind_t::OCXO1  },
+  { interrupt_subscriber_kind_t::OCXO2, "OCXO2", interrupt_provider_kind_t::QTIMER3,  interrupt_lane_t::QTIMER3_CH3_COMP, qtimer_clock_kind_t::OCXO2  },
 };
 
-static interrupt_subscriber_runtime_t* runtime_for(interrupt_subscriber_kind_t kind) {
-  for (uint32_t i = 0; i < g_subscriber_count; i++) {
-    if (g_subscribers[i].desc && g_subscribers[i].desc->kind == kind) return &g_subscribers[i];
-  }
-  return nullptr;
-}
-
-static qtimer16_ocxo_runtime_t* ocxo_clock_runtime_for(qtimer_clock_kind_t kind) {
-  switch (kind) {
-    case qtimer_clock_kind_t::OCXO1: return &g_clock_ocxo1;
-    case qtimer_clock_kind_t::OCXO2: return &g_clock_ocxo2;
-    default: return nullptr;
-  }
-}
-
-static void record_anomaly(uint32_t& counter,
-                           interrupt_subscriber_kind_t kind,
-                           uint32_t detail0 = 0,
-                           uint32_t detail1 = 0,
-                           uint32_t detail2 = 0) {
-  counter++;
-  g_anomaly_diag.last_kind = (uint32_t)kind;
-  g_anomaly_diag.last_detail0 = detail0;
-  g_anomaly_diag.last_detail1 = detail1;
-  g_anomaly_diag.last_detail2 = detail2;
-}
+// ============================================================================
+// Helper strings
+// ============================================================================
 
 const char* interrupt_subscriber_kind_str(interrupt_subscriber_kind_t kind) {
   switch (kind) {
@@ -547,6 +183,24 @@ const char* interrupt_lane_str(interrupt_lane_t lane) {
   }
 }
 
+// ============================================================================
+// Counter helpers
+// ============================================================================
+
+static uint32_t qtimer1_read_32_for_pps_capture(void) {
+  const uint16_t lo1 = IMXRT_TMR1.CH[0].CNTR;
+  const uint16_t hi1 = IMXRT_TMR1.CH[1].HOLD;
+
+  const uint16_t lo2 = IMXRT_TMR1.CH[0].CNTR;
+  const uint16_t hi2 = IMXRT_TMR1.CH[1].HOLD;
+
+  if (hi1 != hi2) {
+    return ((uint32_t)hi2 << 16) | (uint32_t)lo2;
+  }
+  return ((uint32_t)hi1 << 16) | (uint32_t)lo1;
+}
+
+uint32_t interrupt_qtimer1_counter32_now(void) { return qtimer1_read_32_for_pps_capture(); }
 uint16_t interrupt_qtimer3_ch2_counter_now(void) { return IMXRT_TMR3.CH[2].CNTR; }
 uint16_t interrupt_qtimer3_ch3_counter_now(void) { return IMXRT_TMR3.CH[3].CNTR; }
 
@@ -566,6 +220,38 @@ static inline void qtimer3_disable_compare(uint8_t ch) {
   IMXRT_TMR3.CH[ch].CSCTRL &= ~TMR_CSCTRL_TCF1EN;
   qtimer3_clear_compare_flag(ch);
 }
+
+// ============================================================================
+// Runtime lookup
+// ============================================================================
+
+static interrupt_subscriber_runtime_t* runtime_for(interrupt_subscriber_kind_t kind) {
+  for (uint32_t i = 0; i < g_subscriber_count; i++) {
+    if (g_subscribers[i].desc && g_subscribers[i].desc->kind == kind) return &g_subscribers[i];
+  }
+  return nullptr;
+}
+
+static qtimer16_ocxo_runtime_t* ocxo_clock_runtime_for(qtimer_clock_kind_t kind) {
+  switch (kind) {
+    case qtimer_clock_kind_t::OCXO1: return &g_clock_ocxo1;
+    case qtimer_clock_kind_t::OCXO2: return &g_clock_ocxo2;
+    default: return nullptr;
+  }
+}
+
+static const char* dispatch_timer_name(interrupt_subscriber_kind_t kind) {
+  switch (kind) {
+    case interrupt_subscriber_kind_t::PPS:   return "PPS_DISPATCH";
+    case interrupt_subscriber_kind_t::OCXO1: return "OCXO1_DISPATCH";
+    case interrupt_subscriber_kind_t::OCXO2: return "OCXO2_DISPATCH";
+    default:                                 return "";
+  }
+}
+
+// ============================================================================
+// OCXO 16-bit cadence model
+// ============================================================================
 
 static void qtimer16_ocxo_arm_bootstrap(qtimer16_ocxo_runtime_t& clock) {
   const uint16_t now16 = clock.hw.module->CH[clock.hw.channel].CNTR;
@@ -617,437 +303,9 @@ static bool qtimer16_ocxo_consume_cadence_irq(qtimer16_ocxo_runtime_t& clock,
   return true;
 }
 
-static void pps_gpio_isr(void) {
-  const uint32_t dwt_raw = ARM_DWT_CYCCNT;
-  process_interrupt_gpio6789_irq(dwt_raw);
-}
-
-static void qtimer3_isr(void) {
-  const uint32_t dwt_raw = ARM_DWT_CYCCNT;
-  if (IMXRT_TMR3.CH[2].CSCTRL & TMR_CSCTRL_TCF1) process_interrupt_qtimer3_ch2_irq(dwt_raw);
-  if (IMXRT_TMR3.CH[3].CSCTRL & TMR_CSCTRL_TCF1) process_interrupt_qtimer3_ch3_irq(dwt_raw);
-}
-
-
-static void edgekeeper_reset_window(edgekeeper_state_t& ek) {
-  ek.window_samples_total = 0;
-  ek.window_samples_good = 0;
-  ek.window_samples_missing = 0;
-  ek.window_samples_spurious = 0;
-  ek.window_samples_ambiguous = 0;
-}
-
-static void edgekeeper_begin_ocxo_epoch(interrupt_subscriber_runtime_t& rt,
-                                        uint64_t edge_gnss_ns,
-                                        uint32_t dwt_at_edge) {
-  edgekeeper_state_t& ek = rt.edgekeeper;
-  edgekeeper_reset_window(ek);
-  ek.epoch_generation++;
-  ek.epoch_base_gnss_ns = edge_gnss_ns;
-  ek.epoch_base_dwt = dwt_at_edge;
-  ek.epoch_predicted_second_ns = rt.ocxo_prediction.next_second_prediction_gnss_ns;
-  ek.epoch_valid = rt.ocxo_prediction.valid && ek.epoch_predicted_second_ns != 0;
-  ek.last_expected_cadence_index = 0;
-  ek.last_observed_cadence_index = 0;
-  ek.last_cadence_delta = 0;
-  ek.last_phase_error_ns = 0;
-  ek.last_counter16_snapshot = 0;
-}
-
-static void edgekeeper_sample_cadence(interrupt_subscriber_runtime_t& rt,
-                                      const qtimer16_ocxo_runtime_t& clock,
-                                      uint32_t dwt_raw,
-                                      uint16_t counter16_snapshot) {
-  edgekeeper_state_t& ek = rt.edgekeeper;
-  ek.samples_total++;
-  ek.window_samples_total++;
-  ek.last_counter16_snapshot = counter16_snapshot;
-
-  if (!ek.epoch_valid || ek.epoch_predicted_second_ns == 0) {
-    ek.samples_ambiguous++;
-    ek.window_samples_ambiguous++;
-    return;
-  }
-
-  const uint32_t dwt_at_cadence = dwt_raw - rt.desc->isr_overhead_cycles;
-  const int64_t gnss_ns_signed = time_dwt_to_gnss_ns(dwt_at_cadence);
-  if (gnss_ns_signed < 0) {
-    ek.samples_ambiguous++;
-    ek.window_samples_ambiguous++;
-    return;
-  }
-
-  const uint64_t gnss_ns_at_cadence = (uint64_t)gnss_ns_signed;
-  if (gnss_ns_at_cadence < ek.epoch_base_gnss_ns) {
-    ek.samples_ambiguous++;
-    ek.window_samples_ambiguous++;
-    return;
-  }
-
-  uint64_t elapsed_ns = gnss_ns_at_cadence - ek.epoch_base_gnss_ns;
-  if (elapsed_ns > ek.epoch_predicted_second_ns) elapsed_ns = ek.epoch_predicted_second_ns;
-
-  const uint64_t pred_counts64 =
-      ((uint64_t)elapsed_ns * (uint64_t)OCXO_COUNTS_PER_SECOND + ek.epoch_predicted_second_ns / 2ULL) /
-      ek.epoch_predicted_second_ns;
-  const uint32_t predicted_counts =
-      (pred_counts64 > (uint64_t)OCXO_COUNTS_PER_SECOND) ? OCXO_COUNTS_PER_SECOND : (uint32_t)pred_counts64;
-
-  const uint32_t expected_idx = edgekeeper_cadence_index_from_counts(predicted_counts);
-  const uint32_t observed_idx = clock.cadence_hit_index + 1U;
-  const int32_t cadence_delta = (int32_t)observed_idx - (int32_t)expected_idx;
-
-  ek.last_expected_cadence_index = expected_idx;
-  ek.last_observed_cadence_index = observed_idx;
-  ek.last_cadence_delta = cadence_delta;
-
-  const uint32_t observed_counts = edgekeeper_counts_for_cadence_index(observed_idx);
-  const int64_t count_error = (int64_t)observed_counts - (int64_t)predicted_counts;
-  ek.last_phase_error_ns =
-      (int64_t)((count_error * (int64_t)ek.epoch_predicted_second_ns) / (int64_t)OCXO_COUNTS_PER_SECOND);
-
-  if (cadence_delta < -(int32_t)EDGEKEEPER_CADENCE_INDEX_TOLERANCE) {
-    ek.samples_missing++;
-    ek.window_samples_missing++;
-  } else if (cadence_delta > (int32_t)EDGEKEEPER_CADENCE_INDEX_TOLERANCE) {
-    ek.samples_spurious++;
-    ek.window_samples_spurious++;
-  } else {
-    ek.samples_good++;
-    ek.window_samples_good++;
-  }
-}
-
-static void edgekeeper_finalize_ocxo_edge(interrupt_subscriber_runtime_t& rt,
-                                          interrupt_event_t& event) {
-  edgekeeper_state_t& ek = rt.edgekeeper;
-  ek.last_predicted_edge_gnss_ns = 0;
-  ek.last_observed_edge_gnss_ns = event.gnss_ns_at_event;
-  ek.last_corrected_edge_gnss_ns = event.gnss_ns_at_event;
-  ek.last_raw_edge_error_ns = 0;
-  ek.last_corrected_edge_error_ns = 0;
-
-  if (!ek.epoch_valid || ek.epoch_predicted_second_ns == 0 || ek.epoch_base_gnss_ns == 0 || event.gnss_ns_at_event == 0) {
-    ek.edge_ambiguous_count++;
-    return;
-  }
-
-  const uint64_t predicted_edge_gnss_ns = ek.epoch_base_gnss_ns + ek.epoch_predicted_second_ns;
-  ek.last_predicted_edge_gnss_ns = predicted_edge_gnss_ns;
-
-  const int64_t raw_error_ns = (int64_t)event.gnss_ns_at_event - (int64_t)predicted_edge_gnss_ns;
-  ek.last_raw_edge_error_ns = raw_error_ns;
-
-  const int64_t second_ns = (int64_t)ek.epoch_predicted_second_ns;
-
-  bool corrected = false;
-  if (llabs(raw_error_ns) <= EDGEKEEPER_EDGE_WINDOW_NS) {
-    ek.edge_good_count++;
-  } else if (llabs(raw_error_ns - second_ns) <= EDGEKEEPER_EDGE_WINDOW_NS) {
-    ek.edge_missing_count++;
-    corrected = true;
-  } else if (llabs(raw_error_ns + second_ns) <= EDGEKEEPER_EDGE_WINDOW_NS) {
-    ek.edge_spurious_count++;
-    corrected = true;
-  } else {
-    ek.edge_ambiguous_count++;
-  }
-
-  if (corrected) {
-    event.gnss_ns_at_event = predicted_edge_gnss_ns;
-    const uint32_t predicted_dwt = time_gnss_ns_to_dwt((int64_t)predicted_edge_gnss_ns);
-    if (predicted_dwt != 0) {
-      event.dwt_at_event = predicted_dwt;
-    }
-    ek.edge_corrected_count++;
-    ek.last_corrected_edge_gnss_ns = event.gnss_ns_at_event;
-  }
-
-  ek.last_corrected_edge_error_ns = (int64_t)event.gnss_ns_at_event - (int64_t)predicted_edge_gnss_ns;
-}
-
-static const char* prespin_timer_name(interrupt_subscriber_kind_t kind) {
-  switch (kind) {
-    case interrupt_subscriber_kind_t::PPS:   return "PPS_PRESPIN";
-    case interrupt_subscriber_kind_t::OCXO1: return "OCXO1_PRESPIN";
-    case interrupt_subscriber_kind_t::OCXO2: return "OCXO2_PRESPIN";
-    default:                                 return "";
-  }
-}
-
-static const char* dispatch_timer_name(interrupt_subscriber_kind_t kind) {
-  switch (kind) {
-    case interrupt_subscriber_kind_t::PPS:   return "PPS_DISPATCH";
-    case interrupt_subscriber_kind_t::OCXO1: return "OCXO1_DISPATCH";
-    case interrupt_subscriber_kind_t::OCXO2: return "OCXO2_DISPATCH";
-    default:                                 return "";
-  }
-}
-
-static void pps_drumbeat_schedule_from_edge(interrupt_subscriber_runtime_t& rt,
-                                            uint64_t pps_edge_gnss_ns);
-static void pps_drumbeat_bootstrap(interrupt_subscriber_runtime_t& rt);
-static void pps_drumbeat_consume_edge(interrupt_subscriber_runtime_t& rt);
-
-static void prespin_isr_callback(timepop_ctx_t* ctx,
-                                 timepop_diag_t*,
-                                 void* user_data) {
-  auto* rt = static_cast<interrupt_subscriber_runtime_t*>(user_data);
-  if (!rt || !rt->desc) {
-    record_anomaly(g_anomaly_diag.prespin_null_runtime, interrupt_subscriber_kind_t::NONE);
-    return;
-  }
-  if (!rt->active) return;
-
-  prespin_state_t& ps = rt->prespin;
-
-  const timepop_handle_t callback_handle = ctx ? ctx->handle : TIMEPOP_INVALID_HANDLE;
-  if (ps.handle == TIMEPOP_INVALID_HANDLE ||
-      callback_handle == TIMEPOP_INVALID_HANDLE ||
-      callback_handle != ps.handle) {
-    ps.stale_callback_count++;
-    record_anomaly(g_anomaly_diag.prespin_stale_callback,
-                   rt->desc->kind,
-                   (uint32_t)callback_handle,
-                   (uint32_t)ps.handle,
-                   ps.scheduled_generation);
-    return;
-  }
-
-  ps.handle = TIMEPOP_INVALID_HANDLE;
-  ps.active = true;
-  ps.arm_count++;
-  ps.armed_generation = ps.scheduled_generation;
-  ps.snap_generation = ps.armed_generation;
-
-  ps.snap_start_dwt = 0;
-  ps.snap_shadow_dwt = 0;
-  ps.snap_dwt_isr_entry_raw = 0;
-  ps.snap_prespin_fire_gnss_ns = (ctx && ctx->fire_gnss_ns >= 0) ? (uint64_t)ctx->fire_gnss_ns : 0ULL;
-  ps.snap_prespin_fire_dwt = ARM_DWT_CYCCNT;
-  ps.snap_fired = false;
-  ps.snap_timed_out = false;
-
-  g_prespin_responsibility_count++;
-  if (g_prespin_spinning) return;
-
-  g_prespin_spinning = true;
-  g_prespin_shadow_dwt = 0;
-  g_prespin_start_dwt = 0;
-
-  const uint32_t loop_start_dwt = ARM_DWT_CYCCNT;
-  g_prespin_start_dwt = loop_start_dwt;
-
-  volatile uint32_t* const shadow = &g_prespin_shadow_dwt;
-  volatile int32_t*  const count  = &g_prespin_responsibility_count;
-
-  for (;;) {
-    *shadow = ARM_DWT_CYCCNT;
-
-    if (*count <= 0) {
-      g_prespin_spinning = false;
-      return;
-    }
-
-    if ((ARM_DWT_CYCCNT - loop_start_dwt) > PRESPIN_TIMEOUT_CYCLES) {
-      g_prespin_responsibility_count = 0;
-      g_prespin_spinning = false;
-
-      for (uint32_t i = 0; i < g_subscriber_count; i++) {
-        interrupt_subscriber_runtime_t& sub = g_subscribers[i];
-        if (!sub.desc || !sub.desc->uses_prespin) continue;
-        if (!sub.prespin.active) continue;
-
-        sub.prespin.snap_timed_out = true;
-        sub.prespin.snap_start_dwt = loop_start_dwt;
-        sub.prespin.snap_shadow_dwt = g_prespin_shadow_dwt;
-        sub.prespin.snap_timeout_elapsed_cycles = ARM_DWT_CYCCNT - loop_start_dwt;
-        sub.prespin.timeout_count++;
-        sub.prespin.anomaly_count++;
-        sub.prespin.last_timeout_generation = sub.prespin.snap_generation;
-        sub.prespin.active = false;
-
-        record_anomaly(g_anomaly_diag.prespin_timeout,
-                       sub.desc->kind,
-                       g_prespin_shadow_dwt,
-                       sub.prespin.arm_count,
-                       sub.prespin.timeout_count);
-      }
-      return;
-    }
-  }
-}
-
-void interrupt_prespin_service(timepop_ctx_t*, timepop_diag_t*, void*) {
-  // retained for header compatibility
-}
-
-static void schedule_next_prespin_from_anchor(interrupt_subscriber_runtime_t& rt,
-                                              uint64_t anchor_gnss_ns,
-                                              uint64_t offset_gnss_ns) {
-  if (!rt.desc || !rt.desc->uses_prespin) return;
-  if (!rt.active) return;
-
-  prespin_state_t& ps = rt.prespin;
-
-  if (ps.handle != TIMEPOP_INVALID_HANDLE) {
-    timepop_cancel(ps.handle);
-    ps.handle = TIMEPOP_INVALID_HANDLE;
-  }
-  ps.active = false;
-
-  ps.event_target_gnss_ns = anchor_gnss_ns + offset_gnss_ns;
-  ps.prespin_target_gnss_ns =
-      (ps.event_target_gnss_ns >= PRESPIN_LEAD_NS)
-          ? (ps.event_target_gnss_ns - PRESPIN_LEAD_NS)
-          : 0ULL;
-
-  ps.last_schedule_event_target_gnss_ns = ps.event_target_gnss_ns;
-  ps.last_schedule_prespin_target_gnss_ns = ps.prespin_target_gnss_ns;
-  ps.last_schedule_now_gnss_ns = anchor_gnss_ns;
-  ps.last_schedule_delay_ns = offset_gnss_ns - PRESPIN_LEAD_NS;
-  ps.last_prespin_margin_ns = (int64_t)(offset_gnss_ns - PRESPIN_LEAD_NS);
-  ps.scheduled_generation = ps.next_schedule_generation++;
-
-  timepop_handle_t h =
-      timepop_arm_ns((int64_t)ps.prespin_target_gnss_ns,
-                     0,
-                     prespin_isr_callback,
-                     &rt,
-                     prespin_timer_name(rt.desc->kind),
-                     true);
-
-  if (h == TIMEPOP_INVALID_HANDLE) {
-    ps.anomaly_count++;
-    record_anomaly(g_anomaly_diag.prespin_arm_failed,
-                   rt.desc->kind,
-                   (uint32_t)(ps.prespin_target_gnss_ns & 0xFFFFFFFFu),
-                   (uint32_t)(ps.prespin_target_gnss_ns >> 32),
-                   ps.scheduled_generation);
-    return;
-  }
-
-  ps.handle = h;
-}
-
-static void pps_drumbeat_schedule_from_edge(interrupt_subscriber_runtime_t& rt,
-                                            uint64_t pps_edge_gnss_ns) {
-  const uint64_t next_event_target_gnss_ns = pps_edge_gnss_ns + NS_PER_SECOND_U64;
-
-  g_pps_drumbeat.next_event_target_gnss_ns = next_event_target_gnss_ns;
-  g_pps_drumbeat.next_prespin_target_gnss_ns =
-      (next_event_target_gnss_ns >= PRESPIN_LEAD_NS)
-          ? (next_event_target_gnss_ns - PRESPIN_LEAD_NS)
-          : 0ULL;
-
-  schedule_next_prespin_from_anchor(rt, pps_edge_gnss_ns, NS_PER_SECOND_U64);
-}
-
-static void clear_prespin_schedule_state(interrupt_subscriber_runtime_t& rt) {
-  if (rt.prespin.handle != TIMEPOP_INVALID_HANDLE) {
-    timepop_cancel(rt.prespin.handle);
-    rt.prespin.handle = TIMEPOP_INVALID_HANDLE;
-  }
-
-  rt.prespin.active = false;
-  rt.prespin.event_target_gnss_ns = 0;
-  rt.prespin.prespin_target_gnss_ns = 0;
-  rt.prespin.last_schedule_now_gnss_ns = 0;
-  rt.prespin.last_schedule_delay_ns = 0;
-  rt.prespin.last_prespin_margin_ns = 0;
-  rt.prespin.last_schedule_event_target_gnss_ns = 0;
-  rt.prespin.last_schedule_prespin_target_gnss_ns = 0;
-  rt.prespin.scheduled_generation = 0;
-}
-
-static void schedule_ocxo_from_edge(interrupt_subscriber_runtime_t& rt,
-                                    uint64_t edge_gnss_ns) {
-  if (edge_gnss_ns == 0) return;
-
-  ocxo_prediction_state_t& pred = rt.ocxo_prediction;
-
-  if (pred.previous_edge_gnss_ns != 0 && edge_gnss_ns > pred.previous_edge_gnss_ns) {
-    pred.last_measured_second_gnss_ns = edge_gnss_ns - pred.previous_edge_gnss_ns;
-    pred.next_second_prediction_gnss_ns = pred.last_measured_second_gnss_ns;
-    pred.valid = true;
-    pred.update_count++;
-  }
-
-  pred.previous_edge_gnss_ns = edge_gnss_ns;
-
-  if (!pred.valid || pred.next_second_prediction_gnss_ns == 0) {
-    clear_prespin_schedule_state(rt);
-    return;
-  }
-
-  schedule_next_prespin_from_anchor(rt, edge_gnss_ns, pred.next_second_prediction_gnss_ns);
-}
-
-static void pps_drumbeat_bootstrap(interrupt_subscriber_runtime_t&) {
-  g_pps_drumbeat.next_event_target_gnss_ns = 0;
-  g_pps_drumbeat.next_prespin_target_gnss_ns = 0;
-  if (!g_pps_drumbeat.initialized) {
-    g_pps_drumbeat.baseline_gnss_ns = 0;
-    g_pps_drumbeat.next_index = 0;
-  }
-}
-
-static void pps_drumbeat_consume_edge(interrupt_subscriber_runtime_t& rt) {
-  if (!rt.has_fired) return;
-  const uint64_t pps_edge_gnss_ns = rt.last_event.gnss_ns_at_event;
-  if (pps_edge_gnss_ns == 0) return;
-
-  const bool establishing_baseline = !g_pps_drumbeat.initialized || g_pps_drumbeat.zero_pending;
-  g_pps_drumbeat.initialized = true;
-  g_pps_drumbeat.zero_pending = false;
-  g_pps_drumbeat.baseline_gnss_ns = pps_edge_gnss_ns;
-  g_pps_drumbeat.next_index = 1;
-  if (establishing_baseline) g_pps_drumbeat.generation++;
-
-  pps_drumbeat_schedule_from_edge(rt, pps_edge_gnss_ns);
-}
-
-static void fill_diag_common(interrupt_subscriber_runtime_t& rt,
-                             interrupt_capture_diag_t& diag,
-                             const interrupt_event_t& event,
-                             const bridge_observation_t& bridge,
-                             uint32_t dwt_isr_entry_raw,
-                             uint32_t approach_cycles,
-                             uint32_t shadow_to_isr_cycles) {
-  diag.provider = rt.desc->provider;
-  diag.lane = rt.desc->lane;
-  diag.kind = rt.desc->kind;
-  diag.prespin_target_gnss_ns = rt.prespin.prespin_target_gnss_ns;
-  diag.event_target_gnss_ns = rt.prespin.event_target_gnss_ns;
-  diag.prespin_active = rt.prespin.active;
-  diag.prespin_fired = rt.prespin.snap_fired;
-  diag.prespin_timed_out = rt.prespin.snap_timed_out;
-  diag.shadow_dwt = rt.prespin.snap_shadow_dwt;
-  diag.dwt_isr_entry_raw = dwt_isr_entry_raw;
-  diag.approach_cycles = approach_cycles;
-  diag.shadow_to_isr_cycles = shadow_to_isr_cycles;
-  diag.dwt_at_event = event.dwt_at_event;
-  diag.dwt_at_event_adjusted = event.dwt_at_event;
-  diag.gnss_ns_at_event_raw = bridge.gnss_ns_raw;
-  diag.gnss_ns_at_event_final = event.gnss_ns_at_event;
-  diag.gnss_ns_at_event = event.gnss_ns_at_event;
-  diag.gnss_ns_at_event_delta = (int64_t)event.gnss_ns_at_event - (int64_t)bridge.gnss_ns_raw;
-  diag.counter32_at_event = event.counter32_at_event;
-  diag.dwt_event_correction_cycles = event.dwt_event_correction_cycles;
-  diag.bridge_valid = bridge.valid;
-  diag.bridge_within_tolerance = bridge.within_tolerance;
-  diag.bridge_skipped_invalid = bridge.skipped_invalid;
-  diag.bridge_used_prediction = bridge.used_prediction;
-  diag.bridge_gnss_ns_raw = bridge.gnss_ns_raw;
-  diag.bridge_gnss_ns_target = bridge.gnss_ns_target;
-  diag.bridge_gnss_ns_final = bridge.gnss_ns_final;
-  diag.bridge_raw_error_ns = bridge.raw_error_ns;
-  diag.bridge_final_error_ns = bridge.final_error_ns;
-  diag.prespin_arm_count = rt.prespin.arm_count;
-  diag.prespin_complete_count = rt.prespin.complete_count;
-  diag.prespin_timeout_count = rt.prespin.timeout_count;
-  diag.anomaly_count = rt.prespin.anomaly_count;
-}
+// ============================================================================
+// Dispatch
+// ============================================================================
 
 static void maybe_dispatch_event(interrupt_subscriber_runtime_t& rt) {
   if (!rt.subscribed || !rt.sub.on_event) return;
@@ -1059,284 +317,77 @@ static void deferred_dispatch_callback(timepop_ctx_t*, timepop_diag_t*, void* us
   if (!rt || !rt->desc) return;
 
   maybe_dispatch_event(*rt);
-  if (rt->desc->kind == interrupt_subscriber_kind_t::PPS) {
-    pps_drumbeat_consume_edge(*rt);
-  } else {
-    schedule_ocxo_from_edge(*rt, rt->last_event.gnss_ns_at_event);
-    edgekeeper_begin_ocxo_epoch(*rt, rt->last_event.gnss_ns_at_event, rt->last_event.dwt_at_event);
+
+  if (rt->desc->kind == interrupt_subscriber_kind_t::PPS && g_pps_zero_pending) {
+    g_pps_zero_pending = false;
   }
 }
 
 // ============================================================================
-// DWT bridge validation helper
+// Event normalization
 // ============================================================================
-//
-// Validates time_dwt_to_gnss_ns() against a known-true GNSS nanosecond.
-//
-// For PPS events: the true GNSS time is the exact integer second boundary,
-// and dwt_at_event is prespin-corrected — ISR latency is eliminated.
-// The bridge is using the PREVIOUS second's calibration (time_pps_update
-// has not been called yet), so any systematic error in the bridge math
-// will appear as a stable bias.
-//
-// For OCXO events: the true GNSS time is the bridge-computed value
-// (gnss_ns_at_event), so this is a self-consistency check using the
-// anchor snapshot at the moment of the event.
-//
 
-static bridge_observation_t bridge_validate(bridge_validation_state_t& bv,
-                                          uint32_t dwt_at_event,
-                                          uint64_t true_gnss_ns) {
-  bridge_observation_t obs {};
-  obs.gnss_ns_target = true_gnss_ns;
-  obs.gnss_ns_final = true_gnss_ns;
+static void fill_diag_common(interrupt_subscriber_runtime_t& rt,
+                             interrupt_capture_diag_t& diag,
+                             const interrupt_event_t& event,
+                             uint32_t dwt_isr_entry_raw,
+                             bool bridge_valid) {
+  diag.provider = rt.desc->provider;
+  diag.lane = rt.desc->lane;
+  diag.kind = rt.desc->kind;
 
-  const int64_t bridge_gnss_ns = time_dwt_to_gnss_ns(dwt_at_event);
-  if (bridge_gnss_ns < 0) {
-    bv.skipped_invalid++;
-    obs.skipped_invalid = true;
-    return obs;
-  }
+  diag.dwt_isr_entry_raw = dwt_isr_entry_raw;
+  diag.dwt_at_event = event.dwt_at_event;
+  diag.dwt_at_event_adjusted = event.dwt_at_event;
+  diag.counter32_at_event = event.counter32_at_event;
+  diag.dwt_event_correction_cycles = 0;
 
-  obs.valid = true;
-  obs.gnss_ns_raw = (uint64_t)bridge_gnss_ns;
-  obs.raw_error_ns = bridge_gnss_ns - (int64_t)true_gnss_ns;
-  obs.final_error_ns = 0;
+  diag.gnss_ns_at_event_raw = event.gnss_ns_at_event;
+  diag.gnss_ns_at_event_final = event.gnss_ns_at_event;
+  diag.gnss_ns_at_event = event.gnss_ns_at_event;
+  diag.gnss_ns_at_event_delta = 0;
 
-  bv.checks++;
-  bv.last_error_ns = obs.raw_error_ns;
-
-  if (llabs(obs.raw_error_ns) <= BRIDGE_VALIDATION_TOLERANCE_NS) {
-    bv.within_tolerance++;
-    obs.within_tolerance = true;
-  } else {
-    bv.outside_tolerance++;
-  }
-
-  return obs;
+  diag.bridge_valid = bridge_valid;
+  diag.bridge_within_tolerance = bridge_valid;
+  diag.bridge_skipped_invalid = !bridge_valid;
+  diag.bridge_used_prediction = false;
+  diag.gnss_ns_at_event_bridge = event.gnss_ns_at_event;
+  diag.bridge_gnss_ns_raw = event.gnss_ns_at_event;
+  diag.bridge_gnss_ns_target = event.gnss_ns_at_event;
+  diag.bridge_gnss_ns_final = event.gnss_ns_at_event;
+  diag.bridge_raw_error_ns = 0;
+  diag.bridge_final_error_ns = 0;
 }
-
-
-static bridge_observation_t build_ocxo_bridge_observation(const interrupt_event_t& event,
-                                                   uint64_t raw_gnss_ns,
-                                                   const edgekeeper_state_t& ek) {
-  bridge_observation_t obs {};
-  obs.valid = (raw_gnss_ns != 0);
-  obs.gnss_ns_raw = raw_gnss_ns;
-  obs.gnss_ns_final = event.gnss_ns_at_event;
-  obs.used_prediction = (raw_gnss_ns != 0 && event.gnss_ns_at_event != raw_gnss_ns);
-
-  if (ek.last_predicted_edge_gnss_ns != 0) {
-    obs.gnss_ns_target = ek.last_predicted_edge_gnss_ns;
-    if (raw_gnss_ns != 0) {
-      obs.raw_error_ns = (int64_t)raw_gnss_ns - (int64_t)obs.gnss_ns_target;
-    }
-    if (event.gnss_ns_at_event != 0) {
-      obs.final_error_ns = (int64_t)event.gnss_ns_at_event - (int64_t)obs.gnss_ns_target;
-      obs.within_tolerance = (llabs(obs.final_error_ns) <= EDGEKEEPER_EDGE_WINDOW_NS);
-    }
-  }
-
-  return obs;
-}
-
-// ============================================================================
-// handle_event — corrected diagnostic snap + integrity instrumentation (v25)
-// ============================================================================
-//
-// v25 changes:
-//
-//   BUG FIX: snap_fired / snap_timed_out were unconditionally overwritten
-//   to true/false after the if/else prespin state machine, making all
-//   diagnostic reports claim prespin fired successfully regardless of
-//   actual state.  Fixed: snap values are now set INSIDE each branch
-//   to reflect the actual prespin outcome.
-//
-//   BUG FIX: approach_cycles and shadow_to_isr_cycles were computed from
-//   global g_prespin_start_dwt / g_prespin_shadow_dwt even when prespin
-//   was not active for this subscriber, producing stale/meaningless
-//   values (e.g. 598M cycles).  Fixed: these are only computed when
-//   prespin was genuinely active (ps_was_active == true).
-//
-//   NEW: per-OCXO gnss_ns_between_edges is computed inside handle_event
-//   itself and stored in the event struct, so downstream consumers
-//   (process_clocks_alpha) receive it as a first-class fact rather than
-//   recomputing it independently.
-//
-// v26 changes:
-//
-//   NEW: DWT bridge validation at PPS boundary.  After reconstructing
-//   the canonical event, calls time_dwt_to_gnss_ns(dwt_at_event) and
-//   compares against the known-true GNSS nanosecond.  Counts hits
-//   within/outside 100 ns tolerance and records the last error.
-//
-// ============================================================================
 
 static void handle_event(interrupt_subscriber_runtime_t& rt,
                          uint32_t dwt_isr_entry_raw,
                          uint32_t counter32_at_event) {
-  prespin_state_t& ps = rt.prespin;
-
-  // ── Prespin state machine — determine what actually happened ──
-  //
-  // Three mutually exclusive outcomes:
-  //   1. ps.active was true   → prespin caught this event (normal path)
-  //   2. ps.snap_timed_out    → prespin ran but timed out before event
-  //   3. neither              → no prespin was active for this event
-
-  const bool ps_was_active = ps.active;
-  const bool ps_was_timed_out = !ps_was_active && ps.snap_timed_out;
-
-  if (ps_was_active) {
-    // Normal path: prespin was spinning when the ISR fired.
-    g_prespin_responsibility_count--;
-    ps.active = false;
-    ps.complete_count++;
-    ps.last_late_after_timeout_overage_cycles = 0;
-    ps.last_late_after_timeout_overage_ns = 0;
-
-    // Capture snap from the LIVE globals — they belong to us.
-    ps.snap_start_dwt = g_prespin_start_dwt;
-    ps.snap_shadow_dwt = g_prespin_shadow_dwt;
-    ps.snap_dwt_isr_entry_raw = dwt_isr_entry_raw;
-    ps.snap_fired = true;
-    ps.snap_timed_out = false;
-    ps.snap_timeout_elapsed_cycles = 0;
-    ps.last_completed_generation = ps.snap_generation;
-
-  } else if (ps_was_timed_out) {
-    // Late-after-timeout: prespin timed out, then the event eventually arrived.
-    ps.late_after_timeout_count++;
-    const uint32_t timeout_boundary_dwt = ps.snap_start_dwt + PRESPIN_TIMEOUT_CYCLES;
-    const uint32_t overage_cycles = dwt_isr_entry_raw - timeout_boundary_dwt;
-    const uint64_t overage_ns = dwt_cycles_to_ns_runtime(overage_cycles);
-    ps.last_late_after_timeout_overage_cycles = overage_cycles;
-    ps.last_late_after_timeout_overage_ns = overage_ns;
-    if (overage_cycles > ps.max_late_after_timeout_overage_cycles) {
-      ps.max_late_after_timeout_overage_cycles = overage_cycles;
-      ps.max_late_after_timeout_overage_ns = overage_ns;
-    }
-
-    // snap_start_dwt and snap_shadow_dwt were already captured by the
-    // timeout handler in prespin_isr_callback.  Preserve them — they
-    // are the truthful record of the timed-out prespin session.
-    ps.snap_dwt_isr_entry_raw = dwt_isr_entry_raw;
-    ps.snap_fired = false;
-    ps.snap_timed_out = true;
-    // snap_timeout_elapsed_cycles was set by the timeout handler.
-    ps.last_late_after_timeout_generation = ps.snap_generation;
-
-  } else {
-    // No prespin was active at all.
-    ps.last_late_after_timeout_overage_cycles = 0;
-    ps.last_late_after_timeout_overage_ns = 0;
-
-    ps.snap_start_dwt = 0;
-    ps.snap_shadow_dwt = 0;
-    ps.snap_dwt_isr_entry_raw = dwt_isr_entry_raw;
-    ps.snap_fired = false;
-    ps.snap_timed_out = false;
-    ps.snap_timeout_elapsed_cycles = 0;
-  }
-
-  // ── Prespin diagnostics — only meaningful when prespin was active ──
-
-  const bool prespin_expected =
-      (rt.desc->kind == interrupt_subscriber_kind_t::PPS) ||
-      rt.ocxo_prediction.valid;
-
-  uint32_t approach_cycles = 0;
-  uint32_t shadow_to_isr_cycles = 0;
-
-  if (ps_was_active) {
-    // Prespin caught the event — approach and shadow-to-ISR are meaningful.
-    if (ps.snap_start_dwt != 0)  approach_cycles = dwt_isr_entry_raw - ps.snap_start_dwt;
-    if (ps.snap_shadow_dwt != 0) shadow_to_isr_cycles = dwt_isr_entry_raw - ps.snap_shadow_dwt;
-
-    if (ps.snap_shadow_dwt == 0) {
-      ps.anomaly_count++;
-      record_anomaly(g_anomaly_diag.no_shadow_dwt,
-                     rt.desc->kind,
-                     dwt_isr_entry_raw,
-                     ps.arm_count,
-                     ps.complete_count);
-    }
-  } else if (prespin_expected && !ps_was_timed_out) {
-    // Prespin was expected but never fired — no spin loop ran at all.
-    ps.anomaly_count++;
-    record_anomaly(g_anomaly_diag.no_prespin_active,
-                   rt.desc->kind,
-                   dwt_isr_entry_raw,
-                   0,
-                   ps.arm_count);
-  }
-
-  // ── Reconstruct canonical event ──
-
-  const uint32_t correction = rt.desc->isr_overhead_cycles;
-  const uint32_t dwt_at_event = dwt_isr_entry_raw - correction;
-
   interrupt_event_t event {};
-  bridge_observation_t bridge_obs {};
   event.kind = rt.desc->kind;
   event.provider = rt.desc->provider;
   event.lane = rt.desc->lane;
-  event.dwt_at_event = dwt_at_event;
+  event.status = interrupt_event_status_t::OK;
+  event.dwt_at_event = dwt_isr_entry_raw;
   event.counter32_at_event = counter32_at_event;
-  event.dwt_event_correction_cycles = correction;
+  event.dwt_event_correction_cycles = 0;
+
+  bool bridge_valid = true;
 
   if (rt.desc->kind == interrupt_subscriber_kind_t::PPS) {
-    const int64_t pps_index = (int64_t)rt.event_count;
-    event.gnss_ns_at_event = (uint64_t)(pps_index * 1000000000LL);
-    event.status = interrupt_event_status_t::OK;
-
-    // ── DWT bridge validation at PPS boundary ──
-    //
-    // The true GNSS nanosecond is the integer second boundary we just
-    // computed above.  dwt_at_event is prespin-corrected.  The time
-    // anchor still holds the PREVIOUS second's calibration because
-    // time_pps_update() has not been called yet (that happens later
-    // in deferred_dispatch_callback → pps_callback → time_pps_update).
-    //
-    // This is the definitive test: if the bridge shows ~580 ns error
-    // here, the discrepancy is in the bridge math.  If ~0 ns, the
-    // TimePop dispatch error is elsewhere.
-
-    bridge_obs = bridge_validate(g_bridge_pps, dwt_at_event, event.gnss_ns_at_event);
-
+    event.gnss_ns_at_event = (uint64_t)rt.event_count * NS_PER_SECOND_U64;
   } else {
-    const int64_t gnss_ns_signed = time_dwt_to_gnss_ns(dwt_at_event);
-    const uint64_t raw_gnss_ns = (gnss_ns_signed >= 0) ? (uint64_t)gnss_ns_signed : 0ULL;
-    if (gnss_ns_signed >= 0) {
-      event.gnss_ns_at_event = raw_gnss_ns;
-      event.status = interrupt_event_status_t::OK;
-    } else {
+    const int64_t gnss_ns_signed = time_dwt_to_gnss_ns(dwt_isr_entry_raw);
+    if (gnss_ns_signed < 0) {
       event.gnss_ns_at_event = 0;
       event.status = interrupt_event_status_t::HOLD;
+      bridge_valid = false;
+    } else {
+      event.gnss_ns_at_event = (uint64_t)gnss_ns_signed;
     }
-    edgekeeper_finalize_ocxo_edge(rt, event);
-    bridge_obs = build_ocxo_bridge_observation(event, raw_gnss_ns, rt.edgekeeper);
   }
-
-  // ── Prespin prediction error diagnostics ──
-
-  if (ps.event_target_gnss_ns != 0 && event.gnss_ns_at_event != 0) {
-    ps.last_event_error_ns = (int64_t)event.gnss_ns_at_event - (int64_t)ps.event_target_gnss_ns;
-  } else {
-    ps.last_event_error_ns = 0;
-  }
-
-  if (ps.snap_prespin_fire_gnss_ns != 0 && event.gnss_ns_at_event != 0) {
-    ps.last_event_minus_prespin_fire_ns =
-        (int64_t)event.gnss_ns_at_event - (int64_t)ps.snap_prespin_fire_gnss_ns;
-  } else {
-    ps.last_event_minus_prespin_fire_ns = 0;
-  }
-
-  // ── Fill diagnostic struct and dispatch ──
 
   interrupt_capture_diag_t diag {};
-  fill_diag_common(rt, diag, event, bridge_obs, dwt_isr_entry_raw, approach_cycles, shadow_to_isr_cycles);
+  fill_diag_common(rt, diag, event, dwt_isr_entry_raw, bridge_valid);
 
   rt.last_event = event;
   rt.last_diag = diag;
@@ -1346,6 +397,21 @@ static void handle_event(interrupt_subscriber_runtime_t& rt,
   rt.event_count++;
 
   timepop_arm_asap(deferred_dispatch_callback, &rt, dispatch_timer_name(rt.desc->kind));
+}
+
+// ============================================================================
+// ISR wrappers
+// ============================================================================
+
+static void pps_gpio_isr(void) {
+  const uint32_t dwt_raw = ARM_DWT_CYCCNT;
+  process_interrupt_gpio6789_irq(dwt_raw);
+}
+
+static void qtimer3_isr(void) {
+  const uint32_t dwt_raw = ARM_DWT_CYCCNT;
+  if (IMXRT_TMR3.CH[2].CSCTRL & TMR_CSCTRL_TCF1) process_interrupt_qtimer3_ch2_irq(dwt_raw);
+  if (IMXRT_TMR3.CH[3].CSCTRL & TMR_CSCTRL_TCF1) process_interrupt_qtimer3_ch3_irq(dwt_raw);
 }
 
 static void handle_ocxo_qtimer16_irq(qtimer16_ocxo_runtime_t& clock,
@@ -1361,16 +427,9 @@ static void handle_ocxo_qtimer16_irq(qtimer16_ocxo_runtime_t& clock,
 
   const uint16_t counter16_snapshot = clock.hw.module->CH[clock.hw.channel].CNTR;
   if (!clock.phase_bootstrapped) {
-    record_anomaly(g_anomaly_diag.ocxo_bad_channel,
-                   rt.desc->kind,
-                   clock.hw.channel,
-                   counter16_snapshot,
-                   0);
     clock.miss_count++;
     return;
   }
-
-  edgekeeper_sample_cadence(rt, clock, dwt_raw, counter16_snapshot);
 
   uint32_t logical_counter32_at_event = 0;
   const bool is_second_edge = qtimer16_ocxo_consume_cadence_irq(clock,
@@ -1406,6 +465,10 @@ void process_interrupt_qtimer3_ch3_irq(uint32_t dwt_raw) {
   handle_ocxo_qtimer16_irq(g_clock_ocxo2, *g_rt_ocxo2, dwt_raw);
 }
 
+// ============================================================================
+// Public control
+// ============================================================================
+
 bool interrupt_subscribe(const interrupt_subscription_t& sub) {
   if (!g_interrupt_runtime_ready) return false;
   if (sub.kind == interrupt_subscriber_kind_t::NONE) return false;
@@ -1424,14 +487,8 @@ bool interrupt_start(interrupt_subscriber_kind_t kind) {
 
   rt->active = true;
   rt->start_count++;
-  rt->prespin.active = false;
-  rt->ocxo_prediction = {};
-  rt->edgekeeper = {};
-  clear_prespin_schedule_state(*rt);
 
   if (kind == interrupt_subscriber_kind_t::PPS) {
-    debug_log("pps.start", "requested");
-    pps_drumbeat_bootstrap(*rt);
     return true;
   }
 
@@ -1455,14 +512,6 @@ bool interrupt_stop(interrupt_subscriber_kind_t kind) {
 
   rt->active = false;
   rt->stop_count++;
-  if (rt->prespin.handle != TIMEPOP_INVALID_HANDLE) {
-    timepop_cancel(rt->prespin.handle);
-    rt->prespin.handle = TIMEPOP_INVALID_HANDLE;
-  }
-  rt->prespin.active = false;
-  rt->ocxo_prediction = {};
-  rt->edgekeeper = {};
-  clear_prespin_schedule_state(*rt);
 
   qtimer16_ocxo_runtime_t* clock = ocxo_clock_runtime_for(rt->desc->clock_kind);
   if (clock) {
@@ -1473,13 +522,8 @@ bool interrupt_stop(interrupt_subscriber_kind_t kind) {
   return true;
 }
 
-void interrupt_request_pps_zero(void) {
-  g_pps_drumbeat.zero_pending = true;
-}
-
-bool interrupt_pps_zero_pending(void) {
-  return g_pps_drumbeat.zero_pending;
-}
+void interrupt_request_pps_zero(void) { g_pps_zero_pending = true; }
+bool interrupt_pps_zero_pending(void) { return g_pps_zero_pending; }
 
 const interrupt_event_t* interrupt_last_event(interrupt_subscriber_kind_t kind) {
   interrupt_subscriber_runtime_t* rt = runtime_for(kind);
@@ -1492,6 +536,14 @@ const interrupt_capture_diag_t* interrupt_last_diag(interrupt_subscriber_kind_t 
   if (!rt || !rt->has_fired) return nullptr;
   return &rt->last_diag;
 }
+
+void interrupt_prespin_service(timepop_ctx_t*, timepop_diag_t*, void*) {
+  // retained for linkage compatibility
+}
+
+// ============================================================================
+// Lifecycle
+// ============================================================================
 
 void process_interrupt_init_hardware(void) {
   if (g_interrupt_hw_ready) return;
@@ -1564,17 +616,8 @@ void process_interrupt_init(void) {
     }
   }
 
-  g_prespin_shadow_dwt = 0;
-  g_prespin_start_dwt = 0;
-  g_prespin_responsibility_count = 0;
-  g_prespin_spinning = false;
-
-  g_pps_drumbeat = {};
-
-  g_bridge_pps = {};
-  g_bridge_ocxo1 = {};
-  g_bridge_ocxo2 = {};
-
+  g_gpio_diag = {};
+  g_pps_zero_pending = false;
   g_interrupt_runtime_ready = true;
 }
 
@@ -1593,30 +636,8 @@ void process_interrupt_enable_irqs(void) {
 }
 
 // ============================================================================
-// Report helper — emit bridge validation block
+// REPORT
 // ============================================================================
-
-static void report_add_bridge_validation(Payload& p,
-                                         const char* prefix,
-                                         const bridge_validation_state_t& bv) {
-  char key[64];
-
-  auto add_u32 = [&](const char* suffix, uint32_t value) {
-    snprintf(key, sizeof(key), "%s_%s", prefix, suffix);
-    p.add(key, value);
-  };
-
-  auto add_i64 = [&](const char* suffix, int64_t value) {
-    snprintf(key, sizeof(key), "%s_%s", prefix, suffix);
-    p.add(key, value);
-  };
-
-  add_u32("checks", bv.checks);
-  add_u32("within_tolerance", bv.within_tolerance);
-  add_u32("outside_tolerance", bv.outside_tolerance);
-  add_u32("skipped_invalid", bv.skipped_invalid);
-  add_i64("last_error_ns", bv.last_error_ns);
-}
 
 static Payload cmd_report(const Payload&) {
   Payload p;
@@ -1626,49 +647,27 @@ static Payload cmd_report(const Payload&) {
   p.add("irqs_enabled", g_interrupt_irqs_enabled);
   p.add("subscriber_count", g_subscriber_count);
 
+  p.add("pps_zero_pending", g_pps_zero_pending);
+
   p.add("gpio_irq_count", g_gpio_diag.irq_count);
   p.add("gpio_dispatch_count", g_gpio_diag.dispatch_count);
   p.add("gpio_miss_count", g_gpio_diag.miss_count);
 
-  p.add("pps_drumbeat_initialized", g_pps_drumbeat.initialized);
-  p.add("pps_zero_pending", g_pps_drumbeat.zero_pending);
-  p.add("pps_baseline_gnss_ns", g_pps_drumbeat.baseline_gnss_ns);
-  p.add("pps_next_event_target_gnss_ns", g_pps_drumbeat.next_event_target_gnss_ns);
-  p.add("pps_next_prespin_target_gnss_ns", g_pps_drumbeat.next_prespin_target_gnss_ns);
-  p.add("pps_generation", g_pps_drumbeat.generation);
+  p.add("ocxo1_irq_count", g_clock_ocxo1.irq_count);
+  p.add("ocxo1_dispatch_count", g_clock_ocxo1.dispatch_count);
+  p.add("ocxo1_miss_count", g_clock_ocxo1.miss_count);
+  p.add("ocxo1_bootstrap_count", g_clock_ocxo1.bootstrap_count);
+  p.add("ocxo1_cadence_hits_total", g_clock_ocxo1.cadence_hits_total);
+  p.add("ocxo1_last_programmed_compare", (uint32_t)g_clock_ocxo1.last_programmed_compare);
+  p.add("ocxo1_last_counter16_at_irq", (uint32_t)g_clock_ocxo1.last_counter16_at_irq);
 
-  p.add("ocxo1_next_second_prediction_valid", g_rt_ocxo1 ? g_rt_ocxo1->ocxo_prediction.valid : false);
-  p.add("ocxo1_next_second_prediction_gnss_ns", g_rt_ocxo1 ? g_rt_ocxo1->ocxo_prediction.next_second_prediction_gnss_ns : 0ULL);
-  p.add("ocxo1_last_measured_second_gnss_ns", g_rt_ocxo1 ? g_rt_ocxo1->ocxo_prediction.last_measured_second_gnss_ns : 0ULL);
-  p.add("ocxo1_prediction_update_count", g_rt_ocxo1 ? g_rt_ocxo1->ocxo_prediction.update_count : 0U);
-  p.add("ocxo2_next_second_prediction_valid", g_rt_ocxo2 ? g_rt_ocxo2->ocxo_prediction.valid : false);
-  p.add("ocxo2_next_second_prediction_gnss_ns", g_rt_ocxo2 ? g_rt_ocxo2->ocxo_prediction.next_second_prediction_gnss_ns : 0ULL);
-  p.add("ocxo2_last_measured_second_gnss_ns", g_rt_ocxo2 ? g_rt_ocxo2->ocxo_prediction.last_measured_second_gnss_ns : 0ULL);
-  p.add("ocxo2_prediction_update_count", g_rt_ocxo2 ? g_rt_ocxo2->ocxo_prediction.update_count : 0U);
-
-  p.add("prespin_lead_ns", (uint64_t)PRESPIN_LEAD_NS);
-  p.add("prespin_timeout_cycles", PRESPIN_TIMEOUT_CYCLES);
-  p.add("prespin_responsibility_count", g_prespin_responsibility_count);
-  p.add("prespin_spinning", g_prespin_spinning);
-
-  p.add("anomaly_prespin_null_runtime", g_anomaly_diag.prespin_null_runtime);
-  p.add("anomaly_prespin_arm_failed", g_anomaly_diag.prespin_arm_failed);
-  p.add("anomaly_prespin_timeout", g_anomaly_diag.prespin_timeout);
-  p.add("anomaly_prespin_stale_callback", g_anomaly_diag.prespin_stale_callback);
-  p.add("anomaly_no_prespin_active", g_anomaly_diag.no_prespin_active);
-  p.add("anomaly_no_shadow_dwt", g_anomaly_diag.no_shadow_dwt);
-  p.add("anomaly_null_desc", g_anomaly_diag.null_desc);
-  p.add("anomaly_ocxo_bad_channel", g_anomaly_diag.ocxo_bad_channel);
-  p.add("anomaly_ocxo_spurious_irq", g_anomaly_diag.ocxo_spurious_irq);
-
-  p.add("anomaly_last_kind", g_anomaly_diag.last_kind);
-  p.add("anomaly_last_detail0", g_anomaly_diag.last_detail0);
-  p.add("anomaly_last_detail1", g_anomaly_diag.last_detail1);
-  p.add("anomaly_last_detail2", g_anomaly_diag.last_detail2);
-
-  // ── DWT bridge validation ──
-
-  report_add_bridge_validation(p, "bridge_pps", g_bridge_pps);
+  p.add("ocxo2_irq_count", g_clock_ocxo2.irq_count);
+  p.add("ocxo2_dispatch_count", g_clock_ocxo2.dispatch_count);
+  p.add("ocxo2_miss_count", g_clock_ocxo2.miss_count);
+  p.add("ocxo2_bootstrap_count", g_clock_ocxo2.bootstrap_count);
+  p.add("ocxo2_cadence_hits_total", g_clock_ocxo2.cadence_hits_total);
+  p.add("ocxo2_last_programmed_compare", (uint32_t)g_clock_ocxo2.last_programmed_compare);
+  p.add("ocxo2_last_counter16_at_irq", (uint32_t)g_clock_ocxo2.last_counter16_at_irq);
 
   PayloadArray subscribers;
   for (uint32_t i = 0; i < g_subscriber_count; i++) {
@@ -1684,66 +683,14 @@ static Payload cmd_report(const Payload&) {
     s.add("dispatch_count", rt.dispatch_count);
     s.add("event_count", rt.event_count);
 
-    s.add("prespin_arm_count", rt.prespin.arm_count);
-    s.add("prespin_complete_count", rt.prespin.complete_count);
-    s.add("prespin_timeout_count", rt.prespin.timeout_count);
-    s.add("prespin_stale_callback_count", rt.prespin.stale_callback_count);
-    s.add("prespin_armed_generation", rt.prespin.armed_generation);
-    s.add("prespin_last_completed_generation", rt.prespin.last_completed_generation);
-    s.add("prespin_last_timeout_generation", rt.prespin.last_timeout_generation);
-    s.add("prespin_last_late_after_timeout_generation", rt.prespin.last_late_after_timeout_generation);
-    s.add("late_after_timeout_count", rt.prespin.late_after_timeout_count);
-    s.add("anomaly_count", rt.prespin.anomaly_count);
-
-    s.add("ocxo_prediction_valid", rt.ocxo_prediction.valid);
-    s.add("ocxo_next_second_prediction_gnss_ns", rt.ocxo_prediction.next_second_prediction_gnss_ns);
-    s.add("ocxo_last_measured_second_gnss_ns", rt.ocxo_prediction.last_measured_second_gnss_ns);
-    s.add("ocxo_prediction_update_count", rt.ocxo_prediction.update_count);
-
-    s.add("edgekeeper_epoch_valid", rt.edgekeeper.epoch_valid);
-    s.add("edgekeeper_epoch_generation", rt.edgekeeper.epoch_generation);
-    s.add("edgekeeper_epoch_predicted_second_ns", rt.edgekeeper.epoch_predicted_second_ns);
-    s.add("edgekeeper_last_expected_cadence_index", rt.edgekeeper.last_expected_cadence_index);
-    s.add("edgekeeper_last_observed_cadence_index", rt.edgekeeper.last_observed_cadence_index);
-    s.add("edgekeeper_last_cadence_delta", rt.edgekeeper.last_cadence_delta);
-    s.add("edgekeeper_last_phase_error_ns", rt.edgekeeper.last_phase_error_ns);
-
-    s.add("edgekeeper_samples_total", rt.edgekeeper.samples_total);
-    s.add("edgekeeper_samples_good", rt.edgekeeper.samples_good);
-    s.add("edgekeeper_samples_missing", rt.edgekeeper.samples_missing);
-    s.add("edgekeeper_samples_spurious", rt.edgekeeper.samples_spurious);
-    s.add("edgekeeper_samples_ambiguous", rt.edgekeeper.samples_ambiguous);
-
-    s.add("edgekeeper_edge_good_count", rt.edgekeeper.edge_good_count);
-    s.add("edgekeeper_edge_missing_count", rt.edgekeeper.edge_missing_count);
-    s.add("edgekeeper_edge_spurious_count", rt.edgekeeper.edge_spurious_count);
-    s.add("edgekeeper_edge_ambiguous_count", rt.edgekeeper.edge_ambiguous_count);
-    s.add("edgekeeper_edge_corrected_count", rt.edgekeeper.edge_corrected_count);
-
-    s.add("edgekeeper_last_predicted_edge_gnss_ns", rt.edgekeeper.last_predicted_edge_gnss_ns);
-    s.add("edgekeeper_last_observed_edge_gnss_ns", rt.edgekeeper.last_observed_edge_gnss_ns);
-    s.add("edgekeeper_last_corrected_edge_gnss_ns", rt.edgekeeper.last_corrected_edge_gnss_ns);
-    s.add("edgekeeper_last_raw_edge_error_ns", rt.edgekeeper.last_raw_edge_error_ns);
-    s.add("edgekeeper_last_corrected_edge_error_ns", rt.edgekeeper.last_corrected_edge_error_ns);
-
-    s.add("event_target_gnss_ns", rt.prespin.event_target_gnss_ns);
-    s.add("prespin_target_gnss_ns", rt.prespin.prespin_target_gnss_ns);
-    s.add("last_event_error_ns", rt.prespin.last_event_error_ns);
-    s.add("last_event_minus_prespin_fire_ns", rt.prespin.last_event_minus_prespin_fire_ns);
-
     s.add("last_gnss_ns_at_event", rt.last_event.gnss_ns_at_event);
+    s.add("last_dwt_at_event", rt.last_event.dwt_at_event);
     s.add("last_counter32_at_event", rt.last_event.counter32_at_event);
     s.add("last_status", (uint32_t)rt.last_event.status);
 
     s.add("bridge_valid", rt.last_diag.bridge_valid);
-    s.add("bridge_within_tolerance", rt.last_diag.bridge_within_tolerance);
-    s.add("bridge_skipped_invalid", rt.last_diag.bridge_skipped_invalid);
-    s.add("bridge_used_prediction", rt.last_diag.bridge_used_prediction);
-    s.add("bridge_gnss_ns_raw", rt.last_diag.bridge_gnss_ns_raw);
-    s.add("bridge_gnss_ns_target", rt.last_diag.bridge_gnss_ns_target);
     s.add("bridge_gnss_ns_final", rt.last_diag.bridge_gnss_ns_final);
-    s.add("bridge_raw_error_ns", rt.last_diag.bridge_raw_error_ns);
-    s.add("bridge_final_error_ns", rt.last_diag.bridge_final_error_ns);
+    s.add("bridge_skipped_invalid", rt.last_diag.bridge_skipped_invalid);
 
     subscribers.add(s);
   }

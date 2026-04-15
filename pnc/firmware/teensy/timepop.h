@@ -21,95 +21,49 @@
 //        timepop_arm(delay_gnss_ns, ...)
 //
 //      Use this when the caller only cares about "fire after this delay."
-//      Typical examples: serial RX/TX pacing, generic housekeeping timers.
+//      If recurring=true, TimePop will phase-lock the recurrence to the
+//      current lawful GNSS/VCLOCK anchor when one is available.
 //
 //   2. Scheduled-context ASAP dispatch
 //        timepop_arm_asap(...)
 //
-//      Use this when the caller wants to escape into scheduled context at the
-//      front of the next dispatch pass. This is not a timed timer.
-//
 //   3. Scheduled-context ALAP dispatch
 //        timepop_arm_alap(...)
-//
-//      Use this when the caller wants to escape into scheduled context at the
-//      tail of the current/next dispatch pass. This is not a timed timer.
 //
 //   4. Absolute GNSS scheduling
 //        timepop_arm_at(target_gnss_ns, ...)
 //
-//      Use this when the caller already knows the exact GNSS nanosecond
-//      boundary it wants. This avoids "whenever I happened to ask" timing
-//      leakage in the caller.
-//
 //   5. Anchor-relative GNSS scheduling
 //        timepop_arm_from_anchor(anchor_gnss_ns, offset_gnss_ns, ...)
 //
-//      Use this when the caller has a sacred recurrence anchor and wants the
-//      target to be derived from that anchor plus a relative offset, rather
-//      than from dispatch-time "now". This is the correct path for recurring
-//      phase-locked work such as PPS pre-spin.
-//
 //   6. Caller-owned exact target scheduling
 //        timepop_arm_ns(target_gnss_ns, target_dwt, ...)
-//
-//      Use this when the caller owns both the GNSS target and the DWT target
-//      and wants the full nano-precise path, optionally with ISR callback.
 //
 // TimePop owns:
 //   • timed slot scheduling
 //   • deferred ASAP/ALAP scheduled-context dispatch
 //   • next-deadline selection
 //   • CH2 compare arming
+//   • absolute recurring timer series
+//   • Spin-Dry early-wake + deterministic landing for VCLOCK scheduling
 //   • timer diagnostics
-//   • always-on internal scheduler-path characterization
+//   • always-on internal VCLOCK monitor
 //
-// TimePop does not own:
-//   • interrupt-latency canonicalization
-//   • last-mile pre-spin semantics in other subsystems
-//   • provider-specific interrupt custody
-//
-// Those belong elsewhere.
-//
-// ============================================================================
-
-// ============================================================================
-// Handle
 // ============================================================================
 
 typedef uint32_t timepop_handle_t;
-
 static constexpr timepop_handle_t TIMEPOP_INVALID_HANDLE = 0;
 
 // ============================================================================
 // Callback context — authoritative fire facts
 // ============================================================================
-//
-// These values describe when the timer actually fired.
-//
-// All public time values are expressed in the GNSS nanosecond domain.
-// fire_vclock_raw and deadline expose the underlying 10 MHz scheduler facts.
-//
-// ============================================================================
 
 typedef struct timepop_ctx_t {
-  // Opaque timer identity returned from arm().
   timepop_handle_t handle;
-
-  // 10 MHz VCLOCK value captured at fire time.
   uint32_t fire_vclock_raw;
-
-  // 10 MHz VCLOCK deadline that this slot was armed against.
   uint32_t deadline;
-
-  // Scheduler lateness expressed in GNSS nanoseconds:
-  //   (fire_vclock_raw - deadline) * 100
-  //
-  // Negative means early, positive means late.
-  int32_t fire_gnss_error_ns;
-
-  // Absolute GNSS nanosecond at the fire moment.
-  int64_t fire_gnss_ns;
+  int32_t  fire_gnss_error_ns;
+  int64_t  fire_gnss_ns;
 } timepop_ctx_t;
 
 // ============================================================================
@@ -119,27 +73,24 @@ typedef struct timepop_ctx_t {
 // Populated for timed callbacks and ISR callbacks.
 // Null for ASAP/ALAP scheduled-context dispatch.
 //
-// This block is diagnostic only. It is not the authoritative timer result.
-// The authoritative result is timepop_ctx_t.
+// The authoritative result is still timepop_ctx_t. These diagnostics expose
+// Spin-Dry / landing facts that are useful for instrumentation and later
+// TIMEBASE_FRAGMENT analysis.
 //
-// ============================================================================
 
 typedef struct timepop_diag_t {
-  // DWT at ISR entry — raw capture before any optional spin.
   uint32_t dwt_at_isr_entry;
-
-  // DWT at actual callback fire point after optional spin landing.
   uint32_t dwt_at_fire;
 
-  // Predicted DWT corresponding to the slot's target, if available.
   uint32_t predicted_dwt;
   bool     prediction_valid;
 
-  // Spin landing error in cycles:
-  //   dwt_at_fire - predicted_dwt
+  bool     spin_dry_used;
+  uint32_t wake_target_dwt;
+  int32_t  wake_error_cycles;
+
   int32_t  spin_error_cycles;
 
-  // Anchor snapshot used for cross-domain interpretation.
   uint32_t anchor_pps_count;
   uint32_t anchor_qtimer_at_pps;
   uint32_t anchor_dwt_at_pps;
@@ -147,35 +98,11 @@ typedef struct timepop_diag_t {
   bool     anchor_valid;
 } timepop_diag_t;
 
-// ============================================================================
-// Callback signature
-// ============================================================================
-
 typedef void (*timepop_callback_t)(
   timepop_ctx_t*  ctx,
-  timepop_diag_t* diag,   // nullable
+  timepop_diag_t* diag,
   void*           user_data
 );
-
-// ============================================================================
-// Relative scheduling
-// ============================================================================
-//
-// Arms a timer relative to the current GNSS/VCLOCK-aligned scheduler state.
-//
-// delay_gnss_ns:
-//   Delay in GNSS nanoseconds from "now".
-//
-// recurring:
-//   If true, TimePop rearms the timer using absolute GNSS-series semantics
-//   when a lawful anchor is available. For example, a 1 ms recurring timer
-//   lands on exact 1 ms VCLOCK/GNSS grid boundaries rather than drifting
-//   relative to its prior callback. If no lawful anchor exists yet, TimePop
-//   falls back to ordinary relative recurrence until one does.
-//
-// Returns TIMEPOP_INVALID_HANDLE on failure.
-//
-// ============================================================================
 
 timepop_handle_t timepop_arm(
   uint64_t            delay_gnss_ns,
@@ -185,61 +112,17 @@ timepop_handle_t timepop_arm(
   const char*         name
 );
 
-
-// ============================================================================
-// Scheduled-context ASAP dispatch
-// ============================================================================
-//
-// Arms a one-shot scheduled-context callback at the front of the next dispatch
-// pass. This is not a timed timer and does not enter the timed ISR path.
-//
-// Returns TIMEPOP_INVALID_HANDLE on failure.
-//
-// ============================================================================
-
 timepop_handle_t timepop_arm_asap(
   timepop_callback_t  callback,
   void*               user_data,
   const char*         name
 );
 
-// ============================================================================
-// Scheduled-context ALAP dispatch
-// ============================================================================
-//
-// Arms a one-shot scheduled-context callback at the tail of the current/next
-// dispatch pass. This is not a timed timer and does not enter the timed ISR
-// path.
-//
-// Returns TIMEPOP_INVALID_HANDLE on failure.
-//
-// ============================================================================
-
 timepop_handle_t timepop_arm_alap(
   timepop_callback_t  callback,
   void*               user_data,
   const char*         name
 );
-
-// ============================================================================
-// Absolute GNSS scheduling
-// ============================================================================
-//
-// Arms a timer for an exact GNSS nanosecond target.
-//
-// target_gnss_ns:
-//   Absolute GNSS nanosecond at which the timer should fire.
-//
-// recurring:
-//   Public absolute timers remain one-shot unless a future API supplies an
-//   explicit absolute recurrence period.
-//
-// This API is intended for callers that already know the exact target
-// boundary and want to avoid caller-side relative scheduling jitter.
-//
-// Returns TIMEPOP_INVALID_HANDLE on failure.
-//
-// ============================================================================
 
 timepop_handle_t timepop_arm_at(
   int64_t             target_gnss_ns,
@@ -248,30 +131,6 @@ timepop_handle_t timepop_arm_at(
   void*               user_data,
   const char*         name
 );
-
-// ============================================================================
-// Anchor-relative GNSS scheduling
-// ============================================================================
-//
-// Arms a timer using:
-//
-//   target_gnss_ns = anchor_gnss_ns + offset_gnss_ns
-//
-// This preserves sacred recurrence phase because the caller supplies the
-// recurrence anchor explicitly instead of deriving the next target from "now".
-//
-// Typical use:
-//   PPS prespin for the next second:
-//     anchor_gnss_ns = last PPS edge
-//     offset_gnss_ns = 1_000_000_000 - 5_000
-//
-// recurring:
-//   If true, the timer rearms as an absolute 1-second series preserving the
-//   supplied anchor-relative phase.
-//
-// Returns TIMEPOP_INVALID_HANDLE on failure.
-//
-// ============================================================================
 
 timepop_handle_t timepop_arm_from_anchor(
   int64_t             anchor_gnss_ns,
@@ -282,34 +141,6 @@ timepop_handle_t timepop_arm_from_anchor(
   const char*         name
 );
 
-// ============================================================================
-// Caller-owned exact target scheduling
-// ============================================================================
-//
-// Arms a one-shot timer using caller-owned GNSS and DWT targets.
-//
-// This is the most exact path. The caller supplies both:
-//
-//   target_gnss_ns:
-//     Exact GNSS nanosecond target
-//
-//   target_dwt:
-//     DWT target corresponding to that GNSS target
-//
-// isr_callback:
-//   false:
-//     callback fires later in scheduled context
-//
-//   true:
-//     callback fires immediately in ISR context after any spin landing
-//
-// ISR callbacks must be extremely small and must not perform operations
-// that depend on scheduled-context-only mechanisms.
-//
-// Returns TIMEPOP_INVALID_HANDLE on failure.
-//
-// ============================================================================
-
 timepop_handle_t timepop_arm_ns(
   int64_t             target_gnss_ns,
   uint32_t            target_dwt,
@@ -319,27 +150,7 @@ timepop_handle_t timepop_arm_ns(
   bool                isr_callback = false
 );
 
-// ============================================================================
-// Cancellation
-// ============================================================================
-
 bool timepop_cancel(timepop_handle_t handle);
-
 uint32_t timepop_cancel_by_name(const char* name);
-
-// ============================================================================
-// Scheduled-context dispatch
-// ============================================================================
-//
-// All non-ISR callbacks fire here.
-// Call from the main runtime loop.
-//
-// ============================================================================
-
 void timepop_dispatch(void);
-
-// ============================================================================
-// Introspection
-// ============================================================================
-
 uint32_t timepop_active_count(void);
