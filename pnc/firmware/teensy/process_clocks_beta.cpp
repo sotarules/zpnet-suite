@@ -173,6 +173,59 @@ static void clocks_payload_add_interrupt_bridge_diag(Payload& p,
   add_i64("bridge_final_error_ns", diag.bridge_final_error_ns);
 }
 
+static void clocks_payload_add_interrupt_extended_diag(Payload& p,
+                                                       const char* prefix,
+                                                       const interrupt_capture_diag_t& diag) {
+  char key[96];
+
+  auto add_u32 = [&](const char* suffix, uint32_t value) {
+    snprintf(key, sizeof(key), "%s_%s", prefix, suffix);
+    p.add(key, value);
+  };
+
+  auto add_u64 = [&](const char* suffix, uint64_t value) {
+    snprintf(key, sizeof(key), "%s_%s", prefix, suffix);
+    p.add(key, value);
+  };
+
+  auto add_i64 = [&](const char* suffix, int64_t value) {
+    snprintf(key, sizeof(key), "%s_%s", prefix, suffix);
+    p.add(key, value);
+  };
+
+  // Remaining interrupt-capture fields not already surfaced by the
+  // base helper or the bridge helper. Together, these three helpers expose
+  // the full interrupt_capture_diag_t surface into TIMEBASE_FRAGMENT.
+  add_i64("dwt_isr_entry_gnss_ns", diag.dwt_isr_entry_gnss_ns);
+  add_i64("dwt_isr_entry_minus_event_ns", diag.dwt_isr_entry_minus_event_ns);
+  add_u64("gnss_ns_at_event_bridge", diag.gnss_ns_at_event_bridge);
+
+  add_u32("counter16_at_irq", diag.counter16_at_irq);
+  add_u32("compare16_fired", diag.compare16_fired);
+  add_u32("compare16_next_programmed", diag.compare16_next_programmed);
+  add_i64("counter16_minus_compare_ticks", diag.counter16_minus_compare_ticks);
+  add_i64("counter16_minus_compare_ns", diag.counter16_minus_compare_ns);
+
+  add_u32("ocxo_bucket_interval_counts", diag.ocxo_bucket_interval_counts);
+  add_u32("ocxo_current_window_bucket_count", diag.ocxo_current_window_bucket_count);
+  add_u32("ocxo_last_second_bucket_count", diag.ocxo_last_second_bucket_count);
+  add_u32("ocxo_last_bucket_cycles", diag.ocxo_last_bucket_cycles);
+  add_i64("ocxo_last_bucket_gnss_ns", diag.ocxo_last_bucket_gnss_ns);
+  add_u64("ocxo_current_window_cycles_sum", diag.ocxo_current_window_cycles_sum);
+  add_i64("ocxo_current_window_gnss_ns_sum", diag.ocxo_current_window_gnss_ns_sum);
+  add_u64("ocxo_second_cycles_observed", diag.ocxo_second_cycles_observed);
+  add_u64("ocxo_second_cycles_prediction", diag.ocxo_second_cycles_prediction);
+  add_i64("ocxo_second_cycles_prediction_error", diag.ocxo_second_cycles_prediction_error);
+  add_i64("ocxo_second_gnss_ns_observed", diag.ocxo_second_gnss_ns_observed);
+  add_i64("ocxo_second_gnss_ns_prediction", diag.ocxo_second_gnss_ns_prediction);
+  add_i64("ocxo_second_gnss_ns_prediction_error", diag.ocxo_second_gnss_ns_prediction_error);
+  add_i64("ocxo_second_residual_ns", diag.ocxo_second_residual_ns);
+  add_i64("ocxo_second_start_gnss_ns_raw", diag.ocxo_second_start_gnss_ns_raw);
+  add_i64("ocxo_second_end_gnss_ns_raw", diag.ocxo_second_end_gnss_ns_raw);
+  add_u32("ocxo_second_start_dwt_raw", diag.ocxo_second_start_dwt_raw);
+  add_u32("ocxo_second_end_dwt_raw", diag.ocxo_second_end_dwt_raw);
+}
+
 // ── Predictive servo tuning ──
 //
 // Both TOTAL and NOW drive a filtered residual *and* a filtered mean slope
@@ -956,12 +1009,15 @@ void clocks_beta_pps(void) {
 
   clocks_payload_add_interrupt_diag(p, "pps_diag", g_pps_interrupt_diag);
   clocks_payload_add_interrupt_bridge_diag(p, "pps_diag", g_pps_interrupt_diag);
+  clocks_payload_add_interrupt_extended_diag(p, "pps_diag", g_pps_interrupt_diag);
 
   clocks_payload_add_interrupt_diag(p, "ocxo1_diag", g_ocxo1_interrupt_diag);
   clocks_payload_add_interrupt_bridge_diag(p, "ocxo1_diag", g_ocxo1_interrupt_diag);
+  clocks_payload_add_interrupt_extended_diag(p, "ocxo1_diag", g_ocxo1_interrupt_diag);
 
   clocks_payload_add_interrupt_diag(p, "ocxo2_diag", g_ocxo2_interrupt_diag);
   clocks_payload_add_interrupt_bridge_diag(p, "ocxo2_diag", g_ocxo2_interrupt_diag);
+  clocks_payload_add_interrupt_extended_diag(p, "ocxo2_diag", g_ocxo2_interrupt_diag);
 
   // Campaign-cumulative tau and ppb for all clock domains.
   //
