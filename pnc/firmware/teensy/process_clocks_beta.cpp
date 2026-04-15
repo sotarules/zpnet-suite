@@ -63,10 +63,10 @@ volatile uint32_t watchdog_anomaly_trigger_dwt     = 0;
 // Residual tracking
 // ============================================================================
 
-pps_residual_t residual_dwt   = {};
+pps_residual_t residual_dwt    = {};
 pps_residual_t residual_vclock = {};
-pps_residual_t residual_ocxo1 = {};
-pps_residual_t residual_ocxo2 = {};
+pps_residual_t residual_ocxo1  = {};
+pps_residual_t residual_ocxo2  = {};
 
 void residual_reset(pps_residual_t& r) {
   r.residual = 0;
@@ -129,7 +129,6 @@ double dac_welford_stddev(const dac_welford_t& w) {
 double dac_welford_stderr(const dac_welford_t& w) {
   return (w.n >= 2) ? sqrt(w.m2 / (double)(w.n - 1)) / sqrt((double)w.n) : 0.0;
 }
-
 
 static void clocks_payload_add_interrupt_bridge_diag(Payload& p,
                                                      const char* prefix,
@@ -211,10 +210,276 @@ static void now_window_reset(now_window_t& w) {
   w.head = 0;
 }
 
+// ============================================================================
+// DAC pacing / deferred commit
+// ============================================================================
+
+static constexpr const char* OCXO_DAC_COMMIT_NAME = "ocxo-dac-commit";
+
+static bool             g_ocxo_dac_commit_scheduled = false;
+static ocxo_dac_state_t* g_ocxo_dac_commit_selected = nullptr;
+static double           g_ocxo_dac_commit_target = 0.0;
+static uint16_t         g_ocxo_dac_commit_target_hw_code = 0;
+static uint64_t         g_ocxo_dac_last_schedule_second = 0;
+static uint64_t         g_ocxo_dac_last_commit_second = 0;
+static uint32_t         g_ocxo_dac_last_winner = 0;   // 0=none, 1=ocxo1, 2=ocxo2
+static uint32_t         g_ocxo_dac_arbitration_passes = 0;
+static uint32_t         g_ocxo_dac_no_candidate_passes = 0;
+static uint32_t         g_ocxo_dac_schedule_failures = 0;
+static uint32_t         g_ocxo_dac_commit_callbacks = 0;
+static uint32_t         g_ocxo_dac_deferred_candidates = 0;
+static uint32_t         g_ocxo_dac_retry_requests = 0;
+static uint32_t         g_ocxo_dac_retry_successes = 0;
+static uint32_t         g_ocxo_dac_retry_failures = 0;
+static uint32_t         g_ocxo_dac_retry_exhausted = 0;
+static uint32_t         g_ocxo_dac_retry_blocked_candidates = 0;
+
+static constexpr uint64_t OCXO_DAC_RETRY_DELAY_SECONDS = 1ULL;
+static constexpr uint32_t OCXO_DAC_MAX_CONSECUTIVE_WRITE_FAILURES = 2U;
+
+struct ocxo_dac_retry_state_t {
+  uint32_t consecutive_failures = 0;
+  uint32_t retry_requests = 0;
+  uint32_t retry_successes = 0;
+  uint32_t retry_failures = 0;
+  uint32_t retry_exhausted = 0;
+  uint64_t retry_not_before_second = 0;
+  uint16_t last_failed_hw_code = 0;
+  uint8_t  last_failed_stage = 0;
+};
+
+static ocxo_dac_retry_state_t g_ocxo1_dac_retry = {};
+static ocxo_dac_retry_state_t g_ocxo2_dac_retry = {};
+
+static inline uint32_t ocxo_dac_id(const ocxo_dac_state_t* dac) {
+  if (dac == &ocxo1_dac) return 1;
+  if (dac == &ocxo2_dac) return 2;
+  return 0;
+}
+
+static inline const char* ocxo_dac_name(const ocxo_dac_state_t* dac) {
+  if (dac == &ocxo1_dac) return "ocxo1";
+  if (dac == &ocxo2_dac) return "ocxo2";
+  return "";
+}
+
+static inline ocxo_dac_retry_state_t& ocxo_dac_retry_state(ocxo_dac_state_t& dac) {
+  return (&dac == &ocxo1_dac) ? g_ocxo1_dac_retry : g_ocxo2_dac_retry;
+}
+
+static inline const ocxo_dac_retry_state_t& ocxo_dac_retry_state(const ocxo_dac_state_t& dac) {
+  return (&dac == &ocxo1_dac) ? g_ocxo1_dac_retry : g_ocxo2_dac_retry;
+}
+
+static void ocxo_dac_retry_reset(ocxo_dac_state_t& dac) {
+  ocxo_dac_retry_state(dac) = {};
+}
+
+static bool ocxo_dac_retry_ready(const ocxo_dac_state_t& dac) {
+  const ocxo_dac_retry_state_t& retry = ocxo_dac_retry_state(dac);
+  return retry.retry_not_before_second == 0 || campaign_seconds >= retry.retry_not_before_second;
+}
+
+static bool ocxo_dac_pending_eligible(const ocxo_dac_state_t& dac) {
+  return dac.pacing_pending && ocxo_dac_retry_ready(dac);
+}
+
+static void ocxo_servo_latch_dac_fault(ocxo_dac_state_t& dac);
+
+static inline uint64_t ocxo_dac_pending_age_seconds(const ocxo_dac_state_t& dac) {
+  if (!dac.pacing_pending || dac.pacing_pending_since_second == 0) return 0;
+  if (campaign_seconds < dac.pacing_pending_since_second) return 0;
+  return campaign_seconds - dac.pacing_pending_since_second;
+}
+
+static void ocxo_dac_clear_pending(ocxo_dac_state_t& dac) {
+  dac.pacing_pending = false;
+  dac.pacing_pending_target = dac.dac_fractional;
+  dac.pacing_pending_step = 0.0;
+  dac.pacing_pending_hw_code = dac.dac_hw_code;
+  dac.pacing_pending_since_second = 0;
+}
+
+static void ocxo_dac_pacing_abort_all(void) {
+  g_ocxo_dac_commit_scheduled = false;
+  g_ocxo_dac_commit_selected = nullptr;
+  g_ocxo_dac_commit_target = 0.0;
+  g_ocxo_dac_commit_target_hw_code = 0;
+  ocxo_dac_clear_pending(ocxo1_dac);
+  ocxo_dac_clear_pending(ocxo2_dac);
+  ocxo_dac_retry_reset(ocxo1_dac);
+  ocxo_dac_retry_reset(ocxo2_dac);
+}
+
+static void ocxo_dac_pacing_reset(void) {
+  ocxo_dac_pacing_abort_all();
+  g_ocxo_dac_last_schedule_second = 0;
+  g_ocxo_dac_last_commit_second = 0;
+  g_ocxo_dac_last_winner = 0;
+  g_ocxo_dac_arbitration_passes = 0;
+  g_ocxo_dac_no_candidate_passes = 0;
+  g_ocxo_dac_schedule_failures = 0;
+  g_ocxo_dac_commit_callbacks = 0;
+  g_ocxo_dac_deferred_candidates = 0;
+  g_ocxo_dac_retry_requests = 0;
+  g_ocxo_dac_retry_successes = 0;
+  g_ocxo_dac_retry_failures = 0;
+  g_ocxo_dac_retry_exhausted = 0;
+  g_ocxo_dac_retry_blocked_candidates = 0;
+}
+
+static void ocxo_dac_queue_intent(ocxo_dac_state_t& dac, double step) {
+  double target = dac.dac_fractional + step;
+  if (target < (double)dac.dac_min) target = (double)dac.dac_min;
+  if (target > (double)dac.dac_max) target = (double)dac.dac_max;
+
+  const uint16_t target_hw_code = (uint16_t)target;
+
+  dac.pacing_intents++;
+  dac.pacing_last_request_second = campaign_seconds;
+
+  if ((uint16_t)abs((int32_t)target_hw_code - (int32_t)dac.dac_hw_code) < SERVO_MIN_DAC_CODE_DELTA_LSB) {
+    dac.pacing_skip_small_delta_count++;
+    ocxo_dac_clear_pending(dac);
+    ocxo_dac_retry_reset(dac);
+    return;
+  }
+
+  dac.pacing_pending_target = target;
+  dac.pacing_pending_step = step;
+  dac.pacing_pending_hw_code = target_hw_code;
+
+  if (!dac.pacing_pending) {
+    dac.pacing_pending_since_second = campaign_seconds;
+  }
+  dac.pacing_pending = true;
+}
+
+static ocxo_dac_state_t* ocxo_dac_pick_commit_candidate(void) {
+  const bool c1_pending = ocxo1_dac.pacing_pending;
+  const bool c2_pending = ocxo2_dac.pacing_pending;
+  const bool c1_eligible = ocxo_dac_pending_eligible(ocxo1_dac);
+  const bool c2_eligible = ocxo_dac_pending_eligible(ocxo2_dac);
+
+  if (c1_pending && !c1_eligible) g_ocxo_dac_retry_blocked_candidates++;
+  if (c2_pending && !c2_eligible) g_ocxo_dac_retry_blocked_candidates++;
+
+  ocxo_dac_state_t* c1 = c1_eligible ? &ocxo1_dac : nullptr;
+  ocxo_dac_state_t* c2 = c2_eligible ? &ocxo2_dac : nullptr;
+
+  if (!c1) return c2;
+  if (!c2) return c1;
+
+  const uint64_t age1 = ocxo_dac_pending_age_seconds(*c1);
+  const uint64_t age2 = ocxo_dac_pending_age_seconds(*c2);
+  if (age1 > age2) return c1;
+  if (age2 > age1) return c2;
+
+  const double urgency1 = fabs(c1->servo_predicted_residual);
+  const double urgency2 = fabs(c2->servo_predicted_residual);
+  if (urgency1 > urgency2) return c1;
+  if (urgency2 > urgency1) return c2;
+
+  return (g_ocxo_dac_last_winner == 1) ? c2 : c1;
+}
+
+static void ocxo_dac_commit_callback(timepop_ctx_t*, timepop_diag_t*, void*) {
+  g_ocxo_dac_commit_callbacks++;
+
+  ocxo_dac_state_t* dac = g_ocxo_dac_commit_selected;
+  g_ocxo_dac_commit_selected = nullptr;
+  g_ocxo_dac_commit_scheduled = false;
+
+  if (!dac) return;
+  if (!dac->pacing_pending) return;
+  if (!ocxo_dac_retry_ready(*dac)) return;
+
+  double target = dac->pacing_pending_target;
+  const double step = dac->pacing_pending_step;
+  ocxo_dac_retry_state_t& retry = ocxo_dac_retry_state(*dac);
+
+  if (!ocxo_dac_set(*dac, target)) {
+    dac->servo_last_step = 0.0;
+
+    retry.retry_failures++;
+    g_ocxo_dac_retry_failures++;
+    retry.last_failed_hw_code = dac->io_last_attempted_hw_code;
+    retry.last_failed_stage = dac->io_last_failure_stage;
+    retry.consecutive_failures++;
+
+    if (retry.consecutive_failures < OCXO_DAC_MAX_CONSECUTIVE_WRITE_FAILURES) {
+      retry.retry_requests++;
+      g_ocxo_dac_retry_requests++;
+      retry.retry_not_before_second = campaign_seconds + OCXO_DAC_RETRY_DELAY_SECONDS;
+      return;
+    }
+
+    retry.retry_exhausted++;
+    g_ocxo_dac_retry_exhausted++;
+    ocxo_servo_latch_dac_fault(*dac);
+    return;
+  }
+
+  if (retry.consecutive_failures > 0 || retry.retry_not_before_second != 0) {
+    retry.retry_successes++;
+    g_ocxo_dac_retry_successes++;
+  }
+  ocxo_dac_retry_reset(*dac);
+
+  dac->servo_last_step = step;
+  dac->servo_adjustments++;
+  dac->pacing_commit_count++;
+  dac->pacing_last_commit_second = campaign_seconds;
+  g_ocxo_dac_last_commit_second = campaign_seconds;
+  ocxo_dac_clear_pending(*dac);
+}
+
+static void ocxo_dac_schedule_paced_commit(void) {
+  g_ocxo_dac_arbitration_passes++;
+
+  if (g_ocxo_dac_commit_scheduled) {
+    return;
+  }
+
+  ocxo_dac_state_t* winner = ocxo_dac_pick_commit_candidate();
+  if (!winner) {
+    g_ocxo_dac_no_candidate_passes++;
+    return;
+  }
+
+  ocxo_dac_state_t* loser = nullptr;
+  if (winner == &ocxo1_dac && ocxo_dac_pending_eligible(ocxo2_dac)) loser = &ocxo2_dac;
+  if (winner == &ocxo2_dac && ocxo_dac_pending_eligible(ocxo1_dac)) loser = &ocxo1_dac;
+  if (loser) {
+    loser->pacing_deferred_count++;
+    g_ocxo_dac_deferred_candidates++;
+  }
+
+  g_ocxo_dac_commit_selected = winner;
+  g_ocxo_dac_commit_target = winner->pacing_pending_target;
+  g_ocxo_dac_commit_target_hw_code = winner->pacing_pending_hw_code;
+  g_ocxo_dac_last_schedule_second = campaign_seconds;
+  g_ocxo_dac_last_winner = ocxo_dac_id(winner);
+
+  const timepop_handle_t h =
+      timepop_arm_alap(ocxo_dac_commit_callback, nullptr, OCXO_DAC_COMMIT_NAME);
+  if (h == TIMEPOP_INVALID_HANDLE) {
+    g_ocxo_dac_schedule_failures++;
+    g_ocxo_dac_commit_selected = nullptr;
+    g_ocxo_dac_commit_target = 0.0;
+    g_ocxo_dac_commit_target_hw_code = 0;
+    winner->pacing_deferred_count++;
+    g_ocxo_dac_deferred_candidates++;
+    return;
+  }
+
+  g_ocxo_dac_commit_scheduled = true;
+}
 
 static void ocxo_servo_latch_dac_fault(ocxo_dac_state_t& dac) {
   dac.io_fault_latched = true;
   calibrate_ocxo_mode = servo_mode_t::OFF;
+  ocxo_dac_pacing_abort_all();
 }
 
 // ============================================================================
@@ -241,6 +506,7 @@ void clocks_zero_all(void) {
 
   ocxo_dac_predictor_reset(ocxo1_dac);
   ocxo_dac_predictor_reset(ocxo2_dac);
+  ocxo_dac_pacing_reset();
 
   now_window_reset(g_now_window_ocxo1);
   now_window_reset(g_now_window_ocxo2);
@@ -299,6 +565,7 @@ static void ocxo_servo_predictive(ocxo_dac_state_t& dac,
 
   if (fabs(dac.servo_filtered_residual) < SERVO_MIN_RESIDUAL_NS &&
       fabs(dac.servo_predicted_residual) < SERVO_MIN_PREDICTED_NS) {
+    ocxo_dac_clear_pending(dac);
     return;
   }
 
@@ -308,21 +575,12 @@ static void ocxo_servo_predictive(ocxo_dac_state_t& dac,
 
   if (fabs(step) < 1.0) {
     // Do not thrash the DAC for sub-LSB fractional intent.
-    return;
-  }
-
-  // MULE dry run: do not touch the DAC bus
-  dac.servo_last_step = step;
-  return;
-
-  if (!ocxo_dac_set(dac, dac.dac_fractional + step)) {
-    dac.servo_last_step = 0.0;
-    ocxo_servo_latch_dac_fault(dac);
+    ocxo_dac_clear_pending(dac);
     return;
   }
 
   dac.servo_last_step = step;
-  dac.servo_adjustments++;
+  ocxo_dac_queue_intent(dac, step);
 }
 
 static double now_window_mean(const now_window_t& w) {
@@ -374,6 +632,8 @@ static void ocxo_calibration_servo(void) {
     ocxo_servo_total(ocxo1_dac, residual_ocxo1);
     ocxo_servo_total(ocxo2_dac, residual_ocxo2);
   }
+
+  ocxo_dac_schedule_paced_commit();
 }
 
 // ============================================================================
@@ -388,6 +648,7 @@ static void clocks_force_stop_campaign(void) {
   request_zero = false;
   zero_handshake_in_flight = false;
   calibrate_ocxo_mode = servo_mode_t::OFF;
+  ocxo_dac_pacing_abort_all();
   timebase_invalidate();
 }
 
@@ -432,8 +693,9 @@ void clocks_watchdog_anomaly(const char* reason,
   }
 
   watchdog_anomaly_active = true;
+  ocxo_dac_pacing_abort_all();
 
-  timepop_handle_t h =
+  const timepop_handle_t h =
       timepop_arm_asap(clocks_watchdog_anomaly_callback, nullptr, "clocks-anomaly");
 
   if (h == TIMEPOP_INVALID_HANDLE) {
@@ -479,6 +741,7 @@ void clocks_beta_pps(void) {
     request_zero = false;
     zero_handshake_in_flight = false;
     calibrate_ocxo_mode = servo_mode_t::OFF;
+    ocxo_dac_pacing_abort_all();
     timebase_invalidate();
     return;
   }
@@ -488,6 +751,7 @@ void clocks_beta_pps(void) {
 
     request_zero = false;
     zero_handshake_in_flight = false;
+    ocxo_dac_pacing_abort_all();
 
     dwt_cycle_count_total = dwt_ns_to_cycles(recover_dwt_ns);
     gnss_raw_64           = recover_gnss_ns / 100ull;
@@ -633,6 +897,63 @@ void clocks_beta_pps(void) {
   p.add("ocxo2_servo_predictor_updates", ocxo2_dac.servo_predictor_updates);
   p.add("ocxo2_servo_last_step", ocxo2_dac.servo_last_step, 6);
 
+  p.add("ocxo_dac_commit_scheduled", g_ocxo_dac_commit_scheduled);
+  p.add("ocxo_dac_last_schedule_second", g_ocxo_dac_last_schedule_second);
+  p.add("ocxo_dac_last_commit_second", g_ocxo_dac_last_commit_second);
+  p.add("ocxo_dac_last_winner", g_ocxo_dac_last_winner);
+  p.add("ocxo_dac_arbitration_passes", g_ocxo_dac_arbitration_passes);
+  p.add("ocxo_dac_no_candidate_passes", g_ocxo_dac_no_candidate_passes);
+  p.add("ocxo_dac_schedule_failures", g_ocxo_dac_schedule_failures);
+  p.add("ocxo_dac_commit_callbacks", g_ocxo_dac_commit_callbacks);
+  p.add("ocxo_dac_deferred_candidates", g_ocxo_dac_deferred_candidates);
+  p.add("ocxo_dac_retry_requests", g_ocxo_dac_retry_requests);
+  p.add("ocxo_dac_retry_successes", g_ocxo_dac_retry_successes);
+  p.add("ocxo_dac_retry_failures", g_ocxo_dac_retry_failures);
+  p.add("ocxo_dac_retry_exhausted", g_ocxo_dac_retry_exhausted);
+  p.add("ocxo_dac_retry_blocked_candidates", g_ocxo_dac_retry_blocked_candidates);
+  p.add("ocxo_dac_commit_selected", ocxo_dac_name(g_ocxo_dac_commit_selected));
+  p.add("ocxo_dac_commit_target_hw_code", (uint32_t)g_ocxo_dac_commit_target_hw_code);
+
+  p.add("ocxo1_dac_pacing_pending", ocxo1_dac.pacing_pending);
+  p.add("ocxo1_dac_pacing_pending_target", ocxo1_dac.pacing_pending_target, 6);
+  p.add("ocxo1_dac_pacing_pending_step", ocxo1_dac.pacing_pending_step, 6);
+  p.add("ocxo1_dac_pacing_pending_hw_code", ocxo1_dac.pacing_pending_hw_code);
+  p.add("ocxo1_dac_pacing_pending_age_seconds", ocxo_dac_pending_age_seconds(ocxo1_dac));
+  p.add("ocxo1_dac_pacing_last_request_second", ocxo1_dac.pacing_last_request_second);
+  p.add("ocxo1_dac_pacing_last_commit_second", ocxo1_dac.pacing_last_commit_second);
+  p.add("ocxo1_dac_pacing_intents", ocxo1_dac.pacing_intents);
+  p.add("ocxo1_dac_pacing_deferred_count", ocxo1_dac.pacing_deferred_count);
+  p.add("ocxo1_dac_pacing_commit_count", ocxo1_dac.pacing_commit_count);
+  p.add("ocxo1_dac_pacing_skip_small_delta_count", ocxo1_dac.pacing_skip_small_delta_count);
+  p.add("ocxo1_dac_retry_consecutive_failures", g_ocxo1_dac_retry.consecutive_failures);
+  p.add("ocxo1_dac_retry_requests", g_ocxo1_dac_retry.retry_requests);
+  p.add("ocxo1_dac_retry_successes", g_ocxo1_dac_retry.retry_successes);
+  p.add("ocxo1_dac_retry_failures", g_ocxo1_dac_retry.retry_failures);
+  p.add("ocxo1_dac_retry_exhausted", g_ocxo1_dac_retry.retry_exhausted);
+  p.add("ocxo1_dac_retry_not_before_second", g_ocxo1_dac_retry.retry_not_before_second);
+  p.add("ocxo1_dac_retry_last_failed_hw_code", g_ocxo1_dac_retry.last_failed_hw_code);
+  p.add("ocxo1_dac_retry_last_failed_stage", (uint32_t)g_ocxo1_dac_retry.last_failed_stage);
+
+  p.add("ocxo2_dac_pacing_pending", ocxo2_dac.pacing_pending);
+  p.add("ocxo2_dac_pacing_pending_target", ocxo2_dac.pacing_pending_target, 6);
+  p.add("ocxo2_dac_pacing_pending_step", ocxo2_dac.pacing_pending_step, 6);
+  p.add("ocxo2_dac_pacing_pending_hw_code", ocxo2_dac.pacing_pending_hw_code);
+  p.add("ocxo2_dac_pacing_pending_age_seconds", ocxo_dac_pending_age_seconds(ocxo2_dac));
+  p.add("ocxo2_dac_pacing_last_request_second", ocxo2_dac.pacing_last_request_second);
+  p.add("ocxo2_dac_pacing_last_commit_second", ocxo2_dac.pacing_last_commit_second);
+  p.add("ocxo2_dac_pacing_intents", ocxo2_dac.pacing_intents);
+  p.add("ocxo2_dac_pacing_deferred_count", ocxo2_dac.pacing_deferred_count);
+  p.add("ocxo2_dac_pacing_commit_count", ocxo2_dac.pacing_commit_count);
+  p.add("ocxo2_dac_pacing_skip_small_delta_count", ocxo2_dac.pacing_skip_small_delta_count);
+  p.add("ocxo2_dac_retry_consecutive_failures", g_ocxo2_dac_retry.consecutive_failures);
+  p.add("ocxo2_dac_retry_requests", g_ocxo2_dac_retry.retry_requests);
+  p.add("ocxo2_dac_retry_successes", g_ocxo2_dac_retry.retry_successes);
+  p.add("ocxo2_dac_retry_failures", g_ocxo2_dac_retry.retry_failures);
+  p.add("ocxo2_dac_retry_exhausted", g_ocxo2_dac_retry.retry_exhausted);
+  p.add("ocxo2_dac_retry_not_before_second", g_ocxo2_dac_retry.retry_not_before_second);
+  p.add("ocxo2_dac_retry_last_failed_hw_code", g_ocxo2_dac_retry.last_failed_hw_code);
+  p.add("ocxo2_dac_retry_last_failed_stage", (uint32_t)g_ocxo2_dac_retry.last_failed_stage);
+
   clocks_payload_add_interrupt_diag(p, "pps_diag", g_pps_interrupt_diag);
   clocks_payload_add_interrupt_bridge_diag(p, "pps_diag", g_pps_interrupt_diag);
 
@@ -682,17 +1003,7 @@ void clocks_beta_pps(void) {
   }
 
   // ── Campaign-cumulative Welford statistics ──
-  //
-  // Three residual Welfords (per-second clock error):
-  //   dwt_welford_*    — DWT cycles residual (cycles above/below DWT_EXPECTED_PER_PPS)
-  //   ocxo1_welford_*  — OCXO1 second residual (ns, = ppb)
-  //   ocxo2_welford_*  — OCXO2 second residual (ns, = ppb)
-  //
-  // Two DAC Welfords (servo effort — the TEMPEST instrument):
-  //   ocxo1_dac_welford_*  — OCXO1 DAC fractional value
-  //   ocxo2_dac_welford_*  — OCXO2 DAC fractional value
 
-  // DWT residual Welford (cycles)
   p.add("dwt_welford_n", residual_dwt.n);
   p.add("dwt_welford_mean", residual_dwt.mean, 3);
   p.add("dwt_welford_stddev", residual_stddev(residual_dwt), 3);
@@ -700,7 +1011,6 @@ void clocks_beta_pps(void) {
   p.add("dwt_welford_min", residual_dwt.min_val, 3);
   p.add("dwt_welford_max", residual_dwt.max_val, 3);
 
-  // VCLOCK residual Welford (ns)
   p.add("vclock_welford_n", residual_vclock.n);
   p.add("vclock_welford_mean", residual_vclock.mean, 3);
   p.add("vclock_welford_stddev", residual_stddev(residual_vclock), 3);
@@ -708,7 +1018,6 @@ void clocks_beta_pps(void) {
   p.add("vclock_welford_min", residual_vclock.min_val, 3);
   p.add("vclock_welford_max", residual_vclock.max_val, 3);
 
-  // OCXO1 residual Welford (ns)
   p.add("ocxo1_welford_n", residual_ocxo1.n);
   p.add("ocxo1_welford_mean", residual_ocxo1.mean, 3);
   p.add("ocxo1_welford_stddev", residual_stddev(residual_ocxo1), 3);
@@ -716,7 +1025,6 @@ void clocks_beta_pps(void) {
   p.add("ocxo1_welford_min", residual_ocxo1.min_val, 3);
   p.add("ocxo1_welford_max", residual_ocxo1.max_val, 3);
 
-  // OCXO2 residual Welford (ns)
   p.add("ocxo2_welford_n", residual_ocxo2.n);
   p.add("ocxo2_welford_mean", residual_ocxo2.mean, 3);
   p.add("ocxo2_welford_stddev", residual_stddev(residual_ocxo2), 3);
@@ -724,7 +1032,6 @@ void clocks_beta_pps(void) {
   p.add("ocxo2_welford_min", residual_ocxo2.min_val, 3);
   p.add("ocxo2_welford_max", residual_ocxo2.max_val, 3);
 
-  // OCXO1 DAC Welford
   p.add("ocxo1_dac_welford_n", dac_welford_ocxo1.n);
   p.add("ocxo1_dac_welford_mean", dac_welford_ocxo1.mean, 6);
   p.add("ocxo1_dac_welford_stddev", dac_welford_stddev(dac_welford_ocxo1), 6);
@@ -732,7 +1039,6 @@ void clocks_beta_pps(void) {
   p.add("ocxo1_dac_welford_min", dac_welford_ocxo1.min_val, 6);
   p.add("ocxo1_dac_welford_max", dac_welford_ocxo1.max_val, 6);
 
-  // OCXO2 DAC Welford
   p.add("ocxo2_dac_welford_n", dac_welford_ocxo2.n);
   p.add("ocxo2_dac_welford_mean", dac_welford_ocxo2.mean, 6);
   p.add("ocxo2_dac_welford_stddev", dac_welford_stddev(dac_welford_ocxo2), 6);
@@ -769,6 +1075,7 @@ static Payload cmd_start(const Payload& args) {
 
   safeCopy(campaign_name, sizeof(campaign_name), name);
 
+  ocxo_dac_pacing_abort_all();
   ocxo_dac_io_reset(ocxo1_dac);
   ocxo_dac_io_reset(ocxo2_dac);
 
@@ -785,6 +1092,7 @@ static Payload cmd_start(const Payload& args) {
 
   ocxo_dac_predictor_reset(ocxo1_dac);
   ocxo_dac_predictor_reset(ocxo2_dac);
+  ocxo_dac_pacing_reset();
 
   request_start = true;
   request_stop = false;
@@ -873,11 +1181,19 @@ static Payload cmd_report(const Payload&) {
 }
 
 static Payload cmd_set_dac(const Payload& args) {
+  ocxo_dac_pacing_abort_all();
+
   double dac_val;
   bool dac1_ok = true;
   bool dac2_ok = true;
-  if (args.tryGetDouble("set_dac1", dac_val)) dac1_ok = ocxo_dac_set(ocxo1_dac, dac_val);
-  if (args.tryGetDouble("set_dac2", dac_val)) dac2_ok = ocxo_dac_set(ocxo2_dac, dac_val);
+  if (args.tryGetDouble("set_dac1", dac_val)) {
+    dac1_ok = ocxo_dac_set(ocxo1_dac, dac_val);
+    if (dac1_ok) ocxo_dac_retry_reset(ocxo1_dac);
+  }
+  if (args.tryGetDouble("set_dac2", dac_val)) {
+    dac2_ok = ocxo_dac_set(ocxo2_dac, dac_val);
+    if (dac2_ok) ocxo_dac_retry_reset(ocxo2_dac);
+  }
 
   Payload p;
   p.add("ocxo1_dac", ocxo1_dac.dac_fractional);
@@ -900,7 +1216,7 @@ static const process_command_entry_t CLOCKS_COMMANDS[] = {
   { "REPORT",        cmd_report        },
   { "WATCHDOG_TEST", cmd_watchdog_test },
   { "SET_DAC",       cmd_set_dac       },
-  { nullptr,         nullptr           }
+  { nullptr,          nullptr           }
 };
 
 static const process_subscription_entry_t CLOCKS_SUBSCRIPTIONS[] = {

@@ -15,7 +15,7 @@
 //   Epoch installation uses the PPS event contract supplied by
 //   process_interrupt.  The consummating PPS event carries both:
 //
-//     • dwt_at_event      — reconstructed DWT time of the PPS edge
+//     • dwt_at_event       — reconstructed DWT time of the PPS edge
 //     • counter32_at_event — VCLOCK position corresponding to that same edge
 //
 //   No ambient QTimer read is permitted at epoch installation, because that
@@ -62,10 +62,10 @@
 // Constants
 // ============================================================================
 
-static constexpr uint64_t PPS_RELAY_OFF_NS    = 500000000ULL;
-static constexpr uint64_t DWT_ADJUST_TIMER_NS = 100000ULL; // 10 kHz
+static constexpr uint64_t PPS_RELAY_OFF_NS     = 500000000ULL;
+static constexpr uint64_t DWT_ADJUST_TIMER_NS  = 100000ULL; // 10 kHz
 static constexpr int64_t  DWT_ADJUST_THRESHOLD_NS = 2LL;
-static constexpr uint64_t NS_PER_SECOND_U64   = 1000000000ULL;
+static constexpr uint64_t NS_PER_SECOND_U64    = 1000000000ULL;
 
 // ============================================================================
 // Always-on state
@@ -120,10 +120,10 @@ volatile int32_t  g_epoch_live_qtimer_minus_event = 0;
 //
 
 enum class clocks_epoch_reason_t : uint8_t {
-  NONE   = 0,
-  INIT   = 1,
-  ZERO   = 2,
-  START  = 3,
+  NONE  = 0,
+  INIT  = 1,
+  ZERO  = 2,
+  START = 3,
 };
 
 static volatile bool g_epoch_pending = false;
@@ -142,19 +142,20 @@ static volatile uint64_t g_epoch_pps_index = 0;
 // DAC state
 // ============================================================================
 
-ocxo_dac_state_t ocxo1_dac = {
-  (double)AD5693R_DAC_DEFAULT, AD5693R_DAC_DEFAULT, 0, 65535,
-  0, 0.0, 0, 0,
-  false, 0.0, 0.0, 0.0, 0.0, 0,
-  true, false, 0, 0, 0, AD5693R_DAC_DEFAULT, AD5693R_DAC_DEFAULT, 0
-};
+static ocxo_dac_state_t make_default_ocxo_dac_state() {
+  ocxo_dac_state_t s = {};
+  s.dac_fractional = (double)AD5693R_DAC_DEFAULT;
+  s.dac_hw_code = AD5693R_DAC_DEFAULT;
+  s.dac_min = 0;
+  s.dac_max = 65535;
+  s.io_last_write_ok = true;
+  s.io_last_attempted_hw_code = AD5693R_DAC_DEFAULT;
+  s.io_last_good_hw_code = AD5693R_DAC_DEFAULT;
+  return s;
+}
 
-ocxo_dac_state_t ocxo2_dac = {
-  (double)AD5693R_DAC_DEFAULT, AD5693R_DAC_DEFAULT, 0, 65535,
-  0, 0.0, 0, 0,
-  false, 0.0, 0.0, 0.0, 0.0, 0,
-  true, false, 0, 0, 0, AD5693R_DAC_DEFAULT, AD5693R_DAC_DEFAULT, 0
-};
+ocxo_dac_state_t ocxo1_dac = make_default_ocxo_dac_state();
+ocxo_dac_state_t ocxo2_dac = make_default_ocxo_dac_state();
 
 servo_mode_t calibrate_ocxo_mode = servo_mode_t::OFF;
 
@@ -169,8 +170,8 @@ const char* servo_mode_str(servo_mode_t mode) {
 servo_mode_t servo_mode_parse(const char* s) {
   if (!s || !*s) return servo_mode_t::OFF;
   if (strcmp(s, "TOTAL") == 0) return servo_mode_t::TOTAL;
-  if (strcmp(s, "MEAN")  == 0) return servo_mode_t::TOTAL;  // legacy compat
-  if (strcmp(s, "NOW")   == 0) return servo_mode_t::NOW;
+  if (strcmp(s, "MEAN") == 0)  return servo_mode_t::TOTAL;  // legacy compat
+  if (strcmp(s, "NOW") == 0)   return servo_mode_t::NOW;
   return servo_mode_t::OFF;
 }
 
@@ -185,6 +186,18 @@ void ocxo_dac_predictor_reset(ocxo_dac_state_t& s) {
   s.servo_filtered_slope = 0.0;
   s.servo_predicted_residual = 0.0;
   s.servo_predictor_updates = 0;
+
+  s.pacing_pending = false;
+  s.pacing_pending_target = s.dac_fractional;
+  s.pacing_pending_step = 0.0;
+  s.pacing_pending_hw_code = s.dac_hw_code;
+  s.pacing_pending_since_second = 0;
+  s.pacing_last_request_second = 0;
+  s.pacing_last_commit_second = 0;
+  s.pacing_intents = 0;
+  s.pacing_deferred_count = 0;
+  s.pacing_commit_count = 0;
+  s.pacing_skip_small_delta_count = 0;
 }
 
 void ocxo_dac_io_reset(ocxo_dac_state_t& s) {
@@ -203,8 +216,17 @@ bool ocxo_dac_set(ocxo_dac_state_t& s, double value) {
   if (value > (double)s.dac_max) value = (double)s.dac_max;
 
   const uint16_t hw_code = (uint16_t)value;
-  s.io_write_attempts++;
   s.io_last_attempted_hw_code = hw_code;
+
+  // No-op bus guard: if the hardware code is unchanged, do not touch I²C.
+  if (hw_code == s.dac_hw_code) {
+    s.dac_fractional = value;
+    s.io_last_write_ok = true;
+    s.io_last_failure_stage = 0;
+    return true;
+  }
+
+  s.io_write_attempts++;
 
   if (!g_ad5693r_init_ok) {
     s.io_last_write_ok = false;
@@ -322,7 +344,7 @@ static void alpha_install_new_epoch_from_pps(const interrupt_event_t& pps_event)
   g_epoch_dwt_at_pps = pps_event.dwt_at_event;
   g_epoch_qtimer_at_pps = pps_event.counter32_at_event;
 
-  const uint32_t live_qtimer_now = interrupt_qtimer1_counter32_now();   // or equivalent helper
+  const uint32_t live_qtimer_now = interrupt_qtimer1_counter32_now();
   g_epoch_live_qtimer_read = live_qtimer_now;
   g_epoch_live_qtimer_minus_event = (int32_t)(live_qtimer_now - pps_event.counter32_at_event);
 
@@ -348,7 +370,7 @@ static void alpha_install_new_epoch_from_pps(const interrupt_event_t& pps_event)
   g_vclock_measurement.prev_counter32_at_pps_event = pps_event.counter32_at_event;
 
   // OCXO smart-zero: aggregate reset already zeroed g_ocxo1_clock and
-  // g_ocxo2_clock via = {}.  zero_established starts false.  The first
+  // g_ocxo2_clock via = {}. zero_established starts false. The first
   // post-epoch OCXO one-second edge will seed the phase offset ledger.
 
   time_pps_epoch_reset(pps_event.dwt_at_event, g_epoch_qtimer_at_pps);
@@ -457,7 +479,7 @@ static void pps_callback(
   g_vclock_measurement.prev_counter32_at_pps_event = actual_qtimer_at_pps;
   g_vclock_clock.zero_established = true;
 
-  const uint32_t live_qtimer_now = interrupt_qtimer1_counter32_now();   // same helper
+  const uint32_t live_qtimer_now = interrupt_qtimer1_counter32_now();
   g_last_pps_live_qtimer_read = live_qtimer_now;
   g_last_pps_live_qtimer_minus_geared = (int32_t)(live_qtimer_now - expected_qtimer_at_pps);
 
@@ -497,9 +519,9 @@ static void pps_callback(
   }
 
   time_pps_update(
-    g_dwt_cycle_count_at_pps,
-    dwt_effective_cycles_per_second(),
-    g_qtimer_at_pps);
+      g_dwt_cycle_count_at_pps,
+      dwt_effective_cycles_per_second(),
+      g_qtimer_at_pps);
 
   if (campaign_state == clocks_campaign_state_t::STARTED ||
       request_start || request_stop || request_recover || request_zero) {
@@ -664,11 +686,13 @@ void process_clocks_init(void) {
 
   ocxo_dac_io_reset(ocxo1_dac);
   ocxo_dac_io_reset(ocxo2_dac);
+  ocxo_dac_predictor_reset(ocxo1_dac);
+  ocxo_dac_predictor_reset(ocxo2_dac);
 
   (void)ocxo_dac_set(ocxo1_dac, (double)AD5693R_DAC_DEFAULT);
   (void)ocxo_dac_set(ocxo2_dac, (double)AD5693R_DAC_DEFAULT);
 
-  pinMode(GNSS_LOCK_PIN,  INPUT);
+  pinMode(GNSS_LOCK_PIN, INPUT);
   pinMode(GNSS_PPS_RELAY, OUTPUT);
   digitalWriteFast(GNSS_PPS_RELAY, LOW);
 

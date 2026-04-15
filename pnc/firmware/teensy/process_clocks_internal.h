@@ -276,6 +276,19 @@ struct ocxo_dac_state_t {
   double   servo_predicted_residual;
   uint32_t servo_predictor_updates;
 
+  // Servo pacing / deferred commit state.
+  bool     pacing_pending;
+  double   pacing_pending_target;
+  double   pacing_pending_step;
+  uint16_t pacing_pending_hw_code;
+  uint64_t pacing_pending_since_second;
+  uint64_t pacing_last_request_second;
+  uint64_t pacing_last_commit_second;
+  uint32_t pacing_intents;
+  uint32_t pacing_deferred_count;
+  uint32_t pacing_commit_count;
+  uint32_t pacing_skip_small_delta_count;
+
   // DAC I/O health / fault latch.
   bool     io_last_write_ok;
   bool     io_fault_latched;
@@ -305,9 +318,10 @@ extern servo_mode_t calibrate_ocxo_mode;
 const char* servo_mode_str(servo_mode_t mode);
 servo_mode_t servo_mode_parse(const char* s);
 
-static constexpr int32_t  SERVO_MAX_STEP       = 64;
-static constexpr uint32_t SERVO_SETTLE_SECONDS = 5;
-static constexpr uint32_t SERVO_MIN_SAMPLES    = 10;
+static constexpr int32_t  SERVO_MAX_STEP                = 64;
+static constexpr uint32_t SERVO_SETTLE_SECONDS          = 5;
+static constexpr uint32_t SERVO_MIN_SAMPLES             = 10;
+static constexpr uint16_t SERVO_MIN_DAC_CODE_DELTA_LSB  = 1;
 
 bool ocxo_dac_set(ocxo_dac_state_t& s, double value);
 void ocxo_dac_predictor_reset(ocxo_dac_state_t& s);
