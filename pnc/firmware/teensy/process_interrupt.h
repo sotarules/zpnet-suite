@@ -97,6 +97,8 @@ struct interrupt_capture_diag_t {
 
   uint32_t shadow_dwt = 0;
   uint32_t dwt_isr_entry_raw = 0;
+  int64_t  dwt_isr_entry_gnss_ns = -1;
+  int64_t  dwt_isr_entry_minus_event_ns = 0;
   uint32_t approach_cycles = 0;
 
   uint32_t dwt_at_event = 0;
@@ -126,6 +128,13 @@ struct interrupt_capture_diag_t {
   uint32_t prespin_complete_count = 0;
   uint32_t prespin_timeout_count = 0;
   uint32_t anomaly_count = 0;
+
+  // OCXO lane instrumentation: compare that actually fired vs counter captured at IRQ.
+  uint16_t counter16_at_irq = 0;
+  uint16_t compare16_fired = 0;
+  uint16_t compare16_next_programmed = 0;
+  int32_t  counter16_minus_compare_ticks = 0;
+  int64_t  counter16_minus_compare_ns = 0;
 };
 
 using interrupt_subscriber_event_fn =

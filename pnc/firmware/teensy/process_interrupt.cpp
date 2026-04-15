@@ -90,7 +90,10 @@ struct qtimer16_ocxo_runtime_t {
   uint32_t bootstrap_count = 0;
   uint32_t cadence_hits_total = 0;
   uint32_t cadence_hits_since_second = 0;
-  uint16_t last_programmed_compare = 0;
+  uint16_t last_programmed_compare = 0;      // next programmed compare after latest rearm
+  uint16_t last_fired_compare16 = 0;         // compare value that actually fired on latest IRQ
+  int32_t  last_fired_compare_delta_ticks = 0;
+  int64_t  last_fired_compare_delta_ns = 0;
   uint16_t last_initial_counter16 = 0;
   uint16_t last_second_target_low16 = 0;
 };
@@ -284,7 +287,13 @@ static void qtimer16_ocxo_rearm_same_second_target(qtimer16_ocxo_runtime_t& cloc
 static bool qtimer16_ocxo_consume_cadence_irq(qtimer16_ocxo_runtime_t& clock,
                                               uint16_t counter16_snapshot,
                                               uint32_t& logical_counter32_at_event) {
+  const uint16_t fired_compare16 = clock.second_target_low16;
+
   clock.last_counter16_at_irq = counter16_snapshot;
+  clock.last_fired_compare16 = fired_compare16;
+  clock.last_fired_compare_delta_ticks = (int32_t)((uint16_t)(counter16_snapshot - fired_compare16));
+  clock.last_fired_compare_delta_ns = (int64_t)clock.last_fired_compare_delta_ticks * 100LL;
+
   clock.cadence_hits_total++;
   clock.cadence_hits_since_second++;
   clock.cadence_hit_index++;
@@ -331,12 +340,20 @@ static void fill_diag_common(interrupt_subscriber_runtime_t& rt,
                              interrupt_capture_diag_t& diag,
                              const interrupt_event_t& event,
                              uint32_t dwt_isr_entry_raw,
-                             bool bridge_valid) {
+                             bool bridge_valid,
+                             const qtimer16_ocxo_runtime_t* ocxo_clock = nullptr) {
   diag.provider = rt.desc->provider;
   diag.lane = rt.desc->lane;
   diag.kind = rt.desc->kind;
 
   diag.dwt_isr_entry_raw = dwt_isr_entry_raw;
+  const int64_t dwt_isr_entry_gnss_ns = time_dwt_to_gnss_ns(dwt_isr_entry_raw);
+  diag.dwt_isr_entry_gnss_ns = dwt_isr_entry_gnss_ns;
+  diag.dwt_isr_entry_minus_event_ns =
+      (dwt_isr_entry_gnss_ns >= 0 && event.gnss_ns_at_event != 0)
+          ? (dwt_isr_entry_gnss_ns - (int64_t)event.gnss_ns_at_event)
+          : 0;
+
   diag.dwt_at_event = event.dwt_at_event;
   diag.dwt_at_event_adjusted = event.dwt_at_event;
   diag.counter32_at_event = event.counter32_at_event;
@@ -357,11 +374,20 @@ static void fill_diag_common(interrupt_subscriber_runtime_t& rt,
   diag.bridge_gnss_ns_final = event.gnss_ns_at_event;
   diag.bridge_raw_error_ns = 0;
   diag.bridge_final_error_ns = 0;
+
+  if (ocxo_clock) {
+    diag.counter16_at_irq = ocxo_clock->last_counter16_at_irq;
+    diag.compare16_fired = ocxo_clock->last_fired_compare16;
+    diag.compare16_next_programmed = ocxo_clock->last_programmed_compare;
+    diag.counter16_minus_compare_ticks = ocxo_clock->last_fired_compare_delta_ticks;
+    diag.counter16_minus_compare_ns = ocxo_clock->last_fired_compare_delta_ns;
+  }
 }
 
 static void handle_event(interrupt_subscriber_runtime_t& rt,
                          uint32_t dwt_isr_entry_raw,
-                         uint32_t counter32_at_event) {
+                         uint32_t counter32_at_event,
+                         const qtimer16_ocxo_runtime_t* ocxo_clock = nullptr) {
   interrupt_event_t event {};
   event.kind = rt.desc->kind;
   event.provider = rt.desc->provider;
@@ -387,7 +413,7 @@ static void handle_event(interrupt_subscriber_runtime_t& rt,
   }
 
   interrupt_capture_diag_t diag {};
-  fill_diag_common(rt, diag, event, dwt_isr_entry_raw, bridge_valid);
+  fill_diag_common(rt, diag, event, dwt_isr_entry_raw, bridge_valid, ocxo_clock);
 
   rt.last_event = event;
   rt.last_diag = diag;
@@ -438,7 +464,7 @@ static void handle_ocxo_qtimer16_irq(qtimer16_ocxo_runtime_t& clock,
   if (!is_second_edge) return;
 
   clock.dispatch_count++;
-  handle_event(rt, dwt_raw, logical_counter32_at_event);
+  handle_event(rt, dwt_raw, logical_counter32_at_event, &clock);
 }
 
 void process_interrupt_gpio6789_irq(uint32_t dwt_isr_entry_raw) {
@@ -659,7 +685,10 @@ static Payload cmd_report(const Payload&) {
   p.add("ocxo1_bootstrap_count", g_clock_ocxo1.bootstrap_count);
   p.add("ocxo1_cadence_hits_total", g_clock_ocxo1.cadence_hits_total);
   p.add("ocxo1_last_programmed_compare", (uint32_t)g_clock_ocxo1.last_programmed_compare);
+  p.add("ocxo1_last_compare16_fired", (uint32_t)g_clock_ocxo1.last_fired_compare16);
   p.add("ocxo1_last_counter16_at_irq", (uint32_t)g_clock_ocxo1.last_counter16_at_irq);
+  p.add("ocxo1_last_compare_delta_ticks", g_clock_ocxo1.last_fired_compare_delta_ticks);
+  p.add("ocxo1_last_compare_delta_ns", g_clock_ocxo1.last_fired_compare_delta_ns);
 
   p.add("ocxo2_irq_count", g_clock_ocxo2.irq_count);
   p.add("ocxo2_dispatch_count", g_clock_ocxo2.dispatch_count);
@@ -667,7 +696,10 @@ static Payload cmd_report(const Payload&) {
   p.add("ocxo2_bootstrap_count", g_clock_ocxo2.bootstrap_count);
   p.add("ocxo2_cadence_hits_total", g_clock_ocxo2.cadence_hits_total);
   p.add("ocxo2_last_programmed_compare", (uint32_t)g_clock_ocxo2.last_programmed_compare);
+  p.add("ocxo2_last_compare16_fired", (uint32_t)g_clock_ocxo2.last_fired_compare16);
   p.add("ocxo2_last_counter16_at_irq", (uint32_t)g_clock_ocxo2.last_counter16_at_irq);
+  p.add("ocxo2_last_compare_delta_ticks", g_clock_ocxo2.last_fired_compare_delta_ticks);
+  p.add("ocxo2_last_compare_delta_ns", g_clock_ocxo2.last_fired_compare_delta_ns);
 
   PayloadArray subscribers;
   for (uint32_t i = 0; i < g_subscriber_count; i++) {
@@ -677,8 +709,12 @@ static Payload cmd_report(const Payload&) {
     Payload s;
     s.add("slot", i);
     s.add("kind", interrupt_subscriber_kind_str(rt.desc->kind));
+    s.add("provider", interrupt_provider_kind_str(rt.desc->provider));
+    s.add("lane", interrupt_lane_str(rt.desc->lane));
     s.add("active", rt.active);
     s.add("subscribed", rt.subscribed);
+    s.add("start_count", rt.start_count);
+    s.add("stop_count", rt.stop_count);
     s.add("irq_count", rt.irq_count);
     s.add("dispatch_count", rt.dispatch_count);
     s.add("event_count", rt.event_count);
@@ -688,9 +724,36 @@ static Payload cmd_report(const Payload&) {
     s.add("last_counter32_at_event", rt.last_event.counter32_at_event);
     s.add("last_status", (uint32_t)rt.last_event.status);
 
+    s.add("last_dwt_isr_entry_raw", rt.last_diag.dwt_isr_entry_raw);
+    s.add("last_dwt_isr_entry_gnss_ns", rt.last_diag.dwt_isr_entry_gnss_ns);
+    s.add("last_dwt_isr_entry_minus_event_ns", rt.last_diag.dwt_isr_entry_minus_event_ns);
+
+    s.add("last_gnss_ns_at_event_raw", rt.last_diag.gnss_ns_at_event_raw);
+    s.add("last_gnss_ns_at_event_final", rt.last_diag.gnss_ns_at_event_final);
+    s.add("last_gnss_ns_at_event_delta", rt.last_diag.gnss_ns_at_event_delta);
+
     s.add("bridge_valid", rt.last_diag.bridge_valid);
-    s.add("bridge_gnss_ns_final", rt.last_diag.bridge_gnss_ns_final);
+    s.add("bridge_within_tolerance", rt.last_diag.bridge_within_tolerance);
     s.add("bridge_skipped_invalid", rt.last_diag.bridge_skipped_invalid);
+    s.add("bridge_gnss_ns_raw", rt.last_diag.bridge_gnss_ns_raw);
+    s.add("bridge_gnss_ns_target", rt.last_diag.bridge_gnss_ns_target);
+    s.add("bridge_gnss_ns_final", rt.last_diag.bridge_gnss_ns_final);
+    s.add("bridge_raw_error_ns", rt.last_diag.bridge_raw_error_ns);
+    s.add("bridge_final_error_ns", rt.last_diag.bridge_final_error_ns);
+
+    if (rt.desc->clock_kind == qtimer_clock_kind_t::OCXO1 ||
+        rt.desc->clock_kind == qtimer_clock_kind_t::OCXO2) {
+      const qtimer16_ocxo_runtime_t* clock = ocxo_clock_runtime_for(rt.desc->clock_kind);
+      if (clock) {
+        s.add("bootstrap_count", clock->bootstrap_count);
+        s.add("cadence_hits_total", clock->cadence_hits_total);
+      }
+      s.add("counter16_at_irq", (uint32_t)rt.last_diag.counter16_at_irq);
+      s.add("compare16_fired", (uint32_t)rt.last_diag.compare16_fired);
+      s.add("compare16_next_programmed", (uint32_t)rt.last_diag.compare16_next_programmed);
+      s.add("counter16_minus_compare_ticks", rt.last_diag.counter16_minus_compare_ticks);
+      s.add("counter16_minus_compare_ns", rt.last_diag.counter16_minus_compare_ns);
+    }
 
     subscribers.add(s);
   }
