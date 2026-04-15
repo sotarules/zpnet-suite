@@ -1329,7 +1329,7 @@ void timepop_init(void) {
   qtimer1_init_ch2_scheduler();
 
   attachInterruptVector(IRQ_QTIMER1, qtimer1_irq_isr);
-  NVIC_SET_PRIORITY(IRQ_QTIMER1, 16);
+  NVIC_SET_PRIORITY(IRQ_QTIMER1, 1);
   NVIC_ENABLE_IRQ(IRQ_QTIMER1);
 
   noInterrupts();

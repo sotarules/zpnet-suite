@@ -275,6 +275,16 @@ struct ocxo_dac_state_t {
   double   servo_filtered_slope;
   double   servo_predicted_residual;
   uint32_t servo_predictor_updates;
+
+  // DAC I/O health / fault latch.
+  bool     io_last_write_ok;
+  bool     io_fault_latched;
+  uint32_t io_write_attempts;
+  uint32_t io_write_successes;
+  uint32_t io_write_failures;
+  uint16_t io_last_attempted_hw_code;
+  uint16_t io_last_good_hw_code;
+  uint8_t  io_last_failure_stage;   // 0=none, 1=write_input, 2=update_dac, 3=driver_not_init
 };
 
 extern ocxo_dac_state_t ocxo1_dac;
@@ -299,8 +309,9 @@ static constexpr int32_t  SERVO_MAX_STEP       = 64;
 static constexpr uint32_t SERVO_SETTLE_SECONDS = 5;
 static constexpr uint32_t SERVO_MIN_SAMPLES    = 10;
 
-void ocxo_dac_set(ocxo_dac_state_t& s, double value);
+bool ocxo_dac_set(ocxo_dac_state_t& s, double value);
 void ocxo_dac_predictor_reset(ocxo_dac_state_t& s);
+void ocxo_dac_io_reset(ocxo_dac_state_t& s);
 
 // ============================================================================
 // Campaign state

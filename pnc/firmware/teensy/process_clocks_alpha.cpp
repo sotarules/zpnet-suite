@@ -145,13 +145,15 @@ static volatile uint64_t g_epoch_pps_index = 0;
 ocxo_dac_state_t ocxo1_dac = {
   (double)AD5693R_DAC_DEFAULT, AD5693R_DAC_DEFAULT, 0, 65535,
   0, 0.0, 0, 0,
-  false, 0.0, 0.0, 0.0, 0.0, 0
+  false, 0.0, 0.0, 0.0, 0.0, 0,
+  true, false, 0, 0, 0, AD5693R_DAC_DEFAULT, AD5693R_DAC_DEFAULT, 0
 };
 
 ocxo_dac_state_t ocxo2_dac = {
   (double)AD5693R_DAC_DEFAULT, AD5693R_DAC_DEFAULT, 0, 65535,
   0, 0.0, 0, 0,
-  false, 0.0, 0.0, 0.0, 0.0, 0
+  false, 0.0, 0.0, 0.0, 0.0, 0,
+  true, false, 0, 0, 0, AD5693R_DAC_DEFAULT, AD5693R_DAC_DEFAULT, 0
 };
 
 servo_mode_t calibrate_ocxo_mode = servo_mode_t::OFF;
@@ -185,19 +187,58 @@ void ocxo_dac_predictor_reset(ocxo_dac_state_t& s) {
   s.servo_predictor_updates = 0;
 }
 
-void ocxo_dac_set(ocxo_dac_state_t& s, double value) {
+void ocxo_dac_io_reset(ocxo_dac_state_t& s) {
+  s.io_last_write_ok = true;
+  s.io_fault_latched = false;
+  s.io_write_attempts = 0;
+  s.io_write_successes = 0;
+  s.io_write_failures = 0;
+  s.io_last_attempted_hw_code = s.dac_hw_code;
+  s.io_last_good_hw_code = s.dac_hw_code;
+  s.io_last_failure_stage = 0;
+}
+
+bool ocxo_dac_set(ocxo_dac_state_t& s, double value) {
   if (value < (double)s.dac_min) value = (double)s.dac_min;
   if (value > (double)s.dac_max) value = (double)s.dac_max;
-  s.dac_fractional = value;
-  s.dac_hw_code = (uint16_t)value;
 
-  if (&s == &ocxo1_dac) {
-    ad5693r_write_input(AD5693R_ADDR_OCXO1, s.dac_hw_code);
-    ad5693r_update_dac(AD5693R_ADDR_OCXO1);
-  } else {
-    ad5693r_write_input(AD5693R_ADDR_OCXO2, s.dac_hw_code);
-    ad5693r_update_dac(AD5693R_ADDR_OCXO2);
+  const uint16_t hw_code = (uint16_t)value;
+  s.io_write_attempts++;
+  s.io_last_attempted_hw_code = hw_code;
+
+  if (!g_ad5693r_init_ok) {
+    s.io_last_write_ok = false;
+    s.io_fault_latched = true;
+    s.io_write_failures++;
+    s.io_last_failure_stage = 3;
+    return false;
   }
+
+  const uint8_t addr = (&s == &ocxo1_dac) ? AD5693R_ADDR_OCXO1 : AD5693R_ADDR_OCXO2;
+
+  if (!ad5693r_write_input(addr, hw_code)) {
+    s.io_last_write_ok = false;
+    s.io_fault_latched = true;
+    s.io_write_failures++;
+    s.io_last_failure_stage = 1;
+    return false;
+  }
+
+  if (!ad5693r_update_dac(addr)) {
+    s.io_last_write_ok = false;
+    s.io_fault_latched = true;
+    s.io_write_failures++;
+    s.io_last_failure_stage = 2;
+    return false;
+  }
+
+  s.dac_fractional = value;
+  s.dac_hw_code = hw_code;
+  s.io_last_write_ok = true;
+  s.io_write_successes++;
+  s.io_last_good_hw_code = hw_code;
+  s.io_last_failure_stage = 0;
+  return true;
 }
 
 // ============================================================================
@@ -621,8 +662,11 @@ void process_clocks_init(void) {
 
   g_ad5693r_init_ok = ad5693r_init();
 
-  ocxo_dac_set(ocxo1_dac, (double)AD5693R_DAC_DEFAULT);
-  ocxo_dac_set(ocxo2_dac, (double)AD5693R_DAC_DEFAULT);
+  ocxo_dac_io_reset(ocxo1_dac);
+  ocxo_dac_io_reset(ocxo2_dac);
+
+  (void)ocxo_dac_set(ocxo1_dac, (double)AD5693R_DAC_DEFAULT);
+  (void)ocxo_dac_set(ocxo2_dac, (double)AD5693R_DAC_DEFAULT);
 
   pinMode(GNSS_LOCK_PIN,  INPUT);
   pinMode(GNSS_PPS_RELAY, OUTPUT);

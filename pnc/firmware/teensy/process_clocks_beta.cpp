@@ -211,6 +211,12 @@ static void now_window_reset(now_window_t& w) {
   w.head = 0;
 }
 
+
+static void ocxo_servo_latch_dac_fault(ocxo_dac_state_t& dac) {
+  dac.io_fault_latched = true;
+  calibrate_ocxo_mode = servo_mode_t::OFF;
+}
+
 // ============================================================================
 // Zeroing
 // ============================================================================
@@ -305,7 +311,16 @@ static void ocxo_servo_predictive(ocxo_dac_state_t& dac,
     return;
   }
 
-  ocxo_dac_set(dac, dac.dac_fractional + step);
+  // MULE dry run: do not touch the DAC bus
+  dac.servo_last_step = step;
+  return;
+
+  if (!ocxo_dac_set(dac, dac.dac_fractional + step)) {
+    dac.servo_last_step = 0.0;
+    ocxo_servo_latch_dac_fault(dac);
+    return;
+  }
+
   dac.servo_last_step = step;
   dac.servo_adjustments++;
 }
@@ -585,7 +600,25 @@ void clocks_beta_pps(void) {
   p.add("ocxo2_window_error_ns", g_ocxo2_clock.window_error_ns);
 
   p.add("ocxo1_dac", ocxo1_dac.dac_fractional);
+  p.add("ocxo1_dac_last_write_ok", ocxo1_dac.io_last_write_ok);
+  p.add("ocxo1_dac_fault_latched", ocxo1_dac.io_fault_latched);
+  p.add("ocxo1_dac_write_attempts", ocxo1_dac.io_write_attempts);
+  p.add("ocxo1_dac_write_successes", ocxo1_dac.io_write_successes);
+  p.add("ocxo1_dac_write_failures", ocxo1_dac.io_write_failures);
+  p.add("ocxo1_dac_last_attempted_hw_code", ocxo1_dac.io_last_attempted_hw_code);
+  p.add("ocxo1_dac_last_good_hw_code", ocxo1_dac.io_last_good_hw_code);
+  p.add("ocxo1_dac_last_failure_stage", (uint32_t)ocxo1_dac.io_last_failure_stage);
+
   p.add("ocxo2_dac", ocxo2_dac.dac_fractional);
+  p.add("ocxo2_dac_last_write_ok", ocxo2_dac.io_last_write_ok);
+  p.add("ocxo2_dac_fault_latched", ocxo2_dac.io_fault_latched);
+  p.add("ocxo2_dac_write_attempts", ocxo2_dac.io_write_attempts);
+  p.add("ocxo2_dac_write_successes", ocxo2_dac.io_write_successes);
+  p.add("ocxo2_dac_write_failures", ocxo2_dac.io_write_failures);
+  p.add("ocxo2_dac_last_attempted_hw_code", ocxo2_dac.io_last_attempted_hw_code);
+  p.add("ocxo2_dac_last_good_hw_code", ocxo2_dac.io_last_good_hw_code);
+  p.add("ocxo2_dac_last_failure_stage", (uint32_t)ocxo2_dac.io_last_failure_stage);
+
   p.add("calibrate_ocxo", servo_mode_str(calibrate_ocxo_mode));
 
   p.add("ocxo1_servo_filtered_residual_ns", ocxo1_dac.servo_filtered_residual, 6);
@@ -736,11 +769,19 @@ static Payload cmd_start(const Payload& args) {
 
   safeCopy(campaign_name, sizeof(campaign_name), name);
 
+  ocxo_dac_io_reset(ocxo1_dac);
+  ocxo_dac_io_reset(ocxo2_dac);
+
   double dac_val;
-  if (args.tryGetDouble("set_dac1", dac_val)) ocxo_dac_set(ocxo1_dac, dac_val);
-  if (args.tryGetDouble("set_dac2", dac_val)) ocxo_dac_set(ocxo2_dac, dac_val);
+  bool dac1_ok = true;
+  bool dac2_ok = true;
+  if (args.tryGetDouble("set_dac1", dac_val)) dac1_ok = ocxo_dac_set(ocxo1_dac, dac_val);
+  if (args.tryGetDouble("set_dac2", dac_val)) dac2_ok = ocxo_dac_set(ocxo2_dac, dac_val);
 
   calibrate_ocxo_mode = servo_mode_parse(args.getString("calibrate_ocxo"));
+  if (!dac1_ok || !dac2_ok) {
+    calibrate_ocxo_mode = servo_mode_t::OFF;
+  }
 
   ocxo_dac_predictor_reset(ocxo1_dac);
   ocxo_dac_predictor_reset(ocxo2_dac);
@@ -750,9 +791,11 @@ static Payload cmd_start(const Payload& args) {
   request_recover = false;
 
   Payload p;
-  p.add("status", "start_requested");
+  p.add("status", (!dac1_ok || !dac2_ok) ? "start_requested_dac_fault" : "start_requested");
   p.add("ocxo1_dac", ocxo1_dac.dac_fractional);
   p.add("ocxo2_dac", ocxo2_dac.dac_fractional);
+  p.add("ocxo1_dac_last_write_ok", ocxo1_dac.io_last_write_ok);
+  p.add("ocxo2_dac_last_write_ok", ocxo2_dac.io_last_write_ok);
   p.add("calibrate_ocxo", servo_mode_str(calibrate_ocxo_mode));
   return p;
 }
@@ -831,12 +874,17 @@ static Payload cmd_report(const Payload&) {
 
 static Payload cmd_set_dac(const Payload& args) {
   double dac_val;
-  if (args.tryGetDouble("set_dac1", dac_val)) ocxo_dac_set(ocxo1_dac, dac_val);
-  if (args.tryGetDouble("set_dac2", dac_val)) ocxo_dac_set(ocxo2_dac, dac_val);
+  bool dac1_ok = true;
+  bool dac2_ok = true;
+  if (args.tryGetDouble("set_dac1", dac_val)) dac1_ok = ocxo_dac_set(ocxo1_dac, dac_val);
+  if (args.tryGetDouble("set_dac2", dac_val)) dac2_ok = ocxo_dac_set(ocxo2_dac, dac_val);
 
   Payload p;
   p.add("ocxo1_dac", ocxo1_dac.dac_fractional);
   p.add("ocxo2_dac", ocxo2_dac.dac_fractional);
+  p.add("ocxo1_dac_last_write_ok", ocxo1_dac.io_last_write_ok);
+  p.add("ocxo2_dac_last_write_ok", ocxo2_dac.io_last_write_ok);
+  p.add("status", (dac1_ok && dac2_ok) ? "ok" : "dac_write_fault");
   return p;
 }
 
