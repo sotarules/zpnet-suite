@@ -10,8 +10,12 @@
 //   • DWT captured at PPS ISR entry is the authoritative PPS-side anchor.
 //   • OCXO events are observed clocks, not consummated clocks.
 //   • No pre-spin / spin-dry occurs here.
-//   • process_interrupt captures ISR-entry DWT, normalizes to GNSS nanoseconds,
-//     and hands lawful event facts to subscribers.
+//   • PPS is still reported as a direct ISR-entry anchor.
+//   • OCXO one-second tempo is now derived from 1 ms cadence buckets:
+//       1000 adjacent windows per second, accumulated in DWT cycles and
+//       GNSS nanoseconds, so boundary latency largely cancels in the sum.
+//   • process_interrupt captures raw ISR-entry DWT, preserves raw edge facts,
+//     and also exposes the bucket-integrated one-second estimate to subscribers.
 //   • TimePop owns VCLOCK scheduling and Spin-Dry for its own compare path.
 //
 // Notes:
@@ -135,6 +139,26 @@ struct interrupt_capture_diag_t {
   uint16_t compare16_next_programmed = 0;
   int32_t  counter16_minus_compare_ticks = 0;
   int64_t  counter16_minus_compare_ns = 0;
+
+  // OCXO 1 ms bucket integrator diagnostics.
+  uint32_t ocxo_bucket_interval_counts = 0;
+  uint32_t ocxo_current_window_bucket_count = 0;
+  uint32_t ocxo_last_second_bucket_count = 0;
+  uint32_t ocxo_last_bucket_cycles = 0;
+  int64_t  ocxo_last_bucket_gnss_ns = 0;
+  uint64_t ocxo_current_window_cycles_sum = 0;
+  int64_t  ocxo_current_window_gnss_ns_sum = 0;
+  uint64_t ocxo_second_cycles_observed = 0;
+  uint64_t ocxo_second_cycles_prediction = 0;
+  int64_t  ocxo_second_cycles_prediction_error = 0;
+  int64_t  ocxo_second_gnss_ns_observed = 0;
+  int64_t  ocxo_second_gnss_ns_prediction = 0;
+  int64_t  ocxo_second_gnss_ns_prediction_error = 0;
+  int64_t  ocxo_second_residual_ns = 0;
+  int64_t  ocxo_second_start_gnss_ns_raw = -1;
+  int64_t  ocxo_second_end_gnss_ns_raw = -1;
+  uint32_t ocxo_second_start_dwt_raw = 0;
+  uint32_t ocxo_second_end_dwt_raw = 0;
 };
 
 using interrupt_subscriber_event_fn =
