@@ -22,6 +22,14 @@ from zpnet.processes.processes import send_command
 DWT_EXPECTED_PER_PPS = 1_008_000_000
 VREF = 3.002
 
+# Persist last-seen edge timestamps so the readout can show a start→end
+# interval for PPS / OCXO1 / OCXO2 without requiring upstream code changes.
+_PREV_EDGE_NS = {
+    "pps": None,
+    "ocxo1": None,
+    "ocxo2": None,
+}
+
 
 # ---------------------------------------------------------------------
 # Data fetchers
@@ -363,60 +371,42 @@ def clocks_combined_readout() -> list[str]:
             f"  {_baseline_comp(base_dac, now_dac)}"
         )
 
-    # ── Interrupt diagnostics ──
+    # ── Interrupt edge intervals ──
     #
-    # One row per interrupt subscriber (PPS, OCXO1, OCXO2) showing the
-    # TDC pipeline: approach → shadow → ISR entry → correction → edge.
+    # Pre-spin is gone, so for now the useful facts are simply the prior and
+    # current GNSS edge timestamps for PPS / OCXO1 / OCXO2.
     #
     lines.append("")
     lines.append(
         f"{'INT':<6}"
-        f"{'APPROACH':>10}"
-        f"{'SH→ISR':>8}"
-        f"{'CORR':>6}"
-        f"{'DWT_EDGE':>14}"
-        f"{'GNSS_NS_EDGE':>22}"
-        f"{'COUNTER':>14}"
-        f"{'ARM':>8}"
-        f"{'OK':>8}"
-        f"{'TO':>6}"
-        f"{'AN':>6}"
+        f"{'START_GNSS_NS':>22}"
+        f"{'END_GNSS_NS':>22}"
+        f"{'DELTA_NS':>14}"
     )
-    int_clocks = [
-        ("PPS",   "pps_diag"),
-        ("OCXO1", "ocxo1_diag"),
-        ("OCXO2", "ocxo2_diag"),
-    ]
-    for name, prefix in int_clocks:
-        approach   = _to_int(_frag(r, f"{prefix}_approach_cycles"))
-        isr_raw    = _to_int(_frag(r, f"{prefix}_dwt_isr_entry_raw"))
-        shadow     = _to_int(_frag(r, f"{prefix}_shadow_dwt"))
-        corr       = _to_int(_frag(r, f"{prefix}_dwt_event_correction_cycles"))
-        dwt_edge   = _to_int(_frag(r, f"{prefix}_dwt_at_event_adjusted"))
-        gnss_edge  = _to_int(_frag(r, f"{prefix}_gnss_ns_at_event"))
-        counter    = _to_int(_frag(r, f"{prefix}_counter32_at_event"))
-        arm        = _to_int(_frag(r, f"{prefix}_prespin_arm_count"))
-        complete   = _to_int(_frag(r, f"{prefix}_prespin_complete_count"))
-        timeout    = _to_int(_frag(r, f"{prefix}_prespin_timeout_count"))
-        anomaly    = _to_int(_frag(r, f"{prefix}_anomaly_count"))
 
-        sh_to_isr = None
-        if isr_raw is not None and shadow is not None:
-            sh_to_isr = isr_raw - shadow
+    int_clocks = [
+        ("PPS",   "pps",   "pps_diag_gnss_ns_at_event"),
+        ("OCXO1", "ocxo1", "ocxo1_diag_gnss_ns_at_event"),
+        ("OCXO2", "ocxo2", "ocxo2_diag_gnss_ns_at_event"),
+    ]
+
+    for name, state_key, field in int_clocks:
+        end_edge = _to_int(_frag(r, field))
+        start_edge = _PREV_EDGE_NS.get(state_key)
+        delta_edge = None
+        if start_edge is not None and end_edge is not None:
+            delta_edge = end_edge - start_edge
 
         lines.append(
             f"{name:<6}"
-            f"{_comma_int(approach, 10)}"
-            f"{_fmt(sh_to_isr, f'>8d', 8)}"
-            f"{_fmt(corr, f'>6d', 6)}"
-            f"{_comma_int(dwt_edge, 14)}"
-            f"{_comma_int(gnss_edge, 22)}"
-            f"{_comma_int(counter, 14)}"
-            f"{_comma_int(arm, 8)}"
-            f"{_comma_int(complete, 8)}"
-            f"{_comma_int(timeout, 6)}"
-            f"{_comma_int(anomaly, 6)}"
+            f"{_comma_int(start_edge, 22)}"
+            f"{_comma_int(end_edge, 22)}"
+            f"{_comma_int(delta_edge, 14)}"
         )
+
+        if end_edge is not None:
+            _PREV_EDGE_NS[state_key] = end_edge
+
     lines.append("")
 
     # ── NOW servo detail ──
