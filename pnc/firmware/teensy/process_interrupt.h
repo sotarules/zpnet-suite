@@ -152,10 +152,17 @@ struct interrupt_capture_diag_t {
   int64_t  ocxo_last_bucket_gnss_ns = 0;
   uint64_t ocxo_current_window_cycles_sum = 0;
   int64_t  ocxo_current_window_gnss_ns_sum = 0;
+
+  // Canonical authoritative one-second values: synthetic/final boundary delta.
   uint64_t ocxo_second_cycles_observed = 0;
+  int64_t  ocxo_second_gnss_ns_observed = 0;
+
+  // Raw one-second values retained for diagnostics only.
+  uint64_t ocxo_second_cycles_observed_raw = 0;
+  int64_t  ocxo_second_gnss_ns_observed_raw = 0;
+
   uint64_t ocxo_second_cycles_prediction = 0;
   int64_t  ocxo_second_cycles_prediction_error = 0;
-  int64_t  ocxo_second_gnss_ns_observed = 0;
   int64_t  ocxo_second_gnss_ns_prediction = 0;
   int64_t  ocxo_second_gnss_ns_prediction_error = 0;
   int64_t  ocxo_second_residual_ns = 0;

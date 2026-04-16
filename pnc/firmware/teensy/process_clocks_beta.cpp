@@ -159,7 +159,7 @@ static void clocks_payload_add_ocxo_diag(Payload& p,
   //   - canonical edge/event facts
   //   - bridge reconciliation
   //   - compare-latency facts
-  //   - bucket/one-second integrator facts
+  //   - bucket/one-second integrator facts (canonical observed + raw diagnostics)
   add_bool("enabled", diag.enabled);
 
   add_u32("dwt_at_event", diag.dwt_at_event);
@@ -190,9 +190,11 @@ static void clocks_payload_add_ocxo_diag(Payload& p,
   add_u64("ocxo_current_window_cycles_sum", diag.ocxo_current_window_cycles_sum);
   add_i64("ocxo_current_window_gnss_ns_sum", diag.ocxo_current_window_gnss_ns_sum);
   add_u64("ocxo_second_cycles_observed", diag.ocxo_second_cycles_observed);
+  add_u64("ocxo_second_cycles_observed_raw", diag.ocxo_second_cycles_observed_raw);
   add_u64("ocxo_second_cycles_prediction", diag.ocxo_second_cycles_prediction);
   add_i64("ocxo_second_cycles_prediction_error", diag.ocxo_second_cycles_prediction_error);
   add_i64("ocxo_second_gnss_ns_observed", diag.ocxo_second_gnss_ns_observed);
+  add_i64("ocxo_second_gnss_ns_observed_raw", diag.ocxo_second_gnss_ns_observed_raw);
   add_i64("ocxo_second_gnss_ns_prediction", diag.ocxo_second_gnss_ns_prediction);
   add_i64("ocxo_second_gnss_ns_prediction_error", diag.ocxo_second_gnss_ns_prediction_error);
   add_i64("ocxo_second_residual_ns", diag.ocxo_second_residual_ns);
@@ -200,6 +202,12 @@ static void clocks_payload_add_ocxo_diag(Payload& p,
   add_i64("ocxo_second_end_gnss_ns_raw", diag.ocxo_second_end_gnss_ns_raw);
   add_u32("ocxo_second_start_dwt_raw", diag.ocxo_second_start_dwt_raw);
   add_u32("ocxo_second_end_dwt_raw", diag.ocxo_second_end_dwt_raw);
+  add_i64("ocxo_second_start_gnss_ns_final", diag.ocxo_second_start_gnss_ns_final);
+  add_i64("ocxo_second_end_gnss_ns_final", diag.ocxo_second_end_gnss_ns_final);
+  add_u32("ocxo_second_start_dwt_final", diag.ocxo_second_start_dwt_final);
+  add_u32("ocxo_second_end_dwt_final", diag.ocxo_second_end_dwt_final);
+  add_i64("ocxo_second_start_raw_minus_final_ns", diag.ocxo_second_start_raw_minus_final_ns);
+  add_i64("ocxo_second_end_raw_minus_final_ns", diag.ocxo_second_end_raw_minus_final_ns);
 }
 
 // ── Predictive servo tuning ──
