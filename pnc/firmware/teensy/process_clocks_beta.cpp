@@ -130,9 +130,9 @@ double dac_welford_stderr(const dac_welford_t& w) {
   return (w.n >= 2) ? sqrt(w.m2 / (double)(w.n - 1)) / sqrt((double)w.n) : 0.0;
 }
 
-static void clocks_payload_add_interrupt_bridge_diag(Payload& p,
-                                                     const char* prefix,
-                                                     const interrupt_capture_diag_t& diag) {
+static void clocks_payload_add_ocxo_diag(Payload& p,
+                                        const char* prefix,
+                                        const interrupt_capture_diag_t& diag) {
   char key[96];
 
   auto add_bool = [&](const char* suffix, bool value) {
@@ -155,50 +155,26 @@ static void clocks_payload_add_interrupt_bridge_diag(Payload& p,
     p.add(key, value);
   };
 
-  // Canonical reconstructed event facts and bridge/reconciliation diagnostics.
+  // Keep only OCXO truth-surface fields:
+  //   - canonical edge/event facts
+  //   - bridge reconciliation
+  //   - compare-latency facts
+  //   - bucket/one-second integrator facts
+  add_bool("enabled", diag.enabled);
+
   add_u32("dwt_at_event", diag.dwt_at_event);
-  add_u64("gnss_ns_at_event_raw", diag.gnss_ns_at_event_raw);
   add_u64("gnss_ns_at_event_final", diag.gnss_ns_at_event_final);
-  add_i64("gnss_ns_at_event_delta", diag.gnss_ns_at_event_delta);
+  add_i64("dwt_isr_entry_gnss_ns", diag.dwt_isr_entry_gnss_ns);
+  add_i64("dwt_isr_entry_minus_event_ns", diag.dwt_isr_entry_minus_event_ns);
 
   add_bool("bridge_valid", diag.bridge_valid);
   add_bool("bridge_within_tolerance", diag.bridge_within_tolerance);
-  add_bool("bridge_skipped_invalid", diag.bridge_skipped_invalid);
   add_bool("bridge_used_prediction", diag.bridge_used_prediction);
-
   add_u64("bridge_gnss_ns_raw", diag.bridge_gnss_ns_raw);
   add_u64("bridge_gnss_ns_target", diag.bridge_gnss_ns_target);
   add_u64("bridge_gnss_ns_final", diag.bridge_gnss_ns_final);
   add_i64("bridge_raw_error_ns", diag.bridge_raw_error_ns);
   add_i64("bridge_final_error_ns", diag.bridge_final_error_ns);
-}
-
-static void clocks_payload_add_interrupt_extended_diag(Payload& p,
-                                                       const char* prefix,
-                                                       const interrupt_capture_diag_t& diag) {
-  char key[96];
-
-  auto add_u32 = [&](const char* suffix, uint32_t value) {
-    snprintf(key, sizeof(key), "%s_%s", prefix, suffix);
-    p.add(key, value);
-  };
-
-  auto add_u64 = [&](const char* suffix, uint64_t value) {
-    snprintf(key, sizeof(key), "%s_%s", prefix, suffix);
-    p.add(key, value);
-  };
-
-  auto add_i64 = [&](const char* suffix, int64_t value) {
-    snprintf(key, sizeof(key), "%s_%s", prefix, suffix);
-    p.add(key, value);
-  };
-
-  // Remaining interrupt-capture fields not already surfaced by the
-  // base helper or the bridge helper. Together, these three helpers expose
-  // the full interrupt_capture_diag_t surface into TIMEBASE_FRAGMENT.
-  add_i64("dwt_isr_entry_gnss_ns", diag.dwt_isr_entry_gnss_ns);
-  add_i64("dwt_isr_entry_minus_event_ns", diag.dwt_isr_entry_minus_event_ns);
-  add_u64("gnss_ns_at_event_bridge", diag.gnss_ns_at_event_bridge);
 
   add_u32("counter16_at_irq", diag.counter16_at_irq);
   add_u32("compare16_fired", diag.compare16_fired);
@@ -858,56 +834,25 @@ void clocks_beta_pps(void) {
 
   Payload p;
   p.add("campaign", campaign_name);
-
-  p.add("gnss_ns",  g_gnss_ns_count_at_pps);
-  p.add("ocxo1_ns", g_ocxo1_clock.ns_count_at_pps);
-  p.add("ocxo2_ns", g_ocxo2_clock.ns_count_at_pps);
-
   p.add("teensy_pps_count", campaign_seconds);
+  p.add("gnss_ns", g_gnss_ns_count_at_pps);
+  p.add("calibrate_ocxo", servo_mode_str(calibrate_ocxo_mode));
 
-  p.add("dwt_cycle_count_at_pps", g_dwt_cycle_count_at_pps);
-  p.add("dwt_cycle_count_total", g_dwt_cycle_count_total);
-  p.add("dwt_cycle_count_between_pps", g_dwt_cycle_count_between_pps);
-  p.add("dwt_cycle_count_next_second_prediction", g_dwt_cycle_count_next_second_prediction);
-  p.add("dwt_cycle_count_next_second_adjustment", g_dwt_cycle_count_next_second_adjustment);
-  p.add("dwt_model_pps_count", g_dwt_model_pps_count);
-  p.add("qtimer_at_pps", g_qtimer_at_pps);
-  p.add("pps_event_counter32_at_event", g_last_pps_event_counter32_at_event);
-
-  p.add("vclock_counter32_at_pps_event", g_vclock_clock.counter32_at_pps_event);
-  p.add("vclock_counter32_at_pps_expected", g_vclock_clock.counter32_at_pps_expected);
-  p.add("vclock_counter32_error_at_pps", g_vclock_clock.counter32_error_at_pps);
-  p.add("vclock_ticks_between_pps", g_vclock_measurement.ticks_between_pps);
-  p.add("vclock_ns_between_pps", g_vclock_measurement.ns_between_pps);
-  p.add("vclock_ns", g_vclock_clock.ns_count_at_pps);
-  p.add("vclock_ns_expected", g_vclock_clock.ns_count_expected_at_pps);
-  p.add("vclock_second_residual_ns", g_vclock_measurement.second_residual_ns);
-  p.add("vclock_zero_established", g_vclock_clock.zero_established);
-
-  p.add("ocxo1_gnss_ns_at_edge", g_ocxo1_clock.gnss_ns_at_edge);
-  p.add("ocxo1_gnss_ns_between_edges", g_ocxo1_measurement.gnss_ns_between_edges);
-  p.add("ocxo1_dwt_at_edge", g_ocxo1_measurement.dwt_at_edge);
-  p.add("ocxo1_dwt_cycles_between_edges", g_ocxo1_measurement.dwt_cycles_between_edges);
-  p.add("ocxo1_ns_count_at_edge", g_ocxo1_clock.ns_count_at_edge);
+  // OCXO coarse truth surface.
   p.add("ocxo1_ns_count_at_pps", g_ocxo1_clock.ns_count_at_pps);
-
-  p.add("ocxo2_gnss_ns_at_edge", g_ocxo2_clock.gnss_ns_at_edge);
-  p.add("ocxo2_gnss_ns_between_edges", g_ocxo2_measurement.gnss_ns_between_edges);
-  p.add("ocxo2_dwt_at_edge", g_ocxo2_measurement.dwt_at_edge);
-  p.add("ocxo2_dwt_cycles_between_edges", g_ocxo2_measurement.dwt_cycles_between_edges);
-  p.add("ocxo2_ns_count_at_edge", g_ocxo2_clock.ns_count_at_edge);
   p.add("ocxo2_ns_count_at_pps", g_ocxo2_clock.ns_count_at_pps);
 
-  p.add("ocxo1_second_residual_ns", g_ocxo1_measurement.second_residual_ns);
-  p.add("ocxo2_second_residual_ns", g_ocxo2_measurement.second_residual_ns);
+  p.add("ocxo1_gnss_ns_between_edges", g_ocxo1_measurement.gnss_ns_between_edges);
+  p.add("ocxo2_gnss_ns_between_edges", g_ocxo2_measurement.gnss_ns_between_edges);
 
-  // Smart-zero phase offset (cumulative, unwrapped)
+  p.add("ocxo1_dwt_cycles_between_edges", g_ocxo1_measurement.dwt_cycles_between_edges);
+  p.add("ocxo2_dwt_cycles_between_edges", g_ocxo2_measurement.dwt_cycles_between_edges);
+
   p.add("ocxo1_phase_offset_ns", g_ocxo1_clock.phase_offset_ns);
   p.add("ocxo1_zero_established", g_ocxo1_clock.zero_established);
   p.add("ocxo2_phase_offset_ns", g_ocxo2_clock.phase_offset_ns);
   p.add("ocxo2_zero_established", g_ocxo2_clock.zero_established);
 
-  // Per-window viability (replaces cumulative viability)
   p.add("ocxo1_window_checks", g_ocxo1_clock.window_checks);
   p.add("ocxo1_window_mismatches", g_ocxo1_clock.window_mismatches);
   p.add("ocxo1_window_error_ns", g_ocxo1_clock.window_error_ns);
@@ -916,134 +861,20 @@ void clocks_beta_pps(void) {
   p.add("ocxo2_window_mismatches", g_ocxo2_clock.window_mismatches);
   p.add("ocxo2_window_error_ns", g_ocxo2_clock.window_error_ns);
 
+  // Compact DAC / servo state.
   p.add("ocxo1_dac", ocxo1_dac.dac_fractional);
   p.add("ocxo1_dac_last_write_ok", ocxo1_dac.io_last_write_ok);
   p.add("ocxo1_dac_fault_latched", ocxo1_dac.io_fault_latched);
-  p.add("ocxo1_dac_write_attempts", ocxo1_dac.io_write_attempts);
-  p.add("ocxo1_dac_write_successes", ocxo1_dac.io_write_successes);
-  p.add("ocxo1_dac_write_failures", ocxo1_dac.io_write_failures);
-  p.add("ocxo1_dac_last_attempted_hw_code", ocxo1_dac.io_last_attempted_hw_code);
-  p.add("ocxo1_dac_last_good_hw_code", ocxo1_dac.io_last_good_hw_code);
-  p.add("ocxo1_dac_last_failure_stage", (uint32_t)ocxo1_dac.io_last_failure_stage);
+  p.add("ocxo1_servo_predicted_residual_ns", ocxo1_dac.servo_predicted_residual, 6);
+  p.add("ocxo1_servo_last_step", ocxo1_dac.servo_last_step, 6);
 
   p.add("ocxo2_dac", ocxo2_dac.dac_fractional);
   p.add("ocxo2_dac_last_write_ok", ocxo2_dac.io_last_write_ok);
   p.add("ocxo2_dac_fault_latched", ocxo2_dac.io_fault_latched);
-  p.add("ocxo2_dac_write_attempts", ocxo2_dac.io_write_attempts);
-  p.add("ocxo2_dac_write_successes", ocxo2_dac.io_write_successes);
-  p.add("ocxo2_dac_write_failures", ocxo2_dac.io_write_failures);
-  p.add("ocxo2_dac_last_attempted_hw_code", ocxo2_dac.io_last_attempted_hw_code);
-  p.add("ocxo2_dac_last_good_hw_code", ocxo2_dac.io_last_good_hw_code);
-  p.add("ocxo2_dac_last_failure_stage", (uint32_t)ocxo2_dac.io_last_failure_stage);
-
-  p.add("calibrate_ocxo", servo_mode_str(calibrate_ocxo_mode));
-
-  p.add("ocxo1_servo_filtered_residual_ns", ocxo1_dac.servo_filtered_residual, 6);
-  p.add("ocxo1_servo_filtered_slope_ns_per_s", ocxo1_dac.servo_filtered_slope, 6);
-  p.add("ocxo1_servo_predicted_residual_ns", ocxo1_dac.servo_predicted_residual, 6);
-  p.add("ocxo1_servo_predictor_updates", ocxo1_dac.servo_predictor_updates);
-  p.add("ocxo1_servo_last_step", ocxo1_dac.servo_last_step, 6);
-
-  p.add("ocxo2_servo_filtered_residual_ns", ocxo2_dac.servo_filtered_residual, 6);
-  p.add("ocxo2_servo_filtered_slope_ns_per_s", ocxo2_dac.servo_filtered_slope, 6);
   p.add("ocxo2_servo_predicted_residual_ns", ocxo2_dac.servo_predicted_residual, 6);
-  p.add("ocxo2_servo_predictor_updates", ocxo2_dac.servo_predictor_updates);
   p.add("ocxo2_servo_last_step", ocxo2_dac.servo_last_step, 6);
 
-  p.add("ocxo_dac_commit_scheduled", g_ocxo_dac_commit_scheduled);
-  p.add("ocxo_dac_last_schedule_second", g_ocxo_dac_last_schedule_second);
-  p.add("ocxo_dac_last_commit_second", g_ocxo_dac_last_commit_second);
-  p.add("ocxo_dac_last_winner", g_ocxo_dac_last_winner);
-  p.add("ocxo_dac_arbitration_passes", g_ocxo_dac_arbitration_passes);
-  p.add("ocxo_dac_no_candidate_passes", g_ocxo_dac_no_candidate_passes);
-  p.add("ocxo_dac_schedule_failures", g_ocxo_dac_schedule_failures);
-  p.add("ocxo_dac_commit_callbacks", g_ocxo_dac_commit_callbacks);
-  p.add("ocxo_dac_deferred_candidates", g_ocxo_dac_deferred_candidates);
-  p.add("ocxo_dac_retry_requests", g_ocxo_dac_retry_requests);
-  p.add("ocxo_dac_retry_successes", g_ocxo_dac_retry_successes);
-  p.add("ocxo_dac_retry_failures", g_ocxo_dac_retry_failures);
-  p.add("ocxo_dac_retry_exhausted", g_ocxo_dac_retry_exhausted);
-  p.add("ocxo_dac_retry_blocked_candidates", g_ocxo_dac_retry_blocked_candidates);
-  p.add("ocxo_dac_commit_selected", ocxo_dac_name(g_ocxo_dac_commit_selected));
-  p.add("ocxo_dac_commit_target_hw_code", (uint32_t)g_ocxo_dac_commit_target_hw_code);
-
-  p.add("ocxo1_dac_pacing_pending", ocxo1_dac.pacing_pending);
-  p.add("ocxo1_dac_pacing_pending_target", ocxo1_dac.pacing_pending_target, 6);
-  p.add("ocxo1_dac_pacing_pending_step", ocxo1_dac.pacing_pending_step, 6);
-  p.add("ocxo1_dac_pacing_pending_hw_code", ocxo1_dac.pacing_pending_hw_code);
-  p.add("ocxo1_dac_pacing_pending_age_seconds", ocxo_dac_pending_age_seconds(ocxo1_dac));
-  p.add("ocxo1_dac_pacing_last_request_second", ocxo1_dac.pacing_last_request_second);
-  p.add("ocxo1_dac_pacing_last_commit_second", ocxo1_dac.pacing_last_commit_second);
-  p.add("ocxo1_dac_pacing_intents", ocxo1_dac.pacing_intents);
-  p.add("ocxo1_dac_pacing_deferred_count", ocxo1_dac.pacing_deferred_count);
-  p.add("ocxo1_dac_pacing_commit_count", ocxo1_dac.pacing_commit_count);
-  p.add("ocxo1_dac_pacing_skip_small_delta_count", ocxo1_dac.pacing_skip_small_delta_count);
-  p.add("ocxo1_dac_retry_consecutive_failures", g_ocxo1_dac_retry.consecutive_failures);
-  p.add("ocxo1_dac_retry_requests", g_ocxo1_dac_retry.retry_requests);
-  p.add("ocxo1_dac_retry_successes", g_ocxo1_dac_retry.retry_successes);
-  p.add("ocxo1_dac_retry_failures", g_ocxo1_dac_retry.retry_failures);
-  p.add("ocxo1_dac_retry_exhausted", g_ocxo1_dac_retry.retry_exhausted);
-  p.add("ocxo1_dac_retry_not_before_second", g_ocxo1_dac_retry.retry_not_before_second);
-  p.add("ocxo1_dac_retry_last_failed_hw_code", g_ocxo1_dac_retry.last_failed_hw_code);
-  p.add("ocxo1_dac_retry_last_failed_stage", (uint32_t)g_ocxo1_dac_retry.last_failed_stage);
-
-  p.add("ocxo2_dac_pacing_pending", ocxo2_dac.pacing_pending);
-  p.add("ocxo2_dac_pacing_pending_target", ocxo2_dac.pacing_pending_target, 6);
-  p.add("ocxo2_dac_pacing_pending_step", ocxo2_dac.pacing_pending_step, 6);
-  p.add("ocxo2_dac_pacing_pending_hw_code", ocxo2_dac.pacing_pending_hw_code);
-  p.add("ocxo2_dac_pacing_pending_age_seconds", ocxo_dac_pending_age_seconds(ocxo2_dac));
-  p.add("ocxo2_dac_pacing_last_request_second", ocxo2_dac.pacing_last_request_second);
-  p.add("ocxo2_dac_pacing_last_commit_second", ocxo2_dac.pacing_last_commit_second);
-  p.add("ocxo2_dac_pacing_intents", ocxo2_dac.pacing_intents);
-  p.add("ocxo2_dac_pacing_deferred_count", ocxo2_dac.pacing_deferred_count);
-  p.add("ocxo2_dac_pacing_commit_count", ocxo2_dac.pacing_commit_count);
-  p.add("ocxo2_dac_pacing_skip_small_delta_count", ocxo2_dac.pacing_skip_small_delta_count);
-  p.add("ocxo2_dac_retry_consecutive_failures", g_ocxo2_dac_retry.consecutive_failures);
-  p.add("ocxo2_dac_retry_requests", g_ocxo2_dac_retry.retry_requests);
-  p.add("ocxo2_dac_retry_successes", g_ocxo2_dac_retry.retry_successes);
-  p.add("ocxo2_dac_retry_failures", g_ocxo2_dac_retry.retry_failures);
-  p.add("ocxo2_dac_retry_exhausted", g_ocxo2_dac_retry.retry_exhausted);
-  p.add("ocxo2_dac_retry_not_before_second", g_ocxo2_dac_retry.retry_not_before_second);
-  p.add("ocxo2_dac_retry_last_failed_hw_code", g_ocxo2_dac_retry.last_failed_hw_code);
-  p.add("ocxo2_dac_retry_last_failed_stage", (uint32_t)g_ocxo2_dac_retry.last_failed_stage);
-
-  clocks_payload_add_interrupt_diag(p, "pps_diag", g_pps_interrupt_diag);
-  clocks_payload_add_interrupt_bridge_diag(p, "pps_diag", g_pps_interrupt_diag);
-  clocks_payload_add_interrupt_extended_diag(p, "pps_diag", g_pps_interrupt_diag);
-
-  clocks_payload_add_interrupt_diag(p, "ocxo1_diag", g_ocxo1_interrupt_diag);
-  clocks_payload_add_interrupt_bridge_diag(p, "ocxo1_diag", g_ocxo1_interrupt_diag);
-  clocks_payload_add_interrupt_extended_diag(p, "ocxo1_diag", g_ocxo1_interrupt_diag);
-
-  clocks_payload_add_interrupt_diag(p, "ocxo2_diag", g_ocxo2_interrupt_diag);
-  clocks_payload_add_interrupt_bridge_diag(p, "ocxo2_diag", g_ocxo2_interrupt_diag);
-  clocks_payload_add_interrupt_extended_diag(p, "ocxo2_diag", g_ocxo2_interrupt_diag);
-
-  // Campaign-cumulative tau and ppb for all clock domains.
-  //
-  // Tau is the dimensionless rate ratio of each clock relative to GNSS.
-  // A perfect clock has tau = 1.0 and ppb = 0.
-  //
-  // These are derived from the Welford mean of per-second residuals,
-  // which measures rate directly without initial-phase-offset contamination.
-  //
-  // DWT residual is in cycles: ppb = mean_cycles / DWT_EXPECTED * 1e9
-  // OCXO residual is in ns:   ppb = mean_ns  (since 1 ppb = 1 ns/s)
-
-  if (residual_dwt.n > 0) {
-    const double dwt_ppb_val = residual_dwt.mean / (double)DWT_EXPECTED_PER_PPS * 1e9;
-    const double dwt_tau_val = 1.0 + dwt_ppb_val / 1e9;
-    p.add("dwt_tau", dwt_tau_val, 12);
-    p.add("dwt_ppb", dwt_ppb_val, 3);
-  }
-
-  if (residual_vclock.n > 0) {
-    const double vclock_ppb_val = residual_vclock.mean;
-    const double vclock_tau_val = 1.0 + vclock_ppb_val / 1e9;
-    p.add("vclock_tau", vclock_tau_val, 12);
-    p.add("vclock_ppb", vclock_ppb_val, 3);
-  }
-
+  // Compact cumulative campaign stats for OCXO rate.
   if (residual_ocxo1.n > 0) {
     const double ocxo1_ppb_val = residual_ocxo1.mean;
     const double ocxo1_tau_val = 1.0 + ocxo1_ppb_val / 1e9;
@@ -1058,60 +889,17 @@ void clocks_beta_pps(void) {
     p.add("ocxo2_ppb", ocxo2_ppb_val, 3);
   }
 
-  // ── Campaign-cumulative Welford statistics ──
-
-  p.add("dwt_welford_n", residual_dwt.n);
-  p.add("dwt_welford_mean", residual_dwt.mean, 3);
-  p.add("dwt_welford_stddev", residual_stddev(residual_dwt), 3);
-  p.add("dwt_welford_stderr", residual_stderr(residual_dwt), 3);
-  p.add("dwt_welford_min", residual_dwt.min_val, 3);
-  p.add("dwt_welford_max", residual_dwt.max_val, 3);
-
-  p.add("vclock_welford_n", residual_vclock.n);
-  p.add("vclock_welford_mean", residual_vclock.mean, 3);
-  p.add("vclock_welford_stddev", residual_stddev(residual_vclock), 3);
-  p.add("vclock_welford_stderr", residual_stderr(residual_vclock), 3);
-  p.add("vclock_welford_min", residual_vclock.min_val, 3);
-  p.add("vclock_welford_max", residual_vclock.max_val, 3);
-
   p.add("ocxo1_welford_n", residual_ocxo1.n);
   p.add("ocxo1_welford_mean", residual_ocxo1.mean, 3);
   p.add("ocxo1_welford_stddev", residual_stddev(residual_ocxo1), 3);
-  p.add("ocxo1_welford_stderr", residual_stderr(residual_ocxo1), 3);
-  p.add("ocxo1_welford_min", residual_ocxo1.min_val, 3);
-  p.add("ocxo1_welford_max", residual_ocxo1.max_val, 3);
 
   p.add("ocxo2_welford_n", residual_ocxo2.n);
   p.add("ocxo2_welford_mean", residual_ocxo2.mean, 3);
   p.add("ocxo2_welford_stddev", residual_stddev(residual_ocxo2), 3);
-  p.add("ocxo2_welford_stderr", residual_stderr(residual_ocxo2), 3);
-  p.add("ocxo2_welford_min", residual_ocxo2.min_val, 3);
-  p.add("ocxo2_welford_max", residual_ocxo2.max_val, 3);
 
-  p.add("ocxo1_dac_welford_n", dac_welford_ocxo1.n);
-  p.add("ocxo1_dac_welford_mean", dac_welford_ocxo1.mean, 6);
-  p.add("ocxo1_dac_welford_stddev", dac_welford_stddev(dac_welford_ocxo1), 6);
-  p.add("ocxo1_dac_welford_stderr", dac_welford_stderr(dac_welford_ocxo1), 6);
-  p.add("ocxo1_dac_welford_min", dac_welford_ocxo1.min_val, 6);
-  p.add("ocxo1_dac_welford_max", dac_welford_ocxo1.max_val, 6);
-
-  p.add("ocxo2_dac_welford_n", dac_welford_ocxo2.n);
-  p.add("ocxo2_dac_welford_mean", dac_welford_ocxo2.mean, 6);
-  p.add("ocxo2_dac_welford_stddev", dac_welford_stddev(dac_welford_ocxo2), 6);
-  p.add("ocxo2_dac_welford_stderr", dac_welford_stderr(dac_welford_ocxo2), 6);
-  p.add("ocxo2_dac_welford_min", dac_welford_ocxo2.min_val, 6);
-  p.add("ocxo2_dac_welford_max", dac_welford_ocxo2.max_val, 6);
-
-  const time_anchor_snapshot_t snap = time_anchor_snapshot();
-  p.add("time_anchor_ok", snap.ok);
-  p.add("time_anchor_valid", snap.valid);
-  p.add("time_anchor_pps_count", snap.pps_count);
-  p.add("time_anchor_qtimer_at_pps", snap.qtimer_at_pps);
-  p.add("time_anchor_dwt_at_pps", snap.dwt_at_pps);
-  p.add("time_anchor_dwt_cycles_per_s", snap.dwt_cycles_per_s);
-
-  p.add("last_pps_live_qtimer_read", g_last_pps_live_qtimer_read);
-  p.add("last_pps_live_qtimer_minus_geared", g_last_pps_live_qtimer_minus_geared);
+  // Rich bucket / bridge diagnostics for OCXO forensics.
+  clocks_payload_add_ocxo_diag(p, "ocxo1_diag", g_ocxo1_interrupt_diag);
+  clocks_payload_add_ocxo_diag(p, "ocxo2_diag", g_ocxo2_interrupt_diag);
 
   g_last_fragment = p;
   publish("TIMEBASE_FRAGMENT", p);
