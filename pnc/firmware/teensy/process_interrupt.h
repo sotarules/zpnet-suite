@@ -1,29 +1,25 @@
 // ============================================================================
-// process_interrupt.h — simplified interrupt normalization shell
+// process_interrupt.h — interrupt custody and edge normalization
 // ============================================================================
 //
 // process_interrupt is the sole authority for hardware interrupt custody.
 //
 // Current doctrine:
 //
-//   • PPS/DWT is sacred.
-//   • DWT captured at PPS ISR entry is the authoritative PPS-side anchor.
-//   • OCXO events are observed clocks, not consummated clocks.
-//   • No pre-spin / spin-dry occurs here.
-//   • PPS is still reported as a direct ISR-entry anchor.
-//   • OCXO one-second tempo is now derived from perpetual 1 ms cadence buckets:
-//       1000 adjacent windows per second, accumulated in DWT cycles and
-//       GNSS nanoseconds, so shared-boundary latency largely cancels in the sum.
-//   • Only the initial OCXO cadence seed is granted raw DWT authority.
-//       After that, each lawful one-second OCXO edge is synthetic:
-//       previous synthetic edge + bucketed one-second observation.
+//   • PPS remains sacrosanct as the sovereign second boundary.
+//   • The PPS↔DWT bridge is no longer treated as a one-sample oracle.
+//   • DWT bridge timing is reconstructed by rolling interval integration.
+//   • The first PPS after epoch seed is granted raw DWT authority.
+//   • After that seed, each lawful PPS-side DWT edge is synthetic:
+//       previous synthetic edge + integrated interval observation.
+//   • OCXO one-second tempo is likewise reconstructed by rolling interval
+//     integration across adjacent 1 ms cadence intervals.
 //   • Raw ISR-entry DWT/GNSS facts remain diagnostic only for OCXO lanes.
-//       They no longer re-found the next second.
-//   • TimePop owns VCLOCK scheduling and Spin-Dry for its own compare path.
+//   • TimePop owns VCLOCK scheduling for its own compare path.
 //
 // Notes:
 //   The large interrupt_capture_diag_t surface is preserved for compatibility
-//   with existing clocks/reporting code. Most legacy pre-spin fields now remain
+//   with existing clocks/reporting code. Most legacy pre-spin fields remain
 //   zeroed or false.
 //
 // ============================================================================
@@ -73,8 +69,9 @@ struct interrupt_event_t {
   interrupt_lane_t lane = interrupt_lane_t::NONE;
   interrupt_event_status_t status = interrupt_event_status_t::OK;
 
-  // PPS: first-instruction DWT capture remains the canonical PPS-side anchor.
-  // OCXO: best synthetic estimate for the lawful one-second edge.
+  // PPS: best synthetic DWT estimate at the lawful PPS boundary after the
+  //      initial raw epoch seed.
+  // OCXO: best synthetic DWT estimate for the lawful one-second edge.
   uint32_t dwt_at_event = 0;
 
   // PPS: canonical GNSS nanosecond at the PPS edge.
@@ -85,7 +82,7 @@ struct interrupt_event_t {
   // OCXO: software-extended logical 32-bit count at the lawful one-second edge.
   uint32_t counter32_at_event = 0;
 
-  // Retained for compatibility. Always zero in this simplified model.
+  // Retained for compatibility.
   uint32_t dwt_event_correction_cycles = 0;
 };
 
@@ -137,6 +134,32 @@ struct interrupt_capture_diag_t {
   uint32_t prespin_timeout_count = 0;
   uint32_t anomaly_count = 0;
 
+  // PPS↔DWT rolling interval diagnostics.
+  uint32_t dwt_interval_nominal_ns = 0;
+  uint32_t dwt_current_window_interval_count = 0;
+  uint32_t dwt_last_second_interval_count = 0;
+  uint32_t dwt_last_interval_cycles = 0;
+  int64_t  dwt_last_interval_gnss_ns = 0;
+  uint64_t dwt_current_window_cycles_sum = 0;
+  int64_t  dwt_current_window_gnss_ns_sum = 0;
+  uint64_t dwt_second_cycles_observed = 0;
+  uint64_t dwt_second_cycles_prediction = 0;
+  int64_t  dwt_second_cycles_prediction_error = 0;
+  int64_t  dwt_second_gnss_ns_observed = 0;
+  int64_t  dwt_second_gnss_ns_prediction = 0;
+  int64_t  dwt_second_gnss_ns_prediction_error = 0;
+  int64_t  dwt_second_residual_ns = 0;
+  int64_t  dwt_second_start_gnss_ns_raw = -1;
+  int64_t  dwt_second_end_gnss_ns_raw = -1;
+  uint32_t dwt_second_start_dwt_raw = 0;
+  uint32_t dwt_second_end_dwt_raw = 0;
+  int64_t  dwt_second_start_gnss_ns_final = -1;
+  int64_t  dwt_second_end_gnss_ns_final = -1;
+  uint32_t dwt_second_start_dwt_final = 0;
+  uint32_t dwt_second_end_dwt_final = 0;
+  int64_t  dwt_second_start_raw_minus_final_ns = 0;
+  int64_t  dwt_second_end_raw_minus_final_ns = 0;
+
   // OCXO lane instrumentation: compare that actually fired vs counter captured at IRQ.
   uint16_t counter16_at_irq = 0;
   uint16_t compare16_fired = 0;
@@ -144,25 +167,20 @@ struct interrupt_capture_diag_t {
   int32_t  counter16_minus_compare_ticks = 0;
   int64_t  counter16_minus_compare_ns = 0;
 
-  // OCXO 1 ms bucket integrator diagnostics.
-  uint32_t ocxo_bucket_interval_counts = 0;
-  uint32_t ocxo_current_window_bucket_count = 0;
-  uint32_t ocxo_last_second_bucket_count = 0;
-  uint32_t ocxo_last_bucket_cycles = 0;
-  int64_t  ocxo_last_bucket_gnss_ns = 0;
+  // OCXO rolling interval diagnostics.
+  uint32_t ocxo_interval_counts = 0;
+  uint32_t ocxo_current_window_interval_count = 0;
+  uint32_t ocxo_last_second_interval_count = 0;
+  uint32_t ocxo_last_interval_cycles = 0;
+  int64_t  ocxo_last_interval_gnss_ns = 0;
   uint64_t ocxo_current_window_cycles_sum = 0;
   int64_t  ocxo_current_window_gnss_ns_sum = 0;
-
-  // Canonical authoritative one-second values: synthetic/final boundary delta.
   uint64_t ocxo_second_cycles_observed = 0;
-  int64_t  ocxo_second_gnss_ns_observed = 0;
-
-  // Raw one-second values retained for diagnostics only.
   uint64_t ocxo_second_cycles_observed_raw = 0;
-  int64_t  ocxo_second_gnss_ns_observed_raw = 0;
-
   uint64_t ocxo_second_cycles_prediction = 0;
   int64_t  ocxo_second_cycles_prediction_error = 0;
+  int64_t  ocxo_second_gnss_ns_observed = 0;
+  int64_t  ocxo_second_gnss_ns_observed_raw = 0;
   int64_t  ocxo_second_gnss_ns_prediction = 0;
   int64_t  ocxo_second_gnss_ns_prediction_error = 0;
   int64_t  ocxo_second_residual_ns = 0;
@@ -170,15 +188,10 @@ struct interrupt_capture_diag_t {
   int64_t  ocxo_second_end_gnss_ns_raw = -1;
   uint32_t ocxo_second_start_dwt_raw = 0;
   uint32_t ocxo_second_end_dwt_raw = 0;
-
-  // Synthetic one-second ledger carried forward perpetually from the prior
-  // synthetic edge, rather than re-founded from the latest raw ISR sample.
   int64_t  ocxo_second_start_gnss_ns_final = -1;
   int64_t  ocxo_second_end_gnss_ns_final = -1;
   uint32_t ocxo_second_start_dwt_final = 0;
   uint32_t ocxo_second_end_dwt_final = 0;
-
-  // Raw-minus-synthetic forensic deltas at the second boundaries.
   int64_t  ocxo_second_start_raw_minus_final_ns = 0;
   int64_t  ocxo_second_end_raw_minus_final_ns = 0;
 };

@@ -62,10 +62,11 @@
 // Constants
 // ============================================================================
 
+static constexpr uint64_t NS_PER_SECOND_U64    = 1000000000ULL;
 static constexpr uint64_t PPS_RELAY_OFF_NS     = 500000000ULL;
 static constexpr uint64_t DWT_ADJUST_TIMER_NS  = 100000ULL; // 10 kHz
+static constexpr uint32_t DWT_INTERVALS_PER_SECOND = (uint32_t)(NS_PER_SECOND_U64 / DWT_ADJUST_TIMER_NS);
 static constexpr int64_t  DWT_ADJUST_THRESHOLD_NS = 2LL;
-static constexpr uint64_t NS_PER_SECOND_U64    = 1000000000ULL;
 
 // ============================================================================
 // Always-on state
@@ -76,6 +77,9 @@ volatile uint64_t g_gnss_ns_count_at_pps = 0;
 volatile uint32_t g_dwt_cycle_count_at_pps = 0;
 volatile uint64_t g_dwt_cycle_count_total = 0;
 volatile uint32_t g_dwt_cycle_count_between_pps = 0;
+volatile uint32_t g_dwt_cycle_count_between_pps_raw = 0;
+volatile int32_t  g_dwt_cycle_count_between_pps_raw_minus_final = 0;
+volatile uint32_t g_dwt_interval_count_last_second = 0;
 volatile uint32_t g_dwt_cycle_count_last_second_prediction = DWT_EXPECTED_PER_PPS;
 volatile uint32_t g_dwt_cycle_count_next_second_prediction = DWT_EXPECTED_PER_PPS;
 volatile int32_t  g_dwt_cycle_count_next_second_adjustment = 0;
@@ -138,6 +142,18 @@ static volatile uint32_t g_epoch_qtimer_at_pps = 0;
 
 // Canonical PPS count within current epoch (0 at epoch PPS, then 1, 2, 3...).
 static volatile uint64_t g_epoch_pps_index = 0;
+
+
+// ============================================================================
+// DWT rolling interval integration state
+// ============================================================================
+
+static volatile bool     g_dwt_interval_window_valid = false;
+static volatile uint32_t g_dwt_current_interval_count = 0;
+static volatile uint32_t g_dwt_previous_interval_dwt = 0;
+static volatile uint64_t g_dwt_previous_interval_gnss_ns = 0;
+static volatile uint64_t g_dwt_current_interval_cycles_sum = 0;
+static volatile uint32_t g_dwt_last_interval_cycles = 0;
 
 // ============================================================================
 // DAC state
@@ -313,11 +329,20 @@ static void alpha_reset_canonical_clock_state_for_new_epoch(void) {
   g_dwt_cycle_count_at_pps = 0;
   g_dwt_cycle_count_total = 0;
   g_dwt_cycle_count_between_pps = 0;
+  g_dwt_cycle_count_between_pps_raw = 0;
+  g_dwt_cycle_count_between_pps_raw_minus_final = 0;
+  g_dwt_interval_count_last_second = 0;
   g_dwt_cycle_count_last_second_prediction = DWT_EXPECTED_PER_PPS;
   g_dwt_cycle_count_next_second_prediction = DWT_EXPECTED_PER_PPS;
   g_dwt_cycle_count_next_second_adjustment = 0;
   g_dwt_model_pps_count = 0;
   g_qtimer_at_pps = 0;
+  g_dwt_interval_window_valid = false;
+  g_dwt_current_interval_count = 0;
+  g_dwt_previous_interval_dwt = 0;
+  g_dwt_previous_interval_gnss_ns = 0;
+  g_dwt_current_interval_cycles_sum = 0;
+  g_dwt_last_interval_cycles = 0;
   g_vclock_clock = {};
   g_vclock_measurement = {};
 
@@ -389,6 +414,25 @@ static void dwt_adjustment_timer_callback(timepop_ctx_t* ctx, timepop_diag_t*, v
   const uint32_t current_dwt = DWT_CYCCNT;
   const uint64_t elapsed_gnss_ns = ctx->fire_gnss_ns - g_gnss_ns_count_at_pps;
   if (elapsed_gnss_ns == 0) return;
+
+  const int64_t previous_interval_gnss_ns =
+    (int64_t)g_dwt_previous_interval_gnss_ns;
+
+  if (!g_dwt_interval_window_valid) {
+    g_dwt_interval_window_valid = true;
+    g_dwt_current_interval_count = 0;
+    g_dwt_previous_interval_dwt = current_dwt;
+    g_dwt_previous_interval_gnss_ns = ctx->fire_gnss_ns;
+    g_dwt_current_interval_cycles_sum = 0;
+    g_dwt_last_interval_cycles = 0;
+  } else if (previous_interval_gnss_ns >= 0 && ctx->fire_gnss_ns > previous_interval_gnss_ns) {
+    const uint32_t interval_cycles = current_dwt - g_dwt_previous_interval_dwt;
+    g_dwt_last_interval_cycles = interval_cycles;
+    g_dwt_current_interval_cycles_sum += (uint64_t)interval_cycles;
+    g_dwt_current_interval_count++;
+    g_dwt_previous_interval_dwt = current_dwt;
+    g_dwt_previous_interval_gnss_ns = ctx->fire_gnss_ns;
+  }
 
   const int64_t effective =
       (int64_t)g_dwt_cycle_count_next_second_prediction +
@@ -486,17 +530,37 @@ static void pps_callback(
   g_last_pps_live_qtimer_minus_geared = (int32_t)(live_qtimer_now - expected_qtimer_at_pps);
 
   {
-    const uint32_t delta32 = event.dwt_at_event - prev_dwt_pps;
-    g_dwt_cycle_count_total += (uint64_t)delta32;
-    g_dwt_cycle_count_between_pps = delta32;
+    const uint32_t delta32_raw = event.dwt_at_event - prev_dwt_pps;
+
+    uint32_t delta32_final = delta32_raw;
+    uint32_t interval_count_final = 0;
+
+    if (g_dwt_interval_window_valid && g_dwt_previous_interval_gnss_ns <= g_gnss_ns_count_at_pps) {
+      const uint32_t tail_cycles = event.dwt_at_event - g_dwt_previous_interval_dwt;
+      delta32_final = (uint32_t)(g_dwt_current_interval_cycles_sum + (uint64_t)tail_cycles);
+      interval_count_final = g_dwt_current_interval_count + 1U;
+      g_dwt_last_interval_cycles = tail_cycles;
+    }
+
+    g_dwt_cycle_count_total += (uint64_t)delta32_final;
+    g_dwt_cycle_count_between_pps_raw = delta32_raw;
+    g_dwt_cycle_count_between_pps = delta32_final;
+    g_dwt_cycle_count_between_pps_raw_minus_final =
+        (int32_t)((int64_t)delta32_raw - (int64_t)delta32_final);
+    g_dwt_interval_count_last_second = interval_count_final;
     g_dwt_cycle_count_last_second_prediction = g_dwt_cycle_count_next_second_prediction;
 
     if (g_dwt_model_pps_count > 0) {
-      g_dwt_cycle_count_next_second_prediction = delta32;
+      g_dwt_cycle_count_next_second_prediction = delta32_final;
     }
   }
 
   prev_dwt_pps = event.dwt_at_event;
+  g_dwt_interval_window_valid = true;
+  g_dwt_current_interval_count = 0;
+  g_dwt_previous_interval_dwt = event.dwt_at_event;
+  g_dwt_previous_interval_gnss_ns = g_gnss_ns_count_at_pps;
+  g_dwt_current_interval_cycles_sum = 0;
   g_dwt_cycle_count_next_second_adjustment = 0;
   g_dwt_model_pps_count++;
 

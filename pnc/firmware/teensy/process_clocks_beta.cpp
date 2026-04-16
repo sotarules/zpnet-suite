@@ -24,6 +24,9 @@
 #include <stdlib.h>
 #include <climits>
 
+extern volatile uint32_t g_dwt_cycle_count_between_pps_raw;
+extern volatile int32_t  g_dwt_cycle_count_between_pps_raw_minus_final;
+extern volatile uint32_t g_dwt_interval_count_last_second;
 extern volatile uint32_t g_dwt_cycle_count_last_second_prediction;
 
 // ============================================================================
@@ -184,11 +187,11 @@ static void clocks_payload_add_ocxo_diag(Payload& p,
   add_i64("counter16_minus_compare_ticks", diag.counter16_minus_compare_ticks);
   add_i64("counter16_minus_compare_ns", diag.counter16_minus_compare_ns);
 
-  add_u32("ocxo_bucket_interval_counts", diag.ocxo_bucket_interval_counts);
-  add_u32("ocxo_current_window_bucket_count", diag.ocxo_current_window_bucket_count);
-  add_u32("ocxo_last_second_bucket_count", diag.ocxo_last_second_bucket_count);
-  add_u32("ocxo_last_bucket_cycles", diag.ocxo_last_bucket_cycles);
-  add_i64("ocxo_last_bucket_gnss_ns", diag.ocxo_last_bucket_gnss_ns);
+  add_u32("ocxo_interval_counts", diag.ocxo_interval_counts);
+  add_u32("ocxo_current_window_interval_count", diag.ocxo_current_window_interval_count);
+  add_u32("ocxo_last_second_interval_count", diag.ocxo_last_second_interval_count);
+  add_u32("ocxo_last_interval_cycles", diag.ocxo_last_interval_cycles);
+  add_i64("ocxo_last_interval_gnss_ns", diag.ocxo_last_interval_gnss_ns);
   add_u64("ocxo_current_window_cycles_sum", diag.ocxo_current_window_cycles_sum);
   add_i64("ocxo_current_window_gnss_ns_sum", diag.ocxo_current_window_gnss_ns_sum);
   add_u64("ocxo_second_cycles_observed", diag.ocxo_second_cycles_observed);
@@ -843,6 +846,9 @@ void clocks_beta_pps(void) {
   // DWT raw second truth surface.
   p.add("dwt_cycle_count_at_pps", g_dwt_cycle_count_at_pps);
   p.add("dwt_cycle_count_between_pps", g_dwt_cycle_count_between_pps);
+  p.add("dwt_cycle_count_between_pps_raw", g_dwt_cycle_count_between_pps_raw);
+  p.add("dwt_cycle_count_between_pps_raw_minus_final", g_dwt_cycle_count_between_pps_raw_minus_final);
+  p.add("dwt_interval_count_last_second", g_dwt_interval_count_last_second);
   p.add("dwt_cycle_count_last_second_prediction", g_dwt_cycle_count_last_second_prediction);
   p.add("dwt_cycle_count_next_second_prediction", g_dwt_cycle_count_next_second_prediction);
   p.add("dwt_cycle_count_next_second_adjustment", g_dwt_cycle_count_next_second_adjustment);
