@@ -11,11 +11,14 @@
 //   • OCXO events are observed clocks, not consummated clocks.
 //   • No pre-spin / spin-dry occurs here.
 //   • PPS is still reported as a direct ISR-entry anchor.
-//   • OCXO one-second tempo is now derived from 1 ms cadence buckets:
+//   • OCXO one-second tempo is now derived from perpetual 1 ms cadence buckets:
 //       1000 adjacent windows per second, accumulated in DWT cycles and
-//       GNSS nanoseconds, so boundary latency largely cancels in the sum.
-//   • process_interrupt captures raw ISR-entry DWT, preserves raw edge facts,
-//     and also exposes the bucket-integrated one-second estimate to subscribers.
+//       GNSS nanoseconds, so shared-boundary latency largely cancels in the sum.
+//   • Only the initial OCXO cadence seed is granted raw DWT authority.
+//       After that, each lawful one-second OCXO edge is synthetic:
+//       previous synthetic edge + bucketed one-second observation.
+//   • Raw ISR-entry DWT/GNSS facts remain diagnostic only for OCXO lanes.
+//       They no longer re-found the next second.
 //   • TimePop owns VCLOCK scheduling and Spin-Dry for its own compare path.
 //
 // Notes:
@@ -70,11 +73,12 @@ struct interrupt_event_t {
   interrupt_lane_t lane = interrupt_lane_t::NONE;
   interrupt_event_status_t status = interrupt_event_status_t::OK;
 
-  // First-instruction DWT capture for the ISR. For PPS this is the canonical
-  // PPS-side anchor by fiat. For OCXO lanes this is the observed one-second edge.
+  // PPS: first-instruction DWT capture remains the canonical PPS-side anchor.
+  // OCXO: best synthetic estimate for the lawful one-second edge.
   uint32_t dwt_at_event = 0;
 
-  // GNSS nanosecond corresponding to dwt_at_event via the DWT↔GNSS bridge.
+  // PPS: canonical GNSS nanosecond at the PPS edge.
+  // OCXO: best synthetic GNSS nanosecond at the lawful one-second edge.
   uint64_t gnss_ns_at_event = 0;
 
   // PPS: raw 32-bit QTimer1 VCLOCK at edge.
@@ -159,6 +163,17 @@ struct interrupt_capture_diag_t {
   int64_t  ocxo_second_end_gnss_ns_raw = -1;
   uint32_t ocxo_second_start_dwt_raw = 0;
   uint32_t ocxo_second_end_dwt_raw = 0;
+
+  // Synthetic one-second ledger carried forward perpetually from the prior
+  // synthetic edge, rather than re-founded from the latest raw ISR sample.
+  int64_t  ocxo_second_start_gnss_ns_final = -1;
+  int64_t  ocxo_second_end_gnss_ns_final = -1;
+  uint32_t ocxo_second_start_dwt_final = 0;
+  uint32_t ocxo_second_end_dwt_final = 0;
+
+  // Raw-minus-synthetic forensic deltas at the second boundaries.
+  int64_t  ocxo_second_start_raw_minus_final_ns = 0;
+  int64_t  ocxo_second_end_raw_minus_final_ns = 0;
 };
 
 using interrupt_subscriber_event_fn =

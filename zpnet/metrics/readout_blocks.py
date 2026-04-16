@@ -14,7 +14,7 @@ Column layout (DAC rows):
   NAME   DAC_VALUE VOLTAGE   (blanks)   MEAN   SD   N   BASE   NOW   DELTA
 
 Column layout (INT rows):
-  NAME   APPROACH   SH→ISR   CORR   DWT_EDGE   GNSS_NS_EDGE   COUNTER   ARM   OK   TO   AN
+  NAME   START_GNSS_NS   END_GNSS_NS   DELTA_NS
 """
 
 from zpnet.processes.processes import send_command
@@ -22,12 +22,10 @@ from zpnet.processes.processes import send_command
 DWT_EXPECTED_PER_PPS = 1_008_000_000
 VREF = 3.002
 
-# Persist last-seen edge timestamps so the readout can show a start→end
-# interval for PPS / OCXO1 / OCXO2 without requiring upstream code changes.
+# Persist last-seen PPS edge so the readout can show a start→end
+# interval for PPS without upstream state.
 _PREV_EDGE_NS = {
     "pps": None,
-    "ocxo1": None,
-    "ocxo2": None,
 }
 
 
@@ -94,6 +92,14 @@ def _frag(r: dict, key: str, default=None):
     return val if val is not None else default
 
 
+def _frag_first(r: dict, *keys, default=None):
+    for key in keys:
+        val = _frag(r, key, None)
+        if val is not None:
+            return val
+    return default
+
+
 def _extra(r: dict, key: str, default=None):
     ec = r.get("extra_clocks")
     if isinstance(ec, dict):
@@ -119,6 +125,10 @@ def _to_int(v):
         return int(v)
     except Exception:
         return None
+
+
+def _has_any(r: dict, *keys) -> bool:
+    return any(_frag(r, k, None) is not None for k in keys)
 
 
 # ---------------------------------------------------------------------
@@ -284,34 +294,43 @@ def clocks_combined_readout() -> list[str]:
     )
 
     # ── DWT ──
-    dwt_total = _to_int(_frag(r, "dwt_cycle_count_total"))
-    dwt_tau = _to_float(_frag(r, "dwt_tau"))
-    dwt_ppb = _to_float(_frag(r, "dwt_ppb"))
-    dwt_raw = _to_int(_frag(r, "dwt_cycle_count_between_pps"))
-    dwt_res = dwt_raw - DWT_EXPECTED_PER_PPS if dwt_raw is not None else None
-    dwt_mean = _to_float(_frag(r, "dwt_welford_mean"))
-    dwt_sd = _to_float(_frag(r, "dwt_welford_stddev"))
-    dwt_n = _to_int(_frag(r, "dwt_welford_n"))
-    lines.append(
-        f"{'DWT':<{W_NAME}}"
-        f"{_comma_int(dwt_total, W_VALUE)}"
-        f"{_fmt(dwt_tau, f'>{W_TAU}.12f', W_TAU)}"
-        f"{_fmt(dwt_ppb, f'>{W_PPB}.3f', W_PPB)}"
-        f"{_comma_int(dwt_raw, W_RAW)}"
-        f"{_sign_int(dwt_res, W_RES)}"
-        f"{_fmt(dwt_mean, f'>{W_MEAN}.3f', W_MEAN)}"
-        f"{_fmt(dwt_sd, f'>{W_SD}.3f', W_SD)}"
-        f"{_fmt(dwt_n, f'>{W_N}d', W_N)}"
-        f"  {_baseline_comp(baseline_ppb.get('dwt'), dwt_ppb)}"
+    dwt_present = _has_any(
+        r,
+        "dwt_cycle_count_total",
+        "dwt_tau",
+        "dwt_ppb",
+        "dwt_cycle_count_between_pps",
+        "dwt_welford_mean",
     )
+    if dwt_present:
+        dwt_total = _to_int(_frag(r, "dwt_cycle_count_total"))
+        dwt_tau = _to_float(_frag(r, "dwt_tau"))
+        dwt_ppb = _to_float(_frag(r, "dwt_ppb"))
+        dwt_raw = _to_int(_frag(r, "dwt_cycle_count_between_pps"))
+        dwt_res = dwt_raw - DWT_EXPECTED_PER_PPS if dwt_raw is not None else None
+        dwt_mean = _to_float(_frag(r, "dwt_welford_mean"))
+        dwt_sd = _to_float(_frag(r, "dwt_welford_stddev"))
+        dwt_n = _to_int(_frag(r, "dwt_welford_n"))
+        lines.append(
+            f"{'DWT':<{W_NAME}}"
+            f"{_comma_int(dwt_total, W_VALUE)}"
+            f"{_fmt(dwt_tau, f'>{W_TAU}.12f', W_TAU)}"
+            f"{_fmt(dwt_ppb, f'>{W_PPB}.3f', W_PPB)}"
+            f"{_comma_int(dwt_raw, W_RAW)}"
+            f"{_sign_int(dwt_res, W_RES)}"
+            f"{_fmt(dwt_mean, f'>{W_MEAN}.3f', W_MEAN)}"
+            f"{_fmt(dwt_sd, f'>{W_SD}.3f', W_SD)}"
+            f"{_fmt(dwt_n, f'>{W_N}d', W_N)}"
+            f"  {_baseline_comp(baseline_ppb.get('dwt'), dwt_ppb)}"
+        )
 
     # ── OCXO1, OCXO2 ──
     for name, key in [("OCXO1", "ocxo1"), ("OCXO2", "ocxo2")]:
-        ocxo_ns = _to_int(_frag(r, f"{key}_ns"))
+        ocxo_ns = _to_int(_frag_first(r, f"{key}_ns_count_at_pps", f"{key}_ns"))
         tau = _to_float(_frag(r, f"{key}_tau"))
         ppb = _to_float(_frag(r, f"{key}_ppb"))
         raw = _to_int(_frag(r, f"{key}_gnss_ns_between_edges"))
-        res = _to_int(_frag(r, f"{key}_second_residual_ns"))
+        res = _to_int(_frag_first(r, f"{key}_diag_ocxo_second_residual_ns", f"{key}_second_residual_ns"))
         mean = _to_float(_frag(r, f"{key}_welford_mean"))
         sd = _to_float(_frag(r, f"{key}_welford_stddev"))
         wn = _to_int(_frag(r, f"{key}_welford_n"))
@@ -328,19 +347,18 @@ def clocks_combined_readout() -> list[str]:
             f"  {_baseline_comp(baseline_ppb.get(key), ppb)}"
         )
 
-    # ── DAC Welford ──
-    baseline_dac_mean = baseline.get("baseline_dac_mean", {}) if baseline else {}
+    # ── DAC detail ──
     lines.append("")
     lines.append(
-        f"{'DAC':<{W_NAME}}"
+        f"{'DAC':<6}"
         f"{'':>{W_VALUE}}"
         f"{'':>{W_TAU}}"
         f"{'':>{W_PPB}}"
         f"{'':>{W_RAW}}"
         f"{'':>{W_RES}}"
-        f"{'MEAN':>{W_MEAN}}"
-        f"{'SD':>{W_SD}}"
-        f"{'N':>{W_N}}"
+        f"{'':>{W_MEAN}}"
+        f"{'':>{W_SD}}"
+        f"{'':>{W_N}}"
         f"  "
         f"{'BASE':>{W_BASE}}"
         f"{'NOW':>{W_NOW}}"
@@ -353,29 +371,27 @@ def clocks_combined_readout() -> list[str]:
             dac_label = f"{dac_now:>.3f} {dac_volts:.5f}V"
         else:
             dac_label = "---"
-        dac_mean = _to_float(_frag(r, f"{key}_dac_welford_mean"))
-        dac_sd = _to_float(_frag(r, f"{key}_dac_welford_stddev"))
-        dac_n = _to_int(_frag(r, f"{key}_dac_welford_n"))
-        base_dac = baseline_dac_mean.get(key)
-        now_dac = dac_mean if dac_mean is not None else dac_now
+
+        # The curtailed payload may omit DAC Welford detail. Use the live DAC as NOW.
+        base_dac = None
+        if baseline:
+            base_dac = baseline.get("baseline_dac_mean", {}).get(key)
+        now_dac = dac_now
+
         lines.append(
-            f"{name:<{W_NAME}}"
+            f"{name:<6}"
             f"{dac_label:>{W_VALUE}}"
             f"{'':>{W_TAU}}"
             f"{'':>{W_PPB}}"
             f"{'':>{W_RAW}}"
             f"{'':>{W_RES}}"
-            f"{_fmt(dac_mean, f'>{W_MEAN}.3f', W_MEAN)}"
-            f"{_fmt(dac_sd, f'>{W_SD}.3f', W_SD)}"
-            f"{_fmt(dac_n, f'>{W_N}d', W_N)}"
+            f"{'---':>{W_MEAN}}"
+            f"{'---':>{W_SD}}"
+            f"{'---':>{W_N}}"
             f"  {_baseline_comp(base_dac, now_dac)}"
         )
 
     # ── Interrupt edge intervals ──
-    #
-    # Pre-spin is gone, so for now the useful facts are simply the prior and
-    # current GNSS edge timestamps for PPS / OCXO1 / OCXO2.
-    #
     lines.append("")
     lines.append(
         f"{'INT':<6}"
@@ -384,28 +400,32 @@ def clocks_combined_readout() -> list[str]:
         f"{'DELTA_NS':>14}"
     )
 
-    int_clocks = [
-        ("PPS",   "pps",   "pps_diag_gnss_ns_at_event"),
-        ("OCXO1", "ocxo1", "ocxo1_diag_gnss_ns_at_event"),
-        ("OCXO2", "ocxo2", "ocxo2_diag_gnss_ns_at_event"),
-    ]
+    # PPS: use the final PPS event GNSS and a persisted previous edge.
+    pps_end = _to_int(_frag_first(r, "pps_diag_gnss_ns_at_event_final", "pps_diag_gnss_ns_at_event"))
+    pps_start = _PREV_EDGE_NS.get("pps")
+    pps_delta = None
+    if pps_start is not None and pps_end is not None:
+        pps_delta = pps_end - pps_start
+    lines.append(
+        f"{'PPS':<6}"
+        f"{_comma_int(pps_start, 22)}"
+        f"{_comma_int(pps_end, 22)}"
+        f"{_comma_int(pps_delta, 14)}"
+    )
+    if pps_end is not None:
+        _PREV_EDGE_NS["pps"] = pps_end
 
-    for name, state_key, field in int_clocks:
-        end_edge = _to_int(_frag(r, field))
-        start_edge = _PREV_EDGE_NS.get(state_key)
-        delta_edge = None
-        if start_edge is not None and end_edge is not None:
-            delta_edge = end_edge - start_edge
-
+    # OCXO1/OCXO2: use the canonical bucket start/end/delta fields.
+    for name, key in [("OCXO1", "ocxo1"), ("OCXO2", "ocxo2")]:
+        start_edge = _to_int(_frag(r, f"{key}_diag_ocxo_second_start_gnss_ns_raw"))
+        end_edge = _to_int(_frag(r, f"{key}_diag_ocxo_second_end_gnss_ns_raw"))
+        delta_edge = _to_int(_frag_first(r, f"{key}_diag_ocxo_second_gnss_ns_observed", f"{key}_gnss_ns_between_edges"))
         lines.append(
             f"{name:<6}"
             f"{_comma_int(start_edge, 22)}"
             f"{_comma_int(end_edge, 22)}"
             f"{_comma_int(delta_edge, 14)}"
         )
-
-        if end_edge is not None:
-            _PREV_EDGE_NS[state_key] = end_edge
 
     lines.append("")
 
@@ -421,18 +441,17 @@ def clocks_combined_readout() -> list[str]:
             f"{'PPS_NS':>16}"
         )
         for name, key in [("OCXO1", "ocxo1"), ("OCXO2", "ocxo2")]:
-            residual = _frag(r, f"{key}_second_residual_ns")
-            edge_gnss_ns = _frag(r, f"{key}_gnss_ns_at_edge")
-            dac_now = _frag(r, f"{key}_dac")
-            pps_ns = _frag(r, f"{key}_ns_count_at_pps")
-            dac_now_f = float(dac_now) if dac_now is not None else None
-            v_now = (dac_now_f * VREF / 65535.0) if dac_now_f is not None else None
+            residual = _to_int(_frag_first(r, f"{key}_diag_ocxo_second_residual_ns", f"{key}_second_residual_ns"))
+            edge_gnss_ns = _to_int(_frag_first(r, f"{key}_diag_gnss_ns_at_event_final", f"{key}_gnss_ns_at_edge"))
+            dac_now = _to_float(_frag(r, f"{key}_dac"))
+            pps_ns = _to_int(_frag_first(r, f"{key}_ns_count_at_pps", f"{key}_ns"))
+            v_now = (dac_now * VREF / 65535.0) if dac_now is not None else None
             lines.append(
                 f"{name:<6}"
                 f"{_sign_int(residual, 12)}"
                 f"{_comma_int(edge_gnss_ns, 20)}"
                 f"  "
-                f"{_fmt(dac_now_f, '>10.3f', 10)}"
+                f"{_fmt(dac_now, '>10.3f', 10)}"
                 f"{_fmt(v_now, '>10.5f', 10)}"
                 f"{_comma_int(pps_ns, 16)}"
             )
@@ -450,20 +469,21 @@ def clocks_combined_readout() -> list[str]:
     dwt_cyccnt_at_pps = _frag(r, "dwt_cycle_count_at_pps")
     dwt_cycles_64 = _frag(r, "dwt_cycle_count_total")
     gnss_ns_64 = _frag(r, "gnss_ns")
-    dwt_label_w = 12
-    dwt_num_w = 20
-    lines.append(
-        f"DWT   "
-        f"{'PREDICTED:':>{dwt_label_w}} {_comma_int(dwt_pred, dwt_num_w)}"
-        f"    {'ACTUAL:':<{dwt_label_w}} {_comma_int(dwt_actual, dwt_num_w)}"
-        f"    {'CYCCNT@PPS:':>11} {_comma_int(dwt_cyccnt_at_pps, 14)}"
-    )
-    lines.append(
-        f"      "
-        f"{'DWT_CYCLES:':>{dwt_label_w}} {_comma_int(dwt_cycles_64, dwt_num_w)}"
-        f"    {'GNSS_NS:':<{dwt_label_w}} {_comma_int(gnss_ns_64, dwt_num_w)}"
-    )
-    lines.append("")
+    if any(v is not None for v in [dwt_pred, dwt_actual, dwt_cyccnt_at_pps, dwt_cycles_64]):
+        dwt_label_w = 12
+        dwt_num_w = 20
+        lines.append(
+            f"DWT   "
+            f"{'PREDICTED:':>{dwt_label_w}} {_comma_int(dwt_pred, dwt_num_w)}"
+            f"    {'ACTUAL:':<{dwt_label_w}} {_comma_int(dwt_actual, dwt_num_w)}"
+            f"    {'CYCCNT@PPS:':>11} {_comma_int(dwt_cyccnt_at_pps, 14)}"
+        )
+        lines.append(
+            f"      "
+            f"{'DWT_CYCLES:':>{dwt_label_w}} {_comma_int(dwt_cycles_64, dwt_num_w)}"
+            f"    {'GNSS_NS:':<{dwt_label_w}} {_comma_int(gnss_ns_64, dwt_num_w)}"
+        )
+        lines.append("")
 
     # ── GNSS status ──
     try:
@@ -532,36 +552,6 @@ def clocks_combined_readout() -> list[str]:
         env_parts.append(f"TEENSY: {teensy_temp:.1f}°C")
     lines.append("ENV   " + "  ".join(env_parts))
     lines.append("")
-
-    # ── Power ──
-    power = snapshot.get("power", {})
-    def _find_rail(label_match: str):
-        for bus_key, devices in power.items():
-            if not bus_key.startswith("i2c-"):
-                continue
-            if isinstance(devices, dict):
-                for rail in devices.values():
-                    if isinstance(rail, dict) and label_match.lower() in rail.get("label", "").lower():
-                        return rail
-        return None
-
-    power_rails = [
-        ("PI DOMAIN", _find_rail("pi domain")),
-        ("TEENSY DOMAIN", _find_rail("teensy")),
-        ("OCXO1 DOMAIN", _find_rail("ocxo1")),
-        ("OCXO2 DOMAIN", _find_rail("ocxo2")),
-    ]
-    lines.append(f"{'POWER':<18}{'V':>10}{'MA':>10}{'W':>10}")
-    for label, rail in power_rails:
-        if rail:
-            lines.append(
-                f"{label:<18}"
-                f"{rail['volts']:>10.3f}"
-                f"{rail['amps']:>10.1f}"
-                f"{rail['watts']:>10.3f}"
-            )
-        else:
-            lines.append(f"{label:<18}{'---':>10}{'---':>10}{'---':>10}")
 
     return lines
 

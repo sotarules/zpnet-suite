@@ -8,9 +8,10 @@
 // forward lawful event facts to subscribers.
 //
 // OCXO QTimer3 channels remain 16-bit cadence lanes, but one-second OCXO
-// tempo is now estimated from 1000 adjacent 1 ms cadence buckets. The
-// one-second observation is formed from the start/end bucket edges, so the
-// interior interrupt latency largely cancels instead of being second-guessed.
+// tempo is now estimated from perpetual 1000×1 ms cadence buckets.  The
+// one-second observation is formed from adjacent bucket intervals, and each
+// lawful OCXO second edge after the initial seed is carried forward
+// synthetically from the prior synthetic edge plus the observed one-second sum.
 //
 // ============================================================================
 
@@ -43,6 +44,11 @@ static constexpr int64_t  OCXO_PREDICTION_TOLERANCE_NS = 5000LL;
 
 static_assert((OCXO_BUCKETS_PER_SECOND * OCXO_BUCKET_COUNTS) == OCXO_COUNTS_PER_SECOND,
               "Unexpected OCXO bucket decomposition");
+
+static inline uint32_t ns_to_dwt_cycles_runtime(uint64_t ns) {
+  const uint32_t f = F_CPU_ACTUAL ? F_CPU_ACTUAL : 1008000000U;
+  return (uint32_t)(((uint64_t)f * ns + 500000000ULL) / 1000000000ULL);
+}
 
 // ============================================================================
 // Pin assignments
@@ -104,10 +110,19 @@ struct qtimer16_ocxo_runtime_t {
   // 1 ms bucket integrator state.
   bool     second_window_valid = false;
   uint32_t current_window_bucket_count = 0;
+
+  // Continuous raw cadence chain used to measure adjacent 1 ms intervals.
   uint32_t previous_bucket_dwt = 0;
   int64_t  previous_bucket_gnss_ns = -1;
+
+  // Raw first bucket delimiter of the current one-second accumulation window.
   uint32_t second_start_dwt_raw = 0;
   int64_t  second_start_gnss_ns_raw = -1;
+
+  // Synthetic lawful beginning of the current one-second OCXO window.
+  uint32_t second_start_dwt_final = 0;
+  int64_t  second_start_gnss_ns_final = -1;
+
   uint64_t current_window_cycles_sum = 0;
   int64_t  current_window_gnss_ns_sum = 0;
   uint32_t last_bucket_cycles = 0;
@@ -127,12 +142,21 @@ struct qtimer16_ocxo_runtime_t {
   int64_t  last_second_start_gnss_ns_raw = -1;
   int64_t  last_second_end_gnss_ns_raw = -1;
 
+  uint32_t last_second_start_dwt_final = 0;
+  uint32_t last_second_end_dwt_final = 0;
+  int64_t  last_second_start_gnss_ns_final = -1;
+  int64_t  last_second_end_gnss_ns_final = -1;
+  int64_t  last_second_start_raw_minus_final_ns = 0;
+  int64_t  last_second_end_raw_minus_final_ns = 0;
+
   // Rolling next-second prediction ("last is best").
   bool     next_second_prediction_valid = false;
   uint64_t next_second_cycles_prediction = 0;
   int64_t  next_second_gnss_ns_prediction = 0;
 
-  // Raw observed end edge vs inferred end edge carried forward by the integrator.
+  // Raw observed second-end edge vs synthetic lawful second-end edge.
+  // Raw = ISR-entry sample. Final = best estimate of the actual compare edge
+  // after cadence-latency correction and perpetual bucket carry-forward.
   uint32_t last_event_dwt_raw = 0;
   uint32_t last_event_dwt_final = 0;
   int64_t  last_event_gnss_ns_raw = -1;
@@ -317,6 +341,8 @@ static void qtimer16_ocxo_arm_bootstrap(qtimer16_ocxo_runtime_t& clock) {
   clock.previous_bucket_gnss_ns = -1;
   clock.second_start_dwt_raw = 0;
   clock.second_start_gnss_ns_raw = -1;
+  clock.second_start_dwt_final = 0;
+  clock.second_start_gnss_ns_final = -1;
   clock.current_window_cycles_sum = 0;
   clock.current_window_gnss_ns_sum = 0;
   clock.last_bucket_cycles = 0;
@@ -391,6 +417,10 @@ static void fill_diag_common(interrupt_subscriber_runtime_t& rt,
   diag.dwt_at_event_adjusted = event.dwt_at_event;
   diag.counter32_at_event = event.counter32_at_event;
   diag.dwt_event_correction_cycles = 0;
+  diag.event_target_gnss_ns =
+      (ocxo_clock && ocxo_clock->last_event_target_gnss_ns >= 0)
+          ? (uint64_t)ocxo_clock->last_event_target_gnss_ns
+          : event.gnss_ns_at_event;
 
   diag.gnss_ns_at_event_raw =
       (ocxo_clock && ocxo_clock->last_event_gnss_ns_raw >= 0)
@@ -451,6 +481,12 @@ static void fill_diag_common(interrupt_subscriber_runtime_t& rt,
     diag.ocxo_second_end_gnss_ns_raw = ocxo_clock->last_second_end_gnss_ns_raw;
     diag.ocxo_second_start_dwt_raw = ocxo_clock->last_second_start_dwt_raw;
     diag.ocxo_second_end_dwt_raw = ocxo_clock->last_second_end_dwt_raw;
+    diag.ocxo_second_start_gnss_ns_final = ocxo_clock->last_second_start_gnss_ns_final;
+    diag.ocxo_second_end_gnss_ns_final = ocxo_clock->last_second_end_gnss_ns_final;
+    diag.ocxo_second_start_dwt_final = ocxo_clock->last_second_start_dwt_final;
+    diag.ocxo_second_end_dwt_final = ocxo_clock->last_second_end_dwt_final;
+    diag.ocxo_second_start_raw_minus_final_ns = ocxo_clock->last_second_start_raw_minus_final_ns;
+    diag.ocxo_second_end_raw_minus_final_ns = ocxo_clock->last_second_end_raw_minus_final_ns;
   }
 }
 
@@ -546,37 +582,55 @@ static void handle_ocxo_qtimer16_irq(qtimer16_ocxo_runtime_t& clock,
 
   qtimer16_ocxo_note_cadence_irq(clock, counter16_snapshot);
 
-  const int64_t current_gnss_ns = time_dwt_to_gnss_ns(dwt_raw);
+  const int64_t current_gnss_ns_raw = time_dwt_to_gnss_ns(dwt_raw);
+  const int64_t compare_latency_ns =
+      (clock.last_fired_compare_delta_ns > 0) ? clock.last_fired_compare_delta_ns : 0;
+  const uint32_t compare_latency_cycles = ns_to_dwt_cycles_runtime((uint64_t)compare_latency_ns);
+  const uint32_t current_dwt_final = dwt_raw - compare_latency_cycles;
+  const int64_t current_gnss_ns_final =
+      (current_gnss_ns_raw >= 0) ? (current_gnss_ns_raw - compare_latency_ns) : -1;
 
-  // First cadence hit only establishes the baseline edge for the rolling second.
+  // First cadence hit only establishes the baseline raw edge and also seeds
+  // the first synthetic second boundary.  After this seed, the synthetic
+  // boundary is carried forward perpetually from one completed second to the
+  // next, rather than being re-founded from later raw ISR-entry samples.
   if (!clock.second_window_valid) {
     clock.second_window_valid = true;
     clock.current_window_bucket_count = 0;
-    clock.previous_bucket_dwt = dwt_raw;
-    clock.previous_bucket_gnss_ns = current_gnss_ns;
+    clock.previous_bucket_dwt = current_dwt_final;
+    clock.previous_bucket_gnss_ns = current_gnss_ns_final;
     clock.second_start_dwt_raw = dwt_raw;
-    clock.second_start_gnss_ns_raw = current_gnss_ns;
+    clock.second_start_gnss_ns_raw = current_gnss_ns_raw;
+    clock.second_start_dwt_final = current_dwt_final;
+    clock.second_start_gnss_ns_final = current_gnss_ns_final;
     clock.current_window_cycles_sum = 0;
     clock.current_window_gnss_ns_sum = 0;
     clock.last_bucket_cycles = 0;
     clock.last_bucket_gnss_ns = 0;
+
+    clock.last_event_dwt_raw = dwt_raw;
+    clock.last_event_gnss_ns_raw = current_gnss_ns_raw;
+    clock.last_event_dwt_final = current_dwt_final;
+    clock.last_event_gnss_ns_final = current_gnss_ns_final;
+    clock.last_event_target_dwt = 0;
+    clock.last_event_target_gnss_ns = -1;
     return;
   }
 
-  const uint32_t bucket_cycles = dwt_raw - clock.previous_bucket_dwt;
+  const uint32_t bucket_cycles = current_dwt_final - clock.previous_bucket_dwt;
   clock.last_bucket_cycles = bucket_cycles;
   clock.current_window_cycles_sum += (uint64_t)bucket_cycles;
 
-  if (current_gnss_ns >= 0 && clock.previous_bucket_gnss_ns >= 0) {
-    const int64_t bucket_gnss_ns = current_gnss_ns - clock.previous_bucket_gnss_ns;
+  if (current_gnss_ns_final >= 0 && clock.previous_bucket_gnss_ns >= 0) {
+    const int64_t bucket_gnss_ns = current_gnss_ns_final - clock.previous_bucket_gnss_ns;
     clock.last_bucket_gnss_ns = bucket_gnss_ns;
     clock.current_window_gnss_ns_sum += bucket_gnss_ns;
   } else {
     clock.last_bucket_gnss_ns = 0;
   }
 
-  clock.previous_bucket_dwt = dwt_raw;
-  clock.previous_bucket_gnss_ns = current_gnss_ns;
+  clock.previous_bucket_dwt = current_dwt_final;
+  clock.previous_bucket_gnss_ns = current_gnss_ns_final;
   clock.current_window_bucket_count++;
   clock.cadence_hits_since_second = clock.current_window_bucket_count;
 
@@ -590,7 +644,35 @@ static void handle_ocxo_qtimer16_irq(qtimer16_ocxo_runtime_t& clock,
   clock.last_second_start_dwt_raw = clock.second_start_dwt_raw;
   clock.last_second_end_dwt_raw = dwt_raw;
   clock.last_second_start_gnss_ns_raw = clock.second_start_gnss_ns_raw;
-  clock.last_second_end_gnss_ns_raw = current_gnss_ns;
+  clock.last_second_end_gnss_ns_raw = current_gnss_ns_raw;
+
+  // The lawful second begins at the prior synthetic edge and ends at the
+  // prior synthetic edge plus the observed one-second bucket sum.
+  clock.last_second_start_dwt_final = clock.second_start_dwt_final;
+  clock.last_second_start_gnss_ns_final = clock.second_start_gnss_ns_final;
+
+  if (clock.second_start_dwt_final != 0) {
+    clock.last_second_end_dwt_final =
+        clock.second_start_dwt_final + (uint32_t)clock.last_second_cycles_observed;
+  } else {
+    clock.last_second_end_dwt_final = current_dwt_final;
+  }
+
+  if (clock.second_start_gnss_ns_final >= 0) {
+    clock.last_second_end_gnss_ns_final =
+        clock.second_start_gnss_ns_final + clock.last_second_gnss_ns_observed;
+  } else {
+    clock.last_second_end_gnss_ns_final = current_gnss_ns_final;
+  }
+
+  clock.last_second_start_raw_minus_final_ns =
+      (clock.last_second_start_gnss_ns_raw >= 0 && clock.last_second_start_gnss_ns_final >= 0)
+          ? (clock.last_second_start_gnss_ns_raw - clock.last_second_start_gnss_ns_final)
+          : 0;
+  clock.last_second_end_raw_minus_final_ns =
+      (clock.last_second_end_gnss_ns_raw >= 0 && clock.last_second_end_gnss_ns_final >= 0)
+          ? (clock.last_second_end_gnss_ns_raw - clock.last_second_end_gnss_ns_final)
+          : 0;
 
   if (clock.next_second_prediction_valid) {
     clock.last_second_cycles_prediction = clock.next_second_cycles_prediction;
@@ -615,26 +697,21 @@ static void handle_ocxo_qtimer16_irq(qtimer16_ocxo_runtime_t& clock,
   clock.logical_count32_at_last_second_edge += OCXO_COUNTS_PER_SECOND;
   const uint32_t logical_counter32_at_event = clock.logical_count32_at_last_second_edge;
 
+  const uint32_t current_event_target_dwt =
+      (clock.next_second_prediction_valid && clock.second_start_dwt_final != 0)
+          ? (clock.second_start_dwt_final + (uint32_t)clock.next_second_cycles_prediction)
+          : 0;
+  const int64_t current_event_target_gnss_ns =
+      (clock.next_second_prediction_valid && clock.second_start_gnss_ns_final >= 0)
+          ? (clock.second_start_gnss_ns_final + clock.next_second_gnss_ns_prediction)
+          : -1;
+
   clock.last_event_dwt_raw = dwt_raw;
-  clock.last_event_gnss_ns_raw = current_gnss_ns;
-
-  if (clock.last_event_dwt_final != 0) {
-    clock.last_event_target_dwt = clock.last_event_dwt_final +
-                                  (clock.next_second_prediction_valid ? (uint32_t)clock.next_second_cycles_prediction : (uint32_t)clock.last_second_cycles_observed);
-    clock.last_event_dwt_final = clock.last_event_dwt_final + (uint32_t)clock.last_second_cycles_observed;
-  } else {
-    clock.last_event_target_dwt = 0;
-    clock.last_event_dwt_final = dwt_raw;
-  }
-
-  if (clock.last_event_gnss_ns_final >= 0) {
-    clock.last_event_target_gnss_ns = clock.last_event_gnss_ns_final +
-                                      (clock.next_second_prediction_valid ? clock.next_second_gnss_ns_prediction : clock.last_second_gnss_ns_observed);
-    clock.last_event_gnss_ns_final = clock.last_event_gnss_ns_final + clock.last_second_gnss_ns_observed;
-  } else {
-    clock.last_event_target_gnss_ns = -1;
-    clock.last_event_gnss_ns_final = current_gnss_ns;
-  }
+  clock.last_event_gnss_ns_raw = current_gnss_ns_raw;
+  clock.last_event_dwt_final = clock.last_second_end_dwt_final;
+  clock.last_event_gnss_ns_final = clock.last_second_end_gnss_ns_final;
+  clock.last_event_target_dwt = current_event_target_dwt;
+  clock.last_event_target_gnss_ns = current_event_target_gnss_ns;
 
   clock.next_second_cycles_prediction = clock.last_second_cycles_observed;
   clock.next_second_gnss_ns_prediction = clock.last_second_gnss_ns_observed;
@@ -644,14 +721,17 @@ static void handle_ocxo_qtimer16_irq(qtimer16_ocxo_runtime_t& clock,
   clock.dispatch_count++;
   handle_event(rt, dwt_raw, logical_counter32_at_event, &clock);
 
-  // Start the next one-second window at this just-observed edge.
+  // Start the next accumulation window with a fresh sum, but carry forward the
+  // newly synthesized lawful second edge as the beginning of the next second.
   clock.current_window_bucket_count = 0;
   clock.current_window_cycles_sum = 0;
   clock.current_window_gnss_ns_sum = 0;
   clock.second_start_dwt_raw = dwt_raw;
-  clock.second_start_gnss_ns_raw = current_gnss_ns;
-  clock.previous_bucket_dwt = dwt_raw;
-  clock.previous_bucket_gnss_ns = current_gnss_ns;
+  clock.second_start_gnss_ns_raw = current_gnss_ns_raw;
+  clock.second_start_dwt_final = clock.last_event_dwt_final;
+  clock.second_start_gnss_ns_final = clock.last_event_gnss_ns_final;
+  clock.previous_bucket_dwt = current_dwt_final;
+  clock.previous_bucket_gnss_ns = current_gnss_ns_final;
   clock.cadence_hits_since_second = 0;
 }
 
@@ -720,6 +800,8 @@ bool interrupt_start(interrupt_subscriber_kind_t kind) {
   clock->previous_bucket_gnss_ns = -1;
   clock->second_start_dwt_raw = 0;
   clock->second_start_gnss_ns_raw = -1;
+  clock->second_start_dwt_final = 0;
+  clock->second_start_gnss_ns_final = -1;
   clock->current_window_cycles_sum = 0;
   clock->current_window_gnss_ns_sum = 0;
   clock->last_bucket_cycles = 0;
@@ -736,6 +818,12 @@ bool interrupt_start(interrupt_subscriber_kind_t kind) {
   clock->last_second_end_dwt_raw = 0;
   clock->last_second_start_gnss_ns_raw = -1;
   clock->last_second_end_gnss_ns_raw = -1;
+  clock->last_second_start_dwt_final = 0;
+  clock->last_second_end_dwt_final = 0;
+  clock->last_second_start_gnss_ns_final = -1;
+  clock->last_second_end_gnss_ns_final = -1;
+  clock->last_second_start_raw_minus_final_ns = 0;
+  clock->last_second_end_raw_minus_final_ns = 0;
   clock->next_second_prediction_valid = false;
   clock->next_second_cycles_prediction = 0;
   clock->next_second_gnss_ns_prediction = 0;
@@ -919,6 +1007,10 @@ static Payload cmd_report(const Payload&) {
   p.add("ocxo1_last_second_cycles_prediction_error", g_clock_ocxo1.last_second_cycles_prediction_error);
   p.add("ocxo1_last_second_gnss_ns_prediction_error", g_clock_ocxo1.last_second_gnss_ns_prediction_error);
   p.add("ocxo1_last_second_residual_ns", g_clock_ocxo1.last_second_residual_ns);
+  p.add("ocxo1_last_second_start_gnss_ns_final", g_clock_ocxo1.last_second_start_gnss_ns_final);
+  p.add("ocxo1_last_second_end_gnss_ns_final", g_clock_ocxo1.last_second_end_gnss_ns_final);
+  p.add("ocxo1_last_second_start_raw_minus_final_ns", g_clock_ocxo1.last_second_start_raw_minus_final_ns);
+  p.add("ocxo1_last_second_end_raw_minus_final_ns", g_clock_ocxo1.last_second_end_raw_minus_final_ns);
 
   p.add("ocxo2_irq_count", g_clock_ocxo2.irq_count);
   p.add("ocxo2_dispatch_count", g_clock_ocxo2.dispatch_count);
@@ -942,6 +1034,10 @@ static Payload cmd_report(const Payload&) {
   p.add("ocxo2_last_second_cycles_prediction_error", g_clock_ocxo2.last_second_cycles_prediction_error);
   p.add("ocxo2_last_second_gnss_ns_prediction_error", g_clock_ocxo2.last_second_gnss_ns_prediction_error);
   p.add("ocxo2_last_second_residual_ns", g_clock_ocxo2.last_second_residual_ns);
+  p.add("ocxo2_last_second_start_gnss_ns_final", g_clock_ocxo2.last_second_start_gnss_ns_final);
+  p.add("ocxo2_last_second_end_gnss_ns_final", g_clock_ocxo2.last_second_end_gnss_ns_final);
+  p.add("ocxo2_last_second_start_raw_minus_final_ns", g_clock_ocxo2.last_second_start_raw_minus_final_ns);
+  p.add("ocxo2_last_second_end_raw_minus_final_ns", g_clock_ocxo2.last_second_end_raw_minus_final_ns);
 
   PayloadArray subscribers;
   for (uint32_t i = 0; i < g_subscriber_count; i++) {
@@ -1014,6 +1110,12 @@ static Payload cmd_report(const Payload&) {
       s.add("ocxo_second_end_gnss_ns_raw", rt.last_diag.ocxo_second_end_gnss_ns_raw);
       s.add("ocxo_second_start_dwt_raw", rt.last_diag.ocxo_second_start_dwt_raw);
       s.add("ocxo_second_end_dwt_raw", rt.last_diag.ocxo_second_end_dwt_raw);
+      s.add("ocxo_second_start_gnss_ns_final", rt.last_diag.ocxo_second_start_gnss_ns_final);
+      s.add("ocxo_second_end_gnss_ns_final", rt.last_diag.ocxo_second_end_gnss_ns_final);
+      s.add("ocxo_second_start_dwt_final", rt.last_diag.ocxo_second_start_dwt_final);
+      s.add("ocxo_second_end_dwt_final", rt.last_diag.ocxo_second_end_dwt_final);
+      s.add("ocxo_second_start_raw_minus_final_ns", rt.last_diag.ocxo_second_start_raw_minus_final_ns);
+      s.add("ocxo_second_end_raw_minus_final_ns", rt.last_diag.ocxo_second_end_raw_minus_final_ns);
     }
 
     subscribers.add(s);

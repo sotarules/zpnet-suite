@@ -3,22 +3,24 @@ Dedicated OCXO campaign analyzer.
 
 Focused only on OCXO second-edge forensics.
 
-Uses the richer OCXO bucket-integrator fields when present, with graceful
-fallback to the older coarse field set for historical campaigns.
+This version prefers the synthetic/corrected OCXO second-boundary fields when
+present, falls back to raw boundary fields when necessary, and preserves both
+views so remaining pathology can be reasoned about explicitly.
 
-For each OCXO row:
+Canonical row model per OCXO:
   - pps_count
-  - start_gnss_ns
-  - end_gnss_ns
-  - delta_ns
-  - predicted_delta_ns   (last observed delta_ns, i.e. 'last is best')
+  - start_gnss_ns / end_gnss_ns     (prefer synthetic/final boundary)
+  - delta_ns                        (prefer synthetic/final boundary delta)
+  - predicted_delta_ns             (last observed delta_ns, i.e. "last is best")
   - residual_a = delta_ns - predicted_delta_ns
   - residual_b = delta_ns - 1_000_000_000
 
-Also performs sanity checks for:
-  - edge ordering
-  - doubled/short seconds
-  - sudden residual jumps
+Useful forensic side-channels:
+  - raw start/end boundary and raw delta
+  - raw-minus-final corrections at start/end
+  - bridge raw/final errors
+  - compare-latency deltas
+  - bucket observed/predicted GNSS ns and cycles
 
 Usage:
     python -m zpnet.tests.ocxo_campaign_analyzer <campaign_name>
@@ -43,6 +45,7 @@ HALF_SECOND_THRESHOLD_NS = 500_000_000
 DELTA_REASONABLE_WARN_NS = 10_000
 RESIDUAL_JUMP_WARN_NS = 250
 RESIDUAL_JUMP_ALARM_NS = 1_000
+CANONICAL_OBSERVED_MISMATCH_WARN_NS = 50
 
 MAX_TABLE_ROWS = 120
 MAX_ISSUES = 20
@@ -84,6 +87,21 @@ class OcxoRow:
     second_end_gnss_ns_raw: Optional[int]
     second_start_dwt_raw: Optional[int]
     second_end_dwt_raw: Optional[int]
+
+    second_start_gnss_ns_final: Optional[int]
+    second_end_gnss_ns_final: Optional[int]
+    second_start_dwt_final: Optional[int]
+    second_end_dwt_final: Optional[int]
+
+    second_start_raw_minus_final_ns: Optional[int]
+    second_end_raw_minus_final_ns: Optional[int]
+
+    raw_delta_ns: Optional[int]
+    final_delta_ns: Optional[int]
+    canonical_minus_observed_ns: Optional[int]
+
+    compare_delta_ns: Optional[int]
+    compare_delta_ticks: Optional[int]
 
     bucket_interval_counts: Optional[int]
     current_window_bucket_count: Optional[int]
@@ -148,6 +166,40 @@ def _frag_float(row: Dict[str, Any], key: str) -> Optional[float]:
     return float(v) if v is not None else None
 
 
+def _resolved_final_boundary(
+    row: Dict[str, Any],
+    prefix: str,
+    which: str,
+) -> Tuple[Optional[int], Optional[int], Optional[int]]:
+    """
+    Resolve the synthetic/final GNSS boundary if available. If the explicit
+    *_final field is absent, reconstruct it from raw - raw_minus_final.
+    Returns: final_ns, raw_ns, raw_minus_final_ns
+    """
+    final_ns = _frag_int(row, f"{prefix}_diag_ocxo_second_{which}_gnss_ns_final")
+    raw_ns = _frag_int(row, f"{prefix}_diag_ocxo_second_{which}_gnss_ns_raw")
+    raw_minus_final_ns = _frag_int(row, f"{prefix}_diag_ocxo_second_{which}_raw_minus_final_ns")
+
+    if final_ns is None and raw_ns is not None and raw_minus_final_ns is not None:
+        final_ns = raw_ns - raw_minus_final_ns
+
+    return final_ns, raw_ns, raw_minus_final_ns
+
+
+def _resolved_final_dwt(
+    row: Dict[str, Any],
+    prefix: str,
+    which: str,
+) -> Tuple[Optional[int], Optional[int]]:
+    """
+    Resolve synthetic/final DWT boundary when present, otherwise use raw.
+    Returns: final_dwt, raw_dwt
+    """
+    final_dwt = _frag_int(row, f"{prefix}_diag_ocxo_second_{which}_dwt_final")
+    raw_dwt = _frag_int(row, f"{prefix}_diag_ocxo_second_{which}_dwt_raw")
+    if final_dwt is None:
+        final_dwt = raw_dwt
+    return final_dwt, raw_dwt
 
 
 def _choose_best_delta_fields(
@@ -155,23 +207,30 @@ def _choose_best_delta_fields(
     prefix: str,
 ) -> Tuple[Optional[int], Optional[int], Optional[int], Optional[int], str]:
     """
-    Prefer the richer bucket-integrator fields when present.
+    Prefer synthetic/final boundaries, then bucket-observed, then raw, then
+    legacy coarse fields.
 
     Returns:
         start_gnss_ns, end_gnss_ns, delta_ns, second_residual_ns, delta_source
     """
-    start_raw = _frag_int(row, f"{prefix}_diag_ocxo_second_start_gnss_ns_raw")
-    end_raw = _frag_int(row, f"{prefix}_diag_ocxo_second_end_gnss_ns_raw")
+    start_final, start_raw, _ = _resolved_final_boundary(row, prefix, "start")
+    end_final, end_raw, _ = _resolved_final_boundary(row, prefix, "end")
     observed = _frag_int(row, f"{prefix}_diag_ocxo_second_gnss_ns_observed")
     residual = _frag_int(row, f"{prefix}_diag_ocxo_second_residual_ns")
 
-    if start_raw is not None and start_raw >= 0 and end_raw is not None and end_raw >= 0:
+    if start_final is not None and end_final is not None:
+        return start_final, end_final, end_final - start_final, residual, "bucket_final"
+
+    if end_final is not None and observed is not None:
+        return end_final - observed, end_final, observed, residual, "bucket_final_observed"
+
+    if start_raw is not None and end_raw is not None:
         delta_ns = observed
         if delta_ns is None:
             delta_ns = end_raw - start_raw
         return start_raw, end_raw, delta_ns, residual, "bucket_raw"
 
-    if end_raw is not None and end_raw >= 0 and observed is not None:
+    if end_raw is not None and observed is not None:
         return end_raw - observed, end_raw, observed, residual, "bucket_observed"
 
     end_final = _frag_int(row, f"{prefix}_diag_gnss_ns_at_event_final")
@@ -182,6 +241,7 @@ def _choose_best_delta_fields(
         return end_final - coarse_delta, end_final, coarse_delta, coarse_residual, "coarse"
 
     return None, end_final, coarse_delta, coarse_residual, "missing"
+
 
 def fetch_timebase(campaign: str) -> List[Dict[str, Any]]:
     with open_db(row_dict=True) as conn:
@@ -250,7 +310,28 @@ def build_ocxo_rows(
             _choose_best_delta_fields(row, prefix)
         )
 
-        # Prediction is "last is best"
+        second_start_gnss_ns_final, second_start_gnss_ns_raw, second_start_raw_minus_final_ns = (
+            _resolved_final_boundary(row, prefix, "start")
+        )
+        second_end_gnss_ns_final, second_end_gnss_ns_raw, second_end_raw_minus_final_ns = (
+            _resolved_final_boundary(row, prefix, "end")
+        )
+        second_start_dwt_final, second_start_dwt_raw = _resolved_final_dwt(row, prefix, "start")
+        second_end_dwt_final, second_end_dwt_raw = _resolved_final_dwt(row, prefix, "end")
+
+        raw_delta_ns = None
+        if second_start_gnss_ns_raw is not None and second_end_gnss_ns_raw is not None:
+            raw_delta_ns = second_end_gnss_ns_raw - second_start_gnss_ns_raw
+
+        final_delta_ns = None
+        if second_start_gnss_ns_final is not None and second_end_gnss_ns_final is not None:
+            final_delta_ns = second_end_gnss_ns_final - second_start_gnss_ns_final
+
+        second_gnss_ns_observed = _frag_int(row, f"{prefix}_diag_ocxo_second_gnss_ns_observed")
+        canonical_minus_observed_ns = None
+        if final_delta_ns is not None and second_gnss_ns_observed is not None:
+            canonical_minus_observed_ns = final_delta_ns - second_gnss_ns_observed
+
         predicted_delta_ns = prev_delta_ns
 
         residual_a_ns = None
@@ -260,6 +341,9 @@ def build_ocxo_rows(
         residual_b_ns = None
         if delta_ns is not None:
             residual_b_ns = delta_ns - NS_PER_SECOND
+
+        if second_residual_ns is None and delta_ns is not None:
+            second_residual_ns = NS_PER_SECOND - delta_ns
 
         out.append(
             OcxoRow(
@@ -279,16 +363,27 @@ def build_ocxo_rows(
                 ppb=_frag_float(row, f"{prefix}_ppb"),
                 window_error_ns=_frag_int(row, f"{prefix}_window_error_ns"),
                 second_residual_ns=second_residual_ns,
-                second_gnss_ns_observed=_frag_int(row, f"{prefix}_diag_ocxo_second_gnss_ns_observed"),
+                second_gnss_ns_observed=second_gnss_ns_observed,
                 second_gnss_ns_prediction=_frag_int(row, f"{prefix}_diag_ocxo_second_gnss_ns_prediction"),
                 second_gnss_ns_prediction_error=_frag_int(row, f"{prefix}_diag_ocxo_second_gnss_ns_prediction_error"),
                 second_cycles_observed=_frag_int(row, f"{prefix}_diag_ocxo_second_cycles_observed"),
                 second_cycles_prediction=_frag_int(row, f"{prefix}_diag_ocxo_second_cycles_prediction"),
                 second_cycles_prediction_error=_frag_int(row, f"{prefix}_diag_ocxo_second_cycles_prediction_error"),
-                second_start_gnss_ns_raw=_frag_int(row, f"{prefix}_diag_ocxo_second_start_gnss_ns_raw"),
-                second_end_gnss_ns_raw=_frag_int(row, f"{prefix}_diag_ocxo_second_end_gnss_ns_raw"),
-                second_start_dwt_raw=_frag_int(row, f"{prefix}_diag_ocxo_second_start_dwt_raw"),
-                second_end_dwt_raw=_frag_int(row, f"{prefix}_diag_ocxo_second_end_dwt_raw"),
+                second_start_gnss_ns_raw=second_start_gnss_ns_raw,
+                second_end_gnss_ns_raw=second_end_gnss_ns_raw,
+                second_start_dwt_raw=second_start_dwt_raw,
+                second_end_dwt_raw=second_end_dwt_raw,
+                second_start_gnss_ns_final=second_start_gnss_ns_final,
+                second_end_gnss_ns_final=second_end_gnss_ns_final,
+                second_start_dwt_final=second_start_dwt_final,
+                second_end_dwt_final=second_end_dwt_final,
+                second_start_raw_minus_final_ns=second_start_raw_minus_final_ns,
+                second_end_raw_minus_final_ns=second_end_raw_minus_final_ns,
+                raw_delta_ns=raw_delta_ns,
+                final_delta_ns=final_delta_ns,
+                canonical_minus_observed_ns=canonical_minus_observed_ns,
+                compare_delta_ns=_frag_int(row, f"{prefix}_diag_counter16_minus_compare_ns"),
+                compare_delta_ticks=_frag_int(row, f"{prefix}_diag_counter16_minus_compare_ticks"),
                 bucket_interval_counts=_frag_int(row, f"{prefix}_diag_ocxo_bucket_interval_counts"),
                 current_window_bucket_count=_frag_int(row, f"{prefix}_diag_ocxo_current_window_bucket_count"),
                 last_second_bucket_count=_frag_int(row, f"{prefix}_diag_ocxo_last_second_bucket_count"),
@@ -344,12 +439,20 @@ def analyze_ocxo(label: str, data: List[OcxoRow]) -> List[str]:
     pred_stats = WelfordStats()
     residual_a_stats = WelfordStats()
     residual_b_stats = WelfordStats()
-    bridge_stats = WelfordStats()
+    bridge_raw_stats = WelfordStats()
+    bridge_final_stats = WelfordStats()
     bucket_obs_stats = WelfordStats()
     bucket_pred_stats = WelfordStats()
     bucket_err_stats = WelfordStats()
     bucket_residual_stats = WelfordStats()
     cycle_err_stats = WelfordStats()
+    raw_delta_stats = WelfordStats()
+    final_delta_stats = WelfordStats()
+    canon_minus_obs_stats = WelfordStats()
+    start_corr_stats = WelfordStats()
+    end_corr_stats = WelfordStats()
+    compare_ns_stats = WelfordStats()
+    compare_ticks_stats = WelfordStats()
 
     prev_residual_a: Optional[int] = None
     prev_residual_b: Optional[int] = None
@@ -360,6 +463,8 @@ def analyze_ocxo(label: str, data: List[OcxoRow]) -> List[str]:
     short_seconds: List[str] = []
     residual_jump_warns: List[str] = []
     residual_jump_alarms: List[str] = []
+    correction_warns: List[str] = []
+    canonical_mismatch_warns: List[str] = []
 
     for row in data:
         if row.delta_ns is not None:
@@ -370,8 +475,10 @@ def analyze_ocxo(label: str, data: List[OcxoRow]) -> List[str]:
             residual_a_stats.update(float(row.residual_a_ns))
         if row.residual_b_ns is not None:
             residual_b_stats.update(float(row.residual_b_ns))
+        if row.bridge_raw_error_ns is not None:
+            bridge_raw_stats.update(float(row.bridge_raw_error_ns))
         if row.bridge_final_error_ns is not None:
-            bridge_stats.update(float(row.bridge_final_error_ns))
+            bridge_final_stats.update(float(row.bridge_final_error_ns))
         if row.second_gnss_ns_observed is not None:
             bucket_obs_stats.update(float(row.second_gnss_ns_observed))
         if row.second_gnss_ns_prediction is not None:
@@ -382,8 +489,21 @@ def analyze_ocxo(label: str, data: List[OcxoRow]) -> List[str]:
             bucket_residual_stats.update(float(row.second_residual_ns))
         if row.second_cycles_prediction_error is not None:
             cycle_err_stats.update(float(row.second_cycles_prediction_error))
+        if row.raw_delta_ns is not None:
+            raw_delta_stats.update(float(row.raw_delta_ns))
+        if row.final_delta_ns is not None:
+            final_delta_stats.update(float(row.final_delta_ns))
+        if row.canonical_minus_observed_ns is not None:
+            canon_minus_obs_stats.update(float(row.canonical_minus_observed_ns))
+        if row.second_start_raw_minus_final_ns is not None:
+            start_corr_stats.update(float(row.second_start_raw_minus_final_ns))
+        if row.second_end_raw_minus_final_ns is not None:
+            end_corr_stats.update(float(row.second_end_raw_minus_final_ns))
+        if row.compare_delta_ns is not None:
+            compare_ns_stats.update(float(row.compare_delta_ns))
+        if row.compare_delta_ticks is not None:
+            compare_ticks_stats.update(float(row.compare_delta_ticks))
 
-        # Edge sanity
         if row.start_gnss_ns is not None and row.end_gnss_ns is not None:
             if row.end_gnss_ns < row.start_gnss_ns:
                 edge_issues.append(
@@ -391,7 +511,6 @@ def analyze_ocxo(label: str, data: List[OcxoRow]) -> List[str]:
                     f"({row.end_gnss_ns} < {row.start_gnss_ns})"
                 )
 
-        # Delta sanity
         if row.delta_ns is not None:
             if row.delta_ns >= DOUBLED_SECOND_THRESHOLD_NS:
                 doubled_seconds.append(
@@ -406,7 +525,19 @@ def analyze_ocxo(label: str, data: List[OcxoRow]) -> List[str]:
                     f"pps={row.pps_count}: delta_ns dev from 1e9 = {row.delta_ns - NS_PER_SECOND:+,d}"
                 )
 
-        # Residual jump sanity
+        if row.second_start_raw_minus_final_ns is not None or row.second_end_raw_minus_final_ns is not None:
+            s = row.second_start_raw_minus_final_ns or 0
+            e = row.second_end_raw_minus_final_ns or 0
+            if abs(s - e) > CANONICAL_OBSERVED_MISMATCH_WARN_NS:
+                correction_warns.append(
+                    f"pps={row.pps_count}: start/end raw-minus-final differ ({s:+d} vs {e:+d})"
+                )
+
+        if row.canonical_minus_observed_ns is not None and abs(row.canonical_minus_observed_ns) > CANONICAL_OBSERVED_MISMATCH_WARN_NS:
+            canonical_mismatch_warns.append(
+                f"pps={row.pps_count}: canonical-final delta vs observed mismatch = {row.canonical_minus_observed_ns:+d} ns"
+            )
+
         if row.residual_a_ns is not None and prev_residual_a is not None:
             jump = row.residual_a_ns - prev_residual_a
             if abs(jump) >= RESIDUAL_JUMP_ALARM_NS:
@@ -435,22 +566,31 @@ def analyze_ocxo(label: str, data: List[OcxoRow]) -> List[str]:
         if row.residual_b_ns is not None:
             prev_residual_b = row.residual_b_ns
 
-    bucket_rows = sum(1 for row in data if row.delta_source.startswith("bucket"))
-    coarse_rows = sum(1 for row in data if row.delta_source == "coarse")
-    missing_rows = sum(1 for row in data if row.delta_source == "missing")
+    source_counts = {}
+    for row in data:
+        source_counts[row.delta_source] = source_counts.get(row.delta_source, 0) + 1
+    source_mix = "  ".join(f"{k}={v}" for k, v in sorted(source_counts.items()))
 
     print(f"{label} SUMMARY")
-    print(f"  source_mix:        bucket={bucket_rows}  coarse={coarse_rows}  missing={missing_rows}")
+    print(f"  source_mix:        {source_mix if source_mix else 'no data'}")
     print(f"  delta_ns:          {delta_stats.summary('.3f')}")
     print(f"  predicted_delta:   {pred_stats.summary('.3f')}")
     print(f"  residual_a:        {residual_a_stats.summary('.3f')}")
     print(f"  residual_b:        {residual_b_stats.summary('.3f')}")
-    print(f"  bridge_final_err:  {bridge_stats.summary('.3f')}")
+    print(f"  bridge_raw_err:    {bridge_raw_stats.summary('.3f')}")
+    print(f"  bridge_final_err:  {bridge_final_stats.summary('.3f')}")
     print(f"  bucket_obs_ns:     {bucket_obs_stats.summary('.3f')}")
     print(f"  bucket_pred_ns:    {bucket_pred_stats.summary('.3f')}")
     print(f"  bucket_pred_err:   {bucket_err_stats.summary('.3f')}")
     print(f"  bucket_residual:   {bucket_residual_stats.summary('.3f')}")
     print(f"  cycle_pred_err:    {cycle_err_stats.summary('.3f')}")
+    print(f"  raw_delta_ns:      {raw_delta_stats.summary('.3f')}")
+    print(f"  final_delta_ns:    {final_delta_stats.summary('.3f')}")
+    print(f"  canon-observed:    {canon_minus_obs_stats.summary('.3f')}")
+    print(f"  start_raw-final:   {start_corr_stats.summary('.3f')}")
+    print(f"  end_raw-final:     {end_corr_stats.summary('.3f')}")
+    print(f"  compare_delta_ns:  {compare_ns_stats.summary('.3f')}")
+    print(f"  compare_delta_tk:  {compare_ticks_stats.summary('.3f')}")
     print()
 
     def emit(title: str, items: List[str], cap: int = MAX_ISSUES) -> None:
@@ -467,6 +607,8 @@ def analyze_ocxo(label: str, data: List[OcxoRow]) -> List[str]:
     emit("DELTA WARNS", delta_warns)
     emit("DOUBLED-SECOND SUSPECTS", doubled_seconds)
     emit("SHORT-SECOND SUSPECTS", short_seconds)
+    emit("CORRECTION WARNS", correction_warns)
+    emit("CANONICAL MISMATCH WARNS", canonical_mismatch_warns)
     emit("RESIDUAL JUMP WARNS", residual_jump_warns)
     emit("RESIDUAL JUMP ALARMS", residual_jump_alarms)
 
@@ -478,6 +620,8 @@ def analyze_ocxo(label: str, data: List[OcxoRow]) -> List[str]:
         anomalies.append(f"{label}: {len(short_seconds)} short-second suspects")
     if residual_jump_alarms:
         anomalies.append(f"{label}: {len(residual_jump_alarms)} residual jump alarms")
+    if canonical_mismatch_warns:
+        anomalies.append(f"{label}: {len(canonical_mismatch_warns)} canonical mismatch warns")
 
     if anomalies:
         print(f"{label} VERDICT: NEEDS ATTENTION")
