@@ -24,6 +24,8 @@
 #include <stdlib.h>
 #include <climits>
 
+extern volatile uint32_t g_dwt_cycle_count_last_second_prediction;
+
 // ============================================================================
 // Campaign State — definitions
 // ============================================================================
@@ -159,7 +161,7 @@ static void clocks_payload_add_ocxo_diag(Payload& p,
   //   - canonical edge/event facts
   //   - bridge reconciliation
   //   - compare-latency facts
-  //   - bucket/one-second integrator facts (canonical observed + raw diagnostics)
+  //   - bucket/one-second integrator facts
   add_bool("enabled", diag.enabled);
 
   add_u32("dwt_at_event", diag.dwt_at_event);
@@ -190,11 +192,9 @@ static void clocks_payload_add_ocxo_diag(Payload& p,
   add_u64("ocxo_current_window_cycles_sum", diag.ocxo_current_window_cycles_sum);
   add_i64("ocxo_current_window_gnss_ns_sum", diag.ocxo_current_window_gnss_ns_sum);
   add_u64("ocxo_second_cycles_observed", diag.ocxo_second_cycles_observed);
-  add_u64("ocxo_second_cycles_observed_raw", diag.ocxo_second_cycles_observed_raw);
   add_u64("ocxo_second_cycles_prediction", diag.ocxo_second_cycles_prediction);
   add_i64("ocxo_second_cycles_prediction_error", diag.ocxo_second_cycles_prediction_error);
   add_i64("ocxo_second_gnss_ns_observed", diag.ocxo_second_gnss_ns_observed);
-  add_i64("ocxo_second_gnss_ns_observed_raw", diag.ocxo_second_gnss_ns_observed_raw);
   add_i64("ocxo_second_gnss_ns_prediction", diag.ocxo_second_gnss_ns_prediction);
   add_i64("ocxo_second_gnss_ns_prediction_error", diag.ocxo_second_gnss_ns_prediction_error);
   add_i64("ocxo_second_residual_ns", diag.ocxo_second_residual_ns);
@@ -202,12 +202,6 @@ static void clocks_payload_add_ocxo_diag(Payload& p,
   add_i64("ocxo_second_end_gnss_ns_raw", diag.ocxo_second_end_gnss_ns_raw);
   add_u32("ocxo_second_start_dwt_raw", diag.ocxo_second_start_dwt_raw);
   add_u32("ocxo_second_end_dwt_raw", diag.ocxo_second_end_dwt_raw);
-  add_i64("ocxo_second_start_gnss_ns_final", diag.ocxo_second_start_gnss_ns_final);
-  add_i64("ocxo_second_end_gnss_ns_final", diag.ocxo_second_end_gnss_ns_final);
-  add_u32("ocxo_second_start_dwt_final", diag.ocxo_second_start_dwt_final);
-  add_u32("ocxo_second_end_dwt_final", diag.ocxo_second_end_dwt_final);
-  add_i64("ocxo_second_start_raw_minus_final_ns", diag.ocxo_second_start_raw_minus_final_ns);
-  add_i64("ocxo_second_end_raw_minus_final_ns", diag.ocxo_second_end_raw_minus_final_ns);
 }
 
 // ── Predictive servo tuning ──
@@ -845,6 +839,15 @@ void clocks_beta_pps(void) {
   p.add("teensy_pps_count", campaign_seconds);
   p.add("gnss_ns", g_gnss_ns_count_at_pps);
   p.add("calibrate_ocxo", servo_mode_str(calibrate_ocxo_mode));
+
+  // DWT raw second truth surface.
+  p.add("dwt_cycle_count_at_pps", g_dwt_cycle_count_at_pps);
+  p.add("dwt_cycle_count_between_pps", g_dwt_cycle_count_between_pps);
+  p.add("dwt_cycle_count_last_second_prediction", g_dwt_cycle_count_last_second_prediction);
+  p.add("dwt_cycle_count_next_second_prediction", g_dwt_cycle_count_next_second_prediction);
+  p.add("dwt_cycle_count_next_second_adjustment", g_dwt_cycle_count_next_second_adjustment);
+  p.add("dwt_effective_cycles_per_second", dwt_effective_cycles_per_second());
+  p.add("dwt_expected_per_pps", (uint32_t)DWT_EXPECTED_PER_PPS);
 
   // OCXO coarse truth surface.
   p.add("ocxo1_ns_count_at_pps", g_ocxo1_clock.ns_count_at_pps);

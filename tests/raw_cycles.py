@@ -1,19 +1,30 @@
 """
-ZPNet Raw Cycles — v9 Best-Estimate vs Observed OCXO Timing Monitor
+ZPNet Raw Cycles — current TIMEBASE analyzer
 
-This version is aligned to the post-mitigation TIMEBASE fragment.
+Focused on:
+  1. Raw PPS DWT counts and prediction residuals
+  2. Raw OCXO1 / OCXO2 cycle counts between edges
+  3. Raw OCXO1 / OCXO2 GNSS ns between edges
+  4. Simple residuals and lane/common-mode comparisons
 
-Primary goals:
-  1. Verify PPS DWT prediction remains clean.
-  2. Compare OCXO observed/raw deltas vs canonical best-estimate deltas.
-  3. Show whether the best-estimate path escapes the 42-cycle lattice.
-  4. Quantify improvement in GNSS interval residuals and DWT interval smoothness.
-  5. Surface dequantizer state: enabled, inferred bucket size, confidence.
+Expected TIMEBASE/TIMEBASE_FRAGMENT fields:
+  dwt_cycle_count_at_pps
+  dwt_cycle_count_between_pps
+  dwt_cycle_count_last_second_prediction
+  dwt_cycle_count_next_second_prediction
+  dwt_cycle_count_next_second_adjustment
+  dwt_effective_cycles_per_second
+  dwt_expected_per_pps
+
+  ocxo1_dwt_cycles_between_edges
+  ocxo2_dwt_cycles_between_edges
+  ocxo1_gnss_ns_between_edges
+  ocxo2_gnss_ns_between_edges
 
 Usage:
     python -m zpnet.tests.raw_cycles <campaign_name> [limit]
-    .zt raw_cycles gpt1
-    .zt raw_cycles gpt1 100
+    .zt raw_cycles Calibrate4
+    .zt raw_cycles Calibrate4 200
 """
 
 from __future__ import annotations
@@ -21,19 +32,13 @@ from __future__ import annotations
 import json
 import math
 import sys
-from collections import Counter
 from typing import Any, Dict, List, Optional
 
 from zpnet.shared.db import open_db
 
 
-MODULUS = 42
-TOP_BUCKETS = 8
+NS_PER_SECOND = 1_000_000_000
 
-
-# ─────────────────────────────────────────────────────────────────────
-# Welford online accumulator
-# ─────────────────────────────────────────────────────────────────────
 
 class Welford:
     __slots__ = ("n", "mean", "m2", "min_val", "max_val")
@@ -64,52 +69,6 @@ class Welford:
     def stderr(self) -> float:
         return self.stddev / math.sqrt(self.n) if self.n >= 2 else 0.0
 
-    def reset(self) -> None:
-        self.n = 0
-        self.mean = 0.0
-        self.m2 = 0.0
-        self.min_val = float("inf")
-        self.max_val = float("-inf")
-
-
-# ─────────────────────────────────────────────────────────────────────
-# Fragment-aware field access
-# ─────────────────────────────────────────────────────────────────────
-
-def _frag(rec: Dict[str, Any], key: str) -> Any:
-    frag = rec.get("fragment")
-    if isinstance(frag, dict):
-        v = frag.get(key)
-        if v is not None:
-            return v
-    return rec.get(key)
-
-
-def _as_int(v: Any) -> Optional[int]:
-    if v is None:
-        return None
-    try:
-        return int(v)
-    except Exception:
-        return None
-
-
-def _mod(v: Optional[int], mod: int = MODULUS) -> Optional[int]:
-    if v is None:
-        return None
-    return v % mod
-
-
-def _fmt_int(v: Optional[int], width: int = 0, signed: bool = False) -> str:
-    if v is None:
-        return f"{'---':>{width}s}" if width else "---"
-    s = f"{v:+,d}" if signed else f"{v:,d}"
-    return f"{s:>{width}s}" if width else s
-
-
-# ─────────────────────────────────────────────────────────────────────
-# Database fetch
-# ─────────────────────────────────────────────────────────────────────
 
 def fetch_timebase(campaign: str) -> List[Dict[str, Any]]:
     with open_db(row_dict=True) as conn:
@@ -119,7 +78,7 @@ def fetch_timebase(campaign: str) -> List[Dict[str, Any]]:
             SELECT payload
             FROM timebase
             WHERE campaign = %s
-            ORDER BY (payload->>'pps_count')::int ASC
+            ORDER BY (payload->>'pps_count')::bigint ASC
             """,
             (campaign,),
         )
@@ -127,61 +86,72 @@ def fetch_timebase(campaign: str) -> List[Dict[str, Any]]:
 
     result: List[Dict[str, Any]] = []
     for row in rows:
-        p = row["payload"]
-        if isinstance(p, str):
-            p = json.loads(p)
-        result.append(p)
+        payload = row["payload"]
+        if isinstance(payload, str):
+            payload = json.loads(payload)
+        result.append(payload)
 
     return result
 
 
-# ─────────────────────────────────────────────────────────────────────
-# Helpers
-# ─────────────────────────────────────────────────────────────────────
+def normalize_payload_object(rec: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Support both shapes:
+      1) rec == actual TIMEBASE payload object
+      2) rec == wrapper containing {"payload": actual_payload}
+    """
+    if not isinstance(rec, dict):
+        return {}
 
-def _bucket_summary(name: str, counter: Counter[int], limit: int = TOP_BUCKETS) -> None:
-    print(f"  {name}:")
-    if not counter:
-        print("    (no data)")
-        print()
-        return
+    inner = rec.get("payload")
+    if isinstance(inner, dict) and (
+        "pps_count" in inner or "fragment" in inner or "campaign" in inner
+    ):
+        return inner
 
-    total = sum(counter.values())
-    for value, n in counter.most_common(limit):
-        pct = (100.0 * n / total) if total else 0.0
-        print(f"    {value:,}: {n:>4d}  ({pct:5.1f}%)")
-    print()
-
-
-def _residue_summary(name: str, counter: Counter[int], mod: int = MODULUS) -> None:
-    print(f"  {name} mod {mod}:")
-    if not counter:
-        print("    (no data)")
-        print()
-        return
-
-    total = sum(counter.values())
-    for residue, n in sorted(counter.items()):
-        pct = (100.0 * n / total) if total else 0.0
-        print(f"    {residue:>2d}: {n:>4d}  ({pct:5.1f}%)")
-    print()
+    return rec
 
 
-def _diag_field(rec: Dict[str, Any], prefix: str, suffix: str) -> Optional[int]:
-    return _as_int(_frag(rec, f"{prefix}_{suffix}"))
+def root_field(rec: Dict[str, Any], key: str) -> Any:
+    return normalize_payload_object(rec).get(key)
 
 
-def _shadow_to_isr(rec: Dict[str, Any], prefix: str) -> Optional[int]:
-    raw = _diag_field(rec, prefix, "diag_dwt_isr_entry_raw")
-    shadow = _diag_field(rec, prefix, "diag_shadow_dwt")
-    if raw is None or shadow is None:
+def frag_field(rec: Dict[str, Any], key: str) -> Any:
+    frag = normalize_payload_object(rec).get("fragment")
+    if isinstance(frag, dict):
+        return frag.get(key)
+    return None
+
+
+def as_int(v: Any) -> Optional[int]:
+    if v is None:
         return None
-    return raw - shadow
+    try:
+        return int(v)
+    except Exception:
+        return None
 
 
-# ─────────────────────────────────────────────────────────────────────
-# Analysis
-# ─────────────────────────────────────────────────────────────────────
+def fmt_int(v: Optional[int], width: int = 0, signed: bool = False) -> str:
+    if v is None:
+        s = "---"
+    else:
+        s = f"{v:+,d}" if signed else f"{v:,d}"
+    return f"{s:>{width}s}" if width else s
+
+
+def print_series(name: str, w: Welford, unit: str = "") -> None:
+    if w.n < 2:
+        return
+    suffix = f" {unit}" if unit else ""
+    print(f"{name}:")
+    print(f"  n       = {w.n:,}")
+    print(f"  mean    = {w.mean:,.3f}{suffix}")
+    print(f"  stddev  = {w.stddev:,.3f}{suffix}")
+    print(f"  stderr  = {w.stderr:,.3f}{suffix}")
+    print(f"  min/max = {w.min_val:,.0f} .. {w.max_val:,.0f}{suffix}")
+    print()
+
 
 def analyze(campaign: str, limit: int = 0) -> None:
     rows = fetch_timebase(campaign)
@@ -190,308 +160,214 @@ def analyze(campaign: str, limit: int = 0) -> None:
         print(f"No TIMEBASE rows for campaign '{campaign}'")
         return
 
-    print(f"Campaign: {campaign}  ({len(rows)} records)")
+    print(f"Campaign: {campaign}  ({len(rows)} rows)")
     print()
 
     print(
-        f"  {'pps':>5s}"
-        f"  {'pred':>12s}"
-        f"  {'act':>12s}"
-        f"  {'res':>7s}"
-        f"  {'o1_obs':>12s}"
-        f"  {'o1_best':>12s}"
-        f"  {'mO1':>4s}"
-        f"  {'mB1':>4s}"
-        f"  {'ns1':>6s}"
-        f"  {'dq1':>3s}"
-        f"  {'b1':>4s}"
-        f"  {'c1':>4s}"
-        f"  {'o2_obs':>12s}"
-        f"  {'o2_best':>12s}"
-        f"  {'mO2':>4s}"
-        f"  {'mB2':>4s}"
-        f"  {'ns2':>6s}"
-        f"  {'dq2':>3s}"
-        f"  {'b2':>4s}"
-        f"  {'c2':>4s}"
+        f"{'pps':>6s}  "
+        f"{'dwt_act':>12s}  {'dwt_last_pred':>14s}  {'dwt_res':>8s}  "
+        f"{'o1_cyc':>12s}  {'o1_ns':>11s}  {'o1_res':>8s}  "
+        f"{'o2_cyc':>12s}  {'o2_ns':>11s}  {'o2_res':>8s}  "
+        f"{'cycΔ':>8s}  {'nsΔ':>8s}"
     )
     print(
-        f"  {'─' * 5}"
-        f"  {'─' * 12}"
-        f"  {'─' * 12}"
-        f"  {'─' * 7}"
-        f"  {'─' * 12}"
-        f"  {'─' * 12}"
-        f"  {'─' * 4}"
-        f"  {'─' * 4}"
-        f"  {'─' * 6}"
-        f"  {'─' * 3}"
-        f"  {'─' * 4}"
-        f"  {'─' * 4}"
-        f"  {'─' * 12}"
-        f"  {'─' * 12}"
-        f"  {'─' * 4}"
-        f"  {'─' * 4}"
-        f"  {'─' * 6}"
-        f"  {'─' * 3}"
-        f"  {'─' * 4}"
-        f"  {'─' * 4}"
+        f"{'─'*6}  "
+        f"{'─'*12}  {'─'*14}  {'─'*8}  "
+        f"{'─'*12}  {'─'*11}  {'─'*8}  "
+        f"{'─'*12}  {'─'*11}  {'─'*8}  "
+        f"{'─'*8}  {'─'*8}"
     )
 
-    w_dwt = Welford()
+    w_dwt_act = Welford()
+    w_dwt_last_pred = Welford()
+    w_dwt_next_pred = Welford()
+    w_dwt_res = Welford()
+    w_dwt_adj = Welford()
+    w_dwt_effective = Welford()
 
-    w_o1_obs = Welford()
-    w_o1_best = Welford()
-    w_o2_obs = Welford()
-    w_o2_best = Welford()
-
+    w_o1_cyc = Welford()
+    w_o2_cyc = Welford()
     w_o1_ns = Welford()
     w_o2_ns = Welford()
+    w_o1_res = Welford()
+    w_o2_res = Welford()
+    w_lane_cycle_delta = Welford()
+    w_lane_ns_delta = Welford()
+    w_joint_cycle_move_mismatch = Welford()
+    w_joint_ns_move_mismatch = Welford()
 
-    w_s1 = Welford()
-    w_s2 = Welford()
-    w_ap1 = Welford()
-    w_ap2 = Welford()
+    prev_row_pps: Optional[int] = None
+    prev_o1_cyc: Optional[int] = None
+    prev_o2_cyc: Optional[int] = None
+    prev_o1_ns: Optional[int] = None
+    prev_o2_ns: Optional[int] = None
 
-    buckets_o1_obs: Counter[int] = Counter()
-    buckets_o1_best: Counter[int] = Counter()
-    buckets_o2_obs: Counter[int] = Counter()
-    buckets_o2_best: Counter[int] = Counter()
-
-    residues_pps: Counter[int] = Counter()
-    residues_o1_obs: Counter[int] = Counter()
-    residues_o1_best: Counter[int] = Counter()
-    residues_o2_obs: Counter[int] = Counter()
-    residues_o2_best: Counter[int] = Counter()
-
-    dequant_bucket_counts_1: Counter[int] = Counter()
-    dequant_bucket_counts_2: Counter[int] = Counter()
-
-    count = 0
+    shown = 0
     gaps = 0
-    prev_pps: Optional[int] = None
 
     for rec in rows:
-        pps = rec.get("pps_count")
-        if pps is None:
+        row_pps = as_int(frag_field(rec, "teensy_pps_count"))
+        if row_pps is None:
+            row_pps = as_int(root_field(rec, "pps_count"))
+        if row_pps is None:
             continue
-        pps = int(pps)
 
-        if prev_pps is not None and pps != prev_pps + 1:
-            skipped = pps - prev_pps - 1
+        if prev_row_pps is not None and row_pps != prev_row_pps + 1:
             gaps += 1
-            print(f"  {'':>5s}  --- gap {prev_pps} → {pps} ({skipped}s lost, stats reset) ---")
-            for w in (w_dwt, w_o1_obs, w_o1_best, w_o2_obs, w_o2_best, w_o1_ns, w_o2_ns, w_s1, w_s2, w_ap1, w_ap2):
-                w.reset()
+            print(f"{'':>6s}  --- gap {prev_row_pps} → {row_pps} ---")
+        prev_row_pps = row_pps
 
-        prev_pps = pps
+        # DWT raw second truth surface.
+        dwt_at_pps = as_int(frag_field(rec, "dwt_cycle_count_at_pps"))
+        if dwt_at_pps is None:
+            dwt_at_pps = as_int(root_field(rec, "dwt_cycle_count_at_pps"))
 
-        predicted = _as_int(_frag(rec, "dwt_cycle_count_next_second_prediction"))
-        actual = _as_int(_frag(rec, "dwt_cycle_count_between_pps"))
+        dwt_actual = as_int(frag_field(rec, "dwt_cycle_count_between_pps"))
+        if dwt_actual is None:
+            dwt_actual = as_int(root_field(rec, "dwt_cycle_count_between_pps"))
 
-        if predicted is None:
-            predicted = _as_int(rec.get("dwt_cycles_per_pps"))
-        if actual is None:
-            actual = _as_int(rec.get("dwt_delta_raw"))
+        dwt_last_pred = as_int(frag_field(rec, "dwt_cycle_count_last_second_prediction"))
+        if dwt_last_pred is None:
+            dwt_last_pred = as_int(root_field(rec, "dwt_cycle_count_last_second_prediction"))
 
-        o1_obs = _diag_field(rec, "ocxo1", "diag_dwt_delta_observed")
-        o1_best = _diag_field(rec, "ocxo1", "diag_dwt_delta_best")
-        o2_obs = _diag_field(rec, "ocxo2", "diag_dwt_delta_observed")
-        o2_best = _diag_field(rec, "ocxo2", "diag_dwt_delta_best")
+        dwt_next_pred = as_int(frag_field(rec, "dwt_cycle_count_next_second_prediction"))
+        if dwt_next_pred is None:
+            dwt_next_pred = as_int(root_field(rec, "dwt_cycle_count_next_second_prediction"))
 
-        ns1 = _as_int(_frag(rec, "ocxo1_second_residual_ns"))
-        ns2 = _as_int(_frag(rec, "ocxo2_second_residual_ns"))
+        dwt_adj = as_int(frag_field(rec, "dwt_cycle_count_next_second_adjustment"))
+        if dwt_adj is None:
+            dwt_adj = as_int(root_field(rec, "dwt_cycle_count_next_second_adjustment"))
 
-        dq1 = _frag(rec, "ocxo1_diag_dequant_enabled")
-        dq2 = _frag(rec, "ocxo2_diag_dequant_enabled")
-        b1 = _diag_field(rec, "ocxo1", "diag_dequant_bucket_cycles")
-        b2 = _diag_field(rec, "ocxo2", "diag_dequant_bucket_cycles")
-        c1 = _diag_field(rec, "ocxo1", "diag_dequant_confidence")
-        c2 = _diag_field(rec, "ocxo2", "diag_dequant_confidence")
+        dwt_effective = as_int(frag_field(rec, "dwt_effective_cycles_per_second"))
+        if dwt_effective is None:
+            dwt_effective = as_int(root_field(rec, "dwt_effective_cycles_per_second"))
 
-        s1 = _shadow_to_isr(rec, "ocxo1")
-        s2 = _shadow_to_isr(rec, "ocxo2")
-        ap1 = _diag_field(rec, "ocxo1", "diag_approach_cycles")
-        ap2 = _diag_field(rec, "ocxo2", "diag_approach_cycles")
+        dwt_expected = as_int(frag_field(rec, "dwt_expected_per_pps"))
+        if dwt_expected is None:
+            dwt_expected = as_int(root_field(rec, "dwt_expected_per_pps"))
 
-        residual = None
-        if predicted is not None and actual is not None:
-            residual = actual - predicted
-            w_dwt.update(float(residual))
-            residues_pps[_mod(actual)] += 1
+        dwt_res = None
+        if dwt_actual is not None and dwt_last_pred is not None:
+            dwt_res = dwt_actual - dwt_last_pred
 
-        if o1_obs is not None:
-            w_o1_obs.update(float(o1_obs))
-            buckets_o1_obs[o1_obs] += 1
-            residues_o1_obs[_mod(o1_obs)] += 1
+        if dwt_actual is not None:
+            w_dwt_act.update(float(dwt_actual))
+        if dwt_last_pred is not None:
+            w_dwt_last_pred.update(float(dwt_last_pred))
+        if dwt_next_pred is not None:
+            w_dwt_next_pred.update(float(dwt_next_pred))
+        if dwt_res is not None:
+            w_dwt_res.update(float(dwt_res))
+        if dwt_adj is not None:
+            w_dwt_adj.update(float(dwt_adj))
+        if dwt_effective is not None:
+            w_dwt_effective.update(float(dwt_effective))
 
-        if o1_best is not None:
-            w_o1_best.update(float(o1_best))
-            buckets_o1_best[o1_best] += 1
-            residues_o1_best[_mod(o1_best)] += 1
+        # OCXO raw second truth surface.
+        o1_cyc = as_int(frag_field(rec, "ocxo1_dwt_cycles_between_edges"))
+        o2_cyc = as_int(frag_field(rec, "ocxo2_dwt_cycles_between_edges"))
+        o1_ns = as_int(frag_field(rec, "ocxo1_gnss_ns_between_edges"))
+        o2_ns = as_int(frag_field(rec, "ocxo2_gnss_ns_between_edges"))
 
-        if o2_obs is not None:
-            w_o2_obs.update(float(o2_obs))
-            buckets_o2_obs[o2_obs] += 1
-            residues_o2_obs[_mod(o2_obs)] += 1
+        o1_res = None if o1_ns is None else (NS_PER_SECOND - o1_ns)
+        o2_res = None if o2_ns is None else (NS_PER_SECOND - o2_ns)
 
-        if o2_best is not None:
-            w_o2_best.update(float(o2_best))
-            buckets_o2_best[o2_best] += 1
-            residues_o2_best[_mod(o2_best)] += 1
+        cyc_delta = None
+        if o1_cyc is not None and o2_cyc is not None:
+            cyc_delta = o2_cyc - o1_cyc
+            w_lane_cycle_delta.update(float(cyc_delta))
 
-        if ns1 is not None:
-            w_o1_ns.update(float(ns1))
-        if ns2 is not None:
-            w_o2_ns.update(float(ns2))
+        ns_delta = None
+        if o1_ns is not None and o2_ns is not None:
+            ns_delta = o2_ns - o1_ns
+            w_lane_ns_delta.update(float(ns_delta))
 
-        if s1 is not None:
-            w_s1.update(float(s1))
-        if s2 is not None:
-            w_s2.update(float(s2))
+        if o1_cyc is not None:
+            w_o1_cyc.update(float(o1_cyc))
+        if o2_cyc is not None:
+            w_o2_cyc.update(float(o2_cyc))
+        if o1_ns is not None:
+            w_o1_ns.update(float(o1_ns))
+        if o2_ns is not None:
+            w_o2_ns.update(float(o2_ns))
+        if o1_res is not None:
+            w_o1_res.update(float(o1_res))
+        if o2_res is not None:
+            w_o2_res.update(float(o2_res))
 
-        if ap1 is not None:
-            w_ap1.update(float(ap1))
-        if ap2 is not None:
-            w_ap2.update(float(ap2))
+        if (
+            prev_o1_cyc is not None and prev_o2_cyc is not None and
+            o1_cyc is not None and o2_cyc is not None
+        ):
+            move1 = o1_cyc - prev_o1_cyc
+            move2 = o2_cyc - prev_o2_cyc
+            w_joint_cycle_move_mismatch.update(float(move1 - move2))
 
-        if b1 is not None:
-            dequant_bucket_counts_1[b1] += 1
-        if b2 is not None:
-            dequant_bucket_counts_2[b2] += 1
+        if (
+            prev_o1_ns is not None and prev_o2_ns is not None and
+            o1_ns is not None and o2_ns is not None
+        ):
+            move1 = o1_ns - prev_o1_ns
+            move2 = o2_ns - prev_o2_ns
+            w_joint_ns_move_mismatch.update(float(move1 - move2))
 
-        dq1s = "Y" if dq1 is True else "N"
-        dq2s = "Y" if dq2 is True else "N"
+        prev_o1_cyc = o1_cyc
+        prev_o2_cyc = o2_cyc
+        prev_o1_ns = o1_ns
+        prev_o2_ns = o2_ns
 
         print(
-            f"  {pps:>5d}"
-            f"  {_fmt_int(predicted, 12)}"
-            f"  {_fmt_int(actual, 12)}"
-            f"  {_fmt_int(residual, 7, signed=True)}"
-            f"  {_fmt_int(o1_obs, 12)}"
-            f"  {_fmt_int(o1_best, 12)}"
-            f"  {_fmt_int(_mod(o1_obs), 4)}"
-            f"  {_fmt_int(_mod(o1_best), 4)}"
-            f"  {_fmt_int(ns1, 6, signed=True)}"
-            f"  {dq1s:>3s}"
-            f"  {_fmt_int(b1, 4)}"
-            f"  {_fmt_int(c1, 4)}"
-            f"  {_fmt_int(o2_obs, 12)}"
-            f"  {_fmt_int(o2_best, 12)}"
-            f"  {_fmt_int(_mod(o2_obs), 4)}"
-            f"  {_fmt_int(_mod(o2_best), 4)}"
-            f"  {_fmt_int(ns2, 6, signed=True)}"
-            f"  {dq2s:>3s}"
-            f"  {_fmt_int(b2, 4)}"
-            f"  {_fmt_int(c2, 4)}"
+            f"{row_pps:>6d}  "
+            f"{fmt_int(dwt_actual,12)}  {fmt_int(dwt_last_pred,14)}  {fmt_int(dwt_res,8,True)}  "
+            f"{fmt_int(o1_cyc,12)}  {fmt_int(o1_ns,11)}  {fmt_int(o1_res,8,True)}  "
+            f"{fmt_int(o2_cyc,12)}  {fmt_int(o2_ns,11)}  {fmt_int(o2_res,8,True)}  "
+            f"{fmt_int(cyc_delta,8,True)}  {fmt_int(ns_delta,8,True)}"
         )
 
-        count += 1
-        if limit and count >= limit:
+        shown += 1
+        if limit and shown >= limit:
             break
 
     print()
-    print(f"  {count} rows, {gaps} recovery gap(s)")
+    print(f"Rows shown: {shown:,}")
+    print(f"Gaps:       {gaps:,}")
     print()
 
-    if w_dwt.n >= 2:
-        pred_ns = w_dwt.stddev * (125.0 / 126.0)
-        print("  PPS DWT prediction residual (actual - predicted):")
-        print(f"    n       = {w_dwt.n:,}")
-        print(f"    mean    = {w_dwt.mean:+.2f} cycles")
-        print(f"    stddev  = {w_dwt.stddev:.2f} cycles")
-        print(f"    stderr  = {w_dwt.stderr:.3f} cycles")
-        print(f"    1σ interpolation uncertainty = {pred_ns:.2f} ns")
-        print()
+    print_series("DWT cycle count between PPS", w_dwt_act, "cycles")
+    print_series("DWT last-second prediction (untrammeled)", w_dwt_last_pred, "cycles")
+    print_series("DWT next-second prediction (forward-looking)", w_dwt_next_pred, "cycles")
+    print_series("DWT residual (actual - last-second prediction)", w_dwt_res, "cycles")
+    print_series("DWT next-second adjustment", w_dwt_adj, "cycles")
+    print_series("DWT effective cycles per second", w_dwt_effective, "cycles")
 
-    def print_series(name: str, w: Welford, unit: str = "cycles") -> None:
-        if w.n < 2:
-            return
-        print(f"  {name}:")
-        print(f"    n       = {w.n:,}")
-        print(f"    mean    = {w.mean:,.2f} {unit}")
-        print(f"    stddev  = {w.stddev:.2f} {unit}")
-        print(f"    min/max = {w.min_val:,.0f} .. {w.max_val:,.0f}")
-        print()
+    print_series("OCXO1 raw cycles between edges", w_o1_cyc, "cycles")
+    print_series("OCXO2 raw cycles between edges", w_o2_cyc, "cycles")
+    print_series("OCXO1 raw GNSS ns between edges", w_o1_ns, "ns")
+    print_series("OCXO2 raw GNSS ns between edges", w_o2_ns, "ns")
+    print_series("OCXO1 simple residual (1e9 - ns)", w_o1_res, "ns")
+    print_series("OCXO2 simple residual (1e9 - ns)", w_o2_res, "ns")
+    print_series("Lane delta (OCXO2 cycles - OCXO1 cycles)", w_lane_cycle_delta, "cycles")
+    print_series("Lane delta (OCXO2 ns - OCXO1 ns)", w_lane_ns_delta, "ns")
+    print_series("Joint-motion mismatch (ΔOCXO1 vs ΔOCXO2 cycles)", w_joint_cycle_move_mismatch, "cycles")
+    print_series("Joint-motion mismatch (ΔOCXO1 vs ΔOCXO2 ns)", w_joint_ns_move_mismatch, "ns")
 
-    print_series("OCXO1 observed delta", w_o1_obs)
-    print_series("OCXO1 best delta", w_o1_best)
-    print_series("OCXO2 observed delta", w_o2_obs)
-    print_series("OCXO2 best delta", w_o2_best)
-    print_series("OCXO1 second residual", w_o1_ns, "ns")
-    print_series("OCXO2 second residual", w_o2_ns, "ns")
-    print_series("OCXO1 shadow_to_isr_cycles", w_s1)
-    print_series("OCXO2 shadow_to_isr_cycles", w_s2)
-    print_series("OCXO1 approach_cycles", w_ap1)
-    print_series("OCXO2 approach_cycles", w_ap2)
+    print("Notes:")
+    print("  dwt_act       = dwt_cycle_count_between_pps")
+    print("  dwt_last_pred = dwt_cycle_count_last_second_prediction")
+    print("  dwt_next_pred = dwt_cycle_count_next_second_prediction")
+    print("  dwt_res       = dwt_cycle_count_between_pps - dwt_cycle_count_last_second_prediction")
+    print("  o1_res   = 1,000,000,000 - ocxo1_gnss_ns_between_edges")
+    print("  o2_res   = 1,000,000,000 - ocxo2_gnss_ns_between_edges")
+    print("  cycΔ/nsΔ = OCXO2 - OCXO1 for the same second")
+    print("  Joint-motion mismatch near zero suggests common-mode movement.")
+    print("  Large lane deltas with low joint-motion mismatch suggest shared excursions plus fixed bias.")
+    if dwt_expected is not None:
+        print(f"  dwt_expected_per_pps = {dwt_expected:,}")
 
-    print("  Residue summaries:")
-    _residue_summary("PPS actual", residues_pps)
-    _residue_summary("OCXO1 observed", residues_o1_obs)
-    _residue_summary("OCXO1 best", residues_o1_best)
-    _residue_summary("OCXO2 observed", residues_o2_obs)
-    _residue_summary("OCXO2 best", residues_o2_best)
-
-    print("  Dominant bucket summaries:")
-    _bucket_summary("OCXO1 observed buckets", buckets_o1_obs)
-    _bucket_summary("OCXO1 best buckets", buckets_o1_best)
-    _bucket_summary("OCXO2 observed buckets", buckets_o2_obs)
-    _bucket_summary("OCXO2 best buckets", buckets_o2_best)
-
-    print("  Dequantizer inferred bucket counts:")
-    _bucket_summary("OCXO1 inferred bucket size", dequant_bucket_counts_1)
-    _bucket_summary("OCXO2 inferred bucket size", dequant_bucket_counts_2)
-
-    if w_o1_obs.n >= 10 and w_o1_best.n >= 10:
-        print("  Dequantization analysis:")
-        print(f"    OCXO1 observed stddev: {w_o1_obs.stddev:.2f} cycles")
-        print(f"    OCXO1 best stddev:     {w_o1_best.stddev:.2f} cycles")
-        print(f"    OCXO2 observed stddev: {w_o2_obs.stddev:.2f} cycles")
-        print(f"    OCXO2 best stddev:     {w_o2_best.stddev:.2f} cycles")
-        print(f"    OCXO1 residual stddev: {w_o1_ns.stddev:.2f} ns" if w_o1_ns.n >= 2 else "    OCXO1 residual stddev: ---")
-        print(f"    OCXO2 residual stddev: {w_o2_ns.stddev:.2f} ns" if w_o2_ns.n >= 2 else "    OCXO2 residual stddev: ---")
-
-        if len(residues_o1_obs) == 1 and 0 in residues_o1_obs:
-            print("    ✓ OCXO1 observed path remains locked to lattice")
-        if len(residues_o1_best) > 1 or 0 not in residues_o1_best:
-            print("    ✓ OCXO1 best path escapes pure lattice locking")
-
-        if len(residues_o2_obs) == 1 and 0 in residues_o2_obs:
-            print("    ✓ OCXO2 observed path remains locked to lattice")
-        if len(residues_o2_best) > 1 or 0 not in residues_o2_best:
-            print("    ✓ OCXO2 best path escapes pure lattice locking")
-        print()
-
-
-# ─────────────────────────────────────────────────────────────────────
-# Entrypoint
-# ─────────────────────────────────────────────────────────────────────
 
 def main() -> None:
     if len(sys.argv) < 2:
         print("Usage: raw_cycles <campaign_name> [limit]")
-        print()
-        try:
-            with open_db(row_dict=True) as conn:
-                cur = conn.cursor()
-                cur.execute(
-                    """
-                    SELECT campaign, count(*) as cnt
-                    FROM timebase
-                    GROUP BY campaign
-                    ORDER BY max(ts) DESC
-                    LIMIT 10
-                    """
-                )
-                rows = cur.fetchall()
-            if rows:
-                print("Available campaigns:")
-                print(f"  {'CAMPAIGN':<20s} {'RECORDS':>8s}")
-                print(f"  {'─' * 20} {'─' * 8}")
-                for r in rows:
-                    print(f"  {r['campaign']:<20s} {r['cnt']:>8d}")
-        except Exception:
-            pass
         sys.exit(1)
 
     campaign = sys.argv[1]

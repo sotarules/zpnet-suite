@@ -76,6 +76,7 @@ volatile uint64_t g_gnss_ns_count_at_pps = 0;
 volatile uint32_t g_dwt_cycle_count_at_pps = 0;
 volatile uint64_t g_dwt_cycle_count_total = 0;
 volatile uint32_t g_dwt_cycle_count_between_pps = 0;
+volatile uint32_t g_dwt_cycle_count_last_second_prediction = DWT_EXPECTED_PER_PPS;
 volatile uint32_t g_dwt_cycle_count_next_second_prediction = DWT_EXPECTED_PER_PPS;
 volatile int32_t  g_dwt_cycle_count_next_second_adjustment = 0;
 volatile uint64_t g_dwt_model_pps_count = 0;
@@ -312,6 +313,7 @@ static void alpha_reset_canonical_clock_state_for_new_epoch(void) {
   g_dwt_cycle_count_at_pps = 0;
   g_dwt_cycle_count_total = 0;
   g_dwt_cycle_count_between_pps = 0;
+  g_dwt_cycle_count_last_second_prediction = DWT_EXPECTED_PER_PPS;
   g_dwt_cycle_count_next_second_prediction = DWT_EXPECTED_PER_PPS;
   g_dwt_cycle_count_next_second_adjustment = 0;
   g_dwt_model_pps_count = 0;
@@ -487,6 +489,7 @@ static void pps_callback(
     const uint32_t delta32 = event.dwt_at_event - prev_dwt_pps;
     g_dwt_cycle_count_total += (uint64_t)delta32;
     g_dwt_cycle_count_between_pps = delta32;
+    g_dwt_cycle_count_last_second_prediction = g_dwt_cycle_count_next_second_prediction;
 
     if (g_dwt_model_pps_count > 0) {
       g_dwt_cycle_count_next_second_prediction = delta32;
