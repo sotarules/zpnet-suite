@@ -1,12 +1,38 @@
 """
-ZPNet Raw Cycles — legacy vs authoritative timing surfaces
+ZPNet Raw Cycles — honest cross-check of integrator vs simple subtraction
 
-Reads both:
-  1. legacy top-level OCXO fields from TIMEBASE_FRAGMENT
-  2. new authoritative interrupt-diag OCXO interval-ledger fields
+Reads TIMEBASE rows for a campaign and asks the question:
 
-This version is aligned to the actual flat fragment schema, where keys such as
-"ocxo1_diag_ocxo_second_cycles_observed" live directly in fragment.
+    Does the rolling integrator's smoothed synthetic boundary differ
+    meaningfully from what a simple "subtract this PPS's raw DWT capture
+    from the previous PPS's raw DWT capture" would yield?
+
+If yes, the integration is doing real work — averaging away QuadTimer
+compare-path jitter that a single capture would otherwise inject into
+every measurement.
+
+If no, the integration is bookkeeping over a jitter-free substrate, and
+the synthetic boundary is structurally equivalent to the raw capture.
+This would prove that the entire ring-buffer apparatus is unnecessary
+for VCLOCK (and by extension for all three lanes, since they use the
+same QuadTimer compare mechanism).
+
+The two quantities being compared, per PPS:
+
+  integ_diff  = dwt_cycle_count_at_pps[N] - dwt_cycle_count_at_pps[N-1]
+                ↑ The integrator's synthetic boundary delta
+
+  raw_diff    = pps_diag_dwt_isr_entry_raw[N] - pps_diag_dwt_isr_entry_raw[N-1]
+                ↑ What simple subtraction of the actual ISR-entry DWT
+                  capture would yield (no integration, no smoothing)
+
+  integ_minus_raw = integ_diff - raw_diff
+                ↑ The diagnostic that answers the question
+
+Plus the GPIO PPS witness for context.
+
+Usage:
+    python -m zpnet.tests.raw_cycles <campaign_name> [limit]
 """
 
 from __future__ import annotations
@@ -18,8 +44,13 @@ from typing import Any, Dict, List, Optional
 
 from zpnet.shared.db import open_db
 
-NS_PER_SECOND = 1_000_000_000
 
+DWT_EXPECTED_PER_PPS = 1_008_000_000  # nominal CPU cycles per second (1.008 GHz)
+
+
+# ---------------------------------------------------------------------
+# Welford online accumulator
+# ---------------------------------------------------------------------
 
 class Welford:
     __slots__ = ("n", "mean", "m2", "min_val", "max_val")
@@ -51,6 +82,10 @@ class Welford:
         return self.stddev / math.sqrt(self.n) if self.n >= 2 else 0.0
 
 
+# ---------------------------------------------------------------------
+# DB access
+# ---------------------------------------------------------------------
+
 def fetch_timebase(campaign: str) -> List[Dict[str, Any]]:
     with open_db(row_dict=True) as conn:
         cur = conn.cursor()
@@ -75,27 +110,28 @@ def fetch_timebase(campaign: str) -> List[Dict[str, Any]]:
     return result
 
 
-def normalize_payload_object(rec: Dict[str, Any]) -> Dict[str, Any]:
+# ---------------------------------------------------------------------
+# Field access — fragment-aware
+# ---------------------------------------------------------------------
+
+def _frag(rec: Dict[str, Any]) -> Dict[str, Any]:
     if not isinstance(rec, dict):
         return {}
-    inner = rec.get("payload")
-    if isinstance(inner, dict) and ("pps_count" in inner or "fragment" in inner or "campaign" in inner):
-        return inner
-    return rec
+    inner = rec.get("payload") if "payload" in rec else rec
+    if not isinstance(inner, dict):
+        return {}
+    frag = inner.get("fragment")
+    return frag if isinstance(frag, dict) else {}
 
 
-def root_field(rec: Dict[str, Any], key: str) -> Any:
-    return normalize_payload_object(rec).get(key)
+def _root(rec: Dict[str, Any]) -> Dict[str, Any]:
+    if not isinstance(rec, dict):
+        return {}
+    inner = rec.get("payload") if "payload" in rec else rec
+    return inner if isinstance(inner, dict) else {}
 
 
-def frag_field(rec: Dict[str, Any], key: str) -> Any:
-    frag = normalize_payload_object(rec).get("fragment")
-    if isinstance(frag, dict):
-        return frag.get(key)
-    return None
-
-
-def as_int(v: Any) -> Optional[int]:
+def _as_int(v: Any) -> Optional[int]:
     if v is None:
         return None
     try:
@@ -104,7 +140,20 @@ def as_int(v: Any) -> Optional[int]:
         return None
 
 
-def fmt_int(v: Optional[int], width: int = 0, signed: bool = False) -> str:
+# ---------------------------------------------------------------------
+# DWT u32 wrap-aware delta
+# ---------------------------------------------------------------------
+
+def _u32_diff(curr: int, prev: int) -> int:
+    """Unsigned delta of two u32 DWT samples, accounting for wrap."""
+    return (curr - prev) & 0xFFFFFFFF
+
+
+# ---------------------------------------------------------------------
+# Formatting
+# ---------------------------------------------------------------------
+
+def _fmt_int(v: Optional[int], width: int = 0, signed: bool = False) -> str:
     if v is None:
         s = "---"
     else:
@@ -112,18 +161,24 @@ def fmt_int(v: Optional[int], width: int = 0, signed: bool = False) -> str:
     return f"{s:>{width}s}" if width else s
 
 
-def print_series(name: str, w: Welford, unit: str = "") -> None:
+def _print_welford(name: str, w: Welford, unit: str = "") -> None:
     if w.n < 2:
         return
     suffix = f" {unit}" if unit else ""
-    print(f"{name}:")
-    print(f"  n       = {w.n:,}")
-    print(f"  mean    = {w.mean:,.3f}{suffix}")
-    print(f"  stddev  = {w.stddev:,.3f}{suffix}")
-    print(f"  stderr  = {w.stderr:,.3f}{suffix}")
-    print(f"  min/max = {w.min_val:,.0f} .. {w.max_val:,.0f}{suffix}")
+    print(f"  {name}")
+    print(f"    n       = {w.n:,}")
+    print(f"    mean    = {w.mean:+,.3f}{suffix}")
+    print(f"    stddev  = {w.stddev:,.3f}{suffix}")
+    print(f"    stderr  = {w.stderr:,.3f}{suffix}")
+    print(f"    min     = {w.min_val:+,.0f}{suffix}")
+    print(f"    max     = {w.max_val:+,.0f}{suffix}")
+    print(f"    range   = {w.max_val - w.min_val:,.0f}{suffix}")
     print()
 
+
+# ---------------------------------------------------------------------
+# Main analysis
+# ---------------------------------------------------------------------
 
 def analyze(campaign: str, limit: int = 0) -> None:
     rows = fetch_timebase(campaign)
@@ -131,152 +186,204 @@ def analyze(campaign: str, limit: int = 0) -> None:
         print(f"No TIMEBASE rows for campaign '{campaign}'")
         return
 
-    print(f"Campaign: {campaign}  ({len(rows)} rows)")
+    print(f"Campaign: {campaign}  ({len(rows):,} rows)")
+    print(f"DWT_EXPECTED_PER_PPS = {DWT_EXPECTED_PER_PPS:,}")
+    print()
+    print("Cross-check question: does the integrator's smoothed synthetic")
+    print("boundary differ from a simple subtraction of raw ISR-entry DWT?")
     print()
 
-    print(
+    # Header.
+    header = (
         f"{'pps':>6s}  "
-        f"{'dwt_fin':>12s}  {'dwt_raw':>12s}  {'dwt_Δ':>8s}  {'dwt_lp':>12s}  {'dwt_res':>8s}  "
-        f"{'o1_old':>12s}  {'o1_fin':>12s}  {'o1_raw':>12s}  {'o1_ns_old':>11s}  {'o1_ns_fin':>11s}  {'o1_ns_raw':>11s}  "
-        f"{'o2_old':>12s}  {'o2_fin':>12s}  {'o2_raw':>12s}  {'o2_ns_old':>11s}  {'o2_ns_fin':>11s}  {'o2_ns_raw':>11s}"
+        f"{'integ_diff':>13s}  "
+        f"{'raw_diff':>13s}  "
+        f"{'integ-raw':>10s}  "
+        f"{'integ_res':>9s}  "
+        f"{'raw_res':>9s}  "
+        f"{'gpio_ns':>14s}"
     )
-    print(
+    sep = (
         f"{'─'*6}  "
-        f"{'─'*12}  {'─'*12}  {'─'*8}  {'─'*12}  {'─'*8}  "
-        f"{'─'*12}  {'─'*12}  {'─'*12}  {'─'*11}  {'─'*11}  {'─'*11}  "
-        f"{'─'*12}  {'─'*12}  {'─'*12}  {'─'*11}  {'─'*11}  {'─'*11}"
+        f"{'─'*13}  "
+        f"{'─'*13}  "
+        f"{'─'*10}  "
+        f"{'─'*9}  "
+        f"{'─'*9}  "
+        f"{'─'*14}"
     )
+    print(header)
+    print(sep)
 
-    w_dwt_fin = Welford()
-    w_dwt_raw = Welford()
-    w_dwt_delta = Welford()
-    w_dwt_last_pred = Welford()
-    w_dwt_res = Welford()
-    w_dwt_interval_count = Welford()
+    # Welford accumulators.
+    w_integ_diff       = Welford()  # synthetic boundary delta
+    w_raw_diff         = Welford()  # simple-subtraction equivalent
+    w_integ_minus_raw  = Welford()  # THE answer — does integration matter?
+    w_integ_res        = Welford()  # integ_diff vs nominal
+    w_raw_res          = Welford()  # raw_diff vs nominal
+    w_gpio             = Welford()
+    w_gpio_drift       = Welford()  # vs running mean
 
-    w_o1_old = Welford()
-    w_o1_fin = Welford()
-    w_o1_raw = Welford()
-    w_o1_ns_old = Welford()
-    w_o1_ns_fin = Welford()
-    w_o1_ns_raw = Welford()
-
-    w_o2_old = Welford()
-    w_o2_fin = Welford()
-    w_o2_raw = Welford()
-    w_o2_ns_old = Welford()
-    w_o2_ns_fin = Welford()
-    w_o2_ns_raw = Welford()
-
+    samples = []
     shown = 0
     gaps = 0
     prev_pps: Optional[int] = None
+    prev_integ: Optional[int] = None
+    prev_raw: Optional[int] = None
 
     for rec in rows:
-        pps = as_int(root_field(rec, "pps_count"))
+        root = _root(rec)
+        frag = _frag(rec)
+
+        pps = _as_int(root.get("pps_count"))
+        if pps is None:
+            pps = _as_int(frag.get("teensy_pps_count"))
         if pps is None:
             continue
 
+        # Both timing surfaces.
+        integ_now = _as_int(frag.get("dwt_cycle_count_at_pps"))
+        raw_now = _as_int(frag.get("pps_diag_dwt_isr_entry_raw"))
+        gpio_ns = _as_int(frag.get("pps_diag_gpio_minus_synthetic_ns"))
+
+        # Detect gaps.
         if prev_pps is not None and pps != prev_pps + 1:
             gaps += 1
-            print(f"{'':>6s}  --- gap {prev_pps} → {pps} ---")
+            print(f"{'':>6s}  --- gap {prev_pps:,} → {pps:,} ---")
+            # Reset deltas across a gap.
+            prev_integ = None
+            prev_raw = None
         prev_pps = pps
 
-        dwt_fin = as_int(frag_field(rec, "dwt_cycle_count_between_pps"))
-        dwt_raw = as_int(frag_field(rec, "dwt_cycle_count_between_pps_raw"))
-        dwt_delta = as_int(frag_field(rec, "dwt_cycle_count_between_pps_raw_minus_final"))
-        dwt_last_pred = as_int(frag_field(rec, "dwt_cycle_count_last_second_prediction"))
-        dwt_interval_count = as_int(frag_field(rec, "dwt_interval_count_last_second"))
+        # Compute deltas (only if we have a previous sample).
+        integ_diff = None
+        raw_diff = None
+        integ_minus_raw = None
+        integ_res = None
+        raw_res = None
 
-        dwt_res = None
-        if dwt_fin is not None and dwt_last_pred is not None:
-            dwt_res = dwt_fin - dwt_last_pred
+        if integ_now is not None and prev_integ is not None:
+            integ_diff = _u32_diff(integ_now, prev_integ)
+            integ_res = integ_diff - DWT_EXPECTED_PER_PPS
 
-        if dwt_fin is not None:
-            w_dwt_fin.update(float(dwt_fin))
-        if dwt_raw is not None:
-            w_dwt_raw.update(float(dwt_raw))
-        if dwt_delta is not None:
-            w_dwt_delta.update(float(dwt_delta))
-        if dwt_last_pred is not None:
-            w_dwt_last_pred.update(float(dwt_last_pred))
-        if dwt_res is not None:
-            w_dwt_res.update(float(dwt_res))
-        if dwt_interval_count is not None:
-            w_dwt_interval_count.update(float(dwt_interval_count))
+        if raw_now is not None and prev_raw is not None:
+            raw_diff = _u32_diff(raw_now, prev_raw)
+            raw_res = raw_diff - DWT_EXPECTED_PER_PPS
 
-        # Legacy top-level OCXO summary surfaces.
-        o1_old = as_int(frag_field(rec, "ocxo1_dwt_cycles_between_edges"))
-        o2_old = as_int(frag_field(rec, "ocxo2_dwt_cycles_between_edges"))
-        o1_ns_old = as_int(frag_field(rec, "ocxo1_gnss_ns_between_edges"))
-        o2_ns_old = as_int(frag_field(rec, "ocxo2_gnss_ns_between_edges"))
+        if integ_diff is not None and raw_diff is not None:
+            integ_minus_raw = integ_diff - raw_diff
 
-        # New authoritative diag surfaces (final).
-        o1_fin = as_int(frag_field(rec, "ocxo1_diag_ocxo_second_cycles_observed"))
-        o2_fin = as_int(frag_field(rec, "ocxo2_diag_ocxo_second_cycles_observed"))
-        o1_ns_fin = as_int(frag_field(rec, "ocxo1_diag_ocxo_second_gnss_ns_observed"))
-        o2_ns_fin = as_int(frag_field(rec, "ocxo2_diag_ocxo_second_gnss_ns_observed"))
+        # Update Welford.
+        if integ_diff is not None:
+            w_integ_diff.update(float(integ_diff))
+        if raw_diff is not None:
+            w_raw_diff.update(float(raw_diff))
+        if integ_minus_raw is not None:
+            w_integ_minus_raw.update(float(integ_minus_raw))
+        if integ_res is not None:
+            w_integ_res.update(float(integ_res))
+        if raw_res is not None:
+            w_raw_res.update(float(raw_res))
+        if gpio_ns is not None:
+            w_gpio.update(float(gpio_ns))
 
-        # New diag raw surfaces.
-        o1_raw = as_int(frag_field(rec, "ocxo1_diag_ocxo_second_cycles_observed_raw"))
-        o2_raw = as_int(frag_field(rec, "ocxo2_diag_ocxo_second_cycles_observed_raw"))
-        o1_ns_raw = as_int(frag_field(rec, "ocxo1_diag_ocxo_second_gnss_ns_observed_raw"))
-        o2_ns_raw = as_int(frag_field(rec, "ocxo2_diag_ocxo_second_gnss_ns_observed_raw"))
+        samples.append({"pps": pps, "gpio_ns": gpio_ns})
 
-        for v, w in (
-            (o1_old, w_o1_old), (o1_fin, w_o1_fin), (o1_raw, w_o1_raw),
-            (o1_ns_old, w_o1_ns_old), (o1_ns_fin, w_o1_ns_fin), (o1_ns_raw, w_o1_ns_raw),
-            (o2_old, w_o2_old), (o2_fin, w_o2_fin), (o2_raw, w_o2_raw),
-            (o2_ns_old, w_o2_ns_old), (o2_ns_fin, w_o2_ns_fin), (o2_ns_raw, w_o2_ns_raw),
-        ):
-            if v is not None:
-                w.update(float(v))
+        # Save state for next iteration.
+        if integ_now is not None:
+            prev_integ = integ_now
+        if raw_now is not None:
+            prev_raw = raw_now
 
+        # Print row.
         print(
             f"{pps:>6d}  "
-            f"{fmt_int(dwt_fin,12)}  {fmt_int(dwt_raw,12)}  {fmt_int(dwt_delta,8,True)}  {fmt_int(dwt_last_pred,12)}  {fmt_int(dwt_res,8,True)}  "
-            f"{fmt_int(o1_old,12)}  {fmt_int(o1_fin,12)}  {fmt_int(o1_raw,12)}  {fmt_int(o1_ns_old,11)}  {fmt_int(o1_ns_fin,11)}  {fmt_int(o1_ns_raw,11)}  "
-            f"{fmt_int(o2_old,12)}  {fmt_int(o2_fin,12)}  {fmt_int(o2_raw,12)}  {fmt_int(o2_ns_old,11)}  {fmt_int(o2_ns_fin,11)}  {fmt_int(o2_ns_raw,11)}"
+            f"{_fmt_int(integ_diff, 13)}  "
+            f"{_fmt_int(raw_diff, 13)}  "
+            f"{_fmt_int(integ_minus_raw, 10, signed=True)}  "
+            f"{_fmt_int(integ_res, 9, signed=True)}  "
+            f"{_fmt_int(raw_res, 9, signed=True)}  "
+            f"{_fmt_int(gpio_ns, 14, signed=True)}"
         )
 
         shown += 1
         if limit and shown >= limit:
             break
 
+    # Drift-residual pass for GPIO.
+    gpio_mean = w_gpio.mean if w_gpio.n > 0 else 0.0
+    for s in samples:
+        if s["gpio_ns"] is not None:
+            w_gpio_drift.update(float(s["gpio_ns"]) - gpio_mean)
+
     print()
     print(f"Rows shown: {shown:,}")
     print(f"Gaps:       {gaps:,}")
     print()
+    print("─" * 70)
+    print("Summary statistics")
+    print("─" * 70)
+    print()
 
-    print_series("DWT final cycles between PPS", w_dwt_fin, "cycles")
-    print_series("DWT raw cycles between PPS", w_dwt_raw, "cycles")
-    print_series("DWT raw-minus-final", w_dwt_delta, "cycles")
-    print_series("DWT last-second prediction", w_dwt_last_pred, "cycles")
-    print_series("DWT residual (final - last prediction)", w_dwt_res, "cycles")
-    print_series("DWT interval count last second", w_dwt_interval_count, "intervals")
+    print("Synthetic boundary deltas (integrator output):")
+    _print_welford("integ_diff (cycles per synthetic second)",
+                   w_integ_diff, "cycles")
+    _print_welford("integ_res (integ_diff - nominal)",
+                   w_integ_res, "cycles")
+    print()
 
-    print_series("OCXO1 legacy cycles between edges", w_o1_old, "cycles")
-    print_series("OCXO1 final observed cycles", w_o1_fin, "cycles")
-    print_series("OCXO1 raw observed cycles", w_o1_raw, "cycles")
-    print_series("OCXO1 legacy GNSS ns between edges", w_o1_ns_old, "ns")
-    print_series("OCXO1 final observed GNSS ns", w_o1_ns_fin, "ns")
-    print_series("OCXO1 raw observed GNSS ns", w_o1_ns_raw, "ns")
+    print("Raw ISR-entry DWT deltas (simple subtraction equivalent):")
+    _print_welford("raw_diff (cycles between consecutive ISR-entry captures)",
+                   w_raw_diff, "cycles")
+    _print_welford("raw_res (raw_diff - nominal)",
+                   w_raw_res, "cycles")
+    print()
 
-    print_series("OCXO2 legacy cycles between edges", w_o2_old, "cycles")
-    print_series("OCXO2 final observed cycles", w_o2_fin, "cycles")
-    print_series("OCXO2 raw observed cycles", w_o2_raw, "cycles")
-    print_series("OCXO2 legacy GNSS ns between edges", w_o2_ns_old, "ns")
-    print_series("OCXO2 final observed GNSS ns", w_o2_ns_fin, "ns")
-    print_series("OCXO2 raw observed GNSS ns", w_o2_ns_raw, "ns")
+    print("THE CROSS-CHECK — does integration buy us anything?")
+    _print_welford("integ_minus_raw = integ_diff - raw_diff",
+                   w_integ_minus_raw, "cycles")
+    print()
 
-    print("Notes:")
-    print("  dwt_fin = dwt_cycle_count_between_pps")
-    print("  dwt_raw = dwt_cycle_count_between_pps_raw")
-    print("  dwt_Δ   = dwt_cycle_count_between_pps_raw_minus_final")
-    print("  o*_old  = legacy top-level alpha surfaces")
-    print("  o*_fin  = authoritative interrupt-diag final surfaces")
-    print("  o*_raw  = interrupt-diag raw surfaces")
-    print("  This report is intended to compare old vs new timing surfaces directly.")
+    print("GPIO PPS witness:")
+    _print_welford("gpio_ns (raw, includes DC bias)", w_gpio, "ns")
+    _print_welford("gpio_drift_ns (witness - running mean)", w_gpio_drift, "ns")
+
+    # Headline interpretation.
+    print("─" * 70)
+    print("Interpretation")
+    print("─" * 70)
+    print()
+
+    if w_integ_minus_raw.n >= 2:
+        stddev = w_integ_minus_raw.stddev
+        rng = w_integ_minus_raw.max_val - w_integ_minus_raw.min_val
+        mean = w_integ_minus_raw.mean
+
+        print(f"  integ_minus_raw stddev: {stddev:.2f} cycles "
+              f"({stddev:.2f} ns)")
+        print(f"  integ_minus_raw range:  {rng:.0f} cycles peak-to-peak")
+        print(f"  integ_minus_raw mean:   {mean:+.2f} cycles "
+              f"(constant ISR-entry latency, expected)")
+        print()
+
+        if stddev < 5.0:
+            print("  CONCLUSION: integration adds essentially nothing.")
+            print("  The QuadTimer compare path is jitter-free at the cycle")
+            print("  level. Simple subtraction of raw ISR-entry DWT captures")
+            print("  yields the same rate measurement as the SMA over 1000")
+            print("  intervals. The ring buffer is bookkeeping, not filtering.")
+        elif stddev < 50.0:
+            print("  CONCLUSION: integration provides modest smoothing.")
+            print("  Per-tick QuadTimer compare jitter is small but nonzero.")
+            print("  The SMA averages it down by ~31x; the residual difference")
+            print("  is what the integrator is genuinely filtering.")
+        else:
+            print("  CONCLUSION: integration is doing real work.")
+            print("  Per-tick QuadTimer compare jitter is significant. The")
+            print("  integrator is averaging away substantial measurement")
+            print("  noise that simple subtraction would expose directly.")
+
+    print()
 
 
 def main() -> None:

@@ -1,20 +1,50 @@
 // ============================================================================
-// process_interrupt.cpp — simplified interrupt normalization shell
+// process_interrupt.cpp — rolling DWT integration for VCLOCK, OCXO1, OCXO2
 // ============================================================================
 //
-// This file remains the sole authority for hardware interrupt custody.
+// Three rolling integrators, one per lane, each cadenced by its own
+// dedicated QuadTimer compare channel at 1 kHz:
 //
-// PPS:
-//   - DWT captured at PPS ISR entry remains the canonical PPS-side anchor.
-//   - No synthetic reconstruction is applied on the PPS path.
+//   VCLOCK lane:  QTimer1 CH3 compare, +10000 ticks per interval
+//                 (clocked by GNSS 10 MHz VCLOCK; PCS=0)
+//                 ISR is registered with TimePop via
+//                 timepop_register_qtimer1_ch3_isr() — TimePop's
+//                 qtimer1_irq_isr captures DWT as the first instruction
+//                 and dispatches to our handler when CH3's flag is set.
 //
-// OCXO:
-//   - One-second tempo is derived from rolling interval integration over
-//     1000 adjacent 1 ms intervals.
-//   - The callback-facing one-second edge is synthetic: prior lawful edge
-//     plus the integrated one-second observation.
-//   - Raw ISR-entry facts are retained for diagnostics only.
+//   OCXO1 lane:   QTimer3 CH2 compare, +10000 ticks per interval
+//                 (clocked by OCXO1 10 MHz; PCS=2)
+//                 ISR is owned directly by process_interrupt.
 //
+//   OCXO2 lane:   QTimer3 CH3 compare, +10000 ticks per interval
+//                 (clocked by OCXO2 10 MHz; PCS=3)
+//                 ISR is owned directly by process_interrupt.
+//
+// All three lanes have the SAME hardware-to-software latency profile:
+// QuadTimer compare match → NVIC → ISR → DWT capture as first instruction.
+// This is the experimental setup that lets us measure whether the QuadTimer
+// compare path is itself jitter-free, by comparing all three lanes against
+// each other.
+//
+// Subscribers receive boundary events.  No counter reads in canonical
+// paths.  No compare-latency corrections.  No raw/final duality.
+//
+// The integrator computes a synthetic DWT only.  The boundary handler
+// translates that synthetic DWT to a GNSS nanosecond by crossing the
+// DWT↔GNSS bridge — the universal sovereign coordinate for "when did
+// this happen."
+//
+// Bootstrap: the very first VCLOCK boundary fires before the bridge is
+// valid (because that boundary is what establishes the bridge anchor).
+// On that one occasion, the boundary handler emits gnss_ns_at_event = 0
+// with status = OK; alpha treats this as the epoch install bootstrap.
+// All subsequent boundaries — VCLOCK, OCXO1, OCXO2 — use the bridge.
+//
+// The PPS GPIO edge is WITNESS-ONLY — it records its offset from the
+// most recent VCLOCK synthetic boundary as a diagnostic, and dispatches
+// nothing.
+//
+// See process_interrupt.h for the boundary event contract.
 // ============================================================================
 
 #include "process_interrupt.h"
@@ -25,136 +55,137 @@
 #include "payload.h"
 #include "time.h"
 #include "timepop.h"
+#include "process_timepop.h"
 
 #include <Arduino.h>
 #include "imxrt.h"
 
+// ============================================================================
+// Constants
+// ============================================================================
+
 static constexpr uint32_t MAX_INTERRUPT_SUBSCRIBERS = 8;
 static constexpr uint64_t NS_PER_SECOND_U64 = 1000000000ULL;
 
-static constexpr uint32_t OCXO_COUNTS_PER_SECOND  = 10000000U;
-static constexpr uint32_t OCXO_INTERVAL_COUNTS    = 10000U;   // 1 ms at 10 MHz
-static constexpr uint32_t OCXO_INTERVALS_PER_SECOND = OCXO_COUNTS_PER_SECOND / OCXO_INTERVAL_COUNTS;
-static constexpr int64_t  OCXO_PREDICTION_TOLERANCE_NS = 5000LL;
+static constexpr uint32_t VCLOCK_COUNTS_PER_SECOND = 10000000U;
+static constexpr uint32_t VCLOCK_INTERVAL_COUNTS = 10000U;  // 1 ms at 10 MHz
 
-static_assert((OCXO_INTERVALS_PER_SECOND * OCXO_INTERVAL_COUNTS) == OCXO_COUNTS_PER_SECOND,
-              "Unexpected OCXO interval decomposition");
+static constexpr uint32_t OCXO_COUNTS_PER_SECOND = 10000000U;
+static constexpr uint32_t OCXO_INTERVAL_COUNTS = 10000U;    // 1 ms at 10 MHz
 
-static inline uint32_t ns_to_dwt_cycles_runtime(uint64_t ns) {
-  const uint32_t f = F_CPU_ACTUAL ? F_CPU_ACTUAL : 1008000000U;
-  return (uint32_t)(((uint64_t)f * ns + 500000000ULL) / 1000000000ULL);
-}
+static constexpr uint32_t ROLLING_WINDOW_SIZE = 1000U;      // 1000 × 1ms = 1 second
 
 static constexpr int OCXO1_PIN = 14;
 static constexpr int OCXO2_PIN = 15;
 
-enum class qtimer_clock_kind_t : uint8_t {
-  NONE = 0,
-  VCLOCK,
-  OCXO1,
-  OCXO2,
-};
+// ============================================================================
+// Rolling DWT integrator — per-lane state
+// ============================================================================
 
-struct qtimer16_ocxo_hw_t {
-  IMXRT_TMR_t* module = nullptr;
-  uint8_t      channel = 0;
-  IRQ_NUMBER_t irq = IRQ_QTIMER3;
-  int          input_pin = -1;
-  uint8_t      pcs = 0;
-};
+struct rolling_dwt_integrator_t {
+  const char* name = nullptr;
 
-struct qtimer16_ocxo_runtime_t {
-  qtimer_clock_kind_t kind = qtimer_clock_kind_t::NONE;
-  const char*         name = nullptr;
-  qtimer16_ocxo_hw_t  hw {};
+  // Immutable baseline (captured at the first tick).
+  bool     baseline_valid = false;
+  uint32_t baseline_dwt = 0;
 
-  bool     initialized = false;
-  bool     active = false;
-  bool     phase_bootstrapped = false;
-
-  uint16_t second_target_low16 = 0;
-  uint32_t logical_count32_at_last_second_edge = 0;
-  uint16_t last_counter16_at_irq = 0;
-
-  uint32_t irq_count = 0;
-  uint32_t dispatch_count = 0;
-  uint32_t miss_count = 0;
-  uint32_t start_count = 0;
-  uint32_t stop_count = 0;
-  uint32_t event_count = 0;
-
-  uint32_t bootstrap_count = 0;
-  uint32_t cadence_hits_total = 0;
-  uint32_t cadence_hits_since_second = 0;
-  uint16_t last_programmed_compare = 0;
-  uint16_t last_fired_compare16 = 0;
-  int32_t  last_fired_compare_delta_ticks = 0;
-  int64_t  last_fired_compare_delta_ns = 0;
-  uint16_t last_initial_counter16 = 0;
-  uint16_t last_second_target_low16 = 0;
-
-  bool     second_window_valid = false;
-  uint32_t current_window_interval_count = 0;
-
-  uint32_t previous_interval_dwt = 0;
-  int64_t  previous_interval_gnss_ns = -1;
-  uint32_t previous_interval_dwt_raw = 0;
-  int64_t  previous_interval_gnss_ns_raw = -1;
-
-  uint32_t second_start_dwt_raw = 0;
-  int64_t  second_start_gnss_ns_raw = -1;
-  uint32_t second_start_dwt_final = 0;
-  int64_t  second_start_gnss_ns_final = -1;
-
-  uint64_t current_window_cycles_sum = 0;
-  int64_t  current_window_gnss_ns_sum = 0;
-  uint64_t current_window_cycles_sum_raw = 0;
-  int64_t  current_window_gnss_ns_sum_raw = 0;
+  // Per-tick running state.
+  uint32_t prev_dwt = 0;
+  uint64_t total_ticks_seen = 0;
   uint32_t last_interval_cycles = 0;
-  int64_t  last_interval_gnss_ns = 0;
-  uint32_t last_interval_cycles_raw = 0;
-  int64_t  last_interval_gnss_ns_raw = 0;
 
-  uint32_t last_second_interval_count = 0;
-  uint64_t last_second_cycles_observed = 0;
-  int64_t  last_second_gnss_ns_observed = 0;
-  uint64_t last_second_cycles_observed_raw = 0;
-  int64_t  last_second_gnss_ns_observed_raw = 0;
-  uint64_t last_second_cycles_prediction = 0;
-  int64_t  last_second_gnss_ns_prediction = 0;
-  int64_t  last_second_cycles_prediction_error = 0;
-  int64_t  last_second_gnss_ns_prediction_error = 0;
-  int64_t  last_second_residual_ns = 0;
+  // Ring of per-interval DWT cycle deltas.
+  uint32_t ring[ROLLING_WINDOW_SIZE] = {};
+  uint32_t ring_head = 0;
+  uint32_t ring_fill = 0;
+  uint64_t ring_sum = 0;
 
-  uint32_t last_second_start_dwt_raw = 0;
-  uint32_t last_second_end_dwt_raw = 0;
-  int64_t  last_second_start_gnss_ns_raw = -1;
-  int64_t  last_second_end_gnss_ns_raw = -1;
-  uint32_t last_second_start_dwt_final = 0;
-  uint32_t last_second_end_dwt_final = 0;
-  int64_t  last_second_start_gnss_ns_final = -1;
-  int64_t  last_second_end_gnss_ns_final = -1;
-  int64_t  last_second_start_raw_minus_final_ns = 0;
-  int64_t  last_second_end_raw_minus_final_ns = 0;
+  // SMA rate cache, Q32.32 cycles per interval.
+  uint64_t avg_cycles_per_interval_q32 = 0;
 
-  bool     next_second_prediction_valid = false;
-  uint64_t next_second_cycles_prediction = 0;
-  int64_t  next_second_gnss_ns_prediction = 0;
+  // Synthetic output.
+  bool     synthetic_valid = false;
+  uint32_t last_synthetic_dwt = 0;
+  uint32_t boundary_emissions = 0;
 
-  uint32_t last_event_dwt_raw = 0;
-  uint32_t last_event_dwt_final = 0;
-  int64_t  last_event_gnss_ns_raw = -1;
-  int64_t  last_event_gnss_ns_final = -1;
-  uint32_t last_event_target_dwt = 0;
-  int64_t  last_event_target_gnss_ns = -1;
+  // Set true by tick() for the single tick that completed a boundary.
+  bool boundary_emitted_this_tick = false;
 };
+
+static rolling_dwt_integrator_t g_vclock_integrator;
+static rolling_dwt_integrator_t g_ocxo1_integrator;
+static rolling_dwt_integrator_t g_ocxo2_integrator;
+
+// Per-tick update.  Caller must have captured dwt_raw as the first
+// instruction of the ISR.  Sets boundary_emitted_this_tick = true on the
+// tick that completes a 1-second boundary.
+static void rolling_integrator_tick(rolling_dwt_integrator_t& r, uint32_t dwt_raw) {
+  r.boundary_emitted_this_tick = false;
+
+  if (!r.baseline_valid) {
+    r.baseline_dwt = dwt_raw;
+    r.prev_dwt = dwt_raw;
+    r.last_synthetic_dwt = dwt_raw;
+    r.total_ticks_seen = 0;
+    r.baseline_valid = true;
+    return;
+  }
+
+  const uint32_t interval = dwt_raw - r.prev_dwt;  // natural uint32 wrap
+  r.prev_dwt = dwt_raw;
+  r.last_interval_cycles = interval;
+  r.total_ticks_seen++;
+
+  if (r.ring_fill == ROLLING_WINDOW_SIZE) {
+    r.ring_sum -= r.ring[r.ring_head];
+  } else {
+    r.ring_fill++;
+  }
+  r.ring[r.ring_head] = interval;
+  r.ring_sum += interval;
+  r.ring_head = (r.ring_head + 1u) % ROLLING_WINDOW_SIZE;
+
+  if (r.ring_fill > 0) {
+    r.avg_cycles_per_interval_q32 = (r.ring_sum << 32) / r.ring_fill;
+  }
+
+  // Emit boundary every 1000 ticks, once the ring is fully primed.
+  if ((r.total_ticks_seen % ROLLING_WINDOW_SIZE) == 0u &&
+      r.ring_fill == ROLLING_WINDOW_SIZE) {
+
+    // Option X: synthetic_dwt[N] = baseline + total_ticks × avg_rate
+    //
+    // At a boundary tick, total_ticks is exactly N × WINDOW and ring_fill
+    // is exactly WINDOW, so cumulative_cycles = N × ring_sum (exact, no
+    // division truncation).
+    const uint64_t boundary_number = r.total_ticks_seen / ROLLING_WINDOW_SIZE;
+    const uint64_t cumulative_cycles = boundary_number * r.ring_sum;
+
+    r.last_synthetic_dwt = r.baseline_dwt + (uint32_t)cumulative_cycles;
+    r.boundary_emissions++;
+    r.synthetic_valid = true;
+    r.boundary_emitted_this_tick = true;
+  }
+}
+
+static uint64_t integrator_cycles_per_second(const rolling_dwt_integrator_t& r) {
+  if (!r.baseline_valid || r.ring_fill == 0) return 0;
+  return (r.avg_cycles_per_interval_q32 * (uint64_t)ROLLING_WINDOW_SIZE) >> 32;
+}
+
+uint64_t interrupt_vclock_cycles_per_second(void) {
+  return integrator_cycles_per_second(g_vclock_integrator);
+}
+
+// ============================================================================
+// Subscriber runtime
+// ============================================================================
 
 struct interrupt_subscriber_descriptor_t {
   interrupt_subscriber_kind_t kind = interrupt_subscriber_kind_t::NONE;
   const char* name = nullptr;
   interrupt_provider_kind_t provider = interrupt_provider_kind_t::NONE;
   interrupt_lane_t lane = interrupt_lane_t::NONE;
-  qtimer_clock_kind_t clock_kind = qtimer_clock_kind_t::NONE;
 };
 
 struct interrupt_subscriber_runtime_t {
@@ -172,10 +203,10 @@ struct interrupt_subscriber_runtime_t {
   uint32_t event_count = 0;
 };
 
-struct interrupt_provider_diag_t {
-  uint32_t irq_count = 0;
-  uint32_t dispatch_count = 0;
-  uint32_t miss_count = 0;
+static const interrupt_subscriber_descriptor_t DESCRIPTORS[] = {
+  { interrupt_subscriber_kind_t::PPS,   "PPS",   interrupt_provider_kind_t::QTIMER1, interrupt_lane_t::QTIMER1_CH3_COMP },
+  { interrupt_subscriber_kind_t::OCXO1, "OCXO1", interrupt_provider_kind_t::QTIMER3, interrupt_lane_t::QTIMER3_CH2_COMP },
+  { interrupt_subscriber_kind_t::OCXO2, "OCXO2", interrupt_provider_kind_t::QTIMER3, interrupt_lane_t::QTIMER3_CH3_COMP },
 };
 
 static interrupt_subscriber_runtime_t g_subscribers[MAX_INTERRUPT_SUBSCRIBERS] = {};
@@ -184,47 +215,85 @@ static bool g_interrupt_hw_ready = false;
 static bool g_interrupt_runtime_ready = false;
 static bool g_interrupt_irqs_enabled = false;
 static volatile bool g_pps_zero_pending = false;
-static interrupt_provider_diag_t g_gpio_diag = {};
-static interrupt_subscriber_runtime_t* g_rt_pps   = nullptr;
+
+static interrupt_subscriber_runtime_t* g_rt_pps = nullptr;
 static interrupt_subscriber_runtime_t* g_rt_ocxo1 = nullptr;
 static interrupt_subscriber_runtime_t* g_rt_ocxo2 = nullptr;
-static qtimer16_ocxo_runtime_t g_clock_ocxo1 = {};
-static qtimer16_ocxo_runtime_t g_clock_ocxo2 = {};
 
-static const interrupt_subscriber_descriptor_t DESCRIPTORS[] = {
-  { interrupt_subscriber_kind_t::PPS,   "PPS",   interrupt_provider_kind_t::GPIO6789, interrupt_lane_t::GPIO_EDGE,        qtimer_clock_kind_t::VCLOCK },
-  { interrupt_subscriber_kind_t::OCXO1, "OCXO1", interrupt_provider_kind_t::QTIMER3,  interrupt_lane_t::QTIMER3_CH2_COMP, qtimer_clock_kind_t::OCXO1  },
-  { interrupt_subscriber_kind_t::OCXO2, "OCXO2", interrupt_provider_kind_t::QTIMER3,  interrupt_lane_t::QTIMER3_CH3_COMP, qtimer_clock_kind_t::OCXO2  },
+// ============================================================================
+// VCLOCK lane hardware state (QTimer1 CH3)
+// ============================================================================
+
+struct vclock_lane_t {
+  bool     initialized = false;
+  bool     active = false;
+  bool     phase_bootstrapped = false;
+
+  // Compare target (low-16 of QTimer1 CH3 counter).  Advances by
+  // VCLOCK_INTERVAL_COUNTS per tick.
+  uint16_t compare_target = 0;
+
+  // Software-extended logical 32-bit count (advances by VCLOCK_COUNTS_PER_SECOND
+  // per boundary emission).  Authored counter32 for VCLOCK boundary events.
+  uint32_t logical_count32_at_last_boundary = 0;
+
+  // Diagnostic counters.
+  uint32_t irq_count = 0;
+  uint32_t miss_count = 0;
+  uint32_t bootstrap_count = 0;
+  uint32_t cadence_hits_total = 0;
 };
 
-const char* interrupt_subscriber_kind_str(interrupt_subscriber_kind_t kind) {
-  switch (kind) {
-    case interrupt_subscriber_kind_t::PPS:       return "PPS";
-    case interrupt_subscriber_kind_t::OCXO1:     return "OCXO1";
-    case interrupt_subscriber_kind_t::OCXO2:     return "OCXO2";
-    case interrupt_subscriber_kind_t::TIME_TEST: return "TIME_TEST";
-    default:                                     return "NONE";
-  }
-}
+static vclock_lane_t g_vclock_lane;
 
-const char* interrupt_provider_kind_str(interrupt_provider_kind_t provider) {
-  switch (provider) {
-    case interrupt_provider_kind_t::QTIMER3:  return "QTIMER3";
-    case interrupt_provider_kind_t::GPIO6789: return "GPIO6789";
-    default:                                  return "NONE";
-  }
-}
+// ============================================================================
+// OCXO lane hardware state (QTimer3 CH2 / CH3)
+// ============================================================================
 
-const char* interrupt_lane_str(interrupt_lane_t lane) {
-  switch (lane) {
-    case interrupt_lane_t::QTIMER3_CH2_COMP: return "QTIMER3_CH2_COMP";
-    case interrupt_lane_t::QTIMER3_CH3_COMP: return "QTIMER3_CH3_COMP";
-    case interrupt_lane_t::GPIO_EDGE:        return "GPIO_EDGE";
-    default:                                 return "NONE";
-  }
-}
+struct ocxo_lane_t {
+  const char* name = nullptr;
+  IMXRT_TMR_t* module = nullptr;
+  uint8_t      channel = 0;
+  uint8_t      pcs = 0;
+  int          input_pin = -1;
 
-static uint32_t qtimer1_read_32_for_pps_capture(void) {
+  bool     initialized = false;
+  bool     active = false;
+  bool     phase_bootstrapped = false;
+
+  uint16_t compare_target = 0;
+  uint32_t logical_count32_at_last_boundary = 0;
+
+  uint32_t irq_count = 0;
+  uint32_t miss_count = 0;
+  uint32_t bootstrap_count = 0;
+  uint32_t cadence_hits_total = 0;
+};
+
+static ocxo_lane_t g_ocxo1_lane;
+static ocxo_lane_t g_ocxo2_lane;
+
+// ============================================================================
+// PPS GPIO witness state
+// ============================================================================
+
+struct pps_gpio_witness_t {
+  uint32_t edge_count = 0;
+  uint32_t last_dwt = 0;
+  int64_t  last_gnss_ns = 0;
+  int64_t  last_minus_synthetic_ns = 0;
+};
+
+static pps_gpio_witness_t g_pps_gpio_witness;
+
+static uint32_t g_gpio_irq_count = 0;
+static uint32_t g_gpio_miss_count = 0;
+
+// ============================================================================
+// Low-level QuadTimer helpers
+// ============================================================================
+
+static uint32_t qtimer1_read_32_for_diag(void) {
   const uint16_t lo1 = IMXRT_TMR1.CH[0].CNTR;
   const uint16_t hi1 = IMXRT_TMR1.CH[1].HOLD;
   const uint16_t lo2 = IMXRT_TMR1.CH[0].CNTR;
@@ -233,10 +302,27 @@ static uint32_t qtimer1_read_32_for_pps_capture(void) {
                       : (((uint32_t)hi1 << 16) | (uint32_t)lo1);
 }
 
-uint32_t interrupt_qtimer1_counter32_now(void) { return qtimer1_read_32_for_pps_capture(); }
+uint32_t interrupt_qtimer1_counter32_now(void) { return qtimer1_read_32_for_diag(); }
 uint16_t interrupt_qtimer3_ch2_counter_now(void) { return IMXRT_TMR3.CH[2].CNTR; }
 uint16_t interrupt_qtimer3_ch3_counter_now(void) { return IMXRT_TMR3.CH[3].CNTR; }
 
+// QTimer1 CH3 (VCLOCK lane).
+static inline void qtimer1_ch3_clear_compare_flag(void) {
+  IMXRT_TMR1.CH[3].CSCTRL &= ~(TMR_CSCTRL_TCF1 | TMR_CSCTRL_TCF2);
+}
+static inline void qtimer1_ch3_program_compare(uint16_t target_low16) {
+  qtimer1_ch3_clear_compare_flag();
+  IMXRT_TMR1.CH[3].COMP1  = target_low16;
+  IMXRT_TMR1.CH[3].CMPLD1 = target_low16;
+  qtimer1_ch3_clear_compare_flag();
+  IMXRT_TMR1.CH[3].CSCTRL |= TMR_CSCTRL_TCF1EN;
+}
+static inline void qtimer1_ch3_disable_compare(void) {
+  IMXRT_TMR1.CH[3].CSCTRL &= ~TMR_CSCTRL_TCF1EN;
+  qtimer1_ch3_clear_compare_flag();
+}
+
+// QTimer3 (OCXO lanes).
 static inline void qtimer3_clear_compare_flag(uint8_t ch) {
   IMXRT_TMR3.CH[ch].CSCTRL &= ~(TMR_CSCTRL_TCF1 | TMR_CSCTRL_TCF2);
 }
@@ -252,19 +338,34 @@ static inline void qtimer3_disable_compare(uint8_t ch) {
   qtimer3_clear_compare_flag(ch);
 }
 
+// ============================================================================
+// Subscriber lookup
+// ============================================================================
+
 static interrupt_subscriber_runtime_t* runtime_for(interrupt_subscriber_kind_t kind) {
   for (uint32_t i = 0; i < g_subscriber_count; i++) {
-    if (g_subscribers[i].desc && g_subscribers[i].desc->kind == kind) return &g_subscribers[i];
+    if (g_subscribers[i].desc && g_subscribers[i].desc->kind == kind) {
+      return &g_subscribers[i];
+    }
   }
   return nullptr;
 }
-static qtimer16_ocxo_runtime_t* ocxo_clock_runtime_for(qtimer_clock_kind_t kind) {
+
+static ocxo_lane_t* ocxo_lane_for(interrupt_subscriber_kind_t kind) {
+  if (kind == interrupt_subscriber_kind_t::OCXO1) return &g_ocxo1_lane;
+  if (kind == interrupt_subscriber_kind_t::OCXO2) return &g_ocxo2_lane;
+  return nullptr;
+}
+
+static rolling_dwt_integrator_t* integrator_for(interrupt_subscriber_kind_t kind) {
   switch (kind) {
-    case qtimer_clock_kind_t::OCXO1: return &g_clock_ocxo1;
-    case qtimer_clock_kind_t::OCXO2: return &g_clock_ocxo2;
+    case interrupt_subscriber_kind_t::PPS:   return &g_vclock_integrator;
+    case interrupt_subscriber_kind_t::OCXO1: return &g_ocxo1_integrator;
+    case interrupt_subscriber_kind_t::OCXO2: return &g_ocxo2_integrator;
     default: return nullptr;
   }
 }
+
 static const char* dispatch_timer_name(interrupt_subscriber_kind_t kind) {
   switch (kind) {
     case interrupt_subscriber_kind_t::PPS:   return "PPS_DISPATCH";
@@ -274,51 +375,47 @@ static const char* dispatch_timer_name(interrupt_subscriber_kind_t kind) {
   }
 }
 
-static void qtimer16_ocxo_arm_bootstrap(qtimer16_ocxo_runtime_t& clock) {
-  const uint16_t now16 = clock.hw.module->CH[clock.hw.channel].CNTR;
-  clock.phase_bootstrapped = true;
-  clock.bootstrap_count++;
-  clock.cadence_hits_since_second = 0;
-  clock.last_initial_counter16 = now16;
-  clock.second_target_low16 = (uint16_t)(now16 + (uint16_t)OCXO_INTERVAL_COUNTS);
-  clock.last_second_target_low16 = clock.second_target_low16;
-  clock.last_programmed_compare = clock.second_target_low16;
-  clock.second_window_valid = false;
-  clock.current_window_interval_count = 0;
-  clock.previous_interval_dwt = 0;
-  clock.previous_interval_gnss_ns = -1;
-  clock.previous_interval_dwt_raw = 0;
-  clock.previous_interval_gnss_ns_raw = -1;
-  clock.second_start_dwt_raw = 0;
-  clock.second_start_gnss_ns_raw = -1;
-  clock.second_start_dwt_final = 0;
-  clock.second_start_gnss_ns_final = -1;
-  clock.current_window_cycles_sum = 0;
-  clock.current_window_gnss_ns_sum = 0;
-  clock.current_window_cycles_sum_raw = 0;
-  clock.current_window_gnss_ns_sum_raw = 0;
-  clock.last_interval_cycles = 0;
-  clock.last_interval_gnss_ns = 0;
-  clock.last_interval_cycles_raw = 0;
-  clock.last_interval_gnss_ns_raw = 0;
-  qtimer3_program_compare(clock.hw.channel, clock.second_target_low16);
-}
+// ============================================================================
+// Event construction and deferred dispatch
+// ============================================================================
 
-static void qtimer16_ocxo_advance_to_next_interval_target(qtimer16_ocxo_runtime_t& clock) {
-  clock.second_target_low16 = (uint16_t)(clock.second_target_low16 + (uint16_t)OCXO_INTERVAL_COUNTS);
-  clock.last_second_target_low16 = clock.second_target_low16;
-  clock.last_programmed_compare = clock.second_target_low16;
-  qtimer3_program_compare(clock.hw.channel, clock.second_target_low16);
-}
+static void fill_diag(interrupt_capture_diag_t& diag,
+                      const interrupt_subscriber_runtime_t& rt,
+                      const interrupt_event_t& event,
+                      uint32_t dwt_isr_entry_raw,
+                      const rolling_dwt_integrator_t& r) {
+  diag.enabled = true;
+  diag.provider = rt.desc->provider;
+  diag.lane = rt.desc->lane;
+  diag.kind = rt.desc->kind;
 
-static void qtimer16_ocxo_note_interval_irq(qtimer16_ocxo_runtime_t& clock, uint16_t counter16_snapshot) {
-  const uint16_t fired_compare16 = clock.second_target_low16;
-  clock.last_counter16_at_irq = counter16_snapshot;
-  clock.last_fired_compare16 = fired_compare16;
-  clock.last_fired_compare_delta_ticks = (int32_t)((uint16_t)(counter16_snapshot - fired_compare16));
-  clock.last_fired_compare_delta_ns = (int64_t)clock.last_fired_compare_delta_ticks * 100LL;
-  clock.cadence_hits_total++;
-  qtimer16_ocxo_advance_to_next_interval_target(clock);
+  diag.dwt_isr_entry_raw = dwt_isr_entry_raw;
+  const int64_t isr_gnss_ns = time_dwt_to_gnss_ns(dwt_isr_entry_raw);
+  diag.dwt_isr_entry_gnss_ns = isr_gnss_ns;
+  diag.dwt_isr_entry_minus_event_ns =
+      (isr_gnss_ns >= 0 && event.gnss_ns_at_event != 0)
+          ? (isr_gnss_ns - (int64_t)event.gnss_ns_at_event)
+          : 0;
+
+  diag.dwt_at_event = event.dwt_at_event;
+  diag.gnss_ns_at_event = event.gnss_ns_at_event;
+  diag.counter32_at_event = event.counter32_at_event;
+
+  diag.integrator_baseline_valid = r.baseline_valid;
+  diag.integrator_baseline_dwt = r.baseline_dwt;
+  diag.integrator_total_ticks = r.total_ticks_seen;
+  diag.integrator_ring_fill = r.ring_fill;
+  diag.integrator_ring_sum = r.ring_sum;
+  diag.integrator_avg_cycles_per_sec = integrator_cycles_per_second(r);
+  diag.integrator_last_interval_cycles = r.last_interval_cycles;
+  diag.integrator_boundary_emissions = r.boundary_emissions;
+
+  if (rt.desc->kind == interrupt_subscriber_kind_t::PPS) {
+    diag.gpio_edge_count = g_pps_gpio_witness.edge_count;
+    diag.gpio_last_dwt = g_pps_gpio_witness.last_dwt;
+    diag.gpio_last_gnss_ns = g_pps_gpio_witness.last_gnss_ns;
+    diag.gpio_minus_synthetic_ns = g_pps_gpio_witness.last_minus_synthetic_ns;
+  }
 }
 
 static void maybe_dispatch_event(interrupt_subscriber_runtime_t& rt) {
@@ -335,343 +432,198 @@ static void deferred_dispatch_callback(timepop_ctx_t*, timepop_diag_t*, void* us
   }
 }
 
-static void fill_diag_common(interrupt_subscriber_runtime_t& rt,
-                             interrupt_capture_diag_t& diag,
-                             const interrupt_event_t& event,
-                             uint32_t dwt_isr_entry_raw,
-                             bool bridge_valid,
-                             const qtimer16_ocxo_runtime_t* ocxo_clock = nullptr) {
-  diag.provider = rt.desc->provider;
-  diag.lane = rt.desc->lane;
-  diag.kind = rt.desc->kind;
-  diag.dwt_isr_entry_raw = dwt_isr_entry_raw;
-  const int64_t dwt_isr_entry_gnss_ns = time_dwt_to_gnss_ns(dwt_isr_entry_raw);
-  diag.dwt_isr_entry_gnss_ns = dwt_isr_entry_gnss_ns;
-  diag.dwt_isr_entry_minus_event_ns =
-      (dwt_isr_entry_gnss_ns >= 0 && event.gnss_ns_at_event != 0)
-          ? (dwt_isr_entry_gnss_ns - (int64_t)event.gnss_ns_at_event)
-          : 0;
-  diag.dwt_at_event = event.dwt_at_event;
-  diag.dwt_at_event_adjusted = event.dwt_at_event;
-  diag.counter32_at_event = event.counter32_at_event;
-  diag.dwt_event_correction_cycles = 0;
-  diag.event_target_gnss_ns =
-      (ocxo_clock && ocxo_clock->last_event_target_gnss_ns >= 0)
-          ? (uint64_t)ocxo_clock->last_event_target_gnss_ns
-          : event.gnss_ns_at_event;
-  diag.gnss_ns_at_event_raw =
-      (ocxo_clock && ocxo_clock->last_event_gnss_ns_raw >= 0)
-          ? (uint64_t)ocxo_clock->last_event_gnss_ns_raw
-          : event.gnss_ns_at_event;
-  diag.gnss_ns_at_event_final = event.gnss_ns_at_event;
-  diag.gnss_ns_at_event = event.gnss_ns_at_event;
-  diag.gnss_ns_at_event_delta =
-      (int64_t)diag.gnss_ns_at_event_final - (int64_t)diag.gnss_ns_at_event_raw;
-  diag.bridge_valid = bridge_valid;
-  if (ocxo_clock && ocxo_clock->last_event_target_gnss_ns >= 0) {
-    const int64_t abs_err = llabs(ocxo_clock->last_second_gnss_ns_prediction_error);
-    diag.bridge_within_tolerance = abs_err <= OCXO_PREDICTION_TOLERANCE_NS;
-  } else {
-    diag.bridge_within_tolerance = bridge_valid;
-  }
-  diag.bridge_skipped_invalid = !bridge_valid;
-  diag.bridge_used_prediction = (ocxo_clock && ocxo_clock->last_event_target_gnss_ns >= 0);
-  diag.gnss_ns_at_event_bridge = diag.gnss_ns_at_event_final;
-  diag.bridge_gnss_ns_raw = diag.gnss_ns_at_event_raw;
-  diag.bridge_gnss_ns_target =
-      (ocxo_clock && ocxo_clock->last_event_target_gnss_ns >= 0)
-          ? (uint64_t)ocxo_clock->last_event_target_gnss_ns
-          : diag.gnss_ns_at_event_final;
-  diag.bridge_gnss_ns_final = diag.gnss_ns_at_event_final;
-  diag.bridge_raw_error_ns = (int64_t)diag.bridge_gnss_ns_raw - (int64_t)diag.bridge_gnss_ns_target;
-  diag.bridge_final_error_ns = (int64_t)diag.bridge_gnss_ns_final - (int64_t)diag.bridge_gnss_ns_target;
+static void emit_boundary_event(interrupt_subscriber_runtime_t& rt,
+                                uint32_t dwt_isr_entry_raw,
+                                uint32_t authored_counter32) {
+  if (!rt.active) return;
 
-  if (ocxo_clock) {
-    diag.counter16_at_irq = ocxo_clock->last_counter16_at_irq;
-    diag.compare16_fired = ocxo_clock->last_fired_compare16;
-    diag.compare16_next_programmed = ocxo_clock->last_programmed_compare;
-    diag.counter16_minus_compare_ticks = ocxo_clock->last_fired_compare_delta_ticks;
-    diag.counter16_minus_compare_ns = ocxo_clock->last_fired_compare_delta_ns;
-    diag.ocxo_interval_counts = OCXO_INTERVAL_COUNTS;
-    diag.ocxo_current_window_interval_count = ocxo_clock->current_window_interval_count;
-    diag.ocxo_last_second_interval_count = ocxo_clock->last_second_interval_count;
-    diag.ocxo_last_interval_cycles = ocxo_clock->last_interval_cycles;
-    diag.ocxo_last_interval_gnss_ns = ocxo_clock->last_interval_gnss_ns;
-    diag.ocxo_current_window_cycles_sum = ocxo_clock->current_window_cycles_sum;
-    diag.ocxo_current_window_gnss_ns_sum = ocxo_clock->current_window_gnss_ns_sum;
-    diag.ocxo_second_cycles_observed = ocxo_clock->last_second_cycles_observed;
-    diag.ocxo_second_cycles_observed_raw = ocxo_clock->last_second_cycles_observed_raw;
-    diag.ocxo_second_cycles_prediction = ocxo_clock->last_second_cycles_prediction;
-    diag.ocxo_second_cycles_prediction_error = ocxo_clock->last_second_cycles_prediction_error;
-    diag.ocxo_second_gnss_ns_observed = ocxo_clock->last_second_gnss_ns_observed;
-    diag.ocxo_second_gnss_ns_observed_raw = ocxo_clock->last_second_gnss_ns_observed_raw;
-    diag.ocxo_second_gnss_ns_prediction = ocxo_clock->last_second_gnss_ns_prediction;
-    diag.ocxo_second_gnss_ns_prediction_error = ocxo_clock->last_second_gnss_ns_prediction_error;
-    diag.ocxo_second_residual_ns = ocxo_clock->last_second_residual_ns;
-    diag.ocxo_second_start_gnss_ns_raw = ocxo_clock->last_second_start_gnss_ns_raw;
-    diag.ocxo_second_end_gnss_ns_raw = ocxo_clock->last_second_end_gnss_ns_raw;
-    diag.ocxo_second_start_dwt_raw = ocxo_clock->last_second_start_dwt_raw;
-    diag.ocxo_second_end_dwt_raw = ocxo_clock->last_second_end_dwt_raw;
-    diag.ocxo_second_start_gnss_ns_final = ocxo_clock->last_second_start_gnss_ns_final;
-    diag.ocxo_second_end_gnss_ns_final = ocxo_clock->last_second_end_gnss_ns_final;
-    diag.ocxo_second_start_dwt_final = ocxo_clock->last_second_start_dwt_final;
-    diag.ocxo_second_end_dwt_final = ocxo_clock->last_second_end_dwt_final;
-    diag.ocxo_second_start_raw_minus_final_ns = ocxo_clock->last_second_start_raw_minus_final_ns;
-    diag.ocxo_second_end_raw_minus_final_ns = ocxo_clock->last_second_end_raw_minus_final_ns;
-  }
-}
+  rolling_dwt_integrator_t* r = integrator_for(rt.desc->kind);
+  if (!r) return;
 
-static void handle_event(interrupt_subscriber_runtime_t& rt,
-                         uint32_t dwt_isr_entry_raw,
-                         uint32_t counter32_at_event,
-                         const qtimer16_ocxo_runtime_t* ocxo_clock = nullptr) {
   interrupt_event_t event {};
   event.kind = rt.desc->kind;
   event.provider = rt.desc->provider;
   event.lane = rt.desc->lane;
-  event.status = interrupt_event_status_t::OK;
-  event.counter32_at_event = counter32_at_event;
-  event.dwt_event_correction_cycles = 0;
-  bool bridge_valid = true;
-  if (rt.desc->kind == interrupt_subscriber_kind_t::PPS) {
-    event.dwt_at_event = dwt_isr_entry_raw;
-    event.gnss_ns_at_event = (uint64_t)rt.event_count * NS_PER_SECOND_U64;
+  event.dwt_at_event = r->last_synthetic_dwt;
+  event.counter32_at_event = authored_counter32;
+
+  // Translate synthetic DWT to GNSS ns via the bridge.  Bootstrap escape:
+  // if the bridge is invalid (only happens on the very first VCLOCK
+  // boundary), emit gnss_ns_at_event = 0; alpha will install the epoch.
+  const int64_t gnss_ns = time_dwt_to_gnss_ns(r->last_synthetic_dwt);
+  if (gnss_ns >= 0) {
+    event.gnss_ns_at_event = (uint64_t)gnss_ns;
+    event.status = interrupt_event_status_t::OK;
   } else {
-    const int64_t raw_gnss_ns =
-        (ocxo_clock && ocxo_clock->last_event_gnss_ns_raw >= 0)
-            ? ocxo_clock->last_event_gnss_ns_raw
-            : time_dwt_to_gnss_ns(dwt_isr_entry_raw);
-    const int64_t final_gnss_ns =
-        (ocxo_clock && ocxo_clock->last_event_gnss_ns_final >= 0)
-            ? ocxo_clock->last_event_gnss_ns_final
-            : raw_gnss_ns;
-    const uint32_t final_dwt =
-        (ocxo_clock && ocxo_clock->last_event_dwt_final != 0)
-            ? ocxo_clock->last_event_dwt_final
-            : dwt_isr_entry_raw;
-    if (final_gnss_ns < 0) {
-      event.gnss_ns_at_event = 0;
-      event.dwt_at_event = dwt_isr_entry_raw;
-      event.status = interrupt_event_status_t::HOLD;
-      bridge_valid = false;
-    } else {
-      event.gnss_ns_at_event = (uint64_t)final_gnss_ns;
-      event.dwt_at_event = final_dwt;
-    }
+    event.gnss_ns_at_event = 0;
+    event.status = interrupt_event_status_t::OK;
   }
+
   interrupt_capture_diag_t diag {};
-  fill_diag_common(rt, diag, event, dwt_isr_entry_raw, bridge_valid, ocxo_clock);
+  fill_diag(diag, rt, event, dwt_isr_entry_raw, *r);
+
   rt.last_event = event;
   rt.last_diag = diag;
   rt.has_fired = true;
-  rt.irq_count++;
-  rt.dispatch_count++;
   rt.event_count++;
+  rt.dispatch_count++;
+
   timepop_arm_asap(deferred_dispatch_callback, &rt, dispatch_timer_name(rt.desc->kind));
 }
 
-static void pps_gpio_isr(void) {
-  const uint32_t dwt_raw = ARM_DWT_CYCCNT;
-  process_interrupt_gpio6789_irq(dwt_raw);
+// ============================================================================
+// VCLOCK lane — QTimer1 CH3 compare, 1 kHz
+// ============================================================================
+//
+// Identical structural pattern to the OCXO lanes on QTimer3.  The IRQ
+// vector is owned by TimePop (since QTimer1 has only one shared vector);
+// TimePop's qtimer1_irq_isr captures DWT as the first instruction and
+// dispatches here when CH3's flag is set.  From this handler's
+// perspective, dwt_raw was captured at the very first instruction of
+// the real ISR — same latency as a dedicated-vector handler.
+//
+
+static void vclock_lane_arm_bootstrap(void) {
+  const uint16_t now16 = IMXRT_TMR1.CH[3].CNTR;
+  g_vclock_lane.phase_bootstrapped = true;
+  g_vclock_lane.bootstrap_count++;
+  g_vclock_lane.compare_target = (uint16_t)(now16 + (uint16_t)VCLOCK_INTERVAL_COUNTS);
+  qtimer1_ch3_program_compare(g_vclock_lane.compare_target);
 }
+
+static void vclock_lane_advance_compare(void) {
+  g_vclock_lane.compare_target =
+      (uint16_t)(g_vclock_lane.compare_target + (uint16_t)VCLOCK_INTERVAL_COUNTS);
+  qtimer1_ch3_program_compare(g_vclock_lane.compare_target);
+}
+
+// CH3 ISR — registered with TimePop.  Receives the first-instruction DWT
+// from TimePop's qtimer1_irq_isr.
+static void vclock_integrator_isr(uint32_t dwt_raw) {
+  g_vclock_lane.irq_count++;
+  if (g_rt_pps) g_rt_pps->irq_count++;
+
+  qtimer1_ch3_clear_compare_flag();
+
+  if (!g_vclock_lane.active || !g_rt_pps || !g_rt_pps->active) {
+    g_vclock_lane.miss_count++;
+    return;
+  }
+
+  if (!g_vclock_lane.phase_bootstrapped) {
+    vclock_lane_arm_bootstrap();
+    g_vclock_lane.miss_count++;  // first arm — not a real tick
+    return;
+  }
+
+  vclock_lane_advance_compare();
+  g_vclock_lane.cadence_hits_total++;
+
+  rolling_integrator_tick(g_vclock_integrator, dwt_raw);
+
+  if (g_vclock_integrator.boundary_emitted_this_tick) {
+    g_vclock_lane.logical_count32_at_last_boundary += VCLOCK_COUNTS_PER_SECOND;
+    emit_boundary_event(*g_rt_pps, dwt_raw,
+                        g_vclock_lane.logical_count32_at_last_boundary);
+  }
+}
+
+// ============================================================================
+// OCXO lanes — QTimer3 CH2 / CH3 compare, 1 kHz
+// ============================================================================
+
+static void ocxo_lane_arm_bootstrap(ocxo_lane_t& lane) {
+  const uint16_t now16 = lane.module->CH[lane.channel].CNTR;
+  lane.phase_bootstrapped = true;
+  lane.bootstrap_count++;
+  lane.compare_target = (uint16_t)(now16 + (uint16_t)OCXO_INTERVAL_COUNTS);
+  qtimer3_program_compare(lane.channel, lane.compare_target);
+}
+
+static void ocxo_lane_advance_compare(ocxo_lane_t& lane) {
+  lane.compare_target = (uint16_t)(lane.compare_target + (uint16_t)OCXO_INTERVAL_COUNTS);
+  qtimer3_program_compare(lane.channel, lane.compare_target);
+}
+
+static void handle_ocxo_qtimer16_irq(ocxo_lane_t& lane,
+                                     interrupt_subscriber_runtime_t& rt,
+                                     rolling_dwt_integrator_t& integrator,
+                                     uint32_t dwt_raw) {
+  lane.irq_count++;
+  rt.irq_count++;
+
+  qtimer3_clear_compare_flag(lane.channel);
+
+  if (!lane.active || !rt.active) {
+    lane.miss_count++;
+    return;
+  }
+
+  if (!lane.phase_bootstrapped) {
+    ocxo_lane_arm_bootstrap(lane);
+    lane.miss_count++;
+    return;
+  }
+
+  ocxo_lane_advance_compare(lane);
+  lane.cadence_hits_total++;
+
+  rolling_integrator_tick(integrator, dwt_raw);
+
+  if (integrator.boundary_emitted_this_tick) {
+    lane.logical_count32_at_last_boundary += OCXO_COUNTS_PER_SECOND;
+    emit_boundary_event(rt, dwt_raw, lane.logical_count32_at_last_boundary);
+  }
+}
+
+void process_interrupt_qtimer3_ch2_irq(uint32_t dwt_raw) {
+  if (g_rt_ocxo1) {
+    handle_ocxo_qtimer16_irq(g_ocxo1_lane, *g_rt_ocxo1, g_ocxo1_integrator, dwt_raw);
+  }
+}
+
+void process_interrupt_qtimer3_ch3_irq(uint32_t dwt_raw) {
+  if (g_rt_ocxo2) {
+    handle_ocxo_qtimer16_irq(g_ocxo2_lane, *g_rt_ocxo2, g_ocxo2_integrator, dwt_raw);
+  }
+}
+
 static void qtimer3_isr(void) {
-  const uint32_t dwt_raw = ARM_DWT_CYCCNT;
+  const uint32_t dwt_raw = ARM_DWT_CYCCNT;  // FIRST INSTRUCTION
   if (IMXRT_TMR3.CH[2].CSCTRL & TMR_CSCTRL_TCF1) process_interrupt_qtimer3_ch2_irq(dwt_raw);
   if (IMXRT_TMR3.CH[3].CSCTRL & TMR_CSCTRL_TCF1) process_interrupt_qtimer3_ch3_irq(dwt_raw);
 }
 
-static void handle_ocxo_qtimer16_irq(qtimer16_ocxo_runtime_t& clock,
-                                     interrupt_subscriber_runtime_t& rt,
-                                     uint32_t dwt_raw) {
-  clock.irq_count++;
-  qtimer3_clear_compare_flag(clock.hw.channel);
-  if (!clock.active || !rt.active) {
-    clock.miss_count++;
-    return;
-  }
-  const uint16_t counter16_snapshot = clock.hw.module->CH[clock.hw.channel].CNTR;
-  if (!clock.phase_bootstrapped) {
-    clock.miss_count++;
-    return;
-  }
-
-  qtimer16_ocxo_note_interval_irq(clock, counter16_snapshot);
-
-  const int64_t current_gnss_ns_raw = time_dwt_to_gnss_ns(dwt_raw);
-  const int64_t compare_latency_ns = clock.last_fired_compare_delta_ns;
-  const uint32_t compare_latency_cycles = ns_to_dwt_cycles_runtime((uint64_t)llabs(compare_latency_ns));
-  const uint32_t current_dwt_final =
-      (compare_latency_ns >= 0) ? (dwt_raw - compare_latency_cycles)
-                                : (dwt_raw + compare_latency_cycles);
-  const int64_t current_gnss_ns_final =
-      (current_gnss_ns_raw >= 0) ? (current_gnss_ns_raw - compare_latency_ns) : -1;
-
-  if (!clock.second_window_valid) {
-    clock.second_window_valid = true;
-    clock.current_window_interval_count = 0;
-    clock.previous_interval_dwt = current_dwt_final;
-    clock.previous_interval_gnss_ns = current_gnss_ns_final;
-    clock.previous_interval_dwt_raw = dwt_raw;
-    clock.previous_interval_gnss_ns_raw = current_gnss_ns_raw;
-    clock.second_start_dwt_raw = dwt_raw;
-    clock.second_start_gnss_ns_raw = current_gnss_ns_raw;
-    clock.second_start_dwt_final = current_dwt_final;
-    clock.second_start_gnss_ns_final = current_gnss_ns_final;
-    clock.current_window_cycles_sum = 0;
-    clock.current_window_gnss_ns_sum = 0;
-    clock.current_window_cycles_sum_raw = 0;
-    clock.current_window_gnss_ns_sum_raw = 0;
-    clock.last_interval_cycles = 0;
-    clock.last_interval_gnss_ns = 0;
-    clock.last_interval_cycles_raw = 0;
-    clock.last_interval_gnss_ns_raw = 0;
-    clock.last_event_dwt_raw = dwt_raw;
-    clock.last_event_gnss_ns_raw = current_gnss_ns_raw;
-    clock.last_event_dwt_final = current_dwt_final;
-    clock.last_event_gnss_ns_final = current_gnss_ns_final;
-    clock.last_event_target_dwt = 0;
-    clock.last_event_target_gnss_ns = -1;
-    return;
-  }
-
-  const uint32_t interval_cycles_raw = dwt_raw - clock.previous_interval_dwt_raw;
-  clock.last_interval_cycles_raw = interval_cycles_raw;
-  clock.current_window_cycles_sum_raw += (uint64_t)interval_cycles_raw;
-  if (current_gnss_ns_raw >= 0 && clock.previous_interval_gnss_ns_raw >= 0) {
-    const int64_t interval_gnss_ns_raw = current_gnss_ns_raw - clock.previous_interval_gnss_ns_raw;
-    clock.last_interval_gnss_ns_raw = interval_gnss_ns_raw;
-    clock.current_window_gnss_ns_sum_raw += interval_gnss_ns_raw;
-  } else {
-    clock.last_interval_gnss_ns_raw = 0;
-  }
-
-  const uint32_t interval_cycles = current_dwt_final - clock.previous_interval_dwt;
-  clock.last_interval_cycles = interval_cycles;
-  clock.current_window_cycles_sum += (uint64_t)interval_cycles;
-  if (current_gnss_ns_final >= 0 && clock.previous_interval_gnss_ns >= 0) {
-    const int64_t interval_gnss_ns = current_gnss_ns_final - clock.previous_interval_gnss_ns;
-    clock.last_interval_gnss_ns = interval_gnss_ns;
-    clock.current_window_gnss_ns_sum += interval_gnss_ns;
-  } else {
-    clock.last_interval_gnss_ns = 0;
-  }
-
-  clock.previous_interval_dwt_raw = dwt_raw;
-  clock.previous_interval_gnss_ns_raw = current_gnss_ns_raw;
-  clock.previous_interval_dwt = current_dwt_final;
-  clock.previous_interval_gnss_ns = current_gnss_ns_final;
-  clock.current_window_interval_count++;
-  clock.cadence_hits_since_second = clock.current_window_interval_count;
-
-  if (clock.current_window_interval_count < OCXO_INTERVALS_PER_SECOND) return;
-
-  clock.last_second_interval_count = clock.current_window_interval_count;
-  clock.last_second_cycles_observed_raw = clock.current_window_cycles_sum_raw;
-  clock.last_second_gnss_ns_observed_raw = clock.current_window_gnss_ns_sum_raw;
-  clock.last_second_start_dwt_raw = clock.second_start_dwt_raw;
-  clock.last_second_end_dwt_raw = dwt_raw;
-  clock.last_second_start_gnss_ns_raw = clock.second_start_gnss_ns_raw;
-  clock.last_second_end_gnss_ns_raw = current_gnss_ns_raw;
-
-  clock.last_second_start_dwt_final = clock.second_start_dwt_final;
-  clock.last_second_start_gnss_ns_final = clock.second_start_gnss_ns_final;
-  clock.last_second_end_dwt_final =
-      (clock.second_start_dwt_final != 0)
-          ? (clock.second_start_dwt_final + (uint32_t)clock.current_window_cycles_sum)
-          : current_dwt_final;
-  clock.last_second_end_gnss_ns_final =
-      (clock.second_start_gnss_ns_final >= 0)
-          ? (clock.second_start_gnss_ns_final + clock.current_window_gnss_ns_sum)
-          : current_gnss_ns_final;
-
-  clock.last_second_cycles_observed =
-      clock.last_second_end_dwt_final - clock.last_second_start_dwt_final;
-  clock.last_second_gnss_ns_observed =
-      (clock.last_second_end_gnss_ns_final >= 0 && clock.last_second_start_gnss_ns_final >= 0)
-          ? (clock.last_second_end_gnss_ns_final - clock.last_second_start_gnss_ns_final)
-          : 0;
-  clock.last_second_start_raw_minus_final_ns =
-      (clock.last_second_start_gnss_ns_raw >= 0 && clock.last_second_start_gnss_ns_final >= 0)
-          ? (clock.last_second_start_gnss_ns_raw - clock.last_second_start_gnss_ns_final)
-          : 0;
-  clock.last_second_end_raw_minus_final_ns =
-      (clock.last_second_end_gnss_ns_raw >= 0 && clock.last_second_end_gnss_ns_final >= 0)
-          ? (clock.last_second_end_gnss_ns_raw - clock.last_second_end_gnss_ns_final)
-          : 0;
-
-  if (clock.next_second_prediction_valid) {
-    clock.last_second_cycles_prediction = clock.next_second_cycles_prediction;
-    clock.last_second_gnss_ns_prediction = clock.next_second_gnss_ns_prediction;
-    clock.last_second_cycles_prediction_error =
-        (int64_t)clock.last_second_cycles_observed - (int64_t)clock.last_second_cycles_prediction;
-    clock.last_second_gnss_ns_prediction_error =
-        clock.last_second_gnss_ns_observed - clock.last_second_gnss_ns_prediction;
-  } else {
-    clock.last_second_cycles_prediction = 0;
-    clock.last_second_gnss_ns_prediction = 0;
-    clock.last_second_cycles_prediction_error = 0;
-    clock.last_second_gnss_ns_prediction_error = 0;
-  }
-  clock.last_second_residual_ns =
-      (clock.last_second_gnss_ns_observed > 0)
-          ? ((int64_t)NS_PER_SECOND_U64 - clock.last_second_gnss_ns_observed)
-          : 0;
-
-  clock.logical_count32_at_last_second_edge += OCXO_COUNTS_PER_SECOND;
-  const uint32_t logical_counter32_at_event = clock.logical_count32_at_last_second_edge;
-  clock.last_event_target_dwt =
-      (clock.next_second_prediction_valid && clock.second_start_dwt_final != 0)
-          ? (clock.second_start_dwt_final + (uint32_t)clock.next_second_cycles_prediction)
-          : 0;
-  clock.last_event_target_gnss_ns =
-      (clock.next_second_prediction_valid && clock.second_start_gnss_ns_final >= 0)
-          ? (clock.second_start_gnss_ns_final + clock.next_second_gnss_ns_prediction)
-          : -1;
-  clock.last_event_dwt_raw = dwt_raw;
-  clock.last_event_gnss_ns_raw = current_gnss_ns_raw;
-  clock.last_event_dwt_final = clock.last_second_end_dwt_final;
-  clock.last_event_gnss_ns_final = clock.last_second_end_gnss_ns_final;
-
-  clock.next_second_cycles_prediction = clock.last_second_cycles_observed;
-  clock.next_second_gnss_ns_prediction = clock.last_second_gnss_ns_observed;
-  clock.next_second_prediction_valid =
-      (clock.last_second_cycles_observed > 0 && clock.last_second_gnss_ns_observed > 0);
-
-  clock.dispatch_count++;
-  handle_event(rt, dwt_raw, logical_counter32_at_event, &clock);
-
-  clock.current_window_interval_count = 0;
-  clock.current_window_cycles_sum = 0;
-  clock.current_window_gnss_ns_sum = 0;
-  clock.current_window_cycles_sum_raw = 0;
-  clock.current_window_gnss_ns_sum_raw = 0;
-  clock.second_start_dwt_raw = dwt_raw;
-  clock.second_start_gnss_ns_raw = current_gnss_ns_raw;
-  clock.second_start_dwt_final = clock.last_event_dwt_final;
-  clock.second_start_gnss_ns_final = clock.last_event_gnss_ns_final;
-  clock.previous_interval_dwt_raw = dwt_raw;
-  clock.previous_interval_gnss_ns_raw = current_gnss_ns_raw;
-  clock.previous_interval_dwt = current_dwt_final;
-  clock.previous_interval_gnss_ns = current_gnss_ns_final;
-  clock.cadence_hits_since_second = 0;
-}
+// ============================================================================
+// PPS GPIO — witness only
+// ============================================================================
 
 void process_interrupt_gpio6789_irq(uint32_t dwt_isr_entry_raw) {
-  const uint32_t pps_qtimer_at_edge = qtimer1_read_32_for_pps_capture();
-  g_gpio_diag.irq_count++;
-  interrupt_subscriber_runtime_t* rt = g_rt_pps;
-  if (!rt || !rt->active) {
-    g_gpio_diag.miss_count++;
-    return;
+  g_gpio_irq_count++;
+  g_pps_gpio_witness.edge_count++;
+  g_pps_gpio_witness.last_dwt = dwt_isr_entry_raw;
+
+  const int64_t gnss_ns = time_dwt_to_gnss_ns(dwt_isr_entry_raw);
+  g_pps_gpio_witness.last_gnss_ns = gnss_ns;
+
+  if (g_rt_pps && g_rt_pps->has_fired && gnss_ns >= 0) {
+    g_pps_gpio_witness.last_minus_synthetic_ns =
+        gnss_ns - (int64_t)g_rt_pps->last_event.gnss_ns_at_event;
   }
-  g_gpio_diag.dispatch_count++;
-  handle_event(*rt, dwt_isr_entry_raw, pps_qtimer_at_edge);
 }
-void process_interrupt_qtimer3_ch2_irq(uint32_t dwt_raw) { if (g_rt_ocxo1) handle_ocxo_qtimer16_irq(g_clock_ocxo1, *g_rt_ocxo1, dwt_raw); }
-void process_interrupt_qtimer3_ch3_irq(uint32_t dwt_raw) { if (g_rt_ocxo2) handle_ocxo_qtimer16_irq(g_clock_ocxo2, *g_rt_ocxo2, dwt_raw); }
+
+static void pps_gpio_isr(void) {
+  const uint32_t dwt_raw = ARM_DWT_CYCCNT;  // FIRST INSTRUCTION
+  process_interrupt_gpio6789_irq(dwt_raw);
+}
+
+// ============================================================================
+// Subscribe / start / stop
+// ============================================================================
 
 bool interrupt_subscribe(const interrupt_subscription_t& sub) {
-  if (!g_interrupt_runtime_ready || sub.kind == interrupt_subscriber_kind_t::NONE || !sub.on_event) return false;
+  if (!g_interrupt_runtime_ready) return false;
+  if (sub.kind == interrupt_subscriber_kind_t::NONE || !sub.on_event) return false;
   interrupt_subscriber_runtime_t* rt = runtime_for(sub.kind);
   if (!rt || !rt->desc) return false;
   rt->sub = sub;
@@ -684,21 +636,21 @@ bool interrupt_start(interrupt_subscriber_kind_t kind) {
   if (!rt || !rt->desc) return false;
   rt->active = true;
   rt->start_count++;
-  if (kind == interrupt_subscriber_kind_t::PPS) return true;
-  qtimer16_ocxo_runtime_t* clock = ocxo_clock_runtime_for(rt->desc->clock_kind);
-  if (!clock || !clock->initialized) return false;
-  *clock = qtimer16_ocxo_runtime_t{};
-  clock->kind = rt->desc->clock_kind;
-  clock->name = (rt->desc->kind == interrupt_subscriber_kind_t::OCXO1) ? "OCXO1" : "OCXO2";
-  clock->initialized = true;
-  clock->hw.module = &IMXRT_TMR3;
-  clock->hw.channel = (rt->desc->kind == interrupt_subscriber_kind_t::OCXO1) ? 2 : 3;
-  clock->hw.irq = IRQ_QTIMER3;
-  clock->hw.input_pin = (rt->desc->kind == interrupt_subscriber_kind_t::OCXO1) ? OCXO1_PIN : OCXO2_PIN;
-  clock->hw.pcs = (rt->desc->kind == interrupt_subscriber_kind_t::OCXO1) ? 2 : 3;
-  clock->active = true;
-  clock->start_count = 1;
-  qtimer16_ocxo_arm_bootstrap(*clock);
+
+  if (kind == interrupt_subscriber_kind_t::PPS) {
+    g_vclock_lane.active = true;
+    g_vclock_lane.phase_bootstrapped = false;
+    // Re-arm bootstrap on next ISR.
+    qtimer1_ch3_program_compare((uint16_t)(IMXRT_TMR1.CH[3].CNTR + 1));
+    return true;
+  }
+
+  ocxo_lane_t* lane = ocxo_lane_for(kind);
+  if (!lane || !lane->initialized) return false;
+  lane->active = true;
+  lane->phase_bootstrapped = false;
+  qtimer3_program_compare(lane->channel,
+                          (uint16_t)(lane->module->CH[lane->channel].CNTR + 1));
   return true;
 }
 
@@ -707,59 +659,121 @@ bool interrupt_stop(interrupt_subscriber_kind_t kind) {
   if (!rt || !rt->desc) return false;
   rt->active = false;
   rt->stop_count++;
-  qtimer16_ocxo_runtime_t* clock = ocxo_clock_runtime_for(rt->desc->clock_kind);
-  if (clock) {
-    clock->active = false;
-    clock->stop_count++;
-    qtimer3_disable_compare(clock->hw.channel);
+
+  if (kind == interrupt_subscriber_kind_t::PPS) {
+    g_vclock_lane.active = false;
+    qtimer1_ch3_disable_compare();
+    return true;
   }
+
+  ocxo_lane_t* lane = ocxo_lane_for(kind);
+  if (!lane) return false;
+  lane->active = false;
+  qtimer3_disable_compare(lane->channel);
   return true;
 }
 
 void interrupt_request_pps_zero(void) { g_pps_zero_pending = true; }
 bool interrupt_pps_zero_pending(void) { return g_pps_zero_pending; }
+
 const interrupt_event_t* interrupt_last_event(interrupt_subscriber_kind_t kind) {
   interrupt_subscriber_runtime_t* rt = runtime_for(kind);
   return (!rt || !rt->has_fired) ? nullptr : &rt->last_event;
 }
+
 const interrupt_capture_diag_t* interrupt_last_diag(interrupt_subscriber_kind_t kind) {
   interrupt_subscriber_runtime_t* rt = runtime_for(kind);
   return (!rt || !rt->has_fired) ? nullptr : &rt->last_diag;
 }
+
+// Prespin retired; symbol kept as a no-op for linker compatibility.
 void interrupt_prespin_service(timepop_ctx_t*, timepop_diag_t*, void*) {}
+
+// ============================================================================
+// Hardware init
+// ============================================================================
+
+static void qtimer1_ch3_init_vclock_integrator(void) {
+  // CH0/CH1 are TimePop's VCLOCK base counter (PCS=0).  CH2 is TimePop's
+  // dynamic compare scheduler (PCS=0).  CH3 is ours: a third independent
+  // counter on the same GNSS 10 MHz clock, for the VCLOCK integrator.
+  //
+  // CH3 counts the same source as CH0; its CNTR is independent and may
+  // have a small phase offset from CH0/CH2 due to enable order, but that
+  // doesn't matter for our purposes — we only care that CH3.COMP1 fires
+  // when CH3.CNTR matches it, which is a self-consistent local condition.
+  IMXRT_TMR1.CH[3].CTRL   = 0;
+  IMXRT_TMR1.CH[3].SCTRL  = 0;
+  IMXRT_TMR1.CH[3].CSCTRL = 0;
+  IMXRT_TMR1.CH[3].LOAD   = 0;
+  IMXRT_TMR1.CH[3].CNTR   = 0;
+  IMXRT_TMR1.CH[3].COMP1  = 0xFFFF;
+  IMXRT_TMR1.CH[3].CMPLD1 = 0xFFFF;
+  IMXRT_TMR1.CH[3].CTRL   = TMR_CTRL_CM(1) | TMR_CTRL_PCS(0);  // count GNSS 10 MHz
+  qtimer1_ch3_disable_compare();
+}
 
 void process_interrupt_init_hardware(void) {
   if (g_interrupt_hw_ready) return;
-  g_clock_ocxo1.kind = qtimer_clock_kind_t::OCXO1;
-  g_clock_ocxo1.name = "OCXO1";
-  g_clock_ocxo1.hw.module = &IMXRT_TMR3;
-  g_clock_ocxo1.hw.channel = 2;
-  g_clock_ocxo1.hw.irq = IRQ_QTIMER3;
-  g_clock_ocxo1.hw.input_pin = OCXO1_PIN;
-  g_clock_ocxo1.hw.pcs = 2;
-  g_clock_ocxo2.kind = qtimer_clock_kind_t::OCXO2;
-  g_clock_ocxo2.name = "OCXO2";
-  g_clock_ocxo2.hw.module = &IMXRT_TMR3;
-  g_clock_ocxo2.hw.channel = 3;
-  g_clock_ocxo2.hw.irq = IRQ_QTIMER3;
-  g_clock_ocxo2.hw.input_pin = OCXO2_PIN;
-  g_clock_ocxo2.hw.pcs = 3;
+
+  // OCXO1 / OCXO2 on QTimer3.
+  g_ocxo1_lane.name = "OCXO1";
+  g_ocxo1_lane.module = &IMXRT_TMR3;
+  g_ocxo1_lane.channel = 2;
+  g_ocxo1_lane.pcs = 2;
+  g_ocxo1_lane.input_pin = OCXO1_PIN;
+
+  g_ocxo2_lane.name = "OCXO2";
+  g_ocxo2_lane.module = &IMXRT_TMR3;
+  g_ocxo2_lane.channel = 3;
+  g_ocxo2_lane.pcs = 3;
+  g_ocxo2_lane.input_pin = OCXO2_PIN;
+
   CCM_CCGR6 |= CCM_CCGR6_QTIMER3(CCM_CCGR_ON);
   *(portConfigRegister(OCXO1_PIN)) = 1;
   *(portConfigRegister(OCXO2_PIN)) = 1;
   IOMUXC_QTIMER3_TIMER2_SELECT_INPUT = 1;
   IOMUXC_QTIMER3_TIMER3_SELECT_INPUT = 1;
-  IMXRT_TMR3.CH[2].CTRL = 0; IMXRT_TMR3.CH[2].SCTRL = 0; IMXRT_TMR3.CH[2].CSCTRL = 0; IMXRT_TMR3.CH[2].LOAD = 0; IMXRT_TMR3.CH[2].CNTR = 0; IMXRT_TMR3.CH[2].COMP1 = 0xFFFF; IMXRT_TMR3.CH[2].CMPLD1 = 0xFFFF; IMXRT_TMR3.CH[2].CTRL = TMR_CTRL_CM(1) | TMR_CTRL_PCS(g_clock_ocxo1.hw.pcs); qtimer3_disable_compare(2);
-  IMXRT_TMR3.CH[3].CTRL = 0; IMXRT_TMR3.CH[3].SCTRL = 0; IMXRT_TMR3.CH[3].CSCTRL = 0; IMXRT_TMR3.CH[3].LOAD = 0; IMXRT_TMR3.CH[3].CNTR = 0; IMXRT_TMR3.CH[3].COMP1 = 0xFFFF; IMXRT_TMR3.CH[3].CMPLD1 = 0xFFFF; IMXRT_TMR3.CH[3].CTRL = TMR_CTRL_CM(1) | TMR_CTRL_PCS(g_clock_ocxo2.hw.pcs); qtimer3_disable_compare(3);
-  g_clock_ocxo1.initialized = true;
-  g_clock_ocxo2.initialized = true;
+
+  IMXRT_TMR3.CH[2].CTRL = 0; IMXRT_TMR3.CH[2].SCTRL = 0;
+  IMXRT_TMR3.CH[2].CSCTRL = 0; IMXRT_TMR3.CH[2].LOAD = 0;
+  IMXRT_TMR3.CH[2].CNTR = 0; IMXRT_TMR3.CH[2].COMP1 = 0xFFFF;
+  IMXRT_TMR3.CH[2].CMPLD1 = 0xFFFF;
+  IMXRT_TMR3.CH[2].CTRL = TMR_CTRL_CM(1) | TMR_CTRL_PCS(g_ocxo1_lane.pcs);
+  qtimer3_disable_compare(2);
+
+  IMXRT_TMR3.CH[3].CTRL = 0; IMXRT_TMR3.CH[3].SCTRL = 0;
+  IMXRT_TMR3.CH[3].CSCTRL = 0; IMXRT_TMR3.CH[3].LOAD = 0;
+  IMXRT_TMR3.CH[3].CNTR = 0; IMXRT_TMR3.CH[3].COMP1 = 0xFFFF;
+  IMXRT_TMR3.CH[3].CMPLD1 = 0xFFFF;
+  IMXRT_TMR3.CH[3].CTRL = TMR_CTRL_CM(1) | TMR_CTRL_PCS(g_ocxo2_lane.pcs);
+  qtimer3_disable_compare(3);
+
+  g_ocxo1_lane.initialized = true;
+  g_ocxo2_lane.initialized = true;
+
+  // VCLOCK on QTimer1 CH3.  QTimer1's clock gate and CH0/CH1/CH2 setup
+  // are owned by TimePop and have already happened by the time we run
+  // (process_interrupt_init_hardware is called after timepop_init).
+  qtimer1_ch3_init_vclock_integrator();
+  g_vclock_lane.initialized = true;
+
   g_interrupt_hw_ready = true;
 }
 
 void process_interrupt_init(void) {
   if (g_interrupt_runtime_ready) return;
+
+  g_vclock_integrator = rolling_dwt_integrator_t{};
+  g_vclock_integrator.name = "VCLOCK";
+  g_ocxo1_integrator = rolling_dwt_integrator_t{};
+  g_ocxo1_integrator.name = "OCXO1";
+  g_ocxo2_integrator = rolling_dwt_integrator_t{};
+  g_ocxo2_integrator.name = "OCXO2";
+
   g_subscriber_count = 0;
   for (auto& rt : g_subscribers) rt = interrupt_subscriber_runtime_t{};
+
   for (uint32_t i = 0; i < (sizeof(DESCRIPTORS) / sizeof(DESCRIPTORS[0])); i++) {
     interrupt_subscriber_runtime_t& rt = g_subscribers[g_subscriber_count++];
     rt = interrupt_subscriber_runtime_t{};
@@ -768,20 +782,57 @@ void process_interrupt_init(void) {
     else if (rt.desc->kind == interrupt_subscriber_kind_t::OCXO1) g_rt_ocxo1 = &rt;
     else if (rt.desc->kind == interrupt_subscriber_kind_t::OCXO2) g_rt_ocxo2 = &rt;
   }
-  g_gpio_diag = {};
+
+  g_pps_gpio_witness = pps_gpio_witness_t{};
+  g_gpio_irq_count = 0;
+  g_gpio_miss_count = 0;
   g_pps_zero_pending = false;
+
   g_interrupt_runtime_ready = true;
 }
 
 void process_interrupt_enable_irqs(void) {
   if (g_interrupt_irqs_enabled) return;
+
+  // QTimer3 (OCXO lanes) — process_interrupt owns this vector.
   attachInterruptVector(IRQ_QTIMER3, qtimer3_isr);
   NVIC_SET_PRIORITY(IRQ_QTIMER3, 16);
   NVIC_ENABLE_IRQ(IRQ_QTIMER3);
+
+  // PPS GPIO — witness only.
   pinMode(GNSS_PPS_PIN, INPUT);
   attachInterrupt(digitalPinToInterrupt(GNSS_PPS_PIN), pps_gpio_isr, RISING);
   NVIC_SET_PRIORITY(IRQ_GPIO6789, 0);
+
+  // VCLOCK integrator — register CH3 ISR with TimePop.  TimePop's
+  // qtimer1_irq_isr captures DWT first thing and dispatches here when
+  // CH3's flag is set.  No vector ownership; just hosted dispatch.
+  timepop_register_qtimer1_ch3_isr(vclock_integrator_isr);
+
   g_interrupt_irqs_enabled = true;
+}
+
+// ============================================================================
+// Command surface
+// ============================================================================
+
+static void add_integrator_report(Payload& p, const char* prefix,
+                                  const rolling_dwt_integrator_t& r) {
+  char key[96];
+  auto keyf = [&](const char* suffix) -> const char* {
+    snprintf(key, sizeof(key), "%s_%s", prefix, suffix);
+    return key;
+  };
+  p.add(keyf("baseline_valid"), r.baseline_valid);
+  p.add(keyf("baseline_dwt"), r.baseline_dwt);
+  p.add(keyf("total_ticks_seen"), r.total_ticks_seen);
+  p.add(keyf("ring_fill"), r.ring_fill);
+  p.add(keyf("ring_sum"), r.ring_sum);
+  p.add(keyf("avg_cycles_per_sec"), integrator_cycles_per_second(r));
+  p.add(keyf("last_interval_cycles"), r.last_interval_cycles);
+  p.add(keyf("boundary_emissions"), r.boundary_emissions);
+  p.add(keyf("synthetic_valid"), r.synthetic_valid);
+  p.add(keyf("last_synthetic_dwt"), r.last_synthetic_dwt);
 }
 
 static Payload cmd_report(const Payload&) {
@@ -791,65 +842,39 @@ static Payload cmd_report(const Payload&) {
   p.add("irqs_enabled", g_interrupt_irqs_enabled);
   p.add("subscriber_count", g_subscriber_count);
   p.add("pps_zero_pending", g_pps_zero_pending);
-  p.add("gpio_irq_count", g_gpio_diag.irq_count);
-  p.add("gpio_dispatch_count", g_gpio_diag.dispatch_count);
-  p.add("gpio_miss_count", g_gpio_diag.miss_count);
-  p.add("ocxo1_irq_count", g_clock_ocxo1.irq_count);
-  p.add("ocxo1_dispatch_count", g_clock_ocxo1.dispatch_count);
-  p.add("ocxo1_miss_count", g_clock_ocxo1.miss_count);
-  p.add("ocxo1_bootstrap_count", g_clock_ocxo1.bootstrap_count);
-  p.add("ocxo1_cadence_hits_total", g_clock_ocxo1.cadence_hits_total);
-  p.add("ocxo1_current_window_interval_count", g_clock_ocxo1.current_window_interval_count);
-  p.add("ocxo1_last_programmed_compare", (uint32_t)g_clock_ocxo1.last_programmed_compare);
-  p.add("ocxo1_last_compare16_fired", (uint32_t)g_clock_ocxo1.last_fired_compare16);
-  p.add("ocxo1_last_counter16_at_irq", (uint32_t)g_clock_ocxo1.last_counter16_at_irq);
-  p.add("ocxo1_last_compare_delta_ticks", g_clock_ocxo1.last_fired_compare_delta_ticks);
-  p.add("ocxo1_last_compare_delta_ns", g_clock_ocxo1.last_fired_compare_delta_ns);
-  p.add("ocxo1_last_interval_cycles", g_clock_ocxo1.last_interval_cycles);
-  p.add("ocxo1_last_interval_gnss_ns", g_clock_ocxo1.last_interval_gnss_ns);
-  p.add("ocxo1_current_window_cycles_sum", (uint64_t)g_clock_ocxo1.current_window_cycles_sum);
-  p.add("ocxo1_current_window_gnss_ns_sum", g_clock_ocxo1.current_window_gnss_ns_sum);
-  p.add("ocxo1_last_second_cycles_observed", (uint64_t)g_clock_ocxo1.last_second_cycles_observed);
-  p.add("ocxo1_last_second_cycles_observed_raw", (uint64_t)g_clock_ocxo1.last_second_cycles_observed_raw);
-  p.add("ocxo1_last_second_gnss_ns_observed", g_clock_ocxo1.last_second_gnss_ns_observed);
-  p.add("ocxo1_last_second_gnss_ns_observed_raw", g_clock_ocxo1.last_second_gnss_ns_observed_raw);
-  p.add("ocxo1_last_second_cycles_prediction", (uint64_t)g_clock_ocxo1.last_second_cycles_prediction);
-  p.add("ocxo1_last_second_gnss_ns_prediction", g_clock_ocxo1.last_second_gnss_ns_prediction);
-  p.add("ocxo1_last_second_cycles_prediction_error", g_clock_ocxo1.last_second_cycles_prediction_error);
-  p.add("ocxo1_last_second_gnss_ns_prediction_error", g_clock_ocxo1.last_second_gnss_ns_prediction_error);
-  p.add("ocxo1_last_second_residual_ns", g_clock_ocxo1.last_second_residual_ns);
-  p.add("ocxo1_last_second_start_gnss_ns_final", g_clock_ocxo1.last_second_start_gnss_ns_final);
-  p.add("ocxo1_last_second_end_gnss_ns_final", g_clock_ocxo1.last_second_end_gnss_ns_final);
-  p.add("ocxo1_last_second_start_raw_minus_final_ns", g_clock_ocxo1.last_second_start_raw_minus_final_ns);
-  p.add("ocxo1_last_second_end_raw_minus_final_ns", g_clock_ocxo1.last_second_end_raw_minus_final_ns);
-  p.add("ocxo2_irq_count", g_clock_ocxo2.irq_count);
-  p.add("ocxo2_dispatch_count", g_clock_ocxo2.dispatch_count);
-  p.add("ocxo2_miss_count", g_clock_ocxo2.miss_count);
-  p.add("ocxo2_bootstrap_count", g_clock_ocxo2.bootstrap_count);
-  p.add("ocxo2_cadence_hits_total", g_clock_ocxo2.cadence_hits_total);
-  p.add("ocxo2_current_window_interval_count", g_clock_ocxo2.current_window_interval_count);
-  p.add("ocxo2_last_programmed_compare", (uint32_t)g_clock_ocxo2.last_programmed_compare);
-  p.add("ocxo2_last_compare16_fired", (uint32_t)g_clock_ocxo2.last_fired_compare16);
-  p.add("ocxo2_last_counter16_at_irq", (uint32_t)g_clock_ocxo2.last_counter16_at_irq);
-  p.add("ocxo2_last_compare_delta_ticks", g_clock_ocxo2.last_fired_compare_delta_ticks);
-  p.add("ocxo2_last_compare_delta_ns", g_clock_ocxo2.last_fired_compare_delta_ns);
-  p.add("ocxo2_last_interval_cycles", g_clock_ocxo2.last_interval_cycles);
-  p.add("ocxo2_last_interval_gnss_ns", g_clock_ocxo2.last_interval_gnss_ns);
-  p.add("ocxo2_current_window_cycles_sum", (uint64_t)g_clock_ocxo2.current_window_cycles_sum);
-  p.add("ocxo2_current_window_gnss_ns_sum", g_clock_ocxo2.current_window_gnss_ns_sum);
-  p.add("ocxo2_last_second_cycles_observed", (uint64_t)g_clock_ocxo2.last_second_cycles_observed);
-  p.add("ocxo2_last_second_cycles_observed_raw", (uint64_t)g_clock_ocxo2.last_second_cycles_observed_raw);
-  p.add("ocxo2_last_second_gnss_ns_observed", g_clock_ocxo2.last_second_gnss_ns_observed);
-  p.add("ocxo2_last_second_gnss_ns_observed_raw", g_clock_ocxo2.last_second_gnss_ns_observed_raw);
-  p.add("ocxo2_last_second_cycles_prediction", (uint64_t)g_clock_ocxo2.last_second_cycles_prediction);
-  p.add("ocxo2_last_second_gnss_ns_prediction", g_clock_ocxo2.last_second_gnss_ns_prediction);
-  p.add("ocxo2_last_second_cycles_prediction_error", g_clock_ocxo2.last_second_cycles_prediction_error);
-  p.add("ocxo2_last_second_gnss_ns_prediction_error", g_clock_ocxo2.last_second_gnss_ns_prediction_error);
-  p.add("ocxo2_last_second_residual_ns", g_clock_ocxo2.last_second_residual_ns);
-  p.add("ocxo2_last_second_start_gnss_ns_final", g_clock_ocxo2.last_second_start_gnss_ns_final);
-  p.add("ocxo2_last_second_end_gnss_ns_final", g_clock_ocxo2.last_second_end_gnss_ns_final);
-  p.add("ocxo2_last_second_start_raw_minus_final_ns", g_clock_ocxo2.last_second_start_raw_minus_final_ns);
-  p.add("ocxo2_last_second_end_raw_minus_final_ns", g_clock_ocxo2.last_second_end_raw_minus_final_ns);
+
+  p.add("gpio_irq_count", g_gpio_irq_count);
+  p.add("gpio_miss_count", g_gpio_miss_count);
+  p.add("gpio_edge_count", g_pps_gpio_witness.edge_count);
+  p.add("gpio_last_dwt", g_pps_gpio_witness.last_dwt);
+  p.add("gpio_last_gnss_ns", g_pps_gpio_witness.last_gnss_ns);
+  p.add("gpio_minus_synthetic_ns", g_pps_gpio_witness.last_minus_synthetic_ns);
+
+  add_integrator_report(p, "vclock", g_vclock_integrator);
+  add_integrator_report(p, "ocxo1", g_ocxo1_integrator);
+  add_integrator_report(p, "ocxo2", g_ocxo2_integrator);
+
+  p.add("vclock_irq_count", g_vclock_lane.irq_count);
+  p.add("vclock_miss_count", g_vclock_lane.miss_count);
+  p.add("vclock_bootstrap_count", g_vclock_lane.bootstrap_count);
+  p.add("vclock_cadence_hits_total", g_vclock_lane.cadence_hits_total);
+  p.add("vclock_compare_target", (uint32_t)g_vclock_lane.compare_target);
+  p.add("vclock_logical_count32", g_vclock_lane.logical_count32_at_last_boundary);
+
+  p.add("ocxo1_irq_count", g_ocxo1_lane.irq_count);
+  p.add("ocxo1_miss_count", g_ocxo1_lane.miss_count);
+  p.add("ocxo1_bootstrap_count", g_ocxo1_lane.bootstrap_count);
+  p.add("ocxo1_cadence_hits_total", g_ocxo1_lane.cadence_hits_total);
+  p.add("ocxo1_compare_target", (uint32_t)g_ocxo1_lane.compare_target);
+  p.add("ocxo1_logical_count32", g_ocxo1_lane.logical_count32_at_last_boundary);
+
+  p.add("ocxo2_irq_count", g_ocxo2_lane.irq_count);
+  p.add("ocxo2_miss_count", g_ocxo2_lane.miss_count);
+  p.add("ocxo2_bootstrap_count", g_ocxo2_lane.bootstrap_count);
+  p.add("ocxo2_cadence_hits_total", g_ocxo2_lane.cadence_hits_total);
+  p.add("ocxo2_compare_target", (uint32_t)g_ocxo2_lane.compare_target);
+  p.add("ocxo2_logical_count32", g_ocxo2_lane.logical_count32_at_last_boundary);
+
   return p;
 }
 
@@ -857,9 +882,46 @@ static const process_command_entry_t INTERRUPT_COMMANDS[] = {
   { "REPORT", cmd_report },
   { nullptr,  nullptr    }
 };
+
 static const process_vtable_t INTERRUPT_PROCESS = {
   .process_id    = "INTERRUPT",
   .commands      = INTERRUPT_COMMANDS,
   .subscriptions = nullptr
 };
-void process_interrupt_register(void) { process_register("INTERRUPT", &INTERRUPT_PROCESS); }
+
+void process_interrupt_register(void) {
+  process_register("INTERRUPT", &INTERRUPT_PROCESS);
+}
+
+// ============================================================================
+// Label helpers
+// ============================================================================
+
+const char* interrupt_subscriber_kind_str(interrupt_subscriber_kind_t kind) {
+  switch (kind) {
+    case interrupt_subscriber_kind_t::PPS:       return "PPS";
+    case interrupt_subscriber_kind_t::OCXO1:     return "OCXO1";
+    case interrupt_subscriber_kind_t::OCXO2:     return "OCXO2";
+    case interrupt_subscriber_kind_t::TIME_TEST: return "TIME_TEST";
+    default:                                     return "NONE";
+  }
+}
+
+const char* interrupt_provider_kind_str(interrupt_provider_kind_t provider) {
+  switch (provider) {
+    case interrupt_provider_kind_t::QTIMER1:  return "QTIMER1";
+    case interrupt_provider_kind_t::QTIMER3:  return "QTIMER3";
+    case interrupt_provider_kind_t::GPIO6789: return "GPIO6789";
+    default:                                  return "NONE";
+  }
+}
+
+const char* interrupt_lane_str(interrupt_lane_t lane) {
+  switch (lane) {
+    case interrupt_lane_t::QTIMER1_CH3_COMP: return "QTIMER1_CH3_COMP";
+    case interrupt_lane_t::QTIMER3_CH2_COMP: return "QTIMER3_CH2_COMP";
+    case interrupt_lane_t::QTIMER3_CH3_COMP: return "QTIMER3_CH3_COMP";
+    case interrupt_lane_t::GPIO_EDGE:        return "GPIO_EDGE";
+    default:                                 return "NONE";
+  }
+}

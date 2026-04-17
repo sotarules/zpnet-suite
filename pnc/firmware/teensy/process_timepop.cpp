@@ -2123,16 +2123,34 @@ out.add("vclock_edge_monitor_last_vclock_minus_pps_ns", g_vclock_edge_monitor.la
 }
 
 // ============================================================================
+// QTimer1 CH3 hosted client (registered by process_interrupt)
+// ============================================================================
+//
+// process_interrupt owns the VCLOCK rolling integrator and uses CH3 of
+// QTimer1 as a dedicated compare channel.  TimePop's QTimer1 IRQ handler
+// dispatches to this callback when CH3's TCF1 flag is set, passing the
+// first-instruction DWT capture so the client gets identical latency to
+// a dedicated-vector handler.
+//
+static volatile timepop_qtimer1_ch3_isr_fn g_qtimer1_ch3_isr = nullptr;
+
+void timepop_register_qtimer1_ch3_isr(timepop_qtimer1_ch3_isr_fn cb) {
+  g_qtimer1_ch3_isr = cb;
+}
+
+// ============================================================================
 // QTimer1 ISR
 // ============================================================================
 
 static void qtimer1_irq_isr(void) {
   const uint32_t dwt_raw = ARM_DWT_CYCCNT;           // FIRST instruction
   if (IMXRT_TMR1.CH[2].CSCTRL & TMR_CSCTRL_TCF1) {
-    qtimer1_ch2_isr(dwt_raw);                          // pass it down
+    qtimer1_ch2_isr(dwt_raw);                          // TimePop scheduler
+  }
+  if (g_qtimer1_ch3_isr && (IMXRT_TMR1.CH[3].CSCTRL & TMR_CSCTRL_TCF1)) {
+    g_qtimer1_ch3_isr(dwt_raw);                        // hosted CH3 client
   }
 }
-
 
 static const process_command_entry_t TIMEPOP_COMMANDS[] = {
   { "REPORT",                 cmd_report                 },

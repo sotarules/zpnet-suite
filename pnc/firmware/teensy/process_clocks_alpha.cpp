@@ -2,38 +2,30 @@
 // process_clocks_alpha.cpp — Always-On Physics Layer
 // ============================================================================
 //
-// Time source discipline — gears, not rubber bands:
+// Post rolling-integration doctrine:
 //
-//   All canonical time values are derived from ISR-captured facts or from
-//   pure arithmetic on those facts.  No live counter reads are used for
-//   canonical state.
+//   pps_callback is driven by the VCLOCK rolling integrator's 1-second
+//   boundary emission.  The first such boundary carries gnss_ns_at_event = 0
+//   (the bridge cannot be valid until alpha installs the epoch); alpha
+//   treats that as the bootstrap epoch install, captures the synthetic DWT
+//   as the bridge anchor, and from that moment forward every integrator
+//   boundary across all three lanes uses the bridge to translate
+//   synthetic_dwt to GNSS ns.
 //
-//   The QTimer value for time_pps_update() is geared:
-//     g_qtimer_at_pps += TICKS_10MHZ_PER_SECOND
-//   The VCLOCK runs on the GNSS 10 MHz input, so this is exact by definition.
+//   ocxo1_callback / ocxo2_callback receive boundary events whose
+//   gnss_ns_at_event is already the bridge-translated GNSS nanosecond
+//   at which the OCXO's 1-second edge occurred.  Alpha trusts that value
+//   directly — there is no override.
 //
-//   Epoch installation uses the PPS event contract supplied by
-//   process_interrupt.  The consummating PPS event carries both:
+//   The DWT next-second prediction is sourced at each boundary from the
+//   VCLOCK integrator's SMA-derived avg_cycles_per_second.  The old 10 kHz
+//   DWT adjustment timer is retired.
 //
-//     • dwt_at_event       — reconstructed DWT time of the PPS edge
-//     • counter32_at_event — VCLOCK position corresponding to that same edge
+//   The smart-zero OCXO phase model is unchanged.
 //
-//   No ambient QTimer read is permitted at epoch installation, because that
-//   would bless a later instant as though it were the PPS boundary.
-//
-//   The DWT adjustment timer reads DWT_CYCCNT directly at 10 kHz.  This is
-//   a legitimate real-time feedback loop on the DWT bridge substrate.
-//
-// Smart-zero OCXO phase model:
-//
-//   OCXO ns_count_at_edge is a pure OCXO-domain counter that advances by
-//   exactly 1,000,000,000 per lawful one-second OCXO edge.  It does not
-//   incorporate GNSS measurements.  Phase offset is the cumulative
-//   difference: gnss_ns_at_edge - ns_count_at_edge.
-//
-//   Per-window viability checks whether each GNSS-measured OCXO second
-//   approximates 1e9 ns.  This replaces the old cumulative viability
-//   audit, which was answering the wrong question.
+//   residual_vclock is repurposed: it accumulates the GPIO PPS witness
+//   offset from the synthetic boundary.  The Welford mean reveals DC bias;
+//   the standard deviation reveals true GPIO detection latency jitter.
 //
 // ============================================================================
 
@@ -57,16 +49,14 @@
 
 #include <math.h>
 #include <stdlib.h>
+#include <strings.h>
 
 // ============================================================================
 // Constants
 // ============================================================================
 
-static constexpr uint64_t NS_PER_SECOND_U64    = 1000000000ULL;
-static constexpr uint64_t PPS_RELAY_OFF_NS     = 500000000ULL;
-static constexpr uint64_t DWT_ADJUST_TIMER_NS  = 100000ULL; // 10 kHz
-static constexpr uint32_t DWT_INTERVALS_PER_SECOND = (uint32_t)(NS_PER_SECOND_U64 / DWT_ADJUST_TIMER_NS);
-static constexpr int64_t  DWT_ADJUST_THRESHOLD_NS = 2LL;
+static constexpr uint64_t NS_PER_SECOND_U64 = 1000000000ULL;
+static constexpr uint64_t PPS_RELAY_OFF_NS  = 500000000ULL;
 
 // ============================================================================
 // Always-on state
@@ -77,22 +67,12 @@ volatile uint64_t g_gnss_ns_count_at_pps = 0;
 volatile uint32_t g_dwt_cycle_count_at_pps = 0;
 volatile uint64_t g_dwt_cycle_count_total = 0;
 volatile uint32_t g_dwt_cycle_count_between_pps = 0;
-volatile uint32_t g_dwt_cycle_count_between_pps_raw = 0;
-volatile int32_t  g_dwt_cycle_count_between_pps_raw_minus_final = 0;
-volatile uint32_t g_dwt_interval_count_last_second = 0;
-volatile uint32_t g_dwt_cycle_count_last_second_prediction = DWT_EXPECTED_PER_PPS;
 volatile uint32_t g_dwt_cycle_count_next_second_prediction = DWT_EXPECTED_PER_PPS;
-volatile int32_t  g_dwt_cycle_count_next_second_adjustment = 0;
+volatile int32_t  g_dwt_cycle_count_next_second_adjustment = 0;  // vestigial
 volatile uint64_t g_dwt_model_pps_count = 0;
 
-// Lawful VCLOCK anchor captured at each PPS event.
-// Unlike the historical geared follower, this is now the actual event-carried
-// CH0/CH1 position corresponding to the PPS boundary.
 volatile uint32_t g_qtimer_at_pps = 0;
 volatile uint32_t g_last_pps_event_counter32_at_event = 0;
-
-volatile int32_t g_last_pps_live_qtimer_minus_geared = 0;
-volatile uint32_t g_last_pps_live_qtimer_read = 0;
 
 vclock_clock_state_t g_vclock_clock = {};
 vclock_measurement_t g_vclock_measurement = {};
@@ -109,20 +89,9 @@ interrupt_capture_diag_t g_ocxo2_interrupt_diag = {};
 
 bool g_ad5693r_init_ok = false;
 
-volatile uint32_t g_epoch_live_qtimer_read = 0;
-volatile int32_t  g_epoch_live_qtimer_minus_event = 0;
-
 // ============================================================================
 // Alpha epoch state
 // ============================================================================
-//
-// This is the canonical zero-based epoch for the always-on physics layer.
-// It is established only on a lawful PPS edge.
-//
-// The physical raw values captured here are not themselves the canonical
-// clocks; they are the shared boundary facts from which the canonical
-// synthetic clocks are defined.
-//
 
 enum class clocks_epoch_reason_t : uint8_t {
   NONE  = 0,
@@ -136,24 +105,9 @@ static volatile bool g_epoch_initialized = false;
 static volatile uint32_t g_epoch_generation = 0;
 static volatile clocks_epoch_reason_t g_epoch_reason = clocks_epoch_reason_t::NONE;
 
-// Raw physical anchors captured at the consummating PPS boundary.
 static volatile uint32_t g_epoch_dwt_at_pps = 0;
 static volatile uint32_t g_epoch_qtimer_at_pps = 0;
-
-// Canonical PPS count within current epoch (0 at epoch PPS, then 1, 2, 3...).
 static volatile uint64_t g_epoch_pps_index = 0;
-
-
-// ============================================================================
-// DWT rolling interval integration state
-// ============================================================================
-
-static volatile bool     g_dwt_interval_window_valid = false;
-static volatile uint32_t g_dwt_current_interval_count = 0;
-static volatile uint32_t g_dwt_previous_interval_dwt = 0;
-static volatile uint64_t g_dwt_previous_interval_gnss_ns = 0;
-static volatile uint64_t g_dwt_current_interval_cycles_sum = 0;
-static volatile uint32_t g_dwt_last_interval_cycles = 0;
 
 // ============================================================================
 // DAC state
@@ -186,56 +140,46 @@ const char* servo_mode_str(servo_mode_t mode) {
 
 servo_mode_t servo_mode_parse(const char* s) {
   if (!s || !*s) return servo_mode_t::OFF;
-  if (strcmp(s, "TOTAL") == 0) return servo_mode_t::TOTAL;
-  if (strcmp(s, "MEAN") == 0)  return servo_mode_t::TOTAL;  // legacy compat
-  if (strcmp(s, "NOW") == 0)   return servo_mode_t::NOW;
+  if (!strcasecmp(s, "TOTAL")) return servo_mode_t::TOTAL;
+  if (!strcasecmp(s, "NOW"))   return servo_mode_t::NOW;
   return servo_mode_t::OFF;
 }
 
+// Forward decls.
+static bool ocxo_dac_write_hw(ocxo_dac_state_t& s, double value);
+
+bool ocxo_dac_set(ocxo_dac_state_t& s, double value) {
+  return ocxo_dac_write_hw(s, value);
+}
+
 void ocxo_dac_predictor_reset(ocxo_dac_state_t& s) {
-  s.servo_last_step = 0.0;
-  s.servo_last_residual = 0.0;
-  s.servo_settle_count = 0;
-  s.servo_adjustments = 0;
   s.servo_predictor_initialized = false;
   s.servo_last_raw_residual = 0.0;
   s.servo_filtered_residual = 0.0;
   s.servo_filtered_slope = 0.0;
   s.servo_predicted_residual = 0.0;
   s.servo_predictor_updates = 0;
-
-  s.pacing_pending = false;
-  s.pacing_pending_target = s.dac_fractional;
-  s.pacing_pending_step = 0.0;
-  s.pacing_pending_hw_code = s.dac_hw_code;
-  s.pacing_pending_since_second = 0;
-  s.pacing_last_request_second = 0;
-  s.pacing_last_commit_second = 0;
-  s.pacing_intents = 0;
-  s.pacing_deferred_count = 0;
-  s.pacing_commit_count = 0;
-  s.pacing_skip_small_delta_count = 0;
 }
 
 void ocxo_dac_io_reset(ocxo_dac_state_t& s) {
   s.io_last_write_ok = true;
   s.io_fault_latched = false;
-  s.io_write_attempts = 0;
-  s.io_write_successes = 0;
-  s.io_write_failures = 0;
-  s.io_last_attempted_hw_code = s.dac_hw_code;
-  s.io_last_good_hw_code = s.dac_hw_code;
   s.io_last_failure_stage = 0;
 }
 
-bool ocxo_dac_set(ocxo_dac_state_t& s, double value) {
+void ocxo_dac_retry_reset(ocxo_dac_state_t& s) {
+  s.io_last_write_ok = true;
+  s.io_fault_latched = false;
+  s.io_last_failure_stage = 0;
+}
+
+static bool ocxo_dac_write_hw(ocxo_dac_state_t& s, double value) {
   if (value < (double)s.dac_min) value = (double)s.dac_min;
   if (value > (double)s.dac_max) value = (double)s.dac_max;
 
-  const uint16_t hw_code = (uint16_t)value;
+  uint16_t hw_code = (uint16_t)(value + 0.5);
   s.io_last_attempted_hw_code = hw_code;
 
-  // No-op bus guard: if the hardware code is unchanged, do not touch I²C.
   if (hw_code == s.dac_hw_code) {
     s.dac_fractional = value;
     s.io_last_write_ok = true;
@@ -301,7 +245,7 @@ static void pps_relay_deassert(timepop_ctx_t*, timepop_diag_t*, void*) {
 }
 
 // ============================================================================
-// DWT
+// DWT enable
 // ============================================================================
 
 static inline void dwt_enable(void) {
@@ -329,20 +273,11 @@ static void alpha_reset_canonical_clock_state_for_new_epoch(void) {
   g_dwt_cycle_count_at_pps = 0;
   g_dwt_cycle_count_total = 0;
   g_dwt_cycle_count_between_pps = 0;
-  g_dwt_cycle_count_between_pps_raw = 0;
-  g_dwt_cycle_count_between_pps_raw_minus_final = 0;
-  g_dwt_interval_count_last_second = 0;
-  g_dwt_cycle_count_last_second_prediction = DWT_EXPECTED_PER_PPS;
   g_dwt_cycle_count_next_second_prediction = DWT_EXPECTED_PER_PPS;
   g_dwt_cycle_count_next_second_adjustment = 0;
   g_dwt_model_pps_count = 0;
   g_qtimer_at_pps = 0;
-  g_dwt_interval_window_valid = false;
-  g_dwt_current_interval_count = 0;
-  g_dwt_previous_interval_dwt = 0;
-  g_dwt_previous_interval_gnss_ns = 0;
-  g_dwt_current_interval_cycles_sum = 0;
-  g_dwt_last_interval_cycles = 0;
+
   g_vclock_clock = {};
   g_vclock_measurement = {};
 
@@ -371,17 +306,10 @@ static void alpha_install_new_epoch_from_pps(const interrupt_event_t& pps_event)
   g_epoch_dwt_at_pps = pps_event.dwt_at_event;
   g_epoch_qtimer_at_pps = pps_event.counter32_at_event;
 
-  const uint32_t live_qtimer_now = interrupt_qtimer1_counter32_now();
-  g_epoch_live_qtimer_read = live_qtimer_now;
-  g_epoch_live_qtimer_minus_event = (int32_t)(live_qtimer_now - pps_event.counter32_at_event);
-
   alpha_reset_canonical_clock_state_for_new_epoch();
 
   g_gnss_ns_count_at_pps = 0;
   g_dwt_cycle_count_at_pps = pps_event.dwt_at_event;
-  g_dwt_cycle_count_total = 0;
-  g_dwt_cycle_count_between_pps = 0;
-  g_dwt_model_pps_count = 0;
   g_qtimer_at_pps = g_epoch_qtimer_at_pps;
 
   g_vclock_clock.counter32_at_pps_event = pps_event.counter32_at_event;
@@ -396,67 +324,14 @@ static void alpha_install_new_epoch_from_pps(const interrupt_event_t& pps_event)
   g_vclock_measurement.second_residual_ns = 0;
   g_vclock_measurement.prev_counter32_at_pps_event = pps_event.counter32_at_event;
 
-  // OCXO smart-zero: aggregate reset already zeroed g_ocxo1_clock and
-  // g_ocxo2_clock via = {}. zero_established starts false. The first
-  // post-epoch OCXO one-second edge will seed the phase offset ledger.
-
+  // Establish the bridge anchor.  From this moment, time_dwt_to_gnss_ns()
+  // returns valid GNSS nanoseconds for any DWT in the recent past or future,
+  // including the OCXO integrator's synthetic boundaries.
   time_pps_epoch_reset(pps_event.dwt_at_event, g_epoch_qtimer_at_pps);
 }
 
 // ============================================================================
-// Helper: derive DWT adjustment at 10 kHz
-// ============================================================================
-
-static void dwt_adjustment_timer_callback(timepop_ctx_t* ctx, timepop_diag_t*, void*) {
-  if (g_gnss_ns_count_at_pps == 0) return;
-  if (!time_valid()) return;
-
-  const uint32_t current_dwt = DWT_CYCCNT;
-  const uint64_t elapsed_gnss_ns = ctx->fire_gnss_ns - g_gnss_ns_count_at_pps;
-  if (elapsed_gnss_ns == 0) return;
-
-  const int64_t previous_interval_gnss_ns =
-    (int64_t)g_dwt_previous_interval_gnss_ns;
-
-  if (!g_dwt_interval_window_valid) {
-    g_dwt_interval_window_valid = true;
-    g_dwt_current_interval_count = 0;
-    g_dwt_previous_interval_dwt = current_dwt;
-    g_dwt_previous_interval_gnss_ns = ctx->fire_gnss_ns;
-    g_dwt_current_interval_cycles_sum = 0;
-    g_dwt_last_interval_cycles = 0;
-  } else if (previous_interval_gnss_ns >= 0 && ctx->fire_gnss_ns > previous_interval_gnss_ns) {
-    const uint32_t interval_cycles = current_dwt - g_dwt_previous_interval_dwt;
-    g_dwt_last_interval_cycles = interval_cycles;
-    g_dwt_current_interval_cycles_sum += (uint64_t)interval_cycles;
-    g_dwt_current_interval_count++;
-    g_dwt_previous_interval_dwt = current_dwt;
-    g_dwt_previous_interval_gnss_ns = ctx->fire_gnss_ns;
-  }
-
-  const int64_t effective =
-      (int64_t)g_dwt_cycle_count_next_second_prediction +
-      (int64_t)g_dwt_cycle_count_next_second_adjustment;
-
-  const int64_t predicted_dwt =
-      (int64_t)g_dwt_cycle_count_at_pps +
-      ((int64_t)elapsed_gnss_ns * effective) / 1000000000LL;
-
-  const int64_t residual_cycles = (int64_t)current_dwt - predicted_dwt;
-  const int64_t residual_ns = (int64_t)dwt_cycles_to_ns((uint64_t)llabs(residual_cycles));
-
-  if (residual_ns >= DWT_ADJUST_THRESHOLD_NS) {
-    const int64_t candidate_total =
-        ((int64_t)(current_dwt - g_dwt_cycle_count_at_pps) * 1000000000LL) /
-        (int64_t)elapsed_gnss_ns;
-
-    g_dwt_cycle_count_next_second_adjustment =
-        (int32_t)(candidate_total - (int64_t)g_dwt_cycle_count_next_second_prediction);
-  }
-}
-
-// ============================================================================
-// Interrupt subscribers
+// PPS subscriber — driven by VCLOCK rolling integrator boundary
 // ============================================================================
 
 static void pps_callback(
@@ -464,16 +339,18 @@ static void pps_callback(
     const interrupt_capture_diag_t* diag,
     void*) {
 
-  static uint32_t prev_dwt_pps = 0;
-
   if (diag) g_pps_interrupt_diag = *diag;
-  else g_pps_interrupt_diag = {};
+  else      g_pps_interrupt_diag = {};
+
   g_last_pps_event_counter32_at_event = event.counter32_at_event;
 
+  // ── Epoch install (or re-install on request_zero) ──
+  // The first VCLOCK boundary always lands here because the bridge cannot
+  // be valid until we install the epoch.  After install, the bridge IS
+  // valid, and subsequent boundaries flow through the "normal advance"
+  // path with bridge-translated gnss_ns_at_event values.
   if (!g_epoch_initialized || g_epoch_pending) {
     alpha_install_new_epoch_from_pps(event);
-
-    prev_dwt_pps = event.dwt_at_event;
 
     if (campaign_state == clocks_campaign_state_t::STARTED ||
         request_start || request_stop || request_recover || request_zero) {
@@ -481,7 +358,6 @@ static void pps_callback(
     }
 
     digitalWriteFast(GNSS_PPS_RELAY, HIGH);
-
     if (!relay_timer_active) {
       relay_timer_active = true;
       timepop_arm(PPS_RELAY_OFF_NS, false, pps_relay_deassert, nullptr, "pps-relay-off");
@@ -489,95 +365,57 @@ static void pps_callback(
     return;
   }
 
+  // ── Normal advance ──
+  // event.gnss_ns_at_event is the bridge-translated GNSS ns at this
+  // synthetic boundary.  We use it to advance the canonical PPS clock.
   g_epoch_pps_index++;
-  g_gnss_ns_count_at_pps = g_epoch_pps_index * NS_PER_SECOND_U64;
+  g_gnss_ns_count_at_pps = event.gnss_ns_at_event;
   g_dwt_cycle_count_at_pps = event.dwt_at_event;
+  g_qtimer_at_pps = event.counter32_at_event;
 
-  // VCLOCK is now tracked on two rails:
-  //   1) actual lawful CH0/CH1 position carried by the PPS event
-  //   2) synthetic/geared expectation advanced by exactly 10,000,000 ticks
-  const uint32_t actual_qtimer_at_pps = event.counter32_at_event;
-  const uint32_t expected_qtimer_at_pps =
-      g_vclock_clock.zero_established
-          ? (g_vclock_clock.counter32_at_pps_expected + TICKS_10MHZ_PER_SECOND)
-          : actual_qtimer_at_pps;
+  // VCLOCK bookkeeping — by construction one synthetic second elapsed.
+  g_vclock_measurement.ticks_between_pps = TICKS_10MHZ_PER_SECOND;
+  g_vclock_measurement.ns_between_pps = NS_PER_SECOND_U64;
+  g_vclock_measurement.second_residual_ns = 0;
+  g_vclock_clock.counter32_at_pps_event = event.counter32_at_event;
+  g_vclock_clock.counter32_at_pps_expected = event.counter32_at_event;
+  g_vclock_clock.counter32_error_at_pps = 0;
+  g_vclock_clock.ns_count_at_pps = event.gnss_ns_at_event;
+  g_vclock_clock.ns_count_expected_at_pps += NS_PER_SECOND_U64;
+  g_vclock_measurement.prev_counter32_at_pps_event = event.counter32_at_event;
 
-  g_qtimer_at_pps = actual_qtimer_at_pps;
-  g_vclock_clock.counter32_at_pps_event = actual_qtimer_at_pps;
-  g_vclock_clock.counter32_at_pps_expected = expected_qtimer_at_pps;
-  g_vclock_clock.counter32_error_at_pps =
-      (int32_t)(actual_qtimer_at_pps - expected_qtimer_at_pps);
-
-  if (g_vclock_measurement.prev_counter32_at_pps_event != 0) {
-    const uint32_t ticks_between_pps =
-        actual_qtimer_at_pps - g_vclock_measurement.prev_counter32_at_pps_event;
-    const uint64_t ns_between_pps = (uint64_t)ticks_between_pps * 100ULL;
-
-    g_vclock_measurement.ticks_between_pps = ticks_between_pps;
-    g_vclock_measurement.ns_between_pps = ns_between_pps;
-    g_vclock_measurement.second_residual_ns =
-        (int64_t)NS_PER_SECOND_U64 - (int64_t)ns_between_pps;
-
-    g_vclock_clock.ns_count_at_pps += ns_between_pps;
-    g_vclock_clock.ns_count_expected_at_pps += NS_PER_SECOND_U64;
+  // DWT cycles between consecutive synthetic boundaries — sourced from
+  // the integrator's SMA-derived avg cycles per second.
+  const uint64_t integrator_cps = interrupt_vclock_cycles_per_second();
+  if (integrator_cps > 0 && integrator_cps < (uint64_t)UINT32_MAX) {
+    g_dwt_cycle_count_between_pps = (uint32_t)integrator_cps;
+    g_dwt_cycle_count_next_second_prediction = (uint32_t)integrator_cps;
+  } else {
+    g_dwt_cycle_count_between_pps = DWT_EXPECTED_PER_PPS;
+    g_dwt_cycle_count_next_second_prediction = DWT_EXPECTED_PER_PPS;
   }
-
-  g_vclock_measurement.prev_counter32_at_pps_event = actual_qtimer_at_pps;
-  g_vclock_clock.zero_established = true;
-
-  const uint32_t live_qtimer_now = interrupt_qtimer1_counter32_now();
-  g_last_pps_live_qtimer_read = live_qtimer_now;
-  g_last_pps_live_qtimer_minus_geared = (int32_t)(live_qtimer_now - expected_qtimer_at_pps);
-
-  {
-    const uint32_t delta32_raw = event.dwt_at_event - prev_dwt_pps;
-
-    uint32_t delta32_final = delta32_raw;
-    uint32_t interval_count_final = 0;
-
-    if (g_dwt_interval_window_valid && g_dwt_previous_interval_gnss_ns <= g_gnss_ns_count_at_pps) {
-      const uint32_t tail_cycles = event.dwt_at_event - g_dwt_previous_interval_dwt;
-      delta32_final = (uint32_t)(g_dwt_current_interval_cycles_sum + (uint64_t)tail_cycles);
-      interval_count_final = g_dwt_current_interval_count + 1U;
-      g_dwt_last_interval_cycles = tail_cycles;
-    }
-
-    g_dwt_cycle_count_total += (uint64_t)delta32_final;
-    g_dwt_cycle_count_between_pps_raw = delta32_raw;
-    g_dwt_cycle_count_between_pps = delta32_final;
-    g_dwt_cycle_count_between_pps_raw_minus_final =
-        (int32_t)((int64_t)delta32_raw - (int64_t)delta32_final);
-    g_dwt_interval_count_last_second = interval_count_final;
-    g_dwt_cycle_count_last_second_prediction = g_dwt_cycle_count_next_second_prediction;
-
-    if (g_dwt_model_pps_count > 0) {
-      g_dwt_cycle_count_next_second_prediction = delta32_final;
-    }
-  }
-
-  prev_dwt_pps = event.dwt_at_event;
-  g_dwt_interval_window_valid = true;
-  g_dwt_current_interval_count = 0;
-  g_dwt_previous_interval_dwt = event.dwt_at_event;
-  g_dwt_previous_interval_gnss_ns = g_gnss_ns_count_at_pps;
-  g_dwt_current_interval_cycles_sum = 0;
   g_dwt_cycle_count_next_second_adjustment = 0;
+  g_dwt_cycle_count_total += (uint64_t)g_dwt_cycle_count_between_pps;
   g_dwt_model_pps_count++;
 
-  // Project OCXO ns to PPS boundary using the phase offset ledger.
-  //
-  //   ns_count_at_pps = gnss_ns_at_pps - phase_offset_ns
-  //
-  // This gives the OCXO's own ns total, projected to the PPS instant
-  // via the last-known cumulative phase relationship.
+  // ── GPIO PPS witness → residual_vclock ──
+  // The witness offset is the difference between the physical GPIO PPS
+  // edge's GNSS ns and the most recent synthetic boundary's GNSS ns.
+  // This is the measurement we could never trust before; now we capture
+  // its true jitter.
+  if (g_pps_interrupt_diag.gpio_edge_count > 0 &&
+      g_pps_interrupt_diag.gpio_last_gnss_ns > 0) {
+    residual_update_sample(residual_vclock,
+                           g_pps_interrupt_diag.gpio_minus_synthetic_ns);
+  }
 
+  // ── OCXO ns projection to PPS boundary via phase ledger ──
   if (g_ocxo1_clock.zero_established) {
     g_ocxo1_clock.ns_count_at_pps =
         (uint64_t)((int64_t)g_gnss_ns_count_at_pps - g_ocxo1_clock.phase_offset_ns);
   } else {
     g_ocxo1_clock.ns_count_at_pps = 0;
   }
-
   if (g_ocxo2_clock.zero_established) {
     g_ocxo2_clock.ns_count_at_pps =
         (uint64_t)((int64_t)g_gnss_ns_count_at_pps - g_ocxo2_clock.phase_offset_ns);
@@ -585,10 +423,10 @@ static void pps_callback(
     g_ocxo2_clock.ns_count_at_pps = 0;
   }
 
-  time_pps_update(
-      g_dwt_cycle_count_at_pps,
-      dwt_effective_cycles_per_second(),
-      g_qtimer_at_pps);
+  // Update the time bridge with our new authoritative anchor.
+  time_pps_update(g_dwt_cycle_count_at_pps,
+                  dwt_effective_cycles_per_second(),
+                  g_qtimer_at_pps);
 
   if (campaign_state == clocks_campaign_state_t::STARTED ||
       request_start || request_stop || request_recover || request_zero) {
@@ -600,11 +438,68 @@ static void pps_callback(
   }
 
   digitalWriteFast(GNSS_PPS_RELAY, HIGH);
-
   if (!relay_timer_active) {
     relay_timer_active = true;
     timepop_arm(PPS_RELAY_OFF_NS, false, pps_relay_deassert, nullptr, "pps-relay-off");
   }
+}
+
+// ============================================================================
+// OCXO subscribers — driven by per-OCXO rolling integrator boundaries
+// ============================================================================
+//
+// event.dwt_at_event       — synthetic DWT at the OCXO's Nth one-second edge
+// event.gnss_ns_at_event   — bridge-translated GNSS ns at that same edge
+// event.counter32_at_event — software-extended logical OCXO tick count
+//
+// Alpha trusts gnss_ns_at_event directly.  No override.
+//
+
+static void ocxo_apply_edge(ocxo_clock_state_t& clock,
+                            ocxo_measurement_t& meas,
+                            uint32_t dwt_at_edge,
+                            uint64_t gnss_ns_at_edge) {
+
+  clock.gnss_ns_at_edge = gnss_ns_at_edge;
+  meas.dwt_at_edge = dwt_at_edge;
+
+  if (meas.prev_gnss_ns_at_edge == 0) {
+    // First post-epoch OCXO edge: seed the phase offset ledger.
+    clock.ns_count_at_edge = NS_PER_SECOND_U64;
+    clock.phase_offset_ns =
+        (int64_t)gnss_ns_at_edge - (int64_t)NS_PER_SECOND_U64;
+    clock.zero_established = true;
+
+    meas.gnss_ns_between_edges = 0;
+    meas.dwt_cycles_between_edges = 0;
+    meas.second_residual_ns = 0;
+  } else {
+    clock.ns_count_at_edge += NS_PER_SECOND_U64;
+    clock.phase_offset_ns =
+        (int64_t)gnss_ns_at_edge - (int64_t)clock.ns_count_at_edge;
+
+    const uint64_t gnss_ns_between_edges =
+        gnss_ns_at_edge - meas.prev_gnss_ns_at_edge;
+    const uint32_t dwt_cycles_between_edges =
+        dwt_at_edge - meas.prev_dwt_at_edge;
+
+    meas.gnss_ns_between_edges = gnss_ns_between_edges;
+    meas.dwt_cycles_between_edges = dwt_cycles_between_edges;
+    meas.second_residual_ns =
+        (int64_t)NS_PER_SECOND_U64 - (int64_t)gnss_ns_between_edges;
+
+    clock.window_expected_ns = (int64_t)NS_PER_SECOND_U64;
+    clock.window_actual_ns = (int64_t)gnss_ns_between_edges;
+    clock.window_error_ns =
+        (int64_t)gnss_ns_between_edges - (int64_t)NS_PER_SECOND_U64;
+    clock.window_checks++;
+    if (llabs(clock.window_error_ns) > OCXO_WINDOW_TOLERANCE_NS) {
+      clock.window_mismatches++;
+    }
+  }
+
+  meas.prev_gnss_ns_at_edge = gnss_ns_at_edge;
+  meas.prev_dwt_at_edge = dwt_at_edge;
 }
 
 static void ocxo1_callback(
@@ -613,66 +508,17 @@ static void ocxo1_callback(
     void*) {
 
   if (diag) g_ocxo1_interrupt_diag = *diag;
-  else g_ocxo1_interrupt_diag = {};
+  else      g_ocxo1_interrupt_diag = {};
 
-  if (!alpha_ocxo_edges_are_canonical()) {
-    return;
-  }
+  if (!alpha_ocxo_edges_are_canonical()) return;
 
-  const uint32_t dwt_at_edge = event.dwt_at_event;
-  const uint64_t gnss_ns_at_edge = event.gnss_ns_at_event;
+  // Skip events whose gnss_ns_at_event is 0 (bridge wasn't valid at
+  // emission time).  This can only happen for OCXO boundaries that
+  // fired before alpha installed the epoch; should be rare and benign.
+  if (event.gnss_ns_at_event == 0) return;
 
-  g_ocxo1_clock.gnss_ns_at_edge = gnss_ns_at_edge;
-  g_ocxo1_measurement.dwt_at_edge = dwt_at_edge;
-
-  if (g_ocxo1_measurement.prev_gnss_ns_at_edge == 0) {
-    // ── First one-second OCXO edge after epoch zero ──
-    //
-    // The OCXO has counted exactly 10,000,000 ticks since PPS zero.
-    // In the OCXO's own domain, that is exactly 1,000,000,000 ns.
-    // The GNSS measurement of this edge seeds the phase offset ledger.
-
-    g_ocxo1_clock.ns_count_at_edge = NS_PER_SECOND_U64;
-    g_ocxo1_clock.phase_offset_ns =
-        (int64_t)gnss_ns_at_edge - (int64_t)NS_PER_SECOND_U64;
-    g_ocxo1_clock.zero_established = true;
-
-    g_ocxo1_measurement.gnss_ns_between_edges = 0;
-    g_ocxo1_measurement.dwt_cycles_between_edges = 0;
-    g_ocxo1_measurement.second_residual_ns = 0;
-  } else {
-    // ── Subsequent one-second OCXO edges ──
-    //
-    // OCXO ns advances deterministically by 1e9 per OCXO second.
-    // Phase offset is the cumulative GNSS-vs-OCXO difference.
-
-    g_ocxo1_clock.ns_count_at_edge += NS_PER_SECOND_U64;
-    g_ocxo1_clock.phase_offset_ns =
-        (int64_t)gnss_ns_at_edge - (int64_t)g_ocxo1_clock.ns_count_at_edge;
-
-    const uint64_t gnss_ns_between_edges =
-        gnss_ns_at_edge - g_ocxo1_measurement.prev_gnss_ns_at_edge;
-    const uint32_t dwt_cycles_between_edges =
-        dwt_at_edge - g_ocxo1_measurement.prev_dwt_at_edge;
-
-    g_ocxo1_measurement.gnss_ns_between_edges = gnss_ns_between_edges;
-    g_ocxo1_measurement.dwt_cycles_between_edges = dwt_cycles_between_edges;
-    g_ocxo1_measurement.second_residual_ns =
-        (int64_t)NS_PER_SECOND_U64 - (int64_t)gnss_ns_between_edges;
-
-    // Per-window viability audit: did this OCXO second approximate 1e9 ns?
-    g_ocxo1_clock.window_expected_ns = (int64_t)NS_PER_SECOND_U64;
-    g_ocxo1_clock.window_actual_ns = (int64_t)gnss_ns_between_edges;
-    g_ocxo1_clock.window_error_ns =
-        (int64_t)gnss_ns_between_edges - (int64_t)NS_PER_SECOND_U64;
-    g_ocxo1_clock.window_checks++;
-    if (llabs(g_ocxo1_clock.window_error_ns) > OCXO_WINDOW_TOLERANCE_NS) {
-      g_ocxo1_clock.window_mismatches++;
-    }
-  }
-
-  g_ocxo1_measurement.prev_gnss_ns_at_edge = gnss_ns_at_edge;
-  g_ocxo1_measurement.prev_dwt_at_edge = dwt_at_edge;
+  ocxo_apply_edge(g_ocxo1_clock, g_ocxo1_measurement,
+                  event.dwt_at_event, event.gnss_ns_at_event);
 }
 
 static void ocxo2_callback(
@@ -681,54 +527,13 @@ static void ocxo2_callback(
     void*) {
 
   if (diag) g_ocxo2_interrupt_diag = *diag;
-  else g_ocxo2_interrupt_diag = {};
+  else      g_ocxo2_interrupt_diag = {};
 
-  if (!alpha_ocxo_edges_are_canonical()) {
-    return;
-  }
+  if (!alpha_ocxo_edges_are_canonical()) return;
+  if (event.gnss_ns_at_event == 0) return;
 
-  const uint32_t dwt_at_edge = event.dwt_at_event;
-  const uint64_t gnss_ns_at_edge = event.gnss_ns_at_event;
-
-  g_ocxo2_clock.gnss_ns_at_edge = gnss_ns_at_edge;
-  g_ocxo2_measurement.dwt_at_edge = dwt_at_edge;
-
-  if (g_ocxo2_measurement.prev_gnss_ns_at_edge == 0) {
-    g_ocxo2_clock.ns_count_at_edge = NS_PER_SECOND_U64;
-    g_ocxo2_clock.phase_offset_ns =
-        (int64_t)gnss_ns_at_edge - (int64_t)NS_PER_SECOND_U64;
-    g_ocxo2_clock.zero_established = true;
-
-    g_ocxo2_measurement.gnss_ns_between_edges = 0;
-    g_ocxo2_measurement.dwt_cycles_between_edges = 0;
-    g_ocxo2_measurement.second_residual_ns = 0;
-  } else {
-    g_ocxo2_clock.ns_count_at_edge += NS_PER_SECOND_U64;
-    g_ocxo2_clock.phase_offset_ns =
-        (int64_t)gnss_ns_at_edge - (int64_t)g_ocxo2_clock.ns_count_at_edge;
-
-    const uint64_t gnss_ns_between_edges =
-        gnss_ns_at_edge - g_ocxo2_measurement.prev_gnss_ns_at_edge;
-    const uint32_t dwt_cycles_between_edges =
-        dwt_at_edge - g_ocxo2_measurement.prev_dwt_at_edge;
-
-    g_ocxo2_measurement.gnss_ns_between_edges = gnss_ns_between_edges;
-    g_ocxo2_measurement.dwt_cycles_between_edges = dwt_cycles_between_edges;
-    g_ocxo2_measurement.second_residual_ns =
-        (int64_t)NS_PER_SECOND_U64 - (int64_t)gnss_ns_between_edges;
-
-    g_ocxo2_clock.window_expected_ns = (int64_t)NS_PER_SECOND_U64;
-    g_ocxo2_clock.window_actual_ns = (int64_t)gnss_ns_between_edges;
-    g_ocxo2_clock.window_error_ns =
-        (int64_t)gnss_ns_between_edges - (int64_t)NS_PER_SECOND_U64;
-    g_ocxo2_clock.window_checks++;
-    if (llabs(g_ocxo2_clock.window_error_ns) > OCXO_WINDOW_TOLERANCE_NS) {
-      g_ocxo2_clock.window_mismatches++;
-    }
-  }
-
-  g_ocxo2_measurement.prev_gnss_ns_at_edge = gnss_ns_at_edge;
-  g_ocxo2_measurement.prev_dwt_at_edge = dwt_at_edge;
+  ocxo_apply_edge(g_ocxo2_clock, g_ocxo2_measurement,
+                  event.dwt_at_event, event.gnss_ns_at_event);
 }
 
 // ============================================================================
@@ -784,5 +589,6 @@ void process_clocks_init(void) {
   interrupt_subscribe(ocxo2_sub);
   interrupt_start(interrupt_subscriber_kind_t::OCXO2);
 
-  timepop_arm(DWT_ADJUST_TIMER_NS, true, dwt_adjustment_timer_callback, nullptr, "dwt-adjust");
+  // The 10 kHz dwt_adjustment_timer is RETIRED.  The VCLOCK rolling
+  // integrator's avg_cycles_per_second is now the prediction source.
 }

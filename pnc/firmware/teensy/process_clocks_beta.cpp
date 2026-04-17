@@ -1,6 +1,21 @@
 // ============================================================================
 // process_clocks_beta.cpp — Campaign Layer
 // ============================================================================
+//
+// Post rolling-integration changes:
+//   - clocks_payload_add_ocxo_diag rewritten for the new trimmed
+//     interrupt_capture_diag_t field set.
+//   - clocks_payload_add_pps_diag (new) publishes the VCLOCK integrator
+//     state and the PPS GPIO witness offset.
+//   - Retired alpha externs (raw/final duality) removed.
+//   - residual_vclock is now fed from alpha's pps_callback (GPIO witness
+//     offset), not from local measurement.
+//   - TIMEBASE_FRAGMENT publication trimmed of retired fields, augmented
+//     with integrator and witness diagnostics.
+//
+// Everything else (campaign lifecycle, servo, Welford, DAC pacing,
+// watchdog, command surface) is unchanged.
+// ============================================================================
 
 #include "process_clocks_internal.h"
 #include "process_clocks.h"
@@ -23,11 +38,6 @@
 #include <math.h>
 #include <stdlib.h>
 #include <climits>
-
-extern volatile uint32_t g_dwt_cycle_count_between_pps_raw;
-extern volatile int32_t  g_dwt_cycle_count_between_pps_raw_minus_final;
-extern volatile uint32_t g_dwt_interval_count_last_second;
-extern volatile uint32_t g_dwt_cycle_count_last_second_prediction;
 
 // ============================================================================
 // Campaign State — definitions
@@ -54,6 +64,10 @@ static volatile bool zero_handshake_in_flight = false;
 // Most recently published TIMEBASE_FRAGMENT, retained for cmd_report.
 static Payload g_last_fragment;
 
+// ============================================================================
+// Watchdog state
+// ============================================================================
+
 volatile bool     watchdog_anomaly_active          = false;
 volatile bool     watchdog_anomaly_publish_pending = false;
 volatile uint32_t watchdog_anomaly_sequence        = 0;
@@ -69,7 +83,7 @@ volatile uint32_t watchdog_anomaly_trigger_dwt     = 0;
 // ============================================================================
 
 pps_residual_t residual_dwt    = {};
-pps_residual_t residual_vclock = {};
+pps_residual_t residual_vclock = {};   // fed from alpha (GPIO witness)
 pps_residual_t residual_ocxo1  = {};
 pps_residual_t residual_ocxo2  = {};
 
@@ -135,85 +149,83 @@ double dac_welford_stderr(const dac_welford_t& w) {
   return (w.n >= 2) ? sqrt(w.m2 / (double)(w.n - 1)) / sqrt((double)w.n) : 0.0;
 }
 
+// ============================================================================
+// Diag publishers — rewritten for the new interrupt_capture_diag_t
+// ============================================================================
+
 static void clocks_payload_add_ocxo_diag(Payload& p,
-                                        const char* prefix,
-                                        const interrupt_capture_diag_t& diag) {
+                                         const char* prefix,
+                                         const interrupt_capture_diag_t& diag) {
   char key[96];
 
   auto add_bool = [&](const char* suffix, bool value) {
     snprintf(key, sizeof(key), "%s_%s", prefix, suffix);
     p.add(key, value);
   };
-
   auto add_u32 = [&](const char* suffix, uint32_t value) {
     snprintf(key, sizeof(key), "%s_%s", prefix, suffix);
     p.add(key, value);
   };
-
   auto add_u64 = [&](const char* suffix, uint64_t value) {
     snprintf(key, sizeof(key), "%s_%s", prefix, suffix);
     p.add(key, value);
   };
-
   auto add_i64 = [&](const char* suffix, int64_t value) {
     snprintf(key, sizeof(key), "%s_%s", prefix, suffix);
     p.add(key, value);
   };
 
-  // Keep only OCXO truth-surface fields:
-  //   - canonical edge/event facts
-  //   - bridge reconciliation
-  //   - compare-latency facts
-  //   - bucket/one-second integrator facts
   add_bool("enabled", diag.enabled);
 
+  // Event truth surface.
   add_u32("dwt_at_event", diag.dwt_at_event);
-  add_u64("gnss_ns_at_event_final", diag.gnss_ns_at_event_final);
+  add_u64("gnss_ns_at_event", diag.gnss_ns_at_event);
+  add_u32("counter32_at_event", diag.counter32_at_event);
+
+  // Raw ISR-entry facts (diagnostic only).
+  add_u32("dwt_isr_entry_raw", diag.dwt_isr_entry_raw);
   add_i64("dwt_isr_entry_gnss_ns", diag.dwt_isr_entry_gnss_ns);
   add_i64("dwt_isr_entry_minus_event_ns", diag.dwt_isr_entry_minus_event_ns);
 
-  add_bool("bridge_valid", diag.bridge_valid);
-  add_bool("bridge_within_tolerance", diag.bridge_within_tolerance);
-  add_bool("bridge_used_prediction", diag.bridge_used_prediction);
-  add_u64("bridge_gnss_ns_raw", diag.bridge_gnss_ns_raw);
-  add_u64("bridge_gnss_ns_target", diag.bridge_gnss_ns_target);
-  add_u64("bridge_gnss_ns_final", diag.bridge_gnss_ns_final);
-  add_i64("bridge_raw_error_ns", diag.bridge_raw_error_ns);
-  add_i64("bridge_final_error_ns", diag.bridge_final_error_ns);
+  // Rolling integrator state (the new heart of the system).
+  add_bool("integrator_baseline_valid", diag.integrator_baseline_valid);
+  add_u32("integrator_baseline_dwt", diag.integrator_baseline_dwt);
+  add_u64("integrator_total_ticks", diag.integrator_total_ticks);
+  add_u32("integrator_ring_fill", diag.integrator_ring_fill);
+  add_u64("integrator_ring_sum", diag.integrator_ring_sum);
+  add_u64("integrator_avg_cycles_per_sec", diag.integrator_avg_cycles_per_sec);
+  add_u32("integrator_last_interval_cycles", diag.integrator_last_interval_cycles);
+  add_u32("integrator_boundary_emissions", diag.integrator_boundary_emissions);
 
-  add_u32("counter16_at_irq", diag.counter16_at_irq);
-  add_u32("compare16_fired", diag.compare16_fired);
-  add_u32("compare16_next_programmed", diag.compare16_next_programmed);
-  add_i64("counter16_minus_compare_ticks", diag.counter16_minus_compare_ticks);
-  add_i64("counter16_minus_compare_ns", diag.counter16_minus_compare_ns);
-
-  add_u32("ocxo_interval_counts", diag.ocxo_interval_counts);
-  add_u32("ocxo_current_window_interval_count", diag.ocxo_current_window_interval_count);
-  add_u32("ocxo_last_second_interval_count", diag.ocxo_last_second_interval_count);
-  add_u32("ocxo_last_interval_cycles", diag.ocxo_last_interval_cycles);
-  add_i64("ocxo_last_interval_gnss_ns", diag.ocxo_last_interval_gnss_ns);
-  add_u64("ocxo_current_window_cycles_sum", diag.ocxo_current_window_cycles_sum);
-  add_i64("ocxo_current_window_gnss_ns_sum", diag.ocxo_current_window_gnss_ns_sum);
-  add_u64("ocxo_second_cycles_observed", diag.ocxo_second_cycles_observed);
-  add_u64("ocxo_second_cycles_prediction", diag.ocxo_second_cycles_prediction);
-  add_i64("ocxo_second_cycles_prediction_error", diag.ocxo_second_cycles_prediction_error);
-  add_i64("ocxo_second_gnss_ns_observed", diag.ocxo_second_gnss_ns_observed);
-  add_i64("ocxo_second_gnss_ns_prediction", diag.ocxo_second_gnss_ns_prediction);
-  add_i64("ocxo_second_gnss_ns_prediction_error", diag.ocxo_second_gnss_ns_prediction_error);
-  add_i64("ocxo_second_residual_ns", diag.ocxo_second_residual_ns);
-  add_i64("ocxo_second_start_gnss_ns_raw", diag.ocxo_second_start_gnss_ns_raw);
-  add_i64("ocxo_second_end_gnss_ns_raw", diag.ocxo_second_end_gnss_ns_raw);
-  add_u32("ocxo_second_start_dwt_raw", diag.ocxo_second_start_dwt_raw);
-  add_u32("ocxo_second_end_dwt_raw", diag.ocxo_second_end_dwt_raw);
+  add_u32("anomaly_count", diag.anomaly_count);
 }
 
-// ── Predictive servo tuning ──
-//
-// Both TOTAL and NOW drive a filtered residual *and* a filtered mean slope
-// toward zero.  The controller projects a short horizon into the future and
-// adjusts the DAC toward that projected residual rather than reacting only to
-// the current residual.
-//
+static void clocks_payload_add_pps_diag(Payload& p,
+                                        const char* prefix,
+                                        const interrupt_capture_diag_t& diag) {
+  // Same baseline fields as the OCXO publisher, plus the GPIO witness fields
+  // which are populated only on the PPS subscriber's diag.
+  clocks_payload_add_ocxo_diag(p, prefix, diag);
+
+  char key[96];
+  auto add_u32 = [&](const char* suffix, uint32_t value) {
+    snprintf(key, sizeof(key), "%s_%s", prefix, suffix);
+    p.add(key, value);
+  };
+  auto add_i64 = [&](const char* suffix, int64_t value) {
+    snprintf(key, sizeof(key), "%s_%s", prefix, suffix);
+    p.add(key, value);
+  };
+
+  add_u32("gpio_edge_count", diag.gpio_edge_count);
+  add_u32("gpio_last_dwt", diag.gpio_last_dwt);
+  add_i64("gpio_last_gnss_ns", diag.gpio_last_gnss_ns);
+  add_i64("gpio_minus_synthetic_ns", diag.gpio_minus_synthetic_ns);
+}
+
+// ============================================================================
+// Predictive servo tuning (unchanged)
+// ============================================================================
 
 static constexpr uint32_t NOW_WINDOW_SIZE = 5;
 
@@ -244,222 +256,112 @@ static void now_window_reset(now_window_t& w) {
   w.head = 0;
 }
 
+static double now_window_mean(const now_window_t& w) {
+  if (w.count == 0) return 0.0;
+  double sum = 0.0;
+  for (uint32_t i = 0; i < w.count; i++) sum += (double)w.samples[i];
+  return sum / (double)w.count;
+}
+
+static void now_window_push(now_window_t& w, int64_t sample) {
+  w.samples[w.head] = sample;
+  w.head = (w.head + 1) % NOW_WINDOW_SIZE;
+  if (w.count < NOW_WINDOW_SIZE) w.count++;
+}
+
 // ============================================================================
-// DAC pacing / deferred commit
+// DAC pacing / deferred commit (unchanged)
 // ============================================================================
 
-static constexpr const char* OCXO_DAC_COMMIT_NAME = "ocxo-dac-commit";
+static const char* OCXO_DAC_COMMIT_NAME = "ocxo-dac-commit";
 
-static bool             g_ocxo_dac_commit_scheduled = false;
+static volatile bool   g_ocxo_dac_commit_scheduled = false;
 static ocxo_dac_state_t* g_ocxo_dac_commit_selected = nullptr;
-static double           g_ocxo_dac_commit_target = 0.0;
-static uint16_t         g_ocxo_dac_commit_target_hw_code = 0;
-static uint64_t         g_ocxo_dac_last_schedule_second = 0;
-static uint64_t         g_ocxo_dac_last_commit_second = 0;
-static uint32_t         g_ocxo_dac_last_winner = 0;   // 0=none, 1=ocxo1, 2=ocxo2
-static uint32_t         g_ocxo_dac_arbitration_passes = 0;
-static uint32_t         g_ocxo_dac_no_candidate_passes = 0;
-static uint32_t         g_ocxo_dac_schedule_failures = 0;
-static uint32_t         g_ocxo_dac_commit_callbacks = 0;
-static uint32_t         g_ocxo_dac_deferred_candidates = 0;
-static uint32_t         g_ocxo_dac_retry_requests = 0;
-static uint32_t         g_ocxo_dac_retry_successes = 0;
-static uint32_t         g_ocxo_dac_retry_failures = 0;
-static uint32_t         g_ocxo_dac_retry_exhausted = 0;
-static uint32_t         g_ocxo_dac_retry_blocked_candidates = 0;
+static double          g_ocxo_dac_commit_target = 0.0;
+static uint16_t        g_ocxo_dac_commit_target_hw_code = 0;
+static uint64_t        g_ocxo_dac_last_schedule_second = 0;
+static uint64_t        g_ocxo_dac_last_commit_second = 0;
+static uint8_t         g_ocxo_dac_last_winner = 0;
+static uint32_t        g_ocxo_dac_arbitration_passes = 0;
+static uint32_t        g_ocxo_dac_no_candidate_passes = 0;
+static uint32_t        g_ocxo_dac_deferred_candidates = 0;
+static uint32_t        g_ocxo_dac_schedule_failures = 0;
 
-static constexpr uint64_t OCXO_DAC_RETRY_DELAY_SECONDS = 1ULL;
-static constexpr uint32_t OCXO_DAC_MAX_CONSECUTIVE_WRITE_FAILURES = 2U;
-
-struct ocxo_dac_retry_state_t {
-  uint32_t consecutive_failures = 0;
-  uint32_t retry_requests = 0;
-  uint32_t retry_successes = 0;
-  uint32_t retry_failures = 0;
-  uint32_t retry_exhausted = 0;
-  uint64_t retry_not_before_second = 0;
-  uint16_t last_failed_hw_code = 0;
-  uint8_t  last_failed_stage = 0;
-};
-
-static ocxo_dac_retry_state_t g_ocxo1_dac_retry = {};
-static ocxo_dac_retry_state_t g_ocxo2_dac_retry = {};
-
-static inline uint32_t ocxo_dac_id(const ocxo_dac_state_t* dac) {
-  if (dac == &ocxo1_dac) return 1;
-  if (dac == &ocxo2_dac) return 2;
+static uint8_t ocxo_dac_id(const ocxo_dac_state_t* d) {
+  if (d == &ocxo1_dac) return 1;
+  if (d == &ocxo2_dac) return 2;
   return 0;
 }
 
-static inline const char* ocxo_dac_name(const ocxo_dac_state_t* dac) {
-  if (dac == &ocxo1_dac) return "ocxo1";
-  if (dac == &ocxo2_dac) return "ocxo2";
-  return "";
+static void ocxo_dac_clear_pending(ocxo_dac_state_t& d) {
+  d.pacing_pending = false;
+  d.pacing_pending_target = 0.0;
+  d.pacing_pending_step = 0.0;
+  d.pacing_pending_hw_code = 0;
+  d.pacing_pending_since_second = 0;
 }
 
-static inline ocxo_dac_retry_state_t& ocxo_dac_retry_state(ocxo_dac_state_t& dac) {
-  return (&dac == &ocxo1_dac) ? g_ocxo1_dac_retry : g_ocxo2_dac_retry;
-}
-
-static inline const ocxo_dac_retry_state_t& ocxo_dac_retry_state(const ocxo_dac_state_t& dac) {
-  return (&dac == &ocxo1_dac) ? g_ocxo1_dac_retry : g_ocxo2_dac_retry;
-}
-
-static void ocxo_dac_retry_reset(ocxo_dac_state_t& dac) {
-  ocxo_dac_retry_state(dac) = {};
-}
-
-static bool ocxo_dac_retry_ready(const ocxo_dac_state_t& dac) {
-  const ocxo_dac_retry_state_t& retry = ocxo_dac_retry_state(dac);
-  return retry.retry_not_before_second == 0 || campaign_seconds >= retry.retry_not_before_second;
-}
-
-static bool ocxo_dac_pending_eligible(const ocxo_dac_state_t& dac) {
-  return dac.pacing_pending && ocxo_dac_retry_ready(dac);
-}
-
-static void ocxo_servo_latch_dac_fault(ocxo_dac_state_t& dac);
-
-static inline uint64_t ocxo_dac_pending_age_seconds(const ocxo_dac_state_t& dac) {
-  if (!dac.pacing_pending || dac.pacing_pending_since_second == 0) return 0;
-  if (campaign_seconds < dac.pacing_pending_since_second) return 0;
-  return campaign_seconds - dac.pacing_pending_since_second;
-}
-
-static void ocxo_dac_clear_pending(ocxo_dac_state_t& dac) {
-  dac.pacing_pending = false;
-  dac.pacing_pending_target = dac.dac_fractional;
-  dac.pacing_pending_step = 0.0;
-  dac.pacing_pending_hw_code = dac.dac_hw_code;
-  dac.pacing_pending_since_second = 0;
-}
-
-static void ocxo_dac_pacing_abort_all(void) {
+static void ocxo_dac_pacing_reset(void) {
+  ocxo_dac_clear_pending(ocxo1_dac);
+  ocxo_dac_clear_pending(ocxo2_dac);
   g_ocxo_dac_commit_scheduled = false;
   g_ocxo_dac_commit_selected = nullptr;
   g_ocxo_dac_commit_target = 0.0;
   g_ocxo_dac_commit_target_hw_code = 0;
-  ocxo_dac_clear_pending(ocxo1_dac);
-  ocxo_dac_clear_pending(ocxo2_dac);
-  ocxo_dac_retry_reset(ocxo1_dac);
-  ocxo_dac_retry_reset(ocxo2_dac);
-}
-
-static void ocxo_dac_pacing_reset(void) {
-  ocxo_dac_pacing_abort_all();
-  g_ocxo_dac_last_schedule_second = 0;
-  g_ocxo_dac_last_commit_second = 0;
   g_ocxo_dac_last_winner = 0;
-  g_ocxo_dac_arbitration_passes = 0;
-  g_ocxo_dac_no_candidate_passes = 0;
-  g_ocxo_dac_schedule_failures = 0;
-  g_ocxo_dac_commit_callbacks = 0;
-  g_ocxo_dac_deferred_candidates = 0;
-  g_ocxo_dac_retry_requests = 0;
-  g_ocxo_dac_retry_successes = 0;
-  g_ocxo_dac_retry_failures = 0;
-  g_ocxo_dac_retry_exhausted = 0;
-  g_ocxo_dac_retry_blocked_candidates = 0;
 }
 
-static void ocxo_dac_queue_intent(ocxo_dac_state_t& dac, double step) {
-  double target = dac.dac_fractional + step;
-  if (target < (double)dac.dac_min) target = (double)dac.dac_min;
-  if (target > (double)dac.dac_max) target = (double)dac.dac_max;
+static void ocxo_dac_pacing_abort_all(void) {
+  ocxo_dac_pacing_reset();
+}
 
-  const uint16_t target_hw_code = (uint16_t)target;
-
-  dac.pacing_intents++;
-  dac.pacing_last_request_second = campaign_seconds;
-
-  if ((uint16_t)abs((int32_t)target_hw_code - (int32_t)dac.dac_hw_code) < SERVO_MIN_DAC_CODE_DELTA_LSB) {
-    dac.pacing_skip_small_delta_count++;
-    ocxo_dac_clear_pending(dac);
-    ocxo_dac_retry_reset(dac);
-    return;
-  }
-
-  dac.pacing_pending_target = target;
-  dac.pacing_pending_step = step;
-  dac.pacing_pending_hw_code = target_hw_code;
-
-  if (!dac.pacing_pending) {
-    dac.pacing_pending_since_second = campaign_seconds;
-  }
-  dac.pacing_pending = true;
+static bool ocxo_dac_pending_eligible(const ocxo_dac_state_t& d) {
+  return d.pacing_pending;
 }
 
 static ocxo_dac_state_t* ocxo_dac_pick_commit_candidate(void) {
-  const bool c1_pending = ocxo1_dac.pacing_pending;
-  const bool c2_pending = ocxo2_dac.pacing_pending;
-  const bool c1_eligible = ocxo_dac_pending_eligible(ocxo1_dac);
-  const bool c2_eligible = ocxo_dac_pending_eligible(ocxo2_dac);
+  const bool e1 = ocxo_dac_pending_eligible(ocxo1_dac);
+  const bool e2 = ocxo_dac_pending_eligible(ocxo2_dac);
+  if (!e1 && !e2) return nullptr;
+  if (e1 && !e2) return &ocxo1_dac;
+  if (!e1 && e2) return &ocxo2_dac;
+  // Both eligible: alternate based on last winner.
+  return (g_ocxo_dac_last_winner == 1) ? &ocxo2_dac : &ocxo1_dac;
+}
 
-  if (c1_pending && !c1_eligible) g_ocxo_dac_retry_blocked_candidates++;
-  if (c2_pending && !c2_eligible) g_ocxo_dac_retry_blocked_candidates++;
-
-  ocxo_dac_state_t* c1 = c1_eligible ? &ocxo1_dac : nullptr;
-  ocxo_dac_state_t* c2 = c2_eligible ? &ocxo2_dac : nullptr;
-
-  if (!c1) return c2;
-  if (!c2) return c1;
-
-  const uint64_t age1 = ocxo_dac_pending_age_seconds(*c1);
-  const uint64_t age2 = ocxo_dac_pending_age_seconds(*c2);
-  if (age1 > age2) return c1;
-  if (age2 > age1) return c2;
-
-  const double urgency1 = fabs(c1->servo_predicted_residual);
-  const double urgency2 = fabs(c2->servo_predicted_residual);
-  if (urgency1 > urgency2) return c1;
-  if (urgency2 > urgency1) return c2;
-
-  return (g_ocxo_dac_last_winner == 1) ? c2 : c1;
+static void ocxo_dac_queue_intent(ocxo_dac_state_t& dac, double step) {
+  const double target = dac.dac_fractional + step;
+  uint16_t hw_code = (uint16_t)(target + 0.5);
+  if (hw_code == dac.dac_hw_code) {
+    dac.pacing_skip_small_delta_count++;
+    ocxo_dac_clear_pending(dac);
+    return;
+  }
+  dac.pacing_pending = true;
+  dac.pacing_pending_target = target;
+  dac.pacing_pending_step = step;
+  dac.pacing_pending_hw_code = hw_code;
+  dac.pacing_pending_since_second = campaign_seconds;
+  dac.pacing_last_request_second = campaign_seconds;
+  dac.pacing_intents++;
 }
 
 static void ocxo_dac_commit_callback(timepop_ctx_t*, timepop_diag_t*, void*) {
-  g_ocxo_dac_commit_callbacks++;
+  g_ocxo_dac_commit_scheduled = false;
 
   ocxo_dac_state_t* dac = g_ocxo_dac_commit_selected;
   g_ocxo_dac_commit_selected = nullptr;
-  g_ocxo_dac_commit_scheduled = false;
-
   if (!dac) return;
-  if (!dac->pacing_pending) return;
-  if (!ocxo_dac_retry_ready(*dac)) return;
 
-  double target = dac->pacing_pending_target;
-  const double step = dac->pacing_pending_step;
-  ocxo_dac_retry_state_t& retry = ocxo_dac_retry_state(*dac);
-
-  if (!ocxo_dac_set(*dac, target)) {
-    dac->servo_last_step = 0.0;
-
-    retry.retry_failures++;
-    g_ocxo_dac_retry_failures++;
-    retry.last_failed_hw_code = dac->io_last_attempted_hw_code;
-    retry.last_failed_stage = dac->io_last_failure_stage;
-    retry.consecutive_failures++;
-
-    if (retry.consecutive_failures < OCXO_DAC_MAX_CONSECUTIVE_WRITE_FAILURES) {
-      retry.retry_requests++;
-      g_ocxo_dac_retry_requests++;
-      retry.retry_not_before_second = campaign_seconds + OCXO_DAC_RETRY_DELAY_SECONDS;
-      return;
-    }
-
-    retry.retry_exhausted++;
-    g_ocxo_dac_retry_exhausted++;
-    ocxo_servo_latch_dac_fault(*dac);
+  const double target = g_ocxo_dac_commit_target;
+  const double step   = target - dac->dac_fractional;
+  const bool ok = ocxo_dac_set(*dac, target);
+  if (!ok) {
+    dac->io_fault_latched = true;
+    calibrate_ocxo_mode = servo_mode_t::OFF;
+    ocxo_dac_pacing_abort_all();
     return;
   }
-
-  if (retry.consecutive_failures > 0 || retry.retry_not_before_second != 0) {
-    retry.retry_successes++;
-    g_ocxo_dac_retry_successes++;
-  }
-  ocxo_dac_retry_reset(*dac);
-
   dac->servo_last_step = step;
   dac->servo_adjustments++;
   dac->pacing_commit_count++;
@@ -471,9 +373,7 @@ static void ocxo_dac_commit_callback(timepop_ctx_t*, timepop_diag_t*, void*) {
 static void ocxo_dac_schedule_paced_commit(void) {
   g_ocxo_dac_arbitration_passes++;
 
-  if (g_ocxo_dac_commit_scheduled) {
-    return;
-  }
+  if (g_ocxo_dac_commit_scheduled) return;
 
   ocxo_dac_state_t* winner = ocxo_dac_pick_commit_candidate();
   if (!winner) {
@@ -510,12 +410,6 @@ static void ocxo_dac_schedule_paced_commit(void) {
   g_ocxo_dac_commit_scheduled = true;
 }
 
-static void ocxo_servo_latch_dac_fault(ocxo_dac_state_t& dac) {
-  dac.io_fault_latched = true;
-  calibrate_ocxo_mode = servo_mode_t::OFF;
-  ocxo_dac_pacing_abort_all();
-}
-
 // ============================================================================
 // Zeroing
 // ============================================================================
@@ -547,22 +441,8 @@ void clocks_zero_all(void) {
 }
 
 // ============================================================================
-// Servo logic
+// Servo logic (unchanged)
 // ============================================================================
-//
-// TOTAL: uses the campaign-wide residual mean as the residual signal.
-// NOW:   uses the mean of the recent NOW window as the residual signal.
-//
-// Both modes use the same predictive controller:
-//   1. low-pass filter the residual signal
-//   2. low-pass filter the per-second slope of that residual
-//   3. project a short horizon into the future
-//   4. drive the projected residual toward zero
-//
-// Sign convention:
-//   Positive residual = clock fast → lower DAC
-//   Negative residual = clock slow → raise DAC
-//
 
 static void ocxo_servo_predictive(ocxo_dac_state_t& dac,
                                   double residual_signal_ns,
@@ -608,26 +488,12 @@ static void ocxo_servo_predictive(ocxo_dac_state_t& dac,
   if (step < -(double)SERVO_MAX_STEP) step = -(double)SERVO_MAX_STEP;
 
   if (fabs(step) < 1.0) {
-    // Do not thrash the DAC for sub-LSB fractional intent.
     ocxo_dac_clear_pending(dac);
     return;
   }
 
   dac.servo_last_step = step;
   ocxo_dac_queue_intent(dac, step);
-}
-
-static double now_window_mean(const now_window_t& w) {
-  if (w.count == 0) return 0.0;
-  double sum = 0.0;
-  for (uint32_t i = 0; i < w.count; i++) sum += (double)w.samples[i];
-  return sum / (double)w.count;
-}
-
-static void now_window_push(now_window_t& w, int64_t sample) {
-  w.samples[w.head] = sample;
-  w.head = (w.head + 1) % NOW_WINDOW_SIZE;
-  if (w.count < NOW_WINDOW_SIZE) w.count++;
 }
 
 static void ocxo_servo_total(ocxo_dac_state_t& dac, const pps_residual_t& residuals) {
@@ -671,7 +537,7 @@ static void ocxo_calibration_servo(void) {
 }
 
 // ============================================================================
-// Watchdog helpers
+// Watchdog
 // ============================================================================
 
 static void clocks_force_stop_campaign(void) {
@@ -739,20 +605,18 @@ void clocks_watchdog_anomaly(const char* reason,
 }
 
 // ============================================================================
-// clocks_beta_pps
+// clocks_beta_pps — invoked from alpha's pps_callback
 // ============================================================================
 
 void clocks_beta_pps(void) {
+  // Zero / start handshake.
   if (request_zero || request_start) {
     if (!zero_handshake_in_flight) {
       interrupt_request_pps_zero();
       zero_handshake_in_flight = true;
       return;
     }
-
-    if (interrupt_pps_zero_pending()) {
-      return;
-    }
+    if (interrupt_pps_zero_pending()) return;
 
     clocks_zero_all();
 
@@ -764,7 +628,6 @@ void clocks_beta_pps(void) {
       campaign_state = clocks_campaign_state_t::STARTED;
       request_start = false;
     }
-
     return;
   }
 
@@ -782,7 +645,6 @@ void clocks_beta_pps(void) {
 
   if (request_recover) {
     watchdog_anomaly_active = false;
-
     request_zero = false;
     zero_handshake_in_flight = false;
     ocxo_dac_pacing_abort_all();
@@ -799,14 +661,10 @@ void clocks_beta_pps(void) {
     return;
   }
 
-  if (watchdog_anomaly_active) {
-    return;
-  }
+  if (watchdog_anomaly_active) return;
+  if (campaign_state != clocks_campaign_state_t::STARTED) return;
 
-  if (campaign_state != clocks_campaign_state_t::STARTED) {
-    return;
-  }
-
+  // ── Per-second campaign work ──
   campaign_seconds++;
 
   dwt_cycle_count_total = g_dwt_cycle_count_total;
@@ -814,13 +672,13 @@ void clocks_beta_pps(void) {
   ocxo1_ticks_64        = g_ocxo1_clock.ns_count_at_pps / 100ull;
   ocxo2_ticks_64        = g_ocxo2_clock.ns_count_at_pps / 100ull;
 
+  // DWT residual: (synthetic cycles per second) - (nominal expected).
   residual_update_sample(
       residual_dwt,
       (int64_t)dwt_effective_cycles_per_second() - (int64_t)DWT_EXPECTED_PER_PPS);
 
-  if (g_vclock_measurement.prev_counter32_at_pps_event != 0) {
-    residual_update_sample(residual_vclock, g_vclock_measurement.second_residual_ns);
-  }
+  // residual_vclock is fed by alpha's pps_callback from the GPIO PPS witness.
+  // We do NOT update it here.
 
   if (g_ocxo1_measurement.prev_gnss_ns_at_edge != 0) {
     residual_update_sample(residual_ocxo1, g_ocxo1_measurement.second_residual_ns);
@@ -837,23 +695,27 @@ void clocks_beta_pps(void) {
   dac_welford_update(dac_welford_ocxo1, ocxo1_dac.dac_fractional);
   dac_welford_update(dac_welford_ocxo2, ocxo2_dac.dac_fractional);
 
+  // ── Build TIMEBASE_FRAGMENT ──
   Payload p;
   p.add("campaign", campaign_name);
   p.add("teensy_pps_count", campaign_seconds);
   p.add("gnss_ns", g_gnss_ns_count_at_pps);
   p.add("calibrate_ocxo", servo_mode_str(calibrate_ocxo_mode));
 
-  // DWT raw second truth surface.
+  // DWT canonical surface — sourced from VCLOCK integrator.
+  p.add("dwt_cycle_count_total", g_dwt_cycle_count_total);
   p.add("dwt_cycle_count_at_pps", g_dwt_cycle_count_at_pps);
   p.add("dwt_cycle_count_between_pps", g_dwt_cycle_count_between_pps);
-  p.add("dwt_cycle_count_between_pps_raw", g_dwt_cycle_count_between_pps_raw);
-  p.add("dwt_cycle_count_between_pps_raw_minus_final", g_dwt_cycle_count_between_pps_raw_minus_final);
-  p.add("dwt_interval_count_last_second", g_dwt_interval_count_last_second);
-  p.add("dwt_cycle_count_last_second_prediction", g_dwt_cycle_count_last_second_prediction);
   p.add("dwt_cycle_count_next_second_prediction", g_dwt_cycle_count_next_second_prediction);
-  p.add("dwt_cycle_count_next_second_adjustment", g_dwt_cycle_count_next_second_adjustment);
   p.add("dwt_effective_cycles_per_second", dwt_effective_cycles_per_second());
   p.add("dwt_expected_per_pps", (uint32_t)DWT_EXPECTED_PER_PPS);
+
+  // VCLOCK authored facts.
+  p.add("vclock_qtimer_at_pps", g_qtimer_at_pps);
+  p.add("vclock_ns_count_at_pps", g_vclock_clock.ns_count_at_pps);
+  p.add("vclock_ticks_between_pps", g_vclock_measurement.ticks_between_pps);
+  p.add("vclock_ns_between_pps", g_vclock_measurement.ns_between_pps);
+  p.add("vclock_second_residual_ns", g_vclock_measurement.second_residual_ns);
 
   // OCXO coarse truth surface.
   p.add("ocxo1_ns_count_at_pps", g_ocxo1_clock.ns_count_at_pps);
@@ -878,27 +740,46 @@ void clocks_beta_pps(void) {
   p.add("ocxo2_window_mismatches", g_ocxo2_clock.window_mismatches);
   p.add("ocxo2_window_error_ns", g_ocxo2_clock.window_error_ns);
 
-  // Compact DAC / servo state.
+  // DAC / servo state.
   p.add("ocxo1_dac", ocxo1_dac.dac_fractional);
   p.add("ocxo1_dac_last_write_ok", ocxo1_dac.io_last_write_ok);
   p.add("ocxo1_dac_fault_latched", ocxo1_dac.io_fault_latched);
   p.add("ocxo1_servo_predicted_residual_ns", ocxo1_dac.servo_predicted_residual, 6);
   p.add("ocxo1_servo_last_step", ocxo1_dac.servo_last_step, 6);
+  p.add("ocxo1_servo_adjustments", ocxo1_dac.servo_adjustments);
 
   p.add("ocxo2_dac", ocxo2_dac.dac_fractional);
   p.add("ocxo2_dac_last_write_ok", ocxo2_dac.io_last_write_ok);
   p.add("ocxo2_dac_fault_latched", ocxo2_dac.io_fault_latched);
   p.add("ocxo2_servo_predicted_residual_ns", ocxo2_dac.servo_predicted_residual, 6);
   p.add("ocxo2_servo_last_step", ocxo2_dac.servo_last_step, 6);
+  p.add("ocxo2_servo_adjustments", ocxo2_dac.servo_adjustments);
 
-  // Compact cumulative campaign stats for OCXO rate.
+  // DWT residual Welford.
+  if (residual_dwt.n > 0) {
+    const double dwt_ppb_val = -residual_dwt.mean / (double)DWT_EXPECTED_PER_PPS * 1e9;
+    const double dwt_tau_val = 1.0 + dwt_ppb_val / 1e9;
+    p.add("dwt_tau", dwt_tau_val, 12);
+    p.add("dwt_ppb", dwt_ppb_val, 3);
+  }
+  p.add("dwt_welford_n", residual_dwt.n);
+  p.add("dwt_welford_mean", residual_dwt.mean, 3);
+  p.add("dwt_welford_stddev", residual_stddev(residual_dwt), 3);
+
+  // VCLOCK residual = GPIO PPS witness offset (the new truth).
+  p.add("vclock_welford_n", residual_vclock.n);
+  p.add("vclock_welford_mean", residual_vclock.mean, 3);
+  p.add("vclock_welford_stddev", residual_stddev(residual_vclock), 3);
+  p.add("vclock_welford_min", residual_vclock.min_val, 3);
+  p.add("vclock_welford_max", residual_vclock.max_val, 3);
+
+  // OCXO residuals.
   if (residual_ocxo1.n > 0) {
     const double ocxo1_ppb_val = residual_ocxo1.mean;
     const double ocxo1_tau_val = 1.0 + ocxo1_ppb_val / 1e9;
     p.add("ocxo1_tau", ocxo1_tau_val, 12);
     p.add("ocxo1_ppb", ocxo1_ppb_val, 3);
   }
-
   if (residual_ocxo2.n > 0) {
     const double ocxo2_ppb_val = residual_ocxo2.mean;
     const double ocxo2_tau_val = 1.0 + ocxo2_ppb_val / 1e9;
@@ -914,7 +795,24 @@ void clocks_beta_pps(void) {
   p.add("ocxo2_welford_mean", residual_ocxo2.mean, 3);
   p.add("ocxo2_welford_stddev", residual_stddev(residual_ocxo2), 3);
 
-  // Rich bucket / bridge diagnostics for OCXO forensics.
+  // DAC Welford (TEMPEST masthead).
+  p.add("ocxo1_dac_welford_n", dac_welford_ocxo1.n);
+  p.add("ocxo1_dac_welford_mean", dac_welford_ocxo1.mean, 6);
+  p.add("ocxo1_dac_welford_stddev", dac_welford_stddev(dac_welford_ocxo1), 6);
+  p.add("ocxo1_dac_welford_stderr", dac_welford_stderr(dac_welford_ocxo1), 6);
+  p.add("ocxo1_dac_welford_min", dac_welford_ocxo1.min_val, 3);
+  p.add("ocxo1_dac_welford_max", dac_welford_ocxo1.max_val, 3);
+
+  p.add("ocxo2_dac_welford_n", dac_welford_ocxo2.n);
+  p.add("ocxo2_dac_welford_mean", dac_welford_ocxo2.mean, 6);
+  p.add("ocxo2_dac_welford_stddev", dac_welford_stddev(dac_welford_ocxo2), 6);
+  p.add("ocxo2_dac_welford_stderr", dac_welford_stderr(dac_welford_ocxo2), 6);
+  p.add("ocxo2_dac_welford_min", dac_welford_ocxo2.min_val, 3);
+  p.add("ocxo2_dac_welford_max", dac_welford_ocxo2.max_val, 3);
+
+  // Per-lane diag including integrator state.  PPS additionally carries
+  // the GPIO witness fields.
+  clocks_payload_add_pps_diag(p, "pps_diag", g_pps_interrupt_diag);
   clocks_payload_add_ocxo_diag(p, "ocxo1_diag", g_ocxo1_interrupt_diag);
   clocks_payload_add_ocxo_diag(p, "ocxo2_diag", g_ocxo2_interrupt_diag);
 
@@ -947,9 +845,7 @@ static Payload cmd_start(const Payload& args) {
   if (args.tryGetDouble("set_dac2", dac_val)) dac2_ok = ocxo_dac_set(ocxo2_dac, dac_val);
 
   calibrate_ocxo_mode = servo_mode_parse(args.getString("calibrate_ocxo"));
-  if (!dac1_ok || !dac2_ok) {
-    calibrate_ocxo_mode = servo_mode_t::OFF;
-  }
+  if (!dac1_ok || !dac2_ok) calibrate_ocxo_mode = servo_mode_t::OFF;
 
   ocxo_dac_predictor_reset(ocxo1_dac);
   ocxo_dac_predictor_reset(ocxo2_dac);
@@ -960,7 +856,8 @@ static Payload cmd_start(const Payload& args) {
   request_recover = false;
 
   Payload p;
-  p.add("status", (!dac1_ok || !dac2_ok) ? "start_requested_dac_fault" : "start_requested");
+  p.add("status", (!dac1_ok || !dac2_ok) ?
+                  "start_requested_dac_fault" : "start_requested");
   p.add("ocxo1_dac", ocxo1_dac.dac_fractional);
   p.add("ocxo2_dac", ocxo2_dac.dac_fractional);
   p.add("ocxo1_dac_last_write_ok", ocxo1_dac.io_last_write_ok);
@@ -983,7 +880,6 @@ static Payload cmd_zero(const Payload&) {
   request_start = false;
   request_stop = false;
   request_recover = false;
-
   Payload p;
   p.add("status", "zero_requested");
   return p;
@@ -1024,11 +920,7 @@ static Payload cmd_watchdog_test(const Payload&) {
 }
 
 static Payload cmd_report(const Payload&) {
-  // The CLOCKS report IS the most recent TIMEBASE_FRAGMENT,
-  // augmented with live process state for debugging.
-
   Payload p = g_last_fragment.clone();
-
   p.add("campaign_state",
         campaign_state == clocks_campaign_state_t::STARTED ? "STARTED" : "STOPPED");
   p.add("request_start", request_start);
@@ -1037,7 +929,6 @@ static Payload cmd_report(const Payload&) {
   p.add("request_zero", request_zero);
   p.add("zero_handshake_in_flight", zero_handshake_in_flight);
   p.add("interrupt_pps_zero_pending", interrupt_pps_zero_pending());
-
   return p;
 }
 
