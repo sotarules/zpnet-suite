@@ -2,21 +2,43 @@
 // process_clocks_internal.h — Shared Internal State (Alpha ↔ Beta)
 // ============================================================================
 //
-// Doctrine note (post rolling-integration refactor):
-//   - g_dwt_cycle_count_at_pps  is the SYNTHETIC DWT at the integrator
-//                               boundary that drives pps_callback.
-//   - g_dwt_cycle_count_between_pps  is the integrator's ring_sum at boundary
-//                                    (= cycles between consecutive synthetic
-//                                    boundaries, smoothed by SMA).
-//   - g_dwt_cycle_count_next_second_prediction is fed each boundary from
-//                                              interrupt_vclock_cycles_per_second().
-//   - g_dwt_cycle_count_next_second_adjustment is vestigial (always 0).
-//   - g_qtimer_at_pps is the TimePop fire_vclock_raw at the boundary tick
-//                     (the AUTHORED VCLOCK position of the integrator's
-//                     boundary, not a counter read).
-//   - VCLOCK measurement state reflects "authored by integrator" semantics:
-//     ticks_between_pps is exactly TICKS_10MHZ_PER_SECOND, ns_between_pps is
-//     exactly 1e9, second_residual_ns is 0 by construction.
+// Doctrine note (post rolling-integration removal):
+//
+//   - g_dwt_cycle_count_at_pps       is event.dwt_at_event from the most
+//                                    recent VCLOCK one-second event — the
+//                                    ISR's first-instruction DWT capture
+//                                    on the 1000th tick of the VCLOCK
+//                                    1 kHz cadence.  Honest fact; no
+//                                    synthesis.
+//
+//   - g_dwt_cycle_count_between_pps  is the one-second subtraction of
+//                                    consecutive event DWT captures,
+//                                    computed in alpha's vclock_callback.
+//                                    Wraps correctly across DWT_CYCCNT
+//                                    rollover (~4.26 s at 1008 MHz).
+//
+//   - g_dwt_cycle_count_next_second_prediction  is just a mirror of
+//                                               g_dwt_cycle_count_between_pps;
+//                                               the measured delta is
+//                                               its own best prediction.
+//
+//   - g_dwt_cycle_count_next_second_adjustment  is vestigial (always 0).
+//                                               Retained only so the
+//                                               dwt_effective_cycles_per_second
+//                                               helper's add signature
+//                                               stays stable.
+//
+//   - g_qtimer_at_pps                is event.counter32_at_event — the
+//                                    authored 32-bit VCLOCK count that
+//                                    advances by exactly 10,000,000 per
+//                                    VCLOCK one-second event.  Not an
+//                                    ambient counter read.
+//
+//   - VCLOCK measurement state reflects the fact that the VCLOCK lane
+//     DEFINES the second: its ticks_between_pps is exactly
+//     TICKS_10MHZ_PER_SECOND, its ns_between_pps is exactly 1e9, and its
+//     second_residual_ns is 0 by construction.  These invariants are
+//     written unconditionally per event.
 //
 // ============================================================================
 
@@ -67,7 +89,8 @@ extern volatile uint32_t g_dwt_cycle_count_next_second_prediction;
 extern volatile int32_t  g_dwt_cycle_count_next_second_adjustment;  // vestigial; always 0
 extern volatile uint64_t g_dwt_model_pps_count;
 
-// AUTHORED VCLOCK position at the integrator boundary that drives pps_callback.
+// Authored 32-bit VCLOCK count at the most recent VCLOCK one-second
+// event that drove vclock_callback.
 extern volatile uint32_t g_qtimer_at_pps;
 
 // Diagnostics.
@@ -77,13 +100,15 @@ extern volatile uint32_t g_last_pps_event_counter32_at_event;
 // VCLOCK canonical state (alpha-owned, beta-readable)
 // ============================================================================
 //
-// Semantics under rolling integration:
-//   counter32_at_pps_event   = TimePop fire_vclock_raw at the integrator's
-//                              boundary tick (authored, not a counter read)
-//   counter32_at_pps_expected= same as event (no separate "expected" rail)
-//   counter32_error_at_pps   = always 0 by construction
-//   ns_count_at_pps          = N × 1e9 (cumulative authored GNSS ns)
-//   ns_count_expected_at_pps = same (vestigial dual rail)
+// Field semantics:
+//   counter32_at_pps_event    = event.counter32_at_event (authored,
+//                               advances by exactly 10,000,000 per
+//                               VCLOCK one-second event — not a live
+//                               counter read)
+//   counter32_at_pps_expected = same as event (vestigial dual rail)
+//   counter32_error_at_pps    = always 0 by construction (vestigial)
+//   ns_count_at_pps           = N × 1e9 (cumulative authored GNSS ns)
+//   ns_count_expected_at_pps  = same (vestigial dual rail)
 //
 
 struct vclock_clock_state_t {
@@ -101,7 +126,7 @@ struct vclock_measurement_t {
   volatile uint32_t ticks_between_pps;     // always TICKS_10MHZ_PER_SECOND
   volatile uint64_t ns_between_pps;        // always 1e9
   volatile int64_t  second_residual_ns;    // always 0
-  volatile uint32_t prev_counter32_at_pps_event;
+  volatile uint32_t prev_counter32_at_pps_event;  // vestigial
 };
 
 extern vclock_clock_state_t g_vclock_clock;
@@ -274,12 +299,13 @@ extern uint64_t recover_ocxo2_ns;
 // Residual tracking
 // ============================================================================
 //
-// residual_dwt    — DWT cycles per second residual (synthetic - expected)
-// residual_vclock — REPURPOSED: GPIO PPS witness offset from synthetic boundary.
-//                   Welford mean reveals DC bias, stddev reveals true GPIO
-//                   detection latency jitter.
-// residual_ocxo1  — OCXO1 second-to-second drift residual
-// residual_ocxo2  — OCXO2 second-to-second drift residual
+// residual_dwt    — DWT residual: (measured cycles between VCLOCK
+//                   one-second events) - DWT_EXPECTED_PER_PPS.
+// residual_vclock — GPIO PPS witness offset from the VCLOCK one-second
+//                   event.  Welford mean reveals DC bias, stddev reveals
+//                   true GPIO detection latency jitter.
+// residual_ocxo1  — OCXO1 second-to-second drift residual.
+// residual_ocxo2  — OCXO2 second-to-second drift residual.
 //
 
 struct pps_residual_t {

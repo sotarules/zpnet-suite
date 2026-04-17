@@ -2,22 +2,26 @@
 // process_clocks_beta.cpp — Campaign Layer
 // ============================================================================
 //
-// Post rolling-integration changes:
-//   - clocks_payload_add_ocxo_diag rewritten for the new trimmed
-//     interrupt_capture_diag_t field set.
-//   - clocks_payload_add_pps_diag (new) publishes the VCLOCK integrator
-//     state and the PPS GPIO witness offset.
-//   - Retired alpha externs (raw/final duality) removed.
-//   - residual_vclock is now fed from alpha's pps_callback (GPIO witness
-//     offset), not from local measurement.
-//   - TIMEBASE_FRAGMENT publication trimmed of retired fields, augmented
-//     with integrator and witness diagnostics.
+// Post rolling-integration removal:
+//   - clocks_payload_add_ocxo_diag slimmed to match the trimmed
+//     interrupt_capture_diag_t: event facts + anomaly_count only.
+//   - clocks_payload_add_pps_diag (unchanged) delegates to the slimmer
+//     ocxo publisher and adds the GPIO witness fields.
+//   - All integrator_* and boundary_dwt_isr_entry_* publications removed
+//     — those fields no longer exist.
 //
-// Post PPS/VCLOCK provenance cleanup:
-//   - boundary-emitter ISR-entry fields are now published under
-//     boundary_* names so they stop impersonating PPS.
-//   - PPS witness publication now uses pps_edge_* fields sourced from
-//     alpha's pps_edge_callback and ultimately from the GPIO ISR snapshot.
+// DWT cycles-between-PPS-events semantics:
+//   - g_dwt_cycle_count_between_pps is now the one-second subtraction
+//     of consecutive VCLOCK-event DWT captures (authored by alpha in
+//     vclock_callback), not a synthetic SMA output.
+//
+// PPS provenance:
+//   - residual_vclock is fed by alpha's pps_edge_callback from the GPIO
+//     witness snapshot.  Beta does NOT update it locally.
+//   - The "pps_diag" published prefix still identifies the VCLOCK lane's
+//     diag, which is the only lane carrying GPIO PPS witness fields.
+//     The prefix string is preserved verbatim to keep the over-the-wire
+//     schema stable for Pi-side consumers.
 //
 // Everything else (campaign lifecycle, servo, Welford, DAC pacing,
 // watchdog, command surface) is unchanged.
@@ -156,8 +160,13 @@ double dac_welford_stderr(const dac_welford_t& w) {
 }
 
 // ============================================================================
-// Diag publishers — rewritten for the new interrupt_capture_diag_t
+// Diag publishers — slimmed for the trimmed interrupt_capture_diag_t
 // ============================================================================
+//
+// The diag struct no longer carries integrator state or boundary-emitter
+// ISR-entry facts.  What remains is the event truth surface (mirrored
+// from interrupt_event_t) and a per-lane enabled/anomaly count.
+//
 
 static void clocks_payload_add_ocxo_diag(Payload& p,
                                          const char* prefix,
@@ -176,14 +185,6 @@ static void clocks_payload_add_ocxo_diag(Payload& p,
     snprintf(key, sizeof(key), "%s_%s", prefix, suffix);
     p.add(key, value);
   };
-  auto add_i64 = [&](const char* suffix, int64_t value) {
-    snprintf(key, sizeof(key), "%s_%s", prefix, suffix);
-    p.add(key, value);
-  };
-  auto add_double = [&](const char* suffix, double value, int decimals) {
-    snprintf(key, sizeof(key), "%s_%s", prefix, suffix);
-    p.add(key, value, decimals);
-  };
 
   add_bool("enabled", diag.enabled);
 
@@ -192,48 +193,15 @@ static void clocks_payload_add_ocxo_diag(Payload& p,
   add_u64("gnss_ns_at_event", diag.gnss_ns_at_event);
   add_u32("counter32_at_event", diag.counter32_at_event);
 
-  // Boundary-emitter ISR-entry facts (diagnostic only).
-  add_u32("boundary_dwt_isr_entry_raw", diag.boundary_dwt_isr_entry_raw);
-  add_i64("boundary_dwt_isr_entry_gnss_ns", diag.boundary_dwt_isr_entry_gnss_ns);
-  add_i64("boundary_dwt_isr_entry_minus_event_ns", diag.boundary_dwt_isr_entry_minus_event_ns);
-
-  // Rolling integrator state (the new heart of the system).
-  add_bool("integrator_baseline_valid", diag.integrator_baseline_valid);
-  add_u32("integrator_baseline_dwt", diag.integrator_baseline_dwt);
-  add_u64("integrator_total_ticks", diag.integrator_total_ticks);
-  add_u32("integrator_ring_fill", diag.integrator_ring_fill);
-  add_u64("integrator_ring_sum", diag.integrator_ring_sum);
-  add_u64("integrator_avg_cycles_per_sec", diag.integrator_avg_cycles_per_sec);
-  add_u32("integrator_last_interval_cycles", diag.integrator_last_interval_cycles);
-  add_u32("integrator_boundary_emissions", diag.integrator_boundary_emissions);
-
-  // Per-interval distribution — reveals per-tick ISR-entry jitter that
-  // endpoint-level metrics (integ_diff, raw_diff) telescope away by
-  // algebraic identity.  Window stats describe the 1000 intervals that
-  // summed to this boundary's endpoint delta; ever-min/max are
-  // cumulative since baseline and catch rare excursions.
-  add_u32("integrator_interval_window_min_cycles",
-          diag.integrator_interval_window_min_cycles);
-  add_u32("integrator_interval_window_max_cycles",
-          diag.integrator_interval_window_max_cycles);
-  add_double("integrator_interval_window_mean_cycles",
-             diag.integrator_interval_window_mean_cycles, 3);
-  add_double("integrator_interval_window_stddev_cycles",
-             diag.integrator_interval_window_stddev_cycles, 3);
-  add_u32("integrator_interval_min_ever_cycles",
-          diag.integrator_interval_min_ever_cycles);
-  add_u32("integrator_interval_max_ever_cycles",
-          diag.integrator_interval_max_ever_cycles);
-
   add_u32("anomaly_count", diag.anomaly_count);
 }
 
 static void clocks_payload_add_pps_diag(Payload& p,
                                         const char* prefix,
                                         const interrupt_capture_diag_t& diag) {
-  // Same baseline fields as the OCXO publisher, plus the PPS witness fields
-  // refreshed from the authoritative GPIO ISR snapshot immediately before
-  // fragment publication.
+  // Same baseline fields as the OCXO publisher, plus the PPS witness
+  // fields refreshed from the authoritative GPIO ISR snapshot immediately
+  // before fragment publication.
   clocks_payload_add_ocxo_diag(p, prefix, diag);
 
   char key[96];
@@ -634,7 +602,7 @@ void clocks_watchdog_anomaly(const char* reason,
 }
 
 // ============================================================================
-// clocks_beta_pps — invoked from alpha's pps_callback
+// clocks_beta_pps — invoked from alpha's pps_edge_callback
 // ============================================================================
 
 void clocks_beta_pps(void) {
@@ -701,13 +669,13 @@ void clocks_beta_pps(void) {
   ocxo1_ticks_64        = g_ocxo1_clock.ns_count_at_pps / 100ull;
   ocxo2_ticks_64        = g_ocxo2_clock.ns_count_at_pps / 100ull;
 
-  // DWT residual: (synthetic cycles per second) - (nominal expected).
+  // DWT residual: (measured cycles between VCLOCK one-second events) - (nominal expected).
   residual_update_sample(
       residual_dwt,
       (int64_t)dwt_effective_cycles_per_second() - (int64_t)DWT_EXPECTED_PER_PPS);
 
-  // residual_vclock is fed by alpha's pps_callback from the GPIO PPS witness.
-  // We do NOT update it here.
+  // residual_vclock is fed by alpha's pps_edge_callback from the GPIO
+  // PPS witness.  We do NOT update it here.
 
   if (g_ocxo1_measurement.prev_gnss_ns_at_edge != 0) {
     residual_update_sample(residual_ocxo1, g_ocxo1_measurement.second_residual_ns);
@@ -731,7 +699,8 @@ void clocks_beta_pps(void) {
   p.add("gnss_ns", g_gnss_ns_count_at_pps);
   p.add("calibrate_ocxo", servo_mode_str(calibrate_ocxo_mode));
 
-  // DWT canonical surface — sourced from VCLOCK integrator.
+  // DWT canonical surface — sourced from VCLOCK one-second events
+  // (alpha's one-second subtraction).
   p.add("dwt_cycle_count_total", g_dwt_cycle_count_total);
   p.add("dwt_cycle_count_at_pps", g_dwt_cycle_count_at_pps);
   p.add("dwt_cycle_count_between_pps", g_dwt_cycle_count_between_pps);
@@ -839,8 +808,9 @@ void clocks_beta_pps(void) {
   p.add("ocxo2_dac_welford_min", dac_welford_ocxo2.min_val, 3);
   p.add("ocxo2_dac_welford_max", dac_welford_ocxo2.max_val, 3);
 
-  // Per-lane diag including integrator state.  PPS additionally carries
-  // the GPIO witness fields.
+  // Per-lane diag (event facts + anomaly count).  The "pps_diag" entry
+  // corresponds to the VCLOCK lane and additionally carries the GPIO
+  // PPS witness fields.
   clocks_payload_add_pps_diag(p, "pps_diag", g_pps_interrupt_diag);
   clocks_payload_add_ocxo_diag(p, "ocxo1_diag", g_ocxo1_interrupt_diag);
   clocks_payload_add_ocxo_diag(p, "ocxo2_diag", g_ocxo2_interrupt_diag);
@@ -886,7 +856,7 @@ static Payload cmd_start(const Payload& args) {
 
   Payload p;
   p.add("status", (!dac1_ok || !dac2_ok) ?
-                  "start_requested_dac_fault" : "start_requested");
+                      "start_requested_dac_fault" : "start_requested");
   p.add("ocxo1_dac", ocxo1_dac.dac_fractional);
   p.add("ocxo2_dac", ocxo2_dac.dac_fractional);
   p.add("ocxo1_dac_last_write_ok", ocxo1_dac.io_last_write_ok);

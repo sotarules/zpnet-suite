@@ -1,31 +1,34 @@
 // ============================================================================
 // process_clocks_alpha.cpp — Always-On Physics Layer
 // ============================================================================
-#
+//
 // Dispatch doctrine:
-#
-//   GNSS clock state is VCLOCK-driven.  The vclock_callback subscribes to the
-//   VCLOCK integrator's synthetic 1-second boundary and advances all
-//   canonical clock state (epoch install; advances g_gnss_ns_count_at_pps,
-//   g_dwt_cycle_count_at_pps, g_qtimer_at_pps, time_pps_update, OCXO
-//   phase ledger).  This is the low-latency, low-jitter path — DWT is
-//   captured as the first instruction of the CH3 ISR and every
-//   downstream value is ISR-captured fact or pure arithmetic.
-#
+//
+//   GNSS clock state is VCLOCK-driven.  The vclock_callback subscribes to
+//   the VCLOCK lane's one-second event (QTimer1 CH3 cadence, every 1000
+//   ticks at 10 MHz = 1 s of real time) and advances all canonical clock
+//   state: epoch install, g_gnss_ns_count_at_pps, g_dwt_cycle_count_at_pps,
+//   g_qtimer_at_pps, time_pps_update, OCXO phase ledger.  DWT is captured
+//   as the first instruction of the CH3 ISR and carried into the event
+//   verbatim.
+//
 //   GNSS nanoseconds are AUTHORED from VCLOCK pulses.  VCLOCK is the
 //   GNSS-disciplined 10 MHz reference — the time-locked physical
 //   quantity.  Each VCLOCK pulse is exactly 100 ns of GNSS time; each
-//   synthetic boundary represents exactly VCLOCK_COUNTS_PER_SECOND
+//   one-second event represents exactly VCLOCK_COUNTS_PER_SECOND
 //   pulses, i.e. 1e9 ns.
-#
+//
+//   DWT cycles-between-events is computed by simple one-second
+//   subtraction of consecutive event.dwt_at_event values — the honest
+//   measurement.
+//
 //   The physical PPS GPIO edge is demoted to two narrow roles:
 //     1. A diagnostic witness (pps_edge_gnss_ns in the fragment).
 //     2. The trigger for TIMEBASE_FRAGMENT publication.
-#
+//
 //   The PPS witness fields are refreshed coherently in pps_edge_callback()
-//   from the authoritative pps_edge_snapshot_t.  The boundary_* fields in
-//   the diag remain boundary-emitter facts and are never repainted as PPS.
-#
+//   from the authoritative pps_edge_snapshot_t.
+//
 // ============================================================================
 
 #include "process_clocks_internal.h"
@@ -58,6 +61,10 @@ static_assert(NS_PER_SECOND_U64 ==
               "VCLOCK pulse identity broken: NS_PER_SECOND_U64 != "
               "VCLOCK_COUNTS_PER_SECOND * 100");
 
+// ============================================================================
+// Published canonical state (alpha-owned, beta-readable)
+// ============================================================================
+
 volatile uint64_t g_gnss_ns_count_at_pps = 0;
 
 volatile uint32_t g_dwt_cycle_count_at_pps = 0;
@@ -85,6 +92,10 @@ interrupt_capture_diag_t g_ocxo2_interrupt_diag = {};
 
 bool g_ad5693r_init_ok = false;
 
+// ============================================================================
+// Epoch state
+// ============================================================================
+
 enum class clocks_epoch_reason_t : uint8_t {
   NONE  = 0,
   INIT  = 1,
@@ -100,6 +111,14 @@ static volatile clocks_epoch_reason_t g_epoch_reason = clocks_epoch_reason_t::NO
 static volatile uint32_t g_epoch_dwt_at_pps = 0;
 static volatile uint32_t g_epoch_qtimer_at_pps = 0;
 static volatile uint64_t g_epoch_pps_index = 0;
+
+// One-second subtraction state for VCLOCK DWT cycles-between-events.
+// Seeded at epoch install; updated each VCLOCK one-second event.
+static volatile uint32_t g_prev_dwt_at_vclock_event = 0;
+
+// ============================================================================
+// OCXO DAC defaults
+// ============================================================================
 
 static ocxo_dac_state_t make_default_ocxo_dac_state() {
   ocxo_dac_state_t s = {};
@@ -184,7 +203,8 @@ static bool ocxo_dac_write_hw(ocxo_dac_state_t& s, double value) {
     return false;
   }
 
-  const uint8_t addr = (&s == &ocxo1_dac) ? AD5693R_ADDR_OCXO1 : AD5693R_ADDR_OCXO2;
+  const uint8_t addr = (&s == &ocxo1_dac) ?
+      AD5693R_ADDR_OCXO1 : AD5693R_ADDR_OCXO2;
 
   if (!ad5693r_write_input(addr, hw_code)) {
     s.io_last_write_ok = false;
@@ -211,10 +231,18 @@ static bool ocxo_dac_write_hw(ocxo_dac_state_t& s, double value) {
   return true;
 }
 
+// ============================================================================
+// Beta-facing shadow counts
+// ============================================================================
+
 uint64_t dwt_cycle_count_total = 0;
 uint64_t gnss_raw_64           = 0;
 uint64_t ocxo1_ticks_64        = 0;
 uint64_t ocxo2_ticks_64        = 0;
+
+// ============================================================================
+// PPS relay
+// ============================================================================
 
 static volatile bool relay_timer_active = false;
 
@@ -222,6 +250,10 @@ static void pps_relay_deassert(timepop_ctx_t*, timepop_diag_t*, void*) {
   digitalWriteFast(GNSS_PPS_RELAY, LOW);
   relay_timer_active = false;
 }
+
+// ============================================================================
+// DWT enable + epoch helpers
+// ============================================================================
 
 static inline void dwt_enable(void) {
   DEMCR |= DEMCR_TRCENA;
@@ -247,6 +279,7 @@ static void alpha_reset_canonical_clock_state_for_new_epoch(void) {
   g_dwt_cycle_count_next_second_adjustment = 0;
   g_dwt_model_pps_count = 0;
   g_qtimer_at_pps = 0;
+  g_prev_dwt_at_vclock_event = 0;
 
   g_vclock_clock = {};
   g_vclock_measurement = {};
@@ -264,7 +297,7 @@ static void alpha_reset_canonical_clock_state_for_new_epoch(void) {
   ocxo2_ticks_64        = 0;
 }
 
-static void alpha_install_new_epoch_from_vclock_boundary(
+static void alpha_install_new_epoch_from_vclock_event(
     const interrupt_event_t& vclock_event) {
   g_epoch_initialized = true;
   g_epoch_pending = false;
@@ -279,6 +312,14 @@ static void alpha_install_new_epoch_from_vclock_boundary(
   g_gnss_ns_count_at_pps = NS_PER_SECOND_U64;
   g_dwt_cycle_count_at_pps = vclock_event.dwt_at_event;
   g_qtimer_at_pps = g_epoch_qtimer_at_pps;
+
+  // Seed the one-second subtraction state.  No measurement is available
+  // yet; publish DWT_EXPECTED_PER_PPS as a neutral placeholder until the
+  // next VCLOCK event yields a real delta.
+  g_prev_dwt_at_vclock_event = vclock_event.dwt_at_event;
+  g_dwt_cycle_count_between_pps = DWT_EXPECTED_PER_PPS;
+  g_dwt_cycle_count_next_second_prediction = DWT_EXPECTED_PER_PPS;
+  g_dwt_cycle_count_next_second_adjustment = 0;
 
   g_vclock_clock.counter32_at_pps_event = vclock_event.counter32_at_event;
   g_vclock_clock.counter32_at_pps_expected = vclock_event.counter32_at_event;
@@ -295,6 +336,10 @@ static void alpha_install_new_epoch_from_vclock_boundary(
   time_pps_epoch_reset(vclock_event.dwt_at_event, g_epoch_qtimer_at_pps);
 }
 
+// ============================================================================
+// VCLOCK callback — the authoritative GNSS-ns advancer
+// ============================================================================
+
 static void vclock_callback(
     const interrupt_event_t& event,
     const interrupt_capture_diag_t* diag,
@@ -306,7 +351,7 @@ static void vclock_callback(
   g_last_pps_event_counter32_at_event = event.counter32_at_event;
 
   if (!g_epoch_initialized || g_epoch_pending) {
-    alpha_install_new_epoch_from_vclock_boundary(event);
+    alpha_install_new_epoch_from_vclock_event(event);
 
     digitalWriteFast(GNSS_PPS_RELAY, HIGH);
     if (!relay_timer_active) {
@@ -316,6 +361,7 @@ static void vclock_callback(
     return;
   }
 
+  // ── Canonical per-second advance ──
   g_epoch_pps_index++;
   g_gnss_ns_count_at_pps += NS_PER_SECOND_U64;
   g_dwt_cycle_count_at_pps = event.dwt_at_event;
@@ -331,24 +377,30 @@ static void vclock_callback(
   g_vclock_clock.ns_count_expected_at_pps = g_gnss_ns_count_at_pps;
   g_vclock_measurement.prev_counter32_at_pps_event = event.counter32_at_event;
 
-  const uint64_t integrator_cps = interrupt_vclock_cycles_per_second();
-  if (integrator_cps > 0 && integrator_cps < (uint64_t)UINT32_MAX) {
-    g_dwt_cycle_count_between_pps = (uint32_t)integrator_cps;
-    g_dwt_cycle_count_next_second_prediction = (uint32_t)integrator_cps;
-  } else {
-    g_dwt_cycle_count_between_pps = DWT_EXPECTED_PER_PPS;
-    g_dwt_cycle_count_next_second_prediction = DWT_EXPECTED_PER_PPS;
-  }
+  // ── DWT cycles between VCLOCK one-second events: one-second subtraction ──
+  //
+  // Honest measurement: the number of DWT cycles elapsed between this
+  // event's ISR-entry DWT capture and the previous one.  The uint32_t
+  // subtraction wraps correctly across DWT_CYCCNT rollover (~4.26 s
+  // at 1008 MHz, well beyond one second).
+  const uint32_t dwt_between =
+      event.dwt_at_event - g_prev_dwt_at_vclock_event;
+  g_prev_dwt_at_vclock_event = event.dwt_at_event;
+
+  g_dwt_cycle_count_between_pps = dwt_between;
+  g_dwt_cycle_count_next_second_prediction = dwt_between;
   g_dwt_cycle_count_next_second_adjustment = 0;
-  g_dwt_cycle_count_total += (uint64_t)g_dwt_cycle_count_between_pps;
+  g_dwt_cycle_count_total += (uint64_t)dwt_between;
   g_dwt_model_pps_count++;
 
+  // ── Residual tracking from GPIO PPS witness offset ──
   if (g_pps_interrupt_diag.pps_edge_sequence > 0 &&
       g_pps_interrupt_diag.pps_edge_gnss_ns >= 0) {
     residual_update_sample(residual_vclock,
                            g_pps_interrupt_diag.pps_edge_minus_event_ns);
   }
 
+  // ── OCXO phase ledger refresh at VCLOCK cadence ──
   if (g_ocxo1_clock.zero_established) {
     g_ocxo1_clock.ns_count_at_pps =
         (uint64_t)((int64_t)g_gnss_ns_count_at_pps - g_ocxo1_clock.phase_offset_ns);
@@ -379,6 +431,10 @@ static void vclock_callback(
   }
 }
 
+// ============================================================================
+// Physical PPS GPIO edge — witness + TIMEBASE_FRAGMENT publication trigger
+// ============================================================================
+
 static void pps_edge_callback(const pps_edge_snapshot_t& snap) {
   g_pps_interrupt_diag.pps_edge_sequence = snap.sequence;
   g_pps_interrupt_diag.pps_edge_dwt_isr_entry_raw = snap.dwt_at_edge;
@@ -393,6 +449,10 @@ static void pps_edge_callback(const pps_edge_snapshot_t& snap) {
     clocks_beta_pps();
   }
 }
+
+// ============================================================================
+// OCXO one-second events — phase ledger advance
+// ============================================================================
 
 static void ocxo_apply_edge(ocxo_clock_state_t& clock,
                             ocxo_measurement_t& meas,
@@ -469,6 +529,10 @@ static void ocxo2_callback(
   ocxo_apply_edge(g_ocxo2_clock, g_ocxo2_measurement,
                   event.dwt_at_event, event.gnss_ns_at_event);
 }
+
+// ============================================================================
+// Init
+// ============================================================================
 
 void process_clocks_init_hardware(void) {
   dwt_enable();
