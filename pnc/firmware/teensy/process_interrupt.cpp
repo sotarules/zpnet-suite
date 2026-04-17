@@ -85,7 +85,6 @@
 static constexpr uint32_t MAX_INTERRUPT_SUBSCRIBERS = 8;
 static constexpr uint64_t NS_PER_SECOND_U64 = 1000000000ULL;
 
-static constexpr uint32_t VCLOCK_COUNTS_PER_SECOND = 10000000U;
 static constexpr uint32_t VCLOCK_INTERVAL_COUNTS = 10000U;  // 1 ms at 10 MHz
 
 static constexpr uint32_t OCXO_COUNTS_PER_SECOND = 10000000U;

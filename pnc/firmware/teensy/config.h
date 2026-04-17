@@ -52,6 +52,8 @@ static constexpr uint32_t NS_PER_10MHZ_TICK = 100U;
 // has a remainder outside ±PPS_VCLOCK_TOLERANCE is rejected as spurious.
 static constexpr uint32_t PPS_VCLOCK_TOLERANCE = 100;
 
+static constexpr uint32_t VCLOCK_COUNTS_PER_SECOND = 10000000U;
+
 // --------------------------------------------------------------
 // Prescaled clock domains
 // --------------------------------------------------------------
