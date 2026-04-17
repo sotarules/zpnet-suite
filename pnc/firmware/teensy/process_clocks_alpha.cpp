@@ -2,30 +2,33 @@
 // process_clocks_alpha.cpp — Always-On Physics Layer
 // ============================================================================
 //
-// Post rolling-integration doctrine:
+// Dispatch doctrine:
 //
-//   pps_callback is driven by the VCLOCK rolling integrator's 1-second
-//   boundary emission.  The first such boundary carries gnss_ns_at_event = 0
-//   (the bridge cannot be valid until alpha installs the epoch); alpha
-//   treats that as the bootstrap epoch install, captures the synthetic DWT
-//   as the bridge anchor, and from that moment forward every integrator
-//   boundary across all three lanes uses the bridge to translate
-//   synthetic_dwt to GNSS ns.
+//   GNSS clock state is VCLOCK-driven. The vclock_callback subscribes to the
+//   VCLOCK integrator's synthetic 1-second boundary and advances all
+//   canonical clock state (epoch install. Also, advances, g_gnss_ns_count_at_pps,
+//   g_dwt_cycle_count_at_pps, g_qtimer_at_pps, time_pps_update, OCXO
+//   phase ledger).  This is the low-latency, low-jitter path — DWT is
+//   captured as the first instruction of the CH3 ISR and every
+//   downstream value is ISR-captured fact or pure arithmetic.
 //
-//   ocxo1_callback / ocxo2_callback receive boundary events whose
-//   gnss_ns_at_event is already the bridge-translated GNSS nanosecond
-//   at which the OCXO's 1-second edge occurred.  Alpha trusts that value
-//   directly — there is no override.
+//   TIMEBASE_FRAGMENT dispatch is driven by the physical PPS GPIO edge.
+//   pps_edge_callback is registered with process_interrupt and fires
+//   ~tens-of-microseconds after each physical edge (via timepop_arm_asap).
+//   Its job is narrow: refresh the gnss_ns_at_isr diagnostic from the
+//   pps_edge_snapshot_t and call clocks_beta_pps() to assemble and
+//   publish the fragment.
 //
-//   The DWT next-second prediction is sourced at each boundary from the
-//   VCLOCK integrator's SMA-derived avg_cycles_per_second.  The old 10 kHz
-//   DWT adjustment timer is retired.
+//   Temporal ordering: within any given real-world second, VCLOCK
+//   synthetic boundary N fires ~40 ms before physical PPS edge N (CH3
+//   bootstrap phase offset).  So when the physical edge arrives and
+//   triggers fragment dispatch, all clock state has just been advanced
+//   by vclock_callback.  The fragment assembles from fresh, coherent
+//   data and carries this PPS's gnss_ns_at_edge in the witness field.
 //
-//   The smart-zero OCXO phase model is unchanged.
-//
-//   residual_vclock is repurposed: it accumulates the GPIO PPS witness
-//   offset from the synthetic boundary.  The Welford mean reveals DC bias;
-//   the standard deviation reveals true GPIO detection latency jitter.
+//   OCXO subscribers (ocxo1_callback, ocxo2_callback) remain unchanged:
+//   they fire on their own QTimer3 boundary events and update the OCXO
+//   phase ledger independently.
 //
 // ============================================================================
 
@@ -297,23 +300,24 @@ static void alpha_reset_canonical_clock_state_for_new_epoch(void) {
   ocxo2_ticks_64        = 0;
 }
 
-static void alpha_install_new_epoch_from_pps(const interrupt_event_t& pps_event) {
+static void alpha_install_new_epoch_from_vclock_boundary(
+    const interrupt_event_t& vclock_event) {
   g_epoch_initialized = true;
   g_epoch_pending = false;
   g_epoch_generation++;
   g_epoch_pps_index = 0;
 
-  g_epoch_dwt_at_pps = pps_event.dwt_at_event;
-  g_epoch_qtimer_at_pps = pps_event.counter32_at_event;
+  g_epoch_dwt_at_pps = vclock_event.dwt_at_event;
+  g_epoch_qtimer_at_pps = vclock_event.counter32_at_event;
 
   alpha_reset_canonical_clock_state_for_new_epoch();
 
   g_gnss_ns_count_at_pps = 0;
-  g_dwt_cycle_count_at_pps = pps_event.dwt_at_event;
+  g_dwt_cycle_count_at_pps = vclock_event.dwt_at_event;
   g_qtimer_at_pps = g_epoch_qtimer_at_pps;
 
-  g_vclock_clock.counter32_at_pps_event = pps_event.counter32_at_event;
-  g_vclock_clock.counter32_at_pps_expected = pps_event.counter32_at_event;
+  g_vclock_clock.counter32_at_pps_event = vclock_event.counter32_at_event;
+  g_vclock_clock.counter32_at_pps_expected = vclock_event.counter32_at_event;
   g_vclock_clock.counter32_error_at_pps = 0;
   g_vclock_clock.ns_count_at_pps = 0;
   g_vclock_clock.ns_count_expected_at_pps = 0;
@@ -322,19 +326,28 @@ static void alpha_install_new_epoch_from_pps(const interrupt_event_t& pps_event)
   g_vclock_measurement.ticks_between_pps = 0;
   g_vclock_measurement.ns_between_pps = 0;
   g_vclock_measurement.second_residual_ns = 0;
-  g_vclock_measurement.prev_counter32_at_pps_event = pps_event.counter32_at_event;
+  g_vclock_measurement.prev_counter32_at_pps_event = vclock_event.counter32_at_event;
 
   // Establish the bridge anchor.  From this moment, time_dwt_to_gnss_ns()
   // returns valid GNSS nanoseconds for any DWT in the recent past or future,
-  // including the OCXO integrator's synthetic boundaries.
-  time_pps_epoch_reset(pps_event.dwt_at_event, g_epoch_qtimer_at_pps);
+  // including the OCXO integrator's synthetic boundaries and the physical
+  // PPS GPIO edge captured in the GPIO ISR.
+  time_pps_epoch_reset(vclock_event.dwt_at_event, g_epoch_qtimer_at_pps);
 }
 
 // ============================================================================
-// PPS subscriber — driven by VCLOCK rolling integrator boundary
+// VCLOCK subscriber — driven by VCLOCK synthetic boundary (QTimer1 CH3)
 // ============================================================================
+//
+// This is the canonical GNSS clock advancement callback.  It fires on
+// every VCLOCK synthetic 1-second boundary (every 1,008,000 ticks of
+// CH3 counting GNSS 10 MHz) and advances all clock state accordingly.
+//
+// It does NOT publish TIMEBASE_FRAGMENT.  Fragment dispatch is triggered
+// by the physical PPS GPIO edge via pps_edge_callback (see below).
+//
 
-static void pps_callback(
+static void vclock_callback(
     const interrupt_event_t& event,
     const interrupt_capture_diag_t* diag,
     void*) {
@@ -350,12 +363,7 @@ static void pps_callback(
   // valid, and subsequent boundaries flow through the "normal advance"
   // path with bridge-translated gnss_ns_at_event values.
   if (!g_epoch_initialized || g_epoch_pending) {
-    alpha_install_new_epoch_from_pps(event);
-
-    if (campaign_state == clocks_campaign_state_t::STARTED ||
-        request_start || request_stop || request_recover || request_zero) {
-      clocks_beta_pps();
-    }
+    alpha_install_new_epoch_from_vclock_boundary(event);
 
     digitalWriteFast(GNSS_PPS_RELAY, HIGH);
     if (!relay_timer_active) {
@@ -401,13 +409,13 @@ static void pps_callback(
   // ── GPIO PPS witness → residual_vclock ──
   // The witness offset is the difference between the physical GPIO PPS
   // edge's GNSS ns and the most recent synthetic boundary's GNSS ns.
-  // This is the measurement we could never trust before; now we capture
-  // its true jitter.
+  // Under the new doctrine, gpio_minus_synthetic_ns is vestigial (always
+  // zero) — the residual channel will be retired in a follow-up commit.
   if (g_pps_interrupt_diag.gpio_edge_count > 0 &&
       g_pps_interrupt_diag.gnss_ns_at_isr > 0) {
     residual_update_sample(residual_vclock,
                            g_pps_interrupt_diag.gpio_minus_synthetic_ns);
-      }
+  }
 
   // ── OCXO ns projection to PPS boundary via phase ledger ──
   if (g_ocxo1_clock.zero_established) {
@@ -428,11 +436,6 @@ static void pps_callback(
                   dwt_effective_cycles_per_second(),
                   g_qtimer_at_pps);
 
-  if (campaign_state == clocks_campaign_state_t::STARTED ||
-      request_start || request_stop || request_recover || request_zero) {
-    clocks_beta_pps();
-  }
-
   if (request_zero && !g_epoch_pending) {
     alpha_request_epoch_zero(clocks_epoch_reason_t::ZERO);
   }
@@ -441,6 +444,49 @@ static void pps_callback(
   if (!relay_timer_active) {
     relay_timer_active = true;
     timepop_arm(PPS_RELAY_OFF_NS, false, pps_relay_deassert, nullptr, "pps-relay-off");
+  }
+
+  // NOTE: clocks_beta_pps() is NOT called here.  TIMEBASE_FRAGMENT
+  // dispatch is triggered by the physical PPS GPIO edge via
+  // pps_edge_callback.  By the time that callback fires (~40 ms after
+  // this vclock_callback completes), all the state advanced above is
+  // in place and the fragment can assemble from fresh data.
+}
+
+// ============================================================================
+// Physical PPS edge callback — drives TIMEBASE_FRAGMENT dispatch
+// ============================================================================
+//
+// Fires once per physical PPS rising edge via timepop_arm_asap-deferred
+// dispatch from the GPIO ISR.  Narrow responsibilities:
+//
+//   1. Stash snap.gnss_ns_at_edge into the diag's gnss_ns_at_isr field
+//      so the outgoing TIMEBASE_FRAGMENT carries the canonical "when
+//      did the physical PPS edge occur" diagnostic for this PPS.
+//
+//   2. Call clocks_beta_pps() to assemble and publish the fragment.
+//      clocks_beta_pps reads from VCLOCK-maintained clock state (which
+//      was just advanced ~40 ms ago by vclock_callback) plus the diag
+//      we just refreshed.
+//
+// Campaign gating (start / stop / recover / zero) is handled by
+// clocks_beta_pps itself, same as before.
+//
+
+static void pps_edge_callback(const pps_edge_snapshot_t& snap) {
+  // Refresh the diagnostic that will ride in the outgoing fragment.
+  // The VCLOCK subscriber's diag was populated with a stale witness
+  // value (from the previous edge that fired before vclock_callback);
+  // overwrite with the authoritative snapshot of THIS edge.
+  if (snap.gnss_ns_at_edge >= 0) {
+    g_pps_interrupt_diag.gnss_ns_at_isr = snap.gnss_ns_at_edge;
+  }
+  g_pps_interrupt_diag.gpio_last_dwt = snap.dwt_at_edge;
+  g_pps_interrupt_diag.gpio_edge_count = snap.sequence;
+
+  if (campaign_state == clocks_campaign_state_t::STARTED ||
+      request_start || request_stop || request_recover || request_zero) {
+    clocks_beta_pps();
   }
 }
 
@@ -568,12 +614,13 @@ void process_clocks_init(void) {
   pinMode(GNSS_PPS_RELAY, OUTPUT);
   digitalWriteFast(GNSS_PPS_RELAY, LOW);
 
-  interrupt_subscription_t pps_sub {};
-  pps_sub.kind = interrupt_subscriber_kind_t::PPS;
-  pps_sub.on_event = pps_callback;
-  pps_sub.user_data = nullptr;
-  interrupt_subscribe(pps_sub);
-  interrupt_start(interrupt_subscriber_kind_t::PPS);
+  // VCLOCK subscriber — drives GNSS clock state via synthetic boundary.
+  interrupt_subscription_t vclock_sub {};
+  vclock_sub.kind = interrupt_subscriber_kind_t::VCLOCK;
+  vclock_sub.on_event = vclock_callback;
+  vclock_sub.user_data = nullptr;
+  interrupt_subscribe(vclock_sub);
+  interrupt_start(interrupt_subscriber_kind_t::VCLOCK);
 
   interrupt_subscription_t ocxo1_sub {};
   ocxo1_sub.kind = interrupt_subscriber_kind_t::OCXO1;
@@ -588,6 +635,9 @@ void process_clocks_init(void) {
   ocxo2_sub.user_data = nullptr;
   interrupt_subscribe(ocxo2_sub);
   interrupt_start(interrupt_subscriber_kind_t::OCXO2);
+
+  // Physical PPS GPIO edge — drives TIMEBASE_FRAGMENT dispatch only.
+  interrupt_pps_edge_register_dispatch(pps_edge_callback);
 
   // The 10 kHz dwt_adjustment_timer is RETIRED.  The VCLOCK rolling
   // integrator's avg_cycles_per_second is now the prediction source.
