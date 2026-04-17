@@ -22,23 +22,53 @@
 //
 // All three lanes have the SAME hardware-to-software latency profile:
 // QuadTimer compare match → NVIC → ISR → DWT capture as first instruction.
-// This is the experimental setup that lets us measure whether the QuadTimer
-// compare path is itself jitter-free, by comparing all three lanes against
-// each other.
 //
 // Subscribers receive boundary events.  No counter reads in canonical
 // paths.  No compare-latency corrections.  No raw/final duality.
 //
-// The integrator computes a synthetic DWT only.  The boundary handler
-// translates that synthetic DWT to a GNSS nanosecond by crossing the
-// DWT↔GNSS bridge — the universal sovereign coordinate for "when did
-// this happen."
+// ----------------------------------------------------------------------------
+// What the integrator produces (and what it doesn't)
+// ----------------------------------------------------------------------------
 //
-// Bootstrap: the very first VCLOCK boundary fires before the bridge is
-// valid (because that boundary is what establishes the bridge anchor).
-// On that one occasion, the boundary handler emits gnss_ns_at_event = 0
-// with status = OK; alpha treats this as the epoch install bootstrap.
-// All subsequent boundaries — VCLOCK, OCXO1, OCXO2 — use the bridge.
+// Each integrator has TWO products:
+//
+//   1. SYNTHETIC_DWT — an honest cumulative tally.
+//
+//      synthetic_dwt[N] = baseline_dwt + Σ(intervals from tick 1 to tick N)
+//
+//      By construction this equals the DWT captured at the boundary's ISR
+//      entry, modulo the natural u32 wrap.  No multiplication by N.  No
+//      retroactive history rewriting.  The integrator is a faithful
+//      accumulator, not a projection.
+//
+//      Why this matters: an earlier formula computed
+//          synthetic_dwt[N] = baseline + N × ring_sum_now
+//      which projected forward as if every prior second had the CURRENT
+//      rate.  Whenever the SMA rate drifted (which it does every second
+//      due to thermal effects and ring-window slide), the synthetic
+//      timeline shifted retroactively by N × δrate.  At PPS 1500 with
+//      a 5-cycle drift, that's 7500 cycles of fake "jitter" in the
+//      synthetic boundary, none of it corresponding to anything physical.
+//      The honest accumulator below has no such failure mode.
+//
+//   2. RATE (cycles per second) — an SMA over the last 1000 inter-tick
+//      intervals.  Returned via interrupt_vclock_cycles_per_second() and
+//      consumed by alpha for next-second prediction and reporting.  The
+//      ring averaging genuinely smooths the per-tick measurement noise
+//      that would otherwise be visible in any single inter-tick delta.
+//
+// The synthetic_dwt is the boundary anchor.  The rate is the velocity.
+// Together they let alpha cross the DWT↔GNSS bridge cleanly.
+//
+// ----------------------------------------------------------------------------
+// Bootstrap
+// ----------------------------------------------------------------------------
+//
+// The very first VCLOCK boundary fires before the bridge is valid (because
+// that boundary is what establishes the bridge anchor).  On that one
+// occasion, the boundary handler emits gnss_ns_at_event = 0 with status
+// = OK; alpha treats this as the epoch install bootstrap.  All subsequent
+// boundaries — VCLOCK, OCXO1, OCXO2 — use the bridge.
 //
 // The PPS GPIO edge is WITNESS-ONLY — it records its offset from the
 // most recent VCLOCK synthetic boundary as a diagnostic, and dispatches
@@ -94,7 +124,16 @@ struct rolling_dwt_integrator_t {
   uint64_t total_ticks_seen = 0;
   uint32_t last_interval_cycles = 0;
 
-  // Ring of per-interval DWT cycle deltas.
+  // Cumulative cycles since baseline.  Incremented by `interval` on every
+  // tick.  This is the integrator's honest tally — the synthetic_dwt
+  // anchor at any boundary is `baseline_dwt + cumulative_cycles_since_baseline`.
+  // By construction this equals prev_dwt at any moment, but maintaining it
+  // explicitly documents the integrator's role as an accumulator and lets
+  // us assert internal consistency in diagnostics.
+  uint64_t cumulative_cycles_since_baseline = 0;
+
+  // Ring of per-interval DWT cycle deltas.  Used SOLELY for computing the
+  // smoothed cycles-per-second rate.  Not used for the synthetic_dwt anchor.
   uint32_t ring[ROLLING_WINDOW_SIZE] = {};
   uint32_t ring_head = 0;
   uint32_t ring_fill = 0;
@@ -108,6 +147,12 @@ struct rolling_dwt_integrator_t {
   uint32_t last_synthetic_dwt = 0;
   uint32_t boundary_emissions = 0;
 
+  // All-time per-interval min/max, updated in the ISR on every tick.
+  // Captures rare excursions that the rolling ring would slide past.
+  // Sentinel value UINT32_MAX in min means "no samples seen yet."
+  uint32_t interval_min_ever = UINT32_MAX;
+  uint32_t interval_max_ever = 0;
+
   // Set true by tick() for the single tick that completed a boundary.
   bool boundary_emitted_this_tick = false;
 };
@@ -119,6 +164,20 @@ static rolling_dwt_integrator_t g_ocxo2_integrator;
 // Per-tick update.  Caller must have captured dwt_raw as the first
 // instruction of the ISR.  Sets boundary_emitted_this_tick = true on the
 // tick that completes a 1-second boundary.
+//
+// Two distinct accumulations happen here:
+//
+//   A. cumulative_cycles_since_baseline += interval
+//      Honest running tally; used for the synthetic_dwt anchor.
+//
+//   B. ring[head] = interval; ring_sum updated; SMA rate recomputed.
+//      Used SOLELY for the smoothed cycles-per-second rate output.
+//
+// The ring's role is rate measurement.  The cumulative tally's role is
+// boundary anchoring.  Conflating them (as an earlier version did, by
+// projecting baseline + N × ring_sum) introduces N-amplified retroactive
+// drift that has nothing to do with physical reality.
+//
 static void rolling_integrator_tick(rolling_dwt_integrator_t& r, uint32_t dwt_raw) {
   r.boundary_emitted_this_tick = false;
 
@@ -127,6 +186,9 @@ static void rolling_integrator_tick(rolling_dwt_integrator_t& r, uint32_t dwt_ra
     r.prev_dwt = dwt_raw;
     r.last_synthetic_dwt = dwt_raw;
     r.total_ticks_seen = 0;
+    r.cumulative_cycles_since_baseline = 0;
+    r.interval_min_ever = UINT32_MAX;
+    r.interval_max_ever = 0;
     r.baseline_valid = true;
     return;
   }
@@ -136,6 +198,15 @@ static void rolling_integrator_tick(rolling_dwt_integrator_t& r, uint32_t dwt_ra
   r.last_interval_cycles = interval;
   r.total_ticks_seen++;
 
+  // All-time min/max — cheap (two compares, rarely two stores).  Catches
+  // rare excursions even if the rolling ring slides past them.
+  if (interval < r.interval_min_ever) r.interval_min_ever = interval;
+  if (interval > r.interval_max_ever) r.interval_max_ever = interval;
+
+  // (A) Honest cumulative tally — feeds the synthetic_dwt anchor.
+  r.cumulative_cycles_since_baseline += (uint64_t)interval;
+
+  // (B) Ring update — feeds the SMA cycles-per-second rate.
   if (r.ring_fill == ROLLING_WINDOW_SIZE) {
     r.ring_sum -= r.ring[r.ring_head];
   } else {
@@ -149,19 +220,17 @@ static void rolling_integrator_tick(rolling_dwt_integrator_t& r, uint32_t dwt_ra
     r.avg_cycles_per_interval_q32 = (r.ring_sum << 32) / r.ring_fill;
   }
 
-  // Emit boundary every 1000 ticks, once the ring is fully primed.
+  // Emit boundary every 1000 ticks, once the ring is fully primed (so the
+  // rate output is reliable for downstream consumers that read it).
   if ((r.total_ticks_seen % ROLLING_WINDOW_SIZE) == 0u &&
       r.ring_fill == ROLLING_WINDOW_SIZE) {
 
-    // Option X: synthetic_dwt[N] = baseline + total_ticks × avg_rate
-    //
-    // At a boundary tick, total_ticks is exactly N × WINDOW and ring_fill
-    // is exactly WINDOW, so cumulative_cycles = N × ring_sum (exact, no
-    // division truncation).
-    const uint64_t boundary_number = r.total_ticks_seen / ROLLING_WINDOW_SIZE;
-    const uint64_t cumulative_cycles = boundary_number * r.ring_sum;
-
-    r.last_synthetic_dwt = r.baseline_dwt + (uint32_t)cumulative_cycles;
+    // synthetic_dwt = baseline + cumulative_cycles.
+    // Equivalent to dwt_raw at this tick (by construction, since
+    // cumulative = sum of intervals = dwt_raw - baseline).  Maintaining
+    // the accumulator explicitly makes the integrator's role legible.
+    r.last_synthetic_dwt =
+        r.baseline_dwt + (uint32_t)r.cumulative_cycles_since_baseline;
     r.boundary_emissions++;
     r.synthetic_valid = true;
     r.boundary_emitted_this_tick = true;
@@ -175,6 +244,71 @@ static uint64_t integrator_cycles_per_second(const rolling_dwt_integrator_t& r) 
 
 uint64_t interrupt_vclock_cycles_per_second(void) {
   return integrator_cycles_per_second(g_vclock_integrator);
+}
+
+// Compute statistics over the integrator's ring of inter-tick intervals.
+// The ring contains the most recent ring_fill intervals (up to
+// ROLLING_WINDOW_SIZE = 1000).  Returns min, max, mean (sub-cycle), and
+// stddev (sub-cycle).
+//
+// Called from two places:
+//   - fill_diag()  — at boundary emission, to embed per-tick stats in
+//                    the interrupt_capture_diag_t that propagates into
+//                    TIMEBASE_FRAGMENT.  Runs in ISR context, but only
+//                    at 1 Hz per lane; the FPU work (~1000 double ops)
+//                    is negligible overhead at that rate.
+//   - add_integrator_report() — for the REPORT command surface.
+//
+// Why this function exists:
+//   integ_diff (synthetic-boundary delta) and raw_diff (ISR-entry delta)
+//   both telescope to the same pair of endpoints (dwt_at_tick_0,
+//   dwt_at_tick_1000), so neither one can reveal what the 999
+//   intermediate ticks actually did.  They are blind to per-tick
+//   ISR-entry latency variance by algebraic identity.
+//
+//   This function ISN'T blind — it walks the individual inter-tick
+//   intervals directly.  If interval_stddev comes back at a handful of
+//   cycles, the ISR is essentially cycle-deterministic and the
+//   integrator's smoothing is genuinely inert.  If it comes back at
+//   tens or hundreds of cycles, there is real per-tick latency
+//   variance that the SMA has been averaging into the rate output all
+//   along, which endpoint-only cross-checks could never see.
+//
+static void compute_ring_interval_stats(const rolling_dwt_integrator_t& r,
+                                        uint32_t& out_min,
+                                        uint32_t& out_max,
+                                        double&   out_mean,
+                                        double&   out_stddev) {
+  const uint32_t fill = r.ring_fill;  // snapshot — ISR may update concurrently
+  if (fill == 0) {
+    out_min = 0;
+    out_max = 0;
+    out_mean = 0.0;
+    out_stddev = 0.0;
+    return;
+  }
+
+  uint32_t mn = UINT32_MAX;
+  uint32_t mx = 0;
+  uint64_t sum = 0;
+  for (uint32_t i = 0; i < fill; i++) {
+    const uint32_t v = r.ring[i];
+    if (v < mn) mn = v;
+    if (v > mx) mx = v;
+    sum += v;
+  }
+
+  const double mean = (double)sum / (double)fill;
+  double sq_sum = 0.0;
+  for (uint32_t i = 0; i < fill; i++) {
+    const double d = (double)r.ring[i] - mean;
+    sq_sum += d * d;
+  }
+
+  out_min = mn;
+  out_max = mx;
+  out_mean = mean;
+  out_stddev = (fill >= 2) ? sqrt(sq_sum / (double)(fill - 1)) : 0.0;
 }
 
 // ============================================================================
@@ -409,6 +543,26 @@ static void fill_diag(interrupt_capture_diag_t& diag,
   diag.integrator_avg_cycles_per_sec = integrator_cycles_per_second(r);
   diag.integrator_last_interval_cycles = r.last_interval_cycles;
   diag.integrator_boundary_emissions = r.boundary_emissions;
+
+  // Per-interval distribution — the REAL per-tick jitter picture.
+  // Window stats describe the 1000 intervals that sum to this boundary's
+  // endpoint delta, so tick_stddev and endpoint delta are temporally
+  // aligned (they describe the same 1-second window).  Ever-min/max
+  // are cumulative since baseline and catch rare excursions the ring
+  // may have slid past.
+  {
+    uint32_t window_min = 0, window_max = 0;
+    double   window_mean = 0.0, window_stddev = 0.0;
+    compute_ring_interval_stats(r, window_min, window_max,
+                                window_mean, window_stddev);
+    diag.integrator_interval_window_min_cycles = window_min;
+    diag.integrator_interval_window_max_cycles = window_max;
+    diag.integrator_interval_window_mean_cycles = window_mean;
+    diag.integrator_interval_window_stddev_cycles = window_stddev;
+    diag.integrator_interval_min_ever_cycles =
+        (r.interval_min_ever == UINT32_MAX) ? 0u : r.interval_min_ever;
+    diag.integrator_interval_max_ever_cycles = r.interval_max_ever;
+  }
 
   if (rt.desc->kind == interrupt_subscriber_kind_t::PPS) {
     diag.gpio_edge_count = g_pps_gpio_witness.edge_count;
@@ -826,6 +980,7 @@ static void add_integrator_report(Payload& p, const char* prefix,
   p.add(keyf("baseline_valid"), r.baseline_valid);
   p.add(keyf("baseline_dwt"), r.baseline_dwt);
   p.add(keyf("total_ticks_seen"), r.total_ticks_seen);
+  p.add(keyf("cumulative_cycles_since_baseline"), r.cumulative_cycles_since_baseline);
   p.add(keyf("ring_fill"), r.ring_fill);
   p.add(keyf("ring_sum"), r.ring_sum);
   p.add(keyf("avg_cycles_per_sec"), integrator_cycles_per_second(r));
@@ -833,6 +988,25 @@ static void add_integrator_report(Payload& p, const char* prefix,
   p.add(keyf("boundary_emissions"), r.boundary_emissions);
   p.add(keyf("synthetic_valid"), r.synthetic_valid);
   p.add(keyf("last_synthetic_dwt"), r.last_synthetic_dwt);
+
+  // Per-interval distribution statistics — answers the question
+  // endpoint-only cross-checks cannot: is each individual tick's ISR
+  // arrival cycle-deterministic, or is the ring averaging away real
+  // jitter?  Window stats are over the most recent 1000 intervals
+  // (i.e. the last ~1 second); ever-min/max are cumulative since
+  // baseline and catch rare excursions the ring may have slid past.
+  uint32_t window_min, window_max;
+  double   window_mean, window_stddev;
+  compute_ring_interval_stats(r, window_min, window_max, window_mean, window_stddev);
+  p.add(keyf("interval_window_min_cycles"), window_min);
+  p.add(keyf("interval_window_max_cycles"), window_max);
+  p.add(keyf("interval_window_range_cycles"),
+        (window_max >= window_min) ? (window_max - window_min) : 0u);
+  p.add(keyf("interval_window_mean_cycles"), window_mean);
+  p.add(keyf("interval_window_stddev_cycles"), window_stddev);
+  p.add(keyf("interval_min_ever_cycles"),
+        (r.interval_min_ever == UINT32_MAX) ? 0u : r.interval_min_ever);
+  p.add(keyf("interval_max_ever_cycles"), r.interval_max_ever);
 }
 
 static Payload cmd_report(const Payload&) {

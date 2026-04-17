@@ -174,6 +174,10 @@ static void clocks_payload_add_ocxo_diag(Payload& p,
     snprintf(key, sizeof(key), "%s_%s", prefix, suffix);
     p.add(key, value);
   };
+  auto add_double = [&](const char* suffix, double value, int decimals) {
+    snprintf(key, sizeof(key), "%s_%s", prefix, suffix);
+    p.add(key, value, decimals);
+  };
 
   add_bool("enabled", diag.enabled);
 
@@ -196,6 +200,24 @@ static void clocks_payload_add_ocxo_diag(Payload& p,
   add_u64("integrator_avg_cycles_per_sec", diag.integrator_avg_cycles_per_sec);
   add_u32("integrator_last_interval_cycles", diag.integrator_last_interval_cycles);
   add_u32("integrator_boundary_emissions", diag.integrator_boundary_emissions);
+
+  // Per-interval distribution — reveals per-tick ISR-entry jitter that
+  // endpoint-level metrics (integ_diff, raw_diff) telescope away by
+  // algebraic identity.  Window stats describe the 1000 intervals that
+  // summed to this boundary's endpoint delta; ever-min/max are
+  // cumulative since baseline and catch rare excursions.
+  add_u32("integrator_interval_window_min_cycles",
+          diag.integrator_interval_window_min_cycles);
+  add_u32("integrator_interval_window_max_cycles",
+          diag.integrator_interval_window_max_cycles);
+  add_double("integrator_interval_window_mean_cycles",
+             diag.integrator_interval_window_mean_cycles, 3);
+  add_double("integrator_interval_window_stddev_cycles",
+             diag.integrator_interval_window_stddev_cycles, 3);
+  add_u32("integrator_interval_min_ever_cycles",
+          diag.integrator_interval_min_ever_cycles);
+  add_u32("integrator_interval_max_ever_cycles",
+          diag.integrator_interval_max_ever_cycles);
 
   add_u32("anomaly_count", diag.anomaly_count);
 }

@@ -18,16 +18,26 @@
 //   Each integrator:
 //     • Captures DWT as the FIRST INSTRUCTION of its 1 kHz ISR.
 //     • Holds an immutable baseline captured once at the first tick.
-//     • Maintains a 1000-slot SMA ring of inter-tick DWT cycle deltas.
+//     • Accumulates cycles_since_baseline as an honest running tally
+//       (sum of all per-tick intervals).
+//     • Maintains a 1000-slot SMA ring of inter-tick DWT cycle deltas,
+//       used solely for the smoothed cycles-per-second rate output.
 //     • Every 1000 ticks emits a synthetic 1-second boundary:
-//          synthetic_dwt = baseline + total_ticks × avg_cycles_per_interval
-//       where avg_cycles_per_interval is the current SMA rate.
+//          synthetic_dwt = baseline + cumulative_cycles_since_baseline
+//       which by construction equals the DWT captured at that boundary's
+//       ISR entry (telescoping sum of intervals).  No projection; no
+//       N × rate multiplication; no retroactive history rewriting.
 //     • The boundary handler translates synthetic_dwt to GNSS ns via the
 //       DWT↔GNSS bridge.  Bootstrap escape: the very first VCLOCK
 //       boundary fires with gnss_ns_at_event = 0 (alpha installs the
 //       epoch on receipt; from then on the bridge is valid for all lanes).
 //     • The authored counter32 is a software-extended logical 32-bit count
 //       that advances by exactly 10,000,000 per boundary.
+//     • Per-interval distribution (window min/max/mean/stddev plus
+//       all-time min/max) rides along in the capture diag on every
+//       boundary.  Reveals per-tick ISR-entry jitter that endpoint-only
+//       metrics (integ_diff, raw_diff) telescope away by algebraic
+//       identity.
 //
 //   Subscribers receive boundary events.  No counter reads in canonical
 //   paths.  No compare-latency corrections.  No raw/final duality.
@@ -96,8 +106,9 @@ struct interrupt_event_t {
   interrupt_lane_t lane = interrupt_lane_t::NONE;
   interrupt_event_status_t status = interrupt_event_status_t::OK;
 
-  // Synthetic DWT at the 1-second boundary, projected from the
-  // integrator's immutable baseline using the current SMA rate.
+  // Synthetic DWT at the 1-second boundary — baseline + cumulative
+  // cycles, equivalent to the DWT captured at this boundary's ISR
+  // entry.
   uint32_t dwt_at_event = 0;
 
   // GNSS ns at the boundary, computed via the DWT↔GNSS bridge.  May be 0
@@ -136,6 +147,20 @@ struct interrupt_capture_diag_t {
   uint64_t integrator_avg_cycles_per_sec = 0;
   uint32_t integrator_last_interval_cycles = 0;
   uint32_t integrator_boundary_emissions = 0;
+
+  // Per-interval distribution, computed at boundary emission over the
+  // 1000 intervals that summed to this boundary's endpoint delta.
+  // Reveals the per-tick ISR-entry jitter that endpoint-level metrics
+  // (integ_diff, raw_diff) telescope away by algebraic identity.
+  // Window stats describe the most recent 1-second window; ever-min/max
+  // are cumulative since baseline and catch rare excursions the ring
+  // may have slid past.
+  uint32_t integrator_interval_window_min_cycles = 0;
+  uint32_t integrator_interval_window_max_cycles = 0;
+  double   integrator_interval_window_mean_cycles = 0.0;
+  double   integrator_interval_window_stddev_cycles = 0.0;
+  uint32_t integrator_interval_min_ever_cycles = 0;
+  uint32_t integrator_interval_max_ever_cycles = 0;
 
   // PPS GPIO witness (populated on the PPS subscriber's diag only).
   uint32_t gpio_edge_count = 0;
