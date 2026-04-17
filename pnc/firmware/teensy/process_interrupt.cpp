@@ -1,51 +1,51 @@
 // ============================================================================
 // process_interrupt.cpp — rolling DWT integration + physical PPS machinery
 // ============================================================================
-//
+#
 // Three rolling integrators, one per lane, each cadenced by its own
 // dedicated QuadTimer compare channel at 1 kHz:
-//
+#
 //   VCLOCK lane:  QTimer1 CH3 compare, +10000 ticks per interval
 //                 (clocked by GNSS 10 MHz VCLOCK; PCS=0)
 //                 ISR is registered with TimePop via
 //                 timepop_register_qtimer1_ch3_isr() — TimePop's
 //                 qtimer1_irq_isr captures DWT as the first instruction
 //                 and dispatches here when CH3's flag is set.
-//
+#
 //   OCXO1 lane:   QTimer3 CH2 compare, +10000 ticks per interval
 //                 (clocked by OCXO1 10 MHz; PCS=2)
 //                 ISR is owned directly by process_interrupt.
-//
+#
 //   OCXO2 lane:   QTimer3 CH3 compare, +10000 ticks per interval
 //                 (clocked by OCXO2 10 MHz; PCS=3)
 //                 ISR is owned directly by process_interrupt.
-//
+#
 // All three lanes have the SAME hardware-to-software latency profile:
 // QuadTimer compare match → NVIC → ISR → DWT capture as first instruction.
-//
+#
 // VCLOCK is the authoritative GNSS clock — it drives the bridge anchor
 // via alpha's vclock_callback.  Its subscribers receive boundary events
 // through the interrupt_subscribe / interrupt_start machinery.
-//
+#
 // Physical PPS GPIO — witness and dispatch authority:
-//
+#
 //   The physical PPS GPIO edge plays two narrow roles:
-//
+#
 //     1. WITNESS.  The GPIO ISR captures DWT as its first instruction,
 //        translates to GNSS ns via the bridge, stores a seqlock-
 //        protected pps_edge_snapshot_t.  Callers read the snapshot via
 //        interrupt_last_pps_edge().
-//
+#
 //     2. DISPATCH.  The GPIO ISR arms timepop_arm_asap to invoke a
 //        single registered dispatch callback (alpha's pps_edge_callback)
 //        in foreground context.  That callback publishes TIMEBASE_FRAGMENT.
-//
+#
 //   The physical edge does NOT drive the GNSS clock.  GNSS clock state
 //   is maintained by VCLOCK boundary events via alpha's vclock_callback,
 //   as before.
-//
+#
 // Per-interval instrumentation:
-//
+#
 //   Each integrator also maintains:
 //     • interval_min_ever / interval_max_ever — all-time extremes across
 //       the ring (updated in the ISR on every tick; catches rare
@@ -54,12 +54,12 @@
 //       window min/max/mean/stddev.  Called from fill_diag() at boundary
 //       emission (so the stats ride in TIMEBASE_FRAGMENT diag fields)
 //       and from add_integrator_report() for the REPORT command.
-//
+#
 //   Why: integ_diff and raw_diff both telescope to the same pair of
 //   endpoints, so neither can see the 999 intermediate ticks' jitter.
 //   The per-interval stats ARE NOT blind to that jitter — they reveal
 //   what the integrator's SMA has been smoothing all along.
-//
+#
 // See process_interrupt.h for the boundary event and snapshot contracts.
 // ============================================================================
 
@@ -102,36 +102,27 @@ static constexpr int OCXO2_PIN = 15;
 struct rolling_dwt_integrator_t {
   const char* name = nullptr;
 
-  // Immutable baseline (captured at the first tick).
   bool     baseline_valid = false;
   uint32_t baseline_dwt = 0;
 
-  // Per-tick running state.
   uint32_t prev_dwt = 0;
   uint64_t total_ticks_seen = 0;
   uint32_t last_interval_cycles = 0;
 
-  // Ring of per-interval DWT cycle deltas.
   uint32_t ring[ROLLING_WINDOW_SIZE] = {};
   uint32_t ring_head = 0;
   uint32_t ring_fill = 0;
   uint64_t ring_sum = 0;
 
-  // SMA rate cache, Q32.32 cycles per interval.
   uint64_t avg_cycles_per_interval_q32 = 0;
 
-  // Synthetic output.
   bool     synthetic_valid = false;
   uint32_t last_synthetic_dwt = 0;
   uint32_t boundary_emissions = 0;
 
-  // All-time per-interval min/max, updated in the ISR on every tick.
-  // Captures rare excursions that the rolling ring would slide past.
-  // Sentinel value UINT32_MAX in min means "no samples seen yet."
   uint32_t interval_min_ever = UINT32_MAX;
   uint32_t interval_max_ever = 0;
 
-  // Set true by tick() for the single tick that completed a boundary.
   bool boundary_emitted_this_tick = false;
 };
 
@@ -139,9 +130,6 @@ static rolling_dwt_integrator_t g_vclock_integrator;
 static rolling_dwt_integrator_t g_ocxo1_integrator;
 static rolling_dwt_integrator_t g_ocxo2_integrator;
 
-// Per-tick update.  Caller must have captured dwt_raw as the first
-// instruction of the ISR.  Sets boundary_emitted_this_tick = true on the
-// tick that completes a 1-second boundary.
 static void rolling_integrator_tick(rolling_dwt_integrator_t& r, uint32_t dwt_raw) {
   r.boundary_emitted_this_tick = false;
 
@@ -156,13 +144,11 @@ static void rolling_integrator_tick(rolling_dwt_integrator_t& r, uint32_t dwt_ra
     return;
   }
 
-  const uint32_t interval = dwt_raw - r.prev_dwt;  // natural uint32 wrap
+  const uint32_t interval = dwt_raw - r.prev_dwt;
   r.prev_dwt = dwt_raw;
   r.last_interval_cycles = interval;
   r.total_ticks_seen++;
 
-  // All-time min/max — cheap (two compares, rarely two stores).  Catches
-  // rare excursions even if the rolling ring slides past them.
   if (interval < r.interval_min_ever) r.interval_min_ever = interval;
   if (interval > r.interval_max_ever) r.interval_max_ever = interval;
 
@@ -179,15 +165,8 @@ static void rolling_integrator_tick(rolling_dwt_integrator_t& r, uint32_t dwt_ra
     r.avg_cycles_per_interval_q32 = (r.ring_sum << 32) / r.ring_fill;
   }
 
-  // Emit boundary every 1000 ticks, once the ring is fully primed.
   if ((r.total_ticks_seen % ROLLING_WINDOW_SIZE) == 0u &&
       r.ring_fill == ROLLING_WINDOW_SIZE) {
-
-    // synthetic_dwt[N] = baseline + total_ticks × avg_rate
-    //
-    // At a boundary tick, total_ticks is exactly N × WINDOW and ring_fill
-    // is exactly WINDOW, so cumulative_cycles = N × ring_sum (exact, no
-    // division truncation).
     const uint64_t boundary_number = r.total_ticks_seen / ROLLING_WINDOW_SIZE;
     const uint64_t cumulative_cycles = boundary_number * r.ring_sum;
 
@@ -207,40 +186,12 @@ uint64_t interrupt_vclock_cycles_per_second(void) {
   return integrator_cycles_per_second(g_vclock_integrator);
 }
 
-// Compute statistics over the integrator's ring of inter-tick intervals.
-// The ring contains the most recent ring_fill intervals (up to
-// ROLLING_WINDOW_SIZE = 1000).  Returns min, max, mean (sub-cycle), and
-// stddev (sub-cycle).
-//
-// Called from two places:
-//   - fill_diag() — at boundary emission, to embed per-tick stats in
-//                    the interrupt_capture_diag_t that propagates into
-//                    TIMEBASE_FRAGMENT.  Runs in ISR context, but only
-//                    at 1 Hz per lane; the FPU work (~1000 double ops)
-//                    is negligible overhead at that rate.
-//   - add_integrator_report() — for the REPORT command surface.
-//
-// Why this function exists:
-//   integ_diff (synthetic-boundary delta) and raw_diff (ISR-entry delta)
-//   both telescope to the same pair of endpoints (dwt_at_tick_0,
-//   dwt_at_tick_1000), so neither one can reveal what the 999
-//   intermediate ticks actually did.  They are blind to per-tick
-//   ISR-entry latency variance by algebraic identity.
-//
-//   This function ISN'T blind — it walks the individual inter-tick
-//   intervals directly.  If interval_stddev comes back at a handful of
-//   cycles, the ISR is essentially cycle-deterministic and the
-//   integrator's smoothing is genuinely inert.  If it comes back at
-//   tens or hundreds of cycles, there is real per-tick latency
-//   variance that the SMA has been averaging into the rate output all
-//   along, which endpoint-only cross-checks could never see.
-//
 static void compute_ring_interval_stats(const rolling_dwt_integrator_t& r,
                                         uint32_t& out_min,
                                         uint32_t& out_max,
                                         double&   out_mean,
                                         double&   out_stddev) {
-  const uint32_t fill = r.ring_fill;  // snapshot — ISR may update concurrently
+  const uint32_t fill = r.ring_fill;
   if (fill == 0) {
     out_min = 0;
     out_max = 0;
@@ -271,10 +222,6 @@ static void compute_ring_interval_stats(const rolling_dwt_integrator_t& r,
   out_mean = mean;
   out_stddev = (fill >= 2) ? sqrt(sq_sum / (double)(fill - 1)) : 0.0;
 }
-
-// ============================================================================
-// Subscriber runtime (VCLOCK + OCXO dispatch)
-// ============================================================================
 
 struct interrupt_subscriber_descriptor_t {
   interrupt_subscriber_kind_t kind = interrupt_subscriber_kind_t::NONE;
@@ -315,24 +262,12 @@ static interrupt_subscriber_runtime_t* g_rt_vclock = nullptr;
 static interrupt_subscriber_runtime_t* g_rt_ocxo1  = nullptr;
 static interrupt_subscriber_runtime_t* g_rt_ocxo2  = nullptr;
 
-// ============================================================================
-// VCLOCK lane hardware state (QTimer1 CH3)
-// ============================================================================
-
 struct vclock_lane_t {
   bool     initialized = false;
   bool     active = false;
   bool     phase_bootstrapped = false;
-
-  // Compare target (low-16 of QTimer1 CH3 counter).  Advances by
-  // VCLOCK_INTERVAL_COUNTS per tick.
   uint16_t compare_target = 0;
-
-  // Software-extended logical 32-bit count (advances by VCLOCK_COUNTS_PER_SECOND
-  // per boundary emission).  Authored counter32 for VCLOCK boundary events.
   uint32_t logical_count32_at_last_boundary = 0;
-
-  // Diagnostic counters.
   uint32_t irq_count = 0;
   uint32_t miss_count = 0;
   uint32_t bootstrap_count = 0;
@@ -341,24 +276,17 @@ struct vclock_lane_t {
 
 static vclock_lane_t g_vclock_lane;
 
-// ============================================================================
-// OCXO lane hardware state (QTimer3 CH2 / CH3)
-// ============================================================================
-
 struct ocxo_lane_t {
   const char* name = nullptr;
   IMXRT_TMR_t* module = nullptr;
   uint8_t      channel = 0;
   uint8_t      pcs = 0;
   int          input_pin = -1;
-
   bool     initialized = false;
   bool     active = false;
   bool     phase_bootstrapped = false;
-
   uint16_t compare_target = 0;
   uint32_t logical_count32_at_last_boundary = 0;
-
   uint32_t irq_count = 0;
   uint32_t miss_count = 0;
   uint32_t bootstrap_count = 0;
@@ -367,10 +295,6 @@ struct ocxo_lane_t {
 
 static ocxo_lane_t g_ocxo1_lane;
 static ocxo_lane_t g_ocxo2_lane;
-
-// ============================================================================
-// PPS GPIO witness state (populated in GPIO ISR)
-// ============================================================================
 
 struct pps_gpio_witness_t {
   uint32_t edge_count = 0;
@@ -382,10 +306,6 @@ static pps_gpio_witness_t g_pps_gpio_witness;
 
 static uint32_t g_gpio_irq_count = 0;
 static uint32_t g_gpio_miss_count = 0;
-
-// ============================================================================
-// PPS edge snapshot store — seqlock-protected
-// ============================================================================
 
 struct pps_edge_snapshot_store_t {
   volatile uint32_t seq             = 0;
@@ -401,10 +321,6 @@ static inline void dmb_barrier(void) {
   __asm__ volatile ("dmb" ::: "memory");
 }
 
-// ============================================================================
-// Low-level QuadTimer helpers
-// ============================================================================
-
 static uint32_t qtimer1_read_32_for_diag(void) {
   const uint16_t lo1 = IMXRT_TMR1.CH[0].CNTR;
   const uint16_t hi1 = IMXRT_TMR1.CH[1].HOLD;
@@ -418,7 +334,6 @@ uint32_t interrupt_qtimer1_counter32_now(void) { return qtimer1_read_32_for_diag
 uint16_t interrupt_qtimer3_ch2_counter_now(void) { return IMXRT_TMR3.CH[2].CNTR; }
 uint16_t interrupt_qtimer3_ch3_counter_now(void) { return IMXRT_TMR3.CH[3].CNTR; }
 
-// QTimer1 CH3 (VCLOCK lane).
 static inline void qtimer1_ch3_clear_compare_flag(void) {
   IMXRT_TMR1.CH[3].CSCTRL &= ~(TMR_CSCTRL_TCF1 | TMR_CSCTRL_TCF2);
 }
@@ -434,7 +349,6 @@ static inline void qtimer1_ch3_disable_compare(void) {
   qtimer1_ch3_clear_compare_flag();
 }
 
-// QTimer3 (OCXO lanes).
 static inline void qtimer3_clear_compare_flag(uint8_t ch) {
   IMXRT_TMR3.CH[ch].CSCTRL &= ~(TMR_CSCTRL_TCF1 | TMR_CSCTRL_TCF2);
 }
@@ -449,10 +363,6 @@ static inline void qtimer3_disable_compare(uint8_t ch) {
   IMXRT_TMR3.CH[ch].CSCTRL &= ~TMR_CSCTRL_TCF1EN;
   qtimer3_clear_compare_flag(ch);
 }
-
-// ============================================================================
-// Subscriber lookup
-// ============================================================================
 
 static interrupt_subscriber_runtime_t* runtime_for(interrupt_subscriber_kind_t kind) {
   for (uint32_t i = 0; i < g_subscriber_count; i++) {
@@ -487,10 +397,6 @@ static const char* dispatch_timer_name(interrupt_subscriber_kind_t kind) {
   }
 }
 
-// ============================================================================
-// Boundary event construction and deferred dispatch
-// ============================================================================
-
 static void fill_diag(interrupt_capture_diag_t& diag,
                       const interrupt_subscriber_runtime_t& rt,
                       const interrupt_event_t& event,
@@ -501,10 +407,10 @@ static void fill_diag(interrupt_capture_diag_t& diag,
   diag.lane = rt.desc->lane;
   diag.kind = rt.desc->kind;
 
-  diag.dwt_isr_entry_raw = dwt_isr_entry_raw;
+  diag.boundary_dwt_isr_entry_raw = dwt_isr_entry_raw;
   const int64_t isr_gnss_ns = time_dwt_to_gnss_ns(dwt_isr_entry_raw);
-  diag.dwt_isr_entry_gnss_ns = isr_gnss_ns;
-  diag.dwt_isr_entry_minus_event_ns =
+  diag.boundary_dwt_isr_entry_gnss_ns = isr_gnss_ns;
+  diag.boundary_dwt_isr_entry_minus_event_ns =
       (isr_gnss_ns >= 0 && event.gnss_ns_at_event != 0)
           ? (isr_gnss_ns - (int64_t)event.gnss_ns_at_event)
           : 0;
@@ -522,17 +428,10 @@ static void fill_diag(interrupt_capture_diag_t& diag,
   diag.integrator_last_interval_cycles = r.last_interval_cycles;
   diag.integrator_boundary_emissions = r.boundary_emissions;
 
-  // Per-interval distribution — the REAL per-tick jitter picture.
-  // Window stats describe the 1000 intervals that sum to this boundary's
-  // endpoint delta, so tick_stddev and endpoint delta are temporally
-  // aligned (they describe the same 1-second window).  Ever-min/max
-  // are cumulative since baseline and catch rare excursions the ring
-  // may have slid past.
   {
     uint32_t window_min = 0, window_max = 0;
     double   window_mean = 0.0, window_stddev = 0.0;
-    compute_ring_interval_stats(r, window_min, window_max,
-                                window_mean, window_stddev);
+    compute_ring_interval_stats(r, window_min, window_max, window_mean, window_stddev);
     diag.integrator_interval_window_min_cycles = window_min;
     diag.integrator_interval_window_max_cycles = window_max;
     diag.integrator_interval_window_mean_cycles = window_mean;
@@ -542,18 +441,14 @@ static void fill_diag(interrupt_capture_diag_t& diag,
     diag.integrator_interval_max_ever_cycles = r.interval_max_ever;
   }
 
-  // Witness fields populated on the VCLOCK subscriber's diag.  These
-  // reflect the most-recently-captured physical PPS edge as seen by
-  // the GPIO ISR.  Under the new doctrine, gnss_ns_at_isr is also
-  // refreshed by alpha's pps_edge_callback at fragment dispatch time
-  // from the authoritative pps_edge_snapshot_t; the copy here is
-  // advisory and may be stale by up to one PPS.  gpio_minus_synthetic_ns
-  // is vestigial (always zero).
   if (rt.desc->kind == interrupt_subscriber_kind_t::VCLOCK) {
-    diag.gpio_edge_count         = g_pps_gpio_witness.edge_count;
-    diag.gpio_last_dwt           = g_pps_gpio_witness.last_dwt;
-    diag.gnss_ns_at_isr          = g_pps_gpio_witness.last_gnss_ns;
-    diag.gpio_minus_synthetic_ns = 0;
+    diag.pps_edge_sequence = g_pps_gpio_witness.edge_count;
+    diag.pps_edge_dwt_isr_entry_raw = g_pps_gpio_witness.last_dwt;
+    diag.pps_edge_gnss_ns = g_pps_gpio_witness.last_gnss_ns;
+    diag.pps_edge_minus_event_ns =
+        (g_pps_gpio_witness.last_gnss_ns >= 0 && event.gnss_ns_at_event != 0)
+            ? (g_pps_gpio_witness.last_gnss_ns - (int64_t)event.gnss_ns_at_event)
+            : 0;
   }
 }
 
@@ -586,9 +481,6 @@ static void emit_boundary_event(interrupt_subscriber_runtime_t& rt,
   event.dwt_at_event = r->last_synthetic_dwt;
   event.counter32_at_event = authored_counter32;
 
-  // Translate synthetic DWT to GNSS ns via the bridge.  Bootstrap escape:
-  // if the bridge is invalid (only happens on the very first VCLOCK
-  // boundary), emit gnss_ns_at_event = 0; alpha will install the epoch.
   const int64_t gnss_ns = time_dwt_to_gnss_ns(r->last_synthetic_dwt);
   if (gnss_ns >= 0) {
     event.gnss_ns_at_event = (uint64_t)gnss_ns;
@@ -610,10 +502,6 @@ static void emit_boundary_event(interrupt_subscriber_runtime_t& rt,
   timepop_arm_asap(deferred_dispatch_callback, &rt, dispatch_timer_name(rt.desc->kind));
 }
 
-// ============================================================================
-// VCLOCK lane — QTimer1 CH3 compare, 1 kHz
-// ============================================================================
-
 static void vclock_lane_arm_bootstrap(void) {
   const uint16_t now16 = IMXRT_TMR1.CH[3].CNTR;
   g_vclock_lane.phase_bootstrapped = true;
@@ -628,8 +516,6 @@ static void vclock_lane_advance_compare(void) {
   qtimer1_ch3_program_compare(g_vclock_lane.compare_target);
 }
 
-// CH3 ISR — registered with TimePop.  Receives the first-instruction DWT
-// from TimePop's qtimer1_irq_isr.
 static void vclock_integrator_isr(uint32_t dwt_raw) {
   g_vclock_lane.irq_count++;
   if (g_rt_vclock) g_rt_vclock->irq_count++;
@@ -643,7 +529,7 @@ static void vclock_integrator_isr(uint32_t dwt_raw) {
 
   if (!g_vclock_lane.phase_bootstrapped) {
     vclock_lane_arm_bootstrap();
-    g_vclock_lane.miss_count++;  // first arm — not a real tick
+    g_vclock_lane.miss_count++;
     return;
   }
 
@@ -658,10 +544,6 @@ static void vclock_integrator_isr(uint32_t dwt_raw) {
                         g_vclock_lane.logical_count32_at_last_boundary);
   }
 }
-
-// ============================================================================
-// OCXO lanes — QTimer3 CH2 / CH3 compare, 1 kHz
-// ============================================================================
 
 static void ocxo_lane_arm_bootstrap(ocxo_lane_t& lane) {
   const uint16_t now16 = lane.module->CH[lane.channel].CNTR;
@@ -720,27 +602,10 @@ void process_interrupt_qtimer3_ch3_irq(uint32_t dwt_raw) {
 }
 
 static void qtimer3_isr(void) {
-  const uint32_t dwt_raw = ARM_DWT_CYCCNT;  // FIRST INSTRUCTION
+  const uint32_t dwt_raw = ARM_DWT_CYCCNT;
   if (IMXRT_TMR3.CH[2].CSCTRL & TMR_CSCTRL_TCF1) process_interrupt_qtimer3_ch2_irq(dwt_raw);
   if (IMXRT_TMR3.CH[3].CSCTRL & TMR_CSCTRL_TCF1) process_interrupt_qtimer3_ch3_irq(dwt_raw);
 }
-
-// ============================================================================
-// PPS GPIO — witness + dispatch trigger
-// ============================================================================
-//
-// On every physical PPS rising edge:
-//   1. DWT is captured as the first instruction of the ISR.
-//   2. Witness fields are updated (for diag / cmd_report compatibility).
-//   3. The bridge is asked to translate DWT → GNSS ns.  Returns -1 if
-//      the bridge is not yet valid.
-//   4. The seqlocked pps_edge_snapshot_store_t is updated.
-//   5. timepop_arm_asap defers the registered dispatch callback (alpha's
-//      pps_edge_callback) to foreground context.
-//
-// The GPIO ISR does no arithmetic on canonical clock state.  That is
-// VCLOCK's responsibility, driven by QTimer1 CH3.
-//
 
 static void pps_edge_dispatch_trampoline(timepop_ctx_t*, timepop_diag_t*, void*) {
   if (!g_pps_edge_dispatch) return;
@@ -756,7 +621,6 @@ void process_interrupt_gpio6789_irq(uint32_t dwt_isr_entry_raw) {
   const int64_t gnss_ns = time_dwt_to_gnss_ns(dwt_isr_entry_raw);
   g_pps_gpio_witness.last_gnss_ns = gnss_ns;
 
-  // Seqlock write: bump, write, bump.
   g_pps_edge_store.seq++;
   dmb_barrier();
   g_pps_edge_store.sequence        = g_pps_gpio_witness.edge_count;
@@ -765,20 +629,15 @@ void process_interrupt_gpio6789_irq(uint32_t dwt_isr_entry_raw) {
   dmb_barrier();
   g_pps_edge_store.seq++;
 
-  // Defer the fragment-publish dispatch to foreground context.
   if (g_pps_edge_dispatch) {
     timepop_arm_asap(pps_edge_dispatch_trampoline, nullptr, "PPS_EDGE_DISPATCH");
   }
 }
 
 static void pps_gpio_isr(void) {
-  const uint32_t dwt_raw = ARM_DWT_CYCCNT;  // FIRST INSTRUCTION
+  const uint32_t dwt_raw = ARM_DWT_CYCCNT;
   process_interrupt_gpio6789_irq(dwt_raw);
 }
-
-// ============================================================================
-// Public PPS edge API
-// ============================================================================
 
 void interrupt_pps_edge_register_dispatch(pps_edge_dispatch_fn fn) {
   g_pps_edge_dispatch = fn;
@@ -799,10 +658,6 @@ pps_edge_snapshot_t interrupt_last_pps_edge(void) {
   return out;
 }
 
-// ============================================================================
-// Subscribe / start / stop
-// ============================================================================
-
 bool interrupt_subscribe(const interrupt_subscription_t& sub) {
   if (!g_interrupt_runtime_ready) return false;
   if (sub.kind == interrupt_subscriber_kind_t::NONE || !sub.on_event) return false;
@@ -822,7 +677,6 @@ bool interrupt_start(interrupt_subscriber_kind_t kind) {
   if (kind == interrupt_subscriber_kind_t::VCLOCK) {
     g_vclock_lane.active = true;
     g_vclock_lane.phase_bootstrapped = false;
-    // Re-arm bootstrap on next ISR.
     qtimer1_ch3_program_compare((uint16_t)(IMXRT_TMR1.CH[3].CNTR + 1));
     return true;
   }
@@ -868,22 +722,9 @@ const interrupt_capture_diag_t* interrupt_last_diag(interrupt_subscriber_kind_t 
   return (!rt || !rt->has_fired) ? nullptr : &rt->last_diag;
 }
 
-// Prespin retired; symbol kept as a no-op for linker compatibility.
 void interrupt_prespin_service(timepop_ctx_t*, timepop_diag_t*, void*) {}
 
-// ============================================================================
-// Hardware init
-// ============================================================================
-
 static void qtimer1_ch3_init_vclock_integrator(void) {
-  // CH0/CH1 are TimePop's VCLOCK base counter (PCS=0).  CH2 is TimePop's
-  // dynamic compare scheduler (PCS=0).  CH3 is ours: a third independent
-  // counter on the same GNSS 10 MHz clock, for the VCLOCK integrator.
-  //
-  // CH3 counts the same source as CH0; its CNTR is independent and may
-  // have a small phase offset from CH0/CH2 due to enable order, but that
-  // doesn't matter for our purposes — we only care that CH3.COMP1 fires
-  // when CH3.CNTR matches it, which is a self-consistent local condition.
   IMXRT_TMR1.CH[3].CTRL   = 0;
   IMXRT_TMR1.CH[3].SCTRL  = 0;
   IMXRT_TMR1.CH[3].CSCTRL = 0;
@@ -891,14 +732,13 @@ static void qtimer1_ch3_init_vclock_integrator(void) {
   IMXRT_TMR1.CH[3].CNTR   = 0;
   IMXRT_TMR1.CH[3].COMP1  = 0xFFFF;
   IMXRT_TMR1.CH[3].CMPLD1 = 0xFFFF;
-  IMXRT_TMR1.CH[3].CTRL   = TMR_CTRL_CM(1) | TMR_CTRL_PCS(0);  // count GNSS 10 MHz
+  IMXRT_TMR1.CH[3].CTRL   = TMR_CTRL_CM(1) | TMR_CTRL_PCS(0);
   qtimer1_ch3_disable_compare();
 }
 
 void process_interrupt_init_hardware(void) {
   if (g_interrupt_hw_ready) return;
 
-  // OCXO1 / OCXO2 on QTimer3.
   g_ocxo1_lane.name = "OCXO1";
   g_ocxo1_lane.module = &IMXRT_TMR3;
   g_ocxo1_lane.channel = 2;
@@ -934,9 +774,6 @@ void process_interrupt_init_hardware(void) {
   g_ocxo1_lane.initialized = true;
   g_ocxo2_lane.initialized = true;
 
-  // VCLOCK on QTimer1 CH3.  QTimer1's clock gate and CH0/CH1/CH2 setup
-  // are owned by TimePop and have already happened by the time we run
-  // (process_interrupt_init_hardware is called after timepop_init).
   qtimer1_ch3_init_vclock_integrator();
   g_vclock_lane.initialized = true;
 
@@ -979,27 +816,18 @@ void process_interrupt_init(void) {
 void process_interrupt_enable_irqs(void) {
   if (g_interrupt_irqs_enabled) return;
 
-  // QTimer3 (OCXO lanes) — process_interrupt owns this vector.
   attachInterruptVector(IRQ_QTIMER3, qtimer3_isr);
   NVIC_SET_PRIORITY(IRQ_QTIMER3, 16);
   NVIC_ENABLE_IRQ(IRQ_QTIMER3);
 
-  // PPS GPIO — witness and fragment dispatch authority.
   pinMode(GNSS_PPS_PIN, INPUT);
   attachInterrupt(digitalPinToInterrupt(GNSS_PPS_PIN), pps_gpio_isr, RISING);
   NVIC_SET_PRIORITY(IRQ_GPIO6789, 0);
 
-  // VCLOCK integrator — register CH3 ISR with TimePop.  TimePop's
-  // qtimer1_irq_isr captures DWT first thing and dispatches here when
-  // CH3's flag is set.  No vector ownership; just hosted dispatch.
   timepop_register_qtimer1_ch3_isr(vclock_integrator_isr);
 
   g_interrupt_irqs_enabled = true;
 }
-
-// ============================================================================
-// Command surface
-// ============================================================================
 
 static void add_integrator_report(Payload& p, const char* prefix,
                                   const rolling_dwt_integrator_t& r) {
@@ -1019,12 +847,6 @@ static void add_integrator_report(Payload& p, const char* prefix,
   p.add(keyf("synthetic_valid"), r.synthetic_valid);
   p.add(keyf("last_synthetic_dwt"), r.last_synthetic_dwt);
 
-  // Per-interval distribution statistics — answers the question
-  // endpoint-only cross-checks cannot: is each individual tick's ISR
-  // arrival cycle-deterministic, or is the ring averaging away real
-  // jitter?  Window stats are over the most recent 1000 intervals
-  // (i.e. the last ~1 second); ever-min/max are cumulative since
-  // baseline and catch rare excursions the ring may have slid past.
   uint32_t window_min, window_max;
   double   window_mean, window_stddev;
   compute_ring_interval_stats(r, window_min, window_max, window_mean, window_stddev);
@@ -1051,12 +873,12 @@ static Payload cmd_report(const Payload&) {
   p.add("gpio_miss_count", g_gpio_miss_count);
   p.add("gpio_edge_count", g_pps_gpio_witness.edge_count);
   p.add("gpio_last_dwt", g_pps_gpio_witness.last_dwt);
-  p.add("gnss_ns_at_isr", g_pps_gpio_witness.last_gnss_ns);
+  p.add("pps_edge_gnss_ns", g_pps_gpio_witness.last_gnss_ns);
 
   const pps_edge_snapshot_t snap = interrupt_last_pps_edge();
   p.add("pps_edge_sequence", snap.sequence);
   p.add("pps_edge_dwt", snap.dwt_at_edge);
-  p.add("pps_edge_gnss_ns", snap.gnss_ns_at_edge);
+  p.add("pps_edge_gnss_ns_snapshot", snap.gnss_ns_at_edge);
   p.add("pps_edge_dispatch_registered", g_pps_edge_dispatch != nullptr);
 
   add_integrator_report(p, "vclock", g_vclock_integrator);
@@ -1101,10 +923,6 @@ static const process_vtable_t INTERRUPT_PROCESS = {
 void process_interrupt_register(void) {
   process_register("INTERRUPT", &INTERRUPT_PROCESS);
 }
-
-// ============================================================================
-// Label helpers
-// ============================================================================
 
 const char* interrupt_subscriber_kind_str(interrupt_subscriber_kind_t kind) {
   switch (kind) {

@@ -1,34 +1,36 @@
 """
-ZPNet Raw Witness — PPS Lateness Relative to VCLOCK.
+ZPNet Raw Witness — PPS Witness Relative to VCLOCK.
 
 Under ZPNet's current doctrine, VCLOCK owns the canonical GNSS clock
 and emits a synthetic 1-second boundary by pure arithmetic.  The
 physical PPS GPIO edge is demoted to two narrow roles: a diagnostic
 witness, and the trigger for TIMEBASE_FRAGMENT publication.
 
-This tool answers one question:
+This tool answers the closure question:
 
-    How long after the VCLOCK synthetic 1-second boundary does the
-    physical PPS ISR actually fire?
+    Where did the physical PPS edge land relative to the current
+    VCLOCK-authored GNSS second boundary?
 
-For every TIMEBASE_FRAGMENT, it computes:
+For every TIMEBASE / TIMEBASE_FRAGMENT, it reports both:
 
-    delta_ns = pps_diag_dwt_isr_entry_gnss_ns - gnss_ns
+    pps_edge_delta_ns   = pps_diag_pps_edge_gnss_ns - gnss_ns
+    boundary_delta_ns   = pps_diag_boundary_dwt_isr_entry_gnss_ns - pps_diag_gnss_ns_at_event
 
-  • gnss_ns                         — VCLOCK's synthetic 1-second boundary,
-                                       expressed in GNSS nanoseconds (always
-                                       an integer multiple of 1e9 by
-                                       construction)
+Where:
 
-  • pps_diag_dwt_isr_entry_gnss_ns  — the GNSS nanosecond at which the PPS
-                                       ISR was invoked, inferred from the
-                                       ARM_DWT_CYCCNT captured as the first
-                                       instruction of the ISR, translated
-                                       through the DWT↔GNSS bridge
+  • gnss_ns                               — VCLOCK's canonical synthetic
+                                            1-second boundary in GNSS ns
+  • pps_diag_pps_edge_sequence            — PPS witness sequence captured
+                                            in the GPIO ISR snapshot path
+  • pps_diag_pps_edge_gnss_ns             — GNSS ns of the physical PPS edge
+                                            as translated through the bridge
+  • pps_diag_pps_edge_minus_event_ns      — firmware's own PPS-edge delta
+                                            against current fragment gnss_ns
+  • pps_diag_boundary_dwt_isr_entry_*     — boundary-emitter ISR facts
+                                            (VCLOCK-side, not PPS-side)
 
-A positive delta means the PPS ISR fired AFTER the VCLOCK boundary.
-Over time, the mean of delta is the static phase offset between the
-two clocks; the stddev is the run-to-run jitter of the PPS arrival.
+A positive pps_edge_delta means the PPS edge landed AFTER the VCLOCK boundary.
+A negative value means the PPS edge landed BEFORE it.
 
 Usage:
     python -m zpnet.tests.raw_witness <campaign_name> [limit]
@@ -136,6 +138,18 @@ def _as_int(v: Any) -> Optional[int]:
         return None
 
 
+def _fmt_i(v: Optional[int]) -> str:
+    if v is None:
+        return "---"
+    return f"{v:,d}"
+
+
+def _fmt_f(v: Optional[float], decimals: int = 3) -> str:
+    if v is None:
+        return "---"
+    return f"{v:,.{decimals}f}"
+
+
 # ---------------------------------------------------------------------
 # Main analysis
 # ---------------------------------------------------------------------
@@ -150,38 +164,46 @@ def analyze(campaign: str, limit: int = 0) -> None:
     print()
     print("For each PPS boundary:")
     print()
-    print("  delta_ns = pps_diag_dwt_isr_entry_gnss_ns − gnss_ns")
+    print("  pps_edge_delta_ns = pps_diag_pps_edge_gnss_ns - gnss_ns")
     print()
-    print("How long after the VCLOCK synthetic 1-second boundary the PPS ISR")
-    print("was invoked, measured in the GNSS nanosecond timeline.")
+    print("Where gnss_ns is the current VCLOCK-authored synthetic boundary and")
+    print("pps_diag_pps_edge_gnss_ns is the physical PPS witness translated into")
+    print("the GNSS nanosecond timeline.")
     print()
-    print("A positive delta means the PPS ISR fired AFTER the VCLOCK boundary.")
+    print("We also show the VCLOCK boundary-emitter ISR rail for contrast:")
+    print()
+    print("  boundary_delta_ns =")
+    print("      pps_diag_boundary_dwt_isr_entry_gnss_ns - pps_diag_gnss_ns_at_event")
     print()
 
-    # Column headers.
     header = (
         f"{'pps':>6s}  "
-        f"{'gnss_ns':>22s}  "
-        f"{'isr_entry_gnss_ns':>22s}  "
-        f"{'delta_ns':>12s}  "
-        f"{'delta_µs':>12s}"
+        f"{'seq':>6s}  "
+        f"{'gnss_ns':>16s}  "
+        f"{'pps_edge_gnss_ns':>18s}  "
+        f"{'pps_edge_delta_ns':>18s}  "
+        f"{'fw_edge_delta':>14s}  "
+        f"{'boundary_delta_ns':>18s}"
     )
     sep = (
         f"{'─'*6}  "
-        f"{'─'*22}  "
-        f"{'─'*22}  "
-        f"{'─'*12}  "
-        f"{'─'*12}"
+        f"{'─'*6}  "
+        f"{'─'*16}  "
+        f"{'─'*18}  "
+        f"{'─'*18}  "
+        f"{'─'*14}  "
+        f"{'─'*18}"
     )
     print(header)
     print(sep)
 
-    w_delta = Welford()
-    w_firmware_delta = Welford()  # for cross-check
+    w_edge_delta = Welford()
+    w_boundary_delta = Welford()
 
     shown = 0
-    missing = 0
-    firmware_mismatches = 0
+    missing_edge = 0
+    missing_boundary = 0
+    edge_fw_mismatches = 0
 
     for rec in rows:
         root = _root(rec)
@@ -193,31 +215,40 @@ def analyze(campaign: str, limit: int = 0) -> None:
         if pps is None:
             continue
 
+        seq = _as_int(frag.get("pps_diag_pps_edge_sequence"))
         gnss_ns = _as_int(frag.get("gnss_ns"))
-        isr_entry_gnss_ns = _as_int(frag.get("pps_diag_dwt_isr_entry_gnss_ns"))
-        firmware_delta = _as_int(frag.get("pps_diag_dwt_isr_entry_minus_event_ns"))
+        pps_edge_gnss_ns = _as_int(frag.get("pps_diag_pps_edge_gnss_ns"))
+        fw_edge_delta = _as_int(frag.get("pps_diag_pps_edge_minus_event_ns"))
 
-        if gnss_ns is None or isr_entry_gnss_ns is None:
-            missing += 1
-            continue
+        boundary_gnss_ns = _as_int(frag.get("pps_diag_boundary_dwt_isr_entry_gnss_ns"))
+        boundary_event_gnss_ns = _as_int(frag.get("pps_diag_gnss_ns_at_event"))
+        fw_boundary_delta = _as_int(frag.get("pps_diag_boundary_dwt_isr_entry_minus_event_ns"))
 
-        delta_ns = isr_entry_gnss_ns - gnss_ns
-        delta_us = delta_ns / 1000.0
+        edge_delta_ns: Optional[int] = None
+        boundary_delta_ns: Optional[int] = None
 
-        # Cross-check against the firmware's own computation (if present).
-        if firmware_delta is not None:
-            w_firmware_delta.update(float(firmware_delta))
-            if firmware_delta != delta_ns:
-                firmware_mismatches += 1
+        if gnss_ns is not None and pps_edge_gnss_ns is not None:
+            edge_delta_ns = pps_edge_gnss_ns - gnss_ns
+            w_edge_delta.update(float(edge_delta_ns))
+            if fw_edge_delta is not None and fw_edge_delta != edge_delta_ns:
+                edge_fw_mismatches += 1
+        else:
+            missing_edge += 1
 
-        w_delta.update(float(delta_ns))
+        if boundary_gnss_ns is not None and boundary_event_gnss_ns is not None:
+            boundary_delta_ns = boundary_gnss_ns - boundary_event_gnss_ns
+            w_boundary_delta.update(float(boundary_delta_ns))
+        else:
+            missing_boundary += 1
 
         print(
             f"{pps:>6d}  "
-            f"{gnss_ns:>22,d}  "
-            f"{isr_entry_gnss_ns:>22,d}  "
-            f"{delta_ns:>+12,d}  "
-            f"{delta_us:>+12,.3f}"
+            f"{_fmt_i(seq):>6s}  "
+            f"{_fmt_i(gnss_ns):>16s}  "
+            f"{_fmt_i(pps_edge_gnss_ns):>18s}  "
+            f"{_fmt_i(edge_delta_ns):>18s}  "
+            f"{_fmt_i(fw_edge_delta):>14s}  "
+            f"{_fmt_i(boundary_delta_ns):>18s}"
         )
 
         shown += 1
@@ -225,93 +256,79 @@ def analyze(campaign: str, limit: int = 0) -> None:
             break
 
     print()
-    print(f"Rows shown: {shown:,}")
-    print(f"Missing:    {missing:,}  (rows where either field was absent)")
+    print(f"Rows shown:                 {shown:,}")
+    print(f"Missing PPS-edge rows:      {missing_edge:,}")
+    print(f"Missing boundary rows:      {missing_boundary:,}")
     print()
 
-    if w_delta.n < 2:
-        print("(insufficient data for summary)")
-        return
-
-    # -----------------------------------------------------------------
-    # Summary
-    # -----------------------------------------------------------------
     print("═" * 78)
-    print("Delta summary — PPS ISR entry minus VCLOCK synthetic boundary")
+    print("PPS-edge summary — physical PPS witness minus VCLOCK boundary")
     print("═" * 78)
     print()
-    print(f"  n       = {w_delta.n:,}")
-    print(f"  mean    = {w_delta.mean:+,.3f} ns   ({w_delta.mean/1000.0:+,.3f} µs)")
-    print(f"  stddev  = {w_delta.stddev:,.3f} ns   ({w_delta.stddev/1000.0:,.3f} µs)")
-    print(f"  stderr  = {w_delta.stderr:,.3f} ns")
-    print(f"  min     = {w_delta.min_val:+,.0f} ns   ({w_delta.min_val/1000.0:+,.3f} µs)")
-    print(f"  max     = {w_delta.max_val:+,.0f} ns   ({w_delta.max_val/1000.0:+,.3f} µs)")
-    print(f"  range   = {w_delta.max_val - w_delta.min_val:,.0f} ns")
+    if w_edge_delta.n >= 1:
+        print(f"  n       = {w_edge_delta.n:,}")
+        print(f"  mean    = {w_edge_delta.mean:+,.3f} ns   ({w_edge_delta.mean/1000.0:+,.3f} µs)")
+        print(f"  stddev  = {w_edge_delta.stddev:,.3f} ns   ({w_edge_delta.stddev/1000.0:,.3f} µs)")
+        print(f"  stderr  = {w_edge_delta.stderr:,.3f} ns")
+        print(f"  min     = {w_edge_delta.min_val:+,.0f} ns   ({w_edge_delta.min_val/1000.0:+,.3f} µs)")
+        print(f"  max     = {w_edge_delta.max_val:+,.0f} ns   ({w_edge_delta.max_val/1000.0:+,.3f} µs)")
+        print(f"  range   = {w_edge_delta.max_val - w_edge_delta.min_val:,.0f} ns")
+    else:
+        print("  (no PPS-edge rows)")
     print()
 
-    # -----------------------------------------------------------------
-    # Firmware cross-check
-    # -----------------------------------------------------------------
-    if w_firmware_delta.n > 0:
-        print("═" * 78)
-        print("Firmware cross-check")
-        print("═" * 78)
-        print()
-        print("The firmware publishes its own computation of the same delta as")
-        print("pps_diag_dwt_isr_entry_minus_event_ns.  This should match our")
-        print("computed delta_ns exactly for every row.")
-        print()
-        print(f"  Rows with firmware_delta present: {w_firmware_delta.n:,}")
-        print(f"  Rows where firmware ≠ computed:   {firmware_mismatches:,}")
-        if firmware_mismatches == 0:
-            print(f"  ✓ Bit-exact agreement.")
-        else:
-            print(f"  ⚠ {firmware_mismatches:,} divergent rows — investigate.")
-        print()
+    print("═" * 78)
+    print("Boundary summary — boundary ISR entry minus boundary event")
+    print("═" * 78)
+    print()
+    if w_boundary_delta.n >= 1:
+        print(f"  n       = {w_boundary_delta.n:,}")
+        print(f"  mean    = {w_boundary_delta.mean:+,.3f} ns   ({w_boundary_delta.mean/1000.0:+,.3f} µs)")
+        print(f"  stddev  = {w_boundary_delta.stddev:,.3f} ns   ({w_boundary_delta.stddev/1000.0:,.3f} µs)")
+        print(f"  stderr  = {w_boundary_delta.stderr:,.3f} ns")
+        print(f"  min     = {w_boundary_delta.min_val:+,.0f} ns   ({w_boundary_delta.min_val/1000.0:+,.3f} µs)")
+        print(f"  max     = {w_boundary_delta.max_val:+,.0f} ns   ({w_boundary_delta.max_val/1000.0:+,.3f} µs)")
+        print(f"  range   = {w_boundary_delta.max_val - w_boundary_delta.min_val:,.0f} ns")
+    else:
+        print("  (no boundary rows)")
+    print()
 
-    # -----------------------------------------------------------------
-    # Interpretation
-    # -----------------------------------------------------------------
+    print("═" * 78)
+    print("Firmware cross-check")
+    print("═" * 78)
+    print()
+    print("The firmware publishes the PPS-edge delta as")
+    print("pps_diag_pps_edge_minus_event_ns.  This should match our")
+    print("computed pps_edge_delta_ns exactly for every row where both are present.")
+    print()
+    present_fw = sum(
+        1 for rec in rows[:shown]
+        if _as_int(_frag(rec).get("pps_diag_pps_edge_minus_event_ns")) is not None
+    )
+    print(f"  Rows with firmware edge delta present: {present_fw:,}")
+    print(f"  Rows where firmware ≠ computed:        {edge_fw_mismatches:,}")
+    if present_fw > 0 and edge_fw_mismatches == 0:
+        print("  ✓ Bit-exact agreement.")
+    elif edge_fw_mismatches > 0:
+        print(f"  ⚠ {edge_fw_mismatches:,} divergent rows — investigate.")
+    print()
+
     print("═" * 78)
     print("Interpretation")
     print("═" * 78)
     print()
-
-    mean_ns = w_delta.mean
-    stddev_ns = w_delta.stddev
-    range_ns = w_delta.max_val - w_delta.min_val
-
-    print(f"  mean ({mean_ns:+,.0f} ns):")
-    print(f"    The static phase offset between VCLOCK's synthetic boundary")
-    print(f"    and the physical PPS arrival.  Components:")
-    print(f"      • Phase set when the VCLOCK CH3 lane was bootstrapped")
-    print(f"      • Fixed propagation delay in the GF-8802's PPS output path")
-    print(f"      • Fixed GPIO ISR entry latency (NVIC + ISR preamble)")
+    print("  pps_edge_delta_ns:")
+    print("    This is the rail to trust for physical PPS closure work.")
+    print("    It compares the physical PPS witness against the current")
+    print("    VCLOCK-authored second boundary.")
     print()
-
-    print(f"  stddev ({stddev_ns:,.1f} ns):")
-    print(f"    Run-to-run jitter of the PPS arrival.  This is the direct")
-    print(f"    measurement of PPS edge quality in our pipeline:")
-    if stddev_ns < 100:
-        verdict = "EXCELLENT — GPIO edge is tightly disciplined"
-    elif stddev_ns < 500:
-        verdict = "NORMAL — typical for consumer GNSS PPS output"
-    elif stddev_ns < 1000:
-        verdict = "ELEVATED — significant per-edge jitter in PPS output"
-    else:
-        verdict = "POOR — investigate USB/IRQ contention or scheduling"
-    print(f"    → {verdict}")
+    print("  boundary_delta_ns:")
+    print("    This is NOT PPS latency.  It is the boundary-emitter ISR-entry")
+    print("    lateness for the VCLOCK lane itself, kept here as a sanity rail.")
     print()
-
-    print(f"  range ({range_ns:,.0f} ns):")
-    ratio_6sigma = range_ns / (6 * stddev_ns) if stddev_ns > 0 else float("inf")
-    print(f"    Worst-case excursion.  range / 6σ = {ratio_6sigma:.2f}")
-    if ratio_6sigma < 1.2:
-        print(f"    → Distribution is approximately Gaussian.")
-    elif ratio_6sigma < 2.5:
-        print(f"    → Mildly heavy-tailed — a handful of outlier edges.")
-    else:
-        print(f"    → Heavy-tailed — a few pathological edges dominate the range.")
+    print("  pps_diag_pps_edge_sequence:")
+    print("    Track this alongside pps_count.  If sequence is stale, resets,")
+    print("    or drifts unexpectedly, the witness path itself may be stale.")
     print()
 
 

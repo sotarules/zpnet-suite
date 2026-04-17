@@ -13,6 +13,12 @@
 //   - TIMEBASE_FRAGMENT publication trimmed of retired fields, augmented
 //     with integrator and witness diagnostics.
 //
+// Post PPS/VCLOCK provenance cleanup:
+//   - boundary-emitter ISR-entry fields are now published under
+//     boundary_* names so they stop impersonating PPS.
+//   - PPS witness publication now uses pps_edge_* fields sourced from
+//     alpha's pps_edge_callback and ultimately from the GPIO ISR snapshot.
+//
 // Everything else (campaign lifecycle, servo, Welford, DAC pacing,
 // watchdog, command surface) is unchanged.
 // ============================================================================
@@ -186,10 +192,10 @@ static void clocks_payload_add_ocxo_diag(Payload& p,
   add_u64("gnss_ns_at_event", diag.gnss_ns_at_event);
   add_u32("counter32_at_event", diag.counter32_at_event);
 
-  // Raw ISR-entry facts (diagnostic only).
-  add_u32("dwt_isr_entry_raw", diag.dwt_isr_entry_raw);
-  add_i64("dwt_isr_entry_gnss_ns", diag.dwt_isr_entry_gnss_ns);
-  add_i64("dwt_isr_entry_minus_event_ns", diag.dwt_isr_entry_minus_event_ns);
+  // Boundary-emitter ISR-entry facts (diagnostic only).
+  add_u32("boundary_dwt_isr_entry_raw", diag.boundary_dwt_isr_entry_raw);
+  add_i64("boundary_dwt_isr_entry_gnss_ns", diag.boundary_dwt_isr_entry_gnss_ns);
+  add_i64("boundary_dwt_isr_entry_minus_event_ns", diag.boundary_dwt_isr_entry_minus_event_ns);
 
   // Rolling integrator state (the new heart of the system).
   add_bool("integrator_baseline_valid", diag.integrator_baseline_valid);
@@ -225,8 +231,9 @@ static void clocks_payload_add_ocxo_diag(Payload& p,
 static void clocks_payload_add_pps_diag(Payload& p,
                                         const char* prefix,
                                         const interrupt_capture_diag_t& diag) {
-  // Same baseline fields as the OCXO publisher, plus the GPIO witness fields
-  // which are populated only on the PPS subscriber's diag.
+  // Same baseline fields as the OCXO publisher, plus the PPS witness fields
+  // refreshed from the authoritative GPIO ISR snapshot immediately before
+  // fragment publication.
   clocks_payload_add_ocxo_diag(p, prefix, diag);
 
   char key[96];
@@ -239,10 +246,10 @@ static void clocks_payload_add_pps_diag(Payload& p,
     p.add(key, value);
   };
 
-  add_u32("gpio_edge_count", diag.gpio_edge_count);
-  add_u32("gpio_last_dwt", diag.gpio_last_dwt);
-  add_i64("gnss_ns_at_isr", diag.gnss_ns_at_isr);
-  add_i64("gpio_minus_synthetic_ns", diag.gpio_minus_synthetic_ns);
+  add_u32("pps_edge_sequence", diag.pps_edge_sequence);
+  add_u32("pps_edge_dwt_isr_entry_raw", diag.pps_edge_dwt_isr_entry_raw);
+  add_i64("pps_edge_gnss_ns", diag.pps_edge_gnss_ns);
+  add_i64("pps_edge_minus_event_ns", diag.pps_edge_minus_event_ns);
 }
 
 // ============================================================================
