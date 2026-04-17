@@ -404,10 +404,10 @@ static void pps_callback(
   // This is the measurement we could never trust before; now we capture
   // its true jitter.
   if (g_pps_interrupt_diag.gpio_edge_count > 0 &&
-      g_pps_interrupt_diag.gpio_last_gnss_ns > 0) {
+      g_pps_interrupt_diag.gnss_ns_at_isr > 0) {
     residual_update_sample(residual_vclock,
                            g_pps_interrupt_diag.gpio_minus_synthetic_ns);
-  }
+      }
 
   // ── OCXO ns projection to PPS boundary via phase ledger ──
   if (g_ocxo1_clock.zero_established) {

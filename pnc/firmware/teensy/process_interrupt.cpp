@@ -567,7 +567,7 @@ static void fill_diag(interrupt_capture_diag_t& diag,
   if (rt.desc->kind == interrupt_subscriber_kind_t::PPS) {
     diag.gpio_edge_count = g_pps_gpio_witness.edge_count;
     diag.gpio_last_dwt = g_pps_gpio_witness.last_dwt;
-    diag.gpio_last_gnss_ns = g_pps_gpio_witness.last_gnss_ns;
+    diag.gnss_ns_at_isr = g_pps_gpio_witness.last_gnss_ns;
     diag.gpio_minus_synthetic_ns = g_pps_gpio_witness.last_minus_synthetic_ns;
   }
 }

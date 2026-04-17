@@ -163,9 +163,14 @@ struct interrupt_capture_diag_t {
   uint32_t integrator_interval_max_ever_cycles = 0;
 
   // PPS GPIO witness (populated on the PPS subscriber's diag only).
+  // gnss_ns_at_isr is the GNSS ns timestamp of the physical PPS edge,
+  // computed by translating the DWT captured as the first instruction
+  // of pps_gpio_isr via the DWT↔GNSS bridge.  Consecutive values
+  // differ by ~1e9 ns; their jitter is the second-to-second jitter
+  // of the physical PPS edge in GNSS time.
   uint32_t gpio_edge_count = 0;
   uint32_t gpio_last_dwt = 0;
-  int64_t  gpio_last_gnss_ns = 0;
+  int64_t  gnss_ns_at_isr = 0;
   int64_t  gpio_minus_synthetic_ns = 0;
 
   uint32_t anomaly_count = 0;

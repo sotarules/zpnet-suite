@@ -241,7 +241,7 @@ static void clocks_payload_add_pps_diag(Payload& p,
 
   add_u32("gpio_edge_count", diag.gpio_edge_count);
   add_u32("gpio_last_dwt", diag.gpio_last_dwt);
-  add_i64("gpio_last_gnss_ns", diag.gpio_last_gnss_ns);
+  add_i64("gnss_ns_at_isr", diag.gnss_ns_at_isr);
   add_i64("gpio_minus_synthetic_ns", diag.gpio_minus_synthetic_ns);
 }
 
