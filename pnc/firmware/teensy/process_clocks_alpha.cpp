@@ -29,6 +29,22 @@
 //   The PPS witness fields are refreshed coherently in pps_edge_callback()
 //   from the authoritative pps_edge_snapshot_t.
 //
+// Bridge-independent phase diagnostics:
+//
+//   pps_edge_callback also stashes three fields that describe the phase
+//   relationship between the physical PPS edge and the most recent
+//   VCLOCK one-second event, WITHOUT going through the DWT↔GNSS bridge:
+//
+//     pps_edge_dwt_cycles_from_vclock — raw DWT subtraction
+//     pps_edge_ns_from_vclock         — same, in nanoseconds
+//     pps_edge_vclock_event_count     — vclock_callback entry count at
+//                                        pps_edge_callback read time
+//
+//   These fields are pure ISR-captured facts and arithmetic.  They
+//   survive even if the bridge anchor is mis-authored, and they reveal
+//   the boot-determined phase offset between the VCLOCK cadence and
+//   the physical PPS cadence.
+//
 // ============================================================================
 
 #include "process_clocks_internal.h"
@@ -115,6 +131,18 @@ static volatile uint64_t g_epoch_pps_index = 0;
 // One-second subtraction state for VCLOCK DWT cycles-between-events.
 // Seeded at epoch install; updated each VCLOCK one-second event.
 static volatile uint32_t g_prev_dwt_at_vclock_event = 0;
+
+// VCLOCK entry counter — increments on every vclock_callback invocation,
+// including the epoch-install invocation.  Read by pps_edge_callback to
+// cross-check that no VCLOCK event slipped in between the GPIO ISR and
+// the foreground pps_edge_callback.
+//
+// Deliberately NOT reset across epoch resets.  This is a pure diagnostic
+// counting vclock_callback entries since boot; preserving it across epoch
+// resets makes warmup behavior visible (e.g. "campaign started at entry
+// 47" shows 47 VCLOCK events happened during pre-STARTED warmup).  The
+// Pi-side race check still works: per-fragment delta should be exactly 1.
+static volatile uint32_t g_vclock_event_count = 0;
 
 // ============================================================================
 // OCXO DAC defaults
@@ -345,6 +373,11 @@ static void vclock_callback(
     const interrupt_capture_diag_t* diag,
     void*) {
 
+  // Increment the VCLOCK entry counter at the very top, before any branch.
+  // This counts every vclock_callback invocation, including the epoch-
+  // install invocation.  Writing a volatile uint32_t is atomic on Cortex-M7.
+  g_vclock_event_count++;
+
   if (diag) g_pps_interrupt_diag = *diag;
   else      g_pps_interrupt_diag = {};
 
@@ -436,6 +469,7 @@ static void vclock_callback(
 // ============================================================================
 
 static void pps_edge_callback(const pps_edge_snapshot_t& snap) {
+  // Stash the authoritative witness fields from the snapshot.
   g_pps_interrupt_diag.pps_edge_sequence = snap.sequence;
   g_pps_interrupt_diag.pps_edge_dwt_isr_entry_raw = snap.dwt_at_edge;
   g_pps_interrupt_diag.pps_edge_gnss_ns = snap.gnss_ns_at_edge;
@@ -443,6 +477,38 @@ static void pps_edge_callback(const pps_edge_snapshot_t& snap) {
       (snap.gnss_ns_at_edge >= 0)
           ? (snap.gnss_ns_at_edge - (int64_t)g_gnss_ns_count_at_pps)
           : 0;
+
+  // ── Bridge-independent VCLOCK-to-edge phase diagnostics ──
+  //
+  // Sample the two pieces of VCLOCK-authored state into local variables
+  // before computing derived values, so the three published fields are
+  // consistent with each other.  vclock_callback is an ISR (priority 16)
+  // and may preempt this foreground callback — a mid-read interleave
+  // would produce a self-labeling anomaly (count jumps by +1, dwt delta
+  // drops to near zero) rather than silent corruption.
+  const uint32_t vclock_count_local = g_vclock_event_count;
+  const uint32_t prev_dwt_local     = g_prev_dwt_at_vclock_event;
+  const uint32_t dwt_per_sec_local  = dwt_effective_cycles_per_second();
+
+  // Raw DWT delta: how far past the most recent VCLOCK one-second event
+  // did the physical PPS edge fire?  Pure uint32_t subtraction; wraps
+  // correctly across DWT_CYCCNT rollover.
+  const uint32_t dwt_cycles_from_vclock =
+      snap.dwt_at_edge - prev_dwt_local;
+
+  // Same in nanoseconds, using the same divisor the bridge uses.
+  // Guard against division by zero during boot / before first real delta.
+  int64_t ns_from_vclock = 0;
+  if (dwt_per_sec_local > 0) {
+    ns_from_vclock =
+        (int64_t)(((uint64_t)dwt_cycles_from_vclock * NS_PER_SECOND_U64
+                   + (uint64_t)dwt_per_sec_local / 2)
+                  / (uint64_t)dwt_per_sec_local);
+  }
+
+  g_pps_interrupt_diag.pps_edge_dwt_cycles_from_vclock = dwt_cycles_from_vclock;
+  g_pps_interrupt_diag.pps_edge_ns_from_vclock = ns_from_vclock;
+  g_pps_interrupt_diag.pps_edge_vclock_event_count = vclock_count_local;
 
   if (campaign_state == clocks_campaign_state_t::STARTED ||
       request_start || request_stop || request_recover || request_zero) {

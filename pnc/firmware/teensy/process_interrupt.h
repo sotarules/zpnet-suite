@@ -174,6 +174,35 @@ struct interrupt_capture_diag_t {
   int64_t  pps_edge_gnss_ns = -1;
   int64_t  pps_edge_minus_event_ns = 0;
 
+  // ── Bridge-independent VCLOCK-to-edge phase diagnostics ──
+  //
+  // These three fields expose the phase relationship between the physical
+  // PPS edge and the most recent VCLOCK one-second event, WITHOUT going
+  // through the DWT↔GNSS bridge.  They are pure ISR-captured facts and
+  // arithmetic, and reveal the boot-determined phase offset between the
+  // VCLOCK cadence and the physical PPS cadence.
+  //
+  //   pps_edge_dwt_cycles_from_vclock
+  //     = snap.dwt_at_edge − g_prev_dwt_at_vclock_event
+  //     (32-bit subtraction; wraps correctly across DWT_CYCCNT rollover).
+  //     In steady state this is the DWT distance from the most recent
+  //     VCLOCK one-second event to the physical PPS edge that followed it.
+  //
+  //   pps_edge_ns_from_vclock
+  //     = pps_edge_dwt_cycles_from_vclock × 1e9 / dwt_effective_cycles_per_second()
+  //     Same quantity in nanoseconds, using the same divisor the bridge
+  //     uses for interpolation (apples-to-apples with pps_edge_gnss_ns).
+  //
+  //   pps_edge_vclock_event_count
+  //     = number of times vclock_callback has been entered, as observed
+  //     from pps_edge_callback.  In steady state this should equal
+  //     (g_gnss_ns_count_at_pps / 1e9) at publish time, confirming that
+  //     no VCLOCK event slipped in between the GPIO ISR and the
+  //     foreground pps_edge_callback.
+  uint32_t pps_edge_dwt_cycles_from_vclock = 0;
+  int64_t  pps_edge_ns_from_vclock = 0;
+  uint32_t pps_edge_vclock_event_count = 0;
+
   uint32_t anomaly_count = 0;
 };
 

@@ -5,8 +5,11 @@
 // Post rolling-integration removal:
 //   - clocks_payload_add_ocxo_diag slimmed to match the trimmed
 //     interrupt_capture_diag_t: event facts + anomaly_count only.
-//   - clocks_payload_add_pps_diag (unchanged) delegates to the slimmer
-//     ocxo publisher and adds the GPIO witness fields.
+//   - clocks_payload_add_pps_diag delegates to the slimmer
+//     ocxo publisher and adds the GPIO witness fields plus three new
+//     bridge-independent VCLOCK-to-edge phase diagnostics:
+//     pps_edge_dwt_cycles_from_vclock, pps_edge_ns_from_vclock,
+//     pps_edge_vclock_event_count.
 //   - All integrator_* and boundary_dwt_isr_entry_* publications removed
 //     — those fields no longer exist.
 //
@@ -218,6 +221,13 @@ static void clocks_payload_add_pps_diag(Payload& p,
   add_u32("pps_edge_dwt_isr_entry_raw", diag.pps_edge_dwt_isr_entry_raw);
   add_i64("pps_edge_gnss_ns", diag.pps_edge_gnss_ns);
   add_i64("pps_edge_minus_event_ns", diag.pps_edge_minus_event_ns);
+
+  // Bridge-independent VCLOCK-to-edge phase diagnostics (authored by
+  // alpha's pps_edge_callback from g_prev_dwt_at_vclock_event and
+  // g_vclock_event_count, not via the DWT↔GNSS bridge).
+  add_u32("pps_edge_dwt_cycles_from_vclock", diag.pps_edge_dwt_cycles_from_vclock);
+  add_i64("pps_edge_ns_from_vclock", diag.pps_edge_ns_from_vclock);
+  add_u32("pps_edge_vclock_event_count", diag.pps_edge_vclock_event_count);
 }
 
 // ============================================================================
