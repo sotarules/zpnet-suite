@@ -352,7 +352,7 @@ static void alpha_reset_canonical_clock_state_for_new_epoch(void) {
   welford_reset(welford_vclock);
   welford_reset(welford_ocxo1);
   welford_reset(welford_ocxo2);
-  welford_reset(welford_pps_witness);
+  welford_reset(welford_pps_coincidence);
 }
 
 // ============================================================================
@@ -513,6 +513,25 @@ static void vclock_callback(
   time_pps_update(g_dwt_cycle_count_at_pps,
                   dwt_effective_cycles_per_second(),
                   g_qtimer_at_pps);
+
+  // ── PPS/VCLOCK coincidence welford ──
+  //
+  // The coincidence measurement (ISR-delta between the VCLOCK
+  // one-second event and the most recent PPS edge) is captured by
+  // process_interrupt's vclock_cadence_isr and carried on the event.
+  // Convert cycles to ns using the current measured DWT rate and
+  // feed the welford.  Invalid measurements (pre-anchor, or beyond
+  // threshold) are skipped — an invalid measurement is not a sample.
+  if (event.pps_coincidence_valid) {
+    const uint32_t rate = dwt_effective_cycles_per_second();
+    if (rate > 0) {
+      const int64_t coincidence_ns =
+          (int64_t)(((uint64_t)event.pps_coincidence_cycles * NS_PER_SECOND_U64
+                     + (uint64_t)rate / 2)
+                    / (uint64_t)rate);
+      welford_update(welford_pps_coincidence, (double)coincidence_ns);
+    }
+  }
 }
 
 // ============================================================================
@@ -530,9 +549,11 @@ static void vclock_callback(
 //      the current edge.)
 //   2. If the epoch is pending, install it from this snapshot.
 //   3. Compute and stash the PPS witness diagnostic fields.
-//   4. Update the PPS witness welford with a VCLOCK-phase-error
-//      measurement that is INDEPENDENT of foreground callback ordering.
-//   5. Trigger TIMEBASE_FRAGMENT publication via clocks_beta_pps().
+//   4. Trigger TIMEBASE_FRAGMENT publication via clocks_beta_pps().
+//
+// The PPS/VCLOCK coincidence Welford is NOT fed here.  It is fed in
+// vclock_callback from the per-event coincidence cycles measured in
+// vclock_cadence_isr.  See welford_pps_coincidence.
 //
 static void pps_edge_callback(const pps_edge_snapshot_t& snap) {
 
@@ -595,45 +616,15 @@ static void pps_edge_callback(const pps_edge_snapshot_t& snap) {
   g_pps_interrupt_diag.pps_edge_ns_from_vclock = ns_from_vclock;
   g_pps_interrupt_diag.pps_edge_vclock_event_count = vclock_count_local;
 
-  // ── Step 4: ordering-independent PPS witness phase measurement ──
+  // ── Step 4: publish TIMEBASE_FRAGMENT + assert relay ──
   //
-  // Under PPS-anchored operation, the expected hardware counter value
-  // at each subsequent PPS edge is:
-  //
-  //   expected_counter32 = g_epoch_qtimer_at_pps
-  //                      + (snap.sequence - g_epoch_pps_edge_sequence)
-  //                        * VCLOCK_COUNTS_PER_SECOND
-  //
-  // The difference (snap.counter32_at_edge - expected_counter32) is
-  // the "phase error" — how many VCLOCK ticks past the expected
-  // moment the GPIO ISR captured the counter.  In steady state this
-  // is a small positive number reflecting GPIO ISR entry latency;
-  // its JITTER is the diagnostic we care about.  Multiplied by 100
-  // (ns per VCLOCK tick), it becomes nanoseconds.
-  //
-  // This measurement is:
-  //   • Independent of foreground callback ordering.
-  //   • Independent of the DWT↔GNSS bridge math.
-  //   • Pure hardware counter arithmetic.
-  //
-  // If the mean drifts, PPS and VCLOCK are NOT phase-locked and
-  // something is wrong with the discipline.  If the mean stays
-  // constant and SD is small, we have a proven phase lock.
-  //
-  if (g_epoch_initialized && !g_epoch_pending &&
-      snap.sequence >= g_epoch_pps_edge_sequence) {
-    const uint32_t edges_since_epoch =
-        snap.sequence - g_epoch_pps_edge_sequence;
-    const uint32_t expected_counter32 =
-        g_epoch_qtimer_at_pps
-        + edges_since_epoch * (uint32_t)VCLOCK_COUNTS_PER_SECOND;
-    const int32_t phase_error_counts =
-        (int32_t)(snap.counter32_at_edge - expected_counter32);
-    const double phase_error_ns = (double)phase_error_counts * 100.0;
-    welford_update(welford_pps_witness, phase_error_ns);
-  }
-
-  // ── Step 5: publish TIMEBASE_FRAGMENT + assert relay ──
+  // The PPS/VCLOCK witness Welford (welford_pps_coincidence) is no
+  // longer fed here — it is fed in vclock_callback from the per-event
+  // coincidence measurement captured in process_interrupt's
+  // vclock_cadence_isr.  That measurement is pure ISR choreography:
+  // the raw DWT-cycles delta between the VCLOCK one-second event's
+  // ISR entry and this PPS edge's ISR entry.  See
+  // interrupt_event_t.pps_coincidence_cycles.
   pps_relay_pulse();
 
   if (campaign_state == clocks_campaign_state_t::STARTED ||

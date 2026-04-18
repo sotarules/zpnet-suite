@@ -49,14 +49,30 @@
 //     vclock_welford     — bridge interpolation residual samples (ns)
 //     ocxo1_welford      — OCXO1 per-second residual samples (ns)
 //     ocxo2_welford      — OCXO2 per-second residual samples (ns)
-//     pps_witness_welford — PPS/VCLOCK phase-error samples (ns).
-//                          SOURCE: snap.counter32_at_edge minus the
-//                          projected post-epoch expected counter32
-//                          (g_epoch_qtimer_at_pps + edges-since-epoch ×
-//                          VCLOCK_COUNTS_PER_SECOND), scaled to ns.
-//                          Independent of foreground callback ordering.
-//                          Steady-state mean = GPIO ISR entry latency;
-//                          steady-state SD = jitter floor.
+//     pps_coincidence_welford — PPS/VCLOCK coincidence samples (ns).
+//                          SOURCE: the raw DWT-cycles difference between
+//                          the VCLOCK one-second event's ISR entry and
+//                          the most recent physical PPS edge's ISR
+//                          entry, captured in process_interrupt's
+//                          vclock_cadence_isr and converted to ns in
+//                          alpha's vclock_callback using the current
+//                          dwt_effective_cycles_per_second.
+//
+//                          This is an ISR-choreography measurement,
+//                          NOT a clock measurement.  It asserts that
+//                          PPS and VCLOCK are phase-locked by declaring
+//                          the two ISR captures to be of the same
+//                          physical moment, and measuring the
+//                          firmware-induced latency delta between them.
+//
+//                          Steady-state:
+//                            MEAN  — constant, dominated by GPIO ISR
+//                                    body duration + ISR entry
+//                                    latencies.  Expected hundreds of ns.
+//                            SD    — negligibly small.  A non-zero SD
+//                                    means the ISR paths have
+//                                    non-determinism; a growing MEAN
+//                                    means phase lock is failing.
 //     ocxo1_dac_welford  — OCXO1 DAC fractional code samples (LSB)
 //     ocxo2_dac_welford  — OCXO2 DAC fractional code samples (LSB)
 //
@@ -70,8 +86,8 @@
 //   Frequency-bearing clocks (four total):
 //     dwt, vclock, ocxo1, ocxo2
 //
-//   (pps_witness is a phase-error measurement; has no frequency
-//   interpretation.)
+//   (pps_coincidence is an ISR-choreography measurement; has no
+//   frequency interpretation.)
 //
 // Sign convention:
 //
@@ -379,14 +395,13 @@ extern uint64_t recover_ocxo2_ns;
 //
 // Global Welford instances, one per published prefix:
 //
-//   welford_dwt          — Teensy CPU XTAL offset, in ppb
-//   welford_vclock       — bridge interpolation residual, in ns
-//   welford_ocxo1        — OCXO1 per-second residual, in ns
-//   welford_ocxo2        — OCXO2 per-second residual, in ns
-//   welford_pps_witness  — PPS/VCLOCK phase error, in ns
-//                          (counter32-based, ordering-independent)
-//   welford_ocxo1_dac    — OCXO1 DAC fractional code, in LSB
-//   welford_ocxo2_dac    — OCXO2 DAC fractional code, in LSB
+//   welford_dwt              — Teensy CPU XTAL offset, in ppb
+//   welford_vclock           — bridge interpolation residual, in ns
+//   welford_ocxo1            — OCXO1 per-second residual, in ns
+//   welford_ocxo2            — OCXO2 per-second residual, in ns
+//   welford_pps_coincidence  — PPS/VCLOCK coincidence (ISR-delta), in ns
+//   welford_ocxo1_dac        — OCXO1 DAC fractional code, in LSB
+//   welford_ocxo2_dac        — OCXO2 DAC fractional code, in LSB
 //
 
 struct welford_t {
@@ -401,7 +416,7 @@ extern welford_t welford_dwt;
 extern welford_t welford_vclock;
 extern welford_t welford_ocxo1;
 extern welford_t welford_ocxo2;
-extern welford_t welford_pps_witness;
+extern welford_t welford_pps_coincidence;
 extern welford_t welford_ocxo1_dac;
 extern welford_t welford_ocxo2_dac;
 

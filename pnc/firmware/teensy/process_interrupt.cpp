@@ -301,6 +301,10 @@ static void fill_diag(interrupt_capture_diag_t& diag,
         (g_pps_gpio_witness.last_gnss_ns >= 0 && event.gnss_ns_at_event != 0)
             ? (g_pps_gpio_witness.last_gnss_ns - (int64_t)event.gnss_ns_at_event)
             : 0;
+
+    // Mirror the PPS/VCLOCK coincidence measurement from the event.
+    diag.pps_coincidence_cycles = event.pps_coincidence_cycles;
+    diag.pps_coincidence_valid  = event.pps_coincidence_valid;
   }
 }
 
@@ -317,7 +321,9 @@ static void deferred_dispatch_callback(timepop_ctx_t*, timepop_diag_t*, void* us
 
 static void emit_one_second_event(interrupt_subscriber_runtime_t& rt,
                                   uint32_t dwt_at_event,
-                                  uint32_t authored_counter32) {
+                                  uint32_t authored_counter32,
+                                  uint32_t pps_coincidence_cycles = 0,
+                                  bool     pps_coincidence_valid  = false) {
   if (!rt.active) return;
 
   interrupt_event_t event {};
@@ -326,6 +332,8 @@ static void emit_one_second_event(interrupt_subscriber_runtime_t& rt,
   event.lane         = rt.desc->lane;
   event.dwt_at_event = dwt_at_event;
   event.counter32_at_event = authored_counter32;
+  event.pps_coincidence_cycles = pps_coincidence_cycles;
+  event.pps_coincidence_valid  = pps_coincidence_valid;
 
   const int64_t gnss_ns = time_dwt_to_gnss_ns(dwt_at_event);
   event.gnss_ns_at_event = (gnss_ns >= 0) ? (uint64_t)gnss_ns : 0;
@@ -384,8 +392,37 @@ static void vclock_cadence_isr(uint32_t dwt_raw) {
   if (++g_vclock_lane.tick_mod_1000 >= TICKS_PER_SECOND_EVENT) {
     g_vclock_lane.tick_mod_1000 = 0;
     g_vclock_lane.logical_count32_at_last_second += VCLOCK_COUNTS_PER_SECOND;
+
+    // ── PPS/VCLOCK coincidence measurement ──
+    //
+    // This ISR fires on the 1000th CH3 compare-match — the VCLOCK
+    // one-second boundary.  Under PPS-anchored operation the next
+    // physical PPS edge is the same moment, modulo ISR latencies.
+    // GPIO (priority 0) preempts QTimer1 (priority 1), so when both
+    // pend coincidentally, GPIO runs first and THIS ISR lands strictly
+    // after the GPIO ISR completes.
+    //
+    // The measurement is the raw DWT-cycles difference.  See
+    // process_interrupt.h for the threshold rationale.
+    uint32_t coincidence_cycles = 0;
+    bool     coincidence_valid  = false;
+    {
+      const pps_edge_snapshot_t snap = interrupt_last_pps_edge();
+      if (snap.sequence > 0) {
+        const int32_t cycles_since_pps =
+            (int32_t)(dwt_raw - snap.dwt_at_edge);
+        if (cycles_since_pps >= 0 &&
+            cycles_since_pps < DWT_PPS_COINCIDENCE_THRESHOLD_CYCLES) {
+          coincidence_cycles = (uint32_t)cycles_since_pps;
+          coincidence_valid  = true;
+        }
+      }
+    }
+
     emit_one_second_event(*g_rt_vclock, dwt_raw,
-                          g_vclock_lane.logical_count32_at_last_second);
+                          g_vclock_lane.logical_count32_at_last_second,
+                          coincidence_cycles,
+                          coincidence_valid);
   }
 }
 
@@ -727,7 +764,7 @@ void process_interrupt_enable_irqs(void) {
   if (g_interrupt_irqs_enabled) return;
 
   attachInterruptVector(IRQ_QTIMER3, qtimer3_isr);
-  NVIC_SET_PRIORITY(IRQ_QTIMER3, 32);
+  NVIC_SET_PRIORITY(IRQ_QTIMER3, 16);
   NVIC_ENABLE_IRQ(IRQ_QTIMER3);
 
   pinMode(GNSS_PPS_PIN, INPUT);

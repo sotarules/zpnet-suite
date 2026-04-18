@@ -153,6 +153,35 @@ struct interrupt_event_t {
   // equals exactly N * VCLOCK_COUNTS_PER_SECOND for the Nth event
   // after anchor.
   uint32_t counter32_at_event = 0;
+
+  // ── PPS/VCLOCK coincidence measurement ──
+  //
+  // Populated only for VCLOCK-kind one-second events.  Measures the
+  // raw DWT-cycles difference between THIS ISR's entry (dwt_at_event)
+  // and the most recent physical PPS edge's ISR entry:
+  //
+  //     pps_coincidence_cycles = dwt_at_event − snap.dwt_at_edge
+  //
+  // Under PPS-anchored operation the CH3 one-second compare-match and
+  // the PPS GPIO edge are the same physical moment at the receiver,
+  // modulo sub-nanosecond propagation.  With GPIO at priority 0 and
+  // QTimer1 at priority 1, GPIO preempts — so CH3's ISR entry always
+  // lands strictly AFTER the GPIO ISR finishes.  Steady-state cycles
+  // is therefore expected to be a small positive number dominated by
+  // GPIO ISR body duration plus CH3 entry latency — a constant, with
+  // tiny variance determined only by pipeline state.
+  //
+  // `pps_coincidence_valid` is true iff:
+  //   • At least one PPS edge has been captured (snap.sequence > 0)
+  //   • cycles is non-negative
+  //   • cycles < DWT_PPS_COINCIDENCE_THRESHOLD_CYCLES
+  //
+  // A false value indicates this one-second event was NOT coincident
+  // with a recent PPS edge (e.g. pre-anchor operation, or a VCLOCK
+  // event that drifted out of PPS phase — which would itself be a
+  // falsified-phase-lock signal).
+  uint32_t pps_coincidence_cycles = 0;
+  bool     pps_coincidence_valid  = false;
 };
 
 // ============================================================================
@@ -200,8 +229,34 @@ struct interrupt_capture_diag_t {
   int64_t  pps_edge_ns_from_vclock = 0;
   uint32_t pps_edge_vclock_event_count = 0;
 
+  // ── PPS/VCLOCK coincidence mirror ──
+  //
+  // Mirrors event.pps_coincidence_{cycles,valid} for consumers that
+  // only hold a diag pointer.  See interrupt_event_t for semantics.
+  uint32_t pps_coincidence_cycles = 0;
+  bool     pps_coincidence_valid  = false;
+
   uint32_t anomaly_count = 0;
 };
+
+// ============================================================================
+// PPS/VCLOCK coincidence threshold
+// ============================================================================
+//
+// When the VCLOCK one-second compare-match fires, the ISR reads the
+// most recent PPS edge snapshot and computes the DWT-cycles difference.
+// If the difference is in [0, DWT_PPS_COINCIDENCE_THRESHOLD_CYCLES),
+// the two events are declared coincident and the measurement is
+// published.  Otherwise the measurement is marked invalid (the PPS
+// edge happened too long ago — either pre-anchor, or a phase-lock
+// failure).
+//
+// 10,000 cycles at 1.008 GHz ≈ 10 µs.  The expected steady-state
+// value is ~300–600 cycles (GPIO ISR body + entry latencies), so
+// this threshold has three orders of magnitude of margin on the
+// "normal" side and cleanly excludes the "PPS was seconds ago" case.
+//
+static constexpr int32_t DWT_PPS_COINCIDENCE_THRESHOLD_CYCLES = 10000;
 
 // ============================================================================
 // Physical PPS edge snapshot — captured in the GPIO ISR
