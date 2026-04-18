@@ -7,26 +7,26 @@ Data source:
   (Teensy-authoritative).  Pi-side synthetic clocks live in
   extra_clocks.
 
+Stats policy (Pi is a stenographer):
+  Every statistical quantity shown in this panel is read verbatim from
+  the Teensy-authored TIMEBASE_FRAGMENT.  No Pi-side means, stddevs,
+  stderrs, or residuals are computed here.  The only Pi-side arithmetic
+  is presentation-layer unit conversion (DAC code → voltage) and
+  baseline delta (NOW - BASE), neither of which is a statistic.
+
 Column layout (CLK rows):
-  NAME   VALUE (ns or cycles)   TAU   PPB   RAW   RES   MEAN   SD   N   BASE   NOW   DELTA
+  NAME   VALUE   TAU   PPB   RAW   RES   MEAN   SD   SE   N   BASE   NOW   DELTA
 
 Column layout (DAC rows):
-  NAME   DAC_VALUE VOLTAGE   (blanks)   MEAN   SD   N   BASE   NOW   DELTA
+  NAME   DAC_VALUE_VOLTAGE   (blanks)   MEAN   SD   SE   N   BASE   NOW   DELTA
 
 Column layout (INT rows):
-  NAME   START_GNSS_NS   END_GNSS_NS   DELTA_NS
+  NAME   END_GNSS_NS   DELTA_NS
 """
 
 from zpnet.processes.processes import send_command
 
-DWT_EXPECTED_PER_PPS = 1_008_000_000
 VREF = 3.002
-
-# Persist last-seen PPS edge so the readout can show a start→end
-# interval for PPS without upstream state.
-_PREV_EDGE_NS = {
-    "pps": None,
-}
 
 
 # ---------------------------------------------------------------------
@@ -90,14 +90,6 @@ def _frag(r: dict, key: str, default=None):
             return val
     val = r.get(key)
     return val if val is not None else default
-
-
-def _frag_first(r: dict, *keys, default=None):
-    for key in keys:
-        val = _frag(r, key, None)
-        if val is not None:
-            return val
-    return default
 
 
 def _extra(r: dict, key: str, default=None):
@@ -186,6 +178,38 @@ def _baseline_comp(base_val, now_val):
 
 
 # ---------------------------------------------------------------------
+# Welford row renderer — reads 4 firmware-owned statistics verbatim
+# ---------------------------------------------------------------------
+#
+# Returns the formatted MEAN | SD | SE | N column group.  All four values
+# come from firmware-published fields:
+#     <prefix>_welford_mean
+#     <prefix>_welford_stddev
+#     <prefix>_welford_stderr
+#     <prefix>_welford_n
+#
+# source_fn(key) is a lookup function returning the value or None.
+# Typically _frag or _extra.
+#
+# mean_decimals overrides the default precision (3) for the MEAN column.
+# Useful for large-magnitude signals (e.g. the PPS witness DC offset at
+# ~-459M ns) where sub-ns precision is false precision and the extra
+# digits overflow the column.
+#
+def _welford_cols(source_fn, prefix, w_mean, w_sd, w_se, w_n, mean_decimals=3):
+    mean = _to_float(source_fn(f"{prefix}_welford_mean"))
+    sd   = _to_float(source_fn(f"{prefix}_welford_stddev"))
+    se   = _to_float(source_fn(f"{prefix}_welford_stderr"))
+    wn   = _to_int  (source_fn(f"{prefix}_welford_n"))
+    return (
+        f"{_fmt(mean, f'>{w_mean}.{mean_decimals}f', w_mean)}"
+        f"{_fmt(sd,   f'>{w_sd}.3f',   w_sd)}"
+        f"{_fmt(se,   f'>{w_se}.3f',   w_se)}"
+        f"{_fmt(wn,   f'>{w_n}d',      w_n)}"
+    )
+
+
+# ---------------------------------------------------------------------
 # Combined clocks readout
 # ---------------------------------------------------------------------
 
@@ -205,7 +229,7 @@ def clocks_combined_readout() -> list[str]:
     r = report
     campaign = r.get("campaign", "?")
     elapsed = r.get("campaign_elapsed", "00:00:00")
-    n = r.get("pps_count", 0)
+    n = _to_int(_frag(r, "teensy_pps_count")) or r.get("pps_count", 0)
 
     cal = _frag(r, "calibrate_ocxo", "OFF")
 
@@ -233,6 +257,7 @@ def clocks_combined_readout() -> list[str]:
     W_RES   = 8
     W_MEAN  = 10
     W_SD    = 8
+    W_SE    = 8
     W_N     = 6
     W_BASE  = 10
     W_NOW   = 10
@@ -248,6 +273,7 @@ def clocks_combined_readout() -> list[str]:
         f"{'RES':>{W_RES}}"
         f"{'MEAN':>{W_MEAN}}"
         f"{'SD':>{W_SD}}"
+        f"{'SE':>{W_SE}}"
         f"{'N':>{W_N}}"
         f"  "
         f"{'BASE':>{W_BASE}}"
@@ -255,7 +281,7 @@ def clocks_combined_readout() -> list[str]:
         f"{'DELTA':>{W_DELTA}}"
     )
 
-    # ── GNSS ──
+    # ── GNSS (the reference; tau/ppb are tautologically 1.0 / 0.0) ──
     gnss_ns = _to_int(_frag(r, "gnss_ns"))
     gnss_tau = 1.0
     gnss_ppb = 0.0
@@ -268,19 +294,17 @@ def clocks_combined_readout() -> list[str]:
         f"{'---':>{W_RES}}"
         f"{'---':>{W_MEAN}}"
         f"{'---':>{W_SD}}"
+        f"{'---':>{W_SE}}"
         f"{'---':>{W_N}}"
         f"  {_baseline_comp(baseline_ppb.get('gnss'), gnss_ppb)}"
     )
 
-    # ── VCLOCK (measured peer of OCXO1/OCXO2; GNSS-disciplined 10 MHz reference) ──
-    vclock_ns = _to_int(_frag(r, "vclock_ns_count_at_pps"))
+    # ── VCLOCK (measured peer of OCXO1/OCXO2; the GNSS-disciplined reference) ──
+    vclock_ns  = _to_int(_frag(r, "vclock_ns_count_at_pps"))
     vclock_tau = _to_float(_frag(r, "vclock_tau"))
     vclock_ppb = _to_float(_frag(r, "vclock_ppb"))
     vclock_raw = _to_int(_frag(r, "vclock_gnss_ns_between_edges"))
     vclock_res = _to_int(_frag(r, "vclock_second_residual_ns"))
-    vclock_mean = _to_float(_frag(r, "vclock_welford_mean"))
-    vclock_sd = _to_float(_frag(r, "vclock_welford_stddev"))
-    vclock_n = _to_int(_frag(r, "vclock_welford_n"))
     lines.append(
         f"{'VCLOCK':<{W_NAME}}"
         f"{_comma_int(vclock_ns, W_VALUE)}"
@@ -288,20 +312,15 @@ def clocks_combined_readout() -> list[str]:
         f"{_fmt(vclock_ppb, f'>{W_PPB}.3f', W_PPB)}"
         f"{_comma_int(vclock_raw, W_RAW)}"
         f"{_sign_int(vclock_res, W_RES)}"
-        f"{_fmt(vclock_mean, f'>{W_MEAN}.3f', W_MEAN)}"
-        f"{_fmt(vclock_sd, f'>{W_SD}.3f', W_SD)}"
-        f"{_fmt(vclock_n, f'>{W_N}d', W_N)}"
+        f"{_welford_cols(lambda k: _frag(r, k), 'vclock', W_MEAN, W_SD, W_SE, W_N)}"
         f"  {_baseline_comp(baseline_ppb.get('vclock'), vclock_ppb)}"
     )
 
-    # ── GNSS_RAW ──
-    gnss_raw_ns = _to_int(_extra(r, "gnss_raw_ns"))
+    # ── GN_RAW (GNSS receiver's self-reported drift; Pi-side synthetic) ──
+    gnss_raw_ns  = _to_int(_extra(r, "gnss_raw_ns"))
     gnss_raw_tau = _to_float(_extra(r, "gnss_raw_tau"))
     gnss_raw_ppb = _to_float(_extra(r, "gnss_raw_ppb"))
     gnss_raw_res = _to_float(_extra(r, "gnss_raw_drift_ppb"))
-    gnss_raw_mean = _to_float(_extra(r, "gnss_raw_welford_mean"))
-    gnss_raw_sd = _to_float(_extra(r, "gnss_raw_welford_stddev"))
-    gnss_raw_n = _to_int(_extra(r, "gnss_raw_welford_n"))
     lines.append(
         f"{'GN_RAW':<{W_NAME}}"
         f"{_comma_int(gnss_raw_ns, W_VALUE)}"
@@ -309,9 +328,7 @@ def clocks_combined_readout() -> list[str]:
         f"{_fmt(gnss_raw_ppb, f'>{W_PPB}.3f', W_PPB)}"
         f"{'---':>{W_RAW}}"
         f"{_fmt(gnss_raw_res, f'>{W_RES}.1f', W_RES)}"
-        f"{_fmt(gnss_raw_mean, f'>{W_MEAN}.3f', W_MEAN)}"
-        f"{_fmt(gnss_raw_sd, f'>{W_SD}.3f', W_SD)}"
-        f"{_fmt(gnss_raw_n, f'>{W_N}d', W_N)}"
+        f"{_welford_cols(lambda k: _extra(r, k), 'gnss_raw', W_MEAN, W_SD, W_SE, W_N)}"
         f"  {_baseline_comp(baseline_ppb.get('gnss_raw'), gnss_raw_ppb)}"
     )
 
@@ -326,13 +343,12 @@ def clocks_combined_readout() -> list[str]:
     )
     if dwt_present:
         dwt_total = _to_int(_frag(r, "dwt_cycle_count_total"))
-        dwt_tau = _to_float(_frag(r, "dwt_tau"))
-        dwt_ppb = _to_float(_frag(r, "dwt_ppb"))
-        dwt_raw = _to_int(_frag(r, "dwt_cycle_count_between_pps"))
-        dwt_res = dwt_raw - DWT_EXPECTED_PER_PPS if dwt_raw is not None else None
-        dwt_mean = _to_float(_frag(r, "dwt_welford_mean"))
-        dwt_sd = _to_float(_frag(r, "dwt_welford_stddev"))
-        dwt_n = _to_int(_frag(r, "dwt_welford_n"))
+        dwt_tau   = _to_float(_frag(r, "dwt_tau"))
+        dwt_ppb   = _to_float(_frag(r, "dwt_ppb"))
+        dwt_raw   = _to_int(_frag(r, "dwt_cycle_count_between_pps"))
+        # RES comes from firmware (dwt_second_residual_cycles), not
+        # computed Pi-side.
+        dwt_res   = _to_int(_frag(r, "dwt_second_residual_cycles"))
         lines.append(
             f"{'DWT':<{W_NAME}}"
             f"{_comma_int(dwt_total, W_VALUE)}"
@@ -340,22 +356,17 @@ def clocks_combined_readout() -> list[str]:
             f"{_fmt(dwt_ppb, f'>{W_PPB}.3f', W_PPB)}"
             f"{_comma_int(dwt_raw, W_RAW)}"
             f"{_sign_int(dwt_res, W_RES)}"
-            f"{_fmt(dwt_mean, f'>{W_MEAN}.3f', W_MEAN)}"
-            f"{_fmt(dwt_sd, f'>{W_SD}.3f', W_SD)}"
-            f"{_fmt(dwt_n, f'>{W_N}d', W_N)}"
+            f"{_welford_cols(lambda k: _frag(r, k), 'dwt', W_MEAN, W_SD, W_SE, W_N)}"
             f"  {_baseline_comp(baseline_ppb.get('dwt'), dwt_ppb)}"
         )
 
     # ── OCXO1, OCXO2 ──
     for name, key in [("OCXO1", "ocxo1"), ("OCXO2", "ocxo2")]:
-        ocxo_ns = _to_int(_frag_first(r, f"{key}_ns_count_at_pps", f"{key}_ns"))
-        tau = _to_float(_frag(r, f"{key}_tau"))
-        ppb = _to_float(_frag(r, f"{key}_ppb"))
-        raw = _to_int(_frag(r, f"{key}_gnss_ns_between_edges"))
-        res = _to_int(_frag_first(r, f"{key}_diag_ocxo_second_residual_ns", f"{key}_second_residual_ns"))
-        mean = _to_float(_frag(r, f"{key}_welford_mean"))
-        sd = _to_float(_frag(r, f"{key}_welford_stddev"))
-        wn = _to_int(_frag(r, f"{key}_welford_n"))
+        ocxo_ns = _to_int(_frag(r, f"{key}_ns_count_at_pps"))
+        tau     = _to_float(_frag(r, f"{key}_tau"))
+        ppb     = _to_float(_frag(r, f"{key}_ppb"))
+        raw     = _to_int(_frag(r, f"{key}_gnss_ns_between_edges"))
+        res     = _to_int(_frag(r, f"{key}_second_residual_ns"))
         lines.append(
             f"{name:<{W_NAME}}"
             f"{_comma_int(ocxo_ns, W_VALUE)}"
@@ -363,24 +374,28 @@ def clocks_combined_readout() -> list[str]:
             f"{_fmt(ppb, f'>{W_PPB}.3f', W_PPB)}"
             f"{_comma_int(raw, W_RAW)}"
             f"{_sign_int(res, W_RES)}"
-            f"{_fmt(mean, f'>{W_MEAN}.3f', W_MEAN)}"
-            f"{_fmt(sd, f'>{W_SD}.3f', W_SD)}"
-            f"{_fmt(wn, f'>{W_N}d', W_N)}"
+            f"{_welford_cols(lambda k: _frag(r, k), key, W_MEAN, W_SD, W_SE, W_N)}"
             f"  {_baseline_comp(baseline_ppb.get(key), ppb)}"
         )
 
     # ── DAC detail ──
+    #
+    # Each DAC row shows the current DAC code + its voltage (label column),
+    # plus the firmware-owned welford_ocxoN_dac statistics (mean/sd/se/n),
+    # aligned to the CLK block's statistic columns so scanning is easy.
+    #
     lines.append("")
     lines.append(
-        f"{'DAC':<6}"
+        f"{'DAC':<{W_NAME}}"
         f"{'':>{W_VALUE}}"
         f"{'':>{W_TAU}}"
         f"{'':>{W_PPB}}"
         f"{'':>{W_RAW}}"
         f"{'':>{W_RES}}"
-        f"{'':>{W_MEAN}}"
-        f"{'':>{W_SD}}"
-        f"{'':>{W_N}}"
+        f"{'MEAN':>{W_MEAN}}"
+        f"{'SD':>{W_SD}}"
+        f"{'SE':>{W_SE}}"
+        f"{'N':>{W_N}}"
         f"  "
         f"{'BASE':>{W_BASE}}"
         f"{'NOW':>{W_NOW}}"
@@ -394,67 +409,126 @@ def clocks_combined_readout() -> list[str]:
         else:
             dac_label = "---"
 
-        # The curtailed payload may omit DAC Welford detail. Use the live DAC as NOW.
         base_dac = None
         if baseline:
             base_dac = baseline.get("baseline_dac_mean", {}).get(key)
-        now_dac = dac_now
 
         lines.append(
-            f"{name:<6}"
+            f"{name:<{W_NAME}}"
             f"{dac_label:>{W_VALUE}}"
             f"{'':>{W_TAU}}"
             f"{'':>{W_PPB}}"
             f"{'':>{W_RAW}}"
             f"{'':>{W_RES}}"
-            f"{'---':>{W_MEAN}}"
-            f"{'---':>{W_SD}}"
-            f"{'---':>{W_N}}"
-            f"  {_baseline_comp(base_dac, now_dac)}"
+            f"{_welford_cols(lambda k: _frag(r, k), f'{key}_dac', W_MEAN, W_SD, W_SE, W_N)}"
+            f"  {_baseline_comp(base_dac, dac_now)}"
         )
 
+    # ── PPS WITNESS — proof of PPS/VCLOCK phase lock ──
+    #
+    # Under PPS-anchored epoch discipline (the firmware re-phases the
+    # VCLOCK CH3 cadence from a physical PPS edge at INIT/ZERO/START),
+    # every subsequent PPS edge should land coincident with a VCLOCK
+    # one-second moment — up to GPIO ISR entry latency.
+    #
+    # The welford feeds on a counter32-based phase error: the difference
+    # between each PPS edge's captured QTimer1 counter value and the
+    # projected counter value at that edge (g_epoch_qtimer_at_pps +
+    # edges_since_epoch × VCLOCK_COUNTS_PER_SECOND), scaled to ns.
+    #
+    # This measurement is independent of foreground callback ordering
+    # and independent of the DWT↔GNSS bridge — pure hardware counter
+    # arithmetic, firmware-computed.
+    #
+    # Interpretation:
+    #   MEAN — steady-state GPIO ISR entry latency (tens of ns, small
+    #          positive number)
+    #   SD   — GPIO ISR jitter floor (single-digit ns in a healthy system)
+    #   SE   — 1/√n shrinkage; tells you how well you know MEAN
+    #   MIN/MAX — envelope; should stay within ~3–5 SD of MEAN
+    #
+    # If MEAN is stable and SD is small, PPS/VCLOCK phase lock is
+    # PROVEN BY THE SYSTEM ITSELF.  If MEAN drifts, the discipline
+    # has broken and something upstream (VCLOCK counting, GNSS
+    # receiver, bridge) requires investigation.
+    #
+    # BRIDGE_NS / DIRECT_NS are instantaneous secondary diagnostics
+    # from the per-edge diag; retained for cross-checking the bridge
+    # math against pure DWT subtraction.
+    #
+    lines.append("")
+    pps_bridge_ns  = _to_int(_frag(r, "pps_diag_pps_edge_minus_event_ns"))
+    pps_direct_ns  = _to_int(_frag(r, "pps_diag_pps_edge_ns_from_vclock"))
+    pps_direct_cyc = _to_int(_frag(r, "pps_diag_pps_edge_dwt_cycles_from_vclock"))
+    pps_seq        = _to_int(_frag(r, "pps_diag_pps_edge_sequence"))
+
+    pps_mean  = _to_float(_frag(r, "pps_witness_welford_mean"))
+    pps_sd    = _to_float(_frag(r, "pps_witness_welford_stddev"))
+    pps_se    = _to_float(_frag(r, "pps_witness_welford_stderr"))
+    pps_n     = _to_int  (_frag(r, "pps_witness_welford_n"))
+    pps_min   = _to_float(_frag(r, "pps_witness_welford_min"))
+    pps_max   = _to_float(_frag(r, "pps_witness_welford_max"))
+
+    lines.append(
+        f"PPSWIT   "
+        f"BRIDGE_NS: {_sign_int(pps_bridge_ns, 12)}   "
+        f"DIRECT_NS: {_sign_int(pps_direct_ns, 12)}   "
+        f"CYC: {_comma_int(pps_direct_cyc, 14)}   "
+        f"SEQ: {_fmt(pps_seq, '>6d', 6)}"
+    )
+    lines.append(
+        f"         "
+        f"   WELFORD    "
+        f"MEAN: {_fmt(pps_mean, '>12.3f', 12)}   "
+        f"SD: {_fmt(pps_sd, '>10.3f', 10)}   "
+        f"SE: {_fmt(pps_se, '>8.3f', 8)}   "
+        f"N: {_fmt(pps_n, '>6d', 6)}"
+    )
+    lines.append(
+        f"         "
+        f"              "
+        f" MIN: {_fmt(pps_min, '>12.3f', 12)}   "
+        f"MAX: {_fmt(pps_max, '>12.3f', 12)}"
+    )
+
     # ── Interrupt edge intervals ──
+    #
+    # END_GNSS_NS is the firmware-reported GNSS moment of the most recent
+    # event; DELTA_NS is the firmware-computed between-edges interval.
+    # Both come verbatim from the fragment.  No Pi-side state.
+    #
     lines.append("")
     lines.append(
-        f"{'INT':<6}"
-        f"{'START_GNSS_NS':>22}"
+        f"{'INT':<{W_NAME}}"
         f"{'END_GNSS_NS':>22}"
         f"{'DELTA_NS':>14}"
     )
 
-    # PPS: use the final PPS event GNSS and a persisted previous edge.
-    pps_end = _to_int(_frag_first(r, "pps_diag_gnss_ns_at_event_final", "pps_diag_gnss_ns_at_event"))
-    pps_start = _PREV_EDGE_NS.get("pps")
-    pps_delta = None
-    if pps_start is not None and pps_end is not None:
-        pps_delta = pps_end - pps_start
+    # PPS — the VCLOCK-driven advancer.  "End" is the VCLOCK event GNSS ns,
+    # delta is the VCLOCK between-edges interval.
+    pps_end   = _to_int(_frag(r, "pps_diag_gnss_ns_at_event"))
+    pps_delta = _to_int(_frag(r, "vclock_gnss_ns_between_edges"))
     lines.append(
-        f"{'PPS':<6}"
-        f"{_comma_int(pps_start, 22)}"
+        f"{'PPS':<{W_NAME}}"
         f"{_comma_int(pps_end, 22)}"
         f"{_comma_int(pps_delta, 14)}"
     )
-    if pps_end is not None:
-        _PREV_EDGE_NS["pps"] = pps_end
 
-    # OCXO1/OCXO2: use the canonical bucket start/end/delta fields.
     for name, key in [("OCXO1", "ocxo1"), ("OCXO2", "ocxo2")]:
-        start_edge = _to_int(_frag(r, f"{key}_diag_ocxo_second_start_gnss_ns_raw"))
-        end_edge = _to_int(_frag(r, f"{key}_diag_ocxo_second_end_gnss_ns_raw"))
-        delta_edge = _to_int(_frag_first(r, f"{key}_diag_ocxo_second_gnss_ns_observed", f"{key}_gnss_ns_between_edges"))
+        ocxo_end   = _to_int(_frag(r, f"{key}_diag_gnss_ns_at_event"))
+        ocxo_delta = _to_int(_frag(r, f"{key}_gnss_ns_between_edges"))
         lines.append(
-            f"{name:<6}"
-            f"{_comma_int(start_edge, 22)}"
-            f"{_comma_int(end_edge, 22)}"
-            f"{_comma_int(delta_edge, 14)}"
+            f"{name:<{W_NAME}}"
+            f"{_comma_int(ocxo_end, 22)}"
+            f"{_comma_int(ocxo_delta, 14)}"
         )
 
     lines.append("")
 
-    # ── NOW servo detail ──
+    # ── NOW servo detail (only shown when servo mode is NOW) ──
     if cal == "NOW":
         lines.append(
-            f"{'CAL':<6}"
+            f"{'CAL':<{W_NAME}}"
             f"{'SEC_RES':>12}"
             f"{'EDGE_GNSS':>20}"
             f"  "
@@ -463,13 +537,13 @@ def clocks_combined_readout() -> list[str]:
             f"{'PPS_NS':>16}"
         )
         for name, key in [("OCXO1", "ocxo1"), ("OCXO2", "ocxo2")]:
-            residual = _to_int(_frag_first(r, f"{key}_diag_ocxo_second_residual_ns", f"{key}_second_residual_ns"))
-            edge_gnss_ns = _to_int(_frag_first(r, f"{key}_diag_gnss_ns_at_event_final", f"{key}_gnss_ns_at_edge"))
-            dac_now = _to_float(_frag(r, f"{key}_dac"))
-            pps_ns = _to_int(_frag_first(r, f"{key}_ns_count_at_pps", f"{key}_ns"))
-            v_now = (dac_now * VREF / 65535.0) if dac_now is not None else None
+            residual     = _to_int(_frag(r, f"{key}_second_residual_ns"))
+            edge_gnss_ns = _to_int(_frag(r, f"{key}_diag_gnss_ns_at_event"))
+            dac_now      = _to_float(_frag(r, f"{key}_dac"))
+            pps_ns       = _to_int(_frag(r, f"{key}_ns_count_at_pps"))
+            v_now        = (dac_now * VREF / 65535.0) if dac_now is not None else None
             lines.append(
-                f"{name:<6}"
+                f"{name:<{W_NAME}}"
                 f"{_sign_int(residual, 12)}"
                 f"{_comma_int(edge_gnss_ns, 20)}"
                 f"  "
@@ -486,17 +560,23 @@ def clocks_combined_readout() -> list[str]:
     lines.append("")
 
     # ── DWT detail ──
-    dwt_pred = _frag(r, "dwt_cycle_count_next_second_prediction")
-    dwt_actual = _frag(r, "dwt_cycle_count_between_pps")
+    #
+    # ACTUAL = dwt_cycle_count_between_pps (firmware).
+    # EXPECTED = dwt_expected_per_pps (firmware).
+    # The vestigial PREDICTED field was eliminated in the standardization
+    # refactor — it was a pure mirror of ACTUAL.
+    #
+    dwt_actual        = _frag(r, "dwt_cycle_count_between_pps")
+    dwt_expected      = _frag(r, "dwt_expected_per_pps")
     dwt_cyccnt_at_pps = _frag(r, "dwt_cycle_count_at_pps")
-    dwt_cycles_64 = _frag(r, "dwt_cycle_count_total")
-    gnss_ns_64 = _frag(r, "gnss_ns")
-    if any(v is not None for v in [dwt_pred, dwt_actual, dwt_cyccnt_at_pps, dwt_cycles_64]):
+    dwt_cycles_64     = _frag(r, "dwt_cycle_count_total")
+    gnss_ns_64        = _frag(r, "gnss_ns")
+    if any(v is not None for v in [dwt_actual, dwt_expected, dwt_cyccnt_at_pps, dwt_cycles_64]):
         dwt_label_w = 12
         dwt_num_w = 20
         lines.append(
             f"DWT   "
-            f"{'PREDICTED:':>{dwt_label_w}} {_comma_int(dwt_pred, dwt_num_w)}"
+            f"{'EXPECTED:':>{dwt_label_w}} {_comma_int(dwt_expected, dwt_num_w)}"
             f"    {'ACTUAL:':<{dwt_label_w}} {_comma_int(dwt_actual, dwt_num_w)}"
             f"    {'CYCCNT@PPS:':>11} {_comma_int(dwt_cyccnt_at_pps, 14)}"
         )

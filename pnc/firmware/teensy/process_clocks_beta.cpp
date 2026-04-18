@@ -90,8 +90,6 @@ uint64_t recover_gnss_ns  = 0;
 uint64_t recover_ocxo1_ns = 0;
 uint64_t recover_ocxo2_ns = 0;
 
-static volatile bool zero_handshake_in_flight = false;
-
 // Most recently published TIMEBASE_FRAGMENT, retained for cmd_report.
 static Payload g_last_fragment;
 
@@ -568,7 +566,6 @@ static void clocks_force_stop_campaign(void) {
   request_stop = false;
   request_recover = false;
   request_zero = false;
-  zero_handshake_in_flight = false;
   calibrate_ocxo_mode = servo_mode_t::OFF;
   ocxo_dac_pacing_abort_all();
   timebase_invalidate();
@@ -631,18 +628,27 @@ void clocks_watchdog_anomaly(const char* reason,
 // ============================================================================
 
 void clocks_beta_pps(void) {
-  // Zero / start handshake.
+  // ── Zero / start handshake ──
+  //
+  // Under PPS-anchored epoch discipline, all of the interrupt-side
+  // synchronization lives in alpha:
+  //
+  //   • alpha's pps_edge_callback, on seeing request_zero/start and
+  //     !g_epoch_pending, calls alpha_request_epoch_zero() which sets
+  //     g_epoch_pending AND arms a GPIO-ISR-side rebootstrap.
+  //   • The NEXT physical PPS edge consumes the rebootstrap (re-phasing
+  //     the VCLOCK cadence) and alpha installs the epoch from that
+  //     snapshot, clearing g_epoch_pending.
+  //
+  // Beta's job here is simply to wait for alpha to complete the
+  // PPS-anchored install.  When g_epoch_pending clears, the campaign
+  // time base is aligned to a physical PPS moment and we can finalize
+  // the zero/start transition.
   if (request_zero || request_start) {
-    if (!zero_handshake_in_flight) {
-      interrupt_request_pps_zero();
-      zero_handshake_in_flight = true;
-      return;
-    }
-    if (interrupt_pps_zero_pending()) return;
+    if (clocks_epoch_pending()) return;
 
     clocks_zero_all();
 
-    zero_handshake_in_flight = false;
     request_zero = false;
 
     if (request_start) {
@@ -658,7 +664,6 @@ void clocks_beta_pps(void) {
     campaign_state = clocks_campaign_state_t::STOPPED;
     request_stop = false;
     request_zero = false;
-    zero_handshake_in_flight = false;
     calibrate_ocxo_mode = servo_mode_t::OFF;
     ocxo_dac_pacing_abort_all();
     timebase_invalidate();
@@ -668,7 +673,6 @@ void clocks_beta_pps(void) {
   if (request_recover) {
     watchdog_anomaly_active = false;
     request_zero = false;
-    zero_handshake_in_flight = false;
     ocxo_dac_pacing_abort_all();
 
     dwt_cycle_count_total = dwt_ns_to_cycles(recover_dwt_ns);
@@ -707,17 +711,21 @@ void clocks_beta_pps(void) {
 
   // VCLOCK measurement Welford — bridge-interpolation self-test.
   // Sample in ns; mean == ppb under the "ns/sec == ppb" identity.
-  if (g_vclock_measurement.prev_gnss_ns_at_edge != 0) {
+  //
+  // Guard: gnss_ns_between_edges is zero only on the first-edge bootstrap
+  // (clocks_apply_edge writes 0 when there's no previous edge).  Feeding
+  // that bootstrap 0 would pin welford_min to 0 and bias the mean.
+  if (g_vclock_measurement.gnss_ns_between_edges != 0) {
     welford_update(welford_vclock, (double)g_vclock_measurement.second_residual_ns);
   }
 
-  // OCXO measurement Welfords.
-  if (g_ocxo1_measurement.prev_gnss_ns_at_edge != 0) {
+  // OCXO measurement Welfords — same bootstrap guard.
+  if (g_ocxo1_measurement.gnss_ns_between_edges != 0) {
     welford_update(welford_ocxo1, (double)g_ocxo1_measurement.second_residual_ns);
     now_window_push(g_now_window_ocxo1, g_ocxo1_measurement.second_residual_ns);
   }
 
-  if (g_ocxo2_measurement.prev_gnss_ns_at_edge != 0) {
+  if (g_ocxo2_measurement.gnss_ns_between_edges != 0) {
     welford_update(welford_ocxo2, (double)g_ocxo2_measurement.second_residual_ns);
     now_window_push(g_now_window_ocxo2, g_ocxo2_measurement.second_residual_ns);
   }
@@ -744,6 +752,12 @@ void clocks_beta_pps(void) {
   p.add("dwt_cycle_count_at_pps", g_dwt_cycle_count_at_pps);
   p.add("dwt_cycle_count_between_pps", g_dwt_cycle_count_between_pps);
   p.add("dwt_expected_per_pps", (uint32_t)DWT_EXPECTED_PER_PPS);
+  // Instantaneous cycles residual: measured minus expected.
+  // Positive → Teensy CPU fast; negative → Teensy CPU slow.
+  // Same sign convention as dwt_ppb, same units as dwt_cycle_count_between_pps.
+  p.add("dwt_second_residual_cycles",
+        (int32_t)((int64_t)g_dwt_cycle_count_between_pps -
+                  (int64_t)DWT_EXPECTED_PER_PPS));
 
   // VCLOCK surface — authored facts + per-edge measurement + window accounting.
   p.add("vclock_qtimer_at_pps", g_qtimer_at_pps);
@@ -935,8 +949,9 @@ static Payload cmd_report(const Payload&) {
   p.add("request_stop", request_stop);
   p.add("request_recover", request_recover);
   p.add("request_zero", request_zero);
-  p.add("zero_handshake_in_flight", zero_handshake_in_flight);
-  p.add("interrupt_pps_zero_pending", interrupt_pps_zero_pending());
+  p.add("epoch_pending", clocks_epoch_pending());
+  p.add("interrupt_pps_rebootstrap_pending",
+        interrupt_pps_rebootstrap_pending());
   return p;
 }
 

@@ -5,41 +5,56 @@
 // process_interrupt owns interrupt custody for:
 //   • OCXO lanes (QTimer3 vector — CH2, CH3)
 //   • VCLOCK lane (QTimer1 CH3, via TimePop's hosted dispatch)
-//   • Physical PPS GPIO edge (witness + dispatch authority)
+//   • Physical PPS GPIO edge (witness + dispatch authority + epoch anchor)
 //
 // Doctrine — canonical GNSS clock authority:
 //
 //   The GNSS ns timeline is VCLOCK-driven.  The VCLOCK lane delivers one
 //   event per second to alpha's vclock_callback, which advances the
-//   bridge anchor and all canonical clock state.  Each event carries
-//   dwt_at_event (the ISR's first-instruction DWT capture),
-//   gnss_ns_at_event, and counter32_at_event — all ISR-captured facts
-//   or simple authored counts.  Alpha computes DWT cycles-between-events
-//   by one-second subtraction of consecutive dwt_at_event values.
+//   bridge anchor and all canonical clock state.
 //
-//   This arrangement exists to escape the latency and jitter of the
-//   physical PPS GPIO edge.  The physical edge is a real-world event;
-//   VCLOCK is the gear we set running by the first one and read ever
-//   after.
+//   The VCLOCK cadence itself is PPS-anchored.  On the first physical
+//   PPS edge after a rebootstrap request, the GPIO ISR captures the
+//   QTimer1 CH0+CH1 32-bit count AND the QTimer1 CH3 16-bit count as
+//   its first instructions (after the DWT capture), then re-programs
+//   CH3's compare target to fire exactly VCLOCK_INTERVAL_COUNTS ticks
+//   later — aligning the VCLOCK cadence with the physical PPS moment.
+//
+//   From that moment on, every VCLOCK one-second event fires exactly
+//   1 second after the PPS moment, and every Nth one-second event
+//   fires at QTimer1 count C0 + N*VCLOCK_COUNTS_PER_SECOND where C0 is
+//   the QTimer1 count captured at the PPS ISR.
+//
+//   This is the mechanism that gives "pulse identity" to VCLOCK cycles:
+//   before PPS anchor, "pulse N" is whatever tick the counter happened
+//   to label N after boot — arbitrary.  After PPS anchor, "pulse N" is
+//   the tick that coincided (to GPIO-ISR latency) with the physical
+//   PPS second boundary.
 //
 // Doctrine — physical PPS edge:
 //
-//   The physical PPS GPIO edge plays two narrow roles:
+//   The physical PPS GPIO edge plays three narrow roles:
 //
-//     1. DIAGNOSTIC.  The GPIO ISR captures DWT as its first
-//        instruction, translates to GNSS ns via the bridge, and stores
-//        a seqlock-protected pps_edge_snapshot_t (sequence, dwt, gnss_ns).
-//        Consumers read this via interrupt_last_pps_edge().  Under this
-//        doctrine, gnss_ns_at_edge IS the canonical "when did the
-//        physical PPS edge occur in GNSS ns" diagnostic.
+//     1. DIAGNOSTIC WITNESS.  Every edge populates a seqlock-protected
+//        pps_edge_snapshot_t with ISR-captured facts: sequence, DWT,
+//        QTimer1 CH0+CH1 (counter32), QTimer1 CH3, and the bridge-
+//        derived gnss_ns_at_edge.  Consumers read via
+//        interrupt_last_pps_edge().
 //
 //     2. DISPATCH AUTHORITY FOR TIMEBASE_FRAGMENT.  On every edge, the
 //        GPIO ISR arms timepop_arm_asap to invoke a single registered
 //        dispatch callback in foreground context.  That callback
-//        assembles and publishes TIMEBASE_FRAGMENT.
+//        publishes TIMEBASE_FRAGMENT.
 //
-//   The physical edge does NOT drive GNSS clock state.  VCLOCK remains
-//   the authority for all of that.
+//     3. EPOCH ANCHOR.  When a PPS rebootstrap is pending (armed by
+//        alpha), the next PPS edge re-aligns the VCLOCK cadence to the
+//        PPS moment.  The snapshot from that edge carries the counter
+//        values that define the epoch.
+//
+//   The physical PPS edge thus establishes phase identity for VCLOCK
+//   counting but does NOT drive per-second clock state advance.  Those
+//   advances remain the responsibility of vclock_callback, fed by the
+//   CH3 cadence now phase-locked to PPS.
 //
 // Per-lane cadence mechanics:
 //
@@ -53,22 +68,13 @@
 //   a single shot would overflow the compare target many times over, so
 //   the compare is advanced every 10,000 counts (1 ms) and re-armed.
 //
-//   On every 1 kHz tick the ISR does three things:
-//     1. Capture ARM_DWT_CYCCNT as the first instruction.
-//     2. Clear the compare flag.
-//     3. Advance the compare target by +10000 counts (16-bit wrapping).
-//
-//   Every 1000th tick additionally emits a one-second event to the
-//   lane's subscriber, carrying the ISR-entry DWT capture, the
-//   DWT-to-GNSS-ns translation, and an authored 32-bit count that
-//   advances by exactly 10,000,000 per event.
-//
 // Cadence sources:
 //   VCLOCK: QTimer1 CH3 compare, +10000 counts per interval (GNSS 10 MHz)
-//           ISR hosted by TimePop.
+//           ISR hosted by TimePop.  PPS-anchored via rebootstrap flow.
 //   OCXO1:  QTimer3 CH2 compare, +10000 counts per interval (OCXO1 10 MHz)
 //   OCXO2:  QTimer3 CH3 compare, +10000 counts per interval (OCXO2 10 MHz)
-//   PPS:    Physical GPIO edge from GNSS receiver (witness + dispatch only).
+//   PPS:    Physical GPIO edge from GNSS receiver (witness + dispatch +
+//           epoch anchor).
 //
 // ============================================================================
 
@@ -136,12 +142,16 @@ struct interrupt_event_t {
   uint32_t dwt_at_event = 0;
 
   // GNSS ns at the one-second event, computed by time_dwt_to_gnss_ns()
-  // from dwt_at_event.  May be 0 for the bootstrap VCLOCK event if the
-  // bridge is not yet valid (alpha treats that as epoch install).
+  // from dwt_at_event.  May be 0 for events emitted before the bridge
+  // has been anchored by alpha.
   uint64_t gnss_ns_at_event = 0;
 
   // Software-extended logical 32-bit count, advances by exactly
-  // 10,000,000 per event.
+  // 10,000,000 per event.  For the VCLOCK lane, this is re-seeded at
+  // PPS rebootstrap to match the QTimer1 CH0+CH1 count captured at the
+  // PPS edge — so counter32_at_event - snapshot.counter32_at_edge
+  // equals exactly N * VCLOCK_COUNTS_PER_SECOND for the Nth event
+  // after anchor.
   uint32_t counter32_at_event = 0;
 };
 
@@ -164,11 +174,16 @@ struct interrupt_capture_diag_t {
 
   // PPS GPIO witness fields.
   //
-  // These describe the physical PPS GPIO ISR path and are the ONLY fields
-  // in this struct that should be used for PPS-latency / PPS-jitter
-  // analysis.  Populated only on the VCLOCK diag.  They are refreshed in
-  // alpha's pps_edge_callback from the authoritative pps_edge_snapshot_t
+  // Populated only on the VCLOCK diag.  Refreshed in alpha's
+  // pps_edge_callback from the authoritative pps_edge_snapshot_t
   // captured in the GPIO ISR.
+  //
+  // Under PPS-anchored operation, pps_edge_minus_event_ns is the
+  // per-edge measurement that answers "how consistent is the GPIO-ISR
+  // latency between the physical PPS edge and its coincident VCLOCK
+  // one-second event."  Its mean is the DC latency; its stddev is
+  // the jitter.  In steady state the mean is tens of nanoseconds
+  // (GPIO ISR prologue cost) and the stddev is very small.
   uint32_t pps_edge_sequence = 0;
   uint32_t pps_edge_dwt_isr_entry_raw = 0;
   int64_t  pps_edge_gnss_ns = -1;
@@ -176,29 +191,11 @@ struct interrupt_capture_diag_t {
 
   // ── Bridge-independent VCLOCK-to-edge phase diagnostics ──
   //
-  // These three fields expose the phase relationship between the physical
-  // PPS edge and the most recent VCLOCK one-second event, WITHOUT going
-  // through the DWT↔GNSS bridge.  They are pure ISR-captured facts and
-  // arithmetic, and reveal the boot-determined phase offset between the
-  // VCLOCK cadence and the physical PPS cadence.
-  //
-  //   pps_edge_dwt_cycles_from_vclock
-  //     = snap.dwt_at_edge − g_prev_dwt_at_vclock_event
-  //     (32-bit subtraction; wraps correctly across DWT_CYCCNT rollover).
-  //     In steady state this is the DWT distance from the most recent
-  //     VCLOCK one-second event to the physical PPS edge that followed it.
-  //
-  //   pps_edge_ns_from_vclock
-  //     = pps_edge_dwt_cycles_from_vclock × 1e9 / dwt_effective_cycles_per_second()
-  //     Same quantity in nanoseconds, using the same divisor the bridge
-  //     uses for interpolation (apples-to-apples with pps_edge_gnss_ns).
-  //
-  //   pps_edge_vclock_event_count
-  //     = number of times vclock_callback has been entered, as observed
-  //     from pps_edge_callback.  In steady state this should equal
-  //     (g_gnss_ns_count_at_pps / 1e9) at publish time, confirming that
-  //     no VCLOCK event slipped in between the GPIO ISR and the
-  //     foreground pps_edge_callback.
+  // Same information in a form that does NOT depend on the DWT↔GNSS
+  // bridge.  Pure ISR-captured facts plus integer arithmetic.  Under
+  // PPS-anchored operation, pps_edge_ns_from_vclock should stay very
+  // close to zero — the GPIO edge and the VCLOCK one-second moment
+  // are the same event up to GPIO-ISR latency.
   uint32_t pps_edge_dwt_cycles_from_vclock = 0;
   int64_t  pps_edge_ns_from_vclock = 0;
   uint32_t pps_edge_vclock_event_count = 0;
@@ -210,25 +207,28 @@ struct interrupt_capture_diag_t {
 // Physical PPS edge snapshot — captured in the GPIO ISR
 // ============================================================================
 //
-// On every physical PPS rising edge, the GPIO ISR captures DWT as its
-// first instruction, translates to GNSS ns via the bridge (if valid),
-// and stores this snapshot.  Access is seqlock-protected; callers use
-// interrupt_last_pps_edge() for a torn-read-safe copy.
+// On every physical PPS rising edge, the GPIO ISR captures — in this
+// order, as its first instructions after the DWT capture —
 //
-// gnss_ns_at_edge is -1 on the first edges after boot if the bridge has
-// not yet been validated by VCLOCK.  In steady state — VCLOCK has been
-// disciplined, bridge is valid — gnss_ns_at_edge is the canonical
-// answer to "when did the physical PPS edge occur, expressed in GNSS
-// nanoseconds."
+//   • QTimer1 CH0+CH1 cascaded 32-bit counter (the VCLOCK count)
+//   • QTimer1 CH3 16-bit counter (the VCLOCK cadence channel)
 //
-// The sequence field advances monotonically and is used by consumers
-// to detect missed edges.
+// These captures define the PPS moment in terms of the VCLOCK counter
+// hardware.  When a rebootstrap request is pending, the ISR additionally
+// reprograms CH3's compare target so the next 1 ms cadence tick fires
+// exactly VCLOCK_INTERVAL_COUNTS ticks after the PPS moment — phase-
+// locking the VCLOCK one-second cadence to the physical PPS edge.
+//
+// Access is seqlock-protected; callers use interrupt_last_pps_edge()
+// for a torn-read-safe copy.
 //
 
 struct pps_edge_snapshot_t {
-  uint32_t sequence        = 0;
-  uint32_t dwt_at_edge     = 0;
-  int64_t  gnss_ns_at_edge = -1;
+  uint32_t sequence          = 0;
+  uint32_t dwt_at_edge       = 0;
+  uint32_t counter32_at_edge = 0;   // QTimer1 CH0+CH1 32-bit count at ISR entry
+  uint16_t ch3_at_edge       = 0;   // QTimer1 CH3 count at ISR entry
+  int64_t  gnss_ns_at_edge   = -1;
 };
 
 // ============================================================================
@@ -253,9 +253,12 @@ struct interrupt_subscription_t {
 // Invoked from foreground context (via timepop_arm_asap) exactly once
 // per physical PPS edge.  The snapshot is a stable copy of the state
 // captured in the GPIO ISR at first instruction.  The registered
-// callback's responsibility is narrow: stash gnss_ns_at_edge into the
-// TIMEBASE_FRAGMENT-bound diag, and call clocks_beta_pps() to publish
-// the fragment.
+// callback's responsibilities:
+//
+//   1. If g_epoch_pending is true (i.e. alpha is waiting for a PPS-
+//      anchored epoch install), install the epoch from snap.
+//   2. Stash witness fields into the TIMEBASE_FRAGMENT-bound diag.
+//   3. Call clocks_beta_pps() to publish the fragment.
 //
 
 using pps_edge_dispatch_fn = void (*)(const pps_edge_snapshot_t& snap);
@@ -273,8 +276,27 @@ bool interrupt_subscribe(const interrupt_subscription_t& sub);
 bool interrupt_start(interrupt_subscriber_kind_t kind);
 bool interrupt_stop(interrupt_subscriber_kind_t kind);
 
-void interrupt_request_pps_zero(void);
-bool interrupt_pps_zero_pending(void);
+// ── PPS-anchored epoch installation ──
+//
+// Alpha calls interrupt_request_pps_rebootstrap() when it needs a fresh
+// PPS-anchored epoch (at boot, at ZERO, at START).  The next physical
+// PPS edge will:
+//   • Capture the VCLOCK counter at ISR entry.
+//   • Reprogram CH3's compare target to fire VCLOCK_INTERVAL_COUNTS
+//     ticks later, aligning the VCLOCK cadence with the PPS moment.
+//   • Reset the VCLOCK lane's tick_mod_1000 to 0 so the first post-
+//     anchor one-second event fires exactly VCLOCK_COUNTS_PER_SECOND
+//     ticks after PPS.
+//   • Seed logical_count32 from snap.counter32_at_edge so subsequent
+//     counter32_at_event values maintain the hardware-count identity.
+//   • Clear the rebootstrap pending flag.
+//
+// interrupt_pps_rebootstrap_pending() returns true if the flag is set
+// (i.e. a rebootstrap is armed but the next PPS edge has not yet
+// consumed it).
+//
+void interrupt_request_pps_rebootstrap(void);
+bool interrupt_pps_rebootstrap_pending(void);
 
 const interrupt_event_t* interrupt_last_event(interrupt_subscriber_kind_t kind);
 const interrupt_capture_diag_t* interrupt_last_diag(interrupt_subscriber_kind_t kind);

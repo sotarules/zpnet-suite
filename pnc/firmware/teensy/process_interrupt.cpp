@@ -20,38 +20,26 @@
 //                 (clocked by OCXO2 10 MHz; PCS=3)
 //                 ISR is owned directly by process_interrupt.
 //
-// The 1 kHz cadence exists for exactly one reason: the QuadTimer compare
-// registers are 16-bit.  Advancing by 10,000,000 counts per second in a
-// single shot would overflow the compare target many times over, so the
-// compare is advanced every 10,000 counts (1 ms) and re-armed.
+// Physical PPS GPIO — witness, dispatch authority, and epoch anchor:
 //
-// On every 1 kHz tick the ISR does three things:
-//   1. Capture ARM_DWT_CYCCNT as the first instruction.
-//   2. Clear the compare flag.
-//   3. Advance the compare target by +10000 counts (16-bit wrapping).
+//   The GPIO ISR captures DWT as its first instruction, and as
+//   immediately-following instructions captures QTimer1 CH0+CH1 (the
+//   cascaded 32-bit VCLOCK counter) and QTimer1 CH3 (the cadence
+//   channel).  These three captures define the PPS moment in
+//   hardware-counter terms.
 //
-// Every 1000th tick additionally emits a one-second event to the lane's
-// subscriber, carrying:
-//   • dwt_at_event       — the ISR's first-instruction DWT capture.
-//   • gnss_ns_at_event   — time_dwt_to_gnss_ns(dwt_at_event).
-//   • counter32_at_event — software-extended logical count, advanced by
-//                          exactly 10,000,000 per event.
+//   When a rebootstrap request is pending (armed by alpha), the ISR
+//   ALSO reprograms CH3's compare target so the next 1 ms cadence tick
+//   fires VCLOCK_INTERVAL_COUNTS ticks after the PPS moment, and
+//   resets the VCLOCK lane's tick_mod_1000 to 0.  This phase-locks
+//   the VCLOCK one-second event cadence to the physical PPS edge:
+//   from that moment on, vclock_callback fires exactly N seconds
+//   after PPS (plus GPIO ISR latency, which is consistent).
 //
-// Subscribers (alpha's vclock_callback, ocxo1_callback, ocxo2_callback)
-// receive these one-second events via timepop_arm_asap-deferred dispatch.
-//
-// Physical PPS GPIO — witness and dispatch authority:
-//
-//   The physical PPS GPIO edge plays two narrow roles:
-//
-//     1. WITNESS.  The GPIO ISR captures DWT as its first instruction,
-//        translates to GNSS ns via the bridge, stores a seqlock-
-//        protected pps_edge_snapshot_t.  Callers read the snapshot via
-//        interrupt_last_pps_edge().
-//
-//     2. DISPATCH.  The GPIO ISR arms timepop_arm_asap to invoke a
-//        single registered dispatch callback (alpha's pps_edge_callback)
-//        in foreground context.  That callback publishes TIMEBASE_FRAGMENT.
+//   This is the mechanism that gives pulse identity to VCLOCK cycles.
+//   Before PPS anchor, "which VCLOCK tick is the second boundary" is
+//   boot-random.  After PPS anchor, it's the tick coincident with the
+//   physical PPS edge.
 //
 // See process_interrupt.h for the one-second event and snapshot contracts.
 // ============================================================================
@@ -123,7 +111,16 @@ static uint32_t g_subscriber_count = 0;
 static bool g_interrupt_hw_ready = false;
 static bool g_interrupt_runtime_ready = false;
 static bool g_interrupt_irqs_enabled = false;
-static volatile bool g_pps_zero_pending = false;
+
+// PPS-anchored VCLOCK rebootstrap flag.  When set by alpha via
+// interrupt_request_pps_rebootstrap(), the next physical PPS GPIO
+// edge will re-phase the CH3 cadence to align with the PPS moment.
+// Cleared by the GPIO ISR once the rebootstrap has been applied.
+static volatile bool g_pps_rebootstrap_pending = false;
+
+// Accumulated count of rebootstraps the ISR has actually performed.
+// Useful for diagnostics / REPORT.
+static volatile uint32_t g_pps_rebootstrap_count = 0;
 
 static interrupt_subscriber_runtime_t* g_rt_vclock = nullptr;
 static interrupt_subscriber_runtime_t* g_rt_ocxo1  = nullptr;
@@ -185,10 +182,12 @@ static uint32_t g_gpio_irq_count = 0;
 static uint32_t g_gpio_miss_count = 0;
 
 struct pps_edge_snapshot_store_t {
-  volatile uint32_t seq             = 0;
-  volatile uint32_t sequence        = 0;
-  volatile uint32_t dwt_at_edge     = 0;
-  volatile int64_t  gnss_ns_at_edge = -1;
+  volatile uint32_t seq               = 0;
+  volatile uint32_t sequence          = 0;
+  volatile uint32_t dwt_at_edge       = 0;
+  volatile uint32_t counter32_at_edge = 0;
+  volatile uint16_t ch3_at_edge       = 0;
+  volatile int64_t  gnss_ns_at_edge   = -1;
 };
 
 static pps_edge_snapshot_store_t g_pps_edge_store;
@@ -199,10 +198,10 @@ static inline void dmb_barrier(void) {
 }
 
 // ============================================================================
-// QTimer1 32-bit counter (diagnostic read)
+// QTimer1 32-bit counter (diagnostic read and ISR-entry capture)
 // ============================================================================
 
-static uint32_t qtimer1_read_32_for_diag(void) {
+static inline uint32_t qtimer1_read_32_for_diag(void) {
   const uint16_t lo1 = IMXRT_TMR1.CH[0].CNTR;
   const uint16_t hi1 = IMXRT_TMR1.CH[1].HOLD;
   const uint16_t lo2 = IMXRT_TMR1.CH[0].CNTR;
@@ -244,6 +243,7 @@ static inline void qtimer3_program_compare(uint8_t ch, uint16_t target_low16) {
   qtimer3_clear_compare_flag(ch);
   IMXRT_TMR3.CH[ch].CSCTRL |= TMR_CSCTRL_TCF1EN;
 }
+
 static inline void qtimer3_disable_compare(uint8_t ch) {
   IMXRT_TMR3.CH[ch].CSCTRL &= ~TMR_CSCTRL_TCF1EN;
   qtimer3_clear_compare_flag(ch);
@@ -313,9 +313,6 @@ static void deferred_dispatch_callback(timepop_ctx_t*, timepop_diag_t*, void* us
   auto* rt = static_cast<interrupt_subscriber_runtime_t*>(user_data);
   if (!rt || !rt->desc) return;
   maybe_dispatch_event(*rt);
-  if (rt->desc->kind == interrupt_subscriber_kind_t::VCLOCK && g_pps_zero_pending) {
-    g_pps_zero_pending = false;
-  }
 }
 
 static void emit_one_second_event(interrupt_subscriber_runtime_t& rt,
@@ -341,7 +338,6 @@ static void emit_one_second_event(interrupt_subscriber_runtime_t& rt,
   rt.last_diag = diag;
   rt.has_fired = true;
   rt.event_count++;
-  rt.dispatch_count++;
 
   timepop_arm_asap(deferred_dispatch_callback, &rt, dispatch_timer_name(rt.desc->kind));
 }
@@ -459,7 +455,7 @@ static void qtimer3_isr(void) {
 }
 
 // ============================================================================
-// Physical PPS GPIO — witness + dispatch authority
+// Physical PPS GPIO — witness, dispatch authority, epoch anchor
 // ============================================================================
 
 static void pps_edge_dispatch_trampoline(timepop_ctx_t*, timepop_diag_t*, void*) {
@@ -469,6 +465,18 @@ static void pps_edge_dispatch_trampoline(timepop_ctx_t*, timepop_diag_t*, void*)
 }
 
 void process_interrupt_gpio6789_irq(uint32_t dwt_isr_entry_raw) {
+  // ── First-instruction captures ──
+  //
+  // Read the VCLOCK counter state IMMEDIATELY after the DWT capture.
+  // These three captures (DWT, counter32, ch3) define the PPS moment
+  // in hardware-counter terms.  Total additional cost vs. the old ISR
+  // is ~8 loads (counter32 is dual-read for cascade safety).  At
+  // 1 GHz this is on the order of tens of nanoseconds — well under
+  // one VCLOCK period.
+  //
+  const uint32_t counter32 = qtimer1_read_32_for_diag();
+  const uint16_t ch3_now   = IMXRT_TMR1.CH[3].CNTR;
+
   g_gpio_irq_count++;
   g_pps_gpio_witness.edge_count++;
   g_pps_gpio_witness.last_dwt = dwt_isr_entry_raw;
@@ -476,11 +484,44 @@ void process_interrupt_gpio6789_irq(uint32_t dwt_isr_entry_raw) {
   const int64_t gnss_ns = time_dwt_to_gnss_ns(dwt_isr_entry_raw);
   g_pps_gpio_witness.last_gnss_ns = gnss_ns;
 
+  // ── PPS-anchored VCLOCK rebootstrap ──
+  //
+  // If alpha has armed a rebootstrap, consume the flag and re-phase
+  // the VCLOCK cadence so that:
+  //
+  //   • The next CH3 compare-match fires exactly VCLOCK_INTERVAL_COUNTS
+  //     ticks after ch3_now (1 ms after the PPS moment).
+  //   • tick_mod_1000 is reset to 0 so the first post-anchor one-second
+  //     event fires exactly VCLOCK_COUNTS_PER_SECOND ticks after PPS.
+  //   • logical_count32_at_last_second is seeded from counter32 so
+  //     subsequent counter32_at_event values maintain the hardware-
+  //     count identity: counter32_at_event N seconds after anchor
+  //     equals counter32 + N * VCLOCK_COUNTS_PER_SECOND.
+  //
+  // The rebootstrap runs in GPIO ISR priority (0) and therefore
+  // preempts the QTimer1 CH3 ISR (priority 16 via TimePop).  No race
+  // with vclock_cadence_isr can occur here.
+  //
+  if (g_pps_rebootstrap_pending) {
+    g_pps_rebootstrap_pending = false;
+    g_pps_rebootstrap_count++;
+
+    g_vclock_lane.phase_bootstrapped = true;
+    g_vclock_lane.tick_mod_1000 = 0;
+    g_vclock_lane.compare_target =
+        (uint16_t)(ch3_now + (uint16_t)VCLOCK_INTERVAL_COUNTS);
+    g_vclock_lane.logical_count32_at_last_second = counter32;
+    qtimer1_ch3_program_compare(g_vclock_lane.compare_target);
+  }
+
+  // ── Snapshot publication (seqlock) ──
   g_pps_edge_store.seq++;
   dmb_barrier();
-  g_pps_edge_store.sequence        = g_pps_gpio_witness.edge_count;
-  g_pps_edge_store.dwt_at_edge     = dwt_isr_entry_raw;
-  g_pps_edge_store.gnss_ns_at_edge = gnss_ns;
+  g_pps_edge_store.sequence          = g_pps_gpio_witness.edge_count;
+  g_pps_edge_store.dwt_at_edge       = dwt_isr_entry_raw;
+  g_pps_edge_store.counter32_at_edge = counter32;
+  g_pps_edge_store.ch3_at_edge       = ch3_now;
+  g_pps_edge_store.gnss_ns_at_edge   = gnss_ns;
   dmb_barrier();
   g_pps_edge_store.seq++;
 
@@ -503,9 +544,11 @@ pps_edge_snapshot_t interrupt_last_pps_edge(void) {
   for (int attempt = 0; attempt < 4; attempt++) {
     const uint32_t s1 = g_pps_edge_store.seq;
     dmb_barrier();
-    out.sequence        = g_pps_edge_store.sequence;
-    out.dwt_at_edge     = g_pps_edge_store.dwt_at_edge;
-    out.gnss_ns_at_edge = g_pps_edge_store.gnss_ns_at_edge;
+    out.sequence          = g_pps_edge_store.sequence;
+    out.dwt_at_edge       = g_pps_edge_store.dwt_at_edge;
+    out.counter32_at_edge = g_pps_edge_store.counter32_at_edge;
+    out.ch3_at_edge       = g_pps_edge_store.ch3_at_edge;
+    out.gnss_ns_at_edge   = g_pps_edge_store.gnss_ns_at_edge;
     dmb_barrier();
     const uint32_t s2 = g_pps_edge_store.seq;
     if (s1 == s2 && (s1 & 1u) == 0u) return out;
@@ -535,8 +578,9 @@ bool interrupt_start(interrupt_subscriber_kind_t kind) {
 
   if (kind == interrupt_subscriber_kind_t::VCLOCK) {
     g_vclock_lane.active = true;
-    g_vclock_lane.phase_bootstrapped = false;
-    g_vclock_lane.tick_mod_1000 = 0;
+    // Leave phase_bootstrapped as-is.  If set (by a prior PPS rebootstrap
+    // or a prior cadence ISR), respect it.  If unset, the next cadence
+    // ISR will bootstrap.
     qtimer1_ch3_program_compare((uint16_t)(IMXRT_TMR1.CH[3].CNTR + 1));
     return true;
   }
@@ -570,8 +614,15 @@ bool interrupt_stop(interrupt_subscriber_kind_t kind) {
   return true;
 }
 
-void interrupt_request_pps_zero(void) { g_pps_zero_pending = true; }
-bool interrupt_pps_zero_pending(void) { return g_pps_zero_pending; }
+// ── PPS-anchored epoch installation (public API) ──
+
+void interrupt_request_pps_rebootstrap(void) {
+  g_pps_rebootstrap_pending = true;
+}
+
+bool interrupt_pps_rebootstrap_pending(void) {
+  return g_pps_rebootstrap_pending;
+}
 
 const interrupt_event_t* interrupt_last_event(interrupt_subscriber_kind_t kind) {
   interrupt_subscriber_runtime_t* rt = runtime_for(kind);
@@ -663,7 +714,8 @@ void process_interrupt_init(void) {
   g_pps_gpio_witness = pps_gpio_witness_t{};
   g_gpio_irq_count = 0;
   g_gpio_miss_count = 0;
-  g_pps_zero_pending = false;
+  g_pps_rebootstrap_pending = false;
+  g_pps_rebootstrap_count = 0;
 
   g_pps_edge_store = pps_edge_snapshot_store_t{};
   g_pps_edge_dispatch = nullptr;
@@ -697,7 +749,8 @@ static Payload cmd_report(const Payload&) {
   p.add("runtime_ready", g_interrupt_runtime_ready);
   p.add("irqs_enabled", g_interrupt_irqs_enabled);
   p.add("subscriber_count", g_subscriber_count);
-  p.add("pps_zero_pending", g_pps_zero_pending);
+  p.add("pps_rebootstrap_pending", g_pps_rebootstrap_pending);
+  p.add("pps_rebootstrap_count", g_pps_rebootstrap_count);
 
   p.add("gpio_irq_count", g_gpio_irq_count);
   p.add("gpio_miss_count", g_gpio_miss_count);
@@ -708,6 +761,8 @@ static Payload cmd_report(const Payload&) {
   const pps_edge_snapshot_t snap = interrupt_last_pps_edge();
   p.add("pps_edge_sequence", snap.sequence);
   p.add("pps_edge_dwt", snap.dwt_at_edge);
+  p.add("pps_edge_counter32", snap.counter32_at_edge);
+  p.add("pps_edge_ch3", (uint32_t)snap.ch3_at_edge);
   p.add("pps_edge_gnss_ns_snapshot", snap.gnss_ns_at_edge);
   p.add("pps_edge_dispatch_registered", g_pps_edge_dispatch != nullptr);
 

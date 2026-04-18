@@ -9,6 +9,28 @@
 //   says.  This prevents diffusion of authority and gives every downstream
 //   consumer a single well-defined source of truth.
 //
+// Epoch authority:
+//
+//   The canonical epoch is PPS-anchored.  At INIT / ZERO / START, alpha
+//   calls interrupt_request_pps_rebootstrap() + sets g_epoch_pending.
+//   The next physical PPS GPIO edge:
+//
+//     - Is captured in the GPIO ISR with (DWT, counter32, ch3) as
+//       first-instruction captures.
+//     - Triggers an in-ISR re-phasing of the VCLOCK CH3 cadence so that
+//       subsequent one-second events fire at PPS moments plus a
+//       consistent GPIO ISR latency.
+//     - Fires pps_edge_callback, which installs the epoch from the
+//       snapshot: g_epoch_dwt_at_pps = snap.dwt_at_edge,
+//       g_epoch_qtimer_at_pps = snap.counter32_at_edge,
+//       g_gnss_ns_count_at_pps = 0, g_epoch_pps_edge_sequence =
+//       snap.sequence.
+//
+//   After install, vclock_callback becomes a pure per-second advancer:
+//   each invocation advances g_gnss_ns_count_at_pps by exactly 1e9,
+//   and the VCLOCK cadence it responds to is phase-locked to the
+//   physical PPS edge.
+//
 // Statistical surface (standardized):
 //
 //   Every Welford accumulator published in the fragment uses the same
@@ -27,7 +49,14 @@
 //     vclock_welford     — bridge interpolation residual samples (ns)
 //     ocxo1_welford      — OCXO1 per-second residual samples (ns)
 //     ocxo2_welford      — OCXO2 per-second residual samples (ns)
-//     pps_witness_welford — GPIO PPS witness offset samples (ns)
+//     pps_witness_welford — PPS/VCLOCK phase-error samples (ns).
+//                          SOURCE: snap.counter32_at_edge minus the
+//                          projected post-epoch expected counter32
+//                          (g_epoch_qtimer_at_pps + edges-since-epoch ×
+//                          VCLOCK_COUNTS_PER_SECOND), scaled to ns.
+//                          Independent of foreground callback ordering.
+//                          Steady-state mean = GPIO ISR entry latency;
+//                          steady-state SD = jitter floor.
 //     ocxo1_dac_welford  — OCXO1 DAC fractional code samples (LSB)
 //     ocxo2_dac_welford  — OCXO2 DAC fractional code samples (LSB)
 //
@@ -41,7 +70,8 @@
 //   Frequency-bearing clocks (four total):
 //     dwt, vclock, ocxo1, ocxo2
 //
-//   (pps_witness is a DC phase offset; has no frequency interpretation.)
+//   (pps_witness is a phase-error measurement; has no frequency
+//   interpretation.)
 //
 // Sign convention:
 //
@@ -57,19 +87,26 @@
 // Authorship map:
 //
 //   - g_gnss_ns_count_at_pps       advanced by alpha::vclock_callback
+//                                  (set to 0 at PPS-anchored epoch install;
+//                                  +1e9 per subsequent VCLOCK one-second
+//                                  event)
 //   - g_dwt_cycle_count_at_pps     captured from the VCLOCK event's ISR
-//                                  first-instruction DWT
+//                                  first-instruction DWT; at epoch install
+//                                  seeded from snap.dwt_at_edge
 //   - g_dwt_cycle_count_between_pps  one-second subtraction of consecutive
 //                                    event DWT captures (honest measurement)
 //   - g_qtimer_at_pps              event.counter32_at_event (authored
-//                                  10M-per-event VCLOCK count, not an
-//                                  ambient read)
+//                                  10M-per-event VCLOCK count); at epoch
+//                                  install seeded from snap.counter32_at_edge
+//   - g_epoch_qtimer_at_pps        snap.counter32_at_edge at install
+//   - g_epoch_pps_edge_sequence    snap.sequence at install (for projecting
+//                                  expected counter32 at each subsequent edge)
 //
 // VCLOCK as measured peer of OCXO:
 //
 //   VCLOCK is a measured peer of OCXO1/OCXO2.  The same clock_state_t
 //   and clock_measurement_t structs are used for VCLOCK, OCXO1, OCXO2.
-//   alpha::vclock_apply_edge has an identical body to alpha::ocxo_apply_edge.
+//   clocks_apply_edge has an identical body across all three.
 //
 //   Because VCLOCK drives the DWT↔GNSS bridge anchor itself, its
 //   second_residual_ns should sit very close to zero with very small
@@ -154,8 +191,7 @@ static constexpr int64_t CLOCK_WINDOW_TOLERANCE_NS = 500LL;
 // ============================================================================
 //
 // VCLOCK and OCXO1/OCXO2 use field-for-field identical struct shapes.
-// Populated by alpha's vclock_apply_edge / ocxo_apply_edge, which have
-// identical bodies.
+// Populated by alpha's clocks_apply_edge, called for all three.
 //
 
 struct clock_state_t {
@@ -347,7 +383,8 @@ extern uint64_t recover_ocxo2_ns;
 //   welford_vclock       — bridge interpolation residual, in ns
 //   welford_ocxo1        — OCXO1 per-second residual, in ns
 //   welford_ocxo2        — OCXO2 per-second residual, in ns
-//   welford_pps_witness  — GPIO PPS witness offset, in ns
+//   welford_pps_witness  — PPS/VCLOCK phase error, in ns
+//                          (counter32-based, ordering-independent)
 //   welford_ocxo1_dac    — OCXO1 DAC fractional code, in LSB
 //   welford_ocxo2_dac    — OCXO2 DAC fractional code, in LSB
 //
@@ -406,6 +443,16 @@ void clocks_watchdog_anomaly(const char* reason,
                              uint32_t detail1 = 0,
                              uint32_t detail2 = 0,
                              uint32_t detail3 = 0);
+
+// ============================================================================
+// Alpha accessors visible to beta
+// ============================================================================
+
+// Returns the state of alpha's PPS-anchored epoch install handshake.
+// Beta waits on this transitioning to false during ZERO/START.  When
+// false, the canonical clock state has been aligned to a physical PPS
+// edge.
+bool clocks_epoch_pending(void);
 
 // ============================================================================
 // Zeroing

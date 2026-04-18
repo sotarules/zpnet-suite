@@ -1,29 +1,50 @@
 // ============================================================================
-// process_clocks_alpha.cpp — Always-On Physics Layer
+// process_clocks_alpha.cpp — Always-On Physics Layer (PPS-anchored)
 // ============================================================================
 //
 // Dispatch doctrine:
 //
-//   GNSS clock state is VCLOCK-driven.  The vclock_callback subscribes to
-//   the VCLOCK lane's one-second event (QTimer1 CH3 cadence, every 1000
-//   ticks at 10 MHz = 1 s of real time) and advances all canonical clock
-//   state: epoch install, g_gnss_ns_count_at_pps, g_dwt_cycle_count_at_pps,
-//   g_qtimer_at_pps, time_pps_update, OCXO phase ledger, and the measured
-//   VCLOCK phase ledger.
+//   GNSS clock state is VCLOCK-driven AND PPS-anchored.
 //
-//   GNSS nanoseconds are AUTHORED from VCLOCK pulses.  VCLOCK is the
-//   GNSS-disciplined 10 MHz reference — the time-locked physical
-//   quantity.  Each VCLOCK pulse is exactly 100 ns of GNSS time; each
-//   one-second event represents exactly VCLOCK_COUNTS_PER_SECOND
-//   pulses, i.e. 1e9 ns.
+//   The vclock_callback subscribes to the VCLOCK lane's one-second event
+//   (QTimer1 CH3 cadence, every 1000 ticks at 10 MHz = 1 s of real time)
+//   and advances canonical clock state every second: g_gnss_ns_count_at_pps,
+//   g_dwt_cycle_count_at_pps, g_qtimer_at_pps, time_pps_update, OCXO phase
+//   ledger, and the measured VCLOCK phase ledger.
 //
-//   DWT cycles-between-events is computed by simple one-second
-//   subtraction of consecutive event.dwt_at_event values — the honest
-//   measurement.
+//   The VCLOCK cadence itself is phase-locked to the physical PPS edge
+//   by a one-shot rebootstrap mechanism in process_interrupt.cpp.  When
+//   alpha needs a fresh epoch (at INIT, ZERO, or START), it calls
+//   interrupt_request_pps_rebootstrap() and sets g_epoch_pending.  The
+//   NEXT physical PPS GPIO edge:
 //
-//   The physical PPS GPIO edge is demoted to two narrow roles:
-//     1. A diagnostic witness (pps_edge_gnss_ns in the fragment).
-//     2. The trigger for TIMEBASE_FRAGMENT publication.
+//     1. Is captured in the GPIO ISR with (DWT, counter32, ch3) as
+//        first instructions.
+//     2. Triggers an in-ISR re-phasing of the VCLOCK cadence so that
+//        the first subsequent CH3 compare-match fires exactly 1 ms
+//        after the PPS moment, and the first subsequent one-second
+//        event fires exactly 1 s after the PPS moment.
+//     3. Fires the pps_edge_callback, which — seeing g_epoch_pending
+//        — installs the epoch from the snapshot.
+//
+//   From that point on, every VCLOCK one-second event is coincident
+//   with a physical PPS edge (to within GPIO ISR latency).  The PPS
+//   witness measurement thereafter measures only that residual latency
+//   and its jitter — the hallmark of a true PPS/VCLOCK phase lock.
+//
+//   "Pulse identity" is thus established by fiat: the PPS edge that
+//   triggered the rebootstrap DEFINES which VCLOCK tick is the second
+//   boundary.  From the system's point of view, PPS is now phase-
+//   locked to VCLOCK — because we defined it that way.
+//
+// GNSS nanoseconds are AUTHORED from VCLOCK pulses.  VCLOCK is the
+// GNSS-disciplined 10 MHz reference.  Each VCLOCK pulse is exactly
+// 100 ns of GNSS time; each one-second event represents exactly
+// VCLOCK_COUNTS_PER_SECOND pulses, i.e. 1e9 ns.
+//
+// DWT cycles-between-events is computed by simple one-second
+// subtraction of consecutive event.dwt_at_event values — the honest
+// measurement.
 //
 // Per-edge measurement — symmetric template:
 //
@@ -114,20 +135,19 @@ static volatile uint32_t g_epoch_dwt_at_pps = 0;
 static volatile uint32_t g_epoch_qtimer_at_pps = 0;
 static volatile uint64_t g_epoch_pps_index = 0;
 
+// Physical PPS GPIO edge sequence at the moment of epoch install.
+// Used by the PPS witness phase measurement to project the expected
+// hardware-counter value at each subsequent edge.
+static volatile uint32_t g_epoch_pps_edge_sequence = 0;
+
 // One-second subtraction state for VCLOCK DWT cycles-between-events.
 // Seeded at epoch install; updated each VCLOCK one-second event.
-//
-// Independent of g_vclock_measurement.prev_dwt_at_edge — they track
-// the same physical quantity but feed different downstream consumers
-// (this one feeds g_dwt_cycle_count_between_pps; the measurement field
-// feeds clocks_apply_edge).
 static volatile uint32_t g_prev_dwt_at_vclock_event = 0;
 
-// VCLOCK entry counter — increments on every vclock_callback invocation,
-// including the epoch-install invocation.  Read by pps_edge_callback to
-// cross-check that no VCLOCK event slipped in between the GPIO ISR and
-// the foreground pps_edge_callback.  Deliberately NOT reset across epoch
-// resets so warmup behavior is visible.
+// VCLOCK entry counter — increments on every vclock_callback invocation
+// AFTER epoch install.  Read by pps_edge_callback to cross-check that no
+// VCLOCK event slipped in between the GPIO ISR and the foreground
+// pps_edge_callback.
 static volatile uint32_t g_vclock_event_count = 0;
 
 // ============================================================================
@@ -265,6 +285,14 @@ static void pps_relay_deassert(timepop_ctx_t*, timepop_diag_t*, void*) {
   relay_timer_active = false;
 }
 
+static inline void pps_relay_pulse(void) {
+  digitalWriteFast(GNSS_PPS_RELAY, HIGH);
+  if (!relay_timer_active) {
+    relay_timer_active = true;
+    timepop_arm(PPS_RELAY_OFF_NS, false, pps_relay_deassert, nullptr, "pps-relay-off");
+  }
+}
+
 // ============================================================================
 // DWT enable + epoch helpers
 // ============================================================================
@@ -278,6 +306,18 @@ static inline void dwt_enable(void) {
 static void alpha_request_epoch_zero(clocks_epoch_reason_t reason) {
   g_epoch_pending = true;
   g_epoch_reason = reason;
+  // Arm the GPIO ISR to re-phase the VCLOCK cadence on the next PPS
+  // edge.  Without this, the epoch pending flag would be noticed by
+  // pps_edge_callback but the CH3 cadence would continue its boot-
+  // random phase — defeating the entire purpose of anchoring.
+  interrupt_request_pps_rebootstrap();
+}
+
+// Accessor for beta — inspects the alpha-owned epoch pending flag.
+// Beta waits on this during ZERO/START handshakes; when it clears,
+// the PPS-anchored epoch has been installed and beta can finalize.
+bool clocks_epoch_pending(void) {
+  return g_epoch_pending;
 }
 
 static inline bool alpha_ocxo_edges_are_canonical(void) {
@@ -291,6 +331,7 @@ static void alpha_reset_canonical_clock_state_for_new_epoch(void) {
   g_dwt_cycle_count_between_pps = DWT_EXPECTED_PER_PPS;
   g_qtimer_at_pps = 0;
   g_prev_dwt_at_vclock_event = 0;
+  g_vclock_event_count = 0;
 
   g_vclock_clock = {};
   g_vclock_measurement = {};
@@ -306,28 +347,48 @@ static void alpha_reset_canonical_clock_state_for_new_epoch(void) {
   gnss_raw_64           = 0;
   ocxo1_ticks_64        = 0;
   ocxo2_ticks_64        = 0;
+
+  welford_reset(welford_dwt);
+  welford_reset(welford_vclock);
+  welford_reset(welford_ocxo1);
+  welford_reset(welford_ocxo2);
+  welford_reset(welford_pps_witness);
 }
 
-static void alpha_install_new_epoch_from_vclock_event(
-    const interrupt_event_t& vclock_event) {
-  g_epoch_initialized = true;
-  g_epoch_pending = false;
-  g_epoch_generation++;
-  g_epoch_pps_index = 1;
-
-  g_epoch_dwt_at_pps = vclock_event.dwt_at_event;
-  g_epoch_qtimer_at_pps = vclock_event.counter32_at_event;
-
+// ============================================================================
+// Epoch install — PPS-anchored, ONE entry point
+// ============================================================================
+//
+// Called from pps_edge_callback when g_epoch_pending is true.  By the
+// time we're here, the GPIO ISR has already re-phased the VCLOCK cadence
+// (via the interrupt_request_pps_rebootstrap mechanism), so the next
+// vclock_callback will fire exactly 1 second after the PPS moment
+// represented by `snap`.
+//
+// The epoch IS the PPS moment:
+//   g_gnss_ns_count_at_pps = 0      (the PPS edge IS time zero)
+//   g_dwt_cycle_count_at_pps = snap.dwt_at_edge
+//   g_epoch_qtimer_at_pps = snap.counter32_at_edge
+//   g_epoch_pps_edge_sequence = snap.sequence
+//
+static void alpha_install_new_epoch_from_pps_snapshot(
+    const pps_edge_snapshot_t& snap) {
   alpha_reset_canonical_clock_state_for_new_epoch();
 
-  g_gnss_ns_count_at_pps = NS_PER_SECOND_U64;
-  g_dwt_cycle_count_at_pps = vclock_event.dwt_at_event;
-  g_qtimer_at_pps = g_epoch_qtimer_at_pps;
+  g_epoch_dwt_at_pps        = snap.dwt_at_edge;
+  g_epoch_qtimer_at_pps     = snap.counter32_at_edge;
+  g_epoch_pps_edge_sequence = snap.sequence;
+  g_epoch_pps_index         = 0;
 
-  g_prev_dwt_at_vclock_event = vclock_event.dwt_at_event;
-  g_dwt_cycle_count_between_pps = DWT_EXPECTED_PER_PPS;
+  g_dwt_cycle_count_at_pps = snap.dwt_at_edge;
+  g_qtimer_at_pps          = snap.counter32_at_edge;
+  g_prev_dwt_at_vclock_event = snap.dwt_at_edge;
 
-  time_pps_epoch_reset(vclock_event.dwt_at_event, g_epoch_qtimer_at_pps);
+  time_pps_epoch_reset(snap.dwt_at_edge, snap.counter32_at_edge);
+
+  g_epoch_initialized = true;
+  g_epoch_pending     = false;
+  g_epoch_generation++;
 }
 
 // ============================================================================
@@ -382,7 +443,7 @@ static void clocks_apply_edge(clock_state_t& clock,
 }
 
 // ============================================================================
-// VCLOCK callback — the authoritative GNSS-ns advancer
+// VCLOCK callback — pure per-second advancer (epoch install moved to PPS)
 // ============================================================================
 
 static void vclock_callback(
@@ -390,24 +451,22 @@ static void vclock_callback(
     const interrupt_capture_diag_t* diag,
     void*) {
 
-  // Increment the VCLOCK entry counter at the very top, before any branch.
-  g_vclock_event_count++;
-
+  // Stash the VCLOCK-event diag (contains PPS witness fields refreshed
+  // by process_interrupt's fill_diag at event emission time).
   if (diag) g_pps_interrupt_diag = *diag;
   else      g_pps_interrupt_diag = {};
 
   g_last_pps_event_counter32_at_event = event.counter32_at_event;
 
+  // Defensive guard: if the epoch has not yet been installed by the
+  // first PPS edge, do nothing.  The VCLOCK cadence may still be in
+  // its pre-rebootstrap phase; any state advance here would poison
+  // the epoch.
   if (!g_epoch_initialized || g_epoch_pending) {
-    alpha_install_new_epoch_from_vclock_event(event);
-
-    digitalWriteFast(GNSS_PPS_RELAY, HIGH);
-    if (!relay_timer_active) {
-      relay_timer_active = true;
-      timepop_arm(PPS_RELAY_OFF_NS, false, pps_relay_deassert, nullptr, "pps-relay-off");
-    }
     return;
   }
+
+  g_vclock_event_count++;
 
   // ── Canonical per-second advance ──
   g_epoch_pps_index++;
@@ -437,13 +496,6 @@ static void vclock_callback(
   // (no phase-offset adjustment because VCLOCK is the reference).
   g_vclock_clock.ns_count_at_pps = g_gnss_ns_count_at_pps;
 
-  // ── PPS witness welford: accumulate the GPIO-vs-authored offset ──
-  if (g_pps_interrupt_diag.pps_edge_sequence > 0 &&
-      g_pps_interrupt_diag.pps_edge_gnss_ns >= 0) {
-    welford_update(welford_pps_witness,
-                   (double)g_pps_interrupt_diag.pps_edge_minus_event_ns);
-  }
-
   // ── OCXO phase ledger refresh at VCLOCK cadence ──
   if (g_ocxo1_clock.zero_established) {
     g_ocxo1_clock.ns_count_at_pps =
@@ -461,46 +513,77 @@ static void vclock_callback(
   time_pps_update(g_dwt_cycle_count_at_pps,
                   dwt_effective_cycles_per_second(),
                   g_qtimer_at_pps);
+}
 
+// ============================================================================
+// Physical PPS GPIO edge — epoch anchor + witness + fragment dispatch
+// ============================================================================
+//
+// This runs in foreground context, armed by the GPIO ISR via
+// timepop_arm_asap.  By the time we're here, the GPIO ISR has already:
+//   • Captured (DWT, counter32, ch3) into the snapshot.
+//   • If rebootstrap was pending, re-phased the VCLOCK CH3 cadence.
+//
+// Our responsibilities (in order):
+//   1. If ZERO or START is requested and epoch is stable, arm a
+//      rebootstrap so the NEXT PPS edge re-anchors.  (Does not affect
+//      the current edge.)
+//   2. If the epoch is pending, install it from this snapshot.
+//   3. Compute and stash the PPS witness diagnostic fields.
+//   4. Update the PPS witness welford with a VCLOCK-phase-error
+//      measurement that is INDEPENDENT of foreground callback ordering.
+//   5. Trigger TIMEBASE_FRAGMENT publication via clocks_beta_pps().
+//
+static void pps_edge_callback(const pps_edge_snapshot_t& snap) {
+
+  // ── Step 1: arm a future rebootstrap if a request is outstanding ──
+  //
+  // We check this BEFORE installing the epoch from the current snap,
+  // because if ZERO was requested after the current PPS edge fired in
+  // hardware (but before we got to foreground), we don't want to
+  // consume this edge — we want the NEXT one.  alpha_request_epoch_zero
+  // sets both g_epoch_pending AND arms the rebootstrap flag.
   if ((request_zero || request_start) && !g_epoch_pending) {
     alpha_request_epoch_zero(request_start
                                ? clocks_epoch_reason_t::START
                                : clocks_epoch_reason_t::ZERO);
+    // Do NOT install now — this PPS edge was not rebootstrap-aligned.
+    // Fall through to publish the fragment with pre-install state;
+    // the next edge will consume the pending request.
   }
 
-  digitalWriteFast(GNSS_PPS_RELAY, HIGH);
-  if (!relay_timer_active) {
-    relay_timer_active = true;
-    timepop_arm(PPS_RELAY_OFF_NS, false, pps_relay_deassert, nullptr, "pps-relay-off");
+  // ── Step 2: install the epoch from this snapshot if pending ──
+  //
+  // By invariant, if we're here with g_epoch_pending and the GPIO ISR
+  // successfully processed a rebootstrap, this snap describes that very
+  // edge.  The VCLOCK cadence is now phase-locked to this edge.
+  if (g_epoch_pending && !interrupt_pps_rebootstrap_pending()) {
+    alpha_install_new_epoch_from_pps_snapshot(snap);
   }
-}
 
-// ============================================================================
-// Physical PPS GPIO edge — witness + TIMEBASE_FRAGMENT publication trigger
-// ============================================================================
-
-static void pps_edge_callback(const pps_edge_snapshot_t& snap) {
-  // Stash the authoritative witness fields from the snapshot.
-  g_pps_interrupt_diag.pps_edge_sequence = snap.sequence;
+  // ── Step 3: stash witness fields for the fragment ──
+  //
+  // pps_edge_minus_event_ns is the bridge-vs-authored offset: how far
+  // apart is the bridge-derived GPIO edge timestamp from the authored
+  // GNSS ns counter?  Its interpretation depends on whether the VCLOCK
+  // one-second event for this second has been processed in foreground
+  // yet (it might not have been — see vclock_callback ordering notes).
+  // We publish it for diagnostic continuity but do NOT feed it to the
+  // welford, because its variance includes foreground ordering noise.
+  g_pps_interrupt_diag.pps_edge_sequence          = snap.sequence;
   g_pps_interrupt_diag.pps_edge_dwt_isr_entry_raw = snap.dwt_at_edge;
-  g_pps_interrupt_diag.pps_edge_gnss_ns = snap.gnss_ns_at_edge;
+  g_pps_interrupt_diag.pps_edge_gnss_ns           = snap.gnss_ns_at_edge;
   g_pps_interrupt_diag.pps_edge_minus_event_ns =
       (snap.gnss_ns_at_edge >= 0)
           ? (snap.gnss_ns_at_edge - (int64_t)g_gnss_ns_count_at_pps)
           : 0;
 
-  // ── Bridge-independent VCLOCK-to-edge phase diagnostics ──
-  //
-  // Sample VCLOCK-authored state into locals before computing derived
-  // values, so the three published fields are consistent with each
-  // other even if vclock_callback (priority 16) preempts us.
+  // Bridge-independent VCLOCK-to-edge phase diagnostics.
   const uint32_t vclock_count_local = g_vclock_event_count;
   const uint32_t prev_dwt_local     = g_prev_dwt_at_vclock_event;
   const uint32_t dwt_per_sec_local  = dwt_effective_cycles_per_second();
-
   const uint32_t dwt_cycles_from_vclock =
       snap.dwt_at_edge - prev_dwt_local;
-
   int64_t ns_from_vclock = 0;
   if (dwt_per_sec_local > 0) {
     ns_from_vclock =
@@ -508,10 +591,50 @@ static void pps_edge_callback(const pps_edge_snapshot_t& snap) {
                    + (uint64_t)dwt_per_sec_local / 2)
                   / (uint64_t)dwt_per_sec_local);
   }
-
   g_pps_interrupt_diag.pps_edge_dwt_cycles_from_vclock = dwt_cycles_from_vclock;
   g_pps_interrupt_diag.pps_edge_ns_from_vclock = ns_from_vclock;
   g_pps_interrupt_diag.pps_edge_vclock_event_count = vclock_count_local;
+
+  // ── Step 4: ordering-independent PPS witness phase measurement ──
+  //
+  // Under PPS-anchored operation, the expected hardware counter value
+  // at each subsequent PPS edge is:
+  //
+  //   expected_counter32 = g_epoch_qtimer_at_pps
+  //                      + (snap.sequence - g_epoch_pps_edge_sequence)
+  //                        * VCLOCK_COUNTS_PER_SECOND
+  //
+  // The difference (snap.counter32_at_edge - expected_counter32) is
+  // the "phase error" — how many VCLOCK ticks past the expected
+  // moment the GPIO ISR captured the counter.  In steady state this
+  // is a small positive number reflecting GPIO ISR entry latency;
+  // its JITTER is the diagnostic we care about.  Multiplied by 100
+  // (ns per VCLOCK tick), it becomes nanoseconds.
+  //
+  // This measurement is:
+  //   • Independent of foreground callback ordering.
+  //   • Independent of the DWT↔GNSS bridge math.
+  //   • Pure hardware counter arithmetic.
+  //
+  // If the mean drifts, PPS and VCLOCK are NOT phase-locked and
+  // something is wrong with the discipline.  If the mean stays
+  // constant and SD is small, we have a proven phase lock.
+  //
+  if (g_epoch_initialized && !g_epoch_pending &&
+      snap.sequence >= g_epoch_pps_edge_sequence) {
+    const uint32_t edges_since_epoch =
+        snap.sequence - g_epoch_pps_edge_sequence;
+    const uint32_t expected_counter32 =
+        g_epoch_qtimer_at_pps
+        + edges_since_epoch * (uint32_t)VCLOCK_COUNTS_PER_SECOND;
+    const int32_t phase_error_counts =
+        (int32_t)(snap.counter32_at_edge - expected_counter32);
+    const double phase_error_ns = (double)phase_error_counts * 100.0;
+    welford_update(welford_pps_witness, phase_error_ns);
+  }
+
+  // ── Step 5: publish TIMEBASE_FRAGMENT + assert relay ──
+  pps_relay_pulse();
 
   if (campaign_state == clocks_campaign_state_t::STARTED ||
       request_start || request_stop || request_recover || request_zero) {
@@ -565,6 +688,8 @@ void process_clocks_init(void) {
   time_init();
   timebase_init();
 
+  // Arm the first PPS-anchored epoch install.  No VCLOCK-event bootstrap
+  // path exists anymore — the first PPS edge WILL be the anchor.
   alpha_request_epoch_zero(clocks_epoch_reason_t::INIT);
 
   g_ad5693r_init_ok = ad5693r_init();
