@@ -272,6 +272,28 @@ def clocks_combined_readout() -> list[str]:
         f"  {_baseline_comp(baseline_ppb.get('gnss'), gnss_ppb)}"
     )
 
+    # ── VCLOCK (measured peer of OCXO1/OCXO2; GNSS-disciplined 10 MHz reference) ──
+    vclock_ns = _to_int(_frag(r, "vclock_ns_count_at_pps"))
+    vclock_tau = _to_float(_frag(r, "vclock_tau"))
+    vclock_ppb = _to_float(_frag(r, "vclock_ppb"))
+    vclock_raw = _to_int(_frag(r, "vclock_gnss_ns_between_edges"))
+    vclock_res = _to_int(_frag(r, "vclock_second_residual_ns"))
+    vclock_mean = _to_float(_frag(r, "vclock_welford_mean"))
+    vclock_sd = _to_float(_frag(r, "vclock_welford_stddev"))
+    vclock_n = _to_int(_frag(r, "vclock_welford_n"))
+    lines.append(
+        f"{'VCLOCK':<{W_NAME}}"
+        f"{_comma_int(vclock_ns, W_VALUE)}"
+        f"{_fmt(vclock_tau, f'>{W_TAU}.12f', W_TAU)}"
+        f"{_fmt(vclock_ppb, f'>{W_PPB}.3f', W_PPB)}"
+        f"{_comma_int(vclock_raw, W_RAW)}"
+        f"{_sign_int(vclock_res, W_RES)}"
+        f"{_fmt(vclock_mean, f'>{W_MEAN}.3f', W_MEAN)}"
+        f"{_fmt(vclock_sd, f'>{W_SD}.3f', W_SD)}"
+        f"{_fmt(vclock_n, f'>{W_N}d', W_N)}"
+        f"  {_baseline_comp(baseline_ppb.get('vclock'), vclock_ppb)}"
+    )
+
     # ── GNSS_RAW ──
     gnss_raw_ns = _to_int(_extra(r, "gnss_raw_ns"))
     gnss_raw_tau = _to_float(_extra(r, "gnss_raw_tau"))

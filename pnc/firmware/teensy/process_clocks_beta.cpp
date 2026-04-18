@@ -5,13 +5,26 @@
 // Post rolling-integration removal:
 //   - clocks_payload_add_ocxo_diag slimmed to match the trimmed
 //     interrupt_capture_diag_t: event facts + anomaly_count only.
-//   - clocks_payload_add_pps_diag delegates to the slimmer
-//     ocxo publisher and adds the GPIO witness fields plus three new
+//   - clocks_payload_add_pps_diag delegates to the slimmer ocxo
+//     publisher and adds the GPIO witness fields plus three new
 //     bridge-independent VCLOCK-to-edge phase diagnostics:
 //     pps_edge_dwt_cycles_from_vclock, pps_edge_ns_from_vclock,
 //     pps_edge_vclock_event_count.
 //   - All integrator_* and boundary_dwt_isr_entry_* publications removed
 //     — those fields no longer exist.
+//
+// VCLOCK as measured peer of OCXO:
+//   - g_vclock_clock and g_vclock_measurement now hold real measurements
+//     produced by alpha's vclock_apply_edge() (parallel to ocxo_apply_edge),
+//     not the previous fictional constants.
+//   - Beta now publishes vclock_* fields symmetrically with ocxo1_*/ocxo2_*:
+//     vclock_phase_offset_ns, vclock_zero_established, vclock_window_*.
+//   - residual_vclock now feeds from g_vclock_measurement.second_residual_ns
+//     (per-edge bridge-interpolation residual).  Welford on this is a
+//     self-test of bridge consistency and should sit very close to zero.
+//   - residual_pps_witness is the new name for what residual_vclock used
+//     to be: GPIO PPS witness offset from g_gnss_ns_count_at_pps, fed by
+//     alpha's pps_edge_callback.  Published as pps_witness_welford_*.
 //
 // DWT cycles-between-PPS-events semantics:
 //   - g_dwt_cycle_count_between_pps is now the one-second subtraction
@@ -19,8 +32,8 @@
 //     vclock_callback), not a synthetic SMA output.
 //
 // PPS provenance:
-//   - residual_vclock is fed by alpha's pps_edge_callback from the GPIO
-//     witness snapshot.  Beta does NOT update it locally.
+//   - residual_pps_witness is fed by alpha's pps_edge_callback from the
+//     GPIO witness snapshot.  Beta does NOT update it locally.
 //   - The "pps_diag" published prefix still identifies the VCLOCK lane's
 //     diag, which is the only lane carrying GPIO PPS witness fields.
 //     The prefix string is preserved verbatim to keep the over-the-wire
@@ -95,10 +108,11 @@ volatile uint32_t watchdog_anomaly_trigger_dwt     = 0;
 // Residual tracking
 // ============================================================================
 
-pps_residual_t residual_dwt    = {};
-pps_residual_t residual_vclock = {};   // fed from alpha (GPIO witness)
-pps_residual_t residual_ocxo1  = {};
-pps_residual_t residual_ocxo2  = {};
+pps_residual_t residual_dwt          = {};
+pps_residual_t residual_vclock       = {};   // fed by beta from g_vclock_measurement (bridge self-test)
+pps_residual_t residual_pps_witness  = {};   // fed by alpha's pps_edge_callback (GPIO witness offset)
+pps_residual_t residual_ocxo1        = {};
+pps_residual_t residual_ocxo2        = {};
 
 void residual_reset(pps_residual_t& r) {
   r.residual = 0;
@@ -221,13 +235,6 @@ static void clocks_payload_add_pps_diag(Payload& p,
   add_u32("pps_edge_dwt_isr_entry_raw", diag.pps_edge_dwt_isr_entry_raw);
   add_i64("pps_edge_gnss_ns", diag.pps_edge_gnss_ns);
   add_i64("pps_edge_minus_event_ns", diag.pps_edge_minus_event_ns);
-
-  // Bridge-independent VCLOCK-to-edge phase diagnostics (authored by
-  // alpha's pps_edge_callback from g_prev_dwt_at_vclock_event and
-  // g_vclock_event_count, not via the DWT↔GNSS bridge).
-  add_u32("pps_edge_dwt_cycles_from_vclock", diag.pps_edge_dwt_cycles_from_vclock);
-  add_i64("pps_edge_ns_from_vclock", diag.pps_edge_ns_from_vclock);
-  add_u32("pps_edge_vclock_event_count", diag.pps_edge_vclock_event_count);
 }
 
 // ============================================================================
@@ -433,6 +440,7 @@ void clocks_zero_all(void) {
 
   residual_reset(residual_dwt);
   residual_reset(residual_vclock);
+  residual_reset(residual_pps_witness);
   residual_reset(residual_ocxo1);
   residual_reset(residual_ocxo2);
 
@@ -684,8 +692,15 @@ void clocks_beta_pps(void) {
       residual_dwt,
       (int64_t)dwt_effective_cycles_per_second() - (int64_t)DWT_EXPECTED_PER_PPS);
 
-  // residual_vclock is fed by alpha's pps_edge_callback from the GPIO
+  // residual_pps_witness is fed by alpha's pps_edge_callback from the GPIO
   // PPS witness.  We do NOT update it here.
+
+  // VCLOCK measurement Welford — symmetric with the OCXO pumps below.
+  // Self-test signal: bridge-derived ns-between-edges minus 1e9.  Should
+  // sit very close to zero.
+  if (g_vclock_measurement.prev_gnss_ns_at_edge != 0) {
+    residual_update_sample(residual_vclock, g_vclock_measurement.second_residual_ns);
+  }
 
   if (g_ocxo1_measurement.prev_gnss_ns_at_edge != 0) {
     residual_update_sample(residual_ocxo1, g_ocxo1_measurement.second_residual_ns);
@@ -718,12 +733,24 @@ void clocks_beta_pps(void) {
   p.add("dwt_effective_cycles_per_second", dwt_effective_cycles_per_second());
   p.add("dwt_expected_per_pps", (uint32_t)DWT_EXPECTED_PER_PPS);
 
-  // VCLOCK authored facts.
+  // VCLOCK authored facts + measured peer-clock surface (symmetric with OCXO).
   p.add("vclock_qtimer_at_pps", g_qtimer_at_pps);
   p.add("vclock_ns_count_at_pps", g_vclock_clock.ns_count_at_pps);
-  p.add("vclock_ticks_between_pps", g_vclock_measurement.ticks_between_pps);
-  p.add("vclock_ns_between_pps", g_vclock_measurement.ns_between_pps);
+
+  // Per-edge measurement (sourced from g_vclock_measurement; symmetric
+  // with ocxo1_*/ocxo2_* publications below).  These now carry real
+  // values produced by alpha's vclock_apply_edge() rather than the
+  // fictional constants the previous version published.
+  p.add("vclock_gnss_ns_between_edges", g_vclock_measurement.gnss_ns_between_edges);
+  p.add("vclock_dwt_cycles_between_edges", g_vclock_measurement.dwt_cycles_between_edges);
   p.add("vclock_second_residual_ns", g_vclock_measurement.second_residual_ns);
+
+  p.add("vclock_phase_offset_ns", g_vclock_clock.phase_offset_ns);
+  p.add("vclock_zero_established", g_vclock_clock.zero_established);
+
+  p.add("vclock_window_checks", g_vclock_clock.window_checks);
+  p.add("vclock_window_mismatches", g_vclock_clock.window_mismatches);
+  p.add("vclock_window_error_ns", g_vclock_clock.window_error_ns);
 
   // OCXO coarse truth surface.
   p.add("ocxo1_ns_count_at_pps", g_ocxo1_clock.ns_count_at_pps);
@@ -774,12 +801,30 @@ void clocks_beta_pps(void) {
   p.add("dwt_welford_mean", residual_dwt.mean, 3);
   p.add("dwt_welford_stddev", residual_stddev(residual_dwt), 3);
 
-  // VCLOCK residual = GPIO PPS witness offset (the new truth).
+  // VCLOCK measurement Welford — bridge-interpolation self-test.
+  // For the canonical reference clock this should be tightly bound to zero;
+  // any non-zero mean or notable stddev is a diagnostic about the bridge
+  // or DWT bookkeeping rather than the clock itself.
+  if (residual_vclock.n > 0) {
+    const double vclock_ppb_val = residual_vclock.mean;
+    const double vclock_tau_val = 1.0 + vclock_ppb_val / 1e9;
+    p.add("vclock_tau", vclock_tau_val, 12);
+    p.add("vclock_ppb", vclock_ppb_val, 3);
+  }
   p.add("vclock_welford_n", residual_vclock.n);
   p.add("vclock_welford_mean", residual_vclock.mean, 3);
   p.add("vclock_welford_stddev", residual_stddev(residual_vclock), 3);
   p.add("vclock_welford_min", residual_vclock.min_val, 3);
   p.add("vclock_welford_max", residual_vclock.max_val, 3);
+
+  // PPS witness Welford — GPIO PPS witness offset from g_gnss_ns_count_at_pps.
+  // Mean reveals DC bias (boot-determined V→PPS phase + epoch-install
+  // off-by-one); stddev reveals GPIO detection latency jitter.
+  p.add("pps_witness_welford_n", residual_pps_witness.n);
+  p.add("pps_witness_welford_mean", residual_pps_witness.mean, 3);
+  p.add("pps_witness_welford_stddev", residual_stddev(residual_pps_witness), 3);
+  p.add("pps_witness_welford_min", residual_pps_witness.min_val, 3);
+  p.add("pps_witness_welford_max", residual_pps_witness.max_val, 3);
 
   // OCXO residuals.
   if (residual_ocxo1.n > 0) {

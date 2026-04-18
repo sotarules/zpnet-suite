@@ -34,11 +34,21 @@
 //                                    VCLOCK one-second event.  Not an
 //                                    ambient counter read.
 //
-//   - VCLOCK measurement state reflects the fact that the VCLOCK lane
-//     DEFINES the second: its ticks_between_pps is exactly
-//     TICKS_10MHZ_PER_SECOND, its ns_between_pps is exactly 1e9, and its
-//     second_residual_ns is 0 by construction.  These invariants are
-//     written unconditionally per event.
+// Doctrine note (VCLOCK as measured peer of OCXO):
+//
+//   VCLOCK is now treated as a real measured clock peer to OCXO1/OCXO2.
+//   Its measurement state (vclock_clock_state_t / vclock_measurement_t)
+//   is field-for-field identical in shape to ocxo_clock_state_t /
+//   ocxo_measurement_t.  Per-event measurement runs through
+//   vclock_apply_edge() in alpha, parallel to ocxo_apply_edge().
+//
+//   Self-test property:
+//     Because the VCLOCK lane drives the bridge anchor itself, the
+//     bridge-derived per-event delta should always equal exactly 1e9
+//     (modulo DWT measurement noise and dwt_effective_cycles_per_second
+//     estimation noise).  Any non-zero second_residual_ns is a
+//     diagnostic signal about DWT bookkeeping rather than about the
+//     clock itself.
 //
 // ============================================================================
 
@@ -97,46 +107,89 @@ extern volatile uint32_t g_qtimer_at_pps;
 extern volatile uint32_t g_last_pps_event_counter32_at_event;
 
 // ============================================================================
-// VCLOCK canonical state (alpha-owned, beta-readable)
+// VCLOCK / OCXO common tolerance
 // ============================================================================
 //
-// Field semantics:
-//   counter32_at_pps_event    = event.counter32_at_event (authored,
-//                               advances by exactly 10,000,000 per
-//                               VCLOCK one-second event — not a live
-//                               counter read)
-//   counter32_at_pps_expected = same as event (vestigial dual rail)
-//   counter32_error_at_pps    = always 0 by construction (vestigial)
-//   ns_count_at_pps           = N × 1e9 (cumulative authored GNSS ns)
-//   ns_count_expected_at_pps  = same (vestigial dual rail)
+// Window-error tolerance applies symmetrically to all measured clocks
+// (VCLOCK, OCXO1, OCXO2).  A window-error magnitude exceeding this
+// constant on the bridge-derived between-edges interval increments
+// window_mismatches.
+
+static constexpr int64_t CLOCK_WINDOW_TOLERANCE_NS = 500LL;
+
+// Backward-compat alias for existing references.
+static constexpr int64_t OCXO_WINDOW_TOLERANCE_NS = CLOCK_WINDOW_TOLERANCE_NS;
+
+// ============================================================================
+// VCLOCK canonical state — symmetric with OCXO
+// ============================================================================
+//
+// VCLOCK is a measured peer of OCXO1/OCXO2.  These structs are
+// field-for-field identical in shape to ocxo_clock_state_t /
+// ocxo_measurement_t, populated by vclock_apply_edge() in alpha.
 //
 
 struct vclock_clock_state_t {
-  volatile uint32_t counter32_at_pps_event;
-  volatile uint32_t counter32_at_pps_expected;
-  volatile int32_t  counter32_error_at_pps;
+  // Cumulative authored ns count at the VCLOCK edge being applied
+  // (advances by exactly 1e9 each call to vclock_apply_edge after the
+  // first).  Same role as ocxo_clock_state_t::ns_count_at_edge.
+  volatile uint64_t ns_count_at_edge;
 
+  // GNSS ns at the edge as reported by the bridge for this VCLOCK
+  // event.  Carried verbatim from event.gnss_ns_at_event.
+  volatile uint64_t gnss_ns_at_edge;
+
+  // Cumulative authored ns count refreshed at PPS (canonical advance).
   volatile uint64_t ns_count_at_pps;
-  volatile uint64_t ns_count_expected_at_pps;
 
-  volatile bool zero_established;
-};
+  // (gnss_ns_at_edge − ns_count_at_edge).  For VCLOCK this should be
+  // very close to zero on every edge after the first; non-zero values
+  // surface bridge-interpolation drift.
+  volatile int64_t  phase_offset_ns;
 
-struct vclock_measurement_t {
-  volatile uint32_t ticks_between_pps;     // always TICKS_10MHZ_PER_SECOND
-  volatile uint64_t ns_between_pps;        // always 1e9
-  volatile int64_t  second_residual_ns;    // always 0
-  volatile uint32_t prev_counter32_at_pps_event;  // vestigial
+  // Set true on the first vclock_apply_edge call.
+  volatile bool     zero_established;
+
+  // Window-check accounting (window = one bridge-derived between-edges
+  // interval).  Mirrors OCXO semantics.
+  volatile uint32_t window_checks;
+  volatile uint32_t window_mismatches;
+  volatile int64_t  window_expected_ns;
+  volatile int64_t  window_actual_ns;
+  volatile int64_t  window_error_ns;
 };
 
 extern vclock_clock_state_t g_vclock_clock;
+
+struct vclock_measurement_t {
+  // Bridge-derived ns since previous edge minus 1e9.  Self-test signal:
+  // for VCLOCK this should be near zero, surfacing only DWT bookkeeping
+  // noise.  Same role as ocxo_measurement_t::second_residual_ns.
+  volatile int64_t  second_residual_ns;
+
+  // Bridge-derived ns elapsed between this edge and the previous one.
+  volatile uint64_t gnss_ns_between_edges;
+
+  // ISR-captured DWT at this edge.
+  volatile uint32_t dwt_at_edge;
+
+  // DWT cycles elapsed between this edge and the previous one.  Same
+  // semantics as ocxo_measurement_t::dwt_cycles_between_edges.  Note
+  // that g_dwt_cycle_count_between_pps tracks the same physical
+  // quantity through a separate path (one-second subtraction in
+  // vclock_callback) and is preserved for legacy callers.
+  volatile uint32_t dwt_cycles_between_edges;
+
+  // Previous-edge tracking, used to compute the deltas above.
+  volatile uint64_t prev_gnss_ns_at_edge;
+  volatile uint32_t prev_dwt_at_edge;
+};
+
 extern vclock_measurement_t g_vclock_measurement;
 
 // ============================================================================
 // OCXO canonical state — smart-zero phase model (unchanged)
 // ============================================================================
-
-static constexpr int64_t OCXO_WINDOW_TOLERANCE_NS = 500LL;
 
 struct ocxo_clock_state_t {
   volatile uint64_t ns_count_at_edge;
@@ -299,13 +352,20 @@ extern uint64_t recover_ocxo2_ns;
 // Residual tracking
 // ============================================================================
 //
-// residual_dwt    — DWT residual: (measured cycles between VCLOCK
-//                   one-second events) - DWT_EXPECTED_PER_PPS.
-// residual_vclock — GPIO PPS witness offset from the VCLOCK one-second
-//                   event.  Welford mean reveals DC bias, stddev reveals
-//                   true GPIO detection latency jitter.
-// residual_ocxo1  — OCXO1 second-to-second drift residual.
-// residual_ocxo2  — OCXO2 second-to-second drift residual.
+// residual_dwt          — DWT residual: (measured cycles between VCLOCK
+//                         one-second events) - DWT_EXPECTED_PER_PPS.
+// residual_vclock       — VCLOCK measurement residual: bridge-derived
+//                         ns-between-edges minus 1e9.  Self-test for
+//                         the bridge interpolation.  Should be near
+//                         zero with very small stddev.
+// residual_pps_witness  — GPIO PPS witness offset from the authored
+//                         g_gnss_ns_count_at_pps, accumulated from
+//                         pps_edge_callback.  Welford mean reveals DC
+//                         bias (boot-determined V→PPS phase + the
+//                         epoch-install off-by-one); stddev reveals
+//                         GPIO detection latency jitter.
+// residual_ocxo1        — OCXO1 second-to-second drift residual.
+// residual_ocxo2        — OCXO2 second-to-second drift residual.
 //
 
 struct pps_residual_t {
@@ -319,6 +379,7 @@ struct pps_residual_t {
 
 extern pps_residual_t residual_dwt;
 extern pps_residual_t residual_vclock;
+extern pps_residual_t residual_pps_witness;
 extern pps_residual_t residual_ocxo1;
 extern pps_residual_t residual_ocxo2;
 

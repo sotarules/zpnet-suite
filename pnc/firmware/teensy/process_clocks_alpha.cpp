@@ -8,9 +8,8 @@
 //   the VCLOCK lane's one-second event (QTimer1 CH3 cadence, every 1000
 //   ticks at 10 MHz = 1 s of real time) and advances all canonical clock
 //   state: epoch install, g_gnss_ns_count_at_pps, g_dwt_cycle_count_at_pps,
-//   g_qtimer_at_pps, time_pps_update, OCXO phase ledger.  DWT is captured
-//   as the first instruction of the CH3 ISR and carried into the event
-//   verbatim.
+//   g_qtimer_at_pps, time_pps_update, OCXO phase ledger, and now the
+//   measured-VCLOCK phase ledger as well.
 //
 //   GNSS nanoseconds are AUTHORED from VCLOCK pulses.  VCLOCK is the
 //   GNSS-disciplined 10 MHz reference — the time-locked physical
@@ -28,6 +27,21 @@
 //
 //   The PPS witness fields are refreshed coherently in pps_edge_callback()
 //   from the authoritative pps_edge_snapshot_t.
+//
+// VCLOCK as measured peer of OCXO (new):
+//
+//   vclock_apply_edge() is called from vclock_callback in the canonical
+//   advance branch.  It is structurally identical to ocxo_apply_edge():
+//   same signature, same first-edge handling, same subsequent-edge math.
+//   The result is that g_vclock_clock and g_vclock_measurement now hold
+//   real measurements rather than the fictional constants the previous
+//   code wrote.
+//
+//   For VCLOCK, second_residual_ns surfaces bridge-interpolation
+//   inconsistency rather than crystal drift.  It should sit very close
+//   to zero with very small stddev.  If it ever deviates, something is
+//   wrong with our DWT bookkeeping or with the dwt_effective_cycles_per_second
+//   estimator.
 //
 // Bridge-independent phase diagnostics:
 //
@@ -130,6 +144,11 @@ static volatile uint64_t g_epoch_pps_index = 0;
 
 // One-second subtraction state for VCLOCK DWT cycles-between-events.
 // Seeded at epoch install; updated each VCLOCK one-second event.
+//
+// This is independent of g_vclock_measurement.prev_dwt_at_edge:
+// they happen to track the same physical quantity but feed different
+// downstream consumers (this one feeds g_dwt_cycle_count_between_pps
+// and friends; the measurement field feeds vclock_apply_edge).
 static volatile uint32_t g_prev_dwt_at_vclock_event = 0;
 
 // VCLOCK entry counter — increments on every vclock_callback invocation,
@@ -349,19 +368,61 @@ static void alpha_install_new_epoch_from_vclock_event(
   g_dwt_cycle_count_next_second_prediction = DWT_EXPECTED_PER_PPS;
   g_dwt_cycle_count_next_second_adjustment = 0;
 
-  g_vclock_clock.counter32_at_pps_event = vclock_event.counter32_at_event;
-  g_vclock_clock.counter32_at_pps_expected = vclock_event.counter32_at_event;
-  g_vclock_clock.counter32_error_at_pps = 0;
-  g_vclock_clock.ns_count_at_pps = NS_PER_SECOND_U64;
-  g_vclock_clock.ns_count_expected_at_pps = NS_PER_SECOND_U64;
-  g_vclock_clock.zero_established = true;
-
-  g_vclock_measurement.ticks_between_pps = 0;
-  g_vclock_measurement.ns_between_pps = 0;
-  g_vclock_measurement.second_residual_ns = 0;
-  g_vclock_measurement.prev_counter32_at_pps_event = vclock_event.counter32_at_event;
+  // VCLOCK measurement state at install: leave zero_established=false and
+  // prev_*=0 so the first vclock_apply_edge call (next VCLOCK event) takes
+  // the first-edge branch, mirroring OCXO bootstrap semantics.
 
   time_pps_epoch_reset(vclock_event.dwt_at_event, g_epoch_qtimer_at_pps);
+}
+
+// ============================================================================
+// Per-edge measurement — symmetric template (shared shape with OCXO)
+// ============================================================================
+
+static void vclock_apply_edge(vclock_clock_state_t& clock,
+                              vclock_measurement_t& meas,
+                              uint32_t dwt_at_edge,
+                              uint64_t gnss_ns_at_edge) {
+
+  clock.gnss_ns_at_edge = gnss_ns_at_edge;
+  meas.dwt_at_edge = dwt_at_edge;
+
+  if (meas.prev_gnss_ns_at_edge == 0) {
+    clock.ns_count_at_edge = NS_PER_SECOND_U64;
+    clock.phase_offset_ns =
+        (int64_t)gnss_ns_at_edge - (int64_t)NS_PER_SECOND_U64;
+    clock.zero_established = true;
+
+    meas.gnss_ns_between_edges = 0;
+    meas.dwt_cycles_between_edges = 0;
+    meas.second_residual_ns = 0;
+  } else {
+    clock.ns_count_at_edge += NS_PER_SECOND_U64;
+    clock.phase_offset_ns =
+        (int64_t)gnss_ns_at_edge - (int64_t)clock.ns_count_at_edge;
+
+    const uint64_t gnss_ns_between_edges =
+        gnss_ns_at_edge - meas.prev_gnss_ns_at_edge;
+    const uint32_t dwt_cycles_between_edges =
+        dwt_at_edge - meas.prev_dwt_at_edge;
+
+    meas.gnss_ns_between_edges = gnss_ns_between_edges;
+    meas.dwt_cycles_between_edges = dwt_cycles_between_edges;
+    meas.second_residual_ns =
+        (int64_t)NS_PER_SECOND_U64 - (int64_t)gnss_ns_between_edges;
+
+    clock.window_expected_ns = (int64_t)NS_PER_SECOND_U64;
+    clock.window_actual_ns = (int64_t)gnss_ns_between_edges;
+    clock.window_error_ns =
+        (int64_t)gnss_ns_between_edges - (int64_t)NS_PER_SECOND_U64;
+    clock.window_checks++;
+    if (llabs(clock.window_error_ns) > CLOCK_WINDOW_TOLERANCE_NS) {
+      clock.window_mismatches++;
+    }
+  }
+
+  meas.prev_gnss_ns_at_edge = gnss_ns_at_edge;
+  meas.prev_dwt_at_edge = dwt_at_edge;
 }
 
 // ============================================================================
@@ -400,16 +461,6 @@ static void vclock_callback(
   g_dwt_cycle_count_at_pps = event.dwt_at_event;
   g_qtimer_at_pps = event.counter32_at_event;
 
-  g_vclock_measurement.ticks_between_pps = TICKS_10MHZ_PER_SECOND;
-  g_vclock_measurement.ns_between_pps = NS_PER_SECOND_U64;
-  g_vclock_measurement.second_residual_ns = 0;
-  g_vclock_clock.counter32_at_pps_event = event.counter32_at_event;
-  g_vclock_clock.counter32_at_pps_expected = event.counter32_at_event;
-  g_vclock_clock.counter32_error_at_pps = 0;
-  g_vclock_clock.ns_count_at_pps = g_gnss_ns_count_at_pps;
-  g_vclock_clock.ns_count_expected_at_pps = g_gnss_ns_count_at_pps;
-  g_vclock_measurement.prev_counter32_at_pps_event = event.counter32_at_event;
-
   // ── DWT cycles between VCLOCK one-second events: one-second subtraction ──
   //
   // Honest measurement: the number of DWT cycles elapsed between this
@@ -426,10 +477,23 @@ static void vclock_callback(
   g_dwt_cycle_count_total += (uint64_t)dwt_between;
   g_dwt_model_pps_count++;
 
+  // ── VCLOCK measurement (symmetric peer to OCXO) ──
+  //
+  // Skip when the bridge produced 0 (warmup / bridge not yet valid).
+  // Mirrors the OCXO callback's `if (event.gnss_ns_at_event == 0)` guard.
+  if (event.gnss_ns_at_event != 0) {
+    vclock_apply_edge(g_vclock_clock, g_vclock_measurement,
+                      event.dwt_at_event, event.gnss_ns_at_event);
+  }
+
+  // VCLOCK ns_count_at_pps is just the authored cumulative count
+  // (no phase-offset adjustment because VCLOCK is the reference).
+  g_vclock_clock.ns_count_at_pps = g_gnss_ns_count_at_pps;
+
   // ── Residual tracking from GPIO PPS witness offset ──
   if (g_pps_interrupt_diag.pps_edge_sequence > 0 &&
       g_pps_interrupt_diag.pps_edge_gnss_ns >= 0) {
-    residual_update_sample(residual_vclock,
+    residual_update_sample(residual_pps_witness,
                            g_pps_interrupt_diag.pps_edge_minus_event_ns);
   }
 
@@ -557,7 +621,7 @@ static void ocxo_apply_edge(ocxo_clock_state_t& clock,
     clock.window_error_ns =
         (int64_t)gnss_ns_between_edges - (int64_t)NS_PER_SECOND_U64;
     clock.window_checks++;
-    if (llabs(clock.window_error_ns) > OCXO_WINDOW_TOLERANCE_NS) {
+    if (llabs(clock.window_error_ns) > CLOCK_WINDOW_TOLERANCE_NS) {
       clock.window_mismatches++;
     }
   }
