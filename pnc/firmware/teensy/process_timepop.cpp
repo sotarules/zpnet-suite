@@ -82,6 +82,7 @@
 #include "cpu_usage.h"
 #include "time.h"
 #include "config.h"
+#include "util.h"
 
 #include <Arduino.h>
 #include "imxrt.h"
@@ -1160,7 +1161,7 @@ static timepop_handle_t arm_deferred(deferred_slot_t* slots_buf,
                                      const char* name) {
   if (!callback) return TIMEPOP_INVALID_HANDLE;
 
-  noInterrupts();
+  const uint32_t saved = critical_enter();
 
   const bool retired_named = retire_existing_named_slots(name);
   if (retired_named) {
@@ -1187,12 +1188,12 @@ static timepop_handle_t arm_deferred(deferred_slot_t* slots_buf,
 
     update_deferred_high_water(slots_buf, max_slots, high_water);
 
-    interrupts();
+    critical_exit(saved);
     return h;
   }
 
   arm_failures++;
-  interrupts();
+  critical_exit(saved);
   return TIMEPOP_INVALID_HANDLE;
 }
 
@@ -1329,13 +1330,13 @@ void timepop_init(void) {
   qtimer1_init_ch2_scheduler();
 
   attachInterruptVector(IRQ_QTIMER1, qtimer1_irq_isr);
-  NVIC_SET_PRIORITY(IRQ_QTIMER1, 1);
+  NVIC_SET_PRIORITY(IRQ_QTIMER1, 16);
   NVIC_ENABLE_IRQ(IRQ_QTIMER1);
 
-  noInterrupts();
+  const uint32_t saved = critical_enter();
   diag_schedule_next_calls_from_other++;
   schedule_next();
-  interrupts();
+  critical_exit(saved);
 }
 
 static timepop_handle_t arm_absolute_slot_internal(
@@ -1357,7 +1358,7 @@ static timepop_handle_t arm_absolute_slot_internal(
     return TIMEPOP_INVALID_HANDLE;
   }
 
-  noInterrupts();
+  const uint32_t saved = critical_enter();
 
   const bool retired_named = retire_existing_named_slots(name);
   if (retired_named) {
@@ -1415,12 +1416,12 @@ static timepop_handle_t arm_absolute_slot_internal(
     diag_schedule_next_calls_from_other++;
     schedule_next();
     update_slot_high_water();
-    interrupts();
+    critical_exit(saved);
     return h;
   }
 
   diag_arm_failures++;
-  interrupts();
+  critical_exit(saved);
   return TIMEPOP_INVALID_HANDLE;
 }
 
@@ -1478,7 +1479,7 @@ timepop_handle_t timepop_arm(
 ) {
   if (!callback) return TIMEPOP_INVALID_HANDLE;
 
-  noInterrupts();
+  const uint32_t saved = critical_enter();
 
   const bool retired_named = retire_existing_named_slots(name);
   if (retired_named) {
@@ -1572,12 +1573,12 @@ timepop_handle_t timepop_arm(
     schedule_next();
 
     update_slot_high_water();
-    interrupts();
+    critical_exit(saved);
     return h;
   }
 
   diag_arm_failures++;
-  interrupts();
+  critical_exit(saved);
   return TIMEPOP_INVALID_HANDLE;
 }
 
@@ -1707,31 +1708,31 @@ timepop_handle_t timepop_arm_ns(
 bool timepop_cancel(timepop_handle_t handle) {
   if (handle == TIMEPOP_INVALID_HANDLE) return false;
 
-  noInterrupts();
+  const uint32_t saved = critical_enter();
   for (uint32_t i = 0; i < MAX_SLOTS; i++) {
     if (slots[i].active && slots[i].handle == handle) {
       slots[i].active = false;
       diag_schedule_next_calls_from_other++;
       schedule_next();
-      interrupts();
+      critical_exit(saved);
       return true;
     }
   }
   for (uint32_t i = 0; i < MAX_ASAP_SLOTS; i++) {
     if (asap_slots[i].active && asap_slots[i].handle == handle) {
       asap_slots[i].active = false;
-      interrupts();
+      critical_exit(saved);
       return true;
     }
   }
   for (uint32_t i = 0; i < MAX_ALAP_SLOTS; i++) {
     if (alap_slots[i].active && alap_slots[i].handle == handle) {
       alap_slots[i].active = false;
-      interrupts();
+      critical_exit(saved);
       return true;
     }
   }
-  interrupts();
+  critical_exit(saved);
   return false;
 }
 
@@ -1739,7 +1740,7 @@ uint32_t timepop_cancel_by_name(const char* name) {
   if (!name) return 0;
 
   uint32_t cancelled = 0;
-  noInterrupts();
+  const uint32_t saved = critical_enter();
   for (uint32_t i = 0; i < MAX_SLOTS; i++) {
     if (slots[i].active && slots[i].name && strcmp(slots[i].name, name) == 0) {
       slots[i].active = false;
@@ -1763,7 +1764,7 @@ uint32_t timepop_cancel_by_name(const char* name) {
     schedule_next();
     timepop_pending = true;
   }
-  interrupts();
+  critical_exit(saved);
   return cancelled;
 }
 
@@ -1777,9 +1778,9 @@ void timepop_dispatch(void) {
   diag_dispatch_calls++;
 
   if (g_vclock_edge_monitor.enabled && !g_vclock_edge_monitor.armed) {
-    noInterrupts();
+    const uint32_t saved = critical_enter();
     (void)vclock_edge_monitor_bootstrap();
-    interrupts();
+    critical_exit(saved);
   }
 
   dispatch_deferred_phase(asap_slots,
@@ -1846,9 +1847,9 @@ void timepop_dispatch(void) {
             g_vclock_edge_monitor.next_target_gnss_ns = slots[i].target_gnss_ns;
             g_vclock_edge_monitor.target_gnss_ns = g_vclock_edge_monitor.last_target_gnss_ns;
           }
-          noInterrupts();
+          const uint32_t saved = critical_enter();
           schedule_next();
-          interrupts();
+          critical_exit(saved);
         }
       } else if (slots[i].period_ticks == 0) {
         slots[i].active = false;
@@ -1875,9 +1876,9 @@ void timepop_dispatch(void) {
         smartpop_prepare_slot(slots[i]);
 
         slots[i].expired = false;
-        noInterrupts();
+        const uint32_t saved = critical_enter();
         schedule_next();
-        interrupts();
+        critical_exit(saved);
       }
     } else {
       slots[i].active = false;

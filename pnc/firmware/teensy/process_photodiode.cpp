@@ -69,8 +69,6 @@ static void photodiode_snapshot(void) {
     }
   }
 
-  noInterrupts();
-
   // --- Dark stability / latch reset ---
   if (!light_present) {
     if (dark_since_ms == 0) {
@@ -100,8 +98,6 @@ static void photodiode_snapshot(void) {
   last_edge_level = level;
 
   PD.edge_level = level;
-
-  interrupts();
 }
 
 // ================================================================
@@ -119,11 +115,9 @@ void process_photodiode_init(void) {
     CHANGE
   );
 
-  noInterrupts();
   pd_edge_seen       = false;
   pd_episode_latched = false;
   pd_episode_count   = 0;
-  interrupts();
 
   Payload ev;
   ev.add("edge_pin", PHOTODIODE_EDGE_PIN);
@@ -159,9 +153,7 @@ static Payload cmd_report(const Payload& /*args*/) {
 
   {
     uint32_t count;
-    noInterrupts();
     count = pd_isr_count;
-    interrupts();
     p.add("isr_count", count);
   }
 
@@ -176,9 +168,7 @@ static Payload cmd_report(const Payload& /*args*/) {
 static Payload cmd_count(const Payload& /*args*/) {
 
   uint32_t count;
-  noInterrupts();
   count = pd_episode_count;
-  interrupts();
 
   Payload p;
   p.add("count", count);
@@ -191,11 +181,9 @@ static Payload cmd_count(const Payload& /*args*/) {
 // ------------------------------------------------------------
 static Payload cmd_clear(const Payload& /*args*/) {
 
-  noInterrupts();
   pd_episode_count   = 0;
   pd_episode_latched = false;
   pd_edge_seen       = false;
-  interrupts();
 
   Payload ev;
   ev.add("action", "counter_reset");

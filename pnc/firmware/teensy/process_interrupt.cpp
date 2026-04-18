@@ -727,7 +727,7 @@ void process_interrupt_enable_irqs(void) {
   if (g_interrupt_irqs_enabled) return;
 
   attachInterruptVector(IRQ_QTIMER3, qtimer3_isr);
-  NVIC_SET_PRIORITY(IRQ_QTIMER3, 16);
+  NVIC_SET_PRIORITY(IRQ_QTIMER3, 32);
   NVIC_ENABLE_IRQ(IRQ_QTIMER3);
 
   pinMode(GNSS_PPS_PIN, INPUT);
