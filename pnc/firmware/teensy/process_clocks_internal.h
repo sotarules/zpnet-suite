@@ -2,53 +2,79 @@
 // process_clocks_internal.h — Shared Internal State (Alpha ↔ Beta)
 // ============================================================================
 //
-// Doctrine note (post rolling-integration removal):
+// Doctrine:
 //
-//   - g_dwt_cycle_count_at_pps       is event.dwt_at_event from the most
-//                                    recent VCLOCK one-second event — the
-//                                    ISR's first-instruction DWT capture
-//                                    on the 1000th tick of the VCLOCK
-//                                    1 kHz cadence.  Honest fact; no
-//                                    synthesis.
+//   Teensy owns every statistical quantity published in TIMEBASE_FRAGMENT.
+//   The Pi does not compute derived stats; it transcribes what the Teensy
+//   says.  This prevents diffusion of authority and gives every downstream
+//   consumer a single well-defined source of truth.
 //
-//   - g_dwt_cycle_count_between_pps  is the one-second subtraction of
-//                                    consecutive event DWT captures,
-//                                    computed in alpha's vclock_callback.
-//                                    Wraps correctly across DWT_CYCCNT
-//                                    rollover (~4.26 s at 1008 MHz).
+// Statistical surface (standardized):
 //
-//   - g_dwt_cycle_count_next_second_prediction  is just a mirror of
-//                                               g_dwt_cycle_count_between_pps;
-//                                               the measured delta is
-//                                               its own best prediction.
+//   Every Welford accumulator published in the fragment uses the same
+//   suffix set:
 //
-//   - g_dwt_cycle_count_next_second_adjustment  is vestigial (always 0).
-//                                               Retained only so the
-//                                               dwt_effective_cycles_per_second
-//                                               helper's add signature
-//                                               stays stable.
+//     <prefix>_welford_n        — uint64 sample count
+//     <prefix>_welford_mean     — double, in the semantic unit of the signal
+//     <prefix>_welford_stddev   — double, same unit
+//     <prefix>_welford_stderr   — double, same unit  (= stddev / sqrt(n))
+//     <prefix>_welford_min      — double, same unit
+//     <prefix>_welford_max      — double, same unit
 //
-//   - g_qtimer_at_pps                is event.counter32_at_event — the
-//                                    authored 32-bit VCLOCK count that
-//                                    advances by exactly 10,000,000 per
-//                                    VCLOCK one-second event.  Not an
-//                                    ambient counter read.
+//   Published Welford prefixes (seven total):
 //
-// Doctrine note (VCLOCK as measured peer of OCXO):
+//     dwt_welford        — Teensy CPU XTAL offset samples (ppb)
+//     vclock_welford     — bridge interpolation residual samples (ns)
+//     ocxo1_welford      — OCXO1 per-second residual samples (ns)
+//     ocxo2_welford      — OCXO2 per-second residual samples (ns)
+//     pps_witness_welford — GPIO PPS witness offset samples (ns)
+//     ocxo1_dac_welford  — OCXO1 DAC fractional code samples (LSB)
+//     ocxo2_dac_welford  — OCXO2 DAC fractional code samples (LSB)
 //
-//   VCLOCK is now treated as a real measured clock peer to OCXO1/OCXO2.
-//   Its measurement state (vclock_clock_state_t / vclock_measurement_t)
-//   is field-for-field identical in shape to ocxo_clock_state_t /
-//   ocxo_measurement_t.  Per-event measurement runs through
-//   vclock_apply_edge() in alpha, parallel to ocxo_apply_edge().
+//   Every clock with a frequency interpretation additionally publishes:
 //
-//   Self-test property:
-//     Because the VCLOCK lane drives the bridge anchor itself, the
-//     bridge-derived per-event delta should always equal exactly 1e9
-//     (modulo DWT measurement noise and dwt_effective_cycles_per_second
-//     estimation noise).  Any non-zero second_residual_ns is a
-//     diagnostic signal about DWT bookkeeping rather than about the
-//     clock itself.
+//     <clock>_tau        — 1.0 + ppb / 1e9  (fractional frequency)
+//     <clock>_ppb        — parts per billion  (== welford.mean for ns-unit
+//                          clocks; == welford.mean for the DWT clock
+//                          because the DWT Welford samples are fed as ppb)
+//
+//   Frequency-bearing clocks (four total):
+//     dwt, vclock, ocxo1, ocxo2
+//
+//   (pps_witness is a DC phase offset; has no frequency interpretation.)
+//
+// Sign convention:
+//
+//   Uniform across all clocks:
+//
+//     positive ppb  →  this clock is RUNNING FAST vs the GNSS reference
+//     negative ppb  →  this clock is RUNNING SLOW vs the GNSS reference
+//
+//   This is the standard atomic-clock convention.  It holds for DWT,
+//   VCLOCK, OCXO1, OCXO2 alike.  Residual-ns mean has the same sign
+//   semantics: positive mean → clock fast (fires early).
+//
+// Authorship map:
+//
+//   - g_gnss_ns_count_at_pps       advanced by alpha::vclock_callback
+//   - g_dwt_cycle_count_at_pps     captured from the VCLOCK event's ISR
+//                                  first-instruction DWT
+//   - g_dwt_cycle_count_between_pps  one-second subtraction of consecutive
+//                                    event DWT captures (honest measurement)
+//   - g_qtimer_at_pps              event.counter32_at_event (authored
+//                                  10M-per-event VCLOCK count, not an
+//                                  ambient read)
+//
+// VCLOCK as measured peer of OCXO:
+//
+//   VCLOCK is a measured peer of OCXO1/OCXO2.  The same clock_state_t
+//   and clock_measurement_t structs are used for VCLOCK, OCXO1, OCXO2.
+//   alpha::vclock_apply_edge has an identical body to alpha::ocxo_apply_edge.
+//
+//   Because VCLOCK drives the DWT↔GNSS bridge anchor itself, its
+//   second_residual_ns should sit very close to zero with very small
+//   stddev.  Any non-zero mean is a diagnostic signal about bridge /
+//   DWT bookkeeping rather than about the reference clock itself.
 //
 // ============================================================================
 
@@ -95,19 +121,25 @@ extern volatile uint64_t g_gnss_ns_count_at_pps;
 extern volatile uint32_t g_dwt_cycle_count_at_pps;
 extern volatile uint64_t g_dwt_cycle_count_total;
 extern volatile uint32_t g_dwt_cycle_count_between_pps;
-extern volatile uint32_t g_dwt_cycle_count_next_second_prediction;
-extern volatile int32_t  g_dwt_cycle_count_next_second_adjustment;  // vestigial; always 0
-extern volatile uint64_t g_dwt_model_pps_count;
 
 // Authored 32-bit VCLOCK count at the most recent VCLOCK one-second
-// event that drove vclock_callback.
+// event that drove vclock_callback.  Advances by exactly 10,000,000
+// per event.  Not an ambient counter read.
 extern volatile uint32_t g_qtimer_at_pps;
 
-// Diagnostics.
+// Diagnostic — last seen counter32_at_event, for cross-checks.
 extern volatile uint32_t g_last_pps_event_counter32_at_event;
 
+// Returns the most recent measured DWT cycles between VCLOCK one-second
+// events.  Equals g_dwt_cycle_count_between_pps; retained as a named
+// accessor for callers that want the "effective cycles per second"
+// semantic label (time.cpp bridge math).
+static inline uint32_t dwt_effective_cycles_per_second(void) {
+  return g_dwt_cycle_count_between_pps;
+}
+
 // ============================================================================
-// VCLOCK / OCXO common tolerance
+// Clock common tolerance
 // ============================================================================
 //
 // Window-error tolerance applies symmetrically to all measured clocks
@@ -117,54 +149,47 @@ extern volatile uint32_t g_last_pps_event_counter32_at_event;
 
 static constexpr int64_t CLOCK_WINDOW_TOLERANCE_NS = 500LL;
 
-// Backward-compat alias for existing references.
-static constexpr int64_t OCXO_WINDOW_TOLERANCE_NS = CLOCK_WINDOW_TOLERANCE_NS;
-
 // ============================================================================
-// VCLOCK canonical state — symmetric with OCXO
+// Clock state — uniform shape for all measured clocks (VCLOCK, OCXO*)
 // ============================================================================
 //
-// VCLOCK is a measured peer of OCXO1/OCXO2.  These structs are
-// field-for-field identical in shape to ocxo_clock_state_t /
-// ocxo_measurement_t, populated by vclock_apply_edge() in alpha.
+// VCLOCK and OCXO1/OCXO2 use field-for-field identical struct shapes.
+// Populated by alpha's vclock_apply_edge / ocxo_apply_edge, which have
+// identical bodies.
 //
 
-struct vclock_clock_state_t {
-  // Cumulative authored ns count at the VCLOCK edge being applied
-  // (advances by exactly 1e9 each call to vclock_apply_edge after the
-  // first).  Same role as ocxo_clock_state_t::ns_count_at_edge.
+struct clock_state_t {
+  // Cumulative authored ns count at the edge being applied.  Advances
+  // by exactly 1e9 each apply_edge call after the first.
   volatile uint64_t ns_count_at_edge;
 
-  // GNSS ns at the edge as reported by the bridge for this VCLOCK
-  // event.  Carried verbatim from event.gnss_ns_at_event.
+  // GNSS ns at the edge as reported by the bridge for this event.
   volatile uint64_t gnss_ns_at_edge;
 
-  // Cumulative authored ns count refreshed at PPS (canonical advance).
+  // Cumulative authored ns count refreshed at PPS (canonical advance,
+  // phase-adjusted for OCXOs, equals g_gnss_ns_count_at_pps for VCLOCK).
   volatile uint64_t ns_count_at_pps;
 
   // (gnss_ns_at_edge − ns_count_at_edge).  For VCLOCK this should be
-  // very close to zero on every edge after the first; non-zero values
-  // surface bridge-interpolation drift.
+  // near zero after the first edge.  For OCXO this accumulates the
+  // crystal's phase drift from the GNSS reference.
   volatile int64_t  phase_offset_ns;
 
-  // Set true on the first vclock_apply_edge call.
+  // Set true on the first apply_edge call.
   volatile bool     zero_established;
 
-  // Window-check accounting (window = one bridge-derived between-edges
-  // interval).  Mirrors OCXO semantics.
+  // Window-check accounting — the window is one bridge-derived
+  // between-edges interval.  Positive window_error_ns means this edge
+  // came LATE (gnss_ns_between > 1e9, clock running slow).
   volatile uint32_t window_checks;
   volatile uint32_t window_mismatches;
-  volatile int64_t  window_expected_ns;
-  volatile int64_t  window_actual_ns;
   volatile int64_t  window_error_ns;
 };
 
-extern vclock_clock_state_t g_vclock_clock;
-
-struct vclock_measurement_t {
-  // Bridge-derived ns since previous edge minus 1e9.  Self-test signal:
-  // for VCLOCK this should be near zero, surfacing only DWT bookkeeping
-  // noise.  Same role as ocxo_measurement_t::second_residual_ns.
+struct clock_measurement_t {
+  // Bridge-derived ns since previous edge minus 1e9.
+  // Positive → clock fired early this second (running fast).
+  // Negative → clock fired late this second (running slow).
   volatile int64_t  second_residual_ns;
 
   // Bridge-derived ns elapsed between this edge and the previous one.
@@ -173,11 +198,7 @@ struct vclock_measurement_t {
   // ISR-captured DWT at this edge.
   volatile uint32_t dwt_at_edge;
 
-  // DWT cycles elapsed between this edge and the previous one.  Same
-  // semantics as ocxo_measurement_t::dwt_cycles_between_edges.  Note
-  // that g_dwt_cycle_count_between_pps tracks the same physical
-  // quantity through a separate path (one-second subtraction in
-  // vclock_callback) and is preserved for legacy callers.
+  // DWT cycles elapsed between this edge and the previous one.
   volatile uint32_t dwt_cycles_between_edges;
 
   // Previous-edge tracking, used to compute the deltas above.
@@ -185,40 +206,13 @@ struct vclock_measurement_t {
   volatile uint32_t prev_dwt_at_edge;
 };
 
-extern vclock_measurement_t g_vclock_measurement;
+extern clock_state_t       g_vclock_clock;
+extern clock_measurement_t g_vclock_measurement;
 
-// ============================================================================
-// OCXO canonical state — smart-zero phase model (unchanged)
-// ============================================================================
-
-struct ocxo_clock_state_t {
-  volatile uint64_t ns_count_at_edge;
-  volatile uint64_t gnss_ns_at_edge;
-  volatile uint64_t ns_count_at_pps;
-  volatile int64_t  phase_offset_ns;
-  volatile bool     zero_established;
-
-  volatile uint32_t window_checks;
-  volatile uint32_t window_mismatches;
-  volatile int64_t  window_expected_ns;
-  volatile int64_t  window_actual_ns;
-  volatile int64_t  window_error_ns;
-};
-
-extern ocxo_clock_state_t g_ocxo1_clock;
-extern ocxo_clock_state_t g_ocxo2_clock;
-
-struct ocxo_measurement_t {
-  volatile int64_t  second_residual_ns;
-  volatile uint64_t gnss_ns_between_edges;
-  volatile uint32_t dwt_at_edge;
-  volatile uint32_t dwt_cycles_between_edges;
-  volatile uint64_t prev_gnss_ns_at_edge;
-  volatile uint32_t prev_dwt_at_edge;
-};
-
-extern ocxo_measurement_t g_ocxo1_measurement;
-extern ocxo_measurement_t g_ocxo2_measurement;
+extern clock_state_t       g_ocxo1_clock;
+extern clock_state_t       g_ocxo2_clock;
+extern clock_measurement_t g_ocxo1_measurement;
+extern clock_measurement_t g_ocxo2_measurement;
 
 // ============================================================================
 // Last-known interrupt diagnostics (alpha-owned, beta-readable)
@@ -239,22 +233,13 @@ static inline void clocks_capture_interrupt_diag(interrupt_capture_diag_t& dst,
 }
 
 // ============================================================================
-// Simple helpers
-// ============================================================================
-
-static inline uint32_t dwt_effective_cycles_per_second(void) {
-  return (uint32_t)((int64_t)g_dwt_cycle_count_next_second_prediction +
-                    (int64_t)g_dwt_cycle_count_next_second_adjustment);
-}
-
-// ============================================================================
 // AD5693R init
 // ============================================================================
 
 extern bool g_ad5693r_init_ok;
 
 // ============================================================================
-// OCXO DAC state — dual oscillator (unchanged)
+// OCXO DAC state — dual oscillator
 // ============================================================================
 
 struct ocxo_dac_state_t {
@@ -301,7 +286,7 @@ extern ocxo_dac_state_t ocxo1_dac;
 extern ocxo_dac_state_t ocxo2_dac;
 
 // ============================================================================
-// OCXO servo mode (unchanged)
+// OCXO servo mode
 // ============================================================================
 
 enum class servo_mode_t : uint8_t {
@@ -349,27 +334,25 @@ extern uint64_t recover_ocxo1_ns;
 extern uint64_t recover_ocxo2_ns;
 
 // ============================================================================
-// Residual tracking
+// Welford — unified accumulator
 // ============================================================================
 //
-// residual_dwt          — DWT residual: (measured cycles between VCLOCK
-//                         one-second events) - DWT_EXPECTED_PER_PPS.
-// residual_vclock       — VCLOCK measurement residual: bridge-derived
-//                         ns-between-edges minus 1e9.  Self-test for
-//                         the bridge interpolation.  Should be near
-//                         zero with very small stddev.
-// residual_pps_witness  — GPIO PPS witness offset from the authored
-//                         g_gnss_ns_count_at_pps, accumulated from
-//                         pps_edge_callback.  Welford mean reveals DC
-//                         bias (boot-determined V→PPS phase + the
-//                         epoch-install off-by-one); stddev reveals
-//                         GPIO detection latency jitter.
-// residual_ocxo1        — OCXO1 second-to-second drift residual.
-// residual_ocxo2        — OCXO2 second-to-second drift residual.
+// One struct, one API, used for every published Welford accumulator.
+// Samples are stored in the semantic unit of the signal being measured
+// (ppb for frequency clocks, ns for phase offsets, LSB for DAC codes).
+//
+// Global Welford instances, one per published prefix:
+//
+//   welford_dwt          — Teensy CPU XTAL offset, in ppb
+//   welford_vclock       — bridge interpolation residual, in ns
+//   welford_ocxo1        — OCXO1 per-second residual, in ns
+//   welford_ocxo2        — OCXO2 per-second residual, in ns
+//   welford_pps_witness  — GPIO PPS witness offset, in ns
+//   welford_ocxo1_dac    — OCXO1 DAC fractional code, in LSB
+//   welford_ocxo2_dac    — OCXO2 DAC fractional code, in LSB
 //
 
-struct pps_residual_t {
-  int64_t  residual;
+struct welford_t {
   uint64_t n;
   double   mean;
   double   m2;
@@ -377,36 +360,18 @@ struct pps_residual_t {
   double   max_val;
 };
 
-extern pps_residual_t residual_dwt;
-extern pps_residual_t residual_vclock;
-extern pps_residual_t residual_pps_witness;
-extern pps_residual_t residual_ocxo1;
-extern pps_residual_t residual_ocxo2;
+extern welford_t welford_dwt;
+extern welford_t welford_vclock;
+extern welford_t welford_ocxo1;
+extern welford_t welford_ocxo2;
+extern welford_t welford_pps_witness;
+extern welford_t welford_ocxo1_dac;
+extern welford_t welford_ocxo2_dac;
 
-void residual_reset(pps_residual_t& r);
-void residual_update_sample(pps_residual_t& r, int64_t residual);
-double residual_stddev(const pps_residual_t& r);
-double residual_stderr(const pps_residual_t& r);
-
-// ============================================================================
-// DAC Welford tracking (unchanged)
-// ============================================================================
-
-struct dac_welford_t {
-  uint64_t n;
-  double   mean;
-  double   m2;
-  double   min_val;
-  double   max_val;
-};
-
-extern dac_welford_t dac_welford_ocxo1;
-extern dac_welford_t dac_welford_ocxo2;
-
-void dac_welford_reset(dac_welford_t& w);
-void dac_welford_update(dac_welford_t& w, double value);
-double dac_welford_stddev(const dac_welford_t& w);
-double dac_welford_stderr(const dac_welford_t& w);
+void   welford_reset(welford_t& w);
+void   welford_update(welford_t& w, double sample);
+double welford_stddev(const welford_t& w);
+double welford_stderr(const welford_t& w);
 
 // ============================================================================
 // Campaign-scoped accumulators

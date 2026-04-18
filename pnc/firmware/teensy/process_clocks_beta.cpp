@@ -2,45 +2,50 @@
 // process_clocks_beta.cpp — Campaign Layer
 // ============================================================================
 //
-// Post rolling-integration removal:
-//   - clocks_payload_add_ocxo_diag slimmed to match the trimmed
-//     interrupt_capture_diag_t: event facts + anomaly_count only.
-//   - clocks_payload_add_pps_diag delegates to the slimmer ocxo
-//     publisher and adds the GPIO witness fields plus three new
-//     bridge-independent VCLOCK-to-edge phase diagnostics:
-//     pps_edge_dwt_cycles_from_vclock, pps_edge_ns_from_vclock,
-//     pps_edge_vclock_event_count.
-//   - All integrator_* and boundary_dwt_isr_entry_* publications removed
-//     — those fields no longer exist.
+// Statistical surface doctrine:
 //
-// VCLOCK as measured peer of OCXO:
-//   - g_vclock_clock and g_vclock_measurement now hold real measurements
-//     produced by alpha's vclock_apply_edge() (parallel to ocxo_apply_edge),
-//     not the previous fictional constants.
-//   - Beta now publishes vclock_* fields symmetrically with ocxo1_*/ocxo2_*:
-//     vclock_phase_offset_ns, vclock_zero_established, vclock_window_*.
-//   - residual_vclock now feeds from g_vclock_measurement.second_residual_ns
-//     (per-edge bridge-interpolation residual).  Welford on this is a
-//     self-test of bridge consistency and should sit very close to zero.
-//   - residual_pps_witness is the new name for what residual_vclock used
-//     to be: GPIO PPS witness offset from g_gnss_ns_count_at_pps, fed by
-//     alpha's pps_edge_callback.  Published as pps_witness_welford_*.
+//   Teensy owns every statistical quantity published in TIMEBASE_FRAGMENT.
+//   The Pi transcribes what the Teensy says — it does not recompute.
 //
-// DWT cycles-between-PPS-events semantics:
-//   - g_dwt_cycle_count_between_pps is now the one-second subtraction
-//     of consecutive VCLOCK-event DWT captures (authored by alpha in
-//     vclock_callback), not a synthetic SMA output.
+//   Every Welford accumulator is published with the identical suffix set:
 //
-// PPS provenance:
-//   - residual_pps_witness is fed by alpha's pps_edge_callback from the
-//     GPIO witness snapshot.  Beta does NOT update it locally.
-//   - The "pps_diag" published prefix still identifies the VCLOCK lane's
-//     diag, which is the only lane carrying GPIO PPS witness fields.
-//     The prefix string is preserved verbatim to keep the over-the-wire
-//     schema stable for Pi-side consumers.
+//     <prefix>_welford_n
+//     <prefix>_welford_mean
+//     <prefix>_welford_stddev
+//     <prefix>_welford_stderr
+//     <prefix>_welford_min
+//     <prefix>_welford_max
 //
-// Everything else (campaign lifecycle, servo, Welford, DAC pacing,
-// watchdog, command surface) is unchanged.
+//   Seven published Welford prefixes:
+//
+//     dwt_welford         — Teensy CPU XTAL offset (ppb, positive = fast)
+//     vclock_welford      — bridge interpolation residual (ns)
+//     ocxo1_welford       — OCXO1 per-second residual (ns, positive = fast)
+//     ocxo2_welford       — OCXO2 per-second residual (ns, positive = fast)
+//     pps_witness_welford — GPIO PPS witness offset (ns)
+//     ocxo1_dac_welford   — OCXO1 DAC fractional code (LSB)
+//     ocxo2_dac_welford   — OCXO2 DAC fractional code (LSB)
+//
+//   Four published tau/ppb pairs (one per frequency-bearing clock):
+//
+//     dwt_tau,    dwt_ppb
+//     vclock_tau, vclock_ppb
+//     ocxo1_tau,  ocxo1_ppb
+//     ocxo2_tau,  ocxo2_ppb
+//
+//   Sign convention is uniform:  positive ppb → clock RUNNING FAST.
+//
+// Unified Welford:
+//
+//   welford_t replaces the old pps_residual_t and dac_welford_t.  One
+//   struct, one API, double-valued samples (supports ppb + ns + LSB
+//   with the same type).  Global instances named welford_<what>:
+//   welford_dwt, welford_vclock, welford_ocxo1, welford_ocxo2,
+//   welford_pps_witness, welford_ocxo1_dac, welford_ocxo2_dac.
+//
+// Everything else (campaign lifecycle, servo, DAC pacing, watchdog,
+// command surface) is unchanged in behavior.
+//
 // ============================================================================
 
 #include "process_clocks_internal.h"
@@ -66,7 +71,7 @@
 #include <climits>
 
 // ============================================================================
-// Campaign State — definitions
+// Campaign state — definitions
 // ============================================================================
 
 volatile clocks_campaign_state_t campaign_state =
@@ -105,52 +110,18 @@ volatile uint32_t watchdog_anomaly_detail3         = 0;
 volatile uint32_t watchdog_anomaly_trigger_dwt     = 0;
 
 // ============================================================================
-// Residual tracking
+// Welford — unified accumulator
 // ============================================================================
 
-pps_residual_t residual_dwt          = {};
-pps_residual_t residual_vclock       = {};   // fed by beta from g_vclock_measurement (bridge self-test)
-pps_residual_t residual_pps_witness  = {};   // fed by alpha's pps_edge_callback (GPIO witness offset)
-pps_residual_t residual_ocxo1        = {};
-pps_residual_t residual_ocxo2        = {};
+welford_t welford_dwt          = {};
+welford_t welford_vclock       = {};
+welford_t welford_ocxo1        = {};
+welford_t welford_ocxo2        = {};
+welford_t welford_pps_witness  = {};
+welford_t welford_ocxo1_dac    = {};
+welford_t welford_ocxo2_dac    = {};
 
-void residual_reset(pps_residual_t& r) {
-  r.residual = 0;
-  r.n = 0;
-  r.mean = 0.0;
-  r.m2 = 0.0;
-  r.min_val = 1e30;
-  r.max_val = -1e30;
-}
-
-void residual_update_sample(pps_residual_t& r, int64_t residual) {
-  r.residual = residual;
-  r.n++;
-  const double x = (double)residual;
-  const double d1 = x - r.mean;
-  r.mean += d1 / (double)r.n;
-  const double d2 = x - r.mean;
-  r.m2 += d1 * d2;
-  if (x < r.min_val) r.min_val = x;
-  if (x > r.max_val) r.max_val = x;
-}
-
-double residual_stddev(const pps_residual_t& r) {
-  return (r.n >= 2) ? sqrt(r.m2 / (double)(r.n - 1)) : 0.0;
-}
-
-double residual_stderr(const pps_residual_t& r) {
-  return (r.n >= 2) ? sqrt(r.m2 / (double)(r.n - 1)) / sqrt((double)r.n) : 0.0;
-}
-
-// ============================================================================
-// DAC Welford tracking
-// ============================================================================
-
-dac_welford_t dac_welford_ocxo1 = {};
-dac_welford_t dac_welford_ocxo2 = {};
-
-void dac_welford_reset(dac_welford_t& w) {
+void welford_reset(welford_t& w) {
   w.n       = 0;
   w.mean    = 0.0;
   w.m2      = 0.0;
@@ -158,32 +129,73 @@ void dac_welford_reset(dac_welford_t& w) {
   w.max_val = -1e30;
 }
 
-void dac_welford_update(dac_welford_t& w, double value) {
+void welford_update(welford_t& w, double sample) {
   w.n++;
-  const double d1 = value - w.mean;
+  const double d1 = sample - w.mean;
   w.mean += d1 / (double)w.n;
-  const double d2 = value - w.mean;
+  const double d2 = sample - w.mean;
   w.m2 += d1 * d2;
-  if (value < w.min_val) w.min_val = value;
-  if (value > w.max_val) w.max_val = value;
+  if (sample < w.min_val) w.min_val = sample;
+  if (sample > w.max_val) w.max_val = sample;
 }
 
-double dac_welford_stddev(const dac_welford_t& w) {
+double welford_stddev(const welford_t& w) {
   return (w.n >= 2) ? sqrt(w.m2 / (double)(w.n - 1)) : 0.0;
 }
 
-double dac_welford_stderr(const dac_welford_t& w) {
-  return (w.n >= 2) ? sqrt(w.m2 / (double)(w.n - 1)) / sqrt((double)w.n) : 0.0;
+double welford_stderr(const welford_t& w) {
+  if (w.n < 2) return 0.0;
+  const double sd = sqrt(w.m2 / (double)(w.n - 1));
+  return sd / sqrt((double)w.n);
+}
+
+// ============================================================================
+// Payload helpers — standardized publication
+// ============================================================================
+
+// Emits the complete six-field Welford block under <prefix>_welford_*.
+// All six fields are always emitted, regardless of n.  Downstream
+// consumers can rely on the complete set being present in every
+// fragment after campaign start.
+static void publish_welford(Payload& p, const char* prefix, const welford_t& w) {
+  char key[80];
+
+  snprintf(key, sizeof(key), "%s_welford_n", prefix);
+  p.add(key, w.n);
+
+  snprintf(key, sizeof(key), "%s_welford_mean", prefix);
+  p.add(key, w.mean, 6);
+
+  snprintf(key, sizeof(key), "%s_welford_stddev", prefix);
+  p.add(key, welford_stddev(w), 6);
+
+  snprintf(key, sizeof(key), "%s_welford_stderr", prefix);
+  p.add(key, welford_stderr(w), 6);
+
+  snprintf(key, sizeof(key), "%s_welford_min", prefix);
+  p.add(key, (w.n > 0) ? w.min_val : 0.0, 6);
+
+  snprintf(key, sizeof(key), "%s_welford_max", prefix);
+  p.add(key, (w.n > 0) ? w.max_val : 0.0, 6);
+}
+
+// Emits <clock>_tau and <clock>_ppb.  ppb_value is in parts-per-billion
+// under the uniform sign convention (positive = clock running fast).
+// tau = 1.0 + ppb / 1e9.
+static void publish_freq(Payload& p, const char* clock_name, double ppb_value) {
+  char key[80];
+  const double tau_value = 1.0 + ppb_value / 1e9;
+
+  snprintf(key, sizeof(key), "%s_tau", clock_name);
+  p.add(key, tau_value, 12);
+
+  snprintf(key, sizeof(key), "%s_ppb", clock_name);
+  p.add(key, ppb_value, 3);
 }
 
 // ============================================================================
 // Diag publishers — slimmed for the trimmed interrupt_capture_diag_t
 // ============================================================================
-//
-// The diag struct no longer carries integrator state or boundary-emitter
-// ISR-entry facts.  What remains is the event truth surface (mirrored
-// from interrupt_event_t) and a per-lane enabled/anomaly count.
-//
 
 static void clocks_payload_add_ocxo_diag(Payload& p,
                                          const char* prefix,
@@ -204,21 +216,15 @@ static void clocks_payload_add_ocxo_diag(Payload& p,
   };
 
   add_bool("enabled", diag.enabled);
-
-  // Event truth surface.
   add_u32("dwt_at_event", diag.dwt_at_event);
   add_u64("gnss_ns_at_event", diag.gnss_ns_at_event);
   add_u32("counter32_at_event", diag.counter32_at_event);
-
   add_u32("anomaly_count", diag.anomaly_count);
 }
 
 static void clocks_payload_add_pps_diag(Payload& p,
                                         const char* prefix,
                                         const interrupt_capture_diag_t& diag) {
-  // Same baseline fields as the OCXO publisher, plus the PPS witness
-  // fields refreshed from the authoritative GPIO ISR snapshot immediately
-  // before fragment publication.
   clocks_payload_add_ocxo_diag(p, prefix, diag);
 
   char key[96];
@@ -235,10 +241,13 @@ static void clocks_payload_add_pps_diag(Payload& p,
   add_u32("pps_edge_dwt_isr_entry_raw", diag.pps_edge_dwt_isr_entry_raw);
   add_i64("pps_edge_gnss_ns", diag.pps_edge_gnss_ns);
   add_i64("pps_edge_minus_event_ns", diag.pps_edge_minus_event_ns);
+  add_u32("pps_edge_dwt_cycles_from_vclock", diag.pps_edge_dwt_cycles_from_vclock);
+  add_i64("pps_edge_ns_from_vclock", diag.pps_edge_ns_from_vclock);
+  add_u32("pps_edge_vclock_event_count", diag.pps_edge_vclock_event_count);
 }
 
 // ============================================================================
-// Predictive servo tuning (unchanged)
+// Predictive servo tuning
 // ============================================================================
 
 static constexpr uint32_t NOW_WINDOW_SIZE = 5;
@@ -284,7 +293,7 @@ static void now_window_push(now_window_t& w, int64_t sample) {
 }
 
 // ============================================================================
-// DAC pacing / deferred commit (unchanged)
+// DAC pacing / deferred commit
 // ============================================================================
 
 static const char* OCXO_DAC_COMMIT_NAME = "ocxo-dac-commit";
@@ -339,7 +348,6 @@ static ocxo_dac_state_t* ocxo_dac_pick_commit_candidate(void) {
   if (!e1 && !e2) return nullptr;
   if (e1 && !e2) return &ocxo1_dac;
   if (!e1 && e2) return &ocxo2_dac;
-  // Both eligible: alternate based on last winner.
   return (g_ocxo_dac_last_winner == 1) ? &ocxo2_dac : &ocxo1_dac;
 }
 
@@ -438,14 +446,13 @@ void clocks_zero_all(void) {
   ocxo1_ticks_64        = 0;
   ocxo2_ticks_64        = 0;
 
-  residual_reset(residual_dwt);
-  residual_reset(residual_vclock);
-  residual_reset(residual_pps_witness);
-  residual_reset(residual_ocxo1);
-  residual_reset(residual_ocxo2);
-
-  dac_welford_reset(dac_welford_ocxo1);
-  dac_welford_reset(dac_welford_ocxo2);
+  welford_reset(welford_dwt);
+  welford_reset(welford_vclock);
+  welford_reset(welford_ocxo1);
+  welford_reset(welford_ocxo2);
+  welford_reset(welford_pps_witness);
+  welford_reset(welford_ocxo1_dac);
+  welford_reset(welford_ocxo2_dac);
 
   ocxo_dac_predictor_reset(ocxo1_dac);
   ocxo_dac_predictor_reset(ocxo2_dac);
@@ -456,7 +463,7 @@ void clocks_zero_all(void) {
 }
 
 // ============================================================================
-// Servo logic (unchanged)
+// Servo logic
 // ============================================================================
 
 static void ocxo_servo_predictive(ocxo_dac_state_t& dac,
@@ -511,14 +518,14 @@ static void ocxo_servo_predictive(ocxo_dac_state_t& dac,
   ocxo_dac_queue_intent(dac, step);
 }
 
-static void ocxo_servo_total(ocxo_dac_state_t& dac, const pps_residual_t& residuals) {
-  if (residuals.n < SERVO_MIN_SAMPLES) return;
+static void ocxo_servo_total(ocxo_dac_state_t& dac, const welford_t& w) {
+  if (w.n < SERVO_MIN_SAMPLES) return;
 
   dac.servo_settle_count++;
   if (dac.servo_settle_count < SERVO_SETTLE_SECONDS) return;
 
   ocxo_servo_predictive(dac,
-                        residuals.mean,
+                        w.mean,
                         SERVO_TOTAL_RESIDUAL_ALPHA,
                         SERVO_TOTAL_SLOPE_ALPHA,
                         SERVO_TOTAL_HORIZON_S);
@@ -544,8 +551,8 @@ static void ocxo_calibration_servo(void) {
     ocxo_servo_now(ocxo1_dac, g_now_window_ocxo1);
     ocxo_servo_now(ocxo2_dac, g_now_window_ocxo2);
   } else {
-    ocxo_servo_total(ocxo1_dac, residual_ocxo1);
-    ocxo_servo_total(ocxo2_dac, residual_ocxo2);
+    ocxo_servo_total(ocxo1_dac, welford_ocxo1);
+    ocxo_servo_total(ocxo2_dac, welford_ocxo2);
   }
 
   ocxo_dac_schedule_paced_commit();
@@ -687,35 +694,43 @@ void clocks_beta_pps(void) {
   ocxo1_ticks_64        = g_ocxo1_clock.ns_count_at_pps / 100ull;
   ocxo2_ticks_64        = g_ocxo2_clock.ns_count_at_pps / 100ull;
 
-  // DWT residual: (measured cycles between VCLOCK one-second events) - (nominal expected).
-  residual_update_sample(
-      residual_dwt,
-      (int64_t)dwt_effective_cycles_per_second() - (int64_t)DWT_EXPECTED_PER_PPS);
-
-  // residual_pps_witness is fed by alpha's pps_edge_callback from the GPIO
-  // PPS witness.  We do NOT update it here.
-
-  // VCLOCK measurement Welford — symmetric with the OCXO pumps below.
-  // Self-test signal: bridge-derived ns-between-edges minus 1e9.  Should
-  // sit very close to zero.
-  if (g_vclock_measurement.prev_gnss_ns_at_edge != 0) {
-    residual_update_sample(residual_vclock, g_vclock_measurement.second_residual_ns);
+  // ── Welford updates ──
+  //
+  // DWT sample is fed directly as ppb using the uniform sign convention:
+  // positive ppb → Teensy running FAST (measured cycles > expected).
+  {
+    const double cycles = (double)g_dwt_cycle_count_between_pps;
+    const double expected = (double)DWT_EXPECTED_PER_PPS;
+    const double dwt_ppb_sample = (cycles - expected) / expected * 1e9;
+    welford_update(welford_dwt, dwt_ppb_sample);
   }
 
+  // VCLOCK measurement Welford — bridge-interpolation self-test.
+  // Sample in ns; mean == ppb under the "ns/sec == ppb" identity.
+  if (g_vclock_measurement.prev_gnss_ns_at_edge != 0) {
+    welford_update(welford_vclock, (double)g_vclock_measurement.second_residual_ns);
+  }
+
+  // OCXO measurement Welfords.
   if (g_ocxo1_measurement.prev_gnss_ns_at_edge != 0) {
-    residual_update_sample(residual_ocxo1, g_ocxo1_measurement.second_residual_ns);
+    welford_update(welford_ocxo1, (double)g_ocxo1_measurement.second_residual_ns);
     now_window_push(g_now_window_ocxo1, g_ocxo1_measurement.second_residual_ns);
   }
 
   if (g_ocxo2_measurement.prev_gnss_ns_at_edge != 0) {
-    residual_update_sample(residual_ocxo2, g_ocxo2_measurement.second_residual_ns);
+    welford_update(welford_ocxo2, (double)g_ocxo2_measurement.second_residual_ns);
     now_window_push(g_now_window_ocxo2, g_ocxo2_measurement.second_residual_ns);
   }
 
+  // welford_pps_witness is fed by alpha's vclock_callback from the GPIO
+  // witness snapshot.  We do NOT update it here.
+
+  // Servo runs AFTER welford updates so it sees this second's data.
   ocxo_calibration_servo();
 
-  dac_welford_update(dac_welford_ocxo1, ocxo1_dac.dac_fractional);
-  dac_welford_update(dac_welford_ocxo2, ocxo2_dac.dac_fractional);
+  // DAC Welfords — track servo effort (the TEMPEST signal).
+  welford_update(welford_ocxo1_dac, ocxo1_dac.dac_fractional);
+  welford_update(welford_ocxo2_dac, ocxo2_dac.dac_fractional);
 
   // ── Build TIMEBASE_FRAGMENT ──
   Payload p;
@@ -724,58 +739,47 @@ void clocks_beta_pps(void) {
   p.add("gnss_ns", g_gnss_ns_count_at_pps);
   p.add("calibrate_ocxo", servo_mode_str(calibrate_ocxo_mode));
 
-  // DWT canonical surface — sourced from VCLOCK one-second events
-  // (alpha's one-second subtraction).
+  // DWT canonical surface.
   p.add("dwt_cycle_count_total", g_dwt_cycle_count_total);
   p.add("dwt_cycle_count_at_pps", g_dwt_cycle_count_at_pps);
   p.add("dwt_cycle_count_between_pps", g_dwt_cycle_count_between_pps);
-  p.add("dwt_cycle_count_next_second_prediction", g_dwt_cycle_count_next_second_prediction);
-  p.add("dwt_effective_cycles_per_second", dwt_effective_cycles_per_second());
   p.add("dwt_expected_per_pps", (uint32_t)DWT_EXPECTED_PER_PPS);
 
-  // VCLOCK authored facts + measured peer-clock surface (symmetric with OCXO).
+  // VCLOCK surface — authored facts + per-edge measurement + window accounting.
   p.add("vclock_qtimer_at_pps", g_qtimer_at_pps);
   p.add("vclock_ns_count_at_pps", g_vclock_clock.ns_count_at_pps);
-
-  // Per-edge measurement (sourced from g_vclock_measurement; symmetric
-  // with ocxo1_*/ocxo2_* publications below).  These now carry real
-  // values produced by alpha's vclock_apply_edge() rather than the
-  // fictional constants the previous version published.
   p.add("vclock_gnss_ns_between_edges", g_vclock_measurement.gnss_ns_between_edges);
   p.add("vclock_dwt_cycles_between_edges", g_vclock_measurement.dwt_cycles_between_edges);
   p.add("vclock_second_residual_ns", g_vclock_measurement.second_residual_ns);
-
   p.add("vclock_phase_offset_ns", g_vclock_clock.phase_offset_ns);
   p.add("vclock_zero_established", g_vclock_clock.zero_established);
-
   p.add("vclock_window_checks", g_vclock_clock.window_checks);
   p.add("vclock_window_mismatches", g_vclock_clock.window_mismatches);
   p.add("vclock_window_error_ns", g_vclock_clock.window_error_ns);
 
-  // OCXO coarse truth surface.
+  // OCXO1 surface.
   p.add("ocxo1_ns_count_at_pps", g_ocxo1_clock.ns_count_at_pps);
-  p.add("ocxo2_ns_count_at_pps", g_ocxo2_clock.ns_count_at_pps);
-
   p.add("ocxo1_gnss_ns_between_edges", g_ocxo1_measurement.gnss_ns_between_edges);
-  p.add("ocxo2_gnss_ns_between_edges", g_ocxo2_measurement.gnss_ns_between_edges);
-
   p.add("ocxo1_dwt_cycles_between_edges", g_ocxo1_measurement.dwt_cycles_between_edges);
-  p.add("ocxo2_dwt_cycles_between_edges", g_ocxo2_measurement.dwt_cycles_between_edges);
-
+  p.add("ocxo1_second_residual_ns", g_ocxo1_measurement.second_residual_ns);
   p.add("ocxo1_phase_offset_ns", g_ocxo1_clock.phase_offset_ns);
   p.add("ocxo1_zero_established", g_ocxo1_clock.zero_established);
-  p.add("ocxo2_phase_offset_ns", g_ocxo2_clock.phase_offset_ns);
-  p.add("ocxo2_zero_established", g_ocxo2_clock.zero_established);
-
   p.add("ocxo1_window_checks", g_ocxo1_clock.window_checks);
   p.add("ocxo1_window_mismatches", g_ocxo1_clock.window_mismatches);
   p.add("ocxo1_window_error_ns", g_ocxo1_clock.window_error_ns);
 
+  // OCXO2 surface.
+  p.add("ocxo2_ns_count_at_pps", g_ocxo2_clock.ns_count_at_pps);
+  p.add("ocxo2_gnss_ns_between_edges", g_ocxo2_measurement.gnss_ns_between_edges);
+  p.add("ocxo2_dwt_cycles_between_edges", g_ocxo2_measurement.dwt_cycles_between_edges);
+  p.add("ocxo2_second_residual_ns", g_ocxo2_measurement.second_residual_ns);
+  p.add("ocxo2_phase_offset_ns", g_ocxo2_clock.phase_offset_ns);
+  p.add("ocxo2_zero_established", g_ocxo2_clock.zero_established);
   p.add("ocxo2_window_checks", g_ocxo2_clock.window_checks);
   p.add("ocxo2_window_mismatches", g_ocxo2_clock.window_mismatches);
   p.add("ocxo2_window_error_ns", g_ocxo2_clock.window_error_ns);
 
-  // DAC / servo state.
+  // DAC + servo state (live values).
   p.add("ocxo1_dac", ocxo1_dac.dac_fractional);
   p.add("ocxo1_dac_last_write_ok", ocxo1_dac.io_last_write_ok);
   p.add("ocxo1_dac_fault_latched", ocxo1_dac.io_fault_latched);
@@ -790,78 +794,28 @@ void clocks_beta_pps(void) {
   p.add("ocxo2_servo_last_step", ocxo2_dac.servo_last_step, 6);
   p.add("ocxo2_servo_adjustments", ocxo2_dac.servo_adjustments);
 
-  // DWT residual Welford.
-  if (residual_dwt.n > 0) {
-    const double dwt_ppb_val = -residual_dwt.mean / (double)DWT_EXPECTED_PER_PPS * 1e9;
-    const double dwt_tau_val = 1.0 + dwt_ppb_val / 1e9;
-    p.add("dwt_tau", dwt_tau_val, 12);
-    p.add("dwt_ppb", dwt_ppb_val, 3);
-  }
-  p.add("dwt_welford_n", residual_dwt.n);
-  p.add("dwt_welford_mean", residual_dwt.mean, 3);
-  p.add("dwt_welford_stddev", residual_stddev(residual_dwt), 3);
+  // ── Standardized statistics publication ──
+  //
+  // Every Welford publishes the same six fields.  Every frequency-bearing
+  // clock publishes the same tau/ppb pair.  Uniform sign convention:
+  // positive ppb = clock running FAST vs GNSS reference.
 
-  // VCLOCK measurement Welford — bridge-interpolation self-test.
-  // For the canonical reference clock this should be tightly bound to zero;
-  // any non-zero mean or notable stddev is a diagnostic about the bridge
-  // or DWT bookkeeping rather than the clock itself.
-  if (residual_vclock.n > 0) {
-    const double vclock_ppb_val = residual_vclock.mean;
-    const double vclock_tau_val = 1.0 + vclock_ppb_val / 1e9;
-    p.add("vclock_tau", vclock_tau_val, 12);
-    p.add("vclock_ppb", vclock_ppb_val, 3);
-  }
-  p.add("vclock_welford_n", residual_vclock.n);
-  p.add("vclock_welford_mean", residual_vclock.mean, 3);
-  p.add("vclock_welford_stddev", residual_stddev(residual_vclock), 3);
-  p.add("vclock_welford_min", residual_vclock.min_val, 3);
-  p.add("vclock_welford_max", residual_vclock.max_val, 3);
+  // Welford blocks (seven).
+  publish_welford(p, "dwt",          welford_dwt);
+  publish_welford(p, "vclock",       welford_vclock);
+  publish_welford(p, "ocxo1",        welford_ocxo1);
+  publish_welford(p, "ocxo2",        welford_ocxo2);
+  publish_welford(p, "pps_witness",  welford_pps_witness);
+  publish_welford(p, "ocxo1_dac",    welford_ocxo1_dac);
+  publish_welford(p, "ocxo2_dac",    welford_ocxo2_dac);
 
-  // PPS witness Welford — GPIO PPS witness offset from g_gnss_ns_count_at_pps.
-  // Mean reveals DC bias (boot-determined V→PPS phase + epoch-install
-  // off-by-one); stddev reveals GPIO detection latency jitter.
-  p.add("pps_witness_welford_n", residual_pps_witness.n);
-  p.add("pps_witness_welford_mean", residual_pps_witness.mean, 3);
-  p.add("pps_witness_welford_stddev", residual_stddev(residual_pps_witness), 3);
-  p.add("pps_witness_welford_min", residual_pps_witness.min_val, 3);
-  p.add("pps_witness_welford_max", residual_pps_witness.max_val, 3);
-
-  // OCXO residuals.
-  if (residual_ocxo1.n > 0) {
-    const double ocxo1_ppb_val = residual_ocxo1.mean;
-    const double ocxo1_tau_val = 1.0 + ocxo1_ppb_val / 1e9;
-    p.add("ocxo1_tau", ocxo1_tau_val, 12);
-    p.add("ocxo1_ppb", ocxo1_ppb_val, 3);
-  }
-  if (residual_ocxo2.n > 0) {
-    const double ocxo2_ppb_val = residual_ocxo2.mean;
-    const double ocxo2_tau_val = 1.0 + ocxo2_ppb_val / 1e9;
-    p.add("ocxo2_tau", ocxo2_tau_val, 12);
-    p.add("ocxo2_ppb", ocxo2_ppb_val, 3);
-  }
-
-  p.add("ocxo1_welford_n", residual_ocxo1.n);
-  p.add("ocxo1_welford_mean", residual_ocxo1.mean, 3);
-  p.add("ocxo1_welford_stddev", residual_stddev(residual_ocxo1), 3);
-
-  p.add("ocxo2_welford_n", residual_ocxo2.n);
-  p.add("ocxo2_welford_mean", residual_ocxo2.mean, 3);
-  p.add("ocxo2_welford_stddev", residual_stddev(residual_ocxo2), 3);
-
-  // DAC Welford (TEMPEST masthead).
-  p.add("ocxo1_dac_welford_n", dac_welford_ocxo1.n);
-  p.add("ocxo1_dac_welford_mean", dac_welford_ocxo1.mean, 6);
-  p.add("ocxo1_dac_welford_stddev", dac_welford_stddev(dac_welford_ocxo1), 6);
-  p.add("ocxo1_dac_welford_stderr", dac_welford_stderr(dac_welford_ocxo1), 6);
-  p.add("ocxo1_dac_welford_min", dac_welford_ocxo1.min_val, 3);
-  p.add("ocxo1_dac_welford_max", dac_welford_ocxo1.max_val, 3);
-
-  p.add("ocxo2_dac_welford_n", dac_welford_ocxo2.n);
-  p.add("ocxo2_dac_welford_mean", dac_welford_ocxo2.mean, 6);
-  p.add("ocxo2_dac_welford_stddev", dac_welford_stddev(dac_welford_ocxo2), 6);
-  p.add("ocxo2_dac_welford_stderr", dac_welford_stderr(dac_welford_ocxo2), 6);
-  p.add("ocxo2_dac_welford_min", dac_welford_ocxo2.min_val, 3);
-  p.add("ocxo2_dac_welford_max", dac_welford_ocxo2.max_val, 3);
+  // Frequency pairs (four).  For all four clocks the Welford samples are
+  // already in ppb-compatible units (ppb for DWT; ns/sec == ppb numerically
+  // for VCLOCK and OCXOs).
+  publish_freq(p, "dwt",    welford_dwt.mean);
+  publish_freq(p, "vclock", welford_vclock.mean);
+  publish_freq(p, "ocxo1",  welford_ocxo1.mean);
+  publish_freq(p, "ocxo2",  welford_ocxo2.mean);
 
   // Per-lane diag (event facts + anomaly count).  The "pps_diag" entry
   // corresponds to the VCLOCK lane and additionally carries the GPIO
