@@ -189,16 +189,48 @@ void UsageFault_Handler(void) { fault_morse_usagefault(); }
 //   1. maximize_dwt_determinism()        — CPU clock, DWT counter
 //   2. memory_info_init()                — stack sentinel painting
 //   3. cpu_usage_init()                  — DWT accounting baseline
-//   4. process_interrupt_init_hardware() — starts GPT1 (OCXO1), GPT2 (OCXO2)
-//   5. timepop_init()                    — QTimer1 compare scheduler
+//   4. process_interrupt_init_hardware() — QTimer1 CH0/CH1/CH2/CH3 +
+//                                          QTimer3 CH2/CH3 hardware setup
+//                                          (all compare channels start
+//                                          disabled; no spurious ISRs)
+//   5. timepop_init()                    — slot tables + register
+//                                          QTimer1 CH2 handler with
+//                                          process_interrupt
 //   6. process_clocks_init_hardware()    — DWT enable, rolling helper baselines
 //   7. transport_init()                  — arms RX/TX timers
 //   8. debug_init()                      — transport-routed logging
 //   9. process framework + subsystems    — everything else
-//  10. process_interrupt_init()          — runtime slots, descriptor wiring
-//  11. process_interrupt_enable_irqs()   — ISR vectors + NVIC enable
-//  12. process_clocks_init()             — subscribes PPS/OCXO, requests
-//                                          startup epoch zero, starts providers
+//  10. process_interrupt_init()          — runtime subscriber tables
+//  11. process_interrupt_enable_irqs()   — ISR vectors + NVIC enable;
+//                                          IRQ_QTIMER1, IRQ_QTIMER3,
+//                                          IRQ_GPIO6789 all go live.
+//                                          Any pending CH2 TCF1 from
+//                                          step 5's schedule_next()
+//                                          fires immediately and
+//                                          dispatches to TimePop.
+//  12. process_clocks_init()             — subscribes VCLOCK/OCXO,
+//                                          registers PPS edge dispatch,
+//                                          requests startup epoch zero,
+//                                          starts providers (which arms
+//                                          their compare channels)
+//
+// Sacred ordering invariants (post QTimer1 unification refactor):
+//
+//   • process_interrupt_init_hardware() must run before timepop_init()
+//     because timepop_init() programs QTimer1 CH2's compare register
+//     and assumes the channel hardware is already initialized.
+//
+//   • timepop_init() must call interrupt_register_qtimer1_ch2_handler()
+//     before process_interrupt_enable_irqs() so the CH2 dispatcher
+//     finds a registered handler when IRQ_QTIMER1 goes live.  Holds
+//     trivially under this boot order — timepop_init is in phase 1,
+//     enable_irqs is much later.
+//
+//   • process_clocks_init() can safely run after enable_irqs because
+//     OCXO and VCLOCK compare channels remain in disabled-compare
+//     state until their respective interrupt_start() arms them.  No
+//     spurious one-second events fire between enable_irqs and the
+//     first interrupt_start().
 //
 // Sacred epoch note:
 //
@@ -238,11 +270,17 @@ void setup() {
   memory_info_init();
   cpu_usage_init();
 
-  // process_interrupt owns GPT1/GPT2 provider hardware.
+  // process_interrupt owns all interrupt-vector-bearing hardware:
+  // QTimer1 (CH0/CH1/CH2/CH3) and QTimer3 (OCXO CH2/CH3).  All
+  // compare channels start with their compares disabled — no spurious
+  // ISRs can fire between this call and process_interrupt_enable_irqs().
   process_interrupt_init_hardware();
 
-  // TimePop owns QTimer1 and must be ready before any subsystem that relies
-  // on timed callbacks or named singleton timer replacement.
+  // TimePop sets up its slot tables and registers its QTimer1 CH2
+  // handler with process_interrupt.  No NVIC work happens here; the
+  // CH2 IRQ goes live later in process_interrupt_enable_irqs(), and
+  // any pending TCF1 from this init's first schedule_next() fires
+  // the dispatcher then.
   timepop_init();
 
   // clocks owns DWT-local init and helper rolling baselines.

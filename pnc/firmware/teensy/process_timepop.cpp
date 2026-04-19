@@ -58,10 +58,11 @@
 // CH2/CH0 initialization offset:
 //
 //   CH0 and CH2 both count the GNSS 10 MHz clock (CM=1, PCS=0) but are enabled
-//   in separate init functions.  Between CH0's enable (in qtimer1_init_vclock_base)
-//   and CH2's enable (in qtimer1_init_ch2_scheduler), peripheral register writes
-//   for CH1 setup consume several VCLOCK ticks.  This creates a permanent phase
-//   offset: CH2 lags CH0 by a small number of ticks.
+//   in separate init functions in process_interrupt (qtimer1_init_vclock_base
+//   and qtimer1_init_ch2_scheduler).  Between CH0's enable and CH2's enable,
+//   peripheral register writes for CH1 setup consume several VCLOCK ticks.
+//   This creates a permanent phase offset: CH2 lags CH0 by a small number
+//   of ticks.
 //
 //   Since deadlines are computed from CH0+CH1 but the compare fires on CH2, every
 //   compare fires late by the offset.  The fix (once confirmed) is to synchronize
@@ -484,7 +485,6 @@ static void vclock_monitor_callback(timepop_ctx_t* ctx,
 // Forward declarations
 // ============================================================================
 
-static void qtimer1_irq_isr(void);
 static void schedule_next(void);
 static timepop_handle_t arm_absolute_slot_internal(
   int64_t             target_gnss_ns,
@@ -981,18 +981,25 @@ static inline void slot_build_diag(
 }
 
 // ============================================================================
-// QTimer1 CH2 ISR — priority queue scheduler
+// QTimer1 CH2 handler — TimePop priority queue scheduler
 // ============================================================================
+//
+// IRQ-context handler called by process_interrupt's qtimer1_isr
+// dispatcher on every CH2 compare-match.  Receives the standard
+// event/diag payload — DWT, gnss_ns, counter32 — already filled in by
+// the dispatcher.  No need to re-read the counter or recompute gnss_ns
+// here.  The CH2 TCF1 flag is cleared by the dispatcher before this
+// runs, so we don't clear it ourselves.
+//
+void timepop_qtimer1_ch2_handler(const interrupt_event_t& event,
+                                 const interrupt_capture_diag_t& /*diag*/) {
 
-static void qtimer1_ch2_isr(uint32_t dwt_entry) {
-
-  const uint32_t now = qtimer1_read_32_local();
+  const uint32_t dwt_entry      = event.dwt_at_event;
+  const uint32_t now            = event.counter32_at_event;
+  const int64_t  gnss_ns_at_isr = (int64_t)event.gnss_ns_at_event;
   const time_anchor_snapshot_t anchor = time_anchor_snapshot();
 
-  ch2_clear_flag();
   diag_isr_count++;
-
-  const int64_t gnss_ns_at_isr = vclock_to_gnss_ns(now, anchor);
 
   bool any_expired = false;
 
@@ -1198,54 +1205,13 @@ static timepop_handle_t arm_deferred(deferred_slot_t* slots_buf,
 }
 
 // ============================================================================
-// QTimer1 initialization — TimePop owns CH0/CH1/CH2
+// QTimer1 hardware initialization moved to process_interrupt
 // ============================================================================
-
-static void qtimer1_init_vclock_base(void) {
-  CCM_CCGR6 |= CCM_CCGR6_QTIMER1(CCM_CCGR_ON);
-
-  *(portConfigRegister(10)) = 1;
-  IOMUXC_SW_PAD_CTL_PAD_GPIO_B0_00 =
-      IOMUXC_PAD_HYS | IOMUXC_PAD_PKE | IOMUXC_PAD_PUE | IOMUXC_PAD_DSE(4);
-
-  IMXRT_TMR1.CH[0].CTRL = 0;
-  IMXRT_TMR1.CH[1].CTRL = 0;
-
-  IMXRT_TMR1.CH[0].SCTRL  = 0;
-  IMXRT_TMR1.CH[0].CSCTRL = 0;
-  IMXRT_TMR1.CH[0].LOAD   = 0;
-  IMXRT_TMR1.CH[0].CNTR   = 0;
-  IMXRT_TMR1.CH[0].COMP1  = 0xFFFF;
-  IMXRT_TMR1.CH[0].CMPLD1 = 0xFFFF;
-  IMXRT_TMR1.CH[0].CTRL   = TMR_CTRL_CM(1) | TMR_CTRL_PCS(0);
-
-  IMXRT_TMR1.CH[1].SCTRL  = 0;
-  IMXRT_TMR1.CH[1].CSCTRL = 0;
-  IMXRT_TMR1.CH[1].LOAD   = 0;
-  IMXRT_TMR1.CH[1].CNTR   = 0;
-  IMXRT_TMR1.CH[1].COMP1  = 0xFFFF;
-  IMXRT_TMR1.CH[1].CMPLD1 = 0xFFFF;
-  IMXRT_TMR1.CH[1].CTRL   = TMR_CTRL_CM(7);
-
-  IMXRT_TMR1.CH[0].CSCTRL &= ~TMR_CSCTRL_TCF1EN;
-  IMXRT_TMR1.CH[0].CSCTRL |=  TMR_CSCTRL_TCF1;
-  IMXRT_TMR1.CH[1].CSCTRL = 0;
-  IMXRT_TMR1.CH[1].SCTRL &= ~(TMR_SCTRL_TOFIE | TMR_SCTRL_IEF | TMR_SCTRL_IEFIE);
-
-  (void)IMXRT_TMR1.CH[0].CNTR;
-  (void)IMXRT_TMR1.CH[1].HOLD;
-}
-
-static void qtimer1_init_ch2_scheduler(void) {
-  IMXRT_TMR1.CH[2].CTRL   = 0;
-  IMXRT_TMR1.CH[2].CNTR   = 0;
-  IMXRT_TMR1.CH[2].LOAD   = 0;
-  IMXRT_TMR1.CH[2].COMP1  = 0xFFFF;
-  IMXRT_TMR1.CH[2].CMPLD1 = 0xFFFF;
-  IMXRT_TMR1.CH[2].SCTRL  = 0;
-  IMXRT_TMR1.CH[2].CSCTRL = TMR_CSCTRL_TCF1EN;
-  IMXRT_TMR1.CH[2].CTRL   = TMR_CTRL_CM(1) | TMR_CTRL_PCS(0);
-}
+//
+// CH0/CH1 cascade and CH2 scheduler channel are now initialized by
+// process_interrupt_init_hardware().  TimePop only programs the CH2
+// compare register as it schedules slots; the channel mode/control
+// setup is no longer TimePop's responsibility.
 
 // ============================================================================
 // Initialization
@@ -1326,12 +1292,12 @@ void timepop_init(void) {
   g_vclock_edge_monitor = {};
   g_vclock_edge_monitor.enabled = true;
 
-  qtimer1_init_vclock_base();
-  qtimer1_init_ch2_scheduler();
-
-  attachInterruptVector(IRQ_QTIMER1, qtimer1_irq_isr);
-  NVIC_SET_PRIORITY(IRQ_QTIMER1, 16);
-  NVIC_ENABLE_IRQ(IRQ_QTIMER1);
+  // QTimer1 hardware (CH0/CH1/CH2) is initialized by
+  // process_interrupt_init_hardware().  IRQ vector and NVIC priority
+  // are owned by process_interrupt_enable_irqs().  We just register
+  // our CH2 handler here; the dispatcher will invoke it in IRQ
+  // context with a fully-populated event/diag payload.
+  interrupt_register_qtimer1_ch2_handler(timepop_qtimer1_ch2_handler);
 
   const uint32_t saved = critical_enter();
   diag_schedule_next_calls_from_other++;
@@ -2124,34 +2090,15 @@ out.add("vclock_edge_monitor_last_vclock_minus_pps_ns", g_vclock_edge_monitor.la
 }
 
 // ============================================================================
-// QTimer1 CH3 hosted client (registered by process_interrupt)
+// QTimer1 vector ownership moved to process_interrupt
 // ============================================================================
 //
-// process_interrupt owns the VCLOCK rolling integrator and uses CH3 of
-// QTimer1 as a dedicated compare channel.  TimePop's QTimer1 IRQ handler
-// dispatches to this callback when CH3's TCF1 flag is set, passing the
-// first-instruction DWT capture so the client gets identical latency to
-// a dedicated-vector handler.
-//
-static volatile timepop_qtimer1_ch3_isr_fn g_qtimer1_ch3_isr = nullptr;
-
-void timepop_register_qtimer1_ch3_isr(timepop_qtimer1_ch3_isr_fn cb) {
-  g_qtimer1_ch3_isr = cb;
-}
-
-// ============================================================================
-// QTimer1 ISR
-// ============================================================================
-
-static void qtimer1_irq_isr(void) {
-  const uint32_t dwt_raw = ARM_DWT_CYCCNT;           // FIRST instruction
-  if (IMXRT_TMR1.CH[2].CSCTRL & TMR_CSCTRL_TCF1) {
-    qtimer1_ch2_isr(dwt_raw);                          // TimePop scheduler
-  }
-  if (g_qtimer1_ch3_isr && (IMXRT_TMR1.CH[3].CSCTRL & TMR_CSCTRL_TCF1)) {
-    g_qtimer1_ch3_isr(dwt_raw);                        // hosted CH3 client
-  }
-}
+// process_interrupt now owns IRQ_QTIMER1 and dispatches both CH2 (this
+// file's timepop_qtimer1_ch2_handler, registered via
+// interrupt_register_qtimer1_ch2_handler at init) and CH3 (its own
+// internal vclock_cadence_isr).  TimePop is the CH2 hosted client;
+// the previous CH3 hosted-client registration mechanism (where TimePop
+// hosted process_interrupt's CH3 handler) has been retired.
 
 static const process_command_entry_t TIMEPOP_COMMANDS[] = {
   { "REPORT",                 cmd_report                 },

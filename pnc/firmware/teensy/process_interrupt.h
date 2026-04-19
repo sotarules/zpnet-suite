@@ -4,8 +4,24 @@
 //
 // process_interrupt owns interrupt custody for:
 //   • OCXO lanes (QTimer3 vector — CH2, CH3)
-//   • VCLOCK lane (QTimer1 CH3, via TimePop's hosted dispatch)
+//   • VCLOCK lane (QTimer1 vector — CH3)
+//   • TimePop scheduler (QTimer1 vector — CH2, hosted client)
 //   • Physical PPS GPIO edge (witness + dispatch authority + epoch anchor)
+//
+// QTimer1 vector custody:
+//
+//   QTimer1 has a single shared IRQ vector across all four channels.
+//   process_interrupt owns the vector and dispatches in IRQ context:
+//     • CH2 flag set → registered TimePop scheduler handler
+//     • CH3 flag set → vclock_cadence_isr (process_interrupt internal)
+//   Both handlers receive the same first-instruction DWT capture, so
+//   they get identical latency profiles.
+//
+//   TimePop owns the CH2 compare-register programming (advancing the
+//   compare target as it schedules slots).  TimePop registers its
+//   CH2 handler via interrupt_register_qtimer1_ch2_handler at init
+//   time; the registration is a pure function-pointer assignment with
+//   no hardware interaction.
 //
 // Doctrine — canonical GNSS clock authority:
 //
@@ -102,7 +118,7 @@ enum class interrupt_subscriber_kind_t : uint8_t {
   VCLOCK,
   OCXO1,
   OCXO2,
-  TIME_TEST,
+  TIMEPOP,
 };
 
 enum class interrupt_provider_kind_t : uint8_t {
@@ -114,6 +130,7 @@ enum class interrupt_provider_kind_t : uint8_t {
 
 enum class interrupt_lane_t : uint8_t {
   NONE = 0,
+  QTIMER1_CH2_COMP,
   QTIMER1_CH3_COMP,
   QTIMER3_CH2_COMP,
   QTIMER3_CH3_COMP,
@@ -128,7 +145,18 @@ enum class interrupt_event_status_t : uint8_t {
 
 // ============================================================================
 // One-second event — delivered to VCLOCK / OCXO subscribers every 1000 ticks
+// CH2 cadence event — delivered to TimePop on every QTimer1 CH2 compare-match
 // ============================================================================
+//
+// VCLOCK and OCXO lanes deliver one event per second to their foreground
+// subscribers (via timepop_arm_asap deferral).  TIMEPOP receives an event
+// on every CH2 compare-match — IRQ-context delivery, no foreground hop —
+// because TimePop IS the foreground dispatcher and cannot defer its own
+// scheduler heartbeat.
+//
+// The event payload is uniform across all kinds: dwt_at_event,
+// gnss_ns_at_event, counter32_at_event, plus the optional
+// pps_coincidence fields populated only on VCLOCK kind.
 
 struct interrupt_event_t {
   interrupt_subscriber_kind_t kind = interrupt_subscriber_kind_t::NONE;
@@ -363,6 +391,29 @@ void interrupt_pps_edge_register_dispatch(pps_edge_dispatch_fn fn);
 
 // Seqlock-safe snapshot of the most recent physical PPS edge.
 pps_edge_snapshot_t interrupt_last_pps_edge(void);
+
+// ============================================================================
+// QTimer1 CH2 IRQ-context handler — TimePop scheduler heartbeat
+// ============================================================================
+//
+// TimePop registers a single CH2 handler at init.  process_interrupt's
+// QTimer1 ISR captures DWT as the first instruction, then on every
+// QTimer1 CH2 compare-match assembles a standard interrupt_event_t and
+// interrupt_capture_diag_t (kind = TIMEPOP) and invokes this handler in
+// IRQ context.  The handler runs to completion before the ISR returns.
+//
+// Unlike VCLOCK/OCXO subscriptions, this delivery is NOT foreground-
+// deferred — TimePop IS the foreground dispatcher and cannot defer its
+// own scheduler heartbeat.
+//
+// Pass nullptr to unregister.  Only one CH2 handler may be registered;
+// subsequent calls replace the previous registration.
+//
+using interrupt_qtimer1_ch2_handler_fn =
+    void (*)(const interrupt_event_t& event,
+             const interrupt_capture_diag_t& diag);
+
+void interrupt_register_qtimer1_ch2_handler(interrupt_qtimer1_ch2_handler_fn cb);
 
 // ISR entry points (invoked by vector shims).
 void process_interrupt_gpio6789_irq(uint32_t dwt_isr_entry_raw);

@@ -11,58 +11,61 @@
 //   • deferred callback dispatch
 //   • instrumentation / reports
 //   • always-on internal VCLOCK monitor
-//   • the IRQ_QTIMER1 vector itself (single shared vector for QTimer1)
+//   • QTimer1 CH2 compare-register programming (the scheduler compare)
 //
 // TimePop does not own:
 //   • PPS/GPIO interrupt custody
 //   • OCXO interrupt custody
-//   • raw interrupt normalization
-//   • QTimer1 CH3 (hosted client; see below)
+//   • QTimer1 vector custody — process_interrupt owns IRQ_QTIMER1 and
+//     dispatches CH2 to TimePop's registered handler in IRQ context
+//   • QTimer1 CH0/CH1/CH2 hardware mode init — process_interrupt does
+//     the one-time CTRL/SCTRL/CSCTRL/COMP1/CMPLD1 setup
 //
 // Those are owned by process_interrupt.
 //
-// QTimer1 CH3 hosted-client API:
+// QTimer1 CH2 hosted-handler API (TimePop is the hosted client):
 //
 //   QTimer1 has only one IRQ vector shared across all four channels.
-//   process_interrupt owns the VCLOCK rolling integrator, which needs a
-//   dedicated channel compare on QTimer1 (so the integrator's tick has
-//   the same hardware-to-software latency profile as the OCXO ticks on
-//   QTimer3).  Rather than fight TimePop for the vector, process_interrupt
-//   registers a CH3 ISR with TimePop.  TimePop's qtimer1_irq_isr captures
-//   DWT as the first instruction and then dispatches:
-//     • CH2 flag set → TimePop's own scheduler ISR
-//     • CH3 flag set → the registered process_interrupt ISR
-//   Both handlers receive the same first-instruction DWT value, so the
-//   CH3 client gets identical latency to a dedicated-vector handler.
+//   process_interrupt owns the vector and dispatches in IRQ context:
+//     • CH2 flag set → TimePop's registered handler (this file)
+//     • CH3 flag set → process_interrupt's internal vclock_cadence_isr
+//   Both handlers receive the same first-instruction DWT capture.
+//
+//   For CH2, the dispatcher additionally computes counter32_at_event
+//   and gnss_ns_at_event and packages everything into a standard
+//   interrupt_event_t (kind = TIMEPOP) and interrupt_capture_diag_t,
+//   which it passes to TimePop's handler.  TimePop reads the event
+//   payload directly and proceeds with slot dispatch — no need to
+//   re-read the counter or recompute gnss_ns.
+//
+//   TimePop is responsible for:
+//     • registering its CH2 handler at init via
+//       interrupt_register_qtimer1_ch2_handler()
+//     • programming and re-programming the CH2 compare target as
+//       slots are scheduled
 //
 //   process_interrupt is responsible for:
-//     • initializing CH3 hardware (CTRL/SCTRL/CSCTRL/COMP1/CMPLD1)
-//     • programming and re-programming the CH3 compare target
-//     • clearing the CH3 TCF1 flag in its handler
-//
-//   TimePop is responsible only for:
-//     • dispatching to the registered CH3 handler when the flag is set
+//     • initializing CH0/CH1/CH2 hardware (one-time mode/control)
+//     • clearing the CH2 TCF1 flag in the QTimer1 ISR before
+//       invoking TimePop's handler
+//     • building the event/diag payloads passed to TimePop
 //
 // ============================================================================
 
 #pragma once
 
 #include "timepop.h"
+#include "process_interrupt.h"
 #include <stdint.h>
 
 void timepop_bootstrap(void);
 void timepop_init(void);
 void process_timepop_register(void);
 
-// QTimer1 CH3 hosted-client registration.  See doctrine above.
+// QTimer1 CH2 IRQ-context handler.  Registered with process_interrupt
+// at init.  Called by process_interrupt's qtimer1_isr dispatcher on
+// every CH2 compare-match, in IRQ context, with the standard event
+// and diag payloads filled in by the dispatcher.
 //
-// The callback runs in IRQ context.  dwt_isr_entry_raw is the DWT cycle
-// count captured as the first instruction of TimePop's qtimer1_irq_isr —
-// the same value as if the callback owned the IRQ vector itself.
-//
-// Pass nullptr to unregister.  Only one CH3 callback may be registered;
-// subsequent calls replace the previous registration.
-//
-typedef void (*timepop_qtimer1_ch3_isr_fn)(uint32_t dwt_isr_entry_raw);
-
-void timepop_register_qtimer1_ch3_isr(timepop_qtimer1_ch3_isr_fn cb);
+void timepop_qtimer1_ch2_handler(const interrupt_event_t& event,
+                                 const interrupt_capture_diag_t& diag);

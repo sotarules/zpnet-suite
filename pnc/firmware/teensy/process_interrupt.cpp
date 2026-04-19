@@ -2,15 +2,14 @@
 // process_interrupt.cpp — per-lane 1 kHz cadence + physical PPS machinery
 // ============================================================================
 //
-// Three lanes (VCLOCK, OCXO1, OCXO2), each cadenced by its own dedicated
-// QuadTimer compare channel at 1 kHz:
+// Three one-second lanes (VCLOCK, OCXO1, OCXO2), each cadenced by its own
+// dedicated QuadTimer compare channel at 1 kHz, plus a TimePop scheduler
+// channel and a physical PPS GPIO edge:
 //
 //   VCLOCK lane:  QTimer1 CH3 compare, +10000 counts per interval
 //                 (clocked by GNSS 10 MHz VCLOCK; PCS=0)
-//                 ISR is registered with TimePop via
-//                 timepop_register_qtimer1_ch3_isr() — TimePop's
-//                 qtimer1_irq_isr captures DWT as the first instruction
-//                 and dispatches here when CH3's flag is set.
+//                 ISR is vclock_cadence_isr, called directly from this
+//                 file's qtimer1_isr dispatcher when CH3's flag is set.
 //
 //   OCXO1 lane:   QTimer3 CH2 compare, +10000 counts per interval
 //                 (clocked by OCXO1 10 MHz; PCS=2)
@@ -19,6 +18,14 @@
 //   OCXO2 lane:   QTimer3 CH3 compare, +10000 counts per interval
 //                 (clocked by OCXO2 10 MHz; PCS=3)
 //                 ISR is owned directly by process_interrupt.
+//
+//   TimePop:      QTimer1 CH2 compare, varied intervals based on what
+//                 TimePop has scheduled.  TimePop registers an
+//                 IRQ-context handler via interrupt_register_qtimer1_
+//                 ch2_handler() and receives a standard interrupt_event_t
+//                 (kind = TIMEPOP) on every CH2 compare-match.  The
+//                 dispatcher computes the full event payload (DWT,
+//                 counter32, gnss_ns) before invoking the handler.
 //
 // Physical PPS GPIO — witness, dispatch authority, and epoch anchor:
 //
@@ -231,6 +238,14 @@ static inline void qtimer1_ch3_program_compare(uint16_t target_low16) {
 static inline void qtimer1_ch3_disable_compare(void) {
   IMXRT_TMR1.CH[3].CSCTRL &= ~TMR_CSCTRL_TCF1EN;
   qtimer1_ch3_clear_compare_flag();
+}
+
+// ── CH2 (TimePop scheduler) — flag clear only.  TimePop owns CH2
+// compare-register programming via its own helpers; process_interrupt
+// only clears the TCF1 flag in the QTimer1 ISR before invoking the
+// registered TimePop handler.
+static inline void qtimer1_ch2_clear_compare_flag(void) {
+  IMXRT_TMR1.CH[2].CSCTRL &= ~(TMR_CSCTRL_TCF1 | TMR_CSCTRL_TCF2);
 }
 
 static inline void qtimer3_clear_compare_flag(uint8_t ch) {
@@ -492,6 +507,65 @@ static void qtimer3_isr(void) {
 }
 
 // ============================================================================
+// QTimer1 vector — dispatches CH2 (TimePop) and CH3 (VCLOCK cadence)
+// ============================================================================
+//
+// Single shared vector for QTimer1.  Captures DWT as the first
+// instruction, then dispatches each channel whose TCF1 flag is set.
+// CH2 first (TimePop scheduler heartbeat), then CH3 (VCLOCK cadence).
+// Both handlers receive the same first-instruction DWT value.
+//
+// CH2 dispatch packages a standard interrupt_event_t (kind = TIMEPOP)
+// with full payload — dwt_at_event, gnss_ns_at_event, counter32_at_event
+// — and invokes the registered TimePop handler in IRQ context.
+//
+// CH3 dispatch invokes vclock_cadence_isr directly (no registration
+// hop — it's an internal call within process_interrupt).
+//
+static volatile interrupt_qtimer1_ch2_handler_fn g_qtimer1_ch2_handler = nullptr;
+
+void interrupt_register_qtimer1_ch2_handler(interrupt_qtimer1_ch2_handler_fn cb) {
+  g_qtimer1_ch2_handler = cb;
+}
+
+static void qtimer1_isr(void) {
+  const uint32_t dwt_raw = ARM_DWT_CYCCNT;  // FIRST instruction
+
+  if (IMXRT_TMR1.CH[2].CSCTRL & TMR_CSCTRL_TCF1) {
+    qtimer1_ch2_clear_compare_flag();
+
+    if (g_qtimer1_ch2_handler) {
+      const uint32_t counter32 = qtimer1_read_32_for_diag();
+      const int64_t gnss_ns = time_dwt_to_gnss_ns(dwt_raw);
+
+      interrupt_event_t event{};
+      event.kind     = interrupt_subscriber_kind_t::TIMEPOP;
+      event.provider = interrupt_provider_kind_t::QTIMER1;
+      event.lane     = interrupt_lane_t::QTIMER1_CH2_COMP;
+      event.status   = interrupt_event_status_t::OK;
+      event.dwt_at_event       = dwt_raw;
+      event.gnss_ns_at_event   = (gnss_ns >= 0) ? (uint64_t)gnss_ns : 0;
+      event.counter32_at_event = counter32;
+
+      interrupt_capture_diag_t diag{};
+      diag.enabled  = true;
+      diag.provider = interrupt_provider_kind_t::QTIMER1;
+      diag.lane     = interrupt_lane_t::QTIMER1_CH2_COMP;
+      diag.kind     = interrupt_subscriber_kind_t::TIMEPOP;
+      diag.dwt_at_event       = dwt_raw;
+      diag.gnss_ns_at_event   = event.gnss_ns_at_event;
+      diag.counter32_at_event = counter32;
+
+      g_qtimer1_ch2_handler(event, diag);
+    }
+  }
+
+  if (IMXRT_TMR1.CH[3].CSCTRL & TMR_CSCTRL_TCF1) {
+    vclock_cadence_isr(dwt_raw);
+  }
+}
+
+// ============================================================================
 // Physical PPS GPIO — witness, dispatch authority, epoch anchor
 // ============================================================================
 
@@ -677,6 +751,67 @@ void interrupt_prespin_service(timepop_ctx_t*, timepop_diag_t*, void*) {}
 // Hardware + runtime init
 // ============================================================================
 
+// ── QTimer1 CH0/CH1 cascade — VCLOCK-clocked 32-bit counter ──
+//
+// CH0 is the low 16 bits, clocked by the external 10 MHz VCLOCK signal
+// on pin 10.  CH1 is cascaded above it, advanced by CH0's overflow.
+// Together they form a free-running 32-bit count of VCLOCK ticks.
+// Read via qtimer1_read_32_for_diag() with torn-read protection.
+//
+static void qtimer1_init_vclock_base(void) {
+  CCM_CCGR6 |= CCM_CCGR6_QTIMER1(CCM_CCGR_ON);
+
+  *(portConfigRegister(10)) = 1;
+  IOMUXC_SW_PAD_CTL_PAD_GPIO_B0_00 =
+      IOMUXC_PAD_HYS | IOMUXC_PAD_PKE | IOMUXC_PAD_PUE | IOMUXC_PAD_DSE(4);
+
+  IMXRT_TMR1.CH[0].CTRL = 0;
+  IMXRT_TMR1.CH[1].CTRL = 0;
+
+  IMXRT_TMR1.CH[0].SCTRL  = 0;
+  IMXRT_TMR1.CH[0].CSCTRL = 0;
+  IMXRT_TMR1.CH[0].LOAD   = 0;
+  IMXRT_TMR1.CH[0].CNTR   = 0;
+  IMXRT_TMR1.CH[0].COMP1  = 0xFFFF;
+  IMXRT_TMR1.CH[0].CMPLD1 = 0xFFFF;
+  IMXRT_TMR1.CH[0].CTRL   = TMR_CTRL_CM(1) | TMR_CTRL_PCS(0);
+
+  IMXRT_TMR1.CH[1].SCTRL  = 0;
+  IMXRT_TMR1.CH[1].CSCTRL = 0;
+  IMXRT_TMR1.CH[1].LOAD   = 0;
+  IMXRT_TMR1.CH[1].CNTR   = 0;
+  IMXRT_TMR1.CH[1].COMP1  = 0xFFFF;
+  IMXRT_TMR1.CH[1].CMPLD1 = 0xFFFF;
+  IMXRT_TMR1.CH[1].CTRL   = TMR_CTRL_CM(7);
+
+  IMXRT_TMR1.CH[0].CSCTRL &= ~TMR_CSCTRL_TCF1EN;
+  IMXRT_TMR1.CH[0].CSCTRL |=  TMR_CSCTRL_TCF1;
+  IMXRT_TMR1.CH[1].CSCTRL = 0;
+  IMXRT_TMR1.CH[1].SCTRL &= ~(TMR_SCTRL_TOFIE | TMR_SCTRL_IEF | TMR_SCTRL_IEFIE);
+
+  (void)IMXRT_TMR1.CH[0].CNTR;
+  (void)IMXRT_TMR1.CH[1].HOLD;
+}
+
+// ── QTimer1 CH2 — TimePop scheduler compare channel ──
+//
+// CH2 runs from the same VCLOCK source as CH0/CH1 and is used by TimePop
+// as its scheduling compare channel.  TimePop owns the compare register
+// programming; process_interrupt only does the one-time mode/control init
+// here and clears the TCF1 flag in the QTimer1 ISR before invoking
+// TimePop's registered handler.
+//
+static void qtimer1_init_ch2_scheduler(void) {
+  IMXRT_TMR1.CH[2].CTRL   = 0;
+  IMXRT_TMR1.CH[2].CNTR   = 0;
+  IMXRT_TMR1.CH[2].LOAD   = 0;
+  IMXRT_TMR1.CH[2].COMP1  = 0xFFFF;
+  IMXRT_TMR1.CH[2].CMPLD1 = 0xFFFF;
+  IMXRT_TMR1.CH[2].SCTRL  = 0;
+  IMXRT_TMR1.CH[2].CSCTRL = TMR_CSCTRL_TCF1EN;
+  IMXRT_TMR1.CH[2].CTRL   = TMR_CTRL_CM(1) | TMR_CTRL_PCS(0);
+}
+
 static void qtimer1_ch3_init_vclock_cadence(void) {
   IMXRT_TMR1.CH[3].CTRL   = 0;
   IMXRT_TMR1.CH[3].SCTRL  = 0;
@@ -727,6 +862,8 @@ void process_interrupt_init_hardware(void) {
   g_ocxo1_lane.initialized = true;
   g_ocxo2_lane.initialized = true;
 
+  qtimer1_init_vclock_base();
+  qtimer1_init_ch2_scheduler();
   qtimer1_ch3_init_vclock_cadence();
   g_vclock_lane.initialized = true;
 
@@ -763,6 +900,10 @@ void process_interrupt_init(void) {
 void process_interrupt_enable_irqs(void) {
   if (g_interrupt_irqs_enabled) return;
 
+  attachInterruptVector(IRQ_QTIMER1, qtimer1_isr);
+  NVIC_SET_PRIORITY(IRQ_QTIMER1, 16);
+  NVIC_ENABLE_IRQ(IRQ_QTIMER1);
+
   attachInterruptVector(IRQ_QTIMER3, qtimer3_isr);
   NVIC_SET_PRIORITY(IRQ_QTIMER3, 16);
   NVIC_ENABLE_IRQ(IRQ_QTIMER3);
@@ -770,8 +911,6 @@ void process_interrupt_enable_irqs(void) {
   pinMode(GNSS_PPS_PIN, INPUT);
   attachInterrupt(digitalPinToInterrupt(GNSS_PPS_PIN), pps_gpio_isr, RISING);
   NVIC_SET_PRIORITY(IRQ_GPIO6789, 0);
-
-  timepop_register_qtimer1_ch3_isr(vclock_cadence_isr);
 
   g_interrupt_irqs_enabled = true;
 }
@@ -854,7 +993,7 @@ const char* interrupt_subscriber_kind_str(interrupt_subscriber_kind_t kind) {
     case interrupt_subscriber_kind_t::VCLOCK:    return "VCLOCK";
     case interrupt_subscriber_kind_t::OCXO1:     return "OCXO1";
     case interrupt_subscriber_kind_t::OCXO2:     return "OCXO2";
-    case interrupt_subscriber_kind_t::TIME_TEST: return "TIME_TEST";
+    case interrupt_subscriber_kind_t::TIMEPOP:   return "TIMEPOP";
     default:                                     return "NONE";
   }
 }
@@ -870,6 +1009,7 @@ const char* interrupt_provider_kind_str(interrupt_provider_kind_t provider) {
 
 const char* interrupt_lane_str(interrupt_lane_t lane) {
   switch (lane) {
+    case interrupt_lane_t::QTIMER1_CH2_COMP: return "QTIMER1_CH2_COMP";
     case interrupt_lane_t::QTIMER1_CH3_COMP: return "QTIMER1_CH3_COMP";
     case interrupt_lane_t::QTIMER3_CH2_COMP: return "QTIMER3_CH2_COMP";
     case interrupt_lane_t::QTIMER3_CH3_COMP: return "QTIMER3_CH3_COMP";
