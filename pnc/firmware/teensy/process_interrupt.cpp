@@ -63,6 +63,7 @@
 
 #include <Arduino.h>
 #include "imxrt.h"
+#include <math.h>
 
 // ============================================================================
 // Constants
@@ -528,9 +529,346 @@ void interrupt_register_qtimer1_ch2_handler(interrupt_qtimer1_ch2_handler_fn cb)
   g_qtimer1_ch2_handler = cb;
 }
 
+// ============================================================================
+// QTimer1 CH3 witness — torture-sanity test of timekeeping math
+// ============================================================================
+//
+// When witness mode is ON, the CH3 branch of qtimer1_isr routes to the
+// witness path instead of vclock_cadence_isr.  The witness fires nine
+// times per PPS second at 100, 200, ..., 900 ms offsets from the PPS
+// anchor.  Each fire captures DWT as first instruction, computes the
+// residual against the caller's predicted DWT at the VCLOCK target, and
+// feeds the Welford.
+//
+// The witness self-rotates: on slot N's fire, it arms CH3 for slot N+1.
+// After slot 9 (900 ms) fires, CH3 is disabled; the next PPS edge re-
+// arms slot 1 (100 ms).  PPS at the 0 ms boundary is deliberately
+// skipped — that's where GPIO ISR contention would contaminate the
+// measurement.
+//
+// DWT prediction math:
+//   target_dwt[N] = anchor_dwt + round((N * 0.1) * dwt_cycles_per_second)
+//   target_vclock[N] = (anchor_counter32 + N * 1_000_000) & 0xFFFF
+//                      (cast to 16-bit because CH3 compares low 16 bits)
+// where anchor_counter32 and anchor_dwt are captured at the most recent
+// PPS edge and dwt_cycles_per_second is the current DWT rate prediction.
+//
+// Residual in nanoseconds (at 1008 MHz where 1 cycle = 125/126 ns):
+//   residual_cycles = dwt_at_isr_entry - target_dwt[N]
+//   residual_ns     = residual_cycles * 125 / 126
+//
+// Positive residual means DWT advanced past target before the ISR
+// captured it — pure ISR entry latency.  Negative residual would imply
+// DWT reads earlier than target — which should be impossible if math is
+// right, so it accuses the math.
+
+static constexpr uint32_t WITNESS_N_SLOTS = 9;
+
+// 1 ms = 10,000 VCLOCK ticks; 100 ms = 1,000,000 VCLOCK ticks.
+static constexpr uint32_t WITNESS_VCLOCK_TICKS_PER_SLOT = 1000000;
+
+// Reject residuals above this magnitude as garbage — something must
+// have missed the fire window or preempted it catastrophically.
+// 100,000 cycles at 1008 MHz ≈ 99 µs.
+static constexpr int32_t WITNESS_REJECT_CYCLES = 100000;
+
+struct witness_welford_t {
+  uint64_t n;
+  double   mean;       // in DWT cycles
+  double   m2;
+  int32_t  min_val;    // cycles
+  int32_t  max_val;    // cycles
+};
+
+static volatile interrupt_witness_mode_t g_witness_mode =
+    interrupt_witness_mode_t::OFF;
+
+// Slot state for the CURRENT in-flight slot.  Arm computes all three
+// fields atomically; the ISR reads them to validate the fire.
+struct witness_slot_t {
+  uint32_t target_vclock;    // full 32-bit VCLOCK target (for validation)
+  uint32_t target_dwt;       // predicted DWT at target
+  uint8_t  slot_index;       // 1..WITNESS_N_SLOTS (0 = no slot armed)
+};
+
+static volatile witness_slot_t g_witness_current = { 0, 0, 0 };
+
+// Anchor values from the most recent PPS edge (captured in alpha-
+// supplied arm call).  Used to compute the NEXT slot when this one
+// fires.
+static volatile uint32_t g_witness_anchor_counter32 = 0;
+static volatile uint32_t g_witness_anchor_dwt       = 0;
+static volatile uint32_t g_witness_anchor_dwt_cps   = 1008000000;
+
+static witness_welford_t g_witness_welford = {};
+static witness_welford_t g_witness_lag_welford = {};
+static witness_welford_t g_witness_gpio_counter_delay_welford = {};
+
+static volatile uint64_t g_witness_fires_total    = 0;
+static volatile uint64_t g_witness_fires_rejected = 0;
+
+static inline void witness_welford_reset(witness_welford_t& w) {
+  w.n = 0;
+  w.mean = 0.0;
+  w.m2 = 0.0;
+  w.min_val = 0;
+  w.max_val = 0;
+}
+
+static inline void witness_welford_update(witness_welford_t& w, int32_t sample) {
+  w.n++;
+  if (w.n == 1) {
+    w.min_val = sample;
+    w.max_val = sample;
+  } else {
+    if (sample < w.min_val) w.min_val = sample;
+    if (sample > w.max_val) w.max_val = sample;
+  }
+  const double delta  = (double)sample - w.mean;
+  w.mean += delta / (double)w.n;
+  const double delta2 = (double)sample - w.mean;
+  w.m2 += delta * delta2;
+}
+
+static inline double witness_welford_stddev(const witness_welford_t& w) {
+  if (w.n < 2) return 0.0;
+  return sqrt(w.m2 / (double)(w.n - 1));
+}
+
+// Cycles to nanoseconds at 1008 MHz: 1 cycle = 125/126 ns exactly.
+// For residuals in the ~100 ns range this rational conversion matters
+// for the metrics-board headline number.
+static inline double witness_cycles_to_ns(double cycles) {
+  return cycles * (125.0 / 126.0);
+}
+
+// Compute the target_dwt for slot N given the anchor.
+//   delta_dwt = round(N * dwt_cps / 10)  because slot N is at N*100ms
+//   target_dwt = anchor_dwt + delta_dwt
+// Uses 64-bit intermediate to avoid overflow — (9 * 1e9) fits in 64 bits.
+static inline uint32_t witness_compute_target_dwt(uint32_t anchor_dwt,
+                                                   uint32_t dwt_cps,
+                                                   uint32_t slot_index) {
+  const uint64_t delta = ((uint64_t)slot_index * (uint64_t)dwt_cps + 5ULL) / 10ULL;
+  return anchor_dwt + (uint32_t)delta;
+}
+
+// Compute the target_vclock (full 32-bit) for slot N given the anchor.
+static inline uint32_t witness_compute_target_vclock(uint32_t anchor_counter32,
+                                                      uint32_t slot_index) {
+  return anchor_counter32 + slot_index * WITNESS_VCLOCK_TICKS_PER_SLOT;
+}
+
+// Arm CH3 for a specific slot.  Called from:
+//   • interrupt_witness_arm_first_slot (slot_index = 1, from PPS edge)
+//   • witness_ch3_isr itself (slot_index = 2..9, self-rotation)
+// At slot_index == WITNESS_N_SLOTS the witness disables CH3 and waits
+// for the next PPS edge to re-arm slot 1.
+static void witness_arm_slot(uint8_t slot_index) {
+  if (slot_index < 1 || slot_index > WITNESS_N_SLOTS) {
+    qtimer1_ch3_disable_compare();
+    g_witness_current.slot_index = 0;
+    return;
+  }
+
+  const uint32_t target_vclock =
+      witness_compute_target_vclock(g_witness_anchor_counter32, slot_index);
+  const uint32_t target_dwt =
+      witness_compute_target_dwt(g_witness_anchor_dwt,
+                                 g_witness_anchor_dwt_cps,
+                                 slot_index);
+
+  // Store slot state atomically from the ISR's perspective.  ISR reads
+  // slot_index last; we write it last.
+  g_witness_current.target_vclock = target_vclock;
+  g_witness_current.target_dwt    = target_dwt;
+  g_witness_current.slot_index    = slot_index;
+
+  // Program CH3 compare for low 16 bits.  The full 32-bit target_vclock
+  // is stored for the ISR's sanity check; the hardware compare operates
+  // on the low 16 bits only.
+  qtimer1_ch3_program_compare((uint16_t)(target_vclock & 0xFFFF));
+}
+
+// CH3 witness ISR path — called from qtimer1_isr when witness mode is ON.
+//
+// IMPORTANT: CH3's compare hardware only compares the LOW 16 BITS of the
+// counter against COMP1.  At 10 MHz, the counter wraps every ~6.55 ms
+// (65536 ticks), so the compare fires roughly 150x per second — but
+// only ONE of those fires is the real target (the one where the full
+// 32-bit counter equals target_vclock).  The other ~149 are spurious
+// wrap-matches with the same low-16 bits but wildly different high-16.
+//
+// We filter by reading the 32-bit counter at ISR entry and comparing
+// against the full target_vclock.  Matches (within a small tolerance
+// window) are the real fires; non-matches are ignored without rotating
+// slots or incrementing the rejected counter.
+//
+// Rotation only happens on a real match.
+//
+static void witness_ch3_isr(uint32_t dwt_raw) {
+  qtimer1_ch3_clear_compare_flag();
+  g_witness_fires_total++;
+
+  const uint8_t slot_index = g_witness_current.slot_index;
+  if (slot_index < 1 || slot_index > WITNESS_N_SLOTS) {
+    // Spurious fire — no slot armed.  Disable and wait.
+    qtimer1_ch3_disable_compare();
+    g_witness_fires_rejected++;
+    return;
+  }
+
+  // Read the full 32-bit counter to distinguish real fires from wrap
+  // aliases.  A real fire has counter32 very close to target_vclock
+  // (within a few ticks of hardware latency).  An alias has counter32
+  // offset by some multiple of 65536.
+  const uint32_t counter32 = qtimer1_read_32_for_diag();
+  const uint16_t ch3_cntr  = IMXRT_TMR1.CH[3].CNTR;
+  const uint32_t target_vclock = g_witness_current.target_vclock;
+
+  // Signed delta — positive if counter is past target (normal case),
+  // negative if target hasn't arrived yet.  Wrap-alias fires will have
+  // magnitude > ~32768 (because they're at least a half-wrap away).
+  //
+  // Real fire tolerance: within WITNESS_VCLOCK_MATCH_WINDOW ticks of
+  // target.  One VCLOCK tick is 100 ns, so a 256-tick window is 25.6 µs
+  // — plenty of margin for ISR entry latency without allowing aliases.
+  const int32_t vclock_delta = (int32_t)(counter32 - target_vclock);
+  constexpr int32_t WITNESS_VCLOCK_MATCH_WINDOW = 256;
+  if (vclock_delta < -WITNESS_VCLOCK_MATCH_WINDOW ||
+      vclock_delta >  WITNESS_VCLOCK_MATCH_WINDOW) {
+    // Wrap alias — not our real fire.  Don't rotate, don't count as
+    // rejected, just let the compare re-fire at the next wrap and we'll
+    // check again.  Eventually (within ~6.5 ms at worst) we'll see the
+    // real one.
+    return;
+  }
+
+  // CH3 / CH0 phase lag measurement.  Both channels clock from the
+  // same 10 MHz VCLOCK source (PCS=0), but CH3 was enabled by a
+  // different register write than CH0 at init time.  Any phase
+  // difference between them accumulated between those two enables
+  // persists forever and is a pure observable here.
+  //
+  // Compare the low 16 bits of the cascade (CH0) counter against the
+  // CH3 counter.  At this instant, lag = CH0_low16 - CH3.  Positive
+  // lag means CH3 is behind CH0 by that many ticks.
+  const int32_t lag_ticks =
+      (int32_t)(int16_t)((uint16_t)(counter32 & 0xFFFF) - ch3_cntr);
+  witness_welford_update(g_witness_lag_welford, lag_ticks);
+
+  const uint32_t target_dwt = g_witness_current.target_dwt;
+  const int32_t  residual_cycles = (int32_t)(dwt_raw - target_dwt);
+
+  // Sanity: residual must be small positive.  Large magnitude (in
+  // either direction) means something is wrong — likely a missed fire
+  // or heavy preemption.  Reject without polluting the Welford.
+  if (residual_cycles < -WITNESS_REJECT_CYCLES ||
+      residual_cycles >  WITNESS_REJECT_CYCLES) {
+    g_witness_fires_rejected++;
+  } else {
+    witness_welford_update(g_witness_welford, residual_cycles);
+  }
+
+  // Self-rotate: arm next slot.  If this was the final slot, disable
+  // CH3 until the next PPS edge re-arms.
+  if (slot_index < WITNESS_N_SLOTS) {
+    witness_arm_slot(slot_index + 1);
+  } else {
+    qtimer1_ch3_disable_compare();
+    g_witness_current.slot_index = 0;
+  }
+}
+
+// ── Public API ──
+
+void interrupt_witness_set_mode(interrupt_witness_mode_t mode) {
+  if (mode == g_witness_mode) return;
+
+  if (mode == interrupt_witness_mode_t::ON) {
+    // Going ON: disable cadence CH3 arming.  The ISR dispatcher will
+    // route CH3 to the witness path on the next fire.  We also disable
+    // CH3 compare until alpha calls arm_first_slot on the next PPS.
+    qtimer1_ch3_disable_compare();
+    g_witness_current.slot_index = 0;
+    g_witness_mode = mode;
+  } else {
+    // Going OFF: disable CH3 and let the next PPS-edge rebootstrap
+    // restore normal cadence.  Alpha is responsible for calling
+    // interrupt_request_pps_rebootstrap() to trigger that.
+    g_witness_mode = mode;
+    qtimer1_ch3_disable_compare();
+    g_witness_current.slot_index = 0;
+  }
+}
+
+interrupt_witness_mode_t interrupt_witness_get_mode(void) {
+  return g_witness_mode;
+}
+
+void interrupt_witness_arm_first_slot(uint32_t anchor_counter32,
+                                       uint32_t anchor_dwt,
+                                       uint32_t dwt_cycles_per_second) {
+  if (g_witness_mode != interrupt_witness_mode_t::ON) return;
+
+  g_witness_anchor_counter32 = anchor_counter32;
+  g_witness_anchor_dwt       = anchor_dwt;
+  g_witness_anchor_dwt_cps   = dwt_cycles_per_second;
+
+  witness_arm_slot(1);
+}
+
+interrupt_witness_stats_t interrupt_witness_stats(void) {
+  interrupt_witness_stats_t s{};
+  s.mode = g_witness_mode;
+  s.n = g_witness_welford.n;
+  s.mean_ns   = witness_cycles_to_ns(g_witness_welford.mean);
+  const double stddev_cycles = witness_welford_stddev(g_witness_welford);
+  s.stddev_ns = witness_cycles_to_ns(stddev_cycles);
+  s.stderr_ns = (s.n >= 2)
+      ? (s.stddev_ns / sqrt((double)s.n))
+      : 0.0;
+  s.min_ns        = (int64_t)witness_cycles_to_ns((double)g_witness_welford.min_val);
+  s.max_ns        = (int64_t)witness_cycles_to_ns((double)g_witness_welford.max_val);
+  s.fires_total    = g_witness_fires_total;
+  s.fires_rejected = g_witness_fires_rejected;
+
+  // Lag welford — units are VCLOCK ticks (100 ns each).
+  s.lag_n              = g_witness_lag_welford.n;
+  s.lag_mean_ticks     = g_witness_lag_welford.mean;
+  s.lag_stddev_ticks   = witness_welford_stddev(g_witness_lag_welford);
+  s.lag_min_ticks      = g_witness_lag_welford.min_val;
+  s.lag_max_ticks      = g_witness_lag_welford.max_val;
+
+  // GPIO-ISR-entry to counter-read delay — units are DWT cycles.
+  s.gpio_counter_delay_n              = g_witness_gpio_counter_delay_welford.n;
+  s.gpio_counter_delay_mean_cycles    = g_witness_gpio_counter_delay_welford.mean;
+  s.gpio_counter_delay_stddev_cycles  = witness_welford_stddev(g_witness_gpio_counter_delay_welford);
+  s.gpio_counter_delay_min_cycles     = g_witness_gpio_counter_delay_welford.min_val;
+  s.gpio_counter_delay_max_cycles     = g_witness_gpio_counter_delay_welford.max_val;
+
+  return s;
+}
+
+void interrupt_witness_reset_stats(void) {
+  witness_welford_reset(g_witness_welford);
+  witness_welford_reset(g_witness_lag_welford);
+  witness_welford_reset(g_witness_gpio_counter_delay_welford);
+  g_witness_fires_total    = 0;
+  g_witness_fires_rejected = 0;
+}
+
+// ============================================================================
+// QTimer1 vector — dispatches CH2 (TimePop) and CH3 (VCLOCK cadence or witness)
+// ============================================================================
+
 static void qtimer1_isr(void) {
   const uint32_t dwt_raw = ARM_DWT_CYCCNT;  // FIRST instruction
 
+  // ── CH2 (TimePop scheduler) ──
+  //
+  // TimePop drives the foreground (including transport RX/TX timers).
+  //
   if (IMXRT_TMR1.CH[2].CSCTRL & TMR_CSCTRL_TCF1) {
     qtimer1_ch2_clear_compare_flag();
 
@@ -561,7 +899,11 @@ static void qtimer1_isr(void) {
   }
 
   if (IMXRT_TMR1.CH[3].CSCTRL & TMR_CSCTRL_TCF1) {
-    vclock_cadence_isr(dwt_raw);
+    if (g_witness_mode == interrupt_witness_mode_t::ON) {
+      witness_ch3_isr(dwt_raw);
+    } else {
+      vclock_cadence_isr(dwt_raw);
+    }
   }
 }
 
@@ -587,6 +929,16 @@ void process_interrupt_gpio6789_irq(uint32_t dwt_isr_entry_raw) {
   //
   const uint32_t counter32 = qtimer1_read_32_for_diag();
   const uint16_t ch3_now   = IMXRT_TMR1.CH[3].CNTR;
+  const uint32_t dwt_after_counter_reads = ARM_DWT_CYCCNT;
+
+  // Diagnostic: measure the peripheral-bus delay between ISR first
+  // instruction and the counter read moment.  This cost is what makes
+  // `counter32` lag `dwt_isr_entry_raw` in real time.  If we're chasing
+  // a residual offset in the witness, we need to know this number.
+  const int32_t counter_read_delay_cycles =
+      (int32_t)(dwt_after_counter_reads - dwt_isr_entry_raw);
+  witness_welford_update(g_witness_gpio_counter_delay_welford,
+                         counter_read_delay_cycles);
 
   g_gpio_irq_count++;
   g_pps_gpio_witness.edge_count++;
@@ -862,10 +1214,43 @@ void process_interrupt_init_hardware(void) {
   g_ocxo1_lane.initialized = true;
   g_ocxo2_lane.initialized = true;
 
-  qtimer1_init_vclock_base();
-  qtimer1_init_ch2_scheduler();
-  qtimer1_ch3_init_vclock_cadence();
+  // ── QTimer1 synchronized channel start ──
+  //
+  // QTimer1 channels CH0, CH1 (cascaded high-16), CH2 (TimePop scheduler),
+  // and CH3 (VCLOCK cadence) all count the same external VCLOCK source
+  // (PCS=0, 10 MHz phase-locked to GNSS).  If we let each channel's CTRL
+  // register enable counting via separate writes, the channels start on
+  // different VCLOCK edges — producing a permanent 4-5 tick phase offset
+  // that the CH3 witness has made visible.
+  //
+  // The TMR module has a single per-module ENBL register whose low 4 bits
+  // gate counting for CH0..CH3 independently.  A channel counts only when
+  // BOTH its ENBL bit is set AND CTRL.CM != 0.  By clearing ENBL first,
+  // configuring all four channels fully (including CTRL.CM), and then
+  // writing ENBL = 0xF in a single 16-bit store, all four channels start
+  // counting on the same VCLOCK edge — zero phase offset by construction.
+  //
+  // ENBL default value is 0x1 (CH0 auto-enabled at reset).  We clobber it
+  // to 0 before any CTRL.CM writes take effect.
+  IMXRT_TMR1.ENBL = 0;
+
+  qtimer1_init_vclock_base();       // CH0 + CH1 cascade: configured, not yet counting
+  qtimer1_init_ch2_scheduler();     // CH2 scheduler: configured, not yet counting
+  qtimer1_ch3_init_vclock_cadence();// CH3 cadence:   configured, not yet counting
   g_vclock_lane.initialized = true;
+
+  // Zero all four counters immediately before the atomic enable.  ENBL=0
+  // means none are counting, so these writes are pure state setup; order
+  // does not matter.  When ENBL goes to 0xF, all four start from zero.
+  IMXRT_TMR1.CH[0].CNTR = 0;
+  IMXRT_TMR1.CH[1].CNTR = 0;
+  IMXRT_TMR1.CH[2].CNTR = 0;
+  IMXRT_TMR1.CH[3].CNTR = 0;
+
+  // Atomic start.  Single 16-bit register write; all four ENBL bits
+  // assert within one peripheral-clock cycle, and all four channels
+  // begin counting on the same VCLOCK edge.
+  IMXRT_TMR1.ENBL = 0x0F;
 
   g_interrupt_hw_ready = true;
 }
@@ -966,12 +1351,72 @@ static Payload cmd_report(const Payload&) {
   p.add("ocxo2_tick_mod_1000", g_ocxo2_lane.tick_mod_1000);
   p.add("ocxo2_logical_count32", g_ocxo2_lane.logical_count32_at_last_second);
 
+  // ── Witness section ──
+  const interrupt_witness_stats_t ws = interrupt_witness_stats();
+  p.add("witness_active", ws.mode == interrupt_witness_mode_t::ON);
+  p.add("witness_n",              (uint32_t)ws.n);
+  p.add("witness_mean_ns",        ws.mean_ns);
+  p.add("witness_stddev_ns",      ws.stddev_ns);
+  p.add("witness_stderr_ns",      ws.stderr_ns);
+  p.add("witness_min_ns",         ws.min_ns);
+  p.add("witness_max_ns",         ws.max_ns);
+  p.add("witness_fires_total",    (uint32_t)ws.fires_total);
+  p.add("witness_fires_rejected", (uint32_t)ws.fires_rejected);
+
+  // CH3/CH0 phase lag — unit is VCLOCK ticks (100 ns each).
+  p.add("witness_lag_n",            (uint32_t)ws.lag_n);
+  p.add("witness_lag_mean_ticks",   ws.lag_mean_ticks);
+  p.add("witness_lag_stddev_ticks", ws.lag_stddev_ticks);
+  p.add("witness_lag_min_ticks",    ws.lag_min_ticks);
+  p.add("witness_lag_max_ticks",    ws.lag_max_ticks);
+
+  // GPIO-ISR-entry to counter-read delay — unit is DWT cycles.
+  p.add("witness_gpio_counter_delay_n",            (uint32_t)ws.gpio_counter_delay_n);
+  p.add("witness_gpio_counter_delay_mean_cycles",  ws.gpio_counter_delay_mean_cycles);
+  p.add("witness_gpio_counter_delay_stddev_cycles", ws.gpio_counter_delay_stddev_cycles);
+  p.add("witness_gpio_counter_delay_min_cycles",   ws.gpio_counter_delay_min_cycles);
+  p.add("witness_gpio_counter_delay_max_cycles",   ws.gpio_counter_delay_max_cycles);
+
+  return p;
+}
+
+static Payload cmd_witness_start(const Payload&) {
+  interrupt_witness_reset_stats();
+  interrupt_witness_set_mode(interrupt_witness_mode_t::ON);
+  Payload p;
+  p.add("witness_active", true);
+  p.add("status", "WITNESS_STARTED");
+  return p;
+}
+
+static Payload cmd_witness_stop(const Payload&) {
+  interrupt_witness_set_mode(interrupt_witness_mode_t::OFF);
+  // Alpha's next PPS edge will rebootstrap naturally — but request it
+  // now to make sure cadence resumes on the very next edge rather than
+  // drifting silently.
+  interrupt_request_pps_rebootstrap();
+  const interrupt_witness_stats_t ws = interrupt_witness_stats();
+  Payload p;
+  p.add("witness_active", false);
+  p.add("witness_n",        (uint32_t)ws.n);
+  p.add("witness_mean_ns",  ws.mean_ns);
+  p.add("status", "WITNESS_STOPPED");
+  return p;
+}
+
+static Payload cmd_witness_reset(const Payload&) {
+  interrupt_witness_reset_stats();
+  Payload p;
+  p.add("status", "WITNESS_RESET");
   return p;
 }
 
 static const process_command_entry_t INTERRUPT_COMMANDS[] = {
-  { "REPORT", cmd_report },
-  { nullptr,  nullptr    }
+  { "REPORT",        cmd_report         },
+  { "WITNESS_START", cmd_witness_start  },
+  { "WITNESS_STOP",  cmd_witness_stop   },
+  { "WITNESS_RESET", cmd_witness_reset  },
+  { nullptr,         nullptr            }
 };
 
 static const process_vtable_t INTERRUPT_PROCESS = {

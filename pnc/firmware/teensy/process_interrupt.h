@@ -415,6 +415,100 @@ using interrupt_qtimer1_ch2_handler_fn =
 
 void interrupt_register_qtimer1_ch2_handler(interrupt_qtimer1_ch2_handler_fn cb);
 
+// ============================================================================
+// QTimer1 CH3 witness — torture-sanity test of timekeeping math
+// ============================================================================
+//
+// The witness fires QTimer1 CH3 at nine deliberately PPS-avoiding sub-second
+// slots (100 ms through 900 ms offsets from the most recent PPS edge).  At
+// each fire, CH3's ISR captures DWT as the first instruction and compares
+// against the caller-supplied prediction of what DWT should read at that
+// VCLOCK moment.  The residual — if everything is right — is dominated by
+// NVIC vectoring + ISR entry latency: a deterministic small constant,
+// probably under 100 ns.
+//
+// If the residual is larger, it accuses one of the math assumptions in the
+// timekeeping stack: the DWT rate prediction, the PPS anchor, the VCLOCK
+// counter arithmetic, a TDC constant, or an off-by-one in the cascade read.
+// Every component that contributes to time_dwt_to_gnss_ns() is implicated.
+//
+// Life cycle:
+//   1. Alpha calls interrupt_witness_set_mode(ON).  Normal VCLOCK cadence
+//      is suspended while the witness holds CH3.  Foreground traffic
+//      continues normally because CH2 (TimePop scheduler) is untouched.
+//   2. On every PPS edge, alpha's pps_edge_callback calls
+//      interrupt_witness_arm_first_slot(anchor_counter32, anchor_dwt,
+//      dwt_cycles_per_second).  This schedules the first of nine slots.
+//   3. Each witness CH3 fire self-rotates to the next slot (100ms → 200ms
+//      → ... → 900ms).  After the 900 ms slot, CH3 is left idle until the
+//      next PPS edge re-arms slot 0.
+//   4. Alpha calls interrupt_witness_set_mode(OFF) to stop.  Next PPS edge
+//      performs a normal rebootstrap and VCLOCK cadence resumes.
+//
+// The Welford accumulates residual-in-nanoseconds.  Alpha (or any
+// consumer) may read via interrupt_witness_stats().
+
+enum class interrupt_witness_mode_t : uint8_t {
+  OFF = 0,  // normal CH3 cadence operation
+  ON,       // witness owns CH3
+};
+
+struct interrupt_witness_stats_t {
+  interrupt_witness_mode_t mode;
+  uint64_t n;                    // combined Welford sample count
+  double   mean_ns;              // combined mean residual in nanoseconds
+  double   stddev_ns;            // combined stddev in nanoseconds
+  double   stderr_ns;            // combined standard error in nanoseconds
+  int64_t  min_ns;               // worst-case negative residual observed
+  int64_t  max_ns;               // worst-case positive residual observed
+  uint64_t fires_total;          // CH3 fires while in witness mode
+  uint64_t fires_rejected;       // fires rejected as out-of-window garbage
+
+  // CH3-vs-CH0 phase-lag measurement (diagnostic).  At witness ISR
+  // entry we read both the CH0+CH1 cascade counter AND the CH3
+  // counter.  CH0 and CH3 both clock from the 10 MHz VCLOCK (PCS=0)
+  // but were enabled in separate register writes at init time, so
+  // CH3 typically lags CH0 by a small, fixed number of ticks.  Each
+  // tick = 100 ns.  This lag directly accounts for why compare
+  // events fire late relative to predictions derived from CH0's
+  // counter — which is the root cause of any non-physical offset
+  // in mean_ns.
+  uint64_t lag_n;
+  double   lag_mean_ticks;       // mean lag in 100-ns VCLOCK ticks
+  double   lag_stddev_ticks;
+  int32_t  lag_min_ticks;
+  int32_t  lag_max_ticks;
+
+  // GPIO ISR peripheral-bus delay: DWT cycles between the ISR's
+  // first-instruction DWT capture and the counter read that populates
+  // snap.counter32_at_edge.  This measures how much real time elapses
+  // before the counter reflects the post-PPS state.  A residual that's
+  // off by this many cycles would be attributable to using
+  // snap.dwt_at_edge as the anchor while snap.counter32_at_edge was
+  // read later.
+  uint64_t gpio_counter_delay_n;
+  double   gpio_counter_delay_mean_cycles;
+  double   gpio_counter_delay_stddev_cycles;
+  int32_t  gpio_counter_delay_min_cycles;
+  int32_t  gpio_counter_delay_max_cycles;
+};
+
+void interrupt_witness_set_mode(interrupt_witness_mode_t mode);
+interrupt_witness_mode_t interrupt_witness_get_mode(void);
+
+// Arm the first witness slot (100 ms after anchor_counter32 VCLOCK tick).
+// Called by alpha from pps_edge_callback, exactly once per PPS edge, when
+// witness mode is ON.  Caller supplies the PPS-edge counter32, PPS-edge
+// DWT, and the most recent DWT-cycles-per-second prediction.  Subsequent
+// slots (200ms, 300ms, ..., 900ms) are armed self-recursively by the
+// witness ISR path.
+void interrupt_witness_arm_first_slot(uint32_t anchor_counter32,
+                                      uint32_t anchor_dwt,
+                                      uint32_t dwt_cycles_per_second);
+
+interrupt_witness_stats_t interrupt_witness_stats(void);
+void interrupt_witness_reset_stats(void);
+
 // ISR entry points (invoked by vector shims).
 void process_interrupt_gpio6789_irq(uint32_t dwt_isr_entry_raw);
 void process_interrupt_qtimer3_ch2_irq(uint32_t dwt_isr_entry_raw);

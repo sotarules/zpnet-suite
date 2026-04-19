@@ -18,13 +18,13 @@
 //
 //   Seven published Welford prefixes:
 //
-//     dwt_welford             — Teensy CPU XTAL offset (ppb, positive = fast)
-//     vclock_welford          — bridge interpolation residual (ns)
-//     ocxo1_welford           — OCXO1 per-second residual (ns, positive = fast)
-//     ocxo2_welford           — OCXO2 per-second residual (ns, positive = fast)
-//     pps_coincidence_welford — PPS/VCLOCK coincidence ISR-delta (ns)
-//     ocxo1_dac_welford       — OCXO1 DAC fractional code (LSB)
-//     ocxo2_dac_welford       — OCXO2 DAC fractional code (LSB)
+//     dwt_welford         — Teensy CPU XTAL offset (ppb, positive = fast)
+//     vclock_welford      — bridge interpolation residual (ns)
+//     ocxo1_welford       — OCXO1 per-second residual (ns, positive = fast)
+//     ocxo2_welford       — OCXO2 per-second residual (ns, positive = fast)
+//     pps_witness_welford — GPIO PPS witness offset (ns)
+//     ocxo1_dac_welford   — OCXO1 DAC fractional code (LSB)
+//     ocxo2_dac_welford   — OCXO2 DAC fractional code (LSB)
 //
 //   Four published tau/ppb pairs (one per frequency-bearing clock):
 //
@@ -41,7 +41,7 @@
 //   struct, one API, double-valued samples (supports ppb + ns + LSB
 //   with the same type).  Global instances named welford_<what>:
 //   welford_dwt, welford_vclock, welford_ocxo1, welford_ocxo2,
-//   welford_pps_coincidence, welford_ocxo1_dac, welford_ocxo2_dac.
+//   welford_pps_witness, welford_ocxo1_dac, welford_ocxo2_dac.
 //
 // Everything else (campaign lifecycle, servo, DAC pacing, watchdog,
 // command surface) is unchanged in behavior.
@@ -112,12 +112,12 @@ volatile uint32_t watchdog_anomaly_trigger_dwt     = 0;
 // ============================================================================
 
 welford_t welford_dwt          = {};
-welford_t welford_vclock           = {};
-welford_t welford_ocxo1            = {};
-welford_t welford_ocxo2            = {};
-welford_t welford_pps_coincidence  = {};
-welford_t welford_ocxo1_dac        = {};
-welford_t welford_ocxo2_dac        = {};
+welford_t welford_vclock       = {};
+welford_t welford_ocxo1        = {};
+welford_t welford_ocxo2        = {};
+welford_t welford_pps_witness  = {};
+welford_t welford_ocxo1_dac    = {};
+welford_t welford_ocxo2_dac    = {};
 
 void welford_reset(welford_t& w) {
   w.n       = 0;
@@ -234,10 +234,6 @@ static void clocks_payload_add_pps_diag(Payload& p,
     snprintf(key, sizeof(key), "%s_%s", prefix, suffix);
     p.add(key, value);
   };
-  auto add_bool = [&](const char* suffix, bool value) {
-    snprintf(key, sizeof(key), "%s_%s", prefix, suffix);
-    p.add(key, value);
-  };
 
   add_u32("pps_edge_sequence", diag.pps_edge_sequence);
   add_u32("pps_edge_dwt_isr_entry_raw", diag.pps_edge_dwt_isr_entry_raw);
@@ -246,28 +242,6 @@ static void clocks_payload_add_pps_diag(Payload& p,
   add_u32("pps_edge_dwt_cycles_from_vclock", diag.pps_edge_dwt_cycles_from_vclock);
   add_i64("pps_edge_ns_from_vclock", diag.pps_edge_ns_from_vclock);
   add_u32("pps_edge_vclock_event_count", diag.pps_edge_vclock_event_count);
-
-  // ── PPS/VCLOCK coincidence (ISR-delta) ──
-  //
-  // Raw DWT-cycles between the VCLOCK one-second event's ISR entry
-  // and the most recent PPS edge's ISR entry.  Converted to ns using
-  // the current measured DWT rate.  Valid flag indicates the
-  // measurement passed the threshold filter (see
-  // DWT_PPS_COINCIDENCE_THRESHOLD_CYCLES) — i.e. the two ISRs really
-  // were coincident rather than stale-snapshot.
-  add_u32("pps_coincidence_cycles", diag.pps_coincidence_cycles);
-  add_bool("pps_coincidence_valid", diag.pps_coincidence_valid);
-  {
-    const uint32_t rate = dwt_effective_cycles_per_second();
-    int64_t coincidence_ns = 0;
-    if (diag.pps_coincidence_valid && rate > 0) {
-      coincidence_ns =
-          (int64_t)(((uint64_t)diag.pps_coincidence_cycles * 1000000000ULL
-                     + (uint64_t)rate / 2)
-                    / (uint64_t)rate);
-    }
-    add_i64("pps_coincidence_ns", coincidence_ns);
-  }
 }
 
 // ============================================================================
@@ -474,7 +448,7 @@ void clocks_zero_all(void) {
   welford_reset(welford_vclock);
   welford_reset(welford_ocxo1);
   welford_reset(welford_ocxo2);
-  welford_reset(welford_pps_coincidence);
+  welford_reset(welford_pps_witness);
   welford_reset(welford_ocxo1_dac);
   welford_reset(welford_ocxo2_dac);
 
@@ -756,9 +730,8 @@ void clocks_beta_pps(void) {
     now_window_push(g_now_window_ocxo2, g_ocxo2_measurement.second_residual_ns);
   }
 
-  // welford_pps_coincidence is fed by alpha's vclock_callback from the
-  // per-event coincidence cycles captured in vclock_cadence_isr.  We
-  // do NOT update it here.
+  // welford_pps_witness is fed by alpha's vclock_callback from the GPIO
+  // witness snapshot.  We do NOT update it here.
 
   // Servo runs AFTER welford updates so it sees this second's data.
   ocxo_calibration_servo();
@@ -842,13 +815,13 @@ void clocks_beta_pps(void) {
   // positive ppb = clock running FAST vs GNSS reference.
 
   // Welford blocks (seven).
-  publish_welford(p, "dwt",             welford_dwt);
-  publish_welford(p, "vclock",          welford_vclock);
-  publish_welford(p, "ocxo1",           welford_ocxo1);
-  publish_welford(p, "ocxo2",           welford_ocxo2);
-  publish_welford(p, "pps_coincidence", welford_pps_coincidence);
-  publish_welford(p, "ocxo1_dac",       welford_ocxo1_dac);
-  publish_welford(p, "ocxo2_dac",       welford_ocxo2_dac);
+  publish_welford(p, "dwt",          welford_dwt);
+  publish_welford(p, "vclock",       welford_vclock);
+  publish_welford(p, "ocxo1",        welford_ocxo1);
+  publish_welford(p, "ocxo2",        welford_ocxo2);
+  publish_welford(p, "pps_witness",  welford_pps_witness);
+  publish_welford(p, "ocxo1_dac",    welford_ocxo1_dac);
+  publish_welford(p, "ocxo2_dac",    welford_ocxo2_dac);
 
   // Frequency pairs (four).  For all four clocks the Welford samples are
   // already in ppb-compatible units (ppb for DWT; ns/sec == ppb numerically
@@ -864,6 +837,20 @@ void clocks_beta_pps(void) {
   clocks_payload_add_pps_diag(p, "pps_diag", g_pps_interrupt_diag);
   clocks_payload_add_ocxo_diag(p, "ocxo1_diag", g_ocxo1_interrupt_diag);
   clocks_payload_add_ocxo_diag(p, "ocxo2_diag", g_ocxo2_interrupt_diag);
+
+  // CH3 witness — torture-sanity test of timekeeping math.  Authority
+  // lives inside process_interrupt; we just transcribe the public
+  // stats snapshot into the fragment so downstream can render it.
+  const interrupt_witness_stats_t ws = interrupt_witness_stats();
+  p.add("witness_active",         ws.mode == interrupt_witness_mode_t::ON);
+  p.add("witness_welford_n",      ws.n);
+  p.add("witness_welford_mean",   ws.mean_ns,   6);
+  p.add("witness_welford_stddev", ws.stddev_ns, 6);
+  p.add("witness_welford_stderr", ws.stderr_ns, 6);
+  p.add("witness_welford_min",    (double)ws.min_ns, 6);
+  p.add("witness_welford_max",    (double)ws.max_ns, 6);
+  p.add("witness_fires_total",    ws.fires_total);
+  p.add("witness_fires_rejected", ws.fires_rejected);
 
   g_last_fragment = p;
   publish("TIMEBASE_FRAGMENT", p);

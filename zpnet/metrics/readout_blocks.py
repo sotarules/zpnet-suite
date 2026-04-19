@@ -429,55 +429,51 @@ def clocks_combined_readout() -> list[str]:
     # Under PPS-anchored epoch discipline (the firmware re-phases the
     # VCLOCK CH3 cadence from a physical PPS edge at INIT/ZERO/START),
     # every subsequent PPS edge should land coincident with a VCLOCK
-    # one-second moment — up to ISR entry/execution latency.
+    # one-second moment — up to GPIO ISR entry latency.
     #
-    # This panel presents the PPS/VCLOCK coincidence measurement: the
-    # raw DWT-cycles difference between the VCLOCK one-second event's
-    # ISR entry and the most recent PPS edge's ISR entry.  Pure ISR
-    # choreography — no bridge math, no foreground ordering, no
-    # counter-arithmetic projections.  Just two DWT captures subtracted.
+    # The welford feeds on a counter32-based phase error: the difference
+    # between each PPS edge's captured QTimer1 counter value and the
+    # projected counter value at that edge (g_epoch_qtimer_at_pps +
+    # edges_since_epoch × VCLOCK_COUNTS_PER_SECOND), scaled to ns.
     #
-    # Because GPIO is priority 0 and QTimer1 is priority 1, GPIO always
-    # runs first when the two events pend coincidentally.  The measured
-    # delta is therefore dominated by GPIO ISR body duration plus the
-    # two ISR entry latencies — a constant, with variance determined
-    # only by pipeline state.
+    # This measurement is independent of foreground callback ordering
+    # and independent of the DWT↔GNSS bridge — pure hardware counter
+    # arithmetic, firmware-computed.
     #
     # Interpretation:
-    #   CYCLES  — raw ISR-delta in DWT cycles (instantaneous)
-    #   NS      — same, converted via current measured DWT rate
-    #   VALID   — true iff the measurement passed the coincidence
-    #             threshold filter (i.e. PPS really did fire shortly
-    #             before this VCLOCK event, not seconds ago)
-    #   MEAN    — steady-state ISR choreography footprint
-    #   SD      — ISR-path determinism floor (low tens of ns is healthy)
-    #   MIN/MAX — envelope; should sit within 3–5 SD of MEAN
+    #   MEAN — steady-state GPIO ISR entry latency (tens of ns, small
+    #          positive number)
+    #   SD   — GPIO ISR jitter floor (single-digit ns in a healthy system)
+    #   SE   — 1/√n shrinkage; tells you how well you know MEAN
+    #   MIN/MAX — envelope; should stay within ~3–5 SD of MEAN
     #
-    # If MEAN is sane for ISR execution time and SD is negligible,
-    # PPS and VCLOCK are declared phase-locked BY FIAT.  If MEAN drifts
-    # or SD grows, phase lock is falsified and the capture path needs
-    # investigation.
+    # If MEAN is stable and SD is small, PPS/VCLOCK phase lock is
+    # PROVEN BY THE SYSTEM ITSELF.  If MEAN drifts, the discipline
+    # has broken and something upstream (VCLOCK counting, GNSS
+    # receiver, bridge) requires investigation.
+    #
+    # BRIDGE_NS / DIRECT_NS are instantaneous secondary diagnostics
+    # from the per-edge diag; retained for cross-checking the bridge
+    # math against pure DWT subtraction.
     #
     lines.append("")
-    pps_cycles = _to_int(_frag(r, "pps_diag_pps_coincidence_cycles"))
-    pps_ns     = _to_int(_frag(r, "pps_diag_pps_coincidence_ns"))
-    pps_valid  = _frag(r, "pps_diag_pps_coincidence_valid")
-    pps_seq    = _to_int(_frag(r, "pps_diag_pps_edge_sequence"))
+    pps_bridge_ns  = _to_int(_frag(r, "pps_diag_pps_edge_minus_event_ns"))
+    pps_direct_ns  = _to_int(_frag(r, "pps_diag_pps_edge_ns_from_vclock"))
+    pps_direct_cyc = _to_int(_frag(r, "pps_diag_pps_edge_dwt_cycles_from_vclock"))
+    pps_seq        = _to_int(_frag(r, "pps_diag_pps_edge_sequence"))
 
-    pps_mean  = _to_float(_frag(r, "pps_coincidence_welford_mean"))
-    pps_sd    = _to_float(_frag(r, "pps_coincidence_welford_stddev"))
-    pps_se    = _to_float(_frag(r, "pps_coincidence_welford_stderr"))
-    pps_n     = _to_int  (_frag(r, "pps_coincidence_welford_n"))
-    pps_min   = _to_float(_frag(r, "pps_coincidence_welford_min"))
-    pps_max   = _to_float(_frag(r, "pps_coincidence_welford_max"))
-
-    pps_valid_str = "YES" if pps_valid is True else ("NO" if pps_valid is False else "---")
+    pps_mean  = _to_float(_frag(r, "pps_witness_welford_mean"))
+    pps_sd    = _to_float(_frag(r, "pps_witness_welford_stddev"))
+    pps_se    = _to_float(_frag(r, "pps_witness_welford_stderr"))
+    pps_n     = _to_int  (_frag(r, "pps_witness_welford_n"))
+    pps_min   = _to_float(_frag(r, "pps_witness_welford_min"))
+    pps_max   = _to_float(_frag(r, "pps_witness_welford_max"))
 
     lines.append(
         f"PPSWIT   "
-        f"CYCLES: {_comma_int(pps_cycles, 10)}   "
-        f"NS: {_sign_int(pps_ns, 10)}   "
-        f"VALID: {pps_valid_str:>4}   "
+        f"BRIDGE_NS: {_sign_int(pps_bridge_ns, 12)}   "
+        f"DIRECT_NS: {_sign_int(pps_direct_ns, 12)}   "
+        f"CYC: {_comma_int(pps_direct_cyc, 14)}   "
         f"SEQ: {_fmt(pps_seq, '>6d', 6)}"
     )
     lines.append(
@@ -493,6 +489,50 @@ def clocks_combined_readout() -> list[str]:
         f"              "
         f" MIN: {_fmt(pps_min, '>12.3f', 12)}   "
         f"MAX: {_fmt(pps_max, '>12.3f', 12)}"
+    )
+
+    # ── WITNESS ──
+    #
+    # The headline number.  Torture-sanity test of every timekeeping
+    # assumption in the stack.  CH3 fires nine times per second at
+    # deliberately PPS-avoiding offsets (100..900 ms).  Each fire
+    # captures DWT at ISR entry and compares against the predicted
+    # DWT at that VCLOCK moment.  If math is right, the residual is
+    # a deterministic small constant (probably < 100 ns) reflecting
+    # nothing but NVIC vectoring + ISR entry latency.  If math is
+    # wrong, the residual tells on it.
+    #
+    witness_active = bool(_frag(r, "witness_active", False))
+    witness_n      = _to_int(_frag(r, "witness_welford_n"))
+    witness_mean   = _to_float(_frag(r, "witness_welford_mean"))
+    witness_sd     = _to_float(_frag(r, "witness_welford_stddev"))
+    witness_se     = _to_float(_frag(r, "witness_welford_stderr"))
+    witness_min    = _to_float(_frag(r, "witness_welford_min"))
+    witness_max    = _to_float(_frag(r, "witness_welford_max"))
+    witness_fires  = _to_int(_frag(r, "witness_fires_total"))
+    witness_rej    = _to_int(_frag(r, "witness_fires_rejected"))
+
+    lines.append("")
+    state_str = "ACTIVE" if witness_active else "OFF"
+    lines.append(
+        f"WITNESS  "
+        f"STATE: {state_str:<8s} "
+        f"FIRES: {_fmt(witness_fires, '>8d', 8)}   "
+        f"REJECTED: {_fmt(witness_rej, '>6d', 6)}"
+    )
+    lines.append(
+        f"         "
+        f"   WELFORD    "
+        f"MEAN: {_fmt(witness_mean, '>12.3f', 12)}   "
+        f"SD: {_fmt(witness_sd, '>10.3f', 10)}   "
+        f"SE: {_fmt(witness_se, '>8.3f', 8)}   "
+        f"N: {_fmt(witness_n, '>6d', 6)}"
+    )
+    lines.append(
+        f"         "
+        f"              "
+        f" MIN: {_fmt(witness_min, '>12.3f', 12)}   "
+        f"MAX: {_fmt(witness_max, '>12.3f', 12)}"
     )
 
     # ── Interrupt edge intervals ──
