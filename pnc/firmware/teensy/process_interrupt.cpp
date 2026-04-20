@@ -591,7 +591,7 @@ struct witness_slot_t {
   uint8_t  slot_index;       // 1..WITNESS_N_SLOTS (0 = no slot armed)
 };
 
-static volatile witness_slot_t g_witness_current = { 0, 0, 0 };
+static volatile witness_slot_t g_witness_current = { 0, 0, 0xFF };
 
 // Anchor values from the most recent PPS edge (captured in alpha-
 // supplied arm call).  Used to compute the NEXT slot when this one
@@ -606,6 +606,143 @@ static witness_welford_t g_witness_gpio_counter_delay_welford = {};
 
 static volatile uint64_t g_witness_fires_total    = 0;
 static volatile uint64_t g_witness_fires_rejected = 0;
+
+// ── Per-slot capture buffer ──
+//
+// Circular capture of the last second's fires (one entry per slot,
+// indexed by slot_index).  Each struct preserves ALL of the raw
+// inputs to the residual calculation, unreduced, so that post-hoc
+// analysis of any anomalous residual can trace it back to first
+// principles:  which anchor was in play, what the targets were, what
+// the ISR actually captured.
+//
+// Written on every real (non-wrap-alias) CH3 fire in witness_ch3_isr,
+// INCLUDING fires that will subsequently be rejected by the ±tolerance
+// filter.  The whole point is to see what was fed into the
+// accept/reject decision.
+//
+// Dumped via the WITNESS_DUMP command — the regular REPORT surface
+// stays compact.  One full second's worth of captures survives until
+// overwritten by the next second's fires.
+struct witness_capture_t {
+  // Which slot (0..WITNESS_N_SLOTS) this capture represents, and a
+  // monotonic sequence counter.  valid=false on startup until first
+  // write to this slot.
+  uint32_t seq;
+  uint8_t  slot_index;
+  bool     valid;
+
+  // Anchor values (from g_witness_anchor_* at arm time, as seen by
+  // witness_arm_slot).  These are the PPS-edge-derived inputs that
+  // target_vclock and target_dwt were computed from.
+  uint32_t anchor_counter32;
+  uint32_t anchor_dwt;
+  uint32_t anchor_dwt_cps;
+
+  // Targets as programmed for this slot.
+  uint32_t target_vclock;
+  uint32_t target_dwt;
+
+  // ISR-entry captures (this is what the fire actually saw).
+  uint32_t dwt_at_fire;         // ARM_DWT_CYCCNT at first ISR instruction
+  uint32_t counter32_at_fire;   // cascade-read 32-bit VCLOCK counter
+  uint16_t ch3_cntr_at_fire;    // CH3's own low-16 counter
+
+  // Derived diagnostics (same arithmetic as the ISR performs for the
+  // Welford; captured verbatim for easy correlation).
+  int32_t  vclock_delta;        // counter32_at_fire - target_vclock
+  int32_t  residual_cycles;     // dwt_at_fire - target_dwt
+  int32_t  lag_ticks;           // (counter32 & 0xFFFF) - ch3_cntr
+};
+
+// The capture array has WITNESS_N_SLOTS + 1 entries, indexed 0..N.
+// Slot 0 is a CH3 fire just like slots 1..N — same ISR path, same
+// math — but its target is anchor_counter32 (= +0 ticks past anchor),
+// so it fires on the first CH3 compare-match AFTER arming.
+//
+// Slot 0's physical behavior is different from 1..9 because the
+// compare target (anchor_counter32 & 0xFFFF) has ALREADY been passed
+// by the counter when the armer runs — so CH3 fires at the NEXT wrap,
+// roughly 6.5ms after arming.  That fire is preemption-affected
+// (TIMEBASE dispatch, alpha updates, and other PPS-edge foreground
+// work all run concurrently during that window) and its residual
+// will be large and messy — that's fine, it's data we want to see.
+//
+// The slot-0 fire also tells us something special: if dwt_at_fire
+// lands BEFORE anchor_dwt (negative residual with magnitude larger
+// than normal preemption delay), then CH3 executed before the PPS
+// GPIO ISR captured its anchor — an observable race ordering.
+static witness_capture_t g_witness_captures[WITNESS_N_SLOTS + 1] = {};
+static volatile uint32_t g_witness_capture_seq = 0;
+
+static inline void witness_captures_reset(void) {
+  for (uint8_t i = 0; i <= WITNESS_N_SLOTS; i++) {
+    g_witness_captures[i] = {};
+  }
+  g_witness_capture_seq = 0;
+}
+
+// ── Sticky anomaly buffer ──
+//
+// A small fixed-size buffer that captures anomalous fires and PRESERVES
+// them until the next WITNESS_RESET or WITNESS_START.  Unlike the
+// per-slot capture buffer (which gets overwritten every second), this
+// buffer holds anomalies indefinitely so rare events survive until we
+// look at them.
+//
+// Anomaly criterion: |residual_cycles| > WITNESS_ANOMALY_CYCLES.  The
+// healthy residual cluster sits around +128 cycles with cache-state
+// variation of a few cycles either side, so 500 cycles is ~4x the
+// healthy mean — well outside any non-anomalous behavior.
+//
+// Overwrite policy: OLDEST-WINS.  Once full, the buffer ignores new
+// anomalies.  The first WITNESS_ANOMALY_BUFFER_SIZE anomalies seen
+// are frozen in place until reset.  This preserves startup anomalies
+// (which may be transient but important to understand) rather than
+// letting them churn through as the system runs.
+//
+// A separate monotonic counter (g_witness_anomaly_count_total) tracks
+// the total number of anomalies seen regardless of buffer capacity, so
+// the dump can report "N anomalies seen, first 16 captured."
+//
+// Only slots 1..WITNESS_N_SLOTS (CH3 fires) can trigger the anomaly
+// path; slot 0 (PPS edge) is captured every second regardless.
+static constexpr int32_t  WITNESS_ANOMALY_CYCLES      = 500;
+static constexpr uint8_t  WITNESS_ANOMALY_BUFFER_SIZE = 16;
+
+struct witness_anomaly_t {
+  witness_capture_t cap;       // full verbatim capture (same struct)
+  uint64_t fires_total_at_capture;  // for "when during the run" context
+};
+
+static witness_anomaly_t g_witness_anomalies[WITNESS_ANOMALY_BUFFER_SIZE] = {};
+static volatile uint8_t  g_witness_anomaly_slot_next = 0;   // next slot to fill
+static volatile uint32_t g_witness_anomaly_count_total = 0; // monotonic, uncapped
+
+static inline void witness_anomalies_reset(void) {
+  for (uint8_t i = 0; i < WITNESS_ANOMALY_BUFFER_SIZE; i++) {
+    g_witness_anomalies[i] = {};
+  }
+  g_witness_anomaly_slot_next   = 0;
+  g_witness_anomaly_count_total = 0;
+}
+
+static inline void witness_anomaly_maybe_capture(
+    const witness_capture_t& cap,
+    uint64_t fires_total)
+{
+  if (cap.residual_cycles >  WITNESS_ANOMALY_CYCLES ||
+      cap.residual_cycles < -WITNESS_ANOMALY_CYCLES) {
+    g_witness_anomaly_count_total++;
+    // Oldest-wins: write only while slots remain.
+    if (g_witness_anomaly_slot_next < WITNESS_ANOMALY_BUFFER_SIZE) {
+      g_witness_anomalies[g_witness_anomaly_slot_next].cap = cap;
+      g_witness_anomalies[g_witness_anomaly_slot_next].fires_total_at_capture
+          = fires_total;
+      g_witness_anomaly_slot_next++;
+    }
+  }
+}
 
 static inline void witness_welford_reset(witness_welford_t& w) {
   w.n = 0;
@@ -660,14 +797,19 @@ static inline uint32_t witness_compute_target_vclock(uint32_t anchor_counter32,
 }
 
 // Arm CH3 for a specific slot.  Called from:
-//   • interrupt_witness_arm_first_slot (slot_index = 1, from PPS edge)
-//   • witness_ch3_isr itself (slot_index = 2..9, self-rotation)
-// At slot_index == WITNESS_N_SLOTS the witness disables CH3 and waits
-// for the next PPS edge to re-arm slot 1.
+//   • interrupt_witness_arm_first_slot (slot_index = 0, from PPS edge)
+//   • witness_ch3_isr itself (slot_index = 1..9, self-rotation)
+// At slot_index == WITNESS_N_SLOTS + 1 the witness disables CH3 and
+// waits for the next PPS edge to re-arm slot 0.
+//
+// Slot 0 is a CH3 fire with target == anchor (delta 0); physically it
+// catches the first compare-match AFTER arming, which is a wrap-alias
+// ~6.5ms later.  The wrap-alias filter in witness_ch3_isr specifically
+// accepts slot 0's first wrap; see witness_ch3_isr comment.
 static void witness_arm_slot(uint8_t slot_index) {
-  if (slot_index < 1 || slot_index > WITNESS_N_SLOTS) {
+  if (slot_index > WITNESS_N_SLOTS) {
     qtimer1_ch3_disable_compare();
-    g_witness_current.slot_index = 0;
+    g_witness_current.slot_index = 0xFF;  // disarmed sentinel
     return;
   }
 
@@ -711,8 +853,8 @@ static void witness_ch3_isr(uint32_t dwt_raw) {
   g_witness_fires_total++;
 
   const uint8_t slot_index = g_witness_current.slot_index;
-  if (slot_index < 1 || slot_index > WITNESS_N_SLOTS) {
-    // Spurious fire — no slot armed.  Disable and wait.
+  if (slot_index > WITNESS_N_SLOTS) {
+    // Spurious fire — no slot armed (disarmed sentinel = 0xFF).
     qtimer1_ch3_disable_compare();
     g_witness_fires_rejected++;
     return;
@@ -733,15 +875,25 @@ static void witness_ch3_isr(uint32_t dwt_raw) {
   // Real fire tolerance: within WITNESS_VCLOCK_MATCH_WINDOW ticks of
   // target.  One VCLOCK tick is 100 ns, so a 256-tick window is 25.6 µs
   // — plenty of margin for ISR entry latency without allowing aliases.
+  //
+  // SLOT 0 EXCEPTION: slot 0's target (anchor_counter32) has already
+  // been passed by the time the armer runs.  The FIRST compare-match
+  // is thus a wrap-alias ~65536 ticks past target — which would be
+  // rejected by the narrow window.  For slot 0 only, accept the first
+  // fire we see regardless of wrap distance.  This is the whole point
+  // of slot 0: catch whatever CH3 does as soon after the PPS anchor
+  // as possible.
   const int32_t vclock_delta = (int32_t)(counter32 - target_vclock);
   constexpr int32_t WITNESS_VCLOCK_MATCH_WINDOW = 256;
-  if (vclock_delta < -WITNESS_VCLOCK_MATCH_WINDOW ||
-      vclock_delta >  WITNESS_VCLOCK_MATCH_WINDOW) {
-    // Wrap alias — not our real fire.  Don't rotate, don't count as
-    // rejected, just let the compare re-fire at the next wrap and we'll
-    // check again.  Eventually (within ~6.5 ms at worst) we'll see the
-    // real one.
-    return;
+  if (slot_index != 0) {
+    if (vclock_delta < -WITNESS_VCLOCK_MATCH_WINDOW ||
+        vclock_delta >  WITNESS_VCLOCK_MATCH_WINDOW) {
+      // Wrap alias — not our real fire.  Don't rotate, don't count as
+      // rejected, just let the compare re-fire at the next wrap and we'll
+      // check again.  Eventually (within ~6.5 ms at worst) we'll see the
+      // real one.
+      return;
+    }
   }
 
   // CH3 / CH0 phase lag measurement.  Both channels clock from the
@@ -760,23 +912,60 @@ static void witness_ch3_isr(uint32_t dwt_raw) {
   const uint32_t target_dwt = g_witness_current.target_dwt;
   const int32_t  residual_cycles = (int32_t)(dwt_raw - target_dwt);
 
-  // Sanity: residual must be small positive.  Large magnitude (in
-  // either direction) means something is wrong — likely a missed fire
-  // or heavy preemption.  Reject without polluting the Welford.
-  if (residual_cycles < -WITNESS_REJECT_CYCLES ||
+  // ── Capture raw inputs and derived diagnostics ──
+  //
+  // Write the capture BEFORE the reject decision.  Anomalies are
+  // exactly what we want in the buffer — the whole point is to
+  // inspect what was fed into accept/reject.  Indexed by slot_index
+  // directly (0..WITNESS_N_SLOTS), so each slot owns one entry and
+  // is overwritten by next second's fire for the same slot.
+  {
+    witness_capture_t& cap = g_witness_captures[slot_index];
+    cap.seq                = ++g_witness_capture_seq;
+    cap.slot_index         = slot_index;
+    cap.valid              = true;
+    cap.anchor_counter32   = g_witness_anchor_counter32;
+    cap.anchor_dwt         = g_witness_anchor_dwt;
+    cap.anchor_dwt_cps     = g_witness_anchor_dwt_cps;
+    cap.target_vclock      = target_vclock;
+    cap.target_dwt         = target_dwt;
+    cap.dwt_at_fire        = dwt_raw;
+    cap.counter32_at_fire  = counter32;
+    cap.ch3_cntr_at_fire   = ch3_cntr;
+    cap.vclock_delta       = vclock_delta;
+    cap.residual_cycles    = residual_cycles;
+    cap.lag_ticks          = lag_ticks;
+
+    // Sticky capture of anomalies.  Slot 0 is excluded — its residual
+    // is expected to be large and preemption-dominated, so flagging it
+    // as an anomaly would drown out the signal we care about.
+    if (slot_index != 0) {
+      witness_anomaly_maybe_capture(cap, g_witness_fires_total);
+    }
+  }
+
+  // Sanity: residual must be small.  Large magnitude (in either
+  // direction) means something is wrong — likely a missed fire or
+  // heavy preemption.  Reject from the main Welford.  Slot 0 is
+  // always excluded from the Welford because its residual is
+  // structurally large and would corrupt the mean/stddev.
+  if (slot_index == 0 ||
+      residual_cycles < -WITNESS_REJECT_CYCLES ||
       residual_cycles >  WITNESS_REJECT_CYCLES) {
-    g_witness_fires_rejected++;
+    if (slot_index != 0) {
+      g_witness_fires_rejected++;
+    }
   } else {
     witness_welford_update(g_witness_welford, residual_cycles);
   }
 
   // Self-rotate: arm next slot.  If this was the final slot, disable
-  // CH3 until the next PPS edge re-arms.
+  // CH3 until the next PPS edge re-arms slot 0.
   if (slot_index < WITNESS_N_SLOTS) {
     witness_arm_slot(slot_index + 1);
   } else {
     qtimer1_ch3_disable_compare();
-    g_witness_current.slot_index = 0;
+    g_witness_current.slot_index = 0xFF;
   }
 }
 
@@ -790,7 +979,7 @@ void interrupt_witness_set_mode(interrupt_witness_mode_t mode) {
     // route CH3 to the witness path on the next fire.  We also disable
     // CH3 compare until alpha calls arm_first_slot on the next PPS.
     qtimer1_ch3_disable_compare();
-    g_witness_current.slot_index = 0;
+    g_witness_current.slot_index = 0xFF;
     g_witness_mode = mode;
   } else {
     // Going OFF: disable CH3 and let the next PPS-edge rebootstrap
@@ -798,7 +987,7 @@ void interrupt_witness_set_mode(interrupt_witness_mode_t mode) {
     // interrupt_request_pps_rebootstrap() to trigger that.
     g_witness_mode = mode;
     qtimer1_ch3_disable_compare();
-    g_witness_current.slot_index = 0;
+    g_witness_current.slot_index = 0xFF;
   }
 }
 
@@ -815,7 +1004,7 @@ void interrupt_witness_arm_first_slot(uint32_t anchor_counter32,
   g_witness_anchor_dwt       = anchor_dwt;
   g_witness_anchor_dwt_cps   = dwt_cycles_per_second;
 
-  witness_arm_slot(1);
+  witness_arm_slot(0);
 }
 
 interrupt_witness_stats_t interrupt_witness_stats(void) {
@@ -854,6 +1043,8 @@ void interrupt_witness_reset_stats(void) {
   witness_welford_reset(g_witness_welford);
   witness_welford_reset(g_witness_lag_welford);
   witness_welford_reset(g_witness_gpio_counter_delay_welford);
+  witness_captures_reset();
+  witness_anomalies_reset();
   g_witness_fires_total    = 0;
   g_witness_fires_rejected = 0;
 }
@@ -1411,11 +1602,160 @@ static Payload cmd_witness_reset(const Payload&) {
   return p;
 }
 
+// Serialize a witness_capture_t into a Payload with all raw fields
+// plus a handful of derived "prediction" fields that let the reader
+// verify the arithmetic with a calculator.
+//
+// Shared between the per-slot capture dump and the anomaly dump so
+// the two views agree on field names and interpretation.
+static void witness_capture_to_payload(const witness_capture_t& cap,
+                                       Payload& entry)
+{
+  entry.add("slot_index",       (uint32_t)cap.slot_index);
+  entry.add("valid",            cap.valid);
+  entry.add("seq",              cap.seq);
+
+  // Anchors (PPS-edge-derived inputs to the prediction).
+  entry.add("anchor_counter32", cap.anchor_counter32);
+  entry.add("anchor_dwt",       cap.anchor_dwt);
+  entry.add("anchor_dwt_cps",   cap.anchor_dwt_cps);
+
+  // ── Prediction helpers (for calculator-friendly checks) ──
+  //
+  // dwt_cycle_prediction          — cps verbatim, labeled for intent:
+  //                                 "predicted DWT cycles per second."
+  // dwt_cycle_prediction_per_slot — cps / 10 with firmware rounding:
+  //                                 "roughly how many DWT cycles per
+  //                                  100 ms slot."  Watch for per-slot
+  //                                  rounding drift up to ±1 cycle.
+  //
+  // Use these to eyeball dwt_at_fire - anchor_dwt against slot_index *
+  // dwt_cycle_prediction_per_slot.
+  entry.add("dwt_cycle_prediction",
+            cap.anchor_dwt_cps);
+  entry.add("dwt_cycle_prediction_per_slot",
+            (uint32_t)(((uint64_t)cap.anchor_dwt_cps + 5ULL) / 10ULL));
+
+  // Targets as programmed for this slot.
+  entry.add("target_vclock",    cap.target_vclock);
+  entry.add("target_dwt",       cap.target_dwt);
+
+  // ── Formula integrity check ──
+  //
+  // Re-derive the targets from the captured anchors using the SAME
+  // arithmetic witness_arm_slot used.  Under normal operation these
+  // match target_vclock and target_dwt exactly.  A disagreement would
+  // be the smoking gun for an anchor-update race between arming and
+  // firing — the ISR captures g_witness_anchor_* at fire time; if they
+  // differ from what the armer saw, re-deriving from the captured
+  // anchors produces a different target than the one actually armed.
+  //
+  // Also publish deltas for convenience (what "each slot added" in
+  // both clock domains).
+  const uint32_t expected_target_dwt = (cap.slot_index <= WITNESS_N_SLOTS)
+      ? witness_compute_target_dwt(cap.anchor_dwt,
+                                   cap.anchor_dwt_cps,
+                                   cap.slot_index)
+      : 0u;
+  const uint32_t expected_target_vclock = (cap.slot_index <= WITNESS_N_SLOTS)
+      ? witness_compute_target_vclock(cap.anchor_counter32, cap.slot_index)
+      : 0u;
+
+  entry.add("expected_target_dwt",     expected_target_dwt);
+  entry.add("expected_target_vclock",  expected_target_vclock);
+  entry.add("target_dwt_agrees",
+            cap.target_dwt    == expected_target_dwt);
+  entry.add("target_vclock_agrees",
+            cap.target_vclock == expected_target_vclock);
+
+  // Actual delta from anchor — what the DWT counter ACTUALLY advanced
+  // by between the anchor moment and this fire.  Compare against
+  // expected_target_dwt - anchor_dwt to see if the fire landed where
+  // predicted.
+  entry.add("dwt_delta_at_fire",
+            (uint32_t)(cap.dwt_at_fire - cap.anchor_dwt));
+  entry.add("counter32_delta_at_fire",
+            (uint32_t)(cap.counter32_at_fire - cap.anchor_counter32));
+
+  // ISR-entry captures (this is what the fire actually saw).
+  entry.add("dwt_at_fire",      cap.dwt_at_fire);
+  entry.add("counter32_at_fire",cap.counter32_at_fire);
+  entry.add("ch3_cntr_at_fire", (uint32_t)cap.ch3_cntr_at_fire);
+
+  // Derived diagnostics (same arithmetic as the Welford path).
+  entry.add("vclock_delta",     cap.vclock_delta);
+  entry.add("residual_cycles",  cap.residual_cycles);
+  entry.add("lag_ticks",        cap.lag_ticks);
+}
+
+// ── Dump the per-slot capture buffer AND the anomaly buffer ──
+//
+// Emits two arrays:
+//
+//   "witness_captures"  — last-second per-slot captures (always 9).
+//                         Indexed by slot (1..WITNESS_N_SLOTS mapped to
+//                         array indices 0..WITNESS_N_SLOTS-1).  Slots
+//                         that have never been written since the last
+//                         reset carry valid=false.  Slots from different
+//                         seconds can coexist transiently if the dump
+//                         is issued mid-second, so the `seq` field is
+//                         provided for ordering (higher seq = more
+//                         recent write across all slots).
+//
+//   "witness_anomalies" — sticky capture of anomalous fires (|residual|
+//                         > WITNESS_ANOMALY_CYCLES).  Size up to
+//                         WITNESS_ANOMALY_BUFFER_SIZE.  Oldest-wins:
+//                         once full, later anomalies are counted but
+//                         not captured.  Preserved until WITNESS_RESET
+//                         or WITNESS_START.  Each entry adds a
+//                         `fires_total_at_capture` field recording
+//                         the cumulative fire count at the moment of
+//                         capture, for run-time context.
+//
+//   "witness_anomaly_count_total" — monotonic count of anomalies seen
+//                         since last reset, regardless of buffer
+//                         capacity.  Tells you "N anomalies observed,
+//                         first K preserved in witness_anomalies."
+static Payload cmd_witness_dump(const Payload&) {
+  // Per-slot capture array (indices 0..WITNESS_N_SLOTS, inclusive).
+  PayloadArray captures_arr;
+  for (uint8_t i = 0; i <= WITNESS_N_SLOTS; i++) {
+    const witness_capture_t& cap = g_witness_captures[i];
+    Payload entry;
+    entry.add("array_index", (uint32_t)i);
+    witness_capture_to_payload(cap, entry);
+    captures_arr.add(entry);
+  }
+
+  // Anomaly array — only entries that were actually written.
+  PayloadArray anomalies_arr;
+  const uint8_t anomaly_count_captured = g_witness_anomaly_slot_next;
+  for (uint8_t i = 0; i < anomaly_count_captured; i++) {
+    const witness_anomaly_t& a = g_witness_anomalies[i];
+    Payload entry;
+    entry.add("buffer_index",           (uint32_t)i);
+    entry.add("fires_total_at_capture", a.fires_total_at_capture);
+    witness_capture_to_payload(a.cap, entry);
+    anomalies_arr.add(entry);
+  }
+
+  Payload p;
+  p.add("witness_active",             g_witness_mode == interrupt_witness_mode_t::ON);
+  p.add("witness_anomaly_threshold_cycles", (uint32_t)WITNESS_ANOMALY_CYCLES);
+  p.add("witness_anomaly_buffer_size",      (uint32_t)WITNESS_ANOMALY_BUFFER_SIZE);
+  p.add("witness_anomaly_count_total",      g_witness_anomaly_count_total);
+  p.add("witness_anomaly_count_captured",   (uint32_t)anomaly_count_captured);
+  p.add_array("witness_captures",   captures_arr);
+  p.add_array("witness_anomalies",  anomalies_arr);
+  return p;
+}
+
 static const process_command_entry_t INTERRUPT_COMMANDS[] = {
   { "REPORT",        cmd_report         },
   { "WITNESS_START", cmd_witness_start  },
   { "WITNESS_STOP",  cmd_witness_stop   },
   { "WITNESS_RESET", cmd_witness_reset  },
+  { "WITNESS_DUMP",  cmd_witness_dump   },
   { nullptr,         nullptr            }
 };
 
