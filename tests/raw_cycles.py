@@ -1,60 +1,56 @@
 """
-ZPNet Raw Cycles — Teensy DWT rate vs GF-8802 receiver diagnostics.
+ZPNet Raw Cycles — Teensy DWT rate, predictor residual, vs GF-8802 receiver diagnostics.
 
 Reads TIMEBASE rows for a campaign and shows the honest one-second-
-subtraction DWT rate alongside the GF-8802 receiver's compensatory
-diagnostics:
+subtraction DWT rate alongside the firmware's one-step predictor
+residual and the GF-8802 receiver's compensatory diagnostics.
+
+Teensy-side columns (fragment sub-dict):
 
   dwt_cycles   = dwt_cycle_count_between_pps
-                 The one-second subtraction of consecutive VCLOCK
-                 one-second-event DWT captures, computed in alpha's
-                 vclock_callback.  Post rolling-integrator removal,
-                 this is the authoritative per-second DWT delta —
-                 no synthesis, no SMA, no integrator.  The "what
-                 the chip actually did" number.
+                 The one-second subtraction of consecutive PPS GPIO
+                 edge DWT captures (snap.dwt_at_edge), authored in
+                 alpha::pps_edge_callback.  Priority-0 captures —
+                 preemption-proof.  The "what the chip actually did"
+                 number for the just-completed second.
 
   dwt_res      = dwt_cycles - nominal (1,008,000,000)
-                 Residual versus expected 1.008 GHz CPU nominal.
+                 Residual versus the expected 1.008 GHz CPU nominal.
                  Captures the beat between the Teensy CPU crystal
                  and the GF-8802's disciplined 10 MHz output.
 
+  predicted    = dwt_cycles[N-1]
+                 The implicit one-step predictor used by the time.cpp
+                 bridge during second N: "rate[N] = rate[N-1]".  Pi-
+                 side reconstruction by carrying the previous row's
+                 dwt_cycles forward.
+
+  pred_res     = dwt_prediction_residual_cycles (firmware-authored)
+                 Signed residual of the predictor: measured[N] -
+                 measured[N-1], published by firmware.  Near zero in
+                 steady state; slow non-zero mean during thermal
+                 settling; spikes reveal per-second anomalies.
+
   fw_stddev    = dwt_welford_stddev
                  Firmware-side cumulative stddev of the dwt_res
-                 signal over the campaign.  Monotonic visibility
-                 into real per-second DWT jitter.
+                 signal over the campaign.
 
-GF-8802 compensatory columns (from the gnss sub-dict):
+GF-8802 columns (gnss sub-dict):
 
-  drift_ppb    = clock_drift_ppb
-                 GF-8802's observed internal OCXO drift vs UTC (what
-                 the receiver thinks its own oscillator is doing).
+  drift_ppb    = clock_drift_ppb (internal OCXO drift vs UTC)
+  freq_err     = freq_error_ppb (residual after discipline)
+  pps_err_ns   = pps_timing_error_ns (reported phase error vs UTC)
+  pskip        = phase_skip counter (increments on PPS corrections)
+  mode         = freq_mode_name (servo regime — FINE_LOCK, HOLDOVER, etc.)
 
-  freq_err     = freq_error_ppb
-                 GF-8802's reported frequency error after discipline
-                 (the "what's left uncorrected" number, should be small
-                 under FINE_LOCK).
+Predictor integrity cross-check:
 
-  pps_err_ns   = pps_timing_error_ns
-                 GF-8802's reported PPS phase error vs UTC.  Spikes
-                 here are what trigger the receiver's correction steps.
-
-  pskip        = phase_skip
-                 Counter.  Increments when the receiver issues a phase
-                 correction to its PPS output.  The smoking gun for
-                 visible compensation events in dwt_res.
-
-  mode         = freq_mode_name
-                 FINE_LOCK, COARSE_LOCK, HOLDOVER, etc.  A mode change
-                 is a major servo regime transition.
-
-Also shown in summary:
-
-  GPIO-PPS witness offset
-                 pps_diag_pps_edge_minus_event_ns — the physical PPS
-                 GPIO edge position relative to the VCLOCK one-second
-                 event, in nanoseconds.  Large DC offset is fixed
-                 pipeline delay; stddev is real GPIO ISR latency
-                 jitter.  New diagnostic exposed by the refactor.
+  On every row (after the first), the script re-derives the predictor
+  residual locally as (dwt_cycles - prev_dwt_cycles) and compares to
+  the firmware-published dwt_prediction_residual_cycles.  A mismatch
+  would indicate the firmware's authorship of pred_res has drifted
+  from the expected semantic — either a bug or a schema change.
+  In the summary: pred_res_mismatches should be zero.
 
 Usage:
     python -m zpnet.tests.raw_cycles <campaign_name> [limit]
@@ -74,8 +70,7 @@ DWT_EXPECTED_PER_PPS = 1_008_000_000  # nominal CPU cycles per second (1.008 GHz
 
 # Threshold for flagging a dwt_res step as a candidate "event" worth
 # cross-referencing against GF-8802 diagnostics.  ~100 cycles at 1.008
-# GHz is ~100 ns — well above normal second-to-second drift of a few
-# tens of cycles.
+# GHz is ~100 ns — well above normal second-to-second drift.
 DWT_RES_STEP_THRESHOLD_CYCLES = 100
 
 
@@ -252,19 +247,18 @@ def analyze(campaign: str, limit: int = 0) -> None:
     print(f"Campaign: {campaign}  ({len(rows):,} rows)")
     print(f"DWT_EXPECTED_PER_PPS = {DWT_EXPECTED_PER_PPS:,}")
     print()
-    print("Two worlds, side by side:")
-    print("  Teensy side (what the chip measured):")
-    print("    dwt_cycles   = dwt_cycle_count_between_pps")
-    print("                   (one-second subtraction of consecutive")
-    print("                    VCLOCK one-second-event DWT captures)")
-    print("    dwt_res      = dwt_cycles - nominal")
-    print("    fw_stddev    = dwt_welford_stddev (firmware cumulative)")
-    print("  GF-8802 side (what the receiver thought):")
-    print("    drift_ppb    = clock_drift_ppb (internal OCXO vs UTC)")
-    print("    freq_err     = freq_error_ppb (residual after discipline)")
-    print("    pps_err_ns   = pps_timing_error_ns (reported phase error)")
-    print("    pskip        = phase_skip counter (event indicator)")
-    print("    mode         = freq_mode_name (servo regime)")
+    print("Teensy side (PPS-edge-authored, priority-0):")
+    print("  dwt_cycles  = dwt_cycle_count_between_pps")
+    print("  dwt_res     = dwt_cycles - nominal")
+    print("  predicted   = dwt_cycles[N-1]   (implicit one-step predictor)")
+    print("  pred_res    = dwt_prediction_residual_cycles (firmware-authored)")
+    print("  fw_stddev   = dwt_welford_stddev (firmware cumulative)")
+    print("GF-8802 side (what the receiver thought):")
+    print("  drift_ppb   = clock_drift_ppb (internal OCXO vs UTC)")
+    print("  freq_err    = freq_error_ppb (residual after discipline)")
+    print("  pps_err_ns  = pps_timing_error_ns (reported phase error)")
+    print("  pskip       = phase_skip counter (event indicator)")
+    print("  mode        = freq_mode_name (servo regime)")
     print()
 
     # Header.
@@ -272,10 +266,12 @@ def analyze(campaign: str, limit: int = 0) -> None:
         f"{'pps':>6s}  "
         f"{'dwt_cycles':>13s}  "
         f"{'dwt_res':>9s}  "
+        f"{'predicted':>13s}  "
+        f"{'pred_res':>9s}  "
         f"{'fw_stddev':>10s}  "
         f"{'drift_ppb':>10s}  "
         f"{'freq_err':>9s}  "
-        f"{'pps_err_ns':>10s}  "
+        f"{'pps_err':>8s}  "
         f"{'pskip':>5s}  "
         f"{'mode':<10s}"
     )
@@ -283,10 +279,12 @@ def analyze(campaign: str, limit: int = 0) -> None:
         f"{'─'*6}  "
         f"{'─'*13}  "
         f"{'─'*9}  "
+        f"{'─'*13}  "
+        f"{'─'*9}  "
         f"{'─'*10}  "
         f"{'─'*10}  "
         f"{'─'*9}  "
-        f"{'─'*10}  "
+        f"{'─'*8}  "
         f"{'─'*5}  "
         f"{'─'*10}"
     )
@@ -303,7 +301,7 @@ def analyze(campaign: str, limit: int = 0) -> None:
     w_pps_err_ns      = Welford()
     w_temp_c          = Welford()
 
-    # Welford accumulator — GPIO PPS witness offset from VCLOCK event.
+    # Welford accumulator — GPIO PPS witness offset.
     w_pps_witness_ns  = Welford()
 
     # Event detection and bookkeeping.
@@ -311,9 +309,15 @@ def analyze(campaign: str, limit: int = 0) -> None:
     pskip_events: List[Dict[str, Any]] = []
     mode_transitions: List[Dict[str, Any]] = []
 
+    # Predictor integrity cross-check tally.
+    pred_res_samples    = 0   # rows where firmware pred_res was present AND a prior sample existed
+    pred_res_mismatches = 0   # rows where firmware pred_res != Pi-reconstructed (actual - prev_actual)
+    first_mismatch: Optional[Dict[str, Any]] = None
+
     shown = 0
     gaps = 0
     prev_pps: Optional[int] = None
+    prev_dwt_cycles: Optional[int] = None
     prev_dwt_res: Optional[int] = None
     prev_pskip: Optional[int] = None
     prev_mode: Optional[str] = None
@@ -339,11 +343,14 @@ def analyze(campaign: str, limit: int = 0) -> None:
         if pps is None:
             continue
 
-        # Teensy-side fields (new schema).
+        # Teensy-side fields.
         dwt_cycles = _as_int(frag.get("dwt_cycle_count_between_pps"))
         fw_stddev  = _as_float(frag.get("dwt_welford_stddev"))
 
-        # GPIO PPS witness offset.
+        # Firmware-authored predictor residual.
+        fw_pred_res = _as_int(frag.get("dwt_prediction_residual_cycles"))
+
+        # GPIO PPS witness offset (diagnostic).
         pps_witness_ns = _as_int(frag.get("pps_diag_pps_edge_minus_event_ns"))
 
         # Capture firmware-side Welford state (last-wins).
@@ -380,6 +387,7 @@ def analyze(campaign: str, limit: int = 0) -> None:
             gaps += 1
             print(f"{'':>6s}  --- gap {prev_pps:,} → {pps:,} ---")
             prev_dwt_res = None
+            prev_dwt_cycles = None
 
         prev_pps = pps
 
@@ -387,6 +395,28 @@ def analyze(campaign: str, limit: int = 0) -> None:
         dwt_res: Optional[int] = None
         if dwt_cycles is not None:
             dwt_res = dwt_cycles - DWT_EXPECTED_PER_PPS
+
+        # Reconstruct the predictor and the Pi-side predictor residual.
+        predicted: Optional[int] = prev_dwt_cycles
+        pi_pred_res: Optional[int] = None
+        if dwt_cycles is not None and prev_dwt_cycles is not None:
+            pi_pred_res = dwt_cycles - prev_dwt_cycles
+
+        # Predictor integrity cross-check.  Only compare when BOTH
+        # numbers exist (Pi has a prior sample, firmware has authored
+        # a residual).  A mismatch would mean firmware authorship
+        # semantics diverged from "measured[N] - measured[N-1]".
+        if pi_pred_res is not None and fw_pred_res is not None:
+            pred_res_samples += 1
+            if fw_pred_res != pi_pred_res:
+                pred_res_mismatches += 1
+                if first_mismatch is None:
+                    first_mismatch = {
+                        "pps": pps,
+                        "fw_pred_res": fw_pred_res,
+                        "pi_pred_res": pi_pred_res,
+                        "delta": fw_pred_res - pi_pred_res,
+                    }
 
         # Event detection: dwt_res step.
         if (dwt_res is not None and prev_dwt_res is not None and
@@ -445,6 +475,9 @@ def analyze(campaign: str, limit: int = 0) -> None:
         if temp_c is not None:
             w_temp_c.update(temp_c)
 
+        # Advance per-row state.
+        if dwt_cycles is not None:
+            prev_dwt_cycles = dwt_cycles
         if dwt_res is not None:
             prev_dwt_res = dwt_res
         if pskip is not None:
@@ -457,10 +490,12 @@ def analyze(campaign: str, limit: int = 0) -> None:
             f"{pps:>6d}  "
             f"{_fmt_int(dwt_cycles, 13)}  "
             f"{_fmt_int(dwt_res, 9, signed=True)}  "
+            f"{_fmt_int(predicted, 13)}  "
+            f"{_fmt_int(fw_pred_res, 9, signed=True)}  "
             f"{_fmt_float(fw_stddev, 10, decimals=2)}  "
             f"{_fmt_float(drift_ppb, 10, decimals=3, signed=True)}  "
             f"{_fmt_float(freq_err, 9, decimals=2, signed=True)}  "
-            f"{_fmt_int(pps_err_ns, 10, signed=True)}  "
+            f"{_fmt_int(pps_err_ns, 8, signed=True)}  "
             f"{_fmt_int(pskip, 5)}  "
             f"{_fmt_str(mode, 10)}"
         )
@@ -475,21 +510,22 @@ def analyze(campaign: str, limit: int = 0) -> None:
     print()
 
     # -----------------------------------------------------------------
-    # Teensy-side DWT rate statistics (Pi-side reconstruction)
+    # Teensy-side DWT rate stats (Pi-side window reconstruction)
     # -----------------------------------------------------------------
     print("═" * 70)
     print("Teensy-side DWT rate statistics")
-    print("  (one-second subtraction of consecutive VCLOCK event")
-    print("   DWT captures; post rolling-integrator removal)")
+    print("  (one-second subtraction of consecutive PPS GPIO edge")
+    print("   DWT captures; authored by alpha::pps_edge_callback from")
+    print("   priority-0 snap.dwt_at_edge values)")
     print("═" * 70)
     print()
-    _print_welford("dwt_cycles (DWT cycles per VCLOCK one-second interval)",
-                   w_dwt_cycles, "cycles")
+    _print_welford("dwt_cycles (DWT cycles per PPS-to-PPS interval)",
+                   w_dwt_cycles, "cycles", decimals=3)
     _print_welford("dwt_res    (dwt_cycles - nominal)",
-                   w_dwt_res, "cycles")
+                   w_dwt_res, "cycles", decimals=3)
 
     # -----------------------------------------------------------------
-    # Firmware-side cumulative Welford (authoritative long-run view)
+    # Firmware-side cumulative DWT Welford (authoritative)
     # -----------------------------------------------------------------
     print("═" * 70)
     print("Firmware-side DWT residual Welford (cumulative since campaign start)")
@@ -503,7 +539,6 @@ def analyze(campaign: str, limit: int = 0) -> None:
             print(f"  dwt_welford_mean   = {last_fw_dwt_welford_mean:+,.3f} cycles")
         if last_fw_dwt_welford_stddev is not None:
             print(f"  dwt_welford_stddev = {last_fw_dwt_welford_stddev:,.3f} cycles")
-        # Derive ppb from mean if we can.
         if last_fw_dwt_welford_mean is not None:
             ppb = -last_fw_dwt_welford_mean / DWT_EXPECTED_PER_PPS * 1e9
             print(f"  derived ppb        = {ppb:+,.3f} ppb")
@@ -515,13 +550,37 @@ def analyze(campaign: str, limit: int = 0) -> None:
         print()
 
     # -----------------------------------------------------------------
-    # GPIO PPS witness vs VCLOCK event
+    # Predictor integrity cross-check
+    # -----------------------------------------------------------------
+    print("═" * 70)
+    print("Predictor integrity cross-check")
+    print("  (firmware-published dwt_prediction_residual_cycles should")
+    print("   equal Pi-reconstructed (actual - prev_actual) on every row)")
+    print("═" * 70)
+    print()
+    print(f"  samples compared  = {pred_res_samples:,}")
+    print(f"  mismatches        = {pred_res_mismatches:,}")
+    if pred_res_mismatches == 0:
+        print("  firmware predictor-residual authorship is consistent")
+        print("  with 'measured[N] - measured[N-1]' semantics.")
+    else:
+        print("  MISMATCH — firmware pred_res diverged from Pi reconstruction")
+        if first_mismatch is not None:
+            print(f"  first at pps={first_mismatch['pps']}:")
+            print(f"    firmware pred_res = {first_mismatch['fw_pred_res']:+,d}")
+            print(f"    Pi    reconstr.   = {first_mismatch['pi_pred_res']:+,d}")
+            print(f"    delta             = {first_mismatch['delta']:+,d}")
+    print()
+
+    # -----------------------------------------------------------------
+    # GPIO PPS witness offset
     # -----------------------------------------------------------------
     print("═" * 70)
     print("GPIO PPS witness offset from VCLOCK one-second event")
-    print("  (pps_diag_pps_edge_minus_event_ns — new diagnostic exposed")
-    print("   by the refactor; large DC offset is fixed GF-8802 pipeline")
-    print("   delay, stddev is real GPIO ISR latency jitter)")
+    print("  (pps_diag_pps_edge_minus_event_ns — cross-lane phase")
+    print("   diagnostic: PPS GPIO edge vs VCLOCK CH3 cadence event.")
+    print("   Mean DC offset is fixed pipeline delay, stddev is real")
+    print("   ISR-delivery latency jitter across the two lanes)")
     print("═" * 70)
     print()
     _print_welford("pps_witness_ns  (Pi-side reconstruction from fragment)",
@@ -648,13 +707,14 @@ def analyze(campaign: str, limit: int = 0) -> None:
         print(f"  dwt_res stddev (fw):   {last_fw_dwt_welford_stddev:9.3f} cycles  (firmware cumulative)")
     if w_drift_ppb.n >= 2:
         print(f"  drift_ppb stddev:      {w_drift_ppb.stddev:9.3f} ppb")
-        # Convert drift_ppb to cycles/sec at 1.008 GHz.
         drift_as_cycles = w_drift_ppb.stddev * (DWT_EXPECTED_PER_PPS / 1e9)
         print(f"  drift_ppb (in cycles): {drift_as_cycles:9.3f} cycles")
     if w_pps_err_ns.n >= 2:
         print(f"  pps_err_ns stddev:     {w_pps_err_ns.stddev:9.1f} ns")
     if w_pps_witness_ns.n >= 2:
-        print(f"  pps_witness stddev:    {w_pps_witness_ns.stddev:9.1f} ns  (GPIO ISR jitter)")
+        print(f"  pps_witness stddev:    {w_pps_witness_ns.stddev:9.1f} ns  (cross-lane jitter)")
+    print(f"  predictor integrity:   {pred_res_samples:,} compared, "
+          f"{pred_res_mismatches:,} mismatched")
     print()
 
     n_steps = len(step_events)
@@ -683,8 +743,8 @@ def analyze(campaign: str, limit: int = 0) -> None:
         print("    • Smooth frequency corrections (receiver held a different")
         print("      rate for several seconds, walking phase gradually)")
         print("    • CPU-side disturbances (thermal, DMA, cache eviction)")
-        print("    • GPIO ISR latency excursion — check pps_witness stddev")
-        print("      above; if elevated, the substrate was disturbed.")
+        print("    • Substrate disturbance — check pps_witness stddev")
+        print("      above; if elevated, cross-lane ISR delivery was noisy.")
 
     if n_modes > 0:
         print()

@@ -4,17 +4,26 @@
 //
 // Dispatch doctrine:
 //
-//   GNSS clock state is VCLOCK-driven AND PPS-anchored.
+//   GNSS clock state is PPS-authored, VCLOCK-cadenced.
 //
-//   The vclock_callback subscribes to the VCLOCK lane's one-second event
-//   (QTimer1 CH3 cadence, every 1000 ticks at 10 MHz = 1 s of real time)
-//   and advances canonical clock state every second: g_gnss_ns_count_at_pps,
-//   g_dwt_cycle_count_at_pps, g_qtimer_at_pps, time_pps_update, OCXO phase
-//   ledger, and the measured VCLOCK phase ledger.
+//   Canonical per-PPS state (g_dwt_cycle_count_at_pps,
+//   g_dwt_cycle_count_between_pps, g_dwt_cycle_count_total,
+//   g_qtimer_at_pps, and the time.cpp bridge anchor) is authored
+//   by pps_edge_callback from priority-0 GPIO ISR snap captures.
+//   These are preemption-proof: the captures occur at the FIRST
+//   instruction of the GPIO ISR, and no other vector preempts
+//   priority 0.
 //
-//   The VCLOCK cadence itself is phase-locked to the physical PPS edge
-//   by a one-shot rebootstrap mechanism in process_interrupt.cpp.  When
-//   alpha needs a fresh epoch (at INIT, ZERO, or START), it calls
+//   The vclock_callback subscribes to the VCLOCK lane's one-second
+//   event (QTimer1 CH3 cadence, every 1000 ticks at 10 MHz = 1 s of
+//   real time) and handles the cadence-driven concerns that are
+//   genuinely VCLOCK-local: the synthetic g_gnss_ns_count_at_pps
+//   advance (+1e9), the VCLOCK-as-peer-clock measurement via
+//   clocks_apply_edge, and OCXO phase-ledger refresh.
+//
+//   The VCLOCK cadence itself is phase-locked to the physical PPS
+//   edge by a one-shot rebootstrap mechanism in process_interrupt.cpp.
+//   When alpha needs a fresh epoch (at INIT, ZERO, or START), it calls
 //   interrupt_request_pps_rebootstrap() and sets g_epoch_pending.  The
 //   NEXT physical PPS GPIO edge:
 //
@@ -97,6 +106,11 @@ volatile uint32_t g_dwt_cycle_count_at_pps = 0;
 volatile uint64_t g_dwt_cycle_count_total = 0;
 volatile uint32_t g_dwt_cycle_count_between_pps = DWT_EXPECTED_PER_PPS;
 
+// Prediction residual (diagnostic): measured[N] - predicted[N], where
+// predicted[N] is simply dwt_between_pps[N-1].  Signed to preserve
+// direction of drift.  Zero when fewer than two measurements exist.
+volatile int32_t  g_dwt_prediction_residual_cycles = 0;
+
 volatile uint32_t g_qtimer_at_pps = 0;
 volatile uint32_t g_last_pps_event_counter32_at_event = 0;
 
@@ -142,7 +156,50 @@ static volatile uint32_t g_epoch_pps_edge_sequence = 0;
 
 // One-second subtraction state for VCLOCK DWT cycles-between-events.
 // Seeded at epoch install; updated each VCLOCK one-second event.
+// (Local to vclock_callback's clocks_apply_edge measurement only;
+//  no longer the canonical source of g_dwt_cycle_count_between_pps.)
 static volatile uint32_t g_prev_dwt_at_vclock_event = 0;
+
+// ── Canonical one-second subtraction state for DWT cycles-between-PPS ──
+//
+// Authored by pps_edge_callback from the priority-0 GPIO ISR's
+// snap.dwt_at_edge captures.  Seeded at epoch install (with the snap that
+// installed the epoch) and re-seeded across any rebootstrap.  This is the
+// preemption-proof measurement of consecutive PPS edges, and is the sole
+// authority that updates g_dwt_cycle_count_between_pps.
+//
+// History note: until this refactor, g_dwt_cycle_count_between_pps was
+// authored by vclock_callback from QTimer1 CH3's first-instruction DWT
+// captures.  CH3 is at NVIC priority 16 — preemptible by the priority-0
+// GPIO ISR and by any noInterrupts() window.  When CH3 was delayed by D
+// cycles on the 1000th-tick fire, the resulting subtraction produced a
+// reciprocal excursion (+D, then -D) on consecutive seconds.  PPS GPIO at
+// priority 0 cannot be preempted; consecutive snap.dwt_at_edge values are
+// the honest physical second boundaries.
+static volatile uint32_t g_prev_pps_dwt_at_edge = 0;
+static volatile bool     g_prev_pps_dwt_at_edge_valid = false;
+
+// ── Prediction residual state (pure diagnostic) ──
+//
+// Our implicit one-step predictor for second N's DWT cycle count is
+// "same as second N-1's measurement" — because that's the rate the
+// time.cpp bridge carries through second N (see anchor.dwt_cycles_per_s
+// in time_pps_update).  We publish the residual each PPS edge:
+//
+//   dwt_prediction_residual_cycles = measured[N] - predicted[N]
+//                                  = dwt_between_pps[N] - dwt_between_pps[N-1]
+//
+// Sign convention: positive → this second had MORE cycles than the
+// previous second (crystal sped up since last edge).
+//
+// Diagnostic only.  Not consumed by any control path.  Expected
+// behavior: near zero in steady state; slow non-zero mean during
+// thermal settling; spikes reveal per-second anomalies.
+//
+// Requires TWO consecutive measurements before it's meaningful;
+// g_prev_dwt_between_pps_valid latches after second PPS post-install.
+static volatile uint32_t g_prev_dwt_between_pps       = 0;
+static volatile bool     g_prev_dwt_between_pps_valid = false;
 
 // VCLOCK entry counter — increments on every vclock_callback invocation
 // AFTER epoch install.  Read by pps_edge_callback to cross-check that no
@@ -331,6 +388,11 @@ static void alpha_reset_canonical_clock_state_for_new_epoch(void) {
   g_dwt_cycle_count_between_pps = DWT_EXPECTED_PER_PPS;
   g_qtimer_at_pps = 0;
   g_prev_dwt_at_vclock_event = 0;
+  g_prev_pps_dwt_at_edge = 0;
+  g_prev_pps_dwt_at_edge_valid = false;
+  g_prev_dwt_between_pps = 0;
+  g_prev_dwt_between_pps_valid = false;
+  g_dwt_prediction_residual_cycles = 0;
   g_vclock_event_count = 0;
 
   g_vclock_clock = {};
@@ -382,6 +444,8 @@ static void alpha_install_new_epoch_from_pps_snapshot(
   g_dwt_cycle_count_at_pps = snap.dwt_at_edge;
   g_qtimer_at_pps          = snap.counter32_at_edge;
   g_prev_dwt_at_vclock_event = snap.dwt_at_edge;
+  g_prev_pps_dwt_at_edge       = snap.dwt_at_edge;
+  g_prev_pps_dwt_at_edge_valid = true;
 
   time_pps_epoch_reset(snap.dwt_at_edge, snap.counter32_at_edge);
 
@@ -467,25 +531,39 @@ static void vclock_callback(
 
   g_vclock_event_count++;
 
-  // ── Canonical per-second advance ──
+  // ── Canonical per-second advance (synthetic GNSS ns counter) ──
+  //
+  // g_gnss_ns_count_at_pps is a pure +1e9 synthetic counter — no
+  // physical capture is being recorded here, just arithmetic.  It
+  // advances on VCLOCK cadence because that's when we know another
+  // second has elapsed; its semantic meaning is "GNSS ns at the PPS
+  // moment this second corresponds to."
+  //
+  // Historically we ALSO wrote g_dwt_cycle_count_at_pps and
+  // g_qtimer_at_pps here from event.dwt_at_event and
+  // event.counter32_at_event.  Those writes were a misnomer: the
+  // event captures are from the CH3 ISR (priority 16, preemptible),
+  // not from the PPS edge.  Calling them "at_pps" borrowed credibility
+  // they didn't have.  Both now migrate to pps_edge_callback, which
+  // writes them from priority-0 snap captures — honest with their
+  // names at last.
   g_epoch_pps_index++;
   g_gnss_ns_count_at_pps += NS_PER_SECOND_U64;
-  g_dwt_cycle_count_at_pps = event.dwt_at_event;
-  g_qtimer_at_pps = event.counter32_at_event;
-
-  // ── DWT cycles between VCLOCK one-second events ──
-  //
-  // Honest measurement: one-second subtraction of consecutive event
-  // DWT captures.  uint32_t subtraction wraps correctly across DWT
-  // rollover (~4.26 s at 1008 MHz).
-  const uint32_t dwt_between =
-      event.dwt_at_event - g_prev_dwt_at_vclock_event;
-  g_prev_dwt_at_vclock_event = event.dwt_at_event;
-
-  g_dwt_cycle_count_between_pps = dwt_between;
-  g_dwt_cycle_count_total += (uint64_t)dwt_between;
 
   // ── VCLOCK measurement (peer to OCXO) ──
+  //
+  // clocks_apply_edge maintains its own per-clock prev_dwt_at_edge, so
+  // it does its own dwt subtraction internally.  The canonical
+  // g_dwt_cycle_count_between_pps is now authored by pps_edge_callback
+  // from priority-0 GPIO ISR captures (preemption-proof); the CH3-
+  // event-derived value is no longer the authority for it.
+  //
+  // We still maintain g_prev_dwt_at_vclock_event because
+  // pps_edge_callback reads it for its bridge-independent VCLOCK-to-edge
+  // phase diagnostic (pps_edge_dwt_cycles_from_vclock /
+  // pps_edge_ns_from_vclock).
+  g_prev_dwt_at_vclock_event = event.dwt_at_event;
+
   if (event.gnss_ns_at_event != 0) {
     clocks_apply_edge(g_vclock_clock, g_vclock_measurement,
                       event.dwt_at_event, event.gnss_ns_at_event);
@@ -509,9 +587,10 @@ static void vclock_callback(
     g_ocxo2_clock.ns_count_at_pps = 0;
   }
 
-  time_pps_update(g_dwt_cycle_count_at_pps,
-                  dwt_effective_cycles_per_second(),
-                  g_qtimer_at_pps);
+  // time_pps_update() moved to pps_edge_callback.  The time anchor is
+  // semantically the PPS moment, not the VCLOCK-derived 1-second-later
+  // approximation.  Anchoring on the priority-0 PPS DWT capture also
+  // makes time_pps_update preemption-proof.
 }
 
 // ============================================================================
@@ -593,6 +672,57 @@ static void pps_edge_callback(const pps_edge_snapshot_t& snap) {
   g_pps_interrupt_diag.pps_edge_dwt_cycles_from_vclock = dwt_cycles_from_vclock;
   g_pps_interrupt_diag.pps_edge_ns_from_vclock = ns_from_vclock;
   g_pps_interrupt_diag.pps_edge_vclock_event_count = vclock_count_local;
+
+  // ── Step 4: canonical DWT-cycles-between-PPS (preemption-proof) ──
+  //
+  // This is the sole authoritative author of g_dwt_cycle_count_between_pps.
+  // Both endpoints of the subtraction are snap.dwt_at_edge values captured
+  // at the FIRST INSTRUCTION of the priority-0 GPIO ISR — they cannot be
+  // contaminated by any preemption (no other vector preempts priority 0;
+  // tail-chained priority-0 ISRs would only delay our foreground arrival,
+  // not the captures already in snap).
+  //
+  // uint32_t subtraction wraps correctly across DWT rollover (~4.26 s).
+  //
+  // time_pps_update is called from here too (semantically: anchor on the
+  // PPS moment using the PPS-captured DWT, not on a VCLOCK-derived
+  // approximation).  Skipped when epoch is not initialized; re-seeded on
+  // every epoch install via alpha_install_new_epoch_from_pps_snapshot.
+  if (g_epoch_initialized && !g_epoch_pending &&
+      g_prev_pps_dwt_at_edge_valid) {
+    const uint32_t dwt_between_pps =
+        snap.dwt_at_edge - g_prev_pps_dwt_at_edge;
+
+    // Prediction residual (diagnostic): the implicit predictor for
+    // this second was "same cycles as last second," because that's
+    // the rate the time.cpp bridge carried through this second.
+    // residual = measured - predicted = dwt_between_pps - prev_dwt_between_pps.
+    // Signed 32-bit preserves direction; magnitudes during steady-state
+    // thermal conditions should be well under 100 cycles.
+    if (g_prev_dwt_between_pps_valid) {
+      g_dwt_prediction_residual_cycles =
+          (int32_t)((int64_t)dwt_between_pps -
+                    (int64_t)g_prev_dwt_between_pps);
+    } else {
+      g_dwt_prediction_residual_cycles = 0;
+    }
+    g_prev_dwt_between_pps       = dwt_between_pps;
+    g_prev_dwt_between_pps_valid = true;
+
+    g_dwt_cycle_count_between_pps = dwt_between_pps;
+    g_dwt_cycle_count_total      += (uint64_t)dwt_between_pps;
+
+    g_prev_pps_dwt_at_edge = snap.dwt_at_edge;
+
+    // Canonical "at_pps" captures — honest with their names.
+    // Both are priority-0 GPIO ISR captures from this very edge.
+    g_dwt_cycle_count_at_pps = snap.dwt_at_edge;
+    g_qtimer_at_pps          = snap.counter32_at_edge;
+
+    time_pps_update(snap.dwt_at_edge,
+                    dwt_effective_cycles_per_second(),
+                    snap.counter32_at_edge);
+  }
 
   // ── Witness: arm slot 1 for the upcoming second if witness is on ──
   //

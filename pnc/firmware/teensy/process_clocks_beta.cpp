@@ -759,8 +759,22 @@ void clocks_beta_pps(void) {
         (int32_t)((int64_t)g_dwt_cycle_count_between_pps -
                   (int64_t)DWT_EXPECTED_PER_PPS));
 
+  // Prediction residual (diagnostic): measured[N] - measured[N-1].
+  // The bridge's implicit one-step predictor carries rate[N-1] into
+  // second N, so this IS the predictor's per-second error.  Near
+  // zero in steady state; non-zero mean during thermal settling;
+  // spikes indicate per-second anomalies.
+  p.add("dwt_prediction_residual_cycles",
+        g_dwt_prediction_residual_cycles);
+
+  // QTimer1 hardware-counter position captured at the PPS GPIO edge.
+  // (Post-refactor: authored by pps_edge_callback from the priority-0
+  // GPIO ISR's snap.counter32_at_edge — no longer a VCLOCK-surface
+  // fact.  Previously published as "vclock_qtimer_at_pps", which was
+  // a misnomer once the authoring site moved.)
+  p.add("qtimer_at_pps", g_qtimer_at_pps);
+
   // VCLOCK surface — authored facts + per-edge measurement + window accounting.
-  p.add("vclock_qtimer_at_pps", g_qtimer_at_pps);
   p.add("vclock_ns_count_at_pps", g_vclock_clock.ns_count_at_pps);
   p.add("vclock_gnss_ns_between_edges", g_vclock_measurement.gnss_ns_between_edges);
   p.add("vclock_dwt_cycles_between_edges", g_vclock_measurement.dwt_cycles_between_edges);
@@ -837,20 +851,6 @@ void clocks_beta_pps(void) {
   clocks_payload_add_pps_diag(p, "pps_diag", g_pps_interrupt_diag);
   clocks_payload_add_ocxo_diag(p, "ocxo1_diag", g_ocxo1_interrupt_diag);
   clocks_payload_add_ocxo_diag(p, "ocxo2_diag", g_ocxo2_interrupt_diag);
-
-  // CH3 witness — torture-sanity test of timekeeping math.  Authority
-  // lives inside process_interrupt; we just transcribe the public
-  // stats snapshot into the fragment so downstream can render it.
-  const interrupt_witness_stats_t ws = interrupt_witness_stats();
-  p.add("witness_active",         ws.mode == interrupt_witness_mode_t::ON);
-  p.add("witness_welford_n",      ws.n);
-  p.add("witness_welford_mean",   ws.mean_ns,   6);
-  p.add("witness_welford_stddev", ws.stddev_ns, 6);
-  p.add("witness_welford_stderr", ws.stderr_ns, 6);
-  p.add("witness_welford_min",    (double)ws.min_ns, 6);
-  p.add("witness_welford_max",    (double)ws.max_ns, 6);
-  p.add("witness_fires_total",    ws.fires_total);
-  p.add("witness_fires_rejected", ws.fires_rejected);
 
   g_last_fragment = p;
   publish("TIMEBASE_FRAGMENT", p);
