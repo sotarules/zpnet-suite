@@ -286,6 +286,52 @@ struct interrupt_capture_diag_t {
 //
 static constexpr int32_t DWT_PPS_COINCIDENCE_THRESHOLD_CYCLES = 10000;
 
+// ── VCLOCK epoch tick offset ──
+//
+// Compensation for peripheral-bus-read quantization during epoch
+// establishment.  When the PPS GPIO ISR captures the 32-bit VCLOCK
+// cascade counter, the read completes ~140 CPU cycles (~138 ns) after
+// the true PPS edge.  During that window the VCLOCK counter (10 MHz)
+// has ticked once, so the counter value we read is the tick AFTER the
+// one that corresponds to the PPS moment — not the PPS-corresponding
+// tick itself.  If we store the read value as the anchor unmodified,
+// we are asserting that the PPS edge happened at a moment that is
+// physically 100 ns past the true edge, and every downstream target
+// computed from that anchor lands one tick (100 ns) late.
+//
+// The correction is an identity adjustment.  We asked "which VCLOCK
+// tick corresponds to the PPS moment?" and the hardware answered with
+// the tick that came AFTER the one that really did.  We subtract 1
+// to recover the tick that actually corresponds to the PPS edge.
+//
+// (The sign here is for READING an existing labeling.  If this code
+// ever changed to WRITE a new labeling — setting the counter to a
+// specific value at PPS — the sign would flip: we'd write +1 instead
+// of 0, to honestly report that one tick has already passed since PPS
+// by the time we got our write in.  Reading late vs writing late are
+// opposite sides of the same coin.)
+//
+// This is a software label change — nothing about VCLOCK hardware,
+// its 10 MHz tick stream, or PPS arrival is modified.  We are simply
+// correcting the identity we assign to the PPS-corresponding tick.
+//
+// APPLICATION BOUNDARIES:
+//   • Alpha applies this offset when installing its epoch from the
+//     snapshot (process_clocks_alpha.cpp).  Alpha is the canonical
+//     authority for the PPS-corresponding counter identity.
+//   • process_interrupt's VCLOCK lane rebootstrap applies it locally,
+//     because the VCLOCK lane establishes its logical count directly
+//     from counter32 without going through alpha.
+//   • The snapshot's counter32_at_edge is published RAW.  Consumers
+//     that need the corrected identity get it from alpha, not the
+//     snapshot.
+//
+// Deterministic because ISR entry and bus-read latencies have SD of
+// 1-2 cycles across hundreds of fires.  Tunable constant: if live
+// measurements show residuals shifting by more than expected after a
+// code change, adjust this value (plausible range: -2 to 0).
+static constexpr int32_t VCLOCK_EPOCH_TICK_OFFSET = -1;
+
 // ============================================================================
 // Physical PPS edge snapshot — captured in the GPIO ISR
 // ============================================================================

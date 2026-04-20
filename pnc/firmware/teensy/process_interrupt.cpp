@@ -1152,6 +1152,23 @@ void process_interrupt_gpio6789_irq(uint32_t dwt_isr_entry_raw) {
   //     count identity: counter32_at_event N seconds after anchor
   //     equals counter32 + N * VCLOCK_COUNTS_PER_SECOND.
   //
+  // Epoch tick offset (VCLOCK_EPOCH_TICK_OFFSET):
+  //   The counter32 we read is ~1 tick past the true PPS edge due to
+  //   peripheral-bus-read quantization (see the constant's definition
+  //   for the full physical reasoning).  The VCLOCK lane's logical
+  //   count and cadence compare target are established directly here
+  //   from counter32 and ch3_now — without going through alpha — so
+  //   the correction MUST be applied locally for the VCLOCK lane's
+  //   tick identity to agree with alpha's epoch identity downstream.
+  //
+  //   Note: the snapshot itself is published RAW.  Alpha applies the
+  //   same offset independently when installing its epoch, and
+  //   downstream consumers (witness armer, etc.) read alpha's
+  //   corrected state rather than re-applying the offset.  This code
+  //   is the one place in process_interrupt that establishes a new
+  //   tick identity without going through alpha, so it's the one
+  //   place that has to apply the correction locally.
+  //
   // The rebootstrap runs in GPIO ISR priority (0) and therefore
   // preempts the QTimer1 CH3 ISR (priority 16 via TimePop).  No race
   // with vclock_cadence_isr can occur here.
@@ -1163,12 +1180,21 @@ void process_interrupt_gpio6789_irq(uint32_t dwt_isr_entry_raw) {
     g_vclock_lane.phase_bootstrapped = true;
     g_vclock_lane.tick_mod_1000 = 0;
     g_vclock_lane.compare_target =
-        (uint16_t)(ch3_now + (uint16_t)VCLOCK_INTERVAL_COUNTS);
-    g_vclock_lane.logical_count32_at_last_second = counter32;
+        (uint16_t)(ch3_now + (uint16_t)VCLOCK_INTERVAL_COUNTS
+                   + (uint16_t)VCLOCK_EPOCH_TICK_OFFSET);
+    g_vclock_lane.logical_count32_at_last_second =
+        counter32 + VCLOCK_EPOCH_TICK_OFFSET;
     qtimer1_ch3_program_compare(g_vclock_lane.compare_target);
   }
 
   // ── Snapshot publication (seqlock) ──
+  //
+  // counter32_at_edge is published RAW — the honest hardware reading
+  // taken ~140 cycles after the PPS edge.  Downstream consumers that
+  // need the PPS-corresponding counter identity (rather than the
+  // bus-read-moment identity) apply VCLOCK_EPOCH_TICK_OFFSET
+  // themselves.  Alpha's epoch install does this; the witness armer
+  // then reads alpha's corrected epoch rather than the raw snapshot.
   g_pps_edge_store.seq++;
   dmb_barrier();
   g_pps_edge_store.sequence          = g_pps_gpio_witness.edge_count;
