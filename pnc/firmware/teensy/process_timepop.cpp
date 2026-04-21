@@ -70,9 +70,9 @@
 //
 // ============================================================================
 
+#include "config.h"
 #include "timepop.h"
 #include "process_timepop.h"
-#include "tdc_correction.h"
 
 #include "publish.h"
 
@@ -430,7 +430,7 @@ static void vclock_monitor_callback(timepop_ctx_t* ctx,
   const int64_t fire_gnss_ns = ctx ? ctx->fire_gnss_ns : -1;
   const uint32_t dwt_isr_entry_raw = diag ? diag->dwt_at_isr_entry : 0;
   const uint32_t dwt_at_edge =
-      dwt_isr_entry_raw ? (dwt_isr_entry_raw - QTIMER_ISR_FIXED_OVERHEAD) : 0;
+      dwt_isr_entry_raw ? (dwt_isr_entry_raw - QTIMER_ISR_ENTRY_OVERHEAD) : 0;
 
   const int64_t isr_entry_gnss_ns =
       (diag && diag->anchor_valid)

@@ -64,6 +64,7 @@
 #include <Arduino.h>
 #include "imxrt.h"
 #include <math.h>
+#include <strings.h>
 
 // ============================================================================
 // Constants
@@ -218,6 +219,43 @@ static witness_welford_t g_hw_witness_qtimer_welford = {};
 static uint32_t g_hw_witness_gpio_last_reported_hits = 0;
 static uint32_t g_hw_witness_qtimer_last_reported_hits = 0;
 
+enum class hw_witness_mode_t : uint8_t {
+  BOTH = 0,
+  GPIO,
+  QTIMER,
+};
+
+static volatile hw_witness_mode_t g_hw_witness_mode = hw_witness_mode_t::BOTH;
+
+static inline bool hw_witness_gpio_enabled(void) {
+  return g_hw_witness_mode == hw_witness_mode_t::BOTH ||
+         g_hw_witness_mode == hw_witness_mode_t::GPIO;
+}
+
+static inline bool hw_witness_qtimer_enabled(void) {
+  return g_hw_witness_mode == hw_witness_mode_t::BOTH ||
+         g_hw_witness_mode == hw_witness_mode_t::QTIMER;
+}
+
+static const char* hw_witness_mode_str(hw_witness_mode_t mode) {
+  switch (mode) {
+    case hw_witness_mode_t::GPIO:   return "GPIO";
+    case hw_witness_mode_t::QTIMER: return "QTIMER";
+    default:                        return "BOTH";
+  }
+}
+
+static bool hw_witness_mode_parse(const char* s, hw_witness_mode_t& out) {
+  if (!s || !*s) return false;
+  if (!strcasecmp(s, "BOTH"))   { out = hw_witness_mode_t::BOTH; return true; }
+  if (!strcasecmp(s, "GPIO"))   { out = hw_witness_mode_t::GPIO; return true; }
+  if (!strcasecmp(s, "QTIMER")) { out = hw_witness_mode_t::QTIMER; return true; }
+  return false;
+}
+
+static void hw_witness_apply_mode(void);
+
+
 // ============================================================================
 // PPS GPIO witness
 // ============================================================================
@@ -366,7 +404,9 @@ static void hw_witness_drive_high(void) {
   g_witness_square_high = true;
   g_witness_source_emits++;
 
-  hw_witness_snapshot_qtimer_source_state();
+  if (hw_witness_qtimer_enabled()) {
+    hw_witness_snapshot_qtimer_source_state();
+  }
 }
 
 static void hw_witness_drive_low(void) {
@@ -383,6 +423,7 @@ static void hw_witness_low_callback(timepop_ctx_t*, timepop_diag_t*, void*) {
 }
 
 static void witness_gpio_isr(void) {
+  if (!hw_witness_gpio_enabled()) return;
   const uint32_t dwt_raw = ARM_DWT_CYCCNT;
   const int32_t sample = (int32_t)(dwt_raw - g_witness_source_dwt);
   g_witness_gpio_dwt = dwt_raw;
@@ -431,7 +472,26 @@ static void handle_qtimer2_witness_irq(uint32_t dwt_raw) {
 static void qtimer2_isr(void) {
   const uint32_t dwt_raw = ARM_DWT_CYCCNT;
   if (IMXRT_TMR2.CH[0].CSCTRL & TMR_CSCTRL_TCF1) {
+    if (!hw_witness_qtimer_enabled()) {
+      qtimer2_ch0_disable_compare();
+      return;
+    }
     handle_qtimer2_witness_irq(dwt_raw);
+  }
+}
+
+static void hw_witness_apply_mode(void) {
+  if (hw_witness_gpio_enabled()) {
+    pinMode(WITNESS_GPIO_IN_PIN, INPUT);
+    attachInterrupt(digitalPinToInterrupt(WITNESS_GPIO_IN_PIN), witness_gpio_isr, RISING);
+  } else {
+    detachInterrupt(digitalPinToInterrupt(WITNESS_GPIO_IN_PIN));
+  }
+
+  if (hw_witness_qtimer_enabled()) {
+    qtimer3_witness_arm_next();
+  } else {
+    qtimer2_ch0_disable_compare();
   }
 }
 
@@ -1788,12 +1848,11 @@ void process_interrupt_init(void) {
   witness_welford_reset(g_hw_witness_qtimer_welford);
   g_hw_witness_gpio_last_reported_hits = 0;
   g_hw_witness_qtimer_last_reported_hits = 0;
+  g_hw_witness_mode = hw_witness_mode_t::BOTH;
 
   pinMode(WITNESS_SQUARE_OUT_PIN, OUTPUT);
   digitalWriteFast(WITNESS_SQUARE_OUT_PIN, LOW);
-  pinMode(WITNESS_GPIO_IN_PIN, INPUT);
-  attachInterrupt(digitalPinToInterrupt(WITNESS_GPIO_IN_PIN), witness_gpio_isr, RISING);
-  qtimer3_witness_arm_next();
+  hw_witness_apply_mode();
 
   interrupt_witness_reset_stats();
   interrupt_witness_set_mode(interrupt_witness_mode_t::ON);
@@ -1830,6 +1889,9 @@ void process_interrupt_enable_irqs(void) {
 static Payload cmd_report(const Payload&) {
   Payload p;
   p.add("hardware_ready", g_interrupt_hw_ready);
+  p.add("hw_witness_mode", hw_witness_mode_str(g_hw_witness_mode));
+  p.add("hw_witness_gpio_enabled", hw_witness_gpio_enabled());
+  p.add("hw_witness_qtimer_enabled", hw_witness_qtimer_enabled());
   p.add("runtime_ready", g_interrupt_runtime_ready);
   p.add("irqs_enabled", g_interrupt_irqs_enabled);
   p.add("subscriber_count", g_subscriber_count);
@@ -1924,6 +1986,9 @@ static Payload cmd_witness_latency(const Payload&) {
 
   Payload p;
 
+  p.add("hw_witness_mode", hw_witness_mode_str(g_hw_witness_mode));
+  p.add("hw_witness_gpio_enabled", hw_witness_gpio_enabled());
+  p.add("hw_witness_qtimer_enabled", hw_witness_qtimer_enabled());
   p.add("hw_witness_source_emits", g_witness_source_emits);
   p.add("hw_witness_source_dwt", g_witness_source_dwt);
 
@@ -2029,12 +2094,35 @@ static Payload cmd_witness_latency(const Payload&) {
   return p;
 }
 
+static Payload cmd_witness_mode(const Payload& args) {
+  hw_witness_mode_t mode = g_hw_witness_mode;
+  const char* mode_s = args.getString("mode");
+  if (!mode_s || !*mode_s) mode_s = args.getString("MODE");
+  if (!hw_witness_mode_parse(mode_s, mode)) {
+    Payload err;
+    err.add("error", "invalid or missing mode (expected GPIO, QTIMER, or BOTH)");
+    err.add("hw_witness_mode", hw_witness_mode_str(g_hw_witness_mode));
+    return err;
+  }
+
+  g_hw_witness_mode = mode;
+  hw_witness_apply_mode();
+
+  Payload p;
+  p.add("status", "WITNESS_MODE_SET");
+  p.add("hw_witness_mode", hw_witness_mode_str(g_hw_witness_mode));
+  p.add("hw_witness_gpio_enabled", hw_witness_gpio_enabled());
+  p.add("hw_witness_qtimer_enabled", hw_witness_qtimer_enabled());
+  return p;
+}
+
 static Payload cmd_witness_start(const Payload&) {
   interrupt_witness_reset_stats();
   witness_welford_reset(g_hw_witness_gpio_welford);
   witness_welford_reset(g_hw_witness_qtimer_welford);
   g_hw_witness_gpio_last_reported_hits = 0;
   g_hw_witness_qtimer_last_reported_hits = 0;
+  hw_witness_apply_mode();
   interrupt_witness_set_mode(interrupt_witness_mode_t::ON);
   Payload p;
   p.add("witness_active", true);
@@ -2063,6 +2151,7 @@ static Payload cmd_witness_reset(const Payload&) {
   witness_welford_reset(g_hw_witness_qtimer_welford);
   g_hw_witness_gpio_last_reported_hits = 0;
   g_hw_witness_qtimer_last_reported_hits = 0;
+  hw_witness_apply_mode();
   Payload p;
   p.add("status", "WITNESS_RESET");
   return p;
@@ -2207,6 +2296,9 @@ static Payload cmd_witness_dump(const Payload&) {
 
   Payload p;
   p.add("witness_active",             g_witness_mode == interrupt_witness_mode_t::ON);
+  p.add("hw_witness_mode",            hw_witness_mode_str(g_hw_witness_mode));
+  p.add("hw_witness_gpio_enabled",    hw_witness_gpio_enabled());
+  p.add("hw_witness_qtimer_enabled",  hw_witness_qtimer_enabled());
   p.add("witness_anomaly_threshold_cycles", (uint32_t)WITNESS_ANOMALY_CYCLES);
   p.add("witness_anomaly_buffer_size",      (uint32_t)WITNESS_ANOMALY_BUFFER_SIZE);
   p.add("witness_anomaly_count_total",      g_witness_anomaly_count_total);
@@ -2253,6 +2345,7 @@ static const process_command_entry_t INTERRUPT_COMMANDS[] = {
   { "WITNESS_START", cmd_witness_start  },
   { "WITNESS_STOP",  cmd_witness_stop   },
   { "WITNESS_RESET", cmd_witness_reset  },
+  { "WITNESS_MODE",  cmd_witness_mode   },
   { "WITNESS_DUMP",  cmd_witness_dump   },
   { "WITNESS_LATENCY", cmd_witness_latency },
   { nullptr,         nullptr            }

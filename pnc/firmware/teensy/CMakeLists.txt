@@ -110,8 +110,7 @@ set(ZPNET_HEADERS
     util.h
     zpnet_pins.h
     time.h
-    tdc_correction.h
-    ad5693r.h
+        ad5693r.h
     process_interrupt.h
 )
 

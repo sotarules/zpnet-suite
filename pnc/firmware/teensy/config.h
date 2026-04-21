@@ -226,3 +226,13 @@ static constexpr uint32_t OCXO_COUNTS_PER_SECOND = 10000000U;
 
 // Ticks per emitted one-second event.  1000 ticks × 1 ms = 1 s.
 static constexpr uint32_t TICKS_PER_SECOND_EVENT = 1000U;
+
+// ============================================================================
+// Latency constants
+// ============================================================================
+
+static constexpr uint32_t GPIO_TOTAL_LATENCY = 72;
+static constexpr uint32_t QTIMER_TOTAL_LATENCY = 53;
+
+static constexpr uint32_t PPS_ISR_ENTRY_OVERHEAD = 47;
+static constexpr uint32_t QTIMER_ISR_ENTRY_OVERHEAD = 16;
