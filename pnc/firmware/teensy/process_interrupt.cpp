@@ -64,7 +64,6 @@
 #include <Arduino.h>
 #include "imxrt.h"
 #include <math.h>
-#include <IntervalTimer.h>
 
 // ============================================================================
 // Constants
@@ -73,6 +72,12 @@
 static constexpr int WITNESS_SQUARE_OUT_PIN = 24;
 static constexpr int WITNESS_GPIO_IN_PIN   = 26;
 static constexpr int WITNESS_QTIMER_PIN    = 13;
+
+static constexpr uint64_t HW_WITNESS_HIGH_OFFSET_NS = 250000000ULL;
+static constexpr uint64_t HW_WITNESS_LOW_OFFSET_NS  = 750000000ULL;
+static constexpr const char* HW_WITNESS_HIGH_NAME = "HW_WITNESS_HIGH";
+static constexpr const char* HW_WITNESS_LOW_NAME  = "HW_WITNESS_LOW";
+
 
 // ============================================================================
 // Subscriber runtime
@@ -126,6 +131,14 @@ static interrupt_subscriber_runtime_t* g_rt_vclock = nullptr;
 static interrupt_subscriber_runtime_t* g_rt_ocxo1  = nullptr;
 static interrupt_subscriber_runtime_t* g_rt_ocxo2  = nullptr;
 
+struct witness_welford_t {
+  uint64_t n;
+  double   mean;       // in DWT cycles
+  double   m2;
+  int32_t  min_val;    // cycles
+  int32_t  max_val;    // cycles
+};
+
 // ============================================================================
 // Per-lane state
 // ============================================================================
@@ -166,11 +179,11 @@ struct ocxo_lane_t {
 static ocxo_lane_t g_ocxo1_lane;
 static ocxo_lane_t g_ocxo2_lane;
 
+
 // ============================================================================
 // Hardware witness source / sinks
 // ============================================================================
 
-static IntervalTimer g_witness_square_timer;
 static volatile bool     g_witness_square_high = false;
 static volatile uint32_t g_witness_source_dwt = 0;
 static volatile uint32_t g_witness_source_emits = 0;
@@ -198,6 +211,12 @@ static volatile uint32_t g_witness_qtimer_nonzero_cntr_observations = 0;
 static volatile uint32_t g_witness_qtimer_cntr_change_hits = 0;
 static volatile uint32_t g_witness_qtimer_tcf1_seen_at_source = 0;
 static volatile uint32_t g_witness_qtimer_tcf1_seen_in_irq = 0;
+
+static witness_welford_t g_hw_witness_gpio_welford = {};
+static witness_welford_t g_hw_witness_qtimer_welford = {};
+
+static uint32_t g_hw_witness_gpio_last_reported_hits = 0;
+static uint32_t g_hw_witness_qtimer_last_reported_hits = 0;
 
 // ============================================================================
 // PPS GPIO witness
@@ -246,6 +265,12 @@ static inline uint32_t qtimer1_read_32_for_diag(void) {
 uint32_t interrupt_qtimer1_counter32_now(void) { return qtimer1_read_32_for_diag(); }
 uint16_t interrupt_qtimer3_ch2_counter_now(void) { return IMXRT_TMR3.CH[2].CNTR; }
 uint16_t interrupt_qtimer3_ch3_counter_now(void) { return IMXRT_TMR3.CH[3].CNTR; }
+
+// ============================================================================
+// Forward declarations.
+// ============================================================================
+
+static inline void witness_welford_update(witness_welford_t& w, int32_t sample);
 
 // ============================================================================
 // Compare channel helpers
@@ -305,49 +330,65 @@ static inline void qtimer3_disable_compare(uint8_t ch) {
   qtimer3_clear_compare_flag(ch);
 }
 
-static void witness_square_timer_isr(void) {
-  if (!g_witness_square_high) {
-    const uint32_t dwt_raw = ARM_DWT_CYCCNT;
-    const uint16_t qtimer_cntr = IMXRT_TMR2.CH[0].CNTR;
-    const uint16_t qtimer_csctrl = IMXRT_TMR2.CH[0].CSCTRL;
-    const uint16_t qtimer_mux = *(portConfigRegister(WITNESS_QTIMER_PIN));
-    const uint16_t qtimer_select_input = IOMUXC_QTIMER2_TIMER0_SELECT_INPUT;
 
-    g_witness_source_dwt = dwt_raw;
-    g_witness_source_emits++;
+static void hw_witness_snapshot_qtimer_source_state(void) {
+  const uint16_t qtimer_cntr   = IMXRT_TMR2.CH[0].CNTR;
+  const uint16_t qtimer_csctrl = IMXRT_TMR2.CH[0].CSCTRL;
+  const uint16_t qtimer_mux    = *(portConfigRegister(WITNESS_QTIMER_PIN));
+  const uint16_t qtimer_select_input = IOMUXC_QTIMER2_TIMER0_SELECT_INPUT;
 
-    g_witness_qtimer_prev_source_cntr = qtimer_cntr;
-    g_witness_qtimer_last_source_delta =
-        (uint16_t)(qtimer_cntr - g_witness_qtimer_cntr_snapshot);
-    g_witness_qtimer_source_reads++;
-    if (qtimer_cntr != 0) g_witness_qtimer_nonzero_cntr_observations++;
-    if (qtimer_cntr != g_witness_qtimer_cntr_snapshot) g_witness_qtimer_cntr_change_hits++;
-    if (qtimer_csctrl & TMR_CSCTRL_TCF1) g_witness_qtimer_tcf1_seen_at_source++;
+  g_witness_qtimer_prev_source_cntr = qtimer_cntr;
+  g_witness_qtimer_last_source_delta =
+      (uint16_t)(qtimer_cntr - g_witness_qtimer_cntr_snapshot);
+  g_witness_qtimer_source_reads++;
+  if (qtimer_cntr != 0) g_witness_qtimer_nonzero_cntr_observations++;
+  if (qtimer_cntr != g_witness_qtimer_cntr_snapshot) g_witness_qtimer_cntr_change_hits++;
+  if (qtimer_csctrl & TMR_CSCTRL_TCF1) g_witness_qtimer_tcf1_seen_at_source++;
 
-    g_witness_qtimer_cntr_snapshot = qtimer_cntr;
-    g_witness_qtimer_comp1_snapshot = IMXRT_TMR2.CH[0].COMP1;
-    g_witness_qtimer_csctrl_snapshot = qtimer_csctrl;
-    g_witness_qtimer_ctrl_snapshot = IMXRT_TMR2.CH[0].CTRL;
-    g_witness_qtimer_enbl_snapshot = IMXRT_TMR2.ENBL;
-    g_witness_qtimer_sctrl_snapshot = IMXRT_TMR2.CH[0].SCTRL;
-    g_witness_qtimer_load_snapshot = IMXRT_TMR2.CH[0].LOAD;
-    g_witness_qtimer_cmpld1_snapshot = IMXRT_TMR2.CH[0].CMPLD1;
-    g_witness_qtimer_mux_snapshot = qtimer_mux;
-    g_witness_qtimer_select_input_snapshot = qtimer_select_input;
+  g_witness_qtimer_cntr_snapshot = qtimer_cntr;
+  g_witness_qtimer_comp1_snapshot = IMXRT_TMR2.CH[0].COMP1;
+  g_witness_qtimer_csctrl_snapshot = qtimer_csctrl;
+  g_witness_qtimer_ctrl_snapshot = IMXRT_TMR2.CH[0].CTRL;
+  g_witness_qtimer_enbl_snapshot = IMXRT_TMR2.ENBL;
+  g_witness_qtimer_sctrl_snapshot = IMXRT_TMR2.CH[0].SCTRL;
+  g_witness_qtimer_load_snapshot = IMXRT_TMR2.CH[0].LOAD;
+  g_witness_qtimer_cmpld1_snapshot = IMXRT_TMR2.CH[0].CMPLD1;
+  g_witness_qtimer_mux_snapshot = qtimer_mux;
+  g_witness_qtimer_select_input_snapshot = qtimer_select_input;
+}
 
-    digitalWriteFast(WITNESS_SQUARE_OUT_PIN, HIGH);
-    g_witness_square_high = true;
-  } else {
-    digitalWriteFast(WITNESS_SQUARE_OUT_PIN, LOW);
-    g_witness_square_high = false;
-  }
+static void hw_witness_drive_high(void) {
+  // ── Critical latency-measurement window ──
+  const uint32_t dwt_raw = ARM_DWT_CYCCNT;
+  digitalWriteFast(WITNESS_SQUARE_OUT_PIN, HIGH);
+  g_witness_source_dwt = dwt_raw;
+
+  g_witness_square_high = true;
+  g_witness_source_emits++;
+
+  hw_witness_snapshot_qtimer_source_state();
+}
+
+static void hw_witness_drive_low(void) {
+  digitalWriteFast(WITNESS_SQUARE_OUT_PIN, LOW);
+  g_witness_square_high = false;
+}
+
+static void hw_witness_high_callback(timepop_ctx_t*, timepop_diag_t*, void*) {
+  hw_witness_drive_high();
+}
+
+static void hw_witness_low_callback(timepop_ctx_t*, timepop_diag_t*, void*) {
+  hw_witness_drive_low();
 }
 
 static void witness_gpio_isr(void) {
   const uint32_t dwt_raw = ARM_DWT_CYCCNT;
+  const int32_t sample = (int32_t)(dwt_raw - g_witness_source_dwt);
   g_witness_gpio_dwt = dwt_raw;
-  g_witness_gpio_delta_cycles = dwt_raw - g_witness_source_dwt;
+  g_witness_gpio_delta_cycles = (uint32_t)sample;
   g_witness_gpio_hits++;
+  witness_welford_update(g_hw_witness_gpio_welford, sample);
 }
 
 static void qtimer3_witness_arm_next(void) {
@@ -379,9 +420,11 @@ static void handle_qtimer2_witness_irq(uint32_t dwt_raw) {
   g_witness_qtimer_select_input_snapshot = IOMUXC_QTIMER2_TIMER0_SELECT_INPUT;
   g_witness_qtimer_tcf1_seen_in_irq++;
   qtimer2_ch0_clear_compare_flag();
+  const int32_t sample = (int32_t)(dwt_raw - g_witness_source_dwt);
   g_witness_qtimer_dwt = dwt_raw;
-  g_witness_qtimer_delta_cycles = dwt_raw - g_witness_source_dwt;
+  g_witness_qtimer_delta_cycles = (uint32_t)sample;
   g_witness_qtimer_hits++;
+  witness_welford_update(g_hw_witness_qtimer_welford, sample);
   qtimer3_witness_arm_next();
 }
 
@@ -699,14 +742,6 @@ static constexpr uint32_t WITNESS_VCLOCK_TICKS_PER_SLOT = 1000000;
 // have missed the fire window or preempted it catastrophically.
 // 100,000 cycles at 1008 MHz ≈ 99 µs.
 static constexpr int32_t WITNESS_REJECT_CYCLES = 100000;
-
-struct witness_welford_t {
-  uint64_t n;
-  double   mean;       // in DWT cycles
-  double   m2;
-  int32_t  min_val;    // cycles
-  int32_t  max_val;    // cycles
-};
 
 static volatile interrupt_witness_mode_t g_witness_mode =
     interrupt_witness_mode_t::OFF;
@@ -1287,9 +1322,26 @@ static void qtimer1_isr(void) {
 // ============================================================================
 
 static void pps_edge_dispatch_trampoline(timepop_ctx_t*, timepop_diag_t*, void*) {
-  if (!g_pps_edge_dispatch) return;
   const pps_edge_snapshot_t snap = interrupt_last_pps_edge();
-  g_pps_edge_dispatch(snap);
+  if (g_pps_edge_dispatch) {
+    g_pps_edge_dispatch(snap);
+  }
+  if (snap.gnss_ns_at_edge >= 0) {
+    timepop_cancel_by_name(HW_WITNESS_HIGH_NAME);
+    timepop_cancel_by_name(HW_WITNESS_LOW_NAME);
+    timepop_arm_from_anchor(snap.gnss_ns_at_edge,
+                            (int64_t)HW_WITNESS_HIGH_OFFSET_NS,
+                            false,
+                            hw_witness_high_callback,
+                            nullptr,
+                            HW_WITNESS_HIGH_NAME);
+    timepop_arm_from_anchor(snap.gnss_ns_at_edge,
+                            (int64_t)HW_WITNESS_LOW_OFFSET_NS,
+                            false,
+                            hw_witness_low_callback,
+                            nullptr,
+                            HW_WITNESS_LOW_NAME);
+  }
 }
 
 void process_interrupt_gpio6789_irq(uint32_t dwt_isr_entry_raw) {
@@ -1605,7 +1657,13 @@ void process_interrupt_init_hardware(void) {
   IMXRT_TMR2.CH[0].CSCTRL = 0; IMXRT_TMR2.CH[0].LOAD = 0;
   IMXRT_TMR2.CH[0].CNTR = 0; IMXRT_TMR2.CH[0].COMP1 = 0xFFFF;
   IMXRT_TMR2.CH[0].CMPLD1 = 0xFFFF;
-  IMXRT_TMR2.CH[0].CTRL = TMR_CTRL_CM(1) | TMR_CTRL_PCS(1);
+  // PCS(0) selects CH0's own primary source (T0 = pin 13, wired via
+  // IOMUXC_QTIMER2_TIMER0_SELECT_INPUT = 1 and ALT1 on the pad).  This
+  // matches the working pattern used by VCLOCK on TMR1 CH0 (PCS=0
+  // counting pin 10) and OCXO1/OCXO2 on TMR3 CH2/CH3 (PCS=2/3 counting
+  // their own primary pins).  PCS(1) would select CH1's output as the
+  // count source, which is not what we want.
+  IMXRT_TMR2.CH[0].CTRL = TMR_CTRL_CM(1) | TMR_CTRL_PCS(0);
   qtimer2_ch0_disable_compare();
 
   IMXRT_TMR3.CH[2].CTRL = 0; IMXRT_TMR3.CH[2].SCTRL = 0;
@@ -1622,11 +1680,14 @@ void process_interrupt_init_hardware(void) {
   IMXRT_TMR3.CH[3].CTRL = TMR_CTRL_CM(1) | TMR_CTRL_PCS(g_ocxo2_lane.pcs);
   qtimer3_disable_compare(3);
 
-  // Ensure the witness lane (CH1) is explicitly enabled alongside the
-  // OCXO lanes.  CH2/CH3 are already active in the running system; CH1
-  // is new and we want to remove any ambiguity about module-level ENBL
-  // gating while we shake out the hardware witness path.
-  IMXRT_TMR2.ENBL |= (uint16_t)((1u << 1) | (1u << 2) | (1u << 3));
+  // Ensure the witness lane (TMR2 CH0) is explicitly enabled.  A TMR
+  // channel counts only when BOTH its ENBL bit is set AND CTRL.CM != 0.
+  // TMR2 reset defaults typically leave CH0's ENBL bit set, but we
+  // assert all four bits here to remove any ambiguity while we shake
+  // out the hardware witness path.  The OCXO lanes on TMR3 follow the
+  // same pattern (not shown here — they're already covered by the
+  // module's reset defaults plus the CTRL.CM writes above).
+  IMXRT_TMR2.ENBL |= (uint16_t)0x000F;
 
   g_ocxo1_lane.initialized = true;
   g_ocxo2_lane.initialized = true;
@@ -1723,13 +1784,19 @@ void process_interrupt_init(void) {
   g_witness_qtimer_cntr_change_hits = 0;
   g_witness_qtimer_tcf1_seen_at_source = 0;
   g_witness_qtimer_tcf1_seen_in_irq = 0;
+  witness_welford_reset(g_hw_witness_gpio_welford);
+  witness_welford_reset(g_hw_witness_qtimer_welford);
+  g_hw_witness_gpio_last_reported_hits = 0;
+  g_hw_witness_qtimer_last_reported_hits = 0;
 
   pinMode(WITNESS_SQUARE_OUT_PIN, OUTPUT);
   digitalWriteFast(WITNESS_SQUARE_OUT_PIN, LOW);
   pinMode(WITNESS_GPIO_IN_PIN, INPUT);
   attachInterrupt(digitalPinToInterrupt(WITNESS_GPIO_IN_PIN), witness_gpio_isr, RISING);
-  g_witness_square_timer.begin(witness_square_timer_isr, 500000);
   qtimer3_witness_arm_next();
+
+  interrupt_witness_reset_stats();
+  interrupt_witness_set_mode(interrupt_witness_mode_t::ON);
 
   g_interrupt_runtime_ready = true;
 }
@@ -1833,16 +1900,99 @@ static Payload cmd_report(const Payload&) {
   p.add("witness_gpio_counter_delay_min_cycles",   ws.gpio_counter_delay_min_cycles);
   p.add("witness_gpio_counter_delay_max_cycles",   ws.gpio_counter_delay_max_cycles);
 
+
+  return p;
+}
+
+
+static Payload cmd_witness_latency(const Payload&) {
+  const uint32_t gpio_hits = g_witness_gpio_hits;
+  const uint32_t qtimer_hits = g_witness_qtimer_hits;
+
+  const uint32_t gpio_hits_delta =
+      gpio_hits - g_hw_witness_gpio_last_reported_hits;
+  const uint32_t qtimer_hits_delta =
+      qtimer_hits - g_hw_witness_qtimer_last_reported_hits;
+
+  const bool gpio_fresh = gpio_hits_delta > 0;
+  const bool qtimer_fresh = qtimer_hits_delta > 0;
+
+  const double gpio_stddev_cycles =
+      witness_welford_stddev(g_hw_witness_gpio_welford);
+  const double qtimer_stddev_cycles =
+      witness_welford_stddev(g_hw_witness_qtimer_welford);
+
+  Payload p;
+
   p.add("hw_witness_source_emits", g_witness_source_emits);
   p.add("hw_witness_source_dwt", g_witness_source_dwt);
-  p.add("hw_witness_gpio_hits", g_witness_gpio_hits);
+
+  p.add("hw_witness_gpio_hits", gpio_hits);
+  p.add("hw_witness_gpio_last_reported_hits", g_hw_witness_gpio_last_reported_hits);
+  p.add("hw_witness_gpio_hits_delta_since_last_report", gpio_hits_delta);
+  p.add("hw_witness_gpio_fresh", gpio_fresh);
+  p.add("hw_witness_gpio_stale", !gpio_fresh);
   p.add("hw_witness_gpio_dwt", g_witness_gpio_dwt);
   p.add("hw_witness_gpio_delta_cycles", g_witness_gpio_delta_cycles);
-  p.add("hw_witness_gpio_delta_ns", witness_cycles_to_ns((double)g_witness_gpio_delta_cycles));
-  p.add("hw_witness_qtimer_hits", g_witness_qtimer_hits);
+  p.add("hw_witness_gpio_delta_ns",
+        witness_cycles_to_ns((double)g_witness_gpio_delta_cycles));
+
+  p.add("hw_witness_gpio_n", (uint32_t)g_hw_witness_gpio_welford.n);
+  p.add("hw_witness_gpio_mean_cycles", g_hw_witness_gpio_welford.mean);
+  p.add("hw_witness_gpio_stddev_cycles", gpio_stddev_cycles);
+  p.add("hw_witness_gpio_stderr_cycles",
+        (g_hw_witness_gpio_welford.n >= 2)
+            ? (gpio_stddev_cycles / sqrt((double)g_hw_witness_gpio_welford.n))
+            : 0.0);
+  p.add("hw_witness_gpio_min_cycles", g_hw_witness_gpio_welford.min_val);
+  p.add("hw_witness_gpio_max_cycles", g_hw_witness_gpio_welford.max_val);
+  p.add("hw_witness_gpio_mean_ns",
+        witness_cycles_to_ns(g_hw_witness_gpio_welford.mean));
+  p.add("hw_witness_gpio_stddev_ns",
+        witness_cycles_to_ns(gpio_stddev_cycles));
+  p.add("hw_witness_gpio_stderr_ns",
+        (g_hw_witness_gpio_welford.n >= 2)
+            ? witness_cycles_to_ns(
+                  gpio_stddev_cycles / sqrt((double)g_hw_witness_gpio_welford.n))
+            : 0.0);
+  p.add("hw_witness_gpio_min_ns",
+        witness_cycles_to_ns((double)g_hw_witness_gpio_welford.min_val));
+  p.add("hw_witness_gpio_max_ns",
+        witness_cycles_to_ns((double)g_hw_witness_gpio_welford.max_val));
+
+  p.add("hw_witness_qtimer_hits", qtimer_hits);
+  p.add("hw_witness_qtimer_last_reported_hits", g_hw_witness_qtimer_last_reported_hits);
+  p.add("hw_witness_qtimer_hits_delta_since_last_report", qtimer_hits_delta);
+  p.add("hw_witness_qtimer_fresh", qtimer_fresh);
+  p.add("hw_witness_qtimer_stale", !qtimer_fresh);
   p.add("hw_witness_qtimer_dwt", g_witness_qtimer_dwt);
   p.add("hw_witness_qtimer_delta_cycles", g_witness_qtimer_delta_cycles);
-  p.add("hw_witness_qtimer_delta_ns", witness_cycles_to_ns((double)g_witness_qtimer_delta_cycles));
+  p.add("hw_witness_qtimer_delta_ns",
+        witness_cycles_to_ns((double)g_witness_qtimer_delta_cycles));
+
+  p.add("hw_witness_qtimer_n", (uint32_t)g_hw_witness_qtimer_welford.n);
+  p.add("hw_witness_qtimer_mean_cycles", g_hw_witness_qtimer_welford.mean);
+  p.add("hw_witness_qtimer_stddev_cycles", qtimer_stddev_cycles);
+  p.add("hw_witness_qtimer_stderr_cycles",
+        (g_hw_witness_qtimer_welford.n >= 2)
+            ? (qtimer_stddev_cycles / sqrt((double)g_hw_witness_qtimer_welford.n))
+            : 0.0);
+  p.add("hw_witness_qtimer_min_cycles", g_hw_witness_qtimer_welford.min_val);
+  p.add("hw_witness_qtimer_max_cycles", g_hw_witness_qtimer_welford.max_val);
+  p.add("hw_witness_qtimer_mean_ns",
+        witness_cycles_to_ns(g_hw_witness_qtimer_welford.mean));
+  p.add("hw_witness_qtimer_stddev_ns",
+        witness_cycles_to_ns(qtimer_stddev_cycles));
+  p.add("hw_witness_qtimer_stderr_ns",
+        (g_hw_witness_qtimer_welford.n >= 2)
+            ? witness_cycles_to_ns(
+                  qtimer_stddev_cycles / sqrt((double)g_hw_witness_qtimer_welford.n))
+            : 0.0);
+  p.add("hw_witness_qtimer_min_ns",
+        witness_cycles_to_ns((double)g_hw_witness_qtimer_welford.min_val));
+  p.add("hw_witness_qtimer_max_ns",
+        witness_cycles_to_ns((double)g_hw_witness_qtimer_welford.max_val));
+
   p.add("hw_witness_qtimer_cntr", (uint32_t)IMXRT_TMR2.CH[0].CNTR);
   p.add("hw_witness_qtimer_comp1", (uint32_t)IMXRT_TMR2.CH[0].COMP1);
   p.add("hw_witness_qtimer_csctrl", (uint32_t)IMXRT_TMR2.CH[0].CSCTRL);
@@ -1857,20 +2007,34 @@ static Payload cmd_report(const Payload&) {
   p.add("hw_witness_qtimer_load_snapshot", (uint32_t)g_witness_qtimer_load_snapshot);
   p.add("hw_witness_qtimer_cmpld1_snapshot", (uint32_t)g_witness_qtimer_cmpld1_snapshot);
   p.add("hw_witness_qtimer_mux_snapshot", (uint32_t)g_witness_qtimer_mux_snapshot);
-  p.add("hw_witness_qtimer_select_input_snapshot", (uint32_t)g_witness_qtimer_select_input_snapshot);
-  p.add("hw_witness_qtimer_prev_source_cntr", (uint32_t)g_witness_qtimer_prev_source_cntr);
-  p.add("hw_witness_qtimer_last_source_delta", (uint32_t)g_witness_qtimer_last_source_delta);
+  p.add("hw_witness_qtimer_select_input_snapshot",
+        (uint32_t)g_witness_qtimer_select_input_snapshot);
+  p.add("hw_witness_qtimer_prev_source_cntr",
+        (uint32_t)g_witness_qtimer_prev_source_cntr);
+  p.add("hw_witness_qtimer_last_source_delta",
+        (uint32_t)g_witness_qtimer_last_source_delta);
   p.add("hw_witness_qtimer_source_reads", g_witness_qtimer_source_reads);
-  p.add("hw_witness_qtimer_nonzero_cntr_observations", g_witness_qtimer_nonzero_cntr_observations);
-  p.add("hw_witness_qtimer_cntr_change_hits", g_witness_qtimer_cntr_change_hits);
-  p.add("hw_witness_qtimer_tcf1_seen_at_source", g_witness_qtimer_tcf1_seen_at_source);
-  p.add("hw_witness_qtimer_tcf1_seen_in_irq", g_witness_qtimer_tcf1_seen_in_irq);
+  p.add("hw_witness_qtimer_nonzero_cntr_observations",
+        g_witness_qtimer_nonzero_cntr_observations);
+  p.add("hw_witness_qtimer_cntr_change_hits",
+        g_witness_qtimer_cntr_change_hits);
+  p.add("hw_witness_qtimer_tcf1_seen_at_source",
+        g_witness_qtimer_tcf1_seen_at_source);
+  p.add("hw_witness_qtimer_tcf1_seen_in_irq",
+        g_witness_qtimer_tcf1_seen_in_irq);
+
+  g_hw_witness_gpio_last_reported_hits = gpio_hits;
+  g_hw_witness_qtimer_last_reported_hits = qtimer_hits;
 
   return p;
 }
 
 static Payload cmd_witness_start(const Payload&) {
   interrupt_witness_reset_stats();
+  witness_welford_reset(g_hw_witness_gpio_welford);
+  witness_welford_reset(g_hw_witness_qtimer_welford);
+  g_hw_witness_gpio_last_reported_hits = 0;
+  g_hw_witness_qtimer_last_reported_hits = 0;
   interrupt_witness_set_mode(interrupt_witness_mode_t::ON);
   Payload p;
   p.add("witness_active", true);
@@ -1895,6 +2059,10 @@ static Payload cmd_witness_stop(const Payload&) {
 
 static Payload cmd_witness_reset(const Payload&) {
   interrupt_witness_reset_stats();
+  witness_welford_reset(g_hw_witness_gpio_welford);
+  witness_welford_reset(g_hw_witness_qtimer_welford);
+  g_hw_witness_gpio_last_reported_hits = 0;
+  g_hw_witness_qtimer_last_reported_hits = 0;
   Payload p;
   p.add("status", "WITNESS_RESET");
   return p;
@@ -2086,6 +2254,7 @@ static const process_command_entry_t INTERRUPT_COMMANDS[] = {
   { "WITNESS_STOP",  cmd_witness_stop   },
   { "WITNESS_RESET", cmd_witness_reset  },
   { "WITNESS_DUMP",  cmd_witness_dump   },
+  { "WITNESS_LATENCY", cmd_witness_latency },
   { nullptr,         nullptr            }
 };
 
