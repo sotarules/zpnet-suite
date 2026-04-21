@@ -120,23 +120,8 @@ static const int GNSS_LOCK_PIN = 4;
 
 static const int GNSS_PPS_RELAY = 32;
 
-// --------------------------------------------------------------
-// OCXO1 — AOCJY1-A #1 (original)
-// --------------------------------------------------------------
-//
-// OCXO1_10MHZ_PIN:
-//   10 MHz output from OCXO1, counted by GPT1.
-//
-static const int OCXO1_10MHZ_PIN = 25;
-
-// --------------------------------------------------------------
-// OCXO2 — AOCJY1-A #2 (second oscillator)
-// --------------------------------------------------------------
-//
-// OCXO2_10MHZ_PIN:
-//   10 MHz output from OCXO2, counted by GPT2 on pin 14.
-//
-static const int OCXO2_10MHZ_PIN = 14;
+static constexpr int OCXO1_PIN = 14;
+static constexpr int OCXO2_PIN = 15;
 
 // --------------------------------------------------------------
 // QTimer1 cascade configuration
@@ -227,3 +212,17 @@ static const uint32_t PHOTODIODE_OFF_STABLE_MS = 20;
 // --------------------------------------------------------------
 static const float ADC_FS_VOLTS  = 3.3f;
 static const float ADC_FS_COUNTS = 4095.0f;
+
+// ============================================================================
+// Constants
+// ============================================================================
+
+static constexpr uint32_t MAX_INTERRUPT_SUBSCRIBERS = 8;
+
+static constexpr uint32_t VCLOCK_INTERVAL_COUNTS = 10000U;  // 1 ms at 10 MHz
+
+static constexpr uint32_t OCXO_INTERVAL_COUNTS = 10000U;    // 1 ms at 10 MHz
+static constexpr uint32_t OCXO_COUNTS_PER_SECOND = 10000000U;
+
+// Ticks per emitted one-second event.  1000 ticks × 1 ms = 1 s.
+static constexpr uint32_t TICKS_PER_SECOND_EVENT = 1000U;

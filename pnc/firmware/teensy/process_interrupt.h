@@ -487,7 +487,7 @@ void interrupt_register_qtimer1_ch2_handler(interrupt_qtimer1_ch2_handler_fn cb)
 //      dwt_cycles_per_second).  This schedules the first of nine slots.
 //   3. Each witness CH3 fire self-rotates to the next slot (100ms → 200ms
 //      → ... → 900ms).  After the 900 ms slot, CH3 is left idle until the
-//      next PPS edge re-arms slot 1.
+//      next PPS edge re-arms slot 0.
 //   4. Alpha calls interrupt_witness_set_mode(OFF) to stop.  Next PPS edge
 //      performs a normal rebootstrap and VCLOCK cadence resumes.
 //
@@ -496,7 +496,7 @@ void interrupt_register_qtimer1_ch2_handler(interrupt_qtimer1_ch2_handler_fn cb)
 
 enum class interrupt_witness_mode_t : uint8_t {
   OFF = 0,  // normal CH3 cadence operation
-  ON,       // witness owns CH3 (used as the steady-state mode here)
+  ON,       // witness owns CH3
 };
 
 struct interrupt_witness_stats_t {
@@ -542,13 +542,12 @@ struct interrupt_witness_stats_t {
 void interrupt_witness_set_mode(interrupt_witness_mode_t mode);
 interrupt_witness_mode_t interrupt_witness_get_mode(void);
 
-// Arm the first witness slot (slot 1, 100 ms after anchor_counter32 VCLOCK tick).
+// Arm the first witness slot (100 ms after anchor_counter32 VCLOCK tick).
 // Called by alpha from pps_edge_callback, exactly once per PPS edge, when
 // witness mode is ON.  Caller supplies the PPS-edge counter32, PPS-edge
 // DWT, and the most recent DWT-cycles-per-second prediction.  Subsequent
 // slots (200ms, 300ms, ..., 900ms) are armed self-recursively by the
 // witness ISR path.
-// Arms slot 1 (100 ms), not slot 0.
 void interrupt_witness_arm_first_slot(uint32_t anchor_counter32,
                                       uint32_t anchor_dwt,
                                       uint32_t dwt_cycles_per_second);
@@ -556,15 +555,20 @@ void interrupt_witness_arm_first_slot(uint32_t anchor_counter32,
 interrupt_witness_stats_t interrupt_witness_stats(void);
 void interrupt_witness_reset_stats(void);
 
-extern volatile uint32_t g_witness_floor_cycles;
-
-uint32_t interrupt_witness_floor_cycles(void);
-double interrupt_witness_floor_ns(void);
-
-extern volatile uint32_t g_witness_floor_cycles;
-
-uint32_t interrupt_witness_floor_cycles(void);
-double interrupt_witness_floor_ns(void);
+uint32_t interrupt_hw_witness_gpio_delta_cycles(void);
+uint32_t interrupt_hw_witness_qtimer_delta_cycles(void);
+uint32_t interrupt_hw_witness_qtimer_cntr(void);
+uint32_t interrupt_hw_witness_qtimer_comp1(void);
+uint32_t interrupt_hw_witness_qtimer_csctrl(void);
+uint32_t interrupt_hw_witness_qtimer_ctrl(void);
+uint32_t interrupt_hw_witness_qtimer_enbl(void);
+uint32_t interrupt_hw_witness_qtimer_mux(void);
+uint32_t interrupt_hw_witness_qtimer_select_input(void);
+uint32_t interrupt_hw_witness_qtimer_source_reads(void);
+uint32_t interrupt_hw_witness_qtimer_nonzero_cntr_observations(void);
+uint32_t interrupt_hw_witness_qtimer_cntr_change_hits(void);
+uint32_t interrupt_hw_witness_qtimer_tcf1_seen_at_source(void);
+uint32_t interrupt_hw_witness_qtimer_tcf1_seen_in_irq(void);
 
 // ISR entry points (invoked by vector shims).
 void process_interrupt_gpio6789_irq(uint32_t dwt_isr_entry_raw);

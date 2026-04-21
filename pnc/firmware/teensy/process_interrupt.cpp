@@ -64,23 +64,15 @@
 #include <Arduino.h>
 #include "imxrt.h"
 #include <math.h>
+#include <IntervalTimer.h>
 
 // ============================================================================
 // Constants
 // ============================================================================
 
-static constexpr uint32_t MAX_INTERRUPT_SUBSCRIBERS = 8;
-
-static constexpr uint32_t VCLOCK_INTERVAL_COUNTS = 10000U;  // 1 ms at 10 MHz
-
-static constexpr uint32_t OCXO_INTERVAL_COUNTS = 10000U;    // 1 ms at 10 MHz
-static constexpr uint32_t OCXO_COUNTS_PER_SECOND = 10000000U;
-
-// Ticks per emitted one-second event.  1000 ticks × 1 ms = 1 s.
-static constexpr uint32_t TICKS_PER_SECOND_EVENT = 1000U;
-
-static constexpr int OCXO1_PIN = 14;
-static constexpr int OCXO2_PIN = 15;
+static constexpr int WITNESS_SQUARE_OUT_PIN = 24;
+static constexpr int WITNESS_GPIO_IN_PIN   = 26;
+static constexpr int WITNESS_QTIMER_PIN    = 13;
 
 // ============================================================================
 // Subscriber runtime
@@ -175,6 +167,39 @@ static ocxo_lane_t g_ocxo1_lane;
 static ocxo_lane_t g_ocxo2_lane;
 
 // ============================================================================
+// Hardware witness source / sinks
+// ============================================================================
+
+static IntervalTimer g_witness_square_timer;
+static volatile bool     g_witness_square_high = false;
+static volatile uint32_t g_witness_source_dwt = 0;
+static volatile uint32_t g_witness_source_emits = 0;
+static volatile uint32_t g_witness_gpio_dwt = 0;
+static volatile uint32_t g_witness_gpio_delta_cycles = 0;
+static volatile uint32_t g_witness_gpio_hits = 0;
+static volatile uint32_t g_witness_qtimer_dwt = 0;
+static volatile uint32_t g_witness_qtimer_delta_cycles = 0;
+static volatile uint32_t g_witness_qtimer_hits = 0;
+static volatile uint16_t g_witness_qtimer_compare_target = 0;
+static volatile uint16_t g_witness_qtimer_cntr_snapshot = 0;
+static volatile uint16_t g_witness_qtimer_comp1_snapshot = 0;
+static volatile uint16_t g_witness_qtimer_csctrl_snapshot = 0;
+static volatile uint16_t g_witness_qtimer_ctrl_snapshot = 0;
+static volatile uint16_t g_witness_qtimer_enbl_snapshot = 0;
+static volatile uint16_t g_witness_qtimer_sctrl_snapshot = 0;
+static volatile uint16_t g_witness_qtimer_load_snapshot = 0;
+static volatile uint16_t g_witness_qtimer_cmpld1_snapshot = 0;
+static volatile uint16_t g_witness_qtimer_mux_snapshot = 0;
+static volatile uint16_t g_witness_qtimer_select_input_snapshot = 0;
+static volatile uint16_t g_witness_qtimer_prev_source_cntr = 0;
+static volatile uint16_t g_witness_qtimer_last_source_delta = 0;
+static volatile uint32_t g_witness_qtimer_source_reads = 0;
+static volatile uint32_t g_witness_qtimer_nonzero_cntr_observations = 0;
+static volatile uint32_t g_witness_qtimer_cntr_change_hits = 0;
+static volatile uint32_t g_witness_qtimer_tcf1_seen_at_source = 0;
+static volatile uint32_t g_witness_qtimer_tcf1_seen_in_irq = 0;
+
+// ============================================================================
 // PPS GPIO witness
 // ============================================================================
 
@@ -249,6 +274,21 @@ static inline void qtimer1_ch2_clear_compare_flag(void) {
   IMXRT_TMR1.CH[2].CSCTRL &= ~(TMR_CSCTRL_TCF1 | TMR_CSCTRL_TCF2);
 }
 
+static inline void qtimer2_ch0_clear_compare_flag(void) {
+  IMXRT_TMR2.CH[0].CSCTRL &= ~(TMR_CSCTRL_TCF1 | TMR_CSCTRL_TCF2);
+}
+static inline void qtimer2_ch0_program_compare(uint16_t target_low16) {
+  qtimer2_ch0_clear_compare_flag();
+  IMXRT_TMR2.CH[0].COMP1  = target_low16;
+  IMXRT_TMR2.CH[0].CMPLD1 = target_low16;
+  qtimer2_ch0_clear_compare_flag();
+  IMXRT_TMR2.CH[0].CSCTRL |= TMR_CSCTRL_TCF1EN;
+}
+static inline void qtimer2_ch0_disable_compare(void) {
+  IMXRT_TMR2.CH[0].CSCTRL &= ~TMR_CSCTRL_TCF1EN;
+  qtimer2_ch0_clear_compare_flag();
+}
+
 static inline void qtimer3_clear_compare_flag(uint8_t ch) {
   IMXRT_TMR3.CH[ch].CSCTRL &= ~(TMR_CSCTRL_TCF1 | TMR_CSCTRL_TCF2);
 }
@@ -264,6 +304,94 @@ static inline void qtimer3_disable_compare(uint8_t ch) {
   IMXRT_TMR3.CH[ch].CSCTRL &= ~TMR_CSCTRL_TCF1EN;
   qtimer3_clear_compare_flag(ch);
 }
+
+static void witness_square_timer_isr(void) {
+  if (!g_witness_square_high) {
+    const uint32_t dwt_raw = ARM_DWT_CYCCNT;
+    const uint16_t qtimer_cntr = IMXRT_TMR2.CH[0].CNTR;
+    const uint16_t qtimer_csctrl = IMXRT_TMR2.CH[0].CSCTRL;
+    const uint16_t qtimer_mux = *(portConfigRegister(WITNESS_QTIMER_PIN));
+    const uint16_t qtimer_select_input = IOMUXC_QTIMER2_TIMER0_SELECT_INPUT;
+
+    g_witness_source_dwt = dwt_raw;
+    g_witness_source_emits++;
+
+    g_witness_qtimer_prev_source_cntr = qtimer_cntr;
+    g_witness_qtimer_last_source_delta =
+        (uint16_t)(qtimer_cntr - g_witness_qtimer_cntr_snapshot);
+    g_witness_qtimer_source_reads++;
+    if (qtimer_cntr != 0) g_witness_qtimer_nonzero_cntr_observations++;
+    if (qtimer_cntr != g_witness_qtimer_cntr_snapshot) g_witness_qtimer_cntr_change_hits++;
+    if (qtimer_csctrl & TMR_CSCTRL_TCF1) g_witness_qtimer_tcf1_seen_at_source++;
+
+    g_witness_qtimer_cntr_snapshot = qtimer_cntr;
+    g_witness_qtimer_comp1_snapshot = IMXRT_TMR2.CH[0].COMP1;
+    g_witness_qtimer_csctrl_snapshot = qtimer_csctrl;
+    g_witness_qtimer_ctrl_snapshot = IMXRT_TMR2.CH[0].CTRL;
+    g_witness_qtimer_enbl_snapshot = IMXRT_TMR2.ENBL;
+    g_witness_qtimer_sctrl_snapshot = IMXRT_TMR2.CH[0].SCTRL;
+    g_witness_qtimer_load_snapshot = IMXRT_TMR2.CH[0].LOAD;
+    g_witness_qtimer_cmpld1_snapshot = IMXRT_TMR2.CH[0].CMPLD1;
+    g_witness_qtimer_mux_snapshot = qtimer_mux;
+    g_witness_qtimer_select_input_snapshot = qtimer_select_input;
+
+    digitalWriteFast(WITNESS_SQUARE_OUT_PIN, HIGH);
+    g_witness_square_high = true;
+  } else {
+    digitalWriteFast(WITNESS_SQUARE_OUT_PIN, LOW);
+    g_witness_square_high = false;
+  }
+}
+
+static void witness_gpio_isr(void) {
+  const uint32_t dwt_raw = ARM_DWT_CYCCNT;
+  g_witness_gpio_dwt = dwt_raw;
+  g_witness_gpio_delta_cycles = dwt_raw - g_witness_source_dwt;
+  g_witness_gpio_hits++;
+}
+
+static void qtimer3_witness_arm_next(void) {
+  g_witness_qtimer_cntr_snapshot = IMXRT_TMR2.CH[0].CNTR;
+  g_witness_qtimer_compare_target =
+      (uint16_t)(g_witness_qtimer_cntr_snapshot + 1);
+  qtimer2_ch0_program_compare(g_witness_qtimer_compare_target);
+  g_witness_qtimer_comp1_snapshot = IMXRT_TMR2.CH[0].COMP1;
+  g_witness_qtimer_csctrl_snapshot = IMXRT_TMR2.CH[0].CSCTRL;
+  g_witness_qtimer_ctrl_snapshot = IMXRT_TMR2.CH[0].CTRL;
+  g_witness_qtimer_enbl_snapshot = IMXRT_TMR2.ENBL;
+  g_witness_qtimer_sctrl_snapshot = IMXRT_TMR2.CH[0].SCTRL;
+  g_witness_qtimer_load_snapshot = IMXRT_TMR2.CH[0].LOAD;
+  g_witness_qtimer_cmpld1_snapshot = IMXRT_TMR2.CH[0].CMPLD1;
+  g_witness_qtimer_mux_snapshot = *(portConfigRegister(WITNESS_QTIMER_PIN));
+  g_witness_qtimer_select_input_snapshot = IOMUXC_QTIMER2_TIMER0_SELECT_INPUT;
+}
+
+static void handle_qtimer2_witness_irq(uint32_t dwt_raw) {
+  g_witness_qtimer_cntr_snapshot = IMXRT_TMR2.CH[0].CNTR;
+  g_witness_qtimer_comp1_snapshot = IMXRT_TMR2.CH[0].COMP1;
+  g_witness_qtimer_csctrl_snapshot = IMXRT_TMR2.CH[0].CSCTRL;
+  g_witness_qtimer_ctrl_snapshot = IMXRT_TMR2.CH[0].CTRL;
+  g_witness_qtimer_enbl_snapshot = IMXRT_TMR2.ENBL;
+  g_witness_qtimer_sctrl_snapshot = IMXRT_TMR2.CH[0].SCTRL;
+  g_witness_qtimer_load_snapshot = IMXRT_TMR2.CH[0].LOAD;
+  g_witness_qtimer_cmpld1_snapshot = IMXRT_TMR2.CH[0].CMPLD1;
+  g_witness_qtimer_mux_snapshot = *(portConfigRegister(WITNESS_QTIMER_PIN));
+  g_witness_qtimer_select_input_snapshot = IOMUXC_QTIMER2_TIMER0_SELECT_INPUT;
+  g_witness_qtimer_tcf1_seen_in_irq++;
+  qtimer2_ch0_clear_compare_flag();
+  g_witness_qtimer_dwt = dwt_raw;
+  g_witness_qtimer_delta_cycles = dwt_raw - g_witness_source_dwt;
+  g_witness_qtimer_hits++;
+  qtimer3_witness_arm_next();
+}
+
+static void qtimer2_isr(void) {
+  const uint32_t dwt_raw = ARM_DWT_CYCCNT;
+  if (IMXRT_TMR2.CH[0].CSCTRL & TMR_CSCTRL_TCF1) {
+    handle_qtimer2_witness_irq(dwt_raw);
+  }
+}
+
 
 // ============================================================================
 // Subscriber lookup helpers
@@ -588,7 +716,7 @@ static volatile interrupt_witness_mode_t g_witness_mode =
 struct witness_slot_t {
   uint32_t target_vclock;    // full 32-bit VCLOCK target (for validation)
   uint32_t target_dwt;       // predicted DWT at target
-  uint8_t  slot_index;       // 1..WITNESS_N_SLOTS (0 / 0xFF = no slot armed)
+  uint8_t  slot_index;       // 1..WITNESS_N_SLOTS (0 = no slot armed)
 };
 
 static volatile witness_slot_t g_witness_current = { 0, 0, 0xFF };
@@ -606,8 +734,6 @@ static witness_welford_t g_witness_gpio_counter_delay_welford = {};
 
 static volatile uint64_t g_witness_fires_total    = 0;
 static volatile uint64_t g_witness_fires_rejected = 0;
-
-volatile uint32_t g_witness_floor_cycles = 0;
 
 // ── Per-slot capture buffer ──
 //
@@ -658,8 +784,22 @@ struct witness_capture_t {
 };
 
 // The capture array has WITNESS_N_SLOTS + 1 entries, indexed 0..N.
-// Slot 0 is retained only as an unused sentinel entry so the live
-// witness slots remain naturally indexed 1..WITNESS_N_SLOTS.
+// Slot 0 is a CH3 fire just like slots 1..N — same ISR path, same
+// math — but its target is anchor_counter32 (= +0 ticks past anchor),
+// so it fires on the first CH3 compare-match AFTER arming.
+//
+// Slot 0's physical behavior is different from 1..9 because the
+// compare target (anchor_counter32 & 0xFFFF) has ALREADY been passed
+// by the counter when the armer runs — so CH3 fires at the NEXT wrap,
+// roughly 6.5ms after arming.  That fire is preemption-affected
+// (TIMEBASE dispatch, alpha updates, and other PPS-edge foreground
+// work all run concurrently during that window) and its residual
+// will be large and messy — that's fine, it's data we want to see.
+//
+// The slot-0 fire also tells us something special: if dwt_at_fire
+// lands BEFORE anchor_dwt (negative residual with magnitude larger
+// than normal preemption delay), then CH3 executed before the PPS
+// GPIO ISR captured its anchor — an observable race ordering.
 static witness_capture_t g_witness_captures[WITNESS_N_SLOTS + 1] = {};
 static volatile uint32_t g_witness_capture_seq = 0;
 
@@ -693,7 +833,8 @@ static inline void witness_captures_reset(void) {
 // the total number of anomalies seen regardless of buffer capacity, so
 // the dump can report "N anomalies seen, first 16 captured."
 //
-// Only slots 1..WITNESS_N_SLOTS are active witness slots.
+// Only slots 1..WITNESS_N_SLOTS (CH3 fires) can trigger the anomaly
+// path; slot 0 (PPS edge) is captured every second regardless.
 static constexpr int32_t  WITNESS_ANOMALY_CYCLES      = 500;
 static constexpr uint8_t  WITNESS_ANOMALY_BUFFER_SIZE = 16;
 
@@ -766,29 +907,6 @@ static inline double witness_cycles_to_ns(double cycles) {
   return cycles * (125.0 / 126.0);
 }
 
-static void witness_update_floor_from_captures(void) {
-  bool found = false;
-  uint32_t best = 0;
-
-  for (uint8_t i = 1; i <= WITNESS_N_SLOTS; i++) {
-    const witness_capture_t& cap = g_witness_captures[i];
-    if (!cap.valid) continue;
-    if (cap.vclock_delta != 2) continue;
-    if (cap.residual_cycles < 0) continue;
-    if (cap.residual_cycles > WITNESS_REJECT_CYCLES) continue;
-
-    const uint32_t residual = (uint32_t)cap.residual_cycles;
-    if (!found || residual < best) {
-      best = residual;
-      found = true;
-    }
-  }
-
-  if (found) {
-    g_witness_floor_cycles = best;
-  }
-}
-
 // Compute the target_dwt for slot N given the anchor.
 //   delta_dwt = round(N * dwt_cps / 10)  because slot N is at N*100ms
 //   target_dwt = anchor_dwt + delta_dwt
@@ -807,10 +925,15 @@ static inline uint32_t witness_compute_target_vclock(uint32_t anchor_counter32,
 }
 
 // Arm CH3 for a specific slot.  Called from:
-//   • interrupt_witness_arm_first_slot (slot_index = 1, from PPS edge)
-//   • witness_ch3_isr itself (slot_index = 2..9, self-rotation)
+//   • interrupt_witness_arm_first_slot (slot_index = 0, from PPS edge)
+//   • witness_ch3_isr itself (slot_index = 1..9, self-rotation)
 // At slot_index == WITNESS_N_SLOTS + 1 the witness disables CH3 and
-// waits for the next PPS edge to re-arm slot 1.
+// waits for the next PPS edge to re-arm slot 0.
+//
+// Slot 0 is a CH3 fire with target == anchor (delta 0); physically it
+// catches the first compare-match AFTER arming, which is a wrap-alias
+// ~6.5ms later.  The wrap-alias filter in witness_ch3_isr specifically
+// accepts slot 0's first wrap; see witness_ch3_isr comment.
 static void witness_arm_slot(uint8_t slot_index) {
   if (slot_index > WITNESS_N_SLOTS) {
     qtimer1_ch3_disable_compare();
@@ -880,15 +1003,25 @@ static void witness_ch3_isr(uint32_t dwt_raw) {
   // Real fire tolerance: within WITNESS_VCLOCK_MATCH_WINDOW ticks of
   // target.  One VCLOCK tick is 100 ns, so a 256-tick window is 25.6 µs
   // — plenty of margin for ISR entry latency without allowing aliases.
+  //
+  // SLOT 0 EXCEPTION: slot 0's target (anchor_counter32) has already
+  // been passed by the time the armer runs.  The FIRST compare-match
+  // is thus a wrap-alias ~65536 ticks past target — which would be
+  // rejected by the narrow window.  For slot 0 only, accept the first
+  // fire we see regardless of wrap distance.  This is the whole point
+  // of slot 0: catch whatever CH3 does as soon after the PPS anchor
+  // as possible.
   const int32_t vclock_delta = (int32_t)(counter32 - target_vclock);
   constexpr int32_t WITNESS_VCLOCK_MATCH_WINDOW = 256;
-  if (vclock_delta < -WITNESS_VCLOCK_MATCH_WINDOW ||
-      vclock_delta >  WITNESS_VCLOCK_MATCH_WINDOW) {
-    // Wrap alias — not our real fire.  Don't rotate, don't count as
-    // rejected, just let the compare re-fire at the next wrap and we'll
-    // check again.  Eventually (within ~6.5 ms at worst) we'll see the
-    // real one.
-    return;
+  if (slot_index != 0) {
+    if (vclock_delta < -WITNESS_VCLOCK_MATCH_WINDOW ||
+        vclock_delta >  WITNESS_VCLOCK_MATCH_WINDOW) {
+      // Wrap alias — not our real fire.  Don't rotate, don't count as
+      // rejected, just let the compare re-fire at the next wrap and we'll
+      // check again.  Eventually (within ~6.5 ms at worst) we'll see the
+      // real one.
+      return;
+    }
   }
 
   // CH3 / CH0 phase lag measurement.  Both channels clock from the
@@ -931,22 +1064,31 @@ static void witness_ch3_isr(uint32_t dwt_raw) {
     cap.residual_cycles    = residual_cycles;
     cap.lag_ticks          = lag_ticks;
 
-    witness_anomaly_maybe_capture(cap, g_witness_fires_total);
+    // Sticky capture of anomalies.  Slot 0 is excluded — its residual
+    // is expected to be large and preemption-dominated, so flagging it
+    // as an anomaly would drown out the signal we care about.
+    if (slot_index != 0) {
+      witness_anomaly_maybe_capture(cap, g_witness_fires_total);
+    }
   }
 
   // Sanity: residual must be small.  Large magnitude (in either
   // direction) means something is wrong — likely a missed fire or
-  // heavy preemption.  Reject from the main Welford.
-  if (residual_cycles < -WITNESS_REJECT_CYCLES ||
+  // heavy preemption.  Reject from the main Welford.  Slot 0 is
+  // always excluded from the Welford because its residual is
+  // structurally large and would corrupt the mean/stddev.
+  if (slot_index == 0 ||
+      residual_cycles < -WITNESS_REJECT_CYCLES ||
       residual_cycles >  WITNESS_REJECT_CYCLES) {
-    g_witness_fires_rejected++;
+    if (slot_index != 0) {
+      g_witness_fires_rejected++;
+    }
   } else {
     witness_welford_update(g_witness_welford, residual_cycles);
-    witness_update_floor_from_captures();
   }
 
   // Self-rotate: arm next slot.  If this was the final slot, disable
-  // CH3 until the next PPS edge re-arms slot 1.
+  // CH3 until the next PPS edge re-arms slot 0.
   if (slot_index < WITNESS_N_SLOTS) {
     witness_arm_slot(slot_index + 1);
   } else {
@@ -990,7 +1132,7 @@ void interrupt_witness_arm_first_slot(uint32_t anchor_counter32,
   g_witness_anchor_dwt       = anchor_dwt;
   g_witness_anchor_dwt_cps   = dwt_cycles_per_second;
 
-  witness_arm_slot(1);
+  witness_arm_slot(0);
 }
 
 interrupt_witness_stats_t interrupt_witness_stats(void) {
@@ -1033,15 +1175,62 @@ void interrupt_witness_reset_stats(void) {
   witness_anomalies_reset();
   g_witness_fires_total    = 0;
   g_witness_fires_rejected = 0;
-  g_witness_floor_cycles   = 0;
 }
 
-uint32_t interrupt_witness_floor_cycles(void) {
-  return g_witness_floor_cycles;
+uint32_t interrupt_hw_witness_gpio_delta_cycles(void) {
+  return g_witness_gpio_delta_cycles;
 }
 
-double interrupt_witness_floor_ns(void) {
-  return witness_cycles_to_ns((double)g_witness_floor_cycles);
+uint32_t interrupt_hw_witness_qtimer_delta_cycles(void) {
+  return g_witness_qtimer_delta_cycles;
+}
+
+uint32_t interrupt_hw_witness_qtimer_cntr(void) {
+  return IMXRT_TMR2.CH[0].CNTR;
+}
+
+uint32_t interrupt_hw_witness_qtimer_comp1(void) {
+  return IMXRT_TMR2.CH[0].COMP1;
+}
+
+uint32_t interrupt_hw_witness_qtimer_csctrl(void) {
+  return IMXRT_TMR2.CH[0].CSCTRL;
+}
+
+uint32_t interrupt_hw_witness_qtimer_ctrl(void) {
+  return IMXRT_TMR2.CH[0].CTRL;
+}
+
+uint32_t interrupt_hw_witness_qtimer_enbl(void) {
+  return IMXRT_TMR2.ENBL;
+}
+
+uint32_t interrupt_hw_witness_qtimer_mux(void) {
+  return g_witness_qtimer_mux_snapshot;
+}
+
+uint32_t interrupt_hw_witness_qtimer_select_input(void) {
+  return g_witness_qtimer_select_input_snapshot;
+}
+
+uint32_t interrupt_hw_witness_qtimer_source_reads(void) {
+  return g_witness_qtimer_source_reads;
+}
+
+uint32_t interrupt_hw_witness_qtimer_nonzero_cntr_observations(void) {
+  return g_witness_qtimer_nonzero_cntr_observations;
+}
+
+uint32_t interrupt_hw_witness_qtimer_cntr_change_hits(void) {
+  return g_witness_qtimer_cntr_change_hits;
+}
+
+uint32_t interrupt_hw_witness_qtimer_tcf1_seen_at_source(void) {
+  return g_witness_qtimer_tcf1_seen_at_source;
+}
+
+uint32_t interrupt_hw_witness_qtimer_tcf1_seen_in_irq(void) {
+  return g_witness_qtimer_tcf1_seen_in_irq;
 }
 
 // ============================================================================
@@ -1403,11 +1592,21 @@ void process_interrupt_init_hardware(void) {
   g_ocxo2_lane.pcs = 3;
   g_ocxo2_lane.input_pin = OCXO2_PIN;
 
+  CCM_CCGR6 |= CCM_CCGR6_QTIMER2(CCM_CCGR_ON);
   CCM_CCGR6 |= CCM_CCGR6_QTIMER3(CCM_CCGR_ON);
+  *(portConfigRegister(WITNESS_QTIMER_PIN)) = 1;
   *(portConfigRegister(OCXO1_PIN)) = 1;
   *(portConfigRegister(OCXO2_PIN)) = 1;
+  IOMUXC_QTIMER2_TIMER0_SELECT_INPUT = 1;
   IOMUXC_QTIMER3_TIMER2_SELECT_INPUT = 1;
   IOMUXC_QTIMER3_TIMER3_SELECT_INPUT = 1;
+
+  IMXRT_TMR2.CH[0].CTRL = 0; IMXRT_TMR2.CH[0].SCTRL = 0;
+  IMXRT_TMR2.CH[0].CSCTRL = 0; IMXRT_TMR2.CH[0].LOAD = 0;
+  IMXRT_TMR2.CH[0].CNTR = 0; IMXRT_TMR2.CH[0].COMP1 = 0xFFFF;
+  IMXRT_TMR2.CH[0].CMPLD1 = 0xFFFF;
+  IMXRT_TMR2.CH[0].CTRL = TMR_CTRL_CM(1) | TMR_CTRL_PCS(1);
+  qtimer2_ch0_disable_compare();
 
   IMXRT_TMR3.CH[2].CTRL = 0; IMXRT_TMR3.CH[2].SCTRL = 0;
   IMXRT_TMR3.CH[2].CSCTRL = 0; IMXRT_TMR3.CH[2].LOAD = 0;
@@ -1422,6 +1621,12 @@ void process_interrupt_init_hardware(void) {
   IMXRT_TMR3.CH[3].CMPLD1 = 0xFFFF;
   IMXRT_TMR3.CH[3].CTRL = TMR_CTRL_CM(1) | TMR_CTRL_PCS(g_ocxo2_lane.pcs);
   qtimer3_disable_compare(3);
+
+  // Ensure the witness lane (CH1) is explicitly enabled alongside the
+  // OCXO lanes.  CH2/CH3 are already active in the running system; CH1
+  // is new and we want to remove any ambiguity about module-level ENBL
+  // gating while we shake out the hardware witness path.
+  IMXRT_TMR2.ENBL |= (uint16_t)((1u << 1) | (1u << 2) | (1u << 3));
 
   g_ocxo1_lane.initialized = true;
   g_ocxo2_lane.initialized = true;
@@ -1491,8 +1696,40 @@ void process_interrupt_init(void) {
   g_pps_edge_store = pps_edge_snapshot_store_t{};
   g_pps_edge_dispatch = nullptr;
 
-  interrupt_witness_reset_stats();
-  interrupt_witness_set_mode(interrupt_witness_mode_t::ON);
+  g_witness_square_high = false;
+  g_witness_source_dwt = 0;
+  g_witness_source_emits = 0;
+  g_witness_gpio_dwt = 0;
+  g_witness_gpio_delta_cycles = 0;
+  g_witness_gpio_hits = 0;
+  g_witness_qtimer_dwt = 0;
+  g_witness_qtimer_delta_cycles = 0;
+  g_witness_qtimer_hits = 0;
+  g_witness_qtimer_compare_target = 0;
+  g_witness_qtimer_cntr_snapshot = 0;
+  g_witness_qtimer_comp1_snapshot = 0;
+  g_witness_qtimer_csctrl_snapshot = 0;
+  g_witness_qtimer_ctrl_snapshot = 0;
+  g_witness_qtimer_enbl_snapshot = 0;
+  g_witness_qtimer_sctrl_snapshot = 0;
+  g_witness_qtimer_load_snapshot = 0;
+  g_witness_qtimer_cmpld1_snapshot = 0;
+  g_witness_qtimer_mux_snapshot = 0;
+  g_witness_qtimer_select_input_snapshot = 0;
+  g_witness_qtimer_prev_source_cntr = 0;
+  g_witness_qtimer_last_source_delta = 0;
+  g_witness_qtimer_source_reads = 0;
+  g_witness_qtimer_nonzero_cntr_observations = 0;
+  g_witness_qtimer_cntr_change_hits = 0;
+  g_witness_qtimer_tcf1_seen_at_source = 0;
+  g_witness_qtimer_tcf1_seen_in_irq = 0;
+
+  pinMode(WITNESS_SQUARE_OUT_PIN, OUTPUT);
+  digitalWriteFast(WITNESS_SQUARE_OUT_PIN, LOW);
+  pinMode(WITNESS_GPIO_IN_PIN, INPUT);
+  attachInterrupt(digitalPinToInterrupt(WITNESS_GPIO_IN_PIN), witness_gpio_isr, RISING);
+  g_witness_square_timer.begin(witness_square_timer_isr, 500000);
+  qtimer3_witness_arm_next();
 
   g_interrupt_runtime_ready = true;
 }
@@ -1503,6 +1740,10 @@ void process_interrupt_enable_irqs(void) {
   attachInterruptVector(IRQ_QTIMER1, qtimer1_isr);
   NVIC_SET_PRIORITY(IRQ_QTIMER1, 16);
   NVIC_ENABLE_IRQ(IRQ_QTIMER1);
+
+  attachInterruptVector(IRQ_QTIMER2, qtimer2_isr);
+  NVIC_SET_PRIORITY(IRQ_QTIMER2, 16);
+  NVIC_ENABLE_IRQ(IRQ_QTIMER2);
 
   attachInterruptVector(IRQ_QTIMER3, qtimer3_isr);
   NVIC_SET_PRIORITY(IRQ_QTIMER3, 16);
@@ -1592,13 +1833,43 @@ static Payload cmd_report(const Payload&) {
   p.add("witness_gpio_counter_delay_min_cycles",   ws.gpio_counter_delay_min_cycles);
   p.add("witness_gpio_counter_delay_max_cycles",   ws.gpio_counter_delay_max_cycles);
 
-  p.add("witness_floor_cycles", interrupt_witness_floor_cycles());
-  p.add("witness_floor_ns", interrupt_witness_floor_ns());
+  p.add("hw_witness_source_emits", g_witness_source_emits);
+  p.add("hw_witness_source_dwt", g_witness_source_dwt);
+  p.add("hw_witness_gpio_hits", g_witness_gpio_hits);
+  p.add("hw_witness_gpio_dwt", g_witness_gpio_dwt);
+  p.add("hw_witness_gpio_delta_cycles", g_witness_gpio_delta_cycles);
+  p.add("hw_witness_gpio_delta_ns", witness_cycles_to_ns((double)g_witness_gpio_delta_cycles));
+  p.add("hw_witness_qtimer_hits", g_witness_qtimer_hits);
+  p.add("hw_witness_qtimer_dwt", g_witness_qtimer_dwt);
+  p.add("hw_witness_qtimer_delta_cycles", g_witness_qtimer_delta_cycles);
+  p.add("hw_witness_qtimer_delta_ns", witness_cycles_to_ns((double)g_witness_qtimer_delta_cycles));
+  p.add("hw_witness_qtimer_cntr", (uint32_t)IMXRT_TMR2.CH[0].CNTR);
+  p.add("hw_witness_qtimer_comp1", (uint32_t)IMXRT_TMR2.CH[0].COMP1);
+  p.add("hw_witness_qtimer_csctrl", (uint32_t)IMXRT_TMR2.CH[0].CSCTRL);
+  p.add("hw_witness_qtimer_ctrl", (uint32_t)IMXRT_TMR2.CH[0].CTRL);
+  p.add("hw_witness_qtimer_enbl", (uint32_t)IMXRT_TMR2.ENBL);
+  p.add("hw_witness_qtimer_cntr_snapshot", (uint32_t)g_witness_qtimer_cntr_snapshot);
+  p.add("hw_witness_qtimer_comp1_snapshot", (uint32_t)g_witness_qtimer_comp1_snapshot);
+  p.add("hw_witness_qtimer_csctrl_snapshot", (uint32_t)g_witness_qtimer_csctrl_snapshot);
+  p.add("hw_witness_qtimer_ctrl_snapshot", (uint32_t)g_witness_qtimer_ctrl_snapshot);
+  p.add("hw_witness_qtimer_enbl_snapshot", (uint32_t)g_witness_qtimer_enbl_snapshot);
+  p.add("hw_witness_qtimer_sctrl_snapshot", (uint32_t)g_witness_qtimer_sctrl_snapshot);
+  p.add("hw_witness_qtimer_load_snapshot", (uint32_t)g_witness_qtimer_load_snapshot);
+  p.add("hw_witness_qtimer_cmpld1_snapshot", (uint32_t)g_witness_qtimer_cmpld1_snapshot);
+  p.add("hw_witness_qtimer_mux_snapshot", (uint32_t)g_witness_qtimer_mux_snapshot);
+  p.add("hw_witness_qtimer_select_input_snapshot", (uint32_t)g_witness_qtimer_select_input_snapshot);
+  p.add("hw_witness_qtimer_prev_source_cntr", (uint32_t)g_witness_qtimer_prev_source_cntr);
+  p.add("hw_witness_qtimer_last_source_delta", (uint32_t)g_witness_qtimer_last_source_delta);
+  p.add("hw_witness_qtimer_source_reads", g_witness_qtimer_source_reads);
+  p.add("hw_witness_qtimer_nonzero_cntr_observations", g_witness_qtimer_nonzero_cntr_observations);
+  p.add("hw_witness_qtimer_cntr_change_hits", g_witness_qtimer_cntr_change_hits);
+  p.add("hw_witness_qtimer_tcf1_seen_at_source", g_witness_qtimer_tcf1_seen_at_source);
+  p.add("hw_witness_qtimer_tcf1_seen_in_irq", g_witness_qtimer_tcf1_seen_in_irq);
 
   return p;
 }
 
-static Payload __attribute__((unused)) cmd_witness_start(const Payload&) {
+static Payload cmd_witness_start(const Payload&) {
   interrupt_witness_reset_stats();
   interrupt_witness_set_mode(interrupt_witness_mode_t::ON);
   Payload p;
@@ -1607,7 +1878,7 @@ static Payload __attribute__((unused)) cmd_witness_start(const Payload&) {
   return p;
 }
 
-static Payload __attribute__((unused)) cmd_witness_stop(const Payload&) {
+static Payload cmd_witness_stop(const Payload&) {
   interrupt_witness_set_mode(interrupt_witness_mode_t::OFF);
   // Alpha's next PPS edge will rebootstrap naturally — but request it
   // now to make sure cadence resumes on the very next edge rather than
@@ -1772,6 +2043,38 @@ static Payload cmd_witness_dump(const Payload&) {
   p.add("witness_anomaly_buffer_size",      (uint32_t)WITNESS_ANOMALY_BUFFER_SIZE);
   p.add("witness_anomaly_count_total",      g_witness_anomaly_count_total);
   p.add("witness_anomaly_count_captured",   (uint32_t)anomaly_count_captured);
+  p.add("hw_witness_source_emits", g_witness_source_emits);
+  p.add("hw_witness_source_dwt", g_witness_source_dwt);
+  p.add("hw_witness_gpio_hits", g_witness_gpio_hits);
+  p.add("hw_witness_gpio_dwt", g_witness_gpio_dwt);
+  p.add("hw_witness_gpio_delta_cycles", g_witness_gpio_delta_cycles);
+  p.add("hw_witness_gpio_delta_ns", witness_cycles_to_ns((double)g_witness_gpio_delta_cycles));
+  p.add("hw_witness_qtimer_hits", g_witness_qtimer_hits);
+  p.add("hw_witness_qtimer_dwt", g_witness_qtimer_dwt);
+  p.add("hw_witness_qtimer_delta_cycles", g_witness_qtimer_delta_cycles);
+  p.add("hw_witness_qtimer_delta_ns", witness_cycles_to_ns((double)g_witness_qtimer_delta_cycles));
+  p.add("hw_witness_qtimer_cntr", (uint32_t)IMXRT_TMR2.CH[0].CNTR);
+  p.add("hw_witness_qtimer_comp1", (uint32_t)IMXRT_TMR2.CH[0].COMP1);
+  p.add("hw_witness_qtimer_csctrl", (uint32_t)IMXRT_TMR2.CH[0].CSCTRL);
+  p.add("hw_witness_qtimer_ctrl", (uint32_t)IMXRT_TMR2.CH[0].CTRL);
+  p.add("hw_witness_qtimer_enbl", (uint32_t)IMXRT_TMR2.ENBL);
+  p.add("hw_witness_qtimer_cntr_snapshot", (uint32_t)g_witness_qtimer_cntr_snapshot);
+  p.add("hw_witness_qtimer_comp1_snapshot", (uint32_t)g_witness_qtimer_comp1_snapshot);
+  p.add("hw_witness_qtimer_csctrl_snapshot", (uint32_t)g_witness_qtimer_csctrl_snapshot);
+  p.add("hw_witness_qtimer_ctrl_snapshot", (uint32_t)g_witness_qtimer_ctrl_snapshot);
+  p.add("hw_witness_qtimer_enbl_snapshot", (uint32_t)g_witness_qtimer_enbl_snapshot);
+  p.add("hw_witness_qtimer_sctrl_snapshot", (uint32_t)g_witness_qtimer_sctrl_snapshot);
+  p.add("hw_witness_qtimer_load_snapshot", (uint32_t)g_witness_qtimer_load_snapshot);
+  p.add("hw_witness_qtimer_cmpld1_snapshot", (uint32_t)g_witness_qtimer_cmpld1_snapshot);
+  p.add("hw_witness_qtimer_mux_snapshot", (uint32_t)g_witness_qtimer_mux_snapshot);
+  p.add("hw_witness_qtimer_select_input_snapshot", (uint32_t)g_witness_qtimer_select_input_snapshot);
+  p.add("hw_witness_qtimer_prev_source_cntr", (uint32_t)g_witness_qtimer_prev_source_cntr);
+  p.add("hw_witness_qtimer_last_source_delta", (uint32_t)g_witness_qtimer_last_source_delta);
+  p.add("hw_witness_qtimer_source_reads", g_witness_qtimer_source_reads);
+  p.add("hw_witness_qtimer_nonzero_cntr_observations", g_witness_qtimer_nonzero_cntr_observations);
+  p.add("hw_witness_qtimer_cntr_change_hits", g_witness_qtimer_cntr_change_hits);
+  p.add("hw_witness_qtimer_tcf1_seen_at_source", g_witness_qtimer_tcf1_seen_at_source);
+  p.add("hw_witness_qtimer_tcf1_seen_in_irq", g_witness_qtimer_tcf1_seen_in_irq);
   p.add_array("witness_captures",   captures_arr);
   p.add_array("witness_anomalies",  anomalies_arr);
   return p;
@@ -1779,6 +2082,8 @@ static Payload cmd_witness_dump(const Payload&) {
 
 static const process_command_entry_t INTERRUPT_COMMANDS[] = {
   { "REPORT",        cmd_report         },
+  { "WITNESS_START", cmd_witness_start  },
+  { "WITNESS_STOP",  cmd_witness_stop   },
   { "WITNESS_RESET", cmd_witness_reset  },
   { "WITNESS_DUMP",  cmd_witness_dump   },
   { nullptr,         nullptr            }
