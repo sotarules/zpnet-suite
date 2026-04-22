@@ -230,6 +230,90 @@ static constexpr uint32_t TICKS_PER_SECOND_EVENT = 1000U;
 // ============================================================================
 // Latency constants
 // ============================================================================
+//
+// These constants come from the dedicated hardware witness experiments in
+// process_interrupt's WITNESS_LATENCY mode.  They are expressed in DWT cycles
+// at 1.008 GHz and represent our current best empirical floor estimates for
+// the path from a real electrical event to ISR entry.
+//
+// IMPORTANT DISTINCTIONS
+//
+// 1. WITNESS_STIMULATE_LATENCY
+//    This is the measured source-side cost of stimulating the witness signal:
+//    the DWT cycles between the pre-write timestamp and the completion of the
+//    digitalWriteFast(HIGH) action used to create the witness edge.
+//
+//    In other words, this is the cost of "causing" the witness edge in
+//    software.  It is small (~5 cycles) and is INCLUDED in the total witness
+//    latency measurements below.
+//
+// 2. GPIO_TOTAL_LATENCY
+//    This is the measured total latency from the witness source timestamp
+//    (taken immediately before digitalWriteFast(HIGH)) to entry into the GPIO
+//    interrupt handler on the receiving pin.
+//
+//    Because the source timestamp is taken BEFORE the witness pin is driven
+//    high, this total includes both:
+//      • WITNESS_STIMULATE_LATENCY
+//      • the sink-side GPIO path latency
+//
+//    Therefore, GPIO_TOTAL_LATENCY is a source-to-ISR-entry constant, not a
+//    pure electrical-edge-to-ISR-entry constant.  To approximate the latter,
+//    subtract WITNESS_STIMULATE_LATENCY.
+//
+// 3. QTIMER_TOTAL_LATENCY
+//    This is the measured total latency from the witness source timestamp
+//    (again taken immediately before digitalWriteFast(HIGH)) to entry into the
+//    QTimer compare ISR when that incoming witness edge is counted by the
+//    timer hardware and matures into an interrupt.
+//
+//    Like GPIO_TOTAL_LATENCY, this includes the source-side stimulate cost.
+//    Therefore, it is also a source-to-ISR-entry constant, not a pure
+//    electrical-edge-to-ISR-entry constant.  To approximate the latter,
+//    subtract WITNESS_STIMULATE_LATENCY.
+//
+// CURRENT INTERPRETATION
+//
+//   GPIO sink-only floor   ≈ GPIO_TOTAL_LATENCY   - WITNESS_STIMULATE_LATENCY
+//   QTIMER sink-only floor ≈ QTIMER_TOTAL_LATENCY - WITNESS_STIMULATE_LATENCY
+//
+// With current measurements this means roughly:
+//   GPIO sink-only floor   ≈ 72 - 5 = 67 cycles
+//   QTIMER sink-only floor ≈ 53 - 5 = 48 cycles
+//
+// DEPRECATED CONSTANTS
+//
+// PPS_ISR_ENTRY_OVERHEAD and QTIMER_ISR_ENTRY_OVERHEAD are older,
+// partial-model constants from the earlier TDC-correction era.  They were
+// useful when we did not yet have full hardware witness measurements, but
+// they no longer represent the best end-to-end empirical latency model.
+//
+// They remain here temporarily for compatibility and code migration only.
+// New "at edge" timing work should prefer GPIO_TOTAL_LATENCY and
+// QTIMER_TOTAL_LATENCY (optionally adjusted by WITNESS_STIMULATE_LATENCY when
+// the intent is to estimate the actual electrical edge at the Teensy pin).
+//
+// NOTES ON USAGE
+//
+// • PPS / GPIO-origin events:
+//     Use GPIO_TOTAL_LATENCY when translating raw DWT ISR-entry timestamps
+//     into best-guess "DWT at electrical edge" timestamps.
+//
+// • QTimer-origin compare events (VCLOCK / OCXO compare paths):
+//     Use QTIMER_TOTAL_LATENCY when translating raw DWT ISR-entry timestamps
+//     into best-guess "DWT at electrical edge" timestamps.
+//
+// • Counter identity is a separate issue:
+//     Correcting DWT-at-edge is not the same thing as correcting the timer
+//     counter value read later in the ISR.  A counter read performed after ISR
+//     entry is already late by at least the sink-side latency and then by
+//     whatever additional cycles the read itself costs.
+//
+// These numbers are empirical and may need to be re-measured if the ISR entry
+// path, pin routing, optimization level, or witness logic changes.
+// ============================================================================
+
+static constexpr uint32_t WITNESS_STIMULATE_LATENCY = 5;
 
 static constexpr uint32_t GPIO_TOTAL_LATENCY = 72;
 static constexpr uint32_t QTIMER_TOTAL_LATENCY = 53;
