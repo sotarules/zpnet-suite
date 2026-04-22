@@ -188,6 +188,9 @@ static ocxo_lane_t g_ocxo2_lane;
 static volatile bool     g_witness_square_high = false;
 static volatile uint32_t g_witness_source_dwt = 0;
 static volatile uint32_t g_witness_source_emits = 0;
+static volatile uint32_t g_witness_source_dwt_before = 0;
+static volatile uint32_t g_witness_source_dwt_after = 0;
+static volatile uint32_t g_witness_source_stimulate_cycles = 0;
 static volatile uint32_t g_witness_gpio_dwt = 0;
 static volatile uint32_t g_witness_gpio_delta_cycles = 0;
 static volatile uint32_t g_witness_gpio_hits = 0;
@@ -215,6 +218,7 @@ static volatile uint32_t g_witness_qtimer_tcf1_seen_in_irq = 0;
 
 static witness_welford_t g_hw_witness_gpio_welford = {};
 static witness_welford_t g_hw_witness_qtimer_welford = {};
+static witness_welford_t g_hw_witness_source_stimulate_welford = {};
 
 static uint32_t g_hw_witness_gpio_last_reported_hits = 0;
 static uint32_t g_hw_witness_qtimer_last_reported_hits = 0;
@@ -397,12 +401,19 @@ static void hw_witness_snapshot_qtimer_source_state(void) {
 
 static void hw_witness_drive_high(void) {
   // ── Critical latency-measurement window ──
-  const uint32_t dwt_raw = ARM_DWT_CYCCNT;
+  const uint32_t dwt_before = ARM_DWT_CYCCNT;
   digitalWriteFast(WITNESS_SQUARE_OUT_PIN, HIGH);
-  g_witness_source_dwt = dwt_raw;
+  const uint32_t dwt_after = ARM_DWT_CYCCNT;
+
+  g_witness_source_dwt_before = dwt_before;
+  g_witness_source_dwt_after = dwt_after;
+  g_witness_source_stimulate_cycles = dwt_after - dwt_before;
+  g_witness_source_dwt = dwt_before;
 
   g_witness_square_high = true;
   g_witness_source_emits++;
+  witness_welford_update(g_hw_witness_source_stimulate_welford,
+                         (int32_t)g_witness_source_stimulate_cycles);
 
   if (hw_witness_qtimer_enabled()) {
     hw_witness_snapshot_qtimer_source_state();
@@ -1820,6 +1831,9 @@ void process_interrupt_init(void) {
   g_witness_square_high = false;
   g_witness_source_dwt = 0;
   g_witness_source_emits = 0;
+  g_witness_source_dwt_before = 0;
+  g_witness_source_dwt_after = 0;
+  g_witness_source_stimulate_cycles = 0;
   g_witness_gpio_dwt = 0;
   g_witness_gpio_delta_cycles = 0;
   g_witness_gpio_hits = 0;
@@ -1846,6 +1860,7 @@ void process_interrupt_init(void) {
   g_witness_qtimer_tcf1_seen_in_irq = 0;
   witness_welford_reset(g_hw_witness_gpio_welford);
   witness_welford_reset(g_hw_witness_qtimer_welford);
+  witness_welford_reset(g_hw_witness_source_stimulate_welford);
   g_hw_witness_gpio_last_reported_hits = 0;
   g_hw_witness_qtimer_last_reported_hits = 0;
   g_hw_witness_mode = hw_witness_mode_t::BOTH;
@@ -1991,6 +2006,46 @@ static Payload cmd_witness_latency(const Payload&) {
   p.add("hw_witness_qtimer_enabled", hw_witness_qtimer_enabled());
   p.add("hw_witness_source_emits", g_witness_source_emits);
   p.add("hw_witness_source_dwt", g_witness_source_dwt);
+  p.add("hw_witness_source_dwt_before", g_witness_source_dwt_before);
+  p.add("hw_witness_source_dwt_after", g_witness_source_dwt_after);
+  p.add("hw_witness_source_stimulate_cycles", g_witness_source_stimulate_cycles);
+  p.add("hw_witness_source_stimulate_ns",
+        witness_cycles_to_ns((double)g_witness_source_stimulate_cycles));
+
+  const double source_stimulate_stddev_cycles =
+      witness_welford_stddev(g_hw_witness_source_stimulate_welford);
+
+  p.add("hw_witness_source_stimulate_n",
+        (uint32_t)g_hw_witness_source_stimulate_welford.n);
+  p.add("hw_witness_source_stimulate_mean_cycles",
+        g_hw_witness_source_stimulate_welford.mean);
+  p.add("hw_witness_source_stimulate_stddev_cycles",
+        source_stimulate_stddev_cycles);
+  p.add("hw_witness_source_stimulate_stderr_cycles",
+        (g_hw_witness_source_stimulate_welford.n >= 2)
+            ? (source_stimulate_stddev_cycles /
+               sqrt((double)g_hw_witness_source_stimulate_welford.n))
+            : 0.0);
+  p.add("hw_witness_source_stimulate_min_cycles",
+        g_hw_witness_source_stimulate_welford.min_val);
+  p.add("hw_witness_source_stimulate_max_cycles",
+        g_hw_witness_source_stimulate_welford.max_val);
+  p.add("hw_witness_source_stimulate_mean_ns",
+        witness_cycles_to_ns(g_hw_witness_source_stimulate_welford.mean));
+  p.add("hw_witness_source_stimulate_stddev_ns",
+        witness_cycles_to_ns(source_stimulate_stddev_cycles));
+  p.add("hw_witness_source_stimulate_stderr_ns",
+        (g_hw_witness_source_stimulate_welford.n >= 2)
+            ? witness_cycles_to_ns(
+                  source_stimulate_stddev_cycles /
+                  sqrt((double)g_hw_witness_source_stimulate_welford.n))
+            : 0.0);
+  p.add("hw_witness_source_stimulate_min_ns",
+        witness_cycles_to_ns(
+            (double)g_hw_witness_source_stimulate_welford.min_val));
+  p.add("hw_witness_source_stimulate_max_ns",
+        witness_cycles_to_ns(
+            (double)g_hw_witness_source_stimulate_welford.max_val));
 
   p.add("hw_witness_gpio_hits", gpio_hits);
   p.add("hw_witness_gpio_last_reported_hits", g_hw_witness_gpio_last_reported_hits);
@@ -2120,6 +2175,7 @@ static Payload cmd_witness_start(const Payload&) {
   interrupt_witness_reset_stats();
   witness_welford_reset(g_hw_witness_gpio_welford);
   witness_welford_reset(g_hw_witness_qtimer_welford);
+  witness_welford_reset(g_hw_witness_source_stimulate_welford);
   g_hw_witness_gpio_last_reported_hits = 0;
   g_hw_witness_qtimer_last_reported_hits = 0;
   hw_witness_apply_mode();
@@ -2149,6 +2205,7 @@ static Payload cmd_witness_reset(const Payload&) {
   interrupt_witness_reset_stats();
   witness_welford_reset(g_hw_witness_gpio_welford);
   witness_welford_reset(g_hw_witness_qtimer_welford);
+  witness_welford_reset(g_hw_witness_source_stimulate_welford);
   g_hw_witness_gpio_last_reported_hits = 0;
   g_hw_witness_qtimer_last_reported_hits = 0;
   hw_witness_apply_mode();
