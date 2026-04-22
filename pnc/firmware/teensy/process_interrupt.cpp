@@ -314,6 +314,15 @@ uint16_t interrupt_qtimer3_ch3_counter_now(void) { return IMXRT_TMR3.CH[3].CNTR;
 
 static inline void witness_welford_update(witness_welford_t& w, int32_t sample);
 
+static inline uint32_t dwt_at_gpio_edge(uint32_t dwt_isr_entry_raw) {
+  return dwt_isr_entry_raw - (GPIO_TOTAL_LATENCY - WITNESS_STIMULATE_LATENCY);
+}
+
+static inline uint32_t dwt_at_qtimer_edge(uint32_t dwt_isr_entry_raw) {
+  return dwt_isr_entry_raw - (QTIMER_TOTAL_LATENCY - WITNESS_STIMULATE_LATENCY);
+}
+
+
 // ============================================================================
 // Compare channel helpers
 // ============================================================================
@@ -628,6 +637,7 @@ static void vclock_lane_advance_compare(void) {
 }
 
 static void vclock_cadence_isr(uint32_t dwt_raw) {
+  const uint32_t dwt_at_edge = dwt_at_qtimer_edge(dwt_raw);
   g_vclock_lane.irq_count++;
   if (g_rt_vclock) g_rt_vclock->irq_count++;
 
@@ -668,16 +678,15 @@ static void vclock_cadence_isr(uint32_t dwt_raw) {
       const pps_edge_snapshot_t snap = interrupt_last_pps_edge();
       if (snap.sequence > 0) {
         const int32_t cycles_since_pps =
-            (int32_t)(dwt_raw - snap.dwt_at_edge);
-        if (cycles_since_pps >= 0 &&
-            cycles_since_pps < DWT_PPS_COINCIDENCE_THRESHOLD_CYCLES) {
-          coincidence_cycles = (uint32_t)cycles_since_pps;
+            (int32_t)(dwt_at_edge - snap.dwt_at_edge);
+        if (llabs((long long)cycles_since_pps) < DWT_PPS_COINCIDENCE_THRESHOLD_CYCLES) {
+          coincidence_cycles = (uint32_t)(cycles_since_pps >= 0 ? cycles_since_pps : -cycles_since_pps);
           coincidence_valid  = true;
         }
       }
     }
 
-    emit_one_second_event(*g_rt_vclock, dwt_raw,
+    emit_one_second_event(*g_rt_vclock, dwt_at_edge,
                           g_vclock_lane.logical_count32_at_last_second,
                           coincidence_cycles,
                           coincidence_valid);
@@ -705,6 +714,7 @@ static void ocxo_lane_advance_compare(ocxo_lane_t& lane) {
 static void handle_ocxo_qtimer16_irq(ocxo_lane_t& lane,
                                      interrupt_subscriber_runtime_t& rt,
                                      uint32_t dwt_raw) {
+  const uint32_t dwt_at_edge = dwt_at_qtimer_edge(dwt_raw);
   lane.irq_count++;
   rt.irq_count++;
 
@@ -727,7 +737,7 @@ static void handle_ocxo_qtimer16_irq(ocxo_lane_t& lane,
   if (++lane.tick_mod_1000 >= TICKS_PER_SECOND_EVENT) {
     lane.tick_mod_1000 = 0;
     lane.logical_count32_at_last_second += OCXO_COUNTS_PER_SECOND;
-    emit_one_second_event(rt, dwt_raw, lane.logical_count32_at_last_second);
+    emit_one_second_event(rt, dwt_at_edge, lane.logical_count32_at_last_second);
   }
 }
 
@@ -1355,15 +1365,16 @@ static void qtimer1_isr(void) {
 
     if (g_qtimer1_ch2_handler) {
       const uint32_t counter32 = qtimer1_read_32_for_diag();
-      const int64_t gnss_ns = time_dwt_to_gnss_ns(dwt_raw);
+      const uint32_t dwt_at_edge = dwt_at_qtimer_edge(dwt_raw);
+      const int64_t gnss_ns_at_edge = time_dwt_to_gnss_ns(dwt_at_edge);
 
       interrupt_event_t event{};
       event.kind     = interrupt_subscriber_kind_t::TIMEPOP;
       event.provider = interrupt_provider_kind_t::QTIMER1;
       event.lane     = interrupt_lane_t::QTIMER1_CH2_COMP;
       event.status   = interrupt_event_status_t::OK;
-      event.dwt_at_event       = dwt_raw;
-      event.gnss_ns_at_event   = (gnss_ns >= 0) ? (uint64_t)gnss_ns : 0;
+      event.dwt_at_event       = dwt_at_edge;
+      event.gnss_ns_at_event   = (gnss_ns_at_edge >= 0) ? (uint64_t)gnss_ns_at_edge : 0;
       event.counter32_at_event = counter32;
 
       interrupt_capture_diag_t diag{};
@@ -1371,7 +1382,7 @@ static void qtimer1_isr(void) {
       diag.provider = interrupt_provider_kind_t::QTIMER1;
       diag.lane     = interrupt_lane_t::QTIMER1_CH2_COMP;
       diag.kind     = interrupt_subscriber_kind_t::TIMEPOP;
-      diag.dwt_at_event       = dwt_raw;
+      diag.dwt_at_event       = dwt_at_edge;
       diag.gnss_ns_at_event   = event.gnss_ns_at_event;
       diag.counter32_at_event = counter32;
 
@@ -1416,6 +1427,8 @@ static void pps_edge_dispatch_trampoline(timepop_ctx_t*, timepop_diag_t*, void*)
 }
 
 void process_interrupt_gpio6789_irq(uint32_t dwt_isr_entry_raw) {
+  const uint32_t dwt_at_edge = dwt_at_gpio_edge(dwt_isr_entry_raw);
+
   // ── First-instruction captures ──
   //
   // Read the VCLOCK counter state IMMEDIATELY after the DWT capture.
@@ -1440,9 +1453,9 @@ void process_interrupt_gpio6789_irq(uint32_t dwt_isr_entry_raw) {
 
   g_gpio_irq_count++;
   g_pps_gpio_witness.edge_count++;
-  g_pps_gpio_witness.last_dwt = dwt_isr_entry_raw;
+  g_pps_gpio_witness.last_dwt = dwt_at_edge;
 
-  const int64_t gnss_ns = time_dwt_to_gnss_ns(dwt_isr_entry_raw);
+  const int64_t gnss_ns = time_dwt_to_gnss_ns(dwt_at_edge);
   g_pps_gpio_witness.last_gnss_ns = gnss_ns;
 
   // ── PPS-anchored VCLOCK rebootstrap ──
@@ -1505,7 +1518,7 @@ void process_interrupt_gpio6789_irq(uint32_t dwt_isr_entry_raw) {
   g_pps_edge_store.seq++;
   dmb_barrier();
   g_pps_edge_store.sequence          = g_pps_gpio_witness.edge_count;
-  g_pps_edge_store.dwt_at_edge       = dwt_isr_entry_raw;
+  g_pps_edge_store.dwt_at_edge       = dwt_at_edge;
   g_pps_edge_store.counter32_at_edge = counter32;
   g_pps_edge_store.ch3_at_edge       = ch3_now;
   g_pps_edge_store.gnss_ns_at_edge   = gnss_ns;

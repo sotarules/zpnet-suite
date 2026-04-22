@@ -330,7 +330,7 @@ static constexpr int32_t DWT_PPS_COINCIDENCE_THRESHOLD_CYCLES = 10000;
 // 1-2 cycles across hundreds of fires.  Tunable constant: if live
 // measurements show residuals shifting by more than expected after a
 // code change, adjust this value (plausible range: -2 to 0).
-static constexpr int32_t VCLOCK_EPOCH_TICK_OFFSET = -1;
+static constexpr int32_t VCLOCK_EPOCH_TICK_OFFSET = -2;
 
 // ============================================================================
 // Physical PPS edge snapshot — captured in the GPIO ISR
