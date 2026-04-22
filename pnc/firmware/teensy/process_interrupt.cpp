@@ -81,6 +81,136 @@ static constexpr const char* HW_WITNESS_LOW_NAME  = "HW_WITNESS_LOW";
 
 
 // ============================================================================
+// DWT cycles-per-second dynamic refinement
+// ============================================================================
+//
+// A 1 kHz TimePop recurring series observes ARM_DWT_CYCCNT at each tick
+// and refines an estimate of DWT cycles per GNSS second by absorbing
+// the delta between actual and predicted DWT at that GNSS moment.
+//
+// Bookends are the pure-gears, ISR-grade anchors:
+//   • anchor_dwt      : priority-0 DWT at the most recent PPS GPIO edge
+//   • anchor_gnss_ns  : GNSS ns at that same PPS edge
+//   • g_dynamic_cps   : the refinable "cycles per GNSS second" estimate
+//
+// At each 1 kHz fire, ctx->fire_gnss_ns tells us where we are in GNSS
+// time relative to the anchor.  We compute what DWT we would predict at
+// that GNSS moment using g_dynamic_cps, compare to actual DWT, and fold
+// the delta into g_dynamic_cps.  Permanently (within this second).
+//
+// Each fire asks one question: "is the prediction still good?"  If a
+// prior fire already corrected it, this fire's delta will be small; if
+// thermal drift introduces new error, this fire catches it.  Self-
+// correcting per tick.
+//
+// At each PPS edge, g_dynamic_cps is reseeded by computing the real
+// DWT cycles that elapsed during the just-completed PPS-to-PPS
+// interval: snap.dwt_at_edge[N] - snap.dwt_at_edge[N-1].  Both values
+// are priority-0 first-instruction captures, so this is the honest
+// two-bookend ground-truth measurement of that second.  We compute it
+// locally from consecutive snapshot observations — no dependency on
+// alpha's g_dwt_cycle_count_between_pps, no race with alpha's
+// foreground callback.
+//
+// Clients #include process_interrupt.h and call interrupt_dynamic_cps().
+
+static volatile uint32_t g_dynamic_cps                  = DWT_EXPECTED_PER_PPS;
+static volatile uint32_t g_dynamic_cps_pps_sequence     = 0;
+static volatile uint32_t g_dynamic_cps_last_dwt_at_edge = 0;
+
+// ── Per-tick instrumentation ──
+//
+// Captures every intermediate value from the most recent tick of
+// dynamic_cps_tick.  Exposed via interrupt_dynamic_cps_last_tick() so
+// the witness can snapshot it at slot fire time, revealing exactly
+// what arithmetic the last tick performed.  Non-volatile because it
+// is written only by the tick and read only by the witness ISR —
+// both on the same core with visible write ordering; any torn read
+// would show up as a mismatch against the other fields (e.g. a
+// delta that doesn't match predicted_dwt - dwt_at_fire).
+
+struct dynamic_cps_tick_state_t {
+  uint32_t tick_count;
+  uint32_t dwt_at_fire;
+  uint32_t snap_sequence;
+  uint32_t snap_dwt_at_edge;
+  int64_t  snap_gnss_ns_at_edge;
+  int64_t  ctx_fire_gnss_ns;
+  int64_t  gnss_offset_ns;
+  uint32_t cps_before;
+  uint32_t predicted_dwt;
+  int32_t  delta;
+  uint32_t cps_after;
+  bool     reseed_fired;     // did the PPS-boundary reseed run?
+  bool     reseed_computed;  // did we actually compute a new seed (not first edge)?
+};
+
+static dynamic_cps_tick_state_t g_dynamic_cps_last_tick = {};
+
+static void dynamic_cps_tick(timepop_ctx_t* ctx, timepop_diag_t*, void*) {
+  // Use TimePop's ISR-entry DWT capture — the moment that matches
+  // ctx->fire_gnss_ns and ctx->fire_vclock_raw.  Capturing DWT here
+  // in scheduled-context would land tens of microseconds later, biasing
+  // the refinement by that dispatch latency.
+  const uint32_t dwt_at_fire = ctx->fire_dwt_cyccnt;
+
+  const pps_edge_snapshot_t snap = interrupt_last_pps_edge();
+
+  bool reseed_fired    = false;
+  bool reseed_computed = false;
+
+  // PPS edge boundary: reseed g_dynamic_cps from our own two-bookend
+  // measurement of the just-completed second.  On the very first PPS
+  // edge we observe we don't have a prior dwt_at_edge, so we only
+  // stash it and leave g_dynamic_cps at its prior value.
+  if (snap.sequence != g_dynamic_cps_pps_sequence) {
+    reseed_fired = true;
+    if (g_dynamic_cps_pps_sequence != 0) {
+      g_dynamic_cps = snap.dwt_at_edge - g_dynamic_cps_last_dwt_at_edge;
+      reseed_computed = true;
+    }
+    g_dynamic_cps_last_dwt_at_edge = snap.dwt_at_edge;
+    g_dynamic_cps_pps_sequence     = snap.sequence;
+  }
+
+  const uint32_t cps_before    = g_dynamic_cps;
+  const int64_t gnss_offset_ns = ctx->fire_gnss_ns - snap.gnss_ns_at_edge;
+
+  const uint32_t predicted_dwt =
+      snap.dwt_at_edge +
+      (uint32_t)((uint64_t)g_dynamic_cps *
+                 (uint64_t)gnss_offset_ns /
+                 1000000000ULL);
+
+  const int32_t delta = (int32_t)(dwt_at_fire - predicted_dwt);
+  g_dynamic_cps = (uint32_t)((int32_t)g_dynamic_cps + delta);
+
+  // Publish last-tick state for the witness to snapshot.
+  g_dynamic_cps_last_tick.tick_count++;
+  g_dynamic_cps_last_tick.dwt_at_fire          = dwt_at_fire;
+  g_dynamic_cps_last_tick.snap_sequence        = snap.sequence;
+  g_dynamic_cps_last_tick.snap_dwt_at_edge     = snap.dwt_at_edge;
+  g_dynamic_cps_last_tick.snap_gnss_ns_at_edge = snap.gnss_ns_at_edge;
+  g_dynamic_cps_last_tick.ctx_fire_gnss_ns     = ctx->fire_gnss_ns;
+  g_dynamic_cps_last_tick.gnss_offset_ns       = gnss_offset_ns;
+  g_dynamic_cps_last_tick.cps_before           = cps_before;
+  g_dynamic_cps_last_tick.predicted_dwt        = predicted_dwt;
+  g_dynamic_cps_last_tick.delta                = delta;
+  g_dynamic_cps_last_tick.cps_after            = g_dynamic_cps;
+  g_dynamic_cps_last_tick.reseed_fired         = reseed_fired;
+  g_dynamic_cps_last_tick.reseed_computed      = reseed_computed;
+}
+
+uint32_t interrupt_dynamic_cps(void) {
+  return g_dynamic_cps;
+}
+
+dynamic_cps_tick_state_t interrupt_dynamic_cps_last_tick(void) {
+  return g_dynamic_cps_last_tick;
+}
+
+
+// ============================================================================
 // Subscriber runtime
 // ============================================================================
 
@@ -897,6 +1027,30 @@ struct witness_capture_t {
   int32_t  vclock_delta;        // counter32_at_fire - target_vclock
   int32_t  residual_cycles;     // dwt_at_fire - target_dwt
   int32_t  lag_ticks;           // (counter32 & 0xFFFF) - ch3_cntr
+
+  // Dynamic cps observed at this fire.  Captured for comparison against
+  // anchor_dwt_cps (the stale, PPS-anchored value currently used for
+  // prediction).  Does not affect residual_cycles — this is diagnostic
+  // for reasoning about whether the dynamic value would collapse the
+  // per-slot walk if fed into the prediction path.
+  uint32_t dynamic_cps_used;
+
+  // Last tick of dynamic_cps_tick that ran before this witness fire.
+  // Complete per-tick state so we can reason about exactly what the
+  // refinement math was doing.
+  uint32_t dc_tick_count;
+  uint32_t dc_dwt_at_fire;
+  uint32_t dc_snap_sequence;
+  uint32_t dc_snap_dwt_at_edge;
+  int64_t  dc_snap_gnss_ns_at_edge;
+  int64_t  dc_ctx_fire_gnss_ns;
+  int64_t  dc_gnss_offset_ns;
+  uint32_t dc_cps_before;
+  uint32_t dc_predicted_dwt;
+  int32_t  dc_delta;
+  uint32_t dc_cps_after;
+  bool     dc_reseed_fired;
+  bool     dc_reseed_computed;
 };
 
 // The capture array has WITNESS_N_SLOTS + 1 entries, indexed 0..N.
@@ -1179,6 +1333,25 @@ static void witness_ch3_isr(uint32_t dwt_raw) {
     cap.vclock_delta       = vclock_delta;
     cap.residual_cycles    = residual_cycles;
     cap.lag_ticks          = lag_ticks;
+    cap.dynamic_cps_used   = interrupt_dynamic_cps();
+
+    // Snapshot the last tick of the dynamic cps refinement so the
+    // dump can show exactly what arithmetic the most recent tick
+    // performed.
+    const dynamic_cps_tick_state_t dc = interrupt_dynamic_cps_last_tick();
+    cap.dc_tick_count           = dc.tick_count;
+    cap.dc_dwt_at_fire          = dc.dwt_at_fire;
+    cap.dc_snap_sequence        = dc.snap_sequence;
+    cap.dc_snap_dwt_at_edge     = dc.snap_dwt_at_edge;
+    cap.dc_snap_gnss_ns_at_edge = dc.snap_gnss_ns_at_edge;
+    cap.dc_ctx_fire_gnss_ns     = dc.ctx_fire_gnss_ns;
+    cap.dc_gnss_offset_ns       = dc.gnss_offset_ns;
+    cap.dc_cps_before           = dc.cps_before;
+    cap.dc_predicted_dwt        = dc.predicted_dwt;
+    cap.dc_delta                = dc.delta;
+    cap.dc_cps_after            = dc.cps_after;
+    cap.dc_reseed_fired         = dc.reseed_fired;
+    cap.dc_reseed_computed      = dc.reseed_computed;
 
     // Sticky capture of anomalies.  Slot 0 is excluded — its residual
     // is expected to be large and preemption-dominated, so flagging it
@@ -1885,6 +2058,13 @@ void process_interrupt_init(void) {
   interrupt_witness_reset_stats();
   interrupt_witness_set_mode(interrupt_witness_mode_t::ON);
 
+  // Arm the 1 kHz dynamic cps refinement.  No explicit init — g_dynamic_cps
+  // starts at DWT_EXPECTED_PER_PPS and is reseeded from ground truth on
+  // the first PPS edge the tick callback observes.  Phase at arm time is
+  // whatever it happens to be; the algorithm self-corrects regardless.
+  timepop_arm(NS_PER_MILLISECOND, /*recurring=*/true,
+              dynamic_cps_tick, nullptr, "dynamic-cps");
+
   g_interrupt_runtime_ready = true;
 }
 
@@ -2311,6 +2491,30 @@ static void witness_capture_to_payload(const witness_capture_t& cap,
   entry.add("vclock_delta",     cap.vclock_delta);
   entry.add("residual_cycles",  cap.residual_cycles);
   entry.add("lag_ticks",        cap.lag_ticks);
+
+  // Dynamic cps at this fire, from the 1 kHz refinement in
+  // process_interrupt.  Compare against anchor_dwt_cps to reason about
+  // whether switching the prediction to this source would collapse the
+  // per-slot residual walk.
+  entry.add("dynamic_cps_used", cap.dynamic_cps_used);
+
+  // Last-tick instrumentation of the dynamic cps refinement.  Every
+  // intermediate value from the most recent tick of dynamic_cps_tick
+  // that ran before this witness slot fire.  Use these to reconstruct
+  // the arithmetic and pinpoint any step that misbehaves.
+  entry.add("dc_tick_count",           cap.dc_tick_count);
+  entry.add("dc_dwt_at_fire",          cap.dc_dwt_at_fire);
+  entry.add("dc_snap_sequence",        cap.dc_snap_sequence);
+  entry.add("dc_snap_dwt_at_edge",     cap.dc_snap_dwt_at_edge);
+  entry.add("dc_snap_gnss_ns_at_edge", cap.dc_snap_gnss_ns_at_edge);
+  entry.add("dc_ctx_fire_gnss_ns",     cap.dc_ctx_fire_gnss_ns);
+  entry.add("dc_gnss_offset_ns",       cap.dc_gnss_offset_ns);
+  entry.add("dc_cps_before",           cap.dc_cps_before);
+  entry.add("dc_predicted_dwt",        cap.dc_predicted_dwt);
+  entry.add("dc_delta",                cap.dc_delta);
+  entry.add("dc_cps_after",            cap.dc_cps_after);
+  entry.add("dc_reseed_fired",         cap.dc_reseed_fired);
+  entry.add("dc_reseed_computed",      cap.dc_reseed_computed);
 }
 
 // ── Dump the per-slot capture buffer AND the anomaly buffer ──
@@ -2342,9 +2546,12 @@ static void witness_capture_to_payload(const witness_capture_t& cap,
 //                         capacity.  Tells you "N anomalies observed,
 //                         first K preserved in witness_anomalies."
 static Payload cmd_witness_dump(const Payload&) {
-  // Per-slot capture array (indices 0..WITNESS_N_SLOTS, inclusive).
+  // Per-slot capture array — slots 1..4 only.  Slot 0 is excluded
+  // (preemption-dominated wrap-alias fire, not useful diagnostically).
+  // Slots 5..9 are omitted to keep the payload within transport limits
+  // while the full instrumentation is active.
   PayloadArray captures_arr;
-  for (uint8_t i = 0; i <= WITNESS_N_SLOTS; i++) {
+  for (uint8_t i = 1; i <= 4; i++) {
     const witness_capture_t& cap = g_witness_captures[i];
     Payload entry;
     entry.add("array_index", (uint32_t)i);

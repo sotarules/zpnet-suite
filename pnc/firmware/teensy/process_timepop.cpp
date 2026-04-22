@@ -958,6 +958,7 @@ static inline void slot_build_ctx(
 ) {
   ctx.handle              = slot.handle;
   ctx.fire_vclock_raw     = slot.fire_vclock_raw;
+  ctx.fire_dwt_cyccnt     = slot.fire_dwt_cyccnt;
   ctx.deadline            = slot.target_deadline;
   ctx.fire_gnss_error_ns  = (int32_t)(slot.fire_vclock_raw - slot.target_deadline) * (int32_t)NS_PER_TICK;
   ctx.fire_gnss_ns        = slot.fire_gnss_ns;
@@ -996,7 +997,6 @@ void timepop_qtimer1_ch2_handler(const interrupt_event_t& event,
 
   const uint32_t dwt_entry      = event.dwt_at_event;
   const uint32_t now            = event.counter32_at_event;
-  const int64_t  gnss_ns_at_isr = (int64_t)event.gnss_ns_at_event;
   const time_anchor_snapshot_t anchor = time_anchor_snapshot();
 
   diag_isr_count++;
@@ -1078,13 +1078,22 @@ void timepop_qtimer1_ch2_handler(const interrupt_event_t& event,
 
     validate_dispatch_against_dwt(slots[i], landed_dwt);
 
-    int64_t fire_gnss_ns = gnss_ns_at_isr;
-    if (slots[i].target_gnss_ns >= 0 && slots[i].smartpop_enabled && slots[i].prediction_valid) {
-      fire_gnss_ns = slots[i].target_gnss_ns;
-    } else {
-      const int64_t dwt_gnss_ns = time_dwt_to_gnss_ns(landed_dwt);
-      if (dwt_gnss_ns >= 0) fire_gnss_ns = dwt_gnss_ns;
-    }
+    // ── fire_gnss_ns computation — VCLOCK arithmetic ──
+    //
+    // Per this file's design doctrine (see file header):
+    //   fire_gnss_ns = (pps_count - 1) * 1e9 + (fire_vclock_raw - qtimer_at_pps) * 100
+    //
+    // VCLOCK is the authoritative time base.  DWT is diagnostic.
+    // We compute fire_gnss_ns from the ISR-entry VCLOCK counter value
+    // (`now`) and the time anchor — pure gears, no ambient reads, no
+    // DWT bridge dependency.
+    //
+    // The dispatcher contract is: fire_gnss_ns is ALWAYS the GNSS
+    // nanosecond at which this slot fired.  No exceptions.  If the
+    // anchor is not yet valid, vclock_to_gnss_ns returns -1 and the
+    // callback sees that honest sentinel — never 0, never a bridge-
+    // derived fallback.
+    const int64_t fire_gnss_ns = vclock_to_gnss_ns(now, anchor);
 
     slot_capture(slots[i], now, landed_dwt, fire_gnss_ns, anchor);
 
@@ -1122,6 +1131,7 @@ void timepop_qtimer1_ch2_handler(const interrupt_event_t& event,
 static inline void build_deferred_ctx(timepop_handle_t handle, timepop_ctx_t& ctx) {
   ctx.handle = handle;
   ctx.fire_vclock_raw = 0;
+  ctx.fire_dwt_cyccnt = 0;
   ctx.deadline = 0;
   ctx.fire_gnss_error_ns = 0;
   ctx.fire_gnss_ns = -1;

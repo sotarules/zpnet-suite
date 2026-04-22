@@ -579,6 +579,26 @@ uint16_t interrupt_qtimer3_ch2_counter_now(void);
 uint16_t interrupt_qtimer3_ch3_counter_now(void);
 uint32_t interrupt_qtimer1_counter32_now(void);
 
+// ── Dynamic DWT cycles per GNSS second ──
+//
+// Home of the enhanced DWT-cycles-per-second prediction.  A 1 kHz
+// TimePop recurring series observes ARM_DWT_CYCCNT at each tick and
+// refines an estimate of DWT cycles per GNSS second by absorbing the
+// delta between actual DWT and DWT predicted from the PPS anchor.
+//
+// Bookends are the pure-gears, ISR-grade anchors:
+//   anchor_dwt     = priority-0 DWT at the most recent PPS GPIO edge
+//   anchor_gnss_ns = GNSS ns at that same PPS edge
+//
+// At each PPS edge the estimate is reseeded from alpha's
+// g_dwt_cycle_count_between_pps (the honest two-bookend measurement).
+// Between edges it is refined permanently by every tick observation:
+// the delta between actual and predicted DWT is added to the estimate.
+// Self-correcting per tick, with PPS-edge re-anchor as ground truth.
+//
+// Clients #include process_interrupt.h to consume.
+uint32_t interrupt_dynamic_cps(void);
+
 const char* interrupt_subscriber_kind_str(interrupt_subscriber_kind_t kind);
 const char* interrupt_provider_kind_str(interrupt_provider_kind_t provider);
 const char* interrupt_lane_str(interrupt_lane_t lane);

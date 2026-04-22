@@ -61,6 +61,7 @@ static constexpr timepop_handle_t TIMEPOP_INVALID_HANDLE = 0;
 typedef struct timepop_ctx_t {
   timepop_handle_t handle;
   uint32_t fire_vclock_raw;
+  uint32_t fire_dwt_cyccnt;
   uint32_t deadline;
   int32_t  fire_gnss_error_ns;
   int64_t  fire_gnss_ns;
