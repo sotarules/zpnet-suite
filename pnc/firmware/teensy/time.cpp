@@ -56,6 +56,18 @@
 #include "imxrt.h"
 
 // ============================================================================
+// Latency adjusters
+// ============================================================================
+
+uint32_t dwt_at_gpio_edge(uint32_t dwt_isr_entry_raw) {
+  return dwt_isr_entry_raw - (GPIO_TOTAL_LATENCY - WITNESS_STIMULATE_LATENCY);
+}
+
+uint32_t dwt_at_qtimer_edge(uint32_t dwt_isr_entry_raw) {
+  return dwt_isr_entry_raw - (QTIMER_TOTAL_LATENCY - WITNESS_STIMULATE_LATENCY);
+}
+
+// ============================================================================
 // Constants
 // ============================================================================
 

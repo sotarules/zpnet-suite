@@ -445,15 +445,6 @@ uint16_t interrupt_qtimer3_ch3_counter_now(void) { return IMXRT_TMR3.CH[3].CNTR;
 
 static inline void witness_welford_update(witness_welford_t& w, int32_t sample);
 
-static inline uint32_t dwt_at_gpio_edge(uint32_t dwt_isr_entry_raw) {
-  return dwt_isr_entry_raw - (GPIO_TOTAL_LATENCY - WITNESS_STIMULATE_LATENCY);
-}
-
-static inline uint32_t dwt_at_qtimer_edge(uint32_t dwt_isr_entry_raw) {
-  return dwt_isr_entry_raw - (QTIMER_TOTAL_LATENCY - WITNESS_STIMULATE_LATENCY);
-}
-
-
 // ============================================================================
 // Compare channel helpers
 // ============================================================================
