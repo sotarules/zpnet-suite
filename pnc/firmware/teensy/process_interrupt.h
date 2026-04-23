@@ -354,7 +354,11 @@ static constexpr int32_t VCLOCK_EPOCH_TICK_OFFSET = -2;
 
 struct pps_edge_snapshot_t {
   uint32_t sequence          = 0;
-  uint32_t dwt_at_edge       = 0;
+  uint32_t dwt_at_edge       = 0;   // NORMALIZED: raw PPS ISR-entry DWT minus
+  //   (GPIO_TOTAL_LATENCY − WITNESS_STIMULATE_LATENCY)
+  uint32_t dwt_raw_at_edge   = 0;   // RAW PPS ISR-entry DWT, unmodified
+  //   (audit field — invariant is
+  //    dwt_raw_at_edge − dwt_at_edge == 67)
   uint32_t counter32_at_edge = 0;   // QTimer1 CH0+CH1 32-bit count at ISR entry
   uint16_t ch3_at_edge       = 0;   // QTimer1 CH3 count at ISR entry
   int64_t  gnss_ns_at_edge   = -1;
@@ -550,6 +554,7 @@ interrupt_witness_mode_t interrupt_witness_get_mode(void);
 // witness ISR path.
 void interrupt_witness_arm_first_slot(uint32_t anchor_counter32,
                                       uint32_t anchor_dwt,
+                                      uint32_t anchor_dwt_raw,
                                       uint32_t dwt_cycles_per_second);
 
 interrupt_witness_stats_t interrupt_witness_stats(void);

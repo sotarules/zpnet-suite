@@ -428,9 +428,18 @@ static void vclock_monitor_callback(timepop_ctx_t* ctx,
 
   const uint32_t fire_vclock_raw = ctx ? ctx->fire_vclock_raw : 0;
   const int64_t fire_gnss_ns = ctx ? ctx->fire_gnss_ns : -1;
+
+  // The diag.dwt_at_isr_entry field is already normalized by the CH2
+  // dispatcher (via dwt_at_qtimer_edge) before it arrives here.  The historic
+  // QTIMER_ISR_ENTRY_OVERHEAD subtraction on this value was a legacy partial-
+  // model correction from the pre-two-constant era — applying it on top of
+  // the already-normalized value double-corrects and produces a silent bias.
+  // Removed.  Both locals below now hold the same normalized value; the
+  // separate `_raw` variable and the companion GNSS computation are retained
+  // unchanged to preserve the downstream diagnostic field shape, and will be
+  // renamed in the follow-up truth-in-naming pass.
   const uint32_t dwt_isr_entry_raw = diag ? diag->dwt_at_isr_entry : 0;
-  const uint32_t dwt_at_edge =
-      dwt_isr_entry_raw ? (dwt_isr_entry_raw - QTIMER_ISR_ENTRY_OVERHEAD) : 0;
+  const uint32_t dwt_at_edge = dwt_isr_entry_raw;
 
   const int64_t isr_entry_gnss_ns =
       (diag && diag->anchor_valid)

@@ -409,6 +409,7 @@ struct pps_edge_snapshot_store_t {
   volatile uint32_t seq               = 0;
   volatile uint32_t sequence          = 0;
   volatile uint32_t dwt_at_edge       = 0;
+  volatile uint32_t dwt_raw_at_edge   = 0;
   volatile uint32_t counter32_at_edge = 0;
   volatile uint16_t ch3_at_edge       = 0;
   volatile int64_t  gnss_ns_at_edge   = -1;
@@ -972,6 +973,7 @@ static volatile witness_slot_t g_witness_current = { 0, 0, 0xFF };
 // fires.
 static volatile uint32_t g_witness_anchor_counter32 = 0;
 static volatile uint32_t g_witness_anchor_dwt       = 0;
+static volatile uint32_t g_witness_anchor_dwt_raw   = 0;
 static volatile uint32_t g_witness_anchor_dwt_cps   = 1008000000;
 
 static witness_welford_t g_witness_welford = {};
@@ -1010,7 +1012,8 @@ struct witness_capture_t {
   // witness_arm_slot).  These are the PPS-edge-derived inputs that
   // target_vclock and target_dwt were computed from.
   uint32_t anchor_counter32;
-  uint32_t anchor_dwt;
+  uint32_t anchor_dwt;           // NORMALIZED value used in target_dwt math
+  uint32_t anchor_dwt_raw;       // RAW PPS ISR-entry DWT (audit field)
   uint32_t anchor_dwt_cps;
 
   // Targets as programmed for this slot.
@@ -1018,9 +1021,30 @@ struct witness_capture_t {
   uint32_t target_dwt;
 
   // ISR-entry captures (this is what the fire actually saw).
-  uint32_t dwt_at_fire;         // ARM_DWT_CYCCNT at first ISR instruction
+  uint32_t dwt_at_fire;         // NORMALIZED value that feeds the residual:
+  //   dwt_raw_at_fire − dwt_at_fire_normalization_offset
   uint32_t counter32_at_fire;   // cascade-read 32-bit VCLOCK counter
   uint16_t ch3_cntr_at_fire;    // CH3's own low-16 counter
+
+  // ── Normalization audit (added for double-subtraction hunt) ──
+  //
+  // dwt_raw_at_fire is the true first-instruction ARM_DWT_CYCCNT captured at
+  // witness_ch3_isr entry, unmodified by any latency subtraction.  The
+  // offset is the exact number of cycles subtracted by dwt_at_qtimer_edge
+  // to produce dwt_at_fire, computed as (dwt_raw_at_fire − dwt_at_fire).
+  //
+  // Invariant (single normalization): offset == QTIMER_TOTAL_LATENCY −
+  // WITNESS_STIMULATE_LATENCY == 48 cycles.
+  //   • 48  → normalization applied exactly once (expected)
+  //   • 96  → normalization applied twice (bug on fire side)
+  //   •  0  → normalization not applied (bug on fire side)
+  //   • anything else → something we don't yet understand
+  //
+  // If offset == 48 and residual is still biased, the fire-side math is
+  // honest and the bias lives elsewhere (anchor side, cps, or a constant
+  // we haven't yet characterized).
+  uint32_t dwt_raw_at_fire;
+  uint32_t dwt_at_fire_normalization_offset;
 
   // Derived diagnostics (same arithmetic as the ISR performs for the
   // Welford; captured verbatim for easy correlation).
@@ -1250,7 +1274,16 @@ static void witness_ch3_isr(uint32_t dwt_raw) {
   qtimer1_ch3_clear_compare_flag();
   g_witness_fires_total++;
 
+  // Normalize DWT capture into the unified "true physical event" coordinate
+  // system.  target_dwt (computed from alpha's snap.dwt_at_edge — itself
+  // already normalized by dwt_at_gpio_edge in the GPIO ISR) lives there;
+  // normalizing dwt_raw here puts both sides of the residual subtraction
+  // into the same frame.  With correct math and no preemption, the
+  // residual should be exactly zero.
+  const uint32_t dwt_normalized = dwt_at_qtimer_edge(dwt_raw);
+
   const uint8_t slot_index = g_witness_current.slot_index;
+
   if (slot_index > WITNESS_N_SLOTS) {
     // Spurious fire — no slot armed (disarmed sentinel = 0xFF).
     qtimer1_ch3_disable_compare();
@@ -1308,7 +1341,7 @@ static void witness_ch3_isr(uint32_t dwt_raw) {
   witness_welford_update(g_witness_lag_welford, lag_ticks);
 
   const uint32_t target_dwt = g_witness_current.target_dwt;
-  const int32_t  residual_cycles = (int32_t)(dwt_raw - target_dwt);
+  const int32_t  residual_cycles = (int32_t)(dwt_normalized - target_dwt);
 
   // ── Capture raw inputs and derived diagnostics ──
   //
@@ -1322,14 +1355,21 @@ static void witness_ch3_isr(uint32_t dwt_raw) {
     cap.seq                = ++g_witness_capture_seq;
     cap.slot_index         = slot_index;
     cap.valid              = true;
+
     cap.anchor_counter32   = g_witness_anchor_counter32;
     cap.anchor_dwt         = g_witness_anchor_dwt;
+    cap.anchor_dwt_raw     = g_witness_anchor_dwt_raw;
     cap.anchor_dwt_cps     = g_witness_anchor_dwt_cps;
+
     cap.target_vclock      = target_vclock;
     cap.target_dwt         = target_dwt;
-    cap.dwt_at_fire        = dwt_raw;
-    cap.counter32_at_fire  = counter32;
-    cap.ch3_cntr_at_fire   = ch3_cntr;
+
+    cap.dwt_at_fire                      = dwt_normalized;
+    cap.dwt_raw_at_fire                  = dwt_raw;
+    cap.dwt_at_fire_normalization_offset = dwt_raw - dwt_normalized;
+    cap.counter32_at_fire                = counter32;
+    cap.ch3_cntr_at_fire                 = ch3_cntr;
+
     cap.vclock_delta       = vclock_delta;
     cap.residual_cycles    = residual_cycles;
     cap.lag_ticks          = lag_ticks;
@@ -1414,11 +1454,13 @@ interrupt_witness_mode_t interrupt_witness_get_mode(void) {
 
 void interrupt_witness_arm_first_slot(uint32_t anchor_counter32,
                                        uint32_t anchor_dwt,
+                                       uint32_t anchor_dwt_raw,
                                        uint32_t dwt_cycles_per_second) {
   if (g_witness_mode != interrupt_witness_mode_t::ON) return;
 
   g_witness_anchor_counter32 = anchor_counter32;
   g_witness_anchor_dwt       = anchor_dwt;
+  g_witness_anchor_dwt_raw   = anchor_dwt_raw;
   g_witness_anchor_dwt_cps   = dwt_cycles_per_second;
 
   witness_arm_slot(0);
@@ -1525,9 +1567,39 @@ uint32_t interrupt_hw_witness_qtimer_tcf1_seen_in_irq(void) {
 // ============================================================================
 // QTimer1 vector — dispatches CH2 (TimePop) and CH3 (VCLOCK cadence or witness)
 // ============================================================================
+//
+// QTimer1 shares a single IRQ vector across all four channels.  The vector
+// demultiplexes by reading each channel's TCF1 flag and servicing those that
+// are set.  Demultiplex discipline: mutually exclusive per invocation.
+//
+// Historical structure used parallel `if` blocks so that both CH2 and CH3
+// could be serviced in a single vector invocation when both TCF1 flags were
+// pending simultaneously.  That was efficient but violated the sacred first-
+// instruction DWT capture invariant for whichever channel's match occurred
+// AFTER vector entry: a channel's TCF1 can get set by hardware mid-ISR, and
+// the `dwt_raw` captured at the top of the function — before that match —
+// would then be used to service it.  The result was a `dwt_raw` value that
+// did not represent the vector-entry moment for the channel using it.
+//
+// The current `if / else if` structure services at most ONE channel per
+// invocation.  If both flags are pending at dispatch, the first branch runs
+// with `dwt_raw` honestly reflecting its entry; the other flag remains set,
+// the ISR returns, and the NVIC immediately re-dispatches the vector for the
+// other channel, which then captures a fresh `dwt_raw` at that invocation's
+// own first instruction.  Every branch's `dwt_raw` is therefore always the
+// first-instruction capture of the vector invocation that was dispatched
+// specifically to service it — the sacred-capture law holds unconditionally.
+//
+// Ordering (CH2 first) only matters when both channels happen to be pending
+// simultaneously at the moment of NVIC dispatch; in that case CH2 gets the
+// "first" invocation and CH3 gets the immediate re-dispatch.  The opposite
+// ordering would produce identical behavior with the roles reversed.  CH2
+// first is a pragmatic choice: TimePop (CH2) is the foreground scheduler and
+// its heartbeat is the more cadenced of the two.
+//
 
 static void qtimer1_isr(void) {
-  const uint32_t dwt_raw = ARM_DWT_CYCCNT;  // FIRST instruction
+  const uint32_t dwt_raw = ARM_DWT_CYCCNT;  // FIRST instruction — sacred capture
 
   // ── CH2 (TimePop scheduler) ──
   //
@@ -1562,8 +1634,13 @@ static void qtimer1_isr(void) {
       g_qtimer1_ch2_handler(event, diag);
     }
   }
-
-  if (IMXRT_TMR1.CH[3].CSCTRL & TMR_CSCTRL_TCF1) {
+  // ── CH3 (VCLOCK cadence or Witness) ──
+  //
+  // Mutually exclusive with CH2 above: if CH2 was serviced, CH3 — whether
+  // it was also pending at entry or got pended during CH2's body — will be
+  // handled by a subsequent NVIC re-dispatch with its own fresh `dwt_raw`.
+  //
+  else if (IMXRT_TMR1.CH[3].CSCTRL & TMR_CSCTRL_TCF1) {
     if (g_witness_mode == interrupt_witness_mode_t::ON) {
       witness_ch3_isr(dwt_raw);
     } else {
@@ -1692,6 +1769,7 @@ void process_interrupt_gpio6789_irq(uint32_t dwt_isr_entry_raw) {
   dmb_barrier();
   g_pps_edge_store.sequence          = g_pps_gpio_witness.edge_count;
   g_pps_edge_store.dwt_at_edge       = dwt_at_edge;
+  g_pps_edge_store.dwt_raw_at_edge   = dwt_isr_entry_raw;
   g_pps_edge_store.counter32_at_edge = counter32;
   g_pps_edge_store.ch3_at_edge       = ch3_now;
   g_pps_edge_store.gnss_ns_at_edge   = gnss_ns;
@@ -1719,6 +1797,7 @@ pps_edge_snapshot_t interrupt_last_pps_edge(void) {
     dmb_barrier();
     out.sequence          = g_pps_edge_store.sequence;
     out.dwt_at_edge       = g_pps_edge_store.dwt_at_edge;
+    out.dwt_raw_at_edge   = g_pps_edge_store.dwt_raw_at_edge;
     out.counter32_at_edge = g_pps_edge_store.counter32_at_edge;
     out.ch3_at_edge       = g_pps_edge_store.ch3_at_edge;
     out.gnss_ns_at_edge   = g_pps_edge_store.gnss_ns_at_edge;
@@ -2423,6 +2502,7 @@ static void witness_capture_to_payload(const witness_capture_t& cap,
   // Anchors (PPS-edge-derived inputs to the prediction).
   entry.add("anchor_counter32", cap.anchor_counter32);
   entry.add("anchor_dwt",       cap.anchor_dwt);
+  entry.add("anchor_dwt_raw",   cap.anchor_dwt_raw);
   entry.add("anchor_dwt_cps",   cap.anchor_dwt_cps);
 
   // ── Prediction helpers (for calculator-friendly checks) ──
@@ -2483,7 +2563,10 @@ static void witness_capture_to_payload(const witness_capture_t& cap,
             (uint32_t)(cap.counter32_at_fire - cap.anchor_counter32));
 
   // ISR-entry captures (this is what the fire actually saw).
-  entry.add("dwt_at_fire",      cap.dwt_at_fire);
+  entry.add("dwt_at_fire",                      cap.dwt_at_fire);
+  entry.add("dwt_raw_at_fire",                  cap.dwt_raw_at_fire);
+  entry.add("dwt_at_fire_normalization_offset", cap.dwt_at_fire_normalization_offset);
+
   entry.add("counter32_at_fire",cap.counter32_at_fire);
   entry.add("ch3_cntr_at_fire", (uint32_t)cap.ch3_cntr_at_fire);
 
@@ -2551,7 +2634,7 @@ static Payload cmd_witness_dump(const Payload&) {
   // Slots 5..9 are omitted to keep the payload within transport limits
   // while the full instrumentation is active.
   PayloadArray captures_arr;
-  for (uint8_t i = 1; i <= 4; i++) {
+  for (uint8_t i = 0; i <= 4; i++) {
     const witness_capture_t& cap = g_witness_captures[i];
     Payload entry;
     entry.add("array_index", (uint32_t)i);

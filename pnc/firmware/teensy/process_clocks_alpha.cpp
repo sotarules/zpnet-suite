@@ -764,6 +764,7 @@ static void pps_edge_callback(const pps_edge_snapshot_t& snap) {
         snap.counter32_at_edge + VCLOCK_EPOCH_TICK_OFFSET;
     interrupt_witness_arm_first_slot(witness_anchor_counter32,
                                      snap.dwt_at_edge,
+                                     snap.dwt_raw_at_edge,
                                      dwt_effective_cycles_per_second());
   }
 
