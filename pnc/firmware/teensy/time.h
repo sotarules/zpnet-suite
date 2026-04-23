@@ -1,5 +1,7 @@
 #pragma once
 
+#include "config.h"
+
 #include <stdint.h>
 #include <stdbool.h>
 
@@ -49,6 +51,13 @@
 //   The PPS callback is the sole writer. All other callers are readers.
 //
 // ============================================================================
+
+// ============================================================================
+// Latency adjusters
+// ============================================================================
+
+uint32_t dwt_at_gpio_edge(uint32_t dwt_isr_entry_raw);
+uint32_t dwt_at_qtimer_edge(uint32_t dwt_isr_entry_raw);
 
 // ============================================================================
 // Anchor snapshot — public, seqlock-safe copy of the PPS anchor

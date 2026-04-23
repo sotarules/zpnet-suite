@@ -318,5 +318,6 @@ static constexpr uint32_t WITNESS_STIMULATE_LATENCY = 5;
 static constexpr uint32_t GPIO_TOTAL_LATENCY = 72;
 static constexpr uint32_t QTIMER_TOTAL_LATENCY = 53;
 
+// Deprecated--these are records of our "entry latency" tests:
 static constexpr uint32_t PPS_ISR_ENTRY_OVERHEAD = 47;
 static constexpr uint32_t QTIMER_ISR_ENTRY_OVERHEAD = 16;
