@@ -208,7 +208,7 @@ static const float PHOTODIODE_OFF_THRESHOLD_V = 0.05f;
 static const uint32_t PHOTODIODE_OFF_STABLE_MS = 20;
 
 // --------------------------------------------------------------
-// ADC scaling assumptions
+// ADC scaling assumptions:
 // --------------------------------------------------------------
 static const float ADC_FS_VOLTS  = 3.3f;
 static const float ADC_FS_COUNTS = 4095.0f;
