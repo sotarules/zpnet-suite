@@ -143,6 +143,65 @@ struct dynamic_cps_tick_state_t {
   uint32_t cps_after;
   bool     reseed_fired;     // did the PPS-boundary reseed run?
   bool     reseed_computed;  // did we actually compute a new seed (not first edge)?
+
+    // ── Dynamic CPS invalid-tick rejection instrumentation ──
+  //
+  // A dynamic-cps tick is valid only when the TimePop fire GNSS time
+  // belongs to the current PPS epoch:
+  //
+  //   0 <= ctx->fire_gnss_ns - snap.gnss_ns_at_edge < 1 second
+  //
+  // Negative means stale TimePop fire context paired with a newer PPS
+  // snapshot.  >= 1s means old PPS snapshot or otherwise incoherent
+  // epoch pairing.  Either case must NOT refine g_dynamic_cps.
+  uint32_t rejected_negative_offset_count;
+  uint32_t rejected_future_offset_count;
+  uint32_t rejected_total_count;
+
+  uint32_t last_rejected_tick_count;
+  uint32_t last_rejected_snap_sequence;
+  uint32_t last_rejected_dwt_at_fire;
+  uint32_t last_rejected_snap_dwt_at_edge;
+  int64_t  last_rejected_ctx_fire_gnss_ns;
+  int64_t  last_rejected_snap_gnss_ns_at_edge;
+  int64_t  last_rejected_gnss_offset_ns;
+  uint32_t last_rejected_cps_before;
+  bool     last_rejected_negative;
+  bool     last_rejected_future;
+
+  // ── Persistent post-reseed snapshot ──
+  //
+  // Updated ONLY on the tick where a real PPS-boundary reseed runs
+  // (reseed_computed == true).  Every subsequent tick in the same GNSS
+  // second leaves these fields alone, so every witness slot (100 ms,
+  // 200 ms, ..., 900 ms into the second) can see the same reseed-moment
+  // facts.  Disambiguates "reseed produced the right value, refinement
+  // dragged it off" from "reseed itself was biased," which the normal
+  // last-tick fields cannot distinguish because they get overwritten by
+  // every subsequent refinement tick.
+  uint32_t last_reseed_pps_sequence;          // snap.sequence that fed the reseed
+  uint32_t last_reseed_tick_count;            // tick_count at reseed moment
+  uint32_t last_reseed_cps;                   // g_dynamic_cps immediately after reseed
+                                              // assignment (== bookend delta:
+                                              // snap.dwt_at_edge - prev snap.dwt_at_edge).
+                                              // Pre-refinement.
+  uint32_t last_reseed_snap_dwt_at_edge;      // snap.dwt_at_edge of the PPS that triggered reseed
+  uint32_t last_reseed_prev_snap_dwt_at_edge; // g_dynamic_cps_last_dwt_at_edge BEFORE the reseed
+                                              // assignment — the other bookend.  Lets the reader
+                                              // recompute the reseed value and confirm it.
+  int64_t  last_reseed_snap_gnss_ns_at_edge;  // snap.gnss_ns_at_edge of the reseed PPS
+
+  // State of the reseed tick itself — one tick == one refinement step,
+  // so these capture the FIRST residual observed against the just-
+  // reseeded cps.  Usually the reseed tick fires ~0–1 ms after PPS, so
+  // gnss_offset_ns is tiny and delta is noise-dominated; but a large
+  // |delta| at small t is a red flag for a reseed-side bias.
+  int64_t  reseed_tick_gnss_offset_ns;
+  uint32_t reseed_tick_dwt_at_fire;
+  uint32_t reseed_tick_predicted_dwt;
+  int32_t  reseed_tick_delta;
+  uint32_t reseed_tick_cps_after;
+
 };
 
 static dynamic_cps_tick_state_t g_dynamic_cps_last_tick = {};
@@ -158,6 +217,12 @@ static void dynamic_cps_tick(timepop_ctx_t* ctx, timepop_diag_t*, void*) {
 
   bool reseed_fired    = false;
   bool reseed_computed = false;
+
+
+  // Capture the "other bookend" (previous PPS snap.dwt_at_edge) BEFORE
+  // the reseed assignment overwrites it.  Used only for the persistent
+  // post-reseed snapshot block below; harmless when no reseed runs.
+  const uint32_t prev_snap_dwt_at_edge_for_audit = g_dynamic_cps_last_dwt_at_edge;
 
   // PPS edge boundary: reseed g_dynamic_cps from our own two-bookend
   // measurement of the just-completed second.  On the very first PPS
@@ -175,6 +240,46 @@ static void dynamic_cps_tick(timepop_ctx_t* ctx, timepop_diag_t*, void*) {
 
   const uint32_t cps_before    = g_dynamic_cps;
   const int64_t gnss_offset_ns = ctx->fire_gnss_ns - snap.gnss_ns_at_edge;
+
+  const bool invalid_negative = (gnss_offset_ns < 0);
+  const bool invalid_future   = (gnss_offset_ns >= 1000000000LL);
+
+  if (invalid_negative || invalid_future) {
+    g_dynamic_cps_last_tick.tick_count++;
+    g_dynamic_cps_last_tick.dwt_at_fire          = dwt_at_fire;
+    g_dynamic_cps_last_tick.snap_sequence        = snap.sequence;
+    g_dynamic_cps_last_tick.snap_dwt_at_edge     = snap.dwt_at_edge;
+    g_dynamic_cps_last_tick.snap_gnss_ns_at_edge = snap.gnss_ns_at_edge;
+    g_dynamic_cps_last_tick.ctx_fire_gnss_ns     = ctx->fire_gnss_ns;
+    g_dynamic_cps_last_tick.gnss_offset_ns       = gnss_offset_ns;
+    g_dynamic_cps_last_tick.cps_before           = cps_before;
+    g_dynamic_cps_last_tick.predicted_dwt        = 0;
+    g_dynamic_cps_last_tick.delta                = 0;
+    g_dynamic_cps_last_tick.cps_after            = g_dynamic_cps;
+    g_dynamic_cps_last_tick.reseed_fired         = reseed_fired;
+    g_dynamic_cps_last_tick.reseed_computed      = reseed_computed;
+
+    g_dynamic_cps_last_tick.rejected_total_count++;
+    if (invalid_negative) {
+      g_dynamic_cps_last_tick.rejected_negative_offset_count++;
+    }
+    if (invalid_future) {
+      g_dynamic_cps_last_tick.rejected_future_offset_count++;
+    }
+
+    g_dynamic_cps_last_tick.last_rejected_tick_count           = g_dynamic_cps_last_tick.tick_count;
+    g_dynamic_cps_last_tick.last_rejected_snap_sequence        = snap.sequence;
+    g_dynamic_cps_last_tick.last_rejected_dwt_at_fire          = dwt_at_fire;
+    g_dynamic_cps_last_tick.last_rejected_snap_dwt_at_edge     = snap.dwt_at_edge;
+    g_dynamic_cps_last_tick.last_rejected_ctx_fire_gnss_ns     = ctx->fire_gnss_ns;
+    g_dynamic_cps_last_tick.last_rejected_snap_gnss_ns_at_edge = snap.gnss_ns_at_edge;
+    g_dynamic_cps_last_tick.last_rejected_gnss_offset_ns       = gnss_offset_ns;
+    g_dynamic_cps_last_tick.last_rejected_cps_before           = cps_before;
+    g_dynamic_cps_last_tick.last_rejected_negative             = invalid_negative;
+    g_dynamic_cps_last_tick.last_rejected_future               = invalid_future;
+
+    return;
+  }
 
   const uint32_t predicted_dwt =
       snap.dwt_at_edge +
@@ -199,6 +304,34 @@ static void dynamic_cps_tick(timepop_ctx_t* ctx, timepop_diag_t*, void*) {
   g_dynamic_cps_last_tick.cps_after            = g_dynamic_cps;
   g_dynamic_cps_last_tick.reseed_fired         = reseed_fired;
   g_dynamic_cps_last_tick.reseed_computed      = reseed_computed;
+
+
+  // ── Persistent post-reseed snapshot ──
+  //
+  // Update ONLY on the tick where a real bookend-delta reseed actually
+  // ran.  The first PPS edge ever observed sets reseed_fired=true but
+  // reseed_computed=false (no prior bookend); we skip those so the
+  // persistent fields unambiguously describe a real reseed.
+  //
+  // Because subsequent ticks in the same GNSS second leave these alone,
+  // every witness slot in 100 ms..900 ms sees the reseed-moment facts
+  // and the reseed tick's own refinement outcome — letting the reader
+  // tell the two failure modes ("biased reseed" vs "biased refinement")
+  // apart directly, without inferring from the mid-second state.
+  if (reseed_computed) {
+    g_dynamic_cps_last_tick.last_reseed_pps_sequence          = snap.sequence;
+    g_dynamic_cps_last_tick.last_reseed_tick_count            = g_dynamic_cps_last_tick.tick_count;
+    g_dynamic_cps_last_tick.last_reseed_cps                   = cps_before;
+    g_dynamic_cps_last_tick.last_reseed_snap_dwt_at_edge      = snap.dwt_at_edge;
+    g_dynamic_cps_last_tick.last_reseed_prev_snap_dwt_at_edge = prev_snap_dwt_at_edge_for_audit;
+    g_dynamic_cps_last_tick.last_reseed_snap_gnss_ns_at_edge  = snap.gnss_ns_at_edge;
+
+    g_dynamic_cps_last_tick.reseed_tick_gnss_offset_ns = gnss_offset_ns;
+    g_dynamic_cps_last_tick.reseed_tick_dwt_at_fire    = dwt_at_fire;
+    g_dynamic_cps_last_tick.reseed_tick_predicted_dwt  = predicted_dwt;
+    g_dynamic_cps_last_tick.reseed_tick_delta          = delta;
+    g_dynamic_cps_last_tick.reseed_tick_cps_after      = g_dynamic_cps;
+  }
 }
 
 uint32_t interrupt_dynamic_cps(void) {
@@ -1050,6 +1183,21 @@ struct witness_capture_t {
   // per-slot walk if fed into the prediction path.
   uint32_t dynamic_cps_used;
 
+  // Dynamic-CPS prediction path.
+  //
+  // The existing target_dwt/residual_cycles pair uses anchor_dwt_cps,
+  // the PPS-to-PPS bookend value captured when the witness slot was armed.
+  // These fields compute the same target/residual using the live dynamic
+  // CPS estimator sampled at witness fire time.
+  //
+  // This is diagnostic only for now: it lets us determine whether the
+  // dynamic estimator removes the per-slot residual walk and leaves only
+  // a stable constant offset.
+  uint32_t dynamic_target_dwt;
+  int32_t  dynamic_residual_cycles;
+  int32_t  dynamic_minus_static_cps;
+  int32_t  dynamic_minus_static_target_cycles;
+
   // Last tick of dynamic_cps_tick that ran before this witness fire.
   // Complete per-tick state so we can reason about exactly what the
   // refinement math was doing.
@@ -1066,6 +1214,51 @@ struct witness_capture_t {
   uint32_t dc_cps_after;
   bool     dc_reseed_fired;
   bool     dc_reseed_computed;
+
+  uint32_t dc_rejected_negative_offset_count;
+  uint32_t dc_rejected_future_offset_count;
+  uint32_t dc_rejected_total_count;
+
+  uint32_t dc_last_rejected_tick_count;
+  uint32_t dc_last_rejected_snap_sequence;
+  uint32_t dc_last_rejected_dwt_at_fire;
+  uint32_t dc_last_rejected_snap_dwt_at_edge;
+  int64_t  dc_last_rejected_ctx_fire_gnss_ns;
+  int64_t  dc_last_rejected_snap_gnss_ns_at_edge;
+  int64_t  dc_last_rejected_gnss_offset_ns;
+  uint32_t dc_last_rejected_cps_before;
+  bool     dc_last_rejected_negative;
+  bool     dc_last_rejected_future;
+
+
+  // ── Persistent post-reseed snapshot (from dynamic_cps_tick) ──
+  //
+  // These fields are written by dynamic_cps_tick ONLY on a reseed
+  // tick and survive unchanged for the rest of the GNSS second, so
+  // every witness slot (100 ms..900 ms) reports the SAME values for
+  // the reseed that started this second.  They answer: "what did the
+  // bookend reseed produce, and what did the reseed tick itself see
+  // against that value?"  Lets us distinguish a biased reseed (big
+  // magnitude at small offset) from a biased refinement (clean
+  // reseed that drifts across the rest of the second).
+  //
+  // The invariant
+  //     dc_last_reseed_cps == dc_last_reseed_snap_dwt_at_edge -
+  //                           dc_last_reseed_prev_snap_dwt_at_edge
+  // must hold by construction; publishing both bookends lets the
+  // reader recompute the reseed value with a calculator.
+  uint32_t dc_last_reseed_pps_sequence;
+  uint32_t dc_last_reseed_tick_count;
+  uint32_t dc_last_reseed_cps;
+  uint32_t dc_last_reseed_snap_dwt_at_edge;
+  uint32_t dc_last_reseed_prev_snap_dwt_at_edge;
+  int64_t  dc_last_reseed_snap_gnss_ns_at_edge;
+
+  int64_t  dc_reseed_tick_gnss_offset_ns;
+  uint32_t dc_reseed_tick_dwt_at_fire;
+  uint32_t dc_reseed_tick_predicted_dwt;
+  int32_t  dc_reseed_tick_delta;
+  uint32_t dc_reseed_tick_cps_after;
 };
 
 // The capture array has WITNESS_N_SLOTS + 1 entries, indexed 0..N.
@@ -1334,6 +1527,18 @@ static void witness_ch3_isr(uint32_t dwt_raw) {
   const uint32_t target_dwt = g_witness_current.target_dwt;
   const int32_t  residual_cycles = (int32_t)(dwt_normalized - target_dwt);
 
+  const uint32_t dynamic_cps_used = interrupt_dynamic_cps();
+  const uint32_t dynamic_target_dwt =
+      witness_compute_target_dwt(g_witness_anchor_dwt,
+                                 dynamic_cps_used,
+                                 slot_index);
+  const int32_t dynamic_residual_cycles =
+      (int32_t)(dwt_normalized - dynamic_target_dwt);
+  const int32_t dynamic_minus_static_cps =
+      (int32_t)(dynamic_cps_used - g_witness_anchor_dwt_cps);
+  const int32_t dynamic_minus_static_target_cycles =
+      (int32_t)(dynamic_target_dwt - target_dwt);
+
   // ── Capture raw inputs and derived diagnostics ──
   //
   // Write the capture BEFORE the reject decision.  Anomalies are
@@ -1364,7 +1569,12 @@ static void witness_ch3_isr(uint32_t dwt_raw) {
     cap.vclock_delta       = vclock_delta;
     cap.residual_cycles    = residual_cycles;
     cap.lag_ticks          = lag_ticks;
-    cap.dynamic_cps_used   = interrupt_dynamic_cps();
+    cap.dynamic_cps_used   = dynamic_cps_used;
+
+    cap.dynamic_target_dwt                 = dynamic_target_dwt;
+    cap.dynamic_residual_cycles            = dynamic_residual_cycles;
+    cap.dynamic_minus_static_cps           = dynamic_minus_static_cps;
+    cap.dynamic_minus_static_target_cycles = dynamic_minus_static_target_cycles;
 
     // Snapshot the last tick of the dynamic cps refinement so the
     // dump can show exactly what arithmetic the most recent tick
@@ -1381,8 +1591,39 @@ static void witness_ch3_isr(uint32_t dwt_raw) {
     cap.dc_predicted_dwt        = dc.predicted_dwt;
     cap.dc_delta                = dc.delta;
     cap.dc_cps_after            = dc.cps_after;
-    cap.dc_reseed_fired         = dc.reseed_fired;
-    cap.dc_reseed_computed      = dc.reseed_computed;
+
+    cap.dc_rejected_negative_offset_count = dc.rejected_negative_offset_count;
+    cap.dc_rejected_future_offset_count   = dc.rejected_future_offset_count;
+    cap.dc_rejected_total_count           = dc.rejected_total_count;
+
+    cap.dc_last_rejected_tick_count           = dc.last_rejected_tick_count;
+    cap.dc_last_rejected_snap_sequence        = dc.last_rejected_snap_sequence;
+    cap.dc_last_rejected_dwt_at_fire          = dc.last_rejected_dwt_at_fire;
+    cap.dc_last_rejected_snap_dwt_at_edge     = dc.last_rejected_snap_dwt_at_edge;
+    cap.dc_last_rejected_ctx_fire_gnss_ns     = dc.last_rejected_ctx_fire_gnss_ns;
+    cap.dc_last_rejected_snap_gnss_ns_at_edge = dc.last_rejected_snap_gnss_ns_at_edge;
+    cap.dc_last_rejected_gnss_offset_ns       = dc.last_rejected_gnss_offset_ns;
+    cap.dc_last_rejected_cps_before           = dc.last_rejected_cps_before;
+    cap.dc_last_rejected_negative             = dc.last_rejected_negative;
+    cap.dc_last_rejected_future               = dc.last_rejected_future;
+
+
+    // Persistent post-reseed snapshot — same values across every slot
+    // in this second, so long as the last real reseed was this PPS
+    // boundary's.
+    cap.dc_last_reseed_pps_sequence          = dc.last_reseed_pps_sequence;
+    cap.dc_last_reseed_tick_count            = dc.last_reseed_tick_count;
+    cap.dc_last_reseed_cps                   = dc.last_reseed_cps;
+    cap.dc_last_reseed_snap_dwt_at_edge      = dc.last_reseed_snap_dwt_at_edge;
+    cap.dc_last_reseed_prev_snap_dwt_at_edge = dc.last_reseed_prev_snap_dwt_at_edge;
+    cap.dc_last_reseed_snap_gnss_ns_at_edge  = dc.last_reseed_snap_gnss_ns_at_edge;
+
+    cap.dc_reseed_tick_gnss_offset_ns = dc.reseed_tick_gnss_offset_ns;
+    cap.dc_reseed_tick_dwt_at_fire    = dc.reseed_tick_dwt_at_fire;
+    cap.dc_reseed_tick_predicted_dwt  = dc.reseed_tick_predicted_dwt;
+    cap.dc_reseed_tick_delta          = dc.reseed_tick_delta;
+    cap.dc_reseed_tick_cps_after      = dc.reseed_tick_cps_after;
+
 
     // Sticky capture of anomalies.  Slot 0 is excluded — its residual
     // is expected to be large and preemption-dominated, so flagging it
@@ -2240,6 +2481,24 @@ static Payload cmd_report(const Payload&) {
   p.add("witness_gpio_counter_delay_min_cycles",   ws.gpio_counter_delay_min_cycles);
   p.add("witness_gpio_counter_delay_max_cycles",   ws.gpio_counter_delay_max_cycles);
 
+  const dynamic_cps_tick_state_t dc = interrupt_dynamic_cps_last_tick();
+  p.add("dynamic_cps", interrupt_dynamic_cps());
+  p.add("dynamic_cps_tick_count", dc.tick_count);
+  p.add("dynamic_cps_last_gnss_offset_ns", dc.gnss_offset_ns);
+  p.add("dynamic_cps_rejected_negative_offset_count",
+        dc.rejected_negative_offset_count);
+  p.add("dynamic_cps_rejected_future_offset_count",
+        dc.rejected_future_offset_count);
+  p.add("dynamic_cps_rejected_total_count",
+        dc.rejected_total_count);
+  p.add("dynamic_cps_last_rejected_gnss_offset_ns",
+        dc.last_rejected_gnss_offset_ns);
+  p.add("dynamic_cps_last_rejected_snap_sequence",
+        dc.last_rejected_snap_sequence);
+  p.add("dynamic_cps_last_rejected_ctx_fire_gnss_ns",
+        dc.last_rejected_ctx_fire_gnss_ns);
+  p.add("dynamic_cps_last_rejected_snap_gnss_ns_at_edge",
+        dc.last_rejected_snap_gnss_ns_at_edge);
 
   return p;
 }
@@ -2571,6 +2830,11 @@ static void witness_capture_to_payload(const witness_capture_t& cap,
   // whether switching the prediction to this source would collapse the
   // per-slot residual walk.
   entry.add("dynamic_cps_used", cap.dynamic_cps_used);
+  entry.add("dynamic_target_dwt", cap.dynamic_target_dwt);
+  entry.add("dynamic_residual_cycles", cap.dynamic_residual_cycles);
+  entry.add("dynamic_minus_static_cps", cap.dynamic_minus_static_cps);
+  entry.add("dynamic_minus_static_target_cycles",
+            cap.dynamic_minus_static_target_cycles);
 
   // Last-tick instrumentation of the dynamic cps refinement.  Every
   // intermediate value from the most recent tick of dynamic_cps_tick
@@ -2589,6 +2853,52 @@ static void witness_capture_to_payload(const witness_capture_t& cap,
   entry.add("dc_cps_after",            cap.dc_cps_after);
   entry.add("dc_reseed_fired",         cap.dc_reseed_fired);
   entry.add("dc_reseed_computed",      cap.dc_reseed_computed);
+  entry.add("dc_rejected_negative_offset_count",
+            cap.dc_rejected_negative_offset_count);
+  entry.add("dc_rejected_future_offset_count",
+            cap.dc_rejected_future_offset_count);
+  entry.add("dc_rejected_total_count",
+            cap.dc_rejected_total_count);
+
+  entry.add("dc_last_rejected_tick_count",
+            cap.dc_last_rejected_tick_count);
+  entry.add("dc_last_rejected_snap_sequence",
+            cap.dc_last_rejected_snap_sequence);
+  entry.add("dc_last_rejected_dwt_at_fire",
+            cap.dc_last_rejected_dwt_at_fire);
+  entry.add("dc_last_rejected_snap_dwt_at_edge",
+            cap.dc_last_rejected_snap_dwt_at_edge);
+  entry.add("dc_last_rejected_ctx_fire_gnss_ns",
+            cap.dc_last_rejected_ctx_fire_gnss_ns);
+  entry.add("dc_last_rejected_snap_gnss_ns_at_edge",
+            cap.dc_last_rejected_snap_gnss_ns_at_edge);
+  entry.add("dc_last_rejected_gnss_offset_ns",
+            cap.dc_last_rejected_gnss_offset_ns);
+  entry.add("dc_last_rejected_cps_before",
+            cap.dc_last_rejected_cps_before);
+  entry.add("dc_last_rejected_negative",
+            cap.dc_last_rejected_negative);
+  entry.add("dc_last_rejected_future",
+            cap.dc_last_rejected_future);
+
+
+  // Persistent post-reseed snapshot — see witness_capture_t for
+  // field-level semantics.  These repeat across every slot in a
+  // GNSS second, which is the design: they describe the reseed
+  // that started the second, not the per-slot state.
+  entry.add("dc_last_reseed_pps_sequence",          cap.dc_last_reseed_pps_sequence);
+  entry.add("dc_last_reseed_tick_count",            cap.dc_last_reseed_tick_count);
+  entry.add("dc_last_reseed_cps",                   cap.dc_last_reseed_cps);
+  entry.add("dc_last_reseed_snap_dwt_at_edge",      cap.dc_last_reseed_snap_dwt_at_edge);
+  entry.add("dc_last_reseed_prev_snap_dwt_at_edge", cap.dc_last_reseed_prev_snap_dwt_at_edge);
+  entry.add("dc_last_reseed_snap_gnss_ns_at_edge",  cap.dc_last_reseed_snap_gnss_ns_at_edge);
+
+  entry.add("dc_reseed_tick_gnss_offset_ns",        cap.dc_reseed_tick_gnss_offset_ns);
+  entry.add("dc_reseed_tick_dwt_at_fire",           cap.dc_reseed_tick_dwt_at_fire);
+  entry.add("dc_reseed_tick_predicted_dwt",         cap.dc_reseed_tick_predicted_dwt);
+  entry.add("dc_reseed_tick_delta",                 cap.dc_reseed_tick_delta);
+  entry.add("dc_reseed_tick_cps_after",             cap.dc_reseed_tick_cps_after);
+
 }
 
 // ── Dump the per-slot capture buffer AND the anomaly buffer ──
@@ -2625,7 +2935,7 @@ static Payload cmd_witness_dump(const Payload&) {
   // Slots 5..9 are omitted to keep the payload within transport limits
   // while the full instrumentation is active.
   PayloadArray captures_arr;
-  for (uint8_t i = 0; i <= 4; i++) {
+  for (uint8_t i = 1; i <= 3; i++) {
     const witness_capture_t& cap = g_witness_captures[i];
     Payload entry;
     entry.add("array_index", (uint32_t)i);

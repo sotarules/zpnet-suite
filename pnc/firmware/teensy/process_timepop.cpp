@@ -166,6 +166,20 @@ enum class timepop_recurrence_mode_t : uint8_t {
   ABSOLUTE = 2,
 };
 
+enum class timepop_fire_capture_source_t : uint8_t {
+  NONE = 0,
+  IRQ_CH2,
+  SCHEDULE_NEXT,
+};
+
+static const char* fire_capture_source_str(timepop_fire_capture_source_t source) {
+  switch (source) {
+    case timepop_fire_capture_source_t::IRQ_CH2:        return "IRQ_CH2";
+    case timepop_fire_capture_source_t::SCHEDULE_NEXT: return "SCHEDULE_NEXT";
+    default:                                           return "NONE";
+  }
+}
+
 struct timepop_slot_t {
   bool                active;
   bool                expired;
@@ -185,6 +199,7 @@ struct timepop_slot_t {
   int64_t             fire_gnss_ns;
 
   uint32_t            fire_dwt_cyccnt;
+  timepop_fire_capture_source_t fire_capture_source;
 
   uint32_t            anchor_dwt_at_pps;
   uint32_t            anchor_dwt_cycles_per_s;
@@ -495,6 +510,17 @@ static void vclock_monitor_callback(timepop_ctx_t* ctx,
 // ============================================================================
 
 static void schedule_next(void);
+static inline void slot_capture(timepop_slot_t& slot,
+                                uint32_t fire_vclock_raw,
+                                uint32_t fire_dwt_cyccnt,
+                                int64_t fire_gnss_ns,
+                                const time_anchor_snapshot_t& snap,
+                                timepop_fire_capture_source_t source);
+static inline void expire_slot_with_capture(timepop_slot_t& slot,
+                                            uint32_t fire_vclock_raw,
+                                            uint32_t fire_dwt_cyccnt,
+                                            const time_anchor_snapshot_t& snap,
+                                            timepop_fire_capture_source_t source);
 static timepop_handle_t arm_absolute_slot_internal(
   int64_t             target_gnss_ns,
   bool                recurring,
@@ -904,9 +930,14 @@ static void schedule_next(void) {
         slots[i].first_expire_now = now;
         slots[i].first_expire_recorded = true;
       }
-      slots[i].expired = true;
-      expired_count++;
-      timepop_pending = true;
+
+      const time_anchor_snapshot_t snap = time_anchor_snapshot();
+      const uint32_t dwt_now = ARM_DWT_CYCCNT;
+      expire_slot_with_capture(slots[i],
+                               now,
+                               dwt_now,
+                               snap,
+                               timepop_fire_capture_source_t::SCHEDULE_NEXT);
       continue;
     }
 
@@ -949,16 +980,31 @@ static inline void slot_capture(
   uint32_t fire_vclock_raw,
   uint32_t fire_dwt_cyccnt,
   int64_t fire_gnss_ns,
-  const time_anchor_snapshot_t& snap
+  const time_anchor_snapshot_t& snap,
+  timepop_fire_capture_source_t source
 ) {
   slot.fire_vclock_raw         = fire_vclock_raw;
   slot.fire_dwt_cyccnt         = fire_dwt_cyccnt;
   slot.fire_gnss_ns            = fire_gnss_ns;
+  slot.fire_capture_source     = source;
   slot.anchor_dwt_at_pps       = snap.dwt_at_pps;
   slot.anchor_dwt_cycles_per_s = snap.dwt_cycles_per_s;
   slot.anchor_qtimer_at_pps    = snap.qtimer_at_pps;
   slot.anchor_pps_count        = snap.pps_count;
   slot.anchor_valid            = snap.ok && snap.valid;
+}
+
+static inline void expire_slot_with_capture(timepop_slot_t& slot,
+                                            uint32_t fire_vclock_raw,
+                                            uint32_t fire_dwt_cyccnt,
+                                            const time_anchor_snapshot_t& snap,
+                                            timepop_fire_capture_source_t source) {
+  const int64_t fire_gnss_ns = vclock_to_gnss_ns(fire_vclock_raw, snap);
+  slot_capture(slot, fire_vclock_raw, fire_dwt_cyccnt, fire_gnss_ns, snap, source);
+
+  slot.expired = true;
+  expired_count++;
+  timepop_pending = true;
 }
 
 static inline void slot_build_ctx(
@@ -1087,24 +1133,15 @@ void timepop_qtimer1_ch2_handler(const interrupt_event_t& event,
 
     validate_dispatch_against_dwt(slots[i], landed_dwt);
 
-    // ── fire_gnss_ns computation — VCLOCK arithmetic ──
-    //
-    // Per this file's design doctrine (see file header):
-    //   fire_gnss_ns = (pps_count - 1) * 1e9 + (fire_vclock_raw - qtimer_at_pps) * 100
-    //
-    // VCLOCK is the authoritative time base.  DWT is diagnostic.
-    // We compute fire_gnss_ns from the ISR-entry VCLOCK counter value
-    // (`now`) and the time anchor — pure gears, no ambient reads, no
-    // DWT bridge dependency.
-    //
-    // The dispatcher contract is: fire_gnss_ns is ALWAYS the GNSS
-    // nanosecond at which this slot fired.  No exceptions.  If the
-    // anchor is not yet valid, vclock_to_gnss_ns returns -1 and the
-    // callback sees that honest sentinel — never 0, never a bridge-
-    // derived fallback.
-    const int64_t fire_gnss_ns = vclock_to_gnss_ns(now, anchor);
-
-    slot_capture(slots[i], now, landed_dwt, fire_gnss_ns, anchor);
+    // Capture the client-visible fire context exactly once, through the
+    // same helper used by all expiration paths.  This keeps
+    // fire_vclock_raw / fire_dwt_cyccnt / fire_gnss_ns / anchor_* coherent
+    // and prevents scheduled-context callbacks from seeing stale captures.
+    expire_slot_with_capture(slots[i],
+                             now,
+                             landed_dwt,
+                             anchor,
+                             timepop_fire_capture_source_t::IRQ_CH2);
 
     slots[i].isr_callback_fired = false;
 
@@ -1120,8 +1157,6 @@ void timepop_qtimer1_ch2_handler(const interrupt_event_t& event,
       diag_isr_callbacks++;
     }
 
-    slots[i].expired = true;
-    expired_count++;
     any_expired = true;
   }
 
@@ -2096,6 +2131,11 @@ out.add("vclock_edge_monitor_last_vclock_minus_pps_ns", g_vclock_edge_monitor.la
     entry.add("target_gnss_ns",   slots[i].target_gnss_ns);
     entry.add("predicted_dwt",    slots[i].predicted_dwt);
     entry.add("prediction_valid", slots[i].prediction_valid);
+    entry.add("fire_capture_source",
+              fire_capture_source_str(slots[i].fire_capture_source));
+    entry.add("fire_gnss_ns",      slots[i].fire_gnss_ns);
+    entry.add("fire_dwt_cyccnt",   slots[i].fire_dwt_cyccnt);
+    entry.add("fire_vclock_raw",   slots[i].fire_vclock_raw);
 
     entry.add("recurring_rearmed_count",          slots[i].recurring_rearmed_count);
     entry.add("recurring_immediate_expire_count", slots[i].recurring_immediate_expire_count);
