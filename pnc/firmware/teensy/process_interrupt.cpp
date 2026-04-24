@@ -90,6 +90,41 @@ static constexpr const char* HW_WITNESS_LOW_NAME  = "HW_WITNESS_LOW";
 // reopening every downstream consumer.
 static constexpr uint32_t VCLOCK_EPOCH_TICKS_AFTER_PHYSICAL_PPS = 1;
 static constexpr int32_t  VCLOCK_EPOCH_COUNTER32_OFFSET_TICKS   = 0;
+static constexpr int64_t  GNSS_NS_PER_SECOND                    = 1000000000LL;
+
+// Absolute GNSS identity for the current VCLOCK/PPS epoch.
+//
+// This is deliberately VCLOCK/PPS-authored after initial acquisition:
+// once the first absolute GNSS second is identified, subsequent PPS epochs
+// advance by exactly one GNSS second.  Do not derive subsecond VCLOCK GNSS
+// coordinates through DWT interpolation; VCLOCK is the ruler.
+static int64_t g_vclock_epoch_gnss_ns = -1;
+
+pps_edge_snapshot_t interrupt_last_pps_edge(void);
+
+static int64_t vclock_epoch_gnss_from_dwt_seed(int64_t dwt_gnss_estimate_ns) {
+  if (dwt_gnss_estimate_ns < 0) return -1;
+  return ((dwt_gnss_estimate_ns + GNSS_NS_PER_SECOND / 2LL) /
+          GNSS_NS_PER_SECOND) * GNSS_NS_PER_SECOND;
+}
+
+static int64_t vclock_next_epoch_gnss_ns(int64_t dwt_gnss_estimate_ns) {
+  if (g_vclock_epoch_gnss_ns >= 0) {
+    g_vclock_epoch_gnss_ns += GNSS_NS_PER_SECOND;
+    return g_vclock_epoch_gnss_ns;
+  }
+
+  g_vclock_epoch_gnss_ns = vclock_epoch_gnss_from_dwt_seed(dwt_gnss_estimate_ns);
+  return g_vclock_epoch_gnss_ns;
+}
+
+static int64_t vclock_gnss_from_counter32(uint32_t authored_counter32) {
+  const pps_edge_snapshot_t snap = interrupt_last_pps_edge();
+  if (snap.sequence == 0 || snap.gnss_ns_at_edge < 0) return -1;
+
+  const uint32_t delta_ticks = authored_counter32 - snap.counter32_at_edge;
+  return snap.gnss_ns_at_edge + (int64_t)delta_ticks * 100LL;
+}
 
 
 // ============================================================================
@@ -245,13 +280,12 @@ struct dynamic_cps_tick_state_t {
 
 static dynamic_cps_tick_state_t g_dynamic_cps_last_tick = {};
 
-static void dynamic_cps_cadence_update(uint32_t dwt_raw_at_cadence,
+static void dynamic_cps_cadence_update(uint32_t dwt_at_fire,
                                        uint32_t cadence_counter32,
                                        uint32_t cadence_tick_mod_1000) {
 
   // CH3 VCLOCK cadence is the internal PPS-phased 1 kHz gear train.
-  // Use its QTimer-edge-normalized DWT capture as the observation point.
-  const uint32_t dwt_at_fire = dwt_at_qtimer_edge(dwt_raw_at_cadence);
+  // dwt_at_fire is already the latency-compensated QTimer event DWT.
 
   const pps_edge_snapshot_t snap = interrupt_last_pps_edge();
 
@@ -307,7 +341,7 @@ static void dynamic_cps_cadence_update(uint32_t dwt_raw_at_cadence,
   // The exact 1-second cadence hit belongs to the next PPS epoch.  Do not
   // publish it as the "last dynamic tick" for witness purposes and do not
   // count it as an anomaly; it is the expected boundary condition.
-  if (gnss_offset_ns >= 1000000000LL) {
+  if (gnss_offset_ns >= GNSS_NS_PER_SECOND) {
     return;
   }
 
@@ -355,7 +389,7 @@ static void dynamic_cps_cadence_update(uint32_t dwt_raw_at_cadence,
       snap.dwt_at_edge +
       (uint32_t)((uint64_t)g_dynamic_cps *
                  (uint64_t)gnss_offset_ns /
-                 1000000000ULL);
+                 (uint64_t)GNSS_NS_PER_SECOND);
 
   const int32_t delta = (int32_t)(dwt_at_fire - predicted_dwt);
 
@@ -375,7 +409,7 @@ static void dynamic_cps_cadence_update(uint32_t dwt_raw_at_cadence,
     observed_cycles = dwt_at_fire - snap.dwt_at_edge;
 
     inferred_cps =
-        (uint32_t)(((uint64_t)observed_cycles * 1000000000ULL +
+        (uint32_t)(((uint64_t)observed_cycles * (uint64_t)GNSS_NS_PER_SECOND +
                     (uint64_t)gnss_offset_ns / 2ULL) /
                    (uint64_t)gnss_offset_ns);
 
@@ -446,8 +480,31 @@ dynamic_cps_tick_state_t interrupt_dynamic_cps_last_tick(void) {
   return g_dynamic_cps_last_tick;
 }
 
+// ============================================================================
+// DWT event-coordinate helpers
+// ============================================================================
+//
+// Raw ARM_DWT_CYCCNT values captured at ISR entry are implementation details.
+// They must be converted immediately into event-coordinate DWT values before
+// they are stored, published, or handed to subscribers.  After process_interrupt
+// crosses a module boundary, DWT values are already latency-compensated event
+// coordinates.
+
+static inline uint32_t dwt_for_qtimer_compare_event(uint32_t isr_entry_dwt) {
+  return dwt_at_qtimer_edge(isr_entry_dwt);
+}
+
+static inline uint32_t dwt_for_physical_gpio_edge(uint32_t isr_entry_dwt) {
+  return dwt_at_gpio_edge(isr_entry_dwt);
+}
+
 static inline int32_t vclock_epoch_dwt_offset_cycles(void) {
   return CANONICAL_VCLOCK_EPOCH_MINUS_RAW_PPS_ISR_CYCLES;
+}
+
+static inline uint32_t dwt_for_canonical_vclock_epoch_from_pps(
+    uint32_t isr_entry_dwt) {
+  return isr_entry_dwt + (uint32_t)vclock_epoch_dwt_offset_cycles();
 }
 
 // ============================================================================
@@ -649,13 +706,13 @@ struct pps_edge_snapshot_store_t {
   volatile uint32_t seq               = 0;
   volatile uint32_t sequence          = 0;
   volatile uint32_t dwt_at_edge       = 0;
-  volatile uint32_t dwt_raw_at_edge   = 0;
+  volatile uint32_t dwt_legacy_at_edge = 0;
   volatile uint32_t counter32_at_edge = 0;
   volatile uint16_t ch3_at_edge       = 0;
   volatile int64_t  gnss_ns_at_edge   = -1;
 
-  volatile uint32_t physical_pps_dwt_raw_at_edge        = 0;
-  volatile uint32_t physical_pps_dwt_normalized_at_edge = 0;
+  volatile uint32_t physical_pps_dwt_legacy_at_edge = 0;
+  volatile uint32_t physical_pps_dwt_at_edge        = 0;
   volatile uint32_t physical_pps_counter32_at_read      = 0;
   volatile uint16_t physical_pps_ch3_at_read            = 0;
 
@@ -697,8 +754,7 @@ uint16_t interrupt_qtimer3_ch3_counter_now(void) { return IMXRT_TMR3.CH[3].CNTR;
 
 static inline void witness_welford_update(witness_welford_t& w, int32_t sample);
 
-static void witness_cadence_observe(uint32_t dwt_raw,
-                                    uint32_t dwt_normalized,
+static void witness_cadence_observe(uint32_t dwt_at_fire,
                                     uint32_t authored_counter32,
                                     uint32_t cadence_tick_mod_1000);
 
@@ -981,7 +1037,14 @@ static void emit_one_second_event(interrupt_subscriber_runtime_t& rt,
   event.pps_coincidence_cycles = pps_coincidence_cycles;
   event.pps_coincidence_valid  = pps_coincidence_valid;
 
-  const int64_t gnss_ns = time_dwt_to_gnss_ns(dwt_at_event);
+  int64_t gnss_ns = -1;
+  if (rt.desc->kind == interrupt_subscriber_kind_t::VCLOCK) {
+    gnss_ns = vclock_gnss_from_counter32(authored_counter32);
+  } else {
+    // OCXO lanes are not GNSS-authored rulers; their GNSS event time
+    // must still be derived from the DWT->GNSS interpolation model.
+    gnss_ns = time_dwt_to_gnss_ns(dwt_at_event);
+  }
   event.gnss_ns_at_event = (gnss_ns >= 0) ? (uint64_t)gnss_ns : 0;
   event.status = interrupt_event_status_t::OK;
 
@@ -1015,8 +1078,8 @@ static void vclock_lane_advance_compare(void) {
   qtimer1_ch3_program_compare(g_vclock_lane.compare_target);
 }
 
-static void vclock_cadence_isr(uint32_t dwt_raw) {
-  const uint32_t dwt_at_edge = dwt_at_qtimer_edge(dwt_raw);
+static void vclock_cadence_isr(uint32_t isr_entry_dwt) {
+  const uint32_t dwt_at_edge = dwt_for_qtimer_compare_event(isr_entry_dwt);
   g_vclock_lane.irq_count++;
   if (g_rt_vclock) g_rt_vclock->irq_count++;
 
@@ -1041,12 +1104,11 @@ static void vclock_cadence_isr(uint32_t dwt_raw) {
       g_vclock_lane.logical_count32_at_last_second +
       cadence_tick_mod_1000 * VCLOCK_INTERVAL_COUNTS;
 
-  dynamic_cps_cadence_update(dwt_raw,
+  dynamic_cps_cadence_update(dwt_at_edge,
                              cadence_counter32,
                              cadence_tick_mod_1000);
 
-  witness_cadence_observe(dwt_raw,
-                          dwt_at_edge,
+  witness_cadence_observe(dwt_at_edge,
                           cadence_counter32,
                           cadence_tick_mod_1000);
 
@@ -1105,8 +1167,8 @@ static void ocxo_lane_advance_compare(ocxo_lane_t& lane) {
 
 static void handle_ocxo_qtimer16_irq(ocxo_lane_t& lane,
                                      interrupt_subscriber_runtime_t& rt,
-                                     uint32_t dwt_raw) {
-  const uint32_t dwt_at_edge = dwt_at_qtimer_edge(dwt_raw);
+                                     uint32_t isr_entry_dwt) {
+  const uint32_t dwt_at_edge = dwt_for_qtimer_compare_event(isr_entry_dwt);
   lane.irq_count++;
   rt.irq_count++;
 
@@ -1234,7 +1296,6 @@ static volatile witness_slot_t g_witness_current = { 0, 0, 0xFF };
 // fires.
 static volatile uint32_t g_witness_anchor_counter32 = 0;
 static volatile uint32_t g_witness_anchor_dwt       = 0;
-static volatile uint32_t g_witness_anchor_dwt_raw   = 0;
 static volatile uint32_t g_witness_anchor_dwt_cps   = 1008000000;
 
 static witness_welford_t g_witness_welford = {};
@@ -1273,45 +1334,32 @@ struct witness_capture_t {
   // witness_arm_slot).  These are the PPS-edge-derived inputs that
   // target_vclock and target_dwt were computed from.
   uint32_t anchor_counter32;
-  uint32_t anchor_dwt;           // NORMALIZED value used in target_dwt math
-  uint32_t anchor_dwt_raw;       // RAW PPS ISR-entry DWT (audit field)
+  uint32_t anchor_dwt;           // event-coordinate value used in target_dwt math
   uint32_t anchor_dwt_cps;
 
   // Targets as programmed for this slot.
   uint32_t target_vclock;
   uint32_t target_dwt;
 
-  // ISR-entry captures (this is what the fire actually saw).
-  uint32_t dwt_at_fire;         // NORMALIZED value that feeds the residual:
-  //   dwt_raw_at_fire − dwt_at_fire_normalization_offset
-  uint32_t counter32_at_fire;   // cascade-read 32-bit VCLOCK counter
+  // Event-coordinate capture at the authored cadence edge.
+  uint32_t dwt_at_fire;         // latency-compensated QTimer event DWT
+  uint32_t counter32_at_fire;   // authored VCLOCK counter coordinate
   uint16_t ch3_cntr_at_fire;    // CH3's own low-16 counter
-
-  // ── Normalization audit (added for double-subtraction hunt) ──
-  //
-  // dwt_raw_at_fire is the true first-instruction ARM_DWT_CYCCNT captured at
-  // witness_ch3_isr entry, unmodified by any latency subtraction.  The
-  // offset is the exact number of cycles subtracted by dwt_at_qtimer_edge
-  // to produce dwt_at_fire, computed as (dwt_raw_at_fire − dwt_at_fire).
-  //
-  // Invariant (single normalization): offset == QTIMER_TOTAL_LATENCY −
-  // WITNESS_STIMULATE_LATENCY == 48 cycles.
-  //   • 48  → normalization applied exactly once (expected)
-  //   • 96  → normalization applied twice (bug on fire side)
-  //   •  0  → normalization not applied (bug on fire side)
-  //   • anything else → something we don't yet understand
-  //
-  // If offset == 48 and residual is still biased, the fire-side math is
-  // honest and the bias lives elsewhere (anchor side, cps, or a constant
-  // we haven't yet characterized).
-  uint32_t dwt_raw_at_fire;
-  uint32_t dwt_at_fire_normalization_offset;
 
   // Derived diagnostics (same arithmetic as the ISR performs for the
   // Welford; captured verbatim for easy correlation).
   int32_t  vclock_delta;        // counter32_at_fire - target_vclock
   int32_t  residual_cycles;     // dwt_at_fire - target_dwt
   int32_t  lag_ticks;           // (counter32 & 0xFFFF) - ch3_cntr
+
+  // GNSS-domain comparison of the two time paths at this authored
+  // cadence edge.  gnss_from_dwt_ns is produced by the current
+  // DWT->GNSS model; gnss_from_vclock_ns is produced directly from
+  // the authored VCLOCK cadence identity.  The residual is DWT-model
+  // GNSS minus VCLOCK-authored GNSS.
+  int64_t  gnss_from_dwt_ns;
+  int64_t  gnss_from_vclock_ns;
+  int64_t  gnss_residual_ns;
 
   // Dynamic cps observed at this fire.  Captured for comparison against
   // anchor_dwt_cps (the stale, PPS-anchored value currently used for
@@ -1547,46 +1595,9 @@ static inline uint32_t witness_compute_target_vclock(uint32_t anchor_counter32,
   return anchor_counter32 + slot_index * WITNESS_VCLOCK_TICKS_PER_SLOT;
 }
 
-// Arm CH3 for a specific slot.  Called from:
-//   • interrupt_witness_arm_first_slot (slot_index = 0, from PPS edge)
-//   • witness_ch3_isr itself (slot_index = 1..9, self-rotation)
-// At slot_index == WITNESS_N_SLOTS + 1 the witness disables CH3 and
-// waits for the next PPS edge to re-arm slot 0.
-//
-// Slot 0 is a CH3 fire with target == anchor (delta 0); physically it
-// catches the first compare-match AFTER arming, which is a wrap-alias
-// ~6.5ms later.  The wrap-alias filter in witness_ch3_isr specifically
-// accepts slot 0's first wrap; see witness_ch3_isr comment.
-static void witness_arm_slot(uint8_t slot_index) {
-  if (slot_index > WITNESS_N_SLOTS) {
-    qtimer1_ch3_disable_compare();
-    g_witness_current.slot_index = 0xFF;  // disarmed sentinel
-    return;
-  }
-
-  const uint32_t target_vclock =
-      witness_compute_target_vclock(g_witness_anchor_counter32, slot_index);
-  const uint32_t target_dwt =
-      witness_compute_target_dwt(g_witness_anchor_dwt,
-                                 g_witness_anchor_dwt_cps,
-                                 slot_index);
-
-  // Store slot state atomically from the ISR's perspective.  ISR reads
-  // slot_index last; we write it last.
-  g_witness_current.target_vclock = target_vclock;
-  g_witness_current.target_dwt    = target_dwt;
-  g_witness_current.slot_index    = slot_index;
-
-  // Program CH3 compare for low 16 bits.  The full 32-bit target_vclock
-  // is stored for the ISR's sanity check; the hardware compare operates
-  // on the low 16 bits only.
-  qtimer1_ch3_program_compare((uint16_t)(target_vclock & 0xFFFF));
-}
-
 // Passive cadence witness path — called from vclock_cadence_isr on the
 // real production VCLOCK cadence lane.
-static void witness_cadence_observe(uint32_t dwt_raw,
-                                    uint32_t dwt_normalized,
+static void witness_cadence_observe(uint32_t dwt_at_fire,
                                     uint32_t authored_counter32,
                                     uint32_t cadence_tick_mod_1000) {
   if (cadence_tick_mod_1000 == 0 ||
@@ -1603,7 +1614,6 @@ static void witness_cadence_observe(uint32_t dwt_raw,
 
   const uint32_t anchor_counter32 = snap.counter32_at_edge;
   const uint32_t anchor_dwt = snap.dwt_at_edge;
-  const uint32_t anchor_dwt_raw = snap.dwt_raw_at_edge;
   const uint32_t anchor_dwt_cps = interrupt_dynamic_cps();
   const uint32_t target_vclock = witness_compute_target_vclock(anchor_counter32, slot_index);
   const uint32_t target_dwt = witness_compute_target_dwt(anchor_dwt, anchor_dwt_cps, slot_index);
@@ -1614,10 +1624,17 @@ static void witness_cadence_observe(uint32_t dwt_raw,
   const int32_t vclock_delta = (int32_t)(authored_counter32 - target_vclock);
   const int32_t lag_ticks = 0;
   witness_welford_update(g_witness_lag_welford, lag_ticks);
-  const int32_t residual_cycles = (int32_t)(dwt_normalized - target_dwt);
+  const int32_t residual_cycles = (int32_t)(dwt_at_fire - target_dwt);
+
+  const uint32_t vclock_ticks_since_anchor = authored_counter32 - anchor_counter32;
+  const int64_t gnss_from_dwt_ns = time_dwt_to_gnss_ns(dwt_at_fire);
+  const int64_t gnss_from_vclock_ns =
+      snap.gnss_ns_at_edge + (int64_t)vclock_ticks_since_anchor * 100LL;
+  const int64_t gnss_residual_ns = gnss_from_dwt_ns - gnss_from_vclock_ns;
+
   const uint32_t dynamic_cps_used = interrupt_dynamic_cps();
   const uint32_t dynamic_target_dwt = witness_compute_target_dwt(anchor_dwt, dynamic_cps_used, slot_index);
-  const int32_t dynamic_residual_cycles = (int32_t)(dwt_normalized - dynamic_target_dwt);
+  const int32_t dynamic_residual_cycles = (int32_t)(dwt_at_fire - dynamic_target_dwt);
   const int32_t dynamic_minus_static_cps = (int32_t)(dynamic_cps_used - anchor_dwt_cps);
   const int32_t dynamic_minus_static_target_cycles = (int32_t)(dynamic_target_dwt - target_dwt);
 
@@ -1628,18 +1645,18 @@ static void witness_cadence_observe(uint32_t dwt_raw,
   cap.valid = true;
   cap.anchor_counter32 = anchor_counter32;
   cap.anchor_dwt = anchor_dwt;
-  cap.anchor_dwt_raw = anchor_dwt_raw;
   cap.anchor_dwt_cps = anchor_dwt_cps;
   cap.target_vclock = target_vclock;
   cap.target_dwt = target_dwt;
-  cap.dwt_at_fire = dwt_normalized;
-  cap.dwt_raw_at_fire = dwt_raw;
-  cap.dwt_at_fire_normalization_offset = dwt_raw - dwt_normalized;
+  cap.dwt_at_fire = dwt_at_fire;
   cap.counter32_at_fire = authored_counter32;
   cap.ch3_cntr_at_fire = (uint16_t)(authored_counter32 & 0xFFFF);
   cap.vclock_delta = vclock_delta;
   cap.residual_cycles = residual_cycles;
   cap.lag_ticks = lag_ticks;
+  cap.gnss_from_dwt_ns = gnss_from_dwt_ns;
+  cap.gnss_from_vclock_ns = gnss_from_vclock_ns;
+  cap.gnss_residual_ns = gnss_residual_ns;
   cap.dynamic_cps_used = dynamic_cps_used;
   cap.dynamic_target_dwt = dynamic_target_dwt;
   cap.dynamic_residual_cycles = dynamic_residual_cycles;
@@ -1845,7 +1862,7 @@ uint32_t interrupt_hw_witness_qtimer_tcf1_seen_in_irq(void) {
 //
 
 static void qtimer1_isr(void) {
-  const uint32_t dwt_raw = ARM_DWT_CYCCNT;  // FIRST instruction — sacred capture
+  const uint32_t isr_entry_dwt = ARM_DWT_CYCCNT;  // FIRST instruction — sacred capture
 
   // ── CH2 (TimePop scheduler) ──
   //
@@ -1856,7 +1873,7 @@ static void qtimer1_isr(void) {
 
     if (g_qtimer1_ch2_handler) {
       const uint32_t counter32 = 0;
-      const uint32_t dwt_at_edge = dwt_at_qtimer_edge(dwt_raw);
+      const uint32_t dwt_at_edge = dwt_for_qtimer_compare_event(isr_entry_dwt);
       const int64_t gnss_ns_at_edge = time_dwt_to_gnss_ns(dwt_at_edge);
 
       interrupt_event_t event{};
@@ -1887,7 +1904,7 @@ static void qtimer1_isr(void) {
   // handled by a subsequent NVIC re-dispatch with its own fresh `dwt_raw`.
   //
   else if (IMXRT_TMR1.CH[3].CSCTRL & TMR_CSCTRL_TCF1) {
-    vclock_cadence_isr(dwt_raw);
+    vclock_cadence_isr(isr_entry_dwt);
   }
 }
 
@@ -1918,17 +1935,17 @@ static void pps_edge_dispatch_trampoline(timepop_ctx_t*, timepop_diag_t*, void*)
   }
 }
 
-void process_interrupt_gpio6789_irq(uint32_t dwt_isr_entry_raw) {
-  const uint32_t physical_pps_dwt_normalized = dwt_at_gpio_edge(dwt_isr_entry_raw);
+void process_interrupt_gpio6789_irq(uint32_t isr_entry_dwt) {
+  const uint32_t physical_pps_dwt_at_edge =
+      dwt_for_physical_gpio_edge(isr_entry_dwt);
 
   // ── First-instruction captures ──
   //
-  // Read the VCLOCK counter state IMMEDIATELY after the DWT capture.
-  // These three captures (DWT, counter32, ch3) define the PPS moment
-  // in hardware-counter terms.  Total additional cost vs. the old ISR
-  // is ~8 loads (counter32 is dual-read for cascade safety).  At
-  // 1 GHz this is on the order of tens of nanoseconds — well under
-  // one VCLOCK period.
+  // Convert the raw ISR-entry DWT immediately into the two event
+  // coordinates we care about: the physical GPIO PPS edge for audit,
+  // and the canonical VCLOCK-selected epoch for publication.  Raw DWT
+  // does not leave this stack frame.  The VCLOCK counter read is used
+  // only to establish the external PPS tick identity at bootstrap.
   //
   const uint32_t counter32 = qtimer1_read_32_for_diag();
   const uint16_t ch3_now   = (uint16_t)(counter32 & 0xFFFF);
@@ -1936,18 +1953,17 @@ void process_interrupt_gpio6789_irq(uint32_t dwt_isr_entry_raw) {
 
   // Diagnostic: measure the peripheral-bus delay between ISR first
   // instruction and the counter read moment.  This cost is what makes
-  // `counter32` lag `dwt_isr_entry_raw` in real time.  If we're chasing
+  // `counter32` lag `isr_entry_dwt` in real time.  If we're chasing
   // a residual offset in the witness, we need to know this number.
   const int32_t counter_read_delay_cycles =
-      (int32_t)(dwt_after_counter_reads - dwt_isr_entry_raw);
+      (int32_t)(dwt_after_counter_reads - isr_entry_dwt);
   witness_welford_update(g_witness_gpio_counter_delay_welford,
                          counter_read_delay_cycles);
 
   g_gpio_irq_count++;
   g_pps_gpio_witness.edge_count++;
   // Derive the canonical VCLOCK-domain epoch selected by this physical PPS.
-  // Public "PPS" subscribers receive these canonical values.  The raw GPIO
-  // capture remains available in the snapshot as physical_pps_* audit data.
+  // Public "PPS" subscribers receive these canonical values.
   const int32_t selected_counter_offset_ticks = VCLOCK_EPOCH_COUNTER32_OFFSET_TICKS;
   const uint32_t selected_counter32 =
       counter32 + (uint32_t)selected_counter_offset_ticks;
@@ -1955,11 +1971,15 @@ void process_interrupt_gpio6789_irq(uint32_t dwt_isr_entry_raw) {
       (uint16_t)(ch3_now + (int16_t)selected_counter_offset_ticks);
   const int32_t selected_dwt_offset_cycles = vclock_epoch_dwt_offset_cycles();
   const uint32_t dwt_at_edge =
-      dwt_isr_entry_raw + (uint32_t)selected_dwt_offset_cycles;
+      dwt_for_canonical_vclock_epoch_from_pps(isr_entry_dwt);
 
   g_pps_gpio_witness.last_dwt = dwt_at_edge;
 
-  const int64_t gnss_ns = time_dwt_to_gnss_ns(dwt_at_edge);
+  // The public PPS/VCLOCK epoch GNSS coordinate is VCLOCK-authored.
+  // Use DWT only to identify the absolute second on first acquisition;
+  // after that, advance by exactly one GNSS second per PPS.
+  const int64_t dwt_gnss_estimate_ns = time_dwt_to_gnss_ns(dwt_at_edge);
+  const int64_t gnss_ns = vclock_next_epoch_gnss_ns(dwt_gnss_estimate_ns);
   g_pps_gpio_witness.last_gnss_ns = gnss_ns;
 
   // ── PPS-anchored VCLOCK rebootstrap ──
@@ -2011,23 +2031,22 @@ void process_interrupt_gpio6789_irq(uint32_t dwt_isr_entry_raw) {
 
   // ── Snapshot publication (seqlock) ──
   //
-  // counter32_at_edge is published RAW — the honest hardware reading
-  // taken ~140 cycles after the PPS edge.  Downstream consumers that
-  // need the PPS-corresponding counter identity (rather than the
-  // bus-read-moment identity) apply VCLOCK_EPOCH_TICK_OFFSET
-  // themselves.  Alpha's epoch install does this; the witness armer
-  // then reads alpha's corrected epoch rather than the raw snapshot.
+  // All stored DWT values are event
+  // coordinates.  Legacy field names that still contain "raw" are retained
+  // only for API compatibility and do not carry ISR-entry DWT.
   g_pps_edge_store.seq++;
   dmb_barrier();
   g_pps_edge_store.sequence          = g_pps_gpio_witness.edge_count;
   g_pps_edge_store.dwt_at_edge       = dwt_at_edge;
-  g_pps_edge_store.dwt_raw_at_edge   = dwt_isr_entry_raw;
+  // Legacy "raw" field name retained for API compatibility; store the
+  // canonical event-coordinate DWT, not the raw ISR-entry value.
+  g_pps_edge_store.dwt_legacy_at_edge   = dwt_at_edge;
   g_pps_edge_store.counter32_at_edge = selected_counter32;
   g_pps_edge_store.ch3_at_edge       = selected_ch3;
   g_pps_edge_store.gnss_ns_at_edge   = gnss_ns;
 
-  g_pps_edge_store.physical_pps_dwt_raw_at_edge        = dwt_isr_entry_raw;
-  g_pps_edge_store.physical_pps_dwt_normalized_at_edge = physical_pps_dwt_normalized;
+  g_pps_edge_store.physical_pps_dwt_legacy_at_edge        = physical_pps_dwt_at_edge;
+  g_pps_edge_store.physical_pps_dwt_at_edge = physical_pps_dwt_at_edge;
   g_pps_edge_store.physical_pps_counter32_at_read      = counter32;
   g_pps_edge_store.physical_pps_ch3_at_read            = ch3_now;
 
@@ -2046,8 +2065,8 @@ void process_interrupt_gpio6789_irq(uint32_t dwt_isr_entry_raw) {
 }
 
 static void pps_gpio_isr(void) {
-  const uint32_t dwt_raw = ARM_DWT_CYCCNT;
-  process_interrupt_gpio6789_irq(dwt_raw);
+  const uint32_t isr_entry_dwt = ARM_DWT_CYCCNT;
+  process_interrupt_gpio6789_irq(isr_entry_dwt);
 }
 
 void interrupt_pps_edge_register_dispatch(pps_edge_dispatch_fn fn) {
@@ -2061,13 +2080,13 @@ pps_edge_snapshot_t interrupt_last_pps_edge(void) {
     dmb_barrier();
     out.sequence          = g_pps_edge_store.sequence;
     out.dwt_at_edge       = g_pps_edge_store.dwt_at_edge;
-    out.dwt_raw_at_edge   = g_pps_edge_store.dwt_raw_at_edge;
+    out.dwt_raw_at_edge   = g_pps_edge_store.dwt_legacy_at_edge;
     out.counter32_at_edge = g_pps_edge_store.counter32_at_edge;
     out.ch3_at_edge       = g_pps_edge_store.ch3_at_edge;
     out.gnss_ns_at_edge   = g_pps_edge_store.gnss_ns_at_edge;
 
-    out.physical_pps_dwt_raw_at_edge        = g_pps_edge_store.physical_pps_dwt_raw_at_edge;
-    out.physical_pps_dwt_normalized_at_edge = g_pps_edge_store.physical_pps_dwt_normalized_at_edge;
+    out.physical_pps_dwt_raw_at_edge        = g_pps_edge_store.physical_pps_dwt_legacy_at_edge;
+    out.physical_pps_dwt_normalized_at_edge = g_pps_edge_store.physical_pps_dwt_at_edge;
     out.physical_pps_counter32_at_read      = g_pps_edge_store.physical_pps_counter32_at_read;
     out.physical_pps_ch3_at_read            = g_pps_edge_store.physical_pps_ch3_at_read;
 
@@ -2146,6 +2165,7 @@ bool interrupt_stop(interrupt_subscriber_kind_t kind) {
 
 void interrupt_request_pps_rebootstrap(void) {
   g_pps_rebootstrap_pending = true;
+  g_vclock_epoch_gnss_ns = -1;
 }
 
 bool interrupt_pps_rebootstrap_pending(void) {
@@ -2363,6 +2383,7 @@ void process_interrupt_init(void) {
   g_pps_gpio_witness = pps_gpio_witness_t{};
   g_gpio_irq_count = 0;
   g_gpio_miss_count = 0;
+  g_vclock_epoch_gnss_ns = -1;
   g_pps_rebootstrap_pending = false;
   g_pps_rebootstrap_count = 0;
 
@@ -2472,8 +2493,6 @@ static Payload cmd_report(const Payload&) {
   p.add("pps_edge_ch3", (uint32_t)snap.ch3_at_edge);
   p.add("pps_edge_gnss_ns_snapshot", snap.gnss_ns_at_edge);
   p.add("pps_edge_is_vclock_epoch", snap.vclock_epoch_selected);
-  p.add("pps_physical_gpio_dwt_raw", snap.physical_pps_dwt_raw_at_edge);
-  p.add("pps_physical_gpio_dwt_normalized", snap.physical_pps_dwt_normalized_at_edge);
   p.add("pps_physical_gpio_counter32_at_read", snap.physical_pps_counter32_at_read);
   p.add("pps_physical_gpio_ch3_at_read", (uint32_t)snap.physical_pps_ch3_at_read);
   p.add("pps_vclock_epoch_counter32", snap.vclock_epoch_counter32);
@@ -2745,45 +2764,6 @@ static Payload cmd_witness_mode(const Payload& args) {
   return p;
 }
 
-static Payload cmd_witness_start(const Payload&) {
-  interrupt_witness_reset_stats();
-  dynamic_cps_reset_diagnostics();
-  witness_welford_reset(g_hw_witness_gpio_welford);
-  witness_welford_reset(g_hw_witness_qtimer_welford);
-  witness_welford_reset(g_hw_witness_source_stimulate_welford);
-  g_hw_witness_gpio_last_reported_hits = 0;
-  g_hw_witness_qtimer_last_reported_hits = 0;
-  hw_witness_apply_mode();
-  interrupt_witness_set_mode(interrupt_witness_mode_t::ON);
-  Payload p;
-  p.add("witness_active", true);
-  p.add("status", "WITNESS_STARTED");
-  return p;
-}
-
-static Payload cmd_witness_stop(const Payload&) {
-  interrupt_witness_set_mode(interrupt_witness_mode_t::OFF);
-
-  // Do NOT request a hardware-only rebootstrap here.
-  //
-  // A raw interrupt_request_pps_rebootstrap() re-phases CH3, but alpha
-  // does not install a new epoch or reset its VCLOCK measurement state.
-  // The first VCLOCK sample after witness mode would then span across
-  // the witness pause and appear as a bogus multi-second VCLOCK window.
-  //
-  // Let the next explicit ZERO/START path request a full alpha-owned
-  // epoch install.  For manual witness testing, follow WITNESS_STOP with
-  // CLOCKS ZERO or CLOCKS START if canonical clock publication should
-  // resume immediately.
-  const interrupt_witness_stats_t ws = interrupt_witness_stats();
-  Payload p;
-  p.add("witness_active", false);
-  p.add("witness_n",        (uint32_t)ws.n);
-  p.add("witness_mean_ns",  ws.mean_ns);
-  p.add("status", "WITNESS_STOPPED");
-  return p;
-}
-
 static Payload cmd_witness_reset(const Payload&) {
   interrupt_witness_reset_stats();
   witness_welford_reset(g_hw_witness_gpio_welford);
@@ -2813,7 +2793,6 @@ static void witness_capture_to_payload(const witness_capture_t& cap,
   // Anchors (PPS-edge-derived inputs to the prediction).
   entry.add("anchor_counter32", cap.anchor_counter32);
   entry.add("anchor_dwt",       cap.anchor_dwt);
-  entry.add("anchor_dwt_raw",   cap.anchor_dwt_raw);
   entry.add("anchor_dwt_cps",   cap.anchor_dwt_cps);
 
   // ── Prediction helpers (for calculator-friendly checks) ──
@@ -2875,9 +2854,6 @@ static void witness_capture_to_payload(const witness_capture_t& cap,
 
   // ISR-entry captures (this is what the fire actually saw).
   entry.add("dwt_at_fire",                      cap.dwt_at_fire);
-  entry.add("dwt_raw_at_fire",                  cap.dwt_raw_at_fire);
-  entry.add("dwt_at_fire_normalization_offset", cap.dwt_at_fire_normalization_offset);
-
   entry.add("counter32_at_fire",cap.counter32_at_fire);
   entry.add("ch3_cntr_at_fire", (uint32_t)cap.ch3_cntr_at_fire);
 
@@ -2885,6 +2861,9 @@ static void witness_capture_to_payload(const witness_capture_t& cap,
   entry.add("vclock_delta",     cap.vclock_delta);
   entry.add("residual_cycles",  cap.residual_cycles);
   entry.add("lag_ticks",        cap.lag_ticks);
+  entry.add("gnss_from_dwt_ns", cap.gnss_from_dwt_ns);
+  entry.add("gnss_from_vclock_ns", cap.gnss_from_vclock_ns);
+  entry.add("gnss_residual_ns", cap.gnss_residual_ns);
 
   // Dynamic cps at this fire, from the 1 kHz refinement in
   // process_interrupt.  Compare against anchor_dwt_cps to reason about
