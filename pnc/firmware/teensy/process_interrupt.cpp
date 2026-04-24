@@ -130,6 +130,18 @@ static volatile uint32_t g_dynamic_cps                  = DWT_EXPECTED_PER_PPS;
 static volatile uint32_t g_dynamic_cps_pps_sequence     = 0;
 static volatile uint32_t g_dynamic_cps_last_dwt_at_edge = 0;
 
+// Dynamic CPS refinement policy.
+//
+// The PPS-to-PPS bookend measurement remains the authority.  The 1 kHz
+// TimePop observations are used only as intra-second rate hints.
+//
+// Do not refine too close to the PPS edge: tiny fixed timing biases become
+// huge CPS errors when divided by a very small elapsed interval.
+static constexpr int64_t  DYNAMIC_CPS_MIN_REFINE_OFFSET_NS = 10000000LL;   // 10 ms
+static constexpr int64_t  DYNAMIC_CPS_MAX_REFINE_OFFSET_NS = 990000000LL;  // avoid boundary races
+static constexpr int32_t  DYNAMIC_CPS_MAX_STEP_CYCLES      = 128;          // per tick slew limit
+static constexpr uint32_t DYNAMIC_CPS_BLEND_SHIFT          = 4;            // 1/16 gain
+
 // ── Per-tick instrumentation ──
 //
 // Captures every intermediate value from the most recent tick of
@@ -148,10 +160,25 @@ struct dynamic_cps_tick_state_t {
   uint32_t snap_dwt_at_edge;
   int64_t  snap_gnss_ns_at_edge;
   int64_t  ctx_fire_gnss_ns;
+  uint32_t fire_vclock_raw;
+  uint32_t vclock_delta_ticks;
   int64_t  gnss_offset_ns;
   uint32_t cps_before;
   uint32_t predicted_dwt;
   int32_t  delta;
+
+  // Dynamic CPS refinement instrumentation.
+  // observed_cycles is the measured DWT displacement from the current
+  // canonical PPS/VCLOCK anchor to this TimePop fire.
+  // inferred_cps is the full-second DWT cycles/sec implied by that
+  // partial-second observation.
+  // cps_error is inferred_cps - cps_before.
+  // cps_step is the actual slew-limited correction applied to g_dynamic_cps.
+  uint32_t observed_cycles;
+  uint32_t inferred_cps;
+  int32_t  cps_error;
+  int32_t  cps_step;
+
   uint32_t cps_after;
   bool     reseed_fired;     // did the PPS-boundary reseed run?
   bool     reseed_computed;  // did we actually compute a new seed (not first edge)?
@@ -218,18 +245,22 @@ struct dynamic_cps_tick_state_t {
 
 static dynamic_cps_tick_state_t g_dynamic_cps_last_tick = {};
 
-static void dynamic_cps_tick(timepop_ctx_t* ctx, timepop_diag_t*, void*) {
-  // Use TimePop's ISR-entry DWT capture — the moment that matches
-  // ctx->fire_gnss_ns and ctx->fire_vclock_raw.  Capturing DWT here
-  // in scheduled-context would land tens of microseconds later, biasing
-  // the refinement by that dispatch latency.
-  const uint32_t dwt_at_fire = ctx->fire_dwt_cyccnt;
+static void dynamic_cps_cadence_update(uint32_t dwt_raw_at_cadence,
+                                       uint32_t cadence_counter32,
+                                       uint32_t cadence_tick_mod_1000) {
+
+  // CH3 VCLOCK cadence is the internal PPS-phased 1 kHz gear train.
+  // Use its QTimer-edge-normalized DWT capture as the observation point.
+  const uint32_t dwt_at_fire = dwt_at_qtimer_edge(dwt_raw_at_cadence);
 
   const pps_edge_snapshot_t snap = interrupt_last_pps_edge();
 
+  if (snap.sequence == 0 || snap.gnss_ns_at_edge < 0) {
+    return;
+  }
+
   bool reseed_fired    = false;
   bool reseed_computed = false;
-
 
   // Capture the "other bookend" (previous PPS snap.dwt_at_edge) BEFORE
   // the reseed assignment overwrites it.  Used only for the persistent
@@ -250,8 +281,15 @@ static void dynamic_cps_tick(timepop_ctx_t* ctx, timepop_diag_t*, void*) {
     g_dynamic_cps_pps_sequence     = snap.sequence;
   }
 
-  const uint32_t cps_before    = g_dynamic_cps;
-  const int64_t gnss_offset_ns = ctx->fire_gnss_ns - snap.gnss_ns_at_edge;
+  const uint32_t cps_before = g_dynamic_cps;
+
+  // The cadence lane is PPS-phased: after rebootstrap, tick_mod_1000 == 0
+  // at the PPS boundary and each cadence hit advances by exactly 1 ms.
+  // cadence_tick_mod_1000 is the post-increment value for this hit, so it
+  // directly names the elapsed milliseconds since the PPS anchor.
+  const uint32_t vclock_delta_ticks = cadence_tick_mod_1000 * VCLOCK_INTERVAL_COUNTS;
+  const uint32_t fire_vclock_raw    = snap.counter32_at_edge + vclock_delta_ticks;
+  const int64_t gnss_offset_ns      = (int64_t)vclock_delta_ticks * 100LL;
 
   const bool invalid_negative = (gnss_offset_ns < 0);
   const bool invalid_future   = (gnss_offset_ns >= 1000000000LL);
@@ -262,11 +300,17 @@ static void dynamic_cps_tick(timepop_ctx_t* ctx, timepop_diag_t*, void*) {
     g_dynamic_cps_last_tick.snap_sequence        = snap.sequence;
     g_dynamic_cps_last_tick.snap_dwt_at_edge     = snap.dwt_at_edge;
     g_dynamic_cps_last_tick.snap_gnss_ns_at_edge = snap.gnss_ns_at_edge;
-    g_dynamic_cps_last_tick.ctx_fire_gnss_ns     = ctx->fire_gnss_ns;
+    g_dynamic_cps_last_tick.ctx_fire_gnss_ns     = 0;
+    g_dynamic_cps_last_tick.fire_vclock_raw      = fire_vclock_raw;
+    g_dynamic_cps_last_tick.vclock_delta_ticks   = vclock_delta_ticks;
     g_dynamic_cps_last_tick.gnss_offset_ns       = gnss_offset_ns;
     g_dynamic_cps_last_tick.cps_before           = cps_before;
     g_dynamic_cps_last_tick.predicted_dwt        = 0;
     g_dynamic_cps_last_tick.delta                = 0;
+    g_dynamic_cps_last_tick.observed_cycles      = 0;
+    g_dynamic_cps_last_tick.inferred_cps         = 0;
+    g_dynamic_cps_last_tick.cps_error            = 0;
+    g_dynamic_cps_last_tick.cps_step             = 0;
     g_dynamic_cps_last_tick.cps_after            = g_dynamic_cps;
     g_dynamic_cps_last_tick.reseed_fired         = reseed_fired;
     g_dynamic_cps_last_tick.reseed_computed      = reseed_computed;
@@ -283,7 +327,7 @@ static void dynamic_cps_tick(timepop_ctx_t* ctx, timepop_diag_t*, void*) {
     g_dynamic_cps_last_tick.last_rejected_snap_sequence        = snap.sequence;
     g_dynamic_cps_last_tick.last_rejected_dwt_at_fire          = dwt_at_fire;
     g_dynamic_cps_last_tick.last_rejected_snap_dwt_at_edge     = snap.dwt_at_edge;
-    g_dynamic_cps_last_tick.last_rejected_ctx_fire_gnss_ns     = ctx->fire_gnss_ns;
+    g_dynamic_cps_last_tick.last_rejected_ctx_fire_gnss_ns     = 0;
     g_dynamic_cps_last_tick.last_rejected_snap_gnss_ns_at_edge = snap.gnss_ns_at_edge;
     g_dynamic_cps_last_tick.last_rejected_gnss_offset_ns       = gnss_offset_ns;
     g_dynamic_cps_last_tick.last_rejected_cps_before           = cps_before;
@@ -300,7 +344,48 @@ static void dynamic_cps_tick(timepop_ctx_t* ctx, timepop_diag_t*, void*) {
                  1000000000ULL);
 
   const int32_t delta = (int32_t)(dwt_at_fire - predicted_dwt);
-  g_dynamic_cps = (uint32_t)((int32_t)g_dynamic_cps + delta);
+
+  // Dynamic CPS refinement instrumentation defaults.  These stay zero
+  // when the tick is valid but outside the refinement window.
+  uint32_t observed_cycles = 0;
+  uint32_t inferred_cps = 0;
+  int32_t cps_error = 0;
+  int32_t cps_step = 0;
+
+  // A mid-second DWT residual is a POSITION error, not directly a
+  // cycles-per-second error.  Infer the CPS implied by the observed
+  // displacement from the canonical PPS/VCLOCK anchor, then blend toward it.
+  if (gnss_offset_ns >= DYNAMIC_CPS_MIN_REFINE_OFFSET_NS &&
+      gnss_offset_ns <= DYNAMIC_CPS_MAX_REFINE_OFFSET_NS) {
+
+    observed_cycles = dwt_at_fire - snap.dwt_at_edge;
+
+    inferred_cps =
+        (uint32_t)(((uint64_t)observed_cycles * 1000000000ULL +
+                    (uint64_t)gnss_offset_ns / 2ULL) /
+                   (uint64_t)gnss_offset_ns);
+
+    cps_error =
+        (int32_t)((int64_t)inferred_cps - (int64_t)g_dynamic_cps);
+
+    cps_step = cps_error >> DYNAMIC_CPS_BLEND_SHIFT;
+
+    // Ensure very small non-zero errors can still converge.
+    if (cps_step == 0 && cps_error != 0) {
+      cps_step = (cps_error > 0) ? 1 : -1;
+    }
+
+    // Slew-limit each 1 kHz update.  The PPS bookend reseed is still allowed
+    // to make the full authoritative correction once per second.
+    if (cps_step > DYNAMIC_CPS_MAX_STEP_CYCLES) {
+      cps_step = DYNAMIC_CPS_MAX_STEP_CYCLES;
+    } else if (cps_step < -DYNAMIC_CPS_MAX_STEP_CYCLES) {
+      cps_step = -DYNAMIC_CPS_MAX_STEP_CYCLES;
+    }
+
+    g_dynamic_cps =
+        (uint32_t)((int32_t)g_dynamic_cps + cps_step);
+  }
 
   // Publish last-tick state for the witness to snapshot.
   g_dynamic_cps_last_tick.tick_count++;
@@ -308,28 +393,22 @@ static void dynamic_cps_tick(timepop_ctx_t* ctx, timepop_diag_t*, void*) {
   g_dynamic_cps_last_tick.snap_sequence        = snap.sequence;
   g_dynamic_cps_last_tick.snap_dwt_at_edge     = snap.dwt_at_edge;
   g_dynamic_cps_last_tick.snap_gnss_ns_at_edge = snap.gnss_ns_at_edge;
-  g_dynamic_cps_last_tick.ctx_fire_gnss_ns     = ctx->fire_gnss_ns;
+  g_dynamic_cps_last_tick.ctx_fire_gnss_ns     = 0;
+  g_dynamic_cps_last_tick.fire_vclock_raw      = fire_vclock_raw;
+  g_dynamic_cps_last_tick.vclock_delta_ticks   = vclock_delta_ticks;
   g_dynamic_cps_last_tick.gnss_offset_ns       = gnss_offset_ns;
   g_dynamic_cps_last_tick.cps_before           = cps_before;
   g_dynamic_cps_last_tick.predicted_dwt        = predicted_dwt;
   g_dynamic_cps_last_tick.delta                = delta;
+  g_dynamic_cps_last_tick.observed_cycles      = observed_cycles;
+  g_dynamic_cps_last_tick.inferred_cps         = inferred_cps;
+  g_dynamic_cps_last_tick.cps_error            = cps_error;
+  g_dynamic_cps_last_tick.cps_step             = cps_step;
   g_dynamic_cps_last_tick.cps_after            = g_dynamic_cps;
   g_dynamic_cps_last_tick.reseed_fired         = reseed_fired;
   g_dynamic_cps_last_tick.reseed_computed      = reseed_computed;
 
-
-  // ── Persistent post-reseed snapshot ──
-  //
-  // Update ONLY on the tick where a real bookend-delta reseed actually
-  // ran.  The first PPS edge ever observed sets reseed_fired=true but
-  // reseed_computed=false (no prior bookend); we skip those so the
-  // persistent fields unambiguously describe a real reseed.
-  //
-  // Because subsequent ticks in the same GNSS second leave these alone,
-  // every witness slot in 100 ms..900 ms sees the reseed-moment facts
-  // and the reseed tick's own refinement outcome — letting the reader
-  // tell the two failure modes ("biased reseed" vs "biased refinement")
-  // apart directly, without inferring from the mid-second state.
+  // Persistent post-reseed snapshot.
   if (reseed_computed) {
     g_dynamic_cps_last_tick.last_reseed_pps_sequence          = snap.sequence;
     g_dynamic_cps_last_tick.last_reseed_tick_count            = g_dynamic_cps_last_tick.tick_count;
@@ -355,16 +434,8 @@ dynamic_cps_tick_state_t interrupt_dynamic_cps_last_tick(void) {
 }
 
 static inline int32_t vclock_epoch_dwt_offset_cycles(void) {
-  // Convert the selected VCLOCK tick displacement from the physical PPS pulse
-  // into DWT cycles.  This is an epoch-label calculation, not a measurement
-  // update.  Use the current dynamic CPS when available so the offset follows
-  // the live DWT rate; fall back naturally to the expected value at startup.
-  return (int32_t)(((uint64_t)g_dynamic_cps *
-                    (uint64_t)VCLOCK_EPOCH_TICKS_AFTER_PHYSICAL_PPS +
-                    (uint64_t)(VCLOCK_COUNTS_PER_SECOND / 2)) /
-                   (uint64_t)VCLOCK_COUNTS_PER_SECOND);
+  return CANONICAL_VCLOCK_EPOCH_MINUS_RAW_PPS_ISR_CYCLES;
 }
-
 
 // ============================================================================
 // Subscriber runtime
@@ -947,6 +1018,12 @@ static void vclock_cadence_isr(uint32_t dwt_raw) {
   vclock_lane_advance_compare();
   g_vclock_lane.cadence_hits_total++;
 
+  const uint32_t cadence_tick_mod_1000 = g_vclock_lane.tick_mod_1000 + 1;
+  dynamic_cps_cadence_update(dwt_raw,
+                             g_vclock_lane.logical_count32_at_last_second +
+                                 cadence_tick_mod_1000 * VCLOCK_INTERVAL_COUNTS,
+                             cadence_tick_mod_1000);
+
   if (++g_vclock_lane.tick_mod_1000 >= TICKS_PER_SECOND_EVENT) {
     g_vclock_lane.tick_mod_1000 = 0;
     g_vclock_lane.logical_count32_at_last_second += VCLOCK_COUNTS_PER_SECOND;
@@ -1242,10 +1319,18 @@ struct witness_capture_t {
   uint32_t dc_snap_dwt_at_edge;
   int64_t  dc_snap_gnss_ns_at_edge;
   int64_t  dc_ctx_fire_gnss_ns;
+  uint32_t dc_fire_vclock_raw;
+  uint32_t dc_vclock_delta_ticks;
   int64_t  dc_gnss_offset_ns;
   uint32_t dc_cps_before;
   uint32_t dc_predicted_dwt;
   int32_t  dc_delta;
+
+  uint32_t dc_observed_cycles;
+  uint32_t dc_inferred_cps;
+  int32_t  dc_cps_error;
+  int32_t  dc_cps_step;
+
   uint32_t dc_cps_after;
   bool     dc_reseed_fired;
   bool     dc_reseed_computed;
@@ -1621,11 +1706,17 @@ static void witness_ch3_isr(uint32_t dwt_raw) {
     cap.dc_snap_dwt_at_edge     = dc.snap_dwt_at_edge;
     cap.dc_snap_gnss_ns_at_edge = dc.snap_gnss_ns_at_edge;
     cap.dc_ctx_fire_gnss_ns     = dc.ctx_fire_gnss_ns;
+    cap.dc_fire_vclock_raw      = dc.fire_vclock_raw;
+    cap.dc_vclock_delta_ticks   = dc.vclock_delta_ticks;
     cap.dc_gnss_offset_ns       = dc.gnss_offset_ns;
-    cap.dc_cps_before           = dc.cps_before;
-    cap.dc_predicted_dwt        = dc.predicted_dwt;
-    cap.dc_delta                = dc.delta;
-    cap.dc_cps_after            = dc.cps_after;
+    cap.dc_cps_before      = dc.cps_before;
+    cap.dc_predicted_dwt   = dc.predicted_dwt;
+    cap.dc_delta           = dc.delta;
+    cap.dc_observed_cycles = dc.observed_cycles;
+    cap.dc_inferred_cps    = dc.inferred_cps;
+    cap.dc_cps_error       = dc.cps_error;
+    cap.dc_cps_step        = dc.cps_step;
+    cap.dc_cps_after       = dc.cps_after;
 
     cap.dc_rejected_negative_offset_count = dc.rejected_negative_offset_count;
     cap.dc_rejected_future_offset_count   = dc.rejected_future_offset_count;
@@ -1980,7 +2071,7 @@ void process_interrupt_gpio6789_irq(uint32_t dwt_isr_entry_raw) {
       (uint16_t)(ch3_now + (int16_t)selected_counter_offset_ticks);
   const int32_t selected_dwt_offset_cycles = vclock_epoch_dwt_offset_cycles();
   const uint32_t dwt_at_edge =
-      physical_pps_dwt_normalized + (uint32_t)selected_dwt_offset_cycles;
+      dwt_isr_entry_raw + (uint32_t)selected_dwt_offset_cycles;
 
   g_pps_gpio_witness.last_dwt = dwt_at_edge;
 
@@ -2437,12 +2528,10 @@ void process_interrupt_init(void) {
 
   interrupt_witness_reset_stats();
 
-  // Arm the 1 kHz dynamic cps refinement.  No explicit init — g_dynamic_cps
-  // starts at DWT_EXPECTED_PER_PPS and is reseeded from ground truth on
-  // the first PPS edge the tick callback observes.  Phase at arm time is
-  // whatever it happens to be; the algorithm self-corrects regardless.
-  timepop_arm(NS_PER_MILLISECOND, /*recurring=*/true,
-              dynamic_cps_tick, nullptr, "dynamic-cps");
+  // Dynamic CPS refinement now runs on the PPS-phased VCLOCK cadence lane
+  // inside vclock_cadence_isr().  Do not arm a TimePop recurring callback
+  // here: TimePop is a general scheduler, while dynamic CPS is substrate
+  // metrology and must live on the internal 1 kHz VCLOCK gear train.
 
   g_interrupt_runtime_ready = true;
 }
@@ -2932,9 +3021,15 @@ static void witness_capture_to_payload(const witness_capture_t& cap,
   entry.add("dc_snap_dwt_at_edge",     cap.dc_snap_dwt_at_edge);
   entry.add("dc_snap_gnss_ns_at_edge", cap.dc_snap_gnss_ns_at_edge);
   entry.add("dc_ctx_fire_gnss_ns",     cap.dc_ctx_fire_gnss_ns);
+  entry.add("dc_fire_vclock_raw",      cap.dc_fire_vclock_raw);
+  entry.add("dc_vclock_delta_ticks",   cap.dc_vclock_delta_ticks);
   entry.add("dc_gnss_offset_ns",       cap.dc_gnss_offset_ns);
   entry.add("dc_cps_before",           cap.dc_cps_before);
   entry.add("dc_predicted_dwt",        cap.dc_predicted_dwt);
+  entry.add("dc_observed_cycles", cap.dc_observed_cycles);
+  entry.add("dc_inferred_cps",    cap.dc_inferred_cps);
+  entry.add("dc_cps_error",       cap.dc_cps_error);
+  entry.add("dc_cps_step",        cap.dc_cps_step);
   entry.add("dc_delta",                cap.dc_delta);
   entry.add("dc_cps_after",            cap.dc_cps_after);
   entry.add("dc_reseed_fired",         cap.dc_reseed_fired);
