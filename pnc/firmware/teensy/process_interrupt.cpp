@@ -96,9 +96,10 @@ static constexpr int32_t  VCLOCK_EPOCH_COUNTER32_OFFSET_TICKS   = 0;
 // DWT cycles-per-second dynamic refinement
 // ============================================================================
 //
-// A 1 kHz TimePop recurring series observes ARM_DWT_CYCCNT at each tick
-// and refines an estimate of DWT cycles per GNSS second by absorbing
-// the delta between actual and predicted DWT at that GNSS moment.
+// The PPS-phased VCLOCK cadence ISR observes ARM_DWT_CYCCNT at each
+// 1 ms cadence hit and refines an estimate of DWT cycles per GNSS
+// second by absorbing the delta between actual and predicted DWT at
+// that VCLOCK-domain moment.
 //
 // Bookends are the pure-gears, ISR-grade anchors:
 //   • anchor_dwt      : priority-0 DWT at the most recent PPS GPIO edge
@@ -133,7 +134,7 @@ static volatile uint32_t g_dynamic_cps_last_dwt_at_edge = 0;
 // Dynamic CPS refinement policy.
 //
 // The PPS-to-PPS bookend measurement remains the authority.  The 1 kHz
-// TimePop observations are used only as intra-second rate hints.
+// VCLOCK cadence observations are used only as intra-second rate hints.
 //
 // Do not refine too close to the PPS edge: tiny fixed timing biases become
 // huge CPS errors when divided by a very small elapsed interval.
@@ -145,7 +146,7 @@ static constexpr uint32_t DYNAMIC_CPS_BLEND_SHIFT          = 4;            // 1/
 // ── Per-tick instrumentation ──
 //
 // Captures every intermediate value from the most recent tick of
-// dynamic_cps_tick.  Exposed via interrupt_dynamic_cps_last_tick() so
+// dynamic_cps_cadence_update.  Exposed via interrupt_dynamic_cps_last_tick() so
 // the witness can snapshot it at slot fire time, revealing exactly
 // what arithmetic the last tick performed.  Non-volatile because it
 // is written only by the tick and read only by the witness ISR —
@@ -185,14 +186,13 @@ struct dynamic_cps_tick_state_t {
 
     // ── Dynamic CPS invalid-tick rejection instrumentation ──
   //
-  // A dynamic-cps tick is valid only when the TimePop fire GNSS time
-  // belongs to the current PPS epoch:
+  // A dynamic-cps cadence sample is valid only when its VCLOCK-domain
+  // elapsed offset belongs to the current PPS epoch:
   //
-  //   0 <= ctx->fire_gnss_ns - snap.gnss_ns_at_edge < 1 second
+  //   0 <= cadence_offset_ns < 1 second
   //
-  // Negative means stale TimePop fire context paired with a newer PPS
-  // snapshot.  >= 1s means old PPS snapshot or otherwise incoherent
-  // epoch pairing.  Either case must NOT refine g_dynamic_cps.
+  // >= 1s is the exact second-boundary cadence hit; it belongs to the
+  // next PPS epoch and must not refine the old epoch's dynamic CPS.
   uint32_t rejected_negative_offset_count;
   uint32_t rejected_future_offset_count;
   uint32_t rejected_total_count;
@@ -291,10 +291,29 @@ static void dynamic_cps_cadence_update(uint32_t dwt_raw_at_cadence,
   const uint32_t fire_vclock_raw    = snap.counter32_at_edge + vclock_delta_ticks;
   const int64_t gnss_offset_ns      = (int64_t)vclock_delta_ticks * 100LL;
 
-  const bool invalid_negative = (gnss_offset_ns < 0);
-  const bool invalid_future   = (gnss_offset_ns >= 1000000000LL);
+  // Record the authoritative bookend reseed immediately when it happens,
+  // even if this cadence hit is later skipped as the exact 1-second
+  // boundary.  These fields describe the PPS-to-PPS seed, not the
+  // refinement sample.
+  if (reseed_computed) {
+    g_dynamic_cps_last_tick.last_reseed_pps_sequence          = snap.sequence;
+    g_dynamic_cps_last_tick.last_reseed_tick_count            = g_dynamic_cps_last_tick.tick_count + 1;
+    g_dynamic_cps_last_tick.last_reseed_cps                   = cps_before;
+    g_dynamic_cps_last_tick.last_reseed_snap_dwt_at_edge      = snap.dwt_at_edge;
+    g_dynamic_cps_last_tick.last_reseed_prev_snap_dwt_at_edge = prev_snap_dwt_at_edge_for_audit;
+    g_dynamic_cps_last_tick.last_reseed_snap_gnss_ns_at_edge  = snap.gnss_ns_at_edge;
+  }
 
-  if (invalid_negative || invalid_future) {
+  // The exact 1-second cadence hit belongs to the next PPS epoch.  Do not
+  // publish it as the "last dynamic tick" for witness purposes and do not
+  // count it as an anomaly; it is the expected boundary condition.
+  if (gnss_offset_ns >= 1000000000LL) {
+    return;
+  }
+
+  const bool invalid_negative = (gnss_offset_ns < 0);
+
+  if (invalid_negative) {
     g_dynamic_cps_last_tick.tick_count++;
     g_dynamic_cps_last_tick.dwt_at_fire          = dwt_at_fire;
     g_dynamic_cps_last_tick.snap_sequence        = snap.sequence;
@@ -316,12 +335,7 @@ static void dynamic_cps_cadence_update(uint32_t dwt_raw_at_cadence,
     g_dynamic_cps_last_tick.reseed_computed      = reseed_computed;
 
     g_dynamic_cps_last_tick.rejected_total_count++;
-    if (invalid_negative) {
-      g_dynamic_cps_last_tick.rejected_negative_offset_count++;
-    }
-    if (invalid_future) {
-      g_dynamic_cps_last_tick.rejected_future_offset_count++;
-    }
+    g_dynamic_cps_last_tick.rejected_negative_offset_count++;
 
     g_dynamic_cps_last_tick.last_rejected_tick_count           = g_dynamic_cps_last_tick.tick_count;
     g_dynamic_cps_last_tick.last_rejected_snap_sequence        = snap.sequence;
@@ -331,8 +345,8 @@ static void dynamic_cps_cadence_update(uint32_t dwt_raw_at_cadence,
     g_dynamic_cps_last_tick.last_rejected_snap_gnss_ns_at_edge = snap.gnss_ns_at_edge;
     g_dynamic_cps_last_tick.last_rejected_gnss_offset_ns       = gnss_offset_ns;
     g_dynamic_cps_last_tick.last_rejected_cps_before           = cps_before;
-    g_dynamic_cps_last_tick.last_rejected_negative             = invalid_negative;
-    g_dynamic_cps_last_tick.last_rejected_future               = invalid_future;
+    g_dynamic_cps_last_tick.last_rejected_negative             = true;
+    g_dynamic_cps_last_tick.last_rejected_future               = false;
 
     return;
   }
@@ -408,21 +422,20 @@ static void dynamic_cps_cadence_update(uint32_t dwt_raw_at_cadence,
   g_dynamic_cps_last_tick.reseed_fired         = reseed_fired;
   g_dynamic_cps_last_tick.reseed_computed      = reseed_computed;
 
-  // Persistent post-reseed snapshot.
+  // Persistent post-reseed snapshot of the first valid cadence sample
+  // observed after the authoritative PPS-to-PPS reseed.
   if (reseed_computed) {
-    g_dynamic_cps_last_tick.last_reseed_pps_sequence          = snap.sequence;
-    g_dynamic_cps_last_tick.last_reseed_tick_count            = g_dynamic_cps_last_tick.tick_count;
-    g_dynamic_cps_last_tick.last_reseed_cps                   = cps_before;
-    g_dynamic_cps_last_tick.last_reseed_snap_dwt_at_edge      = snap.dwt_at_edge;
-    g_dynamic_cps_last_tick.last_reseed_prev_snap_dwt_at_edge = prev_snap_dwt_at_edge_for_audit;
-    g_dynamic_cps_last_tick.last_reseed_snap_gnss_ns_at_edge  = snap.gnss_ns_at_edge;
-
+    g_dynamic_cps_last_tick.last_reseed_tick_count = g_dynamic_cps_last_tick.tick_count;
     g_dynamic_cps_last_tick.reseed_tick_gnss_offset_ns = gnss_offset_ns;
     g_dynamic_cps_last_tick.reseed_tick_dwt_at_fire    = dwt_at_fire;
     g_dynamic_cps_last_tick.reseed_tick_predicted_dwt  = predicted_dwt;
     g_dynamic_cps_last_tick.reseed_tick_delta          = delta;
     g_dynamic_cps_last_tick.reseed_tick_cps_after      = g_dynamic_cps;
   }
+}
+
+static void dynamic_cps_reset_diagnostics(void) {
+  g_dynamic_cps_last_tick = dynamic_cps_tick_state_t{};
 }
 
 uint32_t interrupt_dynamic_cps(void) {
@@ -683,6 +696,11 @@ uint16_t interrupt_qtimer3_ch3_counter_now(void) { return IMXRT_TMR3.CH[3].CNTR;
 // ============================================================================
 
 static inline void witness_welford_update(witness_welford_t& w, int32_t sample);
+
+static void witness_cadence_observe(uint32_t dwt_raw,
+                                    uint32_t dwt_normalized,
+                                    uint32_t authored_counter32,
+                                    uint32_t cadence_tick_mod_1000);
 
 // ============================================================================
 // Compare channel helpers
@@ -983,11 +1001,11 @@ static void emit_one_second_event(interrupt_subscriber_runtime_t& rt,
 // ============================================================================
 
 static void vclock_lane_arm_bootstrap(void) {
-  const uint16_t now16 = IMXRT_TMR1.CH[3].CNTR;
   g_vclock_lane.phase_bootstrapped = true;
   g_vclock_lane.bootstrap_count++;
   g_vclock_lane.tick_mod_1000 = 0;
-  g_vclock_lane.compare_target = (uint16_t)(now16 + (uint16_t)VCLOCK_INTERVAL_COUNTS);
+  g_vclock_lane.compare_target =
+      (uint16_t)(g_vclock_lane.compare_target + (uint16_t)VCLOCK_INTERVAL_COUNTS);
   qtimer1_ch3_program_compare(g_vclock_lane.compare_target);
 }
 
@@ -1019,10 +1037,18 @@ static void vclock_cadence_isr(uint32_t dwt_raw) {
   g_vclock_lane.cadence_hits_total++;
 
   const uint32_t cadence_tick_mod_1000 = g_vclock_lane.tick_mod_1000 + 1;
+  const uint32_t cadence_counter32 =
+      g_vclock_lane.logical_count32_at_last_second +
+      cadence_tick_mod_1000 * VCLOCK_INTERVAL_COUNTS;
+
   dynamic_cps_cadence_update(dwt_raw,
-                             g_vclock_lane.logical_count32_at_last_second +
-                                 cadence_tick_mod_1000 * VCLOCK_INTERVAL_COUNTS,
+                             cadence_counter32,
                              cadence_tick_mod_1000);
+
+  witness_cadence_observe(dwt_raw,
+                          dwt_at_edge,
+                          cadence_counter32,
+                          cadence_tick_mod_1000);
 
   if (++g_vclock_lane.tick_mod_1000 >= TICKS_PER_SECOND_EVENT) {
     g_vclock_lane.tick_mod_1000 = 0;
@@ -1065,11 +1091,10 @@ static void vclock_cadence_isr(uint32_t dwt_raw) {
 // ============================================================================
 
 static void ocxo_lane_arm_bootstrap(ocxo_lane_t& lane) {
-  const uint16_t now16 = lane.module->CH[lane.channel].CNTR;
   lane.phase_bootstrapped = true;
   lane.bootstrap_count++;
   lane.tick_mod_1000 = 0;
-  lane.compare_target = (uint16_t)(now16 + (uint16_t)OCXO_INTERVAL_COUNTS);
+  lane.compare_target = (uint16_t)(lane.compare_target + (uint16_t)OCXO_INTERVAL_COUNTS);
   qtimer3_program_compare(lane.channel, lane.compare_target);
 }
 
@@ -1192,7 +1217,7 @@ static constexpr uint32_t WITNESS_VCLOCK_TICKS_PER_SLOT = 1000000;
 static constexpr int32_t WITNESS_REJECT_CYCLES = 100000;
 
 static volatile interrupt_witness_mode_t g_witness_mode =
-    interrupt_witness_mode_t::OFF;
+    interrupt_witness_mode_t::ON;
 
 // Slot state for the CURRENT in-flight slot.  Arm computes all three
 // fields atomically; the ISR reads them to validate the fire.
@@ -1310,7 +1335,7 @@ struct witness_capture_t {
   int32_t  dynamic_minus_static_cps;
   int32_t  dynamic_minus_static_target_cycles;
 
-  // Last tick of dynamic_cps_tick that ran before this witness fire.
+  // Last cadence tick of dynamic_cps_cadence_update that ran before this witness fire.
   // Complete per-tick state so we can reason about exactly what the
   // refinement math was doing.
   uint32_t dc_tick_count;
@@ -1353,7 +1378,7 @@ struct witness_capture_t {
 
   // ── Persistent post-reseed snapshot (from dynamic_cps_tick) ──
   //
-  // These fields are written by dynamic_cps_tick ONLY on a reseed
+  // These fields are written by dynamic_cps_cadence_update ONLY on a reseed
   // tick and survive unchanged for the rest of the GNSS second, so
   // every witness slot (100 ms..900 ms) reports the SAME values for
   // the reseed that started this second.  They answer: "what did the
@@ -1558,270 +1583,133 @@ static void witness_arm_slot(uint8_t slot_index) {
   qtimer1_ch3_program_compare((uint16_t)(target_vclock & 0xFFFF));
 }
 
-// CH3 witness ISR path — called from qtimer1_isr when witness mode is ON.
-//
-// IMPORTANT: CH3's compare hardware only compares the LOW 16 BITS of the
-// counter against COMP1.  At 10 MHz, the counter wraps every ~6.55 ms
-// (65536 ticks), so the compare fires roughly 150x per second — but
-// only ONE of those fires is the real target (the one where the full
-// 32-bit counter equals target_vclock).  The other ~149 are spurious
-// wrap-matches with the same low-16 bits but wildly different high-16.
-//
-// We filter by reading the 32-bit counter at ISR entry and comparing
-// against the full target_vclock.  Matches (within a small tolerance
-// window) are the real fires; non-matches are ignored without rotating
-// slots or incrementing the rejected counter.
-//
-// Rotation only happens on a real match.
-//
-static void witness_ch3_isr(uint32_t dwt_raw) {
-  qtimer1_ch3_clear_compare_flag();
-  g_witness_fires_total++;
-
-  // Normalize DWT capture into the unified "true physical event" coordinate
-  // system.  target_dwt (computed from alpha's snap.dwt_at_edge — itself
-  // already normalized by dwt_at_gpio_edge in the GPIO ISR) lives there;
-  // normalizing dwt_raw here puts both sides of the residual subtraction
-  // into the same frame.  With correct math and no preemption, the
-  // residual should be exactly zero.
-  const uint32_t dwt_normalized = dwt_at_qtimer_edge(dwt_raw);
-
-  const uint8_t slot_index = g_witness_current.slot_index;
-
-  if (slot_index > WITNESS_N_SLOTS) {
-    // Spurious fire — no slot armed (disarmed sentinel = 0xFF).
-    qtimer1_ch3_disable_compare();
-    g_witness_fires_rejected++;
+// Passive cadence witness path — called from vclock_cadence_isr on the
+// real production VCLOCK cadence lane.
+static void witness_cadence_observe(uint32_t dwt_raw,
+                                    uint32_t dwt_normalized,
+                                    uint32_t authored_counter32,
+                                    uint32_t cadence_tick_mod_1000) {
+  if (cadence_tick_mod_1000 == 0 ||
+      cadence_tick_mod_1000 >= TICKS_PER_SECOND_EVENT ||
+      (cadence_tick_mod_1000 % 100) != 0) {
     return;
   }
 
-  // Read the full 32-bit counter to distinguish real fires from wrap
-  // aliases.  A real fire has counter32 very close to target_vclock
-  // (within a few ticks of hardware latency).  An alias has counter32
-  // offset by some multiple of 65536.
-  const uint32_t counter32 = qtimer1_read_32_for_diag();
-  const uint16_t ch3_cntr  = IMXRT_TMR1.CH[3].CNTR;
-  const uint32_t target_vclock = g_witness_current.target_vclock;
+  const uint8_t slot_index = (uint8_t)(cadence_tick_mod_1000 / 100);
+  if (slot_index == 0 || slot_index > WITNESS_N_SLOTS) return;
 
-  // Signed delta — positive if counter is past target (normal case),
-  // negative if target hasn't arrived yet.  Wrap-alias fires will have
-  // magnitude > ~32768 (because they're at least a half-wrap away).
-  //
-  // Real fire tolerance: within WITNESS_VCLOCK_MATCH_WINDOW ticks of
-  // target.  One VCLOCK tick is 100 ns, so a 256-tick window is 25.6 µs
-  // — plenty of margin for ISR entry latency without allowing aliases.
-  //
-  // SLOT 0 EXCEPTION: slot 0's target (anchor_counter32) has already
-  // been passed by the time the armer runs.  The FIRST compare-match
-  // is thus a wrap-alias ~65536 ticks past target — which would be
-  // rejected by the narrow window.  For slot 0 only, accept the first
-  // fire we see regardless of wrap distance.  This is the whole point
-  // of slot 0: catch whatever CH3 does as soon after the PPS anchor
-  // as possible.
-  const int32_t vclock_delta = (int32_t)(counter32 - target_vclock);
-  constexpr int32_t WITNESS_VCLOCK_MATCH_WINDOW = 256;
-  if (slot_index != 0) {
-    if (vclock_delta < -WITNESS_VCLOCK_MATCH_WINDOW ||
-        vclock_delta >  WITNESS_VCLOCK_MATCH_WINDOW) {
-      // Wrap alias — not our real fire.  Don't rotate, don't count as
-      // rejected, just let the compare re-fire at the next wrap and we'll
-      // check again.  Eventually (within ~6.5 ms at worst) we'll see the
-      // real one.
-      return;
-    }
-  }
+  const pps_edge_snapshot_t snap = interrupt_last_pps_edge();
+  if (snap.sequence == 0 || snap.gnss_ns_at_edge < 0) return;
 
-  // CH3 / CH0 phase lag measurement.  Both channels clock from the
-  // same 10 MHz VCLOCK source (PCS=0), but CH3 was enabled by a
-  // different register write than CH0 at init time.  Any phase
-  // difference between them accumulated between those two enables
-  // persists forever and is a pure observable here.
-  //
-  // Compare the low 16 bits of the cascade (CH0) counter against the
-  // CH3 counter.  At this instant, lag = CH0_low16 - CH3.  Positive
-  // lag means CH3 is behind CH0 by that many ticks.
-  const int32_t lag_ticks =
-      (int32_t)(int16_t)((uint16_t)(counter32 & 0xFFFF) - ch3_cntr);
+  const uint32_t anchor_counter32 = snap.counter32_at_edge;
+  const uint32_t anchor_dwt = snap.dwt_at_edge;
+  const uint32_t anchor_dwt_raw = snap.dwt_raw_at_edge;
+  const uint32_t anchor_dwt_cps = interrupt_dynamic_cps();
+  const uint32_t target_vclock = witness_compute_target_vclock(anchor_counter32, slot_index);
+  const uint32_t target_dwt = witness_compute_target_dwt(anchor_dwt, anchor_dwt_cps, slot_index);
+  // The cadence compare firing is the identity.  Do not re-read CH0/CH1
+  // or CH3 here: by the time software can observe those registers, the
+  // event is already in the past.  The authored cadence counter is the
+  // VCLOCK coordinate of this production cadence edge.
+  const int32_t vclock_delta = (int32_t)(authored_counter32 - target_vclock);
+  const int32_t lag_ticks = 0;
   witness_welford_update(g_witness_lag_welford, lag_ticks);
-
-  const uint32_t target_dwt = g_witness_current.target_dwt;
-  const int32_t  residual_cycles = (int32_t)(dwt_normalized - target_dwt);
-
+  const int32_t residual_cycles = (int32_t)(dwt_normalized - target_dwt);
   const uint32_t dynamic_cps_used = interrupt_dynamic_cps();
-  const uint32_t dynamic_target_dwt =
-      witness_compute_target_dwt(g_witness_anchor_dwt,
-                                 dynamic_cps_used,
-                                 slot_index);
-  const int32_t dynamic_residual_cycles =
-      (int32_t)(dwt_normalized - dynamic_target_dwt);
-  const int32_t dynamic_minus_static_cps =
-      (int32_t)(dynamic_cps_used - g_witness_anchor_dwt_cps);
-  const int32_t dynamic_minus_static_target_cycles =
-      (int32_t)(dynamic_target_dwt - target_dwt);
+  const uint32_t dynamic_target_dwt = witness_compute_target_dwt(anchor_dwt, dynamic_cps_used, slot_index);
+  const int32_t dynamic_residual_cycles = (int32_t)(dwt_normalized - dynamic_target_dwt);
+  const int32_t dynamic_minus_static_cps = (int32_t)(dynamic_cps_used - anchor_dwt_cps);
+  const int32_t dynamic_minus_static_target_cycles = (int32_t)(dynamic_target_dwt - target_dwt);
 
-  // ── Capture raw inputs and derived diagnostics ──
-  //
-  // Write the capture BEFORE the reject decision.  Anomalies are
-  // exactly what we want in the buffer — the whole point is to
-  // inspect what was fed into accept/reject.  Indexed by slot_index
-  // directly (0..WITNESS_N_SLOTS), so each slot owns one entry and
-  // is overwritten by next second's fire for the same slot.
-  {
-    witness_capture_t& cap = g_witness_captures[slot_index];
-    cap.seq                = ++g_witness_capture_seq;
-    cap.slot_index         = slot_index;
-    cap.valid              = true;
+  g_witness_fires_total++;
+  witness_capture_t& cap = g_witness_captures[slot_index];
+  cap.seq = ++g_witness_capture_seq;
+  cap.slot_index = slot_index;
+  cap.valid = true;
+  cap.anchor_counter32 = anchor_counter32;
+  cap.anchor_dwt = anchor_dwt;
+  cap.anchor_dwt_raw = anchor_dwt_raw;
+  cap.anchor_dwt_cps = anchor_dwt_cps;
+  cap.target_vclock = target_vclock;
+  cap.target_dwt = target_dwt;
+  cap.dwt_at_fire = dwt_normalized;
+  cap.dwt_raw_at_fire = dwt_raw;
+  cap.dwt_at_fire_normalization_offset = dwt_raw - dwt_normalized;
+  cap.counter32_at_fire = authored_counter32;
+  cap.ch3_cntr_at_fire = (uint16_t)(authored_counter32 & 0xFFFF);
+  cap.vclock_delta = vclock_delta;
+  cap.residual_cycles = residual_cycles;
+  cap.lag_ticks = lag_ticks;
+  cap.dynamic_cps_used = dynamic_cps_used;
+  cap.dynamic_target_dwt = dynamic_target_dwt;
+  cap.dynamic_residual_cycles = dynamic_residual_cycles;
+  cap.dynamic_minus_static_cps = dynamic_minus_static_cps;
+  cap.dynamic_minus_static_target_cycles = dynamic_minus_static_target_cycles;
 
-    cap.anchor_counter32   = g_witness_anchor_counter32;
-    cap.anchor_dwt         = g_witness_anchor_dwt;
-    cap.anchor_dwt_raw     = g_witness_anchor_dwt_raw;
-    cap.anchor_dwt_cps     = g_witness_anchor_dwt_cps;
+  const dynamic_cps_tick_state_t dc = interrupt_dynamic_cps_last_tick();
+  cap.dc_tick_count = dc.tick_count;
+  cap.dc_dwt_at_fire = dc.dwt_at_fire;
+  cap.dc_snap_sequence = dc.snap_sequence;
+  cap.dc_snap_dwt_at_edge = dc.snap_dwt_at_edge;
+  cap.dc_snap_gnss_ns_at_edge = dc.snap_gnss_ns_at_edge;
+  cap.dc_ctx_fire_gnss_ns = dc.ctx_fire_gnss_ns;
+  cap.dc_fire_vclock_raw = dc.fire_vclock_raw;
+  cap.dc_vclock_delta_ticks = dc.vclock_delta_ticks;
+  cap.dc_gnss_offset_ns = dc.gnss_offset_ns;
+  cap.dc_cps_before = dc.cps_before;
+  cap.dc_predicted_dwt = dc.predicted_dwt;
+  cap.dc_delta = dc.delta;
+  cap.dc_observed_cycles = dc.observed_cycles;
+  cap.dc_inferred_cps = dc.inferred_cps;
+  cap.dc_cps_error = dc.cps_error;
+  cap.dc_cps_step = dc.cps_step;
+  cap.dc_cps_after = dc.cps_after;
+  cap.dc_rejected_negative_offset_count = dc.rejected_negative_offset_count;
+  cap.dc_rejected_future_offset_count = dc.rejected_future_offset_count;
+  cap.dc_rejected_total_count = dc.rejected_total_count;
+  cap.dc_last_rejected_tick_count = dc.last_rejected_tick_count;
+  cap.dc_last_rejected_snap_sequence = dc.last_rejected_snap_sequence;
+  cap.dc_last_rejected_dwt_at_fire = dc.last_rejected_dwt_at_fire;
+  cap.dc_last_rejected_snap_dwt_at_edge = dc.last_rejected_snap_dwt_at_edge;
+  cap.dc_last_rejected_ctx_fire_gnss_ns = dc.last_rejected_ctx_fire_gnss_ns;
+  cap.dc_last_rejected_snap_gnss_ns_at_edge = dc.last_rejected_snap_gnss_ns_at_edge;
+  cap.dc_last_rejected_gnss_offset_ns = dc.last_rejected_gnss_offset_ns;
+  cap.dc_last_rejected_cps_before = dc.last_rejected_cps_before;
+  cap.dc_last_rejected_negative = dc.last_rejected_negative;
+  cap.dc_last_rejected_future = dc.last_rejected_future;
+  cap.dc_last_reseed_pps_sequence = dc.last_reseed_pps_sequence;
+  cap.dc_last_reseed_tick_count = dc.last_reseed_tick_count;
+  cap.dc_last_reseed_cps = dc.last_reseed_cps;
+  cap.dc_last_reseed_snap_dwt_at_edge = dc.last_reseed_snap_dwt_at_edge;
+  cap.dc_last_reseed_prev_snap_dwt_at_edge = dc.last_reseed_prev_snap_dwt_at_edge;
+  cap.dc_last_reseed_snap_gnss_ns_at_edge = dc.last_reseed_snap_gnss_ns_at_edge;
+  cap.dc_reseed_tick_gnss_offset_ns = dc.reseed_tick_gnss_offset_ns;
+  cap.dc_reseed_tick_dwt_at_fire = dc.reseed_tick_dwt_at_fire;
+  cap.dc_reseed_tick_predicted_dwt = dc.reseed_tick_predicted_dwt;
+  cap.dc_reseed_tick_delta = dc.reseed_tick_delta;
+  cap.dc_reseed_tick_cps_after = dc.reseed_tick_cps_after;
 
-    cap.target_vclock      = target_vclock;
-    cap.target_dwt         = target_dwt;
-
-    cap.dwt_at_fire                      = dwt_normalized;
-    cap.dwt_raw_at_fire                  = dwt_raw;
-    cap.dwt_at_fire_normalization_offset = dwt_raw - dwt_normalized;
-    cap.counter32_at_fire                = counter32;
-    cap.ch3_cntr_at_fire                 = ch3_cntr;
-
-    cap.vclock_delta       = vclock_delta;
-    cap.residual_cycles    = residual_cycles;
-    cap.lag_ticks          = lag_ticks;
-    cap.dynamic_cps_used   = dynamic_cps_used;
-
-    cap.dynamic_target_dwt                 = dynamic_target_dwt;
-    cap.dynamic_residual_cycles            = dynamic_residual_cycles;
-    cap.dynamic_minus_static_cps           = dynamic_minus_static_cps;
-    cap.dynamic_minus_static_target_cycles = dynamic_minus_static_target_cycles;
-
-    // Snapshot the last tick of the dynamic cps refinement so the
-    // dump can show exactly what arithmetic the most recent tick
-    // performed.
-    const dynamic_cps_tick_state_t dc = interrupt_dynamic_cps_last_tick();
-    cap.dc_tick_count           = dc.tick_count;
-    cap.dc_dwt_at_fire          = dc.dwt_at_fire;
-    cap.dc_snap_sequence        = dc.snap_sequence;
-    cap.dc_snap_dwt_at_edge     = dc.snap_dwt_at_edge;
-    cap.dc_snap_gnss_ns_at_edge = dc.snap_gnss_ns_at_edge;
-    cap.dc_ctx_fire_gnss_ns     = dc.ctx_fire_gnss_ns;
-    cap.dc_fire_vclock_raw      = dc.fire_vclock_raw;
-    cap.dc_vclock_delta_ticks   = dc.vclock_delta_ticks;
-    cap.dc_gnss_offset_ns       = dc.gnss_offset_ns;
-    cap.dc_cps_before      = dc.cps_before;
-    cap.dc_predicted_dwt   = dc.predicted_dwt;
-    cap.dc_delta           = dc.delta;
-    cap.dc_observed_cycles = dc.observed_cycles;
-    cap.dc_inferred_cps    = dc.inferred_cps;
-    cap.dc_cps_error       = dc.cps_error;
-    cap.dc_cps_step        = dc.cps_step;
-    cap.dc_cps_after       = dc.cps_after;
-
-    cap.dc_rejected_negative_offset_count = dc.rejected_negative_offset_count;
-    cap.dc_rejected_future_offset_count   = dc.rejected_future_offset_count;
-    cap.dc_rejected_total_count           = dc.rejected_total_count;
-
-    cap.dc_last_rejected_tick_count           = dc.last_rejected_tick_count;
-    cap.dc_last_rejected_snap_sequence        = dc.last_rejected_snap_sequence;
-    cap.dc_last_rejected_dwt_at_fire          = dc.last_rejected_dwt_at_fire;
-    cap.dc_last_rejected_snap_dwt_at_edge     = dc.last_rejected_snap_dwt_at_edge;
-    cap.dc_last_rejected_ctx_fire_gnss_ns     = dc.last_rejected_ctx_fire_gnss_ns;
-    cap.dc_last_rejected_snap_gnss_ns_at_edge = dc.last_rejected_snap_gnss_ns_at_edge;
-    cap.dc_last_rejected_gnss_offset_ns       = dc.last_rejected_gnss_offset_ns;
-    cap.dc_last_rejected_cps_before           = dc.last_rejected_cps_before;
-    cap.dc_last_rejected_negative             = dc.last_rejected_negative;
-    cap.dc_last_rejected_future               = dc.last_rejected_future;
-
-
-    // Persistent post-reseed snapshot — same values across every slot
-    // in this second, so long as the last real reseed was this PPS
-    // boundary's.
-    cap.dc_last_reseed_pps_sequence          = dc.last_reseed_pps_sequence;
-    cap.dc_last_reseed_tick_count            = dc.last_reseed_tick_count;
-    cap.dc_last_reseed_cps                   = dc.last_reseed_cps;
-    cap.dc_last_reseed_snap_dwt_at_edge      = dc.last_reseed_snap_dwt_at_edge;
-    cap.dc_last_reseed_prev_snap_dwt_at_edge = dc.last_reseed_prev_snap_dwt_at_edge;
-    cap.dc_last_reseed_snap_gnss_ns_at_edge  = dc.last_reseed_snap_gnss_ns_at_edge;
-
-    cap.dc_reseed_tick_gnss_offset_ns = dc.reseed_tick_gnss_offset_ns;
-    cap.dc_reseed_tick_dwt_at_fire    = dc.reseed_tick_dwt_at_fire;
-    cap.dc_reseed_tick_predicted_dwt  = dc.reseed_tick_predicted_dwt;
-    cap.dc_reseed_tick_delta          = dc.reseed_tick_delta;
-    cap.dc_reseed_tick_cps_after      = dc.reseed_tick_cps_after;
-
-
-    // Sticky capture of anomalies.  Slot 0 is excluded — its residual
-    // is expected to be large and preemption-dominated, so flagging it
-    // as an anomaly would drown out the signal we care about.
-    if (slot_index != 0) {
-      witness_anomaly_maybe_capture(cap, g_witness_fires_total);
-    }
-  }
-
-  // Sanity: residual must be small.  Large magnitude (in either
-  // direction) means something is wrong — likely a missed fire or
-  // heavy preemption.  Reject from the main Welford.  Slot 0 is
-  // always excluded from the Welford because its residual is
-  // structurally large and would corrupt the mean/stddev.
-  if (slot_index == 0 ||
-      residual_cycles < -WITNESS_REJECT_CYCLES ||
-      residual_cycles >  WITNESS_REJECT_CYCLES) {
-    if (slot_index != 0) {
-      g_witness_fires_rejected++;
-    }
+  if (residual_cycles < -WITNESS_REJECT_CYCLES || residual_cycles > WITNESS_REJECT_CYCLES) {
+    g_witness_fires_rejected++;
+    witness_anomaly_maybe_capture(cap, g_witness_fires_total);
   } else {
     witness_welford_update(g_witness_welford, residual_cycles);
-  }
-
-  // Self-rotate: arm next slot.  If this was the final slot, disable
-  // CH3 until the next PPS edge re-arms slot 0.
-  if (slot_index < WITNESS_N_SLOTS) {
-    witness_arm_slot(slot_index + 1);
-  } else {
-    qtimer1_ch3_disable_compare();
-    g_witness_current.slot_index = 0xFF;
   }
 }
 
 // ── Public API ──
 
 void interrupt_witness_set_mode(interrupt_witness_mode_t mode) {
-  if (mode == g_witness_mode) return;
-
-  if (mode == interrupt_witness_mode_t::ON) {
-    // Going ON: disable cadence CH3 arming.  The ISR dispatcher will
-    // route CH3 to the witness path on the next fire.  We also disable
-    // CH3 compare until alpha calls arm_first_slot on the next PPS.
-    qtimer1_ch3_disable_compare();
-    g_witness_current.slot_index = 0xFF;
-    g_witness_mode = mode;
-  } else {
-    // Going OFF: disable CH3 and let the next PPS-edge rebootstrap
-    // restore normal cadence.  Alpha is responsible for calling
-    // interrupt_request_pps_rebootstrap() to trigger that.
-    g_witness_mode = mode;
-    qtimer1_ch3_disable_compare();
-    g_witness_current.slot_index = 0xFF;
-  }
+  // Passive witness piggybacks on production VCLOCK cadence. Compatibility shim.
+  g_witness_mode = mode;
 }
 
 interrupt_witness_mode_t interrupt_witness_get_mode(void) {
   return g_witness_mode;
 }
 
-void interrupt_witness_arm_first_slot(uint32_t anchor_counter32,
-                                       uint32_t anchor_dwt,
-                                       uint32_t anchor_dwt_raw,
-                                       uint32_t dwt_cycles_per_second) {
-  if (g_witness_mode != interrupt_witness_mode_t::ON) return;
-
-  g_witness_anchor_counter32 = anchor_counter32;
-  g_witness_anchor_dwt       = anchor_dwt;
-  g_witness_anchor_dwt_raw   = anchor_dwt_raw;
-  g_witness_anchor_dwt_cps   = dwt_cycles_per_second;
-
-  witness_arm_slot(0);
+void interrupt_witness_arm_first_slot(uint32_t, uint32_t, uint32_t, uint32_t) {
+  // Passive witness no longer arms CH3 or owns compare targets.
 }
 
 interrupt_witness_stats_t interrupt_witness_stats(void) {
@@ -1967,7 +1855,7 @@ static void qtimer1_isr(void) {
     qtimer1_ch2_clear_compare_flag();
 
     if (g_qtimer1_ch2_handler) {
-      const uint32_t counter32 = qtimer1_read_32_for_diag();
+      const uint32_t counter32 = 0;
       const uint32_t dwt_at_edge = dwt_at_qtimer_edge(dwt_raw);
       const int64_t gnss_ns_at_edge = time_dwt_to_gnss_ns(dwt_at_edge);
 
@@ -1999,11 +1887,7 @@ static void qtimer1_isr(void) {
   // handled by a subsequent NVIC re-dispatch with its own fresh `dwt_raw`.
   //
   else if (IMXRT_TMR1.CH[3].CSCTRL & TMR_CSCTRL_TCF1) {
-    if (g_witness_mode == interrupt_witness_mode_t::ON) {
-      witness_ch3_isr(dwt_raw);
-    } else {
-      vclock_cadence_isr(dwt_raw);
-    }
+    vclock_cadence_isr(dwt_raw);
   }
 }
 
@@ -2047,7 +1931,7 @@ void process_interrupt_gpio6789_irq(uint32_t dwt_isr_entry_raw) {
   // one VCLOCK period.
   //
   const uint32_t counter32 = qtimer1_read_32_for_diag();
-  const uint16_t ch3_now   = IMXRT_TMR1.CH[3].CNTR;
+  const uint16_t ch3_now   = (uint16_t)(counter32 & 0xFFFF);
   const uint32_t dwt_after_counter_reads = ARM_DWT_CYCCNT;
 
   // Diagnostic: measure the peripheral-bus delay between ISR first
@@ -2225,7 +2109,7 @@ bool interrupt_start(interrupt_subscriber_kind_t kind) {
     // Leave phase_bootstrapped as-is.  If set (by a prior PPS rebootstrap
     // or a prior cadence ISR), respect it.  If unset, the next cadence
     // ISR will bootstrap.
-    qtimer1_ch3_program_compare((uint16_t)(IMXRT_TMR1.CH[3].CNTR + 1));
+    qtimer1_ch3_program_compare((uint16_t)(g_vclock_lane.compare_target + 1));
     return true;
   }
 
@@ -2235,7 +2119,7 @@ bool interrupt_start(interrupt_subscriber_kind_t kind) {
   lane->phase_bootstrapped = false;
   lane->tick_mod_1000 = 0;
   qtimer3_program_compare(lane->channel,
-                          (uint16_t)(lane->module->CH[lane->channel].CNTR + 1));
+                          (uint16_t)(lane->compare_target + 1));
   return true;
 }
 
@@ -2527,6 +2411,7 @@ void process_interrupt_init(void) {
   hw_witness_apply_mode();
 
   interrupt_witness_reset_stats();
+  dynamic_cps_reset_diagnostics();
 
   // Dynamic CPS refinement now runs on the PPS-phased VCLOCK cadence lane
   // inside vclock_cadence_isr().  Do not arm a TimePop recurring callback
@@ -2862,6 +2747,7 @@ static Payload cmd_witness_mode(const Payload& args) {
 
 static Payload cmd_witness_start(const Payload&) {
   interrupt_witness_reset_stats();
+  dynamic_cps_reset_diagnostics();
   witness_welford_reset(g_hw_witness_gpio_welford);
   witness_welford_reset(g_hw_witness_qtimer_welford);
   witness_welford_reset(g_hw_witness_source_stimulate_welford);
@@ -3012,7 +2898,7 @@ static void witness_capture_to_payload(const witness_capture_t& cap,
             cap.dynamic_minus_static_target_cycles);
 
   // Last-tick instrumentation of the dynamic cps refinement.  Every
-  // intermediate value from the most recent tick of dynamic_cps_tick
+  // intermediate value from the most recent cadence update
   // that ran before this witness slot fire.  Use these to reconstruct
   // the arithmetic and pinpoint any step that misbehaves.
   entry.add("dc_tick_count",           cap.dc_tick_count);
@@ -3184,8 +3070,6 @@ static Payload cmd_witness_dump(const Payload&) {
 
 static const process_command_entry_t INTERRUPT_COMMANDS[] = {
   { "REPORT",        cmd_report         },
-  { "WITNESS_START", cmd_witness_start  },
-  { "WITNESS_STOP",  cmd_witness_stop   },
   { "WITNESS_RESET", cmd_witness_reset  },
   { "WITNESS_MODE",  cmd_witness_mode   },
   { "WITNESS_DUMP",  cmd_witness_dump   },
