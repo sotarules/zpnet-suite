@@ -2451,7 +2451,7 @@ void process_interrupt_enable_irqs(void) {
   if (g_interrupt_irqs_enabled) return;
 
   attachInterruptVector(IRQ_QTIMER1, qtimer1_isr);
-  NVIC_SET_PRIORITY(IRQ_QTIMER1, 16);
+  NVIC_SET_PRIORITY(IRQ_QTIMER1, 0);
   NVIC_ENABLE_IRQ(IRQ_QTIMER1);
 
   attachInterruptVector(IRQ_QTIMER2, qtimer2_isr);

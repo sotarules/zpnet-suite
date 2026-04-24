@@ -403,6 +403,24 @@ void ocxo_dac_io_reset(ocxo_dac_state_t& s);
 void ocxo_dac_retry_reset(ocxo_dac_state_t& s);
 
 // ============================================================================
+// Campaign warmup suppression
+// ============================================================================
+//
+// A newly installed/recovered campaign deliberately suppresses the first N
+// PPS-driven TIMEBASE_FRAGMENT publications. Alpha continues to measure and
+// refine its internal timing state during this quiet period; beta simply
+// refuses to call those records canonical campaign output.
+//
+// For START, public campaign identity begins after warmup: the first emitted
+// fragment is teensy_pps_count=1 and gnss_ns=1e9.
+//
+// For RECOVER, the suppressed records are treated as real elapsed campaign
+// seconds. The first emitted fragment therefore appears after a deliberate
+// canonical gap, preserving the recovered absolute PPS identity.
+
+static constexpr uint32_t CLOCKS_CAMPAIGN_WARMUP_SUPPRESS_PPS = 20;
+
+// ============================================================================
 // Campaign state
 // ============================================================================
 

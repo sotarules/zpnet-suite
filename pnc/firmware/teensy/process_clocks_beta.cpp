@@ -94,6 +94,165 @@ uint64_t recover_ocxo2_ns = 0;
 static Payload g_last_fragment;
 
 // ============================================================================
+// Campaign warmup suppression
+// ============================================================================
+//
+// Alpha remains fully alive during warmup: PPS/VCLOCK/OCXO measurements,
+// bridge anchors, and predictor state continue to settle normally.  Beta,
+// however, suppresses the first CLOCKS_CAMPAIGN_WARMUP_SUPPRESS_PPS
+// candidate TIMEBASE_FRAGMENT records so the public campaign begins only
+// after the estimators have stopped stretching their legs.
+//
+// START semantics:
+//   Suppressed records are private warmup only.  The first emitted fragment
+//   is teensy_pps_count=1, gnss_ns=1e9, and public totals start from that
+//   first canonical record.
+//
+// RECOVER semantics:
+//   Suppressed records are real elapsed campaign seconds.  The first emitted
+//   fragment therefore appears after a deliberate canonical gap, preserving
+//   the recovered absolute PPS identity.
+
+enum class campaign_warmup_mode_t : uint8_t {
+  NONE    = 0,
+  START   = 1,
+  RECOVER = 2,
+};
+
+static volatile campaign_warmup_mode_t g_campaign_warmup_mode =
+    campaign_warmup_mode_t::NONE;
+static volatile uint32_t g_campaign_warmup_remaining = 0;
+static volatile uint32_t g_campaign_warmup_suppressed_total = 0;
+
+static uint64_t g_campaign_public_dwt_base = 0;
+static uint64_t g_campaign_public_gnss_base = 0;
+static uint64_t g_campaign_public_ocxo1_base = 0;
+static uint64_t g_campaign_public_ocxo2_base = 0;
+
+static void campaign_public_bases_reset_to_current(void) {
+  g_campaign_public_dwt_base   = g_dwt_cycle_count_total;
+  g_campaign_public_gnss_base  = g_gnss_ns_count_at_pps;
+  g_campaign_public_ocxo1_base = g_ocxo1_clock.ns_count_at_pps;
+  g_campaign_public_ocxo2_base = g_ocxo2_clock.ns_count_at_pps;
+}
+
+static uint64_t saturated_base_for_recovered_value(uint64_t current,
+                                                   uint64_t recovered) {
+  return (current >= recovered) ? (current - recovered) : 0;
+}
+
+static void campaign_public_bases_reset_for_recover(void) {
+  g_campaign_public_dwt_base =
+      saturated_base_for_recovered_value(g_dwt_cycle_count_total,
+                                          dwt_ns_to_cycles(recover_dwt_ns));
+  g_campaign_public_gnss_base =
+      saturated_base_for_recovered_value(g_gnss_ns_count_at_pps,
+                                          recover_gnss_ns);
+  g_campaign_public_ocxo1_base =
+      saturated_base_for_recovered_value(g_ocxo1_clock.ns_count_at_pps,
+                                          recover_ocxo1_ns);
+  g_campaign_public_ocxo2_base =
+      saturated_base_for_recovered_value(g_ocxo2_clock.ns_count_at_pps,
+                                          recover_ocxo2_ns);
+}
+
+static void campaign_warmup_begin(campaign_warmup_mode_t mode) {
+  g_campaign_warmup_mode = mode;
+  g_campaign_warmup_remaining = CLOCKS_CAMPAIGN_WARMUP_SUPPRESS_PPS;
+  g_campaign_warmup_suppressed_total = 0;
+
+  if (mode == campaign_warmup_mode_t::RECOVER) {
+    campaign_public_bases_reset_for_recover();
+  } else {
+    campaign_public_bases_reset_to_current();
+  }
+}
+
+static bool campaign_warmup_active(void) {
+  return g_campaign_warmup_mode != campaign_warmup_mode_t::NONE &&
+         g_campaign_warmup_remaining > 0;
+}
+
+static void campaign_warmup_finish_after_this_suppressed_record(void) {
+  const campaign_warmup_mode_t finishing_mode = g_campaign_warmup_mode;
+
+  g_campaign_warmup_mode = campaign_warmup_mode_t::NONE;
+  g_campaign_warmup_remaining = 0;
+
+  if (campaign_state != clocks_campaign_state_t::STARTED) {
+    campaign_public_bases_reset_to_current();
+    return;
+  }
+
+  if (finishing_mode == campaign_warmup_mode_t::START) {
+    // START: warmup records are private.  Public identity begins on the
+    // next PPS after this one, so use the current alpha totals as the base.
+    // The next published record will add exactly one public second.
+    campaign_public_bases_reset_to_current();
+  }
+
+  // RECOVER: leave the recovery bases intact.  Because campaign_seconds
+  // advanced during suppression, the next emitted fragment will preserve
+  // the canonical gap created by the buried records.
+}
+
+static bool campaign_warmup_consume_one_candidate_record(void) {
+  if (!campaign_warmup_active()) return false;
+
+  g_campaign_warmup_suppressed_total++;
+
+  if (g_campaign_warmup_mode == campaign_warmup_mode_t::RECOVER) {
+    // Recovery gaps are canonical.  The suppressed records are real
+    // elapsed campaign seconds, so advance the public PPS identity even
+    // though we do not publish the fragments.
+    campaign_seconds++;
+  }
+
+  if (g_campaign_warmup_remaining > 0) {
+    g_campaign_warmup_remaining--;
+  }
+
+  if (g_campaign_warmup_remaining == 0) {
+    campaign_warmup_finish_after_this_suppressed_record();
+  }
+
+  return true;
+}
+
+static void campaign_warmup_reset(void) {
+  g_campaign_warmup_mode = campaign_warmup_mode_t::NONE;
+  g_campaign_warmup_remaining = 0;
+  g_campaign_warmup_suppressed_total = 0;
+  campaign_public_bases_reset_to_current();
+}
+
+static uint64_t campaign_public_dwt_total(void) {
+  return (g_dwt_cycle_count_total >= g_campaign_public_dwt_base)
+           ? (g_dwt_cycle_count_total - g_campaign_public_dwt_base)
+           : 0;
+}
+
+static uint64_t campaign_public_gnss_ns(void) {
+  return (g_gnss_ns_count_at_pps >= g_campaign_public_gnss_base)
+           ? (g_gnss_ns_count_at_pps - g_campaign_public_gnss_base)
+           : 0;
+}
+
+static uint64_t campaign_public_ocxo1_ns(void) {
+  const uint64_t now = g_ocxo1_clock.ns_count_at_pps;
+  return (now >= g_campaign_public_ocxo1_base)
+           ? (now - g_campaign_public_ocxo1_base)
+           : 0;
+}
+
+static uint64_t campaign_public_ocxo2_ns(void) {
+  const uint64_t now = g_ocxo2_clock.ns_count_at_pps;
+  return (now >= g_campaign_public_ocxo2_base)
+           ? (now - g_campaign_public_ocxo2_base)
+           : 0;
+}
+
+// ============================================================================
 // Watchdog state
 // ============================================================================
 
@@ -444,6 +603,8 @@ void clocks_zero_all(void) {
   ocxo1_ticks_64        = 0;
   ocxo2_ticks_64        = 0;
 
+  campaign_public_bases_reset_to_current();
+
   welford_reset(welford_dwt);
   welford_reset(welford_vclock);
   welford_reset(welford_ocxo1);
@@ -568,6 +729,7 @@ static void clocks_force_stop_campaign(void) {
   request_zero = false;
   calibrate_ocxo_mode = servo_mode_t::OFF;
   ocxo_dac_pacing_abort_all();
+  campaign_warmup_reset();
   timebase_invalidate();
 }
 
@@ -655,6 +817,7 @@ void clocks_beta_pps(void) {
       watchdog_anomaly_active = false;
       campaign_state = clocks_campaign_state_t::STARTED;
       request_start = false;
+      campaign_warmup_begin(campaign_warmup_mode_t::START);
     }
     return;
   }
@@ -666,6 +829,7 @@ void clocks_beta_pps(void) {
     request_zero = false;
     calibrate_ocxo_mode = servo_mode_t::OFF;
     ocxo_dac_pacing_abort_all();
+    campaign_warmup_reset();
     timebase_invalidate();
     return;
   }
@@ -684,19 +848,30 @@ void clocks_beta_pps(void) {
 
     request_recover = false;
     campaign_state = clocks_campaign_state_t::STARTED;
+    campaign_warmup_begin(campaign_warmup_mode_t::RECOVER);
     return;
   }
 
   if (watchdog_anomaly_active) return;
   if (campaign_state != clocks_campaign_state_t::STARTED) return;
 
+  // ── Warmup suppression ──
+  //
+  // Suppressed records still allow alpha's measurement/predictor state to
+  // settle, but they are not allowed to become canonical TIMEBASE_FRAGMENT
+  // rows.  START hides these seconds completely; RECOVER counts them as
+  // deliberate canonical gaps.
+  if (campaign_warmup_consume_one_candidate_record()) {
+    return;
+  }
+
   // ── Per-second campaign work ──
   campaign_seconds++;
 
-  dwt_cycle_count_total = g_dwt_cycle_count_total;
-  gnss_raw_64           = g_gnss_ns_count_at_pps / 100ull;
-  ocxo1_ticks_64        = g_ocxo1_clock.ns_count_at_pps / 100ull;
-  ocxo2_ticks_64        = g_ocxo2_clock.ns_count_at_pps / 100ull;
+  dwt_cycle_count_total = campaign_public_dwt_total();
+  gnss_raw_64           = campaign_public_gnss_ns() / 100ull;
+  ocxo1_ticks_64        = campaign_public_ocxo1_ns() / 100ull;
+  ocxo2_ticks_64        = campaign_public_ocxo2_ns() / 100ull;
 
   // ── Welford updates ──
   //
@@ -744,11 +919,11 @@ void clocks_beta_pps(void) {
   Payload p;
   p.add("campaign", campaign_name);
   p.add("teensy_pps_count", campaign_seconds);
-  p.add("gnss_ns", g_gnss_ns_count_at_pps);
+  p.add("gnss_ns", campaign_public_gnss_ns());
   p.add("calibrate_ocxo", servo_mode_str(calibrate_ocxo_mode));
 
   // DWT canonical surface.
-  p.add("dwt_cycle_count_total", g_dwt_cycle_count_total);
+  p.add("dwt_cycle_count_total", dwt_cycle_count_total);
   p.add("dwt_cycle_count_at_pps", g_dwt_cycle_count_at_pps);
   p.add("dwt_cycle_count_between_pps", g_dwt_cycle_count_between_pps);
   p.add("dwt_expected_per_pps", (uint32_t)DWT_EXPECTED_PER_PPS);
@@ -773,7 +948,7 @@ void clocks_beta_pps(void) {
   p.add("qtimer_at_pps", g_qtimer_at_pps);
 
   // VCLOCK surface — authored facts + per-edge measurement + window accounting.
-  p.add("vclock_ns_count_at_pps", g_vclock_clock.ns_count_at_pps);
+  p.add("vclock_ns_count_at_pps", campaign_public_gnss_ns());
   p.add("vclock_gnss_ns_between_edges", g_vclock_measurement.gnss_ns_between_edges);
   p.add("vclock_dwt_cycles_between_edges", g_vclock_measurement.dwt_cycles_between_edges);
   p.add("vclock_second_residual_ns", g_vclock_measurement.second_residual_ns);
@@ -784,7 +959,7 @@ void clocks_beta_pps(void) {
   p.add("vclock_window_error_ns", g_vclock_clock.window_error_ns);
 
   // OCXO1 surface.
-  p.add("ocxo1_ns_count_at_pps", g_ocxo1_clock.ns_count_at_pps);
+  p.add("ocxo1_ns_count_at_pps", campaign_public_ocxo1_ns());
   p.add("ocxo1_gnss_ns_between_edges", g_ocxo1_measurement.gnss_ns_between_edges);
   p.add("ocxo1_dwt_cycles_between_edges", g_ocxo1_measurement.dwt_cycles_between_edges);
   p.add("ocxo1_second_residual_ns", g_ocxo1_measurement.second_residual_ns);
@@ -795,7 +970,7 @@ void clocks_beta_pps(void) {
   p.add("ocxo1_window_error_ns", g_ocxo1_clock.window_error_ns);
 
   // OCXO2 surface.
-  p.add("ocxo2_ns_count_at_pps", g_ocxo2_clock.ns_count_at_pps);
+  p.add("ocxo2_ns_count_at_pps", campaign_public_ocxo2_ns());
   p.add("ocxo2_gnss_ns_between_edges", g_ocxo2_measurement.gnss_ns_between_edges);
   p.add("ocxo2_dwt_cycles_between_edges", g_ocxo2_measurement.dwt_cycles_between_edges);
   p.add("ocxo2_second_residual_ns", g_ocxo2_measurement.second_residual_ns);
@@ -964,6 +1139,11 @@ static Payload cmd_report(const Payload&) {
   p.add("epoch_pending", clocks_epoch_pending());
   p.add("interrupt_pps_rebootstrap_pending",
         interrupt_pps_rebootstrap_pending());
+  p.add("campaign_warmup_active", campaign_warmup_active());
+  p.add("campaign_warmup_required", CLOCKS_CAMPAIGN_WARMUP_SUPPRESS_PPS);
+  p.add("campaign_warmup_remaining", (uint32_t)g_campaign_warmup_remaining);
+  p.add("campaign_warmup_suppressed_total",
+        (uint32_t)g_campaign_warmup_suppressed_total);
   return p;
 }
 

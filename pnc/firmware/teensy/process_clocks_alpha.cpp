@@ -760,7 +760,11 @@ static void pps_edge_callback(const pps_edge_snapshot_t& snap) {
                                      dwt_effective_cycles_per_second());
   }
 
-  // ── Step 5: publish TIMEBASE_FRAGMENT + assert relay ──
+  // ── Step 5: hand the PPS candidate to beta + assert relay ──
+  //
+  // Alpha presents every eligible PPS edge to beta.  Beta is allowed to
+  // suppress early campaign records during warmup so the public campaign
+  // begins only after alpha's predictors/measurements have settled.
   pps_relay_pulse();
 
   if (campaign_state == clocks_campaign_state_t::STARTED ||

@@ -321,3 +321,27 @@ static constexpr uint32_t QTIMER_TOTAL_LATENCY = 53;
 // Deprecated--these are records of our "entry latency" tests:
 static constexpr uint32_t PPS_ISR_ENTRY_OVERHEAD = 47;
 static constexpr uint32_t QTIMER_ISR_ENTRY_OVERHEAD = 16;
+
+// Observed canonical VCLOCK epoch offset relative to raw PPS ISR entry.
+//
+// After redefining the canonical PPS epoch as the first VCLOCK-domain edge
+// selected by the physical PPS pulse, raw_cycles.py consistently shows:
+//
+//   canonical_dwt_at_pps - raw_pps_isr_entry_dwt ≈ +34 cycles
+//
+// This is an empirical system calibration constant, not a fully decomposed
+// latency model.  Witness measurements predict part of this offset from the
+// GPIO-vs-QTimer sink-path latency difference, but leave a small stable
+// remainder (~15 cycles) that may come from GF-8802 PPS/VCLOCK phase skew,
+// input synchronizers, pad routing, QTimer compare maturation semantics, or
+// other fixed hardware path differences.
+//
+// Priority testing showed the value remains ~34 cycles even when QTimer1 and
+// PPS GPIO are both set to NVIC priority 0, so this does not appear to be a
+// QTimer IRQ priority artifact.
+//
+// Treat this as the observed calibration offset between the physical/raw PPS
+// interrupt timestamp and the canonical VCLOCK-selected PPS epoch.  Re-measure
+// if the GF-8802 wiring, pin routing, ISR paths, QTimer setup, optimization
+// level, or latency correction model changes.
+static constexpr int32_t CANONICAL_VCLOCK_EPOCH_MINUS_RAW_PPS_ISR_CYCLES = 34;

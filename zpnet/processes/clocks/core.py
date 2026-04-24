@@ -135,9 +135,15 @@ NS_PER_SECOND = 1_000_000_000
 GNSS_POLL_INTERVAL = 5
 GNSS_WAIT_LOG_INTERVAL = 60
 
-# Draconian sync waits
-SYNC_FRAGMENT_TIMEOUT_S = 2.0
-SYNC_RECOVER_TIMEOUT_S = 5.0
+# Sync waits
+#
+# Teensy CLOCKS now suppresses the first warmup fragments after START/RECOVER
+# so the first public TIMEBASE_FRAGMENT is already scientifically useful.
+# Pi-side sync must therefore be patient: intentional Teensy silence during
+# warmup is not a fault.
+TEENSY_CAMPAIGN_WARMUP_FRAGMENTS = 20
+SYNC_FRAGMENT_TIMEOUT_S = 35.0
+SYNC_RECOVER_TIMEOUT_S = 45.0
 SYNC_POLL_S = 0.005
 SYNC_LOG_INTERVAL_S = 0.25
 
@@ -874,7 +880,7 @@ def _end_sync_wait(timeout_s: float = SYNC_FRAGMENT_TIMEOUT_S) -> Tuple[Dict[str
     """Block until the sync fragment arrives or timeout.  Hard fault on timeout."""
     global _sync_expected_pps
 
-    logging.info("⏳ [_end_sync_wait] waiting for TIMEBASE_FRAGMENT pps_count=%s...", str(_sync_expected_pps))
+    logging.info("⏳ [_end_sync_wait] waiting for TIMEBASE_FRAGMENT pps_count >= %s...", str(_sync_expected_pps))
 
     t0 = time.monotonic()
     _diag["sync_waits"] += 1
@@ -1433,8 +1439,14 @@ def cmd_start(args: Optional[dict]) -> dict:
 
     _reset_trackers()
 
-    # Prepare sync wait FIRST
-    _begin_sync_wait(expected_pps=0)
+    # Prepare sync wait FIRST.
+    #
+    # Teensy suppresses its first TEENSY_CAMPAIGN_WARMUP_FRAGMENTS
+    # internal records and publishes the first clean public fragment as
+    # pps_count=1 for a fresh campaign.  Waiting for >=1 makes the intent
+    # explicit while still tolerating a later first fragment if warmup policy
+    # changes.
+    _begin_sync_wait(expected_pps=1)
 
     # Arm TEENSY
     logging.info("📡 [start] @%s arming TEENSY START: pps_count=0", system_time_z())
@@ -1450,19 +1462,19 @@ def cmd_start(args: Optional[dict]) -> dict:
     logging.info("📡 [start] @%s TEENSY START returned", system_time_z())
 
     # Wait for sync fragment
-    logging.info("📡 [start] @%s waiting for sync fragment (pps_count=0)...", system_time_z())
+    logging.info("📡 [start] @%s waiting for first post-warmup sync fragment (pps_count>=1)...", system_time_z())
 
     try:
         frag0, waited_s = _end_sync_wait(timeout_s=SYNC_RECOVER_TIMEOUT_S)
     except Exception:
         return {"success": False, "message": "HARD FAULT during START sync (see logs/diag)"}
 
-    # v12.3: Accept pps_count=0 (the first real measurement fragment).
-    # The sync wait captured it for verification, but it also went into
-    # the queue.  Don't drain the queue — let pps_count=0 be processed
-    # normally so teensy_dwt_ns reflects exactly one delta.
-    _armed_pps_count = 0
-    _diag["armed_pps_count"] = 0
+    # Teensy warmup gate: the first fragment we see is the first public,
+    # post-warmup record.  Arm to the following pps_count so processing
+    # accepts that queued sync fragment normally, then expects continuity.
+    teensy_pps_count = int(frag0.get("teensy_pps_count", frag0.get("pps_count", 1)))
+    _armed_pps_count = teensy_pps_count
+    _diag["armed_pps_count"] = _armed_pps_count
 
     _reset_trackers()
     _campaign_active = True
@@ -1486,7 +1498,7 @@ def cmd_start(args: Optional[dict]) -> dict:
             "set_dac1": set_dac1,
             "set_dac2": set_dac2,
             "calibrate_ocxo": calibrate_ocxo,
-            "pps_count": 0,
+            "pps_count": int(teensy_pps_count),
             "waited_s": round(float(waited_s), 3),
             "flash_cut": flash_cut,
             "previous_campaign": active_row["campaign"] if flash_cut else None,
@@ -1816,7 +1828,7 @@ def _recover_campaign() -> None:
 
         _reset_trackers()
 
-        _begin_sync_wait(expected_pps=0)
+        _begin_sync_wait(expected_pps=1)
 
         teensy_args: Dict[str, Any] = {"campaign": campaign_name}
         recover_ocxo1_dac = campaign_payload.get("ocxo1_dac")
@@ -1829,7 +1841,7 @@ def _recover_campaign() -> None:
         if recover_calibrate:
             teensy_args["calibrate_ocxo"] = recover_calibrate
 
-        logging.info("📡 [recovery/cold] @%s arming TEENSY START: pps_count=0", system_time_z())
+        logging.info("📡 [recovery/cold] @%s arming TEENSY START: pps_count=0; waiting for first post-warmup fragment", system_time_z())
         _request_teensy_start(campaign=campaign_name, pps_count=0, args=teensy_args)
 
         try:
@@ -1837,8 +1849,9 @@ def _recover_campaign() -> None:
         except Exception:
             raise
 
-        _armed_pps_count = 1
-        _diag["armed_pps_count"] = 1
+        teensy_pps_count = int(frag.get("teensy_pps_count", frag.get("pps_count", 1)))
+        _armed_pps_count = teensy_pps_count + 1
+        _diag["armed_pps_count"] = _armed_pps_count
 
         while not _fragment_queue.empty():
             try:
@@ -1859,7 +1872,7 @@ def _recover_campaign() -> None:
             "ts_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
             "campaign": campaign_name,
             "mode": "cold_restart",
-            "pps_count": 0,
+            "pps_count": int(teensy_pps_count),
         }
         return
 

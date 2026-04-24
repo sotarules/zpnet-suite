@@ -1,18 +1,31 @@
 """
-ZPNet Raw Cycles — Teensy DWT rate, predictor residual, vs GF-8802 receiver diagnostics.
+ZPNet Raw Cycles — Teensy DWT rate, predictor residual, and PPS/VCLOCK diagnostics.
 
-Reads TIMEBASE rows for a campaign and shows the honest one-second-
-subtraction DWT rate alongside the firmware's one-step predictor
-residual and the GF-8802 receiver's compensatory diagnostics.
+Reads TIMEBASE rows for a campaign and shows the honest one-second
+DWT rate alongside the firmware's one-step predictor residual, the
+canonical VCLOCK-selected PPS DWT anchor, the raw physical GPIO PPS
+DWT audit capture, and the GF-8802 receiver's compensatory diagnostics.
 
 Teensy-side columns (fragment sub-dict):
 
   dwt_cycles   = dwt_cycle_count_between_pps
-                 The one-second subtraction of consecutive PPS GPIO
-                 edge DWT captures (snap.dwt_at_edge), authored in
-                 alpha::pps_edge_callback.  Priority-0 captures —
-                 preemption-proof.  The "what the chip actually did"
-                 number for the just-completed second.
+                 The one-second subtraction of consecutive canonical
+                 VCLOCK-selected PPS DWT anchors (snap.dwt_at_edge),
+                 authored in alpha::pps_edge_callback.  Priority-0
+                 captures/derivations — preemption-proof.  The "what
+                 the chip actually did" number for the just-completed
+                 second.
+
+  dwt_at_pps   = dwt_cycle_count_at_pps
+                 Canonical DWT coordinate of the VCLOCK-selected PPS
+                 epoch edge for this TIMEBASE fragment.
+
+  raw_pps_dwt  = pps_diag_pps_edge_dwt_isr_entry_raw
+                 Raw physical GPIO PPS ISR-entry DWT audit capture.
+
+  canon-raw    = dwt_at_pps - raw_pps_dwt
+                 Cycle delta between the canonical VCLOCK PPS anchor
+                 and the raw physical GPIO PPS capture.
 
   dwt_res      = dwt_cycles - nominal (1,008,000,000)
                  Residual versus the expected 1.008 GHz CPU nominal.
@@ -247,11 +260,15 @@ def analyze(campaign: str, limit: int = 0) -> None:
     print(f"Campaign: {campaign}  ({len(rows):,} rows)")
     print(f"DWT_EXPECTED_PER_PPS = {DWT_EXPECTED_PER_PPS:,}")
     print()
-    print("Teensy side (PPS-edge-authored, priority-0):")
+    print("Teensy side (VCLOCK-domain PPS anchors, priority-0):")
     print("  dwt_cycles  = dwt_cycle_count_between_pps")
     print("  dwt_res     = dwt_cycles - nominal")
     print("  predicted   = dwt_cycles[N-1]   (implicit one-step predictor)")
     print("  pred_res    = dwt_prediction_residual_cycles (firmware-authored)")
+    print("  dwt_at_pps  = dwt_cycle_count_at_pps (canonical VCLOCK-selected anchor)")
+    print("  raw_pps_dwt = pps_diag_pps_edge_dwt_isr_entry_raw (physical GPIO audit)")
+    print("  canon-raw   = dwt_at_pps - raw_pps_dwt")
+    print("  vclk_res    = vclock_second_residual_ns")
     print("  fw_stddev   = dwt_welford_stddev (firmware cumulative)")
     print("GF-8802 side (what the receiver thought):")
     print("  drift_ppb   = clock_drift_ppb (internal OCXO vs UTC)")
@@ -268,6 +285,10 @@ def analyze(campaign: str, limit: int = 0) -> None:
         f"{'dwt_res':>9s}  "
         f"{'predicted':>13s}  "
         f"{'pred_res':>9s}  "
+        f"{'dwt_at_pps':>13s}  "
+        f"{'raw_pps_dwt':>13s}  "
+        f"{'canon-raw':>9s}  "
+        f"{'vclk_res':>8s}  "
         f"{'fw_stddev':>10s}  "
         f"{'drift_ppb':>10s}  "
         f"{'freq_err':>9s}  "
@@ -281,6 +302,10 @@ def analyze(campaign: str, limit: int = 0) -> None:
         f"{'─'*9}  "
         f"{'─'*13}  "
         f"{'─'*9}  "
+        f"{'─'*13}  "
+        f"{'─'*13}  "
+        f"{'─'*9}  "
+        f"{'─'*8}  "
         f"{'─'*10}  "
         f"{'─'*10}  "
         f"{'─'*9}  "
@@ -294,6 +319,9 @@ def analyze(campaign: str, limit: int = 0) -> None:
     # Welford accumulators — Teensy side (Pi-side reconstruction).
     w_dwt_cycles      = Welford()
     w_dwt_res         = Welford()
+    w_canon_minus_raw = Welford()
+    w_vclock_res      = Welford()
+    w_vclock_from_pps = Welford()
 
     # Welford accumulators — GF-8802 side.
     w_drift_ppb       = Welford()
@@ -345,13 +373,23 @@ def analyze(campaign: str, limit: int = 0) -> None:
 
         # Teensy-side fields.
         dwt_cycles = _as_int(frag.get("dwt_cycle_count_between_pps"))
+        dwt_at_pps = _as_int(frag.get("dwt_cycle_count_at_pps"))
         fw_stddev  = _as_float(frag.get("dwt_welford_stddev"))
 
         # Firmware-authored predictor residual.
         fw_pred_res = _as_int(frag.get("dwt_prediction_residual_cycles"))
 
-        # GPIO PPS witness offset (diagnostic).
+        # PPS/VCLOCK diagnostics.
+        raw_pps_dwt = _as_int(frag.get("pps_diag_pps_edge_dwt_isr_entry_raw"))
+        canon_minus_raw: Optional[int] = None
+        if dwt_at_pps is not None and raw_pps_dwt is not None:
+            canon_minus_raw = dwt_at_pps - raw_pps_dwt
+
+        # Legacy/mixed diagnostic retained for context, plus the newer
+        # bridge-independent VCLOCK/PPS relationship.
         pps_witness_ns = _as_int(frag.get("pps_diag_pps_edge_minus_event_ns"))
+        pps_from_vclock_ns = _as_int(frag.get("pps_diag_pps_edge_ns_from_vclock"))
+        vclock_res_ns = _as_int(frag.get("vclock_second_residual_ns"))
 
         # Capture firmware-side Welford state (last-wins).
         fw_dwt_n      = _as_int(frag.get("dwt_welford_n"))
@@ -460,8 +498,14 @@ def analyze(campaign: str, limit: int = 0) -> None:
             w_dwt_cycles.update(float(dwt_cycles))
         if dwt_res is not None:
             w_dwt_res.update(float(dwt_res))
+        if canon_minus_raw is not None:
+            w_canon_minus_raw.update(float(canon_minus_raw))
+        if vclock_res_ns is not None:
+            w_vclock_res.update(float(vclock_res_ns))
+        if pps_from_vclock_ns is not None:
+            w_vclock_from_pps.update(float(pps_from_vclock_ns))
 
-        # Update Welford — GPIO witness offset.
+        # Update Welford — legacy GPIO/PPS-vs-event diagnostic.
         if pps_witness_ns is not None:
             w_pps_witness_ns.update(float(pps_witness_ns))
 
@@ -492,6 +536,10 @@ def analyze(campaign: str, limit: int = 0) -> None:
             f"{_fmt_int(dwt_res, 9, signed=True)}  "
             f"{_fmt_int(predicted, 13)}  "
             f"{_fmt_int(fw_pred_res, 9, signed=True)}  "
+            f"{_fmt_int(dwt_at_pps, 13)}  "
+            f"{_fmt_int(raw_pps_dwt, 13)}  "
+            f"{_fmt_int(canon_minus_raw, 9, signed=True)}  "
+            f"{_fmt_int(vclock_res_ns, 8, signed=True)}  "
             f"{_fmt_float(fw_stddev, 10, decimals=2)}  "
             f"{_fmt_float(drift_ppb, 10, decimals=3, signed=True)}  "
             f"{_fmt_float(freq_err, 9, decimals=2, signed=True)}  "
@@ -514,15 +562,21 @@ def analyze(campaign: str, limit: int = 0) -> None:
     # -----------------------------------------------------------------
     print("═" * 70)
     print("Teensy-side DWT rate statistics")
-    print("  (one-second subtraction of consecutive PPS GPIO edge")
-    print("   DWT captures; authored by alpha::pps_edge_callback from")
-    print("   priority-0 snap.dwt_at_edge values)")
+    print("  (one-second subtraction of consecutive canonical")
+    print("   VCLOCK-selected PPS DWT anchors; authored by")
+    print("   alpha::pps_edge_callback from priority-0 snapshots)")
     print("═" * 70)
     print()
     _print_welford("dwt_cycles (DWT cycles per PPS-to-PPS interval)",
                    w_dwt_cycles, "cycles", decimals=3)
     _print_welford("dwt_res    (dwt_cycles - nominal)",
                    w_dwt_res, "cycles", decimals=3)
+    _print_welford("canon_minus_raw (dwt_cycle_count_at_pps - raw GPIO PPS DWT)",
+                   w_canon_minus_raw, "cycles", decimals=3)
+    _print_welford("vclock_second_residual_ns",
+                   w_vclock_res, "ns", decimals=3)
+    _print_welford("pps_edge_ns_from_vclock (bridge-independent PPS/VCLOCK relation)",
+                   w_vclock_from_pps, "ns", decimals=3)
 
     # -----------------------------------------------------------------
     # Firmware-side cumulative DWT Welford (authoritative)
@@ -576,14 +630,21 @@ def analyze(campaign: str, limit: int = 0) -> None:
     # GPIO PPS witness offset
     # -----------------------------------------------------------------
     print("═" * 70)
-    print("GPIO PPS witness offset from VCLOCK one-second event")
-    print("  (pps_diag_pps_edge_minus_event_ns — cross-lane phase")
-    print("   diagnostic: PPS GPIO edge vs VCLOCK CH3 cadence event.")
-    print("   Mean DC offset is fixed pipeline delay, stddev is real")
-    print("   ISR-delivery latency jitter across the two lanes)")
+    print("PPS / VCLOCK diagnostics")
+    print("  canon_minus_raw is the raw cycle delta between the canonical")
+    print("  VCLOCK-selected PPS DWT anchor and the physical GPIO PPS ISR")
+    print("  DWT audit capture.  pps_edge_ns_from_vclock is the newer")
+    print("  bridge-independent relationship; pps_edge_minus_event_ns is")
+    print("  retained as a legacy mixed-semantic diagnostic.")
     print("═" * 70)
     print()
-    _print_welford("pps_witness_ns  (Pi-side reconstruction from fragment)",
+    _print_welford("canon_minus_raw",
+                   w_canon_minus_raw, "cycles", decimals=3)
+    _print_welford("vclock_second_residual_ns",
+                   w_vclock_res, "ns", decimals=3)
+    _print_welford("pps_edge_ns_from_vclock",
+                   w_vclock_from_pps, "ns", decimals=1)
+    _print_welford("pps_edge_minus_event_ns (legacy/mixed diagnostic)",
                    w_pps_witness_ns, "ns", decimals=1)
     if last_fw_vclock_welford_n is not None and last_fw_vclock_welford_n > 0:
         print("  Firmware-side vclock_welford (cumulative):")
@@ -711,8 +772,14 @@ def analyze(campaign: str, limit: int = 0) -> None:
         print(f"  drift_ppb (in cycles): {drift_as_cycles:9.3f} cycles")
     if w_pps_err_ns.n >= 2:
         print(f"  pps_err_ns stddev:     {w_pps_err_ns.stddev:9.1f} ns")
+    if w_vclock_res.n >= 2:
+        print(f"  vclock_res stddev:     {w_vclock_res.stddev:9.3f} ns")
+    if w_canon_minus_raw.n >= 2:
+        print(f"  canon-raw stddev:      {w_canon_minus_raw.stddev:9.3f} cycles")
+    if w_vclock_from_pps.n >= 2:
+        print(f"  pps_from_vclk stddev:  {w_vclock_from_pps.stddev:9.1f} ns")
     if w_pps_witness_ns.n >= 2:
-        print(f"  pps_witness stddev:    {w_pps_witness_ns.stddev:9.1f} ns  (cross-lane jitter)")
+        print(f"  legacy pps diag stddev:{w_pps_witness_ns.stddev:9.1f} ns")
     print(f"  predictor integrity:   {pred_res_samples:,} compared, "
           f"{pred_res_mismatches:,} mismatched")
     print()
