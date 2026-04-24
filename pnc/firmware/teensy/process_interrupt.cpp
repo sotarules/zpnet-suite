@@ -162,7 +162,8 @@ static int64_t vclock_gnss_from_counter32(uint32_t authored_counter32) {
 //
 // Clients #include process_interrupt.h and call interrupt_dynamic_cps().
 
-static volatile uint32_t g_dynamic_cps                  = DWT_EXPECTED_PER_PPS;
+static volatile uint32_t g_dynamic_cps                  = 0;
+static volatile bool     g_dynamic_cps_valid            = false;
 static volatile uint32_t g_dynamic_cps_pps_sequence     = 0;
 static volatile uint32_t g_dynamic_cps_last_dwt_at_edge = 0;
 
@@ -280,6 +281,18 @@ struct dynamic_cps_tick_state_t {
 
 static dynamic_cps_tick_state_t g_dynamic_cps_last_tick = {};
 
+static void dynamic_cps_reset_diagnostics(void) {
+  g_dynamic_cps_last_tick = dynamic_cps_tick_state_t{};
+}
+
+static void dynamic_cps_reset_model(void) {
+  g_dynamic_cps = 0;
+  g_dynamic_cps_valid = false;
+  g_dynamic_cps_pps_sequence = 0;
+  g_dynamic_cps_last_dwt_at_edge = 0;
+  dynamic_cps_reset_diagnostics();
+}
+
 static void dynamic_cps_cadence_update(uint32_t dwt_at_fire,
                                        uint32_t cadence_counter32,
                                        uint32_t cadence_tick_mod_1000) {
@@ -309,12 +322,16 @@ static void dynamic_cps_cadence_update(uint32_t dwt_at_fire,
     reseed_fired = true;
     if (g_dynamic_cps_pps_sequence != 0) {
       g_dynamic_cps = snap.dwt_at_edge - g_dynamic_cps_last_dwt_at_edge;
+      g_dynamic_cps_valid = true;
       reseed_computed = true;
+    } else {
+      g_dynamic_cps_valid = false;
     }
     g_dynamic_cps_last_dwt_at_edge = snap.dwt_at_edge;
     g_dynamic_cps_pps_sequence     = snap.sequence;
   }
 
+  const bool cps_valid = g_dynamic_cps_valid;
   const uint32_t cps_before = g_dynamic_cps;
 
   // The cadence lane is PPS-phased: after rebootstrap, tick_mod_1000 == 0
@@ -346,6 +363,29 @@ static void dynamic_cps_cadence_update(uint32_t dwt_at_fire,
   }
 
   const bool invalid_negative = (gnss_offset_ns < 0);
+
+  if (!cps_valid || cps_before == 0) {
+    g_dynamic_cps_last_tick.tick_count++;
+    g_dynamic_cps_last_tick.dwt_at_fire          = dwt_at_fire;
+    g_dynamic_cps_last_tick.snap_sequence        = snap.sequence;
+    g_dynamic_cps_last_tick.snap_dwt_at_edge     = snap.dwt_at_edge;
+    g_dynamic_cps_last_tick.snap_gnss_ns_at_edge = snap.gnss_ns_at_edge;
+    g_dynamic_cps_last_tick.ctx_fire_gnss_ns     = 0;
+    g_dynamic_cps_last_tick.fire_vclock_raw      = fire_vclock_raw;
+    g_dynamic_cps_last_tick.vclock_delta_ticks   = vclock_delta_ticks;
+    g_dynamic_cps_last_tick.gnss_offset_ns       = gnss_offset_ns;
+    g_dynamic_cps_last_tick.cps_before           = cps_before;
+    g_dynamic_cps_last_tick.predicted_dwt        = 0;
+    g_dynamic_cps_last_tick.delta                = 0;
+    g_dynamic_cps_last_tick.observed_cycles      = 0;
+    g_dynamic_cps_last_tick.inferred_cps         = 0;
+    g_dynamic_cps_last_tick.cps_error            = 0;
+    g_dynamic_cps_last_tick.cps_step             = 0;
+    g_dynamic_cps_last_tick.cps_after            = g_dynamic_cps;
+    g_dynamic_cps_last_tick.reseed_fired         = reseed_fired;
+    g_dynamic_cps_last_tick.reseed_computed      = reseed_computed;
+    return;
+  }
 
   if (invalid_negative) {
     g_dynamic_cps_last_tick.tick_count++;
@@ -468,10 +508,6 @@ static void dynamic_cps_cadence_update(uint32_t dwt_at_fire,
   }
 }
 
-static void dynamic_cps_reset_diagnostics(void) {
-  g_dynamic_cps_last_tick = dynamic_cps_tick_state_t{};
-}
-
 uint32_t interrupt_dynamic_cps(void) {
   return g_dynamic_cps;
 }
@@ -505,6 +541,34 @@ static inline int32_t vclock_epoch_dwt_offset_cycles(void) {
 static inline uint32_t dwt_for_canonical_vclock_epoch_from_pps(
     uint32_t isr_entry_dwt) {
   return isr_entry_dwt + (uint32_t)vclock_epoch_dwt_offset_cycles();
+}
+
+// DWT->GNSS conversion for interrupt-owned edge events.
+//
+// time.cpp intentionally remains a simple global bridge using the latest
+// PPS-to-PPS anchor rate it was handed.  Inside process_interrupt we also
+// have a fresher intra-second DWT CPS estimate, refined on the PPS-phased
+// VCLOCK cadence.  Use that local model when process_interrupt must assign
+// GNSS time to an interrupt edge (for example OCXO one-second events) and
+// keep time_dwt_to_gnss_ns() as a diagnostic comparison rail.
+static int64_t interrupt_dwt_to_vclock_gnss_ns(uint32_t dwt_at_event) {
+  const pps_edge_snapshot_t snap = interrupt_last_pps_edge();
+  if (snap.sequence == 0 || snap.gnss_ns_at_edge < 0) return -1;
+
+  if (!g_dynamic_cps_valid) return -1;
+
+  const uint32_t cps = interrupt_dynamic_cps();
+  if (cps == 0) return -1;
+
+  const uint32_t dwt_delta = dwt_at_event - snap.dwt_at_edge;
+  const uint64_t ns_delta =
+      ((uint64_t)dwt_delta * (uint64_t)GNSS_NS_PER_SECOND +
+       (uint64_t)cps / 2ULL) /
+      (uint64_t)cps;
+
+  if (ns_delta > (uint64_t)GNSS_NS_PER_SECOND * 3ULL) return -1;
+
+  return snap.gnss_ns_at_edge + (int64_t)ns_delta;
 }
 
 // ============================================================================
@@ -1041,9 +1105,11 @@ static void emit_one_second_event(interrupt_subscriber_runtime_t& rt,
   if (rt.desc->kind == interrupt_subscriber_kind_t::VCLOCK) {
     gnss_ns = vclock_gnss_from_counter32(authored_counter32);
   } else {
-    // OCXO lanes are not GNSS-authored rulers; their GNSS event time
-    // must still be derived from the DWT->GNSS interpolation model.
-    gnss_ns = time_dwt_to_gnss_ns(dwt_at_event);
+    // OCXO lanes are not GNSS-authored rulers; their edge GNSS time
+    // is interpolated from the normalized event DWT.  Use the local
+    // VCLOCK/PPS-anchored dynamic CPS bridge rather than the global
+    // time.cpp bridge so subscribers receive the freshest edge time.
+    gnss_ns = interrupt_dwt_to_vclock_gnss_ns(dwt_at_event);
   }
   event.gnss_ns_at_event = (gnss_ns >= 0) ? (uint64_t)gnss_ns : 0;
   event.status = interrupt_event_status_t::OK;
@@ -1352,14 +1418,24 @@ struct witness_capture_t {
   int32_t  residual_cycles;     // dwt_at_fire - target_dwt
   int32_t  lag_ticks;           // (counter32 & 0xFFFF) - ch3_cntr
 
-  // GNSS-domain comparison of the two time paths at this authored
-  // cadence edge.  gnss_from_dwt_ns is produced by the current
-  // DWT->GNSS model; gnss_from_vclock_ns is produced directly from
-  // the authored VCLOCK cadence identity.  The residual is DWT-model
-  // GNSS minus VCLOCK-authored GNSS.
+  // GNSS-domain comparison of the timing rails at this authored
+  // cadence edge.
+  //
+  // gnss_from_time_bridge_ns is produced by time.cpp's global PPS bridge.
+  // gnss_from_dynamic_dwt_ns is produced by process_interrupt's local
+  // VCLOCK/PPS-anchored dynamic CPS bridge.  gnss_from_vclock_ns is
+  // authored directly from the VCLOCK cadence identity.
+  //
+  // The residuals are DWT-derived GNSS minus VCLOCK-authored GNSS.  The
+  // legacy gnss_from_dwt_ns / gnss_residual_ns fields mirror the time.cpp
+  // bridge rail for continuity while we compare the two approaches.
   int64_t  gnss_from_dwt_ns;
+  int64_t  gnss_from_time_bridge_ns;
+  int64_t  gnss_from_dynamic_dwt_ns;
   int64_t  gnss_from_vclock_ns;
   int64_t  gnss_residual_ns;
+  int64_t  gnss_time_bridge_residual_ns;
+  int64_t  gnss_dynamic_residual_ns;
 
   // Dynamic cps observed at this fire.  Captured for comparison against
   // anchor_dwt_cps (the stale, PPS-anchored value currently used for
@@ -1611,6 +1687,7 @@ static void witness_cadence_observe(uint32_t dwt_at_fire,
 
   const pps_edge_snapshot_t snap = interrupt_last_pps_edge();
   if (snap.sequence == 0 || snap.gnss_ns_at_edge < 0) return;
+  if (!g_dynamic_cps_valid || interrupt_dynamic_cps() == 0) return;
 
   const uint32_t anchor_counter32 = snap.counter32_at_edge;
   const uint32_t anchor_dwt = snap.dwt_at_edge;
@@ -1627,10 +1704,19 @@ static void witness_cadence_observe(uint32_t dwt_at_fire,
   const int32_t residual_cycles = (int32_t)(dwt_at_fire - target_dwt);
 
   const uint32_t vclock_ticks_since_anchor = authored_counter32 - anchor_counter32;
-  const int64_t gnss_from_dwt_ns = time_dwt_to_gnss_ns(dwt_at_fire);
+  const int64_t gnss_from_time_bridge_ns = time_dwt_to_gnss_ns(dwt_at_fire);
+  const int64_t gnss_from_dynamic_dwt_ns = interrupt_dwt_to_vclock_gnss_ns(dwt_at_fire);
   const int64_t gnss_from_vclock_ns =
       snap.gnss_ns_at_edge + (int64_t)vclock_ticks_since_anchor * 100LL;
-  const int64_t gnss_residual_ns = gnss_from_dwt_ns - gnss_from_vclock_ns;
+  const int64_t gnss_time_bridge_residual_ns =
+      gnss_from_time_bridge_ns - gnss_from_vclock_ns;
+  const int64_t gnss_dynamic_residual_ns =
+      gnss_from_dynamic_dwt_ns - gnss_from_vclock_ns;
+
+  // Legacy names: keep publishing the time.cpp bridge rail as the old
+  // DWT-derived comparison while the dynamic rail is evaluated side-by-side.
+  const int64_t gnss_from_dwt_ns = gnss_from_time_bridge_ns;
+  const int64_t gnss_residual_ns = gnss_time_bridge_residual_ns;
 
   const uint32_t dynamic_cps_used = interrupt_dynamic_cps();
   const uint32_t dynamic_target_dwt = witness_compute_target_dwt(anchor_dwt, dynamic_cps_used, slot_index);
@@ -1655,8 +1741,12 @@ static void witness_cadence_observe(uint32_t dwt_at_fire,
   cap.residual_cycles = residual_cycles;
   cap.lag_ticks = lag_ticks;
   cap.gnss_from_dwt_ns = gnss_from_dwt_ns;
+  cap.gnss_from_time_bridge_ns = gnss_from_time_bridge_ns;
+  cap.gnss_from_dynamic_dwt_ns = gnss_from_dynamic_dwt_ns;
   cap.gnss_from_vclock_ns = gnss_from_vclock_ns;
   cap.gnss_residual_ns = gnss_residual_ns;
+  cap.gnss_time_bridge_residual_ns = gnss_time_bridge_residual_ns;
+  cap.gnss_dynamic_residual_ns = gnss_dynamic_residual_ns;
   cap.dynamic_cps_used = dynamic_cps_used;
   cap.dynamic_target_dwt = dynamic_target_dwt;
   cap.dynamic_residual_cycles = dynamic_residual_cycles;
@@ -1874,7 +1964,7 @@ static void qtimer1_isr(void) {
     if (g_qtimer1_ch2_handler) {
       const uint32_t counter32 = 0;
       const uint32_t dwt_at_edge = dwt_for_qtimer_compare_event(isr_entry_dwt);
-      const int64_t gnss_ns_at_edge = time_dwt_to_gnss_ns(dwt_at_edge);
+      const int64_t gnss_ns_at_edge = interrupt_dwt_to_vclock_gnss_ns(dwt_at_edge);
 
       interrupt_event_t event{};
       event.kind     = interrupt_subscriber_kind_t::TIMEPOP;
@@ -2166,6 +2256,7 @@ bool interrupt_stop(interrupt_subscriber_kind_t kind) {
 void interrupt_request_pps_rebootstrap(void) {
   g_pps_rebootstrap_pending = true;
   g_vclock_epoch_gnss_ns = -1;
+  dynamic_cps_reset_model();
 }
 
 bool interrupt_pps_rebootstrap_pending(void) {
@@ -2432,7 +2523,7 @@ void process_interrupt_init(void) {
   hw_witness_apply_mode();
 
   interrupt_witness_reset_stats();
-  dynamic_cps_reset_diagnostics();
+  dynamic_cps_reset_model();
 
   // Dynamic CPS refinement now runs on the PPS-phased VCLOCK cadence lane
   // inside vclock_cadence_isr().  Do not arm a TimePop recurring callback
@@ -2554,6 +2645,9 @@ static Payload cmd_report(const Payload&) {
 
   const dynamic_cps_tick_state_t dc = interrupt_dynamic_cps_last_tick();
   p.add("dynamic_cps", interrupt_dynamic_cps());
+  p.add("dynamic_cps_valid", g_dynamic_cps_valid);
+  p.add("dynamic_cps_pps_sequence", g_dynamic_cps_pps_sequence);
+  p.add("dynamic_cps_last_dwt_at_edge", g_dynamic_cps_last_dwt_at_edge);
   p.add("dynamic_cps_tick_count", dc.tick_count);
   p.add("dynamic_cps_last_gnss_offset_ns", dc.gnss_offset_ns);
   p.add("dynamic_cps_rejected_negative_offset_count",
@@ -2862,8 +2956,12 @@ static void witness_capture_to_payload(const witness_capture_t& cap,
   entry.add("residual_cycles",  cap.residual_cycles);
   entry.add("lag_ticks",        cap.lag_ticks);
   entry.add("gnss_from_dwt_ns", cap.gnss_from_dwt_ns);
+  entry.add("gnss_from_time_bridge_ns", cap.gnss_from_time_bridge_ns);
+  entry.add("gnss_from_dynamic_dwt_ns", cap.gnss_from_dynamic_dwt_ns);
   entry.add("gnss_from_vclock_ns", cap.gnss_from_vclock_ns);
   entry.add("gnss_residual_ns", cap.gnss_residual_ns);
+  entry.add("gnss_time_bridge_residual_ns", cap.gnss_time_bridge_residual_ns);
+  entry.add("gnss_dynamic_residual_ns", cap.gnss_dynamic_residual_ns);
 
   // Dynamic cps at this fire, from the 1 kHz refinement in
   // process_interrupt.  Compare against anchor_dwt_cps to reason about
