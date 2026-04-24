@@ -19,10 +19,8 @@
 // Initialization is split into two phases:
 //
 //   Phase 1: process_clocks_init_hardware()
-//     Starts DWT, QTimer1 (GNSS 10 MHz), GPT1 (OCXO1 10 MHz),
-//     and GPT2 (OCXO2 10 MHz).
-//     Must be called BEFORE timepop_init() so that QTimer1 is running
-//     when TimePop installs its compare ISR.
+//     Starts DWT.  QTimer hardware custody is handled by process_interrupt.
+//     Must be called before full process init so DWT timing is available.
 //
 //   Phase 2: process_clocks_init()
 //     Configures OCXO DACs (both), PPS ISR, relay pins, and arms
@@ -45,7 +43,7 @@
 // Initialization — Phase 1 (hardware only, no TimePop dependency)
 // -----------------------------------------------------------------------------
 
-/// Start DWT, QTimer1 (GNSS VCLOCK), GPT1 (OCXO1), GPT2 (OCXO2).
+/// Start DWT. QTimer/GNSS/OCXO hardware custody belongs to process_interrupt.
 /// Safe to call before timepop_init().
 /// Idempotent — safe to call multiple times.
 void process_clocks_init_hardware(void);

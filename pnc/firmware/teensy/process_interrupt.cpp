@@ -79,6 +79,18 @@ static constexpr uint64_t HW_WITNESS_LOW_OFFSET_NS  = 750000000ULL;
 static constexpr const char* HW_WITNESS_HIGH_NAME = "HW_WITNESS_HIGH";
 static constexpr const char* HW_WITNESS_LOW_NAME  = "HW_WITNESS_LOW";
 
+// ── VCLOCK-domain PPS epoch selection ──
+//
+// The canonical public "PPS" epoch is now the VCLOCK edge selected by the
+// physical PPS pulse, not the GPIO ISR's physical PPS DWT capture.  We select
+// the first VCLOCK edge after the physical pulse.  The GPIO ISR reads the
+// VCLOCK counter after a small, deterministic bus delay, so the raw counter
+// read is already the selected edge identity on the current hardware path.
+// Keep this as a named constant so live measurements can tune it without
+// reopening every downstream consumer.
+static constexpr uint32_t VCLOCK_EPOCH_TICKS_AFTER_PHYSICAL_PPS = 1;
+static constexpr int32_t  VCLOCK_EPOCH_COUNTER32_OFFSET_TICKS   = 0;
+
 
 // ============================================================================
 // DWT cycles-per-second dynamic refinement
@@ -342,6 +354,17 @@ dynamic_cps_tick_state_t interrupt_dynamic_cps_last_tick(void) {
   return g_dynamic_cps_last_tick;
 }
 
+static inline int32_t vclock_epoch_dwt_offset_cycles(void) {
+  // Convert the selected VCLOCK tick displacement from the physical PPS pulse
+  // into DWT cycles.  This is an epoch-label calculation, not a measurement
+  // update.  Use the current dynamic CPS when available so the offset follows
+  // the live DWT rate; fall back naturally to the expected value at startup.
+  return (int32_t)(((uint64_t)g_dynamic_cps *
+                    (uint64_t)VCLOCK_EPOCH_TICKS_AFTER_PHYSICAL_PPS +
+                    (uint64_t)(VCLOCK_COUNTS_PER_SECOND / 2)) /
+                   (uint64_t)VCLOCK_COUNTS_PER_SECOND);
+}
+
 
 // ============================================================================
 // Subscriber runtime
@@ -546,6 +569,18 @@ struct pps_edge_snapshot_store_t {
   volatile uint32_t counter32_at_edge = 0;
   volatile uint16_t ch3_at_edge       = 0;
   volatile int64_t  gnss_ns_at_edge   = -1;
+
+  volatile uint32_t physical_pps_dwt_raw_at_edge        = 0;
+  volatile uint32_t physical_pps_dwt_normalized_at_edge = 0;
+  volatile uint32_t physical_pps_counter32_at_read      = 0;
+  volatile uint16_t physical_pps_ch3_at_read            = 0;
+
+  volatile uint32_t vclock_epoch_counter32              = 0;
+  volatile uint16_t vclock_epoch_ch3                    = 0;
+  volatile uint32_t vclock_epoch_ticks_after_pps        = 0;
+  volatile int32_t  vclock_epoch_counter32_offset_ticks = 0;
+  volatile int32_t  vclock_epoch_dwt_offset_cycles      = 0;
+  volatile bool     vclock_epoch_selected               = false;
 };
 
 static pps_edge_snapshot_store_t g_pps_edge_store;
@@ -1909,7 +1944,7 @@ static void pps_edge_dispatch_trampoline(timepop_ctx_t*, timepop_diag_t*, void*)
 }
 
 void process_interrupt_gpio6789_irq(uint32_t dwt_isr_entry_raw) {
-  const uint32_t dwt_at_edge = dwt_at_gpio_edge(dwt_isr_entry_raw);
+  const uint32_t physical_pps_dwt_normalized = dwt_at_gpio_edge(dwt_isr_entry_raw);
 
   // ── First-instruction captures ──
   //
@@ -1935,6 +1970,18 @@ void process_interrupt_gpio6789_irq(uint32_t dwt_isr_entry_raw) {
 
   g_gpio_irq_count++;
   g_pps_gpio_witness.edge_count++;
+  // Derive the canonical VCLOCK-domain epoch selected by this physical PPS.
+  // Public "PPS" subscribers receive these canonical values.  The raw GPIO
+  // capture remains available in the snapshot as physical_pps_* audit data.
+  const int32_t selected_counter_offset_ticks = VCLOCK_EPOCH_COUNTER32_OFFSET_TICKS;
+  const uint32_t selected_counter32 =
+      counter32 + (uint32_t)selected_counter_offset_ticks;
+  const uint16_t selected_ch3 =
+      (uint16_t)(ch3_now + (int16_t)selected_counter_offset_ticks);
+  const int32_t selected_dwt_offset_cycles = vclock_epoch_dwt_offset_cycles();
+  const uint32_t dwt_at_edge =
+      physical_pps_dwt_normalized + (uint32_t)selected_dwt_offset_cycles;
+
   g_pps_gpio_witness.last_dwt = dwt_at_edge;
 
   const int64_t gnss_ns = time_dwt_to_gnss_ns(dwt_at_edge);
@@ -1982,10 +2029,8 @@ void process_interrupt_gpio6789_irq(uint32_t dwt_isr_entry_raw) {
     g_vclock_lane.phase_bootstrapped = true;
     g_vclock_lane.tick_mod_1000 = 0;
     g_vclock_lane.compare_target =
-        (uint16_t)(ch3_now + (uint16_t)VCLOCK_INTERVAL_COUNTS
-                   + (uint16_t)VCLOCK_EPOCH_TICK_OFFSET);
-    g_vclock_lane.logical_count32_at_last_second =
-        counter32 + VCLOCK_EPOCH_TICK_OFFSET;
+        (uint16_t)(selected_ch3 + (uint16_t)VCLOCK_INTERVAL_COUNTS);
+    g_vclock_lane.logical_count32_at_last_second = selected_counter32;
     qtimer1_ch3_program_compare(g_vclock_lane.compare_target);
   }
 
@@ -2002,9 +2047,21 @@ void process_interrupt_gpio6789_irq(uint32_t dwt_isr_entry_raw) {
   g_pps_edge_store.sequence          = g_pps_gpio_witness.edge_count;
   g_pps_edge_store.dwt_at_edge       = dwt_at_edge;
   g_pps_edge_store.dwt_raw_at_edge   = dwt_isr_entry_raw;
-  g_pps_edge_store.counter32_at_edge = counter32;
-  g_pps_edge_store.ch3_at_edge       = ch3_now;
+  g_pps_edge_store.counter32_at_edge = selected_counter32;
+  g_pps_edge_store.ch3_at_edge       = selected_ch3;
   g_pps_edge_store.gnss_ns_at_edge   = gnss_ns;
+
+  g_pps_edge_store.physical_pps_dwt_raw_at_edge        = dwt_isr_entry_raw;
+  g_pps_edge_store.physical_pps_dwt_normalized_at_edge = physical_pps_dwt_normalized;
+  g_pps_edge_store.physical_pps_counter32_at_read      = counter32;
+  g_pps_edge_store.physical_pps_ch3_at_read            = ch3_now;
+
+  g_pps_edge_store.vclock_epoch_counter32              = selected_counter32;
+  g_pps_edge_store.vclock_epoch_ch3                    = selected_ch3;
+  g_pps_edge_store.vclock_epoch_ticks_after_pps        = VCLOCK_EPOCH_TICKS_AFTER_PHYSICAL_PPS;
+  g_pps_edge_store.vclock_epoch_counter32_offset_ticks = selected_counter_offset_ticks;
+  g_pps_edge_store.vclock_epoch_dwt_offset_cycles      = selected_dwt_offset_cycles;
+  g_pps_edge_store.vclock_epoch_selected               = true;
   dmb_barrier();
   g_pps_edge_store.seq++;
 
@@ -2033,6 +2090,18 @@ pps_edge_snapshot_t interrupt_last_pps_edge(void) {
     out.counter32_at_edge = g_pps_edge_store.counter32_at_edge;
     out.ch3_at_edge       = g_pps_edge_store.ch3_at_edge;
     out.gnss_ns_at_edge   = g_pps_edge_store.gnss_ns_at_edge;
+
+    out.physical_pps_dwt_raw_at_edge        = g_pps_edge_store.physical_pps_dwt_raw_at_edge;
+    out.physical_pps_dwt_normalized_at_edge = g_pps_edge_store.physical_pps_dwt_normalized_at_edge;
+    out.physical_pps_counter32_at_read      = g_pps_edge_store.physical_pps_counter32_at_read;
+    out.physical_pps_ch3_at_read            = g_pps_edge_store.physical_pps_ch3_at_read;
+
+    out.vclock_epoch_counter32              = g_pps_edge_store.vclock_epoch_counter32;
+    out.vclock_epoch_ch3                    = g_pps_edge_store.vclock_epoch_ch3;
+    out.vclock_epoch_ticks_after_pps        = g_pps_edge_store.vclock_epoch_ticks_after_pps;
+    out.vclock_epoch_counter32_offset_ticks = g_pps_edge_store.vclock_epoch_counter32_offset_ticks;
+    out.vclock_epoch_dwt_offset_cycles      = g_pps_edge_store.vclock_epoch_dwt_offset_cycles;
+    out.vclock_epoch_selected               = g_pps_edge_store.vclock_epoch_selected;
     dmb_barrier();
     const uint32_t s2 = g_pps_edge_store.seq;
     if (s1 == s2 && (s1 & 1u) == 0u) return out;
@@ -2367,7 +2436,6 @@ void process_interrupt_init(void) {
   hw_witness_apply_mode();
 
   interrupt_witness_reset_stats();
-  interrupt_witness_set_mode(interrupt_witness_mode_t::ON);
 
   // Arm the 1 kHz dynamic cps refinement.  No explicit init — g_dynamic_cps
   // starts at DWT_EXPECTED_PER_PPS and is reseeded from ground truth on
@@ -2429,6 +2497,16 @@ static Payload cmd_report(const Payload&) {
   p.add("pps_edge_counter32", snap.counter32_at_edge);
   p.add("pps_edge_ch3", (uint32_t)snap.ch3_at_edge);
   p.add("pps_edge_gnss_ns_snapshot", snap.gnss_ns_at_edge);
+  p.add("pps_edge_is_vclock_epoch", snap.vclock_epoch_selected);
+  p.add("pps_physical_gpio_dwt_raw", snap.physical_pps_dwt_raw_at_edge);
+  p.add("pps_physical_gpio_dwt_normalized", snap.physical_pps_dwt_normalized_at_edge);
+  p.add("pps_physical_gpio_counter32_at_read", snap.physical_pps_counter32_at_read);
+  p.add("pps_physical_gpio_ch3_at_read", (uint32_t)snap.physical_pps_ch3_at_read);
+  p.add("pps_vclock_epoch_counter32", snap.vclock_epoch_counter32);
+  p.add("pps_vclock_epoch_ch3", (uint32_t)snap.vclock_epoch_ch3);
+  p.add("pps_vclock_epoch_ticks_after_physical_pps", snap.vclock_epoch_ticks_after_pps);
+  p.add("pps_vclock_epoch_counter32_offset_ticks", snap.vclock_epoch_counter32_offset_ticks);
+  p.add("pps_vclock_epoch_dwt_offset_cycles", snap.vclock_epoch_dwt_offset_cycles);
   p.add("pps_edge_dispatch_registered", g_pps_edge_dispatch != nullptr);
 
   p.add("vclock_irq_count", g_vclock_lane.irq_count);
@@ -2710,10 +2788,18 @@ static Payload cmd_witness_start(const Payload&) {
 
 static Payload cmd_witness_stop(const Payload&) {
   interrupt_witness_set_mode(interrupt_witness_mode_t::OFF);
-  // Alpha's next PPS edge will rebootstrap naturally — but request it
-  // now to make sure cadence resumes on the very next edge rather than
-  // drifting silently.
-  interrupt_request_pps_rebootstrap();
+
+  // Do NOT request a hardware-only rebootstrap here.
+  //
+  // A raw interrupt_request_pps_rebootstrap() re-phases CH3, but alpha
+  // does not install a new epoch or reset its VCLOCK measurement state.
+  // The first VCLOCK sample after witness mode would then span across
+  // the witness pause and appear as a bogus multi-second VCLOCK window.
+  //
+  // Let the next explicit ZERO/START path request a full alpha-owned
+  // epoch install.  For manual witness testing, follow WITNESS_STOP with
+  // CLOCKS ZERO or CLOCKS START if canonical clock publication should
+  // resume immediately.
   const interrupt_witness_stats_t ws = interrupt_witness_stats();
   Payload p;
   p.add("witness_active", false);

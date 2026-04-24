@@ -11,27 +11,30 @@
 //
 // Epoch authority:
 //
-//   The canonical epoch is PPS-anchored.  At INIT / ZERO / START, alpha
-//   calls interrupt_request_pps_rebootstrap() + sets g_epoch_pending.
-//   The next physical PPS GPIO edge:
+//   The canonical epoch is VCLOCK-domain PPS.  At INIT / ZERO / START,
+//   alpha calls interrupt_request_pps_rebootstrap() + sets
+//   g_epoch_pending.  The next physical PPS GPIO edge is captured by
+//   process_interrupt, but the public snapshot it publishes defines
+//   "PPS" as the selected VCLOCK epoch edge: currently the first VCLOCK
+//   edge after the physical PPS pulse, latency-adjusted into DWT space.
 //
-//     - Is captured in the GPIO ISR with (DWT, counter32, ch3) as
-//       first-instruction captures.
-//     - Triggers an in-ISR re-phasing of the VCLOCK CH3 cadence so that
-//       subsequent one-second events fire at PPS moments plus a
-//       consistent GPIO ISR latency.
-//     - Fires pps_edge_callback, which installs the epoch from the
-//       snapshot: g_epoch_dwt_at_pps = snap.dwt_at_edge,
-//       g_epoch_qtimer_at_pps = snap.counter32_at_edge,
-//       g_gnss_ns_count_at_pps = 0, g_epoch_pps_edge_sequence =
-//       snap.sequence.
+//   Alpha installs the epoch from that canonical snapshot verbatim:
+//     g_epoch_dwt_at_pps = snap.dwt_at_edge
+//     g_epoch_qtimer_at_pps = snap.counter32_at_edge
+//     g_gnss_ns_count_at_pps = 0
+//     g_epoch_pps_edge_sequence = snap.sequence
+//
+//   The raw physical GPIO PPS facts remain available in snap.physical_pps_*
+//   only for audit/debugging.  Alpha must not apply the old
+//   VCLOCK_EPOCH_TICK_OFFSET to snap.counter32_at_edge; process_interrupt
+//   already published the chosen VCLOCK epoch identity.
 //
 //   After install, vclock_callback becomes a pure per-second advancer:
 //   each invocation advances g_gnss_ns_count_at_pps by exactly 1e9,
-//   and the VCLOCK cadence it responds to is phase-locked to the
-//   physical PPS edge.
+//   and the VCLOCK cadence it responds to is phase-locked to the selected
+//   VCLOCK epoch.
 //
-// Statistical surface (standardized):
+// // Statistical surface (standardized):
 //
 //   Every Welford accumulator published in the fragment uses the same
 //   suffix set:
@@ -96,19 +99,19 @@
 //                                  in alpha::vclock_callback per
 //                                  VCLOCK one-second event.  No
 //                                  physical capture involved.
-//   - g_dwt_cycle_count_at_pps     snap.dwt_at_edge.  Authored in
-//                                  alpha::pps_edge_callback from the
-//                                  priority-0 GPIO ISR capture.
-//                                  Preemption-proof.
+//   - g_dwt_cycle_count_at_pps     snap.dwt_at_edge.  Canonical
+//                                  VCLOCK-domain PPS epoch DWT selected
+//                                  by the physical PPS pulse in
+//                                  process_interrupt.
 //   - g_dwt_cycle_count_between_pps  Difference of consecutive
 //                                    snap.dwt_at_edge values across
 //                                    two PPS edges.  Authored in
 //                                    alpha::pps_edge_callback.
 //                                    Preemption-proof.
-//   - g_qtimer_at_pps              snap.counter32_at_edge.  Authored
-//                                  in alpha::pps_edge_callback from
-//                                  the priority-0 GPIO ISR capture.
-//                                  Preemption-proof.
+//   - g_qtimer_at_pps              snap.counter32_at_edge.  Canonical
+//                                  VCLOCK-domain PPS epoch counter
+//                                  identity selected by the physical PPS
+//                                  pulse in process_interrupt.
 //   - g_epoch_dwt_at_pps           snap.dwt_at_edge at install.
 //   - g_epoch_qtimer_at_pps        snap.counter32_at_edge at install.
 //   - g_epoch_pps_edge_sequence    snap.sequence at install (for
@@ -184,18 +187,20 @@ static inline uint64_t dwt_ns_to_cycles(uint64_t ns) {
 // second corresponds to."  No physical capture — pure arithmetic.
 extern volatile uint64_t g_gnss_ns_count_at_pps;
 
-// DWT_CYCCNT value captured at the most recent PPS GPIO edge
-// (snap.dwt_at_edge).  Authored from the priority-0 GPIO ISR.
+// Canonical DWT_CYCCNT coordinate of the most recent PPS epoch
+// (snap.dwt_at_edge).  Under the VCLOCK-domain architecture this is the
+// selected VCLOCK edge after the physical PPS pulse, not the raw GPIO ISR
+// capture.
 extern volatile uint32_t g_dwt_cycle_count_at_pps;
 
 // Cumulative sum of dwt_cycles_between_pps across the campaign.
 // Advanced in pps_edge_callback by the latest measurement.
 extern volatile uint64_t g_dwt_cycle_count_total;
 
-// Most recent one-second measurement of DWT cycles between
-// consecutive PPS GPIO edges (snap[n].dwt_at_edge -
-// snap[n-1].dwt_at_edge).  The honest, preemption-proof per-second
-// DWT rate.  Feeds dwt_effective_cycles_per_second().
+// Most recent one-second measurement of DWT cycles between consecutive
+// canonical PPS epochs (snap[n].dwt_at_edge - snap[n-1].dwt_at_edge).
+// These epochs are VCLOCK-domain edges selected by physical PPS pulses.
+// Feeds dwt_effective_cycles_per_second().
 extern volatile uint32_t g_dwt_cycle_count_between_pps;
 
 // Prediction residual (diagnostic).  Signed difference between the
@@ -207,10 +212,9 @@ extern volatile uint32_t g_dwt_cycle_count_between_pps;
 // Zero until two consecutive measurements exist since epoch install.
 extern volatile int32_t  g_dwt_prediction_residual_cycles;
 
-// Cascaded 32-bit QTimer1 CH0/CH1 counter value captured at the
-// most recent PPS GPIO edge (snap.counter32_at_edge).  Authored
-// from the priority-0 GPIO ISR.  This is the VCLOCK hardware-
-// counter position at the PPS moment.
+// Cascaded 32-bit QTimer1 CH0/CH1 counter identity of the most recent
+// canonical PPS epoch (snap.counter32_at_edge).  This is the VCLOCK
+// hardware-counter position selected by the physical PPS pulse.
 extern volatile uint32_t g_qtimer_at_pps;
 
 // Diagnostic — last seen counter32_at_event (CH3 ISR capture).

@@ -767,11 +767,9 @@ void clocks_beta_pps(void) {
   p.add("dwt_prediction_residual_cycles",
         g_dwt_prediction_residual_cycles);
 
-  // QTimer1 hardware-counter position captured at the PPS GPIO edge.
-  // (Post-refactor: authored by pps_edge_callback from the priority-0
-  // GPIO ISR's snap.counter32_at_edge — no longer a VCLOCK-surface
-  // fact.  Previously published as "vclock_qtimer_at_pps", which was
-  // a misnomer once the authoring site moved.)
+  // QTimer1 hardware-counter identity of the canonical PPS epoch.
+  // Under the VCLOCK-domain architecture this is the selected VCLOCK
+  // edge after the physical PPS pulse, not the raw GPIO counter read.
   p.add("qtimer_at_pps", g_qtimer_at_pps);
 
   // VCLOCK surface — authored facts + per-edge measurement + window accounting.

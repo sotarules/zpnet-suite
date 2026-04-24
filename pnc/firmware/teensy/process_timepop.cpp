@@ -42,31 +42,29 @@
 // Dispatch timing audit:
 //
 //   TimePop validates actual dispatch timing in the ISR using two independent
-//   domains:
+//   views of the same VCLOCK-domain event:
 //
-//   1. DWT-domain: captures ARM_DWT_CYCCNT, subtracts fixed ISR overhead,
-//      converts to GNSS ns via the DWT bridge, compares against target.
+//   1. DWT-domain: process_interrupt passes the CH2 compare's normalized
+//      DWT-at-edge capture.  TimePop can spin/land against predicted DWT
+//      targets and convert the landed DWT back through the time bridge for
+//      monitored diagnostics.
 //
-//   2. VCLOCK-domain: reads the VCLOCK counter (CH0+CH1), converts to GNSS ns
-//      via VCLOCK arithmetic, compares against target.  This is self-consistent
-//      with how the deadline was scheduled and reveals any CH2/CH0 phase offset.
+//   2. VCLOCK-domain: process_interrupt passes the CH0+CH1 counter captured
+//      for the same CH2 compare event.  TimePop converts that counter to GNSS
+//      ns by pure VCLOCK arithmetic.  This is the scheduling authority.
 //
-//   If the DWT domain shows ~585 ns error but the VCLOCK domain shows ~600 ns,
-//   the cause is a boot-time initialization offset between CH0 and CH2 — both
-//   count the same 10 MHz clock but CH0 was enabled first.
+//   Under the new interrupt doctrine, process_interrupt owns QTimer1 hardware
+//   and publishes a canonical PPS epoch that is already the selected
+//   VCLOCK-domain edge.  TimePop therefore does not correct PPS/VCLOCK phase;
+//   it consumes the bridge anchor and schedules in the one sovereign VCLOCK
+//   coordinate system.
 //
-// CH2/CH0 initialization offset:
+// CH2/CH0 phase discipline:
 //
-//   CH0 and CH2 both count the GNSS 10 MHz clock (CM=1, PCS=0) but are enabled
-//   in separate init functions in process_interrupt (qtimer1_init_vclock_base
-//   and qtimer1_init_ch2_scheduler).  Between CH0's enable and CH2's enable,
-//   peripheral register writes for CH1 setup consume several VCLOCK ticks.
-//   This creates a permanent phase offset: CH2 lags CH0 by a small number
-//   of ticks.
-//
-//   Since deadlines are computed from CH0+CH1 but the compare fires on CH2, every
-//   compare fires late by the offset.  The fix (once confirmed) is to synchronize
-//   CH2 to CH0 at init time.
+//   CH0, CH1, CH2, and CH3 are initialized and atomically enabled by
+//   process_interrupt.  TimePop owns only CH2 compare programming.  Any
+//   remaining CH2/CH0 phase effect is diagnostic, not something TimePop should
+//   compensate for locally.
 //
 // ============================================================================
 
@@ -127,6 +125,11 @@ static constexpr const char* VCLOCK_MONITOR_NAME = "VCLOCK_MONITOR";
 static inline uint32_t ns_to_dwt_cycles_runtime(uint64_t ns) {
   const uint32_t f = F_CPU_ACTUAL ? F_CPU_ACTUAL : 1008000000U;
   return (uint32_t)(((uint64_t)f * ns + 500000000ULL) / 1000000000ULL);
+}
+
+static inline int64_t dwt_cycles_to_ns_signed(int32_t cycles) {
+  const int64_t c = (int64_t)cycles;
+  return (c * (int64_t)DWT_NS_NUM) / (int64_t)DWT_NS_DEN;
 }
 
 
@@ -402,6 +405,15 @@ struct vclock_edge_monitor_state_t {
   int32_t  last_vclock_minus_pps_cycles = 0;
   int64_t  last_vclock_minus_pps_ns = 0;
 
+  // Under the VCLOCK-selected PPS epoch, the monitor target is intentionally
+  // VCLOCK_MONITOR_OFFSET_NS after the epoch.  The raw minus-epoch value should
+  // therefore be near that offset, not near zero.  The error fields subtract
+  // the expected offset and are the real coherence signal.
+  uint32_t last_expected_offset_cycles = 0;
+  int64_t  last_expected_offset_ns = 0;
+  int32_t  last_vclock_minus_pps_error_cycles = 0;
+  int64_t  last_vclock_minus_pps_error_ns = 0;
+
   int64_t last_target_gnss_ns = -1;   // target for the completed capture
   int64_t next_target_gnss_ns = -1;   // target for the next armed occurrence
 };
@@ -429,10 +441,22 @@ static void vclock_edge_monitor_refresh_correlation(void) {
 
   g_vclock_edge_monitor.last_pps_gnss_ns = latest_pps_gnss_ns;
   g_vclock_edge_monitor.last_pps_dwt_at_edge = snap.dwt_at_pps;
-  g_vclock_edge_monitor.last_vclock_minus_pps_cycles =
+
+  const int32_t actual_offset_cycles =
       (int32_t)(g_vclock_edge_monitor.last_dwt_at_edge - snap.dwt_at_pps);
+  const uint32_t expected_offset_cycles =
+      ns_to_dwt_cycles_runtime((uint64_t)VCLOCK_MONITOR_OFFSET_NS);
+  const int32_t error_cycles =
+      actual_offset_cycles - (int32_t)expected_offset_cycles;
+
+  g_vclock_edge_monitor.last_vclock_minus_pps_cycles = actual_offset_cycles;
   g_vclock_edge_monitor.last_vclock_minus_pps_ns =
-      (int64_t)g_vclock_edge_monitor.last_vclock_minus_pps_cycles;
+      dwt_cycles_to_ns_signed(actual_offset_cycles);
+  g_vclock_edge_monitor.last_expected_offset_cycles = expected_offset_cycles;
+  g_vclock_edge_monitor.last_expected_offset_ns = VCLOCK_MONITOR_OFFSET_NS;
+  g_vclock_edge_monitor.last_vclock_minus_pps_error_cycles = error_cycles;
+  g_vclock_edge_monitor.last_vclock_minus_pps_error_ns =
+      dwt_cycles_to_ns_signed(error_cycles);
   g_vclock_edge_monitor.last_correlation_valid = true;
 }
 
@@ -2108,6 +2132,10 @@ out.add("vclock_edge_monitor_last_ch0_ch1_vclock_raw", g_vclock_edge_monitor.las
 out.add("vclock_edge_monitor_last_pps_dwt_at_edge", g_vclock_edge_monitor.last_pps_dwt_at_edge);
 out.add("vclock_edge_monitor_last_vclock_minus_pps_cycles", g_vclock_edge_monitor.last_vclock_minus_pps_cycles);
 out.add("vclock_edge_monitor_last_vclock_minus_pps_ns", g_vclock_edge_monitor.last_vclock_minus_pps_ns);
+out.add("vclock_edge_monitor_expected_offset_cycles", g_vclock_edge_monitor.last_expected_offset_cycles);
+out.add("vclock_edge_monitor_expected_offset_ns", g_vclock_edge_monitor.last_expected_offset_ns);
+out.add("vclock_edge_monitor_error_cycles", g_vclock_edge_monitor.last_vclock_minus_pps_error_cycles);
+out.add("vclock_edge_monitor_error_ns", g_vclock_edge_monitor.last_vclock_minus_pps_error_ns);
 
   PayloadArray timers;
   for (uint32_t i = 0; i < MAX_SLOTS; i++) {

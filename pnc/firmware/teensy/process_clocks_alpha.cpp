@@ -426,44 +426,39 @@ static void alpha_reset_canonical_clock_state_for_new_epoch(void) {
 // vclock_callback will fire exactly 1 second after the PPS moment
 // represented by `snap`.
 //
-// The epoch IS the PPS moment:
-//   g_gnss_ns_count_at_pps = 0      (the PPS edge IS time zero)
+// The epoch IS the canonical PPS/VCLOCK boundary selected by the
+// physical PPS pulse:
+//   g_gnss_ns_count_at_pps = 0
 //   g_dwt_cycle_count_at_pps = snap.dwt_at_edge
-//   g_epoch_qtimer_at_pps = snap.counter32_at_edge + VCLOCK_EPOCH_TICK_OFFSET
+//   g_epoch_qtimer_at_pps = snap.counter32_at_edge
 //   g_epoch_pps_edge_sequence = snap.sequence
 //
-// Epoch tick offset rationale: snap.counter32_at_edge is the honest
-// hardware reading taken ~140 cycles after the PPS edge, meaning the
-// counter has already ticked once past the PPS-corresponding tick by
-// the time we got the read.  We apply VCLOCK_EPOCH_TICK_OFFSET (a
-// signed correction, currently -1) to recover the identity of the
-// tick that actually corresponds to the PPS edge.  This is alpha's
-// canonical correction site — downstream consumers of alpha's epoch
-// state see the corrected identity; consumers of the raw snapshot do
-// not.  See process_interrupt.h for the full physical reasoning.
+// Important semantic shift: process_interrupt now publishes
+// snap.dwt_at_edge / snap.counter32_at_edge as the VCLOCK-domain epoch
+// selected by the physical PPS pulse.  Alpha must consume the snapshot
+// verbatim.  Applying the old VCLOCK_EPOCH_TICK_OFFSET here would
+// double-correct the epoch and reintroduce the cross-domain phase error
+// this architecture removes.  The raw physical GPIO PPS facts remain
+// available in snap.physical_pps_* for diagnostics only.
 //
 static void alpha_install_new_epoch_from_pps_snapshot(
     const pps_edge_snapshot_t& snap) {
   alpha_reset_canonical_clock_state_for_new_epoch();
 
-  // The PPS-corresponding counter identity, corrected for bus-read
-  // quantization.  Every consumer of alpha's state sees this value;
-  // alpha NEVER re-exposes the raw snap.counter32_at_edge.
-  const uint32_t anchor_counter32_corrected =
-      snap.counter32_at_edge + VCLOCK_EPOCH_TICK_OFFSET;
+  const uint32_t anchor_counter32 = snap.counter32_at_edge;
 
   g_epoch_dwt_at_pps        = snap.dwt_at_edge;
-  g_epoch_qtimer_at_pps     = anchor_counter32_corrected;
+  g_epoch_qtimer_at_pps     = anchor_counter32;
   g_epoch_pps_edge_sequence = snap.sequence;
   g_epoch_pps_index         = 0;
 
   g_dwt_cycle_count_at_pps = snap.dwt_at_edge;
-  g_qtimer_at_pps          = anchor_counter32_corrected;
+  g_qtimer_at_pps          = anchor_counter32;
   g_prev_dwt_at_vclock_event = snap.dwt_at_edge;
   g_prev_pps_dwt_at_edge       = snap.dwt_at_edge;
   g_prev_pps_dwt_at_edge_valid = true;
 
-  time_pps_epoch_reset(snap.dwt_at_edge, anchor_counter32_corrected);
+  time_pps_epoch_reset(snap.dwt_at_edge, anchor_counter32);
 
   g_epoch_initialized = true;
   g_epoch_pending     = false;
@@ -580,7 +575,7 @@ static void vclock_callback(
   // pps_edge_ns_from_vclock).
   g_prev_dwt_at_vclock_event = event.dwt_at_event;
 
-  if (event.gnss_ns_at_event != 0) {
+  if (g_epoch_initialized && !g_epoch_pending) {
     clocks_apply_edge(g_vclock_clock, g_vclock_measurement,
                       event.dwt_at_event, event.gnss_ns_at_event);
   }
@@ -665,7 +660,7 @@ static void pps_edge_callback(const pps_edge_snapshot_t& snap) {
   // We publish it for diagnostic continuity but do NOT feed it to the
   // welford, because its variance includes foreground ordering noise.
   g_pps_interrupt_diag.pps_edge_sequence          = snap.sequence;
-  g_pps_interrupt_diag.pps_edge_dwt_isr_entry_raw = snap.dwt_at_edge;
+  g_pps_interrupt_diag.pps_edge_dwt_isr_entry_raw = snap.physical_pps_dwt_raw_at_edge;
   g_pps_interrupt_diag.pps_edge_gnss_ns           = snap.gnss_ns_at_edge;
   g_pps_interrupt_diag.pps_edge_minus_event_ns =
       (snap.gnss_ns_at_edge >= 0)
@@ -730,21 +725,19 @@ static void pps_edge_callback(const pps_edge_snapshot_t& snap) {
 
     g_prev_pps_dwt_at_edge = snap.dwt_at_edge;
 
-    // Canonical "at_pps" captures — honest with their names.
-    // Both are priority-0 GPIO ISR captures from this very edge.
-    // counter32 is corrected for bus-read quantization (see
-    // VCLOCK_EPOCH_TICK_OFFSET in process_interrupt.h) so every
-    // consumer of alpha's published state sees the true PPS-
-    // corresponding counter identity, not the bus-read-moment value.
-    const uint32_t anchor_counter32_corrected =
-        snap.counter32_at_edge + VCLOCK_EPOCH_TICK_OFFSET;
+    // Canonical "at_pps" captures — honest with their names under the
+    // new contract.  snap.dwt_at_edge and snap.counter32_at_edge are already
+    // the VCLOCK-domain epoch selected by the physical PPS pulse.  The GPIO
+    // ISR's raw physical capture is retained in snap.physical_pps_* only as
+    // audit evidence.
+    const uint32_t anchor_counter32 = snap.counter32_at_edge;
 
     g_dwt_cycle_count_at_pps = snap.dwt_at_edge;
-    g_qtimer_at_pps          = anchor_counter32_corrected;
+    g_qtimer_at_pps          = anchor_counter32;
 
     time_pps_update(snap.dwt_at_edge,
                     dwt_effective_cycles_per_second(),
-                    anchor_counter32_corrected);
+                    anchor_counter32);
   }
 
   // ── Witness: arm slot 0 for the upcoming second if witness is on ──
@@ -755,16 +748,15 @@ static void pps_edge_callback(const pps_edge_snapshot_t& snap) {
   // its internal Welford.  Deliberately skipped when epoch is not yet
   // initialized — witness math presumes a valid anchor.
   //
-  // We pass the CORRECTED counter identity — the same value alpha's
-  // epoch uses — so witness's target_vclock computations land at
-  // physically correct moments relative to the true PPS edge.
+  // We pass the canonical VCLOCK-domain counter identity verbatim — the
+  // same value alpha's epoch uses.  The raw physical PPS DWT is supplied
+  // only as an audit field for witness dumps.
   //
   if (g_epoch_initialized && !g_epoch_pending) {
-    const uint32_t witness_anchor_counter32 =
-        snap.counter32_at_edge + VCLOCK_EPOCH_TICK_OFFSET;
+    const uint32_t witness_anchor_counter32 = snap.counter32_at_edge;
     interrupt_witness_arm_first_slot(witness_anchor_counter32,
                                      snap.dwt_at_edge,
-                                     snap.dwt_raw_at_edge,
+                                     snap.physical_pps_dwt_raw_at_edge,
                                      dwt_effective_cycles_per_second());
   }
 

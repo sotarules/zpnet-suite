@@ -29,7 +29,8 @@
 //   process_interrupt owns the vector and dispatches in IRQ context:
 //     • CH2 flag set → TimePop's registered handler (this file)
 //     • CH3 flag set → process_interrupt's internal vclock_cadence_isr
-//   Both handlers receive the same first-instruction DWT capture.
+//   Each handler receives a normalized DWT-at-edge capture for its own
+//   QTimer event.
 //
 //   For CH2, the dispatcher additionally computes counter32_at_event
 //   and gnss_ns_at_event and packages everything into a standard
@@ -37,6 +38,11 @@
 //   which it passes to TimePop's handler.  TimePop reads the event
 //   payload directly and proceeds with slot dispatch — no need to
 //   re-read the counter or recompute gnss_ns.
+//
+//   The PPS epoch consumed through time_anchor_snapshot() is already
+//   process_interrupt's canonical VCLOCK-selected epoch.  TimePop does
+//   not reinterpret physical PPS GPIO timing; it schedules in that
+//   canonical VCLOCK/GNSS coordinate system.
 //
 //   TimePop is responsible for:
 //     • registering its CH2 handler at init via

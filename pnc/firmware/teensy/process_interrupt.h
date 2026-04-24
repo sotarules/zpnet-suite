@@ -336,8 +336,9 @@ static constexpr int32_t VCLOCK_EPOCH_TICK_OFFSET = -2;
 // Physical PPS edge snapshot — captured in the GPIO ISR
 // ============================================================================
 //
-// On every physical PPS rising edge, the GPIO ISR captures — in this
-// order, as its first instructions after the DWT capture —
+// On every physical PPS rising edge, the GPIO ISR captures physical GPIO
+// facts and then derives the canonical VCLOCK-domain epoch.  It captures —
+// in this order, as its first instructions after the DWT capture —
 //
 //   • QTimer1 CH0+CH1 cascaded 32-bit counter (the VCLOCK count)
 //   • QTimer1 CH3 16-bit counter (the VCLOCK cadence channel)
@@ -354,14 +355,38 @@ static constexpr int32_t VCLOCK_EPOCH_TICK_OFFSET = -2;
 
 struct pps_edge_snapshot_t {
   uint32_t sequence          = 0;
-  uint32_t dwt_at_edge       = 0;   // NORMALIZED: raw PPS ISR-entry DWT minus
-  //   (GPIO_TOTAL_LATENCY − WITNESS_STIMULATE_LATENCY)
-  uint32_t dwt_raw_at_edge   = 0;   // RAW PPS ISR-entry DWT, unmodified
-  //   (audit field — invariant is
-  //    dwt_raw_at_edge − dwt_at_edge == 67)
-  uint32_t counter32_at_edge = 0;   // QTimer1 CH0+CH1 32-bit count at ISR entry
-  uint16_t ch3_at_edge       = 0;   // QTimer1 CH3 count at ISR entry
+
+  // CANONICAL EPOCH VALUES.
+  //
+  // In the VCLOCK-domain architecture, "PPS" means the VCLOCK epoch edge
+  // selected by the physical PPS pulse: currently the first VCLOCK edge after
+  // the physical PPS pulse.  dwt_at_edge is therefore NOT the GPIO PPS ISR
+  // capture.  It is the canonical DWT coordinate assigned to that selected
+  // VCLOCK edge.  counter32_at_edge/ch3_at_edge are the matching VCLOCK
+  // counter identities for the same selected edge.
+  uint32_t dwt_at_edge       = 0;
+  uint32_t dwt_raw_at_edge   = 0;   // legacy audit field: raw physical PPS ISR-entry DWT
+  uint32_t counter32_at_edge = 0;
+  uint16_t ch3_at_edge       = 0;
   int64_t  gnss_ns_at_edge   = -1;
+
+  // PHYSICAL PPS GPIO AUDIT VALUES.
+  //
+  // These are the actual facts captured in the GPIO ISR.  They explain which
+  // physical PPS pulse selected the canonical VCLOCK epoch above, but they are
+  // not themselves the canonical epoch used by the timing model.
+  uint32_t physical_pps_dwt_raw_at_edge        = 0;
+  uint32_t physical_pps_dwt_normalized_at_edge = 0;
+  uint32_t physical_pps_counter32_at_read      = 0;
+  uint16_t physical_pps_ch3_at_read            = 0;
+
+  // VCLOCK epoch derivation audit.
+  uint32_t vclock_epoch_counter32              = 0;
+  uint16_t vclock_epoch_ch3                    = 0;
+  uint32_t vclock_epoch_ticks_after_pps        = 0;
+  int32_t  vclock_epoch_counter32_offset_ticks = 0;
+  int32_t  vclock_epoch_dwt_offset_cycles      = 0;
+  bool     vclock_epoch_selected               = false;
 };
 
 // ============================================================================
