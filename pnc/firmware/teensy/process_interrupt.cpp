@@ -193,11 +193,14 @@ static int64_t vclock_gnss_from_counter32(uint32_t authored_counter32) {
 // Latency adjusters — convert raw ISR-entry DWT to event coordinates
 // ============================================================================
 //
-// These are the ONLY producers of event-coordinate DWT values.  They are
-// called exactly once per ISR, on the first-instruction _raw capture.
+// These are the ONLY producers of event-coordinate DWT values, and they
+// are the ONLY place in the codebase that applies hardware latency math.
+// Called exactly once per ISR, on the first-instruction _raw capture.
+// All downstream code consumes the returned value as event-coordinate
+// truth and applies no further adjustment.
 
 static inline uint32_t pps_dwt_from_isr_entry_raw(uint32_t isr_entry_dwt_raw) {
-  return dwt_at_gpio_edge(isr_entry_dwt_raw);
+  return isr_entry_dwt_raw - (GPIO_TOTAL_LATENCY - WITNESS_STIMULATE_LATENCY);
 }
 
 static inline uint32_t pps_vclock_dwt_from_pps_isr_entry_raw(uint32_t isr_entry_dwt_raw) {
@@ -205,7 +208,7 @@ static inline uint32_t pps_vclock_dwt_from_pps_isr_entry_raw(uint32_t isr_entry_
 }
 
 static inline uint32_t qtimer_event_dwt_from_isr_entry_raw(uint32_t isr_entry_dwt_raw) {
-  return dwt_at_qtimer_edge(isr_entry_dwt_raw);
+  return isr_entry_dwt_raw - (QTIMER_TOTAL_LATENCY - WITNESS_STIMULATE_LATENCY);
 }
 
 // ============================================================================

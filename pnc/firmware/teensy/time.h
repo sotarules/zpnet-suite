@@ -25,11 +25,21 @@
 // That epoch is established on a lawful PPS edge and may be restarted
 // later (for example: startup epoch, explicit zero, campaign start epoch).
 //
+// ─── Contract: this module performs NO latency adjustment ───────────────────
+//
+// Every DWT value passed in or returned by this module is an event
+// coordinate.  Latency math (raw ISR-entry → event-coordinate) is the
+// responsibility of the ISR entry point that captures the _raw value;
+// see process_interrupt.cpp for the canonical home of that math.  By
+// the time a DWT value reaches this module, the cost-of-measurement
+// has already been accounted for and the value describes a moment in
+// physical time.
+//
 // Architecture:
 //
 //   process_clocks_alpha.cpp calls time_pps_update() once per PPS edge,
 //   providing:
-//     - dwt_at_pps:         DWT_CYCCNT captured at the PPS edge
+//     - dwt_at_pps:         event-coordinate DWT at the PPS edge
 //     - dwt_cycles_per_s:   measured DWT cycles in the prior second
 //     - qtimer_at_pps:      QTimer1 raw counter captured at the PPS edge
 //
@@ -53,18 +63,11 @@
 // ============================================================================
 
 // ============================================================================
-// Latency adjusters
-// ============================================================================
-
-uint32_t dwt_at_gpio_edge(uint32_t dwt_isr_entry_raw);
-uint32_t dwt_at_qtimer_edge(uint32_t dwt_isr_entry_raw);
-
-// ============================================================================
 // Anchor snapshot — public, seqlock-safe copy of the PPS anchor
 // ============================================================================
 
 struct time_anchor_snapshot_t {
-  uint32_t dwt_at_pps;         // DWT_CYCCNT at the PPS edge
+  uint32_t dwt_at_pps;         // event-coordinate DWT at the PPS edge
   uint32_t dwt_cycles_per_s;   // DWT cycles in the prior GNSS second
   uint32_t qtimer_at_pps;      // QTimer1 raw counter at the PPS edge (VCLOCK position)
   uint32_t pps_count;          // PPS edges seen in current epoch (1-indexed)

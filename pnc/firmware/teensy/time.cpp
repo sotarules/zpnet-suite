@@ -4,6 +4,11 @@
 //
 // See time.h for full design rationale.
 //
+// Contract: this module performs NO latency adjustment.  Every DWT value
+// passed in or returned is an event coordinate.  The cost of measurement
+// (raw ISR-entry → event-coordinate) is the responsibility of the ISR
+// entry point that captures the _raw value; see process_interrupt.cpp.
+//
 // State model:
 //
 //   The PPS callback in process_clocks_alpha.cpp calls either:
@@ -54,18 +59,6 @@
 
 #include <Arduino.h>
 #include "imxrt.h"
-
-// ============================================================================
-// Latency adjusters
-// ============================================================================
-
-uint32_t dwt_at_gpio_edge(uint32_t dwt_isr_entry_raw) {
-  return dwt_isr_entry_raw - (GPIO_TOTAL_LATENCY - WITNESS_STIMULATE_LATENCY);
-}
-
-uint32_t dwt_at_qtimer_edge(uint32_t dwt_isr_entry_raw) {
-  return dwt_isr_entry_raw - (QTIMER_TOTAL_LATENCY - WITNESS_STIMULATE_LATENCY);
-}
 
 // ============================================================================
 // Constants
