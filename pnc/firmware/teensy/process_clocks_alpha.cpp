@@ -506,12 +506,28 @@ static void pps_vclock_callback(const interrupt_event_t& event, void*) {
   // skip the bookend block (the install edge is the start of rate
   // measurement, not the end), publish the slot at install gnss_ns=0,
   // hand to beta, and return.
+  //
+  // Counter32 reset semantics:
+  //   alpha_install_new_epoch_from_pps_event() calls
+  //   interrupt_synthetic_counters_zero(), which zeros g_vclock_count32,
+  //   g_ocxo1_count32, and g_ocxo2_count32.  The install PPS moment IS
+  //   the new counter origin.  We therefore publish counter32_at_edge=0
+  //   (NOT event.counter32_at_edge — that was captured BEFORE the zero
+  //   and lives on a discarded timeline).
+  //
+  //   Then we call timepop_handle_synthetic_counter_zero() to re-anchor
+  //   every active TimePop slot.  Without this, slots anchored against
+  //   the old (large) counter values stay frozen until the synthetic
+  //   counter wraps back to their old deadlines — minutes of silence
+  //   for transport's RX/TX pumps, which manifests as TIMEBASE_FRAGMENT
+  //   delivery stalling for tens of seconds after START.
   if (g_epoch_pending && !interrupt_pps_rebootstrap_pending()) {
     alpha_install_new_epoch_from_pps_event(event);
     alpha_pps_vclock_publish(event.gnss_ns_at_edge,
                              event.dwt_at_edge,
-                             event.counter32_at_edge,
+                             0,
                              event.sequence);
+    timepop_handle_synthetic_counter_zero();
     pps_relay_pulse();
     if (campaign_state == clocks_campaign_state_t::STARTED ||
         request_start || request_stop || request_recover || request_zero) {

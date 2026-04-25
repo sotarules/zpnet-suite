@@ -101,3 +101,27 @@ bool timepop_cancel(timepop_handle_t handle);
 uint32_t timepop_cancel_by_name(const char* name);
 void timepop_dispatch(void);
 uint32_t timepop_active_count(void);
+
+// ============================================================================
+// Synthetic-counter zero handler
+// ============================================================================
+//
+// Called by alpha after interrupt_synthetic_counters_zero() to re-anchor
+// every active slot to the new counter timeline.  Without this, tick-based
+// recurring slots (e.g. transport's RX/TX pumps) keep their pre-zero
+// deadlines and stay frozen until the synthetic counter wraps back around
+// to the old deadline value — which can take tens of seconds to minutes
+// depending on how long the system was running before the zero.
+//
+// After this call:
+//   • Tick recurring slots:   pending_anchor=true, delay_ticks=period_ticks.
+//                             They re-anchor on the next TICK and resume
+//                             firing at their normal cadence.
+//   • Absolute slots:         deadline recomputed from current alpha slot
+//                             via target_gnss_ns.  If the bridge is not
+//                             yet authoritative (sequence==0), the slot
+//                             falls back to pending_anchor with delay=0
+//                             so it fires on the next TICK.
+//   • Tick one-shot slots:    set pending_anchor=true.  Will fire after
+//                             delay_ticks on the new timeline.
+void timepop_handle_synthetic_counter_zero(void);

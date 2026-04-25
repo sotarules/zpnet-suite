@@ -481,6 +481,67 @@ uint32_t timepop_active_count(void) {
 }
 
 // ============================================================================
+// Synthetic-counter zero handler
+// ============================================================================
+//
+// Called by alpha after interrupt_synthetic_counters_zero() (which runs
+// inside alpha_install_new_epoch_from_pps_event).  All active slots have
+// deadlines anchored to the OLD synthetic-counter timeline, which was
+// just discarded.  Without re-anchoring, tick-based recurring slots
+// (transport RX/TX, etc.) wait for the synthetic counter to wrap back
+// around to their old deadlines — minutes for slots anchored long ago.
+//
+// We re-anchor in place:
+//
+//   • is_absolute slots:
+//       Recompute deadline from target_gnss_ns via the freshly-published
+//       alpha slot.  Because alpha just published with counter32_at_edge=0
+//       and gnss_ns_at_edge=0 (the install edge is the new origin), the
+//       bridge produces a sensible post-zero deadline.  If the bridge is
+//       still invalid (sequence==0, defensive), fall back to pending_anchor.
+//
+//   • Non-absolute (tick) slots:
+//       Set pending_anchor=true.  The next TICK will compute the deadline
+//       as counter32_at_edge + delay_ticks on the new timeline.  For
+//       recurring slots we set delay_ticks=period_ticks so they resume
+//       firing at their normal cadence; one-shots retain their original
+//       delay_ticks so the intended interval is preserved.
+
+void timepop_handle_synthetic_counter_zero(void) {
+  uint32_t saved = critical_enter();
+
+  for (uint32_t i = 0; i < MAX_SLOTS; i++) {
+    if (!slots[i].active) continue;
+
+    slots[i].expired = false;
+
+    if (slots[i].is_absolute) {
+      uint32_t new_deadline = 0;
+      if (gnss_ns_to_counter32_deadline(slots[i].target_gnss_ns, new_deadline)) {
+        slots[i].deadline       = new_deadline;
+        slots[i].pending_anchor = false;
+      } else {
+        // Bridge not yet authoritative — defer to next TICK.
+        slots[i].pending_anchor = true;
+        slots[i].delay_ticks    = (slots[i].recurring && slots[i].period_ticks > 0)
+                                    ? slots[i].period_ticks
+                                    : 0;
+      }
+    } else {
+      // Tick-based slot — re-anchor on next TICK.
+      slots[i].pending_anchor = true;
+      if (slots[i].recurring && slots[i].period_ticks > 0) {
+        slots[i].delay_ticks = slots[i].period_ticks;
+      }
+      // For one-shots, leave delay_ticks at its original value so the
+      // intended interval is preserved (relative to "next TICK after zero").
+    }
+  }
+
+  critical_exit(saved);
+}
+
+// ============================================================================
 // Tick-driven dispatch
 // ============================================================================
 //

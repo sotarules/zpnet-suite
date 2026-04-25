@@ -94,35 +94,25 @@ uint64_t recover_ocxo2_ns = 0;
 static Payload g_last_fragment;
 
 // ============================================================================
-// Campaign warmup suppression
+// Campaign public bases — campaign-relative offsets for published values
 // ============================================================================
 //
-// Alpha remains fully alive during warmup: PPS/VCLOCK/OCXO measurements,
-// bridge anchors, and predictor state continue to settle normally.  Beta,
-// however, suppresses the first CLOCKS_CAMPAIGN_WARMUP_SUPPRESS_PPS
-// candidate TIMEBASE_FRAGMENT records so the public campaign begins only
-// after the estimators have stopped stretching their legs.
+// Alpha's running totals (g_dwt_cycle_count_total, g_gnss_ns_count_at_pps,
+// per-OCXO ns_count_at_pps) increment from epoch install onward.  For
+// publishing, we want values that are zero-based at campaign start (or
+// continuing from a recovery snapshot).  These bases are subtracted from
+// the running totals to produce campaign-relative published values.
 //
 // START semantics:
-//   Suppressed records are private warmup only.  The first emitted fragment
-//   is teensy_pps_count=1, gnss_ns=1e9, and public totals start from that
-//   first canonical record.
+//   bases reset to the current alpha totals at install time → campaign
+//   gnss_ns starts at 0, advances by 1e9 per PPS.  First published
+//   fragment is teensy_pps_count=1, gnss_ns=1e9.
 //
 // RECOVER semantics:
-//   Suppressed records are real elapsed campaign seconds.  The first emitted
-//   fragment therefore appears after a deliberate canonical gap, preserving
-//   the recovered absolute PPS identity.
-
-enum class campaign_warmup_mode_t : uint8_t {
-  NONE    = 0,
-  START   = 1,
-  RECOVER = 2,
-};
-
-static volatile campaign_warmup_mode_t g_campaign_warmup_mode =
-    campaign_warmup_mode_t::NONE;
-static volatile uint32_t g_campaign_warmup_remaining = 0;
-static volatile uint32_t g_campaign_warmup_suppressed_total = 0;
+//   bases set such that current alpha totals minus base equals the
+//   recover_*_ns values supplied by the Pi.  Subsequent advances continue
+//   from there.  First published fragment is teensy_pps_count=N+1,
+//   gnss_ns=(N+1)*1e9 (where N = recover_gnss_ns/1e9).
 
 static uint64_t g_campaign_public_dwt_base = 0;
 static uint64_t g_campaign_public_gnss_base = 0;
@@ -154,76 +144,6 @@ static void campaign_public_bases_reset_for_recover(void) {
   g_campaign_public_ocxo2_base =
       saturated_base_for_recovered_value(g_ocxo2_clock.ns_count_at_pps,
                                           recover_ocxo2_ns);
-}
-
-static void campaign_warmup_begin(campaign_warmup_mode_t mode) {
-  g_campaign_warmup_mode = mode;
-  g_campaign_warmup_remaining = CLOCKS_CAMPAIGN_WARMUP_SUPPRESS_PPS;
-  g_campaign_warmup_suppressed_total = 0;
-
-  if (mode == campaign_warmup_mode_t::RECOVER) {
-    campaign_public_bases_reset_for_recover();
-  } else {
-    campaign_public_bases_reset_to_current();
-  }
-}
-
-static bool campaign_warmup_active(void) {
-  return g_campaign_warmup_mode != campaign_warmup_mode_t::NONE &&
-         g_campaign_warmup_remaining > 0;
-}
-
-static void campaign_warmup_finish_after_this_suppressed_record(void) {
-  const campaign_warmup_mode_t finishing_mode = g_campaign_warmup_mode;
-
-  g_campaign_warmup_mode = campaign_warmup_mode_t::NONE;
-  g_campaign_warmup_remaining = 0;
-
-  if (campaign_state != clocks_campaign_state_t::STARTED) {
-    campaign_public_bases_reset_to_current();
-    return;
-  }
-
-  if (finishing_mode == campaign_warmup_mode_t::START) {
-    // START: warmup records are private.  Public identity begins on the
-    // next PPS after this one, so use the current alpha totals as the base.
-    // The next published record will add exactly one public second.
-    campaign_public_bases_reset_to_current();
-  }
-
-  // RECOVER: leave the recovery bases intact.  Because campaign_seconds
-  // advanced during suppression, the next emitted fragment will preserve
-  // the canonical gap created by the buried records.
-}
-
-static bool campaign_warmup_consume_one_candidate_record(void) {
-  if (!campaign_warmup_active()) return false;
-
-  g_campaign_warmup_suppressed_total++;
-
-  if (g_campaign_warmup_mode == campaign_warmup_mode_t::RECOVER) {
-    // Recovery gaps are canonical.  The suppressed records are real
-    // elapsed campaign seconds, so advance the public PPS identity even
-    // though we do not publish the fragments.
-    campaign_seconds++;
-  }
-
-  if (g_campaign_warmup_remaining > 0) {
-    g_campaign_warmup_remaining--;
-  }
-
-  if (g_campaign_warmup_remaining == 0) {
-    campaign_warmup_finish_after_this_suppressed_record();
-  }
-
-  return true;
-}
-
-static void campaign_warmup_reset(void) {
-  g_campaign_warmup_mode = campaign_warmup_mode_t::NONE;
-  g_campaign_warmup_remaining = 0;
-  g_campaign_warmup_suppressed_total = 0;
-  campaign_public_bases_reset_to_current();
 }
 
 static uint64_t campaign_public_dwt_total(void) {
@@ -702,7 +622,7 @@ static void clocks_force_stop_campaign(void) {
   request_zero = false;
   calibrate_ocxo_mode = servo_mode_t::OFF;
   ocxo_dac_pacing_abort_all();
-  campaign_warmup_reset();
+  campaign_public_bases_reset_to_current();
   timebase_invalidate();
 }
 
@@ -790,7 +710,7 @@ void clocks_beta_pps(void) {
       watchdog_anomaly_active = false;
       campaign_state = clocks_campaign_state_t::STARTED;
       request_start = false;
-      campaign_warmup_begin(campaign_warmup_mode_t::START);
+      campaign_public_bases_reset_to_current();
     }
     return;
   }
@@ -802,7 +722,7 @@ void clocks_beta_pps(void) {
     request_zero = false;
     calibrate_ocxo_mode = servo_mode_t::OFF;
     ocxo_dac_pacing_abort_all();
-    campaign_warmup_reset();
+    campaign_public_bases_reset_to_current();
     timebase_invalidate();
     return;
   }
@@ -821,24 +741,21 @@ void clocks_beta_pps(void) {
 
     request_recover = false;
     campaign_state = clocks_campaign_state_t::STARTED;
-    campaign_warmup_begin(campaign_warmup_mode_t::RECOVER);
+    campaign_public_bases_reset_for_recover();
     return;
   }
 
   if (watchdog_anomaly_active) return;
   if (campaign_state != clocks_campaign_state_t::STARTED) return;
 
-  // ── Warmup suppression ──
-  //
-  // Suppressed records still allow alpha's measurement/predictor state to
-  // settle, but they are not allowed to become canonical TIMEBASE_FRAGMENT
-  // rows.  START hides these seconds completely; RECOVER counts them as
-  // deliberate canonical gaps.
-  if (campaign_warmup_consume_one_candidate_record()) {
-    return;
-  }
-
   // ── Per-second campaign work ──
+  //
+  // Warmup suppression has been removed: every PPS after install
+  // produces a published TIMEBASE_FRAGMENT.  The first few fragments
+  // may have transient values (residuals settling, OCXO welfords with
+  // small N) but the data plane comes alive immediately.  Pi-side
+  // tolerates an overshoot in the first sync fragment via _sync_expected_pps
+  // (>=) and tracks continuity by exact pps_count match thereafter.
   campaign_seconds++;
 
   dwt_cycle_count_total = campaign_public_dwt_total();
@@ -1111,11 +1028,6 @@ static Payload cmd_report(const Payload&) {
   p.add("epoch_pending", clocks_epoch_pending());
   p.add("interrupt_pps_rebootstrap_pending",
         interrupt_pps_rebootstrap_pending());
-  p.add("campaign_warmup_active", campaign_warmup_active());
-  p.add("campaign_warmup_required", CLOCKS_CAMPAIGN_WARMUP_SUPPRESS_PPS);
-  p.add("campaign_warmup_remaining", (uint32_t)g_campaign_warmup_remaining);
-  p.add("campaign_warmup_suppressed_total",
-        (uint32_t)g_campaign_warmup_suppressed_total);
   return p;
 }
 
