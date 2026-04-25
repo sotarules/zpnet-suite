@@ -351,39 +351,16 @@ static void publish_freq(Payload& p, const char* clock_name, double ppb_value) {
 }
 
 // ============================================================================
-// Diag publishers — slimmed for the trimmed interrupt_capture_diag_t
+// Event publishers — slim, post-scorched-earth
 // ============================================================================
+//
+// Each subscription event carries {gnss_ns_at_edge, dwt_at_edge, sequence}.
+// Beta publishes those three fields verbatim per lane.  No diag struct,
+// no counter32, no coincidence, no anomaly count.
 
-static void clocks_payload_add_ocxo_diag(Payload& p,
-                                         const char* prefix,
-                                         const interrupt_capture_diag_t& diag) {
-  char key[96];
-
-  auto add_bool = [&](const char* suffix, bool value) {
-    snprintf(key, sizeof(key), "%s_%s", prefix, suffix);
-    p.add(key, value);
-  };
-  auto add_u32 = [&](const char* suffix, uint32_t value) {
-    snprintf(key, sizeof(key), "%s_%s", prefix, suffix);
-    p.add(key, value);
-  };
-  auto add_u64 = [&](const char* suffix, uint64_t value) {
-    snprintf(key, sizeof(key), "%s_%s", prefix, suffix);
-    p.add(key, value);
-  };
-
-  add_bool("enabled", diag.enabled);
-  add_u32("dwt_at_event", diag.dwt_at_event);
-  add_u64("gnss_ns_at_event", diag.gnss_ns_at_event);
-  add_u32("counter32_at_event", diag.counter32_at_event);
-  add_u32("anomaly_count", diag.anomaly_count);
-}
-
-static void clocks_payload_add_pps_diag(Payload& p,
-                                        const char* prefix,
-                                        const interrupt_capture_diag_t& diag) {
-  clocks_payload_add_ocxo_diag(p, prefix, diag);
-
+static void clocks_payload_add_event(Payload& p,
+                                     const char* prefix,
+                                     const interrupt_event_t& event) {
   char key[96];
   auto add_u32 = [&](const char* suffix, uint32_t value) {
     snprintf(key, sizeof(key), "%s_%s", prefix, suffix);
@@ -394,13 +371,9 @@ static void clocks_payload_add_pps_diag(Payload& p,
     p.add(key, value);
   };
 
-  add_u32("pps_edge_sequence", diag.pps_edge_sequence);
-  add_u32("pps_edge_dwt_isr_entry_raw", diag.pps_edge_dwt_isr_entry_raw);
-  add_i64("pps_edge_gnss_ns", diag.pps_edge_gnss_ns);
-  add_i64("pps_edge_minus_event_ns", diag.pps_edge_minus_event_ns);
-  add_u32("pps_edge_dwt_cycles_from_vclock", diag.pps_edge_dwt_cycles_from_vclock);
-  add_i64("pps_edge_ns_from_vclock", diag.pps_edge_ns_from_vclock);
-  add_u32("pps_edge_vclock_event_count", diag.pps_edge_vclock_event_count);
+  add_u32("dwt_at_edge",     event.dwt_at_edge);
+  add_i64("gnss_ns_at_edge", event.gnss_ns_at_edge);
+  add_u32("sequence",        event.sequence);
 }
 
 // ============================================================================
@@ -942,10 +915,8 @@ void clocks_beta_pps(void) {
   p.add("dwt_prediction_residual_cycles",
         g_dwt_prediction_residual_cycles);
 
-  // QTimer1 hardware-counter identity of the canonical PPS epoch.
-  // Under the VCLOCK-domain architecture this is the selected VCLOCK
-  // edge after the physical PPS pulse, not the raw GPIO counter read.
-  p.add("qtimer_at_pps", g_qtimer_at_pps);
+  // QTimer counter32 is no longer published.  The post-scorched-earth
+  // event payload is {gnss_ns_at_edge, dwt_at_edge, sequence} only.
 
   // VCLOCK surface — authored facts + per-edge measurement + window accounting.
   p.add("vclock_ns_count_at_pps", campaign_public_gnss_ns());
@@ -1018,12 +989,13 @@ void clocks_beta_pps(void) {
   publish_freq(p, "ocxo1",  welford_ocxo1.mean);
   publish_freq(p, "ocxo2",  welford_ocxo2.mean);
 
-  // Per-lane diag (event facts + anomaly count).  The "pps_diag" entry
-  // corresponds to the VCLOCK lane and additionally carries the GPIO
-  // PPS witness fields.
-  clocks_payload_add_pps_diag(p, "pps_diag", g_pps_interrupt_diag);
-  clocks_payload_add_ocxo_diag(p, "ocxo1_diag", g_ocxo1_interrupt_diag);
-  clocks_payload_add_ocxo_diag(p, "ocxo2_diag", g_ocxo2_interrupt_diag);
+  // Per-lane event fact (gnss_ns_at_edge, dwt_at_edge, sequence).  The
+  // PPS_VCLOCK lane's gnss_ns is VCLOCK-authored (sequence × 1e9, ends
+  // in "00000000"); VCLOCK/OCXO lanes' gnss_ns is bridge-projected.
+  clocks_payload_add_event(p, "pps_vclock", g_last_pps_vclock_event);
+  clocks_payload_add_event(p, "vclock",     g_last_vclock_event);
+  clocks_payload_add_event(p, "ocxo1",      g_last_ocxo1_event);
+  clocks_payload_add_event(p, "ocxo2",      g_last_ocxo2_event);
 
   g_last_fragment = p;
   publish("TIMEBASE_FRAGMENT", p);

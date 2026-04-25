@@ -1,243 +1,106 @@
 // ============================================================================
-// process_timepop.cpp — TimePop (VCLOCK-exact GNSS scheduling)
+// process_timepop.cpp — Foreground scheduler, TICK-driven
 // ============================================================================
 //
-// TimePop is the GNSS-domain timer subsystem.
+// See process_timepop.h for the contract.  TimePop owns no hardware.
+// It subscribes to process_interrupt's TICK kind; on every TICK event
+// (1 kHz cadence) it runs in foreground:
 //
-// Core timing substrate:
-//   • QTimer1 CH0+CH1 form a passive 32-bit VCLOCK counter at 10 MHz
-//   • one VCLOCK tick = 100 ns
-//   • QTimer1 CH2 is the dynamic compare scheduler
+//   1. Drain the ASAP queue.
+//   2. Scan timed slots; fire any expired.
+//   3. Drain the ALAP queue.
 //
-// Scheduling modes:
-//   • relative scheduling        — timepop_arm(delay_gnss_ns, ...)
-//   • scheduled ASAP dispatch    — timepop_arm_asap(...)
-//   • scheduled ALAP dispatch    — timepop_arm_alap(...)
-//   • absolute scheduling        — timepop_arm_at(target_gnss_ns, ...)
-//   • anchor-relative scheduling — timepop_arm_from_anchor(anchor_gnss_ns, offset_gnss_ns, ...)
-//   • caller-owned exact path    — timepop_arm_ns(target_gnss_ns, target_dwt, ...)
+// Timed deadlines live in synthetic VCLOCK counter32 ticks.  "Now" is the
+// counter32_at_edge of the TICK event firing this scan.  Scheduling
+// resolution is 1 ms.
 //
-// fire_gnss_ns is computed from VCLOCK arithmetic:
-//   gnss_ns = (pps_count - 1) * 1e9 + (fire_vclock_raw - qtimer_at_pps) * 100
-//
-// DWT is not the authoritative time base here.
-// DWT is diagnostic / cross-check material.
-//
-// Scheduling philosophy — gears, not rubber bands:
-//
-//   Absolute and anchor-relative scheduling NEVER ask "what time is it now?"
-//   Instead, deadlines are computed from the time anchor via pure arithmetic:
-//
-//     anchor_pps_gnss_ns = (pps_count - 1) * 1,000,000,000
-//     ticks_from_anchor  = (target_gnss_ns - anchor_pps_gnss_ns) / 100
-//     deadline           = qtimer_at_pps + ticks_from_anchor
-//
-//   This is possible because VCLOCK is phase-locked to GNSS.  The counter
-//   IS the clock — reading it to compute a deadline introduces jitter that
-//   pure arithmetic avoids.
-//
-//   Only relative scheduling ("fire N ns from now") reads the ambient counter,
-//   because "from now" inherently requires knowing "now."
-//
-// Dispatch timing audit:
-//
-//   TimePop validates actual dispatch timing in the ISR using two independent
-//   views of the same VCLOCK-domain event:
-//
-//   1. DWT-domain: process_interrupt passes the CH2 compare's normalized
-//      DWT-at-edge capture.  TimePop can spin/land against predicted DWT
-//      targets and convert the landed DWT back through the time bridge for
-//      monitored diagnostics.
-//
-//   2. VCLOCK-domain: process_interrupt passes the CH0+CH1 counter captured
-//      for the same CH2 compare event.  TimePop converts that counter to GNSS
-//      ns by pure VCLOCK arithmetic.  This is the scheduling authority.
-//
-//   Under the new interrupt doctrine, process_interrupt owns QTimer1 hardware
-//   and publishes a canonical PPS epoch that is already the selected
-//   VCLOCK-domain edge.  TimePop therefore does not correct PPS/VCLOCK phase;
-//   it consumes the bridge anchor and schedules in the one sovereign VCLOCK
-//   coordinate system.
-//
-// CH2/CH0 phase discipline:
-//
-//   CH0, CH1, CH2, and CH3 are initialized and atomically enabled by
-//   process_interrupt.  TimePop owns only CH2 compare programming.  Any
-//   remaining CH2/CH0 phase effect is diagnostic, not something TimePop should
-//   compensate for locally.
-//
+// All gnss_ns ↔ counter32 conversions go through alpha's PPS_VCLOCK slot
+// via alpha_pps_vclock_load() and alpha_dwt_cycles_per_second().  No
+// counter reads.  No anchor caching.
 // ============================================================================
 
-#include "config.h"
-#include "timepop.h"
 #include "process_timepop.h"
 
-#include "publish.h"
-
-#include "debug.h"
-#include "process.h"
-#include "events.h"
-#include "payload.h"
-#include "cpu_usage.h"
-#include "time.h"
 #include "config.h"
-#include "util.h"
+#include "process.h"
+#include "payload.h"
+#include "publish.h"
+#include "process_interrupt.h"
+#include "time.h"
+#include "timepop.h"
+#include "debug.h"
 
 #include <Arduino.h>
 #include "imxrt.h"
+
 #include <string.h>
-#include <math.h>
-#include <climits>
 
 // ============================================================================
-// Forward declarations
+// Constants
 // ============================================================================
 
-static inline bool deadline_expired(uint32_t deadline, uint32_t now);
-static inline uint32_t vclock_count(void);
-static bool gnss_ns_to_vclock_deadline(int64_t target_gnss_ns,
-                                       const time_anchor_snapshot_t& snap,
-                                       uint32_t& out_deadline);
-static inline uint32_t qtimer1_read_32_local(void);
-static int64_t vclock_to_gnss_ns(uint32_t vclock_raw,
-                                 const time_anchor_snapshot_t& snap);
+static constexpr uint32_t MAX_SLOTS       = 16;
+static constexpr uint32_t MAX_ASAP_SLOTS  = 8;
+static constexpr uint32_t MAX_ALAP_SLOTS  = 4;
+static constexpr uint64_t NS_PER_TICK     = 100ULL;
+static constexpr int64_t  GNSS_NS_PER_SECOND = 1000000000LL;
 
 // ============================================================================
-// Constants — 10 MHz domain
+// Critical-section helpers
 // ============================================================================
 
-static constexpr uint32_t MAX_SLOTS = 16;
-static constexpr uint32_t MAX_ASAP_SLOTS = 8;
-static constexpr uint32_t MAX_ALAP_SLOTS = 4;
-static constexpr uint64_t NS_PER_TICK = 100ULL;
-static constexpr uint32_t MAX_DELAY_TICKS = 0x7FFFFFFFU;
-static constexpr uint32_t MIN_DELAY_TICKS = 2;
-static constexpr uint32_t HEARTBEAT_TICKS = 10000;
-static constexpr uint32_t DWT_SPIN_MAX_CYCLES = 110;
-static constexpr uint32_t PREDICT_MAX_QTIMER_ELAPSED = 15000000U;
-static constexpr int64_t  TIMEPOP_DISPATCH_GNSS_TOLERANCE_NS = 100LL;
-static constexpr uint64_t SMARTPOP_EARLY_WAKE_NS = 1000ULL;
-static constexpr uint32_t SMARTPOP_SPIN_MAX_CYCLES = 3000U;
-static constexpr uint32_t SMARTPOP_MIN_MARGIN_CYCLES = 64U;
-static constexpr int64_t  VCLOCK_MONITOR_OFFSET_NS = 1000000LL;
-static constexpr const char* VCLOCK_MONITOR_NAME = "VCLOCK_MONITOR";
-
-static inline uint32_t ns_to_dwt_cycles_runtime(uint64_t ns) {
-  const uint32_t f = F_CPU_ACTUAL ? F_CPU_ACTUAL : 1008000000U;
-  return (uint32_t)(((uint64_t)f * ns + 500000000ULL) / 1000000000ULL);
+static inline uint32_t critical_enter(void) {
+  uint32_t primask;
+  __asm__ volatile ("MRS %0, primask" : "=r" (primask));
+  __asm__ volatile ("CPSID i" ::: "memory");
+  return primask;
 }
 
-static inline int64_t dwt_cycles_to_ns_signed(int32_t cycles) {
-  const int64_t c = (int64_t)cycles;
-  return (c * (int64_t)DWT_NS_NUM) / (int64_t)DWT_NS_DEN;
-}
-
-
-enum class monitored_client_t : uint8_t {
-  NONE = 0,
-  PPS,
-  OCXO1,
-  OCXO2,
-};
-
-static constexpr const char* TIMEPOP_MONITORED_NAMES[] = {
-  "PPS_PRESPIN",
-  "OCXO1_PRESPIN",
-  "OCXO2_PRESPIN",
-  nullptr
-};
-
-static inline monitored_client_t monitored_client_for_name(const char* name) {
-  if (!name || !*name) return monitored_client_t::NONE;
-  if (strcmp(name, TIMEPOP_MONITORED_NAMES[0]) == 0) return monitored_client_t::PPS;
-  if (strcmp(name, TIMEPOP_MONITORED_NAMES[1]) == 0) return monitored_client_t::OCXO1;
-  if (strcmp(name, TIMEPOP_MONITORED_NAMES[2]) == 0) return monitored_client_t::OCXO2;
-  return monitored_client_t::NONE;
-}
-
-static inline bool is_monitored_name(const char* name) {
-  return monitored_client_for_name(name) != monitored_client_t::NONE;
+static inline void critical_exit(uint32_t primask) {
+  __asm__ volatile ("MSR primask, %0" :: "r" (primask) : "memory");
 }
 
 // ============================================================================
-// Slot
+// Slot types
 // ============================================================================
-
-enum class timepop_recurrence_mode_t : uint8_t {
-  NONE = 0,
-  RELATIVE = 1,
-  ABSOLUTE = 2,
-};
-
-enum class timepop_fire_capture_source_t : uint8_t {
-  NONE = 0,
-  IRQ_CH2,
-  SCHEDULE_NEXT,
-};
-
-static const char* fire_capture_source_str(timepop_fire_capture_source_t source) {
-  switch (source) {
-    case timepop_fire_capture_source_t::IRQ_CH2:        return "IRQ_CH2";
-    case timepop_fire_capture_source_t::SCHEDULE_NEXT: return "SCHEDULE_NEXT";
-    default:                                           return "NONE";
-  }
-}
 
 struct timepop_slot_t {
   bool                active;
   bool                expired;
   bool                recurring;
   bool                is_absolute;
-  timepop_recurrence_mode_t recurrence_mode;
 
+  // Pre-bridge "deferred anchor": the slot was armed before alpha had a
+  // valid PPS_VCLOCK slot, so we couldn't compute a counter32 deadline.
+  // The slot carries delay_ticks (relative) and is anchored on the first
+  // TICK that delivers a valid counter32_at_edge.  After anchoring,
+  // pending_anchor=false and `deadline` is the real counter32 deadline.
+  bool                pending_anchor;
+  uint32_t            delay_ticks;
 
   timepop_handle_t    handle;
+
+  // Deadline in synthetic VCLOCK counter32 ticks.  Compared via
+  // (int32_t)(now - deadline) >= 0 to handle 32-bit wrap correctly.
   uint32_t            deadline;
-  uint32_t            target_deadline;
-  uint32_t            fire_vclock_raw;
+
+  // Recurring period in counter32 ticks; 0 if not recurring.
   uint32_t            period_ticks;
+
+  // For absolute-recurring: target gnss_ns advances by period_ns each
+  // fire, and deadline is recomputed from alpha's slot.
+  int64_t             target_gnss_ns;
   uint64_t            period_ns;
 
-  int64_t             target_gnss_ns;
-  int64_t             fire_gnss_ns;
-
+  // Captured at fire time (filled by tick scan).
   uint32_t            fire_dwt_cyccnt;
-  timepop_fire_capture_source_t fire_capture_source;
-
-  uint32_t            anchor_dwt_at_pps;
-  uint32_t            anchor_dwt_cycles_per_s;
-  uint32_t            anchor_qtimer_at_pps;
-  uint32_t            anchor_pps_count;
-  bool                anchor_valid;
-
-  uint32_t            predicted_dwt;
-  bool                prediction_valid;
-  bool                spin_dry_used;
-  uint32_t            wake_target_dwt;
-  int32_t             wake_error_cycles;
-
-  bool                smartpop_enabled;
-  uint32_t            smartpop_early_ticks;
-
-  bool                isr_callback;
-  bool                isr_callback_fired;
+  uint32_t            fire_counter32;
+  int64_t             fire_gnss_ns;
 
   timepop_callback_t  callback;
   void*               user_data;
   const char*         name;
-
-  uint32_t            recurring_rearmed_count;
-  uint32_t            recurring_immediate_expire_count;
-  uint32_t            recurring_catchup_count;
-  int64_t             recurring_base_gnss_ns;
-  uint64_t            recurring_period_gnss_ns;
-
-  uint32_t            arm_vclock_raw;
-  uint32_t            arm_delta_ticks;
-  uint32_t            first_expire_now;
-  bool                first_expire_recorded;
 };
-
 
 struct deferred_slot_t {
   bool                active;
@@ -251,996 +114,114 @@ struct deferred_slot_t {
 // State
 // ============================================================================
 
-static timepop_slot_t slots[MAX_SLOTS];
+static timepop_slot_t  slots[MAX_SLOTS];
 static deferred_slot_t asap_slots[MAX_ASAP_SLOTS];
 static deferred_slot_t alap_slots[MAX_ALAP_SLOTS];
-static volatile bool   timepop_pending = false;
 static uint32_t        next_handle = 1;
+static volatile bool   timepop_pending = false;
 
 // ============================================================================
 // Diagnostics
 // ============================================================================
 
-static volatile uint32_t isr_fire_count     = 0;
-static volatile uint32_t expired_count      = 0;
-static volatile uint32_t phantom_count      = 0;
-
-static volatile uint32_t diag_slots_high_water        = 0;
-static volatile uint32_t diag_asap_slots_high_water   = 0;
-static volatile uint32_t diag_alap_slots_high_water   = 0;
-static volatile uint32_t diag_arm_failures            = 0;
-static volatile uint32_t diag_named_replacements      = 0;
-static volatile uint32_t diag_named_replacements_pps_prespin = 0;
-static volatile uint32_t diag_named_replacements_ocxo1_prespin = 0;
-static volatile uint32_t diag_named_replacements_ocxo2_prespin = 0;
-static volatile uint32_t diag_named_replacements_pps_dispatch = 0;
-static volatile uint32_t diag_named_replacements_ocxo1_dispatch = 0;
-static volatile uint32_t diag_named_replacements_ocxo2_dispatch = 0;
-
-static volatile uint32_t diag_asap_armed              = 0;
-static volatile uint32_t diag_asap_dispatched         = 0;
-static volatile uint32_t diag_asap_arm_failures       = 0;
-static volatile uint32_t diag_asap_last_armed_dwt     = 0;
-static volatile uint32_t diag_asap_last_dispatch_dwt  = 0;
-static volatile const char* diag_asap_last_armed_name = nullptr;
-
-static volatile uint32_t diag_alap_armed              = 0;
-static volatile uint32_t diag_alap_dispatched         = 0;
-static volatile uint32_t diag_alap_arm_failures       = 0;
-static volatile uint32_t diag_alap_last_armed_dwt     = 0;
-static volatile uint32_t diag_alap_last_dispatch_dwt  = 0;
-static volatile const char* diag_alap_last_armed_name = nullptr;
-
-static volatile uint32_t diag_dispatch_calls     = 0;
-static volatile uint32_t diag_dispatch_callbacks = 0;
-
-static volatile uint32_t diag_isr_count          = 0;
-static volatile uint32_t diag_rearm_count        = 0;
-static volatile uint32_t diag_heartbeat_rearms   = 0;
-static volatile uint32_t diag_race_recoveries    = 0;
-static volatile uint32_t diag_isr_callbacks      = 0;
-
-static volatile uint32_t diag_schedule_next_calls_total = 0;
-static volatile uint32_t diag_schedule_next_calls_from_dispatch = 0;
-static volatile uint32_t diag_schedule_next_calls_from_other = 0;
-
-// SmartPop / dispatch timing diagnostics
-static volatile uint32_t diag_dispatch_gnss_checks = 0;
-static volatile uint32_t diag_dispatch_gnss_mismatches = 0;
-static volatile uint32_t diag_dispatch_gnss_skipped_no_target = 0;
-static volatile uint32_t diag_dispatch_gnss_skipped_invalid_time = 0;
-static volatile uint32_t diag_dispatch_gnss_skipped_unmonitored = 0;
-static volatile int64_t  diag_dispatch_gnss_last_target_ns = -1;
-static volatile int64_t  diag_dispatch_gnss_last_actual_ns = -1;
-static volatile int64_t  diag_dispatch_gnss_last_error_ns = 0;
-static volatile uint64_t diag_dispatch_gnss_max_abs_error_ns = 0;
-
-static volatile uint32_t diag_smartpop_checks = 0;
-static volatile uint32_t diag_smartpop_armed = 0;
-static volatile uint32_t diag_smartpop_fallback_no_prediction = 0;
-static volatile uint32_t diag_smartpop_fallback_late_arm = 0;
-static volatile uint32_t diag_smartpop_woke_early = 0;
-static volatile uint32_t diag_smartpop_woke_late = 0;
-static volatile uint32_t diag_smartpop_spin_attempts = 0;
-static volatile uint32_t diag_smartpop_spin_success = 0;
-static volatile uint32_t diag_smartpop_spin_timeouts = 0;
-static volatile uint32_t diag_smartpop_last_target_dwt = 0;
-static volatile uint32_t diag_smartpop_last_entry_dwt = 0;
-static volatile uint32_t diag_smartpop_last_land_dwt = 0;
-static volatile int32_t  diag_smartpop_last_cycles_early = 0;
-static volatile uint32_t diag_smartpop_last_spin_cycles = 0;
-static volatile uint32_t diag_smartpop_max_spin_cycles = 0;
-static volatile uint32_t diag_smartpop_max_cycles_early = 0;
-
-static volatile uint32_t diag_smartpop_pps_checks = 0;
-static volatile uint32_t diag_smartpop_ocxo1_checks = 0;
-static volatile uint32_t diag_smartpop_ocxo2_checks = 0;
-static volatile uint32_t diag_smartpop_dwt_adjust_checks = 0;
-
-static volatile uint32_t diag_smartpop_pps_spin_success = 0;
-static volatile uint32_t diag_smartpop_ocxo1_spin_success = 0;
-static volatile uint32_t diag_smartpop_ocxo2_spin_success = 0;
-static volatile uint32_t diag_smartpop_dwt_adjust_spin_success = 0;
-
-static volatile uint32_t diag_smartpop_pps_spin_timeouts = 0;
-static volatile uint32_t diag_smartpop_ocxo1_spin_timeouts = 0;
-static volatile uint32_t diag_smartpop_ocxo2_spin_timeouts = 0;
-static volatile uint32_t diag_smartpop_dwt_adjust_spin_timeouts = 0;
-
-static volatile uint32_t diag_smartpop_pps_fallback_no_prediction = 0;
-static volatile uint32_t diag_smartpop_ocxo1_fallback_no_prediction = 0;
-static volatile uint32_t diag_smartpop_ocxo2_fallback_no_prediction = 0;
-static volatile uint32_t diag_smartpop_dwt_adjust_fallback_no_prediction = 0;
-
-static volatile uint32_t diag_smartpop_pps_fallback_late_arm = 0;
-static volatile uint32_t diag_smartpop_ocxo1_fallback_late_arm = 0;
-static volatile uint32_t diag_smartpop_ocxo2_fallback_late_arm = 0;
-static volatile uint32_t diag_smartpop_dwt_adjust_fallback_late_arm = 0;
-
-static volatile int64_t  diag_dispatch_gnss_worst_target_ns = -1;
-static volatile int64_t  diag_dispatch_gnss_worst_actual_ns = -1;
-static volatile int64_t  diag_dispatch_gnss_worst_error_ns = 0;
-static volatile uint32_t diag_dispatch_gnss_worst_handle = 0;
-static volatile bool     diag_dispatch_gnss_worst_prediction_valid = false;
-static volatile bool     diag_dispatch_gnss_worst_smartpop_enabled = false;
-static volatile const char* diag_dispatch_gnss_worst_name = nullptr;
-
-
-static volatile uint32_t diag_deadline_negative_offset = 0;
-static volatile int64_t  diag_deadline_last_target_gnss_ns = -1;
-static volatile int64_t  diag_deadline_last_anchor_pps_gnss_ns = -1;
-static volatile int64_t  diag_deadline_last_ns_from_anchor = 0;
-
-
-
-struct vclock_edge_monitor_state_t {
-  bool     enabled = true;              // always-on internal monitor
-  bool     armed = false;               // true once the recurring slot has been bootstrapped
-  timepop_handle_t handle = TIMEPOP_INVALID_HANDLE;
-  int64_t  target_gnss_ns = -1;         // legacy alias of last_target_gnss_ns
-
-  uint32_t captures = 0;
-  uint32_t arm_count = 0;
-  uint32_t arm_failures = 0;
-  uint32_t skipped_invalid_anchor = 0;
-
-  uint32_t last_fire_vclock_raw = 0;
-  int64_t  last_fire_gnss_ns = -1;
-  uint32_t last_dwt_isr_entry_raw = 0;
-  uint32_t last_dwt_at_edge = 0;
-  int64_t  last_isr_entry_gnss_ns = -1;
-  int64_t  last_isr_entry_minus_target_ns = 0;
-  int64_t  last_dwt_at_edge_gnss_ns = -1;
-  int64_t  last_dwt_at_edge_minus_target_ns = 0;
-
-  // Immediate CH0+CH1 sanity-check read captured at monitor fire time.
-  uint32_t last_ch0_ch1_vclock_raw = 0;
-  int64_t  last_ch0_ch1_gnss_ns = -1;
-  int64_t  last_ch0_ch1_minus_target_ns = 0;
-
-  // Correlation against the corresponding PPS edge.
-  bool     last_correlation_valid = false;
-  uint32_t last_pps_dwt_at_edge = 0;
-  int64_t  last_pps_gnss_ns = -1;
-  int32_t  last_vclock_minus_pps_cycles = 0;
-  int64_t  last_vclock_minus_pps_ns = 0;
-
-  // Under the VCLOCK-selected PPS epoch, the monitor target is intentionally
-  // VCLOCK_MONITOR_OFFSET_NS after the epoch.  The raw minus-epoch value should
-  // therefore be near that offset, not near zero.  The error fields subtract
-  // the expected offset and are the real coherence signal.
-  uint32_t last_expected_offset_cycles = 0;
-  int64_t  last_expected_offset_ns = 0;
-  int32_t  last_vclock_minus_pps_error_cycles = 0;
-  int64_t  last_vclock_minus_pps_error_ns = 0;
-
-  int64_t last_target_gnss_ns = -1;   // target for the completed capture
-  int64_t next_target_gnss_ns = -1;   // target for the next armed occurrence
-};
-
-static vclock_edge_monitor_state_t g_vclock_edge_monitor = {};
-
-static inline int64_t time_anchor_latest_pps_gnss_ns(const time_anchor_snapshot_t& snap) {
-  if (!snap.ok || !snap.valid || snap.pps_count < 1) return -1;
-  return (int64_t)(snap.pps_count - 1) * (int64_t)1000000000LL;
-}
-
-static void vclock_edge_monitor_refresh_correlation(void) {
-  g_vclock_edge_monitor.last_correlation_valid = false;
-
-  if (!g_vclock_edge_monitor.enabled) return;
-  if (g_vclock_edge_monitor.last_dwt_at_edge == 0) return;
-  if (g_vclock_edge_monitor.last_target_gnss_ns < 0) return;
-
-  const time_anchor_snapshot_t snap = time_anchor_snapshot();
-  const int64_t latest_pps_gnss_ns = time_anchor_latest_pps_gnss_ns(snap);
-  if (latest_pps_gnss_ns < 0) return;
-
-  const int64_t expected_pps_gnss_ns = g_vclock_edge_monitor.last_target_gnss_ns - VCLOCK_MONITOR_OFFSET_NS;
-  if (latest_pps_gnss_ns != expected_pps_gnss_ns) return;
-
-  g_vclock_edge_monitor.last_pps_gnss_ns = latest_pps_gnss_ns;
-  g_vclock_edge_monitor.last_pps_dwt_at_edge = snap.dwt_at_pps;
-
-  const int32_t actual_offset_cycles =
-      (int32_t)(g_vclock_edge_monitor.last_dwt_at_edge - snap.dwt_at_pps);
-  const uint32_t expected_offset_cycles =
-      ns_to_dwt_cycles_runtime((uint64_t)VCLOCK_MONITOR_OFFSET_NS);
-  const int32_t error_cycles =
-      actual_offset_cycles - (int32_t)expected_offset_cycles;
-
-  g_vclock_edge_monitor.last_vclock_minus_pps_cycles = actual_offset_cycles;
-  g_vclock_edge_monitor.last_vclock_minus_pps_ns =
-      dwt_cycles_to_ns_signed(actual_offset_cycles);
-  g_vclock_edge_monitor.last_expected_offset_cycles = expected_offset_cycles;
-  g_vclock_edge_monitor.last_expected_offset_ns = VCLOCK_MONITOR_OFFSET_NS;
-  g_vclock_edge_monitor.last_vclock_minus_pps_error_cycles = error_cycles;
-  g_vclock_edge_monitor.last_vclock_minus_pps_error_ns =
-      dwt_cycles_to_ns_signed(error_cycles);
-  g_vclock_edge_monitor.last_correlation_valid = true;
-}
-
-static void vclock_monitor_callback(timepop_ctx_t* ctx,
-                                    timepop_diag_t* diag,
-                                    void*) {
-  const time_anchor_snapshot_t anchor = time_anchor_snapshot();
-
-  const uint32_t fire_vclock_raw = ctx ? ctx->fire_vclock_raw : 0;
-  const int64_t fire_gnss_ns = ctx ? ctx->fire_gnss_ns : -1;
-
-  // The diag.dwt_at_isr_entry field is already normalized by the CH2
-  // dispatcher (via dwt_at_qtimer_edge) before it arrives here.  The historic
-  // QTIMER_ISR_ENTRY_OVERHEAD subtraction on this value was a legacy partial-
-  // model correction from the pre-two-constant era — applying it on top of
-  // the already-normalized value double-corrects and produces a silent bias.
-  // Removed.  Both locals below now hold the same normalized value; the
-  // separate `_raw` variable and the companion GNSS computation are retained
-  // unchanged to preserve the downstream diagnostic field shape, and will be
-  // renamed in the follow-up truth-in-naming pass.
-  const uint32_t dwt_isr_entry_raw = diag ? diag->dwt_at_isr_entry : 0;
-  const uint32_t dwt_at_edge = dwt_isr_entry_raw;
-
-  const int64_t isr_entry_gnss_ns =
-      (diag && diag->anchor_valid)
-          ? time_dwt_to_gnss_ns(dwt_isr_entry_raw,
-                                diag->anchor_dwt_at_pps,
-                                diag->anchor_dwt_cycles_per_s,
-                                diag->anchor_pps_count)
-          : -1;
-  const int64_t dwt_at_edge_gnss_ns =
-      (diag && diag->anchor_valid)
-          ? time_dwt_to_gnss_ns(dwt_at_edge,
-                                diag->anchor_dwt_at_pps,
-                                diag->anchor_dwt_cycles_per_s,
-                                diag->anchor_pps_count)
-          : -1;
-
-  const uint32_t ch0_ch1_vclock_raw = qtimer1_read_32_local();
-  const int64_t ch0_ch1_gnss_ns = vclock_to_gnss_ns(ch0_ch1_vclock_raw, anchor);
-
-  g_vclock_edge_monitor.last_target_gnss_ns = g_vclock_edge_monitor.next_target_gnss_ns;
-  g_vclock_edge_monitor.target_gnss_ns = g_vclock_edge_monitor.last_target_gnss_ns;
-  g_vclock_edge_monitor.last_fire_vclock_raw = fire_vclock_raw;
-  g_vclock_edge_monitor.last_fire_gnss_ns = fire_gnss_ns;
-  g_vclock_edge_monitor.last_dwt_isr_entry_raw = dwt_isr_entry_raw;
-  g_vclock_edge_monitor.last_dwt_at_edge = dwt_at_edge;
-  g_vclock_edge_monitor.last_isr_entry_gnss_ns = isr_entry_gnss_ns;
-  g_vclock_edge_monitor.last_isr_entry_minus_target_ns =
-      (isr_entry_gnss_ns >= 0 && g_vclock_edge_monitor.last_target_gnss_ns >= 0)
-          ? (isr_entry_gnss_ns - g_vclock_edge_monitor.last_target_gnss_ns)
-          : 0;
-  g_vclock_edge_monitor.last_dwt_at_edge_gnss_ns = dwt_at_edge_gnss_ns;
-  g_vclock_edge_monitor.last_dwt_at_edge_minus_target_ns =
-      (dwt_at_edge_gnss_ns >= 0 && g_vclock_edge_monitor.last_target_gnss_ns >= 0)
-          ? (dwt_at_edge_gnss_ns - g_vclock_edge_monitor.last_target_gnss_ns)
-          : 0;
-
-  g_vclock_edge_monitor.last_ch0_ch1_vclock_raw = ch0_ch1_vclock_raw;
-  g_vclock_edge_monitor.last_ch0_ch1_gnss_ns = ch0_ch1_gnss_ns;
-  g_vclock_edge_monitor.last_ch0_ch1_minus_target_ns =
-      (ch0_ch1_gnss_ns >= 0 && g_vclock_edge_monitor.last_target_gnss_ns >= 0)
-          ? (ch0_ch1_gnss_ns - g_vclock_edge_monitor.last_target_gnss_ns)
-          : 0;
-
-  g_vclock_edge_monitor.captures++;
-  g_vclock_edge_monitor.last_pps_gnss_ns = -1;
-  g_vclock_edge_monitor.last_correlation_valid = false;
-
-  vclock_edge_monitor_refresh_correlation();
-}
-
-// ============================================================================
-// Forward declarations
-// ============================================================================
-
-static void schedule_next(void);
-static inline void slot_capture(timepop_slot_t& slot,
-                                uint32_t fire_vclock_raw,
-                                uint32_t fire_dwt_cyccnt,
-                                int64_t fire_gnss_ns,
-                                const time_anchor_snapshot_t& snap,
-                                timepop_fire_capture_source_t source);
-static inline void expire_slot_with_capture(timepop_slot_t& slot,
-                                            uint32_t fire_vclock_raw,
-                                            uint32_t fire_dwt_cyccnt,
-                                            const time_anchor_snapshot_t& snap,
-                                            timepop_fire_capture_source_t source);
-static timepop_handle_t arm_absolute_slot_internal(
-  int64_t             target_gnss_ns,
-  bool                recurring,
-  uint64_t            recurring_period_gnss_ns,
-  timepop_callback_t  callback,
-  void*               user_data,
-  const char*         name,
-  bool                isr_callback,
-  uint32_t            target_dwt = 0);
-static bool vclock_edge_monitor_bootstrap(void);
-
-// ============================================================================
-// Helpers
-// ============================================================================
+static volatile uint32_t diag_tick_count          = 0;
+static volatile uint32_t diag_timed_fired         = 0;
+static volatile uint32_t diag_arm_failures        = 0;
+static volatile uint32_t diag_named_replacements  = 0;
+static volatile uint32_t diag_asap_armed          = 0;
+static volatile uint32_t diag_asap_dispatched     = 0;
+static volatile uint32_t diag_alap_armed          = 0;
+static volatile uint32_t diag_alap_dispatched     = 0;
+static volatile uint32_t diag_dispatch_calls      = 0;
+static volatile uint32_t diag_slots_high_water    = 0;
 
 static inline void update_slot_high_water(void) {
-  uint32_t active = 0;
-  for (uint32_t i = 0; i < MAX_SLOTS; i++) {
-    if (slots[i].active) active++;
-  }
-  if (active > diag_slots_high_water) diag_slots_high_water = active;
+  uint32_t n = 0;
+  for (uint32_t i = 0; i < MAX_SLOTS; i++) if (slots[i].active) n++;
+  if (n > diag_slots_high_water) diag_slots_high_water = n;
 }
 
-
-static inline void update_deferred_high_water(deferred_slot_t* slots_buf,
-                                              uint32_t max_slots,
-                                              volatile uint32_t& high_water) {
-  uint32_t active = 0;
-  for (uint32_t i = 0; i < max_slots; i++) {
-    if (slots_buf[i].active) active++;
-  }
-  if (active > high_water) high_water = active;
-}
-
-// QTimer1 CH0+CH1 32-bit read, instrumented locally in TimePop.
-// CH0 is low 16 bits, CH1 HOLD is high 16 bits of the cascaded counter.
-//
-// This read is used ONLY in contexts where ambient time is genuinely needed:
-//   • schedule_next() — must compare deadlines against the current counter
-//   • relative scheduling — "from now" inherently requires knowing "now"
-//   • recurring timer catch-up — relative timers that fell behind
-// //
-// Absolute and anchor-relative scheduling NEVER call this function.
-// Their deadlines are computed from the time anchor via pure arithmetic.
-static volatile uint32_t diag_qread_total = 0;
-static volatile uint32_t diag_qread_same_hi = 0;
-static volatile uint32_t diag_qread_retry_hi_changed = 0;
-static volatile uint32_t diag_qread_monotonic_backsteps = 0;
-static volatile uint32_t diag_qread_large_forward_jumps = 0;
-static volatile uint16_t diag_qread_last_lo1 = 0;
-static volatile uint16_t diag_qread_last_hi1 = 0;
-static volatile uint16_t diag_qread_last_lo2 = 0;
-static volatile uint16_t diag_qread_last_hi2 = 0;
-static volatile uint32_t diag_qread_last_value = 0;
-
-static inline uint32_t qtimer1_read_32_local(void) {
-  const uint16_t lo1 = IMXRT_TMR1.CH[0].CNTR;
-  const uint16_t hi1 = IMXRT_TMR1.CH[1].HOLD;
-
-  const uint16_t lo2 = IMXRT_TMR1.CH[0].CNTR;
-  const uint16_t hi2 = IMXRT_TMR1.CH[1].HOLD;
-
-  diag_qread_total++;
-  diag_qread_last_lo1 = lo1;
-  diag_qread_last_hi1 = hi1;
-  diag_qread_last_lo2 = lo2;
-  diag_qread_last_hi2 = hi2;
-
-  uint32_t value;
-  if (hi1 != hi2) {
-    diag_qread_retry_hi_changed++;
-    value = ((uint32_t)hi2 << 16) | (uint32_t)lo2;
-  } else {
-    diag_qread_same_hi++;
-    value = ((uint32_t)hi1 << 16) | (uint32_t)lo1;
-  }
-
-  const uint32_t prev = diag_qread_last_value;
-  if (diag_qread_total > 1) {
-    const int32_t signed_delta = (int32_t)(value - prev);
-    if (signed_delta < 0) {
-      diag_qread_monotonic_backsteps++;
-    } else if ((uint32_t)signed_delta > 1000000U) {
-      diag_qread_large_forward_jumps++;
-    }
-  }
-  diag_qread_last_value = value;
-  return value;
-}
-
-static inline uint32_t vclock_count(void) {
-  return qtimer1_read_32_local();
-}
+// ============================================================================
+// Deadline arithmetic
+// ============================================================================
 
 static inline bool deadline_expired(uint32_t deadline, uint32_t now) {
-  return (deadline - now) > MAX_DELAY_TICKS;
+  return (int32_t)(now - deadline) >= 0;
 }
 
-static inline uint32_t ns_to_ticks(uint64_t ns) {
-  uint64_t ticks = ns / NS_PER_TICK;
-  if (ticks < MIN_DELAY_TICKS) ticks = MIN_DELAY_TICKS;
-  if (ticks > MAX_DELAY_TICKS) ticks = MAX_DELAY_TICKS;
-  return (uint32_t)ticks;
-}
-
-static uint32_t predict_dwt_at_deadline(uint32_t deadline, bool& valid) {
-  valid = false;
-  time_anchor_snapshot_t snap = time_anchor_snapshot();
-  if (!snap.ok || !snap.valid) return 0;
-  if (snap.dwt_cycles_per_s == 0) return 0;
-
-  const uint32_t qtimer_elapsed = deadline - snap.qtimer_at_pps;
-  if (qtimer_elapsed > PREDICT_MAX_QTIMER_ELAPSED) return 0;
-
-  const uint64_t ns_elapsed =
-    (uint64_t)qtimer_elapsed * NS_PER_TICK;
-
-  const uint64_t dwt_elapsed =
-    (ns_elapsed * (uint64_t)snap.dwt_cycles_per_s + 500000000ULL) / 1000000000ULL;
-
-  valid = true;
-  return snap.dwt_at_pps + (uint32_t)dwt_elapsed;
-}
-
-static inline void smartpop_note_check_for_name(const char* name) {
-  switch (monitored_client_for_name(name)) {
-    case monitored_client_t::PPS:   diag_smartpop_pps_checks++; break;
-    case monitored_client_t::OCXO1: diag_smartpop_ocxo1_checks++; break;
-    case monitored_client_t::OCXO2: diag_smartpop_ocxo2_checks++; break;
-    default: break;
-  }
-}
-
-static inline void smartpop_note_spin_success_for_name(const char* name) {
-  switch (monitored_client_for_name(name)) {
-    case monitored_client_t::PPS:   diag_smartpop_pps_spin_success++; break;
-    case monitored_client_t::OCXO1: diag_smartpop_ocxo1_spin_success++; break;
-    case monitored_client_t::OCXO2: diag_smartpop_ocxo2_spin_success++; break;
-    default: break;
-  }
-}
-
-static inline void smartpop_note_spin_timeout_for_name(const char* name) {
-  switch (monitored_client_for_name(name)) {
-    case monitored_client_t::PPS:   diag_smartpop_pps_spin_timeouts++; break;
-    case monitored_client_t::OCXO1: diag_smartpop_ocxo1_spin_timeouts++; break;
-    case monitored_client_t::OCXO2: diag_smartpop_ocxo2_spin_timeouts++; break;
-    default: break;
-  }
-}
-
-static inline void smartpop_note_fallback_late_arm_for_name(const char* name) {
-  switch (monitored_client_for_name(name)) {
-    case monitored_client_t::PPS:   diag_smartpop_pps_fallback_late_arm++; break;
-    case monitored_client_t::OCXO1: diag_smartpop_ocxo1_fallback_late_arm++; break;
-    case monitored_client_t::OCXO2: diag_smartpop_ocxo2_fallback_late_arm++; break;
-    default: break;
-  }
-}
-
-static inline void smartpop_note_fallback_no_prediction_for_name(const char* name) {
-  switch (monitored_client_for_name(name)) {
-    case monitored_client_t::PPS:   diag_smartpop_pps_fallback_no_prediction++; break;
-    case monitored_client_t::OCXO1: diag_smartpop_ocxo1_fallback_no_prediction++; break;
-    case monitored_client_t::OCXO2: diag_smartpop_ocxo2_fallback_no_prediction++; break;
-    default: break;
-  }
-}
-
-static inline void smartpop_prepare_slot(timepop_slot_t& slot) {
-  slot.target_deadline = slot.deadline;
-  slot.smartpop_enabled = false;
-  slot.smartpop_early_ticks = 0;
-
-  if (!slot.prediction_valid || slot.predicted_dwt == 0 || slot.target_gnss_ns < 0) {
-    diag_smartpop_fallback_no_prediction++;
-    smartpop_note_fallback_no_prediction_for_name(slot.name);
-    return;
-  }
-
-  const uint32_t early_ticks = (uint32_t)(SMARTPOP_EARLY_WAKE_NS / NS_PER_TICK);
-  if (early_ticks == 0) {
-    diag_smartpop_fallback_no_prediction++;
-    smartpop_note_fallback_no_prediction_for_name(slot.name);
-    return;
-  }
-
-  const uint32_t early_cycles = ns_to_dwt_cycles_runtime(SMARTPOP_EARLY_WAKE_NS);
-  const uint32_t now_dwt = ARM_DWT_CYCCNT;
-  const int32_t margin_cycles = (int32_t)(slot.predicted_dwt - now_dwt);
-
-  if (margin_cycles <= (int32_t)(early_cycles + SMARTPOP_MIN_MARGIN_CYCLES)) {
-    diag_smartpop_fallback_late_arm++;
-    smartpop_note_fallback_late_arm_for_name(slot.name);
-    return;
-  }
-
-  slot.deadline = slot.target_deadline - early_ticks;
-  slot.smartpop_enabled = true;
-  slot.smartpop_early_ticks = early_ticks;
-  diag_smartpop_armed++;
+static inline uint32_t ns_to_ticks_clamp(uint64_t ns) {
+  uint64_t t = ns / NS_PER_TICK;
+  if (t < 1) t = 1;
+  if (t > 0x7FFFFFFFULL) t = 0x7FFFFFFFULL;
+  return (uint32_t)t;
 }
 
 // ============================================================================
-// Absolute GNSS nanosecond → VCLOCK deadline (pure arithmetic)
+// gnss_ns → counter32 conversion via alpha's slot
 // ============================================================================
-//
-// Converts a target GNSS nanosecond to a VCLOCK deadline using the time
-// anchor.  No ambient counter read.  No "what time is it now?"
-//
-// The arithmetic:
-//   anchor_pps_gnss_ns = (pps_count - 1) * 1,000,000,000
-//   ns_from_anchor     = target_gnss_ns - anchor_pps_gnss_ns
-//   ticks_from_anchor  = ns_from_anchor / 100
-//   deadline           = qtimer_at_pps + ticks_from_anchor
-//
-// Returns true if the conversion succeeded (anchor valid, target in range).
-// On success, writes the VCLOCK deadline to *out_deadline.
-static bool gnss_ns_to_vclock_deadline(int64_t target_gnss_ns,
-                                       const time_anchor_snapshot_t& snap,
-                                       uint32_t& out_deadline) {
-  if (!snap.ok || !snap.valid || snap.pps_count < 1) return false;
 
-  const int64_t anchor_pps_gnss_ns =
-    (int64_t)(snap.pps_count - 1) * (int64_t)1000000000LL;
+static bool gnss_ns_to_counter32_deadline(int64_t target_gnss_ns,
+                                          uint32_t& out_deadline) {
+  const alpha_pps_vclock_slot_t a = alpha_pps_vclock_load();
+  if (a.sequence == 0) return false;
 
-  const int64_t ns_from_anchor = target_gnss_ns - anchor_pps_gnss_ns;
-
-  diag_deadline_last_target_gnss_ns = target_gnss_ns;
-  diag_deadline_last_anchor_pps_gnss_ns = anchor_pps_gnss_ns;
-  diag_deadline_last_ns_from_anchor = ns_from_anchor;
-
+  const int64_t ns_from_anchor = target_gnss_ns - a.gnss_ns_at_edge;
   if (ns_from_anchor < 0) {
-    diag_deadline_negative_offset++;
-    return false;
+    // Target is before anchor — express it as a wrapped value (the
+    // expiration check handles wrap correctly).  Compute the negative
+    // delta in ticks and subtract.
+    const uint64_t neg_ns = (uint64_t)(-ns_from_anchor);
+    const uint32_t neg_ticks = (uint32_t)(neg_ns / NS_PER_TICK);
+    out_deadline = a.counter32_at_edge - neg_ticks;
+    return true;
   }
 
   const uint64_t ticks64 = (uint64_t)ns_from_anchor / NS_PER_TICK;
-  if (ticks64 > 0xFFFFFFFFULL) {
-    return false;
-  }
-
-  out_deadline = snap.qtimer_at_pps + (uint32_t)ticks64;
+  if (ticks64 > 0xFFFFFFFFULL) return false;
+  out_deadline = a.counter32_at_edge + (uint32_t)ticks64;
   return true;
 }
 
 // ============================================================================
-// Named singleton replacement
+// Named-slot retirement
 // ============================================================================
-
-static inline void note_named_replacement(const char* name) {
-  if (!name || !*name) return;
-  if (strcmp(name, "PPS_PRESPIN") == 0) {
-    diag_named_replacements_pps_prespin++;
-  } else if (strcmp(name, "OCXO1_PRESPIN") == 0) {
-    diag_named_replacements_ocxo1_prespin++;
-  } else if (strcmp(name, "OCXO2_PRESPIN") == 0) {
-    diag_named_replacements_ocxo2_prespin++;
-  } else if (strcmp(name, "PPS_DISPATCH") == 0) {
-    diag_named_replacements_pps_dispatch++;
-  } else if (strcmp(name, "OCXO1_DISPATCH") == 0) {
-    diag_named_replacements_ocxo1_dispatch++;
-  } else if (strcmp(name, "OCXO2_DISPATCH") == 0) {
-    diag_named_replacements_ocxo2_dispatch++;
-  }
-}
 
 static bool retire_existing_named_slots(const char* name) {
   if (!name || !*name) return false;
-
-  bool retired_any = false;
+  bool retired = false;
 
   for (uint32_t i = 0; i < MAX_SLOTS; i++) {
-    if (!slots[i].active) continue;
-    if (!slots[i].name) continue;
-    if (strcmp(slots[i].name, name) != 0) continue;
-
-    slots[i].active = false;
-    slots[i].expired = false;
-    retired_any = true;
-    diag_named_replacements++;
-    note_named_replacement(name);
+    if (slots[i].active && slots[i].name && strcmp(slots[i].name, name) == 0) {
+      slots[i].active  = false;
+      slots[i].expired = false;
+      retired = true;
+      diag_named_replacements++;
+    }
   }
-
   for (uint32_t i = 0; i < MAX_ASAP_SLOTS; i++) {
-    if (!asap_slots[i].active) continue;
-    if (!asap_slots[i].name) continue;
-    if (strcmp(asap_slots[i].name, name) != 0) continue;
-
-    asap_slots[i].active = false;
-    retired_any = true;
-    diag_named_replacements++;
-    note_named_replacement(name);
+    if (asap_slots[i].active && asap_slots[i].name && strcmp(asap_slots[i].name, name) == 0) {
+      asap_slots[i].active = false;
+      retired = true;
+      diag_named_replacements++;
+    }
   }
-
   for (uint32_t i = 0; i < MAX_ALAP_SLOTS; i++) {
-    if (!alap_slots[i].active) continue;
-    if (!alap_slots[i].name) continue;
-    if (strcmp(alap_slots[i].name, name) != 0) continue;
-
-    alap_slots[i].active = false;
-    retired_any = true;
-    diag_named_replacements++;
-    note_named_replacement(name);
-  }
-
-  return retired_any;
-}
-
-// ============================================================================
-// VCLOCK-exact GNSS nanosecond computation
-// ============================================================================
-
-static int64_t vclock_to_gnss_ns(uint32_t vclock_raw,
-                                 const time_anchor_snapshot_t& snap) {
-  if (!snap.ok || !snap.valid || snap.pps_count < 1) return -1;
-
-  const uint32_t ticks_since_pps = vclock_raw - snap.qtimer_at_pps;
-
-  return (int64_t)(snap.pps_count - 1) * (int64_t)1000000000LL
-       + (int64_t)((uint64_t)ticks_since_pps * NS_PER_TICK);
-}
-
-// ============================================================================
-// Dispatch timing validation — landed DWT domain
-// ============================================================================
-
-static inline void validate_dispatch_against_dwt(const timepop_slot_t& slot,
-                                                 uint32_t landed_dwt) {
-  if (!is_monitored_name(slot.name)) {
-    diag_dispatch_gnss_skipped_unmonitored++;
-    return;
-  }
-
-  if (slot.target_gnss_ns < 0) {
-    diag_dispatch_gnss_skipped_no_target++;
-    return;
-  }
-
-  const int64_t actual_gnss_ns = time_dwt_to_gnss_ns(landed_dwt);
-  if (actual_gnss_ns < 0) {
-    diag_dispatch_gnss_skipped_invalid_time++;
-    return;
-  }
-
-  diag_dispatch_gnss_checks++;
-  diag_dispatch_gnss_last_target_ns = slot.target_gnss_ns;
-  diag_dispatch_gnss_last_actual_ns = actual_gnss_ns;
-
-  const int64_t error_ns = actual_gnss_ns - slot.target_gnss_ns;
-  diag_dispatch_gnss_last_error_ns = error_ns;
-
-  const uint64_t abs_error_ns = (uint64_t)llabs(error_ns);
-  if (abs_error_ns > diag_dispatch_gnss_max_abs_error_ns) {
-    diag_dispatch_gnss_max_abs_error_ns = abs_error_ns;
-    diag_dispatch_gnss_worst_target_ns = slot.target_gnss_ns;
-    diag_dispatch_gnss_worst_actual_ns = actual_gnss_ns;
-    diag_dispatch_gnss_worst_error_ns = error_ns;
-    diag_dispatch_gnss_worst_handle = slot.handle;
-    diag_dispatch_gnss_worst_prediction_valid = slot.prediction_valid;
-    diag_dispatch_gnss_worst_smartpop_enabled = slot.smartpop_enabled;
-    diag_dispatch_gnss_worst_name = slot.name;
-  }
-
-  if (abs_error_ns > (uint64_t)TIMEPOP_DISPATCH_GNSS_TOLERANCE_NS) {
-    diag_dispatch_gnss_mismatches++;
-  }
-}
-
-// ============================================================================
-// CH2 compare management
-// ============================================================================
-
-static inline void ch2_clear_flag(void) {
-  IMXRT_TMR1.CH[2].CSCTRL &= ~(TMR_CSCTRL_TCF1 | TMR_CSCTRL_TCF2);
-}
-
-static inline void ch2_arm_compare(uint16_t target_low16) {
-  ch2_clear_flag();
-  IMXRT_TMR1.CH[2].COMP1  = target_low16;
-  IMXRT_TMR1.CH[2].CMPLD1 = target_low16;
-  ch2_clear_flag();
-  IMXRT_TMR1.CH[2].CSCTRL |= TMR_CSCTRL_TCF1EN;
-}
-
-// ============================================================================
-// schedule_next
-// ============================================================================
-//
-// This is the ONE place in TimePop that legitimately reads the ambient
-// VCLOCK counter.  It must compare deadlines against the current counter
-// to determine which slots have expired and how far away the nearest
-// deadline is.  This is the heartbeat polling loop.
-
-static void schedule_next(void) {
-  diag_schedule_next_calls_total++;
-
-  const uint32_t now = vclock_count();
-  uint32_t soonest = 0;
-  bool found = false;
-
-  for (uint32_t i = 0; i < MAX_SLOTS; i++) {
-    if (!slots[i].active || slots[i].expired) continue;
-
-    if (deadline_expired(slots[i].deadline, now)) {
-      if (!slots[i].first_expire_recorded) {
-        slots[i].first_expire_now = now;
-        slots[i].first_expire_recorded = true;
-      }
-
-      const time_anchor_snapshot_t snap = time_anchor_snapshot();
-      const uint32_t dwt_now = ARM_DWT_CYCCNT;
-      expire_slot_with_capture(slots[i],
-                               now,
-                               dwt_now,
-                               snap,
-                               timepop_fire_capture_source_t::SCHEDULE_NEXT);
-      continue;
-    }
-
-    if (!found || ((slots[i].deadline - now) < (soonest - now))) {
-      soonest = slots[i].deadline;
-      found = true;
+    if (alap_slots[i].active && alap_slots[i].name && strcmp(alap_slots[i].name, name) == 0) {
+      alap_slots[i].active = false;
+      retired = true;
+      diag_named_replacements++;
     }
   }
-
-
-  uint32_t target;
-  if (!found) {
-    target = now + HEARTBEAT_TICKS;
-    diag_heartbeat_rearms++;
-  } else {
-    uint32_t distance = soonest - now;
-    if (distance > HEARTBEAT_TICKS) {
-      target = now + HEARTBEAT_TICKS;
-      diag_heartbeat_rearms++;
-    } else {
-      target = soonest;
-    }
-  }
-
-  ch2_arm_compare((uint16_t)(target & 0xFFFF));
-  diag_rearm_count++;
-
-  const uint16_t cntr = IMXRT_TMR1.CH[2].CNTR;
-  const uint16_t comp = (uint16_t)(target & 0xFFFF);
-  const uint16_t distance_16 = comp - cntr;
-  (void)distance_16;
+  return retired;
 }
 
 // ============================================================================
-// ISR helpers
+// Deferred (asap/alap) arming and dispatch
 // ============================================================================
 
-static inline void slot_capture(
-  timepop_slot_t& slot,
-  uint32_t fire_vclock_raw,
-  uint32_t fire_dwt_cyccnt,
-  int64_t fire_gnss_ns,
-  const time_anchor_snapshot_t& snap,
-  timepop_fire_capture_source_t source
-) {
-  slot.fire_vclock_raw         = fire_vclock_raw;
-  slot.fire_dwt_cyccnt         = fire_dwt_cyccnt;
-  slot.fire_gnss_ns            = fire_gnss_ns;
-  slot.fire_capture_source     = source;
-  slot.anchor_dwt_at_pps       = snap.dwt_at_pps;
-  slot.anchor_dwt_cycles_per_s = snap.dwt_cycles_per_s;
-  slot.anchor_qtimer_at_pps    = snap.qtimer_at_pps;
-  slot.anchor_pps_count        = snap.pps_count;
-  slot.anchor_valid            = snap.ok && snap.valid;
-}
-
-static inline void expire_slot_with_capture(timepop_slot_t& slot,
-                                            uint32_t fire_vclock_raw,
-                                            uint32_t fire_dwt_cyccnt,
-                                            const time_anchor_snapshot_t& snap,
-                                            timepop_fire_capture_source_t source) {
-  const int64_t fire_gnss_ns = vclock_to_gnss_ns(fire_vclock_raw, snap);
-  slot_capture(slot, fire_vclock_raw, fire_dwt_cyccnt, fire_gnss_ns, snap, source);
-
-  slot.expired = true;
-  expired_count++;
-  timepop_pending = true;
-}
-
-static inline void slot_build_ctx(
-  const timepop_slot_t& slot,
-  timepop_ctx_t& ctx
-) {
-  ctx.handle              = slot.handle;
-  ctx.fire_vclock_raw     = slot.fire_vclock_raw;
-  ctx.fire_dwt_cyccnt     = slot.fire_dwt_cyccnt;
-  ctx.deadline            = slot.target_deadline;
-  ctx.fire_gnss_error_ns  = (int32_t)(slot.fire_vclock_raw - slot.target_deadline) * (int32_t)NS_PER_TICK;
-  ctx.fire_gnss_ns        = slot.fire_gnss_ns;
-}
-
-static inline void slot_build_diag(
-  const timepop_slot_t& slot,
-  uint32_t dwt_at_isr_entry,
-  timepop_diag_t& diag
-) {
-  diag.dwt_at_isr_entry        = dwt_at_isr_entry;
-  diag.dwt_at_fire             = slot.fire_dwt_cyccnt;
-  diag.predicted_dwt           = slot.predicted_dwt;
-  diag.prediction_valid        = slot.prediction_valid;
-  diag.spin_error_cycles       = (int32_t)(slot.fire_dwt_cyccnt - slot.predicted_dwt);
-  diag.anchor_pps_count        = slot.anchor_pps_count;
-  diag.anchor_qtimer_at_pps    = slot.anchor_qtimer_at_pps;
-  diag.anchor_dwt_at_pps       = slot.anchor_dwt_at_pps;
-  diag.anchor_dwt_cycles_per_s = slot.anchor_dwt_cycles_per_s;
-  diag.anchor_valid            = slot.anchor_valid;
-}
-
-// ============================================================================
-// QTimer1 CH2 handler — TimePop priority queue scheduler
-// ============================================================================
-//
-// IRQ-context handler called by process_interrupt's qtimer1_isr
-// dispatcher on every CH2 compare-match.  Receives the standard
-// event/diag payload — DWT, gnss_ns, counter32 — already filled in by
-// the dispatcher.  No need to re-read the counter or recompute gnss_ns
-// here.  The CH2 TCF1 flag is cleared by the dispatcher before this
-// runs, so we don't clear it ourselves.
-//
-void timepop_qtimer1_ch2_handler(const interrupt_event_t& event,
-                                 const interrupt_capture_diag_t& /*diag*/) {
-
-  const uint32_t dwt_entry      = event.dwt_at_event;
-  const uint32_t now            = event.counter32_at_event;
-  const time_anchor_snapshot_t anchor = time_anchor_snapshot();
-
-  diag_isr_count++;
-
-  bool any_expired = false;
-
-  for (uint32_t i = 0; i < MAX_SLOTS; i++) {
-    if (!slots[i].active || slots[i].expired) continue;
-    if (!deadline_expired(slots[i].deadline, now)) continue;
-
-    uint32_t landed_dwt = dwt_entry;
-    slots[i].spin_dry_used = false;
-    slots[i].wake_target_dwt = 0;
-    slots[i].wake_error_cycles = 0;
-
-    if (slots[i].smartpop_enabled && slots[i].prediction_valid) {
-      if (is_monitored_name(slots[i].name)) {
-        diag_smartpop_checks++;
-        smartpop_note_check_for_name(slots[i].name);
-      }
-      diag_smartpop_last_target_dwt = slots[i].predicted_dwt;
-      diag_smartpop_last_entry_dwt = dwt_entry;
-
-      const uint32_t wake_early_ns = (uint32_t)((uint64_t)slots[i].smartpop_early_ticks * NS_PER_TICK);
-      const uint32_t wake_early_cycles = ns_to_dwt_cycles_runtime(wake_early_ns);
-      slots[i].spin_dry_used = true;
-      slots[i].wake_target_dwt = slots[i].predicted_dwt - wake_early_cycles;
-      slots[i].wake_error_cycles = (int32_t)(dwt_entry - slots[i].wake_target_dwt);
-      const int32_t cycles_early = (int32_t)(slots[i].predicted_dwt - dwt_entry);
-      diag_smartpop_last_cycles_early = cycles_early;
-
-      if (cycles_early > 0) {
-        diag_smartpop_woke_early++;
-        if ((uint32_t)cycles_early > diag_smartpop_max_cycles_early) {
-          diag_smartpop_max_cycles_early = (uint32_t)cycles_early;
-        }
-
-        diag_smartpop_spin_attempts++;
-        const uint32_t spin_start = ARM_DWT_CYCCNT;
-        while ((int32_t)(slots[i].predicted_dwt - ARM_DWT_CYCCNT) > 0) {
-          if ((ARM_DWT_CYCCNT - spin_start) > SMARTPOP_SPIN_MAX_CYCLES) {
-            break;
-          }
-        }
-        landed_dwt = ARM_DWT_CYCCNT;
-        const uint32_t spin_cycles = landed_dwt - spin_start;
-        diag_smartpop_last_spin_cycles = spin_cycles;
-        if (spin_cycles > diag_smartpop_max_spin_cycles) {
-          diag_smartpop_max_spin_cycles = spin_cycles;
-        }
-
-        if ((int32_t)(slots[i].predicted_dwt - landed_dwt) <= 0) {
-          diag_smartpop_spin_success++;
-          smartpop_note_spin_success_for_name(slots[i].name);
-        } else {
-          diag_smartpop_spin_timeouts++;
-          smartpop_note_spin_timeout_for_name(slots[i].name);
-        }
-      } else {
-        diag_smartpop_woke_late++;
-        diag_smartpop_last_spin_cycles = 0;
-        landed_dwt = dwt_entry;
-      }
-
-      diag_smartpop_last_land_dwt = landed_dwt;
-    } else if (slots[i].prediction_valid) {
-      const uint32_t target_dwt = slots[i].predicted_dwt;
-
-      if ((int32_t)(target_dwt - dwt_entry) > 0) {
-        const uint32_t spin_start = ARM_DWT_CYCCNT;
-        while ((int32_t)(target_dwt - ARM_DWT_CYCCNT) > 0) {
-          if ((ARM_DWT_CYCCNT - spin_start) > DWT_SPIN_MAX_CYCLES) break;
-        }
-        landed_dwt = ARM_DWT_CYCCNT;
-      } else {
-        landed_dwt = target_dwt;
-      }
-    }
-
-    validate_dispatch_against_dwt(slots[i], landed_dwt);
-
-    // Capture the client-visible fire context exactly once, through the
-    // same helper used by all expiration paths.  This keeps
-    // fire_vclock_raw / fire_dwt_cyccnt / fire_gnss_ns / anchor_* coherent
-    // and prevents scheduled-context callbacks from seeing stale captures.
-    expire_slot_with_capture(slots[i],
-                             now,
-                             landed_dwt,
-                             anchor,
-                             timepop_fire_capture_source_t::IRQ_CH2);
-
-    slots[i].isr_callback_fired = false;
-
-    if (slots[i].isr_callback) {
-      timepop_ctx_t ctx;
-      slot_build_ctx(slots[i], ctx);
-
-      timepop_diag_t diag;
-      slot_build_diag(slots[i], dwt_entry, diag);
-
-      slots[i].callback(&ctx, &diag, slots[i].user_data);
-      slots[i].isr_callback_fired = true;
-      diag_isr_callbacks++;
-    }
-
-    any_expired = true;
-  }
-
-  if (any_expired) {
-    isr_fire_count++;
-    timepop_pending = true;
-  } else {
-    phantom_count++;
-  }
-
-  diag_schedule_next_calls_from_other++;
-  schedule_next();
-}
-
-
-static inline void build_deferred_ctx(timepop_handle_t handle, timepop_ctx_t& ctx) {
-  ctx.handle = handle;
-  ctx.fire_vclock_raw = 0;
-  ctx.fire_dwt_cyccnt = 0;
-  ctx.deadline = 0;
-  ctx.fire_gnss_error_ns = 0;
-  ctx.fire_gnss_ns = -1;
-}
-
-static void dispatch_deferred_phase(deferred_slot_t* slots_buf,
-                                    uint32_t max_slots,
-                                    volatile uint32_t& dispatched_count,
-                                    volatile uint32_t& last_dispatch_dwt) {
-  bool pending_this_pass[MAX_ASAP_SLOTS > MAX_ALAP_SLOTS ? MAX_ASAP_SLOTS : MAX_ALAP_SLOTS] = {};
-  for (uint32_t i = 0; i < max_slots; i++) {
-    pending_this_pass[i] = slots_buf[i].active;
-  }
-
-  for (uint32_t i = 0; i < max_slots; i++) {
-    if (!pending_this_pass[i]) continue;
-    if (!slots_buf[i].active) continue;
-
-    timepop_ctx_t ctx;
-    build_deferred_ctx(slots_buf[i].handle, ctx);
-
-    uint32_t start = ARM_DWT_CYCCNT;
-    slots_buf[i].callback(&ctx, nullptr, slots_buf[i].user_data);
-    uint32_t end = ARM_DWT_CYCCNT;
-
-    cpu_usage_account_busy(end - start);
-    diag_dispatch_callbacks++;
-    dispatched_count++;
-    last_dispatch_dwt = end;
-
-    slots_buf[i].active = false;
-  }
-}
-
-static timepop_handle_t arm_deferred(deferred_slot_t* slots_buf,
+static timepop_handle_t arm_deferred(deferred_slot_t* buf,
                                      uint32_t max_slots,
-                                     volatile uint32_t& arm_failures,
                                      volatile uint32_t& armed_count,
-                                     volatile uint32_t& last_armed_dwt,
-                                     volatile const char*& last_armed_name,
-                                     volatile uint32_t& high_water,
                                      timepop_callback_t callback,
                                      void* user_data,
                                      const char* name) {
@@ -1248,167 +229,72 @@ static timepop_handle_t arm_deferred(deferred_slot_t* slots_buf,
 
   const uint32_t saved = critical_enter();
 
-  const bool retired_named = retire_existing_named_slots(name);
-  if (retired_named) {
-    timepop_pending = true;
-  }
+  retire_existing_named_slots(name);
 
   for (uint32_t i = 0; i < max_slots; i++) {
-    if (slots_buf[i].active) continue;
+    if (buf[i].active) continue;
 
     timepop_handle_t h = next_handle++;
     if (next_handle == TIMEPOP_INVALID_HANDLE) next_handle = 1;
 
-    slots_buf[i] = {};
-    slots_buf[i].active = true;
-    slots_buf[i].handle = h;
-    slots_buf[i].callback = callback;
-    slots_buf[i].user_data = user_data;
-    slots_buf[i].name = name;
+    buf[i] = {};
+    buf[i].active     = true;
+    buf[i].handle     = h;
+    buf[i].callback   = callback;
+    buf[i].user_data  = user_data;
+    buf[i].name       = name;
 
-    timepop_pending = true;
     armed_count++;
-    last_armed_dwt = ARM_DWT_CYCCNT;
-    last_armed_name = name;
-
-    update_deferred_high_water(slots_buf, max_slots, high_water);
-
+    timepop_pending = true;
     critical_exit(saved);
     return h;
   }
 
-  arm_failures++;
+  diag_arm_failures++;
   critical_exit(saved);
   return TIMEPOP_INVALID_HANDLE;
 }
 
-// ============================================================================
-// QTimer1 hardware initialization moved to process_interrupt
-// ============================================================================
-//
-// CH0/CH1 cascade and CH2 scheduler channel are now initialized by
-// process_interrupt_init_hardware().  TimePop only programs the CH2
-// compare register as it schedules slots; the channel mode/control
-// setup is no longer TimePop's responsibility.
+static void dispatch_deferred_phase(deferred_slot_t* buf,
+                                    uint32_t max_slots,
+                                    volatile uint32_t& dispatched_count) {
+  bool snapshot_active[MAX_ASAP_SLOTS > MAX_ALAP_SLOTS ? MAX_ASAP_SLOTS : MAX_ALAP_SLOTS] = {};
+  for (uint32_t i = 0; i < max_slots; i++) {
+    snapshot_active[i] = buf[i].active;
+  }
 
-// ============================================================================
-// Initialization
-// ============================================================================
+  for (uint32_t i = 0; i < max_slots; i++) {
+    if (!snapshot_active[i] || !buf[i].active) continue;
 
-void timepop_init(void) {
-  for (uint32_t i = 0; i < MAX_SLOTS; i++) slots[i] = {};
-  for (uint32_t i = 0; i < MAX_ASAP_SLOTS; i++) asap_slots[i] = {};
-  for (uint32_t i = 0; i < MAX_ALAP_SLOTS; i++) alap_slots[i] = {};
+    timepop_ctx_t ctx{};
+    ctx.handle = buf[i].handle;
 
-  diag_dispatch_gnss_checks = 0;
-  diag_dispatch_gnss_mismatches = 0;
-  diag_dispatch_gnss_skipped_no_target = 0;
-  diag_dispatch_gnss_skipped_invalid_time = 0;
-  diag_dispatch_gnss_skipped_unmonitored = 0;
-  diag_dispatch_gnss_last_target_ns = -1;
-  diag_dispatch_gnss_last_actual_ns = -1;
-  diag_dispatch_gnss_last_error_ns = 0;
-  diag_dispatch_gnss_max_abs_error_ns = 0;
-
-  diag_smartpop_checks = 0;
-  diag_smartpop_armed = 0;
-  diag_smartpop_fallback_no_prediction = 0;
-  diag_smartpop_fallback_late_arm = 0;
-  diag_smartpop_woke_early = 0;
-  diag_smartpop_woke_late = 0;
-  diag_smartpop_spin_attempts = 0;
-  diag_smartpop_spin_success = 0;
-  diag_smartpop_spin_timeouts = 0;
-  diag_smartpop_last_target_dwt = 0;
-  diag_smartpop_last_entry_dwt = 0;
-  diag_smartpop_last_land_dwt = 0;
-  diag_smartpop_last_cycles_early = 0;
-  diag_smartpop_last_spin_cycles = 0;
-  diag_smartpop_max_spin_cycles = 0;
-  diag_smartpop_max_cycles_early = 0;
-
-  diag_smartpop_pps_checks = 0;
-  diag_smartpop_ocxo1_checks = 0;
-  diag_smartpop_ocxo2_checks = 0;
-  diag_smartpop_dwt_adjust_checks = 0;
-  diag_smartpop_pps_spin_success = 0;
-  diag_smartpop_ocxo1_spin_success = 0;
-  diag_smartpop_ocxo2_spin_success = 0;
-  diag_smartpop_dwt_adjust_spin_success = 0;
-  diag_smartpop_pps_spin_timeouts = 0;
-  diag_smartpop_ocxo1_spin_timeouts = 0;
-  diag_smartpop_ocxo2_spin_timeouts = 0;
-  diag_smartpop_dwt_adjust_spin_timeouts = 0;
-  diag_smartpop_pps_fallback_no_prediction = 0;
-  diag_smartpop_ocxo1_fallback_no_prediction = 0;
-  diag_smartpop_ocxo2_fallback_no_prediction = 0;
-  diag_smartpop_dwt_adjust_fallback_no_prediction = 0;
-  diag_smartpop_pps_fallback_late_arm = 0;
-  diag_smartpop_ocxo1_fallback_late_arm = 0;
-  diag_smartpop_ocxo2_fallback_late_arm = 0;
-  diag_smartpop_dwt_adjust_fallback_late_arm = 0;
-  diag_dispatch_gnss_worst_target_ns = -1;
-  diag_dispatch_gnss_worst_actual_ns = -1;
-  diag_dispatch_gnss_worst_error_ns = 0;
-  diag_dispatch_gnss_worst_handle = 0;
-  diag_dispatch_gnss_worst_prediction_valid = false;
-  diag_dispatch_gnss_worst_smartpop_enabled = false;
-  diag_dispatch_gnss_worst_name = nullptr;
-
-
-  diag_deadline_negative_offset = 0;
-  diag_deadline_last_target_gnss_ns = -1;
-  diag_deadline_last_anchor_pps_gnss_ns = -1;
-  diag_deadline_last_ns_from_anchor = 0;
-  diag_named_replacements_pps_prespin = 0;
-  diag_named_replacements_ocxo1_prespin = 0;
-  diag_named_replacements_ocxo2_prespin = 0;
-  diag_named_replacements_pps_dispatch = 0;
-  diag_named_replacements_ocxo1_dispatch = 0;
-  diag_named_replacements_ocxo2_dispatch = 0;
-
-  g_vclock_edge_monitor = {};
-  g_vclock_edge_monitor.enabled = true;
-
-  // QTimer1 hardware (CH0/CH1/CH2) is initialized by
-  // process_interrupt_init_hardware().  IRQ vector and NVIC priority
-  // are owned by process_interrupt_enable_irqs().  We just register
-  // our CH2 handler here; the dispatcher will invoke it in IRQ
-  // context with a fully-populated event/diag payload.
-  interrupt_register_qtimer1_ch2_handler(timepop_qtimer1_ch2_handler);
-
-  const uint32_t saved = critical_enter();
-  diag_schedule_next_calls_from_other++;
-  schedule_next();
-  critical_exit(saved);
+    buf[i].callback(&ctx, nullptr, buf[i].user_data);
+    dispatched_count++;
+    buf[i].active = false;
+  }
 }
 
-static timepop_handle_t arm_absolute_slot_internal(
-  int64_t             target_gnss_ns,
-  bool                recurring,
-  uint64_t            recurring_period_gnss_ns,
-  timepop_callback_t  callback,
-  void*               user_data,
-  const char*         name,
-  bool                isr_callback,
-  uint32_t            target_dwt
-) {
+// ============================================================================
+// Public arming API
+// ============================================================================
+
+static timepop_handle_t arm_absolute_internal(int64_t target_gnss_ns,
+                                              bool recurring,
+                                              uint64_t period_ns,
+                                              timepop_callback_t callback,
+                                              void* user_data,
+                                              const char* name) {
   if (!callback) return TIMEPOP_INVALID_HANDLE;
   if (target_gnss_ns <= 0) return TIMEPOP_INVALID_HANDLE;
 
-  const time_anchor_snapshot_t snap = time_anchor_snapshot();
   uint32_t deadline = 0;
-  if (!gnss_ns_to_vclock_deadline(target_gnss_ns, snap, deadline)) {
+  if (!gnss_ns_to_counter32_deadline(target_gnss_ns, deadline)) {
     return TIMEPOP_INVALID_HANDLE;
   }
 
   const uint32_t saved = critical_enter();
-
-  const bool retired_named = retire_existing_named_slots(name);
-  if (retired_named) {
-    diag_schedule_next_calls_from_other++;
-    schedule_next();
-  }
+  retire_existing_named_slots(name);
 
   for (uint32_t i = 0; i < MAX_SLOTS; i++) {
     if (slots[i].active) continue;
@@ -1418,47 +304,17 @@ static timepop_handle_t arm_absolute_slot_internal(
 
     slots[i] = {};
     slots[i].active         = true;
-    slots[i].expired        = false;
-    slots[i].recurring      = recurring;
+    slots[i].recurring      = recurring && period_ns > 0;
     slots[i].is_absolute    = true;
-    slots[i].recurrence_mode =
-        (recurring && recurring_period_gnss_ns > 0)
-            ? timepop_recurrence_mode_t::ABSOLUTE
-            : timepop_recurrence_mode_t::NONE;
     slots[i].handle         = h;
-    slots[i].period_ns      = recurring_period_gnss_ns;
-    slots[i].period_ticks   = (recurring_period_gnss_ns > 0) ? ns_to_ticks(recurring_period_gnss_ns) : 0;
     slots[i].deadline       = deadline;
     slots[i].target_gnss_ns = target_gnss_ns;
+    slots[i].period_ns      = period_ns;
+    slots[i].period_ticks   = (period_ns > 0) ? ns_to_ticks_clamp(period_ns) : 0;
     slots[i].callback       = callback;
     slots[i].user_data      = user_data;
     slots[i].name           = name;
-    slots[i].fire_gnss_ns   = -1;
-    slots[i].isr_callback   = isr_callback;
-    slots[i].spin_dry_used = false;
-    slots[i].wake_target_dwt = 0;
-    slots[i].wake_error_cycles = 0;
-    slots[i].recurring_rearmed_count = 0;
-    slots[i].recurring_immediate_expire_count = 0;
-    slots[i].recurring_catchup_count = 0;
-    slots[i].recurring_base_gnss_ns = target_gnss_ns;
-    slots[i].recurring_period_gnss_ns = recurring_period_gnss_ns;
-    slots[i].arm_vclock_raw = deadline;
-    slots[i].arm_delta_ticks = 0;
-    slots[i].first_expire_now = 0;
-    slots[i].first_expire_recorded = false;
 
-    if (target_dwt != 0) {
-      slots[i].predicted_dwt    = target_dwt;
-      slots[i].prediction_valid = true;
-    } else {
-      slots[i].predicted_dwt = predict_dwt_at_deadline(deadline, slots[i].prediction_valid);
-    }
-
-    smartpop_prepare_slot(slots[i]);
-
-    diag_schedule_next_calls_from_other++;
-    schedule_next();
     update_slot_high_water();
     critical_exit(saved);
     return h;
@@ -1469,67 +325,39 @@ static timepop_handle_t arm_absolute_slot_internal(
   return TIMEPOP_INVALID_HANDLE;
 }
 
-static bool vclock_edge_monitor_bootstrap(void) {
-  if (!g_vclock_edge_monitor.enabled) return false;
-  if (g_vclock_edge_monitor.armed && g_vclock_edge_monitor.handle != TIMEPOP_INVALID_HANDLE) return true;
-  if (!time_valid()) return false;
-
-  const time_anchor_snapshot_t snap = time_anchor_snapshot();
-  const int64_t latest_pps_gnss_ns = time_anchor_latest_pps_gnss_ns(snap);
-  if (latest_pps_gnss_ns < 0) return false;
-
-  int64_t target_gnss_ns = latest_pps_gnss_ns + VCLOCK_MONITOR_OFFSET_NS;
-  const int64_t now_gnss_ns = time_gnss_ns_now();
-  if (now_gnss_ns >= 0 && now_gnss_ns >= target_gnss_ns) {
-    target_gnss_ns += 1000000000LL;
-  }
-
-  const uint32_t target_dwt = time_gnss_ns_to_dwt(target_gnss_ns);
-  const timepop_handle_t h =
-      arm_absolute_slot_internal(target_gnss_ns,
-                                 true,
-                                 1000000000ULL,
-                                 vclock_monitor_callback,
-                                 nullptr,
-                                 VCLOCK_MONITOR_NAME,
-                                 true,
-                                 target_dwt);
-  if (h == TIMEPOP_INVALID_HANDLE) {
-    g_vclock_edge_monitor.arm_failures++;
-    return false;
-  }
-
-  g_vclock_edge_monitor.handle = h;
-  g_vclock_edge_monitor.armed = true;
-  g_vclock_edge_monitor.next_target_gnss_ns = target_gnss_ns;
-  g_vclock_edge_monitor.target_gnss_ns = g_vclock_edge_monitor.last_target_gnss_ns;
-  g_vclock_edge_monitor.arm_count++;
-  return true;
-}
-
-// ============================================================================
-// Arm — relative scheduling ("from now")
-// ============================================================================
-//
-// This is the ONLY arming path that reads the ambient VCLOCK counter,
-// because "from now" inherently requires knowing "now."
-
-timepop_handle_t timepop_arm(
-  uint64_t            delay_gnss_ns,
-  bool                recurring,
-  timepop_callback_t  callback,
-  void*               user_data,
-  const char*         name
-) {
+timepop_handle_t timepop_arm(uint64_t delay_gnss_ns,
+                             bool recurring,
+                             timepop_callback_t callback,
+                             void* user_data,
+                             const char* name) {
   if (!callback) return TIMEPOP_INVALID_HANDLE;
 
-  const uint32_t saved = critical_enter();
+  // Compute delay_ticks once; valid even before the bridge is up.
+  const uint32_t delay_ticks = ns_to_ticks_clamp(delay_gnss_ns);
+  const uint64_t period_ns   = recurring ? delay_gnss_ns : 0;
+  const uint32_t period_ticks = recurring ? delay_ticks : 0;
 
-  const bool retired_named = retire_existing_named_slots(name);
-  if (retired_named) {
-    diag_schedule_next_calls_from_other++;
-    schedule_next();
+  // Try the bridge-aware path first.  If it succeeds, the slot is fully
+  // anchored from boot.  If it fails (typical at boot before first PPS),
+  // fall through to the pre-bridge deferred-anchor path.
+  const int64_t now_gnss_ns = time_gnss_ns_now();
+  if (now_gnss_ns >= 0) {
+    const int64_t target_gnss_ns = now_gnss_ns + (int64_t)delay_gnss_ns;
+    return arm_absolute_internal(target_gnss_ns,
+                                 recurring,
+                                 period_ns,
+                                 callback,
+                                 user_data,
+                                 name);
   }
+
+  // Pre-bridge: arm a deferred-anchor slot.  The first TICK after boot
+  // anchors it with deadline = tick.counter32_at_edge + delay_ticks.
+  // Recurring slots keep period_ticks for post-fire rearming; they do
+  // NOT use the absolute (gnss_ns) recurring path because the bridge
+  // isn't authoritative yet.
+  const uint32_t saved = critical_enter();
+  retire_existing_named_slots(name);
 
   for (uint32_t i = 0; i < MAX_SLOTS; i++) {
     if (slots[i].active) continue;
@@ -1538,83 +366,17 @@ timepop_handle_t timepop_arm(
     if (next_handle == TIMEPOP_INVALID_HANDLE) next_handle = 1;
 
     slots[i] = {};
-    slots[i].active       = true;
-    slots[i].expired      = false;
-    slots[i].recurring    = recurring;
-    slots[i].is_absolute  = false;
-    slots[i].recurrence_mode = timepop_recurrence_mode_t::NONE;
-    slots[i].handle       = h;
-    slots[i].period_ns    = delay_gnss_ns;
-    slots[i].callback     = callback;
-    slots[i].user_data    = user_data;
-    slots[i].name         = name;
-    slots[i].fire_gnss_ns = -1;
-    slots[i].target_gnss_ns = -1;
-    slots[i].isr_callback = false;
-    slots[i].spin_dry_used = false;
-    slots[i].wake_target_dwt = 0;
-    slots[i].wake_error_cycles = 0;
-    slots[i].recurring_rearmed_count = 0;
-    slots[i].recurring_immediate_expire_count = 0;
-    slots[i].recurring_catchup_count = 0;
-    slots[i].recurring_base_gnss_ns = 0;
-    slots[i].recurring_period_gnss_ns = 0;
-    slots[i].arm_vclock_raw = 0;
-    slots[i].arm_delta_ticks = 0;
-    slots[i].first_expire_now = 0;
-    slots[i].first_expire_recorded = false;
-
-    const uint32_t ticks = ns_to_ticks(delay_gnss_ns);
-    slots[i].period_ticks = ticks;
-
-    // Relative scheduling: "from now" requires reading the counter.
-    const uint32_t now = vclock_count();
-    slots[i].deadline = now + ticks;
-    slots[i].arm_vclock_raw = now;
-    slots[i].arm_delta_ticks = ticks;
-
-    if (recurring) {
-      const time_anchor_snapshot_t snap = time_anchor_snapshot();
-      const int64_t latest_pps_gnss_ns = time_anchor_latest_pps_gnss_ns(snap);
-      const int64_t now_gnss_ns = time_gnss_ns_now();
-
-      if (latest_pps_gnss_ns >= 0 && now_gnss_ns >= 0 && delay_gnss_ns > 0) {
-        const uint64_t period_ns = delay_gnss_ns;
-        const int64_t ns_since_anchor = now_gnss_ns - latest_pps_gnss_ns;
-        uint64_t steps = 1;
-        if (ns_since_anchor >= 0) {
-          steps = (uint64_t)(ns_since_anchor / (int64_t)period_ns) + 1ULL;
-        }
-        const int64_t target_gnss_ns = latest_pps_gnss_ns + (int64_t)(steps * period_ns);
-        uint32_t deadline_abs = 0;
-        if (gnss_ns_to_vclock_deadline(target_gnss_ns, snap, deadline_abs)) {
-          slots[i].is_absolute = true;
-          slots[i].recurrence_mode = timepop_recurrence_mode_t::ABSOLUTE;
-          slots[i].recurring_base_gnss_ns = latest_pps_gnss_ns + (int64_t)period_ns;
-          slots[i].recurring_period_gnss_ns = period_ns;
-          slots[i].target_gnss_ns = target_gnss_ns;
-          slots[i].deadline = deadline_abs;
-        } else {
-          slots[i].recurrence_mode = timepop_recurrence_mode_t::RELATIVE;
-          slots[i].recurring_period_gnss_ns = delay_gnss_ns;
-        }
-      } else {
-        slots[i].recurrence_mode = timepop_recurrence_mode_t::RELATIVE;
-        slots[i].recurring_period_gnss_ns = delay_gnss_ns;
-      }
-    }
-
-    slots[i].predicted_dwt = predict_dwt_at_deadline(
-      slots[i].deadline, slots[i].prediction_valid);
-
-    if (slots[i].prediction_valid && slots[i].target_gnss_ns < 0) {
-      slots[i].target_gnss_ns = time_dwt_to_gnss_ns(slots[i].predicted_dwt);
-    }
-
-    smartpop_prepare_slot(slots[i]);
-
-    diag_schedule_next_calls_from_other++;
-    schedule_next();
+    slots[i].active         = true;
+    slots[i].pending_anchor = true;
+    slots[i].delay_ticks    = delay_ticks;
+    slots[i].recurring      = recurring;
+    slots[i].is_absolute    = false;
+    slots[i].handle         = h;
+    slots[i].period_ns      = 0;
+    slots[i].period_ticks   = period_ticks;
+    slots[i].callback       = callback;
+    slots[i].user_data      = user_data;
+    slots[i].name           = name;
 
     update_slot_high_water();
     critical_exit(saved);
@@ -1626,570 +388,252 @@ timepop_handle_t timepop_arm(
   return TIMEPOP_INVALID_HANDLE;
 }
 
-timepop_handle_t timepop_arm_asap(
-  timepop_callback_t  callback,
-  void*               user_data,
-  const char*         name
-) {
-  return arm_deferred(asap_slots,
-                      MAX_ASAP_SLOTS,
-                      diag_asap_arm_failures,
-                      diag_asap_armed,
-                      diag_asap_last_armed_dwt,
-                      diag_asap_last_armed_name,
-                      diag_asap_slots_high_water,
-                      callback,
-                      user_data,
-                      name);
+timepop_handle_t timepop_arm_at(int64_t target_gnss_ns,
+                                bool recurring,
+                                timepop_callback_t callback,
+                                void* user_data,
+                                const char* name) {
+  (void)recurring;  // absolute one-shots only via this API
+  return arm_absolute_internal(target_gnss_ns, false, 0, callback, user_data, name);
 }
 
-timepop_handle_t timepop_arm_alap(
-  timepop_callback_t  callback,
-  void*               user_data,
-  const char*         name
-) {
-  return arm_deferred(alap_slots,
-                      MAX_ALAP_SLOTS,
-                      diag_alap_arm_failures,
-                      diag_alap_armed,
-                      diag_alap_last_armed_dwt,
-                      diag_alap_last_armed_name,
-                      diag_alap_slots_high_water,
-                      callback,
-                      user_data,
-                      name);
-}
-
-// ============================================================================
-// Arm — absolute scheduling (deterministic, no ambient "now")
-// ============================================================================
-//
-// Converts the target GNSS nanosecond to a VCLOCK deadline using the time
-// anchor via pure arithmetic.  No call to vclock_count().  No call to
-// time_gnss_ns_now().  The deadline is geared from the anchor, not measured
-// from ambient time.
-
-timepop_handle_t timepop_arm_at(
-  int64_t             target_gnss_ns,
-  bool                recurring,
-  timepop_callback_t  callback,
-  void*               user_data,
-  const char*         name
-) {
-  // Public absolute timers remain one-shot unless a future API supplies an
-  // explicit absolute recurrence period.
-  (void)recurring;
-  return arm_absolute_slot_internal(target_gnss_ns,
-                                    false,
-                                    0,
-                                    callback,
-                                    user_data,
-                                    name,
-                                    false,
-                                    0);
-}
-
-// ============================================================================
-// Arm — anchor-relative GNSS scheduling
-// ============================================================================
-
-timepop_handle_t timepop_arm_from_anchor(
-  int64_t             anchor_gnss_ns,
-  int64_t             offset_gnss_ns,
-  bool                recurring,
-  timepop_callback_t  callback,
-  void*               user_data,
-  const char*         name
-) {
-  if (!callback) return TIMEPOP_INVALID_HANDLE;
+timepop_handle_t timepop_arm_from_anchor(int64_t anchor_gnss_ns,
+                                         int64_t offset_gnss_ns,
+                                         bool recurring,
+                                         timepop_callback_t callback,
+                                         void* user_data,
+                                         const char* name) {
   if (anchor_gnss_ns <= 0) return TIMEPOP_INVALID_HANDLE;
-
-  const int64_t target_gnss_ns = anchor_gnss_ns + offset_gnss_ns;
-  if (target_gnss_ns <= 0) return TIMEPOP_INVALID_HANDLE;
-  if (target_gnss_ns <= anchor_gnss_ns && offset_gnss_ns > 0) {
-    return TIMEPOP_INVALID_HANDLE;
-  }
-
-  return arm_absolute_slot_internal(target_gnss_ns,
-                                    recurring,
-                                    recurring ? 1000000000ULL : 0ULL,
-                                    callback,
-                                    user_data,
-                                    name,
-                                    false,
-                                    0);
+  const int64_t target = anchor_gnss_ns + offset_gnss_ns;
+  if (target <= 0) return TIMEPOP_INVALID_HANDLE;
+  return arm_absolute_internal(target,
+                               recurring,
+                               recurring ? GNSS_NS_PER_SECOND : 0,
+                               callback,
+                               user_data,
+                               name);
 }
 
-// ============================================================================
-// Arm — caller-owned exact target path (deterministic, no ambient "now")
-// ============================================================================
-//
-// The caller provides both the GNSS nanosecond target and the DWT prediction.
-// The VCLOCK deadline is computed from the time anchor — no ambient read.
-
-timepop_handle_t timepop_arm_ns(
-  int64_t             target_gnss_ns,
-  uint32_t            target_dwt,
-  timepop_callback_t  callback,
-  void*               user_data,
-  const char*         name,
-  bool                isr_callback
-) {
-  return arm_absolute_slot_internal(target_gnss_ns,
-                                    false,
-                                    0,
-                                    callback,
-                                    user_data,
-                                    name,
-                                    isr_callback,
-                                    target_dwt);
+timepop_handle_t timepop_arm_asap(timepop_callback_t callback,
+                                  void* user_data,
+                                  const char* name) {
+  return arm_deferred(asap_slots, MAX_ASAP_SLOTS, diag_asap_armed,
+                      callback, user_data, name);
 }
 
-// ============================================================================
-// Cancel
-// ============================================================================
+timepop_handle_t timepop_arm_alap(timepop_callback_t callback,
+                                  void* user_data,
+                                  const char* name) {
+  return arm_deferred(alap_slots, MAX_ALAP_SLOTS, diag_alap_armed,
+                      callback, user_data, name);
+}
 
 bool timepop_cancel(timepop_handle_t handle) {
   if (handle == TIMEPOP_INVALID_HANDLE) return false;
-
   const uint32_t saved = critical_enter();
+  bool found = false;
   for (uint32_t i = 0; i < MAX_SLOTS; i++) {
     if (slots[i].active && slots[i].handle == handle) {
-      slots[i].active = false;
-      diag_schedule_next_calls_from_other++;
-      schedule_next();
-      critical_exit(saved);
-      return true;
+      slots[i].active = false; slots[i].expired = false; found = true;
     }
   }
   for (uint32_t i = 0; i < MAX_ASAP_SLOTS; i++) {
     if (asap_slots[i].active && asap_slots[i].handle == handle) {
-      asap_slots[i].active = false;
-      critical_exit(saved);
-      return true;
+      asap_slots[i].active = false; found = true;
     }
   }
   for (uint32_t i = 0; i < MAX_ALAP_SLOTS; i++) {
     if (alap_slots[i].active && alap_slots[i].handle == handle) {
-      alap_slots[i].active = false;
-      critical_exit(saved);
-      return true;
+      alap_slots[i].active = false; found = true;
     }
   }
   critical_exit(saved);
-  return false;
+  return found;
 }
 
 uint32_t timepop_cancel_by_name(const char* name) {
-  if (!name) return 0;
-
-  uint32_t cancelled = 0;
+  if (!name || !*name) return 0;
   const uint32_t saved = critical_enter();
+  uint32_t n = 0;
   for (uint32_t i = 0; i < MAX_SLOTS; i++) {
     if (slots[i].active && slots[i].name && strcmp(slots[i].name, name) == 0) {
-      slots[i].active = false;
-      cancelled++;
+      slots[i].active = false; slots[i].expired = false; n++;
     }
   }
   for (uint32_t i = 0; i < MAX_ASAP_SLOTS; i++) {
     if (asap_slots[i].active && asap_slots[i].name && strcmp(asap_slots[i].name, name) == 0) {
-      asap_slots[i].active = false;
-      cancelled++;
+      asap_slots[i].active = false; n++;
     }
   }
   for (uint32_t i = 0; i < MAX_ALAP_SLOTS; i++) {
     if (alap_slots[i].active && alap_slots[i].name && strcmp(alap_slots[i].name, name) == 0) {
-      alap_slots[i].active = false;
-      cancelled++;
+      alap_slots[i].active = false; n++;
     }
   }
-  if (cancelled > 0) {
-    diag_schedule_next_calls_from_other++;
-    schedule_next();
-    timepop_pending = true;
-  }
   critical_exit(saved);
-  return cancelled;
+  return n;
+}
+
+uint32_t timepop_active_count(void) {
+  uint32_t n = 0;
+  for (uint32_t i = 0; i < MAX_SLOTS; i++) if (slots[i].active) n++;
+  return n;
 }
 
 // ============================================================================
-// Dispatch
+// Tick-driven dispatch
 // ============================================================================
+//
+// Called from the TICK subscriber (in foreground via the deferred
+// trampoline).  Drains asap, scans timed slots against the tick's
+// counter32, fires expired slots, then drains alap.
+
+static void tick_callback(const interrupt_event_t& event, void*) {
+  diag_tick_count++;
+
+  // Phase 1: ASAP
+  dispatch_deferred_phase(asap_slots, MAX_ASAP_SLOTS, diag_asap_dispatched);
+
+  // Phase 2a: anchor any pre-bridge deferred-anchor slots.  This is the
+  // first TICK they've seen, so we now know a real counter32; turn the
+  // delay_ticks into a concrete deadline.
+  const uint32_t now = event.counter32_at_edge;
+  for (uint32_t i = 0; i < MAX_SLOTS; i++) {
+    if (slots[i].active && slots[i].pending_anchor) {
+      slots[i].deadline       = now + slots[i].delay_ticks;
+      slots[i].pending_anchor = false;
+    }
+  }
+
+  // Phase 2b: timed slots — scan and fire any expired.
+  for (uint32_t i = 0; i < MAX_SLOTS; i++) {
+    if (!slots[i].active || slots[i].expired) continue;
+    if (slots[i].pending_anchor)              continue;  // can't happen but safe
+    if (!deadline_expired(slots[i].deadline, now)) continue;
+
+    // Capture the firing facts from the TICK event.
+    slots[i].fire_dwt_cyccnt = event.dwt_at_edge;
+    slots[i].fire_counter32  = now;
+    slots[i].fire_gnss_ns    = event.gnss_ns_at_edge;
+    slots[i].expired         = true;
+
+    timepop_ctx_t ctx{};
+    ctx.handle             = slots[i].handle;
+    ctx.fire_dwt_cyccnt    = slots[i].fire_dwt_cyccnt;
+    ctx.fire_counter32     = slots[i].fire_counter32;
+    ctx.fire_gnss_ns       = slots[i].fire_gnss_ns;
+    ctx.target_gnss_ns     = slots[i].target_gnss_ns;
+    ctx.fire_gnss_error_ns =
+        (slots[i].target_gnss_ns > 0)
+            ? (slots[i].fire_gnss_ns - slots[i].target_gnss_ns)
+            : 0;
+
+    slots[i].callback(&ctx, nullptr, slots[i].user_data);
+    diag_timed_fired++;
+
+    // Recurring: advance and re-arm.  One-shot: deactivate.
+    if (slots[i].recurring) {
+      if (slots[i].is_absolute && slots[i].period_ns > 0) {
+        slots[i].target_gnss_ns += (int64_t)slots[i].period_ns;
+        // Catch-up: if we fell behind, jump forward to the next future
+        // boundary.
+        const int64_t now_gnss = time_gnss_ns_now();
+        if (now_gnss > 0 && slots[i].target_gnss_ns <= now_gnss) {
+          const int64_t lag = now_gnss - slots[i].target_gnss_ns;
+          const int64_t jumps = lag / (int64_t)slots[i].period_ns + 1;
+          slots[i].target_gnss_ns += jumps * (int64_t)slots[i].period_ns;
+        }
+        uint32_t next_deadline = 0;
+        if (gnss_ns_to_counter32_deadline(slots[i].target_gnss_ns, next_deadline)) {
+          slots[i].deadline = next_deadline;
+          slots[i].expired  = false;
+        } else {
+          slots[i].active = false;
+        }
+      } else if (slots[i].period_ticks > 0) {
+        slots[i].deadline += slots[i].period_ticks;
+        if (deadline_expired(slots[i].deadline, now)) {
+          slots[i].deadline = now + slots[i].period_ticks;
+        }
+        slots[i].expired = false;
+      } else {
+        slots[i].active = false;
+      }
+    } else {
+      slots[i].active = false;
+    }
+  }
+
+  // Phase 3: ALAP
+  dispatch_deferred_phase(alap_slots, MAX_ALAP_SLOTS, diag_alap_dispatched);
+}
+
+// ============================================================================
+// loop() dispatch entrypoint
+// ============================================================================
+//
+// Some callers (process_interrupt's deferred trampoline) drive the asap
+// queue via timepop_arm_asap; foreground loop() calls timepop_dispatch()
+// to drain it.  Under the tick-driven model the timed slots are scanned
+// inside the TICK callback, but we still drain asap here so callers that
+// arm asap from a non-TICK-event ISR get prompt service in foreground.
 
 void timepop_dispatch(void) {
   if (!timepop_pending) return;
   timepop_pending = false;
   diag_dispatch_calls++;
 
-  if (g_vclock_edge_monitor.enabled && !g_vclock_edge_monitor.armed) {
-    const uint32_t saved = critical_enter();
-    (void)vclock_edge_monitor_bootstrap();
-    critical_exit(saved);
-  }
-
-  dispatch_deferred_phase(asap_slots,
-                          MAX_ASAP_SLOTS,
-                          diag_asap_dispatched,
-                          diag_asap_last_dispatch_dwt);
-
-  const uint32_t dispatch_now = vclock_count();
-  (void)dispatch_now;
-
-  for (uint32_t i = 0; i < MAX_SLOTS; i++) {
-    if (!slots[i].active || !slots[i].expired) continue;
-    slots[i].expired = false;
-
-    const bool callback_already_ran = slots[i].isr_callback_fired;
-    slots[i].isr_callback_fired = false;
-
-    if (!callback_already_ran) {
-      // ── Timed scheduled-context callback ──
-      timepop_ctx_t ctx;
-      slot_build_ctx(slots[i], ctx);
-
-      timepop_diag_t diag;
-      slot_build_diag(slots[i], 0, diag);
-
-      uint32_t start = ARM_DWT_CYCCNT;
-      slots[i].callback(&ctx, &diag, slots[i].user_data);
-      uint32_t end   = ARM_DWT_CYCCNT;
-
-      cpu_usage_account_busy(end - start);
-      diag_dispatch_callbacks++;
-    }
-
-    // ── Recurring rearm ──
-    if (slots[i].recurring) {
-      if (slots[i].recurrence_mode == timepop_recurrence_mode_t::ABSOLUTE &&
-          slots[i].recurring_period_gnss_ns > 0 &&
-          slots[i].target_gnss_ns > 0) {
-        int64_t next_target_gnss_ns = slots[i].target_gnss_ns + (int64_t)slots[i].recurring_period_gnss_ns;
-        const int64_t now_gnss_ns = time_gnss_ns_now();
-        if (now_gnss_ns >= 0 && next_target_gnss_ns <= now_gnss_ns) {
-          const uint64_t missed =
-              (uint64_t)((now_gnss_ns - next_target_gnss_ns) / (int64_t)slots[i].recurring_period_gnss_ns) + 1ULL;
-          next_target_gnss_ns += (int64_t)(missed * slots[i].recurring_period_gnss_ns);
-          slots[i].recurring_immediate_expire_count++;
-          slots[i].recurring_catchup_count += (uint32_t)missed;
-        }
-
-        const time_anchor_snapshot_t snap = time_anchor_snapshot();
-        uint32_t next_deadline = 0;
-        if (!gnss_ns_to_vclock_deadline(next_target_gnss_ns, snap, next_deadline)) {
-          slots[i].active = false;
-        } else {
-          slots[i].target_gnss_ns = next_target_gnss_ns;
-          slots[i].deadline = next_deadline;
-          slots[i].recurring_rearmed_count++;
-          slots[i].predicted_dwt = predict_dwt_at_deadline(
-            slots[i].deadline, slots[i].prediction_valid);
-          smartpop_prepare_slot(slots[i]);
-          slots[i].expired = false;
-          if (slots[i].name && strcmp(slots[i].name, VCLOCK_MONITOR_NAME) == 0) {
-            g_vclock_edge_monitor.armed = true;
-            g_vclock_edge_monitor.handle = slots[i].handle;
-            g_vclock_edge_monitor.next_target_gnss_ns = slots[i].target_gnss_ns;
-            g_vclock_edge_monitor.target_gnss_ns = g_vclock_edge_monitor.last_target_gnss_ns;
-          }
-          const uint32_t saved = critical_enter();
-          schedule_next();
-          critical_exit(saved);
-        }
-      } else if (slots[i].period_ticks == 0) {
-        slots[i].active = false;
-      } else {
-        // Relative recurring: advance deadline by one period.
-        slots[i].deadline += slots[i].period_ticks;
-        slots[i].recurring_rearmed_count++;
-
-        // Catch-up: if we fell behind, skip forward.
-        uint32_t now = vclock_count();
-        if (deadline_expired(slots[i].deadline, now)) {
-          slots[i].recurring_immediate_expire_count++;
-          slots[i].deadline = now + slots[i].period_ticks;
-          slots[i].recurring_catchup_count++;
-        }
-
-        slots[i].predicted_dwt = predict_dwt_at_deadline(
-          slots[i].deadline, slots[i].prediction_valid);
-
-        if (slots[i].prediction_valid) {
-          slots[i].target_gnss_ns = time_dwt_to_gnss_ns(slots[i].predicted_dwt);
-        }
-
-        smartpop_prepare_slot(slots[i]);
-
-        slots[i].expired = false;
-        const uint32_t saved = critical_enter();
-        schedule_next();
-        critical_exit(saved);
-      }
-    } else {
-      slots[i].active = false;
-      if (slots[i].name && strcmp(slots[i].name, VCLOCK_MONITOR_NAME) == 0) {
-        g_vclock_edge_monitor.armed = false;
-        g_vclock_edge_monitor.handle = TIMEPOP_INVALID_HANDLE;
-        g_vclock_edge_monitor.next_target_gnss_ns = -1;
-      }
-    }
-  }
-
-  dispatch_deferred_phase(alap_slots,
-                          MAX_ALAP_SLOTS,
-                          diag_alap_dispatched,
-                          diag_alap_last_dispatch_dwt);
-
-  bool more_pending = false;
-  for (uint32_t i = 0; i < MAX_ASAP_SLOTS; i++) {
-    if (asap_slots[i].active) { more_pending = true; break; }
-  }
-  if (!more_pending) {
-    for (uint32_t i = 0; i < MAX_ALAP_SLOTS; i++) {
-      if (alap_slots[i].active) { more_pending = true; break; }
-    }
-  }
-  if (more_pending) {
-    timepop_pending = true;
-  }
-}
-// ============================================================================
-// Introspection
-// ============================================================================
-
-uint32_t timepop_active_count(void) {
-  uint32_t n = 0;
-  for (uint32_t i = 0; i < MAX_SLOTS; i++) {
-    if (slots[i].active) n++;
-  }
-  for (uint32_t i = 0; i < MAX_ASAP_SLOTS; i++) {
-    if (asap_slots[i].active) n++;
-  }
-  for (uint32_t i = 0; i < MAX_ALAP_SLOTS; i++) {
-    if (alap_slots[i].active) n++;
-  }
-  return n;
+  dispatch_deferred_phase(asap_slots, MAX_ASAP_SLOTS, diag_asap_dispatched);
+  dispatch_deferred_phase(alap_slots, MAX_ALAP_SLOTS, diag_alap_dispatched);
 }
 
 // ============================================================================
-// REPORT
+// Init
+// ============================================================================
+
+void timepop_bootstrap(void) {
+  // No hardware to bootstrap; process_interrupt owns all QTimer1 setup.
+}
+
+void timepop_init(void) {
+  for (uint32_t i = 0; i < MAX_SLOTS; i++) slots[i] = {};
+  for (uint32_t i = 0; i < MAX_ASAP_SLOTS; i++) asap_slots[i] = {};
+  for (uint32_t i = 0; i < MAX_ALAP_SLOTS; i++) alap_slots[i] = {};
+  next_handle = 1;
+  timepop_pending = false;
+
+  // Subscribe to TICK.  Process_interrupt will dispatch tick_callback in
+  // foreground via the deferred trampoline.
+  interrupt_subscription_t tick_sub{};
+  tick_sub.kind     = interrupt_subscriber_kind_t::TICK;
+  tick_sub.on_event = tick_callback;
+  interrupt_subscribe(tick_sub);
+  interrupt_start(interrupt_subscriber_kind_t::TICK);
+}
+
+// ============================================================================
+// REPORT command
 // ============================================================================
 
 static Payload cmd_report(const Payload&) {
-  Payload out;
-
-  out.add("isr_fires",         isr_fire_count);
-  out.add("isr_count",         diag_isr_count);
-  out.add("isr_callbacks",     diag_isr_callbacks);
-  out.add("phantom_count",     phantom_count);
-  out.add("rearm_count",       diag_rearm_count);
-  out.add("heartbeat_rearms",  diag_heartbeat_rearms);
-  out.add("race_recoveries",   diag_race_recoveries);
-  out.add("expired",           expired_count);
-  out.add("vclock_raw_now",    vclock_count());
-  out.add("time_valid",        time_valid());
-  out.add("time_pps_count",    time_pps_count());
-
-  // ── DWT-domain dispatch validation ──
-  out.add("dispatch_gnss_tolerance_ns",         (int64_t)TIMEPOP_DISPATCH_GNSS_TOLERANCE_NS);
-  out.add("dispatch_gnss_checks",               diag_dispatch_gnss_checks);
-  out.add("dispatch_gnss_mismatches",           diag_dispatch_gnss_mismatches);
-  out.add("dispatch_gnss_skipped_no_target",    diag_dispatch_gnss_skipped_no_target);
-  out.add("dispatch_gnss_skipped_invalid_time", diag_dispatch_gnss_skipped_invalid_time);
-  out.add("dispatch_gnss_skipped_unmonitored", diag_dispatch_gnss_skipped_unmonitored);
-  out.add("dispatch_gnss_last_target_ns",       diag_dispatch_gnss_last_target_ns);
-  out.add("dispatch_gnss_last_actual_ns",       diag_dispatch_gnss_last_actual_ns);
-  out.add("dispatch_gnss_last_error_ns",        diag_dispatch_gnss_last_error_ns);
-  out.add("dispatch_gnss_max_abs_error_ns",     diag_dispatch_gnss_max_abs_error_ns);
-
-  out.add("smartpop_early_wake_ns",             (uint64_t)SMARTPOP_EARLY_WAKE_NS);
-  out.add("smartpop_spin_max_cycles",           (uint32_t)SMARTPOP_SPIN_MAX_CYCLES);
-  out.add("smartpop_min_margin_cycles",         (uint32_t)SMARTPOP_MIN_MARGIN_CYCLES);
-  out.add("smartpop_checks",                    diag_smartpop_checks);
-  out.add("smartpop_armed",                     diag_smartpop_armed);
-  out.add("smartpop_fallback_no_prediction",    diag_smartpop_fallback_no_prediction);
-  out.add("smartpop_fallback_late_arm",         diag_smartpop_fallback_late_arm);
-  out.add("smartpop_woke_early",                diag_smartpop_woke_early);
-  out.add("smartpop_woke_late",                 diag_smartpop_woke_late);
-  out.add("smartpop_spin_attempts",             diag_smartpop_spin_attempts);
-  out.add("smartpop_spin_success",              diag_smartpop_spin_success);
-  out.add("smartpop_spin_timeouts",             diag_smartpop_spin_timeouts);
-  out.add("smartpop_last_target_dwt",           diag_smartpop_last_target_dwt);
-  out.add("smartpop_last_entry_dwt",            diag_smartpop_last_entry_dwt);
-  out.add("smartpop_last_land_dwt",             diag_smartpop_last_land_dwt);
-  out.add("smartpop_last_cycles_early",         diag_smartpop_last_cycles_early);
-  out.add("smartpop_last_spin_cycles",          diag_smartpop_last_spin_cycles);
-  out.add("smartpop_max_spin_cycles",           diag_smartpop_max_spin_cycles);
-  out.add("smartpop_max_cycles_early",          diag_smartpop_max_cycles_early);
-
-  out.add("smartpop_pps_checks",                    diag_smartpop_pps_checks);
-  out.add("smartpop_ocxo1_checks",                  diag_smartpop_ocxo1_checks);
-  out.add("smartpop_ocxo2_checks",                  diag_smartpop_ocxo2_checks);
-  out.add("smartpop_pps_spin_success",              diag_smartpop_pps_spin_success);
-  out.add("smartpop_ocxo1_spin_success",            diag_smartpop_ocxo1_spin_success);
-  out.add("smartpop_ocxo2_spin_success",            diag_smartpop_ocxo2_spin_success);
-  out.add("smartpop_pps_spin_timeouts",             diag_smartpop_pps_spin_timeouts);
-  out.add("smartpop_ocxo1_spin_timeouts",           diag_smartpop_ocxo1_spin_timeouts);
-  out.add("smartpop_ocxo2_spin_timeouts",           diag_smartpop_ocxo2_spin_timeouts);
-  out.add("smartpop_pps_fallback_no_prediction",    diag_smartpop_pps_fallback_no_prediction);
-  out.add("smartpop_ocxo1_fallback_no_prediction",  diag_smartpop_ocxo1_fallback_no_prediction);
-  out.add("smartpop_ocxo2_fallback_no_prediction",  diag_smartpop_ocxo2_fallback_no_prediction);
-  out.add("smartpop_pps_fallback_late_arm",         diag_smartpop_pps_fallback_late_arm);
-  out.add("smartpop_ocxo1_fallback_late_arm",       diag_smartpop_ocxo1_fallback_late_arm);
-  out.add("smartpop_ocxo2_fallback_late_arm",       diag_smartpop_ocxo2_fallback_late_arm);
-  out.add("dispatch_gnss_worst_target_ns",          diag_dispatch_gnss_worst_target_ns);
-  out.add("dispatch_gnss_worst_actual_ns",          diag_dispatch_gnss_worst_actual_ns);
-  out.add("dispatch_gnss_worst_error_ns",           diag_dispatch_gnss_worst_error_ns);
-  out.add("dispatch_gnss_worst_handle",             diag_dispatch_gnss_worst_handle);
-  out.add("dispatch_gnss_worst_prediction_valid",   diag_dispatch_gnss_worst_prediction_valid);
-  out.add("dispatch_gnss_worst_smartpop_enabled",   diag_dispatch_gnss_worst_smartpop_enabled);
-  out.add("dispatch_gnss_worst_name",               (const char*)(diag_dispatch_gnss_worst_name ? diag_dispatch_gnss_worst_name : ""));
-
-
-  out.add("slots_active_now",    timepop_active_count());
-  out.add("slots_high_water",     diag_slots_high_water);
-  out.add("slots_max",            (uint32_t)MAX_SLOTS);
-  out.add("asap_slots_high_water", diag_asap_slots_high_water);
-  out.add("asap_slots_max",       (uint32_t)MAX_ASAP_SLOTS);
-  out.add("alap_slots_high_water", diag_alap_slots_high_water);
-  out.add("alap_slots_max",       (uint32_t)MAX_ALAP_SLOTS);
-  out.add("arm_failures",         diag_arm_failures);
-  out.add("named_replacements",   diag_named_replacements);
-  out.add("named_replacements_pps_prespin", diag_named_replacements_pps_prespin);
-  out.add("named_replacements_ocxo1_prespin", diag_named_replacements_ocxo1_prespin);
-  out.add("named_replacements_ocxo2_prespin", diag_named_replacements_ocxo2_prespin);
-  out.add("named_replacements_pps_dispatch", diag_named_replacements_pps_dispatch);
-  out.add("named_replacements_ocxo1_dispatch", diag_named_replacements_ocxo1_dispatch);
-  out.add("named_replacements_ocxo2_dispatch", diag_named_replacements_ocxo2_dispatch);
-
-  out.add("deadline_negative_offset", diag_deadline_negative_offset);
-  out.add("deadline_last_target_gnss_ns", diag_deadline_last_target_gnss_ns);
-  out.add("deadline_last_anchor_pps_gnss_ns", diag_deadline_last_anchor_pps_gnss_ns);
-  out.add("deadline_last_ns_from_anchor", diag_deadline_last_ns_from_anchor);
-
-  out.add("asap_armed",             diag_asap_armed);
-  out.add("asap_dispatched",        diag_asap_dispatched);
-  out.add("asap_arm_failures",      diag_asap_arm_failures);
-  out.add("asap_last_armed_dwt",    diag_asap_last_armed_dwt);
-  out.add("asap_last_dispatch_dwt", diag_asap_last_dispatch_dwt);
-  out.add("asap_last_armed_name", (const char*)(diag_asap_last_armed_name ?
-    diag_asap_last_armed_name : ""));
-  out.add("alap_armed",             diag_alap_armed);
-  out.add("alap_dispatched",        diag_alap_dispatched);
-  out.add("alap_arm_failures",      diag_alap_arm_failures);
-  out.add("alap_last_armed_dwt",    diag_alap_last_armed_dwt);
-  out.add("alap_last_dispatch_dwt", diag_alap_last_dispatch_dwt);
-  out.add("alap_last_armed_name", (const char*)(diag_alap_last_armed_name ?
-    diag_alap_last_armed_name : ""));
-
-  out.add("dispatch_calls",     diag_dispatch_calls);
-  out.add("dispatch_callbacks", diag_dispatch_callbacks);
-
-  out.add("schedule_next_calls_total",         diag_schedule_next_calls_total);
-  out.add("schedule_next_calls_from_dispatch", diag_schedule_next_calls_from_dispatch);
-  out.add("schedule_next_calls_from_other",    diag_schedule_next_calls_from_other);
-
-  out.add("qread_total",                  diag_qread_total);
-  out.add("qread_same_hi",                diag_qread_same_hi);
-  out.add("qread_retry_hi_changed",       diag_qread_retry_hi_changed);
-  out.add("qread_monotonic_backsteps",    diag_qread_monotonic_backsteps);
-  out.add("qread_large_forward_jumps",    diag_qread_large_forward_jumps);
-  out.add("qread_last_lo1",               (uint32_t)diag_qread_last_lo1);
-  out.add("qread_last_hi1",               (uint32_t)diag_qread_last_hi1);
-  out.add("qread_last_lo2",               (uint32_t)diag_qread_last_lo2);
-  out.add("qread_last_hi2",               (uint32_t)diag_qread_last_hi2);
-  out.add("qread_last_value",             diag_qread_last_value);
-
-  out.add("qtmr1_ch2_cntr",   (uint32_t)IMXRT_TMR1.CH[2].CNTR);
-  out.add("qtmr1_ch2_comp1",  (uint32_t)IMXRT_TMR1.CH[2].COMP1);
-  out.add("qtmr1_ch2_csctrl", (uint32_t)IMXRT_TMR1.CH[2].CSCTRL);
-
-vclock_edge_monitor_refresh_correlation();
-out.add("vclock_edge_monitor_enabled", g_vclock_edge_monitor.enabled);
-out.add("vclock_edge_monitor_armed", g_vclock_edge_monitor.armed);
-out.add("vclock_edge_monitor_arm_count", g_vclock_edge_monitor.arm_count);
-out.add("vclock_edge_monitor_arm_failures", g_vclock_edge_monitor.arm_failures);
-out.add("vclock_edge_monitor_skipped_invalid_anchor", g_vclock_edge_monitor.skipped_invalid_anchor);
-out.add("vclock_edge_monitor_captures", g_vclock_edge_monitor.captures);
-out.add("vclock_edge_monitor_last_correlation_valid", g_vclock_edge_monitor.last_correlation_valid);
-
-out.add("vclock_edge_monitor_last_pps_gnss_ns", g_vclock_edge_monitor.last_pps_gnss_ns);
-out.add("vclock_edge_monitor_last_target_gnss_ns", g_vclock_edge_monitor.last_target_gnss_ns);
-out.add("vclock_edge_monitor_next_target_gnss_ns", g_vclock_edge_monitor.next_target_gnss_ns);
-out.add("vclock_edge_monitor_target_gnss_ns", g_vclock_edge_monitor.last_target_gnss_ns);
-
-out.add("vclock_edge_monitor_last_fire_gnss_ns", g_vclock_edge_monitor.last_fire_gnss_ns);
-out.add("vclock_edge_monitor_last_isr_entry_gnss_ns", g_vclock_edge_monitor.last_isr_entry_gnss_ns);
-out.add("vclock_edge_monitor_last_isr_entry_minus_target_ns", g_vclock_edge_monitor.last_isr_entry_minus_target_ns);
-out.add("vclock_edge_monitor_last_dwt_at_edge_gnss_ns", g_vclock_edge_monitor.last_dwt_at_edge_gnss_ns);
-out.add("vclock_edge_monitor_last_dwt_at_edge_minus_target_ns", g_vclock_edge_monitor.last_dwt_at_edge_minus_target_ns);
-out.add("vclock_edge_monitor_last_ch0_ch1_gnss_ns", g_vclock_edge_monitor.last_ch0_ch1_gnss_ns);
-out.add("vclock_edge_monitor_last_ch0_ch1_minus_target_ns", g_vclock_edge_monitor.last_ch0_ch1_minus_target_ns);
-
-out.add("vclock_edge_monitor_last_fire_vclock_raw", g_vclock_edge_monitor.last_fire_vclock_raw);
-out.add("vclock_edge_monitor_last_dwt_isr_entry_raw", g_vclock_edge_monitor.last_dwt_isr_entry_raw);
-out.add("vclock_edge_monitor_last_dwt_at_edge", g_vclock_edge_monitor.last_dwt_at_edge);
-out.add("vclock_edge_monitor_last_ch0_ch1_vclock_raw", g_vclock_edge_monitor.last_ch0_ch1_vclock_raw);
-out.add("vclock_edge_monitor_last_pps_dwt_at_edge", g_vclock_edge_monitor.last_pps_dwt_at_edge);
-out.add("vclock_edge_monitor_last_vclock_minus_pps_cycles", g_vclock_edge_monitor.last_vclock_minus_pps_cycles);
-out.add("vclock_edge_monitor_last_vclock_minus_pps_ns", g_vclock_edge_monitor.last_vclock_minus_pps_ns);
-out.add("vclock_edge_monitor_expected_offset_cycles", g_vclock_edge_monitor.last_expected_offset_cycles);
-out.add("vclock_edge_monitor_expected_offset_ns", g_vclock_edge_monitor.last_expected_offset_ns);
-out.add("vclock_edge_monitor_error_cycles", g_vclock_edge_monitor.last_vclock_minus_pps_error_cycles);
-out.add("vclock_edge_monitor_error_ns", g_vclock_edge_monitor.last_vclock_minus_pps_error_ns);
-
-  PayloadArray timers;
-  for (uint32_t i = 0; i < MAX_SLOTS; i++) {
-    if (!slots[i].active) continue;
-
-    Payload entry;
-    entry.add("slot",      i);
-    entry.add("handle",    slots[i].handle);
-    entry.add("name",      slots[i].name ? slots[i].name : "");
-    entry.add("period_ns", slots[i].period_ns);
-    entry.add("ticks",     slots[i].period_ticks);
-    entry.add("deadline",  slots[i].deadline);
-    entry.add("target_deadline",  slots[i].target_deadline);
-    entry.add("smartpop_enabled", slots[i].smartpop_enabled);
-    entry.add("smartpop_early_ticks", slots[i].smartpop_early_ticks);
-    entry.add("recurring", slots[i].recurring);
-    entry.add("expired",   slots[i].expired);
-    entry.add("isr_cb",    slots[i].isr_callback);
-
-    entry.add("is_absolute",      slots[i].is_absolute);
-    entry.add("target_gnss_ns",   slots[i].target_gnss_ns);
-    entry.add("predicted_dwt",    slots[i].predicted_dwt);
-    entry.add("prediction_valid", slots[i].prediction_valid);
-    entry.add("fire_capture_source",
-              fire_capture_source_str(slots[i].fire_capture_source));
-    entry.add("fire_gnss_ns",      slots[i].fire_gnss_ns);
-    entry.add("fire_dwt_cyccnt",   slots[i].fire_dwt_cyccnt);
-    entry.add("fire_vclock_raw",   slots[i].fire_vclock_raw);
-
-    entry.add("recurring_rearmed_count",          slots[i].recurring_rearmed_count);
-    entry.add("recurring_immediate_expire_count", slots[i].recurring_immediate_expire_count);
-    entry.add("recurring_catchup_count",          slots[i].recurring_catchup_count);
-
-    timers.add(entry);
-  }
-  out.add_array("timers", timers);
-
-  return out;
+  Payload p;
+  p.add("active_count",        timepop_active_count());
+  p.add("slots_high_water",    diag_slots_high_water);
+  p.add("tick_count",          diag_tick_count);
+  p.add("timed_fired",         diag_timed_fired);
+  p.add("asap_armed",          diag_asap_armed);
+  p.add("asap_dispatched",     diag_asap_dispatched);
+  p.add("alap_armed",          diag_alap_armed);
+  p.add("alap_dispatched",     diag_alap_dispatched);
+  p.add("named_replacements",  diag_named_replacements);
+  p.add("arm_failures",        diag_arm_failures);
+  p.add("dispatch_calls",      diag_dispatch_calls);
+  return p;
 }
 
-// ============================================================================
-// QTimer1 vector ownership moved to process_interrupt
-// ============================================================================
-//
-// process_interrupt now owns IRQ_QTIMER1 and dispatches both CH2 (this
-// file's timepop_qtimer1_ch2_handler, registered via
-// interrupt_register_qtimer1_ch2_handler at init) and CH3 (its own
-// internal vclock_cadence_isr).  TimePop is the CH2 hosted client;
-// the previous CH3 hosted-client registration mechanism (where TimePop
-// hosted process_interrupt's CH3 handler) has been retired.
-
 static const process_command_entry_t TIMEPOP_COMMANDS[] = {
-  { "REPORT",                 cmd_report                 },
-  { nullptr,                  nullptr                    }
+  { "REPORT", cmd_report },
+  { nullptr,  nullptr    },
 };
 
 static const process_vtable_t TIMEPOP_PROCESS = {

@@ -345,3 +345,6 @@ static constexpr uint32_t QTIMER_ISR_ENTRY_OVERHEAD = 16;
 // if the GF-8802 wiring, pin routing, ISR paths, QTimer setup, optimization
 // level, or latency correction model changes.
 static constexpr int32_t CANONICAL_VCLOCK_EPOCH_MINUS_RAW_PPS_ISR_CYCLES = 34;
+
+// Adjustment for QTimer
+static constexpr int32_t QTIMER_COUNTER32_TICKS_LATE_AT_READ = 0;

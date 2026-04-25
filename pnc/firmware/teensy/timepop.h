@@ -7,96 +7,51 @@
 // timepop.h — Public Interface
 // ============================================================================
 //
-// TimePop is ZPNet's phase-locked timer subsystem.
+// TimePop is ZPNet's GNSS-nanosecond scheduler.  It is foreground-driven
+// from process_interrupt's TICK subscription (every cadence, ~1 ms).
+// On every TICK, TimePop scans its slot list and fires any expired
+// callbacks in foreground context.
 //
-// Core model:
-//   • QTimer1 CH0+CH1 form a passive 32-bit VCLOCK counter at 10 MHz.
-//   • One VCLOCK tick = 100 ns.
-//   • QTimer1 CH2 is the dynamic compare scheduler.
-//   • All public timing semantics are expressed in GNSS nanoseconds.
+// Resolution is 1 ms — scheduling honor is "fire at or after the
+// requested deadline, on the next TICK boundary."  Callers requesting
+// sub-ms scheduling will get up to 1 ms of late-fire jitter.  This is
+// adequate for all current ZPNet consumers.  A future scheduled-fire
+// extension may reintroduce sub-ms precision via process_interrupt.
 //
 // Scheduling modes:
+//   timepop_arm(delay_gnss_ns, ...)            — relative ("from now")
+//   timepop_arm_at(target_gnss_ns, ...)         — absolute GNSS ns
+//   timepop_arm_from_anchor(anchor, offset, ...) — anchor-relative
+//   timepop_arm_asap(...)                       — fire on next dispatch
+//   timepop_arm_alap(...)                       — fire after asap phase
 //
-//   1. Relative scheduling
-//        timepop_arm(delay_gnss_ns, ...)
-//
-//      Use this when the caller only cares about "fire after this delay."
-//      If recurring=true, TimePop will phase-lock the recurrence to the
-//      current lawful GNSS/VCLOCK anchor when one is available.
-//
-//   2. Scheduled-context ASAP dispatch
-//        timepop_arm_asap(...)
-//
-//   3. Scheduled-context ALAP dispatch
-//        timepop_arm_alap(...)
-//
-//   4. Absolute GNSS scheduling
-//        timepop_arm_at(target_gnss_ns, ...)
-//
-//   5. Anchor-relative GNSS scheduling
-//        timepop_arm_from_anchor(anchor_gnss_ns, offset_gnss_ns, ...)
-//
-//   6. Caller-owned exact target scheduling
-//        timepop_arm_ns(target_gnss_ns, target_dwt, ...)
-//
-// TimePop owns:
-//   • timed slot scheduling
-//   • deferred ASAP/ALAP scheduled-context dispatch
-//   • next-deadline selection
-//   • CH2 compare arming
-//   • absolute recurring timer series
-//   • Spin-Dry early-wake + deterministic landing for VCLOCK scheduling
-//   • timer diagnostics
-//   • always-on internal VCLOCK monitor
-//
+// All "now" semantics use time_gnss_ns_now() — the gear-locked answer
+// derived from alpha's slot.  No counter peeks.  No live reads.
 // ============================================================================
 
 typedef uint32_t timepop_handle_t;
 static constexpr timepop_handle_t TIMEPOP_INVALID_HANDLE = 0;
 
 // ============================================================================
-// Callback context — authoritative fire facts
+// Callback context
 // ============================================================================
 
 typedef struct timepop_ctx_t {
   timepop_handle_t handle;
-  uint32_t fire_vclock_raw;
-  uint32_t fire_dwt_cyccnt;
-  uint32_t deadline;
-  int32_t  fire_gnss_error_ns;
-  int64_t  fire_gnss_ns;
+  uint32_t fire_dwt_cyccnt;       // event-coordinate DWT at the firing TICK
+  uint32_t fire_counter32;        // synthetic VCLOCK counter at the firing TICK
+  int64_t  fire_gnss_ns;          // GNSS ns at the firing TICK
+  int64_t  target_gnss_ns;        // requested deadline (absolute paths)
+  int64_t  fire_gnss_error_ns;    // fire_gnss_ns − target_gnss_ns
 } timepop_ctx_t;
 
 // ============================================================================
-// Optional diagnostics
+// Optional diagnostics (unused under tick-driven model — preserved for
+// callers that pass a nullptr-tolerant pointer)
 // ============================================================================
-//
-// Populated for timed callbacks and ISR callbacks.
-// Null for ASAP/ALAP scheduled-context dispatch.
-//
-// The authoritative result is still timepop_ctx_t. These diagnostics expose
-// Spin-Dry / landing facts that are useful for instrumentation and later
-// TIMEBASE_FRAGMENT analysis.
-//
 
 typedef struct timepop_diag_t {
-  uint32_t dwt_at_isr_entry;
-  uint32_t dwt_at_fire;
-
-  uint32_t predicted_dwt;
-  bool     prediction_valid;
-
-  bool     spin_dry_used;
-  uint32_t wake_target_dwt;
-  int32_t  wake_error_cycles;
-
-  int32_t  spin_error_cycles;
-
-  uint32_t anchor_pps_count;
-  uint32_t anchor_qtimer_at_pps;
-  uint32_t anchor_dwt_at_pps;
-  uint32_t anchor_dwt_cycles_per_s;
-  bool     anchor_valid;
+  uint32_t reserved;
 } timepop_diag_t;
 
 typedef void (*timepop_callback_t)(
@@ -140,15 +95,6 @@ timepop_handle_t timepop_arm_from_anchor(
   timepop_callback_t  callback,
   void*               user_data,
   const char*         name
-);
-
-timepop_handle_t timepop_arm_ns(
-  int64_t             target_gnss_ns,
-  uint32_t            target_dwt,
-  timepop_callback_t  callback,
-  void*               user_data,
-  const char*         name,
-  bool                isr_callback = false
 );
 
 bool timepop_cancel(timepop_handle_t handle);
