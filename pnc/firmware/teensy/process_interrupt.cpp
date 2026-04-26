@@ -21,7 +21,8 @@
 //   events.  They are not read from foreground and have no accessors.
 //
 // Lanes:
-//   PPS_VCLOCK     : GPIO edge.  Sovereign PPS anchor event.
+//   PPS_VCLOCK     : Canonical VCLOCK-selected PPS epoch.  The physical
+//                    PPS GPIO edge is a witness/selector.
 //   VCLOCK         : QTimer1 CH3 cadence.  Advances g_vclock_count32 by
 //                    VCLOCK_INTERVAL_COUNTS per cadence tick; emits TICK
 //                    every cadence and VCLOCK every 1000 cadences.
@@ -324,6 +325,46 @@ static volatile bool g_pps_rebootstrap_pending = false;
 
 void interrupt_request_pps_rebootstrap(void) { g_pps_rebootstrap_pending = true; }
 bool interrupt_pps_rebootstrap_pending(void) { return g_pps_rebootstrap_pending; }
+
+// ============================================================================
+// PPS -> canonical VCLOCK epoch calibration witness
+// ============================================================================
+//
+// PPS GPIO is treated as a physical witness/selector.  The canonical
+// PPS_VCLOCK epoch published to Alpha is not the raw GPIO ISR entry time;
+// it is the empirically selected VCLOCK-domain epoch:
+//
+//   canonical_vclock_epoch_dwt = raw_pps_isr_entry_dwt
+//                              + CANONICAL_VCLOCK_EPOCH_MINUS_RAW_PPS_ISR_CYCLES
+//
+// The fields below continuously re-measure that offset as implemented in
+// this firmware path and expose it in REPORT.  This is a calibration
+// witness: it verifies that the code path is applying the configured
+// offset every PPS and makes future changes immediately visible.
+
+static volatile uint32_t g_pps_raw_isr_entry_dwt_last = 0;
+static volatile uint32_t g_pps_canonical_epoch_dwt_last = 0;
+static volatile int32_t  g_pps_canonical_offset_cycles_last = 0;
+static volatile int32_t  g_pps_canonical_offset_cycles_min = 2147483647;
+static volatile int32_t  g_pps_canonical_offset_cycles_max = -2147483647;
+static volatile uint32_t g_pps_canonical_offset_samples = 0;
+static volatile uint32_t g_pps_canonical_offset_mismatches = 0;
+
+static inline void note_pps_canonical_epoch_calibration(uint32_t raw_pps_isr_entry_dwt,
+                                                        uint32_t canonical_epoch_dwt) {
+  const int32_t observed = (int32_t)(canonical_epoch_dwt - raw_pps_isr_entry_dwt);
+
+  g_pps_raw_isr_entry_dwt_last = raw_pps_isr_entry_dwt;
+  g_pps_canonical_epoch_dwt_last = canonical_epoch_dwt;
+  g_pps_canonical_offset_cycles_last = observed;
+  if (observed < g_pps_canonical_offset_cycles_min) g_pps_canonical_offset_cycles_min = observed;
+  if (observed > g_pps_canonical_offset_cycles_max) g_pps_canonical_offset_cycles_max = observed;
+  g_pps_canonical_offset_samples++;
+
+  if (observed != (int32_t)CANONICAL_VCLOCK_EPOCH_MINUS_RAW_PPS_ISR_CYCLES) {
+    g_pps_canonical_offset_mismatches++;
+  }
+}
 
 // ============================================================================
 // Schedule-fire (CH2) - TimePop precision / SpinDry actuator
@@ -655,20 +696,32 @@ static void qtimer1_isr(void) {
 }
 
 // ============================================================================
-// PPS GPIO ISR — VCLOCK epoch authority
+// PPS GPIO ISR — physical PPS witness, canonical VCLOCK epoch publisher
 // ============================================================================
 //
-// Captures _raw, computes PPS_VCLOCK event-coordinate DWT, advances the
-// PPS_VCLOCK sequence, dispatches.  On rebootstrap, phase-locks CH3 to the
-// PPS moment and zeroes the sequence (so gnss_ns restarts at 0).
+// The physical PPS edge is not published as the sacred TIMEBASE anchor.
+// Instead, PPS selects the canonical VCLOCK-domain epoch.  Empirically,
+// raw_cycles.py established:
 //
-// counter32_at_edge is the synthetic VCLOCK counter at the moment of the
-// PPS GPIO ISR, snapped to the most recent cadence-tick advance (≤ 1 ms
-// stale).  This is the same coordinate system as the cadence ISR's
-// counter32 — uniform tick-axis truth, never reading hardware.
+//   canonical_vclock_epoch_dwt - raw_pps_isr_entry_dwt
+//     == CANONICAL_VCLOCK_EPOCH_MINUS_RAW_PPS_ISR_CYCLES
+//
+// This ISR captures raw PPS ISR-entry DWT, converts it to the canonical
+// VCLOCK-selected epoch DWT using that calibrated offset, records the
+// offset as a continuous witness, and dispatches PPS_VCLOCK with the
+// canonical DWT.
+//
+// The subscription name PPS_VCLOCK is retained for compatibility, but its
+// semantic meaning is: "the canonical VCLOCK-selected PPS epoch is now
+// available."  PPS itself is a witness/selector, not the final DWT fact.
+//
+// counter32_at_edge remains the event-ledger VCLOCK coordinate associated
+// with this epoch.  It is an authored ledger coordinate, not a live QTimer
+// register read.
 
 void process_interrupt_gpio6789_irq(uint32_t isr_entry_dwt_raw) {
   const uint32_t dwt_at_edge = pps_vclock_dwt_from_pps_isr_entry_raw(isr_entry_dwt_raw);
+  note_pps_canonical_epoch_calibration(isr_entry_dwt_raw, dwt_at_edge);
 
   if (g_pps_rebootstrap_pending) {
     g_pps_rebootstrap_pending = false;
@@ -871,13 +924,40 @@ void process_interrupt_enable_irqs(void) {
 static Payload cmd_report(const Payload&) {
   Payload p;
 
+  // Report-time derived diagnostics.  These are observational only: they
+  // do not feed back into timing behavior.  They let an operator compare
+  // event-ledger counters against the bridge-projected live coordinate
+  // and quickly spot phase-accounting drift.
+  uint32_t report_projected_c32 = 0;
+  const bool report_projected_c32_valid =
+      project_vclock_counter32_from_dwt(ARM_DWT_CYCCNT, report_projected_c32);
+
+  const uint32_t tick_sequence_mod_1000 =
+      g_tick.sequence % (uint32_t)TICKS_PER_SECOND_EVENT;
+
   // Lifecycle
   p.add("hardware_ready", g_interrupt_hw_ready);
   p.add("runtime_ready",  g_interrupt_runtime_ready);
   p.add("irqs_enabled",   g_interrupt_irqs_enabled);
 
-  // PPS rebootstrap state
+  // PPS / canonical VCLOCK epoch witness state
   p.add("pps_rebootstrap_pending", g_pps_rebootstrap_pending);
+  p.add("canonical_vclock_epoch_offset_config_cycles",
+        (int32_t)CANONICAL_VCLOCK_EPOCH_MINUS_RAW_PPS_ISR_CYCLES);
+  p.add("canonical_vclock_epoch_offset_last_cycles",
+        g_pps_canonical_offset_cycles_last);
+  p.add("canonical_vclock_epoch_offset_min_cycles",
+        (g_pps_canonical_offset_samples > 0) ? g_pps_canonical_offset_cycles_min : 0);
+  p.add("canonical_vclock_epoch_offset_max_cycles",
+        (g_pps_canonical_offset_samples > 0) ? g_pps_canonical_offset_cycles_max : 0);
+  p.add("canonical_vclock_epoch_offset_samples",
+        g_pps_canonical_offset_samples);
+  p.add("canonical_vclock_epoch_offset_mismatches",
+        g_pps_canonical_offset_mismatches);
+  p.add("last_raw_pps_isr_entry_dwt",
+        g_pps_raw_isr_entry_dwt_last);
+  p.add("last_canonical_vclock_epoch_dwt",
+        g_pps_canonical_epoch_dwt_last);
 
   // Subscriber sequences (monotone counters per kind)
   p.add("pps_vclock_sequence", g_pps_vclock.sequence);
@@ -885,6 +965,15 @@ static Payload cmd_report(const Payload&) {
   p.add("ocxo1_sequence",      g_ocxo1.sequence);
   p.add("ocxo2_sequence",      g_ocxo2.sequence);
   p.add("tick_sequence",       g_tick.sequence);
+
+  // Sequence relationships.  These are signed so report consumers can see
+  // lead/lag directly.  In steady state, PPS may lead one-second cadence
+  // lanes by one edge depending on where the snapshot lands in the second.
+  p.add("pps_minus_vclock_sequence", (int32_t)(g_pps_vclock.sequence - g_vclock.sequence));
+  p.add("pps_minus_ocxo1_sequence",  (int32_t)(g_pps_vclock.sequence - g_ocxo1.sequence));
+  p.add("pps_minus_ocxo2_sequence",  (int32_t)(g_pps_vclock.sequence - g_ocxo2.sequence));
+  p.add("ocxo1_minus_ocxo2_sequence", (int32_t)(g_ocxo1.sequence - g_ocxo2.sequence));
+  p.add("tick_sequence_mod_1000", tick_sequence_mod_1000);
 
   // Subscriber active flags
   p.add("pps_vclock_active", g_pps_vclock.active);
@@ -909,9 +998,33 @@ static Payload cmd_report(const Payload&) {
   p.add("ocxo2_lane_compare_target",     (uint32_t)g_ocxo2_lane.compare_target);
   p.add("ocxo2_lane_tick_mod_1000",      g_ocxo2_lane.tick_mod_1000);
 
-  // Last-known counter32 — foreground scheduling reference
+  // Cadence phase relationships.  These make modulo bookkeeping visible
+  // without requiring the operator to do mental arithmetic.
+  p.add("vclock_mod_minus_tick_mod", (int32_t)(g_vclock_lane.tick_mod_1000 - tick_sequence_mod_1000));
+  p.add("ocxo1_mod_minus_tick_mod",  (int32_t)(g_ocxo1_lane.tick_mod_1000  - tick_sequence_mod_1000));
+  p.add("ocxo2_mod_minus_tick_mod",  (int32_t)(g_ocxo2_lane.tick_mod_1000  - tick_sequence_mod_1000));
+  p.add("ocxo1_mod_minus_ocxo2_mod", (int32_t)(g_ocxo1_lane.tick_mod_1000  - g_ocxo2_lane.tick_mod_1000));
+
+  // Synthetic counter ledgers and projected live VCLOCK coordinate.
+  // The ledger counters are event-authored values.  projected_live_counter32
+  // is a report-time bridge projection from DWT and alpha's PPS_VCLOCK slot.
+  p.add("vclock_event_counter32", (uint32_t)g_vclock_count32);
+  p.add("ocxo1_event_counter32",  (uint32_t)g_ocxo1_count32);
+  p.add("ocxo2_event_counter32",  (uint32_t)g_ocxo2_count32);
+
   p.add("last_known_counter32",       g_last_known_counter32);
   p.add("last_known_counter32_valid", g_last_known_counter32_valid);
+
+  p.add("projected_live_counter32",       report_projected_c32);
+  p.add("projected_live_counter32_valid", report_projected_c32_valid);
+  if (report_projected_c32_valid) {
+    p.add("projected_minus_vclock_event_ticks",
+          (int32_t)(report_projected_c32 - g_vclock_count32));
+    if (g_last_known_counter32_valid) {
+      p.add("projected_minus_last_known_ticks",
+            (int32_t)(report_projected_c32 - g_last_known_counter32));
+    }
+  }
 
   // NVIC priority structure
   p.add("nvic_prio_pps_gpio", NVIC_PRIO_PPS_GPIO);
@@ -923,6 +1036,14 @@ static Payload cmd_report(const Payload&) {
   p.add("schedule_armed",               g_schedule_armed);
   p.add("schedule_target32",            g_schedule_target32);
   p.add("schedule_target16",            (uint32_t)g_schedule_target16);
+  if (g_schedule_armed && report_projected_c32_valid) {
+    p.add("schedule_target_minus_projected_ticks",
+          (int32_t)(g_schedule_target32 - report_projected_c32));
+  }
+  if (g_schedule_armed && g_last_known_counter32_valid) {
+    p.add("schedule_target_minus_last_known_ticks",
+          (int32_t)(g_schedule_target32 - g_last_known_counter32));
+  }
   p.add("schedule_armed_total",         g_schedule_armed_total);
   p.add("schedule_dispatched_total",    g_schedule_dispatched_total);
   p.add("schedule_late_arm_total",      g_schedule_late_arm_total);
