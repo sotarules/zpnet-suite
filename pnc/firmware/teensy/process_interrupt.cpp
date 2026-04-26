@@ -1,38 +1,51 @@
 // ============================================================================
-// process_interrupt.cpp — ISR custodian, sole owner of QTimer hardware
+// process_interrupt.cpp - Timing-event custodian, sole owner of QTimer hardware
 // ============================================================================
 //
-// See process_interrupt.h for the contract.  This module is a fountain,
-// not a reservoir: it captures _raw, latency-adjusts DWT, advances the
-// three synthetic 32-bit counters by gear arithmetic, computes
-// gnss_ns_at_edge for the dispatched event, and hands the event to the
-// subscriber.
+// process_interrupt is the hardware boundary for Teensy timing.  It owns
+// QTimer1, QTimer3, the PPS GPIO ISR, all first-instruction DWT captures,
+// and the precision schedule-fire lane used by TimePop.
 //
-// The synthetic counters are file-static and have no read accessor.  The
-// only way to observe a counter32 value is through a dispatched event
-// (subscriber dispatch or schedule-fire ISR callback).  Alpha may zero
-// all three via interrupt_synthetic_counters_zero().
+// This module does not answer the casual foreground question "what time is
+// it right now?"  It authors timing EVENTS:
+//
+//   - capture _raw DWT at ISR entry,
+//   - convert _raw immediately to event-coordinate DWT,
+//   - advance the appropriate event-ledger synthetic counter,
+//   - compute GNSS ns at the event edge,
+//   - dispatch one small interrupt_event_t to the subscriber.
+//
+// Synthetic counter doctrine:
+//   g_vclock_count32, g_ocxo1_count32, and g_ocxo2_count32 are event
+//   ledgers, not public live clocks.  They are exact at authored cadence
+//   events.  They are not read from foreground and have no accessors.
 //
 // Lanes:
-//   PPS_VCLOCK     : GPIO edge.  Counter32 in event = current g_vclock_count32.
-//   VCLOCK         : QTimer1 CH3, advances g_vclock_count32 by VCLOCK_INTERVAL_COUNTS
-//                    per cadence tick.  TICK fires every cadence; VCLOCK fires on
-//                    the 1000th cadence tick.
-//   OCXO1          : QTimer3 CH2, advances g_ocxo1_count32 by OCXO_INTERVAL_COUNTS
-//                    per cadence tick.  OCXO1 fires on the 1000th.
-//   OCXO2          : QTimer3 CH3, advances g_ocxo2_count32 by OCXO_INTERVAL_COUNTS
-//                    per cadence tick.  OCXO2 fires on the 1000th.
-//   SCHEDULE-FIRE  : QTimer1 CH2, foreground-armed compare.  No subscriber kind
-//                    — invokes a directly-registered ISR callback on match.
-//                    TimePop owns this lane.
+//   PPS_VCLOCK     : GPIO edge.  Sovereign PPS anchor event.
+//   VCLOCK         : QTimer1 CH3 cadence.  Advances g_vclock_count32 by
+//                    VCLOCK_INTERVAL_COUNTS per cadence tick; emits TICK
+//                    every cadence and VCLOCK every 1000 cadences.
+//   OCXO1          : QTimer3 CH2 cadence.  Advances g_ocxo1_count32 by
+//                    OCXO_INTERVAL_COUNTS; emits OCXO1 every 1000 cadences.
+//   OCXO2          : QTimer3 CH3 cadence.  Advances g_ocxo2_count32 by
+//                    OCXO_INTERVAL_COUNTS; emits OCXO2 every 1000 cadences.
+//   SCHEDULE-FIRE  : QTimer1 CH2 compare.  Direct ISR callback lane used
+//                    by TimePop's explicit precision/SpinDry mode only.
 //
 // NVIC priority order:
-//   PPS GPIO   priority  0 (sovereign)
-//   QTimer1   priority 16 (VCLOCK cadence + schedule fire — preempted by PPS)
-//   QTimer3   priority 32 (OCXO cadences — preempted by PPS or QTimer1)
+//   PPS GPIO   priority  0  (sovereign)
+//   QTimer1   priority 16  (VCLOCK cadence + schedule fire)
+//   QTimer3   priority 32  (OCXO cadences)
 //
-// Within IRQ_QTIMER1, CH2 (schedule fire) and CH3 (VCLOCK cadence) share
-// a vector and tail-chain.  See process_interrupt.h for the rationale.
+// TimePop relationship:
+//   process_interrupt provides TimePop with two very different services:
+//     1. TICK events from CH3 for stable foreground scheduling.
+//     2. CH2 schedule-fire for explicit precision/SpinDry work.
+//
+//   Conversely, process_interrupt uses TimePop ASAP to defer subscriber
+//   callbacks out of ISR context.  This mutual dependency is intentional;
+//   it is safe only because ordinary recurring services stay on TICK mode
+//   and do not flood TimePop's ASAP queue with schedule-fire deliveries.
 // ============================================================================
 
 #include "process_interrupt.h"
@@ -76,38 +89,44 @@ static inline uint32_t qtimer_event_dwt_from_isr_entry_raw(uint32_t isr_entry_dw
 }
 
 // ============================================================================
-// Synthetic counters — file-static, no read accessors
+// Synthetic counters - event ledgers, file-static, no read accessors
 // ============================================================================
+//
+// These are authored coordinates.  They are advanced only by their cadence
+// ISR, and observed only through interrupt_event_t or the schedule-fire
+// callback.  Foreground code must not treat them as live free-running
+// counters.
 
 static volatile uint32_t g_vclock_count32 = 0;
 static volatile uint32_t g_ocxo1_count32  = 0;
 static volatile uint32_t g_ocxo2_count32  = 0;
 
-void interrupt_synthetic_counters_zero(void) {
-  // Single-writer model: alpha is the only foreground caller, ISRs read
-  // them at fire time.  Plain stores are fine on Cortex-M7 for aligned
-  // 32-bit volatiles.
-  g_vclock_count32 = 0;
-  g_ocxo1_count32  = 0;
-  g_ocxo2_count32  = 0;
-}
-
-// ============================================================================
-// Last-known counter32 — bookkeeping for foreground scheduling decisions
-// ============================================================================
-//
-// Tracks the freshest VCLOCK-domain counter32 value observed by any
-// dispatch path (cadence dispatch, PPS dispatch, schedule-fire dispatch).
-// Updated unconditionally inside dispatch routines.  Foreground readers
-// may use this as a best-estimate "now in counter32 space" for arming
-// decisions, accepting up to ~1 ms of staleness.
-
+// Last event-authored VCLOCK-domain coordinate observed by any dispatch
+// path.  This is a fallback/diagnostic reference, not a live clock.  It is
+// invalidated on synthetic-counter zero so old-timeline coordinates cannot
+// leak into a newly installed epoch.
 static volatile uint32_t g_last_known_counter32       = 0;
 static volatile bool     g_last_known_counter32_valid = false;
+
+static inline void clear_last_known_counter32(void) {
+  g_last_known_counter32       = 0;
+  g_last_known_counter32_valid = false;
+}
 
 static inline void note_vclock_counter32(uint32_t c32) {
   g_last_known_counter32       = c32;
   g_last_known_counter32_valid = true;
+}
+
+void interrupt_synthetic_counters_zero(void) {
+  // Single-writer model: alpha is the only foreground caller, ISRs read
+  // the counters at fire time.  Plain aligned 32-bit stores are fine on
+  // Cortex-M7.  Invalidate last-known because it belongs to the discarded
+  // counter timeline.
+  g_vclock_count32 = 0;
+  g_ocxo1_count32  = 0;
+  g_ocxo2_count32  = 0;
+  clear_last_known_counter32();
 }
 
 uint32_t interrupt_last_known_counter32(void) {
@@ -307,28 +326,23 @@ void interrupt_request_pps_rebootstrap(void) { g_pps_rebootstrap_pending = true;
 bool interrupt_pps_rebootstrap_pending(void) { return g_pps_rebootstrap_pending; }
 
 // ============================================================================
-// Schedule-fire (CH2) — TimePop's hardware-driven scheduling lane
+// Schedule-fire (CH2) - TimePop precision / SpinDry actuator
 // ============================================================================
 //
-// State:
-//   • g_schedule_callback  — the registered ISR callback (set once,
-//     typically in timepop_init()).  Null until registered.
-//   • g_schedule_user_data — opaque pointer passed to the callback.
-//   • g_schedule_armed     — true if a fire is currently programmed.
-//   • g_schedule_target32  — full 32-bit target for the current arming.
-//                            CH2 compare is a 16-bit register; the high
-//                            16 bits gate the dispatch below.
-//   • g_schedule_target16  — low 16 bits actually programmed into COMP1.
+// CH2 is not a general foreground scheduler.  Normal services use the
+// TICK lane.  CH2 is an actuator for explicit precision work.
 //
-// 32-bit target on a 16-bit compare:
-//   QTimer1 CH0+CH1 cascade is 32-bit, but the CH2 compare register is
-//   16-bit and only matches the LOW word of the cascade (CH0).  When the
-//   target's low 16 bits match, the ISR fires; we then check whether the
-//   current synthetic counter32's high 16 bits match the target's high
-//   16 bits.  If not, the fire is "premature" — we re-arm the same low
-//   target and wait for the next cascade wrap.  In normal operation
-//   (sub-second deadlines) the high bits naturally match on the first
-//   pass, and this branch is never exercised.
+// Public input is a target synthetic VCLOCK counter32 coordinate.  CH2 is
+// only a 16-bit compare, so the implementation programs the low-word fire
+// implied by the target and validates the full 32-bit target at interrupt
+// time by projecting the current VCLOCK coordinate from alpha's PPS_VCLOCK
+// bridge and event-coordinate DWT.
+//
+// Consequence: long-horizon precision targets are possible, but they cost
+// one premature CH2 ISR per 16-bit wrap (~6.55 ms at 10 MHz) until the
+// high word matches.  This is acceptable for sparse precision witnesses
+// and SpinDry work; it is intentionally not used for recurring foreground
+// services.
 
 static volatile interrupt_schedule_fire_isr_fn g_schedule_callback = nullptr;
 static void* volatile                          g_schedule_user_data = nullptr;
@@ -336,15 +350,49 @@ static volatile bool     g_schedule_armed     = false;
 static volatile uint32_t g_schedule_target32  = 0;
 static volatile uint16_t g_schedule_target16  = 0;
 
-static volatile uint32_t g_schedule_armed_total      = 0;
-static volatile uint32_t g_schedule_dispatched_total = 0;
-static volatile uint32_t g_schedule_late_arm_total   = 0;
-static volatile uint32_t g_schedule_cancelled_total  = 0;
-static volatile uint32_t g_schedule_premature_wraps  = 0;
+static volatile uint32_t g_schedule_armed_total        = 0;
+static volatile uint32_t g_schedule_dispatched_total   = 0;
+static volatile uint32_t g_schedule_late_arm_total     = 0;
+static volatile uint32_t g_schedule_late_fire_total    = 0;
+static volatile uint32_t g_schedule_cancelled_total    = 0;
+static volatile uint32_t g_schedule_premature_wraps    = 0;
+static volatile uint32_t g_schedule_projection_failures = 0;
+
+static constexpr int32_t SCHEDULE_MIN_DELTA_TICKS = -16;  // ~1.6 us grace
+static constexpr int32_t SCHEDULE_MATCH_TOLERANCE_TICKS = 16;
+
+static bool project_vclock_counter32_from_dwt(uint32_t dwt_at_edge,
+                                              uint32_t& out_counter32) {
+  const alpha_pps_vclock_slot_t a = alpha_pps_vclock_load();
+  if (a.sequence == 0) return false;
+
+  const uint32_t cps = alpha_dwt_cycles_per_second();
+  if (cps == 0) return false;
+
+  const uint32_t dwt_elapsed = dwt_at_edge - a.dwt_at_edge;
+  const uint64_t ticks_elapsed =
+      ((uint64_t)dwt_elapsed * 10000000ULL + (uint64_t)cps / 2) /
+      (uint64_t)cps;
+
+  if (ticks_elapsed > 0xFFFFFFFFULL) return false;
+  out_counter32 = a.counter32_at_edge + (uint32_t)ticks_elapsed;
+  return true;
+}
+
+static bool project_vclock_counter32_now(uint32_t& out_counter32) {
+  if (project_vclock_counter32_from_dwt(ARM_DWT_CYCCNT, out_counter32)) {
+    return true;
+  }
+  if (g_last_known_counter32_valid) {
+    out_counter32 = g_last_known_counter32;
+    return true;
+  }
+  return false;
+}
 
 void interrupt_schedule_register(interrupt_schedule_fire_isr_fn callback,
                                  void* user_data) {
-  // Single-writer foreground registration.  No critical section needed —
+  // Single-writer foreground registration.  No critical section needed -
   // callback pointer is installed atomically and the CH2 ISR reads it
   // through a volatile.
   g_schedule_user_data = user_data;
@@ -354,91 +402,28 @@ void interrupt_schedule_register(interrupt_schedule_fire_isr_fn callback,
 bool interrupt_schedule_fire_at(uint32_t target_counter32) {
   if (!g_schedule_callback) return false;
 
-  // Past-target detection: refuse targets that are meaningfully in the
-  // past so the caller can fire via foreground asap rather than wait
-  // for the 32-bit cascade to wrap (~7 minutes at 10 MHz).
-  //
-  // We estimate "now in counter32 space" with the freshest source
-  // available:
-  //   1. Bridge — sub-µs accurate via alpha's PPS_VCLOCK slot + live
-  //      DWT + measured rate.  Required for SpinDry slots scheduled
-  //      close to "now" (within a few hundred µs).
-  //   2. last_known_counter32 — fresh up to ~1 ms (last TICK).  Used
-  //      when the bridge is invalid (pre-PPS).
-  //   3. No estimate available — defensively assume future.
-  //
-  // Tolerance interpretation: "in the past by less than tolerance" is
-  // treated as "imminent" and STILL armed (the hardware will fire when
-  // the cascade next reaches that low-word value, which is now-ish).
-  // Tolerance is conservative to absorb the latency of arming and the
-  // staleness of the estimate.
-
-  uint32_t now_c32 = 0;
-  bool now_valid = false;
-
-  {
-    // Bridge path: use alpha's slot and live DWT.  This is the same
-    // math that time.cpp's bridge functions use — kept inline here to
-    // avoid a public header dependency on time.cpp's internals.
-    const alpha_pps_vclock_slot_t a = alpha_pps_vclock_load();
-    if (a.sequence != 0) {
-      const uint32_t cps = alpha_dwt_cycles_per_second();
-      if (cps != 0) {
-        const uint32_t dwt_now     = ARM_DWT_CYCCNT;
-        const uint32_t dwt_elapsed = dwt_now - a.dwt_at_edge;
-        // ticks since anchor = (dwt_elapsed × 1e9 / cps) / 100ns
-        //                    = dwt_elapsed × 10^7 / cps
-        const uint64_t ticks_elapsed =
-            ((uint64_t)dwt_elapsed * 10000000ULL + (uint64_t)cps / 2) /
-            (uint64_t)cps;
-        if (ticks_elapsed <= 0xFFFFFFFFULL) {
-          now_c32   = a.counter32_at_edge + (uint32_t)ticks_elapsed;
-          now_valid = true;
-        }
-      }
-    }
-  }
-  if (!now_valid && g_last_known_counter32_valid) {
-    now_c32   = g_last_known_counter32;
-    now_valid = true;
-  }
-
-  if (now_valid) {
-    const int32_t delta = (int32_t)(target_counter32 - now_c32);
-    static constexpr int32_t MIN_DELTA_TICKS = -16;  // ~1.6 µs grace window
-    if (delta < MIN_DELTA_TICKS) {
-      g_schedule_late_arm_total++;
-      return false;
-    }
-  }
-
-  // Disable interrupts to make the arm atomic against a CH2 ISR.  We're
-  // typically called from foreground (TimePop's schedule_next_head) but
-  // also from inside the CH2 ISR (head rearm); in both cases we want
-  // the state and the hardware register to update together.
   uint32_t primask;
   __asm__ volatile ("MRS %0, primask" : "=r" (primask));
   __asm__ volatile ("CPSID i" ::: "memory");
 
-  // Compute COMP1 as a DELTA-based target rather than an absolute
-  // low-16-bit match.  We want CH2 to fire when g_vclock_count32 reaches
-  // target_counter32; equivalently, after (target_counter32 - g_vclock_count32_now)
-  // VCLOCK ticks elapse.  Since CH2's hardware CNTR advances at exactly
-  // the same rate as g_vclock_count32 (both driven by the same VCLOCK
-  // source), the COMP1 value to program is (CH2.CNTR + delta) mod 65536.
-  //
-  // CRITICAL: this is robust to alpha's interrupt_synthetic_counters_zero
-  // moments.  The synthetic counter (g_vclock_count32) is reset to 0,
-  // but CH2's hardware CNTR is NOT reset (it keeps ticking continuously
-  // since boot).  An absolute low-16-bit COMP1 (target_counter32 & 0xFFFF)
-  // would fire at the wrong moment after the first synthetic-counter zero
-  // because the two domains no longer share aligned low 16 bits.
-  //
-  // The CH2.CNTR read is hardware-programming-immediate — it dies in this
-  // stack frame, never propagates as an event-coordinate value.  Same
-  // pattern as the PPS rebootstrap CH3.CNTR read.
-  const uint32_t now32   = g_vclock_count32;
-  const int32_t  delta   = (int32_t)(target_counter32 - now32);
+  uint32_t now_c32 = 0;
+  if (!project_vclock_counter32_now(now_c32)) {
+    g_schedule_projection_failures++;
+    __asm__ volatile ("MSR primask, %0" :: "r" (primask) : "memory");
+    return false;
+  }
+
+  const int32_t delta = (int32_t)(target_counter32 - now_c32);
+  if (delta < SCHEDULE_MIN_DELTA_TICKS) {
+    g_schedule_late_arm_total++;
+    __asm__ volatile ("MSR primask, %0" :: "r" (primask) : "memory");
+    return false;
+  }
+
+  // CH2.CNTR is live hardware, sampled only for immediate programming.
+  // The delta is computed from the projected live synthetic coordinate,
+  // not the stepped event-ledger g_vclock_count32.  This avoids mixing a
+  // stale cadence ledger with a live 16-bit hardware counter.
   const uint16_t ch2_now = IMXRT_TMR1.CH[2].CNTR;
   const uint16_t ch2_target = (uint16_t)((uint32_t)ch2_now + (uint32_t)delta);
 
@@ -450,7 +435,6 @@ bool interrupt_schedule_fire_at(uint32_t target_counter32) {
   qtimer1_ch2_program_compare(ch2_target);
 
   __asm__ volatile ("MSR primask, %0" :: "r" (primask) : "memory");
-
   return true;
 }
 
@@ -525,65 +509,60 @@ static void vclock_cadence_isr(uint32_t isr_entry_dwt_raw) {
 }
 
 // ============================================================================
-// QTimer1 CH2 — schedule-fire ISR
+// QTimer1 CH2 - schedule-fire ISR
 // ============================================================================
 //
-// CH2's compare matches when the cascade's low 16 bits equal
-// g_schedule_target16.  Because the cascade is 32-bit but the compare is
-// 16-bit, we may receive premature fires when the high 16 bits don't yet
-// match.  In that case we leave the compare armed and return; the
-// hardware will fire again on the next cascade pass at the same low-word
-// value (~6.55 ms later at 10 MHz).
-//
-// In normal operation, sub-millisecond deadlines are armed when the
-// cascade's high bits already equal the target's high bits, so this
-// branch is never exercised.  For longer deadlines (up to ~7 minutes),
-// premature fires are absorbed silently and counted in
-// g_schedule_premature_wraps.
-//
-// On a real fire:
-//   1. Latency-adjust _raw → event-coordinate DWT.
-//   2. Snap g_vclock_count32 (synthetic counter) as counter32_at_edge.
-//   3. Mark schedule disarmed; the consumer is expected to either re-arm
-//      from inside the callback or accept that no further fire happens.
-//   4. Disable the compare (consumer-driven re-arm via
-//      interrupt_schedule_fire_at).
-//   5. Invoke the registered callback IN ISR CONTEXT.
+// CH2 fires whenever its 16-bit compare matches.  A low-word match is only
+// a candidate fire.  We project the current 32-bit VCLOCK coordinate from
+// event-coordinate DWT and alpha's bridge, then accept the fire only when
+// the projected coordinate is within a small tolerance of g_schedule_target32.
+// Otherwise the low-word match was premature; the compare remains armed and
+// will fire again on the next 16-bit wrap.
 
 void process_interrupt_qtimer1_ch2_irq(uint32_t isr_entry_dwt_raw) {
   qtimer1_ch2_clear_compare_flag();
 
   if (!g_schedule_armed) {
-    // Spurious or stale fire — disable and ignore.
     qtimer1_ch2_disable_compare();
     return;
   }
 
-  // With delta-based COMP1 arming (see interrupt_schedule_fire_at), CH2
-  // fires exactly one VCLOCK_INTERVAL_COUNTS-aligned moment after the arm
-  // — there is no possibility of a premature wrap.  We trust the fire.
-  //
-  // counter32_at_edge: report the requested target.  This is the most
-  // truthful value to advertise — it is what the consumer asked CH2 to
-  // fire at.  g_vclock_count32 itself only advances in 10000-tick steps
-  // at CH3 ISR moments, so reporting it directly would be lower-resolution
-  // than the requested target.
-  const uint32_t dwt_at_edge       = qtimer_event_dwt_from_isr_entry_raw(isr_entry_dwt_raw);
-  const uint32_t counter32_at_edge = g_schedule_target32;
+  const uint32_t dwt_at_edge = qtimer_event_dwt_from_isr_entry_raw(isr_entry_dwt_raw);
 
-  // Update last-known counter32 (this dispatch path is also a VCLOCK-
-  // domain event from foreground's perspective).
-  note_vclock_counter32(counter32_at_edge);
+  uint32_t current_c32 = 0;
+  if (!project_vclock_counter32_from_dwt(dwt_at_edge, current_c32)) {
+    g_schedule_projection_failures++;
+    g_schedule_armed = false;
+    qtimer1_ch2_disable_compare();
+    return;
+  }
 
-  // Mark disarmed before invoking the callback so the callback may
-  // re-arm cleanly via interrupt_schedule_fire_at().
+  const int32_t ticks_to_target = (int32_t)(g_schedule_target32 - current_c32);
+
+  if (ticks_to_target > SCHEDULE_MATCH_TOLERANCE_TICKS) {
+    // Correct low word, wrong high word.  Leave CH2 armed for the next
+    // 16-bit pass at the same compare value.
+    g_schedule_premature_wraps++;
+    return;
+  }
+
+  if (ticks_to_target < -SCHEDULE_MATCH_TOLERANCE_TICKS) {
+    // We are past the intended full 32-bit target.  Disarm; firing now
+    // would turn a precision miss into a false precision event.
+    g_schedule_late_fire_total++;
+    g_schedule_armed = false;
+    qtimer1_ch2_disable_compare();
+    return;
+  }
+
+  note_vclock_counter32(current_c32);
+
   g_schedule_armed = false;
   qtimer1_ch2_disable_compare();
   g_schedule_dispatched_total++;
 
-  // Invoke registered callback in ISR context.
   if (g_schedule_callback) {
-    g_schedule_callback(dwt_at_edge, counter32_at_edge, g_schedule_user_data);
+    g_schedule_callback(dwt_at_edge, current_c32, g_schedule_user_data);
   }
 }
 
@@ -943,11 +922,15 @@ static Payload cmd_report(const Payload&) {
   p.add("schedule_callback_registered", g_schedule_callback != nullptr);
   p.add("schedule_armed",               g_schedule_armed);
   p.add("schedule_target32",            g_schedule_target32);
+  p.add("schedule_target16",            (uint32_t)g_schedule_target16);
   p.add("schedule_armed_total",         g_schedule_armed_total);
   p.add("schedule_dispatched_total",    g_schedule_dispatched_total);
   p.add("schedule_late_arm_total",      g_schedule_late_arm_total);
+  p.add("schedule_late_fire_total",     g_schedule_late_fire_total);
   p.add("schedule_cancelled_total",     g_schedule_cancelled_total);
   p.add("schedule_premature_wraps",     g_schedule_premature_wraps);
+  p.add("schedule_projection_failures", g_schedule_projection_failures);
+  p.add("schedule_match_tolerance_ticks", (uint32_t)SCHEDULE_MATCH_TOLERANCE_TICKS);
 
   return p;
 }
