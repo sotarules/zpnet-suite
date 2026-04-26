@@ -32,10 +32,14 @@
 //                    OCXO_INTERVAL_COUNTS; emits OCXO2 every 1000 cadences.
 //   SCHEDULE-FIRE  : QTimer1 CH2 compare.  Direct ISR callback lane used
 //                    by TimePop's explicit precision/SpinDry mode only.
+//   PPS↔VCLOCK     : QTimer1 CH1 one-shot compare.  Armed inside the PPS
+//   OFFSET           GPIO ISR; fires on the next VCLOCK edge.  Measures
+//                    the irreducible hardware-path DWT offset between the
+//                    two physically synchronous events.
 //
 // NVIC priority order:
 //   PPS GPIO   priority  0  (sovereign)
-//   QTimer1   priority 16  (VCLOCK cadence + schedule fire)
+//   QTimer1   priority 16  (VCLOCK cadence + schedule fire + offset CH1)
 //   QTimer3   priority 32  (OCXO cadences)
 //
 // TimePop relationship:
@@ -62,6 +66,8 @@
 #include <Arduino.h>
 #include "imxrt.h"
 
+#include <math.h>
+
 // ============================================================================
 // Constants
 // ============================================================================
@@ -73,6 +79,13 @@ static constexpr uint32_t NVIC_PRIO_PPS_GPIO = 0;
 static constexpr uint32_t NVIC_PRIO_QTIMER1  = 16;
 static constexpr uint32_t NVIC_PRIO_QTIMER3  = 32;
 
+// VCLOCK period in DWT cycles, used as the modulus for the PPS↔VCLOCK
+// offset measurement.  We mod by 100 (the VCLOCK tick period in DWT
+// cycles is ~100,800 at 1.008 GHz; mod 100 strips out the integer-VCLOCK-
+// period component cleanly because 100,800 mod 100 = 0, leaving only the
+// sub-period residual — the actual irreducible hardware offset).
+static constexpr int32_t  PPS_VCLOCK_OFFSET_MODULUS_CYCLES = 100;
+
 // ============================================================================
 // Latency adjusters — convert raw ISR-entry DWT to event coordinates
 // ============================================================================
@@ -80,9 +93,37 @@ static constexpr uint32_t NVIC_PRIO_QTIMER3  = 32;
 // The ONLY producers of event-coordinate DWT, and the ONLY place in the
 // codebase that applies hardware latency math.  Called exactly once per
 // ISR on the first-instruction _raw capture.
+//
+// pps_vclock_dwt_from_pps_isr_entry_raw  : raw GPIO ISR entry → canonical
+//                                          VCLOCK-selected PPS epoch DWT.
+//                                          Uses CANONICAL_VCLOCK_EPOCH_MINUS_
+//                                          RAW_PPS_ISR_CYCLES.  This is
+//                                          the operational estimate used
+//                                          for the dispatched PPS_VCLOCK
+//                                          event; the new CH1-based
+//                                          measurement (below) verifies it
+//                                          empirically every PPS.
+//
+// pps_edge_dwt_from_pps_isr_entry_raw    : raw GPIO ISR entry → latency-
+//                                          compensated electrical-edge
+//                                          DWT for the PPS pin.  Used
+//                                          ONLY by the offset measurement
+//                                          path so the PPS and CH1 sides
+//                                          are referenced to comparable
+//                                          electrical-edge frames.
+//
+// qtimer_event_dwt_from_isr_entry_raw    : raw QTimer ISR entry → latency-
+//                                          compensated electrical-edge
+//                                          DWT for any QTimer compare
+//                                          event.  Used by CH1, CH2, CH3,
+//                                          and the QTimer3 OCXO lanes.
 
 static inline uint32_t pps_vclock_dwt_from_pps_isr_entry_raw(uint32_t isr_entry_dwt_raw) {
   return isr_entry_dwt_raw + (uint32_t)CANONICAL_VCLOCK_EPOCH_MINUS_RAW_PPS_ISR_CYCLES;
+}
+
+static inline uint32_t pps_edge_dwt_from_pps_isr_entry_raw(uint32_t isr_entry_dwt_raw) {
+  return isr_entry_dwt_raw - (GPIO_TOTAL_LATENCY - WITNESS_STIMULATE_LATENCY);
 }
 
 static inline uint32_t qtimer_event_dwt_from_isr_entry_raw(uint32_t isr_entry_dwt_raw) {
@@ -257,6 +298,21 @@ static void dispatch_deferred(subscriber_t& rt,
 // Compare channel helpers
 // ============================================================================
 
+static inline void qtimer1_ch1_clear_compare_flag(void) {
+  IMXRT_TMR1.CH[1].CSCTRL &= ~(TMR_CSCTRL_TCF1 | TMR_CSCTRL_TCF2);
+}
+static inline void qtimer1_ch1_program_compare(uint16_t target_low16) {
+  qtimer1_ch1_clear_compare_flag();
+  IMXRT_TMR1.CH[1].COMP1  = target_low16;
+  IMXRT_TMR1.CH[1].CMPLD1 = target_low16;
+  qtimer1_ch1_clear_compare_flag();
+  IMXRT_TMR1.CH[1].CSCTRL |= TMR_CSCTRL_TCF1EN;
+}
+static inline void qtimer1_ch1_disable_compare(void) {
+  IMXRT_TMR1.CH[1].CSCTRL &= ~TMR_CSCTRL_TCF1EN;
+  qtimer1_ch1_clear_compare_flag();
+}
+
 static inline void qtimer1_ch2_clear_compare_flag(void) {
   IMXRT_TMR1.CH[2].CSCTRL &= ~(TMR_CSCTRL_TCF1 | TMR_CSCTRL_TCF2);
 }
@@ -327,43 +383,105 @@ void interrupt_request_pps_rebootstrap(void) { g_pps_rebootstrap_pending = true;
 bool interrupt_pps_rebootstrap_pending(void) { return g_pps_rebootstrap_pending; }
 
 // ============================================================================
-// PPS -> canonical VCLOCK epoch calibration witness
+// PPS↔VCLOCK irreducible-offset measurement (CH1)
 // ============================================================================
 //
-// PPS GPIO is treated as a physical witness/selector.  The canonical
-// PPS_VCLOCK epoch published to Alpha is not the raw GPIO ISR entry time;
-// it is the empirically selected VCLOCK-domain epoch:
+// CH1 is QTimer1's spare channel.  It is no longer the cascade slave for
+// the old 32-bit cascade — that machinery is gone.  CH1's sole purpose
+// now is to fire on the very next VCLOCK edge after a PPS GPIO ISR and
+// let us empirically measure the irreducible DWT-cycle offset between
+// the two physically synchronous events.
 //
-//   canonical_vclock_epoch_dwt = raw_pps_isr_entry_dwt
-//                              + CANONICAL_VCLOCK_EPOCH_MINUS_RAW_PPS_ISR_CYCLES
+// Method:
+//   1. PPS GPIO ISR fires.  Capture latency-compensated PPS edge DWT via
+//      pps_edge_dwt_from_pps_isr_entry_raw().
+//   2. Read CH1.CNTR and program CH1 compare at CNTR + 1.  This requests
+//      an interrupt on the next VCLOCK rising edge.  Set armed flag.
+//   3. CH1 ISR fires.  Capture latency-compensated VCLOCK edge DWT via
+//      qtimer_event_dwt_from_isr_entry_raw().
+//   4. Compute (vclock_dwt - pps_dwt) % 100 and update Welford state.
+//   5. Disable CH1 compare (one-shot).  Clear armed flag.
 //
-// The fields below continuously re-measure that offset as implemented in
-// this firmware path and expose it in REPORT.  This is a calibration
-// witness: it verifies that the code path is applying the configured
-// offset every PPS and makes future changes immediately visible.
+// The mod-100 absorbs the case where we miss the immediate next VCLOCK
+// edge because the ISR latency exceeded one VCLOCK period — the firmware
+// may catch the second or third edge instead.  Since one VCLOCK tick is
+// 100,800 DWT cycles (mod 100 == 0), the residual mod 100 is invariant
+// to the integer-period miss and equals the actual hardware offset (which
+// is well under 100 cycles).
+//
+// All state is ISR-only (PPS GPIO writes; CH1 ISR reads/writes Welford).
+// Foreground reads via REPORT use plain volatile loads — there's no
+// strict atomicity requirement for diagnostic display.
+//
+// No constants are consulted.  No predicted value is compared to an
+// observed value.  The truth is whatever the hardware reports.
 
-static volatile uint32_t g_pps_raw_isr_entry_dwt_last = 0;
-static volatile uint32_t g_pps_canonical_epoch_dwt_last = 0;
-static volatile int32_t  g_pps_canonical_offset_cycles_last = 0;
-static volatile int32_t  g_pps_canonical_offset_cycles_min = 2147483647;
-static volatile int32_t  g_pps_canonical_offset_cycles_max = -2147483647;
-static volatile uint32_t g_pps_canonical_offset_samples = 0;
-static volatile uint32_t g_pps_canonical_offset_mismatches = 0;
+struct pps_vclock_offset_welford_t {
+  uint32_t n;
+  double   mean;
+  double   m2;
+  int32_t  last;
+  int32_t  min;
+  int32_t  max;
+};
 
-static inline void note_pps_canonical_epoch_calibration(uint32_t raw_pps_isr_entry_dwt,
-                                                        uint32_t canonical_epoch_dwt) {
-  const int32_t observed = (int32_t)(canonical_epoch_dwt - raw_pps_isr_entry_dwt);
+// Single-writer (CH1 ISR), occasional foreground reader (REPORT).  The
+// reader copies under a brief PRIMASK-disabled critical section to get a
+// consistent snapshot.  No volatile qualifier needed on the struct itself.
+static pps_vclock_offset_welford_t g_pps_vclock_offset = {};
+static volatile uint32_t g_pps_vclock_offset_pps_dwt_at_edge = 0;
+static volatile bool     g_pps_vclock_offset_armed = false;
+static volatile uint32_t g_pps_vclock_offset_arm_total      = 0;
+static volatile uint32_t g_pps_vclock_offset_complete_total = 0;
+static volatile uint32_t g_pps_vclock_offset_dropped_total  = 0;
 
-  g_pps_raw_isr_entry_dwt_last = raw_pps_isr_entry_dwt;
-  g_pps_canonical_epoch_dwt_last = canonical_epoch_dwt;
-  g_pps_canonical_offset_cycles_last = observed;
-  if (observed < g_pps_canonical_offset_cycles_min) g_pps_canonical_offset_cycles_min = observed;
-  if (observed > g_pps_canonical_offset_cycles_max) g_pps_canonical_offset_cycles_max = observed;
-  g_pps_canonical_offset_samples++;
+static inline void pps_vclock_offset_reset(void) {
+  g_pps_vclock_offset.n    = 0;
+  g_pps_vclock_offset.mean = 0.0;
+  g_pps_vclock_offset.m2   = 0.0;
+  g_pps_vclock_offset.last = 0;
+  g_pps_vclock_offset.min  =  2147483647;
+  g_pps_vclock_offset.max  = -2147483647;
+}
 
-  if (observed != (int32_t)CANONICAL_VCLOCK_EPOCH_MINUS_RAW_PPS_ISR_CYCLES) {
-    g_pps_canonical_offset_mismatches++;
+static inline void pps_vclock_offset_update(int32_t observed_cycles) {
+  // Welford one-pass, in-ISR.  Single writer (this ISR), so plain
+  // read-modify-write is fine.  No floating-point sqrt here; stddev is
+  // computed at report time from m2/(n-1).
+  pps_vclock_offset_welford_t& w = g_pps_vclock_offset;
+
+  w.last = observed_cycles;
+  if (observed_cycles < w.min) w.min = observed_cycles;
+  if (observed_cycles > w.max) w.max = observed_cycles;
+  w.n++;
+  const double x  = (double)observed_cycles;
+  const double d1 = x - w.mean;
+  w.mean += d1 / (double)w.n;
+  const double d2 = x - w.mean;
+  w.m2   += d1 * d2;
+}
+
+// Called from the PPS GPIO ISR after the latency-compensated PPS edge
+// DWT is in hand.  Reads CH1's live CNTR (immediate hardware programming
+// — the value dies in this stack frame, never propagated as an event
+// coordinate) and programs CH1 to fire on CNTR + 1.
+static inline void pps_vclock_offset_arm(uint32_t pps_edge_dwt) {
+  // If a previous arming hasn't completed, the CH1 ISR didn't fire (or
+  // didn't fire in time).  Disarm and count it; the new measurement
+  // request supersedes.
+  if (g_pps_vclock_offset_armed) {
+    qtimer1_ch1_disable_compare();
+    g_pps_vclock_offset_dropped_total++;
   }
+
+  g_pps_vclock_offset_pps_dwt_at_edge = pps_edge_dwt;
+
+  const uint16_t ch1_now    = IMXRT_TMR1.CH[1].CNTR;
+  const uint16_t ch1_target = (uint16_t)(ch1_now + 1);
+  qtimer1_ch1_program_compare(ch1_target);
+
+  g_pps_vclock_offset_armed = true;
+  g_pps_vclock_offset_arm_total++;
 }
 
 // ============================================================================
@@ -550,6 +668,38 @@ static void vclock_cadence_isr(uint32_t isr_entry_dwt_raw) {
 }
 
 // ============================================================================
+// QTimer1 CH1 — PPS↔VCLOCK irreducible offset capture ISR
+// ============================================================================
+//
+// Fires on the next VCLOCK edge after the PPS GPIO ISR armed it.
+// Captures the latency-compensated VCLOCK-edge DWT, computes the offset
+// from the saved PPS-edge DWT (mod 100), updates Welford, disarms.
+
+void process_interrupt_qtimer1_ch1_irq(uint32_t isr_entry_dwt_raw) {
+  qtimer1_ch1_disable_compare();   // one-shot, regardless of whether armed
+
+  if (!g_pps_vclock_offset_armed) {
+    // Stale fire (e.g., stray TCF1 from prior arming), nothing to record.
+    return;
+  }
+  g_pps_vclock_offset_armed = false;
+
+  const uint32_t vclock_dwt = qtimer_event_dwt_from_isr_entry_raw(isr_entry_dwt_raw);
+  const uint32_t pps_dwt    = g_pps_vclock_offset_pps_dwt_at_edge;
+
+  const int32_t delta_cycles = (int32_t)(vclock_dwt - pps_dwt);
+
+  // Mod by 100.  The C99 % operator's sign for negative dividends is
+  // implementation-defined-but-truncated-toward-zero on Cortex-M7/GCC;
+  // we want a non-negative remainder, so canonicalize.
+  int32_t observed = delta_cycles % PPS_VCLOCK_OFFSET_MODULUS_CYCLES;
+  if (observed < 0) observed += PPS_VCLOCK_OFFSET_MODULUS_CYCLES;
+
+  pps_vclock_offset_update(observed);
+  g_pps_vclock_offset_complete_total++;
+}
+
+// ============================================================================
 // QTimer1 CH2 - schedule-fire ISR
 // ============================================================================
 //
@@ -596,48 +746,40 @@ void process_interrupt_qtimer1_ch2_irq(uint32_t isr_entry_dwt_raw) {
     return;
   }
 
-  note_vclock_counter32(current_c32);
-
+  // Acceptable match — disarm before invoking callback so the callback may
+  // re-arm using the same target (caller's responsibility).
   g_schedule_armed = false;
   qtimer1_ch2_disable_compare();
-  g_schedule_dispatched_total++;
 
   if (g_schedule_callback) {
+    g_schedule_dispatched_total++;
     g_schedule_callback(dwt_at_edge, current_c32, g_schedule_user_data);
   }
 }
 
 // ============================================================================
-// OCXO CH2/CH3 cadence — 1 kHz, advance synthetic counter, fire on 1000th
+// OCXO cadence (QTimer3 CH2/CH3) — 1 Hz, advances OCXO ledger
 // ============================================================================
 
-static void ocxo_lane_arm_bootstrap(cadence_lane_t& lane, uint8_t ch) {
-  lane.phase_bootstrapped = true;
-  lane.tick_mod_1000 = 0;
-  lane.compare_target = (uint16_t)(lane.compare_target + (uint16_t)OCXO_INTERVAL_COUNTS);
-  qtimer3_program_compare(ch, lane.compare_target);
-}
-
-static void ocxo_lane_advance_compare(cadence_lane_t& lane, uint8_t ch) {
-  lane.compare_target = (uint16_t)(lane.compare_target + (uint16_t)OCXO_INTERVAL_COUNTS);
-  qtimer3_program_compare(ch, lane.compare_target);
-}
-
-static void ocxo_cadence_isr(cadence_lane_t& lane,
-                             subscriber_t& rt,
+static void ocxo_cadence_isr(cadence_lane_t&  lane,
+                             subscriber_t&    rt,
                              volatile uint32_t& synthetic_counter,
-                             uint8_t ch,
-                             uint32_t isr_entry_dwt_raw) {
+                             uint8_t          ch,
+                             uint32_t         isr_entry_dwt_raw) {
   qtimer3_clear_compare_flag(ch);
   if (!lane.active) return;
 
   if (!lane.phase_bootstrapped) {
-    ocxo_lane_arm_bootstrap(lane, ch);
+    lane.phase_bootstrapped = true;
+    lane.tick_mod_1000 = 0;
+    lane.compare_target = (uint16_t)(lane.compare_target + (uint16_t)OCXO_INTERVAL_COUNTS);
+    qtimer3_program_compare(ch, lane.compare_target);
     return;
   }
-  ocxo_lane_advance_compare(lane, ch);
 
-  // Advance this OCXO's synthetic counter by one cadence step.
+  lane.compare_target = (uint16_t)(lane.compare_target + (uint16_t)OCXO_INTERVAL_COUNTS);
+  qtimer3_program_compare(ch, lane.compare_target);
+
   synthetic_counter += OCXO_INTERVAL_COUNTS;
 
   if (++lane.tick_mod_1000 < TICKS_PER_SECOND_EVENT) return;
@@ -663,24 +805,34 @@ static void qtimer3_isr(void) {
 }
 
 // ============================================================================
-// QTimer1 vector — dispatches CH2 (schedule fire) and CH3 (VCLOCK cadence)
+// QTimer1 vector — dispatches CH1 (offset capture), CH2 (schedule fire),
+//                  and CH3 (VCLOCK cadence)
 // ============================================================================
 
 static void qtimer1_isr(void) {
   const uint32_t isr_entry_dwt_raw = ARM_DWT_CYCCNT;  // SACRED: first instruction.
 
-  // CH2 (schedule fire) checked first so SpinDry approaches see the
-  // freshest possible _raw.  CH3 immediately after.  Both lanes share
-  // priority; tail-chain ordering across QTimer1 vector is a same-priority
-  // visit, so this in-vector ordering controls the relative latency.
+  // CH1 (PPS↔VCLOCK offset capture) checked first so the offset
+  // measurement sees the freshest possible _raw — minimizing variability
+  // in the latency-compensated VCLOCK edge timestamp that goes into the
+  // mod-100 calculation.  CH2 (schedule fire) next, CH3 (VCLOCK cadence)
+  // last.  All three lanes share priority; tail-chain ordering across the
+  // QTimer1 vector is a same-priority visit, so this in-vector ordering
+  // controls the relative latency.
   //
   // CRITICAL: Each lane is dispatched only if BOTH TCF1 (flag) AND
   // TCF1EN (enable) are set.  The TCF1 flag sets on every compare match
   // regardless of TCF1EN, so a disarmed channel whose CNTR wraps through
   // COMP1 will leave TCF1 set in hardware.  Without the TCF1EN gate, the
-  // shared QTimer1 ISR (entered for CH3's own match) would also run CH2's
-  // handler on every entry once CH2 has wrapped past 0xFFFF — a kHz-rate
-  // storm of spurious CH2 dispatches.
+  // shared QTimer1 ISR (entered for any other lane's match) would also
+  // run the disarmed lane's handler on every entry — a kHz-rate storm of
+  // spurious dispatches.
+  {
+    const uint32_t cs = IMXRT_TMR1.CH[1].CSCTRL;
+    if ((cs & TMR_CSCTRL_TCF1) && (cs & TMR_CSCTRL_TCF1EN)) {
+      process_interrupt_qtimer1_ch1_irq(isr_entry_dwt_raw);
+    }
+  }
   {
     const uint32_t cs = IMXRT_TMR1.CH[2].CSCTRL;
     if ((cs & TMR_CSCTRL_TCF1) && (cs & TMR_CSCTRL_TCF1EN)) {
@@ -707,9 +859,15 @@ static void qtimer1_isr(void) {
 //     == CANONICAL_VCLOCK_EPOCH_MINUS_RAW_PPS_ISR_CYCLES
 //
 // This ISR captures raw PPS ISR-entry DWT, converts it to the canonical
-// VCLOCK-selected epoch DWT using that calibrated offset, records the
-// offset as a continuous witness, and dispatches PPS_VCLOCK with the
-// canonical DWT.
+// VCLOCK-selected epoch DWT using that calibrated offset, and dispatches
+// PPS_VCLOCK with the canonical DWT.
+//
+// In parallel, this ISR captures the latency-compensated PPS edge DWT
+// and arms QTimer1 CH1 to fire on the next VCLOCK rising edge.  The CH1
+// ISR (above) captures the latency-compensated VCLOCK edge DWT and
+// records the irreducible offset between the two — a continuous,
+// constants-free empirical witness to what was previously asserted by
+// the CANONICAL_VCLOCK_EPOCH_MINUS_RAW_PPS_ISR_CYCLES constant.
 //
 // The subscription name PPS_VCLOCK is retained for compatibility, but its
 // semantic meaning is: "the canonical VCLOCK-selected PPS epoch is now
@@ -721,7 +879,12 @@ static void qtimer1_isr(void) {
 
 void process_interrupt_gpio6789_irq(uint32_t isr_entry_dwt_raw) {
   const uint32_t dwt_at_edge = pps_vclock_dwt_from_pps_isr_entry_raw(isr_entry_dwt_raw);
-  note_pps_canonical_epoch_calibration(isr_entry_dwt_raw, dwt_at_edge);
+
+  // Arm CH1 to fire on the next VCLOCK edge so we can empirically measure
+  // the irreducible PPS↔VCLOCK offset.  The PPS-side timestamp passed
+  // here is the latency-compensated electrical-edge DWT (referenced to
+  // the same frame as the QTimer-side capture in the CH1 ISR).
+  pps_vclock_offset_arm(pps_edge_dwt_from_pps_isr_entry_raw(isr_entry_dwt_raw));
 
   if (g_pps_rebootstrap_pending) {
     g_pps_rebootstrap_pending = false;
@@ -777,21 +940,31 @@ static void qtimer1_init_vclock_base(void) {
   IMXRT_TMR1.CH[0].CMPLD1 = 0xFFFF;
   IMXRT_TMR1.CH[0].CTRL   = TMR_CTRL_CM(1) | TMR_CTRL_PCS(0);
 
-  IMXRT_TMR1.CH[1].SCTRL  = 0;
-  IMXRT_TMR1.CH[1].CSCTRL = 0;
-  IMXRT_TMR1.CH[1].LOAD   = 0;
-  IMXRT_TMR1.CH[1].CNTR   = 0;
-  IMXRT_TMR1.CH[1].COMP1  = 0xFFFF;
-  IMXRT_TMR1.CH[1].CMPLD1 = 0xFFFF;
-  IMXRT_TMR1.CH[1].CTRL   = TMR_CTRL_CM(7);
-
   IMXRT_TMR1.CH[0].CSCTRL &= ~TMR_CSCTRL_TCF1EN;
   IMXRT_TMR1.CH[0].CSCTRL |=  TMR_CSCTRL_TCF1;
-  IMXRT_TMR1.CH[1].CSCTRL = 0;
-  IMXRT_TMR1.CH[1].SCTRL &= ~(TMR_SCTRL_TOFIE | TMR_SCTRL_IEF | TMR_SCTRL_IEFIE);
 
   (void)IMXRT_TMR1.CH[0].CNTR;
-  (void)IMXRT_TMR1.CH[1].HOLD;
+}
+
+static void qtimer1_ch1_init_for_offset_measurement(void) {
+  // CH1's maiden voyage as an independent VCLOCK-counting channel.  No
+  // longer the CM=7 cascade slave for the old 32-bit cascade — that
+  // machinery is gone.  CH1 now mirrors CH2's setup: it counts the same
+  // 10 MHz VCLOCK source as CH0/CH2/CH3 with a disabled compare; the
+  // compare is armed dynamically inside the PPS GPIO ISR via
+  // pps_vclock_offset_arm().
+  IMXRT_TMR1.CH[1].CTRL   = 0;
+  IMXRT_TMR1.CH[1].CNTR   = 0;
+  IMXRT_TMR1.CH[1].LOAD   = 0;
+  IMXRT_TMR1.CH[1].COMP1  = 0xFFFF;
+  IMXRT_TMR1.CH[1].CMPLD1 = 0xFFFF;
+  IMXRT_TMR1.CH[1].SCTRL  = 0;
+  IMXRT_TMR1.CH[1].CSCTRL = 0;
+  // CM=1 (count rising edges of primary source), PCS=0 (CH0 input → 10 MHz
+  // VCLOCK).  Same source as CH2/CH3, so CH1's CNTR advances on the same
+  // VCLOCK ticks observed by the rest of the timing stack.
+  IMXRT_TMR1.CH[1].CTRL   = TMR_CTRL_CM(1) | TMR_CTRL_PCS(0);
+  qtimer1_ch1_disable_compare();
 }
 
 static void qtimer1_ch2_init_for_schedule(void) {
@@ -847,11 +1020,12 @@ void process_interrupt_init_hardware(void) {
   IMXRT_TMR3.CH[3].CTRL = TMR_CTRL_CM(1) | TMR_CTRL_PCS(3);
   qtimer3_disable_compare(3);
 
-  // QTimer1 synchronized channel start: ENBL=0 first, configure CH0/CH1/CH2/CH3
-  // fully, then a single ENBL=0xF write starts all four on the same VCLOCK
-  // edge — zero phase offset by construction.
+  // QTimer1 synchronized channel start: ENBL=0 first, configure
+  // CH0/CH1/CH2/CH3 fully, then a single ENBL=0xF write starts all four
+  // on the same VCLOCK edge — zero phase offset by construction.
   IMXRT_TMR1.ENBL = 0;
   qtimer1_init_vclock_base();
+  qtimer1_ch1_init_for_offset_measurement();
   qtimer1_ch2_init_for_schedule();
   qtimer1_ch3_init_vclock_cadence();
   IMXRT_TMR1.CH[0].CNTR = 0;
@@ -859,6 +1033,8 @@ void process_interrupt_init_hardware(void) {
   IMXRT_TMR1.CH[2].CNTR = 0;
   IMXRT_TMR1.CH[3].CNTR = 0;
   IMXRT_TMR1.ENBL = 0x0F;
+
+  pps_vclock_offset_reset();
 
   g_interrupt_hw_ready = true;
 }
@@ -912,7 +1088,9 @@ void process_interrupt_enable_irqs(void) {
   g_ocxo2_lane.phase_bootstrapped = false;
   qtimer3_program_compare(3, (uint16_t)(g_ocxo2_lane.compare_target + 1));
 
-  // CH2 (schedule fire) stays disabled until the consumer arms it.
+  // CH1 (offset measurement) and CH2 (schedule fire) stay disabled until
+  // their respective consumers arm them — CH1 inside the PPS GPIO ISR,
+  // CH2 from TimePop's precision-mode arming.
 
   g_interrupt_irqs_enabled = true;
 }
@@ -940,24 +1118,44 @@ static Payload cmd_report(const Payload&) {
   p.add("runtime_ready",  g_interrupt_runtime_ready);
   p.add("irqs_enabled",   g_interrupt_irqs_enabled);
 
-  // PPS / canonical VCLOCK epoch witness state
+  // PPS rebootstrap state
   p.add("pps_rebootstrap_pending", g_pps_rebootstrap_pending);
-  p.add("canonical_vclock_epoch_offset_config_cycles",
-        (int32_t)CANONICAL_VCLOCK_EPOCH_MINUS_RAW_PPS_ISR_CYCLES);
-  p.add("canonical_vclock_epoch_offset_last_cycles",
-        g_pps_canonical_offset_cycles_last);
-  p.add("canonical_vclock_epoch_offset_min_cycles",
-        (g_pps_canonical_offset_samples > 0) ? g_pps_canonical_offset_cycles_min : 0);
-  p.add("canonical_vclock_epoch_offset_max_cycles",
-        (g_pps_canonical_offset_samples > 0) ? g_pps_canonical_offset_cycles_max : 0);
-  p.add("canonical_vclock_epoch_offset_samples",
-        g_pps_canonical_offset_samples);
-  p.add("canonical_vclock_epoch_offset_mismatches",
-        g_pps_canonical_offset_mismatches);
-  p.add("last_raw_pps_isr_entry_dwt",
-        g_pps_raw_isr_entry_dwt_last);
-  p.add("last_canonical_vclock_epoch_dwt",
-        g_pps_canonical_epoch_dwt_last);
+
+  // PPS↔VCLOCK irreducible offset measurement (empirical, no constant fed back).
+  // Each PPS edge arms CH1 to fire on the next VCLOCK edge; the CH1 ISR
+  // captures (vclock_dwt - pps_dwt) % 100 and updates Welford state.  In
+  // a healthy system, mean is stable and stddev is tiny; the value
+  // historically settled around +34 cycles.
+  {
+    pps_vclock_offset_welford_t w;
+    {
+      uint32_t primask;
+      __asm__ volatile ("MRS %0, primask" : "=r" (primask));
+      __asm__ volatile ("CPSID i" ::: "memory");
+      w = g_pps_vclock_offset;
+      __asm__ volatile ("MSR primask, %0" :: "r" (primask) : "memory");
+    }
+    p.add("pps_vclock_offset_samples", w.n);
+    if (w.n > 0) {
+      p.add("pps_vclock_offset_last_cycles", w.last);
+      p.add("pps_vclock_offset_min_cycles",  w.min);
+      p.add("pps_vclock_offset_max_cycles",  w.max);
+      p.add("pps_vclock_offset_mean_cycles", w.mean);
+      const double variance = (w.n >= 2) ? (w.m2 / (double)(w.n - 1)) : 0.0;
+      p.add("pps_vclock_offset_stddev_cycles",
+            (variance > 0.0) ? sqrt(variance) : 0.0);
+    } else {
+      p.add("pps_vclock_offset_last_cycles", (int32_t)0);
+      p.add("pps_vclock_offset_min_cycles",  (int32_t)0);
+      p.add("pps_vclock_offset_max_cycles",  (int32_t)0);
+      p.add("pps_vclock_offset_mean_cycles", 0.0);
+      p.add("pps_vclock_offset_stddev_cycles", 0.0);
+    }
+    p.add("pps_vclock_offset_arm_total",      g_pps_vclock_offset_arm_total);
+    p.add("pps_vclock_offset_complete_total", g_pps_vclock_offset_complete_total);
+    p.add("pps_vclock_offset_dropped_total",  g_pps_vclock_offset_dropped_total);
+    p.add("pps_vclock_offset_armed",          g_pps_vclock_offset_armed);
+  }
 
   // Subscriber sequences (monotone counters per kind)
   p.add("pps_vclock_sequence", g_pps_vclock.sequence);
@@ -1097,11 +1295,12 @@ const char* interrupt_provider_kind_str(interrupt_provider_kind_t provider) {
 
 const char* interrupt_lane_str(interrupt_lane_t lane) {
   switch (lane) {
-    case interrupt_lane_t::QTIMER1_CH2_SCHED: return "QTIMER1_CH2_SCHED";
-    case interrupt_lane_t::QTIMER1_CH3_COMP:  return "QTIMER1_CH3_COMP";
-    case interrupt_lane_t::QTIMER3_CH2_COMP:  return "QTIMER3_CH2_COMP";
-    case interrupt_lane_t::QTIMER3_CH3_COMP:  return "QTIMER3_CH3_COMP";
-    case interrupt_lane_t::GPIO_EDGE:         return "GPIO_EDGE";
-    default:                                  return "NONE";
+    case interrupt_lane_t::QTIMER1_CH1_OFFSET: return "QTIMER1_CH1_OFFSET";
+    case interrupt_lane_t::QTIMER1_CH2_SCHED:  return "QTIMER1_CH2_SCHED";
+    case interrupt_lane_t::QTIMER1_CH3_COMP:   return "QTIMER1_CH3_COMP";
+    case interrupt_lane_t::QTIMER3_CH2_COMP:   return "QTIMER3_CH2_COMP";
+    case interrupt_lane_t::QTIMER3_CH3_COMP:   return "QTIMER3_CH3_COMP";
+    case interrupt_lane_t::GPIO_EDGE:          return "GPIO_EDGE";
+    default:                                   return "NONE";
   }
 }

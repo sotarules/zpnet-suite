@@ -544,7 +544,6 @@ def teensy_status_readout() -> Generator[str, None, None]:
     t = get_system_snapshot()["teensy"]
 
     yield f"TEENSY STATUS: {t['health_state']}"
-    yield f"FW VERSION: {t['fw_version']}"
     yield f"CPU TEMP: {t['cpu_temp_c']:.2f} C"
     yield f"CPU USAGE: {t['cpu_usage_pct']:.4f} %"
     yield f"FREE HEAP: {t['free_heap_bytes']} BYTES"
