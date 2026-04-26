@@ -187,7 +187,6 @@ void transport_register_receive_callback(
 // =============================================================
 
 static void transport_tx_pump(timepop_ctx_t*, timepop_diag_t*, void*) {
-
   if (tx_job_count == 0)
     return;
 
@@ -534,13 +533,11 @@ static void rx_serial_tick() {
 // =============================================================
 
 static void transport_rx_tick(timepop_ctx_t*, timepop_diag_t*, void*) {
-
 #if defined(ZPNET_TRANSPORT_SELECTED_HID)
   rx_hid_tick();
 #elif defined(ZPNET_TRANSPORT_SELECTED_SERIAL)
   rx_serial_tick();
 #endif
-
 }
 
 // =============================================================
