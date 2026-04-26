@@ -46,8 +46,6 @@
 static constexpr uint32_t MAX_SLOTS          = 16;
 static constexpr uint32_t MAX_ASAP_SLOTS     = 8;
 static constexpr uint32_t MAX_ALAP_SLOTS     = 4;
-static constexpr uint64_t NS_PER_TICK        = 100ULL;
-static constexpr int64_t  GNSS_NS_PER_SECOND = 1000000000LL;
 
 static constexpr uint32_t SPINDRY_APPROACH_TICKS =
     (uint32_t)(SPINDRY_APPROACH_NS / NS_PER_TICK);
@@ -680,7 +678,7 @@ timepop_handle_t timepop_arm_from_anchor(int64_t anchor_gnss_ns,
   if (target <= 0) return TIMEPOP_INVALID_HANDLE;
   return arm_tick_absolute_internal(target,
                                     recurring,
-                                    recurring ? GNSS_NS_PER_SECOND : 0,
+                                    recurring ? NS_PER_SECOND : 0,
                                     callback,
                                     user_data,
                                     name);

@@ -26,6 +26,7 @@ static constexpr transport_backend_t ZPNET_TRANSPORT = TRANSPORT_HID;
 static constexpr uint64_t NS_PER_SECOND      = 1000000000ULL;
 static constexpr uint64_t NS_PER_MILLISECOND = 1000000ULL;
 static constexpr uint64_t NS_PER_MICROSECOND = 1000ULL;
+static constexpr uint64_t NS_PER_TICK        = 100ULL;
 
 // --------------------------------------------------------------
 // 10 MHz clock constants
