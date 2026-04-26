@@ -4,42 +4,30 @@
 //
 // TimePop process interface.
 //
-// TimePop is a foreground scheduler whose timed slots are fired by
-// process_interrupt's hardware-driven schedule-fire mechanism (QTimer1
-// CH2 compare).  TimePop owns no hardware; all hardware programming
-// goes through the public interrupt_schedule_*() API.
+// TimePop is a foreground scheduler with two internal timing modes:
 //
-// Two delivery contexts:
+//   • TICK mode:
+//       The default mode used by timepop_arm(), timepop_arm_at(), and
+//       timepop_arm_from_anchor().  Slots are scanned from the 1 kHz TICK
+//       subscriber and user callbacks run in foreground callback context.
+//       This is the mode for ordinary services: transport RX/TX, event
+//       publishing, CPU usage, DAC pacing, PPS relay off, watchdog work,
+//       and any callback that may touch foreground APIs.
 //
-//   • FOREGROUND:  user callback runs in loop() context.  The CH2 ISR
-//     queues an asap slot; foreground drains it via timepop_dispatch().
+//   • PRECISION / SPINDRY mode:
+//       The opt-in mode used only by timepop_arm_at_spindry() and
+//       timepop_arm_from_anchor_spindry().  TimePop asks process_interrupt
+//       to arm the QTimer1 CH2 schedule-fire lane for an approach fire,
+//       then spins on DWT and invokes the user callback in ISR context.
 //
-//   • SPINDRY:     user callback runs in CH2 ISR context, after a tight
-//     DWT spin from the approach ISR fire to the exact deadline.  See
-//     timepop.h for the contract and diagnostic semantics.
+// TimePop owns no QTimer hardware.  process_interrupt remains the sole
+// owner of QTimer1/QTimer3 registers.  TimePop uses the public
+// interrupt_schedule_*() API only for the precision/SpinDry lane.
 //
-// TimePop additionally subscribes to TICK (1 kHz) for two responsibilities:
-//
-//   1. Pre-bridge anchoring — slots armed via timepop_arm() before the
-//      first PPS edge can't yet compute counter32 deadlines (the bridge
-//      isn't up).  These are stashed with `pending_anchor=true` and a
-//      relative delay_ticks; the first TICK after the bridge comes up
-//      anchors them to a real counter32.
-//
-//   2. ASAP/ALAP heartbeat — although timepop_dispatch() in loop() is
-//      the primary asap/alap drain, TICK provides a guaranteed periodic
-//      drain at 1 kHz for paths that don't rely on loop() turnaround.
-//
-// All timed deadlines are stored in synthetic VCLOCK counter32 ticks.
-// The synthetic counter32 is published into events by process_interrupt;
-// TimePop never reads counter hardware.
-//
-// Scheduling resolution:
-//   • Foreground slots: bounded above by foreground loop turnaround
-//     (~tens of microseconds in normal operation, up to milliseconds if
-//     loop() is busy).
-//   • SpinDry slots: sub-microsecond (target ≤ 50 ns of jitter under
-//     normal operation; subject to PPS preemption — see diag fields).
+// All ordinary timed services are deliberately kept off the CH2 precision
+// path.  This preserves the stability of the original 1 kHz scheduler and
+// prevents recurring foreground work from flooding the ASAP queue with
+// hardware-fire delivery contexts.
 //
 // ============================================================================
 

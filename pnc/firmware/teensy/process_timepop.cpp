@@ -1,31 +1,26 @@
 // ============================================================================
-// process_timepop.cpp — Foreground scheduler, hardware-fire-driven
+// process_timepop.cpp — Two-mode scheduler: TICK stable + SpinDry precision
 // ============================================================================
 //
-// See process_timepop.h for the architectural overview.  This file
-// implements a head-fire model:
+// TimePop now has two deliberately separate timing modes:
 //
-//   • The head-of-queue is the active timed slot whose effective fire
-//     moment is soonest (deadline for foreground slots, or
-//     deadline - SPINDRY_APPROACH_TICKS for SpinDry slots).
-//   • TimePop arms QTimer1 CH2 via interrupt_schedule_fire_at() to fire
-//     at the head's effective fire moment.  Only one slot is armed in
-//     hardware at a time.
-//   • When CH2 fires, our ISR-context callback runs; it dispatches the
-//     head slot (foreground asap for normal slots, synchronous spin for
-//     SpinDry), recomputes the new head, and arms CH2 for the next.
-//   • Any operation that mutates the timed-slot table (arm, cancel,
-//     fire, expire, synthetic-counter zero) calls schedule_next_head()
-//     to rearm CH2 against the new head.
+//   • TICK mode:
+//       Default for timepop_arm(), timepop_arm_at(), and
+//       timepop_arm_from_anchor().  The 1 kHz TICK subscriber scans these
+//       slots and invokes due callbacks in foreground callback context.
+//       This restores the original stable scheduler behavior for ordinary
+//       services and keeps recurring 1 kHz work off the CH2 precision lane.
 //
-// TICK subscription remains for two narrow responsibilities:
-//   1. Pre-bridge anchoring of slots armed before the first PPS edge.
-//   2. A guaranteed 1 kHz asap/alap drain (loop() is the primary drain;
-//      TICK is the safety net).
+//   • SPINDRY precision mode:
+//       Opt-in only via timepop_arm_at_spindry() and
+//       timepop_arm_from_anchor_spindry().  These slots are scheduled by
+//       process_interrupt's QTimer1 CH2 schedule-fire lane.  On approach
+//       fire, TimePop spins on DWT until the target and invokes the user
+//       callback in ISR context.
 //
-// All scheduling math goes through alpha's PPS_VCLOCK slot via
-// alpha_pps_vclock_load() and alpha_dwt_cycles_per_second().  No counter
-// reads.  No anchor caching.
+// The CH2 head-of-queue scheduler ignores all ordinary TICK-mode slots.
+// This prevents transport/event/cpu recurring services from flooding the
+// ASAP queue with hardware-fire delivery contexts.
 // ============================================================================
 
 #include "process_timepop.h"
@@ -48,26 +43,17 @@
 // Constants
 // ============================================================================
 
-static constexpr uint32_t MAX_SLOTS               = 16;
-static constexpr uint32_t MAX_ASAP_SLOTS          = 8;
-static constexpr uint32_t MAX_ALAP_SLOTS          = 4;
-static constexpr uint32_t FIRE_RING_SIZE          = 8;
-static constexpr uint64_t NS_PER_TICK             = 100ULL;
-static constexpr int64_t  GNSS_NS_PER_SECOND      = 1000000000LL;
+static constexpr uint32_t MAX_SLOTS          = 16;
+static constexpr uint32_t MAX_ASAP_SLOTS     = 8;
+static constexpr uint32_t MAX_ALAP_SLOTS     = 4;
+static constexpr uint64_t NS_PER_TICK        = 100ULL;
+static constexpr int64_t  GNSS_NS_PER_SECOND = 1000000000LL;
 
-// SpinDry approach window in counter32 ticks.  At 100 ns per tick,
-// SPINDRY_APPROACH_NS / NS_PER_TICK = 50 ticks for the default 5 µs.
-static constexpr uint32_t SPINDRY_APPROACH_TICKS  =
+static constexpr uint32_t SPINDRY_APPROACH_TICKS =
     (uint32_t)(SPINDRY_APPROACH_NS / NS_PER_TICK);
 
-// Tolerances for diag flags (DWT cycles).  A few cycles is normal spin
-// loop iteration noise; anything substantially above that is a real
-// preemption or overshoot.
-static constexpr int32_t  SPIN_TOLERANCE_CYCLES   = 16;
+static constexpr int32_t  SPIN_TOLERANCE_CYCLES = 16;
 
-// SpinDry approach window in DWT cycles.  Exact rational conversion via
-// config's DWT_NS_NUM=125 / DWT_NS_DEN=126 (1 DWT cycle = 125/126 ns at
-// 1.008 GHz).  For the default 5 µs approach, this is exactly 5040 cycles.
 static constexpr uint32_t SPINDRY_APPROACH_DWT_CYCLES =
     (uint32_t)((SPINDRY_APPROACH_NS * DWT_NS_DEN + DWT_NS_NUM / 2) / DWT_NS_NUM);
 
@@ -90,43 +76,43 @@ static inline void critical_exit(uint32_t primask) {
 // Slot types
 // ============================================================================
 
+enum class timepop_slot_mode_t : uint8_t {
+  TICK    = 0,
+  SPINDRY = 1,
+};
+
+static const char* slot_mode_str(timepop_slot_mode_t mode) {
+  switch (mode) {
+    case timepop_slot_mode_t::SPINDRY: return "SPINDRY";
+    default:                           return "TICK";
+  }
+}
+
 struct timepop_slot_t {
   bool                active;
   bool                expired;
   bool                recurring;
   bool                is_absolute;
-  bool                is_spindry;       // SpinDry contract: ISR-context fire
-
-  // Pre-bridge "deferred anchor": the slot was armed before alpha had a
-  // valid PPS_VCLOCK slot, so we couldn't compute a counter32 deadline.
-  // The slot carries delay_ticks (relative) and is anchored on the first
-  // TICK that delivers a valid counter32_at_edge.  After anchoring,
-  // pending_anchor=false and `deadline` is the real counter32 deadline.
-  // SpinDry slots can never be pending_anchor — they require a valid
-  // bridge to compute target_dwt.
   bool                pending_anchor;
-  uint32_t            delay_ticks;
+  timepop_slot_mode_t mode;
 
+  uint32_t            delay_ticks;
   timepop_handle_t    handle;
 
-  // Deadline in synthetic VCLOCK counter32 ticks.  Compared via
-  // (int32_t)(now - deadline) >= 0 to handle 32-bit wrap correctly.
+  // Deadline in synthetic VCLOCK counter32 ticks.
   uint32_t            deadline;
 
-  // SpinDry: predicted DWT at deadline.  Computed fresh inside the
-  // approach ISR using the latest bridge; the value stored at arm time
-  // is a sanity check only.
+  // SpinDry target DWT sanity value.  Recomputed at fire time.
   uint32_t            target_dwt;
 
-  // Recurring period in counter32 ticks; 0 if not recurring.
   uint32_t            period_ticks;
 
-  // For absolute-recurring: target gnss_ns advances by period_ns each
-  // fire, and deadline is recomputed from alpha's slot.
+  // For absolute slots: target GNSS ns.  For absolute recurring TICK
+  // slots, this advances by period_ns on each fire.
   int64_t             target_gnss_ns;
   uint64_t            period_ns;
 
-  // Captured at fire time (for foreground delivery via fire ring).
+  // Last fire facts for reports.
   uint32_t            fire_dwt_cyccnt;
   uint32_t            fire_counter32;
   int64_t             fire_gnss_ns;
@@ -138,20 +124,11 @@ struct timepop_slot_t {
 
 struct deferred_slot_t {
   bool                active;
+  bool                has_ctx;
   timepop_handle_t    handle;
   timepop_callback_t  callback;
   void*               user_data;
   const char*         name;
-};
-
-// Per-fire pending entry — claimed by the CH2 ISR for normal (foreground)
-// timed slot fires, drained by the asap trampoline.  This buffer lets
-// the slot be re-armed (recurring) or canceled (one-shot) without losing
-// the fire's context.
-struct fire_pending_t {
-  volatile bool       in_use;
-  timepop_callback_t  callback;
-  void*               user_data;
   timepop_ctx_t       ctx;
 };
 
@@ -162,7 +139,6 @@ struct fire_pending_t {
 static timepop_slot_t  slots[MAX_SLOTS];
 static deferred_slot_t asap_slots[MAX_ASAP_SLOTS];
 static deferred_slot_t alap_slots[MAX_ALAP_SLOTS];
-static fire_pending_t  fire_ring[FIRE_RING_SIZE];
 static uint32_t        next_handle = 1;
 static volatile bool   timepop_pending = false;
 
@@ -171,6 +147,7 @@ static volatile bool   timepop_pending = false;
 // ============================================================================
 
 static volatile uint32_t diag_tick_count             = 0;
+static volatile uint32_t diag_tick_timed_fired       = 0;
 static volatile uint32_t diag_timed_fired            = 0;
 static volatile uint32_t diag_arm_failures           = 0;
 static volatile uint32_t diag_named_replacements     = 0;
@@ -180,17 +157,17 @@ static volatile uint32_t diag_alap_armed             = 0;
 static volatile uint32_t diag_alap_dispatched        = 0;
 static volatile uint32_t diag_dispatch_calls         = 0;
 static volatile uint32_t diag_slots_high_water       = 0;
-static volatile uint32_t diag_head_recompute_count   = 0;
-static volatile uint32_t diag_schedule_fire_arm_calls    = 0;
-static volatile uint32_t diag_schedule_fire_cancel_calls = 0;
+static volatile uint32_t diag_precision_head_recompute_count = 0;
+static volatile uint32_t diag_schedule_fire_arm_calls        = 0;
+static volatile uint32_t diag_schedule_fire_cancel_calls     = 0;
 static volatile uint32_t diag_pre_bridge_anchored   = 0;
 
-static volatile uint32_t diag_spindry_fires_total       = 0;
-static volatile uint32_t diag_spindry_fires_preempted   = 0;
-static volatile uint32_t diag_spindry_fires_overshot    = 0;
-static volatile uint32_t diag_spindry_arm_failures      = 0;
-static volatile uint32_t diag_spindry_bridge_lost      = 0;
-static volatile uint32_t diag_fire_ring_overflow       = 0;
+static volatile uint32_t diag_spindry_fires_total     = 0;
+static volatile uint32_t diag_spindry_fires_preempted = 0;
+static volatile uint32_t diag_spindry_fires_overshot  = 0;
+static volatile uint32_t diag_spindry_arm_failures    = 0;
+static volatile uint32_t diag_spindry_bridge_lost     = 0;
+static volatile uint32_t diag_fire_arm_failures       = 0;  // retained for report compatibility
 
 static inline void update_slot_high_water(void) {
   uint32_t n = 0;
@@ -206,9 +183,6 @@ static inline bool deadline_expired(uint32_t deadline, uint32_t now) {
   return (int32_t)(now - deadline) >= 0;
 }
 
-// True if a is "earlier than" b in 32-bit wraparound space.  Valid as
-// long as the spread between any two compared deadlines is < 2^31 ticks
-// (~214 seconds at 10 MHz) — true for every realistic schedule.
 static inline bool deadline_lt(uint32_t a, uint32_t b) {
   return (int32_t)(a - b) < 0;
 }
@@ -231,9 +205,6 @@ static bool gnss_ns_to_counter32_deadline(int64_t target_gnss_ns,
 
   const int64_t ns_from_anchor = target_gnss_ns - a.gnss_ns_at_edge;
   if (ns_from_anchor < 0) {
-    // Target is before anchor — express it as a wrapped value (the
-    // expiration check handles wrap correctly).  Compute the negative
-    // delta in ticks and subtract.
     const uint64_t neg_ns = (uint64_t)(-ns_from_anchor);
     const uint32_t neg_ticks = (uint32_t)(neg_ns / NS_PER_TICK);
     out_deadline = a.counter32_at_edge - neg_ticks;
@@ -246,8 +217,6 @@ static bool gnss_ns_to_counter32_deadline(int64_t target_gnss_ns,
   return true;
 }
 
-// Returns target DWT for `target_gnss_ns`, or 0 on bridge invalid.
-// Wrapper around time_gnss_ns_to_dwt to make the failure mode explicit.
 static inline uint32_t gnss_ns_to_dwt_safe(int64_t target_gnss_ns) {
   return time_gnss_ns_to_dwt(target_gnss_ns);
 }
@@ -286,15 +255,16 @@ static bool retire_existing_named_slots(const char* name) {
 }
 
 // ============================================================================
-// Deferred (asap/alap) arming and dispatch
+// Deferred ASAP/ALAP arming and dispatch
 // ============================================================================
 
-static timepop_handle_t arm_deferred(deferred_slot_t* buf,
-                                     uint32_t max_slots,
-                                     volatile uint32_t& armed_count,
-                                     timepop_callback_t callback,
-                                     void* user_data,
-                                     const char* name) {
+static timepop_handle_t arm_deferred_with_ctx(deferred_slot_t* buf,
+                                              uint32_t max_slots,
+                                              volatile uint32_t& armed_count,
+                                              timepop_callback_t callback,
+                                              void* user_data,
+                                              const char* name,
+                                              const timepop_ctx_t* ctx_or_null) {
   if (!callback) return TIMEPOP_INVALID_HANDLE;
 
   const uint32_t saved = critical_enter();
@@ -313,6 +283,11 @@ static timepop_handle_t arm_deferred(deferred_slot_t* buf,
     buf[i].callback   = callback;
     buf[i].user_data  = user_data;
     buf[i].name       = name;
+    if (ctx_or_null) {
+      buf[i].has_ctx = true;
+      buf[i].ctx     = *ctx_or_null;
+      buf[i].ctx.handle = h;
+    }
 
     armed_count++;
     timepop_pending = true;
@@ -323,6 +298,16 @@ static timepop_handle_t arm_deferred(deferred_slot_t* buf,
   diag_arm_failures++;
   critical_exit(saved);
   return TIMEPOP_INVALID_HANDLE;
+}
+
+static timepop_handle_t arm_deferred(deferred_slot_t* buf,
+                                     uint32_t max_slots,
+                                     volatile uint32_t& armed_count,
+                                     timepop_callback_t callback,
+                                     void* user_data,
+                                     const char* name) {
+  return arm_deferred_with_ctx(buf, max_slots, armed_count,
+                               callback, user_data, name, nullptr);
 }
 
 static void dispatch_deferred_phase(deferred_slot_t* buf,
@@ -337,28 +322,28 @@ static void dispatch_deferred_phase(deferred_slot_t* buf,
   for (uint32_t i = 0; i < max_slots; i++) {
     if (!snapshot_active[i] || !buf[i].active) continue;
 
-    timepop_ctx_t ctx{};
-    ctx.handle = buf[i].handle;
+    timepop_callback_t cb     = buf[i].callback;
+    void*              udata  = buf[i].user_data;
+    timepop_ctx_t      ctx;
+    if (buf[i].has_ctx) {
+      ctx = buf[i].ctx;
+    } else {
+      ctx = timepop_ctx_t{};
+      ctx.handle = buf[i].handle;
+    }
 
     timepop_diag_t diag{};
-    buf[i].callback(&ctx, &diag, buf[i].user_data);
+    cb(&ctx, &diag, udata);
     dispatched_count++;
     buf[i].active = false;
   }
 }
 
 // ============================================================================
-// Head computation and CH2 arming
+// Precision / SpinDry head computation and CH2 arming
 // ============================================================================
-//
-// schedule_next_head is the central rearm primitive.  Call after any
-// mutation of the timed slot table to keep CH2 aligned with the new
-// head-of-queue.
-//
-// Caller must hold the critical section (or be in ISR context with no
-// concurrent foreground access — same effective protection).
 
-static int find_head_for_schedule(uint32_t& out_effective_fire) {
+static int find_precision_head_for_schedule(uint32_t& out_effective_fire) {
   int best_idx = -1;
   uint32_t best_fire = 0;
 
@@ -366,12 +351,9 @@ static int find_head_for_schedule(uint32_t& out_effective_fire) {
     if (!slots[i].active)        continue;
     if (slots[i].expired)        continue;
     if (slots[i].pending_anchor) continue;
+    if (slots[i].mode != timepop_slot_mode_t::SPINDRY) continue;
 
-    uint32_t eff = slots[i].deadline;
-    if (slots[i].is_spindry) {
-      eff = slots[i].deadline - SPINDRY_APPROACH_TICKS;
-    }
-
+    const uint32_t eff = slots[i].deadline - SPINDRY_APPROACH_TICKS;
     if (best_idx < 0 || deadline_lt(eff, best_fire)) {
       best_idx  = (int)i;
       best_fire = eff;
@@ -382,26 +364,14 @@ static int find_head_for_schedule(uint32_t& out_effective_fire) {
   return best_idx;
 }
 
-// Forward declaration — used by schedule_next_head in the asap fallback.
-static void fire_ring_drain(timepop_ctx_t*, timepop_diag_t*, void*);
-static fire_pending_t* claim_fire_pending(void);
-static void fire_slot_to_foreground_asap(timepop_slot_t& slot,
-                                         uint32_t dwt_at_edge,
-                                         uint32_t counter32_at_edge,
-                                         int64_t  gnss_ns_at_edge);
-
-static void schedule_next_head(void) {
-  // Iterative loop — each pass either arms CH2 for a future head, fires
-  // a past head via foreground asap, or finds nothing and disarms.  No
-  // recursion: a chain of past heads is processed in a single while loop.
+static void schedule_next_precision_head(void) {
   while (true) {
-    diag_head_recompute_count++;
+    diag_precision_head_recompute_count++;
 
     uint32_t effective_fire = 0;
-    const int head_idx = find_head_for_schedule(effective_fire);
+    const int head_idx = find_precision_head_for_schedule(effective_fire);
 
     if (head_idx < 0) {
-      // No active timed slot — disarm CH2.
       if (interrupt_schedule_fire_armed()) {
         diag_schedule_fire_cancel_calls++;
         interrupt_schedule_fire_cancel();
@@ -411,286 +381,53 @@ static void schedule_next_head(void) {
 
     diag_schedule_fire_arm_calls++;
     if (interrupt_schedule_fire_at(effective_fire)) {
-      // Successfully armed for a future fire.
       return;
     }
 
-    // Past target — interrupt_schedule_fire_at refused.  Fire via the
-    // foreground asap fallback so the slot doesn't wait for the
-    // ~7-minute cascade wrap.
-    //
-    // For SpinDry slots in this branch (deadline already past), we
-    // deactivate — the SpinDry contract requires sub-µs landing on a
-    // future deadline, and we cannot honor it.
-    timepop_slot_t& s = slots[head_idx];
-
-    if (s.is_spindry) {
-      diag_spindry_arm_failures++;
-      s.active  = false;
-      s.expired = true;
-      continue;  // try next head
-    }
-
-    // Foreground past slot — synthesize a fire context using bridge
-    // values where possible, last_known_counter32 otherwise.
-    const uint32_t now_c32 = interrupt_last_known_counter32_valid()
-                               ? interrupt_last_known_counter32()
-                               : 0;
-
-    uint32_t fire_dwt = 0;
-    int64_t  fire_gns = 0;
-    if (s.is_absolute) {
-      const uint32_t computed = gnss_ns_to_dwt_safe(s.target_gnss_ns);
-      fire_dwt = (computed != 0) ? computed : ARM_DWT_CYCCNT;
-      fire_gns = s.target_gnss_ns;
-    } else {
-      fire_dwt = ARM_DWT_CYCCNT;
-      const int64_t now_g = time_gnss_ns_now();
-      fire_gns = (now_g >= 0) ? now_g : 0;
-    }
-
-    s.expired = true;
-    fire_slot_to_foreground_asap(s, fire_dwt, now_c32, fire_gns);
-    diag_timed_fired++;
-
-    // Advance: recurring re-arm or one-shot deactivate.
-    if (s.recurring) {
-      if (s.is_absolute && s.period_ns > 0) {
-        s.target_gnss_ns += (int64_t)s.period_ns;
-        const int64_t now_g = time_gnss_ns_now();
-        if (now_g > 0 && s.target_gnss_ns <= now_g) {
-          const int64_t lag = now_g - s.target_gnss_ns;
-          const int64_t jumps = lag / (int64_t)s.period_ns + 1;
-          s.target_gnss_ns += jumps * (int64_t)s.period_ns;
-        }
-        uint32_t next_d = 0;
-        if (gnss_ns_to_counter32_deadline(s.target_gnss_ns, next_d)) {
-          s.deadline = next_d;
-          s.expired  = false;
-        } else {
-          s.active = false;
-        }
-      } else if (s.period_ticks > 0) {
-        s.deadline += s.period_ticks;
-        s.expired = false;
-      } else {
-        s.active = false;
-      }
-    } else {
-      s.active = false;
-    }
-
-    // Loop iterates: find next head (may be the same slot if it was
-    // re-armed for a future deadline, or a different slot, or nothing).
+    // Precision/SpinDry missed its safe approach window.  Deactivate it;
+    // this is a precision miss, not something to punt into foreground.
+    slots[head_idx].active  = false;
+    slots[head_idx].expired = true;
+    diag_spindry_arm_failures++;
   }
 }
 
 // ============================================================================
-// Fire-pending ring (foreground delivery from CH2 ISR)
+// TICK-mode fire handling
 // ============================================================================
 
-static fire_pending_t* claim_fire_pending(void) {
-  for (uint32_t i = 0; i < FIRE_RING_SIZE; i++) {
-    if (!fire_ring[i].in_use) {
-      return &fire_ring[i];
-    }
-  }
-  diag_fire_ring_overflow++;
-  return nullptr;
-}
-
-static void fire_ring_drain(timepop_ctx_t*, timepop_diag_t*, void* ud) {
-  auto* fp = static_cast<fire_pending_t*>(ud);
-  if (!fp || !fp->in_use) return;
-
-  // Snapshot to local stack so the ring entry can be released BEFORE
-  // the user callback runs (in case the callback re-arms and somehow
-  // races to claim the same entry — defensive).
-  timepop_callback_t cb     = fp->callback;
-  void*              udata  = fp->user_data;
-  timepop_ctx_t      ctx    = fp->ctx;
-  timepop_diag_t     diag{};   // foreground fires: all diag fields zero
-  fp->in_use = false;
-
-  if (cb) cb(&ctx, &diag, udata);
-}
-
-static void fire_slot_to_foreground_asap(timepop_slot_t& slot,
-                                         uint32_t dwt_at_edge,
-                                         uint32_t counter32_at_edge,
-                                         int64_t  gnss_ns_at_edge) {
-  fire_pending_t* fp = claim_fire_pending();
-  if (!fp) return;
-
-  fp->callback         = slot.callback;
-  fp->user_data        = slot.user_data;
-  fp->ctx.handle       = slot.handle;
-  fp->ctx.fire_dwt_cyccnt = dwt_at_edge;
-  fp->ctx.fire_counter32  = counter32_at_edge;
-  fp->ctx.fire_gnss_ns    = gnss_ns_at_edge;
-  fp->ctx.target_gnss_ns  = slot.target_gnss_ns;
-  fp->ctx.fire_gnss_error_ns =
-      (slot.target_gnss_ns > 0) ? (gnss_ns_at_edge - slot.target_gnss_ns) : 0;
-  fp->in_use = true;
-
-  // Pass nullptr as the asap name rather than slot.name.  If we passed
-  // slot.name, arm_deferred would call retire_existing_named_slots(name)
-  // and find the recurring TIMED slot we're firing — killing it before
-  // its post-fire re-arm runs.  This bug stops every recurring foreground
-  // consumer (transport-rx, transport-tx, cpu-usage, eventbus, ...) on
-  // its first fire.  The asap entry is a per-fire delivery vehicle; its
-  // identity is its fire_ring slot pointer (passed via user_data), not
-  // a name.
-  timepop_arm_asap(fire_ring_drain, fp, nullptr);
-}
-
-// ============================================================================
-// CH2 schedule-fire callback (ISR context)
-// ============================================================================
-//
-// Invoked by process_interrupt's CH2 ISR when the armed compare matches.
-// This is the SOLE entry point from hardware fire to TimePop dispatch.
-//
-// Sequence:
-//   1. Find which slot is the head.
-//   2. If no head: just return (slot table changed since arm; harmless).
-//   3. If SpinDry: spin to target_dwt, populate diag, call user callback
-//      synchronously, deactivate slot.
-//   4. If foreground: snapshot fire context, fire via asap, advance the
-//      slot (recurring re-arm or one-shot deactivate).
-//   5. Recompute head and rearm CH2.
-
-static void handle_spindry_fire(timepop_slot_t& s,
-                                uint32_t approach_isr_dwt,
-                                uint32_t counter32_at_edge);
-static void handle_foreground_fire(timepop_slot_t& s,
-                                   uint32_t dwt_at_edge,
-                                   uint32_t counter32_at_edge);
-
-static void timepop_schedule_fire_callback(uint32_t dwt_at_edge,
-                                           uint32_t counter32_at_edge,
-                                           void*    /*user_data*/) {
-  // Find the head — should be the slot we armed for.  Use the SAME
-  // head-selection logic as schedule_next_head so we agree on which
-  // slot is firing.
-  uint32_t effective_fire = 0;
-  const int head_idx = find_head_for_schedule(effective_fire);
-  if (head_idx < 0) {
-    // Nothing to fire (slot was canceled between arm and fire).  Make
-    // sure CH2 stays disarmed.
-    return;
-  }
-
-  timepop_slot_t& s = slots[head_idx];
-
-  if (s.is_spindry) {
-    handle_spindry_fire(s, dwt_at_edge, counter32_at_edge);
-  } else {
-    handle_foreground_fire(s, dwt_at_edge, counter32_at_edge);
-  }
-
-  // Rearm CH2 for the new head.
-  schedule_next_head();
-}
-
-static void handle_spindry_fire(timepop_slot_t& s,
-                                uint32_t approach_isr_dwt,
-                                uint32_t counter32_at_edge) {
-  // Recompute target_dwt with the freshest bridge.  The value cached at
-  // arm time may be slightly off due to rate drift; the fresh bridge
-  // (refreshed every PPS) gives sub-cycle accuracy.
-  const uint32_t target_dwt = gnss_ns_to_dwt_safe(s.target_gnss_ns);
-
-  if (target_dwt == 0) {
-    // Bridge went invalid between arm and fire (very rare — implies an
-    // epoch zero happened in this brief window).  Skip the fire.
-    diag_spindry_bridge_lost++;
-    s.active  = false;
-    s.expired = true;
-    return;
-  }
-
-  const uint32_t approach_target_dwt = target_dwt - SPINDRY_APPROACH_DWT_CYCLES;
-
-  // Spin until ARM_DWT_CYCCNT >= target_dwt.  This is the SpinDry core:
-  // tight DWT polling, no critical section (PPS GPIO at priority 0 may
-  // preempt — and we WANT it to, so PPS bookkeeping stays accurate).
-  //
-  // The loop is (cmp, branch) — typically 2-3 cycles per iteration on
-  // Cortex-M7 with branch prediction.  Landing precision is ≤ 1 iteration.
-  while ((int32_t)(target_dwt - ARM_DWT_CYCCNT) > 0) {
-    // Empty body — branch predictor handles this efficiently.
-  }
-  const uint32_t spin_landed_dwt = ARM_DWT_CYCCNT;
-
-  // Diagnostics
-  timepop_diag_t diag{};
-  diag.is_spindry           = true;
-  diag.approach_isr_dwt     = approach_isr_dwt;
-  diag.approach_target_dwt  = approach_target_dwt;
-  diag.target_dwt           = target_dwt;
-  diag.spin_landed_dwt      = spin_landed_dwt;
-  diag.spin_error_cycles    = (int32_t)(spin_landed_dwt - target_dwt);
-
-  // preempt_cycles = (actual approach duration) - (expected approach
-  // duration).  Both measured in DWT cycles.
-  const int32_t actual_approach   = (int32_t)(spin_landed_dwt - approach_isr_dwt);
-  const int32_t expected_approach = (int32_t)(target_dwt      - approach_isr_dwt);
-  const int32_t excess            = actual_approach - expected_approach;
-  diag.preempt_cycles  = (excess > 0) ? (uint32_t)excess : 0;
-  diag.preempted       = (excess                  > SPIN_TOLERANCE_CYCLES);
-  diag.deadline_overshot = (diag.spin_error_cycles > SPIN_TOLERANCE_CYCLES);
-
-  if (diag.preempted)         diag_spindry_fires_preempted++;
-  if (diag.deadline_overshot) diag_spindry_fires_overshot++;
-  diag_spindry_fires_total++;
-  diag_timed_fired++;
-
-  // Build context and dispatch synchronously in ISR.
-  timepop_ctx_t ctx{};
-  ctx.handle             = s.handle;
-  ctx.fire_dwt_cyccnt    = spin_landed_dwt;
-  ctx.fire_counter32     = counter32_at_edge;  // approach moment counter32
-  ctx.fire_gnss_ns       = s.target_gnss_ns;
-  ctx.target_gnss_ns     = s.target_gnss_ns;
-  ctx.fire_gnss_error_ns = 0;  // by construction we landed on target
-
-  // Mark slot inactive BEFORE invoking the callback so the callback
-  // may safely re-arm a new SpinDry on the same name.
-  s.active  = false;
-  s.expired = true;
-
-  if (s.callback) {
-    s.callback(&ctx, &diag, s.user_data);
-  }
-}
-
-static void handle_foreground_fire(timepop_slot_t& s,
-                                   uint32_t dwt_at_edge,
-                                   uint32_t counter32_at_edge) {
-  // For foreground slots we compute fire_gnss_ns from the firing edge
-  // DWT.  This is the same value alpha computes for cadence events.
-  const int64_t fire_gnss_ns = time_dwt_to_gnss_ns(dwt_at_edge);
-
-  // Stamp slot's fire facts (kept for backward-compatible inspection).
-  s.fire_dwt_cyccnt = dwt_at_edge;
-  s.fire_counter32  = counter32_at_edge;
+static void fire_tick_slot(timepop_slot_t& s,
+                           uint32_t now_counter32,
+                           uint32_t fire_dwt,
+                           int64_t fire_gnss_ns) {
+  s.fire_dwt_cyccnt = fire_dwt;
+  s.fire_counter32  = now_counter32;
   s.fire_gnss_ns    = fire_gnss_ns;
   s.expired         = true;
 
+  timepop_ctx_t ctx{};
+  ctx.handle             = s.handle;
+  ctx.fire_dwt_cyccnt    = fire_dwt;
+  ctx.fire_counter32     = now_counter32;
+  ctx.fire_gnss_ns       = fire_gnss_ns;
+  ctx.target_gnss_ns     = s.target_gnss_ns;
+  ctx.fire_gnss_error_ns =
+      (s.target_gnss_ns > 0) ? (fire_gnss_ns - s.target_gnss_ns) : 0;
+
+  timepop_diag_t diag{};
+  if (s.callback) {
+    s.callback(&ctx, &diag, s.user_data);
+  }
+
+  diag_tick_timed_fired++;
   diag_timed_fired++;
 
-  // Dispatch via fire ring → asap → foreground.
-  fire_slot_to_foreground_asap(s, dwt_at_edge, counter32_at_edge,
-                               (fire_gnss_ns >= 0) ? fire_gnss_ns : 0);
-
-  // Recurring re-arm or one-shot deactivate.
   if (s.recurring) {
     if (s.is_absolute && s.period_ns > 0) {
       s.target_gnss_ns += (int64_t)s.period_ns;
-      const int64_t now_g = time_gnss_ns_now();
-      if (now_g > 0 && s.target_gnss_ns <= now_g) {
-        const int64_t lag = now_g - s.target_gnss_ns;
+      const int64_t now_gnss = time_gnss_ns_now();
+      if (now_gnss > 0 && s.target_gnss_ns <= now_gnss) {
+        const int64_t lag = now_gnss - s.target_gnss_ns;
         const int64_t jumps = lag / (int64_t)s.period_ns + 1;
         s.target_gnss_ns += jumps * (int64_t)s.period_ns;
       }
@@ -699,10 +436,16 @@ static void handle_foreground_fire(timepop_slot_t& s,
         s.deadline = next_deadline;
         s.expired  = false;
       } else {
-        s.active = false;
+        // Keep the slot alive but wait for a future TICK/bridge to anchor.
+        s.pending_anchor = true;
+        s.delay_ticks = s.period_ticks;
+        s.expired = false;
       }
     } else if (s.period_ticks > 0) {
       s.deadline += s.period_ticks;
+      if (deadline_expired(s.deadline, now_counter32)) {
+        s.deadline = now_counter32 + s.period_ticks;
+      }
       s.expired = false;
     } else {
       s.active = false;
@@ -713,35 +456,104 @@ static void handle_foreground_fire(timepop_slot_t& s,
 }
 
 // ============================================================================
+// CH2 schedule-fire callback (ISR context) — SpinDry only
+// ============================================================================
+
+static void handle_spindry_fire(timepop_slot_t& s,
+                                uint32_t approach_isr_dwt,
+                                uint32_t counter32_at_edge) {
+  const uint32_t target_dwt = gnss_ns_to_dwt_safe(s.target_gnss_ns);
+
+  if (target_dwt == 0) {
+    diag_spindry_bridge_lost++;
+    s.active  = false;
+    s.expired = true;
+    return;
+  }
+
+  const uint32_t approach_target_dwt = target_dwt - SPINDRY_APPROACH_DWT_CYCLES;
+
+  while ((int32_t)(target_dwt - ARM_DWT_CYCCNT) > 0) {
+    // SpinDry: intentional empty DWT spin.
+  }
+  const uint32_t spin_landed_dwt = ARM_DWT_CYCCNT;
+
+  timepop_diag_t diag{};
+  diag.is_spindry          = true;
+  diag.approach_isr_dwt    = approach_isr_dwt;
+  diag.approach_target_dwt = approach_target_dwt;
+  diag.target_dwt          = target_dwt;
+  diag.spin_landed_dwt     = spin_landed_dwt;
+  diag.spin_error_cycles   = (int32_t)(spin_landed_dwt - target_dwt);
+
+  const int32_t actual_approach   = (int32_t)(spin_landed_dwt - approach_isr_dwt);
+  const int32_t expected_approach = (int32_t)(target_dwt      - approach_isr_dwt);
+  const int32_t excess            = actual_approach - expected_approach;
+  diag.preempt_cycles     = (excess > 0) ? (uint32_t)excess : 0;
+  diag.preempted          = (excess > SPIN_TOLERANCE_CYCLES);
+  diag.deadline_overshot  = (diag.spin_error_cycles > SPIN_TOLERANCE_CYCLES);
+
+  if (diag.preempted)         diag_spindry_fires_preempted++;
+  if (diag.deadline_overshot) diag_spindry_fires_overshot++;
+  diag_spindry_fires_total++;
+  diag_timed_fired++;
+
+  timepop_ctx_t ctx{};
+  ctx.handle             = s.handle;
+  ctx.fire_dwt_cyccnt    = spin_landed_dwt;
+  ctx.fire_counter32     = counter32_at_edge;
+  ctx.fire_gnss_ns       = s.target_gnss_ns;
+  ctx.target_gnss_ns     = s.target_gnss_ns;
+  ctx.fire_gnss_error_ns = 0;
+
+  s.fire_dwt_cyccnt = spin_landed_dwt;
+  s.fire_counter32  = counter32_at_edge;
+  s.fire_gnss_ns    = s.target_gnss_ns;
+
+  // Single-shot precision slot.  Mark inactive before callback so the
+  // callback may re-arm using the same name.
+  s.active  = false;
+  s.expired = true;
+
+  if (s.callback) {
+    s.callback(&ctx, &diag, s.user_data);
+  }
+}
+
+static void timepop_schedule_fire_callback(uint32_t dwt_at_edge,
+                                           uint32_t counter32_at_edge,
+                                           void*    /*user_data*/) {
+  uint32_t effective_fire = 0;
+  const int head_idx = find_precision_head_for_schedule(effective_fire);
+  if (head_idx < 0) return;
+
+  timepop_slot_t& s = slots[head_idx];
+  if (s.mode == timepop_slot_mode_t::SPINDRY) {
+    handle_spindry_fire(s, dwt_at_edge, counter32_at_edge);
+  }
+
+  schedule_next_precision_head();
+}
+
+// ============================================================================
 // Public arming API
 // ============================================================================
 
-static timepop_handle_t arm_absolute_internal(int64_t target_gnss_ns,
-                                              bool recurring,
-                                              uint64_t period_ns,
-                                              bool is_spindry,
-                                              timepop_callback_t callback,
-                                              void* user_data,
-                                              const char* name) {
+static timepop_handle_t allocate_slot(timepop_slot_mode_t mode,
+                                      bool recurring,
+                                      bool is_absolute,
+                                      bool pending_anchor,
+                                      uint32_t delay_ticks,
+                                      uint32_t deadline,
+                                      uint32_t target_dwt,
+                                      uint32_t period_ticks,
+                                      int64_t target_gnss_ns,
+                                      uint64_t period_ns,
+                                      timepop_callback_t callback,
+                                      void* user_data,
+                                      const char* name) {
   if (!callback) return TIMEPOP_INVALID_HANDLE;
-  if (target_gnss_ns <= 0) return TIMEPOP_INVALID_HANDLE;
 
-  uint32_t deadline = 0;
-  if (!gnss_ns_to_counter32_deadline(target_gnss_ns, deadline)) {
-    if (is_spindry) diag_spindry_arm_failures++;
-    return TIMEPOP_INVALID_HANDLE;
-  }
-
-  uint32_t target_dwt = 0;
-  if (is_spindry) {
-    target_dwt = gnss_ns_to_dwt_safe(target_gnss_ns);
-    if (target_dwt == 0) {
-      diag_spindry_arm_failures++;
-      return TIMEPOP_INVALID_HANDLE;
-    }
-  }
-
-  const uint32_t saved = critical_enter();
   retire_existing_named_slots(name);
 
   for (uint32_t i = 0; i < MAX_SLOTS; i++) {
@@ -752,27 +564,26 @@ static timepop_handle_t arm_absolute_internal(int64_t target_gnss_ns,
 
     slots[i] = {};
     slots[i].active         = true;
-    slots[i].recurring      = recurring && period_ns > 0 && !is_spindry;
-    slots[i].is_absolute    = true;
-    slots[i].is_spindry     = is_spindry;
+    slots[i].recurring      = recurring;
+    slots[i].is_absolute    = is_absolute;
+    slots[i].pending_anchor = pending_anchor;
+    slots[i].mode           = mode;
+    slots[i].delay_ticks    = delay_ticks;
     slots[i].handle         = h;
     slots[i].deadline       = deadline;
     slots[i].target_dwt     = target_dwt;
+    slots[i].period_ticks   = period_ticks;
     slots[i].target_gnss_ns = target_gnss_ns;
-    slots[i].period_ns      = is_spindry ? 0 : period_ns;
-    slots[i].period_ticks   = (period_ns > 0 && !is_spindry) ? ns_to_ticks_clamp(period_ns) : 0;
+    slots[i].period_ns      = period_ns;
     slots[i].callback       = callback;
     slots[i].user_data      = user_data;
     slots[i].name           = name;
 
     update_slot_high_water();
-    schedule_next_head();
-    critical_exit(saved);
     return h;
   }
 
   diag_arm_failures++;
-  critical_exit(saved);
   return TIMEPOP_INVALID_HANDLE;
 }
 
@@ -783,63 +594,69 @@ timepop_handle_t timepop_arm(uint64_t delay_gnss_ns,
                              const char* name) {
   if (!callback) return TIMEPOP_INVALID_HANDLE;
 
-  // Compute delay_ticks once; valid even before the bridge is up.
-  const uint32_t delay_ticks = ns_to_ticks_clamp(delay_gnss_ns);
-  const uint64_t period_ns   = recurring ? delay_gnss_ns : 0;
+  const uint32_t delay_ticks  = ns_to_ticks_clamp(delay_gnss_ns);
   const uint32_t period_ticks = recurring ? delay_ticks : 0;
 
-  // Try the bridge-aware path first.  If it succeeds, the slot is fully
-  // anchored from boot.  If it fails (typical at boot before first PPS),
-  // fall through to the pre-bridge deferred-anchor path.
-  const int64_t now_gnss_ns = time_gnss_ns_now();
-  if (now_gnss_ns >= 0) {
-    const int64_t target_gnss_ns = now_gnss_ns + (int64_t)delay_gnss_ns;
-    return arm_absolute_internal(target_gnss_ns,
-                                 recurring,
-                                 period_ns,
-                                 false,
-                                 callback,
-                                 user_data,
-                                 name);
-  }
-
-  // Pre-bridge: arm a deferred-anchor slot.  The first TICK after boot
-  // anchors it with deadline = tick.counter32_at_edge + delay_ticks.
-  // Recurring slots keep period_ticks for post-fire rearming; they do
-  // NOT use the absolute (gnss_ns) recurring path because the bridge
-  // isn't authoritative yet.
   const uint32_t saved = critical_enter();
-  retire_existing_named_slots(name);
 
-  for (uint32_t i = 0; i < MAX_SLOTS; i++) {
-    if (slots[i].active) continue;
+  // Always TICK mode.  Relative foreground timers deliberately anchor
+  // on the next TICK rather than last_known_counter32.  This avoids using
+  // a stale pre-zero last_known value during START/ZERO transitions and
+  // restores the original "next scheduler heartbeat establishes now"
+  // behavior.  The cost is at most one TICK of phase ambiguity, which is
+  // exactly the contract for TICK-mode timers.
+  const timepop_handle_t h =
+      allocate_slot(timepop_slot_mode_t::TICK,
+                    recurring,
+                    false,
+                    true,
+                    delay_ticks,
+                    0,
+                    0,
+                    period_ticks,
+                    0,
+                    0,
+                    callback,
+                    user_data,
+                    name);
 
-    timepop_handle_t h = next_handle++;
-    if (next_handle == TIMEPOP_INVALID_HANDLE) next_handle = 1;
-
-    slots[i] = {};
-    slots[i].active         = true;
-    slots[i].pending_anchor = true;
-    slots[i].delay_ticks    = delay_ticks;
-    slots[i].recurring      = recurring;
-    slots[i].is_absolute    = false;
-    slots[i].is_spindry     = false;
-    slots[i].handle         = h;
-    slots[i].period_ns      = 0;
-    slots[i].period_ticks   = period_ticks;
-    slots[i].callback       = callback;
-    slots[i].user_data      = user_data;
-    slots[i].name           = name;
-
-    update_slot_high_water();
-    // No schedule_next_head — this slot can't be the head (pending_anchor).
-    critical_exit(saved);
-    return h;
-  }
-
-  diag_arm_failures++;
   critical_exit(saved);
-  return TIMEPOP_INVALID_HANDLE;
+  return h;
+}
+
+static timepop_handle_t arm_tick_absolute_internal(int64_t target_gnss_ns,
+                                                   bool recurring,
+                                                   uint64_t period_ns,
+                                                   timepop_callback_t callback,
+                                                   void* user_data,
+                                                   const char* name) {
+  if (!callback) return TIMEPOP_INVALID_HANDLE;
+  if (target_gnss_ns <= 0) return TIMEPOP_INVALID_HANDLE;
+
+  uint32_t deadline = 0;
+  const bool have_deadline = gnss_ns_to_counter32_deadline(target_gnss_ns, deadline);
+
+  const uint32_t period_ticks = (recurring && period_ns > 0)
+                                  ? ns_to_ticks_clamp(period_ns)
+                                  : 0;
+
+  const uint32_t saved = critical_enter();
+  const timepop_handle_t h =
+      allocate_slot(timepop_slot_mode_t::TICK,
+                    recurring && period_ns > 0,
+                    true,
+                    !have_deadline,
+                    period_ticks,
+                    have_deadline ? deadline : 0,
+                    0,
+                    period_ticks,
+                    target_gnss_ns,
+                    recurring ? period_ns : 0,
+                    callback,
+                    user_data,
+                    name);
+  critical_exit(saved);
+  return h;
 }
 
 timepop_handle_t timepop_arm_at(int64_t target_gnss_ns,
@@ -848,8 +665,8 @@ timepop_handle_t timepop_arm_at(int64_t target_gnss_ns,
                                 void* user_data,
                                 const char* name) {
   (void)recurring;  // absolute one-shots only via this API
-  return arm_absolute_internal(target_gnss_ns, false, 0, false,
-                               callback, user_data, name);
+  return arm_tick_absolute_internal(target_gnss_ns, false, 0,
+                                    callback, user_data, name);
 }
 
 timepop_handle_t timepop_arm_from_anchor(int64_t anchor_gnss_ns,
@@ -861,21 +678,53 @@ timepop_handle_t timepop_arm_from_anchor(int64_t anchor_gnss_ns,
   if (anchor_gnss_ns <= 0) return TIMEPOP_INVALID_HANDLE;
   const int64_t target = anchor_gnss_ns + offset_gnss_ns;
   if (target <= 0) return TIMEPOP_INVALID_HANDLE;
-  return arm_absolute_internal(target,
-                               recurring,
-                               recurring ? GNSS_NS_PER_SECOND : 0,
-                               false,
-                               callback,
-                               user_data,
-                               name);
+  return arm_tick_absolute_internal(target,
+                                    recurring,
+                                    recurring ? GNSS_NS_PER_SECOND : 0,
+                                    callback,
+                                    user_data,
+                                    name);
 }
 
 timepop_handle_t timepop_arm_at_spindry(int64_t target_gnss_ns,
                                         timepop_callback_t callback,
                                         void* user_data,
                                         const char* name) {
-  return arm_absolute_internal(target_gnss_ns, false, 0, true,
-                               callback, user_data, name);
+  if (!callback) return TIMEPOP_INVALID_HANDLE;
+  if (target_gnss_ns <= 0) return TIMEPOP_INVALID_HANDLE;
+
+  uint32_t deadline = 0;
+  if (!gnss_ns_to_counter32_deadline(target_gnss_ns, deadline)) {
+    diag_spindry_arm_failures++;
+    return TIMEPOP_INVALID_HANDLE;
+  }
+
+  const uint32_t target_dwt = gnss_ns_to_dwt_safe(target_gnss_ns);
+  if (target_dwt == 0) {
+    diag_spindry_arm_failures++;
+    return TIMEPOP_INVALID_HANDLE;
+  }
+
+  const uint32_t saved = critical_enter();
+  const timepop_handle_t h =
+      allocate_slot(timepop_slot_mode_t::SPINDRY,
+                    false,
+                    true,
+                    false,
+                    0,
+                    deadline,
+                    target_dwt,
+                    0,
+                    target_gnss_ns,
+                    0,
+                    callback,
+                    user_data,
+                    name);
+  if (h != TIMEPOP_INVALID_HANDLE) {
+    schedule_next_precision_head();
+  }
+  critical_exit(saved);
+  return h;
 }
 
 timepop_handle_t timepop_arm_from_anchor_spindry(int64_t anchor_gnss_ns,
@@ -886,8 +735,7 @@ timepop_handle_t timepop_arm_from_anchor_spindry(int64_t anchor_gnss_ns,
   if (anchor_gnss_ns <= 0) return TIMEPOP_INVALID_HANDLE;
   const int64_t target = anchor_gnss_ns + offset_gnss_ns;
   if (target <= 0) return TIMEPOP_INVALID_HANDLE;
-  return arm_absolute_internal(target, false, 0, true,
-                               callback, user_data, name);
+  return timepop_arm_at_spindry(target, callback, user_data, name);
 }
 
 timepop_handle_t timepop_arm_asap(timepop_callback_t callback,
@@ -907,51 +755,65 @@ timepop_handle_t timepop_arm_alap(timepop_callback_t callback,
 bool timepop_cancel(timepop_handle_t handle) {
   if (handle == TIMEPOP_INVALID_HANDLE) return false;
   const uint32_t saved = critical_enter();
-  bool found_timed = false;
-  bool found_other = false;
+
+  bool found_precision = false;
+  bool found_any = false;
+
   for (uint32_t i = 0; i < MAX_SLOTS; i++) {
     if (slots[i].active && slots[i].handle == handle) {
-      slots[i].active = false; slots[i].expired = false;
-      found_timed = true;
+      if (slots[i].mode == timepop_slot_mode_t::SPINDRY) found_precision = true;
+      slots[i].active = false;
+      slots[i].expired = false;
+      found_any = true;
     }
   }
   for (uint32_t i = 0; i < MAX_ASAP_SLOTS; i++) {
     if (asap_slots[i].active && asap_slots[i].handle == handle) {
-      asap_slots[i].active = false; found_other = true;
+      asap_slots[i].active = false;
+      found_any = true;
     }
   }
   for (uint32_t i = 0; i < MAX_ALAP_SLOTS; i++) {
     if (alap_slots[i].active && alap_slots[i].handle == handle) {
-      alap_slots[i].active = false; found_other = true;
+      alap_slots[i].active = false;
+      found_any = true;
     }
   }
-  if (found_timed) schedule_next_head();
+
+  if (found_precision) schedule_next_precision_head();
   critical_exit(saved);
-  return found_timed || found_other;
+  return found_any;
 }
 
 uint32_t timepop_cancel_by_name(const char* name) {
   if (!name || !*name) return 0;
   const uint32_t saved = critical_enter();
+
   uint32_t n = 0;
-  bool found_timed = false;
+  bool found_precision = false;
+
   for (uint32_t i = 0; i < MAX_SLOTS; i++) {
     if (slots[i].active && slots[i].name && strcmp(slots[i].name, name) == 0) {
-      slots[i].active = false; slots[i].expired = false; n++;
-      found_timed = true;
+      if (slots[i].mode == timepop_slot_mode_t::SPINDRY) found_precision = true;
+      slots[i].active = false;
+      slots[i].expired = false;
+      n++;
     }
   }
   for (uint32_t i = 0; i < MAX_ASAP_SLOTS; i++) {
     if (asap_slots[i].active && asap_slots[i].name && strcmp(asap_slots[i].name, name) == 0) {
-      asap_slots[i].active = false; n++;
+      asap_slots[i].active = false;
+      n++;
     }
   }
   for (uint32_t i = 0; i < MAX_ALAP_SLOTS; i++) {
     if (alap_slots[i].active && alap_slots[i].name && strcmp(alap_slots[i].name, name) == 0) {
-      alap_slots[i].active = false; n++;
+      alap_slots[i].active = false;
+      n++;
     }
   }
-  if (found_timed) schedule_next_head();
+
+  if (found_precision) schedule_next_precision_head();
   critical_exit(saved);
   return n;
 }
@@ -965,29 +827,22 @@ uint32_t timepop_active_count(void) {
 // ============================================================================
 // Synthetic-counter zero handler
 // ============================================================================
-//
-// Called by alpha after interrupt_synthetic_counters_zero() (which runs
-// inside alpha_install_new_epoch_from_pps_event).  All active slots have
-// deadlines anchored to the OLD synthetic-counter timeline, which was
-// just discarded.  We re-anchor in place; see process_timepop.h for the
-// slot-class breakdown.
 
 void timepop_handle_synthetic_counter_zero(void) {
-  uint32_t saved = critical_enter();
+  const uint32_t saved = critical_enter();
+
+  bool touched_precision = false;
 
   for (uint32_t i = 0; i < MAX_SLOTS; i++) {
     if (!slots[i].active) continue;
 
     slots[i].expired = false;
 
-    if (slots[i].is_spindry) {
-      // SpinDry slots reference an absolute GNSS deadline.  Recompute
-      // both deadline (counter32) and target_dwt against the new
-      // post-zero bridge.  If the bridge is invalid, deactivate
-      // (SpinDry can't tolerate an invalid bridge).
+    if (slots[i].mode == timepop_slot_mode_t::SPINDRY) {
+      touched_precision = true;
       uint32_t new_deadline = 0;
       uint32_t new_target_dwt = 0;
-      const bool d_ok  = gnss_ns_to_counter32_deadline(slots[i].target_gnss_ns, new_deadline);
+      const bool d_ok = gnss_ns_to_counter32_deadline(slots[i].target_gnss_ns, new_deadline);
       if (d_ok) new_target_dwt = gnss_ns_to_dwt_safe(slots[i].target_gnss_ns);
 
       if (d_ok && new_target_dwt != 0) {
@@ -997,19 +852,21 @@ void timepop_handle_synthetic_counter_zero(void) {
         slots[i].active = false;
         diag_spindry_arm_failures++;
       }
-    } else if (slots[i].is_absolute) {
+      continue;
+    }
+
+    if (slots[i].is_absolute) {
       uint32_t new_deadline = 0;
       if (gnss_ns_to_counter32_deadline(slots[i].target_gnss_ns, new_deadline)) {
         slots[i].deadline       = new_deadline;
         slots[i].pending_anchor = false;
       } else {
         slots[i].pending_anchor = true;
-        slots[i].delay_ticks    = (slots[i].recurring && slots[i].period_ticks > 0)
-                                    ? slots[i].period_ticks
-                                    : 0;
+        slots[i].delay_ticks = (slots[i].recurring && slots[i].period_ticks > 0)
+                                  ? slots[i].period_ticks
+                                  : 0;
       }
     } else {
-      // Tick-based slot — re-anchor on next TICK.
       slots[i].pending_anchor = true;
       if (slots[i].recurring && slots[i].period_ticks > 0) {
         slots[i].delay_ticks = slots[i].period_ticks;
@@ -1017,57 +874,66 @@ void timepop_handle_synthetic_counter_zero(void) {
     }
   }
 
-  schedule_next_head();
+  if (touched_precision) schedule_next_precision_head();
+
   critical_exit(saved);
 }
 
 // ============================================================================
-// TICK-driven housekeeping
+// TICK-driven scheduler
 // ============================================================================
-//
-// In the head-fire model, TICK no longer scans timed slots — the CH2
-// hardware fire is the dispatch mechanism.  TICK retains two roles:
-//
-//   1. Pre-bridge anchoring: slots stashed with pending_anchor=true now
-//      get their counter32 deadline.  After anchoring, the head may
-//      have changed; rearm CH2.
-//   2. Periodic asap/alap drain at 1 kHz (loop()'s timepop_dispatch is
-//      the primary drain; TICK is the safety net).
 
 static void tick_callback(const interrupt_event_t& event, void*) {
   diag_tick_count++;
 
-  // Phase 1: ASAP drain
+  // Phase 1: drain ASAP first, preserving the old TimePop rhythm.
   dispatch_deferred_phase(asap_slots, MAX_ASAP_SLOTS, diag_asap_dispatched);
 
-  // Phase 2: Pre-bridge anchoring
-  bool anchored_any = false;
   const uint32_t now = event.counter32_at_edge;
+
+  // Phase 2a: anchor pending TICK slots.
   {
     const uint32_t saved = critical_enter();
     for (uint32_t i = 0; i < MAX_SLOTS; i++) {
-      if (slots[i].active && slots[i].pending_anchor) {
-        slots[i].deadline       = now + slots[i].delay_ticks;
-        slots[i].pending_anchor = false;
-        anchored_any = true;
-        diag_pre_bridge_anchored++;
+      if (!slots[i].active) continue;
+      if (slots[i].mode != timepop_slot_mode_t::TICK) continue;
+      if (!slots[i].pending_anchor) continue;
+
+      if (slots[i].is_absolute) {
+        uint32_t d = 0;
+        if (gnss_ns_to_counter32_deadline(slots[i].target_gnss_ns, d)) {
+          slots[i].deadline = d;
+        } else {
+          slots[i].deadline = now + slots[i].delay_ticks;
+        }
+      } else {
+        slots[i].deadline = now + slots[i].delay_ticks;
       }
+
+      slots[i].pending_anchor = false;
+      diag_pre_bridge_anchored++;
     }
-    if (anchored_any) schedule_next_head();
     critical_exit(saved);
   }
 
-  // Phase 3: ALAP drain
+  // Phase 2b: scan and fire due TICK slots.
+  for (uint32_t i = 0; i < MAX_SLOTS; i++) {
+    if (!slots[i].active) continue;
+    if (slots[i].mode != timepop_slot_mode_t::TICK) continue;
+    if (slots[i].expired) continue;
+    if (slots[i].pending_anchor) continue;
+    if (!deadline_expired(slots[i].deadline, now)) continue;
+
+    fire_tick_slot(slots[i], now, event.dwt_at_edge, event.gnss_ns_at_edge);
+  }
+
+  // Phase 3: drain ALAP last.
   dispatch_deferred_phase(alap_slots, MAX_ALAP_SLOTS, diag_alap_dispatched);
 }
 
 // ============================================================================
 // loop() dispatch entrypoint
 // ============================================================================
-//
-// Foreground asap/alap drain.  The CH2 ISR arms an asap slot for each
-// foreground timed fire; this drains it (and any other asap/alap slots
-// that piled up since last dispatch).
 
 void timepop_dispatch(void) {
   if (!timepop_pending) return;
@@ -1083,24 +949,20 @@ void timepop_dispatch(void) {
 // ============================================================================
 
 void timepop_bootstrap(void) {
-  // No hardware to bootstrap; process_interrupt owns all QTimer1 setup.
+  // No hardware to bootstrap; process_interrupt owns QTimer setup.
 }
 
 void timepop_init(void) {
-  for (uint32_t i = 0; i < MAX_SLOTS; i++)        slots[i] = {};
-  for (uint32_t i = 0; i < MAX_ASAP_SLOTS; i++)   asap_slots[i] = {};
-  for (uint32_t i = 0; i < MAX_ALAP_SLOTS; i++)   alap_slots[i] = {};
-  for (uint32_t i = 0; i < FIRE_RING_SIZE; i++)   fire_ring[i] = {};
+  for (uint32_t i = 0; i < MAX_SLOTS; i++)      slots[i] = {};
+  for (uint32_t i = 0; i < MAX_ASAP_SLOTS; i++) asap_slots[i] = {};
+  for (uint32_t i = 0; i < MAX_ALAP_SLOTS; i++) alap_slots[i] = {};
   next_handle = 1;
   timepop_pending = false;
 
-  // Register our schedule-fire callback with process_interrupt.  The
-  // callback runs in QTimer1 CH2 ISR context when CH2's compare matches.
+  // Register precision/SpinDry schedule-fire callback.  Ordinary timed
+  // services do not use this lane.
   interrupt_schedule_register(timepop_schedule_fire_callback, nullptr);
 
-  // Subscribe to TICK for asap/alap drain heartbeat and pre-bridge
-  // anchoring.  Process_interrupt will dispatch tick_callback in
-  // foreground via the deferred trampoline.
   interrupt_subscription_t tick_sub{};
   tick_sub.kind     = interrupt_subscriber_kind_t::TICK;
   tick_sub.on_event = tick_callback;
@@ -1109,65 +971,282 @@ void timepop_init(void) {
 }
 
 // ============================================================================
-// REPORT command — state visibility for debugging
+// REPORT command
 // ============================================================================
 
+struct timed_slot_snap_t {
+  bool                active;
+  bool                expired;
+  bool                recurring;
+  bool                is_absolute;
+  bool                pending_anchor;
+  timepop_slot_mode_t mode;
+  uint32_t            delay_ticks;
+  timepop_handle_t    handle;
+  uint32_t            deadline;
+  uint32_t            target_dwt;
+  uint32_t            period_ticks;
+  int64_t             target_gnss_ns;
+  uint64_t            period_ns;
+  uint32_t            fire_dwt_cyccnt;
+  uint32_t            fire_counter32;
+  int64_t             fire_gnss_ns;
+  const char*         name;
+  uintptr_t           callback_addr;
+  uintptr_t           user_data_addr;
+};
+
+struct deferred_slot_snap_t {
+  bool                active;
+  bool                has_ctx;
+  timepop_handle_t    handle;
+  const char*         name;
+  uintptr_t           callback_addr;
+  uintptr_t           user_data_addr;
+  timepop_ctx_t       ctx;
+};
+
 static Payload cmd_report(const Payload&) {
-  Payload p;
+  Payload out;
 
-  // Live counts
-  p.add("active_count",        timepop_active_count());
-  p.add("slots_high_water",    diag_slots_high_water);
+  timed_slot_snap_t    slot_snap[MAX_SLOTS];
+  deferred_slot_snap_t asap_snap[MAX_ASAP_SLOTS];
+  deferred_slot_snap_t alap_snap[MAX_ALAP_SLOTS];
 
-  // Per-slot inspection — useful for "what is TimePop holding right now"
-  uint32_t spindry_active = 0;
+  uint32_t active_count          = 0;
+  uint32_t tick_active           = 0;
+  uint32_t spindry_active        = 0;
   uint32_t pending_anchor_active = 0;
-  uint32_t recurring_active = 0;
-  for (uint32_t i = 0; i < MAX_SLOTS; i++) {
-    if (!slots[i].active) continue;
-    if (slots[i].is_spindry)     spindry_active++;
-    if (slots[i].pending_anchor) pending_anchor_active++;
-    if (slots[i].recurring)      recurring_active++;
+  uint32_t recurring_active      = 0;
+  uint32_t asap_active_count     = 0;
+  uint32_t asap_with_ctx_count   = 0;
+  uint32_t alap_active_count     = 0;
+
+  {
+    const uint32_t saved = critical_enter();
+
+    for (uint32_t i = 0; i < MAX_SLOTS; i++) {
+      const timepop_slot_t& s = slots[i];
+      timed_slot_snap_t& d = slot_snap[i];
+      d.active          = s.active;
+      d.expired         = s.expired;
+      d.recurring       = s.recurring;
+      d.is_absolute     = s.is_absolute;
+      d.pending_anchor  = s.pending_anchor;
+      d.mode            = s.mode;
+      d.delay_ticks     = s.delay_ticks;
+      d.handle          = s.handle;
+      d.deadline        = s.deadline;
+      d.target_dwt      = s.target_dwt;
+      d.period_ticks    = s.period_ticks;
+      d.target_gnss_ns  = s.target_gnss_ns;
+      d.period_ns       = s.period_ns;
+      d.fire_dwt_cyccnt = s.fire_dwt_cyccnt;
+      d.fire_counter32  = s.fire_counter32;
+      d.fire_gnss_ns    = s.fire_gnss_ns;
+      d.name            = s.name;
+      d.callback_addr   = (uintptr_t)s.callback;
+      d.user_data_addr  = (uintptr_t)s.user_data;
+
+      if (s.active) {
+        active_count++;
+        if (s.mode == timepop_slot_mode_t::TICK) tick_active++;
+        if (s.mode == timepop_slot_mode_t::SPINDRY) spindry_active++;
+        if (s.pending_anchor) pending_anchor_active++;
+        if (s.recurring) recurring_active++;
+      }
+    }
+
+    for (uint32_t i = 0; i < MAX_ASAP_SLOTS; i++) {
+      const deferred_slot_t& s = asap_slots[i];
+      deferred_slot_snap_t& d = asap_snap[i];
+      d.active         = s.active;
+      d.has_ctx        = s.has_ctx;
+      d.handle         = s.handle;
+      d.name           = s.name;
+      d.callback_addr  = (uintptr_t)s.callback;
+      d.user_data_addr = (uintptr_t)s.user_data;
+      d.ctx            = s.ctx;
+      if (s.active) {
+        asap_active_count++;
+        if (s.has_ctx) asap_with_ctx_count++;
+      }
+    }
+
+    for (uint32_t i = 0; i < MAX_ALAP_SLOTS; i++) {
+      const deferred_slot_t& s = alap_slots[i];
+      deferred_slot_snap_t& d = alap_snap[i];
+      d.active         = s.active;
+      d.has_ctx        = s.has_ctx;
+      d.handle         = s.handle;
+      d.name           = s.name;
+      d.callback_addr  = (uintptr_t)s.callback;
+      d.user_data_addr = (uintptr_t)s.user_data;
+      d.ctx            = s.ctx;
+      if (s.active) alap_active_count++;
+    }
+
+    critical_exit(saved);
   }
-  p.add("spindry_active",        spindry_active);
-  p.add("pending_anchor_active", pending_anchor_active);
-  p.add("recurring_active",      recurring_active);
 
-  // Tick / fire counters
-  p.add("tick_count",       diag_tick_count);
-  p.add("timed_fired",      diag_timed_fired);
+  uint32_t now_c32 = 0;
+  bool now_c32_valid = false;
+  {
+    const alpha_pps_vclock_slot_t a = alpha_pps_vclock_load();
+    if (a.sequence != 0) {
+      const uint32_t cps = alpha_dwt_cycles_per_second();
+      if (cps != 0) {
+        const uint32_t dwt_now = ARM_DWT_CYCCNT;
+        const uint32_t dwt_elapsed = dwt_now - a.dwt_at_edge;
+        const uint64_t ticks_elapsed =
+            ((uint64_t)dwt_elapsed * 10000000ULL + (uint64_t)cps / 2) /
+            (uint64_t)cps;
+        if (ticks_elapsed <= 0xFFFFFFFFULL) {
+          now_c32 = a.counter32_at_edge + (uint32_t)ticks_elapsed;
+          now_c32_valid = true;
+        }
+      }
+    }
+    if (!now_c32_valid && interrupt_last_known_counter32_valid()) {
+      now_c32 = interrupt_last_known_counter32();
+      now_c32_valid = true;
+    }
+  }
 
-  // ASAP / ALAP
-  p.add("asap_armed",          diag_asap_armed);
-  p.add("asap_dispatched",     diag_asap_dispatched);
-  p.add("alap_armed",          diag_alap_armed);
-  p.add("alap_dispatched",     diag_alap_dispatched);
-  p.add("dispatch_calls",      diag_dispatch_calls);
+  out.add("active_count",          active_count);
+  out.add("tick_active",           tick_active);
+  out.add("spindry_active",        spindry_active);
+  out.add("pending_anchor_active", pending_anchor_active);
+  out.add("recurring_active",      recurring_active);
+  out.add("slots_high_water",      diag_slots_high_water);
+  out.add("slots_max",             (uint32_t)MAX_SLOTS);
 
-  // Lifecycle counters
-  p.add("named_replacements",  diag_named_replacements);
-  p.add("arm_failures",        diag_arm_failures);
-  p.add("pre_bridge_anchored", diag_pre_bridge_anchored);
+  out.add("asap_active_count",   asap_active_count);
+  out.add("asap_with_ctx_count", asap_with_ctx_count);
+  out.add("asap_slots_max",      (uint32_t)MAX_ASAP_SLOTS);
+  out.add("alap_active_count",   alap_active_count);
+  out.add("alap_slots_max",      (uint32_t)MAX_ALAP_SLOTS);
 
-  // Head-of-queue scheduler
-  p.add("head_recompute_count",       diag_head_recompute_count);
-  p.add("schedule_fire_arm_calls",    diag_schedule_fire_arm_calls);
-  p.add("schedule_fire_cancel_calls", diag_schedule_fire_cancel_calls);
-  p.add("schedule_fire_armed_now",    interrupt_schedule_fire_armed());
-  p.add("fire_ring_overflow",         diag_fire_ring_overflow);
+  out.add("now_c32",       now_c32);
+  out.add("now_c32_valid", now_c32_valid);
 
-  // SpinDry-specific diagnostics
-  p.add("spindry_fires_total",     diag_spindry_fires_total);
-  p.add("spindry_fires_preempted", diag_spindry_fires_preempted);
-  p.add("spindry_fires_overshot",  diag_spindry_fires_overshot);
-  p.add("spindry_arm_failures",    diag_spindry_arm_failures);
-  p.add("spindry_bridge_lost",     diag_spindry_bridge_lost);
+  out.add("tick_count",        diag_tick_count);
+  out.add("timed_fired",       diag_timed_fired);
+  out.add("tick_timed_fired",  diag_tick_timed_fired);
 
-  // Approach window in nanoseconds and ticks (for empirical tuning)
-  p.add("spindry_approach_ns",     (uint32_t)SPINDRY_APPROACH_NS);
-  p.add("spindry_approach_ticks",  SPINDRY_APPROACH_TICKS);
+  out.add("asap_armed",      diag_asap_armed);
+  out.add("asap_dispatched", diag_asap_dispatched);
+  out.add("alap_armed",      diag_alap_armed);
+  out.add("alap_dispatched", diag_alap_dispatched);
+  out.add("dispatch_calls",  diag_dispatch_calls);
 
-  return p;
+  out.add("named_replacements",  diag_named_replacements);
+  out.add("arm_failures",        diag_arm_failures);
+  out.add("fire_arm_failures",   diag_fire_arm_failures);
+  out.add("pre_bridge_anchored", diag_pre_bridge_anchored);
+
+  out.add("precision_head_recompute_count", diag_precision_head_recompute_count);
+  // Backward-compatible names for existing dashboards/scripts.
+  out.add("head_recompute_count",       diag_precision_head_recompute_count);
+  out.add("schedule_fire_arm_calls",    diag_schedule_fire_arm_calls);
+  out.add("schedule_fire_cancel_calls", diag_schedule_fire_cancel_calls);
+  out.add("schedule_fire_armed_now",    interrupt_schedule_fire_armed());
+
+  out.add("spindry_fires_total",     diag_spindry_fires_total);
+  out.add("spindry_fires_preempted", diag_spindry_fires_preempted);
+  out.add("spindry_fires_overshot",  diag_spindry_fires_overshot);
+  out.add("spindry_arm_failures",    diag_spindry_arm_failures);
+  out.add("spindry_bridge_lost",     diag_spindry_bridge_lost);
+  out.add("spindry_approach_ns",     (uint32_t)SPINDRY_APPROACH_NS);
+  out.add("spindry_approach_ticks",  SPINDRY_APPROACH_TICKS);
+
+  PayloadArray timers;
+  for (uint32_t i = 0; i < MAX_SLOTS; i++) {
+    if (!slot_snap[i].active) continue;
+    const timed_slot_snap_t& s = slot_snap[i];
+
+    Payload entry;
+    entry.add("slot",            i);
+    entry.add("handle",          s.handle);
+    entry.add("name",            s.name ? s.name : "");
+    entry.add("mode",            slot_mode_str(s.mode));
+    entry.add("period_ns",       s.period_ns);
+    entry.add("period_ticks",    s.period_ticks);
+    entry.add("deadline",        s.deadline);
+    entry.add("recurring",       s.recurring);
+    entry.add("expired",         s.expired);
+    entry.add("is_absolute",     s.is_absolute);
+    entry.add("is_spindry",      s.mode == timepop_slot_mode_t::SPINDRY);
+    entry.add("pending_anchor",  s.pending_anchor);
+    entry.add("delay_ticks",     s.delay_ticks);
+    entry.add("target_gnss_ns",  s.target_gnss_ns);
+    entry.add("target_dwt",      s.target_dwt);
+    entry.add("fire_dwt_cyccnt", s.fire_dwt_cyccnt);
+    entry.add("fire_counter32",  s.fire_counter32);
+    entry.add("fire_gnss_ns",    s.fire_gnss_ns);
+    entry.add("callback_addr",   (uint64_t)s.callback_addr);
+    entry.add("user_data_addr",  (uint64_t)s.user_data_addr);
+
+    if (!s.pending_anchor && now_c32_valid) {
+      const int32_t delta = (int32_t)(s.deadline - now_c32);
+      entry.add("deadline_minus_now_ticks", delta);
+    }
+
+    timers.add(entry);
+  }
+  out.add_array("timers", timers);
+
+  PayloadArray asap;
+  for (uint32_t i = 0; i < MAX_ASAP_SLOTS; i++) {
+    if (!asap_snap[i].active) continue;
+    const deferred_slot_snap_t& s = asap_snap[i];
+
+    Payload entry;
+    entry.add("slot",           i);
+    entry.add("handle",         s.handle);
+    entry.add("name",           s.name ? s.name : "");
+    entry.add("has_ctx",        s.has_ctx);
+    entry.add("callback_addr",  (uint64_t)s.callback_addr);
+    entry.add("user_data_addr", (uint64_t)s.user_data_addr);
+
+    if (s.has_ctx) {
+      entry.add("ctx_fire_dwt_cyccnt",    s.ctx.fire_dwt_cyccnt);
+      entry.add("ctx_fire_counter32",     s.ctx.fire_counter32);
+      entry.add("ctx_fire_gnss_ns",       s.ctx.fire_gnss_ns);
+      entry.add("ctx_target_gnss_ns",     s.ctx.target_gnss_ns);
+      entry.add("ctx_fire_gnss_error_ns", s.ctx.fire_gnss_error_ns);
+    }
+
+    asap.add(entry);
+  }
+  out.add_array("asap", asap);
+
+  PayloadArray alap;
+  for (uint32_t i = 0; i < MAX_ALAP_SLOTS; i++) {
+    if (!alap_snap[i].active) continue;
+    const deferred_slot_snap_t& s = alap_snap[i];
+
+    Payload entry;
+    entry.add("slot",           i);
+    entry.add("handle",         s.handle);
+    entry.add("name",           s.name ? s.name : "");
+    entry.add("has_ctx",        s.has_ctx);
+    entry.add("callback_addr",  (uint64_t)s.callback_addr);
+    entry.add("user_data_addr", (uint64_t)s.user_data_addr);
+
+    if (s.has_ctx) {
+      entry.add("ctx_fire_dwt_cyccnt",    s.ctx.fire_dwt_cyccnt);
+      entry.add("ctx_fire_counter32",     s.ctx.fire_counter32);
+      entry.add("ctx_fire_gnss_ns",       s.ctx.fire_gnss_ns);
+      entry.add("ctx_target_gnss_ns",     s.ctx.target_gnss_ns);
+      entry.add("ctx_fire_gnss_error_ns", s.ctx.fire_gnss_error_ns);
+    }
+
+    alap.add(entry);
+  }
+  out.add_array("alap", alap);
+
+  return out;
 }
 
 static const process_command_entry_t TIMEPOP_COMMANDS[] = {

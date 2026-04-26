@@ -7,59 +7,37 @@
 // timepop.h — Public Interface
 // ============================================================================
 //
-// TimePop is ZPNet's GNSS-nanosecond scheduler.  It owns no hardware:
-// process_interrupt is the sole owner of QTimer1/QTimer3 registers, and
-// TimePop schedules its head-of-queue deadline via the public schedule-
-// fire API (interrupt_schedule_fire_at).
+// TimePop is ZPNet's scheduler.  It owns no hardware: process_interrupt is
+// the sole owner of QTimer1/QTimer3 registers.  TimePop has two timing
+// modes:
 //
-// Two delivery modes:
-//
-//   FOREGROUND (default):
+//   TICK mode (default, foreground, 1 kHz):
 //     timepop_arm / timepop_arm_at / timepop_arm_from_anchor /
 //     timepop_arm_asap / timepop_arm_alap
 //
-//     The user callback runs in foreground (loop()) context.  The hardware
-//     compare fires at the deadline; TimePop's CH2 ISR queues the slot
-//     for foreground dispatch via the asap mechanism.  Latency from
-//     hardware fire to user callback is dominated by foreground loop
-//     turnaround — typically tens of microseconds.
+//     The user callback runs in foreground callback context.  Timed slots
+//     are scanned from TimePop's 1 kHz TICK subscriber.  Resolution is one
+//     TICK (normally 1 ms), which is exactly right for normal process
+//     plumbing: transport pumps, event publishing, CPU usage, watchdogs,
+//     DAC pacing, PPS relay off, and anything that may allocate payloads,
+//     publish messages, print debug, or call foreground APIs.
 //
-//     Use for: anything that calls back into foreground APIs, allocates
-//     payloads, sends transport frames, prints debug, etc.  This is the
-//     right mode for ~99% of consumers.
-//
-//   SPINDRY (opt-in, sub-microsecond):
+//   SPINDRY mode (opt-in, precision, ISR context):
 //     timepop_arm_at_spindry / timepop_arm_from_anchor_spindry
 //
-//     The user callback runs in ISR context, on the QTimer1 stack, at
-//     the EXACT requested deadline (modulo a few DWT cycles).  TimePop
-//     arms the CH2 compare to fire SPINDRY_APPROACH_NS before the
-//     deadline; on entry, it spins on ARM_DWT_CYCCNT until the target
-//     is reached, then invokes the user callback synchronously.
+//     The user callback runs in ISR context, on the QTimer1 stack, at the
+//     requested deadline modulo SpinDry approach and DWT spin behavior.
+//     TimePop arms process_interrupt's QTimer1 CH2 schedule-fire lane to
+//     fire SPINDRY_APPROACH_NS before the deadline; on entry, it spins on
+//     ARM_DWT_CYCCNT until the target is reached, then invokes the user
+//     callback synchronously.
 //
-//     Use for: stimulating hardware at a precise moment (LANTERN photon
-//     loop trigger, TIMEPULSE mid-second anchoring witness pulse, etc.).
-//     The user callback MUST be brief, MUST NOT block, MUST NOT call
-//     foreground APIs.
+//     Use only for tiny hardware-stimulus callbacks.  The callback MUST be
+//     brief, MUST NOT block, and MUST NOT call foreground APIs.
 //
-//     SpinDry slots:
-//       • Are SINGLE-SHOT.  Re-arm from inside the callback if you want
-//         a recurring pattern.
-//       • REQUIRE the bridge to be valid at arm time (reverse bridge:
-//         time_gnss_ns_to_dwt must succeed).  Returns INVALID_HANDLE
-//         otherwise.
-//       • May be preempted by PPS GPIO (priority 0).  When that happens,
-//         the spin loop pauses, PPS runs, spin resumes.  Two outcomes:
-//           — PPS finishes within the runway: spin still lands on time.
-//             diag.preempted = true, diag.deadline_overshot = false.
-//           — PPS finishes past the deadline: spin lands late.
-//             diag.preempted = true, diag.deadline_overshot = true.
-//         Consumers that are sensitive to overshoot (LANTERN photon
-//         capture, e.g.) should inspect diag.deadline_overshot in their
-//         callback and skip the sample if true.
+// All normal foreground timed services intentionally use TICK mode.  CH2
+// precision scheduling is reserved for explicit SpinDry calls.
 //
-// All "now" semantics use time_gnss_ns_now() — the gear-locked answer
-// derived from alpha's slot.  No counter peeks.  No live reads.
 // ============================================================================
 
 typedef uint32_t timepop_handle_t;
@@ -73,23 +51,11 @@ static constexpr timepop_handle_t TIMEPOP_INVALID_HANDLE = 0;
 // the SpinDry target deadline.  This is the "runway" — the spin loop's
 // budget to absorb ISR entry latency, potential PPS preemption, and
 // spin-loop iteration overhead.
-//
-// Empirical tuning target (initial value, expected to be adjusted after
-// flash-and-observe):
-//
-//   • ISR entry latency      : ~50 cycles ≈ 50 ns
-//   • PPS ISR worst-case     : ~250 ns (single-pass; may chain on
-//                              rebootstrap edge)
-//   • Spin loop minimum      : ~10 cycles ≈ 10 ns
-//   • Safety margin          : remainder
-//
-// 5 µs gives ~4.5 µs of margin above worst-case observed latencies.
-// Reduce after empirical confirmation that approach landing is stable.
 
 static constexpr uint64_t SPINDRY_APPROACH_NS = 5000ULL;
 
 // ============================================================================
-// Callback context (foreground or SpinDry — same shape)
+// Callback context (TICK foreground or SpinDry — same shape)
 // ============================================================================
 
 typedef struct timepop_ctx_t {
@@ -105,67 +71,8 @@ typedef struct timepop_ctx_t {
 // SpinDry diagnostics
 // ============================================================================
 //
-// Populated by TimePop for SpinDry fires.  For foreground fires, only
-// `is_spindry` is set (false), and the rest are zero.
-//
-// Field semantics:
-//
-//   is_spindry             True iff this fire is the SpinDry path.
-//
-//   approach_isr_dwt       Event-coordinate DWT captured at CH2 ISR entry
-//                          (the approach ISR — i.e., the hardware-compare
-//                          fire that opens the spin runway).
-//
-//   approach_target_dwt    Predicted DWT at which the approach ISR was
-//                          expected to fire.  Computed at arm time as
-//                          target_dwt - APPROACH_DWT_CYCLES.  Useful for
-//                          diagnosing ISR latency drift over time.
-//
-//   target_dwt             Predicted DWT at which the user callback should
-//                          fire.  Recomputed inside the approach ISR using
-//                          the freshest bridge (alpha's PPS_VCLOCK slot)
-//                          rather than the stale value cached at arm time.
-//
-//   spin_landed_dwt        Actual DWT at which the spin loop exited and
-//                          the user callback was invoked.
-//
-//   spin_error_cycles      spin_landed_dwt - target_dwt (signed).
-//                          • Near-zero in normal operation (a few cycles,
-//                            limited by spin loop iteration time).
-//                          • Positive value indicates the spin landed
-//                            past the target — see deadline_overshot.
-//
-//   preempt_cycles         Excess time spent in the approach ISR beyond
-//                          the expected approach duration.  Computed as
-//                          (spin_landed_dwt - approach_isr_dwt) -
-//                          (target_dwt - approach_isr_dwt).  In normal
-//                          operation this is bounded by spin loop noise
-//                          (a few cycles).  A spike (≥ ~100 cycles)
-//                          indicates that a higher-priority ISR (PPS)
-//                          ran during the approach.
-//
-//   preempted              True iff preempt_cycles exceeded a small
-//                          tolerance (16 cycles).  Indicates PPS or
-//                          another higher-priority ISR landed during the
-//                          approach window.
-//
-//   deadline_overshot      True iff spin_error_cycles exceeded a small
-//                          tolerance (16 cycles).  Indicates the target
-//                          was missed — preemption pushed the spin past
-//                          the deadline rather than being absorbed by
-//                          the runway.  The user callback STILL FIRES
-//                          (we don't skip on overshoot), but consumers
-//                          sensitive to timing should inspect this flag
-//                          and decide whether to use or discard the
-//                          sample.
-//
-// Invariants:
-//   • For foreground fires: all fields are zero except is_spindry=false.
-//   • For SpinDry fires: is_spindry=true, other fields populated.
-//   • preempted implies preempt_cycles > 16.
-//   • deadline_overshot implies spin_error_cycles > 16.
-//   • deadline_overshot implies preempted (PPS preemption is the only
-//     known cause of overshoot under normal operating conditions).
+// Populated by TimePop for SpinDry fires.  For TICK/foreground fires,
+// is_spindry is false and the remaining fields are zero.
 
 typedef struct timepop_diag_t {
   bool     is_spindry;
@@ -186,13 +93,12 @@ typedef void (*timepop_callback_t)(
 );
 
 // ============================================================================
-// Foreground arming API
+// Foreground / TICK arming API
 // ============================================================================
 //
-// All foreground arms produce slots whose user callback runs in foreground
-// (loop()) context.  The hardware compare fires at the deadline; the CH2
-// ISR pushes the slot into the asap queue, which is drained by the next
-// loop() iteration via timepop_dispatch().
+// These arms produce TICK-mode slots.  User callbacks run in foreground
+// callback context from the 1 kHz TICK scan or from timepop_dispatch()
+// for ASAP/ALAP work.
 
 timepop_handle_t timepop_arm(
   uint64_t            delay_gnss_ns,
@@ -235,11 +141,10 @@ timepop_handle_t timepop_arm_from_anchor(
 // SpinDry arming API (single-shot, ISR-context delivery)
 // ============================================================================
 //
-// SpinDry arms produce slots whose user callback runs IN ISR CONTEXT
-// at the requested deadline (sub-microsecond precision).  See the file
-// header for the contract.  Both functions return TIMEPOP_INVALID_HANDLE
-// if the bridge is not yet valid (no PPS edge seen) or if the target is
-// not in the future.
+// SpinDry arms produce precision slots whose user callback runs IN ISR
+// CONTEXT at the requested deadline.  Both functions return
+// TIMEPOP_INVALID_HANDLE if the bridge is not valid or the target is not
+// usable.
 
 timepop_handle_t timepop_arm_at_spindry(
   int64_t             target_gnss_ns,
@@ -270,26 +175,17 @@ uint32_t timepop_active_count  (void);
 // ============================================================================
 //
 // Called by alpha after interrupt_synthetic_counters_zero() to re-anchor
-// every active slot to the new counter timeline.  Without this, tick-based
-// recurring slots (e.g. transport's RX/TX pumps) keep their pre-zero
-// deadlines and stay frozen until the synthetic counter wraps back around
-// to the old deadline value — which can take tens of seconds to minutes
-// depending on how long the system was running before the zero.
+// every active slot to the new counter timeline.
 //
 // After this call:
-//   • Tick recurring slots:   pending_anchor=true, delay_ticks=period_ticks.
-//                             They re-anchor on the next TICK and resume
-//                             firing at their normal cadence.
-//   • Absolute slots:         deadline recomputed from current alpha slot
-//                             via target_gnss_ns.  If the bridge is not
-//                             yet authoritative (sequence==0), the slot
-//                             falls back to pending_anchor with delay=0
-//                             so it fires on the next TICK.
-//   • Tick one-shot slots:    set pending_anchor=true.  Will fire after
-//                             delay_ticks on the new timeline.
-//   • SpinDry slots:          deadline recomputed.  If bridge is invalid,
-//                             slot is deactivated (SpinDry requires a
-//                             valid bridge to compute target_dwt).
+//   • TICK recurring slots: pending_anchor=true, delay_ticks=period_ticks;
+//     they re-anchor on the next TICK and resume their normal cadence.
+//   • TICK absolute slots: deadline recomputed from target_gnss_ns if the
+//     bridge is valid; otherwise they fall back to pending_anchor.
+//   • TICK one-shots: pending_anchor=true and fire on the new timeline.
+//   • SpinDry slots: deadline/target_dwt recomputed; invalid bridge
+//     deactivates the slot.
 //
-// After re-anchoring, the head-of-queue is recomputed and CH2 is re-armed.
+// After re-anchoring, only the SpinDry/precision head is recomputed and
+// CH2 is re-armed if needed.
 void timepop_handle_synthetic_counter_zero(void);
