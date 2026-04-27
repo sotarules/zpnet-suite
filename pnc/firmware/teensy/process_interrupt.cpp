@@ -364,7 +364,24 @@ static interrupt_subscriber_runtime_t* g_rt_ocxo2  = nullptr;
 
 static pps_edge_dispatch_fn g_pps_edge_dispatch = nullptr;
 
-// PPS GPIO witness (for cmd_report fields).
+// ============================================================================
+// EDGE — PPS GPIO heartbeat
+// ============================================================================
+//
+// State owned by the EDGE command:
+//   • g_pps_gpio_witness — running tally of PPS GPIO edges plus the last
+//     edge's PPS_VCLOCK DWT and gnss_ns.  Updated in the PPS GPIO ISR.
+//   • g_gpio_irq_count   — total PPS GPIO ISR entries.
+//   • g_gpio_miss_count  — incremented when a GPIO ISR ran but did not
+//     identify a PPS edge to process.
+//
+// The snapshot store (g_store, declared elsewhere in this file) holds the
+// last pps_t and pps_vclock_t.  cmd_edge reads it via store_load() and
+// publishes both views alongside the heartbeat tally.
+//
+// EDGE has no Welford, no anomaly buffer, and no mode.  It is a heartbeat
+// plus a snapshot of "the last edge from two perspectives."
+
 struct pps_gpio_witness_t {
   uint32_t edge_count   = 0;
   uint32_t last_dwt     = 0;     // pps_vclock.dwt_at_edge of most recent edge
@@ -821,9 +838,28 @@ static volatile uint32_t g_witness_anomaly_count_total = 0;
 
 static welford_t g_witness_welford                       = {};
 static welford_t g_witness_lag_welford                   = {};
-static welford_t g_witness_gpio_counter_delay_welford    = {};
 static volatile uint64_t g_witness_fires_total           = 0;
 static volatile uint64_t g_witness_fires_rejected        = 0;
+
+// ============================================================================
+// GPIO_DELAY — cost of the QTimer1 counter read in the PPS GPIO ISR
+// ============================================================================
+//
+// State owned by the GPIO_DELAY command:
+//   • g_witness_gpio_counter_delay_welford — DWT-cycle distance from the
+//     PPS GPIO ISR's first-instruction _raw capture to the completion of
+//     the QTimer1 cascaded counter read that authors pps.counter32_at_edge.
+//
+// Sample is updated once per PPS GPIO ISR, immediately after the counter
+// read.  Quantifies the cost-of-measurement for the very read that
+// produces the canonical edge counter.  Steady-state value is small and
+// stable (~140 cycles ≈ 138 ns at 1.008 GHz); growth or jitter would
+// indicate bus contention or ISR-entry instability.
+//
+// GPIO_DELAY has no anomaly buffer, no mode, no per-edge captures.  It
+// is one Welford on one number.
+
+static welford_t g_witness_gpio_counter_delay_welford    = {};
 
 static inline void witness_captures_reset(void) {
   for (uint8_t i = 0; i <= WITNESS_N_SLOTS; i++) g_witness_captures[i] = {};
@@ -1576,6 +1612,98 @@ void process_interrupt_enable_irqs(void) {
 }
 
 // ============================================================================
+// EDGE command
+// ============================================================================
+//
+// Returns the PPS GPIO heartbeat plus the most recent pps_t and pps_vclock_t
+// from the snapshot store.  Both views describe the same physical edge:
+//   • pps        — physical electrical edge facts
+//   • pps_vclock — canonical VCLOCK-selected edge (gnss_ns ends in "00")
+//
+// Payload shape:
+//   heartbeat: { edge_count, last_dwt, last_gnss_ns,
+//                gpio_irq_count, gpio_miss_count }
+//   pps:        { sequence, dwt_at_edge, counter32_at_edge, ch3_at_edge }
+//   pps_vclock: { sequence, dwt_at_edge, counter32_at_edge, ch3_at_edge,
+//                 gnss_ns_at_edge }
+//   snapshot_load_ok: bool — false if the seqlock retry loop gave up
+
+static Payload cmd_edge(const Payload&) {
+  Payload p;
+
+  // Heartbeat sub-object.
+  Payload heartbeat;
+  heartbeat.add("edge_count",      g_pps_gpio_witness.edge_count);
+  heartbeat.add("last_dwt",        g_pps_gpio_witness.last_dwt);
+  heartbeat.add("last_gnss_ns",    g_pps_gpio_witness.last_gnss_ns);
+  heartbeat.add("gpio_irq_count",  g_gpio_irq_count);
+  heartbeat.add("gpio_miss_count", g_gpio_miss_count);
+  p.add_object("heartbeat", heartbeat);
+
+  // Snapshot store: load both views in one consistent read.
+  pps_t        pps_view;
+  pps_vclock_t pvc_view;
+  const bool snapshot_ok = store_load(pps_view, pvc_view);
+  p.add("snapshot_load_ok", snapshot_ok);
+
+  // pps sub-object — physical electrical edge facts.
+  Payload pps_obj;
+  pps_obj.add("sequence",          pps_view.sequence);
+  pps_obj.add("dwt_at_edge",       pps_view.dwt_at_edge);
+  pps_obj.add("counter32_at_edge", pps_view.counter32_at_edge);
+  pps_obj.add("ch3_at_edge",       (uint32_t)pps_view.ch3_at_edge);
+  p.add_object("pps", pps_obj);
+
+  // pps_vclock sub-object — canonical VCLOCK-selected edge.
+  Payload pvc_obj;
+  pvc_obj.add("sequence",          pvc_view.sequence);
+  pvc_obj.add("dwt_at_edge",       pvc_view.dwt_at_edge);
+  pvc_obj.add("counter32_at_edge", pvc_view.counter32_at_edge);
+  pvc_obj.add("ch3_at_edge",       (uint32_t)pvc_view.ch3_at_edge);
+  pvc_obj.add("gnss_ns_at_edge",   pvc_view.gnss_ns_at_edge);
+  p.add_object("pps_vclock", pvc_obj);
+
+  return p;
+}
+
+// ============================================================================
+// GPIO_DELAY command
+// ============================================================================
+//
+// Returns the Welford summary for the PPS GPIO ISR's counter-read delay.
+// Sampled in DWT cycles; both cycles and ns are published for convenience.
+//
+// Payload shape:
+//   welford: { n, mean_cycles, stddev_cycles, stderr_cycles,
+//              min_cycles, max_cycles,
+//              mean_ns, stddev_ns, stderr_ns, min_ns, max_ns }
+
+static Payload cmd_gpio_delay(const Payload&) {
+  Payload p;
+
+  const welford_t& w = g_witness_gpio_counter_delay_welford;
+  const double stddev_cycles = welford_stddev(w);
+  const double stderr_cycles =
+      (w.n >= 2) ? (stddev_cycles / sqrt((double)w.n)) : 0.0;
+
+  Payload welford;
+  welford.add("n",             (uint32_t)w.n);
+  welford.add("mean_cycles",   w.mean);
+  welford.add("stddev_cycles", stddev_cycles);
+  welford.add("stderr_cycles", stderr_cycles);
+  welford.add("min_cycles",    (int32_t)w.min_val);
+  welford.add("max_cycles",    (int32_t)w.max_val);
+  welford.add("mean_ns",       cycles_to_ns(w.mean));
+  welford.add("stddev_ns",     cycles_to_ns(stddev_cycles));
+  welford.add("stderr_ns",     cycles_to_ns(stderr_cycles));
+  welford.add("min_ns",        cycles_to_ns((double)w.min_val));
+  welford.add("max_ns",        cycles_to_ns((double)w.max_val));
+  p.add_object("welford", welford);
+
+  return p;
+}
+
+// ============================================================================
 // Commands: REPORT, WITNESS_*, etc.
 // ============================================================================
 
@@ -1819,6 +1947,8 @@ static Payload cmd_witness_latency(const Payload&) {
 
 static const process_command_entry_t INTERRUPT_COMMANDS[] = {
   { "REPORT",          cmd_report          },
+  { "EDGE",            cmd_edge            },
+  { "GPIO_DELAY",      cmd_gpio_delay      },
   { "WITNESS_RESET",   cmd_witness_reset   },
   { "WITNESS_MODE",    cmd_witness_mode    },
   { "WITNESS_DUMP",    cmd_witness_dump    },
