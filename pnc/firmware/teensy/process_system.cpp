@@ -109,6 +109,9 @@ static Payload cmd_report(const Payload& /*args*/) {
 
   Payload p;
 
+  // Firmware identity
+  p.add("fw_version", FW_VERSION);
+
   // CPU clock frequency — authoritative runtime value.
   // F_CPU_ACTUAL is updated by set_arm_clock() at boot.
   // This is the ACTUAL core clock, not the compile-time default.

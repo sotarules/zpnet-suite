@@ -4,30 +4,57 @@
 //
 // TimePop process interface.
 //
-// TimePop is a foreground scheduler with two internal timing modes:
+// TimePop owns:
+//   • priority-queue slot scheduling
+//   • absolute recurring series
+//   • Spin-Dry early-wake / landing for VCLOCK scheduling
+//   • deferred callback dispatch
+//   • instrumentation / reports
+//   • always-on internal VCLOCK monitor
+//   • QTimer1 CH2 compare-register programming (the scheduler compare)
 //
-//   • TICK mode:
-//       The default mode used by timepop_arm(), timepop_arm_at(), and
-//       timepop_arm_from_anchor().  Slots are scanned from the 1 kHz TICK
-//       subscriber and user callbacks run in foreground callback context.
-//       This is the mode for ordinary services: transport RX/TX, event
-//       publishing, CPU usage, DAC pacing, PPS relay off, watchdog work,
-//       and any callback that may touch foreground APIs.
+// TimePop does not own:
+//   • PPS/GPIO interrupt custody
+//   • OCXO interrupt custody
+//   • QTimer1 vector custody — process_interrupt owns IRQ_QTIMER1 and
+//     dispatches CH2 to TimePop's registered handler in IRQ context
+//   • QTimer1 CH0/CH1/CH2 hardware mode init — process_interrupt does
+//     the one-time CTRL/SCTRL/CSCTRL/COMP1/CMPLD1 setup
 //
-//   • PRECISION / SPINDRY mode:
-//       The opt-in mode used only by timepop_arm_at_spindry() and
-//       timepop_arm_from_anchor_spindry().  TimePop asks process_interrupt
-//       to arm the QTimer1 CH2 schedule-fire lane for an approach fire,
-//       then spins on DWT and invokes the user callback in ISR context.
+// Those are owned by process_interrupt.
 //
-// TimePop owns no QTimer hardware.  process_interrupt remains the sole
-// owner of QTimer1/QTimer3 registers.  TimePop uses the public
-// interrupt_schedule_*() API only for the precision/SpinDry lane.
+// QTimer1 CH2 hosted-handler API (TimePop is the hosted client):
 //
-// All ordinary timed services are deliberately kept off the CH2 precision
-// path.  This preserves the stability of the original 1 kHz scheduler and
-// prevents recurring foreground work from flooding the ASAP queue with
-// hardware-fire delivery contexts.
+//   QTimer1 has only one IRQ vector shared across all four channels.
+//   process_interrupt owns the vector and dispatches in IRQ context:
+//     • CH2 flag set → TimePop's registered handler (this file)
+//     • CH3 flag set → process_interrupt's internal vclock_cadence_isr
+//   Each handler receives a normalized DWT-at-edge capture for its own
+//   QTimer event.
+//
+//   For CH2, the dispatcher additionally computes counter32_at_event
+//   and gnss_ns_at_event and packages everything into a standard
+//   interrupt_event_t (kind = TIMEPOP) and interrupt_capture_diag_t,
+//   which it passes to TimePop's handler.  TimePop reads the event
+//   payload directly and proceeds with slot dispatch — no need to
+//   re-read the counter or recompute gnss_ns.
+//
+//   The PPS epoch consumed through time_anchor_snapshot() is already
+//   process_interrupt's canonical VCLOCK-selected epoch.  TimePop does
+//   not reinterpret physical PPS GPIO timing; it schedules in that
+//   canonical VCLOCK/GNSS coordinate system.
+//
+//   TimePop is responsible for:
+//     • registering its CH2 handler at init via
+//       interrupt_register_qtimer1_ch2_handler()
+//     • programming and re-programming the CH2 compare target as
+//       slots are scheduled
+//
+//   process_interrupt is responsible for:
+//     • initializing CH0/CH1/CH2 hardware (one-time mode/control)
+//     • clearing the CH2 TCF1 flag in the QTimer1 ISR before
+//       invoking TimePop's handler
+//     • building the event/diag payloads passed to TimePop
 //
 // ============================================================================
 
@@ -40,3 +67,11 @@
 void timepop_bootstrap(void);
 void timepop_init(void);
 void process_timepop_register(void);
+
+// QTimer1 CH2 IRQ-context handler.  Registered with process_interrupt
+// at init.  Called by process_interrupt's qtimer1_isr dispatcher on
+// every CH2 compare-match, in IRQ context, with the standard event
+// and diag payloads filled in by the dispatcher.
+//
+void timepop_qtimer1_ch2_handler(const interrupt_event_t& event,
+                                 const interrupt_capture_diag_t& diag);

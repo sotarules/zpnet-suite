@@ -45,6 +45,7 @@ const char ZPNET_BUILD_FINGERPRINT[] =
   "USB=UNKNOWN;"
 #endif
 
+  "FW_VERSION=" FW_VERSION_STR ";"
   "}";
 
 } // extern "C"

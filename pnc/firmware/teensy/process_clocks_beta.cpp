@@ -94,25 +94,35 @@ uint64_t recover_ocxo2_ns = 0;
 static Payload g_last_fragment;
 
 // ============================================================================
-// Campaign public bases — campaign-relative offsets for published values
+// Campaign warmup suppression
 // ============================================================================
 //
-// Alpha's running totals (g_dwt_cycle_count_total, g_gnss_ns_count_at_pps,
-// per-OCXO ns_count_at_pps) increment from epoch install onward.  For
-// publishing, we want values that are zero-based at campaign start (or
-// continuing from a recovery snapshot).  These bases are subtracted from
-// the running totals to produce campaign-relative published values.
+// Alpha remains fully alive during warmup: PPS/VCLOCK/OCXO measurements,
+// bridge anchors, and predictor state continue to settle normally.  Beta,
+// however, suppresses the first CLOCKS_CAMPAIGN_WARMUP_SUPPRESS_PPS
+// candidate TIMEBASE_FRAGMENT records so the public campaign begins only
+// after the estimators have stopped stretching their legs.
 //
 // START semantics:
-//   bases reset to the current alpha totals at install time → campaign
-//   gnss_ns starts at 0, advances by 1e9 per PPS.  First published
-//   fragment is teensy_pps_count=1, gnss_ns=1e9.
+//   Suppressed records are private warmup only.  The first emitted fragment
+//   is teensy_pps_count=1, gnss_ns=1e9, and public totals start from that
+//   first canonical record.
 //
 // RECOVER semantics:
-//   bases set such that current alpha totals minus base equals the
-//   recover_*_ns values supplied by the Pi.  Subsequent advances continue
-//   from there.  First published fragment is teensy_pps_count=N+1,
-//   gnss_ns=(N+1)*1e9 (where N = recover_gnss_ns/1e9).
+//   Suppressed records are real elapsed campaign seconds.  The first emitted
+//   fragment therefore appears after a deliberate canonical gap, preserving
+//   the recovered absolute PPS identity.
+
+enum class campaign_warmup_mode_t : uint8_t {
+  NONE    = 0,
+  START   = 1,
+  RECOVER = 2,
+};
+
+static volatile campaign_warmup_mode_t g_campaign_warmup_mode =
+    campaign_warmup_mode_t::NONE;
+static volatile uint32_t g_campaign_warmup_remaining = 0;
+static volatile uint32_t g_campaign_warmup_suppressed_total = 0;
 
 static uint64_t g_campaign_public_dwt_base = 0;
 static uint64_t g_campaign_public_gnss_base = 0;
@@ -144,6 +154,76 @@ static void campaign_public_bases_reset_for_recover(void) {
   g_campaign_public_ocxo2_base =
       saturated_base_for_recovered_value(g_ocxo2_clock.ns_count_at_pps,
                                           recover_ocxo2_ns);
+}
+
+static void campaign_warmup_begin(campaign_warmup_mode_t mode) {
+  g_campaign_warmup_mode = mode;
+  g_campaign_warmup_remaining = CLOCKS_CAMPAIGN_WARMUP_SUPPRESS_PPS;
+  g_campaign_warmup_suppressed_total = 0;
+
+  if (mode == campaign_warmup_mode_t::RECOVER) {
+    campaign_public_bases_reset_for_recover();
+  } else {
+    campaign_public_bases_reset_to_current();
+  }
+}
+
+static bool campaign_warmup_active(void) {
+  return g_campaign_warmup_mode != campaign_warmup_mode_t::NONE &&
+         g_campaign_warmup_remaining > 0;
+}
+
+static void campaign_warmup_finish_after_this_suppressed_record(void) {
+  const campaign_warmup_mode_t finishing_mode = g_campaign_warmup_mode;
+
+  g_campaign_warmup_mode = campaign_warmup_mode_t::NONE;
+  g_campaign_warmup_remaining = 0;
+
+  if (campaign_state != clocks_campaign_state_t::STARTED) {
+    campaign_public_bases_reset_to_current();
+    return;
+  }
+
+  if (finishing_mode == campaign_warmup_mode_t::START) {
+    // START: warmup records are private.  Public identity begins on the
+    // next PPS after this one, so use the current alpha totals as the base.
+    // The next published record will add exactly one public second.
+    campaign_public_bases_reset_to_current();
+  }
+
+  // RECOVER: leave the recovery bases intact.  Because campaign_seconds
+  // advanced during suppression, the next emitted fragment will preserve
+  // the canonical gap created by the buried records.
+}
+
+static bool campaign_warmup_consume_one_candidate_record(void) {
+  if (!campaign_warmup_active()) return false;
+
+  g_campaign_warmup_suppressed_total++;
+
+  if (g_campaign_warmup_mode == campaign_warmup_mode_t::RECOVER) {
+    // Recovery gaps are canonical.  The suppressed records are real
+    // elapsed campaign seconds, so advance the public PPS identity even
+    // though we do not publish the fragments.
+    campaign_seconds++;
+  }
+
+  if (g_campaign_warmup_remaining > 0) {
+    g_campaign_warmup_remaining--;
+  }
+
+  if (g_campaign_warmup_remaining == 0) {
+    campaign_warmup_finish_after_this_suppressed_record();
+  }
+
+  return true;
+}
+
+static void campaign_warmup_reset(void) {
+  g_campaign_warmup_mode = campaign_warmup_mode_t::NONE;
+  g_campaign_warmup_remaining = 0;
+  g_campaign_warmup_suppressed_total = 0;
+  campaign_public_bases_reset_to_current();
 }
 
 static uint64_t campaign_public_dwt_total(void) {
@@ -271,16 +351,39 @@ static void publish_freq(Payload& p, const char* clock_name, double ppb_value) {
 }
 
 // ============================================================================
-// Event publishers — slim, post-scorched-earth
+// Diag publishers — slimmed for the trimmed interrupt_capture_diag_t
 // ============================================================================
-//
-// Each subscription event carries {gnss_ns_at_edge, dwt_at_edge, sequence}.
-// Beta publishes those three fields verbatim per lane.  No diag struct,
-// no counter32, no coincidence, no anomaly count.
 
-static void clocks_payload_add_event(Payload& p,
-                                     const char* prefix,
-                                     const interrupt_event_t& event) {
+static void clocks_payload_add_ocxo_diag(Payload& p,
+                                         const char* prefix,
+                                         const interrupt_capture_diag_t& diag) {
+  char key[96];
+
+  auto add_bool = [&](const char* suffix, bool value) {
+    snprintf(key, sizeof(key), "%s_%s", prefix, suffix);
+    p.add(key, value);
+  };
+  auto add_u32 = [&](const char* suffix, uint32_t value) {
+    snprintf(key, sizeof(key), "%s_%s", prefix, suffix);
+    p.add(key, value);
+  };
+  auto add_u64 = [&](const char* suffix, uint64_t value) {
+    snprintf(key, sizeof(key), "%s_%s", prefix, suffix);
+    p.add(key, value);
+  };
+
+  add_bool("enabled", diag.enabled);
+  add_u32("dwt_at_event", diag.dwt_at_event);
+  add_u64("gnss_ns_at_event", diag.gnss_ns_at_event);
+  add_u32("counter32_at_event", diag.counter32_at_event);
+  add_u32("anomaly_count", diag.anomaly_count);
+}
+
+static void clocks_payload_add_pps_diag(Payload& p,
+                                        const char* prefix,
+                                        const interrupt_capture_diag_t& diag) {
+  clocks_payload_add_ocxo_diag(p, prefix, diag);
+
   char key[96];
   auto add_u32 = [&](const char* suffix, uint32_t value) {
     snprintf(key, sizeof(key), "%s_%s", prefix, suffix);
@@ -291,9 +394,13 @@ static void clocks_payload_add_event(Payload& p,
     p.add(key, value);
   };
 
-  add_u32("dwt_at_edge",     event.dwt_at_edge);
-  add_i64("gnss_ns_at_edge", event.gnss_ns_at_edge);
-  add_u32("sequence",        event.sequence);
+  add_u32("pps_edge_sequence", diag.pps_edge_sequence);
+  add_u32("pps_edge_dwt_isr_entry_raw", diag.pps_edge_dwt_isr_entry_raw);
+  add_i64("pps_edge_gnss_ns", diag.pps_edge_gnss_ns);
+  add_i64("pps_edge_minus_event_ns", diag.pps_edge_minus_event_ns);
+  add_u32("pps_edge_dwt_cycles_from_vclock", diag.pps_edge_dwt_cycles_from_vclock);
+  add_i64("pps_edge_ns_from_vclock", diag.pps_edge_ns_from_vclock);
+  add_u32("pps_edge_vclock_event_count", diag.pps_edge_vclock_event_count);
 }
 
 // ============================================================================
@@ -622,7 +729,7 @@ static void clocks_force_stop_campaign(void) {
   request_zero = false;
   calibrate_ocxo_mode = servo_mode_t::OFF;
   ocxo_dac_pacing_abort_all();
-  campaign_public_bases_reset_to_current();
+  campaign_warmup_reset();
   timebase_invalidate();
 }
 
@@ -710,7 +817,7 @@ void clocks_beta_pps(void) {
       watchdog_anomaly_active = false;
       campaign_state = clocks_campaign_state_t::STARTED;
       request_start = false;
-      campaign_public_bases_reset_to_current();
+      campaign_warmup_begin(campaign_warmup_mode_t::START);
     }
     return;
   }
@@ -722,7 +829,7 @@ void clocks_beta_pps(void) {
     request_zero = false;
     calibrate_ocxo_mode = servo_mode_t::OFF;
     ocxo_dac_pacing_abort_all();
-    campaign_public_bases_reset_to_current();
+    campaign_warmup_reset();
     timebase_invalidate();
     return;
   }
@@ -741,21 +848,24 @@ void clocks_beta_pps(void) {
 
     request_recover = false;
     campaign_state = clocks_campaign_state_t::STARTED;
-    campaign_public_bases_reset_for_recover();
+    campaign_warmup_begin(campaign_warmup_mode_t::RECOVER);
     return;
   }
 
   if (watchdog_anomaly_active) return;
   if (campaign_state != clocks_campaign_state_t::STARTED) return;
 
-  // ── Per-second campaign work ──
+  // ── Warmup suppression ──
   //
-  // Warmup suppression has been removed: every PPS after install
-  // produces a published TIMEBASE_FRAGMENT.  The first few fragments
-  // may have transient values (residuals settling, OCXO welfords with
-  // small N) but the data plane comes alive immediately.  Pi-side
-  // tolerates an overshoot in the first sync fragment via _sync_expected_pps
-  // (>=) and tracks continuity by exact pps_count match thereafter.
+  // Suppressed records still allow alpha's measurement/predictor state to
+  // settle, but they are not allowed to become canonical TIMEBASE_FRAGMENT
+  // rows.  START hides these seconds completely; RECOVER counts them as
+  // deliberate canonical gaps.
+  if (campaign_warmup_consume_one_candidate_record()) {
+    return;
+  }
+
+  // ── Per-second campaign work ──
   campaign_seconds++;
 
   dwt_cycle_count_total = campaign_public_dwt_total();
@@ -832,8 +942,10 @@ void clocks_beta_pps(void) {
   p.add("dwt_prediction_residual_cycles",
         g_dwt_prediction_residual_cycles);
 
-  // QTimer counter32 is no longer published.  The post-scorched-earth
-  // event payload is {gnss_ns_at_edge, dwt_at_edge, sequence} only.
+  // QTimer1 hardware-counter identity of the canonical PPS epoch.
+  // Under the VCLOCK-domain architecture this is the selected VCLOCK
+  // edge after the physical PPS pulse, not the raw GPIO counter read.
+  p.add("qtimer_at_pps", g_qtimer_at_pps);
 
   // VCLOCK surface — authored facts + per-edge measurement + window accounting.
   p.add("vclock_ns_count_at_pps", campaign_public_gnss_ns());
@@ -906,13 +1018,12 @@ void clocks_beta_pps(void) {
   publish_freq(p, "ocxo1",  welford_ocxo1.mean);
   publish_freq(p, "ocxo2",  welford_ocxo2.mean);
 
-  // Per-lane event fact (gnss_ns_at_edge, dwt_at_edge, sequence).  The
-  // PPS_VCLOCK lane's gnss_ns is VCLOCK-authored (sequence × 1e9, ends
-  // in "00000000"); VCLOCK/OCXO lanes' gnss_ns is bridge-projected.
-  clocks_payload_add_event(p, "pps_vclock", g_last_pps_vclock_event);
-  clocks_payload_add_event(p, "vclock",     g_last_vclock_event);
-  clocks_payload_add_event(p, "ocxo1",      g_last_ocxo1_event);
-  clocks_payload_add_event(p, "ocxo2",      g_last_ocxo2_event);
+  // Per-lane diag (event facts + anomaly count).  The "pps_diag" entry
+  // corresponds to the VCLOCK lane and additionally carries the GPIO
+  // PPS witness fields.
+  clocks_payload_add_pps_diag(p, "pps_diag", g_pps_interrupt_diag);
+  clocks_payload_add_ocxo_diag(p, "ocxo1_diag", g_ocxo1_interrupt_diag);
+  clocks_payload_add_ocxo_diag(p, "ocxo2_diag", g_ocxo2_interrupt_diag);
 
   g_last_fragment = p;
   publish("TIMEBASE_FRAGMENT", p);
@@ -1028,6 +1139,11 @@ static Payload cmd_report(const Payload&) {
   p.add("epoch_pending", clocks_epoch_pending());
   p.add("interrupt_pps_rebootstrap_pending",
         interrupt_pps_rebootstrap_pending());
+  p.add("campaign_warmup_active", campaign_warmup_active());
+  p.add("campaign_warmup_required", CLOCKS_CAMPAIGN_WARMUP_SUPPRESS_PPS);
+  p.add("campaign_warmup_remaining", (uint32_t)g_campaign_warmup_remaining);
+  p.add("campaign_warmup_suppressed_total",
+        (uint32_t)g_campaign_warmup_suppressed_total);
   return p;
 }
 
