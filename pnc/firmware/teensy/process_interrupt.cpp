@@ -32,14 +32,23 @@
 //                    OCXO_INTERVAL_COUNTS; emits OCXO2 every 1000 cadences.
 //   SCHEDULE-FIRE  : QTimer1 CH2 compare.  Direct ISR callback lane used
 //                    by TimePop's explicit precision/SpinDry mode only.
-//   PPS↔VCLOCK     : QTimer1 CH1 one-shot compare.  Armed inside the PPS
-//   OFFSET           GPIO ISR; fires on the next VCLOCK edge.  Measures
-//                    the irreducible hardware-path DWT offset between the
-//                    two physically synchronous events.
+//
+// PPS↔VCLOCK irreducible-offset measurement:
+//   Every PPS GPIO ISR entry stashes its first-instruction raw DWT.  The
+//   VCLOCK cadence ISR, on every 1-second-boundary tick, computes the
+//   delta against that stashed value as `vclock_dwt_isr_entry_raw -
+//   pps_dwt_isr_entry_raw`.  Two raw, frame-consistent ISR-entry captures
+//   subtracted directly — no latency math, no compare-arming race, no
+//   modular arithmetic.  NVIC strictly serializes the two ISRs (PPS=0,
+//   QTimer1=16) so the cadence boundary always lands cleanly after the
+//   PPS GPIO ISR has returned.
+//
+//   This is "Mechanism A" from the previous (sprawling) generation of
+//   process_interrupt — restored on the current minimal foundation.
 //
 // NVIC priority order:
 //   PPS GPIO   priority  0  (sovereign)
-//   QTimer1   priority 16  (VCLOCK cadence + schedule fire + offset CH1)
+//   QTimer1   priority 16  (VCLOCK cadence + schedule fire)
 //   QTimer3   priority 32  (OCXO cadences)
 //
 // TimePop relationship:
@@ -79,12 +88,17 @@ static constexpr uint32_t NVIC_PRIO_PPS_GPIO = 0;
 static constexpr uint32_t NVIC_PRIO_QTIMER1  = 16;
 static constexpr uint32_t NVIC_PRIO_QTIMER3  = 32;
 
-// VCLOCK period in DWT cycles, used as the modulus for the PPS↔VCLOCK
-// offset measurement.  We mod by 100 (the VCLOCK tick period in DWT
-// cycles is ~100,800 at 1.008 GHz; mod 100 strips out the integer-VCLOCK-
-// period component cleanly because 100,800 mod 100 = 0, leaving only the
-// sub-period residual — the actual irreducible hardware offset).
-static constexpr int32_t  PPS_VCLOCK_OFFSET_MODULUS_CYCLES = 100;
+// Sanity ceiling for the PPS↔VCLOCK offset measurement.  In normal
+// operation the delta between the PPS GPIO ISR's first-instruction DWT
+// and the VCLOCK cadence ISR's first-instruction DWT (on the 1-second
+// boundary aligned with that PPS) is on the order of tens of cycles —
+// it's the duration of the PPS GPIO ISR body plus the NVIC tail-chain
+// cost.  A delta in the millions or billions of cycles indicates a
+// missed PPS edge, a misaligned boundary, or some other anomaly.  Such
+// samples are filtered out and counted separately.
+//
+// 10 µs at 1.008 GHz = ~10080 cycles.  Anything beyond this is junk.
+static constexpr int32_t  PPS_VCLOCK_OFFSET_SANITY_CEILING_CYCLES = 10000;
 
 // ============================================================================
 // Latency adjusters — convert raw ISR-entry DWT to event coordinates
@@ -97,33 +111,16 @@ static constexpr int32_t  PPS_VCLOCK_OFFSET_MODULUS_CYCLES = 100;
 // pps_vclock_dwt_from_pps_isr_entry_raw  : raw GPIO ISR entry → canonical
 //                                          VCLOCK-selected PPS epoch DWT.
 //                                          Uses CANONICAL_VCLOCK_EPOCH_MINUS_
-//                                          RAW_PPS_ISR_CYCLES.  This is
-//                                          the operational estimate used
-//                                          for the dispatched PPS_VCLOCK
-//                                          event; the new CH1-based
-//                                          measurement (below) verifies it
-//                                          empirically every PPS.
-//
-// pps_edge_dwt_from_pps_isr_entry_raw    : raw GPIO ISR entry → latency-
-//                                          compensated electrical-edge
-//                                          DWT for the PPS pin.  Used
-//                                          ONLY by the offset measurement
-//                                          path so the PPS and CH1 sides
-//                                          are referenced to comparable
-//                                          electrical-edge frames.
+//                                          RAW_PPS_ISR_CYCLES.
 //
 // qtimer_event_dwt_from_isr_entry_raw    : raw QTimer ISR entry → latency-
 //                                          compensated electrical-edge
 //                                          DWT for any QTimer compare
-//                                          event.  Used by CH1, CH2, CH3,
-//                                          and the QTimer3 OCXO lanes.
+//                                          event.  Used by CH2, CH3, and
+//                                          the QTimer3 OCXO lanes.
 
 static inline uint32_t pps_vclock_dwt_from_pps_isr_entry_raw(uint32_t isr_entry_dwt_raw) {
   return isr_entry_dwt_raw + (uint32_t)CANONICAL_VCLOCK_EPOCH_MINUS_RAW_PPS_ISR_CYCLES;
-}
-
-static inline uint32_t pps_edge_dwt_from_pps_isr_entry_raw(uint32_t isr_entry_dwt_raw) {
-  return isr_entry_dwt_raw - (GPIO_TOTAL_LATENCY - WITNESS_STIMULATE_LATENCY);
 }
 
 static inline uint32_t qtimer_event_dwt_from_isr_entry_raw(uint32_t isr_entry_dwt_raw) {
@@ -298,21 +295,6 @@ static void dispatch_deferred(subscriber_t& rt,
 // Compare channel helpers
 // ============================================================================
 
-static inline void qtimer1_ch1_clear_compare_flag(void) {
-  IMXRT_TMR1.CH[1].CSCTRL &= ~(TMR_CSCTRL_TCF1 | TMR_CSCTRL_TCF2);
-}
-static inline void qtimer1_ch1_program_compare(uint16_t target_low16) {
-  qtimer1_ch1_clear_compare_flag();
-  IMXRT_TMR1.CH[1].COMP1  = target_low16;
-  IMXRT_TMR1.CH[1].CMPLD1 = target_low16;
-  qtimer1_ch1_clear_compare_flag();
-  IMXRT_TMR1.CH[1].CSCTRL |= TMR_CSCTRL_TCF1EN;
-}
-static inline void qtimer1_ch1_disable_compare(void) {
-  IMXRT_TMR1.CH[1].CSCTRL &= ~TMR_CSCTRL_TCF1EN;
-  qtimer1_ch1_clear_compare_flag();
-}
-
 static inline void qtimer1_ch2_clear_compare_flag(void) {
   IMXRT_TMR1.CH[2].CSCTRL &= ~(TMR_CSCTRL_TCF1 | TMR_CSCTRL_TCF2);
 }
@@ -383,38 +365,55 @@ void interrupt_request_pps_rebootstrap(void) { g_pps_rebootstrap_pending = true;
 bool interrupt_pps_rebootstrap_pending(void) { return g_pps_rebootstrap_pending; }
 
 // ============================================================================
-// PPS↔VCLOCK irreducible-offset measurement (CH1)
+// PPS↔VCLOCK irreducible-offset measurement (NVIC-serialized)
 // ============================================================================
 //
-// CH1 is QTimer1's spare channel.  It is no longer the cascade slave for
-// the old 32-bit cascade — that machinery is gone.  CH1's sole purpose
-// now is to fire on the very next VCLOCK edge after a PPS GPIO ISR and
-// let us empirically measure the irreducible DWT-cycle offset between
-// the two physically synchronous events.
+// The PPS GPIO ISR captures DWT as its first instruction (raw, no latency
+// math).  That value is stashed for the VCLOCK cadence ISR to consume.
 //
-// Method:
-//   1. PPS GPIO ISR fires.  Capture latency-compensated PPS edge DWT via
-//      pps_edge_dwt_from_pps_isr_entry_raw().
-//   2. Read CH1.CNTR and program CH1 compare at CNTR + 1.  This requests
-//      an interrupt on the next VCLOCK rising edge.  Set armed flag.
-//   3. CH1 ISR fires.  Capture latency-compensated VCLOCK edge DWT via
-//      qtimer_event_dwt_from_isr_entry_raw().
-//   4. Compute (vclock_dwt - pps_dwt) % 100 and update Welford state.
-//   5. Disable CH1 compare (one-shot).  Clear armed flag.
+// On every VCLOCK 1-second boundary, the cadence ISR captures its own
+// first-instruction DWT and computes:
 //
-// The mod-100 absorbs the case where we miss the immediate next VCLOCK
-// edge because the ISR latency exceeded one VCLOCK period — the firmware
-// may catch the second or third edge instead.  Since one VCLOCK tick is
-// 100,800 DWT cycles (mod 100 == 0), the residual mod 100 is invariant
-// to the integer-period miss and equals the actual hardware offset (which
-// is well under 100 cycles).
+//   delta = vclock_dwt_isr_entry_raw - pps_dwt_isr_entry_raw
 //
-// All state is ISR-only (PPS GPIO writes; CH1 ISR reads/writes Welford).
-// Foreground reads via REPORT use plain volatile loads — there's no
-// strict atomicity requirement for diagnostic display.
+// Both timestamps are raw, captured by the same DWT counter, and live in
+// the same reference frame.  No latency compensation is applied — that
+// would distort what the measurement is actually capturing.
 //
-// No constants are consulted.  No predicted value is compared to an
-// observed value.  The truth is whatever the hardware reports.
+// What this measurement IS:
+//   The number of DWT cycles between the PPS GPIO ISR entering and the
+//   VCLOCK CH3 cadence ISR entering, on the second when both are
+//   triggered by physically coincident edges.  This is dominated by:
+//     • The body length of the PPS GPIO ISR (deterministic work).
+//     • NVIC tail-chain cost from GPIO returning to QTimer1 entering.
+//     • A small contribution from CH3 compare maturation latency.
+//
+// What it ISN'T:
+//   It is NOT the "irreducible hardware-path offset between PPS and the
+//   immediate-next VCLOCK edge."  That number (which the previous CH1
+//   approach was attempting to measure) lives in the electrical-edge
+//   frame, after subtracting GPIO and QTimer sink-path latencies.  The
+//   new measurement lives in the ISR-entry frame, which is much more
+//   stable but represents a different physical quantity.
+//
+// Why it's better:
+//   NVIC strictly serializes the two ISRs (PPS=0, QTimer1=16).  Whatever
+//   makes the PPS GPIO ISR enter slightly late this second (cache state,
+//   bus contention, etc.) also delays the QTimer1 tail-chain by a
+//   correlated amount — common-mode jitter that partially cancels in the
+//   subtraction.  Two independent ISR-entry latencies (the CH1 case) had
+//   no such cancellation, so the noise added in quadrature.
+//
+// Sanity filter:
+//   In normal operation the delta is on the order of tens of cycles.  If
+//   a PPS edge is missed, or the cadence boundary fires before any PPS
+//   has been observed, or some other misalignment occurs, the delta will
+//   be in the millions or billions of cycles.  PPS_VCLOCK_OFFSET_SANITY_
+//   CEILING_CYCLES filters these out and they're counted separately.
+//
+// Welford state is a single-writer/single-reader-with-PRIMASK pattern:
+//   - VCLOCK cadence ISR is the only writer.
+//   - REPORT reads under brief PRIMASK to copy a consistent snapshot.
 
 struct pps_vclock_offset_welford_t {
   uint32_t n;
@@ -425,15 +424,22 @@ struct pps_vclock_offset_welford_t {
   int32_t  max;
 };
 
-// Single-writer (CH1 ISR), occasional foreground reader (REPORT).  The
-// reader copies under a brief PRIMASK-disabled critical section to get a
-// consistent snapshot.  No volatile qualifier needed on the struct itself.
 static pps_vclock_offset_welford_t g_pps_vclock_offset = {};
-static volatile uint32_t g_pps_vclock_offset_pps_dwt_at_edge = 0;
-static volatile bool     g_pps_vclock_offset_armed = false;
-static volatile uint32_t g_pps_vclock_offset_arm_total      = 0;
+
+// Most recent raw PPS GPIO ISR-entry DWT.  Written by the GPIO ISR,
+// read by the VCLOCK cadence ISR on the 1-second boundary.  The valid
+// flag distinguishes "no PPS edge has been observed yet" from "PPS DWT
+// is zero by coincidence."
+static volatile uint32_t g_pps_isr_entry_dwt_raw_last  = 0;
+static volatile bool     g_pps_isr_entry_dwt_raw_valid = false;
+
+// Total accepted samples (entered into Welford).
 static volatile uint32_t g_pps_vclock_offset_complete_total = 0;
-static volatile uint32_t g_pps_vclock_offset_dropped_total  = 0;
+// Samples filtered out for exceeding the sanity ceiling.  Includes
+// pre-rebootstrap boundaries (when no PPS has been seen, or when the
+// cadence is out of phase with PPS) and any anomalous skew during
+// operation.
+static volatile uint32_t g_pps_vclock_offset_filtered_total = 0;
 
 static inline void pps_vclock_offset_reset(void) {
   g_pps_vclock_offset.n    = 0;
@@ -445,9 +451,9 @@ static inline void pps_vclock_offset_reset(void) {
 }
 
 static inline void pps_vclock_offset_update(int32_t observed_cycles) {
-  // Welford one-pass, in-ISR.  Single writer (this ISR), so plain
-  // read-modify-write is fine.  No floating-point sqrt here; stddev is
-  // computed at report time from m2/(n-1).
+  // Welford one-pass, in-ISR.  Single writer (the VCLOCK cadence ISR),
+  // so plain read-modify-write is fine.  No floating-point sqrt here;
+  // stddev is computed at report time from m2/(n-1).
   pps_vclock_offset_welford_t& w = g_pps_vclock_offset;
 
   w.last = observed_cycles;
@@ -461,27 +467,26 @@ static inline void pps_vclock_offset_update(int32_t observed_cycles) {
   w.m2   += d1 * d2;
 }
 
-// Called from the PPS GPIO ISR after the latency-compensated PPS edge
-// DWT is in hand.  Reads CH1's live CNTR (immediate hardware programming
-// — the value dies in this stack frame, never propagated as an event
-// coordinate) and programs CH1 to fire on CNTR + 1.
-static inline void pps_vclock_offset_arm(uint32_t pps_edge_dwt) {
-  // If a previous arming hasn't completed, the CH1 ISR didn't fire (or
-  // didn't fire in time).  Disarm and count it; the new measurement
-  // request supersedes.
-  if (g_pps_vclock_offset_armed) {
-    qtimer1_ch1_disable_compare();
-    g_pps_vclock_offset_dropped_total++;
+// Called from the VCLOCK cadence ISR on every 1-second boundary.  Reads
+// the most recently stashed PPS ISR-entry raw DWT, computes the delta,
+// and either records or filters based on the sanity ceiling.
+static inline void pps_vclock_offset_record(uint32_t vclock_isr_entry_dwt_raw) {
+  if (!g_pps_isr_entry_dwt_raw_valid) {
+    // No PPS has been observed yet; nothing to subtract from.
+    g_pps_vclock_offset_filtered_total++;
+    return;
   }
 
-  g_pps_vclock_offset_pps_dwt_at_edge = pps_edge_dwt;
+  const uint32_t pps_dwt = g_pps_isr_entry_dwt_raw_last;
+  const int32_t  delta   = (int32_t)(vclock_isr_entry_dwt_raw - pps_dwt);
 
-  const uint16_t ch1_now    = IMXRT_TMR1.CH[1].CNTR;
-  const uint16_t ch1_target = (uint16_t)(ch1_now + 1);
-  qtimer1_ch1_program_compare(ch1_target);
+  if (delta < 0 || delta > PPS_VCLOCK_OFFSET_SANITY_CEILING_CYCLES) {
+    g_pps_vclock_offset_filtered_total++;
+    return;
+  }
 
-  g_pps_vclock_offset_armed = true;
-  g_pps_vclock_offset_arm_total++;
+  pps_vclock_offset_update(delta);
+  g_pps_vclock_offset_complete_total++;
 }
 
 // ============================================================================
@@ -661,42 +666,20 @@ static void vclock_cadence_isr(uint32_t isr_entry_dwt_raw) {
   if (++g_vclock_lane.tick_mod_1000 < TICKS_PER_SECOND_EVENT) return;
   g_vclock_lane.tick_mod_1000 = 0;
 
-  // One-second boundary — fire VCLOCK subscriber.
+  // One-second boundary.  Two things happen here:
+  //
+  //   1. PPS↔VCLOCK offset measurement.  Use the raw ISR-entry DWT
+  //      (not the latency-compensated one) so it lives in the same
+  //      reference frame as the PPS GPIO ISR's stashed raw value.
+  //
+  //   2. VCLOCK subscriber dispatch.  Use the latency-compensated
+  //      event-coordinate DWT, as the rest of the timing stack
+  //      expects.
+  pps_vclock_offset_record(isr_entry_dwt_raw);
+
   const uint32_t dwt_at_edge = qtimer_event_dwt_from_isr_entry_raw(isr_entry_dwt_raw);
   const int64_t  gnss_ns     = time_dwt_to_gnss_ns(dwt_at_edge);
   dispatch_deferred(g_vclock, dwt_at_edge, g_vclock_count32, gnss_ns);
-}
-
-// ============================================================================
-// QTimer1 CH1 — PPS↔VCLOCK irreducible offset capture ISR
-// ============================================================================
-//
-// Fires on the next VCLOCK edge after the PPS GPIO ISR armed it.
-// Captures the latency-compensated VCLOCK-edge DWT, computes the offset
-// from the saved PPS-edge DWT (mod 100), updates Welford, disarms.
-
-void process_interrupt_qtimer1_ch1_irq(uint32_t isr_entry_dwt_raw) {
-  qtimer1_ch1_disable_compare();   // one-shot, regardless of whether armed
-
-  if (!g_pps_vclock_offset_armed) {
-    // Stale fire (e.g., stray TCF1 from prior arming), nothing to record.
-    return;
-  }
-  g_pps_vclock_offset_armed = false;
-
-  const uint32_t vclock_dwt = qtimer_event_dwt_from_isr_entry_raw(isr_entry_dwt_raw);
-  const uint32_t pps_dwt    = g_pps_vclock_offset_pps_dwt_at_edge;
-
-  const int32_t delta_cycles = (int32_t)(vclock_dwt - pps_dwt);
-
-  // Mod by 100.  The C99 % operator's sign for negative dividends is
-  // implementation-defined-but-truncated-toward-zero on Cortex-M7/GCC;
-  // we want a non-negative remainder, so canonicalize.
-  int32_t observed = delta_cycles % PPS_VCLOCK_OFFSET_MODULUS_CYCLES;
-  if (observed < 0) observed += PPS_VCLOCK_OFFSET_MODULUS_CYCLES;
-
-  pps_vclock_offset_update(observed);
-  g_pps_vclock_offset_complete_total++;
 }
 
 // ============================================================================
@@ -805,34 +788,25 @@ static void qtimer3_isr(void) {
 }
 
 // ============================================================================
-// QTimer1 vector — dispatches CH1 (offset capture), CH2 (schedule fire),
-//                  and CH3 (VCLOCK cadence)
+// QTimer1 vector — dispatches CH2 (schedule fire) and CH3 (VCLOCK cadence)
 // ============================================================================
 
 static void qtimer1_isr(void) {
   const uint32_t isr_entry_dwt_raw = ARM_DWT_CYCCNT;  // SACRED: first instruction.
 
-  // CH1 (PPS↔VCLOCK offset capture) checked first so the offset
-  // measurement sees the freshest possible _raw — minimizing variability
-  // in the latency-compensated VCLOCK edge timestamp that goes into the
-  // mod-100 calculation.  CH2 (schedule fire) next, CH3 (VCLOCK cadence)
-  // last.  All three lanes share priority; tail-chain ordering across the
-  // QTimer1 vector is a same-priority visit, so this in-vector ordering
-  // controls the relative latency.
+  // CH2 (schedule fire) checked first so SpinDry approaches see the
+  // freshest possible _raw.  CH3 (VCLOCK cadence) immediately after.
+  // Both lanes share priority; tail-chain ordering across the QTimer1
+  // vector is a same-priority visit, so this in-vector ordering controls
+  // the relative latency.
   //
   // CRITICAL: Each lane is dispatched only if BOTH TCF1 (flag) AND
   // TCF1EN (enable) are set.  The TCF1 flag sets on every compare match
   // regardless of TCF1EN, so a disarmed channel whose CNTR wraps through
   // COMP1 will leave TCF1 set in hardware.  Without the TCF1EN gate, the
-  // shared QTimer1 ISR (entered for any other lane's match) would also
+  // shared QTimer1 ISR (entered for the other lane's match) would also
   // run the disarmed lane's handler on every entry — a kHz-rate storm of
   // spurious dispatches.
-  {
-    const uint32_t cs = IMXRT_TMR1.CH[1].CSCTRL;
-    if ((cs & TMR_CSCTRL_TCF1) && (cs & TMR_CSCTRL_TCF1EN)) {
-      process_interrupt_qtimer1_ch1_irq(isr_entry_dwt_raw);
-    }
-  }
   {
     const uint32_t cs = IMXRT_TMR1.CH[2].CSCTRL;
     if ((cs & TMR_CSCTRL_TCF1) && (cs & TMR_CSCTRL_TCF1EN)) {
@@ -862,12 +836,9 @@ static void qtimer1_isr(void) {
 // VCLOCK-selected epoch DWT using that calibrated offset, and dispatches
 // PPS_VCLOCK with the canonical DWT.
 //
-// In parallel, this ISR captures the latency-compensated PPS edge DWT
-// and arms QTimer1 CH1 to fire on the next VCLOCK rising edge.  The CH1
-// ISR (above) captures the latency-compensated VCLOCK edge DWT and
-// records the irreducible offset between the two — a continuous,
-// constants-free empirical witness to what was previously asserted by
-// the CANONICAL_VCLOCK_EPOCH_MINUS_RAW_PPS_ISR_CYCLES constant.
+// Independently, the raw ISR-entry DWT itself is stashed for the VCLOCK
+// cadence ISR to consume on the next 1-second boundary, where the
+// PPS↔VCLOCK offset measurement happens (see pps_vclock_offset_record).
 //
 // The subscription name PPS_VCLOCK is retained for compatibility, but its
 // semantic meaning is: "the canonical VCLOCK-selected PPS epoch is now
@@ -878,13 +849,15 @@ static void qtimer1_isr(void) {
 // register read.
 
 void process_interrupt_gpio6789_irq(uint32_t isr_entry_dwt_raw) {
-  const uint32_t dwt_at_edge = pps_vclock_dwt_from_pps_isr_entry_raw(isr_entry_dwt_raw);
+  // Stash the raw ISR-entry DWT for the VCLOCK cadence ISR's offset
+  // measurement.  This is a single-writer/single-reader pattern (this
+  // ISR writes; the VCLOCK cadence ISR reads on its 1-second boundary,
+  // which by NVIC priority cannot preempt this ISR).  Plain volatile
+  // stores are sufficient.
+  g_pps_isr_entry_dwt_raw_last  = isr_entry_dwt_raw;
+  g_pps_isr_entry_dwt_raw_valid = true;
 
-  // Arm CH1 to fire on the next VCLOCK edge so we can empirically measure
-  // the irreducible PPS↔VCLOCK offset.  The PPS-side timestamp passed
-  // here is the latency-compensated electrical-edge DWT (referenced to
-  // the same frame as the QTimer-side capture in the CH1 ISR).
-  pps_vclock_offset_arm(pps_edge_dwt_from_pps_isr_entry_raw(isr_entry_dwt_raw));
+  const uint32_t dwt_at_edge = pps_vclock_dwt_from_pps_isr_entry_raw(isr_entry_dwt_raw);
 
   if (g_pps_rebootstrap_pending) {
     g_pps_rebootstrap_pending = false;
@@ -946,25 +919,27 @@ static void qtimer1_init_vclock_base(void) {
   (void)IMXRT_TMR1.CH[0].CNTR;
 }
 
-static void qtimer1_ch1_init_for_offset_measurement(void) {
-  // CH1's maiden voyage as an independent VCLOCK-counting channel.  No
-  // longer the CM=7 cascade slave for the old 32-bit cascade — that
-  // machinery is gone.  CH1 now mirrors CH2's setup: it counts the same
-  // 10 MHz VCLOCK source as CH0/CH2/CH3 with a disabled compare; the
-  // compare is armed dynamically inside the PPS GPIO ISR via
-  // pps_vclock_offset_arm().
+static void qtimer1_ch1_init_dormant(void) {
+  // CH1 is no longer used.  The previous CH1-based PPS↔VCLOCK offset
+  // measurement has been replaced by an NVIC-serialized measurement in
+  // the VCLOCK cadence ISR (see pps_vclock_offset_record).
+  //
+  // Leave CH1 fully configured but inert: CTRL.CM = 0 means the channel
+  // does not count and does not assert TCF1, regardless of whether its
+  // ENBL bit is set.  All compare and status state is cleared.  CH1's
+  // CNTR will sit at 0 forever.
+  //
+  // The synchronized ENBL = 0x0F start at the end of init still asserts
+  // CH1's enable bit; that's harmless given CTRL.CM = 0, and preserves
+  // the "all four channels start synchronously" pattern in case CH1 is
+  // repurposed later.
   IMXRT_TMR1.CH[1].CTRL   = 0;
-  IMXRT_TMR1.CH[1].CNTR   = 0;
-  IMXRT_TMR1.CH[1].LOAD   = 0;
-  IMXRT_TMR1.CH[1].COMP1  = 0xFFFF;
-  IMXRT_TMR1.CH[1].CMPLD1 = 0xFFFF;
   IMXRT_TMR1.CH[1].SCTRL  = 0;
   IMXRT_TMR1.CH[1].CSCTRL = 0;
-  // CM=1 (count rising edges of primary source), PCS=0 (CH0 input → 10 MHz
-  // VCLOCK).  Same source as CH2/CH3, so CH1's CNTR advances on the same
-  // VCLOCK ticks observed by the rest of the timing stack.
-  IMXRT_TMR1.CH[1].CTRL   = TMR_CTRL_CM(1) | TMR_CTRL_PCS(0);
-  qtimer1_ch1_disable_compare();
+  IMXRT_TMR1.CH[1].LOAD   = 0;
+  IMXRT_TMR1.CH[1].CNTR   = 0;
+  IMXRT_TMR1.CH[1].COMP1  = 0xFFFF;
+  IMXRT_TMR1.CH[1].CMPLD1 = 0xFFFF;
 }
 
 static void qtimer1_ch2_init_for_schedule(void) {
@@ -1022,10 +997,12 @@ void process_interrupt_init_hardware(void) {
 
   // QTimer1 synchronized channel start: ENBL=0 first, configure
   // CH0/CH1/CH2/CH3 fully, then a single ENBL=0xF write starts all four
-  // on the same VCLOCK edge — zero phase offset by construction.
+  // on the same VCLOCK edge — zero phase offset by construction (for the
+  // channels that are actually counting; CH1 has CTRL.CM=0 and stays
+  // inert).
   IMXRT_TMR1.ENBL = 0;
   qtimer1_init_vclock_base();
-  qtimer1_ch1_init_for_offset_measurement();
+  qtimer1_ch1_init_dormant();
   qtimer1_ch2_init_for_schedule();
   qtimer1_ch3_init_vclock_cadence();
   IMXRT_TMR1.CH[0].CNTR = 0;
@@ -1035,6 +1012,10 @@ void process_interrupt_init_hardware(void) {
   IMXRT_TMR1.ENBL = 0x0F;
 
   pps_vclock_offset_reset();
+  g_pps_isr_entry_dwt_raw_last  = 0;
+  g_pps_isr_entry_dwt_raw_valid = false;
+  g_pps_vclock_offset_complete_total = 0;
+  g_pps_vclock_offset_filtered_total = 0;
 
   g_interrupt_hw_ready = true;
 }
@@ -1088,9 +1069,7 @@ void process_interrupt_enable_irqs(void) {
   g_ocxo2_lane.phase_bootstrapped = false;
   qtimer3_program_compare(3, (uint16_t)(g_ocxo2_lane.compare_target + 1));
 
-  // CH1 (offset measurement) and CH2 (schedule fire) stay disabled until
-  // their respective consumers arm them — CH1 inside the PPS GPIO ISR,
-  // CH2 from TimePop's precision-mode arming.
+  // CH2 (schedule fire) stays disabled until TimePop arms it.
 
   g_interrupt_irqs_enabled = true;
 }
@@ -1121,11 +1100,25 @@ static Payload cmd_report(const Payload&) {
   // PPS rebootstrap state
   p.add("pps_rebootstrap_pending", g_pps_rebootstrap_pending);
 
-  // PPS↔VCLOCK irreducible offset measurement (empirical, no constant fed back).
-  // Each PPS edge arms CH1 to fire on the next VCLOCK edge; the CH1 ISR
-  // captures (vclock_dwt - pps_dwt) % 100 and updates Welford state.  In
-  // a healthy system, mean is stable and stddev is tiny; the value
-  // historically settled around +34 cycles.
+  // PPS↔VCLOCK irreducible offset measurement (NVIC-serialized).
+  //
+  // Mechanism: the PPS GPIO ISR stashes its first-instruction raw DWT.
+  // The VCLOCK cadence ISR, on every 1-second-boundary tick, captures
+  // its own first-instruction raw DWT and computes the cycle delta.  No
+  // latency math — both timestamps are in the raw ISR-entry frame.
+  //
+  // Field semantics:
+  //   pps_vclock_offset_samples         — count of accepted samples (= n)
+  //   pps_vclock_offset_last_cycles     — most recent accepted delta
+  //   pps_vclock_offset_min/max_cycles  — accepted-sample range
+  //   pps_vclock_offset_mean_cycles     — Welford running mean
+  //   pps_vclock_offset_stddev_cycles   — Welford-derived sample stddev
+  //   pps_vclock_offset_complete_total  — same as samples; kept for
+  //                                       continuity with prior schema
+  //   pps_vclock_offset_filtered_total  — boundaries filtered out by the
+  //                                       sanity ceiling (pre-rebootstrap
+  //                                       boundaries, missed PPS edges,
+  //                                       skewed alignments, etc.)
   {
     pps_vclock_offset_welford_t w;
     {
@@ -1151,10 +1144,10 @@ static Payload cmd_report(const Payload&) {
       p.add("pps_vclock_offset_mean_cycles", 0.0);
       p.add("pps_vclock_offset_stddev_cycles", 0.0);
     }
-    p.add("pps_vclock_offset_arm_total",      g_pps_vclock_offset_arm_total);
     p.add("pps_vclock_offset_complete_total", g_pps_vclock_offset_complete_total);
-    p.add("pps_vclock_offset_dropped_total",  g_pps_vclock_offset_dropped_total);
-    p.add("pps_vclock_offset_armed",          g_pps_vclock_offset_armed);
+    p.add("pps_vclock_offset_filtered_total", g_pps_vclock_offset_filtered_total);
+    p.add("pps_vclock_offset_sanity_ceiling_cycles",
+          (int32_t)PPS_VCLOCK_OFFSET_SANITY_CEILING_CYCLES);
   }
 
   // Subscriber sequences (monotone counters per kind)
@@ -1295,7 +1288,6 @@ const char* interrupt_provider_kind_str(interrupt_provider_kind_t provider) {
 
 const char* interrupt_lane_str(interrupt_lane_t lane) {
   switch (lane) {
-    case interrupt_lane_t::QTIMER1_CH1_OFFSET: return "QTIMER1_CH1_OFFSET";
     case interrupt_lane_t::QTIMER1_CH2_SCHED:  return "QTIMER1_CH2_SCHED";
     case interrupt_lane_t::QTIMER1_CH3_COMP:   return "QTIMER1_CH3_COMP";
     case interrupt_lane_t::QTIMER3_CH2_COMP:   return "QTIMER3_CH2_COMP";

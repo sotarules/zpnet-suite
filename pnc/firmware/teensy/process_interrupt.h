@@ -15,7 +15,7 @@
 //
 // Responsibilities:
 //   - SOLE OWNER of QTimer1 and QTimer3 registers.
-//   - ISR custody for PPS GPIO, QTimer1 CH1/CH2/CH3, and QTimer3 CH2/CH3.
+//   - ISR custody for PPS GPIO, QTimer1 CH2/CH3, and QTimer3 CH2/CH3.
 //   - Conversion of _raw first-instruction DWT captures into canonical
 //     event-coordinate DWT values.
 //   - Maintenance of three internal synthetic 32-bit event ledgers:
@@ -23,7 +23,9 @@
 //   - Publication of small interrupt_event_t payloads to subscribers.
 //   - PPS-anchored VCLOCK rebootstrap on demand.
 //   - CH2 schedule-fire actuator for TimePop precision/SpinDry work.
-//   - CH1 one-shot PPS-to-VCLOCK irreducible-offset measurement.
+//   - PPS↔VCLOCK irreducible-offset measurement (NVIC-serialized; the
+//     PPS GPIO ISR stashes its raw entry DWT and the VCLOCK cadence
+//     ISR computes the cycle delta on every 1-second boundary).
 //
 // Non-responsibilities:
 //   - Foreground timing policy.  TimePop decides what to schedule.
@@ -80,23 +82,25 @@
 //   within a small tolerance of the requested target.  Premature low-word
 //   matches remain armed and are counted diagnostically.
 //
-// PPS-to-VCLOCK irreducible offset (CH1):
+// PPS↔VCLOCK irreducible offset (NVIC-serialized):
 //   PPS GPIO and the GF-8802's 10 MHz VCLOCK are physically synchronous —
-//   the same emission moment.  After full latency compensation on both
-//   sides, the residual DWT-cycle difference between the two ISR
-//   timestamps is a fixed hardware-path artifact (GPIO sink path vs.
-//   QTimer sink path, input synchronizers, pad routing, GF-8802 internal
-//   PPS-to-VCLOCK skew).  process_interrupt measures this empirically:
-//   the PPS GPIO ISR captures pps_dwt_at_edge and arms CH1 to fire on the
-//   next VCLOCK edge; the CH1 ISR captures vclock_dwt_at_edge and records
-//   (vclock_dwt - pps_dwt) % 100 as the offset.  CH1 is one-shot and
-//   disarmed inside the CH1 ISR.  No constants are consulted; the truth
-//   is whatever the hardware reports.
+//   the same emission moment.  process_interrupt measures the irreducible
+//   path-difference DWT cycles between them empirically.  The PPS GPIO
+//   ISR (priority 0) captures its first-instruction raw DWT and stashes
+//   it.  The VCLOCK CH3 cadence ISR (priority 16), on every 1-second
+//   boundary, captures its own first-instruction raw DWT and computes
+//   delta = vclock_dwt - pps_dwt.  Both timestamps live in the same raw
+//   ISR-entry frame; no latency math is applied (it would distort what
+//   the measurement is capturing).  NVIC strictly serializes the two
+//   ISRs, so the cadence boundary always lands cleanly after the PPS
+//   GPIO ISR has returned, and common-mode jitter partially cancels in
+//   the subtraction.  A sanity ceiling filters skewed/missed-edge
+//   samples.  No constants are consulted; the truth is whatever the
+//   hardware reports.
 //
 // NVIC priority structure:
 //   PPS GPIO (IRQ_GPIO6789)  : priority 0  - sovereign; preempts all
 //   QTimer1  (IRQ_QTIMER1)   : priority 16 - VCLOCK cadence + schedule-fire
-//                                            + PPS↔VCLOCK offset (CH1)
 //   QTimer3  (IRQ_QTIMER3)   : priority 32 - OCXO cadences
 //
 // ============================================================================
@@ -124,7 +128,6 @@ enum class interrupt_provider_kind_t : uint8_t {
 enum class interrupt_lane_t : uint8_t {
   NONE = 0,
   GPIO_EDGE,
-  QTIMER1_CH1_OFFSET,
   QTIMER1_CH2_SCHED,
   QTIMER1_CH3_COMP,
   QTIMER3_CH2_COMP,
@@ -235,7 +238,6 @@ uint32_t interrupt_schedule_fires_cancelled_total (void);
 // ============================================================================
 
 void process_interrupt_gpio6789_irq   (uint32_t isr_entry_dwt_raw);
-void process_interrupt_qtimer1_ch1_irq(uint32_t isr_entry_dwt_raw);
 void process_interrupt_qtimer1_ch2_irq(uint32_t isr_entry_dwt_raw);
 void process_interrupt_qtimer3_ch2_irq(uint32_t isr_entry_dwt_raw);
 void process_interrupt_qtimer3_ch3_irq(uint32_t isr_entry_dwt_raw);
