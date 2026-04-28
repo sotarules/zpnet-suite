@@ -11,28 +11,19 @@
 //
 // Epoch authority:
 //
-//   The canonical epoch is VCLOCK-domain PPS.  At INIT / ZERO / START,
-//   alpha calls interrupt_request_pps_rebootstrap() + sets
-//   g_epoch_pending.  The next physical PPS GPIO edge is captured by
-//   process_interrupt, but the public snapshot it publishes defines
-//   "PPS" as the selected VCLOCK epoch edge: currently the first VCLOCK
-//   edge after the physical PPS pulse, latency-adjusted into DWT space.
+//   The canonical epoch is the VCLOCK-domain PPS snapshot authored by
+//   process_interrupt. At INIT / ZERO / START, alpha requests an exact
+//   interrupt-side rebootstrap and synthetic clock32 zero. The next PPS GPIO
+//   ISR consumes that request and publishes a snapshot whose counter32 identity
+//   already matches the 64-bit ns ledger.
 //
-//   Alpha installs the epoch from that canonical snapshot verbatim:
-//     g_epoch_dwt_at_pps = snap.dwt_at_edge
-//     g_epoch_qtimer_at_pps = snap.counter32_at_edge
+//   Alpha installs that snapshot directly:
 //     g_gnss_ns_count_at_pps = 0
-//     g_epoch_pps_edge_sequence = snap.sequence
+//     g_dwt_cycle_count_at_pps = snap.dwt_at_edge
+//     g_qtimer_at_pps = snap.counter32_at_edge
 //
-//   The raw physical GPIO PPS facts remain available in snap.physical_pps_*
-//   only for audit/debugging.  Alpha must not apply the old
-//   VCLOCK_EPOCH_TICK_OFFSET to snap.counter32_at_edge; process_interrupt
-//   already published the chosen VCLOCK epoch identity.
-//
-//   After install, vclock_callback becomes a pure per-second advancer:
-//   each invocation advances g_gnss_ns_count_at_pps by exactly 1e9,
-//   and the VCLOCK cadence it responds to is phase-locked to the selected
-//   VCLOCK epoch.
+//   After install, VCLOCK events advance the synthetic ns ledger by +1e9 and
+//   PPS snapshots refresh the DWT/GNSS bridge anchor.
 //
 // // Statistical surface (standardized):
 //
@@ -52,14 +43,10 @@
 //     vclock_welford     — bridge interpolation residual samples (ns)
 //     ocxo1_welford      — OCXO1 per-second residual samples (ns)
 //     ocxo2_welford      — OCXO2 per-second residual samples (ns)
-//     pps_witness_welford — PPS/VCLOCK phase-error samples (ns).
-//                          SOURCE: snap.counter32_at_edge minus the
-//                          projected post-epoch expected counter32
-//                          (g_epoch_qtimer_at_pps + edges-since-epoch ×
-//                          VCLOCK_COUNTS_PER_SECOND), scaled to ns.
-//                          Independent of foreground callback ordering.
-//                          Steady-state mean = GPIO ISR entry latency;
-//                          steady-state SD = jitter floor.
+//     pps_witness_welford — reserved PPS/VCLOCK phase-error surface (ns).
+//                          Beta publishes it but does not update it; the clean
+//                          witness-owned BRIDGE/PPS_PHASE path will become the
+//                          proper source.
 //     ocxo1_dac_welford  — OCXO1 DAC fractional code samples (LSB)
 //     ocxo2_dac_welford  — OCXO2 DAC fractional code samples (LSB)
 //
@@ -112,11 +99,6 @@
 //                                  VCLOCK-domain PPS epoch counter
 //                                  identity selected by the physical PPS
 //                                  pulse in process_interrupt.
-//   - g_epoch_dwt_at_pps           snap.dwt_at_edge at install.
-//   - g_epoch_qtimer_at_pps        snap.counter32_at_edge at install.
-//   - g_epoch_pps_edge_sequence    snap.sequence at install (for
-//                                  projecting expected counter32 at
-//                                  each subsequent edge).
 //
 // VCLOCK as measured peer of OCXO:
 //

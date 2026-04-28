@@ -905,8 +905,8 @@ void clocks_beta_pps(void) {
     now_window_push(g_now_window_ocxo2, g_ocxo2_measurement.second_residual_ns);
   }
 
-  // welford_pps_witness is fed by alpha's vclock_callback from the GPIO
-  // witness snapshot.  We do NOT update it here.
+  // PPS witness statistics are owned by the witness/PPS_PHASE path.
+  // Beta publishes the accumulator but does not update it here.
 
   // Servo runs AFTER welford updates so it sees this second's data.
   ocxo_calibration_servo();

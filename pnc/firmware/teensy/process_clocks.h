@@ -7,10 +7,10 @@
 // CLOCKS — Authoritative Temporal Subsystem (Teensy) — v12
 // ============================================================================
 //
-// CLOCKS owns ALL notions of time on the Teensy.
+// CLOCKS owns the canonical time ledgers on the Teensy.
 //
 // Responsibilities:
-//   • Hardware clock capture (DWT, GNSS, OCXO1, OCXO2)
+//   • Consumption of process_interrupt-authored clock captures
 //   • Synthetic nanosecond clocks
 //   • PPS-aligned truth capture
 //   • 1 Hz publication of canonical clock tuple
