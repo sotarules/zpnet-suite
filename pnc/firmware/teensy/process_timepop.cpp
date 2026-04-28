@@ -7,7 +7,7 @@
 // Core timing substrate:
 //   • QTimer1 CH0+CH1 form a passive 32-bit VCLOCK counter at 10 MHz
 //   • one VCLOCK tick = 100 ns
-//   • QTimer1 CH2 is the dynamic compare scheduler
+//   • QTimer1 CH2 is the dynamic compare scheduler, programmed by process_interrupt
 //
 // Scheduling modes:
 //   • relative scheduling        — timepop_arm(delay_gnss_ns, ...)
@@ -94,11 +94,9 @@
 // ============================================================================
 
 static inline bool deadline_expired(uint32_t deadline, uint32_t now);
-static inline uint32_t vclock_count(void);
 static bool gnss_ns_to_vclock_deadline(int64_t target_gnss_ns,
                                        const time_anchor_snapshot_t& snap,
                                        uint32_t& out_deadline);
-static inline uint32_t qtimer1_read_32_local(void);
 static int64_t vclock_to_gnss_ns(uint32_t vclock_raw,
                                  const time_anchor_snapshot_t& snap);
 
@@ -495,7 +493,7 @@ static void vclock_monitor_callback(timepop_ctx_t* ctx,
                                 diag->anchor_pps_count)
           : -1;
 
-  const uint32_t ch0_ch1_vclock_raw = qtimer1_read_32_local();
+  const uint32_t ch0_ch1_vclock_raw = interrupt_vclock_counter32_observe_ambient();
   const int64_t ch0_ch1_gnss_ns = vclock_to_gnss_ns(ch0_ch1_vclock_raw, anchor);
 
   g_vclock_edge_monitor.last_target_gnss_ns = g_vclock_edge_monitor.next_target_gnss_ns;
@@ -579,64 +577,10 @@ static inline void update_deferred_high_water(deferred_slot_t* slots_buf,
   if (active > high_water) high_water = active;
 }
 
-// QTimer1 CH0+CH1 32-bit read, instrumented locally in TimePop.
-// CH0 is low 16 bits, CH1 HOLD is high 16 bits of the cascaded counter.
-//
-// This read is used ONLY in contexts where ambient time is genuinely needed:
-//   • schedule_next() — must compare deadlines against the current counter
-//   • relative scheduling — "from now" inherently requires knowing "now"
-//   • recurring timer catch-up — relative timers that fell behind
-// //
-// Absolute and anchor-relative scheduling NEVER call this function.
-// Their deadlines are computed from the time anchor via pure arithmetic.
-static volatile uint32_t diag_qread_total = 0;
-static volatile uint32_t diag_qread_same_hi = 0;
-static volatile uint32_t diag_qread_retry_hi_changed = 0;
-static volatile uint32_t diag_qread_monotonic_backsteps = 0;
-static volatile uint32_t diag_qread_large_forward_jumps = 0;
-static volatile uint16_t diag_qread_last_lo1 = 0;
-static volatile uint16_t diag_qread_last_hi1 = 0;
-static volatile uint16_t diag_qread_last_lo2 = 0;
-static volatile uint16_t diag_qread_last_hi2 = 0;
-static volatile uint32_t diag_qread_last_value = 0;
-
-static inline uint32_t qtimer1_read_32_local(void) {
-  const uint16_t lo1 = IMXRT_TMR1.CH[0].CNTR;
-  const uint16_t hi1 = IMXRT_TMR1.CH[1].HOLD;
-
-  const uint16_t lo2 = IMXRT_TMR1.CH[0].CNTR;
-  const uint16_t hi2 = IMXRT_TMR1.CH[1].HOLD;
-
-  diag_qread_total++;
-  diag_qread_last_lo1 = lo1;
-  diag_qread_last_hi1 = hi1;
-  diag_qread_last_lo2 = lo2;
-  diag_qread_last_hi2 = hi2;
-
-  uint32_t value;
-  if (hi1 != hi2) {
-    diag_qread_retry_hi_changed++;
-    value = ((uint32_t)hi2 << 16) | (uint32_t)lo2;
-  } else {
-    diag_qread_same_hi++;
-    value = ((uint32_t)hi1 << 16) | (uint32_t)lo1;
-  }
-
-  const uint32_t prev = diag_qread_last_value;
-  if (diag_qread_total > 1) {
-    const int32_t signed_delta = (int32_t)(value - prev);
-    if (signed_delta < 0) {
-      diag_qread_monotonic_backsteps++;
-    } else if ((uint32_t)signed_delta > 1000000U) {
-      diag_qread_large_forward_jumps++;
-    }
-  }
-  diag_qread_last_value = value;
-  return value;
-}
-
+// Ambient VCLOCK observations are provided by process_interrupt.
+// These values are scheduling observations only, not event facts.
 static inline uint32_t vclock_count(void) {
-  return qtimer1_read_32_local();
+  return interrupt_vclock_counter32_observe_ambient();
 }
 
 static inline bool deadline_expired(uint32_t deadline, uint32_t now) {
@@ -917,17 +861,12 @@ static inline void validate_dispatch_against_dwt(const timepop_slot_t& slot,
 // ============================================================================
 // CH2 compare management
 // ============================================================================
+//
+// process_interrupt owns QTimer1 CH2 hardware.  TimePop computes the next
+// desired VCLOCK deadline and asks process_interrupt to program the compare.
 
-static inline void ch2_clear_flag(void) {
-  IMXRT_TMR1.CH[2].CSCTRL &= ~(TMR_CSCTRL_TCF1 | TMR_CSCTRL_TCF2);
-}
-
-static inline void ch2_arm_compare(uint16_t target_low16) {
-  ch2_clear_flag();
-  IMXRT_TMR1.CH[2].COMP1  = target_low16;
-  IMXRT_TMR1.CH[2].CMPLD1 = target_low16;
-  ch2_clear_flag();
-  IMXRT_TMR1.CH[2].CSCTRL |= TMR_CSCTRL_TCF1EN;
+static inline void ch2_arm_compare(uint32_t target_counter32) {
+  interrupt_qtimer1_ch2_arm_compare(target_counter32);
 }
 
 // ============================================================================
@@ -986,7 +925,7 @@ static void schedule_next(void) {
     }
   }
 
-  ch2_arm_compare((uint16_t)(target & 0xFFFF));
+  ch2_arm_compare(target);
   diag_rearm_count++;
 
   const uint16_t cntr = IMXRT_TMR1.CH[2].CNTR;
@@ -2088,20 +2027,9 @@ static Payload cmd_report(const Payload&) {
   out.add("schedule_next_calls_from_dispatch", diag_schedule_next_calls_from_dispatch);
   out.add("schedule_next_calls_from_other",    diag_schedule_next_calls_from_other);
 
-  out.add("qread_total",                  diag_qread_total);
-  out.add("qread_same_hi",                diag_qread_same_hi);
-  out.add("qread_retry_hi_changed",       diag_qread_retry_hi_changed);
-  out.add("qread_monotonic_backsteps",    diag_qread_monotonic_backsteps);
-  out.add("qread_large_forward_jumps",    diag_qread_large_forward_jumps);
-  out.add("qread_last_lo1",               (uint32_t)diag_qread_last_lo1);
-  out.add("qread_last_hi1",               (uint32_t)diag_qread_last_hi1);
-  out.add("qread_last_lo2",               (uint32_t)diag_qread_last_lo2);
-  out.add("qread_last_hi2",               (uint32_t)diag_qread_last_hi2);
-  out.add("qread_last_value",             diag_qread_last_value);
-
-  out.add("qtmr1_ch2_cntr",   (uint32_t)IMXRT_TMR1.CH[2].CNTR);
-  out.add("qtmr1_ch2_comp1",  (uint32_t)IMXRT_TMR1.CH[2].COMP1);
-  out.add("qtmr1_ch2_csctrl", (uint32_t)IMXRT_TMR1.CH[2].CSCTRL);
+  out.add("qtmr1_ch2_cntr",   (uint32_t)interrupt_qtimer1_ch2_counter_now());
+  out.add("qtmr1_ch2_comp1",  (uint32_t)interrupt_qtimer1_ch2_comp1_now());
+  out.add("qtmr1_ch2_csctrl", (uint32_t)interrupt_qtimer1_ch2_csctrl_now());
 
 vclock_edge_monitor_refresh_correlation();
 out.add("vclock_edge_monitor_enabled", g_vclock_edge_monitor.enabled);

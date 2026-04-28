@@ -459,6 +459,14 @@ static inline void qtimer1_ch2_clear_compare_flag(void) {
   IMXRT_TMR1.CH[2].CSCTRL &= ~(TMR_CSCTRL_TCF1 | TMR_CSCTRL_TCF2);
 }
 
+static inline void qtimer1_ch2_program_compare(uint16_t target_low16) {
+  qtimer1_ch2_clear_compare_flag();
+  IMXRT_TMR1.CH[2].COMP1  = target_low16;
+  IMXRT_TMR1.CH[2].CMPLD1 = target_low16;
+  qtimer1_ch2_clear_compare_flag();
+  IMXRT_TMR1.CH[2].CSCTRL |= TMR_CSCTRL_TCF1EN;
+}
+
 static inline void qtimer3_clear_compare_flag(uint8_t ch) {
   IMXRT_TMR3.CH[ch].CSCTRL &= ~(TMR_CSCTRL_TCF1 | TMR_CSCTRL_TCF2);
 }
@@ -709,6 +717,22 @@ void interrupt_register_qtimer1_ch2_handler(interrupt_qtimer1_ch2_handler_fn cb)
   g_qtimer1_ch2_handler = cb;
 }
 
+// ============================================================================
+// TimePop hardware service API
+// ============================================================================
+
+uint32_t interrupt_vclock_counter32_observe_ambient(void) {
+  return qtimer1_read_32_for_diag();
+}
+
+void interrupt_qtimer1_ch2_arm_compare(uint32_t target_counter32) {
+  qtimer1_ch2_program_compare((uint16_t)(target_counter32 & 0xFFFFU));
+}
+
+uint16_t interrupt_qtimer1_ch2_counter_now(void) { return IMXRT_TMR1.CH[2].CNTR; }
+uint16_t interrupt_qtimer1_ch2_comp1_now(void)   { return IMXRT_TMR1.CH[2].COMP1; }
+uint16_t interrupt_qtimer1_ch2_csctrl_now(void)  { return IMXRT_TMR1.CH[2].CSCTRL; }
+
 static void qtimer1_isr(void) {
   const uint32_t isr_entry_dwt_raw = ARM_DWT_CYCCNT;  // SACRED: first instruction.
 
@@ -725,7 +749,7 @@ static void qtimer1_isr(void) {
       event.status   = interrupt_event_status_t::OK;
       event.dwt_at_event       = qtimer_event_dwt;
       event.gnss_ns_at_event   = (gnss_ns >= 0) ? (uint64_t)gnss_ns : 0;
-      event.counter32_at_event = 0;
+      event.counter32_at_event = qtimer1_read_32_for_diag();
 
       interrupt_capture_diag_t diag{};
       diag.enabled  = true;
@@ -734,7 +758,7 @@ static void qtimer1_isr(void) {
       diag.kind     = interrupt_subscriber_kind_t::TIMEPOP;
       diag.dwt_at_event       = qtimer_event_dwt;
       diag.gnss_ns_at_event   = event.gnss_ns_at_event;
-      diag.counter32_at_event = 0;
+      diag.counter32_at_event = event.counter32_at_event;
 
       g_qtimer1_ch2_handler(event, diag);
     }

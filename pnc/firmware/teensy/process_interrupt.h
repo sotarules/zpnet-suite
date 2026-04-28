@@ -510,6 +510,22 @@ using interrupt_qtimer1_ch2_handler_fn =
 void interrupt_register_qtimer1_ch2_handler(interrupt_qtimer1_ch2_handler_fn cb);
 
 // ============================================================================
+// TimePop hardware service API — process_interrupt owns QTimer1 CH2 hardware
+// ============================================================================
+//
+// TimePop remains the scheduling policy engine, but it no longer programs
+// QTimer1 CH2 or reads the VCLOCK counter directly.  It asks process_interrupt
+// to perform hardware actions and to provide explicitly ambient scheduling
+// observations.  These observations are NOT event facts.
+
+uint32_t interrupt_vclock_counter32_observe_ambient(void);
+void     interrupt_qtimer1_ch2_arm_compare(uint32_t target_counter32);
+
+uint16_t interrupt_qtimer1_ch2_counter_now(void);
+uint16_t interrupt_qtimer1_ch2_comp1_now(void);
+uint16_t interrupt_qtimer1_ch2_csctrl_now(void);
+
+// ============================================================================
 // QTimer1 CH3 witness — torture-sanity test of timekeeping math
 // ============================================================================
 //

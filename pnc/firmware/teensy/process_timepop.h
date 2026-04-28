@@ -11,7 +11,7 @@
 //   • deferred callback dispatch
 //   • instrumentation / reports
 //   • always-on internal VCLOCK monitor
-//   • QTimer1 CH2 compare-register programming (the scheduler compare)
+//   • scheduler policy for QTimer1 CH2 compare deadlines
 //
 // TimePop does not own:
 //   • PPS/GPIO interrupt custody
@@ -47,7 +47,7 @@
 //   TimePop is responsible for:
 //     • registering its CH2 handler at init via
 //       interrupt_register_qtimer1_ch2_handler()
-//     • programming and re-programming the CH2 compare target as
+//     • requesting CH2 compare target updates from process_interrupt as
 //       slots are scheduled
 //
 //   process_interrupt is responsible for:
