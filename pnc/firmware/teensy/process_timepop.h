@@ -32,8 +32,8 @@
 //   Each handler receives a normalized DWT-at-edge capture for its own
 //   QTimer event.
 //
-//   For CH2, the dispatcher additionally computes counter32_at_event
-//   and gnss_ns_at_event and packages everything into a standard
+//   For CH2, the dispatcher additionally authors synthetic
+//   counter32_at_event and gnss_ns_at_event and packages everything into a standard
 //   interrupt_event_t (kind = TIMEPOP) and interrupt_capture_diag_t,
 //   which it passes to TimePop's handler.  TimePop reads the event
 //   payload directly and proceeds with slot dispatch — no need to

@@ -18,9 +18,10 @@
 //   Both handlers receive the same first-instruction DWT capture, so
 //   they get identical latency profiles.
 //
-//   TimePop owns the CH2 compare-register programming (advancing the
-//   compare target as it schedules slots).  TimePop registers its CH2
-//   handler via interrupt_register_qtimer1_ch2_handler at init time.
+//   TimePop owns scheduler policy only.  process_interrupt owns the CH2
+//   compare-register programming; TimePop requests target updates through
+//   interrupt_qtimer1_ch2_arm_compare().  TimePop registers its CH2 handler
+//   via interrupt_register_qtimer1_ch2_handler at init time.
 //
 // ─── PPS / PPS_VCLOCK doctrine ──────────────────────────────────────────────
 //
@@ -171,11 +172,10 @@ struct interrupt_event_t {
   // May be 0 for events emitted before the first PPS edge anchors GNSS.
   uint64_t gnss_ns_at_event = 0;
 
-  // Software-extended logical 32-bit count, advances by exactly
-  // 10,000,000 per event.  For the VCLOCK lane, re-seeded at PPS
-  // rebootstrap to match the PPS_VCLOCK counter32_at_edge — so
-  // counter32_at_event - pvc.counter32_at_edge equals exactly
-  // N * VCLOCK_COUNTS_PER_SECOND for the Nth event after anchor.
+  // process_interrupt-authored private synthetic 32-bit clock identity at
+  // this event.  This is an event fact, delivered only through the interrupt
+  // callback path.  It is derived from the corresponding 64-bit nanosecond
+  // ledger as (ns / 100) mod 2^32 and advanced in exact 10 MHz lockstep.
   uint32_t counter32_at_event = 0;
 
   // ── PPS / VCLOCK coincidence measurement ──
@@ -520,6 +520,25 @@ void interrupt_register_qtimer1_ch2_handler(interrupt_qtimer1_ch2_handler_fn cb)
 
 uint32_t interrupt_vclock_counter32_observe_ambient(void);
 void     interrupt_qtimer1_ch2_arm_compare(uint32_t target_counter32);
+
+// ============================================================================
+// Private synthetic clock32 zeroing API
+// ============================================================================
+//
+// The synthetic 32-bit QTimer identity for each clock domain is owned by
+// process_interrupt.  Callers provide the 64-bit nanosecond ledger value;
+// process_interrupt derives the compact identity as (ns / 100) mod 2^32.
+//
+// immediate zero: maps the clock's current synthetic identity to ns now.
+// requested zero: latches a zero request to be consumed at the next exact
+// hardware edge owned by process_interrupt.  VCLOCK consumes this in the PPS
+// GPIO ISR during rebootstrap so the snapshot itself carries the new identity.
+
+uint32_t interrupt_clock32_from_ns(uint64_t ns);
+bool     interrupt_clock32_zero_from_ns(interrupt_subscriber_kind_t kind,
+                                        uint64_t ns);
+bool     interrupt_clock32_request_zero_from_ns(interrupt_subscriber_kind_t kind,
+                                                uint64_t ns);
 
 uint16_t interrupt_qtimer1_ch2_counter_now(void);
 uint16_t interrupt_qtimer1_ch2_comp1_now(void);

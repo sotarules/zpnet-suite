@@ -5,7 +5,8 @@
 // TimePop is the GNSS-domain timer subsystem.
 //
 // Core timing substrate:
-//   • QTimer1 CH0+CH1 form a passive 32-bit VCLOCK counter at 10 MHz
+//   • process_interrupt owns the VCLOCK/QTimer1 hardware
+//   • TimePop sees only synthetic 32-bit VCLOCK identities and event facts
 //   • one VCLOCK tick = 100 ns
 //   • QTimer1 CH2 is the dynamic compare scheduler, programmed by process_interrupt
 //
@@ -49,9 +50,10 @@
 //      targets and convert the landed DWT back through the time bridge for
 //      monitored diagnostics.
 //
-//   2. VCLOCK-domain: process_interrupt passes the CH0+CH1 counter captured
-//      for the same CH2 compare event.  TimePop converts that counter to GNSS
-//      ns by pure VCLOCK arithmetic.  This is the scheduling authority.
+//   2. VCLOCK-domain: process_interrupt passes the synthetic VCLOCK counter
+//      identity authored for the same CH2 compare event.  TimePop converts
+//      that counter to GNSS ns by pure VCLOCK arithmetic.  This is the
+//      scheduling authority.
 //
 //   Under the new interrupt doctrine, process_interrupt owns QTimer1 hardware
 //   and publishes a canonical PPS epoch that is already the selected
@@ -928,7 +930,7 @@ static void schedule_next(void) {
   ch2_arm_compare(target);
   diag_rearm_count++;
 
-  const uint16_t cntr = IMXRT_TMR1.CH[2].CNTR;
+  const uint16_t cntr = interrupt_qtimer1_ch2_counter_now();
   const uint16_t comp = (uint16_t)(target & 0xFFFF);
   const uint16_t distance_16 = comp - cntr;
   (void)distance_16;

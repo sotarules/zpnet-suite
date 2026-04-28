@@ -942,9 +942,9 @@ void clocks_beta_pps(void) {
   p.add("dwt_prediction_residual_cycles",
         g_dwt_prediction_residual_cycles);
 
-  // QTimer1 hardware-counter identity of the canonical PPS epoch.
-  // Under the VCLOCK-domain architecture this is the selected VCLOCK
-  // edge after the physical PPS pulse, not the raw GPIO counter read.
+  // Synthetic 32-bit VCLOCK identity of the canonical PPS epoch.
+  // Under the VCLOCK-domain architecture this is the compact event identity
+  // authored by process_interrupt, not a raw ambient hardware read.
   p.add("qtimer_at_pps", g_qtimer_at_pps);
 
   // VCLOCK surface — authored facts + per-edge measurement + window accounting.

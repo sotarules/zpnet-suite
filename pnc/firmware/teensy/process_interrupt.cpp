@@ -419,6 +419,8 @@ struct ocxo_lane_t {
 static ocxo_lane_t g_ocxo1_lane;
 static ocxo_lane_t g_ocxo2_lane;
 
+static ocxo_lane_t* ocxo_lane_for(interrupt_subscriber_kind_t kind);
+
 // ============================================================================
 // QTimer1 32-bit counter (diagnostic read with torn-read protection)
 // ============================================================================
@@ -432,7 +434,144 @@ static inline uint32_t qtimer1_read_32_for_diag(void) {
                       : (((uint32_t)hi1 << 16) | (uint32_t)lo1);
 }
 
-uint32_t interrupt_qtimer1_counter32_now(void)   { return qtimer1_read_32_for_diag(); }
+// ============================================================================
+// Private synthetic 32-bit clock identities
+// ============================================================================
+//
+// Each QTimer-derived clock domain has a private process_interrupt-owned
+// synthetic 32-bit identity.  The public contract is simple: subscribers get
+// counter32_at_event only in the interrupt event payload.  They do not read
+// timer hardware, and they do not author counter identities themselves.
+//
+// For VCLOCK, the synthetic identity is mapped to the underlying QTimer1
+// hardware counter by a single affine offset established at an exact edge.
+// This lets TimePop continue to schedule by synthetic deadlines while
+// process_interrupt alone translates those deadlines into hardware compare
+// values.  For OCXO lanes, the synthetic identity is advanced by the exact
+// 10 MHz tick interval of the process_interrupt-owned cadence.
+
+struct synthetic_clock32_t {
+  bool     zeroed = false;
+  uint64_t zero_ns = 0;
+  uint32_t zero_counter32 = 0;
+  uint32_t current_counter32 = 0;
+  uint32_t zero_count = 0;
+
+  bool     pending_zero = false;
+  uint64_t pending_zero_ns = 0;
+  uint32_t pending_zero_counter32 = 0;
+  uint32_t pending_zero_count = 0;
+};
+
+struct vclock_synthetic_clock32_t : synthetic_clock32_t {
+  uint32_t hardware_counter32_at_zero = 0;
+};
+
+static vclock_synthetic_clock32_t g_vclock_clock32;
+static synthetic_clock32_t        g_ocxo1_clock32;
+static synthetic_clock32_t        g_ocxo2_clock32;
+
+static volatile uint32_t g_qtimer1_ch2_last_target_counter32 = 0;
+static volatile uint32_t g_qtimer1_ch2_arm_count = 0;
+
+static inline uint32_t clock32_from_ns(uint64_t ns) {
+  return (uint32_t)((ns / 100ULL) & 0xFFFFFFFFULL);
+}
+
+uint32_t interrupt_clock32_from_ns(uint64_t ns) {
+  return clock32_from_ns(ns);
+}
+
+static synthetic_clock32_t* synthetic_clock_for_kind(interrupt_subscriber_kind_t kind) {
+  if (kind == interrupt_subscriber_kind_t::OCXO1) return &g_ocxo1_clock32;
+  if (kind == interrupt_subscriber_kind_t::OCXO2) return &g_ocxo2_clock32;
+  return nullptr;
+}
+
+static void synthetic_clock_zero(synthetic_clock32_t& c, uint64_t ns) {
+  c.zeroed = true;
+  c.zero_ns = ns;
+  c.zero_counter32 = clock32_from_ns(ns);
+  c.current_counter32 = c.zero_counter32;
+  c.zero_count++;
+  c.pending_zero = false;
+}
+
+static void vclock_clock_zero_at_hardware_counter(uint64_t ns,
+                                                  uint32_t hardware_counter32) {
+  g_vclock_clock32.zeroed = true;
+  g_vclock_clock32.zero_ns = ns;
+  g_vclock_clock32.zero_counter32 = clock32_from_ns(ns);
+  g_vclock_clock32.current_counter32 = g_vclock_clock32.zero_counter32;
+  g_vclock_clock32.hardware_counter32_at_zero = hardware_counter32;
+  g_vclock_clock32.zero_count++;
+  g_vclock_clock32.pending_zero = false;
+}
+
+static uint32_t vclock_synthetic_from_hardware(uint32_t hardware_counter32) {
+  if (!g_vclock_clock32.zeroed) return hardware_counter32;
+  return g_vclock_clock32.zero_counter32 +
+         (uint32_t)(hardware_counter32 - g_vclock_clock32.hardware_counter32_at_zero);
+}
+
+static uint32_t vclock_hardware_from_synthetic(uint32_t synthetic_counter32) {
+  if (!g_vclock_clock32.zeroed) return synthetic_counter32;
+  return g_vclock_clock32.hardware_counter32_at_zero +
+         (uint32_t)(synthetic_counter32 - g_vclock_clock32.zero_counter32);
+}
+
+bool interrupt_clock32_zero_from_ns(interrupt_subscriber_kind_t kind, uint64_t ns) {
+  if (kind == interrupt_subscriber_kind_t::VCLOCK) {
+    vclock_clock_zero_at_hardware_counter(ns, qtimer1_read_32_for_diag());
+    g_vclock_lane.logical_count32_at_last_second = g_vclock_clock32.current_counter32;
+    return true;
+  }
+
+  synthetic_clock32_t* c = synthetic_clock_for_kind(kind);
+  if (!c) return false;
+  synthetic_clock_zero(*c, ns);
+
+  ocxo_lane_t* lane = ocxo_lane_for(kind);
+  if (lane) {
+    lane->logical_count32_at_last_second = c->current_counter32;
+    lane->tick_mod_1000 = 0;
+  }
+  return true;
+}
+
+bool interrupt_clock32_request_zero_from_ns(interrupt_subscriber_kind_t kind, uint64_t ns) {
+  const uint32_t counter32 = clock32_from_ns(ns);
+
+  if (kind == interrupt_subscriber_kind_t::VCLOCK) {
+    g_vclock_clock32.pending_zero = true;
+    g_vclock_clock32.pending_zero_ns = ns;
+    g_vclock_clock32.pending_zero_counter32 = counter32;
+    g_vclock_clock32.pending_zero_count++;
+    return true;
+  }
+
+  synthetic_clock32_t* c = synthetic_clock_for_kind(kind);
+  if (!c) return false;
+  c->pending_zero = true;
+  c->pending_zero_ns = ns;
+  c->pending_zero_counter32 = counter32;
+  c->pending_zero_count++;
+  return true;
+}
+
+static inline void synthetic_clock_consume_pending_zero_if_any(synthetic_clock32_t& c) {
+  if (!c.pending_zero) return;
+  synthetic_clock_zero(c, c.pending_zero_ns);
+}
+
+static inline uint32_t synthetic_clock_advance(synthetic_clock32_t& c,
+                                               uint32_t ticks) {
+  synthetic_clock_consume_pending_zero_if_any(c);
+  c.current_counter32 += ticks;
+  return c.current_counter32;
+}
+
+uint32_t interrupt_qtimer1_counter32_now(void)   { return vclock_synthetic_from_hardware(qtimer1_read_32_for_diag()); }
 uint16_t interrupt_qtimer3_ch2_counter_now(void) { return IMXRT_TMR3.CH[2].CNTR; }
 uint16_t interrupt_qtimer3_ch3_counter_now(void) { return IMXRT_TMR3.CH[3].CNTR; }
 
@@ -626,13 +765,18 @@ static void vclock_cadence_isr(uint32_t isr_entry_dwt_raw) {
   vclock_lane_advance_compare();
   g_vclock_lane.cadence_hits_total++;
 
+  // Synthetic VCLOCK identity advances in exact 10 MHz lockstep with the
+  // process_interrupt-owned CH3 cadence.  The one-second event below simply
+  // publishes the already-authored compact identity.
+  g_vclock_lane.logical_count32_at_last_second += VCLOCK_INTERVAL_COUNTS;
+  g_vclock_clock32.current_counter32 = g_vclock_lane.logical_count32_at_last_second;
+
   const uint32_t cadence_tick_mod_1000 = g_vclock_lane.tick_mod_1000 + 1;
 
   dynamic_cps_cadence_update(qtimer_event_dwt, cadence_tick_mod_1000);
 
   if (++g_vclock_lane.tick_mod_1000 >= TICKS_PER_SECOND_EVENT) {
     g_vclock_lane.tick_mod_1000 = 0;
-    g_vclock_lane.logical_count32_at_last_second += VCLOCK_COUNTS_PER_SECOND;
 
     // PPS_VCLOCK / PPS coincidence diagnostic.
     uint32_t coincidence_cycles = 0;
@@ -686,9 +830,15 @@ static void handle_ocxo_qtimer16_irq(ocxo_lane_t& lane,
   ocxo_lane_advance_compare(lane);
   lane.cadence_hits_total++;
 
+  synthetic_clock32_t* c = synthetic_clock_for_kind(rt.desc->kind);
+  if (c) {
+    lane.logical_count32_at_last_second = synthetic_clock_advance(*c, OCXO_INTERVAL_COUNTS);
+  } else {
+    lane.logical_count32_at_last_second += OCXO_INTERVAL_COUNTS;
+  }
+
   if (++lane.tick_mod_1000 >= TICKS_PER_SECOND_EVENT) {
     lane.tick_mod_1000 = 0;
-    lane.logical_count32_at_last_second += OCXO_COUNTS_PER_SECOND;
     emit_one_second_event(rt, qtimer_event_dwt, lane.logical_count32_at_last_second);
   }
 }
@@ -722,11 +872,14 @@ void interrupt_register_qtimer1_ch2_handler(interrupt_qtimer1_ch2_handler_fn cb)
 // ============================================================================
 
 uint32_t interrupt_vclock_counter32_observe_ambient(void) {
-  return qtimer1_read_32_for_diag();
+  return vclock_synthetic_from_hardware(qtimer1_read_32_for_diag());
 }
 
 void interrupt_qtimer1_ch2_arm_compare(uint32_t target_counter32) {
-  qtimer1_ch2_program_compare((uint16_t)(target_counter32 & 0xFFFFU));
+  g_qtimer1_ch2_last_target_counter32 = target_counter32;
+  g_qtimer1_ch2_arm_count++;
+  const uint32_t hardware_target = vclock_hardware_from_synthetic(target_counter32);
+  qtimer1_ch2_program_compare((uint16_t)(hardware_target & 0xFFFFU));
 }
 
 uint16_t interrupt_qtimer1_ch2_counter_now(void) { return IMXRT_TMR1.CH[2].CNTR; }
@@ -749,7 +902,10 @@ static void qtimer1_isr(void) {
       event.status   = interrupt_event_status_t::OK;
       event.dwt_at_event       = qtimer_event_dwt;
       event.gnss_ns_at_event   = (gnss_ns >= 0) ? (uint64_t)gnss_ns : 0;
-      event.counter32_at_event = qtimer1_read_32_for_diag();
+      // CH2 compare event identity is the synthetic deadline that
+      // process_interrupt armed in hardware on TimePop's behalf.  This is an
+      // event fact, not a post-event ambient read.
+      event.counter32_at_event = g_qtimer1_ch2_last_target_counter32;
 
       interrupt_capture_diag_t diag{};
       diag.enabled  = true;
@@ -785,14 +941,29 @@ static void pps_edge_dispatch_trampoline(timepop_ctx_t*, timepop_diag_t*, void*)
 }
 
 void process_interrupt_gpio6789_irq(uint32_t isr_entry_dwt_raw) {
-  // Read the VCLOCK counter and CH3 right after _raw capture.
-  const uint32_t counter32 = qtimer1_read_32_for_diag();
-  const uint16_t ch3_now   = (uint16_t)(counter32 & 0xFFFF);
+  // Read the VCLOCK hardware counter and CH3 right after _raw capture.  If a
+  // synthetic zero was requested, consume it at THIS captured edge so the
+  // compact 32-bit identity and the 64-bit GNSS ledger agree by construction.
+  const uint32_t hardware_counter32 = qtimer1_read_32_for_diag();
+  const uint16_t ch3_now = (uint16_t)(hardware_counter32 & 0xFFFF);
+
+  uint64_t zero_ns_consumed = 0;
+  bool zero_consumed = false;
+  if (g_vclock_clock32.pending_zero) {
+    zero_ns_consumed = g_vclock_clock32.pending_zero_ns;
+    vclock_clock_zero_at_hardware_counter(zero_ns_consumed, hardware_counter32);
+    zero_consumed = true;
+    g_vclock_epoch_gnss_ns = (int64_t)zero_ns_consumed;
+  }
+
+  const uint32_t counter32 =
+      vclock_synthetic_from_hardware(hardware_counter32) +
+      (uint32_t)VCLOCK_EPOCH_COUNTER32_OFFSET_TICKS;
 
   g_gpio_irq_count++;
   g_pps_gpio_heartbeat.edge_count++;
 
-  // Author PPS facts (physical edge truth).
+  // Author PPS facts (physical edge truth, synthetic counter identity).
   pps_t pps;
   pps.sequence          = g_pps_gpio_heartbeat.edge_count;
   pps.dwt_at_edge       = pps_dwt_from_isr_entry_raw(isr_entry_dwt_raw);
@@ -803,14 +974,16 @@ void process_interrupt_gpio6789_irq(uint32_t isr_entry_dwt_raw) {
   pps_vclock_t pvc;
   pvc.sequence          = g_pps_gpio_heartbeat.edge_count;
   pvc.dwt_at_edge       = pps_vclock_dwt_from_pps_isr_entry_raw(isr_entry_dwt_raw);
-  pvc.counter32_at_edge = counter32 + (uint32_t)VCLOCK_EPOCH_COUNTER32_OFFSET_TICKS;
-  pvc.ch3_at_edge       = (uint16_t)(ch3_now + (int16_t)VCLOCK_EPOCH_COUNTER32_OFFSET_TICKS);
+  pvc.counter32_at_edge = counter32;
+  pvc.ch3_at_edge       = ch3_now;
 
-  // GNSS ns at the canonical edge, VCLOCK-authored.  Use DWT only as the
-  // bootstrap seed to identify the first absolute second; subsequent edges
-  // advance by exactly 1e9 ns.
+  // GNSS ns at the canonical edge, VCLOCK-authored.  A requested synthetic
+  // zero provides the exact ledger value for this edge; otherwise the epoch
+  // advances by exactly 1e9 per PPS edge.
   const int64_t dwt_gnss_estimate_ns = time_dwt_to_gnss_ns(pvc.dwt_at_edge);
-  pvc.gnss_ns_at_edge = vclock_next_epoch_gnss_ns(dwt_gnss_estimate_ns);
+  pvc.gnss_ns_at_edge = zero_consumed
+      ? (int64_t)zero_ns_consumed
+      : vclock_next_epoch_gnss_ns(dwt_gnss_estimate_ns);
 
   g_pps_gpio_heartbeat.last_dwt     = pvc.dwt_at_edge;
   g_pps_gpio_heartbeat.last_gnss_ns = pvc.gnss_ns_at_edge;
@@ -823,8 +996,9 @@ void process_interrupt_gpio6789_irq(uint32_t isr_entry_dwt_raw) {
     g_vclock_lane.phase_bootstrapped = true;
     g_vclock_lane.tick_mod_1000 = 0;
     g_vclock_lane.compare_target =
-        (uint16_t)(pvc.ch3_at_edge + (uint16_t)VCLOCK_INTERVAL_COUNTS);
+        (uint16_t)(ch3_now + (uint16_t)VCLOCK_INTERVAL_COUNTS);
     g_vclock_lane.logical_count32_at_last_second = pvc.counter32_at_edge;
+    g_vclock_clock32.current_counter32 = pvc.counter32_at_edge;
     qtimer1_ch3_program_compare(g_vclock_lane.compare_target);
   }
 
@@ -1128,6 +1302,12 @@ void process_interrupt_init(void) {
   g_store = snapshot_store_t{};
   g_pps_edge_dispatch = nullptr;
 
+  g_vclock_clock32 = vclock_synthetic_clock32_t{};
+  g_ocxo1_clock32 = synthetic_clock32_t{};
+  g_ocxo2_clock32 = synthetic_clock32_t{};
+  g_qtimer1_ch2_last_target_counter32 = 0;
+  g_qtimer1_ch2_arm_count = 0;
+
   dynamic_cps_reset_model();
 
   g_interrupt_runtime_ready = true;
@@ -1216,6 +1396,32 @@ static Payload cmd_report(const Payload&) {
   p.add("dynamic_cps_last_pvc_dwt_at_edge",    g_dynamic_cps_last_pvc_dwt_at_edge);
   p.add("dynamic_cps_last_reseed_value",       g_dynamic_cps_last_reseed_value);
   p.add("dynamic_cps_last_reseed_was_computed", g_dynamic_cps_last_reseed_was_computed);
+
+  p.add("vclock_clock32_zeroed", g_vclock_clock32.zeroed);
+  p.add("vclock_clock32_zero_ns", g_vclock_clock32.zero_ns);
+  p.add("vclock_clock32_zero_counter32", g_vclock_clock32.zero_counter32);
+  p.add("vclock_clock32_current", g_vclock_clock32.current_counter32);
+  p.add("vclock_clock32_hardware_at_zero", g_vclock_clock32.hardware_counter32_at_zero);
+  p.add("vclock_clock32_pending_zero", g_vclock_clock32.pending_zero);
+  p.add("vclock_clock32_zero_count", g_vclock_clock32.zero_count);
+  p.add("vclock_clock32_pending_zero_count", g_vclock_clock32.pending_zero_count);
+
+  p.add("ocxo1_clock32_zeroed", g_ocxo1_clock32.zeroed);
+  p.add("ocxo1_clock32_zero_ns", g_ocxo1_clock32.zero_ns);
+  p.add("ocxo1_clock32_zero_counter32", g_ocxo1_clock32.zero_counter32);
+  p.add("ocxo1_clock32_current", g_ocxo1_clock32.current_counter32);
+  p.add("ocxo1_clock32_pending_zero", g_ocxo1_clock32.pending_zero);
+  p.add("ocxo1_clock32_zero_count", g_ocxo1_clock32.zero_count);
+
+  p.add("ocxo2_clock32_zeroed", g_ocxo2_clock32.zeroed);
+  p.add("ocxo2_clock32_zero_ns", g_ocxo2_clock32.zero_ns);
+  p.add("ocxo2_clock32_zero_counter32", g_ocxo2_clock32.zero_counter32);
+  p.add("ocxo2_clock32_current", g_ocxo2_clock32.current_counter32);
+  p.add("ocxo2_clock32_pending_zero", g_ocxo2_clock32.pending_zero);
+  p.add("ocxo2_clock32_zero_count", g_ocxo2_clock32.zero_count);
+
+  p.add("qtimer1_ch2_last_target_counter32", g_qtimer1_ch2_last_target_counter32);
+  p.add("qtimer1_ch2_arm_count", g_qtimer1_ch2_arm_count);
 
   return p;
 }

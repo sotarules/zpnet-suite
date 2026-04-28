@@ -212,9 +212,10 @@ extern volatile uint32_t g_dwt_cycle_count_between_pps;
 // Zero until two consecutive measurements exist since epoch install.
 extern volatile int32_t  g_dwt_prediction_residual_cycles;
 
-// Cascaded 32-bit QTimer1 CH0/CH1 counter identity of the most recent
-// canonical PPS epoch (snap.counter32_at_edge).  This is the VCLOCK
-// hardware-counter position selected by the physical PPS pulse.
+// process_interrupt-authored synthetic 32-bit VCLOCK identity of the most
+// recent canonical PPS epoch (snap.counter32_at_edge).  This is the compact
+// clock identity selected by the physical PPS pulse; it is not an ambient
+// hardware read.
 extern volatile uint32_t g_qtimer_at_pps;
 
 // Diagnostic — last seen counter32_at_event (CH3 ISR capture).

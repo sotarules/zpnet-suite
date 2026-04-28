@@ -363,6 +363,20 @@ static inline void dwt_enable(void) {
 static void alpha_request_epoch_zero(clocks_epoch_reason_t reason) {
   g_epoch_pending = true;
   g_epoch_reason = reason;
+
+  // Synthetic clock32 contract: the next rebootstrap PPS edge is also the
+  // exact VCLOCK zero edge.  process_interrupt consumes this request in the
+  // GPIO ISR before publishing the snapshot, so snap.counter32_at_edge is
+  // already the exact compact identity for g_gnss_ns_count_at_pps == 0.
+  interrupt_clock32_request_zero_from_ns(interrupt_subscriber_kind_t::VCLOCK, 0);
+
+  // OCXO lanes are not PPS-selected in hardware.  Their private synthetic
+  // identities are reset immediately; alpha ignores OCXO events until the
+  // PPS epoch is installed, so the first accepted OCXO edge advances from
+  // this exact synthetic origin.
+  interrupt_clock32_zero_from_ns(interrupt_subscriber_kind_t::OCXO1, 0);
+  interrupt_clock32_zero_from_ns(interrupt_subscriber_kind_t::OCXO2, 0);
+
   // Arm the GPIO ISR to re-phase the VCLOCK cadence on the next PPS
   // edge.  Without this, the epoch pending flag would be noticed by
   // pps_edge_callback but the CH3 cadence would continue its boot-
@@ -444,6 +458,12 @@ static void alpha_reset_canonical_clock_state_for_new_epoch(void) {
 static void alpha_install_new_epoch_from_pps_snapshot(
     const pps_edge_snapshot_t& snap) {
   alpha_reset_canonical_clock_state_for_new_epoch();
+
+  // Reassert the OCXO synthetic origins at the exact point alpha begins
+  // accepting OCXO events for the new epoch.  VCLOCK was zeroed in the PPS
+  // ISR before this snapshot was published.
+  interrupt_clock32_zero_from_ns(interrupt_subscriber_kind_t::OCXO1, 0);
+  interrupt_clock32_zero_from_ns(interrupt_subscriber_kind_t::OCXO2, 0);
 
   const uint32_t anchor_counter32 = snap.counter32_at_edge;
 
