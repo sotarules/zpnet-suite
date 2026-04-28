@@ -4,6 +4,13 @@
 //
 // Local hardware witness / latency-test process.
 //
+// Current ROUND_TRIP scheduler model:
+//   • one deterministic 1 Hz supervisor
+//   • 200 ms  GPIO HIGH
+//   • 400 ms  GPIO LOW
+//   • 600 ms  QTIMER HIGH
+//   • 800 ms  QTIMER LOW
+//
 // Current command surface:
 //   .tw witness round_trip   (or transport equivalent for process WITNESS)
 //
