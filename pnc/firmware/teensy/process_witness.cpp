@@ -24,7 +24,13 @@
 // and makes the stimulus visually regular.
 //
 // Current command surface:
-//   ROUND_TRIP — reports source, GPIO sink, and QTimer sink latency stats.
+//   EDGE          — PPS/PPS_VCLOCK heartbeat + last edge facts.
+//   BRIDGE        — DWT/GNSS bridge check using interrupt-owned QTimer1 CH1.
+//   GPIO_DELAY    — simple digitalWriteFast HIGH stimulus cost.
+//   QTIMER_READ   — GPIO ISR-to-VCLOCK counter observation delay/cost.
+//   DWT_READ      — consecutive DWT read-cost measurement.
+//   ENTRY_LATENCY — spin-shadow ISR entry latency for PPS and QTimer.
+//   ROUND_TRIP    — source, GPIO sink, and QTimer sink latency stats.
 //
 // Test cadence:
 //   • 200 ms: GPIO HIGH
@@ -67,6 +73,11 @@ static constexpr const char* GPIO_LOW_NAME    = "WITNESS_GPIO_LOW";
 static constexpr const char* QTIMER_HIGH_NAME = "WITNESS_QTIMER_HIGH";
 static constexpr const char* QTIMER_LOW_NAME  = "WITNESS_QTIMER_LOW";
 static constexpr const char* WITNESS_CYCLE_NAME = "WITNESS_CYCLE";
+
+static constexpr uint64_t ENTRY_LATENCY_LEAD_NS = 5000ULL;
+static constexpr uint32_t ENTRY_LATENCY_TIMEOUT_CYCLES = 100000U;  // ~99 us @ 1.008 GHz
+static constexpr const char* ENTRY_PPS_SPIN_NAME = "ENTRY_LATENCY_PPS_SPIN";
+static constexpr const char* ENTRY_QTIMER_SPIN_NAME = "ENTRY_LATENCY_QTIMER_SPIN";
 
 // ============================================================================
 // Welford
@@ -155,6 +166,91 @@ static welford_t g_gpio_welford = {};
 static welford_t g_qtimer_welford = {};
 
 // ============================================================================
+// QTIMER_READ — cost of obtaining a VCLOCK counter observation inside GPIO ISR
+// ============================================================================
+//
+// This report measures the timing separation between a GPIO ISR's first-
+// instruction DWT capture and an immediate process_interrupt-owned ambient
+// VCLOCK counter observation.  It is a local, repeatable analog of the PPS
+// GPIO-path question: a counter read performed after ISR entry is not the
+// same instant as the edge capture, so the delay and the read cost must be
+// explicit facts.
+//
+// process_witness does not touch QTimer1 registers.  The counter observation
+// goes through interrupt_vclock_counter32_observe_ambient(), preserving
+// process_interrupt as the hardware authority.
+
+static volatile uint32_t g_qtimer_read_samples = 0;
+static volatile uint32_t g_qtimer_read_dwt_at_isr = 0;
+static volatile uint32_t g_qtimer_read_dwt_before_counter_read = 0;
+static volatile uint32_t g_qtimer_read_dwt_after_counter_read = 0;
+static volatile uint32_t g_qtimer_read_counter32_at_read = 0;
+static volatile uint32_t g_qtimer_read_entry_to_read_start_cycles = 0;
+static volatile uint32_t g_qtimer_read_counter_read_cost_cycles = 0;
+static volatile uint32_t g_qtimer_read_entry_to_read_end_cycles = 0;
+
+static welford_t g_qtimer_read_entry_to_read_start_welford = {};
+static welford_t g_qtimer_read_counter_read_cost_welford = {};
+static welford_t g_qtimer_read_entry_to_read_end_welford = {};
+
+
+// ============================================================================
+// GPIO_DELAY — simple digitalWriteFast HIGH stimulus cost
+// ============================================================================
+//
+// DWT before digitalWriteFast(HIGH), DWT immediately after.  This treats the
+// GPIO write as synchronous/blocking and measures the stimulus instruction
+// path itself.
+
+static volatile uint32_t g_gpio_delay_samples = 0;
+static volatile uint32_t g_gpio_delay_dwt_before = 0;
+static volatile uint32_t g_gpio_delay_dwt_after = 0;
+static volatile uint32_t g_gpio_delay_cycles = 0;
+static welford_t g_gpio_delay_welford = {};
+
+// ============================================================================
+// DWT_READ — consecutive ARM_DWT_CYCCNT read cost
+// ============================================================================
+
+static volatile uint32_t g_dwt_read_samples = 0;
+static volatile uint32_t g_dwt_read_before = 0;
+static volatile uint32_t g_dwt_read_after = 0;
+static volatile uint32_t g_dwt_read_cycles = 0;
+static welford_t g_dwt_read_welford = {};
+
+// ============================================================================
+// ENTRY_LATENCY — foreground spin-shadow to ISR first-instruction DWT
+// ============================================================================
+//
+// A TimePop callback lands shortly before a known interrupt, then spins while
+// continuously copying ARM_DWT_CYCCNT into a shadow.  The target ISR records
+// its first-instruction raw DWT and the shadow value it interrupted.  The
+// minimum of (isr_entry_dwt_raw - shadow_at_isr) is the historical ISR entry
+// latency measurement.
+
+struct entry_latency_state_t {
+  volatile bool     armed = false;
+  volatile bool     spin_active = false;
+  volatile bool     last_timeout = false;
+  volatile uint32_t arm_count = 0;
+  volatile uint32_t arm_failures = 0;
+  volatile uint32_t timeout_count = 0;
+  volatile uint32_t sample_count = 0;
+  volatile uint32_t sequence = 0;
+  volatile uint32_t landing_dwt = 0;
+  volatile uint32_t shadow_dwt = 0;
+  volatile uint32_t shadow_at_isr = 0;
+  volatile uint32_t approach_cycles = 0;
+  volatile uint32_t isr_entry_dwt_raw = 0;
+  volatile uint32_t entry_latency_cycles = 0;
+  welford_t welford = {};
+};
+
+static entry_latency_state_t g_entry_pps = {};
+static entry_latency_state_t g_entry_qtimer = {};
+
+
+// ============================================================================
 // BRIDGE — DWT/GNSS bridge validation against VCLOCK truth
 // ============================================================================
 //
@@ -223,6 +319,11 @@ static void gpio_low_callback(timepop_ctx_t*, timepop_diag_t*, void*);
 static void qtimer_high_callback(timepop_ctx_t*, timepop_diag_t*, void*);
 static void qtimer_low_callback(timepop_ctx_t*, timepop_diag_t*, void*);
 static void witness_cycle_callback(timepop_ctx_t*, timepop_diag_t*, void*);
+static void entry_latency_pps_spin_callback(timepop_ctx_t*, timepop_diag_t*, void*);
+static void entry_latency_qtimer_spin_callback(timepop_ctx_t*, timepop_diag_t*, void*);
+static void entry_latency_pps_isr_handler(uint32_t sequence, uint32_t isr_entry_dwt_raw);
+static bool entry_latency_arm_pps_spin(void);
+static bool entry_latency_arm_qtimer_spin(uint32_t target_counter32);
 static void bridge_ch1_handler(const interrupt_qtimer1_ch1_compare_event_t& event);
 static bool bridge_arm_next_sample(void);
 static void qtimer2_arm_next_edge(void);
@@ -285,12 +386,224 @@ static void witness_drive_low(void) {
   g_source_high = false;
 }
 
+
+static void capture_gpio_delay_sample(void) {
+  const uint32_t dwt_before = ARM_DWT_CYCCNT;
+  digitalWriteFast(WITNESS_STIMULUS_PIN, HIGH);
+  const uint32_t dwt_after = ARM_DWT_CYCCNT;
+  digitalWriteFast(WITNESS_STIMULUS_PIN, LOW);
+
+  const uint32_t sample = dwt_after - dwt_before;
+  g_gpio_delay_dwt_before = dwt_before;
+  g_gpio_delay_dwt_after = dwt_after;
+  g_gpio_delay_cycles = sample;
+  g_gpio_delay_samples++;
+  g_source_high = false;
+
+  welford_update(g_gpio_delay_welford, (int32_t)sample);
+}
+
+static void capture_dwt_read_sample(void) {
+  const uint32_t dwt_before = ARM_DWT_CYCCNT;
+  const uint32_t dwt_after = ARM_DWT_CYCCNT;
+
+  const uint32_t sample = dwt_after - dwt_before;
+  g_dwt_read_before = dwt_before;
+  g_dwt_read_after = dwt_after;
+  g_dwt_read_cycles = sample;
+  g_dwt_read_samples++;
+
+  welford_update(g_dwt_read_welford, (int32_t)sample);
+}
+
+// ============================================================================
+// ENTRY_LATENCY helpers
+// ============================================================================
+
+static void entry_latency_reset(entry_latency_state_t& s) {
+  s.armed = false;
+  s.spin_active = false;
+  s.last_timeout = false;
+  s.arm_count = 0;
+  s.arm_failures = 0;
+  s.timeout_count = 0;
+  s.sample_count = 0;
+  s.sequence = 0;
+  s.landing_dwt = 0;
+  s.shadow_dwt = 0;
+  s.shadow_at_isr = 0;
+  s.approach_cycles = 0;
+  s.isr_entry_dwt_raw = 0;
+  s.entry_latency_cycles = 0;
+  welford_reset(s.welford);
+}
+
+static void entry_latency_record_isr(entry_latency_state_t& s,
+                                     uint32_t sequence,
+                                     uint32_t isr_entry_dwt_raw) {
+  if (!s.spin_active) return;
+
+  const uint32_t shadow = s.shadow_dwt;
+  const uint32_t landing = s.landing_dwt;
+  const uint32_t approach = shadow - landing;
+  const uint32_t latency = isr_entry_dwt_raw - shadow;
+
+  s.sequence = sequence;
+  s.shadow_at_isr = shadow;
+  s.approach_cycles = approach;
+  s.isr_entry_dwt_raw = isr_entry_dwt_raw;
+  s.entry_latency_cycles = latency;
+  s.sample_count++;
+  s.last_timeout = false;
+  s.spin_active = false;
+
+  welford_update(s.welford, (int32_t)latency);
+}
+
+static void entry_latency_spin(entry_latency_state_t& s) {
+  const uint32_t landing = ARM_DWT_CYCCNT;
+  s.landing_dwt = landing;
+  s.shadow_dwt = landing;
+  s.shadow_at_isr = 0;
+  s.approach_cycles = 0;
+  s.isr_entry_dwt_raw = 0;
+  s.entry_latency_cycles = 0;
+  s.last_timeout = false;
+  s.spin_active = true;
+
+  while (s.spin_active) {
+    const uint32_t now = ARM_DWT_CYCCNT;
+    s.shadow_dwt = now;
+
+    if ((uint32_t)(now - landing) > ENTRY_LATENCY_TIMEOUT_CYCLES) {
+      s.spin_active = false;
+      s.last_timeout = true;
+      s.timeout_count++;
+      break;
+    }
+  }
+}
+
+static int64_t entry_latency_target_gnss_for_counter(uint32_t target_counter32) {
+  const pps_vclock_t pvc = interrupt_last_pps_vclock();
+  if (pvc.sequence == 0 || pvc.gnss_ns_at_edge < 0) return -1;
+  const uint32_t ticks_since_anchor = target_counter32 - pvc.counter32_at_edge;
+  return pvc.gnss_ns_at_edge + (int64_t)ticks_since_anchor * 100LL;
+}
+
+static bool entry_latency_arm_pps_spin(void) {
+  const pps_vclock_t pvc = interrupt_last_pps_vclock();
+  if (pvc.sequence == 0 || pvc.gnss_ns_at_edge < 0) {
+    g_entry_pps.arm_failures++;
+    return false;
+  }
+
+  int64_t target_gnss_ns = pvc.gnss_ns_at_edge + 1000000000LL -
+                           (int64_t)ENTRY_LATENCY_LEAD_NS;
+  const int64_t now_gnss_ns = time_gnss_ns_now();
+  while (now_gnss_ns >= 0 && target_gnss_ns <= now_gnss_ns) {
+    target_gnss_ns += 1000000000LL;
+  }
+
+  timepop_cancel_by_name(ENTRY_PPS_SPIN_NAME);
+  const timepop_handle_t h =
+      timepop_arm_at(target_gnss_ns,
+                     false,
+                     entry_latency_pps_spin_callback,
+                     nullptr,
+                     ENTRY_PPS_SPIN_NAME);
+  if (h == TIMEPOP_INVALID_HANDLE) {
+    g_entry_pps.armed = false;
+    g_entry_pps.arm_failures++;
+    return false;
+  }
+
+  g_entry_pps.armed = true;
+  g_entry_pps.arm_count++;
+  return true;
+}
+
+static bool entry_latency_arm_qtimer_spin(uint32_t target_counter32) {
+  const int64_t target_event_gnss_ns =
+      entry_latency_target_gnss_for_counter(target_counter32);
+  if (target_event_gnss_ns < 0) {
+    g_entry_qtimer.arm_failures++;
+    return false;
+  }
+
+  const int64_t spin_target_gnss_ns =
+      target_event_gnss_ns - (int64_t)ENTRY_LATENCY_LEAD_NS;
+  const int64_t now_gnss_ns = time_gnss_ns_now();
+  if (now_gnss_ns >= 0 && spin_target_gnss_ns <= now_gnss_ns) {
+    g_entry_qtimer.arm_failures++;
+    return false;
+  }
+
+  timepop_cancel_by_name(ENTRY_QTIMER_SPIN_NAME);
+  const timepop_handle_t h =
+      timepop_arm_at(spin_target_gnss_ns,
+                     false,
+                     entry_latency_qtimer_spin_callback,
+                     nullptr,
+                     ENTRY_QTIMER_SPIN_NAME);
+  if (h == TIMEPOP_INVALID_HANDLE) {
+    g_entry_qtimer.armed = false;
+    g_entry_qtimer.arm_failures++;
+    return false;
+  }
+
+  g_entry_qtimer.armed = true;
+  g_entry_qtimer.arm_count++;
+  return true;
+}
+
+static void entry_latency_pps_spin_callback(timepop_ctx_t*, timepop_diag_t*, void*) {
+  g_entry_pps.armed = false;
+  entry_latency_spin(g_entry_pps);
+  (void)entry_latency_arm_pps_spin();
+}
+
+static void entry_latency_qtimer_spin_callback(timepop_ctx_t*, timepop_diag_t*, void*) {
+  g_entry_qtimer.armed = false;
+  entry_latency_spin(g_entry_qtimer);
+}
+
+static void entry_latency_pps_isr_handler(uint32_t sequence,
+                                          uint32_t isr_entry_dwt_raw) {
+  entry_latency_record_isr(g_entry_pps, sequence, isr_entry_dwt_raw);
+}
+
 // ============================================================================
 // GPIO sink ISR — old-style stable GPIO sink, rising edge only
 // ============================================================================
 
+static inline void capture_qtimer_read_sample(uint32_t isr_entry_dwt_raw) {
+  const uint32_t before_read = ARM_DWT_CYCCNT;
+  const uint32_t counter32 = interrupt_vclock_counter32_observe_ambient();
+  const uint32_t after_read = ARM_DWT_CYCCNT;
+
+  const uint32_t entry_to_start = before_read - isr_entry_dwt_raw;
+  const uint32_t read_cost = after_read - before_read;
+  const uint32_t entry_to_end = after_read - isr_entry_dwt_raw;
+
+  g_qtimer_read_dwt_at_isr = isr_entry_dwt_raw;
+  g_qtimer_read_dwt_before_counter_read = before_read;
+  g_qtimer_read_dwt_after_counter_read = after_read;
+  g_qtimer_read_counter32_at_read = counter32;
+  g_qtimer_read_entry_to_read_start_cycles = entry_to_start;
+  g_qtimer_read_counter_read_cost_cycles = read_cost;
+  g_qtimer_read_entry_to_read_end_cycles = entry_to_end;
+  g_qtimer_read_samples++;
+
+  welford_update(g_qtimer_read_entry_to_read_start_welford, (int32_t)entry_to_start);
+  welford_update(g_qtimer_read_counter_read_cost_welford, (int32_t)read_cost);
+  welford_update(g_qtimer_read_entry_to_read_end_welford, (int32_t)entry_to_end);
+}
+
 void witness_gpio_isr(void) {
   const uint32_t isr_entry_dwt_raw = ARM_DWT_CYCCNT;
+
+  capture_qtimer_read_sample(isr_entry_dwt_raw);
 
   if (g_active_window != witness_window_t::GPIO) {
     g_gpio_wrong_window++;
@@ -417,6 +730,9 @@ static void witness_cycle_callback(timepop_ctx_t*, timepop_diag_t*, void*) {
   if (!g_bridge_armed) {
     (void)bridge_arm_next_sample();
   }
+  if (!g_entry_pps.armed && !g_entry_pps.spin_active) {
+    (void)entry_latency_arm_pps_spin();
+  }
 }
 
 static void witness_schedule_first_test(void) {
@@ -508,6 +824,7 @@ static bool bridge_arm_next_sample(void) {
   }
 
   g_bridge_armed = true;
+  (void)entry_latency_arm_qtimer_spin(target_counter32);
   return true;
 }
 
@@ -577,6 +894,7 @@ static void bridge_capture(const interrupt_qtimer1_ch1_compare_event_t& event) {
 
 static void bridge_ch1_handler(const interrupt_qtimer1_ch1_compare_event_t& event) {
   g_bridge_armed = false;
+  entry_latency_record_isr(g_entry_qtimer, event.sequence, event.isr_entry_dwt_raw);
   bridge_capture(event);
   (void)bridge_arm_next_sample();
 }
@@ -637,6 +955,139 @@ static Payload cmd_bridge(const Payload&) {
 }
 
 // ============================================================================
+// GPIO_DELAY command
+// ============================================================================
+
+static Payload cmd_gpio_delay(const Payload&) {
+  capture_gpio_delay_sample();
+
+  Payload p;
+  p.add("model", "DIGITAL_WRITE_STIMULUS_DELAY");
+  p.add("samples", g_gpio_delay_samples);
+  p.add("hardware_ready", g_witness_hw_ready);
+  p.add("runtime_ready", g_witness_runtime_ready);
+  p.add("irqs_enabled", g_witness_irqs_enabled);
+
+  Payload last;
+  last.add("dwt_before", g_gpio_delay_dwt_before);
+  last.add("dwt_after", g_gpio_delay_dwt_after);
+  last.add("cycles", g_gpio_delay_cycles);
+  last.add("ns", cycles_to_ns((double)g_gpio_delay_cycles));
+  p.add_object("last", last);
+
+  p.add_object("welford", welford_payload(g_gpio_delay_welford));
+  return p;
+}
+
+// ============================================================================
+// DWT_READ command
+// ============================================================================
+
+static Payload cmd_dwt_read(const Payload&) {
+  capture_dwt_read_sample();
+
+  Payload p;
+  p.add("model", "DWT_READ_COST");
+  p.add("samples", g_dwt_read_samples);
+
+  Payload last;
+  last.add("dwt_before", g_dwt_read_before);
+  last.add("dwt_after", g_dwt_read_after);
+  last.add("cycles", g_dwt_read_cycles);
+  last.add("ns", cycles_to_ns((double)g_dwt_read_cycles));
+  p.add_object("last", last);
+
+  p.add_object("welford", welford_payload(g_dwt_read_welford));
+  return p;
+}
+
+// ============================================================================
+// QTIMER_READ command
+// ============================================================================
+
+static Payload cmd_qtimer_read(const Payload&) {
+  if (!g_witness_schedule_armed && g_witness_runtime_ready) {
+    witness_schedule_first_test();
+  }
+
+  Payload p;
+  p.add("model", "QTIMER_READ_FROM_GPIO_ISR");
+  p.add("samples", g_qtimer_read_samples);
+  p.add("hardware_ready", g_witness_hw_ready);
+  p.add("runtime_ready", g_witness_runtime_ready);
+  p.add("irqs_enabled", g_witness_irqs_enabled);
+
+  Payload last;
+  last.add("dwt_at_isr", g_qtimer_read_dwt_at_isr);
+  last.add("dwt_before_counter_read", g_qtimer_read_dwt_before_counter_read);
+  last.add("dwt_after_counter_read", g_qtimer_read_dwt_after_counter_read);
+  last.add("counter32_at_read", g_qtimer_read_counter32_at_read);
+  last.add("entry_to_read_start_cycles", g_qtimer_read_entry_to_read_start_cycles);
+  last.add("entry_to_read_start_ns", cycles_to_ns((double)g_qtimer_read_entry_to_read_start_cycles));
+  last.add("counter_read_cost_cycles", g_qtimer_read_counter_read_cost_cycles);
+  last.add("counter_read_cost_ns", cycles_to_ns((double)g_qtimer_read_counter_read_cost_cycles));
+  last.add("entry_to_read_end_cycles", g_qtimer_read_entry_to_read_end_cycles);
+  last.add("entry_to_read_end_ns", cycles_to_ns((double)g_qtimer_read_entry_to_read_end_cycles));
+  p.add_object("last", last);
+
+  p.add_object("entry_to_read_start", welford_payload(g_qtimer_read_entry_to_read_start_welford));
+  p.add_object("counter_read_cost", welford_payload(g_qtimer_read_counter_read_cost_welford));
+  p.add_object("entry_to_read_end", welford_payload(g_qtimer_read_entry_to_read_end_welford));
+
+  return p;
+}
+
+// ============================================================================
+// ============================================================================
+// ENTRY_LATENCY command
+// ============================================================================
+
+static Payload entry_latency_payload(const entry_latency_state_t& s) {
+  Payload p;
+  p.add("armed", s.armed);
+  p.add("spin_active", s.spin_active);
+  p.add("last_timeout", s.last_timeout);
+  p.add("arm_count", s.arm_count);
+  p.add("arm_failures", s.arm_failures);
+  p.add("timeout_count", s.timeout_count);
+  p.add("samples", s.sample_count);
+  p.add("sequence", s.sequence);
+
+  Payload last;
+  last.add("landing_dwt", s.landing_dwt);
+  last.add("shadow_dwt", s.shadow_dwt);
+  last.add("shadow_at_isr", s.shadow_at_isr);
+  last.add("approach_cycles", s.approach_cycles);
+  last.add("approach_ns", cycles_to_ns((double)s.approach_cycles));
+  last.add("isr_entry_dwt_raw", s.isr_entry_dwt_raw);
+  last.add("entry_latency_cycles", s.entry_latency_cycles);
+  last.add("entry_latency_ns", cycles_to_ns((double)s.entry_latency_cycles));
+  p.add_object("last", last);
+
+  p.add_object("welford", welford_payload(s.welford));
+  return p;
+}
+
+static Payload cmd_entry_latency(const Payload&) {
+  if (g_witness_runtime_ready) {
+    if (!g_entry_pps.armed && !g_entry_pps.spin_active) {
+      (void)entry_latency_arm_pps_spin();
+    }
+    if (!g_bridge_armed) {
+      (void)bridge_arm_next_sample();
+    }
+  }
+
+  Payload p;
+  p.add("model", "ISR_ENTRY_LATENCY_FROM_SPIN_SHADOW");
+  p.add("lead_ns", ENTRY_LATENCY_LEAD_NS);
+  p.add("timeout_cycles", ENTRY_LATENCY_TIMEOUT_CYCLES);
+  p.add("timeout_ns", cycles_to_ns((double)ENTRY_LATENCY_TIMEOUT_CYCLES));
+  p.add_object("pps", entry_latency_payload(g_entry_pps));
+  p.add_object("qtimer", entry_latency_payload(g_entry_qtimer));
+  return p;
+}
+
 // EDGE command
 // ============================================================================
 //
@@ -810,6 +1261,34 @@ void process_witness_init(void) {
   welford_reset(g_gpio_welford);
   welford_reset(g_qtimer_welford);
 
+  g_qtimer_read_samples = 0;
+  g_qtimer_read_dwt_at_isr = 0;
+  g_qtimer_read_dwt_before_counter_read = 0;
+  g_qtimer_read_dwt_after_counter_read = 0;
+  g_qtimer_read_counter32_at_read = 0;
+  g_qtimer_read_entry_to_read_start_cycles = 0;
+  g_qtimer_read_counter_read_cost_cycles = 0;
+  g_qtimer_read_entry_to_read_end_cycles = 0;
+  welford_reset(g_qtimer_read_entry_to_read_start_welford);
+  welford_reset(g_qtimer_read_counter_read_cost_welford);
+  welford_reset(g_qtimer_read_entry_to_read_end_welford);
+
+
+  g_gpio_delay_samples = 0;
+  g_gpio_delay_dwt_before = 0;
+  g_gpio_delay_dwt_after = 0;
+  g_gpio_delay_cycles = 0;
+  welford_reset(g_gpio_delay_welford);
+
+  g_dwt_read_samples = 0;
+  g_dwt_read_before = 0;
+  g_dwt_read_after = 0;
+  g_dwt_read_cycles = 0;
+  welford_reset(g_dwt_read_welford);
+
+  entry_latency_reset(g_entry_pps);
+  entry_latency_reset(g_entry_qtimer);
+
   g_bridge_last = bridge_capture_t{};
   g_bridge_capture_seq = 0;
   g_bridge_fires_total = 0;
@@ -823,6 +1302,7 @@ void process_witness_init(void) {
   welford_reset(g_bridge_dynamic_residual_welford);
 
   interrupt_register_qtimer1_ch1_handler(bridge_ch1_handler);
+  interrupt_register_pps_entry_latency_handler(entry_latency_pps_isr_handler);
 
   digitalWriteFast(WITNESS_STIMULUS_PIN, LOW);
 
@@ -838,6 +1318,7 @@ void process_witness_init(void) {
   g_witness_runtime_ready = true;
 
   witness_schedule_first_test();
+  (void)entry_latency_arm_pps_spin();
 }
 
 void process_witness_enable_irqs(void) {
@@ -851,9 +1332,13 @@ void process_witness_enable_irqs(void) {
 }
 
 static const process_command_entry_t WITNESS_COMMANDS[] = {
-  { "EDGE",       cmd_edge       },
-  { "BRIDGE",     cmd_bridge     },
-  { "ROUND_TRIP", cmd_round_trip },
+  { "EDGE",        cmd_edge        },
+  { "BRIDGE",      cmd_bridge      },
+  { "GPIO_DELAY",  cmd_gpio_delay  },
+  { "QTIMER_READ", cmd_qtimer_read },
+  { "DWT_READ",    cmd_dwt_read    },
+  { "ENTRY_LATENCY", cmd_entry_latency },
+  { "ROUND_TRIP",  cmd_round_trip  },
   { nullptr,      nullptr        }
 };
 

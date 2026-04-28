@@ -481,6 +481,20 @@ pps_vclock_t interrupt_last_pps_vclock(void);
 pps_edge_snapshot_t interrupt_last_pps_edge(void);
 
 // ============================================================================
+// PPS GPIO ISR-entry listener — hosted diagnostics hook for process_witness
+// ============================================================================
+//
+// Called from the PPS GPIO ISR with the first-instruction raw DWT capture and
+// the PPS edge sequence being authored.  This hook is for entry-latency
+// diagnostics only; it must remain tiny and must not touch hardware.
+
+using interrupt_pps_entry_latency_handler_fn =
+    void (*)(uint32_t sequence, uint32_t isr_entry_dwt_raw);
+
+void interrupt_register_pps_entry_latency_handler(
+    interrupt_pps_entry_latency_handler_fn cb);
+
+// ============================================================================
 // QTimer1 CH1 compare service — hosted hardware rail for process_witness
 // ============================================================================
 //
@@ -495,6 +509,14 @@ struct interrupt_qtimer1_ch1_compare_event_t {
   uint32_t target_counter32 = 0;
   uint32_t counter32_at_event = 0;
   int32_t  counter32_residual_ticks = 0;
+
+  // First-instruction ISR-entry DWT, before latency normalization.
+  // Exposed so process_witness can measure true interrupt entry latency
+  // from a foreground spin-shadow without guessing the correction constant.
+  uint32_t isr_entry_dwt_raw = 0;
+
+  // Latency-adjusted QTimer event coordinate.  This remains the normal
+  // event fact used by BRIDGE and other timing reports.
   uint32_t dwt_at_event = 0;
   int64_t  gnss_ns_at_event = -1;
 };

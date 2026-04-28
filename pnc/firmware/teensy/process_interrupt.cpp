@@ -361,6 +361,8 @@ static interrupt_subscriber_runtime_t* g_rt_ocxo1  = nullptr;
 static interrupt_subscriber_runtime_t* g_rt_ocxo2  = nullptr;
 
 static pps_edge_dispatch_fn g_pps_edge_dispatch = nullptr;
+static volatile interrupt_pps_entry_latency_handler_fn
+    g_pps_entry_latency_handler = nullptr;
 
 // ============================================================================
 // EDGE — PPS GPIO heartbeat
@@ -927,6 +929,15 @@ void interrupt_register_qtimer1_ch2_handler(interrupt_qtimer1_ch2_handler_fn cb)
 }
 
 // ============================================================================
+// PPS GPIO ISR-entry listener — hosted diagnostics hook for process_witness
+// ============================================================================
+
+void interrupt_register_pps_entry_latency_handler(
+    interrupt_pps_entry_latency_handler_fn cb) {
+  g_pps_entry_latency_handler = cb;
+}
+
+// ============================================================================
 // QTimer1 CH1 compare service — hosted rail for process_witness
 // ============================================================================
 
@@ -1031,6 +1042,7 @@ static void qtimer1_ch1_bridge_isr(uint32_t isr_entry_dwt_raw) {
   event.counter32_at_event = fired_counter32;
   event.counter32_residual_ticks =
       (int32_t)(fired_counter32 - g_qtimer1_ch1_target_counter32);
+  event.isr_entry_dwt_raw = isr_entry_dwt_raw;
   event.dwt_at_event = qtimer_event_dwt;
   event.gnss_ns_at_event = gnss_ns;
 
@@ -1121,6 +1133,11 @@ void process_interrupt_gpio6789_irq(uint32_t isr_entry_dwt_raw) {
 
   g_gpio_irq_count++;
   g_pps_gpio_heartbeat.edge_count++;
+
+  if (g_pps_entry_latency_handler) {
+    g_pps_entry_latency_handler(g_pps_gpio_heartbeat.edge_count,
+                                isr_entry_dwt_raw);
+  }
 
   // Author PPS facts (physical edge truth, synthetic counter identity).
   pps_t pps;
@@ -1461,6 +1478,7 @@ void process_interrupt_init(void) {
 
   g_store = snapshot_store_t{};
   g_pps_edge_dispatch = nullptr;
+  g_pps_entry_latency_handler = nullptr;
 
   g_vclock_clock32 = vclock_synthetic_clock32_t{};
   g_ocxo1_clock32 = synthetic_clock32_t{};
