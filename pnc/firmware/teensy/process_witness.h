@@ -14,9 +14,10 @@
 // Current command surface:
 //   .tw witness edge         (PPS/PPS_VCLOCK heartbeat + last edge facts)
 //   .tw witness bridge       (DWT/GNSS bridge check using interrupt-owned QTimer1 CH1)
+//   .tw witness pps_phase    (PPS notification vs selected VCLOCK edge phase)
 //   .tw witness gpio_delay   (simple digitalWriteFast HIGH stimulus cost)
 //   .tw witness qtimer_read  (GPIO ISR-to-VCLOCK counter observation delay/cost)
-//   .tw witness dwt_read      (DWT read-cost measurement)
+//   .tw witness dwt_read     (DWT read-cost measurement)
 //   .tw witness entry_latency (spin-shadow ISR entry latency)
 //   .tw witness round_trip   (local stimulate-through-ISR latency)
 //
