@@ -605,7 +605,7 @@ static void vclock_callback(
 }
 
 // ============================================================================
-// Physical PPS GPIO edge — epoch anchor + witness + fragment dispatch
+// Physical PPS GPIO edge — epoch anchor + fragment dispatch
 // ============================================================================
 //
 // This runs in foreground context, armed by the GPIO ISR via
@@ -618,10 +618,8 @@ static void vclock_callback(
 //      rebootstrap so the NEXT PPS edge re-anchors.  (Does not affect
 //      the current edge.)
 //   2. If the epoch is pending, install it from this snapshot.
-//   3. Compute and stash the PPS witness diagnostic fields.
-//   4. Update the PPS witness welford with a VCLOCK-phase-error
-//      measurement that is INDEPENDENT of foreground callback ordering.
-//   5. Trigger TIMEBASE_FRAGMENT publication via clocks_beta_pps().
+//   3. Stash PPS diagnostic fields for the TIMEBASE fragment.
+//   4. Trigger TIMEBASE_FRAGMENT publication via clocks_beta_pps().
 //
 static void pps_edge_callback(const pps_edge_snapshot_t& snap) {
 
@@ -738,26 +736,6 @@ static void pps_edge_callback(const pps_edge_snapshot_t& snap) {
     time_pps_update(snap.dwt_at_edge,
                     dwt_effective_cycles_per_second(),
                     anchor_counter32);
-  }
-
-  // ── Witness: arm slot 0 for the upcoming second if witness is on ──
-  //
-  // process_interrupt owns CH3 witness machinery.  We supply the three
-  // anchor quantities derived from this PPS snapshot; witness self-
-  // rotates through ten sub-second slots (0ms .. 900ms) and updates
-  // its internal Welford.  Deliberately skipped when epoch is not yet
-  // initialized — witness math presumes a valid anchor.
-  //
-  // We pass the canonical VCLOCK-domain counter identity verbatim — the
-  // same value alpha's epoch uses.  The raw physical PPS DWT is supplied
-  // only as an audit field for witness dumps.
-  //
-  if (g_epoch_initialized && !g_epoch_pending) {
-    const uint32_t witness_anchor_counter32 = snap.counter32_at_edge;
-    interrupt_witness_arm_first_slot(witness_anchor_counter32,
-                                     snap.dwt_at_edge,
-                                     snap.physical_pps_dwt_raw_at_edge,
-                                     dwt_effective_cycles_per_second());
   }
 
   // ── Step 5: hand the PPS candidate to beta + assert relay ──
