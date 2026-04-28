@@ -12,7 +12,8 @@
 //   • 800 ms  QTIMER LOW
 //
 // Current command surface:
-//   .tw witness round_trip   (or transport equivalent for process WITNESS)
+//   .tw witness edge         (PPS/PPS_VCLOCK heartbeat + last edge facts)
+//   .tw witness round_trip   (local stimulate-through-ISR latency)
 //
 // process_witness owns:
 //   • stimulus pin 24

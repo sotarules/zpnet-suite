@@ -878,6 +878,17 @@ pps_edge_snapshot_t interrupt_last_pps_edge(void) {
   return out;
 }
 
+
+interrupt_pps_edge_heartbeat_t interrupt_pps_edge_heartbeat(void) {
+  interrupt_pps_edge_heartbeat_t out{};
+  out.edge_count = g_pps_gpio_heartbeat.edge_count;
+  out.last_dwt = g_pps_gpio_heartbeat.last_dwt;
+  out.last_gnss_ns = g_pps_gpio_heartbeat.last_gnss_ns;
+  out.gpio_irq_count = g_gpio_irq_count;
+  out.gpio_miss_count = g_gpio_miss_count;
+  return out;
+}
+
 // ============================================================================
 // Subscribe / start / stop / etc.
 // ============================================================================
@@ -1118,61 +1129,6 @@ void process_interrupt_enable_irqs(void) {
 }
 
 // ============================================================================
-// EDGE command
-// ============================================================================
-//
-// Returns the PPS GPIO heartbeat plus the most recent pps_t and pps_vclock_t
-// from the snapshot store.  Both views describe the same physical edge:
-//   • pps        — physical electrical edge facts
-//   • pps_vclock — canonical VCLOCK-selected edge (gnss_ns ends in "00")
-//
-// Payload shape:
-//   heartbeat: { edge_count, last_dwt, last_gnss_ns,
-//                gpio_irq_count, gpio_miss_count }
-//   pps:        { sequence, dwt_at_edge, counter32_at_edge, ch3_at_edge }
-//   pps_vclock: { sequence, dwt_at_edge, counter32_at_edge, ch3_at_edge,
-//                 gnss_ns_at_edge }
-//   snapshot_load_ok: bool — false if the seqlock retry loop gave up
-
-static Payload cmd_edge(const Payload&) {
-  Payload p;
-
-  // Heartbeat sub-object.
-  Payload heartbeat;
-  heartbeat.add("edge_count",      g_pps_gpio_heartbeat.edge_count);
-  heartbeat.add("last_dwt",        g_pps_gpio_heartbeat.last_dwt);
-  heartbeat.add("last_gnss_ns",    g_pps_gpio_heartbeat.last_gnss_ns);
-  heartbeat.add("gpio_irq_count",  g_gpio_irq_count);
-  heartbeat.add("gpio_miss_count", g_gpio_miss_count);
-  p.add_object("heartbeat", heartbeat);
-
-  // Snapshot store: load both views in one consistent read.
-  pps_t        pps_view;
-  pps_vclock_t pvc_view;
-  const bool snapshot_ok = store_load(pps_view, pvc_view);
-  p.add("snapshot_load_ok", snapshot_ok);
-
-  // pps sub-object — physical electrical edge facts.
-  Payload pps_obj;
-  pps_obj.add("sequence",          pps_view.sequence);
-  pps_obj.add("dwt_at_edge",       pps_view.dwt_at_edge);
-  pps_obj.add("counter32_at_edge", pps_view.counter32_at_edge);
-  pps_obj.add("ch3_at_edge",       (uint32_t)pps_view.ch3_at_edge);
-  p.add_object("pps", pps_obj);
-
-  // pps_vclock sub-object — canonical VCLOCK-selected edge.
-  Payload pvc_obj;
-  pvc_obj.add("sequence",          pvc_view.sequence);
-  pvc_obj.add("dwt_at_edge",       pvc_view.dwt_at_edge);
-  pvc_obj.add("counter32_at_edge", pvc_view.counter32_at_edge);
-  pvc_obj.add("ch3_at_edge",       (uint32_t)pvc_view.ch3_at_edge);
-  pvc_obj.add("gnss_ns_at_edge",   pvc_view.gnss_ns_at_edge);
-  p.add_object("pps_vclock", pvc_obj);
-
-  return p;
-}
-
-// ============================================================================
 // Commands
 // ============================================================================
 
@@ -1242,7 +1198,6 @@ static Payload cmd_report(const Payload&) {
 
 static const process_command_entry_t INTERRUPT_COMMANDS[] = {
   { "REPORT",          cmd_report          },
-  { "EDGE",            cmd_edge            },
   { nullptr,           nullptr             }
 };
 

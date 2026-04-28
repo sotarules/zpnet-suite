@@ -387,6 +387,25 @@ struct pps_edge_snapshot_t {
   bool     vclock_epoch_selected               = false;
 };
 
+
+// ============================================================================
+// PPS GPIO heartbeat accessor
+// ============================================================================
+//
+// Report-only heartbeat counters owned by the PPS GPIO ISR.  These are not
+// timing authorities; they let process_witness publish EDGE without owning
+// or duplicating PPS/PPS_VCLOCK authorship.
+
+struct interrupt_pps_edge_heartbeat_t {
+  uint32_t edge_count = 0;
+  uint32_t last_dwt = 0;       // pps_vclock.dwt_at_edge of most recent edge
+  int64_t  last_gnss_ns = -1;  // pps_vclock.gnss_ns_at_edge of most recent edge
+  uint32_t gpio_irq_count = 0;
+  uint32_t gpio_miss_count = 0;
+};
+
+interrupt_pps_edge_heartbeat_t interrupt_pps_edge_heartbeat(void);
+
 // ============================================================================
 // Subscription and event callback (VCLOCK + OCXO)
 // ============================================================================

@@ -36,6 +36,8 @@
 
 #include "process_witness.h"
 
+#include "process_interrupt.h"
+
 #include "process.h"
 #include "payload.h"
 #include "timepop.h"
@@ -483,6 +485,79 @@ static Payload welford_payload(const welford_t& w) {
   return p;
 }
 
+
+// ============================================================================
+// EDGE command
+// ============================================================================
+//
+// EDGE answers: how many PPS edges have been seen, and what were the facts
+// of the last edge?  process_interrupt remains the author of PPS/PPS_VCLOCK
+// truth; process_witness owns only this report surface.
+
+static Payload cmd_edge(const Payload&) {
+  const interrupt_pps_edge_heartbeat_t hb = interrupt_pps_edge_heartbeat();
+  const pps_t pps = interrupt_last_pps();
+  const pps_vclock_t pvc = interrupt_last_pps_vclock();
+  const pps_edge_snapshot_t legacy = interrupt_last_pps_edge();
+
+  Payload p;
+  p.add("model", "PPS_EDGE_FACTS_FROM_INTERRUPT_AUTHORITY");
+  p.add("hardware_ready", g_witness_hw_ready);
+  p.add("runtime_ready", g_witness_runtime_ready);
+  p.add("irqs_enabled", g_witness_irqs_enabled);
+
+  Payload heartbeat;
+  heartbeat.add("edge_count", hb.edge_count);
+  heartbeat.add("last_dwt", hb.last_dwt);
+  heartbeat.add("last_gnss_ns", hb.last_gnss_ns);
+  heartbeat.add("gpio_irq_count", hb.gpio_irq_count);
+  heartbeat.add("gpio_miss_count", hb.gpio_miss_count);
+  p.add_object("heartbeat", heartbeat);
+
+  Payload pps_obj;
+  pps_obj.add("sequence", pps.sequence);
+  pps_obj.add("dwt_at_edge", pps.dwt_at_edge);
+  pps_obj.add("counter32_at_edge", pps.counter32_at_edge);
+  pps_obj.add("ch3_at_edge", (uint32_t)pps.ch3_at_edge);
+  p.add_object("pps", pps_obj);
+
+  Payload pvc_obj;
+  pvc_obj.add("sequence", pvc.sequence);
+  pvc_obj.add("dwt_at_edge", pvc.dwt_at_edge);
+  pvc_obj.add("counter32_at_edge", pvc.counter32_at_edge);
+  pvc_obj.add("ch3_at_edge", (uint32_t)pvc.ch3_at_edge);
+  pvc_obj.add("gnss_ns_at_edge", pvc.gnss_ns_at_edge);
+  p.add_object("pps_vclock", pvc_obj);
+
+  Payload identity;
+  identity.add("sequence_match", pps.sequence == pvc.sequence);
+  identity.add("heartbeat_matches_pps", hb.edge_count == pps.sequence);
+  identity.add("heartbeat_matches_pps_vclock", hb.edge_count == pvc.sequence);
+  identity.add("legacy_sequence", legacy.sequence);
+  identity.add("legacy_matches_pps_vclock", legacy.sequence == pvc.sequence);
+  identity.add("vclock_epoch_selected", legacy.vclock_epoch_selected);
+  identity.add("vclock_epoch_ticks_after_pps", legacy.vclock_epoch_ticks_after_pps);
+  identity.add("vclock_epoch_counter32_offset_ticks", legacy.vclock_epoch_counter32_offset_ticks);
+  identity.add("vclock_epoch_dwt_offset_cycles", legacy.vclock_epoch_dwt_offset_cycles);
+  p.add_object("identity", identity);
+
+  Payload legacy_obj;
+  legacy_obj.add("dwt_at_edge", legacy.dwt_at_edge);
+  legacy_obj.add("dwt_raw_at_edge", legacy.dwt_raw_at_edge);
+  legacy_obj.add("counter32_at_edge", legacy.counter32_at_edge);
+  legacy_obj.add("ch3_at_edge", (uint32_t)legacy.ch3_at_edge);
+  legacy_obj.add("gnss_ns_at_edge", legacy.gnss_ns_at_edge);
+  legacy_obj.add("physical_pps_dwt_raw_at_edge", legacy.physical_pps_dwt_raw_at_edge);
+  legacy_obj.add("physical_pps_dwt_normalized_at_edge", legacy.physical_pps_dwt_normalized_at_edge);
+  legacy_obj.add("physical_pps_counter32_at_read", legacy.physical_pps_counter32_at_read);
+  legacy_obj.add("physical_pps_ch3_at_read", (uint32_t)legacy.physical_pps_ch3_at_read);
+  legacy_obj.add("vclock_epoch_counter32", legacy.vclock_epoch_counter32);
+  legacy_obj.add("vclock_epoch_ch3", (uint32_t)legacy.vclock_epoch_ch3);
+  p.add_object("legacy_projection", legacy_obj);
+
+  return p;
+}
+
 // ============================================================================
 // ROUND_TRIP command
 // ============================================================================
@@ -688,6 +763,7 @@ void process_witness_enable_irqs(void) {
 }
 
 static const process_command_entry_t WITNESS_COMMANDS[] = {
+  { "EDGE",       cmd_edge       },
   { "ROUND_TRIP", cmd_round_trip },
   { nullptr,      nullptr        }
 };
