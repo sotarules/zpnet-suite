@@ -145,7 +145,7 @@ TEENSY_CAMPAIGN_WARMUP_FRAGMENTS = 20
 SYNC_FRAGMENT_TIMEOUT_S = 35.0
 SYNC_RECOVER_TIMEOUT_S = 45.0
 SYNC_POLL_S = 0.005
-SYNC_LOG_INTERVAL_S = 0.25
+SYNC_LOG_INTERVAL_S = 2.0
 
 # Fragment queue: maxsize=0 means unbounded
 FRAGMENT_QUEUE_MAXSIZE = 0
@@ -904,16 +904,29 @@ def _end_sync_wait(timeout_s: float = SYNC_FRAGMENT_TIMEOUT_S) -> Tuple[Dict[str
     logging.info("⏳ [_end_sync_wait] waiting for TIMEBASE_FRAGMENT PPS/VCLOCK count >= %s...", str(_sync_expected_pps_vclock))
 
     t0 = time.monotonic()
+    last_log = t0
     _diag["sync_waits"] += 1
 
     while True:
-        remaining = timeout_s - (time.monotonic() - t0)
+        now = time.monotonic()
+        remaining = timeout_s - (now - t0)
         if remaining <= 0:
             _diag["hard_fault_sync_timeout"] += 1
             _hard_fault("sync_timeout_waiting_for_fragment", {
                 "expected_pps_vclock_count": _sync_expected_pps_vclock,
                 "timeout_s": timeout_s,
             })
+
+        if now - last_log >= SYNC_LOG_INTERVAL_S:
+            logging.info(
+                "⏳ [_end_sync_wait] still waiting for TIMEBASE_FRAGMENT PPS/VCLOCK count >= %s "
+                "(%.3fs elapsed, %.3fs remaining)",
+                str(_sync_expected_pps_vclock),
+                now - t0,
+                remaining,
+            )
+            last_log = now
+
         if _sync_event.wait(timeout=min(remaining, SYNC_POLL_S)):
             break
 
@@ -958,9 +971,9 @@ def _compute_ppb(clock_ns: int, gnss_ns: int) -> float:
 # TIMEBASE_FRAGMENT schema helpers — PPS/VCLOCK canonical surface
 # ---------------------------------------------------------------------
 
-PPS_VCLOCK_COUNT_KEYS = ("teensy_pps_vclock_count", "teensy_pps_count", "pps_count")
+PPS_VCLOCK_COUNT_KEY = "teensy_pps_vclock_count"
 PPS_VCLOCK_LEDGER_KEYS = ("pps_vclock_ns", "vclock_ns", "pps_ns", "gnss_ns")
-COUNT_LEDGER_MISMATCH_TOLERANCE = 5
+
 
 
 def _as_int(value: Any) -> Optional[int]:
@@ -997,68 +1010,67 @@ def _fragment_count_from_ledger_ns(fragment: Dict[str, Any]) -> Optional[int]:
     return int(ledger_ns // NS_PER_SECOND)
 
 
-def _extract_teensy_pps_vclock_count(fragment: Dict[str, Any], *, prefer_ledger: bool = True) -> Optional[int]:
+def _extract_teensy_pps_vclock_count(fragment: Dict[str, Any]) -> int:
     """
-    Return the canonical one-second identity from a TIMEBASE_FRAGMENT.
+    Return the mandatory canonical one-second identity from a TIMEBASE_FRAGMENT.
 
-    New firmware publishes teensy_pps_vclock_count.  Legacy firmware used
-    teensy_pps_count or pps_count.  When a count field is present but is
-    grossly inconsistent with the synthetic PPS/VCLOCK nanosecond ledger, the
-    ledger wins.  That keeps TIMEBASE rows internally coherent while we tighten
-    the full recovery protocol later.
+    No fallbacks.  No ledger-derived repair.  If this field is missing or
+    invalid, the fragment is not a valid TIMEBASE_FRAGMENT.  The explicit
+    Teensy-authored PPS/VCLOCK count is the only identity surface.
     """
-    raw_count = _first_present_int(fragment, *PPS_VCLOCK_COUNT_KEYS)
+    if PPS_VCLOCK_COUNT_KEY not in fragment or fragment.get(PPS_VCLOCK_COUNT_KEY) is None:
+        raise ValueError("TIMEBASE_FRAGMENT missing mandatory teensy_pps_vclock_count")
+    try:
+        return int(fragment[PPS_VCLOCK_COUNT_KEY])
+    except (TypeError, ValueError) as e:
+        raise ValueError(
+            f"TIMEBASE_FRAGMENT invalid teensy_pps_vclock_count={fragment.get(PPS_VCLOCK_COUNT_KEY)!r}"
+        ) from e
+
+
+def _note_count_ledger_diagnostic(fragment: Dict[str, Any], count: int) -> None:
+    """Record count/ledger disagreement as diagnostic only; never repair identity."""
     ledger_count = _fragment_count_from_ledger_ns(fragment)
-
-    if prefer_ledger and raw_count is not None and ledger_count is not None:
-        delta = int(raw_count) - int(ledger_count)
-        if abs(delta) > COUNT_LEDGER_MISMATCH_TOLERANCE:
-            _diag["pps_vclock_count_ledger_mismatches"] = (
-                _diag.get("pps_vclock_count_ledger_mismatches", 0) + 1
-            )
-            _diag["last_pps_vclock_count_ledger_mismatch"] = {
-                "ts_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
-                "raw_count": int(raw_count),
-                "ledger_count": int(ledger_count),
-                "delta": int(delta),
-                "ledger_ns": _first_present_int(fragment, *PPS_VCLOCK_LEDGER_KEYS),
-            }
-            logging.warning(
-                "⚠️ [clocks] PPS/VCLOCK count/ledger mismatch: raw=%d ledger=%d delta=%+d — using ledger count",
-                int(raw_count), int(ledger_count), int(delta),
-            )
-            return int(ledger_count)
-
-    if raw_count is not None:
-        return int(raw_count)
-    return ledger_count
+    if ledger_count is None:
+        return
+    delta = int(count) - int(ledger_count)
+    if delta == 0:
+        return
+    _diag["pps_vclock_count_ledger_mismatches"] = (
+        _diag.get("pps_vclock_count_ledger_mismatches", 0) + 1
+    )
+    _diag["last_pps_vclock_count_ledger_mismatch"] = {
+        "ts_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        "teensy_pps_vclock_count": int(count),
+        "ledger_count_diagnostic": int(ledger_count),
+        "delta": int(delta),
+        "ledger_ns": _first_present_int(fragment, *PPS_VCLOCK_LEDGER_KEYS),
+    }
+    logging.warning(
+        "⚠️ [clocks] PPS/VCLOCK count/ledger diagnostic mismatch: count=%d ledger=%d delta=%+d — preserving explicit count",
+        int(count), int(ledger_count), int(delta),
+    )
 
 
 def _normalize_fragment_count_aliases(fragment: Dict[str, Any], count: int) -> None:
-    """Ensure both canonical and legacy count aliases exist in a fragment copy."""
-    fragment.setdefault("teensy_pps_vclock_count", int(count))
+    """Preserve canonical identity and compatibility aliases in a fragment copy."""
+    fragment["teensy_pps_vclock_count"] = int(count)
     fragment.setdefault("teensy_pps_count", int(count))
     fragment.setdefault("pps_count", int(count))
 
 
-def _extract_last_timebase_count(last_tb: Dict[str, Any], fragment: Dict[str, Any]) -> Optional[int]:
-    """
-    Return canonical count from a persisted TIMEBASE row or its fragment.
-
-    Prefer the fragment's PPS/VCLOCK ledger-derived identity when available;
-    it is the value that must agree with gnss_ns / pps_vclock_ns / vclock_ns.
-    Fall back to top-level TIMEBASE aliases for older rows.
-    """
-    fragment_count = _extract_teensy_pps_vclock_count(fragment)
-    if fragment_count is not None:
-        return int(fragment_count)
-
-    return _first_present_int(
-        last_tb,
-        "teensy_pps_vclock_count",
-        "pps_count",
-        "teensy_pps_count",
-    )
+def _extract_last_timebase_count(last_tb: Dict[str, Any], fragment: Dict[str, Any]) -> int:
+    """Return canonical count from a persisted TIMEBASE row or its fragment."""
+    if fragment:
+        return _extract_teensy_pps_vclock_count(fragment)
+    if PPS_VCLOCK_COUNT_KEY not in last_tb or last_tb.get(PPS_VCLOCK_COUNT_KEY) is None:
+        raise ValueError("persisted TIMEBASE missing mandatory teensy_pps_vclock_count")
+    try:
+        return int(last_tb[PPS_VCLOCK_COUNT_KEY])
+    except (TypeError, ValueError) as e:
+        raise ValueError(
+            f"persisted TIMEBASE invalid teensy_pps_vclock_count={last_tb.get(PPS_VCLOCK_COUNT_KEY)!r}"
+        ) from e
 
 
 def _fragment_ns(fragment: Dict[str, Any], *keys: str, default: int = 0) -> int:
@@ -1212,6 +1224,28 @@ def _configured_boot_dacs(cfg: Dict[str, Any]) -> Tuple[Optional[float], Optiona
     return d1, d2, source
 
 
+def _normalize_start_args(args: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """Return START args with tolerant aliases normalized to firmware names."""
+    out: Dict[str, Any] = dict(args or {})
+
+    # The typo is common enough to be worth forgiving.  The firmware only
+    # understands calibrate_ocxo, so normalize all accepted spellings here.
+    if not out.get("calibrate_ocxo"):
+        for alias in ("calibrate_oxco", "calibrate_oxo", "calibrate", "calibrate_ocxo_mode"):
+            value = out.get(alias)
+            if value is not None and str(value).strip():
+                out["calibrate_ocxo"] = str(value).strip().upper()
+                logging.warning(
+                    "⚠️ [clocks] START argument '%s' is deprecated/forgiven; use calibrate_ocxo=%s",
+                    alias, out["calibrate_ocxo"],
+                )
+                break
+    elif isinstance(out.get("calibrate_ocxo"), str):
+        out["calibrate_ocxo"] = out["calibrate_ocxo"].strip().upper()
+
+    return out
+
+
 
 # ---------------------------------------------------------------------
 # WATCHDOG_ANOMALY handler (PUBSUB — fast path)
@@ -1280,17 +1314,19 @@ def on_timebase_fragment(payload: Payload) -> None:
     frag = dict(payload)
 
     # --- Extract canonical PPS/VCLOCK count ---
-    pps_vclock_count = _extract_teensy_pps_vclock_count(frag)
-    if pps_vclock_count is None:
+    try:
+        pps_vclock_count = _extract_teensy_pps_vclock_count(frag)
+    except ValueError:
         _diag["fragments_missing_teensy_pps_count"] += 1
         _diag["fragments_missing_teensy_pps_vclock_count"] += 1
-        logging.error(
-            "💥 [clocks] TIMEBASE_FRAGMENT missing PPS/VCLOCK count fields; keys=%s payload=%s",
+        logging.exception(
+            "💥 [clocks] invalid TIMEBASE_FRAGMENT identity; keys=%s payload=%s",
             sorted(list(frag.keys())),
             frag,
         )
         return
 
+    _note_count_ledger_diagnostic(frag, pps_vclock_count)
     _normalize_fragment_count_aliases(frag, pps_vclock_count)
 
     # --- Sync latch (for START/RECOVER waits) ---
@@ -1342,12 +1378,15 @@ def _process_loop() -> None:
         _diag["queue_depth_current"] = _fragment_queue.qsize()
 
         # --- Extract canonical PPS/VCLOCK count ---
-        pps_vclock_count = _extract_teensy_pps_vclock_count(frag)
-        if pps_vclock_count is None:
+        try:
+            pps_vclock_count = _extract_teensy_pps_vclock_count(frag)
+        except ValueError:
             _diag["fragments_missing_teensy_pps_count"] += 1
             _diag["fragments_missing_teensy_pps_vclock_count"] += 1
+            logging.exception("💥 [clocks] processor received invalid TIMEBASE_FRAGMENT identity")
             continue
 
+        _note_count_ledger_diagnostic(frag, pps_vclock_count)
         _normalize_fragment_count_aliases(frag, pps_vclock_count)
         _note_pps_vclock_count(pps_vclock_count)
 
@@ -1612,7 +1651,8 @@ def cmd_start(args: Optional[dict]) -> dict:
     """
     global _campaign_active, _armed_pps_vclock_count
 
-    campaign = args.get("campaign") if args else None
+    start_args = _normalize_start_args(args)
+    campaign = start_args.get("campaign")
     if not campaign:
         return {"success": False, "message": "START requires 'campaign' argument"}
 
@@ -1651,11 +1691,13 @@ def cmd_start(args: Optional[dict]) -> dict:
         }
 
     location = current_location
-    set_dac1 = args.get("set_dac1")
-    set_dac2 = args.get("set_dac2")
-    calibrate_ocxo = args.get("calibrate_ocxo") or None
-    if calibrate_ocxo and calibrate_ocxo not in ("MEAN", "TOTAL", "NOW"):
-        return {"success": False, "message": f"calibrate_ocxo must be 'MEAN' 'TOTAL' or 'NOW', got '{calibrate_ocxo}'"}
+    set_dac1 = start_args.get("set_dac1")
+    set_dac2 = start_args.get("set_dac2")
+    calibrate_ocxo = start_args.get("calibrate_ocxo") or None
+    if calibrate_ocxo and calibrate_ocxo not in ("MEAN", "TOTAL", "NOW", "OFF"):
+        return {"success": False, "message": f"calibrate_ocxo must be 'MEAN' 'TOTAL' 'NOW' or 'OFF', got '{calibrate_ocxo}'"}
+    if calibrate_ocxo == "OFF":
+        calibrate_ocxo = None
 
     # Read default DAC from config if not specified
     if set_dac1 is None or set_dac2 is None:
@@ -1746,6 +1788,14 @@ def cmd_start(args: Optional[dict]) -> dict:
     # changes.
     _begin_sync_wait(expected_pps=1)
 
+    # The first public fragment after START will be PPS/VCLOCK count 1 after
+    # Teensy's warmup suppression.  Arm and mark the campaign active before
+    # the wait so the processor thread cannot discard the sync fragment as
+    # "no campaign" if it wins the race against the command thread.
+    _armed_pps_vclock_count = 1
+    _diag["armed_pps_count"] = _armed_pps_vclock_count
+    _diag["armed_pps_vclock_count"] = _armed_pps_vclock_count
+
     # Arm TEENSY
     logging.info("📡 [start] @%s arming TEENSY START: pps_vclock_count=0", system_time_z())
     teensy_args: Dict[str, Any] = {"campaign": campaign}
@@ -1756,27 +1806,36 @@ def cmd_start(args: Optional[dict]) -> dict:
     if calibrate_ocxo:
         teensy_args["calibrate_ocxo"] = calibrate_ocxo
 
-    _request_teensy_start(campaign=campaign, pps_vclock_count=0, args=teensy_args)
+    try:
+        _request_teensy_start(campaign=campaign, pps_vclock_count=0, args=teensy_args)
+    except Exception as e:
+        _campaign_active = False
+        _armed_pps_vclock_count = None
+        raise
+
+    _campaign_active = True
     logging.info("📡 [start] @%s TEENSY START returned", system_time_z())
 
-    # Wait for sync fragment
-    logging.info("📡 [start] @%s waiting for first post-warmup sync fragment (pps_vclock_count>=1)...", system_time_z())
+    # Wait for sync fragment.  A wait of roughly CLOCKS_CAMPAIGN_WARMUP_SUPPRESS_PPS
+    # seconds is normal: Teensy deliberately suppresses warmup fragments.
+    logging.info(
+        "📡 [start] @%s waiting for first post-warmup sync fragment "
+        "(pps_vclock_count>=1; warmup=%d fragments)...",
+        system_time_z(), TEENSY_CAMPAIGN_WARMUP_FRAGMENTS,
+    )
 
     try:
         frag0, waited_s = _end_sync_wait(timeout_s=SYNC_RECOVER_TIMEOUT_S)
     except Exception:
+        _campaign_active = False
+        _armed_pps_vclock_count = None
         return {"success": False, "message": "HARD FAULT during START sync (see logs/diag)"}
 
-    # Teensy warmup gate: the first fragment we see is the first public,
-    # post-warmup record.  Arm to the following PPS/VCLOCK count so processing
-    # accepts that queued sync fragment normally, then expects continuity.
-    teensy_pps_vclock_count = _extract_teensy_pps_vclock_count(frag0) or 1
-    _armed_pps_vclock_count = teensy_pps_vclock_count
-    _diag["armed_pps_count"] = _armed_pps_vclock_count
-    _diag["armed_pps_vclock_count"] = _armed_pps_vclock_count
-
-    _reset_trackers()
-    _campaign_active = True
+    # Do not rewrite _armed_pps_vclock_count here.  The processor thread may
+    # already have consumed the sync fragment and advanced the expectation to
+    # count+1.  Rewinding it here would create a self-inflicted soft skip on
+    # the next fragment.
+    teensy_pps_vclock_count = _extract_teensy_pps_vclock_count(frag0)
 
     logging.info("✅ [start] @%s sync fragment received (waited=%.3fs)", system_time_z(), waited_s)
 
@@ -2149,7 +2208,7 @@ def _recover_campaign() -> None:
         except Exception:
             raise
 
-        teensy_pps_vclock_count = _extract_teensy_pps_vclock_count(frag) or 1
+        teensy_pps_vclock_count = _extract_teensy_pps_vclock_count(frag)
         _armed_pps_vclock_count = teensy_pps_vclock_count + 1
         _diag["armed_pps_count"] = _armed_pps_vclock_count
         _diag["armed_pps_vclock_count"] = _armed_pps_vclock_count
@@ -2183,12 +2242,12 @@ def _recover_campaign() -> None:
         last_tb = json.loads(last_tb)
 
     last_frag = last_tb.get("fragment") or {}
-    last_pps_vclock_count = _extract_last_timebase_count(last_tb, last_frag)
-    if last_pps_vclock_count is None:
+    try:
+        last_pps_vclock_count = int(_extract_last_timebase_count(last_tb, last_frag))
+    except ValueError as e:
         _diag["recovery_missing_last_pps_count"] += 1
         _diag["recovery_missing_last_pps_vclock_count"] += 1
-        raise RuntimeError("recovery failed: last TIMEBASE missing PPS/VCLOCK count")
-    last_pps_vclock_count = int(last_pps_vclock_count)
+        raise RuntimeError(f"recovery failed: {e}") from e
 
     # Read synthetic nanosecond ledgers from fragment, preferring the new
     # PPS/VCLOCK-era names and falling back to legacy top-level fields.
@@ -2412,7 +2471,7 @@ def _recover_campaign() -> None:
 
     logging.info("✅ [recovery] @%s sync fragment received (waited=%.3fs)", system_time_z(), waited_s)
 
-    teensy_pps_vclock_count = _extract_teensy_pps_vclock_count(frag) or next_pps_vclock_count
+    teensy_pps_vclock_count = _extract_teensy_pps_vclock_count(frag)
     overshoot = teensy_pps_vclock_count - next_pps_vclock_count
 
     if overshoot != 0:

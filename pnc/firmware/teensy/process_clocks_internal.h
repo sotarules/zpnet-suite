@@ -350,7 +350,7 @@ void ocxo_dac_retry_reset(ocxo_dac_state_t& s);
 // seconds. The first emitted fragment therefore appears after a deliberate
 // canonical gap, preserving the recovered absolute PPS identity.
 
-static constexpr uint32_t CLOCKS_CAMPAIGN_WARMUP_SUPPRESS_PPS = 20;
+static constexpr uint32_t CLOCKS_CAMPAIGN_WARMUP_SUPPRESS_PPS = 5;
 
 // ============================================================================
 // Campaign state
