@@ -1,5 +1,5 @@
 // ============================================================================
-// process_clocks_internal.h — Shared Internal State (Alpha ↔ Beta)
+// process_clocks_internal.h - Shared Internal State (Alpha <-> Beta)
 // ============================================================================
 //
 // Doctrine:
@@ -11,112 +11,61 @@
 //
 // Epoch authority:
 //
-//   The canonical epoch is the VCLOCK-domain PPS snapshot authored by
-//   process_interrupt. At INIT / ZERO / START, alpha requests an exact
-//   interrupt-side rebootstrap and synthetic clock32 zero. The next PPS GPIO
-//   ISR consumes that request and publishes a snapshot whose counter32 identity
-//   already matches the 64-bit ns ledger.
+//   PPS is a witness and selector.  process_interrupt observes the physical
+//   PPS edge, selects/authors the corresponding PPS/VCLOCK edge, and publishes
+//   a snapshot whose synthetic counter32 identity already matches the 64-bit
+//   nanosecond ledger.
 //
-//   Alpha installs that snapshot directly:
-//     g_gnss_ns_count_at_pps = 0
-//     g_dwt_cycle_count_at_pps = snap.dwt_at_edge
-//     g_qtimer_at_pps = snap.counter32_at_edge
+//   Alpha installs that selected PPS/VCLOCK snapshot directly:
+//     g_gnss_ns_at_pps_vclock = 0
+//     g_dwt_at_pps_vclock = snap.dwt_at_edge
+//     g_counter32_at_pps_vclock = snap.counter32_at_edge
 //
 //   After install, VCLOCK events advance the synthetic ns ledger by +1e9 and
-//   PPS snapshots refresh the DWT/GNSS bridge anchor.
+//   subsequent PPS-selected PPS/VCLOCK snapshots refresh the DWT/GNSS bridge
+//   anchor.  Raw physical PPS facts remain diagnostics.
 //
-// // Statistical surface (standardized):
+// Statistical surface (standardized):
 //
 //   Every Welford accumulator published in the fragment uses the same
 //   suffix set:
 //
-//     <prefix>_welford_n        — uint64 sample count
-//     <prefix>_welford_mean     — double, in the semantic unit of the signal
-//     <prefix>_welford_stddev   — double, same unit
-//     <prefix>_welford_stderr   — double, same unit  (= stddev / sqrt(n))
-//     <prefix>_welford_min      — double, same unit
-//     <prefix>_welford_max      — double, same unit
+//     <prefix>_welford_n        - uint64 sample count
+//     <prefix>_welford_mean     - double, in the semantic unit of the signal
+//     <prefix>_welford_stddev   - double, same unit
+//     <prefix>_welford_stderr   - double, same unit (= stddev / sqrt(n))
+//     <prefix>_welford_min      - double, same unit
+//     <prefix>_welford_max      - double, same unit
 //
 //   Published Welford prefixes (seven total):
 //
-//     dwt_welford        — Teensy CPU XTAL offset samples (ppb)
-//     vclock_welford     — bridge interpolation residual samples (ns)
-//     ocxo1_welford      — OCXO1 per-second residual samples (ns)
-//     ocxo2_welford      — OCXO2 per-second residual samples (ns)
-//     pps_witness_welford — reserved PPS/VCLOCK phase-error surface (ns).
-//                          Beta publishes it but does not update it; the clean
-//                          witness-owned BRIDGE/PPS_PHASE path will become the
-//                          proper source.
-//     ocxo1_dac_welford  — OCXO1 DAC fractional code samples (LSB)
-//     ocxo2_dac_welford  — OCXO2 DAC fractional code samples (LSB)
+//     dwt_welford         - Teensy CPU XTAL offset samples (ppb)
+//     vclock_welford      - bridge interpolation residual samples (ns)
+//     ocxo1_welford       - OCXO1 per-second residual samples (ns)
+//     ocxo2_welford       - OCXO2 per-second residual samples (ns)
+//     pps_witness_welford - reserved PPS/VCLOCK phase-error surface (ns)
+//     ocxo1_dac_welford   - OCXO1 DAC fractional code samples (LSB)
+//     ocxo2_dac_welford   - OCXO2 DAC fractional code samples (LSB)
 //
-//   Every clock with a frequency interpretation additionally publishes:
+// Authorship map:
 //
-//     <clock>_tau        — 1.0 + ppb / 1e9  (fractional frequency)
-//     <clock>_ppb        — parts per billion  (== welford.mean for ns-unit
-//                          clocks; == welford.mean for the DWT clock
-//                          because the DWT Welford samples are fed as ppb)
-//
-//   Frequency-bearing clocks (four total):
-//     dwt, vclock, ocxo1, ocxo2
-//
-//   (pps_witness is a phase-error measurement; has no frequency
-//   interpretation.)
-//
-// Sign convention:
-//
-//   Uniform across all clocks:
-//
-//     positive ppb  →  this clock is RUNNING FAST vs the GNSS reference
-//     negative ppb  →  this clock is RUNNING SLOW vs the GNSS reference
-//
-//   This is the standard atomic-clock convention.  It holds for DWT,
-//   VCLOCK, OCXO1, OCXO2 alike.  Residual-ns mean has the same sign
-//   semantics: positive mean → clock fast (fires early).
-//
-// Authorship map (post-refactor — all "_at_pps" globals are now
-// authored from priority-0 GPIO ISR snap captures in
-// pps_edge_callback.  The VCLOCK-callback authorship path was a
-// misnomer: "at_pps" borrowed credibility that CH3-captured values
-// did not earn):
-//
-//   - g_gnss_ns_count_at_pps       pure synthetic counter.  Set to 0
-//                                  at epoch install (PPS edge IS time
-//                                  zero).  Advanced by exactly +1e9
-//                                  in alpha::vclock_callback per
-//                                  VCLOCK one-second event.  No
-//                                  physical capture involved.
-//   - g_dwt_cycle_count_at_pps     snap.dwt_at_edge.  Canonical
-//                                  VCLOCK-domain PPS epoch DWT selected
-//                                  by the physical PPS pulse in
-//                                  process_interrupt.
-//   - g_dwt_cycle_count_between_pps  Difference of consecutive
-//                                    snap.dwt_at_edge values across
-//                                    two PPS edges.  Authored in
-//                                    alpha::pps_edge_callback.
-//                                    Preemption-proof.
-//   - g_qtimer_at_pps              snap.counter32_at_edge.  Canonical
-//                                  VCLOCK-domain PPS epoch counter
-//                                  identity selected by the physical PPS
-//                                  pulse in process_interrupt.
+//   - g_gnss_ns_at_pps_vclock         Pure synthetic counter. Set to 0 at
+//                                     epoch install and advanced by exactly
+//                                     +1e9 in alpha::vclock_callback per
+//                                     VCLOCK one-second event.
+//   - g_dwt_at_pps_vclock             DWT coordinate of the selected
+//                                     PPS/VCLOCK edge.
+//   - g_dwt_cycles_between_pps_vclock Difference of consecutive selected
+//                                     PPS/VCLOCK DWT coordinates.
+//   - g_counter32_at_pps_vclock       Synthetic VCLOCK counter identity of
+//                                     the selected PPS/VCLOCK edge.
 //
 // VCLOCK as measured peer of OCXO:
 //
-//   VCLOCK is a measured peer of OCXO1/OCXO2.  The same clock_state_t
-//   and clock_measurement_t structs are used for VCLOCK, OCXO1, OCXO2.
-//   clocks_apply_edge has an identical body across all three.
-//
-//   VCLOCK occupies a special position: it is both the GNSS-locked
-//   10 MHz timebase for the QTimer1 CH0/CH1/CH2/CH3 hardware, AND a
-//   peer clock being measured.  Its CH3 one-second event IS the
-//   reference "1 Hz has elapsed" signal the system uses for the
-//   synthetic g_gnss_ns_count_at_pps advance — so by construction
-//   its own second_residual_ns should sit very close to zero with
-//   very small stddev.  Any non-zero mean is a diagnostic signal
-//   about bridge / DWT bookkeeping rather than about the reference
-//   clock itself.  (Note: the DWT↔GNSS bridge anchor is now authored
-//   by pps_edge_callback from priority-0 PPS GPIO captures, not by
-//   VCLOCK — that path was retired because CH3 is preemptible.)
+//   VCLOCK is both the sovereign GNSS-disciplined 10 MHz timebase and a peer
+//   clock measured with the same clock_state_t / clock_measurement_t shape as
+//   OCXO1 and OCXO2.  Any non-zero VCLOCK residual is diagnostic evidence
+//   about bridge / DWT bookkeeping, not about the reference clock itself.
 //
 // ============================================================================
 
@@ -155,9 +104,9 @@ static inline uint64_t dwt_ns_to_cycles(uint64_t ns) {
 }
 
 // ============================================================================
-// Always-on DWT↔GNSS anchor state (alpha-owned, beta-readable)
+// Always-on DWT-GNSS anchor state (alpha-owned, beta-readable)
 //
-// All five of these globals are authored by alpha::pps_edge_callback
+// All five of these globals are authored by alpha::pps_selector_callback
 // from priority-0 GPIO ISR captures (post-refactor).  They are
 // preemption-proof: the captures are taken at the FIRST INSTRUCTION
 // of the GPIO ISR, and foreground reads of snap data later are
@@ -167,23 +116,23 @@ static inline uint64_t dwt_ns_to_cycles(uint64_t ns) {
 // Synthetic GNSS ns counter: 0 at epoch install, +1e9 per VCLOCK
 // one-second event.  Represents "GNSS ns at the PPS moment this
 // second corresponds to."  No physical capture — pure arithmetic.
-extern volatile uint64_t g_gnss_ns_count_at_pps;
+extern volatile uint64_t g_gnss_ns_at_pps_vclock;
 
-// Canonical DWT_CYCCNT coordinate of the most recent PPS epoch
+// Canonical DWT_CYCCNT coordinate of the most recent selected PPS/VCLOCK epoch
 // (snap.dwt_at_edge).  Under the VCLOCK-domain architecture this is the
 // selected VCLOCK edge after the physical PPS pulse, not the raw GPIO ISR
 // capture.
-extern volatile uint32_t g_dwt_cycle_count_at_pps;
+extern volatile uint32_t g_dwt_at_pps_vclock;
 
 // Cumulative sum of dwt_cycles_between_pps across the campaign.
-// Advanced in pps_edge_callback by the latest measurement.
+// Advanced in pps_selector_callback by the latest measurement.
 extern volatile uint64_t g_dwt_cycle_count_total;
 
 // Most recent one-second measurement of DWT cycles between consecutive
-// canonical PPS epochs (snap[n].dwt_at_edge - snap[n-1].dwt_at_edge).
+// selected PPS/VCLOCK epochs (snap[n].dwt_at_edge - snap[n-1].dwt_at_edge).
 // These epochs are VCLOCK-domain edges selected by physical PPS pulses.
-// Feeds dwt_effective_cycles_per_second().
-extern volatile uint32_t g_dwt_cycle_count_between_pps;
+// Feeds dwt_effective_cycles_per_pps_vclock_second().
+extern volatile uint32_t g_dwt_cycles_between_pps_vclock;
 
 // Prediction residual (diagnostic).  Signed difference between the
 // current second's measured DWT cycles and the previous second's
@@ -195,23 +144,23 @@ extern volatile uint32_t g_dwt_cycle_count_between_pps;
 extern volatile int32_t  g_dwt_prediction_residual_cycles;
 
 // process_interrupt-authored synthetic 32-bit VCLOCK identity of the most
-// recent canonical PPS epoch (snap.counter32_at_edge).  This is the compact
+// recent canonical PPS/VCLOCK epoch (snap.counter32_at_edge).  This is the compact
 // clock identity selected by the physical PPS pulse; it is not an ambient
 // hardware read.
-extern volatile uint32_t g_qtimer_at_pps;
+extern volatile uint32_t g_counter32_at_pps_vclock;
 
 // Diagnostic — last seen counter32_at_event (CH3 ISR capture).
-// Distinct from g_qtimer_at_pps: this one IS authored from the
+// Distinct from g_counter32_at_pps_vclock: this one IS authored from the
 // CH3 ISR's event.counter32_at_event, retained for VCLOCK-phase
 // cross-checks; its name honestly says "event" not "pps."
-extern volatile uint32_t g_last_pps_event_counter32_at_event;
+extern volatile uint32_t g_last_vclock_event_counter32_at_event;
 
 // Returns the most recent one-second measurement of DWT cycles
-// between consecutive PPS GPIO edges.  Semantic label for callers
-// that want the "effective cycles per second" framing (the DWT↔GNSS
+// between consecutive selected PPS/VCLOCK edges.  Semantic label for callers
+// that want the "effective cycles per second" framing (the DWT-GNSS
 // bridge in time.cpp is the primary consumer).
-static inline uint32_t dwt_effective_cycles_per_second(void) {
-  return g_dwt_cycle_count_between_pps;
+static inline uint32_t dwt_effective_cycles_per_pps_vclock_second(void) {
+  return g_dwt_cycles_between_pps_vclock;
 }
 
 // ============================================================================
@@ -241,9 +190,9 @@ struct clock_state_t {
   // GNSS ns at the edge as reported by the bridge for this event.
   volatile uint64_t gnss_ns_at_edge;
 
-  // Cumulative authored ns count refreshed at PPS (canonical advance,
-  // phase-adjusted for OCXOs, equals g_gnss_ns_count_at_pps for VCLOCK).
-  volatile uint64_t ns_count_at_pps;
+  // Cumulative authored ns count refreshed at PPS/VCLOCK (canonical advance,
+  // phase-adjusted for OCXOs, equals g_gnss_ns_at_pps_vclock for VCLOCK).
+  volatile uint64_t ns_count_at_pps_vclock;
 
   // (gnss_ns_at_edge − ns_count_at_edge).  For VCLOCK this should be
   // near zero after the first edge.  For OCXO this accumulates the
@@ -293,7 +242,7 @@ extern clock_measurement_t g_ocxo2_measurement;
 // Last-known interrupt diagnostics (alpha-owned, beta-readable)
 // ============================================================================
 
-extern interrupt_capture_diag_t g_pps_interrupt_diag;
+extern interrupt_capture_diag_t g_pps_witness_diag;
 extern interrupt_capture_diag_t g_ocxo1_interrupt_diag;
 extern interrupt_capture_diag_t g_ocxo2_interrupt_diag;
 
@@ -395,7 +344,7 @@ void ocxo_dac_retry_reset(ocxo_dac_state_t& s);
 // refuses to call those records canonical campaign output.
 //
 // For START, public campaign identity begins after warmup: the first emitted
-// fragment is teensy_pps_count=1 and gnss_ns=1e9.
+// fragment is teensy_pps_vclock_count=1 and gnss_ns=1e9.
 //
 // For RECOVER, the suppressed records are treated as real elapsed campaign
 // seconds. The first emitted fragment therefore appears after a deliberate

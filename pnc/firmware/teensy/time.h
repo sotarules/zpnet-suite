@@ -6,73 +6,48 @@
 #include <stdbool.h>
 
 // ============================================================================
-// time.h — Universal GNSS Nanosecond Interface (Teensy)
+// time.h — VCLOCK-authored GNSS Nanosecond Interface (Teensy)
 // ============================================================================
 //
-// Core functions:
+// Core doctrine:
 //
-//   time_gnss_ns_now()         — current GNSS nanosecond (DWT interpolated)
-//   time_dwt_to_gnss_ns()      — convert a DWT_CYCCNT value to GNSS nanoseconds
-//   time_gnss_ns_to_dwt()      — convert a GNSS nanosecond to a DWT_CYCCNT value
-//   time_anchor_snapshot()     — seqlock-safe copy of the PPS anchor state
+//   PPS is a witness and selector.  It tells process_interrupt which VCLOCK
+//   10 MHz edge is the canonical second boundary.
 //
-// Returns monotonic, PPS-counted nanoseconds with DWT interpolation
-// between PPS edges. Available from boot as soon as the second PPS
-// edge establishes calibration. ISR-safe.
+//   PPS/VCLOCK is the selected VCLOCK edge.  It is the sovereign time anchor.
 //
-// The returned value is a LOCAL temporal coordinate, not a wall clock.
-// It counts nanoseconds from the current sacred epoch.
-// That epoch is established on a lawful PPS edge and may be restarted
-// later (for example: startup epoch, explicit zero, campaign start epoch).
+//   DWT is the high-resolution local ruler used to interpolate between
+//   successive PPS/VCLOCK anchors.
 //
-// ─── Contract: this module performs NO latency adjustment ───────────────────
+// This module stores and serves the PPS/VCLOCK anchor.  It performs NO latency
+// adjustment.  Every DWT value passed in or returned is already an event
+// coordinate.  Raw ISR-entry DWT values must be normalized by the ISR owner
+// before reaching time.cpp.
 //
-// Every DWT value passed in or returned by this module is an event
-// coordinate.  Latency math (raw ISR-entry → event-coordinate) is the
-// responsibility of the ISR entry point that captures the _raw value;
-// see process_interrupt.cpp for the canonical home of that math.  By
-// the time a DWT value reaches this module, the cost-of-measurement
-// has already been accounted for and the value describes a moment in
-// physical time.
+// Returned GNSS nanoseconds are local zero-based campaign/epoch coordinates,
+// not wall-clock UTC.  The epoch may be restarted at boot, ZERO, START, or
+// RECOVER boundaries.
 //
-// Architecture:
-//
-//   process_clocks_alpha.cpp calls time_pps_update() once per PPS edge,
-//   providing:
-//     - dwt_at_pps:         event-coordinate DWT at the PPS edge
-//     - dwt_cycles_per_s:   measured DWT cycles in the prior second
-//     - qtimer_at_pps:      QTimer1 raw counter captured at the PPS edge
-//
-//   process_clocks_alpha.cpp may also call time_pps_epoch_reset() on a
-//   lawful PPS edge to restart the local epoch at zero.
-//
-//   time.cpp maintains a seqlock-protected anchor and a PPS counter.
-//   All conversions use the same anchor snapshot for consistency.
-//
-// Accuracy:
-//
-//   ~5-7 ns (prediction tracker stddev at 1.008 GHz).
-//   Resolution: ~1 ns (single DWT cycle).
-//   Staleness guard: returns -1 if anchor is older than 3 seconds.
-//
-// Concurrency:
-//
-//   Seqlock pattern — safe to call from any context including ISRs.
-//   The PPS callback is the sole writer. All other callers are readers.
-//
-// ============================================================================
-
-// ============================================================================
-// Anchor snapshot — public, seqlock-safe copy of the PPS anchor
+// Compatibility note:
+//   The public snapshot still carries legacy field aliases such as dwt_at_pps,
+//   qtimer_at_pps, and pps_count so older callers keep compiling.  New code
+//   should prefer the PPS/VCLOCK names.
 // ============================================================================
 
 struct time_anchor_snapshot_t {
-  uint32_t dwt_at_pps;         // event-coordinate DWT at the PPS edge
-  uint32_t dwt_cycles_per_s;   // DWT cycles in the prior GNSS second
-  uint32_t qtimer_at_pps;      // QTimer1 raw counter at the PPS edge (VCLOCK position)
-  uint32_t pps_count;          // PPS edges seen in current epoch (1-indexed)
-  bool     valid;              // true after second PPS in current epoch (rate available)
-  bool     ok;                 // true if snapshot was consistent (no torn read)
+  // Canonical fields — use these in new code.
+  uint32_t dwt_at_pps_vclock;             // DWT coordinate of selected VCLOCK edge
+  uint32_t dwt_cycles_per_pps_vclock_s;   // DWT cycles between selected VCLOCK edges
+  uint32_t counter32_at_pps_vclock;       // synthetic VCLOCK counter32 at anchor
+  uint32_t pps_vclock_count;              // selected VCLOCK second edges in epoch, 1-indexed
+  bool     valid;                         // true once a real rate is available
+  bool     ok;                            // true if snapshot was seqlock-consistent
+
+  // Legacy aliases — kept for TimePop / older code during migration.
+  uint32_t dwt_at_pps;
+  uint32_t dwt_cycles_per_s;
+  uint32_t qtimer_at_pps;
+  uint32_t pps_count;
 };
 
 // ============================================================================
@@ -84,9 +59,9 @@ int64_t time_gnss_ns_now(void);
 int64_t time_dwt_to_gnss_ns(uint32_t dwt_cyccnt);
 
 int64_t time_dwt_to_gnss_ns(uint32_t dwt_cyccnt,
-                            uint32_t anchor_dwt_at_pps,
-                            uint32_t anchor_dwt_cycles_per_s,
-                            uint32_t anchor_pps_count);
+                            uint32_t anchor_dwt_at_pps_vclock,
+                            uint32_t anchor_dwt_cycles_per_pps_vclock_s,
+                            uint32_t anchor_pps_vclock_count);
 
 // ============================================================================
 // Core API — reverse (GNSS nanoseconds → DWT)
@@ -95,7 +70,7 @@ int64_t time_dwt_to_gnss_ns(uint32_t dwt_cyccnt,
 uint32_t time_gnss_ns_to_dwt(int64_t gnss_ns);
 
 // ============================================================================
-// Anchor snapshot — seqlock-safe copy of the full PPS anchor
+// Anchor snapshot — seqlock-safe copy of the full PPS/VCLOCK anchor
 // ============================================================================
 
 time_anchor_snapshot_t time_anchor_snapshot(void);
@@ -104,39 +79,29 @@ time_anchor_snapshot_t time_anchor_snapshot(void);
 // Status
 // ============================================================================
 
+uint32_t time_pps_vclock_count(void);
+
+// Legacy alias: returns time_pps_vclock_count().
 uint32_t time_pps_count(void);
+
 bool time_valid(void);
 
 // ============================================================================
-// Update interface (called by process_clocks_alpha.cpp PPS callback ONLY)
+// Update interface (called by process_clocks_alpha.cpp only)
 // ============================================================================
 
-/// Normal PPS advance within the current epoch.
-///
-/// On the first call in a fresh epoch:
-///   - pps_count becomes 1
-///   - valid remains false
-///
-/// On the second call:
-///   - pps_count becomes 2
-///   - valid becomes true if dwt_cycles_per_s > 0
-///
-/// Subsequent calls:
-///   - pps_count increments each PPS
+void time_pps_vclock_update(uint32_t dwt_at_pps_vclock,
+                            uint32_t dwt_cycles_per_pps_vclock_s,
+                            uint32_t counter32_at_pps_vclock);
+
+void time_pps_vclock_epoch_reset(uint32_t dwt_at_pps_vclock,
+                                 uint32_t counter32_at_pps_vclock);
+
+// Legacy wrappers retained during migration.
 void time_pps_update(uint32_t dwt_at_pps,
                      uint32_t dwt_cycles_per_s,
                      uint32_t qtimer_at_pps);
 
-/// Restart the local epoch on a lawful PPS edge.
-///
-/// This must only be called from code that has already decided that this
-/// PPS edge is the new sacred origin (e.g. startup epoch, explicit zero,
-/// campaign-start epoch).
-///
-/// After this call:
-///   - pps_count becomes 1
-///   - returned GNSS nanoseconds count from this PPS edge as zero
-///   - valid is false until the next PPS establishes a real second-rate
 void time_pps_epoch_reset(uint32_t dwt_at_pps,
                           uint32_t qtimer_at_pps);
 

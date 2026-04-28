@@ -8,8 +8,9 @@
 // mirror.  No slot staging, no installed event wrappers, no late hardware
 // reads masquerading as event truth.
 //
-// PPS GPIO snapshots own the canonical epoch and DWT↔GNSS bridge anchor.
-// VCLOCK/OCXO subscription callbacks own per-edge clock measurements.
+// PPS is a selector/witness. process_interrupt authors the selected PPS/VCLOCK
+// edge, and alpha treats that selected VCLOCK edge as the canonical epoch and
+// DWT-GNSS bridge anchor. VCLOCK/OCXO callbacks own per-edge clock measurements.
 // ============================================================================
 
 #include "process_clocks_internal.h"
@@ -46,19 +47,19 @@ static_assert(NS_PER_SECOND_U64 ==
 // Published canonical state (alpha-owned, beta-readable)
 // ============================================================================
 
-volatile uint64_t g_gnss_ns_count_at_pps = 0;
+volatile uint64_t g_gnss_ns_at_pps_vclock = 0;
 
-volatile uint32_t g_dwt_cycle_count_at_pps = 0;
+volatile uint32_t g_dwt_at_pps_vclock = 0;
 volatile uint64_t g_dwt_cycle_count_total = 0;
-volatile uint32_t g_dwt_cycle_count_between_pps = DWT_EXPECTED_PER_PPS;
+volatile uint32_t g_dwt_cycles_between_pps_vclock = DWT_EXPECTED_PER_PPS;
 
 // Prediction residual (diagnostic): measured[N] - predicted[N], where
 // predicted[N] is simply dwt_between_pps[N-1].  Signed to preserve
 // direction of drift.  Zero when fewer than two measurements exist.
 volatile int32_t  g_dwt_prediction_residual_cycles = 0;
 
-volatile uint32_t g_qtimer_at_pps = 0;
-volatile uint32_t g_last_pps_event_counter32_at_event = 0;
+volatile uint32_t g_counter32_at_pps_vclock = 0;
+volatile uint32_t g_last_vclock_event_counter32_at_event = 0;
 
 clock_state_t       g_vclock_clock = {};
 clock_measurement_t g_vclock_measurement = {};
@@ -69,7 +70,7 @@ clock_state_t       g_ocxo2_clock = {};
 clock_measurement_t g_ocxo1_measurement = {};
 clock_measurement_t g_ocxo2_measurement = {};
 
-interrupt_capture_diag_t g_pps_interrupt_diag = {};
+interrupt_capture_diag_t g_pps_witness_diag = {};
 interrupt_capture_diag_t g_ocxo1_interrupt_diag = {};
 interrupt_capture_diag_t g_ocxo2_interrupt_diag = {};
 
@@ -85,31 +86,31 @@ static volatile bool g_epoch_initialized = false;
 // Last VCLOCK event DWT, retained only for PPS-vs-VCLOCK phase diagnostics.
 static volatile uint32_t g_prev_dwt_at_vclock_event = 0;
 
-// ── Canonical one-second subtraction state for DWT cycles-between-PPS ──
+// ── Canonical one-second subtraction state for DWT cycles between PPS/VCLOCK anchors ──
 //
-// Authored by pps_edge_callback from the priority-0 GPIO ISR's
+// Authored by pps_selector_callback from the priority-0 GPIO ISR's
 // snap.dwt_at_edge captures.  Seeded at epoch install (with the snap that
 // installed the epoch) and re-seeded across any rebootstrap.  This is the
-// preemption-proof measurement of consecutive PPS edges, and is the sole
-// authority that updates g_dwt_cycle_count_between_pps.
+// preemption-proof measurement of consecutive selected PPS/VCLOCK edges, and is the sole
+// authority that updates g_dwt_cycles_between_pps_vclock.
 //
-// History note: until this refactor, g_dwt_cycle_count_between_pps was
+// History note: until this refactor, g_dwt_cycles_between_pps_vclock was
 // authored by vclock_callback from QTimer1 CH3's first-instruction DWT
 // captures.  CH3 is at NVIC priority 16 — preemptible by the priority-0
 // GPIO ISR and by any noInterrupts() window.  When CH3 was delayed by D
 // cycles on the 1000th-tick fire, the resulting subtraction produced a
 // reciprocal excursion (+D, then -D) on consecutive seconds.  PPS GPIO at
 // priority 0 cannot be preempted; consecutive snap.dwt_at_edge values are
-// the honest physical second boundaries.
-static volatile uint32_t g_prev_pps_dwt_at_edge = 0;
-static volatile bool     g_prev_pps_dwt_at_edge_valid = false;
+// the selected VCLOCK second boundaries.
+static volatile uint32_t g_prev_pps_vclock_dwt_at_edge = 0;
+static volatile bool     g_prev_pps_vclock_dwt_at_edge_valid = false;
 
 // ── Prediction residual state (pure diagnostic) ──
 //
 // Our implicit one-step predictor for second N's DWT cycle count is
 // "same as second N-1's measurement" — because that's the rate the
 // time.cpp bridge carries through second N (see anchor.dwt_cycles_per_s
-// in time_pps_update).  We publish the residual each PPS edge:
+// in time_pps_vclock_update).  We publish the residual each PPS/VCLOCK edge:
 //
 //   dwt_prediction_residual_cycles = measured[N] - predicted[N]
 //                                  = dwt_between_pps[N] - dwt_between_pps[N-1]
@@ -122,14 +123,14 @@ static volatile bool     g_prev_pps_dwt_at_edge_valid = false;
 // thermal settling; spikes reveal per-second anomalies.
 //
 // Requires TWO consecutive measurements before it's meaningful;
-// g_prev_dwt_between_pps_valid latches after second PPS post-install.
-static volatile uint32_t g_prev_dwt_between_pps       = 0;
-static volatile bool     g_prev_dwt_between_pps_valid = false;
+// g_prev_dwt_between_pps_vclock_valid latches after second PPS/VCLOCK post-install.
+static volatile uint32_t g_prev_dwt_between_pps_vclock       = 0;
+static volatile bool     g_prev_dwt_between_pps_vclock_valid = false;
 
-// VCLOCK entry counter — increments on every vclock_callback invocation
-// AFTER epoch install.  Read by pps_edge_callback to cross-check that no
+// VCLOCK event counter — increments on every vclock_callback invocation
+// AFTER epoch install.  Read by pps_selector_callback to cross-check that no
 // VCLOCK event slipped in between the GPIO ISR and the foreground
-// pps_edge_callback.
+// pps_selector_callback.
 static volatile uint32_t g_vclock_event_count = 0;
 
 // ============================================================================
@@ -308,16 +309,16 @@ static inline bool epoch_ready(void) {
 }
 
 static void alpha_reset_canonical_clock_state_for_new_epoch(void) {
-  g_gnss_ns_count_at_pps = 0;
-  g_dwt_cycle_count_at_pps = 0;
+  g_gnss_ns_at_pps_vclock = 0;
+  g_dwt_at_pps_vclock = 0;
   g_dwt_cycle_count_total = 0;
-  g_dwt_cycle_count_between_pps = DWT_EXPECTED_PER_PPS;
-  g_qtimer_at_pps = 0;
+  g_dwt_cycles_between_pps_vclock = DWT_EXPECTED_PER_PPS;
+  g_counter32_at_pps_vclock = 0;
   g_prev_dwt_at_vclock_event = 0;
-  g_prev_pps_dwt_at_edge = 0;
-  g_prev_pps_dwt_at_edge_valid = false;
-  g_prev_dwt_between_pps = 0;
-  g_prev_dwt_between_pps_valid = false;
+  g_prev_pps_vclock_dwt_at_edge = 0;
+  g_prev_pps_vclock_dwt_at_edge_valid = false;
+  g_prev_dwt_between_pps_vclock = 0;
+  g_prev_dwt_between_pps_vclock_valid = false;
   g_dwt_prediction_residual_cycles = 0;
   g_vclock_event_count = 0;
 
@@ -327,7 +328,7 @@ static void alpha_reset_canonical_clock_state_for_new_epoch(void) {
   g_ocxo2_clock = {};
   g_ocxo1_measurement = {};
   g_ocxo2_measurement = {};
-  g_pps_interrupt_diag = {};
+  g_pps_witness_diag = {};
   g_ocxo1_interrupt_diag = {};
   g_ocxo2_interrupt_diag = {};
 
@@ -345,25 +346,25 @@ static void alpha_reset_canonical_clock_state_for_new_epoch(void) {
 // ============================================================================
 // Epoch install
 // ============================================================================
-// The PPS snapshot is already the canonical VCLOCK-domain edge selected by
+// The PPS snapshot projects the canonical PPS/VCLOCK edge selected by
 // process_interrupt.  Alpha consumes it directly and seeds the DWT/GNSS bridge.
 // ============================================================================
 
-static void alpha_install_new_epoch_from_pps_snapshot(const pps_edge_snapshot_t& snap) {
+static void alpha_install_new_epoch_from_pps_vclock_snapshot(const pps_edge_snapshot_t& snap) {
   alpha_reset_canonical_clock_state_for_new_epoch();
 
-  // VCLOCK was zeroed in the PPS ISR before this snapshot was published.
+  // VCLOCK was zeroed in the PPS GPIO ISR before this snapshot was published.
   // Reassert OCXO origins at the point alpha begins accepting their events.
   interrupt_clock32_zero_from_ns(interrupt_subscriber_kind_t::OCXO1, 0);
   interrupt_clock32_zero_from_ns(interrupt_subscriber_kind_t::OCXO2, 0);
 
-  g_dwt_cycle_count_at_pps = snap.dwt_at_edge;
-  g_qtimer_at_pps = snap.counter32_at_edge;
+  g_dwt_at_pps_vclock = snap.dwt_at_edge;
+  g_counter32_at_pps_vclock = snap.counter32_at_edge;
   g_prev_dwt_at_vclock_event = snap.dwt_at_edge;
-  g_prev_pps_dwt_at_edge = snap.dwt_at_edge;
-  g_prev_pps_dwt_at_edge_valid = true;
+  g_prev_pps_vclock_dwt_at_edge = snap.dwt_at_edge;
+  g_prev_pps_vclock_dwt_at_edge_valid = true;
 
-  time_pps_epoch_reset(snap.dwt_at_edge, snap.counter32_at_edge);
+  time_pps_vclock_epoch_reset(snap.dwt_at_edge, snap.counter32_at_edge);
 
   g_epoch_initialized = true;
   g_epoch_pending = false;
@@ -432,32 +433,32 @@ static void apply_ocxo_event(clock_state_t& clock,
 }
 
 static void refresh_ocxo_pps_ledgers(void) {
-  g_ocxo1_clock.ns_count_at_pps = g_ocxo1_clock.zero_established
-      ? (uint64_t)((int64_t)g_gnss_ns_count_at_pps - g_ocxo1_clock.phase_offset_ns)
+  g_ocxo1_clock.ns_count_at_pps_vclock = g_ocxo1_clock.zero_established
+      ? (uint64_t)((int64_t)g_gnss_ns_at_pps_vclock - g_ocxo1_clock.phase_offset_ns)
       : 0;
 
-  g_ocxo2_clock.ns_count_at_pps = g_ocxo2_clock.zero_established
-      ? (uint64_t)((int64_t)g_gnss_ns_count_at_pps - g_ocxo2_clock.phase_offset_ns)
+  g_ocxo2_clock.ns_count_at_pps_vclock = g_ocxo2_clock.zero_established
+      ? (uint64_t)((int64_t)g_gnss_ns_at_pps_vclock - g_ocxo2_clock.phase_offset_ns)
       : 0;
 }
 
 static void vclock_callback(const interrupt_event_t& event,
                             const interrupt_capture_diag_t* diag,
                             void*) {
-  clocks_capture_interrupt_diag(g_pps_interrupt_diag, diag);
-  g_last_pps_event_counter32_at_event = event.counter32_at_event;
+  clocks_capture_interrupt_diag(g_pps_witness_diag, diag);
+  g_last_vclock_event_counter32_at_event = event.counter32_at_event;
 
   if (!epoch_ready()) return;
 
   g_vclock_event_count++;
-  g_gnss_ns_count_at_pps += NS_PER_SECOND_U64;
+  g_gnss_ns_at_pps_vclock += NS_PER_SECOND_U64;
   g_prev_dwt_at_vclock_event = event.dwt_at_event;
 
   if (event.gnss_ns_at_event != 0) {
     clocks_apply_edge(g_vclock_clock, g_vclock_measurement, event);
   }
 
-  g_vclock_clock.ns_count_at_pps = g_gnss_ns_count_at_pps;
+  g_vclock_clock.ns_count_at_pps_vclock = g_gnss_ns_at_pps_vclock;
   refresh_ocxo_pps_ledgers();
 }
 
@@ -476,7 +477,7 @@ static void ocxo2_callback(const interrupt_event_t& event,
 }
 
 // ============================================================================
-// PPS edge: epoch anchor, bridge update, beta handoff
+// PPS selector callback: PPS/VCLOCK epoch anchor, bridge update, beta handoff
 // ============================================================================
 
 static void request_epoch_if_needed(void) {
@@ -485,19 +486,19 @@ static void request_epoch_if_needed(void) {
   }
 }
 
-static void publish_pps_diag(const pps_edge_snapshot_t& snap) {
-  g_pps_interrupt_diag.pps_edge_sequence = snap.sequence;
-  g_pps_interrupt_diag.pps_edge_dwt_isr_entry_raw = snap.physical_pps_dwt_raw_at_edge;
-  g_pps_interrupt_diag.pps_edge_gnss_ns = snap.gnss_ns_at_edge;
-  g_pps_interrupt_diag.pps_edge_minus_event_ns =
+static void publish_pps_witness_diag(const pps_edge_snapshot_t& snap) {
+  g_pps_witness_diag.pps_edge_sequence = snap.sequence;
+  g_pps_witness_diag.pps_edge_dwt_isr_entry_raw = snap.physical_pps_dwt_raw_at_edge;
+  g_pps_witness_diag.pps_edge_gnss_ns = snap.gnss_ns_at_edge;
+  g_pps_witness_diag.pps_edge_minus_event_ns =
       (snap.gnss_ns_at_edge >= 0)
-          ? (snap.gnss_ns_at_edge - (int64_t)g_gnss_ns_count_at_pps)
+          ? (snap.gnss_ns_at_edge - (int64_t)g_gnss_ns_at_pps_vclock)
           : 0;
 
   const uint32_t dwt_cycles_from_vclock =
       snap.dwt_at_edge - g_prev_dwt_at_vclock_event;
   int64_t ns_from_vclock = 0;
-  const uint32_t dwt_per_sec = dwt_effective_cycles_per_second();
+  const uint32_t dwt_per_sec = dwt_effective_cycles_per_pps_vclock_second();
   if (dwt_per_sec > 0) {
     ns_from_vclock =
         (int64_t)(((uint64_t)dwt_cycles_from_vclock * NS_PER_SECOND_U64 +
@@ -505,31 +506,31 @@ static void publish_pps_diag(const pps_edge_snapshot_t& snap) {
                   (uint64_t)dwt_per_sec);
   }
 
-  g_pps_interrupt_diag.pps_edge_dwt_cycles_from_vclock = dwt_cycles_from_vclock;
-  g_pps_interrupt_diag.pps_edge_ns_from_vclock = ns_from_vclock;
-  g_pps_interrupt_diag.pps_edge_vclock_event_count = g_vclock_event_count;
+  g_pps_witness_diag.pps_edge_dwt_cycles_from_vclock = dwt_cycles_from_vclock;
+  g_pps_witness_diag.pps_edge_ns_from_vclock = ns_from_vclock;
+  g_pps_witness_diag.pps_edge_vclock_event_count = g_vclock_event_count;
 }
 
-static void update_pps_bridge_anchor(const pps_edge_snapshot_t& snap) {
-  if (!epoch_ready() || !g_prev_pps_dwt_at_edge_valid) return;
+static void update_pps_vclock_bridge_anchor(const pps_edge_snapshot_t& snap) {
+  if (!epoch_ready() || !g_prev_pps_vclock_dwt_at_edge_valid) return;
 
-  const uint32_t dwt_between_pps = snap.dwt_at_edge - g_prev_pps_dwt_at_edge;
+  const uint32_t dwt_between_pps = snap.dwt_at_edge - g_prev_pps_vclock_dwt_at_edge;
 
-  g_dwt_prediction_residual_cycles = g_prev_dwt_between_pps_valid
-      ? (int32_t)((int64_t)dwt_between_pps - (int64_t)g_prev_dwt_between_pps)
+  g_dwt_prediction_residual_cycles = g_prev_dwt_between_pps_vclock_valid
+      ? (int32_t)((int64_t)dwt_between_pps - (int64_t)g_prev_dwt_between_pps_vclock)
       : 0;
 
-  g_prev_dwt_between_pps = dwt_between_pps;
-  g_prev_dwt_between_pps_valid = true;
-  g_dwt_cycle_count_between_pps = dwt_between_pps;
+  g_prev_dwt_between_pps_vclock = dwt_between_pps;
+  g_prev_dwt_between_pps_vclock_valid = true;
+  g_dwt_cycles_between_pps_vclock = dwt_between_pps;
   g_dwt_cycle_count_total += (uint64_t)dwt_between_pps;
-  g_prev_pps_dwt_at_edge = snap.dwt_at_edge;
+  g_prev_pps_vclock_dwt_at_edge = snap.dwt_at_edge;
 
-  g_dwt_cycle_count_at_pps = snap.dwt_at_edge;
-  g_qtimer_at_pps = snap.counter32_at_edge;
+  g_dwt_at_pps_vclock = snap.dwt_at_edge;
+  g_counter32_at_pps_vclock = snap.counter32_at_edge;
 
-  time_pps_update(snap.dwt_at_edge,
-                  dwt_effective_cycles_per_second(),
+  time_pps_vclock_update(snap.dwt_at_edge,
+                  dwt_effective_cycles_per_pps_vclock_second(),
                   snap.counter32_at_edge);
 }
 
@@ -540,18 +541,18 @@ static void maybe_publish_fragment(void) {
   }
 }
 
-static void pps_edge_callback(const pps_edge_snapshot_t& snap) {
+static void pps_selector_callback(const pps_edge_snapshot_t& snap) {
   request_epoch_if_needed();
 
   const bool installed_epoch =
       g_epoch_pending && !interrupt_pps_rebootstrap_pending();
   if (installed_epoch) {
-    alpha_install_new_epoch_from_pps_snapshot(snap);
+    alpha_install_new_epoch_from_pps_vclock_snapshot(snap);
   }
 
-  publish_pps_diag(snap);
+  publish_pps_witness_diag(snap);
   if (!installed_epoch) {
-    update_pps_bridge_anchor(snap);
+    update_pps_vclock_bridge_anchor(snap);
   }
 
   pps_relay_pulse();
@@ -581,7 +582,7 @@ void process_clocks_init(void) {
   timebase_init();
 
   // Arm the first PPS-anchored epoch install.  No VCLOCK-event bootstrap
-  // path exists anymore — the first PPS edge WILL be the anchor.
+  // path exists anymore — the first selected PPS/VCLOCK edge WILL be the anchor.
   alpha_request_epoch_zero();
 
   g_ad5693r_init_ok = ad5693r_init();
@@ -602,5 +603,5 @@ void process_clocks_init(void) {
   subscribe_clock(interrupt_subscriber_kind_t::OCXO1, ocxo1_callback);
   subscribe_clock(interrupt_subscriber_kind_t::OCXO2, ocxo2_callback);
 
-  interrupt_pps_edge_register_dispatch(pps_edge_callback);
+  interrupt_pps_edge_register_dispatch(pps_selector_callback);
 }

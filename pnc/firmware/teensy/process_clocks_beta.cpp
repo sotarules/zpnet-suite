@@ -105,7 +105,7 @@ static Payload g_last_fragment;
 //
 // START semantics:
 //   Suppressed records are private warmup only.  The first emitted fragment
-//   is teensy_pps_count=1, gnss_ns=1e9, and public totals start from that
+//   is teensy_pps_vclock_count=1, gnss_ns=1e9, and public totals start from that
 //   first canonical record.
 //
 // RECOVER semantics:
@@ -131,9 +131,9 @@ static uint64_t g_campaign_public_ocxo2_base = 0;
 
 static void campaign_public_bases_reset_to_current(void) {
   g_campaign_public_dwt_base   = g_dwt_cycle_count_total;
-  g_campaign_public_gnss_base  = g_gnss_ns_count_at_pps;
-  g_campaign_public_ocxo1_base = g_ocxo1_clock.ns_count_at_pps;
-  g_campaign_public_ocxo2_base = g_ocxo2_clock.ns_count_at_pps;
+  g_campaign_public_gnss_base  = g_gnss_ns_at_pps_vclock;
+  g_campaign_public_ocxo1_base = g_ocxo1_clock.ns_count_at_pps_vclock;
+  g_campaign_public_ocxo2_base = g_ocxo2_clock.ns_count_at_pps_vclock;
 }
 
 static uint64_t saturated_base_for_recovered_value(uint64_t current,
@@ -146,13 +146,13 @@ static void campaign_public_bases_reset_for_recover(void) {
       saturated_base_for_recovered_value(g_dwt_cycle_count_total,
                                           dwt_ns_to_cycles(recover_dwt_ns));
   g_campaign_public_gnss_base =
-      saturated_base_for_recovered_value(g_gnss_ns_count_at_pps,
+      saturated_base_for_recovered_value(g_gnss_ns_at_pps_vclock,
                                           recover_gnss_ns);
   g_campaign_public_ocxo1_base =
-      saturated_base_for_recovered_value(g_ocxo1_clock.ns_count_at_pps,
+      saturated_base_for_recovered_value(g_ocxo1_clock.ns_count_at_pps_vclock,
                                           recover_ocxo1_ns);
   g_campaign_public_ocxo2_base =
-      saturated_base_for_recovered_value(g_ocxo2_clock.ns_count_at_pps,
+      saturated_base_for_recovered_value(g_ocxo2_clock.ns_count_at_pps_vclock,
                                           recover_ocxo2_ns);
 }
 
@@ -186,7 +186,7 @@ static void campaign_warmup_finish_after_this_suppressed_record(void) {
 
   if (finishing_mode == campaign_warmup_mode_t::START) {
     // START: warmup records are private.  Public identity begins on the
-    // next PPS after this one, so use the current alpha totals as the base.
+    // next selected PPS/VCLOCK edge after this one, so use the current alpha totals as the base.
     // The next published record will add exactly one public second.
     campaign_public_bases_reset_to_current();
   }
@@ -233,20 +233,20 @@ static uint64_t campaign_public_dwt_total(void) {
 }
 
 static uint64_t campaign_public_gnss_ns(void) {
-  return (g_gnss_ns_count_at_pps >= g_campaign_public_gnss_base)
-           ? (g_gnss_ns_count_at_pps - g_campaign_public_gnss_base)
+  return (g_gnss_ns_at_pps_vclock >= g_campaign_public_gnss_base)
+           ? (g_gnss_ns_at_pps_vclock - g_campaign_public_gnss_base)
            : 0;
 }
 
 static uint64_t campaign_public_ocxo1_ns(void) {
-  const uint64_t now = g_ocxo1_clock.ns_count_at_pps;
+  const uint64_t now = g_ocxo1_clock.ns_count_at_pps_vclock;
   return (now >= g_campaign_public_ocxo1_base)
            ? (now - g_campaign_public_ocxo1_base)
            : 0;
 }
 
 static uint64_t campaign_public_ocxo2_ns(void) {
-  const uint64_t now = g_ocxo2_clock.ns_count_at_pps;
+  const uint64_t now = g_ocxo2_clock.ns_count_at_pps_vclock;
   return (now >= g_campaign_public_ocxo2_base)
            ? (now - g_campaign_public_ocxo2_base)
            : 0;
@@ -379,7 +379,7 @@ static void clocks_payload_add_ocxo_diag(Payload& p,
   add_u32("anomaly_count", diag.anomaly_count);
 }
 
-static void clocks_payload_add_pps_diag(Payload& p,
+static void clocks_payload_add_pps_witness_diag(Payload& p,
                                         const char* prefix,
                                         const interrupt_capture_diag_t& diag) {
   clocks_payload_add_ocxo_diag(p, prefix, diag);
@@ -786,25 +786,25 @@ void clocks_watchdog_anomaly(const char* reason,
 }
 
 // ============================================================================
-// clocks_beta_pps — invoked from alpha's pps_edge_callback
+// clocks_beta_pps — invoked from alpha's pps_selector_callback
 // ============================================================================
 
 void clocks_beta_pps(void) {
   // ── Zero / start handshake ──
   //
-  // Under PPS-anchored epoch discipline, all of the interrupt-side
+  // Under PPS/VCLOCK-anchored epoch discipline, all of the interrupt-side
   // synchronization lives in alpha:
   //
-  //   • alpha's pps_edge_callback, on seeing request_zero/start and
+  //   • alpha's pps_selector_callback, on seeing request_zero/start and
   //     !g_epoch_pending, calls alpha_request_epoch_zero() which sets
   //     g_epoch_pending AND arms a GPIO-ISR-side rebootstrap.
-  //   • The NEXT physical PPS edge consumes the rebootstrap (re-phasing
-  //     the VCLOCK cadence) and alpha installs the epoch from that
+  //   * The NEXT physical PPS edge selects the rebootstrap PPS/VCLOCK edge,
+  //     re-phases the VCLOCK cadence, and alpha installs the epoch from that
   //     snapshot, clearing g_epoch_pending.
   //
   // Beta's job here is simply to wait for alpha to complete the
-  // PPS-anchored install.  When g_epoch_pending clears, the campaign
-  // time base is aligned to a physical PPS moment and we can finalize
+  // PPS/VCLOCK-anchored install.  When g_epoch_pending clears, the campaign
+  // time base is aligned to the selected PPS/VCLOCK edge and we can finalize
   // the zero/start transition.
   if (request_zero || request_start) {
     if (clocks_epoch_pending()) return;
@@ -878,7 +878,7 @@ void clocks_beta_pps(void) {
   // DWT sample is fed directly as ppb using the uniform sign convention:
   // positive ppb → Teensy running FAST (measured cycles > expected).
   {
-    const double cycles = (double)g_dwt_cycle_count_between_pps;
+    const double cycles = (double)g_dwt_cycles_between_pps_vclock;
     const double expected = (double)DWT_EXPECTED_PER_PPS;
     const double dwt_ppb_sample = (cycles - expected) / expected * 1e9;
     welford_update(welford_dwt, dwt_ppb_sample);
@@ -916,22 +916,50 @@ void clocks_beta_pps(void) {
   welford_update(welford_ocxo2_dac, ocxo2_dac.dac_fractional);
 
   // ── Build TIMEBASE_FRAGMENT ──
+  const uint64_t public_gnss_ns   = campaign_public_gnss_ns();
+  const uint64_t public_dwt_total = campaign_public_dwt_total();
+  const uint64_t public_dwt_ns    = dwt_cycles_to_ns(public_dwt_total);
+  const uint64_t public_ocxo1_ns  = campaign_public_ocxo1_ns();
+  const uint64_t public_ocxo2_ns  = campaign_public_ocxo2_ns();
+  const uint32_t public_count     = (uint32_t)campaign_seconds;
+
   Payload p;
   p.add("campaign", campaign_name);
-  p.add("teensy_pps_count", campaign_seconds);
-  p.add("gnss_ns", campaign_public_gnss_ns());
+
+  // Canonical campaign-second identity.  PPS is the selector; the selected
+  // PPS/VCLOCK edge is the sovereign second boundary.  Keep legacy aliases so
+  // Pi-side consumers survive the schema transition while the canonical name
+  // moves to PPS/VCLOCK.
+  p.add("teensy_pps_vclock_count", public_count);
+  p.add("teensy_pps_count",        public_count);  // legacy alias
+  p.add("pps_count",               public_count);  // legacy alias
+
+  // Synthetic nanosecond ledgers.  PPS is an imaginary +1e9 ledger, VCLOCK is
+  // the selected-edge authority, and in the current architecture their public
+  // ns count is intentionally identical.  OCXO ledgers are the phase-adjusted
+  // synthetic ns counts at the same PPS/VCLOCK boundary.
+  p.add("gnss_ns",        public_gnss_ns);
+  p.add("pps_ns",         public_gnss_ns);
+  p.add("pps_vclock_ns",  public_gnss_ns);
+  p.add("vclock_ns",      public_gnss_ns);
+  p.add("ocxo1_ns",       public_ocxo1_ns);
+  p.add("ocxo2_ns",       public_ocxo2_ns);
+
   p.add("calibrate_ocxo", servo_mode_str(calibrate_ocxo_mode));
 
-  // DWT canonical surface.
-  p.add("dwt_cycle_count_total", dwt_cycle_count_total);
-  p.add("dwt_cycle_count_at_pps", g_dwt_cycle_count_at_pps);
-  p.add("dwt_cycle_count_between_pps", g_dwt_cycle_count_between_pps);
-  p.add("dwt_expected_per_pps", (uint32_t)DWT_EXPECTED_PER_PPS);
+  // DWT canonical surface.  DWT is not a synthetic ns clock; it is a 64-bit
+  // cycle ledger plus a derived ns convenience value for Pi-side recovery and
+  // reporting.
+  p.add("dwt_cycle_count_total", public_dwt_total);
+  p.add("dwt_ns",                public_dwt_ns);
+  p.add("dwt_at_pps_vclock", g_dwt_at_pps_vclock);
+  p.add("dwt_cycles_between_pps_vclock", g_dwt_cycles_between_pps_vclock);
+  p.add("dwt_expected_per_pps_vclock", (uint32_t)DWT_EXPECTED_PER_PPS);
   // Instantaneous cycles residual: measured minus expected.
   // Positive → Teensy CPU fast; negative → Teensy CPU slow.
-  // Same sign convention as dwt_ppb, same units as dwt_cycle_count_between_pps.
+  // Same sign convention as dwt_ppb, same units as dwt_cycles_between_pps_vclock.
   p.add("dwt_second_residual_cycles",
-        (int32_t)((int64_t)g_dwt_cycle_count_between_pps -
+        (int32_t)((int64_t)g_dwt_cycles_between_pps_vclock -
                   (int64_t)DWT_EXPECTED_PER_PPS));
 
   // Prediction residual (diagnostic): measured[N] - measured[N-1].
@@ -942,13 +970,13 @@ void clocks_beta_pps(void) {
   p.add("dwt_prediction_residual_cycles",
         g_dwt_prediction_residual_cycles);
 
-  // Synthetic 32-bit VCLOCK identity of the canonical PPS epoch.
+  // Synthetic 32-bit VCLOCK identity of the canonical PPS/VCLOCK epoch.
   // Under the VCLOCK-domain architecture this is the compact event identity
   // authored by process_interrupt, not a raw ambient hardware read.
-  p.add("qtimer_at_pps", g_qtimer_at_pps);
+  p.add("counter32_at_pps_vclock", g_counter32_at_pps_vclock);
 
   // VCLOCK surface — authored facts + per-edge measurement + window accounting.
-  p.add("vclock_ns_count_at_pps", campaign_public_gnss_ns());
+  p.add("vclock_gnss_ns_at_pps_vclock", public_gnss_ns);
   p.add("vclock_gnss_ns_between_edges", g_vclock_measurement.gnss_ns_between_edges);
   p.add("vclock_dwt_cycles_between_edges", g_vclock_measurement.dwt_cycles_between_edges);
   p.add("vclock_second_residual_ns", g_vclock_measurement.second_residual_ns);
@@ -959,7 +987,7 @@ void clocks_beta_pps(void) {
   p.add("vclock_window_error_ns", g_vclock_clock.window_error_ns);
 
   // OCXO1 surface.
-  p.add("ocxo1_ns_count_at_pps", campaign_public_ocxo1_ns());
+  p.add("ocxo1_ns_at_pps_vclock", public_ocxo1_ns);
   p.add("ocxo1_gnss_ns_between_edges", g_ocxo1_measurement.gnss_ns_between_edges);
   p.add("ocxo1_dwt_cycles_between_edges", g_ocxo1_measurement.dwt_cycles_between_edges);
   p.add("ocxo1_second_residual_ns", g_ocxo1_measurement.second_residual_ns);
@@ -970,7 +998,7 @@ void clocks_beta_pps(void) {
   p.add("ocxo1_window_error_ns", g_ocxo1_clock.window_error_ns);
 
   // OCXO2 surface.
-  p.add("ocxo2_ns_count_at_pps", campaign_public_ocxo2_ns());
+  p.add("ocxo2_ns_at_pps_vclock", public_ocxo2_ns);
   p.add("ocxo2_gnss_ns_between_edges", g_ocxo2_measurement.gnss_ns_between_edges);
   p.add("ocxo2_dwt_cycles_between_edges", g_ocxo2_measurement.dwt_cycles_between_edges);
   p.add("ocxo2_second_residual_ns", g_ocxo2_measurement.second_residual_ns);
@@ -1018,10 +1046,10 @@ void clocks_beta_pps(void) {
   publish_freq(p, "ocxo1",  welford_ocxo1.mean);
   publish_freq(p, "ocxo2",  welford_ocxo2.mean);
 
-  // Per-lane diag (event facts + anomaly count).  The "pps_diag" entry
+  // Per-lane diag (event facts + anomaly count).  The "pps_witness_diag" entry
   // corresponds to the VCLOCK lane and additionally carries the GPIO
   // PPS witness fields.
-  clocks_payload_add_pps_diag(p, "pps_diag", g_pps_interrupt_diag);
+  clocks_payload_add_pps_witness_diag(p, "pps_witness_diag", g_pps_witness_diag);
   clocks_payload_add_ocxo_diag(p, "ocxo1_diag", g_ocxo1_interrupt_diag);
   clocks_payload_add_ocxo_diag(p, "ocxo2_diag", g_ocxo2_interrupt_diag);
 

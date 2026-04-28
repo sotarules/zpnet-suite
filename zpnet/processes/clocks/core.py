@@ -1,21 +1,21 @@
 """
-ZPNet CLOCKS Process — TIMEBASE Authority (Pi-side) — v9 Dual OCXO
+ZPNet CLOCKS Process — TIMEBASE Authority (Pi-side) — v10 PPS/VCLOCK
 
 Core contract (v2026-03+):
 
   CLOCKS is a pure traffic cop.  It owns NO clock state.  It receives
-  TIMEBASE_FRAGMENT from the Teensy (containing GNSS, DWT, OCXO1, and OCXO2
-  nanoseconds), decorates each fragment with environment snapshots and
+  TIMEBASE_FRAGMENT from the Teensy (containing PPS/VCLOCK, GNSS, DWT,
+  OCXO1, and OCXO2 nanosecond ledgers), decorates each fragment with environment snapshots and
   GF-8802 discipline data, computes Welford statistics, and persists
   the result as an immutable TIMEBASE row.
 
   Architecture:
-    • Teensy owns: GNSS ns, DWT ns/cycles, OCXO1 ns, OCXO2 ns — in TIMEBASE_FRAGMENT
+    • Teensy owns: PPS/VCLOCK count, GNSS/PPS/VCLOCK ns, DWT ns/cycles, OCXO1 ns, OCXO2 ns — in TIMEBASE_FRAGMENT
     • Pi owns: GNSS_RAW ns (synthetic clock from GF-8802 clock drift) — in TIMEBASE
     • GNSS owns: GF-8802 discipline state — in GET_GNSS_INFO
     • CLOCKS owns: correlation, campaign lifecycle
 
-  Five clock domains: GNSS (reference), DWT, OCXO1, OCXO2, GNSS_RAW (synthetic).
+  Six clock domains/surfaces: PPS/VCLOCK (canonical count/epoch), GNSS/VCLOCK ns, DWT, OCXO1, OCXO2, GNSS_RAW (Pi-side synthetic).
 
   v9: Prediction-aware statistics.
 
@@ -53,7 +53,7 @@ Core contract (v2026-03+):
 
   Recovery is symmetric across all four domains:
 
-    projected_gnss_ns = next_pps_count * NS_PER_SECOND
+    projected_gnss_ns = next_pps_vclock_count * NS_PER_SECOND
     projected_ns = projected_gnss_ns * last_clock_ns // last_gnss_ns
 
   v7 recovery hardening (four fixes):
@@ -99,7 +99,7 @@ Semantics:
   * Derivative statistics (tau, ppb) live only in
     the campaign report — never in the TIMEBASE row itself
   * Prediction stats from the Teensy are passed through verbatim
-  * Gaps in pps_count are canonical (recovery) and non-fatal
+  * Gaps in PPS/VCLOCK count are canonical (recovery) and non-fatal
   * WATCHDOG_ANOMALY triggers Pi-side recovery using the last canonical TIMEBASE
 """
 
@@ -167,7 +167,8 @@ _diag: Dict[str, Any] = {
     # Fragment ingress (PUBSUB handler — fast path)
     "fragments_received": 0,
     "fragments_queued": 0,
-    "fragments_missing_teensy_pps_count": 0,
+    "fragments_missing_teensy_pps_count": 0,     # legacy diagnostic alias
+    "fragments_missing_teensy_pps_vclock_count": 0,
 
     # Fragment processing (processor thread — slow path)
     "fragments_processed": 0,
@@ -191,20 +192,27 @@ _diag: Dict[str, Any] = {
     "sync_wait_seconds_last": 0.0,
     "last_sync_wait": {},
 
-    # pps_count continuity (campaign fact, as observed from Teensy)
-    "pps_count_seen": 0,
+    # PPS/VCLOCK count continuity (campaign fact, as observed from Teensy)
+    "pps_count_seen": 0,              # legacy diagnostic alias
+    "pps_vclock_count_seen": 0,
     "pps_count_repeat": 0,
     "pps_count_jump": 0,
     "pps_count_regress": 0,
-    "last_pps_count": None,
-    "armed_pps_count": None,
-    "last_pps_count_anomaly": {},
+    "last_pps_count": None,          # legacy diagnostic alias
+    "last_pps_vclock_count": None,
+    "armed_pps_count": None,         # legacy diagnostic alias
+    "armed_pps_vclock_count": None,
+    "last_pps_count_anomaly": {},    # legacy diagnostic alias
+    "last_pps_vclock_count_anomaly": {},
+    "pps_vclock_count_ledger_mismatches": 0,
+    "last_pps_vclock_count_ledger_mismatch": {},
 
     # Recovery accounting
     "recovery_checks": 0,
     "recovery_no_active_campaign": 0,
     "recovery_missing_timebase": 0,
-    "recovery_missing_last_pps_count": 0,
+    "recovery_missing_last_pps_count": 0,        # legacy diagnostic alias
+    "recovery_missing_last_pps_vclock_count": 0,
     "recovery_elapsed_seconds_nonpositive": 0,
     "last_recovery": {},
 
@@ -339,14 +347,14 @@ def _gnss_raw_reset() -> None:
 
 _campaign_active: bool = False
 
-_last_pps_count_seen: Optional[int] = None
+_last_pps_vclock_count_seen: Optional[int] = None
 
-# What pps_count did we most recently tell the Teensy to use?
-_armed_pps_count: Optional[int] = None
+# What PPS/VCLOCK count did we most recently tell the Teensy to use?
+_armed_pps_vclock_count: Optional[int] = None
 
-# Draconian sync: control-plane waits for a specific fragment pps_count
+# Draconian sync: control-plane waits for a specific fragment PPS/VCLOCK count
 _sync_lock = threading.Lock()
-_sync_expected_pps: Optional[int] = None
+_sync_expected_pps_vclock: Optional[int] = None
 _sync_event = threading.Event()
 _sync_fragment: Optional[Dict[str, Any]] = None
 
@@ -450,42 +458,55 @@ def _hard_fault(reason: str, details: Dict[str, Any]) -> None:
     raise RuntimeError(f"HARD FAULT: {reason} (auto-recovery initiated)")
 
 
-def _note_pps_count(teensy_pps_count: int) -> None:
-    """Observational continuity check on the pps_count stream from Teensy."""
-    global _last_pps_count_seen
+def _note_pps_vclock_count(teensy_pps_vclock_count: int) -> None:
+    """Observational continuity check on the PPS/VCLOCK count stream from Teensy."""
+    global _last_pps_vclock_count_seen
 
-    k = int(teensy_pps_count)
+    k = int(teensy_pps_vclock_count)
     _diag["pps_count_seen"] += 1
+    _diag["pps_vclock_count_seen"] += 1
     _diag["last_pps_count"] = k
+    _diag["last_pps_vclock_count"] = k
 
-    if _last_pps_count_seen is not None:
-        if k == _last_pps_count_seen:
+    if _last_pps_vclock_count_seen is not None:
+        anomaly: Optional[Dict[str, Any]] = None
+        if k == _last_pps_vclock_count_seen:
             _diag["pps_count_repeat"] += 1
-            _diag["last_pps_count_anomaly"] = {
+            anomaly = {
                 "ts_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
                 "reason": "pps_count_repeat",
+                "pps_vclock_count": k,
                 "pps_count": k,
-                "prev_pps_count": int(_last_pps_count_seen),
+                "prev_pps_vclock_count": int(_last_pps_vclock_count_seen),
+                "prev_pps_count": int(_last_pps_vclock_count_seen),
             }
-        elif k < _last_pps_count_seen:
+        elif k < _last_pps_vclock_count_seen:
             _diag["pps_count_regress"] += 1
-            _diag["last_pps_count_anomaly"] = {
+            anomaly = {
                 "ts_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
                 "reason": "pps_count_regress",
+                "pps_vclock_count": k,
                 "pps_count": k,
-                "prev_pps_count": int(_last_pps_count_seen),
+                "prev_pps_vclock_count": int(_last_pps_vclock_count_seen),
+                "prev_pps_count": int(_last_pps_vclock_count_seen),
             }
-        elif k > (_last_pps_count_seen + 1):
+        elif k > (_last_pps_vclock_count_seen + 1):
             _diag["pps_count_jump"] += 1
-            _diag["last_pps_count_anomaly"] = {
+            anomaly = {
                 "ts_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
                 "reason": "pps_count_jump",
+                "pps_vclock_count": k,
                 "pps_count": k,
-                "prev_pps_count": int(_last_pps_count_seen),
-                "jump": int(k - _last_pps_count_seen),
+                "prev_pps_vclock_count": int(_last_pps_vclock_count_seen),
+                "prev_pps_count": int(_last_pps_vclock_count_seen),
+                "jump": int(k - _last_pps_vclock_count_seen),
             }
 
-    _last_pps_count_seen = k
+        if anomaly is not None:
+            _diag["last_pps_vclock_count_anomaly"] = anomaly
+            _diag["last_pps_count_anomaly"] = anomaly
+
+    _last_pps_vclock_count_seen = k
 
 
 def _get_active_campaign() -> Optional[Dict[str, Any]]:
@@ -867,20 +888,20 @@ def _fetch_gnss_info() -> Optional[Dict[str, Any]]:
 
 
 def _begin_sync_wait(expected_pps: int) -> None:
-    """Prepare to wait for a TIMEBASE_FRAGMENT with a specific pps_count."""
-    global _sync_expected_pps, _sync_fragment
+    """Prepare to wait for a TIMEBASE_FRAGMENT with a specific PPS/VCLOCK count."""
+    global _sync_expected_pps_vclock, _sync_fragment
 
     with _sync_lock:
-        _sync_expected_pps = int(expected_pps)
+        _sync_expected_pps_vclock = int(expected_pps)
         _sync_fragment = None
         _sync_event.clear()
 
 
 def _end_sync_wait(timeout_s: float = SYNC_FRAGMENT_TIMEOUT_S) -> Tuple[Dict[str, Any], float]:
     """Block until the sync fragment arrives or timeout.  Hard fault on timeout."""
-    global _sync_expected_pps
+    global _sync_expected_pps_vclock
 
-    logging.info("⏳ [_end_sync_wait] waiting for TIMEBASE_FRAGMENT pps_count >= %s...", str(_sync_expected_pps))
+    logging.info("⏳ [_end_sync_wait] waiting for TIMEBASE_FRAGMENT PPS/VCLOCK count >= %s...", str(_sync_expected_pps_vclock))
 
     t0 = time.monotonic()
     _diag["sync_waits"] += 1
@@ -890,7 +911,7 @@ def _end_sync_wait(timeout_s: float = SYNC_FRAGMENT_TIMEOUT_S) -> Tuple[Dict[str
         if remaining <= 0:
             _diag["hard_fault_sync_timeout"] += 1
             _hard_fault("sync_timeout_waiting_for_fragment", {
-                "expected_pps_count": _sync_expected_pps,
+                "expected_pps_vclock_count": _sync_expected_pps_vclock,
                 "timeout_s": timeout_s,
             })
         if _sync_event.wait(timeout=min(remaining, SYNC_POLL_S)):
@@ -902,14 +923,14 @@ def _end_sync_wait(timeout_s: float = SYNC_FRAGMENT_TIMEOUT_S) -> Tuple[Dict[str
     _diag["sync_wait_seconds_last"] = float(waited)
     _diag["last_sync_wait"] = {
         "ts_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
-        "expected_pps_count": int(_sync_expected_pps or -1),
+        "expected_pps_vclock_count": int(_sync_expected_pps_vclock or -1),
         "waited_s": round(float(waited), 3),
         "timeout_s": float(timeout_s),
     }
 
     with _sync_lock:
         frag = dict(_sync_fragment or {})
-        _sync_expected_pps = None
+        _sync_expected_pps_vclock = None
         return frag, float(waited)
 
 
@@ -931,6 +952,264 @@ def _compute_tau(clock_ns: int, gnss_ns: int) -> float:
 
 def _compute_ppb(clock_ns: int, gnss_ns: int) -> float:
     return (((clock_ns - gnss_ns) / gnss_ns) * 1e9) if gnss_ns else 0.0
+
+
+# ---------------------------------------------------------------------
+# TIMEBASE_FRAGMENT schema helpers — PPS/VCLOCK canonical surface
+# ---------------------------------------------------------------------
+
+PPS_VCLOCK_COUNT_KEYS = ("teensy_pps_vclock_count", "teensy_pps_count", "pps_count")
+PPS_VCLOCK_LEDGER_KEYS = ("pps_vclock_ns", "vclock_ns", "pps_ns", "gnss_ns")
+COUNT_LEDGER_MISMATCH_TOLERANCE = 5
+
+
+def _as_int(value: Any) -> Optional[int]:
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _first_present_int(mapping: Dict[str, Any], *keys: str) -> Optional[int]:
+    for key in keys:
+        if key in mapping and mapping.get(key) is not None:
+            value = _as_int(mapping.get(key))
+            if value is not None:
+                return value
+    return None
+
+
+def _fragment_count_from_ledger_ns(fragment: Dict[str, Any]) -> Optional[int]:
+    """
+    Derive the canonical PPS/VCLOCK count from the fragment nanosecond ledger.
+
+    This is intentionally a low-hanging recovery guard.  During a recovery
+    transition it is possible for a legacy count field to drift away from the
+    Teensy's actual synthetic GNSS/PPS_VCLOCK ledger.  The ledger is the sacred
+    clock value; when the count and ledger violently disagree, the Pi uses the
+    ledger-derived count and logs the disagreement.
+    """
+    ledger_ns = _first_present_int(fragment, *PPS_VCLOCK_LEDGER_KEYS)
+    if ledger_ns is None or ledger_ns < 0:
+        return None
+    return int(ledger_ns // NS_PER_SECOND)
+
+
+def _extract_teensy_pps_vclock_count(fragment: Dict[str, Any], *, prefer_ledger: bool = True) -> Optional[int]:
+    """
+    Return the canonical one-second identity from a TIMEBASE_FRAGMENT.
+
+    New firmware publishes teensy_pps_vclock_count.  Legacy firmware used
+    teensy_pps_count or pps_count.  When a count field is present but is
+    grossly inconsistent with the synthetic PPS/VCLOCK nanosecond ledger, the
+    ledger wins.  That keeps TIMEBASE rows internally coherent while we tighten
+    the full recovery protocol later.
+    """
+    raw_count = _first_present_int(fragment, *PPS_VCLOCK_COUNT_KEYS)
+    ledger_count = _fragment_count_from_ledger_ns(fragment)
+
+    if prefer_ledger and raw_count is not None and ledger_count is not None:
+        delta = int(raw_count) - int(ledger_count)
+        if abs(delta) > COUNT_LEDGER_MISMATCH_TOLERANCE:
+            _diag["pps_vclock_count_ledger_mismatches"] = (
+                _diag.get("pps_vclock_count_ledger_mismatches", 0) + 1
+            )
+            _diag["last_pps_vclock_count_ledger_mismatch"] = {
+                "ts_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+                "raw_count": int(raw_count),
+                "ledger_count": int(ledger_count),
+                "delta": int(delta),
+                "ledger_ns": _first_present_int(fragment, *PPS_VCLOCK_LEDGER_KEYS),
+            }
+            logging.warning(
+                "⚠️ [clocks] PPS/VCLOCK count/ledger mismatch: raw=%d ledger=%d delta=%+d — using ledger count",
+                int(raw_count), int(ledger_count), int(delta),
+            )
+            return int(ledger_count)
+
+    if raw_count is not None:
+        return int(raw_count)
+    return ledger_count
+
+
+def _normalize_fragment_count_aliases(fragment: Dict[str, Any], count: int) -> None:
+    """Ensure both canonical and legacy count aliases exist in a fragment copy."""
+    fragment.setdefault("teensy_pps_vclock_count", int(count))
+    fragment.setdefault("teensy_pps_count", int(count))
+    fragment.setdefault("pps_count", int(count))
+
+
+def _extract_last_timebase_count(last_tb: Dict[str, Any], fragment: Dict[str, Any]) -> Optional[int]:
+    """
+    Return canonical count from a persisted TIMEBASE row or its fragment.
+
+    Prefer the fragment's PPS/VCLOCK ledger-derived identity when available;
+    it is the value that must agree with gnss_ns / pps_vclock_ns / vclock_ns.
+    Fall back to top-level TIMEBASE aliases for older rows.
+    """
+    fragment_count = _extract_teensy_pps_vclock_count(fragment)
+    if fragment_count is not None:
+        return int(fragment_count)
+
+    return _first_present_int(
+        last_tb,
+        "teensy_pps_vclock_count",
+        "pps_count",
+        "teensy_pps_count",
+    )
+
+
+def _fragment_ns(fragment: Dict[str, Any], *keys: str, default: int = 0) -> int:
+    """Extract an integer nanosecond ledger from a TIMEBASE_FRAGMENT."""
+    value = _first_present_int(fragment, *keys)
+    return int(value) if value is not None else int(default)
+
+
+def _report_fragment(report: Dict[str, Any]) -> Dict[str, Any]:
+    frag = report.get("fragment")
+    return frag if isinstance(frag, dict) else {}
+
+
+def _report_extra_clocks(report: Dict[str, Any]) -> Dict[str, Any]:
+    extra = report.get("extra_clocks")
+    return extra if isinstance(extra, dict) else {}
+
+
+def _first_float(*values: Any) -> Optional[float]:
+    for value in values:
+        if value is None:
+            continue
+        try:
+            f = float(value)
+        except (TypeError, ValueError):
+            continue
+        if not math.isnan(f):
+            return f
+    return None
+
+
+def _rounded(value: Optional[float], digits: int) -> Optional[float]:
+    return None if value is None else round(float(value), digits)
+
+
+def _baseline_ppb_from_report(report: Dict[str, Any]) -> Dict[str, float]:
+    """Extract baseline PPB values from the current TIMEBASE-shaped report."""
+    frag = _report_fragment(report)
+    extra = _report_extra_clocks(report)
+
+    candidates = {
+        "gnss": 0.0,
+        "vclock": _first_float(frag.get("vclock_ppb"), report.get("vclock_ppb")),
+        "gnss_raw": _first_float(extra.get("gnss_raw_ppb"), report.get("gnss_raw_ppb")),
+        "dwt": _first_float(frag.get("dwt_ppb"), report.get("dwt_ppb")),
+        "ocxo1": _first_float(frag.get("ocxo1_ppb"), report.get("ocxo1_ppb")),
+        "ocxo2": _first_float(frag.get("ocxo2_ppb"), report.get("ocxo2_ppb")),
+    }
+
+    return {k: round(v, 3) for k, v in candidates.items() if v is not None}
+
+
+def _baseline_tau_from_report(report: Dict[str, Any]) -> Dict[str, float]:
+    """Extract baseline tau values from the current TIMEBASE-shaped report."""
+    frag = _report_fragment(report)
+    extra = _report_extra_clocks(report)
+
+    candidates = {
+        "gnss": 1.0,
+        "vclock": _first_float(frag.get("vclock_tau"), report.get("vclock_tau")),
+        "gnss_raw": _first_float(extra.get("gnss_raw_tau"), report.get("gnss_raw_tau")),
+        "dwt": _first_float(frag.get("dwt_tau"), report.get("dwt_tau")),
+        "ocxo1": _first_float(frag.get("ocxo1_tau"), report.get("ocxo1_tau")),
+        "ocxo2": _first_float(frag.get("ocxo2_tau"), report.get("ocxo2_tau")),
+    }
+
+    return {k: round(v, 12) for k, v in candidates.items() if v is not None}
+
+
+def _baseline_dac_from_report(report: Dict[str, Any]) -> Dict[str, float]:
+    """Extract instantaneous DAC setpoints from the current TIMEBASE-shaped report."""
+    frag = _report_fragment(report)
+    out: Dict[str, float] = {}
+    for key in ("ocxo1", "ocxo2"):
+        v = _first_float(frag.get(f"{key}_dac"), report.get(f"{key}_dac"))
+        if v is not None:
+            out[key] = round(v, 6)
+    return out
+
+
+def _baseline_dac_mean_from_report(report: Dict[str, Any]) -> Dict[str, float]:
+    """Extract DAC mean values from the firmware Welford surface, falling back to current DAC."""
+    frag = _report_fragment(report)
+    current = _baseline_dac_from_report(report)
+    out: Dict[str, float] = {}
+    for key in ("ocxo1", "ocxo2"):
+        current_v = current.get(key)
+        v = _first_float(
+            frag.get(f"{key}_dac_welford_mean"),
+            report.get(f"{key}_dac_welford_mean"),
+            report.get(f"{key}_dac_mean"),
+            current_v,
+        )
+        # A zero DAC mean in old/partial reports is almost certainly a stale
+        # field-shape artifact when the instantaneous DAC is populated.
+        if v == 0.0 and current_v is not None and current_v > 0.0:
+            v = current_v
+        if v is not None:
+            out[key] = round(v, 6)
+    return out
+
+
+def _baseline_dac_stats_from_report(report: Dict[str, Any]) -> Dict[str, Dict[str, float | int]]:
+    """Extract the full DAC Welford block for baseline audit/debug display."""
+    frag = _report_fragment(report)
+    out: Dict[str, Dict[str, float | int]] = {}
+    for key in ("ocxo1", "ocxo2"):
+        prefix = f"{key}_dac_welford"
+        n = _as_int(frag.get(f"{prefix}_n"))
+        mean = _first_float(frag.get(f"{prefix}_mean"))
+        sd = _first_float(frag.get(f"{prefix}_stddev"))
+        se = _first_float(frag.get(f"{prefix}_stderr"))
+        mn = _first_float(frag.get(f"{prefix}_min"))
+        mx = _first_float(frag.get(f"{prefix}_max"))
+        stats: Dict[str, float | int] = {}
+        if n is not None:
+            stats["n"] = int(n)
+        if mean is not None:
+            stats["mean"] = round(mean, 6)
+        if sd is not None:
+            stats["stddev"] = round(sd, 6)
+        if se is not None:
+            stats["stderr"] = round(se, 6)
+        if mn is not None:
+            stats["min"] = round(mn, 6)
+        if mx is not None:
+            stats["max"] = round(mx, 6)
+        if stats:
+            out[key] = stats
+    return out
+
+
+def _configured_boot_dacs(cfg: Dict[str, Any]) -> Tuple[Optional[float], Optional[float], str]:
+    """Return DAC values to push to Teensy at boot, with baseline fallback."""
+    d1 = _first_float(cfg.get("ocxo1_dac"))
+    d2 = _first_float(cfg.get("ocxo2_dac"))
+    source = "system_ocxo_dac"
+
+    if d1 is None or d2 is None:
+        baseline_mean = cfg.get("baseline_dac_mean") if isinstance(cfg.get("baseline_dac_mean"), dict) else {}
+        baseline_dac = cfg.get("baseline_dac") if isinstance(cfg.get("baseline_dac"), dict) else {}
+        if d1 is None:
+            d1 = _first_float(baseline_mean.get("ocxo1"), baseline_dac.get("ocxo1"))
+            if d1 is not None:
+                source = "baseline_dac"
+        if d2 is None:
+            d2 = _first_float(baseline_mean.get("ocxo2"), baseline_dac.get("ocxo2"))
+            if d2 is not None:
+                source = "baseline_dac"
+
+    return d1, d2, source
 
 
 
@@ -955,7 +1234,11 @@ def on_watchdog_anomaly(payload: Payload) -> None:
         "reason": anomaly.get("reason"),
         "campaign": anomaly.get("campaign"),
         "sequence": anomaly.get("sequence"),
-        "teensy_pps_count": anomaly.get("teensy_pps_count"),
+        "teensy_pps_vclock_count": (
+            anomaly.get("teensy_pps_vclock_count")
+            or anomaly.get("teensy_pps_count")
+            or anomaly.get("pps_count")
+        ),
         "campaign_seconds": anomaly.get("campaign_seconds"),
     }
 
@@ -985,7 +1268,7 @@ def on_timebase_fragment(payload: Payload) -> None:
 
     This runs on the PUBSUB delivery thread.  It MUST return immediately.
     All it does:
-      1. Extract teensy_pps_count.
+      1. Extract teensy_pps_vclock_count.
       2. Handle sync latch (for START/RECOVER waits).
       3. Drop fragment into the processing queue.
     No IPC, no I/O, no sleep, no database.
@@ -994,37 +1277,29 @@ def on_timebase_fragment(payload: Payload) -> None:
 
     _diag["fragments_received"] += 1
 
-    frag = payload
+    frag = dict(payload)
 
-    # --- Extract pps_count ---
-    teensy_pps_count_raw = (
-        frag.get("teensy_pps_count")
-        if frag.get("teensy_pps_count") is not None
-        else frag.get("pps_count")
-    )
-
-    if teensy_pps_count_raw is None:
+    # --- Extract canonical PPS/VCLOCK count ---
+    pps_vclock_count = _extract_teensy_pps_vclock_count(frag)
+    if pps_vclock_count is None:
         _diag["fragments_missing_teensy_pps_count"] += 1
+        _diag["fragments_missing_teensy_pps_vclock_count"] += 1
         logging.error(
-            "💥 [clocks] TIMEBASE_FRAGMENT missing pps count fields; keys=%s payload=%s",
+            "💥 [clocks] TIMEBASE_FRAGMENT missing PPS/VCLOCK count fields; keys=%s payload=%s",
             sorted(list(frag.keys())),
             frag,
         )
         return
 
-    try:
-        pps_count = int(teensy_pps_count_raw)
-    except Exception:
-        _diag["fragments_missing_teensy_pps_count"] += 1
-        return
+    _normalize_fragment_count_aliases(frag, pps_vclock_count)
 
     # --- Sync latch (for START/RECOVER waits) ---
     with _sync_lock:
-        if _sync_expected_pps is not None:
-            match = int(pps_count) >= int(_sync_expected_pps)
+        if _sync_expected_pps_vclock is not None:
+            match = int(pps_vclock_count) >= int(_sync_expected_pps_vclock)
             logging.info(
-                "🔎 [on_timebase_fragment] @%s fragment arrived: teensy_pps_count=%d (waiting for >=%d) match=%s",
-                system_time_z(), pps_count, _sync_expected_pps, str(match),
+                "🔎 [on_timebase_fragment] @%s fragment arrived: teensy_pps_vclock_count=%d (waiting for >=%d) match=%s",
+                system_time_z(), pps_vclock_count, _sync_expected_pps_vclock, str(match),
             )
             if match:
                 _sync_fragment = dict(frag)
@@ -1051,7 +1326,7 @@ def _process_loop() -> None:
     environment and GNSS discipline data, builds TIMEBASE, persists.
     Runs forever.
     """
-    global _campaign_active, _armed_pps_count, _gnss_raw_ns, _gnss_raw_n, _gnss_raw_valid
+    global _campaign_active, _armed_pps_vclock_count, _gnss_raw_ns, _gnss_raw_n, _gnss_raw_valid
     global _gnss_raw_welford_n, _gnss_raw_welford_mean, _gnss_raw_welford_m2
     global _gnss_raw_welford_min, _gnss_raw_welford_max
 
@@ -1066,64 +1341,65 @@ def _process_loop() -> None:
         _diag["fragments_processed"] += 1
         _diag["queue_depth_current"] = _fragment_queue.qsize()
 
-        # --- Extract pps_count ---
-        teensy_pps_count_raw = frag.get("teensy_pps_count")
-        if teensy_pps_count_raw is None:
+        # --- Extract canonical PPS/VCLOCK count ---
+        pps_vclock_count = _extract_teensy_pps_vclock_count(frag)
+        if pps_vclock_count is None:
+            _diag["fragments_missing_teensy_pps_count"] += 1
+            _diag["fragments_missing_teensy_pps_vclock_count"] += 1
             continue
 
-        try:
-            pps_count = int(teensy_pps_count_raw)
-        except Exception:
-            continue
-
-        _note_pps_count(pps_count)
+        _normalize_fragment_count_aliases(frag, pps_vclock_count)
+        _note_pps_vclock_count(pps_vclock_count)
 
         # --- No campaign => ignore ---
         if not _campaign_active:
             _diag["fragments_ignored_no_campaign"] += 1
             continue
 
-        # --- Check Teensy pps_count against what we armed ---
-        armed = _armed_pps_count
+        # --- Check Teensy PPS/VCLOCK count against what we armed ---
+        armed = _armed_pps_vclock_count
         sysclk = system_time_z()
-        if armed is not None and int(pps_count) != armed:
-            delta = int(pps_count) - armed
+        if armed is not None and int(pps_vclock_count) != armed:
+            delta = int(pps_vclock_count) - armed
             _diag["pps_mismatch_soft_skips"] = _diag.get("pps_mismatch_soft_skips", 0) + 1
 
             with _sync_lock:
-                sync_active = _sync_expected_pps is not None
+                sync_active = _sync_expected_pps_vclock is not None
 
             if abs(delta) <= 5:
                 logging.warning(
-                    "⚠️ [clocks] @%s pps_count mismatch: "
+                    "⚠️ [clocks] @%s PPS/VCLOCK count mismatch: "
                     "armed=%d teensy=%d (off by %+d) sync_active=%s "
                     "— soft skip, re-arming",
-                    sysclk, armed, int(pps_count), delta, sync_active,
+                    sysclk, armed, int(pps_vclock_count), delta, sync_active,
                 )
-                _armed_pps_count = int(pps_count) + 1
-                _diag["armed_pps_count"] = _armed_pps_count
+                _armed_pps_vclock_count = int(pps_vclock_count) + 1
+                _diag["armed_pps_count"] = _armed_pps_vclock_count
+                _diag["armed_pps_vclock_count"] = _armed_pps_vclock_count
                 continue
 
             # Large jump (>5) is genuinely anomalous — hard fault
             _diag["hard_fault_pps_mismatch"] += 1
             logging.error(
-                "💥 [clocks] @%s TEENSY PPS COUNT MISMATCH! "
+                "💥 [clocks] @%s TEENSY PPS/VCLOCK COUNT MISMATCH! "
                 "armed=%d teensy=%d (off by %+d).",
-                sysclk, armed, int(pps_count), delta,
+                sysclk, armed, int(pps_vclock_count), delta,
             )
             try:
                 _hard_fault("pps_mismatch_teensy_vs_armed", {
                     "system_time": sysclk,
-                    "armed_pps_count": armed,
-                    "teensy_pps_count": int(pps_count),
+                    "armed_pps_vclock_count": armed, "armed_pps_count": armed,
+                    "teensy_pps_vclock_count": int(pps_vclock_count),
+                    "teensy_pps_count": int(pps_vclock_count),
                     "delta": delta,
                 })
             except RuntimeError:
                 continue
 
         # Advance armed expectation to next second
-        _armed_pps_count = int(pps_count) + 1
-        _diag["armed_pps_count"] = _armed_pps_count
+        _armed_pps_vclock_count = int(pps_vclock_count) + 1
+        _diag["armed_pps_count"] = _armed_pps_vclock_count
+        _diag["armed_pps_vclock_count"] = _armed_pps_vclock_count
 
         # --- Extract GNSS ns for stream health canary ---
         system_time_utc = datetime.now(timezone.utc)
@@ -1181,7 +1457,7 @@ def _process_loop() -> None:
         if row is None:
             _diag["hard_fault_no_active_campaign"] += 1
             try:
-                _hard_fault("no_active_campaign", {"pps_count": int(pps_count)})
+                _hard_fault("no_active_campaign", {"teensy_pps_vclock_count": int(pps_vclock_count), "pps_count": int(pps_vclock_count)})
             except RuntimeError:
                 continue
 
@@ -1191,13 +1467,15 @@ def _process_loop() -> None:
         # --- Build TIMEBASE record ---
         timebase = {
             "campaign": campaign,
-            "campaign_elapsed": _seconds_to_hms(int(pps_count)),
+            "campaign_elapsed": _seconds_to_hms(int(pps_vclock_count)),
             "location": campaign_payload.get("location"),
 
             "system_time_utc": system_time_str,
             "gnss_time_utc": system_time_z(),
 
-            "pps_count": int(pps_count),
+            "teensy_pps_vclock_count": int(pps_vclock_count),
+            "teensy_pps_count": int(pps_vclock_count),   # legacy alias
+            "pps_count": int(pps_vclock_count),          # legacy alias
 
             # Entire TIMEBASE_FRAGMENT — the authoritative clock record
             "fragment": frag,
@@ -1227,11 +1505,30 @@ def _process_loop() -> None:
         publish("TIMEBASE", timebase)
         _persist_timebase(timebase)
 
-        # Persist OCXO1/OCXO2 DAC fields into campaign payload (best-effort)
+        # Persist OCXO1/OCXO2 DAC fields into campaign payload (best-effort).
+        #
+        # The active campaign payload is the live source for SET_BASELINE.  Keep
+        # both instantaneous DAC setpoints and firmware-owned DAC Welford means
+        # current so a baseline selected late in a campaign captures the real
+        # clock-control state, not stale legacy field names.
         teensy_ocxo1_dac = frag.get("ocxo1_dac")
         teensy_ocxo2_dac = frag.get("ocxo2_dac")
         teensy_calibrate = frag.get("calibrate_ocxo")
-        if teensy_ocxo1_dac is not None or teensy_ocxo2_dac is not None:
+        ocxo1_dac_current = _first_float(teensy_ocxo1_dac)
+        ocxo2_dac_current = _first_float(teensy_ocxo2_dac)
+        ocxo1_dac_mean = _first_float(frag.get("ocxo1_dac_welford_mean"), ocxo1_dac_current)
+        ocxo2_dac_mean = _first_float(frag.get("ocxo2_dac_welford_mean"), ocxo2_dac_current)
+
+        if ocxo1_dac_current is not None or ocxo2_dac_current is not None:
+            campaign_dac_blob = {
+                "ocxo1_dac": ocxo1_dac_current,
+                "ocxo2_dac": ocxo2_dac_current,
+                "ocxo1_dac_mean": ocxo1_dac_mean,
+                "ocxo2_dac_mean": ocxo2_dac_mean,
+                "calibrate_ocxo": teensy_calibrate if teensy_calibrate and teensy_calibrate != "OFF" else None,
+            }
+            # Drop None values so jsonb concatenation does not erase known values.
+            campaign_dac_blob = {k: v for k, v in campaign_dac_blob.items() if v is not None}
             try:
                 with open_db() as conn:
                     cur = conn.cursor()
@@ -1242,23 +1539,20 @@ def _process_loop() -> None:
                         WHERE campaign = %s
                           AND active = true
                         """,
-                        (
-                            json.dumps({
-                                "ocxo1_dac": float(frag["ocxo1_dac_mean"]) if frag.get(
-                                    "ocxo1_dac_mean") is not None else (float(teensy_ocxo1_dac) if teensy_ocxo1_dac is not None else None),
-                                "ocxo2_dac": float(frag["ocxo2_dac_mean"]) if frag.get(
-                                    "ocxo2_dac_mean") is not None else (float(teensy_ocxo2_dac) if teensy_ocxo2_dac is not None else None),
-                                "calibrate_ocxo": teensy_calibrate if teensy_calibrate and teensy_calibrate != "OFF" else None,
-                            }),
-                            campaign,
-                        ),
+                        (json.dumps(campaign_dac_blob), campaign),
                     )
             except Exception:
                 logging.exception("⚠️ [clocks] failed to persist OCXO DAC values (ignored)")
 
-        # Persist calibrated DAC to SYSTEM config so it survives
-        # across campaigns.  Only during active calibration.
-        if teensy_calibrate and teensy_ocxo1_dac is not None:
+        # Persist latest DAC setpoints to SYSTEM config so Teensy can be pushed
+        # back into the same control state at process boot even when no campaign
+        # is running.  Baseline selection also writes these fields explicitly.
+        if ocxo1_dac_current is not None or ocxo2_dac_current is not None:
+            system_dac_blob = {
+                "ocxo1_dac": ocxo1_dac_current,
+                "ocxo2_dac": ocxo2_dac_current,
+            }
+            system_dac_blob = {k: v for k, v in system_dac_blob.items() if v is not None}
             try:
                 with open_db() as conn:
                     cur = conn.cursor()
@@ -1268,10 +1562,7 @@ def _process_loop() -> None:
                         SET payload = payload || %s::jsonb
                         WHERE config_key = 'SYSTEM'
                         """,
-                        (json.dumps({
-                            "ocxo1_dac": float(frag["ocxo1_dac_mean"]) if frag.get("ocxo1_dac_mean") is not None else float(teensy_ocxo1_dac),
-                            "ocxo2_dac": float(frag["ocxo2_dac_mean"]) if frag.get("ocxo2_dac_mean") is not None else (float(teensy_ocxo2_dac) if teensy_ocxo2_dac is not None else None),
-                        }),),
+                        (json.dumps(system_dac_blob),),
                     )
             except Exception:
                 logging.exception("⚠️ [clocks] failed to persist OCXO DAC values to config (ignored)")
@@ -1283,8 +1574,8 @@ def _process_loop() -> None:
 
 
 def _reset_trackers() -> None:
-    global _last_pps_count_seen
-    _last_pps_count_seen = None
+    global _last_pps_vclock_count_seen
+    _last_pps_vclock_count_seen = None
     _gnss_canary_reset()
     _gnss_raw_reset()
 
@@ -1296,15 +1587,22 @@ def _request_teensy_stop_best_effort() -> None:
         pass
 
 
-def _request_teensy_start(campaign: str, pps_count: int, args: Dict[str, Any]) -> None:
+def _request_teensy_start(campaign: str, pps_vclock_count: int, args: Dict[str, Any]) -> None:
     teensy_args = dict(args)
-    teensy_args.update({"campaign": campaign, "pps_count": str(int(pps_count))})
+    # Teensy still accepts the legacy pps_count command argument.  Send the
+    # explicit PPS/VCLOCK alias too; older firmware will ignore it.
+    teensy_args.update({
+        "campaign": campaign,
+        "pps_count": str(int(pps_vclock_count)),
+        "pps_vclock_count": str(int(pps_vclock_count)),
+    })
     send_command(machine="TEENSY", subsystem="CLOCKS", command="START", args=teensy_args)
 
 
-def _request_teensy_recover(pps_count: int, args: Dict[str, Any]) -> None:
+def _request_teensy_recover(pps_vclock_count: int, args: Dict[str, Any]) -> None:
     teensy_args = dict(args)
-    teensy_args["pps_count"] = str(int(pps_count))
+    teensy_args["pps_count"] = str(int(pps_vclock_count))
+    teensy_args["pps_vclock_count"] = str(int(pps_vclock_count))
     send_command(machine="TEENSY", subsystem="CLOCKS", command="RECOVER", args=teensy_args)
 
 
@@ -1312,7 +1610,7 @@ def cmd_start(args: Optional[dict]) -> dict:
     """
     START — v5 three-domain architecture with flash-cut support.
     """
-    global _campaign_active, _armed_pps_count
+    global _campaign_active, _armed_pps_vclock_count
 
     campaign = args.get("campaign") if args else None
     if not campaign:
@@ -1443,13 +1741,13 @@ def cmd_start(args: Optional[dict]) -> dict:
     #
     # Teensy suppresses its first TEENSY_CAMPAIGN_WARMUP_FRAGMENTS
     # internal records and publishes the first clean public fragment as
-    # pps_count=1 for a fresh campaign.  Waiting for >=1 makes the intent
+    # PPS/VCLOCK count=1 for a fresh campaign.  Waiting for >=1 makes the intent
     # explicit while still tolerating a later first fragment if warmup policy
     # changes.
     _begin_sync_wait(expected_pps=1)
 
     # Arm TEENSY
-    logging.info("📡 [start] @%s arming TEENSY START: pps_count=0", system_time_z())
+    logging.info("📡 [start] @%s arming TEENSY START: pps_vclock_count=0", system_time_z())
     teensy_args: Dict[str, Any] = {"campaign": campaign}
     if set_dac1 is not None:
         teensy_args["set_dac1"] = str(set_dac1)
@@ -1458,11 +1756,11 @@ def cmd_start(args: Optional[dict]) -> dict:
     if calibrate_ocxo:
         teensy_args["calibrate_ocxo"] = calibrate_ocxo
 
-    _request_teensy_start(campaign=campaign, pps_count=0, args=teensy_args)
+    _request_teensy_start(campaign=campaign, pps_vclock_count=0, args=teensy_args)
     logging.info("📡 [start] @%s TEENSY START returned", system_time_z())
 
     # Wait for sync fragment
-    logging.info("📡 [start] @%s waiting for first post-warmup sync fragment (pps_count>=1)...", system_time_z())
+    logging.info("📡 [start] @%s waiting for first post-warmup sync fragment (pps_vclock_count>=1)...", system_time_z())
 
     try:
         frag0, waited_s = _end_sync_wait(timeout_s=SYNC_RECOVER_TIMEOUT_S)
@@ -1470,11 +1768,12 @@ def cmd_start(args: Optional[dict]) -> dict:
         return {"success": False, "message": "HARD FAULT during START sync (see logs/diag)"}
 
     # Teensy warmup gate: the first fragment we see is the first public,
-    # post-warmup record.  Arm to the following pps_count so processing
+    # post-warmup record.  Arm to the following PPS/VCLOCK count so processing
     # accepts that queued sync fragment normally, then expects continuity.
-    teensy_pps_count = int(frag0.get("teensy_pps_count", frag0.get("pps_count", 1)))
-    _armed_pps_count = teensy_pps_count
-    _diag["armed_pps_count"] = _armed_pps_count
+    teensy_pps_vclock_count = _extract_teensy_pps_vclock_count(frag0) or 1
+    _armed_pps_vclock_count = teensy_pps_vclock_count
+    _diag["armed_pps_count"] = _armed_pps_vclock_count
+    _diag["armed_pps_vclock_count"] = _armed_pps_vclock_count
 
     _reset_trackers()
     _campaign_active = True
@@ -1498,7 +1797,8 @@ def cmd_start(args: Optional[dict]) -> dict:
             "set_dac1": set_dac1,
             "set_dac2": set_dac2,
             "calibrate_ocxo": calibrate_ocxo,
-            "pps_count": int(teensy_pps_count),
+            "teensy_pps_vclock_count": int(teensy_pps_vclock_count),
+            "pps_count": int(teensy_pps_vclock_count),
             "waited_s": round(float(waited_s), 3),
             "flash_cut": flash_cut,
             "previous_campaign": active_row["campaign"] if flash_cut else None,
@@ -1751,12 +2051,12 @@ def _recover_campaign() -> None:
     """
     RECOVER — v6 four-domain architecture.
     """
-    global _campaign_active, _armed_pps_count
+    global _campaign_active, _armed_pps_vclock_count
 
     # Immediately deactivate so the processor thread ignores all
     # fragments during recovery.
     _campaign_active = False
-    _armed_pps_count = None
+    _armed_pps_vclock_count = None
 
     _diag["recovery_checks"] += 1
 
@@ -1841,17 +2141,18 @@ def _recover_campaign() -> None:
         if recover_calibrate:
             teensy_args["calibrate_ocxo"] = recover_calibrate
 
-        logging.info("📡 [recovery/cold] @%s arming TEENSY START: pps_count=0; waiting for first post-warmup fragment", system_time_z())
-        _request_teensy_start(campaign=campaign_name, pps_count=0, args=teensy_args)
+        logging.info("📡 [recovery/cold] @%s arming TEENSY START: pps_vclock_count=0; waiting for first post-warmup fragment", system_time_z())
+        _request_teensy_start(campaign=campaign_name, pps_vclock_count=0, args=teensy_args)
 
         try:
             frag, waited_s = _end_sync_wait()
         except Exception:
             raise
 
-        teensy_pps_count = int(frag.get("teensy_pps_count", frag.get("pps_count", 1)))
-        _armed_pps_count = teensy_pps_count + 1
-        _diag["armed_pps_count"] = _armed_pps_count
+        teensy_pps_vclock_count = _extract_teensy_pps_vclock_count(frag) or 1
+        _armed_pps_vclock_count = teensy_pps_vclock_count + 1
+        _diag["armed_pps_count"] = _armed_pps_vclock_count
+        _diag["armed_pps_vclock_count"] = _armed_pps_vclock_count
 
         while not _fragment_queue.empty():
             try:
@@ -1872,7 +2173,8 @@ def _recover_campaign() -> None:
             "ts_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
             "campaign": campaign_name,
             "mode": "cold_restart",
-            "pps_count": int(teensy_pps_count),
+            "teensy_pps_vclock_count": int(teensy_pps_vclock_count),
+            "pps_count": int(teensy_pps_vclock_count),
         }
         return
 
@@ -1880,18 +2182,41 @@ def _recover_campaign() -> None:
     if isinstance(last_tb, str):
         last_tb = json.loads(last_tb)
 
-    last_pps_count = last_tb.get("pps_count") or last_tb.get("teensy_pps_count")
-    if last_pps_count is None:
-        _diag["recovery_missing_last_pps_count"] += 1
-        raise RuntimeError("recovery failed: last TIMEBASE missing pps_count")
-    last_pps_count = int(last_pps_count)
-
-    # Read clock values from fragment (current) with fallback to legacy top-level fields.
     last_frag = last_tb.get("fragment") or {}
-    last_gnss_ns = int(last_frag.get("gnss_ns") or last_tb.get("teensy_gnss_ns") or 0)
-    last_dwt_ns = int(last_frag.get("dwt_cycle_count_total") or last_tb.get("teensy_dwt_cycles") or last_tb.get("teensy_dwt_ns") or 0)
-    last_ocxo1_ns = int(last_frag.get("ocxo1_ns") or last_tb.get("teensy_ocxo1_ns") or 0)
-    last_ocxo2_ns = int(last_frag.get("ocxo2_ns") or last_tb.get("teensy_ocxo2_ns") or 0)
+    last_pps_vclock_count = _extract_last_timebase_count(last_tb, last_frag)
+    if last_pps_vclock_count is None:
+        _diag["recovery_missing_last_pps_count"] += 1
+        _diag["recovery_missing_last_pps_vclock_count"] += 1
+        raise RuntimeError("recovery failed: last TIMEBASE missing PPS/VCLOCK count")
+    last_pps_vclock_count = int(last_pps_vclock_count)
+
+    # Read synthetic nanosecond ledgers from fragment, preferring the new
+    # PPS/VCLOCK-era names and falling back to legacy top-level fields.
+    last_gnss_ns = _fragment_ns(
+        last_frag,
+        "pps_vclock_ns",
+        "vclock_ns",
+        "pps_ns",
+        "gnss_ns",
+        default=int(last_tb.get("teensy_gnss_ns") or 0),
+    )
+    last_dwt_ns = _fragment_ns(
+        last_frag,
+        "dwt_ns",
+        default=int(last_tb.get("teensy_dwt_ns") or 0),
+    )
+    last_ocxo1_ns = _fragment_ns(
+        last_frag,
+        "ocxo1_ns",
+        "ocxo1_ns_at_pps_vclock",
+        default=int(last_tb.get("teensy_ocxo1_ns") or 0),
+    )
+    last_ocxo2_ns = _fragment_ns(
+        last_frag,
+        "ocxo2_ns",
+        "ocxo2_ns_at_pps_vclock",
+        default=int(last_tb.get("teensy_ocxo2_ns") or 0),
+    )
     last_gnss_raw_ns = int(
         (last_tb.get("extra_clocks") or {}).get("gnss_raw_ns")
         or last_tb.get("gnss_raw_ns")
@@ -1906,13 +2231,13 @@ def _recover_campaign() -> None:
 
     logging.info(
         "📐 [recovery] LAST TIMEBASE:\n"
-        "    pps_count  = %d\n"
+        "    pps_vclock_count = %d\n"
         "    gnss_ns    = %d\n"
         "    dwt_ns     = %d\n"
         "    ocxo1_ns   = %d\n"
         "    ocxo2_ns   = %d\n"
         "    gnss_time  = %s",
-        last_pps_count, last_gnss_ns, last_dwt_ns, last_ocxo1_ns, last_ocxo2_ns,
+        last_pps_vclock_count, last_gnss_ns, last_dwt_ns, last_ocxo1_ns, last_ocxo2_ns,
         last_gnss_time_str,
     )
 
@@ -1995,17 +2320,17 @@ def _recover_campaign() -> None:
     # Step 4-5: Symmetric projection
     # ------------------------------------------------------------------
     next_pps_second = elapsed_seconds + 1
-    next_pps_count = last_pps_count + next_pps_second
+    next_pps_vclock_count = last_pps_vclock_count + next_pps_second
 
     logging.info(
-        "📐 [recovery] PPS PROJECTION:\n"
+        "📐 [recovery] PPS/VCLOCK PROJECTION:\n"
         "    next_pps_second = elapsed(%d) + 1 = %d\n"
-        "    next_pps_count  = last(%d) + next_pps_second(%d) = %d",
+        "    next_pps_vclock_count  = last(%d) + next_pps_second(%d) = %d",
         elapsed_seconds, next_pps_second,
-        last_pps_count, next_pps_second, next_pps_count,
+        last_pps_vclock_count, next_pps_second, next_pps_vclock_count,
     )
 
-    projected_gnss_ns = next_pps_count * NS_PER_SECOND
+    projected_gnss_ns = next_pps_vclock_count * NS_PER_SECOND
     projected_dwt_ns = projected_gnss_ns * last_dwt_ns // last_gnss_ns if last_gnss_ns > 0 else projected_gnss_ns
     projected_ocxo1_ns = projected_gnss_ns * last_ocxo1_ns // last_gnss_ns if (last_gnss_ns > 0 and last_ocxo1_ns > 0) else 0
     projected_ocxo2_ns = projected_gnss_ns * last_ocxo2_ns // last_gnss_ns if (last_gnss_ns > 0 and last_ocxo2_ns > 0) else 0
@@ -2018,13 +2343,13 @@ def _recover_campaign() -> None:
     logging.info(
         "📐 [recovery] SYMMETRIC PROJECTION (all nanoseconds):\n"
         "    formula: projected_ns = projected_gnss_ns × last_clock_ns ÷ last_gnss_ns\n"
-        "    projected_gnss_ns = next_pps_count(%d) × NS_PER_SECOND = %d\n"
+        "    projected_gnss_ns = next_pps_vclock_count(%d) × NS_PER_SECOND = %d\n"
         "    last_gnss_ns      = %d\n"
         "    ---\n"
         "    GNSS:  projected = %d  (tau = 1.000000000000)\n"
         "    DWT:   projected = %d  (tau = %.12f, last_dwt_ns = %d)\n"
         "    OCXO1: projected = %d  (tau = %.12f, last_ocxo1_ns = %d)",
-        next_pps_count, projected_gnss_ns, last_gnss_ns,
+        next_pps_vclock_count, projected_gnss_ns, last_gnss_ns,
         projected_gnss_ns,
         projected_dwt_ns, tau_dwt, last_dwt_ns,
         projected_ocxo1_ns, tau_ocxo1, last_ocxo1_ns,
@@ -2033,12 +2358,12 @@ def _recover_campaign() -> None:
     _diag["last_recovery"] = {
         "ts_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
         "campaign": campaign_name,
-        "last_pps_count": int(last_pps_count),
+        "last_pps_vclock_count": int(last_pps_vclock_count),
         "last_gnss_time": last_gnss_time_str,
         "current_gnss_time": current_gnss_time_str,
         "elapsed_seconds": int(elapsed_seconds),
         "next_pps_second": int(next_pps_second),
-        "next_pps_count": int(next_pps_count),
+        "next_pps_vclock_count": int(next_pps_vclock_count),
         "projected_gnss_ns": int(projected_gnss_ns),
         "projected_dwt_ns": int(projected_dwt_ns),
         "projected_ocxo1_ns": int(projected_ocxo1_ns),
@@ -2051,16 +2376,16 @@ def _recover_campaign() -> None:
     # ------------------------------------------------------------------
     # Step 6: Begin sync wait, arm Teensy RECOVER
     # ------------------------------------------------------------------
-    _begin_sync_wait(expected_pps=int(next_pps_count))
+    _begin_sync_wait(expected_pps=int(next_pps_vclock_count))
 
     logging.info(
         "📡 [recovery] @%s arming TEENSY RECOVER:\n"
-        "    pps_count = %d\n"
+        "    pps_vclock_count = %d\n"
         "    dwt_ns    = %d\n"
         "    gnss_ns   = %d\n"
         "    ocxo1_ns  = %d\n"
         "    ocxo2_ns  = %d",
-        system_time_z(), next_pps_count,
+        system_time_z(), next_pps_vclock_count,
         projected_dwt_ns, projected_gnss_ns, projected_ocxo1_ns, projected_ocxo2_ns,
     )
 
@@ -2078,7 +2403,7 @@ def _recover_campaign() -> None:
     if recover_calibrate:
         teensy_recover_args["calibrate_ocxo"] = recover_calibrate
 
-    _request_teensy_recover(int(next_pps_count), teensy_recover_args)
+    _request_teensy_recover(int(next_pps_vclock_count), teensy_recover_args)
 
     try:
         frag, waited_s = _end_sync_wait(timeout_s=SYNC_RECOVER_TIMEOUT_S)
@@ -2087,17 +2412,18 @@ def _recover_campaign() -> None:
 
     logging.info("✅ [recovery] @%s sync fragment received (waited=%.3fs)", system_time_z(), waited_s)
 
-    teensy_pps_count = int(frag.get("teensy_pps_count", next_pps_count))
-    overshoot = teensy_pps_count - next_pps_count
+    teensy_pps_vclock_count = _extract_teensy_pps_vclock_count(frag) or next_pps_vclock_count
+    overshoot = teensy_pps_vclock_count - next_pps_vclock_count
 
     if overshoot != 0:
         logging.info(
-            "📐 [recovery] pps_count overshoot: teensy=%d projected=%d (overshoot=%+d)",
-            teensy_pps_count, next_pps_count, overshoot,
+            "📐 [recovery] PPS/VCLOCK count overshoot: teensy=%d projected=%d (overshoot=%+d)",
+            teensy_pps_vclock_count, next_pps_vclock_count, overshoot,
         )
 
-    _armed_pps_count = teensy_pps_count + 1
-    _diag["armed_pps_count"] = _armed_pps_count
+    _armed_pps_vclock_count = teensy_pps_vclock_count + 1
+    _diag["armed_pps_count"] = _armed_pps_vclock_count
+    _diag["armed_pps_vclock_count"] = _armed_pps_vclock_count
 
     _drained_post = 0
     while not _fragment_queue.empty():
@@ -2119,11 +2445,11 @@ def _recover_campaign() -> None:
 
     logging.info(
         "✅ [recovery] @%s campaign '%s' recovered — TIMEBASE resumes\n"
-        "    teensy_pps_count = %d\n"
+        "    teensy_pps_vclock_count = %d\n"
         "    overshoot        = %+d\n"
-        "    armed_pps_count  = %d",
+        "    armed_pps_vclock_count = %d",
         system_time_z(), campaign_name,
-        teensy_pps_count, overshoot, _armed_pps_count,
+        teensy_pps_vclock_count, overshoot, _armed_pps_vclock_count,
     )
 
 
@@ -2139,12 +2465,17 @@ def _get_baseline_from_config() -> Optional[Dict[str, Any]]:
             cur.execute("SELECT payload FROM config WHERE config_key = 'SYSTEM'")
             row = cur.fetchone()
             if row and row["payload"].get("baseline_id") is not None:
+                payload = row["payload"]
                 return {
-                    "baseline_id": row["payload"]["baseline_id"],
-                    "baseline_ppb": row["payload"].get("baseline_ppb", {}),
-                    "baseline_dac_mean": row["payload"].get("baseline_dac_mean", {}),
-                    "baseline_campaign": row["payload"].get("baseline_campaign"),
-                    "baseline_pps_n": row["payload"].get("baseline_pps_n"),
+                    "baseline_id": payload["baseline_id"],
+                    "baseline_ppb": payload.get("baseline_ppb", {}),
+                    "baseline_tau": payload.get("baseline_tau", {}),
+                    "baseline_dac": payload.get("baseline_dac", {}),
+                    "baseline_dac_mean": payload.get("baseline_dac_mean", {}),
+                    "baseline_dac_stats": payload.get("baseline_dac_stats", {}),
+                    "baseline_campaign": payload.get("baseline_campaign"),
+                    "baseline_pps_vclock_n": payload.get("baseline_pps_vclock_n"),
+                    "baseline_pps_n": payload.get("baseline_pps_n"),
                 }
     except Exception:
         logging.exception("⚠️ [clocks] failed to read baseline from config")
@@ -2190,34 +2521,41 @@ def cmd_set_baseline(args: Optional[dict]) -> Dict[str, Any]:
         payload = json.loads(payload)
 
     report = payload.get("report")
-    if not report:
+    if not isinstance(report, dict) or not report:
         return {"success": False, "message": f"Campaign {baseline_id} ('{row['campaign']}') has no report"}
 
-    baseline_ppb = {}
-    for key in ("gnss", "gnss_raw", "dwt", "ocxo1", "ocxo2"):
-        blk = report.get(key, {})
-        ppb = blk.get("ppb")
-        if ppb is not None:
-            baseline_ppb[key] = round(float(ppb), 3)
-
+    baseline_ppb = _baseline_ppb_from_report(report)
     if not baseline_ppb:
         return {"success": False, "message": f"Campaign {baseline_id} ('{row['campaign']}') report has no PPB data"}
 
-    # DAC mean baseline (TEMPEST DAC test)
-    baseline_dac_mean = {}
-    for key in ("ocxo1", "ocxo2"):
-        blk = report.get(key, {})
-        dac_mean = blk.get("dac_mean")
-        if dac_mean is not None:
-            baseline_dac_mean[key] = round(float(dac_mean), 6)
+    baseline_tau = _baseline_tau_from_report(report)
+    baseline_dac = _baseline_dac_from_report(report)
+    baseline_dac_mean = _baseline_dac_mean_from_report(report)
+    baseline_dac_stats = _baseline_dac_stats_from_report(report)
 
-    baseline_blob = {
+    baseline_pps_vclock_n = _extract_last_timebase_count(report, _report_fragment(report))
+
+    # A baseline should be self-contained, but it should also update the
+    # boot DAC defaults.  Prefer firmware DAC means for startup setpoints;
+    # fall back to instantaneous DAC values.
+    ocxo1_boot_dac = _first_float(baseline_dac_mean.get("ocxo1"), baseline_dac.get("ocxo1"))
+    ocxo2_boot_dac = _first_float(baseline_dac_mean.get("ocxo2"), baseline_dac.get("ocxo2"))
+
+    baseline_blob: Dict[str, Any] = {
         "baseline_id": baseline_id,
         "baseline_ppb": baseline_ppb,
-        "baseline_dac_mean": baseline_dac_mean,    # ← add
+        "baseline_tau": baseline_tau,
+        "baseline_dac": baseline_dac,
+        "baseline_dac_mean": baseline_dac_mean,
+        "baseline_dac_stats": baseline_dac_stats,
         "baseline_campaign": row["campaign"],
-        "baseline_pps_n": report.get("pps_count"),
+        "baseline_pps_vclock_n": baseline_pps_vclock_n,
+        "baseline_pps_n": baseline_pps_vclock_n,  # legacy alias
     }
+    if ocxo1_boot_dac is not None:
+        baseline_blob["ocxo1_dac"] = round(ocxo1_boot_dac, 6)
+    if ocxo2_boot_dac is not None:
+        baseline_blob["ocxo2_dac"] = round(ocxo2_boot_dac, 6)
 
     try:
         with open_db() as conn:
@@ -2234,7 +2572,10 @@ def cmd_set_baseline(args: Optional[dict]) -> Dict[str, Any]:
         logging.exception("❌ [clocks] failed to persist baseline to config")
         return {"success": False, "message": "Failed to persist baseline to config"}
 
-    logging.info("✅ [clocks] baseline set: id=%d campaign='%s' ppb=%s", baseline_id, row["campaign"], baseline_ppb)
+    logging.info(
+        "✅ [clocks] baseline set: id=%d campaign='%s' ppb=%s dac_mean=%s",
+        baseline_id, row["campaign"], baseline_ppb, baseline_dac_mean,
+    )
     return {"success": True, "message": "OK", "payload": baseline_blob}
 
 # ---------------------------------------------------------------------
@@ -2384,8 +2725,12 @@ def cmd_baseline_info(_: Optional[dict]) -> Dict[str, Any]:
         "baseline_set": True,
         "baseline_id": baseline_id,
         "baseline_ppb": info.get("baseline_ppb", {}),
+        "baseline_tau": info.get("baseline_tau", {}),
+        "baseline_dac": info.get("baseline_dac", {}),
         "baseline_dac_mean": info.get("baseline_dac_mean", {}),
+        "baseline_dac_stats": info.get("baseline_dac_stats", {}),
         "baseline_campaign": info.get("baseline_campaign"),
+        "baseline_pps_vclock_n": info.get("baseline_pps_vclock_n"),
         "baseline_pps_n": info.get("baseline_pps_n"),
     }
 
@@ -2509,6 +2854,7 @@ def cmd_list_campaigns(_: Optional[dict]) -> Dict[str, Any]:
             "stopped_at": payload.get("stopped_at"),
             "resumed_at": payload.get("resumed_at"),
             "location": payload.get("location"),
+            "teensy_pps_vclock_count": report.get("teensy_pps_vclock_count") or report.get("pps_count"),
             "pps_count": report.get("pps_count"),
         }
         campaigns.append(entry)
@@ -2531,8 +2877,9 @@ def cmd_list_campaigns(_: Optional[dict]) -> Dict[str, Any]:
 def cmd_clocks_info(_: Optional[dict]) -> Dict[str, Any]:
     payload = {
         "campaign_active": _campaign_active,
-        "last_pps_count_seen": _last_pps_count_seen,
-        "sync_expected_pps": _sync_expected_pps,
+        "last_pps_vclock_count_seen": _last_pps_vclock_count_seen,
+        "sync_expected_pps_vclock": _sync_expected_pps_vclock,
+        "sync_expected_pps": _sync_expected_pps_vclock,
         "diag": _diag,
     }
     return {"success": True, "message": "OK", "payload": payload}
@@ -2686,7 +3033,7 @@ def run() -> None:
     setup_logging()
 
     logging.info(
-        "🕐 [clocks] v9 — Prediction-aware statistics. Teensy v10 trend-aware tracking. "
+        "🕐 [clocks] v10 — PPS/VCLOCK TIMEBASE schema. Teensy PPS/VCLOCK count is canonical. "
         "Four clock domains: GNSS (reference), DWT, OCXO1, OCXO2. "
         "DWT/OCXO1/OCXO2 prediction stats from Teensy are authoritative. "
         "Pi-side Welford for DWT/OCXO1/OCXO2 removed. GNSS stream canary retained. "
@@ -2705,8 +3052,7 @@ def run() -> None:
     try:
         cfg = _get_system_config()
 
-        boot_dac1 = cfg.get("ocxo1_dac")
-        boot_dac2 = cfg.get("ocxo2_dac")
+        boot_dac1, boot_dac2, boot_dac_source = _configured_boot_dacs(cfg)
         if boot_dac1 is not None or boot_dac2 is not None:
             dac_args: Dict[str, Any] = {}
             if boot_dac1 is not None:
@@ -2717,11 +3063,11 @@ def run() -> None:
                 machine="TEENSY", subsystem="CLOCKS", command="SET_DAC", args=dac_args,
             )
             logging.info(
-                "🔧 [clocks] boot DAC push: ocxo1=%s ocxo2=%s resp=%s",
-                boot_dac1, boot_dac2, resp.get("message", "?"),
+                "🔧 [clocks] boot DAC push (%s): ocxo1=%s ocxo2=%s resp=%s",
+                boot_dac_source, boot_dac1, boot_dac2, resp.get("message", "?"),
             )
         else:
-            logging.info("🔧 [clocks] no calibrated DAC values in SYSTEM config — Teensy keeps defaults")
+            logging.info("🔧 [clocks] no DAC defaults or baseline DAC values in SYSTEM config — Teensy keeps defaults")
     except Exception:
         logging.exception("⚠️ [clocks] boot control-state push failed (Teensy keeps defaults)")
 
