@@ -60,7 +60,7 @@
 //
 //   The VCLOCK cadence is PPS-anchored.  On the first physical PPS
 //   edge after a rebootstrap request, the GPIO ISR captures the
-//   QTimer1 CH0+CH1 32-bit count and the QTimer1 CH3 16-bit count
+//   QTimer1 CH0 low-word count and the QTimer1 CH3 16-bit count
 //   immediately after the DWT capture, then re-programs CH3's
 //   compare target to fire exactly VCLOCK_INTERVAL_COUNTS ticks later
 //   — aligning the VCLOCK cadence with the PPS moment.  From that
@@ -95,6 +95,8 @@
 //
 //   Cadence sources:
 //     VCLOCK : QTimer1 CH3 compare, +10000 counts/interval (GNSS 10 MHz)
+//              QTimer1 CH0 is the low-word VCLOCK counter; CH1 is a hosted
+//              VCLOCK-domain compare rail owned by process_interrupt.
 //     OCXO1  : QTimer3 CH2 compare, +10000 counts/interval (OCXO1 10 MHz)
 //     OCXO2  : QTimer3 CH3 compare, +10000 counts/interval (OCXO2 10 MHz)
 // ============================================================================
@@ -134,6 +136,7 @@ enum class interrupt_provider_kind_t : uint8_t {
 
 enum class interrupt_lane_t : uint8_t {
   NONE = 0,
+  QTIMER1_CH1_COMP,
   QTIMER1_CH2_COMP,
   QTIMER1_CH3_COMP,
   QTIMER3_CH2_COMP,
@@ -260,22 +263,9 @@ static constexpr int32_t DWT_PPS_COINCIDENCE_THRESHOLD_CYCLES = 10000;
 // VCLOCK epoch tick offset (alpha-side correction)
 // ============================================================================
 //
-// Compensation for peripheral-bus-read quantization during epoch
-// establishment.  When the PPS GPIO ISR captures the 32-bit VCLOCK
-// cascade counter, the read completes ~140 CPU cycles (~138 ns) after
-// the true PPS edge.  During that window the VCLOCK counter (10 MHz)
-// has ticked once, so the counter value we read is the tick AFTER the
-// PPS-corresponding tick.
-//
-// The correction is applied by alpha when it installs its epoch from
-// the PPS_VCLOCK snapshot.  process_interrupt's PPS_VCLOCK store
-// publishes the counter as read; alpha adjusts.  This split keeps the
-// canonical authority for "which counter tick corresponds to PPS"
-// inside alpha while leaving the ISR-side store as a record of facts.
-//
-// Tunable: if live measurements show residuals shifting by more than
-// expected after a code change, adjust this value (plausible range:
-// -2 to 0).
+// Retired compatibility constant from the former hardware-cascade epoch
+// correction path.  process_interrupt now publishes a private synthetic
+// VCLOCK counter32 identity; alpha consumes that identity verbatim.
 static constexpr int32_t VCLOCK_EPOCH_TICK_OFFSET = -2;
 
 // ============================================================================
@@ -292,8 +282,8 @@ struct pps_t {
   // instruction _raw capture.  Represents the electrical PPS moment.
   uint32_t dwt_at_edge       = 0;
 
-  // VCLOCK 32-bit count and CH3 16-bit count read in the PPS GPIO ISR.
-  // These are the physical-edge facts as the QTimer1 cascade saw them.
+  // process_interrupt-authored synthetic VCLOCK counter32 identity and
+  // QTimer1 low-word phase observed in the PPS GPIO ISR.
   uint32_t counter32_at_edge = 0;
   uint16_t ch3_at_edge       = 0;
 };
@@ -318,8 +308,8 @@ struct pps_vclock_t {
   // (CANONICAL_VCLOCK_EPOCH_MINUS_RAW_PPS_ISR_CYCLES).
   uint32_t dwt_at_edge       = 0;
 
-  // VCLOCK counter identity of the canonical edge.  In the current
-  // build this equals counter32 as read by the ISR (with offset 0).
+  // process_interrupt-authored synthetic VCLOCK counter identity of the
+  // canonical edge.
   uint32_t counter32_at_edge = 0;
   uint16_t ch3_at_edge       = 0;
 
@@ -459,7 +449,7 @@ bool interrupt_stop(interrupt_subscriber_kind_t kind);
 //     aligning the VCLOCK cadence with the PPS moment.
 //   • Reset tick_mod_1000 to 0 so the first post-anchor one-second event
 //     fires exactly VCLOCK_COUNTS_PER_SECOND ticks after PPS.
-//   • Seed logical_count32 from pvc.counter32_at_edge.
+//   • Seed the private synthetic VCLOCK counter32 from pvc.counter32_at_edge.
 //   • Clear the rebootstrap pending flag.
 void interrupt_request_pps_rebootstrap(void);
 bool interrupt_pps_rebootstrap_pending(void);
@@ -489,6 +479,36 @@ pps_vclock_t interrupt_last_pps_vclock(void);
 // store.  Kept for back-compat with alpha; new code should prefer the
 // typed accessors above.
 pps_edge_snapshot_t interrupt_last_pps_edge(void);
+
+// ============================================================================
+// QTimer1 CH1 compare service — hosted hardware rail for process_witness
+// ============================================================================
+//
+// CH1 is a VCLOCK-domain compare rail owned by process_interrupt. Clients do
+// not touch QTimer1 registers. A client registers a single IRQ-context handler
+// and asks process_interrupt to arm a synthetic 32-bit VCLOCK target.
+// process_interrupt advances any required 16-bit compare hops internally and
+// invokes the handler only at the requested target event.
+
+struct interrupt_qtimer1_ch1_compare_event_t {
+  uint32_t sequence = 0;
+  uint32_t target_counter32 = 0;
+  uint32_t counter32_at_event = 0;
+  int32_t  counter32_residual_ticks = 0;
+  uint32_t dwt_at_event = 0;
+  int64_t  gnss_ns_at_event = -1;
+};
+
+using interrupt_qtimer1_ch1_handler_fn =
+    void (*)(const interrupt_qtimer1_ch1_compare_event_t& event);
+
+void interrupt_register_qtimer1_ch1_handler(interrupt_qtimer1_ch1_handler_fn cb);
+bool interrupt_qtimer1_ch1_arm_compare(uint32_t target_counter32);
+void interrupt_qtimer1_ch1_disable_compare(void);
+
+uint16_t interrupt_qtimer1_ch1_counter_now(void);
+uint16_t interrupt_qtimer1_ch1_comp1_now(void);
+uint16_t interrupt_qtimer1_ch1_csctrl_now(void);
 
 // ============================================================================
 // QTimer1 CH2 IRQ-context handler — TimePop scheduler heartbeat

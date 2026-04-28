@@ -164,8 +164,12 @@ static welford_t g_qtimer_welford = {};
 // value for the DWT captured at the compare ISR.
 
 static constexpr uint8_t  BRIDGE_SLOT_INDEX = 5;
-static constexpr uint64_t BRIDGE_SLOT_OFFSET_NS = 500000000ULL;
-static constexpr uint32_t BRIDGE_VCLOCK_TICKS_PER_SLOT = 1000000U;
+// Deliberately not exactly 500 ms: avoiding exact millisecond phase prevents
+// CH1 BRIDGE from colliding with the production CH3 1 kHz cadence in the
+// shared QTimer1 vector.
+static constexpr uint32_t BRIDGE_SLOT_OFFSET_TICKS = 5000123U;
+static constexpr uint64_t BRIDGE_SLOT_OFFSET_NS =
+    (uint64_t)BRIDGE_SLOT_OFFSET_TICKS * 100ULL;
 
 struct bridge_capture_t {
   uint32_t seq = 0;
@@ -198,8 +202,12 @@ struct bridge_capture_t {
 static bridge_capture_t g_bridge_last = {};
 static volatile uint32_t g_bridge_capture_seq = 0;
 static volatile uint64_t g_bridge_fires_total = 0;
+static volatile uint64_t g_bridge_arm_count = 0;
+static volatile uint64_t g_bridge_arm_failures = 0;
 static volatile uint64_t g_bridge_skipped_no_anchor = 0;
 static volatile uint64_t g_bridge_skipped_no_dynamic_cps = 0;
+static volatile uint32_t g_bridge_last_armed_target_counter32 = 0;
+static volatile bool g_bridge_armed = false;
 static welford_t g_bridge_residual_welford = {};
 static welford_t g_bridge_dynamic_residual_welford = {};
 
@@ -215,7 +223,8 @@ static void gpio_low_callback(timepop_ctx_t*, timepop_diag_t*, void*);
 static void qtimer_high_callback(timepop_ctx_t*, timepop_diag_t*, void*);
 static void qtimer_low_callback(timepop_ctx_t*, timepop_diag_t*, void*);
 static void witness_cycle_callback(timepop_ctx_t*, timepop_diag_t*, void*);
-static void bridge_callback(timepop_ctx_t*, timepop_diag_t*, void*);
+static void bridge_ch1_handler(const interrupt_qtimer1_ch1_compare_event_t& event);
+static bool bridge_arm_next_sample(void);
 static void qtimer2_arm_next_edge(void);
 
 // ============================================================================
@@ -405,6 +414,9 @@ static void witness_cycle_callback(timepop_ctx_t*, timepop_diag_t*, void*) {
   g_witness_cycle_reschedules = 0;
 
   witness_arm_cycle_edges();
+  if (!g_bridge_armed) {
+    (void)bridge_arm_next_sample();
+  }
 }
 
 static void witness_schedule_first_test(void) {
@@ -419,12 +431,7 @@ static void witness_schedule_first_test(void) {
               nullptr,
               WITNESS_CYCLE_NAME);
 
-  timepop_cancel_by_name("WITNESS_BRIDGE");
-  timepop_arm(BRIDGE_SLOT_OFFSET_NS,
-              true,
-              bridge_callback,
-              nullptr,
-              "WITNESS_BRIDGE");
+  (void)bridge_arm_next_sample();
 
   g_witness_schedule_armed = true;
 
@@ -474,28 +481,53 @@ static Payload ns_welford_payload(const welford_t& w) {
   return p;
 }
 
-static void bridge_capture(timepop_ctx_t* ctx, timepop_diag_t* diag) {
-  if (!ctx) return;
+static bool bridge_arm_next_sample(void) {
+  const pps_vclock_t pvc = interrupt_last_pps_vclock();
+  if (pvc.sequence == 0 || pvc.gnss_ns_at_edge < 0) {
+    g_bridge_skipped_no_anchor++;
+    return false;
+  }
 
+  uint32_t target_counter32 = pvc.counter32_at_edge + BRIDGE_SLOT_OFFSET_TICKS;
+
+  // If this second's sample has already passed, target the same offset in the
+  // next VCLOCK second.  This uses synthetic counter arithmetic only; no
+  // direct QTimer1 register read occurs in process_witness.
+  const uint32_t now = interrupt_vclock_counter32_observe_ambient();
+  if ((int32_t)(target_counter32 - now) <= 1000) {
+    target_counter32 += 10000000U;
+  }
+
+  g_bridge_last_armed_target_counter32 = target_counter32;
+  g_bridge_arm_count++;
+
+  if (!interrupt_qtimer1_ch1_arm_compare(target_counter32)) {
+    g_bridge_armed = false;
+    g_bridge_arm_failures++;
+    return false;
+  }
+
+  g_bridge_armed = true;
+  return true;
+}
+
+static void bridge_capture(const interrupt_qtimer1_ch1_compare_event_t& event) {
   const pps_vclock_t pvc = interrupt_last_pps_vclock();
   if (pvc.sequence == 0 || pvc.gnss_ns_at_edge < 0) {
     g_bridge_skipped_no_anchor++;
     return;
   }
 
-  const uint32_t qtimer_event_dwt =
-      (diag && diag->dwt_at_fire != 0) ? diag->dwt_at_fire : ctx->fire_dwt_cyccnt;
-  const uint32_t authored_counter32 = ctx->fire_vclock_raw;
+  const uint32_t qtimer_event_dwt = event.dwt_at_event;
+  const uint32_t authored_counter32 = event.counter32_at_event;
 
   const uint32_t dynamic_cps = interrupt_dynamic_cps();
   if (dynamic_cps == 0) {
     g_bridge_skipped_no_dynamic_cps++;
   }
 
-  const uint32_t target_counter32 =
-      pvc.counter32_at_edge + (uint32_t)BRIDGE_SLOT_INDEX * BRIDGE_VCLOCK_TICKS_PER_SLOT;
-  const int32_t counter32_residual_ticks =
-      (int32_t)(authored_counter32 - target_counter32);
+  const uint32_t target_counter32 = event.target_counter32;
+  const int32_t counter32_residual_ticks = event.counter32_residual_ticks;
 
   const uint32_t vclock_ticks_since_anchor = authored_counter32 - pvc.counter32_at_edge;
   const int64_t gnss_from_vclock_ns =
@@ -543,16 +575,26 @@ static void bridge_capture(timepop_ctx_t* ctx, timepop_diag_t* diag) {
   }
 }
 
-static void bridge_callback(timepop_ctx_t* ctx, timepop_diag_t* diag, void*) {
-  bridge_capture(ctx, diag);
+static void bridge_ch1_handler(const interrupt_qtimer1_ch1_compare_event_t& event) {
+  g_bridge_armed = false;
+  bridge_capture(event);
+  (void)bridge_arm_next_sample();
 }
 
 static Payload cmd_bridge(const Payload&) {
+  if (!g_bridge_armed && g_witness_runtime_ready) {
+    (void)bridge_arm_next_sample();
+  }
+
   Payload p;
   p.add("model", "DWT_GNSS_BRIDGE_VS_VCLOCK_TRUTH");
   p.add("slot_index", (uint32_t)BRIDGE_SLOT_INDEX);
   p.add("offset_ns", BRIDGE_SLOT_OFFSET_NS);
   p.add("fires_total", (uint32_t)g_bridge_fires_total);
+  p.add("arm_count", (uint32_t)g_bridge_arm_count);
+  p.add("armed", g_bridge_armed);
+  p.add("arm_failures", (uint32_t)g_bridge_arm_failures);
+  p.add("last_armed_target_counter32", g_bridge_last_armed_target_counter32);
   p.add("skipped_no_anchor", (uint32_t)g_bridge_skipped_no_anchor);
   p.add("skipped_no_dynamic_cps", (uint32_t)g_bridge_skipped_no_dynamic_cps);
 
@@ -768,6 +810,19 @@ void process_witness_init(void) {
   welford_reset(g_gpio_welford);
   welford_reset(g_qtimer_welford);
 
+  g_bridge_last = bridge_capture_t{};
+  g_bridge_capture_seq = 0;
+  g_bridge_fires_total = 0;
+  g_bridge_arm_count = 0;
+  g_bridge_arm_failures = 0;
+  g_bridge_skipped_no_anchor = 0;
+  g_bridge_skipped_no_dynamic_cps = 0;
+  g_bridge_last_armed_target_counter32 = 0;
+  g_bridge_armed = false;
+  welford_reset(g_bridge_residual_welford);
+  welford_reset(g_bridge_dynamic_residual_welford);
+
+  interrupt_register_qtimer1_ch1_handler(bridge_ch1_handler);
 
   digitalWriteFast(WITNESS_STIMULUS_PIN, LOW);
 

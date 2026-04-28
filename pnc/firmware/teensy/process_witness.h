@@ -13,15 +13,18 @@
 //
 // Current command surface:
 //   .tw witness edge         (PPS/PPS_VCLOCK heartbeat + last edge facts)
+//   .tw witness bridge       (DWT/GNSS bridge check using interrupt-owned QTimer1 CH1)
 //   .tw witness round_trip   (local stimulate-through-ISR latency)
 //
-// process_witness owns:
+// process_witness owns the local round-trip hardware:
 //   • stimulus pin 24
 //   • GPIO sink pin 26
 //   • QTimer2 CH0 on pin 13
 //   • IRQ_QTIMER2
 //
-// process_interrupt does not own or observe this hardware.
+// BRIDGE does not touch QTimer1 registers.  It registers as a hosted client
+// of process_interrupt's QTimer1 CH1 compare service and receives already-
+// authored event facts from process_interrupt.
 //
 // ============================================================================
 

@@ -37,7 +37,9 @@
 //   TimePop: QTimer1 CH2, varied compare intervals (foreground scheduler)
 //
 // The PPS GPIO ISR captures DWT as its first instruction, then reads the
-// QTimer1 cascaded counter and CH3.  When a rebootstrap is pending, it
+// QTimer1 CH0 low-word counter.  process_interrupt maps that low-word
+// hardware observation into the private synthetic 32-bit VCLOCK identity.
+// When a rebootstrap is pending, it
 // reprograms CH3's compare to phase-lock the VCLOCK cadence to the PPS
 // moment.  After that, vclock_callback fires N seconds after PPS modulo
 // consistent ISR latency.
@@ -428,16 +430,16 @@ static ocxo_lane_t g_ocxo2_lane;
 static ocxo_lane_t* ocxo_lane_for(interrupt_subscriber_kind_t kind);
 
 // ============================================================================
-// QTimer1 32-bit counter (diagnostic read with torn-read protection)
+// QTimer1 CH0 low-word counter
 // ============================================================================
+//
+// CH0 is the only VCLOCK hardware counter used by process_interrupt now.
+// CH1 is deliberately not cascaded; it remains free for a future dedicated
+// VCLOCK-domain compare rail.  Any public 32-bit VCLOCK identity is synthetic
+// and authored below.
 
-static inline uint32_t qtimer1_read_32_for_diag(void) {
-  const uint16_t lo1 = IMXRT_TMR1.CH[0].CNTR;
-  const uint16_t hi1 = IMXRT_TMR1.CH[1].HOLD;
-  const uint16_t lo2 = IMXRT_TMR1.CH[0].CNTR;
-  const uint16_t hi2 = IMXRT_TMR1.CH[1].HOLD;
-  return (hi1 != hi2) ? (((uint32_t)hi2 << 16) | (uint32_t)lo2)
-                      : (((uint32_t)hi1 << 16) | (uint32_t)lo1);
+static inline uint16_t qtimer1_ch0_counter_now(void) {
+  return IMXRT_TMR1.CH[0].CNTR;
 }
 
 // ============================================================================
@@ -449,12 +451,12 @@ static inline uint32_t qtimer1_read_32_for_diag(void) {
 // counter32_at_event only in the interrupt event payload.  They do not read
 // timer hardware, and they do not author counter identities themselves.
 //
-// For VCLOCK, the synthetic identity is mapped to the underlying QTimer1
-// hardware counter by a single affine offset established at an exact edge.
-// This lets TimePop continue to schedule by synthetic deadlines while
-// process_interrupt alone translates those deadlines into hardware compare
-// values.  For OCXO lanes, the synthetic identity is advanced by the exact
-// 10 MHz tick interval of the process_interrupt-owned cadence.
+// For VCLOCK, the synthetic identity is mapped to QTimer1 CH0's 16-bit
+// hardware counter by a low-word anchor established at an exact edge.  CH1 is
+// no longer cascaded.  TimePop schedules by synthetic deadlines while
+// process_interrupt alone translates those deadlines into low-word hardware
+// compare values.  For OCXO lanes, the synthetic identity is advanced by the
+// exact 10 MHz tick interval of the process_interrupt-owned cadence.
 
 struct synthetic_clock32_t {
   bool     zeroed = false;
@@ -470,12 +472,24 @@ struct synthetic_clock32_t {
 };
 
 struct vclock_synthetic_clock32_t : synthetic_clock32_t {
-  uint32_t hardware_counter32_at_zero = 0;
+  uint16_t hardware_low16_at_zero = 0;
+  uint16_t hardware_low16_at_current = 0;
+  bool     hardware_anchor_valid = false;
+  uint32_t hardware_anchor_update_count = 0;
 };
 
 static vclock_synthetic_clock32_t g_vclock_clock32;
 static synthetic_clock32_t        g_ocxo1_clock32;
 static synthetic_clock32_t        g_ocxo2_clock32;
+
+static volatile uint32_t g_qtimer1_ch1_sequence = 0;
+static volatile uint32_t g_qtimer1_ch1_target_counter32 = 0;
+static volatile uint32_t g_qtimer1_ch1_next_compare_counter32 = 0;
+static volatile uint32_t g_qtimer1_ch1_arm_count = 0;
+static volatile uint32_t g_qtimer1_ch1_fire_count = 0;
+static volatile uint32_t g_qtimer1_ch1_hop_count = 0;
+static volatile bool     g_qtimer1_ch1_active = false;
+static volatile interrupt_qtimer1_ch1_handler_fn g_qtimer1_ch1_handler = nullptr;
 
 static volatile uint32_t g_qtimer1_ch2_last_target_counter32 = 0;
 static volatile uint32_t g_qtimer1_ch2_arm_count = 0;
@@ -503,32 +517,51 @@ static void synthetic_clock_zero(synthetic_clock32_t& c, uint64_t ns) {
   c.pending_zero = false;
 }
 
-static void vclock_clock_zero_at_hardware_counter(uint64_t ns,
-                                                  uint32_t hardware_counter32) {
+static void vclock_clock_anchor_hardware_low16(uint32_t synthetic_counter32,
+                                                 uint16_t hardware_low16) {
+  g_vclock_clock32.current_counter32 = synthetic_counter32;
+  g_vclock_clock32.hardware_low16_at_current = hardware_low16;
+  g_vclock_clock32.hardware_anchor_valid = true;
+  g_vclock_clock32.hardware_anchor_update_count++;
+}
+
+static void vclock_clock_zero_at_hardware_low16(uint64_t ns,
+                                                uint16_t hardware_low16) {
   g_vclock_clock32.zeroed = true;
   g_vclock_clock32.zero_ns = ns;
   g_vclock_clock32.zero_counter32 = clock32_from_ns(ns);
-  g_vclock_clock32.current_counter32 = g_vclock_clock32.zero_counter32;
-  g_vclock_clock32.hardware_counter32_at_zero = hardware_counter32;
+  g_vclock_clock32.hardware_low16_at_zero = hardware_low16;
   g_vclock_clock32.zero_count++;
   g_vclock_clock32.pending_zero = false;
+  vclock_clock_anchor_hardware_low16(g_vclock_clock32.zero_counter32,
+                                     hardware_low16);
 }
 
-static uint32_t vclock_synthetic_from_hardware(uint32_t hardware_counter32) {
-  if (!g_vclock_clock32.zeroed) return hardware_counter32;
+static uint32_t vclock_synthetic_from_hardware_low16(uint16_t hardware_low16) {
+  if (!g_vclock_clock32.zeroed) return (uint32_t)hardware_low16;
+
+  if (g_vclock_clock32.hardware_anchor_valid) {
+    return g_vclock_clock32.current_counter32 +
+           (uint32_t)((uint16_t)(hardware_low16 -
+                                g_vclock_clock32.hardware_low16_at_current));
+  }
+
   return g_vclock_clock32.zero_counter32 +
-         (uint32_t)(hardware_counter32 - g_vclock_clock32.hardware_counter32_at_zero);
+         (uint32_t)((uint16_t)(hardware_low16 -
+                              g_vclock_clock32.hardware_low16_at_zero));
 }
 
-static uint32_t vclock_hardware_from_synthetic(uint32_t synthetic_counter32) {
-  if (!g_vclock_clock32.zeroed) return synthetic_counter32;
-  return g_vclock_clock32.hardware_counter32_at_zero +
-         (uint32_t)(synthetic_counter32 - g_vclock_clock32.zero_counter32);
+static uint16_t vclock_hardware_low16_from_synthetic(uint32_t synthetic_counter32) {
+  if (!g_vclock_clock32.zeroed) return (uint16_t)(synthetic_counter32 & 0xFFFFU);
+
+  return (uint16_t)(g_vclock_clock32.hardware_low16_at_zero +
+                   (uint16_t)(synthetic_counter32 -
+                              g_vclock_clock32.zero_counter32));
 }
 
 bool interrupt_clock32_zero_from_ns(interrupt_subscriber_kind_t kind, uint64_t ns) {
   if (kind == interrupt_subscriber_kind_t::VCLOCK) {
-    vclock_clock_zero_at_hardware_counter(ns, qtimer1_read_32_for_diag());
+    vclock_clock_zero_at_hardware_low16(ns, qtimer1_ch0_counter_now());
     g_vclock_lane.logical_count32_at_last_second = g_vclock_clock32.current_counter32;
     return true;
   }
@@ -577,7 +610,7 @@ static inline uint32_t synthetic_clock_advance(synthetic_clock32_t& c,
   return c.current_counter32;
 }
 
-uint32_t interrupt_qtimer1_counter32_now(void)   { return vclock_synthetic_from_hardware(qtimer1_read_32_for_diag()); }
+uint32_t interrupt_qtimer1_counter32_now(void)   { return vclock_synthetic_from_hardware_low16(qtimer1_ch0_counter_now()); }
 uint16_t interrupt_qtimer3_ch2_counter_now(void) { return IMXRT_TMR3.CH[2].CNTR; }
 uint16_t interrupt_qtimer3_ch3_counter_now(void) { return IMXRT_TMR3.CH[3].CNTR; }
 
@@ -598,6 +631,23 @@ static inline void qtimer1_ch3_program_compare(uint16_t target_low16) {
 static inline void qtimer1_ch3_disable_compare(void) {
   IMXRT_TMR1.CH[3].CSCTRL &= ~TMR_CSCTRL_TCF1EN;
   qtimer1_ch3_clear_compare_flag();
+}
+
+static inline void qtimer1_ch1_clear_compare_flag(void) {
+  IMXRT_TMR1.CH[1].CSCTRL &= ~(TMR_CSCTRL_TCF1 | TMR_CSCTRL_TCF2);
+}
+
+static inline void qtimer1_ch1_program_compare(uint16_t target_low16) {
+  qtimer1_ch1_clear_compare_flag();
+  IMXRT_TMR1.CH[1].COMP1  = target_low16;
+  IMXRT_TMR1.CH[1].CMPLD1 = target_low16;
+  qtimer1_ch1_clear_compare_flag();
+  IMXRT_TMR1.CH[1].CSCTRL |= TMR_CSCTRL_TCF1EN;
+}
+
+static inline void qtimer1_ch1_disable_compare_hw(void) {
+  IMXRT_TMR1.CH[1].CSCTRL &= ~TMR_CSCTRL_TCF1EN;
+  qtimer1_ch1_clear_compare_flag();
 }
 
 static inline void qtimer1_ch2_clear_compare_flag(void) {
@@ -768,14 +818,17 @@ static void vclock_cadence_isr(uint32_t isr_entry_dwt_raw) {
     return;
   }
 
+  const uint16_t fired_low16 = g_vclock_lane.compare_target;
   vclock_lane_advance_compare();
   g_vclock_lane.cadence_hits_total++;
 
   // Synthetic VCLOCK identity advances in exact 10 MHz lockstep with the
-  // process_interrupt-owned CH3 cadence.  The one-second event below simply
-  // publishes the already-authored compact identity.
+  // process_interrupt-owned CH3 cadence.  The fired CH3 compare target is
+  // also the CH0 low-word identity at this cadence edge, so it becomes the
+  // latest low-word anchor for ambient synthetic observations.
   g_vclock_lane.logical_count32_at_last_second += VCLOCK_INTERVAL_COUNTS;
-  g_vclock_clock32.current_counter32 = g_vclock_lane.logical_count32_at_last_second;
+  vclock_clock_anchor_hardware_low16(g_vclock_lane.logical_count32_at_last_second,
+                                     fired_low16);
 
   const uint32_t cadence_tick_mod_1000 = g_vclock_lane.tick_mod_1000 + 1;
 
@@ -874,28 +927,125 @@ void interrupt_register_qtimer1_ch2_handler(interrupt_qtimer1_ch2_handler_fn cb)
 }
 
 // ============================================================================
+// QTimer1 CH1 compare service — hosted rail for process_witness
+// ============================================================================
+
+void interrupt_register_qtimer1_ch1_handler(interrupt_qtimer1_ch1_handler_fn cb) {
+  g_qtimer1_ch1_handler = cb;
+}
+
+static void qtimer1_ch1_schedule_next_hop(void) {
+  if (!g_qtimer1_ch1_active) return;
+
+  const uint32_t now = vclock_synthetic_from_hardware_low16(qtimer1_ch0_counter_now());
+  const uint32_t remaining = g_qtimer1_ch1_target_counter32 - now;
+
+  // If the target is behind us in modular time, stop rather than generating
+  // misleading event facts.  The caller can re-arm from a fresh PPS anchor.
+  if (remaining == 0 || remaining > 0x7FFFFFFFUL) {
+    g_qtimer1_ch1_active = false;
+    qtimer1_ch1_disable_compare_hw();
+    return;
+  }
+
+  static constexpr uint32_t CH1_MAX_COMPARE_STEP_TICKS = 49123U;
+
+  const uint32_t step =
+      (remaining > CH1_MAX_COMPARE_STEP_TICKS)
+          ? CH1_MAX_COMPARE_STEP_TICKS
+          : remaining;
+
+  g_qtimer1_ch1_next_compare_counter32 = now + step;
+
+  const uint16_t hardware_target =
+      vclock_hardware_low16_from_synthetic(g_qtimer1_ch1_next_compare_counter32);
+  qtimer1_ch1_program_compare(hardware_target);
+}
+
+bool interrupt_qtimer1_ch1_arm_compare(uint32_t target_counter32) {
+  if (!g_interrupt_hw_ready) return false;
+
+  g_qtimer1_ch1_target_counter32 = target_counter32;
+  g_qtimer1_ch1_active = true;
+  g_qtimer1_ch1_arm_count++;
+
+  qtimer1_ch1_schedule_next_hop();
+  return g_qtimer1_ch1_active;
+}
+
+void interrupt_qtimer1_ch1_disable_compare(void) {
+  g_qtimer1_ch1_active = false;
+  qtimer1_ch1_disable_compare_hw();
+}
+
+uint16_t interrupt_qtimer1_ch1_counter_now(void) { return IMXRT_TMR1.CH[1].CNTR; }
+uint16_t interrupt_qtimer1_ch1_comp1_now(void)   { return IMXRT_TMR1.CH[1].COMP1; }
+uint16_t interrupt_qtimer1_ch1_csctrl_now(void)  { return IMXRT_TMR1.CH[1].CSCTRL; }
+
+// ============================================================================
 // TimePop hardware service API
 // ============================================================================
 
 uint32_t interrupt_vclock_counter32_observe_ambient(void) {
-  return vclock_synthetic_from_hardware(qtimer1_read_32_for_diag());
+  return vclock_synthetic_from_hardware_low16(qtimer1_ch0_counter_now());
 }
 
 void interrupt_qtimer1_ch2_arm_compare(uint32_t target_counter32) {
   g_qtimer1_ch2_last_target_counter32 = target_counter32;
   g_qtimer1_ch2_arm_count++;
-  const uint32_t hardware_target = vclock_hardware_from_synthetic(target_counter32);
-  qtimer1_ch2_program_compare((uint16_t)(hardware_target & 0xFFFFU));
+  const uint16_t hardware_target = vclock_hardware_low16_from_synthetic(target_counter32);
+  qtimer1_ch2_program_compare(hardware_target);
 }
 
 uint16_t interrupt_qtimer1_ch2_counter_now(void) { return IMXRT_TMR1.CH[2].CNTR; }
 uint16_t interrupt_qtimer1_ch2_comp1_now(void)   { return IMXRT_TMR1.CH[2].COMP1; }
 uint16_t interrupt_qtimer1_ch2_csctrl_now(void)  { return IMXRT_TMR1.CH[2].CSCTRL; }
 
+static void qtimer1_ch1_bridge_isr(uint32_t isr_entry_dwt_raw) {
+  qtimer1_ch1_clear_compare_flag();
+
+  if (!g_qtimer1_ch1_active) {
+    qtimer1_ch1_disable_compare_hw();
+    return;
+  }
+
+  const uint32_t fired_counter32 = g_qtimer1_ch1_next_compare_counter32;
+
+  if (fired_counter32 != g_qtimer1_ch1_target_counter32) {
+    g_qtimer1_ch1_hop_count++;
+    qtimer1_ch1_schedule_next_hop();
+    return;
+  }
+
+  g_qtimer1_ch1_active = false;
+  qtimer1_ch1_disable_compare_hw();
+  g_qtimer1_ch1_fire_count++;
+
+  const uint32_t qtimer_event_dwt =
+      qtimer_event_dwt_from_isr_entry_raw(isr_entry_dwt_raw);
+  const int64_t gnss_ns = vclock_gnss_from_counter32(fired_counter32);
+
+  interrupt_qtimer1_ch1_compare_event_t event{};
+  event.sequence = ++g_qtimer1_ch1_sequence;
+  event.target_counter32 = g_qtimer1_ch1_target_counter32;
+  event.counter32_at_event = fired_counter32;
+  event.counter32_residual_ticks =
+      (int32_t)(fired_counter32 - g_qtimer1_ch1_target_counter32);
+  event.dwt_at_event = qtimer_event_dwt;
+  event.gnss_ns_at_event = gnss_ns;
+
+  if (g_qtimer1_ch1_handler) {
+    g_qtimer1_ch1_handler(event);
+  }
+}
+
 static void qtimer1_isr(void) {
   const uint32_t isr_entry_dwt_raw = ARM_DWT_CYCCNT;  // SACRED: first instruction.
 
-  if (IMXRT_TMR1.CH[2].CSCTRL & TMR_CSCTRL_TCF1) {
+  if (IMXRT_TMR1.CH[1].CSCTRL & TMR_CSCTRL_TCF1) {
+    qtimer1_ch1_bridge_isr(isr_entry_dwt_raw);
+  }
+  else if (IMXRT_TMR1.CH[2].CSCTRL & TMR_CSCTRL_TCF1) {
     qtimer1_ch2_clear_compare_flag();
     if (g_qtimer1_ch2_handler) {
       const uint32_t qtimer_event_dwt = qtimer_event_dwt_from_isr_entry_raw(isr_entry_dwt_raw);
@@ -925,8 +1075,9 @@ static void qtimer1_isr(void) {
       g_qtimer1_ch2_handler(event, diag);
     }
   }
-  // CH2 and CH3 are mutually exclusive per ISR invocation (NVIC re-dispatches
-  // for the other channel with a fresh first-instruction _raw capture).
+  // CH1/CH2/CH3 share one vector.  If multiple flags are pending, the
+  // unhandled flag remains set and NVIC re-dispatches with a fresh
+  // first-instruction _raw capture.
   else if (IMXRT_TMR1.CH[3].CSCTRL & TMR_CSCTRL_TCF1) {
     vclock_cadence_isr(isr_entry_dwt_raw);
   }
@@ -947,23 +1098,25 @@ static void pps_edge_dispatch_trampoline(timepop_ctx_t*, timepop_diag_t*, void*)
 }
 
 void process_interrupt_gpio6789_irq(uint32_t isr_entry_dwt_raw) {
-  // Read the VCLOCK hardware counter and CH3 right after _raw capture.  If a
-  // synthetic zero was requested, consume it at THIS captured edge so the
-  // compact 32-bit identity and the 64-bit GNSS ledger agree by construction.
-  const uint32_t hardware_counter32 = qtimer1_read_32_for_diag();
-  const uint16_t ch3_now = (uint16_t)(hardware_counter32 & 0xFFFF);
+  // Read the VCLOCK low-word counter right after _raw capture.  CH1 is no
+  // longer cascaded; the 32-bit VCLOCK identity below is synthetic and owned
+  // by process_interrupt.  If a synthetic zero was requested, consume it at
+  // THIS captured edge so the compact 32-bit identity and the 64-bit GNSS
+  // ledger agree by construction.
+  const uint16_t hardware_low16 = qtimer1_ch0_counter_now();
+  const uint16_t ch3_now = hardware_low16;
 
   uint64_t zero_ns_consumed = 0;
   bool zero_consumed = false;
   if (g_vclock_clock32.pending_zero) {
     zero_ns_consumed = g_vclock_clock32.pending_zero_ns;
-    vclock_clock_zero_at_hardware_counter(zero_ns_consumed, hardware_counter32);
+    vclock_clock_zero_at_hardware_low16(zero_ns_consumed, hardware_low16);
     zero_consumed = true;
     g_vclock_epoch_gnss_ns = (int64_t)zero_ns_consumed;
   }
 
   const uint32_t counter32 =
-      vclock_synthetic_from_hardware(hardware_counter32) +
+      vclock_synthetic_from_hardware_low16(hardware_low16) +
       (uint32_t)VCLOCK_EPOCH_COUNTER32_OFFSET_TICKS;
 
   g_gpio_irq_count++;
@@ -1004,7 +1157,7 @@ void process_interrupt_gpio6789_irq(uint32_t isr_entry_dwt_raw) {
     g_vclock_lane.compare_target =
         (uint16_t)(ch3_now + (uint16_t)VCLOCK_INTERVAL_COUNTS);
     g_vclock_lane.logical_count32_at_last_second = pvc.counter32_at_edge;
-    g_vclock_clock32.current_counter32 = pvc.counter32_at_edge;
+    vclock_clock_anchor_hardware_low16(pvc.counter32_at_edge, ch3_now);
     qtimer1_ch3_program_compare(g_vclock_lane.compare_target);
   }
 
@@ -1188,21 +1341,22 @@ static void qtimer1_init_vclock_base(void) {
   IMXRT_TMR1.CH[0].CMPLD1 = 0xFFFF;
   IMXRT_TMR1.CH[0].CTRL   = TMR_CTRL_CM(1) | TMR_CTRL_PCS(0);
 
+  // CH1 is an independent VCLOCK-domain compare rail hosted by
+  // process_interrupt for clients such as process_witness.  It is NOT a
+  // cascade high word.
   IMXRT_TMR1.CH[1].SCTRL  = 0;
   IMXRT_TMR1.CH[1].CSCTRL = 0;
   IMXRT_TMR1.CH[1].LOAD   = 0;
   IMXRT_TMR1.CH[1].CNTR   = 0;
   IMXRT_TMR1.CH[1].COMP1  = 0xFFFF;
   IMXRT_TMR1.CH[1].CMPLD1 = 0xFFFF;
-  IMXRT_TMR1.CH[1].CTRL   = TMR_CTRL_CM(7);
+  IMXRT_TMR1.CH[1].CTRL   = TMR_CTRL_CM(1) | TMR_CTRL_PCS(0);
+  qtimer1_ch1_disable_compare_hw();
 
   IMXRT_TMR1.CH[0].CSCTRL &= ~TMR_CSCTRL_TCF1EN;
   IMXRT_TMR1.CH[0].CSCTRL |=  TMR_CSCTRL_TCF1;
-  IMXRT_TMR1.CH[1].CSCTRL = 0;
-  IMXRT_TMR1.CH[1].SCTRL &= ~(TMR_SCTRL_TOFIE | TMR_SCTRL_IEF | TMR_SCTRL_IEFIE);
 
   (void)IMXRT_TMR1.CH[0].CNTR;
-  (void)IMXRT_TMR1.CH[1].HOLD;
 }
 
 static void qtimer1_init_ch2_scheduler(void) {
@@ -1267,8 +1421,8 @@ void process_interrupt_init_hardware(void) {
   g_ocxo2_lane.initialized = true;
 
   // QTimer1 synchronized channel start: ENBL=0 first, configure CH0/CH1/CH2/CH3
-  // fully, then a single ENBL=0xF write starts all four on the same VCLOCK
-  // edge — zero phase offset by construction.
+  // fully, then a single ENBL=0x0F write starts the active VCLOCK-domain
+  // channels on the same edge.  CH1 is an interrupt-owned hosted compare rail.
   IMXRT_TMR1.ENBL = 0;
   qtimer1_init_vclock_base();
   qtimer1_init_ch2_scheduler();
@@ -1311,6 +1465,14 @@ void process_interrupt_init(void) {
   g_vclock_clock32 = vclock_synthetic_clock32_t{};
   g_ocxo1_clock32 = synthetic_clock32_t{};
   g_ocxo2_clock32 = synthetic_clock32_t{};
+  g_qtimer1_ch1_sequence = 0;
+  g_qtimer1_ch1_target_counter32 = 0;
+  g_qtimer1_ch1_next_compare_counter32 = 0;
+  g_qtimer1_ch1_arm_count = 0;
+  g_qtimer1_ch1_fire_count = 0;
+  g_qtimer1_ch1_hop_count = 0;
+  g_qtimer1_ch1_active = false;
+  g_qtimer1_ch1_handler = nullptr;
   g_qtimer1_ch2_last_target_counter32 = 0;
   g_qtimer1_ch2_arm_count = 0;
 
@@ -1407,7 +1569,10 @@ static Payload cmd_report(const Payload&) {
   p.add("vclock_clock32_zero_ns", g_vclock_clock32.zero_ns);
   p.add("vclock_clock32_zero_counter32", g_vclock_clock32.zero_counter32);
   p.add("vclock_clock32_current", g_vclock_clock32.current_counter32);
-  p.add("vclock_clock32_hardware_at_zero", g_vclock_clock32.hardware_counter32_at_zero);
+  p.add("vclock_clock32_hardware_low16_at_zero", (uint32_t)g_vclock_clock32.hardware_low16_at_zero);
+  p.add("vclock_clock32_hardware_low16_at_current", (uint32_t)g_vclock_clock32.hardware_low16_at_current);
+  p.add("vclock_clock32_hardware_anchor_valid", g_vclock_clock32.hardware_anchor_valid);
+  p.add("vclock_clock32_hardware_anchor_update_count", g_vclock_clock32.hardware_anchor_update_count);
   p.add("vclock_clock32_pending_zero", g_vclock_clock32.pending_zero);
   p.add("vclock_clock32_zero_count", g_vclock_clock32.zero_count);
   p.add("vclock_clock32_pending_zero_count", g_vclock_clock32.pending_zero_count);
@@ -1426,6 +1591,13 @@ static Payload cmd_report(const Payload&) {
   p.add("ocxo2_clock32_pending_zero", g_ocxo2_clock32.pending_zero);
   p.add("ocxo2_clock32_zero_count", g_ocxo2_clock32.zero_count);
 
+  p.add("qtimer1_ch1_active", g_qtimer1_ch1_active);
+  p.add("qtimer1_ch1_sequence", g_qtimer1_ch1_sequence);
+  p.add("qtimer1_ch1_target_counter32", g_qtimer1_ch1_target_counter32);
+  p.add("qtimer1_ch1_next_compare_counter32", g_qtimer1_ch1_next_compare_counter32);
+  p.add("qtimer1_ch1_arm_count", g_qtimer1_ch1_arm_count);
+  p.add("qtimer1_ch1_fire_count", g_qtimer1_ch1_fire_count);
+  p.add("qtimer1_ch1_hop_count", g_qtimer1_ch1_hop_count);
   p.add("qtimer1_ch2_last_target_counter32", g_qtimer1_ch2_last_target_counter32);
   p.add("qtimer1_ch2_arm_count", g_qtimer1_ch2_arm_count);
 
@@ -1472,6 +1644,7 @@ const char* interrupt_provider_kind_str(interrupt_provider_kind_t provider) {
 
 const char* interrupt_lane_str(interrupt_lane_t lane) {
   switch (lane) {
+    case interrupt_lane_t::QTIMER1_CH1_COMP: return "QTIMER1_CH1_COMP";
     case interrupt_lane_t::QTIMER1_CH2_COMP: return "QTIMER1_CH2_COMP";
     case interrupt_lane_t::QTIMER1_CH3_COMP: return "QTIMER1_CH3_COMP";
     case interrupt_lane_t::QTIMER3_CH2_COMP: return "QTIMER3_CH2_COMP";
