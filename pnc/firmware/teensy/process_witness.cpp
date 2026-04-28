@@ -67,15 +67,6 @@ static constexpr const char* QTIMER_HIGH_NAME = "WITNESS_QTIMER_HIGH";
 static constexpr const char* QTIMER_LOW_NAME  = "WITNESS_QTIMER_LOW";
 static constexpr const char* WITNESS_CYCLE_NAME = "WITNESS_CYCLE";
 
-static constexpr uint16_t QTIMER2_CH0_ENBL_MASK = 0x0001;
-
-// These are report-only decodes.  The old working path did not enable or
-// clear SCTRL.TCF; it relied on CSCTRL.TCF1 / CSCTRL.TCF1EN.
-static constexpr uint16_t QTIMER_SCTRL_INPUT_MASK = 0x0100;
-static constexpr uint16_t QTIMER_SCTRL_IEF_MASK   = 0x0800;
-static constexpr uint16_t QTIMER_SCTRL_TCFIE_MASK = 0x4000;
-static constexpr uint16_t QTIMER_SCTRL_TCF_MASK   = 0x8000;
-
 // ============================================================================
 // Welford
 // ============================================================================
@@ -162,27 +153,6 @@ static welford_t g_source_welford = {};
 static welford_t g_gpio_welford = {};
 static welford_t g_qtimer_welford = {};
 
-// Selected QTimer2 CH0 register snapshots.
-struct qtimer2_snapshot_t {
-  uint16_t cntr   = 0;
-  uint16_t comp1  = 0;
-  uint16_t cmpld1 = 0;
-  uint16_t cmpld2 = 0;
-  uint16_t csctrl = 0;
-  uint16_t sctrl  = 0;
-  uint16_t ctrl   = 0;
-  uint16_t load   = 0;
-  uint16_t enbl   = 0;
-  uint16_t mux    = 0;
-  uint16_t select_input = 0;
-};
-
-static qtimer2_snapshot_t g_qtimer_last_before_arm = {};
-static qtimer2_snapshot_t g_qtimer_last_after_arm = {};
-static qtimer2_snapshot_t g_qtimer_last_source_high = {};
-static qtimer2_snapshot_t g_qtimer_last_source_low = {};
-static qtimer2_snapshot_t g_qtimer_last_irq_entry = {};
-
 // ============================================================================
 // Forward declarations
 // ============================================================================
@@ -196,44 +166,6 @@ static void qtimer_high_callback(timepop_ctx_t*, timepop_diag_t*, void*);
 static void qtimer_low_callback(timepop_ctx_t*, timepop_diag_t*, void*);
 static void witness_cycle_callback(timepop_ctx_t*, timepop_diag_t*, void*);
 static void qtimer2_arm_next_edge(void);
-
-// ============================================================================
-// Snapshot / payload helpers
-// ============================================================================
-
-static void qtimer2_capture_snapshot(qtimer2_snapshot_t& out) {
-  out.cntr   = IMXRT_TMR2.CH[0].CNTR;
-  out.comp1  = IMXRT_TMR2.CH[0].COMP1;
-  out.cmpld1 = IMXRT_TMR2.CH[0].CMPLD1;
-  out.cmpld2 = IMXRT_TMR2.CH[0].CMPLD2;
-  out.csctrl = IMXRT_TMR2.CH[0].CSCTRL;
-  out.sctrl  = IMXRT_TMR2.CH[0].SCTRL;
-  out.ctrl   = IMXRT_TMR2.CH[0].CTRL;
-  out.load   = IMXRT_TMR2.CH[0].LOAD;
-  out.enbl   = IMXRT_TMR2.ENBL;
-  out.mux    = (uint16_t)(*portConfigRegister(WITNESS_QTIMER_PIN));
-  out.select_input = (uint16_t)IOMUXC_QTIMER2_TIMER0_SELECT_INPUT;
-}
-
-static void qtimer2_snapshot_payload(Payload& p, const qtimer2_snapshot_t& s) {
-  p.add("cntr",   (uint32_t)s.cntr);
-  p.add("comp1",  (uint32_t)s.comp1);
-  p.add("cmpld1", (uint32_t)s.cmpld1);
-  p.add("cmpld2", (uint32_t)s.cmpld2);
-  p.add("csctrl", (uint32_t)s.csctrl);
-  p.add("csctrl_tcf1",   (s.csctrl & TMR_CSCTRL_TCF1) != 0);
-  p.add("csctrl_tcf1en", (s.csctrl & TMR_CSCTRL_TCF1EN) != 0);
-  p.add("sctrl",  (uint32_t)s.sctrl);
-  p.add("sctrl_input", (s.sctrl & QTIMER_SCTRL_INPUT_MASK) != 0);
-  p.add("sctrl_tcf",   (s.sctrl & QTIMER_SCTRL_TCF_MASK) != 0);
-  p.add("sctrl_tcfie", (s.sctrl & QTIMER_SCTRL_TCFIE_MASK) != 0);
-  p.add("sctrl_ief",   (s.sctrl & QTIMER_SCTRL_IEF_MASK) != 0);
-  p.add("ctrl",   (uint32_t)s.ctrl);
-  p.add("load",   (uint32_t)s.load);
-  p.add("enbl",   (uint32_t)s.enbl);
-  p.add("mux",    (uint32_t)s.mux);
-  p.add("select_input", (uint32_t)s.select_input);
-}
 
 // ============================================================================
 // QTimer2 CH0 helpers — intentionally old process_interrupt style
@@ -259,8 +191,6 @@ static inline void qtimer2_ch0_disable_compare(void) {
 }
 
 static void qtimer2_arm_next_edge(void) {
-  qtimer2_capture_snapshot(g_qtimer_last_before_arm);
-
   const uint16_t cntr = IMXRT_TMR2.CH[0].CNTR;
   const uint16_t target = (uint16_t)(cntr + 1);
 
@@ -268,7 +198,6 @@ static void qtimer2_arm_next_edge(void) {
   g_qtimer_arms++;
 
   qtimer2_ch0_program_compare(target);
-  qtimer2_capture_snapshot(g_qtimer_last_after_arm);
 }
 
 // ============================================================================
@@ -288,16 +217,12 @@ static void witness_drive_high(void) {
   g_source_high = true;
 
   welford_update(g_source_welford, (int32_t)g_source_stim_cycles);
-
-  qtimer2_capture_snapshot(g_qtimer_last_source_high);
 }
 
 static void witness_drive_low(void) {
   digitalWriteFast(WITNESS_STIMULUS_PIN, LOW);
   g_source_lows++;
   g_source_high = false;
-
-  qtimer2_capture_snapshot(g_qtimer_last_source_low);
 }
 
 // ============================================================================
@@ -328,7 +253,6 @@ static void qtimer2_isr(void) {
   const uint32_t isr_entry_dwt_raw = ARM_DWT_CYCCNT;
   g_qtimer_irq_entries++;
 
-  qtimer2_capture_snapshot(g_qtimer_last_irq_entry);
 
   if (!(IMXRT_TMR2.CH[0].CSCTRL & TMR_CSCTRL_TCF1)) {
     g_qtimer_no_flag++;
@@ -453,14 +377,6 @@ static void witness_schedule_first_test(void) {
   witness_arm_cycle_edges();
 }
 
-static const char* witness_window_str(witness_window_t w) {
-  switch (w) {
-    case witness_window_t::GPIO: return "GPIO";
-    case witness_window_t::QTIMER: return "QTIMER";
-    default: return "NONE";
-  }
-}
-
 // ============================================================================
 // Payload helpers
 // ============================================================================
@@ -567,95 +483,25 @@ static Payload cmd_round_trip(const Payload&) {
     witness_schedule_first_test();
   }
 
-  const uint32_t csctrl = (uint32_t)IMXRT_TMR2.CH[0].CSCTRL;
-  const uint32_t sctrl  = (uint32_t)IMXRT_TMR2.CH[0].SCTRL;
-
   Payload p;
-  p.add("model", "STABLE_QTIMER_RAIL_DETERMINISTIC_200_400_600_800");
-  p.add("hardware_ready", g_witness_hw_ready);
-  p.add("runtime_ready", g_witness_runtime_ready);
-  p.add("irqs_enabled", g_witness_irqs_enabled);
-  p.add("schedule_armed", g_witness_schedule_armed);
-  p.add("cycle_count", g_witness_cycle_count);
-  p.add("cycle_reschedules", g_witness_cycle_reschedules);
-  p.add("gpio_high_offset_ns", (uint32_t)GPIO_HIGH_OFFSET_NS);
-  p.add("gpio_low_offset_ns", (uint32_t)GPIO_LOW_OFFSET_NS);
-  p.add("qtimer_high_offset_ns", (uint32_t)QTIMER_HIGH_OFFSET_NS);
-  p.add("qtimer_low_offset_ns", (uint32_t)QTIMER_LOW_OFFSET_NS);
-  p.add("active_window", witness_window_str(g_active_window));
-  p.add("source_high", g_source_high);
+  p.add("model", "ROUND_TRIP_LATENCY_SUMMARY");
 
-  Payload source;
-  source.add("emits", g_source_emits);
-  source.add("lows", g_source_lows);
-  source.add("dwt_at_emit", g_source_dwt_at_emit);
-  source.add("dwt_before", g_source_dwt_before);
-  source.add("dwt_after", g_source_dwt_after);
-  source.add("last_stim_cycles", g_source_stim_cycles);
-  source.add("last_stim_ns", cycles_to_ns((double)g_source_stim_cycles));
-  source.add_object("welford", welford_payload(g_source_welford));
-  p.add_object("source", source);
+  Payload stimulate;
+  stimulate.add("last_cycles", g_source_stim_cycles);
+  stimulate.add("last_ns", cycles_to_ns((double)g_source_stim_cycles));
+  stimulate.add_object("welford", welford_payload(g_source_welford));
+  p.add_object("stimulate", stimulate);
 
   Payload gpio;
-  gpio.add("hits", g_gpio_hits);
-  gpio.add("last_dwt_at_isr", g_gpio_dwt_at_isr);
-  gpio.add("last_delta_cycles", g_gpio_delta_cycles);
-  gpio.add("last_delta_ns", cycles_to_ns((double)g_gpio_delta_cycles));
-  gpio.add("wrong_window", g_gpio_wrong_window);
+  gpio.add("last_cycles", g_gpio_delta_cycles);
+  gpio.add("last_ns", cycles_to_ns((double)g_gpio_delta_cycles));
   gpio.add_object("welford", welford_payload(g_gpio_welford));
   p.add_object("gpio", gpio);
 
   Payload qtimer;
-  qtimer.add("hits", g_qtimer_hits);
-  qtimer.add("irq_entries", g_qtimer_irq_entries);
-  qtimer.add("no_flag", g_qtimer_no_flag);
-  qtimer.add("outside_window", g_qtimer_outside_window);
-  qtimer.add("arms", g_qtimer_arms);
-  qtimer.add("last_dwt_at_isr", g_qtimer_dwt_at_isr);
-  qtimer.add("last_delta_cycles", g_qtimer_delta_cycles);
-  qtimer.add("last_delta_ns", cycles_to_ns((double)g_qtimer_delta_cycles));
-  qtimer.add("compare_target", (uint32_t)g_qtimer_compare_target);
+  qtimer.add("last_cycles", g_qtimer_delta_cycles);
+  qtimer.add("last_ns", cycles_to_ns((double)g_qtimer_delta_cycles));
   qtimer.add_object("welford", welford_payload(g_qtimer_welford));
-
-  Payload registers;
-  registers.add("cntr", (uint32_t)IMXRT_TMR2.CH[0].CNTR);
-  registers.add("comp1", (uint32_t)IMXRT_TMR2.CH[0].COMP1);
-  registers.add("cmpld1", (uint32_t)IMXRT_TMR2.CH[0].CMPLD1);
-  registers.add("cmpld2", (uint32_t)IMXRT_TMR2.CH[0].CMPLD2);
-  registers.add("csctrl", csctrl);
-  registers.add("csctrl_tcf1", (csctrl & TMR_CSCTRL_TCF1) != 0);
-  registers.add("csctrl_tcf1en", (csctrl & TMR_CSCTRL_TCF1EN) != 0);
-  registers.add("ctrl", (uint32_t)IMXRT_TMR2.CH[0].CTRL);
-  registers.add("sctrl", sctrl);
-  registers.add("sctrl_input", (sctrl & QTIMER_SCTRL_INPUT_MASK) != 0);
-  registers.add("sctrl_tcf",   (sctrl & QTIMER_SCTRL_TCF_MASK) != 0);
-  registers.add("sctrl_tcfie", (sctrl & QTIMER_SCTRL_TCFIE_MASK) != 0);
-  registers.add("sctrl_ief",   (sctrl & QTIMER_SCTRL_IEF_MASK) != 0);
-  registers.add("enbl", (uint32_t)IMXRT_TMR2.ENBL);
-  registers.add("select_input", (uint32_t)IOMUXC_QTIMER2_TIMER0_SELECT_INPUT);
-  registers.add("mux", (uint32_t)*portConfigRegister(WITNESS_QTIMER_PIN));
-  qtimer.add_object("registers", registers);
-
-  Payload before_arm;
-  qtimer2_snapshot_payload(before_arm, g_qtimer_last_before_arm);
-  qtimer.add_object("before_arm", before_arm);
-
-  Payload after_arm;
-  qtimer2_snapshot_payload(after_arm, g_qtimer_last_after_arm);
-  qtimer.add_object("after_arm", after_arm);
-
-  Payload source_high_snap;
-  qtimer2_snapshot_payload(source_high_snap, g_qtimer_last_source_high);
-  qtimer.add_object("source_high", source_high_snap);
-
-  Payload source_low_snap;
-  qtimer2_snapshot_payload(source_low_snap, g_qtimer_last_source_low);
-  qtimer.add_object("source_low", source_low_snap);
-
-  Payload irq_entry;
-  qtimer2_snapshot_payload(irq_entry, g_qtimer_last_irq_entry);
-  qtimer.add_object("irq_entry", irq_entry);
-
   p.add_object("qtimer", qtimer);
 
   return p;
@@ -730,11 +576,6 @@ void process_witness_init(void) {
   welford_reset(g_gpio_welford);
   welford_reset(g_qtimer_welford);
 
-  g_qtimer_last_before_arm = qtimer2_snapshot_t{};
-  g_qtimer_last_after_arm = qtimer2_snapshot_t{};
-  g_qtimer_last_source_high = qtimer2_snapshot_t{};
-  g_qtimer_last_source_low = qtimer2_snapshot_t{};
-  g_qtimer_last_irq_entry = qtimer2_snapshot_t{};
 
   digitalWriteFast(WITNESS_STIMULUS_PIN, LOW);
 

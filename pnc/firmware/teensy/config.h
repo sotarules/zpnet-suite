@@ -315,8 +315,8 @@ static constexpr uint32_t TICKS_PER_SECOND_EVENT = 1000U;
 
 static constexpr uint32_t WITNESS_STIMULATE_LATENCY = 5;
 
-static constexpr uint32_t GPIO_TOTAL_LATENCY = 69;
-static constexpr uint32_t QTIMER_TOTAL_LATENCY = 53;
+static constexpr uint32_t GPIO_TOTAL_LATENCY = 63;
+static constexpr uint32_t QTIMER_TOTAL_LATENCY = 47;
 
 // Cost to read ARM_DWT_CYCCNT and store the 32-bit value into memory.
 // This is measurement overhead, not external interrupt-path latency.
