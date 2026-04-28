@@ -7,10 +7,8 @@
 // TimePop owns:
 //   • priority-queue slot scheduling
 //   • absolute recurring series
-//   • Spin-Dry early-wake / landing for VCLOCK scheduling
 //   • deferred callback dispatch
 //   • instrumentation / reports
-//   • always-on internal VCLOCK monitor
 //   • scheduler policy for QTimer1 CH2 compare deadlines
 //
 // TimePop does not own:

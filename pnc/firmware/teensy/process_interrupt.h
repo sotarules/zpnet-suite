@@ -7,7 +7,7 @@
 //   • OCXO lanes    (QTimer3 vector — CH2, CH3)
 //   • VCLOCK lane   (QTimer1 vector — CH3)
 //   • TimePop       (QTimer1 vector — CH2, hosted client)
-//   • PPS GPIO edge (witness + dispatch authority + epoch anchor)
+//   • PPS GPIO edge (diagnostics + dispatch authority + epoch anchor)
 //
 // QTimer1 vector custody:
 //
@@ -69,7 +69,7 @@
 //
 // ─── PPS GPIO edge — three roles ────────────────────────────────────────────
 //
-//     1. DIAGNOSTIC WITNESS.  Every edge populates a seqlock-protected
+//     1. DIAGNOSTIC SNAPSHOT.  Every edge populates a seqlock-protected
 //        store with PPS facts and PPS_VCLOCK facts.  Consumers read
 //        via interrupt_last_pps(), interrupt_last_pps_vclock(), or
 //        the legacy interrupt_last_pps_edge().
@@ -217,7 +217,7 @@ struct interrupt_capture_diag_t {
   uint64_t gnss_ns_at_event   = 0;
   uint32_t counter32_at_event = 0;
 
-  // PPS GPIO witness fields, populated only on the VCLOCK diag.
+  // PPS GPIO audit fields, populated only on the VCLOCK diag.
   //
   // pps_edge_dwt_isr_entry_raw is a transitional field name that
   // carries pvc.dwt_at_edge (event-coordinate, NOT _raw).  The name is
@@ -393,7 +393,7 @@ struct pps_edge_snapshot_t {
 // ============================================================================
 //
 // Report-only heartbeat counters owned by the PPS GPIO ISR.  These are not
-// timing authorities; they let process_witness publish EDGE without owning
+// timing authorities; they let the EDGE report publish without owning
 // or duplicating PPS/PPS_VCLOCK authorship.
 
 struct interrupt_pps_edge_heartbeat_t {
@@ -430,7 +430,7 @@ struct interrupt_subscription_t {
 // in the GPIO ISR.  The registered callback's responsibilities:
 //
 //   1. If g_epoch_pending is true, install the epoch from snap.
-//   2. Stash witness fields into the TIMEBASE_FRAGMENT-bound diag.
+//   2. Stash audit fields into the TIMEBASE_FRAGMENT-bound diag.
 //   3. Call clocks_beta_pps() to publish the fragment.
 //
 // Will be replaced by a PPS_VCLOCK-typed dispatch when alpha migrates.
@@ -543,83 +543,6 @@ bool     interrupt_clock32_request_zero_from_ns(interrupt_subscriber_kind_t kind
 uint16_t interrupt_qtimer1_ch2_counter_now(void);
 uint16_t interrupt_qtimer1_ch2_comp1_now(void);
 uint16_t interrupt_qtimer1_ch2_csctrl_now(void);
-
-// ============================================================================
-// QTimer1 CH3 witness — torture-sanity test of timekeeping math
-// ============================================================================
-//
-// The witness fires on the production VCLOCK CH3 cadence at nine deliberately
-// PPS-avoiding sub-second slots (100 ms through 900 ms past the PPS_VCLOCK
-// anchor).  At each fire it asks: "what time does the bridge say it is, vs
-// what time does VCLOCK say it is?"  The VCLOCK answer is ground truth —
-// quantized to 100 ns, ends in "00".  The two bridge rails (time.cpp global
-// bridge, and process_interrupt's local dynamic bridge) are evaluated
-// against it.
-//
-// Witness is passive in the current build: production VCLOCK cadence is not
-// suspended.  interrupt_witness_arm_first_slot is retained as a stub for
-// API compatibility.
-
-enum class interrupt_witness_mode_t : uint8_t {
-  OFF = 0,
-  ON,
-};
-
-struct interrupt_witness_stats_t {
-  interrupt_witness_mode_t mode;
-  uint64_t n;
-  double   mean_ns;
-  double   stddev_ns;
-  double   stderr_ns;
-  int64_t  min_ns;
-  int64_t  max_ns;
-  uint64_t fires_total;
-  uint64_t fires_rejected;
-
-  // CH3-vs-CH0 phase-lag measurement (diagnostic).  Each tick = 100 ns.
-  uint64_t lag_n;
-  double   lag_mean_ticks;
-  double   lag_stddev_ticks;
-  int32_t  lag_min_ticks;
-  int32_t  lag_max_ticks;
-
-  // GPIO ISR peripheral-bus delay: DWT cycles between the ISR's first-
-  // instruction _raw capture and the counter read that populates
-  // pps.counter32_at_edge.
-  uint64_t gpio_counter_delay_n;
-  double   gpio_counter_delay_mean_cycles;
-  double   gpio_counter_delay_stddev_cycles;
-  int32_t  gpio_counter_delay_min_cycles;
-  int32_t  gpio_counter_delay_max_cycles;
-};
-
-void                     interrupt_witness_set_mode(interrupt_witness_mode_t mode);
-interrupt_witness_mode_t interrupt_witness_get_mode(void);
-
-// Stub retained for API compatibility.  Passive witness no longer arms CH3.
-void interrupt_witness_arm_first_slot(uint32_t anchor_counter32,
-                                      uint32_t anchor_dwt,
-                                      uint32_t anchor_dwt_raw,
-                                      uint32_t dwt_cycles_per_second);
-
-interrupt_witness_stats_t interrupt_witness_stats     (void);
-void                      interrupt_witness_reset_stats(void);
-
-// HW witness accessors (square-wave source + GPIO/QTimer sinks).
-uint32_t interrupt_hw_witness_gpio_delta_cycles            (void);
-uint32_t interrupt_hw_witness_qtimer_delta_cycles          (void);
-uint32_t interrupt_hw_witness_qtimer_cntr                  (void);
-uint32_t interrupt_hw_witness_qtimer_comp1                 (void);
-uint32_t interrupt_hw_witness_qtimer_csctrl                (void);
-uint32_t interrupt_hw_witness_qtimer_ctrl                  (void);
-uint32_t interrupt_hw_witness_qtimer_enbl                  (void);
-uint32_t interrupt_hw_witness_qtimer_mux                   (void);
-uint32_t interrupt_hw_witness_qtimer_select_input          (void);
-uint32_t interrupt_hw_witness_qtimer_source_reads          (void);
-uint32_t interrupt_hw_witness_qtimer_nonzero_cntr_observations(void);
-uint32_t interrupt_hw_witness_qtimer_cntr_change_hits      (void);
-uint32_t interrupt_hw_witness_qtimer_tcf1_seen_at_source   (void);
-uint32_t interrupt_hw_witness_qtimer_tcf1_seen_in_irq      (void);
 
 // ============================================================================
 // ISR entry points (invoked by vector shims)

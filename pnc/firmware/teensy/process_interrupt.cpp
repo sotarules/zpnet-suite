@@ -61,6 +61,12 @@
 // Constants
 // ============================================================================
 
+// The GPIO/QTimer latency constants are measured by the latency calibration
+// process as full software-stimulus-to-ISR paths.  process_interrupt needs the
+// event-coordinate ISR-entry correction, so subtract the known software pin
+// launch overhead from those totals.
+static constexpr uint32_t STIMULUS_LAUNCH_LATENCY_CYCLES = 5;
+
 // PPS_VCLOCK epoch selection: the canonical edge is the first VCLOCK edge
 // after the physical PPS pulse.  Counter32 offset is currently 0 because
 // the GPIO ISR's bus-delayed counter read is already that selected edge on
@@ -190,7 +196,7 @@ static int64_t vclock_gnss_from_counter32(uint32_t authored_counter32) {
 // truth and applies no further adjustment.
 
 static inline uint32_t pps_dwt_from_isr_entry_raw(uint32_t isr_entry_dwt_raw) {
-  return isr_entry_dwt_raw - (GPIO_TOTAL_LATENCY - WITNESS_STIMULATE_LATENCY);
+  return isr_entry_dwt_raw - (GPIO_TOTAL_LATENCY - STIMULUS_LAUNCH_LATENCY_CYCLES);
 }
 
 static inline uint32_t pps_vclock_dwt_from_pps_isr_entry_raw(uint32_t isr_entry_dwt_raw) {
@@ -198,7 +204,7 @@ static inline uint32_t pps_vclock_dwt_from_pps_isr_entry_raw(uint32_t isr_entry_
 }
 
 static inline uint32_t qtimer_event_dwt_from_isr_entry_raw(uint32_t isr_entry_dwt_raw) {
-  return isr_entry_dwt_raw - (QTIMER_TOTAL_LATENCY - WITNESS_STIMULATE_LATENCY);
+  return isr_entry_dwt_raw - (QTIMER_TOTAL_LATENCY - STIMULUS_LAUNCH_LATENCY_CYCLES);
 }
 
 // ============================================================================
