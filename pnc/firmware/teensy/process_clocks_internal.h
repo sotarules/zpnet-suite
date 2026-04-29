@@ -134,15 +134,6 @@ extern volatile uint64_t g_dwt_cycle_count_total;
 // Feeds dwt_effective_cycles_per_pps_vclock_second().
 extern volatile uint32_t g_dwt_cycles_between_pps_vclock;
 
-// Prediction residual (diagnostic).  Signed difference between the
-// current second's measured DWT cycles and the previous second's
-// measured cycles.  The time.cpp bridge's implicit one-step
-// predictor for second N is "rate[N] = rate[N-1]", so this IS the
-// measured - predicted error of that predictor.  Near zero in
-// steady state; reveals thermal drift rate and per-second anomalies.
-// Zero until two consecutive measurements exist since epoch install.
-extern volatile int32_t  g_dwt_prediction_residual_cycles;
-
 // process_interrupt-authored synthetic 32-bit VCLOCK identity of the most
 // recent canonical PPS/VCLOCK epoch (snap.counter32_at_edge).  This is the compact
 // clock identity selected by the physical PPS pulse; it is not an ambient

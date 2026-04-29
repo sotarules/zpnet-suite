@@ -16,6 +16,7 @@
 
 #include "process_interrupt.h"
 #include "process_clocks.h"
+#include "process_time.h"
 #include "process_events.h"
 #include "process_timepop.h"
 #include "process_laser.h"
@@ -379,6 +380,19 @@ void setup() {
   debug_log("boot", "process_witness_register");
   process_witness_register();
   debug_log("boot", "process_witness_register done");
+
+  // ----------------------------------------------------------
+  // Time process registration
+  // ----------------------------------------------------------
+
+  debug_log("boot", "process_time_init");
+  process_time_init();
+  debug_log("boot", "process_time_init done");
+
+
+  debug_log("boot", "process_time_register");
+  process_time_register();
+  debug_log("boot", "process_time_register done");
 
   // ----------------------------------------------------------
   // TimePop process registration

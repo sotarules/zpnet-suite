@@ -53,11 +53,6 @@ volatile uint32_t g_dwt_at_pps_vclock = 0;
 volatile uint64_t g_dwt_cycle_count_total = 0;
 volatile uint32_t g_dwt_cycles_between_pps_vclock = DWT_EXPECTED_PER_PPS;
 
-// Prediction residual (diagnostic): measured[N] - predicted[N], where
-// predicted[N] is simply dwt_between_pps[N-1].  Signed to preserve
-// direction of drift.  Zero when fewer than two measurements exist.
-volatile int32_t  g_dwt_prediction_residual_cycles = 0;
-
 volatile uint32_t g_counter32_at_pps_vclock = 0;
 volatile uint32_t g_last_vclock_event_counter32_at_event = 0;
 
@@ -104,28 +99,6 @@ static volatile uint32_t g_prev_dwt_at_vclock_event = 0;
 // the selected VCLOCK second boundaries.
 static volatile uint32_t g_prev_pps_vclock_dwt_at_edge = 0;
 static volatile bool     g_prev_pps_vclock_dwt_at_edge_valid = false;
-
-// ── Prediction residual state (pure diagnostic) ──
-//
-// Our implicit one-step predictor for second N's DWT cycle count is
-// "same as second N-1's measurement" — because that's the rate the
-// time.cpp bridge carries through second N (see anchor.dwt_cycles_per_s
-// in time_pps_vclock_update).  We publish the residual each PPS/VCLOCK edge:
-//
-//   dwt_prediction_residual_cycles = measured[N] - predicted[N]
-//                                  = dwt_between_pps[N] - dwt_between_pps[N-1]
-//
-// Sign convention: positive → this second had MORE cycles than the
-// previous second (crystal sped up since last edge).
-//
-// Diagnostic only.  Not consumed by any control path.  Expected
-// behavior: near zero in steady state; slow non-zero mean during
-// thermal settling; spikes reveal per-second anomalies.
-//
-// Requires TWO consecutive measurements before it's meaningful;
-// g_prev_dwt_between_pps_vclock_valid latches after second PPS/VCLOCK post-install.
-static volatile uint32_t g_prev_dwt_between_pps_vclock       = 0;
-static volatile bool     g_prev_dwt_between_pps_vclock_valid = false;
 
 // VCLOCK event counter — increments on every vclock_callback invocation
 // AFTER epoch install.  Read by pps_selector_callback to cross-check that no
@@ -317,9 +290,6 @@ static void alpha_reset_canonical_clock_state_for_new_epoch(void) {
   g_prev_dwt_at_vclock_event = 0;
   g_prev_pps_vclock_dwt_at_edge = 0;
   g_prev_pps_vclock_dwt_at_edge_valid = false;
-  g_prev_dwt_between_pps_vclock = 0;
-  g_prev_dwt_between_pps_vclock_valid = false;
-  g_dwt_prediction_residual_cycles = 0;
   g_vclock_event_count = 0;
 
   g_vclock_clock = {};
@@ -516,12 +486,6 @@ static void update_pps_vclock_bridge_anchor(const pps_edge_snapshot_t& snap) {
 
   const uint32_t dwt_between_pps = snap.dwt_at_edge - g_prev_pps_vclock_dwt_at_edge;
 
-  g_dwt_prediction_residual_cycles = g_prev_dwt_between_pps_vclock_valid
-      ? (int32_t)((int64_t)dwt_between_pps - (int64_t)g_prev_dwt_between_pps_vclock)
-      : 0;
-
-  g_prev_dwt_between_pps_vclock = dwt_between_pps;
-  g_prev_dwt_between_pps_vclock_valid = true;
   g_dwt_cycles_between_pps_vclock = dwt_between_pps;
   g_dwt_cycle_count_total += (uint64_t)dwt_between_pps;
   g_prev_pps_vclock_dwt_at_edge = snap.dwt_at_edge;

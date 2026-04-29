@@ -19,10 +19,13 @@
 //   DWT is the high-resolution local ruler used to interpolate between
 //   successive PPS/VCLOCK anchors.
 //
-// This module stores and serves the PPS/VCLOCK anchor.  It performs NO latency
-// adjustment.  Every DWT value passed in or returned is already an event
-// coordinate.  Raw ISR-entry DWT values must be normalized by the ISR owner
-// before reaching time.cpp.
+// process_time.cpp owns the anchor, interpolation state, and DWT next-second
+// prediction state.  This header remains the stable general interface for
+// ordinary consumers.
+//
+// This module performs NO latency adjustment.  Every DWT value passed in or
+// returned is already an event coordinate.  Raw ISR-entry DWT values must be
+// normalized by the ISR owner before reaching this interface.
 //
 // Returned GNSS nanoseconds are local zero-based campaign/epoch coordinates,
 // not wall-clock UTC.  The epoch may be restarted at boot, ZERO, START, or
@@ -51,6 +54,43 @@ struct time_anchor_snapshot_t {
 };
 
 // ============================================================================
+// DWT next-second prediction surface
+// ============================================================================
+//
+// Prediction doctrine:
+//   • The actual PPS/VCLOCK-to-PPS/VCLOCK DWT delta remains canonical.
+//   • The prediction is advisory and is judged after the next edge arrives.
+//   • The initial model is random-walk: next predicted cycles = last actual
+//     cycles.  Future predictors can replace this behind the same interface.
+//
+// A record describes one measured second.  `predicted_cycles` is the forecast
+// made before that second completed.  `actual_cycles` is the measured value
+// supplied by time_pps_vclock_update().  `residual_cycles` is actual - predicted.
+// If valid is false, the record represents an actual measurement for which no
+// prior prediction existed yet (typically first post-epoch measurement).
+
+struct time_dwt_prediction_record_t {
+  uint32_t pps_vclock_count;
+  uint32_t dwt_at_pps_vclock;
+  uint32_t counter32_at_pps_vclock;
+  uint32_t predicted_cycles;
+  uint32_t actual_cycles;
+  int32_t  residual_cycles;
+  bool     valid;
+};
+
+struct time_dwt_prediction_snapshot_t {
+  bool     valid;
+  uint32_t pps_vclock_count;
+  uint32_t predicted_cycles_last;
+  uint32_t actual_cycles_last;
+  int32_t  residual_cycles_last;
+  uint32_t predicted_cycles_next;
+  uint32_t history_count;
+  uint32_t history_capacity;
+};
+
+// ============================================================================
 // Core API — forward (DWT → GNSS nanoseconds)
 // ============================================================================
 
@@ -74,6 +114,24 @@ uint32_t time_gnss_ns_to_dwt(int64_t gnss_ns);
 // ============================================================================
 
 time_anchor_snapshot_t time_anchor_snapshot(void);
+
+// ============================================================================
+// DWT prediction accessors
+// ============================================================================
+
+time_dwt_prediction_snapshot_t time_dwt_prediction_snapshot(void);
+
+// Copies up to max_records recent records into out_records, oldest-to-newest.
+// Returns the number of records copied.  Passing nullptr or max_records=0 is
+// valid and returns 0.
+uint32_t time_dwt_prediction_history(time_dwt_prediction_record_t* out_records,
+                                     uint32_t max_records);
+
+bool     time_dwt_prediction_valid(void);
+uint32_t time_dwt_actual_cycles_last_second(void);
+uint32_t time_dwt_predicted_cycles_last_second(void);
+uint32_t time_dwt_next_prediction_cycles(void);
+int32_t  time_dwt_prediction_residual_cycles(void);
 
 // ============================================================================
 // Status

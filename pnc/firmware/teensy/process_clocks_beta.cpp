@@ -975,13 +975,18 @@ void clocks_beta_pps(void) {
         (int32_t)((int64_t)g_dwt_cycles_between_pps_vclock -
                   (int64_t)DWT_EXPECTED_PER_PPS));
 
-  // Prediction residual (diagnostic): measured[N] - measured[N-1].
-  // The bridge's implicit one-step predictor carries rate[N-1] into
-  // second N, so this IS the predictor's per-second error.  Near
-  // zero in steady state; non-zero mean during thermal settling;
-  // spikes indicate per-second anomalies.
-  p.add("dwt_prediction_residual_cycles",
-        g_dwt_prediction_residual_cycles);
+  // DWT next-second prediction surface owned by process_time.
+  // Prediction is advisory only: PPS/VCLOCK measurements remain canonical.
+  {
+    const time_dwt_prediction_snapshot_t pred = time_dwt_prediction_snapshot();
+    p.add("dwt_prediction_valid", pred.valid);
+    p.add("dwt_prediction_pps_vclock_count", pred.pps_vclock_count);
+    p.add("dwt_actual_cycles_last_second", pred.actual_cycles_last);
+    p.add("dwt_predicted_cycles_last_second", pred.predicted_cycles_last);
+    p.add("dwt_prediction_residual_cycles", pred.residual_cycles_last);
+    p.add("dwt_next_prediction_cycles", pred.predicted_cycles_next);
+    p.add("dwt_prediction_history_count", pred.history_count);
+  }
 
   // Synthetic 32-bit VCLOCK identity of the canonical PPS/VCLOCK epoch.
   // Under the VCLOCK-domain architecture this is the compact event identity
