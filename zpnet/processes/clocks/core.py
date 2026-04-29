@@ -56,6 +56,14 @@ Core contract (v2026-03+):
     projected_gnss_ns = next_pps_vclock_count * NS_PER_SECOND
     projected_ns = projected_gnss_ns * last_clock_ns // last_gnss_ns
 
+  v11 start behavior:
+
+    START is asynchronous.  The Pi creates the campaign, sends the Teensy
+    START command, marks the campaign active, and returns immediately.
+    The first TIMEBASE_FRAGMENT is accepted later by the normal fragment
+    processor.  CLOCKS records the first-fragment wait time as diagnostic
+    state, but it does not hold the command path hostage while waiting.
+
   v7 recovery hardening (four fixes):
 
     1. Campaign deactivated immediately on recovery entry — processor
@@ -91,6 +99,7 @@ Responsibilities:
   * Recover clocks after restart if campaign is active
   * Subscribe to WATCHDOG_ANOMALY and initiate Pi-side campaign recovery
   * Flash-cut to new campaign while running (seamless switch)
+  * Return START asynchronously; first fragment arrival is observed later
   * Command GNSS into Time Only mode when campaign has a location
 
 Semantics:
@@ -141,7 +150,7 @@ GNSS_WAIT_LOG_INTERVAL = 60
 # so the first public TIMEBASE_FRAGMENT is already scientifically useful.
 # Pi-side sync must therefore be patient: intentional Teensy silence during
 # warmup is not a fault.
-TEENSY_CAMPAIGN_WARMUP_FRAGMENTS = 20
+TEENSY_CAMPAIGN_WARMUP_FRAGMENTS = 5
 SYNC_FRAGMENT_TIMEOUT_S = 35.0
 SYNC_RECOVER_TIMEOUT_S = 45.0
 SYNC_POLL_S = 0.005
@@ -200,6 +209,17 @@ _diag: Dict[str, Any] = {
     "last_pps_vclock_count": None,
     "accepted_pps_count": None,      # legacy diagnostic alias
     "accepted_pps_vclock_count": None,
+
+    # Asynchronous START / first fragment observation
+    "start_async_requests": 0,
+    "start_waiting_for_first_fragment": False,
+    "start_requested_campaign": None,
+    "start_requested_at_utc": None,
+    "start_first_fragment_at_utc": None,
+    "start_first_fragment_wait_s": None,
+    "start_first_fragment_pps_vclock_count": None,
+    "last_start_async": {},
+
     "last_pps_count_anomaly": {},    # legacy diagnostic alias
     "last_pps_vclock_count_anomaly": {},
     "pps_vclock_count_ledger_mismatches": 0,
@@ -350,6 +370,17 @@ _last_pps_vclock_count_seen: Optional[int] = None
 # Last PPS/VCLOCK count accepted into TIMEBASE processing.
 # This is observational only; it is never used to reject a fragment.
 _accepted_pps_vclock_count: Optional[int] = None
+
+# Asynchronous START observation.  START no longer blocks waiting for the
+# first TIMEBASE_FRAGMENT; this records the pending first-fragment wait so
+# reports can show whether the Teensy has begun publishing.
+_start_waiting_for_first_fragment: bool = False
+_start_requested_campaign: Optional[str] = None
+_start_requested_at_utc: Optional[str] = None
+_start_requested_monotonic: Optional[float] = None
+_start_first_fragment_at_utc: Optional[str] = None
+_start_first_fragment_wait_s: Optional[float] = None
+_start_first_fragment_pps_vclock_count: Optional[int] = None
 
 # Draconian sync: control-plane waits for a specific fragment PPS/VCLOCK count
 _sync_lock = threading.Lock()
@@ -1247,6 +1278,129 @@ def _normalize_start_args(args: Optional[Dict[str, Any]]) -> Dict[str, Any]:
 
 
 # ---------------------------------------------------------------------
+# Asynchronous START helpers
+# ---------------------------------------------------------------------
+
+
+def _mark_start_waiting(campaign: str) -> None:
+    """Record that START returned before the first TIMEBASE_FRAGMENT."""
+    global _start_waiting_for_first_fragment, _start_requested_campaign
+    global _start_requested_at_utc, _start_requested_monotonic
+    global _start_first_fragment_at_utc, _start_first_fragment_wait_s
+    global _start_first_fragment_pps_vclock_count
+
+    now_utc = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+    _start_waiting_for_first_fragment = True
+    _start_requested_campaign = campaign
+    _start_requested_at_utc = now_utc
+    _start_requested_monotonic = time.monotonic()
+    _start_first_fragment_at_utc = None
+    _start_first_fragment_wait_s = None
+    _start_first_fragment_pps_vclock_count = None
+
+    _diag["start_async_requests"] = _diag.get("start_async_requests", 0) + 1
+    _diag["start_waiting_for_first_fragment"] = True
+    _diag["start_requested_campaign"] = campaign
+    _diag["start_requested_at_utc"] = now_utc
+    _diag["start_first_fragment_at_utc"] = None
+    _diag["start_first_fragment_wait_s"] = None
+    _diag["start_first_fragment_pps_vclock_count"] = None
+    _diag["last_start_async"] = {
+        "campaign": campaign,
+        "requested_at_utc": now_utc,
+        "state": "WAITING_FOR_FIRST_FRAGMENT",
+    }
+
+
+def _mark_start_first_fragment_if_needed(
+    *,
+    campaign: str,
+    pps_vclock_count: int,
+) -> None:
+    """Close the async START wait window on the first accepted fragment."""
+    global _start_waiting_for_first_fragment, _start_requested_campaign
+    global _start_requested_monotonic, _start_first_fragment_at_utc
+    global _start_first_fragment_wait_s, _start_first_fragment_pps_vclock_count
+
+    if not _start_waiting_for_first_fragment:
+        return
+    if _start_requested_campaign is not None and campaign != _start_requested_campaign:
+        return
+
+    now_utc = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    waited_s = (
+        time.monotonic() - _start_requested_monotonic
+        if _start_requested_monotonic is not None
+        else 0.0
+    )
+
+    _start_waiting_for_first_fragment = False
+    _start_first_fragment_at_utc = now_utc
+    _start_first_fragment_wait_s = float(waited_s)
+    _start_first_fragment_pps_vclock_count = int(pps_vclock_count)
+
+    _diag["start_waiting_for_first_fragment"] = False
+    _diag["start_first_fragment_at_utc"] = now_utc
+    _diag["start_first_fragment_wait_s"] = round(float(waited_s), 3)
+    _diag["start_first_fragment_pps_vclock_count"] = int(pps_vclock_count)
+    _diag["last_start_async"] = {
+        "campaign": campaign,
+        "requested_at_utc": _start_requested_at_utc,
+        "first_fragment_at_utc": now_utc,
+        "waited_s": round(float(waited_s), 3),
+        "teensy_pps_vclock_count": int(pps_vclock_count),
+        "state": "RUNNING",
+    }
+
+    logging.info(
+        "✅ [start] @%s first TIMEBASE_FRAGMENT accepted asynchronously "
+        "(campaign='%s', pps_vclock_count=%d, waited=%.3fs)",
+        system_time_z(), campaign, int(pps_vclock_count), float(waited_s),
+    )
+
+
+def _start_status_payload() -> Dict[str, Any]:
+    """Return compact async START state for REPORT/CLOCKS_INFO."""
+    seconds_waiting = None
+    if _start_waiting_for_first_fragment and _start_requested_monotonic is not None:
+        seconds_waiting = round(time.monotonic() - _start_requested_monotonic, 3)
+
+    return {
+        "waiting_for_first_fragment": bool(_start_waiting_for_first_fragment),
+        "campaign": _start_requested_campaign,
+        "requested_at_utc": _start_requested_at_utc,
+        "seconds_waiting": seconds_waiting,
+        "first_fragment_at_utc": _start_first_fragment_at_utc,
+        "first_fragment_wait_s": (
+            None if _start_first_fragment_wait_s is None
+            else round(float(_start_first_fragment_wait_s), 3)
+        ),
+        "first_fragment_pps_vclock_count": _start_first_fragment_pps_vclock_count,
+    }
+
+
+def _clear_start_wait_state() -> None:
+    """Clear pending async START observation state on STOP/CLEAR/recovery entry."""
+    global _start_waiting_for_first_fragment, _start_requested_campaign
+    global _start_requested_at_utc, _start_requested_monotonic
+    global _start_first_fragment_at_utc, _start_first_fragment_wait_s
+    global _start_first_fragment_pps_vclock_count
+
+    _start_waiting_for_first_fragment = False
+    _start_requested_campaign = None
+    _start_requested_at_utc = None
+    _start_requested_monotonic = None
+    _start_first_fragment_at_utc = None
+    _start_first_fragment_wait_s = None
+    _start_first_fragment_pps_vclock_count = None
+
+    _diag["start_waiting_for_first_fragment"] = False
+    _diag["start_requested_campaign"] = None
+    _diag["start_requested_at_utc"] = None
+
+
+# ---------------------------------------------------------------------
 # WATCHDOG_ANOMALY handler (PUBSUB — fast path)
 # ---------------------------------------------------------------------
 
@@ -1466,6 +1620,11 @@ def _process_loop() -> None:
         campaign = row["campaign"]
         campaign_payload = row["payload"]
 
+        _mark_start_first_fragment_if_needed(
+            campaign=campaign,
+            pps_vclock_count=int(pps_vclock_count),
+        )
+
         # --- Build TIMEBASE record ---
         timebase = {
             "campaign": campaign,
@@ -1613,6 +1772,7 @@ def cmd_start(args: Optional[dict]) -> dict:
     START — v5 three-domain architecture with flash-cut support.
     """
     global _campaign_active, _accepted_pps_vclock_count
+    global _sync_expected_pps_vclock, _sync_fragment
 
     start_args = _normalize_start_args(args)
     campaign = start_args.get("campaign")
@@ -1733,7 +1893,9 @@ def cmd_start(args: Optional[dict]) -> dict:
 
     _request_teensy_stop_best_effort()
 
-    # Drain stale fragments
+    # Drain stale fragments before arming START.  From this point forward the
+    # Pi accepts the next valid TIMEBASE_FRAGMENT asynchronously; the command
+    # path does not wait for it.
     while not _fragment_queue.empty():
         try:
             _fragment_queue.get_nowait()
@@ -1742,24 +1904,28 @@ def cmd_start(args: Optional[dict]) -> dict:
 
     _reset_trackers()
 
-    # Prepare sync wait FIRST.
-    #
-    # Teensy suppresses its first TEENSY_CAMPAIGN_WARMUP_FRAGMENTS
-    # internal records and publishes the first clean public fragment as
-    # PPS/VCLOCK count=1 for a fresh campaign.  Waiting for >=1 makes the intent
-    # explicit while still tolerating a later first fragment if warmup policy
-    # changes.
-    _begin_sync_wait(expected_pps=1)
+    with _sync_lock:
+        # START is asynchronous, so no START-specific sync latch remains armed.
+        # RECOVER still uses the sync wait machinery.
+        _sync_expected_pps_vclock = None
+        _sync_fragment = None
+        _sync_event.clear()
 
-    # Mark the campaign active before the wait so the processor thread cannot
-    # discard the sync fragment as "no campaign" if it wins the race against
-    # the command thread.  No Pi-side count expectation is installed.
     _accepted_pps_vclock_count = None
     _diag["accepted_pps_count"] = None
     _diag["accepted_pps_vclock_count"] = None
 
+    _mark_start_waiting(campaign)
+
+    # Mark the campaign active before the Teensy START command returns so the
+    # processor thread cannot discard an early fragment as "no campaign".
+    _campaign_active = True
+
     # Arm TEENSY
-    logging.info("📡 [start] @%s arming TEENSY START: pps_vclock_count=0", system_time_z())
+    logging.info(
+        "📡 [start] @%s arming TEENSY START asynchronously: pps_vclock_count=0",
+        system_time_z(),
+    )
     teensy_args: Dict[str, Any] = {"campaign": campaign}
     if set_dac1 is not None:
         teensy_args["set_dac1"] = str(set_dac1)
@@ -1770,57 +1936,38 @@ def cmd_start(args: Optional[dict]) -> dict:
 
     try:
         _request_teensy_start(campaign=campaign, pps_vclock_count=0, args=teensy_args)
-    except Exception as e:
-        _campaign_active = False
-        _accepted_pps_vclock_count = None
-        raise
-
-    _campaign_active = True
-    logging.info("📡 [start] @%s TEENSY START returned", system_time_z())
-
-    # Wait for sync fragment.  A wait of roughly CLOCKS_CAMPAIGN_WARMUP_SUPPRESS_PPS
-    # seconds is normal: Teensy deliberately suppresses warmup fragments.
-    logging.info(
-        "📡 [start] @%s waiting for first post-warmup sync fragment "
-        "(pps_vclock_count>=1; warmup=%d fragments)...",
-        system_time_z(), TEENSY_CAMPAIGN_WARMUP_FRAGMENTS,
-    )
-
-    try:
-        frag0, waited_s = _end_sync_wait(timeout_s=SYNC_RECOVER_TIMEOUT_S)
     except Exception:
         _campaign_active = False
         _accepted_pps_vclock_count = None
-        return {"success": False, "message": "HARD FAULT during START sync (see logs/diag)"}
+        _clear_start_wait_state()
+        raise
 
-    # Do not install or rewrite any Pi-side PPS/VCLOCK expectation here.
-    # The Teensy-authored fragment identity is accepted as observed truth.
-    teensy_pps_vclock_count = _extract_teensy_pps_vclock_count(frag0)
-
-    logging.info("✅ [start] @%s sync fragment received (waited=%.3fs)", system_time_z(), waited_s)
+    logging.info(
+        "▶️ [clocks] @%s START requested asynchronously — campaign '%s' active; "
+        "waiting for first TIMEBASE_FRAGMENT in processor thread",
+        system_time_z(), campaign,
+    )
 
     if flash_cut:
         logging.info(
-            "⚡ [start] @%s FLASH CUT complete — '%s' → '%s' (no interruption)",
+            "⚡ [start] @%s FLASH CUT requested — '%s' → '%s' (no synchronous fragment wait)",
             system_time_z(), prev_campaign, campaign,
         )
-    else:
-        logging.info("▶️ [clocks] @%s START complete — campaign '%s' active", system_time_z(), campaign)
 
     return {
         "success": True,
-        "message": "OK",
+        "message": "START_REQUESTED",
         "payload": {
             "campaign": campaign,
             "location": location,
             "set_dac1": set_dac1,
             "set_dac2": set_dac2,
             "calibrate_ocxo": calibrate_ocxo,
-            "teensy_pps_vclock_count": int(teensy_pps_vclock_count),
-            "pps_count": int(teensy_pps_vclock_count),
-            "waited_s": round(float(waited_s), 3),
+            "waiting_for_first_fragment": True,
+            "startup": _start_status_payload(),
             "flash_cut": flash_cut,
             "previous_campaign": active_row["campaign"] if flash_cut else None,
+            "sync_wait_removed": True,
         },
     }
 
@@ -1859,6 +2006,7 @@ def cmd_stop(_: Optional[dict]) -> dict:
         )
 
     _campaign_active = False
+    _clear_start_wait_state()
     _reset_trackers()
 
     try:
@@ -1881,8 +2029,18 @@ def cmd_stop(_: Optional[dict]) -> dict:
 def cmd_report(_: Optional[dict]) -> Dict[str, Any]:
     row = _get_active_campaign()
     if not row:
-        return {"success": True, "message": "OK", "payload": {"campaign_state": "IDLE"}}
-    return {"success": True, "message": "OK", "payload": row["payload"]}
+        return {
+            "success": True,
+            "message": "OK",
+            "payload": {
+                "campaign_state": "IDLE",
+                "startup": _start_status_payload(),
+            },
+        }
+
+    payload = dict(row["payload"])
+    payload["startup"] = _start_status_payload()
+    return {"success": True, "message": "OK", "payload": payload}
 
 
 def cmd_clear(_: Optional[dict]) -> dict:
@@ -1899,6 +2057,7 @@ def cmd_clear(_: Optional[dict]) -> dict:
             camp_count = cur.rowcount
 
         _campaign_active = False
+        _clear_start_wait_state()
         _reset_trackers()
 
         logging.info("🗑️ [clocks] CLEAR: deleted %d timebase rows, %d campaigns", tb_count, camp_count)
@@ -2076,6 +2235,7 @@ def _recover_campaign() -> None:
     # fragments during recovery.
     _campaign_active = False
     _accepted_pps_vclock_count = None
+    _clear_start_wait_state()
 
     _diag["recovery_checks"] += 1
 
@@ -2899,6 +3059,7 @@ def cmd_clocks_info(_: Optional[dict]) -> Dict[str, Any]:
         "accepted_pps_vclock_count": _accepted_pps_vclock_count,
         "sync_expected_pps_vclock": _sync_expected_pps_vclock,
         "sync_expected_pps": _sync_expected_pps_vclock,
+        "startup": _start_status_payload(),
         "diag": _diag,
     }
     return {"success": True, "message": "OK", "payload": payload}
@@ -3056,7 +3217,7 @@ def run() -> None:
         "Four clock domains: GNSS (reference), DWT, OCXO1, OCXO2. "
         "DWT/OCXO1/OCXO2 prediction stats from Teensy are authoritative. "
         "Pi-side Welford for DWT/OCXO1/OCXO2 removed. GNSS stream canary retained. "
-        "Recovery: campaign deactivated + queue drained + late reset; valid fragments are never rejected for count mismatch. "
+        "Recovery: campaign deactivated + queue drained + late reset; valid fragments are never rejected for count mismatch. START is asynchronous. "
         "START while active performs seamless flash-cut to new campaign. "
         "Commands: START, STOP, RESUME, REPORT, CLEAR, DELETE, SET_DAC, DITHER, "
         "SET_BASELINE, BASELINE_INFO, LIST_CAMPAIGNS, CLOCKS_INFO. "
