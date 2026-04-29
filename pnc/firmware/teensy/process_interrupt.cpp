@@ -58,6 +58,7 @@
 #include <Arduino.h>
 #include "imxrt.h"
 #include <math.h>
+#include <stdio.h>
 
 // ============================================================================
 // Constants
@@ -76,6 +77,27 @@ static constexpr uint32_t STIMULUS_LAUNCH_LATENCY_CYCLES = 5;
 static constexpr uint32_t VCLOCK_EPOCH_TICKS_AFTER_PHYSICAL_PPS = 1;
 static constexpr int32_t  VCLOCK_EPOCH_COUNTER32_OFFSET_TICKS   = 0;
 static constexpr int64_t  GNSS_NS_PER_SECOND                    = 1000000000LL;
+
+// DWT→PPS_VCLOCK anchor selection for OCXO/TimePop event projection.
+// A DWT event near a PPS boundary may be serviced after the PPS ISR has
+// published the next anchor.  The latest anchor can therefore be coherent but
+// semantically wrong for that event.  Keep a tiny immutable history and choose
+// the newest anchor that makes the event land in a lawful post-anchor window.
+static constexpr uint32_t PVC_ANCHOR_RING_SIZE = 4;
+static constexpr uint64_t PVC_ANCHOR_MAX_EVENT_OFFSET_NS = 1250000000ULL;
+
+static constexpr uint32_t ANCHOR_SELECT_NONE     = 0;
+static constexpr uint32_t ANCHOR_SELECT_LATEST   = 1;
+static constexpr uint32_t ANCHOR_SELECT_PREVIOUS = 2;
+static constexpr uint32_t ANCHOR_SELECT_OLDER    = 3;
+static constexpr uint32_t ANCHOR_SELECT_FAILED   = 4;
+
+static constexpr uint32_t ANCHOR_FAIL_RING_UNSTABLE = 1u << 0;
+static constexpr uint32_t ANCHOR_FAIL_NO_ANCHORS    = 1u << 1;
+static constexpr uint32_t ANCHOR_FAIL_BAD_ANCHOR    = 1u << 2;
+static constexpr uint32_t ANCHOR_FAIL_NO_CPS        = 1u << 3;
+static constexpr uint32_t ANCHOR_FAIL_DELTA_RANGE   = 1u << 4;
+static constexpr uint32_t ANCHOR_FAIL_NO_PLAUSIBLE  = 1u << 5;
 
 // ============================================================================
 // PPS / PPS_VCLOCK doctrine
@@ -153,60 +175,6 @@ static pps_vclock_t store_load_pvc(void) {
   pps_vclock_t pvc;
   store_load(pps, pvc);
   return pvc;
-}
-
-// ============================================================================
-// VCLOCK GNSS epoch authoring
-// ============================================================================
-//
-// Once the first absolute GNSS second is identified by DWT-bridge seed,
-// subsequent PPS epochs advance by exactly 1e9 ns.  No DWT interpolation
-// touches PPS_VCLOCK ns — the ruler IS VCLOCK.
-
-static int64_t g_vclock_epoch_gnss_ns = -1;
-
-static int64_t vclock_epoch_gnss_from_dwt_seed(int64_t dwt_gnss_estimate_ns) {
-  if (dwt_gnss_estimate_ns < 0) return -1;
-  return ((dwt_gnss_estimate_ns + GNSS_NS_PER_SECOND / 2LL) /
-          GNSS_NS_PER_SECOND) * GNSS_NS_PER_SECOND;
-}
-
-static int64_t vclock_next_epoch_gnss_ns(int64_t dwt_gnss_estimate_ns) {
-  if (g_vclock_epoch_gnss_ns >= 0) {
-    g_vclock_epoch_gnss_ns += GNSS_NS_PER_SECOND;
-    return g_vclock_epoch_gnss_ns;
-  }
-  g_vclock_epoch_gnss_ns = vclock_epoch_gnss_from_dwt_seed(dwt_gnss_estimate_ns);
-  return g_vclock_epoch_gnss_ns;
-}
-
-static int64_t vclock_gnss_from_counter32(uint32_t authored_counter32) {
-  const pps_vclock_t pvc = store_load_pvc();
-  if (pvc.sequence == 0 || pvc.gnss_ns_at_edge < 0) return -1;
-  const uint32_t delta_ticks = authored_counter32 - pvc.counter32_at_edge;
-  return pvc.gnss_ns_at_edge + (int64_t)delta_ticks * 100LL;
-}
-
-// ============================================================================
-// Latency adjusters — convert raw ISR-entry DWT to event coordinates
-// ============================================================================
-//
-// These are the ONLY producers of event-coordinate DWT values, and they
-// are the ONLY place in the codebase that applies hardware latency math.
-// Called exactly once per ISR, on the first-instruction _raw capture.
-// All downstream code consumes the returned value as event-coordinate
-// truth and applies no further adjustment.
-
-static inline uint32_t pps_dwt_from_isr_entry_raw(uint32_t isr_entry_dwt_raw) {
-  return isr_entry_dwt_raw - (GPIO_TOTAL_LATENCY - STIMULUS_LAUNCH_LATENCY_CYCLES);
-}
-
-static inline uint32_t pps_vclock_dwt_from_pps_isr_entry_raw(uint32_t isr_entry_dwt_raw) {
-  return isr_entry_dwt_raw + (uint32_t)CANONICAL_VCLOCK_EPOCH_MINUS_RAW_PPS_ISR_CYCLES;
-}
-
-static inline uint32_t qtimer_event_dwt_from_isr_entry_raw(uint32_t isr_entry_dwt_raw) {
-  return isr_entry_dwt_raw - (QTIMER_TOTAL_LATENCY - STIMULUS_LAUNCH_LATENCY_CYCLES);
 }
 
 // ============================================================================
@@ -296,23 +264,285 @@ uint32_t interrupt_dynamic_cps(void) {
 }
 
 // ============================================================================
+// PPS_VCLOCK anchor history (for DWT→GNSS projection)
+// ============================================================================
+//
+// The latest PPS_VCLOCK anchor is not always the correct anchor for a lower-
+// priority OCXO/TimePop event.  If an event occurs just before a PPS boundary
+// but is serviced after the priority-0 PPS ISR publishes the next anchor,
+// projecting against the latest anchor turns "slightly before" into a huge
+// unsigned DWT delta.  The ring preserves recent immutable anchors so the
+// projector can choose the newest anchor that makes the event physically
+// plausible.
+
+struct pvc_anchor_record_t {
+  uint32_t sequence = 0;
+  uint32_t dwt_at_edge = 0;
+  uint32_t counter32_at_edge = 0;
+  int64_t  gnss_ns_at_edge = -1;
+  uint32_t cps = 0;
+  bool     cps_valid = false;
+};
+
+struct bridge_projection_t {
+  int64_t  gnss_ns = -1;
+  uint32_t anchor_sequence_used = 0;
+  uint32_t anchor_age_slots = 0;
+  uint32_t anchor_selection_kind = ANCHOR_SELECT_FAILED;
+  uint32_t anchor_dwt_at_edge = 0;
+  int64_t  anchor_gnss_ns_at_edge = -1;
+  uint32_t anchor_cps = 0;
+  uint64_t anchor_ns_delta = 0;
+  uint32_t anchor_failure_mask = 0;
+};
+
+struct bridge_anchor_stats_t {
+  uint32_t latest_count = 0;
+  uint32_t previous_count = 0;
+  uint32_t older_count = 0;
+  uint32_t failed_count = 0;
+  uint32_t last_selection_kind = ANCHOR_SELECT_NONE;
+  uint32_t last_anchor_age_slots = 0;
+  uint32_t last_anchor_sequence_used = 0;
+  uint64_t last_anchor_ns_delta = 0;
+  uint32_t last_anchor_failure_mask = 0;
+};
+
+static volatile uint32_t g_pvc_anchor_seq = 0;
+static volatile uint32_t g_pvc_anchor_head = 0;
+static volatile uint32_t g_pvc_anchor_count = 0;
+static volatile bool     g_pvc_anchor_reset_pending = false;
+static pvc_anchor_record_t g_pvc_anchor_ring[PVC_ANCHOR_RING_SIZE];
+
+static bridge_anchor_stats_t g_bridge_stats_timepop = {};
+static bridge_anchor_stats_t g_bridge_stats_ocxo1 = {};
+static bridge_anchor_stats_t g_bridge_stats_ocxo2 = {};
+
+static void pvc_anchor_ring_reset(void) {
+  g_pvc_anchor_seq++;
+  dmb_barrier();
+
+  g_pvc_anchor_head = 0;
+  g_pvc_anchor_count = 0;
+  g_pvc_anchor_reset_pending = false;
+  for (uint32_t i = 0; i < PVC_ANCHOR_RING_SIZE; i++) {
+    g_pvc_anchor_ring[i] = pvc_anchor_record_t{};
+  }
+
+  dmb_barrier();
+  g_pvc_anchor_seq++;
+}
+
+static void pvc_anchor_publish(const pps_vclock_t& pvc) {
+  const uint32_t next = (g_pvc_anchor_count == 0)
+      ? 0
+      : ((g_pvc_anchor_head + 1u) % PVC_ANCHOR_RING_SIZE);
+
+  g_pvc_anchor_seq++;
+  dmb_barrier();
+
+  g_pvc_anchor_ring[next].sequence = pvc.sequence;
+  g_pvc_anchor_ring[next].dwt_at_edge = pvc.dwt_at_edge;
+  g_pvc_anchor_ring[next].counter32_at_edge = pvc.counter32_at_edge;
+  g_pvc_anchor_ring[next].gnss_ns_at_edge = pvc.gnss_ns_at_edge;
+  g_pvc_anchor_ring[next].cps = g_dynamic_cps;
+  g_pvc_anchor_ring[next].cps_valid = g_dynamic_cps_valid && g_dynamic_cps != 0;
+
+  g_pvc_anchor_head = next;
+  if (g_pvc_anchor_count < PVC_ANCHOR_RING_SIZE) {
+    g_pvc_anchor_count++;
+  }
+
+  dmb_barrier();
+  g_pvc_anchor_seq++;
+}
+
+static bool pvc_anchor_snapshot(pvc_anchor_record_t* out, uint32_t& out_count) {
+  out_count = 0;
+
+  for (int attempt = 0; attempt < 4; attempt++) {
+    const uint32_t s1 = g_pvc_anchor_seq;
+    dmb_barrier();
+
+    const uint32_t count = g_pvc_anchor_count;
+    const uint32_t head = g_pvc_anchor_head;
+    const uint32_t bounded = (count > PVC_ANCHOR_RING_SIZE) ? PVC_ANCHOR_RING_SIZE : count;
+
+    for (uint32_t age = 0; age < bounded; age++) {
+      const uint32_t idx = (head + PVC_ANCHOR_RING_SIZE - age) % PVC_ANCHOR_RING_SIZE;
+      out[age].sequence = g_pvc_anchor_ring[idx].sequence;
+      out[age].dwt_at_edge = g_pvc_anchor_ring[idx].dwt_at_edge;
+      out[age].counter32_at_edge = g_pvc_anchor_ring[idx].counter32_at_edge;
+      out[age].gnss_ns_at_edge = g_pvc_anchor_ring[idx].gnss_ns_at_edge;
+      out[age].cps = g_pvc_anchor_ring[idx].cps;
+      out[age].cps_valid = g_pvc_anchor_ring[idx].cps_valid;
+    }
+
+    dmb_barrier();
+    const uint32_t s2 = g_pvc_anchor_seq;
+    if (s1 == s2 && (s1 & 1u) == 0u) {
+      out_count = bounded;
+      return true;
+    }
+  }
+
+  return false;
+}
+
+static void bridge_projection_copy_to_diag(interrupt_capture_diag_t& diag,
+                                           const bridge_projection_t& proj) {
+  diag.anchor_sequence_used = proj.anchor_sequence_used;
+  diag.anchor_age_slots = proj.anchor_age_slots;
+  diag.anchor_selection_kind = proj.anchor_selection_kind;
+  diag.anchor_dwt_at_edge = proj.anchor_dwt_at_edge;
+  diag.anchor_gnss_ns_at_edge = proj.anchor_gnss_ns_at_edge;
+  diag.anchor_cps = proj.anchor_cps;
+  diag.anchor_ns_delta = proj.anchor_ns_delta;
+  diag.anchor_failure_mask = proj.anchor_failure_mask;
+}
+
+static bridge_anchor_stats_t* bridge_stats_for(interrupt_subscriber_kind_t kind) {
+  if (kind == interrupt_subscriber_kind_t::TIMEPOP) return &g_bridge_stats_timepop;
+  if (kind == interrupt_subscriber_kind_t::OCXO1) return &g_bridge_stats_ocxo1;
+  if (kind == interrupt_subscriber_kind_t::OCXO2) return &g_bridge_stats_ocxo2;
+  return nullptr;
+}
+
+static void bridge_projection_record_stats(interrupt_subscriber_kind_t kind,
+                                           const bridge_projection_t& proj) {
+  bridge_anchor_stats_t* s = bridge_stats_for(kind);
+  if (!s) return;
+
+  if (proj.anchor_selection_kind == ANCHOR_SELECT_LATEST) {
+    s->latest_count++;
+  } else if (proj.anchor_selection_kind == ANCHOR_SELECT_PREVIOUS) {
+    s->previous_count++;
+  } else if (proj.anchor_selection_kind == ANCHOR_SELECT_OLDER) {
+    s->older_count++;
+  } else if (proj.anchor_selection_kind == ANCHOR_SELECT_FAILED) {
+    s->failed_count++;
+  }
+
+  s->last_selection_kind = proj.anchor_selection_kind;
+  s->last_anchor_age_slots = proj.anchor_age_slots;
+  s->last_anchor_sequence_used = proj.anchor_sequence_used;
+  s->last_anchor_ns_delta = proj.anchor_ns_delta;
+  s->last_anchor_failure_mask = proj.anchor_failure_mask;
+}
+
+// ============================================================================
+// VCLOCK GNSS epoch authoring
+// ============================================================================
+//
+// Once the first absolute GNSS second is identified by DWT-bridge seed,
+// subsequent PPS epochs advance by exactly 1e9 ns.  No DWT interpolation
+// touches PPS_VCLOCK ns — the ruler IS VCLOCK.
+
+static int64_t g_vclock_epoch_gnss_ns = -1;
+
+static int64_t vclock_epoch_gnss_from_dwt_seed(int64_t dwt_gnss_estimate_ns) {
+  if (dwt_gnss_estimate_ns < 0) return -1;
+  return ((dwt_gnss_estimate_ns + GNSS_NS_PER_SECOND / 2LL) /
+          GNSS_NS_PER_SECOND) * GNSS_NS_PER_SECOND;
+}
+
+static int64_t vclock_next_epoch_gnss_ns(int64_t dwt_gnss_estimate_ns) {
+  if (g_vclock_epoch_gnss_ns >= 0) {
+    g_vclock_epoch_gnss_ns += GNSS_NS_PER_SECOND;
+    return g_vclock_epoch_gnss_ns;
+  }
+  g_vclock_epoch_gnss_ns = vclock_epoch_gnss_from_dwt_seed(dwt_gnss_estimate_ns);
+  return g_vclock_epoch_gnss_ns;
+}
+
+static int64_t vclock_gnss_from_counter32(uint32_t authored_counter32) {
+  const pps_vclock_t pvc = store_load_pvc();
+  if (pvc.sequence == 0 || pvc.gnss_ns_at_edge < 0) return -1;
+  const uint32_t delta_ticks = authored_counter32 - pvc.counter32_at_edge;
+  return pvc.gnss_ns_at_edge + (int64_t)delta_ticks * 100LL;
+}
+
+// ============================================================================
+// Latency adjusters — convert raw ISR-entry DWT to event coordinates
+// ============================================================================
+//
+// These are the ONLY producers of event-coordinate DWT values, and they
+// are the ONLY place in the codebase that applies hardware latency math.
+// Called exactly once per ISR, on the first-instruction _raw capture.
+// All downstream code consumes the returned value as event-coordinate
+// truth and applies no further adjustment.
+
+static inline uint32_t pps_dwt_from_isr_entry_raw(uint32_t isr_entry_dwt_raw) {
+  return isr_entry_dwt_raw - (GPIO_TOTAL_LATENCY - STIMULUS_LAUNCH_LATENCY_CYCLES);
+}
+
+static inline uint32_t pps_vclock_dwt_from_pps_isr_entry_raw(uint32_t isr_entry_dwt_raw) {
+  return isr_entry_dwt_raw + (uint32_t)CANONICAL_VCLOCK_EPOCH_MINUS_RAW_PPS_ISR_CYCLES;
+}
+
+static inline uint32_t qtimer_event_dwt_from_isr_entry_raw(uint32_t isr_entry_dwt_raw) {
+  return isr_entry_dwt_raw - (QTIMER_TOTAL_LATENCY - STIMULUS_LAUNCH_LATENCY_CYCLES);
+}
+
+// ============================================================================
 // DWT → GNSS conversion (the OCXO/TimePop exception)
 // ============================================================================
 
-static int64_t interrupt_dwt_to_vclock_gnss_ns(uint32_t dwt_at_event) {
-  const pps_vclock_t pvc = store_load_pvc();
-  if (pvc.sequence == 0 || pvc.gnss_ns_at_edge < 0) return -1;
-  if (!g_dynamic_cps_valid) return -1;
-  const uint32_t cps = g_dynamic_cps;
-  if (cps == 0) return -1;
+static bridge_projection_t interrupt_dwt_to_vclock_gnss_projection(uint32_t dwt_at_event) {
+  bridge_projection_t out{};
+  out.gnss_ns = -1;
+  out.anchor_selection_kind = ANCHOR_SELECT_FAILED;
 
-  const uint32_t dwt_delta = dwt_at_event - pvc.dwt_at_edge;
-  const uint64_t ns_delta =
-      ((uint64_t)dwt_delta * (uint64_t)GNSS_NS_PER_SECOND + (uint64_t)cps / 2ULL) /
-      (uint64_t)cps;
+  pvc_anchor_record_t anchors[PVC_ANCHOR_RING_SIZE];
+  uint32_t count = 0;
+  if (!pvc_anchor_snapshot(anchors, count)) {
+    out.anchor_failure_mask |= ANCHOR_FAIL_RING_UNSTABLE;
+    return out;
+  }
 
-  if (ns_delta > (uint64_t)GNSS_NS_PER_SECOND * 3ULL) return -1;
-  return pvc.gnss_ns_at_edge + (int64_t)ns_delta;
+  if (count == 0) {
+    out.anchor_failure_mask |= ANCHOR_FAIL_NO_ANCHORS;
+    return out;
+  }
+
+  for (uint32_t age = 0; age < count; age++) {
+    const pvc_anchor_record_t& a = anchors[age];
+
+    if (a.sequence == 0 || a.gnss_ns_at_edge < 0) {
+      out.anchor_failure_mask |= ANCHOR_FAIL_BAD_ANCHOR;
+      continue;
+    }
+
+    if (!a.cps_valid || a.cps == 0) {
+      out.anchor_failure_mask |= ANCHOR_FAIL_NO_CPS;
+      continue;
+    }
+
+    const uint32_t dwt_delta = dwt_at_event - a.dwt_at_edge;
+    const uint64_t ns_delta =
+        ((uint64_t)dwt_delta * (uint64_t)GNSS_NS_PER_SECOND + (uint64_t)a.cps / 2ULL) /
+        (uint64_t)a.cps;
+
+    if (ns_delta > PVC_ANCHOR_MAX_EVENT_OFFSET_NS) {
+      out.anchor_failure_mask |= ANCHOR_FAIL_DELTA_RANGE;
+      continue;
+    }
+
+    out.gnss_ns = a.gnss_ns_at_edge + (int64_t)ns_delta;
+    out.anchor_sequence_used = a.sequence;
+    out.anchor_age_slots = age;
+    out.anchor_selection_kind = (age == 0)
+        ? ANCHOR_SELECT_LATEST
+        : ((age == 1) ? ANCHOR_SELECT_PREVIOUS : ANCHOR_SELECT_OLDER);
+    out.anchor_dwt_at_edge = a.dwt_at_edge;
+    out.anchor_gnss_ns_at_edge = a.gnss_ns_at_edge;
+    out.anchor_cps = a.cps;
+    out.anchor_ns_delta = ns_delta;
+    return out;
+  }
+
+  out.anchor_failure_mask |= ANCHOR_FAIL_NO_PLAUSIBLE;
+  return out;
 }
 
 // ============================================================================
@@ -764,17 +994,24 @@ static void emit_one_second_event(interrupt_subscriber_runtime_t& rt,
 
   // VCLOCK lane authors GNSS time directly from VCLOCK ticks (no DWT).
   // OCXO lanes use the DWT bridge — the principled exception.
+  bridge_projection_t bridge{};
   int64_t gnss_ns = -1;
   if (rt.desc->kind == interrupt_subscriber_kind_t::VCLOCK) {
     gnss_ns = vclock_gnss_from_counter32(authored_counter32);
+    bridge.anchor_selection_kind = ANCHOR_SELECT_NONE;
   } else {
-    gnss_ns = interrupt_dwt_to_vclock_gnss_ns(dwt_at_event);
+    bridge = interrupt_dwt_to_vclock_gnss_projection(dwt_at_event);
+    gnss_ns = bridge.gnss_ns;
+    bridge_projection_record_stats(rt.desc->kind, bridge);
   }
   event.gnss_ns_at_event = (gnss_ns >= 0) ? (uint64_t)gnss_ns : 0;
   event.status = interrupt_event_status_t::OK;
 
   interrupt_capture_diag_t diag {};
   fill_diag(diag, rt, event);
+  if (rt.desc->kind != interrupt_subscriber_kind_t::VCLOCK) {
+    bridge_projection_copy_to_diag(diag, bridge);
+  }
 
   rt.last_event = event;
   rt.last_diag  = diag;
@@ -1061,7 +1298,9 @@ static void qtimer1_isr(void) {
     qtimer1_ch2_clear_compare_flag();
     if (g_qtimer1_ch2_handler) {
       const uint32_t qtimer_event_dwt = qtimer_event_dwt_from_isr_entry_raw(isr_entry_dwt_raw);
-      const int64_t  gnss_ns = interrupt_dwt_to_vclock_gnss_ns(qtimer_event_dwt);
+      const bridge_projection_t bridge = interrupt_dwt_to_vclock_gnss_projection(qtimer_event_dwt);
+      const int64_t  gnss_ns = bridge.gnss_ns;
+      bridge_projection_record_stats(interrupt_subscriber_kind_t::TIMEPOP, bridge);
 
       interrupt_event_t event{};
       event.kind     = interrupt_subscriber_kind_t::TIMEPOP;
@@ -1083,6 +1322,7 @@ static void qtimer1_isr(void) {
       diag.dwt_at_event       = qtimer_event_dwt;
       diag.gnss_ns_at_event   = event.gnss_ns_at_event;
       diag.counter32_at_event = event.counter32_at_event;
+      bridge_projection_copy_to_diag(diag, bridge);
 
       g_qtimer1_ch2_handler(event, diag);
     }
@@ -1178,7 +1418,12 @@ void process_interrupt_gpio6789_irq(uint32_t isr_entry_dwt_raw) {
     qtimer1_ch3_program_compare(g_vclock_lane.compare_target);
   }
 
+  if (g_pvc_anchor_reset_pending) {
+    pvc_anchor_ring_reset();
+  }
+
   store_publish(pps, pvc);
+  pvc_anchor_publish(pvc);
 
   if (g_pps_edge_dispatch) {
     timepop_arm_asap(pps_edge_dispatch_trampoline, nullptr, "PPS_EDGE_DISPATCH");
@@ -1319,6 +1564,7 @@ bool interrupt_stop(interrupt_subscriber_kind_t kind) {
 void interrupt_request_pps_rebootstrap(void) {
   g_pps_rebootstrap_pending = true;
   g_vclock_epoch_gnss_ns = -1;
+  g_pvc_anchor_reset_pending = true;
   dynamic_cps_reset_model();
 }
 
@@ -1477,6 +1723,10 @@ void process_interrupt_init(void) {
   g_pps_rebootstrap_count = 0;
 
   g_store = snapshot_store_t{};
+  pvc_anchor_ring_reset();
+  g_bridge_stats_timepop = bridge_anchor_stats_t{};
+  g_bridge_stats_ocxo1 = bridge_anchor_stats_t{};
+  g_bridge_stats_ocxo2 = bridge_anchor_stats_t{};
   g_pps_edge_dispatch = nullptr;
   g_pps_entry_latency_handler = nullptr;
 
@@ -1516,6 +1766,31 @@ void process_interrupt_enable_irqs(void) {
   NVIC_SET_PRIORITY(IRQ_GPIO6789, 0);
 
   g_interrupt_irqs_enabled = true;
+}
+
+
+static void add_bridge_stats_payload(Payload& p,
+                                     const char* prefix,
+                                     const bridge_anchor_stats_t& s) {
+  char key[96];
+  auto add_u32 = [&](const char* suffix, uint32_t value) {
+    snprintf(key, sizeof(key), "%s_%s", prefix, suffix);
+    p.add(key, value);
+  };
+  auto add_u64 = [&](const char* suffix, uint64_t value) {
+    snprintf(key, sizeof(key), "%s_%s", prefix, suffix);
+    p.add(key, value);
+  };
+
+  add_u32("anchor_latest_count", s.latest_count);
+  add_u32("anchor_previous_count", s.previous_count);
+  add_u32("anchor_older_count", s.older_count);
+  add_u32("anchor_failed_count", s.failed_count);
+  add_u32("anchor_last_selection_kind", s.last_selection_kind);
+  add_u32("anchor_last_age_slots", s.last_anchor_age_slots);
+  add_u32("anchor_last_sequence_used", s.last_anchor_sequence_used);
+  add_u64("anchor_last_ns_delta", s.last_anchor_ns_delta);
+  add_u32("anchor_last_failure_mask", s.last_anchor_failure_mask);
 }
 
 // ============================================================================
@@ -1582,6 +1857,14 @@ static Payload cmd_report(const Payload&) {
   p.add("dynamic_cps_last_pvc_dwt_at_edge",    g_dynamic_cps_last_pvc_dwt_at_edge);
   p.add("dynamic_cps_last_reseed_value",       g_dynamic_cps_last_reseed_value);
   p.add("dynamic_cps_last_reseed_was_computed", g_dynamic_cps_last_reseed_was_computed);
+
+  p.add("pvc_anchor_ring_count", g_pvc_anchor_count);
+  p.add("pvc_anchor_ring_head", g_pvc_anchor_head);
+  p.add("pvc_anchor_ring_seq", g_pvc_anchor_seq);
+  p.add("pvc_anchor_reset_pending", g_pvc_anchor_reset_pending);
+  add_bridge_stats_payload(p, "timepop", g_bridge_stats_timepop);
+  add_bridge_stats_payload(p, "ocxo1", g_bridge_stats_ocxo1);
+  add_bridge_stats_payload(p, "ocxo2", g_bridge_stats_ocxo2);
 
   p.add("vclock_clock32_zeroed", g_vclock_clock32.zeroed);
   p.add("vclock_clock32_zero_ns", g_vclock_clock32.zero_ns);

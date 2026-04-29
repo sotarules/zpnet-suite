@@ -599,11 +599,24 @@ void timepop_qtimer1_ch2_handler(const interrupt_event_t& event,
     if (!slots[i].active || slots[i].expired) continue;
     if (!deadline_expired(slots[i].deadline, now)) continue;
 
-    expire_slot_with_capture(slots[i],
-                             now,
-                             dwt_entry,
-                             anchor,
-                             timepop_fire_capture_source_t::IRQ_CH2);
+    // CH2 event facts are authored by process_interrupt.  Use the
+    // event-carried GNSS coordinate so TimePop benefits from the same
+    // PPS_VCLOCK anchor-selection logic as OCXO events.  Fall back to the
+    // local VCLOCK conversion only if the event was emitted before a lawful
+    // GNSS coordinate was available.
+    const int64_t event_fire_gnss_ns = event.gnss_ns_at_event != 0
+        ? (int64_t)event.gnss_ns_at_event
+        : vclock_to_gnss_ns(now, anchor);
+
+    slot_capture(slots[i],
+                 now,
+                 dwt_entry,
+                 event_fire_gnss_ns,
+                 anchor,
+                 timepop_fire_capture_source_t::IRQ_CH2);
+    slots[i].expired = true;
+    expired_count++;
+    timepop_pending = true;
 
     slots[i].isr_callback_fired = false;
 

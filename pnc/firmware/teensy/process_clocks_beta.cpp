@@ -372,10 +372,23 @@ static void clocks_payload_add_ocxo_diag(Payload& p,
     p.add(key, value);
   };
 
+  auto add_i64 = [&](const char* suffix, int64_t value) {
+    snprintf(key, sizeof(key), "%s_%s", prefix, suffix);
+    p.add(key, value);
+  };
+
   add_bool("enabled", diag.enabled);
   add_u32("dwt_at_event", diag.dwt_at_event);
   add_u64("gnss_ns_at_event", diag.gnss_ns_at_event);
   add_u32("counter32_at_event", diag.counter32_at_event);
+  add_u32("anchor_sequence_used", diag.anchor_sequence_used);
+  add_u32("anchor_age_slots", diag.anchor_age_slots);
+  add_u32("anchor_selection_kind", diag.anchor_selection_kind);
+  add_u32("anchor_dwt_at_edge", diag.anchor_dwt_at_edge);
+  add_i64("anchor_gnss_ns_at_edge", diag.anchor_gnss_ns_at_edge);
+  add_u32("anchor_cps", diag.anchor_cps);
+  add_u64("anchor_ns_delta", diag.anchor_ns_delta);
+  add_u32("anchor_failure_mask", diag.anchor_failure_mask);
   add_u32("anomaly_count", diag.anomaly_count);
 }
 

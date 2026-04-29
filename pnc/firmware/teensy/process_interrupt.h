@@ -220,6 +220,20 @@ struct interrupt_capture_diag_t {
   uint64_t gnss_ns_at_event   = 0;
   uint32_t counter32_at_event = 0;
 
+  // DWT→PPS_VCLOCK anchor-selection diagnostics.
+  // Populated for OCXO and TIMEPOP events whose GNSS coordinate is derived
+  // by projecting an event DWT coordinate onto the PPS_VCLOCK timeline.
+  // anchor_age_slots: 0=latest anchor, 1=previous, 2+=older ring entry.
+  // anchor_selection_kind: 0=NONE, 1=LATEST, 2=PREVIOUS, 3=OLDER, 4=FAILED.
+  uint32_t anchor_sequence_used = 0;
+  uint32_t anchor_age_slots = 0;
+  uint32_t anchor_selection_kind = 0;
+  uint32_t anchor_dwt_at_edge = 0;
+  int64_t  anchor_gnss_ns_at_edge = -1;
+  uint32_t anchor_cps = 0;
+  uint64_t anchor_ns_delta = 0;
+  uint32_t anchor_failure_mask = 0;
+
   // PPS GPIO audit fields, populated only on the VCLOCK diag.
   //
   // pps_edge_dwt_isr_entry_raw is a transitional field name that
