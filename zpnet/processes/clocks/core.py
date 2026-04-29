@@ -62,10 +62,10 @@ Core contract (v2026-03+):
        thread ignores all fragments during the entire recovery window.
     2. Fragment queue drained after Teensy STOP in warm recovery —
        eliminates stale-fragment poisoning of Welford accumulators.
-    3. Small pps_count mismatches (≤5) are soft-skipped with re-arm
-       instead of triggering a cascading hard-fault → recovery loop.
-    4. Welford reset moved to AFTER sync fragment arrives and
-       armed_pps_count is set — zero chance of stale data.
+    3. Pi-side PPS/VCLOCK count expectation matching was removed.
+       Every valid TIMEBASE_FRAGMENT is accepted as Teensy-authored truth.
+    4. Welford reset moved to AFTER sync fragment arrives — zero chance
+       of stale data.
 
   Flash-cut campaign switching:
 
@@ -99,7 +99,7 @@ Semantics:
   * Derivative statistics (tau, ppb) live only in
     the campaign report — never in the TIMEBASE row itself
   * Prediction stats from the Teensy are passed through verbatim
-  * Gaps in PPS/VCLOCK count are canonical (recovery) and non-fatal
+  * Gaps, jumps, or regressions in PPS/VCLOCK count are observed and recorded, never rejected
   * WATCHDOG_ANOMALY triggers Pi-side recovery using the last canonical TIMEBASE
 """
 
@@ -176,14 +176,12 @@ _diag: Dict[str, Any] = {
     "queue_depth_max_seen": 0,
     "queue_depth_current": 0,
 
-    # Draconian correlation
-    "hard_fault_pps_mismatch": 0,
+    # Fault/recovery accounting
     "hard_fault_no_active_campaign": 0,
     "hard_fault_sync_timeout": 0,
     "last_hard_fault": {},
     "hard_faults_total": 0,
     "auto_recovery_failures": 0,
-    "pps_mismatch_soft_skips": 0,
 
     # Sync waits
     "sync_waits": 0,
@@ -200,8 +198,8 @@ _diag: Dict[str, Any] = {
     "pps_count_regress": 0,
     "last_pps_count": None,          # legacy diagnostic alias
     "last_pps_vclock_count": None,
-    "armed_pps_count": None,         # legacy diagnostic alias
-    "armed_pps_vclock_count": None,
+    "accepted_pps_count": None,      # legacy diagnostic alias
+    "accepted_pps_vclock_count": None,
     "last_pps_count_anomaly": {},    # legacy diagnostic alias
     "last_pps_vclock_count_anomaly": {},
     "pps_vclock_count_ledger_mismatches": 0,
@@ -349,8 +347,9 @@ _campaign_active: bool = False
 
 _last_pps_vclock_count_seen: Optional[int] = None
 
-# What PPS/VCLOCK count did we most recently tell the Teensy to use?
-_armed_pps_vclock_count: Optional[int] = None
+# Last PPS/VCLOCK count accepted into TIMEBASE processing.
+# This is observational only; it is never used to reject a fragment.
+_accepted_pps_vclock_count: Optional[int] = None
 
 # Draconian sync: control-plane waits for a specific fragment PPS/VCLOCK count
 _sync_lock = threading.Lock()
@@ -1362,7 +1361,7 @@ def _process_loop() -> None:
     environment and GNSS discipline data, builds TIMEBASE, persists.
     Runs forever.
     """
-    global _campaign_active, _armed_pps_vclock_count, _gnss_raw_ns, _gnss_raw_n, _gnss_raw_valid
+    global _campaign_active, _accepted_pps_vclock_count, _gnss_raw_ns, _gnss_raw_n, _gnss_raw_valid
     global _gnss_raw_welford_n, _gnss_raw_welford_mean, _gnss_raw_welford_m2
     global _gnss_raw_welford_min, _gnss_raw_welford_max
 
@@ -1395,50 +1394,14 @@ def _process_loop() -> None:
             _diag["fragments_ignored_no_campaign"] += 1
             continue
 
-        # --- Check Teensy PPS/VCLOCK count against what we armed ---
-        armed = _armed_pps_vclock_count
-        sysclk = system_time_z()
-        if armed is not None and int(pps_vclock_count) != armed:
-            delta = int(pps_vclock_count) - armed
-            _diag["pps_mismatch_soft_skips"] = _diag.get("pps_mismatch_soft_skips", 0) + 1
-
-            with _sync_lock:
-                sync_active = _sync_expected_pps_vclock is not None
-
-            if abs(delta) <= 5:
-                logging.warning(
-                    "⚠️ [clocks] @%s PPS/VCLOCK count mismatch: "
-                    "armed=%d teensy=%d (off by %+d) sync_active=%s "
-                    "— soft skip, re-arming",
-                    sysclk, armed, int(pps_vclock_count), delta, sync_active,
-                )
-                _armed_pps_vclock_count = int(pps_vclock_count) + 1
-                _diag["armed_pps_count"] = _armed_pps_vclock_count
-                _diag["armed_pps_vclock_count"] = _armed_pps_vclock_count
-                continue
-
-            # Large jump (>5) is genuinely anomalous — hard fault
-            _diag["hard_fault_pps_mismatch"] += 1
-            logging.error(
-                "💥 [clocks] @%s TEENSY PPS/VCLOCK COUNT MISMATCH! "
-                "armed=%d teensy=%d (off by %+d).",
-                sysclk, armed, int(pps_vclock_count), delta,
-            )
-            try:
-                _hard_fault("pps_mismatch_teensy_vs_armed", {
-                    "system_time": sysclk,
-                    "armed_pps_vclock_count": armed, "armed_pps_count": armed,
-                    "teensy_pps_vclock_count": int(pps_vclock_count),
-                    "teensy_pps_count": int(pps_vclock_count),
-                    "delta": delta,
-                })
-            except RuntimeError:
-                continue
-
-        # Advance armed expectation to next second
-        _armed_pps_vclock_count = int(pps_vclock_count) + 1
-        _diag["armed_pps_count"] = _armed_pps_vclock_count
-        _diag["armed_pps_vclock_count"] = _armed_pps_vclock_count
+        # --- Accept Teensy PPS/VCLOCK count as observed truth ---
+        #
+        # Do not compare this fragment against an armed/expected Pi-side count.
+        # The Pi is a TIMEBASE traffic cop here, not a campaign-count authority.
+        # If the Teensy sends a valid TIMEBASE_FRAGMENT identity, process it.
+        _accepted_pps_vclock_count = int(pps_vclock_count)
+        _diag["accepted_pps_count"] = _accepted_pps_vclock_count
+        _diag["accepted_pps_vclock_count"] = _accepted_pps_vclock_count
 
         # --- Extract GNSS ns for stream health canary ---
         system_time_utc = datetime.now(timezone.utc)
@@ -1649,7 +1612,7 @@ def cmd_start(args: Optional[dict]) -> dict:
     """
     START — v5 three-domain architecture with flash-cut support.
     """
-    global _campaign_active, _armed_pps_vclock_count
+    global _campaign_active, _accepted_pps_vclock_count
 
     start_args = _normalize_start_args(args)
     campaign = start_args.get("campaign")
@@ -1788,13 +1751,12 @@ def cmd_start(args: Optional[dict]) -> dict:
     # changes.
     _begin_sync_wait(expected_pps=1)
 
-    # The first public fragment after START will be PPS/VCLOCK count 1 after
-    # Teensy's warmup suppression.  Arm and mark the campaign active before
-    # the wait so the processor thread cannot discard the sync fragment as
-    # "no campaign" if it wins the race against the command thread.
-    _armed_pps_vclock_count = 1
-    _diag["armed_pps_count"] = _armed_pps_vclock_count
-    _diag["armed_pps_vclock_count"] = _armed_pps_vclock_count
+    # Mark the campaign active before the wait so the processor thread cannot
+    # discard the sync fragment as "no campaign" if it wins the race against
+    # the command thread.  No Pi-side count expectation is installed.
+    _accepted_pps_vclock_count = None
+    _diag["accepted_pps_count"] = None
+    _diag["accepted_pps_vclock_count"] = None
 
     # Arm TEENSY
     logging.info("📡 [start] @%s arming TEENSY START: pps_vclock_count=0", system_time_z())
@@ -1810,7 +1772,7 @@ def cmd_start(args: Optional[dict]) -> dict:
         _request_teensy_start(campaign=campaign, pps_vclock_count=0, args=teensy_args)
     except Exception as e:
         _campaign_active = False
-        _armed_pps_vclock_count = None
+        _accepted_pps_vclock_count = None
         raise
 
     _campaign_active = True
@@ -1828,13 +1790,11 @@ def cmd_start(args: Optional[dict]) -> dict:
         frag0, waited_s = _end_sync_wait(timeout_s=SYNC_RECOVER_TIMEOUT_S)
     except Exception:
         _campaign_active = False
-        _armed_pps_vclock_count = None
+        _accepted_pps_vclock_count = None
         return {"success": False, "message": "HARD FAULT during START sync (see logs/diag)"}
 
-    # Do not rewrite _armed_pps_vclock_count here.  The processor thread may
-    # already have consumed the sync fragment and advanced the expectation to
-    # count+1.  Rewinding it here would create a self-inflicted soft skip on
-    # the next fragment.
+    # Do not install or rewrite any Pi-side PPS/VCLOCK expectation here.
+    # The Teensy-authored fragment identity is accepted as observed truth.
     teensy_pps_vclock_count = _extract_teensy_pps_vclock_count(frag0)
 
     logging.info("✅ [start] @%s sync fragment received (waited=%.3fs)", system_time_z(), waited_s)
@@ -2110,12 +2070,12 @@ def _recover_campaign() -> None:
     """
     RECOVER — v6 four-domain architecture.
     """
-    global _campaign_active, _armed_pps_vclock_count
+    global _campaign_active, _accepted_pps_vclock_count
 
     # Immediately deactivate so the processor thread ignores all
     # fragments during recovery.
     _campaign_active = False
-    _armed_pps_vclock_count = None
+    _accepted_pps_vclock_count = None
 
     _diag["recovery_checks"] += 1
 
@@ -2209,9 +2169,9 @@ def _recover_campaign() -> None:
             raise
 
         teensy_pps_vclock_count = _extract_teensy_pps_vclock_count(frag)
-        _armed_pps_vclock_count = teensy_pps_vclock_count + 1
-        _diag["armed_pps_count"] = _armed_pps_vclock_count
-        _diag["armed_pps_vclock_count"] = _armed_pps_vclock_count
+        _accepted_pps_vclock_count = int(teensy_pps_vclock_count)
+        _diag["accepted_pps_count"] = _accepted_pps_vclock_count
+        _diag["accepted_pps_vclock_count"] = _accepted_pps_vclock_count
 
         while not _fragment_queue.empty():
             try:
@@ -2480,9 +2440,9 @@ def _recover_campaign() -> None:
             teensy_pps_vclock_count, next_pps_vclock_count, overshoot,
         )
 
-    _armed_pps_vclock_count = teensy_pps_vclock_count + 1
-    _diag["armed_pps_count"] = _armed_pps_vclock_count
-    _diag["armed_pps_vclock_count"] = _armed_pps_vclock_count
+    _accepted_pps_vclock_count = int(teensy_pps_vclock_count)
+    _diag["accepted_pps_count"] = _accepted_pps_vclock_count
+    _diag["accepted_pps_vclock_count"] = _accepted_pps_vclock_count
 
     _drained_post = 0
     while not _fragment_queue.empty():
@@ -2505,10 +2465,9 @@ def _recover_campaign() -> None:
     logging.info(
         "✅ [recovery] @%s campaign '%s' recovered — TIMEBASE resumes\n"
         "    teensy_pps_vclock_count = %d\n"
-        "    overshoot        = %+d\n"
-        "    armed_pps_vclock_count = %d",
+        "    overshoot        = %+d",
         system_time_z(), campaign_name,
-        teensy_pps_vclock_count, overshoot, _armed_pps_vclock_count,
+        teensy_pps_vclock_count, overshoot,
     )
 
 
@@ -2937,6 +2896,7 @@ def cmd_clocks_info(_: Optional[dict]) -> Dict[str, Any]:
     payload = {
         "campaign_active": _campaign_active,
         "last_pps_vclock_count_seen": _last_pps_vclock_count_seen,
+        "accepted_pps_vclock_count": _accepted_pps_vclock_count,
         "sync_expected_pps_vclock": _sync_expected_pps_vclock,
         "sync_expected_pps": _sync_expected_pps_vclock,
         "diag": _diag,
@@ -3096,7 +3056,7 @@ def run() -> None:
         "Four clock domains: GNSS (reference), DWT, OCXO1, OCXO2. "
         "DWT/OCXO1/OCXO2 prediction stats from Teensy are authoritative. "
         "Pi-side Welford for DWT/OCXO1/OCXO2 removed. GNSS stream canary retained. "
-        "Recovery: campaign deactivated + queue drained + soft-skip mismatch (≤5) + late reset. "
+        "Recovery: campaign deactivated + queue drained + late reset; valid fragments are never rejected for count mismatch. "
         "START while active performs seamless flash-cut to new campaign. "
         "Commands: START, STOP, RESUME, REPORT, CLEAR, DELETE, SET_DAC, DITHER, "
         "SET_BASELINE, BASELINE_INFO, LIST_CAMPAIGNS, CLOCKS_INFO. "
