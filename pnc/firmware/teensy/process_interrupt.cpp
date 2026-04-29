@@ -178,89 +178,15 @@ static pps_vclock_t store_load_pvc(void) {
 }
 
 // ============================================================================
-// Dynamic CPS — DWT cycles per GNSS second, refined on the VCLOCK cadence
+// Dynamic CPS compatibility
 // ============================================================================
 //
-// Anchor:    pps_vclock.dwt_at_edge  (priority-0 PPS GPIO capture, then
-//                                     latency-adjusted to PPS_VCLOCK frame)
-// Bookend reseed at PPS edge:  cps = pvc.dwt_at_edge - prev pvc.dwt_at_edge
-// Refinement at each 1 kHz cadence tick:
-//   observed_cycles = qtimer_event_dwt - pvc.dwt_at_edge
-//   inferred_cps    = observed_cycles * 1e9 / gnss_offset_ns
-//   blend a slew-limited fraction of (inferred_cps - cps) into cps
-
-static volatile uint32_t g_dynamic_cps                          = 0;
-static volatile bool     g_dynamic_cps_valid                    = false;
-static volatile uint32_t g_dynamic_cps_pps_sequence             = 0;
-static volatile uint32_t g_dynamic_cps_last_pvc_dwt_at_edge     = 0;
-static volatile uint32_t g_dynamic_cps_last_reseed_value        = 0;
-static volatile bool     g_dynamic_cps_last_reseed_was_computed = false;
-
-static constexpr int64_t  DYNAMIC_CPS_MIN_REFINE_OFFSET_NS = 10000000LL;
-static constexpr int64_t  DYNAMIC_CPS_MAX_REFINE_OFFSET_NS = 990000000LL;
-static constexpr int32_t  DYNAMIC_CPS_MAX_STEP_CYCLES      = 128;
-static constexpr uint32_t DYNAMIC_CPS_BLEND_SHIFT          = 4;
-
-static void dynamic_cps_reset_model(void) {
-  g_dynamic_cps                          = 0;
-  g_dynamic_cps_valid                    = false;
-  g_dynamic_cps_pps_sequence             = 0;
-  g_dynamic_cps_last_pvc_dwt_at_edge     = 0;
-  g_dynamic_cps_last_reseed_value        = 0;
-  g_dynamic_cps_last_reseed_was_computed = false;
-}
-
-static void dynamic_cps_cadence_update(uint32_t qtimer_event_dwt,
-                                       uint32_t cadence_tick_mod_1000) {
-  pps_t pps; pps_vclock_t pvc;
-  if (!store_load(pps, pvc)) return;
-  if (pvc.sequence == 0 || pvc.gnss_ns_at_edge < 0) return;
-
-  // PPS edge boundary: reseed cps from the two-bookend measurement.
-  if (pvc.sequence != g_dynamic_cps_pps_sequence) {
-    if (g_dynamic_cps_pps_sequence != 0) {
-      g_dynamic_cps = pvc.dwt_at_edge - g_dynamic_cps_last_pvc_dwt_at_edge;
-      g_dynamic_cps_valid = true;
-      g_dynamic_cps_last_reseed_value = g_dynamic_cps;
-      g_dynamic_cps_last_reseed_was_computed = true;
-    } else {
-      g_dynamic_cps_valid = false;
-      g_dynamic_cps_last_reseed_was_computed = false;
-    }
-    g_dynamic_cps_last_pvc_dwt_at_edge = pvc.dwt_at_edge;
-    g_dynamic_cps_pps_sequence         = pvc.sequence;
-  }
-
-  if (!g_dynamic_cps_valid || g_dynamic_cps == 0) return;
-
-  // PPS_VCLOCK math: gnss_offset_ns derived from cadence_tick_mod_1000 × 1 ms.
-  // cadence_tick_mod_1000 is the post-increment value; tick N is N ms past PPS.
-  const int64_t gnss_offset_ns = (int64_t)cadence_tick_mod_1000 * 1000000LL;
-
-  // Exact 1-second boundary belongs to the next epoch — skip it.
-  if (gnss_offset_ns >= GNSS_NS_PER_SECOND) return;
-  if (gnss_offset_ns <  DYNAMIC_CPS_MIN_REFINE_OFFSET_NS) return;
-  if (gnss_offset_ns >  DYNAMIC_CPS_MAX_REFINE_OFFSET_NS) return;
-
-  const uint32_t observed_cycles = qtimer_event_dwt - pvc.dwt_at_edge;
-  const uint32_t inferred_cps =
-      (uint32_t)(((uint64_t)observed_cycles * (uint64_t)GNSS_NS_PER_SECOND +
-                  (uint64_t)gnss_offset_ns / 2ULL) /
-                 (uint64_t)gnss_offset_ns);
-
-  int32_t cps_error = (int32_t)((int64_t)inferred_cps - (int64_t)g_dynamic_cps);
-  int32_t cps_step  = cps_error >> DYNAMIC_CPS_BLEND_SHIFT;
-  if (cps_step == 0 && cps_error != 0) {
-    cps_step = (cps_error > 0) ? 1 : -1;
-  }
-  if (cps_step >  DYNAMIC_CPS_MAX_STEP_CYCLES) cps_step =  DYNAMIC_CPS_MAX_STEP_CYCLES;
-  if (cps_step < -DYNAMIC_CPS_MAX_STEP_CYCLES) cps_step = -DYNAMIC_CPS_MAX_STEP_CYCLES;
-
-  g_dynamic_cps = (uint32_t)((int32_t)g_dynamic_cps + cps_step);
-}
+// The intra-second DWT cycles-per-second refinement model is owned by
+// process_time.  process_interrupt still provides this legacy accessor so
+// existing diagnostics and callers continue to compile.
 
 uint32_t interrupt_dynamic_cps(void) {
-  return g_dynamic_cps;
+  return time_dynamic_cps_current();
 }
 
 // ============================================================================
@@ -345,8 +271,10 @@ static void pvc_anchor_publish(const pps_vclock_t& pvc) {
   g_pvc_anchor_ring[next].dwt_at_edge = pvc.dwt_at_edge;
   g_pvc_anchor_ring[next].counter32_at_edge = pvc.counter32_at_edge;
   g_pvc_anchor_ring[next].gnss_ns_at_edge = pvc.gnss_ns_at_edge;
-  g_pvc_anchor_ring[next].cps = g_dynamic_cps;
-  g_pvc_anchor_ring[next].cps_valid = g_dynamic_cps_valid && g_dynamic_cps != 0;
+  uint32_t cps = 0;
+  const bool cps_valid = time_dynamic_cps_for_pvc_sequence(pvc.sequence, &cps);
+  g_pvc_anchor_ring[next].cps = cps;
+  g_pvc_anchor_ring[next].cps_valid = cps_valid && cps != 0;
 
   g_pvc_anchor_head = next;
   if (g_pvc_anchor_count < PVC_ANCHOR_RING_SIZE) {
@@ -513,15 +441,22 @@ static bridge_projection_t interrupt_dwt_to_vclock_gnss_projection(uint32_t dwt_
       continue;
     }
 
-    if (!a.cps_valid || a.cps == 0) {
+    uint32_t cps = 0;
+    bool cps_valid = time_dynamic_cps_for_pvc_sequence(a.sequence, &cps);
+    if (!cps_valid && a.cps_valid && a.cps != 0) {
+      cps = a.cps;
+      cps_valid = true;
+    }
+
+    if (!cps_valid || cps == 0) {
       out.anchor_failure_mask |= ANCHOR_FAIL_NO_CPS;
       continue;
     }
 
     const uint32_t dwt_delta = dwt_at_event - a.dwt_at_edge;
     const uint64_t ns_delta =
-        ((uint64_t)dwt_delta * (uint64_t)GNSS_NS_PER_SECOND + (uint64_t)a.cps / 2ULL) /
-        (uint64_t)a.cps;
+        ((uint64_t)dwt_delta * (uint64_t)GNSS_NS_PER_SECOND + (uint64_t)cps / 2ULL) /
+        (uint64_t)cps;
 
     if (ns_delta > PVC_ANCHOR_MAX_EVENT_OFFSET_NS) {
       out.anchor_failure_mask |= ANCHOR_FAIL_DELTA_RANGE;
@@ -536,7 +471,7 @@ static bridge_projection_t interrupt_dwt_to_vclock_gnss_projection(uint32_t dwt_
         : ((age == 1) ? ANCHOR_SELECT_PREVIOUS : ANCHOR_SELECT_OLDER);
     out.anchor_dwt_at_edge = a.dwt_at_edge;
     out.anchor_gnss_ns_at_edge = a.gnss_ns_at_edge;
-    out.anchor_cps = a.cps;
+    out.anchor_cps = cps;
     out.anchor_ns_delta = ns_delta;
     return out;
   }
@@ -1071,7 +1006,7 @@ static void vclock_cadence_isr(uint32_t isr_entry_dwt_raw) {
 
   const uint32_t cadence_tick_mod_1000 = g_vclock_lane.tick_mod_1000 + 1;
 
-  dynamic_cps_cadence_update(qtimer_event_dwt, cadence_tick_mod_1000);
+  time_dynamic_cps_cadence_update(qtimer_event_dwt, cadence_tick_mod_1000);
 
   if (++g_vclock_lane.tick_mod_1000 >= TICKS_PER_SECOND_EVENT) {
     g_vclock_lane.tick_mod_1000 = 0;
@@ -1422,6 +1357,8 @@ void process_interrupt_gpio6789_irq(uint32_t isr_entry_dwt_raw) {
     pvc_anchor_ring_reset();
   }
 
+  time_dynamic_cps_pps_vclock_edge(pvc.sequence, pvc.dwt_at_edge);
+
   store_publish(pps, pvc);
   pvc_anchor_publish(pvc);
 
@@ -1565,7 +1502,7 @@ void interrupt_request_pps_rebootstrap(void) {
   g_pps_rebootstrap_pending = true;
   g_vclock_epoch_gnss_ns = -1;
   g_pvc_anchor_reset_pending = true;
-  dynamic_cps_reset_model();
+  time_dynamic_cps_reset();
 }
 
 bool interrupt_pps_rebootstrap_pending(void) { return g_pps_rebootstrap_pending; }
@@ -1744,7 +1681,7 @@ void process_interrupt_init(void) {
   g_qtimer1_ch2_last_target_counter32 = 0;
   g_qtimer1_ch2_arm_count = 0;
 
-  dynamic_cps_reset_model();
+  time_dynamic_cps_reset();
 
   g_interrupt_runtime_ready = true;
 }
@@ -1850,13 +1787,20 @@ static Payload cmd_report(const Payload&) {
   p.add("ocxo2_tick_mod_1000",      g_ocxo2_lane.tick_mod_1000);
   p.add("ocxo2_logical_count32",    g_ocxo2_lane.logical_count32_at_last_second);
 
-  // Dynamic CPS — bookend reseed value + live refined value.
-  p.add("dynamic_cps",                         g_dynamic_cps);
-  p.add("dynamic_cps_valid",                   g_dynamic_cps_valid);
-  p.add("dynamic_cps_pps_sequence",            g_dynamic_cps_pps_sequence);
-  p.add("dynamic_cps_last_pvc_dwt_at_edge",    g_dynamic_cps_last_pvc_dwt_at_edge);
-  p.add("dynamic_cps_last_reseed_value",       g_dynamic_cps_last_reseed_value);
-  p.add("dynamic_cps_last_reseed_was_computed", g_dynamic_cps_last_reseed_was_computed);
+  // Dynamic CPS — now owned by process_time; mirrored here for compatibility.
+  const time_dynamic_cps_snapshot_t dcps = time_dynamic_cps_snapshot();
+  p.add("dynamic_cps_owner", "TIME");
+  p.add("dynamic_cps",                         dcps.current_cycles);
+  p.add("dynamic_cps_valid",                   dcps.valid);
+  p.add("dynamic_cps_pps_sequence",            dcps.pvc_sequence);
+  p.add("dynamic_cps_last_pvc_dwt_at_edge",    dcps.pvc_dwt_at_edge);
+  p.add("dynamic_cps_last_reseed_value",       dcps.base_cycles);
+  p.add("dynamic_cps_last_reseed_was_computed", dcps.valid);
+  p.add("dynamic_cps_net_adjustment_cycles",   dcps.net_adjustment_cycles);
+  p.add("dynamic_cps_refine_ticks_this_second", dcps.refine_ticks_this_second);
+  p.add("dynamic_cps_adjustments_this_second", dcps.adjustments_this_second);
+  p.add("dynamic_cps_total_refine_ticks",      dcps.total_refine_ticks);
+  p.add("dynamic_cps_total_adjustments",       dcps.total_adjustments);
 
   p.add("pvc_anchor_ring_count", g_pvc_anchor_count);
   p.add("pvc_anchor_ring_head", g_pvc_anchor_head);

@@ -622,16 +622,12 @@ uint16_t interrupt_qtimer3_ch3_counter_now(void);
 uint32_t interrupt_qtimer1_counter32_now (void);
 
 // ============================================================================
-// Dynamic DWT cycles per GNSS second
+// Dynamic DWT cycles per GNSS second — compatibility accessor
 // ============================================================================
 //
-// The PPS_VCLOCK-phased VCLOCK cadence ISR observes ARM_DWT_CYCCNT at each
-// 1 ms tick and refines an estimate of DWT cycles per GNSS second.  Anchor
-// is pvc.dwt_at_edge — the canonical PPS_VCLOCK DWT.  At each PPS edge the
-// estimate is reseeded from the two-bookend measurement
-// (pvc.dwt_at_edge[N] - pvc.dwt_at_edge[N-1]).  Between edges it is
-// refined per tick by blending toward the inferred CPS implied by the
-// observed mid-second DWT displacement.
+// Dynamic CPS ownership has moved to process_time.  process_interrupt still
+// exposes this legacy accessor so older diagnostics and callers can ask for
+// the current refined CPS without knowing about the ownership change.
 
 uint32_t interrupt_dynamic_cps(void);
 
