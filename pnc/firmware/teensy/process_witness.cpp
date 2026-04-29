@@ -24,6 +24,9 @@
 // and makes the stimulus visually regular.
 //
 // Current command surface:
+//   START         — enable full witness instrumentation/circus.
+//   STOP          — cancel witness timers/hooks and return to quiet state.
+//   REPORT        — lifecycle/hardware/timer state.
 //   EDGE          — PPS/PPS_VCLOCK heartbeat + last edge facts.
 //   BRIDGE        — DWT/GNSS bridge check using interrupt-owned QTimer1 CH1.
 //   GPIO_DELAY    — simple digitalWriteFast HIGH stimulus cost.
@@ -143,7 +146,12 @@ static inline double cycles_to_ns(double cycles) {
 static volatile bool g_witness_hw_ready = false;
 static volatile bool g_witness_runtime_ready = false;
 static volatile bool g_witness_irqs_enabled = false;
+static volatile bool g_witness_running = false;
 static volatile bool g_witness_schedule_armed = false;
+static volatile uint32_t g_witness_start_count = 0;
+static volatile uint32_t g_witness_stop_count = 0;
+static volatile uint32_t g_witness_last_start_dwt = 0;
+static volatile uint32_t g_witness_last_stop_dwt = 0;
 static volatile uint32_t g_witness_cycle_count = 0;
 static volatile uint32_t g_witness_cycle_reschedules = 0;
 
@@ -399,6 +407,9 @@ static void pps_phase_capture(const interrupt_qtimer1_ch1_compare_event_t& event
                               const pps_vclock_t& pvc,
                               uint32_t dynamic_cps);
 static void qtimer2_arm_next_edge(void);
+static bool witness_start_activity(void);
+static void witness_stop_activity(void);
+static Payload witness_state_payload(void);
 
 // ============================================================================
 // QTimer2 CH0 helpers — intentionally old process_interrupt style
@@ -424,6 +435,8 @@ static inline void qtimer2_ch0_disable_compare(void) {
 }
 
 static void qtimer2_arm_next_edge(void) {
+  if (!g_witness_running) return;
+
   const uint16_t cntr = IMXRT_TMR2.CH[0].CNTR;
   const uint16_t target = (uint16_t)(cntr + 1);
 
@@ -564,6 +577,8 @@ static int64_t entry_latency_target_gnss_for_counter(uint32_t target_counter32) 
 }
 
 static bool entry_latency_arm_pps_spin(void) {
+  if (!g_witness_running) return false;
+
   const pps_vclock_t pvc = interrupt_last_pps_vclock();
   if (pvc.sequence == 0 || pvc.gnss_ns_at_edge < 0) {
     g_entry_pps.arm_failures++;
@@ -596,6 +611,8 @@ static bool entry_latency_arm_pps_spin(void) {
 }
 
 static bool entry_latency_arm_qtimer_spin(uint32_t target_counter32) {
+  if (!g_witness_running) return false;
+
   const int64_t target_event_gnss_ns =
       entry_latency_target_gnss_for_counter(target_counter32);
   if (target_event_gnss_ns < 0) {
@@ -630,18 +647,24 @@ static bool entry_latency_arm_qtimer_spin(uint32_t target_counter32) {
 }
 
 static void entry_latency_pps_spin_callback(timepop_ctx_t*, timepop_diag_t*, void*) {
+  if (!g_witness_running) return;
+
   g_entry_pps.armed = false;
   entry_latency_spin(g_entry_pps);
   (void)entry_latency_arm_pps_spin();
 }
 
 static void entry_latency_qtimer_spin_callback(timepop_ctx_t*, timepop_diag_t*, void*) {
+  if (!g_witness_running) return;
+
   g_entry_qtimer.armed = false;
   entry_latency_spin(g_entry_qtimer);
 }
 
 static void entry_latency_pps_isr_handler(uint32_t sequence,
                                           uint32_t isr_entry_dwt_raw) {
+  if (!g_witness_running) return;
+
   g_phase_pps_sequence = sequence;
   g_phase_pps_isr_entry_dwt_raw = isr_entry_dwt_raw;
   entry_latency_record_isr(g_entry_pps, sequence, isr_entry_dwt_raw);
@@ -677,6 +700,8 @@ static inline void capture_qtimer_read_sample(uint32_t isr_entry_dwt_raw) {
 void witness_gpio_isr(void) {
   const uint32_t isr_entry_dwt_raw = ARM_DWT_CYCCNT;
 
+  if (!g_witness_running) return;
+
   capture_qtimer_read_sample(isr_entry_dwt_raw);
 
   if (g_active_window != witness_window_t::GPIO) {
@@ -707,6 +732,10 @@ static void qtimer2_isr(void) {
 
   qtimer2_ch0_clear_compare_flag();
 
+  if (!g_witness_running) {
+    return;
+  }
+
   if (g_active_window == witness_window_t::QTIMER) {
     const int32_t sample = (int32_t)(isr_entry_dwt_raw - g_source_dwt_at_emit);
 
@@ -728,6 +757,8 @@ static void qtimer2_isr(void) {
 // ============================================================================
 
 static void gpio_high_callback(timepop_ctx_t*, timepop_diag_t*, void*) {
+  if (!g_witness_running) return;
+
   g_active_window = witness_window_t::GPIO;
   pinMode(WITNESS_GPIO_PIN, INPUT);
   attachInterrupt(digitalPinToInterrupt(WITNESS_GPIO_PIN), witness_gpio_isr, RISING);
@@ -735,18 +766,24 @@ static void gpio_high_callback(timepop_ctx_t*, timepop_diag_t*, void*) {
 }
 
 static void gpio_low_callback(timepop_ctx_t*, timepop_diag_t*, void*) {
+  if (!g_witness_running) return;
+
   witness_drive_low();
   detachInterrupt(digitalPinToInterrupt(WITNESS_GPIO_PIN));
   g_active_window = witness_window_t::NONE;
 }
 
 static void qtimer_high_callback(timepop_ctx_t*, timepop_diag_t*, void*) {
+  if (!g_witness_running) return;
+
   detachInterrupt(digitalPinToInterrupt(WITNESS_GPIO_PIN));
   g_active_window = witness_window_t::QTIMER;
   witness_drive_high();
 }
 
 static void qtimer_low_callback(timepop_ctx_t*, timepop_diag_t*, void*) {
+  if (!g_witness_running) return;
+
   witness_drive_low();
   g_active_window = witness_window_t::NONE;
 }
@@ -789,6 +826,8 @@ static void witness_arm_cycle_edges(void) {
 }
 
 static void witness_cycle_callback(timepop_ctx_t*, timepop_diag_t*, void*) {
+  if (!g_witness_running) return;
+
   g_witness_cycle_count++;
 
   // Start every cycle from a known, quiet witness state.  The QTimer rail
@@ -810,6 +849,7 @@ static void witness_cycle_callback(timepop_ctx_t*, timepop_diag_t*, void*) {
 }
 
 static void witness_schedule_first_test(void) {
+  if (!g_witness_running) return;
   if (g_witness_schedule_armed) return;
 
   timepop_cancel_by_name(WITNESS_CYCLE_NAME);
@@ -829,6 +869,86 @@ static void witness_schedule_first_test(void) {
   // the recurring supervisor.  This avoids chains of child callbacks.
   g_witness_cycle_count++;
   witness_arm_cycle_edges();
+}
+
+// ============================================================================
+// START / STOP lifecycle
+// ============================================================================
+
+static void witness_cancel_all_timepop_callbacks(void) {
+  timepop_cancel_by_name(WITNESS_CYCLE_NAME);
+  witness_cancel_edge_callbacks();
+  timepop_cancel_by_name(ENTRY_PPS_SPIN_NAME);
+  timepop_cancel_by_name(ENTRY_QTIMER_SPIN_NAME);
+}
+
+static void witness_quiesce_outputs_and_irqs(void) {
+  detachInterrupt(digitalPinToInterrupt(WITNESS_GPIO_PIN));
+  digitalWriteFast(WITNESS_STIMULUS_PIN, LOW);
+  g_source_high = false;
+  g_active_window = witness_window_t::NONE;
+
+  qtimer2_ch0_disable_compare();
+
+  interrupt_qtimer1_ch1_disable_compare();
+  interrupt_register_qtimer1_ch1_handler(nullptr);
+  interrupt_register_pps_entry_latency_handler(nullptr);
+}
+
+static void witness_clear_live_flags(void) {
+  g_witness_schedule_armed = false;
+  g_bridge_armed = false;
+
+  g_entry_pps.armed = false;
+  g_entry_pps.spin_active = false;
+  g_entry_qtimer.armed = false;
+  g_entry_qtimer.spin_active = false;
+
+  g_active_window = witness_window_t::NONE;
+}
+
+static bool witness_start_activity(void) {
+  if (!g_witness_runtime_ready) return false;
+
+  if (g_witness_running) {
+    return true;
+  }
+
+  // Begin from a fully quiet state.  This handles stale callbacks left over
+  // from an interrupted prior run and makes START idempotent from the outside.
+  witness_cancel_all_timepop_callbacks();
+  witness_quiesce_outputs_and_irqs();
+  witness_clear_live_flags();
+
+  g_witness_running = true;
+  g_witness_start_count++;
+  g_witness_last_start_dwt = ARM_DWT_CYCCNT;
+
+  // These hooks are intentionally registered only while witness is running.
+  // STOP removes them so the timing hot paths stay quiet during campaign init.
+  interrupt_register_qtimer1_ch1_handler(bridge_ch1_handler);
+  interrupt_register_pps_entry_latency_handler(entry_latency_pps_isr_handler);
+
+  // Full circus: round-trip supervisor, QTimer2 sink rail, CH1 bridge, and
+  // PPS entry-latency spin.  Individual commands may also re-arm their own
+  // instruments, but START brings the legacy always-on witness behavior back.
+  qtimer2_arm_next_edge();
+  witness_schedule_first_test();
+  (void)entry_latency_arm_pps_spin();
+
+  return true;
+}
+
+static void witness_stop_activity(void) {
+  if (!g_witness_runtime_ready && !g_witness_running) return;
+
+  g_witness_running = false;
+  g_witness_stop_count++;
+  g_witness_last_stop_dwt = ARM_DWT_CYCCNT;
+
+  witness_cancel_all_timepop_callbacks();
+  witness_quiesce_outputs_and_irqs();
+  witness_clear_live_flags();
 }
 
 // ============================================================================
@@ -871,7 +991,101 @@ static Payload ns_welford_payload(const welford_t& w) {
   return p;
 }
 
+static const char* witness_window_str(witness_window_t w) {
+  switch (w) {
+    case witness_window_t::GPIO:   return "GPIO";
+    case witness_window_t::QTIMER: return "QTIMER";
+    default:                       return "NONE";
+  }
+}
+
+static Payload witness_state_payload(void) {
+  Payload p;
+  p.add("running", g_witness_running);
+  p.add("hardware_ready", g_witness_hw_ready);
+  p.add("runtime_ready", g_witness_runtime_ready);
+  p.add("irqs_enabled", g_witness_irqs_enabled);
+  p.add("start_count", g_witness_start_count);
+  p.add("stop_count", g_witness_stop_count);
+  p.add("last_start_dwt", g_witness_last_start_dwt);
+  p.add("last_stop_dwt", g_witness_last_stop_dwt);
+
+  Payload timepop_state;
+  timepop_state.add("cycle_armed", g_witness_schedule_armed);
+  timepop_state.add("cycle_count", g_witness_cycle_count);
+  timepop_state.add("cycle_reschedules", g_witness_cycle_reschedules);
+  timepop_state.add("bridge_armed", g_bridge_armed);
+  timepop_state.add("entry_pps_armed", g_entry_pps.armed);
+  timepop_state.add("entry_pps_spin_active", g_entry_pps.spin_active);
+  timepop_state.add("entry_qtimer_armed", g_entry_qtimer.armed);
+  timepop_state.add("entry_qtimer_spin_active", g_entry_qtimer.spin_active);
+  p.add_object("timepop", timepop_state);
+
+  const uint16_t ch1_csctrl = interrupt_qtimer1_ch1_csctrl_now();
+  Payload qtimer1_ch1;
+  qtimer1_ch1.add("counter", (uint32_t)interrupt_qtimer1_ch1_counter_now());
+  qtimer1_ch1.add("comp1", (uint32_t)interrupt_qtimer1_ch1_comp1_now());
+  qtimer1_ch1.add("csctrl", (uint32_t)ch1_csctrl);
+  qtimer1_ch1.add("compare_enabled", (bool)(ch1_csctrl & TMR_CSCTRL_TCF1EN));
+  qtimer1_ch1.add("compare_flag", (bool)(ch1_csctrl & TMR_CSCTRL_TCF1));
+  p.add_object("qtimer1_ch1_bridge", qtimer1_ch1);
+
+  Payload qtimer2;
+  qtimer2.add("counter", (uint32_t)IMXRT_TMR2.CH[0].CNTR);
+  qtimer2.add("comp1", (uint32_t)IMXRT_TMR2.CH[0].COMP1);
+  qtimer2.add("csctrl", (uint32_t)IMXRT_TMR2.CH[0].CSCTRL);
+  qtimer2.add("compare_enabled", (bool)(IMXRT_TMR2.CH[0].CSCTRL & TMR_CSCTRL_TCF1EN));
+  qtimer2.add("compare_flag", (bool)(IMXRT_TMR2.CH[0].CSCTRL & TMR_CSCTRL_TCF1));
+  qtimer2.add("arms", g_qtimer_arms);
+  qtimer2.add("irq_entries", g_qtimer_irq_entries);
+  qtimer2.add("hits", g_qtimer_hits);
+  qtimer2.add("no_flag", g_qtimer_no_flag);
+  qtimer2.add("outside_window", g_qtimer_outside_window);
+  qtimer2.add("last_compare_target", (uint32_t)g_qtimer_compare_target);
+  p.add_object("qtimer2_ch0_sink", qtimer2);
+
+  Payload gpio;
+  gpio.add("active_window", witness_window_str(g_active_window));
+  gpio.add("source_high", g_source_high);
+  gpio.add("source_emits", g_source_emits);
+  gpio.add("source_lows", g_source_lows);
+  gpio.add("gpio_hits", g_gpio_hits);
+  gpio.add("gpio_wrong_window", g_gpio_wrong_window);
+  p.add_object("gpio", gpio);
+
+  Payload bridge;
+  bridge.add("armed", g_bridge_armed);
+  bridge.add("fires_total", (uint32_t)g_bridge_fires_total);
+  bridge.add("arm_count", (uint32_t)g_bridge_arm_count);
+  bridge.add("arm_failures", (uint32_t)g_bridge_arm_failures);
+  bridge.add("last_armed_target_counter32", g_bridge_last_armed_target_counter32);
+  bridge.add("skipped_no_anchor", (uint32_t)g_bridge_skipped_no_anchor);
+  bridge.add("skipped_no_dynamic_cps", (uint32_t)g_bridge_skipped_no_dynamic_cps);
+  p.add_object("bridge", bridge);
+
+  Payload entry;
+  entry.add("pps_armed", g_entry_pps.armed);
+  entry.add("pps_spin_active", g_entry_pps.spin_active);
+  entry.add("pps_last_timeout", g_entry_pps.last_timeout);
+  entry.add("pps_arm_count", g_entry_pps.arm_count);
+  entry.add("pps_arm_failures", g_entry_pps.arm_failures);
+  entry.add("pps_timeout_count", g_entry_pps.timeout_count);
+  entry.add("pps_samples", g_entry_pps.sample_count);
+  entry.add("qtimer_armed", g_entry_qtimer.armed);
+  entry.add("qtimer_spin_active", g_entry_qtimer.spin_active);
+  entry.add("qtimer_last_timeout", g_entry_qtimer.last_timeout);
+  entry.add("qtimer_arm_count", g_entry_qtimer.arm_count);
+  entry.add("qtimer_arm_failures", g_entry_qtimer.arm_failures);
+  entry.add("qtimer_timeout_count", g_entry_qtimer.timeout_count);
+  entry.add("qtimer_samples", g_entry_qtimer.sample_count);
+  p.add_object("entry_latency", entry);
+
+  return p;
+}
+
 static bool bridge_arm_next_sample(void) {
+  if (!g_witness_running) return false;
+
   const pps_vclock_t pvc = interrupt_last_pps_vclock();
   if (pvc.sequence == 0 || pvc.gnss_ns_at_edge < 0) {
     g_bridge_skipped_no_anchor++;
@@ -1046,13 +1260,14 @@ static void bridge_capture(const interrupt_qtimer1_ch1_compare_event_t& event) {
 
 static void bridge_ch1_handler(const interrupt_qtimer1_ch1_compare_event_t& event) {
   g_bridge_armed = false;
+  if (!g_witness_running) return;
   entry_latency_record_isr(g_entry_qtimer, event.sequence, event.isr_entry_dwt_raw);
   bridge_capture(event);
   (void)bridge_arm_next_sample();
 }
 
 static Payload cmd_bridge(const Payload&) {
-  if (!g_bridge_armed && g_witness_runtime_ready) {
+  if (g_witness_running && !g_bridge_armed && g_witness_runtime_ready) {
     (void)bridge_arm_next_sample();
   }
 
@@ -1111,7 +1326,7 @@ static Payload cmd_bridge(const Payload&) {
 // ============================================================================
 
 static Payload cmd_pps_phase(const Payload&) {
-  if (!g_bridge_armed && g_witness_runtime_ready) {
+  if (g_witness_running && !g_bridge_armed && g_witness_runtime_ready) {
     (void)bridge_arm_next_sample();
   }
 
@@ -1226,7 +1441,7 @@ static Payload cmd_dwt_read(const Payload&) {
 // ============================================================================
 
 static Payload cmd_qtimer_read(const Payload&) {
-  if (!g_witness_schedule_armed && g_witness_runtime_ready) {
+  if (g_witness_running && !g_witness_schedule_armed && g_witness_runtime_ready) {
     witness_schedule_first_test();
   }
 
@@ -1289,7 +1504,7 @@ static Payload entry_latency_payload(const entry_latency_state_t& s) {
 }
 
 static Payload cmd_entry_latency(const Payload&) {
-  if (g_witness_runtime_ready) {
+  if (g_witness_running && g_witness_runtime_ready) {
     if (!g_entry_pps.armed && !g_entry_pps.spin_active) {
       (void)entry_latency_arm_pps_spin();
     }
@@ -1305,6 +1520,42 @@ static Payload cmd_entry_latency(const Payload&) {
   p.add("timeout_ns", cycles_to_ns((double)ENTRY_LATENCY_TIMEOUT_CYCLES));
   p.add_object("pps", entry_latency_payload(g_entry_pps));
   p.add_object("qtimer", entry_latency_payload(g_entry_qtimer));
+  return p;
+}
+
+// ============================================================================
+// START / STOP / REPORT commands
+// ============================================================================
+
+static Payload cmd_start(const Payload&) {
+  Payload p;
+  if (!g_witness_runtime_ready) {
+    p.add("status", "not_ready");
+    p.add_object("state", witness_state_payload());
+    return p;
+  }
+
+  const bool already_running = g_witness_running;
+  const bool ok = witness_start_activity();
+  p.add("status", ok ? (already_running ? "already_running" : "started") : "start_failed");
+  p.add_object("state", witness_state_payload());
+  return p;
+}
+
+static Payload cmd_stop(const Payload&) {
+  const bool was_running = g_witness_running;
+  witness_stop_activity();
+
+  Payload p;
+  p.add("status", was_running ? "stopped" : "already_stopped");
+  p.add_object("state", witness_state_payload());
+  return p;
+}
+
+static Payload cmd_report(const Payload&) {
+  Payload p;
+  p.add("model", "WITNESS_LIFECYCLE_AND_HARDWARE_STATE");
+  p.add_object("state", witness_state_payload());
   return p;
 }
 
@@ -1384,7 +1635,7 @@ static Payload cmd_edge(const Payload&) {
 // ============================================================================
 
 static Payload cmd_round_trip(const Payload&) {
-  if (!g_witness_schedule_armed && g_witness_runtime_ready) {
+  if (g_witness_running && !g_witness_schedule_armed && g_witness_runtime_ready) {
     witness_schedule_first_test();
   }
 
@@ -1532,24 +1783,24 @@ void process_witness_init(void) {
   welford_reset(g_bridge_residual_welford);
   welford_reset(g_bridge_dynamic_residual_welford);
 
-  interrupt_register_qtimer1_ch1_handler(bridge_ch1_handler);
-  interrupt_register_pps_entry_latency_handler(entry_latency_pps_isr_handler);
+  // Witness is registered at boot but remains operationally quiet until
+  // WITNESS.START.  The hot-path hooks and timer rails are installed/armed
+  // only while running, then removed again by WITNESS.STOP.
+  interrupt_register_qtimer1_ch1_handler(nullptr);
+  interrupt_register_pps_entry_latency_handler(nullptr);
 
   digitalWriteFast(WITNESS_STIMULUS_PIN, LOW);
 
-  // Stable QTimer rail: configured once and left continuously armed.
-  // GPIO is attached only inside the GPIO measurement window so it cannot
-  // preempt the QTimer measurement window.
+  // Stable QTimer rail: configured once, but compare interrupts remain
+  // disabled until START.  GPIO is attached only inside the GPIO measurement
+  // window while witness is running.
   pinMode(WITNESS_GPIO_PIN, INPUT);
   detachInterrupt(digitalPinToInterrupt(WITNESS_GPIO_PIN));
+  qtimer2_ch0_disable_compare();
 
-  qtimer2_arm_next_edge();
-
+  g_witness_running = false;
   g_witness_schedule_armed = false;
   g_witness_runtime_ready = true;
-
-  witness_schedule_first_test();
-  (void)entry_latency_arm_pps_spin();
 }
 
 void process_witness_enable_irqs(void) {
@@ -1563,6 +1814,9 @@ void process_witness_enable_irqs(void) {
 }
 
 static const process_command_entry_t WITNESS_COMMANDS[] = {
+  { "START",       cmd_start       },
+  { "STOP",        cmd_stop        },
+  { "REPORT",      cmd_report      },
   { "EDGE",        cmd_edge        },
   { "BRIDGE",      cmd_bridge      },
   { "PPS_PHASE",   cmd_pps_phase   },

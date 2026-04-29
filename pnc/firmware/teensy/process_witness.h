@@ -12,6 +12,9 @@
 //   • 800 ms  QTIMER LOW
 //
 // Current command surface:
+//   .tw witness start        (enable full witness instrumentation/circus)
+//   .tw witness stop         (cancel witness timers/hooks; quiet state)
+//   .tw witness report       (lifecycle/hardware/timer state)
 //   .tw witness edge         (PPS/PPS_VCLOCK heartbeat + last edge facts)
 //   .tw witness bridge       (DWT/GNSS bridge check using interrupt-owned QTimer1 CH1)
 //   .tw witness pps_phase    (PPS notification vs selected VCLOCK edge phase)
