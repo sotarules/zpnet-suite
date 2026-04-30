@@ -222,8 +222,6 @@ _diag: Dict[str, Any] = {
 
     "last_pps_count_anomaly": {},    # legacy diagnostic alias
     "last_pps_vclock_count_anomaly": {},
-    "pps_vclock_count_ledger_mismatches": 0,
-    "last_pps_vclock_count_ledger_mismatch": {},
 
     # Recovery accounting
     "recovery_checks": 0,
@@ -1002,7 +1000,6 @@ def _compute_ppb(clock_ns: int, gnss_ns: int) -> float:
 # ---------------------------------------------------------------------
 
 PPS_VCLOCK_COUNT_KEY = "teensy_pps_vclock_count"
-PPS_VCLOCK_LEDGER_KEYS = ("pps_vclock_ns", "vclock_ns", "pps_ns", "gnss_ns")
 
 
 
@@ -1024,22 +1021,6 @@ def _first_present_int(mapping: Dict[str, Any], *keys: str) -> Optional[int]:
     return None
 
 
-def _fragment_count_from_ledger_ns(fragment: Dict[str, Any]) -> Optional[int]:
-    """
-    Derive the canonical PPS/VCLOCK count from the fragment nanosecond ledger.
-
-    This is intentionally a low-hanging recovery guard.  During a recovery
-    transition it is possible for a legacy count field to drift away from the
-    Teensy's actual synthetic GNSS/PPS_VCLOCK ledger.  The ledger is the sacred
-    clock value; when the count and ledger violently disagree, the Pi uses the
-    ledger-derived count and logs the disagreement.
-    """
-    ledger_ns = _first_present_int(fragment, *PPS_VCLOCK_LEDGER_KEYS)
-    if ledger_ns is None or ledger_ns < 0:
-        return None
-    return int(ledger_ns // NS_PER_SECOND)
-
-
 def _extract_teensy_pps_vclock_count(fragment: Dict[str, Any]) -> int:
     """
     Return the mandatory canonical one-second identity from a TIMEBASE_FRAGMENT.
@@ -1056,30 +1037,6 @@ def _extract_teensy_pps_vclock_count(fragment: Dict[str, Any]) -> int:
         raise ValueError(
             f"TIMEBASE_FRAGMENT invalid teensy_pps_vclock_count={fragment.get(PPS_VCLOCK_COUNT_KEY)!r}"
         ) from e
-
-
-def _note_count_ledger_diagnostic(fragment: Dict[str, Any], count: int) -> None:
-    """Record count/ledger disagreement as diagnostic only; never repair identity."""
-    ledger_count = _fragment_count_from_ledger_ns(fragment)
-    if ledger_count is None:
-        return
-    delta = int(count) - int(ledger_count)
-    if delta == 0:
-        return
-    _diag["pps_vclock_count_ledger_mismatches"] = (
-        _diag.get("pps_vclock_count_ledger_mismatches", 0) + 1
-    )
-    _diag["last_pps_vclock_count_ledger_mismatch"] = {
-        "ts_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
-        "teensy_pps_vclock_count": int(count),
-        "ledger_count_diagnostic": int(ledger_count),
-        "delta": int(delta),
-        "ledger_ns": _first_present_int(fragment, *PPS_VCLOCK_LEDGER_KEYS),
-    }
-    logging.warning(
-        "⚠️ [clocks] PPS/VCLOCK count/ledger diagnostic mismatch: count=%d ledger=%d delta=%+d — preserving explicit count",
-        int(count), int(ledger_count), int(delta),
-    )
 
 
 def _normalize_fragment_count_aliases(fragment: Dict[str, Any], count: int) -> None:
@@ -1479,7 +1436,6 @@ def on_timebase_fragment(payload: Payload) -> None:
         )
         return
 
-    _note_count_ledger_diagnostic(frag, pps_vclock_count)
     _normalize_fragment_count_aliases(frag, pps_vclock_count)
 
     # --- Sync latch (for START/RECOVER waits) ---
@@ -1539,8 +1495,7 @@ def _process_loop() -> None:
             logging.exception("💥 [clocks] processor received invalid TIMEBASE_FRAGMENT identity")
             continue
 
-        _note_count_ledger_diagnostic(frag, pps_vclock_count)
-        _normalize_fragment_count_aliases(frag, pps_vclock_count)
+            _normalize_fragment_count_aliases(frag, pps_vclock_count)
         _note_pps_vclock_count(pps_vclock_count)
 
         # --- No campaign => ignore ---
