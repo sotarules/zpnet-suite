@@ -155,6 +155,40 @@ struct time_dynamic_cps_snapshot_t {
   uint32_t last_reseed_value;
   bool     last_reseed_was_computed;
 
+  // Every-PPS local PPS→VCLOCK phase probe. Authored by process_interrupt
+  // from raw ISR-entry DWT captures and carried here for report surfaces.
+  // These fields are diagnostic-only; operational DWT↔GNSS projection remains
+  // on the static PPS/VCLOCK bookend ruler while dynamic CPS is witness-only.
+  bool     phase_probe_valid;
+  uint32_t phase_probe_pps_sequence;
+  uint32_t phase_probe_pps_isr_entry_dwt_raw;
+  uint32_t phase_probe_pps_dwt_at_edge;
+  uint32_t phase_probe_selected_counter32;
+  uint32_t phase_probe_target_counter32;
+  uint32_t phase_probe_counter32_at_event;
+  int32_t  phase_probe_counter32_residual_ticks;
+  uint32_t phase_probe_arm_dwt_raw;
+  uint32_t phase_probe_vclock_isr_entry_dwt_raw;
+  uint32_t phase_probe_vclock_dwt_at_event;
+  uint32_t phase_probe_pps_to_arm_raw_cycles;
+  uint32_t phase_probe_arm_to_vclock_raw_cycles;
+  uint32_t phase_probe_raw_delta_cycles;
+  uint32_t phase_probe_ticks_from_sacred_to_probe;
+  uint32_t phase_probe_cps_used;
+  uint32_t phase_probe_cps_source;
+  uint32_t phase_probe_expected_probe_offset_cycles;
+  int64_t  phase_probe_expected_raw_delta_cycles;
+  int32_t  phase_probe_residual_cycles;
+  uint32_t phase_probe_abs_residual_cycles;
+  int64_t  phase_probe_residual_scaled_numerator;
+  uint32_t phase_probe_residual_scaled_denominator;
+  int32_t  phase_probe_residual_millicycles;
+  uint32_t phase_probe_sacred_dwt_from_probe_raw;
+  uint32_t phase_probe_sacred_dwt_from_pps_raw;
+  uint32_t phase_probe_arm_count;
+  uint32_t phase_probe_fire_count;
+  uint32_t phase_probe_miss_count;
+
   // Fixed-anchor line-fit state for the current second.
   uint32_t fit_samples_this_second;
   uint64_t fit_sum_t2_ms2;
@@ -268,6 +302,40 @@ uint32_t time_dynamic_cps_history(time_dynamic_cps_record_t* out_records,
                                   uint32_t max_records);
 
 void     time_dynamic_cps_reset(void);
+
+// Every-PPS local VCLOCK phase-probe diagnostic, authored by
+// process_interrupt from raw ISR-entry DWT captures.  This is intentionally
+// report-only: it feeds the DYNAMIC_CPS_FIRST_MS report so the PPS→VCLOCK
+// raw modulo phase can be compared against the empirical canonical
+// raw PPS→VCLOCK offset without making raw ISR-entry DWT a general timing API.
+void     time_dynamic_cps_phase_probe_update(uint32_t pps_sequence,
+                                             uint32_t pps_isr_entry_dwt_raw,
+                                             uint32_t pps_dwt_at_edge,
+                                             uint32_t selected_counter32,
+                                             uint32_t target_counter32,
+                                             uint32_t counter32_at_event,
+                                             int32_t counter32_residual_ticks,
+                                             uint32_t arm_dwt_raw,
+                                             uint32_t vclock_isr_entry_dwt_raw,
+                                             uint32_t vclock_dwt_at_event,
+                                             uint32_t pps_to_arm_raw_cycles,
+                                             uint32_t arm_to_vclock_raw_cycles,
+                                             uint32_t raw_delta_cycles,
+                                             uint32_t ticks_from_sacred_to_probe,
+                                             uint32_t cps_used,
+                                             uint32_t cps_source,
+                                             uint32_t expected_probe_offset_cycles,
+                                             int64_t expected_raw_delta_cycles,
+                                             int32_t residual_cycles,
+                                             int64_t residual_scaled_numerator,
+                                             uint32_t residual_scaled_denominator,
+                                             int32_t residual_millicycles,
+                                             uint32_t sacred_dwt_from_probe_raw,
+                                             uint32_t sacred_dwt_from_pps_raw,
+                                             uint32_t arm_count,
+                                             uint32_t fire_count,
+                                             uint32_t miss_count);
+
 void     time_dynamic_cps_pps_vclock_edge(uint32_t pvc_sequence,
                                            uint32_t pvc_dwt_at_edge);
 void     time_dynamic_cps_cadence_update(uint32_t qtimer_event_dwt,

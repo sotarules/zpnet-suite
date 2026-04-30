@@ -68,6 +68,37 @@ void clocks_watchdog_anomaly(const char* reason,
                              uint32_t detail2,
                              uint32_t detail3);
 
+// process_time owns the dynamic CPS report surface.  This internal hook lets
+// process_interrupt publish the every-PPS local VCLOCK phase-probe diagnostic
+// without exposing raw ISR-entry DWT as a general timing API.
+void time_dynamic_cps_phase_probe_update(uint32_t pps_sequence,
+                                         uint32_t pps_isr_entry_dwt_raw,
+                                         uint32_t pps_dwt_at_edge,
+                                         uint32_t selected_counter32,
+                                         uint32_t target_counter32,
+                                         uint32_t counter32_at_event,
+                                         int32_t counter32_residual_ticks,
+                                         uint32_t arm_dwt_raw,
+                                         uint32_t vclock_isr_entry_dwt_raw,
+                                         uint32_t vclock_dwt_at_event,
+                                         uint32_t pps_to_arm_raw_cycles,
+                                         uint32_t arm_to_vclock_raw_cycles,
+                                         uint32_t raw_delta_cycles,
+                                         uint32_t ticks_from_sacred_to_probe,
+                                         uint32_t cps_used,
+                                         uint32_t cps_source,
+                                         uint32_t expected_probe_offset_cycles,
+                                         int64_t expected_raw_delta_cycles,
+                                         int32_t residual_cycles,
+                                         int64_t residual_scaled_numerator,
+                                         uint32_t residual_scaled_denominator,
+                                         int32_t residual_millicycles,
+                                         uint32_t sacred_dwt_from_probe_raw,
+                                         uint32_t sacred_dwt_from_pps_raw,
+                                         uint32_t arm_count,
+                                         uint32_t fire_count,
+                                         uint32_t miss_count);
+
 // ============================================================================
 // Constants
 // ============================================================================
@@ -129,6 +160,16 @@ static constexpr uint32_t VCLOCK_DWT_REPAIR_MAX_PREDICTION_RESIDUAL_CYCLES = 25;
 // flooding the foreground queue.
 static constexpr bool     PPS_VCLOCK_PHASE_WATCHDOG_ENABLED = false;
 static constexpr uint32_t PPS_VCLOCK_PHASE_TOLERANCE_CYCLES = 10;
+
+// Every PPS edge arms QTimer1 CH1 as a local VCLOCK phase probe.  The target
+// is intentionally only a few 10 MHz ticks in the future so tau and DWT-vs-ns
+// conversion error vanish below the diagnostic resolution.  If this lead is
+// too aggressive, the missed-probe counter will tell us immediately.
+static constexpr uint32_t PPS_VCLOCK_PHASE_PROBE_LEAD_TICKS = 8;
+
+static constexpr uint32_t PPS_VCLOCK_PHASE_PROBE_CPS_SOURCE_PREDICTION = 1;
+static constexpr uint32_t PPS_VCLOCK_PHASE_PROBE_CPS_SOURCE_DYNAMIC_CPS = 2;
+static constexpr uint32_t PPS_VCLOCK_PHASE_PROBE_CPS_SOURCE_NOMINAL = 3;
 
 // ============================================================================
 // PPS / PPS_VCLOCK doctrine
@@ -896,6 +937,27 @@ static volatile uint32_t g_qtimer1_ch1_hop_count = 0;
 static volatile bool     g_qtimer1_ch1_active = false;
 static volatile interrupt_qtimer1_ch1_handler_fn g_qtimer1_ch1_handler = nullptr;
 
+static constexpr uint8_t QTIMER1_CH1_OWNER_NONE = 0;
+static constexpr uint8_t QTIMER1_CH1_OWNER_HOSTED = 1;
+static constexpr uint8_t QTIMER1_CH1_OWNER_PPS_PHASE_PROBE = 2;
+
+static volatile uint8_t g_qtimer1_ch1_next_owner = QTIMER1_CH1_OWNER_NONE;
+
+struct pps_vclock_phase_probe_t {
+  bool     active = false;
+  uint32_t pps_sequence = 0;
+  uint32_t pps_isr_entry_dwt_raw = 0;
+  uint32_t pps_dwt_at_edge = 0;
+  uint32_t selected_counter32 = 0;
+  uint32_t target_counter32 = 0;
+  uint32_t arm_dwt_raw = 0;
+  uint32_t arm_count = 0;
+  uint32_t fire_count = 0;
+  uint32_t miss_count = 0;
+};
+
+static pps_vclock_phase_probe_t g_pps_vclock_phase_probe = {};
+
 static volatile uint32_t g_qtimer1_ch2_last_target_counter32 = 0;
 static volatile uint32_t g_qtimer1_ch2_arm_count = 0;
 
@@ -1394,28 +1456,68 @@ void interrupt_register_qtimer1_ch1_handler(interrupt_qtimer1_ch1_handler_fn cb)
   g_qtimer1_ch1_handler = cb;
 }
 
+static bool qtimer1_ch1_future_remaining(uint32_t now,
+                                             uint32_t target,
+                                             uint32_t& remaining) {
+  remaining = target - now;
+  return remaining != 0 && remaining <= 0x7FFFFFFFUL;
+}
+
+static void qtimer1_ch1_note_phase_probe_missed(void) {
+  if (!g_pps_vclock_phase_probe.active) return;
+  g_pps_vclock_phase_probe.active = false;
+  g_pps_vclock_phase_probe.miss_count++;
+}
+
 static void qtimer1_ch1_schedule_next_hop(void) {
-  if (!g_qtimer1_ch1_active) return;
-
   const uint32_t now = vclock_synthetic_from_hardware_low16(qtimer1_ch0_counter_now());
-  const uint32_t remaining = g_qtimer1_ch1_target_counter32 - now;
 
-  // If the target is behind us in modular time, stop rather than generating
-  // misleading event facts.  The caller can re-arm from a fresh PPS anchor.
-  if (remaining == 0 || remaining > 0x7FFFFFFFUL) {
-    g_qtimer1_ch1_active = false;
+  uint32_t best_remaining = 0xFFFFFFFFUL;
+  uint32_t best_target = 0;
+  uint8_t best_owner = QTIMER1_CH1_OWNER_NONE;
+
+  if (g_pps_vclock_phase_probe.active) {
+    uint32_t remaining = 0;
+    if (qtimer1_ch1_future_remaining(now,
+                                     g_pps_vclock_phase_probe.target_counter32,
+                                     remaining)) {
+      best_remaining = remaining;
+      best_target = g_pps_vclock_phase_probe.target_counter32;
+      best_owner = QTIMER1_CH1_OWNER_PPS_PHASE_PROBE;
+    } else {
+      qtimer1_ch1_note_phase_probe_missed();
+    }
+  }
+
+  if (g_qtimer1_ch1_active) {
+    uint32_t remaining = 0;
+    if (qtimer1_ch1_future_remaining(now, g_qtimer1_ch1_target_counter32, remaining)) {
+      if (remaining < best_remaining) {
+        best_remaining = remaining;
+        best_target = g_qtimer1_ch1_target_counter32;
+        best_owner = QTIMER1_CH1_OWNER_HOSTED;
+      }
+    } else {
+      // If the hosted target is behind us in modular time, stop rather than
+      // generating misleading event facts.  The caller can re-arm fresh.
+      g_qtimer1_ch1_active = false;
+    }
+  }
+
+  if (best_owner == QTIMER1_CH1_OWNER_NONE) {
+    g_qtimer1_ch1_next_owner = QTIMER1_CH1_OWNER_NONE;
     qtimer1_ch1_disable_compare_hw();
     return;
   }
 
   static constexpr uint32_t CH1_MAX_COMPARE_STEP_TICKS = 49123U;
-
   const uint32_t step =
-      (remaining > CH1_MAX_COMPARE_STEP_TICKS)
+      (best_remaining > CH1_MAX_COMPARE_STEP_TICKS)
           ? CH1_MAX_COMPARE_STEP_TICKS
-          : remaining;
+          : best_remaining;
 
   g_qtimer1_ch1_next_compare_counter32 = now + step;
+  g_qtimer1_ch1_next_owner = best_owner;
 
   const uint16_t hardware_target =
       vclock_hardware_low16_from_synthetic(g_qtimer1_ch1_next_compare_counter32);
@@ -1435,7 +1537,161 @@ bool interrupt_qtimer1_ch1_arm_compare(uint32_t target_counter32) {
 
 void interrupt_qtimer1_ch1_disable_compare(void) {
   g_qtimer1_ch1_active = false;
-  qtimer1_ch1_disable_compare_hw();
+  qtimer1_ch1_schedule_next_hop();
+}
+
+static uint32_t pps_vclock_phase_probe_cps(uint32_t& source) {
+  uint32_t cps = time_dwt_next_prediction_cycles();
+  if (cps != 0) {
+    source = PPS_VCLOCK_PHASE_PROBE_CPS_SOURCE_PREDICTION;
+    return cps;
+  }
+
+  cps = interrupt_dynamic_cps();
+  if (cps != 0) {
+    source = PPS_VCLOCK_PHASE_PROBE_CPS_SOURCE_DYNAMIC_CPS;
+    return cps;
+  }
+
+  source = PPS_VCLOCK_PHASE_PROBE_CPS_SOURCE_NOMINAL;
+  return DWT_EXPECTED_PER_PPS;
+}
+
+static uint32_t rounded_cycles_for_vclock_ticks(uint32_t ticks,
+                                                uint32_t cps) {
+  return (uint32_t)(((uint64_t)ticks * (uint64_t)cps +
+                     (uint64_t)VCLOCK_COUNTS_PER_SECOND / 2ULL) /
+                    (uint64_t)VCLOCK_COUNTS_PER_SECOND);
+}
+
+static int32_t scaled_residual_to_millicycles(int64_t numerator,
+                                              uint32_t denominator) {
+  if (denominator == 0) return 0;
+
+  const bool neg = numerator < 0;
+  uint64_t mag = neg ? (uint64_t)(-numerator) : (uint64_t)numerator;
+  const uint64_t rounded =
+      (mag * 1000ULL + (uint64_t)denominator / 2ULL) /
+      (uint64_t)denominator;
+
+  if (rounded > 2147483647ULL) {
+    return neg ? INT32_MIN : INT32_MAX;
+  }
+
+  return neg ? -(int32_t)rounded : (int32_t)rounded;
+}
+
+static void pps_vclock_phase_probe_arm(uint32_t pps_sequence,
+                                       uint32_t pps_isr_entry_dwt_raw,
+                                       uint32_t pps_dwt_at_edge,
+                                       uint32_t selected_counter32) {
+  if (!g_interrupt_hw_ready) return;
+
+  if (g_pps_vclock_phase_probe.active) {
+    g_pps_vclock_phase_probe.miss_count++;
+  }
+
+  const uint32_t now = vclock_synthetic_from_hardware_low16(qtimer1_ch0_counter_now());
+
+  g_pps_vclock_phase_probe.active = true;
+  g_pps_vclock_phase_probe.pps_sequence = pps_sequence;
+  g_pps_vclock_phase_probe.pps_isr_entry_dwt_raw = pps_isr_entry_dwt_raw;
+  g_pps_vclock_phase_probe.pps_dwt_at_edge = pps_dwt_at_edge;
+  g_pps_vclock_phase_probe.selected_counter32 = selected_counter32;
+  g_pps_vclock_phase_probe.target_counter32 =
+      now + PPS_VCLOCK_PHASE_PROBE_LEAD_TICKS;
+  g_pps_vclock_phase_probe.arm_dwt_raw = 0;
+  g_pps_vclock_phase_probe.arm_count++;
+
+  qtimer1_ch1_schedule_next_hop();
+
+  // Captured immediately after the CH1 compare has been programmed (or the
+  // arbiter decided it cannot be programmed).  This lets the report separate
+  // "time spent arming the trap" from "time waiting for the trap to fire."
+  g_pps_vclock_phase_probe.arm_dwt_raw = ARM_DWT_CYCCNT;
+}
+
+static void pps_vclock_phase_probe_fire(uint32_t fired_counter32,
+                                        uint32_t isr_entry_dwt_raw) {
+  if (!g_pps_vclock_phase_probe.active) return;
+
+  const pps_vclock_phase_probe_t probe = g_pps_vclock_phase_probe;
+  g_pps_vclock_phase_probe.active = false;
+  g_pps_vclock_phase_probe.fire_count++;
+
+  const uint32_t qtimer_event_dwt =
+      qtimer_event_dwt_from_isr_entry_raw(isr_entry_dwt_raw);
+  const uint32_t raw_delta_cycles =
+      isr_entry_dwt_raw - probe.pps_isr_entry_dwt_raw;
+  const uint32_t pps_to_arm_raw_cycles =
+      (probe.arm_dwt_raw != 0)
+          ? (uint32_t)(probe.arm_dwt_raw - probe.pps_isr_entry_dwt_raw)
+          : 0;
+  const uint32_t arm_to_vclock_raw_cycles =
+      (probe.arm_dwt_raw != 0)
+          ? (uint32_t)(isr_entry_dwt_raw - probe.arm_dwt_raw)
+          : 0;
+
+  const uint32_t ticks_from_sacred_to_probe =
+      probe.target_counter32 - probe.selected_counter32;
+
+  uint32_t cps_source = 0;
+  const uint32_t cps_used = pps_vclock_phase_probe_cps(cps_source);
+  const uint32_t expected_probe_offset_cycles =
+      rounded_cycles_for_vclock_ticks(ticks_from_sacred_to_probe, cps_used);
+
+  const int64_t expected_raw_delta_cycles =
+      (int64_t)CANONICAL_VCLOCK_EPOCH_MINUS_RAW_PPS_ISR_CYCLES +
+      (int64_t)expected_probe_offset_cycles;
+  const int32_t residual_cycles =
+      (int32_t)((int64_t)raw_delta_cycles - expected_raw_delta_cycles);
+
+  // Exact fixed-point residual before final presentation rounding:
+  //   residual = raw_delta - canonical_offset - ticks*cps/10MHz
+  // represented as numerator / VCLOCK_COUNTS_PER_SECOND cycles.
+  const int64_t residual_scaled_numerator =
+      ((int64_t)raw_delta_cycles -
+       (int64_t)CANONICAL_VCLOCK_EPOCH_MINUS_RAW_PPS_ISR_CYCLES) *
+          (int64_t)VCLOCK_COUNTS_PER_SECOND -
+      (int64_t)((uint64_t)ticks_from_sacred_to_probe * (uint64_t)cps_used);
+  const uint32_t residual_scaled_denominator = VCLOCK_COUNTS_PER_SECOND;
+  const int32_t residual_millicycles =
+      scaled_residual_to_millicycles(residual_scaled_numerator,
+                                     residual_scaled_denominator);
+
+  const uint32_t sacred_dwt_from_probe_raw =
+      isr_entry_dwt_raw - expected_probe_offset_cycles;
+  const uint32_t sacred_dwt_from_pps_raw =
+      probe.pps_isr_entry_dwt_raw +
+      (uint32_t)CANONICAL_VCLOCK_EPOCH_MINUS_RAW_PPS_ISR_CYCLES;
+
+  time_dynamic_cps_phase_probe_update(probe.pps_sequence,
+                                      probe.pps_isr_entry_dwt_raw,
+                                      probe.pps_dwt_at_edge,
+                                      probe.selected_counter32,
+                                      probe.target_counter32,
+                                      fired_counter32,
+                                      (int32_t)(fired_counter32 - probe.target_counter32),
+                                      probe.arm_dwt_raw,
+                                      isr_entry_dwt_raw,
+                                      qtimer_event_dwt,
+                                      pps_to_arm_raw_cycles,
+                                      arm_to_vclock_raw_cycles,
+                                      raw_delta_cycles,
+                                      ticks_from_sacred_to_probe,
+                                      cps_used,
+                                      cps_source,
+                                      expected_probe_offset_cycles,
+                                      expected_raw_delta_cycles,
+                                      residual_cycles,
+                                      residual_scaled_numerator,
+                                      residual_scaled_denominator,
+                                      residual_millicycles,
+                                      sacred_dwt_from_probe_raw,
+                                      sacred_dwt_from_pps_raw,
+                                      g_pps_vclock_phase_probe.arm_count,
+                                      g_pps_vclock_phase_probe.fire_count,
+                                      g_pps_vclock_phase_probe.miss_count);
 }
 
 uint16_t interrupt_qtimer1_ch1_counter_now(void) { return IMXRT_TMR1.CH[1].CNTR; }
@@ -1464,12 +1720,31 @@ uint16_t interrupt_qtimer1_ch2_csctrl_now(void)  { return IMXRT_TMR1.CH[2].CSCTR
 static void qtimer1_ch1_bridge_isr(uint32_t isr_entry_dwt_raw) {
   qtimer1_ch1_clear_compare_flag();
 
-  if (!g_qtimer1_ch1_active) {
+  if (!g_qtimer1_ch1_active && !g_pps_vclock_phase_probe.active) {
+    g_qtimer1_ch1_next_owner = QTIMER1_CH1_OWNER_NONE;
     qtimer1_ch1_disable_compare_hw();
     return;
   }
 
   const uint32_t fired_counter32 = g_qtimer1_ch1_next_compare_counter32;
+  const uint8_t owner = g_qtimer1_ch1_next_owner;
+
+  if (owner == QTIMER1_CH1_OWNER_PPS_PHASE_PROBE) {
+    if (fired_counter32 != g_pps_vclock_phase_probe.target_counter32) {
+      g_qtimer1_ch1_hop_count++;
+      qtimer1_ch1_schedule_next_hop();
+      return;
+    }
+
+    pps_vclock_phase_probe_fire(fired_counter32, isr_entry_dwt_raw);
+    qtimer1_ch1_schedule_next_hop();
+    return;
+  }
+
+  if (owner != QTIMER1_CH1_OWNER_HOSTED || !g_qtimer1_ch1_active) {
+    qtimer1_ch1_schedule_next_hop();
+    return;
+  }
 
   if (fired_counter32 != g_qtimer1_ch1_target_counter32) {
     g_qtimer1_ch1_hop_count++;
@@ -1478,7 +1753,6 @@ static void qtimer1_ch1_bridge_isr(uint32_t isr_entry_dwt_raw) {
   }
 
   g_qtimer1_ch1_active = false;
-  qtimer1_ch1_disable_compare_hw();
   g_qtimer1_ch1_fire_count++;
 
   const uint32_t qtimer_event_dwt =
@@ -1498,6 +1772,8 @@ static void qtimer1_ch1_bridge_isr(uint32_t isr_entry_dwt_raw) {
   if (g_qtimer1_ch1_handler) {
     g_qtimer1_ch1_handler(event);
   }
+
+  qtimer1_ch1_schedule_next_hop();
 }
 
 static void qtimer1_isr(void) {
@@ -1605,6 +1881,15 @@ void process_interrupt_gpio6789_irq(uint32_t isr_entry_dwt_raw) {
 
   g_last_pps_witness = pps;
   g_last_pps_witness_valid = true;
+
+  // Every PPS gets a near-future VCLOCK-domain CH1 probe.  This is a local
+  // phase measurement, not a timing authority.  The probe records how long
+  // it took to arm CH1, where the compare actually landed, and a tick-aware
+  // fixed-point residual against the empirical raw PPS→VCLOCK offset.
+  pps_vclock_phase_probe_arm(pps.sequence,
+                             isr_entry_dwt_raw,
+                             pps.dwt_at_edge,
+                             selected_counter32);
 
   // During rebootstrap, PPS selects the sacred VCLOCK edge identity and arms
   // the CH3 cadence.  The first CH3 cadence event backdates one millisecond in
@@ -1953,6 +2238,8 @@ void process_interrupt_init(void) {
   g_qtimer1_ch1_hop_count = 0;
   g_qtimer1_ch1_active = false;
   g_qtimer1_ch1_handler = nullptr;
+  g_qtimer1_ch1_next_owner = QTIMER1_CH1_OWNER_NONE;
+  g_pps_vclock_phase_probe = pps_vclock_phase_probe_t{};
   g_qtimer1_ch2_last_target_counter32 = 0;
   g_qtimer1_ch2_arm_count = 0;
 
@@ -2148,9 +2435,22 @@ static Payload cmd_report(const Payload&) {
   p.add("qtimer1_ch1_sequence", g_qtimer1_ch1_sequence);
   p.add("qtimer1_ch1_target_counter32", g_qtimer1_ch1_target_counter32);
   p.add("qtimer1_ch1_next_compare_counter32", g_qtimer1_ch1_next_compare_counter32);
+  p.add("qtimer1_ch1_next_owner", (uint32_t)g_qtimer1_ch1_next_owner);
   p.add("qtimer1_ch1_arm_count", g_qtimer1_ch1_arm_count);
   p.add("qtimer1_ch1_fire_count", g_qtimer1_ch1_fire_count);
   p.add("qtimer1_ch1_hop_count", g_qtimer1_ch1_hop_count);
+  p.add("pps_vclock_phase_probe_active", g_pps_vclock_phase_probe.active);
+  p.add("pps_vclock_phase_probe_lead_ticks", PPS_VCLOCK_PHASE_PROBE_LEAD_TICKS);
+  p.add("pps_vclock_phase_probe_cps_source_prediction", PPS_VCLOCK_PHASE_PROBE_CPS_SOURCE_PREDICTION);
+  p.add("pps_vclock_phase_probe_cps_source_dynamic_cps", PPS_VCLOCK_PHASE_PROBE_CPS_SOURCE_DYNAMIC_CPS);
+  p.add("pps_vclock_phase_probe_cps_source_nominal", PPS_VCLOCK_PHASE_PROBE_CPS_SOURCE_NOMINAL);
+  p.add("pps_vclock_phase_probe_pps_sequence", g_pps_vclock_phase_probe.pps_sequence);
+  p.add("pps_vclock_phase_probe_selected_counter32", g_pps_vclock_phase_probe.selected_counter32);
+  p.add("pps_vclock_phase_probe_target_counter32", g_pps_vclock_phase_probe.target_counter32);
+  p.add("pps_vclock_phase_probe_arm_dwt_raw", g_pps_vclock_phase_probe.arm_dwt_raw);
+  p.add("pps_vclock_phase_probe_arm_count", g_pps_vclock_phase_probe.arm_count);
+  p.add("pps_vclock_phase_probe_fire_count", g_pps_vclock_phase_probe.fire_count);
+  p.add("pps_vclock_phase_probe_miss_count", g_pps_vclock_phase_probe.miss_count);
   p.add("qtimer1_ch2_last_target_counter32", g_qtimer1_ch2_last_target_counter32);
   p.add("qtimer1_ch2_arm_count", g_qtimer1_ch2_arm_count);
 

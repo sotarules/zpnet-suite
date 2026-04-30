@@ -225,6 +225,41 @@ struct dynamic_cps_state_t {
   bool     valid = false;
   uint32_t pvc_sequence = 0;
   uint32_t current_pvc_dwt_at_edge = 0;
+
+  // PPS→VCLOCK local phase probe, authored by process_interrupt every PPS
+  // using QTimer1 CH1.  Raw ISR-entry DWT values are retained here solely as
+  // diagnostic facts so the first-ms audit can compare the local modulo phase
+  // against the empirical canonical raw PPS→VCLOCK offset.
+  bool     phase_probe_valid = false;
+  uint32_t phase_probe_pps_sequence = 0;
+  uint32_t phase_probe_pps_isr_entry_dwt_raw = 0;
+  uint32_t phase_probe_pps_dwt_at_edge = 0;
+  uint32_t phase_probe_selected_counter32 = 0;
+  uint32_t phase_probe_target_counter32 = 0;
+  uint32_t phase_probe_counter32_at_event = 0;
+  int32_t  phase_probe_counter32_residual_ticks = 0;
+  uint32_t phase_probe_arm_dwt_raw = 0;
+  uint32_t phase_probe_vclock_isr_entry_dwt_raw = 0;
+  uint32_t phase_probe_vclock_dwt_at_event = 0;
+  uint32_t phase_probe_pps_to_arm_raw_cycles = 0;
+  uint32_t phase_probe_arm_to_vclock_raw_cycles = 0;
+  uint32_t phase_probe_raw_delta_cycles = 0;
+  uint32_t phase_probe_ticks_from_sacred_to_probe = 0;
+  uint32_t phase_probe_cps_used = 0;
+  uint32_t phase_probe_cps_source = 0;
+  uint32_t phase_probe_expected_probe_offset_cycles = 0;
+  int64_t  phase_probe_expected_raw_delta_cycles = 0;
+  int32_t  phase_probe_residual_cycles = 0;
+  uint32_t phase_probe_abs_residual_cycles = 0;
+  int64_t  phase_probe_residual_scaled_numerator = 0;
+  uint32_t phase_probe_residual_scaled_denominator = 0;
+  int32_t  phase_probe_residual_millicycles = 0;
+  uint32_t phase_probe_sacred_dwt_from_probe_raw = 0;
+  uint32_t phase_probe_sacred_dwt_from_pps_raw = 0;
+  uint32_t phase_probe_arm_count = 0;
+  uint32_t phase_probe_fire_count = 0;
+  uint32_t phase_probe_miss_count = 0;
+
   dynamic_cps_first_ms_audit_t first_ms_audit[DYNAMIC_CPS_FIRST_MS_AUDIT_COUNT] = {};
   uint32_t first_ms_audit_valid_count = 0;
   uint32_t base_cycles = 0;
@@ -422,6 +457,35 @@ void time_dynamic_cps_reset(void) {
   dynamic_cps.valid = false;
   dynamic_cps.pvc_sequence = 0;
   dynamic_cps.current_pvc_dwt_at_edge = 0;
+  dynamic_cps.phase_probe_valid = false;
+  dynamic_cps.phase_probe_pps_sequence = 0;
+  dynamic_cps.phase_probe_pps_isr_entry_dwt_raw = 0;
+  dynamic_cps.phase_probe_pps_dwt_at_edge = 0;
+  dynamic_cps.phase_probe_selected_counter32 = 0;
+  dynamic_cps.phase_probe_target_counter32 = 0;
+  dynamic_cps.phase_probe_counter32_at_event = 0;
+  dynamic_cps.phase_probe_counter32_residual_ticks = 0;
+  dynamic_cps.phase_probe_arm_dwt_raw = 0;
+  dynamic_cps.phase_probe_vclock_isr_entry_dwt_raw = 0;
+  dynamic_cps.phase_probe_vclock_dwt_at_event = 0;
+  dynamic_cps.phase_probe_pps_to_arm_raw_cycles = 0;
+  dynamic_cps.phase_probe_arm_to_vclock_raw_cycles = 0;
+  dynamic_cps.phase_probe_raw_delta_cycles = 0;
+  dynamic_cps.phase_probe_ticks_from_sacred_to_probe = 0;
+  dynamic_cps.phase_probe_cps_used = 0;
+  dynamic_cps.phase_probe_cps_source = 0;
+  dynamic_cps.phase_probe_expected_probe_offset_cycles = 0;
+  dynamic_cps.phase_probe_expected_raw_delta_cycles = 0;
+  dynamic_cps.phase_probe_residual_cycles = 0;
+  dynamic_cps.phase_probe_abs_residual_cycles = 0;
+  dynamic_cps.phase_probe_residual_scaled_numerator = 0;
+  dynamic_cps.phase_probe_residual_scaled_denominator = 0;
+  dynamic_cps.phase_probe_residual_millicycles = 0;
+  dynamic_cps.phase_probe_sacred_dwt_from_probe_raw = 0;
+  dynamic_cps.phase_probe_sacred_dwt_from_pps_raw = 0;
+  dynamic_cps.phase_probe_arm_count = 0;
+  dynamic_cps.phase_probe_fire_count = 0;
+  dynamic_cps.phase_probe_miss_count = 0;
   dynamic_cps.base_cycles = 0;
   dynamic_cps.current_cycles = 0;
   dynamic_cps.last_reseed_value = 0;
@@ -456,6 +520,70 @@ void time_dynamic_cps_reset(void) {
   for (uint32_t i = 0; i < DYNAMIC_CPS_HISTORY_CAPACITY; i++) {
     dynamic_cps.history[i] = time_dynamic_cps_record_t{};
   }
+
+  dmb();
+  dynamic_cps.seq++;
+}
+
+void time_dynamic_cps_phase_probe_update(uint32_t pps_sequence,
+                                         uint32_t pps_isr_entry_dwt_raw,
+                                         uint32_t pps_dwt_at_edge,
+                                         uint32_t selected_counter32,
+                                         uint32_t target_counter32,
+                                         uint32_t counter32_at_event,
+                                         int32_t counter32_residual_ticks,
+                                         uint32_t arm_dwt_raw,
+                                         uint32_t vclock_isr_entry_dwt_raw,
+                                         uint32_t vclock_dwt_at_event,
+                                         uint32_t pps_to_arm_raw_cycles,
+                                         uint32_t arm_to_vclock_raw_cycles,
+                                         uint32_t raw_delta_cycles,
+                                         uint32_t ticks_from_sacred_to_probe,
+                                         uint32_t cps_used,
+                                         uint32_t cps_source,
+                                         uint32_t expected_probe_offset_cycles,
+                                         int64_t expected_raw_delta_cycles,
+                                         int32_t residual_cycles,
+                                         int64_t residual_scaled_numerator,
+                                         uint32_t residual_scaled_denominator,
+                                         int32_t residual_millicycles,
+                                         uint32_t sacred_dwt_from_probe_raw,
+                                         uint32_t sacred_dwt_from_pps_raw,
+                                         uint32_t arm_count,
+                                         uint32_t fire_count,
+                                         uint32_t miss_count) {
+  dynamic_cps.seq++;
+  dmb();
+
+  dynamic_cps.phase_probe_valid = true;
+  dynamic_cps.phase_probe_pps_sequence = pps_sequence;
+  dynamic_cps.phase_probe_pps_isr_entry_dwt_raw = pps_isr_entry_dwt_raw;
+  dynamic_cps.phase_probe_pps_dwt_at_edge = pps_dwt_at_edge;
+  dynamic_cps.phase_probe_selected_counter32 = selected_counter32;
+  dynamic_cps.phase_probe_target_counter32 = target_counter32;
+  dynamic_cps.phase_probe_counter32_at_event = counter32_at_event;
+  dynamic_cps.phase_probe_counter32_residual_ticks = counter32_residual_ticks;
+  dynamic_cps.phase_probe_arm_dwt_raw = arm_dwt_raw;
+  dynamic_cps.phase_probe_vclock_isr_entry_dwt_raw = vclock_isr_entry_dwt_raw;
+  dynamic_cps.phase_probe_vclock_dwt_at_event = vclock_dwt_at_event;
+  dynamic_cps.phase_probe_pps_to_arm_raw_cycles = pps_to_arm_raw_cycles;
+  dynamic_cps.phase_probe_arm_to_vclock_raw_cycles = arm_to_vclock_raw_cycles;
+  dynamic_cps.phase_probe_raw_delta_cycles = raw_delta_cycles;
+  dynamic_cps.phase_probe_ticks_from_sacred_to_probe = ticks_from_sacred_to_probe;
+  dynamic_cps.phase_probe_cps_used = cps_used;
+  dynamic_cps.phase_probe_cps_source = cps_source;
+  dynamic_cps.phase_probe_expected_probe_offset_cycles = expected_probe_offset_cycles;
+  dynamic_cps.phase_probe_expected_raw_delta_cycles = expected_raw_delta_cycles;
+  dynamic_cps.phase_probe_residual_cycles = residual_cycles;
+  dynamic_cps.phase_probe_abs_residual_cycles = abs_i32_to_u32(residual_cycles);
+  dynamic_cps.phase_probe_residual_scaled_numerator = residual_scaled_numerator;
+  dynamic_cps.phase_probe_residual_scaled_denominator = residual_scaled_denominator;
+  dynamic_cps.phase_probe_residual_millicycles = residual_millicycles;
+  dynamic_cps.phase_probe_sacred_dwt_from_probe_raw = sacred_dwt_from_probe_raw;
+  dynamic_cps.phase_probe_sacred_dwt_from_pps_raw = sacred_dwt_from_pps_raw;
+  dynamic_cps.phase_probe_arm_count = arm_count;
+  dynamic_cps.phase_probe_fire_count = fire_count;
+  dynamic_cps.phase_probe_miss_count = miss_count;
 
   dmb();
   dynamic_cps.seq++;
@@ -966,6 +1094,36 @@ time_dynamic_cps_snapshot_t time_dynamic_cps_snapshot(void) {
     out.last_reseed_value = dynamic_cps.last_reseed_value;
     out.last_reseed_was_computed = dynamic_cps.last_reseed_was_computed;
 
+    out.phase_probe_valid = dynamic_cps.phase_probe_valid;
+    out.phase_probe_pps_sequence = dynamic_cps.phase_probe_pps_sequence;
+    out.phase_probe_pps_isr_entry_dwt_raw = dynamic_cps.phase_probe_pps_isr_entry_dwt_raw;
+    out.phase_probe_pps_dwt_at_edge = dynamic_cps.phase_probe_pps_dwt_at_edge;
+    out.phase_probe_selected_counter32 = dynamic_cps.phase_probe_selected_counter32;
+    out.phase_probe_target_counter32 = dynamic_cps.phase_probe_target_counter32;
+    out.phase_probe_counter32_at_event = dynamic_cps.phase_probe_counter32_at_event;
+    out.phase_probe_counter32_residual_ticks = dynamic_cps.phase_probe_counter32_residual_ticks;
+    out.phase_probe_arm_dwt_raw = dynamic_cps.phase_probe_arm_dwt_raw;
+    out.phase_probe_vclock_isr_entry_dwt_raw = dynamic_cps.phase_probe_vclock_isr_entry_dwt_raw;
+    out.phase_probe_vclock_dwt_at_event = dynamic_cps.phase_probe_vclock_dwt_at_event;
+    out.phase_probe_pps_to_arm_raw_cycles = dynamic_cps.phase_probe_pps_to_arm_raw_cycles;
+    out.phase_probe_arm_to_vclock_raw_cycles = dynamic_cps.phase_probe_arm_to_vclock_raw_cycles;
+    out.phase_probe_raw_delta_cycles = dynamic_cps.phase_probe_raw_delta_cycles;
+    out.phase_probe_ticks_from_sacred_to_probe = dynamic_cps.phase_probe_ticks_from_sacred_to_probe;
+    out.phase_probe_cps_used = dynamic_cps.phase_probe_cps_used;
+    out.phase_probe_cps_source = dynamic_cps.phase_probe_cps_source;
+    out.phase_probe_expected_probe_offset_cycles = dynamic_cps.phase_probe_expected_probe_offset_cycles;
+    out.phase_probe_expected_raw_delta_cycles = dynamic_cps.phase_probe_expected_raw_delta_cycles;
+    out.phase_probe_residual_cycles = dynamic_cps.phase_probe_residual_cycles;
+    out.phase_probe_abs_residual_cycles = dynamic_cps.phase_probe_abs_residual_cycles;
+    out.phase_probe_residual_scaled_numerator = dynamic_cps.phase_probe_residual_scaled_numerator;
+    out.phase_probe_residual_scaled_denominator = dynamic_cps.phase_probe_residual_scaled_denominator;
+    out.phase_probe_residual_millicycles = dynamic_cps.phase_probe_residual_millicycles;
+    out.phase_probe_sacred_dwt_from_probe_raw = dynamic_cps.phase_probe_sacred_dwt_from_probe_raw;
+    out.phase_probe_sacred_dwt_from_pps_raw = dynamic_cps.phase_probe_sacred_dwt_from_pps_raw;
+    out.phase_probe_arm_count = dynamic_cps.phase_probe_arm_count;
+    out.phase_probe_fire_count = dynamic_cps.phase_probe_fire_count;
+    out.phase_probe_miss_count = dynamic_cps.phase_probe_miss_count;
+
     out.fit_samples_this_second = dynamic_cps.fit.samples;
     out.fit_sum_t2_ms2 = dynamic_cps.fit.sum_t2_ms2;
     out.fit_sum_tx_cycles_ms = dynamic_cps.fit.sum_tx_cycles_ms;
@@ -1163,6 +1321,15 @@ static void add_anchor_scalars(Payload& out) {
   out.add("pps_vclock_count", a.pps_vclock_count);
 }
 
+static const char* phase_probe_cps_source_name(uint32_t source) {
+  switch (source) {
+    case 1: return "prediction";
+    case 2: return "dynamic_cps";
+    case 3: return "nominal";
+    default: return "unknown";
+  }
+}
+
 static void add_prediction_scalars(Payload& out) {
   const time_dwt_prediction_snapshot_t p = time_dwt_prediction_snapshot();
   out.add("prediction_valid", p.valid);
@@ -1189,6 +1356,37 @@ static void add_dynamic_cps_scalars(Payload& out) {
   out.add("dynamic_cps_net_adjustment_cycles", c.net_adjustment_cycles);
   out.add("dynamic_cps_last_reseed_value", c.last_reseed_value);
   out.add("dynamic_cps_last_reseed_was_computed", c.last_reseed_was_computed);
+
+  out.add("dynamic_cps_phase_probe_valid", c.phase_probe_valid);
+  out.add("dynamic_cps_phase_probe_pps_sequence", c.phase_probe_pps_sequence);
+  out.add("dynamic_cps_phase_probe_pps_isr_entry_dwt_raw", c.phase_probe_pps_isr_entry_dwt_raw);
+  out.add("dynamic_cps_phase_probe_pps_dwt_at_edge", c.phase_probe_pps_dwt_at_edge);
+  out.add("dynamic_cps_phase_probe_selected_counter32", c.phase_probe_selected_counter32);
+  out.add("dynamic_cps_phase_probe_target_counter32", c.phase_probe_target_counter32);
+  out.add("dynamic_cps_phase_probe_counter32_at_event", c.phase_probe_counter32_at_event);
+  out.add("dynamic_cps_phase_probe_counter32_residual_ticks", c.phase_probe_counter32_residual_ticks);
+  out.add("dynamic_cps_phase_probe_arm_dwt_raw", c.phase_probe_arm_dwt_raw);
+  out.add("dynamic_cps_phase_probe_vclock_isr_entry_dwt_raw", c.phase_probe_vclock_isr_entry_dwt_raw);
+  out.add("dynamic_cps_phase_probe_vclock_dwt_at_event", c.phase_probe_vclock_dwt_at_event);
+  out.add("dynamic_cps_phase_probe_pps_to_arm_raw_cycles", c.phase_probe_pps_to_arm_raw_cycles);
+  out.add("dynamic_cps_phase_probe_arm_to_vclock_raw_cycles", c.phase_probe_arm_to_vclock_raw_cycles);
+  out.add("dynamic_cps_phase_probe_raw_delta_cycles", c.phase_probe_raw_delta_cycles);
+  out.add("dynamic_cps_phase_probe_ticks_from_sacred_to_probe", c.phase_probe_ticks_from_sacred_to_probe);
+  out.add("dynamic_cps_phase_probe_cps_used", c.phase_probe_cps_used);
+  out.add("dynamic_cps_phase_probe_cps_source", c.phase_probe_cps_source);
+  out.add("dynamic_cps_phase_probe_cps_source_name", phase_probe_cps_source_name(c.phase_probe_cps_source));
+  out.add("dynamic_cps_phase_probe_expected_probe_offset_cycles", c.phase_probe_expected_probe_offset_cycles);
+  out.add("dynamic_cps_phase_probe_expected_raw_delta_cycles", c.phase_probe_expected_raw_delta_cycles);
+  out.add("dynamic_cps_phase_probe_residual_cycles", c.phase_probe_residual_cycles);
+  out.add("dynamic_cps_phase_probe_abs_residual_cycles", c.phase_probe_abs_residual_cycles);
+  out.add("dynamic_cps_phase_probe_residual_scaled_numerator", c.phase_probe_residual_scaled_numerator);
+  out.add("dynamic_cps_phase_probe_residual_scaled_denominator", c.phase_probe_residual_scaled_denominator);
+  out.add("dynamic_cps_phase_probe_residual_millicycles", c.phase_probe_residual_millicycles);
+  out.add("dynamic_cps_phase_probe_sacred_dwt_from_probe_raw", c.phase_probe_sacred_dwt_from_probe_raw);
+  out.add("dynamic_cps_phase_probe_sacred_dwt_from_pps_raw", c.phase_probe_sacred_dwt_from_pps_raw);
+  out.add("dynamic_cps_phase_probe_arm_count", c.phase_probe_arm_count);
+  out.add("dynamic_cps_phase_probe_fire_count", c.phase_probe_fire_count);
+  out.add("dynamic_cps_phase_probe_miss_count", c.phase_probe_miss_count);
 
   out.add("dynamic_cps_fit_samples_this_second", c.fit_samples_this_second);
   out.add("dynamic_cps_fit_sum_t2_ms2", c.fit_sum_t2_ms2);
@@ -1402,6 +1600,36 @@ static Payload cmd_dynamic_cps_first_ms(const Payload&) {
       audit[i] = dynamic_cps.first_ms_audit[i];
     }
 
+    const bool phase_probe_valid = dynamic_cps.phase_probe_valid;
+    const uint32_t phase_probe_pps_sequence = dynamic_cps.phase_probe_pps_sequence;
+    const uint32_t phase_probe_pps_isr_entry_dwt_raw = dynamic_cps.phase_probe_pps_isr_entry_dwt_raw;
+    const uint32_t phase_probe_pps_dwt_at_edge = dynamic_cps.phase_probe_pps_dwt_at_edge;
+    const uint32_t phase_probe_selected_counter32 = dynamic_cps.phase_probe_selected_counter32;
+    const uint32_t phase_probe_target_counter32 = dynamic_cps.phase_probe_target_counter32;
+    const uint32_t phase_probe_counter32_at_event = dynamic_cps.phase_probe_counter32_at_event;
+    const int32_t phase_probe_counter32_residual_ticks = dynamic_cps.phase_probe_counter32_residual_ticks;
+    const uint32_t phase_probe_arm_dwt_raw = dynamic_cps.phase_probe_arm_dwt_raw;
+    const uint32_t phase_probe_vclock_isr_entry_dwt_raw = dynamic_cps.phase_probe_vclock_isr_entry_dwt_raw;
+    const uint32_t phase_probe_vclock_dwt_at_event = dynamic_cps.phase_probe_vclock_dwt_at_event;
+    const uint32_t phase_probe_pps_to_arm_raw_cycles = dynamic_cps.phase_probe_pps_to_arm_raw_cycles;
+    const uint32_t phase_probe_arm_to_vclock_raw_cycles = dynamic_cps.phase_probe_arm_to_vclock_raw_cycles;
+    const uint32_t phase_probe_raw_delta_cycles = dynamic_cps.phase_probe_raw_delta_cycles;
+    const uint32_t phase_probe_ticks_from_sacred_to_probe = dynamic_cps.phase_probe_ticks_from_sacred_to_probe;
+    const uint32_t phase_probe_cps_used = dynamic_cps.phase_probe_cps_used;
+    const uint32_t phase_probe_cps_source = dynamic_cps.phase_probe_cps_source;
+    const uint32_t phase_probe_expected_probe_offset_cycles = dynamic_cps.phase_probe_expected_probe_offset_cycles;
+    const int64_t phase_probe_expected_raw_delta_cycles = dynamic_cps.phase_probe_expected_raw_delta_cycles;
+    const int32_t phase_probe_residual_cycles = dynamic_cps.phase_probe_residual_cycles;
+    const uint32_t phase_probe_abs_residual_cycles = dynamic_cps.phase_probe_abs_residual_cycles;
+    const int64_t phase_probe_residual_scaled_numerator = dynamic_cps.phase_probe_residual_scaled_numerator;
+    const uint32_t phase_probe_residual_scaled_denominator = dynamic_cps.phase_probe_residual_scaled_denominator;
+    const int32_t phase_probe_residual_millicycles = dynamic_cps.phase_probe_residual_millicycles;
+    const uint32_t phase_probe_sacred_dwt_from_probe_raw = dynamic_cps.phase_probe_sacred_dwt_from_probe_raw;
+    const uint32_t phase_probe_sacred_dwt_from_pps_raw = dynamic_cps.phase_probe_sacred_dwt_from_pps_raw;
+    const uint32_t phase_probe_arm_count = dynamic_cps.phase_probe_arm_count;
+    const uint32_t phase_probe_fire_count = dynamic_cps.phase_probe_fire_count;
+    const uint32_t phase_probe_miss_count = dynamic_cps.phase_probe_miss_count;
+
     dmb();
     const uint32_t s2 = dynamic_cps.seq;
     if (s1 != s2 || (s1 & 1u) != 0u) {
@@ -1418,6 +1646,38 @@ static Payload cmd_dynamic_cps_first_ms(const Payload&) {
     out.add("audit_count", valid_count);
     out.add("audit_capacity", (uint32_t)DYNAMIC_CPS_FIRST_MS_AUDIT_COUNT);
     out.add("note", "DWT values are adjusted event coordinates supplied by process_interrupt");
+
+    out.add("phase_probe_valid", phase_probe_valid);
+    out.add("phase_probe_pps_sequence", phase_probe_pps_sequence);
+    out.add("phase_probe_pps_isr_entry_dwt_raw", phase_probe_pps_isr_entry_dwt_raw);
+    out.add("phase_probe_pps_dwt_at_edge", phase_probe_pps_dwt_at_edge);
+    out.add("phase_probe_selected_counter32", phase_probe_selected_counter32);
+    out.add("phase_probe_target_counter32", phase_probe_target_counter32);
+    out.add("phase_probe_counter32_at_event", phase_probe_counter32_at_event);
+    out.add("phase_probe_counter32_residual_ticks", phase_probe_counter32_residual_ticks);
+    out.add("phase_probe_arm_dwt_raw", phase_probe_arm_dwt_raw);
+    out.add("phase_probe_vclock_isr_entry_dwt_raw", phase_probe_vclock_isr_entry_dwt_raw);
+    out.add("phase_probe_vclock_dwt_at_event", phase_probe_vclock_dwt_at_event);
+    out.add("phase_probe_pps_to_arm_raw_cycles", phase_probe_pps_to_arm_raw_cycles);
+    out.add("phase_probe_arm_to_vclock_raw_cycles", phase_probe_arm_to_vclock_raw_cycles);
+    out.add("phase_probe_raw_delta_cycles", phase_probe_raw_delta_cycles);
+    out.add("phase_probe_ticks_from_sacred_to_probe", phase_probe_ticks_from_sacred_to_probe);
+    out.add("phase_probe_cps_used", phase_probe_cps_used);
+    out.add("phase_probe_cps_source", phase_probe_cps_source);
+    out.add("phase_probe_cps_source_name", phase_probe_cps_source_name(phase_probe_cps_source));
+    out.add("phase_probe_expected_probe_offset_cycles", phase_probe_expected_probe_offset_cycles);
+    out.add("phase_probe_expected_raw_delta_cycles", phase_probe_expected_raw_delta_cycles);
+    out.add("phase_probe_residual_cycles", phase_probe_residual_cycles);
+    out.add("phase_probe_abs_residual_cycles", phase_probe_abs_residual_cycles);
+    out.add("phase_probe_residual_scaled_numerator", phase_probe_residual_scaled_numerator);
+    out.add("phase_probe_residual_scaled_denominator", phase_probe_residual_scaled_denominator);
+    out.add("phase_probe_residual_millicycles", phase_probe_residual_millicycles);
+    out.add("phase_probe_sacred_dwt_from_probe_raw", phase_probe_sacred_dwt_from_probe_raw);
+    out.add("phase_probe_sacred_dwt_from_pps_raw", phase_probe_sacred_dwt_from_pps_raw);
+    out.add("phase_probe_arm_count", phase_probe_arm_count);
+    out.add("phase_probe_fire_count", phase_probe_fire_count);
+    out.add("phase_probe_miss_count", phase_probe_miss_count);
+    out.add("phase_probe_note", "Tick-aware raw ISR-entry diagnostic: compare raw PPS→CH1 delta against canonical raw PPS→VCLOCK offset plus rounded fixed-point VCLOCK-tick distance.");
 
     PayloadArray arr;
     for (uint32_t i = 0; i < DYNAMIC_CPS_FIRST_MS_AUDIT_COUNT; i++) {

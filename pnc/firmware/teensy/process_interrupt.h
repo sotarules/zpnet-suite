@@ -13,9 +13,10 @@
 //
 //   QTimer1 has a single shared IRQ vector across all four channels.
 //   process_interrupt owns the vector and dispatches in IRQ context:
+//     • CH1 flag set → hosted compare rail plus internal PPS phase probe
 //     • CH2 flag set → registered TimePop scheduler handler
 //     • CH3 flag set → vclock_cadence_isr (process_interrupt internal)
-//   Both handlers receive the same first-instruction DWT capture, so
+//   All handlers receive the same first-instruction DWT capture, so
 //   they get identical latency profiles.
 //
 //   TimePop owns scheduler policy only.  process_interrupt owns the CH2
@@ -96,7 +97,8 @@
 //   Cadence sources:
 //     VCLOCK : QTimer1 CH3 compare, +10000 counts/interval (GNSS 10 MHz)
 //              QTimer1 CH0 is the low-word VCLOCK counter; CH1 is a hosted
-//              VCLOCK-domain compare rail owned by process_interrupt.
+//              VCLOCK-domain compare rail owned by process_interrupt and is
+//              also used internally every PPS as a near-future phase probe.
 //     OCXO1  : QTimer3 CH2 compare, +10000 counts/interval (OCXO1 10 MHz)
 //     OCXO2  : QTimer3 CH3 compare, +10000 counts/interval (OCXO2 10 MHz)
 // ============================================================================
@@ -527,6 +529,10 @@ void interrupt_register_pps_entry_latency_handler(
 // and asks process_interrupt to arm a synthetic 32-bit VCLOCK target.
 // process_interrupt advances any required 16-bit compare hops internally and
 // invokes the handler only at the requested target event.
+//
+// The same CH1 rail is also used internally once per PPS as a near-future
+// VCLOCK phase probe. process_interrupt arbitrates these targets so hosted
+// callers do not directly fight the PPS probe.
 
 struct interrupt_qtimer1_ch1_compare_event_t {
   uint32_t sequence = 0;
