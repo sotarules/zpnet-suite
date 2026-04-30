@@ -94,6 +94,18 @@ static constexpr uint32_t PPS_PIN_TO_ISR_CYCLES =
 static constexpr uint32_t QTIMER_PIN_TO_ISR_CYCLES =
     QTIMER_TOTAL_LATENCY - WITNESS_STIMULATE_LATENCY;
 
+static pps_t witness_last_physical_pps_diag(void) {
+  const pps_edge_snapshot_t snap = interrupt_last_pps_edge();
+
+  pps_t pps{};
+  pps.sequence          = snap.sequence;
+  pps.dwt_at_edge       = snap.physical_pps_dwt_normalized_at_edge;
+  pps.counter32_at_edge = snap.physical_pps_counter32_at_read;
+  pps.ch3_at_edge       = snap.physical_pps_ch3_at_read;
+
+  return pps;
+}
+
 // ============================================================================
 // Welford
 // ============================================================================
@@ -1192,7 +1204,7 @@ static void pps_phase_capture(const interrupt_qtimer1_ch1_compare_event_t& event
 }
 
 static void bridge_capture(const interrupt_qtimer1_ch1_compare_event_t& event) {
-  const pps_t pps = interrupt_last_pps();
+  const pps_t pps = witness_last_physical_pps_diag();
   const pps_vclock_t pvc = interrupt_last_pps_vclock();
   if (pvc.sequence == 0 || pvc.gnss_ns_at_edge < 0) {
     g_bridge_skipped_no_anchor++;
@@ -1568,7 +1580,7 @@ static Payload cmd_report(const Payload&) {
 
 static Payload cmd_edge(const Payload&) {
   const interrupt_pps_edge_heartbeat_t hb = interrupt_pps_edge_heartbeat();
-  const pps_t pps = interrupt_last_pps();
+  const pps_t pps = witness_last_physical_pps_diag();
   const pps_vclock_t pvc = interrupt_last_pps_vclock();
   const pps_edge_snapshot_t legacy = interrupt_last_pps_edge();
 

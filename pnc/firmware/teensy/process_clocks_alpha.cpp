@@ -83,20 +83,11 @@ static volatile uint32_t g_prev_dwt_at_vclock_event = 0;
 
 // ── Canonical one-second subtraction state for DWT cycles between PPS/VCLOCK anchors ──
 //
-// Authored by pps_selector_callback from the priority-0 GPIO ISR's
-// snap.dwt_at_edge captures.  Seeded at epoch install (with the snap that
-// installed the epoch) and re-seeded across any rebootstrap.  This is the
-// preemption-proof measurement of consecutive selected PPS/VCLOCK edges, and is the sole
-// authority that updates g_dwt_cycles_between_pps_vclock.
-//
-// History note: until this refactor, g_dwt_cycles_between_pps_vclock was
-// authored by vclock_callback from QTimer1 CH3's first-instruction DWT
-// captures.  CH3 is at NVIC priority 16 — preemptible by the priority-0
-// GPIO ISR and by any noInterrupts() window.  When CH3 was delayed by D
-// cycles on the 1000th-tick fire, the resulting subtraction produced a
-// reciprocal excursion (+D, then -D) on consecutive seconds.  PPS GPIO at
-// priority 0 cannot be preempted; consecutive snap.dwt_at_edge values are
-// the selected VCLOCK second boundaries.
+// Authored by pps_selector_callback from process_interrupt's PPS/VCLOCK
+// snapshot.  PPS remains the selector/witness, but the public PPS/VCLOCK DWT
+// coordinate is now authored by the VCLOCK/QTimer1 CH3 path, so consecutive
+// snap.dwt_at_edge values live in the same event-coordinate species as the
+// 1 kHz VCLOCK cadence samples.
 static volatile uint32_t g_prev_pps_vclock_dwt_at_edge = 0;
 static volatile bool     g_prev_pps_vclock_dwt_at_edge_valid = false;
 
@@ -421,7 +412,9 @@ static void vclock_callback(const interrupt_event_t& event,
   if (!epoch_ready()) return;
 
   g_vclock_event_count++;
-  g_gnss_ns_at_pps_vclock += NS_PER_SECOND_U64;
+  if (event.gnss_ns_at_event != 0) {
+    g_gnss_ns_at_pps_vclock = event.gnss_ns_at_event;
+  }
   g_prev_dwt_at_vclock_event = event.dwt_at_event;
 
   if (event.gnss_ns_at_event != 0) {
@@ -485,6 +478,10 @@ static void update_pps_vclock_bridge_anchor(const pps_edge_snapshot_t& snap) {
   if (!epoch_ready() || !g_prev_pps_vclock_dwt_at_edge_valid) return;
 
   const uint32_t dwt_between_pps = snap.dwt_at_edge - g_prev_pps_vclock_dwt_at_edge;
+
+  if (snap.gnss_ns_at_edge >= 0) {
+    g_gnss_ns_at_pps_vclock = (uint64_t)snap.gnss_ns_at_edge;
+  }
 
   g_dwt_cycles_between_pps_vclock = dwt_between_pps;
   g_dwt_cycle_count_total += (uint64_t)dwt_between_pps;

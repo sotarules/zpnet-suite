@@ -35,10 +35,11 @@ static constexpr uint32_t PREDICTION_HISTORY_CAPACITY = 32;
 static constexpr uint32_t DYNAMIC_CPS_HISTORY_CAPACITY = 32;
 static constexpr uint32_t HISTORY_DEFAULT_LIMIT = 16;
 
-static constexpr uint64_t DYNAMIC_CPS_MIN_REFINE_OFFSET_NS = 10000000ULL;
-static constexpr uint64_t DYNAMIC_CPS_MAX_REFINE_OFFSET_NS = 990000000ULL;
-static constexpr int32_t  DYNAMIC_CPS_MAX_STEP_CYCLES      = 128;
-static constexpr uint32_t DYNAMIC_CPS_BLEND_SHIFT          = 4;
+static constexpr uint32_t DYNAMIC_CPS_MIN_REFINE_MS = 1;
+static constexpr uint32_t DYNAMIC_CPS_MAX_REFINE_MS = 999;
+static constexpr uint32_t DYNAMIC_CPS_OUTLIER_THRESHOLD_CYCLES = 5;
+static constexpr uint32_t DYNAMIC_CPS_ENDPOINT_SANITY_TOLERANCE_CYCLES = 25;
+static constexpr uint32_t DYNAMIC_CPS_FIRST_MS_AUDIT_COUNT = 3;
 
 // ============================================================================
 // Anchor state (written by clocks alpha, read by time readers)
@@ -57,6 +58,10 @@ static time_anchor_t anchor = {};
 
 static inline void dmb(void) {
   __asm__ volatile ("dmb" ::: "memory");
+}
+
+static inline uint32_t abs_i32_to_u32(int32_t v) {
+  return (v < 0) ? (uint32_t)(-(int64_t)v) : (uint32_t)v;
 }
 
 // ============================================================================
@@ -145,8 +150,74 @@ static void prediction_observe_actual(uint32_t pps_vclock_count,
 }
 
 // ============================================================================
-// Dynamic CPS state
+// Dynamic CPS fixed-anchor witness state
 // ============================================================================
+//
+// Dynamic CPS is currently witness-only.  It does not drive operational
+// DWT<->GNSS projection.  The model is a fixed-anchor online line fit:
+//
+//   t = 0 ms     -> PPS/VCLOCK anchor DWT (implicit, never sampled from CH3)
+//   t = 1..999ms -> VCLOCK 1 kHz cadence observations
+//
+// Each cadence observation is compared against the current fitted line.  If it
+// is outside the outlier threshold, the model value is substituted and the raw
+// error is accumulated.  This lets us expose systematic coordinate-species
+// errors without allowing them to bend the slope.
+
+static inline uint32_t u32_abs_i32(int32_t v) {
+  return (v < 0) ? (uint32_t)(-(int64_t)v) : (uint32_t)v;
+}
+
+static inline uint32_t line_cycles_at_ms(uint32_t cycles_per_second,
+                                         uint32_t ms) {
+  return (uint32_t)(((uint64_t)cycles_per_second * (uint64_t)ms + 500ULL) / 1000ULL);
+}
+
+static inline uint32_t line_slope_from_sums(uint64_t sum_t2_ms2,
+                                            uint64_t sum_tx_cycles_ms,
+                                            uint32_t fallback_cycles) {
+  if (sum_t2_ms2 == 0) return fallback_cycles;
+  return (uint32_t)(((uint64_t)sum_tx_cycles_ms * 1000ULL + sum_t2_ms2 / 2ULL) /
+                    sum_t2_ms2);
+}
+
+struct fixed_anchor_line_fit_t {
+  uint64_t sum_t2_ms2 = 0;
+  uint64_t sum_tx_cycles_ms = 0;
+  uint32_t samples = 0;
+
+  void reset() {
+    sum_t2_ms2 = 0;
+    sum_tx_cycles_ms = 0;
+    samples = 0;
+  }
+
+  void add(uint32_t ms, uint32_t used_cycles) {
+    sum_t2_ms2 += (uint64_t)ms * (uint64_t)ms;
+    sum_tx_cycles_ms += (uint64_t)ms * (uint64_t)used_cycles;
+    samples++;
+  }
+
+  uint32_t slope(uint32_t fallback_cycles) const {
+    return line_slope_from_sums(sum_t2_ms2, sum_tx_cycles_ms, fallback_cycles);
+  }
+};
+
+struct dynamic_cps_first_ms_audit_t {
+  bool     valid = false;
+  uint32_t ms = 0;
+  uint32_t anchor_dwt = 0;
+  uint32_t static_cycles_per_second = 0;
+  uint32_t static_cycles_per_ms_floor = 0;
+  uint32_t expected_elapsed_floor = 0;
+  uint32_t expected_elapsed_round = 0;
+  uint32_t expected_dwt_floor = 0;
+  uint32_t expected_dwt_round = 0;
+  uint32_t observed_dwt = 0;
+  uint32_t observed_elapsed_cycles = 0;
+  int32_t  error_vs_floor_cycles = 0;
+  int32_t  error_vs_round_cycles = 0;
+};
 
 struct dynamic_cps_state_t {
   volatile uint32_t seq;
@@ -154,15 +225,35 @@ struct dynamic_cps_state_t {
   bool     valid = false;
   uint32_t pvc_sequence = 0;
   uint32_t current_pvc_dwt_at_edge = 0;
+  dynamic_cps_first_ms_audit_t first_ms_audit[DYNAMIC_CPS_FIRST_MS_AUDIT_COUNT] = {};
+  uint32_t first_ms_audit_valid_count = 0;
   uint32_t base_cycles = 0;
   uint32_t current_cycles = 0;
   uint32_t last_reseed_value = 0;
   bool     last_reseed_was_computed = false;
 
-  uint32_t last_inferred_cycles = 0;
-  int32_t  last_cps_error = 0;
-  int32_t  last_cps_step = 0;
-  uint64_t last_gnss_offset_ns = 0;
+  fixed_anchor_line_fit_t fit;
+
+  uint32_t last_sample_ms = 0;
+  uint32_t last_observed_cycles = 0;
+  uint32_t last_used_cycles = 0;
+  uint32_t last_expected_static_cycles = 0;
+  uint32_t last_expected_fit_cycles = 0;
+  int32_t  last_observed_error_cycles = 0;
+  int32_t  last_used_error_cycles = 0;
+  int32_t  last_static_path_error_cycles = 0;
+  int32_t  last_fit_error_cycles = 0;
+  uint32_t last_point_slope_cycles = 0;
+
+  uint32_t accepted_samples_this_second = 0;
+  uint32_t substituted_samples_this_second = 0;
+  uint32_t total_accepted_samples = 0;
+  uint32_t total_substituted_samples = 0;
+  uint32_t first_substituted_ms = 0;
+  uint32_t last_substituted_ms = 0;
+  int64_t  substituted_error_sum_cycles = 0;
+  uint64_t substituted_abs_error_sum_cycles = 0;
+  uint32_t max_abs_observed_error_cycles = 0;
 
   uint32_t refine_ticks_this_second = 0;
   uint32_t adjustments_this_second = 0;
@@ -173,6 +264,24 @@ struct dynamic_cps_state_t {
   uint32_t skipped_offset_low = 0;
   uint32_t skipped_offset_high = 0;
 
+  // Dynamic-vs-static effectiveness evaluation.
+  uint32_t eval_count = 0;
+  uint32_t helped_count = 0;
+  uint32_t hurt_count = 0;
+  uint32_t neutral_count = 0;
+  uint64_t total_abs_static_error_cycles = 0;
+  uint64_t total_abs_dynamic_error_cycles = 0;
+  uint32_t last_next_actual_cycles = 0;
+  int32_t  last_static_error_cycles = 0;
+  int32_t  last_dynamic_error_cycles = 0;
+  uint32_t last_abs_static_error_cycles = 0;
+  uint32_t last_abs_dynamic_error_cycles = 0;
+  int32_t  last_improvement_cycles = 0;
+  bool     last_dynamic_helped = false;
+  int32_t  last_endpoint_error_cycles = 0;
+  uint32_t last_abs_endpoint_error_cycles = 0;
+  bool     last_endpoint_sanity_pass = false;
+
   uint32_t history_head = 0;
   uint32_t history_count = 0;
   time_dynamic_cps_record_t history[DYNAMIC_CPS_HISTORY_CAPACITY] = {};
@@ -180,7 +289,34 @@ struct dynamic_cps_state_t {
 
 static dynamic_cps_state_t dynamic_cps = {};
 
-static void dynamic_cps_push_record_locked(void) {
+static void dynamic_cps_note_effectiveness_locked(const time_dynamic_cps_record_t& rec) {
+  if (!rec.eval_valid) return;
+
+  dynamic_cps.eval_count++;
+  dynamic_cps.total_abs_static_error_cycles += rec.abs_static_error_cycles;
+  dynamic_cps.total_abs_dynamic_error_cycles += rec.abs_dynamic_error_cycles;
+
+  if (rec.abs_dynamic_error_cycles < rec.abs_static_error_cycles) {
+    dynamic_cps.helped_count++;
+  } else if (rec.abs_dynamic_error_cycles > rec.abs_static_error_cycles) {
+    dynamic_cps.hurt_count++;
+  } else {
+    dynamic_cps.neutral_count++;
+  }
+
+  dynamic_cps.last_next_actual_cycles = rec.next_actual_cycles;
+  dynamic_cps.last_static_error_cycles = rec.static_error_cycles;
+  dynamic_cps.last_dynamic_error_cycles = rec.dynamic_error_cycles;
+  dynamic_cps.last_abs_static_error_cycles = rec.abs_static_error_cycles;
+  dynamic_cps.last_abs_dynamic_error_cycles = rec.abs_dynamic_error_cycles;
+  dynamic_cps.last_improvement_cycles = rec.improvement_cycles;
+  dynamic_cps.last_dynamic_helped = rec.dynamic_helped;
+  dynamic_cps.last_endpoint_error_cycles = rec.endpoint_error_cycles;
+  dynamic_cps.last_abs_endpoint_error_cycles = rec.abs_endpoint_error_cycles;
+  dynamic_cps.last_endpoint_sanity_pass = rec.endpoint_sanity_pass;
+}
+
+static void dynamic_cps_push_record_locked(uint32_t next_actual_cycles) {
   if (dynamic_cps.pvc_sequence == 0) return;
 
   time_dynamic_cps_record_t rec{};
@@ -192,17 +328,91 @@ static void dynamic_cps_push_record_locked(void) {
       (int32_t)((int64_t)dynamic_cps.current_cycles - (int64_t)dynamic_cps.base_cycles);
   rec.refine_ticks = dynamic_cps.refine_ticks_this_second;
   rec.adjustments = dynamic_cps.adjustments_this_second;
-  rec.last_inferred_cycles = dynamic_cps.last_inferred_cycles;
-  rec.last_cps_error = dynamic_cps.last_cps_error;
-  rec.last_cps_step = dynamic_cps.last_cps_step;
-  rec.last_gnss_offset_ns = dynamic_cps.last_gnss_offset_ns;
-  rec.valid = dynamic_cps.valid;
+
+  rec.fit_samples = dynamic_cps.fit.samples;
+  rec.fit_sum_t2_ms2 = dynamic_cps.fit.sum_t2_ms2;
+  rec.fit_sum_tx_cycles_ms = dynamic_cps.fit.sum_tx_cycles_ms;
+  rec.last_sample_ms = dynamic_cps.last_sample_ms;
+  rec.last_observed_cycles = dynamic_cps.last_observed_cycles;
+  rec.last_used_cycles = dynamic_cps.last_used_cycles;
+  rec.last_expected_static_cycles = dynamic_cps.last_expected_static_cycles;
+  rec.last_expected_fit_cycles = dynamic_cps.last_expected_fit_cycles;
+  rec.last_observed_error_cycles = dynamic_cps.last_observed_error_cycles;
+  rec.last_used_error_cycles = dynamic_cps.last_used_error_cycles;
+  rec.last_static_path_error_cycles = dynamic_cps.last_static_path_error_cycles;
+  rec.last_fit_error_cycles = dynamic_cps.last_fit_error_cycles;
+  rec.last_point_slope_cycles = dynamic_cps.last_point_slope_cycles;
+
+  rec.outlier_threshold_cycles = DYNAMIC_CPS_OUTLIER_THRESHOLD_CYCLES;
+  rec.accepted_samples = dynamic_cps.accepted_samples_this_second;
+  rec.substituted_samples = dynamic_cps.substituted_samples_this_second;
+  rec.first_substituted_ms = dynamic_cps.first_substituted_ms;
+  rec.last_substituted_ms = dynamic_cps.last_substituted_ms;
+  rec.substituted_error_sum_cycles = dynamic_cps.substituted_error_sum_cycles;
+  rec.substituted_abs_error_sum_cycles = dynamic_cps.substituted_abs_error_sum_cycles;
+  rec.max_abs_observed_error_cycles = dynamic_cps.max_abs_observed_error_cycles;
+
+  rec.endpoint_sanity_tolerance_cycles = DYNAMIC_CPS_ENDPOINT_SANITY_TOLERANCE_CYCLES;
+  rec.valid = dynamic_cps.valid && dynamic_cps.base_cycles != 0 && dynamic_cps.current_cycles != 0;
+
+  rec.next_actual_cycles = next_actual_cycles;
+  rec.eval_valid = rec.valid && next_actual_cycles != 0;
+  if (rec.eval_valid) {
+    rec.static_error_cycles =
+        (int32_t)((int64_t)next_actual_cycles - (int64_t)dynamic_cps.base_cycles);
+    rec.dynamic_error_cycles =
+        (int32_t)((int64_t)next_actual_cycles - (int64_t)dynamic_cps.current_cycles);
+    rec.abs_static_error_cycles = u32_abs_i32(rec.static_error_cycles);
+    rec.abs_dynamic_error_cycles = u32_abs_i32(rec.dynamic_error_cycles);
+    rec.improvement_cycles =
+        (int32_t)((int64_t)rec.abs_static_error_cycles -
+                  (int64_t)rec.abs_dynamic_error_cycles);
+    rec.dynamic_helped = rec.abs_dynamic_error_cycles < rec.abs_static_error_cycles;
+
+    rec.endpoint_error_cycles = rec.dynamic_error_cycles;
+    rec.abs_endpoint_error_cycles = rec.abs_dynamic_error_cycles;
+    rec.endpoint_sanity_pass =
+        rec.abs_endpoint_error_cycles <= DYNAMIC_CPS_ENDPOINT_SANITY_TOLERANCE_CYCLES;
+
+    dynamic_cps_note_effectiveness_locked(rec);
+  }
 
   dynamic_cps.history[dynamic_cps.history_head] = rec;
   dynamic_cps.history_head = (dynamic_cps.history_head + 1U) % DYNAMIC_CPS_HISTORY_CAPACITY;
   if (dynamic_cps.history_count < DYNAMIC_CPS_HISTORY_CAPACITY) {
     dynamic_cps.history_count++;
   }
+}
+
+static void dynamic_cps_reset_first_ms_audit_locked(void) {
+  for (uint32_t i = 0; i < DYNAMIC_CPS_FIRST_MS_AUDIT_COUNT; i++) {
+    dynamic_cps.first_ms_audit[i] = dynamic_cps_first_ms_audit_t{};
+  }
+  dynamic_cps.first_ms_audit_valid_count = 0;
+}
+
+static void dynamic_cps_reset_second_locked(void) {
+  dynamic_cps.fit.reset();
+  dynamic_cps_reset_first_ms_audit_locked();
+  dynamic_cps.last_sample_ms = 0;
+  dynamic_cps.last_observed_cycles = 0;
+  dynamic_cps.last_used_cycles = 0;
+  dynamic_cps.last_expected_static_cycles = 0;
+  dynamic_cps.last_expected_fit_cycles = 0;
+  dynamic_cps.last_observed_error_cycles = 0;
+  dynamic_cps.last_used_error_cycles = 0;
+  dynamic_cps.last_static_path_error_cycles = 0;
+  dynamic_cps.last_fit_error_cycles = 0;
+  dynamic_cps.last_point_slope_cycles = 0;
+  dynamic_cps.accepted_samples_this_second = 0;
+  dynamic_cps.substituted_samples_this_second = 0;
+  dynamic_cps.first_substituted_ms = 0;
+  dynamic_cps.last_substituted_ms = 0;
+  dynamic_cps.substituted_error_sum_cycles = 0;
+  dynamic_cps.substituted_abs_error_sum_cycles = 0;
+  dynamic_cps.max_abs_observed_error_cycles = 0;
+  dynamic_cps.refine_ticks_this_second = 0;
+  dynamic_cps.adjustments_this_second = 0;
 }
 
 void time_dynamic_cps_reset(void) {
@@ -216,20 +426,33 @@ void time_dynamic_cps_reset(void) {
   dynamic_cps.current_cycles = 0;
   dynamic_cps.last_reseed_value = 0;
   dynamic_cps.last_reseed_was_computed = false;
-  dynamic_cps.last_inferred_cycles = 0;
-  dynamic_cps.last_cps_error = 0;
-  dynamic_cps.last_cps_step = 0;
-  dynamic_cps.last_gnss_offset_ns = 0;
-  dynamic_cps.refine_ticks_this_second = 0;
-  dynamic_cps.adjustments_this_second = 0;
   dynamic_cps.total_refine_ticks = 0;
   dynamic_cps.total_adjustments = 0;
   dynamic_cps.skipped_no_anchor = 0;
   dynamic_cps.skipped_no_cps = 0;
   dynamic_cps.skipped_offset_low = 0;
   dynamic_cps.skipped_offset_high = 0;
+  dynamic_cps.total_accepted_samples = 0;
+  dynamic_cps.total_substituted_samples = 0;
+  dynamic_cps.eval_count = 0;
+  dynamic_cps.helped_count = 0;
+  dynamic_cps.hurt_count = 0;
+  dynamic_cps.neutral_count = 0;
+  dynamic_cps.total_abs_static_error_cycles = 0;
+  dynamic_cps.total_abs_dynamic_error_cycles = 0;
+  dynamic_cps.last_next_actual_cycles = 0;
+  dynamic_cps.last_static_error_cycles = 0;
+  dynamic_cps.last_dynamic_error_cycles = 0;
+  dynamic_cps.last_abs_static_error_cycles = 0;
+  dynamic_cps.last_abs_dynamic_error_cycles = 0;
+  dynamic_cps.last_improvement_cycles = 0;
+  dynamic_cps.last_dynamic_helped = false;
+  dynamic_cps.last_endpoint_error_cycles = 0;
+  dynamic_cps.last_abs_endpoint_error_cycles = 0;
+  dynamic_cps.last_endpoint_sanity_pass = false;
   dynamic_cps.history_head = 0;
   dynamic_cps.history_count = 0;
+  dynamic_cps_reset_second_locked();
   for (uint32_t i = 0; i < DYNAMIC_CPS_HISTORY_CAPACITY; i++) {
     dynamic_cps.history[i] = time_dynamic_cps_record_t{};
   }
@@ -243,12 +466,12 @@ void time_dynamic_cps_pps_vclock_edge(uint32_t pvc_sequence,
   dynamic_cps.seq++;
   dmb();
 
-  dynamic_cps_push_record_locked();
-
   const bool have_prev = (dynamic_cps.pvc_sequence != 0);
   const uint32_t base = have_prev
       ? (uint32_t)(pvc_dwt_at_edge - dynamic_cps.current_pvc_dwt_at_edge)
       : 0;
+
+  dynamic_cps_push_record_locked(base);
 
   dynamic_cps.pvc_sequence = pvc_sequence;
   dynamic_cps.current_pvc_dwt_at_edge = pvc_dwt_at_edge;
@@ -257,16 +480,42 @@ void time_dynamic_cps_pps_vclock_edge(uint32_t pvc_sequence,
   dynamic_cps.last_reseed_value = base;
   dynamic_cps.last_reseed_was_computed = have_prev;
   dynamic_cps.valid = have_prev && base != 0;
-
-  dynamic_cps.last_inferred_cycles = 0;
-  dynamic_cps.last_cps_error = 0;
-  dynamic_cps.last_cps_step = 0;
-  dynamic_cps.last_gnss_offset_ns = 0;
-  dynamic_cps.refine_ticks_this_second = 0;
-  dynamic_cps.adjustments_this_second = 0;
+  dynamic_cps_reset_second_locked();
 
   dmb();
   dynamic_cps.seq++;
+}
+
+static void dynamic_cps_capture_first_ms_audit_locked(uint32_t sample_ms,
+                                                       uint32_t qtimer_event_dwt,
+                                                       uint32_t observed_cycles) {
+  if (sample_ms < 1 || sample_ms > DYNAMIC_CPS_FIRST_MS_AUDIT_COUNT) return;
+  if (!dynamic_cps.valid || dynamic_cps.base_cycles == 0) return;
+
+  const uint32_t idx = sample_ms - 1U;
+  dynamic_cps_first_ms_audit_t a{};
+  a.valid = true;
+  a.ms = sample_ms;
+  a.anchor_dwt = dynamic_cps.current_pvc_dwt_at_edge;
+  a.static_cycles_per_second = dynamic_cps.base_cycles;
+  a.static_cycles_per_ms_floor = dynamic_cps.base_cycles / 1000U;
+  a.expected_elapsed_floor =
+      (uint32_t)(((uint64_t)dynamic_cps.base_cycles * (uint64_t)sample_ms) / 1000ULL);
+  a.expected_elapsed_round = line_cycles_at_ms(dynamic_cps.base_cycles, sample_ms);
+  a.expected_dwt_floor = a.anchor_dwt + a.expected_elapsed_floor;
+  a.expected_dwt_round = a.anchor_dwt + a.expected_elapsed_round;
+  a.observed_dwt = qtimer_event_dwt;
+  a.observed_elapsed_cycles = observed_cycles;
+  a.error_vs_floor_cycles =
+      (int32_t)((int64_t)observed_cycles - (int64_t)a.expected_elapsed_floor);
+  a.error_vs_round_cycles =
+      (int32_t)((int64_t)observed_cycles - (int64_t)a.expected_elapsed_round);
+
+  const bool was_valid = dynamic_cps.first_ms_audit[idx].valid;
+  dynamic_cps.first_ms_audit[idx] = a;
+  if (!was_valid && dynamic_cps.first_ms_audit_valid_count < DYNAMIC_CPS_FIRST_MS_AUDIT_COUNT) {
+    dynamic_cps.first_ms_audit_valid_count++;
+  }
 }
 
 void time_dynamic_cps_cadence_update(uint32_t qtimer_event_dwt,
@@ -281,23 +530,21 @@ void time_dynamic_cps_cadence_update(uint32_t qtimer_event_dwt,
     return;
   }
 
-  if (!dynamic_cps.valid || dynamic_cps.current_cycles == 0) {
+  if (!dynamic_cps.valid || dynamic_cps.base_cycles == 0 || dynamic_cps.current_cycles == 0) {
     dynamic_cps.skipped_no_cps++;
     dmb();
     dynamic_cps.seq++;
     return;
   }
 
-  const uint64_t gnss_offset_ns = (uint64_t)cadence_tick_mod_1000 * NS_PER_MILLISECOND;
-
-  if (gnss_offset_ns < DYNAMIC_CPS_MIN_REFINE_OFFSET_NS) {
+  const uint32_t sample_ms = cadence_tick_mod_1000;
+  if (sample_ms < DYNAMIC_CPS_MIN_REFINE_MS) {
     dynamic_cps.skipped_offset_low++;
     dmb();
     dynamic_cps.seq++;
     return;
   }
-  if (gnss_offset_ns >= NS_PER_SECOND ||
-      gnss_offset_ns > DYNAMIC_CPS_MAX_REFINE_OFFSET_NS) {
+  if (sample_ms > DYNAMIC_CPS_MAX_REFINE_MS) {
     dynamic_cps.skipped_offset_high++;
     dmb();
     dynamic_cps.seq++;
@@ -305,33 +552,68 @@ void time_dynamic_cps_cadence_update(uint32_t qtimer_event_dwt,
   }
 
   const uint32_t observed_cycles = qtimer_event_dwt - dynamic_cps.current_pvc_dwt_at_edge;
-  const uint32_t inferred_cps =
-      (uint32_t)(((uint64_t)observed_cycles * (uint64_t)NS_PER_SECOND +
-                  gnss_offset_ns / 2ULL) /
-                 gnss_offset_ns);
+  dynamic_cps_capture_first_ms_audit_locked(sample_ms, qtimer_event_dwt, observed_cycles);
+  const uint32_t expected_static = line_cycles_at_ms(dynamic_cps.base_cycles, sample_ms);
+  const uint32_t expected_fit = line_cycles_at_ms(dynamic_cps.current_cycles, sample_ms);
+  const int32_t observed_error =
+      (int32_t)((int64_t)observed_cycles - (int64_t)expected_fit);
+  const uint32_t abs_observed_error = u32_abs_i32(observed_error);
 
-  int32_t cps_error = (int32_t)((int64_t)inferred_cps - (int64_t)dynamic_cps.current_cycles);
-  int32_t cps_step  = cps_error >> DYNAMIC_CPS_BLEND_SHIFT;
-  if (cps_step == 0 && cps_error != 0) {
-    cps_step = (cps_error > 0) ? 1 : -1;
+  uint32_t used_cycles = observed_cycles;
+  bool substituted = false;
+  if (abs_observed_error > DYNAMIC_CPS_OUTLIER_THRESHOLD_CYCLES) {
+    used_cycles = expected_fit;
+    substituted = true;
+    dynamic_cps.substituted_samples_this_second++;
+    dynamic_cps.total_substituted_samples++;
+    if (dynamic_cps.first_substituted_ms == 0) {
+      dynamic_cps.first_substituted_ms = sample_ms;
+    }
+    dynamic_cps.last_substituted_ms = sample_ms;
+    dynamic_cps.substituted_error_sum_cycles += observed_error;
+    dynamic_cps.substituted_abs_error_sum_cycles += abs_observed_error;
+  } else {
+    dynamic_cps.accepted_samples_this_second++;
+    dynamic_cps.total_accepted_samples++;
   }
-  if (cps_step >  DYNAMIC_CPS_MAX_STEP_CYCLES) cps_step =  DYNAMIC_CPS_MAX_STEP_CYCLES;
-  if (cps_step < -DYNAMIC_CPS_MAX_STEP_CYCLES) cps_step = -DYNAMIC_CPS_MAX_STEP_CYCLES;
 
-  int64_t next_cycles = (int64_t)dynamic_cps.current_cycles + (int64_t)cps_step;
-  if (next_cycles < 1) next_cycles = 1;
-  dynamic_cps.current_cycles = (uint32_t)next_cycles;
+  if (abs_observed_error > dynamic_cps.max_abs_observed_error_cycles) {
+    dynamic_cps.max_abs_observed_error_cycles = abs_observed_error;
+  }
 
-  dynamic_cps.last_inferred_cycles = inferred_cps;
-  dynamic_cps.last_cps_error = cps_error;
-  dynamic_cps.last_cps_step = cps_step;
-  dynamic_cps.last_gnss_offset_ns = gnss_offset_ns;
+  const int32_t used_error =
+      (int32_t)((int64_t)used_cycles - (int64_t)expected_fit);
+  const uint32_t point_slope =
+      (uint32_t)(((uint64_t)used_cycles * 1000ULL + (uint64_t)sample_ms / 2ULL) /
+                 (uint64_t)sample_ms);
+
+  const uint32_t previous_cycles = dynamic_cps.current_cycles;
+  dynamic_cps.fit.add(sample_ms, used_cycles);
+  dynamic_cps.current_cycles = dynamic_cps.fit.slope(dynamic_cps.base_cycles);
+
+  const uint32_t expected_fit_after = line_cycles_at_ms(dynamic_cps.current_cycles, sample_ms);
+  const int32_t fit_error_after =
+      (int32_t)((int64_t)used_cycles - (int64_t)expected_fit_after);
+
+  dynamic_cps.last_sample_ms = sample_ms;
+  dynamic_cps.last_observed_cycles = observed_cycles;
+  dynamic_cps.last_used_cycles = used_cycles;
+  dynamic_cps.last_expected_static_cycles = expected_static;
+  dynamic_cps.last_expected_fit_cycles = expected_fit_after;
+  dynamic_cps.last_observed_error_cycles = observed_error;
+  dynamic_cps.last_used_error_cycles = used_error;
+  dynamic_cps.last_static_path_error_cycles =
+      (int32_t)((int64_t)observed_cycles - (int64_t)expected_static);
+  dynamic_cps.last_fit_error_cycles = fit_error_after;
+  dynamic_cps.last_point_slope_cycles = point_slope;
+
   dynamic_cps.refine_ticks_this_second++;
   dynamic_cps.total_refine_ticks++;
-  if (cps_step != 0) {
+  if (dynamic_cps.current_cycles != previous_cycles) {
     dynamic_cps.adjustments_this_second++;
     dynamic_cps.total_adjustments++;
   }
+  (void)substituted;
 
   dmb();
   dynamic_cps.seq++;
@@ -446,11 +728,13 @@ static time_snapshot_t read_anchor(void) {
 
 static uint32_t effective_cycles_for_anchor(uint32_t anchor_dwt_at_pps_vclock,
                                             uint32_t raw_cycles) {
-  const time_dynamic_cps_snapshot_t cps = time_dynamic_cps_snapshot();
-  if (cps.valid && cps.current_cycles != 0 &&
-      cps.current_pvc_dwt_at_edge == anchor_dwt_at_pps_vclock) {
-    return cps.current_cycles;
-  }
+  // Dynamic CPS is currently witness-only. It is measured, reported, and
+  // evaluated against the next PPS/VCLOCK bookend, but it is deliberately
+  // NOT used as the authority for DWT<->GNSS projection.
+  //
+  // The static bookend count is the operational interpolation rate until the
+  // dynamic model proves that it reliably improves projection error.
+  (void)anchor_dwt_at_pps_vclock;
   return raw_cycles;
 }
 
@@ -670,6 +954,8 @@ time_dynamic_cps_snapshot_t time_dynamic_cps_snapshot(void) {
     dmb();
 
     out.valid = dynamic_cps.valid;
+    out.witness_only = true;
+    out.projection_enabled = false;
     out.pvc_sequence = dynamic_cps.pvc_sequence;
     out.current_pvc_dwt_at_edge = dynamic_cps.current_pvc_dwt_at_edge;
     out.pvc_dwt_at_edge = dynamic_cps.current_pvc_dwt_at_edge;
@@ -679,10 +965,32 @@ time_dynamic_cps_snapshot_t time_dynamic_cps_snapshot(void) {
         (int32_t)((int64_t)dynamic_cps.current_cycles - (int64_t)dynamic_cps.base_cycles);
     out.last_reseed_value = dynamic_cps.last_reseed_value;
     out.last_reseed_was_computed = dynamic_cps.last_reseed_was_computed;
-    out.last_inferred_cycles = dynamic_cps.last_inferred_cycles;
-    out.last_cps_error = dynamic_cps.last_cps_error;
-    out.last_cps_step = dynamic_cps.last_cps_step;
-    out.last_gnss_offset_ns = dynamic_cps.last_gnss_offset_ns;
+
+    out.fit_samples_this_second = dynamic_cps.fit.samples;
+    out.fit_sum_t2_ms2 = dynamic_cps.fit.sum_t2_ms2;
+    out.fit_sum_tx_cycles_ms = dynamic_cps.fit.sum_tx_cycles_ms;
+    out.last_sample_ms = dynamic_cps.last_sample_ms;
+    out.last_observed_cycles = dynamic_cps.last_observed_cycles;
+    out.last_used_cycles = dynamic_cps.last_used_cycles;
+    out.last_expected_static_cycles = dynamic_cps.last_expected_static_cycles;
+    out.last_expected_fit_cycles = dynamic_cps.last_expected_fit_cycles;
+    out.last_observed_error_cycles = dynamic_cps.last_observed_error_cycles;
+    out.last_used_error_cycles = dynamic_cps.last_used_error_cycles;
+    out.last_static_path_error_cycles = dynamic_cps.last_static_path_error_cycles;
+    out.last_fit_error_cycles = dynamic_cps.last_fit_error_cycles;
+    out.last_point_slope_cycles = dynamic_cps.last_point_slope_cycles;
+
+    out.outlier_threshold_cycles = DYNAMIC_CPS_OUTLIER_THRESHOLD_CYCLES;
+    out.accepted_samples_this_second = dynamic_cps.accepted_samples_this_second;
+    out.substituted_samples_this_second = dynamic_cps.substituted_samples_this_second;
+    out.total_accepted_samples = dynamic_cps.total_accepted_samples;
+    out.total_substituted_samples = dynamic_cps.total_substituted_samples;
+    out.first_substituted_ms = dynamic_cps.first_substituted_ms;
+    out.last_substituted_ms = dynamic_cps.last_substituted_ms;
+    out.substituted_error_sum_cycles = dynamic_cps.substituted_error_sum_cycles;
+    out.substituted_abs_error_sum_cycles = dynamic_cps.substituted_abs_error_sum_cycles;
+    out.max_abs_observed_error_cycles = dynamic_cps.max_abs_observed_error_cycles;
+
     out.refine_ticks_this_second = dynamic_cps.refine_ticks_this_second;
     out.adjustments_this_second = dynamic_cps.adjustments_this_second;
     out.total_refine_ticks = dynamic_cps.total_refine_ticks;
@@ -691,6 +999,23 @@ time_dynamic_cps_snapshot_t time_dynamic_cps_snapshot(void) {
     out.skipped_no_cps = dynamic_cps.skipped_no_cps;
     out.skipped_offset_low = dynamic_cps.skipped_offset_low;
     out.skipped_offset_high = dynamic_cps.skipped_offset_high;
+    out.eval_count = dynamic_cps.eval_count;
+    out.helped_count = dynamic_cps.helped_count;
+    out.hurt_count = dynamic_cps.hurt_count;
+    out.neutral_count = dynamic_cps.neutral_count;
+    out.total_abs_static_error_cycles = dynamic_cps.total_abs_static_error_cycles;
+    out.total_abs_dynamic_error_cycles = dynamic_cps.total_abs_dynamic_error_cycles;
+    out.last_next_actual_cycles = dynamic_cps.last_next_actual_cycles;
+    out.last_static_error_cycles = dynamic_cps.last_static_error_cycles;
+    out.last_dynamic_error_cycles = dynamic_cps.last_dynamic_error_cycles;
+    out.last_abs_static_error_cycles = dynamic_cps.last_abs_static_error_cycles;
+    out.last_abs_dynamic_error_cycles = dynamic_cps.last_abs_dynamic_error_cycles;
+    out.last_improvement_cycles = dynamic_cps.last_improvement_cycles;
+    out.last_dynamic_helped = dynamic_cps.last_dynamic_helped;
+    out.last_endpoint_error_cycles = dynamic_cps.last_endpoint_error_cycles;
+    out.last_abs_endpoint_error_cycles = dynamic_cps.last_abs_endpoint_error_cycles;
+    out.endpoint_sanity_tolerance_cycles = DYNAMIC_CPS_ENDPOINT_SANITY_TOLERANCE_CYCLES;
+    out.last_endpoint_sanity_pass = dynamic_cps.last_endpoint_sanity_pass;
     out.history_count = dynamic_cps.history_count;
     out.history_capacity = DYNAMIC_CPS_HISTORY_CAPACITY;
 
@@ -756,17 +1081,22 @@ bool time_dynamic_cps_cycles_for_anchor(uint32_t pvc_sequence,
                                         uint32_t* out_cycles) {
   if (!out_cycles) return false;
 
+  // Compatibility accessor used by existing interrupt projection code.
+  // While dynamic CPS is witness-only, return the static PPS/VCLOCK bookend
+  // rate for the requested anchor, not the dynamically refined final/current
+  // value. This keeps GNSS projection on the conservative static ruler while
+  // preserving the function's role as a per-anchor CPS lookup.
   const time_dynamic_cps_snapshot_t snap = time_dynamic_cps_snapshot();
-  if (snap.valid && snap.pvc_sequence == pvc_sequence && snap.current_cycles != 0) {
-    *out_cycles = snap.current_cycles;
+  if (snap.valid && snap.pvc_sequence == pvc_sequence && snap.base_cycles != 0) {
+    *out_cycles = snap.base_cycles;
     return true;
   }
 
   time_dynamic_cps_record_t hist[DYNAMIC_CPS_HISTORY_CAPACITY];
   const uint32_t n = time_dynamic_cps_history(hist, DYNAMIC_CPS_HISTORY_CAPACITY);
   for (uint32_t i = 0; i < n; i++) {
-    if (hist[i].valid && hist[i].pvc_sequence == pvc_sequence && hist[i].final_cycles != 0) {
-      *out_cycles = hist[i].final_cycles;
+    if (hist[i].valid && hist[i].pvc_sequence == pvc_sequence && hist[i].base_cycles != 0) {
+      *out_cycles = hist[i].base_cycles;
       return true;
     }
   }
@@ -848,6 +1178,10 @@ static void add_prediction_scalars(Payload& out) {
 static void add_dynamic_cps_scalars(Payload& out) {
   const time_dynamic_cps_snapshot_t c = time_dynamic_cps_snapshot();
   out.add("dynamic_cps_valid", c.valid);
+  out.add("dynamic_cps_mode", "LINEAR_FIT_WITNESS_WITH_OUTLIER_SUBSTITUTION");
+  out.add("dynamic_cps_model", "FIXED_ANCHOR_ONLINE_LEAST_SQUARES");
+  out.add("dynamic_cps_witness_only", c.witness_only);
+  out.add("dynamic_cps_projection_enabled", c.projection_enabled);
   out.add("dynamic_cps_pvc_sequence", c.pvc_sequence);
   out.add("dynamic_cps_current_pvc_dwt_at_edge", c.current_pvc_dwt_at_edge);
   out.add("dynamic_cps_base_cycles", c.base_cycles);
@@ -855,10 +1189,32 @@ static void add_dynamic_cps_scalars(Payload& out) {
   out.add("dynamic_cps_net_adjustment_cycles", c.net_adjustment_cycles);
   out.add("dynamic_cps_last_reseed_value", c.last_reseed_value);
   out.add("dynamic_cps_last_reseed_was_computed", c.last_reseed_was_computed);
-  out.add("dynamic_cps_last_inferred_cycles", c.last_inferred_cycles);
-  out.add("dynamic_cps_last_cps_error", c.last_cps_error);
-  out.add("dynamic_cps_last_cps_step", c.last_cps_step);
-  out.add("dynamic_cps_last_gnss_offset_ns", c.last_gnss_offset_ns);
+
+  out.add("dynamic_cps_fit_samples_this_second", c.fit_samples_this_second);
+  out.add("dynamic_cps_fit_sum_t2_ms2", c.fit_sum_t2_ms2);
+  out.add("dynamic_cps_fit_sum_tx_cycles_ms", c.fit_sum_tx_cycles_ms);
+  out.add("dynamic_cps_last_sample_ms", c.last_sample_ms);
+  out.add("dynamic_cps_last_observed_cycles", c.last_observed_cycles);
+  out.add("dynamic_cps_last_used_cycles", c.last_used_cycles);
+  out.add("dynamic_cps_last_expected_static_cycles", c.last_expected_static_cycles);
+  out.add("dynamic_cps_last_expected_fit_cycles", c.last_expected_fit_cycles);
+  out.add("dynamic_cps_last_observed_error_cycles", c.last_observed_error_cycles);
+  out.add("dynamic_cps_last_used_error_cycles", c.last_used_error_cycles);
+  out.add("dynamic_cps_last_static_path_error_cycles", c.last_static_path_error_cycles);
+  out.add("dynamic_cps_last_fit_error_cycles", c.last_fit_error_cycles);
+  out.add("dynamic_cps_last_point_slope_cycles", c.last_point_slope_cycles);
+
+  out.add("dynamic_cps_outlier_threshold_cycles", c.outlier_threshold_cycles);
+  out.add("dynamic_cps_accepted_samples_this_second", c.accepted_samples_this_second);
+  out.add("dynamic_cps_substituted_samples_this_second", c.substituted_samples_this_second);
+  out.add("dynamic_cps_total_accepted_samples", c.total_accepted_samples);
+  out.add("dynamic_cps_total_substituted_samples", c.total_substituted_samples);
+  out.add("dynamic_cps_first_substituted_ms", c.first_substituted_ms);
+  out.add("dynamic_cps_last_substituted_ms", c.last_substituted_ms);
+  out.add("dynamic_cps_substituted_error_sum_cycles", c.substituted_error_sum_cycles);
+  out.add("dynamic_cps_substituted_abs_error_sum_cycles", c.substituted_abs_error_sum_cycles);
+  out.add("dynamic_cps_max_abs_observed_error_cycles", c.max_abs_observed_error_cycles);
+
   out.add("dynamic_cps_refine_ticks_this_second", c.refine_ticks_this_second);
   out.add("dynamic_cps_adjustments_this_second", c.adjustments_this_second);
   out.add("dynamic_cps_total_refine_ticks", c.total_refine_ticks);
@@ -867,6 +1223,33 @@ static void add_dynamic_cps_scalars(Payload& out) {
   out.add("dynamic_cps_skipped_no_cps", c.skipped_no_cps);
   out.add("dynamic_cps_skipped_offset_low", c.skipped_offset_low);
   out.add("dynamic_cps_skipped_offset_high", c.skipped_offset_high);
+  out.add("dynamic_cps_eval_count", c.eval_count);
+  out.add("dynamic_cps_helped_count", c.helped_count);
+  out.add("dynamic_cps_hurt_count", c.hurt_count);
+  out.add("dynamic_cps_neutral_count", c.neutral_count);
+  out.add("dynamic_cps_total_abs_static_error_cycles", c.total_abs_static_error_cycles);
+  out.add("dynamic_cps_total_abs_dynamic_error_cycles", c.total_abs_dynamic_error_cycles);
+  out.add("dynamic_cps_mean_abs_static_error_cycles",
+          c.eval_count ? ((double)c.total_abs_static_error_cycles / (double)c.eval_count) : 0.0, 6);
+  out.add("dynamic_cps_mean_abs_dynamic_error_cycles",
+          c.eval_count ? ((double)c.total_abs_dynamic_error_cycles / (double)c.eval_count) : 0.0, 6);
+  const int64_t total_improvement =
+      (int64_t)c.total_abs_static_error_cycles -
+      (int64_t)c.total_abs_dynamic_error_cycles;
+  out.add("dynamic_cps_total_improvement_cycles", total_improvement);
+  out.add("dynamic_cps_mean_improvement_cycles",
+          c.eval_count ? ((double)total_improvement / (double)c.eval_count) : 0.0, 6);
+  out.add("dynamic_cps_last_next_actual_cycles", c.last_next_actual_cycles);
+  out.add("dynamic_cps_last_static_error_cycles", c.last_static_error_cycles);
+  out.add("dynamic_cps_last_dynamic_error_cycles", c.last_dynamic_error_cycles);
+  out.add("dynamic_cps_last_abs_static_error_cycles", c.last_abs_static_error_cycles);
+  out.add("dynamic_cps_last_abs_dynamic_error_cycles", c.last_abs_dynamic_error_cycles);
+  out.add("dynamic_cps_last_improvement_cycles", c.last_improvement_cycles);
+  out.add("dynamic_cps_last_dynamic_helped", c.last_dynamic_helped);
+  out.add("dynamic_cps_last_endpoint_error_cycles", c.last_endpoint_error_cycles);
+  out.add("dynamic_cps_last_abs_endpoint_error_cycles", c.last_abs_endpoint_error_cycles);
+  out.add("dynamic_cps_endpoint_sanity_tolerance_cycles", c.endpoint_sanity_tolerance_cycles);
+  out.add("dynamic_cps_last_endpoint_sanity_pass", c.last_endpoint_sanity_pass);
   out.add("dynamic_cps_history_count", c.history_count);
   out.add("dynamic_cps_history_capacity", c.history_capacity);
 }
@@ -955,10 +1338,43 @@ static Payload cmd_dynamic_cps_history(const Payload& args) {
     e.add("net_adjustment_cycles", hist[i].net_adjustment_cycles);
     e.add("refine_ticks", hist[i].refine_ticks);
     e.add("adjustments", hist[i].adjustments);
-    e.add("last_inferred_cycles", hist[i].last_inferred_cycles);
-    e.add("last_cps_error", hist[i].last_cps_error);
-    e.add("last_cps_step", hist[i].last_cps_step);
-    e.add("last_gnss_offset_ns", hist[i].last_gnss_offset_ns);
+
+    e.add("fit_samples", hist[i].fit_samples);
+    e.add("fit_sum_t2_ms2", hist[i].fit_sum_t2_ms2);
+    e.add("fit_sum_tx_cycles_ms", hist[i].fit_sum_tx_cycles_ms);
+    e.add("last_sample_ms", hist[i].last_sample_ms);
+    e.add("last_observed_cycles", hist[i].last_observed_cycles);
+    e.add("last_used_cycles", hist[i].last_used_cycles);
+    e.add("last_expected_static_cycles", hist[i].last_expected_static_cycles);
+    e.add("last_expected_fit_cycles", hist[i].last_expected_fit_cycles);
+    e.add("last_observed_error_cycles", hist[i].last_observed_error_cycles);
+    e.add("last_used_error_cycles", hist[i].last_used_error_cycles);
+    e.add("last_static_path_error_cycles", hist[i].last_static_path_error_cycles);
+    e.add("last_fit_error_cycles", hist[i].last_fit_error_cycles);
+    e.add("last_point_slope_cycles", hist[i].last_point_slope_cycles);
+
+    e.add("outlier_threshold_cycles", hist[i].outlier_threshold_cycles);
+    e.add("accepted_samples", hist[i].accepted_samples);
+    e.add("substituted_samples", hist[i].substituted_samples);
+    e.add("first_substituted_ms", hist[i].first_substituted_ms);
+    e.add("last_substituted_ms", hist[i].last_substituted_ms);
+    e.add("substituted_error_sum_cycles", hist[i].substituted_error_sum_cycles);
+    e.add("substituted_abs_error_sum_cycles", hist[i].substituted_abs_error_sum_cycles);
+    e.add("max_abs_observed_error_cycles", hist[i].max_abs_observed_error_cycles);
+
+    e.add("endpoint_error_cycles", hist[i].endpoint_error_cycles);
+    e.add("abs_endpoint_error_cycles", hist[i].abs_endpoint_error_cycles);
+    e.add("endpoint_sanity_tolerance_cycles", hist[i].endpoint_sanity_tolerance_cycles);
+    e.add("endpoint_sanity_pass", hist[i].endpoint_sanity_pass);
+
+    e.add("eval_valid", hist[i].eval_valid);
+    e.add("next_actual_cycles", hist[i].next_actual_cycles);
+    e.add("static_error_cycles", hist[i].static_error_cycles);
+    e.add("dynamic_error_cycles", hist[i].dynamic_error_cycles);
+    e.add("abs_static_error_cycles", hist[i].abs_static_error_cycles);
+    e.add("abs_dynamic_error_cycles", hist[i].abs_dynamic_error_cycles);
+    e.add("improvement_cycles", hist[i].improvement_cycles);
+    e.add("dynamic_helped", hist[i].dynamic_helped);
     e.add("valid", hist[i].valid);
     arr.add(e);
   }
@@ -966,13 +1382,76 @@ static Payload cmd_dynamic_cps_history(const Payload& args) {
   return out;
 }
 
+static Payload cmd_dynamic_cps_first_ms(const Payload&) {
+  Payload out;
+  out.add("model", "TIME_DYNAMIC_CPS_FIRST_MS_AUDIT");
+
+  for (int attempt = 0; attempt < 4; attempt++) {
+    const uint32_t s1 = dynamic_cps.seq;
+    dmb();
+
+    const bool valid = dynamic_cps.valid;
+    const uint32_t pvc_sequence = dynamic_cps.pvc_sequence;
+    const uint32_t anchor_dwt = dynamic_cps.current_pvc_dwt_at_edge;
+    const uint32_t static_cycles_per_second = dynamic_cps.base_cycles;
+    const uint32_t static_cycles_per_ms_floor = dynamic_cps.base_cycles / 1000U;
+    const uint32_t current_cycles = dynamic_cps.current_cycles;
+    const uint32_t valid_count = dynamic_cps.first_ms_audit_valid_count;
+    dynamic_cps_first_ms_audit_t audit[DYNAMIC_CPS_FIRST_MS_AUDIT_COUNT];
+    for (uint32_t i = 0; i < DYNAMIC_CPS_FIRST_MS_AUDIT_COUNT; i++) {
+      audit[i] = dynamic_cps.first_ms_audit[i];
+    }
+
+    dmb();
+    const uint32_t s2 = dynamic_cps.seq;
+    if (s1 != s2 || (s1 & 1u) != 0u) {
+      if (attempt == 3) return Payload{};
+      continue;
+    }
+
+    out.add("valid", valid);
+    out.add("pvc_sequence", pvc_sequence);
+    out.add("anchor_dwt", anchor_dwt);
+    out.add("static_cycles_per_second", static_cycles_per_second);
+    out.add("static_cycles_per_ms_floor", static_cycles_per_ms_floor);
+    out.add("current_cycles", current_cycles);
+    out.add("audit_count", valid_count);
+    out.add("audit_capacity", (uint32_t)DYNAMIC_CPS_FIRST_MS_AUDIT_COUNT);
+    out.add("note", "DWT values are adjusted event coordinates supplied by process_interrupt");
+
+    PayloadArray arr;
+    for (uint32_t i = 0; i < DYNAMIC_CPS_FIRST_MS_AUDIT_COUNT; i++) {
+      Payload e;
+      e.add("valid", audit[i].valid);
+      e.add("ms", audit[i].ms);
+      e.add("anchor_dwt", audit[i].anchor_dwt);
+      e.add("static_cycles_per_second", audit[i].static_cycles_per_second);
+      e.add("static_cycles_per_ms_floor", audit[i].static_cycles_per_ms_floor);
+      e.add("expected_elapsed_floor", audit[i].expected_elapsed_floor);
+      e.add("expected_elapsed_round", audit[i].expected_elapsed_round);
+      e.add("expected_dwt_floor", audit[i].expected_dwt_floor);
+      e.add("expected_dwt_round", audit[i].expected_dwt_round);
+      e.add("observed_dwt", audit[i].observed_dwt);
+      e.add("observed_elapsed_cycles", audit[i].observed_elapsed_cycles);
+      e.add("error_vs_floor_cycles", audit[i].error_vs_floor_cycles);
+      e.add("error_vs_round_cycles", audit[i].error_vs_round_cycles);
+      arr.add(e);
+    }
+    out.add_array("first_ms_audit", arr);
+    return out;
+  }
+
+  return Payload{};
+}
+
 static const process_command_entry_t TIME_COMMANDS[] = {
   { "REPORT",              cmd_report              },
   { "ANCHOR_REPORT",       cmd_anchor_report       },
   { "PREDICTION_REPORT",   cmd_prediction_report   },
   { "PREDICTION_HISTORY",  cmd_prediction_history  },
-  { "DYNAMIC_CPS_REPORT",  cmd_dynamic_cps_report  },
-  { "DYNAMIC_CPS_HISTORY", cmd_dynamic_cps_history },
+  { "DYNAMIC_CPS_REPORT",    cmd_dynamic_cps_report   },
+  { "DYNAMIC_CPS_HISTORY",   cmd_dynamic_cps_history  },
+  { "DYNAMIC_CPS_FIRST_MS",  cmd_dynamic_cps_first_ms },
   { nullptr,               nullptr                 }
 };
 

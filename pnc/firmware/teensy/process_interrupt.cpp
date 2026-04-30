@@ -60,6 +60,14 @@
 #include <math.h>
 #include <stdio.h>
 
+// process_clocks owns watchdog publication/stop semantics.  process_interrupt
+// only raises hard timing-identity faults through this narrow boundary.
+void clocks_watchdog_anomaly(const char* reason,
+                             uint32_t detail0,
+                             uint32_t detail1,
+                             uint32_t detail2,
+                             uint32_t detail3);
+
 // ============================================================================
 // Constants
 // ============================================================================
@@ -76,6 +84,10 @@ static constexpr uint32_t STIMULUS_LAUNCH_LATENCY_CYCLES = 5;
 // this hardware.  Tunable named constants so live measurements can adjust.
 static constexpr uint32_t VCLOCK_EPOCH_TICKS_AFTER_PHYSICAL_PPS = 1;
 static constexpr int32_t  VCLOCK_EPOCH_COUNTER32_OFFSET_TICKS   = 0;
+// The PPS GPIO ISR reads the VCLOCK low word after the selected edge has
+// already matured.  Empirically this observation is two 10 MHz ticks later
+// than the sacred first-after-PPS VCLOCK edge.
+static constexpr uint32_t VCLOCK_EPOCH_OBSERVED_TICKS_AFTER_SELECTED = 2;
 static constexpr int64_t  GNSS_NS_PER_SECOND                    = 1000000000LL;
 
 // DWT→PPS_VCLOCK anchor selection for OCXO/TimePop event projection.
@@ -98,6 +110,25 @@ static constexpr uint32_t ANCHOR_FAIL_BAD_ANCHOR    = 1u << 2;
 static constexpr uint32_t ANCHOR_FAIL_NO_CPS        = 1u << 3;
 static constexpr uint32_t ANCHOR_FAIL_DELTA_RANGE   = 1u << 4;
 static constexpr uint32_t ANCHOR_FAIL_NO_PLAUSIBLE  = 1u << 5;
+
+// VCLOCK endpoint repair is currently disabled / witness-only.
+//
+// The previous active diagnostic path proved useful but could destabilize the
+// foreground path while we are still validating the new VCLOCK-domain anchor
+// architecture.  Leave the constants and report surface in place, but keep the
+// ISR hot path passive until we explicitly re-enable the experiment.
+static constexpr bool     VCLOCK_DWT_REPAIR_DIAG_ENABLED = false;
+static constexpr uint32_t VCLOCK_DWT_REPAIR_THRESHOLD_CYCLES = 10;
+static constexpr uint32_t VCLOCK_DWT_REPAIR_MIN_HISTORY_COUNT = 8;
+static constexpr uint32_t VCLOCK_DWT_REPAIR_MAX_PREDICTION_RESIDUAL_CYCLES = 25;
+
+// PPS/VCLOCK identity watchdog.  Paired PPS and selected VCLOCK events should
+// remain close to the empirically calibrated raw-PPS-to-selected-VCLOCK offset.
+// Fault publication is temporarily disabled; the report still records phase
+// checks and faults so we can verify stability without stopping campaigns or
+// flooding the foreground queue.
+static constexpr bool     PPS_VCLOCK_PHASE_WATCHDOG_ENABLED = false;
+static constexpr uint32_t PPS_VCLOCK_PHASE_TOLERANCE_CYCLES = 10;
 
 // ============================================================================
 // PPS / PPS_VCLOCK doctrine
@@ -176,6 +207,9 @@ static pps_vclock_t store_load_pvc(void) {
   store_load(pps, pvc);
   return pvc;
 }
+
+static pps_edge_dispatch_fn g_pps_edge_dispatch = nullptr;
+static void pps_edge_dispatch_trampoline(timepop_ctx_t*, timepop_diag_t*, void*);
 
 // ============================================================================
 // Dynamic CPS compatibility
@@ -359,6 +393,106 @@ static void bridge_projection_record_stats(interrupt_subscriber_kind_t kind,
 }
 
 // ============================================================================
+// EDGE — PPS GPIO heartbeat
+// ============================================================================
+//
+// State owned by the EDGE command:
+//   • g_pps_gpio_heartbeat — running tally of PPS GPIO edges plus the last
+//     edge's PPS_VCLOCK DWT and gnss_ns.  Updated in the PPS GPIO ISR.
+//   • g_gpio_irq_count   — total PPS GPIO ISR entries.
+//   • g_gpio_miss_count  — incremented when a GPIO ISR ran but did not
+//     identify a PPS edge to process.
+//
+// The snapshot store (g_store, declared elsewhere in this file) holds the
+// last pps_t and pps_vclock_t.  cmd_edge reads it via store_load() and
+// publishes both views alongside the heartbeat tally.
+//
+// EDGE is a heartbeat plus a snapshot of "the last edge from two perspectives."
+
+struct pps_gpio_heartbeat_t {
+  uint32_t edge_count   = 0;
+  uint32_t last_dwt     = 0;     // pps_vclock.dwt_at_edge of most recent edge
+  int64_t  last_gnss_ns = 0;     // pvc.gnss_ns_at_edge of most recent edge
+};
+static pps_gpio_heartbeat_t g_pps_gpio_heartbeat;
+
+static uint32_t g_gpio_irq_count  = 0;
+static uint32_t g_gpio_miss_count = 0;
+
+// ============================================================================
+// PPS witness + VCLOCK-domain canonical epoch latch
+// ============================================================================
+//
+// PPS GPIO is a witness/selector only.  It never authors the public
+// PPS/VCLOCK DWT coordinate.  The super-canonical PPS/VCLOCK DWT coordinate
+// is authored by the VCLOCK/QTimer1 CH3 path, so every public DWT timing fact
+// lives in the same QTimer event-coordinate species.
+//
+// During rebootstrap, the PPS ISR selects the VCLOCK counter identity of the
+// sacred edge and arms CH3.  The first CH3 cadence event then backdates by
+// one 1 ms VCLOCK cadence interval to author the selected edge's DWT in the
+// VCLOCK coordinate domain.  After bootstrap, each 1000th CH3 cadence event
+// authors the next canonical PPS/VCLOCK bookend directly.
+
+struct vclock_epoch_latch_t {
+  bool     pending = false;
+  pps_t    pps{};
+
+  uint32_t counter32_at_edge = 0;
+  uint16_t ch3_at_edge = 0;
+  int64_t  gnss_ns_at_edge = -1;
+
+  uint32_t observed_counter32 = 0;
+  uint16_t observed_ch3 = 0;
+  uint32_t observed_ticks_after_selected = 0;
+  uint32_t first_cadence_counter32 = 0;
+  uint32_t first_cadence_dwt = 0;
+  uint32_t backdate_ticks = 0;
+  uint32_t backdate_cycles = 0;
+  uint32_t sacred_dwt = 0;
+};
+
+static pps_t g_last_pps_witness = {};
+static bool  g_last_pps_witness_valid = false;
+static vclock_epoch_latch_t g_vclock_epoch_latch = {};
+
+static inline uint32_t abs_i32_to_u32_local(int32_t v) {
+  return (v < 0) ? (uint32_t)(-(int64_t)v) : (uint32_t)v;
+}
+
+struct dwt_repair_diag_t {
+  bool     valid = false;
+  bool     candidate = false;
+  bool     synthetic = false;   // operational replacement applied; currently false
+  uint32_t original_dwt = 0;
+  uint32_t predicted_dwt = 0;
+  uint32_t used_dwt = 0;
+  int32_t  error_cycles = 0;
+  const char* reason = "none";
+};
+
+struct vclock_repair_stats_t {
+  uint32_t candidate_count = 0;
+  uint32_t applied_count = 0;
+  uint32_t consecutive_candidate_count = 0;
+  uint32_t last_original_dwt = 0;
+  uint32_t last_predicted_dwt = 0;
+  uint32_t last_used_dwt = 0;
+  int32_t  last_error_cycles = 0;
+  uint32_t max_abs_error_cycles = 0;
+  bool     last_candidate = false;
+  bool     last_synthetic = false;
+
+  uint32_t phase_check_count = 0;
+  uint32_t phase_fault_count = 0;
+  uint32_t phase_unpaired_count = 0;
+  int32_t  last_phase_cycles = 0;
+  int32_t  last_phase_error_cycles = 0;
+};
+
+static vclock_repair_stats_t g_vclock_repair_stats = {};
+
+// ============================================================================
 // VCLOCK GNSS epoch authoring
 // ============================================================================
 //
@@ -388,6 +522,136 @@ static int64_t vclock_gnss_from_counter32(uint32_t authored_counter32) {
   if (pvc.sequence == 0 || pvc.gnss_ns_at_edge < 0) return -1;
   const uint32_t delta_ticks = authored_counter32 - pvc.counter32_at_edge;
   return pvc.gnss_ns_at_edge + (int64_t)delta_ticks * 100LL;
+}
+
+static uint32_t vclock_cycles_for_ticks(uint32_t vclock_ticks) {
+  uint32_t cycles = time_dwt_next_prediction_cycles();
+  if (cycles == 0) cycles = interrupt_dynamic_cps();
+  if (cycles == 0) cycles = DWT_EXPECTED_PER_PPS;
+
+  return (uint32_t)(((uint64_t)cycles * (uint64_t)vclock_ticks +
+                     (uint64_t)VCLOCK_COUNTS_PER_SECOND / 2ULL) /
+                    (uint64_t)VCLOCK_COUNTS_PER_SECOND);
+}
+
+static dwt_repair_diag_t vclock_endpoint_repair_diagnostic(uint32_t observed_dwt) {
+  dwt_repair_diag_t r{};
+  r.valid = false;
+  r.candidate = false;
+  r.synthetic = false;
+  r.original_dwt = observed_dwt;
+  r.predicted_dwt = 0;
+  r.used_dwt = observed_dwt;
+  r.error_cycles = 0;
+  r.reason = "disabled";
+
+  g_vclock_repair_stats.last_candidate = false;
+  g_vclock_repair_stats.last_synthetic = false;
+  g_vclock_repair_stats.last_original_dwt = observed_dwt;
+  g_vclock_repair_stats.last_predicted_dwt = 0;
+  g_vclock_repair_stats.last_used_dwt = observed_dwt;
+  g_vclock_repair_stats.last_error_cycles = 0;
+  g_vclock_repair_stats.consecutive_candidate_count = 0;
+
+  if (!VCLOCK_DWT_REPAIR_DIAG_ENABLED) {
+    return r;
+  }
+
+  return r;
+}
+
+static void vclock_check_pps_phase_or_watchdog(const pps_t& pps,
+                                               uint32_t sequence,
+                                               uint32_t counter32_at_edge,
+                                               uint32_t dwt_at_edge) {
+  if (pps.sequence != sequence || pps.counter32_at_edge == 0) {
+    g_vclock_repair_stats.phase_unpaired_count++;
+    return;
+  }
+
+  const uint32_t observed_delta_ticks = pps.counter32_at_edge - counter32_at_edge;
+  if (observed_delta_ticks != VCLOCK_EPOCH_OBSERVED_TICKS_AFTER_SELECTED) {
+    g_vclock_repair_stats.phase_unpaired_count++;
+    return;
+  }
+
+  const uint32_t pps_raw_entry_dwt =
+      pps.dwt_at_edge + (GPIO_TOTAL_LATENCY - STIMULUS_LAUNCH_LATENCY_CYCLES);
+  const int32_t phase_cycles = (int32_t)(dwt_at_edge - pps_raw_entry_dwt);
+  const int32_t phase_error =
+      phase_cycles - (int32_t)CANONICAL_VCLOCK_EPOCH_MINUS_RAW_PPS_ISR_CYCLES;
+  const uint32_t abs_error = abs_i32_to_u32_local(phase_error);
+
+  g_vclock_repair_stats.phase_check_count++;
+  g_vclock_repair_stats.last_phase_cycles = phase_cycles;
+  g_vclock_repair_stats.last_phase_error_cycles = phase_error;
+
+  if (abs_error > PPS_VCLOCK_PHASE_TOLERANCE_CYCLES) {
+    g_vclock_repair_stats.phase_fault_count++;
+    if (PPS_VCLOCK_PHASE_WATCHDOG_ENABLED) {
+      clocks_watchdog_anomaly("pps_vclock_phase_error",
+                              (uint32_t)phase_cycles,
+                              (uint32_t)CANONICAL_VCLOCK_EPOCH_MINUS_RAW_PPS_ISR_CYCLES,
+                              (uint32_t)phase_error,
+                              sequence);
+    }
+  }
+}
+
+static void publish_vclock_domain_pps_vclock(const pps_t& pps,
+                                             uint32_t sequence,
+                                             uint32_t dwt_at_edge,
+                                             uint32_t counter32_at_edge,
+                                             uint16_t ch3_at_edge,
+                                             int64_t gnss_ns_at_edge) {
+  pps_vclock_t pvc;
+  pvc.sequence = sequence;
+  pvc.dwt_at_edge = dwt_at_edge;
+  pvc.counter32_at_edge = counter32_at_edge;
+  pvc.ch3_at_edge = ch3_at_edge;
+  pvc.gnss_ns_at_edge = gnss_ns_at_edge;
+
+  vclock_check_pps_phase_or_watchdog(pps, sequence, counter32_at_edge, dwt_at_edge);
+
+  g_pps_gpio_heartbeat.last_dwt = pvc.dwt_at_edge;
+  g_pps_gpio_heartbeat.last_gnss_ns = pvc.gnss_ns_at_edge;
+
+  if (g_pvc_anchor_reset_pending) {
+    pvc_anchor_ring_reset();
+  }
+
+  time_dynamic_cps_pps_vclock_edge(pvc.sequence, pvc.dwt_at_edge);
+
+  store_publish(pps, pvc);
+  pvc_anchor_publish(pvc);
+}
+
+static void publish_selected_epoch_from_first_vclock_tick(uint32_t qtimer_event_dwt) {
+  if (!g_vclock_epoch_latch.pending) return;
+
+  const uint32_t backdate_ticks = VCLOCK_INTERVAL_COUNTS;
+  const uint32_t backdate_cycles = vclock_cycles_for_ticks(backdate_ticks);
+  const uint32_t anchor_dwt = qtimer_event_dwt - backdate_cycles;
+
+  g_vclock_epoch_latch.first_cadence_counter32 =
+      g_vclock_epoch_latch.counter32_at_edge + backdate_ticks;
+  g_vclock_epoch_latch.first_cadence_dwt = qtimer_event_dwt;
+  g_vclock_epoch_latch.backdate_ticks = backdate_ticks;
+  g_vclock_epoch_latch.backdate_cycles = backdate_cycles;
+  g_vclock_epoch_latch.sacred_dwt = anchor_dwt;
+
+  publish_vclock_domain_pps_vclock(g_vclock_epoch_latch.pps,
+                                    g_vclock_epoch_latch.pps.sequence,
+                                    anchor_dwt,
+                                    g_vclock_epoch_latch.counter32_at_edge,
+                                    g_vclock_epoch_latch.ch3_at_edge,
+                                    g_vclock_epoch_latch.gnss_ns_at_edge);
+
+  g_vclock_epoch_latch.pending = false;
+
+  if (g_pps_edge_dispatch) {
+    timepop_arm_asap(pps_edge_dispatch_trampoline, nullptr, "PPS_VCLOCK_EPOCH_DISPATCH");
+  }
 }
 
 // ============================================================================
@@ -525,36 +789,10 @@ static interrupt_subscriber_runtime_t* g_rt_vclock = nullptr;
 static interrupt_subscriber_runtime_t* g_rt_ocxo1  = nullptr;
 static interrupt_subscriber_runtime_t* g_rt_ocxo2  = nullptr;
 
-static pps_edge_dispatch_fn g_pps_edge_dispatch = nullptr;
 static volatile interrupt_pps_entry_latency_handler_fn
     g_pps_entry_latency_handler = nullptr;
 
-// ============================================================================
-// EDGE — PPS GPIO heartbeat
-// ============================================================================
-//
-// State owned by the EDGE command:
-//   • g_pps_gpio_heartbeat — running tally of PPS GPIO edges plus the last
-//     edge's PPS_VCLOCK DWT and gnss_ns.  Updated in the PPS GPIO ISR.
-//   • g_gpio_irq_count   — total PPS GPIO ISR entries.
-//   • g_gpio_miss_count  — incremented when a GPIO ISR ran but did not
-//     identify a PPS edge to process.
-//
-// The snapshot store (g_store, declared elsewhere in this file) holds the
-// last pps_t and pps_vclock_t.  cmd_edge reads it via store_load() and
-// publishes both views alongside the heartbeat tally.
-//
-// EDGE is a heartbeat plus a snapshot of "the last edge from two perspectives."
 
-struct pps_gpio_heartbeat_t {
-  uint32_t edge_count   = 0;
-  uint32_t last_dwt     = 0;     // pps_vclock.dwt_at_edge of most recent edge
-  int64_t  last_gnss_ns = 0;     // pvc.gnss_ns_at_edge of most recent edge
-};
-static pps_gpio_heartbeat_t g_pps_gpio_heartbeat;
-
-static uint32_t g_gpio_irq_count  = 0;
-static uint32_t g_gpio_miss_count = 0;
 
 // ============================================================================
 // Per-lane state
@@ -915,7 +1153,8 @@ static void emit_one_second_event(interrupt_subscriber_runtime_t& rt,
                                   uint32_t dwt_at_event,
                                   uint32_t authored_counter32,
                                   uint32_t pps_coincidence_cycles = 0,
-                                  bool     pps_coincidence_valid  = false) {
+                                  bool     pps_coincidence_valid  = false,
+                                  const dwt_repair_diag_t* repair = nullptr) {
   if (!rt.active) return;
 
   interrupt_event_t event {};
@@ -944,6 +1183,16 @@ static void emit_one_second_event(interrupt_subscriber_runtime_t& rt,
 
   interrupt_capture_diag_t diag {};
   fill_diag(diag, rt, event);
+  if (repair) {
+    diag.dwt_synthetic = repair->synthetic;
+    diag.dwt_repair_candidate = repair->candidate;
+    diag.dwt_original_at_event = repair->original_dwt;
+    diag.dwt_predicted_at_event = repair->predicted_dwt;
+    diag.dwt_used_at_event = repair->used_dwt;
+    diag.dwt_synthetic_error_cycles = repair->error_cycles;
+    diag.dwt_synthetic_threshold_cycles = VCLOCK_DWT_REPAIR_THRESHOLD_CYCLES;
+    diag.dwt_synthetic_reason = repair->reason;
+  }
   if (rt.desc->kind != interrupt_subscriber_kind_t::VCLOCK) {
     bridge_projection_copy_to_diag(diag, bridge);
   }
@@ -1006,6 +1255,10 @@ static void vclock_cadence_isr(uint32_t isr_entry_dwt_raw) {
 
   const uint32_t cadence_tick_mod_1000 = g_vclock_lane.tick_mod_1000 + 1;
 
+  if (cadence_tick_mod_1000 == 1 && g_vclock_epoch_latch.pending) {
+    publish_selected_epoch_from_first_vclock_tick(qtimer_event_dwt);
+  }
+
   time_dynamic_cps_cadence_update(qtimer_event_dwt, cadence_tick_mod_1000);
 
   if (++g_vclock_lane.tick_mod_1000 >= TICKS_PER_SECOND_EVENT) {
@@ -1025,9 +1278,33 @@ static void vclock_cadence_isr(uint32_t isr_entry_dwt_raw) {
       }
     }
 
+    const pps_t witness_pps = g_last_pps_witness_valid
+        ? g_last_pps_witness
+        : pps_t{};
+    const dwt_repair_diag_t repair =
+        vclock_endpoint_repair_diagnostic(qtimer_event_dwt);
+    const int64_t pvc_gnss_ns =
+        vclock_next_epoch_gnss_ns(time_dwt_to_gnss_ns(qtimer_event_dwt));
+
+    // Repair is diagnostic-only for now: the observed QTimer event DWT remains
+    // the canonical PPS/VCLOCK bookend.  The predicted DWT and would-repair
+    // classification are carried in the VCLOCK diagnostic payload.
+    publish_vclock_domain_pps_vclock(witness_pps,
+                                      (witness_pps.sequence != 0)
+                                          ? witness_pps.sequence
+                                          : (g_pps_gpio_heartbeat.edge_count + 1),
+                                      qtimer_event_dwt,
+                                      g_vclock_lane.logical_count32_at_last_second,
+                                      fired_low16,
+                                      pvc_gnss_ns);
+
     emit_one_second_event(*g_rt_vclock, qtimer_event_dwt,
                           g_vclock_lane.logical_count32_at_last_second,
-                          coincidence_cycles, coincidence_valid);
+                          coincidence_cycles, coincidence_valid, &repair);
+
+    if (g_pps_edge_dispatch) {
+      timepop_arm_asap(pps_edge_dispatch_trampoline, nullptr, "PPS_VCLOCK_DISPATCH");
+    }
   }
 }
 
@@ -1285,26 +1562,32 @@ static void pps_edge_dispatch_trampoline(timepop_ctx_t*, timepop_diag_t*, void*)
 }
 
 void process_interrupt_gpio6789_irq(uint32_t isr_entry_dwt_raw) {
-  // Read the VCLOCK low-word counter right after _raw capture.  CH1 is no
-  // longer cascaded; the 32-bit VCLOCK identity below is synthetic and owned
-  // by process_interrupt.  If a synthetic zero was requested, consume it at
-  // THIS captured edge so the compact 32-bit identity and the 64-bit GNSS
-  // ledger agree by construction.
+  // PPS GPIO is a witness/selector only.  It captures the physical PPS facts
+  // and, during rebootstrap, selects the VCLOCK-domain edge identity.  It does
+  // NOT author the public PPS/VCLOCK DWT coordinate; that coordinate is later
+  // authored by the VCLOCK/QTimer1 CH3 path so all public DWT captures live in
+  // a single VCLOCK event-coordinate system.
   const uint16_t hardware_low16 = qtimer1_ch0_counter_now();
   const uint16_t ch3_now = hardware_low16;
+
+  const uint16_t selected_low16 =
+      (uint16_t)(hardware_low16 -
+                 (uint16_t)VCLOCK_EPOCH_OBSERVED_TICKS_AFTER_SELECTED);
 
   uint64_t zero_ns_consumed = 0;
   bool zero_consumed = false;
   if (g_vclock_clock32.pending_zero) {
     zero_ns_consumed = g_vclock_clock32.pending_zero_ns;
-    vclock_clock_zero_at_hardware_low16(zero_ns_consumed, hardware_low16);
+    vclock_clock_zero_at_hardware_low16(zero_ns_consumed, selected_low16);
     zero_consumed = true;
     g_vclock_epoch_gnss_ns = (int64_t)zero_ns_consumed;
   }
 
-  const uint32_t counter32 =
+  const uint32_t observed_counter32 =
       vclock_synthetic_from_hardware_low16(hardware_low16) +
       (uint32_t)VCLOCK_EPOCH_COUNTER32_OFFSET_TICKS;
+  const uint32_t selected_counter32 =
+      observed_counter32 - VCLOCK_EPOCH_OBSERVED_TICKS_AFTER_SELECTED;
 
   g_gpio_irq_count++;
   g_pps_gpio_heartbeat.edge_count++;
@@ -1314,56 +1597,48 @@ void process_interrupt_gpio6789_irq(uint32_t isr_entry_dwt_raw) {
                                 isr_entry_dwt_raw);
   }
 
-  // Author PPS facts (physical edge truth, synthetic counter identity).
   pps_t pps;
   pps.sequence          = g_pps_gpio_heartbeat.edge_count;
   pps.dwt_at_edge       = pps_dwt_from_isr_entry_raw(isr_entry_dwt_raw);
-  pps.counter32_at_edge = counter32;
+  pps.counter32_at_edge = observed_counter32;
   pps.ch3_at_edge       = ch3_now;
 
-  // Author PPS_VCLOCK facts (canonical VCLOCK-selected edge).
-  pps_vclock_t pvc;
-  pvc.sequence          = g_pps_gpio_heartbeat.edge_count;
-  pvc.dwt_at_edge       = pps_vclock_dwt_from_pps_isr_entry_raw(isr_entry_dwt_raw);
-  pvc.counter32_at_edge = counter32;
-  pvc.ch3_at_edge       = ch3_now;
+  g_last_pps_witness = pps;
+  g_last_pps_witness_valid = true;
 
-  // GNSS ns at the canonical edge, VCLOCK-authored.  A requested synthetic
-  // zero provides the exact ledger value for this edge; otherwise the epoch
-  // advances by exactly 1e9 per PPS edge.
-  const int64_t dwt_gnss_estimate_ns = time_dwt_to_gnss_ns(pvc.dwt_at_edge);
-  pvc.gnss_ns_at_edge = zero_consumed
-      ? (int64_t)zero_ns_consumed
-      : vclock_next_epoch_gnss_ns(dwt_gnss_estimate_ns);
-
-  g_pps_gpio_heartbeat.last_dwt     = pvc.dwt_at_edge;
-  g_pps_gpio_heartbeat.last_gnss_ns = pvc.gnss_ns_at_edge;
-
-  // Rebootstrap if armed by alpha.  Phase-locks the VCLOCK CH3 cadence to
-  // the canonical edge.  Runs in GPIO ISR priority (0) — preempts CH3.
+  // During rebootstrap, PPS selects the sacred VCLOCK edge identity and arms
+  // the CH3 cadence.  The first CH3 cadence event backdates one millisecond in
+  // the VCLOCK coordinate system and publishes the canonical epoch.
   if (g_pps_rebootstrap_pending) {
     g_pps_rebootstrap_pending = false;
     g_pps_rebootstrap_count++;
+
+    const int64_t selected_gnss_ns = zero_consumed
+        ? (int64_t)zero_ns_consumed
+        : vclock_next_epoch_gnss_ns(time_dwt_to_gnss_ns(pps.dwt_at_edge));
+
+    g_vclock_epoch_latch.pending = true;
+    g_vclock_epoch_latch.pps = pps;
+    g_vclock_epoch_latch.counter32_at_edge = selected_counter32;
+    g_vclock_epoch_latch.ch3_at_edge = selected_low16;
+    g_vclock_epoch_latch.gnss_ns_at_edge = selected_gnss_ns;
+    g_vclock_epoch_latch.observed_counter32 = observed_counter32;
+    g_vclock_epoch_latch.observed_ch3 = ch3_now;
+    g_vclock_epoch_latch.observed_ticks_after_selected =
+        VCLOCK_EPOCH_OBSERVED_TICKS_AFTER_SELECTED;
+    g_vclock_epoch_latch.first_cadence_counter32 = 0;
+    g_vclock_epoch_latch.first_cadence_dwt = 0;
+    g_vclock_epoch_latch.backdate_ticks = 0;
+    g_vclock_epoch_latch.backdate_cycles = 0;
+    g_vclock_epoch_latch.sacred_dwt = 0;
+
     g_vclock_lane.phase_bootstrapped = true;
     g_vclock_lane.tick_mod_1000 = 0;
     g_vclock_lane.compare_target =
-        (uint16_t)(ch3_now + (uint16_t)VCLOCK_INTERVAL_COUNTS);
-    g_vclock_lane.logical_count32_at_last_second = pvc.counter32_at_edge;
-    vclock_clock_anchor_hardware_low16(pvc.counter32_at_edge, ch3_now);
+        (uint16_t)(selected_low16 + (uint16_t)VCLOCK_INTERVAL_COUNTS);
+    g_vclock_lane.logical_count32_at_last_second = selected_counter32;
+    vclock_clock_anchor_hardware_low16(selected_counter32, selected_low16);
     qtimer1_ch3_program_compare(g_vclock_lane.compare_target);
-  }
-
-  if (g_pvc_anchor_reset_pending) {
-    pvc_anchor_ring_reset();
-  }
-
-  time_dynamic_cps_pps_vclock_edge(pvc.sequence, pvc.dwt_at_edge);
-
-  store_publish(pps, pvc);
-  pvc_anchor_publish(pvc);
-
-  if (g_pps_edge_dispatch) {
-    timepop_arm_asap(pps_edge_dispatch_trampoline, nullptr, "PPS_EDGE_DISPATCH");
   }
 }
 
@@ -1380,18 +1655,13 @@ void interrupt_pps_edge_register_dispatch(pps_edge_dispatch_fn fn) {
 // PPS / PPS_VCLOCK accessors
 // ============================================================================
 //
-// interrupt_last_pps()        — physical PPS GPIO edge facts.
 // interrupt_last_pps_vclock() — canonical PPS_VCLOCK epoch.
 // interrupt_last_pps_edge()   — legacy projection, for back-compat with
 //                               consumers that still take pps_edge_snapshot_t.
 //                               Field map documented inline below.
-
-pps_t interrupt_last_pps(void) {
-  pps_t pps;
-  pps_vclock_t pvc;
-  store_load(pps, pvc);
-  return pps;
-}
+//
+// There is intentionally no public interrupt_last_pps() accessor.  Physical
+// PPS GPIO DWT is a private witness/audit fact, not a timing primitive.
 
 pps_vclock_t interrupt_last_pps_vclock(void) {
   return store_load_pvc();
@@ -1500,6 +1770,7 @@ bool interrupt_stop(interrupt_subscriber_kind_t kind) {
 
 void interrupt_request_pps_rebootstrap(void) {
   g_pps_rebootstrap_pending = true;
+  g_vclock_epoch_latch = vclock_epoch_latch_t{};
   g_vclock_epoch_gnss_ns = -1;
   g_pvc_anchor_reset_pending = true;
   time_dynamic_cps_reset();
@@ -1655,6 +1926,10 @@ void process_interrupt_init(void) {
   g_pps_gpio_heartbeat = pps_gpio_heartbeat_t{};
   g_gpio_irq_count = 0;
   g_gpio_miss_count = 0;
+  g_last_pps_witness = pps_t{};
+  g_last_pps_witness_valid = false;
+  g_vclock_epoch_latch = vclock_epoch_latch_t{};
+  g_vclock_repair_stats = vclock_repair_stats_t{};
   g_vclock_epoch_gnss_ns = -1;
   g_pps_rebootstrap_pending = false;
   g_pps_rebootstrap_count = 0;
@@ -1742,6 +2017,39 @@ static Payload cmd_report(const Payload&) {
   p.add("subscriber_count", g_subscriber_count);
   p.add("pps_rebootstrap_pending", g_pps_rebootstrap_pending);
   p.add("pps_rebootstrap_count",   g_pps_rebootstrap_count);
+  p.add("vclock_epoch_latch_pending", g_vclock_epoch_latch.pending);
+  p.add("vclock_epoch_latch_counter32", g_vclock_epoch_latch.counter32_at_edge);
+  p.add("vclock_epoch_latch_gnss_ns", g_vclock_epoch_latch.gnss_ns_at_edge);
+  p.add("vclock_epoch_latch_observed_counter32", g_vclock_epoch_latch.observed_counter32);
+  p.add("vclock_epoch_latch_observed_ch3", (uint32_t)g_vclock_epoch_latch.observed_ch3);
+  p.add("vclock_epoch_latch_observed_ticks_after_selected", g_vclock_epoch_latch.observed_ticks_after_selected);
+  p.add("vclock_epoch_latch_first_cadence_counter32", g_vclock_epoch_latch.first_cadence_counter32);
+  p.add("vclock_epoch_latch_first_cadence_dwt", g_vclock_epoch_latch.first_cadence_dwt);
+  p.add("vclock_epoch_latch_backdate_ticks", g_vclock_epoch_latch.backdate_ticks);
+  p.add("vclock_epoch_latch_backdate_cycles", g_vclock_epoch_latch.backdate_cycles);
+  p.add("vclock_epoch_latch_sacred_dwt", g_vclock_epoch_latch.sacred_dwt);
+  p.add("vclock_dwt_repair_enabled", false);
+  p.add("vclock_dwt_repair_threshold_cycles", VCLOCK_DWT_REPAIR_THRESHOLD_CYCLES);
+  p.add("vclock_dwt_repair_min_history_count", VCLOCK_DWT_REPAIR_MIN_HISTORY_COUNT);
+  p.add("vclock_dwt_repair_max_prediction_residual_cycles", VCLOCK_DWT_REPAIR_MAX_PREDICTION_RESIDUAL_CYCLES);
+  p.add("vclock_dwt_repair_candidate_count", g_vclock_repair_stats.candidate_count);
+  p.add("vclock_dwt_repair_applied_count", g_vclock_repair_stats.applied_count);
+  p.add("vclock_dwt_repair_consecutive_candidate_count", g_vclock_repair_stats.consecutive_candidate_count);
+  p.add("vclock_dwt_repair_last_candidate", g_vclock_repair_stats.last_candidate);
+  p.add("vclock_dwt_repair_last_synthetic", g_vclock_repair_stats.last_synthetic);
+  p.add("vclock_dwt_repair_last_original_dwt", g_vclock_repair_stats.last_original_dwt);
+  p.add("vclock_dwt_repair_last_predicted_dwt", g_vclock_repair_stats.last_predicted_dwt);
+  p.add("vclock_dwt_repair_last_used_dwt", g_vclock_repair_stats.last_used_dwt);
+  p.add("vclock_dwt_repair_last_error_cycles", g_vclock_repair_stats.last_error_cycles);
+  p.add("vclock_dwt_repair_max_abs_error_cycles", g_vclock_repair_stats.max_abs_error_cycles);
+  p.add("pps_vclock_phase_expected_cycles", (int32_t)CANONICAL_VCLOCK_EPOCH_MINUS_RAW_PPS_ISR_CYCLES);
+  p.add("pps_vclock_phase_tolerance_cycles", PPS_VCLOCK_PHASE_TOLERANCE_CYCLES);
+  p.add("pps_vclock_phase_watchdog_enabled", PPS_VCLOCK_PHASE_WATCHDOG_ENABLED);
+  p.add("pps_vclock_phase_check_count", g_vclock_repair_stats.phase_check_count);
+  p.add("pps_vclock_phase_fault_count", g_vclock_repair_stats.phase_fault_count);
+  p.add("pps_vclock_phase_unpaired_count", g_vclock_repair_stats.phase_unpaired_count);
+  p.add("pps_vclock_phase_last_cycles", g_vclock_repair_stats.last_phase_cycles);
+  p.add("pps_vclock_phase_last_error_cycles", g_vclock_repair_stats.last_phase_error_cycles);
   p.add("gpio_irq_count", g_gpio_irq_count);
   p.add("gpio_miss_count", g_gpio_miss_count);
   p.add("gpio_edge_count", g_pps_gpio_heartbeat.edge_count);

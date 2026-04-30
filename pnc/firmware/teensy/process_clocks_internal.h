@@ -12,9 +12,9 @@
 // Epoch authority:
 //
 //   PPS is a witness and selector.  process_interrupt observes the physical
-//   PPS edge, selects/authors the corresponding PPS/VCLOCK edge, and publishes
-//   a snapshot whose synthetic counter32 identity already matches the 64-bit
-//   nanosecond ledger.
+//   PPS edge, selects the corresponding VCLOCK edge identity, and publishes
+//   a PPS/VCLOCK snapshot whose DWT coordinate is authored by the VCLOCK/QTimer
+//   event path.  This keeps public DWT facts in one VCLOCK coordinate species.
 //
 //   Alpha installs that selected PPS/VCLOCK snapshot directly:
 //     g_gnss_ns_at_pps_vclock = 0
@@ -107,15 +107,15 @@ static inline uint64_t dwt_ns_to_cycles(uint64_t ns) {
 // Always-on DWT-GNSS anchor state (alpha-owned, beta-readable)
 //
 // All five of these globals are authored by alpha::pps_selector_callback
-// from priority-0 GPIO ISR captures (post-refactor).  They are
-// preemption-proof: the captures are taken at the FIRST INSTRUCTION
-// of the GPIO ISR, and foreground reads of snap data later are
-// transparent to that capture.
+// from process_interrupt's canonical PPS/VCLOCK snapshots.  PPS selects and
+// audits the relationship; the public DWT coordinate itself is authored by
+// the VCLOCK/QTimer event path so the bridge, 1 kHz cadence samples, and
+// one-second bookends share one coordinate species.
 // ============================================================================
 
-// Synthetic GNSS ns counter: 0 at epoch install, +1e9 per VCLOCK
-// one-second event.  Represents "GNSS ns at the PPS moment this
-// second corresponds to."  No physical capture — pure arithmetic.
+// Synthetic GNSS ns counter: 0 at epoch install, then set from the canonical
+// PPS/VCLOCK snapshot authored by process_interrupt.  No physical capture —
+// pure VCLOCK-authored arithmetic.
 extern volatile uint64_t g_gnss_ns_at_pps_vclock;
 
 // Canonical DWT_CYCCNT coordinate of the most recent selected PPS/VCLOCK epoch

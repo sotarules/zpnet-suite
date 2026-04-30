@@ -71,8 +71,8 @@
 //
 //     1. DIAGNOSTIC SNAPSHOT.  Every edge populates a seqlock-protected
 //        store with PPS facts and PPS_VCLOCK facts.  Consumers read
-//        via interrupt_last_pps(), interrupt_last_pps_vclock(), or
-//        the legacy interrupt_last_pps_edge().
+//        via interrupt_last_pps_vclock() or the legacy
+//        interrupt_last_pps_edge().
 //
 //     2. DISPATCH AUTHORITY FOR TIMEBASE_FRAGMENT.  On every edge, the
 //        GPIO ISR arms timepop_arm_asap to invoke a single registered
@@ -220,6 +220,19 @@ struct interrupt_capture_diag_t {
   uint64_t gnss_ns_at_event   = 0;
   uint32_t counter32_at_event = 0;
 
+  // DWT admissibility / repair audit.  dwt_at_event remains the authoritative
+  // coordinate.  While repair is diagnostic-only, dwt_synthetic is false and
+  // dwt_repair_candidate indicates that the observed endpoint would have been
+  // replaced if operational repair were enabled.
+  bool     dwt_synthetic = false;
+  bool     dwt_repair_candidate = false;
+  uint32_t dwt_original_at_event = 0;
+  uint32_t dwt_predicted_at_event = 0;
+  uint32_t dwt_used_at_event = 0;
+  int32_t  dwt_synthetic_error_cycles = 0;
+  uint32_t dwt_synthetic_threshold_cycles = 0;
+  const char* dwt_synthetic_reason = nullptr;
+
   // DWT→PPS_VCLOCK anchor-selection diagnostics.
   // Populated for OCXO and TIMEPOP events whose GNSS coordinate is derived
   // by projecting an event DWT coordinate onto the PPS_VCLOCK timeline.
@@ -362,8 +375,7 @@ struct pps_vclock_t {
 //   vclock_epoch_*  — audit metadata (constants describing the offsets
 //                     used when deriving PPS_VCLOCK from PPS).
 //
-// New code should consume pps_t / pps_vclock_t via interrupt_last_pps()
-// and interrupt_last_pps_vclock().  The misleadingly-named "_raw" fields
+// New code should consume pps_vclock_t via interrupt_last_pps_vclock().  The misleadingly-named "_raw" fields
 // here will be renamed when alpha migrates.
 
 struct pps_edge_snapshot_t {
@@ -480,13 +492,11 @@ void interrupt_pps_edge_register_dispatch(pps_edge_dispatch_fn fn);
 // PPS / PPS_VCLOCK accessors
 // ============================================================================
 //
-// Seqlock-safe snapshots of the most recent physical PPS edge.  Either
-// accessor returns a consistent view of its own subscription's facts;
-// because both are populated from the same GPIO ISR with the same
-// sequence number, two reads (one of each) on the same sequence describe
-// the same edge.
+// Seqlock-safe snapshot of the most recent canonical PPS/VCLOCK edge.
+// Physical PPS GPIO DWT is deliberately not exposed as a timing accessor;
+// it remains a witness/audit fact inside process_interrupt and the legacy
+// diagnostic snapshot only.
 
-pps_t        interrupt_last_pps       (void);
 pps_vclock_t interrupt_last_pps_vclock(void);
 
 // Legacy accessor — populates pps_edge_snapshot_t from the same internal

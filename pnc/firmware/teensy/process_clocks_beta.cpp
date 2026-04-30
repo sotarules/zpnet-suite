@@ -376,11 +376,23 @@ static void clocks_payload_add_ocxo_diag(Payload& p,
     snprintf(key, sizeof(key), "%s_%s", prefix, suffix);
     p.add(key, value);
   };
+  auto add_str = [&](const char* suffix, const char* value) {
+    snprintf(key, sizeof(key), "%s_%s", prefix, suffix);
+    p.add(key, value ? value : "");
+  };
 
   add_bool("enabled", diag.enabled);
   add_u32("dwt_at_event", diag.dwt_at_event);
   add_u64("gnss_ns_at_event", diag.gnss_ns_at_event);
   add_u32("counter32_at_event", diag.counter32_at_event);
+  add_bool("dwt_synthetic", diag.dwt_synthetic);
+  add_bool("dwt_repair_candidate", diag.dwt_repair_candidate);
+  add_u32("dwt_original_at_event", diag.dwt_original_at_event);
+  add_u32("dwt_predicted_at_event", diag.dwt_predicted_at_event);
+  add_u32("dwt_used_at_event", diag.dwt_used_at_event);
+  add_i64("dwt_synthetic_error_cycles", diag.dwt_synthetic_error_cycles);
+  add_u32("dwt_synthetic_threshold_cycles", diag.dwt_synthetic_threshold_cycles);
+  add_str("dwt_synthetic_reason", diag.dwt_synthetic_reason);
   add_u32("anchor_sequence_used", diag.anchor_sequence_used);
   add_u32("anchor_age_slots", diag.anchor_age_slots);
   add_u32("anchor_selection_kind", diag.anchor_selection_kind);
@@ -975,18 +987,12 @@ void clocks_beta_pps(void) {
         (int32_t)((int64_t)g_dwt_cycles_between_pps_vclock -
                   (int64_t)DWT_EXPECTED_PER_PPS));
 
-  // DWT next-second prediction surface owned by process_time.
-  // Prediction is advisory only: PPS/VCLOCK measurements remain canonical.
-  {
-    const time_dwt_prediction_snapshot_t pred = time_dwt_prediction_snapshot();
-    p.add("dwt_prediction_valid", pred.valid);
-    p.add("dwt_prediction_pps_vclock_count", pred.pps_vclock_count);
-    p.add("dwt_actual_cycles_last_second", pred.actual_cycles_last);
-    p.add("dwt_predicted_cycles_last_second", pred.predicted_cycles_last);
-    p.add("dwt_prediction_residual_cycles", pred.residual_cycles_last);
-    p.add("dwt_next_prediction_cycles", pred.predicted_cycles_next);
-    p.add("dwt_prediction_history_count", pred.history_count);
-  }
+  const time_dwt_prediction_snapshot_t pred = time_dwt_prediction_snapshot();
+
+  p.add("vclock_dwt_repair_prediction_valid", pred.valid);
+  p.add("vclock_dwt_repair_prediction_history_count", pred.history_count);
+  p.add("vclock_dwt_repair_last_prediction_residual_cycles",
+        pred.residual_cycles_last);
 
   // Synthetic 32-bit VCLOCK identity of the canonical PPS/VCLOCK epoch.
   // Under the VCLOCK-domain architecture this is the compact event identity
