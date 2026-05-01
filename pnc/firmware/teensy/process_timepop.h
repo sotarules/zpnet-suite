@@ -31,18 +31,19 @@
 //   Each handler receives a normalized DWT-at-edge capture for its own
 //   QTimer event.
 //
-//   For timed TimePop clients, all slots expired by one physical CH2 event
+//   For timed TimePop clients, all slots reached by one physical CH2 event
 //   receive the same fire_vclock_raw, fire_dwt_cyccnt, and fire_gnss_ns.
-//   Callback order is logical only.  ASAP/ALAP are intentionally excluded
-//   from this guarantee because they are deferred scheduled-context queues,
-//   not timed CH2 clients.
+//   Equality with the compare target is the normal fire condition.  Callback
+//   order is logical only.  ASAP/ALAP are intentionally excluded from this
+//   guarantee because they are deferred scheduled-context queues, not timed
+//   CH2 clients.
 //
-//   For CH2, the dispatcher additionally authors synthetic
-//   counter32_at_event and gnss_ns_at_event and packages everything into a standard
-//   interrupt_event_t (kind = TIMEPOP) and interrupt_capture_diag_t,
-//   which it passes to TimePop's handler.  TimePop reads the event
-//   payload directly and proceeds with slot dispatch — no need to
-//   re-read the counter or recompute gnss_ns.
+//   For CH2, the dispatcher authors the synthetic counter32_at_event and a
+//   latency-normalized DWT event coordinate, then packages them into a standard
+//   interrupt_event_t (kind = TIMEPOP) and interrupt_capture_diag_t.  TimePop
+//   treats counter32_at_event as the authoritative VCLOCK identity and authors
+//   fire_gnss_ns from VCLOCK arithmetic.  DWT-derived GNSS values remain
+//   diagnostic/cross-check material, not event identity.
 //
 //   The PPS epoch consumed through time_anchor_snapshot() is already
 //   process_interrupt's canonical VCLOCK-selected epoch.  TimePop does
@@ -60,6 +61,11 @@
 //     • clearing the CH2 TCF1 flag in the QTimer1 ISR before
 //       invoking TimePop's handler
 //     • building the event/diag payloads passed to TimePop
+//
+//   TimePop does not defensively second-guess exact compare fires.  If the
+//   foreground scheduler ever has to discover an already-past timed slot,
+//   that condition is surfaced through report counters rather than hidden as
+//   a normal precision event.
 //
 // ============================================================================
 

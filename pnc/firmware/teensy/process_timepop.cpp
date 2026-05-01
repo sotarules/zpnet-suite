@@ -51,9 +51,16 @@
 //   It does not reinterpret PPS/VCLOCK phase and it does not read timer
 //   hardware directly.
 //
-//   All timed slots expired by the same physical CH2 event receive the same
-//   fire_vclock_raw, fire_dwt_cyccnt, and fire_gnss_ns.  Callback order is
-//   logical only; it must never re-author the physical timing facts.
+//   All timed slots reached by the same physical CH2 event receive the same
+//   fire_vclock_raw, fire_dwt_cyccnt, and fire_gnss_ns.  Equality with the
+//   compare target is the normal fire condition, not a suspicious edge case.
+//   Callback order is logical only; it must never re-author the physical
+//   timing facts.
+//
+//   TimePop authors fire_gnss_ns from VCLOCK arithmetic using the event's
+//   process_interrupt-authored counter32 identity.  Any DWT-derived GNSS
+//   coordinate in the interrupt payload is diagnostic/cross-check material
+//   and is never allowed to redefine the scheduled event's GNSS identity.
 //
 // ============================================================================
 
@@ -82,7 +89,7 @@
 // Forward declarations
 // ============================================================================
 
-static inline bool deadline_expired(uint32_t deadline, uint32_t now);
+static inline bool deadline_reached(uint32_t deadline, uint32_t now);
 static bool gnss_ns_to_vclock_deadline(int64_t target_gnss_ns,
                                        const time_anchor_snapshot_t& snap,
                                        uint32_t& out_deadline);
@@ -234,6 +241,20 @@ static volatile uint32_t diag_schedule_next_calls_total = 0;
 static volatile uint32_t diag_schedule_next_calls_from_dispatch = 0;
 static volatile uint32_t diag_schedule_next_calls_from_other = 0;
 
+// Normal precision fires should be authored by IRQ_CH2.  If schedule_next()
+// discovers an already-past timed slot, TimePop still records and surfaces
+// the fact instead of silently pretending it was a clean hardware fire.
+static volatile uint32_t diag_schedule_next_expired_passes = 0;
+static volatile uint32_t diag_schedule_next_expired_slots = 0;
+static volatile uint32_t diag_schedule_next_late_max_ticks = 0;
+
+static volatile uint32_t diag_irq_expired_slots = 0;
+static volatile uint32_t diag_irq_exact_deadline_slots = 0;
+static volatile uint32_t diag_irq_late_deadline_slots = 0;
+static volatile uint32_t diag_irq_late_max_ticks = 0;
+static volatile uint32_t diag_irq_event_gnss_mismatch_count = 0;
+static volatile int64_t  diag_irq_event_gnss_last_delta_ns = 0;
+
 static volatile uint32_t diag_deadline_negative_offset = 0;
 static volatile int64_t  diag_deadline_last_target_gnss_ns = -1;
 static volatile int64_t  diag_deadline_last_anchor_pps_gnss_ns = -1;
@@ -351,8 +372,20 @@ static inline uint32_t vclock_count(void) {
   return interrupt_vclock_counter32_observe_ambient();
 }
 
-static inline bool deadline_expired(uint32_t deadline, uint32_t now) {
+static inline bool deadline_reached(uint32_t deadline, uint32_t now) {
+  return deadline == now || (deadline - now) > MAX_DELAY_TICKS;
+}
+
+static inline bool deadline_passed(uint32_t deadline, uint32_t now) {
   return (deadline - now) > MAX_DELAY_TICKS;
+}
+
+static inline uint32_t deadline_lateness_ticks(uint32_t deadline, uint32_t now) {
+  return (deadline == now) ? 0U : (now - deadline);
+}
+
+static inline void update_max_u32(volatile uint32_t& target, uint32_t value) {
+  if (value > target) target = value;
 }
 
 static inline uint32_t ns_to_ticks(uint64_t ns) {
@@ -504,9 +537,11 @@ static inline void ch2_arm_compare(uint32_t target_counter32) {
 // ============================================================================
 //
 // This is the ONE place in TimePop that legitimately reads the ambient
-// VCLOCK counter.  It must compare deadlines against the current counter
-// to determine which slots have expired and how far away the nearest
-// deadline is.  This is the heartbeat polling loop.
+// VCLOCK counter.  It determines how far away the nearest deadline is and
+// arms CH2 accordingly.  It does not claim exact equality; equality belongs
+// to the CH2 IRQ event.  If this foreground path ever finds an already-past
+// deadline, it authors a visible SCHEDULE_NEXT catch-up fact and increments
+// report counters.
 
 static void schedule_next(void) {
   diag_schedule_next_calls_total++;
@@ -515,6 +550,7 @@ static void schedule_next(void) {
   const time_anchor_snapshot_t snap = time_anchor_snapshot();
   uint32_t shared_fire_dwt = 0;
   bool shared_fire_captured = false;
+  bool schedule_next_expired_this_pass = false;
 
   uint32_t soonest = 0;
   bool found = false;
@@ -522,15 +558,23 @@ static void schedule_next(void) {
   for (uint32_t i = 0; i < MAX_SLOTS; i++) {
     if (!slots[i].active || slots[i].expired) continue;
 
-    if (deadline_expired(slots[i].deadline, now)) {
+    if (deadline_passed(slots[i].deadline, now)) {
+      if (!schedule_next_expired_this_pass) {
+        diag_schedule_next_expired_passes++;
+        schedule_next_expired_this_pass = true;
+      }
+      diag_schedule_next_expired_slots++;
+      update_max_u32(diag_schedule_next_late_max_ticks,
+                     deadline_lateness_ticks(slots[i].deadline, now));
+
       if (!slots[i].first_expire_recorded) {
         slots[i].first_expire_now = now;
         slots[i].first_expire_recorded = true;
       }
 
-      // SCHEDULE_NEXT is a fallback/foreground discovery path, not the ideal
-      // IRQ_CH2 compare path.  Even here, every slot expired by this one
-      // scheduling pass receives the same captured timing facts.
+      // SCHEDULE_NEXT is not a precision timing source.  It is an anomaly /
+      // catch-up surface: if it ever authors a timed fire, the report counters
+      // above make that fact visible.
       if (!shared_fire_captured) {
         shared_fire_dwt = ARM_DWT_CYCCNT;
         shared_fire_captured = true;
@@ -550,13 +594,12 @@ static void schedule_next(void) {
     }
   }
 
-
   uint32_t target;
   if (!found) {
     target = now + HEARTBEAT_TICKS;
     diag_heartbeat_rearms++;
   } else {
-    uint32_t distance = soonest - now;
+    const uint32_t distance = soonest - now;
     if (distance > HEARTBEAT_TICKS) {
       target = now + HEARTBEAT_TICKS;
       diag_heartbeat_rearms++;
@@ -567,11 +610,6 @@ static void schedule_next(void) {
 
   ch2_arm_compare(target);
   diag_rearm_count++;
-
-  const uint16_t cntr = interrupt_qtimer1_ch2_counter_now();
-  const uint16_t comp = (uint16_t)(target & 0xFFFF);
-  const uint16_t distance_16 = comp - cntr;
-  (void)distance_16;
 }
 
 // ============================================================================
@@ -647,10 +685,11 @@ static inline void slot_build_diag(
 //
 // IRQ-context handler called by process_interrupt's qtimer1_isr
 // dispatcher on every CH2 compare-match.  Receives the standard
-// event/diag payload — DWT, gnss_ns, counter32 — already filled in by
-// the dispatcher.  No need to re-read the counter or recompute gnss_ns
-// here.  The CH2 TCF1 flag is cleared by the dispatcher before this
-// runs, so we don't clear it ourselves.
+// event/diag payload — DWT and counter32 already filled in by the dispatcher.
+// TimePop authors fire_gnss_ns from that counter32 identity using VCLOCK
+// arithmetic; any GNSS value in the interrupt payload is diagnostic.  The
+// CH2 TCF1 flag is cleared by the dispatcher before this runs, so we don't
+// clear it ourselves.
 //
 void timepop_qtimer1_ch2_handler(const interrupt_event_t& event,
                                  const interrupt_capture_diag_t& /*diag*/) {
@@ -664,17 +703,35 @@ void timepop_qtimer1_ch2_handler(const interrupt_event_t& event,
 
   bool any_expired = false;
 
-  // Phase 1: author the shared fire facts for every slot expired by this
+  // Phase 1: author the shared fire facts for every slot reached by this
   // physical CH2 compare event before any user callback is allowed to run.
   // This guarantees simultaneous clients receive the same DWT/VCLOCK/GNSS
   // context; callback serialization is logical only.
-  const int64_t event_fire_gnss_ns = event.gnss_ns_at_event != 0
-      ? (int64_t)event.gnss_ns_at_event
-      : vclock_to_gnss_ns(now, anchor);
+  //
+  // TimePop trusts the VCLOCK compare identity.  GNSS is therefore authored
+  // from VCLOCK arithmetic here, even if process_interrupt also supplied a
+  // DWT-bridge GNSS diagnostic in the event payload.
+  const int64_t event_fire_gnss_ns = vclock_to_gnss_ns(now, anchor);
+  if (event.gnss_ns_at_event != 0 && event_fire_gnss_ns >= 0) {
+    const int64_t delta = (int64_t)event.gnss_ns_at_event - event_fire_gnss_ns;
+    if (delta != 0) {
+      diag_irq_event_gnss_mismatch_count++;
+      diag_irq_event_gnss_last_delta_ns = delta;
+    }
+  }
 
   for (uint32_t i = 0; i < MAX_SLOTS; i++) {
     if (!slots[i].active || slots[i].expired) continue;
-    if (!deadline_expired(slots[i].deadline, now)) continue;
+    if (!deadline_reached(slots[i].deadline, now)) continue;
+
+    const uint32_t late_ticks = deadline_lateness_ticks(slots[i].deadline, now);
+    if (late_ticks == 0) {
+      diag_irq_exact_deadline_slots++;
+    } else {
+      diag_irq_late_deadline_slots++;
+      update_max_u32(diag_irq_late_max_ticks, late_ticks);
+    }
+    diag_irq_expired_slots++;
 
     slot_capture(slots[i],
                  now,
@@ -1289,9 +1346,11 @@ void timepop_dispatch(void) {
           slots[i].deadline += slots[i].period_ticks;
           slots[i].recurring_rearmed_count++;
 
-          // Catch-up: if we fell behind, skip forward.
+          // Catch-up: if we fell behind, skip forward.  Equality belongs to the
+          // hardware compare path; foreground catch-up only handles already-
+          // past deadlines.
           uint32_t now = vclock_count();
-          if (deadline_expired(slots[i].deadline, now)) {
+          if (deadline_passed(slots[i].deadline, now)) {
             slots[i].recurring_immediate_expire_count++;
             slots[i].deadline = now + slots[i].period_ticks;
             slots[i].recurring_catchup_count++;
@@ -1401,6 +1460,16 @@ static Payload cmd_report(const Payload&) {
   out.add("schedule_next_calls_total",         diag_schedule_next_calls_total);
   out.add("schedule_next_calls_from_dispatch", diag_schedule_next_calls_from_dispatch);
   out.add("schedule_next_calls_from_other",    diag_schedule_next_calls_from_other);
+  out.add("schedule_next_expired_passes",      diag_schedule_next_expired_passes);
+  out.add("schedule_next_expired_slots",       diag_schedule_next_expired_slots);
+  out.add("schedule_next_late_max_ticks",      diag_schedule_next_late_max_ticks);
+
+  out.add("irq_expired_slots",                 diag_irq_expired_slots);
+  out.add("irq_exact_deadline_slots",          diag_irq_exact_deadline_slots);
+  out.add("irq_late_deadline_slots",           diag_irq_late_deadline_slots);
+  out.add("irq_late_max_ticks",                diag_irq_late_max_ticks);
+  out.add("irq_event_gnss_mismatch_count",     diag_irq_event_gnss_mismatch_count);
+  out.add("irq_event_gnss_last_delta_ns",      diag_irq_event_gnss_last_delta_ns);
 
   out.add("deadline_negative_offset",          diag_deadline_negative_offset);
   out.add("deadline_last_target_gnss_ns",      diag_deadline_last_target_gnss_ns);
