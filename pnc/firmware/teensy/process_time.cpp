@@ -162,8 +162,8 @@ static void prediction_observe_actual(uint32_t pps_vclock_count,
 // Dynamic CPS fixed-anchor witness state
 // ============================================================================
 //
-// Dynamic CPS is currently witness-only.  It does not drive operational
-// DWT<->GNSS projection.  The model is a fixed-anchor 1 kHz servo:
+// Dynamic CPS now drives operational DWT<->GNSS projection for the current
+// PPS/VCLOCK anchor.  The model is a fixed-anchor 1 kHz servo:
 //
 //   t = 0 ms      -> PPS/VCLOCK anchor DWT (implicit, never sampled from CH3)
 //   t = 1..999 ms -> VCLOCK 1 kHz cadence observations
@@ -871,16 +871,31 @@ static time_snapshot_t read_anchor(void) {
 
 static uint32_t effective_cycles_for_anchor(uint32_t anchor_dwt_at_pps_vclock,
                                             uint32_t raw_cycles) {
-  // Dynamic CPS is currently witness-only. It is measured, reported, and
-  // evaluated against the next PPS/VCLOCK bookend, but it is deliberately
-  // NOT used as the authority for DWT<->GNSS projection.
+  // Operational projection policy:
   //
-  // The static bookend count is the operational interpolation rate until the
-  // dynamic model proves that it reliably improves projection error.
-  (void)anchor_dwt_at_pps_vclock;
+  //   * If the requested anchor is the current dynamic CPS anchor, use the
+  //     live gated-servo CPS estimate.  This is the best available DWT
+  //     cycles-per-GNSS-second denominator for current-second interpolation.
+  //
+  //   * If the request is for an older/external anchor, fall back to the
+  //     explicit bookend CPS supplied with that anchor.  This keeps historical
+  //     and caller-owned projections reconstructive and avoids applying the
+  //     current servo state to the wrong second.
+  //
+  //   * If the dynamic state has not yet been initialized, fall back to the
+  //     static bookend CPS.  During ordinary operation current_cycles is seeded
+  //     from base_cycles at every PPS/VCLOCK edge and then refined by the
+  //     1 kHz gated servo.
+  if (raw_cycles == 0) return 0;
+
+  const time_dynamic_cps_snapshot_t dyn = time_dynamic_cps_snapshot();
+  if (dyn.current_cycles != 0 &&
+      dyn.current_pvc_dwt_at_edge == anchor_dwt_at_pps_vclock) {
+    return dyn.current_cycles;
+  }
+
   return raw_cycles;
 }
-
 static inline uint32_t effective_cycles_per_snapshot(const time_snapshot_t& s) {
   return effective_cycles_for_anchor(s.dwt_at_pps_vclock,
                                      s.dwt_cycles_per_pps_vclock_s);
@@ -1097,8 +1112,8 @@ time_dynamic_cps_snapshot_t time_dynamic_cps_snapshot(void) {
     dmb();
 
     out.valid = dynamic_cps.valid;
-    out.witness_only = true;
-    out.projection_enabled = false;
+    out.witness_only = false;
+    out.projection_enabled = true;
     out.pvc_sequence = dynamic_cps.pvc_sequence;
     out.current_pvc_dwt_at_edge = dynamic_cps.current_pvc_dwt_at_edge;
     out.pvc_dwt_at_edge = dynamic_cps.current_pvc_dwt_at_edge;
