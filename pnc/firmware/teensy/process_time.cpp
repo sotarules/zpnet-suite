@@ -21,6 +21,7 @@
 #include "config.h"
 #include "process.h"
 #include "payload.h"
+#include "timepop.h"
 
 #include <Arduino.h>
 #include "imxrt.h"
@@ -37,6 +38,8 @@ static constexpr uint32_t HISTORY_DEFAULT_LIMIT = 16;
 
 static constexpr uint32_t DYNAMIC_CPS_MIN_REFINE_MS = 1;
 static constexpr uint32_t DYNAMIC_CPS_MAX_REFINE_MS = 999;
+static constexpr uint64_t DYNAMIC_CPS_TIMEPOP_PERIOD_NS = NS_PER_MILLISECOND;
+static constexpr const char* DYNAMIC_CPS_TIMEPOP_NAME = "TIME_DYNAMIC_CPS";
 static constexpr uint32_t DYNAMIC_CPS_OUTLIER_THRESHOLD_CYCLES = 5;
 // Servo gate: observations whose dynamic residual exceeds this threshold are
 // treated as impossible ISR-late/capture outliers. They are reported, but the
@@ -163,16 +166,17 @@ static void prediction_observe_actual(uint32_t pps_vclock_count,
 // ============================================================================
 //
 // Dynamic CPS now drives operational DWT<->GNSS projection for the current
-// PPS/VCLOCK anchor.  The model is a fixed-anchor 1 kHz servo:
+// PPS/VCLOCK anchor.  The model is a fixed-anchor TimePop client servo:
 //
-//   t = 0 ms      -> PPS/VCLOCK anchor DWT (implicit, never sampled from CH3)
-//   t = 1..999 ms -> VCLOCK 1 kHz cadence observations
+//   t = 0       -> PPS/VCLOCK anchor DWT
+//   t = event   -> TimePop-authored fire_vclock_raw + fire_dwt_cyccnt
 //
-// Each cadence observation compares the actual DWT elapsed cycles against the
-// elapsed cycles predicted by the current one-second CPS estimate.  The full
-// observed error is added directly to the current CPS estimate.  This is a
-// servo, not a line fit: it nudges the next-second prediction to match actual
-// cadence observations without recomputing a whole-second slope from scratch.
+// Each TimePop observation compares the actual DWT elapsed cycles against the
+// elapsed cycles predicted by the current one-second CPS estimate at that
+// exact VCLOCK counter position.  The full observed error is added directly
+// to the current CPS estimate when the sample passes the servo gate.  This is
+// a servo, not a line fit, and it no longer depends on a private QTimer CH3
+// cadence rail.
 
 static inline uint32_t u32_abs_i32(int32_t v) {
   return (v < 0) ? (uint32_t)(-(int64_t)v) : (uint32_t)v;
@@ -181,6 +185,13 @@ static inline uint32_t u32_abs_i32(int32_t v) {
 static inline uint32_t line_cycles_at_ms(uint32_t cycles_per_second,
                                          uint32_t ms) {
   return (uint32_t)(((uint64_t)cycles_per_second * (uint64_t)ms + 500ULL) / 1000ULL);
+}
+
+static inline uint32_t line_cycles_at_ticks(uint32_t cycles_per_second,
+                                            uint32_t vclock_ticks) {
+  return (uint32_t)(((uint64_t)cycles_per_second * (uint64_t)vclock_ticks +
+                     (uint64_t)VCLOCK_COUNTS_PER_SECOND / 2ULL) /
+                    (uint64_t)VCLOCK_COUNTS_PER_SECOND);
 }
 
 static inline uint32_t line_slope_from_sums(uint64_t sum_t2_ms2,
@@ -308,6 +319,16 @@ struct dynamic_cps_state_t {
   uint32_t last_completed_dynamic_prediction_valid_count = 0;
   int32_t  last_completed_dynamic_prediction_adjust_cycles = 0;
 
+  bool     timepop_client_armed = false;
+  uint32_t timepop_arm_count = 0;
+  uint32_t timepop_arm_failures = 0;
+  uint32_t timepop_callback_count = 0;
+  uint32_t timepop_last_handle = 0;
+  uint32_t timepop_last_deadline = 0;
+  uint32_t timepop_last_fire_vclock_raw = 0;
+  uint32_t timepop_last_fire_dwt = 0;
+  int64_t  timepop_last_fire_gnss_ns = -1;
+
   fixed_anchor_line_fit_t fit;
 
   uint32_t last_sample_ms = 0;
@@ -364,6 +385,11 @@ struct dynamic_cps_state_t {
 };
 
 static dynamic_cps_state_t dynamic_cps = {};
+
+static bool dynamic_cps_ensure_timepop_client(void);
+static void dynamic_cps_timepop_callback(timepop_ctx_t* ctx,
+                                         timepop_diag_t* diag,
+                                         void* user_data);
 
 static void dynamic_cps_note_effectiveness_locked(const time_dynamic_cps_record_t& rec) {
   if (!rec.eval_valid) return;
@@ -518,6 +544,15 @@ void time_dynamic_cps_reset(void) {
   dynamic_cps.last_completed_dynamic_prediction_invalid_count = 0;
   dynamic_cps.last_completed_dynamic_prediction_valid_count = 0;
   dynamic_cps.last_completed_dynamic_prediction_adjust_cycles = 0;
+  dynamic_cps.timepop_client_armed = false;
+  dynamic_cps.timepop_arm_count = 0;
+  dynamic_cps.timepop_arm_failures = 0;
+  dynamic_cps.timepop_callback_count = 0;
+  dynamic_cps.timepop_last_handle = 0;
+  dynamic_cps.timepop_last_deadline = 0;
+  dynamic_cps.timepop_last_fire_vclock_raw = 0;
+  dynamic_cps.timepop_last_fire_dwt = 0;
+  dynamic_cps.timepop_last_fire_gnss_ns = -1;
   dynamic_cps.history_head = 0;
   dynamic_cps.history_count = 0;
   dynamic_cps_reset_second_locked();
@@ -582,6 +617,7 @@ void time_dynamic_cps_pps_vclock_edge(uint32_t pvc_sequence,
 static void dynamic_cps_capture_first_ms_audit_locked(uint32_t sample_ms,
                                                        uint32_t qtimer_event_dwt,
                                                        uint32_t observed_cycles,
+                                                       uint32_t event_vclock_ticks,
                                                        uint32_t dynamic_cycles_before_sample,
                                                        uint32_t dynamic_cycles_after_sample,
                                                        uint32_t interval_used_cycles,
@@ -600,8 +636,10 @@ static void dynamic_cps_capture_first_ms_audit_locked(uint32_t sample_ms,
   a.static_cycles_per_second = dynamic_cps.base_cycles;
   a.static_cycles_per_ms_floor = dynamic_cps.base_cycles / 1000U;
   a.expected_elapsed_static_floor =
-      (uint32_t)(((uint64_t)dynamic_cps.base_cycles * (uint64_t)sample_ms) / 1000ULL);
-  a.expected_elapsed_static_round = line_cycles_at_ms(dynamic_cps.base_cycles, sample_ms);
+      (uint32_t)(((uint64_t)dynamic_cps.base_cycles * (uint64_t)event_vclock_ticks) /
+                 (uint64_t)VCLOCK_COUNTS_PER_SECOND);
+  a.expected_elapsed_static_round =
+      line_cycles_at_ticks(dynamic_cps.base_cycles, event_vclock_ticks);
   a.expected_dwt_static_floor = a.anchor_dwt + a.expected_elapsed_static_floor;
   a.expected_dwt_static_round = a.anchor_dwt + a.expected_elapsed_static_round;
 
@@ -614,7 +652,7 @@ static void dynamic_cps_capture_first_ms_audit_locked(uint32_t sample_ms,
 
   a.dynamic_cycles_per_second = dynamic_cycles_before_sample;
   a.expected_elapsed_dynamic_round =
-      line_cycles_at_ms(dynamic_cycles_before_sample, sample_ms);
+      line_cycles_at_ticks(dynamic_cycles_before_sample, event_vclock_ticks);
   a.expected_dwt_dynamic_round = a.anchor_dwt + a.expected_elapsed_dynamic_round;
 
   a.observed_dwt = qtimer_event_dwt;
@@ -646,26 +684,53 @@ static void dynamic_cps_capture_first_ms_audit_locked(uint32_t sample_ms,
   }
 }
 
-void time_dynamic_cps_cadence_update(uint32_t qtimer_event_dwt,
-                                     uint32_t cadence_tick_mod_1000) {
+static void time_dynamic_cps_timepop_update(uint32_t fire_dwt,
+                                           uint32_t fire_vclock_raw,
+                                           uint32_t scheduled_deadline,
+                                           int64_t fire_gnss_ns) {
   dynamic_cps.seq++;
   dmb();
 
-  if (dynamic_cps.pvc_sequence == 0) {
+  dynamic_cps.timepop_callback_count++;
+  dynamic_cps.timepop_last_deadline = scheduled_deadline;
+  dynamic_cps.timepop_last_fire_vclock_raw = fire_vclock_raw;
+  dynamic_cps.timepop_last_fire_dwt = fire_dwt;
+  dynamic_cps.timepop_last_fire_gnss_ns = fire_gnss_ns;
+
+  const time_anchor_snapshot_t anchor_snap = time_anchor_snapshot();
+
+  if (dynamic_cps.pvc_sequence == 0 || !anchor_snap.ok || !anchor_snap.valid) {
     dynamic_cps.skipped_no_anchor++;
     dmb();
     dynamic_cps.seq++;
     return;
   }
 
-  if (!dynamic_cps.valid || dynamic_cps.base_cycles == 0 || dynamic_cps.current_cycles == 0) {
+  if (!dynamic_cps.valid || dynamic_cps.base_cycles == 0 || dynamic_cps.current_cycles == 0 ||
+      anchor_snap.dwt_at_pps_vclock != dynamic_cps.current_pvc_dwt_at_edge) {
     dynamic_cps.skipped_no_cps++;
     dmb();
     dynamic_cps.seq++;
     return;
   }
 
-  const uint32_t sample_ms = cadence_tick_mod_1000;
+  const uint32_t anchor_counter32 = anchor_snap.counter32_at_pps_vclock;
+  const uint32_t target_vclock_ticks = scheduled_deadline - anchor_counter32;
+  if (target_vclock_ticks == 0) {
+    dynamic_cps.skipped_offset_low++;
+    dmb();
+    dynamic_cps.seq++;
+    return;
+  }
+  if (target_vclock_ticks >= VCLOCK_COUNTS_PER_SECOND) {
+    dynamic_cps.skipped_offset_high++;
+    dmb();
+    dynamic_cps.seq++;
+    return;
+  }
+
+  const uint32_t sample_ms =
+      (target_vclock_ticks + (VCLOCK_INTERVAL_COUNTS / 2U)) / VCLOCK_INTERVAL_COUNTS;
   if (sample_ms < DYNAMIC_CPS_MIN_REFINE_MS) {
     dynamic_cps.skipped_offset_low++;
     dmb();
@@ -679,14 +744,30 @@ void time_dynamic_cps_cadence_update(uint32_t qtimer_event_dwt,
     return;
   }
 
-  const uint32_t observed_cycles = qtimer_event_dwt - dynamic_cps.current_pvc_dwt_at_edge;
-  const uint32_t dynamic_cycles_before_sample = dynamic_cps.current_cycles;
-  const uint32_t expected_static = line_cycles_at_ms(dynamic_cps.base_cycles, sample_ms);
-  const uint32_t expected_dynamic = line_cycles_at_ms(dynamic_cycles_before_sample, sample_ms);
+  const uint32_t event_vclock_ticks = fire_vclock_raw - anchor_counter32;
+  if (event_vclock_ticks == 0) {
+    dynamic_cps.skipped_offset_low++;
+    dmb();
+    dynamic_cps.seq++;
+    return;
+  }
+  if (event_vclock_ticks >= VCLOCK_COUNTS_PER_SECOND) {
+    dynamic_cps.skipped_offset_high++;
+    dmb();
+    dynamic_cps.seq++;
+    return;
+  }
 
-  // Servo correction: if the sample is sane, move the one-second CPS
-  // prediction by the full observed error.  If the residual is impossibly
-  // large, preserve the raw observation but do not let the servo learn from it.
+  const uint32_t observed_cycles = fire_dwt - dynamic_cps.current_pvc_dwt_at_edge;
+  const uint32_t dynamic_cycles_before_sample = dynamic_cps.current_cycles;
+  const uint32_t expected_static = line_cycles_at_ticks(dynamic_cps.base_cycles,
+                                                       event_vclock_ticks);
+  const uint32_t expected_dynamic = line_cycles_at_ticks(dynamic_cycles_before_sample,
+                                                        event_vclock_ticks);
+
+  // Servo correction: if the TimePop fire fact is sane, move the one-second CPS
+  // prediction by the full observed error. If the residual is impossibly large,
+  // preserve the raw observation but do not let the servo learn from it.
   const int32_t servo_error =
       (int32_t)((int64_t)observed_cycles - (int64_t)expected_dynamic);
   const uint32_t abs_servo_error = u32_abs_i32(servo_error);
@@ -707,8 +788,9 @@ void time_dynamic_cps_cadence_update(uint32_t qtimer_event_dwt,
   const uint32_t dynamic_cycles_after_sample = dynamic_cps.current_cycles;
 
   dynamic_cps_capture_first_ms_audit_locked(sample_ms,
-                                            qtimer_event_dwt,
+                                            fire_dwt,
                                             observed_cycles,
+                                            event_vclock_ticks,
                                             dynamic_cycles_before_sample,
                                             dynamic_cycles_after_sample,
                                             used_cycles,
@@ -718,7 +800,7 @@ void time_dynamic_cps_cadence_update(uint32_t qtimer_event_dwt,
                                             servo_correction);
 
   // Keep the historical fit counters populated for report compatibility, but
-  // do not use them to recompute the CPS.  Dynamic CPS is now servo-owned.
+  // do not use them to recompute the CPS. Dynamic CPS is now servo-owned.
   dynamic_cps.fit.add(sample_ms, used_cycles);
 
   if (servo_gated) {
@@ -760,6 +842,52 @@ void time_dynamic_cps_cadence_update(uint32_t qtimer_event_dwt,
 
   dmb();
   dynamic_cps.seq++;
+}
+
+static void dynamic_cps_timepop_callback(timepop_ctx_t* ctx,
+                                         timepop_diag_t*,
+                                         void*) {
+  if (!ctx) return;
+  time_dynamic_cps_timepop_update(ctx->fire_dwt_cyccnt,
+                                  ctx->fire_vclock_raw,
+                                  ctx->deadline,
+                                  ctx->fire_gnss_ns);
+}
+
+static bool dynamic_cps_ensure_timepop_client(void) {
+  if (dynamic_cps.timepop_client_armed) return true;
+  if (!time_valid()) return false;
+
+  // Named replacement makes this idempotent across epoch/recovery churn.
+  timepop_cancel_by_name(DYNAMIC_CPS_TIMEPOP_NAME);
+  const timepop_handle_t h = timepop_arm(DYNAMIC_CPS_TIMEPOP_PERIOD_NS,
+                                         true,
+                                         dynamic_cps_timepop_callback,
+                                         nullptr,
+                                         DYNAMIC_CPS_TIMEPOP_NAME);
+
+  dynamic_cps.seq++;
+  dmb();
+  if (h == TIMEPOP_INVALID_HANDLE) {
+    dynamic_cps.timepop_client_armed = false;
+    dynamic_cps.timepop_arm_failures++;
+    dmb();
+    dynamic_cps.seq++;
+    return false;
+  }
+
+  dynamic_cps.timepop_client_armed = true;
+  dynamic_cps.timepop_arm_count++;
+  dynamic_cps.timepop_last_handle = h;
+  dmb();
+  dynamic_cps.seq++;
+  return true;
+}
+
+void time_dynamic_cps_cadence_update(uint32_t,
+                                     uint32_t) {
+  // Legacy compatibility hook for the retired private QTimer cadence rail.
+  // Dynamic CPS refinement is now driven by the regular TimePop client above.
 }
 
 // ============================================================================
@@ -817,6 +945,8 @@ void time_pps_vclock_update(uint32_t dwt_at_pps_vclock,
                               counter32_at_pps_vclock,
                               dwt_cycles_per_pps_vclock_s);
   }
+
+  (void)dynamic_cps_ensure_timepop_client();
 }
 
 void time_pps_epoch_reset(uint32_t dwt_at_pps,
@@ -1259,11 +1389,10 @@ bool time_dynamic_cps_cycles_for_anchor(uint32_t pvc_sequence,
                                         uint32_t* out_cycles) {
   if (!out_cycles) return false;
 
-  // Compatibility accessor used by existing interrupt projection code.
-  // While dynamic CPS is witness-only, return the static PPS/VCLOCK bookend
-  // rate for the requested anchor, not the dynamically refined final/current
-  // value. This keeps GNSS projection on the conservative static ruler while
-  // preserving the function's role as a per-anchor CPS lookup.
+  // Compatibility accessor used by historical interrupt projection code.
+  // It intentionally returns the static per-anchor PPS/VCLOCK bookend CPS so
+  // old anchors remain reconstructive. Current-anchor operational projection
+  // uses effective_cycles_for_anchor() instead.
   const time_dynamic_cps_snapshot_t snap = time_dynamic_cps_snapshot();
   if (snap.valid && snap.pvc_sequence == pvc_sequence && snap.base_cycles != 0) {
     *out_cycles = snap.base_cycles;
@@ -1356,8 +1485,8 @@ static void add_prediction_scalars(Payload& out) {
 static void add_dynamic_cps_scalars(Payload& out) {
   const time_dynamic_cps_snapshot_t c = time_dynamic_cps_snapshot();
   out.add("dynamic_cps_valid", c.valid);
-  out.add("dynamic_cps_mode", "SERVO_WITNESS_GATED");
-  out.add("dynamic_cps_model", "FIXED_ANCHOR_1KHZ_ERROR_SERVO_WITH_OUTLIER_GATE");
+  out.add("dynamic_cps_mode", "TIMEPOP_SERVO_PROJECTION_GATED");
+  out.add("dynamic_cps_model", "FIXED_ANCHOR_TIMEPOP_GATED_SERVO_PROJECTION");
   out.add("dynamic_cps_witness_only", c.witness_only);
   out.add("dynamic_cps_projection_enabled", c.projection_enabled);
   out.add("dynamic_cps_pvc_sequence", c.pvc_sequence);
@@ -1377,6 +1506,15 @@ static void add_dynamic_cps_scalars(Payload& out) {
           c.last_completed_dynamic_prediction_valid_count);
   out.add("dynamic_cps_last_completed_adjust_cycles",
           c.last_completed_dynamic_prediction_adjust_cycles);
+  out.add("dynamic_cps_timepop_client_armed", dynamic_cps.timepop_client_armed);
+  out.add("dynamic_cps_timepop_arm_count", dynamic_cps.timepop_arm_count);
+  out.add("dynamic_cps_timepop_arm_failures", dynamic_cps.timepop_arm_failures);
+  out.add("dynamic_cps_timepop_callback_count", dynamic_cps.timepop_callback_count);
+  out.add("dynamic_cps_timepop_last_handle", dynamic_cps.timepop_last_handle);
+  out.add("dynamic_cps_timepop_last_deadline", dynamic_cps.timepop_last_deadline);
+  out.add("dynamic_cps_timepop_last_fire_vclock_raw", dynamic_cps.timepop_last_fire_vclock_raw);
+  out.add("dynamic_cps_timepop_last_fire_dwt", dynamic_cps.timepop_last_fire_dwt);
+  out.add("dynamic_cps_timepop_last_fire_gnss_ns", dynamic_cps.timepop_last_fire_gnss_ns);
 
   out.add("dynamic_cps_phase_probe_valid", c.phase_probe_valid);
   out.add("dynamic_cps_phase_probe_pps_sequence", c.phase_probe_pps_sequence);
@@ -1624,14 +1762,19 @@ static Payload cmd_dynamic_cps_first_ms(const Payload&) {
     out.add("static_cycles_per_second", static_cycles_per_second);
     out.add("static_cycles_per_ms_floor", static_cycles_per_ms_floor);
     out.add("current_cycles", current_cycles);
+    out.add("timepop_client_armed", dynamic_cps.timepop_client_armed);
+    out.add("timepop_callback_count", dynamic_cps.timepop_callback_count);
+    out.add("timepop_last_deadline", dynamic_cps.timepop_last_deadline);
+    out.add("timepop_last_fire_vclock_raw", dynamic_cps.timepop_last_fire_vclock_raw);
+    out.add("timepop_last_fire_dwt", dynamic_cps.timepop_last_fire_dwt);
     out.add("servo_gate_threshold_cycles", (uint32_t)DYNAMIC_CPS_SERVO_GATE_THRESHOLD_CYCLES);
     out.add("audit_count", valid_count);
     out.add("audit_capacity", (uint32_t)DYNAMIC_CPS_FIRST_MS_AUDIT_COUNT);
     out.add("audit_start_ms", (uint32_t)DYNAMIC_CPS_FIRST_MS_AUDIT_START_MS);
     out.add("audit_step_ms", (uint32_t)DYNAMIC_CPS_FIRST_MS_AUDIT_STEP_MS);
     out.add("audit_end_ms", (uint32_t)DYNAMIC_CPS_FIRST_MS_AUDIT_END_MS);
-    out.add("note", "DWT values are adjusted event coordinates supplied by process_interrupt");
-    out.add("comparison_note", "Rows show rounded interval expected cycles, actual cycles, residuals, and servo gate behavior for static bookend CPS versus dynamic servo CPS.");
+    out.add("note", "DWT values are TimePop fire event coordinates shared by scheduled clients");
+    out.add("comparison_note", "Rows show TimePop event expected cycles, actual cycles, residuals, and servo gate behavior for static bookend CPS versus dynamic servo CPS.");
 
     out.add("phase_probe_valid", phase_probe_valid);
     out.add("phase_probe_pps_sequence", phase_probe_pps_sequence);
