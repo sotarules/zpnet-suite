@@ -38,8 +38,17 @@ static constexpr uint32_t HISTORY_DEFAULT_LIMIT = 16;
 static constexpr uint32_t DYNAMIC_CPS_MIN_REFINE_MS = 1;
 static constexpr uint32_t DYNAMIC_CPS_MAX_REFINE_MS = 999;
 static constexpr uint32_t DYNAMIC_CPS_OUTLIER_THRESHOLD_CYCLES = 5;
+// Servo gate: observations whose dynamic residual exceeds this threshold are
+// treated as impossible ISR-late/capture outliers. They are reported, but the
+// servo leaves the one-second CPS prediction unchanged.
+static constexpr uint32_t DYNAMIC_CPS_SERVO_GATE_THRESHOLD_CYCLES = 100;
 static constexpr uint32_t DYNAMIC_CPS_ENDPOINT_SANITY_TOLERANCE_CYCLES = 25;
-static constexpr uint32_t DYNAMIC_CPS_FIRST_MS_AUDIT_COUNT = 3;
+static constexpr uint32_t DYNAMIC_CPS_FIRST_MS_AUDIT_START_MS = 100;
+static constexpr uint32_t DYNAMIC_CPS_FIRST_MS_AUDIT_STEP_MS = 100;
+static constexpr uint32_t DYNAMIC_CPS_FIRST_MS_AUDIT_COUNT = 9;
+static constexpr uint32_t DYNAMIC_CPS_FIRST_MS_AUDIT_END_MS =
+    DYNAMIC_CPS_FIRST_MS_AUDIT_START_MS +
+    (DYNAMIC_CPS_FIRST_MS_AUDIT_COUNT - 1U) * DYNAMIC_CPS_FIRST_MS_AUDIT_STEP_MS;
 
 // ============================================================================
 // Anchor state (written by clocks alpha, read by time readers)
@@ -154,15 +163,16 @@ static void prediction_observe_actual(uint32_t pps_vclock_count,
 // ============================================================================
 //
 // Dynamic CPS is currently witness-only.  It does not drive operational
-// DWT<->GNSS projection.  The model is a fixed-anchor online line fit:
+// DWT<->GNSS projection.  The model is a fixed-anchor 1 kHz servo:
 //
-//   t = 0 ms     -> PPS/VCLOCK anchor DWT (implicit, never sampled from CH3)
-//   t = 1..999ms -> VCLOCK 1 kHz cadence observations
+//   t = 0 ms      -> PPS/VCLOCK anchor DWT (implicit, never sampled from CH3)
+//   t = 1..999 ms -> VCLOCK 1 kHz cadence observations
 //
-// Each cadence observation is compared against the current fitted line.  If it
-// is outside the outlier threshold, the model value is substituted and the raw
-// error is accumulated.  This lets us expose systematic coordinate-species
-// errors without allowing them to bend the slope.
+// Each cadence observation compares the actual DWT elapsed cycles against the
+// elapsed cycles predicted by the current one-second CPS estimate.  The full
+// observed error is added directly to the current CPS estimate.  This is a
+// servo, not a line fit: it nudges the next-second prediction to match actual
+// cadence observations without recomputing a whole-second slope from scratch.
 
 static inline uint32_t u32_abs_i32(int32_t v) {
   return (v < 0) ? (uint32_t)(-(int64_t)v) : (uint32_t)v;
@@ -179,6 +189,21 @@ static inline uint32_t line_slope_from_sums(uint64_t sum_t2_ms2,
   if (sum_t2_ms2 == 0) return fallback_cycles;
   return (uint32_t)(((uint64_t)sum_tx_cycles_ms * 1000ULL + sum_t2_ms2 / 2ULL) /
                     sum_t2_ms2);
+}
+
+static inline bool audit_checkpoint_index(uint32_t sample_ms,
+                                          uint32_t* out_idx) {
+  if (sample_ms < DYNAMIC_CPS_FIRST_MS_AUDIT_START_MS) return false;
+  if (sample_ms > DYNAMIC_CPS_FIRST_MS_AUDIT_END_MS) return false;
+
+  const uint32_t offset = sample_ms - DYNAMIC_CPS_FIRST_MS_AUDIT_START_MS;
+  if ((offset % DYNAMIC_CPS_FIRST_MS_AUDIT_STEP_MS) != 0U) return false;
+
+  const uint32_t idx = offset / DYNAMIC_CPS_FIRST_MS_AUDIT_STEP_MS;
+  if (idx >= DYNAMIC_CPS_FIRST_MS_AUDIT_COUNT) return false;
+
+  if (out_idx) *out_idx = idx;
+  return true;
 }
 
 struct fixed_anchor_line_fit_t {
@@ -207,16 +232,43 @@ struct dynamic_cps_first_ms_audit_t {
   bool     valid = false;
   uint32_t ms = 0;
   uint32_t anchor_dwt = 0;
+
+  // Static path: the PPS/VCLOCK bookend CPS for this second. This is the
+  // conservative ruler used by the operational projection path today.
   uint32_t static_cycles_per_second = 0;
   uint32_t static_cycles_per_ms_floor = 0;
-  uint32_t expected_elapsed_floor = 0;
-  uint32_t expected_elapsed_round = 0;
-  uint32_t expected_dwt_floor = 0;
-  uint32_t expected_dwt_round = 0;
+  uint32_t expected_elapsed_floor = 0;          // legacy static/floor name
+  uint32_t expected_elapsed_round = 0;          // legacy static/round name
+  uint32_t expected_dwt_floor = 0;              // legacy static/floor name
+  uint32_t expected_dwt_round = 0;              // legacy static/round name
+  uint32_t expected_elapsed_static_floor = 0;
+  uint32_t expected_elapsed_static_round = 0;
+  uint32_t expected_dwt_static_floor = 0;
+  uint32_t expected_dwt_static_round = 0;
+  int32_t  error_vs_floor_cycles = 0;           // legacy static/floor name
+  int32_t  error_vs_round_cycles = 0;           // legacy static/round name
+  int32_t  error_vs_static_floor_cycles = 0;
+  int32_t  error_vs_static_round_cycles = 0;
+
+  // Dynamic path: the currently refined CPS before this cadence observation is
+  // consumed.  This makes the report a predictive comparison instead of a
+  // post-sample tautology.
+  uint32_t dynamic_cycles_per_second = 0;
+  uint32_t expected_elapsed_dynamic_round = 0;
+  uint32_t expected_dwt_dynamic_round = 0;
+  int32_t  error_vs_dynamic_round_cycles = 0;
+
+  // Servo gate audit. Impossible residuals are preserved as raw observation
+  // facts, but the servo does not learn from them.
+  uint32_t servo_gate_threshold_cycles = 0;
+  uint32_t servo_abs_error_cycles = 0;
+  bool     servo_gated = false;
+  int32_t  servo_correction_cycles = 0;
+  uint32_t interval_used_cycles = 0;
+  uint32_t dynamic_cycles_after_sample = 0;
+
   uint32_t observed_dwt = 0;
   uint32_t observed_elapsed_cycles = 0;
-  int32_t  error_vs_floor_cycles = 0;
-  int32_t  error_vs_round_cycles = 0;
 };
 
 struct dynamic_cps_state_t {
@@ -358,7 +410,7 @@ static void dynamic_cps_push_record_locked(uint32_t next_actual_cycles) {
   rec.last_fit_error_cycles = dynamic_cps.last_fit_error_cycles;
   rec.last_point_slope_cycles = dynamic_cps.last_point_slope_cycles;
 
-  rec.outlier_threshold_cycles = DYNAMIC_CPS_OUTLIER_THRESHOLD_CYCLES;
+  rec.outlier_threshold_cycles = DYNAMIC_CPS_SERVO_GATE_THRESHOLD_CYCLES;
   rec.accepted_samples = dynamic_cps.accepted_samples_this_second;
   rec.substituted_samples = dynamic_cps.substituted_samples_this_second;
   rec.first_substituted_ms = dynamic_cps.first_substituted_ms;
@@ -509,28 +561,63 @@ void time_dynamic_cps_pps_vclock_edge(uint32_t pvc_sequence,
 
 static void dynamic_cps_capture_first_ms_audit_locked(uint32_t sample_ms,
                                                        uint32_t qtimer_event_dwt,
-                                                       uint32_t observed_cycles) {
-  if (sample_ms < 1 || sample_ms > DYNAMIC_CPS_FIRST_MS_AUDIT_COUNT) return;
+                                                       uint32_t observed_cycles,
+                                                       uint32_t dynamic_cycles_before_sample,
+                                                       uint32_t dynamic_cycles_after_sample,
+                                                       uint32_t interval_used_cycles,
+                                                       int32_t servo_error_cycles,
+                                                       uint32_t servo_abs_error_cycles,
+                                                       bool servo_gated,
+                                                       int32_t servo_correction_cycles) {
+  uint32_t idx = 0;
+  if (!audit_checkpoint_index(sample_ms, &idx)) return;
   if (!dynamic_cps.valid || dynamic_cps.base_cycles == 0) return;
-
-  const uint32_t idx = sample_ms - 1U;
   dynamic_cps_first_ms_audit_t a{};
   a.valid = true;
   a.ms = sample_ms;
   a.anchor_dwt = dynamic_cps.current_pvc_dwt_at_edge;
+
   a.static_cycles_per_second = dynamic_cps.base_cycles;
   a.static_cycles_per_ms_floor = dynamic_cps.base_cycles / 1000U;
-  a.expected_elapsed_floor =
+  a.expected_elapsed_static_floor =
       (uint32_t)(((uint64_t)dynamic_cps.base_cycles * (uint64_t)sample_ms) / 1000ULL);
-  a.expected_elapsed_round = line_cycles_at_ms(dynamic_cps.base_cycles, sample_ms);
-  a.expected_dwt_floor = a.anchor_dwt + a.expected_elapsed_floor;
-  a.expected_dwt_round = a.anchor_dwt + a.expected_elapsed_round;
+  a.expected_elapsed_static_round = line_cycles_at_ms(dynamic_cps.base_cycles, sample_ms);
+  a.expected_dwt_static_floor = a.anchor_dwt + a.expected_elapsed_static_floor;
+  a.expected_dwt_static_round = a.anchor_dwt + a.expected_elapsed_static_round;
+
+  // Legacy field names remain aliases for the static path so existing tooling
+  // continues to read the report unchanged.
+  a.expected_elapsed_floor = a.expected_elapsed_static_floor;
+  a.expected_elapsed_round = a.expected_elapsed_static_round;
+  a.expected_dwt_floor = a.expected_dwt_static_floor;
+  a.expected_dwt_round = a.expected_dwt_static_round;
+
+  a.dynamic_cycles_per_second = dynamic_cycles_before_sample;
+  a.expected_elapsed_dynamic_round =
+      line_cycles_at_ms(dynamic_cycles_before_sample, sample_ms);
+  a.expected_dwt_dynamic_round = a.anchor_dwt + a.expected_elapsed_dynamic_round;
+
   a.observed_dwt = qtimer_event_dwt;
   a.observed_elapsed_cycles = observed_cycles;
-  a.error_vs_floor_cycles =
-      (int32_t)((int64_t)observed_cycles - (int64_t)a.expected_elapsed_floor);
-  a.error_vs_round_cycles =
-      (int32_t)((int64_t)observed_cycles - (int64_t)a.expected_elapsed_round);
+
+  a.error_vs_static_floor_cycles =
+      (int32_t)((int64_t)observed_cycles - (int64_t)a.expected_elapsed_static_floor);
+  a.error_vs_static_round_cycles =
+      (int32_t)((int64_t)observed_cycles - (int64_t)a.expected_elapsed_static_round);
+  a.error_vs_dynamic_round_cycles =
+      (int32_t)((int64_t)observed_cycles - (int64_t)a.expected_elapsed_dynamic_round);
+
+  a.servo_gate_threshold_cycles = DYNAMIC_CPS_SERVO_GATE_THRESHOLD_CYCLES;
+  a.servo_abs_error_cycles = servo_abs_error_cycles;
+  a.servo_gated = servo_gated;
+  a.servo_correction_cycles = servo_correction_cycles;
+  a.interval_used_cycles = interval_used_cycles;
+  a.dynamic_cycles_after_sample = dynamic_cycles_after_sample;
+  (void)servo_error_cycles;  // Same value as error_vs_dynamic_round_cycles.
+
+  // Legacy field names remain aliases for the static path.
+  a.error_vs_floor_cycles = a.error_vs_static_floor_cycles;
+  a.error_vs_round_cycles = a.error_vs_static_round_cycles;
 
   const bool was_valid = dynamic_cps.first_ms_audit[idx].valid;
   dynamic_cps.first_ms_audit[idx] = a;
@@ -573,60 +660,76 @@ void time_dynamic_cps_cadence_update(uint32_t qtimer_event_dwt,
   }
 
   const uint32_t observed_cycles = qtimer_event_dwt - dynamic_cps.current_pvc_dwt_at_edge;
-  dynamic_cps_capture_first_ms_audit_locked(sample_ms, qtimer_event_dwt, observed_cycles);
+  const uint32_t dynamic_cycles_before_sample = dynamic_cps.current_cycles;
   const uint32_t expected_static = line_cycles_at_ms(dynamic_cps.base_cycles, sample_ms);
-  const uint32_t expected_fit = line_cycles_at_ms(dynamic_cps.current_cycles, sample_ms);
-  const int32_t observed_error =
-      (int32_t)((int64_t)observed_cycles - (int64_t)expected_fit);
-  const uint32_t abs_observed_error = u32_abs_i32(observed_error);
+  const uint32_t expected_dynamic = line_cycles_at_ms(dynamic_cycles_before_sample, sample_ms);
 
-  uint32_t used_cycles = observed_cycles;
-  bool substituted = false;
-  if (abs_observed_error > DYNAMIC_CPS_OUTLIER_THRESHOLD_CYCLES) {
-    used_cycles = expected_fit;
-    substituted = true;
+  // Servo correction: if the sample is sane, move the one-second CPS
+  // prediction by the full observed error.  If the residual is impossibly
+  // large, preserve the raw observation but do not let the servo learn from it.
+  const int32_t servo_error =
+      (int32_t)((int64_t)observed_cycles - (int64_t)expected_dynamic);
+  const uint32_t abs_servo_error = u32_abs_i32(servo_error);
+  const bool servo_gated = abs_servo_error > DYNAMIC_CPS_SERVO_GATE_THRESHOLD_CYCLES;
+  const int32_t servo_correction = servo_gated ? 0 : servo_error;
+  const uint32_t used_cycles = servo_gated ? expected_dynamic : observed_cycles;
+
+  const uint32_t previous_cycles = dynamic_cps.current_cycles;
+  const int64_t corrected_cycles_i64 =
+      (int64_t)dynamic_cps.current_cycles + (int64_t)servo_correction;
+  dynamic_cps.current_cycles =
+      (corrected_cycles_i64 <= 0)
+          ? 1U
+          : ((corrected_cycles_i64 > (int64_t)UINT32_MAX)
+                 ? UINT32_MAX
+                 : (uint32_t)corrected_cycles_i64);
+
+  const uint32_t dynamic_cycles_after_sample = dynamic_cps.current_cycles;
+
+  dynamic_cps_capture_first_ms_audit_locked(sample_ms,
+                                            qtimer_event_dwt,
+                                            observed_cycles,
+                                            dynamic_cycles_before_sample,
+                                            dynamic_cycles_after_sample,
+                                            used_cycles,
+                                            servo_error,
+                                            abs_servo_error,
+                                            servo_gated,
+                                            servo_correction);
+
+  // Keep the historical fit counters populated for report compatibility, but
+  // do not use them to recompute the CPS.  Dynamic CPS is now servo-owned.
+  dynamic_cps.fit.add(sample_ms, used_cycles);
+
+  if (servo_gated) {
     dynamic_cps.substituted_samples_this_second++;
     dynamic_cps.total_substituted_samples++;
     if (dynamic_cps.first_substituted_ms == 0) {
       dynamic_cps.first_substituted_ms = sample_ms;
     }
     dynamic_cps.last_substituted_ms = sample_ms;
-    dynamic_cps.substituted_error_sum_cycles += observed_error;
-    dynamic_cps.substituted_abs_error_sum_cycles += abs_observed_error;
+    dynamic_cps.substituted_error_sum_cycles += servo_error;
+    dynamic_cps.substituted_abs_error_sum_cycles += abs_servo_error;
   } else {
     dynamic_cps.accepted_samples_this_second++;
     dynamic_cps.total_accepted_samples++;
   }
 
-  if (abs_observed_error > dynamic_cps.max_abs_observed_error_cycles) {
-    dynamic_cps.max_abs_observed_error_cycles = abs_observed_error;
+  if (abs_servo_error > dynamic_cps.max_abs_observed_error_cycles) {
+    dynamic_cps.max_abs_observed_error_cycles = abs_servo_error;
   }
-
-  const int32_t used_error =
-      (int32_t)((int64_t)used_cycles - (int64_t)expected_fit);
-  const uint32_t point_slope =
-      (uint32_t)(((uint64_t)used_cycles * 1000ULL + (uint64_t)sample_ms / 2ULL) /
-                 (uint64_t)sample_ms);
-
-  const uint32_t previous_cycles = dynamic_cps.current_cycles;
-  dynamic_cps.fit.add(sample_ms, used_cycles);
-  dynamic_cps.current_cycles = dynamic_cps.fit.slope(dynamic_cps.base_cycles);
-
-  const uint32_t expected_fit_after = line_cycles_at_ms(dynamic_cps.current_cycles, sample_ms);
-  const int32_t fit_error_after =
-      (int32_t)((int64_t)used_cycles - (int64_t)expected_fit_after);
 
   dynamic_cps.last_sample_ms = sample_ms;
   dynamic_cps.last_observed_cycles = observed_cycles;
   dynamic_cps.last_used_cycles = used_cycles;
   dynamic_cps.last_expected_static_cycles = expected_static;
-  dynamic_cps.last_expected_fit_cycles = expected_fit_after;
-  dynamic_cps.last_observed_error_cycles = observed_error;
-  dynamic_cps.last_used_error_cycles = used_error;
+  dynamic_cps.last_expected_fit_cycles = expected_dynamic;
+  dynamic_cps.last_observed_error_cycles = servo_error;
+  dynamic_cps.last_used_error_cycles = servo_correction;
   dynamic_cps.last_static_path_error_cycles =
       (int32_t)((int64_t)observed_cycles - (int64_t)expected_static);
-  dynamic_cps.last_fit_error_cycles = fit_error_after;
-  dynamic_cps.last_point_slope_cycles = point_slope;
+  dynamic_cps.last_fit_error_cycles = servo_correction;
+  dynamic_cps.last_point_slope_cycles = dynamic_cps.current_cycles;
 
   dynamic_cps.refine_ticks_this_second++;
   dynamic_cps.total_refine_ticks++;
@@ -634,7 +737,6 @@ void time_dynamic_cps_cadence_update(uint32_t qtimer_event_dwt,
     dynamic_cps.adjustments_this_second++;
     dynamic_cps.total_adjustments++;
   }
-  (void)substituted;
 
   dmb();
   dynamic_cps.seq++;
@@ -1011,7 +1113,7 @@ time_dynamic_cps_snapshot_t time_dynamic_cps_snapshot(void) {
     out.last_fit_error_cycles = dynamic_cps.last_fit_error_cycles;
     out.last_point_slope_cycles = dynamic_cps.last_point_slope_cycles;
 
-    out.outlier_threshold_cycles = DYNAMIC_CPS_OUTLIER_THRESHOLD_CYCLES;
+    out.outlier_threshold_cycles = DYNAMIC_CPS_SERVO_GATE_THRESHOLD_CYCLES;
     out.accepted_samples_this_second = dynamic_cps.accepted_samples_this_second;
     out.substituted_samples_this_second = dynamic_cps.substituted_samples_this_second;
     out.total_accepted_samples = dynamic_cps.total_accepted_samples;
@@ -1209,8 +1311,8 @@ static void add_prediction_scalars(Payload& out) {
 static void add_dynamic_cps_scalars(Payload& out) {
   const time_dynamic_cps_snapshot_t c = time_dynamic_cps_snapshot();
   out.add("dynamic_cps_valid", c.valid);
-  out.add("dynamic_cps_mode", "LINEAR_FIT_WITNESS_WITH_OUTLIER_SUBSTITUTION");
-  out.add("dynamic_cps_model", "FIXED_ANCHOR_ONLINE_LEAST_SQUARES");
+  out.add("dynamic_cps_mode", "SERVO_WITNESS_GATED");
+  out.add("dynamic_cps_model", "FIXED_ANCHOR_1KHZ_ERROR_SERVO_WITH_OUTLIER_GATE");
   out.add("dynamic_cps_witness_only", c.witness_only);
   out.add("dynamic_cps_projection_enabled", c.projection_enabled);
   out.add("dynamic_cps_pvc_sequence", c.pvc_sequence);
@@ -1467,9 +1569,14 @@ static Payload cmd_dynamic_cps_first_ms(const Payload&) {
     out.add("static_cycles_per_second", static_cycles_per_second);
     out.add("static_cycles_per_ms_floor", static_cycles_per_ms_floor);
     out.add("current_cycles", current_cycles);
+    out.add("servo_gate_threshold_cycles", (uint32_t)DYNAMIC_CPS_SERVO_GATE_THRESHOLD_CYCLES);
     out.add("audit_count", valid_count);
     out.add("audit_capacity", (uint32_t)DYNAMIC_CPS_FIRST_MS_AUDIT_COUNT);
+    out.add("audit_start_ms", (uint32_t)DYNAMIC_CPS_FIRST_MS_AUDIT_START_MS);
+    out.add("audit_step_ms", (uint32_t)DYNAMIC_CPS_FIRST_MS_AUDIT_STEP_MS);
+    out.add("audit_end_ms", (uint32_t)DYNAMIC_CPS_FIRST_MS_AUDIT_END_MS);
     out.add("note", "DWT values are adjusted event coordinates supplied by process_interrupt");
+    out.add("comparison_note", "Rows show rounded interval expected cycles, actual cycles, residuals, and servo gate behavior for static bookend CPS versus dynamic servo CPS.");
 
     out.add("phase_probe_valid", phase_probe_valid);
     out.add("phase_probe_pps_sequence", phase_probe_pps_sequence);
@@ -1485,19 +1592,21 @@ static Payload cmd_dynamic_cps_first_ms(const Payload&) {
     PayloadArray arr;
     for (uint32_t i = 0; i < DYNAMIC_CPS_FIRST_MS_AUDIT_COUNT; i++) {
       Payload e;
-      e.add("valid", audit[i].valid);
       e.add("ms", audit[i].ms);
       e.add("anchor_dwt", audit[i].anchor_dwt);
       e.add("static_cycles_per_second", audit[i].static_cycles_per_second);
-      e.add("static_cycles_per_ms_floor", audit[i].static_cycles_per_ms_floor);
-      e.add("expected_elapsed_floor", audit[i].expected_elapsed_floor);
-      e.add("expected_elapsed_round", audit[i].expected_elapsed_round);
-      e.add("expected_dwt_floor", audit[i].expected_dwt_floor);
-      e.add("expected_dwt_round", audit[i].expected_dwt_round);
-      e.add("observed_dwt", audit[i].observed_dwt);
-      e.add("observed_elapsed_cycles", audit[i].observed_elapsed_cycles);
-      e.add("error_vs_floor_cycles", audit[i].error_vs_floor_cycles);
-      e.add("error_vs_round_cycles", audit[i].error_vs_round_cycles);
+      e.add("dynamic_cycles_per_second", audit[i].dynamic_cycles_per_second);
+      e.add("static_interval_expected_cycles", audit[i].expected_elapsed_static_round);
+      e.add("dynamic_interval_expected_cycles", audit[i].expected_elapsed_dynamic_round);
+      e.add("interval_actual_cycles", audit[i].observed_elapsed_cycles);
+      e.add("static_interval_residual_cycles", audit[i].error_vs_static_round_cycles);
+      e.add("dynamic_interval_residual_cycles", audit[i].error_vs_dynamic_round_cycles);
+      e.add("servo_gate_threshold_cycles", audit[i].servo_gate_threshold_cycles);
+      e.add("servo_abs_error_cycles", audit[i].servo_abs_error_cycles);
+      e.add("servo_gated", audit[i].servo_gated);
+      e.add("servo_correction_cycles", audit[i].servo_correction_cycles);
+      e.add("interval_used_cycles", audit[i].interval_used_cycles);
+      e.add("dynamic_cycles_after_sample", audit[i].dynamic_cycles_after_sample);
       arr.add(e);
     }
     out.add_array("first_ms_audit", arr);
