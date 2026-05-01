@@ -988,11 +988,29 @@ void clocks_beta_pps(void) {
                   (int64_t)DWT_EXPECTED_PER_PPS));
 
   const time_dwt_prediction_snapshot_t pred = time_dwt_prediction_snapshot();
+  const time_dynamic_cps_snapshot_t dyn_pred = time_dynamic_cps_snapshot();
 
   p.add("vclock_dwt_repair_prediction_valid", pred.valid);
   p.add("vclock_dwt_repair_prediction_history_count", pred.history_count);
   p.add("vclock_dwt_repair_last_prediction_residual_cycles",
         pred.residual_cycles_last);
+
+  // Prominent DWT prediction surface.
+  //
+  // Static: the random-walk best guess for the upcoming second.
+  // Dynamic: finalized servo facts from the previous second. TIME owns these
+  // quantities; beta only transcribes them into TIMEBASE_FRAGMENT.
+  p.add("dwt_static_prediction_cycle_count", pred.predicted_cycles_next);
+  p.add("dwt_dynamic_prediction_cycle_count",
+        dyn_pred.last_completed_dynamic_prediction_cycle_count);
+  p.add("dwt_dynamic_prediction_adjust_count",
+        dyn_pred.last_completed_dynamic_prediction_adjust_count);
+  p.add("dwt_dynamic_prediction_invalid_count",
+        dyn_pred.last_completed_dynamic_prediction_invalid_count);
+  p.add("dwt_dynamic_prediction_valid_count",
+        dyn_pred.last_completed_dynamic_prediction_valid_count);
+  p.add("dwt_dynamic_prediction_adjust_cycles",
+        dyn_pred.last_completed_dynamic_prediction_adjust_cycles);
 
   // Synthetic 32-bit VCLOCK identity of the canonical PPS/VCLOCK epoch.
   // Under the VCLOCK-domain architecture this is the compact event identity

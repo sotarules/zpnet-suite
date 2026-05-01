@@ -169,6 +169,14 @@ struct time_dynamic_cps_snapshot_t {
   uint32_t phase_probe_adjusted_difference_cycles;
   uint32_t phase_probe_phase_offset_cycles;
 
+  // Last completed dynamic servo second. These are finalized facts from the
+  // previous PPS/VCLOCK interval, captured before the current interval reset.
+  uint32_t last_completed_dynamic_prediction_cycle_count;
+  uint32_t last_completed_dynamic_prediction_adjust_count;
+  uint32_t last_completed_dynamic_prediction_invalid_count;
+  uint32_t last_completed_dynamic_prediction_valid_count;
+  int32_t  last_completed_dynamic_prediction_adjust_cycles;
+
   // Fixed-anchor line-fit state for the current second.
   uint32_t fit_samples_this_second;
   uint64_t fit_sum_t2_ms2;
@@ -285,16 +293,24 @@ void     time_dynamic_cps_reset(void);
 
 // Every-PPS local VCLOCK phase-probe diagnostic, authored by
 // process_interrupt from raw ISR-entry DWT captures.  This is intentionally
-// report-only and intentionally simple: raw PPS, raw arm, raw VCLOCK fire,
-// adjusted PPS, adjusted VCLOCK, adjusted difference, and modulo-100 phase.
+// report-only: it feeds the DYNAMIC_CPS_FIRST_MS report so the PPS→VCLOCK
+// raw modulo phase can be compared against the empirical canonical
+// raw PPS→VCLOCK offset without making raw ISR-entry DWT a general timing API.
 void     time_dynamic_cps_phase_probe_update(uint32_t pps_sequence,
                                              uint32_t pps_isr_entry_dwt_raw,
-                                             uint32_t arm_dwt_raw,
+                                             uint32_t pps_dwt_at_edge,
+                                             uint32_t target_counter32,
+                                             uint32_t counter32_at_event,
+                                             int32_t counter32_residual_ticks,
                                              uint32_t vclock_isr_entry_dwt_raw,
-                                             uint32_t pps_dwt_adjusted,
-                                             uint32_t vclock_dwt_adjusted,
-                                             uint32_t adjusted_difference_cycles,
-                                             uint32_t phase_offset_cycles);
+                                             uint32_t vclock_dwt_at_event,
+                                             uint32_t raw_delta_cycles,
+                                             uint32_t remainder_mod_100_cycles,
+                                             int32_t expected_mod_100_cycles,
+                                             int32_t residual_cycles,
+                                             uint32_t arm_count,
+                                             uint32_t fire_count,
+                                             uint32_t miss_count);
 
 void     time_dynamic_cps_pps_vclock_edge(uint32_t pvc_sequence,
                                            uint32_t pvc_dwt_at_edge);

@@ -299,6 +299,15 @@ struct dynamic_cps_state_t {
   uint32_t last_reseed_value = 0;
   bool     last_reseed_was_computed = false;
 
+  // Finalized facts from the previous PPS/VCLOCK interval. These are captured
+  // before resetting the current-second servo state and are intended for
+  // TIMEBASE_FRAGMENT publication by CLOCKS beta.
+  uint32_t last_completed_dynamic_prediction_cycle_count = 0;
+  uint32_t last_completed_dynamic_prediction_adjust_count = 0;
+  uint32_t last_completed_dynamic_prediction_invalid_count = 0;
+  uint32_t last_completed_dynamic_prediction_valid_count = 0;
+  int32_t  last_completed_dynamic_prediction_adjust_cycles = 0;
+
   fixed_anchor_line_fit_t fit;
 
   uint32_t last_sample_ms = 0;
@@ -444,6 +453,12 @@ static void dynamic_cps_push_record_locked(uint32_t next_actual_cycles) {
     dynamic_cps_note_effectiveness_locked(rec);
   }
 
+  dynamic_cps.last_completed_dynamic_prediction_cycle_count = rec.valid ? rec.final_cycles : 0;
+  dynamic_cps.last_completed_dynamic_prediction_adjust_count = rec.valid ? rec.adjustments : 0;
+  dynamic_cps.last_completed_dynamic_prediction_invalid_count = rec.valid ? rec.substituted_samples : 0;
+  dynamic_cps.last_completed_dynamic_prediction_valid_count = rec.valid ? rec.accepted_samples : 0;
+  dynamic_cps.last_completed_dynamic_prediction_adjust_cycles = rec.valid ? rec.net_adjustment_cycles : 0;
+
   dynamic_cps.history[dynamic_cps.history_head] = rec;
   dynamic_cps.history_head = (dynamic_cps.history_head + 1U) % DYNAMIC_CPS_HISTORY_CAPACITY;
   if (dynamic_cps.history_count < DYNAMIC_CPS_HISTORY_CAPACITY) {
@@ -498,6 +513,11 @@ void time_dynamic_cps_reset(void) {
   dynamic_cps.phase_probe_vclock_dwt_adjusted = 0;
   dynamic_cps.phase_probe_adjusted_difference_cycles = 0;
   dynamic_cps.phase_probe_phase_offset_cycles = 0;
+  dynamic_cps.last_completed_dynamic_prediction_cycle_count = 0;
+  dynamic_cps.last_completed_dynamic_prediction_adjust_count = 0;
+  dynamic_cps.last_completed_dynamic_prediction_invalid_count = 0;
+  dynamic_cps.last_completed_dynamic_prediction_valid_count = 0;
+  dynamic_cps.last_completed_dynamic_prediction_adjust_cycles = 0;
   dynamic_cps.history_head = 0;
   dynamic_cps.history_count = 0;
   dynamic_cps_reset_second_locked();
@@ -1088,6 +1108,16 @@ time_dynamic_cps_snapshot_t time_dynamic_cps_snapshot(void) {
         (int32_t)((int64_t)dynamic_cps.current_cycles - (int64_t)dynamic_cps.base_cycles);
     out.last_reseed_value = dynamic_cps.last_reseed_value;
     out.last_reseed_was_computed = dynamic_cps.last_reseed_was_computed;
+    out.last_completed_dynamic_prediction_cycle_count =
+        dynamic_cps.last_completed_dynamic_prediction_cycle_count;
+    out.last_completed_dynamic_prediction_adjust_count =
+        dynamic_cps.last_completed_dynamic_prediction_adjust_count;
+    out.last_completed_dynamic_prediction_invalid_count =
+        dynamic_cps.last_completed_dynamic_prediction_invalid_count;
+    out.last_completed_dynamic_prediction_valid_count =
+        dynamic_cps.last_completed_dynamic_prediction_valid_count;
+    out.last_completed_dynamic_prediction_adjust_cycles =
+        dynamic_cps.last_completed_dynamic_prediction_adjust_cycles;
 
     out.phase_probe_valid = dynamic_cps.phase_probe_valid;
     out.phase_probe_pps_sequence = dynamic_cps.phase_probe_pps_sequence;
@@ -1322,6 +1352,16 @@ static void add_dynamic_cps_scalars(Payload& out) {
   out.add("dynamic_cps_net_adjustment_cycles", c.net_adjustment_cycles);
   out.add("dynamic_cps_last_reseed_value", c.last_reseed_value);
   out.add("dynamic_cps_last_reseed_was_computed", c.last_reseed_was_computed);
+  out.add("dynamic_cps_last_completed_cycle_count",
+          c.last_completed_dynamic_prediction_cycle_count);
+  out.add("dynamic_cps_last_completed_adjust_count",
+          c.last_completed_dynamic_prediction_adjust_count);
+  out.add("dynamic_cps_last_completed_invalid_count",
+          c.last_completed_dynamic_prediction_invalid_count);
+  out.add("dynamic_cps_last_completed_valid_count",
+          c.last_completed_dynamic_prediction_valid_count);
+  out.add("dynamic_cps_last_completed_adjust_cycles",
+          c.last_completed_dynamic_prediction_adjust_cycles);
 
   out.add("dynamic_cps_phase_probe_valid", c.phase_probe_valid);
   out.add("dynamic_cps_phase_probe_pps_sequence", c.phase_probe_pps_sequence);
