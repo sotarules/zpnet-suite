@@ -2,38 +2,32 @@
 // process_witness.cpp
 // ============================================================================
 //
-// process_witness owns the local hardware latency witnesses:
+// process_witness owns local timing witness instrumentation.  The local
+// hardware ROUND_TRIP rail remains intentionally low-level:
 //
-//   • Stimulus source pin  — foreground TimePop callback drives HIGH/LOW.
+//   • Stimulus source pin  — TimePop callback drives HIGH/LOW.
 //   • GPIO sink            — GPIO interrupt sees the source rising edge.
 //   • QTimer2 CH0 sink     — external-count compare sees stimulus edges.
 //
-// This version preserves the old process_interrupt witness_latency
-// QTimer lifecycle while using a deterministic four-edge measurement cycle:
+// The PPS/VCLOCK bridge and phase witness no longer use QTimer1 CH1 or any
+// process_interrupt-hosted compare plumbing.  They are ordinary TimePop
+// scheduled clients.  TimePop authors one shared fire fact for each scheduled
+// event: fire_vclock_raw, fire_dwt_cyccnt, and fire_gnss_ns.  Witness consumes
+// those facts exactly like any other TimePop client.
 //
-//   • QTimer2 CH0 is initialized once and left live.
-//   • QTimer compare is armed as COMP1 = current CNTR + 1.
-//   • The QTimer ISR clears TCF1, records the sample, then immediately
-//     re-arms COMP1 = current CNTR + 1.
-//   • No per-slot QTimer teardown.
-//   • No SCTRL.TCFIE path.
-//   • GPIO and QTimer measurements occur in separated windows.
-//
-// The scheduler is a single 1 Hz supervisor that arms four one-shot edges
-// at 200, 400, 600, and 800 ms.  This avoids top-of-second PPS activity
-// and makes the stimulus visually regular.
+// Witness is always-on after initialization.  There are no START/STOP commands;
+// the process is safe to run continuously because the operational bridge and
+// phase reports are TimePop clients on the canonical PPS/VCLOCK timing rail.
 //
 // Current command surface:
-//   START         — enable full witness instrumentation/circus.
-//   STOP          — cancel witness timers/hooks and return to quiet state.
 //   REPORT        — lifecycle/hardware/timer state.
 //   EDGE          — PPS/PPS_VCLOCK heartbeat + last edge facts.
-//   BRIDGE        — DWT/GNSS bridge check using interrupt-owned QTimer1 CH1.
+//   BRIDGE        — DWT/GNSS bridge check using TimePop fire facts.
 //   GPIO_DELAY    — simple digitalWriteFast HIGH stimulus cost.
 //   QTIMER_READ   — GPIO ISR-to-VCLOCK counter observation delay/cost.
 //   DWT_READ      — consecutive DWT read-cost measurement.
-//   ENTRY_LATENCY — spin-shadow ISR entry latency for PPS and QTimer.
-//   PPS_PHASE     — PPS notification vs selected VCLOCK edge phase.
+//   ENTRY_LATENCY — spin-shadow ISR entry latency for PPS.
+//   PPS_PHASE     — PPS/VCLOCK phase inferred from TimePop witness events.
 //   ROUND_TRIP    — source, GPIO sink, and QTimer sink latency stats.
 //
 // Test cadence:
@@ -78,6 +72,8 @@ static constexpr const char* GPIO_LOW_NAME    = "WITNESS_GPIO_LOW";
 static constexpr const char* QTIMER_HIGH_NAME = "WITNESS_QTIMER_HIGH";
 static constexpr const char* QTIMER_LOW_NAME  = "WITNESS_QTIMER_LOW";
 static constexpr const char* WITNESS_CYCLE_NAME = "WITNESS_CYCLE";
+static constexpr const char* WITNESS_BRIDGE_NAME = "WITNESS_BRIDGE";
+static constexpr const char* WITNESS_SCHEDULER_NAME = "WITNESS_SCHEDULER";
 
 static constexpr uint64_t ENTRY_LATENCY_LEAD_NS = 5000ULL;
 static constexpr uint32_t ENTRY_LATENCY_TIMEOUT_CYCLES = 100000U;  // ~99 us @ 1.008 GHz
@@ -282,49 +278,44 @@ static entry_latency_state_t g_entry_pps = {};
 static entry_latency_state_t g_entry_qtimer = {};
 
 // ============================================================================
-// PPS_PHASE — raw notification and inferred physical PPS/VCLOCK phase
+// PPS_PHASE — TimePop-authored PPS/VCLOCK phase witness
 // ============================================================================
 //
-// PPS_PHASE piggybacks on the interrupt-owned CH1 BRIDGE compare event.  It
-// compares the PPS GPIO ISR first-instruction raw DWT against the CH1 compare
-// ISR first-instruction raw DWT, then subtracts the deliberately requested
-// VCLOCK tick offset to infer the physical phase between PPS and the selected
-// VCLOCK edge.
-//
-// The inferred physical phase uses the best current pin-arrival model from
-// ROUND_TRIP: GPIO_TOTAL_LATENCY - WITNESS_STIMULATE_LATENCY for PPS, and
-// QTIMER_TOTAL_LATENCY - WITNESS_STIMULATE_LATENCY for QTimer.
-//
-// The result is intentionally NOT reduced modulo one VCLOCK tick: if the
-// selected edge is more than one tick away from PPS, we want to see the full
-// offset.
+// PPS_PHASE now rides on the TimePop BRIDGE scheduled client.  There is no
+// QTimer1 CH1 compare, no CH1 ISR raw notification, and no private hardware
+// rail.  The TimePop callback supplies an authored fire fact; witness walks
+// that fact backward by the VCLOCK tick offset to infer the selected
+// PPS/VCLOCK DWT coordinate and compares it with the canonical PPS/VCLOCK
+// anchor from process_interrupt.
 
 struct pps_phase_capture_t {
   uint32_t seq = 0;
   bool     valid = false;
 
   uint32_t pps_sequence = 0;
-  uint32_t qtimer_sequence = 0;
+  uint32_t pvc_sequence = 0;
 
-  uint32_t pps_isr_entry_dwt_raw = 0;
-  uint32_t vclock_isr_entry_dwt_raw = 0;
-  uint32_t raw_notification_delta_cycles = 0;
+  uint32_t pps_dwt_at_edge = 0;
+  uint32_t pvc_dwt_at_edge = 0;
+  uint32_t pvc_counter32_at_edge = 0;
+  int64_t  pvc_gnss_ns_at_edge = -1;
 
-  uint32_t pps_counter32_at_edge = 0;
-  uint32_t pps_vclock_counter32_at_edge = 0;
-  uint32_t target_counter32 = 0;
-  uint32_t counter32_at_fire = 0;
-  uint32_t selected_to_target_ticks = 0;
-  uint64_t selected_to_target_ns = 0;
+  uint32_t timepop_deadline = 0;
+  uint32_t timepop_fire_vclock_raw = 0;
+  uint32_t timepop_fire_dwt = 0;
+  int64_t  timepop_fire_gnss_ns = -1;
+
+  uint32_t selected_to_fire_ticks = 0;
+  uint64_t selected_to_fire_ns = 0;
 
   uint32_t dynamic_cps = 0;
   uint32_t expected_offset_cycles = 0;
+  uint32_t inferred_pvc_dwt_from_timepop = 0;
 
-  int32_t  pps_pin_to_isr_cycles = 0;
-  int32_t  qtimer_pin_to_isr_cycles = 0;
-  int64_t  selected_physical_phase_cycles = 0;
-  double   selected_physical_phase_ticks = 0.0;
-  bool     greater_than_one_vclock_tick = false;
+  int32_t  timepop_vs_pvc_phase_cycles = 0;
+  double   timepop_vs_pvc_phase_ticks = 0.0;
+  int32_t  physical_pps_to_selected_vclock_cycles = 0;
+  double   physical_pps_to_selected_vclock_ticks = 0.0;
 };
 
 static pps_phase_capture_t g_phase_last = {};
@@ -335,25 +326,20 @@ static volatile uint32_t g_phase_samples = 0;
 static volatile uint32_t g_phase_skipped_no_pps_raw = 0;
 static volatile uint32_t g_phase_skipped_sequence_mismatch = 0;
 static volatile uint32_t g_phase_skipped_no_dynamic_cps = 0;
-static welford_t g_phase_notification_welford = {};
-static welford_t g_phase_selected_physical_welford = {};
+static welford_t g_phase_timepop_vs_pvc_welford = {};
+static welford_t g_phase_physical_pps_to_selected_welford = {};
 
 // ============================================================================
-// BRIDGE — DWT/GNSS bridge validation against VCLOCK truth
+// BRIDGE — DWT/GNSS bridge validation against TimePop/VCLOCK truth
 // ============================================================================
 //
-// One fixed sub-second sample per PPS_VCLOCK second.  VCLOCK is the ground
-// truth: gnss_from_vclock_ns is authored from PPS_VCLOCK + counter ticks.
-// The test asks whether time_dwt_to_gnss_ns(dwt_at_fire) returns the same
-// value for the DWT captured at the compare ISR.
+// One fixed sub-second TimePop client per PPS/VCLOCK second.  TimePop supplies
+// the truth tuple: fire_vclock_raw, fire_dwt_cyccnt, fire_gnss_ns.  The test
+// asks whether time_dwt_to_gnss_ns(fire_dwt_cyccnt) returns the same GNSS
+// coordinate.
 
 static constexpr uint8_t  BRIDGE_SLOT_INDEX = 5;
-// Deliberately not exactly 500 ms: avoiding exact millisecond phase prevents
-// CH1 BRIDGE from colliding with the production CH3 1 kHz cadence in the
-// shared QTimer1 vector.
-static constexpr uint32_t BRIDGE_SLOT_OFFSET_TICKS = 5000123U;
-static constexpr uint64_t BRIDGE_SLOT_OFFSET_NS =
-    (uint64_t)BRIDGE_SLOT_OFFSET_TICKS * 100ULL;
+static constexpr uint64_t BRIDGE_SLOT_OFFSET_NS = 500000000ULL;
 
 struct bridge_capture_t {
   uint32_t seq = 0;
@@ -406,21 +392,13 @@ static void gpio_high_callback(timepop_ctx_t*, timepop_diag_t*, void*);
 static void gpio_low_callback(timepop_ctx_t*, timepop_diag_t*, void*);
 static void qtimer_high_callback(timepop_ctx_t*, timepop_diag_t*, void*);
 static void qtimer_low_callback(timepop_ctx_t*, timepop_diag_t*, void*);
-static void witness_cycle_callback(timepop_ctx_t*, timepop_diag_t*, void*);
+static void witness_scheduler_callback(timepop_ctx_t*, timepop_diag_t*, void*);
+static void witness_bridge_callback(timepop_ctx_t*, timepop_diag_t*, void*);
 static void entry_latency_pps_spin_callback(timepop_ctx_t*, timepop_diag_t*, void*);
-static void entry_latency_qtimer_spin_callback(timepop_ctx_t*, timepop_diag_t*, void*);
 static void entry_latency_pps_isr_handler(uint32_t sequence, uint32_t isr_entry_dwt_raw);
 static bool entry_latency_arm_pps_spin(void);
-static bool entry_latency_arm_qtimer_spin(uint32_t target_counter32);
-static void bridge_ch1_handler(const interrupt_qtimer1_ch1_compare_event_t& event);
-static bool bridge_arm_next_sample(void);
-static void pps_phase_capture(const interrupt_qtimer1_ch1_compare_event_t& event,
-                              const pps_t& pps,
-                              const pps_vclock_t& pvc,
-                              uint32_t dynamic_cps);
 static void qtimer2_arm_next_edge(void);
-static bool witness_start_activity(void);
-static void witness_stop_activity(void);
+static bool witness_ensure_scheduled(void);
 static Payload witness_state_payload(void);
 
 // ============================================================================
@@ -581,13 +559,6 @@ static void entry_latency_spin(entry_latency_state_t& s) {
   }
 }
 
-static int64_t entry_latency_target_gnss_for_counter(uint32_t target_counter32) {
-  const pps_vclock_t pvc = interrupt_last_pps_vclock();
-  if (pvc.sequence == 0 || pvc.gnss_ns_at_edge < 0) return -1;
-  const uint32_t ticks_since_anchor = target_counter32 - pvc.counter32_at_edge;
-  return pvc.gnss_ns_at_edge + (int64_t)ticks_since_anchor * 100LL;
-}
-
 static bool entry_latency_arm_pps_spin(void) {
   if (!g_witness_running) return false;
 
@@ -622,55 +593,12 @@ static bool entry_latency_arm_pps_spin(void) {
   return true;
 }
 
-static bool entry_latency_arm_qtimer_spin(uint32_t target_counter32) {
-  if (!g_witness_running) return false;
-
-  const int64_t target_event_gnss_ns =
-      entry_latency_target_gnss_for_counter(target_counter32);
-  if (target_event_gnss_ns < 0) {
-    g_entry_qtimer.arm_failures++;
-    return false;
-  }
-
-  const int64_t spin_target_gnss_ns =
-      target_event_gnss_ns - (int64_t)ENTRY_LATENCY_LEAD_NS;
-  const int64_t now_gnss_ns = time_gnss_ns_now();
-  if (now_gnss_ns >= 0 && spin_target_gnss_ns <= now_gnss_ns) {
-    g_entry_qtimer.arm_failures++;
-    return false;
-  }
-
-  timepop_cancel_by_name(ENTRY_QTIMER_SPIN_NAME);
-  const timepop_handle_t h =
-      timepop_arm_at(spin_target_gnss_ns,
-                     false,
-                     entry_latency_qtimer_spin_callback,
-                     nullptr,
-                     ENTRY_QTIMER_SPIN_NAME);
-  if (h == TIMEPOP_INVALID_HANDLE) {
-    g_entry_qtimer.armed = false;
-    g_entry_qtimer.arm_failures++;
-    return false;
-  }
-
-  g_entry_qtimer.armed = true;
-  g_entry_qtimer.arm_count++;
-  return true;
-}
-
 static void entry_latency_pps_spin_callback(timepop_ctx_t*, timepop_diag_t*, void*) {
   if (!g_witness_running) return;
 
   g_entry_pps.armed = false;
   entry_latency_spin(g_entry_pps);
   (void)entry_latency_arm_pps_spin();
-}
-
-static void entry_latency_qtimer_spin_callback(timepop_ctx_t*, timepop_diag_t*, void*) {
-  if (!g_witness_running) return;
-
-  g_entry_qtimer.armed = false;
-  entry_latency_spin(g_entry_qtimer);
 }
 
 static void entry_latency_pps_isr_handler(uint32_t sequence,
@@ -800,167 +728,120 @@ static void qtimer_low_callback(timepop_ctx_t*, timepop_diag_t*, void*) {
   g_active_window = witness_window_t::NONE;
 }
 
-static void witness_cancel_edge_callbacks(void) {
+static void witness_cancel_periodic_callbacks(void) {
   timepop_cancel_by_name(GPIO_HIGH_NAME);
   timepop_cancel_by_name(GPIO_LOW_NAME);
   timepop_cancel_by_name(QTIMER_HIGH_NAME);
   timepop_cancel_by_name(QTIMER_LOW_NAME);
+  timepop_cancel_by_name(WITNESS_BRIDGE_NAME);
 }
 
-static void witness_arm_cycle_edges(void) {
-  witness_cancel_edge_callbacks();
+static bool witness_arm_recurring_at_offset(const char* name,
+                                            uint64_t offset_ns,
+                                            timepop_callback_t callback) {
+  const time_anchor_snapshot_t snap = time_anchor_snapshot();
+  if (!snap.ok || !snap.valid || snap.pps_count < 1) return false;
 
-  timepop_arm(GPIO_HIGH_OFFSET_NS,
-              false,
-              gpio_high_callback,
-              nullptr,
-              GPIO_HIGH_NAME);
-
-  timepop_arm(GPIO_LOW_OFFSET_NS,
-              false,
-              gpio_low_callback,
-              nullptr,
-              GPIO_LOW_NAME);
-
-  timepop_arm(QTIMER_HIGH_OFFSET_NS,
-              false,
-              qtimer_high_callback,
-              nullptr,
-              QTIMER_HIGH_NAME);
-
-  timepop_arm(QTIMER_LOW_OFFSET_NS,
-              false,
-              qtimer_low_callback,
-              nullptr,
-              QTIMER_LOW_NAME);
-
-  g_witness_cycle_reschedules++;
-}
-
-static void witness_cycle_callback(timepop_ctx_t*, timepop_diag_t*, void*) {
-  if (!g_witness_running) return;
-
-  g_witness_cycle_count++;
-
-  // Start every cycle from a known, quiet witness state.  The QTimer rail
-  // remains continuously armed; only GPIO and the stimulus pin are reset.
-  detachInterrupt(digitalPinToInterrupt(WITNESS_GPIO_PIN));
-  digitalWriteFast(WITNESS_STIMULUS_PIN, LOW);
-  g_source_high = false;
-  g_active_window = witness_window_t::NONE;
-  g_witness_cycle_count = 0;
-  g_witness_cycle_reschedules = 0;
-
-  witness_arm_cycle_edges();
-  if (!g_bridge_armed) {
-    (void)bridge_arm_next_sample();
+  int64_t anchor_ns = (int64_t)(snap.pps_count - 1) * (int64_t)NS_PER_SECOND;
+  int64_t target_ns = anchor_ns + (int64_t)offset_ns;
+  const int64_t now_ns = time_gnss_ns_now();
+  while (now_ns >= 0 && target_ns <= now_ns) {
+    anchor_ns += (int64_t)NS_PER_SECOND;
+    target_ns = anchor_ns + (int64_t)offset_ns;
   }
+
+  timepop_cancel_by_name(name);
+  const timepop_handle_t h =
+      timepop_arm_from_anchor(anchor_ns,
+                              (int64_t)offset_ns,
+                              true,
+                              callback,
+                              nullptr,
+                              name);
+  return h != TIMEPOP_INVALID_HANDLE;
+}
+
+static bool witness_arm_periodic_clients(void) {
+  if (!g_witness_runtime_ready || !g_witness_running) return false;
+
+  witness_cancel_periodic_callbacks();
+
+  bool ok = true;
+  ok = witness_arm_recurring_at_offset(GPIO_HIGH_NAME,
+                                       GPIO_HIGH_OFFSET_NS,
+                                       gpio_high_callback) && ok;
+  ok = witness_arm_recurring_at_offset(GPIO_LOW_NAME,
+                                       GPIO_LOW_OFFSET_NS,
+                                       gpio_low_callback) && ok;
+  ok = witness_arm_recurring_at_offset(QTIMER_HIGH_NAME,
+                                       QTIMER_HIGH_OFFSET_NS,
+                                       qtimer_high_callback) && ok;
+  ok = witness_arm_recurring_at_offset(QTIMER_LOW_NAME,
+                                       QTIMER_LOW_OFFSET_NS,
+                                       qtimer_low_callback) && ok;
+  ok = witness_arm_recurring_at_offset(WITNESS_BRIDGE_NAME,
+                                       BRIDGE_SLOT_OFFSET_NS,
+                                       witness_bridge_callback) && ok;
+
+  if (ok) {
+    g_witness_schedule_armed = true;
+    g_bridge_armed = true;
+    g_bridge_arm_count++;
+    const time_anchor_snapshot_t snap = time_anchor_snapshot();
+    g_bridge_last_armed_target_counter32 =
+        snap.counter32_at_pps_vclock + (uint32_t)(BRIDGE_SLOT_OFFSET_NS / 100ULL);
+    g_witness_cycle_reschedules++;
+  } else {
+    g_witness_schedule_armed = false;
+    g_bridge_armed = false;
+    g_bridge_arm_failures++;
+  }
+
+  return ok;
+}
+
+static bool witness_ensure_scheduled(void) {
+  if (!g_witness_runtime_ready || !g_witness_running) return false;
+
+  if (!g_witness_schedule_armed) {
+    return witness_arm_periodic_clients();
+  }
+
   if (!g_entry_pps.armed && !g_entry_pps.spin_active) {
     (void)entry_latency_arm_pps_spin();
   }
+
+  return true;
 }
 
-static void witness_schedule_first_test(void) {
+static void witness_scheduler_callback(timepop_ctx_t*, timepop_diag_t*, void*) {
   if (!g_witness_running) return;
-  if (g_witness_schedule_armed) return;
-
-  timepop_cancel_by_name(WITNESS_CYCLE_NAME);
-  witness_cancel_edge_callbacks();
-
-  timepop_arm(WITNESS_CYCLE_PERIOD_NS,
-              true,
-              witness_cycle_callback,
-              nullptr,
-              WITNESS_CYCLE_NAME);
-
-  (void)bridge_arm_next_sample();
-
-  g_witness_schedule_armed = true;
-
-  // Arm the first second immediately; subsequent seconds are regenerated by
-  // the recurring supervisor.  This avoids chains of child callbacks.
   g_witness_cycle_count++;
-  witness_arm_cycle_edges();
+  (void)witness_ensure_scheduled();
 }
 
-// ============================================================================
-// START / STOP lifecycle
-// ============================================================================
-
-static void witness_cancel_all_timepop_callbacks(void) {
-  timepop_cancel_by_name(WITNESS_CYCLE_NAME);
-  witness_cancel_edge_callbacks();
-  timepop_cancel_by_name(ENTRY_PPS_SPIN_NAME);
-  timepop_cancel_by_name(ENTRY_QTIMER_SPIN_NAME);
+static void witness_arm_scheduler(void) {
+  timepop_cancel_by_name(WITNESS_SCHEDULER_NAME);
+  (void)timepop_arm(WITNESS_CYCLE_PERIOD_NS,
+                    true,
+                    witness_scheduler_callback,
+                    nullptr,
+                    WITNESS_SCHEDULER_NAME);
 }
 
-static void witness_quiesce_outputs_and_irqs(void) {
-  detachInterrupt(digitalPinToInterrupt(WITNESS_GPIO_PIN));
-  digitalWriteFast(WITNESS_STIMULUS_PIN, LOW);
-  g_source_high = false;
-  g_active_window = witness_window_t::NONE;
-
-  qtimer2_ch0_disable_compare();
-
-  interrupt_qtimer1_ch1_disable_compare();
-  interrupt_register_qtimer1_ch1_handler(nullptr);
-  interrupt_register_pps_entry_latency_handler(nullptr);
-}
-
-static void witness_clear_live_flags(void) {
-  g_witness_schedule_armed = false;
-  g_bridge_armed = false;
-
-  g_entry_pps.armed = false;
-  g_entry_pps.spin_active = false;
-  g_entry_qtimer.armed = false;
-  g_entry_qtimer.spin_active = false;
-
-  g_active_window = witness_window_t::NONE;
-}
-
-static bool witness_start_activity(void) {
-  if (!g_witness_runtime_ready) return false;
-
-  if (g_witness_running) {
-    return true;
-  }
-
-  // Begin from a fully quiet state.  This handles stale callbacks left over
-  // from an interrupted prior run and makes START idempotent from the outside.
-  witness_cancel_all_timepop_callbacks();
-  witness_quiesce_outputs_and_irqs();
-  witness_clear_live_flags();
+static void witness_start_always_on(void) {
+  if (!g_witness_runtime_ready) return;
 
   g_witness_running = true;
   g_witness_start_count++;
   g_witness_last_start_dwt = ARM_DWT_CYCCNT;
 
-  // These hooks are intentionally registered only while witness is running.
-  // STOP removes them so the timing hot paths stay quiet during campaign init.
-  interrupt_register_qtimer1_ch1_handler(bridge_ch1_handler);
   interrupt_register_pps_entry_latency_handler(entry_latency_pps_isr_handler);
 
-  // Full circus: round-trip supervisor, QTimer2 sink rail, CH1 bridge, and
-  // PPS entry-latency spin.  Individual commands may also re-arm their own
-  // instruments, but START brings the legacy always-on witness behavior back.
   qtimer2_arm_next_edge();
-  witness_schedule_first_test();
+  witness_arm_scheduler();
+  (void)witness_ensure_scheduled();
   (void)entry_latency_arm_pps_spin();
-
-  return true;
-}
-
-static void witness_stop_activity(void) {
-  if (!g_witness_runtime_ready && !g_witness_running) return;
-
-  g_witness_running = false;
-  g_witness_stop_count++;
-  g_witness_last_stop_dwt = ARM_DWT_CYCCNT;
-
-  witness_cancel_all_timepop_callbacks();
-  witness_quiesce_outputs_and_irqs();
-  witness_clear_live_flags();
 }
 
 // ============================================================================
@@ -1033,15 +914,6 @@ static Payload witness_state_payload(void) {
   timepop_state.add("entry_qtimer_spin_active", g_entry_qtimer.spin_active);
   p.add_object("timepop", timepop_state);
 
-  const uint16_t ch1_csctrl = interrupt_qtimer1_ch1_csctrl_now();
-  Payload qtimer1_ch1;
-  qtimer1_ch1.add("counter", (uint32_t)interrupt_qtimer1_ch1_counter_now());
-  qtimer1_ch1.add("comp1", (uint32_t)interrupt_qtimer1_ch1_comp1_now());
-  qtimer1_ch1.add("csctrl", (uint32_t)ch1_csctrl);
-  qtimer1_ch1.add("compare_enabled", (bool)(ch1_csctrl & TMR_CSCTRL_TCF1EN));
-  qtimer1_ch1.add("compare_flag", (bool)(ch1_csctrl & TMR_CSCTRL_TCF1));
-  p.add_object("qtimer1_ch1_bridge", qtimer1_ch1);
-
   Payload qtimer2;
   qtimer2.add("counter", (uint32_t)IMXRT_TMR2.CH[0].CNTR);
   qtimer2.add("comp1", (uint32_t)IMXRT_TMR2.CH[0].COMP1);
@@ -1095,152 +967,99 @@ static Payload witness_state_payload(void) {
   return p;
 }
 
-static bool bridge_arm_next_sample(void) {
-  if (!g_witness_running) return false;
-
+static void pps_phase_capture_from_timepop(const timepop_ctx_t& ctx) {
+  const pps_t pps = witness_last_physical_pps_diag();
   const pps_vclock_t pvc = interrupt_last_pps_vclock();
   if (pvc.sequence == 0 || pvc.gnss_ns_at_edge < 0) {
-    g_bridge_skipped_no_anchor++;
-    return false;
-  }
-
-  uint32_t target_counter32 = pvc.counter32_at_edge + BRIDGE_SLOT_OFFSET_TICKS;
-
-  // If this second's sample has already passed, target the same offset in the
-  // next VCLOCK second.  This uses synthetic counter arithmetic only; no
-  // direct QTimer1 register read occurs in process_witness.
-  const uint32_t now = interrupt_vclock_counter32_observe_ambient();
-  if ((int32_t)(target_counter32 - now) <= 1000) {
-    target_counter32 += 10000000U;
-  }
-
-  g_bridge_last_armed_target_counter32 = target_counter32;
-  g_bridge_arm_count++;
-
-  if (!interrupt_qtimer1_ch1_arm_compare(target_counter32)) {
-    g_bridge_armed = false;
-    g_bridge_arm_failures++;
-    return false;
-  }
-
-  g_bridge_armed = true;
-  (void)entry_latency_arm_qtimer_spin(target_counter32);
-  return true;
-}
-
-static void pps_phase_capture(const interrupt_qtimer1_ch1_compare_event_t& event,
-                              const pps_t& pps,
-                              const pps_vclock_t& pvc,
-                              uint32_t dynamic_cps) {
-  if (g_phase_pps_sequence == 0 || g_phase_pps_isr_entry_dwt_raw == 0) {
-    g_phase_skipped_no_pps_raw++;
-    return;
-  }
-
-  if (g_phase_pps_sequence != pvc.sequence) {
     g_phase_skipped_sequence_mismatch++;
     return;
   }
 
+  const uint32_t dynamic_cps = interrupt_dynamic_cps();
   if (dynamic_cps == 0) {
     g_phase_skipped_no_dynamic_cps++;
     return;
   }
 
-  const uint32_t pps_raw = g_phase_pps_isr_entry_dwt_raw;
-  const uint32_t vclock_raw = event.isr_entry_dwt_raw;
-  const uint32_t raw_delta_cycles = vclock_raw - pps_raw;
-  const uint32_t selected_to_target_ticks = event.target_counter32 - pvc.counter32_at_edge;
-  const uint64_t selected_to_target_ns = (uint64_t)selected_to_target_ticks * 100ULL;
+  const uint32_t selected_to_fire_ticks = ctx.fire_vclock_raw - pvc.counter32_at_edge;
+  const uint64_t selected_to_fire_ns = (uint64_t)selected_to_fire_ticks * 100ULL;
 
   const uint32_t expected_offset_cycles =
-      (uint32_t)(((uint64_t)selected_to_target_ticks * (uint64_t)dynamic_cps +
+      (uint32_t)(((uint64_t)selected_to_fire_ticks * (uint64_t)dynamic_cps +
                   (uint64_t)VCLOCK_TICKS_PER_SECOND_U32 / 2ULL) /
                  (uint64_t)VCLOCK_TICKS_PER_SECOND_U32);
 
-  // Best estimate of selected-VCLOCK-edge physical phase at the Teensy pins:
-  //   qtimer_pin_time - pps_pin_time
-  // = (qtimer_isr_raw - qtimer_pin_to_isr)
-  //   - (pps_isr_raw - pps_pin_to_isr)
-  //   - selected_to_target_offset
-  // = raw_delta + pps_pin_to_isr - qtimer_pin_to_isr - expected_offset.
-  const int64_t selected_physical_phase_cycles =
-      (int64_t)raw_delta_cycles +
-      (int64_t)PPS_PIN_TO_ISR_CYCLES -
-      (int64_t)QTIMER_PIN_TO_ISR_CYCLES -
-      (int64_t)expected_offset_cycles;
+  const uint32_t inferred_pvc_dwt = ctx.fire_dwt_cyccnt - expected_offset_cycles;
+  const int32_t timepop_vs_pvc_phase =
+      (int32_t)((int64_t)inferred_pvc_dwt - (int64_t)pvc.dwt_at_edge);
 
-  const double selected_physical_phase_ticks =
-      ((double)selected_physical_phase_cycles *
-       (double)VCLOCK_TICKS_PER_SECOND_U32) /
+  const int32_t physical_pps_to_selected =
+      (int32_t)((int64_t)pvc.dwt_at_edge - (int64_t)pps.dwt_at_edge);
+
+  const double timepop_vs_pvc_ticks =
+      ((double)timepop_vs_pvc_phase * (double)VCLOCK_TICKS_PER_SECOND_U32) /
+      (double)dynamic_cps;
+  const double physical_phase_ticks =
+      ((double)physical_pps_to_selected * (double)VCLOCK_TICKS_PER_SECOND_U32) /
       (double)dynamic_cps;
 
   pps_phase_capture_t cap;
   cap.seq = ++g_phase_capture_seq;
   cap.valid = true;
-  cap.pps_sequence = pvc.sequence;
-  cap.qtimer_sequence = event.sequence;
-  cap.pps_isr_entry_dwt_raw = pps_raw;
-  cap.vclock_isr_entry_dwt_raw = vclock_raw;
-  cap.raw_notification_delta_cycles = raw_delta_cycles;
-  cap.pps_counter32_at_edge = pps.counter32_at_edge;
-  cap.pps_vclock_counter32_at_edge = pvc.counter32_at_edge;
-  cap.target_counter32 = event.target_counter32;
-  cap.counter32_at_fire = event.counter32_at_event;
-  cap.selected_to_target_ticks = selected_to_target_ticks;
-  cap.selected_to_target_ns = selected_to_target_ns;
+  cap.pps_sequence = pps.sequence;
+  cap.pvc_sequence = pvc.sequence;
+  cap.pps_dwt_at_edge = pps.dwt_at_edge;
+  cap.pvc_dwt_at_edge = pvc.dwt_at_edge;
+  cap.pvc_counter32_at_edge = pvc.counter32_at_edge;
+  cap.pvc_gnss_ns_at_edge = pvc.gnss_ns_at_edge;
+  cap.timepop_deadline = ctx.deadline;
+  cap.timepop_fire_vclock_raw = ctx.fire_vclock_raw;
+  cap.timepop_fire_dwt = ctx.fire_dwt_cyccnt;
+  cap.timepop_fire_gnss_ns = ctx.fire_gnss_ns;
+  cap.selected_to_fire_ticks = selected_to_fire_ticks;
+  cap.selected_to_fire_ns = selected_to_fire_ns;
   cap.dynamic_cps = dynamic_cps;
   cap.expected_offset_cycles = expected_offset_cycles;
-  cap.pps_pin_to_isr_cycles = PPS_PIN_TO_ISR_CYCLES;
-  cap.qtimer_pin_to_isr_cycles = QTIMER_PIN_TO_ISR_CYCLES;
-  cap.selected_physical_phase_cycles = selected_physical_phase_cycles;
-  cap.selected_physical_phase_ticks = selected_physical_phase_ticks;
-  cap.greater_than_one_vclock_tick = fabs(selected_physical_phase_ticks) > 1.0;
+  cap.inferred_pvc_dwt_from_timepop = inferred_pvc_dwt;
+  cap.timepop_vs_pvc_phase_cycles = timepop_vs_pvc_phase;
+  cap.timepop_vs_pvc_phase_ticks = timepop_vs_pvc_ticks;
+  cap.physical_pps_to_selected_vclock_cycles = physical_pps_to_selected;
+  cap.physical_pps_to_selected_vclock_ticks = physical_phase_ticks;
 
   g_phase_last = cap;
   g_phase_samples++;
-  welford_update(g_phase_notification_welford, (int32_t)raw_delta_cycles);
-  welford_update(g_phase_selected_physical_welford, (int32_t)selected_physical_phase_cycles);
+  welford_update(g_phase_timepop_vs_pvc_welford, timepop_vs_pvc_phase);
+  welford_update(g_phase_physical_pps_to_selected_welford, physical_pps_to_selected);
 }
 
-static void bridge_capture(const interrupt_qtimer1_ch1_compare_event_t& event) {
-  const pps_t pps = witness_last_physical_pps_diag();
+static void bridge_capture_from_timepop(const timepop_ctx_t& ctx) {
   const pps_vclock_t pvc = interrupt_last_pps_vclock();
   if (pvc.sequence == 0 || pvc.gnss_ns_at_edge < 0) {
     g_bridge_skipped_no_anchor++;
     return;
   }
 
-  const uint32_t qtimer_event_dwt = event.dwt_at_event;
-  const uint32_t authored_counter32 = event.counter32_at_event;
+  const uint32_t qtimer_event_dwt = ctx.fire_dwt_cyccnt;
+  const uint32_t authored_counter32 = ctx.fire_vclock_raw;
 
   const uint32_t dynamic_cps = interrupt_dynamic_cps();
   if (dynamic_cps == 0) {
     g_bridge_skipped_no_dynamic_cps++;
   }
 
-  pps_phase_capture(event, pps, pvc, dynamic_cps);
+  pps_phase_capture_from_timepop(ctx);
 
-  const uint32_t target_counter32 = event.target_counter32;
-  const int32_t counter32_residual_ticks = event.counter32_residual_ticks;
+  const uint32_t target_counter32 = ctx.deadline;
+  const int32_t counter32_residual_ticks =
+      (int32_t)((int64_t)authored_counter32 - (int64_t)target_counter32);
 
-  const uint32_t vclock_ticks_since_anchor = authored_counter32 - pvc.counter32_at_edge;
-  const int64_t gnss_from_vclock_ns =
-      pvc.gnss_ns_at_edge + (int64_t)vclock_ticks_since_anchor * 100LL;
+  const int64_t gnss_from_vclock_ns = ctx.fire_gnss_ns;
 
   const int64_t gnss_from_time_bridge_ns = time_dwt_to_gnss_ns(qtimer_event_dwt);
   const int64_t residual_ns = gnss_from_time_bridge_ns - gnss_from_vclock_ns;
 
-  int64_t gnss_from_dynamic_dwt_ns = -1;
-  int64_t dynamic_residual_ns = 0;
-  if (dynamic_cps != 0) {
-    const uint32_t dwt_delta = qtimer_event_dwt - pvc.dwt_at_edge;
-    const uint64_t ns_delta =
-        ((uint64_t)dwt_delta * 1000000000ULL + (uint64_t)dynamic_cps / 2ULL) /
-        (uint64_t)dynamic_cps;
-    gnss_from_dynamic_dwt_ns = pvc.gnss_ns_at_edge + (int64_t)ns_delta;
-    dynamic_residual_ns = gnss_from_dynamic_dwt_ns - gnss_from_vclock_ns;
-  }
+  int64_t gnss_from_dynamic_dwt_ns = gnss_from_time_bridge_ns;
+  int64_t dynamic_residual_ns = residual_ns;
 
   bridge_capture_t cap;
   cap.seq = ++g_bridge_capture_seq;
@@ -1270,21 +1089,17 @@ static void bridge_capture(const interrupt_qtimer1_ch1_compare_event_t& event) {
   }
 }
 
-static void bridge_ch1_handler(const interrupt_qtimer1_ch1_compare_event_t& event) {
-  g_bridge_armed = false;
-  if (!g_witness_running) return;
-  entry_latency_record_isr(g_entry_qtimer, event.sequence, event.isr_entry_dwt_raw);
-  bridge_capture(event);
-  (void)bridge_arm_next_sample();
+static void witness_bridge_callback(timepop_ctx_t* ctx, timepop_diag_t*, void*) {
+  if (!g_witness_running || !ctx) return;
+  g_bridge_armed = true;
+  bridge_capture_from_timepop(*ctx);
 }
 
 static Payload cmd_bridge(const Payload&) {
-  if (g_witness_running && !g_bridge_armed && g_witness_runtime_ready) {
-    (void)bridge_arm_next_sample();
-  }
+  (void)witness_ensure_scheduled();
 
   Payload p;
-  p.add("model", "DWT_GNSS_BRIDGE_VS_VCLOCK_TRUTH");
+  p.add("model", "DWT_GNSS_BRIDGE_VS_TIMEPOP_VCLOCK_TRUTH");
   p.add("slot_index", (uint32_t)BRIDGE_SLOT_INDEX);
   p.add("offset_ns", BRIDGE_SLOT_OFFSET_NS);
   p.add("fires_total", (uint32_t)g_bridge_fires_total);
@@ -1308,6 +1123,7 @@ static Payload cmd_bridge(const Payload&) {
   p.add_object("anchor", anchor);
 
   Payload event;
+  event.add("source", "TIMEPOP");
   event.add("target_counter32", cap.target_counter32);
   event.add("counter32_at_fire", cap.counter32_at_fire);
   event.add("counter32_residual_ticks", cap.counter32_residual_ticks);
@@ -1315,7 +1131,7 @@ static Payload cmd_bridge(const Payload&) {
   p.add_object("event", event);
 
   Payload truth;
-  truth.add("gnss_from_vclock_ns", cap.gnss_from_vclock_ns);
+  truth.add("gnss_from_timepop_vclock_ns", cap.gnss_from_vclock_ns);
   p.add_object("truth", truth);
 
   Payload bridge;
@@ -1338,69 +1154,63 @@ static Payload cmd_bridge(const Payload&) {
 // ============================================================================
 
 static Payload cmd_pps_phase(const Payload&) {
-  if (g_witness_running && !g_bridge_armed && g_witness_runtime_ready) {
-    (void)bridge_arm_next_sample();
-  }
+  (void)witness_ensure_scheduled();
 
   const pps_phase_capture_t cap = g_phase_last;
 
   Payload p;
-  p.add("model", "PPS_TO_SELECTED_VCLOCK_PIN_PHASE");
+  p.add("model", "PPS_TO_SELECTED_VCLOCK_TIMEPOP_PHASE");
   p.add("valid", cap.valid);
   p.add("seq", cap.seq);
   p.add("samples", g_phase_samples);
   p.add("skipped_no_pps_raw", g_phase_skipped_no_pps_raw);
   p.add("skipped_sequence_mismatch", g_phase_skipped_sequence_mismatch);
   p.add("skipped_no_dynamic_cps", g_phase_skipped_no_dynamic_cps);
-  p.add("no_modulo", true);
+  p.add("no_ch1", true);
 
-  Payload raw;
-  raw.add("pps_sequence", cap.pps_sequence);
-  raw.add("qtimer_sequence", cap.qtimer_sequence);
-  raw.add("pps_isr_entry_dwt_raw", cap.pps_isr_entry_dwt_raw);
-  raw.add("vclock_isr_entry_dwt_raw", cap.vclock_isr_entry_dwt_raw);
-  raw.add("delta_cycles", cap.raw_notification_delta_cycles);
-  raw.add("delta_ns", cycles_to_ns((double)cap.raw_notification_delta_cycles));
-  raw.add_object("welford", welford_payload(g_phase_notification_welford));
-  p.add_object("raw_notification", raw);
+  Payload anchor;
+  anchor.add("pps_sequence", cap.pps_sequence);
+  anchor.add("pvc_sequence", cap.pvc_sequence);
+  anchor.add("pps_dwt_at_edge", cap.pps_dwt_at_edge);
+  anchor.add("pvc_dwt_at_edge", cap.pvc_dwt_at_edge);
+  anchor.add("pvc_counter32_at_edge", cap.pvc_counter32_at_edge);
+  anchor.add("pvc_gnss_ns_at_edge", cap.pvc_gnss_ns_at_edge);
+  p.add_object("anchor", anchor);
 
-  Payload latency_model;
-  latency_model.add("basis", "ROUND_TRIP_MINUS_STIMULATE");
-  latency_model.add("stimulate_cycles", (uint32_t)WITNESS_STIMULATE_LATENCY);
-  latency_model.add("stimulate_ns", cycles_to_ns((double)WITNESS_STIMULATE_LATENCY));
-  latency_model.add("gpio_total_cycles", (uint32_t)GPIO_TOTAL_LATENCY);
-  latency_model.add("gpio_total_ns", cycles_to_ns((double)GPIO_TOTAL_LATENCY));
-  latency_model.add("qtimer_total_cycles", (uint32_t)QTIMER_TOTAL_LATENCY);
-  latency_model.add("qtimer_total_ns", cycles_to_ns((double)QTIMER_TOTAL_LATENCY));
-  latency_model.add("pps_pin_to_isr_cycles", cap.pps_pin_to_isr_cycles);
-  latency_model.add("pps_pin_to_isr_ns", cycles_to_ns((double)cap.pps_pin_to_isr_cycles));
-  latency_model.add("qtimer_pin_to_isr_cycles", cap.qtimer_pin_to_isr_cycles);
-  latency_model.add("qtimer_pin_to_isr_ns", cycles_to_ns((double)cap.qtimer_pin_to_isr_cycles));
-  p.add_object("pin_latency_model", latency_model);
+  Payload event;
+  event.add("source", "TIMEPOP");
+  event.add("deadline", cap.timepop_deadline);
+  event.add("fire_vclock_raw", cap.timepop_fire_vclock_raw);
+  event.add("fire_dwt", cap.timepop_fire_dwt);
+  event.add("fire_gnss_ns", cap.timepop_fire_gnss_ns);
+  p.add_object("event", event);
 
   Payload selection;
-  selection.add("pps_counter32_at_edge", cap.pps_counter32_at_edge);
-  selection.add("pps_vclock_counter32_at_edge", cap.pps_vclock_counter32_at_edge);
-  selection.add("target_counter32", cap.target_counter32);
-  selection.add("counter32_at_fire", cap.counter32_at_fire);
-  selection.add("selected_to_target_ticks", cap.selected_to_target_ticks);
-  selection.add("selected_to_target_ns", cap.selected_to_target_ns);
+  selection.add("selected_to_fire_ticks", cap.selected_to_fire_ticks);
+  selection.add("selected_to_fire_ns", cap.selected_to_fire_ns);
   selection.add("expected_offset_cycles", cap.expected_offset_cycles);
   selection.add("expected_offset_ns", cycles_to_ns((double)cap.expected_offset_cycles));
   selection.add("dynamic_cps", cap.dynamic_cps);
+  selection.add("inferred_pvc_dwt_from_timepop", cap.inferred_pvc_dwt_from_timepop);
   p.add_object("selection", selection);
 
   Payload inferred;
-  inferred.add("phase_cycles", cap.selected_physical_phase_cycles);
-  inferred.add("phase_ns", cycles_to_ns((double)cap.selected_physical_phase_cycles));
-  inferred.add("phase_ticks", cap.selected_physical_phase_ticks);
-  inferred.add("greater_than_one_vclock_tick", cap.greater_than_one_vclock_tick);
-  inferred.add_object("welford", welford_payload(g_phase_selected_physical_welford));
-  p.add_object("inferred_physical", inferred);
+  inferred.add("timepop_vs_pvc_phase_cycles", cap.timepop_vs_pvc_phase_cycles);
+  inferred.add("timepop_vs_pvc_phase_ns", cycles_to_ns((double)cap.timepop_vs_pvc_phase_cycles));
+  inferred.add("timepop_vs_pvc_phase_ticks", cap.timepop_vs_pvc_phase_ticks);
+  inferred.add_object("timepop_vs_pvc_welford", welford_payload(g_phase_timepop_vs_pvc_welford));
+  inferred.add("physical_pps_to_selected_vclock_cycles", cap.physical_pps_to_selected_vclock_cycles);
+  inferred.add("physical_pps_to_selected_vclock_ns", cycles_to_ns((double)cap.physical_pps_to_selected_vclock_cycles));
+  inferred.add("physical_pps_to_selected_vclock_ticks", cap.physical_pps_to_selected_vclock_ticks);
+  inferred.add_object("physical_welford", welford_payload(g_phase_physical_pps_to_selected_welford));
+  p.add_object("inferred", inferred);
 
   return p;
 }
 
+// ============================================================================
+// GPIO_DELAY command
+// ============================================================================
 // ============================================================================
 // GPIO_DELAY command
 // ============================================================================
@@ -1453,9 +1263,7 @@ static Payload cmd_dwt_read(const Payload&) {
 // ============================================================================
 
 static Payload cmd_qtimer_read(const Payload&) {
-  if (g_witness_running && !g_witness_schedule_armed && g_witness_runtime_ready) {
-    witness_schedule_first_test();
-  }
+  (void)witness_ensure_scheduled();
 
   Payload p;
   p.add("model", "QTIMER_READ_FROM_GPIO_ISR");
@@ -1516,13 +1324,10 @@ static Payload entry_latency_payload(const entry_latency_state_t& s) {
 }
 
 static Payload cmd_entry_latency(const Payload&) {
-  if (g_witness_running && g_witness_runtime_ready) {
-    if (!g_entry_pps.armed && !g_entry_pps.spin_active) {
-      (void)entry_latency_arm_pps_spin();
-    }
-    if (!g_bridge_armed) {
-      (void)bridge_arm_next_sample();
-    }
+  (void)witness_ensure_scheduled();
+  if (g_witness_running && g_witness_runtime_ready &&
+      !g_entry_pps.armed && !g_entry_pps.spin_active) {
+    (void)entry_latency_arm_pps_spin();
   }
 
   Payload p;
@@ -1531,46 +1336,24 @@ static Payload cmd_entry_latency(const Payload&) {
   p.add("timeout_cycles", ENTRY_LATENCY_TIMEOUT_CYCLES);
   p.add("timeout_ns", cycles_to_ns((double)ENTRY_LATENCY_TIMEOUT_CYCLES));
   p.add_object("pps", entry_latency_payload(g_entry_pps));
-  p.add_object("qtimer", entry_latency_payload(g_entry_qtimer));
   return p;
 }
 
 // ============================================================================
-// START / STOP / REPORT commands
+// REPORT command
 // ============================================================================
-
-static Payload cmd_start(const Payload&) {
-  Payload p;
-  if (!g_witness_runtime_ready) {
-    p.add("status", "not_ready");
-    p.add_object("state", witness_state_payload());
-    return p;
-  }
-
-  const bool already_running = g_witness_running;
-  const bool ok = witness_start_activity();
-  p.add("status", ok ? (already_running ? "already_running" : "started") : "start_failed");
-  p.add_object("state", witness_state_payload());
-  return p;
-}
-
-static Payload cmd_stop(const Payload&) {
-  const bool was_running = g_witness_running;
-  witness_stop_activity();
-
-  Payload p;
-  p.add("status", was_running ? "stopped" : "already_stopped");
-  p.add_object("state", witness_state_payload());
-  return p;
-}
 
 static Payload cmd_report(const Payload&) {
+  (void)witness_ensure_scheduled();
+
   Payload p;
-  p.add("model", "WITNESS_LIFECYCLE_AND_HARDWARE_STATE");
+  p.add("model", "WITNESS_ALWAYS_ON_HARDWARE_AND_TIMEPOP_STATE");
   p.add_object("state", witness_state_payload());
   return p;
 }
 
+// EDGE command
+// ============================================================================
 // EDGE command
 // ============================================================================
 //
@@ -1647,9 +1430,7 @@ static Payload cmd_edge(const Payload&) {
 // ============================================================================
 
 static Payload cmd_round_trip(const Payload&) {
-  if (g_witness_running && !g_witness_schedule_armed && g_witness_runtime_ready) {
-    witness_schedule_first_test();
-  }
+  (void)witness_ensure_scheduled();
 
   Payload p;
   p.add("model", "ROUND_TRIP_LATENCY_SUMMARY");
@@ -1780,8 +1561,8 @@ void process_witness_init(void) {
   g_phase_skipped_no_pps_raw = 0;
   g_phase_skipped_sequence_mismatch = 0;
   g_phase_skipped_no_dynamic_cps = 0;
-  welford_reset(g_phase_notification_welford);
-  welford_reset(g_phase_selected_physical_welford);
+  welford_reset(g_phase_timepop_vs_pvc_welford);
+  welford_reset(g_phase_physical_pps_to_selected_welford);
 
   g_bridge_last = bridge_capture_t{};
   g_bridge_capture_seq = 0;
@@ -1795,24 +1576,24 @@ void process_witness_init(void) {
   welford_reset(g_bridge_residual_welford);
   welford_reset(g_bridge_dynamic_residual_welford);
 
-  // Witness is registered at boot but remains operationally quiet until
-  // WITNESS.START.  The hot-path hooks and timer rails are installed/armed
-  // only while running, then removed again by WITNESS.STOP.
-  interrupt_register_qtimer1_ch1_handler(nullptr);
-  interrupt_register_pps_entry_latency_handler(nullptr);
+  // Witness is always-on.  PPS entry latency remains a true low-level
+  // witness hook; BRIDGE/PPS_PHASE are ordinary TimePop clients and do not
+  // register any QTimer1 CH1 handler.
+  interrupt_register_pps_entry_latency_handler(entry_latency_pps_isr_handler);
 
   digitalWriteFast(WITNESS_STIMULUS_PIN, LOW);
 
-  // Stable QTimer rail: configured once, but compare interrupts remain
-  // disabled until START.  GPIO is attached only inside the GPIO measurement
-  // window while witness is running.
+  // Stable QTimer2 rail: configured once and left live. GPIO is attached
+  // only inside the GPIO measurement window.
   pinMode(WITNESS_GPIO_PIN, INPUT);
   detachInterrupt(digitalPinToInterrupt(WITNESS_GPIO_PIN));
   qtimer2_ch0_disable_compare();
 
-  g_witness_running = false;
+  g_witness_running = true;
   g_witness_schedule_armed = false;
   g_witness_runtime_ready = true;
+
+  witness_start_always_on();
 }
 
 void process_witness_enable_irqs(void) {
@@ -1826,8 +1607,6 @@ void process_witness_enable_irqs(void) {
 }
 
 static const process_command_entry_t WITNESS_COMMANDS[] = {
-  { "START",       cmd_start       },
-  { "STOP",        cmd_stop        },
   { "REPORT",      cmd_report      },
   { "EDGE",        cmd_edge        },
   { "BRIDGE",      cmd_bridge      },

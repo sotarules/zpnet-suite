@@ -4,35 +4,29 @@
 //
 // Local hardware witness / latency-test process.
 //
-// Current ROUND_TRIP scheduler model:
-//   • one deterministic 1 Hz supervisor
-//   • 200 ms  GPIO HIGH
-//   • 400 ms  GPIO LOW
-//   • 600 ms  QTIMER HIGH
-//   • 800 ms  QTIMER LOW
+// Always-on model:
+//   • witness initializes once and runs continuously
+//   • no START/STOP commands
+//   • BRIDGE and PPS_PHASE are regular TimePop scheduled clients
+//   • no QTimer1 CH1 compare plumbing is used by witness
 //
-// Current command surface:
-//   .tw witness start        (enable full witness instrumentation/circus)
-//   .tw witness stop         (cancel witness timers/hooks; quiet state)
-//   .tw witness report       (lifecycle/hardware/timer state)
-//   .tw witness edge         (PPS/PPS_VCLOCK heartbeat + last edge facts)
-//   .tw witness bridge       (DWT/GNSS bridge check using interrupt-owned QTimer1 CH1)
-//   .tw witness pps_phase    (PPS notification vs selected VCLOCK edge phase)
-//   .tw witness gpio_delay   (simple digitalWriteFast HIGH stimulus cost)
-//   .tw witness qtimer_read  (GPIO ISR-to-VCLOCK counter observation delay/cost)
-//   .tw witness dwt_read     (DWT read-cost measurement)
-//   .tw witness entry_latency (spin-shadow ISR entry latency)
-//   .tw witness round_trip   (local stimulate-through-ISR latency)
-//
-// process_witness owns the local round-trip hardware:
+// ROUND_TRIP keeps its local low-level hardware because that is the thing being
+// measured:
 //   • stimulus pin 24
 //   • GPIO sink pin 26
 //   • QTimer2 CH0 on pin 13
 //   • IRQ_QTIMER2
 //
-// BRIDGE does not touch QTimer1 registers.  It registers as a hosted client
-// of process_interrupt's QTimer1 CH1 compare service and receives already-
-// authored event facts from process_interrupt.
+// Command surface:
+//   .tw witness report        (hardware/timer state)
+//   .tw witness edge          (PPS/PPS_VCLOCK heartbeat + last edge facts)
+//   .tw witness bridge        (DWT/GNSS bridge check using TimePop fire facts)
+//   .tw witness pps_phase     (PPS/VCLOCK phase using TimePop witness facts)
+//   .tw witness gpio_delay    (simple digitalWriteFast HIGH stimulus cost)
+//   .tw witness qtimer_read   (GPIO ISR-to-VCLOCK counter observation delay/cost)
+//   .tw witness dwt_read      (DWT read-cost measurement)
+//   .tw witness entry_latency (PPS spin-shadow ISR entry latency)
+//   .tw witness round_trip    (local stimulate-through-ISR latency)
 //
 // ============================================================================
 
