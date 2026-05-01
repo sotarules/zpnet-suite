@@ -6,7 +6,8 @@
 //
 // TimePop owns:
 //   • priority-queue slot scheduling
-//   • absolute recurring series
+//   • PPS/VCLOCK phase-locked recurring series
+//   • shared captured fire facts for same-event timed clients
 //   • deferred callback dispatch
 //   • instrumentation / reports
 //   • scheduler policy for QTimer1 CH2 compare deadlines
@@ -29,6 +30,12 @@
 //     • CH3 flag set → process_interrupt's internal vclock_cadence_isr
 //   Each handler receives a normalized DWT-at-edge capture for its own
 //   QTimer event.
+//
+//   For timed TimePop clients, all slots expired by one physical CH2 event
+//   receive the same fire_vclock_raw, fire_dwt_cyccnt, and fire_gnss_ns.
+//   Callback order is logical only.  ASAP/ALAP are intentionally excluded
+//   from this guarantee because they are deferred scheduled-context queues,
+//   not timed CH2 clients.
 //
 //   For CH2, the dispatcher additionally authors synthetic
 //   counter32_at_event and gnss_ns_at_event and packages everything into a standard

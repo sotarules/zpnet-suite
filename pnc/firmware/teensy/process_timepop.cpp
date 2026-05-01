@@ -12,6 +12,9 @@
 //
 // Scheduling modes:
 //   • relative scheduling        — timepop_arm(delay_gnss_ns, ...)
+//     When recurring=true, the first fire is snapped to the next
+//     PPS/VCLOCK phase-grid boundary implied by delay_gnss_ns; subsequent
+//     fires remain on that grid.
 //   • scheduled ASAP dispatch    — timepop_arm_asap(...)
 //   • scheduled ALAP dispatch    — timepop_arm_alap(...)
 //   • absolute scheduling        — timepop_arm_at(target_gnss_ns, ...)
@@ -47,6 +50,10 @@
 //   counter32 event identity.  TimePop uses that event fact to expire slots.
 //   It does not reinterpret PPS/VCLOCK phase and it does not read timer
 //   hardware directly.
+//
+//   All timed slots expired by the same physical CH2 event receive the same
+//   fire_vclock_raw, fire_dwt_cyccnt, and fire_gnss_ns.  Callback order is
+//   logical only; it must never re-author the physical timing facts.
 //
 // ============================================================================
 
@@ -129,8 +136,7 @@ struct timepop_slot_t {
 
 
   timepop_handle_t    handle;
-  uint32_t            deadline;
-  uint32_t            target_deadline;
+  uint32_t            deadline;          // single authoritative scheduled VCLOCK target
   uint32_t            fire_vclock_raw;
   uint32_t            period_ticks;
   uint64_t            period_ns;
@@ -286,7 +292,57 @@ static inline void update_deferred_high_water(deferred_slot_t* slots_buf,
 
 static inline int64_t time_anchor_latest_pps_gnss_ns(const time_anchor_snapshot_t& snap) {
   if (!snap.ok || !snap.valid || snap.pps_count < 1) return -1;
-  return (int64_t)(snap.pps_count - 1) * (int64_t)1000000000LL;
+  return (int64_t)(snap.pps_count - 1) * NS_PER_SECOND;
+}
+
+static bool phase_locked_next_target_gnss_ns(uint64_t period_ns,
+                                             const time_anchor_snapshot_t& snap,
+                                             int64_t now_gnss_ns,
+                                             int64_t& out_target_gnss_ns) {
+  if (period_ns == 0) return false;
+  if (period_ns > (uint64_t)INT64_MAX) return false;
+  if (now_gnss_ns < 0) return false;
+
+  const int64_t anchor_gnss_ns = time_anchor_latest_pps_gnss_ns(snap);
+  if (anchor_gnss_ns < 0) return false;
+
+  int64_t offset_ns = now_gnss_ns - anchor_gnss_ns;
+  if (offset_ns < 0) offset_ns = 0;
+
+  const uint64_t steps = ((uint64_t)offset_ns / period_ns) + 1ULL;
+  const int64_t target = anchor_gnss_ns + (int64_t)(steps * period_ns);
+  if (target <= now_gnss_ns) return false;
+
+  out_target_gnss_ns = target;
+  return true;
+}
+
+static bool configure_phase_locked_recurring_slot(timepop_slot_t& slot,
+                                                  uint64_t period_ns) {
+  if (period_ns == 0) return false;
+
+  const time_anchor_snapshot_t snap = time_anchor_snapshot();
+  const int64_t now_gnss_ns = time_gnss_ns_now();
+  int64_t target_gnss_ns = -1;
+  if (!phase_locked_next_target_gnss_ns(period_ns, snap, now_gnss_ns, target_gnss_ns)) {
+    return false;
+  }
+
+  uint32_t deadline = 0;
+  if (!gnss_ns_to_vclock_deadline(target_gnss_ns, snap, deadline)) {
+    return false;
+  }
+
+  const int64_t anchor_gnss_ns = time_anchor_latest_pps_gnss_ns(snap);
+
+  slot.is_absolute = true;
+  slot.recurrence_mode = timepop_recurrence_mode_t::ABSOLUTE;
+  slot.recurring_base_gnss_ns =
+      (anchor_gnss_ns >= 0) ? (anchor_gnss_ns + (int64_t)period_ns) : target_gnss_ns;
+  slot.recurring_period_gnss_ns = period_ns;
+  slot.target_gnss_ns = target_gnss_ns;
+  slot.deadline = deadline;
+  return true;
 }
 
 // Ambient VCLOCK observations are provided by process_interrupt.
@@ -456,6 +512,10 @@ static void schedule_next(void) {
   diag_schedule_next_calls_total++;
 
   const uint32_t now = vclock_count();
+  const time_anchor_snapshot_t snap = time_anchor_snapshot();
+  uint32_t shared_fire_dwt = 0;
+  bool shared_fire_captured = false;
+
   uint32_t soonest = 0;
   bool found = false;
 
@@ -468,11 +528,17 @@ static void schedule_next(void) {
         slots[i].first_expire_recorded = true;
       }
 
-      const time_anchor_snapshot_t snap = time_anchor_snapshot();
-      const uint32_t dwt_now = ARM_DWT_CYCCNT;
+      // SCHEDULE_NEXT is a fallback/foreground discovery path, not the ideal
+      // IRQ_CH2 compare path.  Even here, every slot expired by this one
+      // scheduling pass receives the same captured timing facts.
+      if (!shared_fire_captured) {
+        shared_fire_dwt = ARM_DWT_CYCCNT;
+        shared_fire_captured = true;
+      }
+
       expire_slot_with_capture(slots[i],
                                now,
-                               dwt_now,
+                               shared_fire_dwt,
                                snap,
                                timepop_fire_capture_source_t::SCHEDULE_NEXT);
       continue;
@@ -548,11 +614,13 @@ static inline void slot_build_ctx(
   const timepop_slot_t& slot,
   timepop_ctx_t& ctx
 ) {
+  // deadline is the one authoritative scheduled VCLOCK target.
+  // fire_gnss_error_ns compares the shared captured event against that target.
   ctx.handle              = slot.handle;
   ctx.fire_vclock_raw     = slot.fire_vclock_raw;
   ctx.fire_dwt_cyccnt     = slot.fire_dwt_cyccnt;
-  ctx.deadline            = slot.target_deadline;
-  ctx.fire_gnss_error_ns  = (int32_t)(slot.fire_vclock_raw - slot.target_deadline) * (int32_t)NS_PER_TICK;
+  ctx.deadline            = slot.deadline;
+  ctx.fire_gnss_error_ns  = (int32_t)(slot.fire_vclock_raw - slot.deadline) * (int32_t)NS_PER_TICK;
   ctx.fire_gnss_ns        = slot.fire_gnss_ns;
 }
 
@@ -590,23 +658,23 @@ void timepop_qtimer1_ch2_handler(const interrupt_event_t& event,
   const uint32_t dwt_entry      = event.dwt_at_event;
   const uint32_t now            = event.counter32_at_event;
   const time_anchor_snapshot_t anchor = time_anchor_snapshot();
+  bool expired_this_pass[MAX_SLOTS] = {};
 
   diag_isr_count++;
 
   bool any_expired = false;
 
+  // Phase 1: author the shared fire facts for every slot expired by this
+  // physical CH2 compare event before any user callback is allowed to run.
+  // This guarantees simultaneous clients receive the same DWT/VCLOCK/GNSS
+  // context; callback serialization is logical only.
+  const int64_t event_fire_gnss_ns = event.gnss_ns_at_event != 0
+      ? (int64_t)event.gnss_ns_at_event
+      : vclock_to_gnss_ns(now, anchor);
+
   for (uint32_t i = 0; i < MAX_SLOTS; i++) {
     if (!slots[i].active || slots[i].expired) continue;
     if (!deadline_expired(slots[i].deadline, now)) continue;
-
-    // CH2 event facts are authored by process_interrupt.  Use the
-    // event-carried GNSS coordinate so TimePop benefits from the same
-    // PPS_VCLOCK anchor-selection logic as OCXO events.  Fall back to the
-    // local VCLOCK conversion only if the event was emitted before a lawful
-    // GNSS coordinate was available.
-    const int64_t event_fire_gnss_ns = event.gnss_ns_at_event != 0
-        ? (int64_t)event.gnss_ns_at_event
-        : vclock_to_gnss_ns(now, anchor);
 
     slot_capture(slots[i],
                  now,
@@ -615,24 +683,30 @@ void timepop_qtimer1_ch2_handler(const interrupt_event_t& event,
                  anchor,
                  timepop_fire_capture_source_t::IRQ_CH2);
     slots[i].expired = true;
+    slots[i].isr_callback_fired = false;
+    expired_this_pass[i] = true;
     expired_count++;
     timepop_pending = true;
-
-    slots[i].isr_callback_fired = false;
-
-    if (slots[i].isr_callback) {
-      timepop_ctx_t ctx;
-      slot_build_ctx(slots[i], ctx);
-
-      timepop_diag_t diag;
-      slot_build_diag(slots[i], dwt_entry, diag);
-
-      slots[i].callback(&ctx, &diag, slots[i].user_data);
-      slots[i].isr_callback_fired = true;
-      diag_isr_callbacks++;
-    }
-
     any_expired = true;
+  }
+
+  // Phase 2: now that the fire facts are stable for all simultaneous slots,
+  // dispatch any IRQ-context callbacks.  Slots without isr_callback will be
+  // dispatched later by timepop_dispatch() using the same stored context.
+  for (uint32_t i = 0; i < MAX_SLOTS; i++) {
+    if (!expired_this_pass[i]) continue;
+    if (!slots[i].active || !slots[i].expired) continue;
+    if (!slots[i].isr_callback) continue;
+
+    timepop_ctx_t ctx;
+    slot_build_ctx(slots[i], ctx);
+
+    timepop_diag_t diag;
+    slot_build_diag(slots[i], dwt_entry, diag);
+
+    slots[i].callback(&ctx, &diag, slots[i].user_data);
+    slots[i].isr_callback_fired = true;
+    diag_isr_callbacks++;
   }
 
   if (any_expired) {
@@ -913,31 +987,10 @@ timepop_handle_t timepop_arm(
     slots[i].arm_delta_ticks = ticks;
 
     if (recurring) {
-      const time_anchor_snapshot_t snap = time_anchor_snapshot();
-      const int64_t latest_pps_gnss_ns = time_anchor_latest_pps_gnss_ns(snap);
-      const int64_t now_gnss_ns = time_gnss_ns_now();
-
-      if (latest_pps_gnss_ns >= 0 && now_gnss_ns >= 0 && delay_gnss_ns > 0) {
-        const uint64_t period_ns = delay_gnss_ns;
-        const int64_t ns_since_anchor = now_gnss_ns - latest_pps_gnss_ns;
-        uint64_t steps = 1;
-        if (ns_since_anchor >= 0) {
-          steps = (uint64_t)(ns_since_anchor / (int64_t)period_ns) + 1ULL;
-        }
-        const int64_t target_gnss_ns = latest_pps_gnss_ns + (int64_t)(steps * period_ns);
-        uint32_t deadline_abs = 0;
-        if (gnss_ns_to_vclock_deadline(target_gnss_ns, snap, deadline_abs)) {
-          slots[i].is_absolute = true;
-          slots[i].recurrence_mode = timepop_recurrence_mode_t::ABSOLUTE;
-          slots[i].recurring_base_gnss_ns = latest_pps_gnss_ns + (int64_t)period_ns;
-          slots[i].recurring_period_gnss_ns = period_ns;
-          slots[i].target_gnss_ns = target_gnss_ns;
-          slots[i].deadline = deadline_abs;
-        } else {
-          slots[i].recurrence_mode = timepop_recurrence_mode_t::RELATIVE;
-          slots[i].recurring_period_gnss_ns = delay_gnss_ns;
-        }
-      } else {
+      // Recurring timers are phase-locked to the PPS/VCLOCK grid implied by
+      // their period.  The first fire snaps to the next legal grid boundary;
+      // subsequent fires advance by the exact period.
+      if (!configure_phase_locked_recurring_slot(slots[i], delay_gnss_ns)) {
         slots[i].recurrence_mode = timepop_recurrence_mode_t::RELATIVE;
         slots[i].recurring_period_gnss_ns = delay_gnss_ns;
       }
@@ -1223,22 +1276,32 @@ void timepop_dispatch(void) {
       } else if (slots[i].period_ticks == 0) {
         slots[i].active = false;
       } else {
-        // Relative recurring: advance deadline by one period.
-        slots[i].deadline += slots[i].period_ticks;
-        slots[i].recurring_rearmed_count++;
+        // Relative recurring is only a bootstrap/fallback state.  As soon as a
+        // lawful time anchor is available, promote it onto the PPS/VCLOCK phase
+        // grid for its period.
+        const uint64_t period_ns = slots[i].recurring_period_gnss_ns
+            ? slots[i].recurring_period_gnss_ns
+            : slots[i].period_ns;
+        if (configure_phase_locked_recurring_slot(slots[i], period_ns)) {
+          slots[i].recurring_rearmed_count++;
+        } else {
+          // Last-resort relative recurrence: advance deadline by one period.
+          slots[i].deadline += slots[i].period_ticks;
+          slots[i].recurring_rearmed_count++;
 
-        // Catch-up: if we fell behind, skip forward.
-        uint32_t now = vclock_count();
-        if (deadline_expired(slots[i].deadline, now)) {
-          slots[i].recurring_immediate_expire_count++;
-          slots[i].deadline = now + slots[i].period_ticks;
-          slots[i].recurring_catchup_count++;
+          // Catch-up: if we fell behind, skip forward.
+          uint32_t now = vclock_count();
+          if (deadline_expired(slots[i].deadline, now)) {
+            slots[i].recurring_immediate_expire_count++;
+            slots[i].deadline = now + slots[i].period_ticks;
+            slots[i].recurring_catchup_count++;
+          }
         }
 
         slots[i].predicted_dwt = predict_dwt_at_deadline(
           slots[i].deadline, slots[i].prediction_valid);
 
-        if (slots[i].prediction_valid) {
+        if (slots[i].prediction_valid && slots[i].target_gnss_ns < 0) {
           slots[i].target_gnss_ns = time_dwt_to_gnss_ns(slots[i].predicted_dwt);
         }
 
@@ -1359,7 +1422,6 @@ static Payload cmd_report(const Payload&) {
     entry.add("period_ns", slots[i].period_ns);
     entry.add("ticks",     slots[i].period_ticks);
     entry.add("deadline",  slots[i].deadline);
-    entry.add("target_deadline", slots[i].target_deadline);
     entry.add("recurring", slots[i].recurring);
     entry.add("expired",   slots[i].expired);
     entry.add("isr_cb",    slots[i].isr_callback);
