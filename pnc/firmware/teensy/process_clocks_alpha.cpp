@@ -54,6 +54,19 @@ volatile uint32_t g_dwt_at_pps_vclock = 0;
 volatile uint64_t g_dwt_cycle_count_total = 0;
 volatile uint32_t g_dwt_cycles_between_pps_vclock = DWT_EXPECTED_PER_PPS;
 
+// Alpha-owned DWT64 logical clock.  This is the one true DWT64 clock surface.
+// It is not physically writable; process_epoch zeros it by installing an epoch
+// origin in this raw extended ledger.  The raw ledger itself is anchored by
+// DWT32 observations and advanced at each PPS/VCLOCK bookend.
+static volatile bool     g_dwt64_raw_anchor_valid = false;
+static volatile uint64_t g_dwt64_raw_cycles_at_anchor = 0;
+static volatile uint32_t g_dwt64_dwt32_at_anchor = 0;
+static volatile bool     g_dwt64_epoch_valid = false;
+static volatile uint64_t g_dwt64_epoch_raw_cycles = 0;
+static volatile uint32_t g_dwt64_epoch_reset_count = 0;
+static volatile uint32_t g_dwt64_epoch_reset_failures = 0;
+static volatile bool     g_dwt_calibration_valid = false;
+
 volatile uint32_t g_counter32_at_pps_vclock = 0;
 volatile uint32_t g_last_vclock_event_counter32_at_event = 0;
 
@@ -213,6 +226,106 @@ static bool ocxo_dac_write_hw(ocxo_dac_state_t& s, double value) {
 }
 
 // ============================================================================
+// Alpha-owned DWT64 logical clock
+// ============================================================================
+
+static inline uint64_t dwt64_raw_now_unlocked(void) {
+  if (!g_dwt64_raw_anchor_valid) {
+    return (uint64_t)DWT_CYCCNT;
+  }
+  return g_dwt64_raw_cycles_at_anchor +
+         (uint64_t)((uint32_t)(DWT_CYCCNT - g_dwt64_dwt32_at_anchor));
+}
+
+static inline uint64_t dwt64_logical_now_unlocked(void) {
+  const uint64_t raw_now = dwt64_raw_now_unlocked();
+  return g_dwt64_epoch_valid
+      ? (raw_now - g_dwt64_epoch_raw_cycles)
+      : raw_now;
+}
+
+static void dwt64_anchor_reset_to_dwt32(uint32_t dwt32_at_anchor,
+                                        uint64_t raw_cycles_at_anchor) {
+  g_dwt64_raw_cycles_at_anchor = raw_cycles_at_anchor;
+  g_dwt64_dwt32_at_anchor = dwt32_at_anchor;
+  g_dwt64_raw_anchor_valid = true;
+}
+
+static void dwt64_anchor_advance_to_dwt32(uint32_t dwt32_at_anchor) {
+  if (!g_dwt64_raw_anchor_valid) {
+    dwt64_anchor_reset_to_dwt32(dwt32_at_anchor, (uint64_t)dwt32_at_anchor);
+    return;
+  }
+
+  const uint32_t delta = dwt32_at_anchor - g_dwt64_dwt32_at_anchor;
+  g_dwt64_raw_cycles_at_anchor += (uint64_t)delta;
+  g_dwt64_dwt32_at_anchor = dwt32_at_anchor;
+}
+
+bool clocks_dwt64_epoch_reset_at_dwt32(uint32_t epoch_dwt32,
+                                       uint64_t* out_raw_epoch_dwt64) {
+  if (!g_dwt64_raw_anchor_valid) {
+    dwt64_anchor_reset_to_dwt32(epoch_dwt32, (uint64_t)epoch_dwt32);
+  }
+
+  const uint64_t raw_epoch =
+      g_dwt64_raw_cycles_at_anchor +
+      (uint64_t)((uint32_t)(epoch_dwt32 - g_dwt64_dwt32_at_anchor));
+
+  // Re-anchor the raw DWT64 ledger exactly at the epoch edge.  This makes
+  // immediate post-epoch reads cheap and removes dependence on the previous
+  // epoch's anchor after ZERO.
+  dwt64_anchor_reset_to_dwt32(epoch_dwt32, raw_epoch);
+
+  g_dwt64_epoch_raw_cycles = raw_epoch;
+  g_dwt64_epoch_valid = true;
+  g_dwt64_epoch_reset_count++;
+
+  if (out_raw_epoch_dwt64) {
+    *out_raw_epoch_dwt64 = raw_epoch;
+  }
+  return true;
+}
+
+uint64_t clocks_dwt_cycles_now(void) {
+  return dwt64_logical_now_unlocked();
+}
+
+
+uint32_t clocks_dwt_cycles_per_gnss_second(void) {
+  return g_dwt_calibration_valid ? g_dwt_cycles_between_pps_vclock : 0;
+}
+
+bool clocks_dwt_calibration_valid(void) {
+  return g_dwt_calibration_valid;
+}
+
+uint64_t clocks_gnss_ns_now(void) {
+  const int64_t ns = time_gnss_ns_now();
+  return (ns >= 0) ? (uint64_t)ns : g_gnss_ns_at_pps_vclock;
+}
+
+uint64_t clocks_gnss_ticks_now(void) {
+  return clocks_gnss_ns_now() / (uint64_t)NS_PER_10MHZ_TICK;
+}
+
+uint64_t clocks_ocxo1_ns_now(void) {
+  return g_ocxo1_clock.ns_count_at_pps_vclock;
+}
+
+uint64_t clocks_ocxo1_ticks_now(void) {
+  return clocks_ocxo1_ns_now() / (uint64_t)NS_PER_10MHZ_TICK;
+}
+
+uint64_t clocks_ocxo2_ns_now(void) {
+  return g_ocxo2_clock.ns_count_at_pps_vclock;
+}
+
+uint64_t clocks_ocxo2_ticks_now(void) {
+  return clocks_ocxo2_ns_now() / (uint64_t)NS_PER_10MHZ_TICK;
+}
+
+// ============================================================================
 // Beta-facing shadow counts
 // ============================================================================
 
@@ -248,6 +361,15 @@ static inline void dwt_enable(void) {
   DEMCR |= DEMCR_TRCENA;
   DWT_CYCCNT = 0;
   DWT_CTRL |= DWT_CTRL_CYCCNTENA;
+
+  g_dwt64_raw_anchor_valid = true;
+  g_dwt64_raw_cycles_at_anchor = 0;
+  g_dwt64_dwt32_at_anchor = DWT_CYCCNT;
+  g_dwt64_epoch_valid = false;
+  g_dwt64_epoch_raw_cycles = 0;
+  g_dwt64_epoch_reset_count = 0;
+  g_dwt64_epoch_reset_failures = 0;
+  g_dwt_calibration_valid = false;
 }
 
 bool clocks_epoch_pending(void) {
@@ -263,6 +385,7 @@ static void alpha_reset_canonical_clock_state_for_new_epoch(void) {
   g_dwt_at_pps_vclock = 0;
   g_dwt_cycle_count_total = 0;
   g_dwt_cycles_between_pps_vclock = DWT_EXPECTED_PER_PPS;
+  g_dwt_calibration_valid = false;
   g_counter32_at_pps_vclock = 0;
   g_prev_dwt_at_vclock_event = 0;
   g_prev_pps_vclock_dwt_at_edge = 0;
@@ -306,6 +429,13 @@ void clocks_alpha_epoch_installed(const epoch_fact_t& fact) {
   g_prev_dwt_at_vclock_event = fact.epoch_dwt;
   g_prev_pps_vclock_dwt_at_edge = fact.epoch_dwt;
   g_prev_pps_vclock_dwt_at_edge_valid = true;
+
+  // process_epoch has already installed the DWT64 epoch origin.  Re-anchor
+  // the raw DWT64 ledger at the same selected edge so the DWT64 logical clock
+  // starts at exactly zero and extends continuously from this epoch.
+  if (g_dwt64_epoch_valid) {
+    dwt64_anchor_reset_to_dwt32(fact.epoch_dwt, g_dwt64_epoch_raw_cycles);
+  }
 
   g_epoch_initialized = true;
 }
@@ -458,6 +588,8 @@ static void update_pps_vclock_bridge_anchor(const pps_edge_snapshot_t& snap) {
 
   g_dwt_cycles_between_pps_vclock = dwt_between_pps;
   g_dwt_cycle_count_total += (uint64_t)dwt_between_pps;
+  dwt64_anchor_advance_to_dwt32(snap.dwt_at_edge);
+  g_dwt_calibration_valid = true;
   g_prev_pps_vclock_dwt_at_edge = snap.dwt_at_edge;
 
   g_dwt_at_pps_vclock = snap.dwt_at_edge;

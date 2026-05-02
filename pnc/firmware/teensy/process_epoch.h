@@ -40,6 +40,13 @@ uint32_t process_epoch_last_request_id(void);
 epoch_fact_t process_epoch_current_fact(void);
 epoch_audit_t process_epoch_current_audit(void);
 
+// DWT64 logical cycle-clock accessors. DWT64 is zeroed by epoch-origin subtraction,
+// not by writing the hardware DWT_CYCCNT register. process_epoch deliberately
+// does not expose a logical nanosecond DWT clock.
+uint64_t process_epoch_dwt64_logical_cycles_now(void);
+uint64_t process_epoch_dwt64_raw_epoch_cycles(void);
+bool process_epoch_dwt64_epoch_valid(void);
+
 // String helpers for reports and diagnostics.
 const char* epoch_reason_str(epoch_reason_t reason);
 const char* epoch_state_str(epoch_state_t state);
