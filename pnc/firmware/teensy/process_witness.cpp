@@ -25,6 +25,7 @@
 //   BRIDGE        — DWT/GNSS bridge check using TimePop fire facts.
 //   GPIO_DELAY    — simple digitalWriteFast HIGH stimulus cost.
 //   QTIMER_READ   — GPIO ISR-to-VCLOCK counter observation delay/cost.
+//   QTIMER_WRITE  — direct 16-bit QTimer CNTR write cost.
 //   DWT_READ      — consecutive DWT read-cost measurement.
 //   ENTRY_LATENCY — spin-shadow ISR entry latency for PPS.
 //   PPS_PHASE     — PPS/VCLOCK phase inferred from TimePop witness events.
@@ -220,6 +221,37 @@ static volatile uint32_t g_qtimer_read_entry_to_read_end_cycles = 0;
 static welford_t g_qtimer_read_entry_to_read_start_welford = {};
 static welford_t g_qtimer_read_counter_read_cost_welford = {};
 static welford_t g_qtimer_read_entry_to_read_end_welford = {};
+
+// ============================================================================
+// QTIMER_WRITE — cost of writing QTimer2 CH0 CNTR
+// ============================================================================
+//
+// DWT before and after a single 16-bit write to CH0 CNTR.  The write value is
+// taken from the ambient counter so this measures register write path cost
+// rather than a semantic retime operation.
+
+static volatile uint32_t g_qtimer_write_samples = 0;
+static volatile uint32_t g_qtimer_write_dwt_before = 0;
+static volatile uint32_t g_qtimer_write_dwt_after = 0;
+static volatile uint16_t g_qtimer_write_value = 0;
+static volatile uint32_t g_qtimer_write_cycles = 0;
+static welford_t g_qtimer_write_welford = {};
+
+static void capture_qtimer_write_sample(void) {
+  const uint16_t value = IMXRT_TMR2.CH[0].CNTR;
+  const uint32_t before = ARM_DWT_CYCCNT;
+  IMXRT_TMR2.CH[0].CNTR = value;
+  const uint32_t after = ARM_DWT_CYCCNT;
+
+  const uint32_t cycles = after - before;
+  g_qtimer_write_samples++;
+  g_qtimer_write_dwt_before = before;
+  g_qtimer_write_dwt_after = after;
+  g_qtimer_write_value = value;
+  g_qtimer_write_cycles = cycles;
+
+  welford_update(g_qtimer_write_welford, (int32_t)cycles);
+}
 
 
 // ============================================================================
@@ -1292,6 +1324,28 @@ static Payload cmd_qtimer_read(const Payload&) {
   return p;
 }
 
+static Payload cmd_qtimer_write(const Payload&) {
+  capture_qtimer_write_sample();
+
+  Payload p;
+  p.add("model", "QTIMER_WRITE_CNTR_COST");
+  p.add("samples", g_qtimer_write_samples);
+  p.add("hardware_ready", g_witness_hw_ready);
+  p.add("runtime_ready", g_witness_runtime_ready);
+  p.add("irqs_enabled", g_witness_irqs_enabled);
+
+  Payload last;
+  last.add("dwt_before", g_qtimer_write_dwt_before);
+  last.add("dwt_after", g_qtimer_write_dwt_after);
+  last.add("value_written", (uint32_t)g_qtimer_write_value);
+  last.add("cycles", g_qtimer_write_cycles);
+  last.add("ns", cycles_to_ns((double)g_qtimer_write_cycles));
+  p.add_object("last", last);
+
+  p.add_object("welford", welford_payload(g_qtimer_write_welford));
+  return p;
+}
+
 // ============================================================================
 // ============================================================================
 // ENTRY_LATENCY command
@@ -1537,6 +1591,13 @@ void process_witness_init(void) {
   welford_reset(g_qtimer_read_counter_read_cost_welford);
   welford_reset(g_qtimer_read_entry_to_read_end_welford);
 
+  g_qtimer_write_samples = 0;
+  g_qtimer_write_dwt_before = 0;
+  g_qtimer_write_dwt_after = 0;
+  g_qtimer_write_value = 0;
+  g_qtimer_write_cycles = 0;
+  welford_reset(g_qtimer_write_welford);
+
 
   g_gpio_delay_samples = 0;
   g_gpio_delay_dwt_before = 0;
@@ -1613,6 +1674,7 @@ static const process_command_entry_t WITNESS_COMMANDS[] = {
   { "PPS_PHASE",   cmd_pps_phase   },
   { "GPIO_DELAY",  cmd_gpio_delay  },
   { "QTIMER_READ", cmd_qtimer_read },
+  { "QTIMER_WRITE", cmd_qtimer_write },
   { "DWT_READ",    cmd_dwt_read    },
   { "ENTRY_LATENCY", cmd_entry_latency },
   { "ROUND_TRIP",  cmd_round_trip  },

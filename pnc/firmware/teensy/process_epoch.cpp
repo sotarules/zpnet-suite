@@ -24,8 +24,12 @@ void clocks_alpha_epoch_installed(const epoch_fact_t&) {}
 void clocks_beta_epoch_installed(const epoch_fact_t& fact) __attribute__((weak));
 void clocks_beta_epoch_installed(const epoch_fact_t&) {}
 
-static constexpr uint32_t WRITE_LOOKAHEAD_CYCLES = 64;  // ~63.5 ns at 1.008 GHz
 static constexpr uint32_t INSTALL_COUNT = 9;
+// Epoch counter estimation tuning constants (hoisted for iterative refinement).
+static constexpr uint32_t ESTIMATOR_PROCESS_DELAY_CYCLES = 10;
+static constexpr uint32_t WRITE_COST_CYCLES_HW16 = 9;
+static constexpr uint32_t WRITE_COST_CYCLES_COUNT32 = 1;
+static constexpr uint32_t WRITE_COST_CYCLES_NS64 = 1;
 
 struct install_audit_t {
   const char* clock = "";
@@ -105,15 +109,33 @@ static tick_projection_t elapsed_from_epoch_to_ticks(uint32_t epoch_dwt,
   return dwt_cycles_to_10mhz(cycles, extra_cycles);
 }
 
-static uint64_t ticks_now_from_epoch(uint32_t epoch_dwt, uint32_t* out_dwt,
-                                     uint64_t* out_cycles, uint64_t* out_ns) {
+static inline uint64_t cycles_to_ns_floor(uint64_t cycles) {
+  // 1 cycle = 125/126 ns at 1.008 GHz.
+  return (cycles * 125ULL) / 126ULL;
+}
+
+static uint64_t estimate_ticks_from_epoch_with_write_cost(uint32_t epoch_dwt,
+                                                          uint32_t write_cost_cycles,
+                                                          uint32_t* out_dwt,
+                                                          uint64_t* out_cycles,
+                                                          uint64_t* out_ns) {
   const uint32_t now = dwt_now();
-  const tick_projection_t t =
-      elapsed_from_epoch_to_ticks(epoch_dwt, now, WRITE_LOOKAHEAD_CYCLES);
+  const uint64_t elapsed_cycles = (uint32_t)(now - epoch_dwt);
+  const uint64_t adjusted_cycles =
+      elapsed_cycles + (uint64_t)ESTIMATOR_PROCESS_DELAY_CYCLES;
+  const uint64_t adjusted_ns = cycles_to_ns_floor(adjusted_cycles);
+
+  uint64_t ticks = adjusted_ns / (uint64_t)NS_PER_10MHZ_TICK;
+  const uint64_t rem_ns = adjusted_ns % (uint64_t)NS_PER_10MHZ_TICK;
+  const uint64_t write_cost_ns = cycles_to_ns_floor((uint64_t)write_cost_cycles);
+  if (rem_ns + write_cost_ns >= (uint64_t)NS_PER_10MHZ_TICK) {
+    ticks++;
+  }
+
   if (out_dwt) *out_dwt = now;
-  if (out_cycles) *out_cycles = t.cycles;
-  if (out_ns) *out_ns = t.ns;
-  return t.ticks;
+  if (out_cycles) *out_cycles = elapsed_cycles;
+  if (out_ns) *out_ns = ticks * (uint64_t)NS_PER_10MHZ_TICK;
+  return ticks;
 }
 
 static void record(const char* clock, const char* target, uint32_t dwt,
@@ -135,7 +157,16 @@ static bool set_target(interrupt_subscriber_kind_t kind, const char* clock,
   uint32_t dwt = 0;
   uint64_t cycles = 0;
   uint64_t ns = 0;
-  const uint64_t ticks = ticks_now_from_epoch(epoch_dwt, &dwt, &cycles, &ns);
+  uint32_t write_cost_cycles = WRITE_COST_CYCLES_COUNT32;
+  if (target[0] == 'H') {
+    write_cost_cycles = WRITE_COST_CYCLES_HW16;
+  } else if (target[0] == 'C') {
+    write_cost_cycles = WRITE_COST_CYCLES_COUNT32;
+  } else {
+    write_cost_cycles = WRITE_COST_CYCLES_NS64;
+  }
+  const uint64_t ticks = estimate_ticks_from_epoch_with_write_cost(
+      epoch_dwt, write_cost_cycles, &dwt, &cycles, &ns);
   bool ok = false;
 
   if (target[0] == 'H') {
@@ -447,19 +478,29 @@ static Payload cmd_clocks(const Payload&) {
 
   Payload p;
   p.add("model", "EPOCH_CLOCKS");
-  p.add("report_style", "normalized_v1");
-  p.add("state", epoch_state_str(g_state));
-  p.add("epoch_sequence", g_epoch_sequence);
-  p.add("epoch_dwt", g_fact.epoch_dwt);
-  p.add("dwt64_cycles", clocks_dwt_cycles_now());
-  p.add("report_dwt", report_dwt);
-  p.add("normalization", "project_each_ambient_read_to_report_dwt");
-  p.add("dwt_to_10mhz_cycles_per_second", (uint32_t)DWT_EXPECTED_PER_PPS);
-  p.add("ns_per_10mhz_tick", (uint32_t)NS_PER_10MHZ_TICK);
 
-  add_clock_report(p, vclock, vclock);
-  add_clock_report(p, ocxo1, vclock);
-  add_clock_report(p, ocxo2, vclock);
+  Payload summary;
+  summary.add("dwt64_cycles_total", clocks_dwt_cycles_now());
+  summary.add("vclock_ns64_total", vclock.norm_ns64);
+  summary.add("ocxo1_ns64_total", ocxo1.norm_ns64);
+  summary.add("ocxo2_ns64_total", ocxo2.norm_ns64);
+  p.add_object("summary", summary);
+
+  Payload detail;
+  detail.add("report_style", "normalized_v1");
+  detail.add("state", epoch_state_str(g_state));
+  detail.add("epoch_sequence", g_epoch_sequence);
+  detail.add("epoch_dwt", g_fact.epoch_dwt);
+  detail.add("dwt64_cycles", clocks_dwt_cycles_now());
+  detail.add("report_dwt", report_dwt);
+  detail.add("normalization", "project_each_ambient_read_to_report_dwt");
+  detail.add("dwt_to_10mhz_cycles_per_second", (uint32_t)DWT_EXPECTED_PER_PPS);
+  detail.add("ns_per_10mhz_tick", (uint32_t)NS_PER_10MHZ_TICK);
+
+  add_clock_report(detail, vclock, vclock);
+  add_clock_report(detail, ocxo1, vclock);
+  add_clock_report(detail, ocxo2, vclock);
+  p.add_object("detail", detail);
   return p;
 }
 
