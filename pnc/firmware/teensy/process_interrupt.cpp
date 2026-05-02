@@ -868,6 +868,8 @@ struct synthetic_clock32_t {
   uint64_t zero_ns = 0;
   uint32_t zero_counter32 = 0;
   uint32_t current_counter32 = 0;
+  uint64_t current_ns = 0;
+  uint16_t hardware16 = 0;
   uint32_t zero_count = 0;
 
   bool     pending_zero = false;
@@ -918,6 +920,8 @@ static void synthetic_clock_zero(synthetic_clock32_t& c, uint64_t ns) {
   c.zero_ns = ns;
   c.zero_counter32 = clock32_from_ns(ns);
   c.current_counter32 = c.zero_counter32;
+  c.current_ns = ns;
+  c.hardware16 = (uint16_t)c.current_counter32;
   c.zero_count++;
   c.pending_zero = false;
 }
@@ -925,6 +929,8 @@ static void synthetic_clock_zero(synthetic_clock32_t& c, uint64_t ns) {
 static void vclock_clock_anchor_hardware_low16(uint32_t synthetic_counter32,
                                                  uint16_t hardware_low16) {
   g_vclock_clock32.current_counter32 = synthetic_counter32;
+  g_vclock_clock32.current_ns = (uint64_t)synthetic_counter32 * 100ULL;
+  g_vclock_clock32.hardware16 = hardware_low16;
   g_vclock_clock32.hardware_low16_at_current = hardware_low16;
   g_vclock_clock32.hardware_anchor_valid = true;
   g_vclock_clock32.hardware_anchor_update_count++;
@@ -1008,16 +1014,153 @@ static inline void synthetic_clock_consume_pending_zero_if_any(synthetic_clock32
   synthetic_clock_zero(c, c.pending_zero_ns);
 }
 
-static inline uint32_t synthetic_clock_advance(synthetic_clock32_t& c,
-                                               uint32_t ticks) {
+static inline uint32_t synthetic_clock_advance_at_hardware(synthetic_clock32_t& c,
+                                                           uint32_t ticks,
+                                                           uint16_t hardware16_at_event) {
   synthetic_clock_consume_pending_zero_if_any(c);
   c.current_counter32 += ticks;
+  c.current_ns += (uint64_t)ticks * 100ULL;
+  c.hardware16 = hardware16_at_event;
   return c.current_counter32;
 }
 
 uint32_t interrupt_qtimer1_counter32_now(void)   { return vclock_synthetic_from_hardware_low16(qtimer1_ch0_counter_now()); }
 uint16_t interrupt_qtimer3_ch2_counter_now(void) { return IMXRT_TMR3.CH[2].CNTR; }
 uint16_t interrupt_qtimer3_ch3_counter_now(void) { return IMXRT_TMR3.CH[3].CNTR; }
+
+// Forward declarations for compare helpers defined below.
+static void qtimer1_ch3_program_compare(uint16_t target_low16);
+static void qtimer3_program_compare(uint8_t ch, uint16_t target_low16);
+
+static inline uint32_t cadence_mod_for_ticks(uint32_t ticks, uint32_t interval) {
+  if (interval == 0) return 0;
+  return (ticks / interval) % TICKS_PER_SECOND_EVENT;
+}
+
+static uint16_t clock_hw16_read(interrupt_subscriber_kind_t kind) {
+  if (kind == interrupt_subscriber_kind_t::VCLOCK) return qtimer1_ch0_counter_now();
+  if (kind == interrupt_subscriber_kind_t::OCXO1)  return IMXRT_TMR3.CH[2].CNTR;
+  if (kind == interrupt_subscriber_kind_t::OCXO2)  return IMXRT_TMR3.CH[3].CNTR;
+  return 0;
+}
+
+static bool clock_hw16_write(interrupt_subscriber_kind_t kind, uint32_t ticks) {
+  const uint16_t value = (uint16_t)ticks;
+
+  if (kind == interrupt_subscriber_kind_t::VCLOCK) {
+    IMXRT_TMR1.CH[0].CNTR = value;
+    IMXRT_TMR1.CH[3].CNTR = value;
+    g_vclock_clock32.hardware16 = value;
+    g_vclock_clock32.hardware_low16_at_current = value;
+    g_vclock_lane.logical_count32_at_last_second = ticks;
+    g_vclock_lane.tick_mod_1000 = cadence_mod_for_ticks(ticks, VCLOCK_INTERVAL_COUNTS);
+    g_vclock_lane.phase_bootstrapped = true;
+    g_vclock_lane.compare_target = (uint16_t)(value + (uint16_t)VCLOCK_INTERVAL_COUNTS);
+    qtimer1_ch3_program_compare(g_vclock_lane.compare_target);
+    return true;
+  }
+
+  ocxo_lane_t* lane = ocxo_lane_for(kind);
+  synthetic_clock32_t* c = synthetic_clock_for_kind(kind);
+  if (!lane || !c) return false;
+
+  IMXRT_TMR3.CH[lane->channel].CNTR = value;
+  c->hardware16 = value;
+  lane->logical_count32_at_last_second = ticks;
+  lane->tick_mod_1000 = cadence_mod_for_ticks(ticks, OCXO_INTERVAL_COUNTS);
+  lane->phase_bootstrapped = true;
+  lane->compare_target = (uint16_t)(value + (uint16_t)OCXO_INTERVAL_COUNTS);
+  qtimer3_program_compare(lane->channel, lane->compare_target);
+  return true;
+}
+
+static uint32_t project_counter32_from_hw16(const synthetic_clock32_t& c,
+                                            uint16_t hardware16) {
+  if (!c.zeroed) return (uint32_t)hardware16;
+  return c.current_counter32 + (uint32_t)((uint16_t)(hardware16 - c.hardware16));
+}
+
+static uint64_t project_ns64_from_hw16(const synthetic_clock32_t& c,
+                                       uint16_t hardware16) {
+  if (!c.zeroed) return (uint64_t)hardware16 * 100ULL;
+  const uint32_t delta = (uint32_t)((uint16_t)(hardware16 - c.hardware16));
+  return c.current_ns + (uint64_t)delta * 100ULL;
+}
+
+bool interrupt_clock16_set_from_ticks(interrupt_subscriber_kind_t kind, uint32_t ticks) {
+  return clock_hw16_write(kind, ticks);
+}
+
+bool interrupt_clock32_set_from_ticks(interrupt_subscriber_kind_t kind, uint32_t ticks) {
+  const uint16_t hw = clock_hw16_read(kind);
+
+  if (kind == interrupt_subscriber_kind_t::VCLOCK) {
+    g_vclock_clock32.zeroed = true;
+    g_vclock_clock32.current_counter32 = ticks;
+    g_vclock_clock32.current_ns = (uint64_t)ticks * 100ULL;
+    g_vclock_clock32.hardware16 = hw;
+    g_vclock_clock32.hardware_low16_at_current = hw;
+    g_vclock_lane.logical_count32_at_last_second = ticks;
+    return true;
+  }
+
+  synthetic_clock32_t* c = synthetic_clock_for_kind(kind);
+  if (!c) return false;
+  c->zeroed = true;
+  c->current_counter32 = ticks;
+  c->current_ns = (uint64_t)ticks * 100ULL;
+  c->hardware16 = hw;
+  ocxo_lane_t* lane = ocxo_lane_for(kind);
+  if (lane) lane->logical_count32_at_last_second = ticks;
+  return true;
+}
+
+bool interrupt_clock64_ns_set(interrupt_subscriber_kind_t kind, uint64_t ns) {
+  const uint16_t hw = clock_hw16_read(kind);
+
+  if (kind == interrupt_subscriber_kind_t::VCLOCK) {
+    g_vclock_clock32.current_ns = ns;
+    g_vclock_clock32.hardware16 = hw;
+    g_vclock_clock32.hardware_low16_at_current = hw;
+    return true;
+  }
+
+  synthetic_clock32_t* c = synthetic_clock_for_kind(kind);
+  if (!c) return false;
+  c->current_ns = ns;
+  c->hardware16 = hw;
+  return true;
+}
+
+bool interrupt_clock_snapshot(interrupt_subscriber_kind_t kind, interrupt_clock_snapshot_t* out) {
+  if (!out) return false;
+
+  if (kind == interrupt_subscriber_kind_t::VCLOCK) {
+    const uint16_t hw = qtimer1_ch0_counter_now();
+    out->hardware16 = hw;
+    out->counter32 = vclock_synthetic_from_hardware_low16(hw);
+    out->ns64 = project_ns64_from_hw16(g_vclock_clock32, hw);
+    return true;
+  }
+
+  if (kind == interrupt_subscriber_kind_t::OCXO1) {
+    const uint16_t hw = IMXRT_TMR3.CH[2].CNTR;
+    out->hardware16 = hw;
+    out->counter32 = project_counter32_from_hw16(g_ocxo1_clock32, hw);
+    out->ns64 = project_ns64_from_hw16(g_ocxo1_clock32, hw);
+    return true;
+  }
+
+  if (kind == interrupt_subscriber_kind_t::OCXO2) {
+    const uint16_t hw = IMXRT_TMR3.CH[3].CNTR;
+    out->hardware16 = hw;
+    out->counter32 = project_counter32_from_hw16(g_ocxo2_clock32, hw);
+    out->ns64 = project_ns64_from_hw16(g_ocxo2_clock32, hw);
+    return true;
+  }
+
+  return false;
+}
 
 // ============================================================================
 // Compare channel helpers
@@ -1337,12 +1480,14 @@ static void handle_ocxo_qtimer16_irq(ocxo_lane_t& lane,
   if (!lane.active || !rt.active) { lane.miss_count++; return; }
   if (!lane.phase_bootstrapped)   { ocxo_lane_arm_bootstrap(lane); lane.miss_count++; return; }
 
+  const uint16_t fired_low16 = lane.compare_target;
   ocxo_lane_advance_compare(lane);
   lane.cadence_hits_total++;
 
   synthetic_clock32_t* c = synthetic_clock_for_kind(rt.desc->kind);
   if (c) {
-    lane.logical_count32_at_last_second = synthetic_clock_advance(*c, OCXO_INTERVAL_COUNTS);
+    lane.logical_count32_at_last_second =
+        synthetic_clock_advance_at_hardware(*c, OCXO_INTERVAL_COUNTS, fired_low16);
   } else {
     lane.logical_count32_at_last_second += OCXO_INTERVAL_COUNTS;
   }

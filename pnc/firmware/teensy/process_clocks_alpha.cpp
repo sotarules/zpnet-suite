@@ -608,6 +608,10 @@ static void maybe_publish_fragment(void) {
 }
 
 static void pps_selector_callback(const pps_edge_snapshot_t& snap) {
+  // EPOCH ZERO is intentionally synchronous here: the selected PPS/VCLOCK
+  // snapshot is the sacred edge, so process_epoch gets first chance to install
+  // its compensated zero before alpha treats the edge as an ordinary bridge
+  // update.
   const bool installed_epoch = process_epoch_on_pps_vclock_snapshot(snap);
 
   publish_pps_witness_diag(snap);

@@ -606,6 +606,22 @@ void     interrupt_qtimer1_ch2_arm_compare(uint32_t target_counter32);
 // hardware edge owned by process_interrupt.  VCLOCK consumes this in the PPS
 // GPIO ISR during rebootstrap so the snapshot itself carries the new identity.
 
+
+struct interrupt_clock_snapshot_t {
+  uint16_t hardware16 = 0;
+  uint32_t counter32 = 0;
+  uint64_t ns64 = 0;
+};
+
+bool interrupt_clock16_set_from_ticks(interrupt_subscriber_kind_t kind,
+                                      uint32_t ticks);
+bool interrupt_clock32_set_from_ticks(interrupt_subscriber_kind_t kind,
+                                      uint32_t ticks);
+bool interrupt_clock64_ns_set(interrupt_subscriber_kind_t kind,
+                              uint64_t ns);
+bool interrupt_clock_snapshot(interrupt_subscriber_kind_t kind,
+                              interrupt_clock_snapshot_t* out);
+
 uint32_t interrupt_clock32_from_ns(uint64_t ns);
 bool     interrupt_clock32_zero_from_ns(interrupt_subscriber_kind_t kind,
                                         uint64_t ns);
