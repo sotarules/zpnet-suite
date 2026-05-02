@@ -51,6 +51,7 @@
 #include "process_clocks_internal.h"
 #include "process_clocks.h"
 #include "process_interrupt.h"
+#include "process_epoch.h"
 
 #include "debug.h"
 #include "timebase.h"
@@ -811,39 +812,42 @@ void clocks_watchdog_anomaly(const char* reason,
 }
 
 // ============================================================================
+// Epoch install callback — invoked by process_epoch after alpha/time install
+// ============================================================================
+
+void clocks_beta_epoch_installed(const epoch_fact_t& fact) {
+  const bool epoch_zero_command =
+      fact.reason == epoch_reason_t::EPOCH_ZERO_COMMAND ||
+      fact.reason == epoch_reason_t::CLOCKS_ZERO_COMMAND ||
+      fact.reason == epoch_reason_t::STARTUP;
+  const bool epoch_start_command =
+      fact.reason == epoch_reason_t::CLOCKS_START;
+
+  if (!request_zero && !request_start && !epoch_zero_command && !epoch_start_command) {
+    return;
+  }
+
+  clocks_zero_all();
+  request_zero = false;
+
+  if (request_start || epoch_start_command) {
+    watchdog_anomaly_active = false;
+    campaign_state = clocks_campaign_state_t::STARTED;
+    request_start = false;
+    campaign_warmup_begin(campaign_warmup_mode_t::START);
+  }
+}
+
+// ============================================================================
 // clocks_beta_pps — invoked from alpha's pps_selector_callback
 // ============================================================================
 
 void clocks_beta_pps(void) {
-  // ── Zero / start handshake ──
-  //
-  // Under PPS/VCLOCK-anchored epoch discipline, all of the interrupt-side
-  // synchronization lives in alpha:
-  //
-  //   • alpha's pps_selector_callback, on seeing request_zero/start and
-  //     !g_epoch_pending, calls alpha_request_epoch_zero() which sets
-  //     g_epoch_pending AND arms a GPIO-ISR-side rebootstrap.
-  //   * The NEXT physical PPS edge selects the rebootstrap PPS/VCLOCK edge,
-  //     re-phases the VCLOCK cadence, and alpha installs the epoch from that
-  //     snapshot, clearing g_epoch_pending.
-  //
-  // Beta's job here is simply to wait for alpha to complete the
-  // PPS/VCLOCK-anchored install.  When g_epoch_pending clears, the campaign
-  // time base is aligned to the selected PPS/VCLOCK edge and we can finalize
-  // the zero/start transition.
+  // ZERO / START epoch installation is now owned by process_epoch.
+  // While a request is pending, beta deliberately does no intrinsic zeroing;
+  // process_epoch will invoke clocks_beta_epoch_installed() after the shared
+  // epoch fact has been authored and installed.
   if (request_zero || request_start) {
-    if (clocks_epoch_pending()) return;
-
-    clocks_zero_all();
-
-    request_zero = false;
-
-    if (request_start) {
-      watchdog_anomaly_active = false;
-      campaign_state = clocks_campaign_state_t::STARTED;
-      request_start = false;
-      campaign_warmup_begin(campaign_warmup_mode_t::START);
-    }
     return;
   }
 
@@ -1131,12 +1135,26 @@ static Payload cmd_start(const Payload& args) {
   ocxo_dac_pacing_reset();
 
   request_start = true;
+  request_zero = false;
   request_stop = false;
   request_recover = false;
 
+  const epoch_request_result_t epoch_result =
+      process_epoch_request_zero(epoch_reason_t::CLOCKS_START);
+  if (!epoch_result.accepted) {
+    request_start = false;
+  }
+
   Payload p;
-  p.add("status", (!dac1_ok || !dac2_ok) ?
-                      "start_requested_dac_fault" : "start_requested");
+  p.add("status", (!epoch_result.accepted)
+                      ? "start_rejected_epoch_pending"
+                      : ((!dac1_ok || !dac2_ok)
+                            ? "start_requested_dac_fault"
+                            : "start_requested"));
+  p.add("delegated_to", "EPOCH");
+  p.add("epoch_request_accepted", epoch_result.accepted);
+  p.add("epoch_request_id", epoch_result.request_id);
+  p.add("epoch_state", epoch_state_str(epoch_result.state));
   p.add("ocxo1_dac", ocxo1_dac.dac_fractional);
   p.add("ocxo2_dac", ocxo2_dac.dac_fractional);
   p.add("ocxo1_dac_last_write_ok", ocxo1_dac.io_last_write_ok);
@@ -1155,12 +1173,21 @@ static Payload cmd_stop(const Payload&) {
 }
 
 static Payload cmd_zero(const Payload&) {
-  request_zero = true;
   request_start = false;
   request_stop = false;
   request_recover = false;
+
+  const epoch_request_result_t epoch_result =
+      process_epoch_request_zero(epoch_reason_t::CLOCKS_ZERO_COMMAND);
+  request_zero = epoch_result.accepted;
+
   Payload p;
-  p.add("status", "zero_requested");
+  p.add("status", epoch_result.accepted ? "zero_requested" : "zero_rejected_epoch_pending");
+  p.add("delegated_to", "EPOCH");
+  p.add("epoch_request_accepted", epoch_result.accepted);
+  p.add("epoch_request_id", epoch_result.request_id);
+  p.add("epoch_state", epoch_state_str(epoch_result.state));
+  p.add("epoch_message", epoch_result.message);
   return p;
 }
 
@@ -1206,7 +1233,10 @@ static Payload cmd_report(const Payload&) {
   p.add("request_stop", request_stop);
   p.add("request_recover", request_recover);
   p.add("request_zero", request_zero);
-  p.add("epoch_pending", clocks_epoch_pending());
+  p.add("epoch_pending", process_epoch_pending());
+  p.add("epoch_state", epoch_state_str(process_epoch_state()));
+  p.add("epoch_request_id", process_epoch_last_request_id());
+  p.add("epoch_sequence", process_epoch_current_sequence());
   p.add("interrupt_pps_rebootstrap_pending",
         interrupt_pps_rebootstrap_pending());
   p.add("campaign_warmup_active", campaign_warmup_active());

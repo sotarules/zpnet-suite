@@ -12,6 +12,7 @@
 // Responsibilities:
 //   • Consumption of process_interrupt-authored clock captures
 //   • Synthetic nanosecond clocks
+//   • Compatibility delegation of ZERO/START epoch requests to process_epoch
 //   • PPS/VCLOCK-selected truth capture
 //   • 1 Hz publication of canonical clock tuple
 //   • Continuous DWT-to-GNSS calibration (campaign-independent)

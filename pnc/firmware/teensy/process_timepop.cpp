@@ -255,6 +255,19 @@ static volatile uint32_t diag_irq_late_max_ticks = 0;
 static volatile uint32_t diag_irq_event_gnss_mismatch_count = 0;
 static volatile int64_t  diag_irq_event_gnss_last_delta_ns = 0;
 
+// Epoch changes rebase the VCLOCK synthetic coordinate system. Existing
+// timed deadlines must not survive that boundary; recurring slots are
+// re-authored into the new epoch and one-shot timed slots are cancelled.
+static volatile uint32_t diag_epoch_change_count = 0;
+static volatile uint32_t diag_epoch_last_sequence = 0;
+static volatile uint32_t diag_epoch_timed_slots_seen = 0;
+static volatile uint32_t diag_epoch_recurring_rearmed = 0;
+static volatile uint32_t diag_epoch_recurring_rearm_failures = 0;
+static volatile uint32_t diag_epoch_one_shot_cancelled = 0;
+static volatile uint32_t diag_epoch_expired_cleared = 0;
+static volatile uint32_t diag_epoch_asap_left_active = 0;
+static volatile uint32_t diag_epoch_alap_left_active = 0;
+
 static volatile uint32_t diag_deadline_negative_offset = 0;
 static volatile int64_t  diag_deadline_last_target_gnss_ns = -1;
 static volatile int64_t  diag_deadline_last_anchor_pps_gnss_ns = -1;
@@ -287,6 +300,7 @@ static timepop_handle_t arm_absolute_slot_internal(
   const char*         name,
   bool                isr_callback,
   uint32_t            target_dwt = 0);
+static bool rearm_recurring_slot_for_epoch(timepop_slot_t& slot);
 
 // ============================================================================
 // Helpers
@@ -413,6 +427,56 @@ static uint32_t predict_dwt_at_deadline(uint32_t deadline, bool& valid) {
   valid = true;
   return snap.dwt_at_pps + (uint32_t)dwt_elapsed;
 }
+
+// Re-author a recurring timed slot after a VCLOCK epoch change.  No old
+// deadline survives the boundary.  Phase-locked recurring slots are placed on
+// the new PPS/VCLOCK grid; if a lawful time anchor is not yet available, the
+// slot falls back to a relative period from the new ambient VCLOCK coordinate.
+static bool rearm_recurring_slot_for_epoch(timepop_slot_t& slot) {
+  if (!slot.active || !slot.recurring) return false;
+
+  const uint64_t period_ns = slot.recurring_period_gnss_ns
+      ? slot.recurring_period_gnss_ns
+      : slot.period_ns;
+  if (period_ns == 0) return false;
+
+  slot.expired = false;
+  slot.isr_callback_fired = false;
+  slot.fire_vclock_raw = 0;
+  slot.fire_dwt_cyccnt = 0;
+  slot.fire_gnss_ns = -1;
+  slot.fire_capture_source = timepop_fire_capture_source_t::NONE;
+  slot.first_expire_now = 0;
+  slot.first_expire_recorded = false;
+
+  if (configure_phase_locked_recurring_slot(slot, period_ns)) {
+    slot.period_ticks = ns_to_ticks(period_ns);
+    slot.period_ns = period_ns;
+    slot.predicted_dwt = predict_dwt_at_deadline(
+        slot.deadline, slot.prediction_valid);
+    slot.recurring_rearmed_count++;
+    return true;
+  }
+
+  const uint32_t ticks = ns_to_ticks(period_ns);
+  const uint32_t now = vclock_count();
+  slot.period_ticks = ticks;
+  slot.period_ns = period_ns;
+  slot.deadline = now + ticks;
+  slot.arm_vclock_raw = now;
+  slot.arm_delta_ticks = ticks;
+  slot.target_gnss_ns = -1;
+  slot.recurrence_mode = timepop_recurrence_mode_t::RELATIVE;
+  slot.is_absolute = false;
+  slot.predicted_dwt = predict_dwt_at_deadline(
+      slot.deadline, slot.prediction_valid);
+  if (slot.prediction_valid) {
+    slot.target_gnss_ns = time_dwt_to_gnss_ns(slot.predicted_dwt);
+  }
+  slot.recurring_rearmed_count++;
+  return true;
+}
+
 
 // ============================================================================
 // Absolute GNSS nanosecond → VCLOCK deadline (pure arithmetic)
@@ -1393,6 +1457,73 @@ void timepop_dispatch(void) {
   }
 }
 // ============================================================================
+// Epoch boundary
+// ============================================================================
+//
+// A VCLOCK epoch change rebases the synthetic counter coordinate system used
+// by every timed TimePop deadline.  No pre-existing timed deadline may survive
+// that boundary.  Recurring slots are re-authored into the new epoch so core
+// services such as transport polling can continue; one-shot timed slots are
+// cancelled because their old-epoch target cannot be interpreted safely.
+
+void timepop_epoch_changed(uint32_t epoch_sequence) {
+  const uint32_t saved = critical_enter();
+
+  uint32_t timed_seen = 0;
+  uint32_t recurring_rearmed = 0;
+  uint32_t recurring_failures = 0;
+  uint32_t one_shot_cancelled = 0;
+  uint32_t expired_cleared = 0;
+  uint32_t asap_active = 0;
+  uint32_t alap_active = 0;
+
+  for (uint32_t i = 0; i < MAX_SLOTS; i++) {
+    if (!slots[i].active && !slots[i].expired) continue;
+    timed_seen++;
+    if (slots[i].expired) expired_cleared++;
+
+    if (slots[i].active && slots[i].recurring) {
+      if (rearm_recurring_slot_for_epoch(slots[i])) {
+        recurring_rearmed++;
+      } else {
+        slots[i] = {};
+        recurring_failures++;
+      }
+    } else {
+      slots[i] = {};
+      one_shot_cancelled++;
+    }
+  }
+
+  for (uint32_t i = 0; i < MAX_ASAP_SLOTS; i++) {
+    if (asap_slots[i].active) asap_active++;
+  }
+  for (uint32_t i = 0; i < MAX_ALAP_SLOTS; i++) {
+    if (alap_slots[i].active) alap_active++;
+  }
+
+  // Timed expirations from the old epoch are invalid.  Deferred ASAP/ALAP
+  // callbacks are not VCLOCK-deadline facts, so leave them in place.
+  timepop_pending = (asap_active > 0 || alap_active > 0);
+
+  diag_epoch_change_count++;
+  diag_epoch_last_sequence = epoch_sequence;
+  diag_epoch_timed_slots_seen += timed_seen;
+  diag_epoch_recurring_rearmed += recurring_rearmed;
+  diag_epoch_recurring_rearm_failures += recurring_failures;
+  diag_epoch_one_shot_cancelled += one_shot_cancelled;
+  diag_epoch_expired_cleared += expired_cleared;
+  diag_epoch_asap_left_active += asap_active;
+  diag_epoch_alap_left_active += alap_active;
+
+  diag_schedule_next_calls_from_other++;
+  schedule_next();
+  update_slot_high_water();
+
+  critical_exit(saved);
+}
+
+// ============================================================================
 // Introspection
 // ============================================================================
 
@@ -1434,6 +1565,15 @@ static Payload cmd_report(const Payload&) {
   out.add("slots_max",              (uint32_t)MAX_SLOTS);
   out.add("arm_failures",           diag_arm_failures);
   out.add("named_replacements",     diag_named_replacements);
+  out.add("epoch_change_count",     diag_epoch_change_count);
+  out.add("epoch_last_sequence",    diag_epoch_last_sequence);
+  out.add("epoch_timed_slots_seen", diag_epoch_timed_slots_seen);
+  out.add("epoch_recurring_rearmed", diag_epoch_recurring_rearmed);
+  out.add("epoch_recurring_rearm_failures", diag_epoch_recurring_rearm_failures);
+  out.add("epoch_one_shot_cancelled", diag_epoch_one_shot_cancelled);
+  out.add("epoch_expired_cleared",  diag_epoch_expired_cleared);
+  out.add("epoch_asap_left_active", diag_epoch_asap_left_active);
+  out.add("epoch_alap_left_active", diag_epoch_alap_left_active);
 
   out.add("asap_armed",             diag_asap_armed);
   out.add("asap_dispatched",        diag_asap_dispatched);

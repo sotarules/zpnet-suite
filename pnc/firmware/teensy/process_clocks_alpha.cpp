@@ -16,6 +16,7 @@
 #include "process_clocks_internal.h"
 #include "process_clocks.h"
 #include "process_interrupt.h"
+#include "process_epoch.h"
 
 #include "debug.h"
 #include "timebase.h"
@@ -75,7 +76,6 @@ bool g_ad5693r_init_ok = false;
 // Epoch state
 // ============================================================================
 
-static volatile bool g_epoch_pending = false;
 static volatile bool g_epoch_initialized = false;
 
 // Last VCLOCK event DWT, retained only for PPS-vs-VCLOCK phase diagnostics.
@@ -250,26 +250,12 @@ static inline void dwt_enable(void) {
   DWT_CTRL |= DWT_CTRL_CYCCNTENA;
 }
 
-static void alpha_request_epoch_zero(void) {
-  g_epoch_pending = true;
-
-  // The next PPS/rebootstrap edge is the exact VCLOCK zero.
-  interrupt_clock32_request_zero_from_ns(interrupt_subscriber_kind_t::VCLOCK, 0);
-
-  // OCXO events are ignored until the epoch is installed, so their synthetic
-  // origins can be reset immediately.
-  interrupt_clock32_zero_from_ns(interrupt_subscriber_kind_t::OCXO1, 0);
-  interrupt_clock32_zero_from_ns(interrupt_subscriber_kind_t::OCXO2, 0);
-
-  interrupt_request_pps_rebootstrap();
-}
-
 bool clocks_epoch_pending(void) {
-  return g_epoch_pending;
+  return process_epoch_pending();
 }
 
 static inline bool epoch_ready(void) {
-  return g_epoch_initialized && !g_epoch_pending;
+  return g_epoch_initialized && process_epoch_finalized();
 }
 
 static void alpha_reset_canonical_clock_state_for_new_epoch(void) {
@@ -311,24 +297,17 @@ static void alpha_reset_canonical_clock_state_for_new_epoch(void) {
 // process_interrupt.  Alpha consumes it directly and seeds the DWT/GNSS bridge.
 // ============================================================================
 
-static void alpha_install_new_epoch_from_pps_vclock_snapshot(const pps_edge_snapshot_t& snap) {
+void clocks_alpha_epoch_installed(const epoch_fact_t& fact) {
   alpha_reset_canonical_clock_state_for_new_epoch();
 
-  // VCLOCK was zeroed in the PPS GPIO ISR before this snapshot was published.
-  // Reassert OCXO origins at the point alpha begins accepting their events.
-  interrupt_clock32_zero_from_ns(interrupt_subscriber_kind_t::OCXO1, 0);
-  interrupt_clock32_zero_from_ns(interrupt_subscriber_kind_t::OCXO2, 0);
-
-  g_dwt_at_pps_vclock = snap.dwt_at_edge;
-  g_counter32_at_pps_vclock = snap.counter32_at_edge;
-  g_prev_dwt_at_vclock_event = snap.dwt_at_edge;
-  g_prev_pps_vclock_dwt_at_edge = snap.dwt_at_edge;
+  g_gnss_ns_at_pps_vclock = fact.epoch_ns;
+  g_dwt_at_pps_vclock = fact.epoch_dwt;
+  g_counter32_at_pps_vclock = fact.vclock_counter32_at_epoch;
+  g_prev_dwt_at_vclock_event = fact.epoch_dwt;
+  g_prev_pps_vclock_dwt_at_edge = fact.epoch_dwt;
   g_prev_pps_vclock_dwt_at_edge_valid = true;
 
-  time_pps_vclock_epoch_reset(snap.dwt_at_edge, snap.counter32_at_edge);
-
   g_epoch_initialized = true;
-  g_epoch_pending = false;
 }
 
 // ============================================================================
@@ -443,12 +422,6 @@ static void ocxo2_callback(const interrupt_event_t& event,
 // PPS selector callback: PPS/VCLOCK epoch anchor, bridge update, beta handoff
 // ============================================================================
 
-static void request_epoch_if_needed(void) {
-  if ((request_zero || request_start) && !g_epoch_pending) {
-    alpha_request_epoch_zero();
-  }
-}
-
 static void publish_pps_witness_diag(const pps_edge_snapshot_t& snap) {
   g_pps_witness_diag.pps_edge_sequence = snap.sequence;
   g_pps_witness_diag.pps_edge_dwt_isr_entry_raw = snap.physical_pps_dwt_raw_at_edge;
@@ -503,13 +476,7 @@ static void maybe_publish_fragment(void) {
 }
 
 static void pps_selector_callback(const pps_edge_snapshot_t& snap) {
-  request_epoch_if_needed();
-
-  const bool installed_epoch =
-      g_epoch_pending && !interrupt_pps_rebootstrap_pending();
-  if (installed_epoch) {
-    alpha_install_new_epoch_from_pps_vclock_snapshot(snap);
-  }
+  const bool installed_epoch = process_epoch_on_pps_vclock_snapshot(snap);
 
   publish_pps_witness_diag(snap);
   if (!installed_epoch) {
@@ -542,9 +509,9 @@ void process_clocks_init(void) {
   time_init();
   timebase_init();
 
-  // Arm the first PPS-anchored epoch install.  No VCLOCK-event bootstrap
-  // path exists anymore — the first selected PPS/VCLOCK edge WILL be the anchor.
-  alpha_request_epoch_zero();
+  // process_epoch owns epoch/ZERO choreography.  Startup requests a fresh
+  // PPS/VCLOCK-selected epoch through the same controller used by ZERO/START.
+  (void)process_epoch_request_zero(epoch_reason_t::STARTUP);
 
   g_ad5693r_init_ok = ad5693r_init();
 

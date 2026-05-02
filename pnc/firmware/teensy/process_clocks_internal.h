@@ -75,6 +75,7 @@
 #include "payload.h"
 #include "time.h"
 #include "process_interrupt.h"
+#include "epoch.h"
 
 #include <stdint.h>
 #include <stddef.h>
@@ -442,17 +443,21 @@ void clocks_watchdog_anomaly(const char* reason,
                              uint32_t detail3 = 0);
 
 // ============================================================================
-// Alpha accessors visible to beta
+// Epoch integration hooks
 // ============================================================================
 
-// Returns the state of alpha's PPS-anchored epoch install handshake.
-// Beta waits on this transitioning to false during ZERO/START.  When
-// false, the canonical clock state has been aligned to a physical PPS
-// edge.
+// Returns true while process_epoch is authoring/installing an epoch.
 bool clocks_epoch_pending(void);
 
+// process_epoch consumer hooks implemented by CLOCKS.
+void clocks_alpha_epoch_installed(const epoch_fact_t& fact);
+void clocks_beta_epoch_installed(const epoch_fact_t& fact);
+
 // ============================================================================
-// Zeroing
+// Campaign/accounting reset
 // ============================================================================
 
+// Beta-local campaign/statistical reset.  This is no longer an epoch author;
+// process_epoch calls clocks_beta_epoch_installed() after the shared epoch fact
+// is installed, and that hook invokes clocks_zero_all() as campaign accounting.
 void clocks_zero_all(void);

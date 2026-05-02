@@ -79,6 +79,11 @@ void timepop_bootstrap(void);
 void timepop_init(void);
 void process_timepop_register(void);
 
+// Notify TimePop that the VCLOCK synthetic coordinate system has been rebased.
+// Existing timed deadlines are old-epoch coordinates and must be re-authored
+// or cancelled before scheduling continues.
+void timepop_epoch_changed(uint32_t epoch_sequence);
+
 // QTimer1 CH2 IRQ-context handler.  Registered with process_interrupt
 // at init.  Called by process_interrupt's qtimer1_isr dispatcher on
 // every CH2 compare-match, in IRQ context, with the standard event
