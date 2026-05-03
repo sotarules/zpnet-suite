@@ -32,10 +32,15 @@
 //   ROUND_TRIP    — source, GPIO sink, and QTimer sink latency stats.
 //
 // Test cadence:
-//   • 200 ms: GPIO HIGH
-//   • 400 ms: GPIO LOW
-//   • 600 ms: QTIMER HIGH
-//   • 800 ms: QTIMER LOW
+//   • 100 ms: GPIO HIGH   (visible 1 Hz heartbeat; away from PPS)
+//   • 600 ms: GPIO LOW    (500 ms high duty interval)
+//   • 700 ms: QTIMER HIGH (separate local QTimer sink witness pulse)
+//   • 900 ms: QTIMER LOW
+//
+// The waveform slots are armed as one-shots once per scheduler cycle.  Do not
+// make HIGH/LOW independent 1 Hz recurring timers: TimePop intentionally
+// re-authors same-period recurring slots onto the same PPS/VCLOCK phase grid
+// after epoch changes, which collapses a heartbeat into a zero-width blip.
 //
 // ============================================================================
 
@@ -62,10 +67,10 @@ static constexpr int WITNESS_STIMULUS_PIN = 24;
 static constexpr int WITNESS_GPIO_PIN     = 26;
 static constexpr int WITNESS_QTIMER_PIN   = 13;   // QTimer2 TIMER0 input
 
-static constexpr uint64_t GPIO_HIGH_OFFSET_NS   = 200000000ULL;
-static constexpr uint64_t GPIO_LOW_OFFSET_NS    = 400000000ULL;
-static constexpr uint64_t QTIMER_HIGH_OFFSET_NS = 600000000ULL;
-static constexpr uint64_t QTIMER_LOW_OFFSET_NS  = 800000000ULL;
+static constexpr uint64_t GPIO_HIGH_OFFSET_NS   = 100000000ULL;
+static constexpr uint64_t GPIO_LOW_OFFSET_NS    = 600000000ULL;
+static constexpr uint64_t QTIMER_HIGH_OFFSET_NS = 700000000ULL;
+static constexpr uint64_t QTIMER_LOW_OFFSET_NS  = 900000000ULL;
 static constexpr uint64_t WITNESS_CYCLE_PERIOD_NS = 1000000000ULL;
 
 static constexpr const char* GPIO_HIGH_NAME   = "WITNESS_GPIO_HIGH";
@@ -768,7 +773,7 @@ static void witness_cancel_periodic_callbacks(void) {
   timepop_cancel_by_name(WITNESS_BRIDGE_NAME);
 }
 
-static bool witness_arm_recurring_at_offset(const char* name,
+static bool witness_arm_one_shot_at_offset(const char* name,
                                             uint64_t offset_ns,
                                             timepop_callback_t callback) {
   const time_anchor_snapshot_t snap = time_anchor_snapshot();
@@ -782,11 +787,15 @@ static bool witness_arm_recurring_at_offset(const char* name,
     target_ns = anchor_ns + (int64_t)offset_ns;
   }
 
+  // These are one-shot phase-offset events.  The 1 Hz WITNESS_SCHEDULER
+  // re-arms the next cycle.  This preserves explicit offsets across TimePop
+  // epoch changes instead of letting same-period recurring slots collapse onto
+  // the same PPS/VCLOCK boundary.
   timepop_cancel_by_name(name);
   const timepop_handle_t h =
       timepop_arm_from_anchor(anchor_ns,
                               (int64_t)offset_ns,
-                              true,
+                              false,
                               callback,
                               nullptr,
                               name);
@@ -799,19 +808,19 @@ static bool witness_arm_periodic_clients(void) {
   witness_cancel_periodic_callbacks();
 
   bool ok = true;
-  ok = witness_arm_recurring_at_offset(GPIO_HIGH_NAME,
+  ok = witness_arm_one_shot_at_offset(GPIO_HIGH_NAME,
                                        GPIO_HIGH_OFFSET_NS,
                                        gpio_high_callback) && ok;
-  ok = witness_arm_recurring_at_offset(GPIO_LOW_NAME,
+  ok = witness_arm_one_shot_at_offset(GPIO_LOW_NAME,
                                        GPIO_LOW_OFFSET_NS,
                                        gpio_low_callback) && ok;
-  ok = witness_arm_recurring_at_offset(QTIMER_HIGH_NAME,
+  ok = witness_arm_one_shot_at_offset(QTIMER_HIGH_NAME,
                                        QTIMER_HIGH_OFFSET_NS,
                                        qtimer_high_callback) && ok;
-  ok = witness_arm_recurring_at_offset(QTIMER_LOW_NAME,
+  ok = witness_arm_one_shot_at_offset(QTIMER_LOW_NAME,
                                        QTIMER_LOW_OFFSET_NS,
                                        qtimer_low_callback) && ok;
-  ok = witness_arm_recurring_at_offset(WITNESS_BRIDGE_NAME,
+  ok = witness_arm_one_shot_at_offset(WITNESS_BRIDGE_NAME,
                                        BRIDGE_SLOT_OFFSET_NS,
                                        witness_bridge_callback) && ok;
 
@@ -849,7 +858,15 @@ static bool witness_ensure_scheduled(void) {
 static void witness_scheduler_callback(timepop_ctx_t*, timepop_diag_t*, void*) {
   if (!g_witness_running) return;
   g_witness_cycle_count++;
-  (void)witness_ensure_scheduled();
+
+  // The scheduler is the single recurring witness metronome.  It arms the
+  // next cycle's phase-offset one-shots, so HIGH/LOW retain their intended
+  // 100 ms / 600 ms positions instead of becoming independent recurring
+  // slots that TimePop may legitimately re-phase onto the same boundary.
+  (void)witness_arm_periodic_clients();
+  if (!g_entry_pps.armed && !g_entry_pps.spin_active) {
+    (void)entry_latency_arm_pps_spin();
+  }
 }
 
 static void witness_arm_scheduler(void) {
