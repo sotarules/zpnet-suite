@@ -40,9 +40,11 @@
 // QTimer1 CH0 low-word counter.  process_interrupt maps that low-word
 // hardware observation into the private synthetic 32-bit VCLOCK identity.
 // When a rebootstrap is pending, it
-// records the selected VCLOCK edge.  The recurring TimePop VCLOCK
-// cadence client consumes the next CH2 fire fact, back-projects to the selected
-// edge, and thereafter emits the one-second VCLOCK events on the TimePop rail.
+// records the selected VCLOCK edge.  The recurring TimePop VCLOCK cadence client is armed as a critical recurring
+// ISR slot.  It consumes the next CH2 fire fact, back-projects to the selected
+// edge, refreshes the synthetic VCLOCK low-word anchor before TimePop schedules
+// the next compare, and thereafter emits the one-second VCLOCK events on the
+// TimePop rail.
 // ============================================================================
 
 #include "process_interrupt.h"
@@ -1402,13 +1404,17 @@ static void vclock_cadence_timepop_callback(timepop_ctx_t* ctx,
 static bool vclock_cadence_arm_timepop(void) {
   if (!g_vclock_lane.active || !g_rt_vclock || !g_rt_vclock->active) return false;
 
+  // VCLOCK_CADENCE is substrate maintenance for TimePop itself: it refreshes
+  // the synthetic VCLOCK low-word anchor that vclock_count() depends on.
+  // Therefore it must run and rearm inside the CH2 ISR pass before TimePop
+  // calls schedule_next().  Ordinary recurring TimePop slots rearm from
+  // foreground dispatch; this one uses the white-glove recurring-ISR mode.
   timepop_cancel_by_name(VCLOCK_CADENCE_NAME);
   const timepop_handle_t h =
-      timepop_arm(VCLOCK_CADENCE_PERIOD_NS,
-                  true,
-                  vclock_cadence_timepop_callback,
-                  nullptr,
-                  VCLOCK_CADENCE_NAME);
+      timepop_arm_recurring_isr(VCLOCK_CADENCE_PERIOD_NS,
+                                vclock_cadence_timepop_callback,
+                                nullptr,
+                                VCLOCK_CADENCE_NAME);
   if (h == TIMEPOP_INVALID_HANDLE) {
     g_vclock_lane.miss_count++;
     return false;
@@ -1444,10 +1450,12 @@ static void vclock_cadence_timepop_callback(timepop_ctx_t* ctx,
 
   g_vclock_lane.cadence_hits_total++;
 
-  // TimePop/CH2 authors the cadence event identity.  Use that shared fire
-  // fact directly instead of a private CH3 compare target.  The low word is
-  // still a valid anchor for translating ambient QTimer1 CH0 observations
-  // into the process_interrupt-owned synthetic VCLOCK counter32 species.
+  // TimePop/CH2 authors the cadence event identity.  Because this callback is
+  // armed through timepop_arm_recurring_isr(), it executes and rearms inside
+  // the CH2 ISR pass before TimePop calls schedule_next().  That ordering is
+  // intentional: the low-word anchor below is the substrate used by
+  // interrupt_vclock_counter32_observe_ambient(), so TimePop must not schedule
+  // the next compare from a stale synthetic VCLOCK anchor.
   g_vclock_lane.logical_count32_at_last_second = cadence_counter32;
   vclock_clock_anchor_hardware_low16(cadence_counter32, fired_low16);
 
@@ -1866,9 +1874,9 @@ void process_interrupt_gpio6789_irq(uint32_t isr_entry_dwt_raw) {
   g_last_pps_witness_valid = true;
 
   // During rebootstrap, PPS selects the sacred VCLOCK edge identity.  The
-  // already-running TimePop VCLOCK cadence client consumes the next CH2 fire
-  // fact, back-projects to this selected edge, and publishes the canonical
-  // epoch.
+  // already-running critical TimePop VCLOCK cadence client consumes the next CH2
+  // fire fact, back-projects to this selected edge, refreshes the synthetic
+  // VCLOCK anchor in ISR context, and publishes the canonical epoch.
   if (g_pps_rebootstrap_pending) {
     g_pps_rebootstrap_pending = false;
     g_pps_rebootstrap_count++;

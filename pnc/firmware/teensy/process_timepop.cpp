@@ -20,6 +20,10 @@
 //   • absolute scheduling        — timepop_arm_at(target_gnss_ns, ...)
 //   • anchor-relative scheduling — timepop_arm_from_anchor(anchor_gnss_ns, offset_gnss_ns, ...)
 //   • caller-owned exact path    — timepop_arm_ns(target_gnss_ns, target_dwt, ...)
+//  • critical ISR recurring    — timepop_arm_recurring_isr(period_ns, ...)
+//    The callback and recurring rearm happen inside the CH2 IRQ pass before
+//    schedule_next() selects the next compare.  Use only for tiny substrate
+//    maintenance callbacks that TimePop itself depends on for safe scheduling.
 //
 // fire_gnss_ns is computed from VCLOCK arithmetic:
 //   gnss_ns = (pps_count - 1) * 1e9 + (fire_vclock_raw - qtimer_at_pps) * 100
@@ -108,6 +112,8 @@ static constexpr uint32_t MAX_DELAY_TICKS = 0x7FFFFFFFU;
 static constexpr uint32_t MIN_DELAY_TICKS = 2;
 static constexpr uint32_t HEARTBEAT_TICKS = 10000;
 static constexpr uint32_t PREDICT_MAX_QTIMER_ELAPSED = 15000000U;
+static constexpr uint32_t ONE_HZ_TICKS = 10000000U;
+static constexpr const char* WITNESS_SCHEDULER_NAME = "WITNESS_SCHEDULER";
 
 
 // ============================================================================
@@ -131,6 +137,38 @@ static const char* fire_capture_source_str(timepop_fire_capture_source_t source)
     case timepop_fire_capture_source_t::IRQ_CH2:        return "IRQ_CH2";
     case timepop_fire_capture_source_t::SCHEDULE_NEXT: return "SCHEDULE_NEXT";
     default:                                           return "NONE";
+  }
+}
+
+enum class timepop_arm_source_t : uint8_t {
+  NONE = 0,
+  RELATIVE_ARM,
+  RELATIVE_ARM_PHASE_LOCKED,
+  ABSOLUTE_ARM,
+  EXACT_ARM,
+  DISPATCH_ABSOLUTE_REARM,
+  DISPATCH_RELATIVE_REARM,
+  DISPATCH_PHASE_LOCKED_REARM,
+  ISR_REARM,
+  ISR_REARM_FALLBACK,
+  EPOCH_REARM,
+  EPOCH_REARM_FALLBACK,
+};
+
+static const char* arm_source_str(timepop_arm_source_t source) {
+  switch (source) {
+    case timepop_arm_source_t::RELATIVE_ARM: return "RELATIVE_ARM";
+    case timepop_arm_source_t::RELATIVE_ARM_PHASE_LOCKED: return "RELATIVE_ARM_PHASE_LOCKED";
+    case timepop_arm_source_t::ABSOLUTE_ARM: return "ABSOLUTE_ARM";
+    case timepop_arm_source_t::EXACT_ARM: return "EXACT_ARM";
+    case timepop_arm_source_t::DISPATCH_ABSOLUTE_REARM: return "DISPATCH_ABSOLUTE_REARM";
+    case timepop_arm_source_t::DISPATCH_RELATIVE_REARM: return "DISPATCH_RELATIVE_REARM";
+    case timepop_arm_source_t::DISPATCH_PHASE_LOCKED_REARM: return "DISPATCH_PHASE_LOCKED_REARM";
+    case timepop_arm_source_t::ISR_REARM: return "ISR_REARM";
+    case timepop_arm_source_t::ISR_REARM_FALLBACK: return "ISR_REARM_FALLBACK";
+    case timepop_arm_source_t::EPOCH_REARM: return "EPOCH_REARM";
+    case timepop_arm_source_t::EPOCH_REARM_FALLBACK: return "EPOCH_REARM_FALLBACK";
+    default: return "NONE";
   }
 }
 
@@ -164,6 +202,7 @@ struct timepop_slot_t {
   bool                prediction_valid;
   bool                isr_callback;
   bool                isr_callback_fired;
+  bool                rearm_in_isr;
 
   timepop_callback_t  callback;
   void*               user_data;
@@ -179,6 +218,42 @@ struct timepop_slot_t {
   uint32_t            arm_delta_ticks;
   uint32_t            first_expire_now;
   bool                first_expire_recorded;
+
+  // schedule_next() catch-up diagnostics.  These counters identify slots whose
+  // deadlines were discovered already behind the ambient VCLOCK observation in
+  // foreground/scheduler context instead of being reached by the normal CH2 IRQ
+  // expiry path.  They are report-only; they do not alter scheduling policy.
+  uint32_t            schedule_next_expired_count;
+  uint32_t            schedule_next_late_max_ticks;
+  uint32_t            schedule_next_last_late_ticks;
+  uint32_t            schedule_next_last_now;
+  uint32_t            schedule_next_last_deadline;
+  uint32_t            schedule_next_last_dwt;
+
+  // IRQ scan diagnostics.  These tell whether a slot was actually visible and
+  // expirable when CH2 scanned the timed slot table.  If a slot is later caught
+  // by schedule_next(), these fields show whether the IRQ path ever saw it due.
+  uint32_t            irq_reached_count;
+  uint32_t            irq_expired_by_irq_count;
+  uint32_t            irq_late_max_ticks;
+  uint32_t            irq_last_now;
+  uint32_t            irq_last_dwt;
+  uint32_t            irq_last_late_ticks;
+  bool                irq_last_exact;
+
+  // Arm/rearm diagnostics.  These answer the question: was this slot already
+  // overdue when it was born or re-authored?  For deterministic absolute paths
+  // the ambient VCLOCK read is diagnostic only; it does not participate in
+  // deadline authorship.
+  timepop_arm_source_t last_arm_source;
+  uint32_t            last_arm_now;
+  uint32_t            last_arm_deadline;
+  int32_t             last_arm_delta_ticks;
+  int64_t             last_arm_target_gnss_ns;
+  uint32_t            last_arm_dwt;
+  bool                last_arm_already_past;
+  bool                last_arm_had_now;
+  uint32_t            arm_already_past_count;
 };
 
 
@@ -236,6 +311,8 @@ static volatile uint32_t diag_rearm_count        = 0;
 static volatile uint32_t diag_heartbeat_rearms   = 0;
 static volatile uint32_t diag_race_recoveries    = 0;
 static volatile uint32_t diag_isr_callbacks      = 0;
+static volatile uint32_t diag_isr_recurring_rearmed = 0;
+static volatile uint32_t diag_isr_recurring_rearm_failures = 0;
 
 static volatile uint32_t diag_schedule_next_calls_total = 0;
 static volatile uint32_t diag_schedule_next_calls_from_dispatch = 0;
@@ -247,6 +324,51 @@ static volatile uint32_t diag_schedule_next_calls_from_other = 0;
 static volatile uint32_t diag_schedule_next_expired_passes = 0;
 static volatile uint32_t diag_schedule_next_expired_slots = 0;
 static volatile uint32_t diag_schedule_next_late_max_ticks = 0;
+static volatile uint32_t diag_schedule_next_last_expired_slot = UINT32_MAX;
+static volatile uint32_t diag_schedule_next_last_expired_handle = 0;
+static volatile const char* diag_schedule_next_last_expired_name = nullptr;
+static volatile uint32_t diag_schedule_next_last_expired_deadline = 0;
+static volatile uint32_t diag_schedule_next_last_expired_now = 0;
+static volatile uint32_t diag_schedule_next_last_expired_late_ticks = 0;
+static volatile uint32_t diag_schedule_next_last_expired_dwt = 0;
+
+// Last arm/rearm diagnostic, across all timed slots.  This is designed to
+// catch timers that are created or re-authored into an already-past deadline.
+static volatile uint32_t diag_arm_already_past_count = 0;
+static volatile uint32_t diag_arm_last_slot = UINT32_MAX;
+static volatile uint32_t diag_arm_last_handle = 0;
+static volatile const char* diag_arm_last_name = nullptr;
+static volatile const char* diag_arm_last_source = nullptr;
+static volatile uint32_t diag_arm_last_now = 0;
+static volatile uint32_t diag_arm_last_deadline = 0;
+static volatile int32_t  diag_arm_last_delta_ticks = 0;
+static volatile int64_t  diag_arm_last_target_gnss_ns = -1;
+static volatile uint32_t diag_arm_last_dwt = 0;
+static volatile bool     diag_arm_last_already_past = false;
+static volatile bool     diag_arm_last_had_now = false;
+
+// IRQ scan audit for the 1 Hz phase grid and WITNESS_SCHEDULER.  This answers
+// the subtle question: when CH2 fired for the shared 1 Hz deadline, was witness
+// present and expirable, or did it become overdue through some other state path?
+static volatile uint32_t diag_irq_grid_audit_count = 0;
+static volatile uint32_t diag_irq_grid_last_now = 0;
+static volatile uint32_t diag_irq_grid_last_dwt = 0;
+static volatile uint32_t diag_irq_grid_onehz_due_count = 0;
+static volatile uint32_t diag_irq_grid_onehz_expired_count = 0;
+static volatile uint32_t diag_irq_grid_witness_slot = UINT32_MAX;
+static volatile uint32_t diag_irq_grid_witness_handle = 0;
+static volatile bool     diag_irq_grid_witness_seen = false;
+static volatile bool     diag_irq_grid_witness_active = false;
+static volatile bool     diag_irq_grid_witness_expired_before = false;
+static volatile bool     diag_irq_grid_witness_reached_before = false;
+static volatile bool     diag_irq_grid_witness_passed_before = false;
+static volatile bool     diag_irq_grid_witness_expired_by_irq = false;
+static volatile uint32_t diag_irq_grid_witness_deadline = 0;
+static volatile uint32_t diag_irq_grid_witness_distance_ticks = 0;
+static volatile uint32_t diag_irq_grid_witness_late_ticks = 0;
+static volatile uint32_t diag_irq_grid_witness_missed_count = 0;
+static volatile uint32_t diag_irq_grid_witness_not_active_count = 0;
+static volatile uint32_t diag_irq_grid_witness_already_expired_count = 0;
 
 static volatile uint32_t diag_irq_expired_slots = 0;
 static volatile uint32_t diag_irq_exact_deadline_slots = 0;
@@ -301,6 +423,19 @@ static timepop_handle_t arm_absolute_slot_internal(
   bool                isr_callback,
   uint32_t            target_dwt = 0);
 static bool rearm_recurring_slot_for_epoch(timepop_slot_t& slot);
+static bool rearm_recurring_slot_from_irq(timepop_slot_t& slot,
+                                          uint32_t fire_vclock_raw,
+                                          int64_t fire_gnss_ns,
+                                          const time_anchor_snapshot_t& snap);
+static timepop_handle_t arm_relative_slot_internal(
+  uint64_t            delay_gnss_ns,
+  bool                recurring,
+  timepop_callback_t  callback,
+  void*               user_data,
+  const char*         name,
+  bool                isr_callback,
+  bool                rearm_in_isr
+);
 
 // ============================================================================
 // Helpers
@@ -402,6 +537,68 @@ static inline void update_max_u32(volatile uint32_t& target, uint32_t value) {
   if (value > target) target = value;
 }
 
+static inline uint32_t slot_index_for(const timepop_slot_t& slot) {
+  const timepop_slot_t* base = &slots[0];
+  const timepop_slot_t* ptr = &slot;
+  if (ptr < base || ptr >= base + MAX_SLOTS) return UINT32_MAX;
+  return (uint32_t)(ptr - base);
+}
+
+static inline int32_t signed_deadline_delta_ticks(uint32_t deadline,
+                                                  uint32_t now,
+                                                  bool& already_past) {
+  already_past = deadline_passed(deadline, now);
+  if (already_past) {
+    const uint32_t late = deadline_lateness_ticks(deadline, now);
+    return (late > (uint32_t)INT32_MAX) ? INT32_MIN : -(int32_t)late;
+  }
+  const uint32_t distance = deadline - now;
+  return (distance > (uint32_t)INT32_MAX) ? INT32_MAX : (int32_t)distance;
+}
+
+static void record_slot_arm_diag(timepop_slot_t& slot,
+                                 timepop_arm_source_t source,
+                                 bool has_now,
+                                 uint32_t now,
+                                 int64_t target_gnss_ns) {
+  bool already_past = false;
+  int32_t delta_ticks = 0;
+  if (has_now) {
+    delta_ticks = signed_deadline_delta_ticks(slot.deadline, now, already_past);
+  }
+
+  slot.last_arm_source = source;
+  slot.last_arm_now = has_now ? now : 0;
+  slot.last_arm_deadline = slot.deadline;
+  slot.last_arm_delta_ticks = has_now ? delta_ticks : 0;
+  slot.last_arm_target_gnss_ns = target_gnss_ns;
+  slot.last_arm_dwt = ARM_DWT_CYCCNT;
+  slot.last_arm_already_past = already_past;
+  slot.last_arm_had_now = has_now;
+  if (already_past) slot.arm_already_past_count++;
+
+  diag_arm_last_slot = slot_index_for(slot);
+  diag_arm_last_handle = slot.handle;
+  diag_arm_last_name = slot.name;
+  diag_arm_last_source = arm_source_str(source);
+  diag_arm_last_now = slot.last_arm_now;
+  diag_arm_last_deadline = slot.last_arm_deadline;
+  diag_arm_last_delta_ticks = slot.last_arm_delta_ticks;
+  diag_arm_last_target_gnss_ns = slot.last_arm_target_gnss_ns;
+  diag_arm_last_dwt = slot.last_arm_dwt;
+  diag_arm_last_already_past = already_past;
+  diag_arm_last_had_now = has_now;
+  if (already_past) diag_arm_already_past_count++;
+}
+
+static inline bool slot_name_equals(const timepop_slot_t& slot, const char* name) {
+  return slot.name && name && strcmp(slot.name, name) == 0;
+}
+
+static inline bool slot_is_one_hz_recurring(const timepop_slot_t& slot) {
+  return slot.active && slot.recurring && slot.period_ticks == ONE_HZ_TICKS;
+}
+
 static inline uint32_t ns_to_ticks(uint64_t ns) {
   uint64_t ticks = ns / NS_PER_TICK;
   if (ticks < MIN_DELAY_TICKS) ticks = MIN_DELAY_TICKS;
@@ -455,6 +652,11 @@ static bool rearm_recurring_slot_for_epoch(timepop_slot_t& slot) {
     slot.predicted_dwt = predict_dwt_at_deadline(
         slot.deadline, slot.prediction_valid);
     slot.recurring_rearmed_count++;
+    record_slot_arm_diag(slot,
+                         timepop_arm_source_t::EPOCH_REARM,
+                         true,
+                         vclock_count(),
+                         slot.target_gnss_ns);
     return true;
   }
 
@@ -474,9 +676,93 @@ static bool rearm_recurring_slot_for_epoch(timepop_slot_t& slot) {
     slot.target_gnss_ns = time_dwt_to_gnss_ns(slot.predicted_dwt);
   }
   slot.recurring_rearmed_count++;
+  record_slot_arm_diag(slot,
+                       timepop_arm_source_t::EPOCH_REARM_FALLBACK,
+                       true,
+                       now,
+                       slot.target_gnss_ns);
   return true;
 }
 
+
+
+// Re-arm a critical recurring ISR slot before schedule_next() chooses the next
+// CH2 compare.  This path must not depend on foreground dispatch.  It uses the
+// already-authored CH2 fire facts from the current IRQ pass and falls back to a
+// relative deadline from the captured VCLOCK identity if the absolute GNSS
+// anchor is not yet usable.
+static bool rearm_recurring_slot_from_irq(timepop_slot_t& slot,
+                                          uint32_t fire_vclock_raw,
+                                          int64_t fire_gnss_ns,
+                                          const time_anchor_snapshot_t& snap) {
+  if (!slot.active || !slot.recurring || !slot.rearm_in_isr) return false;
+
+  const uint64_t period_ns = slot.recurring_period_gnss_ns
+      ? slot.recurring_period_gnss_ns
+      : slot.period_ns;
+  if (period_ns == 0) return false;
+
+  const uint32_t period_ticks = ns_to_ticks(period_ns);
+
+  slot.period_ns = period_ns;
+  slot.period_ticks = period_ticks;
+  slot.expired = false;
+  slot.isr_callback_fired = false;
+  slot.fire_vclock_raw = 0;
+  slot.fire_dwt_cyccnt = 0;
+  slot.fire_gnss_ns = -1;
+  slot.fire_capture_source = timepop_fire_capture_source_t::NONE;
+
+  bool rearmed = false;
+  timepop_arm_source_t rearm_source = timepop_arm_source_t::ISR_REARM_FALLBACK;
+
+  if (slot.recurrence_mode == timepop_recurrence_mode_t::ABSOLUTE &&
+      slot.target_gnss_ns > 0 && fire_gnss_ns >= 0) {
+    int64_t next_target_gnss_ns =
+        slot.target_gnss_ns + (int64_t)period_ns;
+
+    if (next_target_gnss_ns <= fire_gnss_ns) {
+      const uint64_t missed =
+          (uint64_t)((fire_gnss_ns - next_target_gnss_ns) /
+                     (int64_t)period_ns) + 1ULL;
+      next_target_gnss_ns += (int64_t)(missed * period_ns);
+      slot.recurring_immediate_expire_count++;
+      slot.recurring_catchup_count += (uint32_t)missed;
+    }
+
+    uint32_t next_deadline = 0;
+    if (gnss_ns_to_vclock_deadline(next_target_gnss_ns, snap, next_deadline)) {
+      slot.target_gnss_ns = next_target_gnss_ns;
+      slot.deadline = next_deadline;
+      slot.is_absolute = true;
+      slot.recurrence_mode = timepop_recurrence_mode_t::ABSOLUTE;
+      rearm_source = timepop_arm_source_t::ISR_REARM;
+      rearmed = true;
+    }
+  }
+
+  if (!rearmed) {
+    slot.deadline = fire_vclock_raw + period_ticks;
+    slot.arm_vclock_raw = fire_vclock_raw;
+    slot.arm_delta_ticks = period_ticks;
+    slot.is_absolute = false;
+    slot.recurrence_mode = timepop_recurrence_mode_t::RELATIVE;
+    slot.target_gnss_ns = (fire_gnss_ns >= 0)
+        ? (fire_gnss_ns + (int64_t)period_ns)
+        : -1;
+    rearmed = true;
+  }
+
+  slot.predicted_dwt = predict_dwt_at_deadline(slot.deadline,
+                                               slot.prediction_valid);
+  slot.recurring_rearmed_count++;
+  record_slot_arm_diag(slot,
+                       rearm_source,
+                       true,
+                       fire_vclock_raw,
+                       slot.target_gnss_ns);
+  return rearmed;
+}
 
 // ============================================================================
 // Absolute GNSS nanosecond → VCLOCK deadline (pure arithmetic)
@@ -628,8 +914,8 @@ static void schedule_next(void) {
         schedule_next_expired_this_pass = true;
       }
       diag_schedule_next_expired_slots++;
-      update_max_u32(diag_schedule_next_late_max_ticks,
-                     deadline_lateness_ticks(slots[i].deadline, now));
+      const uint32_t late_ticks = deadline_lateness_ticks(slots[i].deadline, now);
+      update_max_u32(diag_schedule_next_late_max_ticks, late_ticks);
 
       if (!slots[i].first_expire_recorded) {
         slots[i].first_expire_now = now;
@@ -643,6 +929,23 @@ static void schedule_next(void) {
         shared_fire_dwt = ARM_DWT_CYCCNT;
         shared_fire_captured = true;
       }
+
+      slots[i].schedule_next_expired_count++;
+      slots[i].schedule_next_last_late_ticks = late_ticks;
+      slots[i].schedule_next_last_now = now;
+      slots[i].schedule_next_last_deadline = slots[i].deadline;
+      slots[i].schedule_next_last_dwt = shared_fire_dwt;
+      if (late_ticks > slots[i].schedule_next_late_max_ticks) {
+        slots[i].schedule_next_late_max_ticks = late_ticks;
+      }
+
+      diag_schedule_next_last_expired_slot = i;
+      diag_schedule_next_last_expired_handle = slots[i].handle;
+      diag_schedule_next_last_expired_name = slots[i].name;
+      diag_schedule_next_last_expired_deadline = slots[i].deadline;
+      diag_schedule_next_last_expired_now = now;
+      diag_schedule_next_last_expired_late_ticks = late_ticks;
+      diag_schedule_next_last_expired_dwt = shared_fire_dwt;
 
       expire_slot_with_capture(slots[i],
                                now,
@@ -766,6 +1069,52 @@ void timepop_qtimer1_ch2_handler(const interrupt_event_t& event,
   diag_isr_count++;
 
   bool any_expired = false;
+  bool needs_scheduled_dispatch = false;
+
+  // Pre-scan audit: capture the state of the 1 Hz grid and WITNESS_SCHEDULER
+  // before the IRQ expiry pass mutates any slot.  This tells us whether a
+  // witness timer that is later caught by schedule_next() was visible at the
+  // shared one-second IRQ boundary.
+  uint32_t audit_onehz_due_count = 0;
+  uint32_t audit_witness_slot = UINT32_MAX;
+  uint32_t audit_witness_handle = 0;
+  bool audit_witness_seen = false;
+  bool audit_witness_active = false;
+  bool audit_witness_expired_before = false;
+  bool audit_witness_reached_before = false;
+  bool audit_witness_passed_before = false;
+  uint32_t audit_witness_deadline = 0;
+  uint32_t audit_witness_distance_ticks = 0;
+  uint32_t audit_witness_late_ticks = 0;
+
+  for (uint32_t i = 0; i < MAX_SLOTS; i++) {
+    if (slot_name_equals(slots[i], WITNESS_SCHEDULER_NAME)) {
+      audit_witness_seen = true;
+      audit_witness_slot = i;
+      audit_witness_handle = slots[i].handle;
+      audit_witness_active = slots[i].active;
+      audit_witness_expired_before = slots[i].expired;
+      audit_witness_deadline = slots[i].deadline;
+      if (slots[i].active && !slots[i].expired) {
+        audit_witness_reached_before = deadline_reached(slots[i].deadline, now);
+        audit_witness_passed_before = deadline_passed(slots[i].deadline, now);
+        if (audit_witness_passed_before) {
+          audit_witness_late_ticks = deadline_lateness_ticks(slots[i].deadline, now);
+        } else {
+          audit_witness_distance_ticks = slots[i].deadline - now;
+        }
+      }
+    }
+
+    if (slot_is_one_hz_recurring(slots[i]) &&
+        !slots[i].expired &&
+        deadline_reached(slots[i].deadline, now)) {
+      audit_onehz_due_count++;
+    }
+  }
+
+  const bool audit_grid_this_irq =
+      audit_onehz_due_count > 0 || audit_witness_reached_before;
 
   // Phase 1: author the shared fire facts for every slot reached by this
   // physical CH2 compare event before any user callback is allowed to run.
@@ -797,6 +1146,18 @@ void timepop_qtimer1_ch2_handler(const interrupt_event_t& event,
     }
     diag_irq_expired_slots++;
 
+    slots[i].irq_reached_count++;
+    slots[i].irq_last_now = now;
+    slots[i].irq_last_dwt = dwt_entry;
+    slots[i].irq_last_late_ticks = late_ticks;
+    slots[i].irq_last_exact = (late_ticks == 0);
+    if (late_ticks > slots[i].irq_late_max_ticks) {
+      slots[i].irq_late_max_ticks = late_ticks;
+    }
+
+    const bool is_critical_isr_recurring =
+        slots[i].isr_callback && slots[i].rearm_in_isr && slots[i].recurring;
+
     slot_capture(slots[i],
                  now,
                  dwt_entry,
@@ -804,11 +1165,56 @@ void timepop_qtimer1_ch2_handler(const interrupt_event_t& event,
                  anchor,
                  timepop_fire_capture_source_t::IRQ_CH2);
     slots[i].expired = true;
+    slots[i].irq_expired_by_irq_count++;
     slots[i].isr_callback_fired = false;
     expired_this_pass[i] = true;
     expired_count++;
-    timepop_pending = true;
+    if (!is_critical_isr_recurring) {
+      timepop_pending = true;
+      needs_scheduled_dispatch = true;
+    }
     any_expired = true;
+  }
+
+  if (audit_grid_this_irq) {
+    uint32_t audit_onehz_expired_count = 0;
+    for (uint32_t i = 0; i < MAX_SLOTS; i++) {
+      if (slot_is_one_hz_recurring(slots[i]) && expired_this_pass[i]) {
+        audit_onehz_expired_count++;
+      }
+    }
+
+    const bool witness_expired_by_irq =
+        audit_witness_seen &&
+        audit_witness_slot < MAX_SLOTS &&
+        expired_this_pass[audit_witness_slot];
+
+    diag_irq_grid_audit_count++;
+    diag_irq_grid_last_now = now;
+    diag_irq_grid_last_dwt = dwt_entry;
+    diag_irq_grid_onehz_due_count = audit_onehz_due_count;
+    diag_irq_grid_onehz_expired_count = audit_onehz_expired_count;
+    diag_irq_grid_witness_slot = audit_witness_slot;
+    diag_irq_grid_witness_handle = audit_witness_handle;
+    diag_irq_grid_witness_seen = audit_witness_seen;
+    diag_irq_grid_witness_active = audit_witness_active;
+    diag_irq_grid_witness_expired_before = audit_witness_expired_before;
+    diag_irq_grid_witness_reached_before = audit_witness_reached_before;
+    diag_irq_grid_witness_passed_before = audit_witness_passed_before;
+    diag_irq_grid_witness_expired_by_irq = witness_expired_by_irq;
+    diag_irq_grid_witness_deadline = audit_witness_deadline;
+    diag_irq_grid_witness_distance_ticks = audit_witness_distance_ticks;
+    diag_irq_grid_witness_late_ticks = audit_witness_late_ticks;
+
+    if (audit_witness_seen && audit_witness_reached_before && !witness_expired_by_irq) {
+      diag_irq_grid_witness_missed_count++;
+    }
+    if (audit_onehz_due_count > 0 && (!audit_witness_seen || !audit_witness_active)) {
+      diag_irq_grid_witness_not_active_count++;
+    }
+    if (audit_onehz_due_count > 0 && audit_witness_seen && audit_witness_expired_before) {
+      diag_irq_grid_witness_already_expired_count++;
+    }
   }
 
   // Phase 2: now that the fire facts are stable for all simultaneous slots,
@@ -828,11 +1234,22 @@ void timepop_qtimer1_ch2_handler(const interrupt_event_t& event,
     slots[i].callback(&ctx, &diag, slots[i].user_data);
     slots[i].isr_callback_fired = true;
     diag_isr_callbacks++;
+
+    if (slots[i].recurring && slots[i].rearm_in_isr) {
+      if (rearm_recurring_slot_from_irq(slots[i], now, event_fire_gnss_ns, anchor)) {
+        diag_isr_recurring_rearmed++;
+      } else {
+        slots[i] = {};
+        diag_isr_recurring_rearm_failures++;
+      }
+    }
   }
 
   if (any_expired) {
     isr_fire_count++;
-    timepop_pending = true;
+    if (needs_scheduled_dispatch) {
+      timepop_pending = true;
+    }
   } else {
     phantom_count++;
   }
@@ -932,10 +1349,10 @@ static timepop_handle_t arm_deferred(deferred_slot_t* slots_buf,
 // QTimer1 hardware initialization moved to process_interrupt
 // ============================================================================
 //
-// CH0/CH1 cascade and CH2 scheduler channel are now initialized by
-// process_interrupt_init_hardware().  TimePop only programs the CH2
-// compare register as it schedules slots; the channel mode/control
-// setup is no longer TimePop's responsibility.
+// CH0 passive VCLOCK counter and CH2 scheduler channel are initialized by
+// process_interrupt_init_hardware().  TimePop only requests CH2 compare
+// updates as it schedules slots; the channel mode/control setup is no longer
+// TimePop's responsibility.
 
 // ============================================================================
 // Initialization
@@ -950,7 +1367,7 @@ void timepop_init(void) {
   diag_deadline_last_target_gnss_ns = -1;
   diag_deadline_last_anchor_pps_gnss_ns = -1;
   diag_deadline_last_ns_from_anchor = 0;
-  // QTimer1 hardware (CH0/CH1/CH2) is initialized by
+  // QTimer1 hardware (CH0/CH2) is initialized by
   // process_interrupt_init_hardware().  IRQ vector and NVIC priority
   // are owned by process_interrupt_enable_irqs().  We just register
   // our CH2 handler here; the dispatcher will invoke it in IRQ
@@ -1015,6 +1432,7 @@ static timepop_handle_t arm_absolute_slot_internal(
     slots[i].name           = name;
     slots[i].fire_gnss_ns   = -1;
     slots[i].isr_callback   = isr_callback;
+    slots[i].rearm_in_isr  = false;
     slots[i].recurring_rearmed_count = 0;
     slots[i].recurring_immediate_expire_count = 0;
     slots[i].recurring_catchup_count = 0;
@@ -1031,6 +1449,14 @@ static timepop_handle_t arm_absolute_slot_internal(
     } else {
       slots[i].predicted_dwt = predict_dwt_at_deadline(deadline, slots[i].prediction_valid);
     }
+
+    record_slot_arm_diag(slots[i],
+                         (target_dwt != 0)
+                             ? timepop_arm_source_t::EXACT_ARM
+                             : timepop_arm_source_t::ABSOLUTE_ARM,
+                         true,
+                         vclock_count(),
+                         slots[i].target_gnss_ns);
 
     diag_schedule_next_calls_from_other++;
     schedule_next();
@@ -1051,14 +1477,17 @@ static timepop_handle_t arm_absolute_slot_internal(
 // This is the ONLY arming path that reads the ambient VCLOCK counter,
 // because "from now" inherently requires knowing "now."
 
-timepop_handle_t timepop_arm(
+static timepop_handle_t arm_relative_slot_internal(
   uint64_t            delay_gnss_ns,
   bool                recurring,
   timepop_callback_t  callback,
   void*               user_data,
-  const char*         name
+  const char*         name,
+  bool                isr_callback,
+  bool                rearm_in_isr
 ) {
   if (!callback) return TIMEPOP_INVALID_HANDLE;
+  if (rearm_in_isr && (!recurring || !isr_callback)) return TIMEPOP_INVALID_HANDLE;
 
   const uint32_t saved = critical_enter();
 
@@ -1087,7 +1516,9 @@ timepop_handle_t timepop_arm(
     slots[i].name         = name;
     slots[i].fire_gnss_ns = -1;
     slots[i].target_gnss_ns = -1;
-    slots[i].isr_callback = false;
+    slots[i].isr_callback = isr_callback;
+    slots[i].isr_callback_fired = false;
+    slots[i].rearm_in_isr = rearm_in_isr;
     slots[i].recurring_rearmed_count = 0;
     slots[i].recurring_immediate_expire_count = 0;
     slots[i].recurring_catchup_count = 0;
@@ -1110,7 +1541,9 @@ timepop_handle_t timepop_arm(
     if (recurring) {
       // Recurring timers are phase-locked to the PPS/VCLOCK grid implied by
       // their period.  The first fire snaps to the next legal grid boundary;
-      // subsequent fires advance by the exact period.
+      // subsequent fires advance by the exact period.  Critical ISR recurring
+      // slots keep this phase grid when possible, but will rearm from the
+      // captured IRQ event if the anchor is temporarily unavailable.
       if (!configure_phase_locked_recurring_slot(slots[i], delay_gnss_ns)) {
         slots[i].recurrence_mode = timepop_recurrence_mode_t::RELATIVE;
         slots[i].recurring_period_gnss_ns = delay_gnss_ns;
@@ -1124,6 +1557,14 @@ timepop_handle_t timepop_arm(
       slots[i].target_gnss_ns = time_dwt_to_gnss_ns(slots[i].predicted_dwt);
     }
 
+    record_slot_arm_diag(slots[i],
+                         slots[i].is_absolute
+                             ? timepop_arm_source_t::RELATIVE_ARM_PHASE_LOCKED
+                             : timepop_arm_source_t::RELATIVE_ARM,
+                         true,
+                         vclock_count(),
+                         slots[i].target_gnss_ns);
+
     diag_schedule_next_calls_from_other++;
     schedule_next();
 
@@ -1135,6 +1576,37 @@ timepop_handle_t timepop_arm(
   diag_arm_failures++;
   critical_exit(saved);
   return TIMEPOP_INVALID_HANDLE;
+}
+
+timepop_handle_t timepop_arm(
+  uint64_t            delay_gnss_ns,
+  bool                recurring,
+  timepop_callback_t  callback,
+  void*               user_data,
+  const char*         name
+) {
+  return arm_relative_slot_internal(delay_gnss_ns,
+                                    recurring,
+                                    callback,
+                                    user_data,
+                                    name,
+                                    false,
+                                    false);
+}
+
+timepop_handle_t timepop_arm_recurring_isr(
+  uint64_t            period_gnss_ns,
+  timepop_callback_t  callback,
+  void*               user_data,
+  const char*         name
+) {
+  return arm_relative_slot_internal(period_gnss_ns,
+                                    true,
+                                    callback,
+                                    user_data,
+                                    name,
+                                    true,
+                                    true);
 }
 
 timepop_handle_t timepop_arm_asap(
@@ -1343,8 +1815,14 @@ void timepop_dispatch(void) {
 
   for (uint32_t i = 0; i < MAX_SLOTS; i++) {
     if (!slots[i].active || !slots[i].expired) continue;
-    slots[i].expired = false;
 
+    // Keep the slot quarantined as expired while its scheduled-context
+    // callback runs.  A callback is allowed to arm/cancel other TimePop work,
+    // and those operations may call schedule_next().  If we clear expired
+    // before the recurring rearm has installed a new deadline, schedule_next()
+    // can rediscover this same slot with its old, already-past deadline and
+    // manufacture a false SCHEDULE_NEXT expiry.  The slot remains expired until
+    // its next appointment is fully authored below.
     const bool callback_already_ran = slots[i].isr_callback_fired;
     slots[i].isr_callback_fired = false;
 
@@ -1362,6 +1840,14 @@ void timepop_dispatch(void) {
 
       cpu_usage_account_busy(end - start);
       diag_dispatch_callbacks++;
+    }
+
+    // The callback may have cancelled or otherwise retired this slot.  Do not
+    // resurrect it by performing the normal recurring rearm path afterward.
+    if (!slots[i].active) {
+      slots[i].expired = false;
+      slots[i].isr_callback_fired = false;
+      continue;
     }
 
     // ── Recurring rearm ──
@@ -1383,6 +1869,8 @@ void timepop_dispatch(void) {
         uint32_t next_deadline = 0;
         if (!gnss_ns_to_vclock_deadline(next_target_gnss_ns, snap, next_deadline)) {
           slots[i].active = false;
+          slots[i].expired = false;
+          slots[i].isr_callback_fired = false;
         } else {
           slots[i].target_gnss_ns = next_target_gnss_ns;
           slots[i].deadline = next_deadline;
@@ -1390,12 +1878,19 @@ void timepop_dispatch(void) {
           slots[i].predicted_dwt = predict_dwt_at_deadline(
             slots[i].deadline, slots[i].prediction_valid);
           slots[i].expired = false;
+          record_slot_arm_diag(slots[i],
+                               timepop_arm_source_t::DISPATCH_ABSOLUTE_REARM,
+                               true,
+                               vclock_count(),
+                               slots[i].target_gnss_ns);
           const uint32_t saved = critical_enter();
           schedule_next();
           critical_exit(saved);
         }
       } else if (slots[i].period_ticks == 0) {
         slots[i].active = false;
+        slots[i].expired = false;
+        slots[i].isr_callback_fired = false;
       } else {
         // Relative recurring is only a bootstrap/fallback state.  As soon as a
         // lawful time anchor is available, promote it onto the PPS/VCLOCK phase
@@ -1429,12 +1924,21 @@ void timepop_dispatch(void) {
         }
 
         slots[i].expired = false;
+        record_slot_arm_diag(slots[i],
+                             slots[i].is_absolute
+                                 ? timepop_arm_source_t::DISPATCH_PHASE_LOCKED_REARM
+                                 : timepop_arm_source_t::DISPATCH_RELATIVE_REARM,
+                             true,
+                             vclock_count(),
+                             slots[i].target_gnss_ns);
         const uint32_t saved = critical_enter();
         schedule_next();
         critical_exit(saved);
       }
     } else {
       slots[i].active = false;
+      slots[i].expired = false;
+      slots[i].isr_callback_fired = false;
     }
   }
 
@@ -1551,6 +2055,8 @@ static Payload cmd_report(const Payload&) {
   out.add("isr_fires",         isr_fire_count);
   out.add("isr_count",         diag_isr_count);
   out.add("isr_callbacks",     diag_isr_callbacks);
+  out.add("isr_recurring_rearmed", diag_isr_recurring_rearmed);
+  out.add("isr_recurring_rearm_failures", diag_isr_recurring_rearm_failures);
   out.add("phantom_count",     phantom_count);
   out.add("expired",           expired_count);
   out.add("rearm_count",       diag_rearm_count);
@@ -1603,6 +2109,56 @@ static Payload cmd_report(const Payload&) {
   out.add("schedule_next_expired_passes",      diag_schedule_next_expired_passes);
   out.add("schedule_next_expired_slots",       diag_schedule_next_expired_slots);
   out.add("schedule_next_late_max_ticks",      diag_schedule_next_late_max_ticks);
+  out.add("schedule_next_last_expired_slot",   diag_schedule_next_last_expired_slot);
+  out.add("schedule_next_last_expired_handle", diag_schedule_next_last_expired_handle);
+  out.add("schedule_next_last_expired_name",
+          (const char*)(diag_schedule_next_last_expired_name
+                            ? diag_schedule_next_last_expired_name
+                            : ""));
+  out.add("schedule_next_last_expired_deadline",
+          diag_schedule_next_last_expired_deadline);
+  out.add("schedule_next_last_expired_now",
+          diag_schedule_next_last_expired_now);
+  out.add("schedule_next_last_expired_late_ticks",
+          diag_schedule_next_last_expired_late_ticks);
+  out.add("schedule_next_last_expired_dwt",
+          diag_schedule_next_last_expired_dwt);
+
+  out.add("arm_already_past_count",            diag_arm_already_past_count);
+  out.add("arm_last_slot",                     diag_arm_last_slot);
+  out.add("arm_last_handle",                   diag_arm_last_handle);
+  out.add("arm_last_name",
+          (const char*)(diag_arm_last_name ? diag_arm_last_name : ""));
+  out.add("arm_last_source",
+          (const char*)(diag_arm_last_source ? diag_arm_last_source : ""));
+  out.add("arm_last_now",                      diag_arm_last_now);
+  out.add("arm_last_deadline",                 diag_arm_last_deadline);
+  out.add("arm_last_delta_ticks",              diag_arm_last_delta_ticks);
+  out.add("arm_last_target_gnss_ns",           diag_arm_last_target_gnss_ns);
+  out.add("arm_last_dwt",                      diag_arm_last_dwt);
+  out.add("arm_last_already_past",             diag_arm_last_already_past);
+  out.add("arm_last_had_now",                  diag_arm_last_had_now);
+
+  out.add("irq_grid_audit_count",              diag_irq_grid_audit_count);
+  out.add("irq_grid_last_now",                 diag_irq_grid_last_now);
+  out.add("irq_grid_last_dwt",                 diag_irq_grid_last_dwt);
+  out.add("irq_grid_onehz_due_count",          diag_irq_grid_onehz_due_count);
+  out.add("irq_grid_onehz_expired_count",      diag_irq_grid_onehz_expired_count);
+  out.add("irq_grid_witness_slot",             diag_irq_grid_witness_slot);
+  out.add("irq_grid_witness_handle",           diag_irq_grid_witness_handle);
+  out.add("irq_grid_witness_seen",             diag_irq_grid_witness_seen);
+  out.add("irq_grid_witness_active",           diag_irq_grid_witness_active);
+  out.add("irq_grid_witness_expired_before",   diag_irq_grid_witness_expired_before);
+  out.add("irq_grid_witness_reached_before",   diag_irq_grid_witness_reached_before);
+  out.add("irq_grid_witness_passed_before",    diag_irq_grid_witness_passed_before);
+  out.add("irq_grid_witness_expired_by_irq",   diag_irq_grid_witness_expired_by_irq);
+  out.add("irq_grid_witness_deadline",         diag_irq_grid_witness_deadline);
+  out.add("irq_grid_witness_distance_ticks",   diag_irq_grid_witness_distance_ticks);
+  out.add("irq_grid_witness_late_ticks",       diag_irq_grid_witness_late_ticks);
+  out.add("irq_grid_witness_missed_count",     diag_irq_grid_witness_missed_count);
+  out.add("irq_grid_witness_not_active_count", diag_irq_grid_witness_not_active_count);
+  out.add("irq_grid_witness_already_expired_count",
+          diag_irq_grid_witness_already_expired_count);
 
   out.add("irq_expired_slots",                 diag_irq_expired_slots);
   out.add("irq_exact_deadline_slots",          diag_irq_exact_deadline_slots);
@@ -1620,36 +2176,9 @@ static Payload cmd_report(const Payload&) {
   out.add("qtmr1_ch2_comp1",  (uint32_t)interrupt_qtimer1_ch2_comp1_now());
   out.add("qtmr1_ch2_csctrl", (uint32_t)interrupt_qtimer1_ch2_csctrl_now());
 
-  PayloadArray timers;
-  for (uint32_t i = 0; i < MAX_SLOTS; i++) {
-    if (!slots[i].active) continue;
+  // Detailed per-slot diagnostics are intentionally excluded from REPORT.
+  // Use TIMEPOP.SLOTS when the full slot table is needed.
 
-    Payload entry;
-    entry.add("slot",      i);
-    entry.add("handle",    slots[i].handle);
-    entry.add("name",      slots[i].name ? slots[i].name : "");
-    entry.add("period_ns", slots[i].period_ns);
-    entry.add("ticks",     slots[i].period_ticks);
-    entry.add("deadline",  slots[i].deadline);
-    entry.add("recurring", slots[i].recurring);
-    entry.add("expired",   slots[i].expired);
-    entry.add("isr_cb",    slots[i].isr_callback);
-    entry.add("is_absolute", slots[i].is_absolute);
-    entry.add("target_gnss_ns", slots[i].target_gnss_ns);
-    entry.add("predicted_dwt", slots[i].predicted_dwt);
-    entry.add("prediction_valid", slots[i].prediction_valid);
-    entry.add("fire_capture_source",
-              fire_capture_source_str(slots[i].fire_capture_source));
-    entry.add("fire_gnss_ns",    slots[i].fire_gnss_ns);
-    entry.add("fire_dwt_cyccnt", slots[i].fire_dwt_cyccnt);
-    entry.add("fire_vclock_raw", slots[i].fire_vclock_raw);
-    entry.add("recurring_rearmed_count",          slots[i].recurring_rearmed_count);
-    entry.add("recurring_immediate_expire_count", slots[i].recurring_immediate_expire_count);
-    entry.add("recurring_catchup_count",          slots[i].recurring_catchup_count);
-
-    timers.add(entry);
-  }
-  out.add_array("timers", timers);
 
   return out;
 }
@@ -1658,15 +2187,76 @@ static Payload cmd_report(const Payload&) {
 // QTimer1 vector ownership moved to process_interrupt
 // ============================================================================
 //
-// process_interrupt now owns IRQ_QTIMER1 and dispatches both CH2 (this
-// file's timepop_qtimer1_ch2_handler, registered via
-// interrupt_register_qtimer1_ch2_handler at init) and CH3 (its own
-// internal vclock_cadence_isr).  TimePop is the CH2 hosted client;
-// the previous CH3 hosted-client registration mechanism (where TimePop
-// hosted process_interrupt's CH3 handler) has been retired.
+// process_interrupt owns IRQ_QTIMER1 and dispatches CH2 to TimePop's
+// registered handler.  VCLOCK cadence and any other white-glove substrate
+// maintenance clients are represented as TimePop slots; critical recurring
+// ISR slots can callback and rearm inside this CH2 IRQ pass before the next
+// compare is selected.
+
+
+static void add_timers_array(Payload& out) {
+  PayloadArray timers;
+  for (uint32_t i = 0; i < MAX_SLOTS; i++) {
+    if (!slots[i].active) continue;
+
+    Payload entry;
+
+    // Compact operational slot table.
+    //
+    // Keep this intentionally small: TIMEPOP.REPORT carries the global
+    // forensic counters, while TIMEPOP.SLOTS should survive the transport /
+    // Payload element ceiling even when the table is crowded.  The fields
+    // below identify the slot, its next deadline, its scheduling class, and
+    // the only remaining per-slot health signals we need after the witness
+    // quarantine bug was found.
+    entry.add("slot",      i);
+    entry.add("handle",    slots[i].handle);
+    entry.add("name",      slots[i].name ? slots[i].name : "");
+    entry.add("deadline",  slots[i].deadline);
+    entry.add("expired",   slots[i].expired);
+
+    entry.add("period_ns", slots[i].period_ns);
+    entry.add("ticks",     slots[i].period_ticks);
+    entry.add("target_gnss_ns", slots[i].target_gnss_ns);
+
+    entry.add("recurring", slots[i].recurring);
+    entry.add("is_absolute", slots[i].is_absolute);
+    entry.add("isr_cb",    slots[i].isr_callback);
+    entry.add("rearm_in_isr", slots[i].rearm_in_isr);
+
+    entry.add("schedule_next_expired_count", slots[i].schedule_next_expired_count);
+    entry.add("schedule_next_late_max_ticks", slots[i].schedule_next_late_max_ticks);
+    entry.add("irq_expired_by_irq_count", slots[i].irq_expired_by_irq_count);
+    entry.add("last_arm_delta_ticks", slots[i].last_arm_delta_ticks);
+
+    timers.add(entry);
+  }
+  out.add_array("timers", timers);
+}
+
+static Payload cmd_slots(const Payload&) {
+  Payload out;
+  out.add("slots_active_now", timepop_active_count());
+  out.add("slots_high_water", diag_slots_high_water);
+  out.add("slots_max", (uint32_t)MAX_SLOTS);
+  out.add("vclock_raw_now", vclock_count());
+  out.add("time_valid", time_valid());
+  out.add("time_pps_count", time_pps_count());
+  out.add("schedule_next_expired_passes", diag_schedule_next_expired_passes);
+  out.add("schedule_next_expired_slots", diag_schedule_next_expired_slots);
+  out.add("schedule_next_late_max_ticks", diag_schedule_next_late_max_ticks);
+  out.add("irq_expired_slots", diag_irq_expired_slots);
+  out.add("irq_exact_deadline_slots", diag_irq_exact_deadline_slots);
+  out.add("irq_late_deadline_slots", diag_irq_late_deadline_slots);
+  out.add("isr_recurring_rearmed", diag_isr_recurring_rearmed);
+  out.add("isr_recurring_rearm_failures", diag_isr_recurring_rearm_failures);
+  add_timers_array(out);
+  return out;
+}
 
 static const process_command_entry_t TIMEPOP_COMMANDS[] = {
   { "REPORT",                 cmd_report                 },
+  { "SLOTS",                  cmd_slots                  },
   { nullptr,                  nullptr                    }
 };
 

@@ -10,7 +10,7 @@
 // TimePop is ZPNet's phase-locked timer subsystem.
 //
 // Core model:
-//   • QTimer1 CH0+CH1 form a passive 32-bit VCLOCK counter at 10 MHz.
+//   • QTimer1 CH0 is the passive VCLOCK counter at 10 MHz.
 //   • One VCLOCK tick = 100 ns.
 //   • QTimer1 CH2 is the dynamic compare scheduler.
 //   • All public timing semantics are expressed in GNSS nanoseconds.
@@ -38,6 +38,14 @@
 //
 //   6. Caller-owned exact target scheduling
 //        timepop_arm_ns(target_gnss_ns, target_dwt, ...)
+//
+//   7. Critical recurring ISR scheduling
+//        timepop_arm_recurring_isr(period_gnss_ns, ...)
+//
+//      Use only for tiny substrate-maintenance clients that must callback and
+//      rearm inside the CH2 IRQ pass before TimePop selects the next compare.
+//      The callback receives the same shared fire facts as other same-deadline
+//      timed clients.
 //
 // TimePop owns:
 //   • timed slot scheduling
@@ -108,6 +116,13 @@ typedef void (*timepop_callback_t)(
 timepop_handle_t timepop_arm(
   uint64_t            delay_gnss_ns,
   bool                recurring,
+  timepop_callback_t  callback,
+  void*               user_data,
+  const char*         name
+);
+
+timepop_handle_t timepop_arm_recurring_isr(
+  uint64_t            period_gnss_ns,
   timepop_callback_t  callback,
   void*               user_data,
   const char*         name

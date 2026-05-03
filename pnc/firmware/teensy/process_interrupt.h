@@ -5,19 +5,19 @@
 // Interrupt custody and per-lane 1 kHz cadence:
 //
 //   • OCXO lanes    (QTimer3 vector — CH2, CH3)
-//   • VCLOCK lane   (QTimer1 vector — CH3)
-//   • TimePop       (QTimer1 vector — CH2, hosted client)
+//   • VCLOCK lane   (critical recurring TimePop client on QTimer1 CH2)
+//   • TimePop       (QTimer1 CH2, hosted scheduler/client rail)
 //   • PPS GPIO edge (diagnostics + dispatch authority + epoch anchor)
 //
 // QTimer1 vector custody:
 //
 //   QTimer1 has a single shared IRQ vector across all four channels.
 //   process_interrupt owns the vector and dispatches in IRQ context:
-//     • CH1 flag set → hosted compare rail plus internal PPS phase probe
+//     • CH1 flag set → legacy hosted compare rail, if explicitly armed
 //     • CH2 flag set → registered TimePop scheduler handler
-//     • CH3 flag set → vclock_cadence_isr (process_interrupt internal)
-//   All handlers receive the same first-instruction DWT capture, so
-//   they get identical latency profiles.
+//   VCLOCK cadence no longer owns a private QTimer1 compare channel.  It is
+//   a critical recurring TimePop slot that runs from the CH2 shared fire facts
+//   and rearms inside the CH2 ISR pass before TimePop chooses the next compare.
 //
 //   TimePop owns scheduler policy only.  process_interrupt owns the CH2
 //   compare-register programming; TimePop requests target updates through
@@ -59,14 +59,18 @@
 //
 // ─── PPS-anchored VCLOCK cadence ────────────────────────────────────────────
 //
-//   The VCLOCK cadence is PPS-anchored.  On the first physical PPS
-//   edge after a rebootstrap request, the GPIO ISR captures the
-//   QTimer1 CH0 low-word count and the QTimer1 CH3 16-bit count
-//   immediately after the DWT capture, then re-programs CH3's
-//   compare target to fire exactly VCLOCK_INTERVAL_COUNTS ticks later
-//   — aligning the VCLOCK cadence with the PPS moment.  From that
-//   moment on, every VCLOCK one-second event fires exactly 1 second
-//   after the PPS moment, modulo consistent ISR latency.
+//   The VCLOCK cadence is PPS-anchored but no longer uses QTimer1 CH3.
+//   On the first physical PPS edge after a rebootstrap request, the GPIO ISR
+//   captures the QTimer1 CH0 low-word count and selects the sacred VCLOCK edge.
+//   The already-running VCLOCK_CADENCE TimePop client consumes a CH2 shared
+//   fire fact, back-projects from that cadence event to the selected edge, and
+//   publishes the canonical PPS_VCLOCK epoch.
+//
+//   VCLOCK_CADENCE is armed with TimePop's critical recurring ISR mode.  Its
+//   callback refreshes the process_interrupt-owned synthetic VCLOCK low-word
+//   anchor inside the CH2 ISR pass, before TimePop calls schedule_next().  This
+//   prevents TimePop from scheduling future compares from a stale VCLOCK
+//   synthetic anchor while preserving the single-compare-rail architecture.
 //
 // ─── PPS GPIO edge — three roles ────────────────────────────────────────────
 //
@@ -87,18 +91,17 @@
 //
 // ─── Per-lane cadence mechanics ─────────────────────────────────────────────
 //
-//   Three lanes (VCLOCK, OCXO1, OCXO2), each cadenced by its own
-//   QuadTimer compare channel at 1 kHz.  Identical hardware-to-software
-//   latency profile: compare match → NVIC → ISR → DWT capture as first
-//   instruction.  The 1 kHz cadence exists because the QuadTimer
-//   compare registers are 16-bit — advancing 10,000,000 counts in one
-//   shot would overflow many times over.
+//   Three lanes (VCLOCK, OCXO1, OCXO2) produce one-second subscriber events.
+//   OCXO lanes are still cadenced by their own QTimer3 compare channels at
+//   1 kHz because their 16-bit compare registers cannot span a full second.
+//   VCLOCK cadence is now a TimePop critical recurring ISR slot on QTimer1 CH2,
+//   sharing fire facts with other same-deadline TimePop clients.
 //
 //   Cadence sources:
-//     VCLOCK : QTimer1 CH3 compare, +10000 counts/interval (GNSS 10 MHz)
-//              QTimer1 CH0 is the low-word VCLOCK counter; CH1 is a hosted
-//              VCLOCK-domain compare rail owned by process_interrupt and is
-//              also used internally every PPS as a near-future phase probe.
+//     VCLOCK : TimePop critical recurring ISR slot, +10000 counts/interval
+//              in the GNSS-disciplined 10 MHz VCLOCK domain.  QTimer1 CH0 is
+//              the passive low-word VCLOCK counter; QTimer1 CH2 is the only
+//              active TimePop compare rail.
 //     OCXO1  : QTimer3 CH2 compare, +10000 counts/interval (OCXO1 10 MHz)
 //     OCXO2  : QTimer3 CH3 compare, +10000 counts/interval (OCXO2 10 MHz)
 // ============================================================================
@@ -514,10 +517,11 @@ bool interrupt_stop(interrupt_subscriber_kind_t kind);
 // Alpha calls interrupt_request_pps_rebootstrap() when it needs a fresh
 // PPS-anchored epoch (at boot, ZERO, START).  The next PPS GPIO edge will:
 //   • Capture the VCLOCK counter at ISR entry.
-//   • Reprogram CH3's compare to fire VCLOCK_INTERVAL_COUNTS ticks later,
-//     aligning the VCLOCK cadence with the PPS moment.
-//   • Reset tick_mod_1000 to 0 so the first post-anchor one-second event
-//     fires exactly VCLOCK_COUNTS_PER_SECOND ticks after PPS.
+//   • Select the sacred VCLOCK edge associated with PPS.
+//   • Let the critical TimePop VCLOCK_CADENCE client back-project from its
+//     next CH2 shared fire fact to that selected edge.
+//   • Reset tick_mod_1000 so the first post-anchor one-second event lands on
+//     the PPS/VCLOCK boundary.
 //   • Seed the private synthetic VCLOCK counter32 from pvc.counter32_at_edge.
 //   • Clear the rebootstrap pending flag.
 void interrupt_request_pps_rebootstrap(void);

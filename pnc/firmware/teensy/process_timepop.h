@@ -8,6 +8,7 @@
 //   • priority-queue slot scheduling
 //   • PPS/VCLOCK phase-locked recurring series
 //   • shared captured fire facts for same-event timed clients
+//   • critical recurring ISR clients that callback/rearm before schedule_next
 //   • deferred callback dispatch
 //   • instrumentation / reports
 //   • scheduler policy for QTimer1 CH2 compare deadlines
@@ -17,7 +18,7 @@
 //   • OCXO interrupt custody
 //   • QTimer1 vector custody — process_interrupt owns IRQ_QTIMER1 and
 //     dispatches CH2 to TimePop's registered handler in IRQ context
-//   • QTimer1 CH0/CH1/CH2 hardware mode init — process_interrupt does
+//   • QTimer1 CH0/CH2 hardware mode init — process_interrupt does
 //     the one-time CTRL/SCTRL/CSCTRL/COMP1/CMPLD1 setup
 //
 // Those are owned by process_interrupt.
@@ -25,11 +26,11 @@
 // QTimer1 CH2 hosted-handler API (TimePop is the hosted client):
 //
 //   QTimer1 has only one IRQ vector shared across all four channels.
-//   process_interrupt owns the vector and dispatches in IRQ context:
-//     • CH2 flag set → TimePop's registered handler (this file)
-//     • CH3 flag set → process_interrupt's internal vclock_cadence_isr
-//   Each handler receives a normalized DWT-at-edge capture for its own
-//   QTimer event.
+//   process_interrupt owns the vector and dispatches CH2 in IRQ context to
+//   TimePop's registered handler.  VCLOCK cadence is no longer a separate
+//   QTimer1 compare path; it is a TimePop critical recurring ISR client.
+//
+//   The handler receives a normalized DWT-at-edge capture for the CH2 event.
 //
 //   For timed TimePop clients, all slots reached by one physical CH2 event
 //   receive the same fire_vclock_raw, fire_dwt_cyccnt, and fire_gnss_ns.
@@ -57,7 +58,7 @@
 //       slots are scheduled
 //
 //   process_interrupt is responsible for:
-//     • initializing CH0/CH1/CH2 hardware (one-time mode/control)
+//     • initializing CH0/CH2 hardware (one-time mode/control)
 //     • clearing the CH2 TCF1 flag in the QTimer1 ISR before
 //       invoking TimePop's handler
 //     • building the event/diag payloads passed to TimePop
@@ -66,6 +67,11 @@
 //   foreground scheduler ever has to discover an already-past timed slot,
 //   that condition is surfaced through report counters rather than hidden as
 //   a normal precision event.
+//
+//   Critical recurring ISR clients are the white-glove exception for tiny
+//   substrate-maintenance work.  They are still ordinary TimePop slots and
+//   share CH2 fire facts, but their callbacks and recurring rearm happen
+//   inside the CH2 IRQ pass before schedule_next() selects the next compare.
 //
 // ============================================================================
 

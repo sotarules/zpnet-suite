@@ -37,8 +37,8 @@
 // Constants
 // =============================================================
 
-static constexpr uint64_t TRANSPORT_RX_POLL_NS = 1000000ULL;  // 1 millisecond
-static constexpr uint64_t TRANSPORT_TX_POLL_NS = 1000000ULL;  // 1 millisecond
+static constexpr uint64_t TRANSPORT_RX_POLL_NS = 2000000ULL;  // 1 millisecond
+static constexpr uint64_t TRANSPORT_TX_POLL_NS = 2000000ULL;  // 1 millisecond
 
 static constexpr size_t TRANSPORT_BLOCK_SIZE = 64;
 static constexpr size_t RX_BUF_MAX           = TRANSPORT_MAX_MESSAGE + 64;
