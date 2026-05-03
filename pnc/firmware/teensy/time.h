@@ -264,6 +264,51 @@ uint32_t time_gnss_ns_to_dwt(int64_t gnss_ns);
 time_anchor_snapshot_t time_anchor_snapshot(void);
 
 // ============================================================================
+// Generalized clock projection interface
+// ============================================================================
+//
+// These functions never read DWT internally.  Callers must supply an
+// already-authored DWT coordinate: an ISR event DWT, a TimePop fire DWT, or an
+// explicitly captured report DWT used consistently for all clocks in that
+// report.  This prevents hidden "now" reads and keeps timing custody visible.
+
+// GNSS is an alias of the VCLOCK clock surface: VCLOCK is the sovereign
+// reference timeline, and GNSS/pps_vclock nanoseconds are projected from it.
+enum class time_clock_id_t : uint8_t {
+  NONE   = 0,
+  VCLOCK = 1,
+  GNSS   = 1,
+  OCXO1  = 2,
+  OCXO2  = 3,
+};
+
+struct time_clock_snapshot_t {
+  bool     valid = false;
+  bool     prediction_valid = false;
+  uint32_t dwt_at_update = 0;
+  uint64_t ns_at_update = 0;
+  uint32_t predicted_dwt_cycles_per_second = 0;
+  uint32_t update_count = 0;
+  uint32_t last_observed_dwt_cycles = 0;
+  uint64_t last_observed_ns = 0;
+  int32_t  last_prediction_residual_cycles = 0;
+};
+
+void time_clock_reset_all(void);
+bool time_clock_epoch_reset(time_clock_id_t clock,
+                            uint32_t dwt_at_update,
+                            uint64_t ns_at_update);
+bool time_clock_update(time_clock_id_t clock,
+                       uint32_t dwt_at_update,
+                       uint64_t ns_at_update);
+bool time_clock_ns_at_dwt(time_clock_id_t clock,
+                          uint32_t dwt_cyccnt,
+                          uint64_t* out_ns);
+bool time_clock_snapshot(time_clock_id_t clock,
+                         time_clock_snapshot_t* out);
+
+
+// ============================================================================
 // DWT prediction accessors
 // ============================================================================
 

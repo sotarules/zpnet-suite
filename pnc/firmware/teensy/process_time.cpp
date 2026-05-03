@@ -68,6 +68,193 @@ struct time_anchor_t {
 
 static time_anchor_t anchor = {};
 
+static inline void dmb(void);
+
+
+// ============================================================================
+// Generalized clock projection state
+// ============================================================================
+//
+// A clock value is represented as the last authored nanosecond value plus the
+// DWT coordinate at which that value was true, together with a per-clock
+// DWT-cycles-per-clock-second prediction.  Callers can then ask for the
+// effective value of any clock at an explicit DWT coordinate without causing a
+// hidden foreground clock read.
+
+static constexpr uint32_t TIME_CLOCK_SLOT_COUNT = 4;  // index by time_clock_id_t value
+
+struct time_clock_state_t {
+  volatile uint32_t seq;
+  bool     valid = false;
+  bool     prediction_valid = false;
+  uint32_t dwt_at_update = 0;
+  uint64_t ns_at_update = 0;
+  uint32_t predicted_dwt_cycles_per_second = DWT_EXPECTED_PER_PPS;
+  uint32_t update_count = 0;
+  uint32_t last_observed_dwt_cycles = 0;
+  uint64_t last_observed_ns = 0;
+  int32_t  last_prediction_residual_cycles = 0;
+};
+
+static time_clock_state_t time_clocks[TIME_CLOCK_SLOT_COUNT] = {};
+
+static int time_clock_index(time_clock_id_t clock) {
+  const uint8_t v = (uint8_t)clock;
+  if (v == (uint8_t)time_clock_id_t::VCLOCK) return 1;
+  if (v == (uint8_t)time_clock_id_t::OCXO1) return 2;
+  if (v == (uint8_t)time_clock_id_t::OCXO2) return 3;
+  return -1;
+}
+
+static bool time_clock_load(time_clock_id_t clock, time_clock_snapshot_t& out) {
+  out = time_clock_snapshot_t{};
+  const int idx = time_clock_index(clock);
+  if (idx < 0) return false;
+
+  const time_clock_state_t& c = time_clocks[idx];
+  for (int attempt = 0; attempt < 4; attempt++) {
+    const uint32_t s1 = c.seq;
+    dmb();
+
+    out.valid = c.valid;
+    out.prediction_valid = c.prediction_valid;
+    out.dwt_at_update = c.dwt_at_update;
+    out.ns_at_update = c.ns_at_update;
+    out.predicted_dwt_cycles_per_second = c.predicted_dwt_cycles_per_second;
+    out.update_count = c.update_count;
+    out.last_observed_dwt_cycles = c.last_observed_dwt_cycles;
+    out.last_observed_ns = c.last_observed_ns;
+    out.last_prediction_residual_cycles = c.last_prediction_residual_cycles;
+
+    dmb();
+    const uint32_t s2 = c.seq;
+    if (s1 == s2 && (s1 & 1u) == 0u) return true;
+  }
+
+  out = time_clock_snapshot_t{};
+  return false;
+}
+
+void time_clock_reset_all(void) {
+  for (uint32_t i = 0; i < TIME_CLOCK_SLOT_COUNT; i++) {
+    time_clock_state_t& c = time_clocks[i];
+    c.seq++;
+    dmb();
+
+    c.valid = false;
+    c.prediction_valid = false;
+    c.dwt_at_update = 0;
+    c.ns_at_update = 0;
+    c.predicted_dwt_cycles_per_second = DWT_EXPECTED_PER_PPS;
+    c.update_count = 0;
+    c.last_observed_dwt_cycles = 0;
+    c.last_observed_ns = 0;
+    c.last_prediction_residual_cycles = 0;
+
+    dmb();
+    c.seq++;
+  }
+}
+
+bool time_clock_epoch_reset(time_clock_id_t clock,
+                            uint32_t dwt_at_update,
+                            uint64_t ns_at_update) {
+  const int idx = time_clock_index(clock);
+  if (idx < 0) return false;
+  time_clock_state_t& c = time_clocks[idx];
+
+  c.seq++;
+  dmb();
+
+  c.valid = true;
+  c.prediction_valid = true;  // fallback prediction; refined by later updates
+  c.dwt_at_update = dwt_at_update;
+  c.ns_at_update = ns_at_update;
+  c.predicted_dwt_cycles_per_second = DWT_EXPECTED_PER_PPS;
+  c.update_count = 0;
+  c.last_observed_dwt_cycles = 0;
+  c.last_observed_ns = 0;
+  c.last_prediction_residual_cycles = 0;
+
+  dmb();
+  c.seq++;
+  return true;
+}
+
+bool time_clock_update(time_clock_id_t clock,
+                       uint32_t dwt_at_update,
+                       uint64_t ns_at_update) {
+  const int idx = time_clock_index(clock);
+  if (idx < 0) return false;
+  time_clock_state_t& c = time_clocks[idx];
+
+  c.seq++;
+  dmb();
+
+  if (c.valid) {
+    const uint32_t observed_dwt = dwt_at_update - c.dwt_at_update;
+    const uint64_t observed_ns = (ns_at_update >= c.ns_at_update)
+        ? (ns_at_update - c.ns_at_update)
+        : 0ULL;
+
+    if (observed_dwt != 0 && observed_ns != 0) {
+      const uint32_t observed_cps =
+          (uint32_t)(((uint64_t)observed_dwt * (uint64_t)NS_PER_SECOND +
+                      observed_ns / 2ULL) /
+                     observed_ns);
+      c.last_prediction_residual_cycles = c.prediction_valid
+          ? (int32_t)((int64_t)observed_cps -
+                      (int64_t)c.predicted_dwt_cycles_per_second)
+          : 0;
+      c.predicted_dwt_cycles_per_second = observed_cps ? observed_cps : DWT_EXPECTED_PER_PPS;
+      c.prediction_valid = true;
+      c.last_observed_dwt_cycles = observed_dwt;
+      c.last_observed_ns = observed_ns;
+    }
+  } else {
+    c.predicted_dwt_cycles_per_second = DWT_EXPECTED_PER_PPS;
+    c.prediction_valid = true;
+    c.last_prediction_residual_cycles = 0;
+    c.last_observed_dwt_cycles = 0;
+    c.last_observed_ns = 0;
+  }
+
+  c.valid = true;
+  c.dwt_at_update = dwt_at_update;
+  c.ns_at_update = ns_at_update;
+  c.update_count++;
+
+  dmb();
+  c.seq++;
+  return true;
+}
+
+bool time_clock_ns_at_dwt(time_clock_id_t clock,
+                          uint32_t dwt_cyccnt,
+                          uint64_t* out_ns) {
+  if (!out_ns) return false;
+  time_clock_snapshot_t s{};
+  if (!time_clock_load(clock, s)) return false;
+  if (!s.valid || !s.prediction_valid || s.predicted_dwt_cycles_per_second == 0) {
+    return false;
+  }
+
+  const uint32_t elapsed_dwt = dwt_cyccnt - s.dwt_at_update;
+  const uint64_t elapsed_ns =
+      ((uint64_t)elapsed_dwt * (uint64_t)NS_PER_SECOND +
+       (uint64_t)s.predicted_dwt_cycles_per_second / 2ULL) /
+      (uint64_t)s.predicted_dwt_cycles_per_second;
+
+  *out_ns = s.ns_at_update + elapsed_ns;
+  return true;
+}
+
+bool time_clock_snapshot(time_clock_id_t clock,
+                         time_clock_snapshot_t* out) {
+  if (!out) return false;
+  return time_clock_load(clock, *out);
+}
+
 static inline void dmb(void) {
   __asm__ volatile ("dmb" ::: "memory");
 }
@@ -1439,6 +1626,7 @@ void time_init(void) {
   anchor = {};
   prediction_reset();
   time_dynamic_cps_reset();
+  time_clock_reset_all();
 }
 
 void process_time_init(void) {

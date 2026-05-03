@@ -75,6 +75,7 @@ bool clocks_dwt64_epoch_reset_at_dwt32(uint32_t epoch_dwt32,
                                        uint64_t* out_raw_epoch_dwt64);
 
 uint64_t clocks_dwt_cycles_now(void);
+uint64_t clocks_dwt_cycles_at_dwt(uint32_t dwt32);
 
 uint64_t clocks_gnss_ticks_now(void);
 uint64_t clocks_gnss_ns_now(void);

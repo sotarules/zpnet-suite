@@ -154,6 +154,8 @@ static inline uint32_t dwt_effective_cycles_per_pps_vclock_second(void) {
   return g_dwt_cycles_between_pps_vclock;
 }
 
+uint64_t clocks_dwt_cycles_at_dwt(uint32_t dwt32);
+
 // ============================================================================
 // Clock common tolerance
 // ============================================================================

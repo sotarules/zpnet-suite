@@ -287,6 +287,17 @@ bool clocks_dwt64_epoch_reset_at_dwt32(uint32_t epoch_dwt32,
   return true;
 }
 
+uint64_t clocks_dwt_cycles_at_dwt(uint32_t dwt32) {
+  const uint64_t raw_at_dwt = g_dwt64_raw_anchor_valid
+      ? (g_dwt64_raw_cycles_at_anchor +
+         (uint64_t)((uint32_t)(dwt32 - g_dwt64_dwt32_at_anchor)))
+      : (uint64_t)dwt32;
+
+  return g_dwt64_epoch_valid
+      ? (raw_at_dwt - g_dwt64_epoch_raw_cycles)
+      : raw_at_dwt;
+}
+
 uint64_t clocks_dwt_cycles_now(void) {
   return dwt64_logical_now_unlocked();
 }
@@ -485,6 +496,9 @@ bool clocks_alpha_zero_from_interrupt_capture(const char* reason) {
   dwt64_anchor_reset_to_dwt32(cap.vclock_dwt_at_edge, g_dwt64_epoch_raw_cycles);
 
   time_pps_vclock_epoch_reset(cap.vclock_dwt_at_edge, cap.vclock_counter32);
+  time_clock_epoch_reset(time_clock_id_t::VCLOCK, cap.vclock_dwt_at_edge, 0);
+  time_clock_epoch_reset(time_clock_id_t::OCXO1,  cap.vclock_dwt_at_edge, 0);
+  time_clock_epoch_reset(time_clock_id_t::OCXO2,  cap.vclock_dwt_at_edge, 0);
   g_alpha_epoch_sequence++;
 
   // VCLOCK synthetic coordinate generation changed.  Re-author recurring
@@ -529,9 +543,11 @@ bool clocks_alpha_epoch_initialized(void) { return g_epoch_initialized; }
 static void clocks_apply_epoch_counter_edge(clock_state_t& clock,
                                             clock_measurement_t& meas,
                                             const interrupt_event_t& event,
-                                            uint32_t epoch_counter32) {
+                                            uint32_t epoch_counter32,
+                                            time_clock_id_t time_clock) {
   const uint64_t ns_now =
       ns_from_counter32_epoch(event.counter32_at_event, epoch_counter32);
+  (void)time_clock_update(time_clock, event.dwt_at_event, ns_now);
 
   const bool had_previous = (meas.prev_dwt_at_edge != 0);
   const uint64_t previous_ns = meas.prev_gnss_ns_at_edge;
@@ -584,10 +600,11 @@ static void apply_ocxo_event(clock_state_t& clock,
                              interrupt_capture_diag_t& diag_dst,
                              const interrupt_event_t& event,
                              const interrupt_capture_diag_t* diag,
-                             uint32_t epoch_counter32) {
+                             uint32_t epoch_counter32,
+                             time_clock_id_t time_clock) {
   clocks_capture_interrupt_diag(diag_dst, diag);
   if (!usable_clock_event(event)) return;
-  clocks_apply_epoch_counter_edge(clock, meas, event, epoch_counter32);
+  clocks_apply_epoch_counter_edge(clock, meas, event, epoch_counter32, time_clock);
 }
 
 static void vclock_callback(const interrupt_event_t& event,
@@ -604,7 +621,8 @@ static void vclock_callback(const interrupt_event_t& event,
   clocks_apply_epoch_counter_edge(g_vclock_clock,
                                   g_vclock_measurement,
                                   event,
-                                  g_alpha_epoch_last_vclock_counter32);
+                                  g_alpha_epoch_last_vclock_counter32,
+                                  time_clock_id_t::VCLOCK);
 
   g_gnss_ns_at_pps_vclock = g_vclock_clock.ns_count_at_pps_vclock;
 }
@@ -614,7 +632,8 @@ static void ocxo1_callback(const interrupt_event_t& event,
                            void*) {
   apply_ocxo_event(g_ocxo1_clock, g_ocxo1_measurement,
                    g_ocxo1_interrupt_diag, event, diag,
-                   g_alpha_epoch_last_ocxo1_counter32);
+                   g_alpha_epoch_last_ocxo1_counter32,
+                   time_clock_id_t::OCXO1);
 }
 
 static void ocxo2_callback(const interrupt_event_t& event,
@@ -622,7 +641,8 @@ static void ocxo2_callback(const interrupt_event_t& event,
                            void*) {
   apply_ocxo_event(g_ocxo2_clock, g_ocxo2_measurement,
                    g_ocxo2_interrupt_diag, event, diag,
-                   g_alpha_epoch_last_ocxo2_counter32);
+                   g_alpha_epoch_last_ocxo2_counter32,
+                   time_clock_id_t::OCXO2);
 }
 
 // ============================================================================

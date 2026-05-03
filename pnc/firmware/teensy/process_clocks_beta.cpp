@@ -1229,13 +1229,25 @@ static Payload cmd_report(const Payload&) {
   Payload p = g_last_fragment.clone();
 
   Payload summary;
-  const uint64_t dwt64_cycles_now = clocks_dwt_cycles_now();
-  summary.add("dwt64_cycles", dwt64_cycles_now);
-  summary.add("dwt64_ns", dwt_cycles_to_ns(dwt64_cycles_now));
-  summary.add("gnss_ns", clocks_gnss_ns_now());
-  summary.add("vclock_ns", g_vclock_clock.ns_count_at_pps_vclock);
-  summary.add("ocxo1_ns", clocks_ocxo1_ns_now());
-  summary.add("ocxo2_ns", clocks_ocxo2_ns_now());
+  const uint32_t report_dwt = DWT_CYCCNT;
+  const uint64_t dwt64_cycles_at_report = clocks_dwt_cycles_at_dwt(report_dwt);
+  uint64_t vclock_ns = 0;
+  uint64_t ocxo1_ns = 0;
+  uint64_t ocxo2_ns = 0;
+  const bool vclock_ok = time_clock_ns_at_dwt(time_clock_id_t::VCLOCK, report_dwt, &vclock_ns);
+  const bool ocxo1_ok  = time_clock_ns_at_dwt(time_clock_id_t::OCXO1,  report_dwt, &ocxo1_ns);
+  const bool ocxo2_ok  = time_clock_ns_at_dwt(time_clock_id_t::OCXO2,  report_dwt, &ocxo2_ns);
+
+  summary.add("report_dwt", report_dwt);
+  summary.add("dwt64_cycles", dwt64_cycles_at_report);
+  summary.add("dwt64_ns", dwt_cycles_to_ns(dwt64_cycles_at_report));
+  summary.add("gnss_ns", vclock_ok ? vclock_ns : 0);
+  summary.add("vclock_ns", vclock_ok ? vclock_ns : 0);
+  summary.add("ocxo1_ns", ocxo1_ok ? ocxo1_ns : 0);
+  summary.add("ocxo2_ns", ocxo2_ok ? ocxo2_ns : 0);
+  summary.add("vclock_valid", vclock_ok);
+  summary.add("ocxo1_valid", ocxo1_ok);
+  summary.add("ocxo2_valid", ocxo2_ok);
   p.add_object("summary", summary);
 
   p.add("campaign_state",
