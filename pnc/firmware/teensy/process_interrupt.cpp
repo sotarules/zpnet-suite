@@ -31,7 +31,7 @@
 // ISR captures onto the PPS_VCLOCK timeline via interrupt_dwt_to_vclock_gnss_ns.
 //
 // Lanes:
-//   VCLOCK : QTimer1 CH3, PCS=0 (10 MHz GNSS-disciplined VCLOCK)
+//   VCLOCK : TimePop recurring client on QTimer1 CH2 (10 MHz VCLOCK domain)
 //   OCXO1  : QTimer3 CH2, PCS=2
 //   OCXO2  : QTimer3 CH3, PCS=3
 //   TimePop: QTimer1 CH2, varied compare intervals (foreground scheduler)
@@ -40,9 +40,9 @@
 // QTimer1 CH0 low-word counter.  process_interrupt maps that low-word
 // hardware observation into the private synthetic 32-bit VCLOCK identity.
 // When a rebootstrap is pending, it
-// reprograms CH3's compare to phase-lock the VCLOCK cadence to the PPS
-// moment.  After that, vclock_callback fires N seconds after PPS modulo
-// consistent ISR latency.
+// records the selected VCLOCK edge.  The recurring TimePop VCLOCK
+// cadence client consumes the next CH2 fire fact, back-projects to the selected
+// edge, and thereafter emits the one-second VCLOCK events on the TimePop rail.
 // ============================================================================
 
 #include "process_interrupt.h"
@@ -137,6 +137,9 @@ static constexpr uint32_t PPS_VCLOCK_PHASE_TOLERANCE_CYCLES = 10;
 static constexpr uint32_t EPOCH_CAPTURE_MAX_WINDOW_CYCLES =
     (DWT_EXPECTED_PER_PPS + (VCLOCK_COUNTS_PER_SECOND - 1U)) /
     VCLOCK_COUNTS_PER_SECOND;
+
+static constexpr uint64_t VCLOCK_CADENCE_PERIOD_NS = 1000000ULL;
+static constexpr const char* VCLOCK_CADENCE_NAME = "VCLOCK_CADENCE";
 
 // ============================================================================
 // PPS / PPS_VCLOCK doctrine
@@ -520,15 +523,15 @@ static uint32_t g_gpio_miss_count = 0;
 // ============================================================================
 //
 // PPS GPIO is a witness/selector only.  It never authors the public
-// PPS/VCLOCK DWT coordinate.  The super-canonical PPS/VCLOCK DWT coordinate
-// is authored by the VCLOCK/QTimer1 CH3 path, so every public DWT timing fact
-// lives in the same QTimer event-coordinate species.
+// PPS/VCLOCK DWT coordinate.  The super-canonical PPS/VCLOCK DWT coordinate is now authored from the
+// TimePop CH2 fire fact of the VCLOCK cadence client.  Every public DWT timing
+// fact therefore lives on the same TimePop/CH2 event-coordinate rail.
 //
 // During rebootstrap, the PPS ISR selects the VCLOCK counter identity of the
-// sacred edge and arms CH3.  The first CH3 cadence event then backdates by
-// one 1 ms VCLOCK cadence interval to author the selected edge's DWT in the
-// VCLOCK coordinate domain.  After bootstrap, each 1000th CH3 cadence event
-// authors the next canonical PPS/VCLOCK bookend directly.
+// sacred edge.  The next TimePop VCLOCK cadence event back-projects from its
+// own shared CH2 fire fact to author the selected edge's DWT.  After bootstrap,
+// every 1000th phase-locked TimePop cadence event authors the next canonical
+// PPS/VCLOCK bookend directly.
 
 struct vclock_epoch_latch_t {
   bool     pending = false;
@@ -722,16 +725,21 @@ static void publish_vclock_domain_pps_vclock(const pps_t& pps,
   pvc_anchor_publish(pvc);
 }
 
-static void publish_selected_epoch_from_first_vclock_tick(uint32_t qtimer_event_dwt) {
+static void publish_selected_epoch_from_vclock_cadence(uint32_t cadence_counter32,
+                                                       uint32_t cadence_event_dwt) {
   if (!g_vclock_epoch_latch.pending) return;
 
-  const uint32_t backdate_ticks = VCLOCK_INTERVAL_COUNTS;
-  const uint32_t backdate_cycles = vclock_cycles_for_ticks(backdate_ticks);
-  const uint32_t anchor_dwt = qtimer_event_dwt - backdate_cycles;
+  const uint32_t backdate_ticks =
+      cadence_counter32 - g_vclock_epoch_latch.counter32_at_edge;
+  if (backdate_ticks == 0 || backdate_ticks > VCLOCK_COUNTS_PER_SECOND) {
+    return;
+  }
 
-  g_vclock_epoch_latch.first_cadence_counter32 =
-      g_vclock_epoch_latch.counter32_at_edge + backdate_ticks;
-  g_vclock_epoch_latch.first_cadence_dwt = qtimer_event_dwt;
+  const uint32_t backdate_cycles = vclock_cycles_for_ticks(backdate_ticks);
+  const uint32_t anchor_dwt = cadence_event_dwt - backdate_cycles;
+
+  g_vclock_epoch_latch.first_cadence_counter32 = cadence_counter32;
+  g_vclock_epoch_latch.first_cadence_dwt = cadence_event_dwt;
   g_vclock_epoch_latch.backdate_ticks = backdate_ticks;
   g_vclock_epoch_latch.backdate_cycles = backdate_cycles;
   g_vclock_epoch_latch.sacred_dwt = anchor_dwt;
@@ -867,7 +875,7 @@ struct interrupt_subscriber_runtime_t {
 };
 
 static const interrupt_subscriber_descriptor_t DESCRIPTORS[] = {
-  { interrupt_subscriber_kind_t::VCLOCK, "VCLOCK", interrupt_provider_kind_t::QTIMER1, interrupt_lane_t::QTIMER1_CH3_COMP },
+  { interrupt_subscriber_kind_t::VCLOCK, "VCLOCK", interrupt_provider_kind_t::QTIMER1, interrupt_lane_t::QTIMER1_CH2_COMP },
   { interrupt_subscriber_kind_t::OCXO1,  "OCXO1",  interrupt_provider_kind_t::QTIMER3, interrupt_lane_t::QTIMER3_CH2_COMP },
   { interrupt_subscriber_kind_t::OCXO2,  "OCXO2",  interrupt_provider_kind_t::QTIMER3, interrupt_lane_t::QTIMER3_CH3_COMP },
 };
@@ -1125,7 +1133,6 @@ uint16_t interrupt_qtimer3_ch2_counter_now(void) { return IMXRT_TMR3.CH[2].CNTR;
 uint16_t interrupt_qtimer3_ch3_counter_now(void) { return IMXRT_TMR3.CH[3].CNTR; }
 
 // Forward declarations for compare helpers defined below.
-static void qtimer1_ch3_program_compare(uint16_t target_low16);
 static void qtimer3_program_compare(uint8_t ch, uint16_t target_low16);
 
 static inline uint32_t cadence_mod_for_ticks(uint32_t ticks, uint32_t interval) {
@@ -1215,21 +1222,6 @@ bool interrupt_clock_snapshot(interrupt_subscriber_kind_t kind, interrupt_clock_
 // ============================================================================
 // Compare channel helpers
 // ============================================================================
-
-static inline void qtimer1_ch3_clear_compare_flag(void) {
-  IMXRT_TMR1.CH[3].CSCTRL &= ~(TMR_CSCTRL_TCF1 | TMR_CSCTRL_TCF2);
-}
-static inline void qtimer1_ch3_program_compare(uint16_t target_low16) {
-  qtimer1_ch3_clear_compare_flag();
-  IMXRT_TMR1.CH[3].COMP1  = target_low16;
-  IMXRT_TMR1.CH[3].CMPLD1 = target_low16;
-  qtimer1_ch3_clear_compare_flag();
-  IMXRT_TMR1.CH[3].CSCTRL |= TMR_CSCTRL_TCF1EN;
-}
-static inline void qtimer1_ch3_disable_compare(void) {
-  IMXRT_TMR1.CH[3].CSCTRL &= ~TMR_CSCTRL_TCF1EN;
-  qtimer1_ch3_clear_compare_flag();
-}
 
 static inline void qtimer1_ch1_clear_compare_flag(void) {
   IMXRT_TMR1.CH[1].CSCTRL &= ~(TMR_CSCTRL_TCF1 | TMR_CSCTRL_TCF2);
@@ -1399,58 +1391,83 @@ static void emit_one_second_event(interrupt_subscriber_runtime_t& rt,
 }
 
 // ============================================================================
-// VCLOCK lane — QTimer1 CH3 cadence (1 kHz)
+// VCLOCK lane — TimePop cadence client (1 kHz)
 // ============================================================================
 
-static void vclock_lane_arm_bootstrap(void) {
+static bool vclock_cadence_arm_timepop(void);
+static void vclock_cadence_timepop_callback(timepop_ctx_t* ctx,
+                                            timepop_diag_t*,
+                                            void*);
+
+static bool vclock_cadence_arm_timepop(void) {
+  if (!g_vclock_lane.active || !g_rt_vclock || !g_rt_vclock->active) return false;
+
+  timepop_cancel_by_name(VCLOCK_CADENCE_NAME);
+  const timepop_handle_t h =
+      timepop_arm(VCLOCK_CADENCE_PERIOD_NS,
+                  true,
+                  vclock_cadence_timepop_callback,
+                  nullptr,
+                  VCLOCK_CADENCE_NAME);
+  if (h == TIMEPOP_INVALID_HANDLE) {
+    g_vclock_lane.miss_count++;
+    return false;
+  }
+
   g_vclock_lane.phase_bootstrapped = true;
   g_vclock_lane.bootstrap_count++;
-  g_vclock_lane.tick_mod_1000 = 0;
-  g_vclock_lane.compare_target =
-      (uint16_t)(g_vclock_lane.compare_target + (uint16_t)VCLOCK_INTERVAL_COUNTS);
-  qtimer1_ch3_program_compare(g_vclock_lane.compare_target);
+  return true;
 }
 
-static void vclock_lane_advance_compare(void) {
-  g_vclock_lane.compare_target =
-      (uint16_t)(g_vclock_lane.compare_target + (uint16_t)VCLOCK_INTERVAL_COUNTS);
-  qtimer1_ch3_program_compare(g_vclock_lane.compare_target);
-}
+static void vclock_cadence_timepop_callback(timepop_ctx_t* ctx,
+                                            timepop_diag_t*,
+                                            void*) {
+  if (!ctx) return;
 
-static void vclock_cadence_isr(uint32_t isr_entry_dwt_raw) {
-  const uint32_t qtimer_event_dwt = qtimer_event_dwt_from_isr_entry_raw(isr_entry_dwt_raw);
+  const uint32_t qtimer_event_dwt = ctx->fire_dwt_cyccnt;
+  const uint32_t cadence_counter32 = ctx->fire_vclock_raw;
+  const uint16_t fired_low16 = (uint16_t)(cadence_counter32 & 0xFFFFU);
+
   g_vclock_lane.irq_count++;
   if (g_rt_vclock) g_rt_vclock->irq_count++;
-
-  qtimer1_ch3_clear_compare_flag();
 
   if (!g_vclock_lane.active || !g_rt_vclock || !g_rt_vclock->active) {
     g_vclock_lane.miss_count++;
     return;
   }
+
   if (!g_vclock_lane.phase_bootstrapped) {
-    vclock_lane_arm_bootstrap();
-    g_vclock_lane.miss_count++;
+    g_vclock_lane.phase_bootstrapped = true;
+    g_vclock_lane.bootstrap_count++;
+    g_vclock_lane.tick_mod_1000 = 0;
+  }
+
+  g_vclock_lane.cadence_hits_total++;
+
+  // TimePop/CH2 authors the cadence event identity.  Use that shared fire
+  // fact directly instead of a private CH3 compare target.  The low word is
+  // still a valid anchor for translating ambient QTimer1 CH0 observations
+  // into the process_interrupt-owned synthetic VCLOCK counter32 species.
+  g_vclock_lane.logical_count32_at_last_second = cadence_counter32;
+  vclock_clock_anchor_hardware_low16(cadence_counter32, fired_low16);
+
+  if (g_vclock_epoch_latch.pending) {
+    const uint32_t selected_to_cadence_ticks =
+        cadence_counter32 - g_vclock_epoch_latch.counter32_at_edge;
+    publish_selected_epoch_from_vclock_cadence(cadence_counter32,
+                                               qtimer_event_dwt);
+    // The latch may be consumed by a pre-grid TimePop fire.  Preserve how many
+    // complete 1 ms grid ticks have already elapsed since the selected edge so
+    // the first one-second bookend still lands on the PPS/VCLOCK boundary.
+    if (!g_vclock_epoch_latch.pending) {
+      g_vclock_lane.tick_mod_1000 =
+          (selected_to_cadence_ticks / VCLOCK_INTERVAL_COUNTS) %
+          TICKS_PER_SECOND_EVENT;
+    }
     return;
   }
 
-  const uint16_t fired_low16 = g_vclock_lane.compare_target;
-  vclock_lane_advance_compare();
-  g_vclock_lane.cadence_hits_total++;
-
-  // Synthetic VCLOCK identity advances in exact 10 MHz lockstep with the
-  // process_interrupt-owned CH3 cadence.  The fired CH3 compare target is
-  // also the CH0 low-word identity at this cadence edge, so it becomes the
-  // latest low-word anchor for ambient synthetic observations.
-  g_vclock_lane.logical_count32_at_last_second += VCLOCK_INTERVAL_COUNTS;
-  vclock_clock_anchor_hardware_low16(g_vclock_lane.logical_count32_at_last_second,
-                                     fired_low16);
-
   const uint32_t cadence_tick_mod_1000 = g_vclock_lane.tick_mod_1000 + 1;
-
-  if (cadence_tick_mod_1000 == 1 && g_vclock_epoch_latch.pending) {
-    publish_selected_epoch_from_first_vclock_tick(qtimer_event_dwt);
-  }
 
   time_dynamic_cps_cadence_update(qtimer_event_dwt, cadence_tick_mod_1000);
 
@@ -1479,20 +1496,19 @@ static void vclock_cadence_isr(uint32_t isr_entry_dwt_raw) {
     const int64_t pvc_gnss_ns =
         vclock_next_epoch_gnss_ns(time_dwt_to_gnss_ns(qtimer_event_dwt));
 
-    // Repair is diagnostic-only for now: the observed QTimer event DWT remains
-    // the canonical PPS/VCLOCK bookend.  The predicted DWT and would-repair
-    // classification are carried in the VCLOCK diagnostic payload.
+    // Repair is diagnostic-only for now: the observed TimePop/CH2 event DWT
+    // remains the canonical PPS/VCLOCK bookend.
     publish_vclock_domain_pps_vclock(witness_pps,
                                       (witness_pps.sequence != 0)
                                           ? witness_pps.sequence
                                           : (g_pps_gpio_heartbeat.edge_count + 1),
                                       qtimer_event_dwt,
-                                      g_vclock_lane.logical_count32_at_last_second,
+                                      cadence_counter32,
                                       fired_low16,
                                       pvc_gnss_ns);
 
     emit_one_second_event(*g_rt_vclock, qtimer_event_dwt,
-                          g_vclock_lane.logical_count32_at_last_second,
+                          cadence_counter32,
                           coincidence_cycles, coincidence_valid, &repair);
 
     if (g_pps_edge_dispatch) {
@@ -1563,7 +1579,7 @@ static void qtimer3_isr(void) {
 }
 
 // ============================================================================
-// QTimer1 vector — dispatches CH2 (TimePop) and CH3 (VCLOCK cadence)
+// QTimer1 vector — dispatches CH2 (TimePop)
 // ============================================================================
 
 static volatile interrupt_qtimer1_ch2_handler_fn g_qtimer1_ch2_handler = nullptr;
@@ -1734,12 +1750,10 @@ static void qtimer1_isr(void) {
       g_qtimer1_ch2_handler(event, diag);
     }
   }
-  // CH1/CH2/CH3 share one vector.  If multiple flags are pending, the
+  // CH1/CH2 share one vector.  If multiple flags are pending, the
   // unhandled flag remains set and NVIC re-dispatches with a fresh
-  // first-instruction _raw capture.
-  else if (IMXRT_TMR1.CH[3].CSCTRL & TMR_CSCTRL_TCF1) {
-    vclock_cadence_isr(isr_entry_dwt_raw);
-  }
+  // first-instruction _raw capture.  VCLOCK cadence no longer owns CH3; it
+  // is a normal TimePop client on CH2.
 }
 
 // ============================================================================
@@ -1760,8 +1774,8 @@ void process_interrupt_gpio6789_irq(uint32_t isr_entry_dwt_raw) {
   // PPS GPIO is a witness/selector only.  It captures the physical PPS facts
   // and, during rebootstrap, selects the VCLOCK-domain edge identity.  It does
   // NOT author the public PPS/VCLOCK DWT coordinate; that coordinate is later
-  // authored by the VCLOCK/QTimer1 CH3 path so all public DWT captures live in
-  // a single VCLOCK event-coordinate system.
+  // authored by the TimePop VCLOCK cadence client on QTimer1 CH2 so all public
+  // DWT captures live in one TimePop event-coordinate system.
   //
   // Epochization capture doctrine: immediately after the first-instruction
   // DWT raw capture, read the three 10 MHz lane counters in one custody
@@ -1851,9 +1865,10 @@ void process_interrupt_gpio6789_irq(uint32_t isr_entry_dwt_raw) {
   g_last_pps_witness = pps;
   g_last_pps_witness_valid = true;
 
-  // During rebootstrap, PPS selects the sacred VCLOCK edge identity and arms
-  // the CH3 cadence.  The first CH3 cadence event backdates one millisecond in
-  // the VCLOCK coordinate system and publishes the canonical epoch.
+  // During rebootstrap, PPS selects the sacred VCLOCK edge identity.  The
+  // already-running TimePop VCLOCK cadence client consumes the next CH2 fire
+  // fact, back-projects to this selected edge, and publishes the canonical
+  // epoch.
   if (g_pps_rebootstrap_pending) {
     g_pps_rebootstrap_pending = false;
     g_pps_rebootstrap_count++;
@@ -1883,7 +1898,6 @@ void process_interrupt_gpio6789_irq(uint32_t isr_entry_dwt_raw) {
         (uint16_t)(selected_low16 + (uint16_t)VCLOCK_INTERVAL_COUNTS);
     g_vclock_lane.logical_count32_at_last_second = selected_counter32;
     vclock_clock_anchor_hardware_low16(selected_counter32, selected_low16);
-    qtimer1_ch3_program_compare(g_vclock_lane.compare_target);
   }
 }
 
@@ -1982,8 +1996,9 @@ bool interrupt_start(interrupt_subscriber_kind_t kind) {
 
   if (kind == interrupt_subscriber_kind_t::VCLOCK) {
     g_vclock_lane.active = true;
-    qtimer1_ch3_program_compare((uint16_t)(g_vclock_lane.compare_target + 1));
-    return true;
+    g_vclock_lane.phase_bootstrapped = false;
+    g_vclock_lane.tick_mod_1000 = 0;
+    return vclock_cadence_arm_timepop();
   }
 
   ocxo_lane_t* lane = ocxo_lane_for(kind);
@@ -2003,7 +2018,8 @@ bool interrupt_stop(interrupt_subscriber_kind_t kind) {
 
   if (kind == interrupt_subscriber_kind_t::VCLOCK) {
     g_vclock_lane.active = false;
-    qtimer1_ch3_disable_compare();
+    g_vclock_lane.phase_bootstrapped = false;
+    (void)timepop_cancel_by_name(VCLOCK_CADENCE_NAME);
     return true;
   }
   ocxo_lane_t* lane = ocxo_lane_for(kind);
@@ -2086,18 +2102,6 @@ static void qtimer1_init_ch2_scheduler(void) {
   IMXRT_TMR1.CH[2].CTRL   = TMR_CTRL_CM(1) | TMR_CTRL_PCS(0);
 }
 
-static void qtimer1_ch3_init_vclock_cadence(void) {
-  IMXRT_TMR1.CH[3].CTRL   = 0;
-  IMXRT_TMR1.CH[3].SCTRL  = 0;
-  IMXRT_TMR1.CH[3].CSCTRL = 0;
-  IMXRT_TMR1.CH[3].LOAD   = 0;
-  IMXRT_TMR1.CH[3].CNTR   = 0;
-  IMXRT_TMR1.CH[3].COMP1  = 0xFFFF;
-  IMXRT_TMR1.CH[3].CMPLD1 = 0xFFFF;
-  IMXRT_TMR1.CH[3].CTRL   = TMR_CTRL_CM(1) | TMR_CTRL_PCS(0);
-  qtimer1_ch3_disable_compare();
-}
-
 void process_interrupt_init_hardware(void) {
   if (g_interrupt_hw_ready) return;
 
@@ -2136,19 +2140,20 @@ void process_interrupt_init_hardware(void) {
   g_ocxo1_lane.initialized = true;
   g_ocxo2_lane.initialized = true;
 
-  // QTimer1 synchronized channel start: ENBL=0 first, configure CH0/CH1/CH2/CH3
-  // fully, then a single ENBL=0x0F write starts the active VCLOCK-domain
-  // channels on the same edge.  CH1 is an interrupt-owned hosted compare rail.
+  // QTimer1 synchronized channel start: ENBL=0 first, configure CH0/CH1/CH2
+  // fully, then a single ENBL write starts the active VCLOCK-domain channels
+  // on the same edge.  CH2 is the only enabled compare channel; VCLOCK cadence
+  // is expressed as a normal TimePop client.
   IMXRT_TMR1.ENBL = 0;
   qtimer1_init_vclock_base();
   qtimer1_init_ch2_scheduler();
-  qtimer1_ch3_init_vclock_cadence();
   g_vclock_lane.initialized = true;
   IMXRT_TMR1.CH[0].CNTR = 0;
   IMXRT_TMR1.CH[1].CNTR = 0;
   IMXRT_TMR1.CH[2].CNTR = 0;
-  IMXRT_TMR1.CH[3].CNTR = 0;
-  IMXRT_TMR1.ENBL = 0x0F;
+  // Only CH0 (passive VCLOCK counter) and CH2 (TimePop scheduler compare)
+  // are enabled.  VCLOCK cadence is now a TimePop client; CH3 remains off.
+  IMXRT_TMR1.ENBL = 0x05;
 
   g_interrupt_hw_ready = true;
 }

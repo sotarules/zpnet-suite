@@ -1,26 +1,34 @@
 """
-Epoch Zero + Clocks Monitor
+Epoch Zero + CLOCKS Report Monitor
 
 Purpose:
     Repeatedly run:
-      1) TEENSY EPOCH ZERO
+      1) TEENSY CLOCKS ZERO
       2) wait N seconds (default 2.0)
-      3) TEENSY EPOCH CLOCKS
+      3) TEENSY CLOCKS REPORT
 
-    Then print one row per cycle with compact synchronization metrics:
-      - summary dwt64 cycle total
-      - summary vclock/ocxo1/ocxo2 ns64 totals
-      - ocxo deltas vs vclock (from detail if present, fallback from summary)
-      - request/status metadata
+    Then print one row per cycle with compact synchronization metrics from the
+    current CLOCKS report schema:
+
+      payload.summary.report_dwt
+      payload.summary.dwt64_cycles
+      payload.summary.dwt64_ns
+      payload.summary.gnss_ns
+      payload.summary.vclock_ns
+      payload.summary.ocxo1_ns
+      payload.summary.ocxo2_ns
+      payload.summary.{vclock,ocxo1,ocxo2}_valid
+
+    Deltas are printed in ns and ticks relative to VCLOCK/GNSS.
 
 Usage:
-    .zt epoch_zero_clocks_monitor
-    .zt epoch_zero_clocks_monitor 2.0
-    .zt epoch_zero_clocks_monitor 2.0 0.5
+    .zt epoch_zero_clocks_monitor_clocksv2
+    .zt epoch_zero_clocks_monitor_clocksv2 2.0
+    .zt epoch_zero_clocks_monitor_clocksv2 2.0 0.5
 
 Args:
-    settle_seconds   Delay between ZERO and CLOCKS (default 2.0)
-    loop_pause       Optional pause between cycles after CLOCKS (default 0.0)
+    settle_seconds   Delay between ZERO and REPORT (default 2.0)
+    loop_pause       Optional pause between cycles after REPORT (default 0.0)
 """
 
 from __future__ import annotations
@@ -30,6 +38,32 @@ import time
 from typing import Any, Optional
 
 from zpnet.processes.processes import send_command
+
+
+NS_PER_TICK = 100
+
+
+def as_int(v: Any) -> Optional[int]:
+    if v is None:
+        return None
+    try:
+        return int(v)
+    except Exception:
+        return None
+
+
+def as_bool(v: Any) -> Optional[bool]:
+    if isinstance(v, bool):
+        return v
+    if v is None:
+        return None
+    if isinstance(v, str):
+        s = v.strip().lower()
+        if s in ("true", "1", "yes", "y"):
+            return True
+        if s in ("false", "0", "no", "n"):
+            return False
+    return None
 
 
 def fmt_int(v: Optional[int], width: int) -> str:
@@ -44,94 +78,137 @@ def fmt_signed(v: Optional[int], width: int) -> str:
     return f"{v:+{width},d}"
 
 
-def as_int(v: Any) -> Optional[int]:
-    if v is None:
-        return None
-    try:
-        return int(v)
-    except Exception:
-        return None
+def fmt_bool(v: Optional[bool]) -> str:
+    if v is True:
+        return "Y"
+    if v is False:
+        return "N"
+    return "?"
 
 
-def cmd_epoch_zero() -> dict:
+def payload(resp: Optional[dict]) -> dict:
+    if not isinstance(resp, dict):
+        return {}
+    p = resp.get("payload", {})
+    return p if isinstance(p, dict) else {}
+
+
+def summary_from_payload(p: dict) -> dict:
+    s = p.get("summary", {})
+    return s if isinstance(s, dict) else {}
+
+
+def delta_ns(a: Optional[int], b: Optional[int]) -> Optional[int]:
+    if a is None or b is None:
+        return None
+    return a - b
+
+
+def delta_ticks(a: Optional[int], b: Optional[int]) -> Optional[int]:
+    d = delta_ns(a, b)
+    if d is None:
+        return None
+    return d // NS_PER_TICK
+
+
+def cmd_clocks_zero() -> dict:
     return send_command(
         machine="TEENSY",
-        subsystem="EPOCH",
+        subsystem="CLOCKS",
         command="ZERO",
         args={},
     )
 
 
-def cmd_epoch_clocks() -> dict:
+def cmd_clocks_report() -> dict:
     return send_command(
         machine="TEENSY",
-        subsystem="EPOCH",
-        command="CLOCKS",
+        subsystem="CLOCKS",
+        command="REPORT",
         args={},
     )
 
 
-def run(settle_seconds: float = 2.0, loop_pause: float = 0.0) -> None:
+def print_header() -> None:
     print()
-    print("Epoch Zero + Clocks Monitor")
+    print("Epoch Zero + CLOCKS Report Monitor")
     print(
-        "cycle  req  zero_ok acc state           "
-        "dwt64_total        vclock_ns64      ocxo1_ns64       ocxo2_ns64       "
-        "ocxo1-vclk   ocxo2-vclk"
+        "cycle zero report zinst epseq capseq win "
+        "report_dwt      "
+        "gnss_ns        vclock_ns      ocxo1_ns       ocxo2_ns       "
+        "o1-vclk ns   o2-vclk ns   o1-vclk t  o2-vclk t  "
+        "dwt-vclk ns  valid"
     )
 
+
+def run(settle_seconds: float = 2.0, loop_pause: float = 0.0) -> None:
+    print_header()
     cycle = 0
 
     try:
         while True:
             cycle += 1
 
-            zero_resp = cmd_epoch_zero()
+            zero_resp = cmd_clocks_zero()
             zero_ok = bool(zero_resp and zero_resp.get("success"))
-            zero_payload = zero_resp.get("payload", {}) if zero_resp else {}
+            zp = payload(zero_resp)
 
-            accepted = zero_payload.get("accepted", None)
-            req_id = as_int(zero_payload.get("request_id", None))
-            zero_state = str(zero_payload.get("state", "n/a"))
+            zero_installed = as_bool(zp.get("zero_installed"))
+            epoch_sequence = as_int(zp.get("epoch_sequence"))
+            capture_sequence = as_int(zp.get("epoch_capture_sequence"))
+            capture_window = as_int(zp.get("epoch_capture_window_cycles"))
 
             time.sleep(settle_seconds)
 
-            clocks_resp = cmd_epoch_clocks()
-            clocks_ok = bool(clocks_resp and clocks_resp.get("success"))
-            clocks_payload = clocks_resp.get("payload", {}) if clocks_resp else {}
+            report_resp = cmd_clocks_report()
+            report_ok = bool(report_resp and report_resp.get("success"))
+            rp = payload(report_resp)
+            s = summary_from_payload(rp)
 
-            summary = clocks_payload.get("summary", {}) if isinstance(clocks_payload, dict) else {}
-            detail = clocks_payload.get("detail", {}) if isinstance(clocks_payload, dict) else {}
+            report_dwt = as_int(s.get("report_dwt"))
+            dwt64_ns = as_int(s.get("dwt64_ns"))
+            gnss_ns = as_int(s.get("gnss_ns"))
+            vclock_ns = as_int(s.get("vclock_ns"))
+            ocxo1_ns = as_int(s.get("ocxo1_ns"))
+            ocxo2_ns = as_int(s.get("ocxo2_ns"))
 
-            dwt64_total = as_int(summary.get("dwt64_cycles_total"))
-            vclock_ns64 = as_int(summary.get("vclock_ns64_total"))
-            ocxo1_ns64 = as_int(summary.get("ocxo1_ns64_total"))
-            ocxo2_ns64 = as_int(summary.get("ocxo2_ns64_total"))
+            vclock_valid = as_bool(s.get("vclock_valid"))
+            ocxo1_valid = as_bool(s.get("ocxo1_valid"))
+            ocxo2_valid = as_bool(s.get("ocxo2_valid"))
 
-            d1 = as_int(detail.get("ocxo1_norm_ticks64_delta_vs_vclock"))
-            d2 = as_int(detail.get("ocxo2_norm_ticks64_delta_vs_vclock"))
+            d_o1_ns = delta_ns(ocxo1_ns, vclock_ns)
+            d_o2_ns = delta_ns(ocxo2_ns, vclock_ns)
+            d_o1_ticks = delta_ticks(ocxo1_ns, vclock_ns)
+            d_o2_ticks = delta_ticks(ocxo2_ns, vclock_ns)
+            d_dwt_ns = delta_ns(dwt64_ns, vclock_ns)
 
-            # Fallback if detail deltas are unavailable.
-            if d1 is None and vclock_ns64 is not None and ocxo1_ns64 is not None:
-                d1 = (ocxo1_ns64 - vclock_ns64) // 100
-            if d2 is None and vclock_ns64 is not None and ocxo2_ns64 is not None:
-                d2 = (ocxo2_ns64 - vclock_ns64) // 100
-
-            ok_tag = "OK" if (zero_ok and clocks_ok) else "ERR"
-            acc_tag = "Y" if accepted is True else ("N" if accepted is False else "?")
+            ok_tag = "OK" if (zero_ok and report_ok) else "ERR"
+            z_tag = fmt_bool(zero_installed)
+            valid_tag = (
+                fmt_bool(vclock_valid)
+                + fmt_bool(ocxo1_valid)
+                + fmt_bool(ocxo2_valid)
+            )
 
             print(
                 f"{cycle:5d} "
-                f"{fmt_int(req_id, 4)} "
-                f"{ok_tag:>7s} "
-                f"{acc_tag:>3s} "
-                f"{zero_state:>15s} "
-                f"{fmt_int(dwt64_total, 16)} "
-                f"{fmt_int(vclock_ns64, 15)} "
-                f"{fmt_int(ocxo1_ns64, 15)} "
-                f"{fmt_int(ocxo2_ns64, 15)} "
-                f"{fmt_signed(d1, 11)} "
-                f"{fmt_signed(d2, 11)}"
+                f"{ok_tag:>4s} "
+                f"{'OK' if report_ok else 'ERR':>6s} "
+                f"{z_tag:>5s} "
+                f"{fmt_int(epoch_sequence, 5)} "
+                f"{fmt_int(capture_sequence, 6)} "
+                f"{fmt_int(capture_window, 3)} "
+                f"{fmt_int(report_dwt, 12)} "
+                f"{fmt_int(gnss_ns, 14)} "
+                f"{fmt_int(vclock_ns, 14)} "
+                f"{fmt_int(ocxo1_ns, 14)} "
+                f"{fmt_int(ocxo2_ns, 14)} "
+                f"{fmt_signed(d_o1_ns, 12)} "
+                f"{fmt_signed(d_o2_ns, 12)} "
+                f"{fmt_signed(d_o1_ticks, 10)} "
+                f"{fmt_signed(d_o2_ticks, 10)} "
+                f"{fmt_signed(d_dwt_ns, 12)} "
+                f"{valid_tag:>5s}"
             )
 
             if loop_pause > 0.0:
