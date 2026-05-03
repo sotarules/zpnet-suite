@@ -51,7 +51,6 @@
 #include "process_clocks_internal.h"
 #include "process_clocks.h"
 #include "process_interrupt.h"
-#include "process_epoch.h"
 
 #include "debug.h"
 #include "timebase.h"
@@ -812,30 +811,21 @@ void clocks_watchdog_anomaly(const char* reason,
 }
 
 // ============================================================================
-// Epoch install callback — invoked by process_epoch after alpha/time install
+// Local ZERO / START completion helpers
 // ============================================================================
 
-void clocks_beta_epoch_installed(const epoch_fact_t& fact) {
-  const bool epoch_zero_command =
-      fact.reason == epoch_reason_t::EPOCH_ZERO_COMMAND ||
-      fact.reason == epoch_reason_t::CLOCKS_ZERO_COMMAND ||
-      fact.reason == epoch_reason_t::STARTUP;
-  const bool epoch_start_command =
-      fact.reason == epoch_reason_t::CLOCKS_START;
-
-  if (!request_zero && !request_start && !epoch_zero_command && !epoch_start_command) {
-    return;
-  }
-
+static void clocks_finish_zero_accounting(void) {
   clocks_zero_all();
   request_zero = false;
+}
 
-  if (request_start || epoch_start_command) {
-    watchdog_anomaly_active = false;
-    campaign_state = clocks_campaign_state_t::STARTED;
-    request_start = false;
-    campaign_warmup_begin(campaign_warmup_mode_t::START);
-  }
+static void clocks_finish_start_accounting(void) {
+  clocks_zero_all();
+  request_zero = false;
+  request_start = false;
+  watchdog_anomaly_active = false;
+  campaign_state = clocks_campaign_state_t::STARTED;
+  campaign_warmup_begin(campaign_warmup_mode_t::START);
 }
 
 // ============================================================================
@@ -843,14 +833,6 @@ void clocks_beta_epoch_installed(const epoch_fact_t& fact) {
 // ============================================================================
 
 void clocks_beta_pps(void) {
-  // ZERO / START epoch installation is now owned by process_epoch.
-  // While a request is pending, beta deliberately does no intrinsic zeroing;
-  // process_epoch will invoke clocks_beta_epoch_installed() after the shared
-  // epoch fact has been authored and installed.
-  if (request_zero || request_start) {
-    return;
-  }
-
   if (request_stop) {
     watchdog_anomaly_active = false;
     campaign_state = clocks_campaign_state_t::STOPPED;
@@ -1139,22 +1121,27 @@ static Payload cmd_start(const Payload& args) {
   request_stop = false;
   request_recover = false;
 
-  const epoch_request_result_t epoch_result =
-      process_epoch_request_zero(epoch_reason_t::CLOCKS_START);
-  if (!epoch_result.accepted) {
+  const bool zero_ok = clocks_alpha_zero_from_interrupt_capture("start");
+  if (zero_ok) {
+    clocks_finish_start_accounting();
+  } else {
     request_start = false;
   }
 
   Payload p;
-  p.add("status", (!epoch_result.accepted)
-                      ? "start_rejected_epoch_pending"
+  p.add("status", !zero_ok
+                      ? "start_rejected_no_epoch_capture"
                       : ((!dac1_ok || !dac2_ok)
-                            ? "start_requested_dac_fault"
-                            : "start_requested"));
-  p.add("delegated_to", "EPOCH");
-  p.add("epoch_request_accepted", epoch_result.accepted);
-  p.add("epoch_request_id", epoch_result.request_id);
-  p.add("epoch_state", epoch_state_str(epoch_result.state));
+                            ? "started_dac_fault"
+                            : "started"));
+  p.add("zero_installed", zero_ok);
+  p.add("epoch_owner", "CLOCKS");
+  p.add("epoch_sequence", clocks_alpha_epoch_sequence());
+  p.add("epoch_reason", clocks_alpha_epoch_last_reason());
+  p.add("epoch_capture_sequence", clocks_alpha_epoch_last_capture_sequence());
+  p.add("epoch_capture_window_cycles", clocks_alpha_epoch_last_capture_window_cycles());
+  p.add("epoch_capture_vclock_valid", clocks_alpha_epoch_last_vclock_capture_valid());
+  p.add("epoch_capture_all_lanes_valid", clocks_alpha_epoch_last_all_lanes_valid());
   p.add("ocxo1_dac", ocxo1_dac.dac_fractional);
   p.add("ocxo2_dac", ocxo2_dac.dac_fractional);
   p.add("ocxo1_dac_last_write_ok", ocxo1_dac.io_last_write_ok);
@@ -1176,18 +1163,31 @@ static Payload cmd_zero(const Payload&) {
   request_start = false;
   request_stop = false;
   request_recover = false;
+  request_zero = true;
 
-  const epoch_request_result_t epoch_result =
-      process_epoch_request_zero(epoch_reason_t::CLOCKS_ZERO_COMMAND);
-  request_zero = epoch_result.accepted;
+  const bool zero_ok = clocks_alpha_zero_from_interrupt_capture("zero");
+  if (zero_ok) {
+    clocks_finish_zero_accounting();
+  } else {
+    request_zero = false;
+  }
 
   Payload p;
-  p.add("status", epoch_result.accepted ? "zero_requested" : "zero_rejected_epoch_pending");
-  p.add("delegated_to", "EPOCH");
-  p.add("epoch_request_accepted", epoch_result.accepted);
-  p.add("epoch_request_id", epoch_result.request_id);
-  p.add("epoch_state", epoch_state_str(epoch_result.state));
-  p.add("epoch_message", epoch_result.message);
+  p.add("status", zero_ok ? "zero_installed" : "zero_rejected_no_epoch_capture");
+  p.add("epoch_owner", "CLOCKS");
+  p.add("zero_installed", zero_ok);
+  p.add("epoch_sequence", clocks_alpha_epoch_sequence());
+  p.add("epoch_install_count", clocks_alpha_epoch_install_count());
+  p.add("epoch_install_failures", clocks_alpha_epoch_install_failures());
+  p.add("epoch_reason", clocks_alpha_epoch_last_reason());
+  p.add("epoch_dwt_at_edge", clocks_alpha_epoch_last_dwt_at_edge());
+  p.add("epoch_vclock_counter32", clocks_alpha_epoch_last_vclock_counter32());
+  p.add("epoch_ocxo1_counter32", clocks_alpha_epoch_last_ocxo1_counter32());
+  p.add("epoch_ocxo2_counter32", clocks_alpha_epoch_last_ocxo2_counter32());
+  p.add("epoch_capture_sequence", clocks_alpha_epoch_last_capture_sequence());
+  p.add("epoch_capture_window_cycles", clocks_alpha_epoch_last_capture_window_cycles());
+  p.add("epoch_capture_vclock_valid", clocks_alpha_epoch_last_vclock_capture_valid());
+  p.add("epoch_capture_all_lanes_valid", clocks_alpha_epoch_last_all_lanes_valid());
   return p;
 }
 
@@ -1227,16 +1227,38 @@ static Payload cmd_watchdog_test(const Payload&) {
 
 static Payload cmd_report(const Payload&) {
   Payload p = g_last_fragment.clone();
+
+  Payload summary;
+  const uint64_t dwt64_cycles_now = clocks_dwt_cycles_now();
+  summary.add("dwt64_cycles", dwt64_cycles_now);
+  summary.add("dwt64_ns", dwt_cycles_to_ns(dwt64_cycles_now));
+  summary.add("gnss_ns", clocks_gnss_ns_now());
+  summary.add("vclock_ns", g_vclock_clock.ns_count_at_pps_vclock);
+  summary.add("ocxo1_ns", clocks_ocxo1_ns_now());
+  summary.add("ocxo2_ns", clocks_ocxo2_ns_now());
+  p.add_object("summary", summary);
+
   p.add("campaign_state",
         campaign_state == clocks_campaign_state_t::STARTED ? "STARTED" : "STOPPED");
   p.add("request_start", request_start);
   p.add("request_stop", request_stop);
   p.add("request_recover", request_recover);
   p.add("request_zero", request_zero);
-  p.add("epoch_pending", process_epoch_pending());
-  p.add("epoch_state", epoch_state_str(process_epoch_state()));
-  p.add("epoch_request_id", process_epoch_last_request_id());
-  p.add("epoch_sequence", process_epoch_current_sequence());
+  p.add("epoch_pending", clocks_epoch_pending());
+  p.add("epoch_owner", "CLOCKS");
+  p.add("epoch_initialized", clocks_alpha_epoch_initialized());
+  p.add("epoch_sequence", clocks_alpha_epoch_sequence());
+  p.add("epoch_install_count", clocks_alpha_epoch_install_count());
+  p.add("epoch_install_failures", clocks_alpha_epoch_install_failures());
+  p.add("epoch_reason", clocks_alpha_epoch_last_reason());
+  p.add("epoch_dwt_at_edge", clocks_alpha_epoch_last_dwt_at_edge());
+  p.add("epoch_vclock_counter32", clocks_alpha_epoch_last_vclock_counter32());
+  p.add("epoch_ocxo1_counter32", clocks_alpha_epoch_last_ocxo1_counter32());
+  p.add("epoch_ocxo2_counter32", clocks_alpha_epoch_last_ocxo2_counter32());
+  p.add("epoch_capture_sequence", clocks_alpha_epoch_last_capture_sequence());
+  p.add("epoch_capture_window_cycles", clocks_alpha_epoch_last_capture_window_cycles());
+  p.add("epoch_capture_vclock_valid", clocks_alpha_epoch_last_vclock_capture_valid());
+  p.add("epoch_capture_all_lanes_valid", clocks_alpha_epoch_last_all_lanes_valid());
   p.add("interrupt_pps_rebootstrap_pending",
         interrupt_pps_rebootstrap_pending());
   p.add("campaign_warmup_active", campaign_warmup_active());

@@ -16,7 +16,6 @@
 #include "process_clocks_internal.h"
 #include "process_clocks.h"
 #include "process_interrupt.h"
-#include "process_epoch.h"
 
 #include "debug.h"
 #include "timebase.h"
@@ -25,6 +24,7 @@
 #include "payload.h"
 #include "publish.h"
 #include "timepop.h"
+#include "process_timepop.h"
 #include "config.h"
 #include "util.h"
 #include "ad5693r.h"
@@ -55,9 +55,9 @@ volatile uint64_t g_dwt_cycle_count_total = 0;
 volatile uint32_t g_dwt_cycles_between_pps_vclock = DWT_EXPECTED_PER_PPS;
 
 // Alpha-owned DWT64 logical clock.  This is the one true DWT64 clock surface.
-// It is not physically writable; process_epoch zeros it by installing an epoch
-// origin in this raw extended ledger.  The raw ledger itself is anchored by
-// DWT32 observations and advanced at each PPS/VCLOCK bookend.
+// It is not physically writable; CLOCKS.ZERO installs a logical epoch origin
+// in this raw extended ledger.  The raw ledger itself is anchored by DWT32
+// observations and advanced at each PPS/VCLOCK bookend.
 static volatile bool     g_dwt64_raw_anchor_valid = false;
 static volatile uint64_t g_dwt64_raw_cycles_at_anchor = 0;
 static volatile uint32_t g_dwt64_dwt32_at_anchor = 0;
@@ -301,8 +301,10 @@ bool clocks_dwt_calibration_valid(void) {
 }
 
 uint64_t clocks_gnss_ns_now(void) {
-  const int64_t ns = time_gnss_ns_now();
-  return (ns >= 0) ? (uint64_t)ns : g_gnss_ns_at_pps_vclock;
+  // CLOCKS owns the public nanosecond counters.  process_time may maintain
+  // its own bridge/absolute projection state, but the CLOCKS surface is
+  // epoch-relative and must not be overwritten by an absolute GNSS estimate.
+  return g_gnss_ns_at_pps_vclock;
 }
 
 uint64_t clocks_gnss_ticks_now(void) {
@@ -373,11 +375,28 @@ static inline void dwt_enable(void) {
 }
 
 bool clocks_epoch_pending(void) {
-  return process_epoch_pending();
+  return false;
 }
 
 static inline bool epoch_ready(void) {
-  return g_epoch_initialized && process_epoch_finalized();
+  return g_epoch_initialized;
+}
+
+static inline uint64_t ns_from_counter32_epoch(uint32_t counter32,
+                                               uint32_t epoch_counter32) {
+  return (uint64_t)((uint32_t)(counter32 - epoch_counter32)) *
+         (uint64_t)NS_PER_10MHZ_TICK;
+}
+
+static void clock_mark_epoch_zero(clock_state_t& clock) {
+  clock.ns_count_at_edge = 0;
+  clock.gnss_ns_at_edge = 0;
+  clock.ns_count_at_pps_vclock = 0;
+  clock.phase_offset_ns = 0;
+  clock.zero_established = true;
+  clock.window_checks = 0;
+  clock.window_mismatches = 0;
+  clock.window_error_ns = 0;
 }
 
 static void alpha_reset_canonical_clock_state_for_new_epoch(void) {
@@ -414,102 +433,161 @@ static void alpha_reset_canonical_clock_state_for_new_epoch(void) {
 }
 
 // ============================================================================
-// Epoch install
+// Local epoch install / ZERO
 // ============================================================================
-// The PPS snapshot projects the canonical PPS/VCLOCK edge selected by
-// process_interrupt.  Alpha consumes it directly and seeds the DWT/GNSS bridge.
+//
+// ZERO is no longer delegated to process_epoch.  process_interrupt continuously
+// authors an epoch-ready PPS capture packet in ISR context.  Alpha selects the
+// latest valid packet, installs local canonical nanosecond/cycle ledgers, and
+// notifies process_time/process_timepop that the VCLOCK coordinate generation
+// has changed.  Raw hardware counters are not written here.
 // ============================================================================
 
-void clocks_alpha_epoch_installed(const epoch_fact_t& fact) {
-  alpha_reset_canonical_clock_state_for_new_epoch();
+static volatile uint32_t g_alpha_epoch_install_count = 0;
+static volatile uint32_t g_alpha_epoch_install_failures = 0;
+static volatile uint32_t g_alpha_epoch_last_capture_sequence = 0;
+static volatile uint32_t g_alpha_epoch_last_capture_window_cycles = 0;
+static volatile bool     g_alpha_epoch_last_vclock_capture_valid = false;
+static volatile bool     g_alpha_epoch_last_all_lanes_valid = false;
+static volatile uint32_t g_alpha_epoch_last_dwt_at_edge = 0;
+static volatile uint32_t g_alpha_epoch_last_vclock_counter32 = 0;
+static volatile uint32_t g_alpha_epoch_last_ocxo1_counter32 = 0;
+static volatile uint32_t g_alpha_epoch_last_ocxo2_counter32 = 0;
+static volatile uint32_t g_alpha_epoch_sequence = 0;
+static char              g_alpha_epoch_last_reason[32] = {0};
 
-  g_gnss_ns_at_pps_vclock = fact.epoch_ns;
-  g_dwt_at_pps_vclock = fact.epoch_dwt;
-  g_counter32_at_pps_vclock = fact.vclock_counter32_at_epoch;
-  g_prev_dwt_at_vclock_event = fact.epoch_dwt;
-  g_prev_pps_vclock_dwt_at_edge = fact.epoch_dwt;
-  g_prev_pps_vclock_dwt_at_edge_valid = true;
-
-  // process_epoch has already installed the DWT64 epoch origin.  Re-anchor
-  // the raw DWT64 ledger at the same selected edge so the DWT64 logical clock
-  // starts at exactly zero and extends continuously from this epoch.
-  if (g_dwt64_epoch_valid) {
-    dwt64_anchor_reset_to_dwt32(fact.epoch_dwt, g_dwt64_epoch_raw_cycles);
+bool clocks_alpha_zero_from_interrupt_capture(const char* reason) {
+  interrupt_epoch_capture_t cap{};
+  if (!interrupt_last_epoch_capture(&cap) || !cap.valid || !cap.vclock_capture_valid) {
+    g_alpha_epoch_install_failures++;
+    return false;
   }
 
+  if (cap.vclock_dwt_at_edge == 0) {
+    g_alpha_epoch_install_failures++;
+    return false;
+  }
+
+  alpha_reset_canonical_clock_state_for_new_epoch();
+
+  g_gnss_ns_at_pps_vclock = 0;
+  g_dwt_at_pps_vclock = cap.vclock_dwt_at_edge;
+  g_counter32_at_pps_vclock = cap.vclock_counter32;
+  g_prev_dwt_at_vclock_event = cap.vclock_dwt_at_edge;
+  g_prev_pps_vclock_dwt_at_edge = cap.vclock_dwt_at_edge;
+  g_prev_pps_vclock_dwt_at_edge_valid = true;
+
+  clock_mark_epoch_zero(g_vclock_clock);
+  clock_mark_epoch_zero(g_ocxo1_clock);
+  clock_mark_epoch_zero(g_ocxo2_clock);
+
+  (void)clocks_dwt64_epoch_reset_at_dwt32(cap.vclock_dwt_at_edge, nullptr);
+  dwt64_anchor_reset_to_dwt32(cap.vclock_dwt_at_edge, g_dwt64_epoch_raw_cycles);
+
+  time_pps_vclock_epoch_reset(cap.vclock_dwt_at_edge, cap.vclock_counter32);
+  g_alpha_epoch_sequence++;
+
+  // VCLOCK synthetic coordinate generation changed.  Re-author recurring
+  // TimePop timers and cancel unsafe old-coordinate one-shots before normal
+  // scheduling resumes.  This is the essential process_epoch behavior that
+  // survives the retirement of process_epoch.
+  timepop_epoch_changed(g_alpha_epoch_sequence);
+
+  g_alpha_epoch_last_capture_sequence = cap.sequence;
+  g_alpha_epoch_last_capture_window_cycles = cap.capture_window_cycles;
+  g_alpha_epoch_last_vclock_capture_valid = cap.vclock_capture_valid;
+  g_alpha_epoch_last_all_lanes_valid = cap.all_lanes_capture_valid;
+  g_alpha_epoch_last_dwt_at_edge = cap.vclock_dwt_at_edge;
+  g_alpha_epoch_last_vclock_counter32 = cap.vclock_counter32;
+  g_alpha_epoch_last_ocxo1_counter32 = cap.ocxo1_counter32;
+  g_alpha_epoch_last_ocxo2_counter32 = cap.ocxo2_counter32;
+  safeCopy(g_alpha_epoch_last_reason, sizeof(g_alpha_epoch_last_reason),
+           (reason && *reason) ? reason : "unknown");
+  g_alpha_epoch_install_count++;
   g_epoch_initialized = true;
+  return true;
 }
+
+uint32_t clocks_alpha_epoch_sequence(void) { return g_alpha_epoch_sequence; }
+uint32_t clocks_alpha_epoch_install_count(void) { return g_alpha_epoch_install_count; }
+uint32_t clocks_alpha_epoch_install_failures(void) { return g_alpha_epoch_install_failures; }
+uint32_t clocks_alpha_epoch_last_capture_sequence(void) { return g_alpha_epoch_last_capture_sequence; }
+uint32_t clocks_alpha_epoch_last_capture_window_cycles(void) { return g_alpha_epoch_last_capture_window_cycles; }
+bool clocks_alpha_epoch_last_vclock_capture_valid(void) { return g_alpha_epoch_last_vclock_capture_valid; }
+bool clocks_alpha_epoch_last_all_lanes_valid(void) { return g_alpha_epoch_last_all_lanes_valid; }
+uint32_t clocks_alpha_epoch_last_dwt_at_edge(void) { return g_alpha_epoch_last_dwt_at_edge; }
+uint32_t clocks_alpha_epoch_last_vclock_counter32(void) { return g_alpha_epoch_last_vclock_counter32; }
+uint32_t clocks_alpha_epoch_last_ocxo1_counter32(void) { return g_alpha_epoch_last_ocxo1_counter32; }
+uint32_t clocks_alpha_epoch_last_ocxo2_counter32(void) { return g_alpha_epoch_last_ocxo2_counter32; }
+const char* clocks_alpha_epoch_last_reason(void) { return g_alpha_epoch_last_reason; }
+bool clocks_alpha_epoch_initialized(void) { return g_epoch_initialized; }
 
 // ============================================================================
 // Direct event application
 // ============================================================================
 
-static void clocks_apply_edge(clock_state_t& clock,
-                              clock_measurement_t& meas,
-                              const interrupt_event_t& event) {
+static void clocks_apply_epoch_counter_edge(clock_state_t& clock,
+                                            clock_measurement_t& meas,
+                                            const interrupt_event_t& event,
+                                            uint32_t epoch_counter32) {
+  const uint64_t ns_now =
+      ns_from_counter32_epoch(event.counter32_at_event, epoch_counter32);
+
+  const bool had_previous = (meas.prev_dwt_at_edge != 0);
+  const uint64_t previous_ns = meas.prev_gnss_ns_at_edge;
+
+  clock.ns_count_at_edge = ns_now;
+  clock.ns_count_at_pps_vclock = ns_now;
   clock.gnss_ns_at_edge = event.gnss_ns_at_event;
+  clock.phase_offset_ns = (event.gnss_ns_at_event != 0)
+      ? ((int64_t)event.gnss_ns_at_event - (int64_t)ns_now)
+      : 0;
+  clock.zero_established = true;
+
   meas.dwt_at_edge = event.dwt_at_event;
 
-  if (meas.prev_gnss_ns_at_edge == 0) {
-    clock.ns_count_at_edge = NS_PER_SECOND_U64;
-    clock.phase_offset_ns =
-        (int64_t)event.gnss_ns_at_event - (int64_t)NS_PER_SECOND_U64;
-    clock.zero_established = true;
-
+  if (!had_previous) {
     meas.gnss_ns_between_edges = 0;
     meas.dwt_cycles_between_edges = 0;
     meas.second_residual_ns = 0;
   } else {
-    clock.ns_count_at_edge += NS_PER_SECOND_U64;
-    clock.phase_offset_ns =
-        (int64_t)event.gnss_ns_at_event - (int64_t)clock.ns_count_at_edge;
-
-    const uint64_t gnss_ns_between_edges =
-        event.gnss_ns_at_event - meas.prev_gnss_ns_at_edge;
+    const uint64_t ns_between_edges = ns_now - previous_ns;
     const uint32_t dwt_cycles_between_edges =
         event.dwt_at_event - meas.prev_dwt_at_edge;
 
-    meas.gnss_ns_between_edges = gnss_ns_between_edges;
+    meas.gnss_ns_between_edges = ns_between_edges;
     meas.dwt_cycles_between_edges = dwt_cycles_between_edges;
-
-    // Positive residual: edge arrived early, clock running fast.
     meas.second_residual_ns =
-        (int64_t)NS_PER_SECOND_U64 - (int64_t)gnss_ns_between_edges;
+        (int64_t)NS_PER_SECOND_U64 - (int64_t)ns_between_edges;
 
     clock.window_error_ns =
-        (int64_t)gnss_ns_between_edges - (int64_t)NS_PER_SECOND_U64;
+        (int64_t)ns_between_edges - (int64_t)NS_PER_SECOND_U64;
     clock.window_checks++;
     if (llabs(clock.window_error_ns) > CLOCK_WINDOW_TOLERANCE_NS) {
       clock.window_mismatches++;
     }
   }
 
-  meas.prev_gnss_ns_at_edge = event.gnss_ns_at_event;
+  // This field is now the previous CLOCKS nanosecond value.  The name is a
+  // legacy diagnostic wart; the next cleanup pass can rename the measurement
+  // struct.  Do not feed absolute GNSS time into CLOCKS counters.
+  meas.prev_gnss_ns_at_edge = ns_now;
   meas.prev_dwt_at_edge = event.dwt_at_event;
 }
 
-static inline bool usable_clock_event(const interrupt_event_t& event) {
-  return epoch_ready() && event.gnss_ns_at_event != 0;
+static inline bool usable_clock_event(const interrupt_event_t&) {
+  return epoch_ready();
 }
 
 static void apply_ocxo_event(clock_state_t& clock,
                              clock_measurement_t& meas,
                              interrupt_capture_diag_t& diag_dst,
                              const interrupt_event_t& event,
-                             const interrupt_capture_diag_t* diag) {
+                             const interrupt_capture_diag_t* diag,
+                             uint32_t epoch_counter32) {
   clocks_capture_interrupt_diag(diag_dst, diag);
   if (!usable_clock_event(event)) return;
-  clocks_apply_edge(clock, meas, event);
-}
-
-static void refresh_ocxo_pps_ledgers(void) {
-  g_ocxo1_clock.ns_count_at_pps_vclock = g_ocxo1_clock.zero_established
-      ? (uint64_t)((int64_t)g_gnss_ns_at_pps_vclock - g_ocxo1_clock.phase_offset_ns)
-      : 0;
-
-  g_ocxo2_clock.ns_count_at_pps_vclock = g_ocxo2_clock.zero_established
-      ? (uint64_t)((int64_t)g_gnss_ns_at_pps_vclock - g_ocxo2_clock.phase_offset_ns)
-      : 0;
+  clocks_apply_epoch_counter_edge(clock, meas, event, epoch_counter32);
 }
 
 static void vclock_callback(const interrupt_event_t& event,
@@ -521,31 +599,30 @@ static void vclock_callback(const interrupt_event_t& event,
   if (!epoch_ready()) return;
 
   g_vclock_event_count++;
-  if (event.gnss_ns_at_event != 0) {
-    g_gnss_ns_at_pps_vclock = event.gnss_ns_at_event;
-  }
   g_prev_dwt_at_vclock_event = event.dwt_at_event;
 
-  if (event.gnss_ns_at_event != 0) {
-    clocks_apply_edge(g_vclock_clock, g_vclock_measurement, event);
-  }
+  clocks_apply_epoch_counter_edge(g_vclock_clock,
+                                  g_vclock_measurement,
+                                  event,
+                                  g_alpha_epoch_last_vclock_counter32);
 
-  g_vclock_clock.ns_count_at_pps_vclock = g_gnss_ns_at_pps_vclock;
-  refresh_ocxo_pps_ledgers();
+  g_gnss_ns_at_pps_vclock = g_vclock_clock.ns_count_at_pps_vclock;
 }
 
 static void ocxo1_callback(const interrupt_event_t& event,
                            const interrupt_capture_diag_t* diag,
                            void*) {
   apply_ocxo_event(g_ocxo1_clock, g_ocxo1_measurement,
-                   g_ocxo1_interrupt_diag, event, diag);
+                   g_ocxo1_interrupt_diag, event, diag,
+                   g_alpha_epoch_last_ocxo1_counter32);
 }
 
 static void ocxo2_callback(const interrupt_event_t& event,
                            const interrupt_capture_diag_t* diag,
                            void*) {
   apply_ocxo_event(g_ocxo2_clock, g_ocxo2_measurement,
-                   g_ocxo2_interrupt_diag, event, diag);
+                   g_ocxo2_interrupt_diag, event, diag,
+                   g_alpha_epoch_last_ocxo2_counter32);
 }
 
 // ============================================================================
@@ -582,9 +659,11 @@ static void update_pps_vclock_bridge_anchor(const pps_edge_snapshot_t& snap) {
 
   const uint32_t dwt_between_pps = snap.dwt_at_edge - g_prev_pps_vclock_dwt_at_edge;
 
-  if (snap.gnss_ns_at_edge >= 0) {
-    g_gnss_ns_at_pps_vclock = (uint64_t)snap.gnss_ns_at_edge;
-  }
+  const uint64_t vclock_ns =
+      ns_from_counter32_epoch(snap.counter32_at_edge,
+                              g_alpha_epoch_last_vclock_counter32);
+  g_gnss_ns_at_pps_vclock = vclock_ns;
+  g_vclock_clock.ns_count_at_pps_vclock = vclock_ns;
 
   g_dwt_cycles_between_pps_vclock = dwt_between_pps;
   g_dwt_cycle_count_total += (uint64_t)dwt_between_pps;
@@ -608,11 +687,13 @@ static void maybe_publish_fragment(void) {
 }
 
 static void pps_selector_callback(const pps_edge_snapshot_t& snap) {
-  // EPOCH ZERO is intentionally synchronous here: the selected PPS/VCLOCK
-  // snapshot is the sacred edge, so process_epoch gets first chance to install
-  // its compensated zero before alpha treats the edge as an ordinary bridge
-  // update.
-  const bool installed_epoch = process_epoch_on_pps_vclock_snapshot(snap);
+  // Startup is the only automatic epoch install.  Explicit ZERO is now an
+  // immediate command that selects the latest already-authored interrupt
+  // epoch capture packet.
+  bool installed_epoch = false;
+  if (!g_epoch_initialized) {
+    installed_epoch = clocks_alpha_zero_from_interrupt_capture("startup");
+  }
 
   publish_pps_witness_diag(snap);
   if (!installed_epoch) {
@@ -645,9 +726,11 @@ void process_clocks_init(void) {
   time_init();
   timebase_init();
 
-  // process_epoch owns epoch/ZERO choreography.  Startup requests a fresh
-  // PPS/VCLOCK-selected epoch through the same controller used by ZERO/START.
-  (void)process_epoch_request_zero(epoch_reason_t::STARTUP);
+  // Startup epoch is installed locally by alpha from the first valid
+  // process_interrupt PPS/VCLOCK epoch capture packet.  Request a PPS
+  // rebootstrap so process_interrupt authors the first canonical PPS_VCLOCK
+  // edge and its epoch-ready capture packet.
+  interrupt_request_pps_rebootstrap();
 
   g_ad5693r_init_ok = ad5693r_init();
 

@@ -405,6 +405,45 @@ struct pps_edge_snapshot_t {
   bool     vclock_epoch_selected               = false;
 };
 
+// ============================================================================
+// Epoch-ready PPS capture packet
+// ============================================================================
+//
+// Authored on every PPS GPIO ISR from the ISR opening custody window.  Raw
+// 16-bit hardware counter reads are intentionally not exposed here; they are
+// translated immediately inside process_interrupt into synthetic 32-bit lane
+// coordinates.  ZERO can select this packet asynchronously without waiting for
+// the next PPS edge.
+
+struct interrupt_epoch_capture_t {
+  bool     valid = false;
+  uint32_t sequence = 0;
+
+  uint32_t capture_dwt_start_raw = 0;
+  uint32_t capture_dwt_after_vclock_raw = 0;
+  uint32_t capture_dwt_end_raw = 0;
+  uint32_t capture_window_cycles = 0;
+  uint32_t vclock_read_offset_cycles = 0;
+
+  // Latency-adjusted DWT coordinate of the selected PPS_VCLOCK edge authored
+  // from this same PPS ISR capture.  CLOCKS ZERO consumes this field directly;
+  // it does not require the previous PPS_VCLOCK snapshot store to have already
+  // advanced to this sequence.
+  uint32_t vclock_dwt_at_edge = 0;
+
+  // vclock_capture_valid is the operational requirement.  If VCLOCK is wrong,
+  // the packet cannot be used as a clock epoch source.  all_lanes_capture_valid
+  // is a quality flag: OCXO one-tick ambiguity is diagnostic rather than fatal.
+  bool     vclock_capture_valid = false;
+  bool     all_lanes_capture_valid = false;
+
+  uint32_t vclock_counter32 = 0;
+  uint32_t ocxo1_counter32 = 0;
+  uint32_t ocxo2_counter32 = 0;
+};
+
+bool interrupt_last_epoch_capture(interrupt_epoch_capture_t* out);
+
 
 // ============================================================================
 // PPS GPIO heartbeat accessor
@@ -447,11 +486,13 @@ struct interrupt_subscription_t {
 // physical PPS edge.  The snapshot is a stable copy of the state captured
 // in the GPIO ISR.  The registered callback's responsibilities:
 //
-//   1. If g_epoch_pending is true, install the epoch from snap.
-//   2. Stash audit fields into the TIMEBASE_FRAGMENT-bound diag.
-//   3. Call clocks_beta_pps() to publish the fragment.
+//   1. Stash audit fields into the TIMEBASE_FRAGMENT-bound diag.
+//   2. Call clocks_beta_pps() to publish the fragment.
 //
-// Will be replaced by a PPS_VCLOCK-typed dispatch when alpha migrates.
+// Epoch ZERO no longer depends on this dispatch path; clocks code selects the
+// already-authored interrupt_epoch_capture_t when it needs an asynchronous
+// logical epoch.  This callback will be replaced by a PPS_VCLOCK-typed dispatch
+// when alpha migrates.
 
 using pps_edge_dispatch_fn = void (*)(const pps_edge_snapshot_t& snap);
 
@@ -594,18 +635,13 @@ uint32_t interrupt_vclock_counter32_observe_ambient(void);
 void     interrupt_qtimer1_ch2_arm_compare(uint32_t target_counter32);
 
 // ============================================================================
-// Private synthetic clock32 zeroing API
+// Private synthetic clock32 API
 // ============================================================================
 //
 // The synthetic 32-bit QTimer identity for each clock domain is owned by
-// process_interrupt.  Callers provide the 64-bit nanosecond ledger value;
-// process_interrupt derives the compact identity as (ns / 100) mod 2^32.
-//
-// immediate zero: maps the clock's current synthetic identity to ns now.
-// requested zero: latches a zero request to be consumed at the next exact
-// hardware edge owned by process_interrupt.  VCLOCK consumes this in the PPS
-// GPIO ISR during rebootstrap so the snapshot itself carries the new identity.
-
+// process_interrupt because ISR callbacks need counter32_at_event immediately.
+// Higher layers interpret those event coordinates; they do not write raw
+// hardware counters.  The former process_epoch setter API has been retired.
 
 struct interrupt_clock_snapshot_t {
   uint16_t hardware16 = 0;
@@ -613,12 +649,6 @@ struct interrupt_clock_snapshot_t {
   uint64_t ns64 = 0;
 };
 
-bool interrupt_clock16_set_from_ticks(interrupt_subscriber_kind_t kind,
-                                      uint32_t ticks);
-bool interrupt_clock32_set_from_ticks(interrupt_subscriber_kind_t kind,
-                                      uint32_t ticks);
-bool interrupt_clock64_ns_set(interrupt_subscriber_kind_t kind,
-                              uint64_t ns);
 bool interrupt_clock_snapshot(interrupt_subscriber_kind_t kind,
                               interrupt_clock_snapshot_t* out);
 

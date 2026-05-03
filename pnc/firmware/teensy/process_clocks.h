@@ -12,7 +12,7 @@
 // Responsibilities:
 //   • Consumption of process_interrupt-authored clock captures
 //   • Synthetic nanosecond clocks
-//   • Compatibility delegation of ZERO/START epoch requests to process_epoch
+//   • Local CLOCKS-owned ZERO/START logical epoch installation
 //   • PPS/VCLOCK-selected truth capture
 //   • 1 Hz publication of canonical clock tuple
 //   • Continuous DWT-to-GNSS calibration (campaign-independent)
@@ -68,9 +68,9 @@ void process_clocks_register(void);
 // -----------------------------------------------------------------------------
 
 // DWT64 logical clock. CLOCKS/alpha owns the physical/extended DWT64 ledger.
-// process_epoch installs the logical zero by asking CLOCKS to map a selected
-// DWT32 event coordinate to the DWT64 epoch origin. After that,
-// clocks_dwt_cycles_now() returns epoch-relative logical DWT64 cycles.
+// CLOCKS.ZERO installs the logical zero by mapping a selected DWT32 event
+// coordinate to the DWT64 epoch origin. After that, clocks_dwt_cycles_now()
+// returns epoch-relative logical DWT64 cycles.
 bool clocks_dwt64_epoch_reset_at_dwt32(uint32_t epoch_dwt32,
                                        uint64_t* out_raw_epoch_dwt64);
 

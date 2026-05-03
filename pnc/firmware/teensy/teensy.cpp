@@ -13,7 +13,6 @@
 #include "transport.h"
 #include "payload.h"
 #include "debug.h"
-#include "epoch.h"
 
 #include "process_interrupt.h"
 #include "process_clocks.h"
@@ -26,7 +25,6 @@
 #include "process_pubsub.h"
 #include "process_performance.h"
 #include "process_witness.h"
-#include "process_epoch.h"
 
 #include <Arduino.h>
 #include <Wire.h>
@@ -386,14 +384,6 @@ void setup() {
   // ----------------------------------------------------------
   // Time process registration
   // ----------------------------------------------------------
-
-  debug_log("boot", "process_epoch_init");
-  process_epoch_init();
-  debug_log("boot", "process_epoch_init done");
-
-  debug_log("boot", "process_epoch_register");
-  process_epoch_register();
-  debug_log("boot", "process_epoch_register done");
 
   debug_log("boot", "process_time_init");
   process_time_init();

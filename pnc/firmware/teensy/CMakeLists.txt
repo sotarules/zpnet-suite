@@ -76,8 +76,6 @@ set(ZPNET_SOURCES
     process_timepop.cpp
     process_witness.cpp
     process_time.cpp
-    process_epoch.cpp
-    epoch.cpp
     publish.cpp
     teensy.cpp
     timebase.cpp
@@ -109,8 +107,6 @@ set(ZPNET_HEADERS
     process_timepop.h
     process_witness.h
     process_time.h
-    process_epoch.h
-    epoch.h
     publish.h
     timebase.h
     timepop.h

@@ -130,6 +130,14 @@ static constexpr uint32_t VCLOCK_DWT_REPAIR_MAX_PREDICTION_RESIDUAL_CYCLES = 25;
 static constexpr bool     PPS_VCLOCK_PHASE_WATCHDOG_ENABLED = false;
 static constexpr uint32_t PPS_VCLOCK_PHASE_TOLERANCE_CYCLES = 10;
 
+// Epoch-ready PPS capture packet.  The ISR captures the first-instruction DWT
+// and the three lane hardware counters in one tiny custody window.  DWT runs
+// at ~1.008 GHz, so 101 cycles is roughly one 10 MHz tick.  The packet remains
+// available for the entire following second; ZERO can select it asynchronously.
+static constexpr uint32_t EPOCH_CAPTURE_MAX_WINDOW_CYCLES =
+    (DWT_EXPECTED_PER_PPS + (VCLOCK_COUNTS_PER_SECOND - 1U)) /
+    VCLOCK_COUNTS_PER_SECOND;
+
 // ============================================================================
 // PPS / PPS_VCLOCK doctrine
 // ============================================================================
@@ -206,6 +214,94 @@ static pps_vclock_t store_load_pvc(void) {
   pps_vclock_t pvc;
   store_load(pps, pvc);
   return pvc;
+}
+
+// ============================================================================
+// Epoch-ready PPS capture packet (seqlock)
+// ============================================================================
+//
+// This packet is authored on every PPS GPIO ISR from the ISR's opening custody
+// window.  The 16-bit hardware reads are not retained operationally; they are
+// immediately translated into process_interrupt-owned synthetic 32-bit lane
+// coordinates.  ZERO consumers select this already-authored packet later.
+
+struct epoch_capture_store_t {
+  volatile uint32_t seq = 0;
+
+  volatile bool     valid = false;
+  volatile uint32_t sequence = 0;
+  volatile uint32_t capture_dwt_start_raw = 0;
+  volatile uint32_t capture_dwt_after_vclock_raw = 0;
+  volatile uint32_t capture_dwt_end_raw = 0;
+  volatile uint32_t capture_window_cycles = 0;
+  volatile uint32_t vclock_read_offset_cycles = 0;
+
+  // Latency-adjusted DWT coordinate of the selected PPS_VCLOCK edge,
+  // derived directly from the same first-instruction PPS ISR raw capture
+  // that authored this epoch-ready packet.  CLOCKS ZERO consumes this field
+  // instead of requiring the most recent published PPS_VCLOCK snapshot to
+  // have caught up to this GPIO edge.
+  volatile uint32_t vclock_dwt_at_edge = 0;
+
+  volatile bool     vclock_capture_valid = false;
+  volatile bool     all_lanes_capture_valid = false;
+
+  volatile uint32_t vclock_counter32 = 0;
+  volatile uint32_t ocxo1_counter32 = 0;
+  volatile uint32_t ocxo2_counter32 = 0;
+};
+
+static epoch_capture_store_t g_epoch_capture_store;
+
+static void epoch_capture_publish(const interrupt_epoch_capture_t& cap) {
+  g_epoch_capture_store.seq++;
+  dmb_barrier();
+
+  g_epoch_capture_store.valid = cap.valid;
+  g_epoch_capture_store.sequence = cap.sequence;
+  g_epoch_capture_store.capture_dwt_start_raw = cap.capture_dwt_start_raw;
+  g_epoch_capture_store.capture_dwt_after_vclock_raw = cap.capture_dwt_after_vclock_raw;
+  g_epoch_capture_store.capture_dwt_end_raw = cap.capture_dwt_end_raw;
+  g_epoch_capture_store.capture_window_cycles = cap.capture_window_cycles;
+  g_epoch_capture_store.vclock_read_offset_cycles = cap.vclock_read_offset_cycles;
+  g_epoch_capture_store.vclock_dwt_at_edge = cap.vclock_dwt_at_edge;
+  g_epoch_capture_store.vclock_capture_valid = cap.vclock_capture_valid;
+  g_epoch_capture_store.all_lanes_capture_valid = cap.all_lanes_capture_valid;
+  g_epoch_capture_store.vclock_counter32 = cap.vclock_counter32;
+  g_epoch_capture_store.ocxo1_counter32 = cap.ocxo1_counter32;
+  g_epoch_capture_store.ocxo2_counter32 = cap.ocxo2_counter32;
+
+  dmb_barrier();
+  g_epoch_capture_store.seq++;
+}
+
+bool interrupt_last_epoch_capture(interrupt_epoch_capture_t* out) {
+  if (!out) return false;
+
+  for (int attempt = 0; attempt < 4; attempt++) {
+    const uint32_t s1 = g_epoch_capture_store.seq;
+    dmb_barrier();
+
+    out->valid = g_epoch_capture_store.valid;
+    out->sequence = g_epoch_capture_store.sequence;
+    out->capture_dwt_start_raw = g_epoch_capture_store.capture_dwt_start_raw;
+    out->capture_dwt_after_vclock_raw = g_epoch_capture_store.capture_dwt_after_vclock_raw;
+    out->capture_dwt_end_raw = g_epoch_capture_store.capture_dwt_end_raw;
+    out->capture_window_cycles = g_epoch_capture_store.capture_window_cycles;
+    out->vclock_read_offset_cycles = g_epoch_capture_store.vclock_read_offset_cycles;
+    out->vclock_dwt_at_edge = g_epoch_capture_store.vclock_dwt_at_edge;
+    out->vclock_capture_valid = g_epoch_capture_store.vclock_capture_valid;
+    out->all_lanes_capture_valid = g_epoch_capture_store.all_lanes_capture_valid;
+    out->vclock_counter32 = g_epoch_capture_store.vclock_counter32;
+    out->ocxo1_counter32 = g_epoch_capture_store.ocxo1_counter32;
+    out->ocxo2_counter32 = g_epoch_capture_store.ocxo2_counter32;
+
+    dmb_barrier();
+    const uint32_t s2 = g_epoch_capture_store.seq;
+    if (s1 == s2 && (s1 & 1u) == 0u) return out->valid;
+  }
+
+  return false;
 }
 
 static pps_edge_dispatch_fn g_pps_edge_dispatch = nullptr;
@@ -1037,99 +1133,53 @@ static inline uint32_t cadence_mod_for_ticks(uint32_t ticks, uint32_t interval) 
   return (ticks / interval) % TICKS_PER_SECOND_EVENT;
 }
 
-static uint16_t clock_hw16_read(interrupt_subscriber_kind_t kind) {
-  if (kind == interrupt_subscriber_kind_t::VCLOCK) return qtimer1_ch0_counter_now();
-  if (kind == interrupt_subscriber_kind_t::OCXO1)  return IMXRT_TMR3.CH[2].CNTR;
-  if (kind == interrupt_subscriber_kind_t::OCXO2)  return IMXRT_TMR3.CH[3].CNTR;
-  return 0;
-}
-
-static bool clock_hw16_write(interrupt_subscriber_kind_t kind, uint32_t ticks) {
-  const uint16_t value = (uint16_t)ticks;
-
-  if (kind == interrupt_subscriber_kind_t::VCLOCK) {
-    IMXRT_TMR1.CH[0].CNTR = value;
-    IMXRT_TMR1.CH[3].CNTR = value;
-    g_vclock_clock32.hardware16 = value;
-    g_vclock_clock32.hardware_low16_at_current = value;
-    g_vclock_lane.logical_count32_at_last_second = ticks;
-    g_vclock_lane.tick_mod_1000 = cadence_mod_for_ticks(ticks, VCLOCK_INTERVAL_COUNTS);
-    g_vclock_lane.phase_bootstrapped = true;
-    g_vclock_lane.compare_target = (uint16_t)(value + (uint16_t)VCLOCK_INTERVAL_COUNTS);
-    qtimer1_ch3_program_compare(g_vclock_lane.compare_target);
-    return true;
-  }
-
-  ocxo_lane_t* lane = ocxo_lane_for(kind);
-  synthetic_clock32_t* c = synthetic_clock_for_kind(kind);
-  if (!lane || !c) return false;
-
-  IMXRT_TMR3.CH[lane->channel].CNTR = value;
-  c->hardware16 = value;
-  lane->logical_count32_at_last_second = ticks;
-  lane->tick_mod_1000 = cadence_mod_for_ticks(ticks, OCXO_INTERVAL_COUNTS);
-  lane->phase_bootstrapped = true;
-  lane->compare_target = (uint16_t)(value + (uint16_t)OCXO_INTERVAL_COUNTS);
-  qtimer3_program_compare(lane->channel, lane->compare_target);
-  return true;
-}
-
 static uint32_t project_counter32_from_hw16(const synthetic_clock32_t& c,
                                             uint16_t hardware16) {
+  // Boot-safety rule: before a lane has been explicitly born/zeroed, raw
+  // hardware low-word observations are still safe diagnostic coordinates.
+  // Do not project from an uninitialized synthetic anchor.  This preserves
+  // the old pre-epoch behavior and keeps early PPS/REPORT paths harmless.
   if (!c.zeroed) return (uint32_t)hardware16;
+
   return c.current_counter32 + (uint32_t)((uint16_t)(hardware16 - c.hardware16));
 }
 
 static uint64_t project_ns64_from_hw16(const synthetic_clock32_t& c,
                                        uint16_t hardware16) {
+  // Same boot-safety rule as COUNT32 projection.  This value is not global
+  // truth before ZERO; it is only a harmless local low-word-derived surface.
   if (!c.zeroed) return (uint64_t)hardware16 * 100ULL;
+
   const uint32_t delta = (uint32_t)((uint16_t)(hardware16 - c.hardware16));
   return c.current_ns + (uint64_t)delta * 100ULL;
 }
 
-bool interrupt_clock16_set_from_ticks(interrupt_subscriber_kind_t kind, uint32_t ticks) {
-  return clock_hw16_write(kind, ticks);
+static void synthetic_clock_bootstrap_from_hw16(synthetic_clock32_t& c,
+                                                uint16_t hardware16) {
+  // This is not a user ZERO.  It merely gives the synthetic extender a
+  // coherent birth anchor so early ISR/report paths never project from an
+  // all-zero default object.
+  c.zeroed = true;
+  c.zero_ns = (uint64_t)hardware16 * 100ULL;
+  c.zero_counter32 = (uint32_t)hardware16;
+  c.current_counter32 = (uint32_t)hardware16;
+  c.current_ns = (uint64_t)hardware16 * 100ULL;
+  c.hardware16 = hardware16;
+  c.pending_zero = false;
 }
 
-bool interrupt_clock32_set_from_ticks(interrupt_subscriber_kind_t kind, uint32_t ticks) {
-  const uint16_t hw = clock_hw16_read(kind);
-
-  if (kind == interrupt_subscriber_kind_t::VCLOCK) {
-    g_vclock_clock32.zeroed = true;
-    g_vclock_clock32.current_counter32 = ticks;
-    g_vclock_clock32.current_ns = (uint64_t)ticks * 100ULL;
-    g_vclock_clock32.hardware16 = hw;
-    g_vclock_clock32.hardware_low16_at_current = hw;
-    g_vclock_lane.logical_count32_at_last_second = ticks;
-    return true;
-  }
-
-  synthetic_clock32_t* c = synthetic_clock_for_kind(kind);
-  if (!c) return false;
-  c->zeroed = true;
-  c->current_counter32 = ticks;
-  c->current_ns = (uint64_t)ticks * 100ULL;
-  c->hardware16 = hw;
-  ocxo_lane_t* lane = ocxo_lane_for(kind);
-  if (lane) lane->logical_count32_at_last_second = ticks;
-  return true;
-}
-
-bool interrupt_clock64_ns_set(interrupt_subscriber_kind_t kind, uint64_t ns) {
-  const uint16_t hw = clock_hw16_read(kind);
-
-  if (kind == interrupt_subscriber_kind_t::VCLOCK) {
-    g_vclock_clock32.current_ns = ns;
-    g_vclock_clock32.hardware16 = hw;
-    g_vclock_clock32.hardware_low16_at_current = hw;
-    return true;
-  }
-
-  synthetic_clock32_t* c = synthetic_clock_for_kind(kind);
-  if (!c) return false;
-  c->current_ns = ns;
-  c->hardware16 = hw;
-  return true;
+static void vclock_clock_bootstrap_from_hw16(uint16_t hardware16) {
+  // Birth the VCLOCK synthetic layer without declaring a logical ZERO.  The
+  // PPS/VCLOCK rebootstrap and CLOCKS.ZERO paths may later install the real
+  // coordinate origin, but the interrupt layer is safe immediately after IRQs
+  // go live.
+  g_vclock_clock32.zeroed = true;
+  g_vclock_clock32.zero_ns = (uint64_t)hardware16 * 100ULL;
+  g_vclock_clock32.zero_counter32 = (uint32_t)hardware16;
+  g_vclock_clock32.hardware_low16_at_zero = hardware16;
+  g_vclock_clock32.pending_zero = false;
+  vclock_clock_anchor_hardware_low16((uint32_t)hardware16, hardware16);
+  g_vclock_lane.logical_count32_at_last_second = (uint32_t)hardware16;
 }
 
 bool interrupt_clock_snapshot(interrupt_subscriber_kind_t kind, interrupt_clock_snapshot_t* out) {
@@ -1712,7 +1762,26 @@ void process_interrupt_gpio6789_irq(uint32_t isr_entry_dwt_raw) {
   // NOT author the public PPS/VCLOCK DWT coordinate; that coordinate is later
   // authored by the VCLOCK/QTimer1 CH3 path so all public DWT captures live in
   // a single VCLOCK event-coordinate system.
+  //
+  // Epochization capture doctrine: immediately after the first-instruction
+  // DWT raw capture, read the three 10 MHz lane counters in one custody
+  // window.  The raw 16-bit reads are local only; after translation below, the
+  // retained epoch packet contains only synthetic 32-bit lane coordinates.
+  const uint32_t epoch_capture_start_raw = isr_entry_dwt_raw;
   const uint16_t hardware_low16 = qtimer1_ch0_counter_now();
+  const uint32_t epoch_capture_after_vclock_raw = ARM_DWT_CYCCNT;
+
+  // Defensive boot rule: VCLOCK is mandatory and QTimer1 CH0 is initialized
+  // before IRQs are enabled.  OCXO raw reads are desirable, but they are not
+  // allowed to become a boot-time dependency unless QTimer3 lane hardware is
+  // known initialized.  This keeps PPS witness/selector work alive even if an
+  // OCXO lane is not ready yet.
+  const bool ocxo_capture_hw_ready =
+      g_interrupt_hw_ready && g_ocxo1_lane.initialized && g_ocxo2_lane.initialized;
+  const uint16_t ocxo1_hardware16 = ocxo_capture_hw_ready ? IMXRT_TMR3.CH[2].CNTR : 0;
+  const uint16_t ocxo2_hardware16 = ocxo_capture_hw_ready ? IMXRT_TMR3.CH[3].CNTR : 0;
+  const uint32_t epoch_capture_end_raw = ARM_DWT_CYCCNT;
+
   const uint16_t ch3_now = hardware_low16;
 
   const uint16_t selected_low16 =
@@ -1734,8 +1803,39 @@ void process_interrupt_gpio6789_irq(uint32_t isr_entry_dwt_raw) {
   const uint32_t selected_counter32 =
       observed_counter32 - VCLOCK_EPOCH_OBSERVED_TICKS_AFTER_SELECTED;
 
+  const uint32_t ocxo1_counter32 = ocxo_capture_hw_ready
+      ? project_counter32_from_hw16(g_ocxo1_clock32, ocxo1_hardware16)
+      : 0;
+  const uint32_t ocxo2_counter32 = ocxo_capture_hw_ready
+      ? project_counter32_from_hw16(g_ocxo2_clock32, ocxo2_hardware16)
+      : 0;
+
   g_gpio_irq_count++;
   g_pps_gpio_heartbeat.edge_count++;
+
+  interrupt_epoch_capture_t epoch_cap{};
+  epoch_cap.sequence = g_pps_gpio_heartbeat.edge_count;
+  epoch_cap.capture_dwt_start_raw = epoch_capture_start_raw;
+  epoch_cap.capture_dwt_after_vclock_raw = epoch_capture_after_vclock_raw;
+  epoch_cap.capture_dwt_end_raw = epoch_capture_end_raw;
+  epoch_cap.capture_window_cycles = epoch_capture_end_raw - epoch_capture_start_raw;
+  epoch_cap.vclock_read_offset_cycles =
+      epoch_capture_after_vclock_raw - epoch_capture_start_raw;
+  epoch_cap.vclock_dwt_at_edge =
+      pps_vclock_dwt_from_pps_isr_entry_raw(isr_entry_dwt_raw);
+  epoch_cap.vclock_capture_valid =
+      epoch_cap.vclock_read_offset_cycles <= EPOCH_CAPTURE_MAX_WINDOW_CYCLES;
+  epoch_cap.all_lanes_capture_valid =
+      ocxo_capture_hw_ready &&
+      epoch_cap.capture_window_cycles <= EPOCH_CAPTURE_MAX_WINDOW_CYCLES;
+  // A packet is operationally selectable only after interrupt runtime has
+  // finished initialization.  This prevents a boot-time partial capture from
+  // being mistaken for a CLOCKS.ZERO epoch packet.
+  epoch_cap.valid = g_interrupt_runtime_ready && epoch_cap.vclock_capture_valid;
+  epoch_cap.vclock_counter32 = selected_counter32;
+  epoch_cap.ocxo1_counter32 = ocxo1_counter32;
+  epoch_cap.ocxo2_counter32 = ocxo2_counter32;
+  epoch_capture_publish(epoch_cap);
 
   if (g_pps_entry_latency_handler) {
     g_pps_entry_latency_handler(g_pps_gpio_heartbeat.edge_count,
@@ -2080,6 +2180,7 @@ void process_interrupt_init(void) {
   g_pps_rebootstrap_count = 0;
 
   g_store = snapshot_store_t{};
+  g_epoch_capture_store = epoch_capture_store_t{};
   pvc_anchor_ring_reset();
   g_bridge_stats_timepop = bridge_anchor_stats_t{};
   g_bridge_stats_ocxo1 = bridge_anchor_stats_t{};
@@ -2090,6 +2191,21 @@ void process_interrupt_init(void) {
   g_vclock_clock32 = vclock_synthetic_clock32_t{};
   g_ocxo1_clock32 = synthetic_clock32_t{};
   g_ocxo2_clock32 = synthetic_clock32_t{};
+
+  // Defensive birth anchors.  These are not logical ZERO operations; they
+  // simply make process_interrupt's synthetic coordinate extenders safe before
+  // CLOCKS has installed a user/campaign epoch.
+  if (g_interrupt_hw_ready) {
+    vclock_clock_bootstrap_from_hw16(qtimer1_ch0_counter_now());
+    if (g_ocxo1_lane.initialized) {
+      synthetic_clock_bootstrap_from_hw16(g_ocxo1_clock32, IMXRT_TMR3.CH[2].CNTR);
+      g_ocxo1_lane.logical_count32_at_last_second = g_ocxo1_clock32.current_counter32;
+    }
+    if (g_ocxo2_lane.initialized) {
+      synthetic_clock_bootstrap_from_hw16(g_ocxo2_clock32, IMXRT_TMR3.CH[3].CNTR);
+      g_ocxo2_lane.logical_count32_at_last_second = g_ocxo2_clock32.current_counter32;
+    }
+  }
   g_qtimer1_ch1_sequence = 0;
   g_qtimer1_ch1_target_counter32 = 0;
   g_qtimer1_ch1_next_compare_counter32 = 0;
@@ -2219,6 +2335,21 @@ static Payload cmd_report(const Payload&) {
   p.add("pps_vclock_counter32_at_edge", pvc.counter32_at_edge);
   p.add("pps_vclock_ch3_at_edge",       (uint32_t)pvc.ch3_at_edge);
   p.add("pps_vclock_gnss_ns_at_edge",   pvc.gnss_ns_at_edge);
+
+  interrupt_epoch_capture_t epoch_cap{};
+  const bool epoch_cap_ok = interrupt_last_epoch_capture(&epoch_cap);
+  p.add("epoch_capture_available", epoch_cap_ok);
+  p.add("epoch_capture_valid", epoch_cap.valid);
+  p.add("epoch_capture_sequence", epoch_cap.sequence);
+  p.add("epoch_capture_window_cycles", epoch_cap.capture_window_cycles);
+  p.add("epoch_capture_max_window_cycles", EPOCH_CAPTURE_MAX_WINDOW_CYCLES);
+  p.add("epoch_capture_vclock_read_offset_cycles", epoch_cap.vclock_read_offset_cycles);
+  p.add("epoch_capture_vclock_dwt_at_edge", epoch_cap.vclock_dwt_at_edge);
+  p.add("epoch_capture_vclock_valid", epoch_cap.vclock_capture_valid);
+  p.add("epoch_capture_all_lanes_valid", epoch_cap.all_lanes_capture_valid);
+  p.add("epoch_capture_vclock_counter32", epoch_cap.vclock_counter32);
+  p.add("epoch_capture_ocxo1_counter32", epoch_cap.ocxo1_counter32);
+  p.add("epoch_capture_ocxo2_counter32", epoch_cap.ocxo2_counter32);
 
   p.add("pps_edge_dispatch_registered", g_pps_edge_dispatch != nullptr);
 

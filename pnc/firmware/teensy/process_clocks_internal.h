@@ -49,10 +49,10 @@
 //
 // Authorship map:
 //
-//   - g_gnss_ns_at_pps_vclock         Pure synthetic counter. Set to 0 at
-//                                     epoch install and advanced by exactly
-//                                     +1e9 in alpha::vclock_callback per
-//                                     VCLOCK one-second event.
+//   - g_gnss_ns_at_pps_vclock         CLOCKS-owned epoch-relative nanosecond
+//                                     counter. Set to 0 at ZERO and updated
+//                                     from the VCLOCK counter32 delta against
+//                                     the current CLOCKS epoch.
 //   - g_dwt_at_pps_vclock             DWT coordinate of the selected
 //                                     PPS/VCLOCK edge.
 //   - g_dwt_cycles_between_pps_vclock Difference of consecutive selected
@@ -75,7 +75,6 @@
 #include "payload.h"
 #include "time.h"
 #include "process_interrupt.h"
-#include "epoch.h"
 
 #include <stdint.h>
 #include <stddef.h>
@@ -182,8 +181,8 @@ struct clock_state_t {
   // GNSS ns at the edge as reported by the bridge for this event.
   volatile uint64_t gnss_ns_at_edge;
 
-  // Cumulative authored ns count refreshed at PPS/VCLOCK (canonical advance,
-  // phase-adjusted for OCXOs, equals g_gnss_ns_at_pps_vclock for VCLOCK).
+  // Cumulative CLOCKS-owned epoch-relative ns count refreshed from the
+  // lane's synthetic counter32 delta against the current CLOCKS epoch.
   volatile uint64_t ns_count_at_pps_vclock;
 
   // (gnss_ns_at_edge − ns_count_at_edge).  For VCLOCK this should be
@@ -443,21 +442,31 @@ void clocks_watchdog_anomaly(const char* reason,
                              uint32_t detail3 = 0);
 
 // ============================================================================
-// Epoch integration hooks
+// Local CLOCKS epoch integration
 // ============================================================================
 
-// Returns true while process_epoch is authoring/installing an epoch.
+// ZERO is now owned by CLOCKS.  Alpha selects the latest epoch-ready capture
+// packet authored by process_interrupt and installs canonical logical origins.
 bool clocks_epoch_pending(void);
-
-// process_epoch consumer hooks implemented by CLOCKS.
-void clocks_alpha_epoch_installed(const epoch_fact_t& fact);
-void clocks_beta_epoch_installed(const epoch_fact_t& fact);
+bool clocks_alpha_zero_from_interrupt_capture(const char* reason);
+bool clocks_alpha_epoch_initialized(void);
+uint32_t clocks_alpha_epoch_sequence(void);
+uint32_t clocks_alpha_epoch_install_count(void);
+uint32_t clocks_alpha_epoch_install_failures(void);
+uint32_t clocks_alpha_epoch_last_capture_sequence(void);
+uint32_t clocks_alpha_epoch_last_capture_window_cycles(void);
+bool clocks_alpha_epoch_last_vclock_capture_valid(void);
+bool clocks_alpha_epoch_last_all_lanes_valid(void);
+uint32_t clocks_alpha_epoch_last_dwt_at_edge(void);
+uint32_t clocks_alpha_epoch_last_vclock_counter32(void);
+uint32_t clocks_alpha_epoch_last_ocxo1_counter32(void);
+uint32_t clocks_alpha_epoch_last_ocxo2_counter32(void);
+const char* clocks_alpha_epoch_last_reason(void);
 
 // ============================================================================
 // Campaign/accounting reset
 // ============================================================================
 
-// Beta-local campaign/statistical reset.  This is no longer an epoch author;
-// process_epoch calls clocks_beta_epoch_installed() after the shared epoch fact
-// is installed, and that hook invokes clocks_zero_all() as campaign accounting.
+// Beta-local campaign/statistical reset.  Alpha owns epoch installation; beta
+// invokes this after CLOCKS.ZERO/START successfully installs logical origins.
 void clocks_zero_all(void);
