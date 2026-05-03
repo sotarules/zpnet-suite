@@ -399,6 +399,235 @@ static inline uint64_t ns_from_counter32_epoch(uint32_t counter32,
          (uint64_t)NS_PER_10MHZ_TICK;
 }
 
+// ============================================================================
+// Alpha clock forensics
+// ============================================================================
+//
+// This is intentionally report-only.  Alpha records the exact event facts and
+// epoch-relative arithmetic it applied for each lane before handing that event
+// to process_time's generalized clock projection model.  This lets REPORT
+// distinguish event/epoch errors from projection-to-report-DWT errors.
+
+struct alpha_lane_forensics_store_t {
+  volatile uint32_t seq = 0;
+  bool     valid = false;
+  uint32_t update_count = 0;
+
+  uint32_t last_event_dwt = 0;
+  uint32_t last_event_counter32 = 0;
+  uint32_t epoch_counter32 = 0;
+  uint32_t counter32_delta_since_epoch = 0;
+  uint64_t ns_from_counter32_epoch = 0;
+
+  uint64_t event_gnss_ns = 0;
+  uint64_t previous_event_gnss_ns = 0;
+  int64_t  phase_offset_ns = 0;
+
+  uint64_t counter_ns_between_edges = 0;
+  uint64_t bridge_gnss_ns_between_edges = 0;
+  int64_t  bridge_residual_ns = 0;
+  bool     bridge_interval_valid = false;
+
+  uint64_t ns_between_edges = 0;
+  uint32_t dwt_cycles_between_edges = 0;
+  int64_t  second_residual_ns = 0;
+  int64_t  window_error_ns = 0;
+  uint32_t window_checks = 0;
+  uint32_t window_mismatches = 0;
+
+  uint32_t diag_anchor_sequence_used = 0;
+  uint32_t diag_anchor_age_slots = 0;
+  uint32_t diag_anchor_selection_kind = 0;
+  uint32_t diag_anchor_dwt_at_edge = 0;
+  int64_t  diag_anchor_gnss_ns_at_edge = -1;
+  uint32_t diag_anchor_cps = 0;
+  uint64_t diag_anchor_ns_delta = 0;
+  uint32_t diag_anchor_failure_mask = 0;
+};
+
+static alpha_lane_forensics_store_t g_vclock_forensics = {};
+static alpha_lane_forensics_store_t g_ocxo1_forensics = {};
+static alpha_lane_forensics_store_t g_ocxo2_forensics = {};
+
+static inline void clocks_alpha_dmb(void) {
+  __asm__ volatile ("dmb" ::: "memory");
+}
+
+static alpha_lane_forensics_store_t* alpha_forensics_store(time_clock_id_t clock) {
+  switch (clock) {
+    case time_clock_id_t::VCLOCK: return &g_vclock_forensics;
+    case time_clock_id_t::OCXO1:  return &g_ocxo1_forensics;
+    case time_clock_id_t::OCXO2:  return &g_ocxo2_forensics;
+    default:                     return nullptr;
+  }
+}
+
+static void alpha_forensics_reset_store(alpha_lane_forensics_store_t& s) {
+  s.seq++;
+  clocks_alpha_dmb();
+
+  s.valid = false;
+  s.update_count = 0;
+  s.last_event_dwt = 0;
+  s.last_event_counter32 = 0;
+  s.epoch_counter32 = 0;
+  s.counter32_delta_since_epoch = 0;
+  s.ns_from_counter32_epoch = 0;
+  s.event_gnss_ns = 0;
+  s.previous_event_gnss_ns = 0;
+  s.phase_offset_ns = 0;
+  s.counter_ns_between_edges = 0;
+  s.bridge_gnss_ns_between_edges = 0;
+  s.bridge_residual_ns = 0;
+  s.bridge_interval_valid = false;
+  s.ns_between_edges = 0;
+  s.dwt_cycles_between_edges = 0;
+  s.second_residual_ns = 0;
+  s.window_error_ns = 0;
+  s.window_checks = 0;
+  s.window_mismatches = 0;
+  s.diag_anchor_sequence_used = 0;
+  s.diag_anchor_age_slots = 0;
+  s.diag_anchor_selection_kind = 0;
+  s.diag_anchor_dwt_at_edge = 0;
+  s.diag_anchor_gnss_ns_at_edge = -1;
+  s.diag_anchor_cps = 0;
+  s.diag_anchor_ns_delta = 0;
+  s.diag_anchor_failure_mask = 0;
+
+  clocks_alpha_dmb();
+  s.seq++;
+}
+
+static void alpha_forensics_reset_all(void) {
+  alpha_forensics_reset_store(g_vclock_forensics);
+  alpha_forensics_reset_store(g_ocxo1_forensics);
+  alpha_forensics_reset_store(g_ocxo2_forensics);
+}
+
+static void alpha_forensics_publish(time_clock_id_t clock_id,
+                                    const clock_state_t& clock,
+                                    const clock_measurement_t& meas,
+                                    const interrupt_event_t& event,
+                                    const interrupt_capture_diag_t* diag,
+                                    uint32_t epoch_counter32,
+                                    uint64_t ns_now) {
+  alpha_lane_forensics_store_t* s = alpha_forensics_store(clock_id);
+  if (!s) return;
+
+  const bool had_prior_counter_event = s->valid;
+  const uint64_t previous_counter_ns = s->ns_from_counter32_epoch;
+  const uint64_t counter_ns_between_edges =
+      (had_prior_counter_event && ns_now >= previous_counter_ns)
+          ? (ns_now - previous_counter_ns)
+          : 0ULL;
+
+  const bool had_prior_bridge_event = s->valid && s->event_gnss_ns != 0 && event.gnss_ns_at_event != 0;
+  const uint64_t previous_event_gnss_ns = s->event_gnss_ns;
+  const uint64_t bridge_gnss_ns_between_edges =
+      (had_prior_bridge_event && event.gnss_ns_at_event >= previous_event_gnss_ns)
+          ? (event.gnss_ns_at_event - previous_event_gnss_ns)
+          : 0ULL;
+  // Signed as interval-minus-ideal: negative means the lane fired early / fast.
+  const int64_t bridge_residual_ns = had_prior_bridge_event
+      ? ((int64_t)bridge_gnss_ns_between_edges - (int64_t)NS_PER_SECOND_U64)
+      : 0;
+
+  s->seq++;
+  clocks_alpha_dmb();
+
+  s->valid = true;
+  s->update_count++;
+  s->last_event_dwt = event.dwt_at_event;
+  s->last_event_counter32 = event.counter32_at_event;
+  s->epoch_counter32 = epoch_counter32;
+  s->counter32_delta_since_epoch = event.counter32_at_event - epoch_counter32;
+  s->ns_from_counter32_epoch = ns_now;
+  s->event_gnss_ns = event.gnss_ns_at_event;
+  s->previous_event_gnss_ns = previous_event_gnss_ns;
+  s->phase_offset_ns = clock.phase_offset_ns;
+  s->counter_ns_between_edges = counter_ns_between_edges;
+  s->bridge_gnss_ns_between_edges = bridge_gnss_ns_between_edges;
+  s->bridge_residual_ns = bridge_residual_ns;
+  s->bridge_interval_valid = had_prior_bridge_event && event.gnss_ns_at_event >= previous_event_gnss_ns;
+  s->ns_between_edges = meas.gnss_ns_between_edges;
+  s->dwt_cycles_between_edges = meas.dwt_cycles_between_edges;
+  s->second_residual_ns = meas.second_residual_ns;
+  s->window_error_ns = clock.window_error_ns;
+  s->window_checks = clock.window_checks;
+  s->window_mismatches = clock.window_mismatches;
+
+  if (diag) {
+    s->diag_anchor_sequence_used = diag->anchor_sequence_used;
+    s->diag_anchor_age_slots = diag->anchor_age_slots;
+    s->diag_anchor_selection_kind = diag->anchor_selection_kind;
+    s->diag_anchor_dwt_at_edge = diag->anchor_dwt_at_edge;
+    s->diag_anchor_gnss_ns_at_edge = diag->anchor_gnss_ns_at_edge;
+    s->diag_anchor_cps = diag->anchor_cps;
+    s->diag_anchor_ns_delta = diag->anchor_ns_delta;
+    s->diag_anchor_failure_mask = diag->anchor_failure_mask;
+  } else {
+    s->diag_anchor_sequence_used = 0;
+    s->diag_anchor_age_slots = 0;
+    s->diag_anchor_selection_kind = 0;
+    s->diag_anchor_dwt_at_edge = 0;
+    s->diag_anchor_gnss_ns_at_edge = -1;
+    s->diag_anchor_cps = 0;
+    s->diag_anchor_ns_delta = 0;
+    s->diag_anchor_failure_mask = 0;
+  }
+
+  clocks_alpha_dmb();
+  s->seq++;
+}
+
+bool clocks_alpha_lane_forensics(time_clock_id_t clock,
+                                 clocks_alpha_lane_forensics_t* out) {
+  if (!out) return false;
+  alpha_lane_forensics_store_t* s = alpha_forensics_store(clock);
+  if (!s) return false;
+
+  for (int attempt = 0; attempt < 4; attempt++) {
+    const uint32_t seq1 = s->seq;
+    clocks_alpha_dmb();
+
+    out->valid = s->valid;
+    out->update_count = s->update_count;
+    out->last_event_dwt = s->last_event_dwt;
+    out->last_event_counter32 = s->last_event_counter32;
+    out->epoch_counter32 = s->epoch_counter32;
+    out->counter32_delta_since_epoch = s->counter32_delta_since_epoch;
+    out->ns_from_counter32_epoch = s->ns_from_counter32_epoch;
+    out->event_gnss_ns = s->event_gnss_ns;
+    out->previous_event_gnss_ns = s->previous_event_gnss_ns;
+    out->phase_offset_ns = s->phase_offset_ns;
+    out->counter_ns_between_edges = s->counter_ns_between_edges;
+    out->bridge_gnss_ns_between_edges = s->bridge_gnss_ns_between_edges;
+    out->bridge_residual_ns = s->bridge_residual_ns;
+    out->bridge_interval_valid = s->bridge_interval_valid;
+    out->ns_between_edges = s->ns_between_edges;
+    out->dwt_cycles_between_edges = s->dwt_cycles_between_edges;
+    out->second_residual_ns = s->second_residual_ns;
+    out->window_error_ns = s->window_error_ns;
+    out->window_checks = s->window_checks;
+    out->window_mismatches = s->window_mismatches;
+    out->diag_anchor_sequence_used = s->diag_anchor_sequence_used;
+    out->diag_anchor_age_slots = s->diag_anchor_age_slots;
+    out->diag_anchor_selection_kind = s->diag_anchor_selection_kind;
+    out->diag_anchor_dwt_at_edge = s->diag_anchor_dwt_at_edge;
+    out->diag_anchor_gnss_ns_at_edge = s->diag_anchor_gnss_ns_at_edge;
+    out->diag_anchor_cps = s->diag_anchor_cps;
+    out->diag_anchor_ns_delta = s->diag_anchor_ns_delta;
+    out->diag_anchor_failure_mask = s->diag_anchor_failure_mask;
+
+    clocks_alpha_dmb();
+    const uint32_t seq2 = s->seq;
+    if (seq1 == seq2 && (seq1 & 1u) == 0u) return out->valid;
+  }
+
+  return false;
+}
+
 static void clock_mark_epoch_zero(clock_state_t& clock) {
   clock.ns_count_at_edge = 0;
   clock.gnss_ns_at_edge = 0;
@@ -431,6 +660,7 @@ static void alpha_reset_canonical_clock_state_for_new_epoch(void) {
   g_pps_witness_diag = {};
   g_ocxo1_interrupt_diag = {};
   g_ocxo2_interrupt_diag = {};
+  alpha_forensics_reset_all();
 
   dwt_cycle_count_total = 0;
   gnss_raw_64           = 0;
@@ -543,6 +773,7 @@ bool clocks_alpha_epoch_initialized(void) { return g_epoch_initialized; }
 static void clocks_apply_epoch_counter_edge(clock_state_t& clock,
                                             clock_measurement_t& meas,
                                             const interrupt_event_t& event,
+                                            const interrupt_capture_diag_t* diag,
                                             uint32_t epoch_counter32,
                                             time_clock_id_t time_clock) {
   const uint64_t ns_now =
@@ -550,7 +781,8 @@ static void clocks_apply_epoch_counter_edge(clock_state_t& clock,
   (void)time_clock_update(time_clock, event.dwt_at_event, ns_now);
 
   const bool had_previous = (meas.prev_dwt_at_edge != 0);
-  const uint64_t previous_ns = meas.prev_gnss_ns_at_edge;
+  const uint64_t previous_counter_ns = clock.ns_count_at_edge;
+  const uint64_t previous_bridge_gnss_ns = meas.prev_gnss_ns_at_edge;
 
   clock.ns_count_at_edge = ns_now;
   clock.ns_count_at_pps_vclock = ns_now;
@@ -567,28 +799,50 @@ static void clocks_apply_epoch_counter_edge(clock_state_t& clock,
     meas.dwt_cycles_between_edges = 0;
     meas.second_residual_ns = 0;
   } else {
-    const uint64_t ns_between_edges = ns_now - previous_ns;
+    const uint64_t counter_ns_between_edges =
+        (ns_now >= previous_counter_ns) ? (ns_now - previous_counter_ns) : 0ULL;
+    (void)counter_ns_between_edges;  // Preserved by alpha forensics.
+
+    const bool bridge_interval_valid =
+        (event.gnss_ns_at_event != 0 && previous_bridge_gnss_ns != 0 &&
+         event.gnss_ns_at_event >= previous_bridge_gnss_ns);
+    const uint64_t bridge_ns_between_edges = bridge_interval_valid
+        ? (event.gnss_ns_at_event - previous_bridge_gnss_ns)
+        : 0ULL;
     const uint32_t dwt_cycles_between_edges =
         event.dwt_at_event - meas.prev_dwt_at_edge;
 
-    meas.gnss_ns_between_edges = ns_between_edges;
+    // This field's historical name is now correct again: it is the
+    // bridge/GNSS-derived interval between this lane's one-second events.
+    // Counter-derived self-consistency is retained separately in forensics.
+    meas.gnss_ns_between_edges = bridge_ns_between_edges;
     meas.dwt_cycles_between_edges = dwt_cycles_between_edges;
-    meas.second_residual_ns =
-        (int64_t)NS_PER_SECOND_U64 - (int64_t)ns_between_edges;
 
-    clock.window_error_ns =
-        (int64_t)ns_between_edges - (int64_t)NS_PER_SECOND_U64;
+    // Positive residual means the lane fired early / is running fast versus
+    // the VCLOCK/GNSS bridge. This matches the published Welford/ppb sign
+    // convention used by beta.
+    meas.second_residual_ns = bridge_interval_valid
+        ? ((int64_t)NS_PER_SECOND_U64 - (int64_t)bridge_ns_between_edges)
+        : 0;
+
+    // Window error keeps the older interval-minus-ideal convention:
+    // positive means the bridge interval was long / the lane was slow.
+    clock.window_error_ns = bridge_interval_valid
+        ? ((int64_t)bridge_ns_between_edges - (int64_t)NS_PER_SECOND_U64)
+        : 0;
     clock.window_checks++;
     if (llabs(clock.window_error_ns) > CLOCK_WINDOW_TOLERANCE_NS) {
       clock.window_mismatches++;
     }
   }
 
-  // This field is now the previous CLOCKS nanosecond value.  The name is a
-  // legacy diagnostic wart; the next cleanup pass can rename the measurement
-  // struct.  Do not feed absolute GNSS time into CLOCKS counters.
-  meas.prev_gnss_ns_at_edge = ns_now;
+  // Previous-edge bridge truth.  The field name is legacy, but its content is
+  // now again event.gnss_ns_at_event rather than the counter-derived CLOCKS ns.
+  meas.prev_gnss_ns_at_edge = event.gnss_ns_at_event;
   meas.prev_dwt_at_edge = event.dwt_at_event;
+
+  alpha_forensics_publish(time_clock, clock, meas, event, diag,
+                          epoch_counter32, ns_now);
 }
 
 static inline bool usable_clock_event(const interrupt_event_t&) {
@@ -604,7 +858,8 @@ static void apply_ocxo_event(clock_state_t& clock,
                              time_clock_id_t time_clock) {
   clocks_capture_interrupt_diag(diag_dst, diag);
   if (!usable_clock_event(event)) return;
-  clocks_apply_epoch_counter_edge(clock, meas, event, epoch_counter32, time_clock);
+  clocks_apply_epoch_counter_edge(clock, meas, event, diag,
+                                  epoch_counter32, time_clock);
 }
 
 static void vclock_callback(const interrupt_event_t& event,
@@ -621,6 +876,7 @@ static void vclock_callback(const interrupt_event_t& event,
   clocks_apply_epoch_counter_edge(g_vclock_clock,
                                   g_vclock_measurement,
                                   event,
+                                  diag,
                                   g_alpha_epoch_last_vclock_counter32,
                                   time_clock_id_t::VCLOCK);
 

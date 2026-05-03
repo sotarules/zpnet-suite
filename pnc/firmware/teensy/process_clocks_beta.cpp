@@ -129,11 +129,36 @@ static uint64_t g_campaign_public_gnss_base = 0;
 static uint64_t g_campaign_public_ocxo1_base = 0;
 static uint64_t g_campaign_public_ocxo2_base = 0;
 
+static uint64_t clock_ns_at_fragment_dwt(time_clock_id_t clock,
+                                         uint64_t fallback_ns) {
+  const uint32_t fragment_dwt = g_dwt_at_pps_vclock;
+  uint64_t ns = 0;
+  if (fragment_dwt != 0 && time_clock_ns_at_dwt(clock, fragment_dwt, &ns)) {
+    return ns;
+  }
+  return fallback_ns;
+}
+
+static uint64_t current_raw_gnss_ns(void) {
+  return clock_ns_at_fragment_dwt(time_clock_id_t::VCLOCK,
+                                  g_gnss_ns_at_pps_vclock);
+}
+
+static uint64_t current_raw_ocxo1_ns(void) {
+  return clock_ns_at_fragment_dwt(time_clock_id_t::OCXO1,
+                                  g_ocxo1_clock.ns_count_at_pps_vclock);
+}
+
+static uint64_t current_raw_ocxo2_ns(void) {
+  return clock_ns_at_fragment_dwt(time_clock_id_t::OCXO2,
+                                  g_ocxo2_clock.ns_count_at_pps_vclock);
+}
+
 static void campaign_public_bases_reset_to_current(void) {
   g_campaign_public_dwt_base   = g_dwt_cycle_count_total;
-  g_campaign_public_gnss_base  = g_gnss_ns_at_pps_vclock;
-  g_campaign_public_ocxo1_base = g_ocxo1_clock.ns_count_at_pps_vclock;
-  g_campaign_public_ocxo2_base = g_ocxo2_clock.ns_count_at_pps_vclock;
+  g_campaign_public_gnss_base  = current_raw_gnss_ns();
+  g_campaign_public_ocxo1_base = current_raw_ocxo1_ns();
+  g_campaign_public_ocxo2_base = current_raw_ocxo2_ns();
 }
 
 static uint64_t saturated_base_for_recovered_value(uint64_t current,
@@ -146,13 +171,13 @@ static void campaign_public_bases_reset_for_recover(void) {
       saturated_base_for_recovered_value(g_dwt_cycle_count_total,
                                           dwt_ns_to_cycles(recover_dwt_ns));
   g_campaign_public_gnss_base =
-      saturated_base_for_recovered_value(g_gnss_ns_at_pps_vclock,
+      saturated_base_for_recovered_value(current_raw_gnss_ns(),
                                           recover_gnss_ns);
   g_campaign_public_ocxo1_base =
-      saturated_base_for_recovered_value(g_ocxo1_clock.ns_count_at_pps_vclock,
+      saturated_base_for_recovered_value(current_raw_ocxo1_ns(),
                                           recover_ocxo1_ns);
   g_campaign_public_ocxo2_base =
-      saturated_base_for_recovered_value(g_ocxo2_clock.ns_count_at_pps_vclock,
+      saturated_base_for_recovered_value(current_raw_ocxo2_ns(),
                                           recover_ocxo2_ns);
 }
 
@@ -233,20 +258,21 @@ static uint64_t campaign_public_dwt_total(void) {
 }
 
 static uint64_t campaign_public_gnss_ns(void) {
-  return (g_gnss_ns_at_pps_vclock >= g_campaign_public_gnss_base)
-           ? (g_gnss_ns_at_pps_vclock - g_campaign_public_gnss_base)
+  const uint64_t now = current_raw_gnss_ns();
+  return (now >= g_campaign_public_gnss_base)
+           ? (now - g_campaign_public_gnss_base)
            : 0;
 }
 
 static uint64_t campaign_public_ocxo1_ns(void) {
-  const uint64_t now = g_ocxo1_clock.ns_count_at_pps_vclock;
+  const uint64_t now = current_raw_ocxo1_ns();
   return (now >= g_campaign_public_ocxo1_base)
            ? (now - g_campaign_public_ocxo1_base)
            : 0;
 }
 
 static uint64_t campaign_public_ocxo2_ns(void) {
-  const uint64_t now = g_ocxo2_clock.ns_count_at_pps_vclock;
+  const uint64_t now = current_raw_ocxo2_ns();
   return (now >= g_campaign_public_ocxo2_base)
            ? (now - g_campaign_public_ocxo2_base)
            : 0;
@@ -895,25 +921,35 @@ void clocks_beta_pps(void) {
     welford_update(welford_dwt, dwt_ppb_sample);
   }
 
+  clocks_alpha_lane_forensics_t vclock_forensics{};
+  clocks_alpha_lane_forensics_t ocxo1_forensics{};
+  clocks_alpha_lane_forensics_t ocxo2_forensics{};
+  const bool vclock_forensics_valid =
+      clocks_alpha_lane_forensics(time_clock_id_t::VCLOCK, &vclock_forensics);
+  const bool ocxo1_forensics_valid =
+      clocks_alpha_lane_forensics(time_clock_id_t::OCXO1, &ocxo1_forensics);
+  const bool ocxo2_forensics_valid =
+      clocks_alpha_lane_forensics(time_clock_id_t::OCXO2, &ocxo2_forensics);
+
   // VCLOCK measurement Welford — bridge-interpolation self-test.
   // Sample in ns; mean == ppb under the "ns/sec == ppb" identity.
-  //
-  // Guard: gnss_ns_between_edges is zero only on the first-edge bootstrap
-  // (clocks_apply_edge writes 0 when there's no previous edge).  Feeding
-  // that bootstrap 0 would pin welford_min to 0 and bias the mean.
   if (g_vclock_measurement.gnss_ns_between_edges != 0) {
     welford_update(welford_vclock, (double)g_vclock_measurement.second_residual_ns);
   }
 
-  // OCXO measurement Welfords — same bootstrap guard.
-  if (g_ocxo1_measurement.gnss_ns_between_edges != 0) {
-    welford_update(welford_ocxo1, (double)g_ocxo1_measurement.second_residual_ns);
-    now_window_push(g_now_window_ocxo1, g_ocxo1_measurement.second_residual_ns);
+  // OCXO measurement Welfords use the real bridge/GNSS interval, not the
+  // counter-derived synthetic interval. Positive residual means the OCXO
+  // one-second edge arrived early / the OCXO is running fast versus VCLOCK.
+  if (ocxo1_forensics_valid && ocxo1_forensics.bridge_interval_valid) {
+    const int64_t residual_fast_ns = -ocxo1_forensics.bridge_residual_ns;
+    welford_update(welford_ocxo1, (double)residual_fast_ns);
+    now_window_push(g_now_window_ocxo1, residual_fast_ns);
   }
 
-  if (g_ocxo2_measurement.gnss_ns_between_edges != 0) {
-    welford_update(welford_ocxo2, (double)g_ocxo2_measurement.second_residual_ns);
-    now_window_push(g_now_window_ocxo2, g_ocxo2_measurement.second_residual_ns);
+  if (ocxo2_forensics_valid && ocxo2_forensics.bridge_interval_valid) {
+    const int64_t residual_fast_ns = -ocxo2_forensics.bridge_residual_ns;
+    welford_update(welford_ocxo2, (double)residual_fast_ns);
+    now_window_push(g_now_window_ocxo2, residual_fast_ns);
   }
 
   // PPS witness statistics are owned by the witness/PPS_PHASE path.
@@ -1017,6 +1053,14 @@ void clocks_beta_pps(void) {
   // OCXO1 surface.
   p.add("ocxo1_ns_at_pps_vclock", public_ocxo1_ns);
   p.add("ocxo1_gnss_ns_between_edges", g_ocxo1_measurement.gnss_ns_between_edges);
+  p.add("ocxo1_counter_ns_between_edges",
+        ocxo1_forensics_valid ? ocxo1_forensics.counter_ns_between_edges : 0ULL);
+  p.add("ocxo1_bridge_gnss_ns_between_edges",
+        ocxo1_forensics_valid ? ocxo1_forensics.bridge_gnss_ns_between_edges : 0ULL);
+  p.add("ocxo1_bridge_residual_ns",
+        ocxo1_forensics_valid ? ocxo1_forensics.bridge_residual_ns : 0LL);
+  p.add("ocxo1_bridge_interval_valid",
+        ocxo1_forensics_valid && ocxo1_forensics.bridge_interval_valid);
   p.add("ocxo1_dwt_cycles_between_edges", g_ocxo1_measurement.dwt_cycles_between_edges);
   p.add("ocxo1_second_residual_ns", g_ocxo1_measurement.second_residual_ns);
   p.add("ocxo1_phase_offset_ns", g_ocxo1_clock.phase_offset_ns);
@@ -1028,6 +1072,14 @@ void clocks_beta_pps(void) {
   // OCXO2 surface.
   p.add("ocxo2_ns_at_pps_vclock", public_ocxo2_ns);
   p.add("ocxo2_gnss_ns_between_edges", g_ocxo2_measurement.gnss_ns_between_edges);
+  p.add("ocxo2_counter_ns_between_edges",
+        ocxo2_forensics_valid ? ocxo2_forensics.counter_ns_between_edges : 0ULL);
+  p.add("ocxo2_bridge_gnss_ns_between_edges",
+        ocxo2_forensics_valid ? ocxo2_forensics.bridge_gnss_ns_between_edges : 0ULL);
+  p.add("ocxo2_bridge_residual_ns",
+        ocxo2_forensics_valid ? ocxo2_forensics.bridge_residual_ns : 0LL);
+  p.add("ocxo2_bridge_interval_valid",
+        ocxo2_forensics_valid && ocxo2_forensics.bridge_interval_valid);
   p.add("ocxo2_dwt_cycles_between_edges", g_ocxo2_measurement.dwt_cycles_between_edges);
   p.add("ocxo2_second_residual_ns", g_ocxo2_measurement.second_residual_ns);
   p.add("ocxo2_phase_offset_ns", g_ocxo2_clock.phase_offset_ns);
@@ -1225,6 +1277,192 @@ static Payload cmd_watchdog_test(const Payload&) {
   return p;
 }
 
+
+// ============================================================================
+// CLOCKS report forensics
+// ============================================================================
+
+static int64_t signed_delta_u64(uint64_t a, uint64_t b) {
+  return (a >= b) ? (int64_t)(a - b) : -(int64_t)(b - a);
+}
+
+static uint32_t apparent_cps_from_projection(uint32_t elapsed_cycles,
+                                             uint64_t projected_ns) {
+  if (projected_ns == 0) return 0;
+  const uint64_t cps =
+      ((uint64_t)elapsed_cycles * 1000000000ULL + projected_ns / 2ULL) /
+      projected_ns;
+  return (cps > (uint64_t)UINT32_MAX) ? UINT32_MAX : (uint32_t)cps;
+}
+
+static double ppb_fast_vs_vclock(uint32_t vclock_cycles,
+                                 uint32_t lane_cycles) {
+  if (vclock_cycles == 0 || lane_cycles == 0) return 0.0;
+  return (((double)vclock_cycles - (double)lane_cycles) /
+          (double)vclock_cycles) * 1.0e9;
+}
+
+static void add_alpha_event_payload(Payload& p,
+                                    const clocks_alpha_lane_forensics_t& f,
+                                    const clocks_alpha_lane_forensics_t* vclock_ref) {
+  p.add("valid", f.valid);
+  p.add("update_count", f.update_count);
+  p.add("last_event_dwt", f.last_event_dwt);
+  p.add("last_event_counter32", f.last_event_counter32);
+  p.add("epoch_counter32", f.epoch_counter32);
+  p.add("counter32_delta_since_epoch", f.counter32_delta_since_epoch);
+  p.add("ns_from_counter32_epoch", f.ns_from_counter32_epoch);
+  p.add("event_gnss_ns", f.event_gnss_ns);
+  p.add("previous_event_gnss_ns", f.previous_event_gnss_ns);
+  p.add("phase_offset_ns", f.phase_offset_ns);
+  p.add("counter_ns_between_edges", f.counter_ns_between_edges);
+  p.add("bridge_interval_valid", f.bridge_interval_valid);
+  p.add("bridge_gnss_ns_between_edges", f.bridge_gnss_ns_between_edges);
+  p.add("bridge_residual_ns", f.bridge_residual_ns);
+
+  if (vclock_ref && vclock_ref->valid && f.valid) {
+    p.add("event_delta_vs_vclock_ns",
+          signed_delta_u64(f.ns_from_counter32_epoch,
+                           vclock_ref->ns_from_counter32_epoch));
+    p.add("event_dwt_delta_vs_vclock_cycles",
+          (int32_t)(f.last_event_dwt - vclock_ref->last_event_dwt));
+    p.add("phase_offset_delta_vs_vclock_ns",
+          f.phase_offset_ns - vclock_ref->phase_offset_ns);
+    p.add("dwt_cycles_between_edges_delta_vs_vclock",
+          (int32_t)((int64_t)f.dwt_cycles_between_edges -
+                    (int64_t)vclock_ref->dwt_cycles_between_edges));
+    p.add("dwt_interval_ppb_fast_vs_vclock",
+          ppb_fast_vs_vclock(vclock_ref->dwt_cycles_between_edges,
+                             f.dwt_cycles_between_edges),
+          3);
+    if (f.bridge_interval_valid && vclock_ref->bridge_interval_valid) {
+      p.add("bridge_residual_delta_vs_vclock_ns",
+            f.bridge_residual_ns - vclock_ref->bridge_residual_ns);
+    }
+  }
+
+  p.add("ns_between_edges", f.ns_between_edges);
+  p.add("dwt_cycles_between_edges", f.dwt_cycles_between_edges);
+  p.add("second_residual_ns", f.second_residual_ns);
+  p.add("window_error_ns", f.window_error_ns);
+  p.add("window_checks", f.window_checks);
+  p.add("window_mismatches", f.window_mismatches);
+
+  Payload anchor;
+  anchor.add("sequence_used", f.diag_anchor_sequence_used);
+  anchor.add("age_slots", f.diag_anchor_age_slots);
+  anchor.add("selection_kind", f.diag_anchor_selection_kind);
+  anchor.add("dwt_at_edge", f.diag_anchor_dwt_at_edge);
+  anchor.add("gnss_ns_at_edge", f.diag_anchor_gnss_ns_at_edge);
+  anchor.add("cps", f.diag_anchor_cps);
+  anchor.add("ns_delta", f.diag_anchor_ns_delta);
+  anchor.add("failure_mask", f.diag_anchor_failure_mask);
+  p.add_object("bridge_anchor", anchor);
+}
+
+static void add_projection_payload(Payload& p,
+                                   time_clock_id_t clock_id,
+                                   uint32_t report_dwt,
+                                   uint64_t report_ns,
+                                   bool report_valid,
+                                   uint64_t vclock_report_ns,
+                                   bool vclock_report_valid,
+                                   const clocks_alpha_lane_forensics_t& f,
+                                   const clocks_alpha_lane_forensics_t* vclock_ref) {
+  p.add("report_valid", report_valid);
+  p.add("report_ns", report_valid ? report_ns : 0ULL);
+
+  if (report_valid && vclock_report_valid) {
+    p.add("report_delta_vs_vclock_ns", signed_delta_u64(report_ns, vclock_report_ns));
+  }
+
+  if (f.valid) {
+    const uint32_t elapsed_cycles = report_dwt - f.last_event_dwt;
+    uint64_t projected_delta_ns = 0;
+    if (report_valid && report_ns >= f.ns_from_counter32_epoch) {
+      projected_delta_ns = report_ns - f.ns_from_counter32_epoch;
+    }
+
+    p.add("elapsed_cycles_from_last_event_to_report", elapsed_cycles);
+    p.add("projected_delta_ns_from_last_event_to_report", projected_delta_ns);
+    p.add("apparent_projection_cps", apparent_cps_from_projection(elapsed_cycles,
+                                                                  projected_delta_ns));
+  }
+
+  Payload alpha;
+  add_alpha_event_payload(alpha, f, vclock_ref);
+  p.add_object("alpha_event", alpha);
+
+  (void)clock_id;
+}
+
+static void add_clock_forensics_payload(Payload& p,
+                                        uint32_t report_dwt,
+                                        uint64_t vclock_ns,
+                                        bool vclock_ok,
+                                        uint64_t ocxo1_ns,
+                                        bool ocxo1_ok,
+                                        uint64_t ocxo2_ns,
+                                        bool ocxo2_ok) {
+  Payload forensic;
+  forensic.add("report_dwt", report_dwt);
+
+  clocks_alpha_lane_forensics_t vf{};
+  clocks_alpha_lane_forensics_t o1f{};
+  clocks_alpha_lane_forensics_t o2f{};
+  const bool vf_ok = clocks_alpha_lane_forensics(time_clock_id_t::VCLOCK, &vf);
+  const bool o1f_ok = clocks_alpha_lane_forensics(time_clock_id_t::OCXO1, &o1f);
+  const bool o2f_ok = clocks_alpha_lane_forensics(time_clock_id_t::OCXO2, &o2f);
+
+  forensic.add("alpha_vclock_valid", vf_ok);
+  forensic.add("alpha_ocxo1_valid", o1f_ok);
+  forensic.add("alpha_ocxo2_valid", o2f_ok);
+
+  Payload vclock;
+  add_projection_payload(vclock, time_clock_id_t::VCLOCK, report_dwt,
+                         vclock_ns, vclock_ok, vclock_ns, vclock_ok,
+                         vf, nullptr);
+  forensic.add_object("vclock", vclock);
+
+  Payload ocxo1;
+  add_projection_payload(ocxo1, time_clock_id_t::OCXO1, report_dwt,
+                         ocxo1_ns, ocxo1_ok, vclock_ns, vclock_ok,
+                         o1f, &vf);
+  forensic.add_object("ocxo1", ocxo1);
+
+  Payload ocxo2;
+  add_projection_payload(ocxo2, time_clock_id_t::OCXO2, report_dwt,
+                         ocxo2_ns, ocxo2_ok, vclock_ns, vclock_ok,
+                         o2f, &vf);
+  forensic.add_object("ocxo2", ocxo2);
+
+  if (vclock_ok && ocxo1_ok && ocxo2_ok) {
+    Payload deltas;
+    deltas.add("ocxo1_minus_vclock_ns", signed_delta_u64(ocxo1_ns, vclock_ns));
+    deltas.add("ocxo2_minus_vclock_ns", signed_delta_u64(ocxo2_ns, vclock_ns));
+    deltas.add("ocxo2_minus_ocxo1_ns", signed_delta_u64(ocxo2_ns, ocxo1_ns));
+    if (vf_ok && o1f_ok) {
+      deltas.add("ocxo1_phase_offset_delta_vs_vclock_ns",
+                 o1f.phase_offset_ns - vf.phase_offset_ns);
+      deltas.add("ocxo1_dwt_interval_ppb_fast_vs_vclock",
+                 ppb_fast_vs_vclock(vf.dwt_cycles_between_edges,
+                                    o1f.dwt_cycles_between_edges),
+                 3);
+    }
+    if (vf_ok && o2f_ok) {
+      deltas.add("ocxo2_phase_offset_delta_vs_vclock_ns",
+                 o2f.phase_offset_ns - vf.phase_offset_ns);
+      deltas.add("ocxo2_dwt_interval_ppb_fast_vs_vclock",
+                 ppb_fast_vs_vclock(vf.dwt_cycles_between_edges,
+                                    o2f.dwt_cycles_between_edges),
+                 3);
+    }
+    forensic.add_object("report_deltas", deltas);
+  }
+
+  p.add_object("clock_forensics", forensic);
+}
+
 static Payload cmd_report(const Payload&) {
   Payload p = g_last_fragment.clone();
 
@@ -1249,6 +1487,11 @@ static Payload cmd_report(const Payload&) {
   summary.add("ocxo1_valid", ocxo1_ok);
   summary.add("ocxo2_valid", ocxo2_ok);
   p.add_object("summary", summary);
+
+  add_clock_forensics_payload(p, report_dwt,
+                              vclock_ok ? vclock_ns : 0ULL, vclock_ok,
+                              ocxo1_ok ? ocxo1_ns : 0ULL, ocxo1_ok,
+                              ocxo2_ok ? ocxo2_ns : 0ULL, ocxo2_ok);
 
   p.add("campaign_state",
         campaign_state == clocks_campaign_state_t::STARTED ? "STARTED" : "STOPPED");

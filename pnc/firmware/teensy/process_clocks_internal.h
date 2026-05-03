@@ -232,6 +232,54 @@ extern clock_measurement_t g_ocxo1_measurement;
 extern clock_measurement_t g_ocxo2_measurement;
 
 // ============================================================================
+// Alpha clock forensic snapshots
+// ============================================================================
+//
+// These snapshots expose the last event alpha consumed for each measured
+// clock, plus the exact epoch-relative counter32->ns arithmetic applied before
+// handing the event to process_time's generalized projection model.  They are
+// diagnostic only; summary remains the compact system-health surface.
+
+struct clocks_alpha_lane_forensics_t {
+  bool     valid;
+  uint32_t update_count;
+
+  uint32_t last_event_dwt;
+  uint32_t last_event_counter32;
+  uint32_t epoch_counter32;
+  uint32_t counter32_delta_since_epoch;
+  uint64_t ns_from_counter32_epoch;
+
+  uint64_t event_gnss_ns;
+  uint64_t previous_event_gnss_ns;
+  int64_t  phase_offset_ns;
+
+  uint64_t counter_ns_between_edges;
+  uint64_t bridge_gnss_ns_between_edges;
+  int64_t  bridge_residual_ns;
+  bool     bridge_interval_valid;
+
+  uint64_t ns_between_edges;
+  uint32_t dwt_cycles_between_edges;
+  int64_t  second_residual_ns;
+  int64_t  window_error_ns;
+  uint32_t window_checks;
+  uint32_t window_mismatches;
+
+  uint32_t diag_anchor_sequence_used;
+  uint32_t diag_anchor_age_slots;
+  uint32_t diag_anchor_selection_kind;
+  uint32_t diag_anchor_dwt_at_edge;
+  int64_t  diag_anchor_gnss_ns_at_edge;
+  uint32_t diag_anchor_cps;
+  uint64_t diag_anchor_ns_delta;
+  uint32_t diag_anchor_failure_mask;
+};
+
+bool clocks_alpha_lane_forensics(time_clock_id_t clock,
+                                 clocks_alpha_lane_forensics_t* out);
+
+// ============================================================================
 // Last-known interrupt diagnostics (alpha-owned, beta-readable)
 // ============================================================================
 
