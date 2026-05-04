@@ -47,10 +47,10 @@
 //
 // Authorship map:
 //
-//   - g_gnss_ns_at_pps_vclock         CLOCKS-owned epoch-relative nanosecond
+//   - g_gnss_ns_at_pps_vclock         CLOCKS-owned zero-offset-relative nanosecond
 //                                     counter. Set to 0 at ZERO and updated
 //                                     from the VCLOCK counter32 delta against
-//                                     the current CLOCKS epoch.
+//                                     the installed CLOCKS zero offset.
 //   - g_dwt_at_pps_vclock             DWT coordinate of the selected
 //                                     PPS/VCLOCK edge.
 //   - g_dwt_cycles_between_pps_vclock Difference of consecutive selected
@@ -181,17 +181,18 @@ struct clock_state_t {
   // GNSS ns at the edge as reported by the bridge for this event.
   volatile uint64_t gnss_ns_at_edge;
 
-  // Cumulative CLOCKS-owned epoch-relative ns count refreshed from the
-  // lane's synthetic counter32 delta against the current CLOCKS epoch.
+  // Cumulative CLOCKS-owned zero-offset-relative ns count refreshed from the
+  // lane's synthetic counter32 delta against the installed CLOCKS zero offset.
   volatile uint64_t ns_count_at_pps_vclock;
 
-  // (gnss_ns_at_edge − ns_count_at_edge).  For VCLOCK this should be
-  // near zero after the first edge.  For OCXO this accumulates the
-  // crystal's phase drift from the GNSS reference.
-  volatile int64_t  phase_offset_ns;
+  // (gnss_ns_at_edge − ns_count_at_edge).  This is an absolute bridge/logical
+  // offset and may include the campaign rebasing offset.  For phase analysis,
+  // compare a lane's value against VCLOCK rather than interpreting the absolute
+  // number directly.
+  volatile int64_t  bridge_minus_logical_ns;
 
   // Set true on the first apply_edge call.
-  volatile bool     zero_established;
+  volatile bool     zero_offset_installed;
 
   // Window-check accounting — the window is one bridge-derived
   // between-edges interval.  Positive window_error_ns means this edge
@@ -234,12 +235,12 @@ extern clock_measurement_t g_ocxo2_measurement;
 // ============================================================================
 //
 // These snapshots expose the last event alpha consumed for each measured
-// clock, plus the exact epoch-relative counter32->ns arithmetic applied before
+// clock, plus the exact zero-offset-relative counter32->ns arithmetic applied before
 // handing the event to process_time's generalized projection model.  They are
 // diagnostic only; summary remains the compact system-health surface.
 
 struct clocks_alpha_lane_forensics_t {
-  bool     valid;
+  bool     has_event;
   uint32_t update_count;
 
   uint32_t last_event_dwt;
@@ -255,19 +256,14 @@ struct clocks_alpha_lane_forensics_t {
   uint64_t logical_ticks64_since_zero;
   uint64_t logical_ns64_since_zero;
 
-  // Legacy aliases retained for report/back-compat consumers.
-  uint32_t epoch_counter32;
-  uint32_t counter32_delta_since_epoch;
-  uint64_t ns_from_counter32_epoch;
-
   uint64_t event_gnss_ns;
   uint64_t previous_event_gnss_ns;
-  int64_t  phase_offset_ns;
+  int64_t  bridge_minus_logical_ns;
 
   uint64_t counter_ns_between_edges;
   uint64_t bridge_gnss_ns_between_edges;
   int64_t  bridge_residual_ns;
-  bool     bridge_interval_valid;
+  bool     bridge_interval_ready;
 
   uint64_t ns_between_edges;
   uint32_t dwt_cycles_between_edges;
@@ -502,35 +498,32 @@ void clocks_watchdog_anomaly(const char* reason,
                              uint32_t detail3 = 0);
 
 // ============================================================================
-// Local CLOCKS epoch integration
+// Local CLOCKS zero-offset integration
 // ============================================================================
 
-// ZERO is now owned by CLOCKS.  Alpha selects the latest epoch-ready capture
+// ZERO is now owned by CLOCKS.  Alpha selects the latest zero-offset-ready capture
 // packet authored by process_interrupt and installs canonical logical origins.
-bool clocks_epoch_pending(void);
-bool clocks_alpha_zero_from_interrupt_capture(const char* reason);
-bool clocks_alpha_epoch_initialized(void);
-uint32_t clocks_alpha_epoch_sequence(void);
-uint32_t clocks_alpha_epoch_install_count(void);
-uint32_t clocks_alpha_epoch_install_failures(void);
-uint32_t clocks_alpha_epoch_last_capture_sequence(void);
-uint32_t clocks_alpha_epoch_last_capture_window_cycles(void);
-bool clocks_alpha_epoch_last_vclock_capture_valid(void);
-bool clocks_alpha_epoch_last_all_lanes_valid(void);
-uint32_t clocks_alpha_epoch_last_dwt_at_edge(void);
-uint32_t clocks_alpha_epoch_last_vclock_counter32(void);
-uint32_t clocks_alpha_epoch_last_ocxo1_counter32(void);
-uint32_t clocks_alpha_epoch_last_ocxo2_counter32(void);
-uint16_t clocks_alpha_epoch_last_vclock_hardware16_observed(void);
-uint16_t clocks_alpha_epoch_last_vclock_hardware16_selected(void);
-uint16_t clocks_alpha_epoch_last_ocxo1_hardware16(void);
-uint16_t clocks_alpha_epoch_last_ocxo2_hardware16(void);
-const char* clocks_alpha_epoch_last_reason(void);
+bool clocks_alpha_install_zero_offsets_from_interrupt_capture(const char* reason);
+bool clocks_alpha_zero_offset_initialized(void);
+uint32_t clocks_alpha_zero_offset_sequence(void);
+uint32_t clocks_alpha_zero_offset_install_count(void);
+uint32_t clocks_alpha_zero_offset_install_failures(void);
+uint32_t clocks_alpha_zero_offset_last_capture_sequence(void);
+uint32_t clocks_alpha_zero_offset_last_capture_window_cycles(void);
+uint32_t clocks_alpha_zero_offset_last_dwt_at_edge(void);
+uint32_t clocks_alpha_zero_offset_last_vclock_counter32(void);
+uint32_t clocks_alpha_zero_offset_last_ocxo1_counter32(void);
+uint32_t clocks_alpha_zero_offset_last_ocxo2_counter32(void);
+uint16_t clocks_alpha_zero_offset_last_vclock_hardware16_observed(void);
+uint16_t clocks_alpha_zero_offset_last_vclock_hardware16_selected(void);
+uint16_t clocks_alpha_zero_offset_last_ocxo1_hardware16(void);
+uint16_t clocks_alpha_zero_offset_last_ocxo2_hardware16(void);
+const char* clocks_alpha_zero_offset_last_reason(void);
 
 // ============================================================================
 // Campaign/accounting reset
 // ============================================================================
 
-// Beta-local campaign/statistical reset.  Alpha owns epoch installation; beta
-// invokes this after CLOCKS.ZERO/START successfully installs logical origins.
+// Beta-local campaign/statistical reset.  Alpha owns zero-offset installation; beta
+// invokes this after CLOCKS.ZERO/START successfully installs zero-offset origins.
 void clocks_zero_all(void);

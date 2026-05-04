@@ -924,11 +924,11 @@ void clocks_beta_pps(void) {
   clocks_alpha_lane_forensics_t vclock_forensics{};
   clocks_alpha_lane_forensics_t ocxo1_forensics{};
   clocks_alpha_lane_forensics_t ocxo2_forensics{};
-  const bool vclock_forensics_valid =
+  const bool vclock_forensics_has_event =
       clocks_alpha_lane_forensics(time_clock_id_t::VCLOCK, &vclock_forensics);
-  const bool ocxo1_forensics_valid =
+  const bool ocxo1_forensics_has_event =
       clocks_alpha_lane_forensics(time_clock_id_t::OCXO1, &ocxo1_forensics);
-  const bool ocxo2_forensics_valid =
+  const bool ocxo2_forensics_has_event =
       clocks_alpha_lane_forensics(time_clock_id_t::OCXO2, &ocxo2_forensics);
 
   // VCLOCK measurement Welford — bridge-interpolation self-test.
@@ -940,13 +940,13 @@ void clocks_beta_pps(void) {
   // OCXO measurement Welfords use the real bridge/GNSS interval, not the
   // counter-derived synthetic interval. Positive residual means the OCXO
   // one-second edge arrived early / the OCXO is running fast versus VCLOCK.
-  if (ocxo1_forensics_valid && ocxo1_forensics.bridge_interval_valid) {
+  if (ocxo1_forensics_has_event && ocxo1_forensics.bridge_interval_ready) {
     const int64_t residual_fast_ns = -ocxo1_forensics.bridge_residual_ns;
     welford_update(welford_ocxo1, (double)residual_fast_ns);
     now_window_push(g_now_window_ocxo1, residual_fast_ns);
   }
 
-  if (ocxo2_forensics_valid && ocxo2_forensics.bridge_interval_valid) {
+  if (ocxo2_forensics_has_event && ocxo2_forensics.bridge_interval_ready) {
     const int64_t residual_fast_ns = -ocxo2_forensics.bridge_residual_ns;
     welford_update(welford_ocxo2, (double)residual_fast_ns);
     now_window_push(g_now_window_ocxo2, residual_fast_ns);
@@ -1044,8 +1044,8 @@ void clocks_beta_pps(void) {
   p.add("vclock_gnss_ns_between_edges", g_vclock_measurement.gnss_ns_between_edges);
   p.add("vclock_dwt_cycles_between_edges", g_vclock_measurement.dwt_cycles_between_edges);
   p.add("vclock_second_residual_ns", g_vclock_measurement.second_residual_ns);
-  p.add("vclock_phase_offset_ns", g_vclock_clock.phase_offset_ns);
-  p.add("vclock_zero_established", g_vclock_clock.zero_established);
+  p.add("vclock_bridge_minus_logical_ns", g_vclock_clock.bridge_minus_logical_ns);
+  p.add("vclock_zero_offset_installed", g_vclock_clock.zero_offset_installed);
   p.add("vclock_window_checks", g_vclock_clock.window_checks);
   p.add("vclock_window_mismatches", g_vclock_clock.window_mismatches);
   p.add("vclock_window_error_ns", g_vclock_clock.window_error_ns);
@@ -1054,17 +1054,17 @@ void clocks_beta_pps(void) {
   p.add("ocxo1_ns_at_pps_vclock", public_ocxo1_ns);
   p.add("ocxo1_gnss_ns_between_edges", g_ocxo1_measurement.gnss_ns_between_edges);
   p.add("ocxo1_counter_ns_between_edges",
-        ocxo1_forensics_valid ? ocxo1_forensics.counter_ns_between_edges : 0ULL);
+        ocxo1_forensics_has_event ? ocxo1_forensics.counter_ns_between_edges : 0ULL);
   p.add("ocxo1_bridge_gnss_ns_between_edges",
-        ocxo1_forensics_valid ? ocxo1_forensics.bridge_gnss_ns_between_edges : 0ULL);
+        ocxo1_forensics_has_event ? ocxo1_forensics.bridge_gnss_ns_between_edges : 0ULL);
   p.add("ocxo1_bridge_residual_ns",
-        ocxo1_forensics_valid ? ocxo1_forensics.bridge_residual_ns : 0LL);
-  p.add("ocxo1_bridge_interval_valid",
-        ocxo1_forensics_valid && ocxo1_forensics.bridge_interval_valid);
+        ocxo1_forensics_has_event ? ocxo1_forensics.bridge_residual_ns : 0LL);
+  p.add("ocxo1_bridge_interval_ready",
+        ocxo1_forensics_has_event && ocxo1_forensics.bridge_interval_ready);
   p.add("ocxo1_dwt_cycles_between_edges", g_ocxo1_measurement.dwt_cycles_between_edges);
   p.add("ocxo1_second_residual_ns", g_ocxo1_measurement.second_residual_ns);
-  p.add("ocxo1_phase_offset_ns", g_ocxo1_clock.phase_offset_ns);
-  p.add("ocxo1_zero_established", g_ocxo1_clock.zero_established);
+  p.add("ocxo1_bridge_minus_logical_ns", g_ocxo1_clock.bridge_minus_logical_ns);
+  p.add("ocxo1_zero_offset_installed", g_ocxo1_clock.zero_offset_installed);
   p.add("ocxo1_window_checks", g_ocxo1_clock.window_checks);
   p.add("ocxo1_window_mismatches", g_ocxo1_clock.window_mismatches);
   p.add("ocxo1_window_error_ns", g_ocxo1_clock.window_error_ns);
@@ -1073,17 +1073,17 @@ void clocks_beta_pps(void) {
   p.add("ocxo2_ns_at_pps_vclock", public_ocxo2_ns);
   p.add("ocxo2_gnss_ns_between_edges", g_ocxo2_measurement.gnss_ns_between_edges);
   p.add("ocxo2_counter_ns_between_edges",
-        ocxo2_forensics_valid ? ocxo2_forensics.counter_ns_between_edges : 0ULL);
+        ocxo2_forensics_has_event ? ocxo2_forensics.counter_ns_between_edges : 0ULL);
   p.add("ocxo2_bridge_gnss_ns_between_edges",
-        ocxo2_forensics_valid ? ocxo2_forensics.bridge_gnss_ns_between_edges : 0ULL);
+        ocxo2_forensics_has_event ? ocxo2_forensics.bridge_gnss_ns_between_edges : 0ULL);
   p.add("ocxo2_bridge_residual_ns",
-        ocxo2_forensics_valid ? ocxo2_forensics.bridge_residual_ns : 0LL);
-  p.add("ocxo2_bridge_interval_valid",
-        ocxo2_forensics_valid && ocxo2_forensics.bridge_interval_valid);
+        ocxo2_forensics_has_event ? ocxo2_forensics.bridge_residual_ns : 0LL);
+  p.add("ocxo2_bridge_interval_ready",
+        ocxo2_forensics_has_event && ocxo2_forensics.bridge_interval_ready);
   p.add("ocxo2_dwt_cycles_between_edges", g_ocxo2_measurement.dwt_cycles_between_edges);
   p.add("ocxo2_second_residual_ns", g_ocxo2_measurement.second_residual_ns);
-  p.add("ocxo2_phase_offset_ns", g_ocxo2_clock.phase_offset_ns);
-  p.add("ocxo2_zero_established", g_ocxo2_clock.zero_established);
+  p.add("ocxo2_bridge_minus_logical_ns", g_ocxo2_clock.bridge_minus_logical_ns);
+  p.add("ocxo2_zero_offset_installed", g_ocxo2_clock.zero_offset_installed);
   p.add("ocxo2_window_checks", g_ocxo2_clock.window_checks);
   p.add("ocxo2_window_mismatches", g_ocxo2_clock.window_mismatches);
   p.add("ocxo2_window_error_ns", g_ocxo2_clock.window_error_ns);
@@ -1173,7 +1173,7 @@ static Payload cmd_start(const Payload& args) {
   request_stop = false;
   request_recover = false;
 
-  const bool zero_ok = clocks_alpha_zero_from_interrupt_capture("start");
+  const bool zero_ok = clocks_alpha_install_zero_offsets_from_interrupt_capture("start");
 
   if (zero_ok) {
     clocks_finish_start_accounting();
@@ -1187,21 +1187,19 @@ static Payload cmd_start(const Payload& args) {
                       : ((!dac1_ok || !dac2_ok)
                             ? "started_dac_fault"
                             : "started"));
-  p.add("zero_installed", zero_ok);
-  p.add("epoch_owner", "CLOCKS");
-  p.add("epoch_sequence", clocks_alpha_epoch_sequence());
-  p.add("epoch_reason", clocks_alpha_epoch_last_reason());
-  p.add("epoch_capture_sequence", clocks_alpha_epoch_last_capture_sequence());
-  p.add("epoch_capture_window_cycles", clocks_alpha_epoch_last_capture_window_cycles());
-  p.add("epoch_capture_vclock_valid", clocks_alpha_epoch_last_vclock_capture_valid());
-  p.add("epoch_capture_all_lanes_valid", clocks_alpha_epoch_last_all_lanes_valid());
-  p.add("zero_offset_vclock_counter32", clocks_alpha_epoch_last_vclock_counter32());
-  p.add("zero_offset_ocxo1_counter32", clocks_alpha_epoch_last_ocxo1_counter32());
-  p.add("zero_offset_ocxo2_counter32", clocks_alpha_epoch_last_ocxo2_counter32());
-  p.add("zero_offset_vclock_hardware16_observed", (uint32_t)clocks_alpha_epoch_last_vclock_hardware16_observed());
-  p.add("zero_offset_vclock_hardware16_selected", (uint32_t)clocks_alpha_epoch_last_vclock_hardware16_selected());
-  p.add("zero_offset_ocxo1_hardware16", (uint32_t)clocks_alpha_epoch_last_ocxo1_hardware16());
-  p.add("zero_offset_ocxo2_hardware16", (uint32_t)clocks_alpha_epoch_last_ocxo2_hardware16());
+  p.add("zero_offset_installed", zero_ok);
+  p.add("zero_offset_owner", "CLOCKS");
+  p.add("zero_offset_sequence", clocks_alpha_zero_offset_sequence());
+  p.add("zero_offset_reason", clocks_alpha_zero_offset_last_reason());
+  p.add("zero_offset_capture_sequence", clocks_alpha_zero_offset_last_capture_sequence());
+  p.add("zero_offset_capture_window_cycles", clocks_alpha_zero_offset_last_capture_window_cycles());
+  p.add("zero_offset_vclock_counter32", clocks_alpha_zero_offset_last_vclock_counter32());
+  p.add("zero_offset_ocxo1_counter32", clocks_alpha_zero_offset_last_ocxo1_counter32());
+  p.add("zero_offset_ocxo2_counter32", clocks_alpha_zero_offset_last_ocxo2_counter32());
+  p.add("zero_offset_vclock_hardware16_observed", (uint32_t)clocks_alpha_zero_offset_last_vclock_hardware16_observed());
+  p.add("zero_offset_vclock_hardware16_selected", (uint32_t)clocks_alpha_zero_offset_last_vclock_hardware16_selected());
+  p.add("zero_offset_ocxo1_hardware16", (uint32_t)clocks_alpha_zero_offset_last_ocxo1_hardware16());
+  p.add("zero_offset_ocxo2_hardware16", (uint32_t)clocks_alpha_zero_offset_last_ocxo2_hardware16());
   p.add("ocxo1_dac", ocxo1_dac.dac_fractional);
   p.add("ocxo2_dac", ocxo2_dac.dac_fractional);
   p.add("ocxo1_dac_last_write_ok", ocxo1_dac.io_last_write_ok);
@@ -1225,7 +1223,7 @@ static Payload cmd_zero(const Payload&) {
   request_recover = false;
   request_zero = true;
 
-  const bool zero_ok = clocks_alpha_zero_from_interrupt_capture("zero");
+  const bool zero_ok = clocks_alpha_install_zero_offsets_from_interrupt_capture("zero");
   if (zero_ok) {
     clocks_finish_zero_accounting();
   } else {
@@ -1233,28 +1231,23 @@ static Payload cmd_zero(const Payload&) {
   }
 
   Payload p;
-  p.add("status", zero_ok ? "zero_installed" : "zero_rejected_zero_offset_integrity_fault");
-  p.add("epoch_owner", "CLOCKS");
-  p.add("zero_installed", zero_ok);
-  p.add("epoch_sequence", clocks_alpha_epoch_sequence());
-  p.add("epoch_install_count", clocks_alpha_epoch_install_count());
-  p.add("epoch_install_failures", clocks_alpha_epoch_install_failures());
-  p.add("epoch_reason", clocks_alpha_epoch_last_reason());
-  p.add("epoch_dwt_at_edge", clocks_alpha_epoch_last_dwt_at_edge());
-  p.add("epoch_vclock_counter32", clocks_alpha_epoch_last_vclock_counter32());
-  p.add("epoch_ocxo1_counter32", clocks_alpha_epoch_last_ocxo1_counter32());
-  p.add("epoch_ocxo2_counter32", clocks_alpha_epoch_last_ocxo2_counter32());
-  p.add("zero_offset_vclock_counter32", clocks_alpha_epoch_last_vclock_counter32());
-  p.add("zero_offset_ocxo1_counter32", clocks_alpha_epoch_last_ocxo1_counter32());
-  p.add("zero_offset_ocxo2_counter32", clocks_alpha_epoch_last_ocxo2_counter32());
-  p.add("zero_offset_vclock_hardware16_observed", (uint32_t)clocks_alpha_epoch_last_vclock_hardware16_observed());
-  p.add("zero_offset_vclock_hardware16_selected", (uint32_t)clocks_alpha_epoch_last_vclock_hardware16_selected());
-  p.add("zero_offset_ocxo1_hardware16", (uint32_t)clocks_alpha_epoch_last_ocxo1_hardware16());
-  p.add("zero_offset_ocxo2_hardware16", (uint32_t)clocks_alpha_epoch_last_ocxo2_hardware16());
-  p.add("epoch_capture_sequence", clocks_alpha_epoch_last_capture_sequence());
-  p.add("epoch_capture_window_cycles", clocks_alpha_epoch_last_capture_window_cycles());
-  p.add("epoch_capture_vclock_valid", clocks_alpha_epoch_last_vclock_capture_valid());
-  p.add("epoch_capture_all_lanes_valid", clocks_alpha_epoch_last_all_lanes_valid());
+  p.add("status", zero_ok ? "zero_offset_installed" : "zero_rejected_zero_offset_integrity_fault");
+  p.add("zero_offset_owner", "CLOCKS");
+  p.add("zero_offset_installed", zero_ok);
+  p.add("zero_offset_sequence", clocks_alpha_zero_offset_sequence());
+  p.add("zero_offset_install_count", clocks_alpha_zero_offset_install_count());
+  p.add("zero_offset_install_failures", clocks_alpha_zero_offset_install_failures());
+  p.add("zero_offset_reason", clocks_alpha_zero_offset_last_reason());
+  p.add("zero_offset_dwt_at_edge", clocks_alpha_zero_offset_last_dwt_at_edge());
+  p.add("zero_offset_vclock_counter32", clocks_alpha_zero_offset_last_vclock_counter32());
+  p.add("zero_offset_ocxo1_counter32", clocks_alpha_zero_offset_last_ocxo1_counter32());
+  p.add("zero_offset_ocxo2_counter32", clocks_alpha_zero_offset_last_ocxo2_counter32());
+  p.add("zero_offset_vclock_hardware16_observed", (uint32_t)clocks_alpha_zero_offset_last_vclock_hardware16_observed());
+  p.add("zero_offset_vclock_hardware16_selected", (uint32_t)clocks_alpha_zero_offset_last_vclock_hardware16_selected());
+  p.add("zero_offset_ocxo1_hardware16", (uint32_t)clocks_alpha_zero_offset_last_ocxo1_hardware16());
+  p.add("zero_offset_ocxo2_hardware16", (uint32_t)clocks_alpha_zero_offset_last_ocxo2_hardware16());
+  p.add("zero_offset_capture_sequence", clocks_alpha_zero_offset_last_capture_sequence());
+  p.add("zero_offset_capture_window_cycles", clocks_alpha_zero_offset_last_capture_window_cycles());
   return p;
 }
 
@@ -1294,7 +1287,7 @@ static Payload cmd_watchdog_test(const Payload&) {
 
 
 // ============================================================================
-// CLOCKS report forensics
+// CLOCKS report diagnostics
 // ============================================================================
 
 static int64_t signed_delta_u64(uint64_t a, uint64_t b) {
@@ -1320,36 +1313,39 @@ static double ppb_fast_vs_vclock(uint32_t vclock_cycles,
 static void add_alpha_event_payload(Payload& p,
                                     const clocks_alpha_lane_forensics_t& f,
                                     const clocks_alpha_lane_forensics_t* vclock_ref) {
-  p.add("valid", f.valid);
+  p.add("has_event", f.has_event);
   p.add("update_count", f.update_count);
   p.add("last_event_dwt", f.last_event_dwt);
   p.add("last_event_counter32", f.last_event_counter32);
+
   p.add("zero_offset_counter32", f.zero_offset_counter32);
   p.add("counter32_delta_since_zero_offset", f.counter32_delta_since_zero_offset);
   p.add("counter32_delta_since_previous_event", f.counter32_delta_since_previous_event);
   p.add("logical_ticks64_since_zero", f.logical_ticks64_since_zero);
   p.add("logical_ns64_since_zero", f.logical_ns64_since_zero);
 
-  // Legacy aliases retained for consumers that still use the old epoch labels.
-  p.add("epoch_counter32", f.epoch_counter32);
-  p.add("counter32_delta_since_epoch", f.counter32_delta_since_epoch);
-  p.add("ns_from_counter32_epoch", f.ns_from_counter32_epoch);
   p.add("event_gnss_ns", f.event_gnss_ns);
   p.add("previous_event_gnss_ns", f.previous_event_gnss_ns);
-  p.add("phase_offset_ns", f.phase_offset_ns);
+  p.add("bridge_minus_logical_ns", f.bridge_minus_logical_ns);
   p.add("counter_ns_between_edges", f.counter_ns_between_edges);
-  p.add("bridge_interval_valid", f.bridge_interval_valid);
   p.add("bridge_gnss_ns_between_edges", f.bridge_gnss_ns_between_edges);
   p.add("bridge_residual_ns", f.bridge_residual_ns);
+  p.add("bridge_interval_ready", f.bridge_interval_ready);
 
-  if (vclock_ref && vclock_ref->valid && f.valid) {
+  p.add("dwt_cycles_between_edges", f.dwt_cycles_between_edges);
+  p.add("second_residual_ns", f.second_residual_ns);
+  p.add("window_error_ns", f.window_error_ns);
+  p.add("window_checks", f.window_checks);
+  p.add("window_mismatches", f.window_mismatches);
+
+  if (vclock_ref && vclock_ref->has_event && f.has_event) {
     p.add("event_delta_vs_vclock_ns",
-          signed_delta_u64(f.ns_from_counter32_epoch,
-                           vclock_ref->ns_from_counter32_epoch));
+          signed_delta_u64(f.logical_ns64_since_zero,
+                           vclock_ref->logical_ns64_since_zero));
     p.add("event_dwt_delta_vs_vclock_cycles",
           (int32_t)(f.last_event_dwt - vclock_ref->last_event_dwt));
-    p.add("phase_offset_delta_vs_vclock_ns",
-          f.phase_offset_ns - vclock_ref->phase_offset_ns);
+    p.add("bridge_minus_logical_delta_vs_vclock_ns",
+          f.bridge_minus_logical_ns - vclock_ref->bridge_minus_logical_ns);
     p.add("dwt_cycles_between_edges_delta_vs_vclock",
           (int32_t)((int64_t)f.dwt_cycles_between_edges -
                     (int64_t)vclock_ref->dwt_cycles_between_edges));
@@ -1357,18 +1353,11 @@ static void add_alpha_event_payload(Payload& p,
           ppb_fast_vs_vclock(vclock_ref->dwt_cycles_between_edges,
                              f.dwt_cycles_between_edges),
           3);
-    if (f.bridge_interval_valid && vclock_ref->bridge_interval_valid) {
+    if (f.bridge_interval_ready && vclock_ref->bridge_interval_ready) {
       p.add("bridge_residual_delta_vs_vclock_ns",
             f.bridge_residual_ns - vclock_ref->bridge_residual_ns);
     }
   }
-
-  p.add("ns_between_edges", f.ns_between_edges);
-  p.add("dwt_cycles_between_edges", f.dwt_cycles_between_edges);
-  p.add("second_residual_ns", f.second_residual_ns);
-  p.add("window_error_ns", f.window_error_ns);
-  p.add("window_checks", f.window_checks);
-  p.add("window_mismatches", f.window_mismatches);
 
   Payload anchor;
   anchor.add("sequence_used", f.diag_anchor_sequence_used);
@@ -1386,23 +1375,23 @@ static void add_projection_payload(Payload& p,
                                    time_clock_id_t clock_id,
                                    uint32_t report_dwt,
                                    uint64_t report_ns,
-                                   bool report_valid,
+                                   bool projection_ready,
                                    uint64_t vclock_report_ns,
-                                   bool vclock_report_valid,
+                                   bool vclock_projection_ready,
                                    const clocks_alpha_lane_forensics_t& f,
                                    const clocks_alpha_lane_forensics_t* vclock_ref) {
-  p.add("report_valid", report_valid);
-  p.add("report_ns", report_valid ? report_ns : 0ULL);
+  p.add("projection_ready", projection_ready);
+  p.add("report_ns", projection_ready ? report_ns : 0ULL);
 
-  if (report_valid && vclock_report_valid) {
+  if (projection_ready && vclock_projection_ready) {
     p.add("report_delta_vs_vclock_ns", signed_delta_u64(report_ns, vclock_report_ns));
   }
 
-  if (f.valid) {
+  if (f.has_event) {
     const uint32_t elapsed_cycles = report_dwt - f.last_event_dwt;
     uint64_t projected_delta_ns = 0;
-    if (report_valid && report_ns >= f.ns_from_counter32_epoch) {
-      projected_delta_ns = report_ns - f.ns_from_counter32_epoch;
+    if (projection_ready && report_ns >= f.logical_ns64_since_zero) {
+      projected_delta_ns = report_ns - f.logical_ns64_since_zero;
     }
 
     p.add("elapsed_cycles_from_last_event_to_report", elapsed_cycles);
@@ -1421,59 +1410,62 @@ static void add_projection_payload(Payload& p,
 static void add_clock_forensics_payload(Payload& p,
                                         uint32_t report_dwt,
                                         uint64_t vclock_ns,
-                                        bool vclock_ok,
+                                        bool vclock_projection_ready,
                                         uint64_t ocxo1_ns,
-                                        bool ocxo1_ok,
+                                        bool ocxo1_projection_ready,
                                         uint64_t ocxo2_ns,
-                                        bool ocxo2_ok) {
+                                        bool ocxo2_projection_ready) {
   Payload forensic;
   forensic.add("report_dwt", report_dwt);
 
   clocks_alpha_lane_forensics_t vf{};
   clocks_alpha_lane_forensics_t o1f{};
   clocks_alpha_lane_forensics_t o2f{};
-  const bool vf_ok = clocks_alpha_lane_forensics(time_clock_id_t::VCLOCK, &vf);
-  const bool o1f_ok = clocks_alpha_lane_forensics(time_clock_id_t::OCXO1, &o1f);
-  const bool o2f_ok = clocks_alpha_lane_forensics(time_clock_id_t::OCXO2, &o2f);
+  const bool vf_has_event = clocks_alpha_lane_forensics(time_clock_id_t::VCLOCK, &vf);
+  const bool o1f_has_event = clocks_alpha_lane_forensics(time_clock_id_t::OCXO1, &o1f);
+  const bool o2f_has_event = clocks_alpha_lane_forensics(time_clock_id_t::OCXO2, &o2f);
 
-  forensic.add("alpha_vclock_valid", vf_ok);
-  forensic.add("alpha_ocxo1_valid", o1f_ok);
-  forensic.add("alpha_ocxo2_valid", o2f_ok);
+  forensic.add("alpha_vclock_has_event", vf_has_event);
+  forensic.add("alpha_ocxo1_has_event", o1f_has_event);
+  forensic.add("alpha_ocxo2_has_event", o2f_has_event);
 
   Payload vclock;
   add_projection_payload(vclock, time_clock_id_t::VCLOCK, report_dwt,
-                         vclock_ns, vclock_ok, vclock_ns, vclock_ok,
+                         vclock_ns, vclock_projection_ready,
+                         vclock_ns, vclock_projection_ready,
                          vf, nullptr);
   forensic.add_object("vclock", vclock);
 
   Payload ocxo1;
   add_projection_payload(ocxo1, time_clock_id_t::OCXO1, report_dwt,
-                         ocxo1_ns, ocxo1_ok, vclock_ns, vclock_ok,
+                         ocxo1_ns, ocxo1_projection_ready,
+                         vclock_ns, vclock_projection_ready,
                          o1f, &vf);
   forensic.add_object("ocxo1", ocxo1);
 
   Payload ocxo2;
   add_projection_payload(ocxo2, time_clock_id_t::OCXO2, report_dwt,
-                         ocxo2_ns, ocxo2_ok, vclock_ns, vclock_ok,
+                         ocxo2_ns, ocxo2_projection_ready,
+                         vclock_ns, vclock_projection_ready,
                          o2f, &vf);
   forensic.add_object("ocxo2", ocxo2);
 
-  if (vclock_ok && ocxo1_ok && ocxo2_ok) {
+  if (vclock_projection_ready && ocxo1_projection_ready && ocxo2_projection_ready) {
     Payload deltas;
     deltas.add("ocxo1_minus_vclock_ns", signed_delta_u64(ocxo1_ns, vclock_ns));
     deltas.add("ocxo2_minus_vclock_ns", signed_delta_u64(ocxo2_ns, vclock_ns));
     deltas.add("ocxo2_minus_ocxo1_ns", signed_delta_u64(ocxo2_ns, ocxo1_ns));
-    if (vf_ok && o1f_ok) {
-      deltas.add("ocxo1_phase_offset_delta_vs_vclock_ns",
-                 o1f.phase_offset_ns - vf.phase_offset_ns);
+    if (vf_has_event && o1f_has_event) {
+      deltas.add("ocxo1_bridge_minus_logical_delta_vs_vclock_ns",
+                 o1f.bridge_minus_logical_ns - vf.bridge_minus_logical_ns);
       deltas.add("ocxo1_dwt_interval_ppb_fast_vs_vclock",
                  ppb_fast_vs_vclock(vf.dwt_cycles_between_edges,
                                     o1f.dwt_cycles_between_edges),
                  3);
     }
-    if (vf_ok && o2f_ok) {
-      deltas.add("ocxo2_phase_offset_delta_vs_vclock_ns",
-                 o2f.phase_offset_ns - vf.phase_offset_ns);
+    if (vf_has_event && o2f_has_event) {
+      deltas.add("ocxo2_bridge_minus_logical_delta_vs_vclock_ns",
+                 o2f.bridge_minus_logical_ns - vf.bridge_minus_logical_ns);
       deltas.add("ocxo2_dwt_interval_ppb_fast_vs_vclock",
                  ppb_fast_vs_vclock(vf.dwt_cycles_between_edges,
                                     o2f.dwt_cycles_between_edges),
@@ -1497,26 +1489,29 @@ static Payload cmd_report(const Payload&) {
   uint64_t vclock_ns = 0;
   uint64_t ocxo1_ns = 0;
   uint64_t ocxo2_ns = 0;
-  const bool vclock_ok = time_clock_ns_at_dwt(time_clock_id_t::VCLOCK, report_dwt, &vclock_ns);
-  const bool ocxo1_ok  = time_clock_ns_at_dwt(time_clock_id_t::OCXO1,  report_dwt, &ocxo1_ns);
-  const bool ocxo2_ok  = time_clock_ns_at_dwt(time_clock_id_t::OCXO2,  report_dwt, &ocxo2_ns);
+  const bool vclock_projection_ready = time_clock_ns_at_dwt(time_clock_id_t::VCLOCK, report_dwt, &vclock_ns);
+  const bool ocxo1_projection_ready  = time_clock_ns_at_dwt(time_clock_id_t::OCXO1,  report_dwt, &ocxo1_ns);
+  const bool ocxo2_projection_ready  = time_clock_ns_at_dwt(time_clock_id_t::OCXO2,  report_dwt, &ocxo2_ns);
 
   summary.add("report_dwt", report_dwt);
   summary.add("dwt64_cycles", dwt64_cycles_at_report);
   summary.add("dwt64_ns", dwt_cycles_to_ns(dwt64_cycles_at_report));
-  summary.add("gnss_ns", vclock_ok ? vclock_ns : 0);
-  summary.add("vclock_ns", vclock_ok ? vclock_ns : 0);
-  summary.add("ocxo1_ns", ocxo1_ok ? ocxo1_ns : 0);
-  summary.add("ocxo2_ns", ocxo2_ok ? ocxo2_ns : 0);
-  summary.add("vclock_valid", vclock_ok);
-  summary.add("ocxo1_valid", ocxo1_ok);
-  summary.add("ocxo2_valid", ocxo2_ok);
+  summary.add("gnss_ns", vclock_projection_ready ? vclock_ns : 0);
+  summary.add("vclock_ns", vclock_projection_ready ? vclock_ns : 0);
+  summary.add("ocxo1_ns", ocxo1_projection_ready ? ocxo1_ns : 0);
+  summary.add("ocxo2_ns", ocxo2_projection_ready ? ocxo2_ns : 0);
+  summary.add("vclock_projection_ready", vclock_projection_ready);
+  summary.add("ocxo1_projection_ready", ocxo1_projection_ready);
+  summary.add("ocxo2_projection_ready", ocxo2_projection_ready);
   p.add_object("summary", summary);
 
   add_clock_forensics_payload(p, report_dwt,
-                              vclock_ok ? vclock_ns : 0ULL, vclock_ok,
-                              ocxo1_ok ? ocxo1_ns : 0ULL, ocxo1_ok,
-                              ocxo2_ok ? ocxo2_ns : 0ULL, ocxo2_ok);
+                              vclock_projection_ready ? vclock_ns : 0ULL,
+                              vclock_projection_ready,
+                              ocxo1_projection_ready ? ocxo1_ns : 0ULL,
+                              ocxo1_projection_ready,
+                              ocxo2_projection_ready ? ocxo2_ns : 0ULL,
+                              ocxo2_projection_ready);
 
   p.add("campaign_state",
         campaign_state == clocks_campaign_state_t::STARTED ? "STARTED" : "STOPPED");
@@ -1524,30 +1519,23 @@ static Payload cmd_report(const Payload&) {
   p.add("request_stop", request_stop);
   p.add("request_recover", request_recover);
   p.add("request_zero", request_zero);
-  p.add("epoch_pending", clocks_epoch_pending());
-  p.add("epoch_owner", "CLOCKS");
-  p.add("epoch_initialized", clocks_alpha_epoch_initialized());
-  p.add("epoch_sequence", clocks_alpha_epoch_sequence());
-  p.add("epoch_install_count", clocks_alpha_epoch_install_count());
-  p.add("epoch_install_failures", clocks_alpha_epoch_install_failures());
-  p.add("epoch_reason", clocks_alpha_epoch_last_reason());
-  p.add("epoch_dwt_at_edge", clocks_alpha_epoch_last_dwt_at_edge());
-  p.add("epoch_vclock_counter32", clocks_alpha_epoch_last_vclock_counter32());
-  p.add("epoch_ocxo1_counter32", clocks_alpha_epoch_last_ocxo1_counter32());
-  p.add("epoch_ocxo2_counter32", clocks_alpha_epoch_last_ocxo2_counter32());
-  p.add("zero_offset_vclock_counter32", clocks_alpha_epoch_last_vclock_counter32());
-  p.add("zero_offset_ocxo1_counter32", clocks_alpha_epoch_last_ocxo1_counter32());
-  p.add("zero_offset_ocxo2_counter32", clocks_alpha_epoch_last_ocxo2_counter32());
-  p.add("zero_offset_vclock_hardware16_observed", (uint32_t)clocks_alpha_epoch_last_vclock_hardware16_observed());
-  p.add("zero_offset_vclock_hardware16_selected", (uint32_t)clocks_alpha_epoch_last_vclock_hardware16_selected());
-  p.add("zero_offset_ocxo1_hardware16", (uint32_t)clocks_alpha_epoch_last_ocxo1_hardware16());
-  p.add("zero_offset_ocxo2_hardware16", (uint32_t)clocks_alpha_epoch_last_ocxo2_hardware16());
-  p.add("epoch_capture_sequence", clocks_alpha_epoch_last_capture_sequence());
-  p.add("epoch_capture_window_cycles", clocks_alpha_epoch_last_capture_window_cycles());
-  p.add("epoch_capture_vclock_valid", clocks_alpha_epoch_last_vclock_capture_valid());
-  p.add("epoch_capture_all_lanes_valid", clocks_alpha_epoch_last_all_lanes_valid());
-  p.add("interrupt_pps_rebootstrap_pending",
-        interrupt_pps_rebootstrap_pending());
+  p.add("zero_offset_owner", "CLOCKS");
+  p.add("zero_offset_initialized", clocks_alpha_zero_offset_initialized());
+  p.add("zero_offset_sequence", clocks_alpha_zero_offset_sequence());
+  p.add("zero_offset_install_count", clocks_alpha_zero_offset_install_count());
+  p.add("zero_offset_install_failures", clocks_alpha_zero_offset_install_failures());
+  p.add("zero_offset_reason", clocks_alpha_zero_offset_last_reason());
+  p.add("zero_offset_dwt_at_edge", clocks_alpha_zero_offset_last_dwt_at_edge());
+  p.add("zero_offset_vclock_counter32", clocks_alpha_zero_offset_last_vclock_counter32());
+  p.add("zero_offset_ocxo1_counter32", clocks_alpha_zero_offset_last_ocxo1_counter32());
+  p.add("zero_offset_ocxo2_counter32", clocks_alpha_zero_offset_last_ocxo2_counter32());
+  p.add("zero_offset_vclock_hardware16_observed", (uint32_t)clocks_alpha_zero_offset_last_vclock_hardware16_observed());
+  p.add("zero_offset_vclock_hardware16_selected", (uint32_t)clocks_alpha_zero_offset_last_vclock_hardware16_selected());
+  p.add("zero_offset_ocxo1_hardware16", (uint32_t)clocks_alpha_zero_offset_last_ocxo1_hardware16());
+  p.add("zero_offset_ocxo2_hardware16", (uint32_t)clocks_alpha_zero_offset_last_ocxo2_hardware16());
+  p.add("zero_offset_capture_sequence", clocks_alpha_zero_offset_last_capture_sequence());
+  p.add("zero_offset_capture_window_cycles", clocks_alpha_zero_offset_last_capture_window_cycles());
+  p.add("interrupt_pps_rebootstrap_pending", interrupt_pps_rebootstrap_pending());
   p.add("campaign_warmup_active", campaign_warmup_active());
   p.add("campaign_warmup_required", CLOCKS_CAMPAIGN_WARMUP_SUPPRESS_PPS);
   p.add("campaign_warmup_remaining", (uint32_t)g_campaign_warmup_remaining);
