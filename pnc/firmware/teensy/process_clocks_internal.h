@@ -16,14 +16,12 @@
 //   a PPS/VCLOCK snapshot whose DWT coordinate is authored by the VCLOCK/QTimer
 //   event path.  This keeps public DWT facts in one VCLOCK coordinate species.
 //
-//   Alpha installs that selected PPS/VCLOCK snapshot directly:
-//     g_gnss_ns_at_pps_vclock = 0
-//     g_dwt_at_pps_vclock = snap.dwt_at_edge
-//     g_counter32_at_pps_vclock = snap.counter32_at_edge
-//
-//   After install, VCLOCK events advance the synthetic ns ledger by +1e9 and
-//   subsequent PPS-selected PPS/VCLOCK snapshots refresh the DWT/GNSS bridge
-//   anchor.  Raw physical PPS facts remain diagnostics.
+//   Alpha installs the selected PPS/VCLOCK snapshot as a logical-zero event.
+//   The captured synthetic counter32 values become per-lane zero-offset ticks:
+//     logical_ticks = counter32_at_event - zero_offset_counter32
+//   Alpha then extends accepted deltas into 64-bit logical tick ledgers so
+//   campaign time does not wrap at the 32-bit / 10 MHz boundary.  Raw physical
+//   PPS facts and raw 16-bit capture values remain diagnostics.
 //
 // Statistical surface (standardized):
 //
@@ -246,6 +244,18 @@ struct clocks_alpha_lane_forensics_t {
 
   uint32_t last_event_dwt;
   uint32_t last_event_counter32;
+
+  // New preferred names.  The zero offset is the synthetic counter32 value
+  // captured at CLOCKS.ZERO/START and used as the lane's logical origin.
+  // If CLOCKS cannot install a complete zero-offset set, it raises a watchdog
+  // anomaly; there is no degraded operating state for partial zero-offset installation.
+  uint32_t zero_offset_counter32;
+  uint32_t counter32_delta_since_zero_offset;
+  uint32_t counter32_delta_since_previous_event;
+  uint64_t logical_ticks64_since_zero;
+  uint64_t logical_ns64_since_zero;
+
+  // Legacy aliases retained for report/back-compat consumers.
   uint32_t epoch_counter32;
   uint32_t counter32_delta_since_epoch;
   uint64_t ns_from_counter32_epoch;
@@ -511,6 +521,10 @@ uint32_t clocks_alpha_epoch_last_dwt_at_edge(void);
 uint32_t clocks_alpha_epoch_last_vclock_counter32(void);
 uint32_t clocks_alpha_epoch_last_ocxo1_counter32(void);
 uint32_t clocks_alpha_epoch_last_ocxo2_counter32(void);
+uint16_t clocks_alpha_epoch_last_vclock_hardware16_observed(void);
+uint16_t clocks_alpha_epoch_last_vclock_hardware16_selected(void);
+uint16_t clocks_alpha_epoch_last_ocxo1_hardware16(void);
+uint16_t clocks_alpha_epoch_last_ocxo2_hardware16(void);
 const char* clocks_alpha_epoch_last_reason(void);
 
 // ============================================================================

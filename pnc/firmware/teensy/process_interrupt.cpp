@@ -226,9 +226,10 @@ static pps_vclock_t store_load_pvc(void) {
 // ============================================================================
 //
 // This packet is authored on every PPS GPIO ISR from the ISR's opening custody
-// window.  The 16-bit hardware reads are not retained operationally; they are
-// immediately translated into process_interrupt-owned synthetic 32-bit lane
-// coordinates.  ZERO consumers select this already-authored packet later.
+// window.  The 16-bit hardware reads are retained only as forensic evidence;
+// runtime consumers use the translated process_interrupt-owned synthetic
+// 32-bit lane coordinates.  ZERO consumers select this already-authored packet
+// later.
 
 struct epoch_capture_store_t {
   volatile uint32_t seq = 0;
@@ -251,6 +252,11 @@ struct epoch_capture_store_t {
   volatile bool     vclock_capture_valid = false;
   volatile bool     all_lanes_capture_valid = false;
 
+  volatile uint16_t vclock_hardware16_observed = 0;
+  volatile uint16_t vclock_hardware16_selected = 0;
+  volatile uint16_t ocxo1_hardware16 = 0;
+  volatile uint16_t ocxo2_hardware16 = 0;
+
   volatile uint32_t vclock_counter32 = 0;
   volatile uint32_t ocxo1_counter32 = 0;
   volatile uint32_t ocxo2_counter32 = 0;
@@ -272,6 +278,10 @@ static void epoch_capture_publish(const interrupt_epoch_capture_t& cap) {
   g_epoch_capture_store.vclock_dwt_at_edge = cap.vclock_dwt_at_edge;
   g_epoch_capture_store.vclock_capture_valid = cap.vclock_capture_valid;
   g_epoch_capture_store.all_lanes_capture_valid = cap.all_lanes_capture_valid;
+  g_epoch_capture_store.vclock_hardware16_observed = cap.vclock_hardware16_observed;
+  g_epoch_capture_store.vclock_hardware16_selected = cap.vclock_hardware16_selected;
+  g_epoch_capture_store.ocxo1_hardware16 = cap.ocxo1_hardware16;
+  g_epoch_capture_store.ocxo2_hardware16 = cap.ocxo2_hardware16;
   g_epoch_capture_store.vclock_counter32 = cap.vclock_counter32;
   g_epoch_capture_store.ocxo1_counter32 = cap.ocxo1_counter32;
   g_epoch_capture_store.ocxo2_counter32 = cap.ocxo2_counter32;
@@ -297,6 +307,10 @@ bool interrupt_last_epoch_capture(interrupt_epoch_capture_t* out) {
     out->vclock_dwt_at_edge = g_epoch_capture_store.vclock_dwt_at_edge;
     out->vclock_capture_valid = g_epoch_capture_store.vclock_capture_valid;
     out->all_lanes_capture_valid = g_epoch_capture_store.all_lanes_capture_valid;
+    out->vclock_hardware16_observed = g_epoch_capture_store.vclock_hardware16_observed;
+    out->vclock_hardware16_selected = g_epoch_capture_store.vclock_hardware16_selected;
+    out->ocxo1_hardware16 = g_epoch_capture_store.ocxo1_hardware16;
+    out->ocxo2_hardware16 = g_epoch_capture_store.ocxo2_hardware16;
     out->vclock_counter32 = g_epoch_capture_store.vclock_counter32;
     out->ocxo1_counter32 = g_epoch_capture_store.ocxo1_counter32;
     out->ocxo2_counter32 = g_epoch_capture_store.ocxo2_counter32;
@@ -1785,10 +1799,10 @@ void process_interrupt_gpio6789_irq(uint32_t isr_entry_dwt_raw) {
   // authored by the TimePop VCLOCK cadence client on QTimer1 CH2 so all public
   // DWT captures live in one TimePop event-coordinate system.
   //
-  // Epochization capture doctrine: immediately after the first-instruction
+  // Zero-offset capture doctrine: immediately after the first-instruction
   // DWT raw capture, read the three 10 MHz lane counters in one custody
-  // window.  The raw 16-bit reads are local only; after translation below, the
-  // retained epoch packet contains only synthetic 32-bit lane coordinates.
+  // window.  The raw 16-bit reads are retained as forensic-only evidence;
+  // runtime timing math consumes the synthetic 32-bit lane coordinates below.
   const uint32_t epoch_capture_start_raw = isr_entry_dwt_raw;
   const uint16_t hardware_low16 = qtimer1_ch0_counter_now();
   const uint32_t epoch_capture_after_vclock_raw = ARM_DWT_CYCCNT;
@@ -1851,9 +1865,16 @@ void process_interrupt_gpio6789_irq(uint32_t isr_entry_dwt_raw) {
       ocxo_capture_hw_ready &&
       epoch_cap.capture_window_cycles <= EPOCH_CAPTURE_MAX_WINDOW_CYCLES;
   // A packet is operationally selectable only after interrupt runtime has
-  // finished initialization.  This prevents a boot-time partial capture from
-  // being mistaken for a CLOCKS.ZERO epoch packet.
-  epoch_cap.valid = g_interrupt_runtime_ready && epoch_cap.vclock_capture_valid;
+  // finished initialization AND all required lane captures fit inside the
+  // custody window.  CLOCKS treats zero-offset installation as an integrity
+  // operation: partial capture is a timing-integrity fault.
+  epoch_cap.valid = g_interrupt_runtime_ready &&
+                    epoch_cap.vclock_capture_valid &&
+                    epoch_cap.all_lanes_capture_valid;
+  epoch_cap.vclock_hardware16_observed = hardware_low16;
+  epoch_cap.vclock_hardware16_selected = selected_low16;
+  epoch_cap.ocxo1_hardware16 = ocxo1_hardware16;
+  epoch_cap.ocxo2_hardware16 = ocxo2_hardware16;
   epoch_cap.vclock_counter32 = selected_counter32;
   epoch_cap.ocxo1_counter32 = ocxo1_counter32;
   epoch_cap.ocxo2_counter32 = ocxo2_counter32;
@@ -2360,6 +2381,10 @@ static Payload cmd_report(const Payload&) {
   p.add("epoch_capture_vclock_dwt_at_edge", epoch_cap.vclock_dwt_at_edge);
   p.add("epoch_capture_vclock_valid", epoch_cap.vclock_capture_valid);
   p.add("epoch_capture_all_lanes_valid", epoch_cap.all_lanes_capture_valid);
+  p.add("epoch_capture_vclock_hardware16_observed", (uint32_t)epoch_cap.vclock_hardware16_observed);
+  p.add("epoch_capture_vclock_hardware16_selected", (uint32_t)epoch_cap.vclock_hardware16_selected);
+  p.add("epoch_capture_ocxo1_hardware16", (uint32_t)epoch_cap.ocxo1_hardware16);
+  p.add("epoch_capture_ocxo2_hardware16", (uint32_t)epoch_cap.ocxo2_hardware16);
   p.add("epoch_capture_vclock_counter32", epoch_cap.vclock_counter32);
   p.add("epoch_capture_ocxo1_counter32", epoch_cap.ocxo1_counter32);
   p.add("epoch_capture_ocxo2_counter32", epoch_cap.ocxo2_counter32);

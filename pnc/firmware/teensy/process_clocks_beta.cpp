@@ -1174,6 +1174,7 @@ static Payload cmd_start(const Payload& args) {
   request_recover = false;
 
   const bool zero_ok = clocks_alpha_zero_from_interrupt_capture("start");
+
   if (zero_ok) {
     clocks_finish_start_accounting();
   } else {
@@ -1182,7 +1183,7 @@ static Payload cmd_start(const Payload& args) {
 
   Payload p;
   p.add("status", !zero_ok
-                      ? "start_rejected_no_epoch_capture"
+                      ? "start_rejected_zero_offset_integrity_fault"
                       : ((!dac1_ok || !dac2_ok)
                             ? "started_dac_fault"
                             : "started"));
@@ -1194,6 +1195,13 @@ static Payload cmd_start(const Payload& args) {
   p.add("epoch_capture_window_cycles", clocks_alpha_epoch_last_capture_window_cycles());
   p.add("epoch_capture_vclock_valid", clocks_alpha_epoch_last_vclock_capture_valid());
   p.add("epoch_capture_all_lanes_valid", clocks_alpha_epoch_last_all_lanes_valid());
+  p.add("zero_offset_vclock_counter32", clocks_alpha_epoch_last_vclock_counter32());
+  p.add("zero_offset_ocxo1_counter32", clocks_alpha_epoch_last_ocxo1_counter32());
+  p.add("zero_offset_ocxo2_counter32", clocks_alpha_epoch_last_ocxo2_counter32());
+  p.add("zero_offset_vclock_hardware16_observed", (uint32_t)clocks_alpha_epoch_last_vclock_hardware16_observed());
+  p.add("zero_offset_vclock_hardware16_selected", (uint32_t)clocks_alpha_epoch_last_vclock_hardware16_selected());
+  p.add("zero_offset_ocxo1_hardware16", (uint32_t)clocks_alpha_epoch_last_ocxo1_hardware16());
+  p.add("zero_offset_ocxo2_hardware16", (uint32_t)clocks_alpha_epoch_last_ocxo2_hardware16());
   p.add("ocxo1_dac", ocxo1_dac.dac_fractional);
   p.add("ocxo2_dac", ocxo2_dac.dac_fractional);
   p.add("ocxo1_dac_last_write_ok", ocxo1_dac.io_last_write_ok);
@@ -1225,7 +1233,7 @@ static Payload cmd_zero(const Payload&) {
   }
 
   Payload p;
-  p.add("status", zero_ok ? "zero_installed" : "zero_rejected_no_epoch_capture");
+  p.add("status", zero_ok ? "zero_installed" : "zero_rejected_zero_offset_integrity_fault");
   p.add("epoch_owner", "CLOCKS");
   p.add("zero_installed", zero_ok);
   p.add("epoch_sequence", clocks_alpha_epoch_sequence());
@@ -1236,6 +1244,13 @@ static Payload cmd_zero(const Payload&) {
   p.add("epoch_vclock_counter32", clocks_alpha_epoch_last_vclock_counter32());
   p.add("epoch_ocxo1_counter32", clocks_alpha_epoch_last_ocxo1_counter32());
   p.add("epoch_ocxo2_counter32", clocks_alpha_epoch_last_ocxo2_counter32());
+  p.add("zero_offset_vclock_counter32", clocks_alpha_epoch_last_vclock_counter32());
+  p.add("zero_offset_ocxo1_counter32", clocks_alpha_epoch_last_ocxo1_counter32());
+  p.add("zero_offset_ocxo2_counter32", clocks_alpha_epoch_last_ocxo2_counter32());
+  p.add("zero_offset_vclock_hardware16_observed", (uint32_t)clocks_alpha_epoch_last_vclock_hardware16_observed());
+  p.add("zero_offset_vclock_hardware16_selected", (uint32_t)clocks_alpha_epoch_last_vclock_hardware16_selected());
+  p.add("zero_offset_ocxo1_hardware16", (uint32_t)clocks_alpha_epoch_last_ocxo1_hardware16());
+  p.add("zero_offset_ocxo2_hardware16", (uint32_t)clocks_alpha_epoch_last_ocxo2_hardware16());
   p.add("epoch_capture_sequence", clocks_alpha_epoch_last_capture_sequence());
   p.add("epoch_capture_window_cycles", clocks_alpha_epoch_last_capture_window_cycles());
   p.add("epoch_capture_vclock_valid", clocks_alpha_epoch_last_vclock_capture_valid());
@@ -1309,6 +1324,13 @@ static void add_alpha_event_payload(Payload& p,
   p.add("update_count", f.update_count);
   p.add("last_event_dwt", f.last_event_dwt);
   p.add("last_event_counter32", f.last_event_counter32);
+  p.add("zero_offset_counter32", f.zero_offset_counter32);
+  p.add("counter32_delta_since_zero_offset", f.counter32_delta_since_zero_offset);
+  p.add("counter32_delta_since_previous_event", f.counter32_delta_since_previous_event);
+  p.add("logical_ticks64_since_zero", f.logical_ticks64_since_zero);
+  p.add("logical_ns64_since_zero", f.logical_ns64_since_zero);
+
+  // Legacy aliases retained for consumers that still use the old epoch labels.
   p.add("epoch_counter32", f.epoch_counter32);
   p.add("counter32_delta_since_epoch", f.counter32_delta_since_epoch);
   p.add("ns_from_counter32_epoch", f.ns_from_counter32_epoch);
@@ -1464,7 +1486,10 @@ static void add_clock_forensics_payload(Payload& p,
 }
 
 static Payload cmd_report(const Payload&) {
-  Payload p = g_last_fragment.clone();
+  // REPORT must be available before the first TIMEBASE_FRAGMENT exists.
+  // Start from a fresh mutable payload; g_last_fragment is retained only as
+  // the last published fragment cache, not as the report construction base.
+  Payload p;
 
   Payload summary;
   const uint32_t report_dwt = DWT_CYCCNT;
@@ -1510,6 +1535,13 @@ static Payload cmd_report(const Payload&) {
   p.add("epoch_vclock_counter32", clocks_alpha_epoch_last_vclock_counter32());
   p.add("epoch_ocxo1_counter32", clocks_alpha_epoch_last_ocxo1_counter32());
   p.add("epoch_ocxo2_counter32", clocks_alpha_epoch_last_ocxo2_counter32());
+  p.add("zero_offset_vclock_counter32", clocks_alpha_epoch_last_vclock_counter32());
+  p.add("zero_offset_ocxo1_counter32", clocks_alpha_epoch_last_ocxo1_counter32());
+  p.add("zero_offset_ocxo2_counter32", clocks_alpha_epoch_last_ocxo2_counter32());
+  p.add("zero_offset_vclock_hardware16_observed", (uint32_t)clocks_alpha_epoch_last_vclock_hardware16_observed());
+  p.add("zero_offset_vclock_hardware16_selected", (uint32_t)clocks_alpha_epoch_last_vclock_hardware16_selected());
+  p.add("zero_offset_ocxo1_hardware16", (uint32_t)clocks_alpha_epoch_last_ocxo1_hardware16());
+  p.add("zero_offset_ocxo2_hardware16", (uint32_t)clocks_alpha_epoch_last_ocxo2_hardware16());
   p.add("epoch_capture_sequence", clocks_alpha_epoch_last_capture_sequence());
   p.add("epoch_capture_window_cycles", clocks_alpha_epoch_last_capture_window_cycles());
   p.add("epoch_capture_vclock_valid", clocks_alpha_epoch_last_vclock_capture_valid());

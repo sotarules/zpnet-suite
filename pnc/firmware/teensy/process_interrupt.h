@@ -335,9 +335,9 @@ struct pps_t {
 struct pps_vclock_t {
   uint32_t sequence          = 0;
 
-  // Canonical VCLOCK-selected edge expressed in DWT.  Derived from the
-  // PPS GPIO ISR's first-instruction _raw capture plus a fixed offset
-  // (CANONICAL_VCLOCK_EPOCH_MINUS_RAW_PPS_ISR_CYCLES).
+  // Canonical VCLOCK-selected edge expressed in DWT.  During rebootstrap this
+  // may be back-projected from the VCLOCK cadence rail; steady-state bookends
+  // are authored directly by the VCLOCK/TimePop cadence event path.
   uint32_t dwt_at_edge       = 0;
 
   // process_interrupt-authored synthetic VCLOCK counter identity of the
@@ -413,10 +413,10 @@ struct pps_edge_snapshot_t {
 // ============================================================================
 //
 // Authored on every PPS GPIO ISR from the ISR opening custody window.  Raw
-// 16-bit hardware counter reads are intentionally not exposed here; they are
-// translated immediately inside process_interrupt into synthetic 32-bit lane
-// coordinates.  ZERO can select this packet asynchronously without waiting for
-// the next PPS edge.
+// 16-bit hardware counter reads are retained here only as forensic evidence.
+// Runtime math consumes the process_interrupt-authored synthetic 32-bit lane
+// coordinates below; ZERO can select this packet asynchronously without waiting
+// for the next PPS edge.
 
 struct interrupt_epoch_capture_t {
   bool     valid = false;
@@ -434,12 +434,23 @@ struct interrupt_epoch_capture_t {
   // advanced to this sequence.
   uint32_t vclock_dwt_at_edge = 0;
 
-  // vclock_capture_valid is the operational requirement.  If VCLOCK is wrong,
-  // the packet cannot be used as a clock epoch source.  all_lanes_capture_valid
-  // is a quality flag: OCXO one-tick ambiguity is diagnostic rather than fatal.
+  // Both validity flags are hard requirements for CLOCKS.ZERO/START.  If any
+  // required lane capture is missing or the custody window is too wide, CLOCKS
+  // raises a watchdog anomaly immediately.
   bool     vclock_capture_valid = false;
   bool     all_lanes_capture_valid = false;
 
+  // Forensic-only raw/selected low-word captures from the PPS custody window.
+  // These are never timing authority; they let reports prove how the synthetic
+  // zero-offset coordinates below were born.
+  uint16_t vclock_hardware16_observed = 0;
+  uint16_t vclock_hardware16_selected = 0;
+  uint16_t ocxo1_hardware16 = 0;
+  uint16_t ocxo2_hardware16 = 0;
+
+  // Synthetic 32-bit coordinates selected as per-lane zero-offset ticks by
+  // CLOCKS.  CLOCKS subtracts these from later event counter32 values and then
+  // extends the deltas into 64-bit logical tick ledgers.
   uint32_t vclock_counter32 = 0;
   uint32_t ocxo1_counter32 = 0;
   uint32_t ocxo2_counter32 = 0;

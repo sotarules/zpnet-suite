@@ -86,7 +86,7 @@ interrupt_capture_diag_t g_ocxo2_interrupt_diag = {};
 bool g_ad5693r_init_ok = false;
 
 // ============================================================================
-// Epoch state
+// Logical-zero / PPS-VCLOCK anchor state
 // ============================================================================
 
 static volatile bool g_epoch_initialized = false;
@@ -395,6 +395,8 @@ static inline bool epoch_ready(void) {
 
 static inline uint64_t ns_from_counter32_epoch(uint32_t counter32,
                                                uint32_t epoch_counter32) {
+  // Legacy bounded-window helper.  Long-lived lane ledgers must use the
+  // alpha_ticks64_* path so 10 MHz time does not wrap at 2^32 ticks.
   return (uint64_t)((uint32_t)(counter32 - epoch_counter32)) *
          (uint64_t)NS_PER_10MHZ_TICK;
 }
@@ -404,9 +406,9 @@ static inline uint64_t ns_from_counter32_epoch(uint32_t counter32,
 // ============================================================================
 //
 // This is intentionally report-only.  Alpha records the exact event facts and
-// epoch-relative arithmetic it applied for each lane before handing that event
-// to process_time's generalized clock projection model.  This lets REPORT
-// distinguish event/epoch errors from projection-to-report-DWT errors.
+// zero-offset-relative arithmetic it applied for each lane before handing that
+// event to process_time's generalized clock projection model.  This lets REPORT
+// distinguish event/zero-offset errors from projection-to-report-DWT errors.
 
 struct alpha_lane_forensics_store_t {
   volatile uint32_t seq = 0;
@@ -415,6 +417,14 @@ struct alpha_lane_forensics_store_t {
 
   uint32_t last_event_dwt = 0;
   uint32_t last_event_counter32 = 0;
+
+  uint32_t zero_offset_counter32 = 0;
+  uint32_t counter32_delta_since_zero_offset = 0;
+  uint32_t counter32_delta_since_previous_event = 0;
+  uint64_t logical_ticks64_since_zero = 0;
+  uint64_t logical_ns64_since_zero = 0;
+
+  // Legacy names retained for report/back-compat surfaces.
   uint32_t epoch_counter32 = 0;
   uint32_t counter32_delta_since_epoch = 0;
   uint64_t ns_from_counter32_epoch = 0;
@@ -449,6 +459,26 @@ static alpha_lane_forensics_store_t g_vclock_forensics = {};
 static alpha_lane_forensics_store_t g_ocxo1_forensics = {};
 static alpha_lane_forensics_store_t g_ocxo2_forensics = {};
 
+// Alpha owns the long logical tick ledgers for the three 10 MHz lanes.
+// process_interrupt emits compact synthetic counter32 event identities; alpha
+// subtracts the per-lane zero-offset counter32 once, then extends subsequent
+// event-to-event deltas into 64-bit tick totals so a campaign cannot wrap at
+// the 32-bit / 10 MHz boundary (~429.5 s).  A zero-offset install is an
+// integrity operation: if the complete capture is not available, alpha raises
+// a watchdog anomaly rather than continuing with partial timing authority.
+struct alpha_lane_logical_ticks_t {
+  bool     have_event = false;
+  uint32_t zero_offset_counter32 = 0;
+  uint32_t last_event_counter32 = 0;
+  uint32_t counter32_delta_since_previous_event = 0;
+  uint64_t logical_ticks64_since_zero = 0;
+  uint32_t update_count = 0;
+};
+
+static alpha_lane_logical_ticks_t g_vclock_ticks64 = {};
+static alpha_lane_logical_ticks_t g_ocxo1_ticks64 = {};
+static alpha_lane_logical_ticks_t g_ocxo2_ticks64 = {};
+
 static inline void clocks_alpha_dmb(void) {
   __asm__ volatile ("dmb" ::: "memory");
 }
@@ -462,6 +492,88 @@ static alpha_lane_forensics_store_t* alpha_forensics_store(time_clock_id_t clock
   }
 }
 
+static alpha_lane_logical_ticks_t* alpha_ticks64_store(time_clock_id_t clock) {
+  switch (clock) {
+    case time_clock_id_t::VCLOCK: return &g_vclock_ticks64;
+    case time_clock_id_t::OCXO1:  return &g_ocxo1_ticks64;
+    case time_clock_id_t::OCXO2:  return &g_ocxo2_ticks64;
+    default:                     return nullptr;
+  }
+}
+
+static void alpha_ticks64_reset_store(alpha_lane_logical_ticks_t& s) {
+  s = alpha_lane_logical_ticks_t{};
+}
+
+static void alpha_ticks64_reset_all(void) {
+  alpha_ticks64_reset_store(g_vclock_ticks64);
+  alpha_ticks64_reset_store(g_ocxo1_ticks64);
+  alpha_ticks64_reset_store(g_ocxo2_ticks64);
+}
+
+static void alpha_ticks64_install_zero(alpha_lane_logical_ticks_t& s,
+                                       uint32_t zero_offset_counter32) {
+  s = alpha_lane_logical_ticks_t{};
+  s.zero_offset_counter32 = zero_offset_counter32;
+  s.last_event_counter32 = zero_offset_counter32;
+}
+
+static bool alpha_ticks64_apply_event(time_clock_id_t clock,
+                                      uint32_t event_counter32,
+                                      uint32_t fallback_zero_offset_counter32,
+                                      uint64_t* out_ticks64,
+                                      uint64_t* out_ns64,
+                                      uint32_t* out_delta_since_zero_offset,
+                                      uint32_t* out_delta_since_previous_event) {
+  alpha_lane_logical_ticks_t* s = alpha_ticks64_store(clock);
+  if (!s) return false;
+
+  const uint32_t zero_offset = s->zero_offset_counter32;
+  const uint32_t delta_since_zero = event_counter32 - zero_offset;
+  uint32_t delta_since_previous = 0;
+
+  if (!s->have_event) {
+    delta_since_previous = delta_since_zero;
+    s->logical_ticks64_since_zero = (uint64_t)delta_since_zero;
+    s->have_event = true;
+  } else {
+    delta_since_previous = event_counter32 - s->last_event_counter32;
+    s->logical_ticks64_since_zero += (uint64_t)delta_since_previous;
+  }
+
+  s->last_event_counter32 = event_counter32;
+  s->counter32_delta_since_previous_event = delta_since_previous;
+  s->update_count++;
+
+  if (out_ticks64) *out_ticks64 = s->logical_ticks64_since_zero;
+  if (out_ns64) *out_ns64 = s->logical_ticks64_since_zero * (uint64_t)NS_PER_10MHZ_TICK;
+  if (out_delta_since_zero_offset) *out_delta_since_zero_offset = delta_since_zero;
+  if (out_delta_since_previous_event) *out_delta_since_previous_event = delta_since_previous;
+
+  (void)fallback_zero_offset_counter32;
+  return true;
+}
+
+static bool alpha_ticks64_project_counter32(time_clock_id_t clock,
+                                            uint32_t counter32,
+                                            uint64_t* out_ticks64,
+                                            uint64_t* out_ns64) {
+  const alpha_lane_logical_ticks_t* s = alpha_ticks64_store(clock);
+  if (!s || !epoch_ready()) return false;
+
+  uint64_t ticks = 0;
+  if (s->have_event) {
+    ticks = s->logical_ticks64_since_zero +
+            (uint64_t)((uint32_t)(counter32 - s->last_event_counter32));
+  } else {
+    ticks = (uint64_t)((uint32_t)(counter32 - s->zero_offset_counter32));
+  }
+
+  if (out_ticks64) *out_ticks64 = ticks;
+  if (out_ns64) *out_ns64 = ticks * (uint64_t)NS_PER_10MHZ_TICK;
+  return true;
+}
+
 static void alpha_forensics_reset_store(alpha_lane_forensics_store_t& s) {
   s.seq++;
   clocks_alpha_dmb();
@@ -470,6 +582,11 @@ static void alpha_forensics_reset_store(alpha_lane_forensics_store_t& s) {
   s.update_count = 0;
   s.last_event_dwt = 0;
   s.last_event_counter32 = 0;
+  s.zero_offset_counter32 = 0;
+  s.counter32_delta_since_zero_offset = 0;
+  s.counter32_delta_since_previous_event = 0;
+  s.logical_ticks64_since_zero = 0;
+  s.logical_ns64_since_zero = 0;
   s.epoch_counter32 = 0;
   s.counter32_delta_since_epoch = 0;
   s.ns_from_counter32_epoch = 0;
@@ -510,7 +627,10 @@ static void alpha_forensics_publish(time_clock_id_t clock_id,
                                     const clock_measurement_t& meas,
                                     const interrupt_event_t& event,
                                     const interrupt_capture_diag_t* diag,
-                                    uint32_t epoch_counter32,
+                                    uint32_t zero_offset_counter32,
+                                    uint32_t counter32_delta_since_zero_offset,
+                                    uint32_t counter32_delta_since_previous_event,
+                                    uint64_t logical_ticks64_since_zero,
                                     uint64_t ns_now) {
   alpha_lane_forensics_store_t* s = alpha_forensics_store(clock_id);
   if (!s) return;
@@ -540,8 +660,13 @@ static void alpha_forensics_publish(time_clock_id_t clock_id,
   s->update_count++;
   s->last_event_dwt = event.dwt_at_event;
   s->last_event_counter32 = event.counter32_at_event;
-  s->epoch_counter32 = epoch_counter32;
-  s->counter32_delta_since_epoch = event.counter32_at_event - epoch_counter32;
+  s->zero_offset_counter32 = zero_offset_counter32;
+  s->counter32_delta_since_zero_offset = counter32_delta_since_zero_offset;
+  s->counter32_delta_since_previous_event = counter32_delta_since_previous_event;
+  s->logical_ticks64_since_zero = logical_ticks64_since_zero;
+  s->logical_ns64_since_zero = ns_now;
+  s->epoch_counter32 = zero_offset_counter32;
+  s->counter32_delta_since_epoch = counter32_delta_since_zero_offset;
   s->ns_from_counter32_epoch = ns_now;
   s->event_gnss_ns = event.gnss_ns_at_event;
   s->previous_event_gnss_ns = previous_event_gnss_ns;
@@ -595,6 +720,11 @@ bool clocks_alpha_lane_forensics(time_clock_id_t clock,
     out->update_count = s->update_count;
     out->last_event_dwt = s->last_event_dwt;
     out->last_event_counter32 = s->last_event_counter32;
+    out->zero_offset_counter32 = s->zero_offset_counter32;
+    out->counter32_delta_since_zero_offset = s->counter32_delta_since_zero_offset;
+    out->counter32_delta_since_previous_event = s->counter32_delta_since_previous_event;
+    out->logical_ticks64_since_zero = s->logical_ticks64_since_zero;
+    out->logical_ns64_since_zero = s->logical_ns64_since_zero;
     out->epoch_counter32 = s->epoch_counter32;
     out->counter32_delta_since_epoch = s->counter32_delta_since_epoch;
     out->ns_from_counter32_epoch = s->ns_from_counter32_epoch;
@@ -661,6 +791,7 @@ static void alpha_reset_canonical_clock_state_for_new_epoch(void) {
   g_ocxo1_interrupt_diag = {};
   g_ocxo2_interrupt_diag = {};
   alpha_forensics_reset_all();
+  alpha_ticks64_reset_all();
 
   dwt_cycle_count_total = 0;
   gnss_raw_64           = 0;
@@ -678,10 +809,11 @@ static void alpha_reset_canonical_clock_state_for_new_epoch(void) {
 // ============================================================================
 //
 // ZERO is no longer delegated to process_epoch.  process_interrupt continuously
-// authors an epoch-ready PPS capture packet in ISR context.  Alpha selects the
-// latest valid packet, installs local canonical nanosecond/cycle ledgers, and
-// notifies process_time/process_timepop that the VCLOCK coordinate generation
-// has changed.  Raw hardware counters are not written here.
+// authors a zero-offset-ready PPS capture packet in ISR context.  Alpha selects
+// the latest valid packet, stores per-lane synthetic counter32 zero offsets,
+// installs local canonical nanosecond/cycle ledgers, and notifies
+// process_time/process_timepop that the VCLOCK coordinate generation has
+// changed.  Raw hardware counters are not written here.
 // ============================================================================
 
 static volatile uint32_t g_alpha_epoch_install_count = 0;
@@ -694,19 +826,40 @@ static volatile uint32_t g_alpha_epoch_last_dwt_at_edge = 0;
 static volatile uint32_t g_alpha_epoch_last_vclock_counter32 = 0;
 static volatile uint32_t g_alpha_epoch_last_ocxo1_counter32 = 0;
 static volatile uint32_t g_alpha_epoch_last_ocxo2_counter32 = 0;
+static volatile uint16_t g_alpha_epoch_last_vclock_hardware16_observed = 0;
+static volatile uint16_t g_alpha_epoch_last_vclock_hardware16_selected = 0;
+static volatile uint16_t g_alpha_epoch_last_ocxo1_hardware16 = 0;
+static volatile uint16_t g_alpha_epoch_last_ocxo2_hardware16 = 0;
 static volatile uint32_t g_alpha_epoch_sequence = 0;
 static char              g_alpha_epoch_last_reason[32] = {0};
 
+static bool alpha_zero_offset_integrity_fault(const char* fault,
+                                             const interrupt_epoch_capture_t& cap) {
+  g_alpha_epoch_install_failures++;
+  clocks_watchdog_anomaly(fault ? fault : "zero_offset_integrity_fault",
+                          cap.sequence,
+                          cap.capture_window_cycles,
+                          cap.vclock_dwt_at_edge,
+                          cap.vclock_counter32);
+  return false;
+}
+
 bool clocks_alpha_zero_from_interrupt_capture(const char* reason) {
   interrupt_epoch_capture_t cap{};
-  if (!interrupt_last_epoch_capture(&cap) || !cap.valid || !cap.vclock_capture_valid) {
-    g_alpha_epoch_install_failures++;
-    return false;
+  if (!interrupt_last_epoch_capture(&cap)) {
+    return alpha_zero_offset_integrity_fault("zero_offset_capture_unavailable", cap);
+  }
+
+  if (!cap.valid) {
+    return alpha_zero_offset_integrity_fault("zero_offset_capture_invalid", cap);
+  }
+
+  if (!cap.vclock_capture_valid || !cap.all_lanes_capture_valid) {
+    return alpha_zero_offset_integrity_fault("zero_offset_capture_incomplete", cap);
   }
 
   if (cap.vclock_dwt_at_edge == 0) {
-    g_alpha_epoch_install_failures++;
-    return false;
+    return alpha_zero_offset_integrity_fault("zero_offset_vclock_dwt_zero", cap);
   }
 
   alpha_reset_canonical_clock_state_for_new_epoch();
@@ -717,6 +870,10 @@ bool clocks_alpha_zero_from_interrupt_capture(const char* reason) {
   g_prev_dwt_at_vclock_event = cap.vclock_dwt_at_edge;
   g_prev_pps_vclock_dwt_at_edge = cap.vclock_dwt_at_edge;
   g_prev_pps_vclock_dwt_at_edge_valid = true;
+
+  alpha_ticks64_install_zero(g_vclock_ticks64, cap.vclock_counter32);
+  alpha_ticks64_install_zero(g_ocxo1_ticks64, cap.ocxo1_counter32);
+  alpha_ticks64_install_zero(g_ocxo2_ticks64, cap.ocxo2_counter32);
 
   clock_mark_epoch_zero(g_vclock_clock);
   clock_mark_epoch_zero(g_ocxo1_clock);
@@ -745,6 +902,10 @@ bool clocks_alpha_zero_from_interrupt_capture(const char* reason) {
   g_alpha_epoch_last_vclock_counter32 = cap.vclock_counter32;
   g_alpha_epoch_last_ocxo1_counter32 = cap.ocxo1_counter32;
   g_alpha_epoch_last_ocxo2_counter32 = cap.ocxo2_counter32;
+  g_alpha_epoch_last_vclock_hardware16_observed = cap.vclock_hardware16_observed;
+  g_alpha_epoch_last_vclock_hardware16_selected = cap.vclock_hardware16_selected;
+  g_alpha_epoch_last_ocxo1_hardware16 = cap.ocxo1_hardware16;
+  g_alpha_epoch_last_ocxo2_hardware16 = cap.ocxo2_hardware16;
   safeCopy(g_alpha_epoch_last_reason, sizeof(g_alpha_epoch_last_reason),
            (reason && *reason) ? reason : "unknown");
   g_alpha_epoch_install_count++;
@@ -763,6 +924,10 @@ uint32_t clocks_alpha_epoch_last_dwt_at_edge(void) { return g_alpha_epoch_last_d
 uint32_t clocks_alpha_epoch_last_vclock_counter32(void) { return g_alpha_epoch_last_vclock_counter32; }
 uint32_t clocks_alpha_epoch_last_ocxo1_counter32(void) { return g_alpha_epoch_last_ocxo1_counter32; }
 uint32_t clocks_alpha_epoch_last_ocxo2_counter32(void) { return g_alpha_epoch_last_ocxo2_counter32; }
+uint16_t clocks_alpha_epoch_last_vclock_hardware16_observed(void) { return g_alpha_epoch_last_vclock_hardware16_observed; }
+uint16_t clocks_alpha_epoch_last_vclock_hardware16_selected(void) { return g_alpha_epoch_last_vclock_hardware16_selected; }
+uint16_t clocks_alpha_epoch_last_ocxo1_hardware16(void) { return g_alpha_epoch_last_ocxo1_hardware16; }
+uint16_t clocks_alpha_epoch_last_ocxo2_hardware16(void) { return g_alpha_epoch_last_ocxo2_hardware16; }
 const char* clocks_alpha_epoch_last_reason(void) { return g_alpha_epoch_last_reason; }
 bool clocks_alpha_epoch_initialized(void) { return g_epoch_initialized; }
 
@@ -774,10 +939,28 @@ static void clocks_apply_epoch_counter_edge(clock_state_t& clock,
                                             clock_measurement_t& meas,
                                             const interrupt_event_t& event,
                                             const interrupt_capture_diag_t* diag,
-                                            uint32_t epoch_counter32,
+                                            uint32_t zero_offset_counter32,
                                             time_clock_id_t time_clock) {
-  const uint64_t ns_now =
-      ns_from_counter32_epoch(event.counter32_at_event, epoch_counter32);
+  uint64_t logical_ticks64 = 0;
+  uint64_t ns_now = 0;
+  uint32_t counter32_delta_since_zero_offset = 0;
+  uint32_t counter32_delta_since_previous_event = 0;
+
+  if (!alpha_ticks64_apply_event(time_clock,
+                                 event.counter32_at_event,
+                                 zero_offset_counter32,
+                                 &logical_ticks64,
+                                 &ns_now,
+                                 &counter32_delta_since_zero_offset,
+                                 &counter32_delta_since_previous_event)) {
+    clocks_watchdog_anomaly("zero_offset_lane_store_missing",
+                            (uint32_t)time_clock,
+                            event.counter32_at_event,
+                            zero_offset_counter32,
+                            event.dwt_at_event);
+    return;
+  }
+
   (void)time_clock_update(time_clock, event.dwt_at_event, ns_now);
 
   const bool had_previous = (meas.prev_dwt_at_edge != 0);
@@ -842,7 +1025,11 @@ static void clocks_apply_epoch_counter_edge(clock_state_t& clock,
   meas.prev_dwt_at_edge = event.dwt_at_event;
 
   alpha_forensics_publish(time_clock, clock, meas, event, diag,
-                          epoch_counter32, ns_now);
+                          zero_offset_counter32,
+                          counter32_delta_since_zero_offset,
+                          counter32_delta_since_previous_event,
+                          logical_ticks64,
+                          ns_now);
 }
 
 static inline bool usable_clock_event(const interrupt_event_t&) {
@@ -935,9 +1122,13 @@ static void update_pps_vclock_bridge_anchor(const pps_edge_snapshot_t& snap) {
 
   const uint32_t dwt_between_pps = snap.dwt_at_edge - g_prev_pps_vclock_dwt_at_edge;
 
-  const uint64_t vclock_ns =
-      ns_from_counter32_epoch(snap.counter32_at_edge,
-                              g_alpha_epoch_last_vclock_counter32);
+  uint64_t vclock_ns = 0;
+  if (!alpha_ticks64_project_counter32(time_clock_id_t::VCLOCK,
+                                       snap.counter32_at_edge,
+                                       nullptr,
+                                       &vclock_ns)) {
+    return;
+  }
   g_gnss_ns_at_pps_vclock = vclock_ns;
   g_vclock_clock.ns_count_at_pps_vclock = vclock_ns;
 
