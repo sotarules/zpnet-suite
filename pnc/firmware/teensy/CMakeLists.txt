@@ -67,6 +67,7 @@ set(ZPNET_SOURCES
     process.cpp
     process_clocks_alpha.cpp
     process_clocks_beta.cpp
+    process_clocks_gamma.cpp
     process_events.cpp
     process_laser.cpp
     process_performance.cpp

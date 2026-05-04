@@ -2,6 +2,7 @@
 
 #include <stdint.h>
 #include "process.h"
+#include "time.h"
 
 // ============================================================================
 // CLOCKS — Authoritative Temporal Subsystem (Teensy) — v12
@@ -16,6 +17,7 @@
 //   • PPS/VCLOCK-selected truth capture
 //   • 1 Hz publication of canonical clock tuple
 //   • Continuous DWT-to-GNSS calibration (campaign-independent)
+//   • Gamma next-second prediction for VCLOCK and OCXO lanes
 //
 // Initialization is split into two phases:
 //
@@ -85,6 +87,50 @@ uint64_t clocks_ocxo1_ns_now(void);
 
 uint64_t clocks_ocxo2_ticks_now(void);
 uint64_t clocks_ocxo2_ns_now(void);
+
+
+// -----------------------------------------------------------------------------
+// CLOCKS Gamma — next-second DWT prediction engine
+// -----------------------------------------------------------------------------
+
+struct clocks_gamma_prediction_snapshot_t {
+  uint32_t clock_id;
+
+  // Last completed clock-second facts.  These are the values that belong in
+  // TIMEBASE_FRAGMENT because they describe the second that just closed.
+  uint32_t completed_edge_count;
+  uint32_t completed_static_prediction_cycles;
+  uint32_t completed_dynamic_prediction_cycles;
+  uint32_t completed_actual_dwt_cycles_between_edges;
+  uint32_t completed_match_count;
+  uint32_t completed_adjust_count;
+  uint32_t completed_ignored_count;
+  int32_t  completed_ignored_min_error_cycles;
+  int32_t  completed_ignored_max_error_cycles;
+  int32_t  completed_last_error_cycles;
+
+  // Current in-flight clock-second facts.  These are report-only forensic
+  // surfaces for the active second.
+  uint32_t edge_count;
+  uint32_t second_start_dwt;
+  uint32_t current_static_prediction_cycles;
+  uint32_t current_dynamic_prediction_cycles;
+  uint32_t current_sample_count;
+  uint32_t current_match_count;
+  uint32_t current_adjust_count;
+  uint32_t current_ignored_count;
+  int32_t  current_ignored_min_error_cycles;
+  int32_t  current_ignored_max_error_cycles;
+  int32_t  current_last_error_cycles;
+  uint32_t current_last_expected_dwt;
+  uint32_t current_last_sample_dwt;
+};
+
+void clocks_gamma_reset_all(void);
+void clocks_gamma_second_edge(time_clock_id_t clock, uint32_t dwt_at_edge);
+void clocks_gamma_100hz_sample(time_clock_id_t clock, uint32_t dwt_at_sample);
+bool clocks_gamma_snapshot(time_clock_id_t clock,
+                           clocks_gamma_prediction_snapshot_t* out);
 
 // -----------------------------------------------------------------------------
 // DWT-to-GNSS calibration (continuous, campaign-independent)

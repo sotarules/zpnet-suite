@@ -409,7 +409,7 @@ struct pps_edge_snapshot_t {
 };
 
 // ============================================================================
-// Zero-offset PPS capture packet
+// Epoch-ready PPS capture packet
 // ============================================================================
 //
 // Authored on every PPS GPIO ISR from the ISR opening custody window.  Raw
@@ -418,7 +418,8 @@ struct pps_edge_snapshot_t {
 // coordinates below; ZERO can select this packet asynchronously without waiting
 // for the next PPS edge.
 
-struct interrupt_zero_offset_capture_t {
+struct interrupt_epoch_capture_t {
+  bool     valid = false;
   uint32_t sequence = 0;
 
   uint32_t capture_dwt_start_raw = 0;
@@ -432,6 +433,12 @@ struct interrupt_zero_offset_capture_t {
   // it does not require the previous PPS_VCLOCK snapshot store to have already
   // advanced to this sequence.
   uint32_t vclock_dwt_at_edge = 0;
+
+  // vclock_capture_valid is the operational requirement.  If VCLOCK is wrong,
+  // the packet cannot be used as a clock epoch source.  all_lanes_capture_valid
+  // is the quality gate for installing OCXO zero offsets from this packet.
+  bool     vclock_capture_valid = false;
+  bool     all_lanes_capture_valid = false;
 
   // Forensic-only raw/selected low-word captures from the PPS custody window.
   // These are never timing authority; they let reports prove how the synthetic
@@ -449,7 +456,7 @@ struct interrupt_zero_offset_capture_t {
   uint32_t ocxo2_counter32 = 0;
 };
 
-bool interrupt_last_zero_offset_capture(interrupt_zero_offset_capture_t* out);
+bool interrupt_last_epoch_capture(interrupt_epoch_capture_t* out);
 
 
 // ============================================================================
@@ -497,7 +504,7 @@ struct interrupt_subscription_t {
 //   2. Call clocks_beta_pps() to publish the fragment.
 //
 // Epoch ZERO no longer depends on this dispatch path; clocks code selects the
-// already-authored interrupt_zero_offset_capture_t when it needs an asynchronous
+// already-authored interrupt_epoch_capture_t when it needs an asynchronous
 // logical epoch.  This callback will be replaced by a PPS_VCLOCK-typed dispatch
 // when alpha migrates.
 

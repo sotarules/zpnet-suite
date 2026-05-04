@@ -48,6 +48,7 @@
 // ============================================================================
 
 #include "process_interrupt.h"
+#include "process_clocks.h"
 
 #include "config.h"
 #include "debug.h"
@@ -132,11 +133,11 @@ static constexpr uint32_t VCLOCK_DWT_REPAIR_MAX_PREDICTION_RESIDUAL_CYCLES = 25;
 static constexpr bool     PPS_VCLOCK_PHASE_WATCHDOG_ENABLED = false;
 static constexpr uint32_t PPS_VCLOCK_PHASE_TOLERANCE_CYCLES = 10;
 
-// Zero-offset-ready PPS capture packet.  The ISR captures the first-instruction DWT
+// Epoch-ready PPS capture packet.  The ISR captures the first-instruction DWT
 // and the three lane hardware counters in one tiny custody window.  DWT runs
 // at ~1.008 GHz, so 101 cycles is roughly one 10 MHz tick.  The packet remains
 // available for the entire following second; ZERO can select it asynchronously.
-static constexpr uint32_t ZERO_OFFSET_CAPTURE_MAX_WINDOW_CYCLES =
+static constexpr uint32_t EPOCH_CAPTURE_MAX_WINDOW_CYCLES =
     (DWT_EXPECTED_PER_PPS + (VCLOCK_COUNTS_PER_SECOND - 1U)) /
     VCLOCK_COUNTS_PER_SECOND;
 
@@ -222,7 +223,7 @@ static pps_vclock_t store_load_pvc(void) {
 }
 
 // ============================================================================
-// Zero-offset PPS capture packet (seqlock)
+// Epoch-ready PPS capture packet (seqlock)
 // ============================================================================
 //
 // This packet is authored on every PPS GPIO ISR from the ISR's opening custody
@@ -231,9 +232,10 @@ static pps_vclock_t store_load_pvc(void) {
 // 32-bit lane coordinates.  ZERO consumers select this already-authored packet
 // later.
 
-struct zero_offset_capture_store_t {
+struct epoch_capture_store_t {
   volatile uint32_t seq = 0;
 
+  volatile bool     valid = false;
   volatile uint32_t sequence = 0;
   volatile uint32_t capture_dwt_start_raw = 0;
   volatile uint32_t capture_dwt_after_vclock_raw = 0;
@@ -243,10 +245,13 @@ struct zero_offset_capture_store_t {
 
   // Latency-adjusted DWT coordinate of the selected PPS_VCLOCK edge,
   // derived directly from the same first-instruction PPS ISR raw capture
-  // that authored this zero-offset packet.  CLOCKS ZERO consumes this field
+  // that authored this epoch-ready packet.  CLOCKS ZERO consumes this field
   // instead of requiring the most recent published PPS_VCLOCK snapshot to
   // have caught up to this GPIO edge.
   volatile uint32_t vclock_dwt_at_edge = 0;
+
+  volatile bool     vclock_capture_valid = false;
+  volatile bool     all_lanes_capture_valid = false;
 
   volatile uint16_t vclock_hardware16_observed = 0;
   volatile uint16_t vclock_hardware16_selected = 0;
@@ -258,65 +263,62 @@ struct zero_offset_capture_store_t {
   volatile uint32_t ocxo2_counter32 = 0;
 };
 
-static zero_offset_capture_store_t g_zero_offset_capture_store;
-static volatile uint32_t g_zero_offset_capture_reject_count = 0;
-static volatile uint32_t g_zero_offset_capture_last_reject_mask = 0;
-static volatile uint32_t g_zero_offset_capture_last_reject_sequence = 0;
-static volatile uint32_t g_zero_offset_capture_last_reject_window_cycles = 0;
+static epoch_capture_store_t g_epoch_capture_store;
 
-static constexpr uint32_t ZERO_OFFSET_REJECT_RUNTIME_NOT_READY = 1u << 0;
-static constexpr uint32_t ZERO_OFFSET_REJECT_VCLOCK_WINDOW     = 1u << 1;
-static constexpr uint32_t ZERO_OFFSET_REJECT_OCXO_NOT_READY    = 1u << 2;
-static constexpr uint32_t ZERO_OFFSET_REJECT_ALL_LANE_WINDOW   = 1u << 3;
-
-static void zero_offset_capture_publish(const interrupt_zero_offset_capture_t& cap) {
-  g_zero_offset_capture_store.seq++;
+static void epoch_capture_publish(const interrupt_epoch_capture_t& cap) {
+  g_epoch_capture_store.seq++;
   dmb_barrier();
 
-  g_zero_offset_capture_store.sequence = cap.sequence;
-  g_zero_offset_capture_store.capture_dwt_start_raw = cap.capture_dwt_start_raw;
-  g_zero_offset_capture_store.capture_dwt_after_vclock_raw = cap.capture_dwt_after_vclock_raw;
-  g_zero_offset_capture_store.capture_dwt_end_raw = cap.capture_dwt_end_raw;
-  g_zero_offset_capture_store.capture_window_cycles = cap.capture_window_cycles;
-  g_zero_offset_capture_store.vclock_read_offset_cycles = cap.vclock_read_offset_cycles;
-  g_zero_offset_capture_store.vclock_dwt_at_edge = cap.vclock_dwt_at_edge;
-  g_zero_offset_capture_store.vclock_hardware16_observed = cap.vclock_hardware16_observed;
-  g_zero_offset_capture_store.vclock_hardware16_selected = cap.vclock_hardware16_selected;
-  g_zero_offset_capture_store.ocxo1_hardware16 = cap.ocxo1_hardware16;
-  g_zero_offset_capture_store.ocxo2_hardware16 = cap.ocxo2_hardware16;
-  g_zero_offset_capture_store.vclock_counter32 = cap.vclock_counter32;
-  g_zero_offset_capture_store.ocxo1_counter32 = cap.ocxo1_counter32;
-  g_zero_offset_capture_store.ocxo2_counter32 = cap.ocxo2_counter32;
+  g_epoch_capture_store.valid = cap.valid;
+  g_epoch_capture_store.sequence = cap.sequence;
+  g_epoch_capture_store.capture_dwt_start_raw = cap.capture_dwt_start_raw;
+  g_epoch_capture_store.capture_dwt_after_vclock_raw = cap.capture_dwt_after_vclock_raw;
+  g_epoch_capture_store.capture_dwt_end_raw = cap.capture_dwt_end_raw;
+  g_epoch_capture_store.capture_window_cycles = cap.capture_window_cycles;
+  g_epoch_capture_store.vclock_read_offset_cycles = cap.vclock_read_offset_cycles;
+  g_epoch_capture_store.vclock_dwt_at_edge = cap.vclock_dwt_at_edge;
+  g_epoch_capture_store.vclock_capture_valid = cap.vclock_capture_valid;
+  g_epoch_capture_store.all_lanes_capture_valid = cap.all_lanes_capture_valid;
+  g_epoch_capture_store.vclock_hardware16_observed = cap.vclock_hardware16_observed;
+  g_epoch_capture_store.vclock_hardware16_selected = cap.vclock_hardware16_selected;
+  g_epoch_capture_store.ocxo1_hardware16 = cap.ocxo1_hardware16;
+  g_epoch_capture_store.ocxo2_hardware16 = cap.ocxo2_hardware16;
+  g_epoch_capture_store.vclock_counter32 = cap.vclock_counter32;
+  g_epoch_capture_store.ocxo1_counter32 = cap.ocxo1_counter32;
+  g_epoch_capture_store.ocxo2_counter32 = cap.ocxo2_counter32;
 
   dmb_barrier();
-  g_zero_offset_capture_store.seq++;
+  g_epoch_capture_store.seq++;
 }
 
-bool interrupt_last_zero_offset_capture(interrupt_zero_offset_capture_t* out) {
+bool interrupt_last_epoch_capture(interrupt_epoch_capture_t* out) {
   if (!out) return false;
 
   for (int attempt = 0; attempt < 4; attempt++) {
-    const uint32_t s1 = g_zero_offset_capture_store.seq;
+    const uint32_t s1 = g_epoch_capture_store.seq;
     dmb_barrier();
 
-    out->sequence = g_zero_offset_capture_store.sequence;
-    out->capture_dwt_start_raw = g_zero_offset_capture_store.capture_dwt_start_raw;
-    out->capture_dwt_after_vclock_raw = g_zero_offset_capture_store.capture_dwt_after_vclock_raw;
-    out->capture_dwt_end_raw = g_zero_offset_capture_store.capture_dwt_end_raw;
-    out->capture_window_cycles = g_zero_offset_capture_store.capture_window_cycles;
-    out->vclock_read_offset_cycles = g_zero_offset_capture_store.vclock_read_offset_cycles;
-    out->vclock_dwt_at_edge = g_zero_offset_capture_store.vclock_dwt_at_edge;
-    out->vclock_hardware16_observed = g_zero_offset_capture_store.vclock_hardware16_observed;
-    out->vclock_hardware16_selected = g_zero_offset_capture_store.vclock_hardware16_selected;
-    out->ocxo1_hardware16 = g_zero_offset_capture_store.ocxo1_hardware16;
-    out->ocxo2_hardware16 = g_zero_offset_capture_store.ocxo2_hardware16;
-    out->vclock_counter32 = g_zero_offset_capture_store.vclock_counter32;
-    out->ocxo1_counter32 = g_zero_offset_capture_store.ocxo1_counter32;
-    out->ocxo2_counter32 = g_zero_offset_capture_store.ocxo2_counter32;
+    out->valid = g_epoch_capture_store.valid;
+    out->sequence = g_epoch_capture_store.sequence;
+    out->capture_dwt_start_raw = g_epoch_capture_store.capture_dwt_start_raw;
+    out->capture_dwt_after_vclock_raw = g_epoch_capture_store.capture_dwt_after_vclock_raw;
+    out->capture_dwt_end_raw = g_epoch_capture_store.capture_dwt_end_raw;
+    out->capture_window_cycles = g_epoch_capture_store.capture_window_cycles;
+    out->vclock_read_offset_cycles = g_epoch_capture_store.vclock_read_offset_cycles;
+    out->vclock_dwt_at_edge = g_epoch_capture_store.vclock_dwt_at_edge;
+    out->vclock_capture_valid = g_epoch_capture_store.vclock_capture_valid;
+    out->all_lanes_capture_valid = g_epoch_capture_store.all_lanes_capture_valid;
+    out->vclock_hardware16_observed = g_epoch_capture_store.vclock_hardware16_observed;
+    out->vclock_hardware16_selected = g_epoch_capture_store.vclock_hardware16_selected;
+    out->ocxo1_hardware16 = g_epoch_capture_store.ocxo1_hardware16;
+    out->ocxo2_hardware16 = g_epoch_capture_store.ocxo2_hardware16;
+    out->vclock_counter32 = g_epoch_capture_store.vclock_counter32;
+    out->ocxo1_counter32 = g_epoch_capture_store.ocxo1_counter32;
+    out->ocxo2_counter32 = g_epoch_capture_store.ocxo2_counter32;
 
     dmb_barrier();
-    const uint32_t s2 = g_zero_offset_capture_store.seq;
-    if (s1 == s2 && (s1 & 1u) == 0u) return out->sequence != 0;
+    const uint32_t s2 = g_epoch_capture_store.seq;
+    if (s1 == s2 && (s1 & 1u) == 0u) return out->valid;
   }
 
   return false;
@@ -575,6 +577,7 @@ static inline uint32_t abs_i32_to_u32_local(int32_t v) {
 }
 
 struct dwt_repair_diag_t {
+  bool     valid = false;
   bool     candidate = false;
   bool     synthetic = false;   // operational replacement applied; currently false
   uint32_t original_dwt = 0;
@@ -649,6 +652,7 @@ static uint32_t vclock_cycles_for_ticks(uint32_t vclock_ticks) {
 
 static dwt_repair_diag_t vclock_endpoint_repair_diagnostic(uint32_t observed_dwt) {
   dwt_repair_diag_t r{};
+  r.valid = false;
   r.candidate = false;
   r.synthetic = false;
   r.original_dwt = observed_dwt;
@@ -1490,6 +1494,11 @@ static void vclock_cadence_timepop_callback(timepop_ctx_t* ctx,
 
   time_dynamic_cps_cadence_update(qtimer_event_dwt, cadence_tick_mod_1000);
 
+  if ((cadence_tick_mod_1000 % 10U) == 0U &&
+      cadence_tick_mod_1000 < TICKS_PER_SECOND_EVENT) {
+    clocks_gamma_100hz_sample(time_clock_id_t::VCLOCK, qtimer_event_dwt);
+  }
+
   if (++g_vclock_lane.tick_mod_1000 >= TICKS_PER_SECOND_EVENT) {
     g_vclock_lane.tick_mod_1000 = 0;
 
@@ -1525,6 +1534,8 @@ static void vclock_cadence_timepop_callback(timepop_ctx_t* ctx,
                                       cadence_counter32,
                                       fired_low16,
                                       pvc_gnss_ns);
+
+    clocks_gamma_second_edge(time_clock_id_t::VCLOCK, qtimer_event_dwt);
 
     emit_one_second_event(*g_rt_vclock, qtimer_event_dwt,
                           cadence_counter32,
@@ -1577,8 +1588,21 @@ static void handle_ocxo_qtimer16_irq(ocxo_lane_t& lane,
     lane.logical_count32_at_last_second += OCXO_INTERVAL_COUNTS;
   }
 
+  const uint32_t next_tick_mod_1000 = lane.tick_mod_1000 + 1U;
+  if ((next_tick_mod_1000 % 10U) == 0U &&
+      next_tick_mod_1000 < TICKS_PER_SECOND_EVENT) {
+    clocks_gamma_100hz_sample(rt.desc->kind == interrupt_subscriber_kind_t::OCXO1
+                                  ? time_clock_id_t::OCXO1
+                                  : time_clock_id_t::OCXO2,
+                              qtimer_event_dwt);
+  }
+
   if (++lane.tick_mod_1000 >= TICKS_PER_SECOND_EVENT) {
     lane.tick_mod_1000 = 0;
+    clocks_gamma_second_edge(rt.desc->kind == interrupt_subscriber_kind_t::OCXO1
+                                 ? time_clock_id_t::OCXO1
+                                 : time_clock_id_t::OCXO2,
+                             qtimer_event_dwt);
     emit_one_second_event(rt, qtimer_event_dwt, lane.logical_count32_at_last_second);
   }
 }
@@ -1800,19 +1824,20 @@ void process_interrupt_gpio6789_irq(uint32_t isr_entry_dwt_raw) {
   // DWT raw capture, read the three 10 MHz lane counters in one custody
   // window.  The raw 16-bit reads are retained as forensic-only evidence;
   // runtime timing math consumes the synthetic 32-bit lane coordinates below.
-  const uint32_t zero_capture_start_raw = isr_entry_dwt_raw;
+  const uint32_t epoch_capture_start_raw = isr_entry_dwt_raw;
   const uint16_t hardware_low16 = qtimer1_ch0_counter_now();
-  const uint32_t zero_capture_after_vclock_raw = ARM_DWT_CYCCNT;
+  const uint32_t epoch_capture_after_vclock_raw = ARM_DWT_CYCCNT;
 
-  // VCLOCK is mandatory and QTimer1 CH0 is initialized before IRQs are
-  // enabled.  OCXO raw reads join the zero-offset capture only after QTimer3
-  // lane hardware is initialized.  Incomplete zero-offset captures are rejected
-  // at this ISR boundary and never become selectable CLOCKS.ZERO packets.
+  // Defensive boot rule: VCLOCK is mandatory and QTimer1 CH0 is initialized
+  // before IRQs are enabled.  OCXO raw reads are desirable, but they are not
+  // allowed to become a boot-time dependency unless QTimer3 lane hardware is
+  // known initialized.  This keeps PPS witness/selector work alive even if an
+  // OCXO lane is not ready yet.
   const bool ocxo_capture_hw_ready =
       g_interrupt_hw_ready && g_ocxo1_lane.initialized && g_ocxo2_lane.initialized;
   const uint16_t ocxo1_hardware16 = ocxo_capture_hw_ready ? IMXRT_TMR3.CH[2].CNTR : 0;
   const uint16_t ocxo2_hardware16 = ocxo_capture_hw_ready ? IMXRT_TMR3.CH[3].CNTR : 0;
-  const uint32_t zero_capture_end_raw = ARM_DWT_CYCCNT;
+  const uint32_t epoch_capture_end_raw = ARM_DWT_CYCCNT;
 
   const uint16_t ch3_now = hardware_low16;
 
@@ -1845,47 +1870,33 @@ void process_interrupt_gpio6789_irq(uint32_t isr_entry_dwt_raw) {
   g_gpio_irq_count++;
   g_pps_gpio_heartbeat.edge_count++;
 
-  interrupt_zero_offset_capture_t zero_cap{};
-  zero_cap.sequence = g_pps_gpio_heartbeat.edge_count;
-  zero_cap.capture_dwt_start_raw = zero_capture_start_raw;
-  zero_cap.capture_dwt_after_vclock_raw = zero_capture_after_vclock_raw;
-  zero_cap.capture_dwt_end_raw = zero_capture_end_raw;
-  zero_cap.capture_window_cycles = zero_capture_end_raw - zero_capture_start_raw;
-  zero_cap.vclock_read_offset_cycles =
-      zero_capture_after_vclock_raw - zero_capture_start_raw;
-  zero_cap.vclock_dwt_at_edge =
+  interrupt_epoch_capture_t epoch_cap{};
+  epoch_cap.sequence = g_pps_gpio_heartbeat.edge_count;
+  epoch_cap.capture_dwt_start_raw = epoch_capture_start_raw;
+  epoch_cap.capture_dwt_after_vclock_raw = epoch_capture_after_vclock_raw;
+  epoch_cap.capture_dwt_end_raw = epoch_capture_end_raw;
+  epoch_cap.capture_window_cycles = epoch_capture_end_raw - epoch_capture_start_raw;
+  epoch_cap.vclock_read_offset_cycles =
+      epoch_capture_after_vclock_raw - epoch_capture_start_raw;
+  epoch_cap.vclock_dwt_at_edge =
       pps_vclock_dwt_from_pps_isr_entry_raw(isr_entry_dwt_raw);
-
-  uint32_t zero_reject_mask = 0;
-  if (!g_interrupt_runtime_ready) {
-    zero_reject_mask |= ZERO_OFFSET_REJECT_RUNTIME_NOT_READY;
-  }
-  if (zero_cap.vclock_read_offset_cycles > ZERO_OFFSET_CAPTURE_MAX_WINDOW_CYCLES) {
-    zero_reject_mask |= ZERO_OFFSET_REJECT_VCLOCK_WINDOW;
-  }
-  if (!ocxo_capture_hw_ready) {
-    zero_reject_mask |= ZERO_OFFSET_REJECT_OCXO_NOT_READY;
-  }
-  if (zero_cap.capture_window_cycles > ZERO_OFFSET_CAPTURE_MAX_WINDOW_CYCLES) {
-    zero_reject_mask |= ZERO_OFFSET_REJECT_ALL_LANE_WINDOW;
-  }
-
-  zero_cap.vclock_hardware16_observed = hardware_low16;
-  zero_cap.vclock_hardware16_selected = selected_low16;
-  zero_cap.ocxo1_hardware16 = ocxo1_hardware16;
-  zero_cap.ocxo2_hardware16 = ocxo2_hardware16;
-  zero_cap.vclock_counter32 = selected_counter32;
-  zero_cap.ocxo1_counter32 = ocxo1_counter32;
-  zero_cap.ocxo2_counter32 = ocxo2_counter32;
-
-  if (zero_reject_mask == 0) {
-    zero_offset_capture_publish(zero_cap);
-  } else {
-    g_zero_offset_capture_reject_count++;
-    g_zero_offset_capture_last_reject_mask = zero_reject_mask;
-    g_zero_offset_capture_last_reject_sequence = zero_cap.sequence;
-    g_zero_offset_capture_last_reject_window_cycles = zero_cap.capture_window_cycles;
-  }
+  epoch_cap.vclock_capture_valid =
+      epoch_cap.vclock_read_offset_cycles <= EPOCH_CAPTURE_MAX_WINDOW_CYCLES;
+  epoch_cap.all_lanes_capture_valid =
+      ocxo_capture_hw_ready &&
+      epoch_cap.capture_window_cycles <= EPOCH_CAPTURE_MAX_WINDOW_CYCLES;
+  // A packet is operationally selectable only after interrupt runtime has
+  // finished initialization.  This prevents a boot-time partial capture from
+  // being mistaken for a CLOCKS.ZERO epoch packet.
+  epoch_cap.valid = g_interrupt_runtime_ready && epoch_cap.vclock_capture_valid;
+  epoch_cap.vclock_hardware16_observed = hardware_low16;
+  epoch_cap.vclock_hardware16_selected = selected_low16;
+  epoch_cap.ocxo1_hardware16 = ocxo1_hardware16;
+  epoch_cap.ocxo2_hardware16 = ocxo2_hardware16;
+  epoch_cap.vclock_counter32 = selected_counter32;
+  epoch_cap.ocxo1_counter32 = ocxo1_counter32;
+  epoch_cap.ocxo2_counter32 = ocxo2_counter32;
+  epoch_capture_publish(epoch_cap);
 
   if (g_pps_entry_latency_handler) {
     g_pps_entry_latency_handler(g_pps_gpio_heartbeat.edge_count,
@@ -2221,7 +2232,7 @@ void process_interrupt_init(void) {
   g_pps_rebootstrap_count = 0;
 
   g_store = snapshot_store_t{};
-  g_zero_offset_capture_store = zero_offset_capture_store_t{};
+  g_epoch_capture_store = epoch_capture_store_t{};
   pvc_anchor_ring_reset();
   g_bridge_stats_timepop = bridge_anchor_stats_t{};
   g_bridge_stats_ocxo1 = bridge_anchor_stats_t{};
@@ -2233,9 +2244,9 @@ void process_interrupt_init(void) {
   g_ocxo1_clock32 = synthetic_clock32_t{};
   g_ocxo2_clock32 = synthetic_clock32_t{};
 
-  // Birth anchors.  These are not logical ZERO operations; they simply make
-  // process_interrupt's synthetic coordinate extenders coherent before CLOCKS
-  // installs a user/campaign zero offset.
+  // Defensive birth anchors.  These are not logical ZERO operations; they
+  // simply make process_interrupt's synthetic coordinate extenders safe before
+  // CLOCKS has installed a user/campaign epoch.
   if (g_interrupt_hw_ready) {
     vclock_clock_bootstrap_from_hw16(qtimer1_ch0_counter_now());
     if (g_ocxo1_lane.initialized) {
@@ -2377,25 +2388,24 @@ static Payload cmd_report(const Payload&) {
   p.add("pps_vclock_ch3_at_edge",       (uint32_t)pvc.ch3_at_edge);
   p.add("pps_vclock_gnss_ns_at_edge",   pvc.gnss_ns_at_edge);
 
-  interrupt_zero_offset_capture_t zero_cap{};
-  const bool zero_cap_loaded = interrupt_last_zero_offset_capture(&zero_cap);
-  p.add("zero_offset_capture_available", zero_cap_loaded);
-  p.add("zero_offset_capture_sequence", zero_cap.sequence);
-  p.add("zero_offset_capture_window_cycles", zero_cap.capture_window_cycles);
-  p.add("zero_offset_capture_max_window_cycles", ZERO_OFFSET_CAPTURE_MAX_WINDOW_CYCLES);
-  p.add("zero_offset_capture_vclock_read_offset_cycles", zero_cap.vclock_read_offset_cycles);
-  p.add("zero_offset_capture_vclock_dwt_at_edge", zero_cap.vclock_dwt_at_edge);
-  p.add("zero_offset_capture_vclock_hardware16_observed", (uint32_t)zero_cap.vclock_hardware16_observed);
-  p.add("zero_offset_capture_vclock_hardware16_selected", (uint32_t)zero_cap.vclock_hardware16_selected);
-  p.add("zero_offset_capture_ocxo1_hardware16", (uint32_t)zero_cap.ocxo1_hardware16);
-  p.add("zero_offset_capture_ocxo2_hardware16", (uint32_t)zero_cap.ocxo2_hardware16);
-  p.add("zero_offset_capture_vclock_counter32", zero_cap.vclock_counter32);
-  p.add("zero_offset_capture_ocxo1_counter32", zero_cap.ocxo1_counter32);
-  p.add("zero_offset_capture_ocxo2_counter32", zero_cap.ocxo2_counter32);
-  p.add("zero_offset_capture_reject_count", g_zero_offset_capture_reject_count);
-  p.add("zero_offset_capture_last_reject_mask", g_zero_offset_capture_last_reject_mask);
-  p.add("zero_offset_capture_last_reject_sequence", g_zero_offset_capture_last_reject_sequence);
-  p.add("zero_offset_capture_last_reject_window_cycles", g_zero_offset_capture_last_reject_window_cycles);
+  interrupt_epoch_capture_t epoch_cap{};
+  const bool epoch_cap_ok = interrupt_last_epoch_capture(&epoch_cap);
+  p.add("epoch_capture_available", epoch_cap_ok);
+  p.add("epoch_capture_valid", epoch_cap.valid);
+  p.add("epoch_capture_sequence", epoch_cap.sequence);
+  p.add("epoch_capture_window_cycles", epoch_cap.capture_window_cycles);
+  p.add("epoch_capture_max_window_cycles", EPOCH_CAPTURE_MAX_WINDOW_CYCLES);
+  p.add("epoch_capture_vclock_read_offset_cycles", epoch_cap.vclock_read_offset_cycles);
+  p.add("epoch_capture_vclock_dwt_at_edge", epoch_cap.vclock_dwt_at_edge);
+  p.add("epoch_capture_vclock_valid", epoch_cap.vclock_capture_valid);
+  p.add("epoch_capture_all_lanes_valid", epoch_cap.all_lanes_capture_valid);
+  p.add("epoch_capture_vclock_hardware16_observed", (uint32_t)epoch_cap.vclock_hardware16_observed);
+  p.add("epoch_capture_vclock_hardware16_selected", (uint32_t)epoch_cap.vclock_hardware16_selected);
+  p.add("epoch_capture_ocxo1_hardware16", (uint32_t)epoch_cap.ocxo1_hardware16);
+  p.add("epoch_capture_ocxo2_hardware16", (uint32_t)epoch_cap.ocxo2_hardware16);
+  p.add("epoch_capture_vclock_counter32", epoch_cap.vclock_counter32);
+  p.add("epoch_capture_ocxo1_counter32", epoch_cap.ocxo1_counter32);
+  p.add("epoch_capture_ocxo2_counter32", epoch_cap.ocxo2_counter32);
 
   p.add("pps_edge_dispatch_registered", g_pps_edge_dispatch != nullptr);
 
