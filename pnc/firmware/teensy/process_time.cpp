@@ -52,6 +52,8 @@ static constexpr uint32_t DYNAMIC_CPS_FIRST_MS_AUDIT_COUNT = 9;
 static constexpr uint32_t DYNAMIC_CPS_FIRST_MS_AUDIT_END_MS =
     DYNAMIC_CPS_FIRST_MS_AUDIT_START_MS +
     (DYNAMIC_CPS_FIRST_MS_AUDIT_COUNT - 1U) * DYNAMIC_CPS_FIRST_MS_AUDIT_STEP_MS;
+static constexpr uint32_t PREDICTION_DETAIL_SAMPLE_STEP_MS = 100;
+static constexpr uint32_t PREDICTION_DETAIL_ENDPOINT_MS = 1000;
 
 // ============================================================================
 // Anchor state (written by clocks alpha, read by time readers)
@@ -404,6 +406,18 @@ static inline bool audit_checkpoint_index(uint32_t sample_ms,
   return true;
 }
 
+static inline bool prediction_detail_checkpoint_index(uint32_t sample_ms,
+                                                      uint32_t* out_idx) {
+  if (sample_ms == 0 || sample_ms > PREDICTION_DETAIL_ENDPOINT_MS) return false;
+  if ((sample_ms % PREDICTION_DETAIL_SAMPLE_STEP_MS) != 0U) return false;
+
+  const uint32_t idx = (sample_ms / PREDICTION_DETAIL_SAMPLE_STEP_MS) - 1U;
+  if (idx >= TIME_PREDICTION_DETAIL_SAMPLE_COUNT) return false;
+
+  if (out_idx) *out_idx = idx;
+  return true;
+}
+
 struct fixed_anchor_line_fit_t {
   uint64_t sum_t2_ms2 = 0;
   uint64_t sum_tx_cycles_ms = 0;
@@ -492,6 +506,11 @@ struct dynamic_cps_state_t {
 
   dynamic_cps_first_ms_audit_t first_ms_audit[DYNAMIC_CPS_FIRST_MS_AUDIT_COUNT] = {};
   uint32_t first_ms_audit_valid_count = 0;
+
+  time_prediction_detail_sample_t prediction_detail_current[TIME_PREDICTION_DETAIL_SAMPLE_COUNT] = {};
+  uint32_t prediction_detail_current_count = 0;
+  time_prediction_detail_snapshot_t prediction_detail_completed = {};
+
   uint32_t base_cycles = 0;
   uint32_t current_cycles = 0;
   uint32_t last_reseed_value = 0;
@@ -577,6 +596,8 @@ static bool dynamic_cps_ensure_timepop_client(void);
 static void dynamic_cps_timepop_callback(timepop_ctx_t* ctx,
                                          timepop_diag_t* diag,
                                          void* user_data);
+static void dynamic_cps_publish_prediction_detail_completed_locked(
+    const time_dynamic_cps_record_t& rec);
 
 static void dynamic_cps_note_effectiveness_locked(const time_dynamic_cps_record_t& rec) {
   if (!rec.eval_valid) return;
@@ -672,6 +693,8 @@ static void dynamic_cps_push_record_locked(uint32_t next_actual_cycles) {
   dynamic_cps.last_completed_dynamic_prediction_valid_count = rec.valid ? rec.accepted_samples : 0;
   dynamic_cps.last_completed_dynamic_prediction_adjust_cycles = rec.valid ? rec.net_adjustment_cycles : 0;
 
+  dynamic_cps_publish_prediction_detail_completed_locked(rec);
+
   dynamic_cps.history[dynamic_cps.history_head] = rec;
   dynamic_cps.history_head = (dynamic_cps.history_head + 1U) % DYNAMIC_CPS_HISTORY_CAPACITY;
   if (dynamic_cps.history_count < DYNAMIC_CPS_HISTORY_CAPACITY) {
@@ -686,9 +709,17 @@ static void dynamic_cps_reset_first_ms_audit_locked(void) {
   dynamic_cps.first_ms_audit_valid_count = 0;
 }
 
+static void dynamic_cps_reset_prediction_detail_current_locked(void) {
+  for (uint32_t i = 0; i < TIME_PREDICTION_DETAIL_SAMPLE_COUNT; i++) {
+    dynamic_cps.prediction_detail_current[i] = time_prediction_detail_sample_t{};
+  }
+  dynamic_cps.prediction_detail_current_count = 0;
+}
+
 static void dynamic_cps_reset_second_locked(void) {
   dynamic_cps.fit.reset();
   dynamic_cps_reset_first_ms_audit_locked();
+  dynamic_cps_reset_prediction_detail_current_locked();
   dynamic_cps.last_sample_ms = 0;
   dynamic_cps.last_observed_cycles = 0;
   dynamic_cps.last_used_cycles = 0;
@@ -731,6 +762,7 @@ void time_dynamic_cps_reset(void) {
   dynamic_cps.last_completed_dynamic_prediction_invalid_count = 0;
   dynamic_cps.last_completed_dynamic_prediction_valid_count = 0;
   dynamic_cps.last_completed_dynamic_prediction_adjust_cycles = 0;
+  dynamic_cps.prediction_detail_completed = time_prediction_detail_snapshot_t{};
   dynamic_cps.timepop_client_armed = false;
   dynamic_cps.timepop_arm_count = 0;
   dynamic_cps.timepop_arm_failures = 0;
@@ -871,6 +903,103 @@ static void dynamic_cps_capture_first_ms_audit_locked(uint32_t sample_ms,
   }
 }
 
+static void dynamic_cps_capture_prediction_detail_sample_locked(
+    uint32_t sample_ms,
+    uint32_t observed_cycles,
+    uint32_t event_vclock_ticks,
+    uint32_t dynamic_cycles_before_sample,
+    uint32_t dynamic_cycles_after_sample,
+    int32_t servo_error_cycles,
+    uint32_t servo_abs_error_cycles,
+    bool servo_gated,
+    int32_t servo_correction_cycles) {
+  uint32_t idx = 0;
+  if (!prediction_detail_checkpoint_index(sample_ms, &idx)) return;
+  if (!dynamic_cps.valid || dynamic_cps.base_cycles == 0) return;
+  if (sample_ms >= PREDICTION_DETAIL_ENDPOINT_MS) return;
+
+  time_prediction_detail_sample_t d{};
+  d.populated = true;
+  d.endpoint = false;
+  d.sample_index = idx + 1U;
+  d.sample_ms = sample_ms;
+  d.static_prediction_cycles = dynamic_cps.base_cycles;
+  d.dynamic_prediction_cycles = dynamic_cycles_before_sample;
+  d.dynamic_prediction_after_sample_cycles = dynamic_cycles_after_sample;
+  d.static_prediction_thus_far_cycles =
+      line_cycles_at_ticks(dynamic_cps.base_cycles, event_vclock_ticks);
+  d.dynamic_prediction_thus_far_cycles =
+      line_cycles_at_ticks(dynamic_cycles_before_sample, event_vclock_ticks);
+  d.dynamic_minus_static_thus_far_cycles =
+      (int32_t)((int64_t)d.dynamic_prediction_thus_far_cycles -
+                (int64_t)d.static_prediction_thus_far_cycles);
+  d.actual_cycles_thus_far = observed_cycles;
+  d.residual_cycles = servo_error_cycles;
+  d.abs_residual_cycles = servo_abs_error_cycles;
+  d.gate_threshold_cycles = DYNAMIC_CPS_SERVO_GATE_THRESHOLD_CYCLES;
+  d.accepted = !servo_gated;
+  d.ignored = servo_gated;
+  d.correction_cycles = servo_correction_cycles;
+
+  const bool was_populated = dynamic_cps.prediction_detail_current[idx].populated;
+  dynamic_cps.prediction_detail_current[idx] = d;
+  if (!was_populated &&
+      dynamic_cps.prediction_detail_current_count < TIME_PREDICTION_DETAIL_SAMPLE_COUNT) {
+    dynamic_cps.prediction_detail_current_count++;
+  }
+}
+
+static void dynamic_cps_capture_prediction_detail_endpoint_locked(
+    time_prediction_detail_snapshot_t& snap,
+    const time_dynamic_cps_record_t& rec) {
+  const uint32_t idx = TIME_PREDICTION_DETAIL_SAMPLE_COUNT - 1U;
+  time_prediction_detail_sample_t d{};
+  d.populated = rec.eval_valid;
+  d.endpoint = true;
+  d.sample_index = TIME_PREDICTION_DETAIL_SAMPLE_COUNT;
+  d.sample_ms = PREDICTION_DETAIL_ENDPOINT_MS;
+  d.static_prediction_cycles = rec.base_cycles;
+  d.dynamic_prediction_cycles = rec.final_cycles;
+  d.dynamic_prediction_after_sample_cycles = rec.final_cycles;
+  d.static_prediction_thus_far_cycles = rec.base_cycles;
+  d.dynamic_prediction_thus_far_cycles = rec.final_cycles;
+  d.dynamic_minus_static_thus_far_cycles =
+      (int32_t)((int64_t)d.dynamic_prediction_thus_far_cycles -
+                (int64_t)d.static_prediction_thus_far_cycles);
+  d.actual_cycles_thus_far = rec.next_actual_cycles;
+  d.residual_cycles = rec.dynamic_error_cycles;
+  d.abs_residual_cycles = rec.abs_dynamic_error_cycles;
+  d.gate_threshold_cycles = DYNAMIC_CPS_ENDPOINT_SANITY_TOLERANCE_CYCLES;
+  d.accepted = rec.eval_valid && rec.endpoint_sanity_pass;
+  d.ignored = rec.eval_valid && !rec.endpoint_sanity_pass;
+  d.correction_cycles = 0;
+
+  snap.samples[idx] = d;
+  if (d.populated) snap.sample_count++;
+}
+
+static void dynamic_cps_publish_prediction_detail_completed_locked(
+    const time_dynamic_cps_record_t& rec) {
+  time_prediction_detail_snapshot_t snap{};
+  snap.valid = rec.valid;
+  snap.pvc_sequence = rec.pvc_sequence;
+  snap.anchor_dwt = rec.pvc_dwt_at_edge;
+  snap.static_prediction_cycles = rec.base_cycles;
+  snap.dynamic_final_prediction_cycles = rec.final_cycles;
+  snap.actual_cycles = rec.next_actual_cycles;
+  snap.static_residual_cycles = rec.static_error_cycles;
+  snap.dynamic_residual_cycles = rec.dynamic_error_cycles;
+  snap.sample_capacity = TIME_PREDICTION_DETAIL_SAMPLE_COUNT;
+
+  for (uint32_t i = 0; i < TIME_PREDICTION_DETAIL_SAMPLE_COUNT - 1U; i++) {
+    snap.samples[i] = dynamic_cps.prediction_detail_current[i];
+    if (snap.samples[i].populated) snap.sample_count++;
+  }
+  dynamic_cps_capture_prediction_detail_endpoint_locked(snap, rec);
+
+  dynamic_cps.prediction_detail_completed = snap;
+}
+
 static void time_dynamic_cps_timepop_update(uint32_t fire_dwt,
                                            uint32_t fire_vclock_raw,
                                            uint32_t scheduled_deadline,
@@ -985,6 +1114,16 @@ static void time_dynamic_cps_timepop_update(uint32_t fire_dwt,
                                             abs_servo_error,
                                             servo_gated,
                                             servo_correction);
+
+  dynamic_cps_capture_prediction_detail_sample_locked(sample_ms,
+                                                      observed_cycles,
+                                                      event_vclock_ticks,
+                                                      dynamic_cycles_before_sample,
+                                                      dynamic_cycles_after_sample,
+                                                      servo_error,
+                                                      abs_servo_error,
+                                                      servo_gated,
+                                                      servo_correction);
 
   // Keep the historical fit counters populated for report compatibility, but
   // do not use them to recompute the CPS. Dynamic CPS is now servo-owned.
@@ -1558,6 +1697,27 @@ uint32_t time_dynamic_cps_history(time_dynamic_cps_record_t* out_records,
   }
 
   return n;
+}
+
+bool time_prediction_detail_snapshot(time_prediction_detail_snapshot_t* out) {
+  if (!out) return false;
+
+  for (int attempt = 0; attempt < 4; attempt++) {
+    const uint32_t s1 = dynamic_cps.seq;
+    dmb();
+
+    time_prediction_detail_snapshot_t local = dynamic_cps.prediction_detail_completed;
+
+    dmb();
+    const uint32_t s2 = dynamic_cps.seq;
+    if (s1 == s2 && (s1 & 1u) == 0u) {
+      *out = local;
+      return local.valid;
+    }
+  }
+
+  *out = time_prediction_detail_snapshot_t{};
+  return false;
 }
 
 bool time_dynamic_cps_valid(void) {

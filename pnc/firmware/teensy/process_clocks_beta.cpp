@@ -69,6 +69,7 @@
 #include <math.h>
 #include <stdlib.h>
 #include <climits>
+#include <strings.h>
 
 // ============================================================================
 // Campaign state — definitions
@@ -1654,6 +1655,85 @@ static Payload cmd_report(const Payload&) {
   return p;
 }
 
+static time_clock_id_t prediction_detail_clock_from_args(const Payload& args) {
+  const char* s = args.getString("clock");
+  if (!s || !*s) s = args.getString("lane");
+  if (!s || !*s) return time_clock_id_t::VCLOCK;
+
+  if (!strcasecmp(s, "VCLOCK") || !strcasecmp(s, "GNSS")) return time_clock_id_t::VCLOCK;
+  if (!strcasecmp(s, "OCXO1")) return time_clock_id_t::OCXO1;
+  if (!strcasecmp(s, "OCXO2")) return time_clock_id_t::OCXO2;
+  return time_clock_id_t::NONE;
+}
+
+static const char* prediction_detail_clock_name(time_clock_id_t clock) {
+  switch (clock) {
+    case time_clock_id_t::VCLOCK: return "VCLOCK";
+    case time_clock_id_t::OCXO1:  return "OCXO1";
+    case time_clock_id_t::OCXO2:  return "OCXO2";
+    default:                     return "NONE";
+  }
+}
+
+static Payload cmd_prediction_detail(const Payload& args) {
+  const time_clock_id_t clock = prediction_detail_clock_from_args(args);
+
+  Payload out;
+  out.add("model", "CLOCKS_GAMMA_PREDICTION_DETAIL");
+  out.add("requested_clock", prediction_detail_clock_name(clock));
+
+  if (clock == time_clock_id_t::NONE) {
+    out.add("error", "invalid clock; use clock=VCLOCK, OCXO1, or OCXO2");
+    return out;
+  }
+
+  clocks_gamma_prediction_detail_snapshot_t detail{};
+  const bool snapshot_ok = clocks_gamma_prediction_detail_snapshot(clock, &detail);
+
+  out.add("snapshot_ok", snapshot_ok);
+  out.add("valid", detail.valid);
+  out.add("clock", prediction_detail_clock_name(clock));
+  out.add("clock_id", detail.clock_id);
+  out.add("completed_edge_count", detail.completed_edge_count);
+  out.add("anchor_dwt", detail.anchor_dwt);
+  out.add("static_prediction_cycles", detail.static_prediction_cycles);
+  out.add("dynamic_final_prediction_cycles", detail.dynamic_final_prediction_cycles);
+  out.add("actual_cycles", detail.actual_cycles);
+  out.add("static_residual_cycles", detail.static_residual_cycles);
+  out.add("dynamic_residual_cycles", detail.dynamic_residual_cycles);
+  out.add("sample_count", detail.sample_count);
+  out.add("sample_capacity", detail.sample_capacity);
+  out.add("sample_step_percent", detail.sample_step_percent);
+  out.add("gate_threshold_cycles", detail.gate_threshold_cycles);
+  out.add("note", "Prior completed Gamma lane-local clock-second. Use clock=VCLOCK, OCXO1, or OCXO2. Samples 1-9 are 10%-90% courtroom checkpoints and sample 10 is the closing 100% edge.");
+
+  PayloadArray arr;
+  for (uint32_t i = 0; i < 10U; i++) {
+    const clocks_gamma_prediction_detail_sample_t& s = detail.samples[i];
+    Payload e;
+    e.add("populated", s.populated);
+    e.add("endpoint", s.endpoint);
+    e.add("sample_index", s.sample_index);
+    e.add("sample_percent", s.sample_percent);
+    e.add("static_prediction_cycles", s.static_prediction_cycles);
+    e.add("dynamic_prediction_cycles", s.dynamic_prediction_cycles);
+    e.add("dynamic_prediction_after_sample_cycles", s.dynamic_prediction_after_sample_cycles);
+    e.add("static_prediction_thus_far_cycles", s.static_prediction_thus_far_cycles);
+    e.add("dynamic_prediction_thus_far_cycles", s.dynamic_prediction_thus_far_cycles);
+    e.add("dynamic_minus_static_thus_far_cycles", s.dynamic_minus_static_thus_far_cycles);
+    e.add("actual_cycles_thus_far", s.actual_cycles_thus_far);
+    e.add("residual_cycles", s.residual_cycles);
+    e.add("abs_residual_cycles", s.abs_residual_cycles);
+    e.add("gate_threshold_cycles", s.gate_threshold_cycles);
+    e.add("accepted", s.accepted);
+    e.add("ignored", s.ignored);
+    e.add("correction_cycles", s.correction_cycles);
+    arr.add(e);
+  }
+  out.add_array("samples", arr);
+  return out;
+}
+
 static Payload cmd_set_dac(const Payload& args) {
   ocxo_dac_pacing_abort_all();
 
@@ -1688,6 +1768,7 @@ static const process_command_entry_t CLOCKS_COMMANDS[] = {
   { "ZERO",          cmd_zero          },
   { "RECOVER",       cmd_recover       },
   { "REPORT",        cmd_report        },
+  { "PREDICTION_DETAIL", cmd_prediction_detail },
   { "WATCHDOG_TEST", cmd_watchdog_test },
   { "SET_DAC",       cmd_set_dac       },
   { nullptr,          nullptr           }

@@ -238,6 +238,57 @@ struct time_dynamic_cps_snapshot_t {
   uint32_t history_capacity;
 };
 
+
+// ============================================================================
+// Prior-second prediction detail surface
+// ============================================================================
+//
+// Captured by process_time at 10 representative points from the most recently
+// completed PPS/VCLOCK interval.  Samples 1..9 are authored by the 1 kHz
+// TimePop dynamic-CPS client at 100 ms intervals; sample 10 is authored from
+// the closing PPS/VCLOCK bookend.  The snapshot is retained after the live
+// per-second structure is reset so CLOCKS.PREDICTION_DETAIL can be queried
+// without timing the command inside the current second.
+
+static constexpr uint32_t TIME_PREDICTION_DETAIL_SAMPLE_COUNT = 10;
+
+struct time_prediction_detail_sample_t {
+  bool     populated = false;
+  bool     endpoint = false;
+  uint32_t sample_index = 0;        // 1..10
+  uint32_t sample_ms = 0;           // 100..1000
+
+  uint32_t static_prediction_cycles = 0;
+  uint32_t dynamic_prediction_cycles = 0;
+  uint32_t dynamic_prediction_after_sample_cycles = 0;
+
+  uint32_t static_prediction_thus_far_cycles = 0;
+  uint32_t dynamic_prediction_thus_far_cycles = 0;
+  int32_t  dynamic_minus_static_thus_far_cycles = 0;
+
+  uint32_t actual_cycles_thus_far = 0;
+  int32_t  residual_cycles = 0;
+  uint32_t abs_residual_cycles = 0;
+  uint32_t gate_threshold_cycles = 0;
+  bool     accepted = false;
+  bool     ignored = false;
+  int32_t  correction_cycles = 0;
+};
+
+struct time_prediction_detail_snapshot_t {
+  bool     valid = false;
+  uint32_t pvc_sequence = 0;
+  uint32_t anchor_dwt = 0;
+  uint32_t static_prediction_cycles = 0;
+  uint32_t dynamic_final_prediction_cycles = 0;
+  uint32_t actual_cycles = 0;
+  int32_t  static_residual_cycles = 0;
+  int32_t  dynamic_residual_cycles = 0;
+  uint32_t sample_count = 0;
+  uint32_t sample_capacity = TIME_PREDICTION_DETAIL_SAMPLE_COUNT;
+  time_prediction_detail_sample_t samples[TIME_PREDICTION_DETAIL_SAMPLE_COUNT] = {};
+};
+
 // ============================================================================
 // Core API — forward (DWT → GNSS nanoseconds)
 // ============================================================================
@@ -333,6 +384,7 @@ int32_t  time_dwt_prediction_residual_cycles(void);
 time_dynamic_cps_snapshot_t time_dynamic_cps_snapshot(void);
 uint32_t time_dynamic_cps_history(time_dynamic_cps_record_t* out_records,
                                   uint32_t max_records);
+bool time_prediction_detail_snapshot(time_prediction_detail_snapshot_t* out);
 
 void     time_dynamic_cps_reset(void);
 

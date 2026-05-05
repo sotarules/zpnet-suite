@@ -155,6 +155,50 @@ void clocks_gamma_100hz_sample_at_index(time_clock_id_t clock,
 bool clocks_gamma_snapshot(time_clock_id_t clock,
                            clocks_gamma_prediction_snapshot_t* out);
 
+struct clocks_gamma_prediction_detail_sample_t {
+  bool     populated;
+  bool     endpoint;
+  uint32_t sample_index;
+  uint32_t sample_percent;
+
+  uint32_t static_prediction_cycles;
+  uint32_t dynamic_prediction_cycles;
+  uint32_t dynamic_prediction_after_sample_cycles;
+
+  uint32_t static_prediction_thus_far_cycles;
+  uint32_t dynamic_prediction_thus_far_cycles;
+  int32_t  dynamic_minus_static_thus_far_cycles;
+  uint32_t actual_cycles_thus_far;
+
+  int32_t  residual_cycles;
+  uint32_t abs_residual_cycles;
+  bool     accepted;
+  bool     ignored;
+  int32_t  correction_cycles;
+  uint32_t gate_threshold_cycles;
+};
+
+struct clocks_gamma_prediction_detail_snapshot_t {
+  bool     valid;
+  uint32_t clock_id;
+  uint32_t completed_edge_count;
+  uint32_t anchor_dwt;
+  uint32_t static_prediction_cycles;
+  uint32_t dynamic_final_prediction_cycles;
+  uint32_t actual_cycles;
+  int32_t  static_residual_cycles;
+  int32_t  dynamic_residual_cycles;
+  uint32_t sample_count;
+  uint32_t sample_capacity;
+  uint32_t sample_step_percent;
+  uint32_t gate_threshold_cycles;
+  clocks_gamma_prediction_detail_sample_t samples[10];
+};
+
+bool clocks_gamma_prediction_detail_snapshot(
+    time_clock_id_t clock,
+    clocks_gamma_prediction_detail_snapshot_t* out);
+
 // -----------------------------------------------------------------------------
 // DWT-to-GNSS calibration (continuous, campaign-independent)
 // -----------------------------------------------------------------------------
