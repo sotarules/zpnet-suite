@@ -144,29 +144,19 @@ static constexpr uint32_t EPOCH_CAPTURE_MAX_WINDOW_CYCLES =
 static constexpr uint64_t VCLOCK_CADENCE_PERIOD_NS = 1000000ULL;
 static constexpr const char* VCLOCK_CADENCE_NAME = "VCLOCK_CADENCE";
 
-// OCXO logical-grid cadence.
-//
-// OCXO prediction is lane-local.  It does not ask which OCXO edge is near
-// PPS/VCLOCK, and it does not reconcile OCXO phase to GNSS phase.  After a
-// CLOCKS epoch, each OCXO compare rail is re-authored from that lane's own
-// synthetic counter coordinate:
-//
-//   epoch + 10,000      -> 1 kHz custody event
-//   epoch + 100,000     -> 100 Hz Gamma courtroom sample
-//   epoch + 10,000,000  -> OCXO-local one-second edge
-//
-// The 16-bit QTimer compare register only sees the low word of those targets;
-// process_interrupt retains the 32-bit synthetic identity as the event fact.
-static constexpr uint32_t OCXO_LOGICAL_CADENCE_TICKS = OCXO_INTERVAL_COUNTS;
-static constexpr uint32_t OCXO_LOGICAL_EVENTS_PER_SAMPLE =
-    CLOCKS_GAMMA_TICKS_PER_SAMPLE / OCXO_LOGICAL_CADENCE_TICKS;
-static constexpr uint32_t OCXO_LOGICAL_EVENTS_PER_SECOND =
-    CLOCKS_GAMMA_TICKS_PER_SECOND / OCXO_LOGICAL_CADENCE_TICKS;
+// QTimer3 OCXO DWT authorship.  Single-lane events use the normal ISR-entry
+// DWT correction.  Coupled same-pass OCXO events are reconstructed from one
+// shared pair anchor plus each lane's authored logical compare-target offset.
+// This avoids treating branch/service latency as an OCXO event coordinate.
+static constexpr uint32_t QTIMER3_DWT_SOURCE_NONE = 0;
+static constexpr uint32_t QTIMER3_DWT_SOURCE_ISR_ENTRY = 1;
+static constexpr uint32_t QTIMER3_DWT_SOURCE_PAIR_RECONSTRUCTED = 2;
 
-static_assert((CLOCKS_GAMMA_TICKS_PER_SAMPLE % OCXO_LOGICAL_CADENCE_TICKS) == 0,
-              "Gamma sample grid must be an integer number of OCXO cadence events");
-static_assert((CLOCKS_GAMMA_TICKS_PER_SECOND % OCXO_LOGICAL_CADENCE_TICKS) == 0,
-              "Gamma second grid must be an integer number of OCXO cadence events");
+// If one OCXO flag is pending and its peer compare target is only a few
+// external-clock ticks away, wait briefly and process the pair symmetrically.
+// This converts near-simultaneous CH2/CH3 service into a single coupled event
+// instead of letting the second lane inherit branch latency.
+static constexpr uint32_t QTIMER3_PAIR_COALESCE_TICKS = 16U;
 
 // ============================================================================
 // PPS / PPS_VCLOCK doctrine
@@ -201,21 +191,6 @@ static snapshot_store_t g_store;
 
 static inline void dmb_barrier(void) {
   __asm__ volatile ("dmb" ::: "memory");
-}
-
-static inline uint32_t irq_save(void) {
-  uint32_t primask = 0;
-  __asm__ volatile ("mrs %0, primask\n\tcpsid i"
-                    : "=r" (primask)
-                    :
-                    : "memory");
-  return primask;
-}
-
-static inline void irq_restore(uint32_t primask) {
-  if ((primask & 1u) == 0u) {
-    __asm__ volatile ("cpsie i" ::: "memory");
-  }
 }
 
 static void store_publish(const pps_t& pps, const pps_vclock_t& pvc) {
@@ -992,19 +967,7 @@ struct ocxo_lane_t {
 static ocxo_lane_t g_ocxo1_lane;
 static ocxo_lane_t g_ocxo2_lane;
 
-struct ocxo_logical_grid_t {
-  uint32_t epoch_counter32 = 0;
-  uint32_t next_counter32 = OCXO_LOGICAL_CADENCE_TICKS;
-  uint32_t cadence_event_index = 0;
-  uint32_t epoch_count = 0;
-};
-
-static ocxo_logical_grid_t g_ocxo1_logical_grid;
-static ocxo_logical_grid_t g_ocxo2_logical_grid;
-
 static ocxo_lane_t* ocxo_lane_for(interrupt_subscriber_kind_t kind);
-static void ocxo_lane_regrid(interrupt_subscriber_kind_t kind,
-                             uint32_t epoch_counter32);
 
 // ============================================================================
 // QTimer1 CH0 low-word counter
@@ -1072,6 +1035,38 @@ static volatile interrupt_qtimer1_ch1_handler_fn g_qtimer1_ch1_handler = nullptr
 
 static volatile uint32_t g_qtimer1_ch2_last_target_counter32 = 0;
 static volatile uint32_t g_qtimer1_ch2_arm_count = 0;
+
+static volatile uint32_t g_qtimer3_dual_pending_count = 0;
+static volatile uint32_t g_qtimer3_single_ch2_count = 0;
+static volatile uint32_t g_qtimer3_single_ch3_count = 0;
+static volatile uint32_t g_qtimer3_dual_ch2_first_count = 0;
+static volatile uint32_t g_qtimer3_dual_ch3_first_count = 0;
+static volatile uint32_t g_qtimer3_dual_same_pass_count = 0;
+static volatile uint32_t g_qtimer3_last_dispatch_channel = 0;
+static volatile uint32_t g_qtimer3_last_ch2_late_ticks = 0;
+static volatile uint32_t g_qtimer3_last_ch3_late_ticks = 0;
+static volatile uint32_t g_qtimer3_last_ch2_dwt_raw = 0;
+static volatile uint32_t g_qtimer3_last_ch3_dwt_raw = 0;
+static volatile uint32_t g_qtimer3_last_branch_delta_cycles = 0;
+
+static volatile uint32_t g_qtimer3_pair_reconstruction_count = 0;
+static volatile uint32_t g_qtimer3_pair_coalesce_attempt_count = 0;
+static volatile uint32_t g_qtimer3_pair_coalesce_success_count = 0;
+static volatile uint32_t g_qtimer3_pair_coalesce_timeout_count = 0;
+static volatile uint32_t g_qtimer3_last_pair_coalesce_peer_channel = 0;
+static volatile uint32_t g_qtimer3_last_pair_coalesce_ticks_until_peer = 0;
+static volatile uint32_t g_qtimer3_last_pair_coalesce_wait_cycles = 0;
+
+static volatile uint32_t g_qtimer3_last_pair_base_dwt_raw = 0;
+static volatile uint32_t g_qtimer3_last_pair_base_event_dwt = 0;
+static volatile uint32_t g_qtimer3_last_pair_base_target32 = 0;
+static volatile int32_t  g_qtimer3_last_pair_delta_ticks = 0;
+static volatile int32_t  g_qtimer3_last_pair_ch2_offset_cycles = 0;
+static volatile int32_t  g_qtimer3_last_pair_ch3_offset_cycles = 0;
+static volatile uint32_t g_qtimer3_last_ch2_event_dwt = 0;
+static volatile uint32_t g_qtimer3_last_ch3_event_dwt = 0;
+static volatile uint32_t g_qtimer3_last_ch2_dwt_coordinate_source = QTIMER3_DWT_SOURCE_NONE;
+static volatile uint32_t g_qtimer3_last_ch3_dwt_coordinate_source = QTIMER3_DWT_SOURCE_NONE;
 
 static inline uint32_t clock32_from_ns(uint64_t ns) {
   return (uint32_t)((ns / 100ULL) & 0xFFFFFFFFULL);
@@ -1158,7 +1153,6 @@ bool interrupt_clock32_zero_from_ns(interrupt_subscriber_kind_t kind, uint64_t n
     lane->logical_count32_at_last_second = c->current_counter32;
     lane->tick_mod_1000 = 0;
   }
-  ocxo_lane_regrid(kind, c->current_counter32);
   return true;
 }
 
@@ -1195,25 +1189,6 @@ static inline uint32_t synthetic_clock_advance_at_hardware(synthetic_clock32_t& 
   c.current_ns += (uint64_t)ticks * 100ULL;
   c.hardware16 = hardware16_at_event;
   return c.current_counter32;
-}
-
-static inline uint32_t synthetic_clock_author_counter32_at_hardware(
-    synthetic_clock32_t& c,
-    uint32_t counter32_at_event,
-    uint16_t hardware16_at_event) {
-  synthetic_clock_consume_pending_zero_if_any(c);
-  const uint32_t delta = counter32_at_event - c.current_counter32;
-  c.current_counter32 = counter32_at_event;
-  c.current_ns += (uint64_t)delta * 100ULL;
-  c.hardware16 = hardware16_at_event;
-  return c.current_counter32;
-}
-
-static inline uint16_t synthetic_clock_hardware16_for_counter32(
-    const synthetic_clock32_t& c,
-    uint32_t counter32_target) {
-  return (uint16_t)(c.hardware16 +
-                    (uint16_t)(counter32_target - c.current_counter32));
 }
 
 uint32_t interrupt_qtimer1_counter32_now(void)   { return vclock_synthetic_from_hardware_low16(qtimer1_ch0_counter_now()); }
@@ -1372,82 +1347,6 @@ static ocxo_lane_t* ocxo_lane_for(interrupt_subscriber_kind_t kind) {
   if (kind == interrupt_subscriber_kind_t::OCXO1) return &g_ocxo1_lane;
   if (kind == interrupt_subscriber_kind_t::OCXO2) return &g_ocxo2_lane;
   return nullptr;
-}
-
-static ocxo_logical_grid_t* ocxo_grid_for(interrupt_subscriber_kind_t kind) {
-  if (kind == interrupt_subscriber_kind_t::OCXO1) return &g_ocxo1_logical_grid;
-  if (kind == interrupt_subscriber_kind_t::OCXO2) return &g_ocxo2_logical_grid;
-  return nullptr;
-}
-
-static time_clock_id_t ocxo_time_clock_for(interrupt_subscriber_kind_t kind) {
-  return (kind == interrupt_subscriber_kind_t::OCXO1)
-      ? time_clock_id_t::OCXO1
-      : time_clock_id_t::OCXO2;
-}
-
-static void ocxo_grid_reset(ocxo_logical_grid_t& grid,
-                            uint32_t epoch_counter32) {
-  grid.epoch_counter32 = epoch_counter32;
-  grid.next_counter32 = epoch_counter32 + OCXO_LOGICAL_CADENCE_TICKS;
-  grid.cadence_event_index = 0;
-  grid.epoch_count++;
-}
-
-static void ocxo_lane_program_grid_compare(interrupt_subscriber_kind_t kind,
-                                           ocxo_lane_t& lane,
-                                           const ocxo_logical_grid_t& grid) {
-  synthetic_clock32_t* c = synthetic_clock_for_kind(kind);
-  lane.compare_target = c
-      ? synthetic_clock_hardware16_for_counter32(*c, grid.next_counter32)
-      : (uint16_t)(grid.next_counter32 & 0xFFFFU);
-  qtimer3_program_compare(lane.channel, lane.compare_target);
-}
-
-static uint32_t ocxo_current_counter32(interrupt_subscriber_kind_t kind) {
-  synthetic_clock32_t* c = synthetic_clock_for_kind(kind);
-  if (!c) return 0;
-
-  if (kind == interrupt_subscriber_kind_t::OCXO1) {
-    return project_counter32_from_hw16(*c, IMXRT_TMR3.CH[2].CNTR);
-  }
-
-  if (kind == interrupt_subscriber_kind_t::OCXO2) {
-    return project_counter32_from_hw16(*c, IMXRT_TMR3.CH[3].CNTR);
-  }
-
-  return 0;
-}
-
-static void ocxo_lane_regrid(interrupt_subscriber_kind_t kind,
-                             uint32_t epoch_counter32) {
-  ocxo_lane_t* lane = ocxo_lane_for(kind);
-  ocxo_logical_grid_t* grid = ocxo_grid_for(kind);
-  if (!lane || !grid) return;
-
-  ocxo_grid_reset(*grid, epoch_counter32);
-  lane->phase_bootstrapped = true;
-  lane->bootstrap_count++;
-  lane->tick_mod_1000 = 0;
-  lane->logical_count32_at_last_second = epoch_counter32;
-
-  if (lane->active) {
-    ocxo_lane_program_grid_compare(kind, *lane, *grid);
-  }
-}
-
-static void ocxo_lane_regrid_from_current(interrupt_subscriber_kind_t kind) {
-  ocxo_lane_regrid(kind, ocxo_current_counter32(kind));
-}
-
-void interrupt_ocxo_logical_grid_epoch(uint32_t ocxo1_epoch_counter32,
-                                       uint32_t ocxo2_epoch_counter32) {
-  const uint32_t primask = irq_save();
-
-  ocxo_lane_regrid(interrupt_subscriber_kind_t::OCXO1, ocxo1_epoch_counter32);
-  ocxo_lane_regrid(interrupt_subscriber_kind_t::OCXO2, ocxo2_epoch_counter32);
-
-  irq_restore(primask);
 }
 
 static const char* dispatch_timer_name(interrupt_subscriber_kind_t kind) {
@@ -1698,66 +1597,135 @@ static void vclock_cadence_timepop_callback(timepop_ctx_t* ctx,
 // OCXO lanes — QTimer3 CH2 / CH3
 // ============================================================================
 
-static void handle_ocxo_qtimer16_irq(ocxo_lane_t& lane,
-                                     interrupt_subscriber_runtime_t& rt,
-                                     uint32_t isr_entry_dwt_raw) {
-  const uint32_t qtimer_event_dwt = qtimer_event_dwt_from_isr_entry_raw(isr_entry_dwt_raw);
+static void ocxo_lane_arm_bootstrap(ocxo_lane_t& lane) {
+  lane.phase_bootstrapped = true;
+  lane.bootstrap_count++;
+  lane.tick_mod_1000 = 0;
+  lane.compare_target = (uint16_t)(lane.compare_target + (uint16_t)OCXO_INTERVAL_COUNTS);
+  qtimer3_program_compare(lane.channel, lane.compare_target);
+}
+
+static void ocxo_lane_advance_compare(ocxo_lane_t& lane) {
+  lane.compare_target = (uint16_t)(lane.compare_target + (uint16_t)OCXO_INTERVAL_COUNTS);
+  qtimer3_program_compare(lane.channel, lane.compare_target);
+}
+
+static inline uint32_t qtimer3_abs_i32_to_u32(int32_t v) {
+  return (v < 0) ? (uint32_t)(-(int64_t)v) : (uint32_t)v;
+}
+
+static inline uint32_t qtimer3_add_signed_cycles(uint32_t dwt, int32_t cycles) {
+  return (cycles < 0)
+      ? (dwt - (uint32_t)(-(int64_t)cycles))
+      : (dwt + (uint32_t)cycles);
+}
+
+static int32_t qtimer3_signed_dwt_cycles_for_ticks(int32_t ticks) {
+  if (ticks == 0) return 0;
+
+  const uint32_t abs_ticks = qtimer3_abs_i32_to_u32(ticks);
+  const uint32_t cycles = vclock_cycles_for_ticks(abs_ticks);
+  return (ticks < 0) ? -(int32_t)cycles : (int32_t)cycles;
+}
+
+static uint32_t ocxo_next_authored_counter32(interrupt_subscriber_kind_t kind,
+                                             const ocxo_lane_t& lane) {
+  const synthetic_clock32_t* c = synthetic_clock_for_kind(kind);
+  if (!c) return lane.logical_count32_at_last_second + OCXO_INTERVAL_COUNTS;
+
+  const uint32_t base = c->pending_zero
+      ? c->pending_zero_counter32
+      : c->current_counter32;
+  return base + OCXO_INTERVAL_COUNTS;
+}
+
+static uint32_t qtimer3_ticks_until_peer_compare(ocxo_lane_t& peer) {
+  return (uint32_t)((uint16_t)(peer.compare_target - peer.module->CH[peer.channel].CNTR));
+}
+
+static void qtimer3_try_coalesce_peer(bool& ch2_pending,
+                                      bool& ch3_pending,
+                                      uint32_t entry_dwt_raw) {
+  if (ch2_pending == ch3_pending) return;
+
+  ocxo_lane_t& peer = ch2_pending ? g_ocxo2_lane : g_ocxo1_lane;
+  const uint32_t peer_channel = ch2_pending ? 3U : 2U;
+  const uint32_t ticks_until_peer = qtimer3_ticks_until_peer_compare(peer);
+  g_qtimer3_last_pair_coalesce_peer_channel = peer_channel;
+  g_qtimer3_last_pair_coalesce_ticks_until_peer = ticks_until_peer;
+
+  if (ticks_until_peer > QTIMER3_PAIR_COALESCE_TICKS) return;
+
+  g_qtimer3_pair_coalesce_attempt_count++;
+
+  const uint32_t timeout_cycles =
+      vclock_cycles_for_ticks(QTIMER3_PAIR_COALESCE_TICKS + 2U) + 128U;
+  const uint32_t start = ARM_DWT_CYCCNT;
+
+  volatile uint16_t* peer_csctrl = &peer.module->CH[peer.channel].CSCTRL;
+  while (((*peer_csctrl) & TMR_CSCTRL_TCF1) == 0) {
+    if ((uint32_t)(ARM_DWT_CYCCNT - start) > timeout_cycles) {
+      g_qtimer3_pair_coalesce_timeout_count++;
+      g_qtimer3_last_pair_coalesce_wait_cycles = ARM_DWT_CYCCNT - start;
+      ch2_pending = (IMXRT_TMR3.CH[2].CSCTRL & TMR_CSCTRL_TCF1) != 0;
+      ch3_pending = (IMXRT_TMR3.CH[3].CSCTRL & TMR_CSCTRL_TCF1) != 0;
+      return;
+    }
+  }
+
+  g_qtimer3_pair_coalesce_success_count++;
+  g_qtimer3_last_pair_coalesce_wait_cycles = ARM_DWT_CYCCNT - start;
+  ch2_pending = (IMXRT_TMR3.CH[2].CSCTRL & TMR_CSCTRL_TCF1) != 0;
+  ch3_pending = (IMXRT_TMR3.CH[3].CSCTRL & TMR_CSCTRL_TCF1) != 0;
+}
+
+static void handle_ocxo_qtimer16_event_dwt(ocxo_lane_t& lane,
+                                           interrupt_subscriber_runtime_t& rt,
+                                           uint32_t qtimer_event_dwt) {
   lane.irq_count++;
   rt.irq_count++;
 
   qtimer3_clear_compare_flag(lane.channel);
 
   if (!lane.active || !rt.active) { lane.miss_count++; return; }
-  if (!lane.phase_bootstrapped) {
-    ocxo_lane_regrid_from_current(rt.desc->kind);
-    lane.miss_count++;
-    return;
-  }
+  if (!lane.phase_bootstrapped)   { ocxo_lane_arm_bootstrap(lane); lane.miss_count++; return; }
 
-  ocxo_logical_grid_t* grid = ocxo_grid_for(rt.desc->kind);
-  if (!grid) { lane.miss_count++; return; }
-
-  const uint32_t authored_counter32 = grid->next_counter32;
   const uint16_t fired_low16 = lane.compare_target;
+  ocxo_lane_advance_compare(lane);
+  lane.cadence_hits_total++;
 
   synthetic_clock32_t* c = synthetic_clock_for_kind(rt.desc->kind);
   if (c) {
     lane.logical_count32_at_last_second =
-        synthetic_clock_author_counter32_at_hardware(*c,
-                                                     authored_counter32,
-                                                     fired_low16);
+        synthetic_clock_advance_at_hardware(*c, OCXO_INTERVAL_COUNTS, fired_low16);
   } else {
-    lane.logical_count32_at_last_second = authored_counter32;
+    lane.logical_count32_at_last_second += OCXO_INTERVAL_COUNTS;
   }
 
-  lane.cadence_hits_total++;
-  lane.tick_mod_1000 = (lane.tick_mod_1000 + 1U) % TICKS_PER_SECOND_EVENT;
-  grid->cadence_event_index++;
-
-  const time_clock_id_t clock = ocxo_time_clock_for(rt.desc->kind);
-
-  if ((grid->cadence_event_index % OCXO_LOGICAL_EVENTS_PER_SAMPLE) == 0U) {
-    const uint32_t sample_index =
-        grid->cadence_event_index / OCXO_LOGICAL_EVENTS_PER_SAMPLE;
-    if (sample_index < CLOCKS_GAMMA_CADENCE_HZ) {
-      clocks_gamma_100hz_sample_at_index(clock, sample_index, qtimer_event_dwt);
-    }
+  const uint32_t next_tick_mod_1000 = lane.tick_mod_1000 + 1U;
+  if ((next_tick_mod_1000 % 10U) == 0U &&
+      next_tick_mod_1000 < TICKS_PER_SECOND_EVENT) {
+    clocks_gamma_100hz_sample(rt.desc->kind == interrupt_subscriber_kind_t::OCXO1
+                                  ? time_clock_id_t::OCXO1
+                                  : time_clock_id_t::OCXO2,
+                              qtimer_event_dwt);
   }
 
-  const bool second_edge =
-      grid->cadence_event_index >= OCXO_LOGICAL_EVENTS_PER_SECOND;
-
-  if (second_edge) {
-    grid->cadence_event_index = 0;
-    clocks_gamma_second_edge(clock, qtimer_event_dwt);
+  if (++lane.tick_mod_1000 >= TICKS_PER_SECOND_EVENT) {
+    lane.tick_mod_1000 = 0;
+    clocks_gamma_second_edge(rt.desc->kind == interrupt_subscriber_kind_t::OCXO1
+                                 ? time_clock_id_t::OCXO1
+                                 : time_clock_id_t::OCXO2,
+                             qtimer_event_dwt);
+    emit_one_second_event(rt, qtimer_event_dwt, lane.logical_count32_at_last_second);
   }
+}
 
-  grid->next_counter32 = authored_counter32 + OCXO_LOGICAL_CADENCE_TICKS;
-  ocxo_lane_program_grid_compare(rt.desc->kind, lane, *grid);
-
-  if (second_edge) {
-    emit_one_second_event(rt, qtimer_event_dwt, authored_counter32);
-  }
+static void handle_ocxo_qtimer16_irq(ocxo_lane_t& lane,
+                                     interrupt_subscriber_runtime_t& rt,
+                                     uint32_t isr_entry_dwt_raw) {
+  const uint32_t qtimer_event_dwt = qtimer_event_dwt_from_isr_entry_raw(isr_entry_dwt_raw);
+  handle_ocxo_qtimer16_event_dwt(lane, rt, qtimer_event_dwt);
 }
 
 void process_interrupt_qtimer3_ch2_irq(uint32_t isr_entry_dwt_raw) {
@@ -1768,10 +1736,97 @@ void process_interrupt_qtimer3_ch3_irq(uint32_t isr_entry_dwt_raw) {
   if (g_rt_ocxo2) handle_ocxo_qtimer16_irq(g_ocxo2_lane, *g_rt_ocxo2, isr_entry_dwt_raw);
 }
 
+static void qtimer3_handle_coupled_pair(uint32_t pair_entry_dwt_raw) {
+  g_qtimer3_pair_reconstruction_count++;
+  g_qtimer3_dual_pending_count++;
+  g_qtimer3_dual_same_pass_count++;
+  g_qtimer3_dual_ch2_first_count++;
+
+  const uint32_t ch2_target32 =
+      ocxo_next_authored_counter32(interrupt_subscriber_kind_t::OCXO1,
+                                   g_ocxo1_lane);
+  const uint32_t ch3_target32 =
+      ocxo_next_authored_counter32(interrupt_subscriber_kind_t::OCXO2,
+                                   g_ocxo2_lane);
+  const int32_t ch3_minus_ch2 = (int32_t)(ch3_target32 - ch2_target32);
+
+  const bool ch2_is_base = ch3_minus_ch2 >= 0;
+  const uint32_t base_target32 = ch2_is_base ? ch2_target32 : ch3_target32;
+  const uint32_t base_event_dwt = qtimer_event_dwt_from_isr_entry_raw(pair_entry_dwt_raw);
+
+  const int32_t ch2_delta_ticks = (int32_t)(ch2_target32 - base_target32);
+  const int32_t ch3_delta_ticks = (int32_t)(ch3_target32 - base_target32);
+  const int32_t ch2_offset_cycles = qtimer3_signed_dwt_cycles_for_ticks(ch2_delta_ticks);
+  const int32_t ch3_offset_cycles = qtimer3_signed_dwt_cycles_for_ticks(ch3_delta_ticks);
+  const uint32_t ch2_event_dwt = qtimer3_add_signed_cycles(base_event_dwt, ch2_offset_cycles);
+  const uint32_t ch3_event_dwt = qtimer3_add_signed_cycles(base_event_dwt, ch3_offset_cycles);
+
+  g_qtimer3_last_pair_base_dwt_raw = pair_entry_dwt_raw;
+  g_qtimer3_last_pair_base_event_dwt = base_event_dwt;
+  g_qtimer3_last_pair_base_target32 = base_target32;
+  g_qtimer3_last_pair_delta_ticks = ch3_minus_ch2;
+  g_qtimer3_last_pair_ch2_offset_cycles = ch2_offset_cycles;
+  g_qtimer3_last_pair_ch3_offset_cycles = ch3_offset_cycles;
+  g_qtimer3_last_ch2_event_dwt = ch2_event_dwt;
+  g_qtimer3_last_ch3_event_dwt = ch3_event_dwt;
+  g_qtimer3_last_ch2_dwt_coordinate_source = QTIMER3_DWT_SOURCE_PAIR_RECONSTRUCTED;
+  g_qtimer3_last_ch3_dwt_coordinate_source = QTIMER3_DWT_SOURCE_PAIR_RECONSTRUCTED;
+
+  const uint32_t ch2_service_raw = ARM_DWT_CYCCNT;
+  g_qtimer3_last_ch2_dwt_raw = ch2_service_raw;
+  g_qtimer3_last_dispatch_channel = 2;
+  g_qtimer3_last_ch2_late_ticks =
+      (uint32_t)((uint16_t)(IMXRT_TMR3.CH[2].CNTR - g_ocxo1_lane.compare_target));
+  if (g_rt_ocxo1) {
+    handle_ocxo_qtimer16_event_dwt(g_ocxo1_lane, *g_rt_ocxo1, ch2_event_dwt);
+  }
+
+  const uint32_t ch3_service_raw = ARM_DWT_CYCCNT;
+  g_qtimer3_last_ch3_dwt_raw = ch3_service_raw;
+  g_qtimer3_last_branch_delta_cycles = ch3_service_raw - ch2_service_raw;
+  g_qtimer3_last_dispatch_channel = 3;
+  g_qtimer3_last_ch3_late_ticks =
+      (uint32_t)((uint16_t)(IMXRT_TMR3.CH[3].CNTR - g_ocxo2_lane.compare_target));
+  if (g_rt_ocxo2) {
+    handle_ocxo_qtimer16_event_dwt(g_ocxo2_lane, *g_rt_ocxo2, ch3_event_dwt);
+  }
+}
+
 static void qtimer3_isr(void) {
-  const uint32_t isr_entry_dwt_raw = ARM_DWT_CYCCNT;
-  if (IMXRT_TMR3.CH[2].CSCTRL & TMR_CSCTRL_TCF1) process_interrupt_qtimer3_ch2_irq(isr_entry_dwt_raw);
-  if (IMXRT_TMR3.CH[3].CSCTRL & TMR_CSCTRL_TCF1) process_interrupt_qtimer3_ch3_irq(isr_entry_dwt_raw);
+  const uint32_t qtimer3_entry_dwt_raw = ARM_DWT_CYCCNT;
+  bool ch2_pending = (IMXRT_TMR3.CH[2].CSCTRL & TMR_CSCTRL_TCF1) != 0;
+  bool ch3_pending = (IMXRT_TMR3.CH[3].CSCTRL & TMR_CSCTRL_TCF1) != 0;
+
+  qtimer3_try_coalesce_peer(ch2_pending, ch3_pending, qtimer3_entry_dwt_raw);
+
+  if (ch2_pending && ch3_pending) {
+    qtimer3_handle_coupled_pair(qtimer3_entry_dwt_raw);
+    return;
+  }
+
+  if (ch2_pending) {
+    g_qtimer3_single_ch2_count++;
+    g_qtimer3_last_ch2_dwt_raw = qtimer3_entry_dwt_raw;
+    g_qtimer3_last_ch2_event_dwt = qtimer_event_dwt_from_isr_entry_raw(qtimer3_entry_dwt_raw);
+    g_qtimer3_last_ch2_dwt_coordinate_source = QTIMER3_DWT_SOURCE_ISR_ENTRY;
+    g_qtimer3_last_dispatch_channel = 2;
+    g_qtimer3_last_ch2_late_ticks =
+        (uint32_t)((uint16_t)(IMXRT_TMR3.CH[2].CNTR - g_ocxo1_lane.compare_target));
+    process_interrupt_qtimer3_ch2_irq(qtimer3_entry_dwt_raw);
+    return;
+  }
+
+  if (ch3_pending) {
+    g_qtimer3_single_ch3_count++;
+    g_qtimer3_last_ch3_dwt_raw = qtimer3_entry_dwt_raw;
+    g_qtimer3_last_ch3_event_dwt = qtimer_event_dwt_from_isr_entry_raw(qtimer3_entry_dwt_raw);
+    g_qtimer3_last_ch3_dwt_coordinate_source = QTIMER3_DWT_SOURCE_ISR_ENTRY;
+    g_qtimer3_last_dispatch_channel = 3;
+    g_qtimer3_last_ch3_late_ticks =
+        (uint32_t)((uint16_t)(IMXRT_TMR3.CH[3].CNTR - g_ocxo2_lane.compare_target));
+    process_interrupt_qtimer3_ch3_irq(qtimer3_entry_dwt_raw);
+    return;
+  }
 }
 
 // ============================================================================
@@ -2051,24 +2106,6 @@ void process_interrupt_gpio6789_irq(uint32_t isr_entry_dwt_raw) {
   epoch_cap.ocxo2_counter32 = ocxo2_counter32;
   epoch_capture_publish(epoch_cap);
 
-  if (zero_consumed) {
-    clocks_gamma_reset_all();
-    clocks_gamma_second_edge(time_clock_id_t::VCLOCK, epoch_cap.vclock_dwt_at_edge);
-
-    if (!epoch_cap.all_lanes_capture_valid) {
-      clocks_watchdog_anomaly("ocxo_epoch_capture_missing",
-                              epoch_cap.capture_window_cycles,
-                              EPOCH_CAPTURE_MAX_WINDOW_CYCLES,
-                              epoch_cap.vclock_capture_valid ? 1u : 0u,
-                              epoch_cap.sequence);
-    } else {
-      clocks_gamma_second_edge(time_clock_id_t::OCXO1, epoch_cap.vclock_dwt_at_edge);
-      clocks_gamma_second_edge(time_clock_id_t::OCXO2, epoch_cap.vclock_dwt_at_edge);
-      interrupt_ocxo_logical_grid_epoch(epoch_cap.ocxo1_counter32,
-                                        epoch_cap.ocxo2_counter32);
-    }
-  }
-
   if (g_pps_entry_latency_handler) {
     g_pps_entry_latency_handler(g_pps_gpio_heartbeat.edge_count,
                                 isr_entry_dwt_raw);
@@ -2222,8 +2259,9 @@ bool interrupt_start(interrupt_subscriber_kind_t kind) {
   ocxo_lane_t* lane = ocxo_lane_for(kind);
   if (!lane || !lane->initialized) return false;
   lane->active = true;
+  lane->phase_bootstrapped = false;
   lane->tick_mod_1000 = 0;
-  ocxo_lane_regrid_from_current(kind);
+  qtimer3_program_compare(lane->channel, (uint16_t)(lane->compare_target + 1));
   return true;
 }
 
@@ -2413,8 +2451,6 @@ void process_interrupt_init(void) {
   g_vclock_clock32 = vclock_synthetic_clock32_t{};
   g_ocxo1_clock32 = synthetic_clock32_t{};
   g_ocxo2_clock32 = synthetic_clock32_t{};
-  g_ocxo1_logical_grid = ocxo_logical_grid_t{};
-  g_ocxo2_logical_grid = ocxo_logical_grid_t{};
 
   // Defensive birth anchors.  These are not logical ZERO operations; they
   // simply make process_interrupt's synthetic coordinate extenders safe before
@@ -2440,6 +2476,35 @@ void process_interrupt_init(void) {
   g_qtimer1_ch1_handler = nullptr;
   g_qtimer1_ch2_last_target_counter32 = 0;
   g_qtimer1_ch2_arm_count = 0;
+  g_qtimer3_dual_pending_count = 0;
+  g_qtimer3_single_ch2_count = 0;
+  g_qtimer3_single_ch3_count = 0;
+  g_qtimer3_dual_ch2_first_count = 0;
+  g_qtimer3_dual_ch3_first_count = 0;
+  g_qtimer3_dual_same_pass_count = 0;
+  g_qtimer3_last_dispatch_channel = 0;
+  g_qtimer3_last_ch2_late_ticks = 0;
+  g_qtimer3_last_ch3_late_ticks = 0;
+  g_qtimer3_last_ch2_dwt_raw = 0;
+  g_qtimer3_last_ch3_dwt_raw = 0;
+  g_qtimer3_last_branch_delta_cycles = 0;
+  g_qtimer3_pair_reconstruction_count = 0;
+  g_qtimer3_pair_coalesce_attempt_count = 0;
+  g_qtimer3_pair_coalesce_success_count = 0;
+  g_qtimer3_pair_coalesce_timeout_count = 0;
+  g_qtimer3_last_pair_coalesce_peer_channel = 0;
+  g_qtimer3_last_pair_coalesce_ticks_until_peer = 0;
+  g_qtimer3_last_pair_coalesce_wait_cycles = 0;
+  g_qtimer3_last_pair_base_dwt_raw = 0;
+  g_qtimer3_last_pair_base_event_dwt = 0;
+  g_qtimer3_last_pair_base_target32 = 0;
+  g_qtimer3_last_pair_delta_ticks = 0;
+  g_qtimer3_last_pair_ch2_offset_cycles = 0;
+  g_qtimer3_last_pair_ch3_offset_cycles = 0;
+  g_qtimer3_last_ch2_event_dwt = 0;
+  g_qtimer3_last_ch3_event_dwt = 0;
+  g_qtimer3_last_ch2_dwt_coordinate_source = QTIMER3_DWT_SOURCE_NONE;
+  g_qtimer3_last_ch3_dwt_coordinate_source = QTIMER3_DWT_SOURCE_NONE;
 
   time_dynamic_cps_reset();
 
@@ -2596,10 +2661,6 @@ static Payload cmd_report(const Payload&) {
   p.add("ocxo1_compare_target",     (uint32_t)g_ocxo1_lane.compare_target);
   p.add("ocxo1_tick_mod_1000",      g_ocxo1_lane.tick_mod_1000);
   p.add("ocxo1_logical_count32",    g_ocxo1_lane.logical_count32_at_last_second);
-  p.add("ocxo1_logical_grid_epoch_counter32", g_ocxo1_logical_grid.epoch_counter32);
-  p.add("ocxo1_logical_grid_next_counter32", g_ocxo1_logical_grid.next_counter32);
-  p.add("ocxo1_logical_grid_cadence_event_index", g_ocxo1_logical_grid.cadence_event_index);
-  p.add("ocxo1_logical_grid_epoch_count", g_ocxo1_logical_grid.epoch_count);
 
   p.add("ocxo2_irq_count",          g_ocxo2_lane.irq_count);
   p.add("ocxo2_miss_count",         g_ocxo2_lane.miss_count);
@@ -2608,10 +2669,6 @@ static Payload cmd_report(const Payload&) {
   p.add("ocxo2_compare_target",     (uint32_t)g_ocxo2_lane.compare_target);
   p.add("ocxo2_tick_mod_1000",      g_ocxo2_lane.tick_mod_1000);
   p.add("ocxo2_logical_count32",    g_ocxo2_lane.logical_count32_at_last_second);
-  p.add("ocxo2_logical_grid_epoch_counter32", g_ocxo2_logical_grid.epoch_counter32);
-  p.add("ocxo2_logical_grid_next_counter32", g_ocxo2_logical_grid.next_counter32);
-  p.add("ocxo2_logical_grid_cadence_event_index", g_ocxo2_logical_grid.cadence_event_index);
-  p.add("ocxo2_logical_grid_epoch_count", g_ocxo2_logical_grid.epoch_count);
 
   // Dynamic CPS — now owned by process_time; mirrored here for compatibility.
   const time_dynamic_cps_snapshot_t dcps = time_dynamic_cps_snapshot();
@@ -2671,6 +2728,35 @@ static Payload cmd_report(const Payload&) {
   p.add("qtimer1_ch1_hop_count", g_qtimer1_ch1_hop_count);
   p.add("qtimer1_ch2_last_target_counter32", g_qtimer1_ch2_last_target_counter32);
   p.add("qtimer1_ch2_arm_count", g_qtimer1_ch2_arm_count);
+  p.add("qtimer3_dual_pending_count", g_qtimer3_dual_pending_count);
+  p.add("qtimer3_single_ch2_count", g_qtimer3_single_ch2_count);
+  p.add("qtimer3_single_ch3_count", g_qtimer3_single_ch3_count);
+  p.add("qtimer3_dual_ch2_first_count", g_qtimer3_dual_ch2_first_count);
+  p.add("qtimer3_dual_ch3_first_count", g_qtimer3_dual_ch3_first_count);
+  p.add("qtimer3_dual_same_pass_count", g_qtimer3_dual_same_pass_count);
+  p.add("qtimer3_last_dispatch_channel", g_qtimer3_last_dispatch_channel);
+  p.add("qtimer3_last_ch2_late_ticks", g_qtimer3_last_ch2_late_ticks);
+  p.add("qtimer3_last_ch3_late_ticks", g_qtimer3_last_ch3_late_ticks);
+  p.add("qtimer3_last_ch2_dwt_raw", g_qtimer3_last_ch2_dwt_raw);
+  p.add("qtimer3_last_ch3_dwt_raw", g_qtimer3_last_ch3_dwt_raw);
+  p.add("qtimer3_last_branch_delta_cycles", g_qtimer3_last_branch_delta_cycles);
+  p.add("qtimer3_pair_reconstruction_count", g_qtimer3_pair_reconstruction_count);
+  p.add("qtimer3_pair_coalesce_attempt_count", g_qtimer3_pair_coalesce_attempt_count);
+  p.add("qtimer3_pair_coalesce_success_count", g_qtimer3_pair_coalesce_success_count);
+  p.add("qtimer3_pair_coalesce_timeout_count", g_qtimer3_pair_coalesce_timeout_count);
+  p.add("qtimer3_last_pair_coalesce_peer_channel", g_qtimer3_last_pair_coalesce_peer_channel);
+  p.add("qtimer3_last_pair_coalesce_ticks_until_peer", g_qtimer3_last_pair_coalesce_ticks_until_peer);
+  p.add("qtimer3_last_pair_coalesce_wait_cycles", g_qtimer3_last_pair_coalesce_wait_cycles);
+  p.add("qtimer3_last_pair_base_dwt_raw", g_qtimer3_last_pair_base_dwt_raw);
+  p.add("qtimer3_last_pair_base_event_dwt", g_qtimer3_last_pair_base_event_dwt);
+  p.add("qtimer3_last_pair_base_target32", g_qtimer3_last_pair_base_target32);
+  p.add("qtimer3_last_pair_delta_ticks", g_qtimer3_last_pair_delta_ticks);
+  p.add("qtimer3_last_pair_ch2_offset_cycles", g_qtimer3_last_pair_ch2_offset_cycles);
+  p.add("qtimer3_last_pair_ch3_offset_cycles", g_qtimer3_last_pair_ch3_offset_cycles);
+  p.add("qtimer3_last_ch2_event_dwt", g_qtimer3_last_ch2_event_dwt);
+  p.add("qtimer3_last_ch3_event_dwt", g_qtimer3_last_ch3_event_dwt);
+  p.add("qtimer3_last_ch2_dwt_coordinate_source", g_qtimer3_last_ch2_dwt_coordinate_source);
+  p.add("qtimer3_last_ch3_dwt_coordinate_source", g_qtimer3_last_ch3_dwt_coordinate_source);
 
   return p;
 }
