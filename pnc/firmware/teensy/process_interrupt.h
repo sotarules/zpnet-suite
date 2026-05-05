@@ -458,6 +458,22 @@ struct interrupt_epoch_capture_t {
 
 bool interrupt_last_epoch_capture(interrupt_epoch_capture_t* out);
 
+// Re-author OCXO QTimer3 compare cadence from CLOCKS logical zero.
+//
+// OCXO Gamma is lane-local.  It does not care which OCXO edge is near PPS or
+// VCLOCK.  Once CLOCKS has selected the OCXO zero-offset counter32 values, this
+// call makes the compare rails land on:
+//
+//   epoch + 10,000
+//   epoch + 20,000
+//   ...
+//   epoch + 10,000,000
+//
+// Every tenth custody event is a Gamma 100 Hz courtroom sample, and every
+// thousandth custody event is the OCXO-local one-second edge.
+void interrupt_ocxo_logical_grid_epoch(uint32_t ocxo1_epoch_counter32,
+                                       uint32_t ocxo2_epoch_counter32);
+
 
 // ============================================================================
 // PPS GPIO heartbeat accessor

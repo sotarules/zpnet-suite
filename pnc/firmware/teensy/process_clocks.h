@@ -93,6 +93,11 @@ uint64_t clocks_ocxo2_ns_now(void);
 // CLOCKS Gamma — next-second DWT prediction engine
 // -----------------------------------------------------------------------------
 
+static constexpr uint32_t CLOCKS_GAMMA_TICKS_PER_SECOND = 10000000U;
+static constexpr uint32_t CLOCKS_GAMMA_CADENCE_HZ = 100U;
+static constexpr uint32_t CLOCKS_GAMMA_TICKS_PER_SAMPLE =
+    CLOCKS_GAMMA_TICKS_PER_SECOND / CLOCKS_GAMMA_CADENCE_HZ;
+
 struct clocks_gamma_prediction_snapshot_t {
   uint32_t clock_id;
 
@@ -108,6 +113,7 @@ struct clocks_gamma_prediction_snapshot_t {
   int32_t  completed_ignored_min_error_cycles;
   int32_t  completed_ignored_max_error_cycles;
   int32_t  completed_last_error_cycles;
+  uint32_t completed_last_sample_index;
 
   // Current in-flight clock-second facts.  These are report-only forensic
   // surfaces for the active second.
@@ -124,11 +130,28 @@ struct clocks_gamma_prediction_snapshot_t {
   int32_t  current_last_error_cycles;
   uint32_t current_last_expected_dwt;
   uint32_t current_last_sample_dwt;
+  uint32_t current_last_sample_index;
 };
 
 void clocks_gamma_reset_all(void);
+
+// Opens or completes a lane-local 10,000,000-tick clock-second.  For OCXO lanes
+// this must be called from OCXO-local logical grid milestones, not from a
+// PPS/VCLOCK phase relationship.
 void clocks_gamma_second_edge(time_clock_id_t clock, uint32_t dwt_at_edge);
+
+// Legacy/sequential courtroom surface.  Kept so existing callers compile, but
+// new OCXO call sites should use clocks_gamma_100hz_sample_at_index() so the
+// sample is judged at its lane-local logical 100 Hz position.
 void clocks_gamma_100hz_sample(time_clock_id_t clock, uint32_t dwt_at_sample);
+
+// Indexed courtroom sample.  sample_index is 1..99 inside the active
+// lane-local clock-second.  A sample_index of 10 means logical tick 1,000,000
+// within that lane's current 10,000,000-tick second, regardless of VCLOCK/PPS.
+void clocks_gamma_100hz_sample_at_index(time_clock_id_t clock,
+                                        uint32_t sample_index,
+                                        uint32_t dwt_at_sample);
+
 bool clocks_gamma_snapshot(time_clock_id_t clock,
                            clocks_gamma_prediction_snapshot_t* out);
 

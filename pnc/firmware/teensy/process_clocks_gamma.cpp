@@ -19,9 +19,9 @@
 //   error == +1/-1  -> dynamic prediction is adjusted by that one cycle
 //   |error| > 1     -> witness is ignored as ISR/preemption contamination
 //
-// No smoothing. No line fitting. No validity fog. The lane either has prior
-// edges and emits facts, or its surfaces remain zero until the first completed
-// second exists.
+// No smoothing. No line fitting. No validity fog. A lane has an acquisition
+// second first; prediction begins only after a lane-local 10,000,000-tick span
+// has actually completed.
 // ============================================================================
 
 #include "process_clocks.h"
@@ -30,7 +30,7 @@
 #include <Arduino.h>
 #include <stdint.h>
 
-static constexpr uint32_t GAMMA_CADENCE_HZ = 100U;
+static constexpr uint32_t GAMMA_CADENCE_HZ = CLOCKS_GAMMA_CADENCE_HZ;
 static constexpr uint32_t GAMMA_ACCEPT_ERROR_CYCLES = 1U;
 
 struct gamma_lane_t {
@@ -39,8 +39,8 @@ struct gamma_lane_t {
   uint32_t edge_count = 0;
   uint32_t second_start_dwt = 0;
 
-  uint32_t current_static_prediction_cycles = DWT_EXPECTED_PER_PPS;
-  uint32_t current_dynamic_prediction_cycles = DWT_EXPECTED_PER_PPS;
+  uint32_t current_static_prediction_cycles = 0;
+  uint32_t current_dynamic_prediction_cycles = 0;
   uint32_t current_sample_count = 0;
   uint32_t current_match_count = 0;
   uint32_t current_adjust_count = 0;
@@ -50,6 +50,7 @@ struct gamma_lane_t {
   int32_t  current_last_error_cycles = 0;
   uint32_t current_last_expected_dwt = 0;
   uint32_t current_last_sample_dwt = 0;
+  uint32_t current_last_sample_index = 0;
 
   uint32_t completed_edge_count = 0;
   uint32_t completed_static_prediction_cycles = 0;
@@ -61,6 +62,7 @@ struct gamma_lane_t {
   int32_t  completed_ignored_min_error_cycles = 0;
   int32_t  completed_ignored_max_error_cycles = 0;
   int32_t  completed_last_error_cycles = 0;
+  uint32_t completed_last_sample_index = 0;
 };
 
 static gamma_lane_t g_gamma_vclock;
@@ -94,6 +96,7 @@ static void gamma_reset_current_second(gamma_lane_t& s) {
   s.current_last_error_cycles = 0;
   s.current_last_expected_dwt = 0;
   s.current_last_sample_dwt = 0;
+  s.current_last_sample_index = 0;
 }
 
 static void gamma_reset_lane(gamma_lane_t& s) {
@@ -102,8 +105,8 @@ static void gamma_reset_lane(gamma_lane_t& s) {
 
   s.edge_count = 0;
   s.second_start_dwt = 0;
-  s.current_static_prediction_cycles = DWT_EXPECTED_PER_PPS;
-  s.current_dynamic_prediction_cycles = DWT_EXPECTED_PER_PPS;
+  s.current_static_prediction_cycles = 0;
+  s.current_dynamic_prediction_cycles = 0;
   gamma_reset_current_second(s);
 
   s.completed_edge_count = 0;
@@ -116,6 +119,7 @@ static void gamma_reset_lane(gamma_lane_t& s) {
   s.completed_ignored_min_error_cycles = 0;
   s.completed_ignored_max_error_cycles = 0;
   s.completed_last_error_cycles = 0;
+  s.completed_last_sample_index = 0;
 
   gamma_dmb();
   s.seq++;
@@ -137,8 +141,8 @@ void clocks_gamma_second_edge(time_clock_id_t clock, uint32_t dwt_at_edge) {
   if (s->edge_count == 0) {
     s->edge_count = 1;
     s->second_start_dwt = dwt_at_edge;
-    s->current_static_prediction_cycles = DWT_EXPECTED_PER_PPS;
-    s->current_dynamic_prediction_cycles = DWT_EXPECTED_PER_PPS;
+    s->current_static_prediction_cycles = 0;
+    s->current_dynamic_prediction_cycles = 0;
     gamma_reset_current_second(*s);
     gamma_dmb();
     s->seq++;
@@ -157,6 +161,7 @@ void clocks_gamma_second_edge(time_clock_id_t clock, uint32_t dwt_at_edge) {
   s->completed_ignored_min_error_cycles = s->current_ignored_min_error_cycles;
   s->completed_ignored_max_error_cycles = s->current_ignored_max_error_cycles;
   s->completed_last_error_cycles = s->current_last_error_cycles;
+  s->completed_last_sample_index = s->current_last_sample_index;
 
   s->edge_count++;
   s->second_start_dwt = dwt_at_edge;
@@ -179,6 +184,68 @@ static inline uint32_t gamma_abs_error(int32_t v) {
   return (v < 0) ? (uint32_t)(-(int64_t)v) : (uint32_t)v;
 }
 
+static void gamma_100hz_sample_indexed(gamma_lane_t& s,
+                                       uint32_t sample_index,
+                                       uint32_t dwt_at_sample) {
+  // Edge 1 opens the acquisition second.  Edge 2 creates the first actual
+  // lane-local 10,000,000-tick DWT span.  Courtroom samples before that first
+  // completed span have no honest static prediction to test.
+  if (s.edge_count < 2) return;
+
+  if (sample_index == 0 || sample_index >= GAMMA_CADENCE_HZ) return;
+
+  const uint32_t expected_dwt =
+      s.second_start_dwt +
+      gamma_expected_offset(s.current_dynamic_prediction_cycles, sample_index);
+  const int32_t error_cycles = (int32_t)(dwt_at_sample - expected_dwt);
+  const uint32_t abs_error = gamma_abs_error(error_cycles);
+
+  s.current_sample_count++;
+  s.current_last_sample_index = sample_index;
+  s.current_last_error_cycles = error_cycles;
+  s.current_last_expected_dwt = expected_dwt;
+  s.current_last_sample_dwt = dwt_at_sample;
+
+  if (error_cycles == 0) {
+    s.current_match_count++;
+  } else if (abs_error <= GAMMA_ACCEPT_ERROR_CYCLES) {
+    const int64_t corrected =
+        (int64_t)s.current_dynamic_prediction_cycles + (int64_t)error_cycles;
+    s.current_dynamic_prediction_cycles = (corrected <= 0)
+        ? 1U
+        : ((corrected > (int64_t)UINT32_MAX) ? UINT32_MAX : (uint32_t)corrected);
+    s.current_adjust_count++;
+  } else {
+    if (s.current_ignored_count == 0) {
+      s.current_ignored_min_error_cycles = error_cycles;
+      s.current_ignored_max_error_cycles = error_cycles;
+    } else {
+      if (error_cycles < s.current_ignored_min_error_cycles) {
+        s.current_ignored_min_error_cycles = error_cycles;
+      }
+      if (error_cycles > s.current_ignored_max_error_cycles) {
+        s.current_ignored_max_error_cycles = error_cycles;
+      }
+    }
+    s.current_ignored_count++;
+  }
+}
+
+void clocks_gamma_100hz_sample_at_index(time_clock_id_t clock,
+                                        uint32_t sample_index,
+                                        uint32_t dwt_at_sample) {
+  gamma_lane_t* s = gamma_lane(clock);
+  if (!s) return;
+
+  s->seq++;
+  gamma_dmb();
+
+  gamma_100hz_sample_indexed(*s, sample_index, dwt_at_sample);
+
+  gamma_dmb();
+  s->seq++;
+}
+
 void clocks_gamma_100hz_sample(time_clock_id_t clock, uint32_t dwt_at_sample) {
   gamma_lane_t* s = gamma_lane(clock);
   if (!s) return;
@@ -186,53 +253,8 @@ void clocks_gamma_100hz_sample(time_clock_id_t clock, uint32_t dwt_at_sample) {
   s->seq++;
   gamma_dmb();
 
-  if (s->edge_count == 0) {
-    gamma_dmb();
-    s->seq++;
-    return;
-  }
-
   const uint32_t sample_index = s->current_sample_count + 1U;
-  if (sample_index >= GAMMA_CADENCE_HZ) {
-    gamma_dmb();
-    s->seq++;
-    return;
-  }
-
-  const uint32_t expected_dwt =
-      s->second_start_dwt +
-      gamma_expected_offset(s->current_dynamic_prediction_cycles, sample_index);
-  const int32_t error_cycles = (int32_t)(dwt_at_sample - expected_dwt);
-  const uint32_t abs_error = gamma_abs_error(error_cycles);
-
-  s->current_sample_count = sample_index;
-  s->current_last_error_cycles = error_cycles;
-  s->current_last_expected_dwt = expected_dwt;
-  s->current_last_sample_dwt = dwt_at_sample;
-
-  if (error_cycles == 0) {
-    s->current_match_count++;
-  } else if (abs_error <= GAMMA_ACCEPT_ERROR_CYCLES) {
-    const int64_t corrected =
-        (int64_t)s->current_dynamic_prediction_cycles + (int64_t)error_cycles;
-    s->current_dynamic_prediction_cycles = (corrected <= 0)
-        ? 1U
-        : ((corrected > (int64_t)UINT32_MAX) ? UINT32_MAX : (uint32_t)corrected);
-    s->current_adjust_count++;
-  } else {
-    if (s->current_ignored_count == 0) {
-      s->current_ignored_min_error_cycles = error_cycles;
-      s->current_ignored_max_error_cycles = error_cycles;
-    } else {
-      if (error_cycles < s->current_ignored_min_error_cycles) {
-        s->current_ignored_min_error_cycles = error_cycles;
-      }
-      if (error_cycles > s->current_ignored_max_error_cycles) {
-        s->current_ignored_max_error_cycles = error_cycles;
-      }
-    }
-    s->current_ignored_count++;
-  }
+  gamma_100hz_sample_indexed(*s, sample_index, dwt_at_sample);
 
   gamma_dmb();
   s->seq++;
@@ -252,6 +274,7 @@ static void gamma_copy_snapshot(time_clock_id_t clock,
   out.completed_ignored_min_error_cycles = s.completed_ignored_min_error_cycles;
   out.completed_ignored_max_error_cycles = s.completed_ignored_max_error_cycles;
   out.completed_last_error_cycles = s.completed_last_error_cycles;
+  out.completed_last_sample_index = s.completed_last_sample_index;
   out.edge_count = s.edge_count;
   out.second_start_dwt = s.second_start_dwt;
   out.current_static_prediction_cycles = s.current_static_prediction_cycles;
@@ -265,6 +288,7 @@ static void gamma_copy_snapshot(time_clock_id_t clock,
   out.current_last_error_cycles = s.current_last_error_cycles;
   out.current_last_expected_dwt = s.current_last_expected_dwt;
   out.current_last_sample_dwt = s.current_last_sample_dwt;
+  out.current_last_sample_index = s.current_last_sample_index;
 }
 
 bool clocks_gamma_snapshot(time_clock_id_t clock,
