@@ -4,7 +4,7 @@
 //
 // Interrupt custody and per-lane 1 kHz cadence:
 //
-//   • OCXO lanes    (QTimer3 vector — CH2, CH3)
+//   • OCXO lanes    (QTimer2 CH0 for OCXO1, QTimer3 CH3 for OCXO2)
 //   • VCLOCK lane   (critical recurring TimePop client on QTimer1 CH2)
 //   • TimePop       (QTimer1 CH2, hosted scheduler/client rail)
 //   • PPS GPIO edge (diagnostics + dispatch authority + epoch anchor)
@@ -92,7 +92,7 @@
 // ─── Per-lane cadence mechanics ─────────────────────────────────────────────
 //
 //   Three lanes (VCLOCK, OCXO1, OCXO2) produce one-second subscriber events.
-//   OCXO lanes are still cadenced by their own QTimer3 compare channels at
+//   OCXO lanes are cadenced by their own QuadTimer compare channels at
 //   1 kHz because their 16-bit compare registers cannot span a full second.
 //   VCLOCK cadence is now a TimePop critical recurring ISR slot on QTimer1 CH2,
 //   sharing fire facts with other same-deadline TimePop clients.
@@ -102,7 +102,7 @@
 //              in the GNSS-disciplined 10 MHz VCLOCK domain.  QTimer1 CH0 is
 //              the passive low-word VCLOCK counter; QTimer1 CH2 is the only
 //              active TimePop compare rail.
-//     OCXO1  : QTimer3 CH2 compare, +10000 counts/interval (OCXO1 10 MHz)
+//     OCXO1  : QTimer2 CH0 compare, +10000 counts/interval (OCXO1 10 MHz)
 //     OCXO2  : QTimer3 CH3 compare, +10000 counts/interval (OCXO2 10 MHz)
 // ============================================================================
 
@@ -135,6 +135,7 @@ enum class interrupt_subscriber_kind_t : uint8_t {
 enum class interrupt_provider_kind_t : uint8_t {
   NONE = 0,
   QTIMER1,
+  QTIMER2,
   QTIMER3,
   GPIO6789,
 };
@@ -144,7 +145,7 @@ enum class interrupt_lane_t : uint8_t {
   QTIMER1_CH1_COMP,
   QTIMER1_CH2_COMP,
   QTIMER1_CH3_COMP,
-  QTIMER3_CH2_COMP,
+  QTIMER2_CH0_COMP,
   QTIMER3_CH3_COMP,
   GPIO_EDGE,
 };
@@ -458,7 +459,7 @@ struct interrupt_epoch_capture_t {
 
 bool interrupt_last_epoch_capture(interrupt_epoch_capture_t* out);
 
-// Re-author OCXO QTimer3 compare cadence from CLOCKS logical zero.
+// Re-author OCXO QuadTimer compare cadence from CLOCKS logical zero.
 //
 // OCXO Gamma is lane-local.  It does not care which OCXO edge is near PPS or
 // VCLOCK.  Once CLOCKS has selected the OCXO zero-offset counter32 values, this
@@ -703,14 +704,14 @@ uint16_t interrupt_qtimer1_ch2_csctrl_now(void);
 // never propagated.
 
 void process_interrupt_gpio6789_irq  (uint32_t isr_entry_dwt_raw);
-void process_interrupt_qtimer3_ch2_irq(uint32_t isr_entry_dwt_raw);
+void process_interrupt_qtimer2_ch0_irq(uint32_t isr_entry_dwt_raw);
 void process_interrupt_qtimer3_ch3_irq(uint32_t isr_entry_dwt_raw);
 
 // ============================================================================
 // Counter accessors (diagnostic, free-running)
 // ============================================================================
 
-uint16_t interrupt_qtimer3_ch2_counter_now(void);
+uint16_t interrupt_qtimer2_ch0_counter_now(void);
 uint16_t interrupt_qtimer3_ch3_counter_now(void);
 uint32_t interrupt_qtimer1_counter32_now (void);
 

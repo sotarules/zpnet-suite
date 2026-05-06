@@ -120,7 +120,7 @@ static const int GNSS_LOCK_PIN = 4;
 
 static const int GNSS_PPS_RELAY = 32;
 
-static constexpr int OCXO1_PIN = 14;
+static constexpr int OCXO1_PIN = 13;
 static constexpr int OCXO2_PIN = 15;
 
 // --------------------------------------------------------------

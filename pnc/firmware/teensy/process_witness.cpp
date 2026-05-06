@@ -7,7 +7,10 @@
 //
 //   • Stimulus source pin  — TimePop callback drives HIGH/LOW.
 //   • GPIO sink            — GPIO interrupt sees the source rising edge.
-//   • QTimer2 CH0 sink     — external-count compare sees stimulus edges.
+//
+// QTimer2 is no longer used by witness.  OCXO1 now owns QTimer2 CH0 through
+// process_interrupt, so witness preserves only the GPIO round-trip path and
+// TimePop-based bridge/phase reports.
 //
 // The PPS/VCLOCK bridge and phase witness no longer use QTimer1 CH1 or any
 // process_interrupt-hosted compare plumbing.  They are ordinary TimePop
@@ -20,22 +23,19 @@
 // phase reports are TimePop clients on the canonical PPS/VCLOCK timing rail.
 //
 // Current command surface:
-//   REPORT        — lifecycle/hardware/timer state.
+//   REPORT        — lifecycle/hardware/TimePop state.
 //   EDGE          — PPS/PPS_VCLOCK heartbeat + last edge facts.
 //   BRIDGE        — DWT/GNSS bridge check using TimePop fire facts.
 //   GPIO_DELAY    — simple digitalWriteFast HIGH stimulus cost.
 //   QTIMER_READ   — GPIO ISR-to-VCLOCK counter observation delay/cost.
-//   QTIMER_WRITE  — direct 16-bit QTimer CNTR write cost.
 //   DWT_READ      — consecutive DWT read-cost measurement.
 //   ENTRY_LATENCY — spin-shadow ISR entry latency for PPS.
 //   PPS_PHASE     — PPS/VCLOCK phase inferred from TimePop witness events.
-//   ROUND_TRIP    — source, GPIO sink, and QTimer sink latency stats.
+//   ROUND_TRIP    — source-to-GPIO ISR latency stats.
 //
 // Test cadence:
 //   • 100 ms: GPIO HIGH   (visible 1 Hz heartbeat; away from PPS)
 //   • 600 ms: GPIO LOW    (500 ms high duty interval)
-//   • 700 ms: QTIMER HIGH (separate local QTimer sink witness pulse)
-//   • 900 ms: QTIMER LOW
 //
 // The waveform slots are armed as one-shots once per scheduler cycle.  Do not
 // make HIGH/LOW independent 1 Hz recurring timers: TimePop intentionally
@@ -65,18 +65,13 @@
 
 static constexpr int WITNESS_STIMULUS_PIN = 24;
 static constexpr int WITNESS_GPIO_PIN     = 26;
-static constexpr int WITNESS_QTIMER_PIN   = 13;   // QTimer2 TIMER0 input
 
 static constexpr uint64_t GPIO_HIGH_OFFSET_NS   = 100000000ULL;
 static constexpr uint64_t GPIO_LOW_OFFSET_NS    = 600000000ULL;
-static constexpr uint64_t QTIMER_HIGH_OFFSET_NS = 700000000ULL;
-static constexpr uint64_t QTIMER_LOW_OFFSET_NS  = 900000000ULL;
 static constexpr uint64_t WITNESS_CYCLE_PERIOD_NS = 1000000000ULL;
 
 static constexpr const char* GPIO_HIGH_NAME   = "WITNESS_GPIO_HIGH";
 static constexpr const char* GPIO_LOW_NAME    = "WITNESS_GPIO_LOW";
-static constexpr const char* QTIMER_HIGH_NAME = "WITNESS_QTIMER_HIGH";
-static constexpr const char* QTIMER_LOW_NAME  = "WITNESS_QTIMER_LOW";
 static constexpr const char* WITNESS_CYCLE_NAME = "WITNESS_CYCLE";
 static constexpr const char* WITNESS_BRIDGE_NAME = "WITNESS_BRIDGE";
 static constexpr const char* WITNESS_SCHEDULER_NAME = "WITNESS_SCHEDULER";
@@ -84,17 +79,8 @@ static constexpr const char* WITNESS_SCHEDULER_NAME = "WITNESS_SCHEDULER";
 static constexpr uint64_t ENTRY_LATENCY_LEAD_NS = 5000ULL;
 static constexpr uint32_t ENTRY_LATENCY_TIMEOUT_CYCLES = 100000U;  // ~99 us @ 1.008 GHz
 static constexpr const char* ENTRY_PPS_SPIN_NAME = "ENTRY_LATENCY_PPS_SPIN";
-static constexpr const char* ENTRY_QTIMER_SPIN_NAME = "ENTRY_LATENCY_QTIMER_SPIN";
 
 static constexpr uint32_t VCLOCK_TICKS_PER_SECOND_U32 = 10000000U;
-
-// Best-guess physical pin-arrival latency model for PPS_PHASE.
-// ROUND_TRIP totals include software stimulus launch cost; subtract it when
-// estimating the delay from a physical pin transition to ISR entry.
-static constexpr uint32_t PPS_PIN_TO_ISR_CYCLES =
-    GPIO_TOTAL_LATENCY - WITNESS_STIMULATE_LATENCY;
-static constexpr uint32_t QTIMER_PIN_TO_ISR_CYCLES =
-    QTIMER_TOTAL_LATENCY - WITNESS_STIMULATE_LATENCY;
 
 static pps_t witness_last_physical_pps_diag(void) {
   const pps_edge_snapshot_t snap = interrupt_last_pps_edge();
@@ -169,7 +155,7 @@ static volatile uint32_t g_witness_last_stop_dwt = 0;
 static volatile uint32_t g_witness_cycle_count = 0;
 static volatile uint32_t g_witness_cycle_reschedules = 0;
 
-enum class witness_window_t : uint8_t { NONE = 0, GPIO, QTIMER };
+enum class witness_window_t : uint8_t { NONE = 0, GPIO };
 static volatile witness_window_t g_active_window = witness_window_t::NONE;
 
 static volatile bool g_source_high = false;
@@ -186,18 +172,8 @@ static volatile uint32_t g_gpio_dwt_at_isr = 0;
 static volatile uint32_t g_gpio_delta_cycles = 0;
 static volatile uint32_t g_gpio_wrong_window = 0;
 
-static volatile uint32_t g_qtimer_hits = 0;
-static volatile uint32_t g_qtimer_irq_entries = 0;
-static volatile uint32_t g_qtimer_no_flag = 0;
-static volatile uint32_t g_qtimer_outside_window = 0;
-static volatile uint32_t g_qtimer_arms = 0;
-static volatile uint32_t g_qtimer_dwt_at_isr = 0;
-static volatile uint32_t g_qtimer_delta_cycles = 0;
-static volatile uint16_t g_qtimer_compare_target = 0;
-
 static welford_t g_source_welford = {};
 static welford_t g_gpio_welford = {};
-static welford_t g_qtimer_welford = {};
 
 // ============================================================================
 // QTIMER_READ — cost of obtaining a VCLOCK counter observation inside GPIO ISR
@@ -226,38 +202,6 @@ static volatile uint32_t g_qtimer_read_entry_to_read_end_cycles = 0;
 static welford_t g_qtimer_read_entry_to_read_start_welford = {};
 static welford_t g_qtimer_read_counter_read_cost_welford = {};
 static welford_t g_qtimer_read_entry_to_read_end_welford = {};
-
-// ============================================================================
-// QTIMER_WRITE — cost of writing QTimer2 CH0 CNTR
-// ============================================================================
-//
-// DWT before and after a single 16-bit write to CH0 CNTR.  The write value is
-// taken from the ambient counter so this measures register write path cost
-// rather than a semantic retime operation.
-
-static volatile uint32_t g_qtimer_write_samples = 0;
-static volatile uint32_t g_qtimer_write_dwt_before = 0;
-static volatile uint32_t g_qtimer_write_dwt_after = 0;
-static volatile uint16_t g_qtimer_write_value = 0;
-static volatile uint32_t g_qtimer_write_cycles = 0;
-static welford_t g_qtimer_write_welford = {};
-
-static void capture_qtimer_write_sample(void) {
-  const uint16_t value = IMXRT_TMR2.CH[0].CNTR;
-  const uint32_t before = ARM_DWT_CYCCNT;
-  IMXRT_TMR2.CH[0].CNTR = value;
-  const uint32_t after = ARM_DWT_CYCCNT;
-
-  const uint32_t cycles = after - before;
-  g_qtimer_write_samples++;
-  g_qtimer_write_dwt_before = before;
-  g_qtimer_write_dwt_after = after;
-  g_qtimer_write_value = value;
-  g_qtimer_write_cycles = cycles;
-
-  welford_update(g_qtimer_write_welford, (int32_t)cycles);
-}
-
 
 // ============================================================================
 // GPIO_DELAY — simple digitalWriteFast HIGH stimulus cost
@@ -312,7 +256,6 @@ struct entry_latency_state_t {
 };
 
 static entry_latency_state_t g_entry_pps = {};
-static entry_latency_state_t g_entry_qtimer = {};
 
 // ============================================================================
 // PPS_PHASE — TimePop-authored PPS/VCLOCK phase witness
@@ -424,54 +367,15 @@ static welford_t g_bridge_dynamic_residual_welford = {};
 
 void witness_gpio_isr(void);
 
-static void qtimer2_isr(void);
 static void gpio_high_callback(timepop_ctx_t*, timepop_diag_t*, void*);
 static void gpio_low_callback(timepop_ctx_t*, timepop_diag_t*, void*);
-static void qtimer_high_callback(timepop_ctx_t*, timepop_diag_t*, void*);
-static void qtimer_low_callback(timepop_ctx_t*, timepop_diag_t*, void*);
 static void witness_scheduler_callback(timepop_ctx_t*, timepop_diag_t*, void*);
 static void witness_bridge_callback(timepop_ctx_t*, timepop_diag_t*, void*);
 static void entry_latency_pps_spin_callback(timepop_ctx_t*, timepop_diag_t*, void*);
 static void entry_latency_pps_isr_handler(uint32_t sequence, uint32_t isr_entry_dwt_raw);
 static bool entry_latency_arm_pps_spin(void);
-static void qtimer2_arm_next_edge(void);
 static bool witness_ensure_scheduled(void);
 static Payload witness_state_payload(void);
-
-// ============================================================================
-// QTimer2 CH0 helpers — intentionally old process_interrupt style
-// ============================================================================
-
-static inline void qtimer2_ch0_clear_compare_flag(void) {
-  IMXRT_TMR2.CH[0].CSCTRL &= ~(TMR_CSCTRL_TCF1 | TMR_CSCTRL_TCF2);
-}
-
-static inline void qtimer2_ch0_program_compare(uint16_t target_low16) {
-  qtimer2_ch0_clear_compare_flag();
-
-  IMXRT_TMR2.CH[0].COMP1  = target_low16;
-  IMXRT_TMR2.CH[0].CMPLD1 = target_low16;
-
-  qtimer2_ch0_clear_compare_flag();
-  IMXRT_TMR2.CH[0].CSCTRL |= TMR_CSCTRL_TCF1EN;
-}
-
-static inline void qtimer2_ch0_disable_compare(void) {
-  IMXRT_TMR2.CH[0].CSCTRL &= ~TMR_CSCTRL_TCF1EN;
-  qtimer2_ch0_clear_compare_flag();
-}
-
-static void qtimer2_arm_next_edge(void) {
-  if (!g_witness_running) return;
-
-  const uint16_t cntr = IMXRT_TMR2.CH[0].CNTR;
-  const uint16_t target = (uint16_t)(cntr + 1);
-
-  g_qtimer_compare_target = target;
-  g_qtimer_arms++;
-
-  qtimer2_ch0_program_compare(target);
-}
 
 // ============================================================================
 // Source drive
@@ -695,42 +599,7 @@ void witness_gpio_isr(void) {
 }
 
 // ============================================================================
-// QTimer2 sink ISR — old-style stable rail, self-rearming
-// ============================================================================
-
-static void qtimer2_isr(void) {
-  const uint32_t isr_entry_dwt_raw = ARM_DWT_CYCCNT;
-  g_qtimer_irq_entries++;
-
-  if (!(IMXRT_TMR2.CH[0].CSCTRL & TMR_CSCTRL_TCF1)) {
-    g_qtimer_no_flag++;
-    return;
-  }
-
-  qtimer2_ch0_clear_compare_flag();
-
-  if (!g_witness_running) {
-    return;
-  }
-
-  if (g_active_window == witness_window_t::QTIMER) {
-    const int32_t sample = (int32_t)(isr_entry_dwt_raw - g_source_dwt_at_emit);
-
-    g_qtimer_dwt_at_isr = isr_entry_dwt_raw;
-    g_qtimer_delta_cycles = (uint32_t)sample;
-    g_qtimer_hits++;
-    welford_update(g_qtimer_welford, sample);
-  } else {
-    g_qtimer_outside_window++;
-  }
-
-  // This is the key old-process_interrupt behavior: immediately re-arm
-  // against the continuously live counter from inside the ISR.
-  qtimer2_arm_next_edge();
-}
-
-// ============================================================================
-// TimePop waveform callbacks — separated GPIO/QTimer measurement windows
+// TimePop waveform callbacks — GPIO measurement window
 // ============================================================================
 
 static void gpio_high_callback(timepop_ctx_t*, timepop_diag_t*, void*) {
@@ -750,26 +619,10 @@ static void gpio_low_callback(timepop_ctx_t*, timepop_diag_t*, void*) {
   g_active_window = witness_window_t::NONE;
 }
 
-static void qtimer_high_callback(timepop_ctx_t*, timepop_diag_t*, void*) {
-  if (!g_witness_running) return;
-
-  detachInterrupt(digitalPinToInterrupt(WITNESS_GPIO_PIN));
-  g_active_window = witness_window_t::QTIMER;
-  witness_drive_high();
-}
-
-static void qtimer_low_callback(timepop_ctx_t*, timepop_diag_t*, void*) {
-  if (!g_witness_running) return;
-
-  witness_drive_low();
-  g_active_window = witness_window_t::NONE;
-}
 
 static void witness_cancel_periodic_callbacks(void) {
   timepop_cancel_by_name(GPIO_HIGH_NAME);
   timepop_cancel_by_name(GPIO_LOW_NAME);
-  timepop_cancel_by_name(QTIMER_HIGH_NAME);
-  timepop_cancel_by_name(QTIMER_LOW_NAME);
   timepop_cancel_by_name(WITNESS_BRIDGE_NAME);
 }
 
@@ -814,12 +667,6 @@ static bool witness_arm_periodic_clients(void) {
   ok = witness_arm_one_shot_at_offset(GPIO_LOW_NAME,
                                        GPIO_LOW_OFFSET_NS,
                                        gpio_low_callback) && ok;
-  ok = witness_arm_one_shot_at_offset(QTIMER_HIGH_NAME,
-                                       QTIMER_HIGH_OFFSET_NS,
-                                       qtimer_high_callback) && ok;
-  ok = witness_arm_one_shot_at_offset(QTIMER_LOW_NAME,
-                                       QTIMER_LOW_OFFSET_NS,
-                                       qtimer_low_callback) && ok;
   ok = witness_arm_one_shot_at_offset(WITNESS_BRIDGE_NAME,
                                        BRIDGE_SLOT_OFFSET_NS,
                                        witness_bridge_callback) && ok;
@@ -887,7 +734,6 @@ static void witness_start_always_on(void) {
 
   interrupt_register_pps_entry_latency_handler(entry_latency_pps_isr_handler);
 
-  qtimer2_arm_next_edge();
   witness_arm_scheduler();
   (void)witness_ensure_scheduled();
   (void)entry_latency_arm_pps_spin();
@@ -936,7 +782,6 @@ static Payload ns_welford_payload(const welford_t& w) {
 static const char* witness_window_str(witness_window_t w) {
   switch (w) {
     case witness_window_t::GPIO:   return "GPIO";
-    case witness_window_t::QTIMER: return "QTIMER";
     default:                       return "NONE";
   }
 }
@@ -959,23 +804,7 @@ static Payload witness_state_payload(void) {
   timepop_state.add("bridge_armed", g_bridge_armed);
   timepop_state.add("entry_pps_armed", g_entry_pps.armed);
   timepop_state.add("entry_pps_spin_active", g_entry_pps.spin_active);
-  timepop_state.add("entry_qtimer_armed", g_entry_qtimer.armed);
-  timepop_state.add("entry_qtimer_spin_active", g_entry_qtimer.spin_active);
   p.add_object("timepop", timepop_state);
-
-  Payload qtimer2;
-  qtimer2.add("counter", (uint32_t)IMXRT_TMR2.CH[0].CNTR);
-  qtimer2.add("comp1", (uint32_t)IMXRT_TMR2.CH[0].COMP1);
-  qtimer2.add("csctrl", (uint32_t)IMXRT_TMR2.CH[0].CSCTRL);
-  qtimer2.add("compare_enabled", (bool)(IMXRT_TMR2.CH[0].CSCTRL & TMR_CSCTRL_TCF1EN));
-  qtimer2.add("compare_flag", (bool)(IMXRT_TMR2.CH[0].CSCTRL & TMR_CSCTRL_TCF1));
-  qtimer2.add("arms", g_qtimer_arms);
-  qtimer2.add("irq_entries", g_qtimer_irq_entries);
-  qtimer2.add("hits", g_qtimer_hits);
-  qtimer2.add("no_flag", g_qtimer_no_flag);
-  qtimer2.add("outside_window", g_qtimer_outside_window);
-  qtimer2.add("last_compare_target", (uint32_t)g_qtimer_compare_target);
-  p.add_object("qtimer2_ch0_sink", qtimer2);
 
   Payload gpio;
   gpio.add("active_window", witness_window_str(g_active_window));
@@ -1004,13 +833,6 @@ static Payload witness_state_payload(void) {
   entry.add("pps_arm_failures", g_entry_pps.arm_failures);
   entry.add("pps_timeout_count", g_entry_pps.timeout_count);
   entry.add("pps_samples", g_entry_pps.sample_count);
-  entry.add("qtimer_armed", g_entry_qtimer.armed);
-  entry.add("qtimer_spin_active", g_entry_qtimer.spin_active);
-  entry.add("qtimer_last_timeout", g_entry_qtimer.last_timeout);
-  entry.add("qtimer_arm_count", g_entry_qtimer.arm_count);
-  entry.add("qtimer_arm_failures", g_entry_qtimer.arm_failures);
-  entry.add("qtimer_timeout_count", g_entry_qtimer.timeout_count);
-  entry.add("qtimer_samples", g_entry_qtimer.sample_count);
   p.add_object("entry_latency", entry);
 
   return p;
@@ -1341,28 +1163,6 @@ static Payload cmd_qtimer_read(const Payload&) {
   return p;
 }
 
-static Payload cmd_qtimer_write(const Payload&) {
-  capture_qtimer_write_sample();
-
-  Payload p;
-  p.add("model", "QTIMER_WRITE_CNTR_COST");
-  p.add("samples", g_qtimer_write_samples);
-  p.add("hardware_ready", g_witness_hw_ready);
-  p.add("runtime_ready", g_witness_runtime_ready);
-  p.add("irqs_enabled", g_witness_irqs_enabled);
-
-  Payload last;
-  last.add("dwt_before", g_qtimer_write_dwt_before);
-  last.add("dwt_after", g_qtimer_write_dwt_after);
-  last.add("value_written", (uint32_t)g_qtimer_write_value);
-  last.add("cycles", g_qtimer_write_cycles);
-  last.add("ns", cycles_to_ns((double)g_qtimer_write_cycles));
-  p.add_object("last", last);
-
-  p.add_object("welford", welford_payload(g_qtimer_write_welford));
-  return p;
-}
-
 // ============================================================================
 // ============================================================================
 // ENTRY_LATENCY command
@@ -1504,7 +1304,7 @@ static Payload cmd_round_trip(const Payload&) {
   (void)witness_ensure_scheduled();
 
   Payload p;
-  p.add("model", "ROUND_TRIP_LATENCY_SUMMARY");
+  p.add("model", "GPIO_ROUND_TRIP_LATENCY_SUMMARY");
 
   Payload stimulate;
   stimulate.add("last_cycles", g_source_stim_cycles);
@@ -1518,11 +1318,6 @@ static Payload cmd_round_trip(const Payload&) {
   gpio.add_object("welford", welford_payload(g_gpio_welford));
   p.add_object("gpio", gpio);
 
-  Payload qtimer;
-  qtimer.add("last_cycles", g_qtimer_delta_cycles);
-  qtimer.add("last_ns", cycles_to_ns((double)g_qtimer_delta_cycles));
-  qtimer.add_object("welford", welford_payload(g_qtimer_welford));
-  p.add_object("qtimer", qtimer);
 
   return p;
 }
@@ -1538,27 +1333,6 @@ void process_witness_init_hardware(void) {
   digitalWriteFast(WITNESS_STIMULUS_PIN, LOW);
 
   pinMode(WITNESS_GPIO_PIN, INPUT);
-
-  CCM_CCGR6 |= CCM_CCGR6_QTIMER2(CCM_CCGR_ON);
-
-  *(portConfigRegister(WITNESS_QTIMER_PIN)) = 1;
-  IOMUXC_QTIMER2_TIMER0_SELECT_INPUT = 1;
-
-  IMXRT_TMR2.CH[0].CTRL   = 0;
-  IMXRT_TMR2.CH[0].SCTRL  = 0;
-  IMXRT_TMR2.CH[0].CSCTRL = 0;
-  IMXRT_TMR2.CH[0].LOAD   = 0;
-  IMXRT_TMR2.CH[0].CNTR   = 0;
-  IMXRT_TMR2.CH[0].COMP1  = 0xFFFF;
-  IMXRT_TMR2.CH[0].CMPLD1 = 0xFFFF;
-  IMXRT_TMR2.CH[0].CMPLD2 = 0;
-  IMXRT_TMR2.CH[0].CTRL   = TMR_CTRL_CM(1) | TMR_CTRL_PCS(0);
-
-  qtimer2_ch0_disable_compare();
-
-  // Old process_interrupt asserted all four bits while shaking out the path.
-  // Preserve that behavior here rather than trying to be clever with CH0 only.
-  IMXRT_TMR2.ENBL |= (uint16_t)0x000F;
 
   g_witness_hw_ready = true;
 }
@@ -1583,19 +1357,8 @@ void process_witness_init(void) {
   g_gpio_delta_cycles = 0;
   g_gpio_wrong_window = 0;
 
-  g_qtimer_hits = 0;
-  g_qtimer_irq_entries = 0;
-  g_qtimer_no_flag = 0;
-  g_qtimer_outside_window = 0;
-  g_qtimer_arms = 0;
-  g_qtimer_dwt_at_isr = 0;
-  g_qtimer_delta_cycles = 0;
-  g_qtimer_compare_target = 0;
-
   welford_reset(g_source_welford);
   welford_reset(g_gpio_welford);
-  welford_reset(g_qtimer_welford);
-
   g_qtimer_read_samples = 0;
   g_qtimer_read_dwt_at_isr = 0;
   g_qtimer_read_dwt_before_counter_read = 0;
@@ -1608,12 +1371,6 @@ void process_witness_init(void) {
   welford_reset(g_qtimer_read_counter_read_cost_welford);
   welford_reset(g_qtimer_read_entry_to_read_end_welford);
 
-  g_qtimer_write_samples = 0;
-  g_qtimer_write_dwt_before = 0;
-  g_qtimer_write_dwt_after = 0;
-  g_qtimer_write_value = 0;
-  g_qtimer_write_cycles = 0;
-  welford_reset(g_qtimer_write_welford);
 
 
   g_gpio_delay_samples = 0;
@@ -1629,7 +1386,6 @@ void process_witness_init(void) {
   welford_reset(g_dwt_read_welford);
 
   entry_latency_reset(g_entry_pps);
-  entry_latency_reset(g_entry_qtimer);
 
   g_phase_last = pps_phase_capture_t{};
   g_phase_capture_seq = 0;
@@ -1661,11 +1417,9 @@ void process_witness_init(void) {
 
   digitalWriteFast(WITNESS_STIMULUS_PIN, LOW);
 
-  // Stable QTimer2 rail: configured once and left live. GPIO is attached
-  // only inside the GPIO measurement window.
+  // GPIO is attached only inside the GPIO measurement window.
   pinMode(WITNESS_GPIO_PIN, INPUT);
   detachInterrupt(digitalPinToInterrupt(WITNESS_GPIO_PIN));
-  qtimer2_ch0_disable_compare();
 
   g_witness_running = true;
   g_witness_schedule_armed = false;
@@ -1677,10 +1431,6 @@ void process_witness_init(void) {
 void process_witness_enable_irqs(void) {
   if (g_witness_irqs_enabled) return;
 
-  attachInterruptVector(IRQ_QTIMER2, qtimer2_isr);
-  NVIC_SET_PRIORITY(IRQ_QTIMER2, 16);
-  NVIC_ENABLE_IRQ(IRQ_QTIMER2);
-
   g_witness_irqs_enabled = true;
 }
 
@@ -1691,7 +1441,6 @@ static const process_command_entry_t WITNESS_COMMANDS[] = {
   { "PPS_PHASE",   cmd_pps_phase   },
   { "GPIO_DELAY",  cmd_gpio_delay  },
   { "QTIMER_READ", cmd_qtimer_read },
-  { "QTIMER_WRITE", cmd_qtimer_write },
   { "DWT_READ",    cmd_dwt_read    },
   { "ENTRY_LATENCY", cmd_entry_latency },
   { "ROUND_TRIP",  cmd_round_trip  },

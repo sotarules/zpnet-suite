@@ -73,7 +73,7 @@ FINAL DECISION:
 FINAL TIMER TOPOLOGY:
 
   QTimer1 → VCLOCK → pin 10
-  QTimer3 → OCXO1  → pin 14 (CH2)
+  QTimer2 → OCXO1  → pin 13 (CH0)
   QTimer3 → OCXO2  → pin 15 (CH3)
 
 CRITICAL PIN NOTES:
@@ -91,7 +91,7 @@ GND           Black         GND                Battery branching ground         
 4             Green         GNSS_LOCK_IN       GF-8802 LOCK                         Lock status signal
 10            Twisted Pair  GNSS_10MHZ_IN      GF-8802 VCLOCK                       QTimer1 ch0+ch1
 
-14            Twisted Pair  OCXO1_10MHZ_IN     OCXO1                                QTimer3 CH2
+13            Twisted Pair  OCXO1_10MHZ_IN     OCXO1                                QTimer3 CH0
 15            Twisted Pair  OCXO2_10MHZ_IN     OCXO2                                QTimer3 CH3
 18            Blue          SDA1               Rail bus SDA1
 19            Yellow        SCL1               Rail bus SCL1
@@ -106,7 +106,7 @@ GND           Black         GND                Battery branching ground         
 -------------------------------------------------------------------------------
 Timer hardware binding summary:
 
-  Pin 14  →  QTimer3 CH2
+  Pin 13  →  QTimer2 CH0
   Pin 15  →  QTimer3 CH3
   Pin 10  →  QTimer1 ch0+ch1
   Pin 10  →  QTimer1 ch2 compare
@@ -123,7 +123,7 @@ Signal Name          Source          Destination       Frequency    Timer HW
 ----------------------------------------------------------------------------------------------------------
 GNSS_PPS_IN          GF-8802 P17     Teensy pin 1      1 Hz         GPIO IRQ
 GNSS_10MHZ_IN        GF-8802 P11     Teensy pin 10     10 MHz       QTimer1
-OCXO1_10MHZ_IN       OCXO1           Teensy pin 14     10 MHz       QTimer3 CH2
+OCXO1_10MHZ_IN       OCXO1           Teensy pin 13     10 MHz       QTimer2 CH0
 OCXO2_10MHZ_IN       OCXO2           Teensy pin 15     10 MHz       QTimer3 CH3
 GNSS_PPS_RELAY       Teensy pin 32   Pi GPIO18/25      1 Hz         —
 
@@ -134,7 +134,7 @@ GNSS_PPS_RELAY       Teensy pin 32   Pi GPIO18/25      1 Hz         —
  (9) OCXO1 — AOCJY1-A
 -------------------------------------------------------------------------------
 
-  10 MHz output  →  Teensy pin 14 (QTimer3 CH2) via STP
+  10 MHz output  →  Teensy pin 13 (QTimer2 CH0) via STP
   CTL input      ←  AD5693R 0x4E VOUT
   VREF source    ←  Teensy pin 23
   Power          →  Dedicated 5V domain
