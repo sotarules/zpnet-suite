@@ -718,9 +718,9 @@ uint32_t interrupt_qtimer1_counter32_now (void);
 // Dynamic DWT cycles per GNSS second — compatibility accessor
 // ============================================================================
 //
-// Dynamic CPS ownership has moved to process_time.  process_interrupt still
-// exposes this legacy accessor so older diagnostics and callers can ask for
-// the current refined CPS without knowing about the ownership change.
+// Compatibility accessor for the current DWT cycles-per-GNSS-second estimate.
+// process_interrupt no longer asks process_time for this value; it mirrors the
+// best CLOCKS/Gamma-owned VCLOCK prediction available to the interrupt layer.
 
 uint32_t interrupt_dynamic_cps(void);
 

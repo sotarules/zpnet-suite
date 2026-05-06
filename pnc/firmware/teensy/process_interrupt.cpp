@@ -342,15 +342,18 @@ static pps_edge_dispatch_fn g_pps_edge_dispatch = nullptr;
 static void pps_edge_dispatch_trampoline(timepop_ctx_t*, timepop_diag_t*, void*);
 
 // ============================================================================
-// Dynamic CPS compatibility
+// DWT cycles-per-second compatibility
 // ============================================================================
 //
-// The intra-second DWT cycles-per-second refinement model is owned by
-// process_time.  process_interrupt still provides this legacy accessor so
-// existing diagnostics and callers continue to compile.
+// process_interrupt no longer asks process_time for dynamic CPS.  The legacy
+// interrupt_dynamic_cps() accessor now mirrors the best CLOCKS/Gamma-owned
+// VCLOCK prediction available to this file.  This keeps older diagnostics and
+// callers buildable while removing process_time from the interrupt hot path.
+
+static uint32_t interrupt_vclock_cycles_per_second(void);
 
 uint32_t interrupt_dynamic_cps(void) {
-  return time_dynamic_cps_current();
+  return interrupt_vclock_cycles_per_second();
 }
 
 // ============================================================================
@@ -435,10 +438,21 @@ static void pvc_anchor_publish(const pps_vclock_t& pvc) {
   g_pvc_anchor_ring[next].dwt_at_edge = pvc.dwt_at_edge;
   g_pvc_anchor_ring[next].counter32_at_edge = pvc.counter32_at_edge;
   g_pvc_anchor_ring[next].gnss_ns_at_edge = pvc.gnss_ns_at_edge;
+
+  // Store a reconstructive CPS with each anchor without consulting process_time.
+  // The newest anchor uses the just-measured previous PPS_VCLOCK interval as
+  // its forward projection denominator, matching the old random-walk policy.
   uint32_t cps = 0;
-  const bool cps_valid = time_dynamic_cps_for_pvc_sequence(pvc.sequence, &cps);
+  bool cps_valid = false;
+  if (g_pvc_anchor_count > 0) {
+    const pvc_anchor_record_t& prev = g_pvc_anchor_ring[g_pvc_anchor_head];
+    if (prev.sequence != 0) {
+      cps = pvc.dwt_at_edge - prev.dwt_at_edge;
+      cps_valid = (cps != 0);
+    }
+  }
   g_pvc_anchor_ring[next].cps = cps;
-  g_pvc_anchor_ring[next].cps_valid = cps_valid && cps != 0;
+  g_pvc_anchor_ring[next].cps_valid = cps_valid;
 
   g_pvc_anchor_head = next;
   if (g_pvc_anchor_count < PVC_ANCHOR_RING_SIZE) {
@@ -654,10 +668,40 @@ static int64_t vclock_gnss_from_counter32(uint32_t authored_counter32) {
   return pvc.gnss_ns_at_edge + (int64_t)delta_ticks * 100LL;
 }
 
+static uint32_t pvc_anchor_latest_cps(void) {
+  if (g_pvc_anchor_count == 0) return 0;
+  const pvc_anchor_record_t& a = g_pvc_anchor_ring[g_pvc_anchor_head];
+  return (a.cps_valid && a.cps != 0) ? a.cps : 0;
+}
+
+static uint32_t interrupt_vclock_cycles_per_second(void) {
+  clocks_gamma_prediction_snapshot_t gamma{};
+  if (clocks_gamma_snapshot(time_clock_id_t::VCLOCK, &gamma)) {
+    if (gamma.current_dynamic_prediction_cycles != 0) {
+      return gamma.current_dynamic_prediction_cycles;
+    }
+    if (gamma.current_static_prediction_cycles != 0) {
+      return gamma.current_static_prediction_cycles;
+    }
+    if (gamma.completed_dynamic_prediction_cycles != 0) {
+      return gamma.completed_dynamic_prediction_cycles;
+    }
+    if (gamma.completed_actual_dwt_cycles_between_edges != 0) {
+      return gamma.completed_actual_dwt_cycles_between_edges;
+    }
+  }
+
+  const uint32_t calibrated = clocks_dwt_cycles_per_gnss_second();
+  if (calibrated != 0) return calibrated;
+
+  const uint32_t anchor_cps = pvc_anchor_latest_cps();
+  if (anchor_cps != 0) return anchor_cps;
+
+  return DWT_EXPECTED_PER_PPS;
+}
+
 static uint32_t vclock_cycles_for_ticks(uint32_t vclock_ticks) {
-  uint32_t cycles = time_dwt_next_prediction_cycles();
-  if (cycles == 0) cycles = interrupt_dynamic_cps();
-  if (cycles == 0) cycles = DWT_EXPECTED_PER_PPS;
+  const uint32_t cycles = interrupt_vclock_cycles_per_second();
 
   return (uint32_t)(((uint64_t)cycles * (uint64_t)vclock_ticks +
                      (uint64_t)VCLOCK_COUNTS_PER_SECOND / 2ULL) /
@@ -750,8 +794,6 @@ static void publish_vclock_domain_pps_vclock(const pps_t& pps,
     pvc_anchor_ring_reset();
   }
 
-  time_dynamic_cps_pps_vclock_edge(pvc.sequence, pvc.dwt_at_edge);
-
   store_publish(pps, pvc);
   pvc_anchor_publish(pvc);
 }
@@ -840,17 +882,11 @@ static bridge_projection_t interrupt_dwt_to_vclock_gnss_projection(uint32_t dwt_
       continue;
     }
 
-    uint32_t cps = 0;
-    bool cps_valid = time_dynamic_cps_for_pvc_sequence(a.sequence, &cps);
-    if (!cps_valid && a.cps_valid && a.cps != 0) {
-      cps = a.cps;
-      cps_valid = true;
-    }
-
-    if (!cps_valid || cps == 0) {
+    if (!a.cps_valid || a.cps == 0) {
       out.anchor_failure_mask |= ANCHOR_FAIL_NO_CPS;
       continue;
     }
+    const uint32_t cps = a.cps;
 
     const uint32_t dwt_delta = dwt_at_event - a.dwt_at_edge;
     const uint64_t ns_delta =
@@ -877,6 +913,10 @@ static bridge_projection_t interrupt_dwt_to_vclock_gnss_projection(uint32_t dwt_
 
   out.anchor_failure_mask |= ANCHOR_FAIL_NO_PLAUSIBLE;
   return out;
+}
+
+static int64_t interrupt_project_dwt_to_vclock_gnss_ns(uint32_t dwt_at_event) {
+  return interrupt_dwt_to_vclock_gnss_projection(dwt_at_event).gnss_ns;
 }
 
 // ============================================================================
@@ -1538,8 +1578,6 @@ static void vclock_cadence_timepop_callback(timepop_ctx_t* ctx,
 
   const uint32_t cadence_tick_mod_1000 = g_vclock_lane.tick_mod_1000 + 1;
 
-  time_dynamic_cps_cadence_update(qtimer_event_dwt, cadence_tick_mod_1000);
-
   if ((cadence_tick_mod_1000 % 10U) == 0U &&
       cadence_tick_mod_1000 < TICKS_PER_SECOND_EVENT) {
     clocks_gamma_100hz_sample(time_clock_id_t::VCLOCK, qtimer_event_dwt);
@@ -1568,7 +1606,7 @@ static void vclock_cadence_timepop_callback(timepop_ctx_t* ctx,
     const dwt_repair_diag_t repair =
         vclock_endpoint_repair_diagnostic(qtimer_event_dwt);
     const int64_t pvc_gnss_ns =
-        vclock_next_epoch_gnss_ns(time_dwt_to_gnss_ns(qtimer_event_dwt));
+        vclock_next_epoch_gnss_ns(interrupt_project_dwt_to_vclock_gnss_ns(qtimer_event_dwt));
 
     // Repair is diagnostic-only for now: the observed TimePop/CH2 event DWT
     // remains the canonical PPS/VCLOCK bookend.
@@ -2130,7 +2168,7 @@ void process_interrupt_gpio6789_irq(uint32_t isr_entry_dwt_raw) {
 
     const int64_t selected_gnss_ns = zero_consumed
         ? (int64_t)zero_ns_consumed
-        : vclock_next_epoch_gnss_ns(time_dwt_to_gnss_ns(pps.dwt_at_edge));
+        : vclock_next_epoch_gnss_ns(interrupt_project_dwt_to_vclock_gnss_ns(pps.dwt_at_edge));
 
     g_vclock_epoch_latch.pending = true;
     g_vclock_epoch_latch.pps = pps;
@@ -2289,7 +2327,6 @@ void interrupt_request_pps_rebootstrap(void) {
   g_vclock_epoch_latch = vclock_epoch_latch_t{};
   g_vclock_epoch_gnss_ns = -1;
   g_pvc_anchor_reset_pending = true;
-  time_dynamic_cps_reset();
 }
 
 bool interrupt_pps_rebootstrap_pending(void) { return g_pps_rebootstrap_pending; }
@@ -2506,7 +2543,6 @@ void process_interrupt_init(void) {
   g_qtimer3_last_ch2_dwt_coordinate_source = QTIMER3_DWT_SOURCE_NONE;
   g_qtimer3_last_ch3_dwt_coordinate_source = QTIMER3_DWT_SOURCE_NONE;
 
-  time_dynamic_cps_reset();
 
   g_interrupt_runtime_ready = true;
 }
@@ -2670,20 +2706,25 @@ static Payload cmd_report(const Payload&) {
   p.add("ocxo2_tick_mod_1000",      g_ocxo2_lane.tick_mod_1000);
   p.add("ocxo2_logical_count32",    g_ocxo2_lane.logical_count32_at_last_second);
 
-  // Dynamic CPS — now owned by process_time; mirrored here for compatibility.
-  const time_dynamic_cps_snapshot_t dcps = time_dynamic_cps_snapshot();
-  p.add("dynamic_cps_owner", "TIME");
-  p.add("dynamic_cps",                         dcps.current_cycles);
-  p.add("dynamic_cps_valid",                   dcps.valid);
-  p.add("dynamic_cps_pps_sequence",            dcps.pvc_sequence);
-  p.add("dynamic_cps_last_pvc_dwt_at_edge",    dcps.pvc_dwt_at_edge);
-  p.add("dynamic_cps_last_reseed_value",       dcps.base_cycles);
-  p.add("dynamic_cps_last_reseed_was_computed", dcps.valid);
-  p.add("dynamic_cps_net_adjustment_cycles",   dcps.net_adjustment_cycles);
-  p.add("dynamic_cps_refine_ticks_this_second", dcps.refine_ticks_this_second);
-  p.add("dynamic_cps_adjustments_this_second", dcps.adjustments_this_second);
-  p.add("dynamic_cps_total_refine_ticks",      dcps.total_refine_ticks);
-  p.add("dynamic_cps_total_adjustments",       dcps.total_adjustments);
+  // Dynamic CPS compatibility — process_interrupt now mirrors CLOCKS/Gamma
+  // prediction directly and no longer queries process_time.
+  clocks_gamma_prediction_snapshot_t gamma{};
+  const bool gamma_ok = clocks_gamma_snapshot(time_clock_id_t::VCLOCK, &gamma);
+  const uint32_t dynamic_cps = interrupt_dynamic_cps();
+  p.add("dynamic_cps_owner", "CLOCKS_GAMMA");
+  p.add("dynamic_cps",                         dynamic_cps);
+  p.add("dynamic_cps_valid",                   dynamic_cps != 0);
+  p.add("dynamic_cps_pps_sequence",            gamma_ok ? gamma.edge_count : 0);
+  p.add("dynamic_cps_last_pvc_dwt_at_edge",    gamma_ok ? gamma.second_start_dwt : 0);
+  p.add("dynamic_cps_last_reseed_value",       gamma_ok ? gamma.current_static_prediction_cycles : 0);
+  p.add("dynamic_cps_last_reseed_was_computed", gamma_ok && gamma.current_static_prediction_cycles != 0);
+  p.add("dynamic_cps_net_adjustment_cycles",
+        gamma_ok ? (int32_t)((int64_t)gamma.current_dynamic_prediction_cycles -
+                             (int64_t)gamma.current_static_prediction_cycles) : 0);
+  p.add("dynamic_cps_refine_ticks_this_second", gamma_ok ? gamma.current_sample_count : 0);
+  p.add("dynamic_cps_adjustments_this_second", gamma_ok ? gamma.current_adjust_count : 0);
+  p.add("dynamic_cps_total_refine_ticks",      gamma_ok ? gamma.edge_count : 0);
+  p.add("dynamic_cps_total_adjustments",       gamma_ok ? gamma.completed_adjust_count : 0);
 
   p.add("pvc_anchor_ring_count", g_pvc_anchor_count);
   p.add("pvc_anchor_ring_head", g_pvc_anchor_head);
