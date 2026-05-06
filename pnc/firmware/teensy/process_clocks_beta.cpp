@@ -130,8 +130,19 @@ static uint64_t g_campaign_public_gnss_base = 0;
 static uint64_t g_campaign_public_ocxo1_base = 0;
 static uint64_t g_campaign_public_ocxo2_base = 0;
 
+static uint64_t clock_ns_at_fragment_dwt(time_clock_id_t clock,
+                                         uint64_t fallback_ns) {
+  const uint32_t fragment_dwt = g_dwt_at_pps_vclock;
+  uint64_t ns = 0;
+  if (fragment_dwt != 0 && time_clock_ns_at_dwt(clock, fragment_dwt, &ns)) {
+    return ns;
+  }
+  return fallback_ns;
+}
+
 static uint64_t current_raw_gnss_ns(void) {
-  return clocks_gnss_ns_now();
+  return clock_ns_at_fragment_dwt(time_clock_id_t::VCLOCK,
+                                  g_gnss_ns_at_pps_vclock);
 }
 
 static uint64_t current_raw_ocxo1_ns(void) {
@@ -391,7 +402,6 @@ static void payload_add_gamma_fragment(Payload& p,
 
   add_u32("static_prediction_cycle_count", g.completed_static_prediction_cycles);
   add_u32("dynamic_prediction_cycle_count", g.completed_dynamic_prediction_cycles);
-  add_u32("best_dwt_cycles_between_edges", g.completed_best_dwt_cycles);
   add_u32("actual_dwt_cycles_between_edges", g.completed_actual_dwt_cycles_between_edges);
   add_u32("prediction_match_count", g.completed_match_count);
   add_u32("prediction_adjust_count", g.completed_adjust_count);
@@ -411,7 +421,6 @@ static void payload_add_gamma_report_lane(Payload& p,
   lane.add("completed_edge_count", g.completed_edge_count);
   lane.add("completed_static_prediction_cycle_count", g.completed_static_prediction_cycles);
   lane.add("completed_dynamic_prediction_cycle_count", g.completed_dynamic_prediction_cycles);
-  lane.add("completed_best_dwt_cycles", g.completed_best_dwt_cycles);
   lane.add("completed_actual_dwt_cycles_between_edges", g.completed_actual_dwt_cycles_between_edges);
   lane.add("completed_match_count", g.completed_match_count);
   lane.add("completed_adjust_count", g.completed_adjust_count);
@@ -1005,18 +1014,17 @@ void clocks_beta_pps(void) {
     welford_update(welford_vclock, (double)g_vclock_measurement.second_residual_ns);
   }
 
-  // OCXO measurement Welfords use Alpha's Gamma-filtered measured-ns
-  // residuals.  Positive residual means the OCXO clock accumulated more than
-  // 1e9 ns over its 10,000,000-tick second, i.e. it is running fast versus
-  // the VCLOCK/GNSS reference.
-  if (g_ocxo1_measurement.dwt_cycles_between_edges != 0) {
-    const int64_t residual_fast_ns = g_ocxo1_measurement.second_residual_ns;
+  // OCXO measurement Welfords use the real bridge/GNSS interval, not the
+  // counter-derived synthetic interval. Positive residual means the OCXO
+  // one-second edge arrived early / the OCXO is running fast versus VCLOCK.
+  if (ocxo1_forensics_valid && ocxo1_forensics.bridge_interval_valid) {
+    const int64_t residual_fast_ns = -ocxo1_forensics.bridge_residual_ns;
     welford_update(welford_ocxo1, (double)residual_fast_ns);
     now_window_push(g_now_window_ocxo1, residual_fast_ns);
   }
 
-  if (g_ocxo2_measurement.dwt_cycles_between_edges != 0) {
-    const int64_t residual_fast_ns = g_ocxo2_measurement.second_residual_ns;
+  if (ocxo2_forensics_valid && ocxo2_forensics.bridge_interval_valid) {
+    const int64_t residual_fast_ns = -ocxo2_forensics.bridge_residual_ns;
     welford_update(welford_ocxo2, (double)residual_fast_ns);
     now_window_push(g_now_window_ocxo2, residual_fast_ns);
   }
@@ -1672,6 +1680,15 @@ static const char* prediction_detail_clock_name(time_clock_id_t clock) {
   }
 }
 
+static const char* prediction_detail_gate_decision_name(uint32_t decision) {
+  switch (decision) {
+    case 0U: return "MATCH";
+    case 1U: return "CORRECT";
+    case 2U: return "IGNORE";
+    default: return "UNKNOWN";
+  }
+}
+
 static Payload cmd_prediction_detail(const Payload& args) {
   const time_clock_id_t clock = prediction_detail_clock_from_args(args);
 
@@ -1721,7 +1738,15 @@ static Payload cmd_prediction_detail(const Payload& args) {
     e.add("actual_cycles_thus_far", s.actual_cycles_thus_far);
     e.add("residual_cycles", s.residual_cycles);
     e.add("abs_residual_cycles", s.abs_residual_cycles);
+    e.add("residual_centicycles", s.residual_centicycles);
+    e.add("abs_residual_centicycles", s.abs_residual_centicycles);
+    e.add("residual_cycles_exact", ((double)s.residual_centicycles) / 100.0, 3);
     e.add("gate_threshold_cycles", s.gate_threshold_cycles);
+    e.add("gate_match_max_centicycles", s.gate_match_max_centicycles);
+    e.add("gate_correct_min_centicycles", s.gate_correct_min_centicycles);
+    e.add("gate_correct_max_centicycles", s.gate_correct_max_centicycles);
+    e.add("gate_decision", s.gate_decision);
+    e.add("gate_decision_name", prediction_detail_gate_decision_name(s.gate_decision));
     e.add("accepted", s.accepted);
     e.add("ignored", s.ignored);
     e.add("correction_cycles", s.correction_cycles);

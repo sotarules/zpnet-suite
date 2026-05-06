@@ -182,6 +182,16 @@ struct clocks_gamma_prediction_detail_sample_t {
   bool     ignored;
   int32_t  correction_cycles;
   uint32_t gate_threshold_cycles;
+
+  // Fractional courtroom evidence, expressed in centicycles
+  // (100 centicycles == 1 DWT cycle). These expose the real gate decision
+  // before integer display rounding hides the fractional residual.
+  int32_t  residual_centicycles;
+  uint32_t abs_residual_centicycles;
+  uint32_t gate_match_max_centicycles;
+  uint32_t gate_correct_min_centicycles;
+  uint32_t gate_correct_max_centicycles;
+  uint32_t gate_decision;  // 0=match/no correction, 1=correct, 2=ignore
 };
 
 struct clocks_gamma_prediction_detail_snapshot_t {

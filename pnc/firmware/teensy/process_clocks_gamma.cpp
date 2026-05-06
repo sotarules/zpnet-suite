@@ -15,9 +15,14 @@
 // in-flight ISR event-coordinate DWT facts against the current prediction.
 //
 // Courtroom rule:
-//   error == 0      -> prediction stands
-//   error == +1/-1  -> dynamic prediction is adjusted by that one cycle
-//   |error| > 1     -> witness is ignored as ISR/preemption contamination
+//   Gamma compares actual integer DWT cycles thus far against the real-valued
+//   prediction implied by the current full-second cycle estimate.  The
+//   comparison is performed in scaled integer space so the fractional part of
+//   prediction_cycles * sample_index / 100 is not lost to truncation.
+//
+//   residual < ~0.75 cycles      -> prediction stands
+//   residual near +/-1 cycle     -> dynamic prediction is adjusted by one cycle
+//   residual clearly beyond that -> witness is ignored as ISR/preemption contamination
 //
 // No smoothing. No line fitting. No validity fog. A lane has an acquisition
 // second first; prediction begins only after a lane-local 10,000,000-tick span
@@ -32,6 +37,15 @@
 
 static constexpr uint32_t GAMMA_CADENCE_HZ = CLOCKS_GAMMA_CADENCE_HZ;
 static constexpr uint32_t GAMMA_ACCEPT_ERROR_CYCLES = 1U;
+static constexpr int64_t  GAMMA_RESIDUAL_SCALE = 100LL;
+static constexpr int64_t  GAMMA_CORRECT_MIN_SCALED_CYCLES = 75LL;
+static constexpr int64_t  GAMMA_CORRECT_MAX_SCALED_CYCLES = 125LL;
+static constexpr int64_t  GAMMA_MATCH_MAX_SCALED_CYCLES =
+    GAMMA_CORRECT_MIN_SCALED_CYCLES - 1LL;
+
+static constexpr uint32_t GAMMA_GATE_DECISION_MATCH = 0U;
+static constexpr uint32_t GAMMA_GATE_DECISION_CORRECT = 1U;
+static constexpr uint32_t GAMMA_GATE_DECISION_IGNORE = 2U;
 static constexpr uint32_t GAMMA_DETAIL_SAMPLE_COUNT = 10U;
 static constexpr uint32_t GAMMA_DETAIL_SAMPLE_STRIDE =
     GAMMA_CADENCE_HZ / GAMMA_DETAIL_SAMPLE_COUNT;
@@ -60,6 +74,16 @@ struct gamma_detail_sample_t {
   bool     ignored = false;
   int32_t  correction_cycles = 0;
   uint32_t gate_threshold_cycles = GAMMA_ACCEPT_ERROR_CYCLES;
+
+  // Fractional courtroom evidence.  Values are in centicycles
+  // (1 cycle == 100 centicycles) so prediction_cycles * sample_index / 100
+  // can be audited without losing the fractional part to integer division.
+  int32_t  residual_centicycles = 0;
+  uint32_t abs_residual_centicycles = 0;
+  uint32_t gate_match_max_centicycles = 0;
+  uint32_t gate_correct_min_centicycles = 0;
+  uint32_t gate_correct_max_centicycles = 0;
+  uint32_t gate_decision = 0;
 };
 
 struct gamma_detail_snapshot_t {
@@ -130,6 +154,56 @@ static gamma_lane_t* gamma_lane(time_clock_id_t clock) {
 
 static inline uint32_t gamma_abs_error(int32_t v) {
   return (v < 0) ? (uint32_t)(-(int64_t)v) : (uint32_t)v;
+}
+
+static inline uint64_t gamma_abs_i64(int64_t v) {
+  return (v < 0) ? (uint64_t)(-v) : (uint64_t)v;
+}
+
+static inline int32_t gamma_round_scaled_cycles_to_i32(int64_t scaled_cycles) {
+  if (scaled_cycles >= 0) {
+    const int64_t rounded =
+        (scaled_cycles + GAMMA_RESIDUAL_SCALE / 2LL) / GAMMA_RESIDUAL_SCALE;
+    return (rounded > (int64_t)INT32_MAX) ? INT32_MAX : (int32_t)rounded;
+  }
+
+  const int64_t rounded =
+      -(((-scaled_cycles) + GAMMA_RESIDUAL_SCALE / 2LL) / GAMMA_RESIDUAL_SCALE);
+  return (rounded < (int64_t)INT32_MIN) ? INT32_MIN : (int32_t)rounded;
+}
+
+static inline int32_t gamma_scaled_residual_to_i32(int64_t scaled_cycles) {
+  if (scaled_cycles > (int64_t)INT32_MAX) return INT32_MAX;
+  if (scaled_cycles < (int64_t)INT32_MIN) return INT32_MIN;
+  return (int32_t)scaled_cycles;
+}
+
+static inline uint32_t gamma_abs_scaled_residual_to_u32(int64_t scaled_cycles) {
+  const uint64_t abs_scaled = gamma_abs_i64(scaled_cycles);
+  return (abs_scaled > (uint64_t)UINT32_MAX) ? UINT32_MAX : (uint32_t)abs_scaled;
+}
+
+static inline int64_t gamma_scaled_residual_cycles(uint32_t actual_cycles_thus_far,
+                                                   uint32_t prediction_cycles,
+                                                   uint32_t sample_index) {
+  return (int64_t)actual_cycles_thus_far * GAMMA_RESIDUAL_SCALE -
+         (int64_t)prediction_cycles * (int64_t)sample_index;
+}
+
+static inline bool gamma_scaled_residual_warrants_correction(int64_t scaled_residual) {
+  const uint64_t abs_scaled = gamma_abs_i64(scaled_residual);
+  return abs_scaled >= (uint64_t)GAMMA_CORRECT_MIN_SCALED_CYCLES &&
+         abs_scaled <= (uint64_t)GAMMA_CORRECT_MAX_SCALED_CYCLES;
+}
+
+static inline bool gamma_scaled_residual_is_outlier(int64_t scaled_residual) {
+  return gamma_abs_i64(scaled_residual) >
+         (uint64_t)GAMMA_CORRECT_MAX_SCALED_CYCLES;
+}
+
+static inline int32_t gamma_correction_from_scaled_residual(int64_t scaled_residual) {
+  if (!gamma_scaled_residual_warrants_correction(scaled_residual)) return 0;
+  return (scaled_residual > 0) ? 1 : -1;
 }
 
 static uint32_t gamma_clock_id(time_clock_id_t clock) {
@@ -205,6 +279,8 @@ static void gamma_capture_detail_sample(gamma_lane_t& s,
                                         uint32_t dynamic_before,
                                         uint32_t dynamic_after,
                                         int32_t error_cycles,
+                                        int64_t scaled_residual_centicycles,
+                                        uint32_t gate_decision,
                                         bool accepted,
                                         bool ignored,
                                         int32_t correction_cycles,
@@ -243,6 +319,14 @@ static void gamma_capture_detail_sample(gamma_lane_t& s,
   d.gate_threshold_cycles = endpoint
       ? GAMMA_ACCEPT_ERROR_CYCLES
       : GAMMA_ACCEPT_ERROR_CYCLES;
+  d.residual_centicycles =
+      gamma_scaled_residual_to_i32(scaled_residual_centicycles);
+  d.abs_residual_centicycles =
+      gamma_abs_scaled_residual_to_u32(scaled_residual_centicycles);
+  d.gate_match_max_centicycles = (uint32_t)GAMMA_MATCH_MAX_SCALED_CYCLES;
+  d.gate_correct_min_centicycles = (uint32_t)GAMMA_CORRECT_MIN_SCALED_CYCLES;
+  d.gate_correct_max_centicycles = (uint32_t)GAMMA_CORRECT_MAX_SCALED_CYCLES;
+  d.gate_decision = gate_decision;
 
   s.current_detail[idx] = d;
 }
@@ -268,14 +352,22 @@ static void gamma_publish_completed_detail(gamma_lane_t& s,
   }
 
   const int32_t endpoint_error = d.dynamic_residual_cycles;
+  const int64_t endpoint_scaled_residual =
+      (int64_t)endpoint_error * GAMMA_RESIDUAL_SCALE;
+  const bool endpoint_outlier =
+      gamma_abs_error(endpoint_error) > GAMMA_ACCEPT_ERROR_CYCLES;
   gamma_capture_detail_sample(s,
                               GAMMA_CADENCE_HZ,
                               dwt_at_edge,
                               s.current_dynamic_prediction_cycles,
                               s.current_dynamic_prediction_cycles,
                               endpoint_error,
-                              gamma_abs_error(endpoint_error) <= GAMMA_ACCEPT_ERROR_CYCLES,
-                              gamma_abs_error(endpoint_error) > GAMMA_ACCEPT_ERROR_CYCLES,
+                              endpoint_scaled_residual,
+                              endpoint_outlier
+                                  ? GAMMA_GATE_DECISION_IGNORE
+                                  : GAMMA_GATE_DECISION_MATCH,
+                              !endpoint_outlier,
+                              endpoint_outlier,
                               0,
                               true);
   d.samples[GAMMA_DETAIL_SAMPLE_COUNT - 1U] =
@@ -350,11 +442,15 @@ static void gamma_100hz_sample_indexed(gamma_lane_t& s,
 
   if (sample_index == 0 || sample_index >= GAMMA_CADENCE_HZ) return;
 
+  const uint32_t actual_cycles_thus_far = dwt_at_sample - s.second_start_dwt;
   const uint32_t expected_dwt =
       s.second_start_dwt +
       gamma_expected_offset(s.current_dynamic_prediction_cycles, sample_index);
-  const int32_t error_cycles = (int32_t)(dwt_at_sample - expected_dwt);
-  const uint32_t abs_error = gamma_abs_error(error_cycles);
+  const int64_t scaled_residual =
+      gamma_scaled_residual_cycles(actual_cycles_thus_far,
+                                   s.current_dynamic_prediction_cycles,
+                                   sample_index);
+  const int32_t error_cycles = gamma_round_scaled_cycles_to_i32(scaled_residual);
 
   s.current_sample_count++;
   s.current_last_sample_index = sample_index;
@@ -366,21 +462,25 @@ static void gamma_100hz_sample_indexed(gamma_lane_t& s,
   bool accepted = false;
   bool ignored = false;
   int32_t correction_cycles = 0;
+  uint32_t gate_decision = GAMMA_GATE_DECISION_MATCH;
 
-  if (error_cycles == 0) {
+  correction_cycles = gamma_correction_from_scaled_residual(scaled_residual);
+  if (correction_cycles == 0 && !gamma_scaled_residual_is_outlier(scaled_residual)) {
     s.current_match_count++;
     accepted = true;
-  } else if (abs_error <= GAMMA_ACCEPT_ERROR_CYCLES) {
+    gate_decision = GAMMA_GATE_DECISION_MATCH;
+  } else if (correction_cycles != 0) {
     const int64_t corrected =
-        (int64_t)s.current_dynamic_prediction_cycles + (int64_t)error_cycles;
+        (int64_t)s.current_dynamic_prediction_cycles + (int64_t)correction_cycles;
     s.current_dynamic_prediction_cycles = (corrected <= 0)
         ? 1U
         : ((corrected > (int64_t)UINT32_MAX) ? UINT32_MAX : (uint32_t)corrected);
     s.current_adjust_count++;
     accepted = true;
-    correction_cycles = error_cycles;
+    gate_decision = GAMMA_GATE_DECISION_CORRECT;
   } else {
     ignored = true;
+    gate_decision = GAMMA_GATE_DECISION_IGNORE;
     if (s.current_ignored_count == 0) {
       s.current_ignored_min_error_cycles = error_cycles;
       s.current_ignored_max_error_cycles = error_cycles;
@@ -401,6 +501,8 @@ static void gamma_100hz_sample_indexed(gamma_lane_t& s,
                               dynamic_before,
                               s.current_dynamic_prediction_cycles,
                               error_cycles,
+                              scaled_residual,
+                              gate_decision,
                               accepted,
                               ignored,
                               correction_cycles,
@@ -513,6 +615,12 @@ static void gamma_copy_detail_sample(const gamma_detail_sample_t& in,
   out.ignored = in.ignored;
   out.correction_cycles = in.correction_cycles;
   out.gate_threshold_cycles = in.gate_threshold_cycles;
+  out.residual_centicycles = in.residual_centicycles;
+  out.abs_residual_centicycles = in.abs_residual_centicycles;
+  out.gate_match_max_centicycles = in.gate_match_max_centicycles;
+  out.gate_correct_min_centicycles = in.gate_correct_min_centicycles;
+  out.gate_correct_max_centicycles = in.gate_correct_max_centicycles;
+  out.gate_decision = in.gate_decision;
 }
 
 bool clocks_gamma_prediction_detail_snapshot(
