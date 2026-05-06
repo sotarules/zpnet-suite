@@ -106,6 +106,12 @@ struct clocks_gamma_prediction_snapshot_t {
   uint32_t completed_edge_count;
   uint32_t completed_static_prediction_cycles;
   uint32_t completed_dynamic_prediction_cycles;
+
+  // Gamma's best completed DWT span for this clock-second.  This is the
+  // dynamic prediction after the 100 Hz courtroom has accepted/rejected
+  // evidence.  Alpha uses this as the DWT span for OCXO measured-ns ledgers.
+  uint32_t completed_best_dwt_cycles;
+
   uint32_t completed_actual_dwt_cycles_between_edges;
   uint32_t completed_match_count;
   uint32_t completed_adjust_count;

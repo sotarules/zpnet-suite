@@ -97,6 +97,7 @@ struct gamma_lane_t {
   uint32_t completed_edge_count = 0;
   uint32_t completed_static_prediction_cycles = 0;
   uint32_t completed_dynamic_prediction_cycles = 0;
+  uint32_t completed_best_dwt_cycles = 0;
   uint32_t completed_actual_dwt_cycles_between_edges = 0;
   uint32_t completed_match_count = 0;
   uint32_t completed_adjust_count = 0;
@@ -168,6 +169,7 @@ static void gamma_reset_lane(gamma_lane_t& s) {
   s.completed_edge_count = 0;
   s.completed_static_prediction_cycles = 0;
   s.completed_dynamic_prediction_cycles = 0;
+  s.completed_best_dwt_cycles = 0;
   s.completed_actual_dwt_cycles_between_edges = 0;
   s.completed_match_count = 0;
   s.completed_adjust_count = 0;
@@ -304,9 +306,14 @@ void clocks_gamma_second_edge(time_clock_id_t clock, uint32_t dwt_at_edge) {
 
   gamma_publish_completed_detail(*s, dwt_at_edge, actual_cycles);
 
+  const uint32_t best_cycles = (s->current_dynamic_prediction_cycles != 0)
+      ? s->current_dynamic_prediction_cycles
+      : actual_cycles;
+
   s->completed_edge_count = s->edge_count;
   s->completed_static_prediction_cycles = s->current_static_prediction_cycles;
   s->completed_dynamic_prediction_cycles = s->current_dynamic_prediction_cycles;
+  s->completed_best_dwt_cycles = best_cycles;
   s->completed_actual_dwt_cycles_between_edges = actual_cycles;
   s->completed_match_count = s->current_match_count;
   s->completed_adjust_count = s->current_adjust_count;
@@ -436,6 +443,7 @@ static void gamma_copy_snapshot(time_clock_id_t clock,
   out.completed_edge_count = s.completed_edge_count;
   out.completed_static_prediction_cycles = s.completed_static_prediction_cycles;
   out.completed_dynamic_prediction_cycles = s.completed_dynamic_prediction_cycles;
+  out.completed_best_dwt_cycles = s.completed_best_dwt_cycles;
   out.completed_actual_dwt_cycles_between_edges = s.completed_actual_dwt_cycles_between_edges;
   out.completed_match_count = s.completed_match_count;
   out.completed_adjust_count = s.completed_adjust_count;
