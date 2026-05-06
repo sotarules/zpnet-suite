@@ -232,11 +232,11 @@ static constexpr uint32_t TICKS_PER_SECOND_EVENT = 1000U;
 // ============================================================================
 
 static constexpr uint32_t DWT_CYCCNT_TO_MEMORY_CYCLES = 1;
-static constexpr uint32_t WITNESS_STIMULATE_LATENCY = 10;
-static constexpr uint32_t QTIMER_READ_LATENCY = 36;
+static constexpr uint32_t WITNESS_STIMULATE_LATENCY = 5;
+static constexpr uint32_t QTIMER_READ_LATENCY = 39;
 
 static constexpr uint32_t GPIO_TOTAL_LATENCY = 63;
-static constexpr uint32_t QTIMER_TOTAL_LATENCY = 47;
+static constexpr uint32_t QTIMER_TOTAL_LATENCY = 46;
 
 static constexpr uint32_t PPS_ISR_ENTRY_OVERHEAD    = 45;
 static constexpr uint32_t QTIMER_ISR_ENTRY_OVERHEAD = 19;

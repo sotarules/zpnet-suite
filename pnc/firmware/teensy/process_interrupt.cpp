@@ -1096,6 +1096,66 @@ static volatile uint32_t g_qtimer3_pair_coalesce_timeout_count = 0;
 static volatile uint32_t g_qtimer3_last_pair_coalesce_peer_channel = 0;
 static volatile uint32_t g_qtimer3_last_pair_coalesce_ticks_until_peer = 0;
 static volatile uint32_t g_qtimer3_last_pair_coalesce_wait_cycles = 0;
+static volatile uint32_t g_qtimer3_last_pair_coalesce_pending_channel = 0;
+static volatile uint32_t g_qtimer3_last_pair_coalesce_pending_late_ticks = 0;
+static volatile uint32_t g_qtimer3_last_pair_coalesce_physical_separation_ticks = 0;
+
+// QTimer3 paired-reconstruction physical-base audit.
+//
+// The paired path reconstructs both OCXO DWT event coordinates from one ISR
+// entry.  The crucial question is whether the chosen reconstruction base
+// matches the physical first event.  Synthetic counter32 target ordering can
+// be misleading when OCXO lanes have independent origins, so this block records
+// three independent order witnesses:
+//   1. pending mask at ISR entry,
+//   2. coalescer pending-channel + peer-distance evidence,
+//   3. compare-late ordering at paired service entry.
+// These fields are report-only and do not change ISR behavior.
+static volatile uint32_t g_qtimer3_last_pair_entry_pending_mask = 0;
+static volatile uint32_t g_qtimer3_last_pair_after_coalesce_pending_mask = 0;
+static volatile uint32_t g_qtimer3_pair_initial_ch2_only_count = 0;
+static volatile uint32_t g_qtimer3_pair_initial_ch3_only_count = 0;
+static volatile uint32_t g_qtimer3_pair_initial_both_count = 0;
+static volatile uint32_t g_qtimer3_pair_initial_other_count = 0;
+
+static volatile uint32_t g_qtimer3_last_pair_ch2_counter16_at_entry = 0;
+static volatile uint32_t g_qtimer3_last_pair_ch3_counter16_at_entry = 0;
+static volatile uint32_t g_qtimer3_last_pair_ch2_compare_target_at_entry = 0;
+static volatile uint32_t g_qtimer3_last_pair_ch3_compare_target_at_entry = 0;
+static volatile uint32_t g_qtimer3_last_pair_ch2_late_ticks_at_entry = 0;
+static volatile uint32_t g_qtimer3_last_pair_ch3_late_ticks_at_entry = 0;
+static volatile int32_t  g_qtimer3_last_pair_late_delta_ticks = 0;
+
+static volatile uint32_t g_qtimer3_last_pair_ch2_target32 = 0;
+static volatile uint32_t g_qtimer3_last_pair_ch3_target32 = 0;
+static volatile uint32_t g_qtimer3_last_pair_synthetic_base_channel = 0;
+static volatile uint32_t g_qtimer3_last_pair_synthetic_separation_ticks = 0;
+static volatile uint32_t g_qtimer3_last_pair_physical_base_channel = 0;
+static volatile uint32_t g_qtimer3_last_pair_physical_base_source = 0;
+static volatile uint32_t g_qtimer3_last_pair_physical_separation_ticks = 0;
+static volatile int32_t  g_qtimer3_last_pair_separation_error_ticks = 0;
+
+static volatile int32_t  g_qtimer3_last_pair_physical_ch2_offset_cycles = 0;
+static volatile int32_t  g_qtimer3_last_pair_physical_ch3_offset_cycles = 0;
+static volatile int32_t  g_qtimer3_last_pair_synthetic_ch2_offset_cycles = 0;
+static volatile int32_t  g_qtimer3_last_pair_synthetic_ch3_offset_cycles = 0;
+static volatile int32_t  g_qtimer3_last_pair_ch2_offset_error_cycles = 0;
+static volatile int32_t  g_qtimer3_last_pair_ch3_offset_error_cycles = 0;
+static volatile uint32_t g_qtimer3_last_pair_reconstruction_base_channel = 0;
+static volatile uint32_t g_qtimer3_last_pair_reconstruction_base_source = 0;
+
+static volatile uint32_t g_qtimer3_pair_synthetic_ch2_base_count = 0;
+static volatile uint32_t g_qtimer3_pair_synthetic_ch3_base_count = 0;
+static volatile uint32_t g_qtimer3_pair_physical_ch2_base_count = 0;
+static volatile uint32_t g_qtimer3_pair_physical_ch3_base_count = 0;
+static volatile uint32_t g_qtimer3_pair_physical_tie_count = 0;
+static volatile uint32_t g_qtimer3_pair_base_match_count = 0;
+static volatile uint32_t g_qtimer3_pair_base_mismatch_count = 0;
+static volatile uint32_t g_qtimer3_pair_base_unknown_count = 0;
+static volatile uint32_t g_qtimer3_pair_separation_mismatch_count = 0;
+static volatile uint32_t g_qtimer3_pair_physical_reconstruction_count = 0;
+static volatile uint32_t g_qtimer3_pair_synthetic_fallback_count = 0;
+static volatile uint32_t g_qtimer3_pair_tie_reconstruction_count = 0;
 
 static volatile uint32_t g_qtimer3_last_pair_base_dwt_raw = 0;
 static volatile uint32_t g_qtimer3_last_pair_base_event_dwt = 0;
@@ -1107,6 +1167,53 @@ static volatile uint32_t g_qtimer3_last_ch2_event_dwt = 0;
 static volatile uint32_t g_qtimer3_last_ch3_event_dwt = 0;
 static volatile uint32_t g_qtimer3_last_ch2_dwt_coordinate_source = QTIMER3_DWT_SOURCE_NONE;
 static volatile uint32_t g_qtimer3_last_ch3_dwt_coordinate_source = QTIMER3_DWT_SOURCE_NONE;
+
+
+// QTimer3 single-lane service timing audit.
+//
+// This answers the design question: is QTIMER3_PAIR_COALESCE_TICKS large
+// enough to cover the real single-lane service window?  If the peer compare is
+// farther away than the coalesce threshold but still becomes pending before the
+// single-lane path returns, the threshold is too small for nanosecond-grade
+// custody.  All values are report-only; they do not alter ISR behavior.
+static volatile uint32_t g_qtimer3_single_service_last_channel = 0;
+static volatile uint32_t g_qtimer3_single_service_last_cycles = 0;
+static volatile uint32_t g_qtimer3_single_service_last_ticks = 0;
+static volatile uint32_t g_qtimer3_single_service_max_cycles = 0;
+static volatile uint32_t g_qtimer3_single_service_max_ticks = 0;
+static volatile uint64_t g_qtimer3_single_service_sum_cycles = 0;
+static volatile uint64_t g_qtimer3_single_service_sum_ticks = 0;
+static volatile uint32_t g_qtimer3_single_service_sample_count = 0;
+static volatile uint32_t g_qtimer3_single_service_exceeds_threshold_count = 0;
+
+static volatile uint32_t g_qtimer3_single_total_last_cycles = 0;
+static volatile uint32_t g_qtimer3_single_total_last_ticks = 0;
+static volatile uint32_t g_qtimer3_single_total_max_cycles = 0;
+static volatile uint32_t g_qtimer3_single_total_max_ticks = 0;
+
+static volatile uint32_t g_qtimer3_single_ch2_service_last_cycles = 0;
+static volatile uint32_t g_qtimer3_single_ch2_service_last_ticks = 0;
+static volatile uint32_t g_qtimer3_single_ch2_service_max_cycles = 0;
+static volatile uint32_t g_qtimer3_single_ch2_service_max_ticks = 0;
+static volatile uint64_t g_qtimer3_single_ch2_service_sum_cycles = 0;
+static volatile uint64_t g_qtimer3_single_ch2_service_sum_ticks = 0;
+
+static volatile uint32_t g_qtimer3_single_ch3_service_last_cycles = 0;
+static volatile uint32_t g_qtimer3_single_ch3_service_last_ticks = 0;
+static volatile uint32_t g_qtimer3_single_ch3_service_max_cycles = 0;
+static volatile uint32_t g_qtimer3_single_ch3_service_max_ticks = 0;
+static volatile uint64_t g_qtimer3_single_ch3_service_sum_cycles = 0;
+static volatile uint64_t g_qtimer3_single_ch3_service_sum_ticks = 0;
+
+static volatile uint32_t g_qtimer3_single_last_peer_channel = 0;
+static volatile uint32_t g_qtimer3_single_last_peer_ticks_until_service = 0;
+static volatile bool     g_qtimer3_single_last_peer_pending_after_service = false;
+static volatile int32_t  g_qtimer3_single_last_margin_ticks = 0;
+static volatile int32_t  g_qtimer3_single_min_margin_ticks = 0x7FFFFFFF;
+static volatile uint32_t g_qtimer3_single_peer_pending_after_service_count = 0;
+static volatile uint32_t g_qtimer3_single_peer_after_threshold_pending_count = 0;
+static volatile uint32_t g_qtimer3_single_peer_inside_service_count = 0;
+static volatile uint32_t g_qtimer3_single_peer_after_threshold_inside_service_count = 0;
 
 static inline uint32_t clock32_from_ns(uint64_t ns) {
   return (uint32_t)((ns / 100ULL) & 0xFFFFFFFFULL);
@@ -1666,6 +1773,114 @@ static int32_t qtimer3_signed_dwt_cycles_for_ticks(int32_t ticks) {
   return (ticks < 0) ? -(int32_t)cycles : (int32_t)cycles;
 }
 
+
+static uint32_t qtimer3_dwt_cycles_to_10mhz_ticks_ceil(uint32_t cycles) {
+  const uint32_t cps = interrupt_vclock_cycles_per_second();
+  if (cps == 0) return 0;
+  const uint64_t numerator = (uint64_t)cycles * (uint64_t)VCLOCK_COUNTS_PER_SECOND;
+  return (uint32_t)((numerator + (uint64_t)cps - 1ULL) / (uint64_t)cps);
+}
+
+static inline void qtimer3_update_max_u32(volatile uint32_t& target,
+                                          uint32_t value) {
+  if (value > target) target = value;
+}
+
+static inline void qtimer3_update_min_i32(volatile int32_t& target,
+                                          int32_t value) {
+  if (value < target) target = value;
+}
+
+static bool qtimer3_peer_pending_for_single_channel(uint32_t service_channel) {
+  if (service_channel == 2U) {
+    return (IMXRT_TMR3.CH[3].CSCTRL & TMR_CSCTRL_TCF1) != 0;
+  }
+  if (service_channel == 3U) {
+    return (IMXRT_TMR3.CH[2].CSCTRL & TMR_CSCTRL_TCF1) != 0;
+  }
+  return false;
+}
+
+static uint32_t qtimer3_peer_ticks_until_for_single_channel(uint32_t service_channel) {
+  if (service_channel == 2U) {
+    return (uint32_t)((uint16_t)(g_ocxo2_lane.compare_target -
+                                g_ocxo2_lane.module->CH[g_ocxo2_lane.channel].CNTR));
+  }
+  if (service_channel == 3U) {
+    return (uint32_t)((uint16_t)(g_ocxo1_lane.compare_target -
+                                g_ocxo1_lane.module->CH[g_ocxo1_lane.channel].CNTR));
+  }
+  return 0;
+}
+
+static void qtimer3_record_single_service(uint32_t service_channel,
+                                          uint32_t isr_entry_dwt_raw,
+                                          uint32_t service_start_dwt,
+                                          uint32_t service_end_dwt,
+                                          uint32_t peer_ticks_until_service,
+                                          bool peer_pending_after_service) {
+  const uint32_t service_cycles = service_end_dwt - service_start_dwt;
+  const uint32_t total_cycles = service_end_dwt - isr_entry_dwt_raw;
+  const uint32_t service_ticks = qtimer3_dwt_cycles_to_10mhz_ticks_ceil(service_cycles);
+  const uint32_t total_ticks = qtimer3_dwt_cycles_to_10mhz_ticks_ceil(total_cycles);
+  const int32_t margin_ticks =
+      (int32_t)((int64_t)peer_ticks_until_service - (int64_t)service_ticks);
+
+  g_qtimer3_single_service_last_channel = service_channel;
+  g_qtimer3_single_service_last_cycles = service_cycles;
+  g_qtimer3_single_service_last_ticks = service_ticks;
+  g_qtimer3_single_service_sum_cycles += (uint64_t)service_cycles;
+  g_qtimer3_single_service_sum_ticks += (uint64_t)service_ticks;
+  g_qtimer3_single_service_sample_count++;
+  qtimer3_update_max_u32(g_qtimer3_single_service_max_cycles, service_cycles);
+  qtimer3_update_max_u32(g_qtimer3_single_service_max_ticks, service_ticks);
+
+  g_qtimer3_single_total_last_cycles = total_cycles;
+  g_qtimer3_single_total_last_ticks = total_ticks;
+  qtimer3_update_max_u32(g_qtimer3_single_total_max_cycles, total_cycles);
+  qtimer3_update_max_u32(g_qtimer3_single_total_max_ticks, total_ticks);
+
+  if (service_ticks > QTIMER3_PAIR_COALESCE_TICKS) {
+    g_qtimer3_single_service_exceeds_threshold_count++;
+  }
+
+  if (service_channel == 2U) {
+    g_qtimer3_single_ch2_service_last_cycles = service_cycles;
+    g_qtimer3_single_ch2_service_last_ticks = service_ticks;
+    g_qtimer3_single_ch2_service_sum_cycles += (uint64_t)service_cycles;
+    g_qtimer3_single_ch2_service_sum_ticks += (uint64_t)service_ticks;
+    qtimer3_update_max_u32(g_qtimer3_single_ch2_service_max_cycles, service_cycles);
+    qtimer3_update_max_u32(g_qtimer3_single_ch2_service_max_ticks, service_ticks);
+  } else if (service_channel == 3U) {
+    g_qtimer3_single_ch3_service_last_cycles = service_cycles;
+    g_qtimer3_single_ch3_service_last_ticks = service_ticks;
+    g_qtimer3_single_ch3_service_sum_cycles += (uint64_t)service_cycles;
+    g_qtimer3_single_ch3_service_sum_ticks += (uint64_t)service_ticks;
+    qtimer3_update_max_u32(g_qtimer3_single_ch3_service_max_cycles, service_cycles);
+    qtimer3_update_max_u32(g_qtimer3_single_ch3_service_max_ticks, service_ticks);
+  }
+
+  g_qtimer3_single_last_peer_channel = (service_channel == 2U) ? 3U : 2U;
+  g_qtimer3_single_last_peer_ticks_until_service = peer_ticks_until_service;
+  g_qtimer3_single_last_peer_pending_after_service = peer_pending_after_service;
+  g_qtimer3_single_last_margin_ticks = margin_ticks;
+  qtimer3_update_min_i32(g_qtimer3_single_min_margin_ticks, margin_ticks);
+
+  if (margin_ticks <= 0) {
+    g_qtimer3_single_peer_inside_service_count++;
+    if (peer_ticks_until_service > QTIMER3_PAIR_COALESCE_TICKS) {
+      g_qtimer3_single_peer_after_threshold_inside_service_count++;
+    }
+  }
+
+  if (peer_pending_after_service) {
+    g_qtimer3_single_peer_pending_after_service_count++;
+    if (peer_ticks_until_service > QTIMER3_PAIR_COALESCE_TICKS) {
+      g_qtimer3_single_peer_after_threshold_pending_count++;
+    }
+  }
+}
+
 static uint32_t ocxo_next_authored_counter32(interrupt_subscriber_kind_t kind,
                                              const ocxo_lane_t& lane) {
   const synthetic_clock32_t* c = synthetic_clock_for_kind(kind);
@@ -1684,13 +1899,23 @@ static uint32_t qtimer3_ticks_until_peer_compare(ocxo_lane_t& peer) {
 static void qtimer3_try_coalesce_peer(bool& ch2_pending,
                                       bool& ch3_pending,
                                       uint32_t entry_dwt_raw) {
+  (void)entry_dwt_raw;
   if (ch2_pending == ch3_pending) return;
 
+  ocxo_lane_t& pending = ch2_pending ? g_ocxo1_lane : g_ocxo2_lane;
   ocxo_lane_t& peer = ch2_pending ? g_ocxo2_lane : g_ocxo1_lane;
+  const uint32_t pending_channel = ch2_pending ? 2U : 3U;
   const uint32_t peer_channel = ch2_pending ? 3U : 2U;
+  const uint32_t pending_late_ticks =
+      (uint32_t)((uint16_t)(pending.module->CH[pending.channel].CNTR -
+                            pending.compare_target));
   const uint32_t ticks_until_peer = qtimer3_ticks_until_peer_compare(peer);
+  g_qtimer3_last_pair_coalesce_pending_channel = pending_channel;
+  g_qtimer3_last_pair_coalesce_pending_late_ticks = pending_late_ticks;
   g_qtimer3_last_pair_coalesce_peer_channel = peer_channel;
   g_qtimer3_last_pair_coalesce_ticks_until_peer = ticks_until_peer;
+  g_qtimer3_last_pair_coalesce_physical_separation_ticks =
+      pending_late_ticks + ticks_until_peer;
 
   if (ticks_until_peer > QTIMER3_PAIR_COALESCE_TICKS) return;
 
@@ -1774,11 +1999,47 @@ void process_interrupt_qtimer3_ch3_irq(uint32_t isr_entry_dwt_raw) {
   if (g_rt_ocxo2) handle_ocxo_qtimer16_irq(g_ocxo2_lane, *g_rt_ocxo2, isr_entry_dwt_raw);
 }
 
+static uint32_t qtimer3_pending_mask(bool ch2_pending, bool ch3_pending) {
+  return (ch2_pending ? 1U : 0U) | (ch3_pending ? 2U : 0U);
+}
+
+static void qtimer3_note_pair_entry_mask(uint32_t initial_mask, uint32_t final_mask) {
+  g_qtimer3_last_pair_entry_pending_mask = initial_mask;
+  g_qtimer3_last_pair_after_coalesce_pending_mask = final_mask;
+
+  if (initial_mask == 1U) {
+    g_qtimer3_pair_initial_ch2_only_count++;
+  } else if (initial_mask == 2U) {
+    g_qtimer3_pair_initial_ch3_only_count++;
+  } else if (initial_mask == 3U) {
+    g_qtimer3_pair_initial_both_count++;
+  } else {
+    g_qtimer3_pair_initial_other_count++;
+  }
+}
+
 static void qtimer3_handle_coupled_pair(uint32_t pair_entry_dwt_raw) {
   g_qtimer3_pair_reconstruction_count++;
   g_qtimer3_dual_pending_count++;
   g_qtimer3_dual_same_pass_count++;
-  g_qtimer3_dual_ch2_first_count++;
+
+  const uint16_t ch2_counter16_at_entry = IMXRT_TMR3.CH[2].CNTR;
+  const uint16_t ch3_counter16_at_entry = IMXRT_TMR3.CH[3].CNTR;
+  const uint16_t ch2_compare_at_entry = g_ocxo1_lane.compare_target;
+  const uint16_t ch3_compare_at_entry = g_ocxo2_lane.compare_target;
+  const uint32_t ch2_late_at_entry =
+      (uint32_t)((uint16_t)(ch2_counter16_at_entry - ch2_compare_at_entry));
+  const uint32_t ch3_late_at_entry =
+      (uint32_t)((uint16_t)(ch3_counter16_at_entry - ch3_compare_at_entry));
+
+  g_qtimer3_last_pair_ch2_counter16_at_entry = ch2_counter16_at_entry;
+  g_qtimer3_last_pair_ch3_counter16_at_entry = ch3_counter16_at_entry;
+  g_qtimer3_last_pair_ch2_compare_target_at_entry = ch2_compare_at_entry;
+  g_qtimer3_last_pair_ch3_compare_target_at_entry = ch3_compare_at_entry;
+  g_qtimer3_last_pair_ch2_late_ticks_at_entry = ch2_late_at_entry;
+  g_qtimer3_last_pair_ch3_late_ticks_at_entry = ch3_late_at_entry;
+  g_qtimer3_last_pair_late_delta_ticks =
+      (int32_t)((int64_t)ch3_late_at_entry - (int64_t)ch2_late_at_entry);
 
   const uint32_t ch2_target32 =
       ocxo_next_authored_counter32(interrupt_subscriber_kind_t::OCXO1,
@@ -1787,24 +2048,166 @@ static void qtimer3_handle_coupled_pair(uint32_t pair_entry_dwt_raw) {
       ocxo_next_authored_counter32(interrupt_subscriber_kind_t::OCXO2,
                                    g_ocxo2_lane);
   const int32_t ch3_minus_ch2 = (int32_t)(ch3_target32 - ch2_target32);
+  const uint32_t synthetic_separation_ticks = qtimer3_abs_i32_to_u32(ch3_minus_ch2);
 
-  const bool ch2_is_base = ch3_minus_ch2 >= 0;
-  const uint32_t base_target32 = ch2_is_base ? ch2_target32 : ch3_target32;
+  uint32_t physical_base_channel = 0;
+  uint32_t physical_base_source = 0;
+  uint32_t physical_separation_ticks = 0;
+
+  const uint32_t initial_mask = g_qtimer3_last_pair_entry_pending_mask;
+  if (initial_mask == 1U || initial_mask == 2U) {
+    // Strongest evidence: a single flag was pending at ISR entry and the peer
+    // was coalesced into the same pass.  The initially-pending channel is the
+    // physical first compare.
+    physical_base_channel = (initial_mask == 1U) ? 2U : 3U;
+    physical_base_source = 1U;
+    physical_separation_ticks = g_qtimer3_last_pair_coalesce_physical_separation_ticks;
+  } else if (initial_mask == 3U) {
+    // Both flags were already pending when CM7 vectored.  The one with the
+    // larger late count is the older physical compare.  Equal late counts are
+    // treated as a tie/unknown rather than forcing an ordering.
+    if (ch2_late_at_entry > ch3_late_at_entry) {
+      physical_base_channel = 2U;
+      physical_base_source = 2U;
+      physical_separation_ticks = ch2_late_at_entry - ch3_late_at_entry;
+    } else if (ch3_late_at_entry > ch2_late_at_entry) {
+      physical_base_channel = 3U;
+      physical_base_source = 2U;
+      physical_separation_ticks = ch3_late_at_entry - ch2_late_at_entry;
+    } else {
+      physical_base_channel = 0U;
+      physical_base_source = 3U;
+      physical_separation_ticks = 0U;
+    }
+  }
+
+  const bool ch2_is_synthetic_base = ch3_minus_ch2 >= 0;
+  const uint32_t synthetic_base_channel = ch2_is_synthetic_base ? 2U : 3U;
+  const uint32_t synthetic_base_target32 = ch2_is_synthetic_base ? ch2_target32 : ch3_target32;
+  const int32_t synthetic_ch2_delta_ticks = (int32_t)(ch2_target32 - synthetic_base_target32);
+  const int32_t synthetic_ch3_delta_ticks = (int32_t)(ch3_target32 - synthetic_base_target32);
+  const int32_t synthetic_ch2_offset_cycles =
+      qtimer3_signed_dwt_cycles_for_ticks(synthetic_ch2_delta_ticks);
+  const int32_t synthetic_ch3_offset_cycles =
+      qtimer3_signed_dwt_cycles_for_ticks(synthetic_ch3_delta_ticks);
+
+  // The ISR-entry DWT belongs to the first physical compare that asserted the
+  // shared QTimer3 interrupt line.  We therefore reconstruct paired event DWTs
+  // from physical pending/late evidence, not from cross-lane synthetic target32
+  // ordering.  Synthetic target32 remains an identity/audit surface only.
   const uint32_t base_event_dwt = qtimer_event_dwt_from_isr_entry_raw(pair_entry_dwt_raw);
 
-  const int32_t ch2_delta_ticks = (int32_t)(ch2_target32 - base_target32);
-  const int32_t ch3_delta_ticks = (int32_t)(ch3_target32 - base_target32);
-  const int32_t ch2_offset_cycles = qtimer3_signed_dwt_cycles_for_ticks(ch2_delta_ticks);
-  const int32_t ch3_offset_cycles = qtimer3_signed_dwt_cycles_for_ticks(ch3_delta_ticks);
-  const uint32_t ch2_event_dwt = qtimer3_add_signed_cycles(base_event_dwt, ch2_offset_cycles);
-  const uint32_t ch3_event_dwt = qtimer3_add_signed_cycles(base_event_dwt, ch3_offset_cycles);
+  int32_t physical_ch2_offset_cycles = 0;
+  int32_t physical_ch3_offset_cycles = 0;
+  if (physical_base_channel == 2U) {
+    physical_ch2_offset_cycles = 0;
+    physical_ch3_offset_cycles =
+        qtimer3_signed_dwt_cycles_for_ticks((int32_t)physical_separation_ticks);
+  } else if (physical_base_channel == 3U) {
+    physical_ch2_offset_cycles =
+        qtimer3_signed_dwt_cycles_for_ticks((int32_t)physical_separation_ticks);
+    physical_ch3_offset_cycles = 0;
+  }
+
+  int32_t applied_ch2_offset_cycles = physical_ch2_offset_cycles;
+  int32_t applied_ch3_offset_cycles = physical_ch3_offset_cycles;
+  uint32_t reconstruction_base_channel = physical_base_channel;
+  uint32_t reconstruction_base_source = physical_base_source;
+  uint32_t base_target32 = 0;
+
+  if (physical_base_channel == 2U) {
+    base_target32 = ch2_target32;
+    g_qtimer3_pair_physical_reconstruction_count++;
+  } else if (physical_base_channel == 3U) {
+    base_target32 = ch3_target32;
+    g_qtimer3_pair_physical_reconstruction_count++;
+  } else if (physical_base_source == 3U) {
+    // Both channels appear simultaneous by the available physical witnesses.
+    // Reconstruct both events at the shared ISR-entry event coordinate.
+    base_target32 = ch2_target32;
+    reconstruction_base_channel = 0U;
+    reconstruction_base_source = 3U;
+    applied_ch2_offset_cycles = 0;
+    applied_ch3_offset_cycles = 0;
+    g_qtimer3_pair_tie_reconstruction_count++;
+  } else {
+    // This path should not occur once both flags are pending, but keep the
+    // system observable rather than silently inventing physical order.  Fall
+    // back to the old synthetic target ordering and report it loudly.
+    base_target32 = synthetic_base_target32;
+    reconstruction_base_channel = synthetic_base_channel;
+    reconstruction_base_source = 4U;
+    applied_ch2_offset_cycles = synthetic_ch2_offset_cycles;
+    applied_ch3_offset_cycles = synthetic_ch3_offset_cycles;
+    g_qtimer3_pair_synthetic_fallback_count++;
+  }
+
+  const uint32_t ch2_event_dwt =
+      qtimer3_add_signed_cycles(base_event_dwt, applied_ch2_offset_cycles);
+  const uint32_t ch3_event_dwt =
+      qtimer3_add_signed_cycles(base_event_dwt, applied_ch3_offset_cycles);
+
+  const int32_t separation_error_ticks =
+      (int32_t)((int64_t)synthetic_separation_ticks -
+                (int64_t)physical_separation_ticks);
+  const int32_t ch2_offset_error_cycles =
+      synthetic_ch2_offset_cycles - physical_ch2_offset_cycles;
+  const int32_t ch3_offset_error_cycles =
+      synthetic_ch3_offset_cycles - physical_ch3_offset_cycles;
 
   g_qtimer3_last_pair_base_dwt_raw = pair_entry_dwt_raw;
   g_qtimer3_last_pair_base_event_dwt = base_event_dwt;
   g_qtimer3_last_pair_base_target32 = base_target32;
   g_qtimer3_last_pair_delta_ticks = ch3_minus_ch2;
-  g_qtimer3_last_pair_ch2_offset_cycles = ch2_offset_cycles;
-  g_qtimer3_last_pair_ch3_offset_cycles = ch3_offset_cycles;
+  g_qtimer3_last_pair_ch2_target32 = ch2_target32;
+  g_qtimer3_last_pair_ch3_target32 = ch3_target32;
+  g_qtimer3_last_pair_synthetic_base_channel = synthetic_base_channel;
+  g_qtimer3_last_pair_synthetic_separation_ticks = synthetic_separation_ticks;
+  g_qtimer3_last_pair_physical_base_channel = physical_base_channel;
+  g_qtimer3_last_pair_physical_base_source = physical_base_source;
+  g_qtimer3_last_pair_physical_separation_ticks = physical_separation_ticks;
+  g_qtimer3_last_pair_separation_error_ticks = separation_error_ticks;
+  g_qtimer3_last_pair_physical_ch2_offset_cycles = physical_ch2_offset_cycles;
+  g_qtimer3_last_pair_physical_ch3_offset_cycles = physical_ch3_offset_cycles;
+  g_qtimer3_last_pair_synthetic_ch2_offset_cycles = synthetic_ch2_offset_cycles;
+  g_qtimer3_last_pair_synthetic_ch3_offset_cycles = synthetic_ch3_offset_cycles;
+  g_qtimer3_last_pair_ch2_offset_error_cycles = ch2_offset_error_cycles;
+  g_qtimer3_last_pair_ch3_offset_error_cycles = ch3_offset_error_cycles;
+  g_qtimer3_last_pair_reconstruction_base_channel = reconstruction_base_channel;
+  g_qtimer3_last_pair_reconstruction_base_source = reconstruction_base_source;
+
+  if (synthetic_base_channel == 2U) {
+    g_qtimer3_pair_synthetic_ch2_base_count++;
+  } else {
+    g_qtimer3_pair_synthetic_ch3_base_count++;
+  }
+
+  if (physical_base_channel == 2U) {
+    g_qtimer3_pair_physical_ch2_base_count++;
+    g_qtimer3_dual_ch2_first_count++;
+  } else if (physical_base_channel == 3U) {
+    g_qtimer3_pair_physical_ch3_base_count++;
+    g_qtimer3_dual_ch3_first_count++;
+  } else if (physical_base_source == 3U) {
+    g_qtimer3_pair_physical_tie_count++;
+  }
+
+  if (physical_base_channel == 0U) {
+    g_qtimer3_pair_base_unknown_count++;
+  } else if (physical_base_channel == synthetic_base_channel) {
+    g_qtimer3_pair_base_match_count++;
+  } else {
+    g_qtimer3_pair_base_mismatch_count++;
+  }
+
+  if (physical_base_channel != 0U &&
+      (physical_base_channel != synthetic_base_channel ||
+       qtimer3_abs_i32_to_u32(separation_error_ticks) > 1U)) {
+    g_qtimer3_pair_separation_mismatch_count++;
+  }
+
+  g_qtimer3_last_pair_ch2_offset_cycles = applied_ch2_offset_cycles;
+  g_qtimer3_last_pair_ch3_offset_cycles = applied_ch3_offset_cycles;
   g_qtimer3_last_ch2_event_dwt = ch2_event_dwt;
   g_qtimer3_last_ch3_event_dwt = ch3_event_dwt;
   g_qtimer3_last_ch2_dwt_coordinate_source = QTIMER3_DWT_SOURCE_PAIR_RECONSTRUCTED;
@@ -1834,10 +2237,13 @@ static void qtimer3_isr(void) {
   const uint32_t qtimer3_entry_dwt_raw = ARM_DWT_CYCCNT;
   bool ch2_pending = (IMXRT_TMR3.CH[2].CSCTRL & TMR_CSCTRL_TCF1) != 0;
   bool ch3_pending = (IMXRT_TMR3.CH[3].CSCTRL & TMR_CSCTRL_TCF1) != 0;
+  const uint32_t initial_pending_mask = qtimer3_pending_mask(ch2_pending, ch3_pending);
 
   qtimer3_try_coalesce_peer(ch2_pending, ch3_pending, qtimer3_entry_dwt_raw);
 
   if (ch2_pending && ch3_pending) {
+    qtimer3_note_pair_entry_mask(initial_pending_mask,
+                                 qtimer3_pending_mask(ch2_pending, ch3_pending));
     qtimer3_handle_coupled_pair(qtimer3_entry_dwt_raw);
     return;
   }
@@ -1850,7 +2256,17 @@ static void qtimer3_isr(void) {
     g_qtimer3_last_dispatch_channel = 2;
     g_qtimer3_last_ch2_late_ticks =
         (uint32_t)((uint16_t)(IMXRT_TMR3.CH[2].CNTR - g_ocxo1_lane.compare_target));
+
+    const uint32_t peer_ticks_until_service = qtimer3_peer_ticks_until_for_single_channel(2U);
+    const uint32_t service_start_dwt = ARM_DWT_CYCCNT;
     process_interrupt_qtimer3_ch2_irq(qtimer3_entry_dwt_raw);
+    const uint32_t service_end_dwt = ARM_DWT_CYCCNT;
+    qtimer3_record_single_service(2U,
+                                  qtimer3_entry_dwt_raw,
+                                  service_start_dwt,
+                                  service_end_dwt,
+                                  peer_ticks_until_service,
+                                  qtimer3_peer_pending_for_single_channel(2U));
     return;
   }
 
@@ -1862,7 +2278,17 @@ static void qtimer3_isr(void) {
     g_qtimer3_last_dispatch_channel = 3;
     g_qtimer3_last_ch3_late_ticks =
         (uint32_t)((uint16_t)(IMXRT_TMR3.CH[3].CNTR - g_ocxo2_lane.compare_target));
+
+    const uint32_t peer_ticks_until_service = qtimer3_peer_ticks_until_for_single_channel(3U);
+    const uint32_t service_start_dwt = ARM_DWT_CYCCNT;
     process_interrupt_qtimer3_ch3_irq(qtimer3_entry_dwt_raw);
+    const uint32_t service_end_dwt = ARM_DWT_CYCCNT;
+    qtimer3_record_single_service(3U,
+                                  qtimer3_entry_dwt_raw,
+                                  service_start_dwt,
+                                  service_end_dwt,
+                                  peer_ticks_until_service,
+                                  qtimer3_peer_pending_for_single_channel(3U));
     return;
   }
 }
@@ -2532,6 +2958,50 @@ void process_interrupt_init(void) {
   g_qtimer3_last_pair_coalesce_peer_channel = 0;
   g_qtimer3_last_pair_coalesce_ticks_until_peer = 0;
   g_qtimer3_last_pair_coalesce_wait_cycles = 0;
+  g_qtimer3_last_pair_coalesce_pending_channel = 0;
+  g_qtimer3_last_pair_coalesce_pending_late_ticks = 0;
+  g_qtimer3_last_pair_coalesce_physical_separation_ticks = 0;
+  g_qtimer3_last_pair_entry_pending_mask = 0;
+  g_qtimer3_last_pair_after_coalesce_pending_mask = 0;
+  g_qtimer3_pair_initial_ch2_only_count = 0;
+  g_qtimer3_pair_initial_ch3_only_count = 0;
+  g_qtimer3_pair_initial_both_count = 0;
+  g_qtimer3_pair_initial_other_count = 0;
+  g_qtimer3_last_pair_ch2_counter16_at_entry = 0;
+  g_qtimer3_last_pair_ch3_counter16_at_entry = 0;
+  g_qtimer3_last_pair_ch2_compare_target_at_entry = 0;
+  g_qtimer3_last_pair_ch3_compare_target_at_entry = 0;
+  g_qtimer3_last_pair_ch2_late_ticks_at_entry = 0;
+  g_qtimer3_last_pair_ch3_late_ticks_at_entry = 0;
+  g_qtimer3_last_pair_late_delta_ticks = 0;
+  g_qtimer3_last_pair_ch2_target32 = 0;
+  g_qtimer3_last_pair_ch3_target32 = 0;
+  g_qtimer3_last_pair_synthetic_base_channel = 0;
+  g_qtimer3_last_pair_synthetic_separation_ticks = 0;
+  g_qtimer3_last_pair_physical_base_channel = 0;
+  g_qtimer3_last_pair_physical_base_source = 0;
+  g_qtimer3_last_pair_physical_separation_ticks = 0;
+  g_qtimer3_last_pair_separation_error_ticks = 0;
+  g_qtimer3_last_pair_physical_ch2_offset_cycles = 0;
+  g_qtimer3_last_pair_physical_ch3_offset_cycles = 0;
+  g_qtimer3_last_pair_synthetic_ch2_offset_cycles = 0;
+  g_qtimer3_last_pair_synthetic_ch3_offset_cycles = 0;
+  g_qtimer3_last_pair_ch2_offset_error_cycles = 0;
+  g_qtimer3_last_pair_ch3_offset_error_cycles = 0;
+  g_qtimer3_last_pair_reconstruction_base_channel = 0;
+  g_qtimer3_last_pair_reconstruction_base_source = 0;
+  g_qtimer3_pair_synthetic_ch2_base_count = 0;
+  g_qtimer3_pair_synthetic_ch3_base_count = 0;
+  g_qtimer3_pair_physical_ch2_base_count = 0;
+  g_qtimer3_pair_physical_ch3_base_count = 0;
+  g_qtimer3_pair_physical_tie_count = 0;
+  g_qtimer3_pair_base_match_count = 0;
+  g_qtimer3_pair_base_mismatch_count = 0;
+  g_qtimer3_pair_base_unknown_count = 0;
+  g_qtimer3_pair_separation_mismatch_count = 0;
+  g_qtimer3_pair_physical_reconstruction_count = 0;
+  g_qtimer3_pair_synthetic_fallback_count = 0;
+  g_qtimer3_pair_tie_reconstruction_count = 0;
   g_qtimer3_last_pair_base_dwt_raw = 0;
   g_qtimer3_last_pair_base_event_dwt = 0;
   g_qtimer3_last_pair_base_target32 = 0;
@@ -2542,6 +3012,41 @@ void process_interrupt_init(void) {
   g_qtimer3_last_ch3_event_dwt = 0;
   g_qtimer3_last_ch2_dwt_coordinate_source = QTIMER3_DWT_SOURCE_NONE;
   g_qtimer3_last_ch3_dwt_coordinate_source = QTIMER3_DWT_SOURCE_NONE;
+
+  g_qtimer3_single_service_last_channel = 0;
+  g_qtimer3_single_service_last_cycles = 0;
+  g_qtimer3_single_service_last_ticks = 0;
+  g_qtimer3_single_service_max_cycles = 0;
+  g_qtimer3_single_service_max_ticks = 0;
+  g_qtimer3_single_service_sum_cycles = 0;
+  g_qtimer3_single_service_sum_ticks = 0;
+  g_qtimer3_single_service_sample_count = 0;
+  g_qtimer3_single_service_exceeds_threshold_count = 0;
+  g_qtimer3_single_total_last_cycles = 0;
+  g_qtimer3_single_total_last_ticks = 0;
+  g_qtimer3_single_total_max_cycles = 0;
+  g_qtimer3_single_total_max_ticks = 0;
+  g_qtimer3_single_ch2_service_last_cycles = 0;
+  g_qtimer3_single_ch2_service_last_ticks = 0;
+  g_qtimer3_single_ch2_service_max_cycles = 0;
+  g_qtimer3_single_ch2_service_max_ticks = 0;
+  g_qtimer3_single_ch2_service_sum_cycles = 0;
+  g_qtimer3_single_ch2_service_sum_ticks = 0;
+  g_qtimer3_single_ch3_service_last_cycles = 0;
+  g_qtimer3_single_ch3_service_last_ticks = 0;
+  g_qtimer3_single_ch3_service_max_cycles = 0;
+  g_qtimer3_single_ch3_service_max_ticks = 0;
+  g_qtimer3_single_ch3_service_sum_cycles = 0;
+  g_qtimer3_single_ch3_service_sum_ticks = 0;
+  g_qtimer3_single_last_peer_channel = 0;
+  g_qtimer3_single_last_peer_ticks_until_service = 0;
+  g_qtimer3_single_last_peer_pending_after_service = false;
+  g_qtimer3_single_last_margin_ticks = 0;
+  g_qtimer3_single_min_margin_ticks = 0x7FFFFFFF;
+  g_qtimer3_single_peer_pending_after_service_count = 0;
+  g_qtimer3_single_peer_after_threshold_pending_count = 0;
+  g_qtimer3_single_peer_inside_service_count = 0;
+  g_qtimer3_single_peer_after_threshold_inside_service_count = 0;
 
 
   g_interrupt_runtime_ready = true;
@@ -2788,6 +3293,55 @@ static Payload cmd_report(const Payload&) {
   p.add("qtimer3_last_pair_coalesce_peer_channel", g_qtimer3_last_pair_coalesce_peer_channel);
   p.add("qtimer3_last_pair_coalesce_ticks_until_peer", g_qtimer3_last_pair_coalesce_ticks_until_peer);
   p.add("qtimer3_last_pair_coalesce_wait_cycles", g_qtimer3_last_pair_coalesce_wait_cycles);
+  p.add("qtimer3_last_pair_coalesce_pending_channel", g_qtimer3_last_pair_coalesce_pending_channel);
+  p.add("qtimer3_last_pair_coalesce_pending_late_ticks", g_qtimer3_last_pair_coalesce_pending_late_ticks);
+  p.add("qtimer3_last_pair_coalesce_physical_separation_ticks", g_qtimer3_last_pair_coalesce_physical_separation_ticks);
+
+  p.add("qtimer3_last_pair_entry_pending_mask", g_qtimer3_last_pair_entry_pending_mask);
+  p.add("qtimer3_last_pair_after_coalesce_pending_mask", g_qtimer3_last_pair_after_coalesce_pending_mask);
+  p.add("qtimer3_pair_initial_ch2_only_count", g_qtimer3_pair_initial_ch2_only_count);
+  p.add("qtimer3_pair_initial_ch3_only_count", g_qtimer3_pair_initial_ch3_only_count);
+  p.add("qtimer3_pair_initial_both_count", g_qtimer3_pair_initial_both_count);
+  p.add("qtimer3_pair_initial_other_count", g_qtimer3_pair_initial_other_count);
+
+  p.add("qtimer3_last_pair_ch2_counter16_at_entry", g_qtimer3_last_pair_ch2_counter16_at_entry);
+  p.add("qtimer3_last_pair_ch3_counter16_at_entry", g_qtimer3_last_pair_ch3_counter16_at_entry);
+  p.add("qtimer3_last_pair_ch2_compare_target_at_entry", g_qtimer3_last_pair_ch2_compare_target_at_entry);
+  p.add("qtimer3_last_pair_ch3_compare_target_at_entry", g_qtimer3_last_pair_ch3_compare_target_at_entry);
+  p.add("qtimer3_last_pair_ch2_late_ticks_at_entry", g_qtimer3_last_pair_ch2_late_ticks_at_entry);
+  p.add("qtimer3_last_pair_ch3_late_ticks_at_entry", g_qtimer3_last_pair_ch3_late_ticks_at_entry);
+  p.add("qtimer3_last_pair_late_delta_ticks", g_qtimer3_last_pair_late_delta_ticks);
+
+  p.add("qtimer3_last_pair_ch2_target32", g_qtimer3_last_pair_ch2_target32);
+  p.add("qtimer3_last_pair_ch3_target32", g_qtimer3_last_pair_ch3_target32);
+  p.add("qtimer3_last_pair_synthetic_base_channel", g_qtimer3_last_pair_synthetic_base_channel);
+  p.add("qtimer3_last_pair_synthetic_separation_ticks", g_qtimer3_last_pair_synthetic_separation_ticks);
+  p.add("qtimer3_last_pair_physical_base_channel", g_qtimer3_last_pair_physical_base_channel);
+  p.add("qtimer3_last_pair_physical_base_source", g_qtimer3_last_pair_physical_base_source);
+  p.add("qtimer3_last_pair_physical_separation_ticks", g_qtimer3_last_pair_physical_separation_ticks);
+  p.add("qtimer3_last_pair_separation_error_ticks", g_qtimer3_last_pair_separation_error_ticks);
+  p.add("qtimer3_last_pair_physical_ch2_offset_cycles", g_qtimer3_last_pair_physical_ch2_offset_cycles);
+  p.add("qtimer3_last_pair_physical_ch3_offset_cycles", g_qtimer3_last_pair_physical_ch3_offset_cycles);
+  p.add("qtimer3_last_pair_synthetic_ch2_offset_cycles", g_qtimer3_last_pair_synthetic_ch2_offset_cycles);
+  p.add("qtimer3_last_pair_synthetic_ch3_offset_cycles", g_qtimer3_last_pair_synthetic_ch3_offset_cycles);
+  p.add("qtimer3_last_pair_ch2_offset_error_cycles", g_qtimer3_last_pair_ch2_offset_error_cycles);
+  p.add("qtimer3_last_pair_ch3_offset_error_cycles", g_qtimer3_last_pair_ch3_offset_error_cycles);
+  p.add("qtimer3_last_pair_reconstruction_base_channel", g_qtimer3_last_pair_reconstruction_base_channel);
+  p.add("qtimer3_last_pair_reconstruction_base_source", g_qtimer3_last_pair_reconstruction_base_source);
+
+  p.add("qtimer3_pair_synthetic_ch2_base_count", g_qtimer3_pair_synthetic_ch2_base_count);
+  p.add("qtimer3_pair_synthetic_ch3_base_count", g_qtimer3_pair_synthetic_ch3_base_count);
+  p.add("qtimer3_pair_physical_ch2_base_count", g_qtimer3_pair_physical_ch2_base_count);
+  p.add("qtimer3_pair_physical_ch3_base_count", g_qtimer3_pair_physical_ch3_base_count);
+  p.add("qtimer3_pair_physical_tie_count", g_qtimer3_pair_physical_tie_count);
+  p.add("qtimer3_pair_base_match_count", g_qtimer3_pair_base_match_count);
+  p.add("qtimer3_pair_base_mismatch_count", g_qtimer3_pair_base_mismatch_count);
+  p.add("qtimer3_pair_base_unknown_count", g_qtimer3_pair_base_unknown_count);
+  p.add("qtimer3_pair_separation_mismatch_count", g_qtimer3_pair_separation_mismatch_count);
+  p.add("qtimer3_pair_physical_reconstruction_count", g_qtimer3_pair_physical_reconstruction_count);
+  p.add("qtimer3_pair_synthetic_fallback_count", g_qtimer3_pair_synthetic_fallback_count);
+  p.add("qtimer3_pair_tie_reconstruction_count", g_qtimer3_pair_tie_reconstruction_count);
+
   p.add("qtimer3_last_pair_base_dwt_raw", g_qtimer3_last_pair_base_dwt_raw);
   p.add("qtimer3_last_pair_base_event_dwt", g_qtimer3_last_pair_base_event_dwt);
   p.add("qtimer3_last_pair_base_target32", g_qtimer3_last_pair_base_target32);
@@ -2798,6 +3352,81 @@ static Payload cmd_report(const Payload&) {
   p.add("qtimer3_last_ch3_event_dwt", g_qtimer3_last_ch3_event_dwt);
   p.add("qtimer3_last_ch2_dwt_coordinate_source", g_qtimer3_last_ch2_dwt_coordinate_source);
   p.add("qtimer3_last_ch3_dwt_coordinate_source", g_qtimer3_last_ch3_dwt_coordinate_source);
+
+  const uint32_t single_mean_cycles =
+      (g_qtimer3_single_service_sample_count == 0)
+          ? 0
+          : (uint32_t)(g_qtimer3_single_service_sum_cycles /
+                       (uint64_t)g_qtimer3_single_service_sample_count);
+  const uint32_t single_mean_ticks =
+      (g_qtimer3_single_service_sample_count == 0)
+          ? 0
+          : (uint32_t)(g_qtimer3_single_service_sum_ticks /
+                       (uint64_t)g_qtimer3_single_service_sample_count);
+  const uint32_t ch2_mean_cycles =
+      (g_qtimer3_single_ch2_count == 0)
+          ? 0
+          : (uint32_t)(g_qtimer3_single_ch2_service_sum_cycles /
+                       (uint64_t)g_qtimer3_single_ch2_count);
+  const uint32_t ch2_mean_ticks =
+      (g_qtimer3_single_ch2_count == 0)
+          ? 0
+          : (uint32_t)(g_qtimer3_single_ch2_service_sum_ticks /
+                       (uint64_t)g_qtimer3_single_ch2_count);
+  const uint32_t ch3_mean_cycles =
+      (g_qtimer3_single_ch3_count == 0)
+          ? 0
+          : (uint32_t)(g_qtimer3_single_ch3_service_sum_cycles /
+                       (uint64_t)g_qtimer3_single_ch3_count);
+  const uint32_t ch3_mean_ticks =
+      (g_qtimer3_single_ch3_count == 0)
+          ? 0
+          : (uint32_t)(g_qtimer3_single_ch3_service_sum_ticks /
+                       (uint64_t)g_qtimer3_single_ch3_count);
+
+  p.add("qtimer3_pair_coalesce_threshold_ticks", (uint32_t)QTIMER3_PAIR_COALESCE_TICKS);
+  p.add("qtimer3_single_service_sample_count", g_qtimer3_single_service_sample_count);
+  p.add("qtimer3_single_service_last_channel", g_qtimer3_single_service_last_channel);
+  p.add("qtimer3_single_service_last_cycles", g_qtimer3_single_service_last_cycles);
+  p.add("qtimer3_single_service_last_ticks", g_qtimer3_single_service_last_ticks);
+  p.add("qtimer3_single_service_mean_cycles", single_mean_cycles);
+  p.add("qtimer3_single_service_mean_ticks", single_mean_ticks);
+  p.add("qtimer3_single_service_max_cycles", g_qtimer3_single_service_max_cycles);
+  p.add("qtimer3_single_service_max_ticks", g_qtimer3_single_service_max_ticks);
+  p.add("qtimer3_single_service_exceeds_threshold_count", g_qtimer3_single_service_exceeds_threshold_count);
+  p.add("qtimer3_single_service_recommended_coalesce_ticks",
+        g_qtimer3_single_service_max_ticks + 2U);
+
+  p.add("qtimer3_single_total_last_cycles", g_qtimer3_single_total_last_cycles);
+  p.add("qtimer3_single_total_last_ticks", g_qtimer3_single_total_last_ticks);
+  p.add("qtimer3_single_total_max_cycles", g_qtimer3_single_total_max_cycles);
+  p.add("qtimer3_single_total_max_ticks", g_qtimer3_single_total_max_ticks);
+  p.add("qtimer3_single_total_recommended_coalesce_ticks",
+        g_qtimer3_single_total_max_ticks + 2U);
+
+  p.add("qtimer3_single_ch2_service_last_cycles", g_qtimer3_single_ch2_service_last_cycles);
+  p.add("qtimer3_single_ch2_service_last_ticks", g_qtimer3_single_ch2_service_last_ticks);
+  p.add("qtimer3_single_ch2_service_mean_cycles", ch2_mean_cycles);
+  p.add("qtimer3_single_ch2_service_mean_ticks", ch2_mean_ticks);
+  p.add("qtimer3_single_ch2_service_max_cycles", g_qtimer3_single_ch2_service_max_cycles);
+  p.add("qtimer3_single_ch2_service_max_ticks", g_qtimer3_single_ch2_service_max_ticks);
+  p.add("qtimer3_single_ch3_service_last_cycles", g_qtimer3_single_ch3_service_last_cycles);
+  p.add("qtimer3_single_ch3_service_last_ticks", g_qtimer3_single_ch3_service_last_ticks);
+  p.add("qtimer3_single_ch3_service_mean_cycles", ch3_mean_cycles);
+  p.add("qtimer3_single_ch3_service_mean_ticks", ch3_mean_ticks);
+  p.add("qtimer3_single_ch3_service_max_cycles", g_qtimer3_single_ch3_service_max_cycles);
+  p.add("qtimer3_single_ch3_service_max_ticks", g_qtimer3_single_ch3_service_max_ticks);
+
+  p.add("qtimer3_single_last_peer_channel", g_qtimer3_single_last_peer_channel);
+  p.add("qtimer3_single_last_peer_ticks_until_service", g_qtimer3_single_last_peer_ticks_until_service);
+  p.add("qtimer3_single_last_peer_pending_after_service", g_qtimer3_single_last_peer_pending_after_service);
+  p.add("qtimer3_single_last_margin_ticks", g_qtimer3_single_last_margin_ticks);
+  p.add("qtimer3_single_min_margin_ticks",
+        (g_qtimer3_single_min_margin_ticks == 0x7FFFFFFF) ? 0 : g_qtimer3_single_min_margin_ticks);
+  p.add("qtimer3_single_peer_pending_after_service_count", g_qtimer3_single_peer_pending_after_service_count);
+  p.add("qtimer3_single_peer_after_threshold_pending_count", g_qtimer3_single_peer_after_threshold_pending_count);
+  p.add("qtimer3_single_peer_inside_service_count", g_qtimer3_single_peer_inside_service_count);
+  p.add("qtimer3_single_peer_after_threshold_inside_service_count", g_qtimer3_single_peer_after_threshold_inside_service_count);
 
   return p;
 }
