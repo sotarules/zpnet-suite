@@ -130,29 +130,24 @@ static uint64_t g_campaign_public_gnss_base = 0;
 static uint64_t g_campaign_public_ocxo1_base = 0;
 static uint64_t g_campaign_public_ocxo2_base = 0;
 
-static uint64_t clock_ns_at_fragment_dwt(time_clock_id_t clock,
-                                         uint64_t fallback_ns) {
-  const uint32_t fragment_dwt = g_dwt_at_pps_vclock;
-  uint64_t ns = 0;
-  if (fragment_dwt != 0 && time_clock_ns_at_dwt(clock, fragment_dwt, &ns)) {
-    return ns;
-  }
-  return fallback_ns;
-}
-
 static uint64_t current_raw_gnss_ns(void) {
-  return clock_ns_at_fragment_dwt(time_clock_id_t::VCLOCK,
-                                  g_gnss_ns_at_pps_vclock);
+  return clocks_gnss_ns_now();
 }
 
 static uint64_t current_raw_ocxo1_ns(void) {
-  return clock_ns_at_fragment_dwt(time_clock_id_t::OCXO1,
-                                  g_ocxo1_clock.ns_count_at_pps_vclock);
+  // OCXO nanosecond ledgers are owned by CLOCKS/alpha.  Do not route these
+  // public campaign totals through legacy process_time projection state; that
+  // path can return DWT-projected / 32-bit-looking artifacts instead of the
+  // 64-bit OCXO ledger.
+  return clocks_ocxo1_ns_now();
 }
 
 static uint64_t current_raw_ocxo2_ns(void) {
-  return clock_ns_at_fragment_dwt(time_clock_id_t::OCXO2,
-                                  g_ocxo2_clock.ns_count_at_pps_vclock);
+  // OCXO nanosecond ledgers are owned by CLOCKS/alpha.  Do not route these
+  // public campaign totals through legacy process_time projection state; that
+  // path can return DWT-projected / 32-bit-looking artifacts instead of the
+  // 64-bit OCXO ledger.
+  return clocks_ocxo2_ns_now();
 }
 
 static void campaign_public_bases_reset_to_current(void) {

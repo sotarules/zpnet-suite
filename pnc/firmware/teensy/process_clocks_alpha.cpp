@@ -49,6 +49,8 @@ static_assert(NS_PER_SECOND_U64 ==
 // ============================================================================
 
 volatile uint64_t g_gnss_ns_at_pps_vclock = 0;
+volatile uint64_t g_ocxo1_ns_at_pps_vclock = 0;
+volatile uint64_t g_ocxo2_ns_at_pps_vclock = 0;
 
 volatile uint32_t g_dwt_at_pps_vclock = 0;
 volatile uint64_t g_dwt_cycle_count_total = 0;
@@ -312,9 +314,6 @@ bool clocks_dwt_calibration_valid(void) {
 }
 
 uint64_t clocks_gnss_ns_now(void) {
-  // CLOCKS owns the public nanosecond counters.  process_time may maintain
-  // its own bridge/absolute projection state, but the CLOCKS surface is
-  // epoch-relative and must not be overwritten by an absolute GNSS estimate.
   return g_gnss_ns_at_pps_vclock;
 }
 
@@ -323,7 +322,7 @@ uint64_t clocks_gnss_ticks_now(void) {
 }
 
 uint64_t clocks_ocxo1_ns_now(void) {
-  return g_ocxo1_clock.ns_count_at_pps_vclock;
+  return g_ocxo1_ns_at_pps_vclock;
 }
 
 uint64_t clocks_ocxo1_ticks_now(void) {
@@ -331,7 +330,7 @@ uint64_t clocks_ocxo1_ticks_now(void) {
 }
 
 uint64_t clocks_ocxo2_ns_now(void) {
-  return g_ocxo2_clock.ns_count_at_pps_vclock;
+  return g_ocxo2_ns_at_pps_vclock;
 }
 
 uint64_t clocks_ocxo2_ticks_now(void) {
@@ -466,12 +465,10 @@ static alpha_lane_forensics_store_t g_ocxo2_forensics = {};
 // event-to-event deltas into 64-bit tick totals so a campaign cannot wrap at
 // the 32-bit / 10 MHz boundary (~429.5 s).
 struct alpha_lane_logical_ticks_t {
-  bool     zero_offset_valid = false;
-  bool     have_event = false;
-  uint32_t zero_offset_counter32 = 0;
-  uint32_t last_event_counter32 = 0;
+  uint32_t zero_counter32 = 0;
+  uint32_t last_counter32 = 0;
   uint32_t counter32_delta_since_previous_event = 0;
-  uint64_t logical_ticks64_since_zero = 0;
+  uint64_t ticks64 = 0;
   uint32_t update_count = 0;
 };
 
@@ -512,12 +509,10 @@ static void alpha_ticks64_reset_all(void) {
 }
 
 static void alpha_ticks64_install_zero(alpha_lane_logical_ticks_t& s,
-                                       uint32_t zero_offset_counter32,
-                                       bool valid) {
+                                       uint32_t zero_counter32) {
   s = alpha_lane_logical_ticks_t{};
-  s.zero_offset_valid = valid;
-  s.zero_offset_counter32 = zero_offset_counter32;
-  s.last_event_counter32 = zero_offset_counter32;
+  s.zero_counter32 = zero_counter32;
+  s.last_counter32 = zero_counter32;
 }
 
 static bool alpha_ticks64_apply_event(time_clock_id_t clock,
@@ -528,27 +523,18 @@ static bool alpha_ticks64_apply_event(time_clock_id_t clock,
                                       uint32_t* out_delta_since_zero_offset,
                                       uint32_t* out_delta_since_previous_event) {
   alpha_lane_logical_ticks_t* s = alpha_ticks64_store(clock);
-  if (!s || !s->zero_offset_valid) return false;
+  if (!s) return false;
 
-  const uint32_t zero_offset = s->zero_offset_counter32;
-  const uint32_t delta_since_zero = event_counter32 - zero_offset;
-  uint32_t delta_since_previous = 0;
+  const uint32_t delta_since_zero = event_counter32 - s->zero_counter32;
+  const uint32_t delta_since_previous = event_counter32 - s->last_counter32;
 
-  if (!s->have_event) {
-    delta_since_previous = delta_since_zero;
-    s->logical_ticks64_since_zero = (uint64_t)delta_since_zero;
-    s->have_event = true;
-  } else {
-    delta_since_previous = event_counter32 - s->last_event_counter32;
-    s->logical_ticks64_since_zero += (uint64_t)delta_since_previous;
-  }
-
-  s->last_event_counter32 = event_counter32;
+  s->ticks64 += (uint64_t)delta_since_previous;
+  s->last_counter32 = event_counter32;
   s->counter32_delta_since_previous_event = delta_since_previous;
   s->update_count++;
 
-  if (out_ticks64) *out_ticks64 = s->logical_ticks64_since_zero;
-  if (out_ns64) *out_ns64 = s->logical_ticks64_since_zero * (uint64_t)NS_PER_10MHZ_TICK;
+  if (out_ticks64) *out_ticks64 = s->ticks64;
+  if (out_ns64) *out_ns64 = s->ticks64 * (uint64_t)NS_PER_10MHZ_TICK;
   if (out_delta_since_zero_offset) *out_delta_since_zero_offset = delta_since_zero;
   if (out_delta_since_previous_event) *out_delta_since_previous_event = delta_since_previous;
 
@@ -557,8 +543,7 @@ static bool alpha_ticks64_apply_event(time_clock_id_t clock,
 }
 
 static bool alpha_zero_offset_valid(time_clock_id_t clock) {
-  const alpha_lane_logical_ticks_t* s = alpha_ticks64_store(clock);
-  return s && s->zero_offset_valid;
+  return alpha_ticks64_store(clock) != nullptr;
 }
 
 static bool alpha_ticks64_project_counter32(time_clock_id_t clock,
@@ -566,15 +551,10 @@ static bool alpha_ticks64_project_counter32(time_clock_id_t clock,
                                             uint64_t* out_ticks64,
                                             uint64_t* out_ns64) {
   const alpha_lane_logical_ticks_t* s = alpha_ticks64_store(clock);
-  if (!s || !s->zero_offset_valid) return false;
+  if (!s) return false;
 
-  uint64_t ticks = 0;
-  if (s->have_event) {
-    ticks = s->logical_ticks64_since_zero +
-            (uint64_t)((uint32_t)(counter32 - s->last_event_counter32));
-  } else {
-    ticks = (uint64_t)((uint32_t)(counter32 - s->zero_offset_counter32));
-  }
+  const uint64_t ticks =
+      s->ticks64 + (uint64_t)((uint32_t)(counter32 - s->last_counter32));
 
   if (out_ticks64) *out_ticks64 = ticks;
   if (out_ns64) *out_ns64 = ticks * (uint64_t)NS_PER_10MHZ_TICK;
@@ -769,12 +749,12 @@ bool clocks_alpha_lane_forensics(time_clock_id_t clock,
   return false;
 }
 
-static void clock_mark_epoch_zero(clock_state_t& clock, bool zero_offset_valid) {
+static void clock_mark_epoch_zero(clock_state_t& clock) {
   clock.ns_count_at_edge = 0;
   clock.gnss_ns_at_edge = 0;
   clock.ns_count_at_pps_vclock = 0;
   clock.phase_offset_ns = 0;
-  clock.zero_established = zero_offset_valid;
+  clock.zero_established = true;  // legacy/report mirror; epoch install is a hard invariant
   clock.window_checks = 0;
   clock.window_mismatches = 0;
   clock.window_error_ns = 0;
@@ -782,6 +762,8 @@ static void clock_mark_epoch_zero(clock_state_t& clock, bool zero_offset_valid) 
 
 static void alpha_reset_canonical_clock_state_for_new_epoch(void) {
   g_gnss_ns_at_pps_vclock = 0;
+  g_ocxo1_ns_at_pps_vclock = 0;
+  g_ocxo2_ns_at_pps_vclock = 0;
   g_dwt_at_pps_vclock = 0;
   g_dwt_cycle_count_total = 0;
   g_dwt_cycles_between_pps_vclock = DWT_EXPECTED_PER_PPS;
@@ -869,16 +851,13 @@ bool clocks_alpha_zero_from_interrupt_capture(const char* reason) {
   g_prev_pps_vclock_dwt_at_edge = cap.vclock_dwt_at_edge;
   g_prev_pps_vclock_dwt_at_edge_valid = true;
 
-  const bool vclock_zero_valid = cap.vclock_capture_valid;
-  const bool ocxo_zero_valid = cap.all_lanes_capture_valid;
+  alpha_ticks64_install_zero(g_vclock_ticks64, cap.vclock_counter32);
+  alpha_ticks64_install_zero(g_ocxo1_ticks64, cap.ocxo1_counter32);
+  alpha_ticks64_install_zero(g_ocxo2_ticks64, cap.ocxo2_counter32);
 
-  alpha_ticks64_install_zero(g_vclock_ticks64, cap.vclock_counter32, vclock_zero_valid);
-  alpha_ticks64_install_zero(g_ocxo1_ticks64, cap.ocxo1_counter32, ocxo_zero_valid);
-  alpha_ticks64_install_zero(g_ocxo2_ticks64, cap.ocxo2_counter32, ocxo_zero_valid);
-
-  clock_mark_epoch_zero(g_vclock_clock, vclock_zero_valid);
-  clock_mark_epoch_zero(g_ocxo1_clock, ocxo_zero_valid);
-  clock_mark_epoch_zero(g_ocxo2_clock, ocxo_zero_valid);
+  clock_mark_epoch_zero(g_vclock_clock);
+  clock_mark_epoch_zero(g_ocxo1_clock);
+  clock_mark_epoch_zero(g_ocxo2_clock);
 
   (void)clocks_dwt64_epoch_reset_at_dwt32(cap.vclock_dwt_at_edge, nullptr);
   dwt64_anchor_reset_to_dwt32(cap.vclock_dwt_at_edge, g_dwt64_epoch_raw_cycles);
@@ -903,9 +882,9 @@ bool clocks_alpha_zero_from_interrupt_capture(const char* reason) {
   g_alpha_epoch_last_vclock_counter32 = cap.vclock_counter32;
   g_alpha_epoch_last_ocxo1_counter32 = cap.ocxo1_counter32;
   g_alpha_epoch_last_ocxo2_counter32 = cap.ocxo2_counter32;
-  g_alpha_epoch_last_vclock_zero_valid = vclock_zero_valid;
-  g_alpha_epoch_last_ocxo1_zero_valid = ocxo_zero_valid;
-  g_alpha_epoch_last_ocxo2_zero_valid = ocxo_zero_valid;
+  g_alpha_epoch_last_vclock_zero_valid = true;
+  g_alpha_epoch_last_ocxo1_zero_valid = true;
+  g_alpha_epoch_last_ocxo2_zero_valid = true;
   g_alpha_epoch_last_vclock_hardware16_observed = cap.vclock_hardware16_observed;
   g_alpha_epoch_last_vclock_hardware16_selected = cap.vclock_hardware16_selected;
   g_alpha_epoch_last_ocxo1_hardware16 = cap.ocxo1_hardware16;
@@ -960,7 +939,11 @@ static void clocks_apply_epoch_counter_edge(clock_state_t& clock,
                                  &ns_now,
                                  &counter32_delta_since_zero_offset,
                                  &counter32_delta_since_previous_event)) {
-    clock.zero_established = false;
+    clocks_watchdog_anomaly("alpha_clock_apply_failed",
+                            (uint32_t)((uint8_t)time_clock),
+                            event.counter32_at_event,
+                            event.dwt_at_event,
+                            0);
     return;
   }
 
@@ -1071,7 +1054,6 @@ static void vclock_callback(const interrupt_event_t& event,
                                   g_alpha_epoch_last_vclock_counter32,
                                   time_clock_id_t::VCLOCK);
 
-  g_gnss_ns_at_pps_vclock = g_vclock_clock.ns_count_at_pps_vclock;
 }
 
 static void ocxo1_callback(const interrupt_event_t& event,
@@ -1121,6 +1103,73 @@ static void publish_pps_witness_diag(const pps_edge_snapshot_t& snap) {
   g_pps_witness_diag.pps_edge_vclock_event_count = g_vclock_event_count;
 }
 
+static bool alpha_sample_all_clocks_at_pps_vclock(const pps_edge_snapshot_t& snap,
+                                                   uint64_t vclock_ns) {
+  interrupt_epoch_capture_t cap{};
+  if (!interrupt_last_epoch_capture(&cap)) {
+    clocks_watchdog_anomaly("alpha_missing_epoch_capture",
+                            snap.sequence,
+                            snap.counter32_at_edge,
+                            snap.dwt_at_edge,
+                            0);
+    return false;
+  }
+
+  if (cap.sequence != snap.sequence) {
+    clocks_watchdog_anomaly("alpha_epoch_capture_sequence_mismatch",
+                            cap.sequence,
+                            snap.sequence,
+                            cap.vclock_counter32,
+                            snap.counter32_at_edge);
+    return false;
+  }
+
+  uint64_t ocxo1_ns = 0;
+  uint64_t ocxo2_ns = 0;
+  if (!alpha_ticks64_project_counter32(time_clock_id_t::OCXO1,
+                                       cap.ocxo1_counter32,
+                                       nullptr,
+                                       &ocxo1_ns)) {
+    clocks_watchdog_anomaly("alpha_ocxo1_pps_sample_failed",
+                            cap.sequence,
+                            cap.ocxo1_counter32,
+                            snap.sequence,
+                            0);
+    return false;
+  }
+
+  if (!alpha_ticks64_project_counter32(time_clock_id_t::OCXO2,
+                                       cap.ocxo2_counter32,
+                                       nullptr,
+                                       &ocxo2_ns)) {
+    clocks_watchdog_anomaly("alpha_ocxo2_pps_sample_failed",
+                            cap.sequence,
+                            cap.ocxo2_counter32,
+                            snap.sequence,
+                            0);
+    return false;
+  }
+
+  g_gnss_ns_at_pps_vclock = vclock_ns;
+  g_ocxo1_ns_at_pps_vclock = ocxo1_ns;
+  g_ocxo2_ns_at_pps_vclock = ocxo2_ns;
+
+  // Compatibility mirrors for existing report/Beta surfaces.  The canonical
+  // values are the explicit alpha-owned globals above.
+  g_vclock_clock.ns_count_at_pps_vclock = vclock_ns;
+  g_ocxo1_clock.ns_count_at_pps_vclock = ocxo1_ns;
+  g_ocxo2_clock.ns_count_at_pps_vclock = ocxo2_ns;
+
+  g_vclock_clock.phase_offset_ns = 0;
+  g_ocxo1_clock.phase_offset_ns = (int64_t)vclock_ns - (int64_t)ocxo1_ns;
+  g_ocxo2_clock.phase_offset_ns = (int64_t)vclock_ns - (int64_t)ocxo2_ns;
+
+  g_vclock_clock.zero_established = true;
+  g_ocxo1_clock.zero_established = true;
+  g_ocxo2_clock.zero_established = true;
+  return true;
+}
+
 static void update_pps_vclock_bridge_anchor(const pps_edge_snapshot_t& snap) {
   if (!epoch_ready() || !g_prev_pps_vclock_dwt_at_edge_valid) return;
 
@@ -1133,8 +1182,9 @@ static void update_pps_vclock_bridge_anchor(const pps_edge_snapshot_t& snap) {
                                        &vclock_ns)) {
     return;
   }
-  g_gnss_ns_at_pps_vclock = vclock_ns;
-  g_vclock_clock.ns_count_at_pps_vclock = vclock_ns;
+  if (!alpha_sample_all_clocks_at_pps_vclock(snap, vclock_ns)) {
+    return;
+  }
 
   g_dwt_cycles_between_pps_vclock = dwt_between_pps;
   g_dwt_cycle_count_total += (uint64_t)dwt_between_pps;

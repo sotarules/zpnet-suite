@@ -47,10 +47,15 @@
 //
 // Authorship map:
 //
-//   - g_gnss_ns_at_pps_vclock         CLOCKS-owned epoch-relative nanosecond
-//                                     counter. Set to 0 at ZERO and updated
-//                                     from the VCLOCK counter32 delta against
-//                                     the current CLOCKS epoch.
+//   - g_gnss_ns_at_pps_vclock         CLOCKS-owned epoch-relative VCLOCK/GNSS
+//                                     nanosecond counter sampled at the latest
+//                                     selected PPS/VCLOCK edge.
+//   - g_ocxo1_ns_at_pps_vclock        CLOCKS-owned epoch-relative OCXO1
+//                                     nanosecond counter sampled at the same
+//                                     PPS/VCLOCK edge.
+//   - g_ocxo2_ns_at_pps_vclock        CLOCKS-owned epoch-relative OCXO2
+//                                     nanosecond counter sampled at the same
+//                                     PPS/VCLOCK edge.
 //   - g_dwt_at_pps_vclock             DWT coordinate of the selected
 //                                     PPS/VCLOCK edge.
 //   - g_dwt_cycles_between_pps_vclock Difference of consecutive selected
@@ -119,10 +124,12 @@ static inline uint64_t dwt_ns_to_cycles(uint64_t ns) {
 // one-second bookends share one coordinate species.
 // ============================================================================
 
-// Synthetic GNSS ns counter: 0 at epoch install, then set from the canonical
-// PPS/VCLOCK snapshot authored by process_interrupt.  No physical capture —
-// pure VCLOCK-authored arithmetic.
+// Canonical 64-bit nanosecond clocks at the most recent selected PPS/VCLOCK
+// edge.  Alpha authors these; Beta publishes them; stateless time.h projection
+// uses them as interpolation bases.
 extern volatile uint64_t g_gnss_ns_at_pps_vclock;
+extern volatile uint64_t g_ocxo1_ns_at_pps_vclock;
+extern volatile uint64_t g_ocxo2_ns_at_pps_vclock;
 
 // Canonical DWT_CYCCNT coordinate of the most recent selected PPS/VCLOCK epoch
 // (snap.dwt_at_edge).  Under the VCLOCK-domain architecture this is the
@@ -174,11 +181,12 @@ uint64_t clocks_dwt_cycles_at_dwt(uint32_t dwt32);
 static constexpr int64_t CLOCK_WINDOW_TOLERANCE_NS = 500LL;
 
 // ============================================================================
-// Clock state — uniform shape for all measured clocks (VCLOCK, OCXO*)
+// Clock state — compatibility mirror for measured clocks (VCLOCK, OCXO*)
 // ============================================================================
 //
-// VCLOCK and OCXO1/OCXO2 use field-for-field identical struct shapes.
-// Populated by alpha's clocks_apply_edge, called for all three.
+// Canonical nanosecond clocks live in Alpha's explicit 64-bit PPS/VCLOCK-edge
+// globals above.  This older struct remains as a compatibility/report mirror
+// while Beta and downstream reports are migrated.
 //
 
 struct clock_state_t {
@@ -189,8 +197,8 @@ struct clock_state_t {
   // GNSS ns at the edge as reported by the bridge for this event.
   volatile uint64_t gnss_ns_at_edge;
 
-  // Cumulative CLOCKS-owned epoch-relative ns count refreshed from the
-  // lane's synthetic counter32 delta against the current CLOCKS epoch.
+  // Compatibility mirror of the canonical Alpha-owned epoch-relative ns
+  // count sampled at the latest PPS/VCLOCK edge.
   volatile uint64_t ns_count_at_pps_vclock;
 
   // (gnss_ns_at_edge − ns_count_at_edge).  For VCLOCK this should be
