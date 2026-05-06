@@ -704,8 +704,6 @@ uint16_t interrupt_qtimer1_ch2_csctrl_now(void);
 // never propagated.
 
 void process_interrupt_gpio6789_irq  (uint32_t isr_entry_dwt_raw);
-void process_interrupt_qtimer2_ch0_irq(uint32_t isr_entry_dwt_raw);
-void process_interrupt_qtimer3_ch3_irq(uint32_t isr_entry_dwt_raw);
 
 // ============================================================================
 // Counter accessors (diagnostic, free-running)
