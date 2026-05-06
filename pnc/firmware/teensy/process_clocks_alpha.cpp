@@ -1194,7 +1194,6 @@ static void subscribe_clock(interrupt_subscriber_kind_t kind,
 }
 
 void process_clocks_init(void) {
-  time_init();
   timebase_init();
 
   // Startup epoch is installed locally by alpha from the first valid

@@ -996,8 +996,7 @@ void clocks_beta_pps(void) {
   clocks_alpha_lane_forensics_t vclock_forensics{};
   clocks_alpha_lane_forensics_t ocxo1_forensics{};
   clocks_alpha_lane_forensics_t ocxo2_forensics{};
-  const bool vclock_forensics_valid =
-      clocks_alpha_lane_forensics(time_clock_id_t::VCLOCK, &vclock_forensics);
+
   const bool ocxo1_forensics_valid =
       clocks_alpha_lane_forensics(time_clock_id_t::OCXO1, &ocxo1_forensics);
   const bool ocxo2_forensics_valid =
