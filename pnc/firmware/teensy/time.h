@@ -6,42 +6,32 @@
 #include <stdbool.h>
 
 // ============================================================================
-// time.h — VCLOCK-authored GNSS Nanosecond Interface (Teensy)
+// time.h -- Transitional TIME interface
 // ============================================================================
 //
-// Core doctrine:
+// This header intentionally supports two worlds during migration:
 //
-//   PPS is a witness and selector. It tells process_interrupt which VCLOCK
-//   10 MHz edge is the canonical second boundary.
+//   1. Legacy process_time.cpp still owns its existing stateful anchor and
+//      dynamic-CPS surfaces so the current firmware continues to build/run.
 //
-//   PPS/VCLOCK is the selected VCLOCK edge. It is the sovereign time anchor.
+//   2. New code should use the six stateless facade calls near the middle of
+//      this file.  Those calls do not expose anchors, do not install anchors,
+//      and do not read DWT.  The caller supplies the DWT coordinate; time.cpp
+//      asks CLOCKS/Gamma for the current clock facts and performs projection.
 //
-//   DWT is the high-resolution local ruler used to interpolate between
-//   successive PPS/VCLOCK anchors.
-//
-// process_time.cpp owns the anchor, interpolation state, DWT next-second
-// prediction, and dynamic CPS refinement. This header remains the stable
-// functional interface for ordinary consumers.
-//
-// This module performs NO latency adjustment. Every DWT value passed in or
-// returned is already an event coordinate. Raw ISR-entry DWT values must be
-// normalized by the ISR owner before reaching this interface.
-//
-// Returned GNSS nanoseconds are local zero-based campaign/epoch coordinates,
-// not wall-clock UTC. The epoch may be restarted at boot, ZERO, START, or
-// RECOVER boundaries.
+// The legacy declarations below are preserved only so process_time.cpp and the
+// current call sites remain compatible while callers are migrated.
 // ============================================================================
 
 struct time_anchor_snapshot_t {
-  // Canonical fields — use these in new code.
-  uint32_t dwt_at_pps_vclock;             // DWT coordinate of selected VCLOCK edge
-  uint32_t dwt_cycles_per_pps_vclock_s;   // raw DWT cycles between selected VCLOCK edges
-  uint32_t counter32_at_pps_vclock;       // synthetic VCLOCK counter32 at anchor
-  uint32_t pps_vclock_count;              // selected VCLOCK second edges in epoch, 1-indexed
-  bool     valid;                         // true once a real rate is available
-  bool     ok;                            // true if snapshot was seqlock-consistent
+  uint32_t dwt_at_pps_vclock;
+  uint32_t dwt_cycles_per_pps_vclock_s;
+  uint32_t counter32_at_pps_vclock;
+  uint32_t pps_vclock_count;
+  bool     valid;
+  bool     ok;
 
-  // Legacy aliases — kept for TimePop / older code during migration.
+  // Legacy aliases used by TimePop and older callers.
   uint32_t dwt_at_pps;
   uint32_t dwt_cycles_per_s;
   uint32_t qtimer_at_pps;
@@ -49,7 +39,7 @@ struct time_anchor_snapshot_t {
 };
 
 // ============================================================================
-// DWT next-second prediction surface
+// Legacy DWT next-second prediction surface
 // ============================================================================
 
 struct time_dwt_prediction_record_t {
@@ -74,15 +64,8 @@ struct time_dwt_prediction_snapshot_t {
 };
 
 // ============================================================================
-// Dynamic CPS refinement surface
+// Legacy dynamic-CPS refinement surface
 // ============================================================================
-//
-// Dynamic CPS starts each PPS/VCLOCK interval with the raw bookend DWT delta
-// and then refines an experimental cycles-per-second estimate from the 1 kHz
-// VCLOCK cadence. It is currently WITNESS-ONLY: measured, reported, and
-// evaluated, but not used as the operational interpolation/projection rate.
-// DWT<->GNSS projection continues to use the static PPS/VCLOCK bookend count
-// until the dynamic model proves it improves prediction error.
 
 struct time_dynamic_cps_record_t {
   uint32_t pvc_sequence;
@@ -93,8 +76,6 @@ struct time_dynamic_cps_record_t {
   uint32_t refine_ticks;
   uint32_t adjustments;
 
-  // Fixed-anchor line-fit audit surface. The PPS/VCLOCK DWT edge is the
-  // immutable t=0 anchor. Cadence samples begin at t=1 ms.
   uint32_t fit_samples;
   uint64_t fit_sum_t2_ms2;
   uint64_t fit_sum_tx_cycles_ms;
@@ -109,9 +90,6 @@ struct time_dynamic_cps_record_t {
   int32_t  last_fit_error_cycles;
   uint32_t last_point_slope_cycles;
 
-  // Outlier/substitution audit. Suspicious cadence observations are not
-  // allowed to bend the line; the model value is substituted and the raw
-  // error is retained for diagnostics.
   uint32_t outlier_threshold_cycles;
   uint32_t accepted_samples;
   uint32_t substituted_samples;
@@ -121,22 +99,18 @@ struct time_dynamic_cps_record_t {
   uint64_t substituted_abs_error_sum_cycles;
   uint32_t max_abs_observed_error_cycles;
 
-  // Endpoint sanity: evaluated when the next PPS/VCLOCK bookend arrives.
-  int32_t  endpoint_error_cycles;       // next_actual - final_cycles
+  int32_t  endpoint_error_cycles;
   uint32_t abs_endpoint_error_cycles;
   uint32_t endpoint_sanity_tolerance_cycles;
   bool     endpoint_sanity_pass;
 
-  // Effectiveness evaluation. A record for anchor sequence S is evaluated
-  // when the next PPS/VCLOCK edge arrives and the actual DWT cycles for
-  // interval S->S+1 become known.
   bool     eval_valid;
   uint32_t next_actual_cycles;
-  int32_t  static_error_cycles;     // next_actual - base_cycles
-  int32_t  dynamic_error_cycles;    // next_actual - final_cycles
+  int32_t  static_error_cycles;
+  int32_t  dynamic_error_cycles;
   uint32_t abs_static_error_cycles;
   uint32_t abs_dynamic_error_cycles;
-  int32_t  improvement_cycles;      // abs_static_error - abs_dynamic_error
+  int32_t  improvement_cycles;
   bool     dynamic_helped;
 
   bool     valid;
@@ -144,21 +118,17 @@ struct time_dynamic_cps_record_t {
 
 struct time_dynamic_cps_snapshot_t {
   bool     valid;
-  bool     witness_only;          // true while dynamic CPS is report-only
-  bool     projection_enabled;    // false: projection uses static bookend CPS
+  bool     witness_only;
+  bool     projection_enabled;
   uint32_t pvc_sequence;
   uint32_t current_pvc_dwt_at_edge;
-  uint32_t pvc_dwt_at_edge;               // legacy alias for current_pvc_dwt_at_edge
+  uint32_t pvc_dwt_at_edge;
   uint32_t base_cycles;
   uint32_t current_cycles;
   int32_t  net_adjustment_cycles;
   uint32_t last_reseed_value;
   bool     last_reseed_was_computed;
 
-  // Every-PPS local PPS→VCLOCK phase probe. Authored by process_interrupt
-  // from raw ISR-entry DWT captures and latency-adjusted event coordinates.
-  // Diagnostic-only: this report intentionally carries captured facts plus
-  // the bounded adjusted phase offset, with no prediction/residual model.
   bool     phase_probe_valid;
   uint32_t phase_probe_pps_sequence;
   uint32_t phase_probe_pps_isr_entry_dwt_raw;
@@ -169,15 +139,12 @@ struct time_dynamic_cps_snapshot_t {
   uint32_t phase_probe_adjusted_difference_cycles;
   uint32_t phase_probe_phase_offset_cycles;
 
-  // Last completed dynamic servo second. These are finalized facts from the
-  // previous PPS/VCLOCK interval, captured before the current interval reset.
   uint32_t last_completed_dynamic_prediction_cycle_count;
   uint32_t last_completed_dynamic_prediction_adjust_count;
   uint32_t last_completed_dynamic_prediction_invalid_count;
   uint32_t last_completed_dynamic_prediction_valid_count;
   int32_t  last_completed_dynamic_prediction_adjust_cycles;
 
-  // Fixed-anchor line-fit state for the current second.
   uint32_t fit_samples_this_second;
   uint64_t fit_sum_t2_ms2;
   uint64_t fit_sum_tx_cycles_ms;
@@ -192,7 +159,6 @@ struct time_dynamic_cps_snapshot_t {
   int32_t  last_fit_error_cycles;
   uint32_t last_point_slope_cycles;
 
-  // Outlier/substitution state for the current second and lifetime totals.
   uint32_t outlier_threshold_cycles;
   uint32_t accepted_samples_this_second;
   uint32_t substituted_samples_this_second;
@@ -213,7 +179,6 @@ struct time_dynamic_cps_snapshot_t {
   uint32_t skipped_offset_low;
   uint32_t skipped_offset_high;
 
-  // Dynamic-vs-static effectiveness summary.
   uint32_t eval_count;
   uint32_t helped_count;
   uint32_t hurt_count;
@@ -228,7 +193,6 @@ struct time_dynamic_cps_snapshot_t {
   int32_t  last_improvement_cycles;
   bool     last_dynamic_helped;
 
-  // Last endpoint sanity result.
   int32_t  last_endpoint_error_cycles;
   uint32_t last_abs_endpoint_error_cycles;
   uint32_t endpoint_sanity_tolerance_cycles;
@@ -238,25 +202,17 @@ struct time_dynamic_cps_snapshot_t {
   uint32_t history_capacity;
 };
 
-
 // ============================================================================
-// Prior-second prediction detail surface
+// Legacy prior-second prediction detail surface
 // ============================================================================
-//
-// Captured by process_time at 10 representative points from the most recently
-// completed PPS/VCLOCK interval.  Samples 1..9 are authored by the 1 kHz
-// TimePop dynamic-CPS client at 100 ms intervals; sample 10 is authored from
-// the closing PPS/VCLOCK bookend.  The snapshot is retained after the live
-// per-second structure is reset so CLOCKS.PREDICTION_DETAIL can be queried
-// without timing the command inside the current second.
 
 static constexpr uint32_t TIME_PREDICTION_DETAIL_SAMPLE_COUNT = 10;
 
 struct time_prediction_detail_sample_t {
   bool     populated = false;
   bool     endpoint = false;
-  uint32_t sample_index = 0;        // 1..10
-  uint32_t sample_ms = 0;           // 100..1000
+  uint32_t sample_index = 0;
+  uint32_t sample_ms = 0;
 
   uint32_t static_prediction_cycles = 0;
   uint32_t dynamic_prediction_cycles = 0;
@@ -290,41 +246,9 @@ struct time_prediction_detail_snapshot_t {
 };
 
 // ============================================================================
-// Core API — forward (DWT → GNSS nanoseconds)
+// Clock identity shared by CLOCKS, Gamma, legacy process_time, and new TIME.
 // ============================================================================
 
-int64_t time_gnss_ns_now(void);
-
-int64_t time_dwt_to_gnss_ns(uint32_t dwt_cyccnt);
-
-int64_t time_dwt_to_gnss_ns(uint32_t dwt_cyccnt,
-                            uint32_t anchor_dwt_at_pps_vclock,
-                            uint32_t anchor_dwt_cycles_per_pps_vclock_s,
-                            uint32_t anchor_pps_vclock_count);
-
-// ============================================================================
-// Core API — reverse (GNSS nanoseconds → DWT)
-// ============================================================================
-
-uint32_t time_gnss_ns_to_dwt(int64_t gnss_ns);
-
-// ============================================================================
-// Anchor snapshot — seqlock-safe copy of the full PPS/VCLOCK anchor
-// ============================================================================
-
-time_anchor_snapshot_t time_anchor_snapshot(void);
-
-// ============================================================================
-// Generalized clock projection interface
-// ============================================================================
-//
-// These functions never read DWT internally.  Callers must supply an
-// already-authored DWT coordinate: an ISR event DWT, a TimePop fire DWT, or an
-// explicitly captured report DWT used consistently for all clocks in that
-// report.  This prevents hidden "now" reads and keeps timing custody visible.
-
-// GNSS is an alias of the VCLOCK clock surface: VCLOCK is the sovereign
-// reference timeline, and GNSS/pps_vclock nanoseconds are projected from it.
 enum class time_clock_id_t : uint8_t {
   NONE   = 0,
   VCLOCK = 1,
@@ -345,6 +269,35 @@ struct time_clock_snapshot_t {
   int32_t  last_prediction_residual_cycles = 0;
 };
 
+// ============================================================================
+// New stateless facade: DWT <-> clock-domain nanoseconds.
+// ============================================================================
+//
+// These calls do not expose anchor/basis structures.  The caller supplies the
+// carefully authored DWT coordinate; time.cpp reads CLOCKS/Gamma facts and does
+// only projection math.
+//
+// The GNSS DWT->ns signature is intentionally kept as int64_t during the
+// bridge period because legacy process_time.cpp already defines that exact
+// symbol.  New code may treat non-negative results as uint64_t.  After the
+// legacy owner is removed, this can be tightened to uint64_t everywhere.
+
+int64_t  time_dwt_to_gnss_ns(uint32_t dwt_cycle_count);
+uint64_t time_dwt_to_ocxo1_ns(uint32_t dwt_cycle_count);
+uint64_t time_dwt_to_ocxo2_ns(uint32_t dwt_cycle_count);
+
+uint32_t time_gnss_ns_to_dwt(int64_t gnss_ns);      // legacy signed form
+uint32_t time_ocxo1_ns_to_dwt(uint64_t ocxo1_ns);
+uint32_t time_ocxo2_ns_to_dwt(uint64_t ocxo2_ns);
+
+// Legacy stateful process_time API retained during migration.
+int64_t time_gnss_ns_now(void);
+int64_t time_dwt_to_gnss_ns(uint32_t dwt_cyccnt,
+                            uint32_t anchor_dwt_at_pps_vclock,
+                            uint32_t anchor_dwt_cycles_per_pps_vclock_s,
+                            uint32_t anchor_pps_vclock_count);
+time_anchor_snapshot_t time_anchor_snapshot(void);
+
 void time_clock_reset_all(void);
 bool time_clock_epoch_reset(time_clock_id_t clock,
                             uint32_t dwt_at_update,
@@ -358,105 +311,51 @@ bool time_clock_ns_at_dwt(time_clock_id_t clock,
 bool time_clock_snapshot(time_clock_id_t clock,
                          time_clock_snapshot_t* out);
 
-
-// ============================================================================
-// DWT prediction accessors
-// ============================================================================
-
+// Legacy prediction accessors.
 time_dwt_prediction_snapshot_t time_dwt_prediction_snapshot(void);
-
-// Copies up to max_records recent records into out_records, oldest-to-newest.
-// Returns the number of records copied. Passing nullptr or max_records=0 is
-// valid and returns 0.
 uint32_t time_dwt_prediction_history(time_dwt_prediction_record_t* out_records,
                                      uint32_t max_records);
-
 bool     time_dwt_prediction_valid(void);
 uint32_t time_dwt_actual_cycles_last_second(void);
 uint32_t time_dwt_predicted_cycles_last_second(void);
 uint32_t time_dwt_next_prediction_cycles(void);
 int32_t  time_dwt_prediction_residual_cycles(void);
 
-// ============================================================================
-// Dynamic CPS accessors / update hooks
-// ============================================================================
-
+// Legacy dynamic-CPS accessors / update hooks.
 time_dynamic_cps_snapshot_t time_dynamic_cps_snapshot(void);
 uint32_t time_dynamic_cps_history(time_dynamic_cps_record_t* out_records,
                                   uint32_t max_records);
 bool time_prediction_detail_snapshot(time_prediction_detail_snapshot_t* out);
 
 void     time_dynamic_cps_reset(void);
-
-// Every-PPS local VCLOCK phase-probe diagnostic, authored by
-// process_interrupt from raw ISR-entry DWT captures.  This is intentionally
-// report-only: it feeds the DYNAMIC_CPS_FIRST_MS report so the PPS→VCLOCK
-// raw modulo phase can be compared against the empirical canonical
-// raw PPS→VCLOCK offset without making raw ISR-entry DWT a general timing API.
-void     time_dynamic_cps_phase_probe_update(uint32_t pps_sequence,
-                                             uint32_t pps_isr_entry_dwt_raw,
-                                             uint32_t pps_dwt_at_edge,
-                                             uint32_t target_counter32,
-                                             uint32_t counter32_at_event,
-                                             int32_t counter32_residual_ticks,
-                                             uint32_t vclock_isr_entry_dwt_raw,
-                                             uint32_t vclock_dwt_at_event,
-                                             uint32_t raw_delta_cycles,
-                                             uint32_t remainder_mod_100_cycles,
-                                             int32_t expected_mod_100_cycles,
-                                             int32_t residual_cycles,
-                                             uint32_t arm_count,
-                                             uint32_t fire_count,
-                                             uint32_t miss_count);
-
-void     time_dynamic_cps_pps_vclock_edge(uint32_t pvc_sequence,
-                                           uint32_t pvc_dwt_at_edge);
-void     time_dynamic_cps_cadence_update(uint32_t qtimer_event_dwt,
-                                          uint32_t cadence_tick_mod_1000);
-
-bool     time_dynamic_cps_valid(void);
-uint32_t time_dynamic_cps_current_cycles(void);
-uint32_t time_dynamic_cps_current(void);  // legacy alias
-// Per-anchor CPS lookup used by existing projection code. While dynamic CPS
-// is witness-only, this returns the static PPS/VCLOCK bookend CPS for the
-// requested anchor rather than the dynamic final/current CPS.
-bool     time_dynamic_cps_cycles_for_anchor(uint32_t pvc_sequence,
-                                            uint32_t* out_cycles);
+uint32_t time_dynamic_cps_current(void);
 bool     time_dynamic_cps_for_pvc_sequence(uint32_t pvc_sequence,
-                                            uint32_t* out_cycles); // legacy alias
+                                           uint32_t* out_cycles);
+void     time_dynamic_cps_pps_vclock_edge(uint32_t pvc_sequence,
+                                          uint32_t pvc_dwt_at_edge);
+void     time_dynamic_cps_cadence_update(uint32_t qtimer_event_dwt,
+                                         uint32_t cadence_tick_mod_1000);
 
-// ============================================================================
-// Status
-// ============================================================================
+void     time_dynamic_cps_phase_probe_update(
+    uint32_t pps_sequence,
+    uint32_t pps_isr_entry_dwt_raw,
+    uint32_t arm_dwt_raw,
+    uint32_t vclock_isr_entry_dwt_raw,
+    uint32_t pps_dwt_adjusted,
+    uint32_t vclock_dwt_adjusted,
+    uint32_t adjusted_difference_cycles,
+    uint32_t phase_offset_cycles);
 
-uint32_t time_pps_vclock_count(void);
-
-// Legacy alias: returns time_pps_vclock_count().
-uint32_t time_pps_count(void);
-
-bool time_valid(void);
-
-// ============================================================================
-// Update interface (called by process_clocks_alpha.cpp only)
-// ============================================================================
-
-void time_pps_vclock_update(uint32_t dwt_at_pps_vclock,
-                            uint32_t dwt_cycles_per_pps_vclock_s,
-                            uint32_t counter32_at_pps_vclock);
-
+// Legacy PPS/VCLOCK anchor hooks retained until CLOCKS fully owns this state.
 void time_pps_vclock_epoch_reset(uint32_t dwt_at_pps_vclock,
                                  uint32_t counter32_at_pps_vclock);
+void time_pps_vclock_update(uint32_t dwt_at_pps_vclock,
+                            uint32_t counter32_at_pps_vclock,
+                            uint32_t pps_vclock_count);
+void time_pps_vclock_update(uint32_t dwt_at_pps_vclock,
+                            uint32_t counter32_at_pps_vclock,
+                            uint32_t pps_vclock_count,
+                            uint32_t dwt_cycles_per_pps_vclock_s);
 
-// Legacy wrappers retained during migration.
-void time_pps_update(uint32_t dwt_at_pps,
-                     uint32_t dwt_cycles_per_s,
-                     uint32_t qtimer_at_pps);
-
-void time_pps_epoch_reset(uint32_t dwt_at_pps,
-                          uint32_t qtimer_at_pps);
-
-// ============================================================================
-// Initialization
-// ============================================================================
-
-void time_init(void);
+bool     time_valid(void);
+uint32_t time_pps_count(void);
