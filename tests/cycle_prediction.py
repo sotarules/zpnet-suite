@@ -1,48 +1,52 @@
 """
 ZPNet Cycle Prediction Report
 
-Analyze DWT cycle prediction fields published in TIMEBASE_FRAGMENT.
+Analyze CLOCKS/Gamma lane-local prediction fields published in TIMEBASE_FRAGMENT.
 
-This report focuses on the promoted top-level prediction fields:
+This version is built for the structured TIMEBASE_FRAGMENT prediction object:
 
-  dwt_static_prediction_cycle_count
-      The static/random-walk prediction for the *upcoming* second.
-      To evaluate it honestly on row N, compare actual[N] against
-      static_prediction[N-1].
+    fragment.prediction
 
-  dwt_dynamic_prediction_cycle_count
-      The final gated-servo dynamic prediction for the just-finished
-      second represented by this row.  Compare actual[N] against this
-      field directly.
+Each TIMEBASE row prints VCLOCK, OCXO1, and OCXO2 side by side so cross-lane
+interdependence is visible.  The row is intentionally wide.
 
-  dwt_dynamic_prediction_adjust_count
-      Number of accepted servo updates that changed the prediction in
-      the just-finished second.
+Primary schema:
 
-  dwt_dynamic_prediction_invalid_count
-      Number of gated/impossible cadence captures in the just-finished
-      second.
+    fragment.prediction.<lane>_static_prediction_cycles
+    fragment.prediction.<lane>_dynamic_final_prediction_cycles
+    fragment.prediction.<lane>_actual_cycles
+    fragment.prediction.<lane>_static_residual_cycles
+    fragment.prediction.<lane>_dynamic_residual_cycles
 
-  dwt_dynamic_prediction_valid_count
-      Number of accepted servo captures in the just-finished second.
+where lane is one of:
 
-  dwt_dynamic_prediction_adjust_cycles
-      Net signed adjustment cycles applied by the dynamic servo during
-      the just-finished second.
+    vclock
+    ocxo1
+    ocxo2
 
-The script prints a compact row table plus summary statistics and event rows.
+Compatibility fallback:
+
+The report also understands the transitional flat top-level Gamma fields:
+
+    <lane>_static_prediction_cycle_count
+    <lane>_dynamic_prediction_cycle_count
+    <lane>_actual_dwt_cycles_between_edges
+
+and computes residuals from those fields when fragment.prediction is absent.
 
 Usage:
-    python cycle_prediction.py <campaign> [limit]
-    python -m zpnet.tests.cycle_prediction <campaign> [limit]
+    python cycle_prediction.py <campaign> [limit] [threshold]
+    python -m zpnet.tests.cycle_prediction <campaign> [limit] [threshold]
 
 Examples:
-    python cycle_prediction.py Overnight1
-    python cycle_prediction.py Overnight1 200
+    python cycle_prediction.py F
+    python cycle_prediction.py F 200
+    python cycle_prediction.py F 0 25
 """
 
 from __future__ import annotations
 
+import csv
 import json
 import math
 import sys
@@ -51,26 +55,50 @@ from typing import Any, Dict, Iterable, List, Optional
 
 from zpnet.shared.db import open_db
 
-DEFAULT_EVENT_THRESHOLD_CYCLES = 100
-DWT_EXPECTED_PER_PPS = 1_008_000_000
+DEFAULT_EVENT_THRESHOLD_CYCLES = 25
+LANES = ("vclock", "ocxo1", "ocxo2")
+
+
+@dataclass
+class LanePrediction:
+    static_prediction_cycles: Optional[int] = None
+    dynamic_final_prediction_cycles: Optional[int] = None
+    actual_cycles: Optional[int] = None
+    static_residual_cycles: Optional[int] = None
+    dynamic_residual_cycles: Optional[int] = None
+    source: str = "missing"
+
+    @property
+    def has_any(self) -> bool:
+        return any(
+            v is not None
+            for v in (
+                self.static_prediction_cycles,
+                self.dynamic_final_prediction_cycles,
+                self.actual_cycles,
+                self.static_residual_cycles,
+                self.dynamic_residual_cycles,
+            )
+        )
 
 
 @dataclass
 class Row:
     pps: int
-    actual_cycles: Optional[int]
-    static_next: Optional[int]
-    static_for_this_second: Optional[int]
-    static_residual: Optional[int]
-    dynamic_final: Optional[int]
-    dynamic_residual: Optional[int]
-    dynamic_adjust_count: Optional[int]
-    dynamic_invalid_count: Optional[int]
-    dynamic_valid_count: Optional[int]
-    dynamic_adjust_cycles: Optional[int]
-    fw_static_residual: Optional[int]
-    dwt_second_residual: Optional[int]
-    old_prediction_residual: Optional[int]
+    campaign: str
+    lanes: Dict[str, LanePrediction]
+    # Useful non-prediction clock facts to keep next to prediction behavior.
+    vclock_dwt_cycles_between_edges: Optional[int]
+    ocxo1_dwt_cycles_between_edges: Optional[int]
+    ocxo2_dwt_cycles_between_edges: Optional[int]
+    ocxo1_second_residual_ns: Optional[int]
+    ocxo2_second_residual_ns: Optional[int]
+    ocxo1_gnss_ns_between_edges: Optional[int]
+    ocxo2_gnss_ns_between_edges: Optional[int]
+    ocxo1_ppb: Optional[float]
+    ocxo2_ppb: Optional[float]
+    ocxo1_dac: Optional[float]
+    ocxo2_dac: Optional[float]
     flags: str
 
 
@@ -143,6 +171,11 @@ def _frag(rec: Dict[str, Any]) -> Dict[str, Any]:
     return frag if isinstance(frag, dict) else {}
 
 
+def _prediction(frag: Dict[str, Any]) -> Dict[str, Any]:
+    p = frag.get("prediction")
+    return p if isinstance(p, dict) else {}
+
+
 def _as_int(v: Any) -> Optional[int]:
     if v is None:
         return None
@@ -152,9 +185,27 @@ def _as_int(v: Any) -> Optional[int]:
         return None
 
 
+def _as_float(v: Any) -> Optional[float]:
+    if v is None:
+        return None
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return None
+    return None if math.isnan(f) else f
+
+
 def _first_int(*values: Any) -> Optional[int]:
     for v in values:
         out = _as_int(v)
+        if out is not None:
+            return out
+    return None
+
+
+def _first_float(*values: Any) -> Optional[float]:
+    for v in values:
+        out = _as_float(v)
         if out is not None:
             return out
     return None
@@ -168,6 +219,14 @@ def _fmt_int(v: Optional[int], width: int = 0, signed: bool = False) -> str:
     return f"{s:>{width}s}" if width else s
 
 
+def _fmt_float(v: Optional[float], width: int = 0, digits: int = 3, signed: bool = False) -> str:
+    if v is None:
+        s = "---"
+    else:
+        s = f"{v:+.{digits}f}" if signed else f"{v:.{digits}f}"
+    return f"{s:>{width}s}" if width else s
+
+
 def _fmt_str(v: str, width: int = 0) -> str:
     s = v[:width] if width else v
     return f"{s:<{width}s}" if width else s
@@ -175,65 +234,131 @@ def _fmt_str(v: str, width: int = 0) -> str:
 
 def _print_stats(name: str, w: Welford, unit: str = "cycles") -> None:
     if w.n == 0:
-        print(f"  {name:<28s} no samples")
+        print(f"  {name:<34s} no samples")
         return
     print(
-        f"  {name:<28s} "
+        f"  {name:<34s} "
         f"n={w.n:>7,d}  "
         f"mean={w.mean:+10.3f} {unit:<6s}  "
         f"sd={w.stddev:9.3f}  "
+        f"se={w.stderr:8.3f}  "
         f"min={w.min_val:+8.0f}  "
         f"max={w.max_val:+8.0f}"
     )
 
 
-def classify_flags(
-    *,
-    actual_cycles: Optional[int],
-    static_residual: Optional[int],
-    dynamic_residual: Optional[int],
-    dynamic_invalid_count: Optional[int],
-    dynamic_valid_count: Optional[int],
-    dynamic_adjust_count: Optional[int],
-    dynamic_adjust_cycles: Optional[int],
-    threshold: int,
-) -> str:
+def lane_prediction_from_fragment(frag: Dict[str, Any], lane: str) -> LanePrediction:
+    pred = _prediction(frag)
+
+    # Primary structured schema.
+    structured = LanePrediction(
+        static_prediction_cycles=_first_int(pred.get(f"{lane}_static_prediction_cycles")),
+        dynamic_final_prediction_cycles=_first_int(pred.get(f"{lane}_dynamic_final_prediction_cycles")),
+        actual_cycles=_first_int(pred.get(f"{lane}_actual_cycles")),
+        static_residual_cycles=_first_int(pred.get(f"{lane}_static_residual_cycles")),
+        dynamic_residual_cycles=_first_int(pred.get(f"{lane}_dynamic_residual_cycles")),
+        source="prediction",
+    )
+    if structured.has_any:
+        return structured
+
+    # Transitional top-level Gamma fields.
+    static_prediction = _first_int(frag.get(f"{lane}_static_prediction_cycle_count"))
+    dynamic_final = _first_int(frag.get(f"{lane}_dynamic_prediction_cycle_count"))
+    actual = _first_int(frag.get(f"{lane}_actual_dwt_cycles_between_edges"))
+    static_residual = (
+        actual - static_prediction
+        if actual is not None and static_prediction is not None
+        else None
+    )
+    dynamic_residual = (
+        actual - dynamic_final
+        if actual is not None and dynamic_final is not None
+        else None
+    )
+
+    fallback = LanePrediction(
+        static_prediction_cycles=static_prediction,
+        dynamic_final_prediction_cycles=dynamic_final,
+        actual_cycles=actual,
+        static_residual_cycles=static_residual,
+        dynamic_residual_cycles=dynamic_residual,
+        source="top_level",
+    )
+    if fallback.has_any:
+        return fallback
+
+    # Very old DWT-only schema mapped to VCLOCK only.
+    if lane == "vclock":
+        static_prediction = _first_int(frag.get("dwt_static_prediction_cycle_count"))
+        dynamic_final = _first_int(frag.get("dwt_dynamic_prediction_cycle_count"))
+        actual = _first_int(
+            frag.get("dwt_cycles_between_pps_vclock"),
+            frag.get("vclock_dwt_cycles_between_edges"),
+        )
+        static_residual = (
+            actual - static_prediction
+            if actual is not None and static_prediction is not None
+            else None
+        )
+        dynamic_residual = (
+            actual - dynamic_final
+            if actual is not None and dynamic_final is not None and dynamic_final != 0
+            else None
+        )
+        legacy = LanePrediction(
+            static_prediction_cycles=static_prediction,
+            dynamic_final_prediction_cycles=dynamic_final,
+            actual_cycles=actual,
+            static_residual_cycles=static_residual,
+            dynamic_residual_cycles=dynamic_residual,
+            source="legacy_dwt",
+        )
+        if legacy.has_any:
+            return legacy
+
+    return LanePrediction()
+
+
+def classify_row(row: Row, threshold: int) -> str:
     flags: List[str] = []
 
-    if actual_cycles is None:
-        flags.append("MISSING_ACTUAL")
+    for lane in LANES:
+        lp = row.lanes[lane]
+        if not lp.has_any:
+            flags.append(f"{lane.upper()}_MISSING")
+            continue
 
-    if static_residual is not None and abs(static_residual) > threshold:
-        flags.append("STATIC_SPIKE")
-    if dynamic_residual is not None and abs(dynamic_residual) > threshold:
-        flags.append("DYN_SPIKE")
+        if lp.static_residual_cycles is not None and abs(lp.static_residual_cycles) > threshold:
+            flags.append(f"{lane.upper()}_STATIC")
+        if lp.dynamic_residual_cycles is not None and abs(lp.dynamic_residual_cycles) > threshold:
+            flags.append(f"{lane.upper()}_DYN")
+        if lp.static_residual_cycles is not None and lp.dynamic_residual_cycles is not None:
+            s = abs(lp.static_residual_cycles)
+            d = abs(lp.dynamic_residual_cycles)
+            if d < s:
+                flags.append(f"{lane.upper()}_DYN_BETTER")
+            elif d > s:
+                flags.append(f"{lane.upper()}_DYN_WORSE")
+            else:
+                flags.append(f"{lane.upper()}_TIE")
 
-    if dynamic_invalid_count is not None and dynamic_invalid_count > 0:
-        flags.append(f"GATED:{dynamic_invalid_count}")
-
-    if dynamic_valid_count is not None and dynamic_valid_count == 0:
-        flags.append("NO_VALID_SERVO")
-
-    if dynamic_adjust_count is not None and dynamic_adjust_count > 0:
-        flags.append(f"ADJ:{dynamic_adjust_count}")
-
-    if dynamic_adjust_cycles is not None and abs(dynamic_adjust_cycles) > threshold:
-        flags.append("BIG_NET_ADJ")
-
-    if static_residual is not None and dynamic_residual is not None:
-        if abs(dynamic_residual) < abs(static_residual):
-            flags.append("DYN_BETTER")
-        elif abs(dynamic_residual) > abs(static_residual):
-            flags.append("DYN_WORSE")
-        else:
-            flags.append("TIE")
+    # Cross-lane hints.  These are deliberately simple; the point is to flag
+    # rows where VCLOCK and OCXO residuals may be moving together.
+    v = row.lanes["vclock"].dynamic_residual_cycles
+    o1 = row.lanes["ocxo1"].dynamic_residual_cycles
+    o2 = row.lanes["ocxo2"].dynamic_residual_cycles
+    if v is not None and o1 is not None and o2 is not None:
+        if (v > 0 and o1 > 0 and o2 > 0) or (v < 0 and o1 < 0 and o2 < 0):
+            flags.append("DYN_SAME_SIGN_ALL")
+        if abs(v) > threshold and (abs(o1) > threshold or abs(o2) > threshold):
+            flags.append("VCLOCK_OCXO_SPIKE")
 
     return ",".join(flags)
 
 
 def build_rows(raw_rows: Iterable[Dict[str, Any]], threshold: int) -> List[Row]:
     out: List[Row] = []
-    prev_static_next: Optional[int] = None
 
     for rec in raw_rows:
         root = _root(rec)
@@ -248,119 +373,159 @@ def build_rows(raw_rows: Iterable[Dict[str, Any]], threshold: int) -> List[Row]:
         if pps is None:
             continue
 
-        actual_cycles = _first_int(
-            frag.get("dwt_cycles_between_pps_vclock"),
-            frag.get("vclock_dwt_cycles_between_edges"),
-            frag.get("dwt_cycle_count_between_pps"),  # legacy/script alias
-        )
+        campaign = str(root.get("campaign") or frag.get("campaign") or "")
 
-        static_next = _first_int(frag.get("dwt_static_prediction_cycle_count"))
-        dynamic_final = _first_int(frag.get("dwt_dynamic_prediction_cycle_count"))
-        dynamic_adjust_count = _first_int(frag.get("dwt_dynamic_prediction_adjust_count"))
-        dynamic_invalid_count = _first_int(frag.get("dwt_dynamic_prediction_invalid_count"))
-        dynamic_valid_count = _first_int(frag.get("dwt_dynamic_prediction_valid_count"))
-        dynamic_adjust_cycles = _first_int(frag.get("dwt_dynamic_prediction_adjust_cycles"))
+        lanes = {
+            lane: lane_prediction_from_fragment(frag, lane)
+            for lane in LANES
+        }
 
-        # Existing/legacy residual surfaces, useful while schemas are in motion.
-        old_prediction_residual = _first_int(
-            frag.get("vclock_dwt_repair_last_prediction_residual_cycles"),
-            frag.get("dwt_prediction_residual_cycles"),
-        )
-        dwt_second_residual = _first_int(frag.get("dwt_second_residual_cycles"))
-
-        static_for_this_second = prev_static_next
-        static_residual = (
-            actual_cycles - static_for_this_second
-            if actual_cycles is not None and static_for_this_second is not None
-            else None
-        )
-        dynamic_residual = (
-            actual_cycles - dynamic_final
-            if actual_cycles is not None and dynamic_final is not None
-            else None
-        )
-
-        # If firmware still publishes the old one-step residual, compare it to
-        # the shifted static residual. This is a cheap schema sanity check.
-        fw_static_residual = old_prediction_residual
-
-        flags = classify_flags(
-            actual_cycles=actual_cycles,
-            static_residual=static_residual,
-            dynamic_residual=dynamic_residual,
-            dynamic_invalid_count=dynamic_invalid_count,
-            dynamic_valid_count=dynamic_valid_count,
-            dynamic_adjust_count=dynamic_adjust_count,
-            dynamic_adjust_cycles=dynamic_adjust_cycles,
-            threshold=threshold,
-        )
-
-        out.append(Row(
+        row = Row(
             pps=int(pps),
-            actual_cycles=actual_cycles,
-            static_next=static_next,
-            static_for_this_second=static_for_this_second,
-            static_residual=static_residual,
-            dynamic_final=dynamic_final,
-            dynamic_residual=dynamic_residual,
-            dynamic_adjust_count=dynamic_adjust_count,
-            dynamic_invalid_count=dynamic_invalid_count,
-            dynamic_valid_count=dynamic_valid_count,
-            dynamic_adjust_cycles=dynamic_adjust_cycles,
-            fw_static_residual=fw_static_residual,
-            dwt_second_residual=dwt_second_residual,
-            old_prediction_residual=old_prediction_residual,
-            flags=flags,
-        ))
-
-        prev_static_next = static_next
+            campaign=campaign,
+            lanes=lanes,
+            vclock_dwt_cycles_between_edges=_first_int(
+                frag.get("vclock_dwt_cycles_between_edges"),
+                frag.get("dwt_cycles_between_pps_vclock"),
+            ),
+            ocxo1_dwt_cycles_between_edges=_first_int(frag.get("ocxo1_dwt_cycles_between_edges")),
+            ocxo2_dwt_cycles_between_edges=_first_int(frag.get("ocxo2_dwt_cycles_between_edges")),
+            ocxo1_second_residual_ns=_first_int(frag.get("ocxo1_second_residual_ns")),
+            ocxo2_second_residual_ns=_first_int(frag.get("ocxo2_second_residual_ns")),
+            ocxo1_gnss_ns_between_edges=_first_int(frag.get("ocxo1_gnss_ns_between_edges")),
+            ocxo2_gnss_ns_between_edges=_first_int(frag.get("ocxo2_gnss_ns_between_edges")),
+            ocxo1_ppb=_first_float(frag.get("ocxo1_ppb")),
+            ocxo2_ppb=_first_float(frag.get("ocxo2_ppb")),
+            ocxo1_dac=_first_float(frag.get("ocxo1_dac")),
+            ocxo2_dac=_first_float(frag.get("ocxo2_dac")),
+            flags="",
+        )
+        row.flags = classify_row(row, threshold)
+        out.append(row)
 
     return out
 
 
+def lane_columns(row: Row, lane: str) -> List[str]:
+    lp = row.lanes[lane]
+    return [
+        _fmt_int(lp.static_prediction_cycles, 12),
+        _fmt_int(lp.dynamic_final_prediction_cycles, 12),
+        _fmt_int(lp.actual_cycles, 12),
+        _fmt_int(lp.static_residual_cycles, 7, signed=True),
+        _fmt_int(lp.dynamic_residual_cycles, 7, signed=True),
+    ]
+
+
 def print_table(rows: List[Row], limit: int) -> None:
-    header = (
-        f"{'pps':>7s}  "
-        f"{'actual':>12s}  "
-        f"{'static_pred':>12s}  "
-        f"{'static_res':>10s}  "
-        f"{'dyn_final':>12s}  "
-        f"{'dyn_res':>9s}  "
-        f"{'valid':>5s}  "
-        f"{'invalid':>7s}  "
-        f"{'adj_ct':>6s}  "
-        f"{'adj_cyc':>8s}  "
-        f"{'static_next':>12s}  "
-        f"{'flags':<34s}"
-    )
-    print(header)
-    print(
-        f"{'─'*7}  {'─'*12}  {'─'*12}  {'─'*10}  {'─'*12}  {'─'*9}  "
-        f"{'─'*5}  {'─'*7}  {'─'*6}  {'─'*8}  {'─'*12}  {'─'*34}"
-    )
+    header_parts = [
+        f"{'pps':>7s}",
+        f"{'v_stat':>12s}", f"{'v_final':>12s}", f"{'v_actual':>12s}", f"{'v_sres':>7s}", f"{'v_dres':>7s}",
+        f"{'o1_stat':>12s}", f"{'o1_final':>12s}", f"{'o1_actual':>12s}", f"{'o1_sres':>7s}", f"{'o1_dres':>7s}",
+        f"{'o2_stat':>12s}", f"{'o2_final':>12s}", f"{'o2_actual':>12s}", f"{'o2_sres':>7s}", f"{'o2_dres':>7s}",
+        f"{'o1_ns_res':>9s}", f"{'o2_ns_res':>9s}",
+        f"{'o1_ppb':>9s}", f"{'o2_ppb':>9s}",
+        f"{'o1_dac':>10s}", f"{'o2_dac':>10s}",
+        f"{'flags':<60s}",
+    ]
+    print("  ".join(header_parts))
+    print("  ".join("─" * len(part) for part in header_parts))
 
     shown = 0
     for r in rows:
-        print(
-            f"{r.pps:>7d}  "
-            f"{_fmt_int(r.actual_cycles, 12)}  "
-            f"{_fmt_int(r.static_for_this_second, 12)}  "
-            f"{_fmt_int(r.static_residual, 10, signed=True)}  "
-            f"{_fmt_int(r.dynamic_final, 12)}  "
-            f"{_fmt_int(r.dynamic_residual, 9, signed=True)}  "
-            f"{_fmt_int(r.dynamic_valid_count, 5)}  "
-            f"{_fmt_int(r.dynamic_invalid_count, 7)}  "
-            f"{_fmt_int(r.dynamic_adjust_count, 6)}  "
-            f"{_fmt_int(r.dynamic_adjust_cycles, 8, signed=True)}  "
-            f"{_fmt_int(r.static_next, 12)}  "
-            f"{_fmt_str(r.flags, 34)}"
-        )
+        parts = [
+            f"{r.pps:>7d}",
+            *lane_columns(r, "vclock"),
+            *lane_columns(r, "ocxo1"),
+            *lane_columns(r, "ocxo2"),
+            _fmt_int(r.ocxo1_second_residual_ns, 9, signed=True),
+            _fmt_int(r.ocxo2_second_residual_ns, 9, signed=True),
+            _fmt_float(r.ocxo1_ppb, 9, 3, signed=True),
+            _fmt_float(r.ocxo2_ppb, 9, 3, signed=True),
+            _fmt_float(r.ocxo1_dac, 10, 3),
+            _fmt_float(r.ocxo2_dac, 10, 3),
+            _fmt_str(r.flags, 60),
+        ]
+        print("  ".join(parts))
         shown += 1
         if limit and shown >= limit:
             break
 
 
-def analyze(campaign: str, limit: int = 0, threshold: int = DEFAULT_EVENT_THRESHOLD_CYCLES) -> None:
+def print_csv(rows: List[Row], limit: int) -> None:
+    fields = ["pps"]
+    for lane in LANES:
+        fields.extend([
+            f"{lane}_static_prediction_cycles",
+            f"{lane}_dynamic_final_prediction_cycles",
+            f"{lane}_actual_cycles",
+            f"{lane}_static_residual_cycles",
+            f"{lane}_dynamic_residual_cycles",
+            f"{lane}_source",
+        ])
+    fields.extend([
+        "vclock_dwt_cycles_between_edges",
+        "ocxo1_dwt_cycles_between_edges",
+        "ocxo2_dwt_cycles_between_edges",
+        "ocxo1_second_residual_ns",
+        "ocxo2_second_residual_ns",
+        "ocxo1_gnss_ns_between_edges",
+        "ocxo2_gnss_ns_between_edges",
+        "ocxo1_ppb",
+        "ocxo2_ppb",
+        "ocxo1_dac",
+        "ocxo2_dac",
+        "flags",
+    ])
+
+    writer = csv.DictWriter(sys.stdout, fieldnames=fields)
+    writer.writeheader()
+
+    shown = 0
+    for r in rows:
+        rec: Dict[str, Any] = {"pps": r.pps}
+        for lane in LANES:
+            lp = r.lanes[lane]
+            rec[f"{lane}_static_prediction_cycles"] = lp.static_prediction_cycles
+            rec[f"{lane}_dynamic_final_prediction_cycles"] = lp.dynamic_final_prediction_cycles
+            rec[f"{lane}_actual_cycles"] = lp.actual_cycles
+            rec[f"{lane}_static_residual_cycles"] = lp.static_residual_cycles
+            rec[f"{lane}_dynamic_residual_cycles"] = lp.dynamic_residual_cycles
+            rec[f"{lane}_source"] = lp.source
+        rec.update({
+            "vclock_dwt_cycles_between_edges": r.vclock_dwt_cycles_between_edges,
+            "ocxo1_dwt_cycles_between_edges": r.ocxo1_dwt_cycles_between_edges,
+            "ocxo2_dwt_cycles_between_edges": r.ocxo2_dwt_cycles_between_edges,
+            "ocxo1_second_residual_ns": r.ocxo1_second_residual_ns,
+            "ocxo2_second_residual_ns": r.ocxo2_second_residual_ns,
+            "ocxo1_gnss_ns_between_edges": r.ocxo1_gnss_ns_between_edges,
+            "ocxo2_gnss_ns_between_edges": r.ocxo2_gnss_ns_between_edges,
+            "ocxo1_ppb": r.ocxo1_ppb,
+            "ocxo2_ppb": r.ocxo2_ppb,
+            "ocxo1_dac": r.ocxo1_dac,
+            "ocxo2_dac": r.ocxo2_dac,
+            "flags": r.flags,
+        })
+        writer.writerow(rec)
+        shown += 1
+        if limit and shown >= limit:
+            break
+
+
+def corr(xs: List[float], ys: List[float]) -> Optional[float]:
+    if len(xs) != len(ys) or len(xs) < 2:
+        return None
+    mx = sum(xs) / len(xs)
+    my = sum(ys) / len(ys)
+    vx = sum((x - mx) ** 2 for x in xs)
+    vy = sum((y - my) ** 2 for y in ys)
+    if vx == 0.0 or vy == 0.0:
+        return None
+    cov = sum((x - mx) * (y - my) for x, y in zip(xs, ys))
+    return cov / math.sqrt(vx * vy)
+
+
+def analyze(campaign: str, limit: int = 0, threshold: int = DEFAULT_EVENT_THRESHOLD_CYCLES, *, csv_mode: bool = False) -> None:
     raw = fetch_timebase(campaign)
     if not raw:
         print(f"No TIMEBASE rows found for campaign '{campaign}'")
@@ -368,110 +533,104 @@ def analyze(campaign: str, limit: int = 0, threshold: int = DEFAULT_EVENT_THRESH
 
     rows = build_rows(raw, threshold)
 
+    if csv_mode:
+        print_csv(rows, limit)
+        return
+
     print(f"Campaign: {campaign}")
     print(f"Rows loaded: {len(rows):,}")
-    print(f"Spike/gate threshold: {threshold:,} cycles")
+    print(f"Spike threshold: {threshold:,} cycles")
     print()
     print("Column semantics:")
-    print("  actual       = dwt_cycles_between_pps_vclock for this TIMEBASE row")
-    print("  static_pred  = prior row's dwt_static_prediction_cycle_count")
-    print("                 (the static prediction that applied to this row)")
-    print("  static_next  = this row's static prediction for the upcoming second")
-    print("  dyn_final    = final dynamic servo prediction for the just-finished second")
-    print("  dyn_res      = actual - dyn_final")
-    print("  adj_cyc      = net signed dynamic servo adjustment during the second")
+    print("  *_stat   = static/before prediction for the completed lane-local second")
+    print("  *_final  = dynamic-final/after prediction after Gamma courtroom samples")
+    print("  *_actual = naive DWT cycles measured between lane-local one-second edges")
+    print("  *_sres   = actual - static prediction")
+    print("  *_dres   = actual - dynamic-final prediction")
+    print("  o*_ns_res = OCXO fast-positive measured GNSS residual in ns")
     print()
 
     print_table(rows, limit)
     print()
 
     # Summary stats.
-    w_static = Welford()
-    w_dynamic = Welford()
-    w_adjust_cycles = Welford()
+    stats: Dict[str, Welford] = {}
+    for lane in LANES:
+        stats[f"{lane}_static_residual"] = Welford()
+        stats[f"{lane}_dynamic_residual"] = Welford()
 
-    count_static = 0
-    count_dynamic = 0
-    dyn_better = 0
-    dyn_worse = 0
-    dyn_tie = 0
-    static_spikes = 0
-    dynamic_spikes = 0
-    rows_with_gates = 0
-    total_invalid = 0
-    total_valid = 0
-    total_adjust_count = 0
-    missing_new_fields = 0
-    fw_mismatch = 0
+    better = {lane: 0 for lane in LANES}
+    worse = {lane: 0 for lane in LANES}
+    tie = {lane: 0 for lane in LANES}
+    missing = {lane: 0 for lane in LANES}
+    sources: Dict[str, Dict[str, int]] = {lane: {} for lane in LANES}
+
+    v_dyn: List[float] = []
+    o1_dyn: List[float] = []
+    o2_dyn: List[float] = []
+    o1_ns: List[float] = []
+    o2_ns: List[float] = []
 
     events: List[Row] = []
 
     for r in rows:
-        if r.static_residual is not None:
-            w_static.update(float(r.static_residual))
-            count_static += 1
-            if abs(r.static_residual) > threshold:
-                static_spikes += 1
+        for lane in LANES:
+            lp = r.lanes[lane]
+            sources[lane][lp.source] = sources[lane].get(lp.source, 0) + 1
+            if not lp.has_any:
+                missing[lane] += 1
+                continue
 
-        if r.dynamic_residual is not None:
-            w_dynamic.update(float(r.dynamic_residual))
-            count_dynamic += 1
-            if abs(r.dynamic_residual) > threshold:
-                dynamic_spikes += 1
+            if lp.static_residual_cycles is not None:
+                stats[f"{lane}_static_residual"].update(float(lp.static_residual_cycles))
+            if lp.dynamic_residual_cycles is not None:
+                stats[f"{lane}_dynamic_residual"].update(float(lp.dynamic_residual_cycles))
 
-        if r.static_residual is not None and r.dynamic_residual is not None:
-            a = abs(r.static_residual)
-            b = abs(r.dynamic_residual)
-            if b < a:
-                dyn_better += 1
-            elif b > a:
-                dyn_worse += 1
-            else:
-                dyn_tie += 1
+            if lp.static_residual_cycles is not None and lp.dynamic_residual_cycles is not None:
+                s = abs(lp.static_residual_cycles)
+                d = abs(lp.dynamic_residual_cycles)
+                if d < s:
+                    better[lane] += 1
+                elif d > s:
+                    worse[lane] += 1
+                else:
+                    tie[lane] += 1
 
-        if r.dynamic_adjust_cycles is not None:
-            w_adjust_cycles.update(float(r.dynamic_adjust_cycles))
-        else:
-            missing_new_fields += 1
+        vd = r.lanes["vclock"].dynamic_residual_cycles
+        o1d = r.lanes["ocxo1"].dynamic_residual_cycles
+        o2d = r.lanes["ocxo2"].dynamic_residual_cycles
+        if vd is not None and o1d is not None and o2d is not None:
+            v_dyn.append(float(vd))
+            o1_dyn.append(float(o1d))
+            o2_dyn.append(float(o2d))
+        if o1d is not None and r.ocxo1_second_residual_ns is not None:
+            o1_ns.append(float(r.ocxo1_second_residual_ns))
+        if o2d is not None and r.ocxo2_second_residual_ns is not None:
+            o2_ns.append(float(r.ocxo2_second_residual_ns))
 
-        if r.dynamic_invalid_count:
-            rows_with_gates += 1
-            total_invalid += r.dynamic_invalid_count
-        if r.dynamic_valid_count:
-            total_valid += r.dynamic_valid_count
-        if r.dynamic_adjust_count:
-            total_adjust_count += r.dynamic_adjust_count
-
-        if r.fw_static_residual is not None and r.static_residual is not None:
-            if r.fw_static_residual != r.static_residual:
-                fw_mismatch += 1
-
-        # Save interesting rows for an event listing.
-        if (
-            (r.static_residual is not None and abs(r.static_residual) > threshold)
-            or (r.dynamic_residual is not None and abs(r.dynamic_residual) > threshold)
-            or (r.dynamic_invalid_count is not None and r.dynamic_invalid_count > 0)
-            or "MISSING" in r.flags
-        ):
+        if r.flags:
             events.append(r)
 
     print("Summary")
     print("═══════")
-    _print_stats("static residual", w_static)
-    _print_stats("dynamic residual", w_dynamic)
-    _print_stats("dynamic net adjustment", w_adjust_cycles)
-    print()
-    print(f"  static residual samples      = {count_static:,}")
-    print(f"  dynamic residual samples     = {count_dynamic:,}")
-    print(f"  dynamic better / worse / tie = {dyn_better:,} / {dyn_worse:,} / {dyn_tie:,}")
-    print(f"  static spikes > threshold    = {static_spikes:,}")
-    print(f"  dynamic spikes > threshold   = {dynamic_spikes:,}")
-    print(f"  rows with gated captures     = {rows_with_gates:,}")
-    print(f"  total gated captures         = {total_invalid:,}")
-    print(f"  total valid servo captures   = {total_valid:,}")
-    print(f"  total servo adjustments      = {total_adjust_count:,}")
-    print(f"  rows missing dynamic fields  = {missing_new_fields:,}")
-    print(f"  old pred residual mismatches = {fw_mismatch:,}")
+    for lane in LANES:
+        _print_stats(f"{lane} static residual", stats[f"{lane}_static_residual"])
+        _print_stats(f"{lane} dynamic residual", stats[f"{lane}_dynamic_residual"])
+        print(
+            f"  {lane:<34s} dynamic better / worse / tie = "
+            f"{better[lane]:,} / {worse[lane]:,} / {tie[lane]:,}; "
+            f"missing={missing[lane]:,}; sources={sources[lane]}"
+        )
+        print()
+
+    print("Cross-lane correlations")
+    print("═══════════════════════")
+    c_v_o1 = corr(v_dyn, o1_dyn)
+    c_v_o2 = corr(v_dyn, o2_dyn)
+    c_o1_o2 = corr(o1_dyn, o2_dyn)
+    print(f"  corr(vclock_dyn_res, ocxo1_dyn_res) = {c_v_o1 if c_v_o1 is not None else 'n/a'}")
+    print(f"  corr(vclock_dyn_res, ocxo2_dyn_res) = {c_v_o2 if c_v_o2 is not None else 'n/a'}")
+    print(f"  corr(ocxo1_dyn_res,  ocxo2_dyn_res) = {c_o1_o2 if c_o1_o2 is not None else 'n/a'}")
     print()
 
     if events:
@@ -489,26 +648,31 @@ def analyze(campaign: str, limit: int = 0, threshold: int = DEFAULT_EVENT_THRESH
 
     print("Notes")
     print("═════")
-    print("  • dwt_static_prediction_cycle_count is a prediction for the NEXT row.")
-    print("    This report shifts it by one row to evaluate the static predictor.")
-    print("  • dwt_dynamic_prediction_cycle_count is treated as the finalized")
-    print("    dynamic prediction for the just-finished interval in the same row.")
-    print("  • A row can have a good dynamic residual even when invalid_count > 0:")
-    print("    that means the servo saw an impossible capture and refused to learn")
-    print("    from it, which is the intended gate behavior.")
+    print("  • The report prefers fragment.prediction and falls back to transitional")
+    print("    top-level Gamma fields while firmware/Pi consumers migrate.")
+    print("  • VCLOCK prediction residuals are DWT-ruler quality evidence.")
+    print("  • OCXO prediction residuals are lane-local edge prediction evidence.")
+    print("  • OCXO ns residuals are measured GNSS interval residuals and therefore")
+    print("    include the VCLOCK/DWT ruler dependency.")
+    print("  • Use --csv if the table is too wide for the terminal and you want to")
+    print("    inspect it in a spreadsheet or pipe it into tooling.")
     print()
 
 
 def main(argv: List[str]) -> None:
     if len(argv) < 2:
-        print("Usage: cycle_prediction.py <campaign> [limit] [threshold]")
-        print("  limit=0 means all rows. threshold defaults to 100 cycles.")
+        print("Usage: cycle_prediction.py <campaign> [limit] [threshold] [--csv]")
+        print("  limit=0 means all rows. threshold defaults to 25 cycles.")
         raise SystemExit(1)
 
-    campaign = argv[1]
-    limit = int(argv[2]) if len(argv) >= 3 else 0
-    threshold = int(argv[3]) if len(argv) >= 4 else DEFAULT_EVENT_THRESHOLD_CYCLES
-    analyze(campaign, limit=limit, threshold=threshold)
+    csv_mode = "--csv" in argv
+    positional = [a for a in argv[1:] if a != "--csv"]
+
+    campaign = positional[0]
+    limit = int(positional[1]) if len(positional) >= 2 else 0
+    threshold = int(positional[2]) if len(positional) >= 3 else DEFAULT_EVENT_THRESHOLD_CYCLES
+
+    analyze(campaign, limit=limit, threshold=threshold, csv_mode=csv_mode)
 
 
 if __name__ == "__main__":

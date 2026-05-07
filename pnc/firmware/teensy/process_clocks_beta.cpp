@@ -380,31 +380,70 @@ static void publish_freq(Payload& p, const char* clock_name, double ppb_value) {
 }
 
 
-static void payload_add_gamma_fragment(Payload& p,
-                                       const char* prefix,
-                                       time_clock_id_t clock) {
+
+static void prediction_add_lane_summary(Payload& prediction,
+                                        const char* prefix,
+                                        time_clock_id_t clock) {
   clocks_gamma_prediction_snapshot_t g{};
   (void)clocks_gamma_snapshot(clock, &g);
+
+  const uint32_t static_prediction_cycles =
+      g.completed_static_prediction_cycles;
+  const uint32_t dynamic_final_prediction_cycles =
+      g.completed_dynamic_prediction_cycles;
+  const uint32_t actual_cycles =
+      g.completed_actual_dwt_cycles_between_edges;
+
+  const bool have_completed_prediction =
+      g.completed_edge_count >= 2 &&
+      static_prediction_cycles != 0 &&
+      dynamic_final_prediction_cycles != 0 &&
+      actual_cycles != 0;
+
+  const int32_t static_residual_cycles = have_completed_prediction
+      ? (int32_t)((int64_t)actual_cycles -
+                  (int64_t)static_prediction_cycles)
+      : 0;
+  const int32_t dynamic_residual_cycles = have_completed_prediction
+      ? (int32_t)((int64_t)actual_cycles -
+                  (int64_t)dynamic_final_prediction_cycles)
+      : 0;
 
   char key[96];
   auto add_u32 = [&](const char* suffix, uint32_t value) {
     snprintf(key, sizeof(key), "%s_%s", prefix, suffix);
-    p.add(key, value);
+    prediction.add(key, value);
   };
   auto add_i32 = [&](const char* suffix, int32_t value) {
     snprintf(key, sizeof(key), "%s_%s", prefix, suffix);
-    p.add(key, value);
+    prediction.add(key, value);
   };
 
-  add_u32("static_prediction_cycle_count", g.completed_static_prediction_cycles);
-  add_u32("dynamic_prediction_cycle_count", g.completed_dynamic_prediction_cycles);
-  add_u32("actual_dwt_cycles_between_edges", g.completed_actual_dwt_cycles_between_edges);
-  add_u32("prediction_match_count", g.completed_match_count);
-  add_u32("prediction_adjust_count", g.completed_adjust_count);
-  add_u32("prediction_ignored_count", g.completed_ignored_count);
-  add_i32("prediction_ignored_min_error_cycles", g.completed_ignored_min_error_cycles);
-  add_i32("prediction_ignored_max_error_cycles", g.completed_ignored_max_error_cycles);
-  add_i32("prediction_last_error_cycles", g.completed_last_error_cycles);
+  add_u32("static_prediction_cycles", static_prediction_cycles);
+  add_u32("dynamic_final_prediction_cycles", dynamic_final_prediction_cycles);
+  add_u32("actual_cycles", actual_cycles);
+  add_i32("static_residual_cycles", static_residual_cycles);
+  add_i32("dynamic_residual_cycles", dynamic_residual_cycles);
+}
+
+static void payload_add_prediction_summary(Payload& p) {
+  Payload prediction;
+
+  // Compact per-TIMEBASE-row prediction audit.  This intentionally publishes
+  // only the completed lane-local second facts needed for campaign analysis.
+  //
+  // Static prediction is the "before" value: the random-walk prediction Gamma
+  // carried into the second.  Dynamic-final prediction is the "after" value:
+  // the final estimate after the 100 Hz courtroom accepted/rejected samples.
+  //
+  // The detailed courtroom samples remain available through
+  // CLOCKS.PREDICTION_DETAIL; TIMEBASE_FRAGMENT keeps only the compact audit
+  // surface so long campaigns remain queryable.
+  prediction_add_lane_summary(prediction, "vclock", time_clock_id_t::VCLOCK);
+  prediction_add_lane_summary(prediction, "ocxo1",  time_clock_id_t::OCXO1);
+  prediction_add_lane_summary(prediction, "ocxo2",  time_clock_id_t::OCXO2);
+
+  p.add_object("prediction", prediction);
 }
 
 static void payload_add_gamma_report_lane(Payload& p,
@@ -448,84 +487,6 @@ static void payload_add_gamma_report(Payload& p) {
   payload_add_gamma_report_lane(gamma, "ocxo1",  time_clock_id_t::OCXO1);
   payload_add_gamma_report_lane(gamma, "ocxo2",  time_clock_id_t::OCXO2);
   p.add_object("gamma_prediction", gamma);
-}
-
-// ============================================================================
-// Diag publishers — slimmed for the trimmed interrupt_capture_diag_t
-// ============================================================================
-
-static void clocks_payload_add_ocxo_diag(Payload& p,
-                                         const char* prefix,
-                                         const interrupt_capture_diag_t& diag) {
-  char key[96];
-
-  auto add_bool = [&](const char* suffix, bool value) {
-    snprintf(key, sizeof(key), "%s_%s", prefix, suffix);
-    p.add(key, value);
-  };
-  auto add_u32 = [&](const char* suffix, uint32_t value) {
-    snprintf(key, sizeof(key), "%s_%s", prefix, suffix);
-    p.add(key, value);
-  };
-  auto add_u64 = [&](const char* suffix, uint64_t value) {
-    snprintf(key, sizeof(key), "%s_%s", prefix, suffix);
-    p.add(key, value);
-  };
-
-  auto add_i64 = [&](const char* suffix, int64_t value) {
-    snprintf(key, sizeof(key), "%s_%s", prefix, suffix);
-    p.add(key, value);
-  };
-  auto add_str = [&](const char* suffix, const char* value) {
-    snprintf(key, sizeof(key), "%s_%s", prefix, suffix);
-    p.add(key, value ? value : "");
-  };
-
-  add_bool("enabled", diag.enabled);
-  add_u32("dwt_at_event", diag.dwt_at_event);
-  add_u64("gnss_ns_at_event", diag.gnss_ns_at_event);
-  add_u32("counter32_at_event", diag.counter32_at_event);
-  add_bool("dwt_synthetic", diag.dwt_synthetic);
-  add_bool("dwt_repair_candidate", diag.dwt_repair_candidate);
-  add_u32("dwt_original_at_event", diag.dwt_original_at_event);
-  add_u32("dwt_predicted_at_event", diag.dwt_predicted_at_event);
-  add_u32("dwt_used_at_event", diag.dwt_used_at_event);
-  add_i64("dwt_synthetic_error_cycles", diag.dwt_synthetic_error_cycles);
-  add_u32("dwt_synthetic_threshold_cycles", diag.dwt_synthetic_threshold_cycles);
-  add_str("dwt_synthetic_reason", diag.dwt_synthetic_reason);
-  add_u32("anchor_sequence_used", diag.anchor_sequence_used);
-  add_u32("anchor_age_slots", diag.anchor_age_slots);
-  add_u32("anchor_selection_kind", diag.anchor_selection_kind);
-  add_u32("anchor_dwt_at_edge", diag.anchor_dwt_at_edge);
-  add_i64("anchor_gnss_ns_at_edge", diag.anchor_gnss_ns_at_edge);
-  add_u32("anchor_cps", diag.anchor_cps);
-  add_u64("anchor_ns_delta", diag.anchor_ns_delta);
-  add_u32("anchor_failure_mask", diag.anchor_failure_mask);
-  add_u32("anomaly_count", diag.anomaly_count);
-}
-
-static void clocks_payload_add_pps_witness_diag(Payload& p,
-                                        const char* prefix,
-                                        const interrupt_capture_diag_t& diag) {
-  clocks_payload_add_ocxo_diag(p, prefix, diag);
-
-  char key[96];
-  auto add_u32 = [&](const char* suffix, uint32_t value) {
-    snprintf(key, sizeof(key), "%s_%s", prefix, suffix);
-    p.add(key, value);
-  };
-  auto add_i64 = [&](const char* suffix, int64_t value) {
-    snprintf(key, sizeof(key), "%s_%s", prefix, suffix);
-    p.add(key, value);
-  };
-
-  add_u32("pps_edge_sequence", diag.pps_edge_sequence);
-  add_u32("pps_edge_dwt_isr_entry_raw", diag.pps_edge_dwt_isr_entry_raw);
-  add_i64("pps_edge_gnss_ns", diag.pps_edge_gnss_ns);
-  add_i64("pps_edge_minus_event_ns", diag.pps_edge_minus_event_ns);
-  add_u32("pps_edge_dwt_cycles_from_vclock", diag.pps_edge_dwt_cycles_from_vclock);
-  add_i64("pps_edge_ns_from_vclock", diag.pps_edge_ns_from_vclock);
-  add_u32("pps_edge_vclock_event_count", diag.pps_edge_vclock_event_count);
 }
 
 // ============================================================================
@@ -1082,37 +1043,11 @@ void clocks_beta_pps(void) {
         (int32_t)((int64_t)g_dwt_cycles_between_pps_vclock -
                   (int64_t)DWT_EXPECTED_PER_PPS));
 
-  const time_dwt_prediction_snapshot_t pred = time_dwt_prediction_snapshot();
-  const time_dynamic_cps_snapshot_t dyn_pred = time_dynamic_cps_snapshot();
-
-  p.add("vclock_dwt_repair_prediction_valid", pred.valid);
-  p.add("vclock_dwt_repair_prediction_history_count", pred.history_count);
-  p.add("vclock_dwt_repair_last_prediction_residual_cycles",
-        pred.residual_cycles_last);
-
-  // Prominent DWT prediction surface.
-  //
-  // Static: the random-walk best guess for the upcoming second.
-  // Dynamic: finalized servo facts from the previous second. TIME owns these
-  // quantities; beta only transcribes them into TIMEBASE_FRAGMENT.
-  p.add("dwt_static_prediction_cycle_count", pred.predicted_cycles_next);
-  p.add("dwt_dynamic_prediction_cycle_count",
-        dyn_pred.last_completed_dynamic_prediction_cycle_count);
-  p.add("dwt_dynamic_prediction_adjust_count",
-        dyn_pred.last_completed_dynamic_prediction_adjust_count);
-  p.add("dwt_dynamic_prediction_invalid_count",
-        dyn_pred.last_completed_dynamic_prediction_invalid_count);
-  p.add("dwt_dynamic_prediction_valid_count",
-        dyn_pred.last_completed_dynamic_prediction_valid_count);
-  p.add("dwt_dynamic_prediction_adjust_cycles",
-        dyn_pred.last_completed_dynamic_prediction_adjust_cycles);
-
-  // Gamma next-second prediction surface.  These are lane-local clock-second
-  // predictions: VCLOCK predicts DWT cycles across 10,000,000 VCLOCK ticks;
-  // OCXO lanes predict DWT cycles across 10,000,000 ticks of their own clock.
-  payload_add_gamma_fragment(p, "vclock", time_clock_id_t::VCLOCK);
-  payload_add_gamma_fragment(p, "ocxo1",  time_clock_id_t::OCXO1);
-  payload_add_gamma_fragment(p, "ocxo2",  time_clock_id_t::OCXO2);
+  // Compact structured Gamma prediction surface.  The detailed courtroom
+  // samples remain available through CLOCKS.PREDICTION_DETAIL; the older
+  // top-level prediction aliases were removed from TIMEBASE_FRAGMENT to keep
+  // the per-second payload small enough for stable transport.
+  payload_add_prediction_summary(p);
 
   // Synthetic 32-bit VCLOCK identity of the canonical PPS/VCLOCK epoch.
   // Under the VCLOCK-domain architecture this is the compact event identity
@@ -1207,13 +1142,6 @@ void clocks_beta_pps(void) {
   publish_freq(p, "vclock", welford_vclock.mean);
   publish_freq(p, "ocxo1",  welford_ocxo1.mean);
   publish_freq(p, "ocxo2",  welford_ocxo2.mean);
-
-  // Per-lane diag (event facts + anomaly count).  The "pps_witness_diag" entry
-  // corresponds to the VCLOCK lane and additionally carries the GPIO
-  // PPS witness fields.
-  clocks_payload_add_pps_witness_diag(p, "pps_witness_diag", g_pps_witness_diag);
-  clocks_payload_add_ocxo_diag(p, "ocxo1_diag", g_ocxo1_interrupt_diag);
-  clocks_payload_add_ocxo_diag(p, "ocxo2_diag", g_ocxo2_interrupt_diag);
 
   g_last_fragment = p;
   publish("TIMEBASE_FRAGMENT", p);

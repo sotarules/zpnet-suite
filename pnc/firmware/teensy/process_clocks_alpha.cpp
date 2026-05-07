@@ -879,45 +879,6 @@ static void clock_mark_epoch_zero(clock_state_t& clock) {
   clock.window_error_ns = 0;
 }
 
-static void alpha_reset_canonical_clock_state_for_new_epoch(void) {
-  g_gnss_ns_at_pps_vclock = 0;
-  g_ocxo1_measured_gnss_ns_at_pps_vclock = 0;
-  g_ocxo2_measured_gnss_ns_at_pps_vclock = 0;
-  g_dwt_at_pps_vclock = 0;
-  g_dwt_cycle_count_total = 0;
-  g_dwt_cycles_between_pps_vclock = DWT_EXPECTED_PER_PPS;
-  g_dwt_calibration_valid = false;
-  g_counter32_at_pps_vclock = 0;
-  g_prev_dwt_at_vclock_event = 0;
-  g_prev_pps_vclock_dwt_at_edge = 0;
-  g_prev_pps_vclock_dwt_at_edge_valid = false;
-  g_vclock_event_count = 0;
-
-  g_vclock_clock = {};
-  g_vclock_measurement = {};
-  g_ocxo1_clock = {};
-  g_ocxo2_clock = {};
-  g_ocxo1_measurement = {};
-  g_ocxo2_measurement = {};
-  g_pps_witness_diag = {};
-  g_ocxo1_interrupt_diag = {};
-  g_ocxo2_interrupt_diag = {};
-  alpha_forensics_reset_all();
-  alpha_ticks64_reset_all();
-  alpha_measured_ns_reset_all();
-  clocks_gamma_reset_all();
-
-  dwt_cycle_count_total = 0;
-  gnss_raw_64           = 0;
-  ocxo1_measured_gnss_ticks_64        = 0;
-  ocxo2_measured_gnss_ticks_64        = 0;
-
-  welford_reset(welford_dwt);
-  welford_reset(welford_vclock);
-  welford_reset(welford_ocxo1);
-  welford_reset(welford_ocxo2);
-}
-
 // ============================================================================
 // Local epoch install / ZERO
 // ============================================================================
@@ -949,6 +910,74 @@ static volatile uint16_t g_alpha_epoch_last_ocxo1_hardware16 = 0;
 static volatile uint16_t g_alpha_epoch_last_ocxo2_hardware16 = 0;
 static volatile uint32_t g_alpha_epoch_sequence = 0;
 static char              g_alpha_epoch_last_reason[32] = {0};
+
+// Runtime PPS/VCLOCK sampling no longer requires the epoch-capture packet.
+// START/ZERO still require a valid capture packet, but ordinary per-second
+// sampling only needs the authored PPS/VCLOCK snapshot and Alpha's measured
+// clock state.  These counters audit capture availability/sequence agreement
+// without killing an otherwise coherent campaign.
+volatile uint32_t g_alpha_runtime_epoch_capture_missing_count = 0;
+volatile uint32_t g_alpha_runtime_epoch_capture_sequence_mismatch_count = 0;
+volatile uint32_t g_alpha_runtime_epoch_capture_last_snap_sequence = 0;
+volatile uint32_t g_alpha_runtime_epoch_capture_last_cap_sequence = 0;
+volatile uint32_t g_alpha_runtime_epoch_capture_last_snap_counter32 = 0;
+volatile uint32_t g_alpha_runtime_epoch_capture_last_cap_counter32 = 0;
+volatile uint32_t g_alpha_runtime_epoch_capture_last_snap_dwt = 0;
+volatile uint32_t g_alpha_runtime_epoch_capture_last_cap_dwt = 0;
+volatile bool     g_alpha_runtime_epoch_capture_last_cap_valid = false;
+volatile bool     g_alpha_runtime_epoch_capture_last_cap_vclock_valid = false;
+volatile bool     g_alpha_runtime_epoch_capture_last_cap_all_lanes_valid = false;
+
+static void alpha_reset_canonical_clock_state_for_new_epoch(void) {
+  g_gnss_ns_at_pps_vclock = 0;
+  g_ocxo1_measured_gnss_ns_at_pps_vclock = 0;
+  g_ocxo2_measured_gnss_ns_at_pps_vclock = 0;
+  g_dwt_at_pps_vclock = 0;
+  g_dwt_cycle_count_total = 0;
+  g_dwt_cycles_between_pps_vclock = DWT_EXPECTED_PER_PPS;
+  g_dwt_calibration_valid = false;
+  g_counter32_at_pps_vclock = 0;
+  g_prev_dwt_at_vclock_event = 0;
+  g_prev_pps_vclock_dwt_at_edge = 0;
+  g_prev_pps_vclock_dwt_at_edge_valid = false;
+  g_vclock_event_count = 0;
+
+  g_alpha_runtime_epoch_capture_missing_count = 0;
+  g_alpha_runtime_epoch_capture_sequence_mismatch_count = 0;
+  g_alpha_runtime_epoch_capture_last_snap_sequence = 0;
+  g_alpha_runtime_epoch_capture_last_cap_sequence = 0;
+  g_alpha_runtime_epoch_capture_last_snap_counter32 = 0;
+  g_alpha_runtime_epoch_capture_last_cap_counter32 = 0;
+  g_alpha_runtime_epoch_capture_last_snap_dwt = 0;
+  g_alpha_runtime_epoch_capture_last_cap_dwt = 0;
+  g_alpha_runtime_epoch_capture_last_cap_valid = false;
+  g_alpha_runtime_epoch_capture_last_cap_vclock_valid = false;
+  g_alpha_runtime_epoch_capture_last_cap_all_lanes_valid = false;
+
+  g_vclock_clock = {};
+  g_vclock_measurement = {};
+  g_ocxo1_clock = {};
+  g_ocxo2_clock = {};
+  g_ocxo1_measurement = {};
+  g_ocxo2_measurement = {};
+  g_pps_witness_diag = {};
+  g_ocxo1_interrupt_diag = {};
+  g_ocxo2_interrupt_diag = {};
+  alpha_forensics_reset_all();
+  alpha_ticks64_reset_all();
+  alpha_measured_ns_reset_all();
+  clocks_gamma_reset_all();
+
+  dwt_cycle_count_total = 0;
+  gnss_raw_64           = 0;
+  ocxo1_measured_gnss_ticks_64        = 0;
+  ocxo2_measured_gnss_ticks_64        = 0;
+
+  welford_reset(welford_dwt);
+  welford_reset(welford_vclock);
+  welford_reset(welford_ocxo1);
+  welford_reset(welford_ocxo2);
+}
 
 bool clocks_alpha_zero_from_interrupt_capture(const char* reason) {
   interrupt_epoch_capture_t cap{};
@@ -1241,22 +1270,22 @@ static void publish_pps_witness_diag(const pps_edge_snapshot_t& snap) {
 static bool alpha_sample_all_clocks_at_pps_vclock(const pps_edge_snapshot_t& snap,
                                                    uint64_t vclock_ns) {
   interrupt_epoch_capture_t cap{};
-  if (!interrupt_last_epoch_capture(&cap)) {
-    clocks_watchdog_anomaly("alpha_missing_epoch_capture",
-                            snap.sequence,
-                            snap.counter32_at_edge,
-                            snap.dwt_at_edge,
-                            0);
-    return false;
-  }
+  const bool cap_available = interrupt_last_epoch_capture(&cap);
 
-  if (cap.sequence != snap.sequence) {
-    clocks_watchdog_anomaly("alpha_epoch_capture_sequence_mismatch",
-                            cap.sequence,
-                            snap.sequence,
-                            cap.vclock_counter32,
-                            snap.counter32_at_edge);
-    return false;
+  g_alpha_runtime_epoch_capture_last_snap_sequence = snap.sequence;
+  g_alpha_runtime_epoch_capture_last_cap_sequence = cap.sequence;
+  g_alpha_runtime_epoch_capture_last_snap_counter32 = snap.counter32_at_edge;
+  g_alpha_runtime_epoch_capture_last_cap_counter32 = cap.vclock_counter32;
+  g_alpha_runtime_epoch_capture_last_snap_dwt = snap.dwt_at_edge;
+  g_alpha_runtime_epoch_capture_last_cap_dwt = cap.vclock_dwt_at_edge;
+  g_alpha_runtime_epoch_capture_last_cap_valid = cap.valid;
+  g_alpha_runtime_epoch_capture_last_cap_vclock_valid = cap.vclock_capture_valid;
+  g_alpha_runtime_epoch_capture_last_cap_all_lanes_valid = cap.all_lanes_capture_valid;
+
+  if (!cap_available) {
+    g_alpha_runtime_epoch_capture_missing_count++;
+  } else if (cap.sequence != snap.sequence) {
+    g_alpha_runtime_epoch_capture_sequence_mismatch_count++;
   }
 
   const uint64_t ocxo1_ns =
