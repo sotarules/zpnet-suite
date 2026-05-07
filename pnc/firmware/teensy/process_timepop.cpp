@@ -24,6 +24,14 @@
 //    The callback and recurring rearm happen inside the CH2 IRQ pass before
 //    schedule_next() selects the next compare.  Use only for tiny substrate
 //    maintenance callbacks that TimePop itself depends on for safe scheduling.
+//  • counter-base anchored ISR recurring
+//      timepop_arm_recurring_isr_from_base_counter32(base_gnss_ns,
+//                                                    base_counter32,
+//                                                    period_ns, ...)
+//    The first and later deadlines are computed from the supplied VCLOCK
+//    counter32 base by gear arithmetic.  This substrate path does not ask
+//    "what time is it now?" at arm time and does not require a current
+//    time_anchor_snapshot() to be valid.
 //
 // fire_gnss_ns is computed from VCLOCK arithmetic:
 //   gnss_ns = (pps_count - 1) * 1e9 + (fire_vclock_raw - qtimer_at_pps) * 100
@@ -90,17 +98,6 @@
 #include <climits>
 
 // ============================================================================
-// Forward declarations
-// ============================================================================
-
-static inline bool deadline_reached(uint32_t deadline, uint32_t now);
-static bool gnss_ns_to_vclock_deadline(int64_t target_gnss_ns,
-                                       const time_anchor_snapshot_t& snap,
-                                       uint32_t& out_deadline);
-static int64_t vclock_to_gnss_ns(uint32_t vclock_raw,
-                                 const time_anchor_snapshot_t& snap);
-
-// ============================================================================
 // Constants — 10 MHz domain
 // ============================================================================
 
@@ -145,6 +142,7 @@ enum class timepop_arm_source_t : uint8_t {
   RELATIVE_ARM,
   RELATIVE_ARM_PHASE_LOCKED,
   ABSOLUTE_ARM,
+  ANCHORED_RECURRING_ISR_ARM,
   EXACT_ARM,
   DISPATCH_ABSOLUTE_REARM,
   DISPATCH_RELATIVE_REARM,
@@ -160,6 +158,7 @@ static const char* arm_source_str(timepop_arm_source_t source) {
     case timepop_arm_source_t::RELATIVE_ARM: return "RELATIVE_ARM";
     case timepop_arm_source_t::RELATIVE_ARM_PHASE_LOCKED: return "RELATIVE_ARM_PHASE_LOCKED";
     case timepop_arm_source_t::ABSOLUTE_ARM: return "ABSOLUTE_ARM";
+    case timepop_arm_source_t::ANCHORED_RECURRING_ISR_ARM: return "ANCHORED_RECURRING_ISR_ARM";
     case timepop_arm_source_t::EXACT_ARM: return "EXACT_ARM";
     case timepop_arm_source_t::DISPATCH_ABSOLUTE_REARM: return "DISPATCH_ABSOLUTE_REARM";
     case timepop_arm_source_t::DISPATCH_RELATIVE_REARM: return "DISPATCH_RELATIVE_REARM";
@@ -209,6 +208,12 @@ struct timepop_slot_t {
   const char*         name;
 
   uint32_t            recurring_rearmed_count;
+  bool                recurring_base_fixed;
+  bool                recurring_base_counter32_fixed;
+  uint32_t            recurring_base_counter32;
+  uint64_t            recurring_next_index;
+  uint32_t            recurring_last_skipped_intervals;
+  uint32_t            recurring_total_skipped_intervals;
   uint32_t            recurring_immediate_expire_count;
   uint32_t            recurring_catchup_count;
   int64_t             recurring_base_gnss_ns;
@@ -400,8 +405,77 @@ static volatile int64_t  diag_deadline_last_ns_from_anchor = 0;
 // ============================================================================
 // Forward declarations
 // ============================================================================
+//
+// Keep all private prototypes here, after constants/types/state exist and before
+// helper definitions begin.  This lets the implementation below be grouped by
+// conceptual layer without C++ declaration-order surprises.
 
 static void schedule_next(void);
+
+static inline uint32_t vclock_count(void);
+static inline bool deadline_reached(uint32_t deadline, uint32_t now);
+static inline bool deadline_passed(uint32_t deadline, uint32_t now);
+static inline uint32_t deadline_lateness_ticks(uint32_t deadline, uint32_t now);
+static inline uint32_t ns_to_ticks(uint64_t ns);
+static bool period_ns_to_exact_ticks(uint64_t period_ns, uint32_t& out_ticks);
+
+static inline void update_slot_high_water(void);
+static inline void update_deferred_high_water(deferred_slot_t* slots_buf,
+                                              uint32_t max_slots,
+                                              volatile uint32_t& high_water);
+static inline void update_max_u32(volatile uint32_t& target, uint32_t value);
+static inline uint32_t slot_index_for(const timepop_slot_t& slot);
+static inline int32_t signed_deadline_delta_ticks(uint32_t deadline,
+                                                  uint32_t now,
+                                                  bool& already_past);
+static inline bool slot_name_equals(const timepop_slot_t& slot, const char* name);
+static inline bool slot_is_one_hz_recurring(const timepop_slot_t& slot);
+static inline void note_named_replacement(const char* name);
+static bool retire_existing_named_slots(const char* name);
+
+static inline int64_t time_anchor_latest_pps_gnss_ns(const time_anchor_snapshot_t& snap);
+static bool phase_locked_next_target_gnss_ns(uint64_t period_ns,
+                                             const time_anchor_snapshot_t& snap,
+                                             int64_t now_gnss_ns,
+                                             int64_t& out_target_gnss_ns);
+static bool anchored_next_target_gnss_ns(int64_t base_gnss_ns,
+                                         uint64_t period_ns,
+                                         int64_t now_gnss_ns,
+                                         int64_t& out_target_gnss_ns,
+                                         uint32_t* out_skipped_intervals);
+static bool gnss_ns_to_vclock_deadline(int64_t target_gnss_ns,
+                                       const time_anchor_snapshot_t& snap,
+                                       uint32_t& out_deadline);
+static int64_t vclock_to_gnss_ns(uint32_t vclock_raw,
+                                 const time_anchor_snapshot_t& snap);
+static uint32_t predict_dwt_at_deadline(uint32_t deadline, bool& valid);
+
+static void record_slot_arm_diag(timepop_slot_t& slot,
+                                 timepop_arm_source_t source,
+                                 bool has_now,
+                                 uint32_t now,
+                                 int64_t target_gnss_ns);
+
+static bool configure_phase_locked_recurring_slot(timepop_slot_t& slot,
+                                                  uint64_t period_ns);
+static bool configure_anchored_recurring_slot(timepop_slot_t& slot,
+                                              int64_t base_gnss_ns,
+                                              uint64_t period_ns,
+                                              timepop_arm_source_t source);
+static bool configure_anchored_recurring_slot_from_counter32(timepop_slot_t& slot,
+                                                             int64_t base_gnss_ns,
+                                                             uint32_t base_counter32,
+                                                             uint64_t period_ns,
+                                                             timepop_arm_source_t source);
+static bool rearm_counter32_anchored_recurring_slot_from_event(timepop_slot_t& slot,
+                                                               uint32_t fire_vclock_raw,
+                                                               timepop_arm_source_t source);
+static bool rearm_recurring_slot_for_epoch(timepop_slot_t& slot);
+static bool rearm_recurring_slot_from_irq(timepop_slot_t& slot,
+                                          uint32_t fire_vclock_raw,
+                                          int64_t fire_gnss_ns,
+                                          const time_anchor_snapshot_t& snap);
+
 static inline void slot_capture(timepop_slot_t& slot,
                                 uint32_t fire_vclock_raw,
                                 uint32_t fire_dwt_cyccnt,
@@ -413,29 +487,38 @@ static inline void expire_slot_with_capture(timepop_slot_t& slot,
                                             uint32_t fire_dwt_cyccnt,
                                             const time_anchor_snapshot_t& snap,
                                             timepop_fire_capture_source_t source);
-static timepop_handle_t arm_absolute_slot_internal(
-  int64_t             target_gnss_ns,
-  bool                recurring,
-  uint64_t            recurring_period_gnss_ns,
-  timepop_callback_t  callback,
-  void*               user_data,
-  const char*         name,
-  bool                isr_callback,
-  uint32_t            target_dwt = 0);
-static bool rearm_recurring_slot_for_epoch(timepop_slot_t& slot);
-static bool rearm_recurring_slot_from_irq(timepop_slot_t& slot,
-                                          uint32_t fire_vclock_raw,
-                                          int64_t fire_gnss_ns,
-                                          const time_anchor_snapshot_t& snap);
-static timepop_handle_t arm_relative_slot_internal(
-  uint64_t            delay_gnss_ns,
-  bool                recurring,
-  timepop_callback_t  callback,
-  void*               user_data,
-  const char*         name,
-  bool                isr_callback,
-  bool                rearm_in_isr
-);
+static inline void slot_build_ctx(const timepop_slot_t& slot,
+                                  timepop_ctx_t& ctx);
+static inline void slot_build_diag(const timepop_slot_t& slot,
+                                   uint32_t dwt_at_isr_entry,
+                                   timepop_diag_t& diag);
+
+static timepop_handle_t arm_anchored_recurring_isr_internal(int64_t base_gnss_ns,
+                                                            uint64_t period_gnss_ns,
+                                                            timepop_callback_t callback,
+                                                            void* user_data,
+                                                            const char* name);
+static timepop_handle_t arm_anchored_recurring_isr_from_counter32_internal(int64_t base_gnss_ns,
+                                                                           uint32_t base_counter32,
+                                                                           uint64_t period_gnss_ns,
+                                                                           timepop_callback_t callback,
+                                                                           void* user_data,
+                                                                           const char* name);
+static timepop_handle_t arm_absolute_slot_internal(int64_t target_gnss_ns,
+                                                   bool recurring,
+                                                   uint64_t recurring_period_gnss_ns,
+                                                   timepop_callback_t callback,
+                                                   void* user_data,
+                                                   const char* name,
+                                                   bool isr_callback,
+                                                   uint32_t target_dwt = 0);
+static timepop_handle_t arm_relative_slot_internal(uint64_t delay_gnss_ns,
+                                                   bool recurring,
+                                                   timepop_callback_t callback,
+                                                   void* user_data,
+                                                   const char* name,
+                                                   bool isr_callback,
+                                                   bool rearm_in_isr);
 
 // ============================================================================
 // Helpers
@@ -507,11 +590,140 @@ static bool configure_phase_locked_recurring_slot(timepop_slot_t& slot,
 
   slot.is_absolute = true;
   slot.recurrence_mode = timepop_recurrence_mode_t::ABSOLUTE;
+  slot.recurring_base_counter32_fixed = false;
+  slot.recurring_base_counter32 = 0;
+  slot.recurring_next_index = 0;
   slot.recurring_base_gnss_ns =
       (anchor_gnss_ns >= 0) ? (anchor_gnss_ns + (int64_t)period_ns) : target_gnss_ns;
   slot.recurring_period_gnss_ns = period_ns;
   slot.target_gnss_ns = target_gnss_ns;
   slot.deadline = deadline;
+  return true;
+}
+
+
+static bool anchored_next_target_gnss_ns(int64_t base_gnss_ns,
+                                          uint64_t period_ns,
+                                          int64_t now_gnss_ns,
+                                          int64_t& out_target_gnss_ns,
+                                          uint32_t* out_skipped_intervals) {
+  if (base_gnss_ns <= 0) return false;
+  if (period_ns == 0 || period_ns > (uint64_t)INT64_MAX) return false;
+  if (now_gnss_ns < 0) return false;
+
+  uint64_t steps = 0;
+  if (now_gnss_ns >= base_gnss_ns) {
+    steps = (uint64_t)((now_gnss_ns - base_gnss_ns) / (int64_t)period_ns) + 1ULL;
+  }
+
+  const int64_t target = base_gnss_ns + (int64_t)(steps * period_ns);
+  if (target <= now_gnss_ns) return false;
+
+  out_target_gnss_ns = target;
+  if (out_skipped_intervals) {
+    *out_skipped_intervals = (steps > 0xFFFFFFFFULL) ? 0xFFFFFFFFUL : (uint32_t)steps;
+  }
+  return true;
+}
+
+static bool period_ns_to_exact_ticks(uint64_t period_ns, uint32_t& out_ticks) {
+  if (period_ns == 0) return false;
+  if ((period_ns % NS_PER_TICK) != 0) return false;
+
+  const uint64_t ticks64 = period_ns / NS_PER_TICK;
+  if (ticks64 < MIN_DELAY_TICKS) return false;
+  if (ticks64 > MAX_DELAY_TICKS) return false;
+
+  out_ticks = (uint32_t)ticks64;
+  return true;
+}
+
+static bool configure_anchored_recurring_slot_from_counter32(
+  timepop_slot_t& slot,
+  int64_t         base_gnss_ns,
+  uint32_t        base_counter32,
+  uint64_t        period_ns,
+  timepop_arm_source_t source
+) {
+  if (base_gnss_ns <= 0) return false;
+  if (period_ns == 0 || period_ns > (uint64_t)INT64_MAX) return false;
+
+  uint32_t period_ticks = 0;
+  if (!period_ns_to_exact_ticks(period_ns, period_ticks)) return false;
+
+  slot.is_absolute = true;
+  slot.recurrence_mode = timepop_recurrence_mode_t::ABSOLUTE;
+  slot.recurring_base_fixed = true;
+  slot.recurring_base_counter32_fixed = true;
+  slot.recurring_base_counter32 = base_counter32;
+  slot.recurring_next_index = 1ULL;
+  slot.recurring_base_gnss_ns = base_gnss_ns;
+  slot.recurring_period_gnss_ns = period_ns;
+  slot.period_ns = period_ns;
+  slot.period_ticks = period_ticks;
+  slot.target_gnss_ns = base_gnss_ns + (int64_t)period_ns;
+  slot.deadline = base_counter32 + period_ticks;
+  slot.recurring_last_skipped_intervals = 0;
+  slot.predicted_dwt = predict_dwt_at_deadline(slot.deadline, slot.prediction_valid);
+
+  // This substrate arm path deliberately does not ask time_gnss_ns_now(), and
+  // it does not require a valid time_anchor_snapshot().  The scheduled grid is
+  // defined by the caller-owned base pair: (base_gnss_ns, base_counter32).
+  record_slot_arm_diag(slot, source, false, 0, slot.target_gnss_ns);
+  return true;
+}
+
+static bool rearm_counter32_anchored_recurring_slot_from_event(
+  timepop_slot_t& slot,
+  uint32_t        fire_vclock_raw,
+  timepop_arm_source_t source
+) {
+  if (!slot.active || !slot.recurring || !slot.recurring_base_counter32_fixed) {
+    return false;
+  }
+
+  const uint64_t period_ns = slot.recurring_period_gnss_ns
+      ? slot.recurring_period_gnss_ns
+      : slot.period_ns;
+  uint32_t period_ticks = 0;
+  if (!period_ns_to_exact_ticks(period_ns, period_ticks)) return false;
+  if (slot.recurring_base_gnss_ns <= 0) return false;
+
+  uint64_t index = slot.recurring_next_index ? slot.recurring_next_index : 1ULL;
+  uint32_t deadline = slot.recurring_base_counter32 + (uint32_t)(index * period_ticks);
+
+  uint32_t skipped = 0;
+  while (deadline_reached(deadline, fire_vclock_raw)) {
+    index++;
+    skipped++;
+    deadline = slot.recurring_base_counter32 + (uint32_t)(index * period_ticks);
+    if (skipped > 100000U) return false;
+  }
+
+  slot.period_ns = period_ns;
+  slot.period_ticks = period_ticks;
+  slot.expired = false;
+  slot.isr_callback_fired = false;
+  slot.fire_vclock_raw = 0;
+  slot.fire_dwt_cyccnt = 0;
+  slot.fire_gnss_ns = -1;
+  slot.fire_capture_source = timepop_fire_capture_source_t::NONE;
+
+  slot.recurring_next_index = index;
+  slot.deadline = deadline;
+  slot.target_gnss_ns = slot.recurring_base_gnss_ns + (int64_t)(index * period_ns);
+  slot.is_absolute = true;
+  slot.recurrence_mode = timepop_recurrence_mode_t::ABSOLUTE;
+  slot.recurring_last_skipped_intervals = skipped;
+  slot.recurring_total_skipped_intervals += skipped;
+  if (skipped > 1) {
+    slot.recurring_immediate_expire_count++;
+    slot.recurring_catchup_count += skipped - 1;
+  }
+
+  slot.predicted_dwt = predict_dwt_at_deadline(slot.deadline, slot.prediction_valid);
+  slot.recurring_rearmed_count++;
+  record_slot_arm_diag(slot, source, true, fire_vclock_raw, slot.target_gnss_ns);
   return true;
 }
 
@@ -625,6 +837,48 @@ static uint32_t predict_dwt_at_deadline(uint32_t deadline, bool& valid) {
   return snap.dwt_at_pps + (uint32_t)dwt_elapsed;
 }
 
+static bool configure_anchored_recurring_slot(timepop_slot_t& slot,
+                                               int64_t base_gnss_ns,
+                                               uint64_t period_ns,
+                                               timepop_arm_source_t source) {
+  if (period_ns == 0) return false;
+
+  const time_anchor_snapshot_t snap = time_anchor_snapshot();
+  const int64_t now_gnss_ns = time_gnss_ns_now();
+  int64_t target_gnss_ns = -1;
+  uint32_t skipped = 0;
+  if (!anchored_next_target_gnss_ns(base_gnss_ns,
+                                    period_ns,
+                                    now_gnss_ns,
+                                    target_gnss_ns,
+                                    &skipped)) {
+    return false;
+  }
+
+  uint32_t deadline = 0;
+  if (!gnss_ns_to_vclock_deadline(target_gnss_ns, snap, deadline)) {
+    return false;
+  }
+
+  slot.is_absolute = true;
+  slot.recurrence_mode = timepop_recurrence_mode_t::ABSOLUTE;
+  slot.recurring_base_fixed = true;
+  slot.recurring_base_counter32_fixed = false;
+  slot.recurring_base_counter32 = 0;
+  slot.recurring_next_index = 0;
+  slot.recurring_base_gnss_ns = base_gnss_ns;
+  slot.recurring_period_gnss_ns = period_ns;
+  slot.period_ns = period_ns;
+  slot.period_ticks = ns_to_ticks(period_ns);
+  slot.target_gnss_ns = target_gnss_ns;
+  slot.deadline = deadline;
+  slot.recurring_last_skipped_intervals = skipped;
+  slot.recurring_total_skipped_intervals += skipped;
+  slot.predicted_dwt = predict_dwt_at_deadline(slot.deadline, slot.prediction_valid);
+  record_slot_arm_diag(slot, source, true, vclock_count(), slot.target_gnss_ns);
+  return true;
+}
+
 // Re-author a recurring timed slot after a VCLOCK epoch change.  No old
 // deadline survives the boundary.  Phase-locked recurring slots are placed on
 // the new PPS/VCLOCK grid; if a lawful time anchor is not yet available, the
@@ -713,25 +967,49 @@ static bool rearm_recurring_slot_from_irq(timepop_slot_t& slot,
   slot.fire_gnss_ns = -1;
   slot.fire_capture_source = timepop_fire_capture_source_t::NONE;
 
+  if (slot.recurring_base_counter32_fixed) {
+    return rearm_counter32_anchored_recurring_slot_from_event(
+        slot, fire_vclock_raw, timepop_arm_source_t::ISR_REARM);
+  }
+
   bool rearmed = false;
   timepop_arm_source_t rearm_source = timepop_arm_source_t::ISR_REARM_FALLBACK;
 
   if (slot.recurrence_mode == timepop_recurrence_mode_t::ABSOLUTE &&
       slot.target_gnss_ns > 0 && fire_gnss_ns >= 0) {
-    int64_t next_target_gnss_ns =
-        slot.target_gnss_ns + (int64_t)period_ns;
+    int64_t next_target_gnss_ns = -1;
+    uint32_t skipped = 0;
 
-    if (next_target_gnss_ns <= fire_gnss_ns) {
-      const uint64_t missed =
-          (uint64_t)((fire_gnss_ns - next_target_gnss_ns) /
-                     (int64_t)period_ns) + 1ULL;
-      next_target_gnss_ns += (int64_t)(missed * period_ns);
-      slot.recurring_immediate_expire_count++;
-      slot.recurring_catchup_count += (uint32_t)missed;
+    if (slot.recurring_base_fixed && slot.recurring_base_gnss_ns > 0) {
+      if (anchored_next_target_gnss_ns(slot.recurring_base_gnss_ns,
+                                       period_ns,
+                                       fire_gnss_ns,
+                                       next_target_gnss_ns,
+                                       &skipped)) {
+        if (next_target_gnss_ns > slot.target_gnss_ns + (int64_t)period_ns) {
+          slot.recurring_immediate_expire_count++;
+          slot.recurring_catchup_count += skipped;
+        }
+        slot.recurring_last_skipped_intervals = skipped;
+        slot.recurring_total_skipped_intervals += skipped;
+      }
+    } else {
+      next_target_gnss_ns = slot.target_gnss_ns + (int64_t)period_ns;
+      if (next_target_gnss_ns <= fire_gnss_ns) {
+        const uint64_t missed =
+            (uint64_t)((fire_gnss_ns - next_target_gnss_ns) /
+                       (int64_t)period_ns) + 1ULL;
+        next_target_gnss_ns += (int64_t)(missed * period_ns);
+        slot.recurring_immediate_expire_count++;
+        slot.recurring_catchup_count += (uint32_t)missed;
+        slot.recurring_last_skipped_intervals = (uint32_t)missed;
+        slot.recurring_total_skipped_intervals += (uint32_t)missed;
+      }
     }
 
     uint32_t next_deadline = 0;
-    if (gnss_ns_to_vclock_deadline(next_target_gnss_ns, snap, next_deadline)) {
+    if (next_target_gnss_ns > 0 &&
+        gnss_ns_to_vclock_deadline(next_target_gnss_ns, snap, next_deadline)) {
       slot.target_gnss_ns = next_target_gnss_ns;
       slot.deadline = next_deadline;
       slot.is_absolute = true;
@@ -1434,6 +1712,12 @@ static timepop_handle_t arm_absolute_slot_internal(
     slots[i].isr_callback   = isr_callback;
     slots[i].rearm_in_isr  = false;
     slots[i].recurring_rearmed_count = 0;
+    slots[i].recurring_base_fixed = false;
+    slots[i].recurring_base_counter32_fixed = false;
+    slots[i].recurring_base_counter32 = 0;
+    slots[i].recurring_next_index = 0;
+    slots[i].recurring_last_skipped_intervals = 0;
+    slots[i].recurring_total_skipped_intervals = 0;
     slots[i].recurring_immediate_expire_count = 0;
     slots[i].recurring_catchup_count = 0;
     slots[i].recurring_base_gnss_ns = target_gnss_ns;
@@ -1457,6 +1741,136 @@ static timepop_handle_t arm_absolute_slot_internal(
                          true,
                          vclock_count(),
                          slots[i].target_gnss_ns);
+
+    diag_schedule_next_calls_from_other++;
+    schedule_next();
+    update_slot_high_water();
+    critical_exit(saved);
+    return h;
+  }
+
+  diag_arm_failures++;
+  critical_exit(saved);
+  return TIMEPOP_INVALID_HANDLE;
+}
+
+
+static timepop_handle_t arm_anchored_recurring_isr_internal(
+  int64_t             base_gnss_ns,
+  uint64_t            period_gnss_ns,
+  timepop_callback_t  callback,
+  void*               user_data,
+  const char*         name
+) {
+  if (!callback) return TIMEPOP_INVALID_HANDLE;
+  if (base_gnss_ns <= 0) return TIMEPOP_INVALID_HANDLE;
+  if (period_gnss_ns == 0) return TIMEPOP_INVALID_HANDLE;
+
+  const uint32_t saved = critical_enter();
+
+  const bool retired_named = retire_existing_named_slots(name);
+  if (retired_named) {
+    diag_schedule_next_calls_from_other++;
+    schedule_next();
+  }
+
+  for (uint32_t i = 0; i < MAX_SLOTS; i++) {
+    if (slots[i].active) continue;
+
+    timepop_handle_t h = next_handle++;
+    if (next_handle == TIMEPOP_INVALID_HANDLE) next_handle = 1;
+
+    slots[i] = {};
+    slots[i].active = true;
+    slots[i].expired = false;
+    slots[i].recurring = true;
+    slots[i].handle = h;
+    slots[i].callback = callback;
+    slots[i].user_data = user_data;
+    slots[i].name = name;
+    slots[i].fire_gnss_ns = -1;
+    slots[i].isr_callback = true;
+    slots[i].isr_callback_fired = false;
+    slots[i].rearm_in_isr = true;
+    slots[i].recurring_rearmed_count = 0;
+    slots[i].recurring_immediate_expire_count = 0;
+    slots[i].recurring_catchup_count = 0;
+
+    if (!configure_anchored_recurring_slot(slots[i],
+                                           base_gnss_ns,
+                                           period_gnss_ns,
+                                           timepop_arm_source_t::ANCHORED_RECURRING_ISR_ARM)) {
+      slots[i] = {};
+      diag_arm_failures++;
+      critical_exit(saved);
+      return TIMEPOP_INVALID_HANDLE;
+    }
+
+    diag_schedule_next_calls_from_other++;
+    schedule_next();
+    update_slot_high_water();
+    critical_exit(saved);
+    return h;
+  }
+
+  diag_arm_failures++;
+  critical_exit(saved);
+  return TIMEPOP_INVALID_HANDLE;
+}
+
+static timepop_handle_t arm_anchored_recurring_isr_from_counter32_internal(
+  int64_t             base_gnss_ns,
+  uint32_t            base_counter32,
+  uint64_t            period_gnss_ns,
+  timepop_callback_t  callback,
+  void*               user_data,
+  const char*         name
+) {
+  if (!callback) return TIMEPOP_INVALID_HANDLE;
+  if (base_gnss_ns <= 0) return TIMEPOP_INVALID_HANDLE;
+  if (period_gnss_ns == 0) return TIMEPOP_INVALID_HANDLE;
+
+  const uint32_t saved = critical_enter();
+
+  const bool retired_named = retire_existing_named_slots(name);
+  if (retired_named) {
+    diag_schedule_next_calls_from_other++;
+    schedule_next();
+  }
+
+  for (uint32_t i = 0; i < MAX_SLOTS; i++) {
+    if (slots[i].active) continue;
+
+    timepop_handle_t h = next_handle++;
+    if (next_handle == TIMEPOP_INVALID_HANDLE) next_handle = 1;
+
+    slots[i] = {};
+    slots[i].active = true;
+    slots[i].expired = false;
+    slots[i].recurring = true;
+    slots[i].handle = h;
+    slots[i].callback = callback;
+    slots[i].user_data = user_data;
+    slots[i].name = name;
+    slots[i].fire_gnss_ns = -1;
+    slots[i].isr_callback = true;
+    slots[i].isr_callback_fired = false;
+    slots[i].rearm_in_isr = true;
+    slots[i].recurring_rearmed_count = 0;
+    slots[i].recurring_immediate_expire_count = 0;
+    slots[i].recurring_catchup_count = 0;
+
+    if (!configure_anchored_recurring_slot_from_counter32(
+            slots[i],
+            base_gnss_ns,
+            base_counter32,
+            period_gnss_ns,
+            timepop_arm_source_t::ANCHORED_RECURRING_ISR_ARM)) {
+      slots[i] = {};
+      diag_arm_failures++;
+      critical_exit(saved);
+      return TIMEPOP_INVALID_HANDLE;
+    }
 
     diag_schedule_next_calls_from_other++;
     schedule_next();
@@ -1520,6 +1934,12 @@ static timepop_handle_t arm_relative_slot_internal(
     slots[i].isr_callback_fired = false;
     slots[i].rearm_in_isr = rearm_in_isr;
     slots[i].recurring_rearmed_count = 0;
+    slots[i].recurring_base_fixed = false;
+    slots[i].recurring_base_counter32_fixed = false;
+    slots[i].recurring_base_counter32 = 0;
+    slots[i].recurring_next_index = 0;
+    slots[i].recurring_last_skipped_intervals = 0;
+    slots[i].recurring_total_skipped_intervals = 0;
     slots[i].recurring_immediate_expire_count = 0;
     slots[i].recurring_catchup_count = 0;
     slots[i].recurring_base_gnss_ns = 0;
@@ -1607,6 +2027,37 @@ timepop_handle_t timepop_arm_recurring_isr(
                                     name,
                                     true,
                                     true);
+}
+
+
+timepop_handle_t timepop_arm_recurring_isr_from_base(
+  int64_t             base_gnss_ns,
+  uint64_t            period_gnss_ns,
+  timepop_callback_t  callback,
+  void*               user_data,
+  const char*         name
+) {
+  return arm_anchored_recurring_isr_internal(base_gnss_ns,
+                                             period_gnss_ns,
+                                             callback,
+                                             user_data,
+                                             name);
+}
+
+timepop_handle_t timepop_arm_recurring_isr_from_base_counter32(
+  int64_t             base_gnss_ns,
+  uint32_t            base_counter32,
+  uint64_t            period_gnss_ns,
+  timepop_callback_t  callback,
+  void*               user_data,
+  const char*         name
+) {
+  return arm_anchored_recurring_isr_from_counter32_internal(base_gnss_ns,
+                                                           base_counter32,
+                                                           period_gnss_ns,
+                                                           callback,
+                                                           user_data,
+                                                           name);
 }
 
 timepop_handle_t timepop_arm_asap(
@@ -1857,12 +2308,32 @@ void timepop_dispatch(void) {
           slots[i].target_gnss_ns > 0) {
         int64_t next_target_gnss_ns = slots[i].target_gnss_ns + (int64_t)slots[i].recurring_period_gnss_ns;
         const int64_t now_gnss_ns = time_gnss_ns_now();
-        if (now_gnss_ns >= 0 && next_target_gnss_ns <= now_gnss_ns) {
+        if (slots[i].recurring_base_fixed && slots[i].recurring_base_gnss_ns > 0) {
+          uint32_t skipped = 0;
+          if (!anchored_next_target_gnss_ns(slots[i].recurring_base_gnss_ns,
+                                            slots[i].recurring_period_gnss_ns,
+                                            now_gnss_ns,
+                                            next_target_gnss_ns,
+                                            &skipped)) {
+            slots[i].active = false;
+            slots[i].expired = false;
+            slots[i].isr_callback_fired = false;
+            continue;
+          }
+          if (next_target_gnss_ns > slots[i].target_gnss_ns + (int64_t)slots[i].recurring_period_gnss_ns) {
+            slots[i].recurring_immediate_expire_count++;
+            slots[i].recurring_catchup_count += skipped;
+          }
+          slots[i].recurring_last_skipped_intervals = skipped;
+          slots[i].recurring_total_skipped_intervals += skipped;
+        } else if (now_gnss_ns >= 0 && next_target_gnss_ns <= now_gnss_ns) {
           const uint64_t missed =
               (uint64_t)((now_gnss_ns - next_target_gnss_ns) / (int64_t)slots[i].recurring_period_gnss_ns) + 1ULL;
           next_target_gnss_ns += (int64_t)(missed * slots[i].recurring_period_gnss_ns);
           slots[i].recurring_immediate_expire_count++;
           slots[i].recurring_catchup_count += (uint32_t)missed;
+          slots[i].recurring_last_skipped_intervals = (uint32_t)missed;
+          slots[i].recurring_total_skipped_intervals += (uint32_t)missed;
         }
 
         const time_anchor_snapshot_t snap = time_anchor_snapshot();
@@ -2220,6 +2691,13 @@ static void add_timers_array(Payload& out) {
     entry.add("target_gnss_ns", slots[i].target_gnss_ns);
 
     entry.add("recurring", slots[i].recurring);
+    entry.add("recurring_base_fixed", slots[i].recurring_base_fixed);
+    entry.add("recurring_base_counter32_fixed", slots[i].recurring_base_counter32_fixed);
+    entry.add("recurring_base_counter32", slots[i].recurring_base_counter32);
+    entry.add("recurring_next_index", (uint32_t)(slots[i].recurring_next_index & 0xFFFFFFFFULL));
+    entry.add("recurring_base_gnss_ns", slots[i].recurring_base_gnss_ns);
+    entry.add("recurring_last_skipped_intervals", slots[i].recurring_last_skipped_intervals);
+    entry.add("recurring_total_skipped_intervals", slots[i].recurring_total_skipped_intervals);
     entry.add("is_absolute", slots[i].is_absolute);
     entry.add("isr_cb",    slots[i].isr_callback);
     entry.add("rearm_in_isr", slots[i].rearm_in_isr);

@@ -67,11 +67,18 @@
 //   fire fact, back-projects from that cadence event to the selected edge, and
 //   publishes the canonical PPS_VCLOCK epoch.
 //
-//   VCLOCK_CADENCE is armed with TimePop's critical recurring ISR mode.  Its
-//   callback refreshes the process_interrupt-owned synthetic VCLOCK low-word
-//   anchor inside the CH2 ISR pass, before TimePop calls schedule_next().  This
-//   prevents TimePop from scheduling future compares from a stale VCLOCK
-//   synthetic anchor while preserving the single-compare-rail architecture.
+//   VCLOCK_CADENCE is armed with TimePop's critical recurring ISR mode.  During
+//   PPS rebootstrap, process_interrupt re-arms that cadence from the selected
+//   PPS_VCLOCK GNSS base using TimePop's anchored recurring API, so the cadence
+//   grid is:
+//
+//       base_gnss_ns + k * 1 ms
+//
+//   rather than an inherited stale scheduler phase.  Its callback refreshes the
+//   process_interrupt-owned synthetic VCLOCK low-word anchor inside the CH2 ISR
+//   pass, before TimePop calls schedule_next().  This prevents TimePop from
+//   scheduling future compares from a stale synthetic VCLOCK anchor while
+//   preserving the single-compare-rail architecture.
 //
 // ─── PPS GPIO edge — three roles ────────────────────────────────────────────
 //
@@ -547,8 +554,10 @@ bool interrupt_stop(interrupt_subscriber_kind_t kind);
 // PPS-anchored epoch (at boot, ZERO, START).  The next PPS GPIO edge will:
 //   • Capture the VCLOCK counter at ISR entry.
 //   • Select the sacred VCLOCK edge associated with PPS.
-//   • Let the critical TimePop VCLOCK_CADENCE client back-project from its
-//     next CH2 shared fire fact to that selected edge.
+//   • Re-arm the critical TimePop VCLOCK_CADENCE client from the selected
+//     PPS_VCLOCK GNSS base.
+//   • Let that anchored cadence client back-project from its next CH2 shared
+//     fire fact to the selected edge.
 //   • Reset tick_mod_1000 so the first post-anchor one-second event lands on
 //     the PPS/VCLOCK boundary.
 //   • Seed the private synthetic VCLOCK counter32 from pvc.counter32_at_edge.

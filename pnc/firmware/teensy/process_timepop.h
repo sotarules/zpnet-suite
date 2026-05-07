@@ -85,6 +85,40 @@ void timepop_bootstrap(void);
 void timepop_init(void);
 void process_timepop_register(void);
 
+// Arm a critical recurring ISR slot on a fixed GNSS nanosecond grid:
+//
+//   target_k = base_gnss_ns + k * period_gnss_ns
+//
+// The first target is the first grid point strictly after current GNSS time.
+// Later rearms remain on the original base grid; missed intervals are skipped
+// rather than accumulated from the late service time.  Callback/rearm run in
+// the CH2 IRQ pass, matching timepop_arm_recurring_isr().
+timepop_handle_t timepop_arm_recurring_isr_from_base(
+  int64_t             base_gnss_ns,
+  uint64_t            period_gnss_ns,
+  timepop_callback_t  callback,
+  void*               user_data,
+  const char*         name
+);
+
+// Arm a critical recurring ISR slot from an explicit GNSS/VCLOCK base pair.
+//
+//   target_k_counter32 = base_counter32 + k * (period_gnss_ns / 100)
+//   target_k_gnss_ns   = base_gnss_ns   + k * period_gnss_ns
+//
+// This substrate-grade path does not require time_gnss_ns_now() or a valid
+// time_anchor_snapshot() at arm time.  It is intended for bootstrap clients
+// such as VCLOCK_CADENCE where the caller already owns the selected VCLOCK
+// counter identity of the base edge.
+timepop_handle_t timepop_arm_recurring_isr_from_base_counter32(
+  int64_t             base_gnss_ns,
+  uint32_t            base_counter32,
+  uint64_t            period_gnss_ns,
+  timepop_callback_t  callback,
+  void*               user_data,
+  const char*         name
+);
+
 // Notify TimePop that the VCLOCK synthetic coordinate system has been rebased.
 // Existing timed deadlines are old-epoch coordinates and must be re-authored
 // or cancelled before scheduling continues.

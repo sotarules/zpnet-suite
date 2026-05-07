@@ -42,11 +42,11 @@
 // QTimer1 CH0 low-word counter.  process_interrupt maps that low-word
 // hardware observation into the private synthetic 32-bit VCLOCK identity.
 // When a rebootstrap is pending, it
-// records the selected VCLOCK edge.  The recurring TimePop VCLOCK cadence client is armed as a critical recurring
-// ISR slot.  It consumes the next CH2 fire fact, back-projects to the selected
-// edge, refreshes the synthetic VCLOCK low-word anchor before TimePop schedules
-// the next compare, and thereafter emits the one-second VCLOCK events on the
-// TimePop rail.
+// records the selected VCLOCK edge.  The recurring TimePop VCLOCK cadence
+// client is normally a critical recurring ISR slot.  During PPS rebootstrap it
+// is re-armed from the freshly selected PPS_VCLOCK GNSS base so its 1 kHz grid
+// is phase-locked to that selected edge instead of inheriting stale scheduler
+// phase.
 // ============================================================================
 
 #include "process_interrupt.h"
@@ -981,6 +981,13 @@ struct vclock_lane_t {
 };
 static vclock_lane_t g_vclock_lane;
 
+static volatile uint32_t g_vclock_cadence_anchored_arm_count = 0;
+static volatile uint32_t g_vclock_cadence_anchored_arm_failure_count = 0;
+static volatile uint32_t g_vclock_cadence_anchored_fallback_count = 0;
+static volatile bool     g_vclock_cadence_last_arm_anchored = false;
+static volatile int64_t  g_vclock_cadence_last_base_gnss_ns = -1;
+static volatile uint32_t g_vclock_cadence_last_base_counter32 = 0;
+
 struct ocxo_lane_t {
   const char* name = nullptr;
   IMXRT_TMR_t* module = nullptr;
@@ -1501,6 +1508,8 @@ static void emit_one_second_event(interrupt_subscriber_runtime_t& rt,
 // ============================================================================
 
 static bool vclock_cadence_arm_timepop(void);
+static bool vclock_cadence_arm_timepop_from_base(int64_t base_gnss_ns,
+                                                   uint32_t base_counter32);
 static void vclock_cadence_timepop_callback(timepop_ctx_t* ctx,
                                             timepop_diag_t*,
                                             void*);
@@ -1524,6 +1533,50 @@ static bool vclock_cadence_arm_timepop(void) {
     return false;
   }
 
+  g_vclock_lane.phase_bootstrapped = true;
+  g_vclock_lane.bootstrap_count++;
+  return true;
+}
+
+static bool vclock_cadence_arm_timepop_from_base(int64_t base_gnss_ns,
+                                                   uint32_t base_counter32) {
+  if (!g_vclock_lane.active || !g_rt_vclock || !g_rt_vclock->active) return false;
+
+  g_vclock_cadence_last_base_gnss_ns = base_gnss_ns;
+  g_vclock_cadence_last_base_counter32 = base_counter32;
+  g_vclock_cadence_last_arm_anchored = false;
+
+  if (base_gnss_ns <= 0) {
+    g_vclock_cadence_anchored_fallback_count++;
+    return vclock_cadence_arm_timepop();
+  }
+
+  // Re-author VCLOCK_CADENCE onto the selected PPS_VCLOCK grid using the
+  // selected edge's VCLOCK counter identity directly.  This substrate-grade
+  // TimePop path does not ask Time what "now" is, and it does not require a
+  // valid time_anchor_snapshot() during cold rebootstrap:
+  //
+  //   counter32_k = base_counter32 + k * (VCLOCK_CADENCE_PERIOD_NS / 100)
+  //   gnss_ns_k   = base_gnss_ns   + k * VCLOCK_CADENCE_PERIOD_NS
+  //
+  // The first scheduled deadline is the first cadence point after the selected
+  // PPS_VCLOCK edge.  Later ISR rearms stay on the same fixed base grid.
+  const timepop_handle_t h =
+      timepop_arm_recurring_isr_from_base_counter32(
+          base_gnss_ns,
+          base_counter32,
+          VCLOCK_CADENCE_PERIOD_NS,
+          vclock_cadence_timepop_callback,
+          nullptr,
+          VCLOCK_CADENCE_NAME);
+  if (h == TIMEPOP_INVALID_HANDLE) {
+    g_vclock_cadence_anchored_arm_failure_count++;
+    g_vclock_cadence_anchored_fallback_count++;
+    return vclock_cadence_arm_timepop();
+  }
+
+  g_vclock_cadence_anchored_arm_count++;
+  g_vclock_cadence_last_arm_anchored = true;
   g_vclock_lane.phase_bootstrapped = true;
   g_vclock_lane.bootstrap_count++;
   return true;
@@ -2160,9 +2213,27 @@ void process_interrupt_gpio6789_irq(uint32_t isr_entry_dwt_raw) {
     g_pps_rebootstrap_pending = false;
     g_pps_rebootstrap_count++;
 
-    const int64_t selected_gnss_ns = zero_consumed
-        ? (int64_t)zero_ns_consumed
-        : vclock_next_epoch_gnss_ns(interrupt_project_dwt_to_vclock_gnss_ns(pps.dwt_at_edge));
+    int64_t selected_gnss_ns = -1;
+    if (zero_consumed) {
+      selected_gnss_ns = (int64_t)zero_ns_consumed;
+      g_vclock_epoch_gnss_ns = selected_gnss_ns;
+    } else {
+      const int64_t projected_gnss_ns =
+          interrupt_project_dwt_to_vclock_gnss_ns(pps.dwt_at_edge);
+      selected_gnss_ns = vclock_next_epoch_gnss_ns(projected_gnss_ns);
+
+      // Cold-start/rebootstrap may occur before the PPS_VCLOCK anchor ring has
+      // enough valid CPS history for the DWT→GNSS bridge to seed an absolute
+      // epoch.  VCLOCK_CADENCE still needs a positive GNSS-base phase so the
+      // anchored TimePop scheduler can place the 1 ms grid.  One exact second
+      // is phase-equivalent to every PPS_VCLOCK second for a 1 ms cadence, so
+      // use it as a deterministic cold-start base instead of poisoning the
+      // latch with -1 and forcing the old non-anchored fallback path.
+      if (selected_gnss_ns < 0) {
+        g_vclock_epoch_gnss_ns = GNSS_NS_PER_SECOND;
+        selected_gnss_ns = g_vclock_epoch_gnss_ns;
+      }
+    }
 
     g_vclock_epoch_latch.pending = true;
     g_vclock_epoch_latch.pps = pps;
@@ -2185,6 +2256,12 @@ void process_interrupt_gpio6789_irq(uint32_t isr_entry_dwt_raw) {
         (uint16_t)(selected_low16 + (uint16_t)VCLOCK_INTERVAL_COUNTS);
     g_vclock_lane.logical_count32_at_last_second = selected_counter32;
     vclock_clock_anchor_hardware_low16(selected_counter32, selected_low16);
+
+    // The old VCLOCK_CADENCE slot may be phase-locked to a stale TimePop grid.
+    // Re-arm it from the just-selected PPS_VCLOCK GNSS base so the cadence
+    // grid belongs to this epoch, not to whatever CH2 phase happened to be
+    // alive before rebootstrap.
+    (void)vclock_cadence_arm_timepop_from_base(selected_gnss_ns, selected_counter32);
   }
 }
 
@@ -2470,6 +2547,12 @@ void process_interrupt_init(void) {
   g_vclock_epoch_latch = vclock_epoch_latch_t{};
   g_vclock_repair_stats = vclock_repair_stats_t{};
   g_vclock_epoch_gnss_ns = -1;
+  g_vclock_cadence_anchored_arm_count = 0;
+  g_vclock_cadence_anchored_arm_failure_count = 0;
+  g_vclock_cadence_anchored_fallback_count = 0;
+  g_vclock_cadence_last_arm_anchored = false;
+  g_vclock_cadence_last_base_gnss_ns = -1;
+  g_vclock_cadence_last_base_counter32 = 0;
   g_pps_rebootstrap_pending = false;
   g_pps_rebootstrap_count = 0;
 
@@ -2685,6 +2768,12 @@ static Payload cmd_report(const Payload&) {
   p.add("vclock_miss_count",        g_vclock_lane.miss_count);
   p.add("vclock_bootstrap_count",   g_vclock_lane.bootstrap_count);
   p.add("vclock_cadence_hits_total", g_vclock_lane.cadence_hits_total);
+  p.add("vclock_cadence_anchored_arm_count", g_vclock_cadence_anchored_arm_count);
+  p.add("vclock_cadence_anchored_arm_failure_count", g_vclock_cadence_anchored_arm_failure_count);
+  p.add("vclock_cadence_anchored_fallback_count", g_vclock_cadence_anchored_fallback_count);
+  p.add("vclock_cadence_last_arm_anchored", g_vclock_cadence_last_arm_anchored);
+  p.add("vclock_cadence_last_base_gnss_ns", g_vclock_cadence_last_base_gnss_ns);
+  p.add("vclock_cadence_last_base_counter32", g_vclock_cadence_last_base_counter32);
   p.add("vclock_compare_target",    (uint32_t)g_vclock_lane.compare_target);
   p.add("vclock_tick_mod_1000",     g_vclock_lane.tick_mod_1000);
   p.add("vclock_logical_count32",   g_vclock_lane.logical_count32_at_last_second);
