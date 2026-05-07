@@ -8,11 +8,11 @@
 // CLOCKS — Authoritative Temporal Subsystem (Teensy) — v12
 // ============================================================================
 //
-// CLOCKS owns the canonical time ledgers on the Teensy.
+// CLOCKS owns the Teensy timing ledgers and bridge-measured residual surfaces.
 //
 // Responsibilities:
 //   • Consumption of process_interrupt-authored clock captures
-//   • Synthetic nanosecond clocks
+//   • Nominal clock ledgers and bridge-derived measured residuals
 //   • Local CLOCKS-owned ZERO/START logical zero-offset installation
 //   • PPS/VCLOCK-selected truth capture
 //   • 1 Hz publication of canonical clock tuple
@@ -82,11 +82,11 @@ uint64_t clocks_dwt_cycles_at_dwt(uint32_t dwt32);
 uint64_t clocks_gnss_ticks_now(void);
 uint64_t clocks_gnss_ns_now(void);
 
-uint64_t clocks_ocxo1_ticks_now(void);
-uint64_t clocks_ocxo1_ns_now(void);
+uint64_t clocks_ocxo1_measured_gnss_ticks_now(void);
+uint64_t clocks_ocxo1_measured_gnss_ns_now(void);
 
-uint64_t clocks_ocxo2_ticks_now(void);
-uint64_t clocks_ocxo2_ns_now(void);
+uint64_t clocks_ocxo2_measured_gnss_ticks_now(void);
+uint64_t clocks_ocxo2_measured_gnss_ns_now(void);
 
 
 // -----------------------------------------------------------------------------

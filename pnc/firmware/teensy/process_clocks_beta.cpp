@@ -146,19 +146,15 @@ static uint64_t current_raw_gnss_ns(void) {
 }
 
 static uint64_t current_raw_ocxo1_ns(void) {
-  // OCXO nanosecond ledgers are owned by CLOCKS/alpha.  Do not route these
-  // public campaign totals through legacy process_time projection state; that
-  // path can return DWT-projected / 32-bit-looking artifacts instead of the
-  // 64-bit OCXO ledger.
-  return clocks_ocxo1_ns_now();
+  // OCXO measured GNSS-elapsed ledgers are owned by CLOCKS/alpha. These are
+  // not counter-ticks × 100 ns and not ideal +1e9-per-edge nominal ledgers.
+  return clocks_ocxo1_measured_gnss_ns_now();
 }
 
 static uint64_t current_raw_ocxo2_ns(void) {
-  // OCXO nanosecond ledgers are owned by CLOCKS/alpha.  Do not route these
-  // public campaign totals through legacy process_time projection state; that
-  // path can return DWT-projected / 32-bit-looking artifacts instead of the
-  // 64-bit OCXO ledger.
-  return clocks_ocxo2_ns_now();
+  // OCXO measured GNSS-elapsed ledgers are owned by CLOCKS/alpha. These are
+  // not counter-ticks × 100 ns and not ideal +1e9-per-edge nominal ledgers.
+  return clocks_ocxo2_measured_gnss_ns_now();
 }
 
 static void campaign_public_bases_reset_to_current(void) {
@@ -729,8 +725,8 @@ void clocks_zero_all(void) {
 
   dwt_cycle_count_total = 0;
   gnss_raw_64           = 0;
-  ocxo1_ticks_64        = 0;
-  ocxo2_ticks_64        = 0;
+  ocxo1_measured_gnss_ticks_64        = 0;
+  ocxo2_measured_gnss_ticks_64        = 0;
 
   campaign_public_bases_reset_to_current();
 
@@ -956,8 +952,8 @@ void clocks_beta_pps(void) {
 
     dwt_cycle_count_total = dwt_ns_to_cycles(recover_dwt_ns);
     gnss_raw_64           = recover_gnss_ns / 100ull;
-    ocxo1_ticks_64        = recover_ocxo1_ns / 100ull;
-    ocxo2_ticks_64        = recover_ocxo2_ns / 100ull;
+    ocxo1_measured_gnss_ticks_64        = recover_ocxo1_ns / 100ull;
+    ocxo2_measured_gnss_ticks_64        = recover_ocxo2_ns / 100ull;
 
     campaign_seconds = recover_gnss_ns / 1000000000ull;
 
@@ -985,8 +981,8 @@ void clocks_beta_pps(void) {
 
   dwt_cycle_count_total = campaign_public_dwt_total();
   gnss_raw_64           = campaign_public_gnss_ns() / 100ull;
-  ocxo1_ticks_64        = campaign_public_ocxo1_ns() / 100ull;
-  ocxo2_ticks_64        = campaign_public_ocxo2_ns() / 100ull;
+  ocxo1_measured_gnss_ticks_64        = campaign_public_ocxo1_ns() / 100ull;
+  ocxo2_measured_gnss_ticks_64        = campaign_public_ocxo2_ns() / 100ull;
 
   // ── Welford updates ──
   //
@@ -999,7 +995,6 @@ void clocks_beta_pps(void) {
     welford_update(welford_dwt, dwt_ppb_sample);
   }
 
-  clocks_alpha_lane_forensics_t vclock_forensics{};
   clocks_alpha_lane_forensics_t ocxo1_forensics{};
   clocks_alpha_lane_forensics_t ocxo2_forensics{};
 
@@ -1014,17 +1009,17 @@ void clocks_beta_pps(void) {
     welford_update(welford_vclock, (double)g_vclock_measurement.second_residual_ns);
   }
 
-  // OCXO measurement Welfords use the real bridge/GNSS interval, not the
-  // counter-derived synthetic interval. Positive residual means the OCXO
-  // one-second edge arrived early / the OCXO is running fast versus VCLOCK.
-  if (ocxo1_forensics_valid && ocxo1_forensics.bridge_interval_valid) {
-    const int64_t residual_fast_ns = -ocxo1_forensics.bridge_residual_ns;
+  // OCXO measurement Welfords use the Alpha-authored measured GNSS interval,
+  // not the counter-derived nominal interval. Positive residual means the
+  // OCXO one-second edge arrived early / the OCXO is running fast versus VCLOCK.
+  if (g_ocxo1_measurement.gnss_ns_between_edges != 0) {
+    const int64_t residual_fast_ns = g_ocxo1_measurement.second_residual_ns;
     welford_update(welford_ocxo1, (double)residual_fast_ns);
     now_window_push(g_now_window_ocxo1, residual_fast_ns);
   }
 
-  if (ocxo2_forensics_valid && ocxo2_forensics.bridge_interval_valid) {
-    const int64_t residual_fast_ns = -ocxo2_forensics.bridge_residual_ns;
+  if (g_ocxo2_measurement.gnss_ns_between_edges != 0) {
+    const int64_t residual_fast_ns = g_ocxo2_measurement.second_residual_ns;
     welford_update(welford_ocxo2, (double)residual_fast_ns);
     now_window_push(g_now_window_ocxo2, residual_fast_ns);
   }
@@ -1058,16 +1053,17 @@ void clocks_beta_pps(void) {
   p.add("teensy_pps_count",        public_count);  // legacy alias
   p.add("pps_count",               public_count);  // legacy alias
 
-  // Synthetic nanosecond ledgers.  PPS is an imaginary +1e9 ledger, VCLOCK is
-  // the selected-edge authority, and in the current architecture their public
-  // ns count is intentionally identical.  OCXO ledgers are the phase-adjusted
-  // synthetic ns counts at the same PPS/VCLOCK boundary.
+  // Canonical nanosecond ledgers. PPS/VCLOCK/GNSS share the selected-edge
+  // reference identity. OCXO public ledgers are measured GNSS-elapsed OCXO
+  // ledgers sampled at the same PPS/VCLOCK boundary.
   p.add("gnss_ns",        public_gnss_ns);
   p.add("pps_ns",         public_gnss_ns);
   p.add("pps_vclock_ns",  public_gnss_ns);
   p.add("vclock_ns",      public_gnss_ns);
-  p.add("ocxo1_ns",       public_ocxo1_ns);
-  p.add("ocxo2_ns",       public_ocxo2_ns);
+  p.add("ocxo1_measured_gnss_ns", public_ocxo1_ns);
+  p.add("ocxo2_measured_gnss_ns", public_ocxo2_ns);
+  p.add("ocxo1_ns",       public_ocxo1_ns);  // legacy alias
+  p.add("ocxo2_ns",       public_ocxo2_ns);  // legacy alias
 
   p.add("calibrate_ocxo", servo_mode_str(calibrate_ocxo_mode));
 
@@ -1135,10 +1131,11 @@ void clocks_beta_pps(void) {
   p.add("vclock_window_error_ns", g_vclock_clock.window_error_ns);
 
   // OCXO1 surface.
-  p.add("ocxo1_ns_at_pps_vclock", public_ocxo1_ns);
+  p.add("ocxo1_measured_gnss_ns_at_pps_vclock", public_ocxo1_ns);
+  p.add("ocxo1_ns_at_pps_vclock", public_ocxo1_ns);  // legacy alias
   p.add("ocxo1_gnss_ns_between_edges", g_ocxo1_measurement.gnss_ns_between_edges);
-  p.add("ocxo1_counter_ns_between_edges",
-        ocxo1_forensics_valid ? ocxo1_forensics.counter_ns_between_edges : 0ULL);
+  p.add("ocxo1_counter_nominal_ns_between_edges",
+        ocxo1_forensics_valid ? ocxo1_forensics.counter_nominal_ns_between_edges : 0ULL);
   p.add("ocxo1_bridge_gnss_ns_between_edges",
         ocxo1_forensics_valid ? ocxo1_forensics.bridge_gnss_ns_between_edges : 0ULL);
   p.add("ocxo1_bridge_residual_ns",
@@ -1154,10 +1151,11 @@ void clocks_beta_pps(void) {
   p.add("ocxo1_window_error_ns", g_ocxo1_clock.window_error_ns);
 
   // OCXO2 surface.
-  p.add("ocxo2_ns_at_pps_vclock", public_ocxo2_ns);
+  p.add("ocxo2_measured_gnss_ns_at_pps_vclock", public_ocxo2_ns);
+  p.add("ocxo2_ns_at_pps_vclock", public_ocxo2_ns);  // legacy alias
   p.add("ocxo2_gnss_ns_between_edges", g_ocxo2_measurement.gnss_ns_between_edges);
-  p.add("ocxo2_counter_ns_between_edges",
-        ocxo2_forensics_valid ? ocxo2_forensics.counter_ns_between_edges : 0ULL);
+  p.add("ocxo2_counter_nominal_ns_between_edges",
+        ocxo2_forensics_valid ? ocxo2_forensics.counter_nominal_ns_between_edges : 0ULL);
   p.add("ocxo2_bridge_gnss_ns_between_edges",
         ocxo2_forensics_valid ? ocxo2_forensics.bridge_gnss_ns_between_edges : 0ULL);
   p.add("ocxo2_bridge_residual_ns",
@@ -1431,24 +1429,24 @@ static void add_alpha_event_payload(Payload& p,
   p.add("counter32_delta_since_zero_offset", f.counter32_delta_since_zero_offset);
   p.add("counter32_delta_since_previous_event", f.counter32_delta_since_previous_event);
   p.add("logical_ticks64_since_zero", f.logical_ticks64_since_zero);
-  p.add("logical_ns64_since_zero", f.logical_ns64_since_zero);
+  p.add("nominal_ns64_since_zero", f.nominal_ns64_since_zero);
 
   // Legacy aliases retained for consumers that still use the old epoch labels.
   p.add("epoch_counter32", f.epoch_counter32);
   p.add("counter32_delta_since_epoch", f.counter32_delta_since_epoch);
-  p.add("ns_from_counter32_epoch", f.ns_from_counter32_epoch);
+  p.add("nominal_ns_from_counter32_epoch", f.nominal_ns_from_counter32_epoch);
   p.add("event_gnss_ns", f.event_gnss_ns);
   p.add("previous_event_gnss_ns", f.previous_event_gnss_ns);
   p.add("phase_offset_ns", f.phase_offset_ns);
-  p.add("counter_ns_between_edges", f.counter_ns_between_edges);
+  p.add("counter_nominal_ns_between_edges", f.counter_nominal_ns_between_edges);
   p.add("bridge_interval_valid", f.bridge_interval_valid);
   p.add("bridge_gnss_ns_between_edges", f.bridge_gnss_ns_between_edges);
   p.add("bridge_residual_ns", f.bridge_residual_ns);
 
   if (vclock_ref && vclock_ref->valid && f.valid) {
     p.add("event_delta_vs_vclock_ns",
-          signed_delta_u64(f.ns_from_counter32_epoch,
-                           vclock_ref->ns_from_counter32_epoch));
+          signed_delta_u64(f.nominal_ns_from_counter32_epoch,
+                           vclock_ref->nominal_ns_from_counter32_epoch));
     p.add("event_dwt_delta_vs_vclock_cycles",
           (int32_t)(f.last_event_dwt - vclock_ref->last_event_dwt));
     p.add("phase_offset_delta_vs_vclock_ns",
@@ -1504,8 +1502,8 @@ static void add_projection_payload(Payload& p,
   if (f.valid) {
     const uint32_t elapsed_cycles = report_dwt - f.last_event_dwt;
     uint64_t projected_delta_ns = 0;
-    if (report_valid && report_ns >= f.ns_from_counter32_epoch) {
-      projected_delta_ns = report_ns - f.ns_from_counter32_epoch;
+    if (report_valid && report_ns >= f.nominal_ns_from_counter32_epoch) {
+      projected_delta_ns = report_ns - f.nominal_ns_from_counter32_epoch;
     }
 
     p.add("elapsed_cycles_from_last_event_to_report", elapsed_cycles);
@@ -1606,8 +1604,10 @@ static Payload cmd_report(const Payload&) {
   summary.add("dwt64_ns", dwt_cycles_to_ns(dwt64_cycles_at_report));
   summary.add("gnss_ns", vclock_ok ? vclock_ns : 0);
   summary.add("vclock_ns", vclock_ok ? vclock_ns : 0);
-  summary.add("ocxo1_ns", ocxo1_ok ? ocxo1_ns : 0);
-  summary.add("ocxo2_ns", ocxo2_ok ? ocxo2_ns : 0);
+  summary.add("ocxo1_measured_gnss_ns", ocxo1_ok ? ocxo1_ns : 0);
+  summary.add("ocxo2_measured_gnss_ns", ocxo2_ok ? ocxo2_ns : 0);
+  summary.add("ocxo1_ns", ocxo1_ok ? ocxo1_ns : 0);  // legacy alias
+  summary.add("ocxo2_ns", ocxo2_ok ? ocxo2_ns : 0);  // legacy alias
   summary.add("vclock_valid", vclock_ok);
   summary.add("ocxo1_valid", ocxo1_ok);
   summary.add("ocxo2_valid", ocxo2_ok);

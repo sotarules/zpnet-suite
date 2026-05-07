@@ -49,8 +49,8 @@ static_assert(NS_PER_SECOND_U64 ==
 // ============================================================================
 
 volatile uint64_t g_gnss_ns_at_pps_vclock = 0;
-volatile uint64_t g_ocxo1_ns_at_pps_vclock = 0;
-volatile uint64_t g_ocxo2_ns_at_pps_vclock = 0;
+volatile uint64_t g_ocxo1_measured_gnss_ns_at_pps_vclock = 0;
+volatile uint64_t g_ocxo2_measured_gnss_ns_at_pps_vclock = 0;
 
 volatile uint32_t g_dwt_at_pps_vclock = 0;
 volatile uint64_t g_dwt_cycle_count_total = 0;
@@ -321,20 +321,36 @@ uint64_t clocks_gnss_ticks_now(void) {
   return clocks_gnss_ns_now() / (uint64_t)NS_PER_10MHZ_TICK;
 }
 
-uint64_t clocks_ocxo1_ns_now(void) {
-  return g_ocxo1_ns_at_pps_vclock;
+uint64_t clocks_ocxo1_measured_gnss_ns_now(void) {
+  return g_ocxo1_measured_gnss_ns_at_pps_vclock;
 }
 
-uint64_t clocks_ocxo1_ticks_now(void) {
-  return clocks_ocxo1_ns_now() / (uint64_t)NS_PER_10MHZ_TICK;
+uint64_t clocks_ocxo1_measured_gnss_ticks_now(void) {
+  return clocks_ocxo1_measured_gnss_ns_now() / (uint64_t)NS_PER_10MHZ_TICK;
 }
 
-uint64_t clocks_ocxo2_ns_now(void) {
-  return g_ocxo2_ns_at_pps_vclock;
+uint64_t clocks_ocxo2_measured_gnss_ns_now(void) {
+  return g_ocxo2_measured_gnss_ns_at_pps_vclock;
 }
 
-uint64_t clocks_ocxo2_ticks_now(void) {
-  return clocks_ocxo2_ns_now() / (uint64_t)NS_PER_10MHZ_TICK;
+uint64_t clocks_ocxo2_measured_gnss_ticks_now(void) {
+  return clocks_ocxo2_measured_gnss_ns_now() / (uint64_t)NS_PER_10MHZ_TICK;
+}
+
+uint64_t clocks_ocxo1_nominal_ns_now(void) {
+  return clocks_ocxo1_measured_gnss_ns_now();
+}
+
+uint64_t clocks_ocxo1_nominal_ticks_now(void) {
+  return clocks_ocxo1_measured_gnss_ticks_now();
+}
+
+uint64_t clocks_ocxo2_nominal_ns_now(void) {
+  return clocks_ocxo2_measured_gnss_ns_now();
+}
+
+uint64_t clocks_ocxo2_nominal_ticks_now(void) {
+  return clocks_ocxo2_measured_gnss_ticks_now();
 }
 
 // ============================================================================
@@ -343,8 +359,8 @@ uint64_t clocks_ocxo2_ticks_now(void) {
 
 uint64_t dwt_cycle_count_total = 0;
 uint64_t gnss_raw_64           = 0;
-uint64_t ocxo1_ticks_64        = 0;
-uint64_t ocxo2_ticks_64        = 0;
+uint64_t ocxo1_measured_gnss_ticks_64        = 0;
+uint64_t ocxo2_measured_gnss_ticks_64        = 0;
 
 // ============================================================================
 // PPS relay
@@ -392,7 +408,7 @@ static inline bool epoch_ready(void) {
   return g_epoch_initialized;
 }
 
-static inline uint64_t ns_from_counter32_epoch(uint32_t counter32,
+static inline uint64_t nominal_ns_from_counter32_epoch(uint32_t counter32,
                                                uint32_t epoch_counter32) {
   // Legacy bounded-window helper.  Long-lived lane ledgers must use the
   // alpha_ticks64_* path so 10 MHz time does not wrap at 2^32 ticks.
@@ -422,18 +438,18 @@ struct alpha_lane_forensics_store_t {
   uint32_t counter32_delta_since_zero_offset = 0;
   uint32_t counter32_delta_since_previous_event = 0;
   uint64_t logical_ticks64_since_zero = 0;
-  uint64_t logical_ns64_since_zero = 0;
+  uint64_t nominal_ns64_since_zero = 0;
 
   // Legacy names retained for report/back-compat surfaces.
   uint32_t epoch_counter32 = 0;
   uint32_t counter32_delta_since_epoch = 0;
-  uint64_t ns_from_counter32_epoch = 0;
+  uint64_t nominal_ns_from_counter32_epoch = 0;
 
   uint64_t event_gnss_ns = 0;
   uint64_t previous_event_gnss_ns = 0;
   int64_t  phase_offset_ns = 0;
 
-  uint64_t counter_ns_between_edges = 0;
+  uint64_t counter_nominal_ns_between_edges = 0;
   uint64_t bridge_gnss_ns_between_edges = 0;
   int64_t  bridge_residual_ns = 0;
   bool     bridge_interval_valid = false;
@@ -476,12 +492,12 @@ static alpha_lane_logical_ticks_t g_vclock_ticks64 = {};
 static alpha_lane_logical_ticks_t g_ocxo1_ticks64 = {};
 static alpha_lane_logical_ticks_t g_ocxo2_ticks64 = {};
 
-// OCXO public nanosecond ledgers are measured clocks, not merely
-// counter-ticks × 100 ns.  The raw tick ledger remains the identity surface.
-// The measured ledger advances by the Gamma-filtered DWT span of each
-// OCXO-local 10,000,000-tick second, converted through the current
-// PPS/VCLOCK DWT→GNSS calibration.
+// OCXO public nanosecond ledgers are measured GNSS-elapsed clocks, not merely
+// counter-ticks × 100 ns and not ideal +1e9-per-edge nominal ledgers. The raw
+// tick ledger remains the identity surface. The measured ledger advances by
+// the projected GNSS duration between consecutive OCXO one-second edges.
 struct alpha_measured_ns_clock_t {
+  bool     initialized = false;
   uint64_t ns_at_edge = 0;
   uint32_t dwt_at_edge = 0;
 };
@@ -599,39 +615,15 @@ static uint64_t alpha_dwt_cycles_to_gnss_ns(uint32_t dwt_cycles) {
          (uint64_t)dwt_per_second;
 }
 
-static uint32_t alpha_gamma_best_completed_dwt_cycles(time_clock_id_t clock,
-                                                     uint32_t raw_dwt_cycles) {
-  clocks_gamma_prediction_snapshot_t g{};
-  (void)clocks_gamma_snapshot(clock, &g);
-
-  if (g.completed_best_dwt_cycles != 0) {
-    return g.completed_best_dwt_cycles;
-  }
-  if (g.completed_dynamic_prediction_cycles != 0) {
-    return g.completed_dynamic_prediction_cycles;
-  }
-  return raw_dwt_cycles;
-}
-
-static uint64_t alpha_ocxo_count_delta_from_measured_interval(uint64_t real_interval_ns) {
-  // Positive-fast convention for the public OCXO ns ledger:
-  // if an OCXO second completes 1 ns early in GNSS time, its own clock
-  // advanced by 1e9+1 ns.  The measured real interval is still retained
-  // in clock_measurement_t::gnss_ns_between_edges.
-  const int64_t residual_fast_ns =
-      (int64_t)NS_PER_SECOND_U64 - (int64_t)real_interval_ns;
-
-  if (residual_fast_ns >= 0) {
-    return NS_PER_SECOND_U64 + (uint64_t)residual_fast_ns;
-  }
-
-  const uint64_t slow_ns = (uint64_t)(-residual_fast_ns);
-  return (slow_ns >= NS_PER_SECOND_U64) ? 0ULL : (NS_PER_SECOND_U64 - slow_ns);
+static uint64_t alpha_ocxo_seed_ns_at_first_edge(uint32_t raw_edge_dwt) {
+  const uint32_t epoch_dwt = clocks_alpha_epoch_last_dwt_at_edge();
+  if (epoch_dwt == 0) return 0;
+  return alpha_dwt_cycles_to_gnss_ns(raw_edge_dwt - epoch_dwt);
 }
 
 static uint64_t alpha_ocxo_apply_measured_second(time_clock_id_t clock,
                                                  uint32_t raw_edge_dwt,
-                                                 uint32_t* out_best_dwt_cycles,
+                                                 uint32_t* out_dwt_cycles,
                                                  uint64_t* out_real_interval_ns,
                                                  int64_t* out_residual_fast_ns) {
   alpha_measured_ns_clock_t* m = alpha_measured_ns_store(clock);
@@ -641,19 +633,28 @@ static uint64_t alpha_ocxo_apply_measured_second(time_clock_id_t clock,
     return 0;
   }
 
-  const uint32_t raw_cycles = raw_edge_dwt - m->dwt_at_edge;
-  const uint32_t best_cycles =
-      alpha_gamma_best_completed_dwt_cycles(clock, raw_cycles);
-  const uint64_t real_interval_ns = alpha_dwt_cycles_to_gnss_ns(best_cycles);
+  if (!m->initialized) {
+    m->initialized = true;
+    m->dwt_at_edge = raw_edge_dwt;
+    m->ns_at_edge = alpha_ocxo_seed_ns_at_first_edge(raw_edge_dwt);
+    if (out_dwt_cycles) *out_dwt_cycles = 0;
+    if (out_real_interval_ns) *out_real_interval_ns = 0;
+    if (out_residual_fast_ns) *out_residual_fast_ns = 0;
+    return m->ns_at_edge;
+  }
+
+  const uint32_t dwt_cycles = raw_edge_dwt - m->dwt_at_edge;
+  const uint64_t real_interval_ns = alpha_dwt_cycles_to_gnss_ns(dwt_cycles);
   const int64_t residual_fast_ns =
       (int64_t)NS_PER_SECOND_U64 - (int64_t)real_interval_ns;
-  const uint64_t count_delta_ns =
-      alpha_ocxo_count_delta_from_measured_interval(real_interval_ns);
 
-  m->ns_at_edge += count_delta_ns;
-  m->dwt_at_edge += best_cycles;
+  // The measured OCXO ledger is the accumulated GNSS duration between OCXO
+  // one-second edges.  This is intentionally not counter ticks × 100 ns and
+  // not an ideal +1e9-per-edge nominal ledger.
+  m->ns_at_edge += real_interval_ns;
+  m->dwt_at_edge = raw_edge_dwt;
 
-  if (out_best_dwt_cycles) *out_best_dwt_cycles = best_cycles;
+  if (out_dwt_cycles) *out_dwt_cycles = dwt_cycles;
   if (out_real_interval_ns) *out_real_interval_ns = real_interval_ns;
   if (out_residual_fast_ns) *out_residual_fast_ns = residual_fast_ns;
   return m->ns_at_edge;
@@ -685,14 +686,14 @@ static void alpha_forensics_reset_store(alpha_lane_forensics_store_t& s) {
   s.counter32_delta_since_zero_offset = 0;
   s.counter32_delta_since_previous_event = 0;
   s.logical_ticks64_since_zero = 0;
-  s.logical_ns64_since_zero = 0;
+  s.nominal_ns64_since_zero = 0;
   s.epoch_counter32 = 0;
   s.counter32_delta_since_epoch = 0;
-  s.ns_from_counter32_epoch = 0;
+  s.nominal_ns_from_counter32_epoch = 0;
   s.event_gnss_ns = 0;
   s.previous_event_gnss_ns = 0;
   s.phase_offset_ns = 0;
-  s.counter_ns_between_edges = 0;
+  s.counter_nominal_ns_between_edges = 0;
   s.bridge_gnss_ns_between_edges = 0;
   s.bridge_residual_ns = 0;
   s.bridge_interval_valid = false;
@@ -737,21 +738,27 @@ static void alpha_forensics_publish(time_clock_id_t clock_id,
   if (!s) return;
 
   const bool had_prior_counter_event = s->valid;
-  const uint64_t previous_counter_ns = s->ns_from_counter32_epoch;
-  const uint64_t counter_ns_between_edges =
+  const uint64_t previous_counter_ns = s->nominal_ns_from_counter32_epoch;
+  const uint64_t counter_nominal_ns_between_edges =
       (had_prior_counter_event && counter_ns_now >= previous_counter_ns)
           ? (counter_ns_now - previous_counter_ns)
           : 0ULL;
 
-  const bool had_prior_bridge_event = s->valid && s->event_gnss_ns != 0 && event.gnss_ns_at_event != 0;
   const uint64_t previous_event_gnss_ns = s->event_gnss_ns;
-  const uint64_t bridge_gnss_ns_between_edges =
-      (had_prior_bridge_event && event.gnss_ns_at_event >= previous_event_gnss_ns)
-          ? (event.gnss_ns_at_event - previous_event_gnss_ns)
-          : 0ULL;
+  const uint64_t event_gnss_ns = (event.gnss_ns_at_event != 0)
+      ? event.gnss_ns_at_event
+      : ns_now;
+
+  // For OCXO lanes process_interrupt may not carry a direct GNSS timestamp in
+  // the event. The authoritative measured interval is therefore the
+  // Alpha-authored measurement surface, not event.gnss_ns_at_event.
+  const bool bridge_interval_valid = (meas.gnss_ns_between_edges != 0);
+  const uint64_t bridge_gnss_ns_between_edges = bridge_interval_valid
+      ? meas.gnss_ns_between_edges
+      : 0ULL;
   // Signed as interval-minus-ideal: negative means the lane fired early / fast.
-  const int64_t bridge_residual_ns = had_prior_bridge_event
-      ? ((int64_t)bridge_gnss_ns_between_edges - (int64_t)NS_PER_SECOND_U64)
+  const int64_t bridge_residual_ns = bridge_interval_valid
+      ? -meas.second_residual_ns
       : 0;
 
   s->seq++;
@@ -766,17 +773,17 @@ static void alpha_forensics_publish(time_clock_id_t clock_id,
   s->counter32_delta_since_zero_offset = counter32_delta_since_zero_offset;
   s->counter32_delta_since_previous_event = counter32_delta_since_previous_event;
   s->logical_ticks64_since_zero = logical_ticks64_since_zero;
-  s->logical_ns64_since_zero = ns_now;
+  s->nominal_ns64_since_zero = ns_now;
   s->epoch_counter32 = zero_offset_counter32;
   s->counter32_delta_since_epoch = counter32_delta_since_zero_offset;
-  s->ns_from_counter32_epoch = counter_ns_now;
-  s->event_gnss_ns = event.gnss_ns_at_event;
+  s->nominal_ns_from_counter32_epoch = counter_ns_now;
+  s->event_gnss_ns = event_gnss_ns;
   s->previous_event_gnss_ns = previous_event_gnss_ns;
   s->phase_offset_ns = clock.phase_offset_ns;
-  s->counter_ns_between_edges = counter_ns_between_edges;
+  s->counter_nominal_ns_between_edges = counter_nominal_ns_between_edges;
   s->bridge_gnss_ns_between_edges = bridge_gnss_ns_between_edges;
   s->bridge_residual_ns = bridge_residual_ns;
-  s->bridge_interval_valid = had_prior_bridge_event && event.gnss_ns_at_event >= previous_event_gnss_ns;
+  s->bridge_interval_valid = bridge_interval_valid;
   s->ns_between_edges = meas.gnss_ns_between_edges;
   s->dwt_cycles_between_edges = meas.dwt_cycles_between_edges;
   s->second_residual_ns = meas.second_residual_ns;
@@ -827,14 +834,14 @@ bool clocks_alpha_lane_forensics(time_clock_id_t clock,
     out->counter32_delta_since_zero_offset = s->counter32_delta_since_zero_offset;
     out->counter32_delta_since_previous_event = s->counter32_delta_since_previous_event;
     out->logical_ticks64_since_zero = s->logical_ticks64_since_zero;
-    out->logical_ns64_since_zero = s->logical_ns64_since_zero;
+    out->nominal_ns64_since_zero = s->nominal_ns64_since_zero;
     out->epoch_counter32 = s->epoch_counter32;
     out->counter32_delta_since_epoch = s->counter32_delta_since_epoch;
-    out->ns_from_counter32_epoch = s->ns_from_counter32_epoch;
+    out->nominal_ns_from_counter32_epoch = s->nominal_ns_from_counter32_epoch;
     out->event_gnss_ns = s->event_gnss_ns;
     out->previous_event_gnss_ns = s->previous_event_gnss_ns;
     out->phase_offset_ns = s->phase_offset_ns;
-    out->counter_ns_between_edges = s->counter_ns_between_edges;
+    out->counter_nominal_ns_between_edges = s->counter_nominal_ns_between_edges;
     out->bridge_gnss_ns_between_edges = s->bridge_gnss_ns_between_edges;
     out->bridge_residual_ns = s->bridge_residual_ns;
     out->bridge_interval_valid = s->bridge_interval_valid;
@@ -862,9 +869,9 @@ bool clocks_alpha_lane_forensics(time_clock_id_t clock,
 }
 
 static void clock_mark_epoch_zero(clock_state_t& clock) {
-  clock.ns_count_at_edge = 0;
+  clock.ledger_ns_count_at_edge = 0;
   clock.gnss_ns_at_edge = 0;
-  clock.ns_count_at_pps_vclock = 0;
+  clock.ledger_ns_count_at_pps_vclock = 0;
   clock.phase_offset_ns = 0;
   clock.zero_established = true;  // legacy/report mirror; epoch install is a hard invariant
   clock.window_checks = 0;
@@ -874,8 +881,8 @@ static void clock_mark_epoch_zero(clock_state_t& clock) {
 
 static void alpha_reset_canonical_clock_state_for_new_epoch(void) {
   g_gnss_ns_at_pps_vclock = 0;
-  g_ocxo1_ns_at_pps_vclock = 0;
-  g_ocxo2_ns_at_pps_vclock = 0;
+  g_ocxo1_measured_gnss_ns_at_pps_vclock = 0;
+  g_ocxo2_measured_gnss_ns_at_pps_vclock = 0;
   g_dwt_at_pps_vclock = 0;
   g_dwt_cycle_count_total = 0;
   g_dwt_cycles_between_pps_vclock = DWT_EXPECTED_PER_PPS;
@@ -902,8 +909,8 @@ static void alpha_reset_canonical_clock_state_for_new_epoch(void) {
 
   dwt_cycle_count_total = 0;
   gnss_raw_64           = 0;
-  ocxo1_ticks_64        = 0;
-  ocxo2_ticks_64        = 0;
+  ocxo1_measured_gnss_ticks_64        = 0;
+  ocxo2_measured_gnss_ticks_64        = 0;
 
   welford_reset(welford_dwt);
   welford_reset(welford_vclock);
@@ -1076,16 +1083,16 @@ static void clocks_apply_epoch_counter_edge(clock_state_t& clock,
   int64_t window_error_ns = 0;
 
   if (is_ocxo) {
-    uint32_t best_dwt_cycles = 0;
+    uint32_t measured_dwt_cycles = 0;
     uint64_t real_interval_ns = 0;
     int64_t residual_fast_ns = 0;
     ns_now = alpha_ocxo_apply_measured_second(time_clock,
                                               event.dwt_at_event,
-                                              &best_dwt_cycles,
+                                              &measured_dwt_cycles,
                                               &real_interval_ns,
                                               &residual_fast_ns);
 
-    dwt_cycles_between_edges = best_dwt_cycles;
+    dwt_cycles_between_edges = measured_dwt_cycles;
     gnss_ns_between_edges = real_interval_ns;
     second_residual_ns = residual_fast_ns;
     window_error_ns = -residual_fast_ns;
@@ -1105,12 +1112,14 @@ static void clocks_apply_epoch_counter_edge(clock_state_t& clock,
 
   (void)time_clock_update(time_clock, event.dwt_at_event, ns_now);
 
-  clock.ns_count_at_edge = ns_now;
-  clock.ns_count_at_pps_vclock = ns_now;
-  clock.gnss_ns_at_edge = event.gnss_ns_at_event;
-  clock.phase_offset_ns = (event.gnss_ns_at_event != 0)
-      ? ((int64_t)event.gnss_ns_at_event - (int64_t)ns_now)
-      : 0;
+  clock.ledger_ns_count_at_edge = ns_now;
+  clock.ledger_ns_count_at_pps_vclock = ns_now;
+  const uint64_t reference_gnss_ns_at_edge = (event.gnss_ns_at_event != 0)
+      ? event.gnss_ns_at_event
+      : ns_now;
+  clock.gnss_ns_at_edge = reference_gnss_ns_at_edge;
+  clock.phase_offset_ns =
+      (int64_t)reference_gnss_ns_at_edge - (int64_t)ns_now;
   clock.zero_established = true;
   clock.window_error_ns = window_error_ns;
 
@@ -1129,10 +1138,10 @@ static void clocks_apply_epoch_counter_edge(clock_state_t& clock,
     }
   }
 
-  // Previous-edge bridge truth.  For OCXO lanes event.gnss_ns_at_event may be
-  // absent while the measured-ns ledger is still fully authored from Gamma's
-  // completed DWT span.
-  meas.prev_gnss_ns_at_edge = event.gnss_ns_at_event;
+  // Previous-edge bridge truth. For OCXO lanes the reference coordinate is the
+  // measured GNSS-elapsed ledger because process_interrupt may not carry a
+  // direct GNSS timestamp in the event.
+  meas.prev_gnss_ns_at_edge = reference_gnss_ns_at_edge;
   meas.prev_dwt_at_edge = event.dwt_at_event;
 
   alpha_forensics_publish(time_clock, clock, meas, event, diag,
@@ -1258,14 +1267,14 @@ static bool alpha_sample_all_clocks_at_pps_vclock(const pps_edge_snapshot_t& sna
                                             snap.dwt_at_edge);
 
   g_gnss_ns_at_pps_vclock = vclock_ns;
-  g_ocxo1_ns_at_pps_vclock = ocxo1_ns;
-  g_ocxo2_ns_at_pps_vclock = ocxo2_ns;
+  g_ocxo1_measured_gnss_ns_at_pps_vclock = ocxo1_ns;
+  g_ocxo2_measured_gnss_ns_at_pps_vclock = ocxo2_ns;
 
   // Compatibility mirrors for existing report/Beta surfaces.  The canonical
   // values are the explicit alpha-owned globals above.
-  g_vclock_clock.ns_count_at_pps_vclock = vclock_ns;
-  g_ocxo1_clock.ns_count_at_pps_vclock = ocxo1_ns;
-  g_ocxo2_clock.ns_count_at_pps_vclock = ocxo2_ns;
+  g_vclock_clock.ledger_ns_count_at_pps_vclock = vclock_ns;
+  g_ocxo1_clock.ledger_ns_count_at_pps_vclock = ocxo1_ns;
+  g_ocxo2_clock.ledger_ns_count_at_pps_vclock = ocxo2_ns;
 
   g_vclock_clock.phase_offset_ns = 0;
   g_ocxo1_clock.phase_offset_ns = (int64_t)vclock_ns - (int64_t)ocxo1_ns;

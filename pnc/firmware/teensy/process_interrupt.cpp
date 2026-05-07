@@ -26,9 +26,11 @@
 //                   there.  Nothing in a data structure, subscription payload,
 //                   or TIMEBASE fragment carries _raw.
 //
-// OCXO subscribers (and TimePop) are the principled exception to the
-// "no DWT conversion in PPS_VCLOCK" rule: they must translate their own
-// ISR captures onto the PPS_VCLOCK timeline via interrupt_dwt_to_vclock_gnss_ns.
+// TimePop is the principled exception to the "no DWT conversion in
+// PPS_VCLOCK" rule: it projects CH2 fire facts onto the PPS_VCLOCK timeline
+// for scheduling diagnostics. OCXO one-second subscribers receive authored
+// OCXO edge facts even when that projection is unavailable; CLOCKS/Alpha owns
+// OCXO measured-GNSS interval construction from consecutive OCXO edge DWTs.
 //
 // Lanes:
 //   VCLOCK : TimePop recurring client on QTimer1 CH2 (10 MHz VCLOCK domain)
@@ -1421,6 +1423,7 @@ static void fill_diag(interrupt_capture_diag_t& diag,
 
 static void maybe_dispatch_event(interrupt_subscriber_runtime_t& rt) {
   if (!rt.subscribed || !rt.sub.on_event) return;
+  rt.dispatch_count++;
   rt.sub.on_event(rt.last_event, &rt.last_diag, rt.sub.user_data);
 }
 
@@ -1435,7 +1438,8 @@ static void emit_one_second_event(interrupt_subscriber_runtime_t& rt,
                                   uint32_t authored_counter32,
                                   uint32_t pps_coincidence_cycles = 0,
                                   bool     pps_coincidence_valid  = false,
-                                  const dwt_repair_diag_t* repair = nullptr) {
+                                  const dwt_repair_diag_t* repair = nullptr,
+                                  bool dispatch_immediately = false) {
   if (!rt.active) return;
 
   interrupt_event_t event {};
@@ -1448,7 +1452,9 @@ static void emit_one_second_event(interrupt_subscriber_runtime_t& rt,
   event.pps_coincidence_valid  = pps_coincidence_valid;
 
   // VCLOCK lane authors GNSS time directly from VCLOCK ticks (no DWT).
-  // OCXO lanes use the DWT bridge — the principled exception.
+  // OCXO lanes try the DWT bridge for diagnostics, but dispatch does not
+  // depend on projection success. Alpha constructs OCXO measured-GNSS
+  // intervals from consecutive OCXO edge DWT facts.
   bridge_projection_t bridge{};
   int64_t gnss_ns = -1;
   if (rt.desc->kind == interrupt_subscriber_kind_t::VCLOCK) {
@@ -1483,7 +1489,11 @@ static void emit_one_second_event(interrupt_subscriber_runtime_t& rt,
   rt.has_fired  = true;
   rt.event_count++;
 
-  timepop_arm_asap(deferred_dispatch_callback, &rt, dispatch_timer_name(rt.desc->kind));
+  if (dispatch_immediately) {
+    maybe_dispatch_event(rt);
+  } else {
+    timepop_arm_asap(deferred_dispatch_callback, &rt, dispatch_timer_name(rt.desc->kind));
+  }
 }
 
 // ============================================================================
@@ -1696,7 +1706,11 @@ static void ocxo_deferred_asap_callback(timepop_ctx_t*, timepop_diag_t*, void* u
     work.edge_pending = false;
     g_ocxo_deferred_edge_count++;
     clocks_gamma_second_edge(clock, dwt);
-    emit_one_second_event(*rt, dwt, counter32);
+
+    // We are already in foreground ASAP context.  Dispatch the authored OCXO
+    // edge directly instead of arming a second named ASAP slot that can be
+    // replaced by the next 100 Hz deferred sample before Alpha sees the edge.
+    emit_one_second_event(*rt, dwt, counter32, 0, false, nullptr, true);
   }
 }
 
@@ -1758,7 +1772,7 @@ static void qtimer2_isr(void) {
     g_ocxo_deferred_asap_arm_count++;
     (void)timepop_arm_asap(ocxo_deferred_asap_callback,
                            g_rt_ocxo1,
-                           "OCXO1_DISPATCH");
+                           "OCXO1_DEFERRED");
   }
 
   if (++g_ocxo1_lane.tick_mod_1000 >= TICKS_PER_SECOND_EVENT) {
@@ -1770,7 +1784,7 @@ static void qtimer2_isr(void) {
     g_ocxo_deferred_asap_arm_count++;
     (void)timepop_arm_asap(ocxo_deferred_asap_callback,
                            g_rt_ocxo1,
-                           "OCXO1_DISPATCH");
+                           "OCXO1_DEFERRED");
   }
 }
 
@@ -1831,7 +1845,7 @@ static void qtimer3_isr(void) {
     g_ocxo_deferred_asap_arm_count++;
     (void)timepop_arm_asap(ocxo_deferred_asap_callback,
                            g_rt_ocxo2,
-                           "OCXO2_DISPATCH");
+                           "OCXO2_DEFERRED");
   }
 
   if (++g_ocxo2_lane.tick_mod_1000 >= TICKS_PER_SECOND_EVENT) {
@@ -1843,7 +1857,7 @@ static void qtimer3_isr(void) {
     g_ocxo_deferred_asap_arm_count++;
     (void)timepop_arm_asap(ocxo_deferred_asap_callback,
                            g_rt_ocxo2,
-                           "OCXO2_DISPATCH");
+                           "OCXO2_DEFERRED");
   }
 }
 
@@ -2580,6 +2594,18 @@ static Payload cmd_report(const Payload&) {
   p.add("runtime_ready",  g_interrupt_runtime_ready);
   p.add("irqs_enabled",   g_interrupt_irqs_enabled);
   p.add("subscriber_count", g_subscriber_count);
+  p.add("vclock_subscribed", g_rt_vclock ? g_rt_vclock->subscribed : false);
+  p.add("vclock_active", g_rt_vclock ? g_rt_vclock->active : false);
+  p.add("vclock_event_count", g_rt_vclock ? g_rt_vclock->event_count : 0U);
+  p.add("vclock_dispatch_count", g_rt_vclock ? g_rt_vclock->dispatch_count : 0U);
+  p.add("ocxo1_subscribed", g_rt_ocxo1 ? g_rt_ocxo1->subscribed : false);
+  p.add("ocxo1_active", g_rt_ocxo1 ? g_rt_ocxo1->active : false);
+  p.add("ocxo1_event_count", g_rt_ocxo1 ? g_rt_ocxo1->event_count : 0U);
+  p.add("ocxo1_dispatch_count", g_rt_ocxo1 ? g_rt_ocxo1->dispatch_count : 0U);
+  p.add("ocxo2_subscribed", g_rt_ocxo2 ? g_rt_ocxo2->subscribed : false);
+  p.add("ocxo2_active", g_rt_ocxo2 ? g_rt_ocxo2->active : false);
+  p.add("ocxo2_event_count", g_rt_ocxo2 ? g_rt_ocxo2->event_count : 0U);
+  p.add("ocxo2_dispatch_count", g_rt_ocxo2 ? g_rt_ocxo2->dispatch_count : 0U);
   p.add("pps_rebootstrap_pending", g_pps_rebootstrap_pending);
   p.add("pps_rebootstrap_count",   g_pps_rebootstrap_count);
   p.add("vclock_epoch_latch_pending", g_vclock_epoch_latch.pending);

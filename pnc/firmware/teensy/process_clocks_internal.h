@@ -50,12 +50,12 @@
 //   - g_gnss_ns_at_pps_vclock         CLOCKS-owned epoch-relative VCLOCK/GNSS
 //                                     nanosecond counter sampled at the latest
 //                                     selected PPS/VCLOCK edge.
-//   - g_ocxo1_ns_at_pps_vclock        CLOCKS-owned epoch-relative OCXO1
-//                                     nanosecond counter sampled at the same
-//                                     PPS/VCLOCK edge.
-//   - g_ocxo2_ns_at_pps_vclock        CLOCKS-owned epoch-relative OCXO2
-//                                     nanosecond counter sampled at the same
-//                                     PPS/VCLOCK edge.
+//   - g_ocxo1_measured_gnss_ns_at_pps_vclock
+//                                     CLOCKS-owned OCXO1 measured GNSS-elapsed
+//                                     ledger sampled at the same PPS/VCLOCK edge.
+//   - g_ocxo2_measured_gnss_ns_at_pps_vclock
+//                                     CLOCKS-owned OCXO2 measured GNSS-elapsed
+//                                     ledger sampled at the same PPS/VCLOCK edge.
 //   - g_dwt_at_pps_vclock             DWT coordinate of the selected
 //                                     PPS/VCLOCK edge.
 //   - g_dwt_cycles_between_pps_vclock Difference of consecutive selected
@@ -124,12 +124,12 @@ static inline uint64_t dwt_ns_to_cycles(uint64_t ns) {
 // one-second bookends share one coordinate species.
 // ============================================================================
 
-// Canonical 64-bit nanosecond clocks at the most recent selected PPS/VCLOCK
-// edge.  Alpha authors these; Beta publishes them; stateless time.h projection
-// uses them as interpolation bases.
+// Canonical VCLOCK/GNSS and measured OCXO 64-bit ledgers at the most recent
+// selected PPS/VCLOCK edge. Alpha authors these; Beta publishes them;
+// stateless time.h projection uses them as interpolation bases.
 extern volatile uint64_t g_gnss_ns_at_pps_vclock;
-extern volatile uint64_t g_ocxo1_ns_at_pps_vclock;
-extern volatile uint64_t g_ocxo2_ns_at_pps_vclock;
+extern volatile uint64_t g_ocxo1_measured_gnss_ns_at_pps_vclock;
+extern volatile uint64_t g_ocxo2_measured_gnss_ns_at_pps_vclock;
 
 // Canonical DWT_CYCCNT coordinate of the most recent selected PPS/VCLOCK epoch
 // (snap.dwt_at_edge).  Under the VCLOCK-domain architecture this is the
@@ -190,20 +190,20 @@ static constexpr int64_t CLOCK_WINDOW_TOLERANCE_NS = 500LL;
 //
 
 struct clock_state_t {
-  // Cumulative authored ns count at the edge being applied.  Advances
-  // by exactly 1e9 each apply_edge call after the first.
-  volatile uint64_t ns_count_at_edge;
+  // Ledger ns count at the edge being applied. For VCLOCK this is GNSS time;
+  // for OCXO lanes this is the measured GNSS-elapsed OCXO ledger.
+  volatile uint64_t ledger_ns_count_at_edge;
 
   // GNSS ns at the edge as reported by the bridge for this event.
   volatile uint64_t gnss_ns_at_edge;
 
-  // Compatibility mirror of the canonical Alpha-owned epoch-relative ns
-  // count sampled at the latest PPS/VCLOCK edge.
-  volatile uint64_t ns_count_at_pps_vclock;
+  // Compatibility mirror of the Alpha-owned ledger sampled at the latest
+  // PPS/VCLOCK edge.
+  volatile uint64_t ledger_ns_count_at_pps_vclock;
 
-  // (gnss_ns_at_edge − ns_count_at_edge).  For VCLOCK this should be
-  // near zero after the first edge.  For OCXO this accumulates the
-  // crystal's phase drift from the GNSS reference.
+  // (reference GNSS ns − ledger_ns_count_at_edge). For VCLOCK this should be
+  // near zero. For OCXO this is the measured phase displacement of the OCXO
+  // ledger relative to the selected PPS/VCLOCK reference.
   volatile int64_t  phase_offset_ns;
 
   // Set true on the first apply_edge call.
@@ -268,18 +268,18 @@ struct clocks_alpha_lane_forensics_t {
   uint32_t counter32_delta_since_zero_offset;
   uint32_t counter32_delta_since_previous_event;
   uint64_t logical_ticks64_since_zero;
-  uint64_t logical_ns64_since_zero;
+  uint64_t nominal_ns64_since_zero;
 
   // Legacy aliases retained for report/back-compat consumers.
   uint32_t epoch_counter32;
   uint32_t counter32_delta_since_epoch;
-  uint64_t ns_from_counter32_epoch;
+  uint64_t nominal_ns_from_counter32_epoch;
 
   uint64_t event_gnss_ns;
   uint64_t previous_event_gnss_ns;
   int64_t  phase_offset_ns;
 
-  uint64_t counter_ns_between_edges;
+  uint64_t counter_nominal_ns_between_edges;
   uint64_t bridge_gnss_ns_between_edges;
   int64_t  bridge_residual_ns;
   bool     bridge_interval_valid;
@@ -488,8 +488,8 @@ double welford_stderr(const welford_t& w);
 
 extern uint64_t dwt_cycle_count_total;
 extern uint64_t gnss_raw_64;
-extern uint64_t ocxo1_ticks_64;
-extern uint64_t ocxo2_ticks_64;
+extern uint64_t ocxo1_measured_gnss_ticks_64;
+extern uint64_t ocxo2_measured_gnss_ticks_64;
 
 // ============================================================================
 // Watchdog anomaly latch

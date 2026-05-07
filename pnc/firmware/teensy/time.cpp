@@ -20,10 +20,10 @@ static constexpr uint64_t TIME_NS_PER_SECOND_U64 = 1000000000ULL;
 
 static uint64_t time_lane_ns(time_clock_id_t clock) {
   if (clock == time_clock_id_t::OCXO1) {
-    return clocks_ocxo1_ns_now();
+    return clocks_ocxo1_measured_gnss_ns_now();
   }
   if (clock == time_clock_id_t::OCXO2) {
-    return clocks_ocxo2_ns_now();
+    return clocks_ocxo2_measured_gnss_ns_now();
   }
   return clocks_gnss_ns_now();
 }

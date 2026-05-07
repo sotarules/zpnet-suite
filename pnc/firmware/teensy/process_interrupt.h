@@ -45,9 +45,10 @@
 //                     ns — the ns value always ends in "00".
 //
 //   PPS_VCLOCK ns is computed from VCLOCK counter ticks × 100 ns,
-//   never from DWT.  OCXO subscribers and TimePop are the principled
-//   exception: they must use the DWT bridge to translate their own
-//   ISR captures onto the PPS_VCLOCK timeline.
+//   never from DWT.  TimePop uses the DWT bridge for CH2 fire diagnostics.
+//   OCXO subscribers receive authored OCXO edge DWT/counter facts even when
+//   bridge projection is unavailable; CLOCKS/Alpha owns OCXO measured-GNSS
+//   interval construction from consecutive OCXO edge DWTs.
 //
 //   The _raw rule is absolute: _raw is reserved for one thing only —
 //   ARM_DWT_CYCCNT captured as the first instruction of an ISR.  The
@@ -176,9 +177,9 @@ struct interrupt_event_t {
   uint32_t dwt_at_event = 0;
 
   // GNSS ns at the event.  For VCLOCK, authored from the VCLOCK counter
-  // (PPS_VCLOCK ruler — ends in "00").  For OCXO/TIMEPOP, derived via the
-  // DWT→PPS_VCLOCK bridge (the principled exception to the no-DWT rule).
-  // May be 0 for events emitted before the first PPS edge anchors GNSS.
+  // (PPS_VCLOCK ruler — ends in "00").  For TimePop, derived via the
+  // DWT→PPS_VCLOCK bridge.  For OCXO, this is diagnostic-only and may be 0;
+  // Alpha measures OCXO intervals from consecutive OCXO edge DWT facts.
   uint64_t gnss_ns_at_event = 0;
 
   // process_interrupt-authored private synthetic 32-bit clock identity at
