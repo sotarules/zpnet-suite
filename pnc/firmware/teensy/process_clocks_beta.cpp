@@ -94,6 +94,16 @@ uint64_t recover_ocxo2_ns = 0;
 // Most recently published TIMEBASE_FRAGMENT, retained for cmd_report.
 static Payload g_last_fragment;
 
+// Alpha-authored physical PPS witness DWT audit surface.  These are published
+// into TIMEBASE_FRAGMENT so Pi-side reports can compare physical PPS-to-PPS
+// DWT intervals against the canonical PPS/VCLOCK DWT rail.
+extern volatile uint32_t g_pps_dwt_at_edge;
+extern volatile uint32_t g_pps_dwt_cycles_between_edges;
+extern volatile bool     g_pps_dwt_cycles_between_edges_valid;
+extern volatile int32_t  g_pps_vclock_phase_cycles;
+extern volatile int32_t  g_pps_vclock_phase_step_cycles;
+extern volatile bool     g_pps_vclock_phase_valid;
+
 // ============================================================================
 // Campaign warmup suppression
 // ============================================================================
@@ -1036,6 +1046,21 @@ void clocks_beta_pps(void) {
   p.add("dwt_at_pps_vclock", g_dwt_at_pps_vclock);
   p.add("dwt_cycles_between_pps_vclock", g_dwt_cycles_between_pps_vclock);
   p.add("dwt_expected_per_pps_vclock", (uint32_t)DWT_EXPECTED_PER_PPS);
+
+  // Physical PPS witness DWT audit surface.  These fields let Pi-side
+  // raw_cycles compare the GPIO PPS witness rail against the canonical
+  // PPS/VCLOCK rail and determine where the 4-cycle lattice lives.
+  p.add("pps_dwt_at_edge", (uint32_t)g_pps_dwt_at_edge);
+  p.add("pps_dwt_cycles_between_edges",
+        g_pps_dwt_cycles_between_edges_valid
+            ? (uint32_t)g_pps_dwt_cycles_between_edges
+            : 0U);
+  p.add("pps_dwt_cycles_between_edges_valid",
+        (bool)g_pps_dwt_cycles_between_edges_valid);
+  p.add("pps_vclock_phase_cycles", (int32_t)g_pps_vclock_phase_cycles);
+  p.add("pps_vclock_phase_step_cycles",
+        (int32_t)g_pps_vclock_phase_step_cycles);
+  p.add("pps_vclock_phase_valid", (bool)g_pps_vclock_phase_valid);
   // Instantaneous cycles residual: measured minus expected.
   // Positive → Teensy CPU fast; negative → Teensy CPU slow.
   // Same sign convention as dwt_ppb, same units as dwt_cycles_between_pps_vclock.

@@ -106,6 +106,22 @@ static volatile uint32_t g_prev_dwt_at_vclock_event = 0;
 static volatile uint32_t g_prev_pps_vclock_dwt_at_edge = 0;
 static volatile bool     g_prev_pps_vclock_dwt_at_edge_valid = false;
 
+// Physical PPS witness DWT audit surface for TIMEBASE.  This is the
+// physical GPIO PPS event-coordinate DWT captured by process_interrupt
+// and exposed through pps_edge_snapshot_t.  It is intentionally separate
+// from the canonical PPS/VCLOCK DWT edge.
+volatile uint32_t g_pps_dwt_at_edge = 0;
+volatile uint32_t g_pps_dwt_cycles_between_edges = 0;
+volatile bool     g_pps_dwt_cycles_between_edges_valid = false;
+volatile int32_t  g_pps_vclock_phase_cycles = 0;
+volatile int32_t  g_pps_vclock_phase_step_cycles = 0;
+volatile bool     g_pps_vclock_phase_valid = false;
+
+static volatile uint32_t g_prev_pps_dwt_at_edge = 0;
+static volatile bool     g_prev_pps_dwt_at_edge_valid = false;
+static volatile int32_t  g_prev_pps_vclock_phase_cycles = 0;
+static volatile bool     g_prev_pps_vclock_phase_valid = false;
+
 // VCLOCK event counter — increments on every vclock_callback invocation
 // AFTER epoch install.  Read by pps_selector_callback to cross-check that no
 // VCLOCK event slipped in between the GPIO ISR and the foreground
@@ -940,6 +956,16 @@ static void alpha_reset_canonical_clock_state_for_new_epoch(void) {
   g_prev_dwt_at_vclock_event = 0;
   g_prev_pps_vclock_dwt_at_edge = 0;
   g_prev_pps_vclock_dwt_at_edge_valid = false;
+  g_pps_dwt_at_edge = 0;
+  g_pps_dwt_cycles_between_edges = 0;
+  g_pps_dwt_cycles_between_edges_valid = false;
+  g_pps_vclock_phase_cycles = 0;
+  g_pps_vclock_phase_step_cycles = 0;
+  g_pps_vclock_phase_valid = false;
+  g_prev_pps_dwt_at_edge = 0;
+  g_prev_pps_dwt_at_edge_valid = false;
+  g_prev_pps_vclock_phase_cycles = 0;
+  g_prev_pps_vclock_phase_valid = false;
   g_vclock_event_count = 0;
 
   g_alpha_runtime_epoch_capture_missing_count = 0;
@@ -1243,8 +1269,33 @@ static void ocxo2_callback(const interrupt_event_t& event,
 // ============================================================================
 
 static void publish_pps_witness_diag(const pps_edge_snapshot_t& snap) {
+  const uint32_t physical_pps_dwt = snap.physical_pps_dwt_normalized_at_edge;
+  const int32_t phase_cycles = (int32_t)(snap.dwt_at_edge - physical_pps_dwt);
+
+  g_pps_dwt_at_edge = physical_pps_dwt;
+  if (g_prev_pps_dwt_at_edge_valid) {
+    g_pps_dwt_cycles_between_edges = physical_pps_dwt - g_prev_pps_dwt_at_edge;
+    g_pps_dwt_cycles_between_edges_valid = true;
+  } else {
+    g_pps_dwt_cycles_between_edges = 0;
+    g_pps_dwt_cycles_between_edges_valid = false;
+  }
+
+  g_pps_vclock_phase_cycles = phase_cycles;
+  if (g_prev_pps_vclock_phase_valid) {
+    g_pps_vclock_phase_step_cycles =
+        phase_cycles - g_prev_pps_vclock_phase_cycles;
+  } else {
+    g_pps_vclock_phase_step_cycles = 0;
+  }
+  g_pps_vclock_phase_valid = true;
+  g_prev_pps_dwt_at_edge = physical_pps_dwt;
+  g_prev_pps_dwt_at_edge_valid = true;
+  g_prev_pps_vclock_phase_cycles = phase_cycles;
+  g_prev_pps_vclock_phase_valid = true;
+
   g_pps_witness_diag.pps_edge_sequence = snap.sequence;
-  g_pps_witness_diag.pps_edge_dwt_isr_entry_raw = snap.physical_pps_dwt_raw_at_edge;
+  g_pps_witness_diag.pps_edge_dwt_isr_entry_raw = physical_pps_dwt;
   g_pps_witness_diag.pps_edge_gnss_ns = snap.gnss_ns_at_edge;
   g_pps_witness_diag.pps_edge_minus_event_ns =
       (snap.gnss_ns_at_edge >= 0)
