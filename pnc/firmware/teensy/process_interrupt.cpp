@@ -146,6 +146,10 @@ static constexpr uint32_t EPOCH_CAPTURE_MAX_WINDOW_CYCLES =
 static constexpr uint64_t VCLOCK_CADENCE_PERIOD_NS = 1000000ULL;
 static constexpr const char* VCLOCK_CADENCE_NAME = "VCLOCK_CADENCE";
 
+// Fixed-point scale for the experimental PPS-witness phase estimator.
+// Values ending in _scaled_cycles are DWT cycles multiplied by this scale.
+static constexpr uint32_t VCLOCK_PHASE_ESTIMATE_SCALE = 1000U;
+
 // OCXO DWT authorship.  OCXO1 and OCXO2 now live on separate QuadTimer
 // modules/vectors.  Each OCXO ISR captures ARM_DWT_CYCCNT as its first
 // instruction and applies the calibrated QTimer ISR-entry latency correction.
@@ -228,6 +232,49 @@ static pps_vclock_t store_load_pvc(void) {
   pps_vclock_t pvc;
   store_load(pps, pvc);
   return pvc;
+}
+
+// ============================================================================
+// Experimental PPS-witness-derived PPS_VCLOCK DWT phase estimate (seqlock)
+// ============================================================================
+
+struct phase_estimate_store_t {
+  volatile uint32_t seq = 0;
+  pps_vclock_phase_estimate_t value{};
+};
+
+static phase_estimate_store_t g_phase_estimate_store;
+
+static void phase_estimate_publish(const pps_vclock_phase_estimate_t& value) {
+  g_phase_estimate_store.seq++;
+  dmb_barrier();
+  g_phase_estimate_store.value = value;
+  dmb_barrier();
+  g_phase_estimate_store.seq++;
+}
+
+static void phase_estimate_reset(void) {
+  phase_estimate_publish(pps_vclock_phase_estimate_t{});
+}
+
+bool interrupt_last_pps_vclock_phase_estimate(
+    pps_vclock_phase_estimate_t* out) {
+  if (!out) return false;
+
+  for (int attempt = 0; attempt < 4; attempt++) {
+    const uint32_t s1 = g_phase_estimate_store.seq;
+    dmb_barrier();
+    const pps_vclock_phase_estimate_t local = g_phase_estimate_store.value;
+    dmb_barrier();
+    const uint32_t s2 = g_phase_estimate_store.seq;
+    if (s1 == s2 && (s1 & 1u) == 0u) {
+      *out = local;
+      return local.valid;
+    }
+  }
+
+  *out = pps_vclock_phase_estimate_t{};
+  return false;
 }
 
 // ============================================================================
@@ -702,6 +749,51 @@ static uint32_t vclock_cycles_for_ticks(uint32_t vclock_ticks) {
                     (uint64_t)VCLOCK_COUNTS_PER_SECOND);
 }
 
+static uint32_t vclock_phase_tick_scaled_from_cps(uint32_t dwt_cycles_per_second) {
+  if (dwt_cycles_per_second == 0) return 0;
+  return (uint32_t)(((uint64_t)dwt_cycles_per_second *
+                     (uint64_t)VCLOCK_PHASE_ESTIMATE_SCALE +
+                     (uint64_t)VCLOCK_COUNTS_PER_SECOND / 2ULL) /
+                    (uint64_t)VCLOCK_COUNTS_PER_SECOND);
+}
+
+static void publish_pps_vclock_phase_estimate(const pps_t& pps,
+                                              uint32_t pvc_sequence,
+                                              uint32_t lattice_dwt_at_edge,
+                                              uint32_t pvc_counter32_at_edge) {
+  pps_vclock_phase_estimate_t out{};
+  out.lattice_dwt_at_edge = lattice_dwt_at_edge;
+  out.estimated_dwt_at_edge = lattice_dwt_at_edge;
+  out.scale = VCLOCK_PHASE_ESTIMATE_SCALE;
+  out.dwt_cycles_per_second = interrupt_vclock_cycles_per_second();
+  out.tick_scaled_cycles =
+      vclock_phase_tick_scaled_from_cps(out.dwt_cycles_per_second);
+  out.pps_sequence = pps.sequence;
+  out.pvc_sequence = pvc_sequence;
+  out.pps_dwt_at_edge = pps.dwt_at_edge;
+  out.pps_counter32_at_edge = pps.counter32_at_edge;
+  out.pvc_counter32_at_edge = pvc_counter32_at_edge;
+
+  if (pps.sequence != 0 && pps.dwt_at_edge != 0 &&
+      out.tick_scaled_cycles != 0) {
+    const uint32_t delta_cycles = lattice_dwt_at_edge - pps.dwt_at_edge;
+    const uint64_t delta_scaled =
+        (uint64_t)delta_cycles * (uint64_t)VCLOCK_PHASE_ESTIMATE_SCALE;
+    out.phase_mod_scaled_cycles =
+        (uint32_t)(delta_scaled % (uint64_t)out.tick_scaled_cycles);
+
+    const uint32_t phase_cycles =
+        (out.phase_mod_scaled_cycles + VCLOCK_PHASE_ESTIMATE_SCALE / 2U) /
+        VCLOCK_PHASE_ESTIMATE_SCALE;
+    out.estimated_dwt_at_edge = pps.dwt_at_edge + phase_cycles;
+    out.correction_cycles =
+        (int32_t)(out.estimated_dwt_at_edge - lattice_dwt_at_edge);
+    out.valid = true;
+  }
+
+  phase_estimate_publish(out);
+}
+
 static dwt_repair_diag_t vclock_endpoint_repair_diagnostic(uint32_t observed_dwt) {
   dwt_repair_diag_t r{};
   r.valid = false;
@@ -779,6 +871,8 @@ static void publish_vclock_domain_pps_vclock(const pps_t& pps,
   pvc.ch3_at_edge = ch3_at_edge;
   pvc.gnss_ns_at_edge = gnss_ns_at_edge;
 
+  publish_pps_vclock_phase_estimate(pps, sequence, dwt_at_edge,
+                                     counter32_at_edge);
   vclock_check_pps_phase_or_watchdog(pps, sequence, counter32_at_edge, dwt_at_edge);
 
   g_pps_gpio_heartbeat.last_dwt = pvc.dwt_at_edge;
@@ -2557,6 +2651,7 @@ void process_interrupt_init(void) {
   g_pps_rebootstrap_count = 0;
 
   g_store = snapshot_store_t{};
+  phase_estimate_reset();
   g_epoch_capture_store = epoch_capture_store_t{};
   pvc_anchor_ring_reset();
   g_bridge_stats_timepop = bridge_anchor_stats_t{};
@@ -2742,6 +2837,23 @@ static Payload cmd_report(const Payload&) {
   p.add("pps_vclock_counter32_at_edge", pvc.counter32_at_edge);
   p.add("pps_vclock_ch3_at_edge",       (uint32_t)pvc.ch3_at_edge);
   p.add("pps_vclock_gnss_ns_at_edge",   pvc.gnss_ns_at_edge);
+
+  pps_vclock_phase_estimate_t phase_est{};
+  const bool phase_est_loaded = interrupt_last_pps_vclock_phase_estimate(&phase_est);
+  p.add("pps_vclock_phase_estimate_loaded", phase_est_loaded);
+  p.add("pps_vclock_phase_estimate_valid", phase_est.valid);
+  p.add("pps_vclock_lattice_dwt_at_edge", phase_est.lattice_dwt_at_edge);
+  p.add("pps_vclock_phase_estimated_dwt_at_edge", phase_est.estimated_dwt_at_edge);
+  p.add("pps_vclock_phase_correction_cycles", phase_est.correction_cycles);
+  p.add("pps_vclock_phase_mod_scaled_cycles", phase_est.phase_mod_scaled_cycles);
+  p.add("pps_vclock_phase_tick_scaled_cycles", phase_est.tick_scaled_cycles);
+  p.add("pps_vclock_phase_scale", phase_est.scale);
+  p.add("pps_vclock_phase_dwt_cycles_per_second", phase_est.dwt_cycles_per_second);
+  p.add("pps_vclock_phase_pps_sequence", phase_est.pps_sequence);
+  p.add("pps_vclock_phase_pvc_sequence", phase_est.pvc_sequence);
+  p.add("pps_vclock_phase_pps_dwt_at_edge", phase_est.pps_dwt_at_edge);
+  p.add("pps_vclock_phase_pps_counter32_at_edge", phase_est.pps_counter32_at_edge);
+  p.add("pps_vclock_phase_pvc_counter32_at_edge", phase_est.pvc_counter32_at_edge);
 
   interrupt_epoch_capture_t epoch_cap{};
   const bool epoch_cap_ok = interrupt_last_epoch_capture(&epoch_cap);

@@ -361,6 +361,35 @@ struct pps_vclock_t {
 };
 
 // ============================================================================
+// Experimental PPS-witness-derived PPS_VCLOCK DWT phase estimate
+// ============================================================================
+//
+// The canonical PPS_VCLOCK identity remains VCLOCK/counter32-authored.  This
+// report surface estimates the selected VCLOCK edge's DWT coordinate using the
+// physical PPS DWT witness as the smoother phase ruler and the VCLOCK lattice
+// DWT as identity evidence.  All math is integer/fixed-point DWT-cycle math;
+// this surface never asks the DWT-GNSS bridge for a timestamp.
+
+struct pps_vclock_phase_estimate_t {
+  bool     valid = false;
+
+  uint32_t lattice_dwt_at_edge = 0;
+  uint32_t estimated_dwt_at_edge = 0;
+  int32_t  correction_cycles = 0;
+
+  uint32_t phase_mod_scaled_cycles = 0;
+  uint32_t tick_scaled_cycles = 0;
+  uint32_t scale = 0;
+  uint32_t dwt_cycles_per_second = 0;
+
+  uint32_t pps_sequence = 0;
+  uint32_t pvc_sequence = 0;
+  uint32_t pps_dwt_at_edge = 0;
+  uint32_t pps_counter32_at_edge = 0;
+  uint32_t pvc_counter32_at_edge = 0;
+};
+
+// ============================================================================
 // Legacy: pps_edge_snapshot_t — transitional projection
 // ============================================================================
 //
@@ -583,6 +612,9 @@ void interrupt_pps_edge_register_dispatch(pps_edge_dispatch_fn fn);
 // diagnostic snapshot only.
 
 pps_vclock_t interrupt_last_pps_vclock(void);
+
+bool interrupt_last_pps_vclock_phase_estimate(
+    pps_vclock_phase_estimate_t* out);
 
 // Legacy accessor — populates pps_edge_snapshot_t from the same internal
 // store.  Kept for back-compat with alpha; new code should prefer the

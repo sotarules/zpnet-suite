@@ -1,33 +1,21 @@
 """
-ZPNet Raw Cycles — PPS/VCLOCK DWT interval audit.
+ZPNet Raw Cycles — compact prediction audit.
 
-Reads TIMEBASE rows for a campaign and compares the one-second DWT interval
-computed from two candidate timing surfaces:
+Reads TIMEBASE rows for a campaign and prints a compact one-second DWT-cycle
+audit for four lanes:
 
-  1. PPS / physical GPIO witness DWT, when available in TIMEBASE.
-  2. PPS_VCLOCK / canonical VCLOCK-selected DWT, from current TIMEBASE schema.
+  • PPS    — physical GPIO witness DWT, static prediction = previous PPS actual
+  • VCLOCK — preferred raw-cycle surface is the PPS-witness phase-estimated
+             PPS_VCLOCK DWT edge when present/valid; otherwise falls back to
+             the lattice PPS_VCLOCK DWT edge and then firmware/Gamma actuals
+  • OCXO1  — Gamma lane-local prediction audit from TIMEBASE
+  • OCXO2  — Gamma lane-local prediction audit from TIMEBASE
 
-Current TIMEBASE schema fields used:
-
-  fragment.dwt_at_pps_vclock
-      Canonical PPS_VCLOCK DWT coordinate.
-
-  fragment.dwt_cycles_between_pps_vclock
-      Firmware-authored one-second DWT interval between consecutive
-      PPS_VCLOCK bookends.
-
-  fragment.dwt_expected_per_pps_vclock
-      Expected/nominal DWT cycles per PPS_VCLOCK second.
-
-  fragment.prediction.vclock_static_prediction_cycles
-  fragment.prediction.vclock_actual_cycles
-  fragment.prediction.vclock_static_residual_cycles
-      Compact Gamma prediction audit.
-
-Legacy PPS/GPIO witness fields are optional. If a TIMEBASE row still carries
-one of the older physical PPS DWT fields, the report computes PPS-to-PPS
-intervals from it. If not, PPS columns show "---" and the report still
-analyzes VCLOCK.
+This report intentionally removes the older modulo/transport clutter.
+It focuses on actual cycles, static prediction, dynamic prediction, residuals,
+and the positive PPS→VCLOCK phase offset from the preferred VCLOCK DWT surface.
+For PPS there is no dynamic prediction surface; the dynamic columns are shown
+as "---".
 
 Usage:
     python -m zpnet.tests.raw_cycles <campaign_name> [limit]
@@ -39,7 +27,7 @@ from __future__ import annotations
 import json
 import math
 import sys
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from zpnet.shared.db import open_db
 
@@ -116,15 +104,15 @@ def _frag(rec: Dict[str, Any]) -> Dict[str, Any]:
     return frag if isinstance(frag, dict) else {}
 
 
+def _prediction(frag: Dict[str, Any]) -> Dict[str, Any]:
+    pred = frag.get("prediction")
+    return pred if isinstance(pred, dict) else {}
+
+
 def _gnss(rec: Dict[str, Any]) -> Dict[str, Any]:
     root = _root(rec)
-    g = root.get("gnss")
-    return g if isinstance(g, dict) else {}
-
-
-def _prediction(frag: Dict[str, Any]) -> Dict[str, Any]:
-    p = frag.get("prediction")
-    return p if isinstance(p, dict) else {}
+    gnss = root.get("gnss")
+    return gnss if isinstance(gnss, dict) else {}
 
 
 def _as_int(v: Any) -> Optional[int]:
@@ -146,6 +134,14 @@ def _as_float(v: Any) -> Optional[float]:
     return None if math.isnan(f) else f
 
 
+def _as_bool(v: Any) -> bool:
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, str):
+        return v.strip().lower() in ("1", "true", "yes", "y")
+    return bool(v)
+
+
 def _as_str(v: Any) -> Optional[str]:
     if v is None:
         return None
@@ -158,14 +154,6 @@ def _as_str(v: Any) -> Optional[str]:
 def _first_int(*values: Any) -> Optional[int]:
     for v in values:
         out = _as_int(v)
-        if out is not None:
-            return out
-    return None
-
-
-def _first_float(*values: Any) -> Optional[float]:
-    for v in values:
-        out = _as_float(v)
         if out is not None:
             return out
     return None
@@ -196,27 +184,28 @@ def _fmt_str(v: Optional[str], width: int = 0) -> str:
     return f"{s:<{width}s}" if width else s
 
 
-def _mod4(v: Optional[int]) -> Optional[int]:
-    return None if v is None else int(v & 3)
-
-
 def _delta_u32(now: int, prev: int) -> int:
     return (now - prev) & 0xFFFFFFFF
+
+
+def _signed_delta_u32(now: int, prev: int) -> int:
+    delta = (now - prev) & 0xFFFFFFFF
+    return delta - 0x100000000 if delta > 0x7FFFFFFF else delta
 
 
 def _print_welford(name: str, w: Welford, unit: str = "cycles",
                    decimals: int = 3) -> None:
     if w.n == 0:
-        print(f"  {name:<52s} no samples")
+        print(f"  {name:<42s} no samples")
         return
     print(
-        f"  {name:<52s} "
+        f"  {name:<42s} "
         f"n={w.n:>7,d}  "
-        f"mean={w.mean:+11,.{decimals}f} {unit:<6s}  "
+        f"mean={w.mean:+12,.{decimals}f} {unit:<6s}  "
         f"sd={w.stddev:10,.{decimals}f}  "
         f"se={w.stderr:9,.{decimals}f}  "
-        f"min={w.min_val:+10,.{decimals}f}  "
-        f"max={w.max_val:+10,.{decimals}f}"
+        f"min={w.min_val:+12,.{decimals}f}  "
+        f"max={w.max_val:+12,.{decimals}f}"
     )
 
 
@@ -232,6 +221,46 @@ def physical_pps_dwt_from_schema(root: Dict[str, Any], frag: Dict[str, Any]) -> 
     )
 
 
+def vclock_preferred_dwt_from_schema(root: Dict[str, Any], frag: Dict[str, Any]) -> Tuple[Optional[int], str]:
+    phase_estimate_valid = _as_bool(frag.get("pps_vclock_phase_estimate_valid"))
+    phase_estimate_dwt = _first_int(
+        frag.get("pps_vclock_phase_estimated_dwt_at_edge"),
+        root.get("pps_vclock_phase_estimated_dwt_at_edge"),
+    )
+    if phase_estimate_valid and phase_estimate_dwt is not None:
+        return phase_estimate_dwt, "phase"
+
+    lattice_dwt = _first_int(
+        frag.get("dwt_at_pps_vclock"),
+        frag.get("pps_vclock_lattice_dwt_at_edge"),
+        root.get("dwt_at_pps_vclock"),
+    )
+    if lattice_dwt is not None:
+        return lattice_dwt, "lattice"
+
+    return None, "---"
+
+
+def lane_prediction(pred: Dict[str, Any], lane: str) -> Tuple[Optional[int], Optional[int], Optional[int], Optional[int], Optional[int]]:
+    actual = _first_int(pred.get(f"{lane}_actual_cycles"))
+    static = _first_int(pred.get(f"{lane}_static_prediction_cycles"))
+    dynamic = _first_int(pred.get(f"{lane}_dynamic_final_prediction_cycles"))
+    static_res = _first_int(pred.get(f"{lane}_static_residual_cycles"))
+    dynamic_res = _first_int(pred.get(f"{lane}_dynamic_residual_cycles"))
+
+    if static_res is None and actual is not None and static is not None:
+        static_res = actual - static
+    if dynamic_res is None and actual is not None and dynamic is not None:
+        dynamic_res = actual - dynamic
+
+    return actual, static, static_res, dynamic, dynamic_res
+
+
+def add_optional(w: Welford, v: Optional[int]) -> None:
+    if v is not None:
+        w.update(float(v))
+
+
 def analyze(campaign: str, limit: int = 0) -> None:
     rows = fetch_timebase(campaign)
     if not rows:
@@ -240,211 +269,178 @@ def analyze(campaign: str, limit: int = 0) -> None:
 
     print(f"Campaign: {campaign}  ({len(rows):,} rows)")
     print()
-    print("Current TIMEBASE schema:")
-    print("  fragment.dwt_at_pps_vclock              canonical VCLOCK-selected DWT edge")
-    print("  fragment.dwt_cycles_between_pps_vclock  firmware VCLOCK edge-to-edge interval")
-    print("  fragment.dwt_expected_per_pps_vclock    expected DWT cycles per VCLOCK second")
-    print("  fragment.prediction.vclock_*            Gamma VCLOCK prediction audit")
-    print()
-    print("PPS physical columns are computed only when legacy/raw PPS DWT fields exist.")
-    print("If those fields are absent, PPS columns show '---'.")
+    print("Raw cycle surfaces:")
+    print("  PPS    actual = physical PPS GPIO DWT delta; static prediction = previous PPS actual")
+    print("  VCLOCK actual = phase-estimated PPS_VCLOCK DWT delta when valid; otherwise lattice/fallback")
+    print("  OCXO   actual/static/dynamic/residual = compact Gamma lane-local prediction audit")
     print()
 
     header = (
         f"{'pps':>6s}  "
-        f"{'pps_dwt':>13s}  "
-        f"{'vclk_dwt':>13s}  "
-        f"{'phase':>9s}  "
-        f"{'ph_step':>8s}  "
-        f"{'ph%4':>4s}  "
-        f"{'pps_cyc':>13s}  "
-        f"{'pps_res':>9s}  "
-        f"{'pps_pred':>8s}  "
-        f"{'p%4':>3s}  "
-        f"{'vclk_cyc':>13s}  "
-        f"{'vclk_res':>9s}  "
-        f"{'v_pred':>8s}  "
-        f"{'v%4':>3s}  "
-        f"{'gamma_act':>13s}  "
-        f"{'g_stat':>13s}  "
-        f"{'g_sres':>7s}  "
-        f"{'v-p':>8s}  "
-        f"{'dwt_ppb':>10s}  "
-        f"{'gnss_drift':>10s}  "
-        f"{'mode':<10s}"
+        f"{'pps_act':>13s} {'pps_stat':>13s} {'pps_sres':>9s} {'phase':>7s}  "
+        f"{'v_act':>13s} {'v_stat':>13s} {'v_sres':>8s} {'v_dyn':>13s} {'v_dres':>8s} {'vsrc':>7s}  "
+        f"{'o1_act':>13s} {'o1_stat':>13s} {'o1_sres':>8s} {'o1_dyn':>13s} {'o1_dres':>8s}  "
+        f"{'o2_act':>13s} {'o2_stat':>13s} {'o2_sres':>8s} {'o2_dyn':>13s} {'o2_dres':>8s}  "
+        f"{'dwt_ppb':>10s}"
     )
     print(header)
     print(
-        f"{'─'*6}  {'─'*13}  {'─'*13}  {'─'*9}  {'─'*8}  {'─'*4}  "
-        f"{'─'*13}  {'─'*9}  {'─'*8}  {'─'*3}  {'─'*13}  {'─'*9}  "
-        f"{'─'*8}  {'─'*3}  {'─'*13}  {'─'*13}  {'─'*7}  {'─'*8}  "
-        f"{'─'*10}  {'─'*10}  {'─'*10}"
+        f"{'─'*6}  "
+        f"{'─'*13} {'─'*13} {'─'*9} {'─'*7}  "
+        f"{'─'*13} {'─'*13} {'─'*8} {'─'*13} {'─'*8} {'─'*7}  "
+        f"{'─'*13} {'─'*13} {'─'*8} {'─'*13} {'─'*8}  "
+        f"{'─'*13} {'─'*13} {'─'*8} {'─'*13} {'─'*8}  "
+        f"{'─'*10}"
     )
 
-    expected = DEFAULT_DWT_EXPECTED_PER_PPS
     shown = 0
     gaps = 0
 
-    prev_pps: Optional[int] = None
+    prev_pps_count: Optional[int] = None
     prev_physical_pps_dwt: Optional[int] = None
     prev_vclock_dwt: Optional[int] = None
-    prev_pps_cycles: Optional[int] = None
-    prev_vclock_cycles: Optional[int] = None
-    prev_phase: Optional[int] = None
+    prev_pps_actual: Optional[int] = None
 
-    w_pps_cycles = Welford()
-    w_pps_res = Welford()
-    w_pps_pred = Welford()
-    w_vclock_cycles = Welford()
-    w_vclock_res = Welford()
-    w_vclock_pred = Welford()
-    w_phase = Welford()
-    w_phase_step = Welford()
-    w_v_minus_p = Welford()
-    w_gamma_sres = Welford()
+    stats: Dict[str, Welford] = {
+        "pps_actual": Welford(),
+        "pps_static_residual": Welford(),
+        "pps_to_vclock_phase": Welford(),
+        "vclock_actual": Welford(),
+        "vclock_static_residual": Welford(),
+        "vclock_dynamic_residual": Welford(),
+        "ocxo1_actual": Welford(),
+        "ocxo1_static_residual": Welford(),
+        "ocxo1_dynamic_residual": Welford(),
+        "ocxo2_actual": Welford(),
+        "ocxo2_static_residual": Welford(),
+        "ocxo2_dynamic_residual": Welford(),
+    }
 
-    schema_counts = {
+    coverage = {
         "rows": 0,
-        "pps_dwt_present": 0,
-        "vclock_dwt_present": 0,
-        "vclock_cycles_present": 0,
-        "gamma_present": 0,
+        "pps_actual": 0,
+        "vclock_phase_actual": 0,
+        "vclock_lattice_actual": 0,
+        "vclock_prediction": 0,
+        "ocxo1_prediction": 0,
+        "ocxo2_prediction": 0,
     }
 
     for rec in rows:
         root = _root(rec)
         frag = _frag(rec)
         pred = _prediction(frag)
-        gnss = _gnss(rec)
-
-        pps = _first_int(root.get("pps_count"), frag.get("pps_count"),
-                         frag.get("teensy_pps_vclock_count"),
-                         frag.get("teensy_pps_count"))
-        if pps is None:
+        pps_count = _first_int(
+            root.get("pps_count"),
+            frag.get("pps_count"),
+            frag.get("teensy_pps_vclock_count"),
+            frag.get("teensy_pps_count"),
+        )
+        if pps_count is None:
             continue
 
-        expected = _first_int(frag.get("dwt_expected_per_pps_vclock")) or expected
-
-        physical_pps_dwt = physical_pps_dwt_from_schema(root, frag)
-        vclock_dwt = _first_int(frag.get("dwt_at_pps_vclock"),
-                                frag.get("dwt_cycle_count_at_pps"),
-                                root.get("dwt_at_pps_vclock"))
-
-        firmware_vclock_cycles = _first_int(
-            frag.get("dwt_cycles_between_pps_vclock"),
-            frag.get("vclock_dwt_cycles_between_edges"),
-            frag.get("dwt_cycle_count_between_pps"),
-        )
-
-        gamma_actual = _first_int(pred.get("vclock_actual_cycles"))
-        gamma_static = _first_int(pred.get("vclock_static_prediction_cycles"))
-        gamma_sres = _first_int(pred.get("vclock_static_residual_cycles"))
-
-        dwt_ppb = _first_float(frag.get("dwt_ppb"))
-        gnss_drift = _first_float(gnss.get("clock_drift_ppb"))
-        mode = _as_str(gnss.get("freq_mode_name"))
-
-        schema_counts["rows"] += 1
-        if physical_pps_dwt is not None:
-            schema_counts["pps_dwt_present"] += 1
-        if vclock_dwt is not None:
-            schema_counts["vclock_dwt_present"] += 1
-        if firmware_vclock_cycles is not None:
-            schema_counts["vclock_cycles_present"] += 1
-        if gamma_actual is not None or gamma_static is not None:
-            schema_counts["gamma_present"] += 1
-
-        if prev_pps is not None and pps != prev_pps + 1:
+        if prev_pps_count is not None and pps_count != prev_pps_count + 1:
             gaps += 1
-            print(f"{'':>6s}  --- gap {prev_pps:,} → {pps:,} ---")
+            print(f"{'':>6s}  --- gap {prev_pps_count:,} → {pps_count:,} ---")
             prev_physical_pps_dwt = None
             prev_vclock_dwt = None
-            prev_pps_cycles = None
-            prev_vclock_cycles = None
-            prev_phase = None
+            prev_pps_actual = None
 
-        pps_cycles: Optional[int] = None
-        if physical_pps_dwt is not None and prev_physical_pps_dwt is not None:
-            pps_cycles = _delta_u32(physical_pps_dwt, prev_physical_pps_dwt)
+        physical_pps_dwt = physical_pps_dwt_from_schema(root, frag)
+        vclock_dwt, vclock_source = vclock_preferred_dwt_from_schema(root, frag)
 
-        vclock_cycles_from_dwt: Optional[int] = None
-        if vclock_dwt is not None and prev_vclock_dwt is not None:
-            vclock_cycles_from_dwt = _delta_u32(vclock_dwt, prev_vclock_dwt)
-
-        vclock_cycles = vclock_cycles_from_dwt if vclock_cycles_from_dwt is not None else firmware_vclock_cycles
-
-        phase: Optional[int] = None
+        pps_to_vclock_phase: Optional[int] = None
         if physical_pps_dwt is not None and vclock_dwt is not None:
-            phase = (vclock_dwt - physical_pps_dwt) & 0xFFFFFFFF
-            if phase > 0x7FFFFFFF:
-                phase -= 0x100000000
+            pps_to_vclock_phase = abs(_signed_delta_u32(vclock_dwt, physical_pps_dwt))
 
-        phase_step: Optional[int] = None
-        if phase is not None and prev_phase is not None:
-            phase_step = phase - prev_phase
+        pps_actual: Optional[int] = None
+        if physical_pps_dwt is not None and prev_physical_pps_dwt is not None:
+            pps_actual = _delta_u32(physical_pps_dwt, prev_physical_pps_dwt)
 
-        pps_res = (pps_cycles - expected) if pps_cycles is not None else None
-        vclock_res = (vclock_cycles - expected) if vclock_cycles is not None else None
-        pps_pred = (pps_cycles - prev_pps_cycles) if pps_cycles is not None and prev_pps_cycles is not None else None
-        vclock_pred = (vclock_cycles - prev_vclock_cycles) if vclock_cycles is not None and prev_vclock_cycles is not None else None
-        v_minus_p = (vclock_cycles - pps_cycles) if vclock_cycles is not None and pps_cycles is not None else None
-
-        if pps_cycles is not None:
-            w_pps_cycles.update(float(pps_cycles))
-        if pps_res is not None:
-            w_pps_res.update(float(pps_res))
-        if pps_pred is not None:
-            w_pps_pred.update(float(pps_pred))
-        if vclock_cycles is not None:
-            w_vclock_cycles.update(float(vclock_cycles))
-        if vclock_res is not None:
-            w_vclock_res.update(float(vclock_res))
-        if vclock_pred is not None:
-            w_vclock_pred.update(float(vclock_pred))
-        if phase is not None:
-            w_phase.update(float(phase))
-        if phase_step is not None:
-            w_phase_step.update(float(phase_step))
-        if v_minus_p is not None:
-            w_v_minus_p.update(float(v_minus_p))
-        if gamma_sres is not None:
-            w_gamma_sres.update(float(gamma_sres))
-
-        print(
-            f"{pps:>6d}  "
-            f"{_fmt_int(physical_pps_dwt, 13)}  "
-            f"{_fmt_int(vclock_dwt, 13)}  "
-            f"{_fmt_int(phase, 9, signed=True)}  "
-            f"{_fmt_int(phase_step, 8, signed=True)}  "
-            f"{_fmt_int(_mod4(phase), 4)}  "
-            f"{_fmt_int(pps_cycles, 13)}  "
-            f"{_fmt_int(pps_res, 9, signed=True)}  "
-            f"{_fmt_int(pps_pred, 8, signed=True)}  "
-            f"{_fmt_int(_mod4(pps_cycles), 3)}  "
-            f"{_fmt_int(vclock_cycles, 13)}  "
-            f"{_fmt_int(vclock_res, 9, signed=True)}  "
-            f"{_fmt_int(vclock_pred, 8, signed=True)}  "
-            f"{_fmt_int(_mod4(vclock_cycles), 3)}  "
-            f"{_fmt_int(gamma_actual, 13)}  "
-            f"{_fmt_int(gamma_static, 13)}  "
-            f"{_fmt_int(gamma_sres, 7, signed=True)}  "
-            f"{_fmt_int(v_minus_p, 8, signed=True)}  "
-            f"{_fmt_float(dwt_ppb, 10, 3, signed=True)}  "
-            f"{_fmt_float(gnss_drift, 10, 3, signed=True)}  "
-            f"{_fmt_str(mode, 10)}"
+        pps_static = prev_pps_actual
+        pps_static_res = (
+            pps_actual - pps_static
+            if pps_actual is not None and pps_static is not None
+            else None
         )
 
-        prev_pps = pps
+        vclock_actual_from_dwt: Optional[int] = None
+        if vclock_dwt is not None and prev_vclock_dwt is not None:
+            vclock_actual_from_dwt = _delta_u32(vclock_dwt, prev_vclock_dwt)
+
+        vclock_gamma_actual, vclock_static, vclock_static_res, vclock_dynamic, vclock_dynamic_res = (
+            lane_prediction(pred, "vclock")
+        )
+        # The report's VCLOCK actual should reflect the preferred raw DWT surface.
+        # If this row cannot compute a DWT delta, fall back to Gamma/firmware actual.
+        vclock_actual = vclock_actual_from_dwt
+        if vclock_actual is None:
+            vclock_actual = _first_int(
+                vclock_gamma_actual,
+                frag.get("dwt_cycles_between_pps_vclock"),
+                frag.get("vclock_dwt_cycles_between_edges"),
+            )
+
+        # If we used the new raw actual, recompute residuals against Gamma predictions.
+        if vclock_actual is not None and vclock_static is not None:
+            vclock_static_res = vclock_actual - vclock_static
+        if vclock_actual is not None and vclock_dynamic is not None:
+            vclock_dynamic_res = vclock_actual - vclock_dynamic
+
+        ocxo1_actual, ocxo1_static, ocxo1_static_res, ocxo1_dynamic, ocxo1_dynamic_res = (
+            lane_prediction(pred, "ocxo1")
+        )
+        ocxo2_actual, ocxo2_static, ocxo2_static_res, ocxo2_dynamic, ocxo2_dynamic_res = (
+            lane_prediction(pred, "ocxo2")
+        )
+
+        dwt_ppb = _as_float(frag.get("dwt_ppb"))
+        coverage["rows"] += 1
+        if pps_actual is not None:
+            coverage["pps_actual"] += 1
+        if vclock_actual is not None and vclock_source == "phase":
+            coverage["vclock_phase_actual"] += 1
+        if vclock_actual is not None and vclock_source == "lattice":
+            coverage["vclock_lattice_actual"] += 1
+        if vclock_gamma_actual is not None or vclock_static is not None or vclock_dynamic is not None:
+            coverage["vclock_prediction"] += 1
+        if ocxo1_actual is not None or ocxo1_static is not None or ocxo1_dynamic is not None:
+            coverage["ocxo1_prediction"] += 1
+        if ocxo2_actual is not None or ocxo2_static is not None or ocxo2_dynamic is not None:
+            coverage["ocxo2_prediction"] += 1
+
+        add_optional(stats["pps_actual"], pps_actual)
+        add_optional(stats["pps_static_residual"], pps_static_res)
+        add_optional(stats["pps_to_vclock_phase"], pps_to_vclock_phase)
+        add_optional(stats["vclock_actual"], vclock_actual)
+        add_optional(stats["vclock_static_residual"], vclock_static_res)
+        add_optional(stats["vclock_dynamic_residual"], vclock_dynamic_res)
+        add_optional(stats["ocxo1_actual"], ocxo1_actual)
+        add_optional(stats["ocxo1_static_residual"], ocxo1_static_res)
+        add_optional(stats["ocxo1_dynamic_residual"], ocxo1_dynamic_res)
+        add_optional(stats["ocxo2_actual"], ocxo2_actual)
+        add_optional(stats["ocxo2_static_residual"], ocxo2_static_res)
+        add_optional(stats["ocxo2_dynamic_residual"], ocxo2_dynamic_res)
+
+        print(
+            f"{pps_count:>6d}  "
+            f"{_fmt_int(pps_actual, 13)} {_fmt_int(pps_static, 13)} {_fmt_int(pps_static_res, 9, signed=True)} {_fmt_int(pps_to_vclock_phase, 7)}  "
+            f"{_fmt_int(vclock_actual, 13)} {_fmt_int(vclock_static, 13)} {_fmt_int(vclock_static_res, 8, signed=True)} "
+            f"{_fmt_int(vclock_dynamic, 13)} {_fmt_int(vclock_dynamic_res, 8, signed=True)} {_fmt_str(vclock_source, 7)}  "
+            f"{_fmt_int(ocxo1_actual, 13)} {_fmt_int(ocxo1_static, 13)} {_fmt_int(ocxo1_static_res, 8, signed=True)} "
+            f"{_fmt_int(ocxo1_dynamic, 13)} {_fmt_int(ocxo1_dynamic_res, 8, signed=True)}  "
+            f"{_fmt_int(ocxo2_actual, 13)} {_fmt_int(ocxo2_static, 13)} {_fmt_int(ocxo2_static_res, 8, signed=True)} "
+            f"{_fmt_int(ocxo2_dynamic, 13)} {_fmt_int(ocxo2_dynamic_res, 8, signed=True)}  "
+            f"{_fmt_float(dwt_ppb, 10, 3, signed=True)}"
+        )
+
+        prev_pps_count = pps_count
         if physical_pps_dwt is not None:
             prev_physical_pps_dwt = physical_pps_dwt
         if vclock_dwt is not None:
             prev_vclock_dwt = vclock_dwt
-        if pps_cycles is not None:
-            prev_pps_cycles = pps_cycles
-        if vclock_cycles is not None:
-            prev_vclock_cycles = vclock_cycles
-        if phase is not None:
-            prev_phase = phase
+        if pps_actual is not None:
+            prev_pps_actual = pps_actual
 
         shown += 1
         if limit and shown >= limit:
@@ -454,40 +450,41 @@ def analyze(campaign: str, limit: int = 0) -> None:
     print(f"Rows shown: {shown:,}")
     print(f"Gaps:       {gaps:,}")
     print()
+
     print("Schema coverage")
     print("═══════════════")
-    print(f"  rows                    = {schema_counts['rows']:,}")
-    print(f"  physical PPS DWT present = {schema_counts['pps_dwt_present']:,}")
-    print(f"  VCLOCK DWT present       = {schema_counts['vclock_dwt_present']:,}")
-    print(f"  VCLOCK interval present  = {schema_counts['vclock_cycles_present']:,}")
-    print(f"  Gamma prediction present = {schema_counts['gamma_present']:,}")
+    print(f"  rows                         = {coverage['rows']:,}")
+    print(f"  PPS actual cycles             = {coverage['pps_actual']:,}")
+    print(f"  VCLOCK phase-estimated actual = {coverage['vclock_phase_actual']:,}")
+    print(f"  VCLOCK lattice actual         = {coverage['vclock_lattice_actual']:,}")
+    print(f"  VCLOCK prediction rows        = {coverage['vclock_prediction']:,}")
+    print(f"  OCXO1 prediction rows         = {coverage['ocxo1_prediction']:,}")
+    print(f"  OCXO2 prediction rows         = {coverage['ocxo2_prediction']:,}")
     print()
 
     print("Summary")
     print("═══════")
-    _print_welford("PPS physical cycles", w_pps_cycles)
-    _print_welford("PPS physical residual vs expected", w_pps_res)
-    _print_welford("PPS physical one-step residual", w_pps_pred)
-    _print_welford("VCLOCK cycles", w_vclock_cycles)
-    _print_welford("VCLOCK residual vs expected", w_vclock_res)
-    _print_welford("VCLOCK one-step residual", w_vclock_pred)
-    _print_welford("PPS→VCLOCK phase", w_phase)
-    _print_welford("PPS→VCLOCK phase step", w_phase_step)
-    _print_welford("VCLOCK cycles minus PPS cycles", w_v_minus_p)
-    _print_welford("Gamma VCLOCK static residual", w_gamma_sres)
+    _print_welford("PPS actual cycles", stats["pps_actual"])
+    _print_welford("PPS static residual", stats["pps_static_residual"])
+    _print_welford("PPS→VCLOCK phase offset", stats["pps_to_vclock_phase"])
+    _print_welford("VCLOCK actual cycles", stats["vclock_actual"])
+    _print_welford("VCLOCK static residual", stats["vclock_static_residual"])
+    _print_welford("VCLOCK dynamic residual", stats["vclock_dynamic_residual"])
+    _print_welford("OCXO1 actual cycles", stats["ocxo1_actual"])
+    _print_welford("OCXO1 static residual", stats["ocxo1_static_residual"])
+    _print_welford("OCXO1 dynamic residual", stats["ocxo1_dynamic_residual"])
+    _print_welford("OCXO2 actual cycles", stats["ocxo2_actual"])
+    _print_welford("OCXO2 static residual", stats["ocxo2_static_residual"])
+    _print_welford("OCXO2 dynamic residual", stats["ocxo2_dynamic_residual"])
     print()
 
-    print("Interpretation cues")
-    print("═══════════════════")
-    print("  • If VCLOCK cycles are locked to a 4-cycle lattice but PPS cycles are")
-    print("    smoother, the quantization was introduced by the VCLOCK/TimePop DWT rail.")
-    print("  • If both PPS and VCLOCK are locked to the same lattice, the quantization")
-    print("    is deeper than the canonical-edge choice.")
-    print("  • phase_step shows how the physical PPS witness moves relative to the")
-    print("    canonical PPS_VCLOCK DWT edge each second.")
-    print("  • Current compact TIMEBASE may not include physical PPS DWT; in that case")
-    print("    the report can only audit the VCLOCK rail until PPS witness fields are")
-    print("    reintroduced.")
+    print("Notes")
+    print("═════")
+    print("  • VCLOCK actual cycles prefer pps_vclock_phase_estimated_dwt_at_edge.")
+    print("  • vsrc=phase means the new PPS-witness estimate supplied the VCLOCK actual.")
+    print("  • phase is the positive PPS→VCLOCK DWT offset from the preferred VCLOCK edge.")
+    print("  • PPS has no dynamic prediction surface; pps_sres is actual minus previous PPS actual.")
+    print("  • VCLOCK residuals are recomputed against Gamma predictions when the phase-estimated actual is used.")
     print()
 
 

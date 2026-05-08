@@ -103,6 +103,19 @@ extern volatile bool     g_pps_dwt_cycles_between_edges_valid;
 extern volatile int32_t  g_pps_vclock_phase_cycles;
 extern volatile int32_t  g_pps_vclock_phase_step_cycles;
 extern volatile bool     g_pps_vclock_phase_valid;
+extern volatile bool     g_pps_vclock_phase_estimate_valid;
+extern volatile uint32_t g_pps_vclock_lattice_dwt_at_edge;
+extern volatile uint32_t g_pps_vclock_phase_estimated_dwt_at_edge;
+extern volatile int32_t  g_pps_vclock_phase_correction_cycles;
+extern volatile uint32_t g_pps_vclock_phase_mod_scaled_cycles;
+extern volatile uint32_t g_pps_vclock_phase_tick_scaled_cycles;
+extern volatile uint32_t g_pps_vclock_phase_scale;
+extern volatile uint32_t g_pps_vclock_phase_dwt_cycles_per_second;
+extern volatile uint32_t g_pps_vclock_phase_pps_sequence;
+extern volatile uint32_t g_pps_vclock_phase_pvc_sequence;
+extern volatile uint32_t g_pps_vclock_phase_pps_dwt_at_edge;
+extern volatile uint32_t g_pps_vclock_phase_pps_counter32_at_edge;
+extern volatile uint32_t g_pps_vclock_phase_pvc_counter32_at_edge;
 
 // ============================================================================
 // Campaign warmup suppression
@@ -1061,6 +1074,33 @@ void clocks_beta_pps(void) {
   p.add("pps_vclock_phase_step_cycles",
         (int32_t)g_pps_vclock_phase_step_cycles);
   p.add("pps_vclock_phase_valid", (bool)g_pps_vclock_phase_valid);
+
+  p.add("pps_vclock_phase_estimate_valid",
+        (bool)g_pps_vclock_phase_estimate_valid);
+  p.add("pps_vclock_lattice_dwt_at_edge",
+        (uint32_t)g_pps_vclock_lattice_dwt_at_edge);
+  p.add("pps_vclock_phase_estimated_dwt_at_edge",
+        (uint32_t)g_pps_vclock_phase_estimated_dwt_at_edge);
+  p.add("pps_vclock_phase_correction_cycles",
+        (int32_t)g_pps_vclock_phase_correction_cycles);
+  p.add("pps_vclock_phase_mod_scaled_cycles",
+        (uint32_t)g_pps_vclock_phase_mod_scaled_cycles);
+  p.add("pps_vclock_phase_tick_scaled_cycles",
+        (uint32_t)g_pps_vclock_phase_tick_scaled_cycles);
+  p.add("pps_vclock_phase_scale",
+        (uint32_t)g_pps_vclock_phase_scale);
+  p.add("pps_vclock_phase_dwt_cycles_per_second",
+        (uint32_t)g_pps_vclock_phase_dwt_cycles_per_second);
+  p.add("pps_vclock_phase_pps_sequence",
+        (uint32_t)g_pps_vclock_phase_pps_sequence);
+  p.add("pps_vclock_phase_pvc_sequence",
+        (uint32_t)g_pps_vclock_phase_pvc_sequence);
+  p.add("pps_vclock_phase_pps_dwt_at_edge",
+        (uint32_t)g_pps_vclock_phase_pps_dwt_at_edge);
+  p.add("pps_vclock_phase_pps_counter32_at_edge",
+        (uint32_t)g_pps_vclock_phase_pps_counter32_at_edge);
+  p.add("pps_vclock_phase_pvc_counter32_at_edge",
+        (uint32_t)g_pps_vclock_phase_pvc_counter32_at_edge);
   // Instantaneous cycles residual: measured minus expected.
   // Positive → Teensy CPU fast; negative → Teensy CPU slow.
   // Same sign convention as dwt_ppb, same units as dwt_cycles_between_pps_vclock.
