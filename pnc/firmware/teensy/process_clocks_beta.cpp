@@ -444,6 +444,64 @@ static void payload_add_prediction_summary(Payload& p) {
   p.add_object("prediction", prediction);
 }
 
+
+static void payload_add_lane_forensics_flat(Payload& p,
+                                            const char* prefix,
+                                            bool valid,
+                                            const clocks_alpha_lane_forensics_t& f) {
+  char key[96];
+
+  auto add_bool = [&](const char* suffix, bool value) {
+    snprintf(key, sizeof(key), "%s_%s", prefix, suffix);
+    p.add(key, value);
+  };
+  auto add_u32 = [&](const char* suffix, uint32_t value) {
+    snprintf(key, sizeof(key), "%s_%s", prefix, suffix);
+    p.add(key, value);
+  };
+  auto add_u64 = [&](const char* suffix, uint64_t value) {
+    snprintf(key, sizeof(key), "%s_%s", prefix, suffix);
+    p.add(key, value);
+  };
+  auto add_i64 = [&](const char* suffix, int64_t value) {
+    snprintf(key, sizeof(key), "%s_%s", prefix, suffix);
+    p.add(key, value);
+  };
+
+  // Flat Alpha-forensics fields for TIMEBASE_FRAGMENT.  raw_cycles.py uses
+  // <lane>_forensics_last_event_dwt to independently reconstruct the OCXO
+  // event-to-event DWT interval and compare it against prediction.<lane>_actual_cycles.
+  add_bool("forensics_valid", valid);
+  add_u32("forensics_update_count", valid ? f.update_count : 0U);
+  add_u32("forensics_last_event_dwt", valid ? f.last_event_dwt : 0U);
+  add_u32("alpha_event_last_event_dwt", valid ? f.last_event_dwt : 0U);  // raw_cycles alias
+  add_u32("forensics_last_event_counter32", valid ? f.last_event_counter32 : 0U);
+  add_u32("forensics_dwt_cycles_between_edges", valid ? f.dwt_cycles_between_edges : 0U);
+  add_u64("forensics_ns_between_edges", valid ? f.ns_between_edges : 0ULL);
+  add_i64("forensics_second_residual_ns", valid ? f.second_residual_ns : 0LL);
+  add_i64("forensics_window_error_ns", valid ? f.window_error_ns : 0LL);
+
+  add_u32("forensics_zero_offset_counter32", valid ? f.zero_offset_counter32 : 0U);
+  add_u32("forensics_counter32_delta_since_zero_offset",
+          valid ? f.counter32_delta_since_zero_offset : 0U);
+  add_u32("forensics_counter32_delta_since_previous_event",
+          valid ? f.counter32_delta_since_previous_event : 0U);
+  add_u64("forensics_logical_ticks64_since_zero",
+          valid ? f.logical_ticks64_since_zero : 0ULL);
+  add_u64("forensics_nominal_ns64_since_zero",
+          valid ? f.nominal_ns64_since_zero : 0ULL);
+
+  add_u64("forensics_counter_nominal_ns_between_edges",
+          valid ? f.counter_nominal_ns_between_edges : 0ULL);
+  add_u64("forensics_bridge_gnss_ns_between_edges",
+          valid ? f.bridge_gnss_ns_between_edges : 0ULL);
+  add_i64("forensics_bridge_residual_ns", valid ? f.bridge_residual_ns : 0LL);
+  add_bool("forensics_bridge_interval_valid", valid && f.bridge_interval_valid);
+  add_u64("forensics_event_gnss_ns", valid ? f.event_gnss_ns : 0ULL);
+  add_u64("forensics_previous_event_gnss_ns", valid ? f.previous_event_gnss_ns : 0ULL);
+  add_i64("forensics_phase_offset_ns", valid ? f.phase_offset_ns : 0LL);
+}
+
 // ============================================================================
 // Predictive servo tuning
 // ============================================================================
@@ -1080,6 +1138,7 @@ void clocks_beta_pps(void) {
   p.add("ocxo1_window_checks", g_ocxo1_clock.window_checks);
   p.add("ocxo1_window_mismatches", g_ocxo1_clock.window_mismatches);
   p.add("ocxo1_window_error_ns", g_ocxo1_clock.window_error_ns);
+  payload_add_lane_forensics_flat(p, "ocxo1", ocxo1_forensics_valid, ocxo1_forensics);
 
   // OCXO2 surface.
   p.add("ocxo2_measured_gnss_ns_at_pps_vclock", public_ocxo2_ns);
@@ -1100,6 +1159,7 @@ void clocks_beta_pps(void) {
   p.add("ocxo2_window_checks", g_ocxo2_clock.window_checks);
   p.add("ocxo2_window_mismatches", g_ocxo2_clock.window_mismatches);
   p.add("ocxo2_window_error_ns", g_ocxo2_clock.window_error_ns);
+  payload_add_lane_forensics_flat(p, "ocxo2", ocxo2_forensics_valid, ocxo2_forensics);
 
   // DAC + servo state (live values).
   p.add("ocxo1_dac", ocxo1_dac.dac_fractional);

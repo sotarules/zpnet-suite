@@ -8,14 +8,25 @@ audit for four lanes:
   • VCLOCK — preferred raw-cycle surface is the PPS-witness phase-estimated
              PPS_VCLOCK DWT edge when present/valid; otherwise falls back to
              the lattice PPS_VCLOCK DWT edge and then firmware/Gamma actuals
-  • OCXO1  — Gamma lane-local prediction audit from TIMEBASE
-  • OCXO2  — Gamma lane-local prediction audit from TIMEBASE
+  • OCXO1  — compact firmware prediction audit from TIMEBASE, plus optional
+             Alpha-forensics DWT reconstruction when last_event_dwt is present
+  • OCXO2  — compact firmware prediction audit from TIMEBASE, plus optional
+             Alpha-forensics DWT reconstruction when last_event_dwt is present
 
 This report intentionally removes the older modulo/transport clutter.
 It focuses on actual cycles, static prediction, dynamic prediction, residuals,
 and the positive PPS→VCLOCK phase offset from the preferred VCLOCK DWT surface.
 For PPS there is no dynamic prediction surface; the dynamic columns are shown
 as "---".
+
+For OCXO lanes, the firmware prediction payload is now cross-checked against
+Alpha forensics when available:
+
+  forensic_actual = alpha_event.last_event_dwt[n] - alpha_event.last_event_dwt[n-1]
+  forensic_delta  = forensic_actual - firmware_prediction_actual
+
+A forensic_delta of zero means the prediction payload and Alpha forensic DWT
+edge subtraction agree exactly.
 
 Usage:
     python -m zpnet.tests.raw_cycles <campaign_name> [limit]
@@ -159,6 +170,23 @@ def _first_int(*values: Any) -> Optional[int]:
     return None
 
 
+def _nested_get(obj: Dict[str, Any], *path: str) -> Any:
+    cur: Any = obj
+    for key in path:
+        if not isinstance(cur, dict):
+            return None
+        cur = cur.get(key)
+    return cur
+
+
+def _first_path_int(*paths: Tuple[Dict[str, Any], Tuple[str, ...]]) -> Optional[int]:
+    for obj, path in paths:
+        out = _as_int(_nested_get(obj, *path))
+        if out is not None:
+            return out
+    return None
+
+
 def _fmt_int(v: Optional[int], width: int = 0, signed: bool = False) -> str:
     if v is None:
         s = "---"
@@ -241,6 +269,41 @@ def vclock_preferred_dwt_from_schema(root: Dict[str, Any], frag: Dict[str, Any])
     return None, "---"
 
 
+def ocxo_forensic_last_event_dwt_from_schema(root: Dict[str, Any],
+                                               frag: Dict[str, Any],
+                                               lane: str) -> Optional[int]:
+    """Return Alpha forensic last_event_dwt for an OCXO lane, if present.
+
+    TIMEBASE schema has moved over time, so accept both nested report-style
+    objects and flat migration keys.  This value is deliberately the Alpha
+    event DWT endpoint, not a live hardware counter or projected report DWT.
+    """
+    flat_keys = (
+        f"{lane}_alpha_event_last_event_dwt",
+        f"{lane}_forensics_last_event_dwt",
+        f"{lane}_last_event_dwt",
+        f"{lane}_event_dwt",
+        f"{lane}_dwt_at_edge",
+    )
+
+    flat = _first_int(*(frag.get(k) for k in flat_keys),
+                      *(root.get(k) for k in flat_keys))
+    if flat is not None:
+        return flat
+
+    # Report-style nested shapes, if TIMEBASE is carrying CLOCKS forensics.
+    return _first_path_int(
+        (frag, ("clock_forensics", lane, "alpha_event", "last_event_dwt")),
+        (root, ("clock_forensics", lane, "alpha_event", "last_event_dwt")),
+        (frag, ("forensics", lane, "alpha_event", "last_event_dwt")),
+        (root, ("forensics", lane, "alpha_event", "last_event_dwt")),
+        (frag, (lane, "alpha_event", "last_event_dwt")),
+        (root, (lane, "alpha_event", "last_event_dwt")),
+        (frag, ("clock_forensics", lane, "last_event_dwt")),
+        (root, ("clock_forensics", lane, "last_event_dwt")),
+    )
+
+
 def lane_prediction(pred: Dict[str, Any], lane: str) -> Tuple[Optional[int], Optional[int], Optional[int], Optional[int], Optional[int]]:
     actual = _first_int(pred.get(f"{lane}_actual_cycles"))
     static = _first_int(pred.get(f"{lane}_static_prediction_cycles"))
@@ -272,15 +335,16 @@ def analyze(campaign: str, limit: int = 0) -> None:
     print("Raw cycle surfaces:")
     print("  PPS    actual = physical PPS GPIO DWT delta; static prediction = previous PPS actual")
     print("  VCLOCK actual = phase-estimated PPS_VCLOCK DWT delta when valid; otherwise lattice/fallback")
-    print("  OCXO   actual/static/dynamic/residual = compact Gamma lane-local prediction audit")
+    print("  OCXO   actual/static/dynamic/residual = compact firmware prediction audit")
+    print("         fact/fΔ = Alpha-forensics DWT reconstruction and fact - actual")
     print()
 
     header = (
         f"{'pps':>6s}  "
         f"{'pps_act':>13s} {'pps_stat':>13s} {'pps_sres':>9s} {'phase':>7s}  "
         f"{'v_act':>13s} {'v_stat':>13s} {'v_sres':>8s} {'v_dyn':>13s} {'v_dres':>8s} {'vsrc':>7s}  "
-        f"{'o1_act':>13s} {'o1_stat':>13s} {'o1_sres':>8s} {'o1_dyn':>13s} {'o1_dres':>8s}  "
-        f"{'o2_act':>13s} {'o2_stat':>13s} {'o2_sres':>8s} {'o2_dyn':>13s} {'o2_dres':>8s}  "
+        f"{'o1_act':>13s} {'o1_stat':>13s} {'o1_sres':>8s} {'o1_fact':>13s} {'o1_fΔ':>8s} {'o1_dyn':>13s} {'o1_dres':>8s}  "
+        f"{'o2_act':>13s} {'o2_stat':>13s} {'o2_sres':>8s} {'o2_fact':>13s} {'o2_fΔ':>8s} {'o2_dyn':>13s} {'o2_dres':>8s}  "
         f"{'dwt_ppb':>10s}"
     )
     print(header)
@@ -288,8 +352,8 @@ def analyze(campaign: str, limit: int = 0) -> None:
         f"{'─'*6}  "
         f"{'─'*13} {'─'*13} {'─'*9} {'─'*7}  "
         f"{'─'*13} {'─'*13} {'─'*8} {'─'*13} {'─'*8} {'─'*7}  "
-        f"{'─'*13} {'─'*13} {'─'*8} {'─'*13} {'─'*8}  "
-        f"{'─'*13} {'─'*13} {'─'*8} {'─'*13} {'─'*8}  "
+        f"{'─'*13} {'─'*13} {'─'*8} {'─'*13} {'─'*8} {'─'*13} {'─'*8}  "
+        f"{'─'*13} {'─'*13} {'─'*8} {'─'*13} {'─'*8} {'─'*13} {'─'*8}  "
         f"{'─'*10}"
     )
 
@@ -300,6 +364,8 @@ def analyze(campaign: str, limit: int = 0) -> None:
     prev_physical_pps_dwt: Optional[int] = None
     prev_vclock_dwt: Optional[int] = None
     prev_pps_actual: Optional[int] = None
+    prev_ocxo1_forensic_dwt: Optional[int] = None
+    prev_ocxo2_forensic_dwt: Optional[int] = None
 
     stats: Dict[str, Welford] = {
         "pps_actual": Welford(),
@@ -310,9 +376,13 @@ def analyze(campaign: str, limit: int = 0) -> None:
         "vclock_dynamic_residual": Welford(),
         "ocxo1_actual": Welford(),
         "ocxo1_static_residual": Welford(),
+        "ocxo1_forensic_actual": Welford(),
+        "ocxo1_forensic_delta": Welford(),
         "ocxo1_dynamic_residual": Welford(),
         "ocxo2_actual": Welford(),
         "ocxo2_static_residual": Welford(),
+        "ocxo2_forensic_actual": Welford(),
+        "ocxo2_forensic_delta": Welford(),
         "ocxo2_dynamic_residual": Welford(),
     }
 
@@ -323,7 +393,11 @@ def analyze(campaign: str, limit: int = 0) -> None:
         "vclock_lattice_actual": 0,
         "vclock_prediction": 0,
         "ocxo1_prediction": 0,
+        "ocxo1_forensic_actual": 0,
+        "ocxo1_forensic_delta": 0,
         "ocxo2_prediction": 0,
+        "ocxo2_forensic_actual": 0,
+        "ocxo2_forensic_delta": 0,
     }
 
     for rec in rows:
@@ -345,6 +419,8 @@ def analyze(campaign: str, limit: int = 0) -> None:
             prev_physical_pps_dwt = None
             prev_vclock_dwt = None
             prev_pps_actual = None
+            prev_ocxo1_forensic_dwt = None
+            prev_ocxo2_forensic_dwt = None
 
         physical_pps_dwt = physical_pps_dwt_from_schema(root, frag)
         vclock_dwt, vclock_source = vclock_preferred_dwt_from_schema(root, frag)
@@ -394,6 +470,27 @@ def analyze(campaign: str, limit: int = 0) -> None:
             lane_prediction(pred, "ocxo2")
         )
 
+        ocxo1_forensic_dwt = ocxo_forensic_last_event_dwt_from_schema(root, frag, "ocxo1")
+        ocxo2_forensic_dwt = ocxo_forensic_last_event_dwt_from_schema(root, frag, "ocxo2")
+
+        ocxo1_forensic_actual: Optional[int] = None
+        if ocxo1_forensic_dwt is not None and prev_ocxo1_forensic_dwt is not None:
+            ocxo1_forensic_actual = _delta_u32(ocxo1_forensic_dwt, prev_ocxo1_forensic_dwt)
+        ocxo1_forensic_delta = (
+            ocxo1_forensic_actual - ocxo1_actual
+            if ocxo1_forensic_actual is not None and ocxo1_actual is not None
+            else None
+        )
+
+        ocxo2_forensic_actual: Optional[int] = None
+        if ocxo2_forensic_dwt is not None and prev_ocxo2_forensic_dwt is not None:
+            ocxo2_forensic_actual = _delta_u32(ocxo2_forensic_dwt, prev_ocxo2_forensic_dwt)
+        ocxo2_forensic_delta = (
+            ocxo2_forensic_actual - ocxo2_actual
+            if ocxo2_forensic_actual is not None and ocxo2_actual is not None
+            else None
+        )
+
         dwt_ppb = _as_float(frag.get("dwt_ppb"))
         coverage["rows"] += 1
         if pps_actual is not None:
@@ -406,8 +503,16 @@ def analyze(campaign: str, limit: int = 0) -> None:
             coverage["vclock_prediction"] += 1
         if ocxo1_actual is not None or ocxo1_static is not None or ocxo1_dynamic is not None:
             coverage["ocxo1_prediction"] += 1
+        if ocxo1_forensic_actual is not None:
+            coverage["ocxo1_forensic_actual"] += 1
+        if ocxo1_forensic_delta is not None:
+            coverage["ocxo1_forensic_delta"] += 1
         if ocxo2_actual is not None or ocxo2_static is not None or ocxo2_dynamic is not None:
             coverage["ocxo2_prediction"] += 1
+        if ocxo2_forensic_actual is not None:
+            coverage["ocxo2_forensic_actual"] += 1
+        if ocxo2_forensic_delta is not None:
+            coverage["ocxo2_forensic_delta"] += 1
 
         add_optional(stats["pps_actual"], pps_actual)
         add_optional(stats["pps_static_residual"], pps_static_res)
@@ -417,9 +522,13 @@ def analyze(campaign: str, limit: int = 0) -> None:
         add_optional(stats["vclock_dynamic_residual"], vclock_dynamic_res)
         add_optional(stats["ocxo1_actual"], ocxo1_actual)
         add_optional(stats["ocxo1_static_residual"], ocxo1_static_res)
+        add_optional(stats["ocxo1_forensic_actual"], ocxo1_forensic_actual)
+        add_optional(stats["ocxo1_forensic_delta"], ocxo1_forensic_delta)
         add_optional(stats["ocxo1_dynamic_residual"], ocxo1_dynamic_res)
         add_optional(stats["ocxo2_actual"], ocxo2_actual)
         add_optional(stats["ocxo2_static_residual"], ocxo2_static_res)
+        add_optional(stats["ocxo2_forensic_actual"], ocxo2_forensic_actual)
+        add_optional(stats["ocxo2_forensic_delta"], ocxo2_forensic_delta)
         add_optional(stats["ocxo2_dynamic_residual"], ocxo2_dynamic_res)
 
         print(
@@ -428,8 +537,10 @@ def analyze(campaign: str, limit: int = 0) -> None:
             f"{_fmt_int(vclock_actual, 13)} {_fmt_int(vclock_static, 13)} {_fmt_int(vclock_static_res, 8, signed=True)} "
             f"{_fmt_int(vclock_dynamic, 13)} {_fmt_int(vclock_dynamic_res, 8, signed=True)} {_fmt_str(vclock_source, 7)}  "
             f"{_fmt_int(ocxo1_actual, 13)} {_fmt_int(ocxo1_static, 13)} {_fmt_int(ocxo1_static_res, 8, signed=True)} "
+            f"{_fmt_int(ocxo1_forensic_actual, 13)} {_fmt_int(ocxo1_forensic_delta, 8, signed=True)} "
             f"{_fmt_int(ocxo1_dynamic, 13)} {_fmt_int(ocxo1_dynamic_res, 8, signed=True)}  "
             f"{_fmt_int(ocxo2_actual, 13)} {_fmt_int(ocxo2_static, 13)} {_fmt_int(ocxo2_static_res, 8, signed=True)} "
+            f"{_fmt_int(ocxo2_forensic_actual, 13)} {_fmt_int(ocxo2_forensic_delta, 8, signed=True)} "
             f"{_fmt_int(ocxo2_dynamic, 13)} {_fmt_int(ocxo2_dynamic_res, 8, signed=True)}  "
             f"{_fmt_float(dwt_ppb, 10, 3, signed=True)}"
         )
@@ -441,6 +552,10 @@ def analyze(campaign: str, limit: int = 0) -> None:
             prev_vclock_dwt = vclock_dwt
         if pps_actual is not None:
             prev_pps_actual = pps_actual
+        if ocxo1_forensic_dwt is not None:
+            prev_ocxo1_forensic_dwt = ocxo1_forensic_dwt
+        if ocxo2_forensic_dwt is not None:
+            prev_ocxo2_forensic_dwt = ocxo2_forensic_dwt
 
         shown += 1
         if limit and shown >= limit:
@@ -459,7 +574,11 @@ def analyze(campaign: str, limit: int = 0) -> None:
     print(f"  VCLOCK lattice actual         = {coverage['vclock_lattice_actual']:,}")
     print(f"  VCLOCK prediction rows        = {coverage['vclock_prediction']:,}")
     print(f"  OCXO1 prediction rows         = {coverage['ocxo1_prediction']:,}")
+    print(f"  OCXO1 forensic actual rows    = {coverage['ocxo1_forensic_actual']:,}")
+    print(f"  OCXO1 forensic delta rows     = {coverage['ocxo1_forensic_delta']:,}")
     print(f"  OCXO2 prediction rows         = {coverage['ocxo2_prediction']:,}")
+    print(f"  OCXO2 forensic actual rows    = {coverage['ocxo2_forensic_actual']:,}")
+    print(f"  OCXO2 forensic delta rows     = {coverage['ocxo2_forensic_delta']:,}")
     print()
 
     print("Summary")
@@ -472,9 +591,13 @@ def analyze(campaign: str, limit: int = 0) -> None:
     _print_welford("VCLOCK dynamic residual", stats["vclock_dynamic_residual"])
     _print_welford("OCXO1 actual cycles", stats["ocxo1_actual"])
     _print_welford("OCXO1 static residual", stats["ocxo1_static_residual"])
+    _print_welford("OCXO1 forensic actual", stats["ocxo1_forensic_actual"])
+    _print_welford("OCXO1 forensic delta", stats["ocxo1_forensic_delta"])
     _print_welford("OCXO1 dynamic residual", stats["ocxo1_dynamic_residual"])
     _print_welford("OCXO2 actual cycles", stats["ocxo2_actual"])
     _print_welford("OCXO2 static residual", stats["ocxo2_static_residual"])
+    _print_welford("OCXO2 forensic actual", stats["ocxo2_forensic_actual"])
+    _print_welford("OCXO2 forensic delta", stats["ocxo2_forensic_delta"])
     _print_welford("OCXO2 dynamic residual", stats["ocxo2_dynamic_residual"])
     print()
 
@@ -484,7 +607,9 @@ def analyze(campaign: str, limit: int = 0) -> None:
     print("  • vsrc=phase means the new PPS-witness estimate supplied the VCLOCK actual.")
     print("  • phase is the positive PPS→VCLOCK DWT offset from the preferred VCLOCK edge.")
     print("  • PPS has no dynamic prediction surface; pps_sres is actual minus previous PPS actual.")
-    print("  • VCLOCK residuals are recomputed against Gamma predictions when the phase-estimated actual is used.")
+    print("  • VCLOCK residuals are recomputed against firmware predictions when the preferred DWT actual is used.")
+    print("  • OCXO fact columns reconstruct cycles from Alpha forensic last_event_dwt when present.")
+    print("  • OCXO fΔ = forensic_actual - prediction_actual; zero means exact agreement.")
     print()
 
 
