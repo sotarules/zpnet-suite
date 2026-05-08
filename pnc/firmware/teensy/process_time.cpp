@@ -1,16 +1,31 @@
 // ============================================================================
-// process_time.cpp — transitional static PPS/VCLOCK interpolation layer
+// process_time.cpp — legacy TIME process, static PPS/VCLOCK interpolation only
 // ============================================================================
 //
-// process_time is on the retirement path.  This file now preserves the legacy
-// API/command surface without operating any dynamic CPS servo or 100 Hz / 1 kHz
-// prediction-update machinery.
+// Step 2 of process_time retirement.
 //
-// Operational doctrine:
-//   • CLOCKS/Alpha owns the PPS/VCLOCK anchor and supplies the static
-//     one-second DWT cycles-per-GNSS-second denominator.
-//   • TIME interpolates linearly from that anchor using DWT_CYCCNT.
-//   • No dynamic rebasing, no TimePop refinement client, no servo state.
+// This file deliberately remains the owner of the legacy TIME anchor and
+// time_clock_snapshot() state for now because that transition is operationally
+// sensitive.  This iteration winds down only one more safe layer: TIME no
+// longer keeps its own static DWT prediction history or exposes a prediction
+// history command.  CLOCKS/Alpha owns the real static prediction audit, and
+// CLOCKS/Beta publishes that audit in TIMEBASE_FRAGMENT.
+//
+// Retired here:
+//   • dynamic CPS servo / rebasing / command surface
+//   • 100 Hz / 1 kHz refinement client
+//   • local TIME DWT prediction history ring
+//   • prediction-history command
+//
+// Preserved here:
+//   • time_anchor_snapshot() ownership
+//   • time_valid(), time_pps_count(), time_gnss_ns_now()
+//   • time_dwt_to_gnss_ns() / time_gnss_ns_to_dwt()
+//   • time_clock_snapshot(), time_clock_update(), time_clock_ns_at_dwt()
+//   • static/no-op compatibility symbols required by time.h callers
+//
+// CLOCKS/Alpha feeds this module the PPS/VCLOCK anchor and per-lane update
+// facts.  TIME interpolates linearly from those facts using DWT_CYCCNT.
 //
 // All DWT inputs are already event-coordinate values.  This module performs no
 // latency adjustment.
@@ -27,12 +42,9 @@
 
 #include <stdint.h>
 #include <stdbool.h>
-#include <stdio.h>
-#include <stdlib.h>
 
 static constexpr uint64_t TIME_NS_PER_SECOND_U64 = 1000000000ULL;
 static constexpr uint64_t MAX_AGE_NS = 3000000000ULL;
-static constexpr uint32_t PREDICTION_HISTORY_CAPACITY = 32;
 
 // ============================================================================
 // Anchor state (written by CLOCKS/Alpha, read by time readers)
@@ -232,7 +244,17 @@ bool time_clock_snapshot(time_clock_id_t clock,
 }
 
 // ============================================================================
-// Static DWT prediction history
+// Static DWT prediction compatibility snapshot
+// ============================================================================
+//
+// TIME no longer owns a prediction history surface.  CLOCKS/Alpha owns the real
+// per-lane static prediction audit, and CLOCKS/Beta publishes that audit in
+// TIMEBASE_FRAGMENT.  Keep this tiny single-value compatibility snapshot so
+// remaining time.h callers can still compile while process_time is wound down.
+//
+// This snapshot is intentionally local to the TIME anchor and is not a campaign
+// statistical authority.  The prior completed PPS/VCLOCK interval remains the
+// next prediction, but no ring/history is retained here.
 // ============================================================================
 
 struct prediction_state_t {
@@ -244,10 +266,6 @@ struct prediction_state_t {
   uint32_t actual_cycles_last = 0;
   int32_t  residual_cycles_last = 0;
   uint32_t predicted_cycles_next = 0;
-
-  uint32_t history_head = 0;
-  uint32_t history_count = 0;
-  time_dwt_prediction_record_t history[PREDICTION_HISTORY_CAPACITY] = {};
 };
 
 static prediction_state_t prediction = {};
@@ -262,27 +280,14 @@ static void prediction_reset(void) {
   prediction.actual_cycles_last = 0;
   prediction.residual_cycles_last = 0;
   prediction.predicted_cycles_next = 0;
-  prediction.history_head = 0;
-  prediction.history_count = 0;
-  for (uint32_t i = 0; i < PREDICTION_HISTORY_CAPACITY; i++) {
-    prediction.history[i] = time_dwt_prediction_record_t{};
-  }
 
   dmb();
   prediction.seq++;
 }
 
-static void prediction_push_record(const time_dwt_prediction_record_t& rec) {
-  prediction.history[prediction.history_head] = rec;
-  prediction.history_head = (prediction.history_head + 1U) % PREDICTION_HISTORY_CAPACITY;
-  if (prediction.history_count < PREDICTION_HISTORY_CAPACITY) {
-    prediction.history_count++;
-  }
-}
-
 static void prediction_observe_actual(uint32_t pps_vclock_count,
-                                      uint32_t dwt_at_pps_vclock,
-                                      uint32_t counter32_at_pps_vclock,
+                                      uint32_t,
+                                      uint32_t,
                                       uint32_t actual_cycles) {
   if (actual_cycles == 0) return;
 
@@ -299,25 +304,20 @@ static void prediction_observe_actual(uint32_t pps_vclock_count,
   prediction.predicted_cycles_last = predicted_for_this_second;
   prediction.actual_cycles_last = actual_cycles;
   prediction.residual_cycles_last = residual;
-  prediction.predicted_cycles_next = actual_cycles;  // static random-walk predictor
+  prediction.predicted_cycles_next = actual_cycles;  // static random-walk compatibility
   prediction.valid = had_prediction;
-
-  time_dwt_prediction_record_t rec{};
-  rec.pps_vclock_count = pps_vclock_count;
-  rec.dwt_at_pps_vclock = dwt_at_pps_vclock;
-  rec.counter32_at_pps_vclock = counter32_at_pps_vclock;
-  rec.predicted_cycles = predicted_for_this_second;
-  rec.actual_cycles = actual_cycles;
-  rec.residual_cycles = residual;
-  rec.valid = had_prediction;
-  prediction_push_record(rec);
 
   dmb();
   prediction.seq++;
 }
 
 // ============================================================================
-// Legacy dynamic-CPS compatibility — static/no-op implementation
+// Legacy dynamic-CPS compatibility symbols — retired/static implementation
+// ============================================================================
+//
+// These symbols remain only because older interrupt/report code may still link
+// against them.  They do not operate a servo, collect history, or affect
+// projection.  The static TIME anchor is the only denominator used here.
 // ============================================================================
 
 void time_dynamic_cps_reset(void) {}
@@ -582,8 +582,8 @@ time_dwt_prediction_snapshot_t time_dwt_prediction_snapshot(void) {
     out.actual_cycles_last = prediction.actual_cycles_last;
     out.residual_cycles_last = prediction.residual_cycles_last;
     out.predicted_cycles_next = prediction.predicted_cycles_next;
-    out.history_count = prediction.history_count;
-    out.history_capacity = PREDICTION_HISTORY_CAPACITY;
+    out.history_count = 0;
+    out.history_capacity = 0;
 
     dmb();
     const uint32_t s2 = prediction.seq;
@@ -593,42 +593,9 @@ time_dwt_prediction_snapshot_t time_dwt_prediction_snapshot(void) {
   return time_dwt_prediction_snapshot_t{};
 }
 
-uint32_t time_dwt_prediction_history(time_dwt_prediction_record_t* out_records,
-                                     uint32_t max_records) {
-  if (!out_records || max_records == 0) return 0;
-
-  time_dwt_prediction_record_t local[PREDICTION_HISTORY_CAPACITY];
-  uint32_t count = 0;
-  uint32_t head = 0;
-
-  for (int attempt = 0; attempt < 4; attempt++) {
-    const uint32_t s1 = prediction.seq;
-    dmb();
-
-    count = prediction.history_count;
-    head = prediction.history_head;
-    if (count > PREDICTION_HISTORY_CAPACITY) count = PREDICTION_HISTORY_CAPACITY;
-    for (uint32_t i = 0; i < count; i++) local[i] = prediction.history[i];
-
-    dmb();
-    const uint32_t s2 = prediction.seq;
-    if (s1 == s2 && (s1 & 1u) == 0u) break;
-    if (attempt == 3) return 0;
-  }
-
-  const uint32_t n = (count < max_records) ? count : max_records;
-  const uint32_t start = (count < PREDICTION_HISTORY_CAPACITY)
-      ? 0U
-      : head;
-
-  const uint32_t skip = count - n;
-  for (uint32_t i = 0; i < n; i++) {
-    const uint32_t logical = skip + i;
-    const uint32_t idx = (start + logical) % PREDICTION_HISTORY_CAPACITY;
-    out_records[i] = local[idx];
-  }
-
-  return n;
+uint32_t time_dwt_prediction_history(time_dwt_prediction_record_t*,
+                                     uint32_t) {
+  return 0;
 }
 
 bool time_dwt_prediction_valid(void) {
@@ -652,7 +619,12 @@ int32_t time_dwt_prediction_residual_cycles(void) {
 }
 
 // ============================================================================
-// Dynamic CPS compatibility accessors — static aliases
+// Dynamic-CPS compatibility accessors — static aliases
+// ============================================================================
+//
+// Expose the current static anchor through the old snapshot shape so remaining
+// callers compile during the retirement window.  The reported object is
+// witness-only and projection-disabled; net adjustment is always zero.
 // ============================================================================
 
 time_dynamic_cps_snapshot_t time_dynamic_cps_snapshot(void) {
@@ -748,11 +720,10 @@ void process_time_init(void) {
 static Payload cmd_report(const Payload&) {
   const time_anchor_snapshot_t a = time_anchor_snapshot();
   const time_dwt_prediction_snapshot_t p = time_dwt_prediction_snapshot();
-  const time_dynamic_cps_snapshot_t c = time_dynamic_cps_snapshot();
 
   Payload out;
-  out.add("model", "TIME_STATIC_TRANSITION_REPORT");
-  out.add("note", "dynamic CPS retired; projection uses static PPS/VCLOCK denominator");
+  out.add("model", "TIME_STEP2_STATIC_PROJECTION_REPORT");
+  out.add("note", "process_time still owns anchor/projection; local prediction history retired");
   out.add("time_valid", time_valid());
   out.add("anchor_ok", a.ok);
   out.add("anchor_valid", a.valid);
@@ -764,11 +735,8 @@ static Payload cmd_report(const Payload&) {
   out.add("predicted_cycles_next", p.predicted_cycles_next);
   out.add("actual_cycles_last", p.actual_cycles_last);
   out.add("residual_cycles_last", p.residual_cycles_last);
+  out.add("prediction_history_retired", true);
   out.add("dynamic_cps_retired", true);
-  out.add("dynamic_cps_valid", c.valid);
-  out.add("dynamic_cps_base_cycles", c.base_cycles);
-  out.add("dynamic_cps_current_cycles", c.current_cycles);
-  out.add("dynamic_cps_net_adjustment_cycles", c.net_adjustment_cycles);
   return out;
 }
 
@@ -789,62 +757,22 @@ static Payload cmd_anchor_report(const Payload&) {
 static Payload cmd_prediction_report(const Payload&) {
   const time_dwt_prediction_snapshot_t p = time_dwt_prediction_snapshot();
   Payload out;
-  out.add("model", "TIME_STATIC_DWT_PREDICTION_REPORT");
+  out.add("model", "TIME_STATIC_DWT_PREDICTION_COMPAT_REPORT");
   out.add("prediction_valid", p.valid);
   out.add("prediction_pps_vclock_count", p.pps_vclock_count);
   out.add("predicted_cycles_last", p.predicted_cycles_last);
   out.add("actual_cycles_last", p.actual_cycles_last);
   out.add("residual_cycles_last", p.residual_cycles_last);
   out.add("predicted_cycles_next", p.predicted_cycles_next);
+  out.add("history_retired", true);
   return out;
 }
 
-static Payload cmd_dynamic_cps_report(const Payload&) {
-  const time_dynamic_cps_snapshot_t c = time_dynamic_cps_snapshot();
-  Payload out;
-  out.add("model", "TIME_DYNAMIC_CPS_RETIRED_REPORT");
-  out.add("dynamic_cps_retired", true);
-  out.add("dynamic_cps_valid", c.valid);
-  out.add("dynamic_cps_pvc_sequence", c.pvc_sequence);
-  out.add("dynamic_cps_current_pvc_dwt_at_edge", c.current_pvc_dwt_at_edge);
-  out.add("dynamic_cps_base_cycles", c.base_cycles);
-  out.add("dynamic_cps_current_cycles", c.current_cycles);
-  out.add("dynamic_cps_net_adjustment_cycles", c.net_adjustment_cycles);
-  return out;
-}
-
-static Payload cmd_prediction_history(const Payload&) {
-  Payload out;
-  out.add("model", "TIME_STATIC_DWT_PREDICTION_HISTORY");
-  out.add("count", time_dwt_prediction_snapshot().history_count);
-  out.add("capacity", (uint32_t)PREDICTION_HISTORY_CAPACITY);
-  out.add("note", "compact report only; history array remains available through API");
-  return out;
-}
-
-static Payload cmd_dynamic_cps_history(const Payload&) {
-  Payload out;
-  out.add("model", "TIME_DYNAMIC_CPS_HISTORY_RETIRED");
-  out.add("count", (uint32_t)0);
-  out.add("note", "dynamic CPS history retired");
-  return out;
-}
-
-static Payload cmd_dynamic_cps_first_ms(const Payload&) {
-  Payload out;
-  out.add("model", "TIME_DYNAMIC_CPS_FIRST_MS_RETIRED");
-  out.add("note", "dynamic CPS first-ms audit retired");
-  return out;
-}
 
 static const process_command_entry_t TIME_COMMANDS[] = {
   { "REPORT",                cmd_report               },
   { "ANCHOR_REPORT",         cmd_anchor_report        },
   { "PREDICTION_REPORT",     cmd_prediction_report    },
-  { "PREDICTION_HISTORY",    cmd_prediction_history   },
-  { "DYNAMIC_CPS_REPORT",    cmd_dynamic_cps_report   },
-  { "DYNAMIC_CPS_HISTORY",   cmd_dynamic_cps_history  },
-  { "DYNAMIC_CPS_FIRST_MS",  cmd_dynamic_cps_first_ms },
   { nullptr,                 nullptr                  }
 };
 

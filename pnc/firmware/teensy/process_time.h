@@ -3,17 +3,16 @@
 #include "time.h"
 
 // ============================================================================
-// process_time.h — legacy process wrapper for the time subsystem
+// process_time.h — legacy process wrapper for static TIME projection
 // ============================================================================
 //
-// time.h remains the functional interface.  process_time currently preserves
-// the legacy lifecycle and command registration surface while the timing system
-// migrates toward CLOCKS-owned clock truth and stateless TIME projection.
+// time.h remains the functional interface.
 //
-// First-pass reduction keeps the exported process_time_init() and
-// process_time_register() entry points, but the command/report payloads are now
-// intentionally compact.  Heavy diagnostic/history reports are retired here and
-// should move to their rightful subsystem owners before process_time disappears.
+// This wrapper still exports process_time_init() and process_time_register() so
+// existing startup code and command routing survive while process_time is
+// retired incrementally.  The TIME process still owns the compatibility anchor
+// and lane projection state, but the local prediction history and dynamic-CPS
+// command surfaces are gone.
 // ============================================================================
 
 void process_time_init(void);
