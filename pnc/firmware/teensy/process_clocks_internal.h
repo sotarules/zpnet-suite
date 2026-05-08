@@ -1,5 +1,5 @@
 // ============================================================================
-// process_clocks_internal.h - Shared Internal State (Alpha <-> Beta <-> Gamma)
+// process_clocks_internal.h - Shared Internal State (Alpha <-> Beta)
 // ============================================================================
 //
 // Doctrine:
@@ -58,18 +58,18 @@
 //                                     ledger sampled at the same PPS/VCLOCK edge.
 //   - g_dwt_at_pps_vclock             DWT coordinate of the selected
 //                                     PPS/VCLOCK edge.
-//   - g_dwt_cycles_between_pps_vclock Difference of consecutive selected
-//                                     PPS/VCLOCK DWT coordinates.
+//   - g_dwt_cycles_between_pps_vclock Effective PPS/GPIO-derived DWT
+//                                     cycles per GNSS second.
 //   - g_counter32_at_pps_vclock       Synthetic VCLOCK counter identity of
 //                                     the selected PPS/VCLOCK edge.
 //
 //
-// Gamma role:
+// Static prediction role:
 //
-//   Gamma owns generalized next-second DWT prediction for VCLOCK, OCXO1, and
-//   OCXO2. Alpha and process_interrupt author the event/cadence facts; Gamma
-//   converts those facts into static and dynamic per-clock-second prediction
-//   surfaces. Beta publishes the resulting facts.
+//   Dynamic 100 Hz prediction has been retired. Alpha now records the prior
+//   completed one-second DWT interval as the static prediction surface. For
+//   VCLOCK this is the PPS/GPIO witness interval. For OCXO lanes this is the
+//   lane-local OCXO edge-to-edge interval. Beta publishes the compact audit.
 //
 // VCLOCK as measured peer of OCXO:
 //
@@ -141,10 +141,11 @@ extern volatile uint32_t g_dwt_at_pps_vclock;
 // Advanced in pps_selector_callback by the latest measurement.
 extern volatile uint64_t g_dwt_cycle_count_total;
 
-// Most recent one-second measurement of DWT cycles between consecutive
-// selected PPS/VCLOCK epochs (snap[n].dwt_at_edge - snap[n-1].dwt_at_edge).
-// These epochs are VCLOCK-domain edges selected by physical PPS pulses.
-// Feeds dwt_effective_cycles_per_pps_vclock_second().
+// Most recent one-second DWT/GNSS slope measurement.  Preferred source is the
+// physical PPS/GPIO witness interval, because the QTimer/VCLOCK event rail is
+// quantized to a 4-cycle lattice.  The legacy name remains while downstream
+// callers migrate; semantically this is the effective DWT cycles per GNSS
+// second.
 extern volatile uint32_t g_dwt_cycles_between_pps_vclock;
 
 // process_interrupt-authored synthetic 32-bit VCLOCK identity of the most

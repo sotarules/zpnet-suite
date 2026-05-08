@@ -4,21 +4,21 @@
 #include <stdint.h>
 
 // ============================================================================
-// time.cpp -- stateless CLOCKS/Gamma facade
+// time.cpp -- stateless CLOCKS/static-prediction facade
 // ============================================================================
 //
 // TIME owns no state here.
 // TIME does not read DWT.
 // TIME does not install anchors.
 //
-// The caller supplies a DWT coordinate. CLOCKS supplies the clock-domain
-// nanosecond ledger. Gamma supplies the current lane-local DWT-cycle
-// prediction. This file only performs projection math.
+// The caller supplies a DWT coordinate.  The transitional process_time clock
+// snapshot supplies the most recent per-lane basis; CLOCKS static prediction is
+// used only as a fallback denominator.  Gamma/dynamic prediction is retired.
 // ============================================================================
 
 static constexpr uint64_t TIME_NS_PER_SECOND_U64 = 1000000000ULL;
 
-static uint64_t time_lane_ns(time_clock_id_t clock) {
+static uint64_t time_lane_fallback_ns(time_clock_id_t clock) {
   if (clock == time_clock_id_t::OCXO1) {
     return clocks_ocxo1_measured_gnss_ns_now();
   }
@@ -28,20 +28,33 @@ static uint64_t time_lane_ns(time_clock_id_t clock) {
   return clocks_gnss_ns_now();
 }
 
-static clocks_gamma_prediction_snapshot_t time_lane_gamma(time_clock_id_t clock) {
-  clocks_gamma_prediction_snapshot_t snap = {};
-  (void)clocks_gamma_snapshot(clock, &snap);
-  return snap;
+static bool time_lane_snapshot(time_clock_id_t clock,
+                               time_clock_snapshot_t& out) {
+  if (time_clock_snapshot(clock, &out) && out.valid) {
+    return true;
+  }
+
+  out = time_clock_snapshot_t{};
+  out.valid = false;
+  out.ns_at_update = time_lane_fallback_ns(clock);
+  out.predicted_dwt_cycles_per_second = DWT_EXPECTED_PER_PPS;
+  return false;
 }
 
-static uint32_t time_lane_basis_dwt(time_clock_id_t clock) {
-  const clocks_gamma_prediction_snapshot_t snap = time_lane_gamma(clock);
-  return snap.second_start_dwt;
-}
+static uint32_t time_lane_dwt_cycles_per_second(time_clock_id_t clock,
+                                                const time_clock_snapshot_t& basis) {
+  if (basis.prediction_valid && basis.predicted_dwt_cycles_per_second != 0) {
+    return basis.predicted_dwt_cycles_per_second;
+  }
 
-static uint32_t time_lane_dwt_cycles_per_second(time_clock_id_t clock) {
-  const clocks_gamma_prediction_snapshot_t snap = time_lane_gamma(clock);
-  return snap.current_dynamic_prediction_cycles;
+  clocks_static_prediction_snapshot_t pred{};
+  if (clocks_static_prediction_snapshot(clock, &pred)) {
+    if (pred.actual_cycles != 0) return pred.actual_cycles;
+    if (pred.static_prediction_cycles != 0) return pred.static_prediction_cycles;
+  }
+
+  const uint32_t dwt_cps = clocks_dwt_cycles_per_gnss_second();
+  return dwt_cps ? dwt_cps : (uint32_t)DWT_EXPECTED_PER_PPS;
 }
 
 static int64_t time_mul_div_round_i64(int64_t value,
@@ -74,29 +87,39 @@ static int64_t time_ns_to_cycles_delta(int64_t ns,
 
 static uint64_t time_project_dwt_to_lane_ns(time_clock_id_t clock,
                                             uint32_t dwt_cycle_count) {
-  const uint64_t basis_ns = time_lane_ns(clock);
-  const uint32_t basis_dwt = time_lane_basis_dwt(clock);
-  const uint32_t dwt_cycles_per_second = time_lane_dwt_cycles_per_second(clock);
+  time_clock_snapshot_t basis{};
+  if (!time_lane_snapshot(clock, basis)) {
+    return basis.ns_at_update;
+  }
 
-  const int32_t dwt_delta = (int32_t)(dwt_cycle_count - basis_dwt);
+  const uint32_t dwt_cycles_per_second =
+      time_lane_dwt_cycles_per_second(clock, basis);
+  if (dwt_cycles_per_second == 0) return basis.ns_at_update;
+
+  const int32_t dwt_delta = (int32_t)(dwt_cycle_count - basis.dwt_at_update);
   const int64_t ns_delta = time_cycles_to_ns_delta(dwt_delta,
                                                    dwt_cycles_per_second);
-  return (uint64_t)((int64_t)basis_ns + ns_delta);
+  return (uint64_t)((int64_t)basis.ns_at_update + ns_delta);
 }
 
 static uint32_t time_project_lane_ns_to_dwt(time_clock_id_t clock,
                                             uint64_t target_ns) {
-  const uint64_t basis_ns = time_lane_ns(clock);
-  const uint32_t basis_dwt = time_lane_basis_dwt(clock);
-  const uint32_t dwt_cycles_per_second = time_lane_dwt_cycles_per_second(clock);
+  time_clock_snapshot_t basis{};
+  if (!time_lane_snapshot(clock, basis)) {
+    return 0;
+  }
 
-  const int64_t ns_delta = (target_ns >= basis_ns)
-      ? (int64_t)(target_ns - basis_ns)
-      : -(int64_t)(basis_ns - target_ns);
+  const uint32_t dwt_cycles_per_second =
+      time_lane_dwt_cycles_per_second(clock, basis);
+  if (dwt_cycles_per_second == 0) return 0;
+
+  const int64_t ns_delta = (target_ns >= basis.ns_at_update)
+      ? (int64_t)(target_ns - basis.ns_at_update)
+      : -(int64_t)(basis.ns_at_update - target_ns);
 
   const int64_t cycle_delta = time_ns_to_cycles_delta(ns_delta,
                                                       dwt_cycles_per_second);
-  return basis_dwt + (uint32_t)cycle_delta;
+  return basis.dwt_at_update + (uint32_t)cycle_delta;
 }
 
 // Bridge-period definition. process_time.cpp currently defines this symbol too;

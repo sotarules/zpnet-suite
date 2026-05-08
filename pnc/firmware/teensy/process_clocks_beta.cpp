@@ -407,30 +407,8 @@ static void publish_freq(Payload& p, const char* clock_name, double ppb_value) {
 static void prediction_add_lane_summary(Payload& prediction,
                                         const char* prefix,
                                         time_clock_id_t clock) {
-  clocks_gamma_prediction_snapshot_t g{};
-  (void)clocks_gamma_snapshot(clock, &g);
-
-  const uint32_t static_prediction_cycles =
-      g.completed_static_prediction_cycles;
-  const uint32_t dynamic_final_prediction_cycles =
-      g.completed_dynamic_prediction_cycles;
-  const uint32_t actual_cycles =
-      g.completed_actual_dwt_cycles_between_edges;
-
-  const bool have_completed_prediction =
-      g.completed_edge_count >= 2 &&
-      static_prediction_cycles != 0 &&
-      dynamic_final_prediction_cycles != 0 &&
-      actual_cycles != 0;
-
-  const int32_t static_residual_cycles = have_completed_prediction
-      ? (int32_t)((int64_t)actual_cycles -
-                  (int64_t)static_prediction_cycles)
-      : 0;
-  const int32_t dynamic_residual_cycles = have_completed_prediction
-      ? (int32_t)((int64_t)actual_cycles -
-                  (int64_t)dynamic_final_prediction_cycles)
-      : 0;
+  clocks_static_prediction_snapshot_t s{};
+  (void)clocks_static_prediction_snapshot(clock, &s);
 
   char key[96];
   auto add_u32 = [&](const char* suffix, uint32_t value) {
@@ -441,75 +419,29 @@ static void prediction_add_lane_summary(Payload& prediction,
     snprintf(key, sizeof(key), "%s_%s", prefix, suffix);
     prediction.add(key, value);
   };
+  auto add_bool = [&](const char* suffix, bool value) {
+    snprintf(key, sizeof(key), "%s_%s", prefix, suffix);
+    prediction.add(key, value);
+  };
 
-  add_u32("static_prediction_cycles", static_prediction_cycles);
-  add_u32("dynamic_final_prediction_cycles", dynamic_final_prediction_cycles);
-  add_u32("actual_cycles", actual_cycles);
-  add_i32("static_residual_cycles", static_residual_cycles);
-  add_i32("dynamic_residual_cycles", dynamic_residual_cycles);
+  add_bool("static_prediction_valid", s.valid);
+  add_u32("completed_interval_count", s.completed_interval_count);
+  add_u32("static_prediction_cycles", s.static_prediction_cycles);
+  add_u32("actual_cycles", s.actual_cycles);
+  add_i32("static_residual_cycles", s.static_residual_cycles);
 }
 
 static void payload_add_prediction_summary(Payload& p) {
   Payload prediction;
 
-  // Compact per-TIMEBASE-row prediction audit.  This intentionally publishes
-  // only the completed lane-local second facts needed for campaign analysis.
-  //
-  // Static prediction is the "before" value: the random-walk prediction Gamma
-  // carried into the second.  Dynamic-final prediction is the "after" value:
-  // the final estimate after the 100 Hz courtroom accepted/rejected samples.
-  //
-  // The detailed courtroom samples remain available through
-  // CLOCKS.PREDICTION_DETAIL; TIMEBASE_FRAGMENT keeps only the compact audit
-  // surface so long campaigns remain queryable.
+  // Compact per-TIMEBASE-row static prediction audit.  Dynamic 100 Hz
+  // prediction has been retired; the prior completed one-second DWT interval
+  // is the only operational next-second prediction surface.
   prediction_add_lane_summary(prediction, "vclock", time_clock_id_t::VCLOCK);
   prediction_add_lane_summary(prediction, "ocxo1",  time_clock_id_t::OCXO1);
   prediction_add_lane_summary(prediction, "ocxo2",  time_clock_id_t::OCXO2);
 
   p.add_object("prediction", prediction);
-}
-
-static void payload_add_gamma_report_lane(Payload& p,
-                                          const char* name,
-                                          time_clock_id_t clock) {
-  clocks_gamma_prediction_snapshot_t g{};
-  (void)clocks_gamma_snapshot(clock, &g);
-
-  Payload lane;
-  lane.add("completed_edge_count", g.completed_edge_count);
-  lane.add("completed_static_prediction_cycle_count", g.completed_static_prediction_cycles);
-  lane.add("completed_dynamic_prediction_cycle_count", g.completed_dynamic_prediction_cycles);
-  lane.add("completed_actual_dwt_cycles_between_edges", g.completed_actual_dwt_cycles_between_edges);
-  lane.add("completed_match_count", g.completed_match_count);
-  lane.add("completed_adjust_count", g.completed_adjust_count);
-  lane.add("completed_ignored_count", g.completed_ignored_count);
-  lane.add("completed_ignored_min_error_cycles", g.completed_ignored_min_error_cycles);
-  lane.add("completed_ignored_max_error_cycles", g.completed_ignored_max_error_cycles);
-  lane.add("completed_last_error_cycles", g.completed_last_error_cycles);
-
-  lane.add("edge_count", g.edge_count);
-  lane.add("second_start_dwt", g.second_start_dwt);
-  lane.add("current_static_prediction_cycle_count", g.current_static_prediction_cycles);
-  lane.add("current_dynamic_prediction_cycle_count", g.current_dynamic_prediction_cycles);
-  lane.add("current_sample_count", g.current_sample_count);
-  lane.add("current_match_count", g.current_match_count);
-  lane.add("current_adjust_count", g.current_adjust_count);
-  lane.add("current_ignored_count", g.current_ignored_count);
-  lane.add("current_ignored_min_error_cycles", g.current_ignored_min_error_cycles);
-  lane.add("current_ignored_max_error_cycles", g.current_ignored_max_error_cycles);
-  lane.add("current_last_error_cycles", g.current_last_error_cycles);
-  lane.add("current_last_expected_dwt", g.current_last_expected_dwt);
-  lane.add("current_last_sample_dwt", g.current_last_sample_dwt);
-
-  p.add_object(name, lane);
-}
-
-static void payload_add_gamma_report(Payload& p) {
-  Payload gamma;
-  payload_add_gamma_report_lane(gamma, "vclock", time_clock_id_t::VCLOCK);
-  payload_add_gamma_report_lane(gamma, "ocxo1",  time_clock_id_t::OCXO1);
-  payload_add_gamma_report_lane(gamma, "ocxo2",  time_clock_id_t::OCXO2);
-  p.add_object("gamma_prediction", gamma);
 }
 
 // ============================================================================
@@ -1108,10 +1040,9 @@ void clocks_beta_pps(void) {
         (int32_t)((int64_t)g_dwt_cycles_between_pps_vclock -
                   (int64_t)DWT_EXPECTED_PER_PPS));
 
-  // Compact structured Gamma prediction surface.  The detailed courtroom
-  // samples remain available through CLOCKS.PREDICTION_DETAIL; the older
-  // top-level prediction aliases were removed from TIMEBASE_FRAGMENT to keep
-  // the per-second payload small enough for stable transport.
+  // Compact static prediction surface.  Dynamic 100 Hz prediction and Gamma
+  // courtroom detail have been retired; TIMEBASE now publishes only the prior
+  // interval prediction, actual interval, and residual.
   payload_add_prediction_summary(p);
 
   // Synthetic 32-bit VCLOCK identity of the canonical PPS/VCLOCK epoch.
@@ -1610,8 +1541,6 @@ static Payload cmd_report(const Payload&) {
                               vclock_ok ? vclock_ns : 0ULL, vclock_ok,
                               ocxo1_ok ? ocxo1_ns : 0ULL, ocxo1_ok,
                               ocxo2_ok ? ocxo2_ns : 0ULL, ocxo2_ok);
-  payload_add_gamma_report(p);
-
   p.add("campaign_state",
         campaign_state == clocks_campaign_state_t::STARTED ? "STARTED" : "STOPPED");
   p.add("request_start", request_start);
@@ -1653,102 +1582,6 @@ static Payload cmd_report(const Payload&) {
   return p;
 }
 
-static time_clock_id_t prediction_detail_clock_from_args(const Payload& args) {
-  const char* s = args.getString("clock");
-  if (!s || !*s) s = args.getString("lane");
-  if (!s || !*s) return time_clock_id_t::VCLOCK;
-
-  if (!strcasecmp(s, "VCLOCK") || !strcasecmp(s, "GNSS")) return time_clock_id_t::VCLOCK;
-  if (!strcasecmp(s, "OCXO1")) return time_clock_id_t::OCXO1;
-  if (!strcasecmp(s, "OCXO2")) return time_clock_id_t::OCXO2;
-  return time_clock_id_t::NONE;
-}
-
-static const char* prediction_detail_clock_name(time_clock_id_t clock) {
-  switch (clock) {
-    case time_clock_id_t::VCLOCK: return "VCLOCK";
-    case time_clock_id_t::OCXO1:  return "OCXO1";
-    case time_clock_id_t::OCXO2:  return "OCXO2";
-    default:                     return "NONE";
-  }
-}
-
-static const char* prediction_detail_gate_decision_name(uint32_t decision) {
-  switch (decision) {
-    case 0U: return "MATCH";
-    case 1U: return "CORRECT";
-    case 2U: return "IGNORE";
-    default: return "UNKNOWN";
-  }
-}
-
-static Payload cmd_prediction_detail(const Payload& args) {
-  const time_clock_id_t clock = prediction_detail_clock_from_args(args);
-
-  Payload out;
-  out.add("model", "CLOCKS_GAMMA_PREDICTION_DETAIL");
-  out.add("requested_clock", prediction_detail_clock_name(clock));
-
-  if (clock == time_clock_id_t::NONE) {
-    out.add("error", "invalid clock; use clock=VCLOCK, OCXO1, or OCXO2");
-    return out;
-  }
-
-  clocks_gamma_prediction_detail_snapshot_t detail{};
-  const bool snapshot_ok = clocks_gamma_prediction_detail_snapshot(clock, &detail);
-
-  out.add("snapshot_ok", snapshot_ok);
-  out.add("valid", detail.valid);
-  out.add("clock", prediction_detail_clock_name(clock));
-  out.add("clock_id", detail.clock_id);
-  out.add("completed_edge_count", detail.completed_edge_count);
-  out.add("anchor_dwt", detail.anchor_dwt);
-  out.add("static_prediction_cycles", detail.static_prediction_cycles);
-  out.add("dynamic_final_prediction_cycles", detail.dynamic_final_prediction_cycles);
-  out.add("actual_cycles", detail.actual_cycles);
-  out.add("static_residual_cycles", detail.static_residual_cycles);
-  out.add("dynamic_residual_cycles", detail.dynamic_residual_cycles);
-  out.add("sample_count", detail.sample_count);
-  out.add("sample_capacity", detail.sample_capacity);
-  out.add("sample_step_percent", detail.sample_step_percent);
-  out.add("gate_threshold_cycles", detail.gate_threshold_cycles);
-  out.add("note", "Prior completed Gamma lane-local clock-second. Use clock=VCLOCK, OCXO1, or OCXO2. Samples 1-9 are 10%-90% courtroom checkpoints and sample 10 is the closing 100% edge.");
-
-  PayloadArray arr;
-  for (uint32_t i = 0; i < 10U; i++) {
-    const clocks_gamma_prediction_detail_sample_t& s = detail.samples[i];
-    Payload e;
-    e.add("populated", s.populated);
-    e.add("endpoint", s.endpoint);
-    e.add("sample_index", s.sample_index);
-    e.add("sample_percent", s.sample_percent);
-    e.add("static_prediction_cycles", s.static_prediction_cycles);
-    e.add("dynamic_prediction_cycles", s.dynamic_prediction_cycles);
-    e.add("dynamic_prediction_after_sample_cycles", s.dynamic_prediction_after_sample_cycles);
-    e.add("static_prediction_thus_far_cycles", s.static_prediction_thus_far_cycles);
-    e.add("dynamic_prediction_thus_far_cycles", s.dynamic_prediction_thus_far_cycles);
-    e.add("dynamic_minus_static_thus_far_cycles", s.dynamic_minus_static_thus_far_cycles);
-    e.add("actual_cycles_thus_far", s.actual_cycles_thus_far);
-    e.add("residual_cycles", s.residual_cycles);
-    e.add("abs_residual_cycles", s.abs_residual_cycles);
-    e.add("residual_centicycles", s.residual_centicycles);
-    e.add("abs_residual_centicycles", s.abs_residual_centicycles);
-    e.add("residual_cycles_exact", ((double)s.residual_centicycles) / 100.0, 3);
-    e.add("gate_threshold_cycles", s.gate_threshold_cycles);
-    e.add("gate_match_max_centicycles", s.gate_match_max_centicycles);
-    e.add("gate_correct_min_centicycles", s.gate_correct_min_centicycles);
-    e.add("gate_correct_max_centicycles", s.gate_correct_max_centicycles);
-    e.add("gate_decision", s.gate_decision);
-    e.add("gate_decision_name", prediction_detail_gate_decision_name(s.gate_decision));
-    e.add("accepted", s.accepted);
-    e.add("ignored", s.ignored);
-    e.add("correction_cycles", s.correction_cycles);
-    arr.add(e);
-  }
-  out.add_array("samples", arr);
-  return out;
-}
-
 static Payload cmd_set_dac(const Payload& args) {
   ocxo_dac_pacing_abort_all();
 
@@ -1783,7 +1616,6 @@ static const process_command_entry_t CLOCKS_COMMANDS[] = {
   { "ZERO",          cmd_zero          },
   { "RECOVER",       cmd_recover       },
   { "REPORT",        cmd_report        },
-  { "PREDICTION_DETAIL", cmd_prediction_detail },
   { "WATCHDOG_TEST", cmd_watchdog_test },
   { "SET_DAC",       cmd_set_dac       },
   { nullptr,          nullptr           }

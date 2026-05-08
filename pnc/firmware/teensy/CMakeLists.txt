@@ -67,8 +67,8 @@ set(ZPNET_SOURCES
     process.cpp
     process_clocks_alpha.cpp
     process_clocks_beta.cpp
-    process_clocks_gamma.cpp
     process_events.cpp
+    process_interrupt.cpp
     process_laser.cpp
     process_performance.cpp
     process_photodiode.cpp
@@ -85,7 +85,7 @@ set(ZPNET_SOURCES
     teensy.ino
     time.cpp
     ad5693r.cpp
-    process_interrupt.cpp
+
 )
 
 set(ZPNET_HEADERS
@@ -94,12 +94,12 @@ set(ZPNET_HEADERS
     cpu_usage.h
     debug.h
     events.h
-    memory_info.h
-    payload.h
+    memory_info.h    payload.h
     process.h
     process_clocks.h
     process_clocks_internal.h
     process_events.h
+    process_interrupt.h
     process_laser.h
     process_performance.h
     process_photodiode.h
@@ -116,7 +116,6 @@ set(ZPNET_HEADERS
     zpnet_pins.h
     time.h
     ad5693r.h
-    process_interrupt.h
 )
 
 # -------------------------------------------------------------

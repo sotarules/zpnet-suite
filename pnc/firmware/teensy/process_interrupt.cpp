@@ -42,11 +42,11 @@
 // QTimer1 CH0 low-word counter.  process_interrupt maps that low-word
 // hardware observation into the private synthetic 32-bit VCLOCK identity.
 // When a rebootstrap is pending, it
-// records the selected VCLOCK edge.  The recurring TimePop VCLOCK cadence
-// client is normally a critical recurring ISR slot.  During PPS rebootstrap it
-// is re-armed from the freshly selected PPS_VCLOCK GNSS base so its 1 kHz grid
-// is phase-locked to that selected edge instead of inheriting stale scheduler
-// phase.
+// records the selected VCLOCK edge.  The recurring TimePop VCLOCK cadence client is armed as a critical recurring
+// ISR slot.  It consumes the next CH2 fire fact, back-projects to the selected
+// edge, refreshes the synthetic VCLOCK low-word anchor before TimePop schedules
+// the next compare, and thereafter emits the one-second VCLOCK events on the
+// TimePop rail.
 // ============================================================================
 
 #include "process_interrupt.h"
@@ -146,10 +146,6 @@ static constexpr uint32_t EPOCH_CAPTURE_MAX_WINDOW_CYCLES =
 static constexpr uint64_t VCLOCK_CADENCE_PERIOD_NS = 1000000ULL;
 static constexpr const char* VCLOCK_CADENCE_NAME = "VCLOCK_CADENCE";
 
-// Fixed-point scale for the experimental PPS-witness phase estimator.
-// Values ending in _scaled_cycles are DWT cycles multiplied by this scale.
-static constexpr uint32_t VCLOCK_PHASE_ESTIMATE_SCALE = 1000U;
-
 // OCXO DWT authorship.  OCXO1 and OCXO2 now live on separate QuadTimer
 // modules/vectors.  Each OCXO ISR captures ARM_DWT_CYCCNT as its first
 // instruction and applies the calibrated QTimer ISR-entry latency correction.
@@ -232,49 +228,6 @@ static pps_vclock_t store_load_pvc(void) {
   pps_vclock_t pvc;
   store_load(pps, pvc);
   return pvc;
-}
-
-// ============================================================================
-// Experimental PPS-witness-derived PPS_VCLOCK DWT phase estimate (seqlock)
-// ============================================================================
-
-struct phase_estimate_store_t {
-  volatile uint32_t seq = 0;
-  pps_vclock_phase_estimate_t value{};
-};
-
-static phase_estimate_store_t g_phase_estimate_store;
-
-static void phase_estimate_publish(const pps_vclock_phase_estimate_t& value) {
-  g_phase_estimate_store.seq++;
-  dmb_barrier();
-  g_phase_estimate_store.value = value;
-  dmb_barrier();
-  g_phase_estimate_store.seq++;
-}
-
-static void phase_estimate_reset(void) {
-  phase_estimate_publish(pps_vclock_phase_estimate_t{});
-}
-
-bool interrupt_last_pps_vclock_phase_estimate(
-    pps_vclock_phase_estimate_t* out) {
-  if (!out) return false;
-
-  for (int attempt = 0; attempt < 4; attempt++) {
-    const uint32_t s1 = g_phase_estimate_store.seq;
-    dmb_barrier();
-    const pps_vclock_phase_estimate_t local = g_phase_estimate_store.value;
-    dmb_barrier();
-    const uint32_t s2 = g_phase_estimate_store.seq;
-    if (s1 == s2 && (s1 & 1u) == 0u) {
-      *out = local;
-      return local.valid;
-    }
-  }
-
-  *out = pps_vclock_phase_estimate_t{};
-  return false;
 }
 
 // ============================================================================
@@ -387,9 +340,8 @@ static void pps_edge_dispatch_trampoline(timepop_ctx_t*, timepop_diag_t*, void*)
 // ============================================================================
 //
 // process_interrupt no longer asks process_time for dynamic CPS.  The legacy
-// interrupt_dynamic_cps() accessor now mirrors the best CLOCKS/Gamma-owned
-// VCLOCK prediction available to this file.  This keeps older diagnostics and
-// callers buildable while removing process_time from the interrupt hot path.
+// interrupt_dynamic_cps() now mirrors CLOCKS static PPS/GPIO-derived
+// DWT cycles-per-GNSS-second.  Gamma/dynamic prediction has been retired.
 
 static uint32_t interrupt_vclock_cycles_per_second(void);
 
@@ -716,22 +668,6 @@ static uint32_t pvc_anchor_latest_cps(void) {
 }
 
 static uint32_t interrupt_vclock_cycles_per_second(void) {
-  clocks_gamma_prediction_snapshot_t gamma{};
-  if (clocks_gamma_snapshot(time_clock_id_t::VCLOCK, &gamma)) {
-    if (gamma.current_dynamic_prediction_cycles != 0) {
-      return gamma.current_dynamic_prediction_cycles;
-    }
-    if (gamma.current_static_prediction_cycles != 0) {
-      return gamma.current_static_prediction_cycles;
-    }
-    if (gamma.completed_dynamic_prediction_cycles != 0) {
-      return gamma.completed_dynamic_prediction_cycles;
-    }
-    if (gamma.completed_actual_dwt_cycles_between_edges != 0) {
-      return gamma.completed_actual_dwt_cycles_between_edges;
-    }
-  }
-
   const uint32_t calibrated = clocks_dwt_cycles_per_gnss_second();
   if (calibrated != 0) return calibrated;
 
@@ -747,51 +683,6 @@ static uint32_t vclock_cycles_for_ticks(uint32_t vclock_ticks) {
   return (uint32_t)(((uint64_t)cycles * (uint64_t)vclock_ticks +
                      (uint64_t)VCLOCK_COUNTS_PER_SECOND / 2ULL) /
                     (uint64_t)VCLOCK_COUNTS_PER_SECOND);
-}
-
-static uint32_t vclock_phase_tick_scaled_from_cps(uint32_t dwt_cycles_per_second) {
-  if (dwt_cycles_per_second == 0) return 0;
-  return (uint32_t)(((uint64_t)dwt_cycles_per_second *
-                     (uint64_t)VCLOCK_PHASE_ESTIMATE_SCALE +
-                     (uint64_t)VCLOCK_COUNTS_PER_SECOND / 2ULL) /
-                    (uint64_t)VCLOCK_COUNTS_PER_SECOND);
-}
-
-static void publish_pps_vclock_phase_estimate(const pps_t& pps,
-                                              uint32_t pvc_sequence,
-                                              uint32_t lattice_dwt_at_edge,
-                                              uint32_t pvc_counter32_at_edge) {
-  pps_vclock_phase_estimate_t out{};
-  out.lattice_dwt_at_edge = lattice_dwt_at_edge;
-  out.estimated_dwt_at_edge = lattice_dwt_at_edge;
-  out.scale = VCLOCK_PHASE_ESTIMATE_SCALE;
-  out.dwt_cycles_per_second = interrupt_vclock_cycles_per_second();
-  out.tick_scaled_cycles =
-      vclock_phase_tick_scaled_from_cps(out.dwt_cycles_per_second);
-  out.pps_sequence = pps.sequence;
-  out.pvc_sequence = pvc_sequence;
-  out.pps_dwt_at_edge = pps.dwt_at_edge;
-  out.pps_counter32_at_edge = pps.counter32_at_edge;
-  out.pvc_counter32_at_edge = pvc_counter32_at_edge;
-
-  if (pps.sequence != 0 && pps.dwt_at_edge != 0 &&
-      out.tick_scaled_cycles != 0) {
-    const uint32_t delta_cycles = lattice_dwt_at_edge - pps.dwt_at_edge;
-    const uint64_t delta_scaled =
-        (uint64_t)delta_cycles * (uint64_t)VCLOCK_PHASE_ESTIMATE_SCALE;
-    out.phase_mod_scaled_cycles =
-        (uint32_t)(delta_scaled % (uint64_t)out.tick_scaled_cycles);
-
-    const uint32_t phase_cycles =
-        (out.phase_mod_scaled_cycles + VCLOCK_PHASE_ESTIMATE_SCALE / 2U) /
-        VCLOCK_PHASE_ESTIMATE_SCALE;
-    out.estimated_dwt_at_edge = pps.dwt_at_edge + phase_cycles;
-    out.correction_cycles =
-        (int32_t)(out.estimated_dwt_at_edge - lattice_dwt_at_edge);
-    out.valid = true;
-  }
-
-  phase_estimate_publish(out);
 }
 
 static dwt_repair_diag_t vclock_endpoint_repair_diagnostic(uint32_t observed_dwt) {
@@ -871,8 +762,6 @@ static void publish_vclock_domain_pps_vclock(const pps_t& pps,
   pvc.ch3_at_edge = ch3_at_edge;
   pvc.gnss_ns_at_edge = gnss_ns_at_edge;
 
-  publish_pps_vclock_phase_estimate(pps, sequence, dwt_at_edge,
-                                     counter32_at_edge);
   vclock_check_pps_phase_or_watchdog(pps, sequence, counter32_at_edge, dwt_at_edge);
 
   g_pps_gpio_heartbeat.last_dwt = pvc.dwt_at_edge;
@@ -1074,13 +963,6 @@ struct vclock_lane_t {
   uint32_t cadence_hits_total = 0;
 };
 static vclock_lane_t g_vclock_lane;
-
-static volatile uint32_t g_vclock_cadence_anchored_arm_count = 0;
-static volatile uint32_t g_vclock_cadence_anchored_arm_failure_count = 0;
-static volatile uint32_t g_vclock_cadence_anchored_fallback_count = 0;
-static volatile bool     g_vclock_cadence_last_arm_anchored = false;
-static volatile int64_t  g_vclock_cadence_last_base_gnss_ns = -1;
-static volatile uint32_t g_vclock_cadence_last_base_counter32 = 0;
 
 struct ocxo_lane_t {
   const char* name = nullptr;
@@ -1602,8 +1484,6 @@ static void emit_one_second_event(interrupt_subscriber_runtime_t& rt,
 // ============================================================================
 
 static bool vclock_cadence_arm_timepop(void);
-static bool vclock_cadence_arm_timepop_from_base(int64_t base_gnss_ns,
-                                                   uint32_t base_counter32);
 static void vclock_cadence_timepop_callback(timepop_ctx_t* ctx,
                                             timepop_diag_t*,
                                             void*);
@@ -1627,50 +1507,6 @@ static bool vclock_cadence_arm_timepop(void) {
     return false;
   }
 
-  g_vclock_lane.phase_bootstrapped = true;
-  g_vclock_lane.bootstrap_count++;
-  return true;
-}
-
-static bool vclock_cadence_arm_timepop_from_base(int64_t base_gnss_ns,
-                                                   uint32_t base_counter32) {
-  if (!g_vclock_lane.active || !g_rt_vclock || !g_rt_vclock->active) return false;
-
-  g_vclock_cadence_last_base_gnss_ns = base_gnss_ns;
-  g_vclock_cadence_last_base_counter32 = base_counter32;
-  g_vclock_cadence_last_arm_anchored = false;
-
-  if (base_gnss_ns <= 0) {
-    g_vclock_cadence_anchored_fallback_count++;
-    return vclock_cadence_arm_timepop();
-  }
-
-  // Re-author VCLOCK_CADENCE onto the selected PPS_VCLOCK grid using the
-  // selected edge's VCLOCK counter identity directly.  This substrate-grade
-  // TimePop path does not ask Time what "now" is, and it does not require a
-  // valid time_anchor_snapshot() during cold rebootstrap:
-  //
-  //   counter32_k = base_counter32 + k * (VCLOCK_CADENCE_PERIOD_NS / 100)
-  //   gnss_ns_k   = base_gnss_ns   + k * VCLOCK_CADENCE_PERIOD_NS
-  //
-  // The first scheduled deadline is the first cadence point after the selected
-  // PPS_VCLOCK edge.  Later ISR rearms stay on the same fixed base grid.
-  const timepop_handle_t h =
-      timepop_arm_recurring_isr_from_base_counter32(
-          base_gnss_ns,
-          base_counter32,
-          VCLOCK_CADENCE_PERIOD_NS,
-          vclock_cadence_timepop_callback,
-          nullptr,
-          VCLOCK_CADENCE_NAME);
-  if (h == TIMEPOP_INVALID_HANDLE) {
-    g_vclock_cadence_anchored_arm_failure_count++;
-    g_vclock_cadence_anchored_fallback_count++;
-    return vclock_cadence_arm_timepop();
-  }
-
-  g_vclock_cadence_anchored_arm_count++;
-  g_vclock_cadence_last_arm_anchored = true;
   g_vclock_lane.phase_bootstrapped = true;
   g_vclock_lane.bootstrap_count++;
   return true;
@@ -1726,12 +1562,6 @@ static void vclock_cadence_timepop_callback(timepop_ctx_t* ctx,
     return;
   }
 
-  const uint32_t cadence_tick_mod_1000 = g_vclock_lane.tick_mod_1000 + 1;
-
-  if ((cadence_tick_mod_1000 % 10U) == 0U &&
-      cadence_tick_mod_1000 < TICKS_PER_SECOND_EVENT) {
-    clocks_gamma_100hz_sample(time_clock_id_t::VCLOCK, qtimer_event_dwt);
-  }
 
   if (++g_vclock_lane.tick_mod_1000 >= TICKS_PER_SECOND_EVENT) {
     g_vclock_lane.tick_mod_1000 = 0;
@@ -1769,8 +1599,6 @@ static void vclock_cadence_timepop_callback(timepop_ctx_t* ctx,
                                       fired_low16,
                                       pvc_gnss_ns);
 
-    clocks_gamma_second_edge(time_clock_id_t::VCLOCK, qtimer_event_dwt);
-
     emit_one_second_event(*g_rt_vclock, qtimer_event_dwt,
                           cadence_counter32,
                           coincidence_cycles, coincidence_valid, &repair);
@@ -1807,15 +1635,13 @@ static void ocxo_lane_disable_compare(ocxo_lane_t& lane) {
 //   3. compute the latency-adjusted event DWT,
 //   4. re-arm the next 1 kHz compare,
 //   5. refresh the synthetic 32-bit lane anchor,
-//   6. arm an ASAP callback only on 100 Hz samples and 1 Hz edges.
+//   6. defer only 1 Hz edge publication.
 //
-// Gamma sampling, Gamma second-edge publication, DWT→GNSS bridge projection,
-// diag filling, and subscriber dispatch all happen outside the OCXO ISR.
+// Dynamic 100 Hz prediction has been retired; OCXO 100 Hz samples are no
+// longer queued from the ISR.
 // ============================================================================
 
 struct ocxo_deferred_work_t {
-  volatile bool sample_pending = false;
-  volatile uint32_t sample_dwt = 0;
   volatile bool edge_pending = false;
   volatile uint32_t edge_dwt = 0;
   volatile uint32_t edge_counter32 = 0;
@@ -1823,12 +1649,6 @@ struct ocxo_deferred_work_t {
 
 static ocxo_deferred_work_t g_ocxo1_deferred = {};
 static ocxo_deferred_work_t g_ocxo2_deferred = {};
-
-static time_clock_id_t ocxo_time_clock_for(interrupt_subscriber_kind_t kind) {
-  return (kind == interrupt_subscriber_kind_t::OCXO1)
-      ? time_clock_id_t::OCXO1
-      : time_clock_id_t::OCXO2;
-}
 
 static void ocxo_deferred_asap_callback(timepop_ctx_t*, timepop_diag_t*, void* user_data) {
   auto* rt = static_cast<interrupt_subscriber_runtime_t*>(user_data);
@@ -1838,21 +1658,11 @@ static void ocxo_deferred_asap_callback(timepop_ctx_t*, timepop_diag_t*, void* u
       (rt->desc->kind == interrupt_subscriber_kind_t::OCXO1)
           ? g_ocxo1_deferred
           : g_ocxo2_deferred;
-  const time_clock_id_t clock = ocxo_time_clock_for(rt->desc->kind);
-
-  if (work.sample_pending) {
-    const uint32_t dwt = work.sample_dwt;
-    work.sample_pending = false;
-    g_ocxo_deferred_sample_count++;
-    clocks_gamma_100hz_sample(clock, dwt);
-  }
-
   if (work.edge_pending) {
     const uint32_t dwt = work.edge_dwt;
     const uint32_t counter32 = work.edge_counter32;
     work.edge_pending = false;
     g_ocxo_deferred_edge_count++;
-    clocks_gamma_second_edge(clock, dwt);
 
     // We are already in foreground ASAP context.  Dispatch the authored OCXO
     // edge directly instead of arming a second named ASAP slot that can be
@@ -1908,18 +1718,6 @@ static void qtimer2_isr(void) {
         synthetic_clock_advance_at_hardware(*c, OCXO_INTERVAL_COUNTS, fired_low16);
   } else {
     g_ocxo1_lane.logical_count32_at_last_second += OCXO_INTERVAL_COUNTS;
-  }
-
-  const uint32_t next_tick_mod_1000 = g_ocxo1_lane.tick_mod_1000 + 1U;
-  if ((next_tick_mod_1000 % 10U) == 0U &&
-      next_tick_mod_1000 < TICKS_PER_SECOND_EVENT) {
-    if (g_ocxo1_deferred.sample_pending) g_ocxo_deferred_asap_overwrite_count++;
-    g_ocxo1_deferred.sample_dwt = event_dwt;
-    g_ocxo1_deferred.sample_pending = true;
-    g_ocxo_deferred_asap_arm_count++;
-    (void)timepop_arm_asap(ocxo_deferred_asap_callback,
-                           g_rt_ocxo1,
-                           "OCXO1_DEFERRED");
   }
 
   if (++g_ocxo1_lane.tick_mod_1000 >= TICKS_PER_SECOND_EVENT) {
@@ -1981,18 +1779,6 @@ static void qtimer3_isr(void) {
         synthetic_clock_advance_at_hardware(*c, OCXO_INTERVAL_COUNTS, fired_low16);
   } else {
     g_ocxo2_lane.logical_count32_at_last_second += OCXO_INTERVAL_COUNTS;
-  }
-
-  const uint32_t next_tick_mod_1000 = g_ocxo2_lane.tick_mod_1000 + 1U;
-  if ((next_tick_mod_1000 % 10U) == 0U &&
-      next_tick_mod_1000 < TICKS_PER_SECOND_EVENT) {
-    if (g_ocxo2_deferred.sample_pending) g_ocxo_deferred_asap_overwrite_count++;
-    g_ocxo2_deferred.sample_dwt = event_dwt;
-    g_ocxo2_deferred.sample_pending = true;
-    g_ocxo_deferred_asap_arm_count++;
-    (void)timepop_arm_asap(ocxo_deferred_asap_callback,
-                           g_rt_ocxo2,
-                           "OCXO2_DEFERRED");
   }
 
   if (++g_ocxo2_lane.tick_mod_1000 >= TICKS_PER_SECOND_EVENT) {
@@ -2307,27 +2093,9 @@ void process_interrupt_gpio6789_irq(uint32_t isr_entry_dwt_raw) {
     g_pps_rebootstrap_pending = false;
     g_pps_rebootstrap_count++;
 
-    int64_t selected_gnss_ns = -1;
-    if (zero_consumed) {
-      selected_gnss_ns = (int64_t)zero_ns_consumed;
-      g_vclock_epoch_gnss_ns = selected_gnss_ns;
-    } else {
-      const int64_t projected_gnss_ns =
-          interrupt_project_dwt_to_vclock_gnss_ns(pps.dwt_at_edge);
-      selected_gnss_ns = vclock_next_epoch_gnss_ns(projected_gnss_ns);
-
-      // Cold-start/rebootstrap may occur before the PPS_VCLOCK anchor ring has
-      // enough valid CPS history for the DWT→GNSS bridge to seed an absolute
-      // epoch.  VCLOCK_CADENCE still needs a positive GNSS-base phase so the
-      // anchored TimePop scheduler can place the 1 ms grid.  One exact second
-      // is phase-equivalent to every PPS_VCLOCK second for a 1 ms cadence, so
-      // use it as a deterministic cold-start base instead of poisoning the
-      // latch with -1 and forcing the old non-anchored fallback path.
-      if (selected_gnss_ns < 0) {
-        g_vclock_epoch_gnss_ns = GNSS_NS_PER_SECOND;
-        selected_gnss_ns = g_vclock_epoch_gnss_ns;
-      }
-    }
+    const int64_t selected_gnss_ns = zero_consumed
+        ? (int64_t)zero_ns_consumed
+        : vclock_next_epoch_gnss_ns(interrupt_project_dwt_to_vclock_gnss_ns(pps.dwt_at_edge));
 
     g_vclock_epoch_latch.pending = true;
     g_vclock_epoch_latch.pps = pps;
@@ -2350,12 +2118,6 @@ void process_interrupt_gpio6789_irq(uint32_t isr_entry_dwt_raw) {
         (uint16_t)(selected_low16 + (uint16_t)VCLOCK_INTERVAL_COUNTS);
     g_vclock_lane.logical_count32_at_last_second = selected_counter32;
     vclock_clock_anchor_hardware_low16(selected_counter32, selected_low16);
-
-    // The old VCLOCK_CADENCE slot may be phase-locked to a stale TimePop grid.
-    // Re-arm it from the just-selected PPS_VCLOCK GNSS base so the cadence
-    // grid belongs to this epoch, not to whatever CH2 phase happened to be
-    // alive before rebootstrap.
-    (void)vclock_cadence_arm_timepop_from_base(selected_gnss_ns, selected_counter32);
   }
 }
 
@@ -2641,17 +2403,10 @@ void process_interrupt_init(void) {
   g_vclock_epoch_latch = vclock_epoch_latch_t{};
   g_vclock_repair_stats = vclock_repair_stats_t{};
   g_vclock_epoch_gnss_ns = -1;
-  g_vclock_cadence_anchored_arm_count = 0;
-  g_vclock_cadence_anchored_arm_failure_count = 0;
-  g_vclock_cadence_anchored_fallback_count = 0;
-  g_vclock_cadence_last_arm_anchored = false;
-  g_vclock_cadence_last_base_gnss_ns = -1;
-  g_vclock_cadence_last_base_counter32 = 0;
   g_pps_rebootstrap_pending = false;
   g_pps_rebootstrap_count = 0;
 
   g_store = snapshot_store_t{};
-  phase_estimate_reset();
   g_epoch_capture_store = epoch_capture_store_t{};
   pvc_anchor_ring_reset();
   g_bridge_stats_timepop = bridge_anchor_stats_t{};
@@ -2838,23 +2593,6 @@ static Payload cmd_report(const Payload&) {
   p.add("pps_vclock_ch3_at_edge",       (uint32_t)pvc.ch3_at_edge);
   p.add("pps_vclock_gnss_ns_at_edge",   pvc.gnss_ns_at_edge);
 
-  pps_vclock_phase_estimate_t phase_est{};
-  const bool phase_est_loaded = interrupt_last_pps_vclock_phase_estimate(&phase_est);
-  p.add("pps_vclock_phase_estimate_loaded", phase_est_loaded);
-  p.add("pps_vclock_phase_estimate_valid", phase_est.valid);
-  p.add("pps_vclock_lattice_dwt_at_edge", phase_est.lattice_dwt_at_edge);
-  p.add("pps_vclock_phase_estimated_dwt_at_edge", phase_est.estimated_dwt_at_edge);
-  p.add("pps_vclock_phase_correction_cycles", phase_est.correction_cycles);
-  p.add("pps_vclock_phase_mod_scaled_cycles", phase_est.phase_mod_scaled_cycles);
-  p.add("pps_vclock_phase_tick_scaled_cycles", phase_est.tick_scaled_cycles);
-  p.add("pps_vclock_phase_scale", phase_est.scale);
-  p.add("pps_vclock_phase_dwt_cycles_per_second", phase_est.dwt_cycles_per_second);
-  p.add("pps_vclock_phase_pps_sequence", phase_est.pps_sequence);
-  p.add("pps_vclock_phase_pvc_sequence", phase_est.pvc_sequence);
-  p.add("pps_vclock_phase_pps_dwt_at_edge", phase_est.pps_dwt_at_edge);
-  p.add("pps_vclock_phase_pps_counter32_at_edge", phase_est.pps_counter32_at_edge);
-  p.add("pps_vclock_phase_pvc_counter32_at_edge", phase_est.pvc_counter32_at_edge);
-
   interrupt_epoch_capture_t epoch_cap{};
   const bool epoch_cap_ok = interrupt_last_epoch_capture(&epoch_cap);
   p.add("epoch_capture_available", epoch_cap_ok);
@@ -2880,12 +2618,6 @@ static Payload cmd_report(const Payload&) {
   p.add("vclock_miss_count",        g_vclock_lane.miss_count);
   p.add("vclock_bootstrap_count",   g_vclock_lane.bootstrap_count);
   p.add("vclock_cadence_hits_total", g_vclock_lane.cadence_hits_total);
-  p.add("vclock_cadence_anchored_arm_count", g_vclock_cadence_anchored_arm_count);
-  p.add("vclock_cadence_anchored_arm_failure_count", g_vclock_cadence_anchored_arm_failure_count);
-  p.add("vclock_cadence_anchored_fallback_count", g_vclock_cadence_anchored_fallback_count);
-  p.add("vclock_cadence_last_arm_anchored", g_vclock_cadence_last_arm_anchored);
-  p.add("vclock_cadence_last_base_gnss_ns", g_vclock_cadence_last_base_gnss_ns);
-  p.add("vclock_cadence_last_base_counter32", g_vclock_cadence_last_base_counter32);
   p.add("vclock_compare_target",    (uint32_t)g_vclock_lane.compare_target);
   p.add("vclock_tick_mod_1000",     g_vclock_lane.tick_mod_1000);
   p.add("vclock_logical_count32",   g_vclock_lane.logical_count32_at_last_second);
@@ -2906,25 +2638,22 @@ static Payload cmd_report(const Payload&) {
   p.add("ocxo2_tick_mod_1000",      g_ocxo2_lane.tick_mod_1000);
   p.add("ocxo2_logical_count32",    g_ocxo2_lane.logical_count32_at_last_second);
 
-  // Dynamic CPS compatibility — process_interrupt now mirrors CLOCKS/Gamma
-  // prediction directly and no longer queries process_time.
-  clocks_gamma_prediction_snapshot_t gamma{};
-  const bool gamma_ok = clocks_gamma_snapshot(time_clock_id_t::VCLOCK, &gamma);
+  // Static CPS compatibility — process_interrupt now mirrors the CLOCKS
+  // PPS/GPIO-derived one-second DWT slope.  Dynamic Gamma prediction has been
+  // retired.
   const uint32_t dynamic_cps = interrupt_dynamic_cps();
-  p.add("dynamic_cps_owner", "CLOCKS_GAMMA");
+  p.add("dynamic_cps_owner", "CLOCKS_STATIC_PPS");
   p.add("dynamic_cps",                         dynamic_cps);
   p.add("dynamic_cps_valid",                   dynamic_cps != 0);
-  p.add("dynamic_cps_pps_sequence",            gamma_ok ? gamma.edge_count : 0);
-  p.add("dynamic_cps_last_pvc_dwt_at_edge",    gamma_ok ? gamma.second_start_dwt : 0);
-  p.add("dynamic_cps_last_reseed_value",       gamma_ok ? gamma.current_static_prediction_cycles : 0);
-  p.add("dynamic_cps_last_reseed_was_computed", gamma_ok && gamma.current_static_prediction_cycles != 0);
-  p.add("dynamic_cps_net_adjustment_cycles",
-        gamma_ok ? (int32_t)((int64_t)gamma.current_dynamic_prediction_cycles -
-                             (int64_t)gamma.current_static_prediction_cycles) : 0);
-  p.add("dynamic_cps_refine_ticks_this_second", gamma_ok ? gamma.current_sample_count : 0);
-  p.add("dynamic_cps_adjustments_this_second", gamma_ok ? gamma.current_adjust_count : 0);
-  p.add("dynamic_cps_total_refine_ticks",      gamma_ok ? gamma.edge_count : 0);
-  p.add("dynamic_cps_total_adjustments",       gamma_ok ? gamma.completed_adjust_count : 0);
+  p.add("dynamic_cps_pps_sequence",            g_pps_gpio_heartbeat.edge_count);
+  p.add("dynamic_cps_last_pvc_dwt_at_edge",    g_pps_gpio_heartbeat.last_dwt);
+  p.add("dynamic_cps_last_reseed_value",       dynamic_cps);
+  p.add("dynamic_cps_last_reseed_was_computed", dynamic_cps != 0);
+  p.add("dynamic_cps_net_adjustment_cycles",   0);
+  p.add("dynamic_cps_refine_ticks_this_second", 0);
+  p.add("dynamic_cps_adjustments_this_second", 0);
+  p.add("dynamic_cps_total_refine_ticks",      0);
+  p.add("dynamic_cps_total_adjustments",       0);
 
   p.add("pvc_anchor_ring_count", g_pvc_anchor_count);
   p.add("pvc_anchor_ring_head", g_pvc_anchor_head);
@@ -2996,9 +2725,9 @@ static Payload cmd_report(const Payload&) {
   p.add("ocxo_deferred_asap_overwrite_count", g_ocxo_deferred_asap_overwrite_count);
   p.add("ocxo_deferred_sample_count", g_ocxo_deferred_sample_count);
   p.add("ocxo_deferred_edge_count", g_ocxo_deferred_edge_count);
-  p.add("ocxo1_deferred_sample_pending", g_ocxo1_deferred.sample_pending);
+  p.add("ocxo1_deferred_sample_pending", false);
   p.add("ocxo1_deferred_edge_pending", g_ocxo1_deferred.edge_pending);
-  p.add("ocxo2_deferred_sample_pending", g_ocxo2_deferred.sample_pending);
+  p.add("ocxo2_deferred_sample_pending", false);
   p.add("ocxo2_deferred_edge_pending", g_ocxo2_deferred.edge_pending);
 
   return p;
