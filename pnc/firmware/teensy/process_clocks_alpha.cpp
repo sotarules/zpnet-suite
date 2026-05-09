@@ -114,52 +114,27 @@ volatile uint32_t g_pps_dwt_at_edge = 0;
 volatile uint32_t g_pps_dwt_cycles_between_edges = 0;
 volatile bool     g_pps_dwt_cycles_between_edges_valid = false;
 volatile int32_t  g_pps_vclock_phase_cycles = 0;
-volatile int32_t  g_pps_vclock_phase_step_cycles = 0;
-volatile bool     g_pps_vclock_phase_valid = false;
-
-// Experimental PPS-witness-derived estimate of the selected PPS_VCLOCK DWT edge.
-// The existing g_dwt_at_pps_vclock remains the VCLOCK/QTimer lattice coordinate
-// until the estimate is promoted after campaign evidence says it should be.
-volatile bool     g_pps_vclock_phase_estimate_valid = false;
-volatile uint32_t g_pps_vclock_lattice_dwt_at_edge = 0;
-volatile uint32_t g_pps_vclock_phase_estimated_dwt_at_edge = 0;
-volatile int32_t  g_pps_vclock_phase_correction_cycles = 0;
-volatile uint32_t g_pps_vclock_phase_mod_scaled_cycles = 0;
-volatile uint32_t g_pps_vclock_phase_tick_scaled_cycles = 0;
-volatile uint32_t g_pps_vclock_phase_scale = 0;
-volatile uint32_t g_pps_vclock_phase_dwt_cycles_per_second = 0;
-volatile uint32_t g_pps_vclock_phase_pps_sequence = 0;
-volatile uint32_t g_pps_vclock_phase_pvc_sequence = 0;
-volatile uint32_t g_pps_vclock_phase_pps_dwt_at_edge = 0;
-volatile uint32_t g_pps_vclock_phase_pps_counter32_at_edge = 0;
-volatile uint32_t g_pps_vclock_phase_pvc_counter32_at_edge = 0;
 
 static volatile uint32_t g_prev_pps_dwt_at_edge = 0;
 static volatile bool     g_prev_pps_dwt_at_edge_valid = false;
-static volatile int32_t  g_prev_pps_vclock_phase_cycles = 0;
-static volatile bool     g_prev_pps_vclock_phase_valid = false;
 
+static uint32_t alpha_pps_vclock_phase_cycles_from_edges(uint32_t pps_dwt_at_edge,
+                                                         uint32_t pvc_dwt_at_edge) {
+  // Scalar PPS→VCLOCK phase.  process_interrupt selects the first VCLOCK edge
+  // after PPS by counter identity, but the DWT-bearing VCLOCK fact may be a
+  // later VCLOCK edge.  Reduce the PPS→VCLOCK DWT delta into one 10 MHz cell
+  // using scaled integer arithmetic so we do not truncate cycles-per-100ns.
+  const uint32_t cps = dwt_effective_cycles_per_pps_vclock_second()
+      ? dwt_effective_cycles_per_pps_vclock_second()
+      : (uint32_t)DWT_EXPECTED_PER_PPS;
+  const uint32_t delta_dwt = pvc_dwt_at_edge - pps_dwt_at_edge;
+  const uint64_t phase_scaled =
+      ((uint64_t)delta_dwt * (uint64_t)VCLOCK_COUNTS_PER_SECOND) %
+      (uint64_t)cps;
 
-static void alpha_copy_pps_vclock_phase_estimate(void) {
-  // Retired with Gamma/dynamic prediction cleanup.
-  //
-  // The operational timing model now uses the physical PPS DWT witness and
-  // static PPS-based DWT slope.  The old interrupt-authored PPS/VCLOCK phase
-  // estimate hook is no longer implemented, but Beta still publishes these
-  // fields during the schema transition.  Keep them explicitly invalid/zeroed.
-  g_pps_vclock_phase_estimate_valid = false;
-  g_pps_vclock_lattice_dwt_at_edge = 0;
-  g_pps_vclock_phase_estimated_dwt_at_edge = 0;
-  g_pps_vclock_phase_correction_cycles = 0;
-  g_pps_vclock_phase_mod_scaled_cycles = 0;
-  g_pps_vclock_phase_tick_scaled_cycles = 0;
-  g_pps_vclock_phase_scale = 0;
-  g_pps_vclock_phase_dwt_cycles_per_second = 0;
-  g_pps_vclock_phase_pps_sequence = 0;
-  g_pps_vclock_phase_pvc_sequence = 0;
-  g_pps_vclock_phase_pps_dwt_at_edge = 0;
-  g_pps_vclock_phase_pps_counter32_at_edge = 0;
-  g_pps_vclock_phase_pvc_counter32_at_edge = 0;
+  return (uint32_t)((phase_scaled +
+                     (uint64_t)VCLOCK_COUNTS_PER_SECOND / 2ULL) /
+                    (uint64_t)VCLOCK_COUNTS_PER_SECOND);
 }
 
 // VCLOCK event counter — increments on every vclock_callback invocation
@@ -1113,25 +1088,8 @@ static void alpha_reset_canonical_clock_state_for_new_epoch(void) {
   g_pps_dwt_cycles_between_edges = 0;
   g_pps_dwt_cycles_between_edges_valid = false;
   g_pps_vclock_phase_cycles = 0;
-  g_pps_vclock_phase_step_cycles = 0;
-  g_pps_vclock_phase_valid = false;
-  g_pps_vclock_phase_estimate_valid = false;
-  g_pps_vclock_lattice_dwt_at_edge = 0;
-  g_pps_vclock_phase_estimated_dwt_at_edge = 0;
-  g_pps_vclock_phase_correction_cycles = 0;
-  g_pps_vclock_phase_mod_scaled_cycles = 0;
-  g_pps_vclock_phase_tick_scaled_cycles = 0;
-  g_pps_vclock_phase_scale = 0;
-  g_pps_vclock_phase_dwt_cycles_per_second = 0;
-  g_pps_vclock_phase_pps_sequence = 0;
-  g_pps_vclock_phase_pvc_sequence = 0;
-  g_pps_vclock_phase_pps_dwt_at_edge = 0;
-  g_pps_vclock_phase_pps_counter32_at_edge = 0;
-  g_pps_vclock_phase_pvc_counter32_at_edge = 0;
   g_prev_pps_dwt_at_edge = 0;
   g_prev_pps_dwt_at_edge_valid = false;
-  g_prev_pps_vclock_phase_cycles = 0;
-  g_prev_pps_vclock_phase_valid = false;
   g_vclock_event_count = 0;
 
   g_alpha_runtime_epoch_capture_missing_count = 0;
@@ -1440,7 +1398,6 @@ static void ocxo2_callback(const interrupt_event_t& event,
 
 static void publish_pps_witness_diag(const pps_edge_snapshot_t& snap) {
   const uint32_t physical_pps_dwt = snap.physical_pps_dwt_normalized_at_edge;
-  const int32_t phase_cycles = (int32_t)(snap.dwt_at_edge - physical_pps_dwt);
 
   g_pps_dwt_at_edge = physical_pps_dwt;
   if (g_prev_pps_dwt_at_edge_valid) {
@@ -1451,21 +1408,11 @@ static void publish_pps_witness_diag(const pps_edge_snapshot_t& snap) {
     g_pps_dwt_cycles_between_edges_valid = false;
   }
 
-  g_pps_vclock_phase_cycles = phase_cycles;
-  if (g_prev_pps_vclock_phase_valid) {
-    g_pps_vclock_phase_step_cycles =
-        phase_cycles - g_prev_pps_vclock_phase_cycles;
-  } else {
-    g_pps_vclock_phase_step_cycles = 0;
-  }
-  g_pps_vclock_phase_valid = true;
+  g_pps_vclock_phase_cycles =
+      (int32_t)alpha_pps_vclock_phase_cycles_from_edges(physical_pps_dwt,
+                                                        snap.dwt_at_edge);
   g_prev_pps_dwt_at_edge = physical_pps_dwt;
   g_prev_pps_dwt_at_edge_valid = true;
-  g_prev_pps_vclock_phase_cycles = phase_cycles;
-  g_prev_pps_vclock_phase_valid = true;
-
-
-  alpha_copy_pps_vclock_phase_estimate();
 
   g_pps_witness_diag.pps_edge_sequence = snap.sequence;
   g_pps_witness_diag.pps_edge_dwt_isr_entry_raw = physical_pps_dwt;

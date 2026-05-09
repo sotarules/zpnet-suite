@@ -154,6 +154,12 @@ extern volatile uint32_t g_dwt_cycles_between_pps_vclock;
 // hardware read.
 extern volatile uint32_t g_counter32_at_pps_vclock;
 
+// Scalar PPS→VCLOCK phase in DWT cycles.  This is the distance from the
+// physical PPS edge to the selected first-after-PPS VCLOCK edge, reduced into
+// one 10 MHz cell.  It is a scalar by construction; no validity flag is
+// published.
+extern volatile int32_t g_pps_vclock_phase_cycles;
+
 // Diagnostic — last seen counter32_at_event (CH3 ISR capture).
 // Distinct from g_counter32_at_pps_vclock: this one IS authored from the
 // CH3 ISR's event.counter32_at_event, retained for VCLOCK-phase

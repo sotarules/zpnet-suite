@@ -5,9 +5,8 @@ Reads TIMEBASE rows for a campaign and prints a compact one-second DWT-cycle
 audit for four lanes:
 
   • PPS    — physical GPIO witness DWT, static prediction = previous PPS actual
-  • VCLOCK — preferred raw-cycle surface is the PPS-witness phase-estimated
-             PPS_VCLOCK DWT edge when present/valid; otherwise falls back to
-             the lattice PPS_VCLOCK DWT edge and then firmware/Gamma actuals
+  • VCLOCK — raw-cycle surface is the lattice PPS/VCLOCK DWT edge and
+             firmware static prediction audit
   • OCXO1  — compact firmware prediction audit from TIMEBASE, plus optional
              Alpha-forensics DWT reconstruction when last_event_dwt is present
   • OCXO2  — compact firmware prediction audit from TIMEBASE, plus optional
@@ -15,7 +14,7 @@ audit for four lanes:
 
 This report intentionally removes the older modulo/transport clutter.
 It focuses on actual cycles, static prediction, dynamic prediction, residuals,
-and the positive PPS→VCLOCK phase offset from the preferred VCLOCK DWT surface.
+and the scalar PPS→VCLOCK phase offset published as pps_vclock_phase_cycles.
 For PPS there is no dynamic prediction surface; the dynamic columns are shown
 as "---".
 
@@ -266,23 +265,38 @@ def physical_pps_dwt_from_schema(root: Dict[str, Any], frag: Dict[str, Any]) -> 
 
 
 def vclock_preferred_dwt_from_schema(root: Dict[str, Any], frag: Dict[str, Any]) -> Tuple[Optional[int], str]:
-    phase_estimate_valid = _as_bool(frag.get("pps_vclock_phase_estimate_valid"))
-    phase_estimate_dwt = _first_int(
-        frag.get("pps_vclock_phase_estimated_dwt_at_edge"),
-        root.get("pps_vclock_phase_estimated_dwt_at_edge"),
-    )
-    if phase_estimate_valid and phase_estimate_dwt is not None:
-        return phase_estimate_dwt, "phase"
-
     lattice_dwt = _first_int(
         frag.get("dwt_at_pps_vclock"),
-        frag.get("pps_vclock_lattice_dwt_at_edge"),
         root.get("dwt_at_pps_vclock"),
     )
     if lattice_dwt is not None:
         return lattice_dwt, "lattice"
 
+    # Legacy fallback for older TIMEBASE rows captured during the temporary
+    # phase-estimate schema.  New rows publish only pps_vclock_phase_cycles,
+    # not a separate estimated PPS/VCLOCK DWT coordinate.
+    phase_estimate_dwt = _first_int(
+        frag.get("pps_vclock_phase_estimated_dwt_at_edge"),
+        root.get("pps_vclock_phase_estimated_dwt_at_edge"),
+    )
+    if phase_estimate_dwt is not None:
+        return phase_estimate_dwt, "phase-old"
+
     return None, "---"
+
+
+def pps_vclock_phase_cycles_from_schema(root: Dict[str, Any], frag: Dict[str, Any]) -> Optional[int]:
+    """Return the scalar PPS→VCLOCK phase offset in DWT cycles.
+
+    New firmware publishes exactly one phase field: pps_vclock_phase_cycles.
+    It is the DWT-cycle offset within one 10 MHz VCLOCK cell and should be
+    less than one VCLOCK tick worth of DWT cycles.  Older rows may lack this
+    scalar; callers can fall back to reconstructing from DWT endpoints.
+    """
+    return _first_int(
+        frag.get("pps_vclock_phase_cycles"),
+        root.get("pps_vclock_phase_cycles"),
+    )
 
 
 def ocxo_forensic_last_event_dwt_from_schema(root: Dict[str, Any],
@@ -380,7 +394,7 @@ def analyze(campaign: str, limit: int = 0) -> None:
     print()
     print("Raw cycle surfaces:")
     print("  PPS    actual = physical PPS GPIO DWT delta; static prediction = previous PPS actual")
-    print("  VCLOCK actual = phase-estimated PPS_VCLOCK DWT delta when valid; otherwise lattice/fallback")
+    print("  VCLOCK actual = lattice PPS/VCLOCK DWT delta; phase column uses scalar pps_vclock_phase_cycles")
     print("  OCXO   actual/static/dynamic/residual = compact firmware prediction audit")
     print("         fact/fΔ = Alpha-forensics DWT reconstruction and fact - actual")
     print("         cdelta  = Alpha-forensics counter32 delta since previous event")
@@ -477,8 +491,9 @@ def analyze(campaign: str, limit: int = 0) -> None:
         physical_pps_dwt = physical_pps_dwt_from_schema(root, frag)
         vclock_dwt, vclock_source = vclock_preferred_dwt_from_schema(root, frag)
 
-        pps_to_vclock_phase: Optional[int] = None
-        if physical_pps_dwt is not None and vclock_dwt is not None:
+        pps_to_vclock_phase: Optional[int] = pps_vclock_phase_cycles_from_schema(root, frag)
+        if pps_to_vclock_phase is None and physical_pps_dwt is not None and vclock_dwt is not None:
+            # Legacy fallback for rows that predate the scalar field.
             pps_to_vclock_phase = abs(_signed_delta_u32(vclock_dwt, physical_pps_dwt))
 
         pps_actual: Optional[int] = None
@@ -633,7 +648,7 @@ def analyze(campaign: str, limit: int = 0) -> None:
     print("═══════════════")
     print(f"  rows                         = {coverage['rows']:,}")
     print(f"  PPS actual cycles             = {coverage['pps_actual']:,}")
-    print(f"  VCLOCK phase-estimated actual = {coverage['vclock_phase_actual']:,}")
+    print(f"  VCLOCK legacy phase actual    = {coverage['vclock_phase_actual']:,}")
     print(f"  VCLOCK lattice actual         = {coverage['vclock_lattice_actual']:,}")
     print(f"  VCLOCK prediction rows        = {coverage['vclock_prediction']:,}")
     print(f"  OCXO1 prediction rows         = {coverage['ocxo1_prediction']:,}")
@@ -670,9 +685,9 @@ def analyze(campaign: str, limit: int = 0) -> None:
 
     print("Notes")
     print("═════")
-    print("  • VCLOCK actual cycles prefer pps_vclock_phase_estimated_dwt_at_edge.")
-    print("  • vsrc=phase means the new PPS-witness estimate supplied the VCLOCK actual.")
-    print("  • phase is the positive PPS→VCLOCK DWT offset from the preferred VCLOCK edge.")
+    print("  • phase is pps_vclock_phase_cycles when present.")
+    print("  • phase fallback reconstructs abs(VCLOCK_DWT - PPS_DWT) for legacy rows only.")
+    print("  • vsrc=phase-old means an older pps_vclock_phase_estimated_dwt_at_edge row supplied VCLOCK actual.")
     print("  • PPS has no dynamic prediction surface; pps_sres is actual minus previous PPS actual.")
     print("  • VCLOCK residuals are recomputed against firmware predictions when the preferred DWT actual is used.")
     print("  • OCXO fact columns reconstruct cycles from Alpha forensic last_event_dwt when present.")
