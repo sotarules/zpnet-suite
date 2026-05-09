@@ -2,9 +2,10 @@
 // process_interrupt.h
 // ============================================================================
 //
-// Interrupt custody and per-lane 1 kHz cadence:
+// Interrupt custody and low-word counter cadence:
 //
-//   • OCXO lanes    (QTimer2 CH0 for OCXO1, QTimer3 CH3 for OCXO2)
+//   • Cadence minder (single TimePop client tending all 16-bit counters)
+//   • OCXO lanes    (QTimer2 CH0 for OCXO1, QTimer3 CH3 for OCXO2; currently still event rails)
 //   • VCLOCK lane   (critical recurring TimePop client on QTimer1 CH2)
 //   • TimePop       (QTimer1 CH2, hosted scheduler/client rail)
 //   • PPS GPIO edge (diagnostics + dispatch authority + epoch anchor)
@@ -100,18 +101,22 @@
 // ─── Per-lane cadence mechanics ─────────────────────────────────────────────
 //
 //   Three lanes (VCLOCK, OCXO1, OCXO2) produce one-second subscriber events.
-//   OCXO lanes are cadenced by their own QuadTimer compare channels at
-//   1 kHz because their 16-bit compare registers cannot span a full second.
-//   VCLOCK cadence is now a TimePop critical recurring ISR slot on QTimer1 CH2,
-//   sharing fire facts with other same-deadline TimePop clients.
+//   A single TimePop cadence minder now refreshes all process_interrupt-owned
+//   synthetic 32-bit counter anchors so 16-bit low-word rollover custody is
+//   centralized on the sovereign VCLOCK/TimePop rail.  OCXO compare channels
+//   are still present as event rails in this step, but rollover custody no
+//   longer depends on frequent OCXO interrupt service.  VCLOCK cadence is a
+//   TimePop critical recurring ISR slot on QTimer1 CH2, sharing fire facts
+//   with other same-deadline TimePop clients.
 //
 //   Cadence sources:
 //     VCLOCK : TimePop critical recurring ISR slot, +10000 counts/interval
 //              in the GNSS-disciplined 10 MHz VCLOCK domain.  QTimer1 CH0 is
 //              the passive low-word VCLOCK counter; QTimer1 CH2 is the only
 //              active TimePop compare rail.
-//     OCXO1  : QTimer2 CH0 compare, +10000 counts/interval (OCXO1 10 MHz)
-//     OCXO2  : QTimer3 CH3 compare, +10000 counts/interval (OCXO2 10 MHz)
+//     MINDER : TimePop recurring 1 ms client, tends VCLOCK/OCXO low-word counters
+//     OCXO1  : QTimer2 CH0 compare, event rail retained for current one-second events
+//     OCXO2  : QTimer3 CH3 compare, event rail retained for current one-second events
 // ============================================================================
 
 #pragma once
