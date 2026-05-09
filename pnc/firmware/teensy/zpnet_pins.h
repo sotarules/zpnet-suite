@@ -178,9 +178,9 @@ Driver: EV5491
 
 Pin numbering starts at the gold pin and proceeds clockwise.
 
-Pin #    Wire Color    Signal Name     Electrical / Voltage        Notes
+Pin #    Wire Color    Signal Name      Electrical / Voltage       Notes
 ---------------------------------------------------------------------------
-1        Blue          CASE_GND        Chassis / case              Parked
+1        Blue          CASE_GND         Chassis / case             Parked
 2        Black         LD- / PD-        GND (EV5491 GND)           Common return
 3        Red           LD+              ~1.397 V                   EV5491 ID1
 4        White         PD+              ~0.918 V                   Monitored (laser on/off)
@@ -277,7 +277,7 @@ Pin #    Signal Name        Wire Color    Connected To        Destination     No
 18       EPPS Output       —             —                   —              Unused
 17       PPS Output        STP           Teensy              Pin 1          Primary PPS
 16       GLCK Out          —             —                   —              Unused
-15       LOCK Signal       Green         Teensy              4            Lock status
+15       LOCK Signal       Green         Teensy              4              Lock status
 14       Alarm             —             —                   —              Unused
 11       VCLOCK Out        STP           Teensy              10             10 MHz square wave
 

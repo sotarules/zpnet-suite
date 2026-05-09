@@ -221,11 +221,23 @@ static constexpr uint32_t MAX_INTERRUPT_SUBSCRIBERS = 8;
 
 static constexpr uint32_t VCLOCK_INTERVAL_COUNTS = 10000U;  // 1 ms at 10 MHz
 
-static constexpr uint32_t OCXO_INTERVAL_COUNTS = 10000U;    // 1 ms at 10 MHz
+// OCXO cadence (deliberately distinct from VCLOCK).
+//
+// Experimental config: each OCXO lane fires every 2 ms (20000 OCXO ticks).
+// 500 compares per OCXO second × 20000 ticks = 10,000,000 ticks = 1 s.
+//
+// Phase offset between the two lanes is OCXO_INTERVAL_COUNTS / 2 (1 ms).
+// OCXO1 fires on even ms boundaries, OCXO2 fires on odd ms boundaries.
+// They cannot share an ISR window.
+static constexpr uint32_t OCXO_INTERVAL_COUNTS = 20000U;       // 2 ms at 10 MHz
 static constexpr uint32_t OCXO_COUNTS_PER_SECOND = 10000000U;
+static constexpr uint32_t OCXO_PHASE_OFFSET_TICKS =
+    OCXO_INTERVAL_COUNTS / 2U;                                 // 1 ms
 
-// Ticks per emitted one-second event.  1000 ticks × 1 ms = 1 s.
-static constexpr uint32_t TICKS_PER_SECOND_EVENT = 1000U;
+// Ticks per emitted one-second event.  Lane-specific because OCXO and VCLOCK
+// run on different cadences.
+static constexpr uint32_t TICKS_PER_SECOND_EVENT      = 1000U;  // VCLOCK: 1 kHz
+static constexpr uint32_t TICKS_PER_SECOND_EVENT_OCXO = 500U;   // OCXO:   500 Hz
 
 // ============================================================================
 // Latency constants

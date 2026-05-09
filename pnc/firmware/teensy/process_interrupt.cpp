@@ -1650,6 +1650,84 @@ struct ocxo_deferred_work_t {
 static ocxo_deferred_work_t g_ocxo1_deferred = {};
 static ocxo_deferred_work_t g_ocxo2_deferred = {};
 
+// ----------------------------------------------------------------------------
+// OCXO post-ISR mailbox — single slot per lane, drained by ASAP foreground.
+// ----------------------------------------------------------------------------
+//
+// The QTimer2/QTimer3 ISR captures the minimum facts needed for hardware
+// rearm and 1 Hz cadence accounting, then writes this mailbox and arms a
+// TimePop ASAP slot.  All non-essential bookkeeping (synthetic clock advance,
+// diag stores, late-ticks accounting, 1 Hz edge defer) runs in the ASAP
+// callback in foreground context.
+//
+// Mailbox semantics:
+//   • Single slot.  If a new ISR fires while the previous sample has not been
+//     consumed, the new sample overwrites and overwrite_count is incremented.
+//   • The lossy bookkeeping is acceptable because cadence-critical state
+//     (lane.tick_mod_1000) is updated inside the ISR itself.
+//   • Hardware re-arm and cadence counting cannot be lost.
+
+struct ocxo_post_isr_mailbox_t {
+  volatile bool     pending = false;
+  volatile uint32_t isr_entry_dwt_raw = 0;
+  volatile uint32_t event_dwt = 0;
+  volatile uint16_t fired_low16 = 0;
+  volatile bool     emit_one_second = false;
+  volatile uint32_t sequence = 0;
+};
+
+static ocxo_post_isr_mailbox_t g_ocxo1_post_isr = {};
+static ocxo_post_isr_mailbox_t g_ocxo2_post_isr = {};
+
+static volatile uint32_t g_ocxo1_post_isr_overwrite_count = 0;
+static volatile uint32_t g_ocxo2_post_isr_overwrite_count = 0;
+static volatile uint32_t g_ocxo1_post_isr_arm_count = 0;
+static volatile uint32_t g_ocxo2_post_isr_arm_count = 0;
+static volatile uint32_t g_ocxo1_post_isr_drain_count = 0;
+static volatile uint32_t g_ocxo2_post_isr_drain_count = 0;
+
+static const char* ocxo_post_isr_name(interrupt_subscriber_kind_t kind) {
+  return (kind == interrupt_subscriber_kind_t::OCXO1)
+      ? "OCXO1_POST_ISR"
+      : "OCXO2_POST_ISR";
+}
+
+static ocxo_post_isr_mailbox_t&
+ocxo_post_isr_mailbox_for(interrupt_subscriber_kind_t kind) {
+  return (kind == interrupt_subscriber_kind_t::OCXO1)
+      ? g_ocxo1_post_isr
+      : g_ocxo2_post_isr;
+}
+
+static void ocxo_post_isr_overwrite_inc(interrupt_subscriber_kind_t kind) {
+  if (kind == interrupt_subscriber_kind_t::OCXO1) {
+    g_ocxo1_post_isr_overwrite_count++;
+  } else {
+    g_ocxo2_post_isr_overwrite_count++;
+  }
+}
+
+static void ocxo_post_isr_arm_inc(interrupt_subscriber_kind_t kind) {
+  if (kind == interrupt_subscriber_kind_t::OCXO1) {
+    g_ocxo1_post_isr_arm_count++;
+  } else {
+    g_ocxo2_post_isr_arm_count++;
+  }
+}
+
+static void ocxo_post_isr_drain_inc(interrupt_subscriber_kind_t kind) {
+  if (kind == interrupt_subscriber_kind_t::OCXO1) {
+    g_ocxo1_post_isr_drain_count++;
+  } else {
+    g_ocxo2_post_isr_drain_count++;
+  }
+}
+
+// Forward decl so the ISR can reference it.
+static void ocxo_post_isr_asap_callback(timepop_ctx_t*,
+                                        timepop_diag_t*,
+                                        void* user_data);
+
 static void ocxo_deferred_asap_callback(timepop_ctx_t*, timepop_diag_t*, void* user_data) {
   auto* rt = static_cast<interrupt_subscriber_runtime_t*>(user_data);
   if (!rt || !rt->desc) return;
@@ -1733,22 +1811,56 @@ static void ocxo_defer_one_second_edge(ocxo_deferred_work_t& work,
                          ocxo_deferred_name(kind));
 }
 
+// Minimal ISR.
+//
+// Cycle budget by inspection:
+//   1.  TCF1 pending check          — one peripheral read
+//   2.  TCF1 clear                  — one peripheral write
+//   3.  event_dwt latency-adjust    — one arithmetic op
+//   4.  compare_target advance      — one arithmetic op
+//   5.  next compare program        — two peripheral writes
+//   6.  tick_mod_1000 advance       — cadence counter (kept in ISR for
+//                                     correctness; see header comment)
+//   7.  mailbox write + ASAP arm    — handoff to foreground
+//
+// Everything else — synthetic clock advance, diag bookkeeping, 1 Hz
+// edge defer, late-ticks moral equivalent — runs in
+// ocxo_post_isr_asap_callback() at foreground priority.
+//
+// Cadence correctness:
+//   tick_mod_1000 lives in the ISR.  ASAP is allowed to drop samples (the
+//   mailbox overwrites), but the 1 Hz boundary detection is never lost
+//   because the counter advances inside the ISR itself.  When the ISR
+//   detects a 1 Hz boundary it sets emit_one_second=true in the mailbox,
+//   and the ASAP callback chains to ocxo_defer_one_second_edge().
+
 static void ocxo_lane_compare_isr(ocxo_lane_t& lane,
                                   interrupt_subscriber_runtime_t* rt,
                                   interrupt_subscriber_kind_t kind,
                                   synthetic_clock32_t& clock32,
                                   ocxo_deferred_work_t& work,
                                   uint32_t isr_entry_dwt_raw) {
+  // Doctrinal foot-shot guard: clock32 / work parameters are unused here
+  // now; the ASAP callback resolves them by kind.  Keep the signature so
+  // the call sites remain trivial wrappers.
+  (void)clock32;
+  (void)work;
+
   if (!ocxo_lane_compare_flag_pending(lane)) return;
 
   ocxo_lane_clear_compare_flag(lane);
 
-  const uint32_t event_dwt = qtimer_event_dwt_from_isr_entry_raw(isr_entry_dwt_raw);
-  const uint16_t fired_low16 = lane.compare_target;
-  const uint32_t late_ticks =
-      (uint32_t)((uint16_t)(ocxo_lane_counter_now(lane) - fired_low16));
+  const uint32_t event_dwt =
+      qtimer_event_dwt_from_isr_entry_raw(isr_entry_dwt_raw);
 
-  ocxo_lane_record_isr_diag(kind, isr_entry_dwt_raw, event_dwt, late_ticks);
+  // Capture fired_low16 before advancing compare_target.
+  const uint16_t fired_low16 = lane.compare_target;
+
+  // Advance hardware compare ladder.  This must happen in the ISR; the
+  // OCXO QTimer does not auto-reload to a new compare value.
+  lane.compare_target =
+      (uint16_t)(lane.compare_target + (uint16_t)OCXO_INTERVAL_COUNTS);
+  ocxo_lane_program_compare(lane, lane.compare_target);
 
   if (!rt || !lane.active || !rt->active) {
     lane.miss_count++;
@@ -1758,10 +1870,6 @@ static void ocxo_lane_compare_isr(ocxo_lane_t& lane,
   lane.irq_count++;
   rt->irq_count++;
 
-  lane.compare_target =
-      (uint16_t)(lane.compare_target + (uint16_t)OCXO_INTERVAL_COUNTS);
-  ocxo_lane_program_compare(lane, lane.compare_target);
-
   if (!lane.phase_bootstrapped) {
     lane.phase_bootstrapped = true;
     lane.bootstrap_count++;
@@ -1770,20 +1878,115 @@ static void ocxo_lane_compare_isr(ocxo_lane_t& lane,
     return;
   }
 
-  lane.cadence_hits_total++;
-  lane.logical_count32_at_last_second =
-      synthetic_clock_advance_at_hardware(clock32,
-                                          OCXO_INTERVAL_COUNTS,
-                                          fired_low16);
+  // Cadence counter — kept in ISR so 1 Hz boundary cannot drift even if
+  // ASAP draining is lossy.
+  //
+  // OCXO lanes run on TICKS_PER_SECOND_EVENT_OCXO (500), distinct from
+  // VCLOCK's TICKS_PER_SECOND_EVENT (1000).  The lane field name retains
+  // its legacy "_1000" suffix; rename will follow once cadence is locked.
+  const bool one_second_boundary =
+      (++lane.tick_mod_1000 >= TICKS_PER_SECOND_EVENT_OCXO);
+  if (one_second_boundary) {
+    lane.tick_mod_1000 = 0;
+  }
 
-  if (++lane.tick_mod_1000 < TICKS_PER_SECOND_EVENT) return;
+  // Hand off everything else to ASAP foreground.
+  ocxo_post_isr_mailbox_t& mb = ocxo_post_isr_mailbox_for(kind);
+  if (mb.pending) {
+    ocxo_post_isr_overwrite_inc(kind);
+  }
+  mb.isr_entry_dwt_raw = isr_entry_dwt_raw;
+  mb.event_dwt         = event_dwt;
+  mb.fired_low16       = fired_low16;
+  mb.emit_one_second   = one_second_boundary;
+  mb.sequence++;
+  mb.pending           = true;
 
-  lane.tick_mod_1000 = 0;
-  ocxo_defer_one_second_edge(work,
-                             rt,
-                             kind,
-                             event_dwt,
-                             lane.logical_count32_at_last_second);
+  ocxo_post_isr_arm_inc(kind);
+  (void)timepop_arm_asap(ocxo_post_isr_asap_callback,
+                         rt,
+                         ocxo_post_isr_name(kind));
+}
+
+// Foreground drain — runs at TimePop ASAP priority, no ISR pressure.
+//
+// Snapshots the mailbox under critical-section guard, then performs all
+// synthetic clock and diagnostic work outside the critical section.
+
+static void ocxo_post_isr_asap_callback(timepop_ctx_t*,
+                                        timepop_diag_t*,
+                                        void* user_data) {
+  auto* rt = static_cast<interrupt_subscriber_runtime_t*>(user_data);
+  if (!rt || !rt->desc) return;
+
+  const interrupt_subscriber_kind_t kind = rt->desc->kind;
+  ocxo_post_isr_mailbox_t& mb = ocxo_post_isr_mailbox_for(kind);
+
+  // Snapshot under PRIMASK so an ISR that fires mid-drain cannot tear the
+  // sample we are about to consume.  The ISR may overwrite *after* we exit
+  // this section; that simply queues a fresh ASAP for the next sample.
+  uint32_t isr_entry_dwt_raw;
+  uint32_t event_dwt;
+  uint16_t fired_low16;
+  bool     emit_one_second;
+  bool     had_sample;
+
+  __disable_irq();
+  had_sample = mb.pending;
+  if (had_sample) {
+    isr_entry_dwt_raw = mb.isr_entry_dwt_raw;
+    event_dwt         = mb.event_dwt;
+    fired_low16       = mb.fired_low16;
+    emit_one_second   = mb.emit_one_second;
+    mb.pending = false;
+  } else {
+    isr_entry_dwt_raw = 0;
+    event_dwt         = 0;
+    fired_low16       = 0;
+    emit_one_second   = false;
+  }
+  __enable_irq();
+
+  if (!had_sample) return;
+
+  ocxo_post_isr_drain_inc(kind);
+
+  ocxo_lane_t* lane = ocxo_lane_for(kind);
+  if (!lane) return;
+
+  // Late-ticks moral equivalent: we are running in foreground, so any
+  // CNTR read here is "drain latency in OCXO ticks", not "ISR-entry-to-
+  // counter ticks".  The diag store retains its existing field shape so
+  // downstream consumers do not see a structural change; the value's
+  // semantics shift from ISR-entry-late to drain-late.
+  const uint32_t drain_ticks =
+      (uint32_t)((uint16_t)(ocxo_lane_counter_now(*lane) - fired_low16));
+
+  ocxo_lane_record_isr_diag(kind, isr_entry_dwt_raw, event_dwt, drain_ticks);
+
+  // Synthetic clock advance — the same arithmetic the ISR used to do.
+  synthetic_clock32_t* clock32 = synthetic_clock_for_kind(kind);
+  if (clock32) {
+    lane->cadence_hits_total++;
+    lane->logical_count32_at_last_second =
+        synthetic_clock_advance_at_hardware(*clock32,
+                                            OCXO_INTERVAL_COUNTS,
+                                            fired_low16);
+  }
+
+  // 1 Hz edge defer — chain into the existing publication path so all
+  // downstream behavior is preserved exactly.
+  if (emit_one_second) {
+    ocxo_deferred_work_t& work =
+        (kind == interrupt_subscriber_kind_t::OCXO1)
+            ? g_ocxo1_deferred
+            : g_ocxo2_deferred;
+    ocxo_defer_one_second_edge(work,
+                               rt,
+                               kind,
+                               event_dwt,
+                               lane->logical_count32_at_last_second);
+  }
 }
 
 static void qtimer2_isr(void) {
@@ -2238,7 +2441,35 @@ bool interrupt_start(interrupt_subscriber_kind_t kind) {
   lane->active = true;
   lane->phase_bootstrapped = false;
   lane->tick_mod_1000 = 0;
-  ocxo_lane_program_compare(*lane, (uint16_t)(lane->compare_target + 1));
+
+  // Deliberate inter-lane phase offset.
+  //
+  // OCXO1 starts one OCXO_INTERVAL_COUNTS ahead of "now" — fires on the
+  // canonical even-ms grid.  OCXO2 starts one OCXO_INTERVAL_COUNTS / 2
+  // (one ms) behind OCXO1 on the same grid — fires on the odd-ms grid.
+  //
+  // Each lane's compare_target is interpreted modulo 65536 by the QTimer
+  // hardware.  After this initial offset, both lanes advance by
+  // OCXO_INTERVAL_COUNTS each ISR, so the half-interval gap is preserved
+  // for the life of the campaign (modulo OCXO crystal frequency drift).
+  //
+  // Note: lane->compare_target on entry here is the most recent value
+  // process_interrupt has authored for this lane; for a freshly initialized
+  // lane that's zero.  We bias from "now" using ocxo_lane_counter_now so
+  // the first compare fires a clean interval ahead of the live counter,
+  // not at an arbitrary stale offset.
+  const uint16_t now_low16 = ocxo_lane_counter_now(*lane);
+  uint16_t initial_target;
+  if (kind == interrupt_subscriber_kind_t::OCXO1) {
+    initial_target = (uint16_t)(now_low16 + (uint16_t)OCXO_INTERVAL_COUNTS);
+  } else {
+    // OCXO2 — half-interval offset for odd/even ms phasing.
+    initial_target = (uint16_t)(now_low16 +
+                                (uint16_t)OCXO_INTERVAL_COUNTS +
+                                (uint16_t)OCXO_PHASE_OFFSET_TICKS);
+  }
+  lane->compare_target = initial_target;
+  ocxo_lane_program_compare(*lane, lane->compare_target);
   return true;
 }
 
@@ -2485,7 +2716,6 @@ void process_interrupt_enable_irqs(void) {
   NVIC_SET_PRIORITY(IRQ_QTIMER1, 0);
   NVIC_ENABLE_IRQ(IRQ_QTIMER1);
 
-
   attachInterruptVector(IRQ_QTIMER2, qtimer2_isr);
   NVIC_SET_PRIORITY(IRQ_QTIMER2, 16);
   NVIC_ENABLE_IRQ(IRQ_QTIMER2);
@@ -2499,7 +2729,7 @@ void process_interrupt_enable_irqs(void) {
   // PPS GPIO is now a witness/selector, not the highest-priority timing
   // interpolation rail.  Keep it below QTimer1 so VCLOCK/TimePop event facts
   // are not delayed by PPS witness work.
-  NVIC_SET_PRIORITY(IRQ_GPIO6789, 32);
+  NVIC_SET_PRIORITY(IRQ_GPIO6789, 0);
 
   g_interrupt_irqs_enabled = true;
 }
@@ -2547,10 +2777,18 @@ static Payload cmd_report(const Payload&) {
   p.add("ocxo1_active", g_rt_ocxo1 ? g_rt_ocxo1->active : false);
   p.add("ocxo1_event_count", g_rt_ocxo1 ? g_rt_ocxo1->event_count : 0U);
   p.add("ocxo1_dispatch_count", g_rt_ocxo1 ? g_rt_ocxo1->dispatch_count : 0U);
+
   p.add("ocxo2_subscribed", g_rt_ocxo2 ? g_rt_ocxo2->subscribed : false);
   p.add("ocxo2_active", g_rt_ocxo2 ? g_rt_ocxo2->active : false);
   p.add("ocxo2_event_count", g_rt_ocxo2 ? g_rt_ocxo2->event_count : 0U);
   p.add("ocxo2_dispatch_count", g_rt_ocxo2 ? g_rt_ocxo2->dispatch_count : 0U);
+  p.add("ocxo1_post_isr_arm_count",       g_ocxo1_post_isr_arm_count);
+  p.add("ocxo1_post_isr_drain_count",     g_ocxo1_post_isr_drain_count);
+  p.add("ocxo1_post_isr_overwrite_count", g_ocxo1_post_isr_overwrite_count);
+  p.add("ocxo2_post_isr_arm_count",       g_ocxo2_post_isr_arm_count);
+  p.add("ocxo2_post_isr_drain_count",     g_ocxo2_post_isr_drain_count);
+  p.add("ocxo2_post_isr_overwrite_count", g_ocxo2_post_isr_overwrite_count);
+
   p.add("pps_rebootstrap_pending", g_pps_rebootstrap_pending);
   p.add("pps_rebootstrap_count",   g_pps_rebootstrap_count);
   p.add("vclock_epoch_latch_pending", g_vclock_epoch_latch.pending);

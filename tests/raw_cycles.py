@@ -28,6 +28,22 @@ Alpha forensics when available:
 A forensic_delta of zero means the prediction payload and Alpha forensic DWT
 edge subtraction agree exactly.
 
+OCXO counter32 surface (cdelta):
+
+  Each TIMEBASE row carries the Alpha-forensics counter32 delta between
+  consecutive OCXO 1 Hz events:
+
+    o1_cdelta = ocxo1_forensics_counter32_delta_since_previous_event
+    o2_cdelta = ocxo2_forensics_counter32_delta_since_previous_event
+
+  These deltas are the synthetic VCLOCK-counter32 advance Alpha applies for
+  each lane per 1 Hz event.  Under the OCXO cadence ladder, each 1 Hz event is
+  TICKS_PER_SECOND_EVENT_OCXO × OCXO_INTERVAL_COUNTS = 10,000,000 OCXO ticks
+  apart by construction, so the expected value is a flat 10,000,000.  Any
+  deviation indicates a synthetic-counter advance that did not match the
+  programmed cadence — useful for distinguishing firmware-asserted bookkeeping
+  from any real OCXO/QTimer measurement variation.
+
 Usage:
     python -m zpnet.tests.raw_cycles <campaign_name> [limit]
     python raw_cycles.py <campaign_name> [limit]
@@ -304,6 +320,36 @@ def ocxo_forensic_last_event_dwt_from_schema(root: Dict[str, Any],
     )
 
 
+def ocxo_forensic_counter32_delta_from_schema(root: Dict[str, Any],
+                                                frag: Dict[str, Any],
+                                                lane: str) -> Optional[int]:
+    """Return Alpha forensic counter32 delta since previous event for an OCXO lane.
+
+    This is the synthetic VCLOCK-counter32 advance Alpha applied between this
+    1 Hz event and the previous one.  Under the OCXO cadence ladder, each 1 Hz
+    event is TICKS_PER_SECOND_EVENT_OCXO × OCXO_INTERVAL_COUNTS = 10,000,000
+    OCXO ticks apart by construction, so this value is expected to be a flat
+    10,000,000 every row.
+    """
+    flat_keys = (
+        f"{lane}_forensics_counter32_delta_since_previous_event",
+        f"{lane}_counter32_delta_since_previous_event",
+    )
+    flat = _first_int(*(frag.get(k) for k in flat_keys),
+                      *(root.get(k) for k in flat_keys))
+    if flat is not None:
+        return flat
+
+    return _first_path_int(
+        (frag, ("clock_forensics", lane, "alpha_event",
+                "counter32_delta_since_previous_event")),
+        (root, ("clock_forensics", lane, "alpha_event",
+                "counter32_delta_since_previous_event")),
+        (frag, ("forensics", lane, "counter32_delta_since_previous_event")),
+        (root, ("forensics", lane, "counter32_delta_since_previous_event")),
+    )
+
+
 def lane_prediction(pred: Dict[str, Any], lane: str) -> Tuple[Optional[int], Optional[int], Optional[int], Optional[int], Optional[int]]:
     actual = _first_int(pred.get(f"{lane}_actual_cycles"))
     static = _first_int(pred.get(f"{lane}_static_prediction_cycles"))
@@ -337,14 +383,16 @@ def analyze(campaign: str, limit: int = 0) -> None:
     print("  VCLOCK actual = phase-estimated PPS_VCLOCK DWT delta when valid; otherwise lattice/fallback")
     print("  OCXO   actual/static/dynamic/residual = compact firmware prediction audit")
     print("         fact/fΔ = Alpha-forensics DWT reconstruction and fact - actual")
+    print("         cdelta  = Alpha-forensics counter32 delta since previous event")
+    print("                   (expected: flat 10,000,000 by cadence-ladder construction)")
     print()
 
     header = (
         f"{'pps':>6s}  "
         f"{'pps_act':>13s} {'pps_stat':>13s} {'pps_sres':>9s} {'phase':>7s}  "
         f"{'v_act':>13s} {'v_stat':>13s} {'v_sres':>8s} {'v_dyn':>13s} {'v_dres':>8s} {'vsrc':>7s}  "
-        f"{'o1_act':>13s} {'o1_stat':>13s} {'o1_sres':>8s} {'o1_fact':>13s} {'o1_fΔ':>8s} {'o1_dyn':>13s} {'o1_dres':>8s}  "
-        f"{'o2_act':>13s} {'o2_stat':>13s} {'o2_sres':>8s} {'o2_fact':>13s} {'o2_fΔ':>8s} {'o2_dyn':>13s} {'o2_dres':>8s}  "
+        f"{'o1_act':>13s} {'o1_stat':>13s} {'o1_sres':>8s} {'o1_fact':>13s} {'o1_fΔ':>8s} {'o1_dyn':>13s} {'o1_dres':>8s} {'o1_cdelta':>13s}  "
+        f"{'o2_act':>13s} {'o2_stat':>13s} {'o2_sres':>8s} {'o2_fact':>13s} {'o2_fΔ':>8s} {'o2_dyn':>13s} {'o2_dres':>8s} {'o2_cdelta':>13s}  "
         f"{'dwt_ppb':>10s}"
     )
     print(header)
@@ -352,8 +400,8 @@ def analyze(campaign: str, limit: int = 0) -> None:
         f"{'─'*6}  "
         f"{'─'*13} {'─'*13} {'─'*9} {'─'*7}  "
         f"{'─'*13} {'─'*13} {'─'*8} {'─'*13} {'─'*8} {'─'*7}  "
-        f"{'─'*13} {'─'*13} {'─'*8} {'─'*13} {'─'*8} {'─'*13} {'─'*8}  "
-        f"{'─'*13} {'─'*13} {'─'*8} {'─'*13} {'─'*8} {'─'*13} {'─'*8}  "
+        f"{'─'*13} {'─'*13} {'─'*8} {'─'*13} {'─'*8} {'─'*13} {'─'*8} {'─'*13}  "
+        f"{'─'*13} {'─'*13} {'─'*8} {'─'*13} {'─'*8} {'─'*13} {'─'*8} {'─'*13}  "
         f"{'─'*10}"
     )
 
@@ -379,11 +427,13 @@ def analyze(campaign: str, limit: int = 0) -> None:
         "ocxo1_forensic_actual": Welford(),
         "ocxo1_forensic_delta": Welford(),
         "ocxo1_dynamic_residual": Welford(),
+        "ocxo1_counter32_delta": Welford(),
         "ocxo2_actual": Welford(),
         "ocxo2_static_residual": Welford(),
         "ocxo2_forensic_actual": Welford(),
         "ocxo2_forensic_delta": Welford(),
         "ocxo2_dynamic_residual": Welford(),
+        "ocxo2_counter32_delta": Welford(),
     }
 
     coverage = {
@@ -395,9 +445,11 @@ def analyze(campaign: str, limit: int = 0) -> None:
         "ocxo1_prediction": 0,
         "ocxo1_forensic_actual": 0,
         "ocxo1_forensic_delta": 0,
+        "ocxo1_counter32_delta": 0,
         "ocxo2_prediction": 0,
         "ocxo2_forensic_actual": 0,
         "ocxo2_forensic_delta": 0,
+        "ocxo2_counter32_delta": 0,
     }
 
     for rec in rows:
@@ -491,6 +543,9 @@ def analyze(campaign: str, limit: int = 0) -> None:
             else None
         )
 
+        ocxo1_counter32_delta = ocxo_forensic_counter32_delta_from_schema(root, frag, "ocxo1")
+        ocxo2_counter32_delta = ocxo_forensic_counter32_delta_from_schema(root, frag, "ocxo2")
+
         dwt_ppb = _as_float(frag.get("dwt_ppb"))
         coverage["rows"] += 1
         if pps_actual is not None:
@@ -507,12 +562,16 @@ def analyze(campaign: str, limit: int = 0) -> None:
             coverage["ocxo1_forensic_actual"] += 1
         if ocxo1_forensic_delta is not None:
             coverage["ocxo1_forensic_delta"] += 1
+        if ocxo1_counter32_delta is not None:
+            coverage["ocxo1_counter32_delta"] += 1
         if ocxo2_actual is not None or ocxo2_static is not None or ocxo2_dynamic is not None:
             coverage["ocxo2_prediction"] += 1
         if ocxo2_forensic_actual is not None:
             coverage["ocxo2_forensic_actual"] += 1
         if ocxo2_forensic_delta is not None:
             coverage["ocxo2_forensic_delta"] += 1
+        if ocxo2_counter32_delta is not None:
+            coverage["ocxo2_counter32_delta"] += 1
 
         add_optional(stats["pps_actual"], pps_actual)
         add_optional(stats["pps_static_residual"], pps_static_res)
@@ -525,11 +584,13 @@ def analyze(campaign: str, limit: int = 0) -> None:
         add_optional(stats["ocxo1_forensic_actual"], ocxo1_forensic_actual)
         add_optional(stats["ocxo1_forensic_delta"], ocxo1_forensic_delta)
         add_optional(stats["ocxo1_dynamic_residual"], ocxo1_dynamic_res)
+        add_optional(stats["ocxo1_counter32_delta"], ocxo1_counter32_delta)
         add_optional(stats["ocxo2_actual"], ocxo2_actual)
         add_optional(stats["ocxo2_static_residual"], ocxo2_static_res)
         add_optional(stats["ocxo2_forensic_actual"], ocxo2_forensic_actual)
         add_optional(stats["ocxo2_forensic_delta"], ocxo2_forensic_delta)
         add_optional(stats["ocxo2_dynamic_residual"], ocxo2_dynamic_res)
+        add_optional(stats["ocxo2_counter32_delta"], ocxo2_counter32_delta)
 
         print(
             f"{pps_count:>6d}  "
@@ -538,10 +599,12 @@ def analyze(campaign: str, limit: int = 0) -> None:
             f"{_fmt_int(vclock_dynamic, 13)} {_fmt_int(vclock_dynamic_res, 8, signed=True)} {_fmt_str(vclock_source, 7)}  "
             f"{_fmt_int(ocxo1_actual, 13)} {_fmt_int(ocxo1_static, 13)} {_fmt_int(ocxo1_static_res, 8, signed=True)} "
             f"{_fmt_int(ocxo1_forensic_actual, 13)} {_fmt_int(ocxo1_forensic_delta, 8, signed=True)} "
-            f"{_fmt_int(ocxo1_dynamic, 13)} {_fmt_int(ocxo1_dynamic_res, 8, signed=True)}  "
+            f"{_fmt_int(ocxo1_dynamic, 13)} {_fmt_int(ocxo1_dynamic_res, 8, signed=True)} "
+            f"{_fmt_int(ocxo1_counter32_delta, 13)}  "
             f"{_fmt_int(ocxo2_actual, 13)} {_fmt_int(ocxo2_static, 13)} {_fmt_int(ocxo2_static_res, 8, signed=True)} "
             f"{_fmt_int(ocxo2_forensic_actual, 13)} {_fmt_int(ocxo2_forensic_delta, 8, signed=True)} "
-            f"{_fmt_int(ocxo2_dynamic, 13)} {_fmt_int(ocxo2_dynamic_res, 8, signed=True)}  "
+            f"{_fmt_int(ocxo2_dynamic, 13)} {_fmt_int(ocxo2_dynamic_res, 8, signed=True)} "
+            f"{_fmt_int(ocxo2_counter32_delta, 13)}  "
             f"{_fmt_float(dwt_ppb, 10, 3, signed=True)}"
         )
 
@@ -576,9 +639,11 @@ def analyze(campaign: str, limit: int = 0) -> None:
     print(f"  OCXO1 prediction rows         = {coverage['ocxo1_prediction']:,}")
     print(f"  OCXO1 forensic actual rows    = {coverage['ocxo1_forensic_actual']:,}")
     print(f"  OCXO1 forensic delta rows     = {coverage['ocxo1_forensic_delta']:,}")
+    print(f"  OCXO1 counter32 delta rows    = {coverage['ocxo1_counter32_delta']:,}")
     print(f"  OCXO2 prediction rows         = {coverage['ocxo2_prediction']:,}")
     print(f"  OCXO2 forensic actual rows    = {coverage['ocxo2_forensic_actual']:,}")
     print(f"  OCXO2 forensic delta rows     = {coverage['ocxo2_forensic_delta']:,}")
+    print(f"  OCXO2 counter32 delta rows    = {coverage['ocxo2_counter32_delta']:,}")
     print()
 
     print("Summary")
@@ -594,11 +659,13 @@ def analyze(campaign: str, limit: int = 0) -> None:
     _print_welford("OCXO1 forensic actual", stats["ocxo1_forensic_actual"])
     _print_welford("OCXO1 forensic delta", stats["ocxo1_forensic_delta"])
     _print_welford("OCXO1 dynamic residual", stats["ocxo1_dynamic_residual"])
+    _print_welford("OCXO1 counter32 delta (ticks)", stats["ocxo1_counter32_delta"], unit="ticks")
     _print_welford("OCXO2 actual cycles", stats["ocxo2_actual"])
     _print_welford("OCXO2 static residual", stats["ocxo2_static_residual"])
     _print_welford("OCXO2 forensic actual", stats["ocxo2_forensic_actual"])
     _print_welford("OCXO2 forensic delta", stats["ocxo2_forensic_delta"])
     _print_welford("OCXO2 dynamic residual", stats["ocxo2_dynamic_residual"])
+    _print_welford("OCXO2 counter32 delta (ticks)", stats["ocxo2_counter32_delta"], unit="ticks")
     print()
 
     print("Notes")
@@ -610,6 +677,9 @@ def analyze(campaign: str, limit: int = 0) -> None:
     print("  • VCLOCK residuals are recomputed against firmware predictions when the preferred DWT actual is used.")
     print("  • OCXO fact columns reconstruct cycles from Alpha forensic last_event_dwt when present.")
     print("  • OCXO fΔ = forensic_actual - prediction_actual; zero means exact agreement.")
+    print("  • OCXO cdelta = ocxo*_forensics_counter32_delta_since_previous_event from the fragment.")
+    print("    Expected value is a flat 10,000,000 by cadence-ladder construction; any deviation")
+    print("    indicates a synthetic-counter advance that did not match the programmed cadence.")
     print()
 
 
