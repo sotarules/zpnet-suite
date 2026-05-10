@@ -112,6 +112,36 @@ static constexpr uint32_t PREDICT_MAX_QTIMER_ELAPSED = 15000000U;
 static constexpr uint32_t ONE_HZ_TICKS = 10000000U;
 static constexpr const char* WITNESS_SCHEDULER_NAME = "WITNESS_SCHEDULER";
 
+// SpinCatch wakes TimePop before a real hardware edge, spins in the CH2 IRQ
+// context, and waits for a different/higher-priority target ISR to finish the
+// capture through timepop_spincatch_finish_from_isr().  Lead is intentionally
+// a TimePop constant so the approach window can be tuned globally.
+static constexpr uint64_t TIMEPOP_SPINCATCH_LEAD_NS = 5000ULL;
+static constexpr uint32_t TIMEPOP_SPINCATCH_LEAD_TICKS =
+    (uint32_t)(TIMEPOP_SPINCATCH_LEAD_NS / NS_PER_TICK);
+static constexpr uint32_t TIMEPOP_SPINCATCH_TIMEOUT_CYCLES = 20000U;
+
+// SpinCatch preemption forensics.  util.h already supplies read_basepri();
+// keep the remaining ARM special-register reads local to TimePop because
+// they are report-only diagnostics for this experiment.
+static inline uint32_t timepop_read_primask(void) {
+  uint32_t v;
+  __asm volatile("mrs %0, primask" : "=r" (v));
+  return v;
+}
+
+static inline uint32_t timepop_read_faultmask(void) {
+  uint32_t v;
+  __asm volatile("mrs %0, faultmask" : "=r" (v));
+  return v;
+}
+
+static inline uint32_t timepop_read_ipsr(void) {
+  uint32_t v;
+  __asm volatile("mrs %0, ipsr" : "=r" (v));
+  return v;
+}
+
 
 // ============================================================================
 // Slot
@@ -151,6 +181,7 @@ enum class timepop_arm_source_t : uint8_t {
   ISR_REARM_FALLBACK,
   EPOCH_REARM,
   EPOCH_REARM_FALLBACK,
+  SPINCATCH_ARM,
 };
 
 static const char* arm_source_str(timepop_arm_source_t source) {
@@ -167,6 +198,7 @@ static const char* arm_source_str(timepop_arm_source_t source) {
     case timepop_arm_source_t::ISR_REARM_FALLBACK: return "ISR_REARM_FALLBACK";
     case timepop_arm_source_t::EPOCH_REARM: return "EPOCH_REARM";
     case timepop_arm_source_t::EPOCH_REARM_FALLBACK: return "EPOCH_REARM_FALLBACK";
+    case timepop_arm_source_t::SPINCATCH_ARM: return "SPINCATCH_ARM";
     default: return "NONE";
   }
 }
@@ -259,6 +291,26 @@ struct timepop_slot_t {
   bool                last_arm_already_past;
   bool                last_arm_had_now;
   uint32_t            arm_already_past_count;
+
+  // SpinCatch: this slot is a pre-interrupt spin window, not a normal timed
+  // callback.  deadline is the early wake/spin-start deadline.  The fields
+  // below retain the real target identity and post-run forensics.
+  bool                spincatch;
+  uint32_t            spincatch_target_deadline;
+  int64_t             spincatch_target_gnss_ns;
+  uint32_t            spincatch_target_dwt;
+  uint64_t            spincatch_lead_ns;
+  uint32_t            spincatch_lead_ticks;
+  uint32_t            spincatch_timeout_cycles;
+  uint32_t            spincatch_fire_count;
+  uint32_t            spincatch_caught_count;
+  uint32_t            spincatch_timeout_count;
+  uint32_t            spincatch_last_landing_dwt;
+  uint32_t            spincatch_last_final_shadow_dwt;
+  uint32_t            spincatch_last_shadow_seq;
+  uint32_t            spincatch_last_approach_cycles;
+  uint32_t            spincatch_last_isr_entry_dwt_raw;
+  uint32_t            spincatch_last_isr_entry_latency_cycles;
 };
 
 
@@ -279,6 +331,100 @@ static deferred_slot_t asap_slots[MAX_ASAP_SLOTS];
 static deferred_slot_t alap_slots[MAX_ALAP_SLOTS];
 static volatile bool   timepop_pending = false;
 static uint32_t        next_handle = 1;
+
+struct spincatch_runtime_t {
+  volatile bool     active = false;
+  volatile bool     caught = false;
+  volatile bool     timeout = false;
+
+  timepop_handle_t   handle = TIMEPOP_INVALID_HANDLE;
+  timepop_callback_t callback = nullptr;
+  void*              user_data = nullptr;
+  const char*        name = nullptr;
+
+  uint32_t           spin_start_deadline = 0;
+  uint32_t           target_deadline = 0;
+  int64_t            target_gnss_ns = -1;
+  uint32_t           target_dwt = 0;
+  bool               prediction_valid = false;
+  uint64_t           lead_ns = TIMEPOP_SPINCATCH_LEAD_NS;
+  uint32_t           lead_ticks = TIMEPOP_SPINCATCH_LEAD_TICKS;
+  uint32_t           timeout_cycles = TIMEPOP_SPINCATCH_TIMEOUT_CYCLES;
+
+  uint32_t           anchor_pps_count = 0;
+  uint32_t           anchor_qtimer_at_pps = 0;
+  uint32_t           anchor_dwt_at_pps = 0;
+  uint32_t           anchor_dwt_cycles_per_s = 0;
+  bool               anchor_valid = false;
+
+  volatile uint32_t  landing_dwt = 0;
+  volatile uint32_t  shadow_dwt = 0;
+  volatile uint32_t  shadow_seq = 0;
+  volatile uint32_t  final_shadow_dwt = 0;
+  volatile uint32_t  approach_cycles = 0;
+  volatile uint32_t  isr_entry_dwt_raw = 0;
+  volatile uint32_t  isr_entry_latency_cycles = 0;
+
+  // Raw ARM exception-mask state captured at the three SpinCatch decision
+  // points.  These are diagnostics only: they do not alter scheduling or
+  // callback behavior.
+  volatile uint32_t  entry_basepri = 0;
+  volatile uint32_t  entry_primask = 0;
+  volatile uint32_t  entry_faultmask = 0;
+  volatile uint32_t  entry_ipsr = 0;
+  volatile uint32_t  timeout_basepri = 0;
+  volatile uint32_t  timeout_primask = 0;
+  volatile uint32_t  timeout_faultmask = 0;
+  volatile uint32_t  timeout_ipsr = 0;
+  volatile uint32_t  finish_basepri = 0;
+  volatile uint32_t  finish_primask = 0;
+  volatile uint32_t  finish_faultmask = 0;
+  volatile uint32_t  finish_ipsr = 0;
+};
+
+static spincatch_runtime_t g_spincatch = {};
+
+static void spincatch_runtime_reset(void) {
+  g_spincatch.active = false;
+  g_spincatch.caught = false;
+  g_spincatch.timeout = false;
+  g_spincatch.handle = TIMEPOP_INVALID_HANDLE;
+  g_spincatch.callback = nullptr;
+  g_spincatch.user_data = nullptr;
+  g_spincatch.name = nullptr;
+  g_spincatch.spin_start_deadline = 0;
+  g_spincatch.target_deadline = 0;
+  g_spincatch.target_gnss_ns = -1;
+  g_spincatch.target_dwt = 0;
+  g_spincatch.prediction_valid = false;
+  g_spincatch.lead_ns = TIMEPOP_SPINCATCH_LEAD_NS;
+  g_spincatch.lead_ticks = TIMEPOP_SPINCATCH_LEAD_TICKS;
+  g_spincatch.timeout_cycles = TIMEPOP_SPINCATCH_TIMEOUT_CYCLES;
+  g_spincatch.anchor_pps_count = 0;
+  g_spincatch.anchor_qtimer_at_pps = 0;
+  g_spincatch.anchor_dwt_at_pps = 0;
+  g_spincatch.anchor_dwt_cycles_per_s = 0;
+  g_spincatch.anchor_valid = false;
+  g_spincatch.landing_dwt = 0;
+  g_spincatch.shadow_dwt = 0;
+  g_spincatch.shadow_seq = 0;
+  g_spincatch.final_shadow_dwt = 0;
+  g_spincatch.approach_cycles = 0;
+  g_spincatch.isr_entry_dwt_raw = 0;
+  g_spincatch.isr_entry_latency_cycles = 0;
+  g_spincatch.entry_basepri = 0;
+  g_spincatch.entry_primask = 0;
+  g_spincatch.entry_faultmask = 0;
+  g_spincatch.entry_ipsr = 0;
+  g_spincatch.timeout_basepri = 0;
+  g_spincatch.timeout_primask = 0;
+  g_spincatch.timeout_faultmask = 0;
+  g_spincatch.timeout_ipsr = 0;
+  g_spincatch.finish_basepri = 0;
+  g_spincatch.finish_primask = 0;
+  g_spincatch.finish_faultmask = 0;
+  g_spincatch.finish_ipsr = 0;
+}
 
 // ============================================================================
 // Diagnostics
@@ -318,6 +464,36 @@ static volatile uint32_t diag_race_recoveries    = 0;
 static volatile uint32_t diag_isr_callbacks      = 0;
 static volatile uint32_t diag_isr_recurring_rearmed = 0;
 static volatile uint32_t diag_isr_recurring_rearm_failures = 0;
+
+static volatile uint32_t diag_spincatch_arm_count = 0;
+static volatile uint32_t diag_spincatch_fire_count = 0;
+static volatile uint32_t diag_spincatch_caught_count = 0;
+static volatile uint32_t diag_spincatch_timeout_count = 0;
+static volatile uint32_t diag_spincatch_finish_without_active_count = 0;
+static volatile uint32_t diag_spincatch_last_handle = 0;
+static volatile const char* diag_spincatch_last_name = nullptr;
+static volatile uint32_t diag_spincatch_last_target_deadline = 0;
+static volatile int64_t  diag_spincatch_last_target_gnss_ns = -1;
+static volatile uint32_t diag_spincatch_last_landing_dwt = 0;
+static volatile uint32_t diag_spincatch_last_final_shadow_dwt = 0;
+static volatile uint32_t diag_spincatch_last_shadow_seq = 0;
+static volatile uint32_t diag_spincatch_last_approach_cycles = 0;
+static volatile uint32_t diag_spincatch_last_isr_entry_dwt_raw = 0;
+static volatile uint32_t diag_spincatch_last_isr_entry_latency_cycles = 0;
+static volatile uint32_t diag_spincatch_last_timeout_cycles = 0;
+static volatile uint64_t diag_spincatch_last_lead_ns = 0;
+static volatile uint32_t diag_spincatch_last_entry_basepri = 0;
+static volatile uint32_t diag_spincatch_last_entry_primask = 0;
+static volatile uint32_t diag_spincatch_last_entry_faultmask = 0;
+static volatile uint32_t diag_spincatch_last_entry_ipsr = 0;
+static volatile uint32_t diag_spincatch_last_timeout_basepri = 0;
+static volatile uint32_t diag_spincatch_last_timeout_primask = 0;
+static volatile uint32_t diag_spincatch_last_timeout_faultmask = 0;
+static volatile uint32_t diag_spincatch_last_timeout_ipsr = 0;
+static volatile uint32_t diag_spincatch_last_finish_basepri = 0;
+static volatile uint32_t diag_spincatch_last_finish_primask = 0;
+static volatile uint32_t diag_spincatch_last_finish_faultmask = 0;
+static volatile uint32_t diag_spincatch_last_finish_ipsr = 0;
 
 static volatile uint32_t diag_schedule_next_calls_total = 0;
 static volatile uint32_t diag_schedule_next_calls_from_dispatch = 0;
@@ -432,6 +608,18 @@ static inline bool slot_name_equals(const timepop_slot_t& slot, const char* name
 static inline bool slot_is_one_hz_recurring(const timepop_slot_t& slot);
 static inline void note_named_replacement(const char* name);
 static bool retire_existing_named_slots(const char* name);
+static void spincatch_begin_from_slot(timepop_slot_t& slot,
+                                      uint32_t spin_fire_vclock_raw,
+                                      uint32_t spin_fire_dwt,
+                                      int64_t spin_fire_gnss_ns,
+                                      const time_anchor_snapshot_t& snap);
+static timepop_handle_t arm_spincatch_absolute_internal(int64_t target_gnss_ns,
+                                                        uint64_t lead_ns,
+                                                        uint32_t timeout_cycles,
+                                                        timepop_callback_t callback,
+                                                        void* user_data,
+                                                        const char* name,
+                                                        uint32_t target_dwt = 0);
 
 static inline int64_t time_anchor_latest_pps_gnss_ns(const time_anchor_snapshot_t& snap);
 static bool phase_locked_next_target_gnss_ns(uint64_t period_ns,
@@ -1322,6 +1510,256 @@ static inline void slot_build_diag(
   diag.anchor_dwt_at_pps       = slot.anchor_dwt_at_pps;
   diag.anchor_dwt_cycles_per_s = slot.anchor_dwt_cycles_per_s;
   diag.anchor_valid            = slot.anchor_valid;
+
+  diag.spin_catch_used = slot.spincatch;
+  diag.spin_catch_timeout = false;
+  diag.spin_catch_handle = slot.handle;
+  diag.spin_catch_target_deadline = slot.spincatch_target_deadline;
+  diag.spin_catch_target_gnss_ns = slot.spincatch_target_gnss_ns;
+  diag.spin_catch_lead_ns = slot.spincatch_lead_ns;
+  diag.spin_catch_lead_ticks = slot.spincatch_lead_ticks;
+  diag.spin_catch_timeout_cycles = slot.spincatch_timeout_cycles;
+  diag.spin_catch_landing_dwt = slot.spincatch_last_landing_dwt;
+  diag.spin_catch_final_shadow_dwt = slot.spincatch_last_final_shadow_dwt;
+  diag.spin_catch_shadow_seq = slot.spincatch_last_shadow_seq;
+  diag.spin_catch_approach_cycles = slot.spincatch_last_approach_cycles;
+  diag.spin_catch_isr_entry_dwt_raw = slot.spincatch_last_isr_entry_dwt_raw;
+  diag.spin_catch_isr_entry_latency_cycles = slot.spincatch_last_isr_entry_latency_cycles;
+}
+
+
+// ============================================================================
+// SpinCatch — early wake, raw DWT shadow, and target-ISR finish
+// ============================================================================
+
+static void spincatch_copy_last_to_diag(timepop_diag_t& diag) {
+  diag.spin_catch_used = true;
+  diag.spin_catch_timeout = g_spincatch.timeout;
+  diag.spin_catch_handle = g_spincatch.handle;
+  diag.spin_catch_target_deadline = g_spincatch.target_deadline;
+  diag.spin_catch_target_gnss_ns = g_spincatch.target_gnss_ns;
+  diag.spin_catch_lead_ns = g_spincatch.lead_ns;
+  diag.spin_catch_lead_ticks = g_spincatch.lead_ticks;
+  diag.spin_catch_timeout_cycles = g_spincatch.timeout_cycles;
+  diag.spin_catch_landing_dwt = g_spincatch.landing_dwt;
+  diag.spin_catch_final_shadow_dwt = g_spincatch.final_shadow_dwt;
+  diag.spin_catch_shadow_seq = g_spincatch.shadow_seq;
+  diag.spin_catch_approach_cycles = g_spincatch.approach_cycles;
+  diag.spin_catch_isr_entry_dwt_raw = g_spincatch.isr_entry_dwt_raw;
+  diag.spin_catch_isr_entry_latency_cycles = g_spincatch.isr_entry_latency_cycles;
+}
+
+static void spincatch_note_last_globals(void) {
+  diag_spincatch_last_handle = g_spincatch.handle;
+  diag_spincatch_last_name = g_spincatch.name;
+  diag_spincatch_last_target_deadline = g_spincatch.target_deadline;
+  diag_spincatch_last_target_gnss_ns = g_spincatch.target_gnss_ns;
+  diag_spincatch_last_landing_dwt = g_spincatch.landing_dwt;
+  diag_spincatch_last_final_shadow_dwt = g_spincatch.final_shadow_dwt;
+  diag_spincatch_last_shadow_seq = g_spincatch.shadow_seq;
+  diag_spincatch_last_approach_cycles = g_spincatch.approach_cycles;
+  diag_spincatch_last_isr_entry_dwt_raw = g_spincatch.isr_entry_dwt_raw;
+  diag_spincatch_last_isr_entry_latency_cycles = g_spincatch.isr_entry_latency_cycles;
+  diag_spincatch_last_timeout_cycles = g_spincatch.timeout_cycles;
+  diag_spincatch_last_lead_ns = g_spincatch.lead_ns;
+  diag_spincatch_last_entry_basepri = g_spincatch.entry_basepri;
+  diag_spincatch_last_entry_primask = g_spincatch.entry_primask;
+  diag_spincatch_last_entry_faultmask = g_spincatch.entry_faultmask;
+  diag_spincatch_last_entry_ipsr = g_spincatch.entry_ipsr;
+  diag_spincatch_last_timeout_basepri = g_spincatch.timeout_basepri;
+  diag_spincatch_last_timeout_primask = g_spincatch.timeout_primask;
+  diag_spincatch_last_timeout_faultmask = g_spincatch.timeout_faultmask;
+  diag_spincatch_last_timeout_ipsr = g_spincatch.timeout_ipsr;
+  diag_spincatch_last_finish_basepri = g_spincatch.finish_basepri;
+  diag_spincatch_last_finish_primask = g_spincatch.finish_primask;
+  diag_spincatch_last_finish_faultmask = g_spincatch.finish_faultmask;
+  diag_spincatch_last_finish_ipsr = g_spincatch.finish_ipsr;
+}
+
+static void spincatch_begin_from_slot(timepop_slot_t& slot,
+                                      uint32_t spin_fire_vclock_raw,
+                                      uint32_t spin_fire_dwt,
+                                      int64_t spin_fire_gnss_ns,
+                                      const time_anchor_snapshot_t& snap) {
+  slot.spincatch_fire_count++;
+  diag_spincatch_fire_count++;
+
+  spincatch_runtime_reset();
+  g_spincatch.handle = slot.handle;
+  g_spincatch.callback = slot.callback;
+  g_spincatch.user_data = slot.user_data;
+  g_spincatch.name = slot.name;
+  g_spincatch.spin_start_deadline = slot.deadline;
+  g_spincatch.target_deadline = slot.spincatch_target_deadline;
+  g_spincatch.target_gnss_ns = slot.spincatch_target_gnss_ns;
+  g_spincatch.target_dwt = slot.spincatch_target_dwt;
+  g_spincatch.prediction_valid = slot.prediction_valid;
+  g_spincatch.lead_ns = slot.spincatch_lead_ns;
+  g_spincatch.lead_ticks = slot.spincatch_lead_ticks;
+  g_spincatch.timeout_cycles = slot.spincatch_timeout_cycles;
+  g_spincatch.anchor_pps_count = snap.pps_count;
+  g_spincatch.anchor_qtimer_at_pps = snap.qtimer_at_pps;
+  g_spincatch.anchor_dwt_at_pps = snap.dwt_at_pps;
+  g_spincatch.anchor_dwt_cycles_per_s = snap.dwt_cycles_per_s;
+  g_spincatch.anchor_valid = snap.ok && snap.valid;
+
+  // Same-vector cadence cannot preempt a QTimer1 SpinCatch loop.  Before the
+  // loop starts, imperatively refresh the interrupt-layer counter custody so
+  // the synthetic 32-bit identities remain coherent while TimePop is spinning.
+  // This is an internal substrate hook, not a user-visible callback.
+  timepop_ctx_t prespin_ctx{};
+  prespin_ctx.handle = slot.handle;
+  prespin_ctx.fire_vclock_raw = spin_fire_vclock_raw;
+  prespin_ctx.fire_dwt_cyccnt = spin_fire_dwt;
+  prespin_ctx.deadline = slot.deadline;
+  prespin_ctx.fire_gnss_error_ns =
+      (int32_t)(spin_fire_vclock_raw - slot.deadline) * (int32_t)NS_PER_TICK;
+  prespin_ctx.fire_gnss_ns = spin_fire_gnss_ns;
+
+  timepop_diag_t prespin_diag{};
+  prespin_diag.dwt_at_isr_entry = spin_fire_dwt;
+  prespin_diag.dwt_at_fire = spin_fire_dwt;
+  prespin_diag.predicted_dwt = slot.predicted_dwt;
+  prespin_diag.prediction_valid = slot.prediction_valid;
+  prespin_diag.anchor_pps_count = snap.pps_count;
+  prespin_diag.anchor_qtimer_at_pps = snap.qtimer_at_pps;
+  prespin_diag.anchor_dwt_at_pps = snap.dwt_at_pps;
+  prespin_diag.anchor_dwt_cycles_per_s = snap.dwt_cycles_per_s;
+  prespin_diag.anchor_valid = snap.ok && snap.valid;
+  prespin_diag.spin_catch_used = true;
+  prespin_diag.spin_catch_handle = slot.handle;
+  prespin_diag.spin_catch_target_deadline = slot.spincatch_target_deadline;
+  prespin_diag.spin_catch_target_gnss_ns = slot.spincatch_target_gnss_ns;
+  prespin_diag.spin_catch_lead_ns = slot.spincatch_lead_ns;
+  prespin_diag.spin_catch_lead_ticks = slot.spincatch_lead_ticks;
+  prespin_diag.spin_catch_timeout_cycles = slot.spincatch_timeout_cycles;
+
+  interrupt_prespin_service(&prespin_ctx, &prespin_diag, nullptr);
+
+  g_spincatch.landing_dwt = ARM_DWT_CYCCNT;
+  g_spincatch.shadow_dwt = g_spincatch.landing_dwt;
+  g_spincatch.shadow_seq = 0;
+  g_spincatch.caught = false;
+  g_spincatch.timeout = false;
+  g_spincatch.active = true;
+
+  // Capture the actual exception-mask state at the moment TimePop starts
+  // the spin.  If target IRQs cannot preempt, these fields should tell us
+  // whether PRIMASK/BASEPRI/FAULTMASK/IPSR are responsible.
+  g_spincatch.entry_basepri = read_basepri();
+  g_spincatch.entry_primask = timepop_read_primask();
+  g_spincatch.entry_faultmask = timepop_read_faultmask();
+  g_spincatch.entry_ipsr = timepop_read_ipsr();
+
+  while (g_spincatch.active) {
+    const uint32_t now_dwt = ARM_DWT_CYCCNT;
+    g_spincatch.shadow_dwt = now_dwt;
+    g_spincatch.shadow_seq++;
+    __asm__ volatile ("" ::: "memory");
+
+    if ((uint32_t)(now_dwt - g_spincatch.landing_dwt) >=
+        g_spincatch.timeout_cycles) {
+      g_spincatch.final_shadow_dwt = now_dwt;
+      g_spincatch.approach_cycles = now_dwt - g_spincatch.landing_dwt;
+      g_spincatch.timeout_basepri = read_basepri();
+      g_spincatch.timeout_primask = timepop_read_primask();
+      g_spincatch.timeout_faultmask = timepop_read_faultmask();
+      g_spincatch.timeout_ipsr = timepop_read_ipsr();
+      g_spincatch.timeout = true;
+      g_spincatch.active = false;
+      slot.spincatch_timeout_count++;
+      slot.spincatch_last_landing_dwt = g_spincatch.landing_dwt;
+      slot.spincatch_last_final_shadow_dwt = g_spincatch.final_shadow_dwt;
+      slot.spincatch_last_shadow_seq = g_spincatch.shadow_seq;
+      slot.spincatch_last_approach_cycles = g_spincatch.approach_cycles;
+      slot.spincatch_last_isr_entry_dwt_raw = 0;
+      slot.spincatch_last_isr_entry_latency_cycles = 0;
+      diag_spincatch_timeout_count++;
+      spincatch_note_last_globals();
+      return;
+    }
+  }
+
+  slot.spincatch_caught_count++;
+  slot.spincatch_last_landing_dwt = g_spincatch.landing_dwt;
+  slot.spincatch_last_final_shadow_dwt = g_spincatch.final_shadow_dwt;
+  slot.spincatch_last_shadow_seq = g_spincatch.shadow_seq;
+  slot.spincatch_last_approach_cycles = g_spincatch.approach_cycles;
+  slot.spincatch_last_isr_entry_dwt_raw = g_spincatch.isr_entry_dwt_raw;
+  slot.spincatch_last_isr_entry_latency_cycles = g_spincatch.isr_entry_latency_cycles;
+  spincatch_note_last_globals();
+}
+
+bool timepop_spincatch_finish_from_isr(uint32_t isr_entry_dwt_raw) {
+  const uint32_t finish_basepri = read_basepri();
+  const uint32_t finish_primask = timepop_read_primask();
+  const uint32_t finish_faultmask = timepop_read_faultmask();
+  const uint32_t finish_ipsr = timepop_read_ipsr();
+
+  // Even a late/missed finish is useful evidence: it tells us which exception
+  // context finally ran after the SpinCatch window was no longer active.
+  diag_spincatch_last_finish_basepri = finish_basepri;
+  diag_spincatch_last_finish_primask = finish_primask;
+  diag_spincatch_last_finish_faultmask = finish_faultmask;
+  diag_spincatch_last_finish_ipsr = finish_ipsr;
+
+  if (!g_spincatch.active) {
+    diag_spincatch_finish_without_active_count++;
+    return false;
+  }
+
+  g_spincatch.finish_basepri = finish_basepri;
+  g_spincatch.finish_primask = finish_primask;
+  g_spincatch.finish_faultmask = finish_faultmask;
+  g_spincatch.finish_ipsr = finish_ipsr;
+
+  const uint32_t shadow = g_spincatch.shadow_dwt;
+  g_spincatch.final_shadow_dwt = shadow;
+  g_spincatch.isr_entry_dwt_raw = isr_entry_dwt_raw;
+  g_spincatch.approach_cycles = shadow - g_spincatch.landing_dwt;
+  g_spincatch.isr_entry_latency_cycles = isr_entry_dwt_raw - shadow;
+  g_spincatch.caught = true;
+  g_spincatch.timeout = false;
+  g_spincatch.active = false;
+  diag_spincatch_caught_count++;
+
+  spincatch_note_last_globals();
+
+  timepop_ctx_t ctx{};
+  ctx.handle = g_spincatch.handle;
+  ctx.fire_vclock_raw = g_spincatch.target_deadline;
+  ctx.fire_dwt_cyccnt = isr_entry_dwt_raw;
+  ctx.deadline = g_spincatch.target_deadline;
+  ctx.fire_gnss_error_ns = 0;
+  ctx.fire_gnss_ns = g_spincatch.target_gnss_ns;
+
+  timepop_diag_t diag{};
+  diag.dwt_at_isr_entry = isr_entry_dwt_raw;
+  diag.dwt_at_fire = isr_entry_dwt_raw;
+  diag.predicted_dwt = g_spincatch.target_dwt;
+  diag.prediction_valid = g_spincatch.prediction_valid;
+  diag.spin_dry_used = false;
+  diag.wake_target_dwt = 0;
+  diag.wake_error_cycles = 0;
+  diag.spin_error_cycles = g_spincatch.prediction_valid
+      ? (int32_t)(isr_entry_dwt_raw - g_spincatch.target_dwt)
+      : 0;
+  diag.anchor_pps_count = g_spincatch.anchor_pps_count;
+  diag.anchor_qtimer_at_pps = g_spincatch.anchor_qtimer_at_pps;
+  diag.anchor_dwt_at_pps = g_spincatch.anchor_dwt_at_pps;
+  diag.anchor_dwt_cycles_per_s = g_spincatch.anchor_dwt_cycles_per_s;
+  diag.anchor_valid = g_spincatch.anchor_valid;
+  spincatch_copy_last_to_diag(diag);
+
+  if (g_spincatch.callback) {
+    g_spincatch.callback(&ctx, &diag, g_spincatch.user_data);
+  }
+
+  return true;
+}
+
+bool timepop_spincatch_active(void) {
+  return g_spincatch.active;
 }
 
 // ============================================================================
@@ -1435,6 +1873,7 @@ void timepop_qtimer1_ch2_handler(const interrupt_event_t& event,
 
     const bool is_critical_isr_recurring =
         slots[i].isr_callback && slots[i].rearm_in_isr && slots[i].recurring;
+    const bool is_spincatch_slot = slots[i].spincatch;
 
     slot_capture(slots[i],
                  now,
@@ -1447,7 +1886,7 @@ void timepop_qtimer1_ch2_handler(const interrupt_event_t& event,
     slots[i].isr_callback_fired = false;
     expired_this_pass[i] = true;
     expired_count++;
-    if (!is_critical_isr_recurring) {
+    if (!is_critical_isr_recurring && !is_spincatch_slot) {
       timepop_pending = true;
       needs_scheduled_dispatch = true;
     }
@@ -1495,13 +1934,56 @@ void timepop_qtimer1_ch2_handler(const interrupt_event_t& event,
     }
   }
 
-  // Phase 2: now that the fire facts are stable for all simultaneous slots,
-  // dispatch any IRQ-context callbacks.  Slots without isr_callback will be
-  // dispatched later by timepop_dispatch() using the same stored context.
+  // Phase 2A: run critical recurring ISR substrate callbacks first.  This
+  // keeps cadence/counter custody ahead of any SpinCatch loop even when slot
+  // table order would otherwise put a SpinCatch window first.
   for (uint32_t i = 0; i < MAX_SLOTS; i++) {
     if (!expired_this_pass[i]) continue;
     if (!slots[i].active || !slots[i].expired) continue;
+    if (slots[i].spincatch) continue;
+
+    const bool is_critical_isr_recurring =
+        slots[i].isr_callback && slots[i].rearm_in_isr && slots[i].recurring;
+    if (!is_critical_isr_recurring) continue;
+
+    timepop_ctx_t ctx;
+    slot_build_ctx(slots[i], ctx);
+
+    timepop_diag_t diag;
+    slot_build_diag(slots[i], dwt_entry, diag);
+
+    slots[i].callback(&ctx, &diag, slots[i].user_data);
+    slots[i].isr_callback_fired = true;
+    diag_isr_callbacks++;
+
+    if (rearm_recurring_slot_from_irq(slots[i], now, event_fire_gnss_ns, anchor)) {
+      diag_isr_recurring_rearmed++;
+    } else {
+      slots[i] = {};
+      diag_isr_recurring_rearm_failures++;
+    }
+  }
+
+  // Phase 2B: only after substrate callbacks have run, enter any SpinCatch
+  // early-spin windows.
+  for (uint32_t i = 0; i < MAX_SLOTS; i++) {
+    if (!expired_this_pass[i]) continue;
+    if (!slots[i].active || !slots[i].expired) continue;
+    if (!slots[i].spincatch) continue;
+
+    spincatch_begin_from_slot(slots[i], now, dwt_entry, event_fire_gnss_ns, anchor);
+    slots[i].active = false;
+    slots[i].expired = false;
+    slots[i].isr_callback_fired = true;
+  }
+
+  // Phase 2C: dispatch any remaining non-substrate IRQ-context callbacks.
+  for (uint32_t i = 0; i < MAX_SLOTS; i++) {
+    if (!expired_this_pass[i]) continue;
+    if (!slots[i].active || !slots[i].expired) continue;
+    if (slots[i].spincatch) continue;
     if (!slots[i].isr_callback) continue;
+    if (slots[i].isr_callback_fired) continue;
 
     timepop_ctx_t ctx;
     slot_build_ctx(slots[i], ctx);
@@ -1645,6 +2127,36 @@ void timepop_init(void) {
   diag_deadline_last_target_gnss_ns = -1;
   diag_deadline_last_anchor_pps_gnss_ns = -1;
   diag_deadline_last_ns_from_anchor = 0;
+  spincatch_runtime_reset();
+  diag_spincatch_arm_count = 0;
+  diag_spincatch_fire_count = 0;
+  diag_spincatch_caught_count = 0;
+  diag_spincatch_timeout_count = 0;
+  diag_spincatch_finish_without_active_count = 0;
+  diag_spincatch_last_handle = 0;
+  diag_spincatch_last_name = nullptr;
+  diag_spincatch_last_target_deadline = 0;
+  diag_spincatch_last_target_gnss_ns = -1;
+  diag_spincatch_last_landing_dwt = 0;
+  diag_spincatch_last_final_shadow_dwt = 0;
+  diag_spincatch_last_shadow_seq = 0;
+  diag_spincatch_last_approach_cycles = 0;
+  diag_spincatch_last_isr_entry_dwt_raw = 0;
+  diag_spincatch_last_isr_entry_latency_cycles = 0;
+  diag_spincatch_last_timeout_cycles = 0;
+  diag_spincatch_last_lead_ns = 0;
+  diag_spincatch_last_entry_basepri = 0;
+  diag_spincatch_last_entry_primask = 0;
+  diag_spincatch_last_entry_faultmask = 0;
+  diag_spincatch_last_entry_ipsr = 0;
+  diag_spincatch_last_timeout_basepri = 0;
+  diag_spincatch_last_timeout_primask = 0;
+  diag_spincatch_last_timeout_faultmask = 0;
+  diag_spincatch_last_timeout_ipsr = 0;
+  diag_spincatch_last_finish_basepri = 0;
+  diag_spincatch_last_finish_primask = 0;
+  diag_spincatch_last_finish_faultmask = 0;
+  diag_spincatch_last_finish_ipsr = 0;
   // QTimer1 hardware (CH0/CH2) is initialized by
   // process_interrupt_init_hardware().  IRQ vector and NVIC priority
   // are owned by process_interrupt_enable_irqs().  We just register
@@ -2092,6 +2604,178 @@ timepop_handle_t timepop_arm_alap(
                       callback,
                       user_data,
                       name);
+}
+
+
+// ============================================================================
+// Arm — SpinCatch pre-interrupt spin window
+// ============================================================================
+
+static timepop_handle_t arm_spincatch_absolute_internal(
+  int64_t             target_gnss_ns,
+  uint64_t            lead_ns,
+  uint32_t            timeout_cycles,
+  timepop_callback_t  callback,
+  void*               user_data,
+  const char*         name,
+  uint32_t            target_dwt
+) {
+  if (!callback) return TIMEPOP_INVALID_HANDLE;
+  if (target_gnss_ns <= 0) return TIMEPOP_INVALID_HANDLE;
+
+  const time_anchor_snapshot_t snap = time_anchor_snapshot();
+  uint32_t target_deadline = 0;
+  if (!gnss_ns_to_vclock_deadline(target_gnss_ns, snap, target_deadline)) {
+    return TIMEPOP_INVALID_HANDLE;
+  }
+
+  const uint32_t lead_ticks = ns_to_ticks(lead_ns ? lead_ns : TIMEPOP_SPINCATCH_LEAD_NS);
+  const uint32_t spin_start_deadline = target_deadline - lead_ticks;
+
+  const uint32_t saved = critical_enter();
+
+  const bool retired_named = retire_existing_named_slots(name);
+  if (retired_named) {
+    diag_schedule_next_calls_from_other++;
+    schedule_next();
+  }
+
+  for (uint32_t i = 0; i < MAX_SLOTS; i++) {
+    if (slots[i].active) continue;
+
+    timepop_handle_t h = next_handle++;
+    if (next_handle == TIMEPOP_INVALID_HANDLE) next_handle = 1;
+
+    slots[i] = {};
+    slots[i].active = true;
+    slots[i].expired = false;
+    slots[i].recurring = false;
+    slots[i].is_absolute = true;
+    slots[i].recurrence_mode = timepop_recurrence_mode_t::NONE;
+    slots[i].handle = h;
+    slots[i].deadline = spin_start_deadline;
+    slots[i].target_gnss_ns = target_gnss_ns;
+    slots[i].callback = callback;
+    slots[i].user_data = user_data;
+    slots[i].name = name;
+    slots[i].isr_callback = true;
+    slots[i].rearm_in_isr = false;
+    slots[i].spincatch = true;
+    slots[i].spincatch_target_deadline = target_deadline;
+    slots[i].spincatch_target_gnss_ns = target_gnss_ns;
+    slots[i].spincatch_lead_ns = lead_ns ? lead_ns : TIMEPOP_SPINCATCH_LEAD_NS;
+    slots[i].spincatch_lead_ticks = lead_ticks;
+    slots[i].spincatch_timeout_cycles = timeout_cycles ? timeout_cycles : TIMEPOP_SPINCATCH_TIMEOUT_CYCLES;
+
+    if (target_dwt != 0) {
+      slots[i].predicted_dwt = target_dwt;
+      slots[i].spincatch_target_dwt = target_dwt;
+      slots[i].prediction_valid = true;
+    } else {
+      slots[i].spincatch_target_dwt = predict_dwt_at_deadline(target_deadline,
+                                                              slots[i].prediction_valid);
+      slots[i].predicted_dwt = slots[i].spincatch_target_dwt;
+    }
+
+    record_slot_arm_diag(slots[i],
+                         timepop_arm_source_t::SPINCATCH_ARM,
+                         true,
+                         vclock_count(),
+                         target_gnss_ns);
+
+    diag_spincatch_arm_count++;
+    diag_schedule_next_calls_from_other++;
+    schedule_next();
+    update_slot_high_water();
+    critical_exit(saved);
+    return h;
+  }
+
+  diag_arm_failures++;
+  critical_exit(saved);
+  return TIMEPOP_INVALID_HANDLE;
+}
+
+timepop_handle_t timepop_arm_spincatch_at(
+  int64_t             target_gnss_ns,
+  timepop_callback_t  callback,
+  void*               user_data,
+  const char*         name
+) {
+  return arm_spincatch_absolute_internal(target_gnss_ns,
+                                         TIMEPOP_SPINCATCH_LEAD_NS,
+                                         TIMEPOP_SPINCATCH_TIMEOUT_CYCLES,
+                                         callback,
+                                         user_data,
+                                         name,
+                                         0);
+}
+
+timepop_handle_t timepop_arm_spincatch_at_ex(
+  int64_t             target_gnss_ns,
+  uint64_t            lead_ns,
+  uint32_t            timeout_cycles,
+  timepop_callback_t  callback,
+  void*               user_data,
+  const char*         name
+) {
+  return arm_spincatch_absolute_internal(target_gnss_ns,
+                                         lead_ns,
+                                         timeout_cycles,
+                                         callback,
+                                         user_data,
+                                         name,
+                                         0);
+}
+
+timepop_handle_t timepop_arm_spincatch_from_anchor(
+  int64_t             anchor_gnss_ns,
+  int64_t             offset_gnss_ns,
+  timepop_callback_t  callback,
+  void*               user_data,
+  const char*         name
+) {
+  if (anchor_gnss_ns <= 0) return TIMEPOP_INVALID_HANDLE;
+  const int64_t target_gnss_ns = anchor_gnss_ns + offset_gnss_ns;
+  if (target_gnss_ns <= 0) return TIMEPOP_INVALID_HANDLE;
+  return timepop_arm_spincatch_at(target_gnss_ns, callback, user_data, name);
+}
+
+timepop_handle_t timepop_arm_spincatch_from_anchor_ex(
+  int64_t             anchor_gnss_ns,
+  int64_t             offset_gnss_ns,
+  uint64_t            lead_ns,
+  uint32_t            timeout_cycles,
+  timepop_callback_t  callback,
+  void*               user_data,
+  const char*         name
+) {
+  if (anchor_gnss_ns <= 0) return TIMEPOP_INVALID_HANDLE;
+  const int64_t target_gnss_ns = anchor_gnss_ns + offset_gnss_ns;
+  if (target_gnss_ns <= 0) return TIMEPOP_INVALID_HANDLE;
+  return arm_spincatch_absolute_internal(target_gnss_ns,
+                                         lead_ns,
+                                         timeout_cycles,
+                                         callback,
+                                         user_data,
+                                         name,
+                                         0);
+}
+
+timepop_handle_t timepop_arm_spincatch_ns(
+  int64_t             target_gnss_ns,
+  uint32_t            target_dwt,
+  timepop_callback_t  callback,
+  void*               user_data,
+  const char*         name
+) {
+  return arm_spincatch_absolute_internal(target_gnss_ns,
+                                         TIMEPOP_SPINCATCH_LEAD_NS,
+                                         TIMEPOP_SPINCATCH_TIMEOUT_CYCLES,
+                                         callback,
+                                         user_data,
+                                         name,
+                                         target_dwt);
 }
 
 // ============================================================================
@@ -2643,6 +3327,39 @@ static Payload cmd_report(const Payload&) {
   out.add("deadline_last_anchor_pps_gnss_ns",  diag_deadline_last_anchor_pps_gnss_ns);
   out.add("deadline_last_ns_from_anchor",      diag_deadline_last_ns_from_anchor);
 
+  out.add("spincatch_active",                    (bool)g_spincatch.active);
+  out.add("spincatch_arm_count",                 diag_spincatch_arm_count);
+  out.add("spincatch_fire_count",                diag_spincatch_fire_count);
+  out.add("spincatch_caught_count",              diag_spincatch_caught_count);
+  out.add("spincatch_timeout_count",             diag_spincatch_timeout_count);
+  out.add("spincatch_finish_without_active_count", diag_spincatch_finish_without_active_count);
+  out.add("spincatch_default_lead_ns",           (uint64_t)TIMEPOP_SPINCATCH_LEAD_NS);
+  out.add("spincatch_default_timeout_cycles",    (uint32_t)TIMEPOP_SPINCATCH_TIMEOUT_CYCLES);
+  out.add("spincatch_last_handle",               diag_spincatch_last_handle);
+  out.add("spincatch_last_name",                 (const char*)(diag_spincatch_last_name ? diag_spincatch_last_name : ""));
+  out.add("spincatch_last_target_deadline",      diag_spincatch_last_target_deadline);
+  out.add("spincatch_last_target_gnss_ns",       diag_spincatch_last_target_gnss_ns);
+  out.add("spincatch_last_lead_ns",              diag_spincatch_last_lead_ns);
+  out.add("spincatch_last_timeout_cycles",       diag_spincatch_last_timeout_cycles);
+  out.add("spincatch_last_landing_dwt",          diag_spincatch_last_landing_dwt);
+  out.add("spincatch_last_final_shadow_dwt",     diag_spincatch_last_final_shadow_dwt);
+  out.add("spincatch_last_shadow_seq",           diag_spincatch_last_shadow_seq);
+  out.add("spincatch_last_approach_cycles",      diag_spincatch_last_approach_cycles);
+  out.add("spincatch_last_isr_entry_dwt_raw",    diag_spincatch_last_isr_entry_dwt_raw);
+  out.add("spincatch_last_isr_entry_latency_cycles", diag_spincatch_last_isr_entry_latency_cycles);
+  out.add("spincatch_last_entry_basepri",        diag_spincatch_last_entry_basepri);
+  out.add("spincatch_last_entry_primask",        diag_spincatch_last_entry_primask);
+  out.add("spincatch_last_entry_faultmask",      diag_spincatch_last_entry_faultmask);
+  out.add("spincatch_last_entry_ipsr",           diag_spincatch_last_entry_ipsr);
+  out.add("spincatch_last_timeout_basepri",      diag_spincatch_last_timeout_basepri);
+  out.add("spincatch_last_timeout_primask",      diag_spincatch_last_timeout_primask);
+  out.add("spincatch_last_timeout_faultmask",    diag_spincatch_last_timeout_faultmask);
+  out.add("spincatch_last_timeout_ipsr",         diag_spincatch_last_timeout_ipsr);
+  out.add("spincatch_last_finish_basepri",       diag_spincatch_last_finish_basepri);
+  out.add("spincatch_last_finish_primask",       diag_spincatch_last_finish_primask);
+  out.add("spincatch_last_finish_faultmask",     diag_spincatch_last_finish_faultmask);
+  out.add("spincatch_last_finish_ipsr",          diag_spincatch_last_finish_ipsr);
+
   out.add("qtmr1_ch2_cntr",   (uint32_t)interrupt_qtimer1_ch2_counter_now());
   out.add("qtmr1_ch2_comp1",  (uint32_t)interrupt_qtimer1_ch2_comp1_now());
   out.add("qtmr1_ch2_csctrl", (uint32_t)interrupt_qtimer1_ch2_csctrl_now());
@@ -2706,6 +3423,17 @@ static void add_timers_array(Payload& out) {
     entry.add("schedule_next_late_max_ticks", slots[i].schedule_next_late_max_ticks);
     entry.add("irq_expired_by_irq_count", slots[i].irq_expired_by_irq_count);
     entry.add("last_arm_delta_ticks", slots[i].last_arm_delta_ticks);
+    entry.add("spincatch", slots[i].spincatch);
+    entry.add("spincatch_target_deadline", slots[i].spincatch_target_deadline);
+    entry.add("spincatch_target_gnss_ns", slots[i].spincatch_target_gnss_ns);
+    entry.add("spincatch_lead_ns", slots[i].spincatch_lead_ns);
+    entry.add("spincatch_lead_ticks", slots[i].spincatch_lead_ticks);
+    entry.add("spincatch_timeout_cycles", slots[i].spincatch_timeout_cycles);
+    entry.add("spincatch_fire_count", slots[i].spincatch_fire_count);
+    entry.add("spincatch_caught_count", slots[i].spincatch_caught_count);
+    entry.add("spincatch_timeout_count", slots[i].spincatch_timeout_count);
+    entry.add("spincatch_last_approach_cycles", slots[i].spincatch_last_approach_cycles);
+    entry.add("spincatch_last_isr_entry_latency_cycles", slots[i].spincatch_last_isr_entry_latency_cycles);
 
     timers.add(entry);
   }
@@ -2728,6 +3456,10 @@ static Payload cmd_slots(const Payload&) {
   out.add("irq_late_deadline_slots", diag_irq_late_deadline_slots);
   out.add("isr_recurring_rearmed", diag_isr_recurring_rearmed);
   out.add("isr_recurring_rearm_failures", diag_isr_recurring_rearm_failures);
+  out.add("spincatch_active", (bool)g_spincatch.active);
+  out.add("spincatch_fire_count", diag_spincatch_fire_count);
+  out.add("spincatch_caught_count", diag_spincatch_caught_count);
+  out.add("spincatch_timeout_count", diag_spincatch_timeout_count);
   add_timers_array(out);
   return out;
 }

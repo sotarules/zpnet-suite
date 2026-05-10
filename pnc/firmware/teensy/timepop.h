@@ -15,47 +15,12 @@
 //   • QTimer1 CH2 is the dynamic compare scheduler.
 //   • All public timing semantics are expressed in GNSS nanoseconds.
 //
-// Scheduling modes:
-//
-//   1. Relative scheduling
-//        timepop_arm(delay_gnss_ns, ...)
-//
-//      Use this when the caller only cares about "fire after this delay."
-//      If recurring=true, TimePop will phase-lock the recurrence to the
-//      current lawful GNSS/VCLOCK anchor when one is available.
-//
-//   2. Scheduled-context ASAP dispatch
-//        timepop_arm_asap(...)
-//
-//   3. Scheduled-context ALAP dispatch
-//        timepop_arm_alap(...)
-//
-//   4. Absolute GNSS scheduling
-//        timepop_arm_at(target_gnss_ns, ...)
-//
-//   5. Anchor-relative GNSS scheduling
-//        timepop_arm_from_anchor(anchor_gnss_ns, offset_gnss_ns, ...)
-//
-//   6. Caller-owned exact target scheduling
-//        timepop_arm_ns(target_gnss_ns, target_dwt, ...)
-//
-//   7. Critical recurring ISR scheduling
-//        timepop_arm_recurring_isr(period_gnss_ns, ...)
-//
-//      Use only for tiny substrate-maintenance clients that must callback and
-//      rearm inside the CH2 IRQ pass before TimePop selects the next compare.
-//      The callback receives the same shared fire facts as other same-deadline
-//      timed clients.
-//
-// TimePop owns:
-//   • timed slot scheduling
-//   • deferred ASAP/ALAP scheduled-context dispatch
-//   • next-deadline selection
-//   • CH2 compare arming
-//   • absolute recurring timer series
-//   • Spin-Dry early-wake + deterministic landing for VCLOCK scheduling
-//   • timer diagnostics
-//   • always-on internal VCLOCK monitor
+// SpinCatch:
+//   TimePop can arm a pre-interrupt spin window at target - lead.  The spin
+//   loop records raw DWT shadow facts until a different, higher-priority ISR
+//   calls timepop_spincatch_finish_from_isr().  The user callback is then
+//   invoked synchronously in that target ISR context with raw, unadjusted
+//   SpinCatch diagnostics in timepop_diag_t.
 //
 // ============================================================================
 
@@ -78,14 +43,6 @@ typedef struct timepop_ctx_t {
 // ============================================================================
 // Optional diagnostics
 // ============================================================================
-//
-// Populated for timed callbacks and ISR callbacks.
-// Null for ASAP/ALAP scheduled-context dispatch.
-//
-// The authoritative result is still timepop_ctx_t. These diagnostics expose
-// Spin-Dry / landing facts that are useful for instrumentation and later
-// TIMEBASE_FRAGMENT analysis.
-//
 
 typedef struct timepop_diag_t {
   uint32_t dwt_at_isr_entry;
@@ -105,6 +62,24 @@ typedef struct timepop_diag_t {
   uint32_t anchor_dwt_at_pps;
   uint32_t anchor_dwt_cycles_per_s;
   bool     anchor_valid;
+
+  // SpinCatch raw forensics. These fields are deliberately NOT
+  // latency-adjusted.  They describe the target ISR's encounter with the
+  // TimePop spin shadow.
+  bool     spin_catch_used;
+  bool     spin_catch_timeout;
+  uint32_t spin_catch_handle;
+  uint32_t spin_catch_target_deadline;
+  int64_t  spin_catch_target_gnss_ns;
+  uint64_t spin_catch_lead_ns;
+  uint32_t spin_catch_lead_ticks;
+  uint32_t spin_catch_timeout_cycles;
+  uint32_t spin_catch_landing_dwt;
+  uint32_t spin_catch_final_shadow_dwt;
+  uint32_t spin_catch_shadow_seq;
+  uint32_t spin_catch_approach_cycles;
+  uint32_t spin_catch_isr_entry_dwt_raw;
+  uint32_t spin_catch_isr_entry_latency_cycles;
 } timepop_diag_t;
 
 typedef void (*timepop_callback_t)(

@@ -151,6 +151,29 @@ static constexpr const char* CADENCE_MINDER_NAME = "CADENCE_MINDER";
 static constexpr uint32_t OCXO_DWT_SOURCE_NONE = 0;
 static constexpr uint32_t OCXO_DWT_SOURCE_ISR_ENTRY = 1;
 
+// SpinCatch integration.  TimePop owns the early spin window; process_interrupt
+// owns the target interrupt encounter and copies raw SpinCatch forensics into
+// the normal interrupt diagnostic path.  PPS uses GPIO as the finishing ISR.
+// OCXO1/OCXO2 use one-shot compare rails armed only during the final 1 ms
+// before the one-second edge, so the retired high-frequency OCXO cadence stays
+// retired.
+static constexpr bool     PPS_SPINCATCH_ENABLED = true;
+static constexpr bool     OCXO_SPINCATCH_ENABLED = true;
+static constexpr uint32_t OCXO_SPINCATCH_ARM_TICK_MOD = TICKS_PER_SECOND_EVENT - 1U;
+static constexpr const char* PPS_SPINCATCH_NAME   = "PPS_SPINCATCH";
+static constexpr const char* OCXO1_SPINCATCH_NAME = "OCXO1_SPINCATCH";
+static constexpr const char* OCXO2_SPINCATCH_NAME = "OCXO2_SPINCATCH";
+static constexpr uint8_t SPINCATCH_SCHEDULER_IRQ_PRIORITY = 16;
+static constexpr uint8_t SPINCATCH_TARGET_IRQ_PRIORITY = 0;
+
+// Diagnostic mirror of TimePop's current default SpinCatch window.  These
+// values are used only to predict where the OCXO finishing interrupt should
+// fall relative to the intended spin window.  They do not control TimePop.
+static constexpr uint64_t SPINCATCH_DIAG_LEAD_NS = 5000ULL;
+static constexpr uint32_t SPINCATCH_DIAG_LEAD_TICKS =
+    (uint32_t)(SPINCATCH_DIAG_LEAD_NS / 100ULL);
+static constexpr uint32_t SPINCATCH_DIAG_TIMEOUT_CYCLES = 20000U;
+
 // ============================================================================
 // PPS / PPS_VCLOCK doctrine
 // ============================================================================
@@ -331,6 +354,7 @@ bool interrupt_last_epoch_capture(interrupt_epoch_capture_t* out) {
 
 static pps_edge_dispatch_fn g_pps_edge_dispatch = nullptr;
 static void pps_edge_dispatch_trampoline(timepop_ctx_t*, timepop_diag_t*, void*);
+static void spincatch_arm_next_pps_from_current_anchor(void);
 
 // ============================================================================
 // DWT cycles-per-second compatibility
@@ -656,6 +680,10 @@ static uint32_t vclock_cycles_for_ticks(uint32_t vclock_ticks) {
                     (uint64_t)VCLOCK_COUNTS_PER_SECOND);
 }
 
+static inline int32_t signed_u32_delta(uint32_t later, uint32_t earlier) {
+  return (int32_t)(later - earlier);
+}
+
 static uint32_t pps_vclock_phase_cycles_from_edges(const pps_t& pps,
                                                    const pps_vclock_t& pvc) {
   // Scalar PPS→VCLOCK phase, by definition less than one 10 MHz tick.
@@ -896,6 +924,140 @@ static interrupt_subscriber_runtime_t* g_rt_ocxo2  = nullptr;
 static volatile interrupt_pps_entry_latency_handler_fn
     g_pps_entry_latency_handler = nullptr;
 
+// ============================================================================
+// SpinCatch diagnostic custody
+// ============================================================================
+
+enum class interrupt_spincatch_target_t : uint8_t {
+  NONE = 0,
+  PPS,
+  OCXO1,
+  OCXO2,
+};
+
+struct interrupt_spincatch_context_t {
+  interrupt_spincatch_target_t target = interrupt_spincatch_target_t::NONE;
+};
+
+struct interrupt_spincatch_store_t {
+  interrupt_spincatch_diag_t last{};
+  bool     pending = false;
+  bool     compare_armed = false;
+  bool     event_delivered = false;
+  uint32_t target_counter32 = 0;
+  uint16_t target_low16 = 0;
+
+  // OCXO target-alignment forensics.  The low-word compare is only 16-bit,
+  // while the event identity is synthetic 32-bit.  These fields prove where
+  // the compare ISR actually landed relative to the intended SpinCatch window.
+  uint32_t arm_dwt = 0;
+  uint16_t arm_counter16 = 0;
+  uint32_t ticks_to_target_at_arm = 0;
+  uint32_t expected_edge_dwt_from_arm = 0;
+  uint32_t expected_spin_start_dwt = 0;
+  uint32_t expected_spin_timeout_dwt = 0;
+  uint32_t irq_dwt_raw = 0;
+  uint16_t irq_counter16 = 0;
+  uint32_t irq_delta_from_target_low16 = 0;
+  int32_t  irq_vs_expected_edge_cycles = 0;
+  int32_t  irq_vs_spin_start_cycles = 0;
+  int32_t  irq_vs_spin_timeout_cycles = 0;
+  bool     irq_during_expected_spin_window = false;
+
+  uint32_t arm_count = 0;
+  uint32_t arm_failures = 0;
+  uint32_t callback_count = 0;
+  uint32_t finish_count = 0;
+  uint32_t finish_miss_count = 0;
+  uint32_t timeout_or_missing_count = 0;
+};
+
+static interrupt_spincatch_context_t g_spincatch_ctx_pps{interrupt_spincatch_target_t::PPS};
+static interrupt_spincatch_context_t g_spincatch_ctx_ocxo1{interrupt_spincatch_target_t::OCXO1};
+static interrupt_spincatch_context_t g_spincatch_ctx_ocxo2{interrupt_spincatch_target_t::OCXO2};
+
+static interrupt_spincatch_store_t g_spincatch_pps = {};
+static interrupt_spincatch_store_t g_spincatch_ocxo1 = {};
+static interrupt_spincatch_store_t g_spincatch_ocxo2 = {};
+static interrupt_spincatch_target_t g_spincatch_next_second_target =
+    interrupt_spincatch_target_t::PPS;
+static uint32_t g_spincatch_round_robin_count = 0;
+
+static const char* spincatch_target_str(interrupt_spincatch_target_t target) {
+  switch (target) {
+    case interrupt_spincatch_target_t::PPS:   return "PPS";
+    case interrupt_spincatch_target_t::OCXO1: return "OCXO1";
+    case interrupt_spincatch_target_t::OCXO2: return "OCXO2";
+    default:                                  return "NONE";
+  }
+}
+
+static interrupt_spincatch_target_t spincatch_rotate_next_second_target(void) {
+  const uint32_t slot = g_spincatch_round_robin_count++ % 3U;
+  if (slot == 0U) return interrupt_spincatch_target_t::PPS;
+  if (slot == 1U) return interrupt_spincatch_target_t::OCXO1;
+  return interrupt_spincatch_target_t::OCXO2;
+}
+
+static interrupt_spincatch_store_t* spincatch_store_for(interrupt_spincatch_target_t target) {
+  switch (target) {
+    case interrupt_spincatch_target_t::PPS:   return &g_spincatch_pps;
+    case interrupt_spincatch_target_t::OCXO1: return &g_spincatch_ocxo1;
+    case interrupt_spincatch_target_t::OCXO2: return &g_spincatch_ocxo2;
+    default:                                  return nullptr;
+  }
+}
+
+static interrupt_spincatch_store_t* spincatch_store_for_kind(interrupt_subscriber_kind_t kind) {
+  if (kind == interrupt_subscriber_kind_t::OCXO1) return &g_spincatch_ocxo1;
+  if (kind == interrupt_subscriber_kind_t::OCXO2) return &g_spincatch_ocxo2;
+  return nullptr;
+}
+
+static void spincatch_copy_diag_from_timepop(interrupt_spincatch_diag_t& out,
+                                             const timepop_diag_t* diag) {
+  out = interrupt_spincatch_diag_t{};
+  if (!diag || !diag->spin_catch_used) return;
+
+  out.used = diag->spin_catch_used;
+  out.timeout = diag->spin_catch_timeout;
+  out.handle = diag->spin_catch_handle;
+  out.target_deadline = diag->spin_catch_target_deadline;
+  out.target_gnss_ns = diag->spin_catch_target_gnss_ns;
+  out.lead_ns = diag->spin_catch_lead_ns;
+  out.lead_ticks = diag->spin_catch_lead_ticks;
+  out.timeout_cycles = diag->spin_catch_timeout_cycles;
+  out.landing_dwt = diag->spin_catch_landing_dwt;
+  out.final_shadow_dwt = diag->spin_catch_final_shadow_dwt;
+  out.shadow_seq = diag->spin_catch_shadow_seq;
+  out.approach_cycles = diag->spin_catch_approach_cycles;
+  out.isr_entry_dwt_raw = diag->spin_catch_isr_entry_dwt_raw;
+  out.isr_entry_latency_cycles = diag->spin_catch_isr_entry_latency_cycles;
+}
+
+static void spincatch_copy_to_interrupt_diag(interrupt_capture_diag_t& dst,
+                                             const interrupt_spincatch_diag_t* src) {
+  if (!src || !src->used) return;
+  dst.spincatch = *src;
+}
+
+static void interrupt_spincatch_timepop_callback(timepop_ctx_t*,
+                                                 timepop_diag_t* diag,
+                                                 void* user_data) {
+  auto* ctx = static_cast<interrupt_spincatch_context_t*>(user_data);
+  if (!ctx) return;
+
+  interrupt_spincatch_store_t* store = spincatch_store_for(ctx->target);
+  if (!store) return;
+
+  spincatch_copy_diag_from_timepop(store->last, diag);
+  store->pending = store->last.used;
+  store->callback_count++;
+  store->finish_count++;
+  if (store->last.timeout) {
+    store->timeout_or_missing_count++;
+  }
+}
 
 
 // ============================================================================
@@ -938,6 +1100,9 @@ static ocxo_lane_t g_ocxo2_lane;
 
 static ocxo_lane_t* ocxo_lane_for(interrupt_subscriber_kind_t kind);
 static inline uint16_t ocxo_lane_counter_now(const ocxo_lane_t& lane);
+
+static void ocxo_lane_program_compare(ocxo_lane_t& lane, uint16_t target_low16);
+static void ocxo_lane_disable_compare(ocxo_lane_t& lane);
 
 // ============================================================================
 // QTimer1 CH0 low-word counter
@@ -1037,6 +1202,15 @@ static volatile uint16_t g_cadence_minder_last_ocxo2_hw16 = 0;
 static volatile uint32_t g_cadence_minder_last_vclock_counter32 = 0;
 static volatile uint32_t g_cadence_minder_last_ocxo1_counter32 = 0;
 static volatile uint32_t g_cadence_minder_last_ocxo2_counter32 = 0;
+
+// SpinCatch pre-spin custody refreshes.  These are deliberately not cadence
+// firings: they refresh the process_interrupt-owned synthetic counter anchors
+// immediately before TimePop enters a SpinCatch loop without advancing
+// one-second cadence state or publishing any lane events.
+static volatile uint32_t g_cadence_minder_prespin_service_count = 0;
+static volatile uint32_t g_cadence_minder_prespin_vclock_updates = 0;
+static volatile uint32_t g_cadence_minder_prespin_ocxo1_updates = 0;
+static volatile uint32_t g_cadence_minder_prespin_ocxo2_updates = 0;
 
 static inline uint32_t clock32_from_ns(uint64_t ns) {
   return (uint32_t)((ns / 100ULL) & 0xFFFFFFFFULL);
@@ -1434,7 +1608,8 @@ static void emit_one_second_event(interrupt_subscriber_runtime_t& rt,
                                   uint32_t pps_coincidence_cycles = 0,
                                   bool     pps_coincidence_valid  = false,
                                   const dwt_repair_diag_t* repair = nullptr,
-                                  bool dispatch_immediately = false) {
+                                  bool dispatch_immediately = false,
+                                  const interrupt_spincatch_diag_t* spincatch = nullptr) {
   if (!rt.active) return;
 
   interrupt_event_t event {};
@@ -1478,6 +1653,7 @@ static void emit_one_second_event(interrupt_subscriber_runtime_t& rt,
   if (rt.desc->kind != interrupt_subscriber_kind_t::VCLOCK) {
     bridge_projection_copy_to_diag(diag, bridge);
   }
+  spincatch_copy_to_interrupt_diag(diag, spincatch);
 
   rt.last_event = event;
   rt.last_diag  = diag;
@@ -1496,11 +1672,102 @@ static void emit_one_second_event(interrupt_subscriber_runtime_t& rt,
 // Cadence minder — single TimePop custody agent for all low-word counters
 // ============================================================================
 
+static const char* ocxo_spincatch_name_for(interrupt_subscriber_kind_t kind) {
+  return (kind == interrupt_subscriber_kind_t::OCXO1)
+      ? OCXO1_SPINCATCH_NAME
+      : OCXO2_SPINCATCH_NAME;
+}
+
+static interrupt_spincatch_context_t* ocxo_spincatch_context_for(interrupt_subscriber_kind_t kind) {
+  return (kind == interrupt_subscriber_kind_t::OCXO1)
+      ? &g_spincatch_ctx_ocxo1
+      : &g_spincatch_ctx_ocxo2;
+}
+
+static bool ocxo_spincatch_arm_final_millisecond(interrupt_subscriber_kind_t kind,
+                                                 ocxo_lane_t& lane,
+                                                 synthetic_clock32_t& clock32,
+                                                 int64_t cadence_gnss_ns) {
+  if (!OCXO_SPINCATCH_ENABLED) return false;
+  if (!lane.initialized || cadence_gnss_ns < 0) return false;
+  if ((kind == interrupt_subscriber_kind_t::OCXO1 &&
+       g_spincatch_next_second_target != interrupt_spincatch_target_t::OCXO1) ||
+      (kind == interrupt_subscriber_kind_t::OCXO2 &&
+       g_spincatch_next_second_target != interrupt_spincatch_target_t::OCXO2)) {
+    return false;
+  }
+
+  interrupt_spincatch_store_t* store = spincatch_store_for_kind(kind);
+  if (!store) return false;
+
+  const uint32_t target_counter32 = clock32.current_counter32 + OCXO_INTERVAL_COUNTS;
+  const uint16_t target_low16 = (uint16_t)(target_counter32 & 0xFFFFU);
+  const int64_t target_gnss_ns = cadence_gnss_ns + (int64_t)CADENCE_MINDER_PERIOD_NS;
+
+  // The physical finishing rail must exist before TimePop arms the early
+  // spin window.  Publish the intended target identity first, then program
+  // the low-word compare, and only then ask TimePop to enter SpinCatch.
+  // A QTimer compare is only 16-bit, but this one-shot is armed inside the
+  // final millisecond; within that window the low-word match is the intended
+  // synthetic 32-bit edge.
+  const uint16_t arm_counter16 = ocxo_lane_counter_now(lane);
+  const uint32_t ticks_to_target_at_arm =
+      (uint32_t)((uint16_t)(target_low16 - arm_counter16));
+  const uint32_t arm_dwt = ARM_DWT_CYCCNT;
+  const uint32_t expected_to_edge_cycles =
+      vclock_cycles_for_ticks(ticks_to_target_at_arm);
+  const uint32_t lead_cycles = vclock_cycles_for_ticks(SPINCATCH_DIAG_LEAD_TICKS);
+  const uint32_t expected_edge_dwt = arm_dwt + expected_to_edge_cycles;
+  const uint32_t expected_spin_start_dwt = expected_edge_dwt - lead_cycles;
+  const uint32_t expected_spin_timeout_dwt =
+      expected_spin_start_dwt + SPINCATCH_DIAG_TIMEOUT_CYCLES;
+
+  store->target_counter32 = target_counter32;
+  store->target_low16 = target_low16;
+  store->compare_armed = false;
+  store->event_delivered = false;
+  store->pending = false;
+  store->last = interrupt_spincatch_diag_t{};
+  store->arm_dwt = arm_dwt;
+  store->arm_counter16 = arm_counter16;
+  store->ticks_to_target_at_arm = ticks_to_target_at_arm;
+  store->expected_edge_dwt_from_arm = expected_edge_dwt;
+  store->expected_spin_start_dwt = expected_spin_start_dwt;
+  store->expected_spin_timeout_dwt = expected_spin_timeout_dwt;
+  store->irq_dwt_raw = 0;
+  store->irq_counter16 = 0;
+  store->irq_delta_from_target_low16 = 0;
+  store->irq_vs_expected_edge_cycles = 0;
+  store->irq_vs_spin_start_cycles = 0;
+  store->irq_vs_spin_timeout_cycles = 0;
+  store->irq_during_expected_spin_window = false;
+
+  ocxo_lane_disable_compare(lane);
+  ocxo_lane_program_compare(lane, target_low16);
+  store->compare_armed = true;
+
+  const timepop_handle_t h =
+      timepop_arm_spincatch_at(target_gnss_ns,
+                               interrupt_spincatch_timepop_callback,
+                               ocxo_spincatch_context_for(kind),
+                               ocxo_spincatch_name_for(kind));
+  if (h == TIMEPOP_INVALID_HANDLE) {
+    store->arm_failures++;
+    store->compare_armed = false;
+    ocxo_lane_disable_compare(lane);
+    return false;
+  }
+
+  store->arm_count++;
+  return true;
+}
+
 static void cadence_minder_emit_ocxo_if_due(interrupt_subscriber_kind_t kind,
                                             ocxo_lane_t& lane,
                                             synthetic_clock32_t& clock32,
                                             interrupt_subscriber_runtime_t* rt,
-                                            uint32_t event_dwt) {
+                                            uint32_t event_dwt,
+                                            int64_t cadence_gnss_ns) {
   if (!lane.initialized) return;
 
   const uint16_t hw16 = ocxo_lane_counter_now(lane);
@@ -1530,13 +1797,31 @@ static void cadence_minder_emit_ocxo_if_due(interrupt_subscriber_kind_t kind,
 
   lane.cadence_hits_total++;
 
-  // CADENCE_MINDER runs at 1 kHz.  OCXO one-second publication therefore uses
-  // the same 1000-tick cadence as VCLOCK.  The OCXO counter identity itself
-  // remains passive and comes from the OCXO hardware low word projected into
-  // the process_interrupt-owned synthetic 32-bit lane.
+  // CADENCE_MINDER runs at 1 kHz and remains the only rollover/cadence
+  // authority.  One millisecond before the OCXO one-second boundary, it arms a
+  // one-shot OCXO compare plus a TimePop SpinCatch window.  The actual OCXO
+  // compare ISR publishes the one-second event with SpinCatch forensics.
+  // If SpinCatch cannot be armed, fall back to the legacy CADENCE_MINDER DWT
+  // event so subscribers do not miss a second.
+  const uint32_t next_tick_mod = lane.tick_mod_1000 + 1U;
+  if (next_tick_mod == OCXO_SPINCATCH_ARM_TICK_MOD) {
+    (void)ocxo_spincatch_arm_final_millisecond(kind, lane, clock32, cadence_gnss_ns);
+  }
+
   if (++lane.tick_mod_1000 >= TICKS_PER_SECOND_EVENT) {
     lane.tick_mod_1000 = 0;
-    emit_one_second_event(*rt, event_dwt, clock32.current_counter32);
+
+    interrupt_spincatch_store_t* store = spincatch_store_for_kind(kind);
+    const bool selected_for_spincatch =
+        (kind == interrupt_subscriber_kind_t::OCXO1 &&
+         g_spincatch_next_second_target == interrupt_spincatch_target_t::OCXO1) ||
+        (kind == interrupt_subscriber_kind_t::OCXO2 &&
+         g_spincatch_next_second_target == interrupt_spincatch_target_t::OCXO2);
+
+    if (!OCXO_SPINCATCH_ENABLED || !selected_for_spincatch || !store ||
+        (!store->compare_armed && !store->event_delivered)) {
+      emit_one_second_event(*rt, event_dwt, clock32.current_counter32);
+    }
   }
 }
 
@@ -1645,12 +1930,14 @@ static void cadence_minder_timepop_callback(timepop_ctx_t* ctx,
                                   g_ocxo1_lane,
                                   g_ocxo1_clock32,
                                   g_rt_ocxo1,
-                                  qtimer_event_dwt);
+                                  qtimer_event_dwt,
+                                  ctx->fire_gnss_ns);
   cadence_minder_emit_ocxo_if_due(interrupt_subscriber_kind_t::OCXO2,
                                   g_ocxo2_lane,
                                   g_ocxo2_clock32,
                                   g_rt_ocxo2,
-                                  qtimer_event_dwt);
+                                  qtimer_event_dwt,
+                                  ctx->fire_gnss_ns);
 }
 
 static bool cadence_minder_arm_timepop(void) {
@@ -1912,15 +2199,84 @@ static void ocxo_lane_compare_isr(ocxo_lane_t& lane,
   (void)work;
   (void)isr_entry_dwt_raw;
 
-  // Retired path.  OCXO QTimer compare channels are passive counter domains
-  // now; they must not re-arm themselves or author cadence.  If a stale flag
-  // is observed from a prior image/boot state, clear it and leave the compare
-  // disabled.  CADENCE_MINDER is the sole cadence agent.
+  // Retired high-frequency cadence path.  A stale flag is still cleaned here,
+  // but real one-second OCXO SpinCatch witness compares are handled by
+  // ocxo_spincatch_compare_event_isr().
   if (!ocxo_lane_compare_flag_pending(lane)) return;
 
   ocxo_lane_clear_compare_flag(lane);
   ocxo_lane_disable_compare(lane);
   lane.miss_count++;
+}
+
+static void ocxo_spincatch_compare_event_isr(ocxo_lane_t& lane,
+                                             interrupt_subscriber_runtime_t* rt,
+                                             interrupt_subscriber_kind_t kind,
+                                             uint32_t isr_entry_dwt_raw) {
+  if (!ocxo_lane_compare_flag_pending(lane)) return;
+
+  lane.irq_count++;
+  if (rt) rt->irq_count++;
+
+  interrupt_spincatch_store_t* store = spincatch_store_for_kind(kind);
+  if (!store || !store->compare_armed) {
+    // Stale compare rail from an old image/state.  Leave the OCXO lane passive.
+    ocxo_lane_clear_compare_flag(lane);
+    ocxo_lane_disable_compare(lane);
+    lane.miss_count++;
+    return;
+  }
+
+  const uint16_t irq_counter16 = ocxo_lane_counter_now(lane);
+  const uint32_t irq_delta_from_target_low16 =
+      (uint32_t)((uint16_t)(irq_counter16 - store->target_low16));
+
+  store->irq_dwt_raw = isr_entry_dwt_raw;
+  store->irq_counter16 = irq_counter16;
+  store->irq_delta_from_target_low16 = irq_delta_from_target_low16;
+  store->irq_vs_expected_edge_cycles =
+      signed_u32_delta(isr_entry_dwt_raw, store->expected_edge_dwt_from_arm);
+  store->irq_vs_spin_start_cycles =
+      signed_u32_delta(isr_entry_dwt_raw, store->expected_spin_start_dwt);
+  store->irq_vs_spin_timeout_cycles =
+      signed_u32_delta(isr_entry_dwt_raw, store->expected_spin_timeout_dwt);
+  store->irq_during_expected_spin_window =
+      store->irq_vs_spin_start_cycles >= 0 &&
+      store->irq_vs_spin_timeout_cycles <= 0;
+
+  // Finish TimePop's active SpinCatch window before doing peripheral cleanup.
+  // These raw facts are the forensic target; do not latency-adjust them here.
+  const bool caught = timepop_spincatch_active()
+      ? timepop_spincatch_finish_from_isr(isr_entry_dwt_raw)
+      : false;
+  if (!caught) {
+    store->finish_miss_count++;
+  }
+
+  ocxo_lane_clear_compare_flag(lane);
+  ocxo_lane_disable_compare(lane);
+  store->compare_armed = false;
+
+  const uint32_t event_dwt = qtimer_event_dwt_from_isr_entry_raw(isr_entry_dwt_raw);
+  const uint32_t event_counter32 = store->target_counter32;
+  const uint32_t late_ticks =
+      (uint32_t)((uint16_t)(ocxo_lane_counter_now(lane) - store->target_low16));
+
+  ocxo_lane_record_isr_diag(kind, isr_entry_dwt_raw, event_dwt, late_ticks);
+
+  const interrupt_spincatch_diag_t* spincatch = store->pending
+      ? &store->last
+      : nullptr;
+
+  if (rt && rt->active) {
+    // Subscriber delivery remains foreground/ASAP.  Only this tiny internal
+    // process_interrupt shim runs synchronously in the target ISR.
+    emit_one_second_event(*rt, event_dwt, event_counter32,
+                          0, false, nullptr, false, spincatch);
+    store->event_delivered = true;
+  }
+
+  store->pending = false;
 }
 
 // Foreground drain — runs at TimePop ASAP priority, no ISR pressure.
@@ -2005,19 +2361,21 @@ static void ocxo_post_isr_asap_callback(timepop_ctx_t*,
 }
 
 static void qtimer2_isr(void) {
-  // Retired OCXO compare cadence rail.  If a stale flag ever vectors here,
-  // clean and hard-disable it.  Do not re-arm, do not advance synthetic time,
-  // and do not publish an OCXO event.  CADENCE_MINDER is the only cadence
-  // owner now.
-  qtimer2_ch0_disable_compare();
+  const uint32_t isr_entry_dwt_raw = ARM_DWT_CYCCNT;  // SACRED: first instruction.
+
+  ocxo_spincatch_compare_event_isr(g_ocxo1_lane,
+                                   g_rt_ocxo1,
+                                   interrupt_subscriber_kind_t::OCXO1,
+                                   isr_entry_dwt_raw);
 }
 
 static void qtimer3_isr(void) {
-  // Retired OCXO compare cadence rail.  If a stale flag ever vectors here,
-  // clean and hard-disable it.  Do not re-arm, do not advance synthetic time,
-  // and do not publish an OCXO event.  CADENCE_MINDER is the only cadence
-  // owner now.
-  qtimer3_disable_compare(3);
+  const uint32_t isr_entry_dwt_raw = ARM_DWT_CYCCNT;  // SACRED: first instruction.
+
+  ocxo_spincatch_compare_event_isr(g_ocxo2_lane,
+                                   g_rt_ocxo2,
+                                   interrupt_subscriber_kind_t::OCXO2,
+                                   isr_entry_dwt_raw);
 }
 
 // ============================================================================
@@ -2205,14 +2563,54 @@ static void qtimer1_isr(void) {
 // The _raw is the first-instruction capture.  It is converted IMMEDIATELY
 // into PPS and PPS_VCLOCK event-coordinate values and never propagated.
 
+static void spincatch_arm_next_pps_from_current_anchor(void) {
+  g_spincatch_next_second_target = spincatch_rotate_next_second_target();
+
+  if (!PPS_SPINCATCH_ENABLED) return;
+  if (g_spincatch_next_second_target != interrupt_spincatch_target_t::PPS) return;
+  if (!g_interrupt_runtime_ready || !time_valid()) return;
+
+  const uint32_t pps_count = time_pps_count();
+  if (pps_count == 0) return;
+
+  const int64_t target_gnss_ns =
+      (int64_t)(pps_count + 1U) * (int64_t)GNSS_NS_PER_SECOND;
+
+  const timepop_handle_t h =
+      timepop_arm_spincatch_at(target_gnss_ns,
+                               interrupt_spincatch_timepop_callback,
+                               &g_spincatch_ctx_pps,
+                               PPS_SPINCATCH_NAME);
+  if (h == TIMEPOP_INVALID_HANDLE) {
+    g_spincatch_pps.arm_failures++;
+    return;
+  }
+
+  g_spincatch_pps.arm_count++;
+}
+
 static void pps_edge_dispatch_trampoline(timepop_ctx_t*, timepop_diag_t*, void*) {
   if (!g_pps_edge_dispatch) return;
 
   const pps_edge_snapshot_t snap = interrupt_last_pps_edge();
   g_pps_edge_dispatch(snap);
+
+  // Alpha's foreground PPS selector updates the TimePop/TIME anchor before it
+  // returns.  Arm the next physical PPS SpinCatch from that fresh anchor.
+  spincatch_arm_next_pps_from_current_anchor();
 }
 
 void process_interrupt_gpio6789_irq(uint32_t isr_entry_dwt_raw) {
+  // If TimePop is spinning for this physical PPS edge, finish SpinCatch before
+  // any counter reads or latency-normalized event-coordinate arithmetic.
+  if (g_spincatch_next_second_target == interrupt_spincatch_target_t::PPS &&
+      timepop_spincatch_active()) {
+    const bool caught = timepop_spincatch_finish_from_isr(isr_entry_dwt_raw);
+    if (!caught) {
+      g_spincatch_pps.finish_miss_count++;
+    }
+  }
+
   // PPS GPIO is a witness/selector only.  It captures the physical PPS facts
   // and, during rebootstrap, selects the VCLOCK-domain edge identity.  It does
   // NOT author the public PPS/VCLOCK DWT coordinate; that coordinate is later
@@ -2397,6 +2795,7 @@ pps_edge_snapshot_t interrupt_last_pps_edge(void) {
   out.vclock_epoch_counter32_offset_ticks = VCLOCK_EPOCH_COUNTER32_OFFSET_TICKS;
   out.vclock_epoch_dwt_offset_cycles      = CANONICAL_VCLOCK_EPOCH_MINUS_RAW_PPS_ISR_CYCLES;
   out.vclock_epoch_selected               = true;
+  out.spincatch                           = g_spincatch_pps.last;
   return out;
 }
 
@@ -2494,7 +2893,45 @@ const interrupt_capture_diag_t* interrupt_last_diag(interrupt_subscriber_kind_t 
   return (!rt || !rt->has_fired) ? nullptr : &rt->last_diag;
 }
 
-void interrupt_prespin_service(timepop_ctx_t*, timepop_diag_t*, void*) {}
+void interrupt_prespin_service(timepop_ctx_t* ctx, timepop_diag_t*, void*) {
+  if (!ctx || !g_interrupt_hw_ready) return;
+
+  // TimePop calls this immediately before entering a SpinCatch loop.  This is
+  // intentionally a custody refresh only, not a cadence fire: do not advance
+  // tick_mod_1000, do not emit one-second events, and do not arm further
+  // SpinCatch work.  Its purpose is to keep the synthetic 32-bit counter
+  // extensions coherent while QTimer1 itself is busy spinning and therefore
+  // cannot service CADENCE_MINDER on the same vector.
+  const uint32_t vclock_counter32 = ctx->fire_vclock_raw;
+  const uint16_t vclock_hw16 = (uint16_t)(vclock_counter32 & 0xFFFFU);
+
+  vclock_clock_anchor_hardware_low16(vclock_counter32, vclock_hw16);
+  g_vclock_clock32.minder_update_count++;
+  g_vclock_lane.logical_count32_at_last_second = vclock_counter32;
+  g_cadence_minder_last_vclock_hw16 = vclock_hw16;
+  g_cadence_minder_last_vclock_counter32 = vclock_counter32;
+
+  if (g_ocxo1_lane.initialized) {
+    const uint16_t hw16 = ocxo_lane_counter_now(g_ocxo1_lane);
+    synthetic_clock_tend_from_hw16(g_ocxo1_clock32, hw16);
+    g_ocxo1_lane.logical_count32_at_last_second = g_ocxo1_clock32.current_counter32;
+    g_cadence_minder_last_ocxo1_hw16 = hw16;
+    g_cadence_minder_last_ocxo1_counter32 = g_ocxo1_clock32.current_counter32;
+    g_cadence_minder_prespin_ocxo1_updates++;
+  }
+
+  if (g_ocxo2_lane.initialized) {
+    const uint16_t hw16 = ocxo_lane_counter_now(g_ocxo2_lane);
+    synthetic_clock_tend_from_hw16(g_ocxo2_clock32, hw16);
+    g_ocxo2_lane.logical_count32_at_last_second = g_ocxo2_clock32.current_counter32;
+    g_cadence_minder_last_ocxo2_hw16 = hw16;
+    g_cadence_minder_last_ocxo2_counter32 = g_ocxo2_clock32.current_counter32;
+    g_cadence_minder_prespin_ocxo2_updates++;
+  }
+
+  g_cadence_minder_prespin_service_count++;
+  g_cadence_minder_prespin_vclock_updates++;
+}
 
 // ============================================================================
 // Hardware + runtime init
@@ -2639,6 +3076,11 @@ void process_interrupt_init(void) {
   g_bridge_stats_ocxo2 = bridge_anchor_stats_t{};
   g_pps_edge_dispatch = nullptr;
   g_pps_entry_latency_handler = nullptr;
+  g_spincatch_pps = interrupt_spincatch_store_t{};
+  g_spincatch_ocxo1 = interrupt_spincatch_store_t{};
+  g_spincatch_ocxo2 = interrupt_spincatch_store_t{};
+  g_spincatch_next_second_target = interrupt_spincatch_target_t::PPS;
+  g_spincatch_round_robin_count = 0;
 
   g_vclock_clock32 = vclock_synthetic_clock32_t{};
   g_ocxo1_clock32 = synthetic_clock32_t{};
@@ -2695,6 +3137,10 @@ void process_interrupt_init(void) {
   g_cadence_minder_last_vclock_counter32 = 0;
   g_cadence_minder_last_ocxo1_counter32 = 0;
   g_cadence_minder_last_ocxo2_counter32 = 0;
+  g_cadence_minder_prespin_service_count = 0;
+  g_cadence_minder_prespin_vclock_updates = 0;
+  g_cadence_minder_prespin_ocxo1_updates = 0;
+  g_cadence_minder_prespin_ocxo2_updates = 0;
   g_ocxo1_deferred = ocxo_deferred_work_t{};
   g_ocxo2_deferred = ocxo_deferred_work_t{};
 
@@ -2706,26 +3152,25 @@ void process_interrupt_enable_irqs(void) {
   if (g_interrupt_irqs_enabled) return;
 
   attachInterruptVector(IRQ_QTIMER1, qtimer1_isr);
-  // VCLOCK/TimePop QTimer1 is the sovereign timing rail.  Keep the entire
-  // shared QTimer1 vector at highest priority; same-vector logical ordering
-  // is handled inside TimePop/process_interrupt.
-  NVIC_SET_PRIORITY(IRQ_QTIMER1, 0);
+  // SpinCatch requires the TimePop/QTimer1 early-spin ISR to be preemptable
+  // by the finishing edge ISR.  QTimer1 remains the scheduler/cadence rail,
+  // but PPS/QTimer2/QTimer3 are allowed to interrupt its short spin window.
+  NVIC_SET_PRIORITY(IRQ_QTIMER1, SPINCATCH_SCHEDULER_IRQ_PRIORITY);
   NVIC_ENABLE_IRQ(IRQ_QTIMER1);
 
   attachInterruptVector(IRQ_QTIMER2, qtimer2_isr);
-  NVIC_SET_PRIORITY(IRQ_QTIMER2, 16);
+  NVIC_SET_PRIORITY(IRQ_QTIMER2, SPINCATCH_TARGET_IRQ_PRIORITY);
   NVIC_ENABLE_IRQ(IRQ_QTIMER2);
 
   attachInterruptVector(IRQ_QTIMER3, qtimer3_isr);
-  NVIC_SET_PRIORITY(IRQ_QTIMER3, 16);
+  NVIC_SET_PRIORITY(IRQ_QTIMER3, SPINCATCH_TARGET_IRQ_PRIORITY);
   NVIC_ENABLE_IRQ(IRQ_QTIMER3);
 
   pinMode(GNSS_PPS_PIN, INPUT);
   attachInterrupt(digitalPinToInterrupt(GNSS_PPS_PIN), pps_gpio_isr, RISING);
-  // PPS GPIO is now a witness/selector, not the highest-priority timing
-  // interpolation rail.  Keep it below QTimer1 so VCLOCK/TimePop event facts
-  // are not delayed by PPS witness work.
-  NVIC_SET_PRIORITY(IRQ_GPIO6789, 0);
+  // PPS GPIO is a SpinCatch finishing interrupt and must be able to preempt
+  // the TimePop/QTimer1 early-spin window.
+  NVIC_SET_PRIORITY(IRQ_GPIO6789, SPINCATCH_TARGET_IRQ_PRIORITY);
 
   g_interrupt_irqs_enabled = true;
 }
@@ -2753,6 +3198,71 @@ static void add_bridge_stats_payload(Payload& p,
   add_u32("anchor_last_sequence_used", s.last_anchor_sequence_used);
   add_u64("anchor_last_ns_delta", s.last_anchor_ns_delta);
   add_u32("anchor_last_failure_mask", s.last_anchor_failure_mask);
+}
+
+static void add_spincatch_payload(Payload& p,
+                                  const char* prefix,
+                                  const interrupt_spincatch_store_t& s) {
+  char key[96];
+  auto add_bool = [&](const char* suffix, bool value) {
+    snprintf(key, sizeof(key), "%s_spincatch_%s", prefix, suffix);
+    p.add(key, value);
+  };
+  auto add_u32 = [&](const char* suffix, uint32_t value) {
+    snprintf(key, sizeof(key), "%s_spincatch_%s", prefix, suffix);
+    p.add(key, value);
+  };
+  auto add_u64 = [&](const char* suffix, uint64_t value) {
+    snprintf(key, sizeof(key), "%s_spincatch_%s", prefix, suffix);
+    p.add(key, value);
+  };
+  auto add_i64 = [&](const char* suffix, int64_t value) {
+    snprintf(key, sizeof(key), "%s_spincatch_%s", prefix, suffix);
+    p.add(key, value);
+  };
+  auto add_i32 = [&](const char* suffix, int32_t value) {
+    snprintf(key, sizeof(key), "%s_spincatch_%s", prefix, suffix);
+    p.add(key, value);
+  };
+
+  add_bool("used", s.last.used);
+  add_bool("timeout", s.last.timeout);
+  add_bool("pending", s.pending);
+  add_bool("compare_armed", s.compare_armed);
+  add_bool("event_delivered", s.event_delivered);
+  add_u32("arm_count", s.arm_count);
+  add_u32("arm_failures", s.arm_failures);
+  add_u32("callback_count", s.callback_count);
+  add_u32("finish_count", s.finish_count);
+  add_u32("finish_miss_count", s.finish_miss_count);
+  add_u32("timeout_or_missing_count", s.timeout_or_missing_count);
+  add_u32("target_counter32", s.target_counter32);
+  add_u32("target_low16", (uint32_t)s.target_low16);
+  add_u32("arm_dwt", s.arm_dwt);
+  add_u32("arm_counter16", (uint32_t)s.arm_counter16);
+  add_u32("ticks_to_target_at_arm", s.ticks_to_target_at_arm);
+  add_u32("expected_edge_dwt_from_arm", s.expected_edge_dwt_from_arm);
+  add_u32("expected_spin_start_dwt", s.expected_spin_start_dwt);
+  add_u32("expected_spin_timeout_dwt", s.expected_spin_timeout_dwt);
+  add_u32("irq_dwt_raw", s.irq_dwt_raw);
+  add_u32("irq_counter16", (uint32_t)s.irq_counter16);
+  add_u32("irq_delta_from_target_low16", s.irq_delta_from_target_low16);
+  add_i32("irq_vs_expected_edge_cycles", s.irq_vs_expected_edge_cycles);
+  add_i32("irq_vs_spin_start_cycles", s.irq_vs_spin_start_cycles);
+  add_i32("irq_vs_spin_timeout_cycles", s.irq_vs_spin_timeout_cycles);
+  add_bool("irq_during_expected_spin_window", s.irq_during_expected_spin_window);
+  add_u32("handle", s.last.handle);
+  add_u32("target_deadline", s.last.target_deadline);
+  add_i64("target_gnss_ns", s.last.target_gnss_ns);
+  add_u64("lead_ns", s.last.lead_ns);
+  add_u32("lead_ticks", s.last.lead_ticks);
+  add_u32("timeout_cycles", s.last.timeout_cycles);
+  add_u32("landing_dwt", s.last.landing_dwt);
+  add_u32("final_shadow_dwt", s.last.final_shadow_dwt);
+  add_u32("shadow_seq", s.last.shadow_seq);
+  add_u32("approach_cycles", s.last.approach_cycles);
+  add_u32("isr_entry_dwt_raw", s.last.isr_entry_dwt_raw);
+  add_u32("isr_entry_latency_cycles", s.last.isr_entry_latency_cycles);
 }
 
 // ============================================================================
@@ -2784,6 +3294,10 @@ static Payload cmd_report(const Payload&) {
   p.add("cadence_minder_last_vclock_counter32", g_cadence_minder_last_vclock_counter32);
   p.add("cadence_minder_last_ocxo1_counter32", g_cadence_minder_last_ocxo1_counter32);
   p.add("cadence_minder_last_ocxo2_counter32", g_cadence_minder_last_ocxo2_counter32);
+  p.add("cadence_minder_prespin_service_count", g_cadence_minder_prespin_service_count);
+  p.add("cadence_minder_prespin_vclock_updates", g_cadence_minder_prespin_vclock_updates);
+  p.add("cadence_minder_prespin_ocxo1_updates", g_cadence_minder_prespin_ocxo1_updates);
+  p.add("cadence_minder_prespin_ocxo2_updates", g_cadence_minder_prespin_ocxo2_updates);
   p.add("vclock_subscribed", g_rt_vclock ? g_rt_vclock->subscribed : false);
   p.add("vclock_active", g_rt_vclock ? g_rt_vclock->active : false);
   p.add("vclock_event_count", g_rt_vclock ? g_rt_vclock->event_count : 0U);
@@ -2833,6 +3347,15 @@ static Payload cmd_report(const Payload&) {
   p.add("gpio_irq_count", g_gpio_irq_count);
   p.add("gpio_miss_count", g_gpio_miss_count);
   p.add("gpio_edge_count", g_pps_gpio_heartbeat.edge_count);
+  p.add("spincatch_pps_enabled", PPS_SPINCATCH_ENABLED);
+  p.add("spincatch_ocxo_enabled", OCXO_SPINCATCH_ENABLED);
+  p.add("spincatch_next_second_target", spincatch_target_str(g_spincatch_next_second_target));
+  p.add("spincatch_round_robin_count", g_spincatch_round_robin_count);
+  p.add("spincatch_scheduler_irq_priority", (uint32_t)SPINCATCH_SCHEDULER_IRQ_PRIORITY);
+  p.add("spincatch_target_irq_priority", (uint32_t)SPINCATCH_TARGET_IRQ_PRIORITY);
+  add_spincatch_payload(p, "pps", g_spincatch_pps);
+  add_spincatch_payload(p, "ocxo1", g_spincatch_ocxo1);
+  add_spincatch_payload(p, "ocxo2", g_spincatch_ocxo2);
 
   // PPS (physical edge) and PPS_VCLOCK (canonical) in symmetric blocks.
   pps_t pps; pps_vclock_t pvc;

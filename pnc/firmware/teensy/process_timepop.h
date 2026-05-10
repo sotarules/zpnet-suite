@@ -119,6 +119,68 @@ timepop_handle_t timepop_arm_recurring_isr_from_base_counter32(
   const char*         name
 );
 
+
+// -----------------------------------------------------------------------------
+// SpinCatch — TimePop early-spin / target-ISR finish
+// -----------------------------------------------------------------------------
+//
+// SpinCatch arms an early CH2 wake at target - lead, enters a tight raw-DWT
+// shadow loop in the TimePop/QTimer1 IRQ context, and waits for a different,
+// higher-priority hardware ISR to call timepop_spincatch_finish_from_isr().
+// The user callback is invoked synchronously from that target ISR with a normal
+// timepop_ctx_t plus SpinCatch raw forensics in timepop_diag_t.
+//
+// The default lead is owned by TimePop (currently 5 us); *_ex variants allow a
+// caller to override lead and timeout during calibration experiments.
+
+timepop_handle_t timepop_arm_spincatch_at(
+  int64_t             target_gnss_ns,
+  timepop_callback_t  callback,
+  void*               user_data,
+  const char*         name
+);
+
+timepop_handle_t timepop_arm_spincatch_at_ex(
+  int64_t             target_gnss_ns,
+  uint64_t            lead_ns,
+  uint32_t            timeout_cycles,
+  timepop_callback_t  callback,
+  void*               user_data,
+  const char*         name
+);
+
+timepop_handle_t timepop_arm_spincatch_from_anchor(
+  int64_t             anchor_gnss_ns,
+  int64_t             offset_gnss_ns,
+  timepop_callback_t  callback,
+  void*               user_data,
+  const char*         name
+);
+
+timepop_handle_t timepop_arm_spincatch_from_anchor_ex(
+  int64_t             anchor_gnss_ns,
+  int64_t             offset_gnss_ns,
+  uint64_t            lead_ns,
+  uint32_t            timeout_cycles,
+  timepop_callback_t  callback,
+  void*               user_data,
+  const char*         name
+);
+
+timepop_handle_t timepop_arm_spincatch_ns(
+  int64_t             target_gnss_ns,
+  uint32_t            target_dwt,
+  timepop_callback_t  callback,
+  void*               user_data,
+  const char*         name
+);
+
+// Target ISR shim/helper.  Call this as early as possible from the finishing
+// interrupt, passing the target ISR's first-instruction raw DWT capture.
+// Returns true if an armed SpinCatch was active and the user callback was run.
+bool timepop_spincatch_finish_from_isr(uint32_t isr_entry_dwt_raw);
+bool timepop_spincatch_active(void);
+
 // Notify TimePop that the VCLOCK synthetic coordinate system has been rebased.
 // Existing timed deadlines are old-epoch coordinates and must be re-authored
 // or cancelled before scheduling continues.

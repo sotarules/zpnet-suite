@@ -9,6 +9,7 @@
 //   • VCLOCK lane   (critical recurring TimePop client on QTimer1 CH2)
 //   • TimePop       (QTimer1 CH2, hosted scheduler/client rail)
 //   • PPS GPIO edge (diagnostics + dispatch authority + epoch anchor)
+//   • SpinCatch witness finishing for PPS / OCXO one-second edges
 //
 // QTimer1 vector custody:
 //
@@ -115,8 +116,10 @@
 //              the passive low-word VCLOCK counter; QTimer1 CH2 is the only
 //              active TimePop compare rail.
 //     MINDER : TimePop recurring 1 ms client, tends VCLOCK/OCXO low-word counters
-//     OCXO1  : QTimer2 CH0 compare, event rail retained for current one-second events
-//     OCXO2  : QTimer3 CH3 compare, event rail retained for current one-second events
+//     OCXO1  : QTimer2 CH0 one-shot compare, armed only in the final millisecond
+//              when SpinCatch selects OCXO1 for that second.
+//     OCXO2  : QTimer3 CH3 one-shot compare, armed only in the final millisecond
+//              when SpinCatch selects OCXO2 for that second.
 // ============================================================================
 
 #pragma once
@@ -223,6 +226,32 @@ struct interrupt_event_t {
 };
 
 // ============================================================================
+// SpinCatch raw forensic surface
+// ============================================================================
+//
+// These fields are raw TimePop SpinCatch facts. They are deliberately not
+// latency-adjusted and must not be treated as event-coordinate DWT values.
+// They describe the relationship between TimePop's final spin shadow and the
+// target ISR's first-instruction DWT capture.
+
+struct interrupt_spincatch_diag_t {
+  bool     used = false;
+  bool     timeout = false;
+  uint32_t handle = 0;
+  uint32_t target_deadline = 0;
+  int64_t  target_gnss_ns = -1;
+  uint64_t lead_ns = 0;
+  uint32_t lead_ticks = 0;
+  uint32_t timeout_cycles = 0;
+  uint32_t landing_dwt = 0;
+  uint32_t final_shadow_dwt = 0;
+  uint32_t shadow_seq = 0;
+  uint32_t approach_cycles = 0;
+  uint32_t isr_entry_dwt_raw = 0;
+  uint32_t isr_entry_latency_cycles = 0;
+};
+
+// ============================================================================
 // Diagnostic surface — carried alongside every one-second event
 // ============================================================================
 
@@ -287,6 +316,10 @@ struct interrupt_capture_diag_t {
   // PPS / VCLOCK coincidence mirror (see interrupt_event_t).
   uint32_t pps_coincidence_cycles = 0;
   bool     pps_coincidence_valid  = false;
+
+  // TimePop SpinCatch raw forensics, copied through process_interrupt so
+  // CLOCKS/Alpha can carry them into TIMEBASE_FRAGMENT without rerunning math.
+  interrupt_spincatch_diag_t spincatch;
 
   uint32_t anomaly_count = 0;
 };
@@ -449,6 +482,9 @@ struct pps_edge_snapshot_t {
   int32_t  vclock_epoch_counter32_offset_ticks = 0;
   int32_t  vclock_epoch_dwt_offset_cycles      = 0;
   bool     vclock_epoch_selected               = false;
+
+  // Physical PPS SpinCatch forensics.  Raw, not latency-adjusted.
+  interrupt_spincatch_diag_t spincatch;
 };
 
 // ============================================================================
