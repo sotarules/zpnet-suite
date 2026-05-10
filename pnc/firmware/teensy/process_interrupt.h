@@ -230,7 +230,8 @@ struct interrupt_event_t {
 // These fields are raw TimePop SpinCatch facts. They are deliberately not
 // latency-adjusted and must not be treated as event-coordinate DWT values.
 // They describe the relationship between TimePop's final spin shadow and the
-// target ISR's first-instruction DWT capture.
+// target ISR's first-instruction DWT capture.  PPS SpinCatch has been retired;
+// the active SpinCatch targets are the OCXO one-shot compare rails.
 
 struct interrupt_spincatch_diag_t {
   bool     used = false;
@@ -481,7 +482,9 @@ struct pps_edge_snapshot_t {
   int32_t  vclock_epoch_dwt_offset_cycles      = 0;
   bool     vclock_epoch_selected               = false;
 
-  // Physical PPS SpinCatch forensics. Raw, not latency-adjusted.
+  // Retired physical PPS SpinCatch forensics. PPS is no longer part of the
+  // SpinCatch regimen, so this remains an always-empty legacy compatibility
+  // surface until pps_edge_snapshot_t is retired.
   interrupt_spincatch_diag_t spincatch;
 };
 

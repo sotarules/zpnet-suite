@@ -126,7 +126,7 @@ static constexpr uint32_t TIMEPOP_SPINCATCH_TIMEOUT_CYCLES = 20000U;
 // microseconds, then enables the target interrupt shortly before the expected
 // hardware edge.  This prevents a valid catch from completing during prespin
 // before shadow_seq has advanced.
-static constexpr uint32_t TIMEPOP_SPINCATCH_ENABLE_TARGET_AFTER_CYCLES = 3500U;
+static constexpr uint32_t TIMEPOP_SPINCATCH_ENABLE_TARGET_AFTER_CYCLES = 4500U;
 
 // SpinCatch preemption forensics.  util.h already supplies read_basepri();
 // keep the remaining ARM special-register reads local to TimePop because

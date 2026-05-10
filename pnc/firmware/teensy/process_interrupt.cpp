@@ -153,14 +153,13 @@ static constexpr uint32_t OCXO_DWT_SOURCE_ISR_ENTRY = 1;
 
 // SpinCatch integration.  TimePop owns the early spin window; process_interrupt
 // owns the target interrupt encounter and copies raw SpinCatch forensics into
-// the normal interrupt diagnostic path.  PPS uses GPIO as the finishing ISR.
-// OCXO1/OCXO2 use one-shot compare rails armed only during the final 1 ms
-// before the one-second edge, so the retired high-frequency OCXO cadence stays
-// retired.
-static constexpr bool     PPS_SPINCATCH_ENABLED = true;
+// the normal interrupt diagnostic path.  Physical PPS SpinCatch is permanently
+// disabled; PPS remains a timing witness and epoch selector only.  OCXO1/OCXO2
+// use one-shot compare rails armed only during the final 1 ms before the
+// one-second edge, so the retired high-frequency OCXO cadence stays retired.
+static constexpr bool     PPS_SPINCATCH_ENABLED = false;
 static constexpr bool     OCXO_SPINCATCH_ENABLED = true;
 static constexpr uint32_t OCXO_SPINCATCH_ARM_TICK_MOD = TICKS_PER_SECOND_EVENT - 1U;
-static constexpr const char* PPS_SPINCATCH_NAME   = "PPS_SPINCATCH";
 static constexpr const char* OCXO1_SPINCATCH_NAME = "OCXO1_SPINCATCH";
 static constexpr const char* OCXO2_SPINCATCH_NAME = "OCXO2_SPINCATCH";
 static constexpr uint8_t SPINCATCH_SCHEDULER_IRQ_PRIORITY = 16;
@@ -362,7 +361,7 @@ bool interrupt_last_epoch_capture(interrupt_epoch_capture_t* out) {
 
 static pps_edge_dispatch_fn g_pps_edge_dispatch = nullptr;
 static void pps_edge_dispatch_trampoline(timepop_ctx_t*, timepop_diag_t*, void*);
-static void spincatch_arm_next_pps_from_current_anchor(void);
+static void spincatch_select_next_ocxo_target_after_pps(void);
 
 // ============================================================================
 // DWT cycles-per-second compatibility
@@ -982,7 +981,46 @@ struct interrupt_spincatch_store_t {
   uint32_t accepted_match_count = 0;
   uint32_t compare_programmed_count = 0;
   uint32_t compare_enabled_count = 0;
-  uint32_t unexpected_irq_while_muted_count = 0;
+  // A compare IRQ can arrive after the one-shot has already been retired
+  // or before any SpinCatch one-shot is software-active.  This is the
+  // known benign stale/retired-rail echo observed once per arm on this
+  // hardware; it is not a live-window early match.
+  uint32_t inactive_compare_irq_count = 0;
+
+  // A compare IRQ reached the ISR while COMP1/CMPLD1 held a SpinCatch target
+  // but TCF1EN was still supposed to be muted.  This is the true pact-doctrine
+  // violation counter: if nonzero during normal SpinCatch tuning, the target
+  // rail became interrupt-live before TimePop deliberately enabled it.
+  uint32_t programmed_but_muted_irq_count = 0;
+
+  // Compare-enable forensics.  These are sampled immediately before the
+  // one-shot compare interrupt is deliberately made live.  They tell how much
+  // 10 MHz counter runway remained when the target rail entered the SpinCatch
+  // window.
+  uint32_t enable_dwt = 0;
+  uint16_t enable_counter16 = 0;
+  uint32_t enable_ticks_to_target = 0;
+
+  // Live-window near-early forensics.  These describe compare IRQs that occur
+  // after the one-shot rail has been deliberately enabled but before the
+  // accepted target match.  near_early_count_this_arm is reset on each arm;
+  // near_early_count_max_per_arm preserves the worst observed arm.
+  uint32_t near_early_count_this_arm = 0;
+  uint32_t near_early_count_max_per_arm = 0;
+  uint16_t last_near_early_counter16 = 0;
+  int32_t  last_near_early_signed_delta_low16 = 0;
+  uint32_t last_near_early_ticks_until_target = 0;
+  uint32_t last_near_early_dwt_raw = 0;
+  uint32_t last_near_early_cycles_after_enable = 0;
+  int32_t  last_near_early_cycles_before_expected_edge = 0;
+
+  // Accepted-match relation to the near-early sequence.  If an accepted match
+  // follows at least one near-early IRQ on the same arm, the after-near-early
+  // counter and delta expose that timing relationship directly.
+  uint32_t accepted_after_near_early_count = 0;
+  uint32_t last_accepted_cycles_after_near_early = 0;
+  uint32_t last_accepted_cycles_after_enable = 0;
+
   int32_t  irq_vs_expected_edge_cycles = 0;
   int32_t  irq_vs_spin_start_cycles = 0;
   int32_t  irq_vs_spin_timeout_cycles = 0;
@@ -996,7 +1034,6 @@ struct interrupt_spincatch_store_t {
   uint32_t timeout_or_missing_count = 0;
 };
 
-static interrupt_spincatch_context_t g_spincatch_ctx_pps{interrupt_spincatch_target_t::PPS};
 static interrupt_spincatch_context_t g_spincatch_ctx_ocxo1{interrupt_spincatch_target_t::OCXO1};
 static interrupt_spincatch_context_t g_spincatch_ctx_ocxo2{interrupt_spincatch_target_t::OCXO2};
 
@@ -1004,7 +1041,7 @@ static interrupt_spincatch_store_t g_spincatch_pps = {};
 static interrupt_spincatch_store_t g_spincatch_ocxo1 = {};
 static interrupt_spincatch_store_t g_spincatch_ocxo2 = {};
 static interrupt_spincatch_target_t g_spincatch_next_second_target =
-    interrupt_spincatch_target_t::PPS;
+    interrupt_spincatch_target_t::OCXO1;
 static uint32_t g_spincatch_round_robin_count = 0;
 
 static const char* spincatch_target_str(interrupt_spincatch_target_t target) {
@@ -1017,10 +1054,10 @@ static const char* spincatch_target_str(interrupt_spincatch_target_t target) {
 }
 
 static interrupt_spincatch_target_t spincatch_rotate_next_second_target(void) {
-  const uint32_t slot = g_spincatch_round_robin_count++ % 3U;
-  if (slot == 0U) return interrupt_spincatch_target_t::PPS;
-  if (slot == 1U) return interrupt_spincatch_target_t::OCXO1;
-  return interrupt_spincatch_target_t::OCXO2;
+  const uint32_t slot = g_spincatch_round_robin_count++ & 1U;
+  return (slot == 0U)
+      ? interrupt_spincatch_target_t::OCXO1
+      : interrupt_spincatch_target_t::OCXO2;
 }
 
 static interrupt_spincatch_store_t* spincatch_store_for(interrupt_spincatch_target_t target) {
@@ -1797,6 +1834,18 @@ static bool ocxo_spincatch_arm_final_millisecond(interrupt_subscriber_kind_t kin
   store->irq_counter16 = 0;
   store->irq_delta_from_target_low16 = 0;
   store->irq_signed_delta_from_target_low16 = 0;
+  store->enable_dwt = 0;
+  store->enable_counter16 = 0;
+  store->enable_ticks_to_target = 0;
+  store->near_early_count_this_arm = 0;
+  store->last_near_early_counter16 = 0;
+  store->last_near_early_signed_delta_low16 = 0;
+  store->last_near_early_ticks_until_target = 0;
+  store->last_near_early_dwt_raw = 0;
+  store->last_near_early_cycles_after_enable = 0;
+  store->last_near_early_cycles_before_expected_edge = 0;
+  store->last_accepted_cycles_after_near_early = 0;
+  store->last_accepted_cycles_after_enable = 0;
   store->irq_vs_expected_edge_cycles = 0;
   store->irq_vs_spin_start_cycles = 0;
   store->irq_vs_spin_timeout_cycles = 0;
@@ -2309,7 +2358,7 @@ static void ocxo_spincatch_compare_event_isr(ocxo_lane_t& lane,
     // hardware and the software mirror so REPORT cannot show a contradictory
     // armed-but-unprogrammed state.
     if (store) {
-      store->unexpected_irq_while_muted_count++;
+      store->inactive_compare_irq_count++;
       store->compare_programmed = false;
       store->compare_armed = false;
       store->compare_irq_enabled = false;
@@ -2325,7 +2374,7 @@ static void ocxo_spincatch_compare_event_isr(ocxo_lane_t& lane,
     // before pre-spin, but its interrupt must remain muted until
     // interrupt_prespin_service() enables it.  If an IRQ reaches us while
     // muted, shut the one-shot down rather than allowing an interrupt storm.
-    store->unexpected_irq_while_muted_count++;
+    store->programmed_but_muted_irq_count++;
     store->compare_programmed = false;
     store->compare_armed = false;
     store->compare_irq_enabled = false;
@@ -2369,6 +2418,21 @@ static void ocxo_spincatch_compare_event_isr(ocxo_lane_t& lane,
     const int32_t ticks_until_target = -(int32_t)irq_signed_delta_low16;
     if (store->irq_during_expected_spin_window &&
         ticks_until_target <= OCXO_SPINCATCH_NEAR_EARLY_TICKS) {
+      store->near_early_count_this_arm++;
+      if (store->near_early_count_this_arm > store->near_early_count_max_per_arm) {
+        store->near_early_count_max_per_arm = store->near_early_count_this_arm;
+      }
+      store->last_near_early_counter16 = irq_counter16;
+      store->last_near_early_signed_delta_low16 =
+          (int32_t)irq_signed_delta_low16;
+      store->last_near_early_ticks_until_target = (uint32_t)ticks_until_target;
+      store->last_near_early_dwt_raw = isr_entry_dwt_raw;
+      store->last_near_early_cycles_after_enable =
+          (store->enable_dwt != 0)
+              ? (isr_entry_dwt_raw - store->enable_dwt)
+              : 0;
+      store->last_near_early_cycles_before_expected_edge =
+          signed_u32_delta(store->expected_edge_dwt_from_arm, isr_entry_dwt_raw);
       store->near_early_kept_armed_count++;
       ocxo_lane_clear_compare_flag(lane);
       return;
@@ -2382,6 +2446,20 @@ static void ocxo_spincatch_compare_event_isr(ocxo_lane_t& lane,
     ocxo_lane_disable_compare(lane);
     return;
   }
+
+  if (store->near_early_count_this_arm != 0) {
+    store->accepted_after_near_early_count++;
+    store->last_accepted_cycles_after_near_early =
+        (store->last_near_early_dwt_raw != 0)
+            ? (isr_entry_dwt_raw - store->last_near_early_dwt_raw)
+            : 0;
+  } else {
+    store->last_accepted_cycles_after_near_early = 0;
+  }
+  store->last_accepted_cycles_after_enable =
+      (store->enable_dwt != 0)
+          ? (isr_entry_dwt_raw - store->enable_dwt)
+          : 0;
 
   store->accepted_match_count++;
 
@@ -2706,30 +2784,11 @@ static void qtimer1_isr(void) {
 // The _raw is the first-instruction capture.  It is converted IMMEDIATELY
 // into PPS and PPS_VCLOCK event-coordinate values and never propagated.
 
-static void spincatch_arm_next_pps_from_current_anchor(void) {
+static void spincatch_select_next_ocxo_target_after_pps(void) {
+  // PPS is no longer part of the SpinCatch regimen.  Each PPS dispatch merely
+  // advances the OCXO-only selector so the following final-millisecond arm
+  // chooses exactly one OCXO lane.
   g_spincatch_next_second_target = spincatch_rotate_next_second_target();
-
-  if (!PPS_SPINCATCH_ENABLED) return;
-  if (g_spincatch_next_second_target != interrupt_spincatch_target_t::PPS) return;
-  if (!g_interrupt_runtime_ready || !time_valid()) return;
-
-  const uint32_t pps_count = time_pps_count();
-  if (pps_count == 0) return;
-
-  const int64_t target_gnss_ns =
-      (int64_t)(pps_count + 1U) * (int64_t)GNSS_NS_PER_SECOND;
-
-  const timepop_handle_t h =
-      timepop_arm_spincatch_at(target_gnss_ns,
-                               interrupt_spincatch_timepop_callback,
-                               &g_spincatch_ctx_pps,
-                               PPS_SPINCATCH_NAME);
-  if (h == TIMEPOP_INVALID_HANDLE) {
-    g_spincatch_pps.arm_failures++;
-    return;
-  }
-
-  g_spincatch_pps.arm_count++;
 }
 
 static void pps_edge_dispatch_trampoline(timepop_ctx_t*, timepop_diag_t*, void*) {
@@ -2739,22 +2798,14 @@ static void pps_edge_dispatch_trampoline(timepop_ctx_t*, timepop_diag_t*, void*)
   g_pps_edge_dispatch(snap);
 
   // Alpha's foreground PPS selector updates the TimePop/TIME anchor before it
-  // returns.  Arm the next physical PPS SpinCatch from that fresh anchor.
-  spincatch_arm_next_pps_from_current_anchor();
+  // returns.  Select the next OCXO-only SpinCatch lane from that fresh anchor.
+  spincatch_select_next_ocxo_target_after_pps();
 }
 
 void process_interrupt_gpio6789_irq(uint32_t isr_entry_dwt_raw) {
-  // If TimePop is spinning for this physical PPS edge, finish SpinCatch before
-  // any counter reads or latency-normalized event-coordinate arithmetic.
-  if (g_spincatch_next_second_target == interrupt_spincatch_target_t::PPS &&
-      timepop_spincatch_active()) {
-    const bool caught = timepop_spincatch_finish_from_isr(isr_entry_dwt_raw);
-    if (!caught) {
-      g_spincatch_pps.finish_miss_count++;
-    }
-  }
-
-  // PPS GPIO is a witness/selector only.  It captures the physical PPS facts
+  // PPS GPIO is a witness/selector only.  It is no longer a SpinCatch finishing
+  // interrupt; OCXO one-shot compare rails are the only SpinCatch targets.
+  // It captures the physical PPS facts
   // and, during rebootstrap, selects the VCLOCK-domain edge identity.  It does
   // NOT author the public PPS/VCLOCK DWT coordinate; that coordinate is later
   // authored by the TimePop VCLOCK cadence client on QTimer1 CH2 so all public
@@ -3049,6 +3100,13 @@ static void ocxo_spincatch_enable_compare_for_prespin(interrupt_subscriber_kind_
   // The COMP registers were populated earlier, but TCF1EN stayed clear so
   // stale low-word flags could not storm the CPU for the full 1–2 ms lead.
   //
+  // Capture the enable geometry immediately before the rail becomes live.
+  // These are forensics only; they do not author event time.
+  store->enable_dwt = ARM_DWT_CYCCNT;
+  store->enable_counter16 = ocxo_lane_counter_now(*lane);
+  store->enable_ticks_to_target =
+      (uint32_t)((uint16_t)(store->target_low16 - store->enable_counter16));
+
   // Publish the software state BEFORE enabling the hardware interrupt.  A
   // priority-0 OCXO ISR can preempt this QTimer1/TimePop context immediately
   // after TCF1EN is set; if the state is still "muted" at that instant, the
@@ -3263,7 +3321,7 @@ void process_interrupt_init(void) {
   g_spincatch_pps = interrupt_spincatch_store_t{};
   g_spincatch_ocxo1 = interrupt_spincatch_store_t{};
   g_spincatch_ocxo2 = interrupt_spincatch_store_t{};
-  g_spincatch_next_second_target = interrupt_spincatch_target_t::PPS;
+  g_spincatch_next_second_target = interrupt_spincatch_target_t::OCXO1;
   g_spincatch_round_robin_count = 0;
 
   g_vclock_clock32 = vclock_synthetic_clock32_t{};
@@ -3352,8 +3410,8 @@ void process_interrupt_enable_irqs(void) {
 
   pinMode(GNSS_PPS_PIN, INPUT);
   attachInterrupt(digitalPinToInterrupt(GNSS_PPS_PIN), pps_gpio_isr, RISING);
-  // PPS GPIO is a SpinCatch finishing interrupt and must be able to preempt
-  // the TimePop/QTimer1 early-spin window.
+  // PPS GPIO is no longer a SpinCatch finishing interrupt, but it remains
+  // priority-0 timing custody for physical PPS witness/epoch selection.
   NVIC_SET_PRIORITY(IRQ_GPIO6789, SPINCATCH_TARGET_IRQ_PRIORITY);
 
   g_interrupt_irqs_enabled = true;
@@ -3440,7 +3498,22 @@ static void add_spincatch_payload(Payload& p,
   add_u32("accepted_match_count", s.accepted_match_count);
   add_u32("compare_programmed_count", s.compare_programmed_count);
   add_u32("compare_enabled_count", s.compare_enabled_count);
-  add_u32("unexpected_irq_while_muted_count", s.unexpected_irq_while_muted_count);
+  add_u32("inactive_compare_irq_count", s.inactive_compare_irq_count);
+  add_u32("programmed_but_muted_irq_count", s.programmed_but_muted_irq_count);
+  add_u32("enable_dwt", s.enable_dwt);
+  add_u32("enable_counter16", (uint32_t)s.enable_counter16);
+  add_u32("enable_ticks_to_target", s.enable_ticks_to_target);
+  add_u32("near_early_count_this_arm", s.near_early_count_this_arm);
+  add_u32("near_early_count_max_per_arm", s.near_early_count_max_per_arm);
+  add_u32("last_near_early_counter16", (uint32_t)s.last_near_early_counter16);
+  add_i32("last_near_early_signed_delta_low16", s.last_near_early_signed_delta_low16);
+  add_u32("last_near_early_ticks_until_target", s.last_near_early_ticks_until_target);
+  add_u32("last_near_early_dwt_raw", s.last_near_early_dwt_raw);
+  add_u32("last_near_early_cycles_after_enable", s.last_near_early_cycles_after_enable);
+  add_i32("last_near_early_cycles_before_expected_edge", s.last_near_early_cycles_before_expected_edge);
+  add_u32("accepted_after_near_early_count", s.accepted_after_near_early_count);
+  add_u32("last_accepted_cycles_after_near_early", s.last_accepted_cycles_after_near_early);
+  add_u32("last_accepted_cycles_after_enable", s.last_accepted_cycles_after_enable);
   add_i32("irq_vs_expected_edge_cycles", s.irq_vs_expected_edge_cycles);
   add_i32("irq_vs_spin_start_cycles", s.irq_vs_spin_start_cycles);
   add_i32("irq_vs_spin_timeout_cycles", s.irq_vs_spin_timeout_cycles);
@@ -3541,16 +3614,6 @@ static Payload cmd_report(const Payload&) {
   p.add("gpio_irq_count", g_gpio_irq_count);
   p.add("gpio_miss_count", g_gpio_miss_count);
   p.add("gpio_edge_count", g_pps_gpio_heartbeat.edge_count);
-  p.add("spincatch_pps_enabled", PPS_SPINCATCH_ENABLED);
-  p.add("spincatch_ocxo_enabled", OCXO_SPINCATCH_ENABLED);
-  p.add("spincatch_next_second_target", spincatch_target_str(g_spincatch_next_second_target));
-  p.add("spincatch_round_robin_count", g_spincatch_round_robin_count);
-  p.add("spincatch_scheduler_irq_priority", (uint32_t)SPINCATCH_SCHEDULER_IRQ_PRIORITY);
-  p.add("spincatch_target_irq_priority", (uint32_t)SPINCATCH_TARGET_IRQ_PRIORITY);
-  add_spincatch_payload(p, "pps", g_spincatch_pps);
-  add_spincatch_payload(p, "ocxo1", g_spincatch_ocxo1);
-  add_spincatch_payload(p, "ocxo2", g_spincatch_ocxo2);
-
   // PPS (physical edge) and PPS_VCLOCK (canonical) in symmetric blocks.
   pps_t pps; pps_vclock_t pvc;
   store_load(pps, pvc);
@@ -3724,8 +3787,31 @@ static Payload cmd_report(const Payload&) {
   return p;
 }
 
+static Payload cmd_spincatch_info(const Payload&) {
+  Payload p;
+
+  p.add("hardware_ready", g_interrupt_hw_ready);
+  p.add("runtime_ready",  g_interrupt_runtime_ready);
+  p.add("irqs_enabled",   g_interrupt_irqs_enabled);
+  p.add("ocxo_compare_live_requires_enabled_and_flag", true);
+  p.add("ocxo_legacy_compare_cadence_retired", true);
+  p.add("spincatch_pps_enabled", PPS_SPINCATCH_ENABLED);
+  p.add("spincatch_ocxo_enabled", OCXO_SPINCATCH_ENABLED);
+  p.add("spincatch_next_second_target", spincatch_target_str(g_spincatch_next_second_target));
+  p.add("spincatch_round_robin_count", g_spincatch_round_robin_count);
+  p.add("spincatch_scheduler_irq_priority", (uint32_t)SPINCATCH_SCHEDULER_IRQ_PRIORITY);
+  p.add("spincatch_target_irq_priority", (uint32_t)SPINCATCH_TARGET_IRQ_PRIORITY);
+
+  add_spincatch_payload(p, "pps", g_spincatch_pps);
+  add_spincatch_payload(p, "ocxo1", g_spincatch_ocxo1);
+  add_spincatch_payload(p, "ocxo2", g_spincatch_ocxo2);
+
+  return p;
+}
+
 static const process_command_entry_t INTERRUPT_COMMANDS[] = {
   { "REPORT",          cmd_report          },
+  { "SPINCATCH_INFO",  cmd_spincatch_info  },
   { nullptr,           nullptr             }
 };
 
