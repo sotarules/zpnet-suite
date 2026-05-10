@@ -121,6 +121,13 @@ static constexpr uint32_t TIMEPOP_SPINCATCH_LEAD_TICKS =
     (uint32_t)(TIMEPOP_SPINCATCH_LEAD_NS / NS_PER_TICK);
 static constexpr uint32_t TIMEPOP_SPINCATCH_TIMEOUT_CYCLES = 20000U;
 
+// The finishing compare rail should not be enabled at the very beginning of
+// the SpinCatch window.  The loop first records shadow DWT samples for several
+// microseconds, then enables the target interrupt shortly before the expected
+// hardware edge.  This prevents a valid catch from completing during prespin
+// before shadow_seq has advanced.
+static constexpr uint32_t TIMEPOP_SPINCATCH_ENABLE_TARGET_AFTER_CYCLES = 3500U;
+
 // SpinCatch preemption forensics.  util.h already supplies read_basepri();
 // keep the remaining ARM special-register reads local to TimePop because
 // they are report-only diagnostics for this experiment.
@@ -1634,6 +1641,10 @@ static void spincatch_begin_from_slot(timepop_slot_t& slot,
   prespin_diag.spin_catch_lead_ticks = slot.spincatch_lead_ticks;
   prespin_diag.spin_catch_timeout_cycles = slot.spincatch_timeout_cycles;
 
+  // Same-vector custody refresh is intentionally performed before the
+  // SpinCatch runtime is exposed.  This hook no longer enables the finishing
+  // OCXO compare rail; it only refreshes interrupt-layer counter custody so
+  // synthetic 32-bit identities remain coherent while QTimer1 is spinning.
   interrupt_prespin_service(&prespin_ctx, &prespin_diag, nullptr);
 
   g_spincatch.landing_dwt = ARM_DWT_CYCCNT;
@@ -1643,13 +1654,15 @@ static void spincatch_begin_from_slot(timepop_slot_t& slot,
   g_spincatch.timeout = false;
   g_spincatch.active = true;
 
-  // Capture the actual exception-mask state at the moment TimePop starts
-  // the spin.  If target IRQs cannot preempt, these fields should tell us
+  // Capture the actual exception-mask state at the moment TimePop starts the
+  // shadow loop.  If target IRQs cannot preempt, these fields should tell us
   // whether PRIMASK/BASEPRI/FAULTMASK/IPSR are responsible.
   g_spincatch.entry_basepri = read_basepri();
   g_spincatch.entry_primask = timepop_read_primask();
   g_spincatch.entry_faultmask = timepop_read_faultmask();
   g_spincatch.entry_ipsr = timepop_read_ipsr();
+
+  bool target_enabled = false;
 
   while (g_spincatch.active) {
     const uint32_t now_dwt = ARM_DWT_CYCCNT;
@@ -1657,8 +1670,14 @@ static void spincatch_begin_from_slot(timepop_slot_t& slot,
     g_spincatch.shadow_seq++;
     __asm__ volatile ("" ::: "memory");
 
-    if ((uint32_t)(now_dwt - g_spincatch.landing_dwt) >=
-        g_spincatch.timeout_cycles) {
+    const uint32_t elapsed_cycles = now_dwt - g_spincatch.landing_dwt;
+    if (!target_enabled &&
+        elapsed_cycles >= TIMEPOP_SPINCATCH_ENABLE_TARGET_AFTER_CYCLES) {
+      target_enabled = true;
+      interrupt_spincatch_enable_target(&prespin_ctx, &prespin_diag, nullptr);
+    }
+
+    if (elapsed_cycles >= g_spincatch.timeout_cycles) {
       g_spincatch.final_shadow_dwt = now_dwt;
       g_spincatch.approach_cycles = now_dwt - g_spincatch.landing_dwt;
       g_spincatch.timeout_basepri = read_basepri();

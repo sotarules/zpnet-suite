@@ -9,7 +9,6 @@
 //   • VCLOCK lane   (critical recurring TimePop client on QTimer1 CH2)
 //   • TimePop       (QTimer1 CH2, hosted scheduler/client rail)
 //   • PPS GPIO edge (diagnostics + dispatch authority + epoch anchor)
-//   • SpinCatch witness finishing for PPS / OCXO one-second edges
 //
 // QTimer1 vector custody:
 //
@@ -116,10 +115,8 @@
 //              the passive low-word VCLOCK counter; QTimer1 CH2 is the only
 //              active TimePop compare rail.
 //     MINDER : TimePop recurring 1 ms client, tends VCLOCK/OCXO low-word counters
-//     OCXO1  : QTimer2 CH0 one-shot compare, armed only in the final millisecond
-//              when SpinCatch selects OCXO1 for that second.
-//     OCXO2  : QTimer3 CH3 one-shot compare, armed only in the final millisecond
-//              when SpinCatch selects OCXO2 for that second.
+//     OCXO1  : QTimer2 CH0 compare, event rail retained for current one-second events
+//     OCXO2  : QTimer3 CH3 compare, event rail retained for current one-second events
 // ============================================================================
 
 #pragma once
@@ -130,6 +127,7 @@
 
 // Compatibility shim — retired but still referenced by loop() plumbing.
 void interrupt_prespin_service(timepop_ctx_t*, timepop_diag_t*, void*);
+void interrupt_spincatch_enable_target(timepop_ctx_t*, timepop_diag_t*, void*);
 
 // ============================================================================
 // Subscriber identities
@@ -483,7 +481,7 @@ struct pps_edge_snapshot_t {
   int32_t  vclock_epoch_dwt_offset_cycles      = 0;
   bool     vclock_epoch_selected               = false;
 
-  // Physical PPS SpinCatch forensics.  Raw, not latency-adjusted.
+  // Physical PPS SpinCatch forensics. Raw, not latency-adjusted.
   interrupt_spincatch_diag_t spincatch;
 };
 

@@ -174,6 +174,14 @@ static constexpr uint32_t SPINCATCH_DIAG_LEAD_TICKS =
     (uint32_t)(SPINCATCH_DIAG_LEAD_NS / 100ULL);
 static constexpr uint32_t SPINCATCH_DIAG_TIMEOUT_CYCLES = 20000U;
 
+// If a stale OCXO compare flag appears immediately after the one-shot compare
+// interrupt is enabled, but the lane is already inside the SpinCatch approach
+// window, keep the compare alive when the target is very near.  The observed
+// stale flag arrives roughly 44-46 OCXO ticks before the intended low-word
+// match; this threshold leaves room for that artifact without reopening the
+// old millisecond-scale interrupt storm.
+static constexpr int32_t OCXO_SPINCATCH_NEAR_EARLY_TICKS = 128;
+
 // ============================================================================
 // PPS / PPS_VCLOCK doctrine
 // ============================================================================
@@ -942,7 +950,15 @@ struct interrupt_spincatch_context_t {
 struct interrupt_spincatch_store_t {
   interrupt_spincatch_diag_t last{};
   bool     pending = false;
+
+  // OCXO SpinCatch pact doctrine:
+  //   • compare_programmed means COMP1/CMPLD1 hold the intended low word.
+  //   • compare_armed means the compare interrupt is actually enabled.
+  // The compare may be programmed early, but it must remain muted until
+  // TimePop calls interrupt_prespin_service() immediately before the spin.
+  bool     compare_programmed = false;
   bool     compare_armed = false;
+  bool     compare_irq_enabled = false;
   bool     event_delivered = false;
   uint32_t target_counter32 = 0;
   uint16_t target_low16 = 0;
@@ -959,6 +975,14 @@ struct interrupt_spincatch_store_t {
   uint32_t irq_dwt_raw = 0;
   uint16_t irq_counter16 = 0;
   uint32_t irq_delta_from_target_low16 = 0;
+  int32_t  irq_signed_delta_from_target_low16 = 0;
+  uint32_t early_false_match_count = 0;
+  uint32_t early_false_disabled_count = 0;
+  uint32_t near_early_kept_armed_count = 0;
+  uint32_t accepted_match_count = 0;
+  uint32_t compare_programmed_count = 0;
+  uint32_t compare_enabled_count = 0;
+  uint32_t unexpected_irq_while_muted_count = 0;
   int32_t  irq_vs_expected_edge_cycles = 0;
   int32_t  irq_vs_spin_start_cycles = 0;
   int32_t  irq_vs_spin_timeout_cycles = 0;
@@ -1102,7 +1126,10 @@ static ocxo_lane_t* ocxo_lane_for(interrupt_subscriber_kind_t kind);
 static inline uint16_t ocxo_lane_counter_now(const ocxo_lane_t& lane);
 
 static void ocxo_lane_program_compare(ocxo_lane_t& lane, uint16_t target_low16);
+static void ocxo_lane_program_compare_muted(ocxo_lane_t& lane, uint16_t target_low16);
+static void ocxo_lane_enable_compare_interrupt(ocxo_lane_t& lane);
 static void ocxo_lane_disable_compare(ocxo_lane_t& lane);
+static void ocxo_spincatch_enable_compare_for_prespin(interrupt_subscriber_kind_t kind);
 
 // ============================================================================
 // QTimer1 CH0 low-word counter
@@ -1507,6 +1534,21 @@ static inline void qtimer2_ch0_program_compare(uint16_t target_low16) {
   qtimer2_ch0_clear_compare_flag();
   IMXRT_TMR2.CH[0].CSCTRL |= TMR_CSCTRL_TCF1EN;
 }
+static inline void qtimer2_ch0_program_compare_muted(uint16_t target_low16) {
+  IMXRT_TMR2.CH[0].CSCTRL &= ~TMR_CSCTRL_TCF1EN;
+  qtimer2_ch0_clear_compare_flag();
+  IMXRT_TMR2.CH[0].COMP1  = target_low16;
+  IMXRT_TMR2.CH[0].CMPLD1 = target_low16;
+  qtimer2_ch0_clear_compare_flag();
+}
+static inline void qtimer2_ch0_enable_compare_interrupt(void) {
+  qtimer2_ch0_clear_compare_flag();
+  IMXRT_TMR2.CH[0].CSCTRL |= TMR_CSCTRL_TCF1EN;
+  // Enabling TCF1EN can expose a stale compare flag immediately on this
+  // hardware.  Clear once more after enabling while the real target is still
+  // tens of ticks away; the accepted match will be allowed to mature normally.
+  qtimer2_ch0_clear_compare_flag();
+}
 static inline void qtimer2_ch0_disable_compare(void) {
   IMXRT_TMR2.CH[0].CSCTRL &= ~TMR_CSCTRL_TCF1EN;
   qtimer2_ch0_clear_compare_flag();
@@ -1527,6 +1569,20 @@ static inline void qtimer3_program_compare(uint8_t ch, uint16_t target_low16) {
   IMXRT_TMR3.CH[ch].CMPLD1 = target_low16;
   qtimer3_clear_compare_flag(ch);
   IMXRT_TMR3.CH[ch].CSCTRL |= TMR_CSCTRL_TCF1EN;
+}
+static inline void qtimer3_program_compare_muted(uint8_t ch, uint16_t target_low16) {
+  IMXRT_TMR3.CH[ch].CSCTRL &= ~TMR_CSCTRL_TCF1EN;
+  qtimer3_clear_compare_flag(ch);
+  IMXRT_TMR3.CH[ch].COMP1  = target_low16;
+  IMXRT_TMR3.CH[ch].CMPLD1 = target_low16;
+  qtimer3_clear_compare_flag(ch);
+}
+static inline void qtimer3_enable_compare_interrupt(uint8_t ch) {
+  qtimer3_clear_compare_flag(ch);
+  IMXRT_TMR3.CH[ch].CSCTRL |= TMR_CSCTRL_TCF1EN;
+  // Same stale-flag hygiene as QTimer2: clear after enabling so the first
+  // real IRQ opportunity belongs to the target low-word match.
+  qtimer3_clear_compare_flag(ch);
 }
 static inline void qtimer3_disable_compare(uint8_t ch) {
   IMXRT_TMR3.CH[ch].CSCTRL &= ~TMR_CSCTRL_TCF1EN;
@@ -1700,16 +1756,17 @@ static bool ocxo_spincatch_arm_final_millisecond(interrupt_subscriber_kind_t kin
   interrupt_spincatch_store_t* store = spincatch_store_for_kind(kind);
   if (!store) return false;
 
-  const uint32_t target_counter32 = clock32.current_counter32 + OCXO_INTERVAL_COUNTS;
+  const uint32_t target_counter32 = clock32.current_counter32 + VCLOCK_INTERVAL_COUNTS;
   const uint16_t target_low16 = (uint16_t)(target_counter32 & 0xFFFFU);
   const int64_t target_gnss_ns = cadence_gnss_ns + (int64_t)CADENCE_MINDER_PERIOD_NS;
 
   // The physical finishing rail must exist before TimePop arms the early
   // spin window.  Publish the intended target identity first, then program
   // the low-word compare, and only then ask TimePop to enter SpinCatch.
-  // A QTimer compare is only 16-bit, but this one-shot is armed inside the
-  // final millisecond; within that window the low-word match is the intended
-  // synthetic 32-bit edge.
+  // This path is driven from CADENCE_MINDER's 1 ms rail.  Therefore the
+  // OCXO one-shot target must be the next 1 ms / 10,000-tick edge, matching
+  // target_gnss_ns below.  OCXO_INTERVAL_COUNTS is 20,000 ticks for the old
+  // 2 ms OCXO compare cadence and is deliberately not used here.
   const uint16_t arm_counter16 = ocxo_lane_counter_now(lane);
   const uint32_t ticks_to_target_at_arm =
       (uint32_t)((uint16_t)(target_low16 - arm_counter16));
@@ -1724,7 +1781,9 @@ static bool ocxo_spincatch_arm_final_millisecond(interrupt_subscriber_kind_t kin
 
   store->target_counter32 = target_counter32;
   store->target_low16 = target_low16;
+  store->compare_programmed = false;
   store->compare_armed = false;
+  store->compare_irq_enabled = false;
   store->event_delivered = false;
   store->pending = false;
   store->last = interrupt_spincatch_diag_t{};
@@ -1737,14 +1796,21 @@ static bool ocxo_spincatch_arm_final_millisecond(interrupt_subscriber_kind_t kin
   store->irq_dwt_raw = 0;
   store->irq_counter16 = 0;
   store->irq_delta_from_target_low16 = 0;
+  store->irq_signed_delta_from_target_low16 = 0;
   store->irq_vs_expected_edge_cycles = 0;
   store->irq_vs_spin_start_cycles = 0;
   store->irq_vs_spin_timeout_cycles = 0;
   store->irq_during_expected_spin_window = false;
 
+  // Program the physical low-word target now, but keep the interrupt muted.
+  // Enabling TCF1EN this early causes the QuadTimer to present stale/immediate
+  // compare IRQs for the entire approach interval.  TimePop will call
+  // interrupt_prespin_service() just before the spin, and that service will
+  // enable the one-shot compare interrupt for the selected OCXO lane.
   ocxo_lane_disable_compare(lane);
-  ocxo_lane_program_compare(lane, target_low16);
-  store->compare_armed = true;
+  ocxo_lane_program_compare_muted(lane, target_low16);
+  store->compare_programmed = true;
+  store->compare_programmed_count++;
 
   const timepop_handle_t h =
       timepop_arm_spincatch_at(target_gnss_ns,
@@ -1753,7 +1819,9 @@ static bool ocxo_spincatch_arm_final_millisecond(interrupt_subscriber_kind_t kin
                                ocxo_spincatch_name_for(kind));
   if (h == TIMEPOP_INVALID_HANDLE) {
     store->arm_failures++;
+    store->compare_programmed = false;
     store->compare_armed = false;
+    store->compare_irq_enabled = false;
     ocxo_lane_disable_compare(lane);
     return false;
   }
@@ -1971,6 +2039,22 @@ static void ocxo_lane_program_compare(ocxo_lane_t& lane, uint16_t target_low16) 
     qtimer2_ch0_program_compare(target_low16);
   } else if (lane.module == &IMXRT_TMR3) {
     qtimer3_program_compare(lane.channel, target_low16);
+  }
+}
+
+static void ocxo_lane_program_compare_muted(ocxo_lane_t& lane, uint16_t target_low16) {
+  if (lane.module == &IMXRT_TMR2 && lane.channel == 0) {
+    qtimer2_ch0_program_compare_muted(target_low16);
+  } else if (lane.module == &IMXRT_TMR3) {
+    qtimer3_program_compare_muted(lane.channel, target_low16);
+  }
+}
+
+static void ocxo_lane_enable_compare_interrupt(ocxo_lane_t& lane) {
+  if (lane.module == &IMXRT_TMR2 && lane.channel == 0) {
+    qtimer2_ch0_enable_compare_interrupt();
+  } else if (lane.module == &IMXRT_TMR3) {
+    qtimer3_enable_compare_interrupt(lane.channel);
   }
 }
 
@@ -2219,8 +2303,32 @@ static void ocxo_spincatch_compare_event_isr(ocxo_lane_t& lane,
   if (rt) rt->irq_count++;
 
   interrupt_spincatch_store_t* store = spincatch_store_for_kind(kind);
-  if (!store || !store->compare_armed) {
-    // Stale compare rail from an old image/state.  Leave the OCXO lane passive.
+  if (!store || !store->compare_programmed) {
+    // Stale compare rail from an old image/state, or an IRQ that arrived after
+    // a previous guard path already retired the one-shot.  Clean both the
+    // hardware and the software mirror so REPORT cannot show a contradictory
+    // armed-but-unprogrammed state.
+    if (store) {
+      store->unexpected_irq_while_muted_count++;
+      store->compare_programmed = false;
+      store->compare_armed = false;
+      store->compare_irq_enabled = false;
+    }
+    ocxo_lane_clear_compare_flag(lane);
+    ocxo_lane_disable_compare(lane);
+    lane.miss_count++;
+    return;
+  }
+
+  if (!store->compare_armed) {
+    // Pact doctrine violation guard: the low-word target may be programmed
+    // before pre-spin, but its interrupt must remain muted until
+    // interrupt_prespin_service() enables it.  If an IRQ reaches us while
+    // muted, shut the one-shot down rather than allowing an interrupt storm.
+    store->unexpected_irq_while_muted_count++;
+    store->compare_programmed = false;
+    store->compare_armed = false;
+    store->compare_irq_enabled = false;
     ocxo_lane_clear_compare_flag(lane);
     ocxo_lane_disable_compare(lane);
     lane.miss_count++;
@@ -2228,12 +2336,14 @@ static void ocxo_spincatch_compare_event_isr(ocxo_lane_t& lane,
   }
 
   const uint16_t irq_counter16 = ocxo_lane_counter_now(lane);
-  const uint32_t irq_delta_from_target_low16 =
-      (uint32_t)((uint16_t)(irq_counter16 - store->target_low16));
+  const uint16_t irq_delta_low16 =
+      (uint16_t)(irq_counter16 - store->target_low16);
+  const int16_t irq_signed_delta_low16 = (int16_t)irq_delta_low16;
 
   store->irq_dwt_raw = isr_entry_dwt_raw;
   store->irq_counter16 = irq_counter16;
-  store->irq_delta_from_target_low16 = irq_delta_from_target_low16;
+  store->irq_delta_from_target_low16 = (uint32_t)irq_delta_low16;
+  store->irq_signed_delta_from_target_low16 = (int32_t)irq_signed_delta_low16;
   store->irq_vs_expected_edge_cycles =
       signed_u32_delta(isr_entry_dwt_raw, store->expected_edge_dwt_from_arm);
   store->irq_vs_spin_start_cycles =
@@ -2243,6 +2353,37 @@ static void ocxo_spincatch_compare_event_isr(ocxo_lane_t& lane,
   store->irq_during_expected_spin_window =
       store->irq_vs_spin_start_cycles >= 0 &&
       store->irq_vs_spin_timeout_cycles <= 0;
+
+  // A QTimer compare flag is only a 16-bit interrupt opportunity.  The
+  // intended OCXO event is a synthetic 32-bit identity.  Some hardware/images
+  // present a stale flag immediately after enabling the compare interrupt.
+  //
+  // If the stale flag appears far from the target, shut the one-shot down to
+  // prevent the old millisecond-scale interrupt storm.  If it appears inside
+  // the SpinCatch approach window and only a few dozen OCXO ticks early, clear
+  // the stale flag and keep the compare live so the real target match can
+  // arrive a few microseconds later.
+  if (irq_signed_delta_low16 < 0) {
+    store->early_false_match_count++;
+
+    const int32_t ticks_until_target = -(int32_t)irq_signed_delta_low16;
+    if (store->irq_during_expected_spin_window &&
+        ticks_until_target <= OCXO_SPINCATCH_NEAR_EARLY_TICKS) {
+      store->near_early_kept_armed_count++;
+      ocxo_lane_clear_compare_flag(lane);
+      return;
+    }
+
+    store->early_false_disabled_count++;
+    store->compare_programmed = false;
+    store->compare_armed = false;
+    store->compare_irq_enabled = false;
+    ocxo_lane_clear_compare_flag(lane);
+    ocxo_lane_disable_compare(lane);
+    return;
+  }
+
+  store->accepted_match_count++;
 
   // Finish TimePop's active SpinCatch window before doing peripheral cleanup.
   // These raw facts are the forensic target; do not latency-adjust them here.
@@ -2255,7 +2396,9 @@ static void ocxo_spincatch_compare_event_isr(ocxo_lane_t& lane,
 
   ocxo_lane_clear_compare_flag(lane);
   ocxo_lane_disable_compare(lane);
+  store->compare_programmed = false;
   store->compare_armed = false;
+  store->compare_irq_enabled = false;
 
   const uint32_t event_dwt = qtimer_event_dwt_from_isr_entry_raw(isr_entry_dwt_raw);
   const uint32_t event_counter32 = store->target_counter32;
@@ -2893,6 +3036,30 @@ const interrupt_capture_diag_t* interrupt_last_diag(interrupt_subscriber_kind_t 
   return (!rt || !rt->has_fired) ? nullptr : &rt->last_diag;
 }
 
+static void ocxo_spincatch_enable_compare_for_prespin(interrupt_subscriber_kind_t kind) {
+  interrupt_spincatch_store_t* store = spincatch_store_for_kind(kind);
+  ocxo_lane_t* lane = ocxo_lane_for(kind);
+  if (!store || !lane || !lane->initialized) return;
+  if (!store->compare_programmed) return;
+  if (store->compare_armed) return;
+  if (store->event_delivered) return;
+
+  // TimePop is about to enter the short SpinCatch loop.  This is the only
+  // moment at which the OCXO compare interrupt is allowed to become live.
+  // The COMP registers were populated earlier, but TCF1EN stayed clear so
+  // stale low-word flags could not storm the CPU for the full 1–2 ms lead.
+  //
+  // Publish the software state BEFORE enabling the hardware interrupt.  A
+  // priority-0 OCXO ISR can preempt this QTimer1/TimePop context immediately
+  // after TCF1EN is set; if the state is still "muted" at that instant, the
+  // ISR will classify a legitimate live rail as unexpected and retire it.
+  store->compare_armed = true;
+  store->compare_irq_enabled = true;
+  store->compare_enabled_count++;
+  ocxo_lane_clear_compare_flag(*lane);
+  ocxo_lane_enable_compare_interrupt(*lane);
+}
+
 void interrupt_prespin_service(timepop_ctx_t* ctx, timepop_diag_t*, void*) {
   if (!ctx || !g_interrupt_hw_ready) return;
 
@@ -2929,8 +3096,25 @@ void interrupt_prespin_service(timepop_ctx_t* ctx, timepop_diag_t*, void*) {
     g_cadence_minder_prespin_ocxo2_updates++;
   }
 
+  // Do not enable the OCXO target compare here.  TimePop calls this service
+  // before the SpinCatch shadow loop begins.  Enabling a priority-0 OCXO
+  // finishing interrupt inside prespin lets the target ISR finish before the
+  // shadow loop has recorded any witness samples.  The target rail is enabled
+  // later by interrupt_spincatch_enable_target(), after TimePop has started
+  // updating shadow_dwt.
+
   g_cadence_minder_prespin_service_count++;
   g_cadence_minder_prespin_vclock_updates++;
+}
+
+void interrupt_spincatch_enable_target(timepop_ctx_t*, timepop_diag_t*, void*) {
+  if (!g_interrupt_hw_ready) return;
+
+  if (g_spincatch_next_second_target == interrupt_spincatch_target_t::OCXO1) {
+    ocxo_spincatch_enable_compare_for_prespin(interrupt_subscriber_kind_t::OCXO1);
+  } else if (g_spincatch_next_second_target == interrupt_spincatch_target_t::OCXO2) {
+    ocxo_spincatch_enable_compare_for_prespin(interrupt_subscriber_kind_t::OCXO2);
+  }
 }
 
 // ============================================================================
@@ -3228,7 +3412,9 @@ static void add_spincatch_payload(Payload& p,
   add_bool("used", s.last.used);
   add_bool("timeout", s.last.timeout);
   add_bool("pending", s.pending);
+  add_bool("compare_programmed", s.compare_programmed);
   add_bool("compare_armed", s.compare_armed);
+  add_bool("compare_irq_enabled", s.compare_irq_enabled);
   add_bool("event_delivered", s.event_delivered);
   add_u32("arm_count", s.arm_count);
   add_u32("arm_failures", s.arm_failures);
@@ -3247,6 +3433,14 @@ static void add_spincatch_payload(Payload& p,
   add_u32("irq_dwt_raw", s.irq_dwt_raw);
   add_u32("irq_counter16", (uint32_t)s.irq_counter16);
   add_u32("irq_delta_from_target_low16", s.irq_delta_from_target_low16);
+  add_i32("irq_signed_delta_from_target_low16", s.irq_signed_delta_from_target_low16);
+  add_u32("early_false_match_count", s.early_false_match_count);
+  add_u32("early_false_disabled_count", s.early_false_disabled_count);
+  add_u32("near_early_kept_armed_count", s.near_early_kept_armed_count);
+  add_u32("accepted_match_count", s.accepted_match_count);
+  add_u32("compare_programmed_count", s.compare_programmed_count);
+  add_u32("compare_enabled_count", s.compare_enabled_count);
+  add_u32("unexpected_irq_while_muted_count", s.unexpected_irq_while_muted_count);
   add_i32("irq_vs_expected_edge_cycles", s.irq_vs_expected_edge_cycles);
   add_i32("irq_vs_spin_start_cycles", s.irq_vs_spin_start_cycles);
   add_i32("irq_vs_spin_timeout_cycles", s.irq_vs_spin_timeout_cycles);
