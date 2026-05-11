@@ -127,7 +127,6 @@
 
 // Compatibility shim — retired but still referenced by loop() plumbing.
 void interrupt_prespin_service(timepop_ctx_t*, timepop_diag_t*, void*);
-void interrupt_spincatch_enable_target(timepop_ctx_t*, timepop_diag_t*, void*);
 
 // ============================================================================
 // Subscriber identities
@@ -224,33 +223,6 @@ struct interrupt_event_t {
 };
 
 // ============================================================================
-// SpinCatch raw forensic surface
-// ============================================================================
-//
-// These fields are raw TimePop SpinCatch facts. They are deliberately not
-// latency-adjusted and must not be treated as event-coordinate DWT values.
-// They describe the relationship between TimePop's final spin shadow and the
-// target ISR's first-instruction DWT capture.  PPS SpinCatch has been retired;
-// the active SpinCatch targets are the OCXO one-shot compare rails.
-
-struct interrupt_spincatch_diag_t {
-  bool     used = false;
-  bool     timeout = false;
-  uint32_t handle = 0;
-  uint32_t target_deadline = 0;
-  int64_t  target_gnss_ns = -1;
-  uint64_t lead_ns = 0;
-  uint32_t lead_ticks = 0;
-  uint32_t timeout_cycles = 0;
-  uint32_t landing_dwt = 0;
-  uint32_t final_shadow_dwt = 0;
-  uint32_t shadow_seq = 0;
-  uint32_t approach_cycles = 0;
-  uint32_t isr_entry_dwt_raw = 0;
-  uint32_t isr_entry_latency_cycles = 0;
-};
-
-// ============================================================================
 // Diagnostic surface — carried alongside every one-second event
 // ============================================================================
 
@@ -315,10 +287,6 @@ struct interrupt_capture_diag_t {
   // PPS / VCLOCK coincidence mirror (see interrupt_event_t).
   uint32_t pps_coincidence_cycles = 0;
   bool     pps_coincidence_valid  = false;
-
-  // TimePop SpinCatch raw forensics, copied through process_interrupt so
-  // CLOCKS/Alpha can carry them into TIMEBASE_FRAGMENT without rerunning math.
-  interrupt_spincatch_diag_t spincatch;
 
   uint32_t anomaly_count = 0;
 };
@@ -481,11 +449,6 @@ struct pps_edge_snapshot_t {
   int32_t  vclock_epoch_counter32_offset_ticks = 0;
   int32_t  vclock_epoch_dwt_offset_cycles      = 0;
   bool     vclock_epoch_selected               = false;
-
-  // Retired physical PPS SpinCatch forensics. PPS is no longer part of the
-  // SpinCatch regimen, so this remains an always-empty legacy compatibility
-  // surface until pps_edge_snapshot_t is retired.
-  interrupt_spincatch_diag_t spincatch;
 };
 
 // ============================================================================
