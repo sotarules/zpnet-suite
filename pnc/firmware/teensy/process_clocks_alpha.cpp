@@ -464,6 +464,12 @@ struct alpha_lane_forensics_store_t {
   uint32_t last_event_dwt = 0;
   uint32_t last_event_counter32 = 0;
 
+  uint32_t previous_edge_dwt = 0;
+  uint32_t last_edge_dwt = 0;
+  uint64_t previous_edge_gnss_ns = 0;
+  uint64_t last_edge_gnss_ns = 0;
+  uint32_t completed_interval_count = 0;
+
   bool     zero_offset_valid = false;
   uint32_t zero_offset_counter32 = 0;
   uint32_t counter32_delta_since_zero_offset = 0;
@@ -825,6 +831,11 @@ static void alpha_forensics_reset_store(alpha_lane_forensics_store_t& s) {
   s.update_count = 0;
   s.last_event_dwt = 0;
   s.last_event_counter32 = 0;
+  s.previous_edge_dwt = 0;
+  s.last_edge_dwt = 0;
+  s.previous_edge_gnss_ns = 0;
+  s.last_edge_gnss_ns = 0;
+  s.completed_interval_count = 0;
   s.zero_offset_valid = false;
   s.zero_offset_counter32 = 0;
   s.counter32_delta_since_zero_offset = 0;
@@ -889,9 +900,12 @@ static void alpha_forensics_publish(time_clock_id_t clock_id,
           : 0ULL;
 
   const uint64_t previous_event_gnss_ns = s->event_gnss_ns;
-  const uint64_t event_gnss_ns = (event.gnss_ns_at_event != 0)
-      ? event.gnss_ns_at_event
-      : ns_now;
+  const bool is_ocxo_lane =
+      (clock_id == time_clock_id_t::OCXO1 ||
+       clock_id == time_clock_id_t::OCXO2);
+  const uint64_t event_gnss_ns = is_ocxo_lane
+      ? ns_now
+      : ((event.gnss_ns_at_event != 0) ? event.gnss_ns_at_event : ns_now);
 
   // For OCXO lanes process_interrupt may not carry a direct GNSS timestamp in
   // the event. The authoritative measured interval is therefore the
@@ -912,6 +926,11 @@ static void alpha_forensics_publish(time_clock_id_t clock_id,
   s->update_count++;
   s->last_event_dwt = event.dwt_at_event;
   s->last_event_counter32 = event.counter32_at_event;
+  s->previous_edge_dwt = meas.previous_edge_dwt;
+  s->last_edge_dwt = meas.last_edge_dwt;
+  s->previous_edge_gnss_ns = meas.previous_edge_gnss_ns;
+  s->last_edge_gnss_ns = meas.last_edge_gnss_ns;
+  s->completed_interval_count = meas.completed_interval_count;
   s->zero_offset_valid = zero_offset_valid;
   s->zero_offset_counter32 = zero_offset_counter32;
   s->counter32_delta_since_zero_offset = counter32_delta_since_zero_offset;
@@ -973,6 +992,11 @@ bool clocks_alpha_lane_forensics(time_clock_id_t clock,
     out->update_count = s->update_count;
     out->last_event_dwt = s->last_event_dwt;
     out->last_event_counter32 = s->last_event_counter32;
+    out->previous_edge_dwt = s->previous_edge_dwt;
+    out->last_edge_dwt = s->last_edge_dwt;
+    out->previous_edge_gnss_ns = s->previous_edge_gnss_ns;
+    out->last_edge_gnss_ns = s->last_edge_gnss_ns;
+    out->completed_interval_count = s->completed_interval_count;
     out->zero_offset_valid = s->zero_offset_valid;
     out->zero_offset_counter32 = s->zero_offset_counter32;
     out->counter32_delta_since_zero_offset = s->counter32_delta_since_zero_offset;
@@ -1175,6 +1199,11 @@ bool clocks_alpha_zero_from_interrupt_capture(const char* reason) {
   // survives the retirement of process_epoch.
   timepop_epoch_changed(g_alpha_epoch_sequence);
 
+  // TimePop epoch changes cancel unsafe one-shot timers.  Schedule the OCXO
+  // compare-gate arming windows only after that cancellation boundary, or the
+  // first OCXO_EDGE_ARM slots will be born and immediately retired.
+  interrupt_ocxo_logical_grid_epoch(cap.ocxo1_counter32, cap.ocxo2_counter32);
+
   g_alpha_epoch_last_capture_sequence = cap.sequence;
   g_alpha_epoch_last_capture_window_cycles = cap.capture_window_cycles;
   g_alpha_epoch_last_vclock_capture_valid = cap.vclock_capture_valid;
@@ -1251,11 +1280,14 @@ static void clocks_apply_epoch_counter_edge(clock_state_t& clock,
   const bool is_ocxo =
       (time_clock == time_clock_id_t::OCXO1 ||
        time_clock == time_clock_id_t::OCXO2);
-  const bool had_previous = (meas.prev_dwt_at_edge != 0);
+
+  const uint32_t prior_last_edge_dwt = meas.last_edge_dwt;
+  const uint64_t prior_last_edge_gnss_ns = meas.last_edge_gnss_ns;
+  const bool had_previous = (prior_last_edge_dwt != 0);
 
   uint64_t ns_now = counter_ns_now;
   uint32_t dwt_cycles_between_edges = had_previous
-      ? (event.dwt_at_event - meas.prev_dwt_at_edge)
+      ? (event.dwt_at_event - prior_last_edge_dwt)
       : 0U;
   uint64_t gnss_ns_between_edges = 0;
   int64_t second_residual_ns = 0;
@@ -1276,7 +1308,7 @@ static void clocks_apply_epoch_counter_edge(clock_state_t& clock,
     second_residual_ns = residual_fast_ns;
     window_error_ns = -residual_fast_ns;
   } else if (had_previous) {
-    const uint64_t previous_bridge_gnss_ns = meas.prev_gnss_ns_at_edge;
+    const uint64_t previous_bridge_gnss_ns = prior_last_edge_gnss_ns;
     const bool bridge_interval_available =
         (event.gnss_ns_at_event != 0 && previous_bridge_gnss_ns != 0 &&
          event.gnss_ns_at_event >= previous_bridge_gnss_ns);
@@ -1293,16 +1325,21 @@ static void clocks_apply_epoch_counter_edge(clock_state_t& clock,
 
   clock.ledger_ns_count_at_edge = ns_now;
   clock.ledger_ns_count_at_pps_vclock = ns_now;
-  const uint64_t reference_gnss_ns_at_edge = (event.gnss_ns_at_event != 0)
-      ? event.gnss_ns_at_event
-      : ns_now;
+  const uint64_t reference_gnss_ns_at_edge = is_ocxo
+      ? ns_now
+      : ((event.gnss_ns_at_event != 0) ? event.gnss_ns_at_event : ns_now);
   clock.gnss_ns_at_edge = reference_gnss_ns_at_edge;
   clock.phase_offset_ns =
       (int64_t)reference_gnss_ns_at_edge - (int64_t)ns_now;
   clock.zero_established = true;
   clock.window_error_ns = window_error_ns;
 
+  meas.previous_edge_dwt = had_previous ? prior_last_edge_dwt : 0U;
+  meas.previous_edge_gnss_ns = had_previous ? prior_last_edge_gnss_ns : 0ULL;
+  meas.last_edge_dwt = event.dwt_at_event;
+  meas.last_edge_gnss_ns = reference_gnss_ns_at_edge;
   meas.dwt_at_edge = event.dwt_at_event;
+
   if (!had_previous) {
     meas.gnss_ns_between_edges = 0;
     meas.dwt_cycles_between_edges = 0;
@@ -1311,15 +1348,15 @@ static void clocks_apply_epoch_counter_edge(clock_state_t& clock,
     meas.gnss_ns_between_edges = gnss_ns_between_edges;
     meas.dwt_cycles_between_edges = dwt_cycles_between_edges;
     meas.second_residual_ns = second_residual_ns;
+    meas.completed_interval_count++;
     clock.window_checks++;
     if (llabs(clock.window_error_ns) > CLOCK_WINDOW_TOLERANCE_NS) {
       clock.window_mismatches++;
     }
   }
 
-  // Previous-edge bridge truth. For OCXO lanes the reference coordinate is the
-  // measured GNSS-elapsed ledger because process_interrupt may not carry a
-  // direct GNSS timestamp in the event.
+  // Legacy previous-edge mirrors retain the "last edge for next update"
+  // meaning while downstream callers migrate to explicit last_edge_* fields.
   meas.prev_gnss_ns_at_edge = reference_gnss_ns_at_edge;
   meas.prev_dwt_at_edge = event.dwt_at_event;
 

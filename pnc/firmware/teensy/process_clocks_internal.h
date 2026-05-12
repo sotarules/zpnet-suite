@@ -225,21 +225,27 @@ struct clock_state_t {
 };
 
 struct clock_measurement_t {
-  // Bridge-derived ns since previous edge minus 1e9.
-  // Positive → clock fired early this second (running fast).
-  // Negative → clock fired late this second (running slow).
+  // Latest completed lane-local one-second interval.  These fields are
+  // deliberately edge-authored, not TIMEBASE-row-authored.  A TIMEBASE row
+  // carries the latest known completed interval for each lane; it does not
+  // define the interval.
+  //
+  // Positive second_residual_ns means the lane fired early / is running fast:
+  //   residual_fast_ns = 1,000,000,000 - ns_between_last_edges
   volatile int64_t  second_residual_ns;
-
-  // Bridge-derived ns elapsed between this edge and the previous one.
   volatile uint64_t gnss_ns_between_edges;
-
-  // ISR-captured DWT at this edge.
-  volatile uint32_t dwt_at_edge;
-
-  // DWT cycles elapsed between this edge and the previous one.
   volatile uint32_t dwt_cycles_between_edges;
 
-  // Previous-edge tracking, used to compute the deltas above.
+  // Standardized "last two edges" surface for VCLOCK and OCXO lanes.
+  volatile uint32_t previous_edge_dwt;
+  volatile uint32_t last_edge_dwt;
+  volatile uint64_t previous_edge_gnss_ns;
+  volatile uint64_t last_edge_gnss_ns;
+  volatile uint32_t completed_interval_count;
+
+  // Legacy mirrors retained while callers migrate to the explicit
+  // previous_edge_* / last_edge_* names above.
+  volatile uint32_t dwt_at_edge;
   volatile uint64_t prev_gnss_ns_at_edge;
   volatile uint32_t prev_dwt_at_edge;
 };
@@ -267,6 +273,12 @@ struct clocks_alpha_lane_forensics_t {
 
   uint32_t last_event_dwt;
   uint32_t last_event_counter32;
+
+  uint32_t previous_edge_dwt;
+  uint32_t last_edge_dwt;
+  uint64_t previous_edge_gnss_ns;
+  uint64_t last_edge_gnss_ns;
+  uint32_t completed_interval_count;
 
   // New preferred names.  The zero offset is the synthetic counter32 value
   // captured at CLOCKS.ZERO/START and used as the lane's logical origin.

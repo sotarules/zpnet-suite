@@ -17,7 +17,7 @@
 //   • PPS/VCLOCK-selected truth capture
 //   • 1 Hz publication of canonical clock tuple
 //   • Continuous DWT-to-GNSS calibration (campaign-independent)
-//   • Static PPS/GPIO-based one-second prediction audit for VCLOCK and OCXO lanes
+//   • Static last-two-edge one-second prediction audit for VCLOCK and OCXO lanes
 //
 // Initialization is split into two phases:
 //
@@ -96,7 +96,7 @@ uint64_t clocks_ocxo2_measured_gnss_ns_now(void);
 //
 // Dynamic 100 Hz prediction has been retired.  The operating doctrine is:
 //
-//   • Use the prior completed one-second DWT interval as the static prediction.
+//   • Use each lane's prior completed last-two-edge DWT interval as the static prediction.
 //   • Do not rebase during the active second from quantized QTimer samples.
 //   • Let Welford/statistical surfaces absorb the remaining measurement noise.
 //

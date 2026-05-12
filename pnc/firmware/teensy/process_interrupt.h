@@ -5,7 +5,7 @@
 // Interrupt custody and low-word counter cadence:
 //
 //   • Cadence minder (single TimePop client tending all 16-bit counters)
-//   • OCXO lanes    (QTimer2 CH0 for OCXO1, QTimer3 CH3 for OCXO2; currently still event rails)
+//   • OCXO lanes    (QTimer2 CH0 for OCXO1, QTimer3 CH3 for OCXO2; edge rails armed by TimePop)
 //   • VCLOCK lane   (critical recurring TimePop client on QTimer1 CH2)
 //   • TimePop       (QTimer1 CH2, hosted scheduler/client rail)
 //   • PPS GPIO edge (diagnostics + dispatch authority + epoch anchor)
@@ -101,11 +101,11 @@
 // ─── Per-lane cadence mechanics ─────────────────────────────────────────────
 //
 //   Three lanes (VCLOCK, OCXO1, OCXO2) produce one-second subscriber events.
-//   A single TimePop cadence minder now refreshes all process_interrupt-owned
+//   A single TimePop cadence minder refreshes all process_interrupt-owned
 //   synthetic 32-bit counter anchors so 16-bit low-word rollover custody is
 //   centralized on the sovereign VCLOCK/TimePop rail.  OCXO compare channels
-//   are still present as event rails in this step, but rollover custody no
-//   longer depends on frequent OCXO interrupt service.  VCLOCK cadence is a
+//   remain the OCXO edge authors, but they are opened only near the expected
+//   one-second edge by lane-local TimePop arm callbacks.  VCLOCK cadence is a
 //   TimePop critical recurring ISR slot on QTimer1 CH2, sharing fire facts
 //   with other same-deadline TimePop clients.
 //
@@ -115,8 +115,8 @@
 //              the passive low-word VCLOCK counter; QTimer1 CH2 is the only
 //              active TimePop compare rail.
 //     MINDER : TimePop recurring 1 ms client, tends VCLOCK/OCXO low-word counters
-//     OCXO1  : QTimer2 CH0 compare, event rail retained for current one-second events
-//     OCXO2  : QTimer3 CH3 compare, event rail retained for current one-second events
+//     OCXO1  : QTimer2 CH0 compare, armed 1 ms before the lane-local edge
+//     OCXO2  : QTimer3 CH3 compare, armed 1 ms before the lane-local edge
 // ============================================================================
 
 #pragma once
@@ -501,19 +501,13 @@ struct interrupt_epoch_capture_t {
 
 bool interrupt_last_epoch_capture(interrupt_epoch_capture_t* out);
 
-// Re-author OCXO QuadTimer compare cadence from CLOCKS logical zero.
+// Re-author OCXO one-second edge capture from CLOCKS logical zero.
 //
-// OCXO Gamma is lane-local.  It does not care which OCXO edge is near PPS or
-// VCLOCK.  Once CLOCKS has selected the OCXO zero-offset counter32 values, this
-// call makes the compare rails land on:
-//
-//   epoch + 10,000
-//   epoch + 20,000
-//   ...
-//   epoch + 10,000,000
-//
-// Every tenth custody event is a Gamma 100 Hz courtroom sample, and every
-// thousandth custody event is the OCXO-local one-second edge.
+// OCXO edges are lane-local and may be out of phase with PPS/VCLOCK.  Once
+// CLOCKS has selected the OCXO zero-offset counter32 values, this call chooses
+// the next epoch + N*10,000,000 target for each OCXO lane and schedules a
+// TimePop callback to enable the corresponding QTimer compare 1 ms before that
+// edge.  TimePop opens the gate; the OCXO QTimer ISR authors the edge fact.
 void interrupt_ocxo_logical_grid_epoch(uint32_t ocxo1_epoch_counter32,
                                        uint32_t ocxo2_epoch_counter32);
 
