@@ -171,9 +171,11 @@ static constexpr const char* OCXO2_EDGE_ARM_NAME = "OCXO2_EDGE_ARM";
 static constexpr const char* OCXO1_EDGE_ARM_REARM_NAME = "OCXO1_EDGE_ARM_REARM";
 static constexpr const char* OCXO2_EDGE_ARM_REARM_NAME = "OCXO2_EDGE_ARM_REARM";
 
-// Safety staging: keep the TimePop OCXO arm cadence alive, but suppress the
-// QTimer compare gate until stale-flag / IRQ behavior is proven safe.
-static constexpr bool OCXO_EDGE_ARM_DRY_RUN = true;
+// Live-gate staging: TimePop opens the OCXO compare gate only after the
+// zero-clear preflight proves the stale compare flag is clear.  If the
+// preflight fails, the gate remains closed and the dry scheduler re-arms for
+// the next OCXO edge.
+static constexpr bool OCXO_EDGE_ARM_DRY_RUN = false;
 
 // OCXO DWT authorship.  OCXO1 and OCXO2 now live on separate QuadTimer
 // modules/vectors.  Each OCXO ISR captures ARM_DWT_CYCCNT as its first
@@ -1117,6 +1119,37 @@ static volatile uint32_t g_ocxo2_arm_last_csctrl_after_clear = 0;
 static volatile uint32_t g_ocxo2_arm_compare_enabled_before_clear = 0;
 static volatile uint32_t g_ocxo2_arm_compare_enabled_after_clear = 0;
 
+// Defensive compare-clear / live-gate diagnostics.  Preflight proved the
+// canonical OCXO clear path is CSCTRL zero-clear, not write-one-to-clear.  The
+// live gate still records zero-clear success/failure before compare enable.
+static volatile uint32_t g_ocxo1_arm_last_sctrl_before_clear = 0;
+static volatile uint32_t g_ocxo1_arm_last_sctrl_after_clear = 0;
+static volatile uint32_t g_ocxo1_arm_csctrl_after_w1c = 0;
+static volatile uint32_t g_ocxo1_arm_csctrl_after_zero_clear = 0;
+static volatile uint32_t g_ocxo1_arm_csctrl_after_far_retarget = 0;
+static volatile uint32_t g_ocxo1_arm_flag_after_w1c = 0;
+static volatile uint32_t g_ocxo1_arm_flag_after_zero_clear = 0;
+static volatile uint32_t g_ocxo1_arm_flag_after_far_retarget = 0;
+static volatile uint32_t g_ocxo1_arm_clear_success_stage = 0;
+static volatile uint32_t g_ocxo1_arm_clear_success_count = 0;
+static volatile uint32_t g_ocxo1_arm_clear_failed_count = 0;
+static volatile uint32_t g_ocxo1_arm_far_target_low16 = 0;
+static volatile uint32_t g_ocxo1_arm_nvic_clear_count = 0;
+
+static volatile uint32_t g_ocxo2_arm_last_sctrl_before_clear = 0;
+static volatile uint32_t g_ocxo2_arm_last_sctrl_after_clear = 0;
+static volatile uint32_t g_ocxo2_arm_csctrl_after_w1c = 0;
+static volatile uint32_t g_ocxo2_arm_csctrl_after_zero_clear = 0;
+static volatile uint32_t g_ocxo2_arm_csctrl_after_far_retarget = 0;
+static volatile uint32_t g_ocxo2_arm_flag_after_w1c = 0;
+static volatile uint32_t g_ocxo2_arm_flag_after_zero_clear = 0;
+static volatile uint32_t g_ocxo2_arm_flag_after_far_retarget = 0;
+static volatile uint32_t g_ocxo2_arm_clear_success_stage = 0;
+static volatile uint32_t g_ocxo2_arm_clear_success_count = 0;
+static volatile uint32_t g_ocxo2_arm_clear_failed_count = 0;
+static volatile uint32_t g_ocxo2_arm_far_target_low16 = 0;
+static volatile uint32_t g_ocxo2_arm_nvic_clear_count = 0;
+
 // CLOCKS-owned OCXO logical grid, installed only after TimePop epoch-change
 // cancellation has completed.  interrupt_start() must not create pre-epoch
 // OCXO one-shots; it may only consume this grid once it exists.
@@ -1409,11 +1442,10 @@ static inline void qtimer1_ch2_program_compare(uint16_t target_low16) {
 }
 
 static inline void qtimer2_ch0_clear_compare_flag(void) {
-  // QuadTimer compare flags are status latches.  On i.MX RT they are
-  // write-one-to-clear; writing zero leaves a latched TCF bit untouched.
-  // Keep this helper OCXO-local so the active QTimer1/TimePop rail remains
-  // unchanged in this pass.
-  IMXRT_TMR2.CH[0].CSCTRL |= (TMR_CSCTRL_TCF1 | TMR_CSCTRL_TCF2);
+  // Empirical ZPNet result: OCXO QuadTimer compare flags clear by writing the
+  // TCF bits LOW in CSCTRL.  The former write-one-to-clear assumption leaves
+  // TCF1 latched and can create an interrupt storm when TCF1EN is enabled.
+  IMXRT_TMR2.CH[0].CSCTRL &= ~(TMR_CSCTRL_TCF1 | TMR_CSCTRL_TCF2);
   (void)IMXRT_TMR2.CH[0].CSCTRL;
 }
 static inline void qtimer2_ch0_program_compare(uint16_t target_low16) {
@@ -1430,11 +1462,10 @@ static inline void qtimer2_ch0_disable_compare(void) {
 }
 
 static inline void qtimer3_clear_compare_flag(uint8_t ch) {
-  // QuadTimer compare flags are status latches.  On i.MX RT they are
-  // write-one-to-clear; writing zero leaves a latched TCF bit untouched.
-  // Keep this helper OCXO-local so the active QTimer1/TimePop rail remains
-  // unchanged in this pass.
-  IMXRT_TMR3.CH[ch].CSCTRL |= (TMR_CSCTRL_TCF1 | TMR_CSCTRL_TCF2);
+  // Empirical ZPNet result: OCXO QuadTimer compare flags clear by writing the
+  // TCF bits LOW in CSCTRL.  The former write-one-to-clear assumption leaves
+  // TCF1 latched and can create an interrupt storm when TCF1EN is enabled.
+  IMXRT_TMR3.CH[ch].CSCTRL &= ~(TMR_CSCTRL_TCF1 | TMR_CSCTRL_TCF2);
   (void)IMXRT_TMR3.CH[ch].CSCTRL;
 }
 static inline void qtimer3_program_compare(uint8_t ch, uint16_t target_low16) {
@@ -1744,12 +1775,32 @@ static bool cadence_minder_arm_timepop(void) {
 // OCXO lanes — QTimer2 CH0 / QTimer3 CH3
 // ============================================================================
 //
-static void ocxo_lane_program_compare(ocxo_lane_t& lane, uint16_t target_low16) {
-  if (lane.module == &IMXRT_TMR2 && lane.channel == 0) {
-    qtimer2_ch0_program_compare(target_low16);
-  } else if (lane.module == &IMXRT_TMR3) {
-    qtimer3_program_compare(lane.channel, target_low16);
+static void ocxo_lane_clear_nvic_pending(const ocxo_lane_t& lane);
+static void ocxo_lane_disable_compare_gate_only(ocxo_lane_t& lane);
+static uint16_t ocxo_lane_zero_clear(ocxo_lane_t& lane);
+static inline bool ocxo_csctrl_flag_set(uint16_t csctrl);
+
+static bool ocxo_lane_program_compare_if_clear(ocxo_lane_t& lane,
+                                                uint16_t target_low16) {
+  // Live-gate safety: the compare interrupt may only be enabled after the
+  // target is programmed and the compare flag is observed clear.  If the flag
+  // is already asserted after programming, leave the gate closed and let the
+  // arm callback reschedule the next opportunity.
+  ocxo_lane_disable_compare_gate_only(lane);
+  ocxo_lane_zero_clear(lane);
+
+  lane.module->CH[lane.channel].COMP1  = target_low16;
+  lane.module->CH[lane.channel].CMPLD1 = target_low16;
+
+  const uint16_t cs_after_clear = ocxo_lane_zero_clear(lane);
+  if (ocxo_csctrl_flag_set(cs_after_clear)) {
+    ocxo_lane_disable_compare_gate_only(lane);
+    ocxo_lane_clear_nvic_pending(lane);
+    return false;
   }
+
+  lane.module->CH[lane.channel].CSCTRL |= TMR_CSCTRL_TCF1EN;
+  return true;
 }
 
 static void ocxo_lane_disable_compare(ocxo_lane_t& lane) {
@@ -1902,17 +1953,94 @@ static uint16_t ocxo_lane_csctrl_now(const ocxo_lane_t& lane) {
   return lane.module->CH[lane.channel].CSCTRL;
 }
 
-static void ocxo_edge_arm_preflight_compare_flag(interrupt_subscriber_kind_t kind,
+static uint16_t ocxo_lane_sctrl_now(const ocxo_lane_t& lane) {
+  return lane.module->CH[lane.channel].SCTRL;
+}
+
+static inline bool ocxo_csctrl_flag_set(uint16_t csctrl) {
+  return (csctrl & TMR_CSCTRL_TCF1) != 0;
+}
+
+static inline bool ocxo_csctrl_enabled(uint16_t csctrl) {
+  return (csctrl & TMR_CSCTRL_TCF1EN) != 0;
+}
+
+static void ocxo_lane_clear_nvic_pending(const ocxo_lane_t& lane) {
+  if (lane.module == &IMXRT_TMR2 && lane.channel == 0) {
+    NVIC_CLEAR_PENDING(IRQ_QTIMER2);
+  } else if (lane.module == &IMXRT_TMR3) {
+    NVIC_CLEAR_PENDING(IRQ_QTIMER3);
+  }
+}
+
+static void ocxo_lane_disable_compare_gate_only(ocxo_lane_t& lane) {
+  lane.module->CH[lane.channel].CSCTRL &= ~TMR_CSCTRL_TCF1EN;
+  (void)lane.module->CH[lane.channel].CSCTRL;
+}
+
+static uint16_t ocxo_lane_zero_clear(ocxo_lane_t& lane) {
+  // Proven clear path for OCXO QuadTimer compare flags: write TCF1/TCF2 low.
+  // This matches the QTimer1 clear style and the OCXO preflight evidence.
+  lane.module->CH[lane.channel].CSCTRL &= ~(TMR_CSCTRL_TCF1 | TMR_CSCTRL_TCF2);
+  (void)lane.module->CH[lane.channel].CSCTRL;
+  return lane.module->CH[lane.channel].CSCTRL;
+}
+
+static uint16_t ocxo_lane_retarget_far_then_zero_clear(ocxo_lane_t& lane,
+                                                       uint16_t far_target_low16) {
+  // Fallback only: move COMP/CMPLD away from the current low-word neighborhood
+  // while the interrupt gate is disabled, then apply the proven zero-clear.
+  lane.module->CH[lane.channel].COMP1  = far_target_low16;
+  lane.module->CH[lane.channel].CMPLD1 = far_target_low16;
+  return ocxo_lane_zero_clear(lane);
+}
+
+static bool ocxo_edge_arm_preflight_compare_flag(interrupt_subscriber_kind_t kind,
                                                  ocxo_lane_t& lane) {
   const uint16_t cs_before = ocxo_lane_csctrl_now(lane);
-  const bool flag_before = (cs_before & TMR_CSCTRL_TCF1) != 0;
-  const bool enabled_before = (cs_before & TMR_CSCTRL_TCF1EN) != 0;
+  const uint16_t s_before  = ocxo_lane_sctrl_now(lane);
+  const bool flag_before = ocxo_csctrl_flag_set(cs_before);
+  const bool enabled_before = ocxo_csctrl_enabled(cs_before);
 
-  ocxo_lane_clear_compare_flag(lane);
+  // Keep the compare interrupt gate closed during all clearing and target
+  // programming preflight.  Enabling is performed only after the final observed
+  // flag state is clear.
+  ocxo_lane_disable_compare_gate_only(lane);
+
+  const uint16_t cs_after_zero = ocxo_lane_zero_clear(lane);
+  const bool flag_after_zero = ocxo_csctrl_flag_set(cs_after_zero);
+
+  const uint16_t now_low16 = ocxo_lane_counter_now(lane);
+  const uint16_t far_target_low16 = (uint16_t)(now_low16 + (uint16_t)0x4000U);
+
+  uint16_t cs_after_far = cs_after_zero;
+  bool flag_after_far = flag_after_zero;
+  uint32_t success_stage = 0;
+
+  if (!flag_after_zero) {
+    success_stage = 1;
+  } else {
+    cs_after_far = ocxo_lane_retarget_far_then_zero_clear(lane, far_target_low16);
+    flag_after_far = ocxo_csctrl_flag_set(cs_after_far);
+    if (!flag_after_far) {
+      success_stage = 2;
+    }
+  }
+
+  // Clear any NVIC pending state after peripheral-level clear attempts.  This
+  // is harmless if no IRQ is pending and gives the live-gate path a clean NVIC
+  // slate immediately before COMP1/CMPLD1 programming.
+  ocxo_lane_clear_nvic_pending(lane);
 
   const uint16_t cs_after = ocxo_lane_csctrl_now(lane);
-  const bool flag_after = (cs_after & TMR_CSCTRL_TCF1) != 0;
-  const bool enabled_after = (cs_after & TMR_CSCTRL_TCF1EN) != 0;
+  const uint16_t s_after  = ocxo_lane_sctrl_now(lane);
+  const bool flag_after = ocxo_csctrl_flag_set(cs_after);
+  const bool enabled_after = ocxo_csctrl_enabled(cs_after);
+  const bool clear_ok = !flag_after && !enabled_after;
+
+  if (clear_ok && success_stage == 0) {
+    success_stage = 3;
+  }
 
   if (kind == interrupt_subscriber_kind_t::OCXO1) {
     g_ocxo1_arm_preflight_count++;
@@ -1922,8 +2050,24 @@ static void ocxo_edge_arm_preflight_compare_flag(interrupt_subscriber_kind_t kin
     g_ocxo1_arm_last_csctrl_after_clear = (uint32_t)cs_after;
     g_ocxo1_arm_compare_enabled_before_clear = enabled_before ? 1U : 0U;
     g_ocxo1_arm_compare_enabled_after_clear = enabled_after ? 1U : 0U;
-    if (flag_after) g_ocxo1_arm_stale_flag_survived_count++;
-    return;
+    g_ocxo1_arm_last_sctrl_before_clear = (uint32_t)s_before;
+    g_ocxo1_arm_last_sctrl_after_clear = (uint32_t)s_after;
+    g_ocxo1_arm_csctrl_after_w1c = 0;
+    g_ocxo1_arm_csctrl_after_zero_clear = (uint32_t)cs_after_zero;
+    g_ocxo1_arm_csctrl_after_far_retarget = (uint32_t)cs_after_far;
+    g_ocxo1_arm_flag_after_w1c = 0;
+    g_ocxo1_arm_flag_after_zero_clear = flag_after_zero ? 1U : 0U;
+    g_ocxo1_arm_flag_after_far_retarget = flag_after_far ? 1U : 0U;
+    g_ocxo1_arm_clear_success_stage = success_stage;
+    g_ocxo1_arm_far_target_low16 = (uint32_t)far_target_low16;
+    g_ocxo1_arm_nvic_clear_count++;
+    if (clear_ok) {
+      g_ocxo1_arm_clear_success_count++;
+    } else {
+      g_ocxo1_arm_stale_flag_survived_count++;
+      g_ocxo1_arm_clear_failed_count++;
+    }
+    return clear_ok;
   }
 
   if (kind == interrupt_subscriber_kind_t::OCXO2) {
@@ -1934,8 +2078,27 @@ static void ocxo_edge_arm_preflight_compare_flag(interrupt_subscriber_kind_t kin
     g_ocxo2_arm_last_csctrl_after_clear = (uint32_t)cs_after;
     g_ocxo2_arm_compare_enabled_before_clear = enabled_before ? 1U : 0U;
     g_ocxo2_arm_compare_enabled_after_clear = enabled_after ? 1U : 0U;
-    if (flag_after) g_ocxo2_arm_stale_flag_survived_count++;
+    g_ocxo2_arm_last_sctrl_before_clear = (uint32_t)s_before;
+    g_ocxo2_arm_last_sctrl_after_clear = (uint32_t)s_after;
+    g_ocxo2_arm_csctrl_after_w1c = 0;
+    g_ocxo2_arm_csctrl_after_zero_clear = (uint32_t)cs_after_zero;
+    g_ocxo2_arm_csctrl_after_far_retarget = (uint32_t)cs_after_far;
+    g_ocxo2_arm_flag_after_w1c = 0;
+    g_ocxo2_arm_flag_after_zero_clear = flag_after_zero ? 1U : 0U;
+    g_ocxo2_arm_flag_after_far_retarget = flag_after_far ? 1U : 0U;
+    g_ocxo2_arm_clear_success_stage = success_stage;
+    g_ocxo2_arm_far_target_low16 = (uint32_t)far_target_low16;
+    g_ocxo2_arm_nvic_clear_count++;
+    if (clear_ok) {
+      g_ocxo2_arm_clear_success_count++;
+    } else {
+      g_ocxo2_arm_stale_flag_survived_count++;
+      g_ocxo2_arm_clear_failed_count++;
+    }
+    return clear_ok;
   }
+
+  return clear_ok;
 }
 
 static void ocxo_lane_record_isr_diag(interrupt_subscriber_kind_t kind,
@@ -2175,25 +2338,27 @@ static void ocxo_edge_arm_callback(timepop_ctx_t*, timepop_diag_t*, void* user_d
   ocxo_lane_t* lane = ocxo_lane_for(kind);
   if (!lane || !lane->initialized || !lane->active) return;
 
-  // Hardware preflight only: prove whether the OCXO compare flag can be
-  // cleared at the intended 1 ms pre-edge point. This still does not enable
-  // the compare interrupt gate.
-  ocxo_edge_arm_preflight_compare_flag(kind, *lane);
+  // Prove the stale compare flag is clear before opening the hardware gate.
+  // If the preflight fails, do not enable; simply re-arm for the next OCXO edge
+  // so the system remains alive and the failure counter remains visible.
+  const bool preflight_ok = ocxo_edge_arm_preflight_compare_flag(kind, *lane);
 
-  if (OCXO_EDGE_ARM_DRY_RUN) {
-    // DRY RUN ONLY:
-    // Keep the TimePop arming cadence alive, but do not enable the OCXO
-    // QTimer compare gate.  Re-arm through an ASAP trampoline rather than
-    // directly from this same named one-shot so TimePop can retire the current
-    // slot before the next OCXO*_EDGE_ARM slot is born.
+  if (OCXO_EDGE_ARM_DRY_RUN || !preflight_ok) {
     (void)timepop_arm_asap(ocxo_edge_arm_reschedule_asap_callback,
                            rt,
                            ocxo_edge_arm_rearm_name(kind));
     return;
   }
 
-  // LIVE GATE PATH — intentionally disabled until stale-flag behavior is proven.
-  ocxo_lane_program_compare(*lane, lane->compare_target);
+  // LIVE GATE PATH: after successful zero-clear preflight, program the OCXO
+  // low-word compare target and enable the compare interrupt only if the flag
+  // remains clear after the target is installed.
+  if (!ocxo_lane_program_compare_if_clear(*lane, lane->compare_target)) {
+    (void)timepop_arm_asap(ocxo_edge_arm_reschedule_asap_callback,
+                           rt,
+                           ocxo_edge_arm_rearm_name(kind));
+    return;
+  }
   ocxo_edge_arm_enable_inc(kind);
 }
 
@@ -3157,6 +3322,19 @@ void process_interrupt_init(void) {
   g_ocxo1_arm_last_csctrl_after_clear = 0;
   g_ocxo1_arm_compare_enabled_before_clear = 0;
   g_ocxo1_arm_compare_enabled_after_clear = 0;
+  g_ocxo1_arm_last_sctrl_before_clear = 0;
+  g_ocxo1_arm_last_sctrl_after_clear = 0;
+  g_ocxo1_arm_csctrl_after_w1c = 0;
+  g_ocxo1_arm_csctrl_after_zero_clear = 0;
+  g_ocxo1_arm_csctrl_after_far_retarget = 0;
+  g_ocxo1_arm_flag_after_w1c = 0;
+  g_ocxo1_arm_flag_after_zero_clear = 0;
+  g_ocxo1_arm_flag_after_far_retarget = 0;
+  g_ocxo1_arm_clear_success_stage = 0;
+  g_ocxo1_arm_clear_success_count = 0;
+  g_ocxo1_arm_clear_failed_count = 0;
+  g_ocxo1_arm_far_target_low16 = 0;
+  g_ocxo1_arm_nvic_clear_count = 0;
   g_ocxo2_arm_preflight_count = 0;
   g_ocxo2_arm_flag_before_clear = 0;
   g_ocxo2_arm_flag_after_clear = 0;
@@ -3165,6 +3343,19 @@ void process_interrupt_init(void) {
   g_ocxo2_arm_last_csctrl_after_clear = 0;
   g_ocxo2_arm_compare_enabled_before_clear = 0;
   g_ocxo2_arm_compare_enabled_after_clear = 0;
+  g_ocxo2_arm_last_sctrl_before_clear = 0;
+  g_ocxo2_arm_last_sctrl_after_clear = 0;
+  g_ocxo2_arm_csctrl_after_w1c = 0;
+  g_ocxo2_arm_csctrl_after_zero_clear = 0;
+  g_ocxo2_arm_csctrl_after_far_retarget = 0;
+  g_ocxo2_arm_flag_after_w1c = 0;
+  g_ocxo2_arm_flag_after_zero_clear = 0;
+  g_ocxo2_arm_flag_after_far_retarget = 0;
+  g_ocxo2_arm_clear_success_stage = 0;
+  g_ocxo2_arm_clear_success_count = 0;
+  g_ocxo2_arm_clear_failed_count = 0;
+  g_ocxo2_arm_far_target_low16 = 0;
+  g_ocxo2_arm_nvic_clear_count = 0;
   g_ocxo1_lane.next_edge_counter32 = 0;
   g_ocxo2_lane.next_edge_counter32 = 0;
   g_ocxo_grid_epoch_valid = false;
@@ -3275,6 +3466,17 @@ static Payload cmd_report(const Payload&) {
   p.add("ocxo1_arm_last_csctrl_after_clear", g_ocxo1_arm_last_csctrl_after_clear);
   p.add("ocxo1_arm_compare_enabled_before_clear", g_ocxo1_arm_compare_enabled_before_clear);
   p.add("ocxo1_arm_compare_enabled_after_clear", g_ocxo1_arm_compare_enabled_after_clear);
+  p.add("ocxo1_arm_last_sctrl_before_clear", g_ocxo1_arm_last_sctrl_before_clear);
+  p.add("ocxo1_arm_last_sctrl_after_clear", g_ocxo1_arm_last_sctrl_after_clear);
+  p.add("ocxo1_arm_csctrl_after_zero_clear", g_ocxo1_arm_csctrl_after_zero_clear);
+  p.add("ocxo1_arm_csctrl_after_far_retarget", g_ocxo1_arm_csctrl_after_far_retarget);
+  p.add("ocxo1_arm_flag_after_zero_clear", g_ocxo1_arm_flag_after_zero_clear);
+  p.add("ocxo1_arm_flag_after_far_retarget", g_ocxo1_arm_flag_after_far_retarget);
+  p.add("ocxo1_arm_clear_success_stage", g_ocxo1_arm_clear_success_stage);
+  p.add("ocxo1_arm_clear_success_count", g_ocxo1_arm_clear_success_count);
+  p.add("ocxo1_arm_clear_failed_count", g_ocxo1_arm_clear_failed_count);
+  p.add("ocxo1_arm_far_target_low16", g_ocxo1_arm_far_target_low16);
+  p.add("ocxo1_arm_nvic_clear_count", g_ocxo1_arm_nvic_clear_count);
   p.add("ocxo2_arm_preflight_count", g_ocxo2_arm_preflight_count);
   p.add("ocxo2_arm_flag_before_clear", g_ocxo2_arm_flag_before_clear);
   p.add("ocxo2_arm_flag_after_clear", g_ocxo2_arm_flag_after_clear);
@@ -3283,6 +3485,17 @@ static Payload cmd_report(const Payload&) {
   p.add("ocxo2_arm_last_csctrl_after_clear", g_ocxo2_arm_last_csctrl_after_clear);
   p.add("ocxo2_arm_compare_enabled_before_clear", g_ocxo2_arm_compare_enabled_before_clear);
   p.add("ocxo2_arm_compare_enabled_after_clear", g_ocxo2_arm_compare_enabled_after_clear);
+  p.add("ocxo2_arm_last_sctrl_before_clear", g_ocxo2_arm_last_sctrl_before_clear);
+  p.add("ocxo2_arm_last_sctrl_after_clear", g_ocxo2_arm_last_sctrl_after_clear);
+  p.add("ocxo2_arm_csctrl_after_zero_clear", g_ocxo2_arm_csctrl_after_zero_clear);
+  p.add("ocxo2_arm_csctrl_after_far_retarget", g_ocxo2_arm_csctrl_after_far_retarget);
+  p.add("ocxo2_arm_flag_after_zero_clear", g_ocxo2_arm_flag_after_zero_clear);
+  p.add("ocxo2_arm_flag_after_far_retarget", g_ocxo2_arm_flag_after_far_retarget);
+  p.add("ocxo2_arm_clear_success_stage", g_ocxo2_arm_clear_success_stage);
+  p.add("ocxo2_arm_clear_success_count", g_ocxo2_arm_clear_success_count);
+  p.add("ocxo2_arm_clear_failed_count", g_ocxo2_arm_clear_failed_count);
+  p.add("ocxo2_arm_far_target_low16", g_ocxo2_arm_far_target_low16);
+  p.add("ocxo2_arm_nvic_clear_count", g_ocxo2_arm_nvic_clear_count);
   p.add("cadence_minder_period_ns", (uint64_t)CADENCE_MINDER_PERIOD_NS);
   p.add("cadence_minder_armed", g_cadence_minder_armed);
   p.add("cadence_minder_arm_count", g_cadence_minder_arm_count);
