@@ -397,19 +397,13 @@ uint64_t ocxo2_measured_gnss_ticks_64        = 0;
 // PPS relay
 // ============================================================================
 
-static volatile bool relay_timer_active = false;
-
 static void pps_relay_deassert(timepop_ctx_t*, timepop_diag_t*, void*) {
   digitalWriteFast(GNSS_PPS_RELAY, LOW);
-  relay_timer_active = false;
 }
 
 static inline void pps_relay_pulse(void) {
   digitalWriteFast(GNSS_PPS_RELAY, HIGH);
-  if (!relay_timer_active) {
-    relay_timer_active = true;
-    timepop_arm(PPS_RELAY_OFF_NS, false, pps_relay_deassert, nullptr, "pps-relay-off");
-  }
+  timepop_arm(PPS_RELAY_OFF_NS, false, pps_relay_deassert, nullptr, "pps-relay-off");
 }
 
 // ============================================================================
@@ -1627,8 +1621,10 @@ void process_clocks_init(void) {
   digitalWriteFast(GNSS_PPS_RELAY, LOW);
 
   subscribe_clock(interrupt_subscriber_kind_t::VCLOCK, vclock_callback);
-  subscribe_clock(interrupt_subscriber_kind_t::OCXO1, ocxo1_callback);
-  subscribe_clock(interrupt_subscriber_kind_t::OCXO2, ocxo2_callback);
+
+  // MULE TESTING:
+  //subscribe_clock(interrupt_subscriber_kind_t::OCXO1, ocxo1_callback);
+  //subscribe_clock(interrupt_subscriber_kind_t::OCXO2, ocxo2_callback);
 
   interrupt_pps_edge_register_dispatch(pps_selector_callback);
 }

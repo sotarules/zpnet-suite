@@ -37,8 +37,8 @@ static constexpr uint64_t NS_PER_MICROSECOND = 1000ULL;
 //
 // All three domains count at 10 MHz (100 ns per tick):
 //   GNSS VCLOCK on QTimer1 ch0+ch1 (single-edge, CM=1)
-//   OCXO1 on GPT1 (single-edge)
-//   OCXO2 on GPT2 (single-edge)
+//   OCXO1 on QTimer2 ch0   (single-edge, CM=1)
+//   OCXO2 on QTimer3 ch3   (single-edge, CM=1)
 //
 
 // Expected ticks per PPS second at 10 MHz
@@ -137,8 +137,8 @@ static constexpr int OCXO2_PIN = 15;
 // The raw QTimer count is in 10 MHz ticks (100 ns per tick).
 // No domain translation is required — one tick = one GNSS cycle.
 //
-// The 32-bit QTimer value is read in the PPS ISR alongside
-// GPT1_CNT, GPT2_CNT, and DWT_CYCCNT.
+// The 32-bit QTimer value is read in the PPS ISR alongside the
+// OCXO1 and OCXO2 QTimer counter values and DWT_CYCCNT.
 //
 static constexpr uint32_t QTIMER1_CH0_BITS = 16;
 static constexpr uint32_t QTIMER1_CH0_MASK = 0xFFFF;
@@ -151,18 +151,26 @@ static constexpr uint32_t QTIMER1_CH0_MASK = 0xFFFF;
 // -------   -------------   ---   --------------------   ----------
 // DWT       ARM_DWT_CYCCNT   —    CPU core (1008 MHz)    ~1 ns
 // GNSS      QTimer1 ch0+1    10   GF-8802 VCLOCK 10 MHz  100 ns
-// OCXO1     QTimer3 ch2      14   AOCJY1-A #1   10 MHz   100 ns
+// OCXO1     QTimer2 ch0      13   AOCJY1-A #1   10 MHz   100 ns
 // OCXO2     QTimer3 ch3      15   AOCJY1-A #2   10 MHz   100 ns
 //
 // All timing domains free-run continuously.
 // All are captured simultaneously in the PPS ISR.
-// GPT1 and GPT2 are 32-bit native.
-// QTimer1 is 16-bit cascaded to 32-bit (wraps at ~429 seconds).
+// QTimer1, QTimer2, and QTimer3 channels are 16-bit native; lane synthetic
+// 32-bit counter32 extension is owned by process_interrupt and tended by
+// the TimePop CADENCE_MINDER recurring ISR slot on QTimer1 CH2.
 // 64-bit extension is via delta accumulation where needed.
 //
-// GNSS VCLOCK is intentionally hosted on QTimer1 because it is the
-// sovereign clock domain used by TimePop and broader timing semantics.
-// OCXO2 is hosted on GPT2.
+// GNSS VCLOCK is intentionally hosted on QTimer1 because it is the sovereign
+// clock domain used by TimePop and broader timing semantics.  OCXO1 and OCXO2
+// are hosted on QTimer2 and QTimer3 respectively; this matches the NVIC
+// vector layout consumed by process_interrupt and is consistent with the
+// priority architecture below (PPS=0, OCXO=16, QTimer1=32).
+//
+// Note: earlier versions of this header described OCXO1/OCXO2 as hosted on
+// GPT1/GPT2.  Those references were vestigial — the system migrated to
+// QTimer2/QTimer3 some time ago.  The current QTimer-based wiring is the
+// authoritative layout.
 //
 
 // --------------------------------------------------------------
@@ -242,6 +250,36 @@ static constexpr uint32_t TICKS_PER_SECOND_EVENT_OCXO = 500U;   // OCXO:   500 H
 // ============================================================================
 // Latency constants
 // ============================================================================
+//
+// Calibration regime note (Patch 8):
+//
+//   Every constant in this section was measured under the pre-Patch-8 NVIC
+//   priority arrangement, in which QTimer1 and PPS GPIO were both at priority
+//   0 (peers) and QTimer2/QTimer3 (OCXO) were at priority 16.  Under that
+//   scheme PPS and QTimer1 could not preempt each other (same-priority
+//   interrupts on Cortex-M do not preempt), and OCXO ISRs were preemptible
+//   by both.
+//
+//   The Patch 8 priority architecture is:
+//
+//     PPS GPIO  : 0    (sovereign labeling witness, uncontested)
+//     OCXO 1/2  : 16   (physical hardware compare events)
+//     QTimer1   : 32   (TimePop bookkeeping + CADENCE_MINDER)
+//
+//   The values in this section are retained at their pre-Patch-8 measurements
+//   and are NOT being modified by Patch 8.  The first-instruction ISR-entry
+//   latencies (PPS_ISR_ENTRY_OVERHEAD, QTIMER_ISR_ENTRY_OVERHEAD) and the
+//   hardware sink-path latencies (GPIO_TOTAL_LATENCY, QTIMER_TOTAL_LATENCY,
+//   QTIMER_READ_LATENCY, WITNESS_STIMULATE_LATENCY, DWT_CYCCNT_TO_MEMORY_CYCLES)
+//   should not be priority-sensitive: same-priority peers do not preempt each
+//   other, so the ISR-entry path was already operating in an "uncontested
+//   peer" regime in the pre-Patch-8 arrangement, and that regime is preserved
+//   (and slightly strengthened, since PPS is now fully sovereign).
+//
+//   Spot-check after the Patch 8 flash by comparing post-flash measurements
+//   against the pre-flash baseline.  If any of these constants shifts by more
+//   than one or two cycles, re-measure and update the constant.  Do not
+//   speculatively adjust the numbers without measurement.
 
 static constexpr uint32_t DWT_CYCCNT_TO_MEMORY_CYCLES = 1;
 static constexpr uint32_t WITNESS_STIMULATE_LATENCY = 5;
@@ -267,12 +305,31 @@ static constexpr uint32_t QTIMER_ISR_ENTRY_OVERHEAD = 19;
 // input synchronizers, pad routing, QTimer compare maturation semantics, or
 // other fixed hardware path differences.
 //
-// Priority testing showed the value remains ~34 cycles even when QTimer1 and
-// PPS GPIO are both set to NVIC priority 0, so this does not appear to be a
-// QTimer IRQ priority artifact.
+// Historical observation (pre-Patch-8):
+//   Priority testing under the pre-Patch-8 priority arrangement showed the
+//   value remained ~34 cycles even when QTimer1 and PPS GPIO were both set
+//   to NVIC priority 0.  Under that arrangement this constant did not appear
+//   to be a QTimer IRQ priority artifact.
+//
+// Patch 8 calibration-regime note:
+//   The Patch 8 priority architecture (PPS=0, OCXO=16, QTimer1=32) is a
+//   different regime than the one in which the observation above was made.
+//   The historical priority-invariance result was specifically about moving
+//   QTimer1 from one priority down to priority 0 to match PPS — a change
+//   that, in the pre-Patch-8 world, made QTimer1 a peer of PPS rather than
+//   a lower-priority preemptee.  Patch 8 moves QTimer1 in the opposite
+//   direction (to priority 32), so the prior priority-invariance result
+//   does not strictly cover the new regime.
+//
+//   The first-instruction ISR-entry latency for the PPS GPIO ISR should not
+//   change under Patch 8, because PPS was already running uncontested by
+//   QTimer1 (same-priority peers do not preempt) and is now even more
+//   sovereign.  But this constant deserves a spot-check against post-flash
+//   raw_cycles.py output.  If it has shifted by more than a cycle or two,
+//   re-measure and update.
 //
 // Treat this as the observed calibration offset between the physical/raw PPS
 // interrupt timestamp and the canonical VCLOCK-selected PPS epoch.  Re-measure
 // if the GF-8802 wiring, pin routing, ISR paths, QTimer setup, optimization
-// level, or latency correction model changes.
+// level, latency correction model, or NVIC priority architecture changes.
 static constexpr int32_t CANONICAL_VCLOCK_EPOCH_MINUS_RAW_PPS_ISR_CYCLES = 34;
