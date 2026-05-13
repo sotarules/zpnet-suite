@@ -1098,111 +1098,6 @@ static volatile uint64_t g_ocxo2_edge_arm_last_delay_ns = 0;
 static volatile uint32_t g_ocxo1_edge_arm_rearm_asap_count = 0;
 static volatile uint32_t g_ocxo2_edge_arm_rearm_asap_count = 0;
 
-// Patch 1 — advance-iteration and arm-delay diagnostics for
-// ocxo_schedule_edge_arm_for_target.  The while loop that walks
-// next_edge_counter32 forward by OCXO_EDGE_INTERVAL_COUNTS is bounded in theory
-// (~430 iterations covers a full 32-bit wrap), but a synthetic-clock race can
-// poison now_counter32 and either drive the loop far higher than it should be
-// or compute an arm_delay_ns that lands the new TimePop slot already past-due.
-// Both conditions are precursors to the freeze pattern we are chasing.
-//
-// Under the Patch 8 priority architecture (QTimer1=32, OCXO=16, PPS=0) the
-// underlying race is structurally prevented — BASEPRI-16 critical sections
-// inside timepop_arm and timepop_cancel_by_name now lawfully exclude
-// CADENCE_MINDER.  These diagnostics remain in place as sanity checks: under
-// Patch 8, advance_iter_count_max should stay at 1 (the legitimate single
-// catch-up case) and short_delay_count should stay at zero forever.  Any
-// growth in these counters after Patch 8 would indicate either the priority
-// change did not take effect or a different race we have not yet identified.
-static volatile uint32_t g_ocxo1_edge_arm_advance_iter_count_total = 0;
-static volatile uint32_t g_ocxo1_edge_arm_advance_iter_count_max = 0;
-static volatile uint32_t g_ocxo1_edge_arm_advance_iter_count_last = 0;
-static volatile uint32_t g_ocxo1_edge_arm_advance_iter_break_count = 0;
-static volatile uint32_t g_ocxo1_edge_arm_last_arm_delay_ns_lo = 0;
-static volatile uint32_t g_ocxo1_edge_arm_short_delay_count = 0;
-
-static volatile uint32_t g_ocxo2_edge_arm_advance_iter_count_total = 0;
-static volatile uint32_t g_ocxo2_edge_arm_advance_iter_count_max = 0;
-static volatile uint32_t g_ocxo2_edge_arm_advance_iter_count_last = 0;
-static volatile uint32_t g_ocxo2_edge_arm_advance_iter_break_count = 0;
-static volatile uint32_t g_ocxo2_edge_arm_last_arm_delay_ns_lo = 0;
-static volatile uint32_t g_ocxo2_edge_arm_short_delay_count = 0;
-
-// Patch 2 — synthetic clock regression detector.  Synthetic ticks must never
-// run backward.  A regression here is almost always evidence of an unguarded
-// read-modify-write race against another execution context tending the same
-// clock.  These counters are written from inside synthetic_clock_tend_from_hw16
-// itself, so they witness every tending pass regardless of caller.
-//
-// Under the Patch 8 priority architecture these counters should stay at zero
-// forever.  Retained as sanity check: a non-zero count after Patch 8 means
-// either the priority change did not take effect or there is a different race
-// we have not yet identified.
-static volatile uint32_t g_ocxo1_clock32_regression_count = 0;
-static volatile uint32_t g_ocxo1_clock32_last_regression_delta = 0;
-static volatile uint32_t g_ocxo1_clock32_max_regression_delta = 0;
-static volatile uint32_t g_ocxo2_clock32_regression_count = 0;
-static volatile uint32_t g_ocxo2_clock32_last_regression_delta = 0;
-static volatile uint32_t g_ocxo2_clock32_max_regression_delta = 0;
-static volatile uint32_t g_vclock_clock32_regression_count = 0;
-static volatile uint32_t g_vclock_clock32_last_regression_delta = 0;
-static volatile uint32_t g_vclock_clock32_max_regression_delta = 0;
-
-// ============================================================================
-// Patch 9 — aliveness probes (freeze diagnosis)
-// ============================================================================
-//
-// Three independent aliveness probes that emit one debug line per second from
-// three distinct execution contexts.  Each probe maintains its own millis()
-// gate so emissions stay at ~1 Hz regardless of the underlying tick rate.
-//
-// When the freeze hits:
-//   • If "pps_alive" stops, the PPS GPIO ISR itself is dead (hard fault or
-//     deeper hardware issue).
-//   • If "pps_alive" continues but "cadence_alive" stops, CADENCE_MINDER
-//     specifically has been starved — its slot has been mis-scheduled, its
-//     IRQ is being blocked, or its callback has hung.
-//   • If both ISR probes continue but the foreground loop-counter doesn't
-//     advance in the next loop emission, foreground is starved while ISRs
-//     remain alive.
-//
-// These probes use debug_log directly to Serial, bypassing TimePop and the
-// transport queue.  They are safe from any context.
-
-static volatile uint32_t g_patch9_pps_emit_count = 0;
-static volatile uint32_t g_patch9_pps_last_emit_ms = 0;
-static volatile uint32_t g_patch9_cadence_emit_count = 0;
-static volatile uint32_t g_patch9_cadence_last_emit_ms = 0;
-
-// ============================================================================
-// Patch 10 — CH2 forensic capture
-// ============================================================================
-//
-// When CADENCE_MINDER dies, the freeze pattern observed in the field is
-// "happily doing nothing" — PPS GPIO ISR continues firing, foreground loop
-// continues spinning, but QTimer1 CH2 IRQ never fires again.  The mechanism
-// that produces this state is one of:
-//
-//   (a) CH2 COMP1 was programmed to a deadline that the counter has already
-//       passed; CH2 won't fire until the counter wraps (~6.5 ms wrap for
-//       16-bit at 10 MHz, but the IRQ won't dispatch until the IRQ
-//       infrastructure thinks it can — see below).
-//   (b) CSCTRL's TCF1EN bit got cleared, disabling the compare interrupt
-//       enable.  TCF1 may still set on compare match but no IRQ fires.
-//   (c) NVIC IRQ_QTIMER1 got disabled or stuck pending.
-//   (d) BASEPRI is held at a value that masks priority 32 (the Patch 8
-//       priority for QTimer1).  If foreground enters a long critical_enter
-//       block and never exits, CH2 IRQ is masked indefinitely.
-//
-// Each PPS edge captures BASEPRI at ISR entry into the global below.  The
-// enhanced PPS probe (under Patch 10, replaces the simpler Patch 9 emission)
-// reads QTimer1 CH2 register state and the captured BASEPRI, and emits
-// everything in one line.  Once CADENCE_MINDER stops, this probe keeps
-// reporting the CH2 hardware state every second, so we can see exactly
-// which mechanism produced the freeze.
-
-static volatile uint32_t g_patch10_basepri_at_pps_entry = 0;
-
 // OCXO compare-flag preflight diagnostics. These dry-run hardware probes run
 // from the TimePop OCXO arm callback before compare enable is allowed. They
 // answer whether the stale TCF flag can be cleared reliably at the intended
@@ -1475,42 +1370,8 @@ static void synthetic_clock_tend_from_hw16(synthetic_clock32_t& c,
   }
 
   synthetic_clock_consume_pending_zero_if_any(c);
-
-  // Patch 2 — regression detector.  Snapshot the prior counter32 before any
-  // write so we can compare against the new projection.  A synthetic tick must
-  // never run backward; if delta wraps into the negative half-range (i.e. the
-  // projected counter32 lands before current_counter32), record the regression
-  // for diagnostic readout.  This is the smoking gun for an unguarded
-  // read-modify-write race between CADENCE_MINDER (ISR) and a foreground
-  // writer.  Note: we still apply the new value either way — the goal is to
-  // observe the lie, not to suppress it.
-  const uint32_t prior_counter32 = c.current_counter32;
   const uint32_t counter32 = project_counter32_from_hw16(c, hardware16);
-  const uint32_t delta = counter32 - prior_counter32;
-
-  if (delta > 0x80000000UL) {
-    const uint32_t regression = prior_counter32 - counter32;
-    if (&c == &g_ocxo1_clock32) {
-      g_ocxo1_clock32_regression_count++;
-      g_ocxo1_clock32_last_regression_delta = regression;
-      if (regression > g_ocxo1_clock32_max_regression_delta) {
-        g_ocxo1_clock32_max_regression_delta = regression;
-      }
-    } else if (&c == &g_ocxo2_clock32) {
-      g_ocxo2_clock32_regression_count++;
-      g_ocxo2_clock32_last_regression_delta = regression;
-      if (regression > g_ocxo2_clock32_max_regression_delta) {
-        g_ocxo2_clock32_max_regression_delta = regression;
-      }
-    } else {
-      g_vclock_clock32_regression_count++;
-      g_vclock_clock32_last_regression_delta = regression;
-      if (regression > g_vclock_clock32_max_regression_delta) {
-        g_vclock_clock32_max_regression_delta = regression;
-      }
-    }
-  }
-
+  const uint32_t delta = counter32 - c.current_counter32;
   c.current_counter32 = counter32;
   c.current_ns += (uint64_t)delta * 100ULL;
   c.hardware16 = hardware16;
@@ -2388,50 +2249,10 @@ static void ocxo_schedule_edge_arm_for_target(interrupt_subscriber_runtime_t* rt
   uint32_t now_counter32 = clock32->current_counter32;
   uint32_t ticks_to_target = next_edge_counter32 - now_counter32;
 
-  // Patch 1 — bounded iteration with diagnostic counters.  In normal operation
-  // this loop iterates 0 or 1 times.  Anything over a couple iterations means
-  // now_counter32 was either far ahead of or far behind the intended target,
-  // which is consistent with a synthetic-clock race poisoning current_counter32
-  // between the tend call above and the read below.  The hard cap at 600 is
-  // well above the theoretical maximum of 2^32 / OCXO_EDGE_INTERVAL_COUNTS
-  // (~430); reaching it means now_counter32 is unrecoverable for this pass and
-  // we break out loudly rather than spin forever.
-  uint32_t advance_iters = 0;
-  bool advance_broke_out = false;
   while (ticks_to_target > 0x80000000UL ||
          ticks_to_target <= OCXO_EDGE_ARM_LEAD_TICKS) {
     next_edge_counter32 += OCXO_EDGE_INTERVAL_COUNTS;
     ticks_to_target = next_edge_counter32 - now_counter32;
-    advance_iters++;
-    if (advance_iters > 600U) {
-      advance_broke_out = true;
-      break;
-    }
-  }
-
-  if (kind == interrupt_subscriber_kind_t::OCXO1) {
-    g_ocxo1_edge_arm_advance_iter_count_total += advance_iters;
-    g_ocxo1_edge_arm_advance_iter_count_last = advance_iters;
-    if (advance_iters > g_ocxo1_edge_arm_advance_iter_count_max) {
-      g_ocxo1_edge_arm_advance_iter_count_max = advance_iters;
-    }
-    if (advance_broke_out) g_ocxo1_edge_arm_advance_iter_break_count++;
-  } else {
-    g_ocxo2_edge_arm_advance_iter_count_total += advance_iters;
-    g_ocxo2_edge_arm_advance_iter_count_last = advance_iters;
-    if (advance_iters > g_ocxo2_edge_arm_advance_iter_count_max) {
-      g_ocxo2_edge_arm_advance_iter_count_max = advance_iters;
-    }
-    if (advance_broke_out) g_ocxo2_edge_arm_advance_iter_break_count++;
-  }
-
-  if (advance_broke_out) {
-    // now_counter32 is poisoned for this pass.  Do not arm — the lane will be
-    // scheduled again at the next CADENCE_MINDER pulse via the normal rearm
-    // path, and the iter_break_count above is the durable evidence that this
-    // pass was abandoned.
-    ocxo_edge_arm_schedule_failure_inc(kind);
-    return;
   }
 
   lane->next_edge_counter32 = next_edge_counter32;
@@ -2440,20 +2261,6 @@ static void ocxo_schedule_edge_arm_for_target(interrupt_subscriber_runtime_t* rt
   const uint32_t ticks_until_arm =
       ticks_to_target - OCXO_EDGE_ARM_LEAD_TICKS;
   const uint64_t arm_delay_ns = ocxo_ticks_to_estimated_gnss_ns(ticks_until_arm);
-
-  // Patch 1 — short-delay witness.  If arm_delay_ns lands below the lead
-  // duration itself, the new TimePop slot will be born essentially at-or-past
-  // its deadline.  This is a precursor to a same-pass recall loop because
-  // schedule_next will immediately rediscover the slot as expired.
-  if (arm_delay_ns < (uint64_t)OCXO_EDGE_ARM_LEAD_NS) {
-    if (kind == interrupt_subscriber_kind_t::OCXO1) {
-      g_ocxo1_edge_arm_short_delay_count++;
-      g_ocxo1_edge_arm_last_arm_delay_ns_lo = (uint32_t)arm_delay_ns;
-    } else {
-      g_ocxo2_edge_arm_short_delay_count++;
-      g_ocxo2_edge_arm_last_arm_delay_ns_lo = (uint32_t)arm_delay_ns;
-    }
-  }
 
   ocxo_edge_arm_record_schedule_diag(kind,
                                      next_edge_counter32,
@@ -3037,128 +2844,10 @@ void process_interrupt_gpio6789_irq(uint32_t isr_entry_dwt_raw) {
     g_vclock_lane.logical_count32_at_last_second = selected_counter32;
     vclock_clock_anchor_hardware_low16(selected_counter32, selected_low16);
   }
-
-  // ── Patch 9 + Patch 10 + Patch 11 — PPS aliveness + CH2 forensics + TimePop state ──
-  //
-  // Emit one debug line per second from PPS GPIO ISR context (priority 0).
-  // Carries:
-  //   • Patch 9/10: PPS counters, CH2 register forensics, NVIC enable/pending,
-  //     and BASEPRI at PPS ISR entry.
-  //   • Patch 11: CADENCE_MINDER slot state + TimePop scheduler counters,
-  //     read via timepop_get_freeze_diag().  This tells us what state
-  //     CADENCE_MINDER is sitting in at the freeze moment and whether
-  //     TimePop's scheduler is busy-looping or quiet.
-  //
-  // Existing fields (Patch 9/10):
-  //   emit=         — PPS probe emission count
-  //   gpio=         — total PPS GPIO ISR entries
-  //   cad_fires=    — g_cadence_minder_fire_count (frozen at death)
-  //   ch2_cntr=     — current CH2 counter (low 16 bits)
-  //   ch2_comp1=    — current CH2 compare target
-  //   ch2_csctrl=   — CH2 CSCTRL register
-  //   nvic_en=      — IRQ_QTIMER1 enabled in NVIC
-  //   nvic_pn=      — IRQ_QTIMER1 pending in NVIC
-  //   bpri=         — BASEPRI at PPS ISR entry
-  //
-  // New fields (Patch 11):
-  //   cm_a=         — CADENCE_MINDER slot.active
-  //   cm_e=         — CADENCE_MINDER slot.expired (true means waiting for dispatch)
-  //   cm_icf=       — CADENCE_MINDER slot.isr_callback_fired
-  //   cm_dl=        — CADENCE_MINDER slot.deadline (32-bit VCLOCK)
-  //   cm_tgt32=     — low 32 bits of slot.target_gnss_ns (hex)
-  //   cm_rar=       — recurring_rearmed_count (total rearms across all paths)
-  //   cm_irq=       — irq_expired_by_irq_count (IRQ caught the deadline)
-  //   cm_sxe=       — schedule_next_expired_count (foreground caught past-deadline)
-  //   cm_sk=        — recurring_total_skipped_intervals
-  //   sn=           — TimePop diag_schedule_next_calls_total
-  //   rearm=        — TimePop diag_rearm_count (CH2 arms)
-  //   hb=           — TimePop diag_heartbeat_rearms (no slot had near deadline)
-  //   disp=         — TimePop diag_dispatch_calls (dispatch ran)
-  //   isr=          — TimePop diag_isr_count (CH2 IRQ entries)
-  //
-  // Interpretation patterns:
-  //   • cm_e=1 stuck across many samples → CADENCE_MINDER is expired but
-  //     dispatch isn't processing it (or isr_callback_fired=true keeps
-  //     skipping the callback path).
-  //   • cm_e=0 stuck → schedule_next never marks it past-deadline, meaning
-  //     cm_dl always appears in the future.  cm_dl should then be advancing.
-  //   • cm_rar growing but cad_fires NOT growing → rearm is happening but
-  //     callback is being skipped (e.g., isr_callback_fired stuck true).
-  //   • sn growing by millions per second → schedule_next runaway loop.
-  //   • hb growing fast → schedule_next can't find any near deadline and
-  //     keeps arming the 1 ms heartbeat.
-  //   • disp growing slowly → dispatch is rarely running, timepop_pending
-  //     is rarely set.
-  const uint32_t pps_now_ms = millis();
-  if ((uint32_t)(pps_now_ms - g_patch9_pps_last_emit_ms) >= 1000) {
-    g_patch9_pps_last_emit_ms = pps_now_ms;
-    g_patch9_pps_emit_count++;
-
-    const uint16_t ch2_cntr   = IMXRT_TMR1.CH[2].CNTR;
-    const uint16_t ch2_comp1  = IMXRT_TMR1.CH[2].COMP1;
-    const uint16_t ch2_csctrl = IMXRT_TMR1.CH[2].CSCTRL;
-
-    // NVIC introspection — read the ISER and ISPR bits for IRQ_QTIMER1.
-    // IRQ_QTIMER1 numeric value > 32, so we use the appropriate ISER/ISPR
-    // bank.  Access via CMSIS-style pattern available through imxrt.h.
-    const uint32_t irq_num    = (uint32_t)IRQ_QTIMER1;
-    const uint32_t irq_bank   = irq_num >> 5;
-    const uint32_t irq_bit    = irq_num & 31U;
-    const uint32_t iser_word  = ((volatile uint32_t*)0xE000E100)[irq_bank];
-    const uint32_t ispr_word  = ((volatile uint32_t*)0xE000E200)[irq_bank];
-    const unsigned nvic_en    = (iser_word >> irq_bit) & 1U;
-    const unsigned nvic_pn    = (ispr_word >> irq_bit) & 1U;
-
-    // Patch 11: snapshot TimePop's view of CADENCE_MINDER and scheduler.
-    timepop_freeze_diag_t td;
-    timepop_get_freeze_diag(td);
-    const uint32_t cm_tgt32 = (uint32_t)((uint64_t)td.cm_target_gnss_ns & 0xFFFFFFFFULL);
-
-    char buf[512];
-    snprintf(buf, sizeof(buf),
-             "emit=%lu gpio=%lu cad_fires=%lu "
-             "ch2_cntr=%u ch2_comp1=%u ch2_csctrl=0x%04x "
-             "nvic_en=%u nvic_pn=%u bpri=%lu "
-             "cm_a=%u cm_e=%u cm_icf=%u cm_dl=%lu cm_tgt32=%08lx "
-             "cm_rar=%lu cm_irq=%lu cm_sxe=%lu cm_sk=%lu "
-             "sn=%lu rearm=%lu hb=%lu disp=%lu isr=%lu",
-             (unsigned long)g_patch9_pps_emit_count,
-             (unsigned long)g_gpio_irq_count,
-             (unsigned long)g_cadence_minder_fire_count,
-             (unsigned)ch2_cntr,
-             (unsigned)ch2_comp1,
-             (unsigned)ch2_csctrl,
-             nvic_en,
-             nvic_pn,
-             (unsigned long)g_patch10_basepri_at_pps_entry,
-             (unsigned)(td.cm_found && td.cm_active ? 1 : 0),
-             (unsigned)(td.cm_found && td.cm_expired ? 1 : 0),
-             (unsigned)(td.cm_found && td.cm_isr_callback_fired ? 1 : 0),
-             (unsigned long)td.cm_deadline,
-             (unsigned long)cm_tgt32,
-             (unsigned long)td.cm_recurring_rearmed_count,
-             (unsigned long)td.cm_irq_expired_by_irq_count,
-             (unsigned long)td.cm_schedule_next_expired_count,
-             (unsigned long)td.cm_recurring_total_skipped_intervals,
-             (unsigned long)td.schedule_next_calls_total,
-             (unsigned long)td.rearm_count,
-             (unsigned long)td.heartbeat_rearms,
-             (unsigned long)td.dispatch_calls,
-             (unsigned long)td.isr_count);
-    debug_log("pps_alive", buf);
-  }
 }
 
 static void pps_gpio_isr(void) {
   const uint32_t isr_entry_dwt_raw = ARM_DWT_CYCCNT;
-  // Patch 10: capture BASEPRI immediately on ISR entry.  This reflects what
-  // BASEPRI was in the preempted context (foreground or another ISR).  If
-  // CADENCE_MINDER is being masked by an overlong critical_enter, this will
-  // show BASEPRI=16 (or whatever mask is in effect) at the moment PPS fired.
-  uint32_t basepri_at_entry;
-  __asm volatile("mrs %0, basepri" : "=r" (basepri_at_entry));
-  g_patch10_basepri_at_pps_entry = basepri_at_entry;
-
   process_interrupt_gpio6789_irq(isr_entry_dwt_raw);
 }
 
@@ -3625,32 +3314,6 @@ void process_interrupt_init(void) {
   g_ocxo2_edge_arm_last_delay_ns = 0;
   g_ocxo1_edge_arm_rearm_asap_count = 0;
   g_ocxo2_edge_arm_rearm_asap_count = 0;
-
-  // Patch 1 — zero advance-iter and short-delay diagnostics.
-  g_ocxo1_edge_arm_advance_iter_count_total = 0;
-  g_ocxo1_edge_arm_advance_iter_count_max = 0;
-  g_ocxo1_edge_arm_advance_iter_count_last = 0;
-  g_ocxo1_edge_arm_advance_iter_break_count = 0;
-  g_ocxo1_edge_arm_last_arm_delay_ns_lo = 0;
-  g_ocxo1_edge_arm_short_delay_count = 0;
-  g_ocxo2_edge_arm_advance_iter_count_total = 0;
-  g_ocxo2_edge_arm_advance_iter_count_max = 0;
-  g_ocxo2_edge_arm_advance_iter_count_last = 0;
-  g_ocxo2_edge_arm_advance_iter_break_count = 0;
-  g_ocxo2_edge_arm_last_arm_delay_ns_lo = 0;
-  g_ocxo2_edge_arm_short_delay_count = 0;
-
-  // Patch 2 — zero synthetic-clock regression counters.
-  g_ocxo1_clock32_regression_count = 0;
-  g_ocxo1_clock32_last_regression_delta = 0;
-  g_ocxo1_clock32_max_regression_delta = 0;
-  g_ocxo2_clock32_regression_count = 0;
-  g_ocxo2_clock32_last_regression_delta = 0;
-  g_ocxo2_clock32_max_regression_delta = 0;
-  g_vclock_clock32_regression_count = 0;
-  g_vclock_clock32_last_regression_delta = 0;
-  g_vclock_clock32_max_regression_delta = 0;
-
   g_ocxo1_arm_preflight_count = 0;
   g_ocxo1_arm_flag_before_clear = 0;
   g_ocxo1_arm_flag_after_clear = 0;
@@ -3712,81 +3375,26 @@ void process_interrupt_init(void) {
 void process_interrupt_enable_irqs(void) {
   if (g_interrupt_irqs_enabled) return;
 
-  // ── Patch 8 — priority architecture ────────────────────────────────────
-  //
-  // Priority ordering (lower number = higher priority on ARM Cortex-M):
-  //
-  //   PPS GPIO  : 0   — physical edge from the GF-8802; labeling witness for
-  //                     the canonical second.  Sovereign and uncontested.
-  //   OCXO 1/2  : 16  — physical hardware compare events.  Their ISR-entry
-  //                     DWT is the OCXO edge fact; they must not be delayed
-  //                     by the TimePop bookkeeping substrate.
-  //   QTimer1   : 32  — TimePop's CH2 scheduler and CADENCE_MINDER.  This is
-  //                     software bookkeeping over the slot tables; it sits
-  //                     below the physical-event observers.
-  //
-  // The doctrinal alignment: events that observe physical reality (PPS, OCXO
-  // edges) outrank the substrate that maintains software bookkeeping
-  // (TimePop slot tables, CADENCE_MINDER counter tending).  This is the
-  // priority architecture demanded by "interrupts are the sole lawful timing
-  // truth" — the physical observers must always run promptly, while the
-  // bookkeeping can be paused under critical_enter() without compromising
-  // measurement integrity.
-  //
-  // BASEPRI invariant: BASEPRI_MASK_BELOW_PPS = 16 in util.h.  A foreground
-  // critical_enter() call sets BASEPRI to 16, which masks all interrupts at
-  // priority ≥ 16.  Under this scheme that includes QTimer1 (32) and OCXO
-  // (16) — meaning the TimePop slot tables can be safely mutated under
-  // critical_enter() without racing against CADENCE_MINDER or any other
-  // CH2-IRQ-context slot-table writer.  PPS GPIO at priority 0 remains
-  // unmasked and sovereign, as it must.
-  //
-  // Consequences of this scheme worth being explicit about:
-  //
-  //   • PPS can now preempt QTimer1 mid-flight.  This is correct — PPS is
-  //     the labeling witness for the canonical second; nothing should delay
-  //     it.  QTimer1 ISRs do not touch the synchronization surfaces that
-  //     PPS reads, so the preemption is harmless.
-  //
-  //   • OCXO can now preempt QTimer1 mid-flight.  Also correct — OCXO edge
-  //     facts capture ARM_DWT_CYCCNT as their first instruction, and any
-  //     QTimer1-induced delay would corrupt that capture.
-  //
-  //   • CADENCE_MINDER (in QTimer1) can be delayed by a foreground
-  //     critical_enter() critical section.  Critical sections in TimePop
-  //     are short (slot-table walks, microseconds at most), so the delay
-  //     to CADENCE_MINDER's 1 ms cadence is negligible.  Keep critical
-  //     sections short.
-  //
-  //   • The PPS ISR is now genuinely uncontested at priority 0.  Previously
-  //     PPS and QTimer1 were peers at priority 0, so neither could preempt
-  //     the other; now PPS is sovereign.  ISR-entry latency calibration
-  //     constants (CANONICAL_VCLOCK_EPOCH_MINUS_RAW_PPS_ISR_CYCLES,
-  //     *_ISR_FIXED_OVERHEAD) were empirically near-invariant to the old
-  //     equal-priority arrangement, but spot-check the post-flash
-  //     measurements against prior baselines and re-measure if they shift.
-
   attachInterruptVector(IRQ_QTIMER1, qtimer1_isr);
-  // QTimer1 hosts TimePop's CH2 scheduler and CADENCE_MINDER.  This is
-  // bookkeeping, not physical-event observation; it sits below PPS and OCXO.
-  NVIC_SET_PRIORITY(IRQ_QTIMER1, 32);
+  // VCLOCK/TimePop QTimer1 is the sovereign timing rail.  Keep the entire
+  // shared QTimer1 vector at highest priority; same-vector logical ordering
+  // is handled inside TimePop/process_interrupt.
+  NVIC_SET_PRIORITY(IRQ_QTIMER1, 0);
   NVIC_ENABLE_IRQ(IRQ_QTIMER1);
 
   attachInterruptVector(IRQ_QTIMER2, qtimer2_isr);
-  // OCXO1 compare match — physical hardware event.  Above QTimer1 so its
-  // ISR-entry DWT capture is not delayed by bookkeeping ISRs.
   NVIC_SET_PRIORITY(IRQ_QTIMER2, 16);
   NVIC_ENABLE_IRQ(IRQ_QTIMER2);
 
   attachInterruptVector(IRQ_QTIMER3, qtimer3_isr);
-  // OCXO2 compare match — same rationale as QTimer2.
   NVIC_SET_PRIORITY(IRQ_QTIMER3, 16);
   NVIC_ENABLE_IRQ(IRQ_QTIMER3);
 
   pinMode(GNSS_PPS_PIN, INPUT);
   attachInterrupt(digitalPinToInterrupt(GNSS_PPS_PIN), pps_gpio_isr, RISING);
-  // PPS GPIO — labeling witness for the canonical second.  Sovereign at
-  // priority 0; nothing in the system may delay it.
+  // PPS GPIO is now a witness/selector, not the highest-priority timing
+  // interpolation rail.  Keep it below QTimer1 so VCLOCK/TimePop event facts
+  // are not delayed by PPS witness work.
   NVIC_SET_PRIORITY(IRQ_GPIO6789, 0);
 
   g_interrupt_irqs_enabled = true;
@@ -3941,42 +3549,6 @@ static Payload cmd_report(const Payload&) {
   p.add("ocxo2_edge_arm_last_ticks_to_target", g_ocxo2_edge_arm_last_ticks_to_target);
   p.add("ocxo2_edge_arm_last_delay_ns", g_ocxo2_edge_arm_last_delay_ns);
   p.add("ocxo2_edge_arm_rearm_asap_count", g_ocxo2_edge_arm_rearm_asap_count);
-
-  // Patch 1 — advance-iter and short-delay diagnostics.  These are the
-  // primary witnesses for the synthetic-clock race hypothesis: a healthy
-  // system produces near-zero iter counts and zero short-delay events.
-  p.add("ocxo1_edge_arm_advance_iter_count_total", g_ocxo1_edge_arm_advance_iter_count_total);
-  p.add("ocxo1_edge_arm_advance_iter_count_max",   g_ocxo1_edge_arm_advance_iter_count_max);
-  p.add("ocxo1_edge_arm_advance_iter_count_last",  g_ocxo1_edge_arm_advance_iter_count_last);
-  p.add("ocxo1_edge_arm_advance_iter_break_count", g_ocxo1_edge_arm_advance_iter_break_count);
-  p.add("ocxo1_edge_arm_short_delay_count",        g_ocxo1_edge_arm_short_delay_count);
-  p.add("ocxo1_edge_arm_last_arm_delay_ns_lo",     g_ocxo1_edge_arm_last_arm_delay_ns_lo);
-  p.add("ocxo2_edge_arm_advance_iter_count_total", g_ocxo2_edge_arm_advance_iter_count_total);
-  p.add("ocxo2_edge_arm_advance_iter_count_max",   g_ocxo2_edge_arm_advance_iter_count_max);
-  p.add("ocxo2_edge_arm_advance_iter_count_last",  g_ocxo2_edge_arm_advance_iter_count_last);
-  p.add("ocxo2_edge_arm_advance_iter_break_count", g_ocxo2_edge_arm_advance_iter_break_count);
-  p.add("ocxo2_edge_arm_short_delay_count",        g_ocxo2_edge_arm_short_delay_count);
-  p.add("ocxo2_edge_arm_last_arm_delay_ns_lo",     g_ocxo2_edge_arm_last_arm_delay_ns_lo);
-
-  // Patch 2 — synthetic-clock regression witnesses.  Any non-zero count here
-  // is the smoking gun for an unguarded read-modify-write race between
-  // CADENCE_MINDER (IRQ context, QTimer1) and a foreground caller of
-  // synthetic_clock_tend_from_hw16 on the same clock instance.  Under the
-  // Patch 8 priority architecture (QTimer1=32, OCXO=16, PPS=0) these
-  // counters should remain at zero forever — BASEPRI-16 critical sections
-  // now lawfully mask CADENCE_MINDER, so the race they witnessed is
-  // structurally prevented.  A non-zero count after Patch 8 would mean
-  // either the priority change did not take effect or there is a different
-  // race we have not yet identified.
-  p.add("ocxo1_clock32_regression_count",        g_ocxo1_clock32_regression_count);
-  p.add("ocxo1_clock32_last_regression_delta",   g_ocxo1_clock32_last_regression_delta);
-  p.add("ocxo1_clock32_max_regression_delta",    g_ocxo1_clock32_max_regression_delta);
-  p.add("ocxo2_clock32_regression_count",        g_ocxo2_clock32_regression_count);
-  p.add("ocxo2_clock32_last_regression_delta",   g_ocxo2_clock32_last_regression_delta);
-  p.add("ocxo2_clock32_max_regression_delta",    g_ocxo2_clock32_max_regression_delta);
-  p.add("vclock_clock32_regression_count",       g_vclock_clock32_regression_count);
-  p.add("vclock_clock32_last_regression_delta",  g_vclock_clock32_last_regression_delta);
-  p.add("vclock_clock32_max_regression_delta",   g_vclock_clock32_max_regression_delta);
 
   p.add("pps_rebootstrap_pending", g_pps_rebootstrap_pending);
   p.add("pps_rebootstrap_count",   g_pps_rebootstrap_count);
