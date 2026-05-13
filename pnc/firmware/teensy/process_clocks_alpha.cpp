@@ -16,7 +16,6 @@
 
 #include "process_clocks_internal.h"
 #include "process_clocks.h"
-#include "process_time.h"
 #include "process_interrupt.h"
 
 #include "debug.h"
@@ -447,7 +446,7 @@ static inline uint64_t nominal_ns_from_counter32_epoch(uint32_t counter32,
 //
 // This is intentionally report-only.  Alpha records the exact event facts and
 // zero-offset-relative arithmetic it applied for each lane before handing that
-// event to process_time's generalized clock projection model.  This lets REPORT
+// event to time.cpp's generalized clock projection model.  This lets REPORT
 // distinguish event/zero-offset errors from projection-to-report-DWT errors.
 
 struct alpha_lane_forensics_store_t {
@@ -1049,7 +1048,7 @@ static void clock_mark_epoch_zero(clock_state_t& clock) {
 // authors a zero-offset-ready PPS capture packet in ISR context.  Alpha selects
 // the latest valid packet, stores per-lane synthetic counter32 zero offsets,
 // installs local canonical nanosecond/cycle ledgers, and notifies
-// process_time/process_timepop that the VCLOCK coordinate generation has
+// time.cpp/process_timepop that the VCLOCK coordinate generation has
 // changed.  Raw hardware counters are not written here.
 // ============================================================================
 
@@ -1181,6 +1180,7 @@ bool clocks_alpha_zero_from_interrupt_capture(const char* reason) {
   (void)clocks_dwt64_epoch_reset_at_dwt32(cap.vclock_dwt_at_edge, nullptr);
   dwt64_anchor_reset_to_dwt32(cap.vclock_dwt_at_edge, g_dwt64_epoch_raw_cycles);
 
+  time_clock_reset_all();
   time_pps_vclock_epoch_reset(cap.vclock_dwt_at_edge, cap.vclock_counter32);
   time_clock_epoch_reset(time_clock_id_t::VCLOCK, cap.vclock_dwt_at_edge, 0);
   time_clock_epoch_reset(time_clock_id_t::OCXO1,  cap.vclock_dwt_at_edge, 0);

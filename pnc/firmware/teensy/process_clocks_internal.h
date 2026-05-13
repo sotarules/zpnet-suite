@@ -264,7 +264,7 @@ extern clock_measurement_t g_ocxo2_measurement;
 //
 // These snapshots expose the last event alpha consumed for each measured
 // clock, plus the exact epoch-relative counter32->ns arithmetic applied before
-// handing the event to process_time's generalized projection model.  They are
+// handing the event to time.cpp's generalized projection model.  They are
 // diagnostic only; summary remains the compact system-health surface.
 
 struct clocks_alpha_lane_forensics_t {
