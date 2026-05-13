@@ -1621,10 +1621,8 @@ void process_clocks_init(void) {
   digitalWriteFast(GNSS_PPS_RELAY, LOW);
 
   subscribe_clock(interrupt_subscriber_kind_t::VCLOCK, vclock_callback);
-
-  // MULE TESTING:
-  //subscribe_clock(interrupt_subscriber_kind_t::OCXO1, ocxo1_callback);
-  //subscribe_clock(interrupt_subscriber_kind_t::OCXO2, ocxo2_callback);
+  subscribe_clock(interrupt_subscriber_kind_t::OCXO1, ocxo1_callback);
+  subscribe_clock(interrupt_subscriber_kind_t::OCXO2, ocxo2_callback);
 
   interrupt_pps_edge_register_dispatch(pps_selector_callback);
 }
