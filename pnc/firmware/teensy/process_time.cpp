@@ -217,7 +217,7 @@ bool time_clock_update(time_clock_id_t clock,
   return true;
 }
 
-bool time_clock_ns_at_dwt(time_clock_id_t clock,
+bool time_clock_ns_at_dwt_deprecated(time_clock_id_t clock,
                           uint32_t dwt_cyccnt,
                           uint64_t* out_ns) {
   if (!out_ns) return false;

@@ -282,6 +282,36 @@ struct time_clock_snapshot_t {
 // symbol.  New code may treat non-negative results as uint64_t.  After the
 // legacy owner is removed, this can be tightened to uint64_t everywhere.
 
+
+struct time_clock_projection_t {
+  time_clock_id_t clock = time_clock_id_t::NONE;
+  bool     valid = false;
+  bool     basis_is_live = false;
+  uint32_t dwt_at_update = 0;
+  uint64_t ns_at_update = 0;
+  uint32_t dwt_cycles_per_second = 0;
+  uint32_t update_count = 0;
+  uint32_t last_observed_dwt_cycles = 0;
+  uint64_t last_observed_ns = 0;
+  int32_t  last_prediction_residual_cycles = 0;
+};
+
+bool time_clock_projection(time_clock_id_t clock,
+                           time_clock_projection_t* out);
+bool time_clock_ns_at_dwt(time_clock_id_t clock,
+                          uint32_t authored_dwt_cycle_count,
+                          uint64_t* out_ns);
+bool time_clock_dwt_at_ns(time_clock_id_t clock,
+                          uint64_t clock_ns,
+                          uint32_t* out_dwt_cycle_count);
+uint64_t time_dwt_to_clock_ns(time_clock_id_t clock,
+                              uint32_t authored_dwt_cycle_count);
+uint32_t time_clock_ns_to_dwt(time_clock_id_t clock,
+                              uint64_t clock_ns);
+
+uint64_t time_dwt_to_vclock_ns(uint32_t authored_dwt_cycle_count);
+uint32_t time_vclock_ns_to_dwt(uint64_t vclock_ns);
+
 int64_t  time_dwt_to_gnss_ns(uint32_t dwt_cycle_count);
 uint64_t time_dwt_to_ocxo1_ns(uint32_t dwt_cycle_count);
 uint64_t time_dwt_to_ocxo2_ns(uint32_t dwt_cycle_count);

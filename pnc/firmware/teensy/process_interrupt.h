@@ -69,13 +69,10 @@
 #include <stdint.h>
 #include <stdbool.h>
 
-// Deferred event service hook.  Retained as a compatibility drain for stale
-// queued OCXO work.  Normal OCXO one-second events now dispatch directly from
-// the private QTimer2/QTimer3 mini-schedulers and do not require this service.
+// Retired deferred-service hooks.  Normal OCXO one-second events dispatch
+// directly from the private QTimer2/QTimer3 mini-schedulers; these remain only
+// as compatibility no-ops for older loop plumbing.
 void interrupt_service_deferred_events(void);
-
-// Compatibility shim for older loop plumbing that still calls the old
-// SpinCatch-era name.
 void interrupt_prespin_service(timepop_ctx_t*, timepop_diag_t*, void*);
 
 // ============================================================================

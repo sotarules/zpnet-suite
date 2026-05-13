@@ -16,10 +16,10 @@
 
 #include "process_clocks_internal.h"
 #include "process_clocks.h"
+#include "process_time.h"
 #include "process_interrupt.h"
 
 #include "debug.h"
-#include "timebase.h"
 #include "time.h"
 
 #include "payload.h"
@@ -1598,7 +1598,6 @@ static void subscribe_clock(interrupt_subscriber_kind_t kind,
 }
 
 void process_clocks_init(void) {
-  timebase_init();
 
   // Startup epoch is installed locally by alpha from the first valid
   // process_interrupt PPS/VCLOCK epoch capture packet.  Request a PPS

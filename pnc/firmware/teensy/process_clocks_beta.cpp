@@ -53,7 +53,6 @@
 #include "process_interrupt.h"
 
 #include "debug.h"
-#include "timebase.h"
 #include "time.h"
 
 #include "payload.h"
@@ -689,7 +688,6 @@ static void ocxo_dac_schedule_paced_commit(void) {
 // ============================================================================
 
 void clocks_zero_all(void) {
-  timebase_invalidate();
 
   campaign_seconds = 0;
 
@@ -827,7 +825,6 @@ static void clocks_force_stop_campaign(void) {
   calibrate_ocxo_mode = servo_mode_t::OFF;
   ocxo_dac_pacing_abort_all();
   campaign_warmup_reset();
-  timebase_invalidate();
 }
 
 static void clocks_watchdog_anomaly_callback(timepop_ctx_t*, timepop_diag_t*, void*) {
@@ -913,7 +910,6 @@ void clocks_beta_pps(void) {
     calibrate_ocxo_mode = servo_mode_t::OFF;
     ocxo_dac_pacing_abort_all();
     campaign_warmup_reset();
-    timebase_invalidate();
     return;
   }
 
@@ -1679,19 +1675,10 @@ static const process_command_entry_t CLOCKS_COMMANDS[] = {
   { nullptr,          nullptr           }
 };
 
-static const process_subscription_entry_t CLOCKS_SUBSCRIPTIONS[] = {
-  { "TIMEBASE_FRAGMENT", on_timebase_fragment },
-  { nullptr, nullptr },
-};
-
-const process_subscription_entry_t* timebase_subscriptions(void) {
-  return CLOCKS_SUBSCRIPTIONS;
-}
-
 static const process_vtable_t CLOCKS_PROCESS = {
   .process_id    = "CLOCKS",
   .commands      = CLOCKS_COMMANDS,
-  .subscriptions = CLOCKS_SUBSCRIPTIONS
+  .subscriptions = nullptr
 };
 
 void process_clocks_register(void) {

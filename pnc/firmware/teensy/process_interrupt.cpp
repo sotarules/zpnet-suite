@@ -865,10 +865,6 @@ static bridge_projection_t interrupt_dwt_to_vclock_gnss_projection(uint32_t dwt_
   return out;
 }
 
-static int64_t interrupt_project_dwt_to_vclock_gnss_ns(uint32_t dwt_at_event) {
-  return interrupt_dwt_to_vclock_gnss_projection(dwt_at_event).gnss_ns;
-}
-
 // ============================================================================
 // Subscriber runtime
 // ============================================================================
@@ -969,8 +965,6 @@ struct ocxo_lane_t {
   uint32_t cadence_hits_total = 0;
   uint32_t edge_hits_total = 0;
   uint32_t second_event_count = 0;
-  uint32_t deferred_edge_count = 0;
-  uint32_t deferred_overwrite_count = 0;
   uint32_t late_max_ticks = 0;
   uint32_t last_late_ticks = 0;
   uint32_t skipped_cadence_count = 0;
@@ -1065,11 +1059,6 @@ static volatile uint32_t g_qtimer3_last_ch3_late_ticks = 0;
 static volatile uint32_t g_qtimer3_last_ch3_dwt_raw = 0;
 static volatile uint32_t g_qtimer3_last_ch3_event_dwt = 0;
 static volatile uint32_t g_qtimer3_last_ch3_dwt_coordinate_source = OCXO_DWT_SOURCE_NONE;
-
-static volatile uint32_t g_ocxo_deferred_asap_arm_count = 0;
-static volatile uint32_t g_ocxo_deferred_asap_overwrite_count = 0;
-static volatile uint32_t g_ocxo_deferred_sample_count = 0;
-static volatile uint32_t g_ocxo_deferred_edge_count = 0;
 
 static volatile bool     g_cadence_minder_armed = false;
 static volatile uint32_t g_cadence_minder_arm_count = 0;
@@ -1286,17 +1275,6 @@ static void vclock_clock_bootstrap_from_hw16(uint16_t hardware16) {
   g_vclock_clock32.pending_zero = false;
   vclock_clock_anchor_hardware_low16((uint32_t)hardware16, hardware16);
   g_vclock_lane.logical_count32_at_last_second = (uint32_t)hardware16;
-}
-
-static void vclock_clock_tend_from_hardware_low16(uint16_t hardware_low16) {
-  if (!g_vclock_clock32.zeroed) {
-    vclock_clock_bootstrap_from_hw16(hardware_low16);
-    return;
-  }
-
-  const uint32_t counter32 = vclock_synthetic_from_hardware_low16(hardware_low16);
-  vclock_clock_anchor_hardware_low16(counter32, hardware_low16);
-  g_vclock_clock32.minder_update_count++;
 }
 
 static void synthetic_clock_tend_from_hw16(synthetic_clock32_t& c,
@@ -1786,40 +1764,6 @@ static void ocxo_edge_fire_inc(interrupt_subscriber_kind_t kind) {
   }
 }
 
-struct ocxo_deferred_work_t {
-  volatile bool     edge_pending = false;
-  volatile uint32_t edge_dwt = 0;
-  volatile uint32_t edge_counter32 = 0;
-  volatile uint32_t sequence = 0;
-};
-
-static ocxo_deferred_work_t g_ocxo1_deferred = {};
-static ocxo_deferred_work_t g_ocxo2_deferred = {};
-
-static ocxo_deferred_work_t& ocxo_deferred_for(interrupt_subscriber_kind_t kind) {
-  return (kind == interrupt_subscriber_kind_t::OCXO1)
-      ? g_ocxo1_deferred
-      : g_ocxo2_deferred;
-}
-
-static void ocxo_defer_one_second_edge(ocxo_lane_t& lane,
-                                       ocxo_deferred_work_t& work,
-                                       uint32_t event_dwt,
-                                       uint32_t event_counter32) {
-  if (work.edge_pending) {
-    lane.deferred_overwrite_count++;
-    g_ocxo_deferred_asap_overwrite_count++;  // legacy counter name
-  }
-
-  work.edge_dwt = event_dwt;
-  work.edge_counter32 = event_counter32;
-  work.sequence++;
-  work.edge_pending = true;
-
-  lane.deferred_edge_count++;
-  g_ocxo_deferred_edge_count++;
-}
-
 static inline void ocxo_lane_update_late_diag(ocxo_lane_t& lane,
                                               uint32_t late_ticks) {
   lane.last_late_ticks = late_ticks;
@@ -2020,10 +1964,7 @@ static void ocxo_lane_cadence_isr(ocxo_lane_t& lane,
                                   interrupt_subscriber_runtime_t* rt,
                                   interrupt_subscriber_kind_t kind,
                                   synthetic_clock32_t& clock32,
-                                  ocxo_deferred_work_t& work,
                                   uint32_t isr_entry_dwt_raw) {
-  (void)work;
-
   if (!ocxo_lane_compare_flag_pending(lane)) {
     lane.miss_count++;
     return;
@@ -2066,10 +2007,7 @@ static void ocxo_lane_cadence_isr(ocxo_lane_t& lane,
     ocxo_edge_fire_inc(kind);
 
     // First-cut OCXO delivery: pass the honest, latency-adjusted, still-
-    // quantized QTimer DWT-at-edge directly to CLOCKS/Alpha.  The former
-    // SpinCatch/prespin mailbox path is retained only as a compatibility
-    // drain for any stale pending work; normal OCXO events no longer depend
-    // on it.
+    // quantized QTimer DWT-at-edge directly to CLOCKS/Alpha.
     emit_one_second_event(*rt, event_dwt, fired_counter32,
                           0, false, nullptr, true);
 
@@ -2079,38 +2017,12 @@ static void ocxo_lane_cadence_isr(ocxo_lane_t& lane,
   ocxo_lane_reschedule_after_fire(lane, fired_counter32, fired_low16);
 }
 
-static void ocxo_drain_deferred_edge(interrupt_subscriber_runtime_t* rt,
-                                     ocxo_lane_t& lane,
-                                     ocxo_deferred_work_t& work) {
-  uint32_t event_dwt = 0;
-  uint32_t event_counter32 = 0;
-  bool had_edge = false;
-
-  __disable_irq();
-  if (work.edge_pending) {
-    event_dwt = work.edge_dwt;
-    event_counter32 = work.edge_counter32;
-    work.edge_pending = false;
-    had_edge = true;
-  }
-  __enable_irq();
-
-  if (!had_edge || !rt || !rt->active) return;
-
-  // Foreground direct dispatch: no TimePop slot mutation.  Alpha receives the
-  // same interrupt_event_t / diag surface, with the OCXO DWT coordinate already
-  // latency-adjusted at ISR entry.
-  emit_one_second_event(*rt, event_dwt, event_counter32, 0, false, nullptr, true);
-  (void)lane;
-}
-
 static void qtimer2_isr(void) {
   const uint32_t isr_entry_dwt_raw = ARM_DWT_CYCCNT;
   ocxo_lane_cadence_isr(g_ocxo1_lane,
                         g_rt_ocxo1,
                         interrupt_subscriber_kind_t::OCXO1,
                         g_ocxo1_clock32,
-                        g_ocxo1_deferred,
                         isr_entry_dwt_raw);
 }
 
@@ -2120,7 +2032,6 @@ static void qtimer3_isr(void) {
                         g_rt_ocxo2,
                         interrupt_subscriber_kind_t::OCXO2,
                         g_ocxo2_clock32,
-                        g_ocxo2_deferred,
                         isr_entry_dwt_raw);
 }
 
@@ -2639,11 +2550,8 @@ const interrupt_capture_diag_t* interrupt_last_diag(interrupt_subscriber_kind_t 
 }
 
 void interrupt_service_deferred_events(void) {
-  // Compatibility drain for stale pre-direct-dispatch OCXO mailbox entries.
-  // Normal OCXO one-second events now dispatch directly from the lane-local
-  // QTimer ISR path and do not depend on this service being called.
-  ocxo_drain_deferred_edge(g_rt_ocxo1, g_ocxo1_lane, g_ocxo1_deferred);
-  ocxo_drain_deferred_edge(g_rt_ocxo2, g_ocxo2_lane, g_ocxo2_deferred);
+  // Retired compatibility hook.  OCXO one-second events dispatch directly
+  // from the lane-local QTimer ISR path; no deferred mailbox remains.
 }
 
 void interrupt_prespin_service(timepop_ctx_t*, timepop_diag_t*, void*) {
@@ -2832,10 +2740,6 @@ void process_interrupt_init(void) {
   g_qtimer3_last_ch3_dwt_raw = 0;
   g_qtimer3_last_ch3_event_dwt = 0;
   g_qtimer3_last_ch3_dwt_coordinate_source = OCXO_DWT_SOURCE_NONE;
-  g_ocxo_deferred_asap_arm_count = 0;
-  g_ocxo_deferred_asap_overwrite_count = 0;
-  g_ocxo_deferred_sample_count = 0;
-  g_ocxo_deferred_edge_count = 0;
   g_cadence_minder_armed = false;
   g_cadence_minder_arm_count = 0;
   g_cadence_minder_arm_failures = 0;
@@ -2866,8 +2770,6 @@ void process_interrupt_init(void) {
   g_ocxo1_lane.cadence_hits_total = 0;
   g_ocxo1_lane.edge_hits_total = 0;
   g_ocxo1_lane.second_event_count = 0;
-  g_ocxo1_lane.deferred_edge_count = 0;
-  g_ocxo1_lane.deferred_overwrite_count = 0;
   g_ocxo1_lane.late_max_ticks = 0;
   g_ocxo1_lane.last_late_ticks = 0;
   g_ocxo1_lane.skipped_cadence_count = 0;
@@ -2892,8 +2794,6 @@ void process_interrupt_init(void) {
   g_ocxo2_lane.cadence_hits_total = 0;
   g_ocxo2_lane.edge_hits_total = 0;
   g_ocxo2_lane.second_event_count = 0;
-  g_ocxo2_lane.deferred_edge_count = 0;
-  g_ocxo2_lane.deferred_overwrite_count = 0;
   g_ocxo2_lane.late_max_ticks = 0;
   g_ocxo2_lane.last_late_ticks = 0;
   g_ocxo2_lane.skipped_cadence_count = 0;
@@ -2910,9 +2810,6 @@ void process_interrupt_init(void) {
   g_ocxo2_grid_epoch_start_count = 0;
   g_ocxo1_grid_epoch_wait_count = 0;
   g_ocxo2_grid_epoch_wait_count = 0;
-  g_ocxo1_deferred = ocxo_deferred_work_t{};
-  g_ocxo2_deferred = ocxo_deferred_work_t{};
-
   g_interrupt_runtime_ready = true;
   (void)cadence_minder_arm_timepop();
 }
@@ -3064,8 +2961,6 @@ static Payload cmd_report(const Payload&) {
   p.add("ocxo1_grid_epoch_counter32_lane", g_ocxo1_lane.grid_epoch_counter32);
   p.add("ocxo1_edge_fire_count", g_ocxo1_edge_fire_count);
   p.add("ocxo1_second_event_count", g_ocxo1_lane.second_event_count);
-  p.add("ocxo1_deferred_edge_count", g_ocxo1_lane.deferred_edge_count);
-  p.add("ocxo1_deferred_overwrite_count", g_ocxo1_lane.deferred_overwrite_count);
   p.add("ocxo1_late_max_ticks", g_ocxo1_lane.late_max_ticks);
   p.add("ocxo1_last_late_ticks", g_ocxo1_lane.last_late_ticks);
   p.add("ocxo1_skipped_cadence_count", g_ocxo1_lane.skipped_cadence_count);
@@ -3082,8 +2977,6 @@ static Payload cmd_report(const Payload&) {
   p.add("ocxo2_grid_epoch_counter32_lane", g_ocxo2_lane.grid_epoch_counter32);
   p.add("ocxo2_edge_fire_count", g_ocxo2_edge_fire_count);
   p.add("ocxo2_second_event_count", g_ocxo2_lane.second_event_count);
-  p.add("ocxo2_deferred_edge_count", g_ocxo2_lane.deferred_edge_count);
-  p.add("ocxo2_deferred_overwrite_count", g_ocxo2_lane.deferred_overwrite_count);
   p.add("ocxo2_late_max_ticks", g_ocxo2_lane.late_max_ticks);
   p.add("ocxo2_last_late_ticks", g_ocxo2_lane.last_late_ticks);
   p.add("ocxo2_skipped_cadence_count", g_ocxo2_lane.skipped_cadence_count);
@@ -3287,15 +3180,6 @@ static Payload cmd_report(const Payload&) {
   p.add("qtimer3_last_ch3_dwt_raw", g_qtimer3_last_ch3_dwt_raw);
   p.add("qtimer3_last_ch3_event_dwt", g_qtimer3_last_ch3_event_dwt);
   p.add("qtimer3_last_ch3_dwt_coordinate_source", g_qtimer3_last_ch3_dwt_coordinate_source);
-
-  p.add("ocxo_deferred_asap_arm_count", g_ocxo_deferred_asap_arm_count);
-  p.add("ocxo_deferred_asap_overwrite_count", g_ocxo_deferred_asap_overwrite_count);
-  p.add("ocxo_deferred_sample_count", g_ocxo_deferred_sample_count);
-  p.add("ocxo_deferred_edge_count", g_ocxo_deferred_edge_count);
-  p.add("ocxo1_deferred_sample_pending", false);
-  p.add("ocxo1_deferred_edge_pending", g_ocxo1_deferred.edge_pending);
-  p.add("ocxo2_deferred_sample_pending", false);
-  p.add("ocxo2_deferred_edge_pending", g_ocxo2_deferred.edge_pending);
 
   return p;
 }
