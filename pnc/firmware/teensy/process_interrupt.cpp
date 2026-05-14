@@ -580,6 +580,26 @@ static pps_gpio_heartbeat_t g_pps_gpio_heartbeat;
 static uint32_t g_gpio_irq_count  = 0;
 static uint32_t g_gpio_miss_count = 0;
 
+// PPS post-ISR drain.  The GPIO ISR still captures the physical PPS witness
+// facts and the small three-counter custody window immediately, because those
+// are the timing facts.  Publication of the epoch packet and diagnostic entry
+// callback are deferred to a TimePop ASAP slot so the priority-0 PPS ISR stays
+// as short as possible.
+struct pps_post_isr_mailbox_t {
+  volatile bool pending = false;
+  volatile uint32_t arm_count = 0;
+  volatile uint32_t drain_count = 0;
+  volatile uint32_t overwrite_count = 0;
+  volatile uint32_t asap_fail_count = 0;
+  volatile uint32_t last_sequence = 0;
+  volatile uint32_t last_capture_window_cycles = 0;
+  interrupt_epoch_capture_t cap{};
+  uint32_t isr_entry_dwt_raw = 0;
+};
+
+static pps_post_isr_mailbox_t g_pps_post_isr = {};
+static void pps_post_isr_asap_callback(timepop_ctx_t*, timepop_diag_t*, void*);
+
 // ============================================================================
 // PPS witness + VCLOCK-domain canonical epoch latch
 // ============================================================================
@@ -2136,8 +2156,14 @@ static void ocxo_witness_compare_isr(ocxo_lane_t& lane,
   ocxo_lane_record_isr_diag(kind, isr_entry_dwt_raw, event_dwt, late_ticks);
 
   // The target identity was known before the interrupt was armed.  The ISR is
-  // only the DWT witness for that already-scheduled OCXO second edge.
-  emit_one_second_event(*rt, event_dwt, target_counter32);
+  // only the DWT witness for that already-scheduled OCXO second edge.  Publish
+  // through the existing ASAP deferred edge path so Alpha/CLOCKS work never
+  // runs inside the OCXO ISR.
+  ocxo_deferred_work_t& work =
+      (kind == interrupt_subscriber_kind_t::OCXO1)
+          ? g_ocxo1_deferred
+          : g_ocxo2_deferred;
+  ocxo_defer_one_second_edge(work, rt, kind, event_dwt, target_counter32);
 
   lane.witness_target_counter32 += OCXO_WITNESS_ONE_SECOND_COUNTS;
 }
@@ -2350,6 +2376,77 @@ static void pps_edge_dispatch_trampoline(timepop_ctx_t*, timepop_diag_t*, void*)
   g_pps_edge_dispatch(snap);
 }
 
+static void pps_post_isr_publish_inline(const interrupt_epoch_capture_t& cap,
+                                        uint32_t isr_entry_dwt_raw) {
+  epoch_capture_publish(cap);
+
+  if (g_pps_entry_latency_handler) {
+    g_pps_entry_latency_handler(cap.sequence, isr_entry_dwt_raw);
+  }
+}
+
+static void pps_post_isr_asap_callback(timepop_ctx_t*, timepop_diag_t*, void*) {
+  interrupt_epoch_capture_t cap{};
+  uint32_t isr_entry_dwt_raw = 0;
+  bool had_sample = false;
+
+  __disable_irq();
+  had_sample = g_pps_post_isr.pending;
+  if (had_sample) {
+    cap = g_pps_post_isr.cap;
+    isr_entry_dwt_raw = g_pps_post_isr.isr_entry_dwt_raw;
+    g_pps_post_isr.pending = false;
+  }
+  __enable_irq();
+
+  if (!had_sample) return;
+
+  g_pps_post_isr.drain_count++;
+  pps_post_isr_publish_inline(cap, isr_entry_dwt_raw);
+}
+
+static void pps_post_isr_defer(const interrupt_epoch_capture_t& cap,
+                               uint32_t isr_entry_dwt_raw) {
+  if (!g_interrupt_runtime_ready) {
+    pps_post_isr_publish_inline(cap, isr_entry_dwt_raw);
+    return;
+  }
+
+  __disable_irq();
+  if (g_pps_post_isr.pending) {
+    g_pps_post_isr.overwrite_count++;
+  }
+  g_pps_post_isr.cap = cap;
+  g_pps_post_isr.isr_entry_dwt_raw = isr_entry_dwt_raw;
+  g_pps_post_isr.pending = true;
+  g_pps_post_isr.arm_count++;
+  g_pps_post_isr.last_sequence = cap.sequence;
+  g_pps_post_isr.last_capture_window_cycles = cap.capture_window_cycles;
+  __enable_irq();
+
+  const timepop_handle_t h =
+      timepop_arm_asap(pps_post_isr_asap_callback, nullptr, "PPS_POST_ISR");
+  if (h == TIMEPOP_INVALID_HANDLE) {
+    interrupt_epoch_capture_t fallback{};
+    uint32_t fallback_raw = 0;
+    bool had_sample = false;
+
+    __disable_irq();
+    had_sample = g_pps_post_isr.pending;
+    if (had_sample) {
+      fallback = g_pps_post_isr.cap;
+      fallback_raw = g_pps_post_isr.isr_entry_dwt_raw;
+      g_pps_post_isr.pending = false;
+      g_pps_post_isr.asap_fail_count++;
+    }
+    __enable_irq();
+
+    if (had_sample) {
+      pps_post_isr_publish_inline(fallback, fallback_raw);
+    }
+  }
+}
+
 void process_interrupt_gpio6789_irq(uint32_t isr_entry_dwt_raw) {
   // PPS GPIO is a witness/selector only.  It captures the physical PPS facts
   // and, during rebootstrap, selects the VCLOCK-domain edge identity.  It does
@@ -2429,12 +2526,6 @@ void process_interrupt_gpio6789_irq(uint32_t isr_entry_dwt_raw) {
   epoch_cap.vclock_counter32 = selected_counter32;
   epoch_cap.ocxo1_counter32 = ocxo1_counter32;
   epoch_cap.ocxo2_counter32 = ocxo2_counter32;
-  epoch_capture_publish(epoch_cap);
-
-  if (g_pps_entry_latency_handler) {
-    g_pps_entry_latency_handler(g_pps_gpio_heartbeat.edge_count,
-                                isr_entry_dwt_raw);
-  }
 
   pps_t pps;
   pps.sequence          = g_pps_gpio_heartbeat.edge_count;
@@ -2444,6 +2535,11 @@ void process_interrupt_gpio6789_irq(uint32_t isr_entry_dwt_raw) {
 
   g_last_pps_witness = pps;
   g_last_pps_witness_valid = true;
+
+  // Defer epoch-packet publication and PPS entry-latency diagnostic callback.
+  // The witness facts above remain immediate because VCLOCK steady-state and
+  // rebootstrap consume them.
+  pps_post_isr_defer(epoch_cap, isr_entry_dwt_raw);
 
   // During rebootstrap, PPS selects the sacred VCLOCK edge identity.  The
   // already-running critical TimePop VCLOCK cadence client consumes the next CH2
@@ -2767,6 +2863,7 @@ void process_interrupt_init(void) {
   g_pps_gpio_heartbeat = pps_gpio_heartbeat_t{};
   g_gpio_irq_count = 0;
   g_gpio_miss_count = 0;
+  g_pps_post_isr = pps_post_isr_mailbox_t{};
   g_last_pps_witness = pps_t{};
   g_last_pps_witness_valid = false;
   g_vclock_epoch_latch = vclock_epoch_latch_t{};
@@ -2915,11 +3012,11 @@ static Payload cmd_report(const Payload&) {
   p.add("hardware_ready", g_interrupt_hw_ready);
   p.add("runtime_ready",  g_interrupt_runtime_ready);
   p.add("irqs_enabled",   g_interrupt_irqs_enabled);
-  p.add("timing_arch_step", "OCXO_WITNESS_COMPARE_MINIMAL");
+  p.add("timing_arch_step", "LIGHTWEIGHT_EDGE_ISR_PASS");
   p.add("timing_arch_behavior_changed", true);
   p.add("timing_arch_vclock_authority", "QTIMER1_CH2_TIMEPOP_CADENCE_MINDER");
   p.add("timing_arch_ocxo_model", "CADENCE_MINDER_ROLLOVER_OCXO_ONCE_PER_SECOND_WITNESS");
-  p.add("timing_arch_ocxo_migration_stage", "OCXO_WITNESS_COMPARE_MINIMAL");
+  p.add("timing_arch_ocxo_migration_stage", "LIGHTWEIGHT_EDGE_ISR_PASS");
 
   p.add("qtimer1_sovereign_priority_expected", INTERRUPT_STEP0_EXPECTED_QTIMER1_PRIORITY);
   p.add("qtimer1_sovereign_priority_applied", g_step0_qtimer1_priority_applied);
@@ -3025,6 +3122,15 @@ static Payload cmd_report(const Payload&) {
   p.add("gpio_irq_count", g_gpio_irq_count);
   p.add("gpio_miss_count", g_gpio_miss_count);
   p.add("gpio_edge_count", g_pps_gpio_heartbeat.edge_count);
+  p.add("pps_post_isr_deferred", true);
+  p.add("pps_post_isr_pending", g_pps_post_isr.pending);
+  p.add("pps_post_isr_arm_count", g_pps_post_isr.arm_count);
+  p.add("pps_post_isr_drain_count", g_pps_post_isr.drain_count);
+  p.add("pps_post_isr_overwrite_count", g_pps_post_isr.overwrite_count);
+  p.add("pps_post_isr_asap_fail_count", g_pps_post_isr.asap_fail_count);
+  p.add("pps_post_isr_last_sequence", g_pps_post_isr.last_sequence);
+  p.add("pps_post_isr_last_capture_window_cycles",
+        g_pps_post_isr.last_capture_window_cycles);
 
   // PPS (physical edge) and PPS_VCLOCK (canonical) in symmetric blocks.
   pps_t pps; pps_vclock_t pvc;
@@ -3088,6 +3194,7 @@ static Payload cmd_report(const Payload&) {
   p.add("ocxo2_logical_count32",    g_ocxo2_lane.logical_count32_at_last_second);
 
   p.add("ocxo_witness_arch_enabled", true);
+  p.add("ocxo_witness_edge_publish_deferred", true);
   p.add("ocxo_witness_one_second_counts", OCXO_WITNESS_ONE_SECOND_COUNTS);
   p.add("ocxo_witness_arm_window_ticks", OCXO_WITNESS_ARM_WINDOW_TICKS);
 
