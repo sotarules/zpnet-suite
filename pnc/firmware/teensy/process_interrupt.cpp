@@ -26,30 +26,27 @@
 //                   there.  Nothing in a data structure, subscription payload,
 //                   or TIMEBASE fragment carries _raw.
 //
-// Scheduling architecture:
-//
-//   VCLOCK remains asymmetric by design: TimePop/CADENCE_MINDER tends the
-//   sovereign VCLOCK rail on QTimer1 CH2.  OCXO1 and OCXO2 do not use TimePop
-//   for cadence, compare arming, or post-ISR dispatch.  Each OCXO lane owns a
-//   private QTimer compare mini-scheduler that advances by 10,000 lane-local
-//   OCXO ticks per fire.  Most fires maintain 16-bit-to-32-bit custody; every
-//   1000th epoch-aligned fire authors the OCXO one-second edge and dispatches
-//   it directly to the subscriber callback.
+// TimePop is the principled exception to the "no DWT conversion in
+// PPS_VCLOCK" rule: it projects CH2 fire facts onto the PPS_VCLOCK timeline
+// for scheduling diagnostics. OCXO one-second subscribers receive authored
+// OCXO edge facts even when that projection is unavailable; CLOCKS/Alpha owns
+// OCXO measured-GNSS interval construction from consecutive OCXO edge DWTs.
 //
 // Lanes:
 //   VCLOCK : TimePop recurring client on QTimer1 CH2 (10 MHz VCLOCK domain)
-//   OCXO1  : QTimer2 CH0 private 1 kHz scheduler, PCS=0
-//   OCXO2  : QTimer3 CH3 private 1 kHz scheduler, PCS=3
+//   OCXO1  : QTimer2 CH0, PCS=0
+//   OCXO2  : QTimer3 CH3, PCS=3
 //   TimePop: QTimer1 CH2, varied compare intervals (foreground scheduler)
 //
 // The PPS GPIO ISR captures DWT as its first instruction, then reads the
 // QTimer1 CH0 low-word counter.  process_interrupt maps that low-word
 // hardware observation into the private synthetic 32-bit VCLOCK identity.
-// During rebootstrap, PPS selects the sacred VCLOCK edge identity; the
-// already-running TimePop VCLOCK cadence consumes the next CH2 fire fact,
-// back-projects to the selected edge, refreshes the synthetic VCLOCK low-word
-// anchor before TimePop schedules the next compare, and thereafter emits the
-// one-second VCLOCK events on the TimePop rail.
+// When a rebootstrap is pending, it
+// records the selected VCLOCK edge.  The recurring TimePop VCLOCK cadence client is armed as a critical recurring
+// ISR slot.  It consumes the next CH2 fire fact, back-projects to the selected
+// edge, refreshes the synthetic VCLOCK low-word anchor before TimePop schedules
+// the next compare, and thereafter emits the one-second VCLOCK events on the
+// TimePop rail.
 // ============================================================================
 
 #include "process_interrupt.h"
@@ -138,33 +135,15 @@ static constexpr uint32_t EPOCH_CAPTURE_MAX_WINDOW_CYCLES =
     (DWT_EXPECTED_PER_PPS + (VCLOCK_COUNTS_PER_SECOND - 1U)) /
     VCLOCK_COUNTS_PER_SECOND;
 
-// Single TimePop custody agent for the VCLOCK rail only.
+// Single TimePop custody agent for all 16-bit hardware counters and all
+// one-second lane events.
 //
-// CADENCE_MINDER remains a TimePop critical recurring client because VCLOCK is
-// the sovereign GNSS-disciplined domain and TimePop already lives there.
-// OCXO1 and OCXO2 no longer participate in TimePop cadence, arming, or
-// post-ISR dispatch.  Each OCXO lane owns a private QTimer compare mini-
-// scheduler that fires every 1 ms in that lane's own 10 MHz domain.
+// CADENCE_MINDER replaces the former separate VCLOCK cadence slot and prevents
+// the OCXO lanes from owning any implicit high-frequency compare cadence. It is
+// armed as a critical recurring TimePop ISR client so every lane is tended
+// from the same QTimer1 CH2 fire fact.
 static constexpr uint64_t CADENCE_MINDER_PERIOD_NS = 1000000ULL;
 static constexpr const char* CADENCE_MINDER_NAME = "CADENCE_MINDER";
-
-// OCXO lane-local mini-scheduler.
-//
-// The hardware compare fires every 10,000 OCXO ticks (1 ms).  Most fires
-// simply extend the lane's 16-bit counter into process_interrupt's synthetic
-// 32-bit counter.  Every 1000th epoch-aligned fire is the OCXO one-second
-// edge delivered to CLOCKS/Alpha.
-static constexpr uint32_t OCXO_CADENCE_INTERVAL_COUNTS = 10000U;
-static constexpr uint32_t OCXO_EDGE_INTERVAL_COUNTS =
-    (uint32_t)VCLOCK_COUNTS_PER_SECOND;
-static constexpr uint32_t OCXO_CADENCE_EVENTS_PER_SECOND =
-    OCXO_EDGE_INTERVAL_COUNTS / OCXO_CADENCE_INTERVAL_COUNTS;
-static_assert(OCXO_EDGE_INTERVAL_COUNTS == 10000000U,
-              "OCXO edge interval must be one 10 MHz second");
-static_assert(OCXO_CADENCE_EVENTS_PER_SECOND == 1000U,
-              "OCXO mini-scheduler must run at 1 kHz");
-static_assert((OCXO_EDGE_INTERVAL_COUNTS % OCXO_CADENCE_INTERVAL_COUNTS) == 0U,
-              "OCXO one-second grid must be an integer number of cadence fires");
 
 // OCXO DWT authorship.  OCXO1 and OCXO2 now live on separate QuadTimer
 // modules/vectors.  Each OCXO ISR captures ARM_DWT_CYCCNT as its first
@@ -865,6 +844,10 @@ static bridge_projection_t interrupt_dwt_to_vclock_gnss_projection(uint32_t dwt_
   return out;
 }
 
+static int64_t interrupt_project_dwt_to_vclock_gnss_ns(uint32_t dwt_at_event) {
+  return interrupt_dwt_to_vclock_gnss_projection(dwt_at_event).gnss_ns;
+}
+
 // ============================================================================
 // Subscriber runtime
 // ============================================================================
@@ -939,40 +922,16 @@ struct ocxo_lane_t {
   uint8_t      channel = 0;
   uint8_t      pcs = 0;
   int          input_pin = -1;
-
   bool     initialized = false;
-  bool     active = false;             // subscriber/campaign interest
-  bool     scheduler_active = false;   // lane-local 1 kHz custody running
-  bool     second_grid_valid = false;  // CLOCKS-authored epoch grid installed
+  bool     active = false;
   bool     phase_bootstrapped = false;
-
-  // Hardware compare target for the next 1 kHz custody fire.  The low word is
-  // written to COMP1/CMPLD1; next_cadence_counter32 is the full synthetic
-  // target identity authored by this lane's private scheduler.
   uint16_t compare_target = 0;
-  uint32_t next_cadence_counter32 = 0;
-
-  // CLOCKS-authored OCXO one-second grid.  Every 1000th cadence target that
-  // equals next_edge_counter32 is emitted to Alpha as an OCXO second edge.
-  uint32_t grid_epoch_counter32 = 0;
-  uint32_t next_edge_counter32 = 0;
-
   uint32_t tick_mod_1000 = 0;
   uint32_t logical_count32_at_last_second = 0;
   uint32_t irq_count = 0;
   uint32_t miss_count = 0;
   uint32_t bootstrap_count = 0;
   uint32_t cadence_hits_total = 0;
-  uint32_t edge_hits_total = 0;
-  uint32_t second_event_count = 0;
-  uint32_t late_max_ticks = 0;
-  uint32_t last_late_ticks = 0;
-  uint32_t skipped_cadence_count = 0;
-  uint32_t missed_second_count = 0;
-  uint32_t compare_rearm_count = 0;
-  uint32_t compare_rearm_failure_count = 0;
-  uint32_t last_fired_counter32 = 0;
-  uint16_t last_fired_low16 = 0;
 };
 static ocxo_lane_t g_ocxo1_lane;
 static ocxo_lane_t g_ocxo2_lane;
@@ -1060,6 +1019,11 @@ static volatile uint32_t g_qtimer3_last_ch3_dwt_raw = 0;
 static volatile uint32_t g_qtimer3_last_ch3_event_dwt = 0;
 static volatile uint32_t g_qtimer3_last_ch3_dwt_coordinate_source = OCXO_DWT_SOURCE_NONE;
 
+static volatile uint32_t g_ocxo_deferred_asap_arm_count = 0;
+static volatile uint32_t g_ocxo_deferred_asap_overwrite_count = 0;
+static volatile uint32_t g_ocxo_deferred_sample_count = 0;
+static volatile uint32_t g_ocxo_deferred_edge_count = 0;
+
 static volatile bool     g_cadence_minder_armed = false;
 static volatile uint32_t g_cadence_minder_arm_count = 0;
 static volatile uint32_t g_cadence_minder_arm_failures = 0;
@@ -1073,19 +1037,6 @@ static volatile uint16_t g_cadence_minder_last_ocxo2_hw16 = 0;
 static volatile uint32_t g_cadence_minder_last_vclock_counter32 = 0;
 static volatile uint32_t g_cadence_minder_last_ocxo1_counter32 = 0;
 static volatile uint32_t g_cadence_minder_last_ocxo2_counter32 = 0;
-
-static volatile uint32_t g_ocxo1_edge_fire_count = 0;
-static volatile uint32_t g_ocxo2_edge_fire_count = 0;
-
-// CLOCKS-owned OCXO logical grid.  The grid is consumed by the private OCXO
-// mini-schedulers; no TimePop one-shot cancellation or arm window exists here.
-static volatile bool     g_ocxo_grid_epoch_valid = false;
-static volatile uint32_t g_ocxo1_grid_epoch_counter32 = 0;
-static volatile uint32_t g_ocxo2_grid_epoch_counter32 = 0;
-static volatile uint32_t g_ocxo1_grid_epoch_start_count = 0;
-static volatile uint32_t g_ocxo2_grid_epoch_start_count = 0;
-static volatile uint32_t g_ocxo1_grid_epoch_wait_count = 0;
-static volatile uint32_t g_ocxo2_grid_epoch_wait_count = 0;
 
 static inline uint32_t clock32_from_ns(uint64_t ns) {
   return (uint32_t)((ns / 100ULL) & 0xFFFFFFFFULL);
@@ -1277,6 +1228,17 @@ static void vclock_clock_bootstrap_from_hw16(uint16_t hardware16) {
   g_vclock_lane.logical_count32_at_last_second = (uint32_t)hardware16;
 }
 
+static void vclock_clock_tend_from_hardware_low16(uint16_t hardware_low16) {
+  if (!g_vclock_clock32.zeroed) {
+    vclock_clock_bootstrap_from_hw16(hardware_low16);
+    return;
+  }
+
+  const uint32_t counter32 = vclock_synthetic_from_hardware_low16(hardware_low16);
+  vclock_clock_anchor_hardware_low16(counter32, hardware_low16);
+  g_vclock_clock32.minder_update_count++;
+}
+
 static void synthetic_clock_tend_from_hw16(synthetic_clock32_t& c,
                                            uint16_t hardware16) {
   if (!c.zeroed) {
@@ -1357,10 +1319,11 @@ static inline void qtimer1_ch2_program_compare(uint16_t target_low16) {
 }
 
 static inline void qtimer2_ch0_clear_compare_flag(void) {
-  // Empirical ZPNet result: OCXO QuadTimer compare flags clear by writing the
-  // TCF bits LOW in CSCTRL.  The former write-one-to-clear assumption leaves
-  // TCF1 latched and can create an interrupt storm when TCF1EN is enabled.
-  IMXRT_TMR2.CH[0].CSCTRL &= ~(TMR_CSCTRL_TCF1 | TMR_CSCTRL_TCF2);
+  // QuadTimer compare flags are status latches.  On i.MX RT they are
+  // write-one-to-clear; writing zero leaves a latched TCF bit untouched.
+  // Keep this helper OCXO-local so the active QTimer1/TimePop rail remains
+  // unchanged in this pass.
+  IMXRT_TMR2.CH[0].CSCTRL |= (TMR_CSCTRL_TCF1 | TMR_CSCTRL_TCF2);
   (void)IMXRT_TMR2.CH[0].CSCTRL;
 }
 static inline void qtimer2_ch0_program_compare(uint16_t target_low16) {
@@ -1377,10 +1340,11 @@ static inline void qtimer2_ch0_disable_compare(void) {
 }
 
 static inline void qtimer3_clear_compare_flag(uint8_t ch) {
-  // Empirical ZPNet result: OCXO QuadTimer compare flags clear by writing the
-  // TCF bits LOW in CSCTRL.  The former write-one-to-clear assumption leaves
-  // TCF1 latched and can create an interrupt storm when TCF1EN is enabled.
-  IMXRT_TMR3.CH[ch].CSCTRL &= ~(TMR_CSCTRL_TCF1 | TMR_CSCTRL_TCF2);
+  // QuadTimer compare flags are status latches.  On i.MX RT they are
+  // write-one-to-clear; writing zero leaves a latched TCF bit untouched.
+  // Keep this helper OCXO-local so the active QTimer1/TimePop rail remains
+  // unchanged in this pass.
+  IMXRT_TMR3.CH[ch].CSCTRL |= (TMR_CSCTRL_TCF1 | TMR_CSCTRL_TCF2);
   (void)IMXRT_TMR3.CH[ch].CSCTRL;
 }
 static inline void qtimer3_program_compare(uint8_t ch, uint16_t target_low16) {
@@ -1529,12 +1493,52 @@ static void emit_one_second_event(interrupt_subscriber_runtime_t& rt,
 
 
 // ============================================================================
-// Cadence minder — single TimePop custody agent for VCLOCK only
+// Cadence minder — single TimePop custody agent for all low-word counters
 // ============================================================================
-//
-// OCXO1 and OCXO2 are deliberately absent here.  Their 16-bit rollover custody
-// is handled by their own QTimer2/QTimer3 1 kHz mini-schedulers, so no OCXO
-// ISR path ever mutates TimePop slots.
+
+static void cadence_minder_emit_ocxo_if_due(interrupt_subscriber_kind_t kind,
+                                            ocxo_lane_t& lane,
+                                            synthetic_clock32_t& clock32,
+                                            interrupt_subscriber_runtime_t* rt,
+                                            uint32_t event_dwt) {
+  if (!lane.initialized) return;
+
+  const uint16_t hw16 = ocxo_lane_counter_now(lane);
+  synthetic_clock_tend_from_hw16(clock32, hw16);
+  lane.logical_count32_at_last_second = clock32.current_counter32;
+
+  if (kind == interrupt_subscriber_kind_t::OCXO1) {
+    g_cadence_minder_ocxo1_updates++;
+    g_cadence_minder_last_ocxo1_hw16 = hw16;
+    g_cadence_minder_last_ocxo1_counter32 = clock32.current_counter32;
+  } else {
+    g_cadence_minder_ocxo2_updates++;
+    g_cadence_minder_last_ocxo2_hw16 = hw16;
+    g_cadence_minder_last_ocxo2_counter32 = clock32.current_counter32;
+  }
+
+  if (!lane.active || !rt || !rt->active) {
+    return;
+  }
+
+  if (!lane.phase_bootstrapped) {
+    lane.phase_bootstrapped = true;
+    lane.bootstrap_count++;
+    lane.tick_mod_1000 = 0;
+    return;
+  }
+
+  lane.cadence_hits_total++;
+
+  // CADENCE_MINDER runs at 1 kHz.  OCXO one-second publication therefore uses
+  // the same 1000-tick cadence as VCLOCK.  The OCXO counter identity itself
+  // remains passive and comes from the OCXO hardware low word projected into
+  // the process_interrupt-owned synthetic 32-bit lane.
+  if (++lane.tick_mod_1000 >= TICKS_PER_SECOND_EVENT) {
+    lane.tick_mod_1000 = 0;
+    emit_one_second_event(*rt, event_dwt, clock32.current_counter32);
+  }
+}
 
 static void cadence_minder_timepop_callback(timepop_ctx_t* ctx,
                                             timepop_diag_t*,
@@ -1634,7 +1638,19 @@ static void cadence_minder_timepop_callback(timepop_ctx_t* ctx,
     g_vclock_lane.miss_count++;
   }
 
-  // OCXO lanes intentionally not touched.
+  // OCXO lanes: passive hardware counters only.  No QTimer2/QTimer3 compare
+  // cadence is armed; CADENCE_MINDER tends the synthetic extensions and emits
+  // the one-second subscriber events.
+  cadence_minder_emit_ocxo_if_due(interrupt_subscriber_kind_t::OCXO1,
+                                  g_ocxo1_lane,
+                                  g_ocxo1_clock32,
+                                  g_rt_ocxo1,
+                                  qtimer_event_dwt);
+  cadence_minder_emit_ocxo_if_due(interrupt_subscriber_kind_t::OCXO2,
+                                  g_ocxo2_lane,
+                                  g_ocxo2_clock32,
+                                  g_rt_ocxo2,
+                                  qtimer_event_dwt);
 }
 
 static bool cadence_minder_arm_timepop(void) {
@@ -1660,27 +1676,152 @@ static bool cadence_minder_arm_timepop(void) {
 }
 
 // ============================================================================
-// OCXO lanes — private QTimer2/QTimer3 1 kHz mini-schedulers
+// OCXO lanes — QTimer2 CH0 / QTimer3 CH3
 // ============================================================================
 //
-// OCXO1 and OCXO2 are now self-sufficient timing domains.  TimePop does not
-// arm OCXO compares, does not drain OCXO post-ISR work, and does not tend OCXO
-// low-word rollover.  Each lane owns one recurring hardware compare chain:
-//
-//   target[n + 1] = target[n] + 10,000 OCXO ticks
-//
-// Most cadence fires are custody-only.  When the full 32-bit cadence target
-// equals the CLOCKS-authored one-second grid target, the lane captures the
-// latency-adjusted DWT at that OCXO edge and dispatches the subscriber callback
-// directly.  This first-cut path intentionally passes the quantized QuadTimer
-// DWT-at-edge through to CLOCKS/Alpha without SpinCatch or dequantization.
-
-static inline uint16_t ocxo_lane_counter_now(const ocxo_lane_t& lane) {
-  return lane.module->CH[lane.channel].CNTR;
+static void ocxo_lane_program_compare(ocxo_lane_t& lane, uint16_t target_low16) {
+  if (lane.module == &IMXRT_TMR2 && lane.channel == 0) {
+    qtimer2_ch0_program_compare(target_low16);
+  } else if (lane.module == &IMXRT_TMR3) {
+    qtimer3_program_compare(lane.channel, target_low16);
+  }
 }
+
+static void ocxo_lane_disable_compare(ocxo_lane_t& lane) {
+  if (lane.module == &IMXRT_TMR2 && lane.channel == 0) {
+    qtimer2_ch0_disable_compare();
+  } else if (lane.module == &IMXRT_TMR3) {
+    qtimer3_disable_compare(lane.channel);
+  }
+}
+
+// ISR discipline for OCXO lanes is intentionally flat and tiny:
+//   1. capture first-instruction DWT,
+//   2. clear the compare flag,
+//   3. compute the latency-adjusted event DWT,
+//   4. re-arm the next 1 kHz compare,
+//   5. refresh the synthetic 32-bit lane anchor,
+//   6. defer only 1 Hz edge publication.
+//
+// Dynamic 100 Hz prediction has been retired; OCXO 100 Hz samples are no
+// longer queued from the ISR.
+// ============================================================================
+
+struct ocxo_deferred_work_t {
+  volatile bool edge_pending = false;
+  volatile uint32_t edge_dwt = 0;
+  volatile uint32_t edge_counter32 = 0;
+};
+
+static ocxo_deferred_work_t g_ocxo1_deferred = {};
+static ocxo_deferred_work_t g_ocxo2_deferred = {};
+
+// ----------------------------------------------------------------------------
+// OCXO post-ISR mailbox — single slot per lane, drained by ASAP foreground.
+// ----------------------------------------------------------------------------
+//
+// The QTimer2/QTimer3 ISR captures the minimum facts needed for hardware
+// rearm and 1 Hz cadence accounting, then writes this mailbox and arms a
+// TimePop ASAP slot.  All non-essential bookkeeping (synthetic clock advance,
+// diag stores, late-ticks accounting, 1 Hz edge defer) runs in the ASAP
+// callback in foreground context.
+//
+// Mailbox semantics:
+//   • Single slot.  If a new ISR fires while the previous sample has not been
+//     consumed, the new sample overwrites and overwrite_count is incremented.
+//   • The lossy bookkeeping is acceptable because cadence-critical state
+//     (lane.tick_mod_1000) is updated inside the ISR itself.
+//   • Hardware re-arm and cadence counting cannot be lost.
+
+struct ocxo_post_isr_mailbox_t {
+  volatile bool     pending = false;
+  volatile uint32_t isr_entry_dwt_raw = 0;
+  volatile uint32_t event_dwt = 0;
+  volatile uint16_t fired_low16 = 0;
+  volatile bool     emit_one_second = false;
+  volatile uint32_t sequence = 0;
+};
+
+static ocxo_post_isr_mailbox_t g_ocxo1_post_isr = {};
+static ocxo_post_isr_mailbox_t g_ocxo2_post_isr = {};
+
+static volatile uint32_t g_ocxo1_post_isr_overwrite_count = 0;
+static volatile uint32_t g_ocxo2_post_isr_overwrite_count = 0;
+static volatile uint32_t g_ocxo1_post_isr_arm_count = 0;
+static volatile uint32_t g_ocxo2_post_isr_arm_count = 0;
+static volatile uint32_t g_ocxo1_post_isr_drain_count = 0;
+static volatile uint32_t g_ocxo2_post_isr_drain_count = 0;
+
+static const char* ocxo_post_isr_name(interrupt_subscriber_kind_t kind) {
+  return (kind == interrupt_subscriber_kind_t::OCXO1)
+      ? "OCXO1_POST_ISR"
+      : "OCXO2_POST_ISR";
+}
+
+static ocxo_post_isr_mailbox_t&
+ocxo_post_isr_mailbox_for(interrupt_subscriber_kind_t kind) {
+  return (kind == interrupt_subscriber_kind_t::OCXO1)
+      ? g_ocxo1_post_isr
+      : g_ocxo2_post_isr;
+}
+
+static void ocxo_post_isr_overwrite_inc(interrupt_subscriber_kind_t kind) {
+  if (kind == interrupt_subscriber_kind_t::OCXO1) {
+    g_ocxo1_post_isr_overwrite_count++;
+  } else {
+    g_ocxo2_post_isr_overwrite_count++;
+  }
+}
+
+static void ocxo_post_isr_arm_inc(interrupt_subscriber_kind_t kind) {
+  if (kind == interrupt_subscriber_kind_t::OCXO1) {
+    g_ocxo1_post_isr_arm_count++;
+  } else {
+    g_ocxo2_post_isr_arm_count++;
+  }
+}
+
+static void ocxo_post_isr_drain_inc(interrupt_subscriber_kind_t kind) {
+  if (kind == interrupt_subscriber_kind_t::OCXO1) {
+    g_ocxo1_post_isr_drain_count++;
+  } else {
+    g_ocxo2_post_isr_drain_count++;
+  }
+}
+
+// Forward decl so the ISR can reference it.
+static void ocxo_post_isr_asap_callback(timepop_ctx_t*,
+                                        timepop_diag_t*,
+                                        void* user_data);
+
+static void ocxo_deferred_asap_callback(timepop_ctx_t*, timepop_diag_t*, void* user_data) {
+  auto* rt = static_cast<interrupt_subscriber_runtime_t*>(user_data);
+  if (!rt || !rt->desc) return;
+
+  ocxo_deferred_work_t& work =
+      (rt->desc->kind == interrupt_subscriber_kind_t::OCXO1)
+          ? g_ocxo1_deferred
+          : g_ocxo2_deferred;
+  if (work.edge_pending) {
+    const uint32_t dwt = work.edge_dwt;
+    const uint32_t counter32 = work.edge_counter32;
+    work.edge_pending = false;
+    g_ocxo_deferred_edge_count++;
+
+    // We are already in foreground ASAP context.  Dispatch the authored OCXO
+    // edge directly instead of arming a second named ASAP slot that can be
+    // replaced by the next 100 Hz deferred sample before Alpha sees the edge.
+    emit_one_second_event(*rt, dwt, counter32, 0, false, nullptr, true);
+  }
+}
+
 
 static inline bool ocxo_lane_compare_flag_pending(const ocxo_lane_t& lane) {
   return (lane.module->CH[lane.channel].CSCTRL & TMR_CSCTRL_TCF1) != 0;
+}
+
+static inline uint16_t ocxo_lane_counter_now(const ocxo_lane_t& lane) {
+  return lane.module->CH[lane.channel].CNTR;
 }
 
 static void ocxo_lane_clear_compare_flag(ocxo_lane_t& lane) {
@@ -1689,49 +1830,6 @@ static void ocxo_lane_clear_compare_flag(ocxo_lane_t& lane) {
   } else if (lane.module == &IMXRT_TMR3) {
     qtimer3_clear_compare_flag(lane.channel);
   }
-}
-
-static void ocxo_lane_clear_nvic_pending(const ocxo_lane_t& lane) {
-  if (lane.module == &IMXRT_TMR2 && lane.channel == 0) {
-    NVIC_CLEAR_PENDING(IRQ_QTIMER2);
-  } else if (lane.module == &IMXRT_TMR3) {
-    NVIC_CLEAR_PENDING(IRQ_QTIMER3);
-  }
-}
-
-static void ocxo_lane_disable_compare_gate_only(ocxo_lane_t& lane) {
-  lane.module->CH[lane.channel].CSCTRL &= ~TMR_CSCTRL_TCF1EN;
-  (void)lane.module->CH[lane.channel].CSCTRL;
-}
-
-static void ocxo_lane_disable_compare(ocxo_lane_t& lane) {
-  ocxo_lane_disable_compare_gate_only(lane);
-  ocxo_lane_clear_compare_flag(lane);
-  ocxo_lane_clear_compare_flag(lane);
-  ocxo_lane_clear_nvic_pending(lane);
-}
-
-static bool ocxo_lane_program_cadence_compare(ocxo_lane_t& lane,
-                                              uint16_t target_low16) {
-  // The compare target is always the next lane-local 1 kHz grid point.  Since
-  // the interval is 10,000 ticks (< 2^16), a low-word COMP1 match uniquely
-  // refers to the next scheduled target as long as this ISR is serviced within
-  // one 16-bit wrap, which is the same custody assumption the 1 kHz cadence is
-  // designed to enforce.
-  ocxo_lane_disable_compare_gate_only(lane);
-  ocxo_lane_clear_compare_flag(lane);
-
-  lane.module->CH[lane.channel].COMP1  = target_low16;
-  lane.module->CH[lane.channel].CMPLD1 = target_low16;
-
-  ocxo_lane_clear_compare_flag(lane);
-  if (ocxo_lane_compare_flag_pending(lane)) {
-    ocxo_lane_disable_compare(lane);
-    return false;
-  }
-
-  lane.module->CH[lane.channel].CSCTRL |= TMR_CSCTRL_TCF1EN;
-  return true;
 }
 
 static void ocxo_lane_record_isr_diag(interrupt_subscriber_kind_t kind,
@@ -1756,283 +1854,170 @@ static void ocxo_lane_record_isr_diag(interrupt_subscriber_kind_t kind,
   }
 }
 
-static void ocxo_edge_fire_inc(interrupt_subscriber_kind_t kind) {
-  if (kind == interrupt_subscriber_kind_t::OCXO1) {
-    g_ocxo1_edge_fire_count++;
-  } else if (kind == interrupt_subscriber_kind_t::OCXO2) {
-    g_ocxo2_edge_fire_count++;
-  }
+static const char* ocxo_deferred_name(interrupt_subscriber_kind_t kind) {
+  return (kind == interrupt_subscriber_kind_t::OCXO1)
+      ? "OCXO1_DEFERRED"
+      : "OCXO2_DEFERRED";
 }
 
-static inline void ocxo_lane_update_late_diag(ocxo_lane_t& lane,
-                                              uint32_t late_ticks) {
-  lane.last_late_ticks = late_ticks;
-  if (late_ticks > lane.late_max_ticks) {
-    lane.late_max_ticks = late_ticks;
-  }
+static void ocxo_defer_one_second_edge(ocxo_deferred_work_t& work,
+                                       interrupt_subscriber_runtime_t* rt,
+                                       interrupt_subscriber_kind_t kind,
+                                       uint32_t event_dwt,
+                                       uint32_t event_counter32) {
+  if (work.edge_pending) g_ocxo_deferred_asap_overwrite_count++;
+
+  work.edge_dwt = event_dwt;
+  work.edge_counter32 = event_counter32;
+  work.edge_pending = true;
+  g_ocxo_deferred_asap_arm_count++;
+
+  (void)timepop_arm_asap(ocxo_deferred_asap_callback,
+                         rt,
+                         ocxo_deferred_name(kind));
 }
 
-static inline bool counter32_future(uint32_t target, uint32_t now) {
-  const uint32_t delta = target - now;
-  return delta != 0 && delta < 0x80000000UL;
-}
+// Minimal ISR.
+//
+// Cycle budget by inspection:
+//   1.  TCF1 pending check          — one peripheral read
+//   2.  TCF1 clear                  — one peripheral write
+//   3.  event_dwt latency-adjust    — one arithmetic op
+//   4.  compare_target advance      — one arithmetic op
+//   5.  next compare program        — two peripheral writes
+//   6.  tick_mod_1000 advance       — cadence counter (kept in ISR for
+//                                     correctness; see header comment)
+//   7.  mailbox write + ASAP arm    — handoff to foreground
+//
+// Everything else — synthetic clock advance, diag bookkeeping, 1 Hz
+// edge defer, late-ticks moral equivalent — runs in
+// ocxo_post_isr_asap_callback() at foreground priority.
+//
+// Cadence correctness:
+//   tick_mod_1000 lives in the ISR.  ASAP is allowed to drop samples (the
+//   mailbox overwrites), but the 1 Hz boundary detection is never lost
+//   because the counter advances inside the ISR itself.  When the ISR
+//   detects a 1 Hz boundary it sets emit_one_second=true in the mailbox,
+//   and the ASAP callback chains to ocxo_defer_one_second_edge().
 
-static uint32_t next_ocxo_grid_target_after(uint32_t epoch_counter32,
-                                            uint32_t current_counter32,
-                                            uint32_t interval_counts) {
-  const uint32_t delta = current_counter32 - epoch_counter32;
-  const uint32_t intervals_completed = (delta / interval_counts) + 1U;
-  return epoch_counter32 + intervals_completed * interval_counts;
-}
-
-static uint32_t next_ocxo_second_target_after(uint32_t epoch_counter32,
-                                              uint32_t current_counter32) {
-  return next_ocxo_grid_target_after(epoch_counter32,
-                                     current_counter32,
-                                     OCXO_EDGE_INTERVAL_COUNTS);
-}
-
-static uint32_t next_ocxo_cadence_target_after(uint32_t epoch_counter32,
-                                               uint32_t current_counter32) {
-  return next_ocxo_grid_target_after(epoch_counter32,
-                                     current_counter32,
-                                     OCXO_CADENCE_INTERVAL_COUNTS);
-}
-
-static void ocxo_lane_anchor_clock_to_event(synthetic_clock32_t& clock32,
-                                            uint32_t event_counter32,
-                                            uint16_t event_low16) {
-  synthetic_clock_consume_pending_zero_if_any(clock32);
-  if (!clock32.zeroed) {
-    synthetic_clock_bootstrap_from_hw16(clock32, event_low16);
-  }
-
-  const uint32_t delta = event_counter32 - clock32.current_counter32;
-  clock32.current_counter32 = event_counter32;
-  clock32.current_ns += (uint64_t)delta * 100ULL;
-  clock32.hardware16 = event_low16;
-  clock32.minder_update_count++;  // retained name: now lane-local custody count
-}
-
-static bool ocxo_lane_arm_next_compare(ocxo_lane_t& lane,
-                                       uint32_t next_counter32) {
-  lane.next_cadence_counter32 = next_counter32;
-  lane.compare_target = (uint16_t)(next_counter32 & 0xFFFFU);
-
-  if (!ocxo_lane_program_cadence_compare(lane, lane.compare_target)) {
-    lane.compare_rearm_failure_count++;
-    return false;
-  }
-
-  lane.compare_rearm_count++;
-  lane.scheduler_active = true;
-  return true;
-}
-
-static bool ocxo_lane_start_custody_scheduler(ocxo_lane_t& lane,
-                                              synthetic_clock32_t& clock32) {
-  if (!lane.initialized) return false;
-
-  ocxo_lane_disable_compare(lane);
-
-  const uint16_t hw16 = ocxo_lane_counter_now(lane);
-  synthetic_clock_tend_from_hw16(clock32, hw16);
-  lane.logical_count32_at_last_second = clock32.current_counter32;
-
-  const uint32_t next_counter32 =
-      clock32.current_counter32 + OCXO_CADENCE_INTERVAL_COUNTS;
-
-  lane.phase_bootstrapped = true;
-  lane.bootstrap_count++;
-  return ocxo_lane_arm_next_compare(lane, next_counter32);
-}
-
-static void ocxo_grid_epoch_wait_inc(interrupt_subscriber_kind_t kind) {
-  if (kind == interrupt_subscriber_kind_t::OCXO1) {
-    g_ocxo1_grid_epoch_wait_count++;
-  } else if (kind == interrupt_subscriber_kind_t::OCXO2) {
-    g_ocxo2_grid_epoch_wait_count++;
-  }
-}
-
-static void ocxo_grid_epoch_start_inc(interrupt_subscriber_kind_t kind) {
-  if (kind == interrupt_subscriber_kind_t::OCXO1) {
-    g_ocxo1_grid_epoch_start_count++;
-  } else if (kind == interrupt_subscriber_kind_t::OCXO2) {
-    g_ocxo2_grid_epoch_start_count++;
-  }
-}
-
-static bool ocxo_lane_install_epoch_grid(interrupt_subscriber_kind_t kind,
-                                         ocxo_lane_t& lane,
-                                         synthetic_clock32_t& clock32,
-                                         uint32_t epoch_counter32) {
-  if (!lane.initialized) return false;
-
-  ocxo_lane_disable_compare(lane);
-
-  const uint16_t hw16 = ocxo_lane_counter_now(lane);
-  synthetic_clock_tend_from_hw16(clock32, hw16);
-  lane.logical_count32_at_last_second = clock32.current_counter32;
-
-  lane.grid_epoch_counter32 = epoch_counter32;
-  lane.next_edge_counter32 = next_ocxo_second_target_after(epoch_counter32,
-                                                           clock32.current_counter32);
-  const uint32_t next_cadence = next_ocxo_cadence_target_after(epoch_counter32,
-                                                               clock32.current_counter32);
-  lane.second_grid_valid = true;
-  lane.tick_mod_1000 =
-      ((next_cadence - epoch_counter32) / OCXO_CADENCE_INTERVAL_COUNTS) %
-      OCXO_CADENCE_EVENTS_PER_SECOND;
-
-  ocxo_grid_epoch_start_inc(kind);
-  return ocxo_lane_arm_next_compare(lane, next_cadence);
-}
-
-static void ocxo_schedule_epoch_grid_if_ready(interrupt_subscriber_runtime_t* rt) {
-  if (!rt || !rt->desc) return;
-
-  const interrupt_subscriber_kind_t kind = rt->desc->kind;
-  ocxo_lane_t* lane = ocxo_lane_for(kind);
-  synthetic_clock32_t* clock32 = synthetic_clock_for_kind(kind);
-  if (!lane || !clock32 || !lane->initialized) return;
-
-  if (!g_ocxo_grid_epoch_valid) {
-    ocxo_grid_epoch_wait_inc(kind);
-    return;
-  }
-
-  const uint32_t epoch_counter32 =
-      (kind == interrupt_subscriber_kind_t::OCXO1)
-          ? g_ocxo1_grid_epoch_counter32
-          : g_ocxo2_grid_epoch_counter32;
-
-  (void)ocxo_lane_install_epoch_grid(kind, *lane, *clock32, epoch_counter32);
-}
-
-static void ocxo_lane_reschedule_after_fire(ocxo_lane_t& lane,
-                                            uint32_t fired_counter32,
-                                            uint16_t fired_low16) {
-  const uint16_t now_low16 = ocxo_lane_counter_now(lane);
-  const uint32_t now_counter32 =
-      fired_counter32 + (uint32_t)((uint16_t)(now_low16 - fired_low16));
-
-  uint32_t next = fired_counter32 + OCXO_CADENCE_INTERVAL_COUNTS;
-  uint32_t skipped = 0;
-  while (!counter32_future(next, now_counter32) && skipped < 2048U) {
-    next += OCXO_CADENCE_INTERVAL_COUNTS;
-    skipped++;
-  }
-
-  if (!counter32_future(next, now_counter32)) {
-    // Extreme catch-up fallback: if the ISR was blocked for longer than the
-    // bounded skip loop, restart the custody cadence one interval ahead of the
-    // best lane-local now estimate.  This is a visible integrity event, not a
-    // silent correction.
-    next = now_counter32 + OCXO_CADENCE_INTERVAL_COUNTS;
-    skipped++;
-  }
-
-  if (skipped > 0) {
-    lane.skipped_cadence_count += skipped;
-  }
-
-  if (lane.second_grid_valid) {
-    // If catch-up skipped over an epoch-aligned second target, we cannot emit
-    // it honestly because no ISR-entry DWT was captured at that target.  Advance
-    // the second grid and make the miss visible.
-    while (lane.next_edge_counter32 != 0) {
-      const uint32_t edge_from_fired = lane.next_edge_counter32 - fired_counter32;
-      const uint32_t next_from_fired = next - fired_counter32;
-      if (edge_from_fired != 0 && edge_from_fired < next_from_fired) {
-        lane.next_edge_counter32 += OCXO_EDGE_INTERVAL_COUNTS;
-        lane.missed_second_count++;
-        continue;
-      }
-      break;
-    }
-
-    lane.tick_mod_1000 =
-        ((next - lane.grid_epoch_counter32) / OCXO_CADENCE_INTERVAL_COUNTS) %
-        OCXO_CADENCE_EVENTS_PER_SECOND;
-  }
-
-  (void)ocxo_lane_arm_next_compare(lane, next);
-}
-
-static void ocxo_lane_cadence_isr(ocxo_lane_t& lane,
+static void ocxo_lane_compare_isr(ocxo_lane_t& lane,
                                   interrupt_subscriber_runtime_t* rt,
                                   interrupt_subscriber_kind_t kind,
                                   synthetic_clock32_t& clock32,
+                                  ocxo_deferred_work_t& work,
                                   uint32_t isr_entry_dwt_raw) {
-  if (!ocxo_lane_compare_flag_pending(lane)) {
-    lane.miss_count++;
-    return;
-  }
+  (void)rt;
+  (void)kind;
+  (void)clock32;
+  (void)work;
+  (void)isr_entry_dwt_raw;
 
-  if (!lane.scheduler_active) {
-    ocxo_lane_disable_compare(lane);
-    lane.miss_count++;
-    return;
-  }
-
-  const uint32_t fired_counter32 = lane.next_cadence_counter32;
-  const uint16_t fired_low16 = lane.compare_target;
-  const uint32_t event_dwt = qtimer_event_dwt_from_isr_entry_raw(isr_entry_dwt_raw);
+  // Retired path.  OCXO QTimer compare channels are passive counter domains
+  // now; they must not re-arm themselves or author cadence.  If a stale flag
+  // is observed from a prior image/boot state, clear it and leave the compare
+  // disabled.  CADENCE_MINDER is the sole cadence agent.
+  if (!ocxo_lane_compare_flag_pending(lane)) return;
 
   ocxo_lane_clear_compare_flag(lane);
+  ocxo_lane_disable_compare(lane);
+  lane.miss_count++;
+}
 
-  lane.irq_count++;
-  lane.cadence_hits_total++;
-  lane.last_fired_counter32 = fired_counter32;
-  lane.last_fired_low16 = fired_low16;
-  if (rt) rt->irq_count++;
+// Foreground drain — runs at TimePop ASAP priority, no ISR pressure.
+//
+// Snapshots the mailbox under critical-section guard, then performs all
+// synthetic clock and diagnostic work outside the critical section.
 
-  const uint32_t late_ticks =
-      (uint32_t)((uint16_t)(ocxo_lane_counter_now(lane) - fired_low16));
-  ocxo_lane_update_late_diag(lane, late_ticks);
-  ocxo_lane_record_isr_diag(kind, isr_entry_dwt_raw, event_dwt, late_ticks);
+static void ocxo_post_isr_asap_callback(timepop_ctx_t*,
+                                        timepop_diag_t*,
+                                        void* user_data) {
+  auto* rt = static_cast<interrupt_subscriber_runtime_t*>(user_data);
+  if (!rt || !rt->desc) return;
 
-  ocxo_lane_anchor_clock_to_event(clock32, fired_counter32, fired_low16);
-  lane.logical_count32_at_last_second = fired_counter32;
+  const interrupt_subscriber_kind_t kind = rt->desc->kind;
+  ocxo_post_isr_mailbox_t& mb = ocxo_post_isr_mailbox_for(kind);
 
-  const bool emit_second =
-      lane.second_grid_valid &&
-      lane.active && rt && rt->active &&
-      fired_counter32 == lane.next_edge_counter32;
+  // Snapshot under PRIMASK so an ISR that fires mid-drain cannot tear the
+  // sample we are about to consume.  The ISR may overwrite *after* we exit
+  // this section; that simply queues a fresh ASAP for the next sample.
+  uint32_t isr_entry_dwt_raw;
+  uint32_t event_dwt;
+  uint16_t fired_low16;
+  bool     emit_one_second;
+  bool     had_sample;
 
-  if (emit_second) {
-    lane.edge_hits_total++;
-    lane.second_event_count++;
-    ocxo_edge_fire_inc(kind);
+  __disable_irq();
+  had_sample = mb.pending;
+  if (had_sample) {
+    isr_entry_dwt_raw = mb.isr_entry_dwt_raw;
+    event_dwt         = mb.event_dwt;
+    fired_low16       = mb.fired_low16;
+    emit_one_second   = mb.emit_one_second;
+    mb.pending = false;
+  } else {
+    isr_entry_dwt_raw = 0;
+    event_dwt         = 0;
+    fired_low16       = 0;
+    emit_one_second   = false;
+  }
+  __enable_irq();
 
-    // First-cut OCXO delivery: pass the honest, latency-adjusted, still-
-    // quantized QTimer DWT-at-edge directly to CLOCKS/Alpha.
-    emit_one_second_event(*rt, event_dwt, fired_counter32,
-                          0, false, nullptr, true);
+  if (!had_sample) return;
 
-    lane.next_edge_counter32 += OCXO_EDGE_INTERVAL_COUNTS;
+  ocxo_post_isr_drain_inc(kind);
+
+  ocxo_lane_t* lane = ocxo_lane_for(kind);
+  if (!lane) return;
+
+  // Late-ticks moral equivalent: we are running in foreground, so any
+  // CNTR read here is "drain latency in OCXO ticks", not "ISR-entry-to-
+  // counter ticks".  The diag store retains its existing field shape so
+  // downstream consumers do not see a structural change; the value's
+  // semantics shift from ISR-entry-late to drain-late.
+  const uint32_t drain_ticks =
+      (uint32_t)((uint16_t)(ocxo_lane_counter_now(*lane) - fired_low16));
+
+  ocxo_lane_record_isr_diag(kind, isr_entry_dwt_raw, event_dwt, drain_ticks);
+
+  // Synthetic clock advance — the same arithmetic the ISR used to do.
+  synthetic_clock32_t* clock32 = synthetic_clock_for_kind(kind);
+  if (clock32) {
+    lane->cadence_hits_total++;
+    lane->logical_count32_at_last_second =
+        synthetic_clock_advance_at_hardware(*clock32,
+                                            OCXO_INTERVAL_COUNTS,
+                                            fired_low16);
   }
 
-  ocxo_lane_reschedule_after_fire(lane, fired_counter32, fired_low16);
+  // 1 Hz edge defer — chain into the existing publication path so all
+  // downstream behavior is preserved exactly.
+  if (emit_one_second) {
+    ocxo_deferred_work_t& work =
+        (kind == interrupt_subscriber_kind_t::OCXO1)
+            ? g_ocxo1_deferred
+            : g_ocxo2_deferred;
+    ocxo_defer_one_second_edge(work,
+                               rt,
+                               kind,
+                               event_dwt,
+                               lane->logical_count32_at_last_second);
+  }
 }
 
 static void qtimer2_isr(void) {
-  const uint32_t isr_entry_dwt_raw = ARM_DWT_CYCCNT;
-  ocxo_lane_cadence_isr(g_ocxo1_lane,
-                        g_rt_ocxo1,
-                        interrupt_subscriber_kind_t::OCXO1,
-                        g_ocxo1_clock32,
-                        isr_entry_dwt_raw);
+  // Retired OCXO compare cadence rail.  If a stale flag ever vectors here,
+  // clean and hard-disable it.  Do not re-arm, do not advance synthetic time,
+  // and do not publish an OCXO event.  CADENCE_MINDER is the only cadence
+  // owner now.
+  qtimer2_ch0_disable_compare();
 }
 
 static void qtimer3_isr(void) {
-  const uint32_t isr_entry_dwt_raw = ARM_DWT_CYCCNT;
-  ocxo_lane_cadence_isr(g_ocxo2_lane,
-                        g_rt_ocxo2,
-                        interrupt_subscriber_kind_t::OCXO2,
-                        g_ocxo2_clock32,
-                        isr_entry_dwt_raw);
+  // Retired OCXO compare cadence rail.  If a stale flag ever vectors here,
+  // clean and hard-disable it.  Do not re-arm, do not advance synthetic time,
+  // and do not publish an OCXO event.  CADENCE_MINDER is the only cadence
+  // owner now.
+  qtimer3_disable_compare(3);
 }
 
 // ============================================================================
@@ -2450,32 +2435,24 @@ bool interrupt_start(interrupt_subscriber_kind_t kind) {
     g_vclock_lane.active = true;
     g_vclock_lane.phase_bootstrapped = true;
     g_vclock_lane.tick_mod_1000 = 0;
-    // CADENCE_MINDER is armed once during process_interrupt_init() and tends
-    // only VCLOCK.  Starting VCLOCK must not arm a second cadence slot.
+    // CADENCE_MINDER is armed once during process_interrupt_init() and is the
+    // only 1 ms TimePop cadence source.  Starting VCLOCK must not arm a second
+    // cadence slot.
     return g_cadence_minder_armed || cadence_minder_arm_timepop();
   }
 
   ocxo_lane_t* lane = ocxo_lane_for(kind);
-  synthetic_clock32_t* clock32 = synthetic_clock_for_kind(kind);
-  if (!lane || !clock32 || !lane->initialized) return false;
-
+  if (!lane || !lane->initialized) return false;
   lane->active = true;
   lane->phase_bootstrapped = true;
   lane->tick_mod_1000 = 0;
 
-  // OCXO custody is lane-local and independent of TimePop.  The scheduler is
-  // normally started during process_interrupt_init(); this start path is kept
-  // as a self-healing hook in case the lane was not yet armed.
-  if (!lane->scheduler_active) {
-    (void)ocxo_lane_start_custody_scheduler(*lane, *clock32);
-  }
-
-  // If CLOCKS has already installed the OCXO logical grid, align the private
-  // scheduler to it now.  Otherwise the 1 kHz scheduler keeps rollover custody
-  // only; second-edge emission begins when interrupt_ocxo_logical_grid_epoch()
-  // arrives.
-  ocxo_schedule_epoch_grid_if_ready(rt);
-  return lane->scheduler_active;
+  // OCXO lanes are passive hardware counter domains.  Do not program QTimer
+  // compare targets here; otherwise OCXO1/OCXO2 would implicitly re-enable
+  // their legacy high-frequency cadence through channel matches.
+  ocxo_lane_disable_compare(*lane);
+  lane->compare_target = 0;
+  return g_cadence_minder_armed || cadence_minder_arm_timepop();
 }
 
 bool interrupt_stop(interrupt_subscriber_kind_t kind) {
@@ -2487,52 +2464,20 @@ bool interrupt_stop(interrupt_subscriber_kind_t kind) {
   if (kind == interrupt_subscriber_kind_t::VCLOCK) {
     g_vclock_lane.active = false;
     g_vclock_lane.phase_bootstrapped = false;
-    // Do not cancel CADENCE_MINDER here; it is the system-wide VCLOCK rail.
+    // Do not cancel CADENCE_MINDER here; it is the system-wide substrate
+    // cadence for VCLOCK and the OCXO passive counter domains.
     return true;
   }
-
   ocxo_lane_t* lane = ocxo_lane_for(kind);
   if (!lane) return false;
   lane->active = false;
-  // Keep the private OCXO scheduler alive for rollover custody.  Stopping a
-  // subscriber suppresses events; it does not shut down the lane's synthetic
-  // 32-bit counter maintenance.
+  ocxo_lane_disable_compare(*lane);
   return true;
-}
-
-void interrupt_ocxo_logical_grid_epoch(uint32_t ocxo1_epoch_counter32,
-                                       uint32_t ocxo2_epoch_counter32) {
-  g_ocxo1_grid_epoch_counter32 = ocxo1_epoch_counter32;
-  g_ocxo2_grid_epoch_counter32 = ocxo2_epoch_counter32;
-  g_ocxo_grid_epoch_valid = true;
-
-  if (g_ocxo1_lane.initialized) {
-    (void)ocxo_lane_install_epoch_grid(interrupt_subscriber_kind_t::OCXO1,
-                                       g_ocxo1_lane,
-                                       g_ocxo1_clock32,
-                                       ocxo1_epoch_counter32);
-  }
-
-  if (g_ocxo2_lane.initialized) {
-    (void)ocxo_lane_install_epoch_grid(interrupt_subscriber_kind_t::OCXO2,
-                                       g_ocxo2_lane,
-                                       g_ocxo2_clock32,
-                                       ocxo2_epoch_counter32);
-  }
 }
 
 void interrupt_request_pps_rebootstrap(void) {
   g_pps_rebootstrap_pending = true;
   g_vclock_epoch_latch = vclock_epoch_latch_t{};
-
-  // OCXO custody keeps running, but the one-second emission grid belongs to
-  // CLOCKS and must be reinstalled after the new logical zero is selected.
-  g_ocxo_grid_epoch_valid = false;
-  g_ocxo1_lane.second_grid_valid = false;
-  g_ocxo2_lane.second_grid_valid = false;
-  g_ocxo1_lane.next_edge_counter32 = 0;
-  g_ocxo2_lane.next_edge_counter32 = 0;
-
   // Rebootstrap selects a fresh PPS_VCLOCK edge identity.
   g_pvc_anchor_reset_pending = true;
 }
@@ -2549,14 +2494,7 @@ const interrupt_capture_diag_t* interrupt_last_diag(interrupt_subscriber_kind_t 
   return (!rt || !rt->has_fired) ? nullptr : &rt->last_diag;
 }
 
-void interrupt_service_deferred_events(void) {
-  // Retired compatibility hook.  OCXO one-second events dispatch directly
-  // from the lane-local QTimer ISR path; no deferred mailbox remains.
-}
-
-void interrupt_prespin_service(timepop_ctx_t*, timepop_diag_t*, void*) {
-  interrupt_service_deferred_events();
-}
+void interrupt_prespin_service(timepop_ctx_t*, timepop_diag_t*, void*) {}
 
 // ============================================================================
 // Hardware + runtime init
@@ -2740,6 +2678,10 @@ void process_interrupt_init(void) {
   g_qtimer3_last_ch3_dwt_raw = 0;
   g_qtimer3_last_ch3_event_dwt = 0;
   g_qtimer3_last_ch3_dwt_coordinate_source = OCXO_DWT_SOURCE_NONE;
+  g_ocxo_deferred_asap_arm_count = 0;
+  g_ocxo_deferred_asap_overwrite_count = 0;
+  g_ocxo_deferred_sample_count = 0;
+  g_ocxo_deferred_edge_count = 0;
   g_cadence_minder_armed = false;
   g_cadence_minder_arm_count = 0;
   g_cadence_minder_arm_failures = 0;
@@ -2753,63 +2695,9 @@ void process_interrupt_init(void) {
   g_cadence_minder_last_vclock_counter32 = 0;
   g_cadence_minder_last_ocxo1_counter32 = 0;
   g_cadence_minder_last_ocxo2_counter32 = 0;
-  g_ocxo1_edge_fire_count = 0;
-  g_ocxo2_edge_fire_count = 0;
-  g_ocxo1_lane.active = false;
-  g_ocxo1_lane.scheduler_active = false;
-  g_ocxo1_lane.second_grid_valid = false;
-  g_ocxo1_lane.phase_bootstrapped = false;
-  g_ocxo1_lane.compare_target = 0;
-  g_ocxo1_lane.next_cadence_counter32 = 0;
-  g_ocxo1_lane.grid_epoch_counter32 = 0;
-  g_ocxo1_lane.next_edge_counter32 = 0;
-  g_ocxo1_lane.tick_mod_1000 = 0;
-  g_ocxo1_lane.irq_count = 0;
-  g_ocxo1_lane.miss_count = 0;
-  g_ocxo1_lane.bootstrap_count = 0;
-  g_ocxo1_lane.cadence_hits_total = 0;
-  g_ocxo1_lane.edge_hits_total = 0;
-  g_ocxo1_lane.second_event_count = 0;
-  g_ocxo1_lane.late_max_ticks = 0;
-  g_ocxo1_lane.last_late_ticks = 0;
-  g_ocxo1_lane.skipped_cadence_count = 0;
-  g_ocxo1_lane.missed_second_count = 0;
-  g_ocxo1_lane.compare_rearm_count = 0;
-  g_ocxo1_lane.compare_rearm_failure_count = 0;
-  g_ocxo1_lane.last_fired_counter32 = 0;
-  g_ocxo1_lane.last_fired_low16 = 0;
+  g_ocxo1_deferred = ocxo_deferred_work_t{};
+  g_ocxo2_deferred = ocxo_deferred_work_t{};
 
-  g_ocxo2_lane.active = false;
-  g_ocxo2_lane.scheduler_active = false;
-  g_ocxo2_lane.second_grid_valid = false;
-  g_ocxo2_lane.phase_bootstrapped = false;
-  g_ocxo2_lane.compare_target = 0;
-  g_ocxo2_lane.next_cadence_counter32 = 0;
-  g_ocxo2_lane.grid_epoch_counter32 = 0;
-  g_ocxo2_lane.next_edge_counter32 = 0;
-  g_ocxo2_lane.tick_mod_1000 = 0;
-  g_ocxo2_lane.irq_count = 0;
-  g_ocxo2_lane.miss_count = 0;
-  g_ocxo2_lane.bootstrap_count = 0;
-  g_ocxo2_lane.cadence_hits_total = 0;
-  g_ocxo2_lane.edge_hits_total = 0;
-  g_ocxo2_lane.second_event_count = 0;
-  g_ocxo2_lane.late_max_ticks = 0;
-  g_ocxo2_lane.last_late_ticks = 0;
-  g_ocxo2_lane.skipped_cadence_count = 0;
-  g_ocxo2_lane.missed_second_count = 0;
-  g_ocxo2_lane.compare_rearm_count = 0;
-  g_ocxo2_lane.compare_rearm_failure_count = 0;
-  g_ocxo2_lane.last_fired_counter32 = 0;
-  g_ocxo2_lane.last_fired_low16 = 0;
-
-  g_ocxo_grid_epoch_valid = false;
-  g_ocxo1_grid_epoch_counter32 = 0;
-  g_ocxo2_grid_epoch_counter32 = 0;
-  g_ocxo1_grid_epoch_start_count = 0;
-  g_ocxo2_grid_epoch_start_count = 0;
-  g_ocxo1_grid_epoch_wait_count = 0;
-  g_ocxo2_grid_epoch_wait_count = 0;
   g_interrupt_runtime_ready = true;
   (void)cadence_minder_arm_timepop();
 }
@@ -2826,37 +2714,10 @@ void process_interrupt_enable_irqs(void) {
 
   attachInterruptVector(IRQ_QTIMER2, qtimer2_isr);
   NVIC_SET_PRIORITY(IRQ_QTIMER2, 16);
+  NVIC_ENABLE_IRQ(IRQ_QTIMER2);
 
   attachInterruptVector(IRQ_QTIMER3, qtimer3_isr);
   NVIC_SET_PRIORITY(IRQ_QTIMER3, 16);
-
-  // Start the OCXO private 1 kHz custody schedulers immediately before their
-  // NVIC lines go live.  They do not emit second events until CLOCKS installs
-  // the OCXO logical grid, but they do maintain 16-bit rollover custody.
-  if (g_interrupt_hw_ready) {
-    if (g_ocxo1_lane.initialized) {
-      if (g_ocxo_grid_epoch_valid) {
-        (void)ocxo_lane_install_epoch_grid(interrupt_subscriber_kind_t::OCXO1,
-                                           g_ocxo1_lane,
-                                           g_ocxo1_clock32,
-                                           g_ocxo1_grid_epoch_counter32);
-      } else {
-        (void)ocxo_lane_start_custody_scheduler(g_ocxo1_lane, g_ocxo1_clock32);
-      }
-    }
-    if (g_ocxo2_lane.initialized) {
-      if (g_ocxo_grid_epoch_valid) {
-        (void)ocxo_lane_install_epoch_grid(interrupt_subscriber_kind_t::OCXO2,
-                                           g_ocxo2_lane,
-                                           g_ocxo2_clock32,
-                                           g_ocxo2_grid_epoch_counter32);
-      } else {
-        (void)ocxo_lane_start_custody_scheduler(g_ocxo2_lane, g_ocxo2_clock32);
-      }
-    }
-  }
-
-  NVIC_ENABLE_IRQ(IRQ_QTIMER2);
   NVIC_ENABLE_IRQ(IRQ_QTIMER3);
 
   pinMode(GNSS_PPS_PIN, INPUT);
@@ -2904,29 +2765,11 @@ static Payload cmd_report(const Payload&) {
   p.add("runtime_ready",  g_interrupt_runtime_ready);
   p.add("irqs_enabled",   g_interrupt_irqs_enabled);
   p.add("subscriber_count", g_subscriber_count);
-  p.add("vclock_timepop_cadence_minder", true);
-  p.add("cadence_minder_tends_vclock_only", true);
-  p.add("ocxo_timepop_arm_retired", true);
-  p.add("ocxo_timepop_post_isr_retired", true);
-  p.add("ocxo_edges_authored_by_qtimer_isr", true);
-  p.add("ocxo_edges_armed_by_timepop", false);
-  p.add("ocxo_scheduler_model", "LANE_LOCAL_1KHZ_QTIMER_COMPARE");
-  p.add("ocxo_cadence_interval_counts", (uint32_t)OCXO_CADENCE_INTERVAL_COUNTS);
-  p.add("ocxo_cadence_events_per_second", (uint32_t)OCXO_CADENCE_EVENTS_PER_SECOND);
-  p.add("ocxo_edge_interval_counts", (uint32_t)OCXO_EDGE_INTERVAL_COUNTS);
-  p.add("ocxo_edge_tick_to_gnss_ns_estimate", 100U);
-  p.add("ocxo_deferred_dispatch_uses_timepop", false);
-  p.add("ocxo_deferred_dispatch_uses_prespin", false);
-  p.add("ocxo_direct_dispatch_from_qtimer_isr", true);
-  p.add("ocxo_prespin_service_retired", true);
-  p.add("ocxo_quad_timer_dwt_quantization_uncompensated", true);
-  p.add("ocxo_grid_epoch_valid", g_ocxo_grid_epoch_valid);
-  p.add("ocxo1_grid_epoch_counter32", g_ocxo1_grid_epoch_counter32);
-  p.add("ocxo2_grid_epoch_counter32", g_ocxo2_grid_epoch_counter32);
-  p.add("ocxo1_grid_epoch_start_count", g_ocxo1_grid_epoch_start_count);
-  p.add("ocxo2_grid_epoch_start_count", g_ocxo2_grid_epoch_start_count);
-  p.add("ocxo1_grid_epoch_wait_count", g_ocxo1_grid_epoch_wait_count);
-  p.add("ocxo2_grid_epoch_wait_count", g_ocxo2_grid_epoch_wait_count);
+  p.add("single_cadence_agent", true);
+  p.add("cadence_minder_isr_mode", true);
+  p.add("vclock_cadence_retired", true);
+  p.add("ocxo_legacy_compare_cadence_retired", true);
+  p.add("ocxo_compare_live_requires_enabled_and_flag", true);
   p.add("cadence_minder_period_ns", (uint64_t)CADENCE_MINDER_PERIOD_NS);
   p.add("cadence_minder_armed", g_cadence_minder_armed);
   p.add("cadence_minder_arm_count", g_cadence_minder_arm_count);
@@ -2954,37 +2797,12 @@ static Payload cmd_report(const Payload&) {
   p.add("ocxo2_active", g_rt_ocxo2 ? g_rt_ocxo2->active : false);
   p.add("ocxo2_event_count", g_rt_ocxo2 ? g_rt_ocxo2->event_count : 0U);
   p.add("ocxo2_dispatch_count", g_rt_ocxo2 ? g_rt_ocxo2->dispatch_count : 0U);
-  p.add("ocxo1_scheduler_active", g_ocxo1_lane.scheduler_active);
-  p.add("ocxo1_second_grid_valid", g_ocxo1_lane.second_grid_valid);
-  p.add("ocxo1_next_cadence_counter32", g_ocxo1_lane.next_cadence_counter32);
-  p.add("ocxo1_next_edge_counter32", g_ocxo1_lane.next_edge_counter32);
-  p.add("ocxo1_grid_epoch_counter32_lane", g_ocxo1_lane.grid_epoch_counter32);
-  p.add("ocxo1_edge_fire_count", g_ocxo1_edge_fire_count);
-  p.add("ocxo1_second_event_count", g_ocxo1_lane.second_event_count);
-  p.add("ocxo1_late_max_ticks", g_ocxo1_lane.late_max_ticks);
-  p.add("ocxo1_last_late_ticks", g_ocxo1_lane.last_late_ticks);
-  p.add("ocxo1_skipped_cadence_count", g_ocxo1_lane.skipped_cadence_count);
-  p.add("ocxo1_missed_second_count", g_ocxo1_lane.missed_second_count);
-  p.add("ocxo1_compare_rearm_count", g_ocxo1_lane.compare_rearm_count);
-  p.add("ocxo1_compare_rearm_failure_count", g_ocxo1_lane.compare_rearm_failure_count);
-  p.add("ocxo1_last_fired_counter32", g_ocxo1_lane.last_fired_counter32);
-  p.add("ocxo1_last_fired_low16", (uint32_t)g_ocxo1_lane.last_fired_low16);
-
-  p.add("ocxo2_scheduler_active", g_ocxo2_lane.scheduler_active);
-  p.add("ocxo2_second_grid_valid", g_ocxo2_lane.second_grid_valid);
-  p.add("ocxo2_next_cadence_counter32", g_ocxo2_lane.next_cadence_counter32);
-  p.add("ocxo2_next_edge_counter32", g_ocxo2_lane.next_edge_counter32);
-  p.add("ocxo2_grid_epoch_counter32_lane", g_ocxo2_lane.grid_epoch_counter32);
-  p.add("ocxo2_edge_fire_count", g_ocxo2_edge_fire_count);
-  p.add("ocxo2_second_event_count", g_ocxo2_lane.second_event_count);
-  p.add("ocxo2_late_max_ticks", g_ocxo2_lane.late_max_ticks);
-  p.add("ocxo2_last_late_ticks", g_ocxo2_lane.last_late_ticks);
-  p.add("ocxo2_skipped_cadence_count", g_ocxo2_lane.skipped_cadence_count);
-  p.add("ocxo2_missed_second_count", g_ocxo2_lane.missed_second_count);
-  p.add("ocxo2_compare_rearm_count", g_ocxo2_lane.compare_rearm_count);
-  p.add("ocxo2_compare_rearm_failure_count", g_ocxo2_lane.compare_rearm_failure_count);
-  p.add("ocxo2_last_fired_counter32", g_ocxo2_lane.last_fired_counter32);
-  p.add("ocxo2_last_fired_low16", (uint32_t)g_ocxo2_lane.last_fired_low16);
+  p.add("ocxo1_post_isr_arm_count",       g_ocxo1_post_isr_arm_count);
+  p.add("ocxo1_post_isr_drain_count",     g_ocxo1_post_isr_drain_count);
+  p.add("ocxo1_post_isr_overwrite_count", g_ocxo1_post_isr_overwrite_count);
+  p.add("ocxo2_post_isr_arm_count",       g_ocxo2_post_isr_arm_count);
+  p.add("ocxo2_post_isr_drain_count",     g_ocxo2_post_isr_drain_count);
+  p.add("ocxo2_post_isr_overwrite_count", g_ocxo2_post_isr_overwrite_count);
 
   p.add("pps_rebootstrap_pending", g_pps_rebootstrap_pending);
   p.add("pps_rebootstrap_count",   g_pps_rebootstrap_count);
@@ -3065,9 +2883,7 @@ static Payload cmd_report(const Payload&) {
   p.add("ocxo1_miss_count",         g_ocxo1_lane.miss_count);
   p.add("ocxo1_bootstrap_count",    g_ocxo1_lane.bootstrap_count);
   p.add("ocxo1_cadence_hits_total", g_ocxo1_lane.cadence_hits_total);
-  p.add("ocxo1_edge_hits_total", g_ocxo1_lane.edge_hits_total);
   p.add("ocxo1_compare_target",     (uint32_t)g_ocxo1_lane.compare_target);
-  p.add("ocxo1_next_edge_counter32", g_ocxo1_lane.next_edge_counter32);
   p.add("ocxo1_tick_mod_1000",      g_ocxo1_lane.tick_mod_1000);
   p.add("ocxo1_logical_count32",    g_ocxo1_lane.logical_count32_at_last_second);
 
@@ -3075,9 +2891,7 @@ static Payload cmd_report(const Payload&) {
   p.add("ocxo2_miss_count",         g_ocxo2_lane.miss_count);
   p.add("ocxo2_bootstrap_count",    g_ocxo2_lane.bootstrap_count);
   p.add("ocxo2_cadence_hits_total", g_ocxo2_lane.cadence_hits_total);
-  p.add("ocxo2_edge_hits_total", g_ocxo2_lane.edge_hits_total);
   p.add("ocxo2_compare_target",     (uint32_t)g_ocxo2_lane.compare_target);
-  p.add("ocxo2_next_edge_counter32", g_ocxo2_lane.next_edge_counter32);
   p.add("ocxo2_tick_mod_1000",      g_ocxo2_lane.tick_mod_1000);
   p.add("ocxo2_logical_count32",    g_ocxo2_lane.logical_count32_at_last_second);
 
@@ -3180,6 +2994,15 @@ static Payload cmd_report(const Payload&) {
   p.add("qtimer3_last_ch3_dwt_raw", g_qtimer3_last_ch3_dwt_raw);
   p.add("qtimer3_last_ch3_event_dwt", g_qtimer3_last_ch3_event_dwt);
   p.add("qtimer3_last_ch3_dwt_coordinate_source", g_qtimer3_last_ch3_dwt_coordinate_source);
+
+  p.add("ocxo_deferred_asap_arm_count", g_ocxo_deferred_asap_arm_count);
+  p.add("ocxo_deferred_asap_overwrite_count", g_ocxo_deferred_asap_overwrite_count);
+  p.add("ocxo_deferred_sample_count", g_ocxo_deferred_sample_count);
+  p.add("ocxo_deferred_edge_count", g_ocxo_deferred_edge_count);
+  p.add("ocxo1_deferred_sample_pending", false);
+  p.add("ocxo1_deferred_edge_pending", g_ocxo1_deferred.edge_pending);
+  p.add("ocxo2_deferred_sample_pending", false);
+  p.add("ocxo2_deferred_edge_pending", g_ocxo2_deferred.edge_pending);
 
   return p;
 }

@@ -76,9 +76,11 @@ set(ZPNET_SOURCES
     process_system.cpp
     process_timepop.cpp
     process_witness.cpp
-        publish.cpp
+    process_time.cpp
+    publish.cpp
     teensy.cpp
-        transport.cpp
+    timebase.cpp
+    transport.cpp
     util.cpp
     teensy.ino
     time.cpp
@@ -105,8 +107,10 @@ set(ZPNET_HEADERS
     process_system.h
     process_timepop.h
     process_witness.h
-        publish.h
-        timepop.h
+    process_time.h
+    publish.h
+    timebase.h
+    timepop.h
     transport.h
     util.h
     zpnet_pins.h

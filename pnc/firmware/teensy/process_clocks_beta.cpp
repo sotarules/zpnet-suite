@@ -53,6 +53,7 @@
 #include "process_interrupt.h"
 
 #include "debug.h"
+#include "timebase.h"
 #include "time.h"
 
 #include "payload.h"
@@ -459,11 +460,6 @@ static void payload_add_lane_forensics_flat(Payload& p,
   add_u32("forensics_last_event_dwt", valid ? f.last_event_dwt : 0U);
   add_u32("alpha_event_last_event_dwt", valid ? f.last_event_dwt : 0U);  // raw_cycles alias
   add_u32("forensics_last_event_counter32", valid ? f.last_event_counter32 : 0U);
-  add_u32("previous_edge_dwt", valid ? f.previous_edge_dwt : 0U);
-  add_u32("last_edge_dwt", valid ? f.last_edge_dwt : 0U);
-  add_u64("previous_edge_gnss_ns", valid ? f.previous_edge_gnss_ns : 0ULL);
-  add_u64("last_edge_gnss_ns", valid ? f.last_edge_gnss_ns : 0ULL);
-  add_u32("completed_interval_count", valid ? f.completed_interval_count : 0U);
   add_u32("forensics_dwt_cycles_between_edges", valid ? f.dwt_cycles_between_edges : 0U);
   add_u64("forensics_ns_between_edges", valid ? f.ns_between_edges : 0ULL);
   add_i64("forensics_second_residual_ns", valid ? f.second_residual_ns : 0LL);
@@ -516,13 +512,6 @@ struct now_window_t {
 
 static now_window_t g_now_window_ocxo1 = {};
 static now_window_t g_now_window_ocxo2 = {};
-
-// Edge-authored OCXO residuals may be carried by more than one TIMEBASE row
-// if the OCXO edge lands after the PPS/VCLOCK publication boundary.  Beta
-// therefore updates OCXO Welfords only once per newly completed lane-local
-// interval.
-static uint32_t g_ocxo1_welford_last_interval_count = 0;
-static uint32_t g_ocxo2_welford_last_interval_count = 0;
 
 static void now_window_reset(now_window_t& w) {
   for (uint32_t i = 0; i < NOW_WINDOW_SIZE; i++) w.samples[i] = 0;
@@ -688,6 +677,7 @@ static void ocxo_dac_schedule_paced_commit(void) {
 // ============================================================================
 
 void clocks_zero_all(void) {
+  timebase_invalidate();
 
   campaign_seconds = 0;
 
@@ -712,8 +702,6 @@ void clocks_zero_all(void) {
 
   now_window_reset(g_now_window_ocxo1);
   now_window_reset(g_now_window_ocxo2);
-  g_ocxo1_welford_last_interval_count = 0;
-  g_ocxo2_welford_last_interval_count = 0;
 }
 
 // ============================================================================
@@ -825,6 +813,7 @@ static void clocks_force_stop_campaign(void) {
   calibrate_ocxo_mode = servo_mode_t::OFF;
   ocxo_dac_pacing_abort_all();
   campaign_warmup_reset();
+  timebase_invalidate();
 }
 
 static void clocks_watchdog_anomaly_callback(timepop_ctx_t*, timepop_diag_t*, void*) {
@@ -910,6 +899,7 @@ void clocks_beta_pps(void) {
     calibrate_ocxo_mode = servo_mode_t::OFF;
     ocxo_dac_pacing_abort_all();
     campaign_warmup_reset();
+    timebase_invalidate();
     return;
   }
 
@@ -980,24 +970,16 @@ void clocks_beta_pps(void) {
   // OCXO measurement Welfords use the Alpha-authored measured GNSS interval,
   // not the counter-derived nominal interval. Positive residual means the
   // OCXO one-second edge arrived early / the OCXO is running fast versus VCLOCK.
-  if (g_ocxo1_measurement.gnss_ns_between_edges != 0 &&
-      g_ocxo1_measurement.completed_interval_count !=
-          g_ocxo1_welford_last_interval_count) {
+  if (g_ocxo1_measurement.gnss_ns_between_edges != 0) {
     const int64_t residual_fast_ns = g_ocxo1_measurement.second_residual_ns;
     welford_update(welford_ocxo1, (double)residual_fast_ns);
     now_window_push(g_now_window_ocxo1, residual_fast_ns);
-    g_ocxo1_welford_last_interval_count =
-        g_ocxo1_measurement.completed_interval_count;
   }
 
-  if (g_ocxo2_measurement.gnss_ns_between_edges != 0 &&
-      g_ocxo2_measurement.completed_interval_count !=
-          g_ocxo2_welford_last_interval_count) {
+  if (g_ocxo2_measurement.gnss_ns_between_edges != 0) {
     const int64_t residual_fast_ns = g_ocxo2_measurement.second_residual_ns;
     welford_update(welford_ocxo2, (double)residual_fast_ns);
     now_window_push(g_now_window_ocxo2, residual_fast_ns);
-    g_ocxo2_welford_last_interval_count =
-        g_ocxo2_measurement.completed_interval_count;
   }
 
   // PPS witness statistics are owned by the witness/PPS_PHASE path.
@@ -1082,11 +1064,6 @@ void clocks_beta_pps(void) {
 
   // VCLOCK surface — authored facts + per-edge measurement + window accounting.
   p.add("vclock_gnss_ns_at_pps_vclock", public_gnss_ns);
-  p.add("vclock_previous_edge_dwt", g_vclock_measurement.previous_edge_dwt);
-  p.add("vclock_last_edge_dwt", g_vclock_measurement.last_edge_dwt);
-  p.add("vclock_previous_edge_gnss_ns", g_vclock_measurement.previous_edge_gnss_ns);
-  p.add("vclock_last_edge_gnss_ns", g_vclock_measurement.last_edge_gnss_ns);
-  p.add("vclock_completed_interval_count", g_vclock_measurement.completed_interval_count);
   p.add("vclock_gnss_ns_between_edges", g_vclock_measurement.gnss_ns_between_edges);
   p.add("vclock_dwt_cycles_between_edges", g_vclock_measurement.dwt_cycles_between_edges);
   p.add("vclock_second_residual_ns", g_vclock_measurement.second_residual_ns);
@@ -1099,12 +1076,6 @@ void clocks_beta_pps(void) {
   // OCXO1 surface.
   p.add("ocxo1_measured_gnss_ns_at_pps_vclock", public_ocxo1_ns);
   p.add("ocxo1_ns_at_pps_vclock", public_ocxo1_ns);  // legacy alias
-  p.add("ocxo1_previous_edge_dwt", g_ocxo1_measurement.previous_edge_dwt);
-  p.add("ocxo1_last_edge_dwt", g_ocxo1_measurement.last_edge_dwt);
-  p.add("ocxo1_previous_edge_gnss_ns", g_ocxo1_measurement.previous_edge_gnss_ns);
-  p.add("ocxo1_last_edge_gnss_ns", g_ocxo1_measurement.last_edge_gnss_ns);
-  p.add("ocxo1_completed_interval_count", g_ocxo1_measurement.completed_interval_count);
-  p.add("ocxo1_welford_last_interval_count", g_ocxo1_welford_last_interval_count);
   p.add("ocxo1_gnss_ns_between_edges", g_ocxo1_measurement.gnss_ns_between_edges);
   p.add("ocxo1_counter_nominal_ns_between_edges",
         ocxo1_forensics_valid ? ocxo1_forensics.counter_nominal_ns_between_edges : 0ULL);
@@ -1126,12 +1097,6 @@ void clocks_beta_pps(void) {
   // OCXO2 surface.
   p.add("ocxo2_measured_gnss_ns_at_pps_vclock", public_ocxo2_ns);
   p.add("ocxo2_ns_at_pps_vclock", public_ocxo2_ns);  // legacy alias
-  p.add("ocxo2_previous_edge_dwt", g_ocxo2_measurement.previous_edge_dwt);
-  p.add("ocxo2_last_edge_dwt", g_ocxo2_measurement.last_edge_dwt);
-  p.add("ocxo2_previous_edge_gnss_ns", g_ocxo2_measurement.previous_edge_gnss_ns);
-  p.add("ocxo2_last_edge_gnss_ns", g_ocxo2_measurement.last_edge_gnss_ns);
-  p.add("ocxo2_completed_interval_count", g_ocxo2_measurement.completed_interval_count);
-  p.add("ocxo2_welford_last_interval_count", g_ocxo2_welford_last_interval_count);
   p.add("ocxo2_gnss_ns_between_edges", g_ocxo2_measurement.gnss_ns_between_edges);
   p.add("ocxo2_counter_nominal_ns_between_edges",
         ocxo2_forensics_valid ? ocxo2_forensics.counter_nominal_ns_between_edges : 0ULL);
@@ -1397,11 +1362,6 @@ static void add_alpha_event_payload(Payload& p,
   p.add("update_count", f.update_count);
   p.add("last_event_dwt", f.last_event_dwt);
   p.add("last_event_counter32", f.last_event_counter32);
-  p.add("previous_edge_dwt", f.previous_edge_dwt);
-  p.add("last_edge_dwt", f.last_edge_dwt);
-  p.add("previous_edge_gnss_ns", f.previous_edge_gnss_ns);
-  p.add("last_edge_gnss_ns", f.last_edge_gnss_ns);
-  p.add("completed_interval_count", f.completed_interval_count);
   p.add("zero_offset_valid", f.zero_offset_valid);
   p.add("zero_offset_counter32", f.zero_offset_counter32);
   p.add("counter32_delta_since_zero_offset", f.counter32_delta_since_zero_offset);
@@ -1675,10 +1635,19 @@ static const process_command_entry_t CLOCKS_COMMANDS[] = {
   { nullptr,          nullptr           }
 };
 
+static const process_subscription_entry_t CLOCKS_SUBSCRIPTIONS[] = {
+  { "TIMEBASE_FRAGMENT", on_timebase_fragment },
+  { nullptr, nullptr },
+};
+
+const process_subscription_entry_t* timebase_subscriptions(void) {
+  return CLOCKS_SUBSCRIPTIONS;
+}
+
 static const process_vtable_t CLOCKS_PROCESS = {
   .process_id    = "CLOCKS",
   .commands      = CLOCKS_COMMANDS,
-  .subscriptions = nullptr
+  .subscriptions = CLOCKS_SUBSCRIPTIONS
 };
 
 void process_clocks_register(void) {

@@ -9,15 +9,18 @@
 // time.h -- Transitional TIME interface
 // ============================================================================
 //
-// time.cpp is the sole owner of TIME state and conversion surfaces.
+// This header intentionally supports two worlds during migration:
 //
-// Canonical conversion calls do not read DWT. The caller supplies an authored
-// DWT coordinate, normally captured by an ISR and latency-normalized before it
-// reaches TIME. Legacy diagnostic helpers that imply "now" remain only for
-// compatibility and must not be used for TIMEBASE authorship.
+//   1. Legacy process_time.cpp still owns its existing stateful anchor and
+//      dynamic-CPS surfaces so the current firmware continues to build/run.
 //
-// process_time.cpp/process_time.h have been retired; declarations retained here
-// are compatibility surfaces owned by time.cpp.
+//   2. New code should use the six stateless facade calls near the middle of
+//      this file.  Those calls do not expose anchors, do not install anchors,
+//      and do not read DWT.  The caller supplies the DWT coordinate; time.cpp
+//      asks CLOCKS/Gamma for the current clock facts and performs projection.
+//
+// The legacy declarations below are preserved only so process_time.cpp and the
+// current call sites remain compatible while callers are migrated.
 // ============================================================================
 
 struct time_anchor_snapshot_t {
@@ -243,7 +246,7 @@ struct time_prediction_detail_snapshot_t {
 };
 
 // ============================================================================
-// Clock identity shared by CLOCKS and TIME.
+// Clock identity shared by CLOCKS, Gamma, legacy process_time, and new TIME.
 // ============================================================================
 
 enum class time_clock_id_t : uint8_t {
@@ -267,45 +270,17 @@ struct time_clock_snapshot_t {
 };
 
 // ============================================================================
-// Canonical facade: authored DWT <-> clock-domain nanoseconds.
+// New stateless facade: DWT <-> clock-domain nanoseconds.
 // ============================================================================
 //
-// These calls do not expose mutable internal state to callers. The caller
-// supplies a carefully authored DWT coordinate; time.cpp uses its latest
-// CLOCKS-fed per-clock projection basis and performs only projection math.
+// These calls do not expose anchor/basis structures.  The caller supplies the
+// carefully authored DWT coordinate; time.cpp reads CLOCKS/Gamma facts and does
+// only projection math.
 //
-// The GNSS DWT->ns signature remains int64_t for compatibility with older
-// callers. New code may treat non-negative results as uint64_t.
-
-
-struct time_clock_projection_t {
-  time_clock_id_t clock = time_clock_id_t::NONE;
-  bool     valid = false;
-  bool     basis_is_live = false;
-  uint32_t dwt_at_update = 0;
-  uint64_t ns_at_update = 0;
-  uint32_t dwt_cycles_per_second = 0;
-  uint32_t update_count = 0;
-  uint32_t last_observed_dwt_cycles = 0;
-  uint64_t last_observed_ns = 0;
-  int32_t  last_prediction_residual_cycles = 0;
-};
-
-bool time_clock_projection(time_clock_id_t clock,
-                           time_clock_projection_t* out);
-bool time_clock_ns_at_dwt(time_clock_id_t clock,
-                          uint32_t authored_dwt_cycle_count,
-                          uint64_t* out_ns);
-bool time_clock_dwt_at_ns(time_clock_id_t clock,
-                          uint64_t clock_ns,
-                          uint32_t* out_dwt_cycle_count);
-uint64_t time_dwt_to_clock_ns(time_clock_id_t clock,
-                              uint32_t authored_dwt_cycle_count);
-uint32_t time_clock_ns_to_dwt(time_clock_id_t clock,
-                              uint64_t clock_ns);
-
-uint64_t time_dwt_to_vclock_ns(uint32_t authored_dwt_cycle_count);
-uint32_t time_vclock_ns_to_dwt(uint64_t vclock_ns);
+// The GNSS DWT->ns signature is intentionally kept as int64_t during the
+// bridge period because legacy process_time.cpp already defines that exact
+// symbol.  New code may treat non-negative results as uint64_t.  After the
+// legacy owner is removed, this can be tightened to uint64_t everywhere.
 
 int64_t  time_dwt_to_gnss_ns(uint32_t dwt_cycle_count);
 uint64_t time_dwt_to_ocxo1_ns(uint32_t dwt_cycle_count);
@@ -315,7 +290,7 @@ uint32_t time_gnss_ns_to_dwt(int64_t gnss_ns);      // legacy signed form
 uint32_t time_ocxo1_ns_to_dwt(uint64_t ocxo1_ns);
 uint32_t time_ocxo2_ns_to_dwt(uint64_t ocxo2_ns);
 
-// Compatibility stateful TIME API retained during migration.
+// Legacy stateful process_time API retained during migration.
 int64_t time_gnss_ns_now(void);
 int64_t time_dwt_to_gnss_ns(uint32_t dwt_cyccnt,
                             uint32_t anchor_dwt_at_pps_vclock,
@@ -330,6 +305,9 @@ bool time_clock_epoch_reset(time_clock_id_t clock,
 bool time_clock_update(time_clock_id_t clock,
                        uint32_t dwt_at_update,
                        uint64_t ns_at_update);
+bool time_clock_ns_at_dwt(time_clock_id_t clock,
+                          uint32_t dwt_cyccnt,
+                          uint64_t* out_ns);
 bool time_clock_snapshot(time_clock_id_t clock,
                          time_clock_snapshot_t* out);
 
@@ -368,7 +346,7 @@ void     time_dynamic_cps_phase_probe_update(
     uint32_t adjusted_difference_cycles,
     uint32_t phase_offset_cycles);
 
-// PPS/VCLOCK compatibility anchor hooks. CLOCKS feeds these; time.cpp owns the state.
+// Legacy PPS/VCLOCK anchor hooks retained until CLOCKS fully owns this state.
 void time_pps_vclock_epoch_reset(uint32_t dwt_at_pps_vclock,
                                  uint32_t counter32_at_pps_vclock);
 void time_pps_vclock_update(uint32_t dwt_at_pps_vclock,
@@ -381,4 +359,3 @@ void time_pps_vclock_update(uint32_t dwt_at_pps_vclock,
 
 bool     time_valid(void);
 uint32_t time_pps_count(void);
-void time_init(void);

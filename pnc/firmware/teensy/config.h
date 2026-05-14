@@ -4,6 +4,8 @@
 #include <cstddef>
 
 #define ZPNET_SERIAL Serial
+#define FW_VERSION_STR "zpnet-teensy-5.2.0"
+static constexpr const char* FW_VERSION = FW_VERSION_STR;
 
 // -------------------------------------------------------------
 // Transport backend selection (runtime)
@@ -34,9 +36,9 @@ static constexpr uint64_t NS_PER_MICROSECOND = 1000ULL;
 // for ISR-level residual computation and PPS edge validation.
 //
 // All three domains count at 10 MHz (100 ns per tick):
-//   GNSS VCLOCK on QTimer1 ch0 low-word (single-edge, CM=1)
-//   OCXO1 on QTimer2 ch0             (single-edge, CM=1)
-//   OCXO2 on QTimer3 ch3             (single-edge, CM=1)
+//   GNSS VCLOCK on QTimer1 ch0+ch1 (single-edge, CM=1)
+//   OCXO1 on GPT1 (single-edge)
+//   OCXO2 on GPT2 (single-edge)
 //
 
 // Expected ticks per PPS second at 10 MHz
@@ -51,12 +53,6 @@ static constexpr uint32_t NS_PER_10MHZ_TICK = 100U;
 static constexpr uint32_t PPS_VCLOCK_TOLERANCE = 100;
 
 static constexpr uint32_t VCLOCK_COUNTS_PER_SECOND = 10000000U;
-
-static_assert(TICKS_10MHZ_PER_SECOND ==
-              (NS_PER_SECOND / NS_PER_10MHZ_TICK),
-              "10 MHz tick geometry broken");
-static_assert(VCLOCK_COUNTS_PER_SECOND == TICKS_10MHZ_PER_SECOND,
-              "VCLOCK must remain a 10 MHz clock");
 
 // --------------------------------------------------------------
 // Prescaled clock domains
@@ -113,7 +109,7 @@ static const int PHOTODIODE_ANALOG_PIN = 22;
 //
 // GNSS_VCLK_PIN:
 //   10 MHz VCLOCK square wave from GF-8802 (pin 10)
-//   Counted by QTimer1 ch0 low-word (single-edge, 100 ns per tick)
+//   Counted by QTimer1 ch0+ch1 (single-edge, 100 ns per tick)
 //
 // GNSS_LOCK_PIN:
 //   GNSS lock status (true/false)
@@ -128,27 +124,21 @@ static constexpr int OCXO1_PIN = 13;
 static constexpr int OCXO2_PIN = 15;
 
 // --------------------------------------------------------------
-// QTimer1 VCLOCK / TimePop configuration
+// QTimer1 cascade configuration
 // --------------------------------------------------------------
 //
-// QTimer1 hosts the sovereign GNSS VCLOCK domain.  process_interrupt owns
-// the hardware registers and presents synthetic 32-bit VCLOCK identities
-// to TimePop and CLOCKS.
+// QTimer1 is used for GNSS VCLOCK counting and scheduling.
 //
 // ch0: primary external count source on pin 10 (GNSS 10 MHz, CM=1)
-//      This is the passive VCLOCK low-word counter.
-// ch1: hosted VCLOCK-domain compare rail for clients such as WITNESS.
-//      It is not a cascade high word.
-// ch2: TimePop dynamic compare scheduler and CADENCE_MINDER rail (CM=1).
-//      VCLOCK one-second bookends are authored from this proven TimePop path.
-// ch3: reserved/off in the current interrupt architecture.
+// ch1: cascaded extension for 32-bit range (CM=7)
+// ch2: TimePop dynamic compare scheduler (priority queue, CM=1)
+// ch3: TIME_TEST compare (VCLOCK edge capture for time audit)
 //
 // The raw QTimer count is in 10 MHz ticks (100 ns per tick).
 // No domain translation is required — one tick = one GNSS cycle.
 //
-// VCLOCK 32-bit identity is synthetic and process_interrupt-owned.  The PPS
-// ISR samples QTimer1 CH0 low-word state; CADENCE_MINDER refreshes the
-// synthetic VCLOCK anchor on the TimePop/CH2 rail.
+// The 32-bit QTimer value is read in the PPS ISR alongside
+// GPT1_CNT, GPT2_CNT, and DWT_CYCCNT.
 //
 static constexpr uint32_t QTIMER1_CH0_BITS = 16;
 static constexpr uint32_t QTIMER1_CH0_MASK = 0xFFFF;
@@ -160,37 +150,19 @@ static constexpr uint32_t QTIMER1_CH0_MASK = 0xFFFF;
 // Domain    Timer           Pin   Clock Source           Resolution
 // -------   -------------   ---   --------------------   ----------
 // DWT       ARM_DWT_CYCCNT   —    CPU core (1008 MHz)    ~1 ns
-// GNSS      QTimer1 ch0      10   GF-8802 VCLOCK 10 MHz  100 ns
-// OCXO1     QTimer2 ch0      13   AOCJY1-A #1   10 MHz   100 ns
+// GNSS      QTimer1 ch0+1    10   GF-8802 VCLOCK 10 MHz  100 ns
+// OCXO1     QTimer3 ch2      14   AOCJY1-A #1   10 MHz   100 ns
 // OCXO2     QTimer3 ch3      15   AOCJY1-A #2   10 MHz   100 ns
 //
-// All timing domains free-run continuously.  The PPS ISR samples the lane
-// low words in one custody window when they are initialized, but those raw
-// 16-bit reads are forensic evidence, not public timing authority.
+// All timing domains free-run continuously.
+// All are captured simultaneously in the PPS ISR.
+// GPT1 and GPT2 are 32-bit native.
+// QTimer1 is 16-bit cascaded to 32-bit (wraps at ~429 seconds).
+// 64-bit extension is via delta accumulation where needed.
 //
-// QTimer channels are 16-bit native.  Synthetic 32-bit counter32 extension is
-// owned by process_interrupt, but custody is intentionally asymmetric:
-//
-//   VCLOCK : TimePop/CADENCE_MINDER on QTimer1 CH2 refreshes the sovereign
-//            VCLOCK synthetic anchor and authors VCLOCK/PPS bookends.
-//   OCXO1  : QTimer2 CH0 owns a private 1 kHz mini-scheduler.
-//   OCXO2  : QTimer3 CH3 owns a private 1 kHz mini-scheduler.
-//
-// OCXO lanes do not use TimePop for cadence, compare arming, rollover
-// custody, or post-ISR dispatch.  Each OCXO lane advances its own compare
-// target by exactly 10,000 OCXO ticks per fire and emits a one-second edge
-// every 1,000 cadence fires.
-//
-// GNSS VCLOCK is intentionally hosted on QTimer1 because it is the sovereign
-// clock domain used by TimePop and broader timing semantics.  OCXO1 and OCXO2
-// are hosted on QTimer2 and QTimer3 respectively; this matches the NVIC
-// vector layout consumed by process_interrupt and the current priority
-// architecture below (QTimer1/PPS=0, OCXO=16).
-//
-// Note: earlier versions of this header described OCXO1/OCXO2 as hosted on
-// GPT1/GPT2.  Those references were vestigial — the system migrated to
-// QTimer2/QTimer3 some time ago.  The current QTimer-based wiring is the
-// authoritative layout.
+// GNSS VCLOCK is intentionally hosted on QTimer1 because it is the
+// sovereign clock domain used by TimePop and broader timing semantics.
+// OCXO2 is hosted on GPT2.
 //
 
 // --------------------------------------------------------------
@@ -247,68 +219,29 @@ static const float ADC_FS_COUNTS = 4095.0f;
 
 static constexpr uint32_t MAX_INTERRUPT_SUBSCRIBERS = 8;
 
-// VCLOCK substrate cadence.  This is the TimePop/CADENCE_MINDER rail.
 static constexpr uint32_t VCLOCK_INTERVAL_COUNTS = 10000U;  // 1 ms at 10 MHz
 
-// OCXO lane-local mini-scheduler cadence.
+// OCXO cadence (deliberately distinct from VCLOCK).
 //
-// Each OCXO lane now owns its own QTimer compare chain.  The compare target
-// advances by exactly 10,000 lane-local OCXO ticks per fire.  Most fires only
-// maintain 16-bit-to-32-bit custody; every 1,000 epoch-aligned fires authors
-// the OCXO one-second edge delivered to CLOCKS/Alpha.
-static constexpr uint32_t OCXO_INTERVAL_COUNTS = 10000U;       // 1 ms at 10 MHz
-static constexpr uint32_t OCXO_COUNTS_PER_SECOND = TICKS_10MHZ_PER_SECOND;
+// Experimental config: each OCXO lane fires every 2 ms (20000 OCXO ticks).
+// 500 compares per OCXO second × 20000 ticks = 10,000,000 ticks = 1 s.
+//
+// Phase offset between the two lanes is OCXO_INTERVAL_COUNTS / 2 (1 ms).
+// OCXO1 fires on even ms boundaries, OCXO2 fires on odd ms boundaries.
+// They cannot share an ISR window.
+static constexpr uint32_t OCXO_INTERVAL_COUNTS = 20000U;       // 2 ms at 10 MHz
+static constexpr uint32_t OCXO_COUNTS_PER_SECOND = 10000000U;
+static constexpr uint32_t OCXO_PHASE_OFFSET_TICKS =
+    OCXO_INTERVAL_COUNTS / 2U;                                 // 1 ms
 
-// Retired compatibility surface.  The new OCXO schedulers do not impose an
-// artificial phase offset between OCXO1 and OCXO2.  Their relative phase is
-// whatever the hardware oscillators and CLOCKS-selected zero offsets say it is.
-static constexpr uint32_t OCXO_PHASE_OFFSET_TICKS = 0U;
-
-// Cadence fires per emitted one-second event.
-static constexpr uint32_t TICKS_PER_SECOND_EVENT =
-    VCLOCK_COUNTS_PER_SECOND / VCLOCK_INTERVAL_COUNTS;
-static constexpr uint32_t TICKS_PER_SECOND_EVENT_OCXO =
-    OCXO_COUNTS_PER_SECOND / OCXO_INTERVAL_COUNTS;
-
-static_assert(TICKS_PER_SECOND_EVENT == 1000U,
-              "VCLOCK cadence must remain 1 kHz");
-static_assert(TICKS_PER_SECOND_EVENT_OCXO == 1000U,
-              "OCXO mini-scheduler cadence must remain 1 kHz");
-static_assert((VCLOCK_COUNTS_PER_SECOND % VCLOCK_INTERVAL_COUNTS) == 0U,
-              "VCLOCK one-second grid must be an integer number of cadence fires");
-static_assert((OCXO_COUNTS_PER_SECOND % OCXO_INTERVAL_COUNTS) == 0U,
-              "OCXO one-second grid must be an integer number of cadence fires");
+// Ticks per emitted one-second event.  Lane-specific because OCXO and VCLOCK
+// run on different cadences.
+static constexpr uint32_t TICKS_PER_SECOND_EVENT      = 1000U;  // VCLOCK: 1 kHz
+static constexpr uint32_t TICKS_PER_SECOND_EVENT_OCXO = 500U;   // OCXO:   500 Hz
 
 // ============================================================================
 // Latency constants
 // ============================================================================
-//
-// Calibration regime note:
-//
-//   The current asymmetric interrupt architecture is:
-//
-//     QTimer1   : 0    (VCLOCK / TimePop / CADENCE_MINDER sovereign rail)
-//     PPS GPIO  : 0    (physical PPS witness + VCLOCK selector)
-//     OCXO 1/2  : 16   (lane-local QTimer compare mini-schedulers)
-//
-//   QTimer1 and PPS GPIO remain same-priority peers; same-priority interrupts
-//   on Cortex-M do not preempt one another.  OCXO lanes are lower priority and
-//   may be preempted by the sovereign VCLOCK/PPS rail.
-//
-//   The values in this section are retained from measurement.  The
-//   first-instruction ISR-entry latencies (PPS_ISR_ENTRY_OVERHEAD,
-//   QTIMER_ISR_ENTRY_OVERHEAD) and the hardware sink-path latencies
-//   (GPIO_TOTAL_LATENCY, QTIMER_TOTAL_LATENCY, QTIMER_READ_LATENCY,
-//   WITNESS_STIMULATE_LATENCY, DWT_CYCCNT_TO_MEMORY_CYCLES) should be
-//   spot-checked after interrupt-priority or QTimer setup changes.  If any
-//   constant shifts by more than one or two cycles, re-measure and update it;
-//   do not speculatively adjust the numbers without measurement.
-//
-//   Known first-cut measurement artifact: QuadTimer event DWT captures can
-//   appear on a 4-cycle lattice.  The OCXO mini-scheduler intentionally emits
-//   honest latency-adjusted ISR-entry facts for now.  Later estimator work may
-//   use the full 1,000-cadence-edge history inside each OCXO second to
-//   neutralize that quantization.
 
 static constexpr uint32_t DWT_CYCCNT_TO_MEMORY_CYCLES = 1;
 static constexpr uint32_t WITNESS_STIMULATE_LATENCY = 5;
@@ -334,23 +267,12 @@ static constexpr uint32_t QTIMER_ISR_ENTRY_OVERHEAD = 19;
 // input synchronizers, pad routing, QTimer compare maturation semantics, or
 // other fixed hardware path differences.
 //
-// Historical observation (pre-Patch-8):
-//   Priority testing under the pre-Patch-8 priority arrangement showed the
-//   value remained ~34 cycles even when QTimer1 and PPS GPIO were both set
-//   to NVIC priority 0.  Under that arrangement this constant did not appear
-//   to be a QTimer IRQ priority artifact.
-//
-// Current-priority calibration note:
-//   QTimer1 and PPS GPIO are both priority-0 peers in the current asymmetric
-//   architecture.  Same-priority peers do not preempt one another, so this
-//   constant should remain in the same measurement family as the historical
-//   priority-0 peer tests.  It still deserves a spot-check against post-flash
-//   raw_cycles.py output after any QTimer setup, optimization, wiring, or NVIC
-//   priority change.  If it shifts by more than a cycle or two, re-measure and
-//   update.
+// Priority testing showed the value remains ~34 cycles even when QTimer1 and
+// PPS GPIO are both set to NVIC priority 0, so this does not appear to be a
+// QTimer IRQ priority artifact.
 //
 // Treat this as the observed calibration offset between the physical/raw PPS
 // interrupt timestamp and the canonical VCLOCK-selected PPS epoch.  Re-measure
 // if the GF-8802 wiring, pin routing, ISR paths, QTimer setup, optimization
-// level, latency correction model, or NVIC priority architecture changes.
+// level, or latency correction model changes.
 static constexpr int32_t CANONICAL_VCLOCK_EPOCH_MINUS_RAW_PPS_ISR_CYCLES = 34;
