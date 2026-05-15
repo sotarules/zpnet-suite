@@ -315,7 +315,7 @@ static welford_t g_phase_physical_pps_to_selected_welford = {};
 //
 // One fixed sub-second TimePop client per PPS/VCLOCK second.  TimePop supplies
 // the truth tuple: fire_vclock_raw, fire_dwt_cyccnt, fire_gnss_ns.  The test
-// asks whether time_dwt_to_gnss_ns(fire_dwt_cyccnt) returns the same GNSS
+// asks whether time_gnss_ns_at_dwt(fire_dwt_cyccnt) returns the same GNSS
 // coordinate.
 
 static constexpr uint8_t  BRIDGE_SLOT_INDEX = 5;
@@ -926,7 +926,7 @@ static void bridge_capture_from_timepop(const timepop_ctx_t& ctx) {
 
   const int64_t gnss_from_vclock_ns = ctx.fire_gnss_ns;
 
-  const int64_t gnss_from_time_bridge_ns = time_dwt_to_gnss_ns(qtimer_event_dwt);
+  const int64_t gnss_from_time_bridge_ns = (int64_t)time_gnss_ns_at_dwt(qtimer_event_dwt);
   const int64_t residual_ns = gnss_from_time_bridge_ns - gnss_from_vclock_ns;
 
   int64_t gnss_from_dynamic_dwt_ns = gnss_from_time_bridge_ns;

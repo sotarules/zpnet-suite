@@ -137,19 +137,17 @@ static uint64_t g_campaign_public_gnss_base = 0;
 static uint64_t g_campaign_public_ocxo1_base = 0;
 static uint64_t g_campaign_public_ocxo2_base = 0;
 
-static uint64_t clock_ns_at_fragment_dwt(time_clock_id_t clock,
-                                         uint64_t fallback_ns) {
-  const uint32_t fragment_dwt = g_dwt_at_pps_vclock;
-  uint64_t ns = 0;
-  if (fragment_dwt != 0 && time_clock_ns_at_dwt(clock, fragment_dwt, &ns)) {
-    return ns;
-  }
-  return fallback_ns;
+static bool clock_projection_valid(time_clock_id_t clock) {
+  time_clock_projection_t projection{};
+  return time_clock_projection(clock, &projection);
 }
 
 static uint64_t current_raw_gnss_ns(void) {
-  return clock_ns_at_fragment_dwt(time_clock_id_t::VCLOCK,
-                                  g_gnss_ns_at_pps_vclock);
+  const uint32_t fragment_dwt = g_dwt_at_pps_vclock;
+  if (fragment_dwt != 0 && clock_projection_valid(time_clock_id_t::VCLOCK)) {
+    return time_gnss_ns_at_dwt(fragment_dwt);
+  }
+  return g_gnss_ns_at_pps_vclock;
 }
 
 static uint64_t current_raw_ocxo1_ns(void) {
@@ -1574,12 +1572,12 @@ static Payload cmd_report(const Payload&) {
   Payload summary;
   const uint32_t report_dwt = DWT_CYCCNT;
   const uint64_t dwt64_cycles_at_report = clocks_dwt_cycles_at_dwt(report_dwt);
-  uint64_t vclock_ns = 0;
-  uint64_t ocxo1_ns = 0;
-  uint64_t ocxo2_ns = 0;
-  const bool vclock_ok = time_clock_ns_at_dwt(time_clock_id_t::VCLOCK, report_dwt, &vclock_ns);
-  const bool ocxo1_ok  = time_clock_ns_at_dwt(time_clock_id_t::OCXO1,  report_dwt, &ocxo1_ns);
-  const bool ocxo2_ok  = time_clock_ns_at_dwt(time_clock_id_t::OCXO2,  report_dwt, &ocxo2_ns);
+  const bool vclock_ok = clock_projection_valid(time_clock_id_t::VCLOCK);
+  const bool ocxo1_ok  = clock_projection_valid(time_clock_id_t::OCXO1);
+  const bool ocxo2_ok  = clock_projection_valid(time_clock_id_t::OCXO2);
+  const uint64_t vclock_ns = vclock_ok ? time_vclock_ns_at_dwt(report_dwt) : 0ULL;
+  const uint64_t ocxo1_ns  = ocxo1_ok  ? time_ocxo1_ns_at_dwt(report_dwt)  : 0ULL;
+  const uint64_t ocxo2_ns  = ocxo2_ok  ? time_ocxo2_ns_at_dwt(report_dwt)  : 0ULL;
 
   summary.add("report_dwt", report_dwt);
   summary.add("dwt64_cycles", dwt64_cycles_at_report);
