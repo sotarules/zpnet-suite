@@ -1,17 +1,21 @@
 // ============================================================================
-// process_time.cpp -- legacy TIME compatibility anchor and projection process
+// process_time.cpp -- TIME compatibility anchor and projection backing store
 // ============================================================================
 //
-// process_time is being retired, but it still owns two compatibility surfaces
-// that are operationally important:
+// process_time remains alive.  It owns the live PPS/VCLOCK anchor consumed by
+// TimePop through time_anchor_snapshot(), plus the per-clock projection backing
+// store consumed by the TIME facade.
 //
-//   * the PPS/VCLOCK anchor consumed by TimePop through time_anchor_snapshot()
-//   * the per-clock projection basis consumed by time_clock_ns_at_dwt()
+// Retired behavior has been removed from this file:
+//   * dynamic-CPS prediction
+//   * prior-second prediction history
+//   * prediction-detail reports
+//   * legacy conversion aliases
 //
-// Everything else in this file is now compatibility glue only.  Dynamic CPS,
-// prediction history, and detailed prediction reports are retired.  CLOCKS/Alpha
-// owns the real four-rail prediction audit, and CLOCKS/Beta publishes that audit
-// in TIMEBASE_FRAGMENT.
+// CLOCKS/Alpha now owns the real four-rail prediction audit, and CLOCKS/Beta
+// publishes that audit in TIMEBASE_FRAGMENT.  This module is intentionally
+// narrow: anchor state, per-clock projection state, TIME.REPORT, and process
+// registration.
 //
 // All DWT inputs are already authored event-coordinate values.  This module
 // performs no latency adjustment and never captures "now" except in the legacy
@@ -89,14 +93,8 @@ static time_snapshot_t read_anchor(void) {
   return time_snapshot_t{};
 }
 
-static inline uint32_t effective_cycles_for_anchor(uint32_t,
-                                                   uint32_t raw_cycles) {
-  return raw_cycles;
-}
-
 static inline uint32_t effective_cycles_per_snapshot(const time_snapshot_t& s) {
-  return effective_cycles_for_anchor(s.dwt_at_pps_vclock,
-                                     s.dwt_cycles_per_pps_vclock_s);
+  return s.dwt_cycles_per_pps_vclock_s;
 }
 
 time_anchor_snapshot_t time_anchor_snapshot(void) {
@@ -273,7 +271,7 @@ bool time_clock_update(time_clock_id_t clock,
 }
 
 bool time_clock_ns_at_dwt(time_clock_id_t clock,
-                          uint32_t dwt_cyccnt,
+                          uint32_t authored_dwt_cycle_count,
                           uint64_t* out_ns) {
   if (!out_ns) return false;
 
@@ -283,7 +281,7 @@ bool time_clock_ns_at_dwt(time_clock_id_t clock,
     return false;
   }
 
-  const uint32_t elapsed_dwt = dwt_cyccnt - s.dwt_at_update;
+  const uint32_t elapsed_dwt = authored_dwt_cycle_count - s.dwt_at_update;
   const uint64_t elapsed_ns =
       ((uint64_t)elapsed_dwt * TIME_NS_PER_SECOND_U64 +
        (uint64_t)s.predicted_dwt_cycles_per_second / 2ULL) /
@@ -319,9 +317,9 @@ void time_pps_vclock_epoch_reset(uint32_t dwt_at_pps_vclock,
 }
 
 static void time_pps_vclock_update_explicit(uint32_t dwt_at_pps_vclock,
-                                             uint32_t dwt_cycles_per_pps_vclock_s,
-                                             uint32_t counter32_at_pps_vclock,
-                                             uint32_t pps_vclock_count) {
+                                            uint32_t dwt_cycles_per_pps_vclock_s,
+                                            uint32_t counter32_at_pps_vclock,
+                                            uint32_t pps_vclock_count) {
   const uint32_t new_pps_vclock_count = pps_vclock_count ? pps_vclock_count : 1U;
 
   anchor.seq++;
@@ -365,19 +363,8 @@ void time_pps_vclock_update(uint32_t dwt_at_pps_vclock,
                                   pps_vclock_count);
 }
 
-void time_pps_epoch_reset(uint32_t dwt_at_pps,
-                          uint32_t qtimer_at_pps) {
-  time_pps_vclock_epoch_reset(dwt_at_pps, qtimer_at_pps);
-}
-
-void time_pps_update(uint32_t dwt_at_pps,
-                     uint32_t dwt_cycles_per_s,
-                     uint32_t qtimer_at_pps) {
-  time_pps_vclock_update(dwt_at_pps, dwt_cycles_per_s, qtimer_at_pps);
-}
-
 // ============================================================================
-// GNSS interpolation helpers
+// GNSS interpolation helper
 // ============================================================================
 
 static inline int64_t interpolate_gnss_ns(const time_snapshot_t& s,
@@ -406,180 +393,13 @@ int64_t time_gnss_ns_now(void) {
   return interpolate_gnss_ns(s, dwt_elapsed);
 }
 
-int64_t time_dwt_to_gnss_ns(uint32_t dwt_cyccnt) {
-  const time_snapshot_t s = read_anchor();
-  if (!s.ok || !s.valid) return -1;
-  if (effective_cycles_per_snapshot(s) == 0) return -1;
-
-  const uint32_t dwt_elapsed = dwt_cyccnt - s.dwt_at_pps_vclock;
-  return interpolate_gnss_ns(s, dwt_elapsed);
-}
-
-int64_t time_dwt_to_gnss_ns(uint32_t dwt_cyccnt,
-                            uint32_t anchor_dwt_at_pps_vclock,
-                            uint32_t anchor_dwt_cycles_per_pps_vclock_s,
-                            uint32_t anchor_pps_vclock_count) {
-  const uint32_t cycles = effective_cycles_for_anchor(anchor_dwt_at_pps_vclock,
-                                                      anchor_dwt_cycles_per_pps_vclock_s);
-  if (cycles == 0) return -1;
-  if (anchor_pps_vclock_count == 0) return -1;
-
-  const uint32_t dwt_elapsed = dwt_cyccnt - anchor_dwt_at_pps_vclock;
-  const uint64_t ns_into_second =
-      ((uint64_t)dwt_elapsed * TIME_NS_PER_SECOND_U64 +
-       (uint64_t)cycles / 2ULL) /
-      (uint64_t)cycles;
-
-  if (ns_into_second > MAX_AGE_NS) return -1;
-
-  return (int64_t)((uint64_t)(anchor_pps_vclock_count - 1) *
-                   TIME_NS_PER_SECOND_U64 +
-                   ns_into_second);
-}
-
-uint32_t time_gnss_ns_to_dwt(int64_t gnss_ns) {
-  const time_snapshot_t s = read_anchor();
-  if (!s.ok || !s.valid) return 0;
-  if (gnss_ns < 0) return 0;
-
-  const uint32_t cycles = effective_cycles_per_snapshot(s);
-  if (cycles == 0) return 0;
-
-  const int64_t anchor_ns =
-      (int64_t)(s.pps_vclock_count - 1) *
-      (int64_t)TIME_NS_PER_SECOND_U64;
-  const int64_t ns_into_second = gnss_ns - anchor_ns;
-  if (ns_into_second < 0) return 0;
-
-  const uint32_t dwt_elapsed =
-      (uint32_t)(((uint64_t)ns_into_second *
-                  (uint64_t)cycles +
-                  TIME_NS_PER_SECOND_U64 / 2ULL) /
-                 TIME_NS_PER_SECOND_U64);
-
-  return s.dwt_at_pps_vclock + dwt_elapsed;
-}
-
-// ============================================================================
-// Retired prediction/dynamic-CPS compatibility surfaces
-// ============================================================================
-
-time_dwt_prediction_snapshot_t time_dwt_prediction_snapshot(void) {
-  return time_dwt_prediction_snapshot_t{};
-}
-
-uint32_t time_dwt_prediction_history(time_dwt_prediction_record_t*,
-                                     uint32_t) {
-  return 0;
-}
-
-bool time_dwt_prediction_valid(void) {
-  return false;
-}
-
-uint32_t time_dwt_actual_cycles_last_second(void) {
-  return 0;
-}
-
-uint32_t time_dwt_predicted_cycles_last_second(void) {
-  return 0;
-}
-
-uint32_t time_dwt_next_prediction_cycles(void) {
-  return 0;
-}
-
-int32_t time_dwt_prediction_residual_cycles(void) {
-  return 0;
-}
-
-void time_dynamic_cps_reset(void) {}
-
-void time_dynamic_cps_phase_probe_update(uint32_t,
-                                         uint32_t,
-                                         uint32_t,
-                                         uint32_t,
-                                         uint32_t,
-                                         uint32_t,
-                                         uint32_t,
-                                         uint32_t) {}
-
-void time_dynamic_cps_pps_vclock_edge(uint32_t,
-                                      uint32_t) {}
-
-void time_dynamic_cps_cadence_update(uint32_t,
-                                     uint32_t) {}
-
-time_dynamic_cps_snapshot_t time_dynamic_cps_snapshot(void) {
-  const time_snapshot_t s = read_anchor();
-  time_dynamic_cps_snapshot_t out{};
-
-  out.valid = s.ok && s.valid && s.dwt_cycles_per_pps_vclock_s != 0;
-  out.witness_only = true;
-  out.projection_enabled = false;
-  out.pvc_sequence = s.pps_vclock_count;
-  out.current_pvc_dwt_at_edge = s.dwt_at_pps_vclock;
-  out.pvc_dwt_at_edge = s.dwt_at_pps_vclock;
-  out.base_cycles = s.dwt_cycles_per_pps_vclock_s;
-  out.current_cycles = s.dwt_cycles_per_pps_vclock_s;
-  out.net_adjustment_cycles = 0;
-  out.last_reseed_value = s.dwt_cycles_per_pps_vclock_s;
-  out.last_reseed_was_computed = out.valid;
-  out.history_count = 0;
-  out.history_capacity = 0;
-  return out;
-}
-
-uint32_t time_dynamic_cps_history(time_dynamic_cps_record_t*,
-                                  uint32_t) {
-  return 0;
-}
-
-bool time_prediction_detail_snapshot(time_prediction_detail_snapshot_t* out) {
-  if (out) *out = time_prediction_detail_snapshot_t{};
-  return false;
-}
-
-bool time_dynamic_cps_valid(void) {
-  return time_dynamic_cps_snapshot().valid;
-}
-
-uint32_t time_dynamic_cps_current_cycles(void) {
-  return time_dynamic_cps_snapshot().current_cycles;
-}
-
-uint32_t time_dynamic_cps_current(void) {
-  return time_dynamic_cps_current_cycles();
-}
-
-bool time_dynamic_cps_cycles_for_anchor(uint32_t pvc_sequence,
-                                        uint32_t* out_cycles) {
-  if (!out_cycles) return false;
-
-  const time_snapshot_t s = read_anchor();
-  if (!s.ok || !s.valid || s.dwt_cycles_per_pps_vclock_s == 0) return false;
-  if (s.pps_vclock_count != pvc_sequence) return false;
-
-  *out_cycles = s.dwt_cycles_per_pps_vclock_s;
-  return true;
-}
-
-bool time_dynamic_cps_for_pvc_sequence(uint32_t pvc_sequence,
-                                       uint32_t* out_cycles) {
-  return time_dynamic_cps_cycles_for_anchor(pvc_sequence, out_cycles);
-}
-
 // ============================================================================
 // Status / init
 // ============================================================================
 
-uint32_t time_pps_vclock_count(void) {
+uint32_t time_pps_count(void) {
   const time_snapshot_t s = read_anchor();
   return s.ok ? s.pps_vclock_count : 0;
-}
-
-uint32_t time_pps_count(void) {
-  return time_pps_vclock_count();
 }
 
 bool time_valid(void) {
@@ -597,46 +417,65 @@ void process_time_init(void) {
 }
 
 // ============================================================================
-// Reduced command surface
+// Report
 // ============================================================================
+
+static void add_clock_snapshot(Payload& parent,
+                               const char* key,
+                               time_clock_id_t clock) {
+  time_clock_snapshot_t s{};
+  const bool load_ok = time_clock_snapshot(clock, &s);
+
+  Payload p;
+  p.add("load_ok", load_ok);
+  p.add("valid", load_ok && s.valid);
+  p.add("prediction_valid", load_ok && s.prediction_valid);
+  p.add("dwt_at_update", load_ok ? s.dwt_at_update : 0U);
+  p.add("ns_at_update", load_ok ? s.ns_at_update : 0ULL);
+  p.add("predicted_dwt_cycles_per_second",
+        load_ok ? s.predicted_dwt_cycles_per_second : 0U);
+  p.add("update_count", load_ok ? s.update_count : 0U);
+  p.add("last_observed_dwt_cycles",
+        load_ok ? s.last_observed_dwt_cycles : 0U);
+  p.add("last_observed_ns", load_ok ? s.last_observed_ns : 0ULL);
+  p.add("last_prediction_residual_cycles",
+        load_ok ? s.last_prediction_residual_cycles : 0);
+
+  parent.add_object(key, p);
+}
 
 static Payload cmd_report(const Payload&) {
   const time_anchor_snapshot_t a = time_anchor_snapshot();
 
   Payload out;
   out.add("model", "TIME_COMPAT_ANCHOR_PROJECTION_REPORT");
-  out.add("note", "process_time owns only legacy anchor/projection state; prediction surfaces are retired");
+  out.add("note", "process_time owns only the PPS/VCLOCK anchor and per-clock projection backing store");
   out.add("time_valid", time_valid());
-  out.add("anchor_ok", a.ok);
-  out.add("anchor_valid", a.valid);
-  out.add("dwt_at_pps_vclock", a.dwt_at_pps_vclock);
-  out.add("dwt_cycles_per_pps_vclock_s", a.dwt_cycles_per_pps_vclock_s);
-  out.add("counter32_at_pps_vclock", a.counter32_at_pps_vclock);
-  out.add("pps_vclock_count", a.pps_vclock_count);
+
+  Payload anchor_payload;
+  anchor_payload.add("ok", a.ok);
+  anchor_payload.add("valid", a.valid);
+  anchor_payload.add("dwt_at_pps_vclock", a.dwt_at_pps_vclock);
+  anchor_payload.add("dwt_cycles_per_pps_vclock_s", a.dwt_cycles_per_pps_vclock_s);
+  anchor_payload.add("counter32_at_pps_vclock", a.counter32_at_pps_vclock);
+  anchor_payload.add("pps_vclock_count", a.pps_vclock_count);
+  out.add_object("anchor", anchor_payload);
+
+  Payload projections;
+  add_clock_snapshot(projections, "vclock", time_clock_id_t::VCLOCK);
+  add_clock_snapshot(projections, "ocxo1", time_clock_id_t::OCXO1);
+  add_clock_snapshot(projections, "ocxo2", time_clock_id_t::OCXO2);
+  out.add_object("projections", projections);
+
   out.add("prediction_surfaces_retired", true);
   out.add("dynamic_cps_retired", true);
-  return out;
-}
-
-static Payload cmd_anchor_report(const Payload&) {
-  const time_anchor_snapshot_t a = time_anchor_snapshot();
-
-  Payload out;
-  out.add("model", "TIME_STATIC_ANCHOR_REPORT");
-  out.add("time_valid", time_valid());
-  out.add("anchor_ok", a.ok);
-  out.add("anchor_valid", a.valid);
-  out.add("dwt_at_pps_vclock", a.dwt_at_pps_vclock);
-  out.add("dwt_cycles_per_pps_vclock_s", a.dwt_cycles_per_pps_vclock_s);
-  out.add("counter32_at_pps_vclock", a.counter32_at_pps_vclock);
-  out.add("pps_vclock_count", a.pps_vclock_count);
+  out.add("retired_dead_code_removed", true);
   return out;
 }
 
 static const process_command_entry_t TIME_COMMANDS[] = {
-  { "REPORT",        cmd_report        },
-  { "ANCHOR_REPORT", cmd_anchor_report },
-  { nullptr,         nullptr           }
+  { "REPORT", cmd_report },
+  { nullptr,  nullptr    }
 };
 
 static const process_vtable_t TIME_PROCESS = {
