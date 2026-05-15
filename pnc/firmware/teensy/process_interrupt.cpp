@@ -64,6 +64,7 @@
 #include "imxrt.h"
 #include <math.h>
 #include <stdio.h>
+#include <strings.h>
 
 // process_clocks owns watchdog publication/stop semantics.  process_interrupt
 // only raises hard timing-identity faults through this narrow boundary.
@@ -3081,17 +3082,7 @@ static void add_bridge_stats_payload(Payload& p,
 // Commands
 // ============================================================================
 
-static Payload cmd_report(const Payload&) {
-  Payload p;
-  p.add("hardware_ready", g_interrupt_hw_ready);
-  p.add("runtime_ready",  g_interrupt_runtime_ready);
-  p.add("irqs_enabled",   g_interrupt_irqs_enabled);
-  p.add("timing_arch_step", "LIGHTWEIGHT_EDGE_ISR_PASS");
-  p.add("timing_arch_behavior_changed", true);
-  p.add("timing_arch_vclock_authority", "QTIMER1_CH2_TIMEPOP_CADENCE_MINDER");
-  p.add("timing_arch_ocxo_model", "CADENCE_MINDER_ROLLOVER_OCXO_ONCE_PER_SECOND_WITNESS");
-  p.add("timing_arch_ocxo_migration_stage", "LIGHTWEIGHT_EDGE_ISR_PASS");
-
+static void add_priority_payload(Payload& p) {
   p.add("qtimer1_sovereign_priority_expected", INTERRUPT_STEP0_EXPECTED_QTIMER1_PRIORITY);
   p.add("qtimer1_sovereign_priority_applied", g_step0_qtimer1_priority_applied);
   p.add("qtimer1_sovereign_priority_ok",
@@ -3116,23 +3107,28 @@ static Payload cmd_report(const Payload&) {
   p.add("irq_qtimer2_enabled_by_interrupt", g_step0_qtimer2_irq_enabled_by_interrupt);
   p.add("irq_qtimer3_enabled_by_interrupt", g_step0_qtimer3_irq_enabled_by_interrupt);
   p.add("irq_gpio6789_configured_by_interrupt", g_step0_gpio6789_configured_by_interrupt);
+}
 
-  p.add("step0_single_cadence_agent_expected", true);
-  p.add("step0_qtimer1_timepop_sovereign",
-        g_step0_qtimer1_priority_applied == INTERRUPT_STEP0_EXPECTED_QTIMER1_PRIORITY);
-  p.add("step0_ocxo_compare_cadence_retired_expected", true);
-  p.add("step0_ocxo1_compare_irq_count", g_qtimer2_ch0_count);
-  p.add("step0_ocxo2_compare_irq_count", g_qtimer3_ch3_count);
-  p.add("step0_vclock_irq_count", g_vclock_lane.irq_count);
-  p.add("step0_timepop_cadence_fire_count", g_cadence_minder_fire_count);
-  p.add("step0_ocxo1_minder_update_count", g_cadence_minder_ocxo1_updates);
-  p.add("step0_ocxo2_minder_update_count", g_cadence_minder_ocxo2_updates);
+static void add_runtime_payload(Payload& p) {
+  p.add("hardware_ready", g_interrupt_hw_ready);
+  p.add("runtime_ready",  g_interrupt_runtime_ready);
+  p.add("irqs_enabled",   g_interrupt_irqs_enabled);
+  p.add("timing_arch_step", "LIGHTWEIGHT_EDGE_ISR_PASS");
+  p.add("timing_arch_behavior_changed", true);
+  p.add("timing_arch_vclock_authority", "QTIMER1_CH2_TIMEPOP_CADENCE_MINDER");
+  p.add("timing_arch_ocxo_model", "CADENCE_MINDER_ROLLOVER_OCXO_ONCE_PER_SECOND_WITNESS");
+  p.add("timing_arch_ocxo_migration_stage", "LIGHTWEIGHT_EDGE_ISR_PASS");
   p.add("subscriber_count", g_subscriber_count);
   p.add("single_cadence_agent", true);
   p.add("cadence_minder_isr_mode", true);
   p.add("vclock_cadence_retired", true);
   p.add("ocxo_legacy_compare_cadence_retired", true);
   p.add("ocxo_compare_live_requires_enabled_and_flag", true);
+  p.add("lane_report_command", "INTERRUPT.REPORT_LANES");
+  p.add("single_lane_report_command", "INTERRUPT.REPORT_LANE lane=VCLOCK|OCXO1|OCXO2");
+}
+
+static void add_cadence_minder_payload(Payload& p) {
   p.add("cadence_minder_period_ns", (uint64_t)CADENCE_MINDER_PERIOD_NS);
   p.add("cadence_minder_armed", g_cadence_minder_armed);
   p.add("cadence_minder_arm_count", g_cadence_minder_arm_count);
@@ -3141,61 +3137,16 @@ static Payload cmd_report(const Payload&) {
   p.add("cadence_minder_vclock_updates", g_cadence_minder_vclock_updates);
   p.add("cadence_minder_ocxo1_updates", g_cadence_minder_ocxo1_updates);
   p.add("cadence_minder_ocxo2_updates", g_cadence_minder_ocxo2_updates);
-  p.add("cadence_minder_last_vclock_hw16", (uint32_t)g_cadence_minder_last_vclock_hw16);
-  p.add("cadence_minder_last_ocxo1_hw16", (uint32_t)g_cadence_minder_last_ocxo1_hw16);
-  p.add("cadence_minder_last_ocxo2_hw16", (uint32_t)g_cadence_minder_last_ocxo2_hw16);
   p.add("cadence_minder_last_vclock_counter32", g_cadence_minder_last_vclock_counter32);
   p.add("cadence_minder_last_ocxo1_counter32", g_cadence_minder_last_ocxo1_counter32);
   p.add("cadence_minder_last_ocxo2_counter32", g_cadence_minder_last_ocxo2_counter32);
-  p.add("vclock_subscribed", g_rt_vclock ? g_rt_vclock->subscribed : false);
-  p.add("vclock_active", g_rt_vclock ? g_rt_vclock->active : false);
-  p.add("vclock_event_count", g_rt_vclock ? g_rt_vclock->event_count : 0U);
-  p.add("vclock_dispatch_count", g_rt_vclock ? g_rt_vclock->dispatch_count : 0U);
-  p.add("ocxo1_subscribed", g_rt_ocxo1 ? g_rt_ocxo1->subscribed : false);
-  p.add("ocxo1_active", g_rt_ocxo1 ? g_rt_ocxo1->active : false);
-  p.add("ocxo1_event_count", g_rt_ocxo1 ? g_rt_ocxo1->event_count : 0U);
-  p.add("ocxo1_dispatch_count", g_rt_ocxo1 ? g_rt_ocxo1->dispatch_count : 0U);
+}
 
-  p.add("ocxo2_subscribed", g_rt_ocxo2 ? g_rt_ocxo2->subscribed : false);
-  p.add("ocxo2_active", g_rt_ocxo2 ? g_rt_ocxo2->active : false);
-  p.add("ocxo2_event_count", g_rt_ocxo2 ? g_rt_ocxo2->event_count : 0U);
-  p.add("ocxo2_dispatch_count", g_rt_ocxo2 ? g_rt_ocxo2->dispatch_count : 0U);
-  p.add("ocxo1_post_isr_arm_count",       g_ocxo1_post_isr_arm_count);
-  p.add("ocxo1_post_isr_drain_count",     g_ocxo1_post_isr_drain_count);
-  p.add("ocxo1_post_isr_overwrite_count", g_ocxo1_post_isr_overwrite_count);
-  p.add("ocxo2_post_isr_arm_count",       g_ocxo2_post_isr_arm_count);
-  p.add("ocxo2_post_isr_drain_count",     g_ocxo2_post_isr_drain_count);
-  p.add("ocxo2_post_isr_overwrite_count", g_ocxo2_post_isr_overwrite_count);
-
-  p.add("pps_rebootstrap_pending", g_pps_rebootstrap_pending);
-  p.add("pps_rebootstrap_count",   g_pps_rebootstrap_count);
-  p.add("vclock_epoch_latch_pending", g_vclock_epoch_latch.pending);
-  p.add("vclock_epoch_latch_counter32", g_vclock_epoch_latch.counter32_at_edge);
-  p.add("vclock_epoch_latch_observed_counter32", g_vclock_epoch_latch.observed_counter32);
-  p.add("vclock_epoch_latch_observed_ch3", (uint32_t)g_vclock_epoch_latch.observed_ch3);
-  p.add("vclock_epoch_latch_observed_ticks_after_selected", g_vclock_epoch_latch.observed_ticks_after_selected);
-  p.add("vclock_epoch_latch_first_cadence_counter32", g_vclock_epoch_latch.first_cadence_counter32);
-  p.add("vclock_epoch_latch_first_cadence_dwt", g_vclock_epoch_latch.first_cadence_dwt);
-  p.add("vclock_epoch_latch_backdate_ticks", g_vclock_epoch_latch.backdate_ticks);
-  p.add("vclock_epoch_latch_backdate_cycles", g_vclock_epoch_latch.backdate_cycles);
-  p.add("vclock_epoch_latch_sacred_dwt", g_vclock_epoch_latch.sacred_dwt);
-  p.add("vclock_dwt_repair_enabled", false);
-  p.add("vclock_dwt_repair_threshold_cycles", VCLOCK_DWT_REPAIR_THRESHOLD_CYCLES);
-  p.add("vclock_dwt_repair_min_history_count", VCLOCK_DWT_REPAIR_MIN_HISTORY_COUNT);
-  p.add("vclock_dwt_repair_max_prediction_residual_cycles", VCLOCK_DWT_REPAIR_MAX_PREDICTION_RESIDUAL_CYCLES);
-  p.add("vclock_dwt_repair_candidate_count", g_vclock_repair_stats.candidate_count);
-  p.add("vclock_dwt_repair_applied_count", g_vclock_repair_stats.applied_count);
-  p.add("vclock_dwt_repair_consecutive_candidate_count", g_vclock_repair_stats.consecutive_candidate_count);
-  p.add("vclock_dwt_repair_last_candidate", g_vclock_repair_stats.last_candidate);
-  p.add("vclock_dwt_repair_last_synthetic", g_vclock_repair_stats.last_synthetic);
-  p.add("vclock_dwt_repair_last_original_dwt", g_vclock_repair_stats.last_original_dwt);
-  p.add("vclock_dwt_repair_last_predicted_dwt", g_vclock_repair_stats.last_predicted_dwt);
-  p.add("vclock_dwt_repair_last_used_dwt", g_vclock_repair_stats.last_used_dwt);
-  p.add("vclock_dwt_repair_last_error_cycles", g_vclock_repair_stats.last_error_cycles);
-  p.add("vclock_dwt_repair_max_abs_error_cycles", g_vclock_repair_stats.max_abs_error_cycles);
+static void add_pps_payload(Payload& p) {
   p.add("gpio_irq_count", g_gpio_irq_count);
   p.add("gpio_miss_count", g_gpio_miss_count);
   p.add("gpio_edge_count", g_pps_gpio_heartbeat.edge_count);
+
   p.add("pps_post_isr_deferred", true);
   p.add("pps_post_isr_pending", g_pps_post_isr.pending);
   p.add("pps_post_isr_arm_count", g_pps_post_isr.arm_count);
@@ -3221,7 +3172,17 @@ static Payload cmd_report(const Payload&) {
   p.add("pps_relay_deassert_arm_skip_count", g_pps_relay_deassert_arm_skip_count);
   p.add("pps_relay_last_assert_sequence", g_pps_relay_last_assert_sequence);
 
-  // PPS (physical edge) and PPS_VCLOCK (canonical) in symmetric blocks.
+  p.add("pps_rebootstrap_pending", g_pps_rebootstrap_pending);
+  p.add("pps_rebootstrap_count",   g_pps_rebootstrap_count);
+  p.add("vclock_epoch_latch_pending", g_vclock_epoch_latch.pending);
+  p.add("vclock_epoch_latch_counter32", g_vclock_epoch_latch.counter32_at_edge);
+  p.add("vclock_epoch_latch_observed_counter32", g_vclock_epoch_latch.observed_counter32);
+  p.add("vclock_epoch_latch_first_cadence_counter32", g_vclock_epoch_latch.first_cadence_counter32);
+  p.add("vclock_epoch_latch_first_cadence_dwt", g_vclock_epoch_latch.first_cadence_dwt);
+  p.add("vclock_epoch_latch_backdate_ticks", g_vclock_epoch_latch.backdate_ticks);
+  p.add("vclock_epoch_latch_backdate_cycles", g_vclock_epoch_latch.backdate_cycles);
+  p.add("vclock_epoch_latch_sacred_dwt", g_vclock_epoch_latch.sacred_dwt);
+
   pps_t pps; pps_vclock_t pvc;
   store_load(pps, pvc);
 
@@ -3234,9 +3195,12 @@ static Payload cmd_report(const Payload&) {
   p.add("pps_vclock_dwt_at_edge",       pvc.dwt_at_edge);
   p.add("pps_vclock_counter32_at_edge", pvc.counter32_at_edge);
   p.add("pps_vclock_ch3_at_edge",       (uint32_t)pvc.ch3_at_edge);
-
   p.add("pps_vclock_phase_cycles", pps_vclock_phase_cycles_from_edges(pps, pvc));
 
+  p.add("pps_edge_dispatch_registered", g_pps_edge_dispatch != nullptr);
+}
+
+static void add_epoch_capture_payload(Payload& p) {
   interrupt_epoch_capture_t epoch_cap{};
   const bool epoch_cap_ok = interrupt_last_epoch_capture(&epoch_cap);
   p.add("epoch_capture_available", epoch_cap_ok);
@@ -3250,123 +3214,150 @@ static Payload cmd_report(const Payload&) {
   p.add("epoch_capture_all_lanes_valid", epoch_cap.all_lanes_capture_valid);
   p.add("epoch_capture_vclock_hardware16_observed", (uint32_t)epoch_cap.vclock_hardware16_observed);
   p.add("epoch_capture_vclock_hardware16_selected", (uint32_t)epoch_cap.vclock_hardware16_selected);
-  p.add("epoch_capture_ocxo1_hardware16", (uint32_t)epoch_cap.ocxo1_hardware16);
-  p.add("epoch_capture_ocxo2_hardware16", (uint32_t)epoch_cap.ocxo2_hardware16);
   p.add("epoch_capture_vclock_counter32", epoch_cap.vclock_counter32);
   p.add("epoch_capture_ocxo1_counter32", epoch_cap.ocxo1_counter32);
   p.add("epoch_capture_ocxo2_counter32", epoch_cap.ocxo2_counter32);
+}
 
-  p.add("pps_edge_dispatch_registered", g_pps_edge_dispatch != nullptr);
-
-  p.add("vclock_irq_count",         g_vclock_lane.irq_count);
-  p.add("vclock_miss_count",        g_vclock_lane.miss_count);
-  p.add("vclock_bootstrap_count",   g_vclock_lane.bootstrap_count);
-  p.add("vclock_cadence_hits_total", g_vclock_lane.cadence_hits_total);
-  p.add("vclock_compare_target",    (uint32_t)g_vclock_lane.compare_target);
-  p.add("vclock_tick_mod_1000",     g_vclock_lane.tick_mod_1000);
-  p.add("vclock_logical_count32",   g_vclock_lane.logical_count32_at_last_second);
-
-  p.add("ocxo1_irq_count",          g_ocxo1_lane.irq_count);
-  p.add("ocxo1_miss_count",         g_ocxo1_lane.miss_count);
-  p.add("ocxo1_bootstrap_count",    g_ocxo1_lane.bootstrap_count);
-  p.add("ocxo1_cadence_hits_total", g_ocxo1_lane.cadence_hits_total);
-  p.add("ocxo1_compare_target",     (uint32_t)g_ocxo1_lane.compare_target);
-  p.add("ocxo1_tick_mod_1000",      g_ocxo1_lane.tick_mod_1000);
-  p.add("ocxo1_logical_count32",    g_ocxo1_lane.logical_count32_at_last_second);
-
-  p.add("ocxo2_irq_count",          g_ocxo2_lane.irq_count);
-  p.add("ocxo2_miss_count",         g_ocxo2_lane.miss_count);
-  p.add("ocxo2_bootstrap_count",    g_ocxo2_lane.bootstrap_count);
-  p.add("ocxo2_cadence_hits_total", g_ocxo2_lane.cadence_hits_total);
-  p.add("ocxo2_compare_target",     (uint32_t)g_ocxo2_lane.compare_target);
-  p.add("ocxo2_tick_mod_1000",      g_ocxo2_lane.tick_mod_1000);
-  p.add("ocxo2_logical_count32",    g_ocxo2_lane.logical_count32_at_last_second);
-
-  p.add("ocxo_witness_arch_enabled", true);
-  p.add("ocxo_witness_edge_publish_deferred", true);
-  p.add("ocxo_witness_one_second_counts", OCXO_WITNESS_ONE_SECOND_COUNTS);
-  p.add("ocxo_witness_arm_window_ticks", OCXO_WITNESS_ARM_WINDOW_TICKS);
-
-  p.add("ocxo1_witness_target_initialized", g_ocxo1_lane.witness_target_initialized);
-  p.add("ocxo1_witness_armed", g_ocxo1_lane.witness_armed);
-  p.add("ocxo1_witness_arm_count", g_ocxo1_lane.witness_arm_count);
-  p.add("ocxo1_witness_fire_count", g_ocxo1_lane.witness_fire_count);
-  p.add("ocxo1_witness_false_irq_count", g_ocxo1_lane.witness_false_irq_count);
-  p.add("ocxo1_witness_missed_target_count", g_ocxo1_lane.witness_missed_target_count);
-  p.add("ocxo1_witness_late_arm_count", g_ocxo1_lane.witness_late_arm_count);
-  p.add("ocxo1_witness_target_counter32", g_ocxo1_lane.witness_target_counter32);
-  p.add("ocxo1_witness_last_event_dwt", g_ocxo1_lane.witness_last_event_dwt);
-  p.add("ocxo1_witness_last_event_counter32", g_ocxo1_lane.witness_last_event_counter32);
-  p.add("ocxo1_witness_last_late_ticks", g_ocxo1_lane.witness_last_late_ticks);
-  p.add("ocxo1_witness_last_arm_remaining_ticks", g_ocxo1_lane.witness_last_arm_remaining_ticks);
-
-  p.add("ocxo2_witness_target_initialized", g_ocxo2_lane.witness_target_initialized);
-  p.add("ocxo2_witness_armed", g_ocxo2_lane.witness_armed);
-  p.add("ocxo2_witness_arm_count", g_ocxo2_lane.witness_arm_count);
-  p.add("ocxo2_witness_fire_count", g_ocxo2_lane.witness_fire_count);
-  p.add("ocxo2_witness_false_irq_count", g_ocxo2_lane.witness_false_irq_count);
-  p.add("ocxo2_witness_missed_target_count", g_ocxo2_lane.witness_missed_target_count);
-  p.add("ocxo2_witness_late_arm_count", g_ocxo2_lane.witness_late_arm_count);
-  p.add("ocxo2_witness_target_counter32", g_ocxo2_lane.witness_target_counter32);
-  p.add("ocxo2_witness_last_event_dwt", g_ocxo2_lane.witness_last_event_dwt);
-  p.add("ocxo2_witness_last_event_counter32", g_ocxo2_lane.witness_last_event_counter32);
-  p.add("ocxo2_witness_last_late_ticks", g_ocxo2_lane.witness_last_late_ticks);
-  p.add("ocxo2_witness_last_arm_remaining_ticks", g_ocxo2_lane.witness_last_arm_remaining_ticks);
-
-  // Static CPS compatibility — process_interrupt now mirrors the CLOCKS
-  // PPS/GPIO-derived one-second DWT slope.  Dynamic Gamma prediction has been
-  // retired.
+static void add_dynamic_cps_payload(Payload& p) {
   const uint32_t dynamic_cps = interrupt_dynamic_cps();
   p.add("dynamic_cps_owner", "CLOCKS_STATIC_PPS");
-  p.add("dynamic_cps",                         dynamic_cps);
-  p.add("dynamic_cps_valid",                   dynamic_cps != 0);
-  p.add("dynamic_cps_pps_sequence",            g_pps_gpio_heartbeat.edge_count);
-  p.add("dynamic_cps_last_pvc_dwt_at_edge",    g_pps_gpio_heartbeat.last_dwt);
-  p.add("dynamic_cps_last_reseed_value",       dynamic_cps);
+  p.add("dynamic_cps", dynamic_cps);
+  p.add("dynamic_cps_valid", dynamic_cps != 0);
+  p.add("dynamic_cps_pps_sequence", g_pps_gpio_heartbeat.edge_count);
+  p.add("dynamic_cps_last_pvc_dwt_at_edge", g_pps_gpio_heartbeat.last_dwt);
+  p.add("dynamic_cps_last_reseed_value", dynamic_cps);
   p.add("dynamic_cps_last_reseed_was_computed", dynamic_cps != 0);
-  p.add("dynamic_cps_net_adjustment_cycles",   0);
-  p.add("dynamic_cps_refine_ticks_this_second", 0);
-  p.add("dynamic_cps_adjustments_this_second", 0);
-  p.add("dynamic_cps_total_refine_ticks",      0);
-  p.add("dynamic_cps_total_adjustments",       0);
+}
 
-  p.add("pvc_anchor_ring_count", g_pvc_anchor_count);
-  p.add("pvc_anchor_ring_head", g_pvc_anchor_head);
-  p.add("pvc_anchor_ring_seq", g_pvc_anchor_seq);
-  p.add("pvc_anchor_reset_pending", g_pvc_anchor_reset_pending);
-  add_bridge_stats_payload(p, "timepop", g_bridge_stats_timepop);
-  add_bridge_stats_payload(p, "ocxo1", g_bridge_stats_ocxo1);
-  add_bridge_stats_payload(p, "ocxo2", g_bridge_stats_ocxo2);
+static void add_vclock_clock32_payload(Payload& p, const char* prefix) {
+  char key[96];
+  auto add_bool = [&](const char* suffix, bool value) {
+    snprintf(key, sizeof(key), "%s_%s", prefix, suffix);
+    p.add(key, value);
+  };
+  auto add_u32 = [&](const char* suffix, uint32_t value) {
+    snprintf(key, sizeof(key), "%s_%s", prefix, suffix);
+    p.add(key, value);
+  };
+  auto add_u64 = [&](const char* suffix, uint64_t value) {
+    snprintf(key, sizeof(key), "%s_%s", prefix, suffix);
+    p.add(key, value);
+  };
 
-  p.add("vclock_clock32_zeroed", g_vclock_clock32.zeroed);
-  p.add("vclock_clock32_zero_ns", g_vclock_clock32.zero_ns);
-  p.add("vclock_clock32_zero_counter32", g_vclock_clock32.zero_counter32);
-  p.add("vclock_clock32_current", g_vclock_clock32.current_counter32);
-  p.add("vclock_clock32_hardware_low16_at_zero", (uint32_t)g_vclock_clock32.hardware_low16_at_zero);
-  p.add("vclock_clock32_hardware_low16_at_current", (uint32_t)g_vclock_clock32.hardware_low16_at_current);
-  p.add("vclock_clock32_hardware_anchor_valid", g_vclock_clock32.hardware_anchor_valid);
-  p.add("vclock_clock32_hardware_anchor_update_count", g_vclock_clock32.hardware_anchor_update_count);
-  p.add("vclock_clock32_pending_zero", g_vclock_clock32.pending_zero);
-  p.add("vclock_clock32_zero_count", g_vclock_clock32.zero_count);
-  p.add("vclock_clock32_minder_update_count", g_vclock_clock32.minder_update_count);
-  p.add("vclock_clock32_pending_zero_count", g_vclock_clock32.pending_zero_count);
+  add_bool("clock32_zeroed", g_vclock_clock32.zeroed);
+  add_u64("clock32_zero_ns", g_vclock_clock32.zero_ns);
+  add_u32("clock32_zero_counter32", g_vclock_clock32.zero_counter32);
+  add_u32("clock32_current", g_vclock_clock32.current_counter32);
+  add_u32("clock32_hardware_low16_at_zero", (uint32_t)g_vclock_clock32.hardware_low16_at_zero);
+  add_u32("clock32_hardware_low16_at_current", (uint32_t)g_vclock_clock32.hardware_low16_at_current);
+  add_bool("clock32_hardware_anchor_valid", g_vclock_clock32.hardware_anchor_valid);
+  add_u32("clock32_hardware_anchor_update_count", g_vclock_clock32.hardware_anchor_update_count);
+  add_bool("clock32_pending_zero", g_vclock_clock32.pending_zero);
+  add_u32("clock32_zero_count", g_vclock_clock32.zero_count);
+  add_u32("clock32_minder_update_count", g_vclock_clock32.minder_update_count);
+  add_u32("clock32_pending_zero_count", g_vclock_clock32.pending_zero_count);
+}
 
-  p.add("ocxo1_clock32_zeroed", g_ocxo1_clock32.zeroed);
-  p.add("ocxo1_clock32_zero_ns", g_ocxo1_clock32.zero_ns);
-  p.add("ocxo1_clock32_zero_counter32", g_ocxo1_clock32.zero_counter32);
-  p.add("ocxo1_clock32_current", g_ocxo1_clock32.current_counter32);
-  p.add("ocxo1_clock32_pending_zero", g_ocxo1_clock32.pending_zero);
-  p.add("ocxo1_clock32_zero_count", g_ocxo1_clock32.zero_count);
-  p.add("ocxo1_clock32_minder_update_count", g_ocxo1_clock32.minder_update_count);
+static void add_ocxo_clock32_payload(Payload& p,
+                                     const char* prefix,
+                                     const synthetic_clock32_t& clock32) {
+  char key[96];
+  auto add_bool = [&](const char* suffix, bool value) {
+    snprintf(key, sizeof(key), "%s_%s", prefix, suffix);
+    p.add(key, value);
+  };
+  auto add_u32 = [&](const char* suffix, uint32_t value) {
+    snprintf(key, sizeof(key), "%s_%s", prefix, suffix);
+    p.add(key, value);
+  };
+  auto add_u64 = [&](const char* suffix, uint64_t value) {
+    snprintf(key, sizeof(key), "%s_%s", prefix, suffix);
+    p.add(key, value);
+  };
 
-  p.add("ocxo2_clock32_zeroed", g_ocxo2_clock32.zeroed);
-  p.add("ocxo2_clock32_zero_ns", g_ocxo2_clock32.zero_ns);
-  p.add("ocxo2_clock32_zero_counter32", g_ocxo2_clock32.zero_counter32);
-  p.add("ocxo2_clock32_current", g_ocxo2_clock32.current_counter32);
-  p.add("ocxo2_clock32_pending_zero", g_ocxo2_clock32.pending_zero);
-  p.add("ocxo2_clock32_zero_count", g_ocxo2_clock32.zero_count);
-  p.add("ocxo2_clock32_minder_update_count", g_ocxo2_clock32.minder_update_count);
+  add_bool("clock32_zeroed", clock32.zeroed);
+  add_u64("clock32_zero_ns", clock32.zero_ns);
+  add_u32("clock32_zero_counter32", clock32.zero_counter32);
+  add_u32("clock32_current", clock32.current_counter32);
+  add_bool("clock32_pending_zero", clock32.pending_zero);
+  add_u32("clock32_zero_count", clock32.zero_count);
+  add_u32("clock32_minder_update_count", clock32.minder_update_count);
+}
 
+static void add_runtime_lane_summary(Payload& p,
+                                     const char* prefix,
+                                     const interrupt_subscriber_runtime_t* rt) {
+  char key[96];
+  auto add_bool = [&](const char* suffix, bool value) {
+    snprintf(key, sizeof(key), "%s_%s", prefix, suffix);
+    p.add(key, value);
+  };
+  auto add_u32 = [&](const char* suffix, uint32_t value) {
+    snprintf(key, sizeof(key), "%s_%s", prefix, suffix);
+    p.add(key, value);
+  };
+
+  add_bool("subscribed", rt ? rt->subscribed : false);
+  add_bool("active", rt ? rt->active : false);
+  add_bool("has_fired", rt ? rt->has_fired : false);
+  add_u32("start_count", rt ? rt->start_count : 0U);
+  add_u32("stop_count", rt ? rt->stop_count : 0U);
+  add_u32("irq_count", rt ? rt->irq_count : 0U);
+  add_u32("dispatch_count", rt ? rt->dispatch_count : 0U);
+  add_u32("event_count", rt ? rt->event_count : 0U);
+  if (rt && rt->has_fired) {
+    add_u32("last_event_dwt", rt->last_event.dwt_at_event);
+    add_u32("last_event_counter32", rt->last_event.counter32_at_event);
+    add_u32("last_event_status", (uint32_t)((uint8_t)rt->last_event.status));
+    add_u32("last_diag_anchor_selection_kind", rt->last_diag.anchor_selection_kind);
+    add_u32("last_diag_anchor_failure_mask", rt->last_diag.anchor_failure_mask);
+  } else {
+    add_u32("last_event_dwt", 0);
+    add_u32("last_event_counter32", 0);
+    add_u32("last_event_status", 0);
+    add_u32("last_diag_anchor_selection_kind", 0);
+    add_u32("last_diag_anchor_failure_mask", 0);
+  }
+}
+
+static void add_vclock_lane_payload(Payload& p, bool detailed) {
+  p.add("lane", "VCLOCK");
+  p.add("kind", "VCLOCK");
+  p.add("provider", "QTIMER1");
+  p.add("hardware_lane", "QTIMER1_CH2_COMP");
+  p.add("cadence_source", "QTIMER1_CH2_TIMEPOP_CADENCE_MINDER");
+  p.add("counter_source", "QTIMER1_CH0_SYNTHETIC_COUNTER32");
+  p.add("event_source", "CADENCE_MINDER_1000TH_FIRE");
+  p.add("dwt_authority", "QTIMER1_CH2_TIMEPOP_EVENT_DWT");
+
+  add_runtime_lane_summary(p, "vclock", g_rt_vclock);
+  p.add("vclock_irq_count", g_vclock_lane.irq_count);
+  p.add("vclock_miss_count", g_vclock_lane.miss_count);
+  p.add("vclock_bootstrap_count", g_vclock_lane.bootstrap_count);
+  p.add("vclock_cadence_hits_total", g_vclock_lane.cadence_hits_total);
+  p.add("vclock_compare_target", (uint32_t)g_vclock_lane.compare_target);
+  p.add("vclock_tick_mod_1000", g_vclock_lane.tick_mod_1000);
+  p.add("vclock_logical_count32", g_vclock_lane.logical_count32_at_last_second);
+
+  if (!detailed) return;
+
+  p.add("vclock_dwt_repair_enabled", false);
+  p.add("vclock_dwt_repair_threshold_cycles", VCLOCK_DWT_REPAIR_THRESHOLD_CYCLES);
+  p.add("vclock_dwt_repair_min_history_count", VCLOCK_DWT_REPAIR_MIN_HISTORY_COUNT);
+  p.add("vclock_dwt_repair_max_prediction_residual_cycles", VCLOCK_DWT_REPAIR_MAX_PREDICTION_RESIDUAL_CYCLES);
+  p.add("vclock_dwt_repair_candidate_count", g_vclock_repair_stats.candidate_count);
+  p.add("vclock_dwt_repair_applied_count", g_vclock_repair_stats.applied_count);
+  p.add("vclock_dwt_repair_consecutive_candidate_count", g_vclock_repair_stats.consecutive_candidate_count);
+  p.add("vclock_dwt_repair_last_candidate", g_vclock_repair_stats.last_candidate);
+  p.add("vclock_dwt_repair_last_synthetic", g_vclock_repair_stats.last_synthetic);
+  p.add("vclock_dwt_repair_last_original_dwt", g_vclock_repair_stats.last_original_dwt);
+  p.add("vclock_dwt_repair_last_predicted_dwt", g_vclock_repair_stats.last_predicted_dwt);
+  p.add("vclock_dwt_repair_last_used_dwt", g_vclock_repair_stats.last_used_dwt);
+  p.add("vclock_dwt_repair_last_error_cycles", g_vclock_repair_stats.last_error_cycles);
+  p.add("vclock_dwt_repair_max_abs_error_cycles", g_vclock_repair_stats.max_abs_error_cycles);
+
+  add_vclock_clock32_payload(p, "vclock");
   p.add("qtimer1_ch1_active", g_qtimer1_ch1_active);
   p.add("qtimer1_ch1_sequence", g_qtimer1_ch1_sequence);
   p.add("qtimer1_ch1_target_counter32", g_qtimer1_ch1_target_counter32);
@@ -3376,58 +3367,201 @@ static Payload cmd_report(const Payload&) {
   p.add("qtimer1_ch1_hop_count", g_qtimer1_ch1_hop_count);
   p.add("qtimer1_ch2_last_target_counter32", g_qtimer1_ch2_last_target_counter32);
   p.add("qtimer1_ch2_arm_count", g_qtimer1_ch2_arm_count);
+}
 
-  p.add("qtimer2_ch0_count", g_qtimer2_ch0_count);
-  p.add("qtimer2_ch0_counter", (uint32_t)IMXRT_TMR2.CH[0].CNTR);
-  p.add("qtimer2_ch0_comp1", (uint32_t)IMXRT_TMR2.CH[0].COMP1);
-  const uint16_t qtimer2_ch0_csctrl = IMXRT_TMR2.CH[0].CSCTRL;
-  const bool qtimer2_ch0_compare_enabled =
-      (qtimer2_ch0_csctrl & TMR_CSCTRL_TCF1EN) != 0;
-  const bool qtimer2_ch0_compare_flag =
-      (qtimer2_ch0_csctrl & TMR_CSCTRL_TCF1) != 0;
-  p.add("qtimer2_ch0_csctrl", (uint32_t)qtimer2_ch0_csctrl);
-  p.add("qtimer2_ch0_compare_enabled", qtimer2_ch0_compare_enabled);
-  p.add("qtimer2_ch0_compare_flag", qtimer2_ch0_compare_flag);
-  p.add("qtimer2_ch0_compare_live",
-        qtimer2_ch0_compare_enabled && qtimer2_ch0_compare_flag);
-  p.add("qtimer2_last_ch0_late_ticks", g_qtimer2_last_ch0_late_ticks);
-  p.add("qtimer2_last_ch0_dwt_raw", g_qtimer2_last_ch0_dwt_raw);
-  p.add("qtimer2_last_ch0_event_dwt", g_qtimer2_last_ch0_event_dwt);
-  p.add("qtimer2_last_ch0_dwt_coordinate_source", g_qtimer2_last_ch0_dwt_coordinate_source);
+static void add_ocxo_lane_payload(Payload& p,
+                                  const char* lane_name,
+                                  const char* prefix,
+                                  ocxo_lane_t& lane,
+                                  const synthetic_clock32_t& clock32,
+                                  const interrupt_subscriber_runtime_t* rt,
+                                  bool detailed) {
+  p.add("lane", lane_name);
+  p.add("kind", lane_name);
+  p.add("provider", (lane.module == &IMXRT_TMR2) ? "QTIMER2" : "QTIMER3");
+  p.add("hardware_lane", (lane.module == &IMXRT_TMR2) ? "QTIMER2_CH0_COMP" : "QTIMER3_CH3_COMP");
+  p.add("cadence_source", "QTIMER1_CH2_TIMEPOP_CADENCE_MINDER");
+  p.add("counter_source", (lane.module == &IMXRT_TMR2)
+      ? "QTIMER2_CH0_PASSIVE_COUNTER_SYNTHETIC_COUNTER32"
+      : "QTIMER3_CH3_PASSIVE_COUNTER_SYNTHETIC_COUNTER32");
+  p.add("event_source", "OCXO_ONCE_PER_SECOND_WITNESS_COMPARE");
+  p.add("dwt_authority", (lane.module == &IMXRT_TMR2)
+      ? "QTIMER2_CH0_ISR_ENTRY_DWT"
+      : "QTIMER3_CH3_ISR_ENTRY_DWT");
 
-  p.add("qtimer3_ch3_count", g_qtimer3_ch3_count);
-  p.add("qtimer3_ch3_counter", (uint32_t)IMXRT_TMR3.CH[3].CNTR);
-  p.add("qtimer3_ch3_comp1", (uint32_t)IMXRT_TMR3.CH[3].COMP1);
-  const uint16_t qtimer3_ch3_csctrl = IMXRT_TMR3.CH[3].CSCTRL;
-  const bool qtimer3_ch3_compare_enabled =
-      (qtimer3_ch3_csctrl & TMR_CSCTRL_TCF1EN) != 0;
-  const bool qtimer3_ch3_compare_flag =
-      (qtimer3_ch3_csctrl & TMR_CSCTRL_TCF1) != 0;
-  p.add("qtimer3_ch3_csctrl", (uint32_t)qtimer3_ch3_csctrl);
-  p.add("qtimer3_ch3_compare_enabled", qtimer3_ch3_compare_enabled);
-  p.add("qtimer3_ch3_compare_flag", qtimer3_ch3_compare_flag);
-  p.add("qtimer3_ch3_compare_live",
-        qtimer3_ch3_compare_enabled && qtimer3_ch3_compare_flag);
-  p.add("qtimer3_last_ch3_late_ticks", g_qtimer3_last_ch3_late_ticks);
-  p.add("qtimer3_last_ch3_dwt_raw", g_qtimer3_last_ch3_dwt_raw);
-  p.add("qtimer3_last_ch3_event_dwt", g_qtimer3_last_ch3_event_dwt);
-  p.add("qtimer3_last_ch3_dwt_coordinate_source", g_qtimer3_last_ch3_dwt_coordinate_source);
+  add_runtime_lane_summary(p, prefix, rt);
 
+  char key[96];
+  auto add_bool = [&](const char* suffix, bool value) {
+    snprintf(key, sizeof(key), "%s_%s", prefix, suffix);
+    p.add(key, value);
+  };
+  auto add_u32 = [&](const char* suffix, uint32_t value) {
+    snprintf(key, sizeof(key), "%s_%s", prefix, suffix);
+    p.add(key, value);
+  };
+
+  add_bool("initialized", lane.initialized);
+  add_bool("active", lane.active);
+  add_u32("irq_count", lane.irq_count);
+  add_u32("miss_count", lane.miss_count);
+  add_u32("bootstrap_count", lane.bootstrap_count);
+  add_u32("cadence_hits_total", lane.cadence_hits_total);
+  add_u32("compare_target", (uint32_t)lane.compare_target);
+  add_u32("tick_mod_1000", lane.tick_mod_1000);
+  add_u32("logical_count32", lane.logical_count32_at_last_second);
+  add_bool("witness_target_initialized", lane.witness_target_initialized);
+  add_bool("witness_armed", lane.witness_armed);
+  add_u32("witness_arm_count", lane.witness_arm_count);
+  add_u32("witness_fire_count", lane.witness_fire_count);
+  add_u32("witness_false_irq_count", lane.witness_false_irq_count);
+  add_u32("witness_missed_target_count", lane.witness_missed_target_count);
+  add_u32("witness_late_arm_count", lane.witness_late_arm_count);
+  add_u32("witness_target_counter32", lane.witness_target_counter32);
+  add_u32("witness_last_event_dwt", lane.witness_last_event_dwt);
+  add_u32("witness_last_event_counter32", lane.witness_last_event_counter32);
+  add_u32("witness_last_late_ticks", lane.witness_last_late_ticks);
+  add_u32("witness_last_arm_remaining_ticks", lane.witness_last_arm_remaining_ticks);
+
+  if (!detailed) return;
+
+  add_ocxo_clock32_payload(p, prefix, clock32);
+
+  const bool is_ocxo1 = (lane.module == &IMXRT_TMR2 && lane.channel == 0);
+  const uint16_t csctrl = is_ocxo1 ? IMXRT_TMR2.CH[0].CSCTRL : IMXRT_TMR3.CH[3].CSCTRL;
+  const bool compare_enabled = (csctrl & TMR_CSCTRL_TCF1EN) != 0;
+  const bool compare_flag = (csctrl & TMR_CSCTRL_TCF1) != 0;
+
+  add_u32("qtimer_count", is_ocxo1 ? g_qtimer2_ch0_count : g_qtimer3_ch3_count);
+  add_u32("qtimer_counter", is_ocxo1 ? (uint32_t)IMXRT_TMR2.CH[0].CNTR
+                                     : (uint32_t)IMXRT_TMR3.CH[3].CNTR);
+  add_u32("qtimer_comp1", is_ocxo1 ? (uint32_t)IMXRT_TMR2.CH[0].COMP1
+                                   : (uint32_t)IMXRT_TMR3.CH[3].COMP1);
+  add_u32("qtimer_csctrl", (uint32_t)csctrl);
+  add_bool("qtimer_compare_enabled", compare_enabled);
+  add_bool("qtimer_compare_flag", compare_flag);
+  add_bool("qtimer_compare_live", compare_enabled && compare_flag);
+  add_u32("qtimer_last_late_ticks", is_ocxo1 ? g_qtimer2_last_ch0_late_ticks
+                                             : g_qtimer3_last_ch3_late_ticks);
+  add_u32("qtimer_last_dwt_raw", is_ocxo1 ? g_qtimer2_last_ch0_dwt_raw
+                                          : g_qtimer3_last_ch3_dwt_raw);
+  add_u32("qtimer_last_event_dwt", is_ocxo1 ? g_qtimer2_last_ch0_event_dwt
+                                            : g_qtimer3_last_ch3_event_dwt);
+  add_u32("qtimer_last_dwt_coordinate_source",
+          is_ocxo1 ? g_qtimer2_last_ch0_dwt_coordinate_source
+                   : g_qtimer3_last_ch3_dwt_coordinate_source);
+
+  add_u32("post_isr_arm_count", is_ocxo1 ? g_ocxo1_post_isr_arm_count : g_ocxo2_post_isr_arm_count);
+  add_u32("post_isr_drain_count", is_ocxo1 ? g_ocxo1_post_isr_drain_count : g_ocxo2_post_isr_drain_count);
+  add_u32("post_isr_overwrite_count", is_ocxo1 ? g_ocxo1_post_isr_overwrite_count : g_ocxo2_post_isr_overwrite_count);
+  add_bool("deferred_edge_pending", is_ocxo1 ? g_ocxo1_deferred.edge_pending : g_ocxo2_deferred.edge_pending);
+}
+
+static Payload cmd_report(const Payload&) {
+  Payload p;
+  add_runtime_payload(p);
+  add_priority_payload(p);
+  add_cadence_minder_payload(p);
+  add_pps_payload(p);
+  add_epoch_capture_payload(p);
+  add_dynamic_cps_payload(p);
+
+  p.add("pvc_anchor_ring_count", g_pvc_anchor_count);
+  p.add("pvc_anchor_ring_head", g_pvc_anchor_head);
+  p.add("pvc_anchor_ring_seq", g_pvc_anchor_seq);
+  p.add("pvc_anchor_reset_pending", g_pvc_anchor_reset_pending);
+
+  // Compact health counters only.  Detailed lane state lives in REPORT_LANES
+  // and REPORT_LANE so this command stays under Payload limits.
+  p.add("vclock_event_count", g_rt_vclock ? g_rt_vclock->event_count : 0U);
+  p.add("vclock_dispatch_count", g_rt_vclock ? g_rt_vclock->dispatch_count : 0U);
+  p.add("vclock_irq_count", g_vclock_lane.irq_count);
+  p.add("vclock_miss_count", g_vclock_lane.miss_count);
+  p.add("ocxo1_event_count", g_rt_ocxo1 ? g_rt_ocxo1->event_count : 0U);
+  p.add("ocxo1_dispatch_count", g_rt_ocxo1 ? g_rt_ocxo1->dispatch_count : 0U);
+  p.add("ocxo1_irq_count", g_ocxo1_lane.irq_count);
+  p.add("ocxo1_miss_count", g_ocxo1_lane.miss_count);
+  p.add("ocxo2_event_count", g_rt_ocxo2 ? g_rt_ocxo2->event_count : 0U);
+  p.add("ocxo2_dispatch_count", g_rt_ocxo2 ? g_rt_ocxo2->dispatch_count : 0U);
+  p.add("ocxo2_irq_count", g_ocxo2_lane.irq_count);
+  p.add("ocxo2_miss_count", g_ocxo2_lane.miss_count);
+
+  p.add("ocxo_witness_arch_enabled", true);
+  p.add("ocxo_witness_edge_publish_deferred", true);
+  p.add("ocxo_witness_one_second_counts", OCXO_WITNESS_ONE_SECOND_COUNTS);
+  p.add("ocxo_witness_arm_window_ticks", OCXO_WITNESS_ARM_WINDOW_TICKS);
   p.add("ocxo_deferred_asap_arm_count", g_ocxo_deferred_asap_arm_count);
   p.add("ocxo_deferred_asap_overwrite_count", g_ocxo_deferred_asap_overwrite_count);
   p.add("ocxo_deferred_sample_count", g_ocxo_deferred_sample_count);
   p.add("ocxo_deferred_edge_count", g_ocxo_deferred_edge_count);
-  p.add("ocxo1_deferred_sample_pending", false);
-  p.add("ocxo1_deferred_edge_pending", g_ocxo1_deferred.edge_pending);
-  p.add("ocxo2_deferred_sample_pending", false);
-  p.add("ocxo2_deferred_edge_pending", g_ocxo2_deferred.edge_pending);
 
   return p;
 }
 
+static Payload cmd_report_lanes(const Payload&) {
+  Payload p;
+  p.add("report", "lanes");
+  p.add("lane_count", 3);
+  p.add("detail_command", "INTERRUPT.REPORT_LANE lane=VCLOCK|OCXO1|OCXO2");
+
+  Payload vclock;
+  add_vclock_lane_payload(vclock, false);
+  p.add_object("vclock", vclock);
+
+  Payload ocxo1;
+  add_ocxo_lane_payload(ocxo1, "OCXO1", "ocxo1", g_ocxo1_lane,
+                        g_ocxo1_clock32, g_rt_ocxo1, false);
+  p.add_object("ocxo1", ocxo1);
+
+  Payload ocxo2;
+  add_ocxo_lane_payload(ocxo2, "OCXO2", "ocxo2", g_ocxo2_lane,
+                        g_ocxo2_clock32, g_rt_ocxo2, false);
+  p.add_object("ocxo2", ocxo2);
+
+  return p;
+}
+
+static Payload cmd_report_lane(const Payload& args) {
+  const char* lane = args.getString("lane");
+  if (!lane || !*lane) lane = args.getString("name");
+
+  Payload p;
+  p.add("report", "lane_detail");
+
+  if (!lane || !*lane) {
+    p.add("error", "missing lane parameter");
+    p.add("usage", "INTERRUPT.REPORT_LANE lane=VCLOCK|OCXO1|OCXO2");
+    return p;
+  }
+
+  if (!strcasecmp(lane, "VCLOCK") || !strcasecmp(lane, "VCLK")) {
+    add_vclock_lane_payload(p, true);
+    return p;
+  }
+
+  if (!strcasecmp(lane, "OCXO1") || !strcasecmp(lane, "O1")) {
+    add_ocxo_lane_payload(p, "OCXO1", "ocxo1", g_ocxo1_lane,
+                          g_ocxo1_clock32, g_rt_ocxo1, true);
+    return p;
+  }
+
+  if (!strcasecmp(lane, "OCXO2") || !strcasecmp(lane, "O2")) {
+    add_ocxo_lane_payload(p, "OCXO2", "ocxo2", g_ocxo2_lane,
+                          g_ocxo2_clock32, g_rt_ocxo2, true);
+    return p;
+  }
+
+  p.add("error", "unknown lane");
+  p.add("lane", lane);
+  p.add("usage", "INTERRUPT.REPORT_LANE lane=VCLOCK|OCXO1|OCXO2");
+  return p;
+}
+
 static const process_command_entry_t INTERRUPT_COMMANDS[] = {
-  { "REPORT",          cmd_report          },
-  { nullptr,           nullptr             }
+  { "REPORT",       cmd_report       },
+  { "REPORT_LANES", cmd_report_lanes },
+  { "REPORT_LANE",  cmd_report_lane  },
+  { nullptr,        nullptr          }
 };
 
 static const process_vtable_t INTERRUPT_PROCESS = {
@@ -3439,6 +3573,7 @@ static const process_vtable_t INTERRUPT_PROCESS = {
 void process_interrupt_register(void) {
   process_register("INTERRUPT", &INTERRUPT_PROCESS);
 }
+
 
 // ============================================================================
 // Stringifiers
