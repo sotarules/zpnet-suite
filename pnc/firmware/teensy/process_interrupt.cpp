@@ -148,9 +148,15 @@ static constexpr const char* CADENCE_MINDER_NAME = "CADENCE_MINDER";
 
 // PPS relay ownership lives in process_interrupt because the visible relay edge
 // is a physical PPS witness.  The rising edge is asserted directly inside the
-// PPS GPIO ISR; the 500 ms deassert is scheduled from deferred TimePop context.
+// PPS GPIO ISR; the 500 ms deassert is driven by CADENCE_MINDER's existing
+// 1 ms heartbeat so relay-off does not allocate/cancel/mutate TimePop slots.
 static constexpr uint64_t PPS_RELAY_OFF_NS = 500000000ULL;
-static constexpr const char* PPS_RELAY_OFF_NAME = "pps-relay-off";
+static constexpr uint32_t PPS_RELAY_OFF_CADENCE_TICKS =
+    (uint32_t)(PPS_RELAY_OFF_NS / CADENCE_MINDER_PERIOD_NS);
+static_assert((PPS_RELAY_OFF_NS % CADENCE_MINDER_PERIOD_NS) == 0ULL,
+              "PPS relay off interval must be an integer CADENCE_MINDER period");
+static_assert(PPS_RELAY_OFF_CADENCE_TICKS == 500U,
+              "PPS relay off interval should be 500 cadence ticks");
 
 // OCXO DWT authorship.  OCXO1 and OCXO2 now live on separate QuadTimer
 // modules/vectors.  Each OCXO ISR captures ARM_DWT_CYCCNT as its first
@@ -609,6 +615,7 @@ static void pps_post_isr_asap_callback(timepop_ctx_t*, timepop_diag_t*, void*);
 
 static volatile bool     g_pps_relay_timer_active = false;
 static volatile bool     g_pps_relay_deassert_arm_pending = false;
+static volatile uint32_t g_pps_relay_deassert_countdown_ticks = 0;
 static volatile uint32_t g_pps_relay_assert_count = 0;
 static volatile uint32_t g_pps_relay_deassert_count = 0;
 static volatile uint32_t g_pps_relay_deassert_arm_count = 0;
@@ -617,9 +624,8 @@ static volatile uint32_t g_pps_relay_deassert_arm_skip_count = 0;
 static volatile uint32_t g_pps_relay_last_assert_sequence = 0;
 static volatile bool     g_pps_relay_pin_initialized = false;
 
-static void pps_relay_deassert_callback(timepop_ctx_t*, timepop_diag_t*, void*);
 static inline void pps_relay_assert_from_isr(uint32_t sequence);
-static void pps_relay_arm_deassert_from_deferred(void);
+static inline void pps_relay_cadence_minder_tick(void);
 
 // ============================================================================
 // PPS witness + VCLOCK-domain canonical epoch latch
@@ -1692,6 +1698,7 @@ static void cadence_minder_timepop_callback(timepop_ctx_t* ctx,
   const uint16_t fired_low16 = (uint16_t)(cadence_counter32 & 0xFFFFU);
 
   g_cadence_minder_fire_count++;
+  pps_relay_cadence_minder_tick();
 
   // VCLOCK: CADENCE_MINDER is now the only 1 ms substrate cadence.  It owns
   // the synthetic VCLOCK low-word anchor refresh and the former separate
@@ -2398,43 +2405,32 @@ static void pps_edge_dispatch_trampoline(timepop_ctx_t*, timepop_diag_t*, void*)
 }
 
 
-static void pps_relay_deassert_callback(timepop_ctx_t*, timepop_diag_t*, void*) {
-  digitalWriteFast(GNSS_PPS_RELAY, LOW);
-  g_pps_relay_timer_active = false;
-  g_pps_relay_deassert_count++;
-}
-
 static inline void pps_relay_assert_from_isr(uint32_t sequence) {
+  // PPS relay HIGH is a physical PPS witness and stays in ISR context.
+  // Relay LOW is intentionally *not* scheduled through TimePop.  Instead,
+  // CADENCE_MINDER's existing 1 ms heartbeat owns the countdown and deasserts
+  // the relay when the counter reaches zero.  This removes relay-off from
+  // TimePop ASAP/one-shot slot mutation entirely.
   digitalWriteFast(GNSS_PPS_RELAY, HIGH);
   g_pps_relay_assert_count++;
   g_pps_relay_last_assert_sequence = sequence;
-  g_pps_relay_deassert_arm_pending = true;
-}
-
-static void pps_relay_arm_deassert_from_deferred(void) {
-  if (!g_pps_relay_deassert_arm_pending) return;
+  g_pps_relay_deassert_countdown_ticks = PPS_RELAY_OFF_CADENCE_TICKS;
   g_pps_relay_deassert_arm_pending = false;
-
-  // Re-arm on every PPS assertion, even if our local mirror still believes an
-  // old deassert timer is active.  TimePop epoch changes may cancel named
-  // one-shots without calling the owner's callback; relying on a sticky
-  // timer_active latch can therefore glue the relay HIGH forever.
-  timepop_cancel_by_name(PPS_RELAY_OFF_NAME);
-
-  const timepop_handle_t h =
-      timepop_arm(PPS_RELAY_OFF_NS,
-                  false,
-                  pps_relay_deassert_callback,
-                  nullptr,
-                  PPS_RELAY_OFF_NAME);
-  if (h == TIMEPOP_INVALID_HANDLE) {
-    g_pps_relay_timer_active = false;
-    g_pps_relay_deassert_arm_fail_count++;
-    return;
-  }
-
   g_pps_relay_timer_active = true;
   g_pps_relay_deassert_arm_count++;
+}
+
+static inline void pps_relay_cadence_minder_tick(void) {
+  uint32_t ticks = g_pps_relay_deassert_countdown_ticks;
+  if (ticks == 0) return;
+
+  ticks--;
+  g_pps_relay_deassert_countdown_ticks = ticks;
+  if (ticks != 0) return;
+
+  digitalWriteFast(GNSS_PPS_RELAY, LOW);
+  g_pps_relay_timer_active = false;
+  g_pps_relay_deassert_count++;
 }
 
 static void pps_post_isr_publish_inline(const interrupt_epoch_capture_t& cap,
@@ -2464,7 +2460,6 @@ static void pps_post_isr_asap_callback(timepop_ctx_t*, timepop_diag_t*, void*) {
 
   g_pps_post_isr.drain_count++;
   pps_post_isr_publish_inline(cap, isr_entry_dwt_raw);
-  pps_relay_arm_deassert_from_deferred();
 }
 
 static void pps_post_isr_defer(const interrupt_epoch_capture_t& cap,
@@ -2933,6 +2928,7 @@ void process_interrupt_init(void) {
   g_pps_post_isr = pps_post_isr_mailbox_t{};
   g_pps_relay_timer_active = false;
   g_pps_relay_deassert_arm_pending = false;
+  g_pps_relay_deassert_countdown_ticks = 0;
   g_pps_relay_assert_count = 0;
   g_pps_relay_deassert_count = 0;
   g_pps_relay_deassert_arm_count = 0;
@@ -3159,12 +3155,15 @@ static void add_pps_payload(Payload& p) {
 
   p.add("pps_relay_owner", "process_interrupt");
   p.add("pps_relay_assert_in_isr", true);
-  p.add("pps_relay_deassert_in_timepop", true);
+  p.add("pps_relay_deassert_in_timepop", false);
+  p.add("pps_relay_deassert_in_cadence_minder", true);
   p.add("pps_relay_rearm_deassert_every_pps", true);
   p.add("pps_relay_off_ns", (uint64_t)PPS_RELAY_OFF_NS);
+  p.add("pps_relay_off_cadence_ticks", PPS_RELAY_OFF_CADENCE_TICKS);
   p.add("pps_relay_pin_initialized", g_pps_relay_pin_initialized);
   p.add("pps_relay_timer_active", g_pps_relay_timer_active);
   p.add("pps_relay_deassert_arm_pending", g_pps_relay_deassert_arm_pending);
+  p.add("pps_relay_deassert_countdown_ticks", g_pps_relay_deassert_countdown_ticks);
   p.add("pps_relay_assert_count", g_pps_relay_assert_count);
   p.add("pps_relay_deassert_count", g_pps_relay_deassert_count);
   p.add("pps_relay_deassert_arm_count", g_pps_relay_deassert_arm_count);
