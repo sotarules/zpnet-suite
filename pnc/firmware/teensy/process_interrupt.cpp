@@ -145,6 +145,12 @@ static constexpr uint32_t EPOCH_CAPTURE_MAX_WINDOW_CYCLES =
 static constexpr uint64_t CADENCE_MINDER_PERIOD_NS = 1000000ULL;
 static constexpr const char* CADENCE_MINDER_NAME = "CADENCE_MINDER";
 
+// PPS relay ownership lives in process_interrupt because the visible relay edge
+// is a physical PPS witness.  The rising edge is asserted directly inside the
+// PPS GPIO ISR; the 500 ms deassert is scheduled from deferred TimePop context.
+static constexpr uint64_t PPS_RELAY_OFF_NS = 500000000ULL;
+static constexpr const char* PPS_RELAY_OFF_NAME = "pps-relay-off";
+
 // OCXO DWT authorship.  OCXO1 and OCXO2 now live on separate QuadTimer
 // modules/vectors.  Each OCXO ISR captures ARM_DWT_CYCCNT as its first
 // instruction and applies the calibrated QTimer ISR-entry latency correction.
@@ -599,6 +605,20 @@ struct pps_post_isr_mailbox_t {
 
 static pps_post_isr_mailbox_t g_pps_post_isr = {};
 static void pps_post_isr_asap_callback(timepop_ctx_t*, timepop_diag_t*, void*);
+
+static volatile bool     g_pps_relay_timer_active = false;
+static volatile bool     g_pps_relay_deassert_arm_pending = false;
+static volatile uint32_t g_pps_relay_assert_count = 0;
+static volatile uint32_t g_pps_relay_deassert_count = 0;
+static volatile uint32_t g_pps_relay_deassert_arm_count = 0;
+static volatile uint32_t g_pps_relay_deassert_arm_fail_count = 0;
+static volatile uint32_t g_pps_relay_deassert_arm_skip_count = 0;
+static volatile uint32_t g_pps_relay_last_assert_sequence = 0;
+static volatile bool     g_pps_relay_pin_initialized = false;
+
+static void pps_relay_deassert_callback(timepop_ctx_t*, timepop_diag_t*, void*);
+static inline void pps_relay_assert_from_isr(uint32_t sequence);
+static void pps_relay_arm_deassert_from_deferred(void);
 
 // ============================================================================
 // PPS witness + VCLOCK-domain canonical epoch latch
@@ -2376,6 +2396,46 @@ static void pps_edge_dispatch_trampoline(timepop_ctx_t*, timepop_diag_t*, void*)
   g_pps_edge_dispatch(snap);
 }
 
+
+static void pps_relay_deassert_callback(timepop_ctx_t*, timepop_diag_t*, void*) {
+  digitalWriteFast(GNSS_PPS_RELAY, LOW);
+  g_pps_relay_timer_active = false;
+  g_pps_relay_deassert_count++;
+}
+
+static inline void pps_relay_assert_from_isr(uint32_t sequence) {
+  digitalWriteFast(GNSS_PPS_RELAY, HIGH);
+  g_pps_relay_assert_count++;
+  g_pps_relay_last_assert_sequence = sequence;
+  g_pps_relay_deassert_arm_pending = true;
+}
+
+static void pps_relay_arm_deassert_from_deferred(void) {
+  if (!g_pps_relay_deassert_arm_pending) return;
+  g_pps_relay_deassert_arm_pending = false;
+
+  // Re-arm on every PPS assertion, even if our local mirror still believes an
+  // old deassert timer is active.  TimePop epoch changes may cancel named
+  // one-shots without calling the owner's callback; relying on a sticky
+  // timer_active latch can therefore glue the relay HIGH forever.
+  timepop_cancel_by_name(PPS_RELAY_OFF_NAME);
+
+  const timepop_handle_t h =
+      timepop_arm(PPS_RELAY_OFF_NS,
+                  false,
+                  pps_relay_deassert_callback,
+                  nullptr,
+                  PPS_RELAY_OFF_NAME);
+  if (h == TIMEPOP_INVALID_HANDLE) {
+    g_pps_relay_timer_active = false;
+    g_pps_relay_deassert_arm_fail_count++;
+    return;
+  }
+
+  g_pps_relay_timer_active = true;
+  g_pps_relay_deassert_arm_count++;
+}
+
 static void pps_post_isr_publish_inline(const interrupt_epoch_capture_t& cap,
                                         uint32_t isr_entry_dwt_raw) {
   epoch_capture_publish(cap);
@@ -2403,6 +2463,7 @@ static void pps_post_isr_asap_callback(timepop_ctx_t*, timepop_diag_t*, void*) {
 
   g_pps_post_isr.drain_count++;
   pps_post_isr_publish_inline(cap, isr_entry_dwt_raw);
+  pps_relay_arm_deassert_from_deferred();
 }
 
 static void pps_post_isr_defer(const interrupt_epoch_capture_t& cap,
@@ -2499,6 +2560,7 @@ void process_interrupt_gpio6789_irq(uint32_t isr_entry_dwt_raw) {
 
   g_gpio_irq_count++;
   g_pps_gpio_heartbeat.edge_count++;
+  pps_relay_assert_from_isr(g_pps_gpio_heartbeat.edge_count);
 
   interrupt_epoch_capture_t epoch_cap{};
   epoch_cap.sequence = g_pps_gpio_heartbeat.edge_count;
@@ -2801,6 +2863,10 @@ void process_interrupt_init_hardware(void) {
   g_ocxo2_lane.pcs = 3;
   g_ocxo2_lane.input_pin = OCXO2_PIN;
 
+  pinMode(GNSS_PPS_RELAY, OUTPUT);
+  digitalWriteFast(GNSS_PPS_RELAY, LOW);
+  g_pps_relay_pin_initialized = true;
+
   CCM_CCGR6 |= CCM_CCGR6_QTIMER2(CCM_CCGR_ON);
   CCM_CCGR6 |= CCM_CCGR6_QTIMER3(CCM_CCGR_ON);
   *(portConfigRegister(OCXO1_PIN)) = 1;
@@ -2864,6 +2930,14 @@ void process_interrupt_init(void) {
   g_gpio_irq_count = 0;
   g_gpio_miss_count = 0;
   g_pps_post_isr = pps_post_isr_mailbox_t{};
+  g_pps_relay_timer_active = false;
+  g_pps_relay_deassert_arm_pending = false;
+  g_pps_relay_assert_count = 0;
+  g_pps_relay_deassert_count = 0;
+  g_pps_relay_deassert_arm_count = 0;
+  g_pps_relay_deassert_arm_fail_count = 0;
+  g_pps_relay_deassert_arm_skip_count = 0;
+  g_pps_relay_last_assert_sequence = 0;
   g_last_pps_witness = pps_t{};
   g_last_pps_witness_valid = false;
   g_vclock_epoch_latch = vclock_epoch_latch_t{};
@@ -3131,6 +3205,21 @@ static Payload cmd_report(const Payload&) {
   p.add("pps_post_isr_last_sequence", g_pps_post_isr.last_sequence);
   p.add("pps_post_isr_last_capture_window_cycles",
         g_pps_post_isr.last_capture_window_cycles);
+
+  p.add("pps_relay_owner", "process_interrupt");
+  p.add("pps_relay_assert_in_isr", true);
+  p.add("pps_relay_deassert_in_timepop", true);
+  p.add("pps_relay_rearm_deassert_every_pps", true);
+  p.add("pps_relay_off_ns", (uint64_t)PPS_RELAY_OFF_NS);
+  p.add("pps_relay_pin_initialized", g_pps_relay_pin_initialized);
+  p.add("pps_relay_timer_active", g_pps_relay_timer_active);
+  p.add("pps_relay_deassert_arm_pending", g_pps_relay_deassert_arm_pending);
+  p.add("pps_relay_assert_count", g_pps_relay_assert_count);
+  p.add("pps_relay_deassert_count", g_pps_relay_deassert_count);
+  p.add("pps_relay_deassert_arm_count", g_pps_relay_deassert_arm_count);
+  p.add("pps_relay_deassert_arm_fail_count", g_pps_relay_deassert_arm_fail_count);
+  p.add("pps_relay_deassert_arm_skip_count", g_pps_relay_deassert_arm_skip_count);
+  p.add("pps_relay_last_assert_sequence", g_pps_relay_last_assert_sequence);
 
   // PPS (physical edge) and PPS_VCLOCK (canonical) in symmetric blocks.
   pps_t pps; pps_vclock_t pvc;

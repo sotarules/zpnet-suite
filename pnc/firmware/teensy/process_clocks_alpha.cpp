@@ -38,7 +38,6 @@
 #include <strings.h>
 
 static constexpr uint64_t NS_PER_SECOND_U64 = 1000000000ULL;
-static constexpr uint64_t PPS_RELAY_OFF_NS  = 500000000ULL;
 
 static_assert(NS_PER_SECOND_U64 ==
               (uint64_t)VCLOCK_COUNTS_PER_SECOND * 100ULL,
@@ -392,25 +391,6 @@ uint64_t dwt_cycle_count_total = 0;
 uint64_t gnss_raw_64           = 0;
 uint64_t ocxo1_measured_gnss_ticks_64        = 0;
 uint64_t ocxo2_measured_gnss_ticks_64        = 0;
-
-// ============================================================================
-// PPS relay
-// ============================================================================
-
-static volatile bool relay_timer_active = false;
-
-static void pps_relay_deassert(timepop_ctx_t*, timepop_diag_t*, void*) {
-  digitalWriteFast(GNSS_PPS_RELAY, LOW);
-  relay_timer_active = false;
-}
-
-static inline void pps_relay_pulse(void) {
-  digitalWriteFast(GNSS_PPS_RELAY, HIGH);
-  if (!relay_timer_active) {
-    relay_timer_active = true;
-    timepop_arm(PPS_RELAY_OFF_NS, false, pps_relay_deassert, nullptr, "pps-relay-off");
-  }
-}
 
 // ============================================================================
 // DWT enable + epoch helpers
@@ -1544,7 +1524,6 @@ static void pps_selector_callback(const pps_edge_snapshot_t& snap) {
     update_pps_vclock_bridge_anchor(snap);
   }
 
-  pps_relay_pulse();
   maybe_publish_fragment();
 }
 
@@ -1586,8 +1565,6 @@ void process_clocks_init(void) {
   (void)ocxo_dac_set(ocxo2_dac, (double)AD5693R_DAC_DEFAULT);
 
   pinMode(GNSS_LOCK_PIN, INPUT);
-  pinMode(GNSS_PPS_RELAY, OUTPUT);
-  digitalWriteFast(GNSS_PPS_RELAY, LOW);
 
   subscribe_clock(interrupt_subscriber_kind_t::VCLOCK, vclock_callback);
   subscribe_clock(interrupt_subscriber_kind_t::OCXO1, ocxo1_callback);
