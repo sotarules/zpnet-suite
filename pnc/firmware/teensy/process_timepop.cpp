@@ -400,6 +400,53 @@ static volatile int64_t  diag_deadline_last_target_gnss_ns = -1;
 static volatile int64_t  diag_deadline_last_anchor_pps_gnss_ns = -1;
 static volatile int64_t  diag_deadline_last_ns_from_anchor = 0;
 
+// Anchor/deadline forensic surface.
+//
+// TimePop's scheduling contract depends on time_anchor_snapshot() being lawful
+// at the exact places where slots are armed, rearmed, and rebuilt across an
+// epoch change.  These counters make that contract visible before any future
+// process_time retirement attempt changes anchor ownership.
+static volatile uint32_t diag_anchor_snapshot_count = 0;
+static volatile uint32_t diag_anchor_snapshot_ok_count = 0;
+static volatile uint32_t diag_anchor_snapshot_not_ok_count = 0;
+static volatile uint32_t diag_anchor_snapshot_invalid_count = 0;
+static volatile uint32_t diag_anchor_snapshot_zero_pps_count = 0;
+static volatile uint32_t diag_anchor_snapshot_zero_cps_count = 0;
+static volatile const char* diag_anchor_snapshot_last_context = nullptr;
+static volatile const char* diag_anchor_snapshot_last_bad_context = nullptr;
+static volatile bool     diag_anchor_snapshot_last_ok = false;
+static volatile bool     diag_anchor_snapshot_last_valid = false;
+static volatile uint32_t diag_anchor_snapshot_last_pps_count = 0;
+static volatile uint32_t diag_anchor_snapshot_last_dwt_at_pps = 0;
+static volatile uint32_t diag_anchor_snapshot_last_cycles_per_s = 0;
+static volatile uint32_t diag_anchor_snapshot_last_qtimer_at_pps = 0;
+static volatile uint32_t diag_anchor_snapshot_last_counter32_at_pps_vclock = 0;
+
+static volatile uint32_t diag_deadline_convert_count = 0;
+static volatile uint32_t diag_deadline_convert_success_count = 0;
+static volatile uint32_t diag_deadline_fail_no_anchor = 0;
+static volatile uint32_t diag_deadline_fail_invalid_anchor = 0;
+static volatile uint32_t diag_deadline_fail_zero_pps_count = 0;
+static volatile uint32_t diag_deadline_fail_range = 0;
+static volatile uint32_t diag_deadline_last_deadline = 0;
+static volatile const char* diag_deadline_last_failure = nullptr;
+static volatile bool     diag_deadline_last_anchor_ok = false;
+static volatile bool     diag_deadline_last_anchor_valid = false;
+static volatile uint32_t diag_deadline_last_anchor_pps_count = 0;
+static volatile uint32_t diag_deadline_last_anchor_qtimer_at_pps = 0;
+static volatile uint32_t diag_deadline_last_anchor_dwt_at_pps = 0;
+static volatile uint32_t diag_deadline_last_anchor_cycles_per_s = 0;
+
+static volatile bool     diag_epoch_last_anchor_ok = false;
+static volatile bool     diag_epoch_last_anchor_valid = false;
+static volatile uint32_t diag_epoch_last_anchor_pps_count = 0;
+static volatile uint32_t diag_epoch_last_anchor_dwt_at_pps = 0;
+static volatile uint32_t diag_epoch_last_anchor_cycles_per_s = 0;
+static volatile uint32_t diag_epoch_last_anchor_qtimer_at_pps = 0;
+static volatile uint32_t diag_epoch_last_anchor_counter32_at_pps_vclock = 0;
+static volatile uint32_t diag_epoch_last_schedule_next_calls_before = 0;
+static volatile uint32_t diag_epoch_last_schedule_next_calls_after = 0;
+
 
 
 // ============================================================================
@@ -411,6 +458,10 @@ static volatile int64_t  diag_deadline_last_ns_from_anchor = 0;
 // conceptual layer without C++ declaration-order surprises.
 
 static void schedule_next(void);
+
+static void timepop_record_anchor_snapshot(const time_anchor_snapshot_t& snap,
+                                           const char* context);
+static time_anchor_snapshot_t timepop_anchor_snapshot(const char* context);
 
 static inline uint32_t vclock_count(void);
 static inline bool deadline_reached(uint32_t deadline, uint32_t now);
@@ -524,6 +575,48 @@ static timepop_handle_t arm_relative_slot_internal(uint64_t delay_gnss_ns,
 // Helpers
 // ============================================================================
 
+static void timepop_record_anchor_snapshot(const time_anchor_snapshot_t& snap,
+                                           const char* context) {
+  diag_anchor_snapshot_count++;
+  diag_anchor_snapshot_last_context = context;
+  diag_anchor_snapshot_last_ok = snap.ok;
+  diag_anchor_snapshot_last_valid = snap.valid;
+  diag_anchor_snapshot_last_pps_count = snap.pps_count;
+  diag_anchor_snapshot_last_dwt_at_pps = snap.dwt_at_pps;
+  diag_anchor_snapshot_last_cycles_per_s = snap.dwt_cycles_per_s;
+  diag_anchor_snapshot_last_qtimer_at_pps = snap.qtimer_at_pps;
+  diag_anchor_snapshot_last_counter32_at_pps_vclock =
+      snap.counter32_at_pps_vclock;
+
+  if (snap.ok) {
+    diag_anchor_snapshot_ok_count++;
+  } else {
+    diag_anchor_snapshot_not_ok_count++;
+    diag_anchor_snapshot_last_bad_context = context;
+  }
+
+  if (!snap.valid) {
+    diag_anchor_snapshot_invalid_count++;
+    diag_anchor_snapshot_last_bad_context = context;
+  }
+
+  if (snap.pps_count < 1) {
+    diag_anchor_snapshot_zero_pps_count++;
+    diag_anchor_snapshot_last_bad_context = context;
+  }
+
+  if (snap.dwt_cycles_per_s == 0) {
+    diag_anchor_snapshot_zero_cps_count++;
+    diag_anchor_snapshot_last_bad_context = context;
+  }
+}
+
+static time_anchor_snapshot_t timepop_anchor_snapshot(const char* context) {
+  const time_anchor_snapshot_t snap = time_anchor_snapshot();
+  timepop_record_anchor_snapshot(snap, context);
+  return snap;
+}
+
 static inline void update_slot_high_water(void) {
   uint32_t active = 0;
   for (uint32_t i = 0; i < MAX_SLOTS; i++) {
@@ -574,7 +667,8 @@ static bool configure_phase_locked_recurring_slot(timepop_slot_t& slot,
                                                   uint64_t period_ns) {
   if (period_ns == 0) return false;
 
-  const time_anchor_snapshot_t snap = time_anchor_snapshot();
+  const time_anchor_snapshot_t snap =
+      timepop_anchor_snapshot("configure_phase_locked");
   const int64_t now_gnss_ns = time_gnss_ns_now();
   int64_t target_gnss_ns = -1;
   if (!phase_locked_next_target_gnss_ns(period_ns, snap, now_gnss_ns, target_gnss_ns)) {
@@ -820,7 +914,8 @@ static inline uint32_t ns_to_ticks(uint64_t ns) {
 
 static uint32_t predict_dwt_at_deadline(uint32_t deadline, bool& valid) {
   valid = false;
-  time_anchor_snapshot_t snap = time_anchor_snapshot();
+  time_anchor_snapshot_t snap =
+      timepop_anchor_snapshot("predict_dwt_at_deadline");
   if (!snap.ok || !snap.valid) return 0;
   if (snap.dwt_cycles_per_s == 0) return 0;
 
@@ -843,7 +938,8 @@ static bool configure_anchored_recurring_slot(timepop_slot_t& slot,
                                                timepop_arm_source_t source) {
   if (period_ns == 0) return false;
 
-  const time_anchor_snapshot_t snap = time_anchor_snapshot();
+  const time_anchor_snapshot_t snap =
+      timepop_anchor_snapshot("configure_anchored_recurring");
   const int64_t now_gnss_ns = time_gnss_ns_now();
   int64_t target_gnss_ns = -1;
   uint32_t skipped = 0;
@@ -1060,28 +1156,58 @@ static bool rearm_recurring_slot_from_irq(timepop_slot_t& slot,
 static bool gnss_ns_to_vclock_deadline(int64_t target_gnss_ns,
                                        const time_anchor_snapshot_t& snap,
                                        uint32_t& out_deadline) {
-  if (!snap.ok || !snap.valid || snap.pps_count < 1) return false;
+  diag_deadline_convert_count++;
+  diag_deadline_last_target_gnss_ns = target_gnss_ns;
+  diag_deadline_last_anchor_ok = snap.ok;
+  diag_deadline_last_anchor_valid = snap.valid;
+  diag_deadline_last_anchor_pps_count = snap.pps_count;
+  diag_deadline_last_anchor_qtimer_at_pps = snap.qtimer_at_pps;
+  diag_deadline_last_anchor_dwt_at_pps = snap.dwt_at_pps;
+  diag_deadline_last_anchor_cycles_per_s = snap.dwt_cycles_per_s;
+  diag_deadline_last_failure = "ok";
+
+  if (!snap.ok) {
+    diag_deadline_fail_no_anchor++;
+    diag_deadline_last_failure = "anchor_not_ok";
+    return false;
+  }
+
+  if (!snap.valid) {
+    diag_deadline_fail_invalid_anchor++;
+    diag_deadline_last_failure = "anchor_invalid";
+    return false;
+  }
+
+  if (snap.pps_count < 1) {
+    diag_deadline_fail_zero_pps_count++;
+    diag_deadline_last_failure = "anchor_zero_pps_count";
+    return false;
+  }
 
   const int64_t anchor_pps_gnss_ns =
     (int64_t)(snap.pps_count - 1) * (int64_t)1000000000LL;
 
   const int64_t ns_from_anchor = target_gnss_ns - anchor_pps_gnss_ns;
 
-  diag_deadline_last_target_gnss_ns = target_gnss_ns;
   diag_deadline_last_anchor_pps_gnss_ns = anchor_pps_gnss_ns;
   diag_deadline_last_ns_from_anchor = ns_from_anchor;
 
   if (ns_from_anchor < 0) {
     diag_deadline_negative_offset++;
+    diag_deadline_last_failure = "negative_offset";
     return false;
   }
 
   const uint64_t ticks64 = (uint64_t)ns_from_anchor / NS_PER_TICK;
   if (ticks64 > 0xFFFFFFFFULL) {
+    diag_deadline_fail_range++;
+    diag_deadline_last_failure = "deadline_range";
     return false;
   }
 
   out_deadline = snap.qtimer_at_pps + (uint32_t)ticks64;
+  diag_deadline_last_deadline = out_deadline;
+  diag_deadline_convert_success_count++;
   return true;
 }
 
@@ -1175,7 +1301,8 @@ static void schedule_next(void) {
   diag_schedule_next_calls_total++;
 
   const uint32_t now = vclock_count();
-  const time_anchor_snapshot_t snap = time_anchor_snapshot();
+  const time_anchor_snapshot_t snap =
+      timepop_anchor_snapshot("schedule_next");
   uint32_t shared_fire_dwt = 0;
   bool shared_fire_captured = false;
   bool schedule_next_expired_this_pass = false;
@@ -1341,7 +1468,8 @@ void timepop_qtimer1_ch2_handler(const interrupt_event_t& event,
 
   const uint32_t dwt_entry      = event.dwt_at_event;
   const uint32_t now            = event.counter32_at_event;
-  const time_anchor_snapshot_t anchor = time_anchor_snapshot();
+  const time_anchor_snapshot_t anchor =
+      timepop_anchor_snapshot("qtimer1_ch2_irq");
   bool expired_this_pass[MAX_SLOTS] = {};
 
   diag_isr_count++;
@@ -1645,6 +1773,44 @@ void timepop_init(void) {
   diag_deadline_last_target_gnss_ns = -1;
   diag_deadline_last_anchor_pps_gnss_ns = -1;
   diag_deadline_last_ns_from_anchor = 0;
+  diag_anchor_snapshot_count = 0;
+  diag_anchor_snapshot_ok_count = 0;
+  diag_anchor_snapshot_not_ok_count = 0;
+  diag_anchor_snapshot_invalid_count = 0;
+  diag_anchor_snapshot_zero_pps_count = 0;
+  diag_anchor_snapshot_zero_cps_count = 0;
+  diag_anchor_snapshot_last_context = nullptr;
+  diag_anchor_snapshot_last_bad_context = nullptr;
+  diag_anchor_snapshot_last_ok = false;
+  diag_anchor_snapshot_last_valid = false;
+  diag_anchor_snapshot_last_pps_count = 0;
+  diag_anchor_snapshot_last_dwt_at_pps = 0;
+  diag_anchor_snapshot_last_cycles_per_s = 0;
+  diag_anchor_snapshot_last_qtimer_at_pps = 0;
+  diag_anchor_snapshot_last_counter32_at_pps_vclock = 0;
+  diag_deadline_convert_count = 0;
+  diag_deadline_convert_success_count = 0;
+  diag_deadline_fail_no_anchor = 0;
+  diag_deadline_fail_invalid_anchor = 0;
+  diag_deadline_fail_zero_pps_count = 0;
+  diag_deadline_fail_range = 0;
+  diag_deadline_last_deadline = 0;
+  diag_deadline_last_failure = nullptr;
+  diag_deadline_last_anchor_ok = false;
+  diag_deadline_last_anchor_valid = false;
+  diag_deadline_last_anchor_pps_count = 0;
+  diag_deadline_last_anchor_qtimer_at_pps = 0;
+  diag_deadline_last_anchor_dwt_at_pps = 0;
+  diag_deadline_last_anchor_cycles_per_s = 0;
+  diag_epoch_last_anchor_ok = false;
+  diag_epoch_last_anchor_valid = false;
+  diag_epoch_last_anchor_pps_count = 0;
+  diag_epoch_last_anchor_dwt_at_pps = 0;
+  diag_epoch_last_anchor_cycles_per_s = 0;
+  diag_epoch_last_anchor_qtimer_at_pps = 0;
+  diag_epoch_last_anchor_counter32_at_pps_vclock = 0;
+  diag_epoch_last_schedule_next_calls_before = 0;
+  diag_epoch_last_schedule_next_calls_after = 0;
   // QTimer1 hardware (CH0/CH2) is initialized by
   // process_interrupt_init_hardware().  IRQ vector and NVIC priority
   // are owned by process_interrupt_enable_irqs().  We just register
@@ -1671,7 +1837,8 @@ static timepop_handle_t arm_absolute_slot_internal(
   if (!callback) return TIMEPOP_INVALID_HANDLE;
   if (target_gnss_ns <= 0) return TIMEPOP_INVALID_HANDLE;
 
-  const time_anchor_snapshot_t snap = time_anchor_snapshot();
+  const time_anchor_snapshot_t snap =
+      timepop_anchor_snapshot("arm_absolute");
   uint32_t deadline = 0;
   if (!gnss_ns_to_vclock_deadline(target_gnss_ns, snap, deadline)) {
     return TIMEPOP_INVALID_HANDLE;
@@ -2336,7 +2503,8 @@ void timepop_dispatch(void) {
           slots[i].recurring_total_skipped_intervals += (uint32_t)missed;
         }
 
-        const time_anchor_snapshot_t snap = time_anchor_snapshot();
+        const time_anchor_snapshot_t snap =
+            timepop_anchor_snapshot("dispatch_rearm");
         uint32_t next_deadline = 0;
         if (!gnss_ns_to_vclock_deadline(next_target_gnss_ns, snap, next_deadline)) {
           slots[i].active = false;
@@ -2444,6 +2612,18 @@ void timepop_dispatch(void) {
 void timepop_epoch_changed(uint32_t epoch_sequence) {
   const uint32_t saved = critical_enter();
 
+  const time_anchor_snapshot_t epoch_anchor =
+      timepop_anchor_snapshot("epoch_changed");
+  diag_epoch_last_anchor_ok = epoch_anchor.ok;
+  diag_epoch_last_anchor_valid = epoch_anchor.valid;
+  diag_epoch_last_anchor_pps_count = epoch_anchor.pps_count;
+  diag_epoch_last_anchor_dwt_at_pps = epoch_anchor.dwt_at_pps;
+  diag_epoch_last_anchor_cycles_per_s = epoch_anchor.dwt_cycles_per_s;
+  diag_epoch_last_anchor_qtimer_at_pps = epoch_anchor.qtimer_at_pps;
+  diag_epoch_last_anchor_counter32_at_pps_vclock =
+      epoch_anchor.counter32_at_pps_vclock;
+  diag_epoch_last_schedule_next_calls_before = diag_schedule_next_calls_total;
+
   uint32_t timed_seen = 0;
   uint32_t recurring_rearmed = 0;
   uint32_t recurring_failures = 0;
@@ -2493,6 +2673,7 @@ void timepop_epoch_changed(uint32_t epoch_sequence) {
 
   diag_schedule_next_calls_from_other++;
   schedule_next();
+  diag_epoch_last_schedule_next_calls_after = diag_schedule_next_calls_total;
   update_slot_high_water();
 
   critical_exit(saved);
@@ -2537,6 +2718,29 @@ static Payload cmd_report(const Payload&) {
   out.add("time_valid",        time_valid());
   out.add("time_pps_count",    time_pps_count());
 
+  out.add("anchor_snapshot_count", diag_anchor_snapshot_count);
+  out.add("anchor_snapshot_ok_count", diag_anchor_snapshot_ok_count);
+  out.add("anchor_snapshot_not_ok_count", diag_anchor_snapshot_not_ok_count);
+  out.add("anchor_snapshot_invalid_count", diag_anchor_snapshot_invalid_count);
+  out.add("anchor_snapshot_zero_pps_count", diag_anchor_snapshot_zero_pps_count);
+  out.add("anchor_snapshot_zero_cps_count", diag_anchor_snapshot_zero_cps_count);
+  out.add("anchor_snapshot_last_context",
+          (const char*)(diag_anchor_snapshot_last_context
+                            ? diag_anchor_snapshot_last_context
+                            : ""));
+  out.add("anchor_snapshot_last_bad_context",
+          (const char*)(diag_anchor_snapshot_last_bad_context
+                            ? diag_anchor_snapshot_last_bad_context
+                            : ""));
+  out.add("anchor_snapshot_last_ok", diag_anchor_snapshot_last_ok);
+  out.add("anchor_snapshot_last_valid", diag_anchor_snapshot_last_valid);
+  out.add("anchor_snapshot_last_pps_count", diag_anchor_snapshot_last_pps_count);
+  out.add("anchor_snapshot_last_dwt_at_pps", diag_anchor_snapshot_last_dwt_at_pps);
+  out.add("anchor_snapshot_last_cycles_per_s", diag_anchor_snapshot_last_cycles_per_s);
+  out.add("anchor_snapshot_last_qtimer_at_pps", diag_anchor_snapshot_last_qtimer_at_pps);
+  out.add("anchor_snapshot_last_counter32_at_pps_vclock",
+          diag_anchor_snapshot_last_counter32_at_pps_vclock);
+
   out.add("slots_active_now",       timepop_active_count());
   out.add("slots_high_water",       diag_slots_high_water);
   out.add("slots_max",              (uint32_t)MAX_SLOTS);
@@ -2551,6 +2755,18 @@ static Payload cmd_report(const Payload&) {
   out.add("epoch_expired_cleared",  diag_epoch_expired_cleared);
   out.add("epoch_asap_left_active", diag_epoch_asap_left_active);
   out.add("epoch_alap_left_active", diag_epoch_alap_left_active);
+  out.add("epoch_last_anchor_ok", diag_epoch_last_anchor_ok);
+  out.add("epoch_last_anchor_valid", diag_epoch_last_anchor_valid);
+  out.add("epoch_last_anchor_pps_count", diag_epoch_last_anchor_pps_count);
+  out.add("epoch_last_anchor_dwt_at_pps", diag_epoch_last_anchor_dwt_at_pps);
+  out.add("epoch_last_anchor_cycles_per_s", diag_epoch_last_anchor_cycles_per_s);
+  out.add("epoch_last_anchor_qtimer_at_pps", diag_epoch_last_anchor_qtimer_at_pps);
+  out.add("epoch_last_anchor_counter32_at_pps_vclock",
+          diag_epoch_last_anchor_counter32_at_pps_vclock);
+  out.add("epoch_last_schedule_next_calls_before",
+          diag_epoch_last_schedule_next_calls_before);
+  out.add("epoch_last_schedule_next_calls_after",
+          diag_epoch_last_schedule_next_calls_after);
 
   out.add("asap_armed",             diag_asap_armed);
   out.add("asap_dispatched",        diag_asap_dispatched);
@@ -2638,10 +2854,27 @@ static Payload cmd_report(const Payload&) {
   out.add("irq_event_gnss_mismatch_count",     diag_irq_event_gnss_mismatch_count);
   out.add("irq_event_gnss_last_delta_ns",      diag_irq_event_gnss_last_delta_ns);
 
+  out.add("deadline_convert_count",            diag_deadline_convert_count);
+  out.add("deadline_convert_success_count",    diag_deadline_convert_success_count);
+  out.add("deadline_fail_no_anchor",           diag_deadline_fail_no_anchor);
+  out.add("deadline_fail_invalid_anchor",      diag_deadline_fail_invalid_anchor);
+  out.add("deadline_fail_zero_pps_count",      diag_deadline_fail_zero_pps_count);
   out.add("deadline_negative_offset",          diag_deadline_negative_offset);
+  out.add("deadline_fail_range",               diag_deadline_fail_range);
   out.add("deadline_last_target_gnss_ns",      diag_deadline_last_target_gnss_ns);
   out.add("deadline_last_anchor_pps_gnss_ns",  diag_deadline_last_anchor_pps_gnss_ns);
   out.add("deadline_last_ns_from_anchor",      diag_deadline_last_ns_from_anchor);
+  out.add("deadline_last_deadline",            diag_deadline_last_deadline);
+  out.add("deadline_last_failure",
+          (const char*)(diag_deadline_last_failure
+                            ? diag_deadline_last_failure
+                            : ""));
+  out.add("deadline_last_anchor_ok",           diag_deadline_last_anchor_ok);
+  out.add("deadline_last_anchor_valid",        diag_deadline_last_anchor_valid);
+  out.add("deadline_last_anchor_pps_count",    diag_deadline_last_anchor_pps_count);
+  out.add("deadline_last_anchor_qtimer_at_pps", diag_deadline_last_anchor_qtimer_at_pps);
+  out.add("deadline_last_anchor_dwt_at_pps",   diag_deadline_last_anchor_dwt_at_pps);
+  out.add("deadline_last_anchor_cycles_per_s", diag_deadline_last_anchor_cycles_per_s);
 
   out.add("qtmr1_ch2_cntr",   (uint32_t)interrupt_qtimer1_ch2_counter_now());
   out.add("qtmr1_ch2_comp1",  (uint32_t)interrupt_qtimer1_ch2_comp1_now());
@@ -2720,6 +2953,17 @@ static Payload cmd_slots(const Payload&) {
   out.add("vclock_raw_now", vclock_count());
   out.add("time_valid", time_valid());
   out.add("time_pps_count", time_pps_count());
+  out.add("anchor_snapshot_last_ok", diag_anchor_snapshot_last_ok);
+  out.add("anchor_snapshot_last_valid", diag_anchor_snapshot_last_valid);
+  out.add("anchor_snapshot_last_pps_count", diag_anchor_snapshot_last_pps_count);
+  out.add("anchor_snapshot_zero_pps_count", diag_anchor_snapshot_zero_pps_count);
+  out.add("deadline_fail_zero_pps_count", diag_deadline_fail_zero_pps_count);
+  out.add("deadline_last_failure",
+          (const char*)(diag_deadline_last_failure
+                            ? diag_deadline_last_failure
+                            : ""));
+  out.add("epoch_change_count", diag_epoch_change_count);
+  out.add("epoch_last_anchor_pps_count", diag_epoch_last_anchor_pps_count);
   out.add("schedule_next_expired_passes", diag_schedule_next_expired_passes);
   out.add("schedule_next_expired_slots", diag_schedule_next_expired_slots);
   out.add("schedule_next_late_max_ticks", diag_schedule_next_late_max_ticks);
