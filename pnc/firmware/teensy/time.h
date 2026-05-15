@@ -9,15 +9,16 @@
 // time.h -- Transitional TIME interface
 // ============================================================================
 //
-// CLOCKS owns TIME state; time.cpp owns stateless conversion surfaces.
+// process_time remains alive as the legacy anchor/projection backing store.
+// time.cpp owns the caller-facing conversion facade names.
 //
 // Canonical conversion calls do not read DWT. The caller supplies an authored
 // DWT coordinate, normally captured by an ISR and latency-normalized before it
 // reaches TIME. Legacy diagnostic helpers that imply "now" remain only for
 // compatibility and must not be used for TIMEBASE authorship.
 //
-// process_time.cpp/process_time.h have been retired; declarations retained here
-// are compatibility surfaces implemented by time.cpp or retired shims.
+// process_time.cpp owns the overlapping legacy symbols and stateful update
+// hooks. time.cpp defines only non-conflicting facade names and aliases.
 // ============================================================================
 
 struct time_anchor_snapshot_t {
@@ -293,26 +294,56 @@ struct time_clock_projection_t {
 
 bool time_clock_projection(time_clock_id_t clock,
                            time_clock_projection_t* out);
+
+// Preferred generic conversion questions.
+//
+//   time_clock_ns_at_dwt(clock, dwt, &ns)
+//     What is this clock's nanosecond value at this authored DWT coordinate?
+//
+//   time_dwt_at_clock_ns(clock, ns, &dwt)
+//     What DWT coordinate corresponds to this clock-domain nanosecond value?
+//
+// time_clock_dwt_at_ns() is retained as a compatibility alias for the earlier
+// facade spelling. New code should prefer time_dwt_at_clock_ns().
 bool time_clock_ns_at_dwt(time_clock_id_t clock,
                           uint32_t authored_dwt_cycle_count,
                           uint64_t* out_ns);
+bool time_dwt_at_clock_ns(time_clock_id_t clock,
+                          uint64_t clock_ns,
+                          uint32_t* out_dwt_cycle_count);
 bool time_clock_dwt_at_ns(time_clock_id_t clock,
                           uint64_t clock_ns,
                           uint32_t* out_dwt_cycle_count);
+
 uint64_t time_dwt_to_clock_ns(time_clock_id_t clock,
                               uint32_t authored_dwt_cycle_count);
 uint32_t time_clock_ns_to_dwt(time_clock_id_t clock,
                               uint64_t clock_ns);
 
+// Preferred convenience wrappers.
+uint64_t time_vclock_ns_at_dwt(uint32_t authored_dwt_cycle_count);
+uint32_t time_dwt_at_vclock_ns(uint64_t vclock_ns);
+
+uint64_t time_gnss_ns_at_dwt(uint32_t authored_dwt_cycle_count);
+uint32_t time_dwt_at_gnss_ns(uint64_t gnss_ns);
+
+uint64_t time_ocxo1_ns_at_dwt(uint32_t authored_dwt_cycle_count);
+uint32_t time_dwt_at_ocxo1_ns(uint64_t ocxo1_ns);
+
+uint64_t time_ocxo2_ns_at_dwt(uint32_t authored_dwt_cycle_count);
+uint32_t time_dwt_at_ocxo2_ns(uint64_t ocxo2_ns);
+
+// Legacy compatibility aliases. New code should prefer the *_at_* names above.
 uint64_t time_dwt_to_vclock_ns(uint32_t authored_dwt_cycle_count);
 uint32_t time_vclock_ns_to_dwt(uint64_t vclock_ns);
 
 int64_t  time_dwt_to_gnss_ns(uint32_t dwt_cycle_count);
-uint64_t time_dwt_to_ocxo1_ns(uint32_t dwt_cycle_count);
-uint64_t time_dwt_to_ocxo2_ns(uint32_t dwt_cycle_count);
-
 uint32_t time_gnss_ns_to_dwt(int64_t gnss_ns);      // legacy signed form
+
+uint64_t time_dwt_to_ocxo1_ns(uint32_t dwt_cycle_count);
 uint32_t time_ocxo1_ns_to_dwt(uint64_t ocxo1_ns);
+
+uint64_t time_dwt_to_ocxo2_ns(uint32_t dwt_cycle_count);
 uint32_t time_ocxo2_ns_to_dwt(uint64_t ocxo2_ns);
 
 // Compatibility stateful TIME API retained during migration.
@@ -368,7 +399,7 @@ void     time_dynamic_cps_phase_probe_update(
     uint32_t adjusted_difference_cycles,
     uint32_t phase_offset_cycles);
 
-// PPS/VCLOCK compatibility anchor hooks. CLOCKS feeds these; time.cpp owns the state.
+// PPS/VCLOCK compatibility anchor hooks. CLOCKS feeds these; process_time owns the state.
 void time_pps_vclock_epoch_reset(uint32_t dwt_at_pps_vclock,
                                  uint32_t counter32_at_pps_vclock);
 void time_pps_vclock_update(uint32_t dwt_at_pps_vclock,

@@ -126,6 +126,12 @@ bool time_dwt_at_clock_ns(time_clock_id_t clock,
   return true;
 }
 
+bool time_clock_dwt_at_ns(time_clock_id_t clock,
+                          uint64_t clock_ns,
+                          uint32_t* out_dwt_cycle_count) {
+  return time_dwt_at_clock_ns(clock, clock_ns, out_dwt_cycle_count);
+}
+
 uint64_t time_dwt_to_clock_ns(time_clock_id_t clock,
                               uint32_t authored_dwt_cycle_count) {
   uint64_t out = 0;

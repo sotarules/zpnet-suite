@@ -1023,7 +1023,7 @@ static bool rearm_recurring_slot_for_epoch(timepop_slot_t& slot) {
   slot.predicted_dwt = predict_dwt_at_deadline(
       slot.deadline, slot.prediction_valid);
   if (slot.prediction_valid) {
-    slot.target_gnss_ns = time_dwt_to_gnss_ns(slot.predicted_dwt);
+    slot.target_gnss_ns = time_gnss_ns_at_dwt(slot.predicted_dwt);
   }
   slot.recurring_rearmed_count++;
   record_slot_arm_diag(slot,
@@ -2141,7 +2141,7 @@ static timepop_handle_t arm_relative_slot_internal(
       slots[i].deadline, slots[i].prediction_valid);
 
     if (slots[i].prediction_valid && slots[i].target_gnss_ns < 0) {
-      slots[i].target_gnss_ns = time_dwt_to_gnss_ns(slots[i].predicted_dwt);
+      slots[i].target_gnss_ns = time_gnss_ns_at_dwt(slots[i].predicted_dwt);
     }
 
     record_slot_arm_diag(slots[i],
@@ -2559,7 +2559,7 @@ void timepop_dispatch(void) {
           slots[i].deadline, slots[i].prediction_valid);
 
         if (slots[i].prediction_valid && slots[i].target_gnss_ns < 0) {
-          slots[i].target_gnss_ns = time_dwt_to_gnss_ns(slots[i].predicted_dwt);
+          slots[i].target_gnss_ns = time_gnss_ns_at_dwt(slots[i].predicted_dwt);
         }
 
         slots[i].expired = false;
