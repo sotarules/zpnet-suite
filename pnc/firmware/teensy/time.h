@@ -6,19 +6,24 @@
 #include <stdbool.h>
 
 // ============================================================================
-// time.h -- Transitional TIME interface
+// time.h -- Preferred TIME facade + live process_time backing-store contract
 // ============================================================================
 //
-// process_time remains alive as the legacy anchor/projection backing store.
-// time.cpp owns the caller-facing conversion facade names.
+// process_time remains alive.  It owns the PPS/VCLOCK anchor and per-clock
+// projection backing store consumed by CLOCKS, TimePop, and the facade below.
 //
-// Canonical conversion calls do not read DWT. The caller supplies an authored
-// DWT coordinate, normally captured by an ISR and latency-normalized before it
-// reaches TIME. Legacy diagnostic helpers that imply "now" remain only for
-// compatibility and must not be used for TIMEBASE authorship.
+// The public conversion language is now the explicit "at" form:
 //
-// process_time.cpp owns the overlapping legacy symbols and stateful update
-// hooks. time.cpp defines only non-conflicting facade names and aliases.
+//   time_<clock>_ns_at_dwt(authored_dwt)
+//   time_dwt_at_<clock>_ns(clock_ns)
+//
+// Callers provide authored DWT coordinates.  TIME does not capture DWT for
+// these conversions and does not apply latency correction; those facts must
+// already have been authored by the interrupt/capture layer.
+//
+// Retired prediction/dynamic-CPS data shapes are retained only because
+// process_time.cpp still defines inert compatibility stubs that return them.
+// Their callable declarations are intentionally absent from this facade.
 // ============================================================================
 
 struct time_anchor_snapshot_t {
@@ -37,7 +42,7 @@ struct time_anchor_snapshot_t {
 };
 
 // ============================================================================
-// Legacy DWT next-second prediction surface
+// Retired compatibility data shapes
 // ============================================================================
 
 struct time_dwt_prediction_record_t {
@@ -60,10 +65,6 @@ struct time_dwt_prediction_snapshot_t {
   uint32_t history_count;
   uint32_t history_capacity;
 };
-
-// ============================================================================
-// Legacy dynamic-CPS refinement surface
-// ============================================================================
 
 struct time_dynamic_cps_record_t {
   uint32_t pvc_sequence;
@@ -200,10 +201,6 @@ struct time_dynamic_cps_snapshot_t {
   uint32_t history_capacity;
 };
 
-// ============================================================================
-// Legacy prior-second prediction detail surface
-// ============================================================================
-
 static constexpr uint32_t TIME_PREDICTION_DETAIL_SAMPLE_COUNT = 10;
 
 struct time_prediction_detail_sample_t {
@@ -244,7 +241,7 @@ struct time_prediction_detail_snapshot_t {
 };
 
 // ============================================================================
-// Clock identity shared by CLOCKS and TIME.
+// Clock identity shared by CLOCKS and TIME
 // ============================================================================
 
 enum class time_clock_id_t : uint8_t {
@@ -267,18 +264,6 @@ struct time_clock_snapshot_t {
   int32_t  last_prediction_residual_cycles = 0;
 };
 
-// ============================================================================
-// Canonical facade: authored DWT <-> clock-domain nanoseconds.
-// ============================================================================
-//
-// These calls do not expose mutable internal state to callers. The caller
-// supplies a carefully authored DWT coordinate; time.cpp uses its latest
-// CLOCKS-fed per-clock projection basis and performs only projection math.
-//
-// The GNSS DWT->ns signature remains int64_t for compatibility with older
-// callers. New code may treat non-negative results as uint64_t.
-
-
 struct time_clock_projection_t {
   time_clock_id_t clock = time_clock_id_t::NONE;
   bool     valid = false;
@@ -292,35 +277,21 @@ struct time_clock_projection_t {
   int32_t  last_prediction_residual_cycles = 0;
 };
 
+// ============================================================================
+// Preferred conversion facade
+// ============================================================================
+
 bool time_clock_projection(time_clock_id_t clock,
                            time_clock_projection_t* out);
 
-// Preferred generic conversion questions.
-//
-//   time_clock_ns_at_dwt(clock, dwt, &ns)
-//     What is this clock's nanosecond value at this authored DWT coordinate?
-//
-//   time_dwt_at_clock_ns(clock, ns, &dwt)
-//     What DWT coordinate corresponds to this clock-domain nanosecond value?
-//
-// time_clock_dwt_at_ns() is retained as a compatibility alias for the earlier
-// facade spelling. New code should prefer time_dwt_at_clock_ns().
 bool time_clock_ns_at_dwt(time_clock_id_t clock,
                           uint32_t authored_dwt_cycle_count,
                           uint64_t* out_ns);
+
 bool time_dwt_at_clock_ns(time_clock_id_t clock,
                           uint64_t clock_ns,
                           uint32_t* out_dwt_cycle_count);
-bool time_clock_dwt_at_ns(time_clock_id_t clock,
-                          uint64_t clock_ns,
-                          uint32_t* out_dwt_cycle_count);
 
-uint64_t time_dwt_to_clock_ns(time_clock_id_t clock,
-                              uint32_t authored_dwt_cycle_count);
-uint32_t time_clock_ns_to_dwt(time_clock_id_t clock,
-                              uint64_t clock_ns);
-
-// Preferred convenience wrappers.
 uint64_t time_vclock_ns_at_dwt(uint32_t authored_dwt_cycle_count);
 uint32_t time_dwt_at_vclock_ns(uint64_t vclock_ns);
 
@@ -333,78 +304,34 @@ uint32_t time_dwt_at_ocxo1_ns(uint64_t ocxo1_ns);
 uint64_t time_ocxo2_ns_at_dwt(uint32_t authored_dwt_cycle_count);
 uint32_t time_dwt_at_ocxo2_ns(uint64_t ocxo2_ns);
 
-// Legacy compatibility aliases. New code should prefer the *_at_* names above.
-uint64_t time_dwt_to_vclock_ns(uint32_t authored_dwt_cycle_count);
-uint32_t time_vclock_ns_to_dwt(uint64_t vclock_ns);
+// ============================================================================
+// Live process_time backing-store / anchor contract
+// ============================================================================
 
-int64_t  time_dwt_to_gnss_ns(uint32_t dwt_cycle_count);
-uint32_t time_gnss_ns_to_dwt(int64_t gnss_ns);      // legacy signed form
-
-uint64_t time_dwt_to_ocxo1_ns(uint32_t dwt_cycle_count);
-uint32_t time_ocxo1_ns_to_dwt(uint64_t ocxo1_ns);
-
-uint64_t time_dwt_to_ocxo2_ns(uint32_t dwt_cycle_count);
-uint32_t time_ocxo2_ns_to_dwt(uint64_t ocxo2_ns);
-
-// Compatibility stateful TIME API retained during migration.
 int64_t time_gnss_ns_now(void);
-int64_t time_dwt_to_gnss_ns(uint32_t dwt_cyccnt,
-                            uint32_t anchor_dwt_at_pps_vclock,
-                            uint32_t anchor_dwt_cycles_per_pps_vclock_s,
-                            uint32_t anchor_pps_vclock_count);
+
 time_anchor_snapshot_t time_anchor_snapshot(void);
 
 void time_clock_reset_all(void);
+
 bool time_clock_epoch_reset(time_clock_id_t clock,
                             uint32_t dwt_at_update,
                             uint64_t ns_at_update);
+
 bool time_clock_update(time_clock_id_t clock,
                        uint32_t dwt_at_update,
                        uint64_t ns_at_update);
+
 bool time_clock_snapshot(time_clock_id_t clock,
                          time_clock_snapshot_t* out);
 
-// Legacy prediction accessors.
-time_dwt_prediction_snapshot_t time_dwt_prediction_snapshot(void);
-uint32_t time_dwt_prediction_history(time_dwt_prediction_record_t* out_records,
-                                     uint32_t max_records);
-bool     time_dwt_prediction_valid(void);
-uint32_t time_dwt_actual_cycles_last_second(void);
-uint32_t time_dwt_predicted_cycles_last_second(void);
-uint32_t time_dwt_next_prediction_cycles(void);
-int32_t  time_dwt_prediction_residual_cycles(void);
-
-// Legacy dynamic-CPS accessors / update hooks.
-time_dynamic_cps_snapshot_t time_dynamic_cps_snapshot(void);
-uint32_t time_dynamic_cps_history(time_dynamic_cps_record_t* out_records,
-                                  uint32_t max_records);
-bool time_prediction_detail_snapshot(time_prediction_detail_snapshot_t* out);
-
-void     time_dynamic_cps_reset(void);
-uint32_t time_dynamic_cps_current(void);
-bool     time_dynamic_cps_for_pvc_sequence(uint32_t pvc_sequence,
-                                           uint32_t* out_cycles);
-void     time_dynamic_cps_pps_vclock_edge(uint32_t pvc_sequence,
-                                          uint32_t pvc_dwt_at_edge);
-void     time_dynamic_cps_cadence_update(uint32_t qtimer_event_dwt,
-                                         uint32_t cadence_tick_mod_1000);
-
-void     time_dynamic_cps_phase_probe_update(
-    uint32_t pps_sequence,
-    uint32_t pps_isr_entry_dwt_raw,
-    uint32_t arm_dwt_raw,
-    uint32_t vclock_isr_entry_dwt_raw,
-    uint32_t pps_dwt_adjusted,
-    uint32_t vclock_dwt_adjusted,
-    uint32_t adjusted_difference_cycles,
-    uint32_t phase_offset_cycles);
-
-// PPS/VCLOCK compatibility anchor hooks. CLOCKS feeds these; process_time owns the state.
 void time_pps_vclock_epoch_reset(uint32_t dwt_at_pps_vclock,
                                  uint32_t counter32_at_pps_vclock);
+
 void time_pps_vclock_update(uint32_t dwt_at_pps_vclock,
-                            uint32_t counter32_at_pps_vclock,
-                            uint32_t pps_vclock_count);
+                            uint32_t dwt_cycles_per_pps_vclock_s,
+                            uint32_t counter32_at_pps_vclock);
+
 void time_pps_vclock_update(uint32_t dwt_at_pps_vclock,
                             uint32_t counter32_at_pps_vclock,
                             uint32_t pps_vclock_count,
@@ -412,4 +339,4 @@ void time_pps_vclock_update(uint32_t dwt_at_pps_vclock,
 
 bool     time_valid(void);
 uint32_t time_pps_count(void);
-void time_init(void);
+void     time_init(void);

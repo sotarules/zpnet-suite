@@ -7,17 +7,17 @@
 // time.cpp -- caller-facing TIME conversion facade
 // ============================================================================
 //
-// process_time remains alive and owns the legacy anchor/projection state that
-// TimePop depends on.  This file owns only the new, self-documenting conversion
-// facade names and non-conflicting compatibility aliases.
+// process_time remains alive and owns the PPS/VCLOCK anchor plus per-clock
+// projection backing store.  This file defines only the preferred conversion
+// facade names that are not already owned by process_time.
 //
 // Rules:
 //   • Callers provide authored DWT coordinates; this file never captures DWT.
 //   • Conversion math is DWT <-> clock-domain nanoseconds.
-//   • process_time supplies the current per-clock projection basis through
+//   • process_time supplies the current per-clock basis through
 //     time_clock_snapshot() / time_clock_ns_at_dwt().
 //   • CLOCKS static prediction is a fallback denominator only.
-//   • Legacy symbols already owned by process_time are NOT defined here.
+//   • Obsolete *_to_* aliases are intentionally gone from this facade.
 // ============================================================================
 
 static constexpr uint64_t TIME_NS_PER_SECOND_U64 = 1000000000ULL;
@@ -126,90 +126,62 @@ bool time_dwt_at_clock_ns(time_clock_id_t clock,
   return true;
 }
 
-bool time_clock_dwt_at_ns(time_clock_id_t clock,
-                          uint64_t clock_ns,
-                          uint32_t* out_dwt_cycle_count) {
-  return time_dwt_at_clock_ns(clock, clock_ns, out_dwt_cycle_count);
-}
-
-uint64_t time_dwt_to_clock_ns(time_clock_id_t clock,
-                              uint32_t authored_dwt_cycle_count) {
-  uint64_t out = 0;
-  (void)time_clock_ns_at_dwt(clock, authored_dwt_cycle_count, &out);
-  return out;
-}
-
-uint32_t time_clock_ns_to_dwt(time_clock_id_t clock,
-                              uint64_t clock_ns) {
-  uint32_t out = 0;
-  (void)time_dwt_at_clock_ns(clock, clock_ns, &out);
-  return out;
-}
-
 // ============================================================================
 // Preferred convenience wrappers: <clock> ns at DWT, DWT at <clock> ns
 // ============================================================================
 
 uint64_t time_vclock_ns_at_dwt(uint32_t authored_dwt_cycle_count) {
-  return time_dwt_to_clock_ns(time_clock_id_t::VCLOCK,
-                              authored_dwt_cycle_count);
+  uint64_t out = 0;
+  (void)time_clock_ns_at_dwt(time_clock_id_t::VCLOCK,
+                             authored_dwt_cycle_count,
+                             &out);
+  return out;
 }
 
 uint32_t time_dwt_at_vclock_ns(uint64_t vclock_ns) {
-  return time_clock_ns_to_dwt(time_clock_id_t::VCLOCK, vclock_ns);
+  uint32_t out = 0;
+  (void)time_dwt_at_clock_ns(time_clock_id_t::VCLOCK, vclock_ns, &out);
+  return out;
 }
 
 uint64_t time_gnss_ns_at_dwt(uint32_t authored_dwt_cycle_count) {
-  return time_dwt_to_clock_ns(time_clock_id_t::GNSS,
-                              authored_dwt_cycle_count);
+  uint64_t out = 0;
+  (void)time_clock_ns_at_dwt(time_clock_id_t::GNSS,
+                             authored_dwt_cycle_count,
+                             &out);
+  return out;
 }
 
 uint32_t time_dwt_at_gnss_ns(uint64_t gnss_ns) {
-  return time_clock_ns_to_dwt(time_clock_id_t::GNSS, gnss_ns);
+  uint32_t out = 0;
+  (void)time_dwt_at_clock_ns(time_clock_id_t::GNSS, gnss_ns, &out);
+  return out;
 }
 
 uint64_t time_ocxo1_ns_at_dwt(uint32_t authored_dwt_cycle_count) {
-  return time_dwt_to_clock_ns(time_clock_id_t::OCXO1,
-                              authored_dwt_cycle_count);
+  uint64_t out = 0;
+  (void)time_clock_ns_at_dwt(time_clock_id_t::OCXO1,
+                             authored_dwt_cycle_count,
+                             &out);
+  return out;
 }
 
 uint32_t time_dwt_at_ocxo1_ns(uint64_t ocxo1_ns) {
-  return time_clock_ns_to_dwt(time_clock_id_t::OCXO1, ocxo1_ns);
+  uint32_t out = 0;
+  (void)time_dwt_at_clock_ns(time_clock_id_t::OCXO1, ocxo1_ns, &out);
+  return out;
 }
 
 uint64_t time_ocxo2_ns_at_dwt(uint32_t authored_dwt_cycle_count) {
-  return time_dwt_to_clock_ns(time_clock_id_t::OCXO2,
-                              authored_dwt_cycle_count);
+  uint64_t out = 0;
+  (void)time_clock_ns_at_dwt(time_clock_id_t::OCXO2,
+                             authored_dwt_cycle_count,
+                             &out);
+  return out;
 }
 
 uint32_t time_dwt_at_ocxo2_ns(uint64_t ocxo2_ns) {
-  return time_clock_ns_to_dwt(time_clock_id_t::OCXO2, ocxo2_ns);
-}
-
-// ============================================================================
-// Non-conflicting legacy aliases retained for migration
-// ============================================================================
-
-uint64_t time_dwt_to_vclock_ns(uint32_t authored_dwt_cycle_count) {
-  return time_vclock_ns_at_dwt(authored_dwt_cycle_count);
-}
-
-uint32_t time_vclock_ns_to_dwt(uint64_t vclock_ns) {
-  return time_dwt_at_vclock_ns(vclock_ns);
-}
-
-uint64_t time_dwt_to_ocxo1_ns(uint32_t dwt_cycle_count) {
-  return time_ocxo1_ns_at_dwt(dwt_cycle_count);
-}
-
-uint64_t time_dwt_to_ocxo2_ns(uint32_t dwt_cycle_count) {
-  return time_ocxo2_ns_at_dwt(dwt_cycle_count);
-}
-
-uint32_t time_ocxo1_ns_to_dwt(uint64_t ocxo1_ns) {
-  return time_dwt_at_ocxo1_ns(ocxo1_ns);
-}
-
-uint32_t time_ocxo2_ns_to_dwt(uint64_t ocxo2_ns) {
-  return time_dwt_at_ocxo2_ns(ocxo2_ns);
+  uint32_t out = 0;
+  (void)time_dwt_at_clock_ns(time_clock_id_t::OCXO2, ocxo2_ns, &out);
+  return out;
 }
