@@ -56,7 +56,7 @@ void process_clocks_init_hardware(void);
 // Initialization — Phase 2 (full lifecycle, requires TimePop)
 // -----------------------------------------------------------------------------
 
-/// Configure PPS ISR, OCXO DACs (both), relay pins, arm dither timer.
+/// Configure OCXO DACs (both), subscriptions, and CLOCKS state.
 /// Must be called after timepop_init().
 void process_clocks_init(void);
 
@@ -100,10 +100,12 @@ uint64_t clocks_ocxo2_measured_gnss_ns_now(void);
 //   • Do not rebase during the active second from quantized QTimer samples.
 //   • Let Welford/statistical surfaces absorb the remaining measurement noise.
 //
-// VCLOCK's static prediction is PPS/GPIO-witness based: it uses physical
-// PPS-to-PPS DWT cycles as the smooth DWT/GNSS slope witness.  OCXO predictions
-// are lane-local: each OCXO uses DWT cycles between consecutive OCXO one-second
-// edges.
+// Four symmetric static prediction surfaces are published:
+//   PPS    — physical GPIO PPS edge-to-edge DWT cycles
+//   VCLOCK — canonical PPS/VCLOCK lattice edge-to-edge DWT cycles
+//   OCXO1  — OCXO1 witness edge-to-edge DWT cycles
+//   OCXO2  — OCXO2 witness edge-to-edge DWT cycles
+// Each lane uses the prior completed interval as the next-second prediction.
 
 struct clocks_static_prediction_snapshot_t {
   uint32_t clock_id = 0;
@@ -120,6 +122,7 @@ struct clocks_static_prediction_snapshot_t {
 };
 
 void clocks_static_prediction_reset_all(void);
+bool clocks_static_prediction_pps_snapshot(clocks_static_prediction_snapshot_t* out);
 bool clocks_static_prediction_snapshot(time_clock_id_t clock,
                                        clocks_static_prediction_snapshot_t* out);
 

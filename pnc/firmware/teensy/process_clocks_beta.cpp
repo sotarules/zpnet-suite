@@ -388,12 +388,21 @@ static void publish_freq(Payload& p, const char* clock_name, double ppb_value) {
 
 
 
-static void prediction_add_lane_summary(Payload& prediction,
-                                        const char* prefix,
-                                        time_clock_id_t clock) {
+static clocks_static_prediction_snapshot_t prediction_snapshot_for_pps(void) {
+  clocks_static_prediction_snapshot_t s{};
+  (void)clocks_static_prediction_pps_snapshot(&s);
+  return s;
+}
+
+static clocks_static_prediction_snapshot_t prediction_snapshot_for_clock(time_clock_id_t clock) {
   clocks_static_prediction_snapshot_t s{};
   (void)clocks_static_prediction_snapshot(clock, &s);
+  return s;
+}
 
+static void prediction_add_legacy_lane_summary(Payload& prediction,
+                                               const char* prefix,
+                                               const clocks_static_prediction_snapshot_t& s) {
   char key[96];
   auto add_u32 = [&](const char* suffix, uint32_t value) {
     snprintf(key, sizeof(key), "%s_%s", prefix, suffix);
@@ -415,15 +424,49 @@ static void prediction_add_lane_summary(Payload& prediction,
   add_i32("static_residual_cycles", s.static_residual_cycles);
 }
 
-static void payload_add_prediction_summary(Payload& p) {
-  Payload prediction;
+static void payload_add_flat_prediction_lane(Payload& p,
+                                             const char* prefix,
+                                             const clocks_static_prediction_snapshot_t& s) {
+  char key[96];
+  auto add_u32 = [&](const char* suffix, uint32_t value) {
+    snprintf(key, sizeof(key), "%s_%s", prefix, suffix);
+    p.add(key, value);
+  };
+  auto add_i32 = [&](const char* suffix, int32_t value) {
+    snprintf(key, sizeof(key), "%s_%s", prefix, suffix);
+    p.add(key, value);
+  };
+  auto add_bool = [&](const char* suffix, bool value) {
+    snprintf(key, sizeof(key), "%s_%s", prefix, suffix);
+    p.add(key, value);
+  };
 
-  // Compact per-TIMEBASE-row static prediction audit.  Dynamic 100 Hz
-  // prediction has been retired; the prior completed one-second DWT interval
-  // is the only operational next-second prediction surface.
-  prediction_add_lane_summary(prediction, "vclock", time_clock_id_t::VCLOCK);
-  prediction_add_lane_summary(prediction, "ocxo1",  time_clock_id_t::OCXO1);
-  prediction_add_lane_summary(prediction, "ocxo2",  time_clock_id_t::OCXO2);
+  add_bool("prediction_valid", s.valid);
+  add_u32("completed_interval_count", s.completed_interval_count);
+  add_u32("prediction_cycles", s.static_prediction_cycles);
+  add_u32("actual_cycles", s.actual_cycles);
+  add_i32("residual_cycles", s.static_residual_cycles);
+}
+
+static void payload_add_prediction_summary(Payload& p) {
+  const clocks_static_prediction_snapshot_t pps = prediction_snapshot_for_pps();
+  const clocks_static_prediction_snapshot_t vclock = prediction_snapshot_for_clock(time_clock_id_t::VCLOCK);
+  const clocks_static_prediction_snapshot_t ocxo1 = prediction_snapshot_for_clock(time_clock_id_t::OCXO1);
+  const clocks_static_prediction_snapshot_t ocxo2 = prediction_snapshot_for_clock(time_clock_id_t::OCXO2);
+
+  // Canonical flat four-rail prediction surface.  Each rail uses the prior
+  // completed one-second DWT interval as its next-second prediction.
+  payload_add_flat_prediction_lane(p, "pps",    pps);
+  payload_add_flat_prediction_lane(p, "vclock", vclock);
+  payload_add_flat_prediction_lane(p, "ocxo1",  ocxo1);
+  payload_add_flat_prediction_lane(p, "ocxo2",  ocxo2);
+
+  // Legacy nested prediction object retained during Pi-side report migration.
+  Payload prediction;
+  prediction_add_legacy_lane_summary(prediction, "pps",    pps);
+  prediction_add_legacy_lane_summary(prediction, "vclock", vclock);
+  prediction_add_legacy_lane_summary(prediction, "ocxo1",  ocxo1);
+  prediction_add_legacy_lane_summary(prediction, "ocxo2",  ocxo2);
 
   p.add_object("prediction", prediction);
 }
@@ -1053,8 +1096,9 @@ void clocks_beta_pps(void) {
                   (int64_t)DWT_EXPECTED_PER_PPS));
 
   // Compact static prediction surface.  Dynamic 100 Hz prediction and Gamma
-  // courtroom detail have been retired; TIMEBASE now publishes only the prior
-  // interval prediction, actual interval, and residual.
+  // courtroom detail have been retired.  TIMEBASE now publishes four
+  // independent rails (PPS, VCLOCK, OCXO1, OCXO2): prior interval prediction,
+  // actual interval, and residual.
   payload_add_prediction_summary(p);
 
   // Synthetic 32-bit VCLOCK identity of the canonical PPS/VCLOCK epoch.

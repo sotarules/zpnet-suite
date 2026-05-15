@@ -59,7 +59,10 @@
 //   - g_dwt_at_pps_vclock             DWT coordinate of the selected
 //                                     PPS/VCLOCK edge.
 //   - g_dwt_cycles_between_pps_vclock Effective PPS/GPIO-derived DWT
-//                                     cycles per GNSS second.
+//                                     cycles per GNSS second.  This remains
+//                                     the smooth DWT-GNSS calibration source;
+//                                     it is distinct from the VCLOCK rail's own
+//                                     edge-to-edge prediction surface.
 //   - g_counter32_at_pps_vclock       Synthetic VCLOCK counter identity of
 //                                     the selected PPS/VCLOCK edge.
 //
@@ -67,9 +70,13 @@
 // Static prediction role:
 //
 //   Dynamic 100 Hz prediction has been retired. Alpha now records the prior
-//   completed one-second DWT interval as the static prediction surface. For
-//   VCLOCK this is the PPS/GPIO witness interval. For OCXO lanes this is the
-//   lane-local OCXO edge-to-edge interval. Beta publishes the compact audit.
+//   completed one-second DWT interval as the static prediction surface for four
+//   independent rails:
+//     PPS    — physical GPIO PPS edge-to-edge DWT interval
+//     VCLOCK — canonical PPS/VCLOCK lattice edge-to-edge DWT interval
+//     OCXO1  — OCXO1 witness edge-to-edge DWT interval
+//     OCXO2  — OCXO2 witness edge-to-edge DWT interval
+//   Beta publishes the compact audit.
 //
 // VCLOCK as measured peer of OCXO:
 //

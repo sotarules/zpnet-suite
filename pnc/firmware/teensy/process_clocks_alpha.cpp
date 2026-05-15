@@ -526,9 +526,12 @@ static inline void clocks_alpha_dmb(void) {
 // ============================================================================
 //
 // Gamma/dynamic prediction is retired.  This compact audit records the honest
-// static model: the prior completed interval predicts the next one.  VCLOCK is
-// fed from the physical PPS/GPIO DWT interval; OCXO lanes are fed from their
-// own lane-local DWT edge intervals.
+// static model: the prior completed interval predicts the next one.  Four
+// symmetric rails are tracked independently:
+//   PPS    — physical GPIO PPS edge-to-edge DWT interval
+//   VCLOCK — canonical PPS/VCLOCK lattice edge-to-edge DWT interval
+//   OCXO1  — OCXO1 witness edge-to-edge DWT interval
+//   OCXO2  — OCXO2 witness edge-to-edge DWT interval
 
 struct alpha_static_prediction_store_t {
   volatile uint32_t seq = 0;
@@ -540,6 +543,7 @@ struct alpha_static_prediction_store_t {
   int32_t  static_residual_cycles = 0;
 };
 
+static alpha_static_prediction_store_t g_static_prediction_pps = {};
 static alpha_static_prediction_store_t g_static_prediction_vclock = {};
 static alpha_static_prediction_store_t g_static_prediction_ocxo1 = {};
 static alpha_static_prediction_store_t g_static_prediction_ocxo2 = {};
@@ -569,6 +573,7 @@ static void alpha_static_prediction_reset_store(alpha_static_prediction_store_t&
 }
 
 void clocks_static_prediction_reset_all(void) {
+  alpha_static_prediction_reset_store(g_static_prediction_pps);
   alpha_static_prediction_reset_store(g_static_prediction_vclock);
   alpha_static_prediction_reset_store(g_static_prediction_ocxo1);
   alpha_static_prediction_reset_store(g_static_prediction_ocxo2);
@@ -597,6 +602,29 @@ static void alpha_static_prediction_record(time_clock_id_t clock,
 
   clocks_alpha_dmb();
   s->seq++;
+}
+
+static void alpha_static_prediction_record_pps(uint32_t actual_cycles) {
+  if (actual_cycles == 0) return;
+
+  alpha_static_prediction_store_t& s = g_static_prediction_pps;
+  const uint32_t prior_actual = s.last_actual_cycles;
+  const bool have_prior = (prior_actual != 0);
+
+  s.seq++;
+  clocks_alpha_dmb();
+
+  s.completed_interval_count++;
+  s.valid = have_prior;
+  s.static_prediction_cycles = have_prior ? prior_actual : 0U;
+  s.actual_cycles = actual_cycles;
+  s.static_residual_cycles = have_prior
+      ? (int32_t)((int64_t)actual_cycles - (int64_t)prior_actual)
+      : 0;
+  s.last_actual_cycles = actual_cycles;
+
+  clocks_alpha_dmb();
+  s.seq++;
 }
 
 static uint32_t alpha_static_prediction_clock_id(time_clock_id_t clock) {
@@ -631,6 +659,39 @@ bool clocks_static_prediction_snapshot(time_clock_id_t clock,
 
   *out = clocks_static_prediction_snapshot_t{};
   return false;
+}
+
+static bool alpha_static_prediction_snapshot_store(const alpha_static_prediction_store_t& store,
+                                                   uint32_t clock_id,
+                                                   clocks_static_prediction_snapshot_t* out) {
+  if (!out) return false;
+
+  for (int attempt = 0; attempt < 4; attempt++) {
+    const uint32_t seq1 = store.seq;
+    clocks_alpha_dmb();
+
+    clocks_static_prediction_snapshot_t local{};
+    local.clock_id = clock_id;
+    local.valid = store.valid;
+    local.completed_interval_count = store.completed_interval_count;
+    local.static_prediction_cycles = store.static_prediction_cycles;
+    local.actual_cycles = store.actual_cycles;
+    local.static_residual_cycles = store.static_residual_cycles;
+
+    clocks_alpha_dmb();
+    const uint32_t seq2 = store.seq;
+    if (seq1 == seq2 && (seq1 & 1u) == 0u) {
+      *out = local;
+      return local.valid;
+    }
+  }
+
+  *out = clocks_static_prediction_snapshot_t{};
+  return false;
+}
+
+bool clocks_static_prediction_pps_snapshot(clocks_static_prediction_snapshot_t* out) {
+  return alpha_static_prediction_snapshot_store(g_static_prediction_pps, 0U, out);
 }
 
 static alpha_lane_forensics_store_t* alpha_forensics_store(time_clock_id_t clock) {
@@ -1303,7 +1364,7 @@ static void clocks_apply_epoch_counter_edge(clock_state_t& clock,
   meas.prev_gnss_ns_at_edge = reference_gnss_ns_at_edge;
   meas.prev_dwt_at_edge = event.dwt_at_event;
 
-  if (had_previous && is_ocxo && dwt_cycles_between_edges != 0) {
+  if (had_previous && dwt_cycles_between_edges != 0) {
     alpha_static_prediction_record(time_clock, dwt_cycles_between_edges);
   }
 
@@ -1383,6 +1444,7 @@ static void publish_pps_witness_diag(const pps_edge_snapshot_t& snap) {
   if (g_prev_pps_dwt_at_edge_valid) {
     g_pps_dwt_cycles_between_edges = physical_pps_dwt - g_prev_pps_dwt_at_edge;
     g_pps_dwt_cycles_between_edges_valid = true;
+    alpha_static_prediction_record_pps((uint32_t)g_pps_dwt_cycles_between_edges);
   } else {
     g_pps_dwt_cycles_between_edges = 0;
     g_pps_dwt_cycles_between_edges_valid = false;
@@ -1489,8 +1551,9 @@ static void update_pps_vclock_bridge_anchor(const pps_edge_snapshot_t& snap) {
 
   g_dwt_cycles_between_pps_vclock = effective_dwt_cycles_per_second;
   g_dwt_cycle_count_total += (uint64_t)effective_dwt_cycles_per_second;
-  alpha_static_prediction_record(time_clock_id_t::VCLOCK,
-                                 effective_dwt_cycles_per_second);
+  // VCLOCK prediction is recorded from the VCLOCK event rail itself in
+  // clocks_apply_epoch_counter_edge().  Do not feed it from the smoother PPS
+  // witness interval here; PPS now owns its own first-class prediction lane.
   dwt64_anchor_advance_to_dwt32(snap.dwt_at_edge);
   g_dwt_calibration_valid = true;
   g_prev_pps_vclock_dwt_at_edge = snap.dwt_at_edge;
