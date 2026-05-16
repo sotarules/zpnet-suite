@@ -15,16 +15,18 @@
 //     When recurring=true, the first fire is snapped to the next
 //     PPS/VCLOCK phase-grid boundary implied by delay_gnss_ns; subsequent
 //     fires remain on that grid.
-//   • scheduled ASAP dispatch    — timepop_arm_asap(...)
-//   • scheduled ALAP dispatch    — timepop_arm_alap(...)
+//   • safe ASAP dispatch         — timepop_arm_asap(...)
+//     Fixed deferred lane, not a timed slot; ISR-safe and drained before slots.
+//   • safe ALAP dispatch         — timepop_arm_alap(...)
+//     Fixed deferred lane, not a timed slot; ISR-safe and drained after slots.
 //   • absolute scheduling        — timepop_arm_at(target_gnss_ns, ...)
 //   • anchor-relative scheduling — timepop_arm_from_anchor(anchor_gnss_ns, offset_gnss_ns, ...)
 //   • caller-owned exact path    — timepop_arm_ns(target_gnss_ns, target_dwt, ...)
-//  • critical ISR recurring    — timepop_arm_recurring_isr(period_ns, ...)
-//    The callback and recurring rearm happen inside the CH2 IRQ pass before
-//    schedule_next() selects the next compare.  Use only for tiny substrate
+//   • critical ISR recurring    — timepop_arm_recurring_isr(period_ns, ...)
+//     The callback and recurring rearm happen inside the CH2 IRQ pass before
+//     schedule_next() selects the next compare.  Use only for tiny substrate
 //    maintenance callbacks that TimePop itself depends on for safe scheduling.
-//  • counter-base anchored ISR recurring
+//   • counter-base anchored ISR recurring
 //      timepop_arm_recurring_isr_from_base_counter32(base_gnss_ns,
 //                                                    base_counter32,
 //                                                    period_ns, ...)
@@ -263,11 +265,28 @@ struct timepop_slot_t {
 
 
 struct deferred_slot_t {
-  bool                active;
-  timepop_handle_t    handle;
-  timepop_callback_t  callback;
-  void*               user_data;
-  const char*         name;
+  // Dedicated non-timed deferred lane.
+  //
+  // ASAP/ALAP callbacks are not TimePop scheduled slots and never own a
+  // VCLOCK deadline.  They may be armed from ISR context: arming only writes
+  // this fixed mailbox under PRIMASK and sets timepop_pending.  It does not
+  // scan/mutate/reorder the timed slot table and it never calls schedule_next().
+  //
+  // pending     — a callback is waiting for scheduled-context dispatch.
+  // dispatching — this entry's callback is currently running in foreground.
+  //               If the same named callback is re-armed while it is running,
+  //               pending is set again and the new request survives the
+  //               dispatch epilogue for the next pass.
+  volatile bool       pending;
+  volatile bool       dispatching;
+  timepop_handle_t    handle;          // pending request handle
+  timepop_callback_t  callback;        // pending request callback
+  void*               user_data;       // pending request user data
+  const char*         name;            // pending request name
+
+  timepop_handle_t    dispatch_handle; // currently-running request handle
+  const char*         dispatch_name;   // currently-running request name
+  uint32_t            generation;
 };
 
 // ============================================================================
@@ -300,6 +319,9 @@ static volatile uint32_t diag_asap_arm_failures       = 0;
 static volatile uint32_t diag_asap_last_armed_dwt     = 0;
 static volatile uint32_t diag_asap_last_dispatch_dwt  = 0;
 static volatile const char* diag_asap_last_armed_name = nullptr;
+static volatile uint32_t diag_asap_replacements       = 0;
+static volatile uint32_t diag_asap_cancelled          = 0;
+static volatile uint32_t diag_asap_arm_while_dispatching = 0;
 
 static volatile uint32_t diag_alap_armed              = 0;
 static volatile uint32_t diag_alap_dispatched         = 0;
@@ -307,6 +329,9 @@ static volatile uint32_t diag_alap_arm_failures       = 0;
 static volatile uint32_t diag_alap_last_armed_dwt     = 0;
 static volatile uint32_t diag_alap_last_dispatch_dwt  = 0;
 static volatile const char* diag_alap_last_armed_name = nullptr;
+static volatile uint32_t diag_alap_replacements       = 0;
+static volatile uint32_t diag_alap_cancelled          = 0;
+static volatile uint32_t diag_alap_arm_while_dispatching = 0;
 
 static volatile uint32_t diag_dispatch_calls     = 0;
 static volatile uint32_t diag_dispatch_callbacks = 0;
@@ -474,6 +499,27 @@ static inline void update_slot_high_water(void);
 static inline void update_deferred_high_water(deferred_slot_t* slots_buf,
                                               uint32_t max_slots,
                                               volatile uint32_t& high_water);
+static inline bool deferred_entry_occupied(const deferred_slot_t& slot);
+static inline bool deferred_name_equals(const deferred_slot_t& slot,
+                                        const char* name);
+static inline bool deferred_any_pending(const deferred_slot_t* slots_buf,
+                                        uint32_t max_slots);
+static uint32_t deferred_pending_count(const deferred_slot_t* slots_buf,
+                                       uint32_t max_slots);
+static uint32_t deferred_dispatching_count(const deferred_slot_t* slots_buf,
+                                           uint32_t max_slots);
+static uint32_t deferred_occupied_count(const deferred_slot_t* slots_buf,
+                                        uint32_t max_slots);
+static uint32_t deferred_cancel_pending_by_name_unlocked(deferred_slot_t* slots_buf,
+                                                         uint32_t max_slots,
+                                                         const char* name,
+                                                         volatile uint32_t& cancelled_count);
+static bool deferred_cancel_pending_by_handle_unlocked(deferred_slot_t* slots_buf,
+                                                       uint32_t max_slots,
+                                                       timepop_handle_t handle,
+                                                       volatile uint32_t& cancelled_count);
+static inline void deferred_clear_if_idle(deferred_slot_t& slot);
+static inline timepop_handle_t allocate_handle_unlocked(void);
 static inline void update_max_u32(volatile uint32_t& target, uint32_t value);
 static inline uint32_t slot_index_for(const timepop_slot_t& slot);
 static inline int32_t signed_deadline_delta_ticks(uint32_t deadline,
@@ -626,13 +672,114 @@ static inline void update_slot_high_water(void) {
 }
 
 
+static inline bool deferred_entry_occupied(const deferred_slot_t& slot) {
+  return slot.pending || slot.dispatching;
+}
+
+static inline bool deferred_name_equals(const deferred_slot_t& slot,
+                                        const char* name) {
+  if (!name || !*name) return false;
+  if (slot.pending && slot.name && strcmp(slot.name, name) == 0) return true;
+  if (slot.dispatching && slot.dispatch_name &&
+      strcmp(slot.dispatch_name, name) == 0) return true;
+  return false;
+}
+
+static inline void deferred_clear_if_idle(deferred_slot_t& slot) {
+  if (slot.pending || slot.dispatching) return;
+  slot.handle = TIMEPOP_INVALID_HANDLE;
+  slot.callback = nullptr;
+  slot.user_data = nullptr;
+  slot.name = nullptr;
+  slot.dispatch_handle = TIMEPOP_INVALID_HANDLE;
+  slot.dispatch_name = nullptr;
+}
+
+static inline timepop_handle_t allocate_handle_unlocked(void) {
+  timepop_handle_t h = next_handle++;
+  if (next_handle == TIMEPOP_INVALID_HANDLE) next_handle = 1;
+  return h;
+}
+
+static uint32_t deferred_pending_count(const deferred_slot_t* slots_buf,
+                                       uint32_t max_slots) {
+  uint32_t n = 0;
+  for (uint32_t i = 0; i < max_slots; i++) {
+    if (slots_buf[i].pending) n++;
+  }
+  return n;
+}
+
+static uint32_t deferred_dispatching_count(const deferred_slot_t* slots_buf,
+                                           uint32_t max_slots) {
+  uint32_t n = 0;
+  for (uint32_t i = 0; i < max_slots; i++) {
+    if (slots_buf[i].dispatching) n++;
+  }
+  return n;
+}
+
+static uint32_t deferred_occupied_count(const deferred_slot_t* slots_buf,
+                                        uint32_t max_slots) {
+  uint32_t n = 0;
+  for (uint32_t i = 0; i < max_slots; i++) {
+    if (deferred_entry_occupied(slots_buf[i])) n++;
+  }
+  return n;
+}
+
+static inline bool deferred_any_pending(const deferred_slot_t* slots_buf,
+                                        uint32_t max_slots) {
+  for (uint32_t i = 0; i < max_slots; i++) {
+    if (slots_buf[i].pending) return true;
+  }
+  return false;
+}
+
+static uint32_t deferred_cancel_pending_by_name_unlocked(deferred_slot_t* slots_buf,
+                                                         uint32_t max_slots,
+                                                         const char* name,
+                                                         volatile uint32_t& cancelled_count) {
+  if (!name || !*name) return 0;
+
+  uint32_t cancelled = 0;
+  for (uint32_t i = 0; i < max_slots; i++) {
+    if (!slots_buf[i].pending || !slots_buf[i].name) continue;
+    if (strcmp(slots_buf[i].name, name) != 0) continue;
+
+    slots_buf[i].pending = false;
+    cancelled++;
+    cancelled_count++;
+    if (!slots_buf[i].dispatching) {
+      deferred_clear_if_idle(slots_buf[i]);
+    }
+  }
+  return cancelled;
+}
+
+static bool deferred_cancel_pending_by_handle_unlocked(deferred_slot_t* slots_buf,
+                                                       uint32_t max_slots,
+                                                       timepop_handle_t handle,
+                                                       volatile uint32_t& cancelled_count) {
+  if (handle == TIMEPOP_INVALID_HANDLE) return false;
+
+  for (uint32_t i = 0; i < max_slots; i++) {
+    if (!slots_buf[i].pending || slots_buf[i].handle != handle) continue;
+
+    slots_buf[i].pending = false;
+    cancelled_count++;
+    if (!slots_buf[i].dispatching) {
+      deferred_clear_if_idle(slots_buf[i]);
+    }
+    return true;
+  }
+  return false;
+}
+
 static inline void update_deferred_high_water(deferred_slot_t* slots_buf,
                                               uint32_t max_slots,
                                               volatile uint32_t& high_water) {
-  uint32_t active = 0;
-  for (uint32_t i = 0; i < max_slots; i++) {
-    if (slots_buf[i].active) active++;
-  }
+  const uint32_t active = deferred_occupied_count(slots_buf, max_slots);
   if (active > high_water) high_water = active;
 }
 
@@ -1234,24 +1381,21 @@ static bool retire_existing_named_slots(const char* name) {
     note_named_replacement(name);
   }
 
-  for (uint32_t i = 0; i < MAX_ASAP_SLOTS; i++) {
-    if (!asap_slots[i].active) continue;
-    if (!asap_slots[i].name) continue;
-    if (strcmp(asap_slots[i].name, name) != 0) continue;
-
-    asap_slots[i].active = false;
+  const uint32_t asap_cancelled =
+      deferred_cancel_pending_by_name_unlocked(asap_slots,
+                                               MAX_ASAP_SLOTS,
+                                               name,
+                                               diag_asap_cancelled);
+  const uint32_t alap_cancelled =
+      deferred_cancel_pending_by_name_unlocked(alap_slots,
+                                               MAX_ALAP_SLOTS,
+                                               name,
+                                               diag_alap_cancelled);
+  if (asap_cancelled || alap_cancelled) {
     retired_any = true;
-    note_named_replacement(name);
-  }
-
-  for (uint32_t i = 0; i < MAX_ALAP_SLOTS; i++) {
-    if (!alap_slots[i].active) continue;
-    if (!alap_slots[i].name) continue;
-    if (strcmp(alap_slots[i].name, name) != 0) continue;
-
-    alap_slots[i].active = false;
-    retired_any = true;
-    note_named_replacement(name);
+    for (uint32_t i = 0; i < asap_cancelled + alap_cancelled; i++) {
+      note_named_replacement(name);
+    }
   }
 
   return retired_any;
@@ -1678,38 +1822,70 @@ static void dispatch_deferred_phase(deferred_slot_t* slots_buf,
                                     uint32_t max_slots,
                                     volatile uint32_t& dispatched_count,
                                     volatile uint32_t& last_dispatch_dwt) {
-  bool pending_this_pass[MAX_ASAP_SLOTS > MAX_ALAP_SLOTS ? MAX_ASAP_SLOTS : MAX_ALAP_SLOTS] = {};
   for (uint32_t i = 0; i < max_slots; i++) {
-    pending_this_pass[i] = slots_buf[i].active;
-  }
+    timepop_callback_t callback = nullptr;
+    void* user_data = nullptr;
+    timepop_handle_t handle = TIMEPOP_INVALID_HANDLE;
+    const char* name = nullptr;
 
-  for (uint32_t i = 0; i < max_slots; i++) {
-    if (!pending_this_pass[i]) continue;
-    if (!slots_buf[i].active) continue;
+    {
+      const uint32_t saved = critical_enter();
+      if (slots_buf[i].pending) {
+        callback = slots_buf[i].callback;
+        user_data = slots_buf[i].user_data;
+        handle = slots_buf[i].handle;
+        name = slots_buf[i].name;
+
+        slots_buf[i].pending = false;
+        slots_buf[i].dispatching = true;
+        slots_buf[i].dispatch_handle = handle;
+        slots_buf[i].dispatch_name = name;
+      }
+      critical_exit(saved);
+    }
+
+    if (!callback || handle == TIMEPOP_INVALID_HANDLE) continue;
 
     timepop_ctx_t ctx;
-    build_deferred_ctx(slots_buf[i].handle, ctx);
+    build_deferred_ctx(handle, ctx);
 
-    uint32_t start = ARM_DWT_CYCCNT;
-    slots_buf[i].callback(&ctx, nullptr, slots_buf[i].user_data);
-    uint32_t end = ARM_DWT_CYCCNT;
+    const uint32_t start = ARM_DWT_CYCCNT;
+    callback(&ctx, nullptr, user_data);
+    const uint32_t end = ARM_DWT_CYCCNT;
 
     cpu_usage_account_busy(end - start);
     diag_dispatch_callbacks++;
     dispatched_count++;
     last_dispatch_dwt = end;
 
-    slots_buf[i].active = false;
+    {
+      const uint32_t saved = critical_enter();
+      if (slots_buf[i].dispatching &&
+          slots_buf[i].dispatch_handle == handle) {
+        slots_buf[i].dispatching = false;
+        slots_buf[i].dispatch_handle = TIMEPOP_INVALID_HANDLE;
+        slots_buf[i].dispatch_name = nullptr;
+      }
+      if (!slots_buf[i].pending && !slots_buf[i].dispatching) {
+        deferred_clear_if_idle(slots_buf[i]);
+      }
+      critical_exit(saved);
+    }
   }
 }
 
 static timepop_handle_t arm_deferred(deferred_slot_t* slots_buf,
                                      uint32_t max_slots,
+                                     deferred_slot_t* other_slots_buf,
+                                     uint32_t other_max_slots,
                                      volatile uint32_t& arm_failures,
                                      volatile uint32_t& armed_count,
                                      volatile uint32_t& last_armed_dwt,
                                      volatile const char*& last_armed_name,
                                      volatile uint32_t& high_water,
+                                     volatile uint32_t& replacements,
+                                     volatile uint32_t& other_cancelled_count,
+                                     volatile uint32_t& arm_while_dispatching_count,
                                      timepop_callback_t callback,
                                      void* user_data,
                                      const char* name) {
@@ -1717,23 +1893,63 @@ static timepop_handle_t arm_deferred(deferred_slot_t* slots_buf,
 
   const uint32_t saved = critical_enter();
 
-  const bool retired_named = retire_existing_named_slots(name);
-  if (retired_named) {
-    timepop_pending = true;
+  // Deferred callbacks are intentionally not timed slots.  Arming ASAP/ALAP
+  // from ISR context must not mutate the timed slot table and must not call
+  // schedule_next().  Named replacement is therefore restricted to the
+  // dedicated deferred lanes.
+  if (name && *name && other_slots_buf && other_max_slots > 0) {
+    const uint32_t cancelled =
+        deferred_cancel_pending_by_name_unlocked(other_slots_buf,
+                                                 other_max_slots,
+                                                 name,
+                                                 other_cancelled_count);
+    if (cancelled != 0) {
+      for (uint32_t i = 0; i < cancelled; i++) note_named_replacement(name);
+    }
+  }
+
+  if (name && *name) {
+    for (uint32_t i = 0; i < max_slots; i++) {
+      if (!deferred_name_equals(slots_buf[i], name)) continue;
+
+      const timepop_handle_t h = allocate_handle_unlocked();
+      slots_buf[i].pending = true;
+      slots_buf[i].handle = h;
+      slots_buf[i].callback = callback;
+      slots_buf[i].user_data = user_data;
+      slots_buf[i].name = name;
+      slots_buf[i].generation++;
+
+      if (slots_buf[i].dispatching) {
+        arm_while_dispatching_count++;
+      } else {
+        replacements++;
+      }
+      note_named_replacement(name);
+
+      timepop_pending = true;
+      armed_count++;
+      last_armed_dwt = ARM_DWT_CYCCNT;
+      last_armed_name = name;
+      update_deferred_high_water(slots_buf, max_slots, high_water);
+
+      critical_exit(saved);
+      return h;
+    }
   }
 
   for (uint32_t i = 0; i < max_slots; i++) {
-    if (slots_buf[i].active) continue;
+    if (deferred_entry_occupied(slots_buf[i])) continue;
 
-    timepop_handle_t h = next_handle++;
-    if (next_handle == TIMEPOP_INVALID_HANDLE) next_handle = 1;
+    const timepop_handle_t h = allocate_handle_unlocked();
 
     slots_buf[i] = {};
-    slots_buf[i].active = true;
+    slots_buf[i].pending = true;
     slots_buf[i].handle = h;
     slots_buf[i].callback = callback;
     slots_buf[i].user_data = user_data;
     slots_buf[i].name = name;
+    slots_buf[i].generation = 1;
 
     timepop_pending = true;
     armed_count++;
@@ -1768,6 +1984,26 @@ void timepop_init(void) {
   for (uint32_t i = 0; i < MAX_SLOTS; i++) slots[i] = {};
   for (uint32_t i = 0; i < MAX_ASAP_SLOTS; i++) asap_slots[i] = {};
   for (uint32_t i = 0; i < MAX_ALAP_SLOTS; i++) alap_slots[i] = {};
+
+  diag_asap_armed = 0;
+  diag_asap_dispatched = 0;
+  diag_asap_arm_failures = 0;
+  diag_asap_last_armed_dwt = 0;
+  diag_asap_last_dispatch_dwt = 0;
+  diag_asap_last_armed_name = nullptr;
+  diag_asap_replacements = 0;
+  diag_asap_cancelled = 0;
+  diag_asap_arm_while_dispatching = 0;
+
+  diag_alap_armed = 0;
+  diag_alap_dispatched = 0;
+  diag_alap_arm_failures = 0;
+  diag_alap_last_armed_dwt = 0;
+  diag_alap_last_dispatch_dwt = 0;
+  diag_alap_last_armed_name = nullptr;
+  diag_alap_replacements = 0;
+  diag_alap_cancelled = 0;
+  diag_alap_arm_while_dispatching = 0;
 
   diag_deadline_negative_offset = 0;
   diag_deadline_last_target_gnss_ns = -1;
@@ -1855,8 +2091,7 @@ static timepop_handle_t arm_absolute_slot_internal(
   for (uint32_t i = 0; i < MAX_SLOTS; i++) {
     if (slots[i].active) continue;
 
-    timepop_handle_t h = next_handle++;
-    if (next_handle == TIMEPOP_INVALID_HANDLE) next_handle = 1;
+    const timepop_handle_t h = allocate_handle_unlocked();
 
     slots[i] = {};
     slots[i].active         = true;
@@ -1944,8 +2179,7 @@ static timepop_handle_t arm_anchored_recurring_isr_internal(
   for (uint32_t i = 0; i < MAX_SLOTS; i++) {
     if (slots[i].active) continue;
 
-    timepop_handle_t h = next_handle++;
-    if (next_handle == TIMEPOP_INVALID_HANDLE) next_handle = 1;
+    const timepop_handle_t h = allocate_handle_unlocked();
 
     slots[i] = {};
     slots[i].active = true;
@@ -2008,8 +2242,7 @@ static timepop_handle_t arm_anchored_recurring_isr_from_counter32_internal(
   for (uint32_t i = 0; i < MAX_SLOTS; i++) {
     if (slots[i].active) continue;
 
-    timepop_handle_t h = next_handle++;
-    if (next_handle == TIMEPOP_INVALID_HANDLE) next_handle = 1;
+    const timepop_handle_t h = allocate_handle_unlocked();
 
     slots[i] = {};
     slots[i].active = true;
@@ -2081,8 +2314,7 @@ static timepop_handle_t arm_relative_slot_internal(
   for (uint32_t i = 0; i < MAX_SLOTS; i++) {
     if (slots[i].active) continue;
 
-    timepop_handle_t h = next_handle++;
-    if (next_handle == TIMEPOP_INVALID_HANDLE) next_handle = 1;
+    const timepop_handle_t h = allocate_handle_unlocked();
 
     slots[i] = {};
     slots[i].active       = true;
@@ -2234,11 +2466,16 @@ timepop_handle_t timepop_arm_asap(
 ) {
   return arm_deferred(asap_slots,
                       MAX_ASAP_SLOTS,
+                      alap_slots,
+                      MAX_ALAP_SLOTS,
                       diag_asap_arm_failures,
                       diag_asap_armed,
                       diag_asap_last_armed_dwt,
                       diag_asap_last_armed_name,
                       diag_asap_slots_high_water,
+                      diag_asap_replacements,
+                      diag_alap_cancelled,
+                      diag_asap_arm_while_dispatching,
                       callback,
                       user_data,
                       name);
@@ -2251,11 +2488,16 @@ timepop_handle_t timepop_arm_alap(
 ) {
   return arm_deferred(alap_slots,
                       MAX_ALAP_SLOTS,
+                      asap_slots,
+                      MAX_ASAP_SLOTS,
                       diag_alap_arm_failures,
                       diag_alap_armed,
                       diag_alap_last_armed_dwt,
                       diag_alap_last_armed_name,
                       diag_alap_slots_high_water,
+                      diag_alap_replacements,
+                      diag_asap_cancelled,
+                      diag_alap_arm_while_dispatching,
                       callback,
                       user_data,
                       name);
@@ -2363,19 +2605,19 @@ bool timepop_cancel(timepop_handle_t handle) {
       return true;
     }
   }
-  for (uint32_t i = 0; i < MAX_ASAP_SLOTS; i++) {
-    if (asap_slots[i].active && asap_slots[i].handle == handle) {
-      asap_slots[i].active = false;
-      critical_exit(saved);
-      return true;
-    }
+  if (deferred_cancel_pending_by_handle_unlocked(asap_slots,
+                                                 MAX_ASAP_SLOTS,
+                                                 handle,
+                                                 diag_asap_cancelled)) {
+    critical_exit(saved);
+    return true;
   }
-  for (uint32_t i = 0; i < MAX_ALAP_SLOTS; i++) {
-    if (alap_slots[i].active && alap_slots[i].handle == handle) {
-      alap_slots[i].active = false;
-      critical_exit(saved);
-      return true;
-    }
+  if (deferred_cancel_pending_by_handle_unlocked(alap_slots,
+                                                 MAX_ALAP_SLOTS,
+                                                 handle,
+                                                 diag_alap_cancelled)) {
+    critical_exit(saved);
+    return true;
   }
   critical_exit(saved);
   return false;
@@ -2384,33 +2626,40 @@ bool timepop_cancel(timepop_handle_t handle) {
 uint32_t timepop_cancel_by_name(const char* name) {
   if (!name) return 0;
 
-  uint32_t cancelled = 0;
+  uint32_t timed_cancelled = 0;
+  uint32_t deferred_cancelled = 0;
   const uint32_t saved = critical_enter();
+
   for (uint32_t i = 0; i < MAX_SLOTS; i++) {
     if (slots[i].active && slots[i].name && strcmp(slots[i].name, name) == 0) {
       slots[i].active = false;
-      cancelled++;
+      timed_cancelled++;
     }
   }
-  for (uint32_t i = 0; i < MAX_ASAP_SLOTS; i++) {
-    if (asap_slots[i].active && asap_slots[i].name && strcmp(asap_slots[i].name, name) == 0) {
-      asap_slots[i].active = false;
-      cancelled++;
-    }
-  }
-  for (uint32_t i = 0; i < MAX_ALAP_SLOTS; i++) {
-    if (alap_slots[i].active && alap_slots[i].name && strcmp(alap_slots[i].name, name) == 0) {
-      alap_slots[i].active = false;
-      cancelled++;
-    }
-  }
-  if (cancelled > 0) {
+
+  deferred_cancelled +=
+      deferred_cancel_pending_by_name_unlocked(asap_slots,
+                                               MAX_ASAP_SLOTS,
+                                               name,
+                                               diag_asap_cancelled);
+  deferred_cancelled +=
+      deferred_cancel_pending_by_name_unlocked(alap_slots,
+                                               MAX_ALAP_SLOTS,
+                                               name,
+                                               diag_alap_cancelled);
+
+  if (timed_cancelled > 0) {
     diag_schedule_next_calls_from_other++;
     schedule_next();
+  }
+  if (deferred_cancelled > 0 &&
+      (deferred_any_pending(asap_slots, MAX_ASAP_SLOTS) ||
+       deferred_any_pending(alap_slots, MAX_ALAP_SLOTS))) {
     timepop_pending = true;
   }
+
   critical_exit(saved);
-  return cancelled;
+  return timed_cancelled + deferred_cancelled;
 }
 
 // ============================================================================
@@ -2418,8 +2667,16 @@ uint32_t timepop_cancel_by_name(const char* name) {
 // ============================================================================
 
 void timepop_dispatch(void) {
-  if (!timepop_pending) return;
-  timepop_pending = false;
+  {
+    const uint32_t saved = critical_enter();
+    if (!timepop_pending) {
+      critical_exit(saved);
+      return;
+    }
+    timepop_pending = false;
+    critical_exit(saved);
+  }
+
   diag_dispatch_calls++;
 
 
@@ -2586,16 +2843,8 @@ void timepop_dispatch(void) {
                           diag_alap_dispatched,
                           diag_alap_last_dispatch_dwt);
 
-  bool more_pending = false;
-  for (uint32_t i = 0; i < MAX_ASAP_SLOTS; i++) {
-    if (asap_slots[i].active) { more_pending = true; break; }
-  }
-  if (!more_pending) {
-    for (uint32_t i = 0; i < MAX_ALAP_SLOTS; i++) {
-      if (alap_slots[i].active) { more_pending = true; break; }
-    }
-  }
-  if (more_pending) {
+  if (deferred_any_pending(asap_slots, MAX_ASAP_SLOTS) ||
+      deferred_any_pending(alap_slots, MAX_ALAP_SLOTS)) {
     timepop_pending = true;
   }
 }
@@ -2650,16 +2899,14 @@ void timepop_epoch_changed(uint32_t epoch_sequence) {
     }
   }
 
-  for (uint32_t i = 0; i < MAX_ASAP_SLOTS; i++) {
-    if (asap_slots[i].active) asap_active++;
-  }
-  for (uint32_t i = 0; i < MAX_ALAP_SLOTS; i++) {
-    if (alap_slots[i].active) alap_active++;
-  }
+  asap_active = deferred_occupied_count(asap_slots, MAX_ASAP_SLOTS);
+  alap_active = deferred_occupied_count(alap_slots, MAX_ALAP_SLOTS);
 
   // Timed expirations from the old epoch are invalid.  Deferred ASAP/ALAP
   // callbacks are not VCLOCK-deadline facts, so leave them in place.
-  timepop_pending = (asap_active > 0 || alap_active > 0);
+  timepop_pending =
+      deferred_any_pending(asap_slots, MAX_ASAP_SLOTS) ||
+      deferred_any_pending(alap_slots, MAX_ALAP_SLOTS);
 
   diag_epoch_change_count++;
   diag_epoch_last_sequence = epoch_sequence;
@@ -2688,12 +2935,8 @@ uint32_t timepop_active_count(void) {
   for (uint32_t i = 0; i < MAX_SLOTS; i++) {
     if (slots[i].active) n++;
   }
-  for (uint32_t i = 0; i < MAX_ASAP_SLOTS; i++) {
-    if (asap_slots[i].active) n++;
-  }
-  for (uint32_t i = 0; i < MAX_ALAP_SLOTS; i++) {
-    if (alap_slots[i].active) n++;
-  }
+  n += deferred_occupied_count(asap_slots, MAX_ASAP_SLOTS);
+  n += deferred_occupied_count(alap_slots, MAX_ALAP_SLOTS);
   return n;
 }
 
@@ -2773,6 +3016,12 @@ static Payload cmd_report(const Payload&) {
   out.add("asap_arm_failures",      diag_asap_arm_failures);
   out.add("asap_slots_high_water",  diag_asap_slots_high_water);
   out.add("asap_slots_max",         (uint32_t)MAX_ASAP_SLOTS);
+  out.add("asap_pending_now",       deferred_pending_count(asap_slots, MAX_ASAP_SLOTS));
+  out.add("asap_dispatching_now",   deferred_dispatching_count(asap_slots, MAX_ASAP_SLOTS));
+  out.add("asap_replacements",      diag_asap_replacements);
+  out.add("asap_cancelled",         diag_asap_cancelled);
+  out.add("asap_arm_while_dispatching", diag_asap_arm_while_dispatching);
+  out.add("asap_non_slot_deferred", true);
   out.add("asap_last_armed_dwt",    diag_asap_last_armed_dwt);
   out.add("asap_last_dispatch_dwt", diag_asap_last_dispatch_dwt);
   out.add("asap_last_armed_name",
@@ -2783,6 +3032,12 @@ static Payload cmd_report(const Payload&) {
   out.add("alap_arm_failures",      diag_alap_arm_failures);
   out.add("alap_slots_high_water",  diag_alap_slots_high_water);
   out.add("alap_slots_max",         (uint32_t)MAX_ALAP_SLOTS);
+  out.add("alap_pending_now",       deferred_pending_count(alap_slots, MAX_ALAP_SLOTS));
+  out.add("alap_dispatching_now",   deferred_dispatching_count(alap_slots, MAX_ALAP_SLOTS));
+  out.add("alap_replacements",      diag_alap_replacements);
+  out.add("alap_cancelled",         diag_alap_cancelled);
+  out.add("alap_arm_while_dispatching", diag_alap_arm_while_dispatching);
+  out.add("alap_non_slot_deferred", true);
   out.add("alap_last_armed_dwt",    diag_alap_last_armed_dwt);
   out.add("alap_last_dispatch_dwt", diag_alap_last_dispatch_dwt);
   out.add("alap_last_armed_name",

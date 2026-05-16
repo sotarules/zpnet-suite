@@ -9,7 +9,7 @@
 //   • PPS/VCLOCK phase-locked recurring series
 //   • shared captured fire facts for same-event timed clients
 //   • critical recurring ISR clients that callback/rearm before schedule_next
-//   • deferred callback dispatch
+//   • fixed non-slot deferred callback dispatch
 //   • instrumentation / reports
 //   • scheduler policy for QTimer1 CH2 compare deadlines
 //
@@ -36,8 +36,8 @@
 //   receive the same fire_vclock_raw, fire_dwt_cyccnt, and fire_gnss_ns.
 //   Equality with the compare target is the normal fire condition.  Callback
 //   order is logical only.  ASAP/ALAP are intentionally excluded from this
-//   guarantee because they are deferred scheduled-context queues, not timed
-//   CH2 clients.
+//   guarantee because they are fixed scheduled-context deferred lanes,
+//   not timed CH2 clients.
 //
 //   For CH2, the dispatcher authors the synthetic counter32_at_event and a
 //   latency-normalized DWT event coordinate, then packages them into a standard
@@ -67,6 +67,14 @@
 //   foreground scheduler ever has to discover an already-past timed slot,
 //   that condition is surfaced through report counters rather than hidden as
 //   a normal precision event.
+//
+//   ASAP/ALAP:
+//
+//   timepop_arm_asap() and timepop_arm_alap() keep their public API, but are
+//   implemented as fixed deferred mailboxes rather than scheduled slots.  They
+//   are safe to request from ISR context: the request only writes the deferred
+//   lane under PRIMASK and sets the dispatch-pending bit.  ASAP drains before
+//   timed scheduled-context slots; ALAP drains after timed slots.
 //
 //   Critical recurring ISR clients are the white-glove exception for tiny
 //   substrate-maintenance work.  They are still ordinary TimePop slots and
