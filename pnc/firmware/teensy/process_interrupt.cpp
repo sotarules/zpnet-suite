@@ -175,6 +175,23 @@ static_assert(OCXO_WITNESS_ONE_SECOND_COUNTS == 10000000U,
 static constexpr uint32_t OCXO_WITNESS_ARM_WINDOW_TICKS = 20000U;
 static constexpr uint32_t OCXO_WITNESS_MIN_ARM_LEAD_TICKS = 64U;
 
+// OCXO witness scheduling/report classifications.  These are instrumentation
+// only: they make CADENCE_MINDER arm decisions and OCXO compare-service timing
+// visible without changing whether an event is published.
+static constexpr uint32_t OCXO_SCHEDULE_DECISION_NONE               = 0;
+static constexpr uint32_t OCXO_SCHEDULE_DECISION_INACTIVE           = 1;
+static constexpr uint32_t OCXO_SCHEDULE_DECISION_ALREADY_ARMED      = 2;
+static constexpr uint32_t OCXO_SCHEDULE_DECISION_TARGET_INITIALIZED = 3;
+static constexpr uint32_t OCXO_SCHEDULE_DECISION_TARGET_ADVANCED    = 4;
+static constexpr uint32_t OCXO_SCHEDULE_DECISION_TOO_CLOSE          = 5;
+static constexpr uint32_t OCXO_SCHEDULE_DECISION_OUTSIDE_WINDOW     = 6;
+static constexpr uint32_t OCXO_SCHEDULE_DECISION_ARMED              = 7;
+
+static constexpr uint32_t OCXO_SERVICE_CLASS_NONE                   = 0;
+static constexpr uint32_t OCXO_SERVICE_CLASS_FALSE_IRQ              = 1;
+static constexpr uint32_t OCXO_SERVICE_CLASS_EARLY_PRETARGET        = 2;
+static constexpr uint32_t OCXO_SERVICE_CLASS_ON_OR_AFTER_TARGET     = 3;
+
 // ============================================================================
 // Step 0 migration baseline — report-only safety rails
 // ============================================================================
@@ -1032,7 +1049,65 @@ struct ocxo_lane_t {
   uint32_t witness_last_arm_remaining_ticks = 0;
   uint32_t witness_last_event_dwt = 0;
   uint32_t witness_last_event_counter32 = 0;
+
+  // Legacy ambiguous surface retained for continuity.  This is the raw
+  // 16-bit modular delta: isr_counter_low16 - target_low16 (mod 65536).
+  // Values > 32767 mean early service, not very-late service.
   uint32_t witness_last_late_ticks = 0;
+
+  // CADENCE_MINDER arm-decision diagnostics.
+  uint32_t witness_schedule_last_decision = OCXO_SCHEDULE_DECISION_NONE;
+  uint32_t witness_schedule_last_current_counter32 = 0;
+  uint32_t witness_schedule_last_target_counter32 = 0;
+  uint32_t witness_schedule_last_remaining_ticks = 0;
+  uint32_t witness_schedule_last_phase_ticks = 0;
+  uint32_t witness_schedule_last_ticks_until_arm_window = 0;
+  uint16_t witness_schedule_last_current_low16 = 0;
+  uint16_t witness_schedule_last_target_low16 = 0;
+
+  // Arming snapshots.
+  uint32_t witness_last_arm_dwt_raw = 0;
+  uint32_t witness_last_arm_counter32 = 0;
+  uint16_t witness_last_arm_low16 = 0;
+  uint32_t witness_last_arm_target_counter32 = 0;
+  uint16_t witness_last_arm_target_low16 = 0;
+  uint32_t witness_last_arm_to_isr_ticks = 0;
+  uint32_t witness_last_arm_to_isr_dwt_cycles = 0;
+  uint32_t witness_last_program_csctrl_before = 0;
+  uint32_t witness_last_program_csctrl_after = 0;
+  bool     witness_last_program_flag_before = false;
+  bool     witness_last_program_flag_after = false;
+  bool     witness_last_program_enabled_before = false;
+  bool     witness_last_program_enabled_after = false;
+
+  // Compare-service diagnostics.  These are report-only and do not change
+  // publish/compare behavior.
+  uint32_t witness_last_isr_csctrl_entry = 0;
+  uint32_t witness_last_isr_csctrl_after_disable = 0;
+  bool     witness_last_isr_compare_flag_entry = false;
+  bool     witness_last_isr_compare_enabled_entry = false;
+  bool     witness_last_isr_compare_flag_after_disable = false;
+  bool     witness_last_isr_compare_enabled_after_disable = false;
+  bool     witness_last_irq_had_armed = false;
+  bool     witness_last_irq_had_active_rt = false;
+
+  uint16_t witness_last_target_low16 = 0;
+  uint16_t witness_last_isr_counter_low16 = 0;
+  uint32_t witness_last_target_delta_mod65536_ticks = 0;
+  uint32_t witness_last_interpreted_late_ticks = 0;
+  uint32_t witness_last_early_ticks = 0;
+  int32_t  witness_last_service_offset_signed_ticks = 0;
+  uint32_t witness_last_service_offset_abs_ticks = 0;
+  bool     witness_last_service_was_early = false;
+  bool     witness_last_service_was_on_or_after_target = false;
+  uint32_t witness_last_service_class = OCXO_SERVICE_CLASS_NONE;
+
+  uint32_t witness_service_count = 0;
+  uint32_t witness_early_service_count = 0;
+  uint32_t witness_on_or_after_service_count = 0;
+  uint32_t witness_valid_publish_count = 0;
+  uint32_t witness_early_service_published_count = 0;
+  bool     witness_last_event_published = false;
 };
 static ocxo_lane_t g_ocxo1_lane;
 static ocxo_lane_t g_ocxo2_lane;
@@ -1111,13 +1186,27 @@ static volatile uint32_t g_qtimer1_ch2_last_target_counter32 = 0;
 static volatile uint32_t g_qtimer1_ch2_arm_count = 0;
 
 static volatile uint32_t g_qtimer2_ch0_count = 0;
-static volatile uint32_t g_qtimer2_last_ch0_late_ticks = 0;
+static volatile uint32_t g_qtimer2_last_ch0_late_ticks = 0;  // legacy raw modular delta
+static volatile uint32_t g_qtimer2_last_ch0_interpreted_late_ticks = 0;
+static volatile uint32_t g_qtimer2_last_ch0_early_ticks = 0;
+static volatile int32_t  g_qtimer2_last_ch0_service_offset_signed_ticks = 0;
+static volatile uint32_t g_qtimer2_last_ch0_service_offset_abs_ticks = 0;
+static volatile uint32_t g_qtimer2_last_ch0_target_delta_mod65536_ticks = 0;
+static volatile uint16_t g_qtimer2_last_ch0_target_low16 = 0;
+static volatile uint16_t g_qtimer2_last_ch0_isr_counter_low16 = 0;
 static volatile uint32_t g_qtimer2_last_ch0_dwt_raw = 0;
 static volatile uint32_t g_qtimer2_last_ch0_event_dwt = 0;
 static volatile uint32_t g_qtimer2_last_ch0_dwt_coordinate_source = OCXO_DWT_SOURCE_NONE;
 
 static volatile uint32_t g_qtimer3_ch3_count = 0;
-static volatile uint32_t g_qtimer3_last_ch3_late_ticks = 0;
+static volatile uint32_t g_qtimer3_last_ch3_late_ticks = 0;  // legacy raw modular delta
+static volatile uint32_t g_qtimer3_last_ch3_interpreted_late_ticks = 0;
+static volatile uint32_t g_qtimer3_last_ch3_early_ticks = 0;
+static volatile int32_t  g_qtimer3_last_ch3_service_offset_signed_ticks = 0;
+static volatile uint32_t g_qtimer3_last_ch3_service_offset_abs_ticks = 0;
+static volatile uint32_t g_qtimer3_last_ch3_target_delta_mod65536_ticks = 0;
+static volatile uint16_t g_qtimer3_last_ch3_target_low16 = 0;
+static volatile uint16_t g_qtimer3_last_ch3_isr_counter_low16 = 0;
 static volatile uint32_t g_qtimer3_last_ch3_dwt_raw = 0;
 static volatile uint32_t g_qtimer3_last_ch3_event_dwt = 0;
 static volatile uint32_t g_qtimer3_last_ch3_dwt_coordinate_source = OCXO_DWT_SOURCE_NONE;
@@ -1421,14 +1510,13 @@ static inline void qtimer1_ch2_program_compare(uint16_t target_low16) {
   IMXRT_TMR1.CH[2].CSCTRL |= TMR_CSCTRL_TCF1EN;
 }
 
+// QuadTimer compare flags are cleared by writing the flag bits low in CSCTRL.
+// Match the QTimer1 CH1/CH2 clear idiom.
 static inline void qtimer2_ch0_clear_compare_flag(void) {
-  // QuadTimer compare flags are status latches.  On i.MX RT they are
-  // write-one-to-clear; writing zero leaves a latched TCF bit untouched.
-  // Keep this helper OCXO-local so the active QTimer1/TimePop rail remains
-  // unchanged in this pass.
-  IMXRT_TMR2.CH[0].CSCTRL |= (TMR_CSCTRL_TCF1 | TMR_CSCTRL_TCF2);
+  IMXRT_TMR2.CH[0].CSCTRL &= ~(TMR_CSCTRL_TCF1 | TMR_CSCTRL_TCF2);
   (void)IMXRT_TMR2.CH[0].CSCTRL;
 }
+
 static inline void qtimer2_ch0_program_compare(uint16_t target_low16) {
   qtimer2_ch0_clear_compare_flag();
   IMXRT_TMR2.CH[0].COMP1  = target_low16;
@@ -1436,20 +1524,20 @@ static inline void qtimer2_ch0_program_compare(uint16_t target_low16) {
   qtimer2_ch0_clear_compare_flag();
   IMXRT_TMR2.CH[0].CSCTRL |= TMR_CSCTRL_TCF1EN;
 }
+
 static inline void qtimer2_ch0_disable_compare(void) {
   IMXRT_TMR2.CH[0].CSCTRL &= ~TMR_CSCTRL_TCF1EN;
   qtimer2_ch0_clear_compare_flag();
   qtimer2_ch0_clear_compare_flag();
 }
 
+// QuadTimer compare flags are cleared by writing the flag bits low in CSCTRL.
+// Match the QTimer1 CH1/CH2 clear idiom.
 static inline void qtimer3_clear_compare_flag(uint8_t ch) {
-  // QuadTimer compare flags are status latches.  On i.MX RT they are
-  // write-one-to-clear; writing zero leaves a latched TCF bit untouched.
-  // Keep this helper OCXO-local so the active QTimer1/TimePop rail remains
-  // unchanged in this pass.
-  IMXRT_TMR3.CH[ch].CSCTRL |= (TMR_CSCTRL_TCF1 | TMR_CSCTRL_TCF2);
+  IMXRT_TMR3.CH[ch].CSCTRL &= ~(TMR_CSCTRL_TCF1 | TMR_CSCTRL_TCF2);
   (void)IMXRT_TMR3.CH[ch].CSCTRL;
 }
+
 static inline void qtimer3_program_compare(uint8_t ch, uint16_t target_low16) {
   qtimer3_clear_compare_flag(ch);
   IMXRT_TMR3.CH[ch].COMP1  = target_low16;
@@ -1457,6 +1545,7 @@ static inline void qtimer3_program_compare(uint8_t ch, uint16_t target_low16) {
   qtimer3_clear_compare_flag(ch);
   IMXRT_TMR3.CH[ch].CSCTRL |= TMR_CSCTRL_TCF1EN;
 }
+
 static inline void qtimer3_disable_compare(uint8_t ch) {
   IMXRT_TMR3.CH[ch].CSCTRL &= ~TMR_CSCTRL_TCF1EN;
   qtimer3_clear_compare_flag(ch);
@@ -1599,6 +1688,55 @@ static void emit_one_second_event(interrupt_subscriber_runtime_t& rt,
 // Cadence minder — single TimePop custody agent for all low-word counters
 // ============================================================================
 
+static const char* ocxo_schedule_decision_name(uint32_t decision) {
+  switch (decision) {
+    case OCXO_SCHEDULE_DECISION_INACTIVE: return "INACTIVE";
+    case OCXO_SCHEDULE_DECISION_ALREADY_ARMED: return "ALREADY_ARMED";
+    case OCXO_SCHEDULE_DECISION_TARGET_INITIALIZED: return "TARGET_INITIALIZED";
+    case OCXO_SCHEDULE_DECISION_TARGET_ADVANCED: return "TARGET_ADVANCED";
+    case OCXO_SCHEDULE_DECISION_TOO_CLOSE: return "TOO_CLOSE";
+    case OCXO_SCHEDULE_DECISION_OUTSIDE_WINDOW: return "OUTSIDE_WINDOW";
+    case OCXO_SCHEDULE_DECISION_ARMED: return "ARMED";
+    default: return "NONE";
+  }
+}
+
+static const char* ocxo_service_class_name(uint32_t service_class) {
+  switch (service_class) {
+    case OCXO_SERVICE_CLASS_FALSE_IRQ: return "FALSE_IRQ";
+    case OCXO_SERVICE_CLASS_EARLY_PRETARGET: return "EARLY_PRETARGET";
+    case OCXO_SERVICE_CLASS_ON_OR_AFTER_TARGET: return "ON_OR_AFTER_TARGET";
+    default: return "NONE";
+  }
+}
+
+static void ocxo_witness_schedule_record(ocxo_lane_t& lane,
+                                         uint32_t decision,
+                                         uint32_t current_counter32,
+                                         uint16_t current_low16,
+                                         uint32_t remaining_ticks) {
+  lane.witness_schedule_last_decision = decision;
+  lane.witness_schedule_last_current_counter32 = current_counter32;
+  lane.witness_schedule_last_target_counter32 = lane.witness_target_counter32;
+  lane.witness_schedule_last_remaining_ticks = remaining_ticks;
+  lane.witness_schedule_last_current_low16 = current_low16;
+  lane.witness_schedule_last_target_low16 =
+      (uint16_t)(lane.witness_target_counter32 & 0xFFFFU);
+
+  if (lane.witness_target_initialized) {
+    const uint32_t second_start =
+        lane.witness_target_counter32 - OCXO_WITNESS_ONE_SECOND_COUNTS;
+    lane.witness_schedule_last_phase_ticks = current_counter32 - second_start;
+  } else {
+    lane.witness_schedule_last_phase_ticks = 0;
+  }
+
+  lane.witness_schedule_last_ticks_until_arm_window =
+      (remaining_ticks > OCXO_WITNESS_ARM_WINDOW_TICKS)
+          ? (remaining_ticks - OCXO_WITNESS_ARM_WINDOW_TICKS)
+          : 0U;
+}
+
 static void ocxo_witness_advance_target_past_current(ocxo_lane_t& lane,
                                                      uint32_t current_counter32) {
   while ((uint32_t)(current_counter32 - lane.witness_target_counter32) <
@@ -1610,37 +1748,103 @@ static void ocxo_witness_advance_target_past_current(ocxo_lane_t& lane,
 
 static void ocxo_witness_maybe_arm_from_minder(ocxo_lane_t& lane,
                                                const synthetic_clock32_t& clock32) {
-  if (!lane.initialized || !lane.active || lane.witness_armed) return;
+  const uint32_t current_counter32 = clock32.current_counter32;
+  const uint16_t current_low16 = clock32.hardware16;
+
+  if (!lane.initialized || !lane.active) {
+    ocxo_witness_schedule_record(lane,
+                                 OCXO_SCHEDULE_DECISION_INACTIVE,
+                                 current_counter32,
+                                 current_low16,
+                                 0);
+    return;
+  }
+
+  if (lane.witness_armed) {
+    const uint32_t remaining = lane.witness_target_initialized
+        ? (lane.witness_target_counter32 - current_counter32)
+        : 0U;
+    ocxo_witness_schedule_record(lane,
+                                 OCXO_SCHEDULE_DECISION_ALREADY_ARMED,
+                                 current_counter32,
+                                 current_low16,
+                                 remaining);
+    return;
+  }
 
   if (!lane.witness_target_initialized) {
     lane.witness_target_counter32 =
-        clock32.current_counter32 + OCXO_WITNESS_ONE_SECOND_COUNTS;
+        current_counter32 + OCXO_WITNESS_ONE_SECOND_COUNTS;
     lane.witness_target_initialized = true;
   }
 
-  uint32_t remaining = lane.witness_target_counter32 - clock32.current_counter32;
+  uint32_t remaining = lane.witness_target_counter32 - current_counter32;
+  uint32_t decision = OCXO_SCHEDULE_DECISION_TARGET_INITIALIZED;
 
   // If the target is already behind the current passive observation, skip to
   // the next OCXO second.  This should only happen during startup or if the
   // compare was not armed in time; it is explicitly counted.
   if (remaining > 0x7FFFFFFFUL) {
-    ocxo_witness_advance_target_past_current(lane, clock32.current_counter32);
-    remaining = lane.witness_target_counter32 - clock32.current_counter32;
+    ocxo_witness_advance_target_past_current(lane, current_counter32);
+    remaining = lane.witness_target_counter32 - current_counter32;
+    decision = OCXO_SCHEDULE_DECISION_TARGET_ADVANCED;
   }
 
   if (remaining <= OCXO_WITNESS_MIN_ARM_LEAD_TICKS) {
     lane.witness_late_arm_count++;
+    ocxo_witness_schedule_record(lane,
+                                 OCXO_SCHEDULE_DECISION_TOO_CLOSE,
+                                 current_counter32,
+                                 current_low16,
+                                 remaining);
     return;
   }
 
-  if (remaining > OCXO_WITNESS_ARM_WINDOW_TICKS) return;
+  if (remaining > OCXO_WITNESS_ARM_WINDOW_TICKS) {
+    ocxo_witness_schedule_record(lane,
+                                 OCXO_SCHEDULE_DECISION_OUTSIDE_WINDOW,
+                                 current_counter32,
+                                 current_low16,
+                                 remaining);
+    return;
+  }
 
   lane.witness_target_low16 = (uint16_t)(lane.witness_target_counter32 & 0xFFFFU);
   lane.compare_target = lane.witness_target_low16;
+  lane.witness_last_arm_dwt_raw = ARM_DWT_CYCCNT;
+  lane.witness_last_arm_counter32 = current_counter32;
+  lane.witness_last_arm_low16 = current_low16;
+  lane.witness_last_arm_target_counter32 = lane.witness_target_counter32;
+  lane.witness_last_arm_target_low16 = lane.witness_target_low16;
   lane.witness_last_arm_remaining_ticks = remaining;
+  lane.witness_last_arm_to_isr_ticks = 0;
+  lane.witness_last_arm_to_isr_dwt_cycles = 0;
+  lane.witness_last_event_published = false;
+  lane.witness_last_service_class = OCXO_SERVICE_CLASS_NONE;
+
+  lane.witness_last_program_csctrl_before = lane.module->CH[lane.channel].CSCTRL;
+  lane.witness_last_program_flag_before =
+      (lane.witness_last_program_csctrl_before & TMR_CSCTRL_TCF1) != 0;
+  lane.witness_last_program_enabled_before =
+      (lane.witness_last_program_csctrl_before & TMR_CSCTRL_TCF1EN) != 0;
+
   ocxo_lane_program_compare(lane, lane.witness_target_low16);
+
+  lane.witness_last_program_csctrl_after = lane.module->CH[lane.channel].CSCTRL;
+  lane.witness_last_program_flag_after =
+      (lane.witness_last_program_csctrl_after & TMR_CSCTRL_TCF1) != 0;
+  lane.witness_last_program_enabled_after =
+      (lane.witness_last_program_csctrl_after & TMR_CSCTRL_TCF1EN) != 0;
+
   lane.witness_armed = true;
   lane.witness_arm_count++;
+
+  ocxo_witness_schedule_record(lane,
+                               OCXO_SCHEDULE_DECISION_ARMED,
+                               current_counter32,
+                               current_low16,
+                               remaining);
+  (void)decision;
 }
 
 static void cadence_minder_emit_ocxo_if_due(interrupt_subscriber_kind_t kind,
@@ -1983,13 +2187,27 @@ static void ocxo_lane_clear_compare_flag(ocxo_lane_t& lane) {
 static void ocxo_lane_record_isr_diag(interrupt_subscriber_kind_t kind,
                                       uint32_t isr_entry_dwt_raw,
                                       uint32_t event_dwt,
-                                      uint32_t late_ticks) {
+                                      uint32_t legacy_late_ticks,
+                                      uint32_t interpreted_late_ticks = 0,
+                                      uint32_t early_ticks = 0,
+                                      int32_t service_offset_signed_ticks = 0,
+                                      uint32_t service_offset_abs_ticks = 0,
+                                      uint32_t target_delta_mod65536_ticks = 0,
+                                      uint16_t target_low16 = 0,
+                                      uint16_t isr_counter_low16 = 0) {
   if (kind == interrupt_subscriber_kind_t::OCXO1) {
     g_qtimer2_ch0_count++;
     g_qtimer2_last_ch0_dwt_raw = isr_entry_dwt_raw;
     g_qtimer2_last_ch0_event_dwt = event_dwt;
     g_qtimer2_last_ch0_dwt_coordinate_source = OCXO_DWT_SOURCE_ISR_ENTRY;
-    g_qtimer2_last_ch0_late_ticks = late_ticks;
+    g_qtimer2_last_ch0_late_ticks = legacy_late_ticks;
+    g_qtimer2_last_ch0_interpreted_late_ticks = interpreted_late_ticks;
+    g_qtimer2_last_ch0_early_ticks = early_ticks;
+    g_qtimer2_last_ch0_service_offset_signed_ticks = service_offset_signed_ticks;
+    g_qtimer2_last_ch0_service_offset_abs_ticks = service_offset_abs_ticks;
+    g_qtimer2_last_ch0_target_delta_mod65536_ticks = target_delta_mod65536_ticks;
+    g_qtimer2_last_ch0_target_low16 = target_low16;
+    g_qtimer2_last_ch0_isr_counter_low16 = isr_counter_low16;
     return;
   }
 
@@ -1998,7 +2216,14 @@ static void ocxo_lane_record_isr_diag(interrupt_subscriber_kind_t kind,
     g_qtimer3_last_ch3_dwt_raw = isr_entry_dwt_raw;
     g_qtimer3_last_ch3_event_dwt = event_dwt;
     g_qtimer3_last_ch3_dwt_coordinate_source = OCXO_DWT_SOURCE_ISR_ENTRY;
-    g_qtimer3_last_ch3_late_ticks = late_ticks;
+    g_qtimer3_last_ch3_late_ticks = legacy_late_ticks;
+    g_qtimer3_last_ch3_interpreted_late_ticks = interpreted_late_ticks;
+    g_qtimer3_last_ch3_early_ticks = early_ticks;
+    g_qtimer3_last_ch3_service_offset_signed_ticks = service_offset_signed_ticks;
+    g_qtimer3_last_ch3_service_offset_abs_ticks = service_offset_abs_ticks;
+    g_qtimer3_last_ch3_target_delta_mod65536_ticks = target_delta_mod65536_ticks;
+    g_qtimer3_last_ch3_target_low16 = target_low16;
+    g_qtimer3_last_ch3_isr_counter_low16 = isr_counter_low16;
   }
 }
 
@@ -2156,21 +2381,81 @@ static void ocxo_witness_compare_isr(ocxo_lane_t& lane,
                                      interrupt_subscriber_runtime_t* rt,
                                      interrupt_subscriber_kind_t kind,
                                      uint32_t isr_entry_dwt_raw) {
-  if (!ocxo_lane_compare_flag_pending(lane)) return;
+  const uint32_t isr_csctrl_entry = lane.module->CH[lane.channel].CSCTRL;
+  if ((isr_csctrl_entry & TMR_CSCTRL_TCF1) == 0) return;
+
+  const uint32_t target_counter32 = lane.witness_target_counter32;
+  const uint16_t target_low16 = (uint16_t)(target_counter32 & 0xFFFFU);
+  const uint16_t isr_counter_low16 = ocxo_lane_counter_now(lane);
+  const uint16_t target_delta_mod65536 =
+      (uint16_t)(isr_counter_low16 - target_low16);
+  const int16_t service_offset_signed = (int16_t)target_delta_mod65536;
+  const bool service_early = (service_offset_signed < 0);
+  const uint32_t early_ticks = service_early
+      ? (uint32_t)(-(int32_t)service_offset_signed)
+      : 0U;
+  const uint32_t interpreted_late_ticks = service_early
+      ? 0U
+      : (uint32_t)service_offset_signed;
+  const uint32_t service_offset_abs_ticks = service_early
+      ? early_ticks
+      : interpreted_late_ticks;
+
+  lane.witness_last_isr_csctrl_entry = isr_csctrl_entry;
+  lane.witness_last_isr_compare_flag_entry =
+      (isr_csctrl_entry & TMR_CSCTRL_TCF1) != 0;
+  lane.witness_last_isr_compare_enabled_entry =
+      (isr_csctrl_entry & TMR_CSCTRL_TCF1EN) != 0;
+  lane.witness_last_irq_had_armed = lane.witness_armed;
+  lane.witness_last_irq_had_active_rt = (rt && rt->active);
+
+  lane.witness_last_target_low16 = target_low16;
+  lane.witness_last_isr_counter_low16 = isr_counter_low16;
+  lane.witness_last_target_delta_mod65536_ticks =
+      (uint32_t)target_delta_mod65536;
+  lane.witness_last_interpreted_late_ticks = interpreted_late_ticks;
+  lane.witness_last_early_ticks = early_ticks;
+  lane.witness_last_service_offset_signed_ticks =
+      (int32_t)service_offset_signed;
+  lane.witness_last_service_offset_abs_ticks = service_offset_abs_ticks;
+  lane.witness_last_service_was_early = service_early;
+  lane.witness_last_service_was_on_or_after_target = !service_early;
+  lane.witness_last_arm_to_isr_ticks =
+      (uint32_t)((uint16_t)(isr_counter_low16 - lane.witness_last_arm_low16));
+  lane.witness_last_arm_to_isr_dwt_cycles =
+      isr_entry_dwt_raw - lane.witness_last_arm_dwt_raw;
+  lane.witness_last_service_class = service_early
+      ? OCXO_SERVICE_CLASS_EARLY_PRETARGET
+      : OCXO_SERVICE_CLASS_ON_OR_AFTER_TARGET;
+  lane.witness_service_count++;
+  if (service_early) {
+    lane.witness_early_service_count++;
+  } else {
+    lane.witness_on_or_after_service_count++;
+  }
+  lane.witness_last_event_published = false;
 
   ocxo_lane_clear_compare_flag(lane);
   ocxo_lane_disable_compare(lane);
 
+  const uint32_t isr_csctrl_after_disable = lane.module->CH[lane.channel].CSCTRL;
+  lane.witness_last_isr_csctrl_after_disable = isr_csctrl_after_disable;
+  lane.witness_last_isr_compare_flag_after_disable =
+      (isr_csctrl_after_disable & TMR_CSCTRL_TCF1) != 0;
+  lane.witness_last_isr_compare_enabled_after_disable =
+      (isr_csctrl_after_disable & TMR_CSCTRL_TCF1EN) != 0;
+
   if (!lane.witness_armed || !rt || !rt->active) {
     lane.witness_false_irq_count++;
+    lane.witness_last_service_class = OCXO_SERVICE_CLASS_FALSE_IRQ;
     return;
   }
 
-  const uint32_t target_counter32 = lane.witness_target_counter32;
   const uint32_t event_dwt = qtimer_event_dwt_from_isr_entry_raw(isr_entry_dwt_raw);
-  const uint32_t late_ticks =
-      (uint32_t)((uint16_t)(ocxo_lane_counter_now(lane) -
-                            (uint16_t)(target_counter32 & 0xFFFFU)));
+
+  // Legacy diagnostic value retained unchanged: modular uint16 delta.  The
+  // truthful signed interpretation is published separately in the lane report.
+  const uint32_t legacy_late_ticks = (uint32_t)target_delta_mod65536;
 
   lane.witness_armed = false;
   lane.witness_fire_count++;
@@ -2178,9 +2463,22 @@ static void ocxo_witness_compare_isr(ocxo_lane_t& lane,
   lane.logical_count32_at_last_second = target_counter32;
   lane.witness_last_event_dwt = event_dwt;
   lane.witness_last_event_counter32 = target_counter32;
-  lane.witness_last_late_ticks = late_ticks;
+  lane.witness_last_late_ticks = legacy_late_ticks;
+  lane.witness_last_event_published = true;
+  lane.witness_valid_publish_count++;
+  if (service_early) {
+    lane.witness_early_service_published_count++;
+  }
 
-  ocxo_lane_record_isr_diag(kind, isr_entry_dwt_raw, event_dwt, late_ticks);
+  ocxo_lane_record_isr_diag(kind, isr_entry_dwt_raw, event_dwt,
+                            legacy_late_ticks,
+                            interpreted_late_ticks,
+                            early_ticks,
+                            (int32_t)service_offset_signed,
+                            service_offset_abs_ticks,
+                            (uint32_t)target_delta_mod65536,
+                            target_low16,
+                            isr_counter_low16);
 
   // The target identity was known before the interrupt was armed.  The ISR is
   // only the DWT witness for that already-scheduled OCXO second edge.  Publish
@@ -2980,11 +3278,25 @@ void process_interrupt_init(void) {
   g_qtimer1_ch2_arm_count = 0;
   g_qtimer2_ch0_count = 0;
   g_qtimer2_last_ch0_late_ticks = 0;
+  g_qtimer2_last_ch0_interpreted_late_ticks = 0;
+  g_qtimer2_last_ch0_early_ticks = 0;
+  g_qtimer2_last_ch0_service_offset_signed_ticks = 0;
+  g_qtimer2_last_ch0_service_offset_abs_ticks = 0;
+  g_qtimer2_last_ch0_target_delta_mod65536_ticks = 0;
+  g_qtimer2_last_ch0_target_low16 = 0;
+  g_qtimer2_last_ch0_isr_counter_low16 = 0;
   g_qtimer2_last_ch0_dwt_raw = 0;
   g_qtimer2_last_ch0_event_dwt = 0;
   g_qtimer2_last_ch0_dwt_coordinate_source = OCXO_DWT_SOURCE_NONE;
   g_qtimer3_ch3_count = 0;
   g_qtimer3_last_ch3_late_ticks = 0;
+  g_qtimer3_last_ch3_interpreted_late_ticks = 0;
+  g_qtimer3_last_ch3_early_ticks = 0;
+  g_qtimer3_last_ch3_service_offset_signed_ticks = 0;
+  g_qtimer3_last_ch3_service_offset_abs_ticks = 0;
+  g_qtimer3_last_ch3_target_delta_mod65536_ticks = 0;
+  g_qtimer3_last_ch3_target_low16 = 0;
+  g_qtimer3_last_ch3_isr_counter_low16 = 0;
   g_qtimer3_last_ch3_dwt_raw = 0;
   g_qtimer3_last_ch3_event_dwt = 0;
   g_qtimer3_last_ch3_dwt_coordinate_source = OCXO_DWT_SOURCE_NONE;
@@ -3398,6 +3710,14 @@ static void add_ocxo_lane_payload(Payload& p,
     snprintf(key, sizeof(key), "%s_%s", prefix, suffix);
     p.add(key, value);
   };
+  auto add_i32 = [&](const char* suffix, int32_t value) {
+    snprintf(key, sizeof(key), "%s_%s", prefix, suffix);
+    p.add(key, value);
+  };
+  auto add_str = [&](const char* suffix, const char* value) {
+    snprintf(key, sizeof(key), "%s_%s", prefix, suffix);
+    p.add(key, value ? value : "");
+  };
 
   add_bool("initialized", lane.initialized);
   add_bool("active", lane.active);
@@ -3421,7 +3741,105 @@ static void add_ocxo_lane_payload(Payload& p,
   add_u32("witness_last_late_ticks", lane.witness_last_late_ticks);
   add_u32("witness_last_arm_remaining_ticks", lane.witness_last_arm_remaining_ticks);
 
+  // Compare-service interpretation.  These make early/stale service visible
+  // without changing the existing publication path.
+  add_u32("witness_last_target_delta_mod65536_ticks",
+          lane.witness_last_target_delta_mod65536_ticks);
+  add_i32("witness_last_service_offset_signed_ticks",
+          lane.witness_last_service_offset_signed_ticks);
+  add_u32("witness_last_early_ticks", lane.witness_last_early_ticks);
+  add_u32("witness_last_interpreted_late_ticks",
+          lane.witness_last_interpreted_late_ticks);
+  add_u32("witness_last_service_offset_abs_ticks",
+          lane.witness_last_service_offset_abs_ticks);
+  add_bool("witness_last_service_was_early",
+           lane.witness_last_service_was_early);
+  add_bool("witness_last_service_was_on_or_after_target",
+           lane.witness_last_service_was_on_or_after_target);
+  add_bool("witness_last_event_published", lane.witness_last_event_published);
+  add_u32("witness_last_service_class", lane.witness_last_service_class);
+  add_str("witness_last_service_class_name",
+          ocxo_service_class_name(lane.witness_last_service_class));
+  add_u32("witness_service_count", lane.witness_service_count);
+  add_u32("witness_early_service_count", lane.witness_early_service_count);
+  add_u32("witness_on_or_after_service_count",
+          lane.witness_on_or_after_service_count);
+  add_u32("witness_valid_publish_count", lane.witness_valid_publish_count);
+  add_u32("witness_early_service_published_count",
+          lane.witness_early_service_published_count);
+  add_u32("witness_schedule_last_decision",
+          lane.witness_schedule_last_decision);
+  add_str("witness_schedule_last_decision_name",
+          ocxo_schedule_decision_name(lane.witness_schedule_last_decision));
+
   if (!detailed) return;
+
+  add_u32("witness_schedule_last_current_counter32",
+          lane.witness_schedule_last_current_counter32);
+  add_u32("witness_schedule_last_target_counter32",
+          lane.witness_schedule_last_target_counter32);
+  add_u32("witness_schedule_last_remaining_ticks",
+          lane.witness_schedule_last_remaining_ticks);
+  add_u32("witness_schedule_last_phase_ticks",
+          lane.witness_schedule_last_phase_ticks);
+  add_u32("witness_schedule_last_ticks_until_arm_window",
+          lane.witness_schedule_last_ticks_until_arm_window);
+  add_u32("witness_schedule_last_current_low16",
+          (uint32_t)lane.witness_schedule_last_current_low16);
+  add_u32("witness_schedule_last_target_low16",
+          (uint32_t)lane.witness_schedule_last_target_low16);
+
+  add_u32("witness_last_arm_dwt_raw", lane.witness_last_arm_dwt_raw);
+  add_u32("witness_last_arm_counter32", lane.witness_last_arm_counter32);
+  add_u32("witness_last_arm_low16", (uint32_t)lane.witness_last_arm_low16);
+  add_u32("witness_last_arm_target_counter32",
+          lane.witness_last_arm_target_counter32);
+  add_u32("witness_last_arm_target_low16",
+          (uint32_t)lane.witness_last_arm_target_low16);
+  add_u32("witness_last_arm_to_isr_ticks",
+          lane.witness_last_arm_to_isr_ticks);
+  add_u32("witness_last_arm_to_isr_dwt_cycles",
+          lane.witness_last_arm_to_isr_dwt_cycles);
+  add_i32("witness_last_arm_remaining_minus_early_ticks",
+          (int32_t)lane.witness_last_arm_remaining_ticks -
+          (int32_t)lane.witness_last_early_ticks);
+
+  add_u32("witness_last_program_csctrl_before",
+          lane.witness_last_program_csctrl_before);
+  add_u32("witness_last_program_csctrl_after",
+          lane.witness_last_program_csctrl_after);
+  add_bool("witness_last_program_flag_before",
+           lane.witness_last_program_flag_before);
+  add_bool("witness_last_program_flag_after",
+           lane.witness_last_program_flag_after);
+  add_bool("witness_last_program_enabled_before",
+           lane.witness_last_program_enabled_before);
+  add_bool("witness_last_program_enabled_after",
+           lane.witness_last_program_enabled_after);
+
+  add_u32("witness_last_isr_csctrl_entry",
+          lane.witness_last_isr_csctrl_entry);
+  add_u32("witness_last_isr_csctrl_after_disable",
+          lane.witness_last_isr_csctrl_after_disable);
+  add_bool("witness_last_isr_compare_flag_entry",
+           lane.witness_last_isr_compare_flag_entry);
+  add_bool("witness_last_isr_compare_enabled_entry",
+           lane.witness_last_isr_compare_enabled_entry);
+  add_bool("witness_last_isr_compare_flag_after_disable",
+           lane.witness_last_isr_compare_flag_after_disable);
+  add_bool("witness_last_isr_compare_enabled_after_disable",
+           lane.witness_last_isr_compare_enabled_after_disable);
+  add_bool("witness_last_irq_had_armed", lane.witness_last_irq_had_armed);
+  add_bool("witness_last_irq_had_active_rt",
+           lane.witness_last_irq_had_active_rt);
+
+  add_u32("witness_last_target_low16",
+          (uint32_t)lane.witness_last_target_low16);
+  add_u32("witness_last_isr_counter_low16",
+          (uint32_t)lane.witness_last_isr_counter_low16);
+  add_bool("witness_last_service_early_immediate_after_arm",
+           lane.witness_last_service_was_early &&
+           lane.witness_last_arm_to_isr_ticks <= 256U);
 
   add_ocxo_clock32_payload(p, prefix, clock32);
 
@@ -3441,6 +3859,27 @@ static void add_ocxo_lane_payload(Payload& p,
   add_bool("qtimer_compare_live", compare_enabled && compare_flag);
   add_u32("qtimer_last_late_ticks", is_ocxo1 ? g_qtimer2_last_ch0_late_ticks
                                              : g_qtimer3_last_ch3_late_ticks);
+  add_u32("qtimer_last_interpreted_late_ticks",
+          is_ocxo1 ? g_qtimer2_last_ch0_interpreted_late_ticks
+                   : g_qtimer3_last_ch3_interpreted_late_ticks);
+  add_u32("qtimer_last_early_ticks",
+          is_ocxo1 ? g_qtimer2_last_ch0_early_ticks
+                   : g_qtimer3_last_ch3_early_ticks);
+  add_i32("qtimer_last_service_offset_signed_ticks",
+          is_ocxo1 ? g_qtimer2_last_ch0_service_offset_signed_ticks
+                   : g_qtimer3_last_ch3_service_offset_signed_ticks);
+  add_u32("qtimer_last_service_offset_abs_ticks",
+          is_ocxo1 ? g_qtimer2_last_ch0_service_offset_abs_ticks
+                   : g_qtimer3_last_ch3_service_offset_abs_ticks);
+  add_u32("qtimer_last_target_delta_mod65536_ticks",
+          is_ocxo1 ? g_qtimer2_last_ch0_target_delta_mod65536_ticks
+                   : g_qtimer3_last_ch3_target_delta_mod65536_ticks);
+  add_u32("qtimer_last_target_low16",
+          is_ocxo1 ? (uint32_t)g_qtimer2_last_ch0_target_low16
+                   : (uint32_t)g_qtimer3_last_ch3_target_low16);
+  add_u32("qtimer_last_isr_counter_low16",
+          is_ocxo1 ? (uint32_t)g_qtimer2_last_ch0_isr_counter_low16
+                   : (uint32_t)g_qtimer3_last_ch3_isr_counter_low16);
   add_u32("qtimer_last_dwt_raw", is_ocxo1 ? g_qtimer2_last_ch0_dwt_raw
                                           : g_qtimer3_last_ch3_dwt_raw);
   add_u32("qtimer_last_event_dwt", is_ocxo1 ? g_qtimer2_last_ch0_event_dwt
@@ -3488,6 +3927,9 @@ static Payload cmd_report(const Payload&) {
   p.add("ocxo_witness_edge_publish_deferred", true);
   p.add("ocxo_witness_one_second_counts", OCXO_WITNESS_ONE_SECOND_COUNTS);
   p.add("ocxo_witness_arm_window_ticks", OCXO_WITNESS_ARM_WINDOW_TICKS);
+  p.add("ocxo_compare_service_signed_offset_instrumented", true);
+  p.add("ocxo_compare_service_early_when_signed_offset_negative", true);
+  p.add("ocxo_compare_service_behavior_changed", false);
   p.add("ocxo_deferred_asap_arm_count", g_ocxo_deferred_asap_arm_count);
   p.add("ocxo_deferred_asap_overwrite_count", g_ocxo_deferred_asap_overwrite_count);
   p.add("ocxo_deferred_sample_count", g_ocxo_deferred_sample_count);
