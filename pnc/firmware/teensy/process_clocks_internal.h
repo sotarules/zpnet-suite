@@ -313,6 +313,18 @@ struct clocks_alpha_lane_forensics_t {
   uint32_t diag_anchor_cps;
   uint64_t diag_anchor_ns_delta;
   uint32_t diag_anchor_failure_mask;
+
+  // OCXO compare-service diagnostics copied from interrupt_capture_diag_t.
+  // Valid only for OCXO1/OCXO2 lanes; zero for VCLOCK or unavailable diag.
+  uint32_t diag_service_class;
+  int32_t  diag_service_offset_signed_ticks;
+  uint32_t diag_service_offset_abs_ticks;
+  uint32_t diag_interpreted_late_ticks;
+  uint32_t diag_early_ticks;
+  uint32_t diag_target_delta_mod65536_ticks;
+  uint32_t diag_arm_remaining_ticks;
+  uint32_t diag_arm_to_isr_ticks;
+  uint32_t diag_arm_to_isr_dwt_cycles;
 };
 
 bool clocks_alpha_lane_forensics(time_clock_id_t clock,

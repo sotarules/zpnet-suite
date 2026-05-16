@@ -480,6 +480,16 @@ struct alpha_lane_forensics_store_t {
   uint32_t diag_anchor_cps = 0;
   uint64_t diag_anchor_ns_delta = 0;
   uint32_t diag_anchor_failure_mask = 0;
+
+  uint32_t diag_service_class = 0;
+  int32_t  diag_service_offset_signed_ticks = 0;
+  uint32_t diag_service_offset_abs_ticks = 0;
+  uint32_t diag_interpreted_late_ticks = 0;
+  uint32_t diag_early_ticks = 0;
+  uint32_t diag_target_delta_mod65536_ticks = 0;
+  uint32_t diag_arm_remaining_ticks = 0;
+  uint32_t diag_arm_to_isr_ticks = 0;
+  uint32_t diag_arm_to_isr_dwt_cycles = 0;
 };
 
 static alpha_lane_forensics_store_t g_vclock_forensics = {};
@@ -896,6 +906,15 @@ static void alpha_forensics_reset_store(alpha_lane_forensics_store_t& s) {
   s.diag_anchor_cps = 0;
   s.diag_anchor_ns_delta = 0;
   s.diag_anchor_failure_mask = 0;
+  s.diag_service_class = 0;
+  s.diag_service_offset_signed_ticks = 0;
+  s.diag_service_offset_abs_ticks = 0;
+  s.diag_interpreted_late_ticks = 0;
+  s.diag_early_ticks = 0;
+  s.diag_target_delta_mod65536_ticks = 0;
+  s.diag_arm_remaining_ticks = 0;
+  s.diag_arm_to_isr_ticks = 0;
+  s.diag_arm_to_isr_dwt_cycles = 0;
 
   clocks_alpha_dmb();
   s.seq++;
@@ -985,6 +1004,18 @@ static void alpha_forensics_publish(time_clock_id_t clock_id,
     s->diag_anchor_cps = diag->anchor_cps;
     s->diag_anchor_ns_delta = diag->anchor_ns_delta;
     s->diag_anchor_failure_mask = diag->anchor_failure_mask;
+
+    s->diag_service_class = diag->ocxo_service_class;
+    s->diag_service_offset_signed_ticks =
+        diag->ocxo_service_offset_signed_ticks;
+    s->diag_service_offset_abs_ticks = diag->ocxo_service_offset_abs_ticks;
+    s->diag_interpreted_late_ticks = diag->ocxo_interpreted_late_ticks;
+    s->diag_early_ticks = diag->ocxo_early_ticks;
+    s->diag_target_delta_mod65536_ticks =
+        diag->ocxo_target_delta_mod65536_ticks;
+    s->diag_arm_remaining_ticks = diag->ocxo_arm_remaining_ticks;
+    s->diag_arm_to_isr_ticks = diag->ocxo_arm_to_isr_ticks;
+    s->diag_arm_to_isr_dwt_cycles = diag->ocxo_arm_to_isr_dwt_cycles;
   } else {
     s->diag_anchor_sequence_used = 0;
     s->diag_anchor_age_slots = 0;
@@ -994,6 +1025,15 @@ static void alpha_forensics_publish(time_clock_id_t clock_id,
     s->diag_anchor_cps = 0;
     s->diag_anchor_ns_delta = 0;
     s->diag_anchor_failure_mask = 0;
+    s->diag_service_class = 0;
+    s->diag_service_offset_signed_ticks = 0;
+    s->diag_service_offset_abs_ticks = 0;
+    s->diag_interpreted_late_ticks = 0;
+    s->diag_early_ticks = 0;
+    s->diag_target_delta_mod65536_ticks = 0;
+    s->diag_arm_remaining_ticks = 0;
+    s->diag_arm_to_isr_ticks = 0;
+    s->diag_arm_to_isr_dwt_cycles = 0;
   }
 
   clocks_alpha_dmb();
@@ -1044,6 +1084,17 @@ bool clocks_alpha_lane_forensics(time_clock_id_t clock,
     out->diag_anchor_cps = s->diag_anchor_cps;
     out->diag_anchor_ns_delta = s->diag_anchor_ns_delta;
     out->diag_anchor_failure_mask = s->diag_anchor_failure_mask;
+    out->diag_service_class = s->diag_service_class;
+    out->diag_service_offset_signed_ticks =
+        s->diag_service_offset_signed_ticks;
+    out->diag_service_offset_abs_ticks = s->diag_service_offset_abs_ticks;
+    out->diag_interpreted_late_ticks = s->diag_interpreted_late_ticks;
+    out->diag_early_ticks = s->diag_early_ticks;
+    out->diag_target_delta_mod65536_ticks =
+        s->diag_target_delta_mod65536_ticks;
+    out->diag_arm_remaining_ticks = s->diag_arm_remaining_ticks;
+    out->diag_arm_to_isr_ticks = s->diag_arm_to_isr_ticks;
+    out->diag_arm_to_isr_dwt_cycles = s->diag_arm_to_isr_dwt_cycles;
 
     clocks_alpha_dmb();
     const uint32_t seq2 = s->seq;

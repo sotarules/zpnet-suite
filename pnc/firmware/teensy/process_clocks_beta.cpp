@@ -484,47 +484,50 @@ static void payload_add_lane_forensics_flat(Payload& p,
     snprintf(key, sizeof(key), "%s_%s", prefix, suffix);
     p.add(key, value);
   };
-  auto add_u64 = [&](const char* suffix, uint64_t value) {
-    snprintf(key, sizeof(key), "%s_%s", prefix, suffix);
-    p.add(key, value);
-  };
-  auto add_i64 = [&](const char* suffix, int64_t value) {
+  auto add_i32 = [&](const char* suffix, int32_t value) {
     snprintf(key, sizeof(key), "%s_%s", prefix, suffix);
     p.add(key, value);
   };
 
-  // Flat Alpha-forensics fields for TIMEBASE_FRAGMENT.  raw_cycles.py uses
-  // <lane>_forensics_last_event_dwt to independently reconstruct the OCXO
-  // event-to-event DWT interval and compare it against prediction.<lane>_actual_cycles.
+  // Compact flat Alpha-forensics fields for TIMEBASE_FRAGMENT.
+  // raw_cycles.py needs the event DWT and the previous-event counter delta;
+  // the new OCXO service fields make compare-service latency visible in the
+  // same row as the static residual without carrying the full lane-report
+  // debugging surface in every fragment.
   add_bool("forensics_valid", valid);
   add_u32("forensics_update_count", valid ? f.update_count : 0U);
   add_u32("forensics_last_event_dwt", valid ? f.last_event_dwt : 0U);
   add_u32("alpha_event_last_event_dwt", valid ? f.last_event_dwt : 0U);  // raw_cycles alias
   add_u32("forensics_last_event_counter32", valid ? f.last_event_counter32 : 0U);
   add_u32("forensics_dwt_cycles_between_edges", valid ? f.dwt_cycles_between_edges : 0U);
-  add_u64("forensics_ns_between_edges", valid ? f.ns_between_edges : 0ULL);
-  add_i64("forensics_second_residual_ns", valid ? f.second_residual_ns : 0LL);
-  add_i64("forensics_window_error_ns", valid ? f.window_error_ns : 0LL);
-
+  add_u32("forensics_counter32_delta_since_previous_event",
+          valid ? f.counter32_delta_since_previous_event : 0U);
   add_u32("forensics_zero_offset_counter32", valid ? f.zero_offset_counter32 : 0U);
   add_u32("forensics_counter32_delta_since_zero_offset",
           valid ? f.counter32_delta_since_zero_offset : 0U);
-  add_u32("forensics_counter32_delta_since_previous_event",
-          valid ? f.counter32_delta_since_previous_event : 0U);
-  add_u64("forensics_logical_ticks64_since_zero",
-          valid ? f.logical_ticks64_since_zero : 0ULL);
-  add_u64("forensics_nominal_ns64_since_zero",
-          valid ? f.nominal_ns64_since_zero : 0ULL);
 
-  add_u64("forensics_counter_nominal_ns_between_edges",
-          valid ? f.counter_nominal_ns_between_edges : 0ULL);
-  add_u64("forensics_bridge_gnss_ns_between_edges",
-          valid ? f.bridge_gnss_ns_between_edges : 0ULL);
-  add_i64("forensics_bridge_residual_ns", valid ? f.bridge_residual_ns : 0LL);
-  add_bool("forensics_bridge_interval_valid", valid && f.bridge_interval_valid);
-  add_u64("forensics_event_gnss_ns", valid ? f.event_gnss_ns : 0ULL);
-  add_u64("forensics_previous_event_gnss_ns", valid ? f.previous_event_gnss_ns : 0ULL);
-  add_i64("forensics_phase_offset_ns", valid ? f.phase_offset_ns : 0LL);
+  // OCXO compare-service diagnostics propagated from process_interrupt through
+  // Alpha.  These are zero for missing diag.  The signed service offset is the
+  // primary correlation surface for OCXO residual excursions:
+  //   negative -> pre-target/early service
+  //   zero     -> exact target service
+  //   positive -> late service after target
+  add_u32("forensics_service_class", valid ? f.diag_service_class : 0U);
+  add_i32("forensics_service_offset_ticks",
+          valid ? f.diag_service_offset_signed_ticks : 0);
+  add_u32("forensics_service_offset_abs_ticks",
+          valid ? f.diag_service_offset_abs_ticks : 0U);
+  add_u32("forensics_interpreted_late_ticks",
+          valid ? f.diag_interpreted_late_ticks : 0U);
+  add_u32("forensics_early_ticks", valid ? f.diag_early_ticks : 0U);
+  add_u32("forensics_target_delta_mod65536_ticks",
+          valid ? f.diag_target_delta_mod65536_ticks : 0U);
+  add_u32("forensics_arm_remaining_ticks",
+          valid ? f.diag_arm_remaining_ticks : 0U);
+  add_u32("forensics_arm_to_isr_ticks",
+          valid ? f.diag_arm_to_isr_ticks : 0U);
+  add_u32("forensics_arm_to_isr_dwt_cycles",
+          valid ? f.diag_arm_to_isr_dwt_cycles : 0U);
 }
 
 // ============================================================================

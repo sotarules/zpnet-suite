@@ -288,6 +288,21 @@ struct interrupt_capture_diag_t {
   uint32_t pps_coincidence_cycles = 0;
   bool     pps_coincidence_valid  = false;
 
+  // OCXO compare-service diagnostics.
+  // Populated only for OCXO1/OCXO2 one-second witness events.  These are the
+  // compact fields needed to correlate TIMEBASE residuals with QTimer compare
+  // service timing without carrying the entire lane-report surface in every
+  // fragment.
+  uint32_t ocxo_service_class = 0;
+  int32_t  ocxo_service_offset_signed_ticks = 0;
+  uint32_t ocxo_service_offset_abs_ticks = 0;
+  uint32_t ocxo_interpreted_late_ticks = 0;
+  uint32_t ocxo_early_ticks = 0;
+  uint32_t ocxo_target_delta_mod65536_ticks = 0;
+  uint32_t ocxo_arm_remaining_ticks = 0;
+  uint32_t ocxo_arm_to_isr_ticks = 0;
+  uint32_t ocxo_arm_to_isr_dwt_cycles = 0;
+
   uint32_t anomaly_count = 0;
 };
 

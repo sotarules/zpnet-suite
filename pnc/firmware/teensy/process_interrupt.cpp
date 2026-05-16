@@ -1606,6 +1606,26 @@ static void fill_diag(interrupt_capture_diag_t& diag,
     diag.pps_coincidence_cycles = event.pps_coincidence_cycles;
     diag.pps_coincidence_valid  = event.pps_coincidence_valid;
   }
+
+  if (rt.desc->kind == interrupt_subscriber_kind_t::OCXO1 ||
+      rt.desc->kind == interrupt_subscriber_kind_t::OCXO2) {
+    const ocxo_lane_t* lane = ocxo_lane_for(rt.desc->kind);
+    if (lane) {
+      diag.ocxo_service_class = lane->witness_last_service_class;
+      diag.ocxo_service_offset_signed_ticks =
+          lane->witness_last_service_offset_signed_ticks;
+      diag.ocxo_service_offset_abs_ticks =
+          lane->witness_last_service_offset_abs_ticks;
+      diag.ocxo_interpreted_late_ticks =
+          lane->witness_last_interpreted_late_ticks;
+      diag.ocxo_early_ticks = lane->witness_last_early_ticks;
+      diag.ocxo_target_delta_mod65536_ticks =
+          lane->witness_last_target_delta_mod65536_ticks;
+      diag.ocxo_arm_remaining_ticks = lane->witness_last_arm_remaining_ticks;
+      diag.ocxo_arm_to_isr_ticks = lane->witness_last_arm_to_isr_ticks;
+      diag.ocxo_arm_to_isr_dwt_cycles = lane->witness_last_arm_to_isr_dwt_cycles;
+    }
+  }
 }
 
 static void maybe_dispatch_event(interrupt_subscriber_runtime_t& rt) {
