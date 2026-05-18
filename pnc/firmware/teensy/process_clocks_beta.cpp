@@ -165,8 +165,13 @@ static uint64_t current_raw_ocxo2_ns(void) {
 static void campaign_public_bases_reset_to_current(void) {
   g_campaign_public_dwt_base   = g_dwt_cycle_count_total;
   g_campaign_public_gnss_base  = current_raw_gnss_ns();
-  g_campaign_public_ocxo1_base = current_raw_ocxo1_ns();
-  g_campaign_public_ocxo2_base = current_raw_ocxo2_ns();
+
+  // Do not subtract away the intentional OCXO phase.  Public OCXO ledgers are
+  // expressed against the same PPS/VCLOCK base as GNSS/VCLOCK, so their
+  // non-zero phase at campaign zero remains visible instead of being
+  // cosmetically tandem-zeroed.
+  g_campaign_public_ocxo1_base = g_campaign_public_gnss_base;
+  g_campaign_public_ocxo2_base = g_campaign_public_gnss_base;
 }
 
 static uint64_t saturated_base_for_recovered_value(uint64_t current,
@@ -444,6 +449,39 @@ static void payload_add_flat_prediction_lane(Payload& p,
   add_u32("prediction_cycles", s.static_prediction_cycles);
   add_u32("actual_cycles", s.actual_cycles);
   add_i32("residual_cycles", s.static_residual_cycles);
+}
+
+static void payload_add_ocxo_phase_epoch_payload(Payload& p) {
+  p.add("ocxo_phase_model", "PHASE_AUTHORED_NON_TANDEM_ZERO");
+  p.add("ocxo_one_second_ticks", CLOCKS_OCXO_ONE_SECOND_TICKS);
+
+  p.add("ocxo1_first_edge_delay_ticks",
+        clocks_alpha_epoch_last_ocxo1_first_edge_delay_ticks());
+  p.add("ocxo1_first_edge_delay_ns",
+        (uint64_t)clocks_alpha_epoch_last_ocxo1_first_edge_delay_ticks() *
+        (uint64_t)NS_PER_10MHZ_TICK);
+  p.add("ocxo1_phase_at_pps_vclock_zero_ticks",
+        clocks_alpha_epoch_last_ocxo1_phase_ticks_at_pps_vclock_zero());
+  p.add("ocxo1_phase_at_pps_vclock_zero_ns",
+        clocks_alpha_epoch_last_ocxo1_phase_ns_at_pps_vclock_zero());
+  p.add("ocxo1_capture_counter32",
+        clocks_alpha_epoch_last_ocxo1_capture_counter32());
+  p.add("ocxo1_first_target_counter32",
+        clocks_alpha_epoch_last_ocxo1_first_target_counter32());
+
+  p.add("ocxo2_first_edge_delay_ticks",
+        clocks_alpha_epoch_last_ocxo2_first_edge_delay_ticks());
+  p.add("ocxo2_first_edge_delay_ns",
+        (uint64_t)clocks_alpha_epoch_last_ocxo2_first_edge_delay_ticks() *
+        (uint64_t)NS_PER_10MHZ_TICK);
+  p.add("ocxo2_phase_at_pps_vclock_zero_ticks",
+        clocks_alpha_epoch_last_ocxo2_phase_ticks_at_pps_vclock_zero());
+  p.add("ocxo2_phase_at_pps_vclock_zero_ns",
+        clocks_alpha_epoch_last_ocxo2_phase_ns_at_pps_vclock_zero());
+  p.add("ocxo2_capture_counter32",
+        clocks_alpha_epoch_last_ocxo2_capture_counter32());
+  p.add("ocxo2_first_target_counter32",
+        clocks_alpha_epoch_last_ocxo2_first_target_counter32());
 }
 
 static void payload_add_prediction_summary(Payload& p) {
@@ -1066,6 +1104,7 @@ void clocks_beta_pps(void) {
   p.add("ocxo2_measured_gnss_ns", public_ocxo2_ns);
   p.add("ocxo1_ns",       public_ocxo1_ns);  // legacy alias
   p.add("ocxo2_ns",       public_ocxo2_ns);  // legacy alias
+  payload_add_ocxo_phase_epoch_payload(p);
 
   p.add("calibrate_ocxo", servo_mode_str(calibrate_ocxo_mode));
 
@@ -1280,6 +1319,7 @@ static Payload cmd_start(const Payload& args) {
   p.add("zero_offset_vclock_hardware16_selected", (uint32_t)clocks_alpha_epoch_last_vclock_hardware16_selected());
   p.add("zero_offset_ocxo1_hardware16", (uint32_t)clocks_alpha_epoch_last_ocxo1_hardware16());
   p.add("zero_offset_ocxo2_hardware16", (uint32_t)clocks_alpha_epoch_last_ocxo2_hardware16());
+  payload_add_ocxo_phase_epoch_payload(p);
   p.add("ocxo_zero_valid", ocxo_zero_ok);
   p.add("servo_disabled_by_zero", servo_disabled_by_zero);
   p.add("ocxo1_dac", ocxo1_dac.dac_fractional);
@@ -1338,6 +1378,7 @@ static Payload cmd_zero(const Payload&) {
   p.add("epoch_capture_window_cycles", clocks_alpha_epoch_last_capture_window_cycles());
   p.add("epoch_capture_vclock_valid", clocks_alpha_epoch_last_vclock_capture_valid());
   p.add("epoch_capture_all_lanes_valid", clocks_alpha_epoch_last_all_lanes_valid());
+  payload_add_ocxo_phase_epoch_payload(p);
   return p;
 }
 
@@ -1631,6 +1672,7 @@ static Payload cmd_report(const Payload&) {
   p.add("epoch_capture_window_cycles", clocks_alpha_epoch_last_capture_window_cycles());
   p.add("epoch_capture_vclock_valid", clocks_alpha_epoch_last_vclock_capture_valid());
   p.add("epoch_capture_all_lanes_valid", clocks_alpha_epoch_last_all_lanes_valid());
+  payload_add_ocxo_phase_epoch_payload(p);
   p.add("interrupt_pps_rebootstrap_pending",
         interrupt_pps_rebootstrap_pending());
   p.add("campaign_warmup_active", campaign_warmup_active());

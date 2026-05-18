@@ -23,6 +23,13 @@
 //   campaign time does not wrap at the 32-bit / 10 MHz boundary.  Raw physical
 //   PPS facts and raw 16-bit capture values remain diagnostics.
 //
+//   OCXO lanes are intentionally phase-authored, not tandem-zeroed.  At the
+//   PPS/VCLOCK logical-zero event, VCLOCK reads zero, but OCXO1 and OCXO2 are
+//   deliberately already partway through their own local seconds.  Alpha crafts
+//   the OCXO zero-offset ticks so their public/synthetic/ns coordinates are
+//   non-zero at PPS/VCLOCK zero, and process_interrupt arms their first witness
+//   targets on the quiet half-millisecond-upbeat phase grid.
+//
 // Statistical surface (standardized):
 //
 //   Every Welford accumulator published in the fragment uses the same
@@ -193,6 +200,47 @@ uint64_t clocks_dwt_cycles_at_dwt(uint32_t dwt32);
 // window_mismatches.
 
 static constexpr int64_t CLOCK_WINDOW_TOLERANCE_NS = 500LL;
+
+// ============================================================================
+// OCXO phase-authored epoch policy
+// ============================================================================
+//
+// These are not calibration fudge factors and they are not hidden report
+// offsets.  They are the deliberate local-clock phase contract installed at
+// CLOCKS.ZERO / CLOCKS.START:
+//
+//   PPS/VCLOCK zero:  VCLOCK reads 0.
+//   OCXO1 next edge:  PPS/VCLOCK zero + 250,500 us.
+//   OCXO2 next edge:  PPS/VCLOCK zero + 750,500 us.
+//
+// Therefore, at PPS/VCLOCK zero the OCXO local coordinates already read:
+//
+//   OCXO1 = 1s - 250.5ms = 749.5ms
+//   OCXO2 = 1s - 750.5ms = 249.5ms
+//
+// Alpha implements this by crafting zero-offset ticks in the past relative to
+// the PPS capture.  process_interrupt implements the physical consequence by
+// placing the OCXO witness compare targets on those phase-authored edges.
+
+static constexpr uint32_t CLOCKS_OCXO_ONE_SECOND_TICKS =
+    (uint32_t)VCLOCK_COUNTS_PER_SECOND;
+static_assert(CLOCKS_OCXO_ONE_SECOND_TICKS == 10000000U,
+              "OCXO phase policy assumes 10 MHz / 10,000,000 ticks per second");
+
+static constexpr uint32_t CLOCKS_OCXO1_FIRST_EDGE_DELAY_TICKS = 2505000U;
+static constexpr uint32_t CLOCKS_OCXO2_FIRST_EDGE_DELAY_TICKS = 7505000U;
+
+static constexpr uint32_t CLOCKS_OCXO1_PHASE_TICKS_AT_PPS_VCLOCK_ZERO =
+    CLOCKS_OCXO_ONE_SECOND_TICKS - CLOCKS_OCXO1_FIRST_EDGE_DELAY_TICKS;
+static constexpr uint32_t CLOCKS_OCXO2_PHASE_TICKS_AT_PPS_VCLOCK_ZERO =
+    CLOCKS_OCXO_ONE_SECOND_TICKS - CLOCKS_OCXO2_FIRST_EDGE_DELAY_TICKS;
+
+static constexpr uint64_t CLOCKS_OCXO1_PHASE_NS_AT_PPS_VCLOCK_ZERO =
+    (uint64_t)CLOCKS_OCXO1_PHASE_TICKS_AT_PPS_VCLOCK_ZERO *
+    (uint64_t)NS_PER_10MHZ_TICK;
+static constexpr uint64_t CLOCKS_OCXO2_PHASE_NS_AT_PPS_VCLOCK_ZERO =
+    (uint64_t)CLOCKS_OCXO2_PHASE_TICKS_AT_PPS_VCLOCK_ZERO *
+    (uint64_t)NS_PER_10MHZ_TICK;
 
 // ============================================================================
 // Clock state — compatibility mirror for measured clocks (VCLOCK, OCXO*)
@@ -565,6 +613,16 @@ uint32_t clocks_alpha_epoch_last_ocxo2_counter32(void);
 bool clocks_alpha_epoch_last_vclock_zero_valid(void);
 bool clocks_alpha_epoch_last_ocxo1_zero_valid(void);
 bool clocks_alpha_epoch_last_ocxo2_zero_valid(void);
+uint32_t clocks_alpha_epoch_last_ocxo1_capture_counter32(void);
+uint32_t clocks_alpha_epoch_last_ocxo2_capture_counter32(void);
+uint32_t clocks_alpha_epoch_last_ocxo1_first_target_counter32(void);
+uint32_t clocks_alpha_epoch_last_ocxo2_first_target_counter32(void);
+uint32_t clocks_alpha_epoch_last_ocxo1_first_edge_delay_ticks(void);
+uint32_t clocks_alpha_epoch_last_ocxo2_first_edge_delay_ticks(void);
+uint32_t clocks_alpha_epoch_last_ocxo1_phase_ticks_at_pps_vclock_zero(void);
+uint32_t clocks_alpha_epoch_last_ocxo2_phase_ticks_at_pps_vclock_zero(void);
+uint64_t clocks_alpha_epoch_last_ocxo1_phase_ns_at_pps_vclock_zero(void);
+uint64_t clocks_alpha_epoch_last_ocxo2_phase_ns_at_pps_vclock_zero(void);
 uint16_t clocks_alpha_epoch_last_vclock_hardware16_observed(void);
 uint16_t clocks_alpha_epoch_last_vclock_hardware16_selected(void);
 uint16_t clocks_alpha_epoch_last_ocxo1_hardware16(void);

@@ -519,6 +519,7 @@ static alpha_lane_logical_ticks_t g_ocxo2_ticks64 = {};
 // the projected GNSS duration between consecutive OCXO one-second edges.
 struct alpha_measured_ns_clock_t {
   bool     initialized = false;
+  bool     have_physical_edge = false;
   uint64_t ns_at_edge = 0;
   uint32_t dwt_at_edge = 0;
 };
@@ -790,6 +791,16 @@ static void alpha_measured_ns_reset_all(void) {
   g_ocxo2_measured_ns = alpha_measured_ns_clock_t{};
 }
 
+static void alpha_measured_ns_install_epoch_phase(alpha_measured_ns_clock_t& s,
+                                                 uint32_t epoch_dwt,
+                                                 uint64_t ns_at_epoch) {
+  s = alpha_measured_ns_clock_t{};
+  s.initialized = true;
+  s.have_physical_edge = false;
+  s.ns_at_edge = ns_at_epoch;
+  s.dwt_at_edge = epoch_dwt;
+}
+
 static alpha_measured_ns_clock_t* alpha_measured_ns_store(time_clock_id_t clock) {
   switch (clock) {
     case time_clock_id_t::OCXO1: return &g_ocxo1_measured_ns;
@@ -830,6 +841,7 @@ static uint64_t alpha_ocxo_apply_measured_second(time_clock_id_t clock,
 
   if (!m->initialized) {
     m->initialized = true;
+    m->have_physical_edge = true;
     m->dwt_at_edge = raw_edge_dwt;
     m->ns_at_edge = alpha_ocxo_seed_ns_at_first_edge(raw_edge_dwt);
     if (out_dwt_cycles) *out_dwt_cycles = 0;
@@ -840,14 +852,24 @@ static uint64_t alpha_ocxo_apply_measured_second(time_clock_id_t clock,
 
   const uint32_t dwt_cycles = raw_edge_dwt - m->dwt_at_edge;
   const uint64_t real_interval_ns = alpha_dwt_cycles_to_gnss_ns(dwt_cycles);
-  const int64_t residual_fast_ns =
-      (int64_t)NS_PER_SECOND_U64 - (int64_t)real_interval_ns;
 
-  // The measured OCXO ledger is the accumulated GNSS duration between OCXO
-  // one-second edges.  This is intentionally not counter ticks × 100 ns and
-  // not an ideal +1e9-per-edge nominal ledger.
   m->ns_at_edge += real_interval_ns;
   m->dwt_at_edge = raw_edge_dwt;
+
+  // If the clock was initialized at PPS/VCLOCK zero with a deliberate OCXO
+  // phase, the first physical OCXO edge is a partial interval that closes the
+  // clock's local second.  It is real coordinate motion, but it is not a
+  // one-second residual sample and must not poison the next-second predictor.
+  if (!m->have_physical_edge) {
+    m->have_physical_edge = true;
+    if (out_dwt_cycles) *out_dwt_cycles = 0;
+    if (out_real_interval_ns) *out_real_interval_ns = 0;
+    if (out_residual_fast_ns) *out_residual_fast_ns = 0;
+    return m->ns_at_edge;
+  }
+
+  const int64_t residual_fast_ns =
+      (int64_t)NS_PER_SECOND_U64 - (int64_t)real_interval_ns;
 
   if (out_dwt_cycles) *out_dwt_cycles = dwt_cycles;
   if (out_real_interval_ns) *out_real_interval_ns = real_interval_ns;
@@ -1115,6 +1137,18 @@ static void clock_mark_epoch_zero(clock_state_t& clock) {
   clock.window_error_ns = 0;
 }
 
+static void clock_mark_epoch_phase(clock_state_t& clock,
+                                   uint64_t phase_ns_at_epoch) {
+  clock.ledger_ns_count_at_edge = phase_ns_at_epoch;
+  clock.gnss_ns_at_edge = 0;
+  clock.ledger_ns_count_at_pps_vclock = phase_ns_at_epoch;
+  clock.phase_offset_ns = -(int64_t)phase_ns_at_epoch;
+  clock.zero_established = true;  // legacy/report mirror: coordinate is established, not zeroed
+  clock.window_checks = 0;
+  clock.window_mismatches = 0;
+  clock.window_error_ns = 0;
+}
+
 // ============================================================================
 // Local epoch install / ZERO
 // ============================================================================
@@ -1137,6 +1171,10 @@ static volatile uint32_t g_alpha_epoch_last_dwt_at_edge = 0;
 static volatile uint32_t g_alpha_epoch_last_vclock_counter32 = 0;
 static volatile uint32_t g_alpha_epoch_last_ocxo1_counter32 = 0;
 static volatile uint32_t g_alpha_epoch_last_ocxo2_counter32 = 0;
+static volatile uint32_t g_alpha_epoch_last_ocxo1_capture_counter32 = 0;
+static volatile uint32_t g_alpha_epoch_last_ocxo2_capture_counter32 = 0;
+static volatile uint32_t g_alpha_epoch_last_ocxo1_first_target_counter32 = 0;
+static volatile uint32_t g_alpha_epoch_last_ocxo2_first_target_counter32 = 0;
 static volatile bool     g_alpha_epoch_last_vclock_zero_valid = false;
 static volatile bool     g_alpha_epoch_last_ocxo1_zero_valid = false;
 static volatile bool     g_alpha_epoch_last_ocxo2_zero_valid = false;
@@ -1221,6 +1259,20 @@ static void alpha_reset_canonical_clock_state_for_new_epoch(void) {
   welford_reset(welford_ocxo2);
 }
 
+static inline uint32_t alpha_ocxo_zero_offset_from_capture(uint32_t capture_counter32,
+                                                           uint32_t first_edge_delay_ticks) {
+  // The zero offset is intentionally behind the PPS-captured OCXO coordinate.
+  // If the next local one-second edge is P ticks after PPS/VCLOCK zero, then
+  // at PPS/VCLOCK zero the OCXO clock reads (1s - P).  Therefore:
+  //   zero_offset = capture + P - 1s
+  return capture_counter32 + first_edge_delay_ticks - CLOCKS_OCXO_ONE_SECOND_TICKS;
+}
+
+static inline uint32_t alpha_ocxo_first_target_from_capture(uint32_t capture_counter32,
+                                                            uint32_t first_edge_delay_ticks) {
+  return capture_counter32 + first_edge_delay_ticks;
+}
+
 bool clocks_alpha_zero_from_interrupt_capture(const char* reason) {
   interrupt_epoch_capture_t cap{};
   if (!interrupt_last_epoch_capture(&cap) || !cap.valid || !cap.vclock_capture_valid) {
@@ -1233,9 +1285,26 @@ bool clocks_alpha_zero_from_interrupt_capture(const char* reason) {
     return false;
   }
 
+  const uint32_t ocxo1_zero_offset =
+      alpha_ocxo_zero_offset_from_capture(cap.ocxo1_counter32,
+                                          CLOCKS_OCXO1_FIRST_EDGE_DELAY_TICKS);
+  const uint32_t ocxo2_zero_offset =
+      alpha_ocxo_zero_offset_from_capture(cap.ocxo2_counter32,
+                                          CLOCKS_OCXO2_FIRST_EDGE_DELAY_TICKS);
+  const uint32_t ocxo1_first_target =
+      alpha_ocxo_first_target_from_capture(cap.ocxo1_counter32,
+                                           CLOCKS_OCXO1_FIRST_EDGE_DELAY_TICKS);
+  const uint32_t ocxo2_first_target =
+      alpha_ocxo_first_target_from_capture(cap.ocxo2_counter32,
+                                           CLOCKS_OCXO2_FIRST_EDGE_DELAY_TICKS);
+
   alpha_reset_canonical_clock_state_for_new_epoch();
 
   g_gnss_ns_at_pps_vclock = 0;
+  g_ocxo1_measured_gnss_ns_at_pps_vclock =
+      CLOCKS_OCXO1_PHASE_NS_AT_PPS_VCLOCK_ZERO;
+  g_ocxo2_measured_gnss_ns_at_pps_vclock =
+      CLOCKS_OCXO2_PHASE_NS_AT_PPS_VCLOCK_ZERO;
   g_dwt_at_pps_vclock = cap.vclock_dwt_at_edge;
   g_counter32_at_pps_vclock = cap.vclock_counter32;
   g_prev_dwt_at_vclock_event = cap.vclock_dwt_at_edge;
@@ -1243,22 +1312,24 @@ bool clocks_alpha_zero_from_interrupt_capture(const char* reason) {
   g_prev_pps_vclock_dwt_at_edge_valid = true;
 
   alpha_ticks64_install_zero(g_vclock_ticks64, cap.vclock_counter32);
-  alpha_ticks64_install_zero(g_ocxo1_ticks64, cap.ocxo1_counter32);
-  alpha_ticks64_install_zero(g_ocxo2_ticks64, cap.ocxo2_counter32);
-  g_ocxo1_measured_ns.dwt_at_edge = cap.vclock_dwt_at_edge;
-  g_ocxo2_measured_ns.dwt_at_edge = cap.vclock_dwt_at_edge;
+  alpha_ticks64_install_zero(g_ocxo1_ticks64, ocxo1_zero_offset);
+  alpha_ticks64_install_zero(g_ocxo2_ticks64, ocxo2_zero_offset);
+  alpha_measured_ns_install_epoch_phase(g_ocxo1_measured_ns,
+                                        cap.vclock_dwt_at_edge,
+                                        CLOCKS_OCXO1_PHASE_NS_AT_PPS_VCLOCK_ZERO);
+  alpha_measured_ns_install_epoch_phase(g_ocxo2_measured_ns,
+                                        cap.vclock_dwt_at_edge,
+                                        CLOCKS_OCXO2_PHASE_NS_AT_PPS_VCLOCK_ZERO);
 
   clock_mark_epoch_zero(g_vclock_clock);
-  clock_mark_epoch_zero(g_ocxo1_clock);
-  clock_mark_epoch_zero(g_ocxo2_clock);
+  clock_mark_epoch_phase(g_ocxo1_clock, CLOCKS_OCXO1_PHASE_NS_AT_PPS_VCLOCK_ZERO);
+  clock_mark_epoch_phase(g_ocxo2_clock, CLOCKS_OCXO2_PHASE_NS_AT_PPS_VCLOCK_ZERO);
 
   (void)clocks_dwt64_epoch_reset_at_dwt32(cap.vclock_dwt_at_edge, nullptr);
   dwt64_anchor_reset_to_dwt32(cap.vclock_dwt_at_edge, g_dwt64_epoch_raw_cycles);
 
   time_pps_vclock_epoch_reset(cap.vclock_dwt_at_edge, cap.vclock_counter32);
   time_clock_epoch_reset(time_clock_id_t::VCLOCK, cap.vclock_dwt_at_edge, 0);
-  time_clock_epoch_reset(time_clock_id_t::OCXO1,  cap.vclock_dwt_at_edge, 0);
-  time_clock_epoch_reset(time_clock_id_t::OCXO2,  cap.vclock_dwt_at_edge, 0);
   g_alpha_epoch_sequence++;
 
   // VCLOCK synthetic coordinate generation changed.  Re-author recurring
@@ -1273,8 +1344,12 @@ bool clocks_alpha_zero_from_interrupt_capture(const char* reason) {
   g_alpha_epoch_last_all_lanes_valid = cap.all_lanes_capture_valid;
   g_alpha_epoch_last_dwt_at_edge = cap.vclock_dwt_at_edge;
   g_alpha_epoch_last_vclock_counter32 = cap.vclock_counter32;
-  g_alpha_epoch_last_ocxo1_counter32 = cap.ocxo1_counter32;
-  g_alpha_epoch_last_ocxo2_counter32 = cap.ocxo2_counter32;
+  g_alpha_epoch_last_ocxo1_counter32 = ocxo1_zero_offset;
+  g_alpha_epoch_last_ocxo2_counter32 = ocxo2_zero_offset;
+  g_alpha_epoch_last_ocxo1_capture_counter32 = cap.ocxo1_counter32;
+  g_alpha_epoch_last_ocxo2_capture_counter32 = cap.ocxo2_counter32;
+  g_alpha_epoch_last_ocxo1_first_target_counter32 = ocxo1_first_target;
+  g_alpha_epoch_last_ocxo2_first_target_counter32 = ocxo2_first_target;
   g_alpha_epoch_last_vclock_zero_valid = true;
   g_alpha_epoch_last_ocxo1_zero_valid = true;
   g_alpha_epoch_last_ocxo2_zero_valid = true;
@@ -1303,6 +1378,24 @@ uint32_t clocks_alpha_epoch_last_ocxo2_counter32(void) { return g_alpha_epoch_la
 bool clocks_alpha_epoch_last_vclock_zero_valid(void) { return g_alpha_epoch_last_vclock_zero_valid; }
 bool clocks_alpha_epoch_last_ocxo1_zero_valid(void) { return g_alpha_epoch_last_ocxo1_zero_valid; }
 bool clocks_alpha_epoch_last_ocxo2_zero_valid(void) { return g_alpha_epoch_last_ocxo2_zero_valid; }
+uint32_t clocks_alpha_epoch_last_ocxo1_capture_counter32(void) { return g_alpha_epoch_last_ocxo1_capture_counter32; }
+uint32_t clocks_alpha_epoch_last_ocxo2_capture_counter32(void) { return g_alpha_epoch_last_ocxo2_capture_counter32; }
+uint32_t clocks_alpha_epoch_last_ocxo1_first_target_counter32(void) { return g_alpha_epoch_last_ocxo1_first_target_counter32; }
+uint32_t clocks_alpha_epoch_last_ocxo2_first_target_counter32(void) { return g_alpha_epoch_last_ocxo2_first_target_counter32; }
+uint32_t clocks_alpha_epoch_last_ocxo1_first_edge_delay_ticks(void) { return CLOCKS_OCXO1_FIRST_EDGE_DELAY_TICKS; }
+uint32_t clocks_alpha_epoch_last_ocxo2_first_edge_delay_ticks(void) { return CLOCKS_OCXO2_FIRST_EDGE_DELAY_TICKS; }
+uint32_t clocks_alpha_epoch_last_ocxo1_phase_ticks_at_pps_vclock_zero(void) {
+  return CLOCKS_OCXO1_PHASE_TICKS_AT_PPS_VCLOCK_ZERO;
+}
+uint32_t clocks_alpha_epoch_last_ocxo2_phase_ticks_at_pps_vclock_zero(void) {
+  return CLOCKS_OCXO2_PHASE_TICKS_AT_PPS_VCLOCK_ZERO;
+}
+uint64_t clocks_alpha_epoch_last_ocxo1_phase_ns_at_pps_vclock_zero(void) {
+  return CLOCKS_OCXO1_PHASE_NS_AT_PPS_VCLOCK_ZERO;
+}
+uint64_t clocks_alpha_epoch_last_ocxo2_phase_ns_at_pps_vclock_zero(void) {
+  return CLOCKS_OCXO2_PHASE_NS_AT_PPS_VCLOCK_ZERO;
+}
 uint16_t clocks_alpha_epoch_last_vclock_hardware16_observed(void) { return g_alpha_epoch_last_vclock_hardware16_observed; }
 uint16_t clocks_alpha_epoch_last_vclock_hardware16_selected(void) { return g_alpha_epoch_last_vclock_hardware16_selected; }
 uint16_t clocks_alpha_epoch_last_ocxo1_hardware16(void) { return g_alpha_epoch_last_ocxo1_hardware16; }

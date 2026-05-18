@@ -516,21 +516,22 @@ struct interrupt_epoch_capture_t {
 
 bool interrupt_last_epoch_capture(interrupt_epoch_capture_t* out);
 
-// Re-author OCXO QuadTimer compare cadence from CLOCKS logical zero.
+// Re-author OCXO QuadTimer witness targets from CLOCKS phase-authored zero.
 //
-// OCXO Gamma is lane-local.  It does not care which OCXO edge is near PPS or
-// VCLOCK.  Once CLOCKS has selected the OCXO zero-offset counter32 values, this
-// call makes the compare rails land on:
+// OCXO lanes are not tandem-zeroed with VCLOCK.  CLOCKS/Alpha chooses crafted
+// OCXO zero-offset ticks such that the OCXO local coordinates are already
+// non-zero at PPS/VCLOCK zero.  It then passes the first physical witness
+// targets to process_interrupt:
 //
-//   epoch + 10,000
-//   epoch + 20,000
-//   ...
-//   epoch + 10,000,000
+//   OCXO1: PPS/VCLOCK zero + 250,500 us
+//   OCXO2: PPS/VCLOCK zero + 750,500 us
 //
-// Every tenth custody event is a Gamma 100 Hz courtroom sample, and every
-// thousandth custody event is the OCXO-local one-second edge.
-void interrupt_ocxo_logical_grid_epoch(uint32_t ocxo1_epoch_counter32,
-                                       uint32_t ocxo2_epoch_counter32);
+// If the requested first target is already behind the current passive OCXO
+// observation, the cadence minder advances the target by exact 10 MHz seconds
+// until the same phase is future-reachable.  After each witnessed OCXO edge,
+// the ISR advances the lane target by exactly 10,000,000 ticks.
+void interrupt_ocxo_phase_grid_epoch(uint32_t ocxo1_first_target_counter32,
+                                     uint32_t ocxo2_first_target_counter32);
 
 
 // ============================================================================

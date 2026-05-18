@@ -2067,6 +2067,38 @@ static void ocxo_lane_disable_compare(ocxo_lane_t& lane) {
   }
 }
 
+static void ocxo_lane_install_phase_target(ocxo_lane_t& lane,
+                                           uint32_t first_target_counter32) {
+  if (!lane.initialized) return;
+
+  ocxo_lane_disable_compare(lane);
+
+  lane.witness_armed = false;
+  lane.witness_target_initialized = true;
+  lane.witness_target_counter32 = first_target_counter32;
+  lane.witness_target_low16 = (uint16_t)(first_target_counter32 & 0xFFFFU);
+  lane.compare_target = lane.witness_target_low16;
+
+  lane.witness_last_event_published = false;
+  lane.witness_last_service_class = OCXO_SERVICE_CLASS_NONE;
+  lane.witness_schedule_last_decision =
+      OCXO_SCHEDULE_DECISION_TARGET_INITIALIZED;
+  lane.witness_schedule_last_target_counter32 = first_target_counter32;
+  lane.witness_schedule_last_target_low16 = lane.witness_target_low16;
+}
+
+void interrupt_ocxo_phase_grid_epoch(uint32_t ocxo1_first_target_counter32,
+                                     uint32_t ocxo2_first_target_counter32) {
+  // The target identities are authored by CLOCKS/Alpha from the selected
+  // PPS/VCLOCK epoch packet.  process_interrupt only owns the hardware
+  // consequence: disable any stale compare and resume the OCXO witness ladders
+  // from these exact synthetic 32-bit phase targets.
+  __disable_irq();
+  ocxo_lane_install_phase_target(g_ocxo1_lane, ocxo1_first_target_counter32);
+  ocxo_lane_install_phase_target(g_ocxo2_lane, ocxo2_first_target_counter32);
+  __enable_irq();
+}
+
 // ISR discipline for OCXO lanes is intentionally flat and tiny:
 //   1. capture first-instruction DWT,
 //   2. clear the compare flag,
