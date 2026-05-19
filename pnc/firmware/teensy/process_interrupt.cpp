@@ -38,6 +38,10 @@
 //   OCXO2  : QTimer3 CH3, PCS=3
 //   TimePop: QTimer1 CH2, varied compare intervals (foreground scheduler)
 //
+// INTERRUPT.OCXO_STOP lane=OCXO1|OCXO2|both releases selected OCXO hardware
+// lanes to an external owner such as process_witness.  INTERRUPT.OCXO_START
+// reclaims and reconfigures those lanes for process_interrupt.
+//
 // The PPS GPIO ISR captures DWT as its first instruction, then reads the
 // QTimer1 CH0 low-word counter.  process_interrupt maps that low-word
 // hardware observation into the private synthetic 32-bit VCLOCK identity.
@@ -191,6 +195,14 @@ static constexpr uint32_t OCXO_SERVICE_CLASS_NONE                   = 0;
 static constexpr uint32_t OCXO_SERVICE_CLASS_FALSE_IRQ              = 1;
 static constexpr uint32_t OCXO_SERVICE_CLASS_EARLY_PRETARGET        = 2;
 static constexpr uint32_t OCXO_SERVICE_CLASS_ON_OR_AFTER_TARGET     = 3;
+
+// OCXO external-ownership masks.  These are used only by the command surface
+// that deliberately removes one or both OCXO hardware lanes from
+// process_interrupt so process_witness can run an isolated hardware test.
+static constexpr uint8_t OCXO_LANE_MASK_OCXO1 = 0x01;
+static constexpr uint8_t OCXO_LANE_MASK_OCXO2 = 0x02;
+static constexpr uint8_t OCXO_LANE_MASK_BOTH  =
+    OCXO_LANE_MASK_OCXO1 | OCXO_LANE_MASK_OCXO2;
 
 // ============================================================================
 // Step 0 migration baseline — report-only safety rails
@@ -1034,6 +1046,22 @@ struct ocxo_lane_t {
   uint32_t bootstrap_count = 0;
   uint32_t cadence_hits_total = 0;
 
+  // External ownership gate.  When true, process_interrupt has surgically
+  // released this OCXO lane to an external owner such as process_witness.
+  // The cadence minder does not read the lane, PPS epoch capture does not
+  // sample it, process_interrupt does not arm compares, and the QTimer vector
+  // for this lane is disabled until OCXO_START reclaims it.
+  bool     released_to_witness = false;
+  bool     release_was_lane_active = false;
+  bool     release_was_runtime_active = false;
+  uint32_t release_count = 0;
+  uint32_t reclaim_count = 0;
+  uint32_t release_minder_skip_count = 0;
+  uint32_t release_start_block_count = 0;
+  uint32_t release_clock_snapshot_block_count = 0;
+  uint32_t last_release_dwt = 0;
+  uint32_t last_reclaim_dwt = 0;
+
   // Once-per-second OCXO witness compare.  This is deliberately not cadence
   // custody.  CADENCE_MINDER tends rollover and arms the next known second
   // target; the OCXO ISR only witnesses that target and captures DWT.
@@ -1116,6 +1144,7 @@ static ocxo_lane_t* ocxo_lane_for(interrupt_subscriber_kind_t kind);
 static inline uint16_t ocxo_lane_counter_now(const ocxo_lane_t& lane);
 static void ocxo_lane_program_compare(ocxo_lane_t& lane, uint16_t target_low16);
 static void ocxo_lane_disable_compare(ocxo_lane_t& lane);
+static void ocxo_lane_configure_counter_hardware(ocxo_lane_t& lane);
 
 // ============================================================================
 // QTimer1 CH0 low-word counter
@@ -1313,9 +1342,12 @@ bool interrupt_clock32_zero_from_ns(interrupt_subscriber_kind_t kind, uint64_t n
 
   synthetic_clock32_t* c = synthetic_clock_for_kind(kind);
   if (!c) return false;
-  synthetic_clock_zero(*c, ns);
 
   ocxo_lane_t* lane = ocxo_lane_for(kind);
+  if (lane && lane->released_to_witness) return false;
+
+  synthetic_clock_zero(*c, ns);
+
   if (lane) {
     lane->logical_count32_at_last_second = c->current_counter32;
     lane->tick_mod_1000 = 0;
@@ -1336,6 +1368,10 @@ bool interrupt_clock32_request_zero_from_ns(interrupt_subscriber_kind_t kind, ui
 
   synthetic_clock32_t* c = synthetic_clock_for_kind(kind);
   if (!c) return false;
+
+  ocxo_lane_t* lane = ocxo_lane_for(kind);
+  if (lane && lane->released_to_witness) return false;
+
   c->pending_zero = true;
   c->pending_zero_ns = ns;
   c->pending_zero_counter32 = counter32;
@@ -1359,8 +1395,14 @@ static inline uint32_t synthetic_clock_advance_at_hardware(synthetic_clock32_t& 
 }
 
 uint32_t interrupt_qtimer1_counter32_now(void)   { return vclock_synthetic_from_hardware_low16(qtimer1_ch0_counter_now()); }
-uint16_t interrupt_qtimer2_ch0_counter_now(void) { return IMXRT_TMR2.CH[0].CNTR; }
-uint16_t interrupt_qtimer3_ch3_counter_now(void) { return IMXRT_TMR3.CH[3].CNTR; }
+uint16_t interrupt_qtimer2_ch0_counter_now(void) {
+  if (g_ocxo1_lane.released_to_witness) return 0;
+  return IMXRT_TMR2.CH[0].CNTR;
+}
+uint16_t interrupt_qtimer3_ch3_counter_now(void) {
+  if (g_ocxo2_lane.released_to_witness) return 0;
+  return IMXRT_TMR3.CH[3].CNTR;
+}
 
 // Forward declarations for compare helpers defined below.
 static void qtimer2_ch0_program_compare(uint16_t target_low16);
@@ -1459,6 +1501,10 @@ bool interrupt_clock_snapshot(interrupt_subscriber_kind_t kind, interrupt_clock_
   }
 
   if (kind == interrupt_subscriber_kind_t::OCXO1) {
+    if (g_ocxo1_lane.released_to_witness) {
+      g_ocxo1_lane.release_clock_snapshot_block_count++;
+      return false;
+    }
     const uint16_t hw = IMXRT_TMR2.CH[0].CNTR;
     out->hardware16 = hw;
     out->counter32 = project_counter32_from_hw16(g_ocxo1_clock32, hw);
@@ -1467,6 +1513,10 @@ bool interrupt_clock_snapshot(interrupt_subscriber_kind_t kind, interrupt_clock_
   }
 
   if (kind == interrupt_subscriber_kind_t::OCXO2) {
+    if (g_ocxo2_lane.released_to_witness) {
+      g_ocxo2_lane.release_clock_snapshot_block_count++;
+      return false;
+    }
     const uint16_t hw = IMXRT_TMR3.CH[3].CNTR;
     out->hardware16 = hw;
     out->counter32 = project_counter32_from_hw16(g_ocxo2_clock32, hw);
@@ -1550,6 +1600,46 @@ static inline void qtimer3_disable_compare(uint8_t ch) {
   IMXRT_TMR3.CH[ch].CSCTRL &= ~TMR_CSCTRL_TCF1EN;
   qtimer3_clear_compare_flag(ch);
   qtimer3_clear_compare_flag(ch);
+}
+
+static void ocxo_lane_configure_counter_hardware(ocxo_lane_t& lane) {
+  if (lane.module == &IMXRT_TMR2 && lane.channel == 0) {
+    CCM_CCGR6 |= CCM_CCGR6_QTIMER2(CCM_CCGR_ON);
+    *(portConfigRegister(lane.input_pin)) = 1;
+    IOMUXC_QTIMER2_TIMER0_SELECT_INPUT = 1;
+
+    IMXRT_TMR2.ENBL &= (uint16_t)~0x0001U;
+    IMXRT_TMR2.CH[0].CTRL = 0;
+    IMXRT_TMR2.CH[0].SCTRL = 0;
+    IMXRT_TMR2.CH[0].CSCTRL = 0;
+    IMXRT_TMR2.CH[0].LOAD = 0;
+    IMXRT_TMR2.CH[0].CNTR = 0;
+    IMXRT_TMR2.CH[0].COMP1 = 0xFFFF;
+    IMXRT_TMR2.CH[0].CMPLD1 = 0xFFFF;
+    IMXRT_TMR2.CH[0].CMPLD2 = 0;
+    IMXRT_TMR2.CH[0].CTRL = TMR_CTRL_CM(1) | TMR_CTRL_PCS(lane.pcs);
+    qtimer2_ch0_disable_compare();
+    IMXRT_TMR2.ENBL |= 0x0001;
+    return;
+  }
+
+  if (lane.module == &IMXRT_TMR3 && lane.channel == 3) {
+    CCM_CCGR6 |= CCM_CCGR6_QTIMER3(CCM_CCGR_ON);
+    *(portConfigRegister(lane.input_pin)) = 1;
+    IOMUXC_QTIMER3_TIMER3_SELECT_INPUT = 1;
+
+    IMXRT_TMR3.ENBL &= (uint16_t)~(1U << 3);
+    IMXRT_TMR3.CH[3].CTRL = 0;
+    IMXRT_TMR3.CH[3].SCTRL = 0;
+    IMXRT_TMR3.CH[3].CSCTRL = 0;
+    IMXRT_TMR3.CH[3].LOAD = 0;
+    IMXRT_TMR3.CH[3].CNTR = 0;
+    IMXRT_TMR3.CH[3].COMP1 = 0xFFFF;
+    IMXRT_TMR3.CH[3].CMPLD1 = 0xFFFF;
+    IMXRT_TMR3.CH[3].CTRL = TMR_CTRL_CM(1) | TMR_CTRL_PCS(lane.pcs);
+    qtimer3_disable_compare(3);
+    IMXRT_TMR3.ENBL |= (uint16_t)(1U << 3);
+  }
 }
 
 // ============================================================================
@@ -1876,6 +1966,11 @@ static void cadence_minder_emit_ocxo_if_due(interrupt_subscriber_kind_t kind,
 
   if (!lane.initialized) return;
 
+  if (lane.released_to_witness) {
+    lane.release_minder_skip_count++;
+    return;
+  }
+
   const uint16_t hw16 = ocxo_lane_counter_now(lane);
   synthetic_clock_tend_from_hw16(clock32, hw16);
 
@@ -2069,7 +2164,7 @@ static void ocxo_lane_disable_compare(ocxo_lane_t& lane) {
 
 static void ocxo_lane_install_phase_target(ocxo_lane_t& lane,
                                            uint32_t first_target_counter32) {
-  if (!lane.initialized) return;
+  if (!lane.initialized || lane.released_to_witness) return;
 
   ocxo_lane_disable_compare(lane);
 
@@ -2433,6 +2528,8 @@ static void ocxo_witness_compare_isr(ocxo_lane_t& lane,
                                      interrupt_subscriber_runtime_t* rt,
                                      interrupt_subscriber_kind_t kind,
                                      uint32_t isr_entry_dwt_raw) {
+  if (lane.released_to_witness) return;
+
   const uint32_t isr_csctrl_entry = lane.module->CH[lane.channel].CSCTRL;
   if ((isr_csctrl_entry & TMR_CSCTRL_TCF1) == 0) return;
 
@@ -2873,10 +2970,16 @@ void process_interrupt_gpio6789_irq(uint32_t isr_entry_dwt_raw) {
   // allowed to become a boot-time dependency unless QTimer3 lane hardware is
   // known initialized.  This keeps PPS witness/selector work alive even if an
   // OCXO lane is not ready yet.
-  const bool ocxo_capture_hw_ready =
-      g_interrupt_hw_ready && g_ocxo1_lane.initialized && g_ocxo2_lane.initialized;
-  const uint16_t ocxo1_hardware16 = ocxo_capture_hw_ready ? IMXRT_TMR2.CH[0].CNTR : 0;
-  const uint16_t ocxo2_hardware16 = ocxo_capture_hw_ready ? IMXRT_TMR3.CH[3].CNTR : 0;
+  const bool ocxo1_capture_hw_ready =
+      g_interrupt_hw_ready && g_ocxo1_lane.initialized &&
+      !g_ocxo1_lane.released_to_witness;
+  const bool ocxo2_capture_hw_ready =
+      g_interrupt_hw_ready && g_ocxo2_lane.initialized &&
+      !g_ocxo2_lane.released_to_witness;
+  const uint16_t ocxo1_hardware16 =
+      ocxo1_capture_hw_ready ? IMXRT_TMR2.CH[0].CNTR : 0;
+  const uint16_t ocxo2_hardware16 =
+      ocxo2_capture_hw_ready ? IMXRT_TMR3.CH[3].CNTR : 0;
   const uint32_t epoch_capture_end_raw = ARM_DWT_CYCCNT;
 
   const uint16_t ch3_now = hardware_low16;
@@ -2896,10 +2999,10 @@ void process_interrupt_gpio6789_irq(uint32_t isr_entry_dwt_raw) {
   const uint32_t selected_counter32 =
       observed_counter32 - VCLOCK_EPOCH_OBSERVED_TICKS_AFTER_SELECTED;
 
-  const uint32_t ocxo1_counter32 = ocxo_capture_hw_ready
+  const uint32_t ocxo1_counter32 = ocxo1_capture_hw_ready
       ? project_counter32_from_hw16(g_ocxo1_clock32, ocxo1_hardware16)
       : 0;
-  const uint32_t ocxo2_counter32 = ocxo_capture_hw_ready
+  const uint32_t ocxo2_counter32 = ocxo2_capture_hw_ready
       ? project_counter32_from_hw16(g_ocxo2_clock32, ocxo2_hardware16)
       : 0;
 
@@ -2920,7 +3023,7 @@ void process_interrupt_gpio6789_irq(uint32_t isr_entry_dwt_raw) {
   epoch_cap.vclock_capture_valid =
       epoch_cap.vclock_read_offset_cycles <= EPOCH_CAPTURE_MAX_WINDOW_CYCLES;
   epoch_cap.all_lanes_capture_valid =
-      ocxo_capture_hw_ready &&
+      ocxo1_capture_hw_ready && ocxo2_capture_hw_ready &&
       epoch_cap.capture_window_cycles <= EPOCH_CAPTURE_MAX_WINDOW_CYCLES;
   // A packet is operationally selectable only after interrupt runtime has
   // finished initialization.  This prevents a boot-time partial capture from
@@ -3084,6 +3187,11 @@ bool interrupt_start(interrupt_subscriber_kind_t kind) {
 
   ocxo_lane_t* lane = ocxo_lane_for(kind);
   if (!lane || !lane->initialized) return false;
+  if (lane->released_to_witness) {
+    lane->release_start_block_count++;
+    rt->active = false;
+    return false;
+  }
   lane->active = true;
   lane->phase_bootstrapped = true;
   lane->tick_mod_1000 = 0;
@@ -3117,7 +3225,9 @@ bool interrupt_stop(interrupt_subscriber_kind_t kind) {
   if (!lane) return false;
   lane->active = false;
   lane->witness_armed = false;
-  ocxo_lane_disable_compare(*lane);
+  if (!lane->released_to_witness) {
+    ocxo_lane_disable_compare(*lane);
+  }
   return true;
 }
 
@@ -3219,21 +3329,8 @@ void process_interrupt_init_hardware(void) {
   IOMUXC_QTIMER2_TIMER0_SELECT_INPUT = 1;
   IOMUXC_QTIMER3_TIMER3_SELECT_INPUT = 1;
 
-  IMXRT_TMR2.CH[0].CTRL = 0; IMXRT_TMR2.CH[0].SCTRL = 0;
-  IMXRT_TMR2.CH[0].CSCTRL = 0; IMXRT_TMR2.CH[0].LOAD = 0;
-  IMXRT_TMR2.CH[0].CNTR = 0; IMXRT_TMR2.CH[0].COMP1 = 0xFFFF;
-  IMXRT_TMR2.CH[0].CMPLD1 = 0xFFFF; IMXRT_TMR2.CH[0].CMPLD2 = 0;
-  IMXRT_TMR2.CH[0].CTRL = TMR_CTRL_CM(1) | TMR_CTRL_PCS(g_ocxo1_lane.pcs);
-  qtimer2_ch0_disable_compare();
-  IMXRT_TMR2.ENBL |= 0x0001;
-
-  IMXRT_TMR3.CH[3].CTRL = 0; IMXRT_TMR3.CH[3].SCTRL = 0;
-  IMXRT_TMR3.CH[3].CSCTRL = 0; IMXRT_TMR3.CH[3].LOAD = 0;
-  IMXRT_TMR3.CH[3].CNTR = 0; IMXRT_TMR3.CH[3].COMP1 = 0xFFFF;
-  IMXRT_TMR3.CH[3].CMPLD1 = 0xFFFF;
-  IMXRT_TMR3.CH[3].CTRL = TMR_CTRL_CM(1) | TMR_CTRL_PCS(g_ocxo2_lane.pcs);
-  qtimer3_disable_compare(3);
-  IMXRT_TMR3.ENBL |= (uint16_t)(1U << 3);
+  ocxo_lane_configure_counter_hardware(g_ocxo1_lane);
+  ocxo_lane_configure_counter_hardware(g_ocxo2_lane);
 
   g_ocxo1_lane.initialized = true;
   g_ocxo2_lane.initialized = true;
@@ -3251,7 +3348,8 @@ void process_interrupt_init_hardware(void) {
   IMXRT_TMR1.CH[2].CNTR = 0;
   // Only CH0 (passive VCLOCK counter) and CH2 (TimePop scheduler compare)
   // are enabled.  VCLOCK cadence is now a TimePop client; CH3 remains off.
-  IMXRT_TMR1.ENBL = 0x05;
+  // MULE UPDATE per ChatGPT: 0x07 not 0x05 to enable CH0,CH1, CH2 for witness.
+  IMXRT_TMR1.ENBL = 0x07;
 
   g_interrupt_hw_ready = true;
 }
@@ -3380,31 +3478,31 @@ void process_interrupt_enable_irqs(void) {
   if (g_interrupt_irqs_enabled) return;
 
   attachInterruptVector(IRQ_QTIMER1, qtimer1_isr);
-  // VCLOCK/TimePop QTimer1 is the sovereign timing rail.  Keep the entire
-  // shared QTimer1 vector at highest priority; same-vector logical ordering
-  // is handled inside TimePop/process_interrupt.
+
   NVIC_SET_PRIORITY(IRQ_QTIMER1, 0);
   g_step0_qtimer1_priority_applied = 0;
   NVIC_ENABLE_IRQ(IRQ_QTIMER1);
   g_step0_qtimer1_irq_enabled_by_interrupt = true;
 
-  attachInterruptVector(IRQ_QTIMER2, qtimer2_isr);
-  NVIC_SET_PRIORITY(IRQ_QTIMER2, 16);
-  g_step0_qtimer2_priority_applied = 16;
-  NVIC_ENABLE_IRQ(IRQ_QTIMER2);
-  g_step0_qtimer2_irq_enabled_by_interrupt = true;
+  if (!g_ocxo1_lane.released_to_witness) {
+    attachInterruptVector(IRQ_QTIMER2, qtimer2_isr);
+    NVIC_SET_PRIORITY(IRQ_QTIMER2, 16);
+    g_step0_qtimer2_priority_applied = 16;
+    NVIC_ENABLE_IRQ(IRQ_QTIMER2);
+    g_step0_qtimer2_irq_enabled_by_interrupt = true;
+  }
 
-  attachInterruptVector(IRQ_QTIMER3, qtimer3_isr);
-  NVIC_SET_PRIORITY(IRQ_QTIMER3, 16);
-  g_step0_qtimer3_priority_applied = 16;
-  NVIC_ENABLE_IRQ(IRQ_QTIMER3);
-  g_step0_qtimer3_irq_enabled_by_interrupt = true;
+  if (!g_ocxo2_lane.released_to_witness) {
+    attachInterruptVector(IRQ_QTIMER3, qtimer3_isr);
+    NVIC_SET_PRIORITY(IRQ_QTIMER3, 16);
+    g_step0_qtimer3_priority_applied = 16;
+    NVIC_ENABLE_IRQ(IRQ_QTIMER3);
+    g_step0_qtimer3_irq_enabled_by_interrupt = true;
+  }
 
   pinMode(GNSS_PPS_PIN, INPUT);
   attachInterrupt(digitalPinToInterrupt(GNSS_PPS_PIN), pps_gpio_isr, RISING);
-  // PPS GPIO is now a witness/selector, not the highest-priority timing
-  // interpolation rail.  Keep it below QTimer1 so VCLOCK/TimePop event facts
-  // are not delayed by PPS witness work.
+
   NVIC_SET_PRIORITY(IRQ_GPIO6789, 0);
   g_step0_gpio6789_priority_applied = 0;
   g_step0_gpio6789_configured_by_interrupt = true;
@@ -3435,6 +3533,275 @@ static void add_bridge_stats_payload(Payload& p,
   add_u32("anchor_last_sequence_used", s.last_anchor_sequence_used);
   add_u64("anchor_last_ns_delta", s.last_anchor_ns_delta);
   add_u32("anchor_last_failure_mask", s.last_anchor_failure_mask);
+}
+
+// ============================================================================
+// External OCXO ownership control
+// ============================================================================
+//
+// These command helpers deliberately remove one or both OCXO hardware lanes
+// from process_interrupt so process_witness can configure the same QTimer
+// channels for an isolated edge-to-edge DWT experiment.  VCLOCK and the
+// TimePop CH2 scheduler remain untouched.
+
+static const char* ocxo_external_owner_name(const ocxo_lane_t& lane) {
+  return lane.released_to_witness ? "process_witness" : "process_interrupt";
+}
+
+static bool parse_ocxo_lane_mask(const Payload& args,
+                                 uint8_t& mask,
+                                 Payload& p) {
+  const char* lane = args.getString("lane");
+  if (!lane || !*lane) lane = args.getString("name");
+  if (!lane || !*lane) lane = args.getString("which");
+
+  if (!lane || !*lane) {
+    mask = OCXO_LANE_MASK_BOTH;
+    return true;
+  }
+
+  if (!strcasecmp(lane, "both") || !strcasecmp(lane, "all") ||
+      !strcasecmp(lane, "12") || !strcasecmp(lane, "1,2") ||
+      !strcasecmp(lane, "OCXO1,OCXO2") || !strcasecmp(lane, "OCXO2,OCXO1")) {
+    mask = OCXO_LANE_MASK_BOTH;
+    return true;
+  }
+
+  if (!strcasecmp(lane, "1") || !strcasecmp(lane, "O1") ||
+      !strcasecmp(lane, "OCXO1")) {
+    mask = OCXO_LANE_MASK_OCXO1;
+    return true;
+  }
+
+  if (!strcasecmp(lane, "2") || !strcasecmp(lane, "O2") ||
+      !strcasecmp(lane, "OCXO2")) {
+    mask = OCXO_LANE_MASK_OCXO2;
+    return true;
+  }
+
+  p.add("error", "unknown lane");
+  p.add("lane", lane);
+  p.add("usage", "INTERRUPT.OCXO_STOP lane=OCXO1|OCXO2|both; INTERRUPT.OCXO_START lane=OCXO1|OCXO2|both");
+  mask = 0;
+  return false;
+}
+
+static void ocxo_lane_attach_process_interrupt_vector(ocxo_lane_t& lane) {
+  if (lane.module == &IMXRT_TMR2) {
+    attachInterruptVector(IRQ_QTIMER2, qtimer2_isr);
+    NVIC_SET_PRIORITY(IRQ_QTIMER2, 16);
+    NVIC_ENABLE_IRQ(IRQ_QTIMER2);
+    g_step0_qtimer2_priority_applied = 16;
+    g_step0_qtimer2_irq_enabled_by_interrupt = true;
+  } else if (lane.module == &IMXRT_TMR3) {
+    attachInterruptVector(IRQ_QTIMER3, qtimer3_isr);
+    NVIC_SET_PRIORITY(IRQ_QTIMER3, 16);
+    NVIC_ENABLE_IRQ(IRQ_QTIMER3);
+    g_step0_qtimer3_priority_applied = 16;
+    g_step0_qtimer3_irq_enabled_by_interrupt = true;
+  }
+}
+
+static void ocxo_lane_disable_process_interrupt_irq(ocxo_lane_t& lane) {
+  if (lane.module == &IMXRT_TMR2) {
+    NVIC_DISABLE_IRQ(IRQ_QTIMER2);
+    g_step0_qtimer2_irq_enabled_by_interrupt = false;
+  } else if (lane.module == &IMXRT_TMR3) {
+    NVIC_DISABLE_IRQ(IRQ_QTIMER3);
+    g_step0_qtimer3_irq_enabled_by_interrupt = false;
+  }
+}
+
+static void ocxo_lane_release_to_witness(interrupt_subscriber_kind_t kind,
+                                         ocxo_lane_t& lane,
+                                         interrupt_subscriber_runtime_t* rt) {
+  __disable_irq();
+
+  if (!lane.released_to_witness) {
+    lane.release_was_lane_active = lane.active;
+    lane.release_was_runtime_active = rt ? rt->active : false;
+    lane.release_count++;
+  }
+
+  lane.last_release_dwt = ARM_DWT_CYCCNT;
+  lane.released_to_witness = true;
+  lane.active = false;
+  lane.phase_bootstrapped = false;
+  lane.witness_armed = false;
+  lane.witness_target_initialized = false;
+  lane.witness_target_counter32 = 0;
+  lane.witness_target_low16 = 0;
+  lane.compare_target = 0;
+
+  if (rt) {
+    rt->active = false;
+  }
+
+  if (kind == interrupt_subscriber_kind_t::OCXO1) {
+    g_ocxo1_deferred.edge_pending = false;
+    g_ocxo1_post_isr.pending = false;
+  } else if (kind == interrupt_subscriber_kind_t::OCXO2) {
+    g_ocxo2_deferred.edge_pending = false;
+    g_ocxo2_post_isr.pending = false;
+  }
+
+  ocxo_lane_disable_compare(lane);
+  ocxo_lane_disable_process_interrupt_irq(lane);
+
+  __enable_irq();
+}
+
+static void ocxo_lane_reclaim_from_witness(interrupt_subscriber_kind_t kind,
+                                           ocxo_lane_t& lane,
+                                           synthetic_clock32_t& clock32,
+                                           interrupt_subscriber_runtime_t* rt) {
+  (void)kind;
+
+  __disable_irq();
+
+  if (!lane.released_to_witness) {
+    __enable_irq();
+    return;
+  }
+
+  ocxo_lane_configure_counter_hardware(lane);
+  ocxo_lane_attach_process_interrupt_vector(lane);
+
+  const uint16_t hw16 = ocxo_lane_counter_now(lane);
+  synthetic_clock_bootstrap_from_hw16(clock32, hw16);
+
+  lane.initialized = true;
+  lane.released_to_witness = false;
+  lane.reclaim_count++;
+  lane.last_reclaim_dwt = ARM_DWT_CYCCNT;
+  lane.active = lane.release_was_lane_active;
+  lane.phase_bootstrapped = lane.active;
+  lane.tick_mod_1000 = 0;
+  lane.logical_count32_at_last_second = clock32.current_counter32;
+  lane.witness_armed = false;
+  lane.witness_target_initialized = false;
+  lane.witness_target_counter32 = 0;
+  lane.witness_target_low16 = 0;
+  lane.compare_target = 0;
+  lane.witness_last_event_published = false;
+  lane.witness_last_service_class = OCXO_SERVICE_CLASS_NONE;
+
+  if (rt) {
+    rt->active = lane.release_was_runtime_active;
+  }
+
+  __enable_irq();
+}
+
+bool interrupt_ocxo_owned_by_interrupt(interrupt_subscriber_kind_t kind) {
+  const ocxo_lane_t* lane = ocxo_lane_for(kind);
+  return lane && !lane->released_to_witness;
+}
+
+bool interrupt_ocxo_release(interrupt_subscriber_kind_t kind) {
+  ocxo_lane_t* lane = ocxo_lane_for(kind);
+  if (!lane || !lane->initialized) return false;
+
+  interrupt_subscriber_runtime_t* rt = runtime_for(kind);
+  ocxo_lane_release_to_witness(kind, *lane, rt);
+  return true;
+}
+
+bool interrupt_ocxo_reclaim(interrupt_subscriber_kind_t kind) {
+  ocxo_lane_t* lane = ocxo_lane_for(kind);
+  if (!lane) return false;
+
+  interrupt_subscriber_runtime_t* rt = runtime_for(kind);
+  if (kind == interrupt_subscriber_kind_t::OCXO1) {
+    ocxo_lane_reclaim_from_witness(kind, *lane, g_ocxo1_clock32, rt);
+    return true;
+  }
+  if (kind == interrupt_subscriber_kind_t::OCXO2) {
+    ocxo_lane_reclaim_from_witness(kind, *lane, g_ocxo2_clock32, rt);
+    return true;
+  }
+  return false;
+}
+
+static void add_ocxo_control_lane_payload(Payload& p,
+                                          const char* name,
+                                          const ocxo_lane_t& lane,
+                                          const interrupt_subscriber_runtime_t* rt) {
+  p.add("lane", name);
+  p.add("owner", ocxo_external_owner_name(lane));
+  p.add("released_to_witness", lane.released_to_witness);
+  p.add("initialized", lane.initialized);
+  p.add("lane_active", lane.active);
+  p.add("runtime_active", rt ? rt->active : false);
+  p.add("release_count", lane.release_count);
+  p.add("reclaim_count", lane.reclaim_count);
+  p.add("release_was_lane_active", lane.release_was_lane_active);
+  p.add("release_was_runtime_active", lane.release_was_runtime_active);
+  p.add("last_release_dwt", lane.last_release_dwt);
+  p.add("last_reclaim_dwt", lane.last_reclaim_dwt);
+  p.add("compare_armed", lane.witness_armed);
+  p.add("target_initialized", lane.witness_target_initialized);
+  p.add("counter_custody", lane.released_to_witness ? "external" : "process_interrupt");
+  p.add("epoch_capture_samples_lane", !lane.released_to_witness);
+}
+
+static Payload cmd_ocxo_stop(const Payload& args) {
+  Payload p;
+  p.add("command", "OCXO_STOP");
+  p.add("meaning", "release selected OCXO QTimer lane(s) from process_interrupt to external ownership");
+  p.add("vclock_untouched", true);
+  p.add("cadence_minder_kept_running", true);
+
+  uint8_t mask = 0;
+  if (!parse_ocxo_lane_mask(args, mask, p)) return p;
+  p.add("lane_mask", (uint32_t)mask);
+
+  if (mask & OCXO_LANE_MASK_OCXO1) {
+    (void)interrupt_ocxo_release(interrupt_subscriber_kind_t::OCXO1);
+  }
+  if (mask & OCXO_LANE_MASK_OCXO2) {
+    (void)interrupt_ocxo_release(interrupt_subscriber_kind_t::OCXO2);
+  }
+
+  Payload ocxo1;
+  add_ocxo_control_lane_payload(ocxo1, "OCXO1", g_ocxo1_lane, g_rt_ocxo1);
+  p.add_object("ocxo1", ocxo1);
+
+  Payload ocxo2;
+  add_ocxo_control_lane_payload(ocxo2, "OCXO2", g_ocxo2_lane, g_rt_ocxo2);
+  p.add_object("ocxo2", ocxo2);
+
+  return p;
+}
+
+static Payload cmd_ocxo_start(const Payload& args) {
+  Payload p;
+  p.add("command", "OCXO_START");
+  p.add("meaning", "reclaim selected OCXO QTimer lane(s) for process_interrupt");
+  p.add("vclock_untouched", true);
+  p.add("cadence_minder_kept_running", true);
+  p.add("fresh_clock_zero_recommended", true);
+
+  uint8_t mask = 0;
+  if (!parse_ocxo_lane_mask(args, mask, p)) return p;
+  p.add("lane_mask", (uint32_t)mask);
+
+  if (mask & OCXO_LANE_MASK_OCXO1) {
+    (void)interrupt_ocxo_reclaim(interrupt_subscriber_kind_t::OCXO1);
+  }
+  if (mask & OCXO_LANE_MASK_OCXO2) {
+    (void)interrupt_ocxo_reclaim(interrupt_subscriber_kind_t::OCXO2);
+  }
+
+  Payload ocxo1;
+  add_ocxo_control_lane_payload(ocxo1, "OCXO1", g_ocxo1_lane, g_rt_ocxo1);
+  p.add_object("ocxo1", ocxo1);
+
+  Payload ocxo2;
+  add_ocxo_control_lane_payload(ocxo2, "OCXO2", g_ocxo2_lane, g_rt_ocxo2);
+  p.add_object("ocxo2", ocxo2);
+
+  return p;
 }
 
 // ============================================================================
@@ -3485,6 +3852,8 @@ static void add_runtime_payload(Payload& p) {
   p.add("ocxo_compare_live_requires_enabled_and_flag", true);
   p.add("lane_report_command", "INTERRUPT.REPORT_LANES");
   p.add("single_lane_report_command", "INTERRUPT.REPORT_LANE lane=VCLOCK|OCXO1|OCXO2");
+  p.add("ocxo_release_command", "INTERRUPT.OCXO_STOP lane=OCXO1|OCXO2|both");
+  p.add("ocxo_reclaim_command", "INTERRUPT.OCXO_START lane=OCXO1|OCXO2|both");
 }
 
 static void add_cadence_minder_payload(Payload& p) {
@@ -3773,6 +4142,13 @@ static void add_ocxo_lane_payload(Payload& p,
 
   add_bool("initialized", lane.initialized);
   add_bool("active", lane.active);
+  add_bool("released_to_witness", lane.released_to_witness);
+  add_str("owner", ocxo_external_owner_name(lane));
+  add_u32("release_count", lane.release_count);
+  add_u32("reclaim_count", lane.reclaim_count);
+  add_u32("release_minder_skip_count", lane.release_minder_skip_count);
+  add_u32("release_start_block_count", lane.release_start_block_count);
+  add_u32("release_clock_snapshot_block_count", lane.release_clock_snapshot_block_count);
   add_u32("irq_count", lane.irq_count);
   add_u32("miss_count", lane.miss_count);
   add_u32("bootstrap_count", lane.bootstrap_count);
@@ -3896,6 +4272,14 @@ static void add_ocxo_lane_payload(Payload& p,
   add_ocxo_clock32_payload(p, prefix, clock32);
 
   const bool is_ocxo1 = (lane.module == &IMXRT_TMR2 && lane.channel == 0);
+  if (lane.released_to_witness) {
+    add_bool("qtimer_owned_by_process_interrupt", false);
+    add_u32("qtimer_count", is_ocxo1 ? g_qtimer2_ch0_count : g_qtimer3_ch3_count);
+    add_bool("deferred_edge_pending", is_ocxo1 ? g_ocxo1_deferred.edge_pending : g_ocxo2_deferred.edge_pending);
+    return;
+  }
+
+  add_bool("qtimer_owned_by_process_interrupt", true);
   const uint16_t csctrl = is_ocxo1 ? IMXRT_TMR2.CH[0].CSCTRL : IMXRT_TMR3.CH[3].CSCTRL;
   const bool compare_enabled = (csctrl & TMR_CSCTRL_TCF1EN) != 0;
   const bool compare_flag = (csctrl & TMR_CSCTRL_TCF1) != 0;
@@ -3974,6 +4358,10 @@ static Payload cmd_report(const Payload&) {
   p.add("ocxo2_dispatch_count", g_rt_ocxo2 ? g_rt_ocxo2->dispatch_count : 0U);
   p.add("ocxo2_irq_count", g_ocxo2_lane.irq_count);
   p.add("ocxo2_miss_count", g_ocxo2_lane.miss_count);
+  p.add("ocxo1_released_to_witness", g_ocxo1_lane.released_to_witness);
+  p.add("ocxo2_released_to_witness", g_ocxo2_lane.released_to_witness);
+  p.add("ocxo1_owner", ocxo_external_owner_name(g_ocxo1_lane));
+  p.add("ocxo2_owner", ocxo_external_owner_name(g_ocxo2_lane));
 
   p.add("ocxo_witness_arch_enabled", true);
   p.add("ocxo_witness_edge_publish_deferred", true);
@@ -4053,6 +4441,10 @@ static const process_command_entry_t INTERRUPT_COMMANDS[] = {
   { "REPORT",       cmd_report       },
   { "REPORT_LANES", cmd_report_lanes },
   { "REPORT_LANE",  cmd_report_lane  },
+  { "OCXO_STOP",    cmd_ocxo_stop    },
+  { "OCXO_START",   cmd_ocxo_start   },
+  { "OCXO_RELEASE", cmd_ocxo_stop    },
+  { "OCXO_CLAIM",   cmd_ocxo_start   },
   { nullptr,        nullptr          }
 };
 

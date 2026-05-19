@@ -8,19 +8,34 @@
 //   • Stimulus source pin  — TimePop callback drives HIGH/LOW.
 //   • GPIO sink            — GPIO interrupt sees the source rising edge.
 //
-// QTimer2 is no longer used by witness.  OCXO1 now owns QTimer2 CH0 through
-// process_interrupt, so witness preserves only the GPIO round-trip path and
-// TimePop-based bridge/phase reports.
+// Operationally, QTimer2/QTimer3 remain owned by process_interrupt.  This
+// file normally preserves only the GPIO round-trip path and TimePop-based
+// bridge/phase reports.
 //
-// The PPS/VCLOCK bridge and phase witness no longer use QTimer1 CH1 or any
-// process_interrupt-hosted compare plumbing.  They are ordinary TimePop
-// scheduled clients.  TimePop authors one shared fire fact for each scheduled
-// event: fire_vclock_raw, fire_dwt_cyccnt, and fire_gnss_ns.  Witness consumes
-// those facts exactly like any other TimePop client.
+// Special CLOCK_WITNESS modes are intentionally different:
 //
-// Witness is always-on after initialization.  There are no START/STOP commands;
-// the process is safe to run continuously because the operational bridge and
-// phase reports are TimePop clients on the canonical PPS/VCLOCK timing rail.
+//   • OCXO_START/OCXO_STOP let witness temporarily take over the same OCXO
+//     hardware lanes used by process_interrupt after process_interrupt has
+//     been explicitly defeated.
+//
+//   • VCLOCK_START/VCLOCK_STOP use process_interrupt's hosted QTimer1 CH1
+//     compare service to ring a side bell every 10,000,000 VCLOCK ticks
+//     without taking over the sovereign QTimer1 CH2/TimePop rail.
+//
+// The shared experiment is minimal edge-to-edge timing: capture DWT at each
+// 10,000,000-count clock boundary and publish historical one-second interval
+// facts from scheduled context on the CLOCK_WITNESS topic.
+//
+// The PPS/VCLOCK bridge and phase reports remain ordinary TimePop scheduled
+// clients.  TimePop authors one shared fire fact for each scheduled event:
+// fire_vclock_raw, fire_dwt_cyccnt, and fire_gnss_ns.  Witness consumes those
+// facts exactly like any other TimePop client.
+//
+// Witness is always-on after initialization.  There are no global START/STOP
+// commands; the process is safe to run continuously because the operational
+// bridge and phase reports are TimePop clients on the canonical PPS/VCLOCK
+// timing rail.  OCXO_START/OCXO_STOP and VCLOCK_START/VCLOCK_STOP are narrow
+// test-mode commands only.
 //
 // Current command surface:
 //   REPORT        — lifecycle/hardware/TimePop state.
@@ -32,6 +47,10 @@
 //   ENTRY_LATENCY — spin-shadow ISR entry latency for PPS.
 //   PPS_PHASE     — PPS/VCLOCK phase inferred from TimePop witness events.
 //   ROUND_TRIP    — source-to-GPIO ISR latency stats.
+//   OCXO_START    — begin minimal OCXO edge-to-edge DWT witness mode.
+//   OCXO_STOP     — stop OCXO witness mode and disable its compares.
+//   VCLOCK_START  — begin hosted QTimer1 CH1 VCLOCK edge witness mode.
+//   VCLOCK_STOP   — stop hosted VCLOCK witness mode.
 //
 // Test cadence:
 //   • 100 ms: GPIO HIGH   (visible 1 Hz heartbeat; away from PPS)
@@ -51,6 +70,7 @@
 #include "config.h"
 #include "process.h"
 #include "payload.h"
+#include "publish.h"
 #include "timepop.h"
 #include "time.h"
 
@@ -58,6 +78,8 @@
 #include "imxrt.h"
 
 #include <math.h>
+#include <string.h>
+#include <strings.h>
 
 // ============================================================================
 // Hardware constants
@@ -361,6 +383,233 @@ static volatile bool g_bridge_armed = false;
 static welford_t g_bridge_residual_welford = {};
 static welford_t g_bridge_dynamic_residual_welford = {};
 
+
+// ============================================================================
+// CLOCK_WITNESS — minimal edge-to-edge clock/DWT experiment
+// ============================================================================
+//
+// This mode is off by default and must only be used after process_interrupt has
+// relinquished the OCXO rails.  It mirrors the current process_interrupt OCXO
+// hardware mapping:
+//
+//   OCXO1: QTimer2 CH0, pin OCXO1_PIN, PCS(0)
+//   OCXO2: QTimer3 CH3, pin OCXO2_PIN, PCS(3)
+//
+// QTimer compare ISR work is deliberately tiny: clear/disable compare, latch
+// first-instruction DWT + counter low16, request a safe TimePop ASAP callback.
+// The ASAP callback authors edge facts.  A 1 kHz VCLOCK/TimePop cadence minder
+// extends the 16-bit counters, arms one-shot compares only when the 10,000,000
+// count boundary is near, and requests a scheduled-context publication once per
+// VCLOCK second.  Published CLOCK_WITNESS records are historical snapshots of
+// already-captured clock intervals.
+
+static constexpr uint32_t OCXO_WITNESS_COUNTS_PER_SECOND = 10000000U;
+static constexpr uint32_t OCXO_WITNESS_MINDER_PERIOD_NS = 1000000U;  // 1 ms
+static constexpr uint32_t OCXO_WITNESS_MINDER_PER_REPORT = 1000U;
+static constexpr uint32_t OCXO_WITNESS_ARM_WINDOW_TICKS = 50000U;
+static constexpr uint16_t OCXO_WITNESS_LARGE_DELTA16_TICKS = 50000U;
+static constexpr const char* OCXO_WITNESS_MINDER_NAME = "CLOCK_WITNESS_MINDER";
+static constexpr const char* OCXO_WITNESS_EDGE_ASAP_NAME = "CLOCK_WITNESS_EDGE_ASAP";
+static constexpr const char* OCXO_WITNESS_PUBLISH_ASAP_NAME = "CLOCK_WITNESS_PUBLISH_ASAP";
+
+static constexpr uint8_t OCXO_WITNESS_LANE1_MASK = 0x01;
+static constexpr uint8_t OCXO_WITNESS_LANE2_MASK = 0x02;
+static constexpr uint8_t OCXO_WITNESS_BOTH_MASK =
+    OCXO_WITNESS_LANE1_MASK | OCXO_WITNESS_LANE2_MASK;
+
+static constexpr const char* CLOCK_WITNESS_TOPIC = "CLOCK_WITNESS";
+
+// VCLOCK side-bell target starts at a non-1ms phase so CH1 does not
+// intentionally collide with the TimePop/CH2 1ms cadence grid.
+static constexpr uint32_t VCLOCK_WITNESS_FIRST_TARGET_DELAY_TICKS = 5005000U;
+static constexpr uint32_t VCLOCK_WITNESS_ARM_WINDOW_TICKS = 45000U;
+static constexpr uint32_t VCLOCK_WITNESS_MIN_ARM_LEAD_TICKS = 64U;
+
+struct ocxo_witness_edge_record_t {
+  bool     valid = false;
+  bool     delta_valid = false;
+  bool     residual_valid = false;
+
+  uint32_t sequence = 0;
+  uint32_t irq_count = 0;
+
+  uint64_t ocxo_total_at_edge = 0;
+  uint64_t ocxo_total_at_isr = 0;
+  uint64_t dwt_total_at_edge = 0;
+
+  uint32_t dwt_at_edge = 0;
+  uint32_t dwt_delta_cycles = 0;
+  uint32_t dwt_pred_cycles = 0;
+  int32_t  dwt_residual_cycles = 0;
+
+  uint16_t target_low16 = 0;
+  uint16_t counter_low16_at_isr = 0;
+  int32_t  service_offset_ticks = 0;
+};
+
+struct ocxo_witness_lane_t {
+  const char*  name = nullptr;
+  IMXRT_TMR_t* module = nullptr;
+  uint8_t      channel = 0;
+  uint8_t      pcs = 0;
+  int          input_pin = -1;
+  uint8_t      mask = 0;
+
+  volatile bool enabled = false;
+  volatile bool initialized = false;
+  volatile bool compare_armed = false;
+  volatile bool irq_pending = false;
+
+  volatile uint32_t irq_count = 0;
+  volatile uint32_t false_irq_count = 0;
+  volatile uint32_t pending_overwrite_count = 0;
+  volatile uint32_t asap_arm_failures = 0;
+  volatile uint32_t pending_dwt_at_isr = 0;
+  volatile uint16_t pending_counter_low16_at_isr = 0;
+  volatile uint16_t pending_target_low16 = 0;
+
+  uint16_t origin_low16 = 0;
+  uint16_t last_hw16 = 0;
+  uint64_t total_cycles = 0;
+  uint64_t next_target_total = OCXO_WITNESS_COUNTS_PER_SECOND;
+  uint16_t next_target_low16 = 0;
+  uint64_t dwt_total_cycles = 0;
+
+  bool     seen_first_edge = false;
+  bool     have_last_delta = false;
+  uint32_t last_edge_dwt32 = 0;
+  uint64_t last_edge_dwt64 = 0;
+  uint32_t last_dwt_delta_cycles = 0;
+
+  ocxo_witness_edge_record_t previous = {};
+  ocxo_witness_edge_record_t last = {};
+
+  uint32_t start_count = 0;
+  uint32_t stop_count = 0;
+  uint32_t edge_count = 0;
+  uint32_t arm_count = 0;
+  uint32_t arm_late_count = 0;
+  uint32_t missed_target_count = 0;
+  uint32_t rollover_update_count = 0;
+  uint32_t large_delta_count = 0;
+  uint16_t largest_delta16 = 0;
+  uint32_t last_published_edge_count = 0;
+
+  welford_t dwt_delta_welford = {};
+  welford_t residual_welford = {};
+};
+
+static ocxo_witness_lane_t g_ocxo_witness_1 = {};
+static ocxo_witness_lane_t g_ocxo_witness_2 = {};
+
+static volatile bool g_ocxo_witness_running = false;
+static volatile uint8_t g_ocxo_witness_active_mask = 0;
+static volatile bool g_ocxo_witness_minder_armed = false;
+static volatile bool g_ocxo_witness_edge_asap_requested = false;
+static volatile bool g_ocxo_witness_publish_asap_requested = false;
+static volatile uint8_t g_ocxo_witness_vector_mask = 0;
+static volatile uint32_t g_ocxo_witness_start_count = 0;
+static volatile uint32_t g_ocxo_witness_stop_count = 0;
+static volatile uint32_t g_ocxo_witness_minder_fire_count = 0;
+static volatile uint32_t g_ocxo_witness_minder_arm_count = 0;
+static volatile uint32_t g_ocxo_witness_minder_arm_failures = 0;
+static volatile uint32_t g_ocxo_witness_minder_divider = 0;
+static volatile uint32_t g_ocxo_witness_publish_request_count = 0;
+static volatile uint32_t g_ocxo_witness_publish_count = 0;
+static volatile uint32_t g_ocxo_witness_publish_asap_failures = 0;
+static volatile uint32_t g_ocxo_witness_edge_asap_count = 0;
+
+// ============================================================================
+// VCLOCK witness — hosted QTimer1 CH1 edge-to-edge VCLOCK/DWT experiment
+// ============================================================================
+//
+// This does not take ownership of VCLOCK and does not touch QTimer1 registers.
+// process_interrupt owns QTimer1 CH1 as a hosted VCLOCK-domain compare rail.
+// Witness registers a tiny IRQ-context handler, arms a near one-shot target
+// only when the next 10,000,000-count boundary is close, and folds the
+// historical interval facts into the same CLOCK_WITNESS stream used by the
+// OCXO witness lanes.
+
+struct vclock_witness_edge_record_t {
+  bool     valid = false;
+  bool     delta_valid = false;
+  bool     residual_valid = false;
+
+  uint32_t sequence = 0;
+  uint32_t irq_count = 0;
+
+  uint64_t clock_total_at_edge = 0;
+  uint64_t clock_total_at_event = 0;
+  uint64_t dwt_total_at_edge = 0;
+
+  uint32_t target_counter32 = 0;
+  uint32_t counter32_at_event = 0;
+  int32_t  counter32_residual_ticks = 0;
+
+  uint32_t isr_entry_dwt_raw = 0;
+  uint32_t dwt_at_edge = 0;
+  int64_t  gnss_ns_at_event = -1;
+
+  uint32_t dwt_delta_cycles = 0;
+  uint32_t dwt_pred_cycles = 0;
+  int32_t  dwt_residual_cycles = 0;
+
+  int32_t  service_offset_ticks = 0;
+};
+
+struct vclock_witness_lane_t {
+  volatile bool enabled = false;
+  volatile bool initialized = false;
+  volatile bool compare_armed = false;
+  volatile bool irq_pending = false;
+  volatile bool handler_registered = false;
+
+  volatile uint32_t irq_count = 0;
+  volatile uint32_t false_irq_count = 0;
+  volatile uint32_t pending_overwrite_count = 0;
+  volatile uint32_t asap_arm_failures = 0;
+
+  volatile uint32_t pending_sequence = 0;
+  volatile uint32_t pending_target_counter32 = 0;
+  volatile uint32_t pending_counter32_at_event = 0;
+  volatile int32_t  pending_counter32_residual_ticks = 0;
+  volatile uint32_t pending_isr_entry_dwt_raw = 0;
+  volatile uint32_t pending_dwt_at_event = 0;
+  volatile int64_t  pending_gnss_ns_at_event = -1;
+
+  uint32_t origin_counter32 = 0;
+  uint32_t next_target_counter32 = 0;
+  uint64_t next_target_total = OCXO_WITNESS_COUNTS_PER_SECOND;
+  uint32_t first_target_delay_ticks = VCLOCK_WITNESS_FIRST_TARGET_DELAY_TICKS;
+  uint64_t dwt_total_cycles = 0;
+
+  bool     seen_first_edge = false;
+  bool     have_last_delta = false;
+  uint32_t last_edge_dwt32 = 0;
+  uint64_t last_edge_dwt64 = 0;
+  uint32_t last_dwt_delta_cycles = 0;
+
+  vclock_witness_edge_record_t previous = {};
+  vclock_witness_edge_record_t last = {};
+
+  uint32_t start_count = 0;
+  uint32_t stop_count = 0;
+  uint32_t edge_count = 0;
+  uint32_t arm_count = 0;
+  uint32_t arm_failures = 0;
+  uint32_t arm_late_count = 0;
+  uint32_t missed_target_count = 0;
+  uint32_t tend_count = 0;
+  uint32_t last_arm_remaining_ticks = 0;
+  uint32_t last_arm_now_counter32 = 0;
+  uint32_t last_published_edge_count = 0;
+
+  welford_t dwt_delta_welford = {};
+  welford_t residual_welford = {};
+};
+
+static vclock_witness_lane_t g_vclock_witness = {};
+
 // ============================================================================
 // Forward declarations
 // ============================================================================
@@ -376,6 +625,16 @@ static void entry_latency_pps_isr_handler(uint32_t sequence, uint32_t isr_entry_
 static bool entry_latency_arm_pps_spin(void);
 static bool witness_ensure_scheduled(void);
 static Payload witness_state_payload(void);
+static Payload welford_payload(const welford_t& w);
+static void ocxo_witness_minder_callback(timepop_ctx_t*, timepop_diag_t*, void*);
+static void ocxo_witness_edge_asap_callback(timepop_ctx_t*, timepop_diag_t*, void*);
+static void ocxo_witness_publish_asap_callback(timepop_ctx_t*, timepop_diag_t*, void*);
+static void vclock_witness_ch1_handler(const interrupt_qtimer1_ch1_compare_event_t& event);
+static void vclock_witness_process_pending(void);
+static Payload cmd_ocxo_start(const Payload& args);
+static Payload cmd_ocxo_stop(const Payload& args);
+static Payload cmd_vclock_start(const Payload& args);
+static Payload cmd_vclock_stop(const Payload& args);
 
 // ============================================================================
 // Source drive
@@ -430,6 +689,1082 @@ static void capture_dwt_read_sample(void) {
   g_dwt_read_samples++;
 
   welford_update(g_dwt_read_welford, (int32_t)sample);
+}
+
+
+// ============================================================================
+// OCXO_WITNESS helpers
+// ============================================================================
+
+static inline int32_t clamp_i64_to_i32(int64_t v) {
+  if (v > INT32_MAX) return INT32_MAX;
+  if (v < INT32_MIN) return INT32_MIN;
+  return (int32_t)v;
+}
+
+static bool clock_witness_any_active(void) {
+  return g_ocxo_witness_1.enabled || g_ocxo_witness_2.enabled ||
+         g_vclock_witness.enabled;
+}
+
+static void clock_witness_cancel_deferred_if_idle(void) {
+  if (clock_witness_any_active()) return;
+
+  timepop_cancel_by_name(OCXO_WITNESS_MINDER_NAME);
+  timepop_cancel_by_name(OCXO_WITNESS_EDGE_ASAP_NAME);
+  timepop_cancel_by_name(OCXO_WITNESS_PUBLISH_ASAP_NAME);
+  g_ocxo_witness_running = false;
+  g_ocxo_witness_minder_armed = false;
+  g_ocxo_witness_edge_asap_requested = false;
+  g_ocxo_witness_publish_asap_requested = false;
+}
+
+static void vclock_witness_reset_runtime(void) {
+  const uint32_t prior_start_count = g_vclock_witness.start_count;
+  const uint32_t prior_stop_count = g_vclock_witness.stop_count;
+
+  g_vclock_witness = vclock_witness_lane_t{};
+  g_vclock_witness.start_count = prior_start_count;
+  g_vclock_witness.stop_count = prior_stop_count;
+  welford_reset(g_vclock_witness.dwt_delta_welford);
+  welford_reset(g_vclock_witness.residual_welford);
+}
+
+static void vclock_witness_advance_target_to_future(uint32_t now_counter32) {
+  while ((uint32_t)(now_counter32 - g_vclock_witness.next_target_counter32) <
+         0x80000000UL) {
+    g_vclock_witness.next_target_counter32 += OCXO_WITNESS_COUNTS_PER_SECOND;
+    g_vclock_witness.next_target_total += OCXO_WITNESS_COUNTS_PER_SECOND;
+    g_vclock_witness.missed_target_count++;
+  }
+}
+
+static void vclock_witness_tend(void) {
+  if (!g_vclock_witness.enabled || !g_vclock_witness.initialized) return;
+  if (g_vclock_witness.irq_pending || g_vclock_witness.compare_armed) return;
+
+  const uint32_t now = interrupt_vclock_counter32_observe_ambient();
+  g_vclock_witness.tend_count++;
+
+  uint32_t remaining = g_vclock_witness.next_target_counter32 - now;
+  if (remaining > 0x7FFFFFFFUL) {
+    vclock_witness_advance_target_to_future(now);
+    return;
+  }
+
+  if (remaining <= VCLOCK_WITNESS_MIN_ARM_LEAD_TICKS) {
+    g_vclock_witness.arm_late_count++;
+    return;
+  }
+
+  if (remaining > VCLOCK_WITNESS_ARM_WINDOW_TICKS) {
+    return;
+  }
+
+  g_vclock_witness.last_arm_now_counter32 = now;
+  g_vclock_witness.last_arm_remaining_ticks = remaining;
+  if (interrupt_qtimer1_ch1_arm_compare(g_vclock_witness.next_target_counter32)) {
+    g_vclock_witness.compare_armed = true;
+    g_vclock_witness.arm_count++;
+  } else {
+    g_vclock_witness.arm_failures++;
+  }
+}
+
+static void vclock_witness_complete_edge(uint32_t sequence,
+                                         uint32_t target_counter32,
+                                         uint32_t counter32_at_event,
+                                         int32_t counter32_residual_ticks,
+                                         uint32_t isr_entry_dwt_raw,
+                                         uint32_t dwt_at_event,
+                                         int64_t gnss_ns_at_event) {
+  if (!g_vclock_witness.enabled) return;
+
+  const uint64_t target_total = g_vclock_witness.next_target_total;
+  const int32_t service_offset = counter32_residual_ticks;
+
+  vclock_witness_edge_record_t rec{};
+  rec.valid = true;
+  rec.sequence = g_vclock_witness.edge_count + 1;
+  rec.irq_count = g_vclock_witness.irq_count;
+  rec.clock_total_at_edge = target_total;
+  rec.clock_total_at_event =
+      (service_offset >= 0)
+          ? (target_total + (uint64_t)service_offset)
+          : (target_total - (uint64_t)(-service_offset));
+  rec.target_counter32 = target_counter32;
+  rec.counter32_at_event = counter32_at_event;
+  rec.counter32_residual_ticks = counter32_residual_ticks;
+  rec.isr_entry_dwt_raw = isr_entry_dwt_raw;
+  rec.dwt_at_edge = dwt_at_event;
+  rec.gnss_ns_at_event = gnss_ns_at_event;
+  rec.service_offset_ticks = service_offset;
+
+  if (g_vclock_witness.seen_first_edge) {
+    const uint32_t dwt_delta = (uint32_t)(dwt_at_event - g_vclock_witness.last_edge_dwt32);
+    g_vclock_witness.dwt_total_cycles += dwt_delta;
+    g_vclock_witness.last_edge_dwt64 = g_vclock_witness.dwt_total_cycles;
+
+    rec.delta_valid = true;
+    rec.dwt_total_at_edge = g_vclock_witness.dwt_total_cycles;
+    rec.dwt_delta_cycles = dwt_delta;
+    rec.dwt_pred_cycles = g_vclock_witness.have_last_delta
+        ? g_vclock_witness.last_dwt_delta_cycles
+        : 0;
+
+    welford_update(g_vclock_witness.dwt_delta_welford, (int32_t)dwt_delta);
+
+    if (g_vclock_witness.have_last_delta) {
+      rec.residual_valid = true;
+      rec.dwt_residual_cycles =
+          (int32_t)((int64_t)dwt_delta -
+                    (int64_t)g_vclock_witness.last_dwt_delta_cycles);
+      welford_update(g_vclock_witness.residual_welford,
+                     rec.dwt_residual_cycles);
+    }
+
+    g_vclock_witness.last_dwt_delta_cycles = dwt_delta;
+    g_vclock_witness.have_last_delta = true;
+  } else {
+    g_vclock_witness.seen_first_edge = true;
+    g_vclock_witness.dwt_total_cycles = 0;
+    g_vclock_witness.last_edge_dwt64 = 0;
+    rec.dwt_total_at_edge = 0;
+  }
+
+  g_vclock_witness.last_edge_dwt32 = dwt_at_event;
+  g_vclock_witness.previous = g_vclock_witness.last;
+  g_vclock_witness.last = rec;
+  g_vclock_witness.edge_count++;
+
+  g_vclock_witness.next_target_counter32 =
+      target_counter32 + OCXO_WITNESS_COUNTS_PER_SECOND;
+  g_vclock_witness.next_target_total =
+      target_total + OCXO_WITNESS_COUNTS_PER_SECOND;
+  g_vclock_witness.compare_armed = false;
+}
+
+static void vclock_witness_process_pending(void) {
+  bool pending;
+  uint32_t sequence;
+  uint32_t target_counter32;
+  uint32_t counter32_at_event;
+  int32_t counter32_residual_ticks;
+  uint32_t isr_entry_dwt_raw;
+  uint32_t dwt_at_event;
+  int64_t gnss_ns_at_event;
+
+  noInterrupts();
+  pending = g_vclock_witness.irq_pending;
+  sequence = g_vclock_witness.pending_sequence;
+  target_counter32 = g_vclock_witness.pending_target_counter32;
+  counter32_at_event = g_vclock_witness.pending_counter32_at_event;
+  counter32_residual_ticks = g_vclock_witness.pending_counter32_residual_ticks;
+  isr_entry_dwt_raw = g_vclock_witness.pending_isr_entry_dwt_raw;
+  dwt_at_event = g_vclock_witness.pending_dwt_at_event;
+  gnss_ns_at_event = g_vclock_witness.pending_gnss_ns_at_event;
+  g_vclock_witness.irq_pending = false;
+  interrupts();
+
+  if (!pending) return;
+  vclock_witness_complete_edge(sequence,
+                               target_counter32,
+                               counter32_at_event,
+                               counter32_residual_ticks,
+                               isr_entry_dwt_raw,
+                               dwt_at_event,
+                               gnss_ns_at_event);
+}
+
+static void vclock_witness_ch1_handler(const interrupt_qtimer1_ch1_compare_event_t& event) {
+  if (!g_vclock_witness.enabled || !g_vclock_witness.compare_armed) {
+    g_vclock_witness.false_irq_count++;
+    return;
+  }
+
+  if (g_vclock_witness.irq_pending) g_vclock_witness.pending_overwrite_count++;
+
+  g_vclock_witness.pending_sequence = event.sequence;
+  g_vclock_witness.pending_target_counter32 = event.target_counter32;
+  g_vclock_witness.pending_counter32_at_event = event.counter32_at_event;
+  g_vclock_witness.pending_counter32_residual_ticks = event.counter32_residual_ticks;
+  g_vclock_witness.pending_isr_entry_dwt_raw = event.isr_entry_dwt_raw;
+  g_vclock_witness.pending_dwt_at_event = event.dwt_at_event;
+  g_vclock_witness.pending_gnss_ns_at_event = event.gnss_ns_at_event;
+  g_vclock_witness.irq_pending = true;
+  g_vclock_witness.irq_count++;
+  g_vclock_witness.compare_armed = false;
+
+  if (!g_ocxo_witness_edge_asap_requested) {
+    g_ocxo_witness_edge_asap_requested = true;
+    const timepop_handle_t h = timepop_arm_asap(ocxo_witness_edge_asap_callback,
+                                                nullptr,
+                                                OCXO_WITNESS_EDGE_ASAP_NAME);
+    if (h == TIMEPOP_INVALID_HANDLE) {
+      g_vclock_witness.asap_arm_failures++;
+      g_ocxo_witness_edge_asap_requested = false;
+    }
+  }
+}
+
+static const char* ocxo_witness_module_name(const ocxo_witness_lane_t& lane) {
+  if (lane.module == &IMXRT_TMR2) return "QTIMER2";
+  if (lane.module == &IMXRT_TMR3) return "QTIMER3";
+  return "UNKNOWN";
+}
+
+static void ocxo_witness_bind_lanes(void) {
+  g_ocxo_witness_1.name = "OCXO1";
+  g_ocxo_witness_1.module = &IMXRT_TMR2;
+  g_ocxo_witness_1.channel = 0;
+  g_ocxo_witness_1.pcs = 0;
+  g_ocxo_witness_1.input_pin = OCXO1_PIN;
+  g_ocxo_witness_1.mask = OCXO_WITNESS_LANE1_MASK;
+
+  g_ocxo_witness_2.name = "OCXO2";
+  g_ocxo_witness_2.module = &IMXRT_TMR3;
+  g_ocxo_witness_2.channel = 3;
+  g_ocxo_witness_2.pcs = 3;
+  g_ocxo_witness_2.input_pin = OCXO2_PIN;
+  g_ocxo_witness_2.mask = OCXO_WITNESS_LANE2_MASK;
+}
+
+static inline void ocxo_witness_clear_compare_flag(ocxo_witness_lane_t& lane) {
+  lane.module->CH[lane.channel].CSCTRL &= ~(TMR_CSCTRL_TCF1 | TMR_CSCTRL_TCF2);
+}
+
+static inline void ocxo_witness_disable_compare(ocxo_witness_lane_t& lane) {
+  lane.module->CH[lane.channel].CSCTRL &= ~TMR_CSCTRL_TCF1EN;
+  ocxo_witness_clear_compare_flag(lane);
+  lane.compare_armed = false;
+}
+
+static inline void ocxo_witness_program_compare(ocxo_witness_lane_t& lane,
+                                                uint16_t target_low16) {
+  ocxo_witness_clear_compare_flag(lane);
+  lane.module->CH[lane.channel].COMP1  = target_low16;
+  lane.module->CH[lane.channel].CMPLD1 = target_low16;
+  ocxo_witness_clear_compare_flag(lane);
+  lane.module->CH[lane.channel].CSCTRL |= TMR_CSCTRL_TCF1EN;
+  lane.compare_armed = true;
+  lane.arm_count++;
+}
+
+static inline uint16_t ocxo_witness_counter_now(const ocxo_witness_lane_t& lane) {
+  return lane.module->CH[lane.channel].CNTR;
+}
+
+static inline uint16_t ocxo_witness_target_low16(const ocxo_witness_lane_t& lane,
+                                                 uint64_t target_total) {
+  return (uint16_t)(lane.origin_low16 + (uint16_t)(target_total & 0xFFFFULL));
+}
+
+static void ocxo_witness_lane_reset_runtime(ocxo_witness_lane_t& lane) {
+  lane.enabled = false;
+  lane.initialized = false;
+  lane.compare_armed = false;
+  lane.irq_pending = false;
+
+  lane.irq_count = 0;
+  lane.false_irq_count = 0;
+  lane.pending_overwrite_count = 0;
+  lane.asap_arm_failures = 0;
+  lane.pending_dwt_at_isr = 0;
+  lane.pending_counter_low16_at_isr = 0;
+  lane.pending_target_low16 = 0;
+
+  lane.origin_low16 = 0;
+  lane.last_hw16 = 0;
+  lane.total_cycles = 0;
+  lane.next_target_total = OCXO_WITNESS_COUNTS_PER_SECOND;
+  lane.next_target_low16 = 0;
+  lane.dwt_total_cycles = 0;
+
+  lane.seen_first_edge = false;
+  lane.have_last_delta = false;
+  lane.last_edge_dwt32 = 0;
+  lane.last_edge_dwt64 = 0;
+  lane.last_dwt_delta_cycles = 0;
+
+  lane.previous = ocxo_witness_edge_record_t{};
+  lane.last = ocxo_witness_edge_record_t{};
+
+  lane.edge_count = 0;
+  lane.arm_count = 0;
+  lane.arm_late_count = 0;
+  lane.missed_target_count = 0;
+  lane.rollover_update_count = 0;
+  lane.large_delta_count = 0;
+  lane.largest_delta16 = 0;
+  lane.last_published_edge_count = 0;
+
+  welford_reset(lane.dwt_delta_welford);
+  welford_reset(lane.residual_welford);
+}
+
+static void ocxo_witness_configure_hw_lane(ocxo_witness_lane_t& lane) {
+  if (lane.module == &IMXRT_TMR2) {
+    CCM_CCGR6 |= CCM_CCGR6_QTIMER2(CCM_CCGR_ON);
+    *(portConfigRegister(lane.input_pin)) = 1;
+    IOMUXC_QTIMER2_TIMER0_SELECT_INPUT = 1;
+  } else if (lane.module == &IMXRT_TMR3) {
+    CCM_CCGR6 |= CCM_CCGR6_QTIMER3(CCM_CCGR_ON);
+    *(portConfigRegister(lane.input_pin)) = 1;
+    IOMUXC_QTIMER3_TIMER3_SELECT_INPUT = 1;
+  }
+
+  lane.module->CH[lane.channel].CTRL   = 0;
+  lane.module->CH[lane.channel].SCTRL  = 0;
+  lane.module->CH[lane.channel].CSCTRL = 0;
+  lane.module->CH[lane.channel].LOAD   = 0;
+  lane.module->CH[lane.channel].CNTR   = 0;
+  lane.module->CH[lane.channel].COMP1  = 0xFFFF;
+  lane.module->CH[lane.channel].CMPLD1 = 0xFFFF;
+  lane.module->CH[lane.channel].CMPLD2 = 0;
+  lane.module->CH[lane.channel].CTRL   = TMR_CTRL_CM(1) | TMR_CTRL_PCS(lane.pcs);
+  ocxo_witness_disable_compare(lane);
+
+  if (lane.module == &IMXRT_TMR2) {
+    IMXRT_TMR2.ENBL |= (uint16_t)(1U << lane.channel);
+  } else if (lane.module == &IMXRT_TMR3) {
+    IMXRT_TMR3.ENBL |= (uint16_t)(1U << lane.channel);
+  }
+
+  lane.initialized = true;
+}
+
+static void ocxo_witness_qtimer2_isr(void) {
+  const uint32_t dwt_raw = ARM_DWT_CYCCNT;
+  if (!(IMXRT_TMR2.CH[0].CSCTRL & TMR_CSCTRL_TCF1)) return;
+
+  ocxo_witness_lane_t& lane = g_ocxo_witness_1;
+  const uint16_t counter_low16 = IMXRT_TMR2.CH[0].CNTR;
+  ocxo_witness_clear_compare_flag(lane);
+
+  if (!lane.enabled || !lane.compare_armed) {
+    lane.false_irq_count++;
+    ocxo_witness_disable_compare(lane);
+    return;
+  }
+
+  if (lane.irq_pending) lane.pending_overwrite_count++;
+  lane.pending_dwt_at_isr = dwt_raw;
+  lane.pending_counter_low16_at_isr = counter_low16;
+  lane.pending_target_low16 = lane.next_target_low16;
+  lane.irq_pending = true;
+  lane.irq_count++;
+  ocxo_witness_disable_compare(lane);
+
+  if (!g_ocxo_witness_edge_asap_requested) {
+    g_ocxo_witness_edge_asap_requested = true;
+    const timepop_handle_t h = timepop_arm_asap(ocxo_witness_edge_asap_callback,
+                                                nullptr,
+                                                OCXO_WITNESS_EDGE_ASAP_NAME);
+    if (h == TIMEPOP_INVALID_HANDLE) {
+      lane.asap_arm_failures++;
+      g_ocxo_witness_edge_asap_requested = false;
+    }
+  }
+}
+
+static void ocxo_witness_qtimer3_isr(void) {
+  const uint32_t dwt_raw = ARM_DWT_CYCCNT;
+  if (!(IMXRT_TMR3.CH[3].CSCTRL & TMR_CSCTRL_TCF1)) return;
+
+  ocxo_witness_lane_t& lane = g_ocxo_witness_2;
+  const uint16_t counter_low16 = IMXRT_TMR3.CH[3].CNTR;
+  ocxo_witness_clear_compare_flag(lane);
+
+  if (!lane.enabled || !lane.compare_armed) {
+    lane.false_irq_count++;
+    ocxo_witness_disable_compare(lane);
+    return;
+  }
+
+  if (lane.irq_pending) lane.pending_overwrite_count++;
+  lane.pending_dwt_at_isr = dwt_raw;
+  lane.pending_counter_low16_at_isr = counter_low16;
+  lane.pending_target_low16 = lane.next_target_low16;
+  lane.irq_pending = true;
+  lane.irq_count++;
+  ocxo_witness_disable_compare(lane);
+
+  if (!g_ocxo_witness_edge_asap_requested) {
+    g_ocxo_witness_edge_asap_requested = true;
+    const timepop_handle_t h = timepop_arm_asap(ocxo_witness_edge_asap_callback,
+                                                nullptr,
+                                                OCXO_WITNESS_EDGE_ASAP_NAME);
+    if (h == TIMEPOP_INVALID_HANDLE) {
+      lane.asap_arm_failures++;
+      g_ocxo_witness_edge_asap_requested = false;
+    }
+  }
+}
+
+static void ocxo_witness_install_vectors(uint8_t mask) {
+  if (mask & OCXO_WITNESS_LANE1_MASK) {
+    attachInterruptVector(IRQ_QTIMER2, ocxo_witness_qtimer2_isr);
+    NVIC_SET_PRIORITY(IRQ_QTIMER2, 16);
+    NVIC_ENABLE_IRQ(IRQ_QTIMER2);
+    g_ocxo_witness_vector_mask |= OCXO_WITNESS_LANE1_MASK;
+  }
+
+  if (mask & OCXO_WITNESS_LANE2_MASK) {
+    attachInterruptVector(IRQ_QTIMER3, ocxo_witness_qtimer3_isr);
+    NVIC_SET_PRIORITY(IRQ_QTIMER3, 16);
+    NVIC_ENABLE_IRQ(IRQ_QTIMER3);
+    g_ocxo_witness_vector_mask |= OCXO_WITNESS_LANE2_MASK;
+  }
+}
+
+static void ocxo_witness_release_vectors(uint8_t mask) {
+  if ((mask & OCXO_WITNESS_LANE1_MASK) &&
+      (g_ocxo_witness_vector_mask & OCXO_WITNESS_LANE1_MASK) &&
+      !g_ocxo_witness_1.enabled) {
+    NVIC_DISABLE_IRQ(IRQ_QTIMER2);
+    g_ocxo_witness_vector_mask &= (uint8_t)~OCXO_WITNESS_LANE1_MASK;
+  }
+
+  if ((mask & OCXO_WITNESS_LANE2_MASK) &&
+      (g_ocxo_witness_vector_mask & OCXO_WITNESS_LANE2_MASK) &&
+      !g_ocxo_witness_2.enabled) {
+    NVIC_DISABLE_IRQ(IRQ_QTIMER3);
+    g_ocxo_witness_vector_mask &= (uint8_t)~OCXO_WITNESS_LANE2_MASK;
+  }
+}
+
+static void ocxo_witness_start_lane(ocxo_witness_lane_t& lane) {
+  const uint32_t prior_start_count = lane.start_count;
+  ocxo_witness_lane_reset_runtime(lane);
+  lane.start_count = prior_start_count + 1;
+  ocxo_witness_configure_hw_lane(lane);
+
+  const uint16_t now16 = ocxo_witness_counter_now(lane);
+  lane.origin_low16 = now16;
+  lane.last_hw16 = now16;
+  lane.total_cycles = 0;
+  lane.next_target_total = OCXO_WITNESS_COUNTS_PER_SECOND;
+  lane.next_target_low16 = ocxo_witness_target_low16(lane, lane.next_target_total);
+  lane.enabled = true;
+}
+
+static void ocxo_witness_stop_lane(ocxo_witness_lane_t& lane) {
+  const bool was_active = lane.enabled || lane.compare_armed || lane.irq_pending;
+  if (was_active && lane.initialized) {
+    ocxo_witness_disable_compare(lane);
+  }
+  lane.enabled = false;
+  lane.irq_pending = false;
+  if (was_active) lane.stop_count++;
+}
+
+static bool ocxo_witness_any_lane_enabled(void) {
+  return g_ocxo_witness_1.enabled || g_ocxo_witness_2.enabled;
+}
+
+static void ocxo_witness_update_total_from_hw16(ocxo_witness_lane_t& lane,
+                                                uint16_t now16) {
+  const uint16_t delta16 = (uint16_t)(now16 - lane.last_hw16);
+  if (delta16 == 0) return;
+
+  lane.total_cycles += (uint32_t)delta16;
+  lane.last_hw16 = now16;
+  lane.rollover_update_count++;
+  if (delta16 > lane.largest_delta16) lane.largest_delta16 = delta16;
+  if (delta16 >= OCXO_WITNESS_LARGE_DELTA16_TICKS) lane.large_delta_count++;
+}
+
+static void ocxo_witness_advance_target_to_future(ocxo_witness_lane_t& lane) {
+  while (lane.total_cycles >= lane.next_target_total) {
+    lane.missed_target_count++;
+    lane.next_target_total += OCXO_WITNESS_COUNTS_PER_SECOND;
+  }
+  lane.next_target_low16 = ocxo_witness_target_low16(lane, lane.next_target_total);
+}
+
+static void ocxo_witness_tend_lane(ocxo_witness_lane_t& lane) {
+  if (!lane.enabled || !lane.initialized) return;
+  if (lane.irq_pending) return;
+
+  // Once the one-shot compare is armed, stop tending this lane until the
+  // compare ISR/ASAP pair authors the edge.  The arm window is < one 16-bit
+  // rollover, so pausing here prevents the cadence minder from moving the
+  // software total past the target before the edge fact is consumed.
+  if (lane.compare_armed) return;
+
+  const uint16_t now16 = ocxo_witness_counter_now(lane);
+  ocxo_witness_update_total_from_hw16(lane, now16);
+
+  if (lane.total_cycles >= lane.next_target_total) {
+    lane.arm_late_count++;
+    ocxo_witness_advance_target_to_future(lane);
+    return;
+  }
+
+  const uint64_t remaining = lane.next_target_total - lane.total_cycles;
+  if (remaining <= OCXO_WITNESS_ARM_WINDOW_TICKS) {
+    lane.next_target_low16 = ocxo_witness_target_low16(lane, lane.next_target_total);
+    ocxo_witness_program_compare(lane, lane.next_target_low16);
+  }
+}
+
+static void ocxo_witness_complete_edge(ocxo_witness_lane_t& lane,
+                                       uint32_t dwt_at_isr,
+                                       uint16_t counter_low16_at_isr,
+                                       uint16_t target_low16) {
+  if (!lane.enabled) return;
+
+  ocxo_witness_update_total_from_hw16(lane, counter_low16_at_isr);
+
+  const uint64_t target_total = lane.next_target_total;
+  const uint64_t total_at_isr = lane.total_cycles;
+  const int32_t service_offset =
+      clamp_i64_to_i32((int64_t)total_at_isr - (int64_t)target_total);
+
+  ocxo_witness_edge_record_t rec{};
+  rec.valid = true;
+  rec.sequence = lane.edge_count + 1;
+  rec.irq_count = lane.irq_count;
+  rec.ocxo_total_at_edge = target_total;
+  rec.ocxo_total_at_isr = total_at_isr;
+  rec.dwt_at_edge = dwt_at_isr;
+  rec.target_low16 = target_low16;
+  rec.counter_low16_at_isr = counter_low16_at_isr;
+  rec.service_offset_ticks = service_offset;
+
+  if (lane.seen_first_edge) {
+    const uint32_t dwt_delta = (uint32_t)(dwt_at_isr - lane.last_edge_dwt32);
+    lane.dwt_total_cycles += dwt_delta;
+    lane.last_edge_dwt64 = lane.dwt_total_cycles;
+
+    rec.delta_valid = true;
+    rec.dwt_total_at_edge = lane.dwt_total_cycles;
+    rec.dwt_delta_cycles = dwt_delta;
+    rec.dwt_pred_cycles = lane.have_last_delta ? lane.last_dwt_delta_cycles : 0;
+
+    welford_update(lane.dwt_delta_welford, (int32_t)dwt_delta);
+
+    if (lane.have_last_delta) {
+      rec.residual_valid = true;
+      rec.dwt_residual_cycles =
+          (int32_t)((int64_t)dwt_delta - (int64_t)lane.last_dwt_delta_cycles);
+      welford_update(lane.residual_welford, rec.dwt_residual_cycles);
+    }
+
+    lane.last_dwt_delta_cycles = dwt_delta;
+    lane.have_last_delta = true;
+  } else {
+    lane.seen_first_edge = true;
+    lane.dwt_total_cycles = 0;
+    lane.last_edge_dwt64 = 0;
+    rec.dwt_total_at_edge = 0;
+  }
+
+  lane.last_edge_dwt32 = dwt_at_isr;
+  lane.previous = lane.last;
+  lane.last = rec;
+  lane.edge_count++;
+
+  lane.next_target_total = target_total + OCXO_WITNESS_COUNTS_PER_SECOND;
+  lane.next_target_low16 = ocxo_witness_target_low16(lane, lane.next_target_total);
+  lane.compare_armed = false;
+}
+
+static void ocxo_witness_process_pending_lane(ocxo_witness_lane_t& lane) {
+  bool pending;
+  uint32_t dwt_at_isr;
+  uint16_t counter_low16_at_isr;
+  uint16_t target_low16;
+
+  noInterrupts();
+  pending = lane.irq_pending;
+  dwt_at_isr = lane.pending_dwt_at_isr;
+  counter_low16_at_isr = lane.pending_counter_low16_at_isr;
+  target_low16 = lane.pending_target_low16;
+  lane.irq_pending = false;
+  interrupts();
+
+  if (!pending) return;
+  ocxo_witness_complete_edge(lane, dwt_at_isr, counter_low16_at_isr, target_low16);
+}
+
+static void ocxo_witness_edge_asap_callback(timepop_ctx_t*, timepop_diag_t*, void*) {
+  g_ocxo_witness_edge_asap_requested = false;
+  g_ocxo_witness_edge_asap_count++;
+  vclock_witness_process_pending();
+  ocxo_witness_process_pending_lane(g_ocxo_witness_1);
+  ocxo_witness_process_pending_lane(g_ocxo_witness_2);
+}
+
+static void ocxo_witness_minder_callback(timepop_ctx_t*, timepop_diag_t*, void*) {
+  if (!g_ocxo_witness_running) return;
+
+  g_ocxo_witness_minder_fire_count++;
+  vclock_witness_tend();
+  ocxo_witness_tend_lane(g_ocxo_witness_1);
+  ocxo_witness_tend_lane(g_ocxo_witness_2);
+
+  if (++g_ocxo_witness_minder_divider >= OCXO_WITNESS_MINDER_PER_REPORT) {
+    g_ocxo_witness_minder_divider = 0;
+    g_ocxo_witness_publish_request_count++;
+
+    if (!g_ocxo_witness_publish_asap_requested) {
+      g_ocxo_witness_publish_asap_requested = true;
+      const timepop_handle_t h = timepop_arm_asap(ocxo_witness_publish_asap_callback,
+                                                  nullptr,
+                                                  OCXO_WITNESS_PUBLISH_ASAP_NAME);
+      if (h == TIMEPOP_INVALID_HANDLE) {
+        g_ocxo_witness_publish_asap_requested = false;
+        g_ocxo_witness_publish_asap_failures++;
+      }
+    }
+  }
+}
+
+static bool ocxo_witness_arm_minder(void) {
+  timepop_cancel_by_name(OCXO_WITNESS_MINDER_NAME);
+  const timepop_handle_t h =
+      timepop_arm_recurring_isr(OCXO_WITNESS_MINDER_PERIOD_NS,
+                                ocxo_witness_minder_callback,
+                                nullptr,
+                                OCXO_WITNESS_MINDER_NAME);
+  if (h == TIMEPOP_INVALID_HANDLE) {
+    g_ocxo_witness_minder_armed = false;
+    g_ocxo_witness_minder_arm_failures++;
+    return false;
+  }
+
+  g_ocxo_witness_minder_armed = true;
+  g_ocxo_witness_minder_arm_count++;
+  return true;
+}
+
+static uint8_t ocxo_witness_parse_lane_mask(const Payload& args) {
+  const char* lane = args.getString("lane");
+  if (lane && *lane) {
+    if (strcasecmp(lane, "1") == 0 || strcasecmp(lane, "ocxo1") == 0) {
+      return OCXO_WITNESS_LANE1_MASK;
+    }
+    if (strcasecmp(lane, "2") == 0 || strcasecmp(lane, "ocxo2") == 0) {
+      return OCXO_WITNESS_LANE2_MASK;
+    }
+    if (strcasecmp(lane, "both") == 0 || strcasecmp(lane, "all") == 0 ||
+        strcasecmp(lane, "12") == 0) {
+      return OCXO_WITNESS_BOTH_MASK;
+    }
+    return 0;
+  }
+
+  uint32_t lane_u32 = 0;
+  if (args.tryGetUInt("lane", lane_u32)) {
+    if (lane_u32 == 1) return OCXO_WITNESS_LANE1_MASK;
+    if (lane_u32 == 2) return OCXO_WITNESS_LANE2_MASK;
+    if (lane_u32 == 12 || lane_u32 == 0) return OCXO_WITNESS_BOTH_MASK;
+    return 0;
+  }
+
+  return OCXO_WITNESS_BOTH_MASK;
+}
+
+static Payload ocxo_witness_edge_payload(const ocxo_witness_edge_record_t& e) {
+  Payload p;
+  p.add("valid", e.valid);
+  p.add("delta_valid", e.delta_valid);
+  p.add("residual_valid", e.residual_valid);
+  p.add("sequence", e.sequence);
+  p.add("irq_count", e.irq_count);
+  p.add("clock_total_at_edge", e.ocxo_total_at_edge);
+  p.add("clock_total_at_event", e.ocxo_total_at_isr);
+  p.add("ocxo_total_at_edge", e.ocxo_total_at_edge);
+  p.add("ocxo_total_at_isr", e.ocxo_total_at_isr);
+  p.add("dwt_total_at_edge", e.dwt_total_at_edge);
+  p.add("dwt_at_edge", e.dwt_at_edge);
+  p.add("dwt_delta_cycles", e.dwt_delta_cycles);
+  p.add("dwt_pred_cycles", e.dwt_pred_cycles);
+  p.add("dwt_residual_cycles", e.dwt_residual_cycles);
+  p.add("target_low16", (uint32_t)e.target_low16);
+  p.add("counter_low16_at_isr", (uint32_t)e.counter_low16_at_isr);
+  p.add("service_offset_ticks", e.service_offset_ticks);
+  return p;
+}
+
+static Payload ocxo_witness_lane_payload(ocxo_witness_lane_t& lane,
+                                        bool consume_publish_marker = false) {
+  ocxo_witness_edge_record_t last;
+  ocxo_witness_edge_record_t previous;
+  welford_t delta_w;
+  welford_t residual_w;
+
+  noInterrupts();
+  last = lane.last;
+  previous = lane.previous;
+  delta_w = lane.dwt_delta_welford;
+  residual_w = lane.residual_welford;
+  const bool enabled = lane.enabled;
+  const bool initialized = lane.initialized;
+  const bool compare_armed = lane.compare_armed;
+  const bool irq_pending = lane.irq_pending;
+  const uint16_t hw16 = initialized ? ocxo_witness_counter_now(lane) : 0;
+  const uint16_t origin_low16 = lane.origin_low16;
+  const uint16_t last_hw16 = lane.last_hw16;
+  const uint64_t total_cycles = lane.total_cycles;
+  const uint64_t next_target_total = lane.next_target_total;
+  const uint16_t next_target_low16 = lane.next_target_low16;
+  const uint64_t dwt_total_cycles = lane.dwt_total_cycles;
+  const uint32_t start_count = lane.start_count;
+  const uint32_t stop_count = lane.stop_count;
+  const uint32_t edge_count = lane.edge_count;
+  const uint32_t irq_count = lane.irq_count;
+  const uint32_t false_irq_count = lane.false_irq_count;
+  const uint32_t pending_overwrite_count = lane.pending_overwrite_count;
+  const uint32_t asap_arm_failures = lane.asap_arm_failures;
+  const uint32_t arm_count = lane.arm_count;
+  const uint32_t arm_late_count = lane.arm_late_count;
+  const uint32_t missed_target_count = lane.missed_target_count;
+  const uint32_t rollover_update_count = lane.rollover_update_count;
+  const uint32_t large_delta_count = lane.large_delta_count;
+  const uint16_t largest_delta16 = lane.largest_delta16;
+  const bool new_since_last_publish = lane.edge_count != lane.last_published_edge_count;
+  if (consume_publish_marker) {
+    lane.last_published_edge_count = lane.edge_count;
+  }
+  interrupts();
+
+  Payload p;
+  p.add("name", lane.name ? lane.name : "");
+  p.add("enabled", enabled);
+  p.add("initialized", initialized);
+  p.add("module", ocxo_witness_module_name(lane));
+  p.add("channel", (uint32_t)lane.channel);
+  p.add("pcs", (uint32_t)lane.pcs);
+  p.add("pin", (uint32_t)lane.input_pin);
+  p.add("compare_armed", compare_armed);
+  p.add("irq_pending", irq_pending);
+  p.add("new_since_last_publish", new_since_last_publish);
+
+  p.add("origin_low16", (uint32_t)origin_low16);
+  p.add("hw16_now", (uint32_t)hw16);
+  p.add("last_hw16", (uint32_t)last_hw16);
+  p.add("total_cycles", total_cycles);
+  p.add("next_target_total", next_target_total);
+  p.add("next_target_low16", (uint32_t)next_target_low16);
+  p.add("dwt_total_cycles", dwt_total_cycles);
+
+  p.add("start_count", start_count);
+  p.add("stop_count", stop_count);
+  p.add("edge_count", edge_count);
+  p.add("irq_count", irq_count);
+  p.add("false_irq_count", false_irq_count);
+  p.add("pending_overwrite_count", pending_overwrite_count);
+  p.add("asap_arm_failures", asap_arm_failures);
+  p.add("arm_count", arm_count);
+  p.add("arm_late_count", arm_late_count);
+  p.add("missed_target_count", missed_target_count);
+  p.add("rollover_update_count", rollover_update_count);
+  p.add("large_delta_count", large_delta_count);
+  p.add("largest_delta16", (uint32_t)largest_delta16);
+
+  p.add_object("last", ocxo_witness_edge_payload(last));
+  p.add_object("previous", ocxo_witness_edge_payload(previous));
+  p.add_object("dwt_delta_welford", welford_payload(delta_w));
+  p.add_object("residual_welford", welford_payload(residual_w));
+  return p;
+}
+
+static Payload vclock_witness_edge_payload(const vclock_witness_edge_record_t& e) {
+  Payload p;
+  p.add("valid", e.valid);
+  p.add("delta_valid", e.delta_valid);
+  p.add("residual_valid", e.residual_valid);
+  p.add("sequence", e.sequence);
+  p.add("irq_count", e.irq_count);
+  p.add("clock_total_at_edge", e.clock_total_at_edge);
+  p.add("clock_total_at_event", e.clock_total_at_event);
+  p.add("vclock_total_at_edge", e.clock_total_at_edge);
+  p.add("vclock_total_at_event", e.clock_total_at_event);
+  p.add("dwt_total_at_edge", e.dwt_total_at_edge);
+  p.add("target_counter32", e.target_counter32);
+  p.add("counter32_at_event", e.counter32_at_event);
+  p.add("counter32_residual_ticks", e.counter32_residual_ticks);
+  p.add("isr_entry_dwt_raw", e.isr_entry_dwt_raw);
+  p.add("dwt_at_edge", e.dwt_at_edge);
+  p.add("gnss_ns_at_event", e.gnss_ns_at_event);
+  p.add("dwt_delta_cycles", e.dwt_delta_cycles);
+  p.add("dwt_pred_cycles", e.dwt_pred_cycles);
+  p.add("dwt_residual_cycles", e.dwt_residual_cycles);
+  p.add("service_offset_ticks", e.service_offset_ticks);
+  return p;
+}
+
+static Payload vclock_witness_lane_payload(bool consume_publish_marker = false) {
+  vclock_witness_edge_record_t last;
+  vclock_witness_edge_record_t previous;
+  welford_t delta_w;
+  welford_t residual_w;
+
+  noInterrupts();
+  last = g_vclock_witness.last;
+  previous = g_vclock_witness.previous;
+  delta_w = g_vclock_witness.dwt_delta_welford;
+  residual_w = g_vclock_witness.residual_welford;
+  const bool enabled = g_vclock_witness.enabled;
+  const bool initialized = g_vclock_witness.initialized;
+  const bool compare_armed = g_vclock_witness.compare_armed;
+  const bool irq_pending = g_vclock_witness.irq_pending;
+  const bool handler_registered = g_vclock_witness.handler_registered;
+  const uint32_t origin_counter32 = g_vclock_witness.origin_counter32;
+  const uint32_t next_target_counter32 = g_vclock_witness.next_target_counter32;
+  const uint64_t next_target_total = g_vclock_witness.next_target_total;
+  const uint32_t first_delay_ticks = g_vclock_witness.first_target_delay_ticks;
+  const uint64_t dwt_total_cycles = g_vclock_witness.dwt_total_cycles;
+  const uint32_t start_count = g_vclock_witness.start_count;
+  const uint32_t stop_count = g_vclock_witness.stop_count;
+  const uint32_t edge_count = g_vclock_witness.edge_count;
+  const uint32_t irq_count = g_vclock_witness.irq_count;
+  const uint32_t false_irq_count = g_vclock_witness.false_irq_count;
+  const uint32_t pending_overwrite_count = g_vclock_witness.pending_overwrite_count;
+  const uint32_t asap_arm_failures = g_vclock_witness.asap_arm_failures;
+  const uint32_t arm_count = g_vclock_witness.arm_count;
+  const uint32_t arm_failures = g_vclock_witness.arm_failures;
+  const uint32_t arm_late_count = g_vclock_witness.arm_late_count;
+  const uint32_t missed_target_count = g_vclock_witness.missed_target_count;
+  const uint32_t tend_count = g_vclock_witness.tend_count;
+  const uint32_t last_arm_remaining_ticks = g_vclock_witness.last_arm_remaining_ticks;
+  const uint32_t last_arm_now_counter32 = g_vclock_witness.last_arm_now_counter32;
+  const bool new_since_last_publish =
+      g_vclock_witness.edge_count != g_vclock_witness.last_published_edge_count;
+  if (consume_publish_marker) {
+    g_vclock_witness.last_published_edge_count = g_vclock_witness.edge_count;
+  }
+  interrupts();
+
+  const uint32_t counter32_now = initialized
+      ? interrupt_vclock_counter32_observe_ambient()
+      : 0;
+
+  Payload p;
+  p.add("name", "VCLOCK");
+  p.add("enabled", enabled);
+  p.add("initialized", initialized);
+  p.add("module", "QTIMER1");
+  p.add("channel", (uint32_t)1);
+  p.add("hardware_lane", "QTIMER1_CH1_COMP_HOSTED");
+  p.add("counter_source", "QTIMER1_CH0_SYNTHETIC_COUNTER32");
+  p.add("compare_armed", compare_armed);
+  p.add("irq_pending", irq_pending);
+  p.add("handler_registered", handler_registered);
+  p.add("new_since_last_publish", new_since_last_publish);
+
+  p.add("origin_counter32", origin_counter32);
+  p.add("counter32_now", counter32_now);
+  p.add("next_target_counter32", next_target_counter32);
+  p.add("next_target_total", next_target_total);
+  p.add("first_delay_ticks", first_delay_ticks);
+  p.add("dwt_total_cycles", dwt_total_cycles);
+
+  p.add("start_count", start_count);
+  p.add("stop_count", stop_count);
+  p.add("edge_count", edge_count);
+  p.add("irq_count", irq_count);
+  p.add("false_irq_count", false_irq_count);
+  p.add("pending_overwrite_count", pending_overwrite_count);
+  p.add("asap_arm_failures", asap_arm_failures);
+  p.add("arm_count", arm_count);
+  p.add("arm_failures", arm_failures);
+  p.add("arm_late_count", arm_late_count);
+  p.add("missed_target_count", missed_target_count);
+  p.add("tend_count", tend_count);
+  p.add("last_arm_remaining_ticks", last_arm_remaining_ticks);
+  p.add("last_arm_now_counter32", last_arm_now_counter32);
+
+  p.add_object("last", vclock_witness_edge_payload(last));
+  p.add_object("previous", vclock_witness_edge_payload(previous));
+  p.add_object("dwt_delta_welford", welford_payload(delta_w));
+  p.add_object("residual_welford", welford_payload(residual_w));
+  return p;
+}
+
+static Payload ocxo_witness_state_payload(bool consume_publish_marker = false) {
+  Payload p;
+  p.add("running", g_ocxo_witness_running);
+  p.add("active_mask", (uint32_t)g_ocxo_witness_active_mask);
+  p.add("vclock_active", g_vclock_witness.enabled);
+  p.add("vector_mask", (uint32_t)g_ocxo_witness_vector_mask);
+  p.add("vectors_installed", g_ocxo_witness_vector_mask != 0);
+  p.add("minder_armed", g_ocxo_witness_minder_armed);
+  p.add("minder_period_ns", OCXO_WITNESS_MINDER_PERIOD_NS);
+  p.add("minder_per_report", OCXO_WITNESS_MINDER_PER_REPORT);
+  p.add("arm_window_ticks", OCXO_WITNESS_ARM_WINDOW_TICKS);
+  p.add("start_count", g_ocxo_witness_start_count);
+  p.add("stop_count", g_ocxo_witness_stop_count);
+  p.add("minder_fire_count", g_ocxo_witness_minder_fire_count);
+  p.add("minder_arm_count", g_ocxo_witness_minder_arm_count);
+  p.add("minder_arm_failures", g_ocxo_witness_minder_arm_failures);
+  p.add("publish_request_count", g_ocxo_witness_publish_request_count);
+  p.add("publish_count", g_ocxo_witness_publish_count);
+  p.add("publish_asap_failures", g_ocxo_witness_publish_asap_failures);
+  p.add("edge_asap_count", g_ocxo_witness_edge_asap_count);
+  p.add_object("vclock", vclock_witness_lane_payload(consume_publish_marker));
+  p.add_object("ocxo1", ocxo_witness_lane_payload(g_ocxo_witness_1, consume_publish_marker));
+  p.add_object("ocxo2", ocxo_witness_lane_payload(g_ocxo_witness_2, consume_publish_marker));
+  return p;
+}
+
+static void ocxo_witness_publish_asap_callback(timepop_ctx_t*, timepop_diag_t*, void*) {
+  g_ocxo_witness_publish_asap_requested = false;
+  g_ocxo_witness_publish_count++;
+
+  Payload p;
+  p.add("model", "CLOCK_EDGE_TO_EDGE_DWT_CYCLES");
+  p.add("historical", true);
+  p.add("counts_per_second", OCXO_WITNESS_COUNTS_PER_SECOND);
+  p.add("topic_replaces", "OCXO_WITNESS");
+  p.add_object("state", ocxo_witness_state_payload(true));
+  publish(CLOCK_WITNESS_TOPIC, p);
+}
+
+static void ocxo_witness_stop_mask(uint8_t mask) {
+  if (mask & OCXO_WITNESS_LANE1_MASK) ocxo_witness_stop_lane(g_ocxo_witness_1);
+  if (mask & OCXO_WITNESS_LANE2_MASK) ocxo_witness_stop_lane(g_ocxo_witness_2);
+
+  uint8_t active = 0;
+  if (g_ocxo_witness_1.enabled) active |= OCXO_WITNESS_LANE1_MASK;
+  if (g_ocxo_witness_2.enabled) active |= OCXO_WITNESS_LANE2_MASK;
+  g_ocxo_witness_active_mask = active;
+  g_ocxo_witness_running = clock_witness_any_active();
+
+  ocxo_witness_release_vectors(mask);
+  clock_witness_cancel_deferred_if_idle();
+}
+
+static Payload cmd_ocxo_start(const Payload& args) {
+  const uint8_t mask = ocxo_witness_parse_lane_mask(args);
+  Payload p;
+  p.add("model", "OCXO_EDGE_TO_EDGE_DWT_CYCLES");
+  p.add("publish_topic", CLOCK_WITNESS_TOPIC);
+  p.add("requires_process_interrupt_defeated", true);
+
+  if (mask == 0) {
+    p.add("status", "error");
+    p.add("error", "invalid lane; use lane=1, lane=2, or lane=both");
+    return p;
+  }
+
+  ocxo_witness_bind_lanes();
+  ocxo_witness_stop_mask(g_ocxo_witness_active_mask);
+  ocxo_witness_install_vectors(mask);
+
+  g_ocxo_witness_start_count++;
+  g_ocxo_witness_active_mask = mask;
+  g_ocxo_witness_minder_fire_count = 0;
+  g_ocxo_witness_minder_divider = 0;
+  g_ocxo_witness_publish_request_count = 0;
+  g_ocxo_witness_publish_count = 0;
+  g_ocxo_witness_publish_asap_failures = 0;
+  g_ocxo_witness_edge_asap_count = 0;
+
+  if (mask & OCXO_WITNESS_LANE1_MASK) ocxo_witness_start_lane(g_ocxo_witness_1);
+  if (mask & OCXO_WITNESS_LANE2_MASK) ocxo_witness_start_lane(g_ocxo_witness_2);
+
+  g_ocxo_witness_running = clock_witness_any_active();
+  const bool minder_ok = g_ocxo_witness_minder_armed || ocxo_witness_arm_minder();
+
+  p.add("status", g_ocxo_witness_running && minder_ok ? "started" : "error");
+  p.add("lane_mask", (uint32_t)mask);
+  p.add("minder_ok", minder_ok);
+  p.add_object("state", ocxo_witness_state_payload());
+  return p;
+}
+
+static Payload cmd_ocxo_stop(const Payload& args) {
+  uint8_t mask = ocxo_witness_parse_lane_mask(args);
+  if (mask == 0) mask = OCXO_WITNESS_BOTH_MASK;
+
+  g_ocxo_witness_stop_count++;
+  ocxo_witness_stop_mask(mask);
+
+  Payload p;
+  p.add("model", "OCXO_EDGE_TO_EDGE_DWT_CYCLES");
+  p.add("publish_topic", CLOCK_WITNESS_TOPIC);
+  p.add("status", "stopped");
+  p.add("lane_mask", (uint32_t)mask);
+  p.add_object("state", ocxo_witness_state_payload());
+  return p;
+}
+
+static uint32_t vclock_witness_first_delay_from_args(const Payload& args) {
+  uint32_t first_delay = VCLOCK_WITNESS_FIRST_TARGET_DELAY_TICKS;
+  (void)args.tryGetUInt("first_delay_ticks", first_delay);
+  (void)args.tryGetUInt("delay_ticks", first_delay);
+  (void)args.tryGetUInt("offset_ticks", first_delay);
+
+  if (first_delay == 0 || first_delay > 0x7FFFFFFFUL) {
+    first_delay = VCLOCK_WITNESS_FIRST_TARGET_DELAY_TICKS;
+  }
+  return first_delay;
+}
+
+static Payload cmd_vclock_start(const Payload& args) {
+  Payload p;
+  p.add("model", "VCLOCK_CH1_EDGE_TO_EDGE_DWT_CYCLES");
+  p.add("publish_topic", CLOCK_WITNESS_TOPIC);
+  p.add("uses_process_interrupt_hosted_ch1", true);
+  p.add("vclock_ch2_untouched", true);
+
+  interrupt_qtimer1_ch1_disable_compare();
+  interrupt_register_qtimer1_ch1_handler(nullptr);
+  vclock_witness_reset_runtime();
+  g_vclock_witness.start_count++;
+
+  const uint32_t first_delay = vclock_witness_first_delay_from_args(args);
+  const uint32_t now = interrupt_vclock_counter32_observe_ambient();
+
+  g_vclock_witness.enabled = true;
+  g_vclock_witness.initialized = true;
+  g_vclock_witness.handler_registered = true;
+  g_vclock_witness.origin_counter32 = now;
+  g_vclock_witness.first_target_delay_ticks = first_delay;
+  g_vclock_witness.next_target_total = first_delay;
+  g_vclock_witness.next_target_counter32 = now + first_delay;
+
+  interrupt_register_qtimer1_ch1_handler(vclock_witness_ch1_handler);
+
+  g_ocxo_witness_running = clock_witness_any_active();
+  const bool minder_ok = g_ocxo_witness_minder_armed || ocxo_witness_arm_minder();
+
+  p.add("status", minder_ok ? "started" : "error");
+  p.add("first_delay_ticks", first_delay);
+  p.add("origin_counter32", now);
+  p.add("first_target_counter32", g_vclock_witness.next_target_counter32);
+  p.add("minder_ok", minder_ok);
+  p.add_object("state", ocxo_witness_state_payload());
+  return p;
+}
+
+static Payload cmd_vclock_stop(const Payload&) {
+  const bool was_active = g_vclock_witness.enabled ||
+                          g_vclock_witness.compare_armed ||
+                          g_vclock_witness.irq_pending ||
+                          g_vclock_witness.handler_registered;
+
+  interrupt_qtimer1_ch1_disable_compare();
+  interrupt_register_qtimer1_ch1_handler(nullptr);
+
+  g_vclock_witness.enabled = false;
+  g_vclock_witness.compare_armed = false;
+  g_vclock_witness.irq_pending = false;
+  g_vclock_witness.handler_registered = false;
+  if (was_active) g_vclock_witness.stop_count++;
+
+  g_ocxo_witness_running = clock_witness_any_active();
+  clock_witness_cancel_deferred_if_idle();
+
+  Payload p;
+  p.add("model", "VCLOCK_CH1_EDGE_TO_EDGE_DWT_CYCLES");
+  p.add("publish_topic", CLOCK_WITNESS_TOPIC);
+  p.add("status", "stopped");
+  p.add_object("state", ocxo_witness_state_payload());
+  return p;
 }
 
 // ============================================================================
@@ -834,6 +2169,8 @@ static Payload witness_state_payload(void) {
   entry.add("pps_timeout_count", g_entry_pps.timeout_count);
   entry.add("pps_samples", g_entry_pps.sample_count);
   p.add_object("entry_latency", entry);
+
+  p.add_object("clock_witness", ocxo_witness_state_payload());
 
   return p;
 }
@@ -1410,9 +2747,31 @@ void process_witness_init(void) {
   welford_reset(g_bridge_residual_welford);
   welford_reset(g_bridge_dynamic_residual_welford);
 
+  ocxo_witness_bind_lanes();
+  ocxo_witness_lane_reset_runtime(g_ocxo_witness_1);
+  ocxo_witness_lane_reset_runtime(g_ocxo_witness_2);
+  g_ocxo_witness_running = false;
+  g_ocxo_witness_active_mask = 0;
+  g_ocxo_witness_minder_armed = false;
+  g_ocxo_witness_edge_asap_requested = false;
+  g_ocxo_witness_publish_asap_requested = false;
+  g_ocxo_witness_vector_mask = 0;
+  g_ocxo_witness_start_count = 0;
+  g_ocxo_witness_stop_count = 0;
+  g_ocxo_witness_minder_fire_count = 0;
+  g_ocxo_witness_minder_arm_count = 0;
+  g_ocxo_witness_minder_arm_failures = 0;
+  g_ocxo_witness_minder_divider = 0;
+  g_ocxo_witness_publish_request_count = 0;
+  g_ocxo_witness_publish_count = 0;
+  g_ocxo_witness_publish_asap_failures = 0;
+  g_ocxo_witness_edge_asap_count = 0;
+  vclock_witness_reset_runtime();
+
   // Witness is always-on.  PPS entry latency remains a true low-level
-  // witness hook; BRIDGE/PPS_PHASE are ordinary TimePop clients and do not
-  // register any QTimer1 CH1 handler.
+  // witness hook; BRIDGE/PPS_PHASE are ordinary TimePop clients.  The
+  // optional VCLOCK witness registers QTimer1 CH1 only while VCLOCK_START
+  // is active.
   interrupt_register_pps_entry_latency_handler(entry_latency_pps_isr_handler);
 
   digitalWriteFast(WITNESS_STIMULUS_PIN, LOW);
@@ -1444,6 +2803,10 @@ static const process_command_entry_t WITNESS_COMMANDS[] = {
   { "DWT_READ",    cmd_dwt_read    },
   { "ENTRY_LATENCY", cmd_entry_latency },
   { "ROUND_TRIP",  cmd_round_trip  },
+  { "OCXO_START",  cmd_ocxo_start  },
+  { "OCXO_STOP",   cmd_ocxo_stop   },
+  { "VCLOCK_START", cmd_vclock_start },
+  { "VCLOCK_STOP",  cmd_vclock_stop  },
   { nullptr,      nullptr        }
 };
 

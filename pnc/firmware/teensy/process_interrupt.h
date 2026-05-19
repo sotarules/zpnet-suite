@@ -10,6 +10,17 @@
 //   • TimePop       (QTimer1 CH2, hosted scheduler/client rail)
 //   • PPS GPIO edge (diagnostics + dispatch authority + epoch anchor)
 //
+// External OCXO ownership commands:
+//   • INTERRUPT.OCXO_STOP  lane=OCXO1|OCXO2|both
+//       Releases selected OCXO hardware lane(s) to an external owner such as
+//       process_witness.  The selected QTimer compare is disabled, the QTimer
+//       vector is disabled by process_interrupt, cadence-minder OCXO reads are
+//       suppressed, and PPS epoch capture stops sampling that lane.
+//   • INTERRUPT.OCXO_START lane=OCXO1|OCXO2|both
+//       Reclaims selected OCXO hardware lane(s), restores the normal QTimer
+//       mapping/vector, and reboots process_interrupt's local OCXO synthetic
+//       counter anchor from the current hardware low word.
+//
 // QTimer1 vector custody:
 //
 //   QTimer1 has a single shared IRQ vector across all four channels.
@@ -597,6 +608,15 @@ void process_interrupt_register(void);
 bool interrupt_subscribe(const interrupt_subscription_t& sub);
 bool interrupt_start(interrupt_subscriber_kind_t kind);
 bool interrupt_stop(interrupt_subscriber_kind_t kind);
+
+// OCXO hardware ownership gate for the process_witness stripped-down OCXO
+// experiment. Releasing a lane disables process_interrupt compare ownership,
+// suppresses cadence-minder hardware reads for that lane, and allows another
+// module to attach the corresponding QTimer vector/registers. Reclaiming a
+// lane restores the normal process_interrupt QTimer configuration/vector.
+bool interrupt_ocxo_release(interrupt_subscriber_kind_t kind);
+bool interrupt_ocxo_reclaim(interrupt_subscriber_kind_t kind);
+bool interrupt_ocxo_owned_by_interrupt(interrupt_subscriber_kind_t kind);
 
 // ── PPS-anchored epoch installation ──
 //
