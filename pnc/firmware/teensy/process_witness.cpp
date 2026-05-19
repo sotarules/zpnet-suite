@@ -406,7 +406,8 @@ static welford_t g_bridge_dynamic_residual_welford = {};
 static constexpr uint32_t OCXO_WITNESS_COUNTS_PER_SECOND = 10000000U;
 static constexpr uint32_t OCXO_WITNESS_MINDER_PERIOD_NS = 1000000U;  // 1 ms
 static constexpr uint32_t OCXO_WITNESS_MINDER_PER_REPORT = 1000U;
-static constexpr uint32_t OCXO_WITNESS_ARM_WINDOW_TICKS = 50000U;
+static constexpr uint32_t OCXO_WITNESS_ARM_WINDOW_TICKS = 20000U;
+static constexpr uint32_t OCXO_WITNESS_MIN_ARM_LEAD_TICKS = 64U;
 static constexpr uint16_t OCXO_WITNESS_LARGE_DELTA16_TICKS = 50000U;
 static constexpr const char* OCXO_WITNESS_MINDER_NAME = "CLOCK_WITNESS_MINDER";
 static constexpr const char* OCXO_WITNESS_EDGE_ASAP_NAME = "CLOCK_WITNESS_EDGE_ASAP";
@@ -467,7 +468,10 @@ struct ocxo_witness_lane_t {
   volatile uint32_t pending_dwt_at_isr = 0;
   volatile uint16_t pending_counter_low16_at_isr = 0;
   volatile uint16_t pending_target_low16 = 0;
+  volatile uint64_t pending_target_total = 0;
 
+  uint64_t armed_target_total = 0;
+  uint16_t armed_target_low16 = 0;
   uint16_t origin_low16 = 0;
   uint16_t last_hw16 = 0;
   uint64_t total_cycles = 0;
@@ -863,7 +867,6 @@ static void vclock_witness_process_pending(void) {
   isr_entry_dwt_raw = g_vclock_witness.pending_isr_entry_dwt_raw;
   dwt_at_event = g_vclock_witness.pending_dwt_at_event;
   gnss_ns_at_event = g_vclock_witness.pending_gnss_ns_at_event;
-  g_vclock_witness.irq_pending = false;
   interrupts();
 
   if (!pending) return;
@@ -874,6 +877,10 @@ static void vclock_witness_process_pending(void) {
                                isr_entry_dwt_raw,
                                dwt_at_event,
                                gnss_ns_at_event);
+
+  noInterrupts();
+  g_vclock_witness.irq_pending = false;
+  interrupts();
 }
 
 static void vclock_witness_ch1_handler(const interrupt_qtimer1_ch1_compare_event_t& event) {
@@ -929,18 +936,69 @@ static void ocxo_witness_bind_lanes(void) {
   g_ocxo_witness_2.mask = OCXO_WITNESS_LANE2_MASK;
 }
 
+static inline void ocxo_witness_disable_lane_irq(ocxo_witness_lane_t& lane) {
+  if (lane.module == &IMXRT_TMR2) {
+    NVIC_DISABLE_IRQ(IRQ_QTIMER2);
+#if defined(NVIC_CLEAR_PENDING)
+    NVIC_CLEAR_PENDING(IRQ_QTIMER2);
+#endif
+  } else if (lane.module == &IMXRT_TMR3) {
+    NVIC_DISABLE_IRQ(IRQ_QTIMER3);
+#if defined(NVIC_CLEAR_PENDING)
+    NVIC_CLEAR_PENDING(IRQ_QTIMER3);
+#endif
+  }
+}
+
+static inline void ocxo_witness_enable_lane_irq(ocxo_witness_lane_t& lane) {
+  if (lane.module == &IMXRT_TMR2) {
+#if defined(NVIC_CLEAR_PENDING)
+    NVIC_CLEAR_PENDING(IRQ_QTIMER2);
+#endif
+    NVIC_SET_PRIORITY(IRQ_QTIMER2, 16);
+    NVIC_ENABLE_IRQ(IRQ_QTIMER2);
+  } else if (lane.module == &IMXRT_TMR3) {
+#if defined(NVIC_CLEAR_PENDING)
+    NVIC_CLEAR_PENDING(IRQ_QTIMER3);
+#endif
+    NVIC_SET_PRIORITY(IRQ_QTIMER3, 16);
+    NVIC_ENABLE_IRQ(IRQ_QTIMER3);
+  }
+}
+
+static inline void ocxo_witness_disable_qtimer_channel(ocxo_witness_lane_t& lane) {
+  if (lane.module == &IMXRT_TMR2) {
+    IMXRT_TMR2.ENBL &= (uint16_t)~(uint16_t)(1U << lane.channel);
+  } else if (lane.module == &IMXRT_TMR3) {
+    IMXRT_TMR3.ENBL &= (uint16_t)~(uint16_t)(1U << lane.channel);
+  }
+}
+
+static inline void ocxo_witness_enable_qtimer_channel(ocxo_witness_lane_t& lane) {
+  if (lane.module == &IMXRT_TMR2) {
+    IMXRT_TMR2.ENBL |= (uint16_t)(1U << lane.channel);
+  } else if (lane.module == &IMXRT_TMR3) {
+    IMXRT_TMR3.ENBL |= (uint16_t)(1U << lane.channel);
+  }
+}
+
 static inline void ocxo_witness_clear_compare_flag(ocxo_witness_lane_t& lane) {
   lane.module->CH[lane.channel].CSCTRL &= ~(TMR_CSCTRL_TCF1 | TMR_CSCTRL_TCF2);
+  (void)lane.module->CH[lane.channel].CSCTRL;
 }
 
 static inline void ocxo_witness_disable_compare(ocxo_witness_lane_t& lane) {
   lane.module->CH[lane.channel].CSCTRL &= ~TMR_CSCTRL_TCF1EN;
   ocxo_witness_clear_compare_flag(lane);
+  ocxo_witness_clear_compare_flag(lane);
   lane.compare_armed = false;
 }
 
 static inline void ocxo_witness_program_compare(ocxo_witness_lane_t& lane,
+                                                uint64_t target_total,
                                                 uint16_t target_low16) {
+  lane.armed_target_total = target_total;
+  lane.armed_target_low16 = target_low16;
   ocxo_witness_clear_compare_flag(lane);
   lane.module->CH[lane.channel].COMP1  = target_low16;
   lane.module->CH[lane.channel].CMPLD1 = target_low16;
@@ -972,7 +1030,10 @@ static void ocxo_witness_lane_reset_runtime(ocxo_witness_lane_t& lane) {
   lane.pending_dwt_at_isr = 0;
   lane.pending_counter_low16_at_isr = 0;
   lane.pending_target_low16 = 0;
+  lane.pending_target_total = 0;
 
+  lane.armed_target_total = 0;
+  lane.armed_target_low16 = 0;
   lane.origin_low16 = 0;
   lane.last_hw16 = 0;
   lane.total_cycles = 0;
@@ -1003,6 +1064,12 @@ static void ocxo_witness_lane_reset_runtime(ocxo_witness_lane_t& lane) {
 }
 
 static void ocxo_witness_configure_hw_lane(ocxo_witness_lane_t& lane) {
+  // Match process_interrupt's custody discipline: the selected channel is
+  // stopped before any register is rewritten, compare state is cleared twice,
+  // and the NVIC pending debt is cleared before witness exposes its vector.
+  ocxo_witness_disable_lane_irq(lane);
+  ocxo_witness_disable_qtimer_channel(lane);
+
   if (lane.module == &IMXRT_TMR2) {
     CCM_CCGR6 |= CCM_CCGR6_QTIMER2(CCM_CCGR_ON);
     *(portConfigRegister(lane.input_pin)) = 1;
@@ -1023,12 +1090,8 @@ static void ocxo_witness_configure_hw_lane(ocxo_witness_lane_t& lane) {
   lane.module->CH[lane.channel].CMPLD2 = 0;
   lane.module->CH[lane.channel].CTRL   = TMR_CTRL_CM(1) | TMR_CTRL_PCS(lane.pcs);
   ocxo_witness_disable_compare(lane);
-
-  if (lane.module == &IMXRT_TMR2) {
-    IMXRT_TMR2.ENBL |= (uint16_t)(1U << lane.channel);
-  } else if (lane.module == &IMXRT_TMR3) {
-    IMXRT_TMR3.ENBL |= (uint16_t)(1U << lane.channel);
-  }
+  ocxo_witness_enable_qtimer_channel(lane);
+  ocxo_witness_clear_compare_flag(lane);
 
   lane.initialized = true;
 }
@@ -1050,7 +1113,8 @@ static void ocxo_witness_qtimer2_isr(void) {
   if (lane.irq_pending) lane.pending_overwrite_count++;
   lane.pending_dwt_at_isr = dwt_raw;
   lane.pending_counter_low16_at_isr = counter_low16;
-  lane.pending_target_low16 = lane.next_target_low16;
+  lane.pending_target_low16 = lane.armed_target_low16;
+  lane.pending_target_total = lane.armed_target_total;
   lane.irq_pending = true;
   lane.irq_count++;
   ocxo_witness_disable_compare(lane);
@@ -1084,7 +1148,8 @@ static void ocxo_witness_qtimer3_isr(void) {
   if (lane.irq_pending) lane.pending_overwrite_count++;
   lane.pending_dwt_at_isr = dwt_raw;
   lane.pending_counter_low16_at_isr = counter_low16;
-  lane.pending_target_low16 = lane.next_target_low16;
+  lane.pending_target_low16 = lane.armed_target_low16;
+  lane.pending_target_total = lane.armed_target_total;
   lane.irq_pending = true;
   lane.irq_count++;
   ocxo_witness_disable_compare(lane);
@@ -1103,16 +1168,16 @@ static void ocxo_witness_qtimer3_isr(void) {
 
 static void ocxo_witness_install_vectors(uint8_t mask) {
   if (mask & OCXO_WITNESS_LANE1_MASK) {
+    ocxo_witness_clear_compare_flag(g_ocxo_witness_1);
     attachInterruptVector(IRQ_QTIMER2, ocxo_witness_qtimer2_isr);
-    NVIC_SET_PRIORITY(IRQ_QTIMER2, 16);
-    NVIC_ENABLE_IRQ(IRQ_QTIMER2);
+    ocxo_witness_enable_lane_irq(g_ocxo_witness_1);
     g_ocxo_witness_vector_mask |= OCXO_WITNESS_LANE1_MASK;
   }
 
   if (mask & OCXO_WITNESS_LANE2_MASK) {
+    ocxo_witness_clear_compare_flag(g_ocxo_witness_2);
     attachInterruptVector(IRQ_QTIMER3, ocxo_witness_qtimer3_isr);
-    NVIC_SET_PRIORITY(IRQ_QTIMER3, 16);
-    NVIC_ENABLE_IRQ(IRQ_QTIMER3);
+    ocxo_witness_enable_lane_irq(g_ocxo_witness_2);
     g_ocxo_witness_vector_mask |= OCXO_WITNESS_LANE2_MASK;
   }
 }
@@ -1121,14 +1186,14 @@ static void ocxo_witness_release_vectors(uint8_t mask) {
   if ((mask & OCXO_WITNESS_LANE1_MASK) &&
       (g_ocxo_witness_vector_mask & OCXO_WITNESS_LANE1_MASK) &&
       !g_ocxo_witness_1.enabled) {
-    NVIC_DISABLE_IRQ(IRQ_QTIMER2);
+    ocxo_witness_disable_lane_irq(g_ocxo_witness_1);
     g_ocxo_witness_vector_mask &= (uint8_t)~OCXO_WITNESS_LANE1_MASK;
   }
 
   if ((mask & OCXO_WITNESS_LANE2_MASK) &&
       (g_ocxo_witness_vector_mask & OCXO_WITNESS_LANE2_MASK) &&
       !g_ocxo_witness_2.enabled) {
-    NVIC_DISABLE_IRQ(IRQ_QTIMER3);
+    ocxo_witness_disable_lane_irq(g_ocxo_witness_2);
     g_ocxo_witness_vector_mask &= (uint8_t)~OCXO_WITNESS_LANE2_MASK;
   }
 }
@@ -1155,6 +1220,10 @@ static void ocxo_witness_stop_lane(ocxo_witness_lane_t& lane) {
   }
   lane.enabled = false;
   lane.irq_pending = false;
+  lane.pending_target_total = 0;
+  lane.pending_target_low16 = 0;
+  lane.armed_target_total = 0;
+  lane.armed_target_low16 = 0;
   if (was_active) lane.stop_count++;
 }
 
@@ -1202,21 +1271,25 @@ static void ocxo_witness_tend_lane(ocxo_witness_lane_t& lane) {
   }
 
   const uint64_t remaining = lane.next_target_total - lane.total_cycles;
+  if (remaining <= OCXO_WITNESS_MIN_ARM_LEAD_TICKS) {
+    lane.arm_late_count++;
+    return;
+  }
   if (remaining <= OCXO_WITNESS_ARM_WINDOW_TICKS) {
     lane.next_target_low16 = ocxo_witness_target_low16(lane, lane.next_target_total);
-    ocxo_witness_program_compare(lane, lane.next_target_low16);
+    ocxo_witness_program_compare(lane, lane.next_target_total, lane.next_target_low16);
   }
 }
 
 static void ocxo_witness_complete_edge(ocxo_witness_lane_t& lane,
                                        uint32_t dwt_at_isr,
                                        uint16_t counter_low16_at_isr,
+                                       uint64_t target_total,
                                        uint16_t target_low16) {
   if (!lane.enabled) return;
 
   ocxo_witness_update_total_from_hw16(lane, counter_low16_at_isr);
 
-  const uint64_t target_total = lane.next_target_total;
   const uint64_t total_at_isr = lane.total_cycles;
   const int32_t service_offset =
       clamp_i64_to_i32((int64_t)total_at_isr - (int64_t)target_total);
@@ -1274,18 +1347,31 @@ static void ocxo_witness_process_pending_lane(ocxo_witness_lane_t& lane) {
   bool pending;
   uint32_t dwt_at_isr;
   uint16_t counter_low16_at_isr;
+  uint64_t target_total;
   uint16_t target_low16;
 
   noInterrupts();
   pending = lane.irq_pending;
   dwt_at_isr = lane.pending_dwt_at_isr;
   counter_low16_at_isr = lane.pending_counter_low16_at_isr;
+  target_total = lane.pending_target_total;
   target_low16 = lane.pending_target_low16;
-  lane.irq_pending = false;
+  // Keep irq_pending true while the foreground edge author consumes the
+  // sample.  The 1 ms minder treats irq_pending as a custody barrier, so
+  // clearing it early lets the high-word extender run on a half-consumed
+  // compare and can make the next low-word target appear one 16-bit lap early.
   interrupts();
 
   if (!pending) return;
-  ocxo_witness_complete_edge(lane, dwt_at_isr, counter_low16_at_isr, target_low16);
+  if (target_total == 0) target_total = lane.next_target_total;
+  ocxo_witness_complete_edge(lane, dwt_at_isr, counter_low16_at_isr,
+                             target_total, target_low16);
+
+  noInterrupts();
+  lane.irq_pending = false;
+  lane.pending_target_total = 0;
+  lane.pending_target_low16 = 0;
+  interrupts();
 }
 
 static void ocxo_witness_edge_asap_callback(timepop_ctx_t*, timepop_diag_t*, void*) {
@@ -1366,6 +1452,23 @@ static uint8_t ocxo_witness_parse_lane_mask(const Payload& args) {
   return OCXO_WITNESS_BOTH_MASK;
 }
 
+static bool ocxo_witness_interrupt_owns_selected_lane(uint8_t mask, Payload& p) {
+  bool owned = false;
+  if (mask & OCXO_WITNESS_LANE1_MASK) {
+    const bool owns =
+        interrupt_ocxo_owned_by_interrupt(interrupt_subscriber_kind_t::OCXO1);
+    p.add("ocxo1_process_interrupt_owned", owns);
+    owned = owned || owns;
+  }
+  if (mask & OCXO_WITNESS_LANE2_MASK) {
+    const bool owns =
+        interrupt_ocxo_owned_by_interrupt(interrupt_subscriber_kind_t::OCXO2);
+    p.add("ocxo2_process_interrupt_owned", owns);
+    owned = owned || owns;
+  }
+  return owned;
+}
+
 static Payload ocxo_witness_edge_payload(const ocxo_witness_edge_record_t& e) {
   Payload p;
   p.add("valid", e.valid);
@@ -1410,6 +1513,10 @@ static Payload ocxo_witness_lane_payload(ocxo_witness_lane_t& lane,
   const uint64_t total_cycles = lane.total_cycles;
   const uint64_t next_target_total = lane.next_target_total;
   const uint16_t next_target_low16 = lane.next_target_low16;
+  const uint64_t armed_target_total = lane.armed_target_total;
+  const uint16_t armed_target_low16 = lane.armed_target_low16;
+  const uint64_t pending_target_total = lane.pending_target_total;
+  const uint16_t pending_target_low16 = lane.pending_target_low16;
   const uint64_t dwt_total_cycles = lane.dwt_total_cycles;
   const uint32_t start_count = lane.start_count;
   const uint32_t stop_count = lane.stop_count;
@@ -1448,6 +1555,10 @@ static Payload ocxo_witness_lane_payload(ocxo_witness_lane_t& lane,
   p.add("total_cycles", total_cycles);
   p.add("next_target_total", next_target_total);
   p.add("next_target_low16", (uint32_t)next_target_low16);
+  p.add("armed_target_total", armed_target_total);
+  p.add("armed_target_low16", (uint32_t)armed_target_low16);
+  p.add("pending_target_total", pending_target_total);
+  p.add("pending_target_low16", (uint32_t)pending_target_low16);
   p.add("dwt_total_cycles", dwt_total_cycles);
 
   p.add("start_count", start_count);
@@ -1595,6 +1706,7 @@ static Payload ocxo_witness_state_payload(bool consume_publish_marker = false) {
   p.add("minder_period_ns", OCXO_WITNESS_MINDER_PERIOD_NS);
   p.add("minder_per_report", OCXO_WITNESS_MINDER_PER_REPORT);
   p.add("arm_window_ticks", OCXO_WITNESS_ARM_WINDOW_TICKS);
+  p.add("min_arm_lead_ticks", OCXO_WITNESS_MIN_ARM_LEAD_TICKS);
   p.add("start_count", g_ocxo_witness_start_count);
   p.add("stop_count", g_ocxo_witness_stop_count);
   p.add("minder_fire_count", g_ocxo_witness_minder_fire_count);
@@ -1652,7 +1764,14 @@ static Payload cmd_ocxo_start(const Payload& args) {
 
   ocxo_witness_bind_lanes();
   ocxo_witness_stop_mask(g_ocxo_witness_active_mask);
-  ocxo_witness_install_vectors(mask);
+
+  if (ocxo_witness_interrupt_owns_selected_lane(mask, p)) {
+    p.add("status", "error");
+    p.add("error", "selected OCXO lane is still owned by process_interrupt; run INTERRUPT.OCXO_STOP first");
+    p.add("lane_mask", (uint32_t)mask);
+    p.add_object("state", ocxo_witness_state_payload());
+    return p;
+  }
 
   g_ocxo_witness_start_count++;
   g_ocxo_witness_active_mask = mask;
@@ -1663,8 +1782,13 @@ static Payload cmd_ocxo_start(const Payload& args) {
   g_ocxo_witness_publish_asap_failures = 0;
   g_ocxo_witness_edge_asap_count = 0;
 
+  // Configure the selected hardware lanes with their QTimer vectors disabled.
+  // Only after the registers and runtime state are coherent do we expose the
+  // IRQ vector.  This mirrors process_interrupt's disable/configure/enable
+  // custody sequence and removes stale-pending compare debt from the handoff.
   if (mask & OCXO_WITNESS_LANE1_MASK) ocxo_witness_start_lane(g_ocxo_witness_1);
   if (mask & OCXO_WITNESS_LANE2_MASK) ocxo_witness_start_lane(g_ocxo_witness_2);
+  ocxo_witness_install_vectors(mask);
 
   g_ocxo_witness_running = clock_witness_any_active();
   const bool minder_ok = g_ocxo_witness_minder_armed || ocxo_witness_arm_minder();

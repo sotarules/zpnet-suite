@@ -16,6 +16,8 @@
 //   • OCXO_START / OCXO_STOP temporarily take over the OCXO timer lanes
 //   • VCLOCK_START / VCLOCK_STOP use process_interrupt-hosted QTimer1 CH1
 //   • OCXO mode is only for branches where process_interrupt has been defeated
+//   • OCXO_START refuses a lane that process_interrupt still owns
+//   • witness configures OCXO QTimer channels with IRQs/channel disabled first
 //   • QTimer compare handlers only latch edge facts and request TimePop ASAP work
 //   • all test lanes publish historical interval facts on CLOCK_WITNESS
 //
