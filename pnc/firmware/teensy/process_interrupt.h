@@ -5,7 +5,7 @@
 // Interrupt custody and low-word counter cadence:
 //
 //   • Cadence minder (single TimePop client tending all 16-bit counters)
-//   • OCXO lanes    (QTimer3 CH3 / pin 15 for OCXO1, QTimer2 CH0 / pin 13 for OCXO2; currently still event rails)
+//   • OCXO lanes    (QTimer2 CH0 for OCXO1, QTimer3 CH3 for OCXO2; currently still event rails)
 //   • VCLOCK lane   (critical recurring TimePop client on QTimer1 CH2)
 //   • TimePop       (QTimer1 CH2, hosted scheduler/client rail)
 //   • PPS GPIO edge (diagnostics + dispatch authority + epoch anchor)
@@ -126,8 +126,8 @@
 //              the passive low-word VCLOCK counter; QTimer1 CH2 is the only
 //              active TimePop compare rail.
 //     MINDER : TimePop recurring 1 ms client, tends VCLOCK/OCXO low-word counters
-//     OCXO1  : QTimer3 CH3 compare on pin 15, event rail retained for current one-second events
-//     OCXO2  : QTimer2 CH0 compare on pin 13, event rail retained for current one-second events
+//     OCXO1  : QTimer2 CH0 compare, event rail retained for current one-second events
+//     OCXO2  : QTimer3 CH3 compare, event rail retained for current one-second events
 // ============================================================================
 
 #pragma once
@@ -534,8 +534,8 @@ bool interrupt_last_epoch_capture(interrupt_epoch_capture_t* out);
 // non-zero at PPS/VCLOCK zero.  It then passes the first physical witness
 // targets to process_interrupt:
 //
-//   OCXO1 (QTimer3 CH3 / pin 15): PPS/VCLOCK zero + 250,500 us
-//   OCXO2 (QTimer2 CH0 / pin 13): PPS/VCLOCK zero + 750,500 us
+//   OCXO1: PPS/VCLOCK zero + 250,500 us
+//   OCXO2: PPS/VCLOCK zero + 750,500 us
 //
 // If the requested first target is already behind the current passive OCXO
 // observation, the cadence minder advances the target by exact 10 MHz seconds

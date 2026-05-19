@@ -36,9 +36,9 @@ static constexpr uint64_t NS_PER_MICROSECOND = 1000ULL;
 // for ISR-level residual computation and PPS edge validation.
 //
 // All three domains count at 10 MHz (100 ns per tick):
-//   GNSS VCLOCK on QTimer1 CH0 (single-edge, CM=1), pin 10
-//   OCXO1 on QTimer3 CH3 (single-edge, CM=1), pin 15
-//   OCXO2 on QTimer2 CH0 (single-edge, CM=1), pin 13
+//   GNSS VCLOCK on QTimer1 ch0+ch1 (single-edge, CM=1)
+//   OCXO1 on GPT1 (single-edge)
+//   OCXO2 on GPT2 (single-edge)
 //
 
 // Expected ticks per PPS second at 10 MHz
@@ -109,8 +109,7 @@ static const int PHOTODIODE_ANALOG_PIN = 22;
 //
 // GNSS_VCLK_PIN:
 //   10 MHz VCLOCK square wave from GF-8802 (pin 10)
-//   Counted by QTimer1 CH0 (single-edge, 100 ns per tick).
-//   QTimer1 CH1/CH2 are hosted compare/scheduler rails, not external inputs.
+//   Counted by QTimer1 ch0+ch1 (single-edge, 100 ns per tick)
 //
 // GNSS_LOCK_PIN:
 //   GNSS lock status (true/false)
@@ -121,25 +120,25 @@ static const int GNSS_LOCK_PIN = 4;
 
 static const int GNSS_PPS_RELAY = 32;
 
-static constexpr int OCXO1_PIN = 15;
-static constexpr int OCXO2_PIN = 13;
+static constexpr int OCXO1_PIN = 13;
+static constexpr int OCXO2_PIN = 15;
 
 // --------------------------------------------------------------
-// QTimer1 VCLOCK / scheduler configuration
+// QTimer1 cascade configuration
 // --------------------------------------------------------------
 //
 // QTimer1 is used for GNSS VCLOCK counting and scheduling.
 //
 // ch0: primary external count source on pin 10 (GNSS 10 MHz, CM=1)
-// ch1: hosted VCLOCK-domain compare rail for witness/diagnostics
+// ch1: cascaded extension for 32-bit range (CM=7)
 // ch2: TimePop dynamic compare scheduler (priority queue, CM=1)
-// ch3: unused/off
+// ch3: TIME_TEST compare (VCLOCK edge capture for time audit)
 //
 // The raw QTimer count is in 10 MHz ticks (100 ns per tick).
 // No domain translation is required — one tick = one GNSS cycle.
 //
-// process_interrupt owns synthetic 32-bit extension from the 16-bit
-// QTimer1 CH0 low word.
+// The 32-bit QTimer value is read in the PPS ISR alongside
+// GPT1_CNT, GPT2_CNT, and DWT_CYCCNT.
 //
 static constexpr uint32_t QTIMER1_CH0_BITS = 16;
 static constexpr uint32_t QTIMER1_CH0_MASK = 0xFFFF;
@@ -151,19 +150,19 @@ static constexpr uint32_t QTIMER1_CH0_MASK = 0xFFFF;
 // Domain    Timer           Pin   Clock Source           Resolution
 // -------   -------------   ---   --------------------   ----------
 // DWT       ARM_DWT_CYCCNT   —    CPU core (1008 MHz)    ~1 ns
-// GNSS      QTimer1 CH0      10   GF-8802 VCLOCK 10 MHz  100 ns
-// OCXO1     QTimer3 CH3      15   AOCJY1-A #1   10 MHz   100 ns
-// OCXO2     QTimer2 CH0      13   AOCJY1-A #2   10 MHz   100 ns
+// GNSS      QTimer1 ch0+1    10   GF-8802 VCLOCK 10 MHz  100 ns
+// OCXO1     QTimer3 ch2      14   AOCJY1-A #1   10 MHz   100 ns
+// OCXO2     QTimer3 ch3      15   AOCJY1-A #2   10 MHz   100 ns
 //
 // All timing domains free-run continuously.
 // All are captured simultaneously in the PPS ISR.
-// QTimer1/QTimer2/QTimer3 are 16-bit hardware counters.
-// process_interrupt owns synthetic 32-bit/64-bit extension where needed.
+// GPT1 and GPT2 are 32-bit native.
+// QTimer1 is 16-bit cascaded to 32-bit (wraps at ~429 seconds).
+// 64-bit extension is via delta accumulation where needed.
 //
 // GNSS VCLOCK is intentionally hosted on QTimer1 because it is the
 // sovereign clock domain used by TimePop and broader timing semantics.
-// Current working OCXO wiring deliberately maps OCXO1 to QTimer3/pin15
-// and OCXO2 to QTimer2/pin13.
+// OCXO2 is hosted on GPT2.
 //
 
 // --------------------------------------------------------------
@@ -228,7 +227,7 @@ static constexpr uint32_t VCLOCK_INTERVAL_COUNTS = 10000U;  // 1 ms at 10 MHz
 // 500 compares per OCXO second × 20000 ticks = 10,000,000 ticks = 1 s.
 //
 // Phase offset between the two lanes is OCXO_INTERVAL_COUNTS / 2 (1 ms).
-// Logical OCXO1 is currently QTimer3/pin15; logical OCXO2 is QTimer2/pin13.
+// OCXO1 fires on even ms boundaries, OCXO2 fires on odd ms boundaries.
 // They cannot share an ISR window.
 static constexpr uint32_t OCXO_INTERVAL_COUNTS = 20000U;       // 2 ms at 10 MHz
 static constexpr uint32_t OCXO_COUNTS_PER_SECOND = 10000000U;
