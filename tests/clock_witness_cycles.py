@@ -1,10 +1,13 @@
 """
-ZPNet Clock Witness Cycles — live CLOCK_WITNESS cycle audit.
+ZPNet Clock Witness Cycles — durable CLOCK_WITNESS table audit.
 
-This is the unified live-stream sibling of tests/raw_cycles.py.  Instead of
-reading TIMEBASE rows from Postgres, it registers a temporary Pi-side pub/sub
-process, subscribes to CLOCK_WITNESS, and prints compact real-time rows for the
-witness lanes that are actually producing new historical edge facts.
+This is the unified witness-cycle formatter for the durable CLOCK_WITNESS
+stream.  EVENTS is the permanent Pi-side subscriber for CLOCK_WITNESS and
+persists every payload into the PostgreSQL witness table.  This tool no longer
+creates a temporary pub/sub process, no longer asks PUBSUB to REFRESH, and no
+longer participates in routing.  It tails new witness rows from Postgres and
+prints compact real-time rows for the witness lanes that are actually producing
+new historical edge facts.
 
 CLOCK_WITNESS currently carries up to three lanes:
 
@@ -17,18 +20,27 @@ The firmware publishes historical edge facts.  The report cadence is
 VCLOCK/TimePop time; the measured data is the already-completed interval from
 one 10,000,000-count edge to the next.
 
+Default behavior:
+  • On startup, read max(witness.id) and use that as a high-water mark.
+  • Ignore older witness rows already in the table.
+  • Poll for rows where witness.id > high-water mark.
+  • Feed each new row payload through the existing formatter/statistics path.
+
 Usage, from the zpnet-suite repo root on the Pi:
 
     python tests/clock_witness_cycles.py
     python tests/clock_witness_cycles.py --lane all
-    python tests/clock_witness_cycles.py --lane vclock
+    python tests/clock_witness_cycles.py --lane ocxo
     python tests/clock_witness_cycles.py --lane ocxo1
     python tests/clock_witness_cycles.py --lane ocxo2
-    python tests/clock_witness_cycles.py --lane ocxo
     python tests/clock_witness_cycles.py --limit 200
     python tests/clock_witness_cycles.py --include-stale
     python tests/clock_witness_cycles.py --debug-shape
-    python tests/clock_witness_cycles.py --no-refresh
+    python tests/clock_witness_cycles.py --campaign Enough1
+    python tests/clock_witness_cycles.py --since-id 12345
+    python tests/clock_witness_cycles.py --from-id 12345
+    python tests/clock_witness_cycles.py --from-beginning
+    python tests/clock_witness_cycles.py --include-existing
 
 Typical firmware setup:
 
@@ -40,9 +52,8 @@ Typical firmware setup:
     python tests/clock_witness_cycles.py
 
 Notes:
-  • This tool creates a temporary PID-unique PI subsystem named CLOCK_WITNESS_CYCLES_<pid>.
-  • By default it asks PUBSUB to REFRESH so the route to this process is live.
-  • It does not touch Postgres.
+  • This tool is now a Postgres tailer, not a pub/sub subscriber.
+  • Durable ingress is owned by zpnet-events via the witness table.
   • Stale lanes are not counted in statistics unless --include-stale is used.
   • Freshness is inferred from edge sequence / edge total changes, so the tool
     still works if firmware omits or clears new_since_last_publish.
@@ -67,11 +78,11 @@ REPO_ROOT = os.path.dirname(THIS_DIR)
 if REPO_ROOT not in sys.path:
     sys.path.insert(0, REPO_ROOT)
 
-from zpnet.processes.processes import send_command, server_setup  # noqa: E402
+from zpnet.shared.db import open_db  # noqa: E402
 
 
-SUBSYSTEM_BASE = "CLOCK_WITNESS_CYCLES"
 TOPIC = "CLOCK_WITNESS"
+WITNESS_TABLE = "witness"
 
 DWT_CYCLE_NS = 125.0 / 126.0  # 1.008 GHz DWT
 EXPECTED_COUNTS_PER_SECOND = 10_000_000
@@ -360,66 +371,78 @@ def _selected_lanes(lane_filter: str) -> tuple[str, ...]:
     return ("vclock", "ocxo1", "ocxo2")
 
 
-def _socket_dir() -> str:
-    return "/tmp"
+def _decode_payload(value: Any) -> Dict[str, Any]:
+    """Return a dict payload from PostgreSQL json/jsonb driver output."""
+    if value is None:
+        return {}
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str):
+        decoded = json.loads(value)
+        return decoded if isinstance(decoded, dict) else {"value": decoded}
+    return {"value": value}
 
 
-def _command_socket_path(subsystem: str) -> str:
-    return f"{_socket_dir()}/zpnet-{subsystem.lower()}-command.sock"
+def _serialize_ts(value: Any) -> str:
+    if hasattr(value, "isoformat"):
+        return value.isoformat().replace("+00:00", "Z")
+    return str(value)
 
 
-def _pubsub_socket_path(subsystem: str) -> str:
-    return f"{_socket_dir()}/zpnet-{subsystem.lower()}-pubsub.sock"
-
-
-def _wait_for_local_sockets(subsystem: str, timeout_s: float = 3.0) -> None:
-    deadline = time.monotonic() + timeout_s
-    command_path = _command_socket_path(subsystem)
-    pubsub_path = _pubsub_socket_path(subsystem)
-
-    while time.monotonic() < deadline:
-        if os.path.exists(command_path) and os.path.exists(pubsub_path):
-            return
-        time.sleep(0.05)
-
-    raise RuntimeError(
-        "local process sockets did not appear: "
-        f"{command_path!r}, {pubsub_path!r}"
-    )
-
-
-def _route_is_live(subsystem: str) -> bool:
-    resp = send_command(machine="PI", subsystem="PUBSUB", command="REPORT")
-    routes = resp.get("payload", {}).get("routes", [])
-    for row in routes:
-        if (
-            row.get("machine") == "PI"
-            and row.get("subsystem") == subsystem
-            and row.get("topic") == TOPIC
-        ):
-            return True
-    return False
-
-
-def _refresh_until_routed(subsystem: str, attempts: int = 5) -> None:
-    last_resp: Dict[str, Any] | None = None
-
-    for attempt in range(1, attempts + 1):
-        time.sleep(0.2)
-        last_resp = send_command(machine="PI", subsystem="PUBSUB", command="REFRESH")
-        if not last_resp.get("success", False):
-            continue
-        if _route_is_live(subsystem):
-            print(
-                f"PUBSUB route confirmed: {TOPIC} -> PI:{subsystem}",
-                flush=True,
+def _max_witness_id(*, campaign: Optional[str]) -> int:
+    """Return the current witness high-water mark."""
+    with open_db(row_dict=True) as conn:
+        cur = conn.cursor()
+        if campaign:
+            cur.execute(
+                """
+                SELECT COALESCE(MAX(id), 0) AS max_id
+                FROM witness
+                WHERE campaign = %s
+                """,
+                (campaign,),
             )
-            return
+        else:
+            cur.execute("SELECT COALESCE(MAX(id), 0) AS max_id FROM witness")
+        row = cur.fetchone()
 
-    raise RuntimeError(
-        f"PUBSUB route was not installed for {TOPIC} -> PI:{subsystem}; "
-        f"last_refresh={last_resp}"
-    )
+    return int(row["max_id"] or 0) if row else 0
+
+
+def _fetch_witness_rows(
+    *,
+    after_id: int,
+    limit: int,
+    campaign: Optional[str],
+) -> list[Dict[str, Any]]:
+    """Fetch new witness rows in durable id order."""
+    with open_db(row_dict=True) as conn:
+        cur = conn.cursor()
+        if campaign:
+            cur.execute(
+                """
+                SELECT id, ts, campaign, payload
+                FROM witness
+                WHERE id > %s AND campaign = %s
+                ORDER BY id ASC
+                LIMIT %s
+                """,
+                (after_id, campaign, limit),
+            )
+        else:
+            cur.execute(
+                """
+                SELECT id, ts, campaign, payload
+                FROM witness
+                WHERE id > %s
+                ORDER BY id ASC
+                LIMIT %s
+                """,
+                (after_id, limit),
+            )
+        rows = cur.fetchall()
+
+    return list(rows)
 
 
 class LiveAudit:
@@ -471,6 +494,9 @@ class LiveAudit:
             print(json.dumps(payload, separators=(",", ":")), flush=True)
 
         self.publish_count += 1
+        source = payload.get("_witness_row") if isinstance(payload, dict) else None
+        source_id = _as_int(source.get("id")) if isinstance(source, dict) else None
+        display_id = source_id if source_id is not None else self.publish_count
         state = _state(payload)
         counts_per_second = _counts_per_second(payload)
 
@@ -513,8 +539,8 @@ class LiveAudit:
                     for lane in self.lanes
                 )
                 print(
-                    f"{self.publish_count:>6d} {'no-new':<7s} "
-                    f"received CLOCK_WITNESS but no selected lane advanced "
+                    f"{display_id:>6d} {'no-new':<7s} "
+                    f"read witness row but no selected lane advanced "
                     f"(lanes {found})",
                     flush=True,
                 )
@@ -529,10 +555,10 @@ class LiveAudit:
 
         for sample in selected_samples:
             if self.include_stale or sample.inferred_fresh or sample.new_since_last_publish:
-                self._print_lane_row(self.publish_count, sample)
+                self._print_lane_row(display_id, sample)
 
         if len(self.lanes) > 1:
-            self._print_delta_row(self.publish_count, samples)
+            self._print_delta_row(display_id, samples)
 
         self.rows_printed += 1
         if self.limit and self.rows_printed >= self.limit:
@@ -595,7 +621,7 @@ class LiveAudit:
     def _print_header(self, counts_per_second: int) -> None:
         print("Live CLOCK_WITNESS cycle audit")
         print("══════════════════════════════")
-        print("  Rows are live pub/sub snapshots from CLOCK_WITNESS.")
+        print("  Rows are payloads read from the durable Postgres witness table.")
         print("  act/pred/res are DWT cycles over one completed 10,000,000-count clock interval.")
         print("  svc is service offset in that lane's count ticks at ISR/event capture.")
         print("  cΔ is the lane total-count delta between fresh completed edges; it should be 10,000,000.")
@@ -605,7 +631,7 @@ class LiveAudit:
         print()
 
         header = (
-            f"{'pub':>6s} {'lane':<7s} {'seq':>7s} "
+            f"{'rec':>6s} {'lane':<7s} {'seq':>7s} "
             f"{'act':>13s} {'pred':>13s} {'res':>8s} "
             f"{'svc':>6s} {'cΔ':>11s} {'edge_total':>14s} {'event_total':>14s} "
             f"{'target':>11s} {'event':>11s} {'dwt_edge':>13s} "
@@ -676,7 +702,7 @@ class LiveAudit:
             print()
             print("Summary")
             print("═══════")
-            print(f"  publishes received                         = {self.publish_count:,}")
+            print(f"  witness records received                   = {self.publish_count:,}")
             print(f"  row groups printed                         = {self.rows_printed:,}")
             print(f"  stale included in stats                    = {self.include_stale}")
 
@@ -694,13 +720,9 @@ class LiveAudit:
             _print_welford("OCXO1 residual - OCXO2 residual", self.stats["ocxo1_minus_ocxo2_residual"])
 
 
-def _refresh_pubsub(subsystem: str) -> None:
-    _wait_for_local_sockets(subsystem)
-    _refresh_until_routed(subsystem)
-
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Live CLOCK_WITNESS raw-cycle stream formatter")
+    parser = argparse.ArgumentParser(description="Tail durable witness table and format CLOCK_WITNESS cycles")
     parser.add_argument(
         "--lane",
         default="all",
@@ -728,7 +750,14 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--raw", action="store_true", help="also dump raw payload JSON before formatted rows")
     parser.add_argument("--include-stale", action="store_true", help="print and count stale lane snapshots")
     parser.add_argument("--debug-shape", action="store_true", help="print first payload shape summary")
-    parser.add_argument("--no-refresh", action="store_true", help="do not ask PUBSUB to REFRESH routes")
+    parser.add_argument("--poll-s", type=float, default=0.25, help="database poll interval in seconds")
+    parser.add_argument("--batch-size", type=int, default=100, help="maximum witness rows to fetch per poll")
+    parser.add_argument("--campaign", help="only read witness rows for this campaign label")
+    parser.add_argument("--since-id", type=int, help="start after this witness.id instead of max(id)")
+    parser.add_argument("--from-id", dest="since_id", type=int, help="alias for --since-id")
+    parser.add_argument("--from-beginning", action="store_true", help="process existing witness rows from id 1 instead of tailing only new rows")
+    parser.add_argument("--include-existing", dest="from_beginning", action="store_true", help="alias for --from-beginning")
+    parser.add_argument("--no-refresh", action="store_true", help=argparse.SUPPRESS)  # legacy no-op; kept so old aliases do not break
     return parser.parse_args(argv)
 
 
@@ -748,28 +777,64 @@ def main(argv: list[str]) -> int:
     signal.signal(signal.SIGINT, handle_sigint)
     signal.signal(signal.SIGTERM, handle_sigint)
 
-    subsystem = f"{SUBSYSTEM_BASE}_{os.getpid()}"
+    if args.poll_s <= 0.0:
+        raise RuntimeError("--poll-s must be > 0")
+    if args.batch_size <= 0:
+        raise RuntimeError("--batch-size must be > 0")
 
-    server_setup(
-        subsystem=subsystem,
-        commands={},
-        subscriptions={TOPIC: audit.handle},
-        blocking=False,
-    )
-
-    if not args.no_refresh:
-        _refresh_pubsub(subsystem)
+    if args.from_beginning:
+        last_id = 0
+        start_mode = "from-beginning"
+    elif args.since_id is not None:
+        last_id = int(args.since_id)
+        start_mode = f"since-id={last_id}"
     else:
-        print(
-            "Skipping PUBSUB REFRESH; ensure the route exists manually: "
-            f"{TOPIC} -> PI:{subsystem}",
-            flush=True,
-        )
+        last_id = _max_witness_id(campaign=args.campaign)
+        start_mode = f"tail-new-after-max-id={last_id}"
 
-    print(f"Subscribed to {TOPIC} as PI:{subsystem}. Waiting for publications...", flush=True)
+    print(
+        "Tailing witness table for durable CLOCK_WITNESS payloads "
+        f"(mode={start_mode}, campaign={args.campaign or 'ALL'}, "
+        f"poll_s={args.poll_s}, batch_size={args.batch_size}).",
+        flush=True,
+    )
+    print("Older witness rows are ignored by default; waiting for new rows...", flush=True)
+
+    idle_log_deadline = time.monotonic() + 10.0
 
     while not audit.stop_event.is_set():
-        time.sleep(0.1)
+        rows = _fetch_witness_rows(
+            after_id=last_id,
+            limit=args.batch_size,
+            campaign=args.campaign,
+        )
+
+        if not rows:
+            now = time.monotonic()
+            if now >= idle_log_deadline:
+                print(
+                    f"Waiting for witness rows after id {last_id} "
+                    f"(campaign={args.campaign or 'ALL'})...",
+                    flush=True,
+                )
+                idle_log_deadline = now + 10.0
+            audit.stop_event.wait(args.poll_s)
+            continue
+
+        idle_log_deadline = time.monotonic() + 10.0
+
+        for row in rows:
+            row_id = int(row["id"])
+            last_id = row_id
+            payload = dict(_decode_payload(row.get("payload")))
+            payload["_witness_row"] = {
+                "id": row_id,
+                "ts": _serialize_ts(row.get("ts")),
+                "campaign": row.get("campaign"),
+            }
+            audit.handle(payload)
+            if audit.stop_event.is_set():
+                break
 
     audit.print_summary()
     return 0

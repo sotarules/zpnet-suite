@@ -33,6 +33,7 @@ import json
 import logging
 import os
 import socket
+import stat
 import threading
 import time
 from typing import Any, Dict, Callable, Optional
@@ -75,6 +76,22 @@ TEENSY_PUBLISH_SUBSCRIBE_SOCKET = "/tmp/zpnet_teensy_ps.sock"
 SERVER_COMMAND_SOCKET = "/tmp/zpnet_server_cmd.sock"
 
 # =============================================================================
+# External-boundary timeouts / sizing
+# =============================================================================
+#
+# A Unix socket file is not proof of a healthy peer. Test utilities and stale
+# processes can leave sockets behind; a peer may also accept and never answer.
+# Commands remain synchronous, but every external socket operation is bounded.
+# PUBSUB may pass a much shorter timeout for cheap SUBSCRIPTIONS discovery.
+
+COMMAND_SOCKET_TIMEOUT_S = 30.0
+COMMAND_SERVER_CLIENT_TIMEOUT_S = 30.0
+PUBLISH_SOCKET_TIMEOUT_S = 1.0
+BIND_PROBE_TIMEOUT_S = 0.25
+COMMAND_RECV_CHUNK = 65536
+SLOW_COMMAND_LOG_MS = 500
+
+# =============================================================================
 # Helpers
 # =============================================================================
 
@@ -87,19 +104,57 @@ def list_subsystems() -> list[str]:
       • Filesystem is the source of truth
       • Returned names are UPPERCASE (protocol identity)
       • Order is sorted for determinism
+
+    Socket files are filtered to real Unix sockets. This does not prove the
+    owning process is healthy — send_command() owns that boundary — but it does
+    keep unrelated files from entering process discovery.
     """
     subsystems: set[str] = set()
 
-    for fname in os.listdir(SOCKET_DIR):
+    try:
+        filenames = os.listdir(SOCKET_DIR)
+    except FileNotFoundError:
+        return []
+
+    for fname in filenames:
         if not fname.startswith("zpnet-"):
             continue
         if not fname.endswith("-command.sock"):
+            continue
+
+        path = os.path.join(SOCKET_DIR, fname)
+        try:
+            if not stat.S_ISSOCK(os.stat(path).st_mode):
+                continue
+        except FileNotFoundError:
             continue
 
         subsystem_fs = fname[len("zpnet-"):-len("-command.sock")]
         subsystems.add(subsystem_fs.upper())
 
     return sorted(subsystems)
+
+
+def _recv_response_bytes(sock: socket.socket) -> bytes:
+    """
+    Read a command response from a synchronous command socket.
+
+    The protocol sends one compact JSON response. Most replies fit in a single
+    read; the timeout on the socket bounds any stale peer that accepts but does
+    not close or complete the response.
+    """
+    chunks: list[bytes] = []
+
+    while True:
+        chunk = sock.recv(COMMAND_RECV_CHUNK)
+        if not chunk:
+            break
+        chunks.append(chunk)
+        if len(chunk) < COMMAND_RECV_CHUNK:
+            break
+
+    return b"".join(chunks)
+
 
 # =============================================================================
 # Canonical RPC client
@@ -113,6 +168,7 @@ def send_command(
     args: Optional[Dict[str, Any]] = None,
     retries: int = 5,
     retry_delay_s: float = 0.25,
+    timeout_s: float = COMMAND_SOCKET_TIMEOUT_S,
 ) -> Dict[str, Any]:
     """
     Send a single command and return a single response.
@@ -120,6 +176,7 @@ def send_command(
     Semantics:
       • JSON-in / JSON-out
       • Bounded retries at unowned transport boundary
+      • Bounded connect/send/receive wait via timeout_s
       • Any persistent failure propagates
 
     Machine routing:
@@ -132,7 +189,7 @@ def send_command(
         sock_path = command_socket_path(subsystem)
 
         # ------------------------------------------------------------
-        # Minimal defensive check: missing subsystem socket
+        # Minimal boundary check: missing subsystem socket
         # ------------------------------------------------------------
         if not os.path.exists(sock_path):
             return {
@@ -168,15 +225,33 @@ def send_command(
     last_exc: Exception | None = None
 
     for attempt in range(1, retries + 1):
+        attempt_started = time.monotonic()
+
         try:
             with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+                sock.settimeout(timeout_s)
                 sock.connect(sock_path)
                 sock.sendall(raw)
                 sock.shutdown(socket.SHUT_WR)
 
-                resp_raw = sock.recv(65536)
+                resp_raw = _recv_response_bytes(sock)
                 if not resp_raw:
                     raise RuntimeError("empty response")
+
+                elapsed_ms = int((time.monotonic() - attempt_started) * 1000)
+                if elapsed_ms >= SLOW_COMMAND_LOG_MS:
+                    logging.info(
+                        "🐢 [send_command] slow response machine=%s subsystem=%s "
+                        "command=%s attempt=%d/%d elapsed_ms=%d timeout_s=%.3f bytes=%d",
+                        machine,
+                        subsystem,
+                        command,
+                        attempt,
+                        retries,
+                        elapsed_ms,
+                        timeout_s,
+                        len(resp_raw),
+                    )
 
                 return json.loads(resp_raw.decode("utf-8"))
 
@@ -184,22 +259,40 @@ def send_command(
             FileNotFoundError,
             ConnectionRefusedError,
             ConnectionResetError,
+            BrokenPipeError,
             RuntimeError,
+            socket.timeout,
+            TimeoutError,
+            json.JSONDecodeError,
         ) as e:
             last_exc = e
+            elapsed_ms = int((time.monotonic() - attempt_started) * 1000)
+            logging.warning(
+                "⚠️ [send_command] failed attempt=%d/%d machine=%s subsystem=%s "
+                "command=%s elapsed_ms=%d timeout_s=%.3f error=%r",
+                attempt,
+                retries,
+                machine,
+                subsystem,
+                command,
+                elapsed_ms,
+                timeout_s,
+                e,
+            )
+
             if attempt >= retries:
                 break
             time.sleep(retry_delay_s)
 
     raise RuntimeError(
         f"[send_command] failed after {retries} attempts "
-        f"({machine} {subsystem} {command})"
+        f"({machine} {subsystem} {command}) "
+        f"timeout_s={timeout_s} last_error={last_exc!r}"
     ) from last_exc
 
 
-
 # =============================================================================
-# Public Pub/Sub API — publishing (UNCHANGED)
+# Public Pub/Sub API — publishing
 # =============================================================================
 
 def publish(
@@ -230,6 +323,7 @@ def publish(
 
     try:
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+            sock.settimeout(PUBLISH_SOCKET_TIMEOUT_S)
             sock.connect(TEENSY_PUBLISH_SUBSCRIBE_SOCKET)
             sock.sendall(raw)
             sock.shutdown(socket.SHUT_WR)
@@ -245,15 +339,23 @@ def _bind_unix_socket(path: str) -> socket.socket:
     if os.path.exists(path):
         try:
             with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as probe:
+                probe.settimeout(BIND_PROBE_TIMEOUT_S)
                 probe.connect(path)
             raise RuntimeError(f"socket already active: {path}")
         except ConnectionRefusedError:
             os.unlink(path)
+        except FileNotFoundError:
+            # A racing cleanup removed it between exists() and connect().
+            pass
 
     srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     srv.bind(path)
     srv.listen()
     return srv
+
+
+def _send_json(conn: socket.socket, payload: Dict[str, Any]) -> None:
+    conn.sendall(json.dumps(payload, separators=(",", ":")).encode("utf-8"))
 
 
 # =============================================================================
@@ -273,35 +375,77 @@ def _serve_commands(
     while True:
         conn, _ = srv.accept()
         with conn:
-            raw = conn.recv(65536)
-            req = json.loads(raw.decode("utf-8"))
+            try:
+                conn.settimeout(COMMAND_SERVER_CLIENT_TIMEOUT_S)
+                raw = conn.recv(COMMAND_RECV_CHUNK)
+                if not raw:
+                    continue
 
-            cmd = req["command"]
-            args = req.get("args")
+                req = json.loads(raw.decode("utf-8"))
+                cmd = req.get("command")
+                args = req.get("args")
 
-            # ------------------------------------------------------------
-            # Minimal defensive check for invalid command
-            # ------------------------------------------------------------
-            if cmd not in commands:
-                resp = {
-                    "success": False,
-                    "message": "BAD",
-                    "payload": {
-                        "error": "unknown command"
+                # ------------------------------------------------------------
+                # Minimal boundary check for invalid command
+                # ------------------------------------------------------------
+                if cmd not in commands:
+                    _send_json(conn, {
+                        "success": False,
+                        "message": "BAD",
+                        "payload": {
+                            "error": "unknown command"
+                        }
+                    })
+                    continue
+
+                handler = commands[cmd]
+                handler_started = time.monotonic()
+
+                try:
+                    resp = handler(args)
+                except Exception as e:
+                    logging.exception(
+                        "💥 [commands] handler failed subsystem=%s command=%s",
+                        subsystem,
+                        cmd,
+                    )
+                    resp = {
+                        "success": False,
+                        "message": "BAD",
+                        "payload": {
+                            "error": "handler exception",
+                            "detail": str(e),
+                        },
                     }
-                }
-                conn.sendall(
-                    json.dumps(resp, separators=(",", ":")).encode("utf-8")
+
+                elapsed_ms = int((time.monotonic() - handler_started) * 1000)
+                if elapsed_ms >= SLOW_COMMAND_LOG_MS:
+                    logging.info(
+                        "🐢 [commands] slow handler subsystem=%s command=%s elapsed_ms=%d",
+                        subsystem,
+                        cmd,
+                        elapsed_ms,
+                    )
+
+                _send_json(conn, resp)
+
+            except (socket.timeout, TimeoutError):
+                logging.warning(
+                    "⏱️ [commands] request timeout subsystem=%s socket=%s",
+                    subsystem,
+                    sock_path,
                 )
                 continue
 
-            handler = commands[cmd]
-            resp = handler(args)
-
-            conn.sendall(
-                json.dumps(resp, separators=(",", ":")).encode("utf-8")
-            )
-
+            except Exception:
+                # A malformed request or broken client must not kill the
+                # command server thread. This is an external boundary.
+                logging.exception(
+                    "💥 [commands] bad request ignored subsystem=%s socket=%s",
+                    subsystem,
+                    sock_path,
+                )
+                continue
 
 
 # =============================================================================
@@ -316,10 +460,14 @@ def _serve_pubsub(*, subsystem: str, subscriptions: Dict[str, Callable[[dict], N
         conn, _ = srv.accept()
         with conn:
             try:
-                raw = conn.recv(65536)
+                conn.settimeout(COMMAND_SERVER_CLIENT_TIMEOUT_S)
+                raw = conn.recv(COMMAND_RECV_CHUNK)
                 if not raw:
                     continue
                 msg = json.loads(raw.decode("utf-8"))
+            except (socket.timeout, TimeoutError):
+                logging.warning("[pubsub] recv timeout (ignored) %s", subsystem)
+                continue
             except Exception:
                 logging.exception("[pubsub] bad message (ignored) %s", subsystem)
                 continue

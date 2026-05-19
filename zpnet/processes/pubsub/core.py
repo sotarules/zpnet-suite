@@ -70,8 +70,23 @@ SOCKET_DIR = "/tmp"
 TRANSPORT_RETRY_INTERVAL_S = 0.25   # poll every 250 ms — aggressive but not a spinlock
 
 # Subsystems that PUBSUB should never query during ALLSUBSCRIPTIONS.
-# These are test/utility programs that may leave stale sockets behind.
+#
+# Exact skips are long-lived utility/test surfaces. Prefix skips are especially
+# important for transient test programs whose socket names include historical
+# PIDs. Those sockets can remain in /tmp after the owning process exits and can
+# poison route convergence if PUBSUB treats them as normal services.
 SUBSYSTEM_SKIP = {"TIMEBASE_WATCH"}
+SUBSYSTEM_SKIP_PREFIXES = (
+    "CLOCK_WITNESS_CYCLES_",
+)
+
+# PI-side subscription discovery is an external boundary. SUBSCRIPTIONS should
+# be answered immediately by the injected process runtime command, so use a
+# short, explicit timeout here. This prevents a stale but connectable Unix
+# socket from holding REFRESH hostage.
+PI_SUBSCRIPTIONS_RETRIES = 1
+PI_SUBSCRIPTIONS_RETRY_DELAY_S = 0.05
+PI_SUBSCRIPTIONS_TIMEOUT_S = 1.0
 
 # SERVER TCP configuration
 SERVER_TCP_HOST = "127.0.0.1"     # localhost only — SERVER arrives via reverse tunnel
@@ -84,12 +99,44 @@ SERVER_CMD_SOCKET_PATH = "/tmp/zpnet_server_cmd.sock"
 SERVER_CMD_BACKLOG = 4
 SERVER_CMD_TIMEOUT_S = 30.0       # max wait for SERVER to respond
 
+# REFRESH instrumentation
+#
+# These are observational only. They do not change routing semantics.
+# A stuck REFRESH is usually blocked inside a synchronous boundary, so a
+# separate watchdog thread periodically reports the last declared stage.
+REFRESH_STUCK_LOG_INTERVAL_S = 5.0
+REFRESH_HISTORY_MAX = 25
+ROUTE_NO_TARGET_LOG_INTERVAL_S = 10.0
+ROUTE_TRACE_TOPICS = {"TIMEBASE_FRAGMENT", "WATCHDOG_ANOMALY", "CLOCK_WITNESS"}
+
+# Single-flight REFRESH behavior. REFRESH is a convergence transaction, not a
+# concurrent workload. If one REFRESH is already in flight, automatic triggers
+# retry rather than overlapping another transaction. Manual REFRESH receives a
+# truthful busy response.
+REFRESH_BUSY_RETRY_DELAY_S = 1.0
+AUTO_REFRESH_ATTEMPTS = 8
+SERVER_SUBSCRIBE_REFRESH_ATTEMPTS = 8
+
 # ---------------------------------------------------------------------
 # Global state
 # ---------------------------------------------------------------------
 
 pending_replies: Dict[int, Queue] = {}
 req_id_counter = itertools.count(1)
+
+# ---------------------------------------------------------------------
+# REFRESH instrumentation state
+# ---------------------------------------------------------------------
+
+refresh_id_counter = itertools.count(1)
+refresh_state_lock = threading.Lock()
+refresh_single_flight_lock = threading.Lock()
+active_refreshes: Dict[int, Dict[str, Any]] = {}
+refresh_history: List[Dict[str, Any]] = []
+
+# Topic-level no-route warnings are rate-limited so a missing TIMEBASE route
+# can be seen clearly without flooding syslog every second.
+route_no_target_last_log: Dict[str, float] = {}
 
 # ---------------------------------------------------------------------
 # Routing table (cartesian subscription edges)
@@ -185,6 +232,430 @@ def log_pubsub(payload: Dict[str, Any]) -> None:
 
 
 # ---------------------------------------------------------------------
+# Instrumentation helpers
+# ---------------------------------------------------------------------
+
+def _ms_since(start: float) -> int:
+    return int((time.monotonic() - start) * 1000)
+
+
+def _fmt_kv(fields: Dict[str, Any]) -> str:
+    parts = []
+    for key in sorted(fields.keys()):
+        value = fields[key]
+        if isinstance(value, float):
+            parts.append(f"{key}={value:.3f}")
+        else:
+            parts.append(f"{key}={value!r}")
+    return " ".join(parts)
+
+
+def _subscription_summary(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+    machine_counts: Dict[str, int] = {}
+    topic_count = 0
+
+    for row in rows:
+        machine = str(row.get("machine") or "?")
+        machine_counts[machine] = machine_counts.get(machine, 0) + 1
+        subs = row.get("subscriptions") or []
+        if isinstance(subs, list):
+            topic_count += len(subs)
+
+    return {
+        "rows": len(rows),
+        "topic_declarations": topic_count,
+        "machines": machine_counts,
+    }
+
+
+def _route_summary(routes: Dict[str, Set[Tuple[str, str]]]) -> Dict[str, int]:
+    edge_count = 0
+    for targets in routes.values():
+        edge_count += len(targets)
+    return {
+        "topics": len(routes),
+        "edges": edge_count,
+    }
+
+
+def _log_route_watch_topics(refresh_id: Optional[int], routes: Dict[str, Set[Tuple[str, str]]]) -> None:
+    for topic in sorted(ROUTE_TRACE_TOPICS):
+        targets = sorted(routes.get(topic, set()))
+        if targets:
+            logging.info(
+                "🧭 [pubsub.routes] watched topic=%s targets=%d %s",
+                topic,
+                len(targets),
+                targets,
+            )
+            _refresh_stage(
+                refresh_id,
+                "refresh.routes.watch_topic.present",
+                topic=topic,
+                targets=len(targets),
+                target_list=targets,
+            )
+        else:
+            logging.warning(
+                "🕳️ [pubsub.routes] watched topic has no targets topic=%s route_topics=%d",
+                topic,
+                len(routes),
+            )
+            _refresh_stage(
+                refresh_id,
+                "refresh.routes.watch_topic.missing",
+                topic=topic,
+                route_topics=len(routes),
+            )
+
+
+def _payload_size_bytes(payload: Any) -> int:
+    try:
+        return len(payload_to_json_bytes(payload))
+    except Exception:
+        try:
+            return len(json.dumps(payload, separators=(",", ":")).encode("utf-8"))
+        except Exception:
+            return -1
+
+
+def _args_refresh_id(args: Optional[dict]) -> Optional[int]:
+    if not isinstance(args, dict):
+        return None
+
+    raw = args.get("_refresh_id", args.get("refresh_id"))
+    if raw is None:
+        return None
+
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return None
+
+
+def _args_origin(args: Optional[dict], default: str) -> str:
+    if not isinstance(args, dict):
+        return default
+
+    origin = args.get("origin") or args.get("_origin")
+    if origin is None:
+        return default
+
+    return str(origin)
+
+
+def _subsystem_skip_reason(subsystem: str) -> Optional[str]:
+    if subsystem in SUBSYSTEM_SKIP:
+        return "SUBSYSTEM_SKIP"
+
+    for prefix in SUBSYSTEM_SKIP_PREFIXES:
+        if subsystem.startswith(prefix):
+            return f"SUBSYSTEM_SKIP_PREFIX:{prefix}"
+
+    return None
+
+
+def _refresh_busy_payload(origin: str) -> Dict[str, Any]:
+    with refresh_state_lock:
+        active = [dict(v) for v in active_refreshes.values()]
+
+    now = time.monotonic()
+    for item in active:
+        started = float(item.get("started_monotonic", now))
+        stage_since = float(item.get("stage_since_monotonic", now))
+        item["elapsed_s"] = round(now - started, 3)
+        item["stage_elapsed_s"] = round(now - stage_since, 3)
+        item.pop("started_monotonic", None)
+        item.pop("stage_since_monotonic", None)
+
+    logging.warning(
+        "🔁 [pubsub.refresh] busy origin=%s active_refreshes=%d active=%s",
+        origin,
+        len(active),
+        active,
+    )
+
+    return {
+        "success": False,
+        "message": "REFRESH already active",
+        "payload": {
+            "origin": origin,
+            "active": active,
+        },
+    }
+
+
+def _is_refresh_busy_response(resp: Dict[str, Any]) -> bool:
+    return resp.get("message") == "REFRESH already active"
+
+
+def _refresh_with_retry(
+    *,
+    origin: str,
+    label: str,
+    attempts: int,
+    delay_s: float,
+) -> Dict[str, Any]:
+    last_resp: Dict[str, Any] = {
+        "success": False,
+        "message": "REFRESH not attempted",
+        "payload": {},
+    }
+
+    for attempt in range(1, attempts + 1):
+        try:
+            logging.info(
+                "🔄 [pubsub] %s REFRESH starting attempt=%d/%d origin=%s",
+                label,
+                attempt,
+                attempts,
+                origin,
+            )
+            resp = cmd_refresh({"origin": origin})
+            last_resp = resp
+
+            if resp.get("success"):
+                logging.info(
+                    "✅ [pubsub] %s REFRESH complete attempt=%d/%d message=%s",
+                    label,
+                    attempt,
+                    attempts,
+                    resp.get("message"),
+                )
+                return resp
+
+            if _is_refresh_busy_response(resp) and attempt < attempts:
+                logging.warning(
+                    "🔁 [pubsub] %s REFRESH busy attempt=%d/%d; retrying in %.3fs",
+                    label,
+                    attempt,
+                    attempts,
+                    delay_s,
+                )
+                time.sleep(delay_s)
+                continue
+
+            logging.warning(
+                "❌ [pubsub] %s REFRESH returned failure attempt=%d/%d message=%s payload_keys=%s",
+                label,
+                attempt,
+                attempts,
+                resp.get("message"),
+                sorted((resp.get("payload") or {}).keys()),
+            )
+            return resp
+
+        except Exception as e:
+            logging.exception(
+                "❌ [pubsub] %s REFRESH raised attempt=%d/%d error=%r",
+                label,
+                attempt,
+                attempts,
+                e,
+            )
+            last_resp = {
+                "success": False,
+                "message": "REFRESH raised exception",
+                "payload": {"error": repr(e)},
+            }
+            if attempt < attempts:
+                time.sleep(delay_s)
+
+    return last_resp
+
+
+def _refresh_begin(origin: str) -> int:
+    refresh_id = next(refresh_id_counter)
+    now = time.monotonic()
+    with refresh_state_lock:
+        active_refreshes[refresh_id] = {
+            "id": refresh_id,
+            "origin": origin,
+            "thread": threading.current_thread().name,
+            "started_monotonic": now,
+            "stage": "begin",
+            "stage_since_monotonic": now,
+            "last_fields": {},
+        }
+        active_count = len(active_refreshes)
+
+    if active_count > 1:
+        logging.warning(
+            "🔁 [pubsub.refresh:%d] begin origin=%s thread=%s concurrent_refreshes=%d",
+            refresh_id, origin, threading.current_thread().name, active_count,
+        )
+    else:
+        logging.info(
+            "🔄 [pubsub.refresh:%d] begin origin=%s thread=%s",
+            refresh_id, origin, threading.current_thread().name,
+        )
+
+    return refresh_id
+
+
+def _refresh_stage(refresh_id: Optional[int], stage: str, **fields: Any) -> None:
+    if refresh_id is None:
+        return
+
+    now = time.monotonic()
+
+    with refresh_state_lock:
+        state = active_refreshes.get(refresh_id)
+        if state is not None:
+            started = float(state.get("started_monotonic", now))
+            prior_stage_since = float(state.get("stage_since_monotonic", now))
+            state["stage"] = stage
+            state["stage_since_monotonic"] = now
+            state["last_fields"] = dict(fields)
+        else:
+            started = now
+            prior_stage_since = now
+
+    logging.info(
+        "🔎 [pubsub.refresh:%d] stage=%s elapsed_ms=%d prior_stage_ms=%d %s",
+        refresh_id,
+        stage,
+        int((now - started) * 1000),
+        int((now - prior_stage_since) * 1000),
+        _fmt_kv(fields),
+    )
+
+
+def _refresh_finish(refresh_id: int, success: bool, message: str, **fields: Any) -> None:
+    now = time.monotonic()
+
+    with refresh_state_lock:
+        state = active_refreshes.pop(refresh_id, None)
+        active_count = len(active_refreshes)
+
+    if state is None:
+        elapsed_ms = 0
+        origin = "?"
+        thread = "?"
+        stage = "?"
+    else:
+        elapsed_ms = int((now - float(state.get("started_monotonic", now))) * 1000)
+        origin = str(state.get("origin", "?"))
+        thread = str(state.get("thread", "?"))
+        stage = str(state.get("stage", "?"))
+
+    history_entry = {
+        "id": refresh_id,
+        "origin": origin,
+        "thread": thread,
+        "success": success,
+        "message": message,
+        "elapsed_ms": elapsed_ms,
+        "last_stage": stage,
+        "finished_monotonic": now,
+        "fields": dict(fields),
+    }
+
+    with refresh_state_lock:
+        refresh_history.append(history_entry)
+        del refresh_history[:-REFRESH_HISTORY_MAX]
+
+    log_fn = logging.info if success else logging.warning
+    log_fn(
+        "%s [pubsub.refresh:%d] finish success=%s elapsed_ms=%d origin=%s "
+        "thread=%s last_stage=%s active_refreshes=%d message=%s %s",
+        "✅" if success else "❌",
+        refresh_id,
+        success,
+        elapsed_ms,
+        origin,
+        thread,
+        stage,
+        active_count,
+        message,
+        _fmt_kv(fields),
+    )
+
+
+def _refresh_snapshot() -> Dict[str, Any]:
+    with refresh_state_lock:
+        active = [dict(v) for v in active_refreshes.values()]
+        history = list(refresh_history)
+
+    now = time.monotonic()
+    for item in active:
+        started = float(item.get("started_monotonic", now))
+        stage_since = float(item.get("stage_since_monotonic", now))
+        item["elapsed_s"] = round(now - started, 3)
+        item["stage_elapsed_s"] = round(now - stage_since, 3)
+        item.pop("started_monotonic", None)
+        item.pop("stage_since_monotonic", None)
+
+    for item in history:
+        item.pop("finished_monotonic", None)
+
+    return {
+        "active": active,
+        "history": history[-10:],
+    }
+
+
+def refresh_watchdog_loop() -> None:
+    while True:
+        time.sleep(REFRESH_STUCK_LOG_INTERVAL_S)
+
+        now = time.monotonic()
+        with refresh_state_lock:
+            snapshot = [dict(v) for v in active_refreshes.values()]
+
+        if not snapshot:
+            continue
+
+        with state_lock:
+            pending_count = len(pending_replies)
+            pending_ids = list(pending_replies.keys())[:20]
+            route_topics = len(routes_by_topic)
+            server_sub_count = len(server_subscriptions)
+
+        for item in snapshot:
+            refresh_id = int(item.get("id", -1))
+            started = float(item.get("started_monotonic", now))
+            stage_since = float(item.get("stage_since_monotonic", now))
+            logging.warning(
+                "⏱️ [pubsub.refresh:%d] still active elapsed_s=%.3f "
+                "stage=%s stage_elapsed_s=%.3f origin=%s thread=%s "
+                "pending_replies=%d pending_ids=%s route_topics=%d "
+                "server_subscriptions=%d last_fields=%s",
+                refresh_id,
+                now - started,
+                item.get("stage"),
+                now - stage_since,
+                item.get("origin"),
+                item.get("thread"),
+                pending_count,
+                pending_ids,
+                route_topics,
+                server_sub_count,
+                item.get("last_fields"),
+            )
+
+
+def _log_no_targets(topic: str, forward_to_teensy: bool) -> None:
+    if topic not in ROUTE_TRACE_TOPICS:
+        return
+
+    now = time.monotonic()
+    last = route_no_target_last_log.get(topic, 0.0)
+    if now - last < ROUTE_NO_TARGET_LOG_INTERVAL_S:
+        return
+
+    route_no_target_last_log[topic] = now
+    logging.warning(
+        "🕳️ [pubsub.route] no targets for topic=%s forward_to_teensy=%s "
+        "routes_have_topics=%d",
+        topic,
+        forward_to_teensy,
+        len(routes_by_topic),
+    )
+
+
+
+# ---------------------------------------------------------------------
 # Debug sink
 # ---------------------------------------------------------------------
 
@@ -225,6 +696,19 @@ def on_receive_request_response(payload: Dict[str, Any]) -> None:
 
     payload["latency"] = latency
 
+    with state_lock:
+        pending_count = len(pending_replies)
+
+    logging.info(
+        "📩 [pubsub.rpc] TEENSY response req_id=%s latency_ms=%s success=%s "
+        "message=%r pending_after=%d",
+        req_id,
+        latency,
+        payload.get("success"),
+        payload.get("message"),
+        pending_count,
+    )
+
     q.put(payload)
 
 def on_receive_publish_subscribe(payload: Dict[str, Any]) -> None:
@@ -242,6 +726,15 @@ def handle_client(conn: socket.socket) -> None:
             return
 
         req = json.loads(raw.decode("utf-8"))
+        subsystem = req.get("subsystem")
+        command = req.get("command")
+
+        logging.info(
+            "➡️ [pubsub.rpc] PI->TEENSY request subsystem=%s command=%s bytes=%d",
+            subsystem,
+            command,
+            len(raw),
+        )
 
         req_id = None
 
@@ -254,21 +747,66 @@ def handle_client(conn: socket.socket) -> None:
             q = Queue(maxsize=1)
             with state_lock:
                 pending_replies[req_id] = q
+                pending_count = len(pending_replies)
+
+            attempt_start = time.monotonic()
 
             try:
+                logging.info(
+                    "➡️ [pubsub.rpc] send TEENSY attempt=%d/%d req_id=%s "
+                    "subsystem=%s command=%s pending=%d payload_bytes=%d",
+                    attempt + 1,
+                    MAX_TEENSY_RETRIES,
+                    req_id,
+                    subsystem,
+                    command,
+                    pending_count,
+                    _payload_size_bytes(req),
+                )
+
                 transport_send(TRAFFIC_REQUEST_RESPONSE, req)
 
                 reply = q.get(timeout=REPLY_TIMEOUT_S)
+                elapsed_ms = _ms_since(attempt_start)
+                logging.info(
+                    "⬅️ [pubsub.rpc] reply TEENSY req_id=%s subsystem=%s "
+                    "command=%s elapsed_ms=%d success=%s message=%r",
+                    req_id,
+                    subsystem,
+                    command,
+                    elapsed_ms,
+                    reply.get("success"),
+                    reply.get("message"),
+                )
                 conn.sendall(
                     json.dumps(reply, separators=(",", ":")).encode()
                 )
                 return
 
             except Empty:
+                elapsed_ms = _ms_since(attempt_start)
+                logging.warning(
+                    "⌛ [pubsub.rpc] TEENSY timeout req_id=%s subsystem=%s "
+                    "command=%s attempt=%d/%d elapsed_ms=%d",
+                    req_id,
+                    subsystem,
+                    command,
+                    attempt + 1,
+                    MAX_TEENSY_RETRIES,
+                    elapsed_ms,
+                )
                 # Timeout on this attempt — clean up and retry
                 with state_lock:
                     pending_replies.pop(req_id, None)
                 continue
+
+        logging.warning(
+            "❌ [pubsub.rpc] TEENSY exhausted retries subsystem=%s command=%s "
+            "last_req_id=%s",
+            subsystem,
+            command,
+            req_id,
+        )
 
         # All retries exhausted
         conn.sendall(
@@ -315,6 +853,9 @@ def route_publish(msg: Dict[str, Any], *, forward_to_teensy: bool) -> None:
     # Copy the set so fan-out iterates over a stable view
     # of the subscription edge set.
     targets = set(topic_routes)
+
+    if not targets:
+        _log_no_targets(topic, forward_to_teensy)
 
     raw = payload_to_json_bytes(msg)
 
@@ -532,11 +1073,19 @@ def _server_handle_subscribe(msg: Dict[str, Any]) -> None:
         len(server_subscriptions),
     )
 
-    # Auto-refresh routes to include SERVER subscriptions
-    try:
-        cmd_refresh(None)
-    except Exception:
-        logging.exception("⚠️ [pubsub] auto REFRESH after SERVER subscribe failed")
+    # Auto-refresh routes to include SERVER subscriptions. Run in its own
+    # worker so the SERVER reader is never held hostage by route convergence.
+    threading.Thread(
+        target=_refresh_with_retry,
+        kwargs={
+            "origin": "server-subscribe",
+            "label": "SERVER subscribe-triggered",
+            "attempts": SERVER_SUBSCRIBE_REFRESH_ATTEMPTS,
+            "delay_s": REFRESH_BUSY_RETRY_DELAY_S,
+        },
+        daemon=True,
+        name="pubsub-refresh-server-subscribe",
+    ).start()
 
 
 def _server_handle_command(msg: Dict[str, Any], conn: socket.socket) -> None:
@@ -629,13 +1178,47 @@ def _server_command_to_teensy(
         q = Queue(maxsize=1)
         with state_lock:
             pending_replies[req_id] = q
+            pending_count = len(pending_replies)
+
+        attempt_start = time.monotonic()
 
         try:
+            logging.info(
+                "➡️ [pubsub.rpc] SERVER->TEENSY send attempt=%d/%d req_id=%s "
+                "subsystem=%s command=%s pending=%d payload_bytes=%d",
+                attempt + 1,
+                MAX_TEENSY_RETRIES,
+                req_id,
+                subsystem,
+                command,
+                pending_count,
+                _payload_size_bytes(req),
+            )
             transport_send(TRAFFIC_REQUEST_RESPONSE, req)
             reply = q.get(timeout=REPLY_TIMEOUT_S)
+            logging.info(
+                "⬅️ [pubsub.rpc] SERVER->TEENSY reply req_id=%s subsystem=%s "
+                "command=%s elapsed_ms=%d success=%s message=%r",
+                req_id,
+                subsystem,
+                command,
+                _ms_since(attempt_start),
+                reply.get("success"),
+                reply.get("message"),
+            )
             return reply
 
         except Empty:
+            logging.warning(
+                "⌛ [pubsub.rpc] SERVER->TEENSY timeout req_id=%s subsystem=%s "
+                "command=%s attempt=%d/%d elapsed_ms=%d",
+                req_id,
+                subsystem,
+                command,
+                attempt + 1,
+                MAX_TEENSY_RETRIES,
+                _ms_since(attempt_start),
+            )
             with state_lock:
                 pending_replies.pop(req_id, None)
             continue
@@ -902,6 +1485,7 @@ def cmd_diagnostics(_: Optional[dict]) -> Dict[str, Any]:
         pending_count = len(pending_replies)
         pending_ids = list(pending_replies.keys())
         server_cmd_pending = len(server_pending_commands)
+        route_summary = _route_summary(routes_by_topic)
 
     with server_conn_lock:
         server_connected = server_conn is not None
@@ -913,11 +1497,18 @@ def cmd_diagnostics(_: Optional[dict]) -> Dict[str, Any]:
             "pending_reply_count": pending_count,
             "pending_req_ids": pending_ids[:50],  # cap for sanity
             "req_id_current": next(req_id_counter),
-            "routes_topic_count": len(routes_by_topic),
+            "routes_topic_count": route_summary["topics"],
+            "routes_edge_count": route_summary["edges"],
             "active_threads": threading.active_count(),
             "server_connected": server_connected,
             "server_subscription_count": len(server_subscriptions),
             "server_cmd_pending": server_cmd_pending,
+            "refresh_single_flight_locked": refresh_single_flight_lock.locked(),
+            "subsystem_skip": sorted(SUBSYSTEM_SKIP),
+            "subsystem_skip_prefixes": list(SUBSYSTEM_SKIP_PREFIXES),
+            "pi_subscriptions_retries": PI_SUBSCRIPTIONS_RETRIES,
+            "pi_subscriptions_timeout_s": PI_SUBSCRIPTIONS_TIMEOUT_S,
+            "refresh": _refresh_snapshot(),
         },
     }
 
@@ -954,20 +1545,53 @@ def cmd_report(_: Optional[dict]) -> Dict[str, Any]:
         },
     }
 
-def cmd_allsubscriptions(_: Optional[dict]) -> Dict[str, Any]:
+def cmd_allsubscriptions(args: Optional[dict]) -> Dict[str, Any]:
+    refresh_id = _args_refresh_id(args)
     results: List[Dict[str, Any]] = []
 
-    for subsystem in list_subsystems():
-        # Skip known non-service subsystems (test/utility programs)
-        if subsystem in SUBSYSTEM_SKIP:
-            logging.debug(
-                "ℹ️ [pubsub] skipping %s (in SUBSYSTEM_SKIP)", subsystem,
+    subsystems = list_subsystems()
+    logging.info(
+        "🧭 [pubsub.allsubscriptions] begin refresh_id=%s subsystem_count=%d subsystems=%s",
+        refresh_id,
+        len(subsystems),
+        subsystems,
+    )
+    _refresh_stage(
+        refresh_id,
+        "pi.allsubscriptions.begin",
+        subsystem_count=len(subsystems),
+        subsystems=subsystems,
+    )
+
+    started = time.monotonic()
+
+    for subsystem in subsystems:
+        subsystem_started = time.monotonic()
+
+        # Skip known non-service subsystems and transient test utilities.
+        # This protects REFRESH from stale /tmp sockets left by short-lived
+        # diagnostic programs such as CLOCK_WITNESS_CYCLES_<pid>.
+        skip_reason = _subsystem_skip_reason(subsystem)
+        if skip_reason:
+            logging.info(
+                "⏭️ [pubsub.allsubscriptions] skip subsystem=%s reason=%s",
+                subsystem,
+                skip_reason,
+            )
+            _refresh_stage(
+                refresh_id,
+                "pi.subscriptions.query.skipped",
+                subsystem=subsystem,
+                reason=skip_reason,
             )
             continue
 
         try:
             # Self-query: answer directly
             if subsystem == "PUBSUB":
+                logging.info(
+                    "🧭 [pubsub.allsubscriptions] self subsystem=PUBSUB subscriptions=0"
+                )
                 results.append({
                     "machine": "PI",
                     "subsystem": "PUBSUB",
@@ -978,29 +1602,99 @@ def cmd_allsubscriptions(_: Optional[dict]) -> Dict[str, Any]:
             # Skip subsystems whose command socket doesn't exist
             sock_path = f"{SOCKET_DIR}/zpnet-{subsystem.lower()}-command.sock"
             if not os.path.exists(sock_path):
-                logging.debug(
-                    "ℹ️ [pubsub] skipping %s (no socket at %s)",
-                    subsystem, sock_path,
+                logging.info(
+                    "⏭️ [pubsub.allsubscriptions] skip subsystem=%s reason=no_socket path=%s",
+                    subsystem,
+                    sock_path,
                 )
                 continue
 
-            # IPC for real subsystems
+            _refresh_stage(
+                refresh_id,
+                "pi.subscriptions.query.begin",
+                subsystem=subsystem,
+                sock_path=sock_path,
+            )
+            logging.info(
+                "📨 [pubsub.allsubscriptions] query begin subsystem=%s sock=%s",
+                subsystem,
+                sock_path,
+            )
+
+            # IPC for real subsystems. This is a synchronous boundary and one
+            # of the most important places to see the last log line if REFRESH
+            # stalls.
             resp = send_command(
                 machine="PI",
                 subsystem=subsystem,
                 command="SUBSCRIPTIONS",
+                retries=PI_SUBSCRIPTIONS_RETRIES,
+                retry_delay_s=PI_SUBSCRIPTIONS_RETRY_DELAY_S,
+                timeout_s=PI_SUBSCRIPTIONS_TIMEOUT_S,
             )
 
             payload = resp.get("payload")
+            sub_count = 0
+            if isinstance(payload, dict):
+                sub_count = len(payload.get("subscriptions") or [])
+
+            logging.info(
+                "📬 [pubsub.allsubscriptions] query complete subsystem=%s "
+                "elapsed_ms=%d success=%s message=%r subscriptions=%d",
+                subsystem,
+                _ms_since(subsystem_started),
+                resp.get("success"),
+                resp.get("message"),
+                sub_count,
+            )
+            _refresh_stage(
+                refresh_id,
+                "pi.subscriptions.query.complete",
+                subsystem=subsystem,
+                elapsed_ms=_ms_since(subsystem_started),
+                success=resp.get("success"),
+                subscriptions=sub_count,
+            )
+
             if payload:
                 results.append(payload)
 
-        except Exception:
-            # Stale socket or subsystem not yet ready — skip quietly
-            logging.debug(
-                "ℹ️ [pubsub] skipping %s (SUBSCRIPTIONS query failed)",
+        except Exception as e:
+            # Stale socket or subsystem not yet ready — skip quietly in terms of
+            # behavior, but log visibly while diagnosing REFRESH brittleness.
+            logging.warning(
+                "⚠️ [pubsub.allsubscriptions] query failed subsystem=%s "
+                "elapsed_ms=%d error=%r",
                 subsystem,
+                _ms_since(subsystem_started),
+                e,
             )
+            _refresh_stage(
+                refresh_id,
+                "pi.subscriptions.query.failed",
+                subsystem=subsystem,
+                elapsed_ms=_ms_since(subsystem_started),
+                error=repr(e),
+            )
+
+    summary = _subscription_summary(results)
+    logging.info(
+        "🧭 [pubsub.allsubscriptions] complete refresh_id=%s elapsed_ms=%d "
+        "rows=%d topic_declarations=%d machines=%s",
+        refresh_id,
+        _ms_since(started),
+        summary["rows"],
+        summary["topic_declarations"],
+        summary["machines"],
+    )
+    _refresh_stage(
+        refresh_id,
+        "pi.allsubscriptions.complete",
+        elapsed_ms=_ms_since(started),
+        rows=summary["rows"],
+        topic_declarations=summary["topic_declarations"],
+        machines=summary["machines"],
+    )
 
     return {
         "success": True,
@@ -1010,7 +1704,7 @@ def cmd_allsubscriptions(_: Optional[dict]) -> Dict[str, Any]:
         },
     }
 
-def cmd_unionsubscriptions(_: Optional[dict]) -> Dict[str, Any]:
+def cmd_unionsubscriptions(args: Optional[dict]) -> Dict[str, Any]:
     """
     Return the union of PI-side, TEENSY-side, and SERVER-side
     declared subscriptions.
@@ -1022,36 +1716,124 @@ def cmd_unionsubscriptions(_: Optional[dict]) -> Dict[str, Any]:
       • Canonical payload shape
     """
 
+    refresh_id = _args_refresh_id(args)
     results: List[Dict[str, Any]] = []
+
+    logging.info("🧬 [pubsub.union] begin refresh_id=%s", refresh_id)
+    _refresh_stage(refresh_id, "union.begin")
 
     # 1) PI-side
     try:
-        pi_resp = cmd_allsubscriptions(None)
+        _refresh_stage(refresh_id, "union.pi.begin")
+        pi_started = time.monotonic()
+        pi_resp = cmd_allsubscriptions({"_refresh_id": refresh_id})
         pi_payload = pi_resp.get("payload", {}).get("subscriptions", [])
         results.extend(pi_payload)
+        pi_summary = _subscription_summary(pi_payload)
+        logging.info(
+            "🧬 [pubsub.union] PI complete refresh_id=%s elapsed_ms=%d "
+            "rows=%d topic_declarations=%d machines=%s",
+            refresh_id,
+            _ms_since(pi_started),
+            pi_summary["rows"],
+            pi_summary["topic_declarations"],
+            pi_summary["machines"],
+        )
+        _refresh_stage(
+            refresh_id,
+            "union.pi.complete",
+            elapsed_ms=_ms_since(pi_started),
+            rows=pi_summary["rows"],
+            topic_declarations=pi_summary["topic_declarations"],
+            machines=pi_summary["machines"],
+        )
     except Exception:
-        logging.warning("⚠️ [pubsub] failed to collect PI subscriptions")
+        logging.exception("⚠️ [pubsub] failed to collect PI subscriptions")
+        _refresh_stage(refresh_id, "union.pi.failed")
 
     # 2) TEENSY-side
     try:
-        teensy_payload = send_command(
+        _refresh_stage(refresh_id, "union.teensy.begin")
+        teensy_started = time.monotonic()
+        logging.info(
+            "🧬 [pubsub.union] TEENSY ALLSUBSCRIPTIONS begin refresh_id=%s",
+            refresh_id,
+        )
+
+        teensy_resp = send_command(
             machine="TEENSY",
             subsystem="PUBSUB",
             command="ALLSUBSCRIPTIONS",
-        ).get("payload", {}).get("subscriptions", [])
+        )
+        teensy_payload = teensy_resp.get("payload", {}).get("subscriptions", [])
 
         results.extend(teensy_payload)
+        teensy_summary = _subscription_summary(teensy_payload)
+        logging.info(
+            "🧬 [pubsub.union] TEENSY ALLSUBSCRIPTIONS complete refresh_id=%s "
+            "elapsed_ms=%d success=%s message=%r rows=%d topic_declarations=%d",
+            refresh_id,
+            _ms_since(teensy_started),
+            teensy_resp.get("success"),
+            teensy_resp.get("message"),
+            teensy_summary["rows"],
+            teensy_summary["topic_declarations"],
+        )
+        _refresh_stage(
+            refresh_id,
+            "union.teensy.complete",
+            elapsed_ms=_ms_since(teensy_started),
+            success=teensy_resp.get("success"),
+            rows=teensy_summary["rows"],
+            topic_declarations=teensy_summary["topic_declarations"],
+        )
 
     except Exception:
-        logging.warning("⚠️ [pubsub] failed to collect TEENSY subscriptions")
+        logging.exception("⚠️ [pubsub] failed to collect TEENSY subscriptions")
+        _refresh_stage(refresh_id, "union.teensy.failed")
 
     # 3) SERVER-side (from cached subscription declaration)
     with state_lock:
-        if server_subscriptions:
-            results.extend(list(server_subscriptions))
+        server_rows = list(server_subscriptions)
+
+    if server_rows:
+        results.extend(server_rows)
+
+    server_summary = _subscription_summary(server_rows)
+    logging.info(
+        "🧬 [pubsub.union] SERVER cached refresh_id=%s rows=%d topic_declarations=%d",
+        refresh_id,
+        server_summary["rows"],
+        server_summary["topic_declarations"],
+    )
+    _refresh_stage(
+        refresh_id,
+        "union.server.cached",
+        rows=server_summary["rows"],
+        topic_declarations=server_summary["topic_declarations"],
+    )
 
     # 4) Canonical ordering
     results.sort(key=lambda x: (x.get("machine"), x.get("subsystem")))
+
+    summary = _subscription_summary(results)
+    logging.info(
+        "🧬 [pubsub.union] complete refresh_id=%s rows=%d "
+        "topic_declarations=%d payload_bytes=%d machines=%s",
+        refresh_id,
+        summary["rows"],
+        summary["topic_declarations"],
+        _payload_size_bytes({"subscriptions": results}),
+        summary["machines"],
+    )
+    _refresh_stage(
+        refresh_id,
+        "union.complete",
+        rows=summary["rows"],
+        topic_declarations=summary["topic_declarations"],
+        payload_bytes=_payload_size_bytes({"subscriptions": results}),
+        machines=summary["machines"],
+    )
 
     return {
         "success": True,
@@ -1061,7 +1843,7 @@ def cmd_unionsubscriptions(_: Optional[dict]) -> Dict[str, Any]:
         },
     }
 
-def cmd_refresh(_: Optional[dict]) -> Dict[str, Any]:
+def cmd_refresh(args: Optional[dict]) -> Dict[str, Any]:
     """
     REFRESH — commit canonical subscription truth.
 
@@ -1074,76 +1856,199 @@ def cmd_refresh(_: Optional[dict]) -> Dict[str, Any]:
       • SERVER subscriptions are included in the routing table
         but are NOT forwarded to TEENSY (TEENSY does not need to
         know about SERVER; pubsub handles SERVER fan-out)
+
+    Concurrency doctrine:
+      • REFRESH is single-flight. It is a convergence transaction, so
+        overlapping refreshes are not allowed to race each other.
+      • Automatic triggers retry when busy. Manual callers receive an
+        explicit "REFRESH already active" response.
     """
 
-    # 1) Observe + union (single source of truth)
-    union_resp = cmd_unionsubscriptions(None)
-    union_payload = union_resp.get("payload", {})
+    origin = _args_origin(args, "command")
 
-    # 2) Commit union verbatim to TEENSY
-    #    NOTE: TEENSY receives the full union including SERVER entries.
-    #    This is harmless — TEENSY ignores subscriptions it doesn't
-    #    originate, and the union is observational truth.
+    if not refresh_single_flight_lock.acquire(blocking=False):
+        return _refresh_busy_payload(origin)
+
+    refresh_id = _refresh_begin(origin)
+    refresh_started = time.monotonic()
+
     try:
-        teensy_resp = send_command(
-            machine="TEENSY",
-            subsystem="PUBSUB",
-            command="SETSUBSCRIPTIONS",
-            args=union_payload,
-        )
-    except Exception as e:
-        logging.warning("⚠️ [pubsub] REFRESH failed applying TEENSY state: %s", e)
-        return {
-            "success": False,
-            "message": "REFRESH failed (TEENSY SETSUBSCRIPTIONS error)",
-            "payload": {
-                "union": union_payload,
-            },
-        }
+        try:
+            # 1) Observe + union (single source of truth)
+            _refresh_stage(refresh_id, "refresh.union.begin")
+            union_resp = cmd_unionsubscriptions({"_refresh_id": refresh_id})
+            union_payload = union_resp.get("payload", {})
+            union_rows = union_payload.get("subscriptions", [])
+            union_summary = _subscription_summary(union_rows)
+            _refresh_stage(
+                refresh_id,
+                "refresh.union.complete",
+                rows=union_summary["rows"],
+                topic_declarations=union_summary["topic_declarations"],
+                payload_bytes=_payload_size_bytes(union_payload),
+                machines=union_summary["machines"],
+            )
 
-    if not teensy_resp.get("success", False):
-        return {
-            "success": False,
-            "message": "REFRESH failed (TEENSY rejected SETSUBSCRIPTIONS)",
-            "payload": {
-                "union": union_payload,
-                "teensy_response": teensy_resp,
-            },
-        }
+            # 2) Commit union verbatim to TEENSY
+            #    NOTE: TEENSY receives the full union including SERVER entries.
+            #    This is harmless — TEENSY ignores subscriptions it doesn't
+            #    originate, and the union is observational truth.
+            try:
+                _refresh_stage(
+                    refresh_id,
+                    "refresh.teensy.setsubscriptions.begin",
+                    rows=union_summary["rows"],
+                    topic_declarations=union_summary["topic_declarations"],
+                    payload_bytes=_payload_size_bytes(union_payload),
+                )
+                teensy_started = time.monotonic()
+                logging.info(
+                    "📤 [pubsub.refresh:%d] TEENSY SETSUBSCRIPTIONS begin "
+                    "rows=%d topic_declarations=%d payload_bytes=%d",
+                    refresh_id,
+                    union_summary["rows"],
+                    union_summary["topic_declarations"],
+                    _payload_size_bytes(union_payload),
+                )
 
-    # 3) Build machine-qualified routes_by_topic from union
-    new_routes: Dict[str, Set[Tuple[str, str]]] = {}
+                teensy_resp = send_command(
+                    machine="TEENSY",
+                    subsystem="PUBSUB",
+                    command="SETSUBSCRIPTIONS",
+                    args=union_payload,
+                )
+                logging.info(
+                    "📥 [pubsub.refresh:%d] TEENSY SETSUBSCRIPTIONS complete "
+                    "elapsed_ms=%d success=%s message=%r",
+                    refresh_id,
+                    _ms_since(teensy_started),
+                    teensy_resp.get("success"),
+                    teensy_resp.get("message"),
+                )
+                _refresh_stage(
+                    refresh_id,
+                    "refresh.teensy.setsubscriptions.complete",
+                    elapsed_ms=_ms_since(teensy_started),
+                    success=teensy_resp.get("success"),
+                    message=teensy_resp.get("message"),
+                )
+            except Exception as e:
+                logging.warning(
+                    "⚠️ [pubsub] REFRESH failed applying TEENSY state: %s",
+                    e,
+                    exc_info=True,
+                )
+                _refresh_finish(
+                    refresh_id,
+                    False,
+                    "REFRESH failed (TEENSY SETSUBSCRIPTIONS error)",
+                    elapsed_ms=_ms_since(refresh_started),
+                    error=repr(e),
+                )
+                return {
+                    "success": False,
+                    "message": "REFRESH failed (TEENSY SETSUBSCRIPTIONS error)",
+                    "payload": {
+                        "union": union_payload,
+                    },
+                }
 
-    for row in union_payload.get("subscriptions", []):
-        machine = row.get("machine")
-        subsystem = row.get("subsystem")
-        subs = row.get("subscriptions", [])
+            if not teensy_resp.get("success", False):
+                _refresh_finish(
+                    refresh_id,
+                    False,
+                    "REFRESH failed (TEENSY rejected SETSUBSCRIPTIONS)",
+                    elapsed_ms=_ms_since(refresh_started),
+                    teensy_message=teensy_resp.get("message"),
+                )
+                return {
+                    "success": False,
+                    "message": "REFRESH failed (TEENSY rejected SETSUBSCRIPTIONS)",
+                    "payload": {
+                        "union": union_payload,
+                        "teensy_response": teensy_resp,
+                    },
+                }
 
-        if not machine or not subsystem:
-            continue
+            # 3) Build machine-qualified routes_by_topic from union
+            _refresh_stage(refresh_id, "refresh.routes.build.begin")
+            new_routes: Dict[str, Set[Tuple[str, str]]] = {}
 
-        for s in subs:
-            name = s.get("name") if isinstance(s, dict) else None
-            if not name:
-                continue
-            new_routes.setdefault(name, set()).add((machine, subsystem))
+            for row in union_payload.get("subscriptions", []):
+                machine = row.get("machine")
+                subsystem = row.get("subsystem")
+                subs = row.get("subscriptions", [])
 
-    # 4) Commit locally
-    with state_lock:
-        routes_by_topic.clear()
-        routes_by_topic.update(new_routes)
+                if not machine or not subsystem:
+                    continue
 
-        applied_union.clear()
-        applied_union.update(union_payload)
+                for s in subs:
+                    name = s.get("name") if isinstance(s, dict) else None
+                    if not name:
+                        continue
+                    new_routes.setdefault(name, set()).add((machine, subsystem))
 
-        logging.info("🚀 [pubsub] routes updated (%d topics)", len(routes_by_topic))
+            route_summary = _route_summary(new_routes)
+            _refresh_stage(
+                refresh_id,
+                "refresh.routes.build.complete",
+                topics=route_summary["topics"],
+                edges=route_summary["edges"],
+            )
+            _log_route_watch_topics(refresh_id, new_routes)
 
-    # 5) Return committed truth
-    return {
-        "success": True,
-        "message": "OK",
-        "payload": union_payload,
-    }
+            # 4) Commit locally
+            _refresh_stage(refresh_id, "refresh.routes.commit.begin")
+            with state_lock:
+                routes_by_topic.clear()
+                routes_by_topic.update(new_routes)
+
+                applied_union.clear()
+                applied_union.update(union_payload)
+
+            logging.info(
+                "🚀 [pubsub] routes updated topics=%d edges=%d",
+                route_summary["topics"],
+                route_summary["edges"],
+            )
+            _refresh_stage(
+                refresh_id,
+                "refresh.routes.commit.complete",
+                topics=route_summary["topics"],
+                edges=route_summary["edges"],
+            )
+
+            _refresh_finish(
+                refresh_id,
+                True,
+                "OK",
+                topics=route_summary["topics"],
+                edges=route_summary["edges"],
+                rows=union_summary["rows"],
+                topic_declarations=union_summary["topic_declarations"],
+            )
+
+            # 5) Return committed truth
+            return {
+                "success": True,
+                "message": "OK",
+                "payload": union_payload,
+            }
+
+        except Exception as e:
+            logging.exception("❌ [pubsub.refresh:%d] unhandled exception", refresh_id)
+            _refresh_finish(
+                refresh_id,
+                False,
+                "REFRESH failed (unhandled exception)",
+                elapsed_ms=_ms_since(refresh_started),
+                error=repr(e),
+            )
+            raise
+
+    finally:
+        refresh_single_flight_lock.release()
+
 
 # ---------------------------------------------------------------------
 # Declarations
@@ -1164,12 +2069,12 @@ def _delayed_refresh(delay_s: float = 10.0) -> None:
     import time
 
     time.sleep(delay_s)
-    try:
-        logging.info("🔄 [pubsub] auto REFRESH starting")
-        cmd_refresh(None)
-        logging.info("✅ [pubsub] auto REFRESH complete")
-    except Exception:
-        logging.exception("❌ [pubsub] auto REFRESH failed")
+    _refresh_with_retry(
+        origin="startup-auto",
+        label="auto",
+        attempts=AUTO_REFRESH_ATTEMPTS,
+        delay_s=REFRESH_BUSY_RETRY_DELAY_S,
+    )
 
 # ---------------------------------------------------------------------
 # Transport init with aggressive retry
@@ -1245,6 +2150,14 @@ def run() -> None:
         target=server_cmd_relay_server,
         daemon=True,
         name="server-cmd-relay",
+    ).start()
+
+    # REFRESH watchdog — observational only. It reports any REFRESH that
+    # remains active across REFRESH_STUCK_LOG_INTERVAL_S windows.
+    threading.Thread(
+        target=refresh_watchdog_loop,
+        daemon=True,
+        name="pubsub-refresh-watchdog",
     ).start()
 
     # Automatic control-plane convergence
