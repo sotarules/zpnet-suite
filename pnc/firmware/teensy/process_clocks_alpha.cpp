@@ -37,6 +37,11 @@
 #include <stdlib.h>
 #include <strings.h>
 
+// process_time.cpp defines this reset hook; time.h may not expose it on older
+// branches, so Alpha declares the narrow symbol it needs when SmartZero makes
+// the old projection bases invalid.
+void time_clock_reset_all(void);
+
 static constexpr uint64_t NS_PER_SECOND_U64 = 1000000000ULL;
 
 static_assert(NS_PER_SECOND_U64 ==
@@ -412,7 +417,7 @@ static inline void dwt_enable(void) {
 }
 
 bool clocks_epoch_pending(void) {
-  return false;
+  return interrupt_smartzero_running();
 }
 
 static inline bool epoch_ready(void) {
@@ -1147,6 +1152,19 @@ static volatile uint16_t g_alpha_epoch_last_ocxo2_hardware16 = 0;
 static volatile uint32_t g_alpha_epoch_sequence = 0;
 static char              g_alpha_epoch_last_reason[32] = {0};
 
+static interrupt_smartzero_snapshot_t g_alpha_epoch_last_smartzero = {};
+static volatile uint32_t g_alpha_smartzero_begin_count = 0;
+static volatile uint32_t g_alpha_smartzero_begin_failures = 0;
+
+bool clocks_alpha_epoch_last_smartzero(interrupt_smartzero_snapshot_t* out) {
+  if (!out) return false;
+  *out = g_alpha_epoch_last_smartzero;
+  return out->complete;
+}
+
+uint32_t clocks_alpha_smartzero_begin_count(void) { return g_alpha_smartzero_begin_count; }
+uint32_t clocks_alpha_smartzero_begin_failures(void) { return g_alpha_smartzero_begin_failures; }
+
 // Runtime PPS/VCLOCK sampling no longer requires the epoch-capture packet.
 // START/ZERO still require a valid capture packet, but ordinary per-second
 // sampling only needs the authored PPS/VCLOCK snapshot and Alpha's measured
@@ -1165,13 +1183,18 @@ volatile bool     g_alpha_runtime_epoch_capture_last_cap_vclock_valid = false;
 volatile bool     g_alpha_runtime_epoch_capture_last_cap_all_lanes_valid = false;
 
 static void alpha_reset_canonical_clock_state_for_new_epoch(void) {
+  const bool saved_dwt_calibration_valid = g_dwt_calibration_valid;
+  const uint32_t saved_dwt_cycles_per_second = g_dwt_cycles_between_pps_vclock;
+
   g_gnss_ns_at_pps_vclock = 0;
   g_ocxo1_measured_gnss_ns_at_pps_vclock = 0;
   g_ocxo2_measured_gnss_ns_at_pps_vclock = 0;
   g_dwt_at_pps_vclock = 0;
   g_dwt_cycle_count_total = 0;
-  g_dwt_cycles_between_pps_vclock = DWT_EXPECTED_PER_PPS;
-  g_dwt_calibration_valid = false;
+  g_dwt_cycles_between_pps_vclock = saved_dwt_calibration_valid
+      ? saved_dwt_cycles_per_second
+      : (uint32_t)DWT_EXPECTED_PER_PPS;
+  g_dwt_calibration_valid = saved_dwt_calibration_valid;
   g_counter32_at_pps_vclock = 0;
   g_prev_dwt_at_vclock_event = 0;
   g_prev_pps_vclock_dwt_at_edge = 0;
@@ -1221,14 +1244,43 @@ static void alpha_reset_canonical_clock_state_for_new_epoch(void) {
   welford_reset(welford_ocxo2);
 }
 
-bool clocks_alpha_zero_from_interrupt_capture(const char* reason) {
-  interrupt_epoch_capture_t cap{};
-  if (!interrupt_last_epoch_capture(&cap) || !cap.valid || !cap.vclock_capture_valid) {
+bool clocks_alpha_begin_smartzero_epoch(const char* reason) {
+  alpha_reset_canonical_clock_state_for_new_epoch();
+  g_epoch_initialized = false;
+  g_alpha_epoch_last_smartzero = interrupt_smartzero_snapshot_t{};
+
+  timebase_invalidate();
+  time_pps_vclock_epoch_reset(0, 0);
+  time_clock_reset_all();
+
+  safeCopy(g_alpha_epoch_last_reason, sizeof(g_alpha_epoch_last_reason),
+           (reason && *reason) ? reason : "smartzero");
+
+  const bool ok = interrupt_smartzero_begin();
+  if (ok) {
+    g_alpha_smartzero_begin_count++;
+  } else {
+    g_alpha_smartzero_begin_failures++;
+    g_alpha_epoch_install_failures++;
+  }
+  return ok;
+}
+
+bool clocks_alpha_zero_from_smartzero(const char* reason) {
+  interrupt_smartzero_snapshot_t z{};
+  if (!interrupt_smartzero_snapshot(&z) || !z.complete) {
     g_alpha_epoch_install_failures++;
     return false;
   }
 
-  if (cap.vclock_dwt_at_edge == 0) {
+  const interrupt_smartzero_lane_snapshot_t& vclock = z.lanes[0];
+  const interrupt_smartzero_lane_snapshot_t& ocxo1  = z.lanes[1];
+  const interrupt_smartzero_lane_snapshot_t& ocxo2  = z.lanes[2];
+
+  if (vclock.state != interrupt_smartzero_lane_state_t::LOCKED ||
+      ocxo1.state  != interrupt_smartzero_lane_state_t::LOCKED ||
+      ocxo2.state  != interrupt_smartzero_lane_state_t::LOCKED ||
+      vclock.anchor_dwt == 0 || ocxo1.anchor_dwt == 0 || ocxo2.anchor_dwt == 0) {
     g_alpha_epoch_install_failures++;
     return false;
   }
@@ -1236,57 +1288,72 @@ bool clocks_alpha_zero_from_interrupt_capture(const char* reason) {
   alpha_reset_canonical_clock_state_for_new_epoch();
 
   g_gnss_ns_at_pps_vclock = 0;
-  g_dwt_at_pps_vclock = cap.vclock_dwt_at_edge;
-  g_counter32_at_pps_vclock = cap.vclock_counter32;
-  g_prev_dwt_at_vclock_event = cap.vclock_dwt_at_edge;
-  g_prev_pps_vclock_dwt_at_edge = cap.vclock_dwt_at_edge;
+  g_dwt_at_pps_vclock = vclock.anchor_dwt;
+  g_counter32_at_pps_vclock = vclock.anchor_counter32;
+  g_prev_dwt_at_vclock_event = vclock.anchor_dwt;
+  g_prev_pps_vclock_dwt_at_edge = vclock.anchor_dwt;
   g_prev_pps_vclock_dwt_at_edge_valid = true;
 
-  alpha_ticks64_install_zero(g_vclock_ticks64, cap.vclock_counter32);
-  alpha_ticks64_install_zero(g_ocxo1_ticks64, cap.ocxo1_counter32);
-  alpha_ticks64_install_zero(g_ocxo2_ticks64, cap.ocxo2_counter32);
-  g_ocxo1_measured_ns.dwt_at_edge = cap.vclock_dwt_at_edge;
-  g_ocxo2_measured_ns.dwt_at_edge = cap.vclock_dwt_at_edge;
+  alpha_ticks64_install_zero(g_vclock_ticks64, vclock.anchor_counter32);
+  alpha_ticks64_install_zero(g_ocxo1_ticks64, ocxo1.anchor_counter32);
+  alpha_ticks64_install_zero(g_ocxo2_ticks64, ocxo2.anchor_counter32);
+
+  // OCXO measured ledgers now have their own mathematically-qualified zero
+  // anchors.  The first post-zero OCXO edge measures from that OCXO anchor,
+  // not from the VCLOCK anchor.
+  g_ocxo1_measured_ns.initialized = true;
+  g_ocxo1_measured_ns.ns_at_edge = 0;
+  g_ocxo1_measured_ns.dwt_at_edge = ocxo1.anchor_dwt;
+  g_ocxo2_measured_ns.initialized = true;
+  g_ocxo2_measured_ns.ns_at_edge = 0;
+  g_ocxo2_measured_ns.dwt_at_edge = ocxo2.anchor_dwt;
 
   clock_mark_epoch_zero(g_vclock_clock);
   clock_mark_epoch_zero(g_ocxo1_clock);
   clock_mark_epoch_zero(g_ocxo2_clock);
 
-  (void)clocks_dwt64_epoch_reset_at_dwt32(cap.vclock_dwt_at_edge, nullptr);
-  dwt64_anchor_reset_to_dwt32(cap.vclock_dwt_at_edge, g_dwt64_epoch_raw_cycles);
+  (void)clocks_dwt64_epoch_reset_at_dwt32(vclock.anchor_dwt, nullptr);
+  dwt64_anchor_reset_to_dwt32(vclock.anchor_dwt, g_dwt64_epoch_raw_cycles);
 
-  time_pps_vclock_epoch_reset(cap.vclock_dwt_at_edge, cap.vclock_counter32);
-  time_clock_epoch_reset(time_clock_id_t::VCLOCK, cap.vclock_dwt_at_edge, 0);
-  time_clock_epoch_reset(time_clock_id_t::OCXO1,  cap.vclock_dwt_at_edge, 0);
-  time_clock_epoch_reset(time_clock_id_t::OCXO2,  cap.vclock_dwt_at_edge, 0);
+  time_pps_vclock_epoch_reset(vclock.anchor_dwt, vclock.anchor_counter32);
+  time_clock_epoch_reset(time_clock_id_t::VCLOCK, vclock.anchor_dwt, 0);
+  time_clock_epoch_reset(time_clock_id_t::OCXO1,  ocxo1.anchor_dwt, 0);
+  time_clock_epoch_reset(time_clock_id_t::OCXO2,  ocxo2.anchor_dwt, 0);
   g_alpha_epoch_sequence++;
 
   // VCLOCK synthetic coordinate generation changed.  Re-author recurring
   // TimePop timers and cancel unsafe old-coordinate one-shots before normal
-  // scheduling resumes.  This is the essential process_epoch behavior that
-  // survives the retirement of process_epoch.
+  // scheduling resumes.
   timepop_epoch_changed(g_alpha_epoch_sequence);
 
-  g_alpha_epoch_last_capture_sequence = cap.sequence;
-  g_alpha_epoch_last_capture_window_cycles = cap.capture_window_cycles;
-  g_alpha_epoch_last_vclock_capture_valid = cap.vclock_capture_valid;
-  g_alpha_epoch_last_all_lanes_valid = cap.all_lanes_capture_valid;
-  g_alpha_epoch_last_dwt_at_edge = cap.vclock_dwt_at_edge;
-  g_alpha_epoch_last_vclock_counter32 = cap.vclock_counter32;
-  g_alpha_epoch_last_ocxo1_counter32 = cap.ocxo1_counter32;
-  g_alpha_epoch_last_ocxo2_counter32 = cap.ocxo2_counter32;
+  g_alpha_epoch_last_capture_sequence = z.sequence;
+  g_alpha_epoch_last_capture_window_cycles = 0;
+  g_alpha_epoch_last_vclock_capture_valid = true;
+  g_alpha_epoch_last_all_lanes_valid = true;
+  g_alpha_epoch_last_dwt_at_edge = vclock.anchor_dwt;
+  g_alpha_epoch_last_vclock_counter32 = vclock.anchor_counter32;
+  g_alpha_epoch_last_ocxo1_counter32 = ocxo1.anchor_counter32;
+  g_alpha_epoch_last_ocxo2_counter32 = ocxo2.anchor_counter32;
   g_alpha_epoch_last_vclock_zero_valid = true;
   g_alpha_epoch_last_ocxo1_zero_valid = true;
   g_alpha_epoch_last_ocxo2_zero_valid = true;
-  g_alpha_epoch_last_vclock_hardware16_observed = cap.vclock_hardware16_observed;
-  g_alpha_epoch_last_vclock_hardware16_selected = cap.vclock_hardware16_selected;
-  g_alpha_epoch_last_ocxo1_hardware16 = cap.ocxo1_hardware16;
-  g_alpha_epoch_last_ocxo2_hardware16 = cap.ocxo2_hardware16;
+  g_alpha_epoch_last_vclock_hardware16_observed = vclock.anchor_hardware16;
+  g_alpha_epoch_last_vclock_hardware16_selected = vclock.anchor_hardware16;
+  g_alpha_epoch_last_ocxo1_hardware16 = ocxo1.anchor_hardware16;
+  g_alpha_epoch_last_ocxo2_hardware16 = ocxo2.anchor_hardware16;
+  g_alpha_epoch_last_smartzero = z;
+
   safeCopy(g_alpha_epoch_last_reason, sizeof(g_alpha_epoch_last_reason),
-           (reason && *reason) ? reason : "unknown");
+           (reason && *reason) ? reason : "smartzero");
   g_alpha_epoch_install_count++;
   g_epoch_initialized = true;
   return true;
+}
+
+bool clocks_alpha_zero_from_interrupt_capture(const char* reason) {
+  // Compatibility wrapper: the legacy capture-packet ZERO path is retired.
+  // All callers now install from the completed SmartZero proof surface.
+  return clocks_alpha_zero_from_smartzero(reason);
 }
 
 uint32_t clocks_alpha_epoch_sequence(void) { return g_alpha_epoch_sequence; }
@@ -1495,6 +1562,14 @@ static void publish_pps_witness_diag(const pps_edge_snapshot_t& snap) {
   if (g_prev_pps_dwt_at_edge_valid) {
     g_pps_dwt_cycles_between_edges = physical_pps_dwt - g_prev_pps_dwt_at_edge;
     g_pps_dwt_cycles_between_edges_valid = true;
+
+    // SmartZero needs a live PPS/GPIO-derived one-second DWT ruler before
+    // any campaign epoch exists.  The physical PPS witness is therefore the
+    // continuous calibration source; it is not zeroed and does not wait for
+    // the PPS/VCLOCK bridge to become valid.
+    g_dwt_cycles_between_pps_vclock = (uint32_t)g_pps_dwt_cycles_between_edges;
+    g_dwt_calibration_valid = true;
+
     alpha_static_prediction_record_pps((uint32_t)g_pps_dwt_cycles_between_edges);
   } else {
     g_pps_dwt_cycles_between_edges = 0;
@@ -1625,12 +1700,17 @@ static void maybe_publish_fragment(void) {
 }
 
 static void pps_selector_callback(const pps_edge_snapshot_t& snap) {
-  // Startup is the only automatic epoch install.  Explicit ZERO is now an
-  // immediate command that selects the latest already-authored interrupt
-  // epoch capture packet.
+  // Startup epoch install is now SmartZero-gated.  Explicit START/ZERO
+  // requests are finished by Beta once the same SmartZero proof surface is
+  // complete; startup uses it only when no command-owned acquisition is active.
   bool installed_epoch = false;
-  if (!g_epoch_initialized) {
-    installed_epoch = clocks_alpha_zero_from_interrupt_capture("startup");
+  if (!g_epoch_initialized && !request_start && !request_zero) {
+    if (!interrupt_smartzero_running() && !interrupt_smartzero_complete()) {
+      (void)clocks_alpha_begin_smartzero_epoch("startup");
+    }
+    if (interrupt_smartzero_complete()) {
+      installed_epoch = clocks_alpha_zero_from_smartzero("startup");
+    }
   }
 
   publish_pps_witness_diag(snap);
@@ -1685,4 +1765,5 @@ void process_clocks_init(void) {
   subscribe_clock(interrupt_subscriber_kind_t::OCXO2, ocxo2_callback);
 
   interrupt_pps_edge_register_dispatch(pps_selector_callback);
+  (void)clocks_alpha_begin_smartzero_epoch("startup");
 }

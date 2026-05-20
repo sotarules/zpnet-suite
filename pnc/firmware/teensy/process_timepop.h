@@ -63,10 +63,23 @@
 //       invoking TimePop's handler
 //     • building the event/diag payloads passed to TimePop
 //
-//   TimePop does not defensively second-guess exact compare fires.  If the
-//   foreground scheduler ever has to discover an already-past timed slot,
-//   that condition is surfaced through report counters rather than hidden as
-//   a normal precision event.
+//   TimePop does not defensively second-guess exact compare fires.  Exact
+//   equality between a slot deadline and the process_interrupt-authored CH2
+//   event counter is the only condition that can produce a timed callback fire.
+//   If IRQ scan or schedule_next() discovers an already-past timed slot, that
+//   deadline is quarantined as missed: one-shots are cancelled, recurring slots
+//   are advanced to their next lawful grid point, and no callback receives the
+//   current event DWT under the old deadline's identity.  schedule_next() is
+//   not an event source: it may choose the next compare target, quarantine
+//   missed/too-close slots, or re-author recurring work, but it never authors
+//   a timed fire fact.
+//
+//   TimePop also refuses to arm CH2 at-or-inside the scheduler race window.
+//   A too-close deadline is treated as missed before hardware programming,
+//   preventing immediate/missed-compare storms.  While CLOCKS/SmartZero is
+//   intentionally invalidating the public TIME anchor for epoch acquisition,
+//   old absolute deadlines are degraded/cancelled without callback rather than
+//   allowed to survive as old-coordinate facts.
 //
 //   ASAP/ALAP:
 //
