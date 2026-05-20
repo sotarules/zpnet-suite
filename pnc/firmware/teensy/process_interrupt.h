@@ -5,36 +5,25 @@
 // Interrupt custody and low-word counter cadence:
 //
 //   • Cadence minder (single TimePop client tending all 16-bit counters)
-//   • OCXO lanes    (QTimer1 CH0 for OCXO1, QTimer3 CH3 for OCXO2; currently still event rails)
-//   • VCLOCK lane   (critical recurring TimePop client on QTimer2 CH2)
-//   • TimePop       (QTimer2 CH2, hosted scheduler/client rail)
+//   • OCXO lanes    (QTimer2 CH0 for OCXO1, QTimer3 CH3 for OCXO2; currently still event rails)
+//   • VCLOCK lane   (critical recurring TimePop client on QTimer1 CH2)
+//   • TimePop       (QTimer1 CH2, hosted scheduler/client rail)
 //   • PPS GPIO edge (diagnostics + dispatch authority + epoch anchor)
 //
-// External OCXO ownership commands:
-//   • INTERRUPT.OCXO_STOP  lane=OCXO1|OCXO2|both
-//       Releases selected OCXO hardware lane(s) to an external owner such as
-//       process_witness.  The selected QTimer compare is disabled, the QTimer
-//       vector is disabled by process_interrupt, cadence-minder OCXO reads are
-//       suppressed, and PPS epoch capture stops sampling that lane.
-//   • INTERRUPT.OCXO_START lane=OCXO1|OCXO2|both
-//       Reclaims selected OCXO hardware lane(s), restores the normal QTimer
-//       mapping/vector, and reboots process_interrupt's local OCXO synthetic
-//       counter anchor from the current hardware low word.
+// QTimer1 vector custody:
 //
-// QTimer2 vector custody:
-//
-//   QTimer2 has a single shared IRQ vector across all four channels.
+//   QTimer1 has a single shared IRQ vector across all four channels.
 //   process_interrupt owns the vector and dispatches in IRQ context:
 //     • CH1 flag set → legacy hosted compare rail, if explicitly armed
 //     • CH2 flag set → registered TimePop scheduler handler
-//   VCLOCK cadence no longer owns a private QTimer2 compare channel.  It is
+//   VCLOCK cadence no longer owns a private QTimer1 compare channel.  It is
 //   a critical recurring TimePop slot that runs from the CH2 shared fire facts
 //   and rearms inside the CH2 ISR pass before TimePop chooses the next compare.
 //
 //   TimePop owns scheduler policy only.  process_interrupt owns the CH2
 //   compare-register programming; TimePop requests target updates through
-//   interrupt_qtimer2_ch2_arm_compare().  TimePop registers its CH2 handler
-//   via interrupt_register_qtimer2_ch2_handler at init time.
+//   interrupt_qtimer1_ch2_arm_compare().  TimePop registers its CH2 handler
+//   via interrupt_register_qtimer1_ch2_handler at init time.
 //
 // ─── PPS / PPS_VCLOCK doctrine ──────────────────────────────────────────────
 //
@@ -74,7 +63,7 @@
 //
 //   The VCLOCK cadence is PPS-anchored but no longer uses QTimer1 CH3.
 //   On the first physical PPS edge after a rebootstrap request, the GPIO ISR
-//   captures the QTimer2 CH0 low-word count and selects the sacred VCLOCK edge.
+//   captures the QTimer1 CH0 low-word count and selects the sacred VCLOCK edge.
 //   The already-running VCLOCK_CADENCE TimePop client consumes a CH2 shared
 //   fire fact, back-projects from that cadence event to the selected edge, and
 //   publishes the canonical PPS_VCLOCK epoch.
@@ -117,16 +106,16 @@
 //   centralized on the sovereign VCLOCK/TimePop rail.  OCXO compare channels
 //   are still present as event rails in this step, but rollover custody no
 //   longer depends on frequent OCXO interrupt service.  VCLOCK cadence is a
-//   TimePop critical recurring ISR slot on QTimer2 CH2, sharing fire facts
+//   TimePop critical recurring ISR slot on QTimer1 CH2, sharing fire facts
 //   with other same-deadline TimePop clients.
 //
 //   Cadence sources:
 //     VCLOCK : TimePop critical recurring ISR slot, +10000 counts/interval
-//              in the GNSS-disciplined 10 MHz VCLOCK domain.  QTimer2 CH0 is
-//              the passive low-word VCLOCK counter; QTimer2 CH2 is the only
+//              in the GNSS-disciplined 10 MHz VCLOCK domain.  QTimer1 CH0 is
+//              the passive low-word VCLOCK counter; QTimer1 CH2 is the only
 //              active TimePop compare rail.
 //     MINDER : TimePop recurring 1 ms client, tends VCLOCK/OCXO low-word counters
-//     OCXO1  : QTimer1 CH0 compare, event rail retained for current one-second events
+//     OCXO1  : QTimer2 CH0 compare, event rail retained for current one-second events
 //     OCXO2  : QTimer3 CH3 compare, event rail retained for current one-second events
 // ============================================================================
 
@@ -166,13 +155,10 @@ enum class interrupt_provider_kind_t : uint8_t {
 
 enum class interrupt_lane_t : uint8_t {
   NONE = 0,
-  QTIMER1_CH0_COMP,
   QTIMER1_CH1_COMP,
   QTIMER1_CH2_COMP,
   QTIMER1_CH3_COMP,
   QTIMER2_CH0_COMP,
-  QTIMER2_CH1_COMP,
-  QTIMER2_CH2_COMP,
   QTIMER3_CH3_COMP,
   GPIO_EDGE,
 };
@@ -185,7 +171,7 @@ enum class interrupt_event_status_t : uint8_t {
 
 // ============================================================================
 // One-second event — VCLOCK / OCXO subscribers (every 1000 ticks)
-// CH2 cadence event — TimePop (every QTimer2 CH2 compare-match)
+// CH2 cadence event — TimePop (every QTimer1 CH2 compare-match)
 // ============================================================================
 //
 // VCLOCK and OCXO lanes deliver one event per second to their foreground
@@ -530,22 +516,21 @@ struct interrupt_epoch_capture_t {
 
 bool interrupt_last_epoch_capture(interrupt_epoch_capture_t* out);
 
-// Re-author OCXO QuadTimer witness targets from CLOCKS phase-authored zero.
+// Re-author OCXO QuadTimer compare cadence from CLOCKS logical zero.
 //
-// OCXO lanes are not tandem-zeroed with VCLOCK.  CLOCKS/Alpha chooses crafted
-// OCXO zero-offset ticks such that the OCXO local coordinates are already
-// non-zero at PPS/VCLOCK zero.  It then passes the first physical witness
-// targets to process_interrupt:
+// OCXO Gamma is lane-local.  It does not care which OCXO edge is near PPS or
+// VCLOCK.  Once CLOCKS has selected the OCXO zero-offset counter32 values, this
+// call makes the compare rails land on:
 //
-//   OCXO1: PPS/VCLOCK zero + 250,500 us
-//   OCXO2: PPS/VCLOCK zero + 750,500 us
+//   epoch + 10,000
+//   epoch + 20,000
+//   ...
+//   epoch + 10,000,000
 //
-// If the requested first target is already behind the current passive OCXO
-// observation, the cadence minder advances the target by exact 10 MHz seconds
-// until the same phase is future-reachable.  After each witnessed OCXO edge,
-// the ISR advances the lane target by exactly 10,000,000 ticks.
-void interrupt_ocxo_phase_grid_epoch(uint32_t ocxo1_first_target_counter32,
-                                     uint32_t ocxo2_first_target_counter32);
+// Every tenth custody event is a Gamma 100 Hz courtroom sample, and every
+// thousandth custody event is the OCXO-local one-second edge.
+void interrupt_ocxo_logical_grid_epoch(uint32_t ocxo1_epoch_counter32,
+                                       uint32_t ocxo2_epoch_counter32);
 
 
 // ============================================================================
@@ -612,15 +597,6 @@ bool interrupt_subscribe(const interrupt_subscription_t& sub);
 bool interrupt_start(interrupt_subscriber_kind_t kind);
 bool interrupt_stop(interrupt_subscriber_kind_t kind);
 
-// OCXO hardware ownership gate for the process_witness stripped-down OCXO
-// experiment. Releasing a lane disables process_interrupt compare ownership,
-// suppresses cadence-minder hardware reads for that lane, and allows another
-// module to attach the corresponding QTimer vector/registers. Reclaiming a
-// lane restores the normal process_interrupt QTimer configuration/vector.
-bool interrupt_ocxo_release(interrupt_subscriber_kind_t kind);
-bool interrupt_ocxo_reclaim(interrupt_subscriber_kind_t kind);
-bool interrupt_ocxo_owned_by_interrupt(interrupt_subscriber_kind_t kind);
-
 // ── PPS-anchored epoch installation ──
 //
 // Alpha calls interrupt_request_pps_rebootstrap() when it needs a fresh
@@ -680,11 +656,11 @@ void interrupt_register_pps_entry_latency_handler(
     interrupt_pps_entry_latency_handler_fn cb);
 
 // ============================================================================
-// QTimer2 CH1 compare service — hosted hardware rail for process_witness
+// QTimer1 CH1 compare service — hosted hardware rail for process_witness
 // ============================================================================
 //
 // CH1 is a VCLOCK-domain compare rail owned by process_interrupt. Clients do
-// not touch QTimer2 registers. A client registers a single IRQ-context handler
+// not touch QTimer1 registers. A client registers a single IRQ-context handler
 // and asks process_interrupt to arm a synthetic 32-bit VCLOCK target.
 // process_interrupt advances any required 16-bit compare hops internally and
 // invokes the handler only at the requested target event.
@@ -693,7 +669,7 @@ void interrupt_register_pps_entry_latency_handler(
 // VCLOCK phase probe. process_interrupt arbitrates these targets so hosted
 // callers do not directly fight the PPS probe.
 
-struct interrupt_qtimer2_ch1_compare_event_t {
+struct interrupt_qtimer1_ch1_compare_event_t {
   uint32_t sequence = 0;
   uint32_t target_counter32 = 0;
   uint32_t counter32_at_event = 0;
@@ -710,34 +686,23 @@ struct interrupt_qtimer2_ch1_compare_event_t {
   int64_t  gnss_ns_at_event = -1;
 };
 
-using interrupt_qtimer2_ch1_handler_fn =
-    void (*)(const interrupt_qtimer2_ch1_compare_event_t& event);
+using interrupt_qtimer1_ch1_handler_fn =
+    void (*)(const interrupt_qtimer1_ch1_compare_event_t& event);
 
-void interrupt_register_qtimer2_ch1_handler(interrupt_qtimer2_ch1_handler_fn cb);
-bool interrupt_qtimer2_ch1_arm_compare(uint32_t target_counter32);
-void interrupt_qtimer2_ch1_disable_compare(void);
-
-uint16_t interrupt_qtimer2_ch1_counter_now(void);
-uint16_t interrupt_qtimer2_ch1_comp1_now(void);
-uint16_t interrupt_qtimer2_ch1_csctrl_now(void);
-
-// Compatibility aliases for modules that still include/call the historical
-// QTimer1-hosted API names.  These now forward to the QTimer2 sovereign rail.
-using interrupt_qtimer1_ch1_compare_event_t = interrupt_qtimer2_ch1_compare_event_t;
-using interrupt_qtimer1_ch1_handler_fn = interrupt_qtimer2_ch1_handler_fn;
 void interrupt_register_qtimer1_ch1_handler(interrupt_qtimer1_ch1_handler_fn cb);
 bool interrupt_qtimer1_ch1_arm_compare(uint32_t target_counter32);
 void interrupt_qtimer1_ch1_disable_compare(void);
+
 uint16_t interrupt_qtimer1_ch1_counter_now(void);
 uint16_t interrupt_qtimer1_ch1_comp1_now(void);
 uint16_t interrupt_qtimer1_ch1_csctrl_now(void);
 
 // ============================================================================
-// QTimer2 CH2 IRQ-context handler — TimePop scheduler heartbeat
+// QTimer1 CH2 IRQ-context handler — TimePop scheduler heartbeat
 // ============================================================================
 //
 // TimePop registers a single CH2 handler at init.  process_interrupt's
-// QTimer2 ISR captures DWT as the first instruction, then on every CH2
+// QTimer1 ISR captures DWT as the first instruction, then on every CH2
 // compare-match assembles a standard interrupt_event_t and
 // interrupt_capture_diag_t (kind = TIMEPOP) and invokes this handler in
 // IRQ context.  Unlike VCLOCK/OCXO subscriptions, CH2 delivery is NOT
@@ -745,27 +710,23 @@ uint16_t interrupt_qtimer1_ch1_csctrl_now(void);
 //
 // Pass nullptr to unregister.  Only one CH2 handler may be registered.
 
-using interrupt_qtimer2_ch2_handler_fn =
+using interrupt_qtimer1_ch2_handler_fn =
     void (*)(const interrupt_event_t& event,
              const interrupt_capture_diag_t& diag);
 
-void interrupt_register_qtimer2_ch2_handler(interrupt_qtimer2_ch2_handler_fn cb);
-
-using interrupt_qtimer1_ch2_handler_fn = interrupt_qtimer2_ch2_handler_fn;
 void interrupt_register_qtimer1_ch2_handler(interrupt_qtimer1_ch2_handler_fn cb);
 
 // ============================================================================
-// TimePop hardware service API — process_interrupt owns QTimer2 CH2 hardware
+// TimePop hardware service API — process_interrupt owns QTimer1 CH2 hardware
 // ============================================================================
 //
 // TimePop remains the scheduling policy engine, but it no longer programs
-// QTimer2 CH2 or reads the VCLOCK counter directly.  It asks process_interrupt
+// QTimer1 CH2 or reads the VCLOCK counter directly.  It asks process_interrupt
 // to perform hardware actions and to provide explicitly ambient scheduling
 // observations.  These observations are NOT event facts.
 
 uint32_t interrupt_vclock_counter32_observe_ambient(void);
-void     interrupt_qtimer2_ch2_arm_compare(uint32_t target_counter32);
-void     interrupt_qtimer1_ch2_arm_compare(uint32_t target_counter32);  // compatibility alias
+void     interrupt_qtimer1_ch2_arm_compare(uint32_t target_counter32);
 
 // ============================================================================
 // Private synthetic clock32 API
@@ -791,12 +752,9 @@ bool     interrupt_clock32_zero_from_ns(interrupt_subscriber_kind_t kind,
 bool     interrupt_clock32_request_zero_from_ns(interrupt_subscriber_kind_t kind,
                                                 uint64_t ns);
 
-uint16_t interrupt_qtimer2_ch2_counter_now(void);
-uint16_t interrupt_qtimer2_ch2_comp1_now(void);
-uint16_t interrupt_qtimer2_ch2_csctrl_now(void);
-uint16_t interrupt_qtimer1_ch2_counter_now(void);  // compatibility alias
-uint16_t interrupt_qtimer1_ch2_comp1_now(void);    // compatibility alias
-uint16_t interrupt_qtimer1_ch2_csctrl_now(void);   // compatibility alias
+uint16_t interrupt_qtimer1_ch2_counter_now(void);
+uint16_t interrupt_qtimer1_ch2_comp1_now(void);
+uint16_t interrupt_qtimer1_ch2_csctrl_now(void);
 
 // ============================================================================
 // ISR entry points (invoked by vector shims)
@@ -813,11 +771,9 @@ void process_interrupt_gpio6789_irq  (uint32_t isr_entry_dwt_raw);
 // Counter accessors (diagnostic, free-running)
 // ============================================================================
 
-uint16_t interrupt_qtimer1_ch0_counter_now(void);  // OCXO1 after QTimer1/QTimer2 role swap
-uint16_t interrupt_qtimer2_ch0_counter_now(void);  // compatibility alias; now VCLOCK low-word
+uint16_t interrupt_qtimer2_ch0_counter_now(void);
 uint16_t interrupt_qtimer3_ch3_counter_now(void);
-uint32_t interrupt_qtimer2_counter32_now (void);   // VCLOCK counter32 after role swap
-uint32_t interrupt_qtimer1_counter32_now (void);   // compatibility alias
+uint32_t interrupt_qtimer1_counter32_now (void);
 
 // ============================================================================
 // Dynamic DWT cycles per GNSS second — compatibility accessor
