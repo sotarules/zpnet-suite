@@ -1156,14 +1156,55 @@ static interrupt_smartzero_snapshot_t g_alpha_epoch_last_smartzero = {};
 static volatile uint32_t g_alpha_smartzero_begin_count = 0;
 static volatile uint32_t g_alpha_smartzero_begin_failures = 0;
 
+// Non-destructive SmartZero begin forensics. These describe the live
+// acquisition request, not the installed epoch proof.
+static volatile bool     g_alpha_smartzero_last_begin_preserved_epoch = false;
+static volatile uint32_t g_alpha_smartzero_last_begin_preserved_epoch_sequence = 0;
+static volatile uint32_t g_alpha_smartzero_begin_preserved_epoch_count = 0;
+static volatile uint32_t g_alpha_smartzero_begin_cold_count = 0;
+static char              g_alpha_smartzero_last_begin_reason[32] = {0};
+static volatile bool     g_alpha_smartzero_pending_active = false;
+static char              g_alpha_smartzero_pending_reason[32] = {0};
+
 bool clocks_alpha_epoch_last_smartzero(interrupt_smartzero_snapshot_t* out) {
   if (!out) return false;
   *out = g_alpha_epoch_last_smartzero;
   return out->complete;
 }
 
+bool clocks_alpha_installed_smartzero_valid(void) {
+  return g_alpha_epoch_last_smartzero.complete;
+}
+
+uint32_t clocks_alpha_installed_smartzero_sequence(void) {
+  return g_alpha_epoch_last_smartzero.sequence;
+}
+
 uint32_t clocks_alpha_smartzero_begin_count(void) { return g_alpha_smartzero_begin_count; }
 uint32_t clocks_alpha_smartzero_begin_failures(void) { return g_alpha_smartzero_begin_failures; }
+bool clocks_alpha_smartzero_pending_active(void) { return g_alpha_smartzero_pending_active; }
+const char* clocks_alpha_smartzero_pending_reason(void) {
+  return g_alpha_smartzero_pending_active ? g_alpha_smartzero_pending_reason : "";
+}
+void clocks_alpha_smartzero_pending_clear(void) {
+  g_alpha_smartzero_pending_active = false;
+  g_alpha_smartzero_pending_reason[0] = '\0';
+}
+bool clocks_alpha_smartzero_last_begin_preserved_epoch(void) {
+  return g_alpha_smartzero_last_begin_preserved_epoch;
+}
+uint32_t clocks_alpha_smartzero_last_begin_preserved_epoch_sequence(void) {
+  return g_alpha_smartzero_last_begin_preserved_epoch_sequence;
+}
+uint32_t clocks_alpha_smartzero_begin_preserved_epoch_count(void) {
+  return g_alpha_smartzero_begin_preserved_epoch_count;
+}
+uint32_t clocks_alpha_smartzero_begin_cold_count(void) {
+  return g_alpha_smartzero_begin_cold_count;
+}
+const char* clocks_alpha_smartzero_last_begin_reason(void) {
+  return g_alpha_smartzero_last_begin_reason;
+}
 
 // Runtime PPS/VCLOCK sampling no longer requires the epoch-capture packet.
 // START/ZERO still require a valid capture packet, but ordinary per-second
@@ -1245,23 +1286,49 @@ static void alpha_reset_canonical_clock_state_for_new_epoch(void) {
 }
 
 bool clocks_alpha_begin_smartzero_epoch(const char* reason) {
-  alpha_reset_canonical_clock_state_for_new_epoch();
-  g_epoch_initialized = false;
-  g_alpha_epoch_last_smartzero = interrupt_smartzero_snapshot_t{};
+  const char* begin_reason = (reason && *reason) ? reason : "smartzero";
+  const bool preserved_epoch = g_epoch_initialized;
 
-  timebase_invalidate();
-  time_pps_vclock_epoch_reset(0, 0);
-  time_clock_reset_all();
+  // Beginning SmartZero is not an epoch event. If a service/science epoch is
+  // already installed, keep it alive while the replacement proof is acquired.
+  // The destructive rebase remains in clocks_alpha_zero_from_smartzero(), where
+  // a complete three-lane proof exists and can be installed atomically.
+  safeCopy(g_alpha_smartzero_last_begin_reason,
+           sizeof(g_alpha_smartzero_last_begin_reason),
+           begin_reason);
+  safeCopy(g_alpha_smartzero_pending_reason,
+           sizeof(g_alpha_smartzero_pending_reason),
+           begin_reason);
+  g_alpha_smartzero_pending_active = true;
+  g_alpha_smartzero_last_begin_preserved_epoch = preserved_epoch;
+  g_alpha_smartzero_last_begin_preserved_epoch_sequence =
+      preserved_epoch ? g_alpha_epoch_sequence : 0;
 
-  safeCopy(g_alpha_epoch_last_reason, sizeof(g_alpha_epoch_last_reason),
-           (reason && *reason) ? reason : "smartzero");
+  if (preserved_epoch) {
+    g_alpha_smartzero_begin_preserved_epoch_count++;
+  } else {
+    // Cold-start path: no epoch exists yet, so there is no service coordinate
+    // system to preserve. Retain the old cleanup only for first-ever acquisition.
+    alpha_reset_canonical_clock_state_for_new_epoch();
+    g_epoch_initialized = false;
+    timebase_invalidate();
+    time_pps_vclock_epoch_reset(0, 0);
+    time_clock_reset_all();
+    g_alpha_smartzero_begin_cold_count++;
+    safeCopy(g_alpha_epoch_last_reason, sizeof(g_alpha_epoch_last_reason),
+             begin_reason);
+  }
 
   const bool ok = interrupt_smartzero_begin();
   if (ok) {
     g_alpha_smartzero_begin_count++;
   } else {
+    g_alpha_smartzero_pending_active = false;
+    g_alpha_smartzero_pending_reason[0] = '\0';
     g_alpha_smartzero_begin_failures++;
-    g_alpha_epoch_install_failures++;
+    if (!preserved_epoch) {
+      g_alpha_epoch_install_failures++;
+    }
   }
   return ok;
 }
@@ -1342,6 +1409,7 @@ bool clocks_alpha_zero_from_smartzero(const char* reason) {
   g_alpha_epoch_last_ocxo1_hardware16 = ocxo1.anchor_hardware16;
   g_alpha_epoch_last_ocxo2_hardware16 = ocxo2.anchor_hardware16;
   g_alpha_epoch_last_smartzero = z;
+  clocks_alpha_smartzero_pending_clear();
 
   safeCopy(g_alpha_epoch_last_reason, sizeof(g_alpha_epoch_last_reason),
            (reason && *reason) ? reason : "smartzero");

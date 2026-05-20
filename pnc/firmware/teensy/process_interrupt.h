@@ -346,6 +346,7 @@ enum class interrupt_smartzero_phase_t : uint8_t {
   IDLE     = 0,
   RUNNING  = 1,
   COMPLETE = 2,
+  ABORTED  = 3,
 };
 
 enum class interrupt_smartzero_lane_state_t : uint8_t {
@@ -407,6 +408,7 @@ struct interrupt_smartzero_snapshot_t {
   interrupt_smartzero_phase_t phase = interrupt_smartzero_phase_t::IDLE;
   bool running = false;
   bool complete = false;
+  bool aborted = false;
   uint32_t sequence = 0;
   uint32_t begin_count = 0;
   uint32_t complete_count = 0;
@@ -423,6 +425,15 @@ bool interrupt_smartzero_begin(void);
 void interrupt_smartzero_abort(void);
 bool interrupt_smartzero_running(void);
 bool interrupt_smartzero_complete(void);
+
+// Live acquisition attempt snapshot.  This is deliberately distinct from the
+// CLOCKS-installed SmartZero proof that backs the active epoch.  Live may be
+// RUNNING, COMPLETE, ABORTED, or IDLE; an ABORTED/IDLE live acquisition does
+// not invalidate the previously installed proof.
+bool interrupt_smartzero_live_snapshot(interrupt_smartzero_snapshot_t* out);
+
+// Compatibility alias for existing callers.  Semantically this returns the
+// live acquisition attempt, not the installed epoch proof.
 bool interrupt_smartzero_snapshot(interrupt_smartzero_snapshot_t* out);
 
 // ============================================================================

@@ -1561,6 +1561,15 @@ static const char* smartzero_lane_state_name(interrupt_smartzero_lane_state_t s)
   }
 }
 
+static const char* smartzero_phase_name(interrupt_smartzero_phase_t p) {
+  switch (p) {
+    case interrupt_smartzero_phase_t::RUNNING:  return "RUNNING";
+    case interrupt_smartzero_phase_t::COMPLETE: return "COMPLETE";
+    case interrupt_smartzero_phase_t::ABORTED:  return "ABORTED";
+    default:                                    return "IDLE";
+  }
+}
+
 static inline void smartzero_write_begin(void) {
   g_smartzero.seq++;
   dmb_barrier();
@@ -1864,8 +1873,18 @@ void interrupt_smartzero_abort(void) {
   smartzero_write_begin();
   g_smartzero.running = false;
   g_smartzero.complete = false;
-  g_smartzero.phase = interrupt_smartzero_phase_t::IDLE;
+  g_smartzero.phase = interrupt_smartzero_phase_t::ABORTED;
   g_smartzero.abort_count++;
+  g_smartzero.current_lane_index = SMARTZERO_LANE_COUNT;
+
+  // Live acquisition state is not the installed proof.  When a live attempt
+  // is aborted, clear its lane proof surface so reports do not show stale
+  // LOCKED anchors under smartzero_complete=false.  CLOCKS/Alpha retains the
+  // installed SmartZero proof separately.
+  for (uint32_t i = 0; i < SMARTZERO_LANE_COUNT; i++) {
+    smartzero_reset_lane(i);
+  }
+
   ocxo_lane_disable_compare(g_ocxo1_lane);
   ocxo_lane_disable_compare(g_ocxo2_lane);
   smartzero_write_end();
@@ -1879,7 +1898,7 @@ bool interrupt_smartzero_complete(void) {
   return g_smartzero.complete;
 }
 
-bool interrupt_smartzero_snapshot(interrupt_smartzero_snapshot_t* out) {
+bool interrupt_smartzero_live_snapshot(interrupt_smartzero_snapshot_t* out) {
   if (!out) return false;
 
   for (int attempt = 0; attempt < 4; attempt++) {
@@ -1890,12 +1909,15 @@ bool interrupt_smartzero_snapshot(interrupt_smartzero_snapshot_t* out) {
     local.phase = g_smartzero.phase;
     local.running = g_smartzero.running;
     local.complete = g_smartzero.complete;
+    local.aborted = (g_smartzero.phase == interrupt_smartzero_phase_t::ABORTED);
     local.sequence = g_smartzero.sequence;
     local.begin_count = g_smartzero.begin_count;
     local.complete_count = g_smartzero.complete_count;
     local.abort_count = g_smartzero.abort_count;
     local.current_lane_index = g_smartzero.current_lane_index;
-    local.current_lane = smartzero_kind_for_index(g_smartzero.current_lane_index);
+    local.current_lane = g_smartzero.running
+        ? smartzero_kind_for_index(g_smartzero.current_lane_index)
+        : interrupt_subscriber_kind_t::NONE;
     local.tolerance_cycles = SMARTZERO_INTERVAL_TOLERANCE_CYCLES;
     local.sample_rate_hz = SMARTZERO_SAMPLE_RATE_HZ;
     local.counter_delta_ticks = SMARTZERO_INTERVAL_TICKS;
@@ -1913,6 +1935,10 @@ bool interrupt_smartzero_snapshot(interrupt_smartzero_snapshot_t* out) {
 
   *out = interrupt_smartzero_snapshot_t{};
   return false;
+}
+
+bool interrupt_smartzero_snapshot(interrupt_smartzero_snapshot_t* out) {
+  return interrupt_smartzero_live_snapshot(out);
 }
 
 // ============================================================================
@@ -4068,11 +4094,29 @@ static void add_smartzero_lane_payload(Payload& parent,
 
 static void add_smartzero_payload(Payload& p) {
   interrupt_smartzero_snapshot_t z{};
-  (void)interrupt_smartzero_snapshot(&z);
+  (void)interrupt_smartzero_live_snapshot(&z);
 
-  p.add("smartzero_phase", z.complete ? "COMPLETE" : (z.running ? "RUNNING" : "IDLE"));
+  // Explicit live-acquisition surface.  This is NOT the installed epoch proof.
+  p.add("live_smartzero_phase", smartzero_phase_name(z.phase));
+  p.add("live_smartzero_running", z.running);
+  p.add("live_smartzero_complete", z.complete);
+  p.add("live_smartzero_aborted", z.aborted);
+  p.add("live_smartzero_sequence", z.sequence);
+  p.add("live_smartzero_begin_count", z.begin_count);
+  p.add("live_smartzero_complete_count", z.complete_count);
+  p.add("live_smartzero_abort_count", z.abort_count);
+  p.add("live_smartzero_current_lane_index", z.current_lane_index);
+  p.add("live_smartzero_current_lane", interrupt_subscriber_kind_str(z.current_lane));
+  p.add("live_smartzero_sample_rate_hz", z.sample_rate_hz);
+  p.add("live_smartzero_counter_delta_ticks", z.counter_delta_ticks);
+  p.add("live_smartzero_tolerance_cycles", z.tolerance_cycles);
+
+  // Legacy aliases retained for existing tooling.  These names refer to the
+  // live acquisition attempt only; CLOCKS reports the installed proof.
+  p.add("smartzero_phase", smartzero_phase_name(z.phase));
   p.add("smartzero_running", z.running);
   p.add("smartzero_complete", z.complete);
+  p.add("smartzero_aborted", z.aborted);
   p.add("smartzero_sequence", z.sequence);
   p.add("smartzero_begin_count", z.begin_count);
   p.add("smartzero_complete_count", z.complete_count);
@@ -4083,11 +4127,17 @@ static void add_smartzero_payload(Payload& p) {
   p.add("smartzero_counter_delta_ticks", z.counter_delta_ticks);
   p.add("smartzero_tolerance_cycles", z.tolerance_cycles);
 
-  Payload lanes;
-  add_smartzero_lane_payload(lanes, "vclock", z.lanes[0]);
-  add_smartzero_lane_payload(lanes, "ocxo1", z.lanes[1]);
-  add_smartzero_lane_payload(lanes, "ocxo2", z.lanes[2]);
-  p.add_object("smartzero", lanes);
+  Payload live_lanes;
+  add_smartzero_lane_payload(live_lanes, "vclock", z.lanes[0]);
+  add_smartzero_lane_payload(live_lanes, "ocxo1", z.lanes[1]);
+  add_smartzero_lane_payload(live_lanes, "ocxo2", z.lanes[2]);
+  p.add_object("live_smartzero", live_lanes);
+
+  Payload legacy_lanes;
+  add_smartzero_lane_payload(legacy_lanes, "vclock", z.lanes[0]);
+  add_smartzero_lane_payload(legacy_lanes, "ocxo1", z.lanes[1]);
+  add_smartzero_lane_payload(legacy_lanes, "ocxo2", z.lanes[2]);
+  p.add_object("smartzero", legacy_lanes);  // legacy live alias
 }
 
 static void add_vclock_clock32_payload(Payload& p, const char* prefix) {

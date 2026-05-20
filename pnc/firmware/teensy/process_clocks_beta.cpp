@@ -382,6 +382,15 @@ static const char* smartzero_lane_state_name_beta(interrupt_smartzero_lane_state
   }
 }
 
+static const char* smartzero_phase_name_beta(interrupt_smartzero_phase_t p) {
+  switch (p) {
+    case interrupt_smartzero_phase_t::RUNNING:  return "RUNNING";
+    case interrupt_smartzero_phase_t::COMPLETE: return "COMPLETE";
+    case interrupt_smartzero_phase_t::ABORTED:  return "ABORTED";
+    default:                                    return "IDLE";
+  }
+}
+
 static const char* smartzero_decision_name_beta(interrupt_smartzero_decision_t d) {
   switch (d) {
     case interrupt_smartzero_decision_t::WAITING_FOR_CPS:  return "WAITING_FOR_CPS";
@@ -423,26 +432,137 @@ static void payload_add_smartzero_lane(Payload& parent,
   parent.add_object(key, lane);
 }
 
-static void payload_add_smartzero_summary(Payload& p) {
-  interrupt_smartzero_snapshot_t z{};
-  (void)interrupt_smartzero_snapshot(&z);
-  p.add("smartzero_running", z.running);
-  p.add("smartzero_complete", z.complete);
-  p.add("smartzero_sequence", z.sequence);
-  p.add("smartzero_begin_count", z.begin_count);
-  p.add("smartzero_complete_count", z.complete_count);
-  p.add("smartzero_abort_count", z.abort_count);
-  p.add("smartzero_current_lane", interrupt_subscriber_kind_str(z.current_lane));
-  p.add("smartzero_current_lane_index", z.current_lane_index);
-  p.add("smartzero_sample_rate_hz", z.sample_rate_hz);
-  p.add("smartzero_counter_delta_ticks", z.counter_delta_ticks);
-  p.add("smartzero_tolerance_cycles", z.tolerance_cycles);
+static void payload_add_smartzero_snapshot_object(
+  Payload& parent,
+  const char* key,
+  const interrupt_smartzero_snapshot_t& z,
+  bool valid,
+  bool include_lanes
+) {
+  Payload obj;
+  obj.add("valid", valid);
+  obj.add("phase", smartzero_phase_name_beta(z.phase));
+  obj.add("running", z.running);
+  obj.add("complete", z.complete);
+  obj.add("aborted", z.aborted);
+  obj.add("sequence", z.sequence);
+  obj.add("begin_count", z.begin_count);
+  obj.add("complete_count", z.complete_count);
+  obj.add("abort_count", z.abort_count);
+  obj.add("current_lane", interrupt_subscriber_kind_str(z.current_lane));
+  obj.add("current_lane_index", z.current_lane_index);
+  obj.add("sample_rate_hz", z.sample_rate_hz);
+  obj.add("counter_delta_ticks", z.counter_delta_ticks);
+  obj.add("tolerance_cycles", z.tolerance_cycles);
 
-  Payload lanes;
-  payload_add_smartzero_lane(lanes, "vclock", z.lanes[0]);
-  payload_add_smartzero_lane(lanes, "ocxo1", z.lanes[1]);
-  payload_add_smartzero_lane(lanes, "ocxo2", z.lanes[2]);
-  p.add_object("smartzero", lanes);
+  if (include_lanes) {
+    Payload lanes;
+    payload_add_smartzero_lane(lanes, "vclock", z.lanes[0]);
+    payload_add_smartzero_lane(lanes, "ocxo1", z.lanes[1]);
+    payload_add_smartzero_lane(lanes, "ocxo2", z.lanes[2]);
+    obj.add_object("lanes", lanes);
+  }
+
+  parent.add_object(key, obj);
+}
+
+static void payload_add_prefixed_smartzero_compact(
+  Payload& p,
+  const char* prefix,
+  const interrupt_smartzero_snapshot_t& z,
+  bool valid
+) {
+  char key[96];
+  auto add_bool = [&](const char* suffix, bool value) {
+    snprintf(key, sizeof(key), "%s_%s", prefix, suffix);
+    p.add(key, value);
+  };
+  auto add_u32 = [&](const char* suffix, uint32_t value) {
+    snprintf(key, sizeof(key), "%s_%s", prefix, suffix);
+    p.add(key, value);
+  };
+  auto add_str = [&](const char* suffix, const char* value) {
+    snprintf(key, sizeof(key), "%s_%s", prefix, suffix);
+    p.add(key, value ? value : "");
+  };
+
+  add_bool("valid", valid);
+  add_str("phase", smartzero_phase_name_beta(z.phase));
+  add_bool("running", z.running);
+  add_bool("complete", z.complete);
+  add_bool("aborted", z.aborted);
+  add_u32("sequence", z.sequence);
+  add_u32("begin_count", z.begin_count);
+  add_u32("complete_count", z.complete_count);
+  add_u32("abort_count", z.abort_count);
+  add_str("current_lane", interrupt_subscriber_kind_str(z.current_lane));
+  add_u32("current_lane_index", z.current_lane_index);
+}
+
+static void payload_add_smartzero_summary(Payload& p) {
+  interrupt_smartzero_snapshot_t live{};
+  (void)interrupt_smartzero_live_snapshot(&live);
+
+  interrupt_smartzero_snapshot_t installed{};
+  const bool installed_valid = clocks_alpha_epoch_last_smartzero(&installed);
+  const bool installed_backing_epoch = installed_valid && clocks_alpha_epoch_initialized();
+
+  payload_add_prefixed_smartzero_compact(p, "installed_smartzero", installed, installed_valid);
+  p.add("installed_smartzero_backing_epoch", installed_backing_epoch);
+  p.add("installed_smartzero_epoch_sequence", clocks_alpha_epoch_sequence());
+  if (installed_valid) {
+    p.add("installed_smartzero_vclock_anchor_dwt", installed.lanes[0].anchor_dwt);
+    p.add("installed_smartzero_ocxo1_anchor_dwt", installed.lanes[1].anchor_dwt);
+    p.add("installed_smartzero_ocxo2_anchor_dwt", installed.lanes[2].anchor_dwt);
+    p.add("installed_smartzero_vclock_anchor_counter32", installed.lanes[0].anchor_counter32);
+    p.add("installed_smartzero_ocxo1_anchor_counter32", installed.lanes[1].anchor_counter32);
+    p.add("installed_smartzero_ocxo2_anchor_counter32", installed.lanes[2].anchor_counter32);
+  } else {
+    p.add("installed_smartzero_vclock_anchor_dwt", 0U);
+    p.add("installed_smartzero_ocxo1_anchor_dwt", 0U);
+    p.add("installed_smartzero_ocxo2_anchor_dwt", 0U);
+    p.add("installed_smartzero_vclock_anchor_counter32", 0U);
+    p.add("installed_smartzero_ocxo1_anchor_counter32", 0U);
+    p.add("installed_smartzero_ocxo2_anchor_counter32", 0U);
+  }
+
+  payload_add_prefixed_smartzero_compact(p, "live_smartzero", live, true);
+  p.add("smartzero_pending_active", clocks_alpha_smartzero_pending_active());
+  p.add("smartzero_pending_reason", clocks_alpha_smartzero_pending_reason());
+  p.add("smartzero_begin_service_epoch_preserved",
+        clocks_alpha_smartzero_last_begin_preserved_epoch());
+  p.add("smartzero_begin_preserved_epoch_sequence",
+        clocks_alpha_smartzero_last_begin_preserved_epoch_sequence());
+  p.add("smartzero_begin_reason", clocks_alpha_smartzero_last_begin_reason());
+  p.add("smartzero_begin_preserved_epoch_count",
+        clocks_alpha_smartzero_begin_preserved_epoch_count());
+  p.add("smartzero_begin_cold_count",
+        clocks_alpha_smartzero_begin_cold_count());
+
+  // Legacy aliases retained for existing tools.  These refer ONLY to the live
+  // acquisition attempt.  The installed proof is reported with the explicit
+  // installed_smartzero_* prefix and object below.
+  p.add("smartzero_running", live.running);
+  p.add("smartzero_complete", live.complete);
+  p.add("smartzero_aborted", live.aborted);
+  p.add("smartzero_sequence", live.sequence);
+  p.add("smartzero_begin_count", live.begin_count);
+  p.add("smartzero_complete_count", live.complete_count);
+  p.add("smartzero_abort_count", live.abort_count);
+  p.add("smartzero_current_lane", interrupt_subscriber_kind_str(live.current_lane));
+  p.add("smartzero_current_lane_index", live.current_lane_index);
+  p.add("smartzero_sample_rate_hz", live.sample_rate_hz);
+  p.add("smartzero_counter_delta_ticks", live.counter_delta_ticks);
+  p.add("smartzero_tolerance_cycles", live.tolerance_cycles);
+
+  payload_add_smartzero_snapshot_object(p, "installed_smartzero", installed, installed_valid, true);
+  payload_add_smartzero_snapshot_object(p, "live_smartzero", live, true, true);
+
+  Payload live_lanes;
+  payload_add_smartzero_lane(live_lanes, "vclock", live.lanes[0]);
+  payload_add_smartzero_lane(live_lanes, "ocxo1", live.lanes[1]);
+  payload_add_smartzero_lane(live_lanes, "ocxo2", live.lanes[2]);
+  p.add_object("smartzero", live_lanes);
 }
 
 static void publish_freq(Payload& p, const char* clock_name, double ppb_value) {
@@ -793,8 +913,10 @@ static void ocxo_dac_schedule_paced_commit(void) {
 // ============================================================================
 
 void clocks_zero_all(void) {
-  timebase_invalidate();
-
+  // Beta-local accounting reset only.  Alpha owns the active time/epoch
+  // projection. Do not invalidate it here: after SmartZero install the new
+  // epoch has just been authored; during acquisition the old service epoch
+  // must remain alive.
   campaign_seconds = 0;
 
   dwt_cycle_count_total = 0;
@@ -1030,6 +1152,7 @@ static bool clocks_try_finish_pending_smartzero(void) {
 
 void clocks_beta_pps(void) {
   if (request_stop) {
+    const bool was_started = (campaign_state == clocks_campaign_state_t::STARTED);
     watchdog_anomaly_active = false;
     campaign_state = clocks_campaign_state_t::STOPPED;
     request_stop = false;
@@ -1037,7 +1160,9 @@ void clocks_beta_pps(void) {
     calibrate_ocxo_mode = servo_mode_t::OFF;
     ocxo_dac_pacing_abort_all();
     campaign_warmup_reset();
-    timebase_invalidate();
+    if (was_started) {
+      timebase_invalidate();
+    }
     return;
   }
 
@@ -1339,8 +1464,10 @@ static Payload cmd_start(const Payload& args) {
   watchdog_anomaly_active = false;
   campaign_state = clocks_campaign_state_t::STOPPED;
   campaign_warmup_reset();
-  timebase_invalidate();
 
+  // Non-destructive SmartZero begin: preserve the currently installed service
+  // epoch while the replacement proof is acquired. The destructive science
+  // rebase happens only after clocks_alpha_zero_from_smartzero() succeeds.
   const bool smartzero_started = clocks_alpha_begin_smartzero_epoch("start");
   if (!smartzero_started) {
     request_start = false;
@@ -1355,6 +1482,12 @@ static Payload cmd_start(const Payload& args) {
   p.add("zero_installed", false);
   p.add("smartzero_required", true);
   p.add("smartzero_started", smartzero_started);
+  p.add("service_epoch_preserved",
+        clocks_alpha_smartzero_last_begin_preserved_epoch());
+  p.add("smartzero_begin_destructive", false);
+  p.add("smartzero_begin_reason", clocks_alpha_smartzero_last_begin_reason());
+  p.add("smartzero_pending_active", clocks_alpha_smartzero_pending_active());
+  p.add("smartzero_pending_reason", clocks_alpha_smartzero_pending_reason());
   p.add("epoch_owner", "CLOCKS_SMARTZERO");
   p.add("epoch_sequence", clocks_alpha_epoch_sequence());
   p.add("epoch_reason", clocks_alpha_epoch_last_reason());
@@ -1368,14 +1501,46 @@ static Payload cmd_start(const Payload& args) {
 }
 
 static Payload cmd_stop(const Payload&) {
+  const bool had_live_smartzero = interrupt_smartzero_running();
+  const bool had_pending_start = request_start;
+  const bool had_pending_zero = request_zero;
+
   interrupt_smartzero_abort();
-  request_stop = true;
+  if (had_live_smartzero || had_pending_start || had_pending_zero) {
+    clocks_alpha_smartzero_pending_clear();
+  }
+
   request_start = false;
   request_zero = false;
+  request_recover = false;
+
   Payload p;
-  p.add("status", "stop_requested");
+
+  if (campaign_state == clocks_campaign_state_t::STARTED) {
+    request_stop = true;
+    p.add("status", "stop_requested");
+    p.add("service_epoch_preserved", false);
+    return p;
+  }
+
+  // STOP while no campaign is running is a control-plane abort. It must not
+  // invalidate the installed epoch or defer a destructive stop branch to PPS.
+  request_stop = false;
+  watchdog_anomaly_active = false;
+  calibrate_ocxo_mode = servo_mode_t::OFF;
+  ocxo_dac_pacing_abort_all();
+
+  p.add("status", (had_live_smartzero || had_pending_start || had_pending_zero)
+                      ? "smartzero_abort_requested"
+                      : "stopped_idle");
+  p.add("service_epoch_preserved", true);
+  p.add("had_live_smartzero", had_live_smartzero);
+  p.add("had_pending_start", had_pending_start);
+  p.add("had_pending_zero", had_pending_zero);
+  payload_add_smartzero_summary(p);
   return p;
 }
+
 
 static Payload cmd_zero(const Payload&) {
   request_start = false;
@@ -1384,8 +1549,9 @@ static Payload cmd_zero(const Payload&) {
   request_zero = true;
   campaign_state = clocks_campaign_state_t::STOPPED;
   campaign_warmup_reset();
-  timebase_invalidate();
 
+  // ZERO acquisition is also non-destructive until a completed SmartZero proof
+  // is installed. Service time remains alive while the new proof is sought.
   const bool smartzero_started = clocks_alpha_begin_smartzero_epoch("zero");
   if (!smartzero_started) {
     request_zero = false;
@@ -1399,6 +1565,12 @@ static Payload cmd_zero(const Payload&) {
   p.add("zero_installed", false);
   p.add("smartzero_required", true);
   p.add("smartzero_started", smartzero_started);
+  p.add("service_epoch_preserved",
+        clocks_alpha_smartzero_last_begin_preserved_epoch());
+  p.add("smartzero_begin_destructive", false);
+  p.add("smartzero_begin_reason", clocks_alpha_smartzero_last_begin_reason());
+  p.add("smartzero_pending_active", clocks_alpha_smartzero_pending_active());
+  p.add("smartzero_pending_reason", clocks_alpha_smartzero_pending_reason());
   p.add("epoch_sequence", clocks_alpha_epoch_sequence());
   p.add("epoch_install_count", clocks_alpha_epoch_install_count());
   p.add("epoch_install_failures", clocks_alpha_epoch_install_failures());
@@ -1760,19 +1932,85 @@ static void add_epoch_payload(Payload& p) {
   p.add("epoch_capture_all_lanes_valid", clocks_alpha_epoch_last_all_lanes_valid());
   p.add("alpha_smartzero_begin_count", clocks_alpha_smartzero_begin_count());
   p.add("alpha_smartzero_begin_failures", clocks_alpha_smartzero_begin_failures());
+  p.add("alpha_smartzero_begin_preserved_epoch_count",
+        clocks_alpha_smartzero_begin_preserved_epoch_count());
+  p.add("alpha_smartzero_begin_cold_count",
+        clocks_alpha_smartzero_begin_cold_count());
+  p.add("alpha_smartzero_last_begin_preserved_epoch",
+        clocks_alpha_smartzero_last_begin_preserved_epoch());
+  p.add("alpha_smartzero_last_begin_preserved_epoch_sequence",
+        clocks_alpha_smartzero_last_begin_preserved_epoch_sequence());
+  p.add("alpha_smartzero_last_begin_reason",
+        clocks_alpha_smartzero_last_begin_reason());
+  p.add("smartzero_pending_active", clocks_alpha_smartzero_pending_active());
+  p.add("smartzero_pending_reason", clocks_alpha_smartzero_pending_reason());
+
+  interrupt_smartzero_snapshot_t installed{};
+  const bool installed_valid = clocks_alpha_epoch_last_smartzero(&installed);
+  p.add("installed_smartzero_valid", installed_valid);
+  p.add("installed_smartzero_backing_epoch",
+        installed_valid && clocks_alpha_epoch_initialized());
+  p.add("installed_smartzero_sequence", installed.sequence);
+  p.add("installed_smartzero_vclock_anchor_dwt",
+        installed_valid ? installed.lanes[0].anchor_dwt : 0U);
+  p.add("installed_smartzero_ocxo1_anchor_dwt",
+        installed_valid ? installed.lanes[1].anchor_dwt : 0U);
+  p.add("installed_smartzero_ocxo2_anchor_dwt",
+        installed_valid ? installed.lanes[2].anchor_dwt : 0U);
+
   p.add("interrupt_pps_rebootstrap_pending", interrupt_pps_rebootstrap_pending());
 }
 
 static void add_compact_smartzero_status(Payload& p) {
-  interrupt_smartzero_snapshot_t z{};
-  (void)interrupt_smartzero_snapshot(&z);
-  p.add("smartzero_running", z.running);
-  p.add("smartzero_complete", z.complete);
-  p.add("smartzero_sequence", z.sequence);
-  p.add("smartzero_current_lane", interrupt_subscriber_kind_str(z.current_lane));
-  p.add("smartzero_begin_count", z.begin_count);
-  p.add("smartzero_complete_count", z.complete_count);
-  p.add("smartzero_abort_count", z.abort_count);
+  interrupt_smartzero_snapshot_t installed{};
+  const bool installed_valid = clocks_alpha_epoch_last_smartzero(&installed);
+  const bool installed_backing_epoch = installed_valid && clocks_alpha_epoch_initialized();
+
+  interrupt_smartzero_snapshot_t live{};
+  (void)interrupt_smartzero_live_snapshot(&live);
+
+  p.add("installed_smartzero_valid", installed_valid);
+  p.add("installed_smartzero_backing_epoch", installed_backing_epoch);
+  p.add("installed_smartzero_sequence", installed.sequence);
+  p.add("installed_smartzero_vclock_anchor_dwt",
+        installed_valid ? installed.lanes[0].anchor_dwt : 0U);
+  p.add("installed_smartzero_ocxo1_anchor_dwt",
+        installed_valid ? installed.lanes[1].anchor_dwt : 0U);
+  p.add("installed_smartzero_ocxo2_anchor_dwt",
+        installed_valid ? installed.lanes[2].anchor_dwt : 0U);
+
+  p.add("live_smartzero_phase", smartzero_phase_name_beta(live.phase));
+  p.add("live_smartzero_running", live.running);
+  p.add("live_smartzero_complete", live.complete);
+  p.add("live_smartzero_aborted", live.aborted);
+  p.add("live_smartzero_sequence", live.sequence);
+  p.add("live_smartzero_current_lane",
+        interrupt_subscriber_kind_str(live.current_lane));
+  p.add("live_smartzero_begin_count", live.begin_count);
+  p.add("live_smartzero_complete_count", live.complete_count);
+  p.add("live_smartzero_abort_count", live.abort_count);
+
+  p.add("smartzero_pending_active", clocks_alpha_smartzero_pending_active());
+  p.add("smartzero_pending_reason", clocks_alpha_smartzero_pending_reason());
+  p.add("smartzero_begin_service_epoch_preserved",
+        clocks_alpha_smartzero_last_begin_preserved_epoch());
+  p.add("smartzero_begin_preserved_epoch_sequence",
+        clocks_alpha_smartzero_last_begin_preserved_epoch_sequence());
+  p.add("smartzero_begin_reason", clocks_alpha_smartzero_last_begin_reason());
+  p.add("smartzero_begin_preserved_epoch_count",
+        clocks_alpha_smartzero_begin_preserved_epoch_count());
+  p.add("smartzero_begin_cold_count",
+        clocks_alpha_smartzero_begin_cold_count());
+
+  // Legacy aliases: live acquisition only.
+  p.add("smartzero_running", live.running);
+  p.add("smartzero_complete", live.complete);
+  p.add("smartzero_aborted", live.aborted);
+  p.add("smartzero_sequence", live.sequence);
+  p.add("smartzero_current_lane", interrupt_subscriber_kind_str(live.current_lane));
+  p.add("smartzero_begin_count", live.begin_count);
+  p.add("smartzero_complete_count", live.complete_count);
+  p.add("smartzero_abort_count", live.abort_count);
 }
 
 static void add_dac_payload(Payload& p) {
@@ -1853,7 +2091,7 @@ static void add_dac_payload(Payload& p) {
 static Payload cmd_report(const Payload&) {
   Payload p;
   p.add("report", "CLOCKS_COMPACT");
-  p.add("subreports", "REPORT_STATUS REPORT_SUMMARY REPORT_EPOCH REPORT_SMARTZERO REPORT_FORENSICS REPORT_FORENSICS_VCLOCK REPORT_FORENSICS_OCXO1 REPORT_FORENSICS_OCXO2 REPORT_PREDICTION REPORT_STATS REPORT_DAC");
+  p.add("subreports", "REPORT_STATUS REPORT_SUMMARY REPORT_EPOCH REPORT_SMARTZERO REPORT_INSTALLED_SMARTZERO REPORT_LIVE_SMARTZERO REPORT_FORENSICS REPORT_FORENSICS_VCLOCK REPORT_FORENSICS_OCXO1 REPORT_FORENSICS_OCXO2 REPORT_PREDICTION REPORT_STATS REPORT_DAC");
   add_summary_payload(p);
   add_campaign_payload(p);
 
@@ -1898,6 +2136,33 @@ static Payload cmd_report_smartzero(const Payload&) {
   Payload p;
   p.add("report", "CLOCKS_SMARTZERO");
   payload_add_smartzero_summary(p);
+  return p;
+}
+
+static Payload cmd_report_installed_smartzero(const Payload&) {
+  Payload p;
+  p.add("report", "CLOCKS_INSTALLED_SMARTZERO");
+  interrupt_smartzero_snapshot_t installed{};
+  const bool installed_valid = clocks_alpha_epoch_last_smartzero(&installed);
+  payload_add_smartzero_snapshot_object(
+      p,
+      "installed_smartzero",
+      installed,
+      installed_valid,
+      true);
+  p.add("installed_smartzero_backing_epoch",
+        installed_valid && clocks_alpha_epoch_initialized());
+  p.add("epoch_sequence", clocks_alpha_epoch_sequence());
+  p.add("epoch_reason", clocks_alpha_epoch_last_reason());
+  return p;
+}
+
+static Payload cmd_report_live_smartzero(const Payload&) {
+  Payload p;
+  p.add("report", "CLOCKS_LIVE_SMARTZERO");
+  interrupt_smartzero_snapshot_t live{};
+  (void)interrupt_smartzero_live_snapshot(&live);
+  payload_add_smartzero_snapshot_object(p, "live_smartzero", live, true, true);
   return p;
 }
 
@@ -2027,6 +2292,8 @@ static const process_command_entry_t CLOCKS_COMMANDS[] = {
   { "REPORT_SUMMARY",    cmd_report_summary    },
   { "REPORT_EPOCH",      cmd_report_epoch      },
   { "REPORT_SMARTZERO",  cmd_report_smartzero  },
+  { "REPORT_INSTALLED_SMARTZERO", cmd_report_installed_smartzero },
+  { "REPORT_LIVE_SMARTZERO",      cmd_report_live_smartzero      },
   { "REPORT_FORENSICS",        cmd_report_forensics        },
   { "REPORT_FORENSICS_VCLOCK", cmd_report_forensics_vclock },
   { "REPORT_FORENSICS_OCXO1",  cmd_report_forensics_ocxo1  },
