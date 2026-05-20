@@ -97,6 +97,10 @@ bool g_ad5693r_init_ok = false;
 // ============================================================================
 
 static volatile bool g_epoch_initialized = false;
+// Set only while a completed live SmartZero proof is being committed into a
+// new science epoch.  Event consumers treat the epoch as not ready during this
+// short transaction so they cannot observe half-rebased Alpha state.
+static volatile bool g_alpha_epoch_install_in_progress = false;
 
 // Last VCLOCK event DWT, retained only for PPS-vs-VCLOCK phase diagnostics.
 static volatile uint32_t g_prev_dwt_at_vclock_event = 0;
@@ -417,11 +421,11 @@ static inline void dwt_enable(void) {
 }
 
 bool clocks_epoch_pending(void) {
-  return interrupt_smartzero_running();
+  return interrupt_smartzero_running() || g_alpha_epoch_install_in_progress;
 }
 
 static inline bool epoch_ready(void) {
-  return g_epoch_initialized;
+  return g_epoch_initialized && !g_alpha_epoch_install_in_progress;
 }
 
 static inline uint64_t nominal_ns_from_counter32_epoch(uint32_t counter32,
@@ -1166,6 +1170,56 @@ static char              g_alpha_smartzero_last_begin_reason[32] = {0};
 static volatile bool     g_alpha_smartzero_pending_active = false;
 static char              g_alpha_smartzero_pending_reason[32] = {0};
 
+// Atomic SmartZero install transaction forensics.  Beginning SmartZero is a
+// live acquisition event; installing SmartZero is the only epoch event.  These
+// fields bracket that commit so reports can distinguish a fully committed epoch
+// from an in-progress rebase.
+static constexpr uint32_t SMARTZERO_INSTALL_STAGE_IDLE             = 0;
+static constexpr uint32_t SMARTZERO_INSTALL_STAGE_SNAPSHOT         = 1;
+static constexpr uint32_t SMARTZERO_INSTALL_STAGE_VALIDATE         = 2;
+static constexpr uint32_t SMARTZERO_INSTALL_STAGE_RESET_STATE      = 3;
+static constexpr uint32_t SMARTZERO_INSTALL_STAGE_INSTALL_ANCHORS  = 4;
+static constexpr uint32_t SMARTZERO_INSTALL_STAGE_DWT64            = 5;
+static constexpr uint32_t SMARTZERO_INSTALL_STAGE_TIME_ANCHORS     = 6;
+static constexpr uint32_t SMARTZERO_INSTALL_STAGE_TIMEPOP_REAUTHOR = 7;
+static constexpr uint32_t SMARTZERO_INSTALL_STAGE_COMMIT           = 8;
+static constexpr uint32_t SMARTZERO_INSTALL_STAGE_FAIL             = 9;
+
+static constexpr uint32_t SMARTZERO_INSTALL_FAIL_NONE              = 0;
+static constexpr uint32_t SMARTZERO_INSTALL_FAIL_REENTRANT         = 1;
+static constexpr uint32_t SMARTZERO_INSTALL_FAIL_NO_COMPLETE_PROOF = 2;
+static constexpr uint32_t SMARTZERO_INSTALL_FAIL_BAD_LANE_PROOF    = 3;
+
+static volatile uint32_t g_alpha_smartzero_install_attempt_count = 0;
+static volatile uint32_t g_alpha_smartzero_install_commit_count = 0;
+static volatile uint32_t g_alpha_smartzero_install_failure_count = 0;
+static volatile uint32_t g_alpha_smartzero_install_last_stage = SMARTZERO_INSTALL_STAGE_IDLE;
+static volatile uint32_t g_alpha_smartzero_install_last_failure_stage = SMARTZERO_INSTALL_STAGE_IDLE;
+static volatile uint32_t g_alpha_smartzero_install_last_failure_code = SMARTZERO_INSTALL_FAIL_NONE;
+static volatile uint32_t g_alpha_smartzero_install_last_live_sequence = 0;
+static volatile uint32_t g_alpha_smartzero_install_last_prior_epoch_sequence = 0;
+static volatile uint32_t g_alpha_smartzero_install_last_committed_epoch_sequence = 0;
+static volatile uint32_t g_alpha_smartzero_install_last_committed_smartzero_sequence = 0;
+static volatile bool     g_alpha_smartzero_install_last_success = false;
+static volatile bool     g_alpha_smartzero_install_last_atomic = false;
+static char              g_alpha_smartzero_install_last_reason[32] = {0};
+
+static const char* smartzero_install_stage_name(uint32_t stage) {
+  switch (stage) {
+    case SMARTZERO_INSTALL_STAGE_IDLE:             return "IDLE";
+    case SMARTZERO_INSTALL_STAGE_SNAPSHOT:         return "SNAPSHOT";
+    case SMARTZERO_INSTALL_STAGE_VALIDATE:         return "VALIDATE";
+    case SMARTZERO_INSTALL_STAGE_RESET_STATE:      return "RESET_STATE";
+    case SMARTZERO_INSTALL_STAGE_INSTALL_ANCHORS:  return "INSTALL_ANCHORS";
+    case SMARTZERO_INSTALL_STAGE_DWT64:            return "DWT64";
+    case SMARTZERO_INSTALL_STAGE_TIME_ANCHORS:     return "TIME_ANCHORS";
+    case SMARTZERO_INSTALL_STAGE_TIMEPOP_REAUTHOR: return "TIMEPOP_REAUTHOR";
+    case SMARTZERO_INSTALL_STAGE_COMMIT:           return "COMMIT";
+    case SMARTZERO_INSTALL_STAGE_FAIL:             return "FAIL";
+    default:                                       return "UNKNOWN";
+  }
+}
+
 bool clocks_alpha_epoch_last_smartzero(interrupt_smartzero_snapshot_t* out) {
   if (!out) return false;
   *out = g_alpha_epoch_last_smartzero;
@@ -1178,6 +1232,64 @@ bool clocks_alpha_installed_smartzero_valid(void) {
 
 uint32_t clocks_alpha_installed_smartzero_sequence(void) {
   return g_alpha_epoch_last_smartzero.sequence;
+}
+
+
+bool clocks_alpha_installed_smartzero_backing_epoch(void) {
+  return g_epoch_initialized &&
+         !g_alpha_epoch_install_in_progress &&
+         g_alpha_epoch_last_smartzero.complete &&
+         g_alpha_epoch_last_smartzero.sequence ==
+             g_alpha_smartzero_install_last_committed_smartzero_sequence;
+}
+
+bool clocks_alpha_epoch_install_in_progress(void) {
+  return g_alpha_epoch_install_in_progress;
+}
+uint32_t clocks_alpha_smartzero_install_attempt_count(void) {
+  return g_alpha_smartzero_install_attempt_count;
+}
+uint32_t clocks_alpha_smartzero_install_commit_count(void) {
+  return g_alpha_smartzero_install_commit_count;
+}
+uint32_t clocks_alpha_smartzero_install_failure_count(void) {
+  return g_alpha_smartzero_install_failure_count;
+}
+uint32_t clocks_alpha_smartzero_install_last_stage(void) {
+  return g_alpha_smartzero_install_last_stage;
+}
+const char* clocks_alpha_smartzero_install_last_stage_name(void) {
+  return smartzero_install_stage_name(g_alpha_smartzero_install_last_stage);
+}
+uint32_t clocks_alpha_smartzero_install_last_failure_stage(void) {
+  return g_alpha_smartzero_install_last_failure_stage;
+}
+const char* clocks_alpha_smartzero_install_last_failure_stage_name(void) {
+  return smartzero_install_stage_name(g_alpha_smartzero_install_last_failure_stage);
+}
+uint32_t clocks_alpha_smartzero_install_last_failure_code(void) {
+  return g_alpha_smartzero_install_last_failure_code;
+}
+uint32_t clocks_alpha_smartzero_install_last_live_sequence(void) {
+  return g_alpha_smartzero_install_last_live_sequence;
+}
+uint32_t clocks_alpha_smartzero_install_last_prior_epoch_sequence(void) {
+  return g_alpha_smartzero_install_last_prior_epoch_sequence;
+}
+uint32_t clocks_alpha_smartzero_install_last_committed_epoch_sequence(void) {
+  return g_alpha_smartzero_install_last_committed_epoch_sequence;
+}
+uint32_t clocks_alpha_smartzero_install_last_committed_smartzero_sequence(void) {
+  return g_alpha_smartzero_install_last_committed_smartzero_sequence;
+}
+bool clocks_alpha_smartzero_install_last_success(void) {
+  return g_alpha_smartzero_install_last_success;
+}
+bool clocks_alpha_smartzero_install_last_atomic(void) {
+  return g_alpha_smartzero_install_last_atomic;
+}
+const char* clocks_alpha_smartzero_install_last_reason(void) {
+  return g_alpha_smartzero_install_last_reason;
 }
 
 uint32_t clocks_alpha_smartzero_begin_count(void) { return g_alpha_smartzero_begin_count; }
@@ -1204,6 +1316,71 @@ uint32_t clocks_alpha_smartzero_begin_cold_count(void) {
 }
 const char* clocks_alpha_smartzero_last_begin_reason(void) {
   return g_alpha_smartzero_last_begin_reason;
+}
+
+static void alpha_smartzero_install_mark_stage(uint32_t stage) {
+  g_alpha_smartzero_install_last_stage = stage;
+  clocks_alpha_dmb();
+}
+
+static void alpha_smartzero_install_begin_transaction(const char* reason) {
+  safeCopy(g_alpha_smartzero_install_last_reason,
+           sizeof(g_alpha_smartzero_install_last_reason),
+           (reason && *reason) ? reason : "smartzero");
+  g_alpha_epoch_install_in_progress = true;
+  g_alpha_smartzero_install_attempt_count++;
+  g_alpha_smartzero_install_last_success = false;
+  g_alpha_smartzero_install_last_atomic = false;
+  g_alpha_smartzero_install_last_failure_code = SMARTZERO_INSTALL_FAIL_NONE;
+  g_alpha_smartzero_install_last_failure_stage = SMARTZERO_INSTALL_STAGE_IDLE;
+  g_alpha_smartzero_install_last_live_sequence = 0;
+  g_alpha_smartzero_install_last_prior_epoch_sequence = g_alpha_epoch_sequence;
+  alpha_smartzero_install_mark_stage(SMARTZERO_INSTALL_STAGE_SNAPSHOT);
+}
+
+static void alpha_smartzero_install_fail(uint32_t stage,
+                                         uint32_t failure_code) {
+  g_alpha_smartzero_install_last_failure_stage = stage;
+  g_alpha_smartzero_install_last_failure_code = failure_code;
+  g_alpha_smartzero_install_last_success = false;
+  g_alpha_smartzero_install_last_atomic = false;
+  g_alpha_smartzero_install_failure_count++;
+  g_alpha_epoch_install_failures++;
+  alpha_smartzero_install_mark_stage(SMARTZERO_INSTALL_STAGE_FAIL);
+  g_alpha_epoch_install_in_progress = false;
+  clocks_alpha_smartzero_pending_clear();
+}
+
+static void alpha_smartzero_install_commit(uint32_t committed_epoch_sequence,
+                                           uint32_t committed_smartzero_sequence) {
+  g_alpha_smartzero_install_last_committed_epoch_sequence = committed_epoch_sequence;
+  g_alpha_smartzero_install_last_committed_smartzero_sequence = committed_smartzero_sequence;
+  g_alpha_smartzero_install_last_success = true;
+  g_alpha_smartzero_install_last_atomic = true;
+  g_alpha_smartzero_install_commit_count++;
+  alpha_smartzero_install_mark_stage(SMARTZERO_INSTALL_STAGE_COMMIT);
+  g_alpha_epoch_install_in_progress = false;
+}
+
+static bool smartzero_completed_proof_valid(const interrupt_smartzero_snapshot_t& z) {
+  if (!z.complete || z.running || z.aborted) return false;
+
+  const interrupt_smartzero_lane_snapshot_t& vclock = z.lanes[0];
+  const interrupt_smartzero_lane_snapshot_t& ocxo1  = z.lanes[1];
+  const interrupt_smartzero_lane_snapshot_t& ocxo2  = z.lanes[2];
+
+  return vclock.kind == interrupt_subscriber_kind_t::VCLOCK &&
+         ocxo1.kind  == interrupt_subscriber_kind_t::OCXO1 &&
+         ocxo2.kind  == interrupt_subscriber_kind_t::OCXO2 &&
+         vclock.state == interrupt_smartzero_lane_state_t::LOCKED &&
+         ocxo1.state  == interrupt_smartzero_lane_state_t::LOCKED &&
+         ocxo2.state  == interrupt_smartzero_lane_state_t::LOCKED &&
+         vclock.accepted_count != 0 && ocxo1.accepted_count != 0 &&
+         ocxo2.accepted_count != 0 &&
+         vclock.anchor_dwt != 0 && ocxo1.anchor_dwt != 0 &&
+         ocxo2.anchor_dwt != 0 &&
+         vclock.anchor_counter32 != 0 && ocxo1.anchor_counter32 != 0 &&
+         ocxo2.anchor_counter32 != 0;
 }
 
 // Runtime PPS/VCLOCK sampling no longer requires the epoch-capture packet.
@@ -1334,26 +1511,53 @@ bool clocks_alpha_begin_smartzero_epoch(const char* reason) {
 }
 
 bool clocks_alpha_zero_from_smartzero(const char* reason) {
+  const char* install_reason = (reason && *reason) ? reason : "smartzero";
+
+  if (g_alpha_epoch_install_in_progress) {
+    g_alpha_smartzero_install_attempt_count++;
+    safeCopy(g_alpha_smartzero_install_last_reason,
+             sizeof(g_alpha_smartzero_install_last_reason),
+             install_reason);
+    g_alpha_smartzero_install_last_failure_stage = SMARTZERO_INSTALL_STAGE_SNAPSHOT;
+    g_alpha_smartzero_install_last_failure_code = SMARTZERO_INSTALL_FAIL_REENTRANT;
+    g_alpha_smartzero_install_last_success = false;
+    g_alpha_smartzero_install_last_atomic = false;
+    g_alpha_smartzero_install_failure_count++;
+    g_alpha_epoch_install_failures++;
+    g_alpha_smartzero_install_last_stage = SMARTZERO_INSTALL_STAGE_FAIL;
+    return false;
+  }
+
+  alpha_smartzero_install_begin_transaction(install_reason);
+
   interrupt_smartzero_snapshot_t z{};
   if (!interrupt_smartzero_snapshot(&z) || !z.complete) {
-    g_alpha_epoch_install_failures++;
+    alpha_smartzero_install_fail(SMARTZERO_INSTALL_STAGE_SNAPSHOT,
+                                 SMARTZERO_INSTALL_FAIL_NO_COMPLETE_PROOF);
+    return false;
+  }
+  g_alpha_smartzero_install_last_live_sequence = z.sequence;
+
+  alpha_smartzero_install_mark_stage(SMARTZERO_INSTALL_STAGE_VALIDATE);
+  if (!smartzero_completed_proof_valid(z)) {
+    alpha_smartzero_install_fail(SMARTZERO_INSTALL_STAGE_VALIDATE,
+                                 SMARTZERO_INSTALL_FAIL_BAD_LANE_PROOF);
     return false;
   }
 
   const interrupt_smartzero_lane_snapshot_t& vclock = z.lanes[0];
   const interrupt_smartzero_lane_snapshot_t& ocxo1  = z.lanes[1];
   const interrupt_smartzero_lane_snapshot_t& ocxo2  = z.lanes[2];
+  const uint32_t next_epoch_sequence = g_alpha_epoch_sequence + 1U;
 
-  if (vclock.state != interrupt_smartzero_lane_state_t::LOCKED ||
-      ocxo1.state  != interrupt_smartzero_lane_state_t::LOCKED ||
-      ocxo2.state  != interrupt_smartzero_lane_state_t::LOCKED ||
-      vclock.anchor_dwt == 0 || ocxo1.anchor_dwt == 0 || ocxo2.anchor_dwt == 0) {
-    g_alpha_epoch_install_failures++;
-    return false;
-  }
-
+  // Commit window begins.  A complete proof exists, so it is now lawful to
+  // replace the installed science epoch.  epoch_ready() is false while this
+  // transaction runs, so Alpha event consumers cannot apply events against
+  // reset ledgers or half-installed zero offsets.
+  alpha_smartzero_install_mark_stage(SMARTZERO_INSTALL_STAGE_RESET_STATE);
   alpha_reset_canonical_clock_state_for_new_epoch();
 
+  alpha_smartzero_install_mark_stage(SMARTZERO_INSTALL_STAGE_INSTALL_ANCHORS);
   g_gnss_ns_at_pps_vclock = 0;
   g_dwt_at_pps_vclock = vclock.anchor_dwt;
   g_counter32_at_pps_vclock = vclock.anchor_counter32;
@@ -1365,8 +1569,8 @@ bool clocks_alpha_zero_from_smartzero(const char* reason) {
   alpha_ticks64_install_zero(g_ocxo1_ticks64, ocxo1.anchor_counter32);
   alpha_ticks64_install_zero(g_ocxo2_ticks64, ocxo2.anchor_counter32);
 
-  // OCXO measured ledgers now have their own mathematically-qualified zero
-  // anchors.  The first post-zero OCXO edge measures from that OCXO anchor,
+  // OCXO measured ledgers have their own mathematically-qualified zero
+  // anchors. The first post-zero OCXO edge measures from that OCXO anchor,
   // not from the VCLOCK anchor.
   g_ocxo1_measured_ns.initialized = true;
   g_ocxo1_measured_ns.ns_at_edge = 0;
@@ -1379,20 +1583,26 @@ bool clocks_alpha_zero_from_smartzero(const char* reason) {
   clock_mark_epoch_zero(g_ocxo1_clock);
   clock_mark_epoch_zero(g_ocxo2_clock);
 
+  alpha_smartzero_install_mark_stage(SMARTZERO_INSTALL_STAGE_DWT64);
   (void)clocks_dwt64_epoch_reset_at_dwt32(vclock.anchor_dwt, nullptr);
   dwt64_anchor_reset_to_dwt32(vclock.anchor_dwt, g_dwt64_epoch_raw_cycles);
 
+  alpha_smartzero_install_mark_stage(SMARTZERO_INSTALL_STAGE_TIME_ANCHORS);
   time_pps_vclock_epoch_reset(vclock.anchor_dwt, vclock.anchor_counter32);
   time_clock_epoch_reset(time_clock_id_t::VCLOCK, vclock.anchor_dwt, 0);
   time_clock_epoch_reset(time_clock_id_t::OCXO1,  ocxo1.anchor_dwt, 0);
   time_clock_epoch_reset(time_clock_id_t::OCXO2,  ocxo2.anchor_dwt, 0);
-  g_alpha_epoch_sequence++;
 
-  // VCLOCK synthetic coordinate generation changed.  Re-author recurring
+  alpha_smartzero_install_mark_stage(SMARTZERO_INSTALL_STAGE_TIMEPOP_REAUTHOR);
+  // VCLOCK synthetic coordinate generation changed. Re-author recurring
   // TimePop timers and cancel unsafe old-coordinate one-shots before normal
   // scheduling resumes.
-  timepop_epoch_changed(g_alpha_epoch_sequence);
+  timepop_epoch_changed(next_epoch_sequence);
 
+  // Public commit point. From here on, all epoch-report fields, installed
+  // SmartZero proof, and epoch sequence refer to the newly installed proof.
+  alpha_smartzero_install_mark_stage(SMARTZERO_INSTALL_STAGE_COMMIT);
+  g_alpha_epoch_sequence = next_epoch_sequence;
   g_alpha_epoch_last_capture_sequence = z.sequence;
   g_alpha_epoch_last_capture_window_cycles = 0;
   g_alpha_epoch_last_vclock_capture_valid = true;
@@ -1409,12 +1619,14 @@ bool clocks_alpha_zero_from_smartzero(const char* reason) {
   g_alpha_epoch_last_ocxo1_hardware16 = ocxo1.anchor_hardware16;
   g_alpha_epoch_last_ocxo2_hardware16 = ocxo2.anchor_hardware16;
   g_alpha_epoch_last_smartzero = z;
-  clocks_alpha_smartzero_pending_clear();
 
   safeCopy(g_alpha_epoch_last_reason, sizeof(g_alpha_epoch_last_reason),
-           (reason && *reason) ? reason : "smartzero");
+           install_reason);
   g_alpha_epoch_install_count++;
   g_epoch_initialized = true;
+  clocks_alpha_smartzero_pending_clear();
+
+  alpha_smartzero_install_commit(next_epoch_sequence, z.sequence);
   return true;
 }
 
@@ -1443,7 +1655,7 @@ uint16_t clocks_alpha_epoch_last_vclock_hardware16_selected(void) { return g_alp
 uint16_t clocks_alpha_epoch_last_ocxo1_hardware16(void) { return g_alpha_epoch_last_ocxo1_hardware16; }
 uint16_t clocks_alpha_epoch_last_ocxo2_hardware16(void) { return g_alpha_epoch_last_ocxo2_hardware16; }
 const char* clocks_alpha_epoch_last_reason(void) { return g_alpha_epoch_last_reason; }
-bool clocks_alpha_epoch_initialized(void) { return g_epoch_initialized; }
+bool clocks_alpha_epoch_initialized(void) { return g_epoch_initialized && !g_alpha_epoch_install_in_progress; }
 
 // ============================================================================
 // Direct event application

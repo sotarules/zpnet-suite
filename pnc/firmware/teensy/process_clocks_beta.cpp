@@ -499,13 +499,47 @@ static void payload_add_prefixed_smartzero_compact(
   add_u32("current_lane_index", z.current_lane_index);
 }
 
+static void payload_add_smartzero_install_transaction(Payload& p) {
+  p.add("smartzero_install_in_progress", clocks_alpha_epoch_install_in_progress());
+  p.add("smartzero_install_attempt_count",
+        clocks_alpha_smartzero_install_attempt_count());
+  p.add("smartzero_install_commit_count",
+        clocks_alpha_smartzero_install_commit_count());
+  p.add("smartzero_install_failure_count",
+        clocks_alpha_smartzero_install_failure_count());
+  p.add("smartzero_install_last_stage",
+        clocks_alpha_smartzero_install_last_stage());
+  p.add("smartzero_install_last_stage_name",
+        clocks_alpha_smartzero_install_last_stage_name());
+  p.add("smartzero_install_last_failure_stage",
+        clocks_alpha_smartzero_install_last_failure_stage());
+  p.add("smartzero_install_last_failure_stage_name",
+        clocks_alpha_smartzero_install_last_failure_stage_name());
+  p.add("smartzero_install_last_failure_code",
+        clocks_alpha_smartzero_install_last_failure_code());
+  p.add("smartzero_install_last_live_sequence",
+        clocks_alpha_smartzero_install_last_live_sequence());
+  p.add("smartzero_install_last_prior_epoch_sequence",
+        clocks_alpha_smartzero_install_last_prior_epoch_sequence());
+  p.add("smartzero_install_last_committed_epoch_sequence",
+        clocks_alpha_smartzero_install_last_committed_epoch_sequence());
+  p.add("smartzero_install_last_committed_smartzero_sequence",
+        clocks_alpha_smartzero_install_last_committed_smartzero_sequence());
+  p.add("smartzero_install_last_success",
+        clocks_alpha_smartzero_install_last_success());
+  p.add("smartzero_install_last_atomic",
+        clocks_alpha_smartzero_install_last_atomic());
+  p.add("smartzero_install_last_reason",
+        clocks_alpha_smartzero_install_last_reason());
+}
+
 static void payload_add_smartzero_summary(Payload& p) {
   interrupt_smartzero_snapshot_t live{};
   (void)interrupt_smartzero_live_snapshot(&live);
 
   interrupt_smartzero_snapshot_t installed{};
   const bool installed_valid = clocks_alpha_epoch_last_smartzero(&installed);
-  const bool installed_backing_epoch = installed_valid && clocks_alpha_epoch_initialized();
+  const bool installed_backing_epoch = clocks_alpha_installed_smartzero_backing_epoch();
 
   payload_add_prefixed_smartzero_compact(p, "installed_smartzero", installed, installed_valid);
   p.add("installed_smartzero_backing_epoch", installed_backing_epoch);
@@ -529,6 +563,7 @@ static void payload_add_smartzero_summary(Payload& p) {
   payload_add_prefixed_smartzero_compact(p, "live_smartzero", live, true);
   p.add("smartzero_pending_active", clocks_alpha_smartzero_pending_active());
   p.add("smartzero_pending_reason", clocks_alpha_smartzero_pending_reason());
+  payload_add_smartzero_install_transaction(p);
   p.add("smartzero_begin_service_epoch_preserved",
         clocks_alpha_smartzero_last_begin_preserved_epoch());
   p.add("smartzero_begin_preserved_epoch_sequence",
@@ -1944,12 +1979,13 @@ static void add_epoch_payload(Payload& p) {
         clocks_alpha_smartzero_last_begin_reason());
   p.add("smartzero_pending_active", clocks_alpha_smartzero_pending_active());
   p.add("smartzero_pending_reason", clocks_alpha_smartzero_pending_reason());
+  payload_add_smartzero_install_transaction(p);
 
   interrupt_smartzero_snapshot_t installed{};
   const bool installed_valid = clocks_alpha_epoch_last_smartzero(&installed);
   p.add("installed_smartzero_valid", installed_valid);
   p.add("installed_smartzero_backing_epoch",
-        installed_valid && clocks_alpha_epoch_initialized());
+        clocks_alpha_installed_smartzero_backing_epoch());
   p.add("installed_smartzero_sequence", installed.sequence);
   p.add("installed_smartzero_vclock_anchor_dwt",
         installed_valid ? installed.lanes[0].anchor_dwt : 0U);
@@ -1964,7 +2000,7 @@ static void add_epoch_payload(Payload& p) {
 static void add_compact_smartzero_status(Payload& p) {
   interrupt_smartzero_snapshot_t installed{};
   const bool installed_valid = clocks_alpha_epoch_last_smartzero(&installed);
-  const bool installed_backing_epoch = installed_valid && clocks_alpha_epoch_initialized();
+  const bool installed_backing_epoch = clocks_alpha_installed_smartzero_backing_epoch();
 
   interrupt_smartzero_snapshot_t live{};
   (void)interrupt_smartzero_live_snapshot(&live);
@@ -1992,6 +2028,7 @@ static void add_compact_smartzero_status(Payload& p) {
 
   p.add("smartzero_pending_active", clocks_alpha_smartzero_pending_active());
   p.add("smartzero_pending_reason", clocks_alpha_smartzero_pending_reason());
+  payload_add_smartzero_install_transaction(p);
   p.add("smartzero_begin_service_epoch_preserved",
         clocks_alpha_smartzero_last_begin_preserved_epoch());
   p.add("smartzero_begin_preserved_epoch_sequence",
@@ -2151,7 +2188,7 @@ static Payload cmd_report_installed_smartzero(const Payload&) {
       installed_valid,
       true);
   p.add("installed_smartzero_backing_epoch",
-        installed_valid && clocks_alpha_epoch_initialized());
+        clocks_alpha_installed_smartzero_backing_epoch());
   p.add("epoch_sequence", clocks_alpha_epoch_sequence());
   p.add("epoch_reason", clocks_alpha_epoch_last_reason());
   return p;
