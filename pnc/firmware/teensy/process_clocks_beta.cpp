@@ -373,6 +373,78 @@ static void publish_welford(Payload& p, const char* prefix, const welford_t& w) 
 // Emits <clock>_tau and <clock>_ppb.  ppb_value is in parts-per-billion
 // under the uniform sign convention (positive = clock running fast).
 // tau = 1.0 + ppb / 1e9.
+
+static const char* smartzero_lane_state_name_beta(interrupt_smartzero_lane_state_t s) {
+  switch (s) {
+    case interrupt_smartzero_lane_state_t::ACQUIRING: return "ACQUIRING";
+    case interrupt_smartzero_lane_state_t::LOCKED:    return "LOCKED";
+    default:                                         return "IDLE";
+  }
+}
+
+static const char* smartzero_decision_name_beta(interrupt_smartzero_decision_t d) {
+  switch (d) {
+    case interrupt_smartzero_decision_t::WAITING_FOR_CPS:  return "WAITING_FOR_CPS";
+    case interrupt_smartzero_decision_t::FIRST_SAMPLE:     return "FIRST_SAMPLE";
+    case interrupt_smartzero_decision_t::ACCEPTED:         return "ACCEPTED";
+    case interrupt_smartzero_decision_t::REJECTED_DWT:     return "REJECTED_DWT";
+    case interrupt_smartzero_decision_t::REJECTED_COUNTER: return "REJECTED_COUNTER";
+    default:                                               return "NONE";
+  }
+}
+
+static void payload_add_smartzero_lane(Payload& parent,
+                                       const char* key,
+                                       const interrupt_smartzero_lane_snapshot_t& z) {
+  Payload lane;
+  lane.add("kind", interrupt_subscriber_kind_str(z.kind));
+  lane.add("state", smartzero_lane_state_name_beta(z.state));
+  lane.add("last_decision", smartzero_decision_name_beta(z.last_decision));
+  lane.add("sample_count", z.sample_count);
+  lane.add("interval_attempt_count", z.interval_attempt_count);
+  lane.add("accepted_count", z.accepted_count);
+  lane.add("rejected_count", z.rejected_count);
+  lane.add("waiting_for_cps_count", z.waiting_for_cps_count);
+  lane.add("cps_used", z.cps_used);
+  lane.add("expected_interval_cycles", z.expected_interval_cycles);
+  lane.add("tolerance_cycles", z.tolerance_cycles);
+  lane.add("required_counter_delta_ticks", z.required_counter_delta_ticks);
+  lane.add("last_interval_cycles", z.last_interval_cycles);
+  lane.add("last_interval_error_cycles", z.last_interval_error_cycles);
+  lane.add("max_abs_interval_error_cycles", z.max_abs_interval_error_cycles);
+  lane.add("last_counter_delta_ticks", z.last_counter_delta_ticks);
+  lane.add("anchor_dwt", z.anchor_dwt);
+  lane.add("anchor_counter32", z.anchor_counter32);
+  lane.add("anchor_hardware16", (uint32_t)z.anchor_hardware16);
+  lane.add("anchor_pair_previous_dwt", z.anchor_pair_previous_dwt);
+  lane.add("anchor_pair_previous_counter32", z.anchor_pair_previous_counter32);
+  lane.add("arm_count", z.arm_count);
+  lane.add("fire_count", z.fire_count);
+  parent.add_object(key, lane);
+}
+
+static void payload_add_smartzero_summary(Payload& p) {
+  interrupt_smartzero_snapshot_t z{};
+  (void)interrupt_smartzero_snapshot(&z);
+  p.add("smartzero_running", z.running);
+  p.add("smartzero_complete", z.complete);
+  p.add("smartzero_sequence", z.sequence);
+  p.add("smartzero_begin_count", z.begin_count);
+  p.add("smartzero_complete_count", z.complete_count);
+  p.add("smartzero_abort_count", z.abort_count);
+  p.add("smartzero_current_lane", interrupt_subscriber_kind_str(z.current_lane));
+  p.add("smartzero_current_lane_index", z.current_lane_index);
+  p.add("smartzero_sample_rate_hz", z.sample_rate_hz);
+  p.add("smartzero_counter_delta_ticks", z.counter_delta_ticks);
+  p.add("smartzero_tolerance_cycles", z.tolerance_cycles);
+
+  Payload lanes;
+  payload_add_smartzero_lane(lanes, "vclock", z.lanes[0]);
+  payload_add_smartzero_lane(lanes, "ocxo1", z.lanes[1]);
+  payload_add_smartzero_lane(lanes, "ocxo2", z.lanes[2]);
+  p.add_object("smartzero", lanes);
+}
+
 static void publish_freq(Payload& p, const char* clock_name, double ppb_value) {
   char key[80];
   const double tau_value = 1.0 + ppb_value / 1e9;
@@ -930,6 +1002,28 @@ static void clocks_finish_start_accounting(void) {
   campaign_warmup_begin(campaign_warmup_mode_t::START);
 }
 
+
+static bool clocks_try_finish_pending_smartzero(void) {
+  if (!request_start && !request_zero) return false;
+  if (!interrupt_smartzero_complete()) return false;
+
+  const bool finishing_start = request_start;
+  const bool zero_ok = clocks_alpha_zero_from_smartzero(finishing_start ? "start" : "zero");
+  if (!zero_ok) {
+    request_start = false;
+    request_zero = false;
+    return false;
+  }
+
+  if (finishing_start) {
+    clocks_finish_start_accounting();
+  } else {
+    campaign_state = clocks_campaign_state_t::STOPPED;
+    clocks_finish_zero_accounting();
+  }
+  return true;
+}
+
 // ============================================================================
 // clocks_beta_pps — invoked from alpha's pps_selector_callback
 // ============================================================================
@@ -944,6 +1038,11 @@ void clocks_beta_pps(void) {
     ocxo_dac_pacing_abort_all();
     campaign_warmup_reset();
     timebase_invalidate();
+    return;
+  }
+
+  if (request_start || request_zero) {
+    (void)clocks_try_finish_pending_smartzero();
     return;
   }
 
@@ -1237,60 +1336,39 @@ static Payload cmd_start(const Payload& args) {
   request_zero = false;
   request_stop = false;
   request_recover = false;
+  watchdog_anomaly_active = false;
+  campaign_state = clocks_campaign_state_t::STOPPED;
+  campaign_warmup_reset();
+  timebase_invalidate();
 
-  const bool zero_ok = clocks_alpha_zero_from_interrupt_capture("start");
-  const bool ocxo_zero_ok =
-      clocks_alpha_epoch_last_ocxo1_zero_valid() &&
-      clocks_alpha_epoch_last_ocxo2_zero_valid();
-  bool servo_disabled_by_zero = false;
-  if (zero_ok && calibrate_ocxo_mode != servo_mode_t::OFF && !ocxo_zero_ok) {
-    calibrate_ocxo_mode = servo_mode_t::OFF;
-    servo_disabled_by_zero = true;
-  }
-
-  if (zero_ok) {
-    clocks_finish_start_accounting();
-  } else {
+  const bool smartzero_started = clocks_alpha_begin_smartzero_epoch("start");
+  if (!smartzero_started) {
     request_start = false;
   }
 
   Payload p;
-  p.add("status", !zero_ok
-                      ? "start_rejected_no_zero_offset_capture"
+  p.add("status", !smartzero_started
+                      ? "start_rejected_smartzero_start_failed"
                       : ((!dac1_ok || !dac2_ok)
-                            ? "started_dac_fault"
-                            : (servo_disabled_by_zero
-                                  ? "started_ocxo_zero_invalid_servo_off"
-                                  : "started")));
-  p.add("zero_installed", zero_ok);
-  p.add("epoch_owner", "CLOCKS");
+                            ? "start_pending_smartzero_dac_fault"
+                            : "start_pending_smartzero"));
+  p.add("zero_installed", false);
+  p.add("smartzero_required", true);
+  p.add("smartzero_started", smartzero_started);
+  p.add("epoch_owner", "CLOCKS_SMARTZERO");
   p.add("epoch_sequence", clocks_alpha_epoch_sequence());
   p.add("epoch_reason", clocks_alpha_epoch_last_reason());
-  p.add("epoch_capture_sequence", clocks_alpha_epoch_last_capture_sequence());
-  p.add("epoch_capture_window_cycles", clocks_alpha_epoch_last_capture_window_cycles());
-  p.add("epoch_capture_vclock_valid", clocks_alpha_epoch_last_vclock_capture_valid());
-  p.add("epoch_capture_all_lanes_valid", clocks_alpha_epoch_last_all_lanes_valid());
-  p.add("zero_offset_vclock_valid", clocks_alpha_epoch_last_vclock_zero_valid());
-  p.add("zero_offset_ocxo1_valid", clocks_alpha_epoch_last_ocxo1_zero_valid());
-  p.add("zero_offset_ocxo2_valid", clocks_alpha_epoch_last_ocxo2_zero_valid());
-  p.add("zero_offset_vclock_counter32", clocks_alpha_epoch_last_vclock_counter32());
-  p.add("zero_offset_ocxo1_counter32", clocks_alpha_epoch_last_ocxo1_counter32());
-  p.add("zero_offset_ocxo2_counter32", clocks_alpha_epoch_last_ocxo2_counter32());
-  p.add("zero_offset_vclock_hardware16_observed", (uint32_t)clocks_alpha_epoch_last_vclock_hardware16_observed());
-  p.add("zero_offset_vclock_hardware16_selected", (uint32_t)clocks_alpha_epoch_last_vclock_hardware16_selected());
-  p.add("zero_offset_ocxo1_hardware16", (uint32_t)clocks_alpha_epoch_last_ocxo1_hardware16());
-  p.add("zero_offset_ocxo2_hardware16", (uint32_t)clocks_alpha_epoch_last_ocxo2_hardware16());
-  p.add("ocxo_zero_valid", ocxo_zero_ok);
-  p.add("servo_disabled_by_zero", servo_disabled_by_zero);
   p.add("ocxo1_dac", ocxo1_dac.dac_fractional);
   p.add("ocxo2_dac", ocxo2_dac.dac_fractional);
   p.add("ocxo1_dac_last_write_ok", ocxo1_dac.io_last_write_ok);
   p.add("ocxo2_dac_last_write_ok", ocxo2_dac.io_last_write_ok);
   p.add("calibrate_ocxo", servo_mode_str(calibrate_ocxo_mode));
+  payload_add_smartzero_summary(p);
   return p;
 }
 
 static Payload cmd_stop(const Payload&) {
+  interrupt_smartzero_abort();
   request_stop = true;
   request_start = false;
   request_zero = false;
@@ -1304,40 +1382,28 @@ static Payload cmd_zero(const Payload&) {
   request_stop = false;
   request_recover = false;
   request_zero = true;
+  campaign_state = clocks_campaign_state_t::STOPPED;
+  campaign_warmup_reset();
+  timebase_invalidate();
 
-  const bool zero_ok = clocks_alpha_zero_from_interrupt_capture("zero");
-  if (zero_ok) {
-    clocks_finish_zero_accounting();
-  } else {
+  const bool smartzero_started = clocks_alpha_begin_smartzero_epoch("zero");
+  if (!smartzero_started) {
     request_zero = false;
   }
 
   Payload p;
-  p.add("status", zero_ok ? "zero_installed" : "zero_rejected_no_zero_offset_capture");
-  p.add("epoch_owner", "CLOCKS");
-  p.add("zero_installed", zero_ok);
+  p.add("status", smartzero_started
+                      ? "zero_pending_smartzero"
+                      : "zero_rejected_smartzero_start_failed");
+  p.add("epoch_owner", "CLOCKS_SMARTZERO");
+  p.add("zero_installed", false);
+  p.add("smartzero_required", true);
+  p.add("smartzero_started", smartzero_started);
   p.add("epoch_sequence", clocks_alpha_epoch_sequence());
   p.add("epoch_install_count", clocks_alpha_epoch_install_count());
   p.add("epoch_install_failures", clocks_alpha_epoch_install_failures());
   p.add("epoch_reason", clocks_alpha_epoch_last_reason());
-  p.add("epoch_dwt_at_edge", clocks_alpha_epoch_last_dwt_at_edge());
-  p.add("epoch_vclock_counter32", clocks_alpha_epoch_last_vclock_counter32());
-  p.add("epoch_ocxo1_counter32", clocks_alpha_epoch_last_ocxo1_counter32());
-  p.add("epoch_ocxo2_counter32", clocks_alpha_epoch_last_ocxo2_counter32());
-  p.add("zero_offset_vclock_valid", clocks_alpha_epoch_last_vclock_zero_valid());
-  p.add("zero_offset_ocxo1_valid", clocks_alpha_epoch_last_ocxo1_zero_valid());
-  p.add("zero_offset_ocxo2_valid", clocks_alpha_epoch_last_ocxo2_zero_valid());
-  p.add("zero_offset_vclock_counter32", clocks_alpha_epoch_last_vclock_counter32());
-  p.add("zero_offset_ocxo1_counter32", clocks_alpha_epoch_last_ocxo1_counter32());
-  p.add("zero_offset_ocxo2_counter32", clocks_alpha_epoch_last_ocxo2_counter32());
-  p.add("zero_offset_vclock_hardware16_observed", (uint32_t)clocks_alpha_epoch_last_vclock_hardware16_observed());
-  p.add("zero_offset_vclock_hardware16_selected", (uint32_t)clocks_alpha_epoch_last_vclock_hardware16_selected());
-  p.add("zero_offset_ocxo1_hardware16", (uint32_t)clocks_alpha_epoch_last_ocxo1_hardware16());
-  p.add("zero_offset_ocxo2_hardware16", (uint32_t)clocks_alpha_epoch_last_ocxo2_hardware16());
-  p.add("epoch_capture_sequence", clocks_alpha_epoch_last_capture_sequence());
-  p.add("epoch_capture_window_cycles", clocks_alpha_epoch_last_capture_window_cycles());
-  p.add("epoch_capture_vclock_valid", clocks_alpha_epoch_last_vclock_capture_valid());
-  p.add("epoch_capture_all_lanes_valid", clocks_alpha_epoch_last_all_lanes_valid());
+  payload_add_smartzero_summary(p);
   return p;
 }
 
@@ -1358,6 +1424,7 @@ static Payload cmd_recover(const Payload& args) {
   recover_ocxo1_ns = strtoull(s_ocxo1,  nullptr, 10);
   recover_ocxo2_ns = strtoull(s_ocxo2,  nullptr, 10);
 
+  interrupt_smartzero_abort();
   request_recover = true;
   request_start   = false;
   request_stop    = false;
@@ -1569,9 +1636,50 @@ static void add_clock_forensics_payload(Payload& p,
   p.add_object("clock_forensics", forensic);
 }
 
-static Payload cmd_report(const Payload&) {
-  Payload p;
 
+static void add_single_clock_forensics_payload(Payload& p,
+                                               const char* key,
+                                               time_clock_id_t clock_id,
+                                               uint32_t report_dwt,
+                                               uint64_t vclock_ns,
+                                               bool vclock_ok,
+                                               uint64_t report_ns,
+                                               bool report_ok) {
+  Payload lane;
+  lane.add("report_dwt", report_dwt);
+  lane.add("clock", key ? key : "");
+
+  clocks_alpha_lane_forensics_t vf{};
+  clocks_alpha_lane_forensics_t lf{};
+  const bool vf_ok = clocks_alpha_lane_forensics(time_clock_id_t::VCLOCK, &vf);
+  const bool lf_ok = clocks_alpha_lane_forensics(clock_id, &lf);
+  lane.add("alpha_vclock_valid", vf_ok);
+  lane.add("alpha_lane_valid", lf_ok);
+
+  add_projection_payload(lane,
+                         clock_id,
+                         report_dwt,
+                         report_ok ? report_ns : 0ULL,
+                         report_ok,
+                         vclock_ok ? vclock_ns : 0ULL,
+                         vclock_ok,
+                         lf,
+                         (clock_id == time_clock_id_t::VCLOCK) ? nullptr : &vf);
+
+  p.add_object(key ? key : "lane", lane);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// CLOCKS report command split
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// The former CLOCKS.REPORT tried to carry summary, epoch, SmartZero, full Alpha
+// forensics, campaign state, warmup state, and report-time projections in one
+// large nested payload.  That report was diagnostically useful but too expensive
+// for the Teensy transport/heap budget.  Keep CLOCKS.REPORT small and make each
+// heavy surface explicitly opt-in through a focused command.
+
+static void add_summary_payload(Payload& p) {
   Payload summary;
   const uint32_t report_dwt = DWT_CYCCNT;
   const uint64_t dwt64_cycles_at_report = clocks_dwt_cycles_at_dwt(report_dwt);
@@ -1585,29 +1693,44 @@ static Payload cmd_report(const Payload&) {
   summary.add("report_dwt", report_dwt);
   summary.add("dwt64_cycles", dwt64_cycles_at_report);
   summary.add("dwt64_ns", dwt_cycles_to_ns(dwt64_cycles_at_report));
-  summary.add("gnss_ns", vclock_ok ? vclock_ns : 0);
-  summary.add("vclock_ns", vclock_ok ? vclock_ns : 0);
-  summary.add("ocxo1_measured_gnss_ns", ocxo1_ok ? ocxo1_ns : 0);
-  summary.add("ocxo2_measured_gnss_ns", ocxo2_ok ? ocxo2_ns : 0);
-  summary.add("ocxo1_ns", ocxo1_ok ? ocxo1_ns : 0);  // legacy alias
-  summary.add("ocxo2_ns", ocxo2_ok ? ocxo2_ns : 0);  // legacy alias
+  summary.add("gnss_ns", vclock_ok ? vclock_ns : 0ULL);
+  summary.add("vclock_ns", vclock_ok ? vclock_ns : 0ULL);
+  summary.add("ocxo1_measured_gnss_ns", ocxo1_ok ? ocxo1_ns : 0ULL);
+  summary.add("ocxo2_measured_gnss_ns", ocxo2_ok ? ocxo2_ns : 0ULL);
+  summary.add("ocxo1_ns", ocxo1_ok ? ocxo1_ns : 0ULL);  // legacy alias
+  summary.add("ocxo2_ns", ocxo2_ok ? ocxo2_ns : 0ULL);  // legacy alias
   summary.add("vclock_valid", vclock_ok);
   summary.add("ocxo1_valid", ocxo1_ok);
   summary.add("ocxo2_valid", ocxo2_ok);
   p.add_object("summary", summary);
+}
 
-  add_clock_forensics_payload(p, report_dwt,
-                              vclock_ok ? vclock_ns : 0ULL, vclock_ok,
-                              ocxo1_ok ? ocxo1_ns : 0ULL, ocxo1_ok,
-                              ocxo2_ok ? ocxo2_ns : 0ULL, ocxo2_ok);
+static void add_campaign_payload(Payload& p) {
   p.add("campaign_state",
         campaign_state == clocks_campaign_state_t::STARTED ? "STARTED" : "STOPPED");
+  p.add("campaign", campaign_name);
+  p.add("campaign_seconds", campaign_seconds);
   p.add("request_start", request_start);
   p.add("request_stop", request_stop);
   p.add("request_recover", request_recover);
   p.add("request_zero", request_zero);
+  p.add("watchdog_anomaly_active", watchdog_anomaly_active);
+  p.add("watchdog_anomaly_publish_pending", watchdog_anomaly_publish_pending);
+  p.add("watchdog_anomaly_sequence", watchdog_anomaly_sequence);
+  p.add("watchdog_anomaly_reason", watchdog_anomaly_reason);
+  p.add("calibrate_ocxo", servo_mode_str(calibrate_ocxo_mode));
+
+  p.add("campaign_warmup_active", campaign_warmup_active());
+  p.add("campaign_warmup_required", CLOCKS_CAMPAIGN_WARMUP_SUPPRESS_PPS);
+  p.add("campaign_warmup_remaining", (uint32_t)g_campaign_warmup_remaining);
+  p.add("campaign_warmup_suppressed_total",
+        (uint32_t)g_campaign_warmup_suppressed_total);
+}
+
+static void add_epoch_payload(Payload& p) {
   p.add("epoch_pending", clocks_epoch_pending());
-  p.add("epoch_owner", "CLOCKS");
+  p.add("epoch_owner", "CLOCKS_SMARTZERO");
+  p.add("epoch_source", "SMARTZERO");
   p.add("epoch_initialized", clocks_alpha_epoch_initialized());
   p.add("epoch_sequence", clocks_alpha_epoch_sequence());
   p.add("epoch_install_count", clocks_alpha_epoch_install_count());
@@ -1623,21 +1746,246 @@ static Payload cmd_report(const Payload&) {
   p.add("zero_offset_vclock_counter32", clocks_alpha_epoch_last_vclock_counter32());
   p.add("zero_offset_ocxo1_counter32", clocks_alpha_epoch_last_ocxo1_counter32());
   p.add("zero_offset_ocxo2_counter32", clocks_alpha_epoch_last_ocxo2_counter32());
-  p.add("zero_offset_vclock_hardware16_observed", (uint32_t)clocks_alpha_epoch_last_vclock_hardware16_observed());
-  p.add("zero_offset_vclock_hardware16_selected", (uint32_t)clocks_alpha_epoch_last_vclock_hardware16_selected());
-  p.add("zero_offset_ocxo1_hardware16", (uint32_t)clocks_alpha_epoch_last_ocxo1_hardware16());
-  p.add("zero_offset_ocxo2_hardware16", (uint32_t)clocks_alpha_epoch_last_ocxo2_hardware16());
+  p.add("zero_offset_vclock_hardware16_observed",
+        (uint32_t)clocks_alpha_epoch_last_vclock_hardware16_observed());
+  p.add("zero_offset_vclock_hardware16_selected",
+        (uint32_t)clocks_alpha_epoch_last_vclock_hardware16_selected());
+  p.add("zero_offset_ocxo1_hardware16",
+        (uint32_t)clocks_alpha_epoch_last_ocxo1_hardware16());
+  p.add("zero_offset_ocxo2_hardware16",
+        (uint32_t)clocks_alpha_epoch_last_ocxo2_hardware16());
   p.add("epoch_capture_sequence", clocks_alpha_epoch_last_capture_sequence());
   p.add("epoch_capture_window_cycles", clocks_alpha_epoch_last_capture_window_cycles());
   p.add("epoch_capture_vclock_valid", clocks_alpha_epoch_last_vclock_capture_valid());
   p.add("epoch_capture_all_lanes_valid", clocks_alpha_epoch_last_all_lanes_valid());
-  p.add("interrupt_pps_rebootstrap_pending",
-        interrupt_pps_rebootstrap_pending());
-  p.add("campaign_warmup_active", campaign_warmup_active());
-  p.add("campaign_warmup_required", CLOCKS_CAMPAIGN_WARMUP_SUPPRESS_PPS);
-  p.add("campaign_warmup_remaining", (uint32_t)g_campaign_warmup_remaining);
-  p.add("campaign_warmup_suppressed_total",
-        (uint32_t)g_campaign_warmup_suppressed_total);
+  p.add("alpha_smartzero_begin_count", clocks_alpha_smartzero_begin_count());
+  p.add("alpha_smartzero_begin_failures", clocks_alpha_smartzero_begin_failures());
+  p.add("interrupt_pps_rebootstrap_pending", interrupt_pps_rebootstrap_pending());
+}
+
+static void add_compact_smartzero_status(Payload& p) {
+  interrupt_smartzero_snapshot_t z{};
+  (void)interrupt_smartzero_snapshot(&z);
+  p.add("smartzero_running", z.running);
+  p.add("smartzero_complete", z.complete);
+  p.add("smartzero_sequence", z.sequence);
+  p.add("smartzero_current_lane", interrupt_subscriber_kind_str(z.current_lane));
+  p.add("smartzero_begin_count", z.begin_count);
+  p.add("smartzero_complete_count", z.complete_count);
+  p.add("smartzero_abort_count", z.abort_count);
+}
+
+static void add_dac_payload(Payload& p) {
+  Payload o1;
+  o1.add("dac", ocxo1_dac.dac_fractional);
+  o1.add("dac_hw_code", (uint32_t)ocxo1_dac.dac_hw_code);
+  o1.add("dac_min", ocxo1_dac.dac_min);
+  o1.add("dac_max", ocxo1_dac.dac_max);
+  o1.add("servo_last_step", ocxo1_dac.servo_last_step, 6);
+  o1.add("servo_last_residual", ocxo1_dac.servo_last_residual, 6);
+  o1.add("servo_settle_count", ocxo1_dac.servo_settle_count);
+  o1.add("servo_adjustments", ocxo1_dac.servo_adjustments);
+  o1.add("servo_predictor_initialized", ocxo1_dac.servo_predictor_initialized);
+  o1.add("servo_filtered_residual", ocxo1_dac.servo_filtered_residual, 6);
+  o1.add("servo_filtered_slope", ocxo1_dac.servo_filtered_slope, 6);
+  o1.add("servo_predicted_residual", ocxo1_dac.servo_predicted_residual, 6);
+  o1.add("servo_predictor_updates", ocxo1_dac.servo_predictor_updates);
+  o1.add("pacing_pending", ocxo1_dac.pacing_pending);
+  o1.add("pacing_pending_target", ocxo1_dac.pacing_pending_target, 6);
+  o1.add("pacing_pending_step", ocxo1_dac.pacing_pending_step, 6);
+  o1.add("pacing_intents", ocxo1_dac.pacing_intents);
+  o1.add("pacing_deferred_count", ocxo1_dac.pacing_deferred_count);
+  o1.add("pacing_commit_count", ocxo1_dac.pacing_commit_count);
+  o1.add("pacing_skip_small_delta_count", ocxo1_dac.pacing_skip_small_delta_count);
+  o1.add("io_last_write_ok", ocxo1_dac.io_last_write_ok);
+  o1.add("io_fault_latched", ocxo1_dac.io_fault_latched);
+  o1.add("io_write_attempts", ocxo1_dac.io_write_attempts);
+  o1.add("io_write_successes", ocxo1_dac.io_write_successes);
+  o1.add("io_write_failures", ocxo1_dac.io_write_failures);
+  o1.add("io_last_attempted_hw_code", (uint32_t)ocxo1_dac.io_last_attempted_hw_code);
+  o1.add("io_last_good_hw_code", (uint32_t)ocxo1_dac.io_last_good_hw_code);
+  o1.add("io_last_failure_stage", (uint32_t)ocxo1_dac.io_last_failure_stage);
+  p.add_object("ocxo1", o1);
+
+  Payload o2;
+  o2.add("dac", ocxo2_dac.dac_fractional);
+  o2.add("dac_hw_code", (uint32_t)ocxo2_dac.dac_hw_code);
+  o2.add("dac_min", ocxo2_dac.dac_min);
+  o2.add("dac_max", ocxo2_dac.dac_max);
+  o2.add("servo_last_step", ocxo2_dac.servo_last_step, 6);
+  o2.add("servo_last_residual", ocxo2_dac.servo_last_residual, 6);
+  o2.add("servo_settle_count", ocxo2_dac.servo_settle_count);
+  o2.add("servo_adjustments", ocxo2_dac.servo_adjustments);
+  o2.add("servo_predictor_initialized", ocxo2_dac.servo_predictor_initialized);
+  o2.add("servo_filtered_residual", ocxo2_dac.servo_filtered_residual, 6);
+  o2.add("servo_filtered_slope", ocxo2_dac.servo_filtered_slope, 6);
+  o2.add("servo_predicted_residual", ocxo2_dac.servo_predicted_residual, 6);
+  o2.add("servo_predictor_updates", ocxo2_dac.servo_predictor_updates);
+  o2.add("pacing_pending", ocxo2_dac.pacing_pending);
+  o2.add("pacing_pending_target", ocxo2_dac.pacing_pending_target, 6);
+  o2.add("pacing_pending_step", ocxo2_dac.pacing_pending_step, 6);
+  o2.add("pacing_intents", ocxo2_dac.pacing_intents);
+  o2.add("pacing_deferred_count", ocxo2_dac.pacing_deferred_count);
+  o2.add("pacing_commit_count", ocxo2_dac.pacing_commit_count);
+  o2.add("pacing_skip_small_delta_count", ocxo2_dac.pacing_skip_small_delta_count);
+  o2.add("io_last_write_ok", ocxo2_dac.io_last_write_ok);
+  o2.add("io_fault_latched", ocxo2_dac.io_fault_latched);
+  o2.add("io_write_attempts", ocxo2_dac.io_write_attempts);
+  o2.add("io_write_successes", ocxo2_dac.io_write_successes);
+  o2.add("io_write_failures", ocxo2_dac.io_write_failures);
+  o2.add("io_last_attempted_hw_code", (uint32_t)ocxo2_dac.io_last_attempted_hw_code);
+  o2.add("io_last_good_hw_code", (uint32_t)ocxo2_dac.io_last_good_hw_code);
+  o2.add("io_last_failure_stage", (uint32_t)ocxo2_dac.io_last_failure_stage);
+  p.add_object("ocxo2", o2);
+
+  p.add("calibrate_ocxo", servo_mode_str(calibrate_ocxo_mode));
+  p.add("ad5693r_init_ok", g_ad5693r_init_ok);
+  p.add("commit_scheduled", g_ocxo_dac_commit_scheduled);
+  p.add("last_schedule_second", g_ocxo_dac_last_schedule_second);
+  p.add("last_commit_second", g_ocxo_dac_last_commit_second);
+  p.add("last_winner", (uint32_t)g_ocxo_dac_last_winner);
+  p.add("arbitration_passes", g_ocxo_dac_arbitration_passes);
+  p.add("no_candidate_passes", g_ocxo_dac_no_candidate_passes);
+  p.add("deferred_candidates", g_ocxo_dac_deferred_candidates);
+  p.add("schedule_failures", g_ocxo_dac_schedule_failures);
+}
+
+static Payload cmd_report(const Payload&) {
+  Payload p;
+  p.add("report", "CLOCKS_COMPACT");
+  p.add("subreports", "REPORT_STATUS REPORT_SUMMARY REPORT_EPOCH REPORT_SMARTZERO REPORT_FORENSICS REPORT_FORENSICS_VCLOCK REPORT_FORENSICS_OCXO1 REPORT_FORENSICS_OCXO2 REPORT_PREDICTION REPORT_STATS REPORT_DAC");
+  add_summary_payload(p);
+  add_campaign_payload(p);
+
+  // Compact epoch status only.  The full zero-offset / SmartZero proof surface
+  // lives in REPORT_EPOCH and REPORT_SMARTZERO.
+  p.add("epoch_pending", clocks_epoch_pending());
+  p.add("epoch_initialized", clocks_alpha_epoch_initialized());
+  p.add("epoch_sequence", clocks_alpha_epoch_sequence());
+  p.add("epoch_install_count", clocks_alpha_epoch_install_count());
+  p.add("epoch_install_failures", clocks_alpha_epoch_install_failures());
+  p.add("epoch_reason", clocks_alpha_epoch_last_reason());
+  p.add("epoch_source", "SMARTZERO");
+
+  add_compact_smartzero_status(p);
+  return p;
+}
+
+static Payload cmd_report_status(const Payload&) {
+  Payload p;
+  p.add("report", "CLOCKS_STATUS");
+  add_campaign_payload(p);
+  add_epoch_payload(p);
+  add_compact_smartzero_status(p);
+  return p;
+}
+
+static Payload cmd_report_summary(const Payload&) {
+  Payload p;
+  p.add("report", "CLOCKS_SUMMARY");
+  add_summary_payload(p);
+  return p;
+}
+
+static Payload cmd_report_epoch(const Payload&) {
+  Payload p;
+  p.add("report", "CLOCKS_EPOCH");
+  add_epoch_payload(p);
+  return p;
+}
+
+static Payload cmd_report_smartzero(const Payload&) {
+  Payload p;
+  p.add("report", "CLOCKS_SMARTZERO");
+  payload_add_smartzero_summary(p);
+  return p;
+}
+
+static Payload cmd_report_forensics(const Payload&) {
+  Payload p;
+  p.add("report", "CLOCKS_FORENSICS");
+  const uint32_t report_dwt = DWT_CYCCNT;
+  const bool vclock_ok = clock_projection_valid(time_clock_id_t::VCLOCK);
+  const bool ocxo1_ok  = clock_projection_valid(time_clock_id_t::OCXO1);
+  const bool ocxo2_ok  = clock_projection_valid(time_clock_id_t::OCXO2);
+  const uint64_t vclock_ns = vclock_ok ? time_vclock_ns_at_dwt(report_dwt) : 0ULL;
+  const uint64_t ocxo1_ns  = ocxo1_ok  ? time_ocxo1_ns_at_dwt(report_dwt)  : 0ULL;
+  const uint64_t ocxo2_ns  = ocxo2_ok  ? time_ocxo2_ns_at_dwt(report_dwt)  : 0ULL;
+  add_clock_forensics_payload(p, report_dwt,
+                              vclock_ok ? vclock_ns : 0ULL, vclock_ok,
+                              ocxo1_ok ? ocxo1_ns : 0ULL, ocxo1_ok,
+                              ocxo2_ok ? ocxo2_ns : 0ULL, ocxo2_ok);
+  return p;
+}
+
+static Payload cmd_report_forensics_vclock(const Payload&) {
+  Payload p;
+  p.add("report", "CLOCKS_FORENSICS_VCLOCK");
+  const uint32_t report_dwt = DWT_CYCCNT;
+  const bool vclock_ok = clock_projection_valid(time_clock_id_t::VCLOCK);
+  const uint64_t vclock_ns = vclock_ok ? time_vclock_ns_at_dwt(report_dwt) : 0ULL;
+  add_single_clock_forensics_payload(p, "vclock", time_clock_id_t::VCLOCK,
+                                     report_dwt, vclock_ns, vclock_ok,
+                                     vclock_ns, vclock_ok);
+  return p;
+}
+
+static Payload cmd_report_forensics_ocxo1(const Payload&) {
+  Payload p;
+  p.add("report", "CLOCKS_FORENSICS_OCXO1");
+  const uint32_t report_dwt = DWT_CYCCNT;
+  const bool vclock_ok = clock_projection_valid(time_clock_id_t::VCLOCK);
+  const bool ocxo1_ok  = clock_projection_valid(time_clock_id_t::OCXO1);
+  const uint64_t vclock_ns = vclock_ok ? time_vclock_ns_at_dwt(report_dwt) : 0ULL;
+  const uint64_t ocxo1_ns  = ocxo1_ok  ? time_ocxo1_ns_at_dwt(report_dwt)  : 0ULL;
+  add_single_clock_forensics_payload(p, "ocxo1", time_clock_id_t::OCXO1,
+                                     report_dwt, vclock_ns, vclock_ok,
+                                     ocxo1_ns, ocxo1_ok);
+  return p;
+}
+
+static Payload cmd_report_forensics_ocxo2(const Payload&) {
+  Payload p;
+  p.add("report", "CLOCKS_FORENSICS_OCXO2");
+  const uint32_t report_dwt = DWT_CYCCNT;
+  const bool vclock_ok = clock_projection_valid(time_clock_id_t::VCLOCK);
+  const bool ocxo2_ok  = clock_projection_valid(time_clock_id_t::OCXO2);
+  const uint64_t vclock_ns = vclock_ok ? time_vclock_ns_at_dwt(report_dwt) : 0ULL;
+  const uint64_t ocxo2_ns  = ocxo2_ok  ? time_ocxo2_ns_at_dwt(report_dwt)  : 0ULL;
+  add_single_clock_forensics_payload(p, "ocxo2", time_clock_id_t::OCXO2,
+                                     report_dwt, vclock_ns, vclock_ok,
+                                     ocxo2_ns, ocxo2_ok);
+  return p;
+}
+
+static Payload cmd_report_prediction(const Payload&) {
+  Payload p;
+  p.add("report", "CLOCKS_PREDICTION");
+  payload_add_prediction_summary(p);
+  return p;
+}
+
+static Payload cmd_report_stats(const Payload&) {
+  Payload p;
+  p.add("report", "CLOCKS_STATS");
+  publish_welford(p, "dwt",          welford_dwt);
+  publish_welford(p, "vclock",       welford_vclock);
+  publish_welford(p, "ocxo1",        welford_ocxo1);
+  publish_welford(p, "ocxo2",        welford_ocxo2);
+  publish_welford(p, "pps_witness",  welford_pps_witness);
+  publish_welford(p, "ocxo1_dac",    welford_ocxo1_dac);
+  publish_welford(p, "ocxo2_dac",    welford_ocxo2_dac);
+  publish_freq(p, "dwt",    welford_dwt.mean);
+  publish_freq(p, "vclock", welford_vclock.mean);
+  publish_freq(p, "ocxo1",  welford_ocxo1.mean);
+  publish_freq(p, "ocxo2",  welford_ocxo2.mean);
+  return p;
+}
+
+static Payload cmd_report_dac(const Payload&) {
+  Payload p;
+  p.add("report", "CLOCKS_DAC");
+  add_dac_payload(p);
   return p;
 }
 
@@ -1670,14 +2018,25 @@ static Payload cmd_set_dac(const Payload& args) {
 // ============================================================================
 
 static const process_command_entry_t CLOCKS_COMMANDS[] = {
-  { "START",         cmd_start         },
-  { "STOP",          cmd_stop          },
-  { "ZERO",          cmd_zero          },
-  { "RECOVER",       cmd_recover       },
-  { "REPORT",        cmd_report        },
-  { "WATCHDOG_TEST", cmd_watchdog_test },
-  { "SET_DAC",       cmd_set_dac       },
-  { nullptr,          nullptr           }
+  { "START",             cmd_start             },
+  { "STOP",              cmd_stop              },
+  { "ZERO",              cmd_zero              },
+  { "RECOVER",           cmd_recover           },
+  { "REPORT",            cmd_report            },
+  { "REPORT_STATUS",     cmd_report_status     },
+  { "REPORT_SUMMARY",    cmd_report_summary    },
+  { "REPORT_EPOCH",      cmd_report_epoch      },
+  { "REPORT_SMARTZERO",  cmd_report_smartzero  },
+  { "REPORT_FORENSICS",        cmd_report_forensics        },
+  { "REPORT_FORENSICS_VCLOCK", cmd_report_forensics_vclock },
+  { "REPORT_FORENSICS_OCXO1",  cmd_report_forensics_ocxo1  },
+  { "REPORT_FORENSICS_OCXO2",  cmd_report_forensics_ocxo2  },
+  { "REPORT_PREDICTION",       cmd_report_prediction       },
+  { "REPORT_STATS",      cmd_report_stats      },
+  { "REPORT_DAC",        cmd_report_dac        },
+  { "WATCHDOG_TEST",     cmd_watchdog_test     },
+  { "SET_DAC",           cmd_set_dac           },
+  { nullptr,              nullptr               }
 };
 
 static const process_subscription_entry_t CLOCKS_SUBSCRIPTIONS[] = {

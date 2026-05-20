@@ -1116,6 +1116,19 @@ static ocxo_lane_t* ocxo_lane_for(interrupt_subscriber_kind_t kind);
 static inline uint16_t ocxo_lane_counter_now(const ocxo_lane_t& lane);
 static void ocxo_lane_program_compare(ocxo_lane_t& lane, uint16_t target_low16);
 static void ocxo_lane_disable_compare(ocxo_lane_t& lane);
+static void ocxo_lane_clear_compare_flag(ocxo_lane_t& lane);
+static inline bool ocxo_lane_compare_flag_pending(const ocxo_lane_t& lane);
+static void ocxo_lane_record_isr_diag(interrupt_subscriber_kind_t kind,
+                                      uint32_t isr_entry_dwt_raw,
+                                      uint32_t event_dwt,
+                                      uint32_t legacy_late_ticks,
+                                      uint32_t interpreted_late_ticks,
+                                      uint32_t early_ticks,
+                                      int32_t service_offset_signed_ticks,
+                                      uint32_t service_offset_abs_ticks,
+                                      uint32_t target_delta_mod65536_ticks,
+                                      uint16_t target_low16,
+                                      uint16_t isr_counter_low16);
 
 // ============================================================================
 // QTimer1 CH0 low-word counter
@@ -1474,6 +1487,431 @@ bool interrupt_clock_snapshot(interrupt_subscriber_kind_t kind, interrupt_clock_
     return true;
   }
 
+  return false;
+}
+
+
+// ============================================================================
+// SmartZero(R) — mathematically-qualified logical zero acquisition
+// ============================================================================
+//
+// The old epoch packet trusted a latency-adjusted ISR capture. SmartZero does
+// not.  It observes consecutive 1 kHz edge captures and accepts a lane only
+// when the DWT interval matches the current PPS/GPIO-derived cycles-per-second
+// ruler within a tight cycle window.  The later edge of the accepted pair is
+// the lane's canonical zero anchor.  Acquisition is strictly serial:
+// VCLOCK -> OCXO1 -> OCXO2.
+
+static constexpr uint32_t SMARTZERO_INTERVAL_TICKS = SMARTZERO_COUNTER_DELTA_TICKS;
+static constexpr int32_t  SMARTZERO_INTERVAL_TOLERANCE_CYCLES =
+    SMARTZERO_DEFAULT_TOLERANCE_CYCLES;
+
+struct smartzero_lane_runtime_t {
+  interrupt_smartzero_lane_snapshot_t pub{};
+  bool previous_present = false;
+};
+
+struct smartzero_runtime_t {
+  volatile uint32_t seq = 0;
+  interrupt_smartzero_phase_t phase = interrupt_smartzero_phase_t::IDLE;
+  bool running = false;
+  bool complete = false;
+  uint32_t sequence = 0;
+  uint32_t begin_count = 0;
+  uint32_t complete_count = 0;
+  uint32_t abort_count = 0;
+  uint32_t current_lane_index = 0;
+  smartzero_lane_runtime_t lanes[SMARTZERO_LANE_COUNT];
+};
+
+static smartzero_runtime_t g_smartzero = {};
+
+static interrupt_subscriber_kind_t smartzero_kind_for_index(uint32_t index) {
+  switch (index) {
+    case 0: return interrupt_subscriber_kind_t::VCLOCK;
+    case 1: return interrupt_subscriber_kind_t::OCXO1;
+    case 2: return interrupt_subscriber_kind_t::OCXO2;
+    default: return interrupt_subscriber_kind_t::NONE;
+  }
+}
+
+static int smartzero_index_for_kind(interrupt_subscriber_kind_t kind) {
+  if (kind == interrupt_subscriber_kind_t::VCLOCK) return 0;
+  if (kind == interrupt_subscriber_kind_t::OCXO1)  return 1;
+  if (kind == interrupt_subscriber_kind_t::OCXO2)  return 2;
+  return -1;
+}
+
+static const char* smartzero_decision_name(interrupt_smartzero_decision_t d) {
+  switch (d) {
+    case interrupt_smartzero_decision_t::WAITING_FOR_CPS:  return "WAITING_FOR_CPS";
+    case interrupt_smartzero_decision_t::FIRST_SAMPLE:     return "FIRST_SAMPLE";
+    case interrupt_smartzero_decision_t::ACCEPTED:         return "ACCEPTED";
+    case interrupt_smartzero_decision_t::REJECTED_DWT:     return "REJECTED_DWT";
+    case interrupt_smartzero_decision_t::REJECTED_COUNTER: return "REJECTED_COUNTER";
+    default:                                               return "NONE";
+  }
+}
+
+static const char* smartzero_lane_state_name(interrupt_smartzero_lane_state_t s) {
+  switch (s) {
+    case interrupt_smartzero_lane_state_t::ACQUIRING: return "ACQUIRING";
+    case interrupt_smartzero_lane_state_t::LOCKED:    return "LOCKED";
+    default:                                         return "IDLE";
+  }
+}
+
+static inline void smartzero_write_begin(void) {
+  g_smartzero.seq++;
+  dmb_barrier();
+}
+
+static inline void smartzero_write_end(void) {
+  dmb_barrier();
+  g_smartzero.seq++;
+}
+
+static void smartzero_reset_lane(uint32_t index) {
+  smartzero_lane_runtime_t& r = g_smartzero.lanes[index];
+  r = smartzero_lane_runtime_t{};
+  r.pub.kind = smartzero_kind_for_index(index);
+  r.pub.state = interrupt_smartzero_lane_state_t::IDLE;
+  r.pub.last_decision = interrupt_smartzero_decision_t::NONE;
+  r.pub.tolerance_cycles = SMARTZERO_INTERVAL_TOLERANCE_CYCLES;
+  r.pub.required_counter_delta_ticks = SMARTZERO_INTERVAL_TICKS;
+}
+
+static bool smartzero_is_current_lane(interrupt_subscriber_kind_t kind) {
+  if (!g_smartzero.running || g_smartzero.complete) return false;
+  return smartzero_kind_for_index(g_smartzero.current_lane_index) == kind;
+}
+
+static uint32_t smartzero_expected_interval_cycles(uint32_t* out_cps) {
+  const uint32_t cps = interrupt_vclock_cycles_per_second();
+  if (out_cps) *out_cps = cps;
+
+  // SmartZero's admissibility ruler is intentionally PPS/GPIO-derived.  The
+  // fallback DWT_EXPECTED_PER_PPS is close, but ZERO authority should wait for
+  // the physical PPS witness to give us a live one-second ruler.
+  if (!clocks_dwt_calibration_valid() || cps == 0) return 0;
+
+  return (uint32_t)(((uint64_t)cps +
+                     (uint64_t)SMARTZERO_SAMPLE_RATE_HZ / 2ULL) /
+                    (uint64_t)SMARTZERO_SAMPLE_RATE_HZ);
+}
+
+static void smartzero_arm_ocxo_lane(interrupt_subscriber_kind_t kind) {
+  const int idx = smartzero_index_for_kind(kind);
+  if (idx < 0) return;
+
+  ocxo_lane_t* lane = ocxo_lane_for(kind);
+  synthetic_clock32_t* clock32 = synthetic_clock_for_kind(kind);
+  if (!lane || !clock32 || !lane->initialized) return;
+
+  // SmartZero owns the OCXO compare channel while the lane is acquiring.
+  // Clear any one-second witness state so the zero sampler has sole custody.
+  lane->witness_armed = false;
+  ocxo_lane_disable_compare(*lane);
+
+  const uint16_t hw16 = ocxo_lane_counter_now(*lane);
+  synthetic_clock_tend_from_hw16(*clock32, hw16);
+  const uint32_t current_counter32 = clock32->current_counter32;
+  const uint32_t target_counter32 = current_counter32 + SMARTZERO_INTERVAL_TICKS;
+  const uint16_t target_low16 = (uint16_t)(target_counter32 & 0xFFFFU);
+
+  smartzero_lane_runtime_t& r = g_smartzero.lanes[idx];
+  r.pub.next_target_counter32 = target_counter32;
+  r.pub.arm_count++;
+
+  lane->compare_target = target_low16;
+  ocxo_lane_program_compare(*lane, target_low16);
+}
+
+static void smartzero_arm_current_lane(void) {
+  const interrupt_subscriber_kind_t kind =
+      smartzero_kind_for_index(g_smartzero.current_lane_index);
+  if (kind == interrupt_subscriber_kind_t::OCXO1 ||
+      kind == interrupt_subscriber_kind_t::OCXO2) {
+    smartzero_arm_ocxo_lane(kind);
+  }
+}
+
+static void smartzero_advance_or_complete(void) {
+  if (g_smartzero.current_lane_index + 1U >= SMARTZERO_LANE_COUNT) {
+    g_smartzero.running = false;
+    g_smartzero.complete = true;
+    g_smartzero.phase = interrupt_smartzero_phase_t::COMPLETE;
+    g_smartzero.complete_count++;
+    return;
+  }
+
+  g_smartzero.current_lane_index++;
+  smartzero_lane_runtime_t& next = g_smartzero.lanes[g_smartzero.current_lane_index];
+  next.pub.state = interrupt_smartzero_lane_state_t::ACQUIRING;
+  next.pub.last_decision = interrupt_smartzero_decision_t::NONE;
+  next.previous_present = false;
+  smartzero_arm_current_lane();
+}
+
+static void smartzero_feed_sample(interrupt_subscriber_kind_t kind,
+                                  uint32_t event_dwt,
+                                  uint32_t counter32,
+                                  uint16_t hardware16) {
+  if (!smartzero_is_current_lane(kind)) return;
+
+  const int idx = smartzero_index_for_kind(kind);
+  if (idx < 0) return;
+
+  uint32_t cps = 0;
+  const uint32_t expected = smartzero_expected_interval_cycles(&cps);
+
+  smartzero_write_begin();
+
+  smartzero_lane_runtime_t& r = g_smartzero.lanes[idx];
+  interrupt_smartzero_lane_snapshot_t& z = r.pub;
+
+  z.state = interrupt_smartzero_lane_state_t::ACQUIRING;
+  z.sample_count++;
+  z.cps_used = cps;
+  z.expected_interval_cycles = expected;
+  z.last_sample_dwt = event_dwt;
+  z.last_sample_counter32 = counter32;
+  z.last_sample_hardware16 = hardware16;
+
+  if (expected == 0) {
+    z.waiting_for_cps_count++;
+    z.last_decision = interrupt_smartzero_decision_t::WAITING_FOR_CPS;
+    r.previous_present = false;
+    smartzero_write_end();
+    return;
+  }
+
+  if (!r.previous_present) {
+    z.previous_sample_dwt = event_dwt;
+    z.previous_sample_counter32 = counter32;
+    z.previous_sample_hardware16 = hardware16;
+    z.last_decision = interrupt_smartzero_decision_t::FIRST_SAMPLE;
+    r.previous_present = true;
+    smartzero_write_end();
+    return;
+  }
+
+  const uint32_t previous_dwt = z.previous_sample_dwt;
+  const uint32_t previous_counter32 = z.previous_sample_counter32;
+  const uint16_t previous_hw16 = z.previous_sample_hardware16;
+
+  const uint32_t interval_cycles = event_dwt - previous_dwt;
+  const uint32_t counter_delta = counter32 - previous_counter32;
+  const int32_t error_cycles =
+      (int32_t)((int64_t)interval_cycles - (int64_t)expected);
+  const uint32_t abs_error = (uint32_t)(error_cycles < 0
+      ? -(int64_t)error_cycles
+      :  (int64_t)error_cycles);
+
+  z.interval_attempt_count++;
+  z.last_interval_cycles = interval_cycles;
+  z.last_interval_error_cycles = error_cycles;
+  z.last_counter_delta_ticks = counter_delta;
+  if (abs_error > z.max_abs_interval_error_cycles) {
+    z.max_abs_interval_error_cycles = abs_error;
+  }
+
+  const bool counter_ok = (counter_delta == SMARTZERO_INTERVAL_TICKS);
+  const bool dwt_ok = ((int32_t)abs_error <= SMARTZERO_INTERVAL_TOLERANCE_CYCLES);
+
+  if (counter_ok && dwt_ok) {
+    z.accepted_count++;
+    z.state = interrupt_smartzero_lane_state_t::LOCKED;
+    z.last_decision = interrupt_smartzero_decision_t::ACCEPTED;
+    z.anchor_dwt = event_dwt;
+    z.anchor_counter32 = counter32;
+    z.anchor_hardware16 = hardware16;
+    z.anchor_pair_previous_dwt = previous_dwt;
+    z.anchor_pair_previous_counter32 = previous_counter32;
+
+    if (kind == interrupt_subscriber_kind_t::OCXO1 ||
+        kind == interrupt_subscriber_kind_t::OCXO2) {
+      ocxo_lane_t* lane = ocxo_lane_for(kind);
+      if (lane) ocxo_lane_disable_compare(*lane);
+    }
+
+    smartzero_advance_or_complete();
+    smartzero_write_end();
+    return;
+  }
+
+  z.rejected_count++;
+  z.last_decision = counter_ok
+      ? interrupt_smartzero_decision_t::REJECTED_DWT
+      : interrupt_smartzero_decision_t::REJECTED_COUNTER;
+
+  // Roll the observation window forward.  If this sample was the bad one, the
+  // next interval will reject; if it was good, the next good edge can lock.
+  z.previous_sample_dwt = event_dwt;
+  z.previous_sample_counter32 = counter32;
+  z.previous_sample_hardware16 = hardware16;
+  (void)previous_hw16;
+
+  smartzero_write_end();
+}
+
+static bool smartzero_ocxo_compare_isr(ocxo_lane_t& lane,
+                                       interrupt_subscriber_kind_t kind,
+                                       synthetic_clock32_t& clock32,
+                                       uint32_t isr_entry_dwt_raw) {
+  if (!smartzero_is_current_lane(kind)) return false;
+  if (!ocxo_lane_compare_flag_pending(lane)) return false;
+
+  const int idx = smartzero_index_for_kind(kind);
+  if (idx < 0) return false;
+
+  const uint32_t target_counter32 = g_smartzero.lanes[idx].pub.next_target_counter32;
+  const uint16_t target_low16 = (uint16_t)(target_counter32 & 0xFFFFU);
+  const uint16_t isr_counter_low16 = ocxo_lane_counter_now(lane);
+  const uint16_t target_delta_mod65536 =
+      (uint16_t)(isr_counter_low16 - target_low16);
+  const int16_t service_offset_signed = (int16_t)target_delta_mod65536;
+  const bool service_early = (service_offset_signed < 0);
+  const uint32_t early_ticks = service_early
+      ? (uint32_t)(-(int32_t)service_offset_signed)
+      : 0U;
+  const uint32_t interpreted_late_ticks = service_early
+      ? 0U
+      : (uint32_t)service_offset_signed;
+  const uint32_t service_offset_abs_ticks = service_early
+      ? early_ticks
+      : interpreted_late_ticks;
+
+  ocxo_lane_clear_compare_flag(lane);
+
+  const uint32_t event_dwt = qtimer_event_dwt_from_isr_entry_raw(isr_entry_dwt_raw);
+
+  // Make the known compare target the synthetic identity of this sample.  The
+  // foreground/cadence minder may also tend the low word, but SmartZero's
+  // sample identity is the compare target, not an ambient post-event read.
+  clock32.current_counter32 = target_counter32;
+  clock32.current_ns = (uint64_t)target_counter32 * 100ULL;
+  clock32.hardware16 = target_low16;
+  clock32.minder_update_count++;
+  lane.logical_count32_at_last_second = target_counter32;
+  lane.compare_target = target_low16;
+  lane.cadence_hits_total++;
+
+  ocxo_lane_record_isr_diag(kind,
+                            isr_entry_dwt_raw,
+                            event_dwt,
+                            (uint32_t)target_delta_mod65536,
+                            interpreted_late_ticks,
+                            early_ticks,
+                            (int32_t)service_offset_signed,
+                            service_offset_abs_ticks,
+                            (uint32_t)target_delta_mod65536,
+                            target_low16,
+                            isr_counter_low16);
+
+  smartzero_write_begin();
+  g_smartzero.lanes[idx].pub.fire_count++;
+  smartzero_write_end();
+
+  smartzero_feed_sample(kind, event_dwt, target_counter32, target_low16);
+
+  if (smartzero_is_current_lane(kind)) {
+    const uint32_t next_target = target_counter32 + SMARTZERO_INTERVAL_TICKS;
+    const uint16_t next_low16 = (uint16_t)(next_target & 0xFFFFU);
+
+    smartzero_write_begin();
+    g_smartzero.lanes[idx].pub.next_target_counter32 = next_target;
+    g_smartzero.lanes[idx].pub.arm_count++;
+    smartzero_write_end();
+
+    lane.compare_target = next_low16;
+    ocxo_lane_program_compare(lane, next_low16);
+  } else {
+    ocxo_lane_disable_compare(lane);
+  }
+
+  return true;
+}
+
+bool interrupt_smartzero_begin(void) {
+  if (!g_interrupt_runtime_ready || !g_interrupt_hw_ready) return false;
+
+  smartzero_write_begin();
+
+  g_smartzero.running = true;
+  g_smartzero.complete = false;
+  g_smartzero.phase = interrupt_smartzero_phase_t::RUNNING;
+  g_smartzero.sequence++;
+  g_smartzero.begin_count++;
+  g_smartzero.current_lane_index = 0;
+  for (uint32_t i = 0; i < SMARTZERO_LANE_COUNT; i++) {
+    smartzero_reset_lane(i);
+  }
+  g_smartzero.lanes[0].pub.state = interrupt_smartzero_lane_state_t::ACQUIRING;
+
+  // SmartZero owns any OCXO compare channels once acquisition begins.  VCLOCK
+  // samples arrive through the already-running TimePop/CADENCE_MINDER rail.
+  ocxo_lane_disable_compare(g_ocxo1_lane);
+  ocxo_lane_disable_compare(g_ocxo2_lane);
+  g_ocxo1_lane.witness_armed = false;
+  g_ocxo2_lane.witness_armed = false;
+
+  smartzero_write_end();
+  return true;
+}
+
+void interrupt_smartzero_abort(void) {
+  smartzero_write_begin();
+  g_smartzero.running = false;
+  g_smartzero.complete = false;
+  g_smartzero.phase = interrupt_smartzero_phase_t::IDLE;
+  g_smartzero.abort_count++;
+  ocxo_lane_disable_compare(g_ocxo1_lane);
+  ocxo_lane_disable_compare(g_ocxo2_lane);
+  smartzero_write_end();
+}
+
+bool interrupt_smartzero_running(void) {
+  return g_smartzero.running && !g_smartzero.complete;
+}
+
+bool interrupt_smartzero_complete(void) {
+  return g_smartzero.complete;
+}
+
+bool interrupt_smartzero_snapshot(interrupt_smartzero_snapshot_t* out) {
+  if (!out) return false;
+
+  for (int attempt = 0; attempt < 4; attempt++) {
+    const uint32_t seq1 = g_smartzero.seq;
+    dmb_barrier();
+
+    interrupt_smartzero_snapshot_t local{};
+    local.phase = g_smartzero.phase;
+    local.running = g_smartzero.running;
+    local.complete = g_smartzero.complete;
+    local.sequence = g_smartzero.sequence;
+    local.begin_count = g_smartzero.begin_count;
+    local.complete_count = g_smartzero.complete_count;
+    local.abort_count = g_smartzero.abort_count;
+    local.current_lane_index = g_smartzero.current_lane_index;
+    local.current_lane = smartzero_kind_for_index(g_smartzero.current_lane_index);
+    local.tolerance_cycles = SMARTZERO_INTERVAL_TOLERANCE_CYCLES;
+    local.sample_rate_hz = SMARTZERO_SAMPLE_RATE_HZ;
+    local.counter_delta_ticks = SMARTZERO_INTERVAL_TICKS;
+    for (uint32_t i = 0; i < SMARTZERO_LANE_COUNT; i++) {
+      local.lanes[i] = g_smartzero.lanes[i].pub;
+    }
+
+    dmb_barrier();
+    const uint32_t seq2 = g_smartzero.seq;
+    if (seq1 == seq2 && (seq1 & 1u) == 0u) {
+      *out = local;
+      return local.complete;
+    }
+  }
+
+  *out = interrupt_smartzero_snapshot_t{};
   return false;
 }
 
@@ -1905,6 +2343,12 @@ static void cadence_minder_emit_ocxo_if_due(interrupt_subscriber_kind_t kind,
     lane.tick_mod_1000 = 0;
   }
 
+  // During SmartZero, the active OCXO lane owns its compare channel at 1 kHz.
+  // Do not let the once-per-second witness armer contend for the same rail.
+  if (smartzero_is_current_lane(kind)) {
+    return;
+  }
+
   // CADENCE_MINDER keeps passive low-word rollover custody and arms exactly
   // one OCXO compare as the known synthetic second target approaches.  The
   // actual OCXO event is emitted only by the OCXO compare ISR.
@@ -1932,6 +2376,14 @@ static void cadence_minder_timepop_callback(timepop_ctx_t* ctx,
   g_cadence_minder_vclock_updates++;
   g_cadence_minder_last_vclock_hw16 = fired_low16;
   g_cadence_minder_last_vclock_counter32 = cadence_counter32;
+
+  // SmartZero VCLOCK samples are the same 1 kHz TimePop fire facts that will
+  // later feed regression.  During zero acquisition they are observations; the
+  // accepted pair decides the canonical VCLOCK zero anchor.
+  smartzero_feed_sample(interrupt_subscriber_kind_t::VCLOCK,
+                        qtimer_event_dwt,
+                        cadence_counter32,
+                        fired_low16);
 
   if (g_rt_vclock) {
     g_rt_vclock->irq_count++;
@@ -2515,6 +2967,12 @@ static void ocxo_witness_compare_isr(ocxo_lane_t& lane,
 
 static void qtimer2_isr(void) {
   const uint32_t isr_entry_dwt_raw = ARM_DWT_CYCCNT;  // SACRED: first instruction.
+  if (smartzero_ocxo_compare_isr(g_ocxo1_lane,
+                                 interrupt_subscriber_kind_t::OCXO1,
+                                 g_ocxo1_clock32,
+                                 isr_entry_dwt_raw)) {
+    return;
+  }
   ocxo_witness_compare_isr(g_ocxo1_lane,
                            g_rt_ocxo1,
                            interrupt_subscriber_kind_t::OCXO1,
@@ -2523,6 +2981,12 @@ static void qtimer2_isr(void) {
 
 static void qtimer3_isr(void) {
   const uint32_t isr_entry_dwt_raw = ARM_DWT_CYCCNT;  // SACRED: first instruction.
+  if (smartzero_ocxo_compare_isr(g_ocxo2_lane,
+                                 interrupt_subscriber_kind_t::OCXO2,
+                                 g_ocxo2_clock32,
+                                 isr_entry_dwt_raw)) {
+    return;
+  }
   ocxo_witness_compare_isr(g_ocxo2_lane,
                            g_rt_ocxo2,
                            interrupt_subscriber_kind_t::OCXO2,
@@ -3271,6 +3735,10 @@ void process_interrupt_init(void) {
   g_vclock_clock32 = vclock_synthetic_clock32_t{};
   g_ocxo1_clock32 = synthetic_clock32_t{};
   g_ocxo2_clock32 = synthetic_clock32_t{};
+  g_smartzero = smartzero_runtime_t{};
+  for (uint32_t i = 0; i < SMARTZERO_LANE_COUNT; i++) {
+    smartzero_reset_lane(i);
+  }
 
   // Defensive birth anchors.  These are not logical ZERO operations; they
   // simply make process_interrupt's synthetic coordinate extenders safe before
@@ -3558,6 +4026,68 @@ static void add_dynamic_cps_payload(Payload& p) {
   p.add("dynamic_cps_last_pvc_dwt_at_edge", g_pps_gpio_heartbeat.last_dwt);
   p.add("dynamic_cps_last_reseed_value", dynamic_cps);
   p.add("dynamic_cps_last_reseed_was_computed", dynamic_cps != 0);
+}
+
+
+static void add_smartzero_lane_payload(Payload& parent,
+                                       const char* key,
+                                       const interrupt_smartzero_lane_snapshot_t& z) {
+  Payload p;
+  p.add("kind", interrupt_subscriber_kind_str(z.kind));
+  p.add("state", smartzero_lane_state_name(z.state));
+  p.add("last_decision", smartzero_decision_name(z.last_decision));
+  p.add("sample_count", z.sample_count);
+  p.add("interval_attempt_count", z.interval_attempt_count);
+  p.add("accepted_count", z.accepted_count);
+  p.add("rejected_count", z.rejected_count);
+  p.add("waiting_for_cps_count", z.waiting_for_cps_count);
+  p.add("cps_used", z.cps_used);
+  p.add("expected_interval_cycles", z.expected_interval_cycles);
+  p.add("tolerance_cycles", z.tolerance_cycles);
+  p.add("required_counter_delta_ticks", z.required_counter_delta_ticks);
+  p.add("last_sample_dwt", z.last_sample_dwt);
+  p.add("last_sample_counter32", z.last_sample_counter32);
+  p.add("last_sample_hardware16", (uint32_t)z.last_sample_hardware16);
+  p.add("previous_sample_dwt", z.previous_sample_dwt);
+  p.add("previous_sample_counter32", z.previous_sample_counter32);
+  p.add("previous_sample_hardware16", (uint32_t)z.previous_sample_hardware16);
+  p.add("last_interval_cycles", z.last_interval_cycles);
+  p.add("last_interval_error_cycles", z.last_interval_error_cycles);
+  p.add("max_abs_interval_error_cycles", z.max_abs_interval_error_cycles);
+  p.add("last_counter_delta_ticks", z.last_counter_delta_ticks);
+  p.add("anchor_dwt", z.anchor_dwt);
+  p.add("anchor_counter32", z.anchor_counter32);
+  p.add("anchor_hardware16", (uint32_t)z.anchor_hardware16);
+  p.add("anchor_pair_previous_dwt", z.anchor_pair_previous_dwt);
+  p.add("anchor_pair_previous_counter32", z.anchor_pair_previous_counter32);
+  p.add("arm_count", z.arm_count);
+  p.add("fire_count", z.fire_count);
+  p.add("next_target_counter32", z.next_target_counter32);
+  parent.add_object(key, p);
+}
+
+static void add_smartzero_payload(Payload& p) {
+  interrupt_smartzero_snapshot_t z{};
+  (void)interrupt_smartzero_snapshot(&z);
+
+  p.add("smartzero_phase", z.complete ? "COMPLETE" : (z.running ? "RUNNING" : "IDLE"));
+  p.add("smartzero_running", z.running);
+  p.add("smartzero_complete", z.complete);
+  p.add("smartzero_sequence", z.sequence);
+  p.add("smartzero_begin_count", z.begin_count);
+  p.add("smartzero_complete_count", z.complete_count);
+  p.add("smartzero_abort_count", z.abort_count);
+  p.add("smartzero_current_lane_index", z.current_lane_index);
+  p.add("smartzero_current_lane", interrupt_subscriber_kind_str(z.current_lane));
+  p.add("smartzero_sample_rate_hz", z.sample_rate_hz);
+  p.add("smartzero_counter_delta_ticks", z.counter_delta_ticks);
+  p.add("smartzero_tolerance_cycles", z.tolerance_cycles);
+
+  Payload lanes;
+  add_smartzero_lane_payload(lanes, "vclock", z.lanes[0]);
+  add_smartzero_lane_payload(lanes, "ocxo1", z.lanes[1]);
+  add_smartzero_lane_payload(lanes, "ocxo2", z.lanes[2]);
+  p.add_object("smartzero", lanes);
 }
 
 static void add_vclock_clock32_payload(Payload& p, const char* prefix) {
@@ -3922,6 +4452,7 @@ static Payload cmd_report(const Payload&) {
   add_pps_payload(p);
   add_epoch_capture_payload(p);
   add_dynamic_cps_payload(p);
+  add_smartzero_payload(p);
 
   p.add("pvc_anchor_ring_count", g_pvc_anchor_count);
   p.add("pvc_anchor_ring_head", g_pvc_anchor_head);

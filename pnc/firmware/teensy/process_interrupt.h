@@ -320,6 +320,111 @@ struct interrupt_capture_diag_t {
 // "PPS was seconds ago" case while leaving generous headroom.
 static constexpr int32_t DWT_PPS_COINCIDENCE_THRESHOLD_CYCLES = 10000;
 
+
+// ============================================================================
+// SmartZero(R) — mathematically-qualified logical zero acquisition
+// ============================================================================
+//
+// SmartZero treats first-instruction ISR DWT captures as observations, not as
+// authority.  During acquisition each clock domain is sampled at 1 kHz and the
+// interval between consecutive samples is tested against the current
+// PPS/GPIO-derived DWT cycles-per-GNSS-second ruler.  A lane locks only after
+// a lawful 1 kHz interval is observed; the later edge of that accepted pair is
+// the lane's canonical zero anchor.
+//
+// Acquisition order is strictly serial:
+//   VCLOCK -> OCXO1 -> OCXO2
+//
+// No campaign may start until all three lanes are locked.
+
+static constexpr uint32_t SMARTZERO_LANE_COUNT = 3;
+static constexpr uint32_t SMARTZERO_SAMPLE_RATE_HZ = 1000;
+static constexpr uint32_t SMARTZERO_COUNTER_DELTA_TICKS = 10000;
+static constexpr int32_t  SMARTZERO_DEFAULT_TOLERANCE_CYCLES = 4;
+
+enum class interrupt_smartzero_phase_t : uint8_t {
+  IDLE     = 0,
+  RUNNING  = 1,
+  COMPLETE = 2,
+};
+
+enum class interrupt_smartzero_lane_state_t : uint8_t {
+  IDLE      = 0,
+  ACQUIRING = 1,
+  LOCKED    = 2,
+};
+
+enum class interrupt_smartzero_decision_t : uint8_t {
+  NONE             = 0,
+  WAITING_FOR_CPS  = 1,
+  FIRST_SAMPLE     = 2,
+  ACCEPTED         = 3,
+  REJECTED_DWT     = 4,
+  REJECTED_COUNTER = 5,
+};
+
+struct interrupt_smartzero_lane_snapshot_t {
+  interrupt_subscriber_kind_t kind = interrupt_subscriber_kind_t::NONE;
+  interrupt_smartzero_lane_state_t state = interrupt_smartzero_lane_state_t::IDLE;
+  interrupt_smartzero_decision_t last_decision = interrupt_smartzero_decision_t::NONE;
+
+  uint32_t sample_count = 0;
+  uint32_t interval_attempt_count = 0;
+  uint32_t accepted_count = 0;
+  uint32_t rejected_count = 0;
+  uint32_t waiting_for_cps_count = 0;
+
+  uint32_t expected_interval_cycles = 0;
+  int32_t  tolerance_cycles = SMARTZERO_DEFAULT_TOLERANCE_CYCLES;
+  uint32_t required_counter_delta_ticks = SMARTZERO_COUNTER_DELTA_TICKS;
+  uint32_t cps_used = 0;
+
+  uint32_t last_sample_dwt = 0;
+  uint32_t last_sample_counter32 = 0;
+  uint16_t last_sample_hardware16 = 0;
+
+  uint32_t previous_sample_dwt = 0;
+  uint32_t previous_sample_counter32 = 0;
+  uint16_t previous_sample_hardware16 = 0;
+
+  uint32_t last_interval_cycles = 0;
+  int32_t  last_interval_error_cycles = 0;
+  uint32_t max_abs_interval_error_cycles = 0;
+  uint32_t last_counter_delta_ticks = 0;
+
+  uint32_t anchor_dwt = 0;
+  uint32_t anchor_counter32 = 0;
+  uint16_t anchor_hardware16 = 0;
+  uint32_t anchor_pair_previous_dwt = 0;
+  uint32_t anchor_pair_previous_counter32 = 0;
+
+  uint32_t arm_count = 0;
+  uint32_t fire_count = 0;
+  uint32_t next_target_counter32 = 0;
+};
+
+struct interrupt_smartzero_snapshot_t {
+  interrupt_smartzero_phase_t phase = interrupt_smartzero_phase_t::IDLE;
+  bool running = false;
+  bool complete = false;
+  uint32_t sequence = 0;
+  uint32_t begin_count = 0;
+  uint32_t complete_count = 0;
+  uint32_t abort_count = 0;
+  uint32_t current_lane_index = 0;
+  interrupt_subscriber_kind_t current_lane = interrupt_subscriber_kind_t::NONE;
+  uint32_t tolerance_cycles = SMARTZERO_DEFAULT_TOLERANCE_CYCLES;
+  uint32_t sample_rate_hz = SMARTZERO_SAMPLE_RATE_HZ;
+  uint32_t counter_delta_ticks = SMARTZERO_COUNTER_DELTA_TICKS;
+  interrupt_smartzero_lane_snapshot_t lanes[SMARTZERO_LANE_COUNT];
+};
+
+bool interrupt_smartzero_begin(void);
+void interrupt_smartzero_abort(void);
+bool interrupt_smartzero_running(void);
+bool interrupt_smartzero_complete(void);
+bool interrupt_smartzero_snapshot(interrupt_smartzero_snapshot_t* out);
+
 // ============================================================================
 // VCLOCK epoch tick offset (alpha-side correction)
 // ============================================================================

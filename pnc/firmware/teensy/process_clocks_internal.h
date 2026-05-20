@@ -546,9 +546,15 @@ void clocks_watchdog_anomaly(const char* reason,
 // Local CLOCKS epoch integration
 // ============================================================================
 
-// ZERO is now owned by CLOCKS.  Alpha selects the latest epoch-ready capture
-// packet authored by process_interrupt and installs canonical logical origins.
+// ZERO is now owned by CLOCKS.  Alpha selects a mathematically-qualified
+// SmartZero acquisition surface and installs canonical logical origins.
+// The legacy interrupt-capture entry point is retained as a compatibility
+// wrapper during migration.
 bool clocks_epoch_pending(void);
+bool clocks_alpha_begin_smartzero_epoch(const char* reason);
+bool clocks_alpha_zero_from_smartzero(const char* reason);
+uint32_t clocks_alpha_smartzero_begin_count(void);
+uint32_t clocks_alpha_smartzero_begin_failures(void);
 bool clocks_alpha_zero_from_interrupt_capture(const char* reason);
 bool clocks_alpha_epoch_initialized(void);
 uint32_t clocks_alpha_epoch_sequence(void);

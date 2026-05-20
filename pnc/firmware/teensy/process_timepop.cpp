@@ -65,9 +65,11 @@
 //   It does not reinterpret PPS/VCLOCK phase and it does not read timer
 //   hardware directly.
 //
-//   All timed slots reached by the same physical CH2 event receive the same
-//   fire_vclock_raw, fire_dwt_cyccnt, and fire_gnss_ns.  Equality with the
-//   compare target is the normal fire condition, not a suspicious edge case.
+//   Only timed slots whose authored deadline exactly equals the physical CH2
+//   event counter receive a callback.  All slots exactly matched by the same
+//   CH2 event receive the same fire_vclock_raw, fire_dwt_cyccnt, and
+//   fire_gnss_ns.  Already-past deadlines are missed edges, not late fires;
+//   TimePop quarantines them without callback and re-authors recurring grids.
 //   Callback order is logical only; it must never re-author the physical
 //   timing facts.
 //
@@ -109,6 +111,10 @@ static constexpr uint32_t MAX_ALAP_SLOTS = 4;
 static constexpr uint64_t NS_PER_TICK = 100ULL;
 static constexpr uint32_t MAX_DELAY_TICKS = 0x7FFFFFFFU;
 static constexpr uint32_t MIN_DELAY_TICKS = 2;
+// Minimum safe lead when programming QTimer1 CH2 from scheduler context.
+// A deadline closer than this is treated as already missed/too-close;
+// TimePop must not arm CH2 at-or-inside the hardware race window.
+static constexpr uint32_t SCHEDULE_MIN_ARM_LEAD_TICKS = 64;
 static constexpr uint32_t HEARTBEAT_TICKS = 10000;
 static constexpr uint32_t PREDICT_MAX_QTIMER_ELAPSED = 15000000U;
 static constexpr uint32_t ONE_HZ_TICKS = 10000000U;
@@ -151,6 +157,8 @@ enum class timepop_arm_source_t : uint8_t {
   DISPATCH_PHASE_LOCKED_REARM,
   ISR_REARM,
   ISR_REARM_FALLBACK,
+  MISSED_DEADLINE_REARM,
+  MISSED_DEADLINE_REARM_FALLBACK,
   EPOCH_REARM,
   EPOCH_REARM_FALLBACK,
 };
@@ -167,6 +175,8 @@ static const char* arm_source_str(timepop_arm_source_t source) {
     case timepop_arm_source_t::DISPATCH_PHASE_LOCKED_REARM: return "DISPATCH_PHASE_LOCKED_REARM";
     case timepop_arm_source_t::ISR_REARM: return "ISR_REARM";
     case timepop_arm_source_t::ISR_REARM_FALLBACK: return "ISR_REARM_FALLBACK";
+    case timepop_arm_source_t::MISSED_DEADLINE_REARM: return "MISSED_DEADLINE_REARM";
+    case timepop_arm_source_t::MISSED_DEADLINE_REARM_FALLBACK: return "MISSED_DEADLINE_REARM_FALLBACK";
     case timepop_arm_source_t::EPOCH_REARM: return "EPOCH_REARM";
     case timepop_arm_source_t::EPOCH_REARM_FALLBACK: return "EPOCH_REARM_FALLBACK";
     default: return "NONE";
@@ -362,6 +372,25 @@ static volatile uint32_t diag_schedule_next_last_expired_now = 0;
 static volatile uint32_t diag_schedule_next_last_expired_late_ticks = 0;
 static volatile uint32_t diag_schedule_next_last_expired_dwt = 0;
 
+// Missed-deadline quarantine.  TimePop must never attach the current CH2
+// event DWT to a slot whose authored deadline is already in the past.  These
+// counters surface slots that were cancelled or re-authored because their
+// exact compare edge was missed.
+static volatile uint32_t diag_missed_deadline_slots = 0;
+static volatile uint32_t diag_missed_deadline_one_shot_cancelled = 0;
+static volatile uint32_t diag_missed_deadline_recurring_rearmed = 0;
+static volatile uint32_t diag_missed_deadline_recurring_rearm_failures = 0;
+static volatile uint32_t diag_missed_deadline_too_close_count = 0;
+static volatile uint32_t diag_missed_deadline_late_max_ticks = 0;
+static volatile uint32_t diag_missed_deadline_last_slot = UINT32_MAX;
+static volatile uint32_t diag_missed_deadline_last_handle = 0;
+static volatile const char* diag_missed_deadline_last_name = nullptr;
+static volatile const char* diag_missed_deadline_last_source = nullptr;
+static volatile uint32_t diag_missed_deadline_last_deadline = 0;
+static volatile uint32_t diag_missed_deadline_last_now = 0;
+static volatile uint32_t diag_missed_deadline_last_late_ticks = 0;
+static volatile uint32_t diag_missed_deadline_last_dwt = 0;
+
 // Last arm/rearm diagnostic, across all timed slots.  This is designed to
 // catch timers that are created or re-authored into an already-past deadline.
 static volatile uint32_t diag_arm_already_past_count = 0;
@@ -489,8 +518,9 @@ static void timepop_record_anchor_snapshot(const time_anchor_snapshot_t& snap,
 static time_anchor_snapshot_t timepop_anchor_snapshot(const char* context);
 
 static inline uint32_t vclock_count(void);
-static inline bool deadline_reached(uint32_t deadline, uint32_t now);
+static inline bool deadline_exact(uint32_t deadline, uint32_t now);
 static inline bool deadline_passed(uint32_t deadline, uint32_t now);
+static inline bool deadline_reached_or_passed(uint32_t deadline, uint32_t now);
 static inline uint32_t deadline_lateness_ticks(uint32_t deadline, uint32_t now);
 static inline uint32_t ns_to_ticks(uint64_t ns);
 static bool period_ns_to_exact_ticks(uint64_t period_ns, uint32_t& out_ticks);
@@ -572,6 +602,11 @@ static bool rearm_recurring_slot_from_irq(timepop_slot_t& slot,
                                           uint32_t fire_vclock_raw,
                                           int64_t fire_gnss_ns,
                                           const time_anchor_snapshot_t& snap);
+static bool timepop_quarantine_missed_deadline(timepop_slot_t& slot,
+                                               uint32_t now,
+                                               uint32_t dwt,
+                                               const char* source,
+                                               bool too_close);
 
 static inline void slot_capture(timepop_slot_t& slot,
                                 uint32_t fire_vclock_raw,
@@ -934,7 +969,7 @@ static bool rearm_counter32_anchored_recurring_slot_from_event(
   uint32_t deadline = slot.recurring_base_counter32 + (uint32_t)(index * period_ticks);
 
   uint32_t skipped = 0;
-  while (deadline_reached(deadline, fire_vclock_raw)) {
+  while (deadline_reached_or_passed(deadline, fire_vclock_raw)) {
     index++;
     skipped++;
     deadline = slot.recurring_base_counter32 + (uint32_t)(index * period_ticks);
@@ -974,16 +1009,20 @@ static inline uint32_t vclock_count(void) {
   return interrupt_vclock_counter32_observe_ambient();
 }
 
-static inline bool deadline_reached(uint32_t deadline, uint32_t now) {
-  return deadline == now || (deadline - now) > MAX_DELAY_TICKS;
+static inline bool deadline_exact(uint32_t deadline, uint32_t now) {
+  return deadline == now;
 }
 
 static inline bool deadline_passed(uint32_t deadline, uint32_t now) {
-  return (deadline - now) > MAX_DELAY_TICKS;
+  return deadline != now && ((deadline - now) > MAX_DELAY_TICKS);
+}
+
+static inline bool deadline_reached_or_passed(uint32_t deadline, uint32_t now) {
+  return deadline_exact(deadline, now) || deadline_passed(deadline, now);
 }
 
 static inline uint32_t deadline_lateness_ticks(uint32_t deadline, uint32_t now) {
-  return (deadline == now) ? 0U : (now - deadline);
+  return deadline_exact(deadline, now) ? 0U : (now - deadline);
 }
 
 static inline void update_max_u32(volatile uint32_t& target, uint32_t value) {
@@ -1285,6 +1324,140 @@ static bool rearm_recurring_slot_from_irq(timepop_slot_t& slot,
   return rearmed;
 }
 
+static bool timepop_quarantine_missed_deadline(timepop_slot_t& slot,
+                                               uint32_t now,
+                                               uint32_t dwt,
+                                               const char* source,
+                                               bool too_close) {
+  const uint32_t idx = slot_index_for(slot);
+  const uint32_t old_deadline = slot.deadline;
+  const uint32_t late_ticks = deadline_passed(old_deadline, now)
+      ? deadline_lateness_ticks(old_deadline, now)
+      : 0U;
+
+  // A too-close deadline is still in the future, but not far enough into the
+  // future to arm safely.  Re-author recurring grids past the scheduler race
+  // window, not merely past the ambient observation.
+  const uint32_t rearm_now = too_close ? (now + SCHEDULE_MIN_ARM_LEAD_TICKS) : now;
+
+  diag_missed_deadline_slots++;
+  if (too_close) diag_missed_deadline_too_close_count++;
+  update_max_u32(diag_missed_deadline_late_max_ticks, late_ticks);
+  diag_missed_deadline_last_slot = idx;
+  diag_missed_deadline_last_handle = slot.handle;
+  diag_missed_deadline_last_name = slot.name;
+  diag_missed_deadline_last_source = source;
+  diag_missed_deadline_last_deadline = old_deadline;
+  diag_missed_deadline_last_now = now;
+  diag_missed_deadline_last_late_ticks = late_ticks;
+  diag_missed_deadline_last_dwt = dwt;
+
+  if (!slot.first_expire_recorded) {
+    slot.first_expire_now = now;
+    slot.first_expire_recorded = true;
+  }
+
+  slot.schedule_next_expired_count++;
+  slot.schedule_next_last_late_ticks = late_ticks;
+  slot.schedule_next_last_now = now;
+  slot.schedule_next_last_deadline = old_deadline;
+  slot.schedule_next_last_dwt = dwt;
+  if (late_ticks > slot.schedule_next_late_max_ticks) {
+    slot.schedule_next_late_max_ticks = late_ticks;
+  }
+
+  slot.expired = false;
+  slot.isr_callback_fired = false;
+  slot.fire_vclock_raw = 0;
+  slot.fire_dwt_cyccnt = 0;
+  slot.fire_gnss_ns = -1;
+  slot.fire_capture_source = timepop_fire_capture_source_t::NONE;
+
+  if (!slot.recurring) {
+    slot = {};
+    diag_missed_deadline_one_shot_cancelled++;
+    return true;
+  }
+
+  bool rearmed = false;
+
+  if (slot.recurring_base_counter32_fixed) {
+    rearmed = rearm_counter32_anchored_recurring_slot_from_event(
+        slot, rearm_now, timepop_arm_source_t::MISSED_DEADLINE_REARM);
+  }
+
+  if (!rearmed &&
+      slot.recurrence_mode == timepop_recurrence_mode_t::ABSOLUTE &&
+      slot.recurring_period_gnss_ns > 0 &&
+      slot.recurring_base_fixed &&
+      slot.recurring_base_gnss_ns > 0) {
+    const time_anchor_snapshot_t snap =
+        timepop_anchor_snapshot("missed_deadline_rearm");
+    const int64_t now_gnss_ns = vclock_to_gnss_ns(rearm_now, snap);
+    int64_t next_target_gnss_ns = -1;
+    uint32_t skipped = 0;
+    if (anchored_next_target_gnss_ns(slot.recurring_base_gnss_ns,
+                                     slot.recurring_period_gnss_ns,
+                                     now_gnss_ns,
+                                     next_target_gnss_ns,
+                                     &skipped)) {
+      uint32_t next_deadline = 0;
+      if (gnss_ns_to_vclock_deadline(next_target_gnss_ns, snap, next_deadline)) {
+        slot.target_gnss_ns = next_target_gnss_ns;
+        slot.deadline = next_deadline;
+        slot.is_absolute = true;
+        slot.recurrence_mode = timepop_recurrence_mode_t::ABSOLUTE;
+        slot.recurring_last_skipped_intervals = skipped;
+        slot.recurring_total_skipped_intervals += skipped;
+        slot.predicted_dwt = predict_dwt_at_deadline(slot.deadline,
+                                                     slot.prediction_valid);
+        slot.recurring_rearmed_count++;
+        record_slot_arm_diag(slot,
+                             timepop_arm_source_t::MISSED_DEADLINE_REARM,
+                             true,
+                             rearm_now,
+                             slot.target_gnss_ns);
+        rearmed = true;
+      }
+    }
+  }
+
+  if (!rearmed) {
+    const uint64_t period_ns = slot.recurring_period_gnss_ns
+        ? slot.recurring_period_gnss_ns
+        : slot.period_ns;
+    uint32_t period_ticks = 0;
+    if (period_ns_to_exact_ticks(period_ns, period_ticks)) {
+      slot.period_ns = period_ns;
+      slot.period_ticks = period_ticks;
+      slot.deadline = rearm_now + period_ticks;
+      slot.arm_vclock_raw = rearm_now;
+      slot.arm_delta_ticks = period_ticks;
+      slot.is_absolute = false;
+      slot.recurrence_mode = timepop_recurrence_mode_t::RELATIVE;
+      slot.target_gnss_ns = -1;
+      slot.predicted_dwt = predict_dwt_at_deadline(slot.deadline,
+                                                   slot.prediction_valid);
+      slot.recurring_rearmed_count++;
+      record_slot_arm_diag(slot,
+                           timepop_arm_source_t::MISSED_DEADLINE_REARM_FALLBACK,
+                           true,
+                           rearm_now,
+                           slot.target_gnss_ns);
+      rearmed = true;
+    }
+  }
+
+  if (rearmed) {
+    diag_missed_deadline_recurring_rearmed++;
+    return true;
+  }
+
+  slot = {};
+  diag_missed_deadline_recurring_rearm_failures++;
+  return false;
+}
+
 // ============================================================================
 // Absolute GNSS nanosecond → VCLOCK deadline (pure arithmetic)
 // ============================================================================
@@ -1438,18 +1611,15 @@ static inline void ch2_arm_compare(uint32_t target_counter32) {
 // VCLOCK counter.  It determines how far away the nearest deadline is and
 // arms CH2 accordingly.  It does not claim exact equality; equality belongs
 // to the CH2 IRQ event.  If this foreground path ever finds an already-past
-// deadline, it authors a visible SCHEDULE_NEXT catch-up fact and increments
-// report counters.
+// deadline, it quarantines that slot as missed.  It never authors a
+// precision fire fact from foreground/scheduler context.
 
 static void schedule_next(void) {
   diag_schedule_next_calls_total++;
 
   const uint32_t now = vclock_count();
-  const time_anchor_snapshot_t snap =
-      timepop_anchor_snapshot("schedule_next");
-  uint32_t shared_fire_dwt = 0;
-  bool shared_fire_captured = false;
-  bool schedule_next_expired_this_pass = false;
+  const uint32_t scheduler_dwt = ARM_DWT_CYCCNT;
+  const bool scheduler_time_valid = time_valid();
 
   uint32_t soonest = 0;
   bool found = false;
@@ -1457,54 +1627,65 @@ static void schedule_next(void) {
   for (uint32_t i = 0; i < MAX_SLOTS; i++) {
     if (!slots[i].active || slots[i].expired) continue;
 
-    if (deadline_passed(slots[i].deadline, now)) {
-      if (!schedule_next_expired_this_pass) {
-        diag_schedule_next_expired_passes++;
-        schedule_next_expired_this_pass = true;
+    // During SmartZero / epoch reacquisition, the public TIME anchor is
+    // intentionally invalid.  Old absolute deadlines are old-coordinate facts;
+    // they must not survive as precision timers.  Keep relative recurring
+    // services alive, and re-author absolute recurring services into a safe
+    // relative future without firing their callbacks.
+    if (!scheduler_time_valid &&
+        slots[i].is_absolute &&
+        !slots[i].recurring_base_counter32_fixed) {
+      timepop_quarantine_missed_deadline(slots[i],
+                                         now,
+                                         scheduler_dwt,
+                                         "schedule_next_invalid_time",
+                                         false);
+      if (!slots[i].active || slots[i].expired) continue;
+    }
+
+    const bool exact = deadline_exact(slots[i].deadline, now);
+    const bool passed = deadline_passed(slots[i].deadline, now);
+    const uint32_t distance = slots[i].deadline - now;
+    const bool too_close = !exact && !passed &&
+        distance < SCHEDULE_MIN_ARM_LEAD_TICKS;
+
+    if (exact || passed || too_close) {
+      // schedule_next() is not an event source.  It cannot supply a lawful DWT
+      // edge coordinate for a deadline that has already been reached, nor can
+      // it safely program a compare that is already at/inside the hardware race
+      // window.  Quarantine the missed slot: recurring slots are re-authored
+      // onto their next lawful deadline, one-shots are cancelled.
+      diag_schedule_next_expired_passes++;
+      if (passed) {
+        diag_schedule_next_expired_slots++;
+        const uint32_t late_ticks = deadline_lateness_ticks(slots[i].deadline, now);
+        update_max_u32(diag_schedule_next_late_max_ticks, late_ticks);
+        diag_schedule_next_last_expired_slot = i;
+        diag_schedule_next_last_expired_handle = slots[i].handle;
+        diag_schedule_next_last_expired_name = slots[i].name;
+        diag_schedule_next_last_expired_deadline = slots[i].deadline;
+        diag_schedule_next_last_expired_now = now;
+        diag_schedule_next_last_expired_late_ticks = late_ticks;
+        diag_schedule_next_last_expired_dwt = scheduler_dwt;
       }
-      diag_schedule_next_expired_slots++;
-      const uint32_t late_ticks = deadline_lateness_ticks(slots[i].deadline, now);
-      update_max_u32(diag_schedule_next_late_max_ticks, late_ticks);
 
-      if (!slots[i].first_expire_recorded) {
-        slots[i].first_expire_now = now;
-        slots[i].first_expire_recorded = true;
-      }
+      timepop_quarantine_missed_deadline(slots[i],
+                                         now,
+                                         scheduler_dwt,
+                                         too_close ? "schedule_next_too_close"
+                                                   : (exact ? "schedule_next_exact_no_irq"
+                                                            : "schedule_next_passed"),
+                                         too_close);
+      if (!slots[i].active || slots[i].expired) continue;
+    }
 
-      // SCHEDULE_NEXT is not a precision timing source.  It is an anomaly /
-      // catch-up surface: if it ever authors a timed fire, the report counters
-      // above make that fact visible.
-      if (!shared_fire_captured) {
-        shared_fire_dwt = ARM_DWT_CYCCNT;
-        shared_fire_captured = true;
-      }
-
-      slots[i].schedule_next_expired_count++;
-      slots[i].schedule_next_last_late_ticks = late_ticks;
-      slots[i].schedule_next_last_now = now;
-      slots[i].schedule_next_last_deadline = slots[i].deadline;
-      slots[i].schedule_next_last_dwt = shared_fire_dwt;
-      if (late_ticks > slots[i].schedule_next_late_max_ticks) {
-        slots[i].schedule_next_late_max_ticks = late_ticks;
-      }
-
-      diag_schedule_next_last_expired_slot = i;
-      diag_schedule_next_last_expired_handle = slots[i].handle;
-      diag_schedule_next_last_expired_name = slots[i].name;
-      diag_schedule_next_last_expired_deadline = slots[i].deadline;
-      diag_schedule_next_last_expired_now = now;
-      diag_schedule_next_last_expired_late_ticks = late_ticks;
-      diag_schedule_next_last_expired_dwt = shared_fire_dwt;
-
-      expire_slot_with_capture(slots[i],
-                               now,
-                               shared_fire_dwt,
-                               snap,
-                               timepop_fire_capture_source_t::SCHEDULE_NEXT);
+    const uint32_t post_distance = slots[i].deadline - now;
+    if (deadline_reached_or_passed(slots[i].deadline, now) ||
+        post_distance < SCHEDULE_MIN_ARM_LEAD_TICKS) {
       continue;
     }
 
-    if (!found || ((slots[i].deadline - now) < (soonest - now))) {
+    if (!found || (post_distance < (soonest - now))) {
       soonest = slots[i].deadline;
       found = true;
     }
@@ -1522,6 +1703,14 @@ static void schedule_next(void) {
     } else {
       target = soonest;
     }
+  }
+
+  // Final safety net: never program CH2 at or inside the scheduler race window.
+  // If the chosen target became too close while we were scanning, use a
+  // heartbeat compare instead of risking an immediate/missed-compare storm.
+  if ((target - now) < SCHEDULE_MIN_ARM_LEAD_TICKS) {
+    target = now + HEARTBEAT_TICKS;
+    diag_heartbeat_rearms++;
   }
 
   ch2_arm_compare(target);
@@ -1646,7 +1835,7 @@ void timepop_qtimer1_ch2_handler(const interrupt_event_t& event,
       audit_witness_expired_before = slots[i].expired;
       audit_witness_deadline = slots[i].deadline;
       if (slots[i].active && !slots[i].expired) {
-        audit_witness_reached_before = deadline_reached(slots[i].deadline, now);
+        audit_witness_reached_before = (slots[i].deadline == now);
         audit_witness_passed_before = deadline_passed(slots[i].deadline, now);
         if (audit_witness_passed_before) {
           audit_witness_late_ticks = deadline_lateness_ticks(slots[i].deadline, now);
@@ -1658,7 +1847,7 @@ void timepop_qtimer1_ch2_handler(const interrupt_event_t& event,
 
     if (slot_is_one_hz_recurring(slots[i]) &&
         !slots[i].expired &&
-        deadline_reached(slots[i].deadline, now)) {
+        slots[i].deadline == now) {
       audit_onehz_due_count++;
     }
   }
@@ -1666,8 +1855,35 @@ void timepop_qtimer1_ch2_handler(const interrupt_event_t& event,
   const bool audit_grid_this_irq =
       audit_onehz_due_count > 0 || audit_witness_reached_before;
 
-  // Phase 1: author the shared fire facts for every slot reached by this
-  // physical CH2 compare event before any user callback is allowed to run.
+  // Pre-pass: quarantine missed timed slots.  A slot whose deadline is already
+  // behind this CH2 event did not fire at this edge.  Do not attach this DWT
+  // coordinate to that old deadline; re-author recurring slots and cancel
+  // one-shots instead.
+  for (uint32_t i = 0; i < MAX_SLOTS; i++) {
+    if (!slots[i].active || slots[i].expired) continue;
+    if (!deadline_passed(slots[i].deadline, now)) continue;
+
+    const uint32_t late_ticks = deadline_lateness_ticks(slots[i].deadline, now);
+    slots[i].irq_reached_count++;
+    slots[i].irq_last_now = now;
+    slots[i].irq_last_dwt = dwt_entry;
+    slots[i].irq_last_late_ticks = late_ticks;
+    slots[i].irq_last_exact = false;
+    if (late_ticks > slots[i].irq_late_max_ticks) {
+      slots[i].irq_late_max_ticks = late_ticks;
+    }
+
+    diag_irq_late_deadline_slots++;
+    update_max_u32(diag_irq_late_max_ticks, late_ticks);
+    timepop_quarantine_missed_deadline(slots[i],
+                                       now,
+                                       dwt_entry,
+                                       "irq_late_deadline",
+                                       false);
+  }
+
+  // Phase 1: author the shared fire facts for every slot that exactly matches
+  // this physical CH2 compare event before any user callback is allowed to run.
   // This guarantees simultaneous clients receive the same DWT/VCLOCK/GNSS
   // context; callback serialization is logical only.
   //
@@ -1685,9 +1901,9 @@ void timepop_qtimer1_ch2_handler(const interrupt_event_t& event,
 
   for (uint32_t i = 0; i < MAX_SLOTS; i++) {
     if (!slots[i].active || slots[i].expired) continue;
-    if (!deadline_reached(slots[i].deadline, now)) continue;
+    if (slots[i].deadline != now) continue;
 
-    const uint32_t late_ticks = deadline_lateness_ticks(slots[i].deadline, now);
+    const uint32_t late_ticks = 0;
     if (late_ticks == 0) {
       diag_irq_exact_deadline_slots++;
     } else {
@@ -3066,6 +3282,27 @@ static Payload cmd_report(const Payload&) {
   out.add("schedule_next_last_expired_dwt",
           diag_schedule_next_last_expired_dwt);
 
+  out.add("missed_deadline_slots", diag_missed_deadline_slots);
+  out.add("missed_deadline_one_shot_cancelled", diag_missed_deadline_one_shot_cancelled);
+  out.add("missed_deadline_recurring_rearmed", diag_missed_deadline_recurring_rearmed);
+  out.add("missed_deadline_recurring_rearm_failures", diag_missed_deadline_recurring_rearm_failures);
+  out.add("missed_deadline_too_close_count", diag_missed_deadline_too_close_count);
+  out.add("missed_deadline_late_max_ticks", diag_missed_deadline_late_max_ticks);
+  out.add("missed_deadline_last_slot", diag_missed_deadline_last_slot);
+  out.add("missed_deadline_last_handle", diag_missed_deadline_last_handle);
+  out.add("missed_deadline_last_name",
+          (const char*)(diag_missed_deadline_last_name
+                            ? diag_missed_deadline_last_name
+                            : ""));
+  out.add("missed_deadline_last_source",
+          (const char*)(diag_missed_deadline_last_source
+                            ? diag_missed_deadline_last_source
+                            : ""));
+  out.add("missed_deadline_last_deadline", diag_missed_deadline_last_deadline);
+  out.add("missed_deadline_last_now", diag_missed_deadline_last_now);
+  out.add("missed_deadline_last_late_ticks", diag_missed_deadline_last_late_ticks);
+  out.add("missed_deadline_last_dwt", diag_missed_deadline_last_dwt);
+
   out.add("arm_already_past_count",            diag_arm_already_past_count);
   out.add("arm_last_slot",                     diag_arm_last_slot);
   out.add("arm_last_handle",                   diag_arm_last_handle);
@@ -3222,6 +3459,14 @@ static Payload cmd_slots(const Payload&) {
   out.add("schedule_next_expired_passes", diag_schedule_next_expired_passes);
   out.add("schedule_next_expired_slots", diag_schedule_next_expired_slots);
   out.add("schedule_next_late_max_ticks", diag_schedule_next_late_max_ticks);
+  out.add("missed_deadline_slots", diag_missed_deadline_slots);
+  out.add("missed_deadline_recurring_rearmed", diag_missed_deadline_recurring_rearmed);
+  out.add("missed_deadline_one_shot_cancelled", diag_missed_deadline_one_shot_cancelled);
+  out.add("missed_deadline_last_name",
+          (const char*)(diag_missed_deadline_last_name
+                            ? diag_missed_deadline_last_name
+                            : ""));
+  out.add("missed_deadline_last_late_ticks", diag_missed_deadline_last_late_ticks);
   out.add("irq_expired_slots", diag_irq_expired_slots);
   out.add("irq_exact_deadline_slots", diag_irq_exact_deadline_slots);
   out.add("irq_late_deadline_slots", diag_irq_late_deadline_slots);
