@@ -1102,6 +1102,27 @@ struct ocxo_lane_t {
   bool     witness_last_service_was_on_or_after_target = false;
   uint32_t witness_last_service_class = OCXO_SERVICE_CLASS_NONE;
 
+  // Deferred perishable-fact diagnostics.  The ISR captures these facts, but
+  // foreground ASAP interprets them and updates this report surface.
+  uint32_t witness_last_fact_sequence = 0;
+  int32_t  witness_last_service_correction_cycles = 0;
+  uint32_t witness_last_service_corrected_dwt = 0;
+  bool     witness_last_fact_one_second_due = false;
+  uint32_t witness_fact_enqueue_count = 0;
+  uint32_t witness_fact_drain_count = 0;
+  uint32_t witness_fact_overflow_count = 0;
+  uint32_t witness_fact_high_water = 0;
+  uint32_t witness_fact_asap_arm_count = 0;
+  uint32_t witness_fact_asap_fail_count = 0;
+
+  // Canonical one-second custody audit.  A normal OCXO event stream advances
+  // exactly 10,000,000 ticks per published edge.
+  bool     witness_previous_event_counter32_valid = false;
+  uint32_t witness_previous_event_counter32 = 0;
+  uint32_t witness_last_counter_delta_ticks = 0;
+  uint32_t witness_counter_delta_violation_count = 0;
+  uint32_t witness_last_bad_counter_delta = 0;
+
   uint32_t witness_service_count = 0;
   uint32_t witness_early_service_count = 0;
   uint32_t witness_on_or_after_service_count = 0;
@@ -2088,6 +2109,16 @@ static void fill_diag(interrupt_capture_diag_t& diag,
       diag.ocxo_arm_remaining_ticks = lane->witness_last_arm_remaining_ticks;
       diag.ocxo_arm_to_isr_ticks = lane->witness_last_arm_to_isr_ticks;
       diag.ocxo_arm_to_isr_dwt_cycles = lane->witness_last_arm_to_isr_dwt_cycles;
+      diag.ocxo_perishable_fact_sequence = lane->witness_last_fact_sequence;
+      diag.ocxo_service_correction_cycles =
+          lane->witness_last_service_correction_cycles;
+      diag.ocxo_service_corrected_dwt_at_event =
+          lane->witness_last_service_corrected_dwt;
+      diag.ocxo_fact_ring_overflow_count = lane->witness_fact_overflow_count;
+      diag.ocxo_counter_delta_violation_count =
+          lane->witness_counter_delta_violation_count;
+      diag.ocxo_last_bad_counter_delta = lane->witness_last_bad_counter_delta;
+      diag.ocxo_last_counter_delta_ticks = lane->witness_last_counter_delta_ticks;
     }
   }
 }
@@ -2567,82 +2598,195 @@ static ocxo_deferred_work_t g_ocxo1_deferred = {};
 static ocxo_deferred_work_t g_ocxo2_deferred = {};
 
 // ----------------------------------------------------------------------------
-// OCXO post-ISR mailbox — single slot per lane, drained by ASAP foreground.
+// Standardized OCXO perishable-fact ring — ISR capture, ASAP interpretation.
 // ----------------------------------------------------------------------------
 //
-// The QTimer2/QTimer3 ISR captures the minimum facts needed for hardware
-// rearm and 1 Hz cadence accounting, then writes this mailbox and arms a
-// TimePop ASAP slot.  All non-essential bookkeeping (synthetic clock advance,
-// diag stores, late-ticks accounting, 1 Hz edge defer) runs in the ASAP
-// callback in foreground context.
+// This is the conservative first step toward the universal interrupt capture
+// pipeline.  The ISR captures only facts that would be lost if delayed:
+// first-instruction DWT, authored compare target identity, service-time
+// hardware low word, service offset, compare flag state, and minimal class.
+// Foreground ASAP drains the ring, updates diagnostics, audits custody, and
+// dispatches the one-second event to CLOCKS/Alpha.
 //
-// Mailbox semantics:
-//   • Single slot.  If a new ISR fires while the previous sample has not been
-//     consumed, the new sample overwrites and overwrite_count is incremented.
-//   • The lossy bookkeeping is acceptable because cadence-critical state
-//     (lane.tick_mod_1000) is updated inside the ISR itself.
-//   • Hardware re-arm and cadence counting cannot be lost.
+// The ring is intentionally per-lane and loss-visible.  A canonical OCXO
+// one-second event must never be silently overwritten; if the ring fills, the
+// overflow is counted and reported.  Size 8 is generous for a once-per-second
+// witness rail but small enough to keep ISR writes deterministic.
 
-struct ocxo_post_isr_mailbox_t {
-  volatile bool     pending = false;
-  volatile uint32_t isr_entry_dwt_raw = 0;
-  volatile uint32_t event_dwt = 0;
-  volatile uint16_t fired_low16 = 0;
-  volatile bool     emit_one_second = false;
-  volatile uint32_t sequence = 0;
+static constexpr uint32_t OCXO_PERISHABLE_FACT_RING_SIZE = 8;
+
+struct interrupt_perishable_fact_t {
+  interrupt_subscriber_kind_t kind = interrupt_subscriber_kind_t::NONE;
+  interrupt_provider_kind_t provider = interrupt_provider_kind_t::NONE;
+  interrupt_lane_t lane = interrupt_lane_t::NONE;
+
+  uint32_t sequence = 0;
+
+  // Captured as first ISR instruction.  This remains private custody evidence;
+  // published event DWT remains latency-adjusted service_dwt_at_event.
+  uint32_t isr_entry_dwt_raw = 0;
+  uint32_t service_dwt_at_event = 0;
+
+  // Authored target identity.  This is the event identity, not an ambient read.
+  uint32_t target_counter32 = 0;
+  uint16_t target_low16 = 0;
+
+  // Hardware observation at ISR service time.
+  uint16_t service_counter_low16 = 0;
+  int16_t service_offset_ticks = 0;
+  uint32_t service_offset_abs_ticks = 0;
+  uint32_t interpreted_late_ticks = 0;
+  uint32_t early_ticks = 0;
+  uint32_t target_delta_mod65536_ticks = 0;
+
+  // Arming/service forensics captured before interpretation.
+  uint32_t arm_remaining_ticks = 0;
+  uint32_t arm_to_isr_ticks = 0;
+  uint32_t arm_to_isr_dwt_cycles = 0;
+  uint32_t csctrl_entry = 0;
+  uint32_t csctrl_after_disable = 0;
+  bool compare_flag_seen = false;
+  bool compare_enabled_entry = false;
+  bool compare_flag_after_disable = false;
+  bool compare_enabled_after_disable = false;
+  bool had_armed = false;
+  bool had_active_rt = false;
+
+  uint32_t service_class = OCXO_SERVICE_CLASS_NONE;
+  bool one_second_due = false;
+  bool exact_target_identity = true;
 };
 
-static ocxo_post_isr_mailbox_t g_ocxo1_post_isr = {};
-static ocxo_post_isr_mailbox_t g_ocxo2_post_isr = {};
+struct ocxo_perishable_ring_t {
+  interrupt_perishable_fact_t facts[OCXO_PERISHABLE_FACT_RING_SIZE]{};
+  volatile uint32_t head = 0;
+  volatile uint32_t tail = 0;
+  volatile uint32_t count = 0;
+  volatile bool drain_armed = false;
+  volatile uint32_t sequence = 0;
+  volatile uint32_t enqueue_count = 0;
+  volatile uint32_t drain_count = 0;
+  volatile uint32_t overflow_count = 0;
+  volatile uint32_t high_water = 0;
+  volatile uint32_t asap_arm_count = 0;
+  volatile uint32_t asap_fail_count = 0;
+};
 
-static volatile uint32_t g_ocxo1_post_isr_overwrite_count = 0;
-static volatile uint32_t g_ocxo2_post_isr_overwrite_count = 0;
-static volatile uint32_t g_ocxo1_post_isr_arm_count = 0;
-static volatile uint32_t g_ocxo2_post_isr_arm_count = 0;
-static volatile uint32_t g_ocxo1_post_isr_drain_count = 0;
-static volatile uint32_t g_ocxo2_post_isr_drain_count = 0;
+static ocxo_perishable_ring_t g_ocxo1_fact_ring = {};
+static ocxo_perishable_ring_t g_ocxo2_fact_ring = {};
 
-static const char* ocxo_post_isr_name(interrupt_subscriber_kind_t kind) {
+static ocxo_perishable_ring_t&
+ocxo_fact_ring_for(interrupt_subscriber_kind_t kind) {
   return (kind == interrupt_subscriber_kind_t::OCXO1)
-      ? "OCXO1_POST_ISR"
-      : "OCXO2_POST_ISR";
+      ? g_ocxo1_fact_ring
+      : g_ocxo2_fact_ring;
 }
 
-static ocxo_post_isr_mailbox_t&
-ocxo_post_isr_mailbox_for(interrupt_subscriber_kind_t kind) {
+static const char* ocxo_fact_drain_name(interrupt_subscriber_kind_t kind) {
   return (kind == interrupt_subscriber_kind_t::OCXO1)
-      ? g_ocxo1_post_isr
-      : g_ocxo2_post_isr;
+      ? "OCXO1_FACT_DRAIN"
+      : "OCXO2_FACT_DRAIN";
 }
 
-static void ocxo_post_isr_overwrite_inc(interrupt_subscriber_kind_t kind) {
-  if (kind == interrupt_subscriber_kind_t::OCXO1) {
-    g_ocxo1_post_isr_overwrite_count++;
-  } else {
-    g_ocxo2_post_isr_overwrite_count++;
+static void ocxo_perishable_fact_ring_reset(ocxo_perishable_ring_t& r) {
+  for (uint32_t i = 0; i < OCXO_PERISHABLE_FACT_RING_SIZE; i++) {
+    r.facts[i] = interrupt_perishable_fact_t{};
   }
+  r.head = 0;
+  r.tail = 0;
+  r.count = 0;
+  r.drain_armed = false;
+  r.sequence = 0;
+  r.enqueue_count = 0;
+  r.drain_count = 0;
+  r.overflow_count = 0;
+  r.high_water = 0;
+  r.asap_arm_count = 0;
+  r.asap_fail_count = 0;
 }
 
-static void ocxo_post_isr_arm_inc(interrupt_subscriber_kind_t kind) {
-  if (kind == interrupt_subscriber_kind_t::OCXO1) {
-    g_ocxo1_post_isr_arm_count++;
-  } else {
-    g_ocxo2_post_isr_arm_count++;
+static int32_t dwt_cycles_for_ocxo_ticks_signed(int32_t ticks) {
+  const uint32_t cps = interrupt_vclock_cycles_per_second();
+  if (cps == 0 || ticks == 0) return 0;
+
+  const int64_t numerator = (int64_t)ticks * (int64_t)cps;
+  const int64_t denom = (int64_t)OCXO_WITNESS_ONE_SECOND_COUNTS;
+  if (numerator >= 0) {
+    return (int32_t)((numerator + denom / 2) / denom);
   }
+  return (int32_t)(-(((-numerator) + denom / 2) / denom));
 }
 
-static void ocxo_post_isr_drain_inc(interrupt_subscriber_kind_t kind) {
-  if (kind == interrupt_subscriber_kind_t::OCXO1) {
-    g_ocxo1_post_isr_drain_count++;
-  } else {
-    g_ocxo2_post_isr_drain_count++;
+static bool ocxo_fact_ring_push_from_isr(interrupt_subscriber_kind_t kind,
+                                         const interrupt_perishable_fact_t& fact,
+                                         interrupt_subscriber_runtime_t* rt);
+static void ocxo_fact_drain_callback(timepop_ctx_t*, timepop_diag_t*, void* user_data);
+
+static bool ocxo_fact_ring_pop(interrupt_subscriber_kind_t kind,
+                               interrupt_perishable_fact_t& out) {
+  ocxo_perishable_ring_t& r = ocxo_fact_ring_for(kind);
+
+  __disable_irq();
+  if (r.count == 0) {
+    r.drain_armed = false;
+    __enable_irq();
+    return false;
   }
+
+  out = r.facts[r.tail];
+  r.tail = (r.tail + 1U) % OCXO_PERISHABLE_FACT_RING_SIZE;
+  r.count--;
+  r.drain_count++;
+  if (r.count == 0) {
+    r.drain_armed = false;
+  }
+  __enable_irq();
+  return true;
 }
 
-// Forward decl so the ISR can reference it.
-static void ocxo_post_isr_asap_callback(timepop_ctx_t*,
-                                        timepop_diag_t*,
-                                        void* user_data);
+static bool ocxo_fact_ring_push_from_isr(interrupt_subscriber_kind_t kind,
+                                         const interrupt_perishable_fact_t& fact,
+                                         interrupt_subscriber_runtime_t* rt) {
+  ocxo_perishable_ring_t& r = ocxo_fact_ring_for(kind);
+  ocxo_lane_t* lane = ocxo_lane_for(kind);
+
+  if (r.count >= OCXO_PERISHABLE_FACT_RING_SIZE) {
+    r.overflow_count++;
+    if (lane) {
+      lane->witness_fact_overflow_count = r.overflow_count;
+    }
+    return false;
+  }
+
+  r.facts[r.head] = fact;
+  r.head = (r.head + 1U) % OCXO_PERISHABLE_FACT_RING_SIZE;
+  r.count++;
+  r.enqueue_count++;
+  if (r.count > r.high_water) r.high_water = r.count;
+
+  if (lane) {
+    lane->witness_fact_enqueue_count = r.enqueue_count;
+    lane->witness_fact_overflow_count = r.overflow_count;
+    lane->witness_fact_high_water = r.high_water;
+  }
+
+  if (!r.drain_armed) {
+    r.drain_armed = true;
+    r.asap_arm_count++;
+    if (lane) lane->witness_fact_asap_arm_count = r.asap_arm_count;
+
+    const timepop_handle_t h =
+        timepop_arm_asap(ocxo_fact_drain_callback, rt, ocxo_fact_drain_name(kind));
+    if (h == TIMEPOP_INVALID_HANDLE) {
+      r.drain_armed = false;
+      r.asap_fail_count++;
+      if (lane) lane->witness_fact_asap_fail_count = r.asap_fail_count;
+      return false;
+    }
+  }
+
+  return true;
+}
 
 static void ocxo_deferred_asap_callback(timepop_ctx_t*, timepop_diag_t*, void* user_data) {
   auto* rt = static_cast<interrupt_subscriber_runtime_t*>(user_data);
@@ -2725,6 +2869,135 @@ static void ocxo_lane_record_isr_diag(interrupt_subscriber_kind_t kind,
   }
 }
 
+static void ocxo_apply_perishable_fact_deferred(
+    const interrupt_perishable_fact_t& fact,
+    interrupt_subscriber_runtime_t* rt) {
+  ocxo_lane_t* lane = ocxo_lane_for(fact.kind);
+  if (!lane) return;
+
+  ocxo_perishable_ring_t& ring = ocxo_fact_ring_for(fact.kind);
+  lane->witness_fact_drain_count = ring.drain_count;
+  lane->witness_fact_overflow_count = ring.overflow_count;
+  lane->witness_fact_high_water = ring.high_water;
+  lane->witness_fact_asap_arm_count = ring.asap_arm_count;
+  lane->witness_fact_asap_fail_count = ring.asap_fail_count;
+
+  const int32_t correction_cycles =
+      dwt_cycles_for_ocxo_ticks_signed((int32_t)fact.service_offset_ticks);
+  const uint32_t corrected_dwt =
+      (uint32_t)((int64_t)fact.service_dwt_at_event -
+                 (int64_t)correction_cycles);
+
+  lane->witness_last_fact_sequence = fact.sequence;
+  lane->witness_last_fact_one_second_due = fact.one_second_due;
+  lane->witness_last_isr_csctrl_entry = fact.csctrl_entry;
+  lane->witness_last_isr_compare_flag_entry = fact.compare_flag_seen;
+  lane->witness_last_isr_compare_enabled_entry = fact.compare_enabled_entry;
+  lane->witness_last_irq_had_armed = fact.had_armed;
+  lane->witness_last_irq_had_active_rt = fact.had_active_rt;
+  lane->witness_last_target_low16 = fact.target_low16;
+  lane->witness_last_isr_counter_low16 = fact.service_counter_low16;
+  lane->witness_last_target_delta_mod65536_ticks =
+      fact.target_delta_mod65536_ticks;
+  lane->witness_last_interpreted_late_ticks = fact.interpreted_late_ticks;
+  lane->witness_last_early_ticks = fact.early_ticks;
+  lane->witness_last_service_offset_signed_ticks =
+      (int32_t)fact.service_offset_ticks;
+  lane->witness_last_service_offset_abs_ticks = fact.service_offset_abs_ticks;
+  lane->witness_last_service_was_early = (fact.service_offset_ticks < 0);
+  lane->witness_last_service_was_on_or_after_target =
+      (fact.service_offset_ticks >= 0);
+  lane->witness_last_arm_to_isr_ticks = fact.arm_to_isr_ticks;
+  lane->witness_last_arm_to_isr_dwt_cycles = fact.arm_to_isr_dwt_cycles;
+  lane->witness_last_service_class = fact.service_class;
+  lane->witness_last_isr_csctrl_after_disable = fact.csctrl_after_disable;
+  lane->witness_last_isr_compare_flag_after_disable =
+      fact.compare_flag_after_disable;
+  lane->witness_last_isr_compare_enabled_after_disable =
+      fact.compare_enabled_after_disable;
+  lane->witness_last_service_correction_cycles = correction_cycles;
+  lane->witness_last_service_corrected_dwt = corrected_dwt;
+  lane->witness_last_late_ticks = fact.target_delta_mod65536_ticks;
+  lane->witness_last_event_published = false;
+
+  lane->witness_service_count++;
+  if (fact.service_class == OCXO_SERVICE_CLASS_FALSE_IRQ) {
+    lane->witness_false_irq_count++;
+  } else if (fact.service_offset_ticks < 0) {
+    lane->witness_early_service_count++;
+  } else {
+    lane->witness_on_or_after_service_count++;
+  }
+
+  ocxo_lane_record_isr_diag(fact.kind,
+                            fact.isr_entry_dwt_raw,
+                            fact.service_dwt_at_event,
+                            fact.target_delta_mod65536_ticks,
+                            fact.interpreted_late_ticks,
+                            fact.early_ticks,
+                            (int32_t)fact.service_offset_ticks,
+                            fact.service_offset_abs_ticks,
+                            fact.target_delta_mod65536_ticks,
+                            fact.target_low16,
+                            fact.service_counter_low16);
+
+  if (!fact.one_second_due || !rt || !rt->active) {
+    return;
+  }
+
+  lane->witness_fire_count++;
+  lane->irq_count++;
+  lane->logical_count32_at_last_second = fact.target_counter32;
+  lane->witness_last_event_dwt = fact.service_dwt_at_event;
+  lane->witness_last_event_counter32 = fact.target_counter32;
+  lane->witness_last_event_published = true;
+  lane->witness_valid_publish_count++;
+  if (fact.service_offset_ticks < 0) {
+    lane->witness_early_service_published_count++;
+  }
+
+  if (lane->witness_previous_event_counter32_valid) {
+    const uint32_t delta =
+        fact.target_counter32 - lane->witness_previous_event_counter32;
+    lane->witness_last_counter_delta_ticks = delta;
+    if (delta != OCXO_WITNESS_ONE_SECOND_COUNTS) {
+      lane->witness_counter_delta_violation_count++;
+      lane->witness_last_bad_counter_delta = delta;
+    }
+  } else {
+    lane->witness_last_counter_delta_ticks = 0;
+  }
+  lane->witness_previous_event_counter32 = fact.target_counter32;
+  lane->witness_previous_event_counter32_valid = true;
+
+  // We are already in TimePop ASAP/foreground context.  Dispatch the authored
+  // OCXO edge directly so a second single-slot deferred mailbox cannot drop a
+  // canonical one-second event.  Canonical DWT remains the raw service DWT for
+  // this pass; corrected DWT is diagnostic-only.
+  g_ocxo_deferred_edge_count++;
+  emit_one_second_event(*rt,
+                        fact.service_dwt_at_event,
+                        fact.target_counter32,
+                        0,
+                        false,
+                        nullptr,
+                        true);
+}
+
+static void ocxo_fact_drain_callback(timepop_ctx_t*,
+                                     timepop_diag_t*,
+                                     void* user_data) {
+  auto* rt = static_cast<interrupt_subscriber_runtime_t*>(user_data);
+  if (!rt || !rt->desc) return;
+
+  const interrupt_subscriber_kind_t kind = rt->desc->kind;
+  for (;;) {
+    interrupt_perishable_fact_t fact{};
+    if (!ocxo_fact_ring_pop(kind, fact)) break;
+    ocxo_apply_perishable_fact_deferred(fact, rt);
+  }
+}
+
 static const char* ocxo_deferred_name(interrupt_subscriber_kind_t kind) {
   return (kind == interrupt_subscriber_kind_t::OCXO1)
       ? "OCXO1_DEFERRED"
@@ -2748,133 +3021,6 @@ static void ocxo_defer_one_second_edge(ocxo_deferred_work_t& work,
                          ocxo_deferred_name(kind));
 }
 
-// Minimal ISR.
-//
-// Cycle budget by inspection:
-//   1.  TCF1 pending check          — one peripheral read
-//   2.  TCF1 clear                  — one peripheral write
-//   3.  event_dwt latency-adjust    — one arithmetic op
-//   4.  compare_target advance      — one arithmetic op
-//   5.  next compare program        — two peripheral writes
-//   6.  tick_mod_1000 advance       — cadence counter (kept in ISR for
-//                                     correctness; see header comment)
-//   7.  mailbox write + ASAP arm    — handoff to foreground
-//
-// Everything else — synthetic clock advance, diag bookkeeping, 1 Hz
-// edge defer, late-ticks moral equivalent — runs in
-// ocxo_post_isr_asap_callback() at foreground priority.
-//
-// Cadence correctness:
-//   tick_mod_1000 lives in the ISR.  ASAP is allowed to drop samples (the
-//   mailbox overwrites), but the 1 Hz boundary detection is never lost
-//   because the counter advances inside the ISR itself.  When the ISR
-//   detects a 1 Hz boundary it sets emit_one_second=true in the mailbox,
-//   and the ASAP callback chains to ocxo_defer_one_second_edge().
-
-static void ocxo_lane_compare_isr(ocxo_lane_t& lane,
-                                  interrupt_subscriber_runtime_t* rt,
-                                  interrupt_subscriber_kind_t kind,
-                                  synthetic_clock32_t& clock32,
-                                  ocxo_deferred_work_t& work,
-                                  uint32_t isr_entry_dwt_raw) {
-  (void)rt;
-  (void)kind;
-  (void)clock32;
-  (void)work;
-  (void)isr_entry_dwt_raw;
-
-  // Retired path.  OCXO QTimer compare channels are passive counter domains
-  // now; they must not re-arm themselves or author cadence.  If a stale flag
-  // is observed from a prior image/boot state, clear it and leave the compare
-  // disabled.  CADENCE_MINDER is the sole cadence agent.
-  if (!ocxo_lane_compare_flag_pending(lane)) return;
-
-  ocxo_lane_clear_compare_flag(lane);
-  ocxo_lane_disable_compare(lane);
-  lane.miss_count++;
-}
-
-// Foreground drain — runs at TimePop ASAP priority, no ISR pressure.
-//
-// Snapshots the mailbox under critical-section guard, then performs all
-// synthetic clock and diagnostic work outside the critical section.
-
-static void ocxo_post_isr_asap_callback(timepop_ctx_t*,
-                                        timepop_diag_t*,
-                                        void* user_data) {
-  auto* rt = static_cast<interrupt_subscriber_runtime_t*>(user_data);
-  if (!rt || !rt->desc) return;
-
-  const interrupt_subscriber_kind_t kind = rt->desc->kind;
-  ocxo_post_isr_mailbox_t& mb = ocxo_post_isr_mailbox_for(kind);
-
-  // Snapshot under PRIMASK so an ISR that fires mid-drain cannot tear the
-  // sample we are about to consume.  The ISR may overwrite *after* we exit
-  // this section; that simply queues a fresh ASAP for the next sample.
-  uint32_t isr_entry_dwt_raw;
-  uint32_t event_dwt;
-  uint16_t fired_low16;
-  bool     emit_one_second;
-  bool     had_sample;
-
-  __disable_irq();
-  had_sample = mb.pending;
-  if (had_sample) {
-    isr_entry_dwt_raw = mb.isr_entry_dwt_raw;
-    event_dwt         = mb.event_dwt;
-    fired_low16       = mb.fired_low16;
-    emit_one_second   = mb.emit_one_second;
-    mb.pending = false;
-  } else {
-    isr_entry_dwt_raw = 0;
-    event_dwt         = 0;
-    fired_low16       = 0;
-    emit_one_second   = false;
-  }
-  __enable_irq();
-
-  if (!had_sample) return;
-
-  ocxo_post_isr_drain_inc(kind);
-
-  ocxo_lane_t* lane = ocxo_lane_for(kind);
-  if (!lane) return;
-
-  // Late-ticks moral equivalent: we are running in foreground, so any
-  // CNTR read here is "drain latency in OCXO ticks", not "ISR-entry-to-
-  // counter ticks".  The diag store retains its existing field shape so
-  // downstream consumers do not see a structural change; the value's
-  // semantics shift from ISR-entry-late to drain-late.
-  const uint32_t drain_ticks =
-      (uint32_t)((uint16_t)(ocxo_lane_counter_now(*lane) - fired_low16));
-
-  ocxo_lane_record_isr_diag(kind, isr_entry_dwt_raw, event_dwt, drain_ticks);
-
-  // Synthetic clock advance — the same arithmetic the ISR used to do.
-  synthetic_clock32_t* clock32 = synthetic_clock_for_kind(kind);
-  if (clock32) {
-    lane->cadence_hits_total++;
-    lane->logical_count32_at_last_second =
-        synthetic_clock_advance_at_hardware(*clock32,
-                                            OCXO_INTERVAL_COUNTS,
-                                            fired_low16);
-  }
-
-  // 1 Hz edge defer — chain into the existing publication path so all
-  // downstream behavior is preserved exactly.
-  if (emit_one_second) {
-    ocxo_deferred_work_t& work =
-        (kind == interrupt_subscriber_kind_t::OCXO1)
-            ? g_ocxo1_deferred
-            : g_ocxo2_deferred;
-    ocxo_defer_one_second_edge(work,
-                               rt,
-                               kind,
-                               event_dwt,
-                               lane->logical_count32_at_last_second);
-  }
-}
-
 static void ocxo_witness_compare_isr(ocxo_lane_t& lane,
                                      interrupt_subscriber_runtime_t* rt,
                                      interrupt_subscriber_kind_t kind,
@@ -2882,6 +3028,7 @@ static void ocxo_witness_compare_isr(ocxo_lane_t& lane,
   const uint32_t isr_csctrl_entry = lane.module->CH[lane.channel].CSCTRL;
   if ((isr_csctrl_entry & TMR_CSCTRL_TCF1) == 0) return;
 
+  // Perishable facts: capture before the counter moves any farther.
   const uint32_t target_counter32 = lane.witness_target_counter32;
   const uint16_t target_low16 = (uint16_t)(target_counter32 & 0xFFFFU);
   const uint16_t isr_counter_low16 = ocxo_lane_counter_now(lane);
@@ -2899,96 +3046,76 @@ static void ocxo_witness_compare_isr(ocxo_lane_t& lane,
       ? early_ticks
       : interpreted_late_ticks;
 
-  lane.witness_last_isr_csctrl_entry = isr_csctrl_entry;
-  lane.witness_last_isr_compare_flag_entry =
-      (isr_csctrl_entry & TMR_CSCTRL_TCF1) != 0;
-  lane.witness_last_isr_compare_enabled_entry =
-      (isr_csctrl_entry & TMR_CSCTRL_TCF1EN) != 0;
-  lane.witness_last_irq_had_armed = lane.witness_armed;
-  lane.witness_last_irq_had_active_rt = (rt && rt->active);
-
-  lane.witness_last_target_low16 = target_low16;
-  lane.witness_last_isr_counter_low16 = isr_counter_low16;
-  lane.witness_last_target_delta_mod65536_ticks =
-      (uint32_t)target_delta_mod65536;
-  lane.witness_last_interpreted_late_ticks = interpreted_late_ticks;
-  lane.witness_last_early_ticks = early_ticks;
-  lane.witness_last_service_offset_signed_ticks =
-      (int32_t)service_offset_signed;
-  lane.witness_last_service_offset_abs_ticks = service_offset_abs_ticks;
-  lane.witness_last_service_was_early = service_early;
-  lane.witness_last_service_was_on_or_after_target = !service_early;
-  lane.witness_last_arm_to_isr_ticks =
+  const bool had_armed = lane.witness_armed;
+  const bool had_active_rt = (rt && rt->active);
+  const uint32_t arm_remaining_ticks = lane.witness_last_arm_remaining_ticks;
+  const uint32_t arm_to_isr_ticks =
       (uint32_t)((uint16_t)(isr_counter_low16 - lane.witness_last_arm_low16));
-  lane.witness_last_arm_to_isr_dwt_cycles =
+  const uint32_t arm_to_isr_dwt_cycles =
       isr_entry_dwt_raw - lane.witness_last_arm_dwt_raw;
-  lane.witness_last_service_class = service_early
-      ? OCXO_SERVICE_CLASS_EARLY_PRETARGET
-      : OCXO_SERVICE_CLASS_ON_OR_AFTER_TARGET;
-  lane.witness_service_count++;
-  if (service_early) {
-    lane.witness_early_service_count++;
-  } else {
-    lane.witness_on_or_after_service_count++;
-  }
-  lane.witness_last_event_published = false;
 
+  // Acknowledge hardware immediately.  After this point the compare rail is no
+  // longer live; the next one-second target is authored by the target ladder
+  // below and armed later by CADENCE_MINDER as it enters the arm window.
   ocxo_lane_clear_compare_flag(lane);
   ocxo_lane_disable_compare(lane);
-
   const uint32_t isr_csctrl_after_disable = lane.module->CH[lane.channel].CSCTRL;
-  lane.witness_last_isr_csctrl_after_disable = isr_csctrl_after_disable;
-  lane.witness_last_isr_compare_flag_after_disable =
-      (isr_csctrl_after_disable & TMR_CSCTRL_TCF1) != 0;
-  lane.witness_last_isr_compare_enabled_after_disable =
-      (isr_csctrl_after_disable & TMR_CSCTRL_TCF1EN) != 0;
-
-  if (!lane.witness_armed || !rt || !rt->active) {
-    lane.witness_false_irq_count++;
-    lane.witness_last_service_class = OCXO_SERVICE_CLASS_FALSE_IRQ;
-    return;
-  }
 
   const uint32_t event_dwt = qtimer_event_dwt_from_isr_entry_raw(isr_entry_dwt_raw);
 
-  // Legacy diagnostic value retained unchanged: modular uint16 delta.  The
-  // truthful signed interpretation is published separately in the lane report.
-  const uint32_t legacy_late_ticks = (uint32_t)target_delta_mod65536;
+  ocxo_perishable_ring_t& ring = ocxo_fact_ring_for(kind);
+  interrupt_perishable_fact_t fact{};
+  fact.kind = kind;
+  fact.provider = (kind == interrupt_subscriber_kind_t::OCXO1)
+      ? interrupt_provider_kind_t::QTIMER2
+      : interrupt_provider_kind_t::QTIMER3;
+  fact.lane = (kind == interrupt_subscriber_kind_t::OCXO1)
+      ? interrupt_lane_t::QTIMER2_CH0_COMP
+      : interrupt_lane_t::QTIMER3_CH3_COMP;
+  fact.sequence = ++ring.sequence;
+  fact.isr_entry_dwt_raw = isr_entry_dwt_raw;
+  fact.service_dwt_at_event = event_dwt;
+  fact.target_counter32 = target_counter32;
+  fact.target_low16 = target_low16;
+  fact.service_counter_low16 = isr_counter_low16;
+  fact.service_offset_ticks = service_offset_signed;
+  fact.service_offset_abs_ticks = service_offset_abs_ticks;
+  fact.interpreted_late_ticks = interpreted_late_ticks;
+  fact.early_ticks = early_ticks;
+  fact.target_delta_mod65536_ticks = (uint32_t)target_delta_mod65536;
+  fact.arm_remaining_ticks = arm_remaining_ticks;
+  fact.arm_to_isr_ticks = arm_to_isr_ticks;
+  fact.arm_to_isr_dwt_cycles = arm_to_isr_dwt_cycles;
+  fact.csctrl_entry = isr_csctrl_entry;
+  fact.csctrl_after_disable = isr_csctrl_after_disable;
+  fact.compare_flag_seen = true;
+  fact.compare_enabled_entry = (isr_csctrl_entry & TMR_CSCTRL_TCF1EN) != 0;
+  fact.compare_flag_after_disable =
+      (isr_csctrl_after_disable & TMR_CSCTRL_TCF1) != 0;
+  fact.compare_enabled_after_disable =
+      (isr_csctrl_after_disable & TMR_CSCTRL_TCF1EN) != 0;
+  fact.had_armed = had_armed;
+  fact.had_active_rt = had_active_rt;
+  fact.one_second_due = had_armed && had_active_rt;
+  fact.service_class = fact.one_second_due
+      ? (service_early ? OCXO_SERVICE_CLASS_EARLY_PRETARGET
+                       : OCXO_SERVICE_CLASS_ON_OR_AFTER_TARGET)
+      : OCXO_SERVICE_CLASS_FALSE_IRQ;
+  fact.exact_target_identity = true;
 
+  // Minimal rail state that must change before CADENCE_MINDER sees the lane
+  // again.  Do not leave witness_armed true after the compare has been cleared.
   lane.witness_armed = false;
-  lane.witness_fire_count++;
-  lane.irq_count++;
-  lane.logical_count32_at_last_second = target_counter32;
-  lane.witness_last_event_dwt = event_dwt;
-  lane.witness_last_event_counter32 = target_counter32;
-  lane.witness_last_late_ticks = legacy_late_ticks;
-  lane.witness_last_event_published = true;
-  lane.witness_valid_publish_count++;
-  if (service_early) {
-    lane.witness_early_service_published_count++;
+  if (had_armed) {
+    lane.witness_target_counter32 += OCXO_WITNESS_ONE_SECOND_COUNTS;
+    lane.witness_target_low16 = (uint16_t)(lane.witness_target_counter32 & 0xFFFFU);
   }
 
-  ocxo_lane_record_isr_diag(kind, isr_entry_dwt_raw, event_dwt,
-                            legacy_late_ticks,
-                            interpreted_late_ticks,
-                            early_ticks,
-                            (int32_t)service_offset_signed,
-                            service_offset_abs_ticks,
-                            (uint32_t)target_delta_mod65536,
-                            target_low16,
-                            isr_counter_low16);
-
-  // The target identity was known before the interrupt was armed.  The ISR is
-  // only the DWT witness for that already-scheduled OCXO second edge.  Publish
-  // through the existing ASAP deferred edge path so Alpha/CLOCKS work never
-  // runs inside the OCXO ISR.
-  ocxo_deferred_work_t& work =
-      (kind == interrupt_subscriber_kind_t::OCXO1)
-          ? g_ocxo1_deferred
-          : g_ocxo2_deferred;
-  ocxo_defer_one_second_edge(work, rt, kind, event_dwt, target_counter32);
-
-  lane.witness_target_counter32 += OCXO_WITNESS_ONE_SECOND_COUNTS;
+  if (!ocxo_fact_ring_push_from_isr(kind, fact, rt)) {
+    // The ring reports the overflow.  Count the lane miss as well so the
+    // existing lane report shows that a hardware event was not handed off.
+    lane.miss_count++;
+  }
 }
 
 static void qtimer2_isr(void) {
@@ -3833,6 +3960,8 @@ void process_interrupt_init(void) {
   g_cadence_minder_last_ocxo2_counter32 = 0;
   g_ocxo1_deferred = ocxo_deferred_work_t{};
   g_ocxo2_deferred = ocxo_deferred_work_t{};
+  ocxo_perishable_fact_ring_reset(g_ocxo1_fact_ring);
+  ocxo_perishable_fact_ring_reset(g_ocxo2_fact_ring);
 
   g_interrupt_runtime_ready = true;
   (void)cadence_minder_arm_timepop();
@@ -3934,11 +4063,11 @@ static void add_runtime_payload(Payload& p) {
   p.add("hardware_ready", g_interrupt_hw_ready);
   p.add("runtime_ready",  g_interrupt_runtime_ready);
   p.add("irqs_enabled",   g_interrupt_irqs_enabled);
-  p.add("timing_arch_step", "LIGHTWEIGHT_EDGE_ISR_PASS");
+  p.add("timing_arch_step", "EXTREME_ISR_HYGIENE_OCXO_FACT_RING");
   p.add("timing_arch_behavior_changed", true);
   p.add("timing_arch_vclock_authority", "QTIMER1_CH2_TIMEPOP_CADENCE_MINDER");
   p.add("timing_arch_ocxo_model", "CADENCE_MINDER_ROLLOVER_OCXO_ONCE_PER_SECOND_WITNESS");
-  p.add("timing_arch_ocxo_migration_stage", "LIGHTWEIGHT_EDGE_ISR_PASS");
+  p.add("timing_arch_ocxo_migration_stage", "OCXO_PERISHABLE_FACT_RING_DIAGNOSTIC_PASS");
   p.add("subscriber_count", g_subscriber_count);
   p.add("single_cadence_agent", true);
   p.add("cadence_minder_isr_mode", true);
@@ -4367,6 +4496,25 @@ static void add_ocxo_lane_payload(Payload& p,
   add_u32("witness_valid_publish_count", lane.witness_valid_publish_count);
   add_u32("witness_early_service_published_count",
           lane.witness_early_service_published_count);
+  add_u32("witness_last_fact_sequence", lane.witness_last_fact_sequence);
+  add_bool("witness_last_fact_one_second_due",
+           lane.witness_last_fact_one_second_due);
+  add_i32("witness_last_service_correction_cycles",
+          lane.witness_last_service_correction_cycles);
+  add_u32("witness_last_service_corrected_dwt",
+          lane.witness_last_service_corrected_dwt);
+  add_u32("witness_last_counter_delta_ticks",
+          lane.witness_last_counter_delta_ticks);
+  add_u32("witness_counter_delta_violation_count",
+          lane.witness_counter_delta_violation_count);
+  add_u32("witness_last_bad_counter_delta",
+          lane.witness_last_bad_counter_delta);
+  add_u32("witness_fact_enqueue_count", lane.witness_fact_enqueue_count);
+  add_u32("witness_fact_drain_count", lane.witness_fact_drain_count);
+  add_u32("witness_fact_overflow_count", lane.witness_fact_overflow_count);
+  add_u32("witness_fact_high_water", lane.witness_fact_high_water);
+  add_u32("witness_fact_asap_arm_count", lane.witness_fact_asap_arm_count);
+  add_u32("witness_fact_asap_fail_count", lane.witness_fact_asap_fail_count);
   add_u32("witness_schedule_last_decision",
           lane.witness_schedule_last_decision);
   add_str("witness_schedule_last_decision_name",
@@ -4488,76 +4636,270 @@ static void add_ocxo_lane_payload(Payload& p,
           is_ocxo1 ? g_qtimer2_last_ch0_dwt_coordinate_source
                    : g_qtimer3_last_ch3_dwt_coordinate_source);
 
-  add_u32("post_isr_arm_count", is_ocxo1 ? g_ocxo1_post_isr_arm_count : g_ocxo2_post_isr_arm_count);
-  add_u32("post_isr_drain_count", is_ocxo1 ? g_ocxo1_post_isr_drain_count : g_ocxo2_post_isr_drain_count);
-  add_u32("post_isr_overwrite_count", is_ocxo1 ? g_ocxo1_post_isr_overwrite_count : g_ocxo2_post_isr_overwrite_count);
+  add_u32("perishable_fact_ring_size", OCXO_PERISHABLE_FACT_RING_SIZE);
+  add_u32("perishable_fact_ring_count",
+          is_ocxo1 ? g_ocxo1_fact_ring.count : g_ocxo2_fact_ring.count);
+  add_u32("perishable_fact_enqueue_count",
+          is_ocxo1 ? g_ocxo1_fact_ring.enqueue_count : g_ocxo2_fact_ring.enqueue_count);
+  add_u32("perishable_fact_drain_count",
+          is_ocxo1 ? g_ocxo1_fact_ring.drain_count : g_ocxo2_fact_ring.drain_count);
+  add_u32("perishable_fact_overflow_count",
+          is_ocxo1 ? g_ocxo1_fact_ring.overflow_count : g_ocxo2_fact_ring.overflow_count);
+  add_u32("perishable_fact_high_water",
+          is_ocxo1 ? g_ocxo1_fact_ring.high_water : g_ocxo2_fact_ring.high_water);
+  add_u32("perishable_fact_asap_arm_count",
+          is_ocxo1 ? g_ocxo1_fact_ring.asap_arm_count : g_ocxo2_fact_ring.asap_arm_count);
+  add_u32("perishable_fact_asap_fail_count",
+          is_ocxo1 ? g_ocxo1_fact_ring.asap_fail_count : g_ocxo2_fact_ring.asap_fail_count);
+  add_bool("perishable_fact_drain_armed",
+           is_ocxo1 ? g_ocxo1_fact_ring.drain_armed : g_ocxo2_fact_ring.drain_armed);
   add_bool("deferred_edge_pending", is_ocxo1 ? g_ocxo1_deferred.edge_pending : g_ocxo2_deferred.edge_pending);
 }
 
 static Payload cmd_report(const Payload&) {
   Payload p;
-  add_runtime_payload(p);
-  add_priority_payload(p);
-  add_cadence_minder_payload(p);
-  add_pps_payload(p);
-  add_epoch_capture_payload(p);
-  add_dynamic_cps_payload(p);
-  add_smartzero_payload(p);
+  p.add("report", "INTERRUPT_COMPACT");
+  p.add("subreports",
+        "REPORT_STATUS REPORT_PPS REPORT_CADENCE REPORT_SMARTZERO "
+        "REPORT_BRIDGE REPORT_LANES REPORT_LANE");
 
-  p.add("pvc_anchor_ring_count", g_pvc_anchor_count);
-  p.add("pvc_anchor_ring_head", g_pvc_anchor_head);
-  p.add("pvc_anchor_ring_seq", g_pvc_anchor_seq);
-  p.add("pvc_anchor_reset_pending", g_pvc_anchor_reset_pending);
+  // Keep the default INTERRUPT.REPORT deliberately small.  The former
+  // monolithic report carried PPS, epoch capture, SmartZero lane proof,
+  // bridge, cadence, and lane forensics all at once; after the perishable
+  // fact pass it can exceed the transport/payload budget.  This compact
+  // report is a health dashboard only.  Heavy surfaces are explicit opt-in
+  // subreports below.
+  p.add("hardware_ready", g_interrupt_hw_ready);
+  p.add("runtime_ready",  g_interrupt_runtime_ready);
+  p.add("irqs_enabled",   g_interrupt_irqs_enabled);
+  p.add("timing_arch_step", "EXTREME_ISR_HYGIENE_FACT_CAPTURE");
+  p.add("timing_arch_behavior_changed", true);
+  p.add("single_cadence_agent", true);
+  p.add("cadence_minder_isr_mode", true);
+  p.add("ocxo_perishable_fact_capture", true);
+  p.add("ocxo_fact_ring_size", OCXO_PERISHABLE_FACT_RING_SIZE);
 
-  // Compact health counters only.  Detailed lane state lives in REPORT_LANES
-  // and REPORT_LANE so this command stays under Payload limits.
+  p.add("qtimer1_priority_ok",
+        g_step0_qtimer1_priority_applied == INTERRUPT_STEP0_EXPECTED_QTIMER1_PRIORITY);
+  p.add("qtimer2_priority_ok",
+        g_step0_qtimer2_priority_applied == INTERRUPT_STEP0_EXPECTED_QTIMER2_PRIORITY);
+  p.add("qtimer3_priority_ok",
+        g_step0_qtimer3_priority_applied == INTERRUPT_STEP0_EXPECTED_QTIMER3_PRIORITY);
+  p.add("gpio6789_priority_ok",
+        g_step0_gpio6789_priority_applied == INTERRUPT_STEP0_EXPECTED_GPIO6789_PRIORITY);
+
+  p.add("gpio_edge_count", g_pps_gpio_heartbeat.edge_count);
+  p.add("gpio_irq_count", g_gpio_irq_count);
+  p.add("gpio_miss_count", g_gpio_miss_count);
+  p.add("pps_post_isr_pending", g_pps_post_isr.pending);
+  p.add("pps_post_isr_overwrite_count", g_pps_post_isr.overwrite_count);
+  p.add("pps_post_isr_asap_fail_count", g_pps_post_isr.asap_fail_count);
+  p.add("pps_rebootstrap_pending", g_pps_rebootstrap_pending);
+  p.add("vclock_epoch_latch_pending", g_vclock_epoch_latch.pending);
+
+  p.add("cadence_minder_armed", g_cadence_minder_armed);
+  p.add("cadence_minder_fire_count", g_cadence_minder_fire_count);
+  p.add("cadence_minder_arm_failures", g_cadence_minder_arm_failures);
+  p.add("cadence_minder_vclock_updates", g_cadence_minder_vclock_updates);
+  p.add("cadence_minder_ocxo1_updates", g_cadence_minder_ocxo1_updates);
+  p.add("cadence_minder_ocxo2_updates", g_cadence_minder_ocxo2_updates);
+
+  interrupt_smartzero_snapshot_t z{};
+  (void)interrupt_smartzero_live_snapshot(&z);
+  p.add("live_smartzero_phase", smartzero_phase_name(z.phase));
+  p.add("live_smartzero_running", z.running);
+  p.add("live_smartzero_complete", z.complete);
+  p.add("live_smartzero_aborted", z.aborted);
+  p.add("live_smartzero_sequence", z.sequence);
+  p.add("live_smartzero_current_lane", interrupt_subscriber_kind_str(z.current_lane));
+
   p.add("vclock_event_count", g_rt_vclock ? g_rt_vclock->event_count : 0U);
   p.add("vclock_dispatch_count", g_rt_vclock ? g_rt_vclock->dispatch_count : 0U);
   p.add("vclock_irq_count", g_vclock_lane.irq_count);
   p.add("vclock_miss_count", g_vclock_lane.miss_count);
+
   p.add("ocxo1_event_count", g_rt_ocxo1 ? g_rt_ocxo1->event_count : 0U);
   p.add("ocxo1_dispatch_count", g_rt_ocxo1 ? g_rt_ocxo1->dispatch_count : 0U);
   p.add("ocxo1_irq_count", g_ocxo1_lane.irq_count);
   p.add("ocxo1_miss_count", g_ocxo1_lane.miss_count);
+  p.add("ocxo1_service_offset_ticks", g_ocxo1_lane.witness_last_service_offset_signed_ticks);
+  p.add("ocxo1_counter_delta_violation_count", g_ocxo1_lane.witness_counter_delta_violation_count);
+  p.add("ocxo1_missed_target_count", g_ocxo1_lane.witness_missed_target_count);
+  p.add("ocxo1_false_irq_count", g_ocxo1_lane.witness_false_irq_count);
+  p.add("ocxo1_late_arm_count", g_ocxo1_lane.witness_late_arm_count);
+  p.add("ocxo1_fact_enqueue_count", g_ocxo1_fact_ring.enqueue_count);
+  p.add("ocxo1_fact_drain_count", g_ocxo1_fact_ring.drain_count);
+  p.add("ocxo1_fact_overflow_count", g_ocxo1_fact_ring.overflow_count);
+  p.add("ocxo1_fact_high_water", g_ocxo1_fact_ring.high_water);
+  p.add("ocxo1_fact_asap_fail_count", g_ocxo1_fact_ring.asap_fail_count);
+
   p.add("ocxo2_event_count", g_rt_ocxo2 ? g_rt_ocxo2->event_count : 0U);
   p.add("ocxo2_dispatch_count", g_rt_ocxo2 ? g_rt_ocxo2->dispatch_count : 0U);
   p.add("ocxo2_irq_count", g_ocxo2_lane.irq_count);
   p.add("ocxo2_miss_count", g_ocxo2_lane.miss_count);
+  p.add("ocxo2_service_offset_ticks", g_ocxo2_lane.witness_last_service_offset_signed_ticks);
+  p.add("ocxo2_counter_delta_violation_count", g_ocxo2_lane.witness_counter_delta_violation_count);
+  p.add("ocxo2_missed_target_count", g_ocxo2_lane.witness_missed_target_count);
+  p.add("ocxo2_false_irq_count", g_ocxo2_lane.witness_false_irq_count);
+  p.add("ocxo2_late_arm_count", g_ocxo2_lane.witness_late_arm_count);
+  p.add("ocxo2_fact_enqueue_count", g_ocxo2_fact_ring.enqueue_count);
+  p.add("ocxo2_fact_drain_count", g_ocxo2_fact_ring.drain_count);
+  p.add("ocxo2_fact_overflow_count", g_ocxo2_fact_ring.overflow_count);
+  p.add("ocxo2_fact_high_water", g_ocxo2_fact_ring.high_water);
+  p.add("ocxo2_fact_asap_fail_count", g_ocxo2_fact_ring.asap_fail_count);
 
-  p.add("ocxo_witness_arch_enabled", true);
-  p.add("ocxo_witness_edge_publish_deferred", true);
-  p.add("ocxo_witness_one_second_counts", OCXO_WITNESS_ONE_SECOND_COUNTS);
-  p.add("ocxo_witness_arm_window_ticks", OCXO_WITNESS_ARM_WINDOW_TICKS);
-  p.add("ocxo_compare_service_signed_offset_instrumented", true);
-  p.add("ocxo_compare_service_early_when_signed_offset_negative", true);
-  p.add("ocxo_compare_service_behavior_changed", false);
-  p.add("ocxo_deferred_asap_arm_count", g_ocxo_deferred_asap_arm_count);
   p.add("ocxo_deferred_asap_overwrite_count", g_ocxo_deferred_asap_overwrite_count);
-  p.add("ocxo_deferred_sample_count", g_ocxo_deferred_sample_count);
   p.add("ocxo_deferred_edge_count", g_ocxo_deferred_edge_count);
-
   return p;
+}
+
+static Payload cmd_report_status(const Payload&) {
+  Payload p;
+  p.add("report", "INTERRUPT_STATUS");
+  add_runtime_payload(p);
+  add_priority_payload(p);
+  return p;
+}
+
+static Payload cmd_report_pps(const Payload&) {
+  Payload p;
+  p.add("report", "INTERRUPT_PPS");
+  add_pps_payload(p);
+  add_epoch_capture_payload(p);
+  return p;
+}
+
+static Payload cmd_report_cadence(const Payload&) {
+  Payload p;
+  p.add("report", "INTERRUPT_CADENCE");
+  add_cadence_minder_payload(p);
+  add_dynamic_cps_payload(p);
+  return p;
+}
+
+static Payload cmd_report_smartzero(const Payload&) {
+  Payload p;
+  p.add("report", "INTERRUPT_SMARTZERO");
+  add_smartzero_payload(p);
+  return p;
+}
+
+static void add_bridge_payload(Payload& p) {
+  p.add("pvc_anchor_ring_count", g_pvc_anchor_count);
+  p.add("pvc_anchor_ring_head", g_pvc_anchor_head);
+  p.add("pvc_anchor_ring_seq", g_pvc_anchor_seq);
+  p.add("pvc_anchor_reset_pending", g_pvc_anchor_reset_pending);
+  add_bridge_stats_payload(p, "timepop", g_bridge_stats_timepop);
+  add_bridge_stats_payload(p, "ocxo1", g_bridge_stats_ocxo1);
+  add_bridge_stats_payload(p, "ocxo2", g_bridge_stats_ocxo2);
+}
+
+static Payload cmd_report_bridge(const Payload&) {
+  Payload p;
+  p.add("report", "INTERRUPT_BRIDGE");
+  add_bridge_payload(p);
+  return p;
+}
+
+static void add_lane_summary_object(Payload& parent,
+                                    const char* key,
+                                    const char* name,
+                                    const interrupt_subscriber_runtime_t* rt,
+                                    uint32_t irq_count,
+                                    uint32_t miss_count,
+                                    uint32_t tick_mod_1000,
+                                    uint32_t logical_count32) {
+  Payload lane;
+  lane.add("lane", name);
+  lane.add("subscribed", rt ? rt->subscribed : false);
+  lane.add("active", rt ? rt->active : false);
+  lane.add("has_fired", rt ? rt->has_fired : false);
+  lane.add("event_count", rt ? rt->event_count : 0U);
+  lane.add("dispatch_count", rt ? rt->dispatch_count : 0U);
+  lane.add("irq_count", irq_count);
+  lane.add("miss_count", miss_count);
+  lane.add("tick_mod_1000", tick_mod_1000);
+  lane.add("logical_count32", logical_count32);
+  if (rt && rt->has_fired) {
+    lane.add("last_event_dwt", rt->last_event.dwt_at_event);
+    lane.add("last_event_counter32", rt->last_event.counter32_at_event);
+  } else {
+    lane.add("last_event_dwt", 0U);
+    lane.add("last_event_counter32", 0U);
+  }
+  parent.add_object(key, lane);
+}
+
+static void add_ocxo_lane_summary_object(Payload& parent,
+                                         const char* key,
+                                         const char* name,
+                                         const interrupt_subscriber_runtime_t* rt,
+                                         const ocxo_lane_t& lane,
+                                         const ocxo_perishable_ring_t& ring) {
+  Payload o;
+  o.add("lane", name);
+  o.add("subscribed", rt ? rt->subscribed : false);
+  o.add("active", rt ? rt->active : false);
+  o.add("has_fired", rt ? rt->has_fired : false);
+  o.add("event_count", rt ? rt->event_count : 0U);
+  o.add("dispatch_count", rt ? rt->dispatch_count : 0U);
+  o.add("irq_count", lane.irq_count);
+  o.add("miss_count", lane.miss_count);
+  o.add("tick_mod_1000", lane.tick_mod_1000);
+  o.add("logical_count32", lane.logical_count32_at_last_second);
+  o.add("witness_arm_count", lane.witness_arm_count);
+  o.add("witness_fire_count", lane.witness_fire_count);
+  o.add("witness_last_counter_delta_ticks", lane.witness_last_counter_delta_ticks);
+  o.add("witness_counter_delta_violation_count", lane.witness_counter_delta_violation_count);
+  o.add("witness_missed_target_count", lane.witness_missed_target_count);
+  o.add("witness_false_irq_count", lane.witness_false_irq_count);
+  o.add("witness_late_arm_count", lane.witness_late_arm_count);
+  o.add("witness_service_offset_ticks", lane.witness_last_service_offset_signed_ticks);
+  o.add("witness_service_class", lane.witness_last_service_class);
+  o.add("witness_service_class_name", ocxo_service_class_name(lane.witness_last_service_class));
+  o.add("fact_enqueue_count", ring.enqueue_count);
+  o.add("fact_drain_count", ring.drain_count);
+  o.add("fact_overflow_count", ring.overflow_count);
+  o.add("fact_high_water", ring.high_water);
+  o.add("fact_asap_fail_count", ring.asap_fail_count);
+  if (rt && rt->has_fired) {
+    o.add("last_event_dwt", rt->last_event.dwt_at_event);
+    o.add("last_event_counter32", rt->last_event.counter32_at_event);
+  } else {
+    o.add("last_event_dwt", 0U);
+    o.add("last_event_counter32", 0U);
+  }
+  parent.add_object(key, o);
 }
 
 static Payload cmd_report_lanes(const Payload&) {
   Payload p;
-  p.add("report", "lanes");
+  p.add("report", "INTERRUPT_LANES");
   p.add("lane_count", 3);
   p.add("detail_command", "INTERRUPT.REPORT_LANE lane=VCLOCK|OCXO1|OCXO2");
 
-  Payload vclock;
-  add_vclock_lane_payload(vclock, false);
-  p.add_object("vclock", vclock);
+  add_lane_summary_object(p,
+                          "vclock",
+                          "VCLOCK",
+                          g_rt_vclock,
+                          g_vclock_lane.irq_count,
+                          g_vclock_lane.miss_count,
+                          g_vclock_lane.tick_mod_1000,
+                          g_vclock_lane.logical_count32_at_last_second);
 
-  Payload ocxo1;
-  add_ocxo_lane_payload(ocxo1, "OCXO1", "ocxo1", g_ocxo1_lane,
-                        g_ocxo1_clock32, g_rt_ocxo1, false);
-  p.add_object("ocxo1", ocxo1);
+  add_ocxo_lane_summary_object(p,
+                               "ocxo1",
+                               "OCXO1",
+                               g_rt_ocxo1,
+                               g_ocxo1_lane,
+                               g_ocxo1_fact_ring);
 
-  Payload ocxo2;
-  add_ocxo_lane_payload(ocxo2, "OCXO2", "ocxo2", g_ocxo2_lane,
-                        g_ocxo2_clock32, g_rt_ocxo2, false);
-  p.add_object("ocxo2", ocxo2);
+  add_ocxo_lane_summary_object(p,
+                               "ocxo2",
+                               "OCXO2",
+                               g_rt_ocxo2,
+                               g_ocxo2_lane,
+                               g_ocxo2_fact_ring);
 
   return p;
 }
@@ -4599,10 +4941,15 @@ static Payload cmd_report_lane(const Payload& args) {
 }
 
 static const process_command_entry_t INTERRUPT_COMMANDS[] = {
-  { "REPORT",       cmd_report       },
-  { "REPORT_LANES", cmd_report_lanes },
-  { "REPORT_LANE",  cmd_report_lane  },
-  { nullptr,        nullptr          }
+  { "REPORT",          cmd_report          },
+  { "REPORT_STATUS",   cmd_report_status   },
+  { "REPORT_PPS",      cmd_report_pps      },
+  { "REPORT_CADENCE",  cmd_report_cadence  },
+  { "REPORT_SMARTZERO", cmd_report_smartzero },
+  { "REPORT_BRIDGE",   cmd_report_bridge   },
+  { "REPORT_LANES",    cmd_report_lanes    },
+  { "REPORT_LANE",     cmd_report_lane     },
+  { nullptr,           nullptr             }
 };
 
 static const process_vtable_t INTERRUPT_PROCESS = {

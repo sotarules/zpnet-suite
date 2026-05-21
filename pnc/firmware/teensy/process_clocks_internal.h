@@ -325,6 +325,14 @@ struct clocks_alpha_lane_forensics_t {
   uint32_t diag_arm_remaining_ticks;
   uint32_t diag_arm_to_isr_ticks;
   uint32_t diag_arm_to_isr_dwt_cycles;
+
+  uint32_t diag_perishable_fact_sequence;
+  int32_t  diag_service_correction_cycles;
+  uint32_t diag_service_corrected_dwt_at_event;
+  uint32_t diag_fact_ring_overflow_count;
+  uint32_t diag_counter_delta_violation_count;
+  uint32_t diag_last_bad_counter_delta;
+  uint32_t diag_last_counter_delta_ticks;
 };
 
 bool clocks_alpha_lane_forensics(time_clock_id_t clock,

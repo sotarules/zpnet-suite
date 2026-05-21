@@ -303,6 +303,17 @@ struct interrupt_capture_diag_t {
   uint32_t ocxo_arm_to_isr_ticks = 0;
   uint32_t ocxo_arm_to_isr_dwt_cycles = 0;
 
+  // Extreme ISR hygiene / perishable-fact diagnostics.  The canonical OCXO
+  // event DWT is still dwt_at_event in this pass; these fields expose the
+  // diagnostic service-offset correction without promoting it to authority.
+  uint32_t ocxo_perishable_fact_sequence = 0;
+  int32_t  ocxo_service_correction_cycles = 0;
+  uint32_t ocxo_service_corrected_dwt_at_event = 0;
+  uint32_t ocxo_fact_ring_overflow_count = 0;
+  uint32_t ocxo_counter_delta_violation_count = 0;
+  uint32_t ocxo_last_bad_counter_delta = 0;
+  uint32_t ocxo_last_counter_delta_ticks = 0;
+
   uint32_t anomaly_count = 0;
 };
 

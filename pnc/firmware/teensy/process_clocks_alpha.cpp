@@ -499,6 +499,14 @@ struct alpha_lane_forensics_store_t {
   uint32_t diag_arm_remaining_ticks = 0;
   uint32_t diag_arm_to_isr_ticks = 0;
   uint32_t diag_arm_to_isr_dwt_cycles = 0;
+
+  uint32_t diag_perishable_fact_sequence = 0;
+  int32_t  diag_service_correction_cycles = 0;
+  uint32_t diag_service_corrected_dwt_at_event = 0;
+  uint32_t diag_fact_ring_overflow_count = 0;
+  uint32_t diag_counter_delta_violation_count = 0;
+  uint32_t diag_last_bad_counter_delta = 0;
+  uint32_t diag_last_counter_delta_ticks = 0;
 };
 
 static alpha_lane_forensics_store_t g_vclock_forensics = {};
@@ -924,6 +932,13 @@ static void alpha_forensics_reset_store(alpha_lane_forensics_store_t& s) {
   s.diag_arm_remaining_ticks = 0;
   s.diag_arm_to_isr_ticks = 0;
   s.diag_arm_to_isr_dwt_cycles = 0;
+  s.diag_perishable_fact_sequence = 0;
+  s.diag_service_correction_cycles = 0;
+  s.diag_service_corrected_dwt_at_event = 0;
+  s.diag_fact_ring_overflow_count = 0;
+  s.diag_counter_delta_violation_count = 0;
+  s.diag_last_bad_counter_delta = 0;
+  s.diag_last_counter_delta_ticks = 0;
 
   clocks_alpha_dmb();
   s.seq++;
@@ -1025,6 +1040,15 @@ static void alpha_forensics_publish(time_clock_id_t clock_id,
     s->diag_arm_remaining_ticks = diag->ocxo_arm_remaining_ticks;
     s->diag_arm_to_isr_ticks = diag->ocxo_arm_to_isr_ticks;
     s->diag_arm_to_isr_dwt_cycles = diag->ocxo_arm_to_isr_dwt_cycles;
+    s->diag_perishable_fact_sequence = diag->ocxo_perishable_fact_sequence;
+    s->diag_service_correction_cycles = diag->ocxo_service_correction_cycles;
+    s->diag_service_corrected_dwt_at_event =
+        diag->ocxo_service_corrected_dwt_at_event;
+    s->diag_fact_ring_overflow_count = diag->ocxo_fact_ring_overflow_count;
+    s->diag_counter_delta_violation_count =
+        diag->ocxo_counter_delta_violation_count;
+    s->diag_last_bad_counter_delta = diag->ocxo_last_bad_counter_delta;
+    s->diag_last_counter_delta_ticks = diag->ocxo_last_counter_delta_ticks;
   } else {
     s->diag_anchor_sequence_used = 0;
     s->diag_anchor_age_slots = 0;
@@ -1043,6 +1067,13 @@ static void alpha_forensics_publish(time_clock_id_t clock_id,
     s->diag_arm_remaining_ticks = 0;
     s->diag_arm_to_isr_ticks = 0;
     s->diag_arm_to_isr_dwt_cycles = 0;
+    s->diag_perishable_fact_sequence = 0;
+    s->diag_service_correction_cycles = 0;
+    s->diag_service_corrected_dwt_at_event = 0;
+    s->diag_fact_ring_overflow_count = 0;
+    s->diag_counter_delta_violation_count = 0;
+    s->diag_last_bad_counter_delta = 0;
+    s->diag_last_counter_delta_ticks = 0;
   }
 
   clocks_alpha_dmb();
@@ -1104,6 +1135,15 @@ bool clocks_alpha_lane_forensics(time_clock_id_t clock,
     out->diag_arm_remaining_ticks = s->diag_arm_remaining_ticks;
     out->diag_arm_to_isr_ticks = s->diag_arm_to_isr_ticks;
     out->diag_arm_to_isr_dwt_cycles = s->diag_arm_to_isr_dwt_cycles;
+    out->diag_perishable_fact_sequence = s->diag_perishable_fact_sequence;
+    out->diag_service_correction_cycles = s->diag_service_correction_cycles;
+    out->diag_service_corrected_dwt_at_event =
+        s->diag_service_corrected_dwt_at_event;
+    out->diag_fact_ring_overflow_count = s->diag_fact_ring_overflow_count;
+    out->diag_counter_delta_violation_count =
+        s->diag_counter_delta_violation_count;
+    out->diag_last_bad_counter_delta = s->diag_last_bad_counter_delta;
+    out->diag_last_counter_delta_ticks = s->diag_last_counter_delta_ticks;
 
     clocks_alpha_dmb();
     const uint32_t seq2 = s->seq;

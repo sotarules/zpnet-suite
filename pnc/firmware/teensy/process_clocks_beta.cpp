@@ -755,6 +755,23 @@ static void payload_add_lane_forensics_flat(Payload& p,
           valid ? f.diag_arm_to_isr_ticks : 0U);
   add_u32("forensics_arm_to_isr_dwt_cycles",
           valid ? f.diag_arm_to_isr_dwt_cycles : 0U);
+
+  // Extreme ISR hygiene diagnostics.  Corrected DWT is diagnostic-only in
+  // this pass; canonical OCXO event DWT remains forensics_last_event_dwt.
+  add_u32("forensics_perishable_fact_sequence",
+          valid ? f.diag_perishable_fact_sequence : 0U);
+  add_i32("forensics_service_correction_cycles",
+          valid ? f.diag_service_correction_cycles : 0);
+  add_u32("forensics_service_corrected_dwt_at_event",
+          valid ? f.diag_service_corrected_dwt_at_event : 0U);
+  add_u32("forensics_fact_ring_overflow_count",
+          valid ? f.diag_fact_ring_overflow_count : 0U);
+  add_u32("forensics_counter_delta_violation_count",
+          valid ? f.diag_counter_delta_violation_count : 0U);
+  add_u32("forensics_last_bad_counter_delta",
+          valid ? f.diag_last_bad_counter_delta : 0U);
+  add_u32("forensics_last_counter_delta_ticks",
+          valid ? f.diag_last_counter_delta_ticks : 0U);
 }
 
 // ============================================================================
@@ -1738,6 +1755,30 @@ static void add_alpha_event_payload(Payload& p,
   anchor.add("ns_delta", f.diag_anchor_ns_delta);
   anchor.add("failure_mask", f.diag_anchor_failure_mask);
   p.add_object("bridge_anchor", anchor);
+
+  Payload service;
+  service.add("class", f.diag_service_class);
+  service.add("offset_signed_ticks", f.diag_service_offset_signed_ticks);
+  service.add("offset_abs_ticks", f.diag_service_offset_abs_ticks);
+  service.add("interpreted_late_ticks", f.diag_interpreted_late_ticks);
+  service.add("early_ticks", f.diag_early_ticks);
+  service.add("target_delta_mod65536_ticks",
+              f.diag_target_delta_mod65536_ticks);
+  service.add("arm_remaining_ticks", f.diag_arm_remaining_ticks);
+  service.add("arm_to_isr_ticks", f.diag_arm_to_isr_ticks);
+  service.add("arm_to_isr_dwt_cycles", f.diag_arm_to_isr_dwt_cycles);
+  service.add("perishable_fact_sequence",
+              f.diag_perishable_fact_sequence);
+  service.add("correction_cycles", f.diag_service_correction_cycles);
+  service.add("corrected_dwt_at_event",
+              f.diag_service_corrected_dwt_at_event);
+  service.add("fact_ring_overflow_count",
+              f.diag_fact_ring_overflow_count);
+  service.add("counter_delta_violation_count",
+              f.diag_counter_delta_violation_count);
+  service.add("last_bad_counter_delta", f.diag_last_bad_counter_delta);
+  service.add("last_counter_delta_ticks", f.diag_last_counter_delta_ticks);
+  p.add_object("ocxo_service", service);
 }
 
 static void add_projection_payload(Payload& p,
