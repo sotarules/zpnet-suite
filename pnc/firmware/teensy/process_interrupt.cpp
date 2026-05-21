@@ -3978,10 +3978,12 @@ void process_interrupt_init_hardware(void) {
   g_interrupt_hw_ready = true;
 }
 
-void process_interrupt_init(void) {
-  if (g_interrupt_runtime_ready) return;
-
+static void runtime_init_subscribers(void) {
   g_subscriber_count = 0;
+  g_rt_vclock = nullptr;
+  g_rt_ocxo1 = nullptr;
+  g_rt_ocxo2 = nullptr;
+
   for (auto& rt : g_subscribers) rt = interrupt_subscriber_runtime_t{};
 
   for (uint32_t i = 0; i < (sizeof(DESCRIPTORS) / sizeof(DESCRIPTORS[0])); i++) {
@@ -3992,7 +3994,9 @@ void process_interrupt_init(void) {
     else if (rt.desc->kind == interrupt_subscriber_kind_t::OCXO1)  g_rt_ocxo1  = &rt;
     else if (rt.desc->kind == interrupt_subscriber_kind_t::OCXO2)  g_rt_ocxo2  = &rt;
   }
+}
 
+static void runtime_reset_pps_state(void) {
   g_pps_gpio_heartbeat = pps_gpio_heartbeat_t{};
   g_gpio_irq_count = 0;
   g_gpio_miss_count = 0;
@@ -4012,7 +4016,9 @@ void process_interrupt_init(void) {
   g_vclock_repair_stats = vclock_repair_stats_t{};
   g_pps_rebootstrap_pending = false;
   g_pps_rebootstrap_count = 0;
+}
 
+static void runtime_reset_snapshot_and_bridge_state(void) {
   g_store = snapshot_store_t{};
   g_epoch_capture_store = epoch_capture_store_t{};
   pvc_anchor_ring_reset();
@@ -4021,29 +4027,39 @@ void process_interrupt_init(void) {
   g_bridge_stats_ocxo2 = bridge_anchor_stats_t{};
   g_pps_edge_dispatch = nullptr;
   g_pps_entry_latency_handler = nullptr;
+}
 
-  g_vclock_clock32 = vclock_synthetic_clock32_t{};
-  g_ocxo1_clock32 = synthetic_clock32_t{};
-  g_ocxo2_clock32 = synthetic_clock32_t{};
+static void runtime_reset_smartzero_state(void) {
   g_smartzero = smartzero_runtime_t{};
   for (uint32_t i = 0; i < SMARTZERO_LANE_COUNT; i++) {
     smartzero_reset_lane(i);
   }
+}
 
+static void runtime_reset_clock32_state(void) {
+  g_vclock_clock32 = vclock_synthetic_clock32_t{};
+  g_ocxo1_clock32 = synthetic_clock32_t{};
+  g_ocxo2_clock32 = synthetic_clock32_t{};
+}
+
+static void runtime_bootstrap_synthetic_clocks_if_ready(void) {
   // Defensive birth anchors.  These are not logical ZERO operations; they
   // simply make process_interrupt's synthetic coordinate extenders safe before
   // CLOCKS has installed a user/campaign epoch.
-  if (g_interrupt_hw_ready) {
-    vclock_clock_bootstrap_from_hw16(qtimer1_ch0_counter_now());
-    if (g_ocxo1_lane.initialized) {
-      synthetic_clock_bootstrap_from_hw16(g_ocxo1_clock32, IMXRT_TMR2.CH[0].CNTR);
-      g_ocxo1_lane.logical_count32_at_last_second = g_ocxo1_clock32.current_counter32;
-    }
-    if (g_ocxo2_lane.initialized) {
-      synthetic_clock_bootstrap_from_hw16(g_ocxo2_clock32, IMXRT_TMR3.CH[3].CNTR);
-      g_ocxo2_lane.logical_count32_at_last_second = g_ocxo2_clock32.current_counter32;
-    }
+  if (!g_interrupt_hw_ready) return;
+
+  vclock_clock_bootstrap_from_hw16(qtimer1_ch0_counter_now());
+  if (g_ocxo1_lane.initialized) {
+    synthetic_clock_bootstrap_from_hw16(g_ocxo1_clock32, IMXRT_TMR2.CH[0].CNTR);
+    g_ocxo1_lane.logical_count32_at_last_second = g_ocxo1_clock32.current_counter32;
   }
+  if (g_ocxo2_lane.initialized) {
+    synthetic_clock_bootstrap_from_hw16(g_ocxo2_clock32, IMXRT_TMR3.CH[3].CNTR);
+    g_ocxo2_lane.logical_count32_at_last_second = g_ocxo2_clock32.current_counter32;
+  }
+}
+
+static void runtime_reset_qtimer_host_state(void) {
   g_qtimer1_ch1_sequence = 0;
   g_qtimer1_ch1_target_counter32 = 0;
   g_qtimer1_ch1_next_compare_counter32 = 0;
@@ -4056,6 +4072,9 @@ void process_interrupt_init(void) {
   g_qtimer1_ch2_arm_count = 0;
   g_ocxo1_qtimer_diag = ocxo_qtimer_diag_t{};
   g_ocxo2_qtimer_diag = ocxo_qtimer_diag_t{};
+}
+
+static void runtime_reset_cadence_minder_state(void) {
   g_cadence_minder_armed = false;
   g_cadence_minder_arm_count = 0;
   g_cadence_minder_arm_failures = 0;
@@ -4069,8 +4088,29 @@ void process_interrupt_init(void) {
   g_cadence_minder_last_vclock_counter32 = 0;
   g_cadence_minder_last_ocxo1_counter32 = 0;
   g_cadence_minder_last_ocxo2_counter32 = 0;
+}
+
+static void runtime_reset_ocxo_fact_rings(void) {
   ocxo_fact_ring_reset(g_ocxo1_ctx);
   ocxo_fact_ring_reset(g_ocxo2_ctx);
+}
+
+static void runtime_reset_for_init(void) {
+  runtime_init_subscribers();
+  runtime_reset_pps_state();
+  runtime_reset_snapshot_and_bridge_state();
+  runtime_reset_clock32_state();
+  runtime_reset_smartzero_state();
+  runtime_bootstrap_synthetic_clocks_if_ready();
+  runtime_reset_qtimer_host_state();
+  runtime_reset_cadence_minder_state();
+  runtime_reset_ocxo_fact_rings();
+}
+
+void process_interrupt_init(void) {
+  if (g_interrupt_runtime_ready) return;
+
+  runtime_reset_for_init();
 
   g_interrupt_runtime_ready = true;
   (void)cadence_minder_arm_timepop();
