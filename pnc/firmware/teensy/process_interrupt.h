@@ -4,9 +4,9 @@
 //
 // Interrupt custody and low-word counter cadence:
 //
-//   • Cadence minder (single TimePop client tending all 16-bit counters)
-//   • OCXO lanes    (QTimer2 CH0 for OCXO1, QTimer3 CH3 for OCXO2; currently still event rails)
 //   • VCLOCK lane   (critical recurring TimePop client on QTimer1 CH2)
+//   • OCXO lanes    (local 1 kHz QTimer compare cadence on QTimer2 CH0 / QTimer3 CH3)
+//   • Cadence minder (TimePop VCLOCK/relay heartbeat; no longer OCXO rollover owner)
 //   • TimePop       (QTimer1 CH2, hosted scheduler/client rail)
 //   • PPS GPIO edge (diagnostics + dispatch authority + epoch anchor)
 //
@@ -101,22 +101,22 @@
 // ─── Per-lane cadence mechanics ─────────────────────────────────────────────
 //
 //   Three lanes (VCLOCK, OCXO1, OCXO2) produce one-second subscriber events.
-//   A single TimePop cadence minder now refreshes all process_interrupt-owned
-//   synthetic 32-bit counter anchors so 16-bit low-word rollover custody is
-//   centralized on the sovereign VCLOCK/TimePop rail.  OCXO compare channels
-//   are still present as event rails in this step, but rollover custody no
-//   longer depends on frequent OCXO interrupt service.  VCLOCK cadence is a
-//   TimePop critical recurring ISR slot on QTimer1 CH2, sharing fire facts
-//   with other same-deadline TimePop clients.
+//   The 1 kHz custody model is now lane-centric:
 //
-//   Cadence sources:
 //     VCLOCK : TimePop critical recurring ISR slot, +10000 counts/interval
 //              in the GNSS-disciplined 10 MHz VCLOCK domain.  QTimer1 CH0 is
 //              the passive low-word VCLOCK counter; QTimer1 CH2 is the only
-//              active TimePop compare rail.
-//     MINDER : TimePop recurring 1 ms client, tends VCLOCK/OCXO low-word counters
-//     OCXO1  : QTimer2 CH0 compare, event rail retained for current one-second events
-//     OCXO2  : QTimer3 CH3 compare, event rail retained for current one-second events
+//              active TimePop compare rail.  This asymmetry is intentional:
+//              TimePop coalesces duplicate deadlines onto one perishable ISR
+//              fact surface and avoids a competing VCLOCK preemption rail.
+//
+//     OCXO1  : QTimer2 CH0 local compare every +10,000 OCXO ticks.
+//     OCXO2  : QTimer3 CH3 local compare every +10,000 OCXO ticks.
+//
+//   OCXO compare ISRs schedule the next +10,000-tick target immediately, then
+//   enqueue the perishable service facts into the lane ring for TimePop ASAP
+//   foreground interpretation.  Every 1000th OCXO cadence sample remains the
+//   public one-second event consumed by CLOCKS/Alpha.
 // ============================================================================
 
 #pragma once
@@ -645,17 +645,16 @@ bool interrupt_last_epoch_capture(interrupt_epoch_capture_t* out);
 
 // Re-author OCXO QuadTimer compare cadence from CLOCKS logical zero.
 //
-// OCXO Gamma is lane-local.  It does not care which OCXO edge is near PPS or
-// VCLOCK.  Once CLOCKS has selected the OCXO zero-offset counter32 values, this
-// call makes the compare rails land on:
+// Once CLOCKS has selected the OCXO zero-offset counter32 values, this call
+// makes each local compare rail land on that lane's 1 kHz logical grid:
 //
 //   epoch + 10,000
 //   epoch + 20,000
 //   ...
 //   epoch + 10,000,000
 //
-// Every tenth custody event is a Gamma 100 Hz courtroom sample, and every
-// thousandth custody event is the OCXO-local one-second edge.
+// Every cadence event is a future regression sample; every thousandth cadence
+// event is the OCXO-local one-second edge delivered to Alpha.
 void interrupt_ocxo_logical_grid_epoch(uint32_t ocxo1_epoch_counter32,
                                        uint32_t ocxo2_epoch_counter32);
 
