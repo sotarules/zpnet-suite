@@ -3029,17 +3029,44 @@ static void ocxo_defer_one_second_edge(ocxo_deferred_work_t& work,
                          ocxo_deferred_name(kind));
 }
 
-static void ocxo_witness_compare_isr(ocxo_runtime_context_t& ctx,
-                                     uint32_t isr_entry_dwt_raw) {
-  ocxo_lane_t& lane = *ctx.lane;
-  interrupt_subscriber_runtime_t* rt = ocxo_runtime_for(ctx);
-  const interrupt_subscriber_kind_t kind = ctx.kind;
+struct ocxo_cadence_isr_sample_t {
+  interrupt_subscriber_runtime_t* rt = nullptr;
 
-  const uint32_t isr_csctrl_entry = lane.module->CH[lane.channel].CSCTRL;
+  uint32_t isr_entry_dwt_raw = 0;
+  uint32_t isr_csctrl_entry = 0;
+  uint32_t isr_csctrl_after_program = 0;
+  uint32_t event_dwt = 0;
+
+  bool had_armed = false;
+  bool had_active_rt = false;
+  bool was_smartzero_current = false;
+
+  uint32_t target_counter32 = 0;
+  uint16_t target_low16 = 0;
+  uint16_t service_counter_low16 = 0;
+  uint32_t target_delta_mod65536_ticks = 0;
+
+  int16_t service_offset_signed_ticks = 0;
+  bool service_was_early = false;
+  uint32_t early_ticks = 0;
+  uint32_t interpreted_late_ticks = 0;
+  uint32_t service_offset_abs_ticks = 0;
+
+  uint32_t arm_remaining_ticks = 0;
+  uint32_t arm_to_isr_ticks = 0;
+  uint32_t arm_to_isr_dwt_cycles = 0;
+
+  bool one_second_due = false;
+};
+
+static bool ocxo_cadence_classify_irq(ocxo_runtime_context_t& ctx,
+                                      uint32_t isr_csctrl_entry) {
+  ocxo_lane_t& lane = *ctx.lane;
+
   if ((isr_csctrl_entry & TMR_CSCTRL_TCF1) == 0) {
     lane.cadence_false_irq_count++;
     lane.witness_false_irq_count++;
-    return;
+    return false;
   }
 
   if (!lane.cadence_enabled || !lane.cadence_armed) {
@@ -3047,68 +3074,104 @@ static void ocxo_witness_compare_isr(ocxo_runtime_context_t& ctx,
     lane.witness_false_irq_count++;
     ocxo_lane_clear_compare_flag(lane);
     ocxo_lane_stop_local_cadence(lane, OCXO_CADENCE_REASON_STOP);
-    return;
+    return false;
   }
 
-  // Perishable facts: capture before the counter moves any farther.
-  const bool had_armed = lane.cadence_armed;
-  const bool had_active_rt = (rt && rt->active && lane.active);
-  if (rt) rt->irq_count++;
-  const bool was_smartzero_current = smartzero_is_current_lane(kind);
-  const uint32_t target_counter32 = lane.cadence_next_counter32;
-  const uint16_t target_low16 = (uint16_t)(target_counter32 & 0xFFFFU);
-  const uint16_t isr_counter_low16 = ocxo_lane_counter_now(lane);
-  const uint16_t target_delta_mod65536 =
-      (uint16_t)(isr_counter_low16 - target_low16);
-  const int16_t service_offset_signed = (int16_t)target_delta_mod65536;
-  const bool service_early = (service_offset_signed < 0);
-  const uint32_t early_ticks = service_early
-      ? (uint32_t)(-(int32_t)service_offset_signed)
-      : 0U;
-  const uint32_t interpreted_late_ticks = service_early
-      ? 0U
-      : (uint32_t)service_offset_signed;
-  const uint32_t service_offset_abs_ticks = service_early
-      ? early_ticks
-      : interpreted_late_ticks;
+  return true;
+}
 
-  const uint32_t arm_remaining_ticks = lane.witness_last_arm_remaining_ticks;
-  const uint32_t arm_to_isr_ticks =
-      (uint32_t)((uint16_t)(isr_counter_low16 - lane.witness_last_arm_low16));
-  const uint32_t arm_to_isr_dwt_cycles =
+static ocxo_cadence_isr_sample_t ocxo_cadence_capture_perishable_facts(
+    ocxo_runtime_context_t& ctx,
+    uint32_t isr_entry_dwt_raw,
+    uint32_t isr_csctrl_entry) {
+  ocxo_lane_t& lane = *ctx.lane;
+
+  ocxo_cadence_isr_sample_t sample{};
+  sample.rt = ocxo_runtime_for(ctx);
+  sample.isr_entry_dwt_raw = isr_entry_dwt_raw;
+  sample.isr_csctrl_entry = isr_csctrl_entry;
+  sample.had_armed = lane.cadence_armed;
+  sample.had_active_rt = (sample.rt && sample.rt->active && lane.active);
+  sample.was_smartzero_current = smartzero_is_current_lane(ctx.kind);
+
+  if (sample.rt) sample.rt->irq_count++;
+
+  sample.target_counter32 = lane.cadence_next_counter32;
+  sample.target_low16 = (uint16_t)(sample.target_counter32 & 0xFFFFU);
+  sample.service_counter_low16 = ocxo_lane_counter_now(lane);
+  sample.target_delta_mod65536_ticks =
+      (uint32_t)((uint16_t)(sample.service_counter_low16 - sample.target_low16));
+
+  sample.service_offset_signed_ticks =
+      (int16_t)((uint16_t)sample.target_delta_mod65536_ticks);
+  sample.service_was_early = (sample.service_offset_signed_ticks < 0);
+  sample.early_ticks = sample.service_was_early
+      ? (uint32_t)(-(int32_t)sample.service_offset_signed_ticks)
+      : 0U;
+  sample.interpreted_late_ticks = sample.service_was_early
+      ? 0U
+      : (uint32_t)sample.service_offset_signed_ticks;
+  sample.service_offset_abs_ticks = sample.service_was_early
+      ? sample.early_ticks
+      : sample.interpreted_late_ticks;
+
+  sample.arm_remaining_ticks = lane.witness_last_arm_remaining_ticks;
+  sample.arm_to_isr_ticks =
+      (uint32_t)((uint16_t)(sample.service_counter_low16 -
+                            lane.witness_last_arm_low16));
+  sample.arm_to_isr_dwt_cycles =
       isr_entry_dwt_raw - lane.witness_last_arm_dwt_raw;
 
+  return sample;
+}
+
+static void ocxo_cadence_acknowledge_and_timestamp(
+    ocxo_runtime_context_t& ctx,
+    ocxo_cadence_isr_sample_t& sample) {
   // Acknowledge hardware immediately; the next cadence target is programmed
-  // below before any foreground work is requested.
-  ocxo_lane_clear_compare_flag(lane);
-  const uint32_t event_dwt = qtimer_event_dwt_from_isr_entry_raw(isr_entry_dwt_raw);
+  // before any foreground work is requested.
+  ocxo_lane_clear_compare_flag(*ctx.lane);
+  sample.event_dwt =
+      qtimer_event_dwt_from_isr_entry_raw(sample.isr_entry_dwt_raw);
+}
+
+static void ocxo_cadence_update_synthetic_identity(
+    ocxo_runtime_context_t& ctx,
+    const ocxo_cadence_isr_sample_t& sample) {
+  ocxo_lane_t& lane = *ctx.lane;
 
   // Authored sample identity.  The compare target, not the service-time low16
   // read, is the synthetic counter32 coordinate of this cadence sample.
-  synthetic_clock32_t* clock32 = synthetic_clock_for_kind(kind);
-  if (clock32) {
-    clock32->current_counter32 = target_counter32;
-    clock32->current_ns = (uint64_t)target_counter32 * 100ULL;
-    clock32->hardware16 = target_low16;
-    clock32->minder_update_count++;
+  if (ctx.clock32) {
+    ctx.clock32->current_counter32 = sample.target_counter32;
+    ctx.clock32->current_ns = (uint64_t)sample.target_counter32 * 100ULL;
+    ctx.clock32->hardware16 = sample.target_low16;
+    ctx.clock32->minder_update_count++;
   }
 
-  lane.logical_count32_at_last_second = target_counter32;
-  lane.compare_target = target_low16;
+  lane.logical_count32_at_last_second = sample.target_counter32;
+  lane.compare_target = sample.target_low16;
   lane.cadence_hits_total++;
   lane.cadence_fire_count++;
-  lane.cadence_last_target_counter32 = target_counter32;
-  lane.cadence_last_target_low16 = target_low16;
-  lane.cadence_last_service_low16 = isr_counter_low16;
-  lane.cadence_last_fire_dwt = event_dwt;
-  lane.cadence_last_isr_entry_dwt_raw = isr_entry_dwt_raw;
-  lane.cadence_last_service_offset_signed_ticks = (int32_t)service_offset_signed;
-  lane.cadence_last_service_offset_abs_ticks = service_offset_abs_ticks;
-  lane.cadence_last_interpreted_late_ticks = interpreted_late_ticks;
-  lane.cadence_last_early_ticks = early_ticks;
-  lane.cadence_last_was_early = service_early;
-  lane.witness_last_arm_to_isr_ticks = arm_to_isr_ticks;
-  lane.witness_last_arm_to_isr_dwt_cycles = arm_to_isr_dwt_cycles;
+  lane.cadence_last_target_counter32 = sample.target_counter32;
+  lane.cadence_last_target_low16 = sample.target_low16;
+  lane.cadence_last_service_low16 = sample.service_counter_low16;
+  lane.cadence_last_fire_dwt = sample.event_dwt;
+  lane.cadence_last_isr_entry_dwt_raw = sample.isr_entry_dwt_raw;
+  lane.cadence_last_service_offset_signed_ticks =
+      (int32_t)sample.service_offset_signed_ticks;
+  lane.cadence_last_service_offset_abs_ticks = sample.service_offset_abs_ticks;
+  lane.cadence_last_interpreted_late_ticks = sample.interpreted_late_ticks;
+  lane.cadence_last_early_ticks = sample.early_ticks;
+  lane.cadence_last_was_early = sample.service_was_early;
+  lane.witness_last_arm_to_isr_ticks = sample.arm_to_isr_ticks;
+  lane.witness_last_arm_to_isr_dwt_cycles = sample.arm_to_isr_dwt_cycles;
+}
+
+static void ocxo_cadence_update_sample_phase(
+    ocxo_runtime_context_t& ctx,
+    ocxo_cadence_isr_sample_t& sample) {
+  ocxo_lane_t& lane = *ctx.lane;
 
   if (!lane.phase_bootstrapped) {
     lane.phase_bootstrapped = true;
@@ -3116,16 +3179,19 @@ static void ocxo_witness_compare_isr(ocxo_runtime_context_t& ctx,
     lane.tick_mod_1000 = 0;
   }
 
-  bool one_second_due = false;
   if (++lane.tick_mod_1000 >= TICKS_PER_SECOND_EVENT) {
     lane.tick_mod_1000 = 0;
-    one_second_due = true;
+    sample.one_second_due = true;
     lane.cadence_one_second_due_count++;
   }
-  lane.cadence_last_one_second_due = one_second_due;
+  lane.cadence_last_one_second_due = sample.one_second_due;
+}
 
-  if (was_smartzero_current) {
-    const int idx = smartzero_index_for_kind(kind);
+static void ocxo_cadence_feed_smartzero(
+    ocxo_runtime_context_t& ctx,
+    const ocxo_cadence_isr_sample_t& sample) {
+  if (sample.was_smartzero_current) {
+    const int idx = smartzero_index_for_kind(ctx.kind);
     if (idx >= 0) {
       smartzero_write_begin();
       g_smartzero.lanes[idx].pub.fire_count++;
@@ -3133,14 +3199,24 @@ static void ocxo_witness_compare_isr(ocxo_runtime_context_t& ctx,
     }
   }
 
-  smartzero_feed_sample(kind, event_dwt, target_counter32, target_low16);
+  smartzero_feed_sample(ctx.kind,
+                        sample.event_dwt,
+                        sample.target_counter32,
+                        sample.target_low16);
+}
 
-  const bool keep_for_smartzero = smartzero_is_current_lane(kind);
+static void ocxo_cadence_rearm_or_stop(
+    ocxo_runtime_context_t& ctx,
+    ocxo_cadence_isr_sample_t& sample) {
+  ocxo_lane_t& lane = *ctx.lane;
+
+  const bool keep_for_smartzero = smartzero_is_current_lane(ctx.kind);
   const bool keep_running = lane.active || keep_for_smartzero;
   if (keep_running) {
-    const uint32_t next_target = target_counter32 + OCXO_CADENCE_INTERVAL_TICKS;
+    const uint32_t next_target =
+        sample.target_counter32 + OCXO_CADENCE_INTERVAL_TICKS;
     if (keep_for_smartzero) {
-      const int idx = smartzero_index_for_kind(kind);
+      const int idx = smartzero_index_for_kind(ctx.kind);
       if (idx >= 0) {
         smartzero_write_begin();
         g_smartzero.lanes[idx].pub.next_target_counter32 = next_target;
@@ -3148,9 +3224,10 @@ static void ocxo_witness_compare_isr(ocxo_runtime_context_t& ctx,
         smartzero_write_end();
       }
     }
+
     lane.witness_last_arm_dwt_raw = ARM_DWT_CYCCNT;
-    lane.witness_last_arm_counter32 = target_counter32;
-    lane.witness_last_arm_low16 = target_low16;
+    lane.witness_last_arm_counter32 = sample.target_counter32;
+    lane.witness_last_arm_low16 = sample.target_low16;
     lane.witness_last_arm_target_counter32 = next_target;
     lane.witness_last_arm_target_low16 = (uint16_t)(next_target & 0xFFFFU);
     lane.witness_last_arm_remaining_ticks = OCXO_CADENCE_INTERVAL_TICKS;
@@ -3160,64 +3237,109 @@ static void ocxo_witness_compare_isr(ocxo_runtime_context_t& ctx,
     ocxo_lane_stop_local_cadence(lane, OCXO_CADENCE_REASON_STOP);
   }
 
-  const uint32_t isr_csctrl_after_program = lane.module->CH[lane.channel].CSCTRL;
+  sample.isr_csctrl_after_program = lane.module->CH[lane.channel].CSCTRL;
+}
 
-  ocxo_perishable_ring_t& ring = ocxo_fact_ring_for(kind);
+static interrupt_perishable_fact_t ocxo_cadence_build_perishable_fact(
+    ocxo_runtime_context_t& ctx,
+    ocxo_cadence_isr_sample_t& sample) {
+  ocxo_perishable_ring_t& ring = ocxo_fact_ring_for(ctx.kind);
+
   interrupt_perishable_fact_t fact{};
-  fact.kind = kind;
+  fact.kind = ctx.kind;
   fact.provider = ctx.provider;
   fact.lane = ctx.lane_id;
   fact.sequence = ++ring.sequence;
-  fact.isr_entry_dwt_raw = isr_entry_dwt_raw;
-  fact.service_dwt_at_event = event_dwt;
-  fact.target_counter32 = target_counter32;
-  fact.target_low16 = target_low16;
-  fact.service_counter_low16 = isr_counter_low16;
-  fact.service_offset_ticks = service_offset_signed;
-  fact.service_offset_abs_ticks = service_offset_abs_ticks;
-  fact.interpreted_late_ticks = interpreted_late_ticks;
-  fact.early_ticks = early_ticks;
-  fact.target_delta_mod65536_ticks = (uint32_t)target_delta_mod65536;
-  fact.arm_remaining_ticks = arm_remaining_ticks;
-  fact.arm_to_isr_ticks = arm_to_isr_ticks;
-  fact.arm_to_isr_dwt_cycles = arm_to_isr_dwt_cycles;
-  fact.csctrl_entry = isr_csctrl_entry;
-  fact.csctrl_after_disable = isr_csctrl_after_program;
+  fact.isr_entry_dwt_raw = sample.isr_entry_dwt_raw;
+  fact.service_dwt_at_event = sample.event_dwt;
+  fact.target_counter32 = sample.target_counter32;
+  fact.target_low16 = sample.target_low16;
+  fact.service_counter_low16 = sample.service_counter_low16;
+  fact.service_offset_ticks = sample.service_offset_signed_ticks;
+  fact.service_offset_abs_ticks = sample.service_offset_abs_ticks;
+  fact.interpreted_late_ticks = sample.interpreted_late_ticks;
+  fact.early_ticks = sample.early_ticks;
+  fact.target_delta_mod65536_ticks = sample.target_delta_mod65536_ticks;
+  fact.arm_remaining_ticks = sample.arm_remaining_ticks;
+  fact.arm_to_isr_ticks = sample.arm_to_isr_ticks;
+  fact.arm_to_isr_dwt_cycles = sample.arm_to_isr_dwt_cycles;
+  fact.csctrl_entry = sample.isr_csctrl_entry;
+  fact.csctrl_after_disable = sample.isr_csctrl_after_program;
   fact.compare_flag_seen = true;
-  fact.compare_enabled_entry = (isr_csctrl_entry & TMR_CSCTRL_TCF1EN) != 0;
+  fact.compare_enabled_entry =
+      (sample.isr_csctrl_entry & TMR_CSCTRL_TCF1EN) != 0;
   fact.compare_flag_after_disable =
-      (isr_csctrl_after_program & TMR_CSCTRL_TCF1) != 0;
+      (sample.isr_csctrl_after_program & TMR_CSCTRL_TCF1) != 0;
   fact.compare_enabled_after_disable =
-      (isr_csctrl_after_program & TMR_CSCTRL_TCF1EN) != 0;
-  fact.had_armed = had_armed;
-  fact.had_active_rt = had_active_rt;
-  fact.one_second_due = one_second_due && had_active_rt;
-  fact.service_class = had_armed
-      ? (service_early ? OCXO_SERVICE_CLASS_EARLY_PRETARGET
-                       : OCXO_SERVICE_CLASS_ON_OR_AFTER_TARGET)
+      (sample.isr_csctrl_after_program & TMR_CSCTRL_TCF1EN) != 0;
+  fact.had_armed = sample.had_armed;
+  fact.had_active_rt = sample.had_active_rt;
+  fact.one_second_due = sample.one_second_due && sample.had_active_rt;
+  fact.service_class = sample.had_armed
+      ? (sample.service_was_early ? OCXO_SERVICE_CLASS_EARLY_PRETARGET
+                                  : OCXO_SERVICE_CLASS_ON_OR_AFTER_TARGET)
       : OCXO_SERVICE_CLASS_FALSE_IRQ;
   fact.exact_target_identity = true;
 
-  if (one_second_due) {
-    lane.witness_target_counter32 = target_counter32;
-    lane.witness_target_low16 = target_low16;
-  }
+  return fact;
+}
 
-  if (!ocxo_fact_ring_push_from_isr(kind, fact, rt)) {
+static void ocxo_cadence_update_one_second_witness(
+    ocxo_runtime_context_t& ctx,
+    const ocxo_cadence_isr_sample_t& sample) {
+  if (!sample.one_second_due) return;
+  ctx.lane->witness_target_counter32 = sample.target_counter32;
+  ctx.lane->witness_target_low16 = sample.target_low16;
+}
+
+static void ocxo_cadence_enqueue_fact(
+    ocxo_runtime_context_t& ctx,
+    const interrupt_perishable_fact_t& fact,
+    interrupt_subscriber_runtime_t* rt) {
+  ocxo_lane_t& lane = *ctx.lane;
+
+  if (!ocxo_fact_ring_push_from_isr(ctx.kind, fact, rt)) {
     // The ring reports the overflow.  Count the lane miss as well so the
     // existing lane report shows that a hardware event was not handed off.
     lane.miss_count++;
   }
 }
 
+static void ocxo_cadence_compare_isr(ocxo_runtime_context_t& ctx,
+                                     uint32_t isr_entry_dwt_raw) {
+  ocxo_lane_t& lane = *ctx.lane;
+
+  const uint32_t isr_csctrl_entry = lane.module->CH[lane.channel].CSCTRL;
+  if (!ocxo_cadence_classify_irq(ctx, isr_csctrl_entry)) return;
+
+  ocxo_cadence_isr_sample_t sample =
+      ocxo_cadence_capture_perishable_facts(ctx,
+                                            isr_entry_dwt_raw,
+                                            isr_csctrl_entry);
+  ocxo_cadence_acknowledge_and_timestamp(ctx, sample);
+  ocxo_cadence_update_synthetic_identity(ctx, sample);
+  ocxo_cadence_update_sample_phase(ctx, sample);
+
+  // Preserve the existing SmartZero custody rule: feed the sample before
+  // deciding whether the local cadence remains owned by SmartZero or by the
+  // normal active lane.
+  ocxo_cadence_feed_smartzero(ctx, sample);
+  ocxo_cadence_rearm_or_stop(ctx, sample);
+  ocxo_cadence_update_one_second_witness(ctx, sample);
+
+  interrupt_perishable_fact_t fact =
+      ocxo_cadence_build_perishable_fact(ctx, sample);
+  ocxo_cadence_enqueue_fact(ctx, fact, sample.rt);
+}
+
 static void qtimer2_isr(void) {
   const uint32_t isr_entry_dwt_raw = ARM_DWT_CYCCNT;  // SACRED: first instruction.
-  ocxo_witness_compare_isr(g_ocxo1_ctx, isr_entry_dwt_raw);
+  ocxo_cadence_compare_isr(g_ocxo1_ctx, isr_entry_dwt_raw);
 }
 
 static void qtimer3_isr(void) {
   const uint32_t isr_entry_dwt_raw = ARM_DWT_CYCCNT;  // SACRED: first instruction.
-  ocxo_witness_compare_isr(g_ocxo2_ctx, isr_entry_dwt_raw);
+  ocxo_cadence_compare_isr(g_ocxo2_ctx, isr_entry_dwt_raw);
 }
 
 // ============================================================================
