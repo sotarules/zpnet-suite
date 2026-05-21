@@ -1312,6 +1312,7 @@ struct ocxo_runtime_context_t {
   const char* cadence_source = nullptr;
   const char* counter_source = nullptr;
   const char* dwt_authority = nullptr;
+  const char* fact_drain_name = nullptr;
   ocxo_lane_t* lane = nullptr;
   synthetic_clock32_t* clock32 = nullptr;
   interrupt_subscriber_runtime_t** rt_slot = nullptr;
@@ -1327,6 +1328,7 @@ static ocxo_runtime_context_t g_ocxo1_ctx = {
   "QTIMER2_CH0_LOCAL_1KHZ_COMPARE",
   "QTIMER2_CH0_LOCAL_SYNTHETIC_COUNTER32",
   "QTIMER2_CH0_ISR_ENTRY_DWT",
+  "OCXO1_FACT_DRAIN",
   &g_ocxo1_lane,
   &g_ocxo1_clock32,
   &g_rt_ocxo1,
@@ -1342,6 +1344,7 @@ static ocxo_runtime_context_t g_ocxo2_ctx = {
   "QTIMER3_CH3_LOCAL_1KHZ_COMPARE",
   "QTIMER3_CH3_LOCAL_SYNTHETIC_COUNTER32",
   "QTIMER3_CH3_ISR_ENTRY_DWT",
+  "OCXO2_FACT_DRAIN",
   &g_ocxo2_lane,
   &g_ocxo2_clock32,
   &g_rt_ocxo2,
@@ -2693,19 +2696,25 @@ static ocxo_perishable_ring_t g_ocxo1_fact_ring = {};
 static ocxo_perishable_ring_t g_ocxo2_fact_ring = {};
 
 static ocxo_perishable_ring_t&
-ocxo_fact_ring_for(interrupt_subscriber_kind_t kind) {
-  return (kind == interrupt_subscriber_kind_t::OCXO1)
+ocxo_fact_ring_for(ocxo_runtime_context_t& ctx) {
+  return (ctx.kind == interrupt_subscriber_kind_t::OCXO1)
       ? g_ocxo1_fact_ring
       : g_ocxo2_fact_ring;
 }
 
-static const char* ocxo_fact_drain_name(interrupt_subscriber_kind_t kind) {
-  return (kind == interrupt_subscriber_kind_t::OCXO1)
-      ? "OCXO1_FACT_DRAIN"
-      : "OCXO2_FACT_DRAIN";
+static const ocxo_perishable_ring_t&
+ocxo_fact_ring_for(const ocxo_runtime_context_t& ctx) {
+  return (ctx.kind == interrupt_subscriber_kind_t::OCXO1)
+      ? g_ocxo1_fact_ring
+      : g_ocxo2_fact_ring;
 }
 
-static void ocxo_perishable_fact_ring_reset(ocxo_perishable_ring_t& r) {
+static const char* ocxo_fact_drain_name(const ocxo_runtime_context_t& ctx) {
+  return ctx.fact_drain_name ? ctx.fact_drain_name : ctx.name;
+}
+
+static void ocxo_fact_ring_reset(ocxo_runtime_context_t& ctx) {
+  ocxo_perishable_ring_t& r = ocxo_fact_ring_for(ctx);
   for (uint32_t i = 0; i < OCXO_PERISHABLE_FACT_RING_SIZE; i++) {
     r.facts[i] = interrupt_perishable_fact_t{};
   }
@@ -2734,14 +2743,13 @@ static int32_t dwt_cycles_for_ocxo_ticks_signed(int32_t ticks) {
   return (int32_t)(-(((-numerator) + denom / 2) / denom));
 }
 
-static bool ocxo_fact_ring_push_from_isr(interrupt_subscriber_kind_t kind,
-                                         const interrupt_perishable_fact_t& fact,
-                                         interrupt_subscriber_runtime_t* rt);
+static bool ocxo_fact_ring_push_from_isr(ocxo_runtime_context_t& ctx,
+                                         const interrupt_perishable_fact_t& fact);
 static void ocxo_fact_drain_callback(timepop_ctx_t*, timepop_diag_t*, void* user_data);
 
-static bool ocxo_fact_ring_pop(interrupt_subscriber_kind_t kind,
+static bool ocxo_fact_ring_pop(ocxo_runtime_context_t& ctx,
                                interrupt_perishable_fact_t& out) {
-  ocxo_perishable_ring_t& r = ocxo_fact_ring_for(kind);
+  ocxo_perishable_ring_t& r = ocxo_fact_ring_for(ctx);
 
   __disable_irq();
   if (r.count == 0) {
@@ -2761,11 +2769,10 @@ static bool ocxo_fact_ring_pop(interrupt_subscriber_kind_t kind,
   return true;
 }
 
-static bool ocxo_fact_ring_push_from_isr(interrupt_subscriber_kind_t kind,
-                                         const interrupt_perishable_fact_t& fact,
-                                         interrupt_subscriber_runtime_t* rt) {
-  ocxo_perishable_ring_t& r = ocxo_fact_ring_for(kind);
-  ocxo_lane_t* lane = ocxo_lane_for(kind);
+static bool ocxo_fact_ring_push_from_isr(ocxo_runtime_context_t& ctx,
+                                         const interrupt_perishable_fact_t& fact) {
+  ocxo_perishable_ring_t& r = ocxo_fact_ring_for(ctx);
+  ocxo_lane_t* lane = ctx.lane;
 
   if (r.count >= OCXO_PERISHABLE_FACT_RING_SIZE) {
     r.overflow_count++;
@@ -2793,7 +2800,7 @@ static bool ocxo_fact_ring_push_from_isr(interrupt_subscriber_kind_t kind,
     if (lane) lane->witness_fact_asap_arm_count = r.asap_arm_count;
 
     const timepop_handle_t h =
-        timepop_arm_asap(ocxo_fact_drain_callback, rt, ocxo_fact_drain_name(kind));
+        timepop_arm_asap(ocxo_fact_drain_callback, &ctx, ocxo_fact_drain_name(ctx));
     if (h == TIMEPOP_INVALID_HANDLE) {
       r.drain_armed = false;
       r.asap_fail_count++;
@@ -2872,18 +2879,18 @@ static void ocxo_qtimer_diag_record(ocxo_runtime_context_t& ctx,
 }
 
 static void ocxo_apply_perishable_fact_deferred(
-    const interrupt_perishable_fact_t& fact,
-    interrupt_subscriber_runtime_t* rt) {
-  ocxo_runtime_context_t* ctx = ocxo_context_for(fact.kind);
-  if (!ctx || !ctx->lane) return;
+    ocxo_runtime_context_t& ctx,
+    const interrupt_perishable_fact_t& fact) {
+  ocxo_lane_t* lane = ctx.lane;
+  if (!lane) return;
 
-  ocxo_lane_t* lane = ctx->lane;
+  interrupt_subscriber_runtime_t* rt = ocxo_runtime_for(ctx);
 
   // First-pass lane-local cadence user callback.  Regression will attach here;
   // for this migration pass it is intentionally a no-op with a visible count.
   lane->cadence_user_callback_count++;
 
-  ocxo_perishable_ring_t& ring = ocxo_fact_ring_for(fact.kind);
+  const ocxo_perishable_ring_t& ring = ocxo_fact_ring_for(ctx);
   lane->witness_fact_drain_count = ring.drain_count;
   lane->witness_fact_overflow_count = ring.overflow_count;
   lane->witness_fact_high_water = ring.high_water;
@@ -2937,7 +2944,7 @@ static void ocxo_apply_perishable_fact_deferred(
     lane->witness_on_or_after_service_count++;
   }
 
-  ocxo_qtimer_diag_record(*ctx,
+  ocxo_qtimer_diag_record(ctx,
                           fact.isr_entry_dwt_raw,
                           fact.service_dwt_at_event,
                           fact.target_delta_mod65536_ticks,
@@ -2995,14 +3002,13 @@ static void ocxo_apply_perishable_fact_deferred(
 static void ocxo_fact_drain_callback(timepop_ctx_t*,
                                      timepop_diag_t*,
                                      void* user_data) {
-  auto* rt = static_cast<interrupt_subscriber_runtime_t*>(user_data);
-  if (!rt || !rt->desc) return;
+  auto* ctx = static_cast<ocxo_runtime_context_t*>(user_data);
+  if (!ctx || !ctx->lane) return;
 
-  const interrupt_subscriber_kind_t kind = rt->desc->kind;
   for (;;) {
     interrupt_perishable_fact_t fact{};
-    if (!ocxo_fact_ring_pop(kind, fact)) break;
-    ocxo_apply_perishable_fact_deferred(fact, rt);
+    if (!ocxo_fact_ring_pop(*ctx, fact)) break;
+    ocxo_apply_perishable_fact_deferred(*ctx, fact);
   }
 }
 
@@ -3243,7 +3249,7 @@ static void ocxo_cadence_rearm_or_stop(
 static interrupt_perishable_fact_t ocxo_cadence_build_perishable_fact(
     ocxo_runtime_context_t& ctx,
     ocxo_cadence_isr_sample_t& sample) {
-  ocxo_perishable_ring_t& ring = ocxo_fact_ring_for(ctx.kind);
+  ocxo_perishable_ring_t& ring = ocxo_fact_ring_for(ctx);
 
   interrupt_perishable_fact_t fact{};
   fact.kind = ctx.kind;
@@ -3294,11 +3300,10 @@ static void ocxo_cadence_update_one_second_witness(
 
 static void ocxo_cadence_enqueue_fact(
     ocxo_runtime_context_t& ctx,
-    const interrupt_perishable_fact_t& fact,
-    interrupt_subscriber_runtime_t* rt) {
+    const interrupt_perishable_fact_t& fact) {
   ocxo_lane_t& lane = *ctx.lane;
 
-  if (!ocxo_fact_ring_push_from_isr(ctx.kind, fact, rt)) {
+  if (!ocxo_fact_ring_push_from_isr(ctx, fact)) {
     // The ring reports the overflow.  Count the lane miss as well so the
     // existing lane report shows that a hardware event was not handed off.
     lane.miss_count++;
@@ -3329,7 +3334,7 @@ static void ocxo_cadence_compare_isr(ocxo_runtime_context_t& ctx,
 
   interrupt_perishable_fact_t fact =
       ocxo_cadence_build_perishable_fact(ctx, sample);
-  ocxo_cadence_enqueue_fact(ctx, fact, sample.rt);
+  ocxo_cadence_enqueue_fact(ctx, fact);
 }
 
 static void qtimer2_isr(void) {
@@ -4129,8 +4134,8 @@ void process_interrupt_init(void) {
   g_cadence_minder_last_ocxo2_counter32 = 0;
   g_ocxo1_deferred = ocxo_deferred_work_t{};
   g_ocxo2_deferred = ocxo_deferred_work_t{};
-  ocxo_perishable_fact_ring_reset(g_ocxo1_fact_ring);
-  ocxo_perishable_fact_ring_reset(g_ocxo2_fact_ring);
+  ocxo_fact_ring_reset(g_ocxo1_ctx);
+  ocxo_fact_ring_reset(g_ocxo2_ctx);
 
   g_interrupt_runtime_ready = true;
   (void)cadence_minder_arm_timepop();
@@ -4829,7 +4834,7 @@ static void add_ocxo_lane_payload(Payload& p,
   const uint16_t csctrl = lane.module->CH[lane.channel].CSCTRL;
   const bool compare_enabled = (csctrl & TMR_CSCTRL_TCF1EN) != 0;
   const bool compare_flag = (csctrl & TMR_CSCTRL_TCF1) != 0;
-  ocxo_perishable_ring_t& ring = ocxo_fact_ring_for(ctx.kind);
+  const ocxo_perishable_ring_t& ring = ocxo_fact_ring_for(ctx);
   ocxo_deferred_work_t& deferred = (ctx.kind == interrupt_subscriber_kind_t::OCXO1)
       ? g_ocxo1_deferred
       : g_ocxo2_deferred;
@@ -4950,11 +4955,11 @@ static Payload cmd_report(const Payload&) {
   p.add("ocxo1_missed_target_count", g_ocxo1_lane.witness_missed_target_count);
   p.add("ocxo1_false_irq_count", g_ocxo1_lane.witness_false_irq_count);
   p.add("ocxo1_late_arm_count", g_ocxo1_lane.witness_late_arm_count);
-  p.add("ocxo1_fact_enqueue_count", g_ocxo1_fact_ring.enqueue_count);
-  p.add("ocxo1_fact_drain_count", g_ocxo1_fact_ring.drain_count);
-  p.add("ocxo1_fact_overflow_count", g_ocxo1_fact_ring.overflow_count);
-  p.add("ocxo1_fact_high_water", g_ocxo1_fact_ring.high_water);
-  p.add("ocxo1_fact_asap_fail_count", g_ocxo1_fact_ring.asap_fail_count);
+  p.add("ocxo1_fact_enqueue_count", ocxo_fact_ring_for(g_ocxo1_ctx).enqueue_count);
+  p.add("ocxo1_fact_drain_count", ocxo_fact_ring_for(g_ocxo1_ctx).drain_count);
+  p.add("ocxo1_fact_overflow_count", ocxo_fact_ring_for(g_ocxo1_ctx).overflow_count);
+  p.add("ocxo1_fact_high_water", ocxo_fact_ring_for(g_ocxo1_ctx).high_water);
+  p.add("ocxo1_fact_asap_fail_count", ocxo_fact_ring_for(g_ocxo1_ctx).asap_fail_count);
 
   p.add("ocxo2_event_count", g_rt_ocxo2 ? g_rt_ocxo2->event_count : 0U);
   p.add("ocxo2_dispatch_count", g_rt_ocxo2 ? g_rt_ocxo2->dispatch_count : 0U);
@@ -4973,11 +4978,11 @@ static Payload cmd_report(const Payload&) {
   p.add("ocxo2_missed_target_count", g_ocxo2_lane.witness_missed_target_count);
   p.add("ocxo2_false_irq_count", g_ocxo2_lane.witness_false_irq_count);
   p.add("ocxo2_late_arm_count", g_ocxo2_lane.witness_late_arm_count);
-  p.add("ocxo2_fact_enqueue_count", g_ocxo2_fact_ring.enqueue_count);
-  p.add("ocxo2_fact_drain_count", g_ocxo2_fact_ring.drain_count);
-  p.add("ocxo2_fact_overflow_count", g_ocxo2_fact_ring.overflow_count);
-  p.add("ocxo2_fact_high_water", g_ocxo2_fact_ring.high_water);
-  p.add("ocxo2_fact_asap_fail_count", g_ocxo2_fact_ring.asap_fail_count);
+  p.add("ocxo2_fact_enqueue_count", ocxo_fact_ring_for(g_ocxo2_ctx).enqueue_count);
+  p.add("ocxo2_fact_drain_count", ocxo_fact_ring_for(g_ocxo2_ctx).drain_count);
+  p.add("ocxo2_fact_overflow_count", ocxo_fact_ring_for(g_ocxo2_ctx).overflow_count);
+  p.add("ocxo2_fact_high_water", ocxo_fact_ring_for(g_ocxo2_ctx).high_water);
+  p.add("ocxo2_fact_asap_fail_count", ocxo_fact_ring_for(g_ocxo2_ctx).asap_fail_count);
 
   p.add("ocxo_deferred_asap_overwrite_count", g_ocxo_deferred_asap_overwrite_count);
   p.add("ocxo_deferred_edge_count", g_ocxo_deferred_edge_count);
@@ -5063,12 +5068,13 @@ static void add_lane_summary_object(Payload& parent,
 
 static void add_ocxo_lane_summary_object(Payload& parent,
                                          const char* key,
-                                         const char* name,
-                                         const interrupt_subscriber_runtime_t* rt,
-                                         const ocxo_lane_t& lane,
-                                         const ocxo_perishable_ring_t& ring) {
+                                         const ocxo_runtime_context_t& ctx) {
+  const interrupt_subscriber_runtime_t* rt = ocxo_runtime_for(ctx);
+  const ocxo_lane_t& lane = *ctx.lane;
+  const ocxo_perishable_ring_t& ring = ocxo_fact_ring_for(ctx);
+
   Payload o;
-  o.add("lane", name);
+  o.add("lane", ctx.name);
   o.add("subscribed", rt ? rt->subscribed : false);
   o.add("active", rt ? rt->active : false);
   o.add("has_fired", rt ? rt->has_fired : false);
@@ -5135,17 +5141,11 @@ static Payload cmd_report_lanes(const Payload&) {
 
   add_ocxo_lane_summary_object(p,
                                "ocxo1",
-                               "OCXO1",
-                               g_rt_ocxo1,
-                               g_ocxo1_lane,
-                               g_ocxo1_fact_ring);
+                               g_ocxo1_ctx);
 
   add_ocxo_lane_summary_object(p,
                                "ocxo2",
-                               "OCXO2",
-                               g_rt_ocxo2,
-                               g_ocxo2_lane,
-                               g_ocxo2_fact_ring);
+                               g_ocxo2_ctx);
 
   return p;
 }
