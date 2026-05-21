@@ -8,6 +8,10 @@
 // mirror.  No slot staging, no installed event wrappers, no late hardware
 // reads masquerading as event truth.
 //
+// OCXO events carry an additional diagnostic service-corrected DWT endpoint.
+// Alpha promotes that corrected endpoint for OCXO physics-facing interval math
+// while preserving the interrupt-authored event identity and correction audit.
+//
 // PPS is a selector/witness. process_interrupt authors the selected PPS/VCLOCK
 // edge identity, while the physical PPS/GPIO DWT witness supplies the smooth
 // one-second DWT/GNSS slope. VCLOCK/OCXO callbacks own per-edge clock
@@ -994,6 +998,10 @@ static void alpha_forensics_publish(time_clock_id_t clock_id,
 
   s->valid = true;
   s->update_count++;
+  // Alpha-facing event DWT.  For OCXO lanes this may be the promoted
+  // service-corrected endpoint; the original ISR-serviced endpoint remains
+  // reconstructable from diag_service_corrected_dwt_at_event plus
+  // diag_service_correction_cycles.
   s->last_event_dwt = event.dwt_at_event;
   s->last_event_counter32 = event.counter32_at_event;
   s->zero_offset_valid = zero_offset_valid;
@@ -1701,6 +1709,22 @@ bool clocks_alpha_epoch_initialized(void) { return g_epoch_initialized && !g_alp
 // Direct event application
 // ============================================================================
 
+static inline bool alpha_clock_is_ocxo(time_clock_id_t clock) {
+  return clock == time_clock_id_t::OCXO1 ||
+         clock == time_clock_id_t::OCXO2;
+}
+
+static uint32_t alpha_physics_dwt_at_event(time_clock_id_t clock,
+                                           const interrupt_event_t& event,
+                                           const interrupt_capture_diag_t* diag) {
+  if (alpha_clock_is_ocxo(clock) && diag &&
+      diag->ocxo_service_corrected_dwt_at_event != 0) {
+    return diag->ocxo_service_corrected_dwt_at_event;
+  }
+
+  return event.dwt_at_event;
+}
+
 static void clocks_apply_epoch_counter_edge(clock_state_t& clock,
                                             clock_measurement_t& meas,
                                             const interrupt_event_t& event,
@@ -1727,14 +1751,16 @@ static void clocks_apply_epoch_counter_edge(clock_state_t& clock,
     return;
   }
 
-  const bool is_ocxo =
-      (time_clock == time_clock_id_t::OCXO1 ||
-       time_clock == time_clock_id_t::OCXO2);
+  const bool is_ocxo = alpha_clock_is_ocxo(time_clock);
+  interrupt_event_t applied_event = event;
+  applied_event.dwt_at_event =
+      alpha_physics_dwt_at_event(time_clock, event, diag);
+
   const bool had_previous = (meas.prev_dwt_at_edge != 0);
 
   uint64_t ns_now = counter_ns_now;
   uint32_t dwt_cycles_between_edges = had_previous
-      ? (event.dwt_at_event - meas.prev_dwt_at_edge)
+      ? (applied_event.dwt_at_event - meas.prev_dwt_at_edge)
       : 0U;
   uint64_t gnss_ns_between_edges = 0;
   int64_t second_residual_ns = 0;
@@ -1745,7 +1771,7 @@ static void clocks_apply_epoch_counter_edge(clock_state_t& clock,
     uint64_t real_interval_ns = 0;
     int64_t residual_fast_ns = 0;
     ns_now = alpha_ocxo_apply_measured_second(time_clock,
-                                              event.dwt_at_event,
+                                              applied_event.dwt_at_event,
                                               &measured_dwt_cycles,
                                               &real_interval_ns,
                                               &residual_fast_ns);
@@ -1768,7 +1794,7 @@ static void clocks_apply_epoch_counter_edge(clock_state_t& clock,
     }
   }
 
-  (void)time_clock_update(time_clock, event.dwt_at_event, ns_now);
+  (void)time_clock_update(time_clock, applied_event.dwt_at_event, ns_now);
 
   clock.ledger_ns_count_at_edge = ns_now;
   clock.ledger_ns_count_at_pps_vclock = ns_now;
@@ -1781,7 +1807,7 @@ static void clocks_apply_epoch_counter_edge(clock_state_t& clock,
   clock.zero_established = true;
   clock.window_error_ns = window_error_ns;
 
-  meas.dwt_at_edge = event.dwt_at_event;
+  meas.dwt_at_edge = applied_event.dwt_at_event;
   if (!had_previous) {
     meas.gnss_ns_between_edges = 0;
     meas.dwt_cycles_between_edges = 0;
@@ -1800,13 +1826,13 @@ static void clocks_apply_epoch_counter_edge(clock_state_t& clock,
   // measured GNSS-elapsed ledger because process_interrupt may not carry a
   // direct GNSS timestamp in the event.
   meas.prev_gnss_ns_at_edge = reference_gnss_ns_at_edge;
-  meas.prev_dwt_at_edge = event.dwt_at_event;
+  meas.prev_dwt_at_edge = applied_event.dwt_at_event;
 
   if (had_previous && dwt_cycles_between_edges != 0) {
     alpha_static_prediction_record(time_clock, dwt_cycles_between_edges);
   }
 
-  alpha_forensics_publish(time_clock, clock, meas, event, diag,
+  alpha_forensics_publish(time_clock, clock, meas, applied_event, diag,
                           alpha_zero_offset_valid(time_clock),
                           zero_offset_counter32,
                           counter32_delta_since_zero_offset,

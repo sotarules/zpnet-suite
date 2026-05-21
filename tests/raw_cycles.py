@@ -5,7 +5,7 @@ Reads TIMEBASE rows for a campaign and prints a compact one-second DWT-cycle
 audit for four rails:
 
   • PPS    — static prediction audit: previous physical PPS DWT interval
-  • VCLOCK — static prediction audit: previous VCLOCK/QTimer interval
+  • VCLOCK — static prediction audit + VCLOCK Alpha-forensics/counter identity
   • OCXO1  — static prediction audit + OCXO compare-service forensics
   • OCXO2  — static prediction audit + OCXO compare-service forensics
 
@@ -30,9 +30,16 @@ captured at the actual compare target or after ISR service latency:
   cls    = service class: OK=on/after target, ERLY=early/pre-target, FIRQ=false IRQ
   cdelta = Alpha-forensics counter32 delta since previous event
 
-A flat cdelta of 10,000,000 proves the OCXO synthetic target ladder is intact.
-Residual excursions with changing svc/svcΔ point at service-latency variation
-rather than oscillator physics.
+A flat cdelta of 10,000,000 proves the synthetic target ladder is intact.
+For VCLOCK, v_cΔ distinguishes a missing/bookend-skipped event (20,000,000)
+from a DWT/ledger/reporting anomaly (10,000,000 with an ugly DWT interval).
+
+For OCXO lanes, raw_cycles also emulates the Alpha change we intend to make:
+it reads ocxo*_forensics_service_corrected_dwt_at_event, computes corrected
+DWT intervals from those endpoints, and then runs the same static residual
+math against the corrected intervals.  The o*_c_res columns are therefore the
+"what Alpha would have seen" residuals if service-corrected endpoints were
+promoted to the physics-facing OCXO interval surface.
 
 Usage:
     python -m zpnet.tests.raw_cycles <campaign_name> [limit]
@@ -333,6 +340,46 @@ def ocxo_forensic_counter32_delta_from_schema(root: Dict[str, Any],
     )
 
 
+
+def ocxo_service_corrected_dwt_from_schema(root: Dict[str, Any],
+                                           frag: Dict[str, Any],
+                                           lane: str) -> Optional[int]:
+    prefix = f"{lane}_forensics_"
+    return _first_int(
+        frag.get(prefix + "service_corrected_dwt_at_event"),
+        root.get(prefix + "service_corrected_dwt_at_event"),
+        _nested_get(frag, "clock_forensics", lane, "alpha_event",
+                    "ocxo_service", "corrected_dwt_at_event"),
+        _nested_get(root, "clock_forensics", lane, "alpha_event",
+                    "ocxo_service", "corrected_dwt_at_event"),
+        _nested_get(frag, "clock_forensics", lane, "ocxo_service",
+                    "corrected_dwt_at_event"),
+        _nested_get(root, "clock_forensics", lane, "ocxo_service",
+                    "corrected_dwt_at_event"),
+    )
+
+
+def corrected_residual(current_corrected_actual: Optional[int],
+                       previous_corrected_actual: Optional[int]) -> Optional[int]:
+    if current_corrected_actual is None or previous_corrected_actual is None:
+        return None
+    return current_corrected_actual - previous_corrected_actual
+
+
+def vclock_counter32_at_event_from_schema(root: Dict[str, Any],
+                                         frag: Dict[str, Any]) -> Optional[int]:
+    return _first_int(
+        frag.get("vclock_forensics_last_event_counter32"),
+        root.get("vclock_forensics_last_event_counter32"),
+        frag.get("counter32_at_pps_vclock"),
+        root.get("counter32_at_pps_vclock"),
+        _nested_get(frag, "clock_forensics", "vclock", "alpha_event",
+                    "last_event_counter32"),
+        _nested_get(root, "clock_forensics", "vclock", "alpha_event",
+                    "last_event_counter32"),
+    )
+
+
 def ocxo_service_diag_from_schema(root: Dict[str, Any],
                                   frag: Dict[str, Any],
                                   lane: str) -> Dict[str, Optional[int]]:
@@ -425,16 +472,19 @@ def analyze(campaign: str, limit: int = 0) -> None:
     print("  act/pred/res are firmware static prediction surfaces: residual = actual - prior actual.")
     print("  OCXO svc is signed compare-service offset in OCXO ticks: negative=early, positive=late.")
     print("  OCXO svcΔ is the row-to-row change in that signed service offset.")
+    print("  v_cΔ is VCLOCK counter32 delta; 10,000,000 is normal, 20,000,000 means a skipped bookend.")
+    print("  v_fΔ is VCLOCK forensic-DWT interval minus firmware v_act; nonzero means schema disagreement.")
+    print("  o*_c_res emulates Alpha using service-corrected OCXO DWT endpoints.")
     print("  OCXO cΔ should be flat 10,000,000; deviations indicate target-identity/counter-ladder trouble.")
     print()
 
     header = (
         f"{'pps':>6s}  "
         f"{'p_act':>13s} {'p_pred':>13s} {'p_res':>8s}  "
-        f"{'v_act':>13s} {'v_pred':>13s} {'v_res':>8s} {'phase':>5s}  "
-        f"{'o1_act':>13s} {'o1_pred':>13s} {'o1_res':>8s} "
+        f"{'v_act':>13s} {'v_pred':>13s} {'v_res':>8s} {'phase':>5s} {'v_cΔ':>11s} {'v_fΔ':>8s}  "
+        f"{'o1_act':>13s} {'o1_pred':>13s} {'o1_res':>8s} {'o1_c_res':>9s} "
         f"{'o1_svc':>7s} {'o1_sΔ':>7s} {'o1_late':>7s} {'o1_early':>8s} {'o1_cls':>5s} {'o1_cΔ':>11s}  "
-        f"{'o2_act':>13s} {'o2_pred':>13s} {'o2_res':>8s} "
+        f"{'o2_act':>13s} {'o2_pred':>13s} {'o2_res':>8s} {'o2_c_res':>9s} "
         f"{'o2_svc':>7s} {'o2_sΔ':>7s} {'o2_late':>7s} {'o2_early':>8s} {'o2_cls':>5s} {'o2_cΔ':>11s}  "
         f"{'dwt_ppb':>10s}"
     )
@@ -442,10 +492,10 @@ def analyze(campaign: str, limit: int = 0) -> None:
     print(
         f"{'─'*6}  "
         f"{'─'*13} {'─'*13} {'─'*8}  "
-        f"{'─'*13} {'─'*13} {'─'*8} {'─'*5}  "
-        f"{'─'*13} {'─'*13} {'─'*8} "
+        f"{'─'*13} {'─'*13} {'─'*8} {'─'*5} {'─'*11} {'─'*8}  "
+        f"{'─'*13} {'─'*13} {'─'*8} {'─'*9} "
         f"{'─'*7} {'─'*7} {'─'*7} {'─'*8} {'─'*5} {'─'*11}  "
-        f"{'─'*13} {'─'*13} {'─'*8} "
+        f"{'─'*13} {'─'*13} {'─'*8} {'─'*9} "
         f"{'─'*7} {'─'*7} {'─'*7} {'─'*8} {'─'*5} {'─'*11}  "
         f"{'─'*10}"
     )
@@ -456,8 +506,14 @@ def analyze(campaign: str, limit: int = 0) -> None:
     prev_pps_count: Optional[int] = None
     prev_physical_pps_dwt: Optional[int] = None
     prev_vclock_dwt: Optional[int] = None
+    prev_vclock_forensic_dwt: Optional[int] = None
+    prev_vclock_counter32: Optional[int] = None
     prev_ocxo1_forensic_dwt: Optional[int] = None
     prev_ocxo2_forensic_dwt: Optional[int] = None
+    prev_ocxo1_corrected_dwt: Optional[int] = None
+    prev_ocxo2_corrected_dwt: Optional[int] = None
+    prev_o1_corrected_actual: Optional[int] = None
+    prev_o2_corrected_actual: Optional[int] = None
     prev_o1_service: Optional[int] = None
     prev_o2_service: Optional[int] = None
 
@@ -467,9 +523,14 @@ def analyze(campaign: str, limit: int = 0) -> None:
         "phase": Welford(),
         "vclock_actual": Welford(),
         "vclock_residual": Welford(),
+        "vclock_forensic_delta": Welford(),
+        "vclock_counter32_delta": Welford(),
         "ocxo1_actual": Welford(),
         "ocxo1_residual": Welford(),
         "ocxo1_forensic_delta": Welford(),
+        "ocxo1_corrected_actual": Welford(),
+        "ocxo1_corrected_residual": Welford(),
+        "ocxo1_residual_collapse": Welford(),
         "ocxo1_counter32_delta": Welford(),
         "ocxo1_service_offset": Welford(),
         "ocxo1_service_delta": Welford(),
@@ -479,6 +540,9 @@ def analyze(campaign: str, limit: int = 0) -> None:
         "ocxo2_actual": Welford(),
         "ocxo2_residual": Welford(),
         "ocxo2_forensic_delta": Welford(),
+        "ocxo2_corrected_actual": Welford(),
+        "ocxo2_corrected_residual": Welford(),
+        "ocxo2_residual_collapse": Welford(),
         "ocxo2_counter32_delta": Welford(),
         "ocxo2_service_offset": Welford(),
         "ocxo2_service_delta": Welford(),
@@ -489,12 +553,16 @@ def analyze(campaign: str, limit: int = 0) -> None:
 
     coverage = {
         "rows": 0,
+        "vclock_forensic_delta": 0,
+        "vclock_counter32_delta": 0,
         "ocxo1_service": 0,
         "ocxo2_service": 0,
         "ocxo1_counter32_delta": 0,
         "ocxo2_counter32_delta": 0,
         "ocxo1_forensic_delta": 0,
         "ocxo2_forensic_delta": 0,
+        "ocxo1_corrected_residual": 0,
+        "ocxo2_corrected_residual": 0,
     }
 
     service_class_counts = {
@@ -503,6 +571,7 @@ def analyze(campaign: str, limit: int = 0) -> None:
     }
 
     excursions: List[Dict[str, Any]] = []
+    vclock_excursions: List[Dict[str, Any]] = []
 
     for rec in rows:
         root = _root(rec)
@@ -522,8 +591,14 @@ def analyze(campaign: str, limit: int = 0) -> None:
             print(f"{'':>6s}  --- gap {prev_pps_count:,} → {pps_count:,} ---")
             prev_physical_pps_dwt = None
             prev_vclock_dwt = None
+            prev_vclock_forensic_dwt = None
+            prev_vclock_counter32 = None
             prev_ocxo1_forensic_dwt = None
             prev_ocxo2_forensic_dwt = None
+            prev_ocxo1_corrected_dwt = None
+            prev_ocxo2_corrected_dwt = None
+            prev_o1_corrected_actual = None
+            prev_o2_corrected_actual = None
             prev_o1_service = None
             prev_o2_service = None
 
@@ -545,8 +620,48 @@ def analyze(campaign: str, limit: int = 0) -> None:
         if v_actual is None and vclock_dwt is not None and prev_vclock_dwt is not None:
             v_actual = _delta_u32(vclock_dwt, prev_vclock_dwt)
 
+        vclock_forensic_dwt = ocxo_forensic_last_event_dwt_from_schema(root, frag, "vclock")
+        vclock_event_counter32 = vclock_counter32_at_event_from_schema(root, frag)
+
+        v_forensic_actual: Optional[int] = None
+        if vclock_forensic_dwt is not None and prev_vclock_forensic_dwt is not None:
+            v_forensic_actual = _delta_u32(vclock_forensic_dwt, prev_vclock_forensic_dwt)
+        v_forensic_delta = (
+            v_forensic_actual - v_actual
+            if v_forensic_actual is not None and v_actual is not None
+            else None
+        )
+
+        v_cdelta = ocxo_forensic_counter32_delta_from_schema(root, frag, "vclock")
+        if (v_cdelta is None and
+            vclock_event_counter32 is not None and
+            prev_vclock_counter32 is not None):
+            v_cdelta = _delta_u32(vclock_event_counter32, prev_vclock_counter32)
+
         o1_forensic_dwt = ocxo_forensic_last_event_dwt_from_schema(root, frag, "ocxo1")
         o2_forensic_dwt = ocxo_forensic_last_event_dwt_from_schema(root, frag, "ocxo2")
+        o1_corrected_dwt = ocxo_service_corrected_dwt_from_schema(root, frag, "ocxo1")
+        o2_corrected_dwt = ocxo_service_corrected_dwt_from_schema(root, frag, "ocxo2")
+
+        o1_corrected_actual: Optional[int] = None
+        if o1_corrected_dwt is not None and prev_ocxo1_corrected_dwt is not None:
+            o1_corrected_actual = _delta_u32(o1_corrected_dwt, prev_ocxo1_corrected_dwt)
+        o1_corrected_res = corrected_residual(o1_corrected_actual, prev_o1_corrected_actual)
+        o1_residual_collapse = (
+            abs(o1_res) - abs(o1_corrected_res)
+            if o1_res is not None and o1_corrected_res is not None
+            else None
+        )
+
+        o2_corrected_actual: Optional[int] = None
+        if o2_corrected_dwt is not None and prev_ocxo2_corrected_dwt is not None:
+            o2_corrected_actual = _delta_u32(o2_corrected_dwt, prev_ocxo2_corrected_dwt)
+        o2_corrected_res = corrected_residual(o2_corrected_actual, prev_o2_corrected_actual)
+        o2_residual_collapse = (
+            abs(o2_res) - abs(o2_corrected_res)
+            if o2_res is not None and o2_corrected_res is not None
+            else None
+        )
 
         o1_forensic_actual: Optional[int] = None
         if o1_forensic_dwt is not None and prev_ocxo1_forensic_dwt is not None:
@@ -595,6 +710,10 @@ def analyze(campaign: str, limit: int = 0) -> None:
         dwt_ppb = _as_float(frag.get("dwt_ppb"))
 
         coverage["rows"] += 1
+        if v_cdelta is not None:
+            coverage["vclock_counter32_delta"] += 1
+        if v_forensic_delta is not None:
+            coverage["vclock_forensic_delta"] += 1
         if o1_svc is not None:
             coverage["ocxo1_service"] += 1
         if o2_svc is not None:
@@ -607,15 +726,24 @@ def analyze(campaign: str, limit: int = 0) -> None:
             coverage["ocxo1_forensic_delta"] += 1
         if o2_forensic_delta is not None:
             coverage["ocxo2_forensic_delta"] += 1
+        if o1_corrected_res is not None:
+            coverage["ocxo1_corrected_residual"] += 1
+        if o2_corrected_res is not None:
+            coverage["ocxo2_corrected_residual"] += 1
 
         add_optional(stats["pps_actual"], pps_actual)
         add_optional(stats["pps_residual"], pps_res)
         add_optional(stats["phase"], pps_phase)
         add_optional(stats["vclock_actual"], v_actual)
         add_optional(stats["vclock_residual"], v_res)
+        add_optional(stats["vclock_forensic_delta"], v_forensic_delta)
+        add_optional(stats["vclock_counter32_delta"], v_cdelta)
         add_optional(stats["ocxo1_actual"], o1_actual)
         add_optional(stats["ocxo1_residual"], o1_res)
         add_optional(stats["ocxo1_forensic_delta"], o1_forensic_delta)
+        add_optional(stats["ocxo1_corrected_actual"], o1_corrected_actual)
+        add_optional(stats["ocxo1_corrected_residual"], o1_corrected_res)
+        add_optional(stats["ocxo1_residual_collapse"], o1_residual_collapse)
         add_optional(stats["ocxo1_counter32_delta"], o1_cdelta)
         add_optional(stats["ocxo1_service_offset"], o1_svc)
         add_optional(stats["ocxo1_service_delta"], o1_svc_delta)
@@ -626,6 +754,9 @@ def analyze(campaign: str, limit: int = 0) -> None:
         add_optional(stats["ocxo2_actual"], o2_actual)
         add_optional(stats["ocxo2_residual"], o2_res)
         add_optional(stats["ocxo2_forensic_delta"], o2_forensic_delta)
+        add_optional(stats["ocxo2_corrected_actual"], o2_corrected_actual)
+        add_optional(stats["ocxo2_corrected_residual"], o2_corrected_res)
+        add_optional(stats["ocxo2_residual_collapse"], o2_residual_collapse)
         add_optional(stats["ocxo2_counter32_delta"], o2_cdelta)
         add_optional(stats["ocxo2_service_offset"], o2_svc)
         add_optional(stats["ocxo2_service_delta"], o2_svc_delta)
@@ -634,12 +765,28 @@ def analyze(campaign: str, limit: int = 0) -> None:
         if o2_diag["arm_to_isr"] is not None and o2_diag["arm_remaining"] is not None:
             add_optional(stats["ocxo2_arm_error"], o2_diag["arm_to_isr"] - o2_diag["arm_remaining"])
 
+        if v_res is not None and abs(v_res) >= EXCURSION_THRESHOLD_CYCLES:
+            vclock_excursions.append({
+                "pps": pps_count,
+                "v_res": v_res,
+                "v_act": v_actual,
+                "v_pred": v_pred,
+                "v_cdelta": v_cdelta,
+                "v_forensic_delta": v_forensic_delta,
+                "v_forensic_actual": v_forensic_actual,
+                "phase": pps_phase,
+                "p_res": pps_res,
+            })
+
         if (o1_res is not None and abs(o1_res) >= EXCURSION_THRESHOLD_CYCLES) or (
             o2_res is not None and abs(o2_res) >= EXCURSION_THRESHOLD_CYCLES
         ):
             excursions.append({
                 "pps": pps_count,
                 "o1_res": o1_res,
+                "o1_cres": o1_corrected_res,
+                "o1_cact": o1_corrected_actual,
+                "o1_collapse": o1_residual_collapse,
                 "o1_act": o1_actual,
                 "o1_pred": o1_pred,
                 "o1_svc": o1_svc,
@@ -650,6 +797,9 @@ def analyze(campaign: str, limit: int = 0) -> None:
                 "o1_isr": o1_diag["arm_to_isr"],
                 "o1_cls": o1_class,
                 "o2_res": o2_res,
+                "o2_cres": o2_corrected_res,
+                "o2_cact": o2_corrected_actual,
+                "o2_collapse": o2_residual_collapse,
                 "o2_act": o2_actual,
                 "o2_pred": o2_pred,
                 "o2_svc": o2_svc,
@@ -666,12 +816,13 @@ def analyze(campaign: str, limit: int = 0) -> None:
         print(
             f"{pps_count:>6d}  "
             f"{_fmt_int(pps_actual, 13)} {_fmt_int(pps_pred, 13)} {_fmt_int(pps_res, 8, signed=True)}  "
-            f"{_fmt_int(v_actual, 13)} {_fmt_int(v_pred, 13)} {_fmt_int(v_res, 8, signed=True)} {_fmt_int(pps_phase, 5)}  "
-            f"{_fmt_int(o1_actual, 13)} {_fmt_int(o1_pred, 13)} {_fmt_int(o1_res, 8, signed=True)} "
+            f"{_fmt_int(v_actual, 13)} {_fmt_int(v_pred, 13)} {_fmt_int(v_res, 8, signed=True)} {_fmt_int(pps_phase, 5)} "
+            f"{_fmt_int(v_cdelta, 11)} {_fmt_int(v_forensic_delta, 8, signed=True)}  "
+            f"{_fmt_int(o1_actual, 13)} {_fmt_int(o1_pred, 13)} {_fmt_int(o1_res, 8, signed=True)} {_fmt_int(o1_corrected_res, 9, signed=True)} "
             f"{_fmt_int(o1_svc, 7, signed=True)} {_fmt_int(o1_svc_delta, 7, signed=True)} "
             f"{_fmt_int(o1_diag['late'], 7)} {_fmt_int(o1_diag['early'], 8)} {_fmt_str(o1_class, 5)} "
             f"{_fmt_int(o1_cdelta, 11)}  "
-            f"{_fmt_int(o2_actual, 13)} {_fmt_int(o2_pred, 13)} {_fmt_int(o2_res, 8, signed=True)} "
+            f"{_fmt_int(o2_actual, 13)} {_fmt_int(o2_pred, 13)} {_fmt_int(o2_res, 8, signed=True)} {_fmt_int(o2_corrected_res, 9, signed=True)} "
             f"{_fmt_int(o2_svc, 7, signed=True)} {_fmt_int(o2_svc_delta, 7, signed=True)} "
             f"{_fmt_int(o2_diag['late'], 7)} {_fmt_int(o2_diag['early'], 8)} {_fmt_str(o2_class, 5)} "
             f"{_fmt_int(o2_cdelta, 11)}  "
@@ -683,10 +834,22 @@ def analyze(campaign: str, limit: int = 0) -> None:
             prev_physical_pps_dwt = physical_pps_dwt
         if vclock_dwt is not None:
             prev_vclock_dwt = vclock_dwt
+        if vclock_forensic_dwt is not None:
+            prev_vclock_forensic_dwt = vclock_forensic_dwt
+        if vclock_event_counter32 is not None:
+            prev_vclock_counter32 = vclock_event_counter32
         if o1_forensic_dwt is not None:
             prev_ocxo1_forensic_dwt = o1_forensic_dwt
         if o2_forensic_dwt is not None:
             prev_ocxo2_forensic_dwt = o2_forensic_dwt
+        if o1_corrected_dwt is not None:
+            prev_ocxo1_corrected_dwt = o1_corrected_dwt
+        if o2_corrected_dwt is not None:
+            prev_ocxo2_corrected_dwt = o2_corrected_dwt
+        if o1_corrected_actual is not None:
+            prev_o1_corrected_actual = o1_corrected_actual
+        if o2_corrected_actual is not None:
+            prev_o2_corrected_actual = o2_corrected_actual
         if o1_svc is not None:
             prev_o1_service = o1_svc
         if o2_svc is not None:
@@ -704,10 +867,14 @@ def analyze(campaign: str, limit: int = 0) -> None:
     print("Schema coverage")
     print("═══════════════")
     print(f"  rows                         = {coverage['rows']:,}")
+    print(f"  VCLOCK forensic delta rows    = {coverage['vclock_forensic_delta']:,}")
+    print(f"  VCLOCK counter32 delta rows   = {coverage['vclock_counter32_delta']:,}")
     print(f"  OCXO1 service diag rows       = {coverage['ocxo1_service']:,}")
     print(f"  OCXO2 service diag rows       = {coverage['ocxo2_service']:,}")
     print(f"  OCXO1 forensic delta rows     = {coverage['ocxo1_forensic_delta']:,}")
     print(f"  OCXO2 forensic delta rows     = {coverage['ocxo2_forensic_delta']:,}")
+    print(f"  OCXO1 corrected residual rows = {coverage['ocxo1_corrected_residual']:,}")
+    print(f"  OCXO2 corrected residual rows = {coverage['ocxo2_corrected_residual']:,}")
     print(f"  OCXO1 counter32 delta rows    = {coverage['ocxo1_counter32_delta']:,}")
     print(f"  OCXO2 counter32 delta rows    = {coverage['ocxo2_counter32_delta']:,}")
     print(f"  OCXO1 service classes         = {service_class_counts['ocxo1']}")
@@ -721,9 +888,14 @@ def analyze(campaign: str, limit: int = 0) -> None:
     _print_welford("PPS→VCLOCK phase offset", stats["phase"])
     _print_welford("VCLOCK actual cycles", stats["vclock_actual"])
     _print_welford("VCLOCK static residual", stats["vclock_residual"])
+    _print_welford("VCLOCK forensic delta", stats["vclock_forensic_delta"])
+    _print_welford("VCLOCK counter32 delta", stats["vclock_counter32_delta"], unit="ticks")
     _print_welford("OCXO1 actual cycles", stats["ocxo1_actual"])
     _print_welford("OCXO1 static residual", stats["ocxo1_residual"])
     _print_welford("OCXO1 forensic delta", stats["ocxo1_forensic_delta"])
+    _print_welford("OCXO1 corrected actual cycles", stats["ocxo1_corrected_actual"])
+    _print_welford("OCXO1 corrected residual", stats["ocxo1_corrected_residual"])
+    _print_welford("OCXO1 residual |collapse|", stats["ocxo1_residual_collapse"])
     _print_welford("OCXO1 counter32 delta", stats["ocxo1_counter32_delta"], unit="ticks")
     _print_welford("OCXO1 service offset", stats["ocxo1_service_offset"], unit="ticks")
     _print_welford("OCXO1 service offset delta", stats["ocxo1_service_delta"], unit="ticks")
@@ -733,6 +905,9 @@ def analyze(campaign: str, limit: int = 0) -> None:
     _print_welford("OCXO2 actual cycles", stats["ocxo2_actual"])
     _print_welford("OCXO2 static residual", stats["ocxo2_residual"])
     _print_welford("OCXO2 forensic delta", stats["ocxo2_forensic_delta"])
+    _print_welford("OCXO2 corrected actual cycles", stats["ocxo2_corrected_actual"])
+    _print_welford("OCXO2 corrected residual", stats["ocxo2_corrected_residual"])
+    _print_welford("OCXO2 residual |collapse|", stats["ocxo2_residual_collapse"])
     _print_welford("OCXO2 counter32 delta", stats["ocxo2_counter32_delta"], unit="ticks")
     _print_welford("OCXO2 service offset", stats["ocxo2_service_offset"], unit="ticks")
     _print_welford("OCXO2 service offset delta", stats["ocxo2_service_delta"], unit="ticks")
@@ -741,19 +916,48 @@ def analyze(campaign: str, limit: int = 0) -> None:
     _print_welford("OCXO2 arm_to_isr - arm_remaining", stats["ocxo2_arm_error"], unit="ticks")
     print()
 
+    print(f"VCLOCK residual excursions (|residual| ≥ {EXCURSION_THRESHOLD_CYCLES} cycles)")
+    print("════════════════════════════════════════════════════════════")
+    if not vclock_excursions:
+        print("  none")
+    else:
+        v_header = (
+            f"{'pps':>6s} {'v_res':>8s} {'v_act':>13s} {'v_pred':>13s} "
+            f"{'v_cΔ':>11s} {'v_fΔ':>8s} {'v_fact':>13s} {'phase':>5s} {'p_res':>8s}"
+        )
+        print(v_header)
+        print(
+            f"{'─'*6} {'─'*8} {'─'*13} {'─'*13} "
+            f"{'─'*11} {'─'*8} {'─'*13} {'─'*5} {'─'*8}"
+        )
+        for ex in vclock_excursions[:60]:
+            print(
+                f"{ex['pps']:>6d} "
+                f"{_fmt_int(ex['v_res'], 8, signed=True)} "
+                f"{_fmt_int(ex['v_act'], 13)} {_fmt_int(ex['v_pred'], 13)} "
+                f"{_fmt_int(ex['v_cdelta'], 11)} "
+                f"{_fmt_int(ex['v_forensic_delta'], 8, signed=True)} "
+                f"{_fmt_int(ex['v_forensic_actual'], 13)} "
+                f"{_fmt_int(ex['phase'], 5)} "
+                f"{_fmt_int(ex['p_res'], 8, signed=True)}"
+            )
+        if len(vclock_excursions) > 60:
+            print(f"  ... {len(vclock_excursions) - 60:,} more VCLOCK excursion rows omitted")
+    print()
+
     print(f"OCXO residual excursions (|residual| ≥ {EXCURSION_THRESHOLD_CYCLES} cycles)")
     print("════════════════════════════════════════════════════════════")
     if not excursions:
         print("  none")
     else:
         ex_header = (
-            f"{'pps':>6s} {'lane':>5s} {'res':>8s} {'act':>13s} {'pred':>13s} "
+            f"{'pps':>6s} {'lane':>5s} {'res':>8s} {'c_res':>8s} {'collapse':>8s} {'act':>13s} {'c_act':>13s} {'pred':>13s} "
             f"{'svc':>7s} {'svcΔ':>7s} {'late':>7s} {'early':>7s} "
             f"{'arm':>7s} {'isr':>7s} {'cls':>5s} {'p_res':>8s} {'v_res':>8s}"
         )
         print(ex_header)
         print(
-            f"{'─'*6} {'─'*5} {'─'*8} {'─'*13} {'─'*13} "
+            f"{'─'*6} {'─'*5} {'─'*8} {'─'*8} {'─'*8} {'─'*13} {'─'*13} {'─'*13} "
             f"{'─'*7} {'─'*7} {'─'*7} {'─'*7} "
             f"{'─'*7} {'─'*7} {'─'*5} {'─'*8} {'─'*8}"
         )
@@ -765,7 +969,9 @@ def analyze(campaign: str, limit: int = 0) -> None:
                 print(
                     f"{ex['pps']:>6d} {lane:>5s} "
                     f"{_fmt_int(res, 8, signed=True)} "
-                    f"{_fmt_int(ex[f'{lane}_act'], 13)} {_fmt_int(ex[f'{lane}_pred'], 13)} "
+                    f"{_fmt_int(ex[f'{lane}_cres'], 8, signed=True)} "
+                    f"{_fmt_int(ex[f'{lane}_collapse'], 8, signed=True)} "
+                    f"{_fmt_int(ex[f'{lane}_act'], 13)} {_fmt_int(ex[f'{lane}_cact'], 13)} {_fmt_int(ex[f'{lane}_pred'], 13)} "
                     f"{_fmt_int(ex[f'{lane}_svc'], 7, signed=True)} "
                     f"{_fmt_int(ex[f'{lane}_svc_delta'], 7, signed=True)} "
                     f"{_fmt_int(ex[f'{lane}_late'], 7)} "
@@ -782,6 +988,13 @@ def analyze(campaign: str, limit: int = 0) -> None:
     print()
     print("Notes")
     print("═════")
+    print("  • v_cΔ is VCLOCK counter32 delta.  Normal is 10,000,000; 20,000,000 means")
+    print("    the consumed VCLOCK event stream skipped one public bookend.")
+    print("  • v_fΔ is VCLOCK forensic-DWT interval minus v_act.  Nonzero means the")
+    print("    Alpha-forensics DWT surface disagrees with the flat prediction surface.")
+    print("  • o*_c_res is computed from ocxo*_forensics_service_corrected_dwt_at_event.")
+    print("    It emulates promoting the service-corrected DWT endpoint into Alpha math.")
+    print("  • collapse = abs(raw residual) - abs(corrected residual); positive is good.")
     print("  • svc is signed OCXO compare-service offset in 10 MHz ticks.")
     print("    Positive values mean ISR service was after target; negative values mean early/pre-target.")
     print("  • svcΔ is row-to-row change in svc.  Residual excursions often track changes in service timing.")

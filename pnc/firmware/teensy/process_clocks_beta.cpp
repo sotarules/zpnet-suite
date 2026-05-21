@@ -1273,9 +1273,12 @@ void clocks_beta_pps(void) {
     welford_update(welford_dwt, dwt_ppb_sample);
   }
 
+  clocks_alpha_lane_forensics_t vclock_forensics{};
   clocks_alpha_lane_forensics_t ocxo1_forensics{};
   clocks_alpha_lane_forensics_t ocxo2_forensics{};
 
+  const bool vclock_forensics_valid =
+      clocks_alpha_lane_forensics(time_clock_id_t::VCLOCK, &vclock_forensics);
   const bool ocxo1_forensics_valid =
       clocks_alpha_lane_forensics(time_clock_id_t::OCXO1, &ocxo1_forensics);
   const bool ocxo2_forensics_valid =
@@ -1393,6 +1396,15 @@ void clocks_beta_pps(void) {
   p.add("vclock_window_checks", g_vclock_clock.window_checks);
   p.add("vclock_window_mismatches", g_vclock_clock.window_mismatches);
   p.add("vclock_window_error_ns", g_vclock_clock.window_error_ns);
+
+  // VCLOCK Alpha-forensics.  These mirror the OCXO flat forensics surface and
+  // make the canonical VCLOCK event identity auditable in TIMEBASE rows.  In
+  // particular, raw_cycles.py can distinguish a true missing VCLOCK bookend
+  // (counter32 delta = 20,000,000) from a DWT/ledger pairing artifact
+  // (counter32 delta = 10,000,000 with abnormal DWT interval).
+  payload_add_lane_forensics_flat(p, "vclock",
+                                  vclock_forensics_valid,
+                                  vclock_forensics);
 
   // OCXO1 surface.
   p.add("ocxo1_measured_gnss_ns_at_pps_vclock", public_ocxo1_ns);
