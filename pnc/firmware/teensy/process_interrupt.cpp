@@ -1361,11 +1361,6 @@ static interrupt_subscriber_runtime_t* ocxo_runtime_for(const ocxo_runtime_conte
   return ctx.rt_slot ? *ctx.rt_slot : nullptr;
 }
 
-static volatile uint32_t g_ocxo_deferred_asap_arm_count = 0;
-static volatile uint32_t g_ocxo_deferred_asap_overwrite_count = 0;
-static volatile uint32_t g_ocxo_deferred_sample_count = 0;
-static volatile uint32_t g_ocxo_deferred_edge_count = 0;
-
 static volatile bool     g_cadence_minder_armed = false;
 static volatile uint32_t g_cadence_minder_arm_count = 0;
 static volatile uint32_t g_cadence_minder_arm_failures = 0;
@@ -2602,20 +2597,12 @@ static void ocxo_lane_disable_compare(ocxo_lane_t& lane) {
 //   3. compute the latency-adjusted event DWT,
 //   4. re-arm the next 1 kHz compare,
 //   5. refresh the synthetic 32-bit lane anchor,
-//   6. defer only 1 Hz edge publication.
+//   6. enqueue the perishable fact for foreground interpretation.
 //
 // Dynamic 100 Hz prediction has been retired; OCXO 100 Hz samples are no
-// longer queued from the ISR.
+// longer queued from the ISR. The old single-slot OCXO deferred edge mailbox
+// is gone; the perishable fact ring is the sole OCXO ISR-to-foreground handoff.
 // ============================================================================
-
-struct ocxo_deferred_work_t {
-  volatile bool edge_pending = false;
-  volatile uint32_t edge_dwt = 0;
-  volatile uint32_t edge_counter32 = 0;
-};
-
-static ocxo_deferred_work_t g_ocxo1_deferred = {};
-static ocxo_deferred_work_t g_ocxo2_deferred = {};
 
 // ----------------------------------------------------------------------------
 // Standardized OCXO perishable-fact ring — ISR capture, ASAP interpretation.
@@ -2812,27 +2799,6 @@ static bool ocxo_fact_ring_push_from_isr(ocxo_runtime_context_t& ctx,
   return true;
 }
 
-static void ocxo_deferred_asap_callback(timepop_ctx_t*, timepop_diag_t*, void* user_data) {
-  auto* rt = static_cast<interrupt_subscriber_runtime_t*>(user_data);
-  if (!rt || !rt->desc) return;
-
-  ocxo_deferred_work_t& work =
-      (rt->desc->kind == interrupt_subscriber_kind_t::OCXO1)
-          ? g_ocxo1_deferred
-          : g_ocxo2_deferred;
-  if (work.edge_pending) {
-    const uint32_t dwt = work.edge_dwt;
-    const uint32_t counter32 = work.edge_counter32;
-    work.edge_pending = false;
-    g_ocxo_deferred_edge_count++;
-
-    // We are already in foreground ASAP context.  Dispatch the authored OCXO
-    // edge directly instead of arming a second named ASAP slot that can be
-    // replaced by the next 100 Hz deferred sample before Alpha sees the edge.
-    emit_one_second_event(*rt, dwt, counter32, 0, false, nullptr, true);
-  }
-}
-
 
 static inline bool ocxo_lane_compare_flag_pending(const ocxo_lane_t& lane) {
   return (lane.module->CH[lane.channel].CSCTRL & TMR_CSCTRL_TCF1) != 0;
@@ -2985,11 +2951,9 @@ static void ocxo_apply_perishable_fact_deferred(
   lane->witness_previous_event_counter32 = fact.target_counter32;
   lane->witness_previous_event_counter32_valid = true;
 
-  // We are already in TimePop ASAP/foreground context.  Dispatch the authored
-  // OCXO edge directly so a second single-slot deferred mailbox cannot drop a
-  // canonical one-second event.  Canonical DWT remains the raw service DWT for
-  // this pass; corrected DWT is diagnostic-only.
-  g_ocxo_deferred_edge_count++;
+  // We are already in TimePop ASAP/foreground context. Dispatch the authored
+  // OCXO edge directly from the fact drain. Canonical DWT remains the raw
+  // service DWT for this pass; corrected DWT is diagnostic-only.
   emit_one_second_event(*rt,
                         fact.service_dwt_at_event,
                         fact.target_counter32,
@@ -3010,29 +2974,6 @@ static void ocxo_fact_drain_callback(timepop_ctx_t*,
     if (!ocxo_fact_ring_pop(*ctx, fact)) break;
     ocxo_apply_perishable_fact_deferred(*ctx, fact);
   }
-}
-
-static const char* ocxo_deferred_name(interrupt_subscriber_kind_t kind) {
-  return (kind == interrupt_subscriber_kind_t::OCXO1)
-      ? "OCXO1_DEFERRED"
-      : "OCXO2_DEFERRED";
-}
-
-static void ocxo_defer_one_second_edge(ocxo_deferred_work_t& work,
-                                       interrupt_subscriber_runtime_t* rt,
-                                       interrupt_subscriber_kind_t kind,
-                                       uint32_t event_dwt,
-                                       uint32_t event_counter32) {
-  if (work.edge_pending) g_ocxo_deferred_asap_overwrite_count++;
-
-  work.edge_dwt = event_dwt;
-  work.edge_counter32 = event_counter32;
-  work.edge_pending = true;
-  g_ocxo_deferred_asap_arm_count++;
-
-  (void)timepop_arm_asap(ocxo_deferred_asap_callback,
-                         rt,
-                         ocxo_deferred_name(kind));
 }
 
 struct ocxo_cadence_isr_sample_t {
@@ -4115,10 +4056,6 @@ void process_interrupt_init(void) {
   g_qtimer1_ch2_arm_count = 0;
   g_ocxo1_qtimer_diag = ocxo_qtimer_diag_t{};
   g_ocxo2_qtimer_diag = ocxo_qtimer_diag_t{};
-  g_ocxo_deferred_asap_arm_count = 0;
-  g_ocxo_deferred_asap_overwrite_count = 0;
-  g_ocxo_deferred_sample_count = 0;
-  g_ocxo_deferred_edge_count = 0;
   g_cadence_minder_armed = false;
   g_cadence_minder_arm_count = 0;
   g_cadence_minder_arm_failures = 0;
@@ -4132,8 +4069,6 @@ void process_interrupt_init(void) {
   g_cadence_minder_last_vclock_counter32 = 0;
   g_cadence_minder_last_ocxo1_counter32 = 0;
   g_cadence_minder_last_ocxo2_counter32 = 0;
-  g_ocxo1_deferred = ocxo_deferred_work_t{};
-  g_ocxo2_deferred = ocxo_deferred_work_t{};
   ocxo_fact_ring_reset(g_ocxo1_ctx);
   ocxo_fact_ring_reset(g_ocxo2_ctx);
 
@@ -4835,9 +4770,6 @@ static void add_ocxo_lane_payload(Payload& p,
   const bool compare_enabled = (csctrl & TMR_CSCTRL_TCF1EN) != 0;
   const bool compare_flag = (csctrl & TMR_CSCTRL_TCF1) != 0;
   const ocxo_perishable_ring_t& ring = ocxo_fact_ring_for(ctx);
-  ocxo_deferred_work_t& deferred = (ctx.kind == interrupt_subscriber_kind_t::OCXO1)
-      ? g_ocxo1_deferred
-      : g_ocxo2_deferred;
 
   add_u32("qtimer_count", qdiag.count);
   add_u32("qtimer_counter", (uint32_t)lane.module->CH[lane.channel].CNTR);
@@ -4872,7 +4804,6 @@ static void add_ocxo_lane_payload(Payload& p,
   add_u32("perishable_fact_asap_arm_count", ring.asap_arm_count);
   add_u32("perishable_fact_asap_fail_count", ring.asap_fail_count);
   add_bool("perishable_fact_drain_armed", ring.drain_armed);
-  add_bool("deferred_edge_pending", deferred.edge_pending);
 }
 
 static Payload cmd_report(const Payload&) {
@@ -4984,8 +4915,6 @@ static Payload cmd_report(const Payload&) {
   p.add("ocxo2_fact_high_water", ocxo_fact_ring_for(g_ocxo2_ctx).high_water);
   p.add("ocxo2_fact_asap_fail_count", ocxo_fact_ring_for(g_ocxo2_ctx).asap_fail_count);
 
-  p.add("ocxo_deferred_asap_overwrite_count", g_ocxo_deferred_asap_overwrite_count);
-  p.add("ocxo_deferred_edge_count", g_ocxo_deferred_edge_count);
   return p;
 }
 
