@@ -511,6 +511,25 @@ struct alpha_lane_forensics_store_t {
   uint32_t diag_counter_delta_violation_count = 0;
   uint32_t diag_last_bad_counter_delta = 0;
   uint32_t diag_last_counter_delta_ticks = 0;
+
+  bool     regression_valid = false;
+  uint32_t regression_sequence = 0;
+  uint32_t regression_sample_count = 0;
+  uint32_t regression_observed_dwt_at_event = 0;
+  uint32_t regression_inferred_dwt_at_event = 0;
+  int32_t  regression_inferred_minus_observed_cycles = 0;
+  uint32_t regression_target_counter32_at_event = 0;
+  uint16_t regression_target_hardware16_at_event = 0;
+  uint16_t regression_observed_hardware16_at_event = 0;
+  uint64_t regression_slope_q16_cycles_per_sample = 0;
+  int64_t  regression_slope_delta_q16_cycles_per_sample = 0;
+  int32_t  regression_fit_error_mean_q16_cycles = 0;
+  uint32_t regression_fit_error_stddev_q16_cycles = 0;
+  int32_t  regression_fit_error_min_cycles = 0;
+  int32_t  regression_fit_error_max_cycles = 0;
+  uint32_t regression_fit_error_gt_plus4_count = 0;
+  uint32_t regression_fit_error_lt_minus4_count = 0;
+  uint32_t regression_fit_error_abs_gt4_count = 0;
 };
 
 static alpha_lane_forensics_store_t g_vclock_forensics = {};
@@ -943,6 +962,24 @@ static void alpha_forensics_reset_store(alpha_lane_forensics_store_t& s) {
   s.diag_counter_delta_violation_count = 0;
   s.diag_last_bad_counter_delta = 0;
   s.diag_last_counter_delta_ticks = 0;
+  s.regression_valid = false;
+  s.regression_sequence = 0;
+  s.regression_sample_count = 0;
+  s.regression_observed_dwt_at_event = 0;
+  s.regression_inferred_dwt_at_event = 0;
+  s.regression_inferred_minus_observed_cycles = 0;
+  s.regression_target_counter32_at_event = 0;
+  s.regression_target_hardware16_at_event = 0;
+  s.regression_observed_hardware16_at_event = 0;
+  s.regression_slope_q16_cycles_per_sample = 0;
+  s.regression_slope_delta_q16_cycles_per_sample = 0;
+  s.regression_fit_error_mean_q16_cycles = 0;
+  s.regression_fit_error_stddev_q16_cycles = 0;
+  s.regression_fit_error_min_cycles = 0;
+  s.regression_fit_error_max_cycles = 0;
+  s.regression_fit_error_gt_plus4_count = 0;
+  s.regression_fit_error_lt_minus4_count = 0;
+  s.regression_fit_error_abs_gt4_count = 0;
 
   clocks_alpha_dmb();
   s.seq++;
@@ -1057,6 +1094,40 @@ static void alpha_forensics_publish(time_clock_id_t clock_id,
         diag->ocxo_counter_delta_violation_count;
     s->diag_last_bad_counter_delta = diag->ocxo_last_bad_counter_delta;
     s->diag_last_counter_delta_ticks = diag->ocxo_last_counter_delta_ticks;
+
+    s->regression_valid = diag->regression_valid;
+    s->regression_sequence = diag->regression_sequence;
+    s->regression_sample_count = diag->regression_sample_count;
+    s->regression_observed_dwt_at_event =
+        diag->regression_observed_dwt_at_event;
+    s->regression_inferred_dwt_at_event =
+        diag->regression_inferred_dwt_at_event;
+    s->regression_inferred_minus_observed_cycles =
+        diag->regression_inferred_minus_observed_cycles;
+    s->regression_target_counter32_at_event =
+        diag->regression_target_counter32_at_event;
+    s->regression_target_hardware16_at_event =
+        diag->regression_target_hardware16_at_event;
+    s->regression_observed_hardware16_at_event =
+        diag->regression_observed_hardware16_at_event;
+    s->regression_slope_q16_cycles_per_sample =
+        diag->regression_slope_q16_cycles_per_sample;
+    s->regression_slope_delta_q16_cycles_per_sample =
+        diag->regression_slope_delta_q16_cycles_per_sample;
+    s->regression_fit_error_mean_q16_cycles =
+        diag->regression_fit_error_mean_q16_cycles;
+    s->regression_fit_error_stddev_q16_cycles =
+        diag->regression_fit_error_stddev_q16_cycles;
+    s->regression_fit_error_min_cycles =
+        diag->regression_fit_error_min_cycles;
+    s->regression_fit_error_max_cycles =
+        diag->regression_fit_error_max_cycles;
+    s->regression_fit_error_gt_plus4_count =
+        diag->regression_fit_error_gt_plus4_count;
+    s->regression_fit_error_lt_minus4_count =
+        diag->regression_fit_error_lt_minus4_count;
+    s->regression_fit_error_abs_gt4_count =
+        diag->regression_fit_error_abs_gt4_count;
   } else {
     s->diag_anchor_sequence_used = 0;
     s->diag_anchor_age_slots = 0;
@@ -1082,6 +1153,24 @@ static void alpha_forensics_publish(time_clock_id_t clock_id,
     s->diag_counter_delta_violation_count = 0;
     s->diag_last_bad_counter_delta = 0;
     s->diag_last_counter_delta_ticks = 0;
+    s->regression_valid = false;
+    s->regression_sequence = 0;
+    s->regression_sample_count = 0;
+    s->regression_observed_dwt_at_event = 0;
+    s->regression_inferred_dwt_at_event = 0;
+    s->regression_inferred_minus_observed_cycles = 0;
+    s->regression_target_counter32_at_event = 0;
+    s->regression_target_hardware16_at_event = 0;
+    s->regression_observed_hardware16_at_event = 0;
+    s->regression_slope_q16_cycles_per_sample = 0;
+    s->regression_slope_delta_q16_cycles_per_sample = 0;
+    s->regression_fit_error_mean_q16_cycles = 0;
+    s->regression_fit_error_stddev_q16_cycles = 0;
+    s->regression_fit_error_min_cycles = 0;
+    s->regression_fit_error_max_cycles = 0;
+    s->regression_fit_error_gt_plus4_count = 0;
+    s->regression_fit_error_lt_minus4_count = 0;
+    s->regression_fit_error_abs_gt4_count = 0;
   }
 
   clocks_alpha_dmb();
@@ -1152,6 +1241,39 @@ bool clocks_alpha_lane_forensics(time_clock_id_t clock,
         s->diag_counter_delta_violation_count;
     out->diag_last_bad_counter_delta = s->diag_last_bad_counter_delta;
     out->diag_last_counter_delta_ticks = s->diag_last_counter_delta_ticks;
+    out->regression_valid = s->regression_valid;
+    out->regression_sequence = s->regression_sequence;
+    out->regression_sample_count = s->regression_sample_count;
+    out->regression_observed_dwt_at_event =
+        s->regression_observed_dwt_at_event;
+    out->regression_inferred_dwt_at_event =
+        s->regression_inferred_dwt_at_event;
+    out->regression_inferred_minus_observed_cycles =
+        s->regression_inferred_minus_observed_cycles;
+    out->regression_target_counter32_at_event =
+        s->regression_target_counter32_at_event;
+    out->regression_target_hardware16_at_event =
+        s->regression_target_hardware16_at_event;
+    out->regression_observed_hardware16_at_event =
+        s->regression_observed_hardware16_at_event;
+    out->regression_slope_q16_cycles_per_sample =
+        s->regression_slope_q16_cycles_per_sample;
+    out->regression_slope_delta_q16_cycles_per_sample =
+        s->regression_slope_delta_q16_cycles_per_sample;
+    out->regression_fit_error_mean_q16_cycles =
+        s->regression_fit_error_mean_q16_cycles;
+    out->regression_fit_error_stddev_q16_cycles =
+        s->regression_fit_error_stddev_q16_cycles;
+    out->regression_fit_error_min_cycles =
+        s->regression_fit_error_min_cycles;
+    out->regression_fit_error_max_cycles =
+        s->regression_fit_error_max_cycles;
+    out->regression_fit_error_gt_plus4_count =
+        s->regression_fit_error_gt_plus4_count;
+    out->regression_fit_error_lt_minus4_count =
+        s->regression_fit_error_lt_minus4_count;
+    out->regression_fit_error_abs_gt4_count =
+        s->regression_fit_error_abs_gt4_count;
 
     clocks_alpha_dmb();
     const uint32_t seq2 = s->seq;

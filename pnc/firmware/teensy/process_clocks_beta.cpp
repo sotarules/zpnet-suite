@@ -772,8 +772,306 @@ static void payload_add_lane_forensics_flat(Payload& p,
           valid ? f.diag_last_bad_counter_delta : 0U);
   add_u32("forensics_last_counter_delta_ticks",
           valid ? f.diag_last_counter_delta_ticks : 0U);
+
+  // Linear-regression diagnostics are experimental-only in this pass.
+  // The subscriber-facing event DWT remains the traditional edge DWT; these
+  // fields expose what the regression engine inferred from the 1 kHz window.
+  add_bool("forensics_regression_valid",
+           valid && f.regression_valid);
+  add_u32("forensics_regression_sequence",
+          valid ? f.regression_sequence : 0U);
+  add_u32("forensics_regression_sample_count",
+          valid ? f.regression_sample_count : 0U);
+  add_u32("forensics_regression_observed_dwt_at_event",
+          valid ? f.regression_observed_dwt_at_event : 0U);
+  add_u32("forensics_regression_inferred_dwt_at_event",
+          valid ? f.regression_inferred_dwt_at_event : 0U);
+  add_i32("forensics_regression_inferred_minus_observed_cycles",
+          valid ? f.regression_inferred_minus_observed_cycles : 0);
+  add_u32("forensics_regression_target_counter32_at_event",
+          valid ? f.regression_target_counter32_at_event : 0U);
+  add_u32("forensics_regression_target_hardware16_at_event",
+          valid ? (uint32_t)f.regression_target_hardware16_at_event : 0U);
+  add_u32("forensics_regression_observed_hardware16_at_event",
+          valid ? (uint32_t)f.regression_observed_hardware16_at_event : 0U);
+  snprintf(key, sizeof(key), "%s_%s", prefix,
+           "forensics_regression_slope_q16_cycles_per_sample");
+  p.add(key, valid ? f.regression_slope_q16_cycles_per_sample : 0ULL);
+  snprintf(key, sizeof(key), "%s_%s", prefix,
+           "forensics_regression_slope_delta_q16_cycles_per_sample");
+  p.add(key, valid ? f.regression_slope_delta_q16_cycles_per_sample : 0LL);
+  add_i32("forensics_regression_fit_error_mean_q16_cycles",
+          valid ? f.regression_fit_error_mean_q16_cycles : 0);
+  add_u32("forensics_regression_fit_error_stddev_q16_cycles",
+          valid ? f.regression_fit_error_stddev_q16_cycles : 0U);
+  add_i32("forensics_regression_fit_error_min_cycles",
+          valid ? f.regression_fit_error_min_cycles : 0);
+  add_i32("forensics_regression_fit_error_max_cycles",
+          valid ? f.regression_fit_error_max_cycles : 0);
+  add_u32("forensics_regression_fit_error_gt_plus4_count",
+          valid ? f.regression_fit_error_gt_plus4_count : 0U);
+  add_u32("forensics_regression_fit_error_lt_minus4_count",
+          valid ? f.regression_fit_error_lt_minus4_count : 0U);
+  add_u32("forensics_regression_fit_error_abs_gt4_count",
+          valid ? f.regression_fit_error_abs_gt4_count : 0U);
 }
 
+
+// ============================================================================
+// TIMEBASE_FRAGMENT v2 — hierarchical publication helpers
+// ============================================================================
+//
+// TIMEBASE_FRAGMENT used to publish almost everything as flat key/value pairs.
+// That was convenient for ad-hoc scripts, but it burned Payload entry slots and
+// arena bytes through repeated prefixes such as
+// ocxo1_forensics_regression_fit_error_abs_gt4_count.  The fragment is now
+// lane-centric: PPS/DWT/GNSS remain shared sections, prediction stays separate,
+// and each clock owns its own measurement/forensics/service/regression objects.
+//
+// Keep the legacy flat helpers above for focused reports and transition tools;
+// TIMEBASE_FRAGMENT itself uses the helpers below.
+
+static void payload_add_welford_object(Payload& parent,
+                                       const char* key,
+                                       const welford_t& w) {
+  Payload obj;
+  obj.add("n", w.n);
+  obj.add("mean", w.mean, 6);
+  obj.add("stddev", welford_stddev(w), 6);
+  obj.add("stderr", welford_stderr(w), 6);
+  obj.add("min", (w.n > 0) ? w.min_val : 0.0, 6);
+  obj.add("max", (w.n > 0) ? w.max_val : 0.0, 6);
+  parent.add_object(key, obj);
+}
+
+static void payload_add_frequency_fields(Payload& obj, double ppb_value) {
+  const double tau_value = 1.0 + ppb_value / 1e9;
+  obj.add("tau", tau_value, 12);
+  obj.add("ppb", ppb_value, 3);
+}
+
+static void payload_add_stats_clock(Payload& parent,
+                                    const char* key,
+                                    const welford_t& w,
+                                    bool include_frequency) {
+  Payload obj;
+  payload_add_welford_object(obj, "welford", w);
+  if (include_frequency) {
+    payload_add_frequency_fields(obj, w.mean);
+  }
+  parent.add_object(key, obj);
+}
+
+static void payload_add_stats_summary_hierarchical(Payload& p) {
+  Payload stats;
+  payload_add_stats_clock(stats, "dwt", welford_dwt, true);
+  payload_add_stats_clock(stats, "vclock", welford_vclock, true);
+  payload_add_stats_clock(stats, "ocxo1", welford_ocxo1, true);
+  payload_add_stats_clock(stats, "ocxo2", welford_ocxo2, true);
+  payload_add_stats_clock(stats, "pps_witness", welford_pps_witness, false);
+
+  Payload dac;
+  payload_add_welford_object(dac, "ocxo1", welford_ocxo1_dac);
+  payload_add_welford_object(dac, "ocxo2", welford_ocxo2_dac);
+  stats.add_object("dac", dac);
+
+  p.add_object("stats", stats);
+}
+
+static void payload_add_prediction_lane_object(Payload& parent,
+                                               const char* key,
+                                               const clocks_static_prediction_snapshot_t& s) {
+  Payload lane;
+  lane.add("valid", s.valid);
+  lane.add("completed_interval_count", s.completed_interval_count);
+  lane.add("prediction_cycles", s.static_prediction_cycles);
+  lane.add("actual_cycles", s.actual_cycles);
+  lane.add("residual_cycles", s.static_residual_cycles);
+  parent.add_object(key, lane);
+}
+
+static void payload_add_prediction_summary_hierarchical(Payload& p) {
+  Payload prediction;
+  payload_add_prediction_lane_object(prediction, "pps", prediction_snapshot_for_pps());
+  payload_add_prediction_lane_object(prediction, "vclock", prediction_snapshot_for_clock(time_clock_id_t::VCLOCK));
+  payload_add_prediction_lane_object(prediction, "ocxo1", prediction_snapshot_for_clock(time_clock_id_t::OCXO1));
+  payload_add_prediction_lane_object(prediction, "ocxo2", prediction_snapshot_for_clock(time_clock_id_t::OCXO2));
+  p.add_object("prediction", prediction);
+}
+
+static void payload_add_clock_measurement_object(Payload& parent,
+                                                 const clock_state_t& clock,
+                                                 const clock_measurement_t& meas) {
+  Payload measurement;
+  measurement.add("gnss_ns_between_edges", (uint64_t)meas.gnss_ns_between_edges);
+  measurement.add("second_residual_ns", (int64_t)meas.second_residual_ns);
+  measurement.add("phase_offset_ns", (int64_t)clock.phase_offset_ns);
+  measurement.add("zero_established", (bool)clock.zero_established);
+  measurement.add("window_checks", (uint32_t)clock.window_checks);
+  measurement.add("window_mismatches", (uint32_t)clock.window_mismatches);
+  measurement.add("window_error_ns", (int64_t)clock.window_error_ns);
+  parent.add_object("measurement", measurement);
+}
+
+static void payload_add_ocxo_interval_object(Payload& parent,
+                                             bool valid,
+                                             const clocks_alpha_lane_forensics_t& f) {
+  Payload interval;
+  interval.add("counter_nominal_ns_between_edges",
+               valid ? f.counter_nominal_ns_between_edges : 0ULL);
+  interval.add("bridge_gnss_ns_between_edges",
+               valid ? f.bridge_gnss_ns_between_edges : 0ULL);
+  interval.add("bridge_residual_ns",
+               valid ? f.bridge_residual_ns : 0LL);
+  interval.add("bridge_interval_valid",
+               valid && f.bridge_interval_valid);
+  parent.add_object("interval", interval);
+}
+
+static void payload_add_lane_forensics_object(Payload& parent,
+                                              bool valid,
+                                              const clocks_alpha_lane_forensics_t& f) {
+  Payload forensics;
+  forensics.add("valid", valid);
+  forensics.add("update_count", valid ? f.update_count : 0U);
+  forensics.add("last_event_dwt", valid ? f.last_event_dwt : 0U);
+  forensics.add("last_event_counter32", valid ? f.last_event_counter32 : 0U);
+  forensics.add("dwt_cycles_between_edges", valid ? f.dwt_cycles_between_edges : 0U);
+  forensics.add("counter32_delta_since_previous_event",
+                valid ? f.counter32_delta_since_previous_event : 0U);
+  forensics.add("zero_offset_counter32", valid ? f.zero_offset_counter32 : 0U);
+  forensics.add("counter32_delta_since_zero_offset",
+                valid ? f.counter32_delta_since_zero_offset : 0U);
+  parent.add_object("forensics", forensics);
+}
+
+static void payload_add_ocxo_service_object(Payload& parent,
+                                            bool valid,
+                                            const clocks_alpha_lane_forensics_t& f) {
+  Payload service;
+  service.add("class", valid ? f.diag_service_class : 0U);
+  service.add("offset_ticks", valid ? f.diag_service_offset_signed_ticks : 0);
+  service.add("offset_abs_ticks", valid ? f.diag_service_offset_abs_ticks : 0U);
+  service.add("late_ticks", valid ? f.diag_interpreted_late_ticks : 0U);
+  service.add("early_ticks", valid ? f.diag_early_ticks : 0U);
+  service.add("target_delta_mod65536_ticks",
+              valid ? f.diag_target_delta_mod65536_ticks : 0U);
+  service.add("arm_remaining_ticks", valid ? f.diag_arm_remaining_ticks : 0U);
+  service.add("arm_to_isr_ticks", valid ? f.diag_arm_to_isr_ticks : 0U);
+  service.add("arm_to_isr_dwt_cycles", valid ? f.diag_arm_to_isr_dwt_cycles : 0U);
+  service.add("perishable_fact_sequence",
+              valid ? f.diag_perishable_fact_sequence : 0U);
+  service.add("correction_cycles", valid ? f.diag_service_correction_cycles : 0);
+  service.add("corrected_dwt_at_event",
+              valid ? f.diag_service_corrected_dwt_at_event : 0U);
+  service.add("fact_ring_overflow_count",
+              valid ? f.diag_fact_ring_overflow_count : 0U);
+  service.add("counter_delta_violation_count",
+              valid ? f.diag_counter_delta_violation_count : 0U);
+  service.add("last_bad_counter_delta", valid ? f.diag_last_bad_counter_delta : 0U);
+  service.add("last_counter_delta_ticks", valid ? f.diag_last_counter_delta_ticks : 0U);
+  parent.add_object("service", service);
+}
+
+static void payload_add_lane_regression_object(Payload& parent,
+                                               bool valid,
+                                               const clocks_alpha_lane_forensics_t& f) {
+  Payload regression;
+  regression.add("valid", valid && f.regression_valid);
+  regression.add("sequence", valid ? f.regression_sequence : 0U);
+  regression.add("sample_count", valid ? f.regression_sample_count : 0U);
+  regression.add("observed_dwt_at_event",
+                 valid ? f.regression_observed_dwt_at_event : 0U);
+  regression.add("inferred_dwt_at_event",
+                 valid ? f.regression_inferred_dwt_at_event : 0U);
+  regression.add("inferred_minus_observed_cycles",
+                 valid ? f.regression_inferred_minus_observed_cycles : 0);
+  regression.add("target_counter32_at_event",
+                 valid ? f.regression_target_counter32_at_event : 0U);
+  regression.add("target_hardware16_at_event",
+                 valid ? (uint32_t)f.regression_target_hardware16_at_event : 0U);
+  regression.add("observed_hardware16_at_event",
+                 valid ? (uint32_t)f.regression_observed_hardware16_at_event : 0U);
+  regression.add("slope_q16_cycles_per_sample",
+                 valid ? f.regression_slope_q16_cycles_per_sample : 0ULL);
+  regression.add("slope_delta_q16_cycles_per_sample",
+                 valid ? f.regression_slope_delta_q16_cycles_per_sample : 0LL);
+  regression.add("fit_error_mean_q16_cycles",
+                 valid ? f.regression_fit_error_mean_q16_cycles : 0);
+  regression.add("fit_error_stddev_q16_cycles",
+                 valid ? f.regression_fit_error_stddev_q16_cycles : 0U);
+  regression.add("fit_error_min_cycles",
+                 valid ? f.regression_fit_error_min_cycles : 0);
+  regression.add("fit_error_max_cycles",
+                 valid ? f.regression_fit_error_max_cycles : 0);
+  regression.add("fit_error_gt_plus4_count",
+                 valid ? f.regression_fit_error_gt_plus4_count : 0U);
+  regression.add("fit_error_lt_minus4_count",
+                 valid ? f.regression_fit_error_lt_minus4_count : 0U);
+  regression.add("fit_error_abs_gt4_count",
+                 valid ? f.regression_fit_error_abs_gt4_count : 0U);
+  parent.add_object("regression", regression);
+}
+
+static void payload_add_vclock_fragment(Payload& p,
+                                        uint64_t public_gnss_ns,
+                                        bool forensics_valid,
+                                        const clocks_alpha_lane_forensics_t& f) {
+  Payload lane;
+  lane.add("ns", public_gnss_ns);
+  lane.add("gnss_ns_at_pps_vclock", public_gnss_ns);
+  lane.add("counter32_at_pps_vclock", (uint32_t)g_counter32_at_pps_vclock);
+  payload_add_clock_measurement_object(lane, g_vclock_clock, g_vclock_measurement);
+  payload_add_lane_forensics_object(lane, forensics_valid, f);
+  payload_add_lane_regression_object(lane, forensics_valid, f);
+  p.add_object("vclock", lane);
+}
+
+static void payload_add_ocxo_fragment(Payload& p,
+                                      const char* key,
+                                      uint64_t public_ns,
+                                      const clock_state_t& clock,
+                                      const clock_measurement_t& meas,
+                                      bool forensics_valid,
+                                      const clocks_alpha_lane_forensics_t& f) {
+  Payload lane;
+  lane.add("ns", public_ns);
+  lane.add("measured_gnss_ns", public_ns);
+  lane.add("measured_gnss_ns_at_pps_vclock", public_ns);
+  lane.add("ns_at_pps_vclock", public_ns);
+  payload_add_clock_measurement_object(lane, clock, meas);
+  payload_add_ocxo_interval_object(lane, forensics_valid, f);
+  payload_add_lane_forensics_object(lane, forensics_valid, f);
+  payload_add_ocxo_service_object(lane, forensics_valid, f);
+  payload_add_lane_regression_object(lane, forensics_valid, f);
+  p.add_object(key, lane);
+}
+
+static void payload_add_dac_summary_hierarchical(Payload& p) {
+  Payload dac;
+  dac.add("calibrate_ocxo", servo_mode_str(calibrate_ocxo_mode));
+  dac.add("ad5693r_init_ok", g_ad5693r_init_ok);
+
+  Payload o1;
+  o1.add("value", ocxo1_dac.dac_fractional);
+  o1.add("last_write_ok", ocxo1_dac.io_last_write_ok);
+  o1.add("fault_latched", ocxo1_dac.io_fault_latched);
+  o1.add("servo_predicted_residual_ns", ocxo1_dac.servo_predicted_residual, 6);
+  o1.add("servo_last_step", ocxo1_dac.servo_last_step, 6);
+  o1.add("servo_adjustments", ocxo1_dac.servo_adjustments);
+  dac.add_object("ocxo1", o1);
+
+  Payload o2;
+  o2.add("value", ocxo2_dac.dac_fractional);
+  o2.add("last_write_ok", ocxo2_dac.io_last_write_ok);
+  o2.add("fault_latched", ocxo2_dac.io_fault_latched);
+  o2.add("servo_predicted_residual_ns", ocxo2_dac.servo_predicted_residual, 6);
+  o2.add("servo_last_step", ocxo2_dac.servo_last_step, 6);
+  o2.add("servo_adjustments", ocxo2_dac.servo_adjustments);
+  dac.add_object("ocxo2", o2);
+
+  p.add_object("dac", dac);
+}
 // ============================================================================
 // Predictive servo tuning
 // ============================================================================
@@ -1324,167 +1622,96 @@ void clocks_beta_pps(void) {
   const uint32_t public_count     = (uint32_t)campaign_seconds;
 
   Payload p;
-  p.add("campaign", campaign_name);
+  p.add("schema", "TIMEBASE_FRAGMENT_V2");
+  p.add("fragment_version", 2U);
 
-  // Canonical campaign-second identity.  PPS is the selector; the selected
-  // PPS/VCLOCK edge is the sovereign second boundary.  Keep legacy aliases so
-  // Pi-side consumers survive the schema transition while the canonical name
-  // moves to PPS/VCLOCK.
+  // Minimal flat compatibility spine.  TIMEBASE stores this fragment as an
+  // opaque object, but Pi-side indexing and older tools still need these few
+  // top-level identities while reports migrate to the hierarchical schema.
+  p.add("campaign", campaign_name);
   p.add("teensy_pps_vclock_count", public_count);
   p.add("teensy_pps_count",        public_count);  // legacy alias
-  p.add("pps_count",               public_count);  // legacy alias
-
-  // Canonical nanosecond ledgers. PPS/VCLOCK/GNSS share the selected-edge
-  // reference identity. OCXO public ledgers are measured GNSS-elapsed OCXO
-  // ledgers sampled at the same PPS/VCLOCK boundary.
-  p.add("gnss_ns",        public_gnss_ns);
-  p.add("pps_ns",         public_gnss_ns);
-  p.add("pps_vclock_ns",  public_gnss_ns);
-  p.add("vclock_ns",      public_gnss_ns);
-  p.add("ocxo1_measured_gnss_ns", public_ocxo1_ns);
-  p.add("ocxo2_measured_gnss_ns", public_ocxo2_ns);
-  p.add("ocxo1_ns",       public_ocxo1_ns);  // legacy alias
-  p.add("ocxo2_ns",       public_ocxo2_ns);  // legacy alias
-
-  p.add("calibrate_ocxo", servo_mode_str(calibrate_ocxo_mode));
-
-  // DWT canonical surface.  DWT is not a synthetic ns clock; it is a 64-bit
-  // cycle ledger plus a derived ns convenience value for Pi-side recovery and
-  // reporting.
-  p.add("dwt_cycle_count_total", public_dwt_total);
-  p.add("dwt_ns",                public_dwt_ns);
-  p.add("dwt_at_pps_vclock", g_dwt_at_pps_vclock);
-  p.add("dwt_cycles_between_pps_vclock", g_dwt_cycles_between_pps_vclock);
-  p.add("dwt_expected_per_pps_vclock", (uint32_t)DWT_EXPECTED_PER_PPS);
-
-  // Physical PPS witness DWT audit surface.  These fields let Pi-side
-  // raw_cycles compare the GPIO PPS witness rail against the canonical
-  // PPS/VCLOCK rail and determine where the 4-cycle lattice lives.
-  p.add("pps_dwt_at_edge", (uint32_t)g_pps_dwt_at_edge);
-  p.add("pps_dwt_cycles_between_edges",
-        g_pps_dwt_cycles_between_edges_valid
-            ? (uint32_t)g_pps_dwt_cycles_between_edges
-            : 0U);
-  p.add("pps_dwt_cycles_between_edges_valid",
-        (bool)g_pps_dwt_cycles_between_edges_valid);
+  p.add("pps_count",               public_count);  // legacy alias / DB order key
+  p.add("gnss_ns",                 public_gnss_ns);
+  p.add("dwt_at_pps_vclock",       (uint32_t)g_dwt_at_pps_vclock);
+  p.add("dwt_cycles_between_pps_vclock", (uint32_t)g_dwt_cycles_between_pps_vclock);
+  p.add("counter32_at_pps_vclock", (uint32_t)g_counter32_at_pps_vclock);
+  p.add("pps_dwt_at_edge",         (uint32_t)g_pps_dwt_at_edge);
   p.add("pps_vclock_phase_cycles", (int32_t)g_pps_vclock_phase_cycles);
-  // Instantaneous cycles residual: measured minus expected.
-  // Positive → Teensy CPU fast; negative → Teensy CPU slow.
-  // Same sign convention as dwt_ppb, same units as dwt_cycles_between_pps_vclock.
-  p.add("dwt_second_residual_cycles",
-        (int32_t)((int64_t)g_dwt_cycles_between_pps_vclock -
-                  (int64_t)DWT_EXPECTED_PER_PPS));
 
-  // Compact static prediction surface.  Dynamic 100 Hz prediction and Gamma
-  // courtroom detail have been retired.  TIMEBASE now publishes four
-  // independent rails (PPS, VCLOCK, OCXO1, OCXO2): prior interval prediction,
-  // actual interval, and residual.
-  payload_add_prediction_summary(p);
+  {
+    Payload gnss;
+    gnss.add("ns", public_gnss_ns);
+    gnss.add("pps_ns", public_gnss_ns);
+    gnss.add("pps_vclock_ns", public_gnss_ns);
+    gnss.add("vclock_ns", public_gnss_ns);
+    gnss.add("ocxo1_measured_ns", public_ocxo1_ns);
+    gnss.add("ocxo2_measured_ns", public_ocxo2_ns);
+    p.add_object("gnss", gnss);
+  }
 
-  // Synthetic 32-bit VCLOCK identity of the canonical PPS/VCLOCK epoch.
-  // Under the VCLOCK-domain architecture this is the compact event identity
-  // authored by process_interrupt, not a raw ambient hardware read.
-  p.add("counter32_at_pps_vclock", g_counter32_at_pps_vclock);
+  {
+    Payload environmental;
+    environmental.add("calibrate_ocxo", servo_mode_str(calibrate_ocxo_mode));
+    environmental.add("ad5693r_init_ok", g_ad5693r_init_ok);
+    p.add_object("environmental", environmental);
+  }
 
-  // VCLOCK surface — authored facts + per-edge measurement + window accounting.
-  p.add("vclock_gnss_ns_at_pps_vclock", public_gnss_ns);
-  p.add("vclock_gnss_ns_between_edges", g_vclock_measurement.gnss_ns_between_edges);
-  p.add("vclock_dwt_cycles_between_edges", g_vclock_measurement.dwt_cycles_between_edges);
-  p.add("vclock_second_residual_ns", g_vclock_measurement.second_residual_ns);
-  p.add("vclock_phase_offset_ns", g_vclock_clock.phase_offset_ns);
-  p.add("vclock_zero_established", g_vclock_clock.zero_established);
-  p.add("vclock_window_checks", g_vclock_clock.window_checks);
-  p.add("vclock_window_mismatches", g_vclock_clock.window_mismatches);
-  p.add("vclock_window_error_ns", g_vclock_clock.window_error_ns);
+  {
+    Payload dwt;
+    dwt.add("cycle_count_total", public_dwt_total);
+    dwt.add("ns", public_dwt_ns);
+    dwt.add("at_pps_vclock", (uint32_t)g_dwt_at_pps_vclock);
+    dwt.add("cycles_between_pps_vclock", (uint32_t)g_dwt_cycles_between_pps_vclock);
+    dwt.add("expected_per_pps_vclock", (uint32_t)DWT_EXPECTED_PER_PPS);
+    dwt.add("second_residual_cycles",
+            (int32_t)((int64_t)g_dwt_cycles_between_pps_vclock -
+                      (int64_t)DWT_EXPECTED_PER_PPS));
+    p.add_object("dwt", dwt);
+  }
 
-  // VCLOCK Alpha-forensics.  These mirror the OCXO flat forensics surface and
-  // make the canonical VCLOCK event identity auditable in TIMEBASE rows.  In
-  // particular, raw_cycles.py can distinguish a true missing VCLOCK bookend
-  // (counter32 delta = 20,000,000) from a DWT/ledger pairing artifact
-  // (counter32 delta = 10,000,000 with abnormal DWT interval).
-  payload_add_lane_forensics_flat(p, "vclock",
-                                  vclock_forensics_valid,
-                                  vclock_forensics);
+  {
+    Payload pps;
+    pps.add("count", public_count);
+    pps.add("dwt_at_edge", (uint32_t)g_pps_dwt_at_edge);
+    pps.add("dwt_cycles_between_edges",
+            g_pps_dwt_cycles_between_edges_valid
+                ? (uint32_t)g_pps_dwt_cycles_between_edges
+                : 0U);
+    pps.add("dwt_cycles_between_edges_valid",
+            (bool)g_pps_dwt_cycles_between_edges_valid);
+    pps.add("vclock_phase_cycles", (int32_t)g_pps_vclock_phase_cycles);
+    p.add_object("pps", pps);
+  }
 
-  // OCXO1 surface.
-  p.add("ocxo1_measured_gnss_ns_at_pps_vclock", public_ocxo1_ns);
-  p.add("ocxo1_ns_at_pps_vclock", public_ocxo1_ns);  // legacy alias
-  p.add("ocxo1_gnss_ns_between_edges", g_ocxo1_measurement.gnss_ns_between_edges);
-  p.add("ocxo1_counter_nominal_ns_between_edges",
-        ocxo1_forensics_valid ? ocxo1_forensics.counter_nominal_ns_between_edges : 0ULL);
-  p.add("ocxo1_bridge_gnss_ns_between_edges",
-        ocxo1_forensics_valid ? ocxo1_forensics.bridge_gnss_ns_between_edges : 0ULL);
-  p.add("ocxo1_bridge_residual_ns",
-        ocxo1_forensics_valid ? ocxo1_forensics.bridge_residual_ns : 0LL);
-  p.add("ocxo1_bridge_interval_valid",
-        ocxo1_forensics_valid && ocxo1_forensics.bridge_interval_valid);
-  p.add("ocxo1_dwt_cycles_between_edges", g_ocxo1_measurement.dwt_cycles_between_edges);
-  p.add("ocxo1_second_residual_ns", g_ocxo1_measurement.second_residual_ns);
-  p.add("ocxo1_phase_offset_ns", g_ocxo1_clock.phase_offset_ns);
-  p.add("ocxo1_zero_established", g_ocxo1_clock.zero_established);
-  p.add("ocxo1_window_checks", g_ocxo1_clock.window_checks);
-  p.add("ocxo1_window_mismatches", g_ocxo1_clock.window_mismatches);
-  p.add("ocxo1_window_error_ns", g_ocxo1_clock.window_error_ns);
-  payload_add_lane_forensics_flat(p, "ocxo1", ocxo1_forensics_valid, ocxo1_forensics);
+  // Prediction remains an intentionally separate four-rail courtroom surface.
+  // Clock objects below carry live measurement and diagnostics, but not their
+  // static-prediction fields.
+  payload_add_prediction_summary_hierarchical(p);
 
-  // OCXO2 surface.
-  p.add("ocxo2_measured_gnss_ns_at_pps_vclock", public_ocxo2_ns);
-  p.add("ocxo2_ns_at_pps_vclock", public_ocxo2_ns);  // legacy alias
-  p.add("ocxo2_gnss_ns_between_edges", g_ocxo2_measurement.gnss_ns_between_edges);
-  p.add("ocxo2_counter_nominal_ns_between_edges",
-        ocxo2_forensics_valid ? ocxo2_forensics.counter_nominal_ns_between_edges : 0ULL);
-  p.add("ocxo2_bridge_gnss_ns_between_edges",
-        ocxo2_forensics_valid ? ocxo2_forensics.bridge_gnss_ns_between_edges : 0ULL);
-  p.add("ocxo2_bridge_residual_ns",
-        ocxo2_forensics_valid ? ocxo2_forensics.bridge_residual_ns : 0LL);
-  p.add("ocxo2_bridge_interval_valid",
-        ocxo2_forensics_valid && ocxo2_forensics.bridge_interval_valid);
-  p.add("ocxo2_dwt_cycles_between_edges", g_ocxo2_measurement.dwt_cycles_between_edges);
-  p.add("ocxo2_second_residual_ns", g_ocxo2_measurement.second_residual_ns);
-  p.add("ocxo2_phase_offset_ns", g_ocxo2_clock.phase_offset_ns);
-  p.add("ocxo2_zero_established", g_ocxo2_clock.zero_established);
-  p.add("ocxo2_window_checks", g_ocxo2_clock.window_checks);
-  p.add("ocxo2_window_mismatches", g_ocxo2_clock.window_mismatches);
-  p.add("ocxo2_window_error_ns", g_ocxo2_clock.window_error_ns);
-  payload_add_lane_forensics_flat(p, "ocxo2", ocxo2_forensics_valid, ocxo2_forensics);
+  payload_add_vclock_fragment(p,
+                              public_gnss_ns,
+                              vclock_forensics_valid,
+                              vclock_forensics);
 
-  // DAC + servo state (live values).
-  p.add("ocxo1_dac", ocxo1_dac.dac_fractional);
-  p.add("ocxo1_dac_last_write_ok", ocxo1_dac.io_last_write_ok);
-  p.add("ocxo1_dac_fault_latched", ocxo1_dac.io_fault_latched);
-  p.add("ocxo1_servo_predicted_residual_ns", ocxo1_dac.servo_predicted_residual, 6);
-  p.add("ocxo1_servo_last_step", ocxo1_dac.servo_last_step, 6);
-  p.add("ocxo1_servo_adjustments", ocxo1_dac.servo_adjustments);
+  payload_add_ocxo_fragment(p,
+                            "ocxo1",
+                            public_ocxo1_ns,
+                            g_ocxo1_clock,
+                            g_ocxo1_measurement,
+                            ocxo1_forensics_valid,
+                            ocxo1_forensics);
 
-  p.add("ocxo2_dac", ocxo2_dac.dac_fractional);
-  p.add("ocxo2_dac_last_write_ok", ocxo2_dac.io_last_write_ok);
-  p.add("ocxo2_dac_fault_latched", ocxo2_dac.io_fault_latched);
-  p.add("ocxo2_servo_predicted_residual_ns", ocxo2_dac.servo_predicted_residual, 6);
-  p.add("ocxo2_servo_last_step", ocxo2_dac.servo_last_step, 6);
-  p.add("ocxo2_servo_adjustments", ocxo2_dac.servo_adjustments);
+  payload_add_ocxo_fragment(p,
+                            "ocxo2",
+                            public_ocxo2_ns,
+                            g_ocxo2_clock,
+                            g_ocxo2_measurement,
+                            ocxo2_forensics_valid,
+                            ocxo2_forensics);
 
-  // ── Standardized statistics publication ──
-  //
-  // Every Welford publishes the same six fields.  Every frequency-bearing
-  // clock publishes the same tau/ppb pair.  Uniform sign convention:
-  // positive ppb = clock running FAST vs GNSS reference.
-
-  // Welford blocks (seven).
-  publish_welford(p, "dwt",          welford_dwt);
-  publish_welford(p, "vclock",       welford_vclock);
-  publish_welford(p, "ocxo1",        welford_ocxo1);
-  publish_welford(p, "ocxo2",        welford_ocxo2);
-  publish_welford(p, "pps_witness",  welford_pps_witness);
-  publish_welford(p, "ocxo1_dac",    welford_ocxo1_dac);
-  publish_welford(p, "ocxo2_dac",    welford_ocxo2_dac);
-
-  // Frequency pairs (four).  For all four clocks the Welford samples are
-  // already in ppb-compatible units (ppb for DWT; ns/sec == ppb numerically
-  // for VCLOCK and OCXOs).
-  publish_freq(p, "dwt",    welford_dwt.mean);
-  publish_freq(p, "vclock", welford_vclock.mean);
-  publish_freq(p, "ocxo1",  welford_ocxo1.mean);
-  publish_freq(p, "ocxo2",  welford_ocxo2.mean);
+  payload_add_dac_summary_hierarchical(p);
+  payload_add_stats_summary_hierarchical(p);
 
   g_last_fragment = p;
   publish("TIMEBASE_FRAGMENT", p);
@@ -1791,6 +2018,42 @@ static void add_alpha_event_payload(Payload& p,
   service.add("last_bad_counter_delta", f.diag_last_bad_counter_delta);
   service.add("last_counter_delta_ticks", f.diag_last_counter_delta_ticks);
   p.add_object("ocxo_service", service);
+
+  Payload regression;
+  regression.add("valid", f.regression_valid);
+  regression.add("sequence", f.regression_sequence);
+  regression.add("sample_count", f.regression_sample_count);
+  regression.add("observed_dwt_at_event",
+                 f.regression_observed_dwt_at_event);
+  regression.add("inferred_dwt_at_event",
+                 f.regression_inferred_dwt_at_event);
+  regression.add("inferred_minus_observed_cycles",
+                 f.regression_inferred_minus_observed_cycles);
+  regression.add("target_counter32_at_event",
+                 f.regression_target_counter32_at_event);
+  regression.add("target_hardware16_at_event",
+                 (uint32_t)f.regression_target_hardware16_at_event);
+  regression.add("observed_hardware16_at_event",
+                 (uint32_t)f.regression_observed_hardware16_at_event);
+  regression.add("slope_q16_cycles_per_sample",
+                 f.regression_slope_q16_cycles_per_sample);
+  regression.add("slope_delta_q16_cycles_per_sample",
+                 f.regression_slope_delta_q16_cycles_per_sample);
+  regression.add("fit_error_mean_q16_cycles",
+                 f.regression_fit_error_mean_q16_cycles);
+  regression.add("fit_error_stddev_q16_cycles",
+                 f.regression_fit_error_stddev_q16_cycles);
+  regression.add("fit_error_min_cycles",
+                 f.regression_fit_error_min_cycles);
+  regression.add("fit_error_max_cycles",
+                 f.regression_fit_error_max_cycles);
+  regression.add("fit_error_gt_plus4_count",
+                 f.regression_fit_error_gt_plus4_count);
+  regression.add("fit_error_lt_minus4_count",
+                 f.regression_fit_error_lt_minus4_count);
+  regression.add("fit_error_abs_gt4_count",
+                 f.regression_fit_error_abs_gt4_count);
+  p.add_object("regression", regression);
 }
 
 static void add_projection_payload(Payload& p,

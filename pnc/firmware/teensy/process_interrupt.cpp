@@ -64,6 +64,7 @@
 #include <math.h>
 #include <stdio.h>
 #include <strings.h>
+#include <climits>
 
 // process_clocks owns watchdog publication/stop semantics.  process_interrupt
 // only raises hard timing-identity faults through this narrow boundary.
@@ -205,6 +206,29 @@ static constexpr uint32_t OCXO_SERVICE_CLASS_NONE                   = 0;
 static constexpr uint32_t OCXO_SERVICE_CLASS_FALSE_IRQ              = 1;
 static constexpr uint32_t OCXO_SERVICE_CLASS_EARLY_PRETARGET        = 2;
 static constexpr uint32_t OCXO_SERVICE_CLASS_ON_OR_AFTER_TARGET     = 3;
+
+// 1 kHz regression custody.  The regression engine is currently diagnostic-only:
+// subscribers receive the traditional edge DWT while the fitted edge is carried
+// in interrupt_capture_diag_t for side-by-side analysis.  ISR context only
+// captures/enqueues observations; fit math runs in ASAP/foreground context.
+static constexpr uint32_t REGRESSION_SAMPLES_PER_SECOND = TICKS_PER_SECOND_EVENT;
+static constexpr uint32_t REGRESSION_COUNTER_DELTA_TICKS = OCXO_CADENCE_INTERVAL_TICKS;
+static constexpr uint32_t REGRESSION_MIN_SAMPLE_COUNT = 16;
+static constexpr int32_t  REGRESSION_FIT_ERROR_THRESHOLD_CYCLES = 4;
+static constexpr double   REGRESSION_Q16_SCALE = 65536.0;
+static_assert(REGRESSION_SAMPLES_PER_SECOND == 1000U,
+              "Regression windows are expected to be 1 kHz / one second");
+
+// VCLOCK regression remains disabled until it gets a non-dropping double-buffered
+// 1000-sample window.  The old 32-slot fact ring proved too small for the 1 kHz
+// VCLOCK rail and must not participate in timing authority.
+static constexpr bool VCLOCK_LINEAR_REGRESSION_ENABLED = false;
+
+// Regression is experimental/diagnostic in this build.  The subscriber-facing
+// DWT stays traditional while regression_inferred_dwt_at_event exposes what the
+// fitted edge would have been.
+static constexpr bool LINEAR_REGRESSION_AUTHORED_DWT = false;
+static constexpr bool LINEAR_REGRESSION_DIAGNOSTIC_ONLY = true;
 
 // ============================================================================
 // Step 0 migration baseline — report-only safety rails
@@ -1425,6 +1449,8 @@ static void synthetic_clock_bootstrap_from_hw16(synthetic_clock32_t& c, uint16_t
 static void vclock_clock_bootstrap_from_hw16(uint16_t hardware16);
 static uint32_t project_counter32_from_hw16(const synthetic_clock32_t& c, uint16_t hardware16);
 static inline void synthetic_clock_consume_pending_zero_if_any(synthetic_clock32_t& c);
+static void cadence_regression_reset_kind(interrupt_subscriber_kind_t kind);
+static void vclock_fact_ring_reset(void);
 
 static uint32_t vclock_synthetic_from_hardware_low16(uint16_t hardware_low16) {
   if (!g_vclock_clock32.zeroed) return (uint32_t)hardware_low16;
@@ -1452,6 +1478,8 @@ bool interrupt_clock32_zero_from_ns(interrupt_subscriber_kind_t kind, uint64_t n
   if (kind == interrupt_subscriber_kind_t::VCLOCK) {
     vclock_clock_zero_at_hardware_low16(ns, qtimer1_ch0_counter_now());
     g_vclock_lane.logical_count32_at_last_second = g_vclock_clock32.current_counter32;
+    cadence_regression_reset_kind(interrupt_subscriber_kind_t::VCLOCK);
+    vclock_fact_ring_reset();
     return true;
   }
 
@@ -1477,6 +1505,8 @@ bool interrupt_clock32_request_zero_from_ns(interrupt_subscriber_kind_t kind, ui
     g_vclock_clock32.pending_zero_ns = ns;
     g_vclock_clock32.pending_zero_counter32 = counter32;
     g_vclock_clock32.pending_zero_count++;
+    cadence_regression_reset_kind(interrupt_subscriber_kind_t::VCLOCK);
+    vclock_fact_ring_reset();
     return true;
   }
 
@@ -2129,6 +2159,332 @@ static const char* dispatch_timer_name(interrupt_subscriber_kind_t kind) {
 }
 
 // ============================================================================
+// Shared 1 kHz linear regression engine
+// ============================================================================
+
+struct cadence_regression_sample_t {
+  interrupt_subscriber_kind_t kind = interrupt_subscriber_kind_t::NONE;
+  uint32_t observed_dwt_at_event = 0;
+  uint32_t target_counter32_at_event = 0;
+  uint16_t target_hardware16_at_event = 0;
+  uint16_t observed_hardware16_at_event = 0;
+  bool one_second_due = false;
+};
+
+struct cadence_regression_result_t {
+  bool valid = false;
+  uint32_t sequence = 0;
+  uint32_t sample_count = 0;
+
+  uint32_t observed_dwt_at_event = 0;
+  uint32_t inferred_dwt_at_event = 0;
+  int32_t inferred_minus_observed_cycles = 0;
+
+  uint32_t target_counter32_at_event = 0;
+  uint16_t target_hardware16_at_event = 0;
+  uint16_t observed_hardware16_at_event = 0;
+
+  uint64_t slope_q16_cycles_per_sample = 0;
+  int64_t slope_delta_q16_cycles_per_sample = 0;
+  int32_t fit_error_mean_q16_cycles = 0;
+  uint32_t fit_error_stddev_q16_cycles = 0;
+  int32_t fit_error_min_cycles = 0;
+  int32_t fit_error_max_cycles = 0;
+  uint32_t fit_error_gt_plus4_count = 0;
+  uint32_t fit_error_lt_minus4_count = 0;
+  uint32_t fit_error_abs_gt4_count = 0;
+};
+
+struct cadence_regression_lane_t {
+  interrupt_subscriber_kind_t kind = interrupt_subscriber_kind_t::NONE;
+  bool window_active = false;
+  uint32_t sequence = 0;
+  uint32_t sample_total_count = 0;
+  uint32_t reset_count = 0;
+  uint32_t insufficient_count = 0;
+  uint32_t counter_discontinuity_count = 0;
+
+  uint32_t sample_count = 0;
+  uint32_t base_counter32 = 0;
+  uint32_t base_observed_dwt = 0;
+  uint32_t last_counter32 = 0;
+  uint32_t last_observed_dwt = 0;
+
+  bool previous_slope_valid = false;
+  double previous_slope_cycles_per_sample = 0.0;
+
+  int32_t observed_dwt_rel[REGRESSION_SAMPLES_PER_SECOND]{};
+  cadence_regression_result_t last_result{};
+};
+
+static cadence_regression_lane_t g_regression_vclock = {};
+static cadence_regression_lane_t g_regression_ocxo1 = {};
+static cadence_regression_lane_t g_regression_ocxo2 = {};
+
+static int32_t regression_round_i32(double value) {
+  return (int32_t)((value >= 0.0) ? (value + 0.5) : (value - 0.5));
+}
+
+static uint64_t regression_round_u64_q16(double value) {
+  if (value <= 0.0) return 0ULL;
+  return (uint64_t)(value * REGRESSION_Q16_SCALE + 0.5);
+}
+
+static uint32_t regression_round_u32_q16(double value) {
+  if (value <= 0.0) return 0U;
+  const double scaled = value * REGRESSION_Q16_SCALE + 0.5;
+  return (scaled > (double)UINT32_MAX) ? UINT32_MAX : (uint32_t)scaled;
+}
+
+static int32_t regression_round_i32_q16(double value) {
+  const double scaled = value * REGRESSION_Q16_SCALE;
+  if (scaled > (double)INT32_MAX) return INT32_MAX;
+  if (scaled < (double)INT32_MIN) return INT32_MIN;
+  return regression_round_i32(scaled);
+}
+
+static int64_t regression_round_i64_q16(double value) {
+  const double scaled = value * REGRESSION_Q16_SCALE;
+  return (int64_t)((scaled >= 0.0) ? (scaled + 0.5) : (scaled - 0.5));
+}
+
+static cadence_regression_lane_t*
+cadence_regression_for(interrupt_subscriber_kind_t kind) {
+  if (kind == interrupt_subscriber_kind_t::VCLOCK) return &g_regression_vclock;
+  if (kind == interrupt_subscriber_kind_t::OCXO1)  return &g_regression_ocxo1;
+  if (kind == interrupt_subscriber_kind_t::OCXO2)  return &g_regression_ocxo2;
+  return nullptr;
+}
+
+static const cadence_regression_lane_t*
+cadence_regression_for_const(interrupt_subscriber_kind_t kind) {
+  return cadence_regression_for(kind);
+}
+
+static void cadence_regression_reset_window(cadence_regression_lane_t& r) {
+  r.window_active = false;
+  r.sample_count = 0;
+  r.base_counter32 = 0;
+  r.base_observed_dwt = 0;
+  r.last_counter32 = 0;
+  r.last_observed_dwt = 0;
+}
+
+static void cadence_regression_reset_kind(interrupt_subscriber_kind_t kind) {
+  cadence_regression_lane_t* r = cadence_regression_for(kind);
+  if (!r) return;
+
+  const interrupt_subscriber_kind_t saved_kind = r->kind;
+  const uint32_t prior_reset_count = r->reset_count;
+  *r = cadence_regression_lane_t{};
+  r->kind = (saved_kind == interrupt_subscriber_kind_t::NONE) ? kind : saved_kind;
+  r->reset_count = prior_reset_count + 1U;
+}
+
+static void cadence_regression_reset_all(void) {
+  g_regression_vclock = cadence_regression_lane_t{};
+  g_regression_ocxo1 = cadence_regression_lane_t{};
+  g_regression_ocxo2 = cadence_regression_lane_t{};
+  g_regression_vclock.kind = interrupt_subscriber_kind_t::VCLOCK;
+  g_regression_ocxo1.kind = interrupt_subscriber_kind_t::OCXO1;
+  g_regression_ocxo2.kind = interrupt_subscriber_kind_t::OCXO2;
+}
+
+static cadence_regression_result_t
+cadence_regression_result_from_sample(cadence_regression_lane_t& r,
+                                      const cadence_regression_sample_t& sample,
+                                      bool valid) {
+  cadence_regression_result_t out{};
+  out.valid = valid;
+  out.sequence = r.sequence;
+  out.sample_count = r.sample_count;
+  out.observed_dwt_at_event = sample.observed_dwt_at_event;
+  out.inferred_dwt_at_event = sample.observed_dwt_at_event;
+  out.inferred_minus_observed_cycles = 0;
+  out.target_counter32_at_event = sample.target_counter32_at_event;
+  out.target_hardware16_at_event = sample.target_hardware16_at_event;
+  out.observed_hardware16_at_event = sample.observed_hardware16_at_event;
+  return out;
+}
+
+static cadence_regression_result_t
+cadence_regression_finalize(cadence_regression_lane_t& r,
+                            const cadence_regression_sample_t& event_sample) {
+  const uint32_t n = r.sample_count;
+  if (n < REGRESSION_MIN_SAMPLE_COUNT) {
+    r.insufficient_count++;
+    cadence_regression_result_t out =
+        cadence_regression_result_from_sample(r, event_sample, false);
+    r.last_result = out;
+    return out;
+  }
+
+  double sum_x = 0.0;
+  double sum_y = 0.0;
+  double sum_xx = 0.0;
+  double sum_xy = 0.0;
+
+  for (uint32_t i = 0; i < n; i++) {
+    const double x = (double)i;
+    const double y = (double)r.observed_dwt_rel[i];
+    sum_x += x;
+    sum_y += y;
+    sum_xx += x * x;
+    sum_xy += x * y;
+  }
+
+  const double denom = (double)n * sum_xx - sum_x * sum_x;
+  if (denom == 0.0) {
+    r.insufficient_count++;
+    cadence_regression_result_t out =
+        cadence_regression_result_from_sample(r, event_sample, false);
+    r.last_result = out;
+    return out;
+  }
+
+  const double slope = ((double)n * sum_xy - sum_x * sum_y) / denom;
+  const double intercept = (sum_y - slope * sum_x) / (double)n;
+  const double x_event = (double)(n - 1U);
+  const double inferred_rel_d = intercept + slope * x_event;
+  const int32_t inferred_rel = regression_round_i32(inferred_rel_d);
+
+  double mean = 0.0;
+  double m2 = 0.0;
+  int32_t min_err = INT32_MAX;
+  int32_t max_err = INT32_MIN;
+  uint32_t gt_plus4 = 0;
+  uint32_t lt_minus4 = 0;
+  uint32_t abs_gt4 = 0;
+
+  for (uint32_t i = 0; i < n; i++) {
+    const double estimate = intercept + slope * (double)i;
+    const double err_d = estimate - (double)r.observed_dwt_rel[i];
+    const int32_t err = regression_round_i32(err_d);
+
+    const double d1 = err_d - mean;
+    mean += d1 / (double)(i + 1U);
+    const double d2 = err_d - mean;
+    m2 += d1 * d2;
+
+    if (err < min_err) min_err = err;
+    if (err > max_err) max_err = err;
+    if (err_d > (double)REGRESSION_FIT_ERROR_THRESHOLD_CYCLES) gt_plus4++;
+    if (err_d < (double)(-REGRESSION_FIT_ERROR_THRESHOLD_CYCLES)) lt_minus4++;
+    if (fabs(err_d) > (double)REGRESSION_FIT_ERROR_THRESHOLD_CYCLES) abs_gt4++;
+  }
+
+  const double variance = (n >= 2U) ? (m2 / (double)(n - 1U)) : 0.0;
+  const double stddev = sqrt(variance < 0.0 ? 0.0 : variance);
+
+  r.sequence++;
+  cadence_regression_result_t out{};
+  out.valid = true;
+  out.sequence = r.sequence;
+  out.sample_count = n;
+  out.observed_dwt_at_event = event_sample.observed_dwt_at_event;
+  out.inferred_dwt_at_event = r.base_observed_dwt + (uint32_t)inferred_rel;
+  out.inferred_minus_observed_cycles =
+      (int32_t)(out.inferred_dwt_at_event - event_sample.observed_dwt_at_event);
+  out.target_counter32_at_event = event_sample.target_counter32_at_event;
+  out.target_hardware16_at_event = event_sample.target_hardware16_at_event;
+  out.observed_hardware16_at_event = event_sample.observed_hardware16_at_event;
+  out.slope_q16_cycles_per_sample = regression_round_u64_q16(slope);
+  out.slope_delta_q16_cycles_per_sample = r.previous_slope_valid
+      ? regression_round_i64_q16(slope - r.previous_slope_cycles_per_sample)
+      : 0;
+  out.fit_error_mean_q16_cycles = regression_round_i32_q16(mean);
+  out.fit_error_stddev_q16_cycles = regression_round_u32_q16(stddev);
+  out.fit_error_min_cycles = min_err;
+  out.fit_error_max_cycles = max_err;
+  out.fit_error_gt_plus4_count = gt_plus4;
+  out.fit_error_lt_minus4_count = lt_minus4;
+  out.fit_error_abs_gt4_count = abs_gt4;
+
+  r.previous_slope_cycles_per_sample = slope;
+  r.previous_slope_valid = true;
+  r.last_result = out;
+  return out;
+}
+
+static cadence_regression_result_t
+cadence_regression_feed_sample(interrupt_subscriber_kind_t kind,
+                               const cadence_regression_sample_t& sample) {
+  cadence_regression_lane_t* r = cadence_regression_for(kind);
+  if (!r) return cadence_regression_result_t{};
+
+  r->sample_total_count++;
+
+  if (!r->window_active || r->sample_count >= REGRESSION_SAMPLES_PER_SECOND) {
+    cadence_regression_reset_window(*r);
+    r->window_active = true;
+    r->base_counter32 = sample.target_counter32_at_event;
+    r->base_observed_dwt = sample.observed_dwt_at_event;
+  } else {
+    const uint32_t expected_counter =
+        r->base_counter32 + r->sample_count * REGRESSION_COUNTER_DELTA_TICKS;
+    if (sample.target_counter32_at_event != expected_counter) {
+      r->counter_discontinuity_count++;
+      cadence_regression_reset_window(*r);
+      r->window_active = true;
+      r->base_counter32 = sample.target_counter32_at_event;
+      r->base_observed_dwt = sample.observed_dwt_at_event;
+    }
+  }
+
+  const uint32_t idx = r->sample_count;
+  if (idx < REGRESSION_SAMPLES_PER_SECOND) {
+    r->observed_dwt_rel[idx] =
+        (int32_t)(sample.observed_dwt_at_event - r->base_observed_dwt);
+    r->sample_count++;
+  }
+
+  r->last_counter32 = sample.target_counter32_at_event;
+  r->last_observed_dwt = sample.observed_dwt_at_event;
+
+  if (!sample.one_second_due) {
+    return cadence_regression_result_t{};
+  }
+
+  cadence_regression_result_t out = cadence_regression_finalize(*r, sample);
+  cadence_regression_reset_window(*r);
+  return out;
+}
+
+static void copy_regression_diag(interrupt_capture_diag_t& diag,
+                                 const cadence_regression_result_t* r) {
+  if (!r) return;
+
+  diag.regression_valid = r->valid;
+  diag.regression_sequence = r->sequence;
+  diag.regression_sample_count = r->sample_count;
+  diag.regression_observed_dwt_at_event = r->observed_dwt_at_event;
+  diag.regression_inferred_dwt_at_event = r->inferred_dwt_at_event;
+  diag.regression_inferred_minus_observed_cycles =
+      r->inferred_minus_observed_cycles;
+  diag.regression_target_counter32_at_event = r->target_counter32_at_event;
+  diag.regression_target_hardware16_at_event = r->target_hardware16_at_event;
+  diag.regression_observed_hardware16_at_event =
+      r->observed_hardware16_at_event;
+  diag.regression_slope_q16_cycles_per_sample =
+      r->slope_q16_cycles_per_sample;
+  diag.regression_slope_delta_q16_cycles_per_sample =
+      r->slope_delta_q16_cycles_per_sample;
+  diag.regression_fit_error_mean_q16_cycles =
+      r->fit_error_mean_q16_cycles;
+  diag.regression_fit_error_stddev_q16_cycles =
+      r->fit_error_stddev_q16_cycles;
+  diag.regression_fit_error_min_cycles = r->fit_error_min_cycles;
+  diag.regression_fit_error_max_cycles = r->fit_error_max_cycles;
+  diag.regression_fit_error_gt_plus4_count = r->fit_error_gt_plus4_count;
+  diag.regression_fit_error_lt_minus4_count = r->fit_error_lt_minus4_count;
+  diag.regression_fit_error_abs_gt4_count = r->fit_error_abs_gt4_count;
+
+  // Diagnostic-only build: do not promote the fitted DWT into any legacy
+  // correction/authority field.  Alpha/Beta can compare diag.dwt_at_event
+  // against regression_inferred_dwt_at_event without changing physics math.
+}
+
+// ============================================================================
 // Diag fill + event dispatch
 // ============================================================================
 
@@ -2175,8 +2531,13 @@ static void fill_diag(interrupt_capture_diag_t& diag,
       diag.ocxo_perishable_fact_sequence = lane->witness_last_fact_sequence;
       diag.ocxo_service_correction_cycles =
           lane->witness_last_service_correction_cycles;
-      diag.ocxo_service_corrected_dwt_at_event =
-          lane->witness_last_service_corrected_dwt;
+      // Traditional-authority build: do not populate the legacy
+      // service-corrected endpoint field.  Alpha treats zero here as
+      // "no replacement" and consumes event.dwt_at_event directly.
+      // The scalar correction magnitude remains visible in
+      // ocxo_service_correction_cycles; the regression-inferred endpoint is
+      // published in the regression_* diagnostic fields.
+      diag.ocxo_service_corrected_dwt_at_event = 0U;
       diag.ocxo_fact_ring_overflow_count = lane->witness_fact_overflow_count;
       diag.ocxo_counter_delta_violation_count =
           lane->witness_counter_delta_violation_count;
@@ -2204,7 +2565,8 @@ static void emit_one_second_event(interrupt_subscriber_runtime_t& rt,
                                   uint32_t pps_coincidence_cycles = 0,
                                   bool     pps_coincidence_valid  = false,
                                   const dwt_repair_diag_t* repair = nullptr,
-                                  bool dispatch_immediately = false) {
+                                  bool dispatch_immediately = false,
+                                  const cadence_regression_result_t* regression = nullptr) {
   if (!rt.active) return;
 
   interrupt_event_t event {};
@@ -2235,6 +2597,7 @@ static void emit_one_second_event(interrupt_subscriber_runtime_t& rt,
 
   interrupt_capture_diag_t diag {};
   fill_diag(diag, rt, event);
+  copy_regression_diag(diag, regression);
   if (repair) {
     diag.dwt_synthetic = repair->synthetic;
     diag.dwt_repair_candidate = repair->candidate;
@@ -2258,6 +2621,187 @@ static void emit_one_second_event(interrupt_subscriber_runtime_t& rt,
     maybe_dispatch_event(rt);
   } else {
     timepop_arm_asap(deferred_dispatch_callback, &rt, dispatch_timer_name(rt.desc->kind));
+  }
+}
+
+// ============================================================================
+// VCLOCK perishable cadence fact ring
+// ============================================================================
+
+static constexpr uint32_t VCLOCK_PERISHABLE_FACT_RING_SIZE = 32;
+static constexpr const char* VCLOCK_FACT_DRAIN_NAME = "VCLOCK_FACT_DRAIN";
+
+struct vclock_perishable_fact_t {
+  uint32_t sequence = 0;
+  uint32_t observed_dwt_at_event = 0;
+  uint32_t target_counter32 = 0;
+  uint16_t target_low16 = 0;
+  uint16_t observed_low16 = 0;
+  bool one_second_due = false;
+  bool witness_pps_valid = false;
+  pps_t witness_pps{};
+  uint32_t fallback_sequence = 0;
+};
+
+struct vclock_perishable_ring_t {
+  vclock_perishable_fact_t facts[VCLOCK_PERISHABLE_FACT_RING_SIZE]{};
+  volatile uint32_t head = 0;
+  volatile uint32_t tail = 0;
+  volatile uint32_t count = 0;
+  volatile bool drain_armed = false;
+  volatile uint32_t sequence = 0;
+  volatile uint32_t enqueue_count = 0;
+  volatile uint32_t drain_count = 0;
+  volatile uint32_t overflow_count = 0;
+  volatile uint32_t high_water = 0;
+  volatile uint32_t asap_arm_count = 0;
+  volatile uint32_t asap_fail_count = 0;
+};
+
+static vclock_perishable_ring_t g_vclock_fact_ring = {};
+static void vclock_fact_drain_callback(timepop_ctx_t*, timepop_diag_t*, void*);
+
+static void vclock_fact_ring_reset(void) {
+  for (uint32_t i = 0; i < VCLOCK_PERISHABLE_FACT_RING_SIZE; i++) {
+    g_vclock_fact_ring.facts[i] = vclock_perishable_fact_t{};
+  }
+  g_vclock_fact_ring.head = 0;
+  g_vclock_fact_ring.tail = 0;
+  g_vclock_fact_ring.count = 0;
+  g_vclock_fact_ring.drain_armed = false;
+  g_vclock_fact_ring.sequence = 0;
+  g_vclock_fact_ring.enqueue_count = 0;
+  g_vclock_fact_ring.drain_count = 0;
+  g_vclock_fact_ring.overflow_count = 0;
+  g_vclock_fact_ring.high_water = 0;
+  g_vclock_fact_ring.asap_arm_count = 0;
+  g_vclock_fact_ring.asap_fail_count = 0;
+}
+
+static bool vclock_fact_ring_pop(vclock_perishable_fact_t& out) {
+  __disable_irq();
+  if (g_vclock_fact_ring.count == 0) {
+    g_vclock_fact_ring.drain_armed = false;
+    __enable_irq();
+    return false;
+  }
+
+  out = g_vclock_fact_ring.facts[g_vclock_fact_ring.tail];
+  g_vclock_fact_ring.tail =
+      (g_vclock_fact_ring.tail + 1U) % VCLOCK_PERISHABLE_FACT_RING_SIZE;
+  g_vclock_fact_ring.count--;
+  g_vclock_fact_ring.drain_count++;
+  if (g_vclock_fact_ring.count == 0) {
+    g_vclock_fact_ring.drain_armed = false;
+  }
+  __enable_irq();
+  return true;
+}
+
+static bool vclock_fact_ring_push_from_isr(vclock_perishable_fact_t fact) {
+  if (g_vclock_fact_ring.count >= VCLOCK_PERISHABLE_FACT_RING_SIZE) {
+    g_vclock_fact_ring.overflow_count++;
+    g_vclock_lane.miss_count++;
+    return false;
+  }
+
+  fact.sequence = ++g_vclock_fact_ring.sequence;
+  g_vclock_fact_ring.facts[g_vclock_fact_ring.head] = fact;
+  g_vclock_fact_ring.head =
+      (g_vclock_fact_ring.head + 1U) % VCLOCK_PERISHABLE_FACT_RING_SIZE;
+  g_vclock_fact_ring.count++;
+  g_vclock_fact_ring.enqueue_count++;
+  if (g_vclock_fact_ring.count > g_vclock_fact_ring.high_water) {
+    g_vclock_fact_ring.high_water = g_vclock_fact_ring.count;
+  }
+
+  if (!g_vclock_fact_ring.drain_armed) {
+    g_vclock_fact_ring.drain_armed = true;
+    g_vclock_fact_ring.asap_arm_count++;
+    const timepop_handle_t h =
+        timepop_arm_asap(vclock_fact_drain_callback, nullptr,
+                         VCLOCK_FACT_DRAIN_NAME);
+    if (h == TIMEPOP_INVALID_HANDLE) {
+      g_vclock_fact_ring.drain_armed = false;
+      g_vclock_fact_ring.asap_fail_count++;
+      return false;
+    }
+  }
+
+  return true;
+}
+
+static void vclock_apply_perishable_fact_deferred(
+    const vclock_perishable_fact_t& fact) {
+  cadence_regression_sample_t sample{};
+  sample.kind = interrupt_subscriber_kind_t::VCLOCK;
+  sample.observed_dwt_at_event = fact.observed_dwt_at_event;
+  sample.target_counter32_at_event = fact.target_counter32;
+  sample.target_hardware16_at_event = fact.target_low16;
+  sample.observed_hardware16_at_event = fact.observed_low16;
+  sample.one_second_due = fact.one_second_due;
+
+  cadence_regression_result_t regression =
+      cadence_regression_feed_sample(interrupt_subscriber_kind_t::VCLOCK,
+                                     sample);
+
+  if (!fact.one_second_due || !g_rt_vclock || !g_rt_vclock->active) {
+    return;
+  }
+
+  const uint32_t inferred_dwt = regression.valid
+      ? regression.inferred_dwt_at_event
+      : fact.observed_dwt_at_event;
+
+  uint32_t coincidence_cycles = 0;
+  bool coincidence_valid = false;
+  if (fact.witness_pps_valid && fact.witness_pps.sequence > 0) {
+    const int32_t cycles_since_pps =
+        (int32_t)(inferred_dwt - fact.witness_pps.dwt_at_edge);
+    if (llabs((long long)cycles_since_pps) <
+        DWT_PPS_COINCIDENCE_THRESHOLD_CYCLES) {
+      coincidence_cycles = (uint32_t)(cycles_since_pps >= 0
+          ? cycles_since_pps
+          : -cycles_since_pps);
+      coincidence_valid = true;
+    }
+  }
+
+  const dwt_repair_diag_t repair =
+      vclock_endpoint_repair_diagnostic(fact.observed_dwt_at_event);
+
+  const pps_t witness_pps = fact.witness_pps_valid ? fact.witness_pps : pps_t{};
+  publish_vclock_domain_pps_vclock(witness_pps,
+                                    (witness_pps.sequence != 0)
+                                        ? witness_pps.sequence
+                                        : fact.fallback_sequence,
+                                    inferred_dwt,
+                                    fact.target_counter32,
+                                    fact.target_low16);
+
+  emit_one_second_event(*g_rt_vclock,
+                        inferred_dwt,
+                        fact.target_counter32,
+                        coincidence_cycles,
+                        coincidence_valid,
+                        &repair,
+                        true,
+                        &regression);
+
+  if (g_pps_edge_dispatch) {
+    timepop_arm_asap(pps_edge_dispatch_trampoline,
+                     nullptr,
+                     "PPS_VCLOCK_DISPATCH");
+  }
+}
+
+static void vclock_fact_drain_callback(timepop_ctx_t*,
+                                       timepop_diag_t*,
+                                       void*) {
+  for (;;) {
+    vclock_perishable_fact_t fact{};
+    if (!vclock_fact_ring_pop(fact)) break;
+    vclock_apply_perishable_fact_deferred(fact);
   }
 }
 
@@ -2427,6 +2971,7 @@ static void ocxo_lane_install_logical_grid(interrupt_subscriber_kind_t kind,
   lane.witness_previous_event_counter32_valid = false;
   lane.witness_previous_event_counter32 = 0;
   lane.witness_last_counter_delta_ticks = 0;
+  cadence_regression_reset_kind(kind);
 
   if (lane.active || smartzero_is_current_lane(kind)) {
     (void)ocxo_lane_start_local_cadence(kind, lane, clock32, reason);
@@ -2922,6 +3467,16 @@ static void ocxo_apply_perishable_fact_deferred(
                           fact.target_low16,
                           fact.service_counter_low16);
 
+  cadence_regression_sample_t regression_sample{};
+  regression_sample.kind = ctx.kind;
+  regression_sample.observed_dwt_at_event = fact.service_dwt_at_event;
+  regression_sample.target_counter32_at_event = fact.target_counter32;
+  regression_sample.target_hardware16_at_event = fact.target_low16;
+  regression_sample.observed_hardware16_at_event = fact.service_counter_low16;
+  regression_sample.one_second_due = fact.one_second_due;
+  cadence_regression_result_t regression =
+      cadence_regression_feed_sample(ctx.kind, regression_sample);
+
   if (!fact.one_second_due || !rt || !rt->active) {
     return;
   }
@@ -2929,7 +3484,11 @@ static void ocxo_apply_perishable_fact_deferred(
   lane->witness_fire_count++;
   lane->irq_count++;
   lane->logical_count32_at_last_second = fact.target_counter32;
-  lane->witness_last_event_dwt = fact.service_dwt_at_event;
+  // Diagnostic-only regression: publish the traditional service-observed
+  // edge DWT and carry the fitted edge in the diagnostic payload.
+  const uint32_t published_dwt = fact.service_dwt_at_event;
+
+  lane->witness_last_event_dwt = published_dwt;
   lane->witness_last_event_counter32 = fact.target_counter32;
   lane->witness_last_event_published = true;
   lane->witness_valid_publish_count++;
@@ -2952,15 +3511,16 @@ static void ocxo_apply_perishable_fact_deferred(
   lane->witness_previous_event_counter32_valid = true;
 
   // We are already in TimePop ASAP/foreground context. Dispatch the authored
-  // OCXO edge directly from the fact drain. Canonical DWT remains the raw
-  // service DWT for this pass; corrected DWT is diagnostic-only.
+  // OCXO edge directly from the fact drain. Subscriber-facing DWT is the
+  // traditional service-observed endpoint; regression remains diagnostic-only.
   emit_one_second_event(*rt,
-                        fact.service_dwt_at_event,
+                        published_dwt,
                         fact.target_counter32,
                         0,
                         false,
                         nullptr,
-                        true);
+                        true,
+                        &regression);
 }
 
 static void ocxo_fact_drain_callback(timepop_ctx_t*,
@@ -3798,6 +4358,7 @@ bool interrupt_start(interrupt_subscriber_kind_t kind) {
   if (!rt || !rt->desc) return false;
   rt->active = true;
   rt->start_count++;
+  cadence_regression_reset_kind(kind);
 
   if (kind == interrupt_subscriber_kind_t::VCLOCK) {
     g_vclock_lane.active = true;
@@ -3828,6 +4389,7 @@ bool interrupt_stop(interrupt_subscriber_kind_t kind) {
   if (!rt || !rt->desc) return false;
   rt->active = false;
   rt->stop_count++;
+  cadence_regression_reset_kind(kind);
 
   if (kind == interrupt_subscriber_kind_t::VCLOCK) {
     g_vclock_lane.active = false;
@@ -3846,6 +4408,8 @@ bool interrupt_stop(interrupt_subscriber_kind_t kind) {
 void interrupt_request_pps_rebootstrap(void) {
   g_pps_rebootstrap_pending = true;
   g_vclock_epoch_latch = vclock_epoch_latch_t{};
+  cadence_regression_reset_kind(interrupt_subscriber_kind_t::VCLOCK);
+  vclock_fact_ring_reset();
   // Rebootstrap selects a fresh PPS_VCLOCK edge identity.
   g_pvc_anchor_reset_pending = true;
 }
@@ -4104,7 +4668,9 @@ static void runtime_reset_for_init(void) {
   runtime_bootstrap_synthetic_clocks_if_ready();
   runtime_reset_qtimer_host_state();
   runtime_reset_cadence_minder_state();
+  vclock_fact_ring_reset();
   runtime_reset_ocxo_fact_rings();
+  cadence_regression_reset_all();
 }
 
 void process_interrupt_init(void) {
@@ -4185,6 +4751,11 @@ struct payload_prefix_t {
     p.add(key, value);
   }
 
+  void add_i64(const char* suffix, int64_t value) {
+    make_key(suffix);
+    p.add(key, value);
+  }
+
   void add_str(const char* suffix, const char* value) {
     make_key(suffix);
     p.add(key, value ? value : "");
@@ -4205,6 +4776,56 @@ static void add_bridge_stats_payload(Payload& p,
   out.add_u32("anchor_last_sequence_used", s.last_anchor_sequence_used);
   out.add_u64("anchor_last_ns_delta", s.last_anchor_ns_delta);
   out.add_u32("anchor_last_failure_mask", s.last_anchor_failure_mask);
+}
+
+static void add_regression_payload(Payload& p,
+                                   const char* prefix,
+                                   const cadence_regression_lane_t& r) {
+  payload_prefix_t out(p, prefix);
+  const cadence_regression_result_t& last = r.last_result;
+
+  out.add_bool("regression_enabled",
+               r.kind != interrupt_subscriber_kind_t::VCLOCK ||
+               VCLOCK_LINEAR_REGRESSION_ENABLED);
+  out.add_u32("regression_samples_per_second", REGRESSION_SAMPLES_PER_SECOND);
+  out.add_u32("regression_sample_total_count", r.sample_total_count);
+  out.add_u32("regression_window_sample_count", r.sample_count);
+  out.add_u32("regression_reset_count", r.reset_count);
+  out.add_u32("regression_insufficient_count", r.insufficient_count);
+  out.add_u32("regression_counter_discontinuity_count",
+              r.counter_discontinuity_count);
+
+  out.add_bool("regression_last_valid", last.valid);
+  out.add_u32("regression_last_sequence", last.sequence);
+  out.add_u32("regression_last_sample_count", last.sample_count);
+  out.add_u32("regression_last_observed_dwt", last.observed_dwt_at_event);
+  out.add_u32("regression_last_inferred_dwt", last.inferred_dwt_at_event);
+  out.add_i32("regression_last_inferred_minus_observed_cycles",
+              last.inferred_minus_observed_cycles);
+  out.add_u32("regression_last_target_counter32",
+              last.target_counter32_at_event);
+  out.add_u32("regression_last_target_hardware16",
+              (uint32_t)last.target_hardware16_at_event);
+  out.add_u32("regression_last_observed_hardware16",
+              (uint32_t)last.observed_hardware16_at_event);
+  out.add_u64("regression_last_slope_q16_cycles_per_sample",
+              last.slope_q16_cycles_per_sample);
+  out.add_i64("regression_last_slope_delta_q16_cycles_per_sample",
+              last.slope_delta_q16_cycles_per_sample);
+  out.add_i32("regression_last_fit_error_mean_q16_cycles",
+              last.fit_error_mean_q16_cycles);
+  out.add_u32("regression_last_fit_error_stddev_q16_cycles",
+              last.fit_error_stddev_q16_cycles);
+  out.add_i32("regression_last_fit_error_min_cycles",
+              last.fit_error_min_cycles);
+  out.add_i32("regression_last_fit_error_max_cycles",
+              last.fit_error_max_cycles);
+  out.add_u32("regression_last_fit_error_gt_plus4_count",
+              last.fit_error_gt_plus4_count);
+  out.add_u32("regression_last_fit_error_lt_minus4_count",
+              last.fit_error_lt_minus4_count);
+  out.add_u32("regression_last_fit_error_abs_gt4_count",
+              last.fit_error_abs_gt4_count);
 }
 // ============================================================================
 // Commands
@@ -4241,11 +4862,17 @@ static void add_runtime_payload(Payload& p) {
   p.add("hardware_ready", g_interrupt_hw_ready);
   p.add("runtime_ready",  g_interrupt_runtime_ready);
   p.add("irqs_enabled",   g_interrupt_irqs_enabled);
-  p.add("timing_arch_step", "LANE_LOCAL_OCXO_1KHZ_CADENCE");
+  p.add("timing_arch_step",
+        VCLOCK_LINEAR_REGRESSION_ENABLED
+            ? "LANE_LOCAL_1KHZ_LINEAR_REGRESSION"
+            : "OCXO_LINEAR_REGRESSION_VCLOCK_DIRECT_SAFEMODE");
   p.add("timing_arch_behavior_changed", true);
-  p.add("timing_arch_vclock_authority", "QTIMER1_CH2_TIMEPOP_CADENCE");
-  p.add("timing_arch_ocxo_model", "LOCAL_QTIMER_1KHZ_ROLLOVER_CADENCE");
-  p.add("timing_arch_ocxo_migration_stage", "LANE_LOCAL_CADENCE_PRE_REGRESSION");
+  p.add("timing_arch_vclock_authority",
+        VCLOCK_LINEAR_REGRESSION_ENABLED
+            ? "QTIMER1_CH2_TIMEPOP_CADENCE_REGRESSION"
+            : "QTIMER1_CH2_TIMEPOP_DIRECT_SAFEMODE");
+  p.add("timing_arch_ocxo_model", "LOCAL_QTIMER_1KHZ_ROLLOVER_REGRESSION");
+  p.add("timing_arch_ocxo_migration_stage", "LINEAR_REGRESSION_AUTHORED_DWT");
   p.add("subscriber_count", g_subscriber_count);
   p.add("single_cadence_agent", false);
   p.add("cadence_minder_isr_mode", true);
@@ -4561,6 +5188,16 @@ static void add_vclock_lane_payload(Payload& p, bool detailed) {
   p.add("vclock_dwt_repair_max_abs_error_cycles", g_vclock_repair_stats.max_abs_error_cycles);
 
   add_vclock_clock32_payload(p, "vclock");
+  p.add("vclock_perishable_fact_ring_size", VCLOCK_PERISHABLE_FACT_RING_SIZE);
+  p.add("vclock_perishable_fact_ring_count", g_vclock_fact_ring.count);
+  p.add("vclock_perishable_fact_enqueue_count", g_vclock_fact_ring.enqueue_count);
+  p.add("vclock_perishable_fact_drain_count", g_vclock_fact_ring.drain_count);
+  p.add("vclock_perishable_fact_overflow_count", g_vclock_fact_ring.overflow_count);
+  p.add("vclock_perishable_fact_high_water", g_vclock_fact_ring.high_water);
+  p.add("vclock_perishable_fact_asap_arm_count", g_vclock_fact_ring.asap_arm_count);
+  p.add("vclock_perishable_fact_asap_fail_count", g_vclock_fact_ring.asap_fail_count);
+  p.add("vclock_perishable_fact_drain_armed", g_vclock_fact_ring.drain_armed);
+  add_regression_payload(p, "vclock", g_regression_vclock);
   p.add("qtimer1_ch1_active", g_qtimer1_ch1_active);
   p.add("qtimer1_ch1_sequence", g_qtimer1_ch1_sequence);
   p.add("qtimer1_ch1_target_counter32", g_qtimer1_ch1_target_counter32);
@@ -4847,6 +5484,8 @@ static void add_ocxo_lane_payload(Payload& p,
   add_ocxo_clock32_payload(p, ctx.prefix, clock32);
   add_ocxo_qtimer_payload(out, ctx, qdiag);
   add_ocxo_perishable_ring_payload(out, ctx);
+  const cadence_regression_lane_t* regression = cadence_regression_for_const(ctx.kind);
+  if (regression) add_regression_payload(p, ctx.prefix, *regression);
 }
 static void add_ocxo_compact_payload(Payload& p,
                                      const ocxo_runtime_context_t& ctx) {
@@ -4877,6 +5516,18 @@ static void add_ocxo_compact_payload(Payload& p,
   out.add_u32("fact_overflow_count", ring.overflow_count);
   out.add_u32("fact_high_water", ring.high_water);
   out.add_u32("fact_asap_fail_count", ring.asap_fail_count);
+
+  const cadence_regression_lane_t* regression = cadence_regression_for_const(ctx.kind);
+  if (regression) {
+    out.add_bool("regression_last_valid", regression->last_result.valid);
+    out.add_u32("regression_last_sample_count", regression->last_result.sample_count);
+    out.add_i32("regression_last_inferred_minus_observed_cycles",
+                regression->last_result.inferred_minus_observed_cycles);
+    out.add_u32("regression_last_fit_error_stddev_q16_cycles",
+                regression->last_result.fit_error_stddev_q16_cycles);
+    out.add_u32("regression_last_fit_error_abs_gt4_count",
+                regression->last_result.fit_error_abs_gt4_count);
+  }
 }
 
 static Payload cmd_report(const Payload&) {
@@ -4895,8 +5546,12 @@ static Payload cmd_report(const Payload&) {
   p.add("hardware_ready", g_interrupt_hw_ready);
   p.add("runtime_ready",  g_interrupt_runtime_ready);
   p.add("irqs_enabled",   g_interrupt_irqs_enabled);
-  p.add("timing_arch_step", "LANE_LOCAL_OCXO_1KHZ_CADENCE");
+  p.add("timing_arch_step", "TRADITIONAL_DWT_WITH_REGRESSION_DIAGNOSTICS");
   p.add("timing_arch_behavior_changed", true);
+  p.add("linear_regression_authored_dwt", LINEAR_REGRESSION_AUTHORED_DWT);
+  p.add("linear_regression_diagnostic_only", LINEAR_REGRESSION_DIAGNOSTIC_ONLY);
+  p.add("vclock_linear_regression_enabled", VCLOCK_LINEAR_REGRESSION_ENABLED);
+  p.add("ocxo_linear_regression_enabled", true);
   p.add("single_cadence_agent", false);
   p.add("cadence_minder_isr_mode", true);
   p.add("ocxo_lane_local_cadence", true);
@@ -4941,6 +5596,21 @@ static Payload cmd_report(const Payload&) {
   p.add("vclock_dispatch_count", g_rt_vclock ? g_rt_vclock->dispatch_count : 0U);
   p.add("vclock_irq_count", g_vclock_lane.irq_count);
   p.add("vclock_miss_count", g_vclock_lane.miss_count);
+  p.add("vclock_linear_regression_enabled", VCLOCK_LINEAR_REGRESSION_ENABLED);
+  p.add("vclock_fact_ring_size", VCLOCK_PERISHABLE_FACT_RING_SIZE);
+  p.add("vclock_fact_enqueue_count", g_vclock_fact_ring.enqueue_count);
+  p.add("vclock_fact_drain_count", g_vclock_fact_ring.drain_count);
+  p.add("vclock_fact_overflow_count", g_vclock_fact_ring.overflow_count);
+  p.add("vclock_fact_high_water", g_vclock_fact_ring.high_water);
+  p.add("vclock_fact_asap_fail_count", g_vclock_fact_ring.asap_fail_count);
+  p.add("vclock_regression_last_valid", g_regression_vclock.last_result.valid);
+  p.add("vclock_regression_last_sample_count", g_regression_vclock.last_result.sample_count);
+  p.add("vclock_regression_last_inferred_minus_observed_cycles",
+        g_regression_vclock.last_result.inferred_minus_observed_cycles);
+  p.add("vclock_regression_last_fit_error_stddev_q16_cycles",
+        g_regression_vclock.last_result.fit_error_stddev_q16_cycles);
+  p.add("vclock_regression_last_fit_error_abs_gt4_count",
+        g_regression_vclock.last_result.fit_error_abs_gt4_count);
 
   add_ocxo_compact_payload(p, g_ocxo1_ctx);
   add_ocxo_compact_payload(p, g_ocxo2_ctx);

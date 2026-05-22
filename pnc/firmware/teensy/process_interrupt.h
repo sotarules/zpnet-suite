@@ -184,8 +184,10 @@ struct interrupt_event_t {
   interrupt_lane_t            lane     = interrupt_lane_t::NONE;
   interrupt_event_status_t    status   = interrupt_event_status_t::OK;
 
-  // Latency-adjusted DWT coordinate of the lane's 1 kHz compare event on the
-  // 1000th tick.  Derived from the ISR's first-instruction _raw capture.
+  // Traditional event-coordinate DWT of the lane's one-second edge.
+  // Experimental 1 kHz linear-regression inference is carried separately in
+  // interrupt_capture_diag_t and does not replace this subscriber-facing value
+  // in the diagnostic-only build.
   uint32_t dwt_at_event = 0;
 
   // GNSS ns at the event.  For VCLOCK, authored from the VCLOCK counter
@@ -251,6 +253,29 @@ struct interrupt_capture_diag_t {
   int32_t  dwt_synthetic_error_cycles = 0;
   uint32_t dwt_synthetic_threshold_cycles = 0;
   const char* dwt_synthetic_reason = nullptr;
+
+  // 1 kHz cadence linear-regression audit.  In the diagnostic-only build,
+  // subscribers still receive the traditional event DWT in event.dwt_at_event /
+  // diag.dwt_at_event.  These fields expose the fitted endpoint and per-second
+  // fit quality side-by-side without changing timing authority.
+  bool     regression_valid = false;
+  uint32_t regression_sequence = 0;
+  uint32_t regression_sample_count = 0;
+  uint32_t regression_observed_dwt_at_event = 0;
+  uint32_t regression_inferred_dwt_at_event = 0;
+  int32_t  regression_inferred_minus_observed_cycles = 0;
+  uint32_t regression_target_counter32_at_event = 0;
+  uint16_t regression_target_hardware16_at_event = 0;
+  uint16_t regression_observed_hardware16_at_event = 0;
+  uint64_t regression_slope_q16_cycles_per_sample = 0;
+  int64_t  regression_slope_delta_q16_cycles_per_sample = 0;
+  int32_t  regression_fit_error_mean_q16_cycles = 0;
+  uint32_t regression_fit_error_stddev_q16_cycles = 0;
+  int32_t  regression_fit_error_min_cycles = 0;
+  int32_t  regression_fit_error_max_cycles = 0;
+  uint32_t regression_fit_error_gt_plus4_count = 0;
+  uint32_t regression_fit_error_lt_minus4_count = 0;
+  uint32_t regression_fit_error_abs_gt4_count = 0;
 
   // DWT→PPS_VCLOCK anchor-selection diagnostics.
   // Populated for OCXO and TIMEPOP events whose GNSS coordinate is derived

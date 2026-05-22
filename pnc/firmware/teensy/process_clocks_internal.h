@@ -333,6 +333,25 @@ struct clocks_alpha_lane_forensics_t {
   uint32_t diag_counter_delta_violation_count;
   uint32_t diag_last_bad_counter_delta;
   uint32_t diag_last_counter_delta_ticks;
+
+  bool     regression_valid;
+  uint32_t regression_sequence;
+  uint32_t regression_sample_count;
+  uint32_t regression_observed_dwt_at_event;
+  uint32_t regression_inferred_dwt_at_event;
+  int32_t  regression_inferred_minus_observed_cycles;
+  uint32_t regression_target_counter32_at_event;
+  uint16_t regression_target_hardware16_at_event;
+  uint16_t regression_observed_hardware16_at_event;
+  uint64_t regression_slope_q16_cycles_per_sample;
+  int64_t  regression_slope_delta_q16_cycles_per_sample;
+  int32_t  regression_fit_error_mean_q16_cycles;
+  uint32_t regression_fit_error_stddev_q16_cycles;
+  int32_t  regression_fit_error_min_cycles;
+  int32_t  regression_fit_error_max_cycles;
+  uint32_t regression_fit_error_gt_plus4_count;
+  uint32_t regression_fit_error_lt_minus4_count;
+  uint32_t regression_fit_error_abs_gt4_count;
 };
 
 bool clocks_alpha_lane_forensics(time_clock_id_t clock,
