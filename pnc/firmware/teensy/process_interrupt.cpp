@@ -216,6 +216,17 @@ static constexpr uint32_t REGRESSION_COUNTER_DELTA_TICKS = OCXO_CADENCE_INTERVAL
 static constexpr uint32_t REGRESSION_MIN_SAMPLE_COUNT = 16;
 static constexpr int32_t  REGRESSION_FIT_ERROR_THRESHOLD_CYCLES = 4;
 static constexpr double   REGRESSION_Q16_SCALE = 65536.0;
+
+// REGRESSION_SAMPLES report discipline.
+//
+// This command is deliberately live-only and allocates no retained 1000-sample
+// windows.  A prior diagnostic build retained per-sample windows for every
+// lane and destabilized the runtime by consuming too much RAM.  This version
+// only inspects the existing live regression window already present in the
+// baseline HEALTH: EXCELLENT build.
+static constexpr uint32_t REGRESSION_SAMPLE_REPORT_SLICE_LIMIT = 8;
+static constexpr uint32_t REGRESSION_SAMPLE_REPORT_EXTREME_LIMIT = 4;
+
 static_assert(REGRESSION_SAMPLES_PER_SECOND == 1000U,
               "Regression windows are expected to be 1 kHz / one second");
 
@@ -4827,6 +4838,180 @@ static void add_regression_payload(Payload& p,
   out.add_u32("regression_last_fit_error_abs_gt4_count",
               last.fit_error_abs_gt4_count);
 }
+
+static uint32_t regression_abs_i32(int32_t value) {
+  return (uint32_t)(value < 0 ? -(int64_t)value : (int64_t)value);
+}
+
+static interrupt_subscriber_kind_t regression_kind_from_lane_arg(const char* lane) {
+  if (!lane || !*lane) return interrupt_subscriber_kind_t::NONE;
+  if (!strcasecmp(lane, "VCLOCK") || !strcasecmp(lane, "VCLK")) {
+    return interrupt_subscriber_kind_t::VCLOCK;
+  }
+  if (!strcasecmp(lane, "OCXO1") || !strcasecmp(lane, "O1")) {
+    return interrupt_subscriber_kind_t::OCXO1;
+  }
+  if (!strcasecmp(lane, "OCXO2") || !strcasecmp(lane, "O2")) {
+    return interrupt_subscriber_kind_t::OCXO2;
+  }
+  return interrupt_subscriber_kind_t::NONE;
+}
+
+static bool regression_live_fit_params(const cadence_regression_lane_t& r,
+                                       double& slope,
+                                       double& intercept) {
+  const uint32_t n = r.sample_count;
+  if (n < REGRESSION_MIN_SAMPLE_COUNT || n > REGRESSION_SAMPLES_PER_SECOND) {
+    slope = 0.0;
+    intercept = 0.0;
+    return false;
+  }
+
+  double sum_x = 0.0;
+  double sum_y = 0.0;
+  double sum_xx = 0.0;
+  double sum_xy = 0.0;
+
+  for (uint32_t i = 0; i < n; i++) {
+    const double x = (double)i;
+    const double y = (double)r.observed_dwt_rel[i];
+    sum_x += x;
+    sum_y += y;
+    sum_xx += x * x;
+    sum_xy += x * y;
+  }
+
+  const double denom = (double)n * sum_xx - sum_x * sum_x;
+  if (denom == 0.0) {
+    slope = 0.0;
+    intercept = 0.0;
+    return false;
+  }
+
+  slope = ((double)n * sum_xy - sum_x * sum_y) / denom;
+  intercept = (sum_y - slope * sum_x) / (double)n;
+  return true;
+}
+
+static int32_t regression_live_fit_error_cycles(const cadence_regression_lane_t& r,
+                                                uint32_t index,
+                                                double slope,
+                                                double intercept) {
+  if (index >= r.sample_count || index >= REGRESSION_SAMPLES_PER_SECOND) return 0;
+  const double estimate = intercept + slope * (double)index;
+  const double err_d = estimate - (double)r.observed_dwt_rel[index];
+  return regression_round_i32(err_d);
+}
+
+static void regression_append_csv_u32(char* buf, size_t len,
+                                      uint32_t& used,
+                                      uint32_t value) {
+  if (used >= len) return;
+  const int n = snprintf(buf + used, len - used,
+                         used == 0 ? "%lu" : ",%lu",
+                         (unsigned long)value);
+  if (n > 0) {
+    const uint32_t add = (uint32_t)n;
+    used = (add >= (len - used)) ? (uint32_t)(len - 1U) : (used + add);
+  }
+}
+
+static void regression_append_csv_i32(char* buf, size_t len,
+                                      uint32_t& used,
+                                      int32_t value) {
+  if (used >= len) return;
+  const int n = snprintf(buf + used, len - used,
+                         used == 0 ? "%ld" : ",%ld",
+                         (long)value);
+  if (n > 0) {
+    const uint32_t add = (uint32_t)n;
+    used = (add >= (len - used)) ? (uint32_t)(len - 1U) : (used + add);
+  }
+}
+
+static void add_regression_sample_scalar(Payload& p,
+                                         const cadence_regression_lane_t& r,
+                                         uint32_t index,
+                                         uint32_t ordinal,
+                                         bool fit_valid,
+                                         double slope,
+                                         double intercept) {
+  if (index >= r.sample_count || index >= REGRESSION_SAMPLES_PER_SECOND) return;
+
+  char key[64];
+  const uint32_t target_counter32 =
+      r.base_counter32 + index * REGRESSION_COUNTER_DELTA_TICKS;
+  const int32_t observed_rel = r.observed_dwt_rel[index];
+  const uint32_t observed_dwt = r.base_observed_dwt + (uint32_t)observed_rel;
+  const int32_t fit_error = fit_valid
+      ? regression_live_fit_error_cycles(r, index, slope, intercept)
+      : 0;
+
+  snprintf(key, sizeof(key), "sample_%02lu_i", (unsigned long)ordinal);
+  p.add(key, index);
+  snprintf(key, sizeof(key), "sample_%02lu_target_counter32", (unsigned long)ordinal);
+  p.add(key, target_counter32);
+  snprintf(key, sizeof(key), "sample_%02lu_observed_dwt_rel", (unsigned long)ordinal);
+  p.add(key, observed_rel);
+  snprintf(key, sizeof(key), "sample_%02lu_observed_dwt", (unsigned long)ordinal);
+  p.add(key, observed_dwt);
+  snprintf(key, sizeof(key), "sample_%02lu_fit_valid", (unsigned long)ordinal);
+  p.add(key, fit_valid);
+  snprintf(key, sizeof(key), "sample_%02lu_fit_error_cycles", (unsigned long)ordinal);
+  p.add(key, fit_error);
+  snprintf(key, sizeof(key), "sample_%02lu_abs_fit_error_cycles", (unsigned long)ordinal);
+  p.add(key, fit_valid ? regression_abs_i32(fit_error) : 0U);
+}
+
+static void add_regression_extreme_csv(Payload& p,
+                                       const cadence_regression_lane_t& r,
+                                       bool best,
+                                       bool fit_valid,
+                                       double slope,
+                                       double intercept) {
+  uint32_t chosen[REGRESSION_SAMPLE_REPORT_EXTREME_LIMIT]{};
+  uint32_t scores[REGRESSION_SAMPLE_REPORT_EXTREME_LIMIT]{};
+  uint32_t chosen_count = 0;
+
+  if (fit_valid) {
+    for (uint32_t i = 0; i < r.sample_count && i < REGRESSION_SAMPLES_PER_SECOND; i++) {
+      const int32_t err = regression_live_fit_error_cycles(r, i, slope, intercept);
+      const uint32_t score = regression_abs_i32(err);
+      uint32_t pos = chosen_count;
+      if (best) {
+        while (pos > 0 && score < scores[pos - 1U]) pos--;
+      } else {
+        while (pos > 0 && score > scores[pos - 1U]) pos--;
+      }
+      if (pos >= REGRESSION_SAMPLE_REPORT_EXTREME_LIMIT) continue;
+      if (chosen_count < REGRESSION_SAMPLE_REPORT_EXTREME_LIMIT) chosen_count++;
+      for (uint32_t j = chosen_count - 1U; j > pos; j--) {
+        chosen[j] = chosen[j - 1U];
+        scores[j] = scores[j - 1U];
+      }
+      chosen[pos] = i;
+      scores[pos] = score;
+    }
+  }
+
+  char idx_csv[96] = {};
+  char abs_csv[96] = {};
+  char err_csv[96] = {};
+  uint32_t idx_used = 0, abs_used = 0, err_used = 0;
+  for (uint32_t i = 0; i < chosen_count; i++) {
+    const uint32_t idx = chosen[i];
+    const int32_t err = regression_live_fit_error_cycles(r, idx, slope, intercept);
+    regression_append_csv_u32(idx_csv, sizeof(idx_csv), idx_used, idx);
+    regression_append_csv_u32(abs_csv, sizeof(abs_csv), abs_used, scores[i]);
+    regression_append_csv_i32(err_csv, sizeof(err_csv), err_used, err);
+  }
+
+  p.add(best ? "best_abs_error_count" : "worst_abs_error_count", chosen_count);
+  p.add(best ? "best_abs_error_indices" : "worst_abs_error_indices", idx_csv);
+  p.add(best ? "best_abs_error_abs_cycles" : "worst_abs_error_abs_cycles", abs_csv);
+  p.add(best ? "best_abs_error_cycles" : "worst_abs_error_cycles", err_csv);
+}
+
 // ============================================================================
 // Commands
 // ============================================================================
@@ -4881,6 +5066,8 @@ static void add_runtime_payload(Payload& p) {
   p.add("ocxo_compare_live_requires_enabled_and_flag", true);
   p.add("lane_report_command", "INTERRUPT.REPORT_LANES");
   p.add("single_lane_report_command", "INTERRUPT.REPORT_LANE lane=VCLOCK|OCXO1|OCXO2");
+  p.add("regression_samples_report_command",
+        "INTERRUPT.REGRESSION_SAMPLES lane=OCXO1|OCXO2|VCLOCK offset=0 count=8 threshold=4");
 }
 
 static void add_ocxo_cadence_report_payload(Payload& p,
@@ -5535,7 +5722,9 @@ static Payload cmd_report(const Payload&) {
   p.add("report", "INTERRUPT_COMPACT");
   p.add("subreports",
         "REPORT_STATUS REPORT_PPS REPORT_CADENCE REPORT_SMARTZERO "
-        "REPORT_BRIDGE REPORT_LANES REPORT_LANE");
+        "REPORT_BRIDGE REPORT_LANES REPORT_LANE REGRESSION_SAMPLES");
+  p.add("regression_samples_report_command",
+        "INTERRUPT.REGRESSION_SAMPLES lane=OCXO1|OCXO2|VCLOCK offset=0 count=8 threshold=4");
 
   // Keep the default INTERRUPT.REPORT deliberately small.  The former
   // monolithic report carried PPS, epoch capture, SmartZero lane proof,
@@ -5812,6 +6001,157 @@ static Payload cmd_report_lane(const Payload& args) {
   return p;
 }
 
+static Payload cmd_regression_samples(const Payload& args) {
+  const char* lane = args.getString("lane");
+  if (!lane || !*lane) lane = args.getString("name");
+
+  Payload p;
+  p.add("report", "INTERRUPT_REGRESSION_SAMPLES");
+  p.add("usage", "INTERRUPT.REGRESSION_SAMPLES lane=OCXO1|OCXO2|VCLOCK offset=0 count=8 threshold=4");
+  p.add("implementation", "LIVE_ONLY_NO_RETAINED_WINDOWS");
+  p.add("memory_policy", "NO_NEW_SAMPLE_BUFFERS");
+  p.add("completed_window_available", false);
+
+  const interrupt_subscriber_kind_t kind = regression_kind_from_lane_arg(lane);
+  if (kind == interrupt_subscriber_kind_t::NONE) {
+    p.add("error", lane && *lane ? "unknown lane" : "missing lane parameter");
+    if (lane) p.add("lane", lane);
+    return p;
+  }
+
+  const cadence_regression_lane_t* r = cadence_regression_for_const(kind);
+  if (!r) {
+    p.add("error", "no regression lane");
+    p.add("lane", interrupt_subscriber_kind_str(kind));
+    return p;
+  }
+
+  uint32_t offset = args.getUInt("offset", 0U);
+  uint32_t count = args.getUInt("count", REGRESSION_SAMPLE_REPORT_SLICE_LIMIT);
+  uint32_t threshold = args.getUInt(
+      "threshold", (uint32_t)REGRESSION_FIT_ERROR_THRESHOLD_CYCLES);
+  if (count == 0 || count > REGRESSION_SAMPLE_REPORT_SLICE_LIMIT) {
+    count = REGRESSION_SAMPLE_REPORT_SLICE_LIMIT;
+  }
+
+  const cadence_regression_result_t& last = r->last_result;
+  const uint32_t n = (r->sample_count > REGRESSION_SAMPLES_PER_SECOND)
+      ? REGRESSION_SAMPLES_PER_SECOND
+      : r->sample_count;
+
+  double slope = 0.0;
+  double intercept = 0.0;
+  const bool fit_valid = regression_live_fit_params(*r, slope, intercept);
+
+  int32_t fit_min = 0;
+  int32_t fit_max = 0;
+  uint32_t abs_le4 = 0;
+  uint32_t abs_le8 = 0;
+  uint32_t abs_le12 = 0;
+  uint32_t abs_le20 = 0;
+  uint32_t abs_le50 = 0;
+  uint32_t abs_le100 = 0;
+  uint32_t abs_gt100 = 0;
+  uint32_t gate_accepted = 0;
+
+  if (fit_valid) {
+    fit_min = INT32_MAX;
+    fit_max = INT32_MIN;
+    for (uint32_t i = 0; i < n; i++) {
+      const int32_t err = regression_live_fit_error_cycles(*r, i, slope, intercept);
+      const uint32_t abs_err = regression_abs_i32(err);
+      if (err < fit_min) fit_min = err;
+      if (err > fit_max) fit_max = err;
+      if (abs_err <= 4U) abs_le4++;
+      if (abs_err <= 8U) abs_le8++;
+      if (abs_err <= 12U) abs_le12++;
+      if (abs_err <= 20U) abs_le20++;
+      if (abs_err <= 50U) abs_le50++;
+      if (abs_err <= 100U) abs_le100++; else abs_gt100++;
+      if (abs_err <= threshold) gate_accepted++;
+    }
+  }
+
+  const uint32_t last_index = (n > 0) ? (n - 1U) : 0U;
+  const int32_t inferred_rel = fit_valid
+      ? regression_round_i32(intercept + slope * (double)last_index)
+      : 0;
+  const uint32_t inferred_dwt = fit_valid
+      ? (r->base_observed_dwt + (uint32_t)inferred_rel)
+      : 0U;
+  const int32_t inferred_minus_observed = (fit_valid && n > 0)
+      ? (int32_t)(inferred_dwt - r->last_observed_dwt)
+      : 0;
+
+  p.add("lane", interrupt_subscriber_kind_str(kind));
+  p.add("regression_samples_per_second", REGRESSION_SAMPLES_PER_SECOND);
+  p.add("regression_counter_delta_ticks", REGRESSION_COUNTER_DELTA_TICKS);
+  p.add("linear_regression_authored_dwt", LINEAR_REGRESSION_AUTHORED_DWT);
+  p.add("linear_regression_diagnostic_only", LINEAR_REGRESSION_DIAGNOSTIC_ONLY);
+  p.add("sample_total_count", r->sample_total_count);
+  p.add("live_window_sample_count", n);
+  p.add("window_sample_count", n);
+  p.add("reset_count", r->reset_count);
+  p.add("insufficient_count", r->insufficient_count);
+  p.add("counter_discontinuity_count", r->counter_discontinuity_count);
+
+  p.add("regression_last_valid", last.valid);
+  p.add("regression_last_sequence", last.sequence);
+  p.add("regression_last_sample_count", last.sample_count);
+  p.add("regression_last_observed_dwt", last.observed_dwt_at_event);
+  p.add("regression_last_inferred_dwt", last.inferred_dwt_at_event);
+  p.add("regression_last_inferred_minus_observed_cycles",
+        last.inferred_minus_observed_cycles);
+
+  p.add("report_source", fit_valid ? "live_window_provisional_fit" : "live_window_raw");
+  p.add("selected_window_is_live", true);
+  p.add("selected_window_is_completed", false);
+  p.add("live_window_fit_valid", fit_valid);
+  p.add("regression_window_valid", n > 0);
+  p.add("regression_window_sequence", r->sequence);
+  p.add("regression_window_sample_count", n);
+  p.add("regression_window_base_counter32", r->base_counter32);
+  p.add("regression_window_base_observed_dwt", r->base_observed_dwt);
+  p.add("regression_window_event_target_counter32", r->last_counter32);
+  p.add("regression_window_event_observed_dwt", r->last_observed_dwt);
+  p.add("regression_window_event_inferred_dwt", inferred_dwt);
+  p.add("regression_window_event_inferred_minus_observed_cycles",
+        inferred_minus_observed);
+
+  p.add("fit_error_min_cycles", fit_valid ? fit_min : 0);
+  p.add("fit_error_max_cycles", fit_valid ? fit_max : 0);
+  p.add("abs_error_le4_count", abs_le4);
+  p.add("abs_error_le8_count", abs_le8);
+  p.add("abs_error_le12_count", abs_le12);
+  p.add("abs_error_le20_count", abs_le20);
+  p.add("abs_error_le50_count", abs_le50);
+  p.add("abs_error_le100_count", abs_le100);
+  p.add("abs_error_gt100_count", abs_gt100);
+  p.add("gate_threshold_cycles", threshold);
+  p.add("gate_accepted_count", fit_valid ? gate_accepted : 0U);
+  p.add("gate_rejected_count", fit_valid ? (n - gate_accepted) : 0U);
+
+  p.add("sample_slice_offset", offset);
+  p.add("sample_slice_count_requested", count);
+  p.add("sample_slice_limit", REGRESSION_SAMPLE_REPORT_SLICE_LIMIT);
+  p.add("sample_encoding", "flat_scalar_fields_no_service_offsets");
+
+  if (n > 0) {
+    if (offset >= n) offset = n - 1U;
+    if (offset + count > n) count = n - offset;
+    p.add("sample_slice_count_returned", count);
+    for (uint32_t i = 0; i < count; i++) {
+      add_regression_sample_scalar(p, *r, offset + i, i, fit_valid, slope, intercept);
+    }
+  } else {
+    p.add("sample_slice_count_returned", 0U);
+  }
+
+  add_regression_extreme_csv(p, *r, true, fit_valid, slope, intercept);
+  add_regression_extreme_csv(p, *r, false, fit_valid, slope, intercept);
+  return p;
+}
+
 static const process_command_entry_t INTERRUPT_COMMANDS[] = {
   { "REPORT",          cmd_report          },
   { "REPORT_STATUS",   cmd_report_status   },
@@ -5821,6 +6161,7 @@ static const process_command_entry_t INTERRUPT_COMMANDS[] = {
   { "REPORT_BRIDGE",   cmd_report_bridge   },
   { "REPORT_LANES",    cmd_report_lanes    },
   { "REPORT_LANE",     cmd_report_lane     },
+  { "REGRESSION_SAMPLES", cmd_regression_samples },
   { nullptr,           nullptr             }
 };
 

@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <project version="4">
-  <component name="PublishConfigData" remoteFilesAllowedToDisappearOnAutoupload="false" confirmBeforeUploading="false">
+  <component name="PublishConfigData" autoUpload="Always" serverName="ZPNet Tunnel (mule)" remoteFilesAllowedToDisappearOnAutoupload="false" confirmBeforeUploading="false">
     <option name="confirmBeforeUploading" value="false" />
     <serverData>
       <paths name="Remote Host (a5cfe2a7-4f26-41c4-88a1-7110059ca353)">
@@ -8,19 +8,16 @@
           <mappings>
             <mapping deploy="/tmp/tmp.vuwsUhNf4y/teensy" local="$PROJECT_DIR$" />
           </mappings>
-          <excludedPaths>
-            <excludedPath local="true" path="$PROJECT_DIR$/cmake-build-debug-remote-host" />
-            <excludedPath local="true" path="$PROJECT_DIR$/cmake-build-debug-remote-host" />
-          </excludedPaths>
         </serverdata>
       </paths>
       <paths name="ZPNet Tunnel (mule)">
         <serverdata>
           <mappings>
-            <mapping local="$PROJECT_DIR$" web="/" />
+            <mapping deploy="/home/mule/zpnet/pnc/firmware/teensy" local="$PROJECT_DIR$" web="/" />
           </mappings>
         </serverdata>
       </paths>
     </serverData>
+    <option name="myAutoUpload" value="ALWAYS" />
   </component>
 </project>
