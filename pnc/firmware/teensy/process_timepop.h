@@ -145,6 +145,19 @@ timepop_handle_t timepop_arm_recurring_isr_from_base_counter32(
 // or cancelled before scheduling continues.
 void timepop_epoch_changed(uint32_t epoch_sequence);
 
+// Diagnostic command surface:
+//
+//   TIMEPOP.PHASE_PROBE action=START phase_us=250 period_us=1000 samples=0
+//   TIMEPOP.PHASE_PROBE
+//   TIMEPOP.PHASE_PROBE action=STOP
+//   TIMEPOP.PHASE_PROBE action=RESET
+//
+// PHASE_PROBE is a report-only quiet-zone instrument.  It arms a tiny critical
+// recurring ISR slot at a fixed phase within the VCLOCK period and records
+// scalar statistics about co-expired timed slots, deferred backlog, exact-fire
+// error, and DWT prediction error.  It does not alter scheduler policy or
+// timing authority.
+
 // QTimer1 CH2 IRQ-context handler.  Registered with process_interrupt
 // at init.  Called by process_interrupt's qtimer1_isr dispatcher on
 // every CH2 compare-match, in IRQ context, with the standard event

@@ -258,8 +258,8 @@ static constexpr bool LINEAR_REGRESSION_DIAGNOSTIC_ONLY = true;
 // invariant can complete without changing process_clocks.
 //
 // Normal baseline: both false.  For the VCLOCK-only test set both true.
-static constexpr bool OCXO1_DISABLED = true;
-static constexpr bool OCXO2_DISABLED = true;
+static constexpr bool OCXO1_DISABLED = false;
+static constexpr bool OCXO2_DISABLED = false;
 static constexpr bool OCXO_DISABLE_EXPERIMENT = OCXO1_DISABLED || OCXO2_DISABLED;
 static constexpr uint32_t OCXO_DISABLED_COUNT =
     (OCXO1_DISABLED ? 1U : 0U) + (OCXO2_DISABLED ? 1U : 0U);
