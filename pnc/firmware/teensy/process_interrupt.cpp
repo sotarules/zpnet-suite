@@ -2845,10 +2845,12 @@ static void emit_one_second_event(interrupt_subscriber_runtime_t& rt,
   event.pps_coincidence_cycles = pps_coincidence_cycles;
   event.pps_coincidence_valid  = pps_coincidence_valid;
 
-  // VCLOCK lane authors GNSS time directly from VCLOCK ticks (no DWT).
-  // OCXO lanes try the DWT bridge for diagnostics, but dispatch does not
-  // depend on projection success. Alpha constructs OCXO measured-GNSS
-  // intervals from consecutive OCXO edge DWT facts.
+  // VCLOCK remains unavailable here because process_interrupt does not
+  // invent campaign GNSS labels for the sovereign PPS/VCLOCK rail.
+  // OCXO lanes normalize the authored sample DWT through the labeled
+  // PPS_VCLOCK anchor ring. For OCXO this is a subscriber-visible
+  // GNSS-at-sample witness only; Alpha has not yet promoted it to
+  // canonical residual/servo truth.
   bridge_projection_t bridge{};
   int64_t gnss_ns = -1;
   if (rt.desc->kind == interrupt_subscriber_kind_t::VCLOCK) {
@@ -5702,13 +5704,25 @@ static void add_runtime_lane_summary(Payload& p,
   if (rt && rt->has_fired) {
     out.add_u32("last_event_dwt", rt->last_event.dwt_at_event);
     out.add_u32("last_event_counter32", rt->last_event.counter32_at_event);
+    out.add_u64("last_event_gnss_ns_at_event", rt->last_event.gnss_ns_at_event);
+    out.add_bool("last_event_gnss_ns_available", rt->last_event.gnss_ns_at_event != 0);
     out.add_u32("last_event_status", (uint32_t)((uint8_t)rt->last_event.status));
+    out.add_u64("last_diag_gnss_ns_at_event", rt->last_diag.gnss_ns_at_event);
+    out.add_bool("last_diag_gnss_ns_available", rt->last_diag.gnss_ns_at_event != 0);
+    out.add_bool("last_diag_gnss_projection_valid",
+                 rt->last_diag.gnss_ns_at_event != 0 &&
+                 rt->last_diag.anchor_failure_mask == 0);
     out.add_u32("last_diag_anchor_selection_kind", rt->last_diag.anchor_selection_kind);
     out.add_u32("last_diag_anchor_failure_mask", rt->last_diag.anchor_failure_mask);
   } else {
     out.add_u32("last_event_dwt", 0);
     out.add_u32("last_event_counter32", 0);
+    out.add_u64("last_event_gnss_ns_at_event", 0);
+    out.add_bool("last_event_gnss_ns_available", false);
     out.add_u32("last_event_status", 0);
+    out.add_u64("last_diag_gnss_ns_at_event", 0);
+    out.add_bool("last_diag_gnss_ns_available", false);
+    out.add_bool("last_diag_gnss_projection_valid", false);
     out.add_u32("last_diag_anchor_selection_kind", 0);
     out.add_u32("last_diag_anchor_failure_mask", 0);
   }
@@ -6068,6 +6082,16 @@ static void add_ocxo_compact_payload(Payload& p,
 
   out.add_u32("event_count", rt ? rt->event_count : 0U);
   out.add_u32("dispatch_count", rt ? rt->dispatch_count : 0U);
+  out.add_u64("last_event_gnss_ns_at_event",
+              (rt && rt->has_fired) ? rt->last_event.gnss_ns_at_event : 0ULL);
+  out.add_bool("last_event_gnss_ns_available",
+               rt && rt->has_fired && rt->last_event.gnss_ns_at_event != 0);
+  out.add_u64("last_diag_gnss_ns_at_event",
+              (rt && rt->has_fired) ? rt->last_diag.gnss_ns_at_event : 0ULL);
+  out.add_bool("last_diag_gnss_projection_valid",
+               rt && rt->has_fired &&
+               rt->last_diag.gnss_ns_at_event != 0 &&
+               rt->last_diag.anchor_failure_mask == 0);
   out.add_u32("irq_count", lane.irq_count);
   out.add_u32("miss_count", lane.miss_count);
   out.add_bool("cadence_enabled", lane.cadence_enabled);
@@ -6354,9 +6378,13 @@ static void add_lane_summary_object(Payload& parent,
   if (rt && rt->has_fired) {
     lane.add("last_event_dwt", rt->last_event.dwt_at_event);
     lane.add("last_event_counter32", rt->last_event.counter32_at_event);
+    lane.add("last_event_gnss_ns_at_event", rt->last_event.gnss_ns_at_event);
+    lane.add("last_event_gnss_ns_available", rt->last_event.gnss_ns_at_event != 0);
   } else {
     lane.add("last_event_dwt", 0U);
     lane.add("last_event_counter32", 0U);
+    lane.add("last_event_gnss_ns_at_event", 0ULL);
+    lane.add("last_event_gnss_ns_available", false);
   }
   parent.add_object(key, lane);
 }
@@ -6412,9 +6440,23 @@ static void add_ocxo_lane_summary_object(Payload& parent,
   if (rt && rt->has_fired) {
     o.add("last_event_dwt", rt->last_event.dwt_at_event);
     o.add("last_event_counter32", rt->last_event.counter32_at_event);
+    o.add("last_event_gnss_ns_at_event", rt->last_event.gnss_ns_at_event);
+    o.add("last_event_gnss_ns_available", rt->last_event.gnss_ns_at_event != 0);
+    o.add("last_diag_gnss_ns_at_event", rt->last_diag.gnss_ns_at_event);
+    o.add("last_diag_gnss_projection_valid",
+          rt->last_diag.gnss_ns_at_event != 0 &&
+          rt->last_diag.anchor_failure_mask == 0);
+    o.add("last_diag_anchor_selection_kind", rt->last_diag.anchor_selection_kind);
+    o.add("last_diag_anchor_failure_mask", rt->last_diag.anchor_failure_mask);
   } else {
     o.add("last_event_dwt", 0U);
     o.add("last_event_counter32", 0U);
+    o.add("last_event_gnss_ns_at_event", 0ULL);
+    o.add("last_event_gnss_ns_available", false);
+    o.add("last_diag_gnss_ns_at_event", 0ULL);
+    o.add("last_diag_gnss_projection_valid", false);
+    o.add("last_diag_anchor_selection_kind", 0U);
+    o.add("last_diag_anchor_failure_mask", 0U);
   }
   parent.add_object(key, o);
 }
