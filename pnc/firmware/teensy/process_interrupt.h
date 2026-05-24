@@ -193,8 +193,11 @@ struct interrupt_event_t {
 
   // GNSS ns at the event.  For VCLOCK, authored from the VCLOCK counter
   // (PPS_VCLOCK ruler — ends in "00").  For TimePop, derived via the
-  // DWT→PPS_VCLOCK bridge.  For OCXO, this is diagnostic-only and may be 0;
-  // Alpha measures OCXO intervals from consecutive OCXO edge DWT facts.
+  // DWT→PPS_VCLOCK bridge.  For OCXO, this field is being promoted into the
+  // normalized GNSS timestamp of the authored OCXO event edge.  Projection
+  // proof/failure metadata is carried in interrupt_capture_diag_t.  During
+  // the migration, consumers must treat a zero OCXO value as unavailable and
+  // must not infer canonical OCXO frequency truth from DWT-cycle residuals.
   uint64_t gnss_ns_at_event = 0;
 
   // process_interrupt-authored private synthetic 32-bit clock identity at
