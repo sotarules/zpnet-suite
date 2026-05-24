@@ -34,8 +34,8 @@
 //
 // Lanes:
 //   VCLOCK : TimePop recurring client on QTimer1 CH2 (10 MHz VCLOCK domain)
-//   OCXO1  : QTimer2 CH0, PCS=0
-//   OCXO2  : QTimer3 CH3, PCS=3
+//   OCXO1  : QTimer2 CH0, PCS=0, quiet phase +250 us in VCLOCK ms cell
+//   OCXO2  : QTimer3 CH3, PCS=3, quiet phase +750 us in VCLOCK ms cell
 //   TimePop: QTimer1 CH2, varied compare intervals (foreground scheduler)
 //
 // The PPS GPIO ISR captures DWT as its first instruction, then reads the
@@ -181,6 +181,26 @@ static_assert(OCXO_WITNESS_ONE_SECOND_COUNTS ==
 static constexpr uint32_t OCXO_WITNESS_ARM_WINDOW_TICKS = OCXO_CADENCE_INTERVAL_TICKS;
 static constexpr uint32_t OCXO_WITNESS_MIN_ARM_LEAD_TICKS = 64U;
 
+// Quiet-phase OCXO custody.
+//
+// The OCXO local compare ladders still hop at 1 kHz because a 10 MHz / 1 s
+// hardware compare does not fit in the 16-bit QuadTimer compare span.  What
+// changes here is the initial phase of each +10,000-tick ladder: OCXO1 and
+// OCXO2 are placed into TimePop-measured quiet zones inside the VCLOCK
+// millisecond cell.  Every 1000th sample remains the public one-second event.
+static constexpr bool     OCXO_QUIET_PHASE_SAMPLING_ENABLED = true;
+static constexpr uint32_t OCXO_QUIET_PHASE_PERIOD_TICKS = OCXO_CADENCE_INTERVAL_TICKS;
+static constexpr uint32_t OCXO1_QUIET_PHASE_TICKS = 2500U;  // +250 us
+static constexpr uint32_t OCXO2_QUIET_PHASE_TICKS = 7500U;  // +750 us
+static constexpr uint32_t OCXO_QUIET_PHASE_MIN_LEAD_TICKS =
+    OCXO_WITNESS_MIN_ARM_LEAD_TICKS;
+static_assert(OCXO_QUIET_PHASE_PERIOD_TICKS == 10000U,
+              "OCXO quiet phase period must be one VCLOCK millisecond");
+static_assert(OCXO1_QUIET_PHASE_TICKS < OCXO_QUIET_PHASE_PERIOD_TICKS,
+              "OCXO1 quiet phase must be inside the millisecond cell");
+static_assert(OCXO2_QUIET_PHASE_TICKS < OCXO_QUIET_PHASE_PERIOD_TICKS,
+              "OCXO2 quiet phase must be inside the millisecond cell");
+
 static constexpr uint32_t OCXO_CADENCE_REASON_NONE          = 0;
 static constexpr uint32_t OCXO_CADENCE_REASON_BOOTSTRAP     = 1;
 static constexpr uint32_t OCXO_CADENCE_REASON_START         = 2;
@@ -207,10 +227,12 @@ static constexpr uint32_t OCXO_SERVICE_CLASS_FALSE_IRQ              = 1;
 static constexpr uint32_t OCXO_SERVICE_CLASS_EARLY_PRETARGET        = 2;
 static constexpr uint32_t OCXO_SERVICE_CLASS_ON_OR_AFTER_TARGET     = 3;
 
-// 1 kHz regression custody.  The regression engine is currently diagnostic-only:
-// subscribers receive the traditional edge DWT while the fitted edge is carried
-// in interrupt_capture_diag_t for side-by-side analysis.  ISR context only
-// captures/enqueues observations; fit math runs in ASAP/foreground context.
+// Linear regression is intentionally disabled for the quiet-phase custody
+// checkpoint.  The code surface remains compiled for later reactivation, but
+// no VCLOCK/OCXO samples are fed and no subscriber-facing diagnostic result is
+// populated.  This removes regression as a confounder while we validate whether
+// phase-separated OCXO custody alone collapses the raw cycle residuals.
+static constexpr bool     OCXO_LINEAR_REGRESSION_ENABLED = false;
 static constexpr uint32_t REGRESSION_SAMPLES_PER_SECOND = TICKS_PER_SECOND_EVENT;
 static constexpr uint32_t REGRESSION_COUNTER_DELTA_TICKS = OCXO_CADENCE_INTERVAL_TICKS;
 static constexpr uint32_t REGRESSION_MIN_SAMPLE_COUNT = 16;
@@ -239,7 +261,7 @@ static constexpr bool VCLOCK_LINEAR_REGRESSION_ENABLED = false;
 // DWT stays traditional while regression_inferred_dwt_at_event exposes what the
 // fitted edge would have been.
 static constexpr bool LINEAR_REGRESSION_AUTHORED_DWT = false;
-static constexpr bool LINEAR_REGRESSION_DIAGNOSTIC_ONLY = true;
+static constexpr bool LINEAR_REGRESSION_DIAGNOSTIC_ONLY = false;
 
 // ============================================================================
 // Symmetric OCXO disable matrix (temporary A/B experiment surface)
@@ -1117,6 +1139,21 @@ struct ocxo_lane_t {
   bool     cadence_armed = false;
   bool     cadence_epoch_valid = false;
   uint32_t cadence_epoch_counter32 = 0;
+
+  // Configured quiet phase of this OCXO sample ladder inside the VCLOCK
+  // millisecond cell.  This is a subscriber contract field: process_clocks may
+  // back-project the clean observed sample to the logical one-second boundary.
+  bool     cadence_sample_phase_valid = false;
+  uint32_t cadence_sample_phase_ticks = 0;
+  uint32_t cadence_sample_phase_us = 0;
+  uint32_t cadence_sample_phase_ns = 0;
+  uint32_t cadence_sample_period_ticks = 0;
+  uint32_t cadence_phase_align_start_count = 0;
+  uint32_t cadence_last_phase_align_vclock_counter32 = 0;
+  uint32_t cadence_last_phase_align_vclock_phase_ticks = 0;
+  uint32_t cadence_last_phase_align_ticks_until_target = 0;
+  uint32_t cadence_last_phase_align_ocxo_counter32 = 0;
+
   uint32_t cadence_next_counter32 = 0;
   uint16_t cadence_next_low16 = 0;
   uint32_t cadence_last_target_counter32 = 0;
@@ -1383,7 +1420,7 @@ static ocxo_runtime_context_t g_ocxo1_ctx = {
   interrupt_lane_t::QTIMER2_CH0_COMP,
   "OCXO1",
   "ocxo1",
-  "QTIMER2_CH0_LOCAL_1KHZ_COMPARE",
+  "QTIMER2_CH0_LOCAL_1KHZ_QUIET_PHASE_COMPARE",
   "QTIMER2_CH0_LOCAL_SYNTHETIC_COUNTER32",
   "QTIMER2_CH0_ISR_ENTRY_DWT",
   "OCXO1_FACT_DRAIN",
@@ -1399,7 +1436,7 @@ static ocxo_runtime_context_t g_ocxo2_ctx = {
   interrupt_lane_t::QTIMER3_CH3_COMP,
   "OCXO2",
   "ocxo2",
-  "QTIMER3_CH3_LOCAL_1KHZ_COMPARE",
+  "QTIMER3_CH3_LOCAL_1KHZ_QUIET_PHASE_COMPARE",
   "QTIMER3_CH3_LOCAL_SYNTHETIC_COUNTER32",
   "QTIMER3_CH3_ISR_ENTRY_DWT",
   "OCXO2_FACT_DRAIN",
@@ -2665,6 +2702,13 @@ static void fill_diag(interrupt_capture_diag_t& diag,
           lane->witness_counter_delta_violation_count;
       diag.ocxo_last_bad_counter_delta = lane->witness_last_bad_counter_delta;
       diag.ocxo_last_counter_delta_ticks = lane->witness_last_counter_delta_ticks;
+      diag.ocxo_sample_phase_valid = lane->cadence_sample_phase_valid;
+      diag.ocxo_sample_phase_ticks = lane->cadence_sample_phase_ticks;
+      diag.ocxo_sample_phase_ns = lane->cadence_sample_phase_ns;
+      diag.ocxo_sample_phase_us = lane->cadence_sample_phase_us;
+      diag.ocxo_sample_period_ticks = lane->cadence_sample_period_ticks;
+      diag.ocxo_sample_dwt_at_event = event.dwt_at_event;
+      diag.ocxo_sample_counter32_at_event = event.counter32_at_event;
     }
   }
 }
@@ -2855,25 +2899,11 @@ static bool vclock_fact_ring_push_from_isr(vclock_perishable_fact_t fact) {
 
 static void vclock_apply_perishable_fact_deferred(
     const vclock_perishable_fact_t& fact) {
-  cadence_regression_sample_t sample{};
-  sample.kind = interrupt_subscriber_kind_t::VCLOCK;
-  sample.observed_dwt_at_event = fact.observed_dwt_at_event;
-  sample.target_counter32_at_event = fact.target_counter32;
-  sample.target_hardware16_at_event = fact.target_low16;
-  sample.observed_hardware16_at_event = fact.observed_low16;
-  sample.one_second_due = fact.one_second_due;
-
-  cadence_regression_result_t regression =
-      cadence_regression_feed_sample(interrupt_subscriber_kind_t::VCLOCK,
-                                     sample);
-
   if (!fact.one_second_due || !g_rt_vclock || !g_rt_vclock->active) {
     return;
   }
 
-  const uint32_t inferred_dwt = regression.valid
-      ? regression.inferred_dwt_at_event
-      : fact.observed_dwt_at_event;
+  const uint32_t inferred_dwt = fact.observed_dwt_at_event;
 
   uint32_t coincidence_cycles = 0;
   bool coincidence_valid = false;
@@ -2908,7 +2938,7 @@ static void vclock_apply_perishable_fact_deferred(
                         coincidence_valid,
                         &repair,
                         true,
-                        &regression);
+                        nullptr);
 
   if (g_pps_edge_dispatch) {
     timepop_arm_asap(pps_edge_dispatch_trampoline,
@@ -2965,6 +2995,51 @@ static const char* ocxo_cadence_reason_name(uint32_t reason) {
     case OCXO_CADENCE_REASON_STOP:         return "STOP";
     default:                               return "NONE";
   }
+}
+
+static uint32_t ocxo_quiet_phase_ticks_for(interrupt_subscriber_kind_t kind) {
+  if (kind == interrupt_subscriber_kind_t::OCXO1) return OCXO1_QUIET_PHASE_TICKS;
+  if (kind == interrupt_subscriber_kind_t::OCXO2) return OCXO2_QUIET_PHASE_TICKS;
+  return 0U;
+}
+
+static uint32_t ocxo_phase_ticks_to_us(uint32_t phase_ticks) {
+  return (uint32_t)(((uint64_t)phase_ticks * 100ULL + 500ULL) / 1000ULL);
+}
+
+static uint32_t ocxo_phase_ticks_to_ns(uint32_t phase_ticks) {
+  return phase_ticks * 100U;
+}
+
+static uint32_t ocxo_quiet_phase_next_target(interrupt_subscriber_kind_t kind,
+                                             ocxo_lane_t& lane,
+                                             const synthetic_clock32_t& clock32) {
+  const uint32_t desired_phase = ocxo_quiet_phase_ticks_for(kind);
+  const uint32_t vclock_now = interrupt_vclock_counter32_observe_ambient();
+  const uint32_t vclock_phase = vclock_now % OCXO_QUIET_PHASE_PERIOD_TICKS;
+
+  uint32_t ticks_until =
+      (desired_phase + OCXO_QUIET_PHASE_PERIOD_TICKS - vclock_phase) %
+      OCXO_QUIET_PHASE_PERIOD_TICKS;
+
+  // A phase exactly "now" or too close to program safely belongs to the next
+  // millisecond cell.  This keeps first arming out of the hardware race window.
+  if (ticks_until < OCXO_QUIET_PHASE_MIN_LEAD_TICKS) {
+    ticks_until += OCXO_QUIET_PHASE_PERIOD_TICKS;
+  }
+
+  lane.cadence_sample_phase_valid = true;
+  lane.cadence_sample_phase_ticks = desired_phase;
+  lane.cadence_sample_phase_us = ocxo_phase_ticks_to_us(desired_phase);
+  lane.cadence_sample_phase_ns = ocxo_phase_ticks_to_ns(desired_phase);
+  lane.cadence_sample_period_ticks = OCXO_QUIET_PHASE_PERIOD_TICKS;
+  lane.cadence_phase_align_start_count++;
+  lane.cadence_last_phase_align_vclock_counter32 = vclock_now;
+  lane.cadence_last_phase_align_vclock_phase_ticks = vclock_phase;
+  lane.cadence_last_phase_align_ticks_until_target = ticks_until;
+  lane.cadence_last_phase_align_ocxo_counter32 = clock32.current_counter32;
+
+  return clock32.current_counter32 + ticks_until;
 }
 
 static uint32_t ocxo_grid_next_target_after(uint32_t epoch_counter32,
@@ -3057,19 +3132,33 @@ static bool ocxo_lane_start_local_cadence(interrupt_subscriber_kind_t kind,
   const uint16_t hw16 = ocxo_lane_counter_now(lane);
   synthetic_clock_tend_from_hw16(clock32, hw16);
 
-  const uint32_t target = lane.cadence_epoch_valid
-      ? ocxo_grid_next_target_after(lane.cadence_epoch_counter32,
-                                    clock32.current_counter32)
-      : (clock32.current_counter32 + OCXO_CADENCE_INTERVAL_TICKS);
+  uint32_t target = 0;
+  if (OCXO_QUIET_PHASE_SAMPLING_ENABLED &&
+      (kind == interrupt_subscriber_kind_t::OCXO1 ||
+       kind == interrupt_subscriber_kind_t::OCXO2)) {
+    target = ocxo_quiet_phase_next_target(kind, lane, clock32);
+  } else {
+    lane.cadence_sample_phase_valid = false;
+    lane.cadence_sample_phase_ticks = 0;
+    lane.cadence_sample_phase_us = 0;
+    lane.cadence_sample_phase_ns = 0;
+    lane.cadence_sample_period_ticks = OCXO_CADENCE_INTERVAL_TICKS;
+    target = lane.cadence_epoch_valid
+        ? ocxo_grid_next_target_after(lane.cadence_epoch_counter32,
+                                      clock32.current_counter32)
+        : (clock32.current_counter32 + OCXO_CADENCE_INTERVAL_TICKS);
+  }
 
   if (!lane.phase_bootstrapped) {
     lane.phase_bootstrapped = true;
     lane.bootstrap_count++;
   }
-  lane.tick_mod_1000 = lane.cadence_epoch_valid
-      ? ((target - lane.cadence_epoch_counter32) / OCXO_CADENCE_INTERVAL_TICKS - 1U) %
-            TICKS_PER_SECOND_EVENT
-      : 0U;
+
+  // Quiet-phase custody deliberately makes the published one-second sample
+  // cadence relative to the first quiet sample, not to the SmartZero anchor's
+  // arbitrary millisecond phase.  The counter delta between published events
+  // remains exactly 10,000,000 ticks.
+  lane.tick_mod_1000 = 0U;
 
   return ocxo_lane_start_local_cadence_at_target(kind, lane, clock32, target, reason);
 }
@@ -3329,6 +3418,12 @@ struct interrupt_perishable_fact_t {
   uint32_t service_class = OCXO_SERVICE_CLASS_NONE;
   bool one_second_due = false;
   bool exact_target_identity = true;
+
+  bool sample_phase_valid = false;
+  uint32_t sample_phase_ticks = 0;
+  uint32_t sample_phase_us = 0;
+  uint32_t sample_phase_ns = 0;
+  uint32_t sample_period_ticks = 0;
 };
 
 struct ocxo_perishable_ring_t {
@@ -3519,8 +3614,8 @@ static void ocxo_apply_perishable_fact_deferred(
 
   interrupt_subscriber_runtime_t* rt = ocxo_runtime_for(ctx);
 
-  // First-pass lane-local cadence user callback.  Regression will attach here;
-  // for this migration pass it is intentionally a no-op with a visible count.
+  // First-pass lane-local cadence user callback hook.  Linear regression is
+  // disabled for this checkpoint, so this remains a visible no-op count.
   lane->cadence_user_callback_count++;
 
   const ocxo_perishable_ring_t& ring = ocxo_fact_ring_for(ctx);
@@ -3589,15 +3684,9 @@ static void ocxo_apply_perishable_fact_deferred(
                           fact.target_low16,
                           fact.service_counter_low16);
 
-  cadence_regression_sample_t regression_sample{};
-  regression_sample.kind = ctx.kind;
-  regression_sample.observed_dwt_at_event = fact.service_dwt_at_event;
-  regression_sample.target_counter32_at_event = fact.target_counter32;
-  regression_sample.target_hardware16_at_event = fact.target_low16;
-  regression_sample.observed_hardware16_at_event = fact.service_counter_low16;
-  regression_sample.one_second_due = fact.one_second_due;
-  cadence_regression_result_t regression =
-      cadence_regression_feed_sample(ctx.kind, regression_sample);
+  // Linear regression is disabled for the quiet-phase custody checkpoint.
+  // Keep the cadence_user_callback_count as a visible hook, but do not feed
+  // sample windows or populate regression diagnostics.
 
   if (!fact.one_second_due || !rt || !rt->active) {
     return;
@@ -3606,8 +3695,9 @@ static void ocxo_apply_perishable_fact_deferred(
   lane->witness_fire_count++;
   lane->irq_count++;
   lane->logical_count32_at_last_second = fact.target_counter32;
-  // Diagnostic-only regression: publish the traditional service-observed
-  // edge DWT and carry the fitted edge in the diagnostic payload.
+  // Publish the quiet-zone sample DWT.  Alpha receives the phase metadata in
+  // interrupt_capture_diag_t and may back-project this sample to the logical
+  // one-second boundary for physics/accounting.
   const uint32_t published_dwt = fact.service_dwt_at_event;
 
   lane->witness_last_event_dwt = published_dwt;
@@ -3633,8 +3723,7 @@ static void ocxo_apply_perishable_fact_deferred(
   lane->witness_previous_event_counter32_valid = true;
 
   // We are already in TimePop ASAP/foreground context. Dispatch the authored
-  // OCXO edge directly from the fact drain. Subscriber-facing DWT is the
-  // traditional service-observed endpoint; regression remains diagnostic-only.
+  // quiet-zone OCXO sample directly from the fact drain.
   emit_one_second_event(*rt,
                         published_dwt,
                         fact.target_counter32,
@@ -3642,7 +3731,7 @@ static void ocxo_apply_perishable_fact_deferred(
                         false,
                         nullptr,
                         true,
-                        &regression);
+                        nullptr);
 }
 
 static void ocxo_fact_drain_callback(timepop_ctx_t*,
@@ -3909,6 +3998,11 @@ static interrupt_perishable_fact_t ocxo_cadence_build_perishable_fact(
                                   : OCXO_SERVICE_CLASS_ON_OR_AFTER_TARGET)
       : OCXO_SERVICE_CLASS_FALSE_IRQ;
   fact.exact_target_identity = true;
+  fact.sample_phase_valid = ctx.lane->cadence_sample_phase_valid;
+  fact.sample_phase_ticks = ctx.lane->cadence_sample_phase_ticks;
+  fact.sample_phase_us = ctx.lane->cadence_sample_phase_us;
+  fact.sample_phase_ns = ctx.lane->cadence_sample_phase_ns;
+  fact.sample_period_ticks = ctx.lane->cadence_sample_period_ticks;
 
   return fact;
 }
@@ -4847,8 +4941,8 @@ void process_interrupt_enable_irqs(void) {
 
   if (!OCXO1_DISABLED) {
     attachInterruptVector(IRQ_QTIMER2, qtimer2_isr);
-    NVIC_SET_PRIORITY(IRQ_QTIMER2, 16);
-    g_step0_qtimer2_priority_applied = 16;
+    NVIC_SET_PRIORITY(IRQ_QTIMER2, 0);
+    g_step0_qtimer2_priority_applied = 0;
     NVIC_ENABLE_IRQ(IRQ_QTIMER2);
     g_step0_qtimer2_irq_enabled_by_interrupt = true;
   } else {
@@ -4858,8 +4952,8 @@ void process_interrupt_enable_irqs(void) {
 
   if (!OCXO2_DISABLED) {
     attachInterruptVector(IRQ_QTIMER3, qtimer3_isr);
-    NVIC_SET_PRIORITY(IRQ_QTIMER3, 16);
-    g_step0_qtimer3_priority_applied = 16;
+    NVIC_SET_PRIORITY(IRQ_QTIMER3, 0);
+    g_step0_qtimer3_priority_applied = 0;
     NVIC_ENABLE_IRQ(IRQ_QTIMER3);
     g_step0_qtimer3_irq_enabled_by_interrupt = true;
   } else {
@@ -4946,8 +5040,9 @@ static void add_regression_payload(Payload& p,
   const cadence_regression_result_t& last = r.last_result;
 
   out.add_bool("regression_enabled",
-               r.kind != interrupt_subscriber_kind_t::VCLOCK ||
-               VCLOCK_LINEAR_REGRESSION_ENABLED);
+               r.kind == interrupt_subscriber_kind_t::VCLOCK
+                   ? VCLOCK_LINEAR_REGRESSION_ENABLED
+                   : OCXO_LINEAR_REGRESSION_ENABLED);
   out.add_u32("regression_samples_per_second", REGRESSION_SAMPLES_PER_SECOND);
   out.add_u32("regression_sample_total_count", r.sample_total_count);
   out.add_u32("regression_window_sample_count", r.sample_count);
@@ -5206,17 +5301,16 @@ static void add_runtime_payload(Payload& p) {
   p.add("ocxo1_irq_qtimer2_disabled", OCXO1_DISABLED);
   p.add("ocxo2_irq_qtimer3_disabled", OCXO2_DISABLED);
   p.add("ocxo_smartzero_surrogates_enabled", OCXO_DISABLE_EXPERIMENT);
-  p.add("timing_arch_step",
-        VCLOCK_LINEAR_REGRESSION_ENABLED
-            ? "LANE_LOCAL_1KHZ_LINEAR_REGRESSION"
-            : "OCXO_LINEAR_REGRESSION_VCLOCK_DIRECT_SAFEMODE");
+  p.add("ocxo_quiet_phase_sampling_enabled", OCXO_QUIET_PHASE_SAMPLING_ENABLED);
+  p.add("ocxo1_quiet_phase_ticks", OCXO1_QUIET_PHASE_TICKS);
+  p.add("ocxo1_quiet_phase_us", ocxo_phase_ticks_to_us(OCXO1_QUIET_PHASE_TICKS));
+  p.add("ocxo2_quiet_phase_ticks", OCXO2_QUIET_PHASE_TICKS);
+  p.add("ocxo2_quiet_phase_us", ocxo_phase_ticks_to_us(OCXO2_QUIET_PHASE_TICKS));
+  p.add("timing_arch_step", "OCXO_QUIET_PHASE_CADENCE_NO_REGRESSION");
   p.add("timing_arch_behavior_changed", true);
-  p.add("timing_arch_vclock_authority",
-        VCLOCK_LINEAR_REGRESSION_ENABLED
-            ? "QTIMER1_CH2_TIMEPOP_CADENCE_REGRESSION"
-            : "QTIMER1_CH2_TIMEPOP_DIRECT_SAFEMODE");
-  p.add("timing_arch_ocxo_model", "LOCAL_QTIMER_1KHZ_ROLLOVER_REGRESSION");
-  p.add("timing_arch_ocxo_migration_stage", "LINEAR_REGRESSION_AUTHORED_DWT");
+  p.add("timing_arch_vclock_authority", "QTIMER1_CH2_TIMEPOP_DIRECT_SAFEMODE");
+  p.add("timing_arch_ocxo_model", "LOCAL_QTIMER_1KHZ_QUIET_PHASE_ROLLOVER");
+  p.add("timing_arch_ocxo_migration_stage", "QUIET_PHASE_DWT_AUTHORITY");
   p.add("subscriber_count", g_subscriber_count);
   p.add("single_cadence_agent", false);
   p.add("cadence_minder_isr_mode", true);
@@ -5225,8 +5319,7 @@ static void add_runtime_payload(Payload& p) {
   p.add("ocxo_compare_live_requires_enabled_and_flag", true);
   p.add("lane_report_command", "INTERRUPT.REPORT_LANES");
   p.add("single_lane_report_command", "INTERRUPT.REPORT_LANE lane=VCLOCK|OCXO1|OCXO2");
-  p.add("regression_samples_report_command",
-        "INTERRUPT.REGRESSION_SAMPLES lane=OCXO1|OCXO2|VCLOCK offset=0 count=8 threshold=4");
+  p.add("regression_samples_report_command", "disabled");
 }
 
 static void add_ocxo_cadence_report_payload(Payload& p,
@@ -5238,6 +5331,11 @@ static void add_ocxo_cadence_report_payload(Payload& p,
   out.add_bool("cadence_armed", lane.cadence_armed);
   out.add_bool("cadence_epoch_valid", lane.cadence_epoch_valid);
   out.add_u32("cadence_epoch_counter32", lane.cadence_epoch_counter32);
+  out.add_bool("cadence_sample_phase_valid", lane.cadence_sample_phase_valid);
+  out.add_u32("cadence_sample_phase_ticks", lane.cadence_sample_phase_ticks);
+  out.add_u32("cadence_sample_phase_us", lane.cadence_sample_phase_us);
+  out.add_u32("cadence_sample_phase_ns", lane.cadence_sample_phase_ns);
+  out.add_u32("cadence_sample_period_ticks", lane.cadence_sample_period_ticks);
   out.add_u32("cadence_next_counter32", lane.cadence_next_counter32);
   out.add_u32("cadence_fire_count", lane.cadence_fire_count);
   out.add_u32("cadence_one_second_due_count", lane.cadence_one_second_due_count);
@@ -5261,6 +5359,12 @@ static void add_cadence_minder_payload(Payload& p) {
 
   p.add("ocxo_cadence_interval_ticks", OCXO_CADENCE_INTERVAL_TICKS);
   p.add("ocxo_cadence_samples_per_second", TICKS_PER_SECOND_EVENT);
+  p.add("ocxo_quiet_phase_sampling_enabled", OCXO_QUIET_PHASE_SAMPLING_ENABLED);
+  p.add("ocxo_quiet_phase_period_ticks", OCXO_QUIET_PHASE_PERIOD_TICKS);
+  p.add("ocxo1_quiet_phase_ticks", OCXO1_QUIET_PHASE_TICKS);
+  p.add("ocxo1_quiet_phase_us", ocxo_phase_ticks_to_us(OCXO1_QUIET_PHASE_TICKS));
+  p.add("ocxo2_quiet_phase_ticks", OCXO2_QUIET_PHASE_TICKS);
+  p.add("ocxo2_quiet_phase_us", ocxo_phase_ticks_to_us(OCXO2_QUIET_PHASE_TICKS));
   add_ocxo_cadence_report_payload(p, g_ocxo1_ctx);
   add_ocxo_cadence_report_payload(p, g_ocxo2_ctx);
 }
@@ -5563,7 +5667,7 @@ static void add_ocxo_identity_payload(Payload& p,
   p.add("hardware_lane", interrupt_lane_str(ctx.lane_id));
   p.add("cadence_source", ctx.cadence_source);
   p.add("counter_source", ctx.counter_source);
-  p.add("event_source", "LOCAL_CADENCE_1000TH_SAMPLE");
+  p.add("event_source", "LOCAL_CADENCE_1000TH_QUIET_PHASE_SAMPLE");
   p.add("dwt_authority", ctx.dwt_authority);
 }
 
@@ -5580,6 +5684,16 @@ static void add_ocxo_lane_basic_payload(payload_prefix_t& out,
   out.add_bool("cadence_epoch_valid", lane.cadence_epoch_valid);
   out.add_u32("cadence_epoch_counter32", lane.cadence_epoch_counter32);
   out.add_u32("cadence_interval_ticks", OCXO_CADENCE_INTERVAL_TICKS);
+  out.add_bool("cadence_sample_phase_valid", lane.cadence_sample_phase_valid);
+  out.add_u32("cadence_sample_phase_ticks", lane.cadence_sample_phase_ticks);
+  out.add_u32("cadence_sample_phase_us", lane.cadence_sample_phase_us);
+  out.add_u32("cadence_sample_phase_ns", lane.cadence_sample_phase_ns);
+  out.add_u32("cadence_sample_period_ticks", lane.cadence_sample_period_ticks);
+  out.add_u32("cadence_phase_align_start_count", lane.cadence_phase_align_start_count);
+  out.add_u32("cadence_last_phase_align_vclock_counter32", lane.cadence_last_phase_align_vclock_counter32);
+  out.add_u32("cadence_last_phase_align_vclock_phase_ticks", lane.cadence_last_phase_align_vclock_phase_ticks);
+  out.add_u32("cadence_last_phase_align_ticks_until_target", lane.cadence_last_phase_align_ticks_until_target);
+  out.add_u32("cadence_last_phase_align_ocxo_counter32", lane.cadence_last_phase_align_ocxo_counter32);
   out.add_u32("cadence_next_counter32", lane.cadence_next_counter32);
   out.add_u32("cadence_next_low16", (uint32_t)lane.cadence_next_low16);
   out.add_u32("cadence_fire_count", lane.cadence_fire_count);
@@ -5850,6 +5964,9 @@ static void add_ocxo_compact_payload(Payload& p,
   out.add_u32("cadence_one_second_due_count", lane.cadence_one_second_due_count);
   out.add_u32("cadence_false_irq_count", lane.cadence_false_irq_count);
   out.add_u32("cadence_next_counter32", lane.cadence_next_counter32);
+  out.add_bool("cadence_sample_phase_valid", lane.cadence_sample_phase_valid);
+  out.add_u32("cadence_sample_phase_ticks", lane.cadence_sample_phase_ticks);
+  out.add_u32("cadence_sample_phase_us", lane.cadence_sample_phase_us);
   out.add_i32("cadence_service_offset_ticks",
               lane.cadence_last_service_offset_signed_ticks);
   out.add_i32("service_offset_ticks", lane.witness_last_service_offset_signed_ticks);
@@ -5862,6 +5979,7 @@ static void add_ocxo_compact_payload(Payload& p,
   out.add_u32("fact_overflow_count", ring.overflow_count);
   out.add_u32("fact_high_water", ring.high_water);
   out.add_u32("fact_asap_fail_count", ring.asap_fail_count);
+  out.add_bool("linear_regression_enabled", OCXO_LINEAR_REGRESSION_ENABLED);
 
   const cadence_regression_lane_t* regression = cadence_regression_for_const(ctx.kind);
   if (regression) {
@@ -5881,9 +5999,8 @@ static Payload cmd_report(const Payload&) {
   p.add("report", "INTERRUPT_COMPACT");
   p.add("subreports",
         "REPORT_STATUS REPORT_PPS REPORT_CADENCE REPORT_SMARTZERO "
-        "REPORT_BRIDGE REPORT_LANES REPORT_LANE REGRESSION_SAMPLES");
-  p.add("regression_samples_report_command",
-        "INTERRUPT.REGRESSION_SAMPLES lane=OCXO1|OCXO2|VCLOCK offset=0 count=8 threshold=4");
+        "REPORT_BRIDGE REPORT_LANES REPORT_LANE");
+  p.add("regression_samples_report_command", "disabled");
 
   // Keep the default INTERRUPT.REPORT deliberately small.  The former
   // monolithic report carried PPS, epoch capture, SmartZero lane proof,
@@ -5901,12 +6018,17 @@ static Payload cmd_report(const Payload&) {
   p.add("ocxo1_irq_qtimer2_disabled", OCXO1_DISABLED);
   p.add("ocxo2_irq_qtimer3_disabled", OCXO2_DISABLED);
   p.add("ocxo_smartzero_surrogates_enabled", OCXO_DISABLE_EXPERIMENT);
-  p.add("timing_arch_step", "TRADITIONAL_DWT_WITH_REGRESSION_DIAGNOSTICS");
+  p.add("ocxo_quiet_phase_sampling_enabled", OCXO_QUIET_PHASE_SAMPLING_ENABLED);
+  p.add("ocxo1_quiet_phase_ticks", OCXO1_QUIET_PHASE_TICKS);
+  p.add("ocxo1_quiet_phase_us", ocxo_phase_ticks_to_us(OCXO1_QUIET_PHASE_TICKS));
+  p.add("ocxo2_quiet_phase_ticks", OCXO2_QUIET_PHASE_TICKS);
+  p.add("ocxo2_quiet_phase_us", ocxo_phase_ticks_to_us(OCXO2_QUIET_PHASE_TICKS));
+  p.add("timing_arch_step", "OCXO_QUIET_PHASE_CADENCE_NO_REGRESSION");
   p.add("timing_arch_behavior_changed", true);
   p.add("linear_regression_authored_dwt", LINEAR_REGRESSION_AUTHORED_DWT);
   p.add("linear_regression_diagnostic_only", LINEAR_REGRESSION_DIAGNOSTIC_ONLY);
   p.add("vclock_linear_regression_enabled", VCLOCK_LINEAR_REGRESSION_ENABLED);
-  p.add("ocxo_linear_regression_enabled", true);
+  p.add("ocxo_linear_regression_enabled", OCXO_LINEAR_REGRESSION_ENABLED);
   p.add("single_cadence_agent", false);
   p.add("cadence_minder_isr_mode", true);
   p.add("ocxo_lane_local_cadence", true);
@@ -6329,7 +6451,6 @@ static const process_command_entry_t INTERRUPT_COMMANDS[] = {
   { "REPORT_BRIDGE",   cmd_report_bridge   },
   { "REPORT_LANES",    cmd_report_lanes    },
   { "REPORT_LANE",     cmd_report_lane     },
-  { "REGRESSION_SAMPLES", cmd_regression_samples },
   { nullptr,           nullptr             }
 };
 

@@ -184,10 +184,11 @@ struct interrupt_event_t {
   interrupt_lane_t            lane     = interrupt_lane_t::NONE;
   interrupt_event_status_t    status   = interrupt_event_status_t::OK;
 
-  // Traditional event-coordinate DWT of the lane's one-second edge.
-  // Experimental 1 kHz linear-regression inference is carried separately in
-  // interrupt_capture_diag_t and does not replace this subscriber-facing value
-  // in the diagnostic-only build.
+  // Traditional event-coordinate DWT of the lane's one-second event.
+  // For OCXO quiet-zone custody this is the observed quiet-zone sample; the
+  // diagnostic payload carries its phase so subscribers may reconstruct the
+  // logical one-second boundary.  Linear regression is disabled in this
+  // checkpoint and does not replace this value.
   uint32_t dwt_at_event = 0;
 
   // GNSS ns at the event.  For VCLOCK, authored from the VCLOCK counter
@@ -338,6 +339,25 @@ struct interrupt_capture_diag_t {
   uint32_t ocxo_counter_delta_violation_count = 0;
   uint32_t ocxo_last_bad_counter_delta = 0;
   uint32_t ocxo_last_counter_delta_ticks = 0;
+
+  // OCXO quiet-zone sample phase.  These fields are populated only for OCXO
+  // one-second subscriber events.  The event DWT/counter32 describe the clean
+  // observed quiet-zone sample; process_clocks may use this explicit phase
+  // metadata to back-project the sample to the logical one-second boundary.
+  bool     ocxo_sample_phase_valid = false;
+  uint32_t ocxo_sample_phase_ticks = 0;     // 10 MHz ticks; 2500 = +250 us
+  uint32_t ocxo_sample_phase_ns = 0;
+  uint32_t ocxo_sample_phase_us = 0;
+  uint32_t ocxo_sample_period_ticks = 0;    // normally 10,000 ticks = 1 ms
+  uint32_t ocxo_sample_dwt_at_event = 0;
+  uint32_t ocxo_sample_counter32_at_event = 0;
+
+  // Subscriber-computed boundary projection.  process_interrupt leaves these
+  // zero; Alpha fills them in its forensics surface after subtracting the
+  // phase-derived DWT/counter offset.
+  uint32_t ocxo_boundary_dwt_at_event = 0;
+  uint32_t ocxo_boundary_counter32_at_event = 0;
+  int32_t  ocxo_boundary_correction_cycles = 0;
 
   uint32_t anomaly_count = 0;
 };

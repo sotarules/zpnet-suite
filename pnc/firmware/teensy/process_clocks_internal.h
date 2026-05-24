@@ -74,8 +74,8 @@
 //   independent rails:
 //     PPS    — physical GPIO PPS edge-to-edge DWT interval
 //     VCLOCK — canonical PPS/VCLOCK lattice edge-to-edge DWT interval
-//     OCXO1  — OCXO1 witness edge-to-edge DWT interval
-//     OCXO2  — OCXO2 witness edge-to-edge DWT interval
+//     OCXO1  — OCXO1 phase-projected boundary-to-boundary DWT interval
+//     OCXO2  — OCXO2 phase-projected boundary-to-boundary DWT interval
 //   Beta publishes the compact audit.
 //
 // VCLOCK as measured peer of OCXO:
@@ -333,6 +333,17 @@ struct clocks_alpha_lane_forensics_t {
   uint32_t diag_counter_delta_violation_count;
   uint32_t diag_last_bad_counter_delta;
   uint32_t diag_last_counter_delta_ticks;
+
+  bool     diag_sample_phase_valid;
+  uint32_t diag_sample_phase_ticks;
+  uint32_t diag_sample_phase_ns;
+  uint32_t diag_sample_phase_us;
+  uint32_t diag_sample_period_ticks;
+  uint32_t diag_sample_dwt_at_event;
+  uint32_t diag_sample_counter32_at_event;
+  uint32_t diag_boundary_dwt_at_event;
+  uint32_t diag_boundary_counter32_at_event;
+  int32_t  diag_boundary_correction_cycles;
 
   bool     regression_valid;
   uint32_t regression_sequence;

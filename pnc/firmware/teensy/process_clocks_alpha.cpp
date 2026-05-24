@@ -8,9 +8,11 @@
 // mirror.  No slot staging, no installed event wrappers, no late hardware
 // reads masquerading as event truth.
 //
-// OCXO events carry an additional diagnostic service-corrected DWT endpoint.
-// Alpha promotes that corrected endpoint for OCXO physics-facing interval math
-// while preserving the interrupt-authored event identity and correction audit.
+// OCXO events may be deliberately sampled in quiet zones inside the VCLOCK
+// millisecond cell.  Alpha consumes the explicit sample phase diagnostic and
+// back-projects the observed sample to the logical one-second boundary before
+// applying OCXO physics/accounting.  The raw quiet-zone sample remains visible
+// in the forensic diagnostics.
 //
 // PPS is a selector/witness. process_interrupt authors the selected PPS/VCLOCK
 // edge identity, while the physical PPS/GPIO DWT witness supplies the smooth
@@ -512,6 +514,17 @@ struct alpha_lane_forensics_store_t {
   uint32_t diag_last_bad_counter_delta = 0;
   uint32_t diag_last_counter_delta_ticks = 0;
 
+  bool     diag_sample_phase_valid = false;
+  uint32_t diag_sample_phase_ticks = 0;
+  uint32_t diag_sample_phase_ns = 0;
+  uint32_t diag_sample_phase_us = 0;
+  uint32_t diag_sample_period_ticks = 0;
+  uint32_t diag_sample_dwt_at_event = 0;
+  uint32_t diag_sample_counter32_at_event = 0;
+  uint32_t diag_boundary_dwt_at_event = 0;
+  uint32_t diag_boundary_counter32_at_event = 0;
+  int32_t  diag_boundary_correction_cycles = 0;
+
   bool     regression_valid = false;
   uint32_t regression_sequence = 0;
   uint32_t regression_sample_count = 0;
@@ -962,6 +975,16 @@ static void alpha_forensics_reset_store(alpha_lane_forensics_store_t& s) {
   s.diag_counter_delta_violation_count = 0;
   s.diag_last_bad_counter_delta = 0;
   s.diag_last_counter_delta_ticks = 0;
+  s.diag_sample_phase_valid = false;
+  s.diag_sample_phase_ticks = 0;
+  s.diag_sample_phase_ns = 0;
+  s.diag_sample_phase_us = 0;
+  s.diag_sample_period_ticks = 0;
+  s.diag_sample_dwt_at_event = 0;
+  s.diag_sample_counter32_at_event = 0;
+  s.diag_boundary_dwt_at_event = 0;
+  s.diag_boundary_counter32_at_event = 0;
+  s.diag_boundary_correction_cycles = 0;
   s.regression_valid = false;
   s.regression_sequence = 0;
   s.regression_sample_count = 0;
@@ -1094,6 +1117,16 @@ static void alpha_forensics_publish(time_clock_id_t clock_id,
         diag->ocxo_counter_delta_violation_count;
     s->diag_last_bad_counter_delta = diag->ocxo_last_bad_counter_delta;
     s->diag_last_counter_delta_ticks = diag->ocxo_last_counter_delta_ticks;
+    s->diag_sample_phase_valid = diag->ocxo_sample_phase_valid;
+    s->diag_sample_phase_ticks = diag->ocxo_sample_phase_ticks;
+    s->diag_sample_phase_ns = diag->ocxo_sample_phase_ns;
+    s->diag_sample_phase_us = diag->ocxo_sample_phase_us;
+    s->diag_sample_period_ticks = diag->ocxo_sample_period_ticks;
+    s->diag_sample_dwt_at_event = diag->ocxo_sample_dwt_at_event;
+    s->diag_sample_counter32_at_event = diag->ocxo_sample_counter32_at_event;
+    s->diag_boundary_dwt_at_event = diag->ocxo_boundary_dwt_at_event;
+    s->diag_boundary_counter32_at_event = diag->ocxo_boundary_counter32_at_event;
+    s->diag_boundary_correction_cycles = diag->ocxo_boundary_correction_cycles;
 
     s->regression_valid = diag->regression_valid;
     s->regression_sequence = diag->regression_sequence;
@@ -1153,6 +1186,16 @@ static void alpha_forensics_publish(time_clock_id_t clock_id,
     s->diag_counter_delta_violation_count = 0;
     s->diag_last_bad_counter_delta = 0;
     s->diag_last_counter_delta_ticks = 0;
+    s->diag_sample_phase_valid = false;
+    s->diag_sample_phase_ticks = 0;
+    s->diag_sample_phase_ns = 0;
+    s->diag_sample_phase_us = 0;
+    s->diag_sample_period_ticks = 0;
+    s->diag_sample_dwt_at_event = 0;
+    s->diag_sample_counter32_at_event = 0;
+    s->diag_boundary_dwt_at_event = 0;
+    s->diag_boundary_counter32_at_event = 0;
+    s->diag_boundary_correction_cycles = 0;
     s->regression_valid = false;
     s->regression_sequence = 0;
     s->regression_sample_count = 0;
@@ -1241,6 +1284,16 @@ bool clocks_alpha_lane_forensics(time_clock_id_t clock,
         s->diag_counter_delta_violation_count;
     out->diag_last_bad_counter_delta = s->diag_last_bad_counter_delta;
     out->diag_last_counter_delta_ticks = s->diag_last_counter_delta_ticks;
+    out->diag_sample_phase_valid = s->diag_sample_phase_valid;
+    out->diag_sample_phase_ticks = s->diag_sample_phase_ticks;
+    out->diag_sample_phase_ns = s->diag_sample_phase_ns;
+    out->diag_sample_phase_us = s->diag_sample_phase_us;
+    out->diag_sample_period_ticks = s->diag_sample_period_ticks;
+    out->diag_sample_dwt_at_event = s->diag_sample_dwt_at_event;
+    out->diag_sample_counter32_at_event = s->diag_sample_counter32_at_event;
+    out->diag_boundary_dwt_at_event = s->diag_boundary_dwt_at_event;
+    out->diag_boundary_counter32_at_event = s->diag_boundary_counter32_at_event;
+    out->diag_boundary_correction_cycles = s->diag_boundary_correction_cycles;
     out->regression_valid = s->regression_valid;
     out->regression_sequence = s->regression_sequence;
     out->regression_sample_count = s->regression_sample_count;
@@ -1847,19 +1900,72 @@ static uint32_t alpha_physics_dwt_at_event(time_clock_id_t clock,
   return event.dwt_at_event;
 }
 
+static uint32_t alpha_dwt_cycles_for_10mhz_ticks(uint32_t ticks,
+                                                 uint32_t cycles_per_second) {
+  if (ticks == 0 || cycles_per_second == 0) return 0;
+  return (uint32_t)(((uint64_t)cycles_per_second * (uint64_t)ticks +
+                     (uint64_t)VCLOCK_COUNTS_PER_SECOND / 2ULL) /
+                    (uint64_t)VCLOCK_COUNTS_PER_SECOND);
+}
+
+static uint32_t alpha_phase_backprojection_cps(const clock_measurement_t& meas) {
+  if (meas.dwt_cycles_between_edges != 0) {
+    return meas.dwt_cycles_between_edges;
+  }
+  const uint32_t effective = dwt_effective_cycles_per_pps_vclock_second();
+  return effective ? effective : (uint32_t)DWT_EXPECTED_PER_PPS;
+}
+
 static void clocks_apply_epoch_counter_edge(clock_state_t& clock,
                                             clock_measurement_t& meas,
                                             const interrupt_event_t& event,
                                             const interrupt_capture_diag_t* diag,
                                             uint32_t zero_offset_counter32,
                                             time_clock_id_t time_clock) {
+  const bool is_ocxo = alpha_clock_is_ocxo(time_clock);
+  const bool had_previous = (meas.prev_dwt_at_edge != 0);
+
+  interrupt_event_t applied_event = event;
+  const uint32_t sample_physics_dwt =
+      alpha_physics_dwt_at_event(time_clock, event, diag);
+  uint32_t phase_ticks = 0;
+  uint32_t phase_cycles = 0;
+
+  if (is_ocxo && diag && diag->ocxo_sample_phase_valid) {
+    phase_ticks = diag->ocxo_sample_phase_ticks;
+    phase_cycles = alpha_dwt_cycles_for_10mhz_ticks(
+        phase_ticks, alpha_phase_backprojection_cps(meas));
+    applied_event.dwt_at_event = sample_physics_dwt - phase_cycles;
+    applied_event.counter32_at_event = event.counter32_at_event - phase_ticks;
+  } else {
+    applied_event.dwt_at_event = sample_physics_dwt;
+  }
+
+  interrupt_capture_diag_t local_diag{};
+  const interrupt_capture_diag_t* applied_diag = diag;
+  if (diag) {
+    local_diag = *diag;
+    if (is_ocxo) {
+      local_diag.ocxo_sample_dwt_at_event =
+          diag->ocxo_sample_dwt_at_event ? diag->ocxo_sample_dwt_at_event : event.dwt_at_event;
+      local_diag.ocxo_sample_counter32_at_event =
+          diag->ocxo_sample_counter32_at_event ? diag->ocxo_sample_counter32_at_event : event.counter32_at_event;
+      local_diag.ocxo_boundary_dwt_at_event = applied_event.dwt_at_event;
+      local_diag.ocxo_boundary_counter32_at_event = applied_event.counter32_at_event;
+      local_diag.ocxo_boundary_correction_cycles = (int32_t)phase_cycles;
+      local_diag.dwt_at_event = applied_event.dwt_at_event;
+      local_diag.counter32_at_event = applied_event.counter32_at_event;
+    }
+    applied_diag = &local_diag;
+  }
+
   uint64_t logical_ticks64 = 0;
   uint64_t counter_ns_now = 0;
   uint32_t counter32_delta_since_zero_offset = 0;
   uint32_t counter32_delta_since_previous_event = 0;
 
   if (!alpha_ticks64_apply_event(time_clock,
-                                 event.counter32_at_event,
+                                 applied_event.counter32_at_event,
                                  zero_offset_counter32,
                                  &logical_ticks64,
                                  &counter_ns_now,
@@ -1867,18 +1973,11 @@ static void clocks_apply_epoch_counter_edge(clock_state_t& clock,
                                  &counter32_delta_since_previous_event)) {
     clocks_watchdog_anomaly("alpha_clock_apply_failed",
                             (uint32_t)((uint8_t)time_clock),
-                            event.counter32_at_event,
-                            event.dwt_at_event,
+                            applied_event.counter32_at_event,
+                            applied_event.dwt_at_event,
                             0);
     return;
   }
-
-  const bool is_ocxo = alpha_clock_is_ocxo(time_clock);
-  interrupt_event_t applied_event = event;
-  applied_event.dwt_at_event =
-      alpha_physics_dwt_at_event(time_clock, event, diag);
-
-  const bool had_previous = (meas.prev_dwt_at_edge != 0);
 
   uint64_t ns_now = counter_ns_now;
   uint32_t dwt_cycles_between_edges = had_previous
@@ -1920,9 +2019,10 @@ static void clocks_apply_epoch_counter_edge(clock_state_t& clock,
 
   clock.ledger_ns_count_at_edge = ns_now;
   clock.ledger_ns_count_at_pps_vclock = ns_now;
-  const uint64_t reference_gnss_ns_at_edge = (event.gnss_ns_at_event != 0)
-      ? event.gnss_ns_at_event
-      : ns_now;
+  const uint64_t reference_gnss_ns_at_edge =
+      is_ocxo
+          ? ns_now
+          : ((event.gnss_ns_at_event != 0) ? event.gnss_ns_at_event : ns_now);
   clock.gnss_ns_at_edge = reference_gnss_ns_at_edge;
   clock.phase_offset_ns =
       (int64_t)reference_gnss_ns_at_edge - (int64_t)ns_now;
@@ -1954,7 +2054,7 @@ static void clocks_apply_epoch_counter_edge(clock_state_t& clock,
     alpha_static_prediction_record(time_clock, dwt_cycles_between_edges);
   }
 
-  alpha_forensics_publish(time_clock, clock, meas, applied_event, diag,
+  alpha_forensics_publish(time_clock, clock, meas, applied_event, applied_diag,
                           alpha_zero_offset_valid(time_clock),
                           zero_offset_counter32,
                           counter32_delta_since_zero_offset,

@@ -773,7 +773,33 @@ static void payload_add_lane_forensics_flat(Payload& p,
   add_u32("forensics_last_counter_delta_ticks",
           valid ? f.diag_last_counter_delta_ticks : 0U);
 
-  // Linear-regression diagnostics are experimental-only in this pass.
+  // Quiet-zone OCXO sample phase / Alpha boundary projection.  raw_cycles can
+  // continue to use forensics_last_event_dwt as the Alpha-applied boundary DWT
+  // while these fields expose the observed sample and the subtracted phase.
+  add_bool("forensics_sample_phase_valid",
+           valid && f.diag_sample_phase_valid);
+  add_u32("forensics_sample_phase_ticks",
+          valid ? f.diag_sample_phase_ticks : 0U);
+  add_u32("forensics_sample_phase_us",
+          valid ? f.diag_sample_phase_us : 0U);
+  add_u32("forensics_sample_phase_ns",
+          valid ? f.diag_sample_phase_ns : 0U);
+  add_u32("forensics_sample_period_ticks",
+          valid ? f.diag_sample_period_ticks : 0U);
+  add_u32("forensics_sample_dwt_at_event",
+          valid ? f.diag_sample_dwt_at_event : 0U);
+  add_u32("forensics_sample_counter32_at_event",
+          valid ? f.diag_sample_counter32_at_event : 0U);
+  add_u32("forensics_boundary_dwt_at_event",
+          valid ? f.diag_boundary_dwt_at_event : 0U);
+  add_u32("forensics_boundary_counter32_at_event",
+          valid ? f.diag_boundary_counter32_at_event : 0U);
+  add_i32("forensics_boundary_correction_cycles",
+          valid ? f.diag_boundary_correction_cycles : 0);
+
+  // Linear-regression diagnostics are disabled in the quiet-phase checkpoint.
+  // The zero-valued/invalid surface is kept temporarily so existing report
+  // readers do not fail while the OCXO custody experiment is evaluated.
   // The subscriber-facing event DWT remains the traditional edge DWT; these
   // fields expose what the regression engine inferred from the 1 kHz window.
   add_bool("forensics_regression_valid",
@@ -970,6 +996,19 @@ static void payload_add_ocxo_service_object(Payload& parent,
               valid ? f.diag_counter_delta_violation_count : 0U);
   service.add("last_bad_counter_delta", valid ? f.diag_last_bad_counter_delta : 0U);
   service.add("last_counter_delta_ticks", valid ? f.diag_last_counter_delta_ticks : 0U);
+  service.add("sample_phase_valid", valid && f.diag_sample_phase_valid);
+  service.add("sample_phase_ticks", valid ? f.diag_sample_phase_ticks : 0U);
+  service.add("sample_phase_us", valid ? f.diag_sample_phase_us : 0U);
+  service.add("sample_phase_ns", valid ? f.diag_sample_phase_ns : 0U);
+  service.add("sample_period_ticks", valid ? f.diag_sample_period_ticks : 0U);
+  service.add("sample_dwt_at_event", valid ? f.diag_sample_dwt_at_event : 0U);
+  service.add("sample_counter32_at_event",
+              valid ? f.diag_sample_counter32_at_event : 0U);
+  service.add("boundary_dwt_at_event", valid ? f.diag_boundary_dwt_at_event : 0U);
+  service.add("boundary_counter32_at_event",
+              valid ? f.diag_boundary_counter32_at_event : 0U);
+  service.add("boundary_correction_cycles",
+              valid ? f.diag_boundary_correction_cycles : 0);
   parent.add_object("service", service);
 }
 
@@ -977,7 +1016,8 @@ static void payload_add_lane_regression_object(Payload& parent,
                                                bool valid,
                                                const clocks_alpha_lane_forensics_t& f) {
   Payload regression;
-  regression.add("valid", valid && f.regression_valid);
+  regression.add("enabled", false);
+  regression.add("valid", false);
   regression.add("sequence", valid ? f.regression_sequence : 0U);
   regression.add("sample_count", valid ? f.regression_sample_count : 0U);
   regression.add("observed_dwt_at_event",
@@ -2017,10 +2057,21 @@ static void add_alpha_event_payload(Payload& p,
               f.diag_counter_delta_violation_count);
   service.add("last_bad_counter_delta", f.diag_last_bad_counter_delta);
   service.add("last_counter_delta_ticks", f.diag_last_counter_delta_ticks);
+  service.add("sample_phase_valid", f.diag_sample_phase_valid);
+  service.add("sample_phase_ticks", f.diag_sample_phase_ticks);
+  service.add("sample_phase_us", f.diag_sample_phase_us);
+  service.add("sample_phase_ns", f.diag_sample_phase_ns);
+  service.add("sample_period_ticks", f.diag_sample_period_ticks);
+  service.add("sample_dwt_at_event", f.diag_sample_dwt_at_event);
+  service.add("sample_counter32_at_event", f.diag_sample_counter32_at_event);
+  service.add("boundary_dwt_at_event", f.diag_boundary_dwt_at_event);
+  service.add("boundary_counter32_at_event", f.diag_boundary_counter32_at_event);
+  service.add("boundary_correction_cycles", f.diag_boundary_correction_cycles);
   p.add_object("ocxo_service", service);
 
   Payload regression;
-  regression.add("valid", f.regression_valid);
+  regression.add("enabled", false);
+  regression.add("valid", false);
   regression.add("sequence", f.regression_sequence);
   regression.add("sample_count", f.regression_sample_count);
   regression.add("observed_dwt_at_event",

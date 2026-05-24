@@ -18,6 +18,7 @@
 //   • 1 Hz publication of canonical clock tuple
 //   • Continuous DWT-to-GNSS calibration (campaign-independent)
 //   • Static PPS/GPIO-based one-second prediction audit for VCLOCK and OCXO lanes
+//   • Phase-aware OCXO quiet-zone sample consumption and boundary projection
 //
 // Initialization is split into two phases:
 //
@@ -103,8 +104,8 @@ uint64_t clocks_ocxo2_measured_gnss_ns_now(void);
 // Four symmetric static prediction surfaces are published:
 //   PPS    — physical GPIO PPS edge-to-edge DWT cycles
 //   VCLOCK — canonical PPS/VCLOCK lattice edge-to-edge DWT cycles
-//   OCXO1  — OCXO1 witness edge-to-edge DWT cycles
-//   OCXO2  — OCXO2 witness edge-to-edge DWT cycles
+//   OCXO1  — OCXO1 phase-projected boundary-to-boundary DWT cycles
+//   OCXO2  — OCXO2 phase-projected boundary-to-boundary DWT cycles
 // Each lane uses the prior completed interval as the next-second prediction.
 
 struct clocks_static_prediction_snapshot_t {
