@@ -1817,6 +1817,13 @@ bool clocks_alpha_zero_from_smartzero(const char* reason) {
   time_clock_epoch_reset(time_clock_id_t::OCXO2,  ocxo2.anchor_dwt, 0);
 
   alpha_smartzero_install_mark_stage(SMARTZERO_INSTALL_STAGE_TIMEPOP_REAUTHOR);
+  // CLOCKS has now selected and installed the OCXO logical zero-offset
+  // counter32 values. Explicitly hand those anchors back to process_interrupt
+  // so the OCXO local compare ladders are re-authored from the installed
+  // SmartZero proof instead of relying on acquisition-side residue.
+  interrupt_ocxo_logical_grid_epoch(ocxo1.anchor_counter32,
+                                    ocxo2.anchor_counter32);
+
   // VCLOCK synthetic coordinate generation changed. Re-author recurring
   // TimePop timers and cancel unsafe old-coordinate one-shots before normal
   // scheduling resumes.
