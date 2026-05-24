@@ -635,6 +635,54 @@ static bool pvc_anchor_snapshot(pvc_anchor_record_t* out, uint32_t& out_count) {
   return false;
 }
 
+// Label an already-authored PPS_VCLOCK anchor with CLOCKS/Alpha's campaign
+// GNSS identity and PPS/GPIO-derived static DWT cycles-per-second ruler.
+// This is deliberately a ring annotation only: process_interrupt still owns
+// anchor selection and DWT-to-GNSS projection for subscriber events, but it
+// does not invent campaign GNSS labels locally.
+void interrupt_pps_vclock_label_anchor(uint32_t sequence,
+                                       uint32_t counter32_at_edge,
+                                       uint64_t gnss_ns_at_edge,
+                                       uint32_t dwt_cycles_per_second) {
+  if (sequence == 0 || dwt_cycles_per_second == 0) return;
+
+  uint32_t primask = 0;
+  __asm__ volatile ("mrs %0, primask" : "=r" (primask) :: "memory");
+  __disable_irq();
+
+  uint32_t match = PVC_ANCHOR_RING_SIZE;
+  const uint32_t count = g_pvc_anchor_count;
+  const uint32_t bounded =
+      (count > PVC_ANCHOR_RING_SIZE) ? PVC_ANCHOR_RING_SIZE : count;
+  const uint32_t head = g_pvc_anchor_head;
+
+  for (uint32_t age = 0; age < bounded; age++) {
+    const uint32_t idx =
+        (head + PVC_ANCHOR_RING_SIZE - age) % PVC_ANCHOR_RING_SIZE;
+    const pvc_anchor_record_t& a = g_pvc_anchor_ring[idx];
+    if (a.sequence == sequence && a.counter32_at_edge == counter32_at_edge) {
+      match = idx;
+      break;
+    }
+  }
+
+  if (match < PVC_ANCHOR_RING_SIZE) {
+    g_pvc_anchor_seq++;
+    dmb_barrier();
+
+    g_pvc_anchor_ring[match].gnss_ns_at_edge = (int64_t)gnss_ns_at_edge;
+    g_pvc_anchor_ring[match].cps = dwt_cycles_per_second;
+    g_pvc_anchor_ring[match].cps_valid = true;
+
+    dmb_barrier();
+    g_pvc_anchor_seq++;
+  }
+
+  if ((primask & 1u) == 0) {
+    __enable_irq();
+  }
+}
+
 static void bridge_projection_copy_to_diag(interrupt_capture_diag_t& diag,
                                            const bridge_projection_t& proj) {
   diag.anchor_sequence_used = proj.anchor_sequence_used;

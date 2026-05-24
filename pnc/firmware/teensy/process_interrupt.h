@@ -807,6 +807,17 @@ void interrupt_pps_edge_register_dispatch(pps_edge_dispatch_fn fn);
 
 pps_vclock_t interrupt_last_pps_vclock(void);
 
+// CLOCKS/Alpha owns the campaign GNSS ledger.  When it has assigned a
+// GNSS label and PPS-derived DWT cycles-per-second ruler to a PPS_VCLOCK
+// bookend, it may hand that label back to process_interrupt so the
+// DWT-to-PPS_VCLOCK bridge can normalize later OCXO/TimePop event DWT facts.
+// This call only annotates an existing process_interrupt-authored anchor; it
+// does not publish an edge, create a local GNSS ledger, or alter event custody.
+void interrupt_pps_vclock_label_anchor(uint32_t sequence,
+                                       uint32_t counter32_at_edge,
+                                       uint64_t gnss_ns_at_edge,
+                                       uint32_t dwt_cycles_per_second);
+
 bool interrupt_last_pps_vclock_phase_estimate(
     pps_vclock_phase_estimate_t* out);
 
