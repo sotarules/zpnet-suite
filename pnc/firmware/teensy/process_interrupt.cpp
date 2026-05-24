@@ -547,6 +547,20 @@ static volatile uint32_t g_pvc_anchor_count = 0;
 static volatile bool     g_pvc_anchor_reset_pending = false;
 static pvc_anchor_record_t g_pvc_anchor_ring[PVC_ANCHOR_RING_SIZE];
 
+// Report-only accounting for CLOCKS/Alpha GNSS-label annotations.
+// The label API does not create anchors or change event custody; these counters
+// only make successful/missed annotations visible in INTERRUPT.REPORT_BRIDGE.
+static uint32_t g_pvc_anchor_label_update_count = 0;
+static uint32_t g_pvc_anchor_label_miss_count = 0;
+static uint32_t g_pvc_anchor_label_invalid_count = 0;
+static uint32_t g_pvc_anchor_label_last_sequence = 0;
+static uint32_t g_pvc_anchor_label_last_counter32 = 0;
+static int64_t  g_pvc_anchor_label_last_gnss_ns = -1;
+static uint32_t g_pvc_anchor_label_last_cps = 0;
+static uint32_t g_pvc_anchor_label_last_match_age_slots = 0xFFFFFFFFUL;
+static uint32_t g_pvc_anchor_label_last_match_index = 0xFFFFFFFFUL;
+static bool     g_pvc_anchor_label_last_success = false;
+
 static bridge_anchor_stats_t g_bridge_stats_timepop = {};
 static bridge_anchor_stats_t g_bridge_stats_ocxo1 = {};
 static bridge_anchor_stats_t g_bridge_stats_ocxo2 = {};
@@ -558,6 +572,16 @@ static void pvc_anchor_ring_reset(void) {
   g_pvc_anchor_head = 0;
   g_pvc_anchor_count = 0;
   g_pvc_anchor_reset_pending = false;
+  g_pvc_anchor_label_update_count = 0;
+  g_pvc_anchor_label_miss_count = 0;
+  g_pvc_anchor_label_invalid_count = 0;
+  g_pvc_anchor_label_last_sequence = 0;
+  g_pvc_anchor_label_last_counter32 = 0;
+  g_pvc_anchor_label_last_gnss_ns = -1;
+  g_pvc_anchor_label_last_cps = 0;
+  g_pvc_anchor_label_last_match_age_slots = 0xFFFFFFFFUL;
+  g_pvc_anchor_label_last_match_index = 0xFFFFFFFFUL;
+  g_pvc_anchor_label_last_success = false;
   for (uint32_t i = 0; i < PVC_ANCHOR_RING_SIZE; i++) {
     g_pvc_anchor_ring[i] = pvc_anchor_record_t{};
   }
@@ -644,13 +668,24 @@ void interrupt_pps_vclock_label_anchor(uint32_t sequence,
                                        uint32_t counter32_at_edge,
                                        uint64_t gnss_ns_at_edge,
                                        uint32_t dwt_cycles_per_second) {
-  if (sequence == 0 || dwt_cycles_per_second == 0) return;
+  if (sequence == 0 || dwt_cycles_per_second == 0) {
+    g_pvc_anchor_label_invalid_count++;
+    g_pvc_anchor_label_last_sequence = sequence;
+    g_pvc_anchor_label_last_counter32 = counter32_at_edge;
+    g_pvc_anchor_label_last_gnss_ns = (int64_t)gnss_ns_at_edge;
+    g_pvc_anchor_label_last_cps = dwt_cycles_per_second;
+    g_pvc_anchor_label_last_match_age_slots = 0xFFFFFFFFUL;
+    g_pvc_anchor_label_last_match_index = 0xFFFFFFFFUL;
+    g_pvc_anchor_label_last_success = false;
+    return;
+  }
 
   uint32_t primask = 0;
   __asm__ volatile ("mrs %0, primask" : "=r" (primask) :: "memory");
   __disable_irq();
 
   uint32_t match = PVC_ANCHOR_RING_SIZE;
+  uint32_t match_age = 0xFFFFFFFFUL;
   const uint32_t count = g_pvc_anchor_count;
   const uint32_t bounded =
       (count > PVC_ANCHOR_RING_SIZE) ? PVC_ANCHOR_RING_SIZE : count;
@@ -662,9 +697,17 @@ void interrupt_pps_vclock_label_anchor(uint32_t sequence,
     const pvc_anchor_record_t& a = g_pvc_anchor_ring[idx];
     if (a.sequence == sequence && a.counter32_at_edge == counter32_at_edge) {
       match = idx;
+      match_age = age;
       break;
     }
   }
+
+  g_pvc_anchor_label_last_sequence = sequence;
+  g_pvc_anchor_label_last_counter32 = counter32_at_edge;
+  g_pvc_anchor_label_last_gnss_ns = (int64_t)gnss_ns_at_edge;
+  g_pvc_anchor_label_last_cps = dwt_cycles_per_second;
+  g_pvc_anchor_label_last_match_age_slots = match_age;
+  g_pvc_anchor_label_last_match_index = match;
 
   if (match < PVC_ANCHOR_RING_SIZE) {
     g_pvc_anchor_seq++;
@@ -676,6 +719,12 @@ void interrupt_pps_vclock_label_anchor(uint32_t sequence,
 
     dmb_barrier();
     g_pvc_anchor_seq++;
+
+    g_pvc_anchor_label_update_count++;
+    g_pvc_anchor_label_last_success = true;
+  } else {
+    g_pvc_anchor_label_miss_count++;
+    g_pvc_anchor_label_last_success = false;
   }
 
   if ((primask & 1u) == 0) {
@@ -6190,11 +6239,87 @@ static Payload cmd_report_smartzero(const Payload&) {
   return p;
 }
 
+static void add_pvc_anchor_entry_payload(Payload& p,
+                                         const char* prefix,
+                                         const pvc_anchor_record_t& a,
+                                         bool present) {
+  payload_prefix_t out(p, prefix);
+  const bool label_present = present && a.gnss_ns_at_edge >= 0;
+  const bool cps_present = present && a.cps_valid && a.cps != 0;
+
+  out.add_bool("present", present);
+  out.add_bool("gnss_label_present", label_present);
+  out.add_bool("cps_valid", cps_present);
+  out.add_bool("usable", label_present && cps_present);
+  out.add_u32("sequence", present ? a.sequence : 0U);
+  out.add_u32("dwt_at_edge", present ? a.dwt_at_edge : 0U);
+  out.add_u32("counter32_at_edge", present ? a.counter32_at_edge : 0U);
+  out.add_i64("gnss_ns_at_edge", present ? a.gnss_ns_at_edge : -1);
+  out.add_u32("cps", present ? a.cps : 0U);
+}
+
 static void add_bridge_payload(Payload& p) {
   p.add("pvc_anchor_ring_count", g_pvc_anchor_count);
   p.add("pvc_anchor_ring_head", g_pvc_anchor_head);
   p.add("pvc_anchor_ring_seq", g_pvc_anchor_seq);
   p.add("pvc_anchor_reset_pending", g_pvc_anchor_reset_pending);
+
+  pvc_anchor_record_t anchors[PVC_ANCHOR_RING_SIZE];
+  uint32_t snapshot_count = 0;
+  const bool snapshot_ok = pvc_anchor_snapshot(anchors, snapshot_count);
+  uint32_t label_count = 0;
+  uint32_t cps_valid_count = 0;
+  uint32_t usable_count = 0;
+
+  if (snapshot_ok) {
+    for (uint32_t i = 0; i < snapshot_count; i++) {
+      const bool has_label = anchors[i].gnss_ns_at_edge >= 0;
+      const bool has_cps = anchors[i].cps_valid && anchors[i].cps != 0;
+      if (has_label) label_count++;
+      if (has_cps) cps_valid_count++;
+      if (has_label && has_cps) usable_count++;
+    }
+  }
+
+  p.add("pvc_anchor_snapshot_ok", snapshot_ok);
+  p.add("pvc_anchor_snapshot_count", snapshot_ok ? snapshot_count : 0U);
+  p.add("pvc_anchor_label_count", label_count);
+  p.add("pvc_anchor_cps_valid_count", cps_valid_count);
+  p.add("pvc_anchor_usable_count", usable_count);
+  p.add("pvc_anchor_label_update_count", g_pvc_anchor_label_update_count);
+  p.add("pvc_anchor_label_miss_count", g_pvc_anchor_label_miss_count);
+  p.add("pvc_anchor_label_invalid_count", g_pvc_anchor_label_invalid_count);
+  p.add("pvc_anchor_label_last_success", g_pvc_anchor_label_last_success);
+  p.add("pvc_anchor_label_last_sequence", g_pvc_anchor_label_last_sequence);
+  p.add("pvc_anchor_label_last_counter32", g_pvc_anchor_label_last_counter32);
+  p.add("pvc_anchor_label_last_gnss_ns", g_pvc_anchor_label_last_gnss_ns);
+  p.add("pvc_anchor_label_last_cps", g_pvc_anchor_label_last_cps);
+  p.add("pvc_anchor_label_last_match_age_slots",
+        g_pvc_anchor_label_last_match_age_slots);
+  p.add("pvc_anchor_label_last_match_index",
+        g_pvc_anchor_label_last_match_index);
+
+  add_pvc_anchor_entry_payload(p, "pvc_anchor_latest",
+                               snapshot_ok && snapshot_count > 0
+                                   ? anchors[0]
+                                   : pvc_anchor_record_t{},
+                               snapshot_ok && snapshot_count > 0);
+  add_pvc_anchor_entry_payload(p, "pvc_anchor_previous",
+                               snapshot_ok && snapshot_count > 1
+                                   ? anchors[1]
+                                   : pvc_anchor_record_t{},
+                               snapshot_ok && snapshot_count > 1);
+  add_pvc_anchor_entry_payload(p, "pvc_anchor_older2",
+                               snapshot_ok && snapshot_count > 2
+                                   ? anchors[2]
+                                   : pvc_anchor_record_t{},
+                               snapshot_ok && snapshot_count > 2);
+  add_pvc_anchor_entry_payload(p, "pvc_anchor_older3",
+                               snapshot_ok && snapshot_count > 3
+                                   ? anchors[3]
+                                   : pvc_anchor_record_t{},
+                               snapshot_ok && snapshot_count > 3);
+
   add_bridge_stats_payload(p, "timepop", g_bridge_stats_timepop);
   add_bridge_stats_payload(p, "ocxo1", g_bridge_stats_ocxo1);
   add_bridge_stats_payload(p, "ocxo2", g_bridge_stats_ocxo2);
