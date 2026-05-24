@@ -2250,6 +2250,15 @@ static void update_pps_vclock_bridge_anchor(const pps_edge_snapshot_t& snap) {
           ? (uint32_t)g_pps_dwt_cycles_between_edges
           : dwt_between_pps;
 
+  // Attach Alpha's campaign GNSS label and PPS/GPIO-derived static CPS to
+  // the already-authored process_interrupt PPS_VCLOCK anchor. This makes the
+  // interrupt bridge able to normalize later OCXO/TimePop event DWT facts
+  // without letting process_interrupt invent campaign GNSS labels locally.
+  interrupt_pps_vclock_label_anchor(snap.sequence,
+                                    snap.counter32_at_edge,
+                                    vclock_ns,
+                                    effective_dwt_cycles_per_second);
+
   g_dwt_cycles_between_pps_vclock = effective_dwt_cycles_per_second;
   g_dwt_cycle_count_total += (uint64_t)effective_dwt_cycles_per_second;
   // VCLOCK prediction is recorded from the VCLOCK event rail itself in
