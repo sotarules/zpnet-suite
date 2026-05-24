@@ -382,6 +382,91 @@ bool clocks_alpha_lane_forensics(time_clock_id_t clock,
                                  clocks_alpha_lane_forensics_t* out);
 
 // ============================================================================
+// Alpha event-flow forensic snapshots
+// ============================================================================
+//
+// Report-only control-flow counters for diagnosing the handoff from
+// process_interrupt subscriber events into Alpha's per-lane measurement and
+// forensics stores. These fields are intentionally not published in
+// TIMEBASE_FRAGMENT; Beta exposes them through CLOCKS.REPORT_ALPHA_FLOW.
+
+struct clocks_alpha_event_flow_snapshot_t {
+  uint32_t clock_id;
+
+  uint32_t forensics_reset_count;
+  uint32_t callback_entry_count;
+  uint32_t callback_diag_present_count;
+  uint32_t callback_diag_missing_count;
+  uint32_t callback_accepted_count;
+  uint32_t callback_rejected_epoch_not_ready_count;
+
+  uint32_t apply_entry_count;
+  uint32_t apply_phase_projected_count;
+  uint32_t apply_ticks64_success_count;
+  uint32_t apply_ticks64_failure_count;
+  uint32_t apply_measured_second_count;
+  uint32_t apply_measured_store_missing_count;
+  uint32_t apply_time_update_count;
+  uint32_t apply_static_prediction_count;
+  uint32_t apply_complete_count;
+
+  uint32_t forensics_publish_count;
+  uint32_t forensics_publish_missing_store_count;
+  uint32_t forensics_snapshot_request_count;
+  uint32_t forensics_snapshot_consistent_count;
+  uint32_t forensics_snapshot_valid_true_count;
+  uint32_t forensics_snapshot_valid_false_count;
+  uint32_t forensics_snapshot_retry_fail_count;
+  uint32_t forensics_snapshot_missing_store_count;
+
+  uint32_t last_stage;
+  uint32_t last_failure_stage;
+
+  uint32_t last_callback_dwt_at_event;
+  uint32_t last_callback_counter32_at_event;
+  uint64_t last_callback_gnss_ns_at_event;
+  bool     last_callback_gnss_ns_available;
+  bool     last_callback_diag_present;
+  uint32_t last_callback_diag_anchor_selection_kind;
+  uint32_t last_callback_diag_anchor_failure_mask;
+  uint32_t last_callback_diag_service_class;
+  int32_t  last_callback_diag_service_offset_ticks;
+  uint32_t last_callback_diag_perishable_fact_sequence;
+  bool     last_callback_sample_phase_valid;
+  uint32_t last_callback_sample_phase_ticks;
+
+  uint32_t last_rejected_dwt_at_event;
+  uint32_t last_rejected_counter32_at_event;
+  uint64_t last_rejected_gnss_ns_at_event;
+
+  uint32_t last_applied_dwt_at_event;
+  uint32_t last_applied_counter32_at_event;
+  uint32_t last_applied_phase_ticks;
+  uint32_t last_applied_phase_cycles;
+  uint32_t last_applied_dwt_cycles_between_edges;
+  uint64_t last_applied_gnss_ns_between_edges;
+  int64_t  last_applied_second_residual_ns;
+  uint64_t last_applied_ns_now;
+  uint32_t last_applied_counter32_delta_since_previous_event;
+
+  bool     last_forensics_store_valid;
+  uint32_t last_forensics_update_count;
+  uint32_t last_forensics_seq;
+  uint32_t last_forensics_last_event_dwt;
+  uint32_t last_forensics_last_event_counter32;
+  bool     last_forensics_sample_gnss_available;
+  uint64_t last_forensics_sample_gnss_ns_at_event;
+
+  bool     last_snapshot_return_value;
+  bool     last_snapshot_store_valid;
+  uint32_t last_snapshot_update_count;
+  uint32_t last_snapshot_seq;
+};
+
+bool clocks_alpha_event_flow_snapshot(time_clock_id_t clock,
+                                      clocks_alpha_event_flow_snapshot_t* out);
+
+// ============================================================================
 // Last-known interrupt diagnostics (alpha-owned, beta-readable)
 // ============================================================================
 

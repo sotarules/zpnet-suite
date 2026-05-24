@@ -1079,6 +1079,25 @@ static void payload_add_ocxo_fragment(Payload& p,
   lane.add("measured_gnss_ns", public_ns);
   lane.add("measured_gnss_ns_at_pps_vclock", public_ns);
   lane.add("ns_at_pps_vclock", public_ns);
+
+  // Direct interrupt-authored GNSS-at-edge witness. This is the normalized
+  // GNSS timestamp of the observed OCXO quiet-zone sample, not Alpha's
+  // measured ledger and not a boundary-normalized value. These fields are
+  // passive TIMEBASE witnesses only; no residual is computed here.
+  const bool sample_available =
+      forensics_valid && f.sample_gnss_ns_at_event_available;
+  const bool previous_sample_available =
+      forensics_valid && f.previous_sample_gnss_ns_at_event_available;
+  lane.add("sample_gnss_ns_at_event_available", sample_available);
+  lane.add("sample_gnss_ns_at_event",
+           sample_available ? f.sample_gnss_ns_at_event : 0ULL);
+  lane.add("previous_sample_gnss_ns_at_event_available",
+           previous_sample_available);
+  lane.add("previous_sample_gnss_ns_at_event",
+           previous_sample_available
+               ? f.previous_sample_gnss_ns_at_event
+               : 0ULL);
+
   payload_add_clock_measurement_object(lane, clock, meas);
   payload_add_ocxo_interval_object(lane, forensics_valid, f);
   payload_add_lane_forensics_object(lane, forensics_valid, f);
@@ -2499,10 +2518,160 @@ static void add_dac_payload(Payload& p) {
   p.add("schedule_failures", g_ocxo_dac_schedule_failures);
 }
 
+
+static const char* alpha_flow_stage_name_beta(uint32_t stage) {
+  switch (stage) {
+    case 1:  return "CALLBACK_ENTRY";
+    case 2:  return "REJECT_EPOCH";
+    case 3:  return "CALLBACK_ACCEPTED";
+    case 4:  return "APPLY_ENTRY";
+    case 5:  return "PHASE_PROJECTED";
+    case 6:  return "TICKS64_OK";
+    case 7:  return "TICKS64_FAIL";
+    case 8:  return "MEASURED_SECOND";
+    case 9:  return "TIME_UPDATE";
+    case 10: return "STATIC_PREDICTION";
+    case 11: return "FORENSICS_PUBLISH";
+    case 12: return "COMPLETE";
+    case 13: return "FORENSICS_RESET";
+    case 14: return "FORENSICS_SNAPSHOT";
+    case 15: return "MEASURED_STORE_FAIL";
+    default: return "NONE";
+  }
+}
+
+static void payload_add_alpha_flow_lane(Payload& parent,
+                                        const char* key,
+                                        time_clock_id_t clock,
+                                        bool detailed) {
+  clocks_alpha_event_flow_snapshot_t f{};
+  const bool ok = clocks_alpha_event_flow_snapshot(clock, &f);
+
+  clocks_alpha_lane_forensics_t lane{};
+  const bool lane_ok = clocks_alpha_lane_forensics(clock, &lane);
+
+  Payload p;
+  p.add("snapshot_ok", ok);
+  p.add("clock_id", ok ? f.clock_id : 0U);
+
+  p.add("forensics_reset_count", ok ? f.forensics_reset_count : 0U);
+  p.add("callback_entry_count", ok ? f.callback_entry_count : 0U);
+  p.add("callback_diag_present_count", ok ? f.callback_diag_present_count : 0U);
+  p.add("callback_diag_missing_count", ok ? f.callback_diag_missing_count : 0U);
+  p.add("callback_accepted_count", ok ? f.callback_accepted_count : 0U);
+  p.add("callback_rejected_epoch_not_ready_count",
+        ok ? f.callback_rejected_epoch_not_ready_count : 0U);
+
+  p.add("apply_entry_count", ok ? f.apply_entry_count : 0U);
+  p.add("apply_phase_projected_count", ok ? f.apply_phase_projected_count : 0U);
+  p.add("apply_ticks64_success_count", ok ? f.apply_ticks64_success_count : 0U);
+  p.add("apply_ticks64_failure_count", ok ? f.apply_ticks64_failure_count : 0U);
+  p.add("apply_measured_second_count", ok ? f.apply_measured_second_count : 0U);
+  p.add("apply_measured_store_missing_count",
+        ok ? f.apply_measured_store_missing_count : 0U);
+  p.add("apply_time_update_count", ok ? f.apply_time_update_count : 0U);
+  p.add("apply_static_prediction_count", ok ? f.apply_static_prediction_count : 0U);
+  p.add("apply_complete_count", ok ? f.apply_complete_count : 0U);
+
+  p.add("forensics_publish_count", ok ? f.forensics_publish_count : 0U);
+  p.add("forensics_publish_missing_store_count",
+        ok ? f.forensics_publish_missing_store_count : 0U);
+  p.add("forensics_snapshot_request_count",
+        ok ? f.forensics_snapshot_request_count : 0U);
+  p.add("forensics_snapshot_consistent_count",
+        ok ? f.forensics_snapshot_consistent_count : 0U);
+  p.add("forensics_snapshot_valid_true_count",
+        ok ? f.forensics_snapshot_valid_true_count : 0U);
+  p.add("forensics_snapshot_valid_false_count",
+        ok ? f.forensics_snapshot_valid_false_count : 0U);
+  p.add("forensics_snapshot_retry_fail_count",
+        ok ? f.forensics_snapshot_retry_fail_count : 0U);
+  p.add("forensics_snapshot_missing_store_count",
+        ok ? f.forensics_snapshot_missing_store_count : 0U);
+
+  p.add("last_stage", ok ? f.last_stage : 0U);
+  p.add("last_stage_name", ok ? alpha_flow_stage_name_beta(f.last_stage) : "NONE");
+  p.add("last_failure_stage", ok ? f.last_failure_stage : 0U);
+  p.add("last_failure_stage_name",
+        ok ? alpha_flow_stage_name_beta(f.last_failure_stage) : "NONE");
+
+  if (!detailed) {
+    parent.add_object(key, p);
+    return;
+  }
+
+  Payload callback;
+  callback.add("dwt_at_event", ok ? f.last_callback_dwt_at_event : 0U);
+  callback.add("counter32_at_event", ok ? f.last_callback_counter32_at_event : 0U);
+  callback.add("gnss_ns_at_event", ok ? f.last_callback_gnss_ns_at_event : 0ULL);
+  callback.add("gnss_ns_available", ok && f.last_callback_gnss_ns_available);
+  callback.add("diag_present", ok && f.last_callback_diag_present);
+  callback.add("diag_anchor_selection_kind",
+               ok ? f.last_callback_diag_anchor_selection_kind : 0U);
+  callback.add("diag_anchor_failure_mask",
+               ok ? f.last_callback_diag_anchor_failure_mask : 0U);
+  callback.add("diag_service_class", ok ? f.last_callback_diag_service_class : 0U);
+  callback.add("diag_service_offset_ticks",
+               ok ? f.last_callback_diag_service_offset_ticks : 0);
+  callback.add("diag_perishable_fact_sequence",
+               ok ? f.last_callback_diag_perishable_fact_sequence : 0U);
+  callback.add("sample_phase_valid", ok && f.last_callback_sample_phase_valid);
+  callback.add("sample_phase_ticks", ok ? f.last_callback_sample_phase_ticks : 0U);
+  p.add_object("last_callback", callback);
+
+  Payload rejected;
+  rejected.add("dwt_at_event", ok ? f.last_rejected_dwt_at_event : 0U);
+  rejected.add("counter32_at_event", ok ? f.last_rejected_counter32_at_event : 0U);
+  rejected.add("gnss_ns_at_event", ok ? f.last_rejected_gnss_ns_at_event : 0ULL);
+  p.add_object("last_rejected", rejected);
+
+  Payload applied;
+  applied.add("dwt_at_event", ok ? f.last_applied_dwt_at_event : 0U);
+  applied.add("counter32_at_event", ok ? f.last_applied_counter32_at_event : 0U);
+  applied.add("phase_ticks", ok ? f.last_applied_phase_ticks : 0U);
+  applied.add("phase_cycles", ok ? f.last_applied_phase_cycles : 0U);
+  applied.add("dwt_cycles_between_edges",
+              ok ? f.last_applied_dwt_cycles_between_edges : 0U);
+  applied.add("gnss_ns_between_edges",
+              ok ? f.last_applied_gnss_ns_between_edges : 0ULL);
+  applied.add("second_residual_ns", ok ? f.last_applied_second_residual_ns : 0LL);
+  applied.add("ns_now", ok ? f.last_applied_ns_now : 0ULL);
+  applied.add("counter32_delta_since_previous_event",
+              ok ? f.last_applied_counter32_delta_since_previous_event : 0U);
+  p.add_object("last_applied", applied);
+
+  Payload published;
+  published.add("store_valid", ok && f.last_forensics_store_valid);
+  published.add("update_count", ok ? f.last_forensics_update_count : 0U);
+  published.add("seq", ok ? f.last_forensics_seq : 0U);
+  published.add("last_event_dwt", ok ? f.last_forensics_last_event_dwt : 0U);
+  published.add("last_event_counter32", ok ? f.last_forensics_last_event_counter32 : 0U);
+  published.add("sample_gnss_available", ok && f.last_forensics_sample_gnss_available);
+  published.add("sample_gnss_ns_at_event",
+                ok ? f.last_forensics_sample_gnss_ns_at_event : 0ULL);
+  p.add_object("last_forensics_publish", published);
+
+  Payload snapshot;
+  snapshot.add("lane_forensics_return", lane_ok);
+  snapshot.add("lane_forensics_valid", lane.valid);
+  snapshot.add("lane_forensics_update_count", lane_ok ? lane.update_count : 0U);
+  snapshot.add("lane_forensics_sample_available",
+               lane_ok && lane.sample_gnss_ns_at_event_available);
+  snapshot.add("lane_forensics_sample_gnss_ns_at_event",
+               lane_ok ? lane.sample_gnss_ns_at_event : 0ULL);
+  snapshot.add("last_return_value", ok && f.last_snapshot_return_value);
+  snapshot.add("last_store_valid", ok && f.last_snapshot_store_valid);
+  snapshot.add("last_update_count", ok ? f.last_snapshot_update_count : 0U);
+  snapshot.add("last_seq", ok ? f.last_snapshot_seq : 0U);
+  p.add_object("current_beta_probe", snapshot);
+
+  parent.add_object(key, p);
+}
+
 static Payload cmd_report(const Payload&) {
   Payload p;
   p.add("report", "CLOCKS_COMPACT");
-  p.add("subreports", "REPORT_STATUS REPORT_SUMMARY REPORT_EPOCH REPORT_SMARTZERO REPORT_INSTALLED_SMARTZERO REPORT_LIVE_SMARTZERO REPORT_FORENSICS REPORT_FORENSICS_VCLOCK REPORT_FORENSICS_OCXO1 REPORT_FORENSICS_OCXO2 REPORT_PREDICTION REPORT_STATS REPORT_DAC");
+  p.add("subreports", "REPORT_STATUS REPORT_SUMMARY REPORT_EPOCH REPORT_SMARTZERO REPORT_INSTALLED_SMARTZERO REPORT_LIVE_SMARTZERO REPORT_FORENSICS REPORT_FORENSICS_VCLOCK REPORT_FORENSICS_OCXO1 REPORT_FORENSICS_OCXO2 REPORT_ALPHA_FLOW REPORT_ALPHA_FLOW_VCLOCK REPORT_ALPHA_FLOW_OCXO1 REPORT_ALPHA_FLOW_OCXO2 REPORT_PREDICTION REPORT_STATS REPORT_DAC");
   add_summary_payload(p);
   add_campaign_payload(p);
 
@@ -2634,6 +2803,40 @@ static Payload cmd_report_forensics_ocxo2(const Payload&) {
   return p;
 }
 
+
+static Payload cmd_report_alpha_flow(const Payload&) {
+  Payload p;
+  p.add("report", "CLOCKS_ALPHA_FLOW");
+  p.add("description", "Alpha subscriber-event flow counters; report-only, not TIMEBASE");
+  p.add("detail", "compact");
+  p.add("detail_commands", "REPORT_ALPHA_FLOW_VCLOCK REPORT_ALPHA_FLOW_OCXO1 REPORT_ALPHA_FLOW_OCXO2");
+  payload_add_alpha_flow_lane(p, "vclock", time_clock_id_t::VCLOCK, false);
+  payload_add_alpha_flow_lane(p, "ocxo1", time_clock_id_t::OCXO1, false);
+  payload_add_alpha_flow_lane(p, "ocxo2", time_clock_id_t::OCXO2, false);
+  return p;
+}
+
+static Payload cmd_report_alpha_flow_vclock(const Payload&) {
+  Payload p;
+  p.add("report", "CLOCKS_ALPHA_FLOW_VCLOCK");
+  payload_add_alpha_flow_lane(p, "vclock", time_clock_id_t::VCLOCK, true);
+  return p;
+}
+
+static Payload cmd_report_alpha_flow_ocxo1(const Payload&) {
+  Payload p;
+  p.add("report", "CLOCKS_ALPHA_FLOW_OCXO1");
+  payload_add_alpha_flow_lane(p, "ocxo1", time_clock_id_t::OCXO1, true);
+  return p;
+}
+
+static Payload cmd_report_alpha_flow_ocxo2(const Payload&) {
+  Payload p;
+  p.add("report", "CLOCKS_ALPHA_FLOW_OCXO2");
+  payload_add_alpha_flow_lane(p, "ocxo2", time_clock_id_t::OCXO2, true);
+  return p;
+}
+
 static Payload cmd_report_prediction(const Payload&) {
   Payload p;
   p.add("report", "CLOCKS_PREDICTION");
@@ -2709,6 +2912,10 @@ static const process_command_entry_t CLOCKS_COMMANDS[] = {
   { "REPORT_FORENSICS_VCLOCK", cmd_report_forensics_vclock },
   { "REPORT_FORENSICS_OCXO1",  cmd_report_forensics_ocxo1  },
   { "REPORT_FORENSICS_OCXO2",  cmd_report_forensics_ocxo2  },
+  { "REPORT_ALPHA_FLOW",       cmd_report_alpha_flow       },
+  { "REPORT_ALPHA_FLOW_VCLOCK", cmd_report_alpha_flow_vclock },
+  { "REPORT_ALPHA_FLOW_OCXO1",  cmd_report_alpha_flow_ocxo1  },
+  { "REPORT_ALPHA_FLOW_OCXO2",  cmd_report_alpha_flow_ocxo2  },
   { "REPORT_PREDICTION",       cmd_report_prediction       },
   { "REPORT_STATS",      cmd_report_stats      },
   { "REPORT_DAC",        cmd_report_dac        },

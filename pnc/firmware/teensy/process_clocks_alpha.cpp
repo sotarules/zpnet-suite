@@ -562,6 +562,393 @@ static alpha_lane_forensics_store_t g_vclock_forensics = {};
 static alpha_lane_forensics_store_t g_ocxo1_forensics = {};
 static alpha_lane_forensics_store_t g_ocxo2_forensics = {};
 
+
+// Report-only event-flow forensics.  These counters answer one narrow question:
+// did an interrupt-authored subscriber event reach Alpha, survive Alpha's gates,
+// update the lane measurement stores, publish Alpha forensics, and later get
+// snapshotted by Beta?  This surface deliberately stays out of TIMEBASE.
+static constexpr uint32_t ALPHA_FLOW_STAGE_NONE                 = 0;
+static constexpr uint32_t ALPHA_FLOW_STAGE_CALLBACK_ENTRY       = 1;
+static constexpr uint32_t ALPHA_FLOW_STAGE_REJECT_EPOCH         = 2;
+static constexpr uint32_t ALPHA_FLOW_STAGE_CALLBACK_ACCEPTED    = 3;
+static constexpr uint32_t ALPHA_FLOW_STAGE_APPLY_ENTRY          = 4;
+static constexpr uint32_t ALPHA_FLOW_STAGE_PHASE_PROJECTED      = 5;
+static constexpr uint32_t ALPHA_FLOW_STAGE_TICKS64_OK           = 6;
+static constexpr uint32_t ALPHA_FLOW_STAGE_TICKS64_FAIL         = 7;
+static constexpr uint32_t ALPHA_FLOW_STAGE_MEASURED_SECOND      = 8;
+static constexpr uint32_t ALPHA_FLOW_STAGE_TIME_UPDATE          = 9;
+static constexpr uint32_t ALPHA_FLOW_STAGE_STATIC_PREDICTION    = 10;
+static constexpr uint32_t ALPHA_FLOW_STAGE_FORENSICS_PUBLISH    = 11;
+static constexpr uint32_t ALPHA_FLOW_STAGE_COMPLETE             = 12;
+static constexpr uint32_t ALPHA_FLOW_STAGE_FORENSICS_RESET      = 13;
+static constexpr uint32_t ALPHA_FLOW_STAGE_FORENSICS_SNAPSHOT   = 14;
+static constexpr uint32_t ALPHA_FLOW_STAGE_MEASURED_STORE_FAIL  = 15;
+
+struct alpha_event_flow_store_t {
+  uint32_t clock_id = 0;
+
+  uint32_t forensics_reset_count = 0;
+  uint32_t callback_entry_count = 0;
+  uint32_t callback_diag_present_count = 0;
+  uint32_t callback_diag_missing_count = 0;
+  uint32_t callback_accepted_count = 0;
+  uint32_t callback_rejected_epoch_not_ready_count = 0;
+
+  uint32_t apply_entry_count = 0;
+  uint32_t apply_phase_projected_count = 0;
+  uint32_t apply_ticks64_success_count = 0;
+  uint32_t apply_ticks64_failure_count = 0;
+  uint32_t apply_measured_second_count = 0;
+  uint32_t apply_measured_store_missing_count = 0;
+  uint32_t apply_time_update_count = 0;
+  uint32_t apply_static_prediction_count = 0;
+  uint32_t apply_complete_count = 0;
+
+  uint32_t forensics_publish_count = 0;
+  uint32_t forensics_publish_missing_store_count = 0;
+  uint32_t forensics_snapshot_request_count = 0;
+  uint32_t forensics_snapshot_consistent_count = 0;
+  uint32_t forensics_snapshot_valid_true_count = 0;
+  uint32_t forensics_snapshot_valid_false_count = 0;
+  uint32_t forensics_snapshot_retry_fail_count = 0;
+  uint32_t forensics_snapshot_missing_store_count = 0;
+
+  uint32_t last_stage = ALPHA_FLOW_STAGE_NONE;
+  uint32_t last_failure_stage = ALPHA_FLOW_STAGE_NONE;
+
+  uint32_t last_callback_dwt_at_event = 0;
+  uint32_t last_callback_counter32_at_event = 0;
+  uint64_t last_callback_gnss_ns_at_event = 0;
+  bool     last_callback_gnss_ns_available = false;
+  bool     last_callback_diag_present = false;
+  uint32_t last_callback_diag_anchor_selection_kind = 0;
+  uint32_t last_callback_diag_anchor_failure_mask = 0;
+  uint32_t last_callback_diag_service_class = 0;
+  int32_t  last_callback_diag_service_offset_ticks = 0;
+  uint32_t last_callback_diag_perishable_fact_sequence = 0;
+  bool     last_callback_sample_phase_valid = false;
+  uint32_t last_callback_sample_phase_ticks = 0;
+
+  uint32_t last_rejected_dwt_at_event = 0;
+  uint32_t last_rejected_counter32_at_event = 0;
+  uint64_t last_rejected_gnss_ns_at_event = 0;
+
+  uint32_t last_applied_dwt_at_event = 0;
+  uint32_t last_applied_counter32_at_event = 0;
+  uint32_t last_applied_phase_ticks = 0;
+  uint32_t last_applied_phase_cycles = 0;
+  uint32_t last_applied_dwt_cycles_between_edges = 0;
+  uint64_t last_applied_gnss_ns_between_edges = 0;
+  int64_t  last_applied_second_residual_ns = 0;
+  uint64_t last_applied_ns_now = 0;
+  uint32_t last_applied_counter32_delta_since_previous_event = 0;
+
+  bool     last_forensics_store_valid = false;
+  uint32_t last_forensics_update_count = 0;
+  uint32_t last_forensics_seq = 0;
+  uint32_t last_forensics_last_event_dwt = 0;
+  uint32_t last_forensics_last_event_counter32 = 0;
+  bool     last_forensics_sample_gnss_available = false;
+  uint64_t last_forensics_sample_gnss_ns_at_event = 0;
+
+  bool     last_snapshot_return_value = false;
+  bool     last_snapshot_store_valid = false;
+  uint32_t last_snapshot_update_count = 0;
+  uint32_t last_snapshot_seq = 0;
+};
+
+static alpha_event_flow_store_t g_vclock_event_flow = {};
+static alpha_event_flow_store_t g_ocxo1_event_flow  = {};
+static alpha_event_flow_store_t g_ocxo2_event_flow  = {};
+
+static alpha_event_flow_store_t* alpha_event_flow_store(time_clock_id_t clock) {
+  switch (clock) {
+    case time_clock_id_t::VCLOCK: return &g_vclock_event_flow;
+    case time_clock_id_t::OCXO1:  return &g_ocxo1_event_flow;
+    case time_clock_id_t::OCXO2:  return &g_ocxo2_event_flow;
+    default:                     return nullptr;
+  }
+}
+
+static void alpha_event_flow_note_callback(time_clock_id_t clock,
+                                           const interrupt_event_t& event,
+                                           const interrupt_capture_diag_t* diag) {
+  alpha_event_flow_store_t* f = alpha_event_flow_store(clock);
+  if (!f) return;
+  f->callback_entry_count++;
+  f->last_stage = ALPHA_FLOW_STAGE_CALLBACK_ENTRY;
+  f->last_callback_dwt_at_event = event.dwt_at_event;
+  f->last_callback_counter32_at_event = event.counter32_at_event;
+  f->last_callback_gnss_ns_at_event = event.gnss_ns_at_event;
+  f->last_callback_gnss_ns_available = (event.gnss_ns_at_event != 0);
+  f->last_callback_diag_present = (diag != nullptr);
+  if (diag) {
+    f->callback_diag_present_count++;
+    f->last_callback_diag_anchor_selection_kind = diag->anchor_selection_kind;
+    f->last_callback_diag_anchor_failure_mask = diag->anchor_failure_mask;
+    f->last_callback_diag_service_class = diag->ocxo_service_class;
+    f->last_callback_diag_service_offset_ticks = diag->ocxo_service_offset_signed_ticks;
+    f->last_callback_diag_perishable_fact_sequence = diag->ocxo_perishable_fact_sequence;
+    f->last_callback_sample_phase_valid = diag->ocxo_sample_phase_valid;
+    f->last_callback_sample_phase_ticks = diag->ocxo_sample_phase_ticks;
+  } else {
+    f->callback_diag_missing_count++;
+    f->last_callback_diag_anchor_selection_kind = 0;
+    f->last_callback_diag_anchor_failure_mask = 0;
+    f->last_callback_diag_service_class = 0;
+    f->last_callback_diag_service_offset_ticks = 0;
+    f->last_callback_diag_perishable_fact_sequence = 0;
+    f->last_callback_sample_phase_valid = false;
+    f->last_callback_sample_phase_ticks = 0;
+  }
+}
+
+static void alpha_event_flow_note_reject_epoch(time_clock_id_t clock,
+                                               const interrupt_event_t& event) {
+  alpha_event_flow_store_t* f = alpha_event_flow_store(clock);
+  if (!f) return;
+  f->callback_rejected_epoch_not_ready_count++;
+  f->last_stage = ALPHA_FLOW_STAGE_REJECT_EPOCH;
+  f->last_failure_stage = ALPHA_FLOW_STAGE_REJECT_EPOCH;
+  f->last_rejected_dwt_at_event = event.dwt_at_event;
+  f->last_rejected_counter32_at_event = event.counter32_at_event;
+  f->last_rejected_gnss_ns_at_event = event.gnss_ns_at_event;
+}
+
+static void alpha_event_flow_note_callback_accepted(time_clock_id_t clock) {
+  alpha_event_flow_store_t* f = alpha_event_flow_store(clock);
+  if (!f) return;
+  f->callback_accepted_count++;
+  f->last_stage = ALPHA_FLOW_STAGE_CALLBACK_ACCEPTED;
+}
+
+static void alpha_event_flow_note_apply_entry(time_clock_id_t clock) {
+  alpha_event_flow_store_t* f = alpha_event_flow_store(clock);
+  if (!f) return;
+  f->apply_entry_count++;
+  f->last_stage = ALPHA_FLOW_STAGE_APPLY_ENTRY;
+}
+
+static void alpha_event_flow_note_phase(time_clock_id_t clock,
+                                        uint32_t phase_ticks,
+                                        uint32_t phase_cycles,
+                                        const interrupt_event_t& applied_event) {
+  alpha_event_flow_store_t* f = alpha_event_flow_store(clock);
+  if (!f) return;
+  f->apply_phase_projected_count++;
+  f->last_stage = ALPHA_FLOW_STAGE_PHASE_PROJECTED;
+  f->last_applied_phase_ticks = phase_ticks;
+  f->last_applied_phase_cycles = phase_cycles;
+  f->last_applied_dwt_at_event = applied_event.dwt_at_event;
+  f->last_applied_counter32_at_event = applied_event.counter32_at_event;
+}
+
+static void alpha_event_flow_note_ticks64(time_clock_id_t clock,
+                                          bool ok,
+                                          const interrupt_event_t& applied_event,
+                                          uint32_t delta_since_previous_event) {
+  alpha_event_flow_store_t* f = alpha_event_flow_store(clock);
+  if (!f) return;
+  if (ok) {
+    f->apply_ticks64_success_count++;
+    f->last_stage = ALPHA_FLOW_STAGE_TICKS64_OK;
+  } else {
+    f->apply_ticks64_failure_count++;
+    f->last_stage = ALPHA_FLOW_STAGE_TICKS64_FAIL;
+    f->last_failure_stage = ALPHA_FLOW_STAGE_TICKS64_FAIL;
+  }
+  f->last_applied_dwt_at_event = applied_event.dwt_at_event;
+  f->last_applied_counter32_at_event = applied_event.counter32_at_event;
+  f->last_applied_counter32_delta_since_previous_event = delta_since_previous_event;
+}
+
+static void alpha_event_flow_note_measured_store_missing(time_clock_id_t clock) {
+  alpha_event_flow_store_t* f = alpha_event_flow_store(clock);
+  if (!f) return;
+  f->apply_measured_store_missing_count++;
+  f->last_stage = ALPHA_FLOW_STAGE_MEASURED_STORE_FAIL;
+  f->last_failure_stage = ALPHA_FLOW_STAGE_MEASURED_STORE_FAIL;
+}
+
+static void alpha_event_flow_note_measured(time_clock_id_t clock,
+                                           uint32_t dwt_cycles,
+                                           uint64_t interval_ns,
+                                           int64_t residual_ns,
+                                           uint64_t ns_now) {
+  alpha_event_flow_store_t* f = alpha_event_flow_store(clock);
+  if (!f) return;
+  f->apply_measured_second_count++;
+  f->last_stage = ALPHA_FLOW_STAGE_MEASURED_SECOND;
+  f->last_applied_dwt_cycles_between_edges = dwt_cycles;
+  f->last_applied_gnss_ns_between_edges = interval_ns;
+  f->last_applied_second_residual_ns = residual_ns;
+  f->last_applied_ns_now = ns_now;
+}
+
+static void alpha_event_flow_note_time_update(time_clock_id_t clock, uint64_t ns_now) {
+  alpha_event_flow_store_t* f = alpha_event_flow_store(clock);
+  if (!f) return;
+  f->apply_time_update_count++;
+  f->last_stage = ALPHA_FLOW_STAGE_TIME_UPDATE;
+  f->last_applied_ns_now = ns_now;
+}
+
+static void alpha_event_flow_note_static_prediction(time_clock_id_t clock,
+                                                    uint32_t dwt_cycles) {
+  alpha_event_flow_store_t* f = alpha_event_flow_store(clock);
+  if (!f) return;
+  f->apply_static_prediction_count++;
+  f->last_stage = ALPHA_FLOW_STAGE_STATIC_PREDICTION;
+  f->last_applied_dwt_cycles_between_edges = dwt_cycles;
+}
+
+static void alpha_event_flow_note_forensics_reset(time_clock_id_t clock) {
+  alpha_event_flow_store_t* f = alpha_event_flow_store(clock);
+  if (!f) return;
+  f->forensics_reset_count++;
+  f->last_stage = ALPHA_FLOW_STAGE_FORENSICS_RESET;
+  f->last_forensics_store_valid = false;
+  f->last_forensics_update_count = 0;
+  f->last_forensics_seq = 0;
+}
+
+static void alpha_event_flow_note_forensics_publish(time_clock_id_t clock,
+                                                    const alpha_lane_forensics_store_t& s) {
+  alpha_event_flow_store_t* f = alpha_event_flow_store(clock);
+  if (!f) return;
+  f->forensics_publish_count++;
+  f->last_stage = ALPHA_FLOW_STAGE_FORENSICS_PUBLISH;
+  f->last_forensics_store_valid = s.valid;
+  f->last_forensics_update_count = s.update_count;
+  f->last_forensics_seq = s.seq;
+  f->last_forensics_last_event_dwt = s.last_event_dwt;
+  f->last_forensics_last_event_counter32 = s.last_event_counter32;
+  f->last_forensics_sample_gnss_available = s.sample_gnss_ns_at_event_available;
+  f->last_forensics_sample_gnss_ns_at_event = s.sample_gnss_ns_at_event;
+}
+
+static void alpha_event_flow_note_forensics_missing_store(time_clock_id_t clock) {
+  alpha_event_flow_store_t* f = alpha_event_flow_store(clock);
+  if (!f) return;
+  f->forensics_publish_missing_store_count++;
+  f->last_failure_stage = ALPHA_FLOW_STAGE_FORENSICS_PUBLISH;
+}
+
+static void alpha_event_flow_note_complete(time_clock_id_t clock) {
+  alpha_event_flow_store_t* f = alpha_event_flow_store(clock);
+  if (!f) return;
+  f->apply_complete_count++;
+  f->last_stage = ALPHA_FLOW_STAGE_COMPLETE;
+}
+
+static void alpha_event_flow_note_snapshot_request(time_clock_id_t clock) {
+  alpha_event_flow_store_t* f = alpha_event_flow_store(clock);
+  if (!f) return;
+  f->forensics_snapshot_request_count++;
+}
+
+static void alpha_event_flow_note_snapshot(time_clock_id_t clock,
+                                           bool consistent,
+                                           bool return_value,
+                                           bool store_valid,
+                                           uint32_t update_count,
+                                           uint32_t seq) {
+  alpha_event_flow_store_t* f = alpha_event_flow_store(clock);
+  if (!f) return;
+  if (consistent) {
+    f->forensics_snapshot_consistent_count++;
+    if (store_valid) f->forensics_snapshot_valid_true_count++;
+    else f->forensics_snapshot_valid_false_count++;
+    f->last_stage = ALPHA_FLOW_STAGE_FORENSICS_SNAPSHOT;
+  } else {
+    f->forensics_snapshot_retry_fail_count++;
+    f->last_failure_stage = ALPHA_FLOW_STAGE_FORENSICS_SNAPSHOT;
+  }
+  f->last_snapshot_return_value = return_value;
+  f->last_snapshot_store_valid = store_valid;
+  f->last_snapshot_update_count = update_count;
+  f->last_snapshot_seq = seq;
+}
+
+static void alpha_event_flow_note_snapshot_missing_store(time_clock_id_t clock) {
+  alpha_event_flow_store_t* f = alpha_event_flow_store(clock);
+  if (!f) return;
+  f->forensics_snapshot_missing_store_count++;
+  f->last_failure_stage = ALPHA_FLOW_STAGE_FORENSICS_SNAPSHOT;
+}
+
+bool clocks_alpha_event_flow_snapshot(time_clock_id_t clock,
+                                      clocks_alpha_event_flow_snapshot_t* out) {
+  if (!out) return false;
+  alpha_event_flow_store_t* f = alpha_event_flow_store(clock);
+  if (!f) return false;
+
+  clocks_alpha_event_flow_snapshot_t local{};
+  local.clock_id = (uint32_t)((uint8_t)clock);
+  local.forensics_reset_count = f->forensics_reset_count;
+  local.callback_entry_count = f->callback_entry_count;
+  local.callback_diag_present_count = f->callback_diag_present_count;
+  local.callback_diag_missing_count = f->callback_diag_missing_count;
+  local.callback_accepted_count = f->callback_accepted_count;
+  local.callback_rejected_epoch_not_ready_count = f->callback_rejected_epoch_not_ready_count;
+  local.apply_entry_count = f->apply_entry_count;
+  local.apply_phase_projected_count = f->apply_phase_projected_count;
+  local.apply_ticks64_success_count = f->apply_ticks64_success_count;
+  local.apply_ticks64_failure_count = f->apply_ticks64_failure_count;
+  local.apply_measured_second_count = f->apply_measured_second_count;
+  local.apply_measured_store_missing_count = f->apply_measured_store_missing_count;
+  local.apply_time_update_count = f->apply_time_update_count;
+  local.apply_static_prediction_count = f->apply_static_prediction_count;
+  local.apply_complete_count = f->apply_complete_count;
+  local.forensics_publish_count = f->forensics_publish_count;
+  local.forensics_publish_missing_store_count = f->forensics_publish_missing_store_count;
+  local.forensics_snapshot_request_count = f->forensics_snapshot_request_count;
+  local.forensics_snapshot_consistent_count = f->forensics_snapshot_consistent_count;
+  local.forensics_snapshot_valid_true_count = f->forensics_snapshot_valid_true_count;
+  local.forensics_snapshot_valid_false_count = f->forensics_snapshot_valid_false_count;
+  local.forensics_snapshot_retry_fail_count = f->forensics_snapshot_retry_fail_count;
+  local.forensics_snapshot_missing_store_count = f->forensics_snapshot_missing_store_count;
+  local.last_stage = f->last_stage;
+  local.last_failure_stage = f->last_failure_stage;
+  local.last_callback_dwt_at_event = f->last_callback_dwt_at_event;
+  local.last_callback_counter32_at_event = f->last_callback_counter32_at_event;
+  local.last_callback_gnss_ns_at_event = f->last_callback_gnss_ns_at_event;
+  local.last_callback_gnss_ns_available = f->last_callback_gnss_ns_available;
+  local.last_callback_diag_present = f->last_callback_diag_present;
+  local.last_callback_diag_anchor_selection_kind = f->last_callback_diag_anchor_selection_kind;
+  local.last_callback_diag_anchor_failure_mask = f->last_callback_diag_anchor_failure_mask;
+  local.last_callback_diag_service_class = f->last_callback_diag_service_class;
+  local.last_callback_diag_service_offset_ticks = f->last_callback_diag_service_offset_ticks;
+  local.last_callback_diag_perishable_fact_sequence = f->last_callback_diag_perishable_fact_sequence;
+  local.last_callback_sample_phase_valid = f->last_callback_sample_phase_valid;
+  local.last_callback_sample_phase_ticks = f->last_callback_sample_phase_ticks;
+  local.last_rejected_dwt_at_event = f->last_rejected_dwt_at_event;
+  local.last_rejected_counter32_at_event = f->last_rejected_counter32_at_event;
+  local.last_rejected_gnss_ns_at_event = f->last_rejected_gnss_ns_at_event;
+  local.last_applied_dwt_at_event = f->last_applied_dwt_at_event;
+  local.last_applied_counter32_at_event = f->last_applied_counter32_at_event;
+  local.last_applied_phase_ticks = f->last_applied_phase_ticks;
+  local.last_applied_phase_cycles = f->last_applied_phase_cycles;
+  local.last_applied_dwt_cycles_between_edges = f->last_applied_dwt_cycles_between_edges;
+  local.last_applied_gnss_ns_between_edges = f->last_applied_gnss_ns_between_edges;
+  local.last_applied_second_residual_ns = f->last_applied_second_residual_ns;
+  local.last_applied_ns_now = f->last_applied_ns_now;
+  local.last_applied_counter32_delta_since_previous_event = f->last_applied_counter32_delta_since_previous_event;
+  local.last_forensics_store_valid = f->last_forensics_store_valid;
+  local.last_forensics_update_count = f->last_forensics_update_count;
+  local.last_forensics_seq = f->last_forensics_seq;
+  local.last_forensics_last_event_dwt = f->last_forensics_last_event_dwt;
+  local.last_forensics_last_event_counter32 = f->last_forensics_last_event_counter32;
+  local.last_forensics_sample_gnss_available = f->last_forensics_sample_gnss_available;
+  local.last_forensics_sample_gnss_ns_at_event = f->last_forensics_sample_gnss_ns_at_event;
+  local.last_snapshot_return_value = f->last_snapshot_return_value;
+  local.last_snapshot_store_valid = f->last_snapshot_store_valid;
+  local.last_snapshot_update_count = f->last_snapshot_update_count;
+  local.last_snapshot_seq = f->last_snapshot_seq;
+  *out = local;
+  return true;
+}
+
 // Alpha owns the long logical tick ledgers for the three 10 MHz lanes.
 // process_interrupt emits compact synthetic counter32 event identities; alpha
 // subtracts the per-lane zero-offset counter32 once, then extends subsequent
@@ -889,6 +1276,7 @@ static uint64_t alpha_ocxo_apply_measured_second(time_clock_id_t clock,
                                                  int64_t* out_residual_fast_ns) {
   alpha_measured_ns_clock_t* m = alpha_measured_ns_store(clock);
   if (!m) {
+    alpha_event_flow_note_measured_store_missing(clock);
     clocks_watchdog_anomaly("alpha_ocxo_measured_store_missing",
                             (uint32_t)((uint8_t)clock), raw_edge_dwt, 0, 0);
     return 0;
@@ -1027,8 +1415,11 @@ static void alpha_forensics_reset_store(alpha_lane_forensics_store_t& s) {
 
 static void alpha_forensics_reset_all(void) {
   alpha_forensics_reset_store(g_vclock_forensics);
+  alpha_event_flow_note_forensics_reset(time_clock_id_t::VCLOCK);
   alpha_forensics_reset_store(g_ocxo1_forensics);
+  alpha_event_flow_note_forensics_reset(time_clock_id_t::OCXO1);
   alpha_forensics_reset_store(g_ocxo2_forensics);
+  alpha_event_flow_note_forensics_reset(time_clock_id_t::OCXO2);
 }
 
 static void alpha_forensics_publish(time_clock_id_t clock_id,
@@ -1044,7 +1435,10 @@ static void alpha_forensics_publish(time_clock_id_t clock_id,
                                     uint64_t counter_ns_now,
                                     uint64_t ns_now) {
   alpha_lane_forensics_store_t* s = alpha_forensics_store(clock_id);
-  if (!s) return;
+  if (!s) {
+    alpha_event_flow_note_forensics_missing_store(clock_id);
+    return;
+  }
 
   const bool had_prior_counter_event = s->valid;
   const uint64_t previous_counter_ns = s->nominal_ns_from_counter32_epoch;
@@ -1249,13 +1643,18 @@ static void alpha_forensics_publish(time_clock_id_t clock_id,
 
   clocks_alpha_dmb();
   s->seq++;
+  alpha_event_flow_note_forensics_publish(clock_id, *s);
 }
 
 bool clocks_alpha_lane_forensics(time_clock_id_t clock,
                                  clocks_alpha_lane_forensics_t* out) {
   if (!out) return false;
+  alpha_event_flow_note_snapshot_request(clock);
   alpha_lane_forensics_store_t* s = alpha_forensics_store(clock);
-  if (!s) return false;
+  if (!s) {
+    alpha_event_flow_note_snapshot_missing_store(clock);
+    return false;
+  }
 
   for (int attempt = 0; attempt < 4; attempt++) {
     const uint32_t seq1 = s->seq;
@@ -1368,9 +1767,14 @@ bool clocks_alpha_lane_forensics(time_clock_id_t clock,
 
     clocks_alpha_dmb();
     const uint32_t seq2 = s->seq;
-    if (seq1 == seq2 && (seq1 & 1u) == 0u) return out->valid;
+    if (seq1 == seq2 && (seq1 & 1u) == 0u) {
+      alpha_event_flow_note_snapshot(clock, true, out->valid, out->valid,
+                                     out->update_count, seq2);
+      return out->valid;
+    }
   }
 
+  alpha_event_flow_note_snapshot(clock, false, false, false, 0, 0);
   return false;
 }
 
@@ -1967,6 +2371,7 @@ static void clocks_apply_epoch_counter_edge(clock_state_t& clock,
                                             const interrupt_capture_diag_t* diag,
                                             uint32_t zero_offset_counter32,
                                             time_clock_id_t time_clock) {
+  alpha_event_flow_note_apply_entry(time_clock);
   const bool is_ocxo = alpha_clock_is_ocxo(time_clock);
   const bool had_previous = (meas.prev_dwt_at_edge != 0);
 
@@ -1982,6 +2387,7 @@ static void clocks_apply_epoch_counter_edge(clock_state_t& clock,
         phase_ticks, alpha_phase_backprojection_cps(meas));
     applied_event.dwt_at_event = sample_physics_dwt - phase_cycles;
     applied_event.counter32_at_event = event.counter32_at_event - phase_ticks;
+    alpha_event_flow_note_phase(time_clock, phase_ticks, phase_cycles, applied_event);
   } else {
     applied_event.dwt_at_event = sample_physics_dwt;
   }
@@ -2009,13 +2415,16 @@ static void clocks_apply_epoch_counter_edge(clock_state_t& clock,
   uint32_t counter32_delta_since_zero_offset = 0;
   uint32_t counter32_delta_since_previous_event = 0;
 
-  if (!alpha_ticks64_apply_event(time_clock,
+  const bool ticks64_ok = alpha_ticks64_apply_event(time_clock,
                                  applied_event.counter32_at_event,
                                  zero_offset_counter32,
                                  &logical_ticks64,
                                  &counter_ns_now,
                                  &counter32_delta_since_zero_offset,
-                                 &counter32_delta_since_previous_event)) {
+                                 &counter32_delta_since_previous_event);
+  alpha_event_flow_note_ticks64(time_clock, ticks64_ok, applied_event,
+                                counter32_delta_since_previous_event);
+  if (!ticks64_ok) {
     clocks_watchdog_anomaly("alpha_clock_apply_failed",
                             (uint32_t)((uint8_t)time_clock),
                             applied_event.counter32_at_event,
@@ -2041,6 +2450,8 @@ static void clocks_apply_epoch_counter_edge(clock_state_t& clock,
                                               &measured_dwt_cycles,
                                               &real_interval_ns,
                                               &residual_fast_ns);
+    alpha_event_flow_note_measured(time_clock, measured_dwt_cycles,
+                                   real_interval_ns, residual_fast_ns, ns_now);
 
     dwt_cycles_between_edges = measured_dwt_cycles;
     gnss_ns_between_edges = real_interval_ns;
@@ -2061,6 +2472,7 @@ static void clocks_apply_epoch_counter_edge(clock_state_t& clock,
   }
 
   (void)time_clock_update(time_clock, applied_event.dwt_at_event, ns_now);
+  alpha_event_flow_note_time_update(time_clock, ns_now);
 
   clock.ledger_ns_count_at_edge = ns_now;
   clock.ledger_ns_count_at_pps_vclock = ns_now;
@@ -2097,6 +2509,7 @@ static void clocks_apply_epoch_counter_edge(clock_state_t& clock,
 
   if (had_previous && dwt_cycles_between_edges != 0) {
     alpha_static_prediction_record(time_clock, dwt_cycles_between_edges);
+    alpha_event_flow_note_static_prediction(time_clock, dwt_cycles_between_edges);
   }
 
   alpha_forensics_publish(time_clock, clock, meas, applied_event, applied_diag,
@@ -2107,6 +2520,7 @@ static void clocks_apply_epoch_counter_edge(clock_state_t& clock,
                           logical_ticks64,
                           counter_ns_now,
                           ns_now);
+  alpha_event_flow_note_complete(time_clock);
 }
 
 static inline bool usable_clock_event(const interrupt_event_t&) {
@@ -2120,8 +2534,13 @@ static void apply_ocxo_event(clock_state_t& clock,
                              const interrupt_capture_diag_t* diag,
                              uint32_t epoch_counter32,
                              time_clock_id_t time_clock) {
+  alpha_event_flow_note_callback(time_clock, event, diag);
   clocks_capture_interrupt_diag(diag_dst, diag);
-  if (!usable_clock_event(event)) return;
+  if (!usable_clock_event(event)) {
+    alpha_event_flow_note_reject_epoch(time_clock, event);
+    return;
+  }
+  alpha_event_flow_note_callback_accepted(time_clock);
   clocks_apply_epoch_counter_edge(clock, meas, event, diag,
                                   epoch_counter32, time_clock);
 }
@@ -2129,10 +2548,15 @@ static void apply_ocxo_event(clock_state_t& clock,
 static void vclock_callback(const interrupt_event_t& event,
                             const interrupt_capture_diag_t* diag,
                             void*) {
+  alpha_event_flow_note_callback(time_clock_id_t::VCLOCK, event, diag);
   clocks_capture_interrupt_diag(g_pps_witness_diag, diag);
   g_last_vclock_event_counter32_at_event = event.counter32_at_event;
 
-  if (!epoch_ready()) return;
+  if (!epoch_ready()) {
+    alpha_event_flow_note_reject_epoch(time_clock_id_t::VCLOCK, event);
+    return;
+  }
+  alpha_event_flow_note_callback_accepted(time_clock_id_t::VCLOCK);
 
   g_vclock_event_count++;
   g_prev_dwt_at_vclock_event = event.dwt_at_event;
