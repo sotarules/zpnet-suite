@@ -471,8 +471,21 @@ struct alpha_lane_forensics_store_t {
   uint32_t counter32_delta_since_epoch = 0;
   uint64_t nominal_ns_from_counter32_epoch = 0;
 
+  // Compatibility mirror.  When process_interrupt supplies a direct
+  // GNSS timestamp, event_gnss_ns carries it; otherwise it falls back to
+  // the Alpha ledger coordinate used for this lane.
   uint64_t event_gnss_ns = 0;
   uint64_t previous_event_gnss_ns = 0;
+
+  // Process_interrupt-authored GNSS witness for the actual subscriber event
+  // sample.  For OCXO lanes this is the quiet-zone sample timestamp, not the
+  // Alpha phase-backprojected logical one-second boundary.  These fields are
+  // passive forensics only; they do not drive residuals or servo behavior.
+  bool     sample_gnss_ns_at_event_available = false;
+  bool     previous_sample_gnss_ns_at_event_available = false;
+  uint64_t sample_gnss_ns_at_event = 0;
+  uint64_t previous_sample_gnss_ns_at_event = 0;
+
   int64_t  phase_offset_ns = 0;
 
   uint64_t counter_nominal_ns_between_edges = 0;
@@ -940,6 +953,10 @@ static void alpha_forensics_reset_store(alpha_lane_forensics_store_t& s) {
   s.nominal_ns_from_counter32_epoch = 0;
   s.event_gnss_ns = 0;
   s.previous_event_gnss_ns = 0;
+  s.sample_gnss_ns_at_event_available = false;
+  s.previous_sample_gnss_ns_at_event_available = false;
+  s.sample_gnss_ns_at_event = 0;
+  s.previous_sample_gnss_ns_at_event = 0;
   s.phase_offset_ns = 0;
   s.counter_nominal_ns_between_edges = 0;
   s.bridge_gnss_ns_between_edges = 0;
@@ -1037,13 +1054,22 @@ static void alpha_forensics_publish(time_clock_id_t clock_id,
           : 0ULL;
 
   const uint64_t previous_event_gnss_ns = s->event_gnss_ns;
-  const uint64_t event_gnss_ns = (event.gnss_ns_at_event != 0)
+  const bool sample_gnss_ns_at_event_available =
+      (event.gnss_ns_at_event != 0);
+  const uint64_t previous_sample_gnss_ns_at_event =
+      s->sample_gnss_ns_at_event;
+  const bool previous_sample_gnss_ns_at_event_available =
+      s->sample_gnss_ns_at_event_available;
+  const uint64_t sample_gnss_ns_at_event = sample_gnss_ns_at_event_available
+      ? event.gnss_ns_at_event
+      : 0ULL;
+  const uint64_t event_gnss_ns = sample_gnss_ns_at_event_available
       ? event.gnss_ns_at_event
       : ns_now;
 
-  // For OCXO lanes process_interrupt may not carry a direct GNSS timestamp in
-  // the event. The authoritative measured interval is therefore the
-  // Alpha-authored measurement surface, not event.gnss_ns_at_event.
+  // For OCXO lanes Alpha's authoritative measured interval remains the
+  // existing Alpha-authored measurement surface in this step.  The
+  // process_interrupt GNSS timestamp is stored as a passive witness only.
   const bool bridge_interval_valid = (meas.gnss_ns_between_edges != 0);
   const uint64_t bridge_gnss_ns_between_edges = bridge_interval_valid
       ? meas.gnss_ns_between_edges
@@ -1075,6 +1101,11 @@ static void alpha_forensics_publish(time_clock_id_t clock_id,
   s->nominal_ns_from_counter32_epoch = counter_ns_now;
   s->event_gnss_ns = event_gnss_ns;
   s->previous_event_gnss_ns = previous_event_gnss_ns;
+  s->sample_gnss_ns_at_event_available = sample_gnss_ns_at_event_available;
+  s->previous_sample_gnss_ns_at_event_available =
+      previous_sample_gnss_ns_at_event_available;
+  s->sample_gnss_ns_at_event = sample_gnss_ns_at_event;
+  s->previous_sample_gnss_ns_at_event = previous_sample_gnss_ns_at_event;
   s->phase_offset_ns = clock.phase_offset_ns;
   s->counter_nominal_ns_between_edges = counter_nominal_ns_between_edges;
   s->bridge_gnss_ns_between_edges = bridge_gnss_ns_between_edges;
@@ -1245,6 +1276,13 @@ bool clocks_alpha_lane_forensics(time_clock_id_t clock,
     out->nominal_ns_from_counter32_epoch = s->nominal_ns_from_counter32_epoch;
     out->event_gnss_ns = s->event_gnss_ns;
     out->previous_event_gnss_ns = s->previous_event_gnss_ns;
+    out->sample_gnss_ns_at_event_available =
+        s->sample_gnss_ns_at_event_available;
+    out->previous_sample_gnss_ns_at_event_available =
+        s->previous_sample_gnss_ns_at_event_available;
+    out->sample_gnss_ns_at_event = s->sample_gnss_ns_at_event;
+    out->previous_sample_gnss_ns_at_event =
+        s->previous_sample_gnss_ns_at_event;
     out->phase_offset_ns = s->phase_offset_ns;
     out->counter_nominal_ns_between_edges = s->counter_nominal_ns_between_edges;
     out->bridge_gnss_ns_between_edges = s->bridge_gnss_ns_between_edges;

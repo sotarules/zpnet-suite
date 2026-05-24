@@ -1990,6 +1990,13 @@ static void add_alpha_event_payload(Payload& p,
   p.add("nominal_ns_from_counter32_epoch", f.nominal_ns_from_counter32_epoch);
   p.add("event_gnss_ns", f.event_gnss_ns);
   p.add("previous_event_gnss_ns", f.previous_event_gnss_ns);
+  p.add("sample_gnss_ns_at_event", f.sample_gnss_ns_at_event);
+  p.add("sample_gnss_ns_at_event_available",
+        f.sample_gnss_ns_at_event_available);
+  p.add("previous_sample_gnss_ns_at_event",
+        f.previous_sample_gnss_ns_at_event);
+  p.add("previous_sample_gnss_ns_at_event_available",
+        f.previous_sample_gnss_ns_at_event_available);
   p.add("phase_offset_ns", f.phase_offset_ns);
   p.add("counter_nominal_ns_between_edges", f.counter_nominal_ns_between_edges);
   p.add("bridge_interval_valid", f.bridge_interval_valid);

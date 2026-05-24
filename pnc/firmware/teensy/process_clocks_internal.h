@@ -289,8 +289,21 @@ struct clocks_alpha_lane_forensics_t {
   uint32_t counter32_delta_since_epoch;
   uint64_t nominal_ns_from_counter32_epoch;
 
+  // Compatibility mirror.  When process_interrupt supplies a direct GNSS
+  // timestamp this carries it; otherwise Alpha falls back to the lane ledger
+  // coordinate used for projection/report compatibility.
   uint64_t event_gnss_ns;
   uint64_t previous_event_gnss_ns;
+
+  // Process_interrupt-authored GNSS witness for the actual subscriber event
+  // sample.  For OCXO lanes this is the quiet-zone sample timestamp, not the
+  // Alpha phase-backprojected logical one-second boundary.  Passive forensic
+  // storage only; residual/servo promotion is a later step.
+  bool     sample_gnss_ns_at_event_available;
+  bool     previous_sample_gnss_ns_at_event_available;
+  uint64_t sample_gnss_ns_at_event;
+  uint64_t previous_sample_gnss_ns_at_event;
+
   int64_t  phase_offset_ns;
 
   uint64_t counter_nominal_ns_between_edges;
