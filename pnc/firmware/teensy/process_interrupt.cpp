@@ -2003,14 +2003,14 @@ static void smartzero_advance_or_complete(void) {
   smartzero_arm_current_lane();
 }
 
-static void smartzero_feed_sample(interrupt_subscriber_kind_t kind,
+static bool smartzero_feed_sample(interrupt_subscriber_kind_t kind,
                                   uint32_t event_dwt,
                                   uint32_t counter32,
                                   uint16_t hardware16) {
-  if (!smartzero_is_current_lane(kind)) return;
+  if (!smartzero_is_current_lane(kind)) return false;
 
   const int idx = smartzero_index_for_kind(kind);
-  if (idx < 0) return;
+  if (idx < 0) return false;
 
   uint32_t cps = 0;
   const uint32_t expected = smartzero_expected_interval_cycles(&cps);
@@ -2033,7 +2033,7 @@ static void smartzero_feed_sample(interrupt_subscriber_kind_t kind,
     z.last_decision = interrupt_smartzero_decision_t::WAITING_FOR_CPS;
     r.previous_present = false;
     smartzero_write_end();
-    return;
+    return false;
   }
 
   if (!r.previous_present) {
@@ -2043,7 +2043,7 @@ static void smartzero_feed_sample(interrupt_subscriber_kind_t kind,
     z.last_decision = interrupt_smartzero_decision_t::FIRST_SAMPLE;
     r.previous_present = true;
     smartzero_write_end();
-    return;
+    return false;
   }
 
   const uint32_t previous_dwt = z.previous_sample_dwt;
@@ -2070,6 +2070,8 @@ static void smartzero_feed_sample(interrupt_subscriber_kind_t kind,
   const bool dwt_ok = ((int32_t)abs_error <= SMARTZERO_INTERVAL_TOLERANCE_CYCLES);
 
   if (counter_ok && dwt_ok) {
+    bool ocxo_cadence_reauthored = false;
+
     z.accepted_count++;
     z.state = interrupt_smartzero_lane_state_t::LOCKED;
     z.last_decision = interrupt_smartzero_decision_t::ACCEPTED;
@@ -2086,6 +2088,7 @@ static void smartzero_feed_sample(interrupt_subscriber_kind_t kind,
       if (lane && clock32) {
         ocxo_lane_install_logical_grid(kind, *lane, *clock32, counter32,
                                        OCXO_CADENCE_REASON_SMARTZERO);
+        ocxo_cadence_reauthored = true;
         if (!lane->active) {
           ocxo_lane_stop_local_cadence(*lane, OCXO_CADENCE_REASON_SMARTZERO);
         }
@@ -2094,7 +2097,7 @@ static void smartzero_feed_sample(interrupt_subscriber_kind_t kind,
 
     smartzero_advance_or_complete();
     smartzero_write_end();
-    return;
+    return ocxo_cadence_reauthored;
   }
 
   z.rejected_count++;
@@ -2110,6 +2113,7 @@ static void smartzero_feed_sample(interrupt_subscriber_kind_t kind,
   (void)previous_hw16;
 
   smartzero_write_end();
+  return false;
 }
 
 // OCXO SmartZero samples are now served by the same lane-local 1 kHz
@@ -3905,7 +3909,7 @@ static void ocxo_cadence_update_sample_phase(
   lane.cadence_last_one_second_due = sample.one_second_due;
 }
 
-static void ocxo_cadence_feed_smartzero(
+static bool ocxo_cadence_feed_smartzero(
     ocxo_runtime_context_t& ctx,
     const ocxo_cadence_isr_sample_t& sample) {
   if (sample.was_smartzero_current) {
@@ -3917,16 +3921,26 @@ static void ocxo_cadence_feed_smartzero(
     }
   }
 
-  smartzero_feed_sample(ctx.kind,
-                        sample.event_dwt,
-                        sample.target_counter32,
-                        sample.target_low16);
+  return smartzero_feed_sample(ctx.kind,
+                               sample.event_dwt,
+                               sample.target_counter32,
+                               sample.target_low16);
 }
 
 static void ocxo_cadence_rearm_or_stop(
     ocxo_runtime_context_t& ctx,
-    ocxo_cadence_isr_sample_t& sample) {
+    ocxo_cadence_isr_sample_t& sample,
+    bool cadence_reauthored_by_smartzero) {
   ocxo_lane_t& lane = *ctx.lane;
+
+  if (cadence_reauthored_by_smartzero) {
+    // SmartZero acceptance can re-author this OCXO lane's quiet/logical grid
+    // from inside smartzero_feed_sample().  In that case the compare target
+    // already belongs to the newly installed grid; do not overwrite it with
+    // the just-serviced sample.target + 10,000 stale ISR rearm.
+    sample.isr_csctrl_after_program = lane.module->CH[lane.channel].CSCTRL;
+    return;
+  }
 
   const bool keep_for_smartzero = smartzero_is_current_lane(ctx.kind);
   const bool keep_running = lane.active || keep_for_smartzero;
@@ -4045,8 +4059,9 @@ static void ocxo_cadence_compare_isr(ocxo_runtime_context_t& ctx,
   // Preserve the existing SmartZero custody rule: feed the sample before
   // deciding whether the local cadence remains owned by SmartZero or by the
   // normal active lane.
-  ocxo_cadence_feed_smartzero(ctx, sample);
-  ocxo_cadence_rearm_or_stop(ctx, sample);
+  const bool cadence_reauthored_by_smartzero =
+      ocxo_cadence_feed_smartzero(ctx, sample);
+  ocxo_cadence_rearm_or_stop(ctx, sample, cadence_reauthored_by_smartzero);
   ocxo_cadence_update_one_second_witness(ctx, sample);
 
   interrupt_perishable_fact_t fact =
