@@ -20,8 +20,8 @@
 //
 //     dwt_welford         — Teensy CPU XTAL offset (ppb, positive = fast)
 //     vclock_welford      — bridge interpolation residual (ns)
-//     ocxo1_welford       — OCXO1 per-second residual (ns, positive = fast)
-//     ocxo2_welford       — OCXO2 per-second residual (ns, positive = fast)
+//     ocxo1_welford       — OCXO1 PPS-interval residual (ns, positive = fast)
+//     ocxo2_welford       — OCXO2 PPS-interval residual (ns, positive = fast)
 //     pps_witness_welford — GPIO PPS witness offset (ns)
 //     ocxo1_dac_welford   — OCXO1 DAC fractional code (LSB)
 //     ocxo2_dac_welford   — OCXO2 DAC fractional code (LSB)
@@ -142,6 +142,96 @@ static uint64_t g_campaign_public_ocxo2_base = 0;
 // ledgers so measured_gnss_ns remains useful as a diagnostic side surface.
 static uint64_t g_campaign_public_ocxo1_measured_base = 0;
 static uint64_t g_campaign_public_ocxo2_measured_base = 0;
+
+// Step D: canonical OCXO residuals/Welfords are now PPS-founded.  The
+// previous public TIMEBASE clock tuple is retained so Beta can compute the
+// row-to-row PPS-interval residual directly from the same public values that
+// downstream panels see:
+//
+//   residual_ns = (current_ocxo_ns - previous_ocxo_ns)
+//               - (current_gnss_ns - previous_gnss_ns)
+//
+// Positive residual means the OCXO clock ledger advanced too far during the
+// PPS interval: clock running fast.
+struct pps_interval_residuals_t {
+  bool     ocxo1_valid = false;
+  bool     ocxo2_valid = false;
+  uint32_t public_count = 0;
+  uint64_t gnss_interval_ns = 0;
+  uint64_t ocxo1_interval_ns = 0;
+  uint64_t ocxo2_interval_ns = 0;
+  int64_t  ocxo1_fast_residual_ns = 0;
+  int64_t  ocxo2_fast_residual_ns = 0;
+};
+
+static uint32_t g_pps_residual_prev_public_count = 0;
+static uint64_t g_pps_residual_prev_gnss_ns = 0;
+static uint64_t g_pps_residual_prev_ocxo1_ns = 0;
+static uint64_t g_pps_residual_prev_ocxo2_ns = 0;
+static bool     g_pps_residual_prev_ocxo1_pps_projected = false;
+static bool     g_pps_residual_prev_ocxo2_pps_projected = false;
+static pps_interval_residuals_t g_last_pps_interval_residuals = {};
+
+static void pps_interval_residuals_reset(void) {
+  g_pps_residual_prev_public_count = 0;
+  g_pps_residual_prev_gnss_ns = 0;
+  g_pps_residual_prev_ocxo1_ns = 0;
+  g_pps_residual_prev_ocxo2_ns = 0;
+  g_pps_residual_prev_ocxo1_pps_projected = false;
+  g_pps_residual_prev_ocxo2_pps_projected = false;
+  g_last_pps_interval_residuals = pps_interval_residuals_t{};
+}
+
+static pps_interval_residuals_t pps_interval_residuals_update(
+    uint32_t public_count,
+    uint64_t public_gnss_ns,
+    uint64_t public_ocxo1_ns,
+    uint64_t public_ocxo2_ns,
+    bool ocxo1_pps_projected,
+    bool ocxo2_pps_projected) {
+  pps_interval_residuals_t r{};
+  r.public_count = public_count;
+
+  const bool have_previous = (g_pps_residual_prev_public_count != 0);
+  const bool consecutive = have_previous &&
+      (public_count == (g_pps_residual_prev_public_count + 1U));
+  const bool gnss_monotonic = public_gnss_ns >= g_pps_residual_prev_gnss_ns;
+  const bool ocxo1_monotonic = public_ocxo1_ns >= g_pps_residual_prev_ocxo1_ns;
+  const bool ocxo2_monotonic = public_ocxo2_ns >= g_pps_residual_prev_ocxo2_ns;
+
+  if (consecutive && gnss_monotonic) {
+    r.gnss_interval_ns = public_gnss_ns - g_pps_residual_prev_gnss_ns;
+
+    if (r.gnss_interval_ns != 0 &&
+        ocxo1_monotonic &&
+        g_pps_residual_prev_ocxo1_pps_projected &&
+        ocxo1_pps_projected) {
+      r.ocxo1_interval_ns = public_ocxo1_ns - g_pps_residual_prev_ocxo1_ns;
+      r.ocxo1_fast_residual_ns =
+          (int64_t)r.ocxo1_interval_ns - (int64_t)r.gnss_interval_ns;
+      r.ocxo1_valid = true;
+    }
+
+    if (r.gnss_interval_ns != 0 &&
+        ocxo2_monotonic &&
+        g_pps_residual_prev_ocxo2_pps_projected &&
+        ocxo2_pps_projected) {
+      r.ocxo2_interval_ns = public_ocxo2_ns - g_pps_residual_prev_ocxo2_ns;
+      r.ocxo2_fast_residual_ns =
+          (int64_t)r.ocxo2_interval_ns - (int64_t)r.gnss_interval_ns;
+      r.ocxo2_valid = true;
+    }
+  }
+
+  g_pps_residual_prev_public_count = public_count;
+  g_pps_residual_prev_gnss_ns = public_gnss_ns;
+  g_pps_residual_prev_ocxo1_ns = public_ocxo1_ns;
+  g_pps_residual_prev_ocxo2_ns = public_ocxo2_ns;
+  g_pps_residual_prev_ocxo1_pps_projected = ocxo1_pps_projected;
+  g_pps_residual_prev_ocxo2_pps_projected = ocxo2_pps_projected;
+  g_last_pps_interval_residuals = r;
+  return r;
+}
 
 static bool clock_projection_valid(time_clock_id_t clock) {
   time_clock_projection_t projection{};
@@ -1115,6 +1205,20 @@ static void payload_add_lane_regression_object(Payload& parent,
   parent.add_object("regression", regression);
 }
 
+static void payload_add_ocxo_pps_residual_object(Payload& parent,
+                                                bool valid,
+                                                uint64_t gnss_interval_ns,
+                                                uint64_t clock_interval_ns,
+                                                int64_t fast_residual_ns) {
+  Payload residual;
+  residual.add("valid", valid);
+  residual.add("gnss_interval_ns", valid ? gnss_interval_ns : 0ULL);
+  residual.add("clock_interval_ns", valid ? clock_interval_ns : 0ULL);
+  residual.add("fast_residual_ns", valid ? fast_residual_ns : 0LL);
+  residual.add("positive_means", "clock_fast");
+  parent.add_object("pps_residual", residual);
+}
+
 static void payload_add_vclock_fragment(Payload& p,
                                         uint64_t public_gnss_ns,
                                         bool forensics_valid,
@@ -1139,7 +1243,11 @@ static void payload_add_ocxo_fragment(Payload& p,
                                       const clocks_alpha_lane_forensics_t& f,
                                       bool pps_projection_valid,
                                       const clocks_alpha_ocxo_pps_projection_snapshot_t& pps_projection,
-                                      uint64_t public_pps_projected_ns) {
+                                      uint64_t public_pps_projected_ns,
+                                      bool pps_residual_valid,
+                                      uint64_t pps_gnss_interval_ns,
+                                      uint64_t pps_clock_interval_ns,
+                                      int64_t pps_fast_residual_ns) {
   Payload lane;
 
   // Step C authority: ocxoN.ns is now the campaign-public OCXO clock value
@@ -1187,6 +1295,16 @@ static void payload_add_ocxo_fragment(Payload& p,
   lane.add("pps_projected_minus_measured_ns", projected_minus_measured_ns);
   lane.add("pps_projection_source",
            pps_projection_valid ? pps_projection.source : 0U);
+
+  // Step D canonical residual surface: this is the same PPS-founded
+  // row-to-row residual used to feed the OCXO Welfords.  It is deliberately
+  // computed from public TIMEBASE clock values, not OCXO event-edge witnesses
+  // and not DWT cycle residuals.
+  payload_add_ocxo_pps_residual_object(lane,
+                                       pps_residual_valid,
+                                       pps_gnss_interval_ns,
+                                       pps_clock_interval_ns,
+                                       pps_fast_residual_ns);
 
   // Direct interrupt-authored GNSS-at-edge witness. This is the normalized
   // GNSS timestamp of the observed OCXO quiet-zone sample, not Alpha's
@@ -1451,6 +1569,8 @@ void clocks_zero_all(void) {
   welford_reset(welford_ocxo1_dac);
   welford_reset(welford_ocxo2_dac);
 
+  pps_interval_residuals_reset();
+
   ocxo_dac_predictor_reset(ocxo1_dac);
   ocxo_dac_predictor_reset(ocxo2_dac);
   ocxo_dac_pacing_reset();
@@ -1699,6 +1819,7 @@ void clocks_beta_pps(void) {
     ocxo2_measured_gnss_ticks_64        = recover_ocxo2_ns / 100ull;
 
     campaign_seconds = recover_gnss_ns / 1000000000ull;
+    pps_interval_residuals_reset();
 
     request_recover = false;
     campaign_state = clocks_campaign_state_t::STARTED;
@@ -1758,38 +1879,12 @@ void clocks_beta_pps(void) {
       clocks_alpha_ocxo_pps_projection_snapshot(time_clock_id_t::OCXO2,
                                                 &ocxo2_pps_projection);
 
-  // VCLOCK measurement Welford — bridge-interpolation self-test.
-  // Sample in ns; mean == ppb under the "ns/sec == ppb" identity.
-  if (g_vclock_measurement.gnss_ns_between_edges != 0) {
-    welford_update(welford_vclock, (double)g_vclock_measurement.second_residual_ns);
-  }
-
-  // OCXO measurement Welfords use the Alpha-authored measured GNSS interval,
-  // not the counter-derived nominal interval. Positive residual means the
-  // OCXO one-second edge arrived early / the OCXO is running fast versus VCLOCK.
-  if (g_ocxo1_measurement.gnss_ns_between_edges != 0) {
-    const int64_t residual_fast_ns = g_ocxo1_measurement.second_residual_ns;
-    welford_update(welford_ocxo1, (double)residual_fast_ns);
-    now_window_push(g_now_window_ocxo1, residual_fast_ns);
-  }
-
-  if (g_ocxo2_measurement.gnss_ns_between_edges != 0) {
-    const int64_t residual_fast_ns = g_ocxo2_measurement.second_residual_ns;
-    welford_update(welford_ocxo2, (double)residual_fast_ns);
-    now_window_push(g_now_window_ocxo2, residual_fast_ns);
-  }
-
-  // PPS witness statistics are owned by the witness/PPS_PHASE path.
-  // Beta publishes the accumulator but does not update it here.
-
-  // Servo runs AFTER welford updates so it sees this second's data.
-  ocxo_calibration_servo();
-
-  // DAC Welfords — track servo effort (the TEMPEST signal).
-  welford_update(welford_ocxo1_dac, ocxo1_dac.dac_fractional);
-  welford_update(welford_ocxo2_dac, ocxo2_dac.dac_fractional);
-
-  // ── Build TIMEBASE_FRAGMENT ──
+  // ── Public PPS-edge clock tuple ──
+  //
+  // Step C made public_ocxoN_ns the canonical PPS-projected OCXO clock value.
+  // Step D computes OCXO residuals/Welfords from consecutive values in this
+  // same public tuple.  No normalization happens here; if these values are
+  // not already PPS-founded, that is an upstream architecture problem.
   const uint64_t public_gnss_ns   = campaign_public_gnss_ns();
   const uint64_t public_dwt_total = campaign_public_dwt_total();
   const uint64_t public_dwt_ns    = dwt_cycles_to_ns(public_dwt_total);
@@ -1823,9 +1918,6 @@ void clocks_beta_pps(void) {
                 g_campaign_public_ocxo2_base)
           : 0ULL;
 
-  // Step C promotion: canonical OCXO TIMEBASE ns values are PPS-edge
-  // projections when available.  The measured ledgers are published
-  // separately as diagnostics.
   const uint64_t public_ocxo1_ns = ocxo1_pps_projected_valid
       ? public_ocxo1_pps_projected_ns
       : public_ocxo1_measured_ns;
@@ -1833,8 +1925,54 @@ void clocks_beta_pps(void) {
       ? public_ocxo2_pps_projected_ns
       : public_ocxo2_measured_ns;
 
-  const uint32_t public_count     = (uint32_t)campaign_seconds;
+  const uint32_t public_count = (uint32_t)campaign_seconds;
+  const pps_interval_residuals_t pps_residuals =
+      pps_interval_residuals_update(public_count,
+                                    public_gnss_ns,
+                                    public_ocxo1_ns,
+                                    public_ocxo2_ns,
+                                    ocxo1_pps_projected_valid,
+                                    ocxo2_pps_projected_valid);
 
+  // VCLOCK measurement Welford — bridge-interpolation self-test.
+  // Sample in ns; mean == ppb under the "ns/sec == ppb" identity.
+  if (g_vclock_measurement.gnss_ns_between_edges != 0) {
+    welford_update(welford_vclock, (double)g_vclock_measurement.second_residual_ns);
+  }
+
+  // Step D OCXO Welfords use PPS-founded public clock residuals.
+  // The residual is computed from consecutive TIMEBASE clock values:
+  //
+  //   (current_ocxo_ns - previous_ocxo_ns) -
+  //   (current_gnss_ns - previous_gnss_ns)
+  //
+  // Positive residual means the OCXO clock ledger advanced too far during
+  // the PPS interval: OCXO running fast.  This intentionally ignores the
+  // old edge-domain measured residuals; those remain published as diagnostics.
+  if (pps_residuals.ocxo1_valid) {
+    welford_update(welford_ocxo1,
+                   (double)pps_residuals.ocxo1_fast_residual_ns);
+    now_window_push(g_now_window_ocxo1,
+                    pps_residuals.ocxo1_fast_residual_ns);
+  }
+  if (pps_residuals.ocxo2_valid) {
+    welford_update(welford_ocxo2,
+                   (double)pps_residuals.ocxo2_fast_residual_ns);
+    now_window_push(g_now_window_ocxo2,
+                    pps_residuals.ocxo2_fast_residual_ns);
+  }
+
+  // PPS witness statistics are owned by the witness/PPS_PHASE path.
+  // Beta publishes the accumulator but does not update it here.
+
+  // Servo runs AFTER welford updates so it sees this second's data.
+  ocxo_calibration_servo();
+
+  // DAC Welfords — track servo effort (the TEMPEST signal).
+  welford_update(welford_ocxo1_dac, ocxo1_dac.dac_fractional);
+  welford_update(welford_ocxo2_dac, ocxo2_dac.dac_fractional);
+
+  // ── Build TIMEBASE_FRAGMENT ──
   Payload p;
   p.add("schema", "TIMEBASE_FRAGMENT_V2");
   p.add("fragment_version", 2U);
@@ -1920,7 +2058,11 @@ void clocks_beta_pps(void) {
                             ocxo1_forensics,
                             ocxo1_pps_projected_valid,
                             ocxo1_pps_projection,
-                            public_ocxo1_pps_projected_ns);
+                            public_ocxo1_pps_projected_ns,
+                            pps_residuals.ocxo1_valid,
+                            pps_residuals.gnss_interval_ns,
+                            pps_residuals.ocxo1_interval_ns,
+                            pps_residuals.ocxo1_fast_residual_ns);
 
   payload_add_ocxo_fragment(p,
                             "ocxo2",
@@ -1932,7 +2074,11 @@ void clocks_beta_pps(void) {
                             ocxo2_forensics,
                             ocxo2_pps_projected_valid,
                             ocxo2_pps_projection,
-                            public_ocxo2_pps_projected_ns);
+                            public_ocxo2_pps_projected_ns,
+                            pps_residuals.ocxo2_valid,
+                            pps_residuals.gnss_interval_ns,
+                            pps_residuals.ocxo2_interval_ns,
+                            pps_residuals.ocxo2_fast_residual_ns);
 
   payload_add_dac_summary_hierarchical(p);
   payload_add_stats_summary_hierarchical(p);

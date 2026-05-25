@@ -39,8 +39,8 @@
 //
 //     dwt_welford         - Teensy CPU XTAL offset samples (ppb)
 //     vclock_welford      - bridge interpolation residual samples (ns)
-//     ocxo1_welford       - OCXO1 per-second residual samples (ns)
-//     ocxo2_welford       - OCXO2 per-second residual samples (ns)
+//     ocxo1_welford       - OCXO1 PPS-interval residual samples (ns)
+//     ocxo2_welford       - OCXO2 PPS-interval residual samples (ns)
 //     pps_witness_welford - reserved PPS/VCLOCK phase-error surface (ns)
 //     ocxo1_dac_welford   - OCXO1 DAC fractional code samples (LSB)
 //     ocxo2_dac_welford   - OCXO2 DAC fractional code samples (LSB)
@@ -676,8 +676,8 @@ extern uint64_t recover_ocxo2_ns;
 //
 //   welford_dwt          — Teensy CPU XTAL offset, in ppb
 //   welford_vclock       — bridge interpolation residual, in ns
-//   welford_ocxo1        — OCXO1 per-second residual, in ns
-//   welford_ocxo2        — OCXO2 per-second residual, in ns
+//   welford_ocxo1        — OCXO1 PPS-interval residual, in ns
+//   welford_ocxo2        — OCXO2 PPS-interval residual, in ns
 //   welford_pps_witness  — PPS/VCLOCK phase error, in ns
 //                          (counter32-based, ordering-independent)
 //   welford_ocxo1_dac    — OCXO1 DAC fractional code, in LSB
