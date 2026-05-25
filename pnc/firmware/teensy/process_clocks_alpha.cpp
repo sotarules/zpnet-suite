@@ -1157,6 +1157,386 @@ bool clocks_static_prediction_pps_snapshot(clocks_static_prediction_snapshot_t* 
   return alpha_static_prediction_snapshot_store(g_static_prediction_pps, 0U, out);
 }
 
+// ============================================================================
+// Report-only OCXO PPS-edge projection surface
+// ============================================================================
+//
+// Step A for the PPS-founded OCXO clock standard.  Alpha records OCXO
+// boundary edge facts and, once per PPS/VCLOCK row, computes what the OCXO
+// clock's own nanosecond ledger would have read at that PPS/VCLOCK DWT
+// coordinate.  This is not yet promoted into g_ocxo*_measured_gnss_ns_at_pps_vclock
+// and it does not feed TIMEBASE/Welfords/servo.
+
+static constexpr uint32_t ALPHA_OCXO_PPS_PROJECTION_SOURCE_NONE = 0;
+static constexpr uint32_t ALPHA_OCXO_PPS_PROJECTION_SOURCE_ACTUAL_BRACKET = 1;
+static constexpr uint32_t ALPHA_OCXO_PPS_PROJECTION_SOURCE_STATIC_NEXT_EDGE = 2;
+
+static constexpr uint32_t ALPHA_OCXO_PPS_PROJECTION_INVALID_NONE = 0;
+static constexpr uint32_t ALPHA_OCXO_PPS_PROJECTION_INVALID_NO_EDGE = 1;
+static constexpr uint32_t ALPHA_OCXO_PPS_PROJECTION_INVALID_NO_INTERVAL = 2;
+static constexpr uint32_t ALPHA_OCXO_PPS_PROJECTION_INVALID_TARGET_OUT_OF_WINDOW = 3;
+
+struct alpha_ocxo_edge_fact_t {
+  bool     valid = false;
+  uint32_t dwt_at_edge = 0;
+  uint32_t counter32_at_edge = 0;
+  uint64_t ocxo_ns_at_edge = 0;
+  uint64_t measured_ns_at_edge = 0;
+  bool     sample_gnss_available = false;
+  uint64_t sample_gnss_ns_at_event = 0;
+  bool     boundary_gnss_available = false;
+  uint64_t boundary_gnss_ns_at_edge = 0;
+  uint32_t sample_phase_ticks = 0;
+  uint32_t phase_cycles = 0;
+};
+
+struct alpha_ocxo_edge_history_t {
+  bool current_valid = false;
+  bool previous_valid = false;
+  alpha_ocxo_edge_fact_t current = {};
+  alpha_ocxo_edge_fact_t previous = {};
+  uint32_t update_count = 0;
+};
+
+struct alpha_ocxo_pps_projection_store_t {
+  volatile uint32_t seq = 0;
+  clocks_alpha_ocxo_pps_projection_snapshot_t v = {};
+};
+
+static alpha_ocxo_edge_history_t g_ocxo1_edge_history = {};
+static alpha_ocxo_edge_history_t g_ocxo2_edge_history = {};
+static alpha_ocxo_pps_projection_store_t g_ocxo1_pps_projection = {};
+static alpha_ocxo_pps_projection_store_t g_ocxo2_pps_projection = {};
+
+static alpha_ocxo_edge_history_t* alpha_ocxo_edge_history(time_clock_id_t clock) {
+  switch (clock) {
+    case time_clock_id_t::OCXO1: return &g_ocxo1_edge_history;
+    case time_clock_id_t::OCXO2: return &g_ocxo2_edge_history;
+    default:                    return nullptr;
+  }
+}
+
+static alpha_ocxo_pps_projection_store_t* alpha_ocxo_pps_projection_store(
+    time_clock_id_t clock) {
+  switch (clock) {
+    case time_clock_id_t::OCXO1: return &g_ocxo1_pps_projection;
+    case time_clock_id_t::OCXO2: return &g_ocxo2_pps_projection;
+    default:                    return nullptr;
+  }
+}
+
+static int64_t alpha_signed_delta_u64(uint64_t a, uint64_t b) {
+  return (a >= b) ? (int64_t)(a - b) : -(int64_t)(b - a);
+}
+
+static void alpha_ocxo_pps_projection_reset_store(
+    alpha_ocxo_pps_projection_store_t& s, uint32_t clock_id) {
+  s.seq++;
+  clocks_alpha_dmb();
+  s.v = clocks_alpha_ocxo_pps_projection_snapshot_t{};
+  s.v.clock_id = clock_id;
+  clocks_alpha_dmb();
+  s.seq++;
+}
+
+static void alpha_ocxo_pps_projection_reset_all(void) {
+  g_ocxo1_edge_history = alpha_ocxo_edge_history_t{};
+  g_ocxo2_edge_history = alpha_ocxo_edge_history_t{};
+  alpha_ocxo_pps_projection_reset_store(
+      g_ocxo1_pps_projection, (uint32_t)((uint8_t)time_clock_id_t::OCXO1));
+  alpha_ocxo_pps_projection_reset_store(
+      g_ocxo2_pps_projection, (uint32_t)((uint8_t)time_clock_id_t::OCXO2));
+}
+
+static void alpha_ocxo_edge_history_install_zero(time_clock_id_t clock,
+                                                 uint32_t dwt_at_edge,
+                                                 uint32_t counter32_at_edge) {
+  alpha_ocxo_edge_history_t* h = alpha_ocxo_edge_history(clock);
+  if (!h) return;
+
+  *h = alpha_ocxo_edge_history_t{};
+  h->current_valid = true;
+  h->current.valid = true;
+  h->current.dwt_at_edge = dwt_at_edge;
+  h->current.counter32_at_edge = counter32_at_edge;
+  h->current.ocxo_ns_at_edge = 0;
+  h->current.measured_ns_at_edge = 0;
+}
+
+static void alpha_ocxo_edge_history_record(time_clock_id_t clock,
+                                           uint32_t dwt_at_edge,
+                                           uint32_t counter32_at_edge,
+                                           uint64_t ocxo_ns_at_edge,
+                                           uint64_t measured_ns_at_edge,
+                                           bool sample_gnss_available,
+                                           uint64_t sample_gnss_ns_at_event,
+                                           bool boundary_gnss_available,
+                                           uint64_t boundary_gnss_ns_at_edge,
+                                           uint32_t sample_phase_ticks,
+                                           uint32_t phase_cycles) {
+  alpha_ocxo_edge_history_t* h = alpha_ocxo_edge_history(clock);
+  if (!h) return;
+
+  alpha_ocxo_edge_fact_t fact{};
+  fact.valid = true;
+  fact.dwt_at_edge = dwt_at_edge;
+  fact.counter32_at_edge = counter32_at_edge;
+  fact.ocxo_ns_at_edge = ocxo_ns_at_edge;
+  fact.measured_ns_at_edge = measured_ns_at_edge;
+  fact.sample_gnss_available = sample_gnss_available;
+  fact.sample_gnss_ns_at_event = sample_gnss_ns_at_event;
+  fact.boundary_gnss_available = boundary_gnss_available;
+  fact.boundary_gnss_ns_at_edge = boundary_gnss_ns_at_edge;
+  fact.sample_phase_ticks = sample_phase_ticks;
+  fact.phase_cycles = phase_cycles;
+
+  h->previous = h->current;
+  h->previous_valid = h->current_valid;
+  h->current = fact;
+  h->current_valid = true;
+  h->update_count++;
+}
+
+static uint32_t alpha_ocxo_latest_actual_interval_cycles(
+    time_clock_id_t clock,
+    uint32_t* out_completed_interval_count,
+    bool* out_static_prediction_valid) {
+  const alpha_static_prediction_store_t* s = alpha_static_prediction_store(clock);
+  if (!s) {
+    if (out_completed_interval_count) *out_completed_interval_count = 0;
+    if (out_static_prediction_valid) *out_static_prediction_valid = false;
+    return 0;
+  }
+
+  if (out_completed_interval_count) {
+    *out_completed_interval_count = s->completed_interval_count;
+  }
+  if (out_static_prediction_valid) {
+    *out_static_prediction_valid = s->valid;
+  }
+  return s->actual_cycles;
+}
+
+static void alpha_ocxo_pps_projection_set_invalid(
+    time_clock_id_t clock,
+    uint32_t reason,
+    uint32_t pps_sequence,
+    uint32_t pps_dwt_at_edge,
+    uint64_t pps_vclock_ns,
+    uint64_t existing_pps_ns) {
+  alpha_ocxo_pps_projection_store_t* s = alpha_ocxo_pps_projection_store(clock);
+  if (!s) return;
+
+  const uint32_t prior_update_count = s->v.update_count;
+  const uint32_t prior_compute_count = s->v.compute_count;
+  const uint32_t no_edge_count = s->v.invalid_no_edge_count;
+  const uint32_t no_interval_count = s->v.invalid_no_interval_count;
+  const uint32_t out_of_window_count = s->v.invalid_target_out_of_window_count;
+
+  clocks_alpha_ocxo_pps_projection_snapshot_t local{};
+  local.clock_id = (uint32_t)((uint8_t)clock);
+  local.update_count = prior_update_count + 1U;
+  local.compute_count = prior_compute_count + 1U;
+  local.invalid_no_edge_count = no_edge_count +
+      ((reason == ALPHA_OCXO_PPS_PROJECTION_INVALID_NO_EDGE) ? 1U : 0U);
+  local.invalid_no_interval_count = no_interval_count +
+      ((reason == ALPHA_OCXO_PPS_PROJECTION_INVALID_NO_INTERVAL) ? 1U : 0U);
+  local.invalid_target_out_of_window_count = out_of_window_count +
+      ((reason == ALPHA_OCXO_PPS_PROJECTION_INVALID_TARGET_OUT_OF_WINDOW) ? 1U : 0U);
+  local.valid = false;
+  local.source = ALPHA_OCXO_PPS_PROJECTION_SOURCE_NONE;
+  local.last_invalid_reason = reason;
+  local.pps_sequence = pps_sequence;
+  local.pps_dwt_at_edge = pps_dwt_at_edge;
+  local.pps_vclock_ns = pps_vclock_ns;
+  local.projected_minus_existing_pps_ns = 0;
+  local.projected_minus_vclock_ns = 0;
+
+  s->seq++;
+  clocks_alpha_dmb();
+  s->v = local;
+  clocks_alpha_dmb();
+  s->seq++;
+}
+
+static bool alpha_ocxo_pps_projection_build(
+    time_clock_id_t clock,
+    uint32_t source,
+    const alpha_ocxo_edge_fact_t& edge0,
+    const alpha_ocxo_edge_fact_t& edge1,
+    uint32_t interval_cycles,
+    uint32_t target_delta_cycles,
+    uint32_t pps_sequence,
+    uint32_t pps_dwt_at_edge,
+    uint64_t pps_vclock_ns,
+    uint64_t existing_pps_ns,
+    uint32_t latest_actual_interval_cycles,
+    uint32_t completed_interval_count,
+    bool static_prediction_valid) {
+  alpha_ocxo_pps_projection_store_t* s = alpha_ocxo_pps_projection_store(clock);
+  if (!s || interval_cycles == 0) return false;
+
+  const uint64_t interval_ocxo_ns = (edge1.ocxo_ns_at_edge >= edge0.ocxo_ns_at_edge)
+      ? (edge1.ocxo_ns_at_edge - edge0.ocxo_ns_at_edge)
+      : 0ULL;
+  if (interval_ocxo_ns == 0) return false;
+
+  const uint64_t projected_delta_ns =
+      ((uint64_t)target_delta_cycles * interval_ocxo_ns +
+       (uint64_t)interval_cycles / 2ULL) /
+      (uint64_t)interval_cycles;
+  const uint64_t projected_ns = edge0.ocxo_ns_at_edge + projected_delta_ns;
+
+  clocks_alpha_ocxo_pps_projection_snapshot_t local = s->v;
+  local.valid = true;
+  local.clock_id = (uint32_t)((uint8_t)clock);
+  local.update_count++;
+  local.compute_count++;
+  local.source = source;
+  local.last_invalid_reason = ALPHA_OCXO_PPS_PROJECTION_INVALID_NONE;
+  local.pps_sequence = pps_sequence;
+  local.pps_dwt_at_edge = pps_dwt_at_edge;
+  local.pps_vclock_ns = pps_vclock_ns;
+
+  local.edge0_dwt_at_edge = edge0.dwt_at_edge;
+  local.edge0_counter32_at_edge = edge0.counter32_at_edge;
+  local.edge0_ocxo_ns_at_edge = edge0.ocxo_ns_at_edge;
+  local.edge0_measured_ns_at_edge = edge0.measured_ns_at_edge;
+  local.edge0_sample_gnss_available = edge0.sample_gnss_available;
+  local.edge0_sample_gnss_ns_at_event = edge0.sample_gnss_ns_at_event;
+  local.edge0_boundary_gnss_available = edge0.boundary_gnss_available;
+  local.edge0_boundary_gnss_ns_at_edge = edge0.boundary_gnss_ns_at_edge;
+
+  local.edge1_dwt_at_edge = edge1.dwt_at_edge;
+  local.edge1_counter32_at_edge = edge1.counter32_at_edge;
+  local.edge1_ocxo_ns_at_edge = edge1.ocxo_ns_at_edge;
+  local.edge1_measured_ns_at_edge = edge1.measured_ns_at_edge;
+  local.edge1_sample_gnss_available = edge1.sample_gnss_available;
+  local.edge1_sample_gnss_ns_at_event = edge1.sample_gnss_ns_at_event;
+  local.edge1_boundary_gnss_available = edge1.boundary_gnss_available;
+  local.edge1_boundary_gnss_ns_at_edge = edge1.boundary_gnss_ns_at_edge;
+
+  local.interval_dwt_cycles = interval_cycles;
+  local.interval_ocxo_ns = interval_ocxo_ns;
+  local.target_delta_cycles = target_delta_cycles;
+  local.target_remaining_cycles = interval_cycles - target_delta_cycles;
+  local.projected_ocxo_ns_at_pps = projected_ns;
+  local.projected_minus_existing_pps_ns =
+      alpha_signed_delta_u64(projected_ns, existing_pps_ns);
+  local.projected_minus_vclock_ns =
+      alpha_signed_delta_u64(projected_ns, pps_vclock_ns);
+  local.latest_actual_interval_cycles = latest_actual_interval_cycles;
+  local.static_prediction_completed_interval_count = completed_interval_count;
+  local.static_prediction_valid = static_prediction_valid;
+
+  s->seq++;
+  clocks_alpha_dmb();
+  s->v = local;
+  clocks_alpha_dmb();
+  s->seq++;
+  return true;
+}
+
+static void alpha_ocxo_pps_projection_compute(time_clock_id_t clock,
+                                              uint32_t pps_sequence,
+                                              uint32_t pps_dwt_at_edge,
+                                              uint64_t pps_vclock_ns,
+                                              uint64_t existing_pps_ns) {
+  const alpha_ocxo_edge_history_t* h = alpha_ocxo_edge_history(clock);
+  if (!h || !h->current_valid) {
+    alpha_ocxo_pps_projection_set_invalid(
+        clock, ALPHA_OCXO_PPS_PROJECTION_INVALID_NO_EDGE,
+        pps_sequence, pps_dwt_at_edge, pps_vclock_ns, existing_pps_ns);
+    return;
+  }
+
+  uint32_t completed_interval_count = 0;
+  bool static_prediction_valid = false;
+  const uint32_t latest_actual_interval_cycles =
+      alpha_ocxo_latest_actual_interval_cycles(
+          clock, &completed_interval_count, &static_prediction_valid);
+
+  // Prefer an actual bracketing pair when the latest OCXO event has already
+  // arrived after this PPS edge.  Otherwise use the latest edge plus the
+  // static next-edge DWT projection.
+  if (h->previous_valid && h->previous.valid && h->current.valid) {
+    const uint32_t actual_interval =
+        h->current.dwt_at_edge - h->previous.dwt_at_edge;
+    const uint32_t target_delta = pps_dwt_at_edge - h->previous.dwt_at_edge;
+    if (actual_interval != 0 && target_delta <= actual_interval) {
+      if (alpha_ocxo_pps_projection_build(
+              clock, ALPHA_OCXO_PPS_PROJECTION_SOURCE_ACTUAL_BRACKET,
+              h->previous, h->current, actual_interval, target_delta,
+              pps_sequence, pps_dwt_at_edge, pps_vclock_ns, existing_pps_ns,
+              latest_actual_interval_cycles, completed_interval_count,
+              static_prediction_valid)) {
+        return;
+      }
+    }
+  }
+
+  if (latest_actual_interval_cycles == 0) {
+    alpha_ocxo_pps_projection_set_invalid(
+        clock, ALPHA_OCXO_PPS_PROJECTION_INVALID_NO_INTERVAL,
+        pps_sequence, pps_dwt_at_edge, pps_vclock_ns, existing_pps_ns);
+    return;
+  }
+
+  const uint32_t target_delta = pps_dwt_at_edge - h->current.dwt_at_edge;
+  if (target_delta > latest_actual_interval_cycles) {
+    alpha_ocxo_pps_projection_set_invalid(
+        clock, ALPHA_OCXO_PPS_PROJECTION_INVALID_TARGET_OUT_OF_WINDOW,
+        pps_sequence, pps_dwt_at_edge, pps_vclock_ns, existing_pps_ns);
+    return;
+  }
+
+  alpha_ocxo_edge_fact_t projected_next = h->current;
+  projected_next.dwt_at_edge = h->current.dwt_at_edge + latest_actual_interval_cycles;
+  projected_next.counter32_at_edge =
+      h->current.counter32_at_edge + (uint32_t)VCLOCK_COUNTS_PER_SECOND;
+  projected_next.ocxo_ns_at_edge = h->current.ocxo_ns_at_edge + NS_PER_SECOND_U64;
+  // This edge is a projection, not an observed Alpha measured-ledger edge.
+  projected_next.measured_ns_at_edge = 0;
+  projected_next.sample_gnss_available = false;
+  projected_next.sample_gnss_ns_at_event = 0;
+  projected_next.boundary_gnss_available = false;
+  projected_next.boundary_gnss_ns_at_edge = 0;
+
+  if (!alpha_ocxo_pps_projection_build(
+          clock, ALPHA_OCXO_PPS_PROJECTION_SOURCE_STATIC_NEXT_EDGE,
+          h->current, projected_next, latest_actual_interval_cycles,
+          target_delta, pps_sequence, pps_dwt_at_edge, pps_vclock_ns,
+          existing_pps_ns, latest_actual_interval_cycles,
+          completed_interval_count, static_prediction_valid)) {
+    alpha_ocxo_pps_projection_set_invalid(
+        clock, ALPHA_OCXO_PPS_PROJECTION_INVALID_NO_INTERVAL,
+        pps_sequence, pps_dwt_at_edge, pps_vclock_ns, existing_pps_ns);
+  }
+}
+
+bool clocks_alpha_ocxo_pps_projection_snapshot(
+    time_clock_id_t clock,
+    clocks_alpha_ocxo_pps_projection_snapshot_t* out) {
+  if (!out) return false;
+  alpha_ocxo_pps_projection_store_t* s = alpha_ocxo_pps_projection_store(clock);
+  if (!s) return false;
+
+  for (int attempt = 0; attempt < 4; attempt++) {
+    const uint32_t seq1 = s->seq;
+    clocks_alpha_dmb();
+    clocks_alpha_ocxo_pps_projection_snapshot_t local = s->v;
+    clocks_alpha_dmb();
+    const uint32_t seq2 = s->seq;
+    if (seq1 == seq2 && (seq1 & 1u) == 0u) {
+      *out = local;
+      return local.valid;
+    }
+  }
+
+  *out = clocks_alpha_ocxo_pps_projection_snapshot_t{};
+  return false;
+}
+
 static alpha_lane_forensics_store_t* alpha_forensics_store(time_clock_id_t clock) {
   switch (clock) {
     case time_clock_id_t::VCLOCK: return &g_vclock_forensics;
@@ -2114,6 +2494,7 @@ static void alpha_reset_canonical_clock_state_for_new_epoch(void) {
   alpha_forensics_reset_all();
   alpha_ticks64_reset_all();
   alpha_measured_ns_reset_all();
+  alpha_ocxo_pps_projection_reset_all();
   clocks_static_prediction_reset_all();
 
   dwt_cycle_count_total = 0;
@@ -2243,6 +2624,13 @@ bool clocks_alpha_zero_from_smartzero(const char* reason) {
   g_ocxo2_measured_ns.initialized = true;
   g_ocxo2_measured_ns.ns_at_edge = 0;
   g_ocxo2_measured_ns.dwt_at_edge = ocxo2.anchor_dwt;
+
+  alpha_ocxo_edge_history_install_zero(time_clock_id_t::OCXO1,
+                                       ocxo1.anchor_dwt,
+                                       ocxo1.anchor_counter32);
+  alpha_ocxo_edge_history_install_zero(time_clock_id_t::OCXO2,
+                                       ocxo2.anchor_dwt,
+                                       ocxo2.anchor_counter32);
 
   clock_mark_epoch_zero(g_vclock_clock);
   clock_mark_epoch_zero(g_ocxo1_clock);
@@ -2452,6 +2840,39 @@ static void clocks_apply_epoch_counter_edge(clock_state_t& clock,
                                               &residual_fast_ns);
     alpha_event_flow_note_measured(time_clock, measured_dwt_cycles,
                                    real_interval_ns, residual_fast_ns, ns_now);
+
+    const bool sample_gnss_available = (event.gnss_ns_at_event != 0);
+    const uint64_t sample_gnss_ns_at_event = sample_gnss_available
+        ? event.gnss_ns_at_event
+        : 0ULL;
+    uint64_t boundary_gnss_ns_at_edge = 0;
+    bool boundary_gnss_available = false;
+    if (sample_gnss_available) {
+      const uint32_t dwt_per_second =
+          dwt_effective_cycles_per_pps_vclock_second();
+      if (dwt_per_second != 0) {
+        const uint64_t phase_ns =
+            ((uint64_t)phase_cycles * NS_PER_SECOND_U64 +
+             (uint64_t)dwt_per_second / 2ULL) /
+            (uint64_t)dwt_per_second;
+        if (sample_gnss_ns_at_event >= phase_ns) {
+          boundary_gnss_ns_at_edge = sample_gnss_ns_at_event - phase_ns;
+          boundary_gnss_available = true;
+        }
+      }
+    }
+
+    alpha_ocxo_edge_history_record(time_clock,
+                                   applied_event.dwt_at_event,
+                                   applied_event.counter32_at_event,
+                                   counter_ns_now,
+                                   ns_now,
+                                   sample_gnss_available,
+                                   sample_gnss_ns_at_event,
+                                   boundary_gnss_available,
+                                   boundary_gnss_ns_at_edge,
+                                   phase_ticks,
+                                   phase_cycles);
 
     dwt_cycles_between_edges = measured_dwt_cycles;
     gnss_ns_between_edges = real_interval_ns;
@@ -2670,6 +3091,17 @@ static bool alpha_sample_all_clocks_at_pps_vclock(const pps_edge_snapshot_t& sna
   const uint64_t ocxo2_ns =
       alpha_ocxo_project_measured_ns_to_dwt(time_clock_id_t::OCXO2,
                                             snap.dwt_at_edge);
+
+  alpha_ocxo_pps_projection_compute(time_clock_id_t::OCXO1,
+                                    snap.sequence,
+                                    snap.dwt_at_edge,
+                                    vclock_ns,
+                                    ocxo1_ns);
+  alpha_ocxo_pps_projection_compute(time_clock_id_t::OCXO2,
+                                    snap.sequence,
+                                    snap.dwt_at_edge,
+                                    vclock_ns,
+                                    ocxo2_ns);
 
   g_gnss_ns_at_pps_vclock = vclock_ns;
   g_ocxo1_measured_gnss_ns_at_pps_vclock = ocxo1_ns;

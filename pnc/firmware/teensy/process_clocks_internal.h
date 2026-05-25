@@ -467,6 +467,67 @@ bool clocks_alpha_event_flow_snapshot(time_clock_id_t clock,
                                       clocks_alpha_event_flow_snapshot_t* out);
 
 // ============================================================================
+// Alpha OCXO PPS-edge projection forensics
+// ============================================================================
+//
+// Step A report-only surface for the coming PPS-founded OCXO nanosecond clock
+// standard.  Alpha computes what the OCXO clock value would be at the current
+// PPS/VCLOCK DWT coordinate from OCXO edge facts, but does not yet promote
+// that value into g_ocxo*_measured_gnss_ns_at_pps_vclock or TIMEBASE.
+
+struct clocks_alpha_ocxo_pps_projection_snapshot_t {
+  bool     valid;
+  uint32_t clock_id;
+  uint32_t update_count;
+  uint32_t compute_count;
+  uint32_t invalid_no_edge_count;
+  uint32_t invalid_no_interval_count;
+  uint32_t invalid_target_out_of_window_count;
+
+  // 0=NONE, 1=ACTUAL_BRACKET, 2=STATIC_NEXT_EDGE.
+  uint32_t source;
+  uint32_t last_invalid_reason;
+
+  uint32_t pps_sequence;
+  uint32_t pps_dwt_at_edge;
+  uint64_t pps_vclock_ns;
+
+  uint32_t edge0_dwt_at_edge;
+  uint32_t edge0_counter32_at_edge;
+  uint64_t edge0_ocxo_ns_at_edge;
+  uint64_t edge0_measured_ns_at_edge;
+  bool     edge0_sample_gnss_available;
+  uint64_t edge0_sample_gnss_ns_at_event;
+  bool     edge0_boundary_gnss_available;
+  uint64_t edge0_boundary_gnss_ns_at_edge;
+
+  uint32_t edge1_dwt_at_edge;
+  uint32_t edge1_counter32_at_edge;
+  uint64_t edge1_ocxo_ns_at_edge;
+  uint64_t edge1_measured_ns_at_edge;
+  bool     edge1_sample_gnss_available;
+  uint64_t edge1_sample_gnss_ns_at_event;
+  bool     edge1_boundary_gnss_available;
+  uint64_t edge1_boundary_gnss_ns_at_edge;
+
+  uint32_t interval_dwt_cycles;
+  uint64_t interval_ocxo_ns;
+  uint32_t target_delta_cycles;
+  uint32_t target_remaining_cycles;
+  uint64_t projected_ocxo_ns_at_pps;
+  int64_t  projected_minus_existing_pps_ns;
+  int64_t  projected_minus_vclock_ns;
+
+  uint32_t latest_actual_interval_cycles;
+  uint32_t static_prediction_completed_interval_count;
+  bool     static_prediction_valid;
+};
+
+bool clocks_alpha_ocxo_pps_projection_snapshot(
+    time_clock_id_t clock,
+    clocks_alpha_ocxo_pps_projection_snapshot_t* out);
+
+// ============================================================================
 // Last-known interrupt diagnostics (alpha-owned, beta-readable)
 // ============================================================================
 

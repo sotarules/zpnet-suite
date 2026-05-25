@@ -2668,10 +2668,112 @@ static void payload_add_alpha_flow_lane(Payload& parent,
   parent.add_object(key, p);
 }
 
+static const char* ocxo_pps_projection_source_name(uint32_t source) {
+  switch (source) {
+    case 1: return "ACTUAL_BRACKET";
+    case 2: return "STATIC_NEXT_EDGE";
+    default: return "NONE";
+  }
+}
+
+static const char* ocxo_pps_projection_invalid_reason_name(uint32_t reason) {
+  switch (reason) {
+    case 1: return "NO_EDGE";
+    case 2: return "NO_INTERVAL";
+    case 3: return "TARGET_OUT_OF_WINDOW";
+    default: return "NONE";
+  }
+}
+
+static void payload_add_ocxo_pps_projection_lane(Payload& parent,
+                                                 const char* key,
+                                                 time_clock_id_t clock) {
+  clocks_alpha_ocxo_pps_projection_snapshot_t s{};
+  const bool ok = clocks_alpha_ocxo_pps_projection_snapshot(clock, &s);
+
+  Payload lane;
+  lane.add("snapshot_ok", ok);
+  lane.add("valid", s.valid);
+  lane.add("clock_id", s.clock_id);
+  lane.add("source", s.source);
+  lane.add("source_name", ocxo_pps_projection_source_name(s.source));
+  lane.add("last_invalid_reason", s.last_invalid_reason);
+  lane.add("last_invalid_reason_name",
+           ocxo_pps_projection_invalid_reason_name(s.last_invalid_reason));
+
+  Payload counters;
+  counters.add("update_count", s.update_count);
+  counters.add("compute_count", s.compute_count);
+  counters.add("invalid_no_edge_count", s.invalid_no_edge_count);
+  counters.add("invalid_no_interval_count", s.invalid_no_interval_count);
+  counters.add("invalid_target_out_of_window_count",
+               s.invalid_target_out_of_window_count);
+  lane.add_object("counters", counters);
+
+  Payload pps;
+  pps.add("sequence", s.pps_sequence);
+  pps.add("dwt_at_edge", s.pps_dwt_at_edge);
+  pps.add("vclock_ns", s.pps_vclock_ns);
+  lane.add_object("pps", pps);
+
+  Payload edge0;
+  edge0.add("dwt_at_edge", s.edge0_dwt_at_edge);
+  edge0.add("counter32_at_edge", s.edge0_counter32_at_edge);
+  edge0.add("ocxo_ns_at_edge", s.edge0_ocxo_ns_at_edge);
+  edge0.add("measured_ns_at_edge", s.edge0_measured_ns_at_edge);
+  edge0.add("sample_gnss_available", s.edge0_sample_gnss_available);
+  edge0.add("sample_gnss_ns_at_event", s.edge0_sample_gnss_ns_at_event);
+  edge0.add("boundary_gnss_available", s.edge0_boundary_gnss_available);
+  edge0.add("boundary_gnss_ns_at_edge", s.edge0_boundary_gnss_ns_at_edge);
+  lane.add_object("edge0", edge0);
+
+  Payload edge1;
+  edge1.add("dwt_at_edge", s.edge1_dwt_at_edge);
+  edge1.add("counter32_at_edge", s.edge1_counter32_at_edge);
+  edge1.add("ocxo_ns_at_edge", s.edge1_ocxo_ns_at_edge);
+  edge1.add("measured_ns_at_edge", s.edge1_measured_ns_at_edge);
+  edge1.add("sample_gnss_available", s.edge1_sample_gnss_available);
+  edge1.add("sample_gnss_ns_at_event", s.edge1_sample_gnss_ns_at_event);
+  edge1.add("boundary_gnss_available", s.edge1_boundary_gnss_available);
+  edge1.add("boundary_gnss_ns_at_edge", s.edge1_boundary_gnss_ns_at_edge);
+  lane.add_object("edge1", edge1);
+
+  Payload projection;
+  projection.add("interval_dwt_cycles", s.interval_dwt_cycles);
+  projection.add("interval_ocxo_ns", s.interval_ocxo_ns);
+  projection.add("target_delta_cycles", s.target_delta_cycles);
+  projection.add("target_remaining_cycles", s.target_remaining_cycles);
+  projection.add("projected_ocxo_ns_at_pps", s.projected_ocxo_ns_at_pps);
+  projection.add("projected_minus_existing_pps_ns",
+                 s.projected_minus_existing_pps_ns);
+  projection.add("projected_minus_vclock_ns", s.projected_minus_vclock_ns);
+  lane.add_object("projection", projection);
+
+  Payload static_prediction;
+  static_prediction.add("latest_actual_interval_cycles",
+                        s.latest_actual_interval_cycles);
+  static_prediction.add("completed_interval_count",
+                        s.static_prediction_completed_interval_count);
+  static_prediction.add("valid", s.static_prediction_valid);
+  lane.add_object("static_prediction", static_prediction);
+
+  parent.add_object(key, lane);
+}
+
+static Payload cmd_report_ocxo_pps_projection(const Payload&) {
+  Payload p;
+  p.add("report", "CLOCKS_OCXO_PPS_PROJECTION");
+  p.add("description",
+        "Report-only Alpha projection of OCXO clock ns to the PPS/VCLOCK DWT edge; not TIMEBASE authority yet");
+  payload_add_ocxo_pps_projection_lane(p, "ocxo1", time_clock_id_t::OCXO1);
+  payload_add_ocxo_pps_projection_lane(p, "ocxo2", time_clock_id_t::OCXO2);
+  return p;
+}
+
 static Payload cmd_report(const Payload&) {
   Payload p;
   p.add("report", "CLOCKS_COMPACT");
-  p.add("subreports", "REPORT_STATUS REPORT_SUMMARY REPORT_EPOCH REPORT_SMARTZERO REPORT_INSTALLED_SMARTZERO REPORT_LIVE_SMARTZERO REPORT_FORENSICS REPORT_FORENSICS_VCLOCK REPORT_FORENSICS_OCXO1 REPORT_FORENSICS_OCXO2 REPORT_ALPHA_FLOW REPORT_ALPHA_FLOW_VCLOCK REPORT_ALPHA_FLOW_OCXO1 REPORT_ALPHA_FLOW_OCXO2 REPORT_PREDICTION REPORT_STATS REPORT_DAC");
+  p.add("subreports", "REPORT_STATUS REPORT_SUMMARY REPORT_EPOCH REPORT_SMARTZERO REPORT_INSTALLED_SMARTZERO REPORT_LIVE_SMARTZERO REPORT_FORENSICS REPORT_FORENSICS_VCLOCK REPORT_FORENSICS_OCXO1 REPORT_FORENSICS_OCXO2 REPORT_OCXO_PPS_PROJECTION REPORT_ALPHA_FLOW REPORT_ALPHA_FLOW_VCLOCK REPORT_ALPHA_FLOW_OCXO1 REPORT_ALPHA_FLOW_OCXO2 REPORT_PREDICTION REPORT_STATS REPORT_DAC");
   add_summary_payload(p);
   add_campaign_payload(p);
 
@@ -2912,6 +3014,7 @@ static const process_command_entry_t CLOCKS_COMMANDS[] = {
   { "REPORT_FORENSICS_VCLOCK", cmd_report_forensics_vclock },
   { "REPORT_FORENSICS_OCXO1",  cmd_report_forensics_ocxo1  },
   { "REPORT_FORENSICS_OCXO2",  cmd_report_forensics_ocxo2  },
+  { "REPORT_OCXO_PPS_PROJECTION", cmd_report_ocxo_pps_projection },
   { "REPORT_ALPHA_FLOW",       cmd_report_alpha_flow       },
   { "REPORT_ALPHA_FLOW_VCLOCK", cmd_report_alpha_flow_vclock },
   { "REPORT_ALPHA_FLOW_OCXO1",  cmd_report_alpha_flow_ocxo1  },
