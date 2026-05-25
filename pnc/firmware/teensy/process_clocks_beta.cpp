@@ -104,6 +104,120 @@ extern volatile uint32_t g_pps_dwt_cycles_between_edges;
 extern volatile bool     g_pps_dwt_cycles_between_edges_valid;
 
 // ============================================================================
+// TIMEBASE publication-tail diagnostics
+// ============================================================================
+//
+// Report-only flight recorder for the PPS -> Alpha -> Beta -> publish tail.
+// These counters deliberately do not change TIMEBASE_FRAGMENT shape or publish
+// behavior. They make it possible to distinguish whether Beta returned through
+// an early gate, reached per-second campaign work, stopped during fragment
+// construction, or called publish("TIMEBASE_FRAGMENT", p) and returned.
+//
+// Focused report: CLOCKS.REPORT_TIMEBASE_PUBLISH
+
+static constexpr uint32_t TIMEBASE_BUILD_STAGE_NONE = 0;
+static constexpr uint32_t TIMEBASE_BUILD_STAGE_ENTRY = 1;
+static constexpr uint32_t TIMEBASE_BUILD_STAGE_STOP_GATE = 2;
+static constexpr uint32_t TIMEBASE_BUILD_STAGE_START_ZERO_GATE = 3;
+static constexpr uint32_t TIMEBASE_BUILD_STAGE_RECOVER_GATE = 4;
+static constexpr uint32_t TIMEBASE_BUILD_STAGE_WATCHDOG_GATE = 5;
+static constexpr uint32_t TIMEBASE_BUILD_STAGE_NOT_STARTED_GATE = 6;
+static constexpr uint32_t TIMEBASE_BUILD_STAGE_WARMUP_GATE = 7;
+static constexpr uint32_t TIMEBASE_BUILD_STAGE_CANDIDATE = 8;
+static constexpr uint32_t TIMEBASE_BUILD_STAGE_PER_SECOND = 9;
+static constexpr uint32_t TIMEBASE_BUILD_STAGE_WELFORD = 10;
+static constexpr uint32_t TIMEBASE_BUILD_STAGE_SERVO = 11;
+static constexpr uint32_t TIMEBASE_BUILD_STAGE_DAC_WELFORD = 12;
+static constexpr uint32_t TIMEBASE_BUILD_STAGE_BUILD_BEGIN = 20;
+static constexpr uint32_t TIMEBASE_BUILD_STAGE_SPINE = 21;
+static constexpr uint32_t TIMEBASE_BUILD_STAGE_GNSS = 22;
+static constexpr uint32_t TIMEBASE_BUILD_STAGE_ENVIRONMENTAL = 23;
+static constexpr uint32_t TIMEBASE_BUILD_STAGE_DWT = 24;
+static constexpr uint32_t TIMEBASE_BUILD_STAGE_PPS = 25;
+static constexpr uint32_t TIMEBASE_BUILD_STAGE_PREDICTION = 26;
+static constexpr uint32_t TIMEBASE_BUILD_STAGE_VCLOCK = 27;
+static constexpr uint32_t TIMEBASE_BUILD_STAGE_OCXO1 = 28;
+static constexpr uint32_t TIMEBASE_BUILD_STAGE_OCXO2 = 29;
+static constexpr uint32_t TIMEBASE_BUILD_STAGE_DAC = 30;
+static constexpr uint32_t TIMEBASE_BUILD_STAGE_STATS = 31;
+static constexpr uint32_t TIMEBASE_BUILD_STAGE_BUILD_COMPLETE = 32;
+static constexpr uint32_t TIMEBASE_BUILD_STAGE_ASSIGN_LAST_FRAGMENT = 33;
+static constexpr uint32_t TIMEBASE_BUILD_STAGE_PUBLISH_ATTEMPT = 34;
+static constexpr uint32_t TIMEBASE_BUILD_STAGE_PUBLISH_RETURN = 35;
+
+static uint32_t g_timebase_pps_entry_count = 0;
+static uint32_t g_timebase_stop_gate_count = 0;
+static uint32_t g_timebase_start_zero_gate_count = 0;
+static uint32_t g_timebase_recover_gate_count = 0;
+static uint32_t g_timebase_watchdog_gate_count = 0;
+static uint32_t g_timebase_not_started_gate_count = 0;
+static uint32_t g_timebase_warmup_suppressed_count = 0;
+static uint32_t g_timebase_candidate_count = 0;
+static uint32_t g_timebase_per_second_count = 0;
+static uint32_t g_timebase_build_begin_count = 0;
+static uint32_t g_timebase_build_complete_count = 0;
+static uint32_t g_timebase_assign_last_fragment_count = 0;
+static uint32_t g_timebase_publish_attempt_count = 0;
+static uint32_t g_timebase_publish_return_count = 0;
+
+static uint32_t g_timebase_last_stage = TIMEBASE_BUILD_STAGE_NONE;
+static uint64_t g_timebase_last_entry_campaign_seconds = 0;
+static uint64_t g_timebase_last_candidate_campaign_seconds = 0;
+static uint64_t g_timebase_last_per_second_campaign_seconds = 0;
+static uint64_t g_timebase_last_build_begin_campaign_seconds = 0;
+static uint64_t g_timebase_last_build_complete_campaign_seconds = 0;
+static uint64_t g_timebase_last_assign_campaign_seconds = 0;
+static uint64_t g_timebase_last_publish_attempt_campaign_seconds = 0;
+static uint64_t g_timebase_last_publish_return_campaign_seconds = 0;
+static uint32_t g_timebase_last_public_count = 0;
+static uint64_t g_timebase_last_public_gnss_ns = 0;
+static uint64_t g_timebase_last_public_dwt_total = 0;
+static uint64_t g_timebase_last_public_ocxo1_ns = 0;
+static uint64_t g_timebase_last_public_ocxo2_ns = 0;
+static bool     g_timebase_last_ocxo1_pps_projected = false;
+static bool     g_timebase_last_ocxo2_pps_projected = false;
+static bool     g_timebase_last_ocxo1_pps_residual_valid = false;
+static bool     g_timebase_last_ocxo2_pps_residual_valid = false;
+
+static const char* timebase_build_stage_name(uint32_t stage) {
+  switch (stage) {
+    case TIMEBASE_BUILD_STAGE_ENTRY: return "ENTRY";
+    case TIMEBASE_BUILD_STAGE_STOP_GATE: return "STOP_GATE";
+    case TIMEBASE_BUILD_STAGE_START_ZERO_GATE: return "START_ZERO_GATE";
+    case TIMEBASE_BUILD_STAGE_RECOVER_GATE: return "RECOVER_GATE";
+    case TIMEBASE_BUILD_STAGE_WATCHDOG_GATE: return "WATCHDOG_GATE";
+    case TIMEBASE_BUILD_STAGE_NOT_STARTED_GATE: return "NOT_STARTED_GATE";
+    case TIMEBASE_BUILD_STAGE_WARMUP_GATE: return "WARMUP_GATE";
+    case TIMEBASE_BUILD_STAGE_CANDIDATE: return "CANDIDATE";
+    case TIMEBASE_BUILD_STAGE_PER_SECOND: return "PER_SECOND";
+    case TIMEBASE_BUILD_STAGE_WELFORD: return "WELFORD";
+    case TIMEBASE_BUILD_STAGE_SERVO: return "SERVO";
+    case TIMEBASE_BUILD_STAGE_DAC_WELFORD: return "DAC_WELFORD";
+    case TIMEBASE_BUILD_STAGE_BUILD_BEGIN: return "BUILD_BEGIN";
+    case TIMEBASE_BUILD_STAGE_SPINE: return "SPINE";
+    case TIMEBASE_BUILD_STAGE_GNSS: return "GNSS";
+    case TIMEBASE_BUILD_STAGE_ENVIRONMENTAL: return "ENVIRONMENTAL";
+    case TIMEBASE_BUILD_STAGE_DWT: return "DWT";
+    case TIMEBASE_BUILD_STAGE_PPS: return "PPS";
+    case TIMEBASE_BUILD_STAGE_PREDICTION: return "PREDICTION";
+    case TIMEBASE_BUILD_STAGE_VCLOCK: return "VCLOCK";
+    case TIMEBASE_BUILD_STAGE_OCXO1: return "OCXO1";
+    case TIMEBASE_BUILD_STAGE_OCXO2: return "OCXO2";
+    case TIMEBASE_BUILD_STAGE_DAC: return "DAC";
+    case TIMEBASE_BUILD_STAGE_STATS: return "STATS";
+    case TIMEBASE_BUILD_STAGE_BUILD_COMPLETE: return "BUILD_COMPLETE";
+    case TIMEBASE_BUILD_STAGE_ASSIGN_LAST_FRAGMENT: return "ASSIGN_LAST_FRAGMENT";
+    case TIMEBASE_BUILD_STAGE_PUBLISH_ATTEMPT: return "PUBLISH_ATTEMPT";
+    case TIMEBASE_BUILD_STAGE_PUBLISH_RETURN: return "PUBLISH_RETURN";
+    default: return "NONE";
+  }
+}
+
+static void timebase_build_stage(uint32_t stage) {
+  g_timebase_last_stage = stage;
+}
+
+// ============================================================================
 // Campaign warmup suppression
 // ============================================================================
 //
@@ -1900,7 +2014,13 @@ static bool clocks_try_finish_pending_smartzero(void) {
 // ============================================================================
 
 void clocks_beta_pps(void) {
+  g_timebase_pps_entry_count++;
+  g_timebase_last_entry_campaign_seconds = campaign_seconds;
+  timebase_build_stage(TIMEBASE_BUILD_STAGE_ENTRY);
+
   if (request_stop) {
+    g_timebase_stop_gate_count++;
+    timebase_build_stage(TIMEBASE_BUILD_STAGE_STOP_GATE);
     const bool was_started = (campaign_state == clocks_campaign_state_t::STARTED);
     watchdog_anomaly_active = false;
     campaign_state = clocks_campaign_state_t::STOPPED;
@@ -1916,11 +2036,15 @@ void clocks_beta_pps(void) {
   }
 
   if (request_start || request_zero) {
+    g_timebase_start_zero_gate_count++;
+    timebase_build_stage(TIMEBASE_BUILD_STAGE_START_ZERO_GATE);
     (void)clocks_try_finish_pending_smartzero();
     return;
   }
 
   if (request_recover) {
+    g_timebase_recover_gate_count++;
+    timebase_build_stage(TIMEBASE_BUILD_STAGE_RECOVER_GATE);
     watchdog_anomaly_active = false;
     request_zero = false;
     ocxo_dac_pacing_abort_all();
@@ -1939,8 +2063,16 @@ void clocks_beta_pps(void) {
     return;
   }
 
-  if (watchdog_anomaly_active) return;
-  if (campaign_state != clocks_campaign_state_t::STARTED) return;
+  if (watchdog_anomaly_active) {
+    g_timebase_watchdog_gate_count++;
+    timebase_build_stage(TIMEBASE_BUILD_STAGE_WATCHDOG_GATE);
+    return;
+  }
+  if (campaign_state != clocks_campaign_state_t::STARTED) {
+    g_timebase_not_started_gate_count++;
+    timebase_build_stage(TIMEBASE_BUILD_STAGE_NOT_STARTED_GATE);
+    return;
+  }
 
   // ── Warmup suppression ──
   //
@@ -1949,11 +2081,20 @@ void clocks_beta_pps(void) {
   // rows.  START hides these seconds completely; RECOVER counts them as
   // deliberate canonical gaps.
   if (campaign_warmup_consume_one_candidate_record()) {
+    g_timebase_warmup_suppressed_count++;
+    timebase_build_stage(TIMEBASE_BUILD_STAGE_WARMUP_GATE);
     return;
   }
 
+  g_timebase_candidate_count++;
+  g_timebase_last_candidate_campaign_seconds = campaign_seconds;
+  timebase_build_stage(TIMEBASE_BUILD_STAGE_CANDIDATE);
+
   // ── Per-second campaign work ──
   campaign_seconds++;
+  g_timebase_per_second_count++;
+  g_timebase_last_per_second_campaign_seconds = campaign_seconds;
+  timebase_build_stage(TIMEBASE_BUILD_STAGE_PER_SECOND);
 
   dwt_cycle_count_total = campaign_public_dwt_total();
   gnss_raw_64           = campaign_public_gnss_ns() / 100ull;
@@ -2093,15 +2234,32 @@ void clocks_beta_pps(void) {
                           welford_ocxo2,
                           g_now_window_ocxo2);
 
+  timebase_build_stage(TIMEBASE_BUILD_STAGE_WELFORD);
+
   // Servo runs AFTER PPS-founded residual/Welford updates so it sees this
   // second's public TIMEBASE residual sample.
   ocxo_calibration_servo();
+  timebase_build_stage(TIMEBASE_BUILD_STAGE_SERVO);
 
   // DAC Welfords — track servo effort (the TEMPEST signal).
   welford_update(welford_ocxo1_dac, ocxo1_dac.dac_fractional);
   welford_update(welford_ocxo2_dac, ocxo2_dac.dac_fractional);
+  timebase_build_stage(TIMEBASE_BUILD_STAGE_DAC_WELFORD);
 
   // ── Build TIMEBASE_FRAGMENT ──
+  g_timebase_build_begin_count++;
+  g_timebase_last_build_begin_campaign_seconds = campaign_seconds;
+  g_timebase_last_public_count = public_count;
+  g_timebase_last_public_gnss_ns = public_gnss_ns;
+  g_timebase_last_public_dwt_total = public_dwt_total;
+  g_timebase_last_public_ocxo1_ns = public_ocxo1_ns;
+  g_timebase_last_public_ocxo2_ns = public_ocxo2_ns;
+  g_timebase_last_ocxo1_pps_projected = ocxo1_pps_projected_valid;
+  g_timebase_last_ocxo2_pps_projected = ocxo2_pps_projected_valid;
+  g_timebase_last_ocxo1_pps_residual_valid = pps_residuals.ocxo1_valid;
+  g_timebase_last_ocxo2_pps_residual_valid = pps_residuals.ocxo2_valid;
+  timebase_build_stage(TIMEBASE_BUILD_STAGE_BUILD_BEGIN);
+
   Payload p;
   p.add("schema", "TIMEBASE_FRAGMENT_V2");
   p.add("fragment_version", 2U);
@@ -2119,8 +2277,10 @@ void clocks_beta_pps(void) {
   p.add("counter32_at_pps_vclock", (uint32_t)g_counter32_at_pps_vclock);
   p.add("pps_dwt_at_edge",         (uint32_t)g_pps_dwt_at_edge);
   p.add("pps_vclock_phase_cycles", (int32_t)g_pps_vclock_phase_cycles);
+  timebase_build_stage(TIMEBASE_BUILD_STAGE_SPINE);
 
   {
+    timebase_build_stage(TIMEBASE_BUILD_STAGE_GNSS);
     Payload gnss;
     gnss.add("ns", public_gnss_ns);
     gnss.add("pps_ns", public_gnss_ns);
@@ -2134,6 +2294,7 @@ void clocks_beta_pps(void) {
   }
 
   {
+    timebase_build_stage(TIMEBASE_BUILD_STAGE_ENVIRONMENTAL);
     Payload environmental;
     environmental.add("calibrate_ocxo", servo_mode_str(calibrate_ocxo_mode));
     environmental.add("ad5693r_init_ok", g_ad5693r_init_ok);
@@ -2141,6 +2302,7 @@ void clocks_beta_pps(void) {
   }
 
   {
+    timebase_build_stage(TIMEBASE_BUILD_STAGE_DWT);
     Payload dwt;
     dwt.add("cycle_count_total", public_dwt_total);
     dwt.add("ns", public_dwt_ns);
@@ -2154,6 +2316,7 @@ void clocks_beta_pps(void) {
   }
 
   {
+    timebase_build_stage(TIMEBASE_BUILD_STAGE_PPS);
     Payload pps;
     pps.add("count", public_count);
     pps.add("dwt_at_edge", (uint32_t)g_pps_dwt_at_edge);
@@ -2170,13 +2333,16 @@ void clocks_beta_pps(void) {
   // Prediction remains an intentionally separate four-rail courtroom surface.
   // Clock objects below carry live measurement and diagnostics, but not their
   // static-prediction fields.
+  timebase_build_stage(TIMEBASE_BUILD_STAGE_PREDICTION);
   payload_add_prediction_summary_hierarchical(p);
 
+  timebase_build_stage(TIMEBASE_BUILD_STAGE_VCLOCK);
   payload_add_vclock_fragment(p,
                               public_gnss_ns,
                               vclock_forensics_valid,
                               vclock_forensics);
 
+  timebase_build_stage(TIMEBASE_BUILD_STAGE_OCXO1);
   payload_add_ocxo_fragment(p,
                             "ocxo1",
                             public_ocxo1_ns,
@@ -2193,6 +2359,7 @@ void clocks_beta_pps(void) {
                             pps_residuals.ocxo1_interval_ns,
                             pps_residuals.ocxo1_fast_residual_ns);
 
+  timebase_build_stage(TIMEBASE_BUILD_STAGE_OCXO2);
   payload_add_ocxo_fragment(p,
                             "ocxo2",
                             public_ocxo2_ns,
@@ -2209,11 +2376,28 @@ void clocks_beta_pps(void) {
                             pps_residuals.ocxo2_interval_ns,
                             pps_residuals.ocxo2_fast_residual_ns);
 
+  timebase_build_stage(TIMEBASE_BUILD_STAGE_DAC);
   payload_add_dac_summary_hierarchical(p);
+  timebase_build_stage(TIMEBASE_BUILD_STAGE_STATS);
   payload_add_stats_summary_hierarchical(p);
 
+  g_timebase_build_complete_count++;
+  g_timebase_last_build_complete_campaign_seconds = campaign_seconds;
+  timebase_build_stage(TIMEBASE_BUILD_STAGE_BUILD_COMPLETE);
+
+  timebase_build_stage(TIMEBASE_BUILD_STAGE_ASSIGN_LAST_FRAGMENT);
   g_last_fragment = p;
+  g_timebase_assign_last_fragment_count++;
+  g_timebase_last_assign_campaign_seconds = campaign_seconds;
+
+  g_timebase_publish_attempt_count++;
+  g_timebase_last_publish_attempt_campaign_seconds = campaign_seconds;
+  timebase_build_stage(TIMEBASE_BUILD_STAGE_PUBLISH_ATTEMPT);
   publish("TIMEBASE_FRAGMENT", p);
+
+  g_timebase_publish_return_count++;
+  g_timebase_last_publish_return_campaign_seconds = campaign_seconds;
+  timebase_build_stage(TIMEBASE_BUILD_STAGE_PUBLISH_RETURN);
 }
 
 // ============================================================================
@@ -3212,10 +3396,77 @@ static Payload cmd_report_ocxo_pps_projection(const Payload&) {
   return p;
 }
 
+static Payload cmd_report_timebase_publish(const Payload&) {
+  Payload p;
+  p.add("report", "CLOCKS_TIMEBASE_PUBLISH");
+  p.add("description", "Report-only TIMEBASE_FRAGMENT build/publish flight recorder");
+
+  Payload counters;
+  counters.add("pps_entry_count", g_timebase_pps_entry_count);
+  counters.add("candidate_count", g_timebase_candidate_count);
+  counters.add("per_second_count", g_timebase_per_second_count);
+  counters.add("build_begin_count", g_timebase_build_begin_count);
+  counters.add("build_complete_count", g_timebase_build_complete_count);
+  counters.add("assign_last_fragment_count", g_timebase_assign_last_fragment_count);
+  counters.add("publish_attempt_count", g_timebase_publish_attempt_count);
+  counters.add("publish_return_count", g_timebase_publish_return_count);
+  p.add_object("counters", counters);
+
+  Payload gates;
+  gates.add("stop_gate_count", g_timebase_stop_gate_count);
+  gates.add("start_zero_gate_count", g_timebase_start_zero_gate_count);
+  gates.add("recover_gate_count", g_timebase_recover_gate_count);
+  gates.add("watchdog_gate_count", g_timebase_watchdog_gate_count);
+  gates.add("not_started_gate_count", g_timebase_not_started_gate_count);
+  gates.add("warmup_suppressed_count", g_timebase_warmup_suppressed_count);
+  gates.add("campaign_state", campaign_state == clocks_campaign_state_t::STARTED ? "STARTED" : "STOPPED");
+  gates.add("warmup_active", campaign_warmup_active());
+  gates.add("watchdog_anomaly_active", watchdog_anomaly_active);
+  gates.add("request_start", request_start);
+  gates.add("request_stop", request_stop);
+  gates.add("request_recover", request_recover);
+  gates.add("request_zero", request_zero);
+  p.add_object("gates", gates);
+
+  Payload last;
+  last.add("stage", g_timebase_last_stage);
+  last.add("stage_name", timebase_build_stage_name(g_timebase_last_stage));
+  last.add("entry_campaign_seconds", g_timebase_last_entry_campaign_seconds);
+  last.add("candidate_campaign_seconds", g_timebase_last_candidate_campaign_seconds);
+  last.add("per_second_campaign_seconds", g_timebase_last_per_second_campaign_seconds);
+  last.add("build_begin_campaign_seconds", g_timebase_last_build_begin_campaign_seconds);
+  last.add("build_complete_campaign_seconds", g_timebase_last_build_complete_campaign_seconds);
+  last.add("assign_campaign_seconds", g_timebase_last_assign_campaign_seconds);
+  last.add("publish_attempt_campaign_seconds", g_timebase_last_publish_attempt_campaign_seconds);
+  last.add("publish_return_campaign_seconds", g_timebase_last_publish_return_campaign_seconds);
+  last.add("public_count", g_timebase_last_public_count);
+  last.add("public_gnss_ns", g_timebase_last_public_gnss_ns);
+  last.add("public_dwt_total", g_timebase_last_public_dwt_total);
+  last.add("public_ocxo1_ns", g_timebase_last_public_ocxo1_ns);
+  last.add("public_ocxo2_ns", g_timebase_last_public_ocxo2_ns);
+  last.add("ocxo1_pps_projected", g_timebase_last_ocxo1_pps_projected);
+  last.add("ocxo2_pps_projected", g_timebase_last_ocxo2_pps_projected);
+  last.add("ocxo1_pps_residual_valid", g_timebase_last_ocxo1_pps_residual_valid);
+  last.add("ocxo2_pps_residual_valid", g_timebase_last_ocxo2_pps_residual_valid);
+  p.add_object("last", last);
+
+  Payload gaps;
+  gaps.add("candidate_minus_build_begin", (int64_t)g_timebase_candidate_count - (int64_t)g_timebase_build_begin_count);
+  gaps.add("build_begin_minus_build_complete", (int64_t)g_timebase_build_begin_count - (int64_t)g_timebase_build_complete_count);
+  gaps.add("build_complete_minus_assign", (int64_t)g_timebase_build_complete_count - (int64_t)g_timebase_assign_last_fragment_count);
+  gaps.add("assign_minus_publish_attempt", (int64_t)g_timebase_assign_last_fragment_count - (int64_t)g_timebase_publish_attempt_count);
+  gaps.add("publish_attempt_minus_return", (int64_t)g_timebase_publish_attempt_count - (int64_t)g_timebase_publish_return_count);
+  gaps.add("publish_return_lag_vs_campaign_seconds", (int64_t)campaign_seconds - (int64_t)g_timebase_last_publish_return_campaign_seconds);
+  gaps.add("publish_tail_returning", g_timebase_publish_attempt_count == g_timebase_publish_return_count);
+  p.add_object("gaps", gaps);
+
+  return p;
+}
+
 static Payload cmd_report(const Payload&) {
   Payload p;
   p.add("report", "CLOCKS_COMPACT");
-  p.add("subreports", "REPORT_STATUS REPORT_SUMMARY REPORT_EPOCH REPORT_SMARTZERO REPORT_INSTALLED_SMARTZERO REPORT_LIVE_SMARTZERO REPORT_FORENSICS REPORT_FORENSICS_VCLOCK REPORT_FORENSICS_OCXO1 REPORT_FORENSICS_OCXO2 REPORT_OCXO_PPS_PROJECTION REPORT_ALPHA_FLOW REPORT_ALPHA_FLOW_VCLOCK REPORT_ALPHA_FLOW_OCXO1 REPORT_ALPHA_FLOW_OCXO2 REPORT_PREDICTION REPORT_STATS REPORT_DAC");
+  p.add("subreports", "REPORT_STATUS REPORT_SUMMARY REPORT_EPOCH REPORT_SMARTZERO REPORT_INSTALLED_SMARTZERO REPORT_LIVE_SMARTZERO REPORT_FORENSICS REPORT_FORENSICS_VCLOCK REPORT_FORENSICS_OCXO1 REPORT_FORENSICS_OCXO2 REPORT_OCXO_PPS_PROJECTION REPORT_TIMEBASE_PUBLISH REPORT_ALPHA_FLOW REPORT_ALPHA_FLOW_VCLOCK REPORT_ALPHA_FLOW_OCXO1 REPORT_ALPHA_FLOW_OCXO2 REPORT_PREDICTION REPORT_STATS REPORT_DAC");
   add_summary_payload(p);
   add_campaign_payload(p);
 
@@ -3457,6 +3708,7 @@ static const process_command_entry_t CLOCKS_COMMANDS[] = {
   { "REPORT_FORENSICS_OCXO1",  cmd_report_forensics_ocxo1  },
   { "REPORT_FORENSICS_OCXO2",  cmd_report_forensics_ocxo2  },
   { "REPORT_OCXO_PPS_PROJECTION", cmd_report_ocxo_pps_projection },
+  { "REPORT_TIMEBASE_PUBLISH", cmd_report_timebase_publish },
   { "REPORT_ALPHA_FLOW",       cmd_report_alpha_flow       },
   { "REPORT_ALPHA_FLOW_VCLOCK", cmd_report_alpha_flow_vclock },
   { "REPORT_ALPHA_FLOW_OCXO1",  cmd_report_alpha_flow_ocxo1  },
