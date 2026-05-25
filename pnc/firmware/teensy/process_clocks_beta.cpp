@@ -162,6 +162,11 @@ static uint64_t current_raw_ocxo2_ns(void) {
   return clocks_ocxo2_measured_gnss_ns_now();
 }
 
+static uint64_t campaign_public_from_base(uint64_t raw_ns,
+                                          uint64_t base_ns) {
+  return (raw_ns >= base_ns) ? (raw_ns - base_ns) : 0;
+}
+
 static void campaign_public_bases_reset_to_current(void) {
   g_campaign_public_dwt_base   = g_dwt_cycle_count_total;
   g_campaign_public_gnss_base  = current_raw_gnss_ns();
@@ -1073,12 +1078,35 @@ static void payload_add_ocxo_fragment(Payload& p,
                                       const clock_state_t& clock,
                                       const clock_measurement_t& meas,
                                       bool forensics_valid,
-                                      const clocks_alpha_lane_forensics_t& f) {
+                                      const clocks_alpha_lane_forensics_t& f,
+                                      bool pps_projection_valid,
+                                      const clocks_alpha_ocxo_pps_projection_snapshot_t& pps_projection,
+                                      uint64_t public_pps_projected_ns) {
   Payload lane;
   lane.add("ns", public_ns);
   lane.add("measured_gnss_ns", public_ns);
   lane.add("measured_gnss_ns_at_pps_vclock", public_ns);
   lane.add("ns_at_pps_vclock", public_ns);
+
+  // Step B: publish Alpha's PPS-edge OCXO clock candidate side-by-side with
+  // the existing OCXO authority.  This is still passive: ocxoN.ns, Welfords,
+  // servo inputs, campaign bases, and recovery semantics remain unchanged.
+  const int64_t projected_minus_ns =
+      (!pps_projection_valid)
+          ? 0LL
+          : ((public_pps_projected_ns >= public_ns)
+                 ? (int64_t)(public_pps_projected_ns - public_ns)
+                 : -(int64_t)(public_ns - public_pps_projected_ns));
+  lane.add("pps_projected_valid", pps_projection_valid);
+  lane.add("pps_projected_ns",
+           pps_projection_valid ? public_pps_projected_ns : 0ULL);
+  lane.add("pps_projected_raw_ns",
+           pps_projection_valid
+               ? pps_projection.projected_ocxo_ns_at_pps
+               : 0ULL);
+  lane.add("pps_projected_minus_ns", projected_minus_ns);
+  lane.add("pps_projection_source",
+           pps_projection_valid ? pps_projection.source : 0U);
 
   // Direct interrupt-authored GNSS-at-edge witness. This is the normalized
   // GNSS timestamp of the observed OCXO quiet-zone sample, not Alpha's
@@ -1641,6 +1669,15 @@ void clocks_beta_pps(void) {
   const bool ocxo2_forensics_valid =
       clocks_alpha_lane_forensics(time_clock_id_t::OCXO2, &ocxo2_forensics);
 
+  clocks_alpha_ocxo_pps_projection_snapshot_t ocxo1_pps_projection{};
+  clocks_alpha_ocxo_pps_projection_snapshot_t ocxo2_pps_projection{};
+  const bool ocxo1_pps_projection_ok =
+      clocks_alpha_ocxo_pps_projection_snapshot(time_clock_id_t::OCXO1,
+                                                &ocxo1_pps_projection);
+  const bool ocxo2_pps_projection_ok =
+      clocks_alpha_ocxo_pps_projection_snapshot(time_clock_id_t::OCXO2,
+                                                &ocxo2_pps_projection);
+
   // VCLOCK measurement Welford — bridge-interpolation self-test.
   // Sample in ns; mean == ppb under the "ns/sec == ppb" identity.
   if (g_vclock_measurement.gnss_ns_between_edges != 0) {
@@ -1678,6 +1715,32 @@ void clocks_beta_pps(void) {
   const uint64_t public_dwt_ns    = dwt_cycles_to_ns(public_dwt_total);
   const uint64_t public_ocxo1_ns  = campaign_public_ocxo1_ns();
   const uint64_t public_ocxo2_ns  = campaign_public_ocxo2_ns();
+  const bool ocxo1_pps_projected_raw_valid =
+      ocxo1_pps_projection_ok && ocxo1_pps_projection.valid &&
+      ocxo1_pps_projection.projected_ocxo_ns_at_pps != 0;
+  const bool ocxo2_pps_projected_raw_valid =
+      ocxo2_pps_projection_ok && ocxo2_pps_projection.valid &&
+      ocxo2_pps_projection.projected_ocxo_ns_at_pps != 0;
+  const bool ocxo1_pps_projected_valid =
+      ocxo1_pps_projected_raw_valid &&
+      ocxo1_pps_projection.projected_ocxo_ns_at_pps >=
+          g_campaign_public_ocxo1_base;
+  const bool ocxo2_pps_projected_valid =
+      ocxo2_pps_projected_raw_valid &&
+      ocxo2_pps_projection.projected_ocxo_ns_at_pps >=
+          g_campaign_public_ocxo2_base;
+  const uint64_t public_ocxo1_pps_projected_ns =
+      ocxo1_pps_projected_valid
+          ? campaign_public_from_base(
+                ocxo1_pps_projection.projected_ocxo_ns_at_pps,
+                g_campaign_public_ocxo1_base)
+          : 0ULL;
+  const uint64_t public_ocxo2_pps_projected_ns =
+      ocxo2_pps_projected_valid
+          ? campaign_public_from_base(
+                ocxo2_pps_projection.projected_ocxo_ns_at_pps,
+                g_campaign_public_ocxo2_base)
+          : 0ULL;
   const uint32_t public_count     = (uint32_t)campaign_seconds;
 
   Payload p;
@@ -1759,7 +1822,10 @@ void clocks_beta_pps(void) {
                             g_ocxo1_clock,
                             g_ocxo1_measurement,
                             ocxo1_forensics_valid,
-                            ocxo1_forensics);
+                            ocxo1_forensics,
+                            ocxo1_pps_projected_valid,
+                            ocxo1_pps_projection,
+                            public_ocxo1_pps_projected_ns);
 
   payload_add_ocxo_fragment(p,
                             "ocxo2",
@@ -1767,7 +1833,10 @@ void clocks_beta_pps(void) {
                             g_ocxo2_clock,
                             g_ocxo2_measurement,
                             ocxo2_forensics_valid,
-                            ocxo2_forensics);
+                            ocxo2_forensics,
+                            ocxo2_pps_projected_valid,
+                            ocxo2_pps_projection,
+                            public_ocxo2_pps_projected_ns);
 
   payload_add_dac_summary_hierarchical(p);
   payload_add_stats_summary_hierarchical(p);
