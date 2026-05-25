@@ -43,8 +43,9 @@
 //   welford_dwt, welford_vclock, welford_ocxo1, welford_ocxo2,
 //   welford_pps_witness, welford_ocxo1_dac, welford_ocxo2_dac.
 //
-// Everything else (campaign lifecycle, servo, DAC pacing, watchdog,
-// command surface) is unchanged in behavior.
+// Campaign lifecycle, DAC pacing, and watchdog behavior remain unchanged.
+// Servo inputs now consume the same PPS-founded OCXO residual surface that
+// feeds the OCXO Welfords, and DAC/TIMEBASE reports expose that provenance.
 //
 // ============================================================================
 
@@ -1332,6 +1333,74 @@ static void payload_add_ocxo_fragment(Payload& p,
   p.add_object(key, lane);
 }
 
+// Step E servo source doctrine. Servo input is explicitly the PPS-founded
+// OCXO residual surface introduced in Step D. TOTAL consumes the Welford mean
+// of public PPS-edge residuals; NOW consumes the rolling window mean of the
+// same residual samples. No event-edge residual, phase correction, or DWT
+// normalization is performed in the servo path.
+static constexpr uint32_t SERVO_INPUT_SOURCE_NONE = 0;
+static constexpr uint32_t SERVO_INPUT_SOURCE_TOTAL_PPS_RESIDUAL_WELFORD = 1;
+static constexpr uint32_t SERVO_INPUT_SOURCE_NOW_PPS_RESIDUAL_WINDOW = 2;
+
+static const char* servo_input_source_name(uint32_t source) {
+  switch (source) {
+    case SERVO_INPUT_SOURCE_TOTAL_PPS_RESIDUAL_WELFORD:
+      return "PPS_RESIDUAL_WELFORD_MEAN";
+    case SERVO_INPUT_SOURCE_NOW_PPS_RESIDUAL_WINDOW:
+      return "PPS_RESIDUAL_NOW_WINDOW_MEAN";
+    default:
+      return "NONE";
+  }
+}
+
+struct servo_input_diag_t {
+  bool     pps_residual_valid = false;
+  uint64_t pps_gnss_interval_ns = 0;
+  uint64_t pps_clock_interval_ns = 0;
+  int64_t  pps_fast_residual_ns = 0;
+
+  uint64_t welford_n = 0;
+  double   welford_mean_ns = 0.0;
+  bool     total_input_valid = false;
+
+  uint32_t now_window_count = 0;
+  double   now_window_mean_ns = 0.0;
+  bool     now_input_valid = false;
+
+  uint32_t selected_source = SERVO_INPUT_SOURCE_NONE;
+  bool     selected_input_valid = false;
+  double   selected_input_residual_ns = 0.0;
+};
+
+static servo_input_diag_t g_servo_input_ocxo1 = {};
+static servo_input_diag_t g_servo_input_ocxo2 = {};
+
+static void servo_input_diag_reset(servo_input_diag_t& d) {
+  d = servo_input_diag_t{};
+}
+
+static void payload_add_servo_input_diag(Payload& lane,
+                                         const servo_input_diag_t& d) {
+  Payload input;
+  input.add("residual_source", "PPS_FOUNDED_TIMEBASE_RESIDUAL");
+  input.add("positive_means", "clock_fast");
+  input.add("selected_source", servo_input_source_name(d.selected_source));
+  input.add("selected_source_id", d.selected_source);
+  input.add("selected_valid", d.selected_input_valid);
+  input.add("selected_residual_ns", d.selected_input_residual_ns, 6);
+  input.add("pps_residual_valid", d.pps_residual_valid);
+  input.add("pps_fast_residual_ns", d.pps_fast_residual_ns);
+  input.add("pps_gnss_interval_ns", d.pps_gnss_interval_ns);
+  input.add("pps_clock_interval_ns", d.pps_clock_interval_ns);
+  input.add("total_welford_n", d.welford_n);
+  input.add("total_welford_mean_ns", d.welford_mean_ns, 6);
+  input.add("total_input_valid", d.total_input_valid);
+  input.add("now_window_count", d.now_window_count);
+  input.add("now_window_mean_ns", d.now_window_mean_ns, 6);
+  input.add("now_input_valid", d.now_input_valid);
+  lane.add_object("servo_input", input);
+}
+
 static void payload_add_dac_summary_hierarchical(Payload& p) {
   Payload dac;
   dac.add("calibrate_ocxo", servo_mode_str(calibrate_ocxo_mode));
@@ -1344,6 +1413,7 @@ static void payload_add_dac_summary_hierarchical(Payload& p) {
   o1.add("servo_predicted_residual_ns", ocxo1_dac.servo_predicted_residual, 6);
   o1.add("servo_last_step", ocxo1_dac.servo_last_step, 6);
   o1.add("servo_adjustments", ocxo1_dac.servo_adjustments);
+  payload_add_servo_input_diag(o1, g_servo_input_ocxo1);
   dac.add_object("ocxo1", o1);
 
   Payload o2;
@@ -1353,6 +1423,7 @@ static void payload_add_dac_summary_hierarchical(Payload& p) {
   o2.add("servo_predicted_residual_ns", ocxo2_dac.servo_predicted_residual, 6);
   o2.add("servo_last_step", ocxo2_dac.servo_last_step, 6);
   o2.add("servo_adjustments", ocxo2_dac.servo_adjustments);
+  payload_add_servo_input_diag(o2, g_servo_input_ocxo2);
   dac.add_object("ocxo2", o2);
 
   p.add_object("dac", dac);
@@ -1401,6 +1472,43 @@ static void now_window_push(now_window_t& w, int64_t sample) {
   w.samples[w.head] = sample;
   w.head = (w.head + 1) % NOW_WINDOW_SIZE;
   if (w.count < NOW_WINDOW_SIZE) w.count++;
+}
+
+static void servo_input_diag_update(servo_input_diag_t& d,
+                                    bool pps_residual_valid,
+                                    uint64_t pps_gnss_interval_ns,
+                                    uint64_t pps_clock_interval_ns,
+                                    int64_t pps_fast_residual_ns,
+                                    const welford_t& w,
+                                    const now_window_t& now) {
+  d.pps_residual_valid = pps_residual_valid;
+  d.pps_gnss_interval_ns = pps_residual_valid ? pps_gnss_interval_ns : 0ULL;
+  d.pps_clock_interval_ns = pps_residual_valid ? pps_clock_interval_ns : 0ULL;
+  d.pps_fast_residual_ns = pps_residual_valid ? pps_fast_residual_ns : 0LL;
+
+  d.welford_n = w.n;
+  d.welford_mean_ns = (w.n > 0) ? w.mean : 0.0;
+  d.total_input_valid = pps_residual_valid && (w.n >= SERVO_MIN_SAMPLES);
+
+  d.now_window_count = now.count;
+  d.now_window_mean_ns = (now.count > 0) ? now_window_mean(now) : 0.0;
+  d.now_input_valid = pps_residual_valid &&
+                      now.count >= NOW_WINDOW_SIZE &&
+                      campaign_seconds >= SERVO_MIN_SAMPLES;
+
+  if (calibrate_ocxo_mode == servo_mode_t::TOTAL) {
+    d.selected_source = SERVO_INPUT_SOURCE_TOTAL_PPS_RESIDUAL_WELFORD;
+    d.selected_input_valid = d.total_input_valid;
+    d.selected_input_residual_ns = d.total_input_valid ? d.welford_mean_ns : 0.0;
+  } else if (calibrate_ocxo_mode == servo_mode_t::NOW) {
+    d.selected_source = SERVO_INPUT_SOURCE_NOW_PPS_RESIDUAL_WINDOW;
+    d.selected_input_valid = d.now_input_valid;
+    d.selected_input_residual_ns = d.now_input_valid ? d.now_window_mean_ns : 0.0;
+  } else {
+    d.selected_source = SERVO_INPUT_SOURCE_NONE;
+    d.selected_input_valid = false;
+    d.selected_input_residual_ns = 0.0;
+  }
 }
 
 // ============================================================================
@@ -1577,6 +1685,8 @@ void clocks_zero_all(void) {
 
   now_window_reset(g_now_window_ocxo1);
   now_window_reset(g_now_window_ocxo2);
+  servo_input_diag_reset(g_servo_input_ocxo1);
+  servo_input_diag_reset(g_servo_input_ocxo2);
 }
 
 // ============================================================================
@@ -1635,14 +1745,15 @@ static void ocxo_servo_predictive(ocxo_dac_state_t& dac,
   ocxo_dac_queue_intent(dac, step);
 }
 
-static void ocxo_servo_total(ocxo_dac_state_t& dac, const welford_t& w) {
-  if (w.n < SERVO_MIN_SAMPLES) return;
+static void ocxo_servo_total(ocxo_dac_state_t& dac,
+                             const servo_input_diag_t& input) {
+  if (!input.total_input_valid) return;
 
   dac.servo_settle_count++;
   if (dac.servo_settle_count < SERVO_SETTLE_SECONDS) return;
 
   ocxo_servo_predictive(dac,
-                        w.mean,
+                        input.welford_mean_ns,
                         SERVO_TOTAL_RESIDUAL_ALPHA,
                         SERVO_TOTAL_SLOPE_ALPHA,
                         SERVO_TOTAL_HORIZON_S);
@@ -1650,12 +1761,12 @@ static void ocxo_servo_total(ocxo_dac_state_t& dac, const welford_t& w) {
   dac.servo_settle_count = 0;
 }
 
-static void ocxo_servo_now(ocxo_dac_state_t& dac, const now_window_t& window) {
-  if (window.count < NOW_WINDOW_SIZE) return;
-  if (campaign_seconds < SERVO_MIN_SAMPLES) return;
+static void ocxo_servo_now(ocxo_dac_state_t& dac,
+                           const servo_input_diag_t& input) {
+  if (!input.now_input_valid) return;
 
   ocxo_servo_predictive(dac,
-                        now_window_mean(window),
+                        input.now_window_mean_ns,
                         SERVO_NOW_RESIDUAL_ALPHA,
                         SERVO_NOW_SLOPE_ALPHA,
                         SERVO_NOW_HORIZON_S);
@@ -1665,11 +1776,11 @@ static void ocxo_calibration_servo(void) {
   if (calibrate_ocxo_mode == servo_mode_t::OFF) return;
 
   if (calibrate_ocxo_mode == servo_mode_t::NOW) {
-    ocxo_servo_now(ocxo1_dac, g_now_window_ocxo1);
-    ocxo_servo_now(ocxo2_dac, g_now_window_ocxo2);
+    ocxo_servo_now(ocxo1_dac, g_servo_input_ocxo1);
+    ocxo_servo_now(ocxo2_dac, g_servo_input_ocxo2);
   } else {
-    ocxo_servo_total(ocxo1_dac, welford_ocxo1);
-    ocxo_servo_total(ocxo2_dac, welford_ocxo2);
+    ocxo_servo_total(ocxo1_dac, g_servo_input_ocxo1);
+    ocxo_servo_total(ocxo2_dac, g_servo_input_ocxo2);
   }
 
   ocxo_dac_schedule_paced_commit();
@@ -1940,8 +2051,9 @@ void clocks_beta_pps(void) {
     welford_update(welford_vclock, (double)g_vclock_measurement.second_residual_ns);
   }
 
-  // Step D OCXO Welfords use PPS-founded public clock residuals.
-  // The residual is computed from consecutive TIMEBASE clock values:
+  // Step D/E OCXO Welfords, NOW windows, and servo inputs use
+  // PPS-founded public clock residuals.  The residual is computed from
+  // consecutive TIMEBASE clock values:
   //
   //   (current_ocxo_ns - previous_ocxo_ns) -
   //   (current_gnss_ns - previous_gnss_ns)
@@ -1965,7 +2077,23 @@ void clocks_beta_pps(void) {
   // PPS witness statistics are owned by the witness/PPS_PHASE path.
   // Beta publishes the accumulator but does not update it here.
 
-  // Servo runs AFTER welford updates so it sees this second's data.
+  servo_input_diag_update(g_servo_input_ocxo1,
+                          pps_residuals.ocxo1_valid,
+                          pps_residuals.gnss_interval_ns,
+                          pps_residuals.ocxo1_interval_ns,
+                          pps_residuals.ocxo1_fast_residual_ns,
+                          welford_ocxo1,
+                          g_now_window_ocxo1);
+  servo_input_diag_update(g_servo_input_ocxo2,
+                          pps_residuals.ocxo2_valid,
+                          pps_residuals.gnss_interval_ns,
+                          pps_residuals.ocxo2_interval_ns,
+                          pps_residuals.ocxo2_fast_residual_ns,
+                          welford_ocxo2,
+                          g_now_window_ocxo2);
+
+  // Servo runs AFTER PPS-founded residual/Welford updates so it sees this
+  // second's public TIMEBASE residual sample.
   ocxo_calibration_servo();
 
   // DAC Welfords — track servo effort (the TEMPEST signal).
@@ -2769,6 +2897,7 @@ static void add_dac_payload(Payload& p) {
   o1.add("servo_filtered_slope", ocxo1_dac.servo_filtered_slope, 6);
   o1.add("servo_predicted_residual", ocxo1_dac.servo_predicted_residual, 6);
   o1.add("servo_predictor_updates", ocxo1_dac.servo_predictor_updates);
+  payload_add_servo_input_diag(o1, g_servo_input_ocxo1);
   o1.add("pacing_pending", ocxo1_dac.pacing_pending);
   o1.add("pacing_pending_target", ocxo1_dac.pacing_pending_target, 6);
   o1.add("pacing_pending_step", ocxo1_dac.pacing_pending_step, 6);
@@ -2800,6 +2929,7 @@ static void add_dac_payload(Payload& p) {
   o2.add("servo_filtered_slope", ocxo2_dac.servo_filtered_slope, 6);
   o2.add("servo_predicted_residual", ocxo2_dac.servo_predicted_residual, 6);
   o2.add("servo_predictor_updates", ocxo2_dac.servo_predictor_updates);
+  payload_add_servo_input_diag(o2, g_servo_input_ocxo2);
   o2.add("pacing_pending", ocxo2_dac.pacing_pending);
   o2.add("pacing_pending_target", ocxo2_dac.pacing_pending_target, 6);
   o2.add("pacing_pending_step", ocxo2_dac.pacing_pending_step, 6);
