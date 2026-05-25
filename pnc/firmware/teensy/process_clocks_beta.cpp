@@ -46,6 +46,7 @@
 // Campaign lifecycle, DAC pacing, and watchdog behavior remain unchanged.
 // Servo inputs now consume the same PPS-founded OCXO residual surface that
 // feeds the OCXO Welfords, and DAC/TIMEBASE reports expose that provenance.
+// Servos are now ready.
 //
 // ============================================================================
 
