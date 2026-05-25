@@ -137,6 +137,12 @@ static uint64_t g_campaign_public_gnss_base = 0;
 static uint64_t g_campaign_public_ocxo1_base = 0;
 static uint64_t g_campaign_public_ocxo2_base = 0;
 
+// Step C: OCXO public/canonical bases now track the PPS-edge projected
+// OCXO clock values. Keep separate bases for the legacy measured-GNSS
+// ledgers so measured_gnss_ns remains useful as a diagnostic side surface.
+static uint64_t g_campaign_public_ocxo1_measured_base = 0;
+static uint64_t g_campaign_public_ocxo2_measured_base = 0;
+
 static bool clock_projection_valid(time_clock_id_t clock) {
   time_clock_projection_t projection{};
   return time_clock_projection(clock, &projection);
@@ -150,16 +156,49 @@ static uint64_t current_raw_gnss_ns(void) {
   return g_gnss_ns_at_pps_vclock;
 }
 
-static uint64_t current_raw_ocxo1_ns(void) {
-  // OCXO measured GNSS-elapsed ledgers are owned by CLOCKS/alpha. These are
-  // not counter-ticks × 100 ns and not ideal +1e9-per-edge nominal ledgers.
+static bool current_raw_ocxo_pps_projected_ns(time_clock_id_t clock,
+                                              uint64_t* out_raw_ns) {
+  if (!out_raw_ns) return false;
+  *out_raw_ns = 0;
+
+  clocks_alpha_ocxo_pps_projection_snapshot_t s{};
+  if (!clocks_alpha_ocxo_pps_projection_snapshot(clock, &s)) return false;
+  if (!s.valid || s.projected_ocxo_ns_at_pps == 0) return false;
+
+  *out_raw_ns = s.projected_ocxo_ns_at_pps;
+  return true;
+}
+
+static uint64_t current_raw_ocxo1_measured_ns(void) {
+  // Legacy measured GNSS-elapsed ledger retained as a diagnostic surface.
   return clocks_ocxo1_measured_gnss_ns_now();
 }
 
-static uint64_t current_raw_ocxo2_ns(void) {
-  // OCXO measured GNSS-elapsed ledgers are owned by CLOCKS/alpha. These are
-  // not counter-ticks × 100 ns and not ideal +1e9-per-edge nominal ledgers.
+static uint64_t current_raw_ocxo2_measured_ns(void) {
+  // Legacy measured GNSS-elapsed ledger retained as a diagnostic surface.
   return clocks_ocxo2_measured_gnss_ns_now();
+}
+
+static uint64_t current_raw_ocxo1_ns(void) {
+  // Step C authority: prefer Alpha's PPS/VCLOCK-edge OCXO clock projection.
+  // Fall back to the legacy measured ledger only until the projection surface
+  // has enough edge history to become valid.
+  uint64_t projected = 0;
+  if (current_raw_ocxo_pps_projected_ns(time_clock_id_t::OCXO1, &projected)) {
+    return projected;
+  }
+  return current_raw_ocxo1_measured_ns();
+}
+
+static uint64_t current_raw_ocxo2_ns(void) {
+  // Step C authority: prefer Alpha's PPS/VCLOCK-edge OCXO clock projection.
+  // Fall back to the legacy measured ledger only until the projection surface
+  // has enough edge history to become valid.
+  uint64_t projected = 0;
+  if (current_raw_ocxo_pps_projected_ns(time_clock_id_t::OCXO2, &projected)) {
+    return projected;
+  }
+  return current_raw_ocxo2_measured_ns();
 }
 
 static uint64_t campaign_public_from_base(uint64_t raw_ns,
@@ -167,11 +206,23 @@ static uint64_t campaign_public_from_base(uint64_t raw_ns,
   return (raw_ns >= base_ns) ? (raw_ns - base_ns) : 0;
 }
 
+static uint64_t campaign_public_ocxo1_measured_ns(void) {
+  return campaign_public_from_base(current_raw_ocxo1_measured_ns(),
+                                   g_campaign_public_ocxo1_measured_base);
+}
+
+static uint64_t campaign_public_ocxo2_measured_ns(void) {
+  return campaign_public_from_base(current_raw_ocxo2_measured_ns(),
+                                   g_campaign_public_ocxo2_measured_base);
+}
+
 static void campaign_public_bases_reset_to_current(void) {
   g_campaign_public_dwt_base   = g_dwt_cycle_count_total;
   g_campaign_public_gnss_base  = current_raw_gnss_ns();
   g_campaign_public_ocxo1_base = current_raw_ocxo1_ns();
   g_campaign_public_ocxo2_base = current_raw_ocxo2_ns();
+  g_campaign_public_ocxo1_measured_base = current_raw_ocxo1_measured_ns();
+  g_campaign_public_ocxo2_measured_base = current_raw_ocxo2_measured_ns();
 }
 
 static uint64_t saturated_base_for_recovered_value(uint64_t current,
@@ -191,6 +242,12 @@ static void campaign_public_bases_reset_for_recover(void) {
                                           recover_ocxo1_ns);
   g_campaign_public_ocxo2_base =
       saturated_base_for_recovered_value(current_raw_ocxo2_ns(),
+                                          recover_ocxo2_ns);
+  g_campaign_public_ocxo1_measured_base =
+      saturated_base_for_recovered_value(current_raw_ocxo1_measured_ns(),
+                                          recover_ocxo1_ns);
+  g_campaign_public_ocxo2_measured_base =
+      saturated_base_for_recovered_value(current_raw_ocxo2_measured_ns(),
                                           recover_ocxo2_ns);
 }
 
@@ -1075,6 +1132,7 @@ static void payload_add_vclock_fragment(Payload& p,
 static void payload_add_ocxo_fragment(Payload& p,
                                       const char* key,
                                       uint64_t public_ns,
+                                      uint64_t public_measured_ns,
                                       const clock_state_t& clock,
                                       const clock_measurement_t& meas,
                                       bool forensics_valid,
@@ -1083,20 +1141,41 @@ static void payload_add_ocxo_fragment(Payload& p,
                                       const clocks_alpha_ocxo_pps_projection_snapshot_t& pps_projection,
                                       uint64_t public_pps_projected_ns) {
   Payload lane;
-  lane.add("ns", public_ns);
-  lane.add("measured_gnss_ns", public_ns);
-  lane.add("measured_gnss_ns_at_pps_vclock", public_ns);
-  lane.add("ns_at_pps_vclock", public_ns);
 
-  // Step B: publish Alpha's PPS-edge OCXO clock candidate side-by-side with
-  // the existing OCXO authority.  This is still passive: ocxoN.ns, Welfords,
-  // servo inputs, campaign bases, and recovery semantics remain unchanged.
+  // Step C authority: ocxoN.ns is now the campaign-public OCXO clock value
+  // projected to this TIMEBASE row's canonical PPS/VCLOCK edge.  The legacy
+  // Alpha measured-GNSS ledger remains visible as a diagnostic side surface.
+  lane.add("ns", public_ns);
+  lane.add("ns_at_pps_vclock", public_ns);
+  lane.add("ns_source", pps_projection_valid ? "PPS_PROJECTED"
+                                              : "MEASURED_FALLBACK");
+  lane.add("ns_source_id", pps_projection_valid ? 2U : 1U);
+
+  lane.add("measured_gnss_ns", public_measured_ns);
+  lane.add("measured_gnss_ns_at_pps_vclock", public_measured_ns);
+  lane.add("legacy_measured_gnss_ns", public_measured_ns);
+  const int64_t measured_minus_ns =
+      (public_measured_ns >= public_ns)
+          ? (int64_t)(public_measured_ns - public_ns)
+          : -(int64_t)(public_ns - public_measured_ns);
+  lane.add("measured_minus_ns", measured_minus_ns);
+
+  // Keep the Step B sidecar during promotion.  When the projection is valid,
+  // pps_projected_ns is the same canonical value as ns; if the projection is
+  // not yet valid during early startup, ns falls back to the measured ledger
+  // and this sidecar records the unavailability.
   const int64_t projected_minus_ns =
       (!pps_projection_valid)
           ? 0LL
           : ((public_pps_projected_ns >= public_ns)
                  ? (int64_t)(public_pps_projected_ns - public_ns)
                  : -(int64_t)(public_ns - public_pps_projected_ns));
+  const int64_t projected_minus_measured_ns =
+      (!pps_projection_valid)
+          ? 0LL
+          : ((public_pps_projected_ns >= public_measured_ns)
+                 ? (int64_t)(public_pps_projected_ns - public_measured_ns)
+                 : -(int64_t)(public_measured_ns - public_pps_projected_ns));
   lane.add("pps_projected_valid", pps_projection_valid);
   lane.add("pps_projected_ns",
            pps_projection_valid ? public_pps_projected_ns : 0ULL);
@@ -1105,6 +1184,7 @@ static void payload_add_ocxo_fragment(Payload& p,
                ? pps_projection.projected_ocxo_ns_at_pps
                : 0ULL);
   lane.add("pps_projected_minus_ns", projected_minus_ns);
+  lane.add("pps_projected_minus_measured_ns", projected_minus_measured_ns);
   lane.add("pps_projection_source",
            pps_projection_valid ? pps_projection.source : 0U);
 
@@ -1713,8 +1793,9 @@ void clocks_beta_pps(void) {
   const uint64_t public_gnss_ns   = campaign_public_gnss_ns();
   const uint64_t public_dwt_total = campaign_public_dwt_total();
   const uint64_t public_dwt_ns    = dwt_cycles_to_ns(public_dwt_total);
-  const uint64_t public_ocxo1_ns  = campaign_public_ocxo1_ns();
-  const uint64_t public_ocxo2_ns  = campaign_public_ocxo2_ns();
+  const uint64_t public_ocxo1_measured_ns = campaign_public_ocxo1_measured_ns();
+  const uint64_t public_ocxo2_measured_ns = campaign_public_ocxo2_measured_ns();
+
   const bool ocxo1_pps_projected_raw_valid =
       ocxo1_pps_projection_ok && ocxo1_pps_projection.valid &&
       ocxo1_pps_projection.projected_ocxo_ns_at_pps != 0;
@@ -1741,6 +1822,17 @@ void clocks_beta_pps(void) {
                 ocxo2_pps_projection.projected_ocxo_ns_at_pps,
                 g_campaign_public_ocxo2_base)
           : 0ULL;
+
+  // Step C promotion: canonical OCXO TIMEBASE ns values are PPS-edge
+  // projections when available.  The measured ledgers are published
+  // separately as diagnostics.
+  const uint64_t public_ocxo1_ns = ocxo1_pps_projected_valid
+      ? public_ocxo1_pps_projected_ns
+      : public_ocxo1_measured_ns;
+  const uint64_t public_ocxo2_ns = ocxo2_pps_projected_valid
+      ? public_ocxo2_pps_projected_ns
+      : public_ocxo2_measured_ns;
+
   const uint32_t public_count     = (uint32_t)campaign_seconds;
 
   Payload p;
@@ -1767,8 +1859,10 @@ void clocks_beta_pps(void) {
     gnss.add("pps_ns", public_gnss_ns);
     gnss.add("pps_vclock_ns", public_gnss_ns);
     gnss.add("vclock_ns", public_gnss_ns);
-    gnss.add("ocxo1_measured_ns", public_ocxo1_ns);
-    gnss.add("ocxo2_measured_ns", public_ocxo2_ns);
+    gnss.add("ocxo1_ns", public_ocxo1_ns);
+    gnss.add("ocxo2_ns", public_ocxo2_ns);
+    gnss.add("ocxo1_measured_ns", public_ocxo1_measured_ns);
+    gnss.add("ocxo2_measured_ns", public_ocxo2_measured_ns);
     p.add_object("gnss", gnss);
   }
 
@@ -1819,6 +1913,7 @@ void clocks_beta_pps(void) {
   payload_add_ocxo_fragment(p,
                             "ocxo1",
                             public_ocxo1_ns,
+                            public_ocxo1_measured_ns,
                             g_ocxo1_clock,
                             g_ocxo1_measurement,
                             ocxo1_forensics_valid,
@@ -1830,6 +1925,7 @@ void clocks_beta_pps(void) {
   payload_add_ocxo_fragment(p,
                             "ocxo2",
                             public_ocxo2_ns,
+                            public_ocxo2_measured_ns,
                             g_ocxo2_clock,
                             g_ocxo2_measurement,
                             ocxo2_forensics_valid,
