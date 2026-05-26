@@ -29,13 +29,14 @@
 // TimePop is the principled exception to the "no DWT conversion in
 // PPS_VCLOCK" rule: it projects CH2 fire facts onto the PPS_VCLOCK timeline
 // for scheduling diagnostics. OCXO one-second subscribers receive authored
-// OCXO edge facts even when that projection is unavailable; CLOCKS/Alpha owns
-// OCXO measured-GNSS interval construction from consecutive OCXO edge DWTs.
+// OCXO edge facts whose DWT coordinate is EMA-predicted from the lane's
+// completed one-second intervals; CLOCKS/Alpha owns OCXO measured-GNSS
+// interval construction from consecutive OCXO edge DWTs.
 //
 // Lanes:
 //   VCLOCK : TimePop recurring client on QTimer1 CH2 (10 MHz VCLOCK domain)
-//   OCXO1  : QTimer2 CH0, PCS=0, quiet phase +250 us in VCLOCK ms cell
-//   OCXO2  : QTimer3 CH3, PCS=3, quiet phase +750 us in VCLOCK ms cell
+//   OCXO1  : QTimer2 CH0, PCS=0, lane-local rollover-only compare ladder
+//   OCXO2  : QTimer3 CH3, PCS=3, lane-local rollover-only compare ladder
 //   TimePop: QTimer1 CH2, varied compare intervals (foreground scheduler)
 //
 // The PPS GPIO ISR captures DWT as its first instruction, then reads the
@@ -158,18 +159,31 @@ static_assert((PPS_RELAY_OFF_NS % CADENCE_MINDER_PERIOD_NS) == 0ULL,
 static_assert(PPS_RELAY_OFF_CADENCE_TICKS == 500U,
               "PPS relay off interval should be 500 cadence ticks");
 
-// OCXO DWT authorship.  OCXO1 and OCXO2 now live on separate QuadTimer
-// modules/vectors.  Each OCXO ISR captures ARM_DWT_CYCCNT as its first
-// instruction and applies the calibrated QTimer ISR-entry latency correction.
+// OCXO DWT authorship.  OCXO1 and OCXO2 live on separate QuadTimer
+// modules/vectors.  Each OCXO ISR still captures ARM_DWT_CYCCNT as first
+// instruction for private evidence, but the subscriber-facing OCXO DWT is now
+// the lane-local EMA prediction of the one-second edge.  The raw ISR capture
+// is diagnostic only.
 static constexpr uint32_t OCXO_DWT_SOURCE_NONE = 0;
 static constexpr uint32_t OCXO_DWT_SOURCE_ISR_ENTRY = 1;
+static constexpr uint32_t OCXO_DWT_SOURCE_EMA_PREDICTED = 2;
 
-// OCXO lane-local cadence.  OCXO1/OCXO2 now own their own 1 kHz rollover
-// custody by programming their local QTimer compare channel to the next
-// 10,000-tick target in the lane's own 10 MHz domain.  Every compare ISR
-// immediately schedules the next target and captures the perishable service
-// facts; foreground ASAP drains those facts.  Every 1000th local cadence fact
-// remains the public one-second OCXO event consumed by Alpha.
+// EMA authority for OCXO one-second DWT publication.  The ISR still maintains
+// a 1 kHz rollover ladder because the 16-bit QuadTimer cannot compare a full
+// second directly.  Only the 1000th rollover fact is deferred to foreground;
+// intermediate 1 kHz facts do not enter a perishable ring.  The published edge
+// DWT is last-published + EMA(observed one-second interval), smoothing the
+// common-mode residuals that defeated the service-forensics experiment.
+static constexpr bool     OCXO_EMA_DWT_AUTHORITY_ENABLED = true;
+static constexpr uint32_t OCXO_EMA_SHIFT = 4;  // alpha = 1/16
+static constexpr uint32_t OCXO_EMA_ALPHA_NUMERATOR = 1;
+static constexpr uint32_t OCXO_EMA_ALPHA_DENOMINATOR = (1U << OCXO_EMA_SHIFT);
+
+// OCXO lane-local cadence.  OCXO1/OCXO2 own a small 1 kHz rollover-only
+// compare ladder in their own 10 MHz domains.  Every compare ISR schedules
+// the next +10,000 tick target.  Every 1000th local cadence fact becomes the
+// public one-second OCXO event consumed by Alpha; the other 999 ticks are
+// local rollover maintenance only.
 static constexpr uint32_t OCXO_CADENCE_INTERVAL_TICKS = 10000U;
 static constexpr uint32_t OCXO_WITNESS_ONE_SECOND_COUNTS =
     (uint32_t)VCLOCK_COUNTS_PER_SECOND;
@@ -181,14 +195,15 @@ static_assert(OCXO_WITNESS_ONE_SECOND_COUNTS ==
 static constexpr uint32_t OCXO_WITNESS_ARM_WINDOW_TICKS = OCXO_CADENCE_INTERVAL_TICKS;
 static constexpr uint32_t OCXO_WITNESS_MIN_ARM_LEAD_TICKS = 64U;
 
-// Quiet-phase OCXO custody.
+// Quiet-phase OCXO custody — retired/dormant.
 //
 // The OCXO local compare ladders still hop at 1 kHz because a 10 MHz / 1 s
-// hardware compare does not fit in the 16-bit QuadTimer compare span.  What
-// changes here is the initial phase of each +10,000-tick ladder: OCXO1 and
-// OCXO2 are placed into TimePop-measured quiet zones inside the VCLOCK
-// millisecond cell.  Every 1000th sample remains the public one-second event.
-static constexpr bool     OCXO_QUIET_PHASE_SAMPLING_ENABLED = true;
+// hardware compare does not fit in the 16-bit QuadTimer compare span.  The
+// quiet-phase experiment is now disabled; the lane publishes only logical
+// rollover events, and the subscriber-facing DWT is EMA-predicted.  The constants
+// remain visible as report/back-compat surfaces while the old experiment is
+// unwound.
+static constexpr bool     OCXO_QUIET_PHASE_SAMPLING_ENABLED = false;
 static constexpr uint32_t OCXO_QUIET_PHASE_PERIOD_TICKS = OCXO_CADENCE_INTERVAL_TICKS;
 static constexpr uint32_t OCXO1_QUIET_PHASE_TICKS = 2500U;  // +250 us
 static constexpr uint32_t OCXO2_QUIET_PHASE_TICKS = 7500U;  // +750 us
@@ -1372,6 +1387,21 @@ struct ocxo_lane_t {
   uint32_t witness_valid_publish_count = 0;
   uint32_t witness_early_service_published_count = 0;
   bool     witness_last_event_published = false;
+
+  // Rollover-only EMA DWT authority.  The one-second event delivered to Alpha
+  // uses ema_last_emitted_dwt, not the raw ISR-service DWT.  The observed ISR
+  // endpoint is retained only as a diagnostic and as the interval sample that
+  // updates the EMA predictor.
+  bool     ema_initialized = false;
+  bool     ema_interval_valid = false;
+  uint32_t ema_last_observed_dwt = 0;
+  uint32_t ema_last_emitted_dwt = 0;
+  uint32_t ema_last_observed_interval_cycles = 0;
+  uint32_t ema_interval_cycles = 0;
+  uint32_t ema_last_predicted_dwt = 0;
+  int32_t  ema_last_error_cycles = 0;
+  uint32_t ema_max_abs_error_cycles = 0;
+  uint32_t ema_update_count = 0;
 };
 static ocxo_lane_t g_ocxo1_lane;
 static ocxo_lane_t g_ocxo2_lane;
@@ -1392,7 +1422,8 @@ static void ocxo_qtimer_diag_record(ocxo_runtime_context_t& ctx,
                                     uint32_t service_offset_abs_ticks,
                                     uint32_t target_delta_mod65536_ticks,
                                     uint16_t target_low16,
-                                    uint16_t isr_counter_low16);
+                                    uint16_t isr_counter_low16,
+                                    bool ema_predicted);
 static bool ocxo_lane_start_local_cadence(interrupt_subscriber_kind_t kind,
                                           ocxo_lane_t& lane,
                                           synthetic_clock32_t& clock32,
@@ -1403,6 +1434,7 @@ static bool ocxo_lane_start_local_cadence_at_target(interrupt_subscriber_kind_t 
                                                     uint32_t target_counter32,
                                                     uint32_t reason);
 static void ocxo_lane_stop_local_cadence(ocxo_lane_t& lane, uint32_t reason);
+static void ocxo_lane_ema_reset(ocxo_lane_t& lane);
 static void ocxo_lane_install_logical_grid(interrupt_subscriber_kind_t kind,
                                            ocxo_lane_t& lane,
                                            synthetic_clock32_t& clock32,
@@ -1517,7 +1549,7 @@ static ocxo_runtime_context_t g_ocxo1_ctx = {
   interrupt_lane_t::QTIMER2_CH0_COMP,
   "OCXO1",
   "ocxo1",
-  "QTIMER2_CH0_LOCAL_1KHZ_QUIET_PHASE_COMPARE",
+  "QTIMER2_CH0_LOCAL_1KHZ_ROLLOVER_COMPARE",
   "QTIMER2_CH0_LOCAL_SYNTHETIC_COUNTER32",
   "QTIMER2_CH0_ISR_ENTRY_DWT",
   "OCXO1_FACT_DRAIN",
@@ -1533,7 +1565,7 @@ static ocxo_runtime_context_t g_ocxo2_ctx = {
   interrupt_lane_t::QTIMER3_CH3_COMP,
   "OCXO2",
   "ocxo2",
-  "QTIMER3_CH3_LOCAL_1KHZ_QUIET_PHASE_COMPARE",
+  "QTIMER3_CH3_LOCAL_1KHZ_ROLLOVER_COMPARE",
   "QTIMER3_CH3_LOCAL_SYNTHETIC_COUNTER32",
   "QTIMER3_CH3_ISR_ENTRY_DWT",
   "OCXO2_FACT_DRAIN",
@@ -3257,13 +3289,34 @@ static bool ocxo_lane_start_local_cadence(interrupt_subscriber_kind_t kind,
     lane.bootstrap_count++;
   }
 
-  // Quiet-phase custody deliberately makes the published one-second sample
-  // cadence relative to the first quiet sample, not to the SmartZero anchor's
-  // arbitrary millisecond phase.  The counter delta between published events
-  // remains exactly 10,000,000 ticks.
-  lane.tick_mod_1000 = 0U;
+  // Rollover-only custody publishes on the logical 10,000,000-tick grid.
+  // tick_mod_1000 stores the number of +10,000 cadence steps already implied
+  // by the next target, minus one because ocxo_cadence_update_sample_phase()
+  // increments before checking for the 1000th step.
+  if (lane.cadence_epoch_valid) {
+    const uint32_t delta = target - lane.cadence_epoch_counter32;
+    const uint32_t steps_to_target = delta / OCXO_CADENCE_INTERVAL_TICKS;
+    lane.tick_mod_1000 = (steps_to_target == 0U)
+        ? 0U
+        : ((steps_to_target - 1U) % TICKS_PER_SECOND_EVENT);
+  } else {
+    lane.tick_mod_1000 = 0U;
+  }
 
   return ocxo_lane_start_local_cadence_at_target(kind, lane, clock32, target, reason);
+}
+
+static void ocxo_lane_ema_reset(ocxo_lane_t& lane) {
+  lane.ema_initialized = false;
+  lane.ema_interval_valid = false;
+  lane.ema_last_observed_dwt = 0;
+  lane.ema_last_emitted_dwt = 0;
+  lane.ema_last_observed_interval_cycles = 0;
+  lane.ema_interval_cycles = 0;
+  lane.ema_last_predicted_dwt = 0;
+  lane.ema_last_error_cycles = 0;
+  lane.ema_max_abs_error_cycles = 0;
+  lane.ema_update_count = 0;
 }
 
 static void ocxo_lane_stop_local_cadence(ocxo_lane_t& lane, uint32_t reason) {
@@ -3282,6 +3335,7 @@ static void ocxo_lane_install_logical_grid(interrupt_subscriber_kind_t kind,
   lane.cadence_epoch_valid = true;
   lane.cadence_epoch_counter32 = epoch_counter32;
   lane.tick_mod_1000 = 0;
+  ocxo_lane_ema_reset(lane);
   lane.witness_previous_event_counter32_valid = false;
   lane.witness_previous_event_counter32 = 0;
   lane.witness_last_counter_delta_ticks = 0;
@@ -3458,26 +3512,22 @@ static void ocxo_lane_disable_compare(ocxo_lane_t& lane) {
 //   5. refresh the synthetic 32-bit lane anchor,
 //   6. enqueue the perishable fact for foreground interpretation.
 //
-// Dynamic 100 Hz prediction has been retired; OCXO 100 Hz samples are no
-// longer queued from the ISR. The old single-slot OCXO deferred edge mailbox
-// is gone; the perishable fact ring is the sole OCXO ISR-to-foreground handoff.
+// Dynamic 100 Hz prediction has been retired. The old single-slot OCXO
+// deferred edge mailbox is gone; the one-second fact ring is the sole OCXO
+// ISR-to-foreground handoff.
 // ============================================================================
 
 // ----------------------------------------------------------------------------
-// Standardized OCXO perishable-fact ring — ISR capture, ASAP interpretation.
+// OCXO one-second fact ring — ISR capture, ASAP interpretation.
 // ----------------------------------------------------------------------------
 //
-// This is the conservative first step toward the universal interrupt capture
-// pipeline.  The ISR captures only facts that would be lost if delayed:
-// first-instruction DWT, authored compare target identity, service-time
-// hardware low word, service offset, compare flag state, and minimal class.
-// Foreground ASAP drains the ring, updates diagnostics, audits custody, and
-// dispatches the one-second event to CLOCKS/Alpha.
+// The former build enqueued every 1 kHz OCXO cadence sample and asked
+// foreground TimePop ASAP to drain/interpret them. That proved too expensive.
+// The rollover-only build keeps the 1 kHz hardware ladder but enqueues only
+// the 1000th sample that represents an OCXO one-second event. Intermediate
+// cadence ticks rearm the local compare and update small lane counters only.
 //
-// The ring is intentionally per-lane and loss-visible.  The cadence rail is
-// now 1 kHz, so the buffer must absorb short foreground/ASAP stalls without
-// ever silently overwriting a perishable sample.  Size 32 spans 32 ms at the
-// new cadence while remaining small enough for deterministic ISR writes.
+// The ring remains per-lane and loss-visible, but its normal rate is now 1 Hz.
 
 static constexpr uint32_t OCXO_PERISHABLE_FACT_RING_SIZE = 32;
 
@@ -3691,14 +3741,17 @@ static void ocxo_qtimer_diag_record(ocxo_runtime_context_t& ctx,
                                     uint32_t service_offset_abs_ticks = 0,
                                     uint32_t target_delta_mod65536_ticks = 0,
                                     uint16_t target_low16 = 0,
-                                    uint16_t isr_counter_low16 = 0) {
+                                    uint16_t isr_counter_low16 = 0,
+                                    bool ema_predicted = false) {
   if (!ctx.qtimer_diag) return;
 
   ocxo_qtimer_diag_t& d = *ctx.qtimer_diag;
   d.count++;
   d.dwt_raw = isr_entry_dwt_raw;
   d.event_dwt = event_dwt;
-  d.dwt_coordinate_source = OCXO_DWT_SOURCE_ISR_ENTRY;
+  d.dwt_coordinate_source = ema_predicted
+      ? OCXO_DWT_SOURCE_EMA_PREDICTED
+      : OCXO_DWT_SOURCE_ISR_ENTRY;
   d.late_ticks = legacy_late_ticks;
   d.interpreted_late_ticks = interpreted_late_ticks;
   d.early_ticks = early_ticks;
@@ -3707,6 +3760,70 @@ static void ocxo_qtimer_diag_record(ocxo_runtime_context_t& ctx,
   d.target_delta_mod65536_ticks = target_delta_mod65536_ticks;
   d.target_low16 = target_low16;
   d.isr_counter_low16 = isr_counter_low16;
+}
+
+static uint32_t ocxo_ema_abs_i32(int32_t value) {
+  return (uint32_t)(value < 0 ? -(int64_t)value : (int64_t)value);
+}
+
+static int32_t ocxo_ema_round_shift(int32_t value, uint32_t shift) {
+  if (shift == 0) return value;
+  const int32_t half = (int32_t)(1U << (shift - 1U));
+  if (value >= 0) return (value + half) >> shift;
+  return -(((-value) + half) >> shift);
+}
+
+static uint32_t ocxo_lane_ema_predict_dwt(ocxo_lane_t& lane,
+                                          uint32_t observed_dwt,
+                                          bool* out_synthetic,
+                                          int32_t* out_error_cycles) {
+  if (out_synthetic) *out_synthetic = false;
+  if (out_error_cycles) *out_error_cycles = 0;
+
+  if (!OCXO_EMA_DWT_AUTHORITY_ENABLED) {
+    return observed_dwt;
+  }
+
+  if (!lane.ema_initialized) {
+    lane.ema_initialized = true;
+    lane.ema_last_observed_dwt = observed_dwt;
+    lane.ema_last_emitted_dwt = observed_dwt;
+    lane.ema_last_predicted_dwt = observed_dwt;
+    lane.ema_last_observed_interval_cycles = 0;
+    lane.ema_last_error_cycles = 0;
+    lane.ema_update_count++;
+    return observed_dwt;
+  }
+
+  const uint32_t observed_interval = observed_dwt - lane.ema_last_observed_dwt;
+  lane.ema_last_observed_interval_cycles = observed_interval;
+
+  if (!lane.ema_interval_valid || lane.ema_interval_cycles == 0) {
+    lane.ema_interval_cycles = observed_interval;
+    lane.ema_interval_valid = true;
+  } else {
+    const int32_t err = (int32_t)((int64_t)observed_interval -
+                                  (int64_t)lane.ema_interval_cycles);
+    lane.ema_interval_cycles = (uint32_t)((int64_t)lane.ema_interval_cycles +
+        (int64_t)ocxo_ema_round_shift(err, OCXO_EMA_SHIFT));
+  }
+
+  const uint32_t predicted = lane.ema_last_emitted_dwt + lane.ema_interval_cycles;
+  const int32_t prediction_error = (int32_t)(observed_dwt - predicted);
+  lane.ema_last_error_cycles = prediction_error;
+  const uint32_t abs_error = ocxo_ema_abs_i32(prediction_error);
+  if (abs_error > lane.ema_max_abs_error_cycles) {
+    lane.ema_max_abs_error_cycles = abs_error;
+  }
+
+  lane.ema_last_observed_dwt = observed_dwt;
+  lane.ema_last_emitted_dwt = predicted;
+  lane.ema_last_predicted_dwt = predicted;
+  lane.ema_update_count++;
+
+  if (out_synthetic) *out_synthetic = true;
+  if (out_error_cycles) *out_error_cycles = prediction_error;
+  return predicted;
 }
 
 static void ocxo_apply_perishable_fact_deferred(
@@ -3775,9 +3892,34 @@ static void ocxo_apply_perishable_fact_deferred(
     lane->witness_on_or_after_service_count++;
   }
 
+  // Linear regression is disabled and the OCXO per-sample forensic experiment
+  // has been retired from the hot path.  Only one-second rollover facts reach
+  // this foreground drain.
+
+  if (!fact.one_second_due || !rt || !rt->active) {
+    return;
+  }
+
+  bool ema_synthetic = false;
+  int32_t ema_error_cycles = 0;
+  const uint32_t observed_dwt = fact.service_dwt_at_event;
+
+  // A skipped or duplicated one-second target is a custody discontinuity, not
+  // an interval sample.  Do not let it poison the EMA predictor.
+  if (lane->witness_previous_event_counter32_valid) {
+    const uint32_t prior_delta =
+        fact.target_counter32 - lane->witness_previous_event_counter32;
+    if (prior_delta != OCXO_WITNESS_ONE_SECOND_COUNTS) {
+      ocxo_lane_ema_reset(*lane);
+    }
+  }
+
+  const uint32_t published_dwt = ocxo_lane_ema_predict_dwt(
+      *lane, observed_dwt, &ema_synthetic, &ema_error_cycles);
+
   ocxo_qtimer_diag_record(ctx,
                           fact.isr_entry_dwt_raw,
-                          fact.service_dwt_at_event,
+                          published_dwt,
                           fact.target_delta_mod65536_ticks,
                           fact.interpreted_late_ticks,
                           fact.early_ticks,
@@ -3785,23 +3927,12 @@ static void ocxo_apply_perishable_fact_deferred(
                           fact.service_offset_abs_ticks,
                           fact.target_delta_mod65536_ticks,
                           fact.target_low16,
-                          fact.service_counter_low16);
-
-  // Linear regression is disabled for the quiet-phase custody checkpoint.
-  // Keep the cadence_user_callback_count as a visible hook, but do not feed
-  // sample windows or populate regression diagnostics.
-
-  if (!fact.one_second_due || !rt || !rt->active) {
-    return;
-  }
+                          fact.service_counter_low16,
+                          ema_synthetic);
 
   lane->witness_fire_count++;
   lane->irq_count++;
   lane->logical_count32_at_last_second = fact.target_counter32;
-  // Publish the quiet-zone sample DWT.  Alpha receives the phase metadata in
-  // interrupt_capture_diag_t and may back-project this sample to the logical
-  // one-second boundary for physics/accounting.
-  const uint32_t published_dwt = fact.service_dwt_at_event;
 
   lane->witness_last_event_dwt = published_dwt;
   lane->witness_last_event_counter32 = fact.target_counter32;
@@ -3825,14 +3956,24 @@ static void ocxo_apply_perishable_fact_deferred(
   lane->witness_previous_event_counter32 = fact.target_counter32;
   lane->witness_previous_event_counter32_valid = true;
 
+  dwt_repair_diag_t ema_diag{};
+  ema_diag.valid = true;
+  ema_diag.candidate = ema_synthetic;
+  ema_diag.synthetic = ema_synthetic;
+  ema_diag.original_dwt = observed_dwt;
+  ema_diag.predicted_dwt = published_dwt;
+  ema_diag.used_dwt = published_dwt;
+  ema_diag.error_cycles = ema_error_cycles;
+  ema_diag.reason = ema_synthetic ? "ocxo_ema" : "ocxo_ema_init";
+
   // We are already in TimePop ASAP/foreground context. Dispatch the authored
-  // quiet-zone OCXO sample directly from the fact drain.
+  // rollover OCXO edge directly from the fact drain.
   emit_one_second_event(*rt,
                         published_dwt,
                         fact.target_counter32,
                         0,
                         false,
-                        nullptr,
+                        &ema_diag,
                         true,
                         nullptr);
 }
@@ -4163,9 +4304,11 @@ static void ocxo_cadence_compare_isr(ocxo_runtime_context_t& ctx,
   ocxo_cadence_rearm_or_stop(ctx, sample, cadence_reauthored_by_smartzero);
   ocxo_cadence_update_one_second_witness(ctx, sample);
 
-  interrupt_perishable_fact_t fact =
-      ocxo_cadence_build_perishable_fact(ctx, sample);
-  ocxo_cadence_enqueue_fact(ctx, fact);
+  if (sample.one_second_due && sample.had_active_rt) {
+    interrupt_perishable_fact_t fact =
+        ocxo_cadence_build_perishable_fact(ctx, sample);
+    ocxo_cadence_enqueue_fact(ctx, fact);
+  }
 }
 
 static void qtimer2_isr(void) {
@@ -4723,6 +4866,7 @@ bool interrupt_start(interrupt_subscriber_kind_t kind) {
   lane->active = true;
   lane->phase_bootstrapped = true;
   lane->tick_mod_1000 = 0;
+  ocxo_lane_ema_reset(*lane);
 
   // OCXO lanes now own their local 1 kHz rollover cadence.  Start the
   // compare ladder from the installed logical grid when available; otherwise
@@ -5055,7 +5199,7 @@ void process_interrupt_enable_irqs(void) {
 
   if (!OCXO1_DISABLED) {
     attachInterruptVector(IRQ_QTIMER2, qtimer2_isr);
-    NVIC_SET_PRIORITY(IRQ_QTIMER2, 0);
+    NVIC_SET_PRIORITY(IRQ_QTIMER2, INTERRUPT_STEP0_EXPECTED_QTIMER2_PRIORITY);
     g_step0_qtimer2_priority_applied = 0;
     NVIC_ENABLE_IRQ(IRQ_QTIMER2);
     g_step0_qtimer2_irq_enabled_by_interrupt = true;
@@ -5066,7 +5210,7 @@ void process_interrupt_enable_irqs(void) {
 
   if (!OCXO2_DISABLED) {
     attachInterruptVector(IRQ_QTIMER3, qtimer3_isr);
-    NVIC_SET_PRIORITY(IRQ_QTIMER3, 0);
+    NVIC_SET_PRIORITY(IRQ_QTIMER3, INTERRUPT_STEP0_EXPECTED_QTIMER3_PRIORITY);
     g_step0_qtimer3_priority_applied = 0;
     NVIC_ENABLE_IRQ(IRQ_QTIMER3);
     g_step0_qtimer3_irq_enabled_by_interrupt = true;
@@ -5416,15 +5560,19 @@ static void add_runtime_payload(Payload& p) {
   p.add("ocxo2_irq_qtimer3_disabled", OCXO2_DISABLED);
   p.add("ocxo_smartzero_surrogates_enabled", OCXO_DISABLE_EXPERIMENT);
   p.add("ocxo_quiet_phase_sampling_enabled", OCXO_QUIET_PHASE_SAMPLING_ENABLED);
+  p.add("ocxo_rollover_only_mode", !OCXO_QUIET_PHASE_SAMPLING_ENABLED);
+  p.add("ocxo_ema_dwt_authority_enabled", OCXO_EMA_DWT_AUTHORITY_ENABLED);
+  p.add("ocxo_ema_alpha_numerator", OCXO_EMA_ALPHA_NUMERATOR);
+  p.add("ocxo_ema_alpha_denominator", OCXO_EMA_ALPHA_DENOMINATOR);
   p.add("ocxo1_quiet_phase_ticks", OCXO1_QUIET_PHASE_TICKS);
   p.add("ocxo1_quiet_phase_us", ocxo_phase_ticks_to_us(OCXO1_QUIET_PHASE_TICKS));
   p.add("ocxo2_quiet_phase_ticks", OCXO2_QUIET_PHASE_TICKS);
   p.add("ocxo2_quiet_phase_us", ocxo_phase_ticks_to_us(OCXO2_QUIET_PHASE_TICKS));
-  p.add("timing_arch_step", "OCXO_QUIET_PHASE_CADENCE_NO_REGRESSION");
+  p.add("timing_arch_step", "OCXO_ROLLOVER_ONLY_EMA_DWT");
   p.add("timing_arch_behavior_changed", true);
   p.add("timing_arch_vclock_authority", "QTIMER1_CH2_TIMEPOP_DIRECT_SAFEMODE");
-  p.add("timing_arch_ocxo_model", "LOCAL_QTIMER_1KHZ_QUIET_PHASE_ROLLOVER");
-  p.add("timing_arch_ocxo_migration_stage", "QUIET_PHASE_DWT_AUTHORITY");
+  p.add("timing_arch_ocxo_model", "LOCAL_QTIMER_1KHZ_ROLLOVER_ONLY");
+  p.add("timing_arch_ocxo_migration_stage", "EMA_DWT_AUTHORITY");
   p.add("subscriber_count", g_subscriber_count);
   p.add("single_cadence_agent", false);
   p.add("cadence_minder_isr_mode", true);
@@ -5474,6 +5622,10 @@ static void add_cadence_minder_payload(Payload& p) {
   p.add("ocxo_cadence_interval_ticks", OCXO_CADENCE_INTERVAL_TICKS);
   p.add("ocxo_cadence_samples_per_second", TICKS_PER_SECOND_EVENT);
   p.add("ocxo_quiet_phase_sampling_enabled", OCXO_QUIET_PHASE_SAMPLING_ENABLED);
+  p.add("ocxo_rollover_only_mode", !OCXO_QUIET_PHASE_SAMPLING_ENABLED);
+  p.add("ocxo_ema_dwt_authority_enabled", OCXO_EMA_DWT_AUTHORITY_ENABLED);
+  p.add("ocxo_ema_alpha_numerator", OCXO_EMA_ALPHA_NUMERATOR);
+  p.add("ocxo_ema_alpha_denominator", OCXO_EMA_ALPHA_DENOMINATOR);
   p.add("ocxo_quiet_phase_period_ticks", OCXO_QUIET_PHASE_PERIOD_TICKS);
   p.add("ocxo1_quiet_phase_ticks", OCXO1_QUIET_PHASE_TICKS);
   p.add("ocxo1_quiet_phase_us", ocxo_phase_ticks_to_us(OCXO1_QUIET_PHASE_TICKS));
@@ -5793,7 +5945,7 @@ static void add_ocxo_identity_payload(Payload& p,
   p.add("hardware_lane", interrupt_lane_str(ctx.lane_id));
   p.add("cadence_source", ctx.cadence_source);
   p.add("counter_source", ctx.counter_source);
-  p.add("event_source", "LOCAL_CADENCE_1000TH_QUIET_PHASE_SAMPLE");
+  p.add("event_source", "LOCAL_CADENCE_1000TH_ROLLOVER_EMA_EDGE");
   p.add("dwt_authority", ctx.dwt_authority);
 }
 
@@ -5894,6 +6046,20 @@ static void add_ocxo_witness_service_payload(payload_prefix_t& out,
   out.add_u32("witness_fact_high_water", lane.witness_fact_high_water);
   out.add_u32("witness_fact_asap_arm_count", lane.witness_fact_asap_arm_count);
   out.add_u32("witness_fact_asap_fail_count", lane.witness_fact_asap_fail_count);
+  out.add_bool("ema_dwt_authority_enabled", OCXO_EMA_DWT_AUTHORITY_ENABLED);
+  out.add_u32("ema_alpha_numerator", OCXO_EMA_ALPHA_NUMERATOR);
+  out.add_u32("ema_alpha_denominator", OCXO_EMA_ALPHA_DENOMINATOR);
+  out.add_bool("ema_initialized", lane.ema_initialized);
+  out.add_bool("ema_interval_valid", lane.ema_interval_valid);
+  out.add_u32("ema_update_count", lane.ema_update_count);
+  out.add_u32("ema_last_observed_dwt", lane.ema_last_observed_dwt);
+  out.add_u32("ema_last_emitted_dwt", lane.ema_last_emitted_dwt);
+  out.add_u32("ema_last_observed_interval_cycles",
+              lane.ema_last_observed_interval_cycles);
+  out.add_u32("ema_interval_cycles", lane.ema_interval_cycles);
+  out.add_u32("ema_last_predicted_dwt", lane.ema_last_predicted_dwt);
+  out.add_i32("ema_last_error_cycles", lane.ema_last_error_cycles);
+  out.add_u32("ema_max_abs_error_cycles", lane.ema_max_abs_error_cycles);
   out.add_u32("witness_schedule_last_decision",
               lane.witness_schedule_last_decision);
   out.add_str("witness_schedule_last_decision_name",
@@ -5916,6 +6082,13 @@ static void add_ocxo_cadence_sample_payload(payload_prefix_t& out,
   out.add_u32("cadence_last_early_ticks", lane.cadence_last_early_ticks);
   out.add_bool("cadence_last_was_early", lane.cadence_last_was_early);
   out.add_bool("cadence_last_one_second_due", lane.cadence_last_one_second_due);
+  out.add_bool("ema_initialized", lane.ema_initialized);
+  out.add_u32("ema_update_count", lane.ema_update_count);
+  out.add_u32("ema_last_observed_interval_cycles",
+              lane.ema_last_observed_interval_cycles);
+  out.add_u32("ema_interval_cycles", lane.ema_interval_cycles);
+  out.add_u32("ema_last_predicted_dwt", lane.ema_last_predicted_dwt);
+  out.add_i32("ema_last_error_cycles", lane.ema_last_error_cycles);
 }
 
 static void add_ocxo_witness_detail_payload(payload_prefix_t& out,
@@ -6115,6 +6288,11 @@ static void add_ocxo_compact_payload(Payload& p,
   out.add_u32("fact_overflow_count", ring.overflow_count);
   out.add_u32("fact_high_water", ring.high_water);
   out.add_u32("fact_asap_fail_count", ring.asap_fail_count);
+  out.add_bool("ema_dwt_authority_enabled", OCXO_EMA_DWT_AUTHORITY_ENABLED);
+  out.add_bool("ema_initialized", lane.ema_initialized);
+  out.add_u32("ema_update_count", lane.ema_update_count);
+  out.add_u32("ema_interval_cycles", lane.ema_interval_cycles);
+  out.add_i32("ema_last_error_cycles", lane.ema_last_error_cycles);
   out.add_bool("linear_regression_enabled", OCXO_LINEAR_REGRESSION_ENABLED);
 
   const cadence_regression_lane_t* regression = cadence_regression_for_const(ctx.kind);
@@ -6159,7 +6337,7 @@ static Payload cmd_report(const Payload&) {
   p.add("ocxo1_quiet_phase_us", ocxo_phase_ticks_to_us(OCXO1_QUIET_PHASE_TICKS));
   p.add("ocxo2_quiet_phase_ticks", OCXO2_QUIET_PHASE_TICKS);
   p.add("ocxo2_quiet_phase_us", ocxo_phase_ticks_to_us(OCXO2_QUIET_PHASE_TICKS));
-  p.add("timing_arch_step", "OCXO_QUIET_PHASE_CADENCE_NO_REGRESSION");
+  p.add("timing_arch_step", "OCXO_ROLLOVER_ONLY_EMA_DWT");
   p.add("timing_arch_behavior_changed", true);
   p.add("linear_regression_authored_dwt", LINEAR_REGRESSION_AUTHORED_DWT);
   p.add("linear_regression_diagnostic_only", LINEAR_REGRESSION_DIAGNOSTIC_ONLY);

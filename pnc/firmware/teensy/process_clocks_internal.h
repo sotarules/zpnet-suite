@@ -74,8 +74,8 @@
 //   independent rails:
 //     PPS    — physical GPIO PPS edge-to-edge DWT interval
 //     VCLOCK — canonical PPS/VCLOCK lattice edge-to-edge DWT interval
-//     OCXO1  — OCXO1 phase-projected boundary-to-boundary DWT interval
-//     OCXO2  — OCXO2 phase-projected boundary-to-boundary DWT interval
+//     OCXO1  — OCXO1 EMA-predicted boundary-to-boundary DWT interval
+//     OCXO2  — OCXO2 EMA-predicted boundary-to-boundary DWT interval
 //   Beta publishes the compact audit.
 //
 // VCLOCK as measured peer of OCXO:
@@ -295,10 +295,10 @@ struct clocks_alpha_lane_forensics_t {
   uint64_t event_gnss_ns;
   uint64_t previous_event_gnss_ns;
 
-  // Process_interrupt-authored GNSS witness for the actual subscriber event
-  // sample.  For OCXO lanes this is the quiet-zone sample timestamp, not the
-  // Alpha phase-backprojected logical one-second boundary.  Passive forensic
-  // storage only; residual/servo promotion is a later step.
+  // Process_interrupt-authored GNSS witness for the subscriber event.  In the
+  // rollover-only EMA build, OCXO lanes normally arrive already at the logical
+  // one-second edge; the older quiet-zone sample fields remain compatibility
+  // surfaces only.
   bool     sample_gnss_ns_at_event_available;
   bool     previous_sample_gnss_ns_at_event_available;
   uint64_t sample_gnss_ns_at_event;
@@ -327,7 +327,7 @@ struct clocks_alpha_lane_forensics_t {
   uint64_t diag_anchor_ns_delta;
   uint32_t diag_anchor_failure_mask;
 
-  // OCXO compare-service diagnostics copied from interrupt_capture_diag_t.
+  // OCXO compare-service / EMA diagnostics copied from interrupt_capture_diag_t.
   // Valid only for OCXO1/OCXO2 lanes; zero for VCLOCK or unavailable diag.
   uint32_t diag_service_class;
   int32_t  diag_service_offset_signed_ticks;

@@ -5,7 +5,8 @@
 // Interrupt custody and low-word counter cadence:
 //
 //   • VCLOCK lane   (critical recurring TimePop client on QTimer1 CH2)
-//   • OCXO lanes    (local 1 kHz QTimer compare cadence on QTimer2 CH0 / QTimer3 CH3)
+//   • OCXO lanes    (local 1 kHz QTimer rollover ladder on QTimer2 CH0 / QTimer3 CH3;
+//                    only every 1000th tick publishes a one-second event)
 //   • Cadence minder (TimePop VCLOCK/relay heartbeat; no longer OCXO rollover owner)
 //   • TimePop       (QTimer1 CH2, hosted scheduler/client rail)
 //   • PPS GPIO edge (diagnostics + dispatch authority + epoch anchor)
@@ -113,10 +114,11 @@
 //     OCXO1  : QTimer2 CH0 local compare every +10,000 OCXO ticks.
 //     OCXO2  : QTimer3 CH3 local compare every +10,000 OCXO ticks.
 //
-//   OCXO compare ISRs schedule the next +10,000-tick target immediately, then
-//   enqueue the perishable service facts into the lane ring for TimePop ASAP
-//   foreground interpretation.  Every 1000th OCXO cadence sample remains the
-//   public one-second event consumed by CLOCKS/Alpha.
+//   OCXO compare ISRs schedule the next +10,000-tick target immediately.  The
+//   intermediate 1 kHz ticks are rollover maintenance only.  Every 1000th OCXO
+//   cadence tick is deferred to foreground as a one-second event consumed by
+//   CLOCKS/Alpha.  Its subscriber-facing DWT is EMA-predicted from completed
+//   one-second intervals, while the ISR-captured DWT remains diagnostic.
 // ============================================================================
 
 #pragma once
@@ -185,10 +187,9 @@ struct interrupt_event_t {
   interrupt_event_status_t    status   = interrupt_event_status_t::OK;
 
   // Traditional event-coordinate DWT of the lane's one-second event.
-  // For OCXO quiet-zone custody this is the observed quiet-zone sample; the
-  // diagnostic payload carries its phase so subscribers may reconstruct the
-  // logical one-second boundary.  Linear regression is disabled in this
-  // checkpoint and does not replace this value.
+  // VCLOCK uses the authored TimePop/QTimer event coordinate.  OCXO lanes now
+  // publish an EMA-predicted one-second edge DWT; the ISR-captured endpoint is
+  // retained in diagnostics as dwt_original_at_event.
   uint32_t dwt_at_event = 0;
 
   // GNSS ns at the event.  For VCLOCK, authored from the VCLOCK counter
@@ -245,10 +246,9 @@ struct interrupt_capture_diag_t {
   uint64_t gnss_ns_at_event   = 0;
   uint32_t counter32_at_event = 0;
 
-  // DWT admissibility / repair audit.  dwt_at_event remains the authoritative
-  // coordinate.  While repair is diagnostic-only, dwt_synthetic is false and
-  // dwt_repair_candidate indicates that the observed endpoint would have been
-  // replaced if operational repair were enabled.
+  // DWT admissibility / repair/prediction audit.  dwt_at_event remains the
+  // authoritative subscriber coordinate.  For OCXO lanes, dwt_synthetic may be
+  // true when the EMA-predicted edge replaces the observed ISR endpoint.
   bool     dwt_synthetic = false;
   bool     dwt_repair_candidate = false;
   uint32_t dwt_original_at_event = 0;
@@ -343,10 +343,9 @@ struct interrupt_capture_diag_t {
   uint32_t ocxo_last_bad_counter_delta = 0;
   uint32_t ocxo_last_counter_delta_ticks = 0;
 
-  // OCXO quiet-zone sample phase.  These fields are populated only for OCXO
-  // one-second subscriber events.  The event DWT/counter32 describe the clean
-  // observed quiet-zone sample; process_clocks may use this explicit phase
-  // metadata to back-project the sample to the logical one-second boundary.
+  // OCXO sample phase.  Quiet-phase publication has been retired in the
+  // rollover-only EMA build, so these fields are normally false/zero.  They are
+  // retained for compatibility with older Alpha/report code.
   bool     ocxo_sample_phase_valid = false;
   uint32_t ocxo_sample_phase_ticks = 0;     // 10 MHz ticks; 2500 = +250 us
   uint32_t ocxo_sample_phase_ns = 0;
@@ -701,8 +700,8 @@ bool interrupt_last_epoch_capture(interrupt_epoch_capture_t* out);
 //   ...
 //   epoch + 10,000,000
 //
-// Every cadence event is a future regression sample; every thousandth cadence
-// event is the OCXO-local one-second edge delivered to Alpha.
+// Every thousandth cadence event is the OCXO-local one-second edge delivered
+// to Alpha.  Intermediate 1 kHz ticks are rollover maintenance only.
 void interrupt_ocxo_logical_grid_epoch(uint32_t ocxo1_epoch_counter32,
                                        uint32_t ocxo2_epoch_counter32);
 

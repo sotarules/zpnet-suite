@@ -8,11 +8,10 @@
 // mirror.  No slot staging, no installed event wrappers, no late hardware
 // reads masquerading as event truth.
 //
-// OCXO events may be deliberately sampled in quiet zones inside the VCLOCK
-// millisecond cell.  Alpha consumes the explicit sample phase diagnostic and
-// back-projects the observed sample to the logical one-second boundary before
-// applying OCXO physics/accounting.  The raw quiet-zone sample remains visible
-// in the forensic diagnostics.
+// OCXO events are now delivered as rollover-only one-second events whose DWT
+// coordinate is EMA-predicted by process_interrupt from completed one-second
+// intervals.  Alpha still accepts the older sample-phase diagnostic surface for
+// compatibility, but the normal EMA path arrives already at the logical edge.
 //
 // PPS is a selector/witness. process_interrupt authors the selected PPS/VCLOCK
 // edge identity, while the physical PPS/GPIO DWT witness supplies the smooth
@@ -993,8 +992,8 @@ static inline void clocks_alpha_dmb(void) {
 // symmetric rails are tracked independently:
 //   PPS    — physical GPIO PPS edge-to-edge DWT interval
 //   VCLOCK — canonical PPS/VCLOCK lattice edge-to-edge DWT interval
-//   OCXO1  — OCXO1 witness edge-to-edge DWT interval
-//   OCXO2  — OCXO2 witness edge-to-edge DWT interval
+//   OCXO1  — OCXO1 EMA-predicted edge-to-edge DWT interval
+//   OCXO2  — OCXO2 EMA-predicted edge-to-edge DWT interval
 
 struct alpha_static_prediction_store_t {
   volatile uint32_t seq = 0;
