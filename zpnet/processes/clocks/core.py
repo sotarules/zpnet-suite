@@ -156,32 +156,60 @@ SYNC_RECOVER_TIMEOUT_S = 45.0
 SYNC_POLL_S = 0.005
 SYNC_LOG_INTERVAL_S = 2.0
 
-# Fragment queue: maxsize=0 means unbounded
-FRAGMENT_QUEUE_MAXSIZE = 0
+# TIMEBASE ingress queue: maxsize=0 means unbounded
+#
+# TIMEBASE_FRAGMENT and TIMEBASE_FORENSICS arrive independently on PUBSUB.
+# The PUBSUB handlers enqueue tiny topic/payload envelopes; the processor
+# thread performs the exact PPS-count pair join before building TIMEBASE.
+TIMEBASE_INGRESS_QUEUE_MAXSIZE = 0
+TIMEBASE_FRAGMENT_TOPIC = "TIMEBASE_FRAGMENT"
+TIMEBASE_FORENSICS_TOPIC = "TIMEBASE_FORENSICS"
+TIMEBASE_PAIR_TIMEOUT_S = 5.0
 
 PREFLIGHT_POLL_INTERVAL_S = 30
 PREFLIGHT_LOG_PREFIX = "🛡️ [preflight]"
 
 # ---------------------------------------------------------------------
-# Fragment queue (decouples reception from processing)
+# TIMEBASE ingress queue + exact-pair state
 # ---------------------------------------------------------------------
 
-_fragment_queue: queue.Queue[Dict[str, Any]] = queue.Queue(maxsize=FRAGMENT_QUEUE_MAXSIZE)
+_fragment_queue: queue.Queue[Dict[str, Any]] = queue.Queue(maxsize=TIMEBASE_INGRESS_QUEUE_MAXSIZE)
+
+_timebase_pair_lock = threading.Lock()
+_timebase_pending_pairs: Dict[int, Dict[str, Any]] = {}
+_last_completed_timebase_pair_count: Optional[int] = None
 
 # ---------------------------------------------------------------------
 # Diagnostics (monotonic counters + last anomaly snapshots)
 # ---------------------------------------------------------------------
 
 _diag: Dict[str, Any] = {
-    # Fragment ingress (PUBSUB handler — fast path)
+    # Fragment/forensics ingress (PUBSUB handler — fast path)
     "fragments_received": 0,
     "fragments_queued": 0,
     "fragments_missing_teensy_pps_count": 0,     # legacy diagnostic alias
     "fragments_missing_teensy_pps_vclock_count": 0,
+    "forensics_received": 0,
+    "forensics_queued": 0,
+    "forensics_missing_teensy_pps_count": 0,
+    "forensics_missing_teensy_pps_vclock_count": 0,
+
+    # TIMEBASE exact-pair join (processor thread — slow path)
+    "timebase_pieces_processed": 0,
+    "timebase_pairs_completed": 0,
+    "timebase_pairs_pending": 0,
+    "timebase_pairs_stale_incomplete": 0,
+    "timebase_pair_duplicate_role": 0,
+    "timebase_pair_late_or_duplicate_count": 0,
+    "timebase_pair_campaign_mismatch": 0,
+    "timebase_pair_version_mismatch": 0,
+    "timebase_pair_timeout": 0,
+    "last_timebase_pair_fault": {},
 
     # Fragment processing (processor thread — slow path)
     "fragments_processed": 0,
     "fragments_ignored_no_campaign": 0,
+    "forensics_ignored_no_campaign": 0,
     "queue_depth_max_seen": 0,
     "queue_depth_current": 0,
 
@@ -929,7 +957,7 @@ def _end_sync_wait(timeout_s: float = SYNC_FRAGMENT_TIMEOUT_S) -> Tuple[Dict[str
     """Block until the sync fragment arrives or timeout.  Hard fault on timeout."""
     global _sync_expected_pps_vclock
 
-    logging.info("⏳ [_end_sync_wait] waiting for TIMEBASE_FRAGMENT PPS/VCLOCK count >= %s...", str(_sync_expected_pps_vclock))
+    logging.info("⏳ [_end_sync_wait] waiting for complete TIMEBASE pair PPS/VCLOCK count >= %s...", str(_sync_expected_pps_vclock))
 
     t0 = time.monotonic()
     last_log = t0
@@ -947,7 +975,7 @@ def _end_sync_wait(timeout_s: float = SYNC_FRAGMENT_TIMEOUT_S) -> Tuple[Dict[str
 
         if now - last_log >= SYNC_LOG_INTERVAL_S:
             logging.info(
-                "⏳ [_end_sync_wait] still waiting for TIMEBASE_FRAGMENT PPS/VCLOCK count >= %s "
+                "⏳ [_end_sync_wait] still waiting for complete TIMEBASE pair PPS/VCLOCK count >= %s "
                 "(%.3fs elapsed, %.3fs remaining)",
                 str(_sync_expected_pps_vclock),
                 now - t0,
@@ -973,6 +1001,25 @@ def _end_sync_wait(timeout_s: float = SYNC_FRAGMENT_TIMEOUT_S) -> Tuple[Dict[str
         frag = dict(_sync_fragment or {})
         _sync_expected_pps_vclock = None
         return frag, float(waited)
+
+
+def _signal_sync_pair_if_needed(fragment: Dict[str, Any], pps_vclock_count: int) -> None:
+    """Satisfy START/RECOVER sync only after the complete TIMEBASE pair is present."""
+    global _sync_fragment
+
+    with _sync_lock:
+        if _sync_expected_pps_vclock is None:
+            return
+
+        match = int(pps_vclock_count) >= int(_sync_expected_pps_vclock)
+        logging.info(
+            "🔎 [timebase_pair] @%s complete pair arrived: teensy_pps_vclock_count=%d "
+            "(waiting for >=%d) match=%s",
+            system_time_z(), int(pps_vclock_count), int(_sync_expected_pps_vclock), str(match),
+        )
+        if match:
+            _sync_fragment = dict(fragment)
+            _sync_event.set()
 
 
 # ---------------------------------------------------------------------
@@ -1002,6 +1049,19 @@ def _compute_ppb(clock_ns: int, gnss_ns: int) -> float:
 PPS_VCLOCK_COUNT_KEY = "teensy_pps_vclock_count"
 
 
+def _path_get(mapping: Dict[str, Any], path: str) -> Any:
+    """Return mapping[path] where path may be dotted, or None if absent."""
+    cur: Any = mapping
+    for part in path.split("."):
+        if not isinstance(cur, dict) or part not in cur:
+            return None
+        cur = cur.get(part)
+    return cur
+
+
+def _float_path(mapping: Dict[str, Any], path: str) -> Optional[float]:
+    return _first_float(_path_get(mapping, path))
+
 
 def _as_int(value: Any) -> Optional[int]:
     if value is None:
@@ -1021,21 +1081,21 @@ def _first_present_int(mapping: Dict[str, Any], *keys: str) -> Optional[int]:
     return None
 
 
-def _extract_teensy_pps_vclock_count(fragment: Dict[str, Any]) -> int:
+def _extract_teensy_pps_vclock_count(publication: Dict[str, Any], *, topic: str = TIMEBASE_FRAGMENT_TOPIC) -> int:
     """
-    Return the mandatory canonical one-second identity from a TIMEBASE_FRAGMENT.
+    Return the mandatory canonical one-second identity from a Teensy TIMEBASE publication.
 
     No fallbacks.  No ledger-derived repair.  If this field is missing or
-    invalid, the fragment is not a valid TIMEBASE_FRAGMENT.  The explicit
+    invalid, the publication is not a valid TIMEBASE pair member.  The explicit
     Teensy-authored PPS/VCLOCK count is the only identity surface.
     """
-    if PPS_VCLOCK_COUNT_KEY not in fragment or fragment.get(PPS_VCLOCK_COUNT_KEY) is None:
-        raise ValueError("TIMEBASE_FRAGMENT missing mandatory teensy_pps_vclock_count")
+    if PPS_VCLOCK_COUNT_KEY not in publication or publication.get(PPS_VCLOCK_COUNT_KEY) is None:
+        raise ValueError(f"{topic} missing mandatory teensy_pps_vclock_count")
     try:
-        return int(fragment[PPS_VCLOCK_COUNT_KEY])
+        return int(publication[PPS_VCLOCK_COUNT_KEY])
     except (TypeError, ValueError) as e:
         raise ValueError(
-            f"TIMEBASE_FRAGMENT invalid teensy_pps_vclock_count={fragment.get(PPS_VCLOCK_COUNT_KEY)!r}"
+            f"{topic} invalid teensy_pps_vclock_count={publication.get(PPS_VCLOCK_COUNT_KEY)!r}"
         ) from e
 
 
@@ -1060,9 +1120,19 @@ def _extract_last_timebase_count(last_tb: Dict[str, Any], fragment: Dict[str, An
         ) from e
 
 
+def _first_present_int_path(mapping: Dict[str, Any], *keys: str) -> Optional[int]:
+    for key in keys:
+        value = _path_get(mapping, key) if "." in key else mapping.get(key)
+        if value is not None:
+            parsed = _as_int(value)
+            if parsed is not None:
+                return parsed
+    return None
+
+
 def _fragment_ns(fragment: Dict[str, Any], *keys: str, default: int = 0) -> int:
-    """Extract an integer nanosecond ledger from a TIMEBASE_FRAGMENT."""
-    value = _first_present_int(fragment, *keys)
+    """Extract an integer nanosecond ledger from a TIMEBASE_FRAGMENT, including V3 nested paths."""
+    value = _first_present_int_path(fragment, *keys)
     return int(value) if value is not None else int(default)
 
 
@@ -1074,6 +1144,11 @@ def _report_fragment(report: Dict[str, Any]) -> Dict[str, Any]:
 def _report_extra_clocks(report: Dict[str, Any]) -> Dict[str, Any]:
     extra = report.get("extra_clocks")
     return extra if isinstance(extra, dict) else {}
+
+
+def _report_forensics(report: Dict[str, Any]) -> Dict[str, Any]:
+    forensics = report.get("forensics")
+    return forensics if isinstance(forensics, dict) else {}
 
 
 def _first_float(*values: Any) -> Optional[float]:
@@ -1100,11 +1175,11 @@ def _baseline_ppb_from_report(report: Dict[str, Any]) -> Dict[str, float]:
 
     candidates = {
         "gnss": 0.0,
-        "vclock": _first_float(frag.get("vclock_ppb"), report.get("vclock_ppb")),
+        "vclock": _first_float(_path_get(frag, "stats.vclock.ppb"), frag.get("vclock_ppb"), report.get("vclock_ppb")),
         "gnss_raw": _first_float(extra.get("gnss_raw_ppb"), report.get("gnss_raw_ppb")),
-        "dwt": _first_float(frag.get("dwt_ppb"), report.get("dwt_ppb")),
-        "ocxo1": _first_float(frag.get("ocxo1_ppb"), report.get("ocxo1_ppb")),
-        "ocxo2": _first_float(frag.get("ocxo2_ppb"), report.get("ocxo2_ppb")),
+        "dwt": _first_float(_path_get(frag, "stats.dwt.ppb"), frag.get("dwt_ppb"), report.get("dwt_ppb")),
+        "ocxo1": _first_float(_path_get(frag, "stats.ocxo1.ppb"), frag.get("ocxo1_ppb"), report.get("ocxo1_ppb")),
+        "ocxo2": _first_float(_path_get(frag, "stats.ocxo2.ppb"), frag.get("ocxo2_ppb"), report.get("ocxo2_ppb")),
     }
 
     return {k: round(v, 3) for k, v in candidates.items() if v is not None}
@@ -1117,11 +1192,11 @@ def _baseline_tau_from_report(report: Dict[str, Any]) -> Dict[str, float]:
 
     candidates = {
         "gnss": 1.0,
-        "vclock": _first_float(frag.get("vclock_tau"), report.get("vclock_tau")),
+        "vclock": _first_float(_path_get(frag, "stats.vclock.tau"), frag.get("vclock_tau"), report.get("vclock_tau")),
         "gnss_raw": _first_float(extra.get("gnss_raw_tau"), report.get("gnss_raw_tau")),
-        "dwt": _first_float(frag.get("dwt_tau"), report.get("dwt_tau")),
-        "ocxo1": _first_float(frag.get("ocxo1_tau"), report.get("ocxo1_tau")),
-        "ocxo2": _first_float(frag.get("ocxo2_tau"), report.get("ocxo2_tau")),
+        "dwt": _first_float(_path_get(frag, "stats.dwt.tau"), frag.get("dwt_tau"), report.get("dwt_tau")),
+        "ocxo1": _first_float(_path_get(frag, "stats.ocxo1.tau"), frag.get("ocxo1_tau"), report.get("ocxo1_tau")),
+        "ocxo2": _first_float(_path_get(frag, "stats.ocxo2.tau"), frag.get("ocxo2_tau"), report.get("ocxo2_tau")),
     }
 
     return {k: round(v, 12) for k, v in candidates.items() if v is not None}
@@ -1130,9 +1205,15 @@ def _baseline_tau_from_report(report: Dict[str, Any]) -> Dict[str, float]:
 def _baseline_dac_from_report(report: Dict[str, Any]) -> Dict[str, float]:
     """Extract instantaneous DAC setpoints from the current TIMEBASE-shaped report."""
     frag = _report_fragment(report)
+    forensics = _report_forensics(report)
     out: Dict[str, float] = {}
     for key in ("ocxo1", "ocxo2"):
-        v = _first_float(frag.get(f"{key}_dac"), report.get(f"{key}_dac"))
+        v = _first_float(
+            _path_get(forensics, f"dac.{key}.value"),
+            _path_get(frag, f"dac.{key}.value"),
+            frag.get(f"{key}_dac"),
+            report.get(f"{key}_dac"),
+        )
         if v is not None:
             out[key] = round(v, 6)
     return out
@@ -1146,13 +1227,12 @@ def _baseline_dac_mean_from_report(report: Dict[str, Any]) -> Dict[str, float]:
     for key in ("ocxo1", "ocxo2"):
         current_v = current.get(key)
         v = _first_float(
+            _path_get(frag, f"stats.dac.{key}.mean"),
             frag.get(f"{key}_dac_welford_mean"),
             report.get(f"{key}_dac_welford_mean"),
             report.get(f"{key}_dac_mean"),
             current_v,
         )
-        # A zero DAC mean in old/partial reports is almost certainly a stale
-        # field-shape artifact when the instantaneous DAC is populated.
         if v == 0.0 and current_v is not None and current_v > 0.0:
             v = current_v
         if v is not None:
@@ -1166,12 +1246,20 @@ def _baseline_dac_stats_from_report(report: Dict[str, Any]) -> Dict[str, Dict[st
     out: Dict[str, Dict[str, float | int]] = {}
     for key in ("ocxo1", "ocxo2"):
         prefix = f"{key}_dac_welford"
-        n = _as_int(frag.get(f"{prefix}_n"))
-        mean = _first_float(frag.get(f"{prefix}_mean"))
-        sd = _first_float(frag.get(f"{prefix}_stddev"))
-        se = _first_float(frag.get(f"{prefix}_stderr"))
-        mn = _first_float(frag.get(f"{prefix}_min"))
-        mx = _first_float(frag.get(f"{prefix}_max"))
+        n = _as_int(_path_get(frag, f"stats.dac.{key}.n"))
+        mean = _first_float(_path_get(frag, f"stats.dac.{key}.mean"))
+        sd = _first_float(_path_get(frag, f"stats.dac.{key}.stddev"))
+        se = _first_float(_path_get(frag, f"stats.dac.{key}.stderr"))
+        mn = _first_float(_path_get(frag, f"stats.dac.{key}.min"))
+        mx = _first_float(_path_get(frag, f"stats.dac.{key}.max"))
+
+        n = n if n is not None else _as_int(frag.get(f"{prefix}_n"))
+        mean = mean if mean is not None else _first_float(frag.get(f"{prefix}_mean"))
+        sd = sd if sd is not None else _first_float(frag.get(f"{prefix}_stddev"))
+        se = se if se is not None else _first_float(frag.get(f"{prefix}_stderr"))
+        mn = mn if mn is not None else _first_float(frag.get(f"{prefix}_min"))
+        mx = mx if mx is not None else _first_float(frag.get(f"{prefix}_max"))
+
         stats: Dict[str, float | int] = {}
         if n is not None:
             stats["n"] = int(n)
@@ -1412,6 +1500,221 @@ def on_watchdog_anomaly(payload: Payload) -> None:
         _diag["watchdog_anomaly_recovery_started"] += 1
 
 
+def _enqueue_timebase_piece(topic: str, payload: Dict[str, Any]) -> None:
+    """
+    Enqueue one Teensy TIMEBASE publication for processor-thread pairing.
+    """
+    _fragment_queue.put({"topic": topic, "payload": dict(payload)})
+
+    depth = _fragment_queue.qsize()
+    _diag["queue_depth_current"] = depth
+    if depth > _diag["queue_depth_max_seen"]:
+        _diag["queue_depth_max_seen"] = depth
+
+
+def _drain_timebase_ingress_and_pending() -> int:
+    """Drain inbound TIMEBASE pieces and clear incomplete pair state."""
+    global _last_completed_timebase_pair_count
+
+    drained = 0
+    while not _fragment_queue.empty():
+        try:
+            _fragment_queue.get_nowait()
+            drained += 1
+        except queue.Empty:
+            break
+
+    with _timebase_pair_lock:
+        pending = len(_timebase_pending_pairs)
+        _timebase_pending_pairs.clear()
+        _last_completed_timebase_pair_count = None
+        _diag["timebase_pairs_pending"] = 0
+
+    return drained + pending
+
+
+def _timebase_pair_fault(reason: str, details: Dict[str, Any]) -> None:
+    """Record and escalate an exact-pair integrity failure."""
+    _diag["last_timebase_pair_fault"] = {
+        "ts_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        "reason": reason,
+        "details": details,
+    }
+    _hard_fault(reason, details)
+
+
+def _check_timebase_pair_timeouts() -> None:
+    """Fault if one half of a TIMEBASE pair arrives without its companion."""
+    if not _campaign_active and _sync_expected_pps_vclock is None:
+        return
+
+    now = time.monotonic()
+    fault_details = None
+    with _timebase_pair_lock:
+        for count, slot in sorted(_timebase_pending_pairs.items()):
+            first_seen = float(slot.get("first_seen_monotonic", now))
+            age_s = now - first_seen
+            if age_s >= TIMEBASE_PAIR_TIMEOUT_S:
+                fault_details = {
+                    "pps_vclock_count": int(count),
+                    "pps_count": int(count),
+                    "age_s": round(age_s, 3),
+                    "timeout_s": TIMEBASE_PAIR_TIMEOUT_S,
+                    "has_fragment": "fragment" in slot,
+                    "has_forensics": "forensics" in slot,
+                    "roles_present": sorted(list(slot.keys())),
+                }
+                _timebase_pending_pairs.clear()
+                _diag["timebase_pairs_pending"] = 0
+                break
+
+    if fault_details is not None:
+        _diag["timebase_pair_timeout"] += 1
+        _timebase_pair_fault("timebase_pair_timeout", fault_details)
+
+
+def _validate_completed_timebase_pair(
+    *,
+    pps_vclock_count: int,
+    fragment: Dict[str, Any],
+    forensics: Dict[str, Any],
+) -> None:
+    """Validate the two halves of a completed TIMEBASE publication pair."""
+    fragment_count = _extract_teensy_pps_vclock_count(fragment, topic=TIMEBASE_FRAGMENT_TOPIC)
+    forensics_count = _extract_teensy_pps_vclock_count(forensics, topic=TIMEBASE_FORENSICS_TOPIC)
+    if fragment_count != forensics_count or fragment_count != int(pps_vclock_count):
+        _timebase_pair_fault(
+            "timebase_pair_identity_mismatch",
+            {
+                "pair_pps_vclock_count": int(pps_vclock_count),
+                "fragment_pps_vclock_count": int(fragment_count),
+                "forensics_pps_vclock_count": int(forensics_count),
+            },
+        )
+
+    fragment_campaign = str(fragment.get("campaign") or "")
+    forensics_campaign = str(forensics.get("campaign") or "")
+    if fragment_campaign and forensics_campaign and fragment_campaign != forensics_campaign:
+        _diag["timebase_pair_campaign_mismatch"] += 1
+        _timebase_pair_fault(
+            "timebase_pair_campaign_mismatch",
+            {
+                "pps_vclock_count": int(pps_vclock_count),
+                "fragment_campaign": fragment_campaign,
+                "forensics_campaign": forensics_campaign,
+            },
+        )
+
+    fragment_pair_version = _as_int(fragment.get("timebase_pair_version"))
+    forensics_pair_version = _as_int(forensics.get("timebase_pair_version"))
+    if (
+        fragment_pair_version is not None
+        and forensics_pair_version is not None
+        and fragment_pair_version != forensics_pair_version
+    ):
+        _diag["timebase_pair_version_mismatch"] += 1
+        _timebase_pair_fault(
+            "timebase_pair_version_mismatch",
+            {
+                "pps_vclock_count": int(pps_vclock_count),
+                "fragment_pair_version": int(fragment_pair_version),
+                "forensics_pair_version": int(forensics_pair_version),
+            },
+        )
+
+
+def _accept_timebase_piece_for_pair(
+    *,
+    topic: str,
+    payload: Dict[str, Any],
+    pps_vclock_count: int,
+) -> Optional[Tuple[Dict[str, Any], Dict[str, Any], int]]:
+    """
+    Store one TIMEBASE half and return a completed (fragment, forensics, count)
+    tuple only when the exact PPS-count pair is present.
+    """
+    global _last_completed_timebase_pair_count
+
+    if topic == TIMEBASE_FRAGMENT_TOPIC:
+        role = "fragment"
+    elif topic == TIMEBASE_FORENSICS_TOPIC:
+        role = "forensics"
+    else:
+        _timebase_pair_fault("timebase_unknown_piece_topic", {"topic": topic})
+        return None
+
+    fault_reason: Optional[str] = None
+    fault_details: Dict[str, Any] = {}
+
+    with _timebase_pair_lock:
+        last_completed = _last_completed_timebase_pair_count
+        if last_completed is not None and int(pps_vclock_count) <= int(last_completed):
+            _diag["timebase_pair_late_or_duplicate_count"] += 1
+            fault_reason = "timebase_pair_late_or_duplicate_count"
+            fault_details = {
+                "topic": topic,
+                "role": role,
+                "pps_vclock_count": int(pps_vclock_count),
+                "last_completed_pps_vclock_count": int(last_completed),
+            }
+
+        stale_counts = sorted(k for k in _timebase_pending_pairs.keys() if int(k) < int(pps_vclock_count))
+        if stale_counts and fault_reason is None:
+            _diag["timebase_pairs_stale_incomplete"] += len(stale_counts)
+            fault_reason = "timebase_pair_incomplete_before_new_identity"
+            fault_details = {
+                "topic": topic,
+                "role": role,
+                "incoming_pps_vclock_count": int(pps_vclock_count),
+                "stale_pending_counts": [int(k) for k in stale_counts],
+                "stale_pending_roles": {
+                    str(k): sorted(list(_timebase_pending_pairs[k].keys()))
+                    for k in stale_counts
+                },
+            }
+
+        if fault_reason is not None:
+            _timebase_pending_pairs.clear()
+            _diag["timebase_pairs_pending"] = 0
+        else:
+            slot = _timebase_pending_pairs.setdefault(
+                int(pps_vclock_count),
+                {
+                    "first_seen_monotonic": time.monotonic(),
+                    "first_seen_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+                },
+            )
+            if role in slot:
+                _diag["timebase_pair_duplicate_role"] += 1
+                fault_reason = "timebase_pair_duplicate_role"
+                fault_details = {
+                    "topic": topic,
+                    "role": role,
+                    "pps_vclock_count": int(pps_vclock_count),
+                    "existing_roles": sorted(list(slot.keys())),
+                }
+                _timebase_pending_pairs.clear()
+                _diag["timebase_pairs_pending"] = 0
+            else:
+                slot[role] = dict(payload)
+                _diag["timebase_pairs_pending"] = len(_timebase_pending_pairs)
+
+                if "fragment" in slot and "forensics" in slot:
+                    fragment = dict(slot["fragment"])
+                    forensics = dict(slot["forensics"])
+                    del _timebase_pending_pairs[int(pps_vclock_count)]
+                    _last_completed_timebase_pair_count = int(pps_vclock_count)
+                    _diag["timebase_pairs_pending"] = len(_timebase_pending_pairs)
+                    _diag["timebase_pairs_completed"] += 1
+                    return fragment, forensics, int(pps_vclock_count)
+
+    if fault_reason is not None:
+        _timebase_pair_fault(fault_reason, fault_details)
+
+    return None
+
+
+
 # ---------------------------------------------------------------------
 # Fragment handler (PUBSUB — fast path, NEVER blocks)
 # ---------------------------------------------------------------------
@@ -1421,22 +1724,16 @@ def on_timebase_fragment(payload: Payload) -> None:
     """
     PUBSUB handler for TIMEBASE_FRAGMENT.
 
-    This runs on the PUBSUB delivery thread.  It MUST return immediately.
-    All it does:
-      1. Extract teensy_pps_vclock_count.
-      2. Handle sync latch (for START/RECOVER waits).
-      3. Drop fragment into the processing queue.
-    No IPC, no I/O, no sleep, no database.
+    Fast path only: validate identity, satisfy sync waits, enqueue the fragment
+    half for exact-pair processing with TIMEBASE_FORENSICS.
     """
     global _sync_fragment
 
     _diag["fragments_received"] += 1
-
     frag = dict(payload)
 
-    # --- Extract canonical PPS/VCLOCK count ---
     try:
-        pps_vclock_count = _extract_teensy_pps_vclock_count(frag)
+        pps_vclock_count = _extract_teensy_pps_vclock_count(frag, topic=TIMEBASE_FRAGMENT_TOPIC)
     except ValueError:
         _diag["fragments_missing_teensy_pps_count"] += 1
         _diag["fragments_missing_teensy_pps_vclock_count"] += 1
@@ -1449,26 +1746,38 @@ def on_timebase_fragment(payload: Payload) -> None:
 
     _normalize_fragment_count_aliases(frag, pps_vclock_count)
 
-    # --- Sync latch (for START/RECOVER waits) ---
-    with _sync_lock:
-        if _sync_expected_pps_vclock is not None:
-            match = int(pps_vclock_count) >= int(_sync_expected_pps_vclock)
-            logging.info(
-                "🔎 [on_timebase_fragment] @%s fragment arrived: teensy_pps_vclock_count=%d (waiting for >=%d) match=%s",
-                system_time_z(), pps_vclock_count, _sync_expected_pps_vclock, str(match),
-            )
-            if match:
-                _sync_fragment = dict(frag)
-                _sync_event.set()
+    # Sync waits are satisfied only by the processor thread after the exact
+    # TIMEBASE_FRAGMENT/TIMEBASE_FORENSICS pair is complete.
 
-    # --- Enqueue for processing ---
-    _fragment_queue.put(dict(frag))
+    _enqueue_timebase_piece(TIMEBASE_FRAGMENT_TOPIC, frag)
     _diag["fragments_queued"] += 1
 
-    depth = _fragment_queue.qsize()
-    _diag["queue_depth_current"] = depth
-    if depth > _diag["queue_depth_max_seen"]:
-        _diag["queue_depth_max_seen"] = depth
+
+def on_timebase_forensics(payload: Payload) -> None:
+    """
+    PUBSUB handler for TIMEBASE_FORENSICS.
+
+    Fast path only: validate identity and enqueue the forensic half for the
+    processor-thread exact-pair join.
+    """
+    _diag["forensics_received"] += 1
+    forensic = dict(payload)
+
+    try:
+        pps_vclock_count = _extract_teensy_pps_vclock_count(forensic, topic=TIMEBASE_FORENSICS_TOPIC)
+    except ValueError:
+        _diag["forensics_missing_teensy_pps_count"] += 1
+        _diag["forensics_missing_teensy_pps_vclock_count"] += 1
+        logging.exception(
+            "💥 [clocks] invalid TIMEBASE_FORENSICS identity; keys=%s payload=%s",
+            sorted(list(forensic.keys())),
+            forensic,
+        )
+        return
+
+    _normalize_fragment_count_aliases(forensic, pps_vclock_count)
+    _enqueue_timebase_piece(TIMEBASE_FORENSICS_TOPIC, forensic)
+    _diag["forensics_queued"] += 1
 
 
 # ---------------------------------------------------------------------
@@ -1490,35 +1799,75 @@ def _process_loop() -> None:
 
     while True:
         try:
-            frag = _fragment_queue.get(timeout=5.0)
+            piece = _fragment_queue.get(timeout=0.25)
         except queue.Empty:
+            try:
+                _check_timebase_pair_timeouts()
+            except RuntimeError:
+                continue
+            continue
+
+        _diag["timebase_pieces_processed"] += 1
+        _diag["queue_depth_current"] = _fragment_queue.qsize()
+
+        topic = str(piece.get("topic") or "")
+        payload = piece.get("payload")
+        if not isinstance(payload, dict):
+            logging.error("💥 [clocks] processor received malformed TIMEBASE piece: %s", piece)
+            continue
+
+        try:
+            pps_piece_count = _extract_teensy_pps_vclock_count(payload, topic=topic or "TIMEBASE")
+        except ValueError:
+            if topic == TIMEBASE_FORENSICS_TOPIC:
+                _diag["forensics_missing_teensy_pps_count"] += 1
+                _diag["forensics_missing_teensy_pps_vclock_count"] += 1
+            else:
+                _diag["fragments_missing_teensy_pps_count"] += 1
+                _diag["fragments_missing_teensy_pps_vclock_count"] += 1
+            logging.exception("💥 [clocks] processor received invalid %s identity", topic or "TIMEBASE piece")
+            continue
+
+        _normalize_fragment_count_aliases(payload, pps_piece_count)
+
+        try:
+            completed = _accept_timebase_piece_for_pair(
+                topic=topic,
+                payload=payload,
+                pps_vclock_count=int(pps_piece_count),
+            )
+        except RuntimeError:
+            continue
+        if completed is None:
+            continue
+
+        frag, forensics, pps_vclock_count = completed
+        try:
+            _validate_completed_timebase_pair(
+                pps_vclock_count=pps_vclock_count,
+                fragment=frag,
+                forensics=forensics,
+            )
+        except RuntimeError:
+            continue
+
+        _signal_sync_pair_if_needed(frag, pps_vclock_count)
+
+        # --- No campaign => ignore only after the exact pair has completed ---
+        # This keeps recovery/cold-start sync traffic from leaving one half of a
+        # pair orphaned in the join buffer.
+        if not _campaign_active:
+            _diag["fragments_ignored_no_campaign"] += 1
+            _diag["forensics_ignored_no_campaign"] += 1
             continue
 
         _diag["fragments_processed"] += 1
-        _diag["queue_depth_current"] = _fragment_queue.qsize()
-
-        # --- Extract canonical PPS/VCLOCK count ---
-        try:
-            pps_vclock_count = _extract_teensy_pps_vclock_count(frag)
-        except ValueError:
-            _diag["fragments_missing_teensy_pps_count"] += 1
-            _diag["fragments_missing_teensy_pps_vclock_count"] += 1
-            logging.exception("💥 [clocks] processor received invalid TIMEBASE_FRAGMENT identity")
-            continue
-
-            _normalize_fragment_count_aliases(frag, pps_vclock_count)
         _note_pps_vclock_count(pps_vclock_count)
-
-        # --- No campaign => ignore ---
-        if not _campaign_active:
-            _diag["fragments_ignored_no_campaign"] += 1
-            continue
 
         # --- Accept Teensy PPS/VCLOCK count as observed truth ---
         #
-        # Do not compare this fragment against an armed/expected Pi-side count.
+        # Do not compare this pair against an armed/expected Pi-side count.
         # The Pi is a TIMEBASE traffic cop here, not a campaign-count authority.
-        # If the Teensy sends a valid TIMEBASE_FRAGMENT identity, process it.
         _accepted_pps_vclock_count = int(pps_vclock_count)
         _diag["accepted_pps_count"] = _accepted_pps_vclock_count
         _diag["accepted_pps_vclock_count"] = _accepted_pps_vclock_count
@@ -1593,6 +1942,8 @@ def _process_loop() -> None:
 
         # --- Build TIMEBASE record ---
         timebase = {
+            "schema": "TIMEBASE_V3",
+            "timebase_pair_version": frag.get("timebase_pair_version"),
             "campaign": campaign,
             "campaign_elapsed": _seconds_to_hms(int(pps_vclock_count)),
             "location": campaign_payload.get("location"),
@@ -1604,8 +1955,9 @@ def _process_loop() -> None:
             "teensy_pps_count": int(pps_vclock_count),   # legacy alias
             "pps_count": int(pps_vclock_count),          # legacy alias
 
-            # Entire TIMEBASE_FRAGMENT — the authoritative clock record
+            # Teensy-authored exact pair, ferried through unchanged.
             "fragment": frag,
+            "forensics": forensics,
 
             # Environment snapshot (correlated with this PPS edge)
             "environment": env_snapshot,
@@ -1638,13 +1990,26 @@ def _process_loop() -> None:
         # both instantaneous DAC setpoints and firmware-owned DAC Welford means
         # current so a baseline selected late in a campaign captures the real
         # clock-control state, not stale legacy field names.
-        teensy_ocxo1_dac = frag.get("ocxo1_dac")
-        teensy_ocxo2_dac = frag.get("ocxo2_dac")
-        teensy_calibrate = frag.get("calibrate_ocxo")
+        forensics_dac = forensics.get("dac") if isinstance(forensics.get("dac"), dict) else {}
+        forensics_env = forensics.get("environmental") if isinstance(forensics.get("environmental"), dict) else {}
+        forensics_dac_ocxo1 = forensics_dac.get("ocxo1") if isinstance(forensics_dac.get("ocxo1"), dict) else {}
+        forensics_dac_ocxo2 = forensics_dac.get("ocxo2") if isinstance(forensics_dac.get("ocxo2"), dict) else {}
+        fragment_stats = frag.get("stats") if isinstance(frag.get("stats"), dict) else {}
+        fragment_stats_dac = fragment_stats.get("dac") if isinstance(fragment_stats.get("dac"), dict) else {}
+        fragment_stats_dac_ocxo1 = fragment_stats_dac.get("ocxo1") if isinstance(fragment_stats_dac.get("ocxo1"), dict) else {}
+        fragment_stats_dac_ocxo2 = fragment_stats_dac.get("ocxo2") if isinstance(fragment_stats_dac.get("ocxo2"), dict) else {}
+
+        teensy_ocxo1_dac = forensics_dac_ocxo1.get("value", frag.get("ocxo1_dac"))
+        teensy_ocxo2_dac = forensics_dac_ocxo2.get("value", frag.get("ocxo2_dac"))
+        teensy_calibrate = (
+            forensics_dac.get("calibrate_ocxo")
+            or forensics_env.get("calibrate_ocxo")
+            or frag.get("calibrate_ocxo")
+        )
         ocxo1_dac_current = _first_float(teensy_ocxo1_dac)
         ocxo2_dac_current = _first_float(teensy_ocxo2_dac)
-        ocxo1_dac_mean = _first_float(frag.get("ocxo1_dac_welford_mean"), ocxo1_dac_current)
-        ocxo2_dac_mean = _first_float(frag.get("ocxo2_dac_welford_mean"), ocxo2_dac_current)
+        ocxo1_dac_mean = _first_float(fragment_stats_dac_ocxo1.get("mean"), frag.get("ocxo1_dac_welford_mean"), ocxo1_dac_current)
+        ocxo2_dac_mean = _first_float(fragment_stats_dac_ocxo2.get("mean"), frag.get("ocxo2_dac_welford_mean"), ocxo2_dac_current)
 
         if ocxo1_dac_current is not None or ocxo2_dac_current is not None:
             campaign_dac_blob = {
@@ -1710,6 +2075,7 @@ def _reset_trackers() -> None:
     _last_pps_vclock_count_seen = None
     _gnss_canary_reset()
     _gnss_raw_reset()
+    _drain_timebase_ingress_and_pending()
 
 
 def _request_teensy_stop_best_effort() -> None:
@@ -1864,14 +2230,9 @@ def cmd_start(args: Optional[dict]) -> dict:
 
     _request_teensy_stop_best_effort()
 
-    # Drain stale fragments before arming START.  From this point forward the
-    # Pi accepts the next valid TIMEBASE_FRAGMENT asynchronously; the command
-    # path does not wait for it.
-    while not _fragment_queue.empty():
-        try:
-            _fragment_queue.get_nowait()
-        except queue.Empty:
-            break
+    # Drain stale TIMEBASE pieces before arming START. From this point forward
+    # the Pi accepts exact TIMEBASE_FRAGMENT + TIMEBASE_FORENSICS pairs asynchronously.
+    _drain_timebase_ingress_and_pending()
 
     _reset_trackers()
 
@@ -1978,6 +2339,7 @@ def cmd_stop(_: Optional[dict]) -> dict:
 
     _campaign_active = False
     _clear_start_wait_state()
+    _drain_timebase_ingress_and_pending()
     _reset_trackers()
 
     try:
@@ -2029,6 +2391,7 @@ def cmd_clear(_: Optional[dict]) -> dict:
 
         _campaign_active = False
         _clear_start_wait_state()
+        _drain_timebase_ingress_and_pending()
         _reset_trackers()
 
         logging.info("🗑️ [clocks] CLEAR: deleted %d timebase rows, %d campaigns", tb_count, camp_count)
@@ -2267,14 +2630,11 @@ def _recover_campaign() -> None:
             raise RuntimeError(f"recovery/cold failed: {e}")
 
         _wait_for_pubsub_route(context="recovery/cold", topic="TIMEBASE_FRAGMENT")
+        _wait_for_pubsub_route(context="recovery/cold", topic="TIMEBASE_FORENSICS")
 
         _request_teensy_stop_best_effort()
 
-        while not _fragment_queue.empty():
-            try:
-                _fragment_queue.get_nowait()
-            except queue.Empty:
-                break
+        _drain_timebase_ingress_and_pending()
 
         _reset_trackers()
 
@@ -2304,11 +2664,7 @@ def _recover_campaign() -> None:
         _diag["accepted_pps_count"] = _accepted_pps_vclock_count
         _diag["accepted_pps_vclock_count"] = _accepted_pps_vclock_count
 
-        while not _fragment_queue.empty():
-            try:
-                _fragment_queue.get_nowait()
-            except queue.Empty:
-                break
+        _drain_timebase_ingress_and_pending()
 
         _reset_trackers()
         _campaign_active = True
@@ -2344,6 +2700,9 @@ def _recover_campaign() -> None:
     # PPS/VCLOCK-era names and falling back to legacy top-level fields.
     last_gnss_ns = _fragment_ns(
         last_frag,
+        "gnss.ns",
+        "gnss.pps_vclock_ns",
+        "gnss.vclock_ns",
         "pps_vclock_ns",
         "vclock_ns",
         "pps_ns",
@@ -2352,17 +2711,22 @@ def _recover_campaign() -> None:
     )
     last_dwt_ns = _fragment_ns(
         last_frag,
+        "dwt.ns",
         "dwt_ns",
         default=int(last_tb.get("teensy_dwt_ns") or 0),
     )
     last_ocxo1_ns = _fragment_ns(
         last_frag,
+        "ocxo1.ns",
+        "gnss.ocxo1_ns",
         "ocxo1_ns",
         "ocxo1_ns_at_pps_vclock",
         default=int(last_tb.get("teensy_ocxo1_ns") or 0),
     )
     last_ocxo2_ns = _fragment_ns(
         last_frag,
+        "ocxo2.ns",
+        "gnss.ocxo2_ns",
         "ocxo2_ns",
         "ocxo2_ns_at_pps_vclock",
         default=int(last_tb.get("teensy_ocxo2_ns") or 0),
@@ -2416,6 +2780,7 @@ def _recover_campaign() -> None:
     _wait_for_preflight("recovery")
 
     _wait_for_pubsub_route(context="recovery", topic="TIMEBASE_FRAGMENT")
+    _wait_for_pubsub_route(context="recovery", topic="TIMEBASE_FORENSICS")
 
     # ------------------------------------------------------------------
     # Stop Teensy, quiesce, snap to second boundary
@@ -2424,15 +2789,9 @@ def _recover_campaign() -> None:
     _request_teensy_stop_best_effort()
     time.sleep(2.0)
 
-    _drained = 0
-    while not _fragment_queue.empty():
-        try:
-            _fragment_queue.get_nowait()
-            _drained += 1
-        except queue.Empty:
-            break
+    _drained = _drain_timebase_ingress_and_pending()
     if _drained > 0:
-        logging.info("🧹 [recovery] drained %d stale fragments from queue", _drained)
+        logging.info("🧹 [recovery] drained %d stale TIMEBASE pieces/pending halves", _drained)
 
     now_frac = time.time() % 1.0
     sleep_to_boundary = (1.0 - now_frac) + 0.050
@@ -2575,15 +2934,9 @@ def _recover_campaign() -> None:
     _diag["accepted_pps_count"] = _accepted_pps_vclock_count
     _diag["accepted_pps_vclock_count"] = _accepted_pps_vclock_count
 
-    _drained_post = 0
-    while not _fragment_queue.empty():
-        try:
-            _fragment_queue.get_nowait()
-            _drained_post += 1
-        except queue.Empty:
-            break
+    _drained_post = _drain_timebase_ingress_and_pending()
     if _drained_post > 0:
-        logging.info("🧹 [recovery] drained %d fragments accumulated during sync wait", _drained_post)
+        logging.info("🧹 [recovery] drained %d TIMEBASE pieces/pending halves accumulated during sync wait", _drained_post)
 
     _reset_trackers()
 
@@ -3312,7 +3665,7 @@ def run() -> None:
         "START while active performs seamless flash-cut to new campaign. "
         "Commands: START, STOP, RESUME, REPORT, CLEAR, DELETE, SET_DAC, DITHER, "
         "SET_BASELINE, BASELINE_INFO, LIST_CAMPAIGNS, CLOCKS_INFO. "
-        "Subscriptions: TIMEBASE_FRAGMENT, WATCHDOG_ANOMALY."
+        "Subscriptions: TIMEBASE_FRAGMENT, TIMEBASE_FORENSICS, WATCHDOG_ANOMALY."
     )
 
     # Foist global OCXO control configuration onto Teensy at boot.
@@ -3355,6 +3708,7 @@ def run() -> None:
         commands=COMMANDS,
         subscriptions={
             "TIMEBASE_FRAGMENT": on_timebase_fragment,
+            "TIMEBASE_FORENSICS": on_timebase_forensics,
             "WATCHDOG_ANOMALY": on_watchdog_anomaly,
         },
         blocking=False,

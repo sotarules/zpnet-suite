@@ -4,8 +4,9 @@
 //
 // Statistical surface doctrine:
 //
-//   Teensy owns every statistical quantity published in TIMEBASE_FRAGMENT.
-//   The Pi transcribes what the Teensy says — it does not recompute.
+//   Teensy owns every statistical quantity published in the TIMEBASE
+//   publication pair. The Pi transcribes what the Teensy says — it does not
+//   recompute.
 //
 //   Every Welford accumulator is published with the identical suffix set:
 //
@@ -46,7 +47,11 @@
 // Campaign lifecycle, DAC pacing, and watchdog behavior remain unchanged.
 // Servo inputs now consume the same PPS-founded OCXO residual surface that
 // feeds the OCXO Welfords, and DAC/TIMEBASE reports expose that provenance.
-// Servos are now ready.
+//
+// TIMEBASE publication is intentionally split:
+//   TIMEBASE_FRAGMENT   — compact canonical campaign row / science spine.
+//   TIMEBASE_FORENSICS  — companion diagnostic row for the same PPS identity.
+// The Pi pairs the two by pps_count and stores them as { fragment, forensics }.
 //
 // ============================================================================
 
@@ -93,11 +98,13 @@ uint64_t recover_gnss_ns  = 0;
 uint64_t recover_ocxo1_ns = 0;
 uint64_t recover_ocxo2_ns = 0;
 
-// Most recently published TIMEBASE_FRAGMENT, retained for cmd_report.
+// Most recently published compact TIMEBASE_FRAGMENT, retained for cmd_report.
+// TIMEBASE_FORENSICS is deliberately not retained; it is the larger companion
+// payload that this split keeps out of steady heap.
 static Payload g_last_fragment;
 
 // Alpha-authored physical PPS witness DWT audit surface.  These are published
-// into TIMEBASE_FRAGMENT so Pi-side reports can compare physical PPS-to-PPS
+// into the TIMEBASE publication pair so Pi-side reports can compare physical PPS-to-PPS
 // DWT intervals against the canonical PPS/VCLOCK DWT rail.
 extern volatile uint32_t g_pps_dwt_at_edge;
 extern volatile uint32_t g_pps_dwt_cycles_between_edges;
@@ -111,7 +118,8 @@ extern volatile bool     g_pps_dwt_cycles_between_edges_valid;
 // These counters deliberately do not change TIMEBASE_FRAGMENT shape or publish
 // behavior. They make it possible to distinguish whether Beta returned through
 // an early gate, reached per-second campaign work, stopped during fragment
-// construction, or called publish("TIMEBASE_FRAGMENT", p) and returned.
+// construction, or called publish("TIMEBASE_FRAGMENT", fragment) /
+// publish("TIMEBASE_FORENSICS", forensics) and returned.
 //
 // Focused report: CLOCKS.REPORT_TIMEBASE_PUBLISH
 
@@ -144,6 +152,10 @@ static constexpr uint32_t TIMEBASE_BUILD_STAGE_BUILD_COMPLETE = 32;
 static constexpr uint32_t TIMEBASE_BUILD_STAGE_ASSIGN_LAST_FRAGMENT = 33;
 static constexpr uint32_t TIMEBASE_BUILD_STAGE_PUBLISH_ATTEMPT = 34;
 static constexpr uint32_t TIMEBASE_BUILD_STAGE_PUBLISH_RETURN = 35;
+static constexpr uint32_t TIMEBASE_BUILD_STAGE_FORENSICS_BUILD_BEGIN = 36;
+static constexpr uint32_t TIMEBASE_BUILD_STAGE_FORENSICS_BUILD_COMPLETE = 37;
+static constexpr uint32_t TIMEBASE_BUILD_STAGE_FORENSICS_PUBLISH_ATTEMPT = 38;
+static constexpr uint32_t TIMEBASE_BUILD_STAGE_FORENSICS_PUBLISH_RETURN = 39;
 
 static uint32_t g_timebase_pps_entry_count = 0;
 static uint32_t g_timebase_stop_gate_count = 0;
@@ -159,6 +171,10 @@ static uint32_t g_timebase_build_complete_count = 0;
 static uint32_t g_timebase_assign_last_fragment_count = 0;
 static uint32_t g_timebase_publish_attempt_count = 0;
 static uint32_t g_timebase_publish_return_count = 0;
+static uint32_t g_timebase_forensics_build_begin_count = 0;
+static uint32_t g_timebase_forensics_build_complete_count = 0;
+static uint32_t g_timebase_forensics_publish_attempt_count = 0;
+static uint32_t g_timebase_forensics_publish_return_count = 0;
 
 static uint32_t g_timebase_last_stage = TIMEBASE_BUILD_STAGE_NONE;
 static uint64_t g_timebase_last_entry_campaign_seconds = 0;
@@ -169,6 +185,10 @@ static uint64_t g_timebase_last_build_complete_campaign_seconds = 0;
 static uint64_t g_timebase_last_assign_campaign_seconds = 0;
 static uint64_t g_timebase_last_publish_attempt_campaign_seconds = 0;
 static uint64_t g_timebase_last_publish_return_campaign_seconds = 0;
+static uint64_t g_timebase_last_forensics_build_begin_campaign_seconds = 0;
+static uint64_t g_timebase_last_forensics_build_complete_campaign_seconds = 0;
+static uint64_t g_timebase_last_forensics_publish_attempt_campaign_seconds = 0;
+static uint64_t g_timebase_last_forensics_publish_return_campaign_seconds = 0;
 static uint32_t g_timebase_last_public_count = 0;
 static uint64_t g_timebase_last_public_gnss_ns = 0;
 static uint64_t g_timebase_last_public_dwt_total = 0;
@@ -209,6 +229,10 @@ static const char* timebase_build_stage_name(uint32_t stage) {
     case TIMEBASE_BUILD_STAGE_ASSIGN_LAST_FRAGMENT: return "ASSIGN_LAST_FRAGMENT";
     case TIMEBASE_BUILD_STAGE_PUBLISH_ATTEMPT: return "PUBLISH_ATTEMPT";
     case TIMEBASE_BUILD_STAGE_PUBLISH_RETURN: return "PUBLISH_RETURN";
+    case TIMEBASE_BUILD_STAGE_FORENSICS_BUILD_BEGIN: return "FORENSICS_BUILD_BEGIN";
+    case TIMEBASE_BUILD_STAGE_FORENSICS_BUILD_COMPLETE: return "FORENSICS_BUILD_COMPLETE";
+    case TIMEBASE_BUILD_STAGE_FORENSICS_PUBLISH_ATTEMPT: return "FORENSICS_PUBLISH_ATTEMPT";
+    case TIMEBASE_BUILD_STAGE_FORENSICS_PUBLISH_RETURN: return "FORENSICS_PUBLISH_RETURN";
     default: return "NONE";
   }
 }
@@ -1112,18 +1136,16 @@ static void payload_add_lane_forensics_flat(Payload& p,
 
 
 // ============================================================================
-// TIMEBASE_FRAGMENT v2 — hierarchical publication helpers
+// TIMEBASE publication pair — hierarchical helpers
 // ============================================================================
 //
-// TIMEBASE_FRAGMENT used to publish almost everything as flat key/value pairs.
-// That was convenient for ad-hoc scripts, but it burned Payload entry slots and
-// arena bytes through repeated prefixes such as
-// ocxo1_forensics_regression_fit_error_abs_gt4_count.  The fragment is now
-// lane-centric: PPS/DWT/GNSS remain shared sections, prediction stays separate,
-// and each clock owns its own measurement/forensics/service/regression objects.
+// TIMEBASE_FRAGMENT is now the compact canonical campaign row / science spine.
+// TIMEBASE_FORENSICS is the larger diagnostic companion for the same pps_count.
+// Pi-side clocks pairs the two opaque payloads by identity and persists one
+// TIMEBASE record with { fragment, forensics }.
 //
 // Keep the legacy flat helpers above for focused reports and transition tools;
-// TIMEBASE_FRAGMENT itself uses the helpers below.
+// the publication pair itself uses the helpers below.
 
 static void payload_add_welford_object(Payload& parent,
                                        const char* key,
@@ -1335,10 +1357,41 @@ static void payload_add_ocxo_pps_residual_object(Payload& parent,
   parent.add_object("pps_residual", residual);
 }
 
-static void payload_add_vclock_fragment(Payload& p,
-                                        uint64_t public_gnss_ns,
-                                        bool forensics_valid,
-                                        const clocks_alpha_lane_forensics_t& f) {
+static void payload_add_timebase_pair_identity(Payload& p,
+                                               const char* schema,
+                                               const char* version_key,
+                                               uint32_t version,
+                                               const char* pair_role,
+                                               uint32_t public_count,
+                                               uint64_t public_gnss_ns) {
+  p.add("schema", schema);
+  p.add(version_key, version);
+  p.add("timebase_pair_version", 1U);
+  p.add("pair_role", pair_role ? pair_role : "");
+  p.add("campaign", campaign_name);
+  p.add("teensy_pps_vclock_count", public_count);
+  p.add("teensy_pps_count",        public_count);
+  p.add("pps_count",               public_count);
+  p.add("gnss_ns",                 public_gnss_ns);
+  p.add("dwt_at_pps_vclock",       (uint32_t)g_dwt_at_pps_vclock);
+  p.add("dwt_cycles_between_pps_vclock", (uint32_t)g_dwt_cycles_between_pps_vclock);
+  p.add("counter32_at_pps_vclock", (uint32_t)g_counter32_at_pps_vclock);
+  p.add("pps_dwt_at_edge",         (uint32_t)g_pps_dwt_at_edge);
+  p.add("pps_vclock_phase_cycles", (int32_t)g_pps_vclock_phase_cycles);
+}
+
+static void payload_add_vclock_fragment(Payload& p, uint64_t public_gnss_ns) {
+  Payload lane;
+  lane.add("ns", public_gnss_ns);
+  lane.add("gnss_ns_at_pps_vclock", public_gnss_ns);
+  lane.add("counter32_at_pps_vclock", (uint32_t)g_counter32_at_pps_vclock);
+  p.add_object("vclock", lane);
+}
+
+static void payload_add_vclock_forensics(Payload& p,
+                                         uint64_t public_gnss_ns,
+                                         bool forensics_valid,
+                                         const clocks_alpha_lane_forensics_t& f) {
   Payload lane;
   lane.add("ns", public_gnss_ns);
   lane.add("gnss_ns_at_pps_vclock", public_gnss_ns);
@@ -1353,22 +1406,59 @@ static void payload_add_ocxo_fragment(Payload& p,
                                       const char* key,
                                       uint64_t public_ns,
                                       uint64_t public_measured_ns,
-                                      const clock_state_t& clock,
-                                      const clock_measurement_t& meas,
-                                      bool forensics_valid,
-                                      const clocks_alpha_lane_forensics_t& f,
                                       bool pps_projection_valid,
-                                      const clocks_alpha_ocxo_pps_projection_snapshot_t& pps_projection,
-                                      uint64_t public_pps_projected_ns,
+                                      uint32_t pps_projection_source,
                                       bool pps_residual_valid,
                                       uint64_t pps_gnss_interval_ns,
                                       uint64_t pps_clock_interval_ns,
                                       int64_t pps_fast_residual_ns) {
   Payload lane;
 
-  // Step C authority: ocxoN.ns is now the campaign-public OCXO clock value
-  // projected to this TIMEBASE row's canonical PPS/VCLOCK edge.  The legacy
-  // Alpha measured-GNSS ledger remains visible as a diagnostic side surface.
+  // Compact science surface: canonical OCXO clock value at this PPS/VCLOCK row,
+  // the legacy measured side clock, source identity, and PPS-founded residual.
+  lane.add("ns", public_ns);
+  lane.add("ns_at_pps_vclock", public_ns);
+  lane.add("ns_source", pps_projection_valid ? "PPS_PROJECTED"
+                                              : "MEASURED_FALLBACK");
+  lane.add("ns_source_id", pps_projection_valid ? 2U : 1U);
+  lane.add("pps_projected_valid", pps_projection_valid);
+  lane.add("pps_projection_source", pps_projection_valid ? pps_projection_source : 0U);
+
+  lane.add("measured_gnss_ns", public_measured_ns);
+  lane.add("measured_gnss_ns_at_pps_vclock", public_measured_ns);
+  lane.add("legacy_measured_gnss_ns", public_measured_ns);
+  const int64_t measured_minus_ns =
+      (public_measured_ns >= public_ns)
+          ? (int64_t)(public_measured_ns - public_ns)
+          : -(int64_t)(public_ns - public_measured_ns);
+  lane.add("measured_minus_ns", measured_minus_ns);
+
+  payload_add_ocxo_pps_residual_object(lane,
+                                       pps_residual_valid,
+                                       pps_gnss_interval_ns,
+                                       pps_clock_interval_ns,
+                                       pps_fast_residual_ns);
+
+  p.add_object(key, lane);
+}
+
+static void payload_add_ocxo_forensics(Payload& p,
+                                       const char* key,
+                                       uint64_t public_ns,
+                                       uint64_t public_measured_ns,
+                                       const clock_state_t& clock,
+                                       const clock_measurement_t& meas,
+                                       bool forensics_valid,
+                                       const clocks_alpha_lane_forensics_t& f,
+                                       bool pps_projection_valid,
+                                       const clocks_alpha_ocxo_pps_projection_snapshot_t& pps_projection,
+                                       uint64_t public_pps_projected_ns,
+                                       bool pps_residual_valid,
+                                       uint64_t pps_gnss_interval_ns,
+                                       uint64_t pps_clock_interval_ns,
+                                       int64_t pps_fast_residual_ns) {
+  Payload lane;
+
   lane.add("ns", public_ns);
   lane.add("ns_at_pps_vclock", public_ns);
   lane.add("ns_source", pps_projection_valid ? "PPS_PROJECTED"
@@ -1384,10 +1474,6 @@ static void payload_add_ocxo_fragment(Payload& p,
           : -(int64_t)(public_ns - public_measured_ns);
   lane.add("measured_minus_ns", measured_minus_ns);
 
-  // Keep the Step B sidecar during promotion.  When the projection is valid,
-  // pps_projected_ns is the same canonical value as ns; if the projection is
-  // not yet valid during early startup, ns falls back to the measured ledger
-  // and this sidecar records the unavailability.
   const int64_t projected_minus_ns =
       (!pps_projection_valid)
           ? 0LL
@@ -1412,20 +1498,12 @@ static void payload_add_ocxo_fragment(Payload& p,
   lane.add("pps_projection_source",
            pps_projection_valid ? pps_projection.source : 0U);
 
-  // Step D canonical residual surface: this is the same PPS-founded
-  // row-to-row residual used to feed the OCXO Welfords.  It is deliberately
-  // computed from public TIMEBASE clock values, not OCXO event-edge witnesses
-  // and not DWT cycle residuals.
   payload_add_ocxo_pps_residual_object(lane,
                                        pps_residual_valid,
                                        pps_gnss_interval_ns,
                                        pps_clock_interval_ns,
                                        pps_fast_residual_ns);
 
-  // Direct interrupt-authored GNSS-at-edge witness. This is the normalized
-  // GNSS timestamp of the observed OCXO quiet-zone sample, not Alpha's
-  // measured ledger and not a boundary-normalized value. These fields are
-  // passive TIMEBASE witnesses only; no residual is computed here.
   const bool sample_available =
       forensics_valid && f.sample_gnss_ns_at_event_available;
   const bool previous_sample_available =
@@ -2260,144 +2338,200 @@ void clocks_beta_pps(void) {
   g_timebase_last_ocxo2_pps_residual_valid = pps_residuals.ocxo2_valid;
   timebase_build_stage(TIMEBASE_BUILD_STAGE_BUILD_BEGIN);
 
-  Payload p;
-  p.add("schema", "TIMEBASE_FRAGMENT_V2");
-  p.add("fragment_version", 2U);
-
-  // Minimal flat compatibility spine.  TIMEBASE stores this fragment as an
-  // opaque object, but Pi-side indexing and older tools still need these few
-  // top-level identities while reports migrate to the hierarchical schema.
-  p.add("campaign", campaign_name);
-  p.add("teensy_pps_vclock_count", public_count);
-  p.add("teensy_pps_count",        public_count);  // legacy alias
-  p.add("pps_count",               public_count);  // legacy alias / DB order key
-  p.add("gnss_ns",                 public_gnss_ns);
-  p.add("dwt_at_pps_vclock",       (uint32_t)g_dwt_at_pps_vclock);
-  p.add("dwt_cycles_between_pps_vclock", (uint32_t)g_dwt_cycles_between_pps_vclock);
-  p.add("counter32_at_pps_vclock", (uint32_t)g_counter32_at_pps_vclock);
-  p.add("pps_dwt_at_edge",         (uint32_t)g_pps_dwt_at_edge);
-  p.add("pps_vclock_phase_cycles", (int32_t)g_pps_vclock_phase_cycles);
-  timebase_build_stage(TIMEBASE_BUILD_STAGE_SPINE);
-
   {
-    timebase_build_stage(TIMEBASE_BUILD_STAGE_GNSS);
-    Payload gnss;
-    gnss.add("ns", public_gnss_ns);
-    gnss.add("pps_ns", public_gnss_ns);
-    gnss.add("pps_vclock_ns", public_gnss_ns);
-    gnss.add("vclock_ns", public_gnss_ns);
-    gnss.add("ocxo1_ns", public_ocxo1_ns);
-    gnss.add("ocxo2_ns", public_ocxo2_ns);
-    gnss.add("ocxo1_measured_ns", public_ocxo1_measured_ns);
-    gnss.add("ocxo2_measured_ns", public_ocxo2_measured_ns);
-    p.add_object("gnss", gnss);
+    Payload p;
+    payload_add_timebase_pair_identity(p,
+                                       "TIMEBASE_FRAGMENT_V3",
+                                       "fragment_version",
+                                       3U,
+                                       "fragment",
+                                       public_count,
+                                       public_gnss_ns);
+    p.add("paired_forensics_topic", "TIMEBASE_FORENSICS");
+    p.add("paired_forensics_schema", "TIMEBASE_FORENSICS_V1");
+
+    // Minimal flat compatibility spine.  TIMEBASE stores this fragment as an
+    // opaque object, but Pi-side indexing and older tools still need these few
+    // top-level identities while reports migrate to the paired schema.
+    timebase_build_stage(TIMEBASE_BUILD_STAGE_SPINE);
+
+    {
+      timebase_build_stage(TIMEBASE_BUILD_STAGE_GNSS);
+      Payload gnss;
+      gnss.add("ns", public_gnss_ns);
+      gnss.add("pps_ns", public_gnss_ns);
+      gnss.add("pps_vclock_ns", public_gnss_ns);
+      gnss.add("vclock_ns", public_gnss_ns);
+      gnss.add("ocxo1_ns", public_ocxo1_ns);
+      gnss.add("ocxo2_ns", public_ocxo2_ns);
+      gnss.add("ocxo1_measured_ns", public_ocxo1_measured_ns);
+      gnss.add("ocxo2_measured_ns", public_ocxo2_measured_ns);
+      p.add_object("gnss", gnss);
+    }
+
+    {
+      timebase_build_stage(TIMEBASE_BUILD_STAGE_DWT);
+      Payload dwt;
+      dwt.add("cycle_count_total", public_dwt_total);
+      dwt.add("ns", public_dwt_ns);
+      dwt.add("at_pps_vclock", (uint32_t)g_dwt_at_pps_vclock);
+      dwt.add("cycles_between_pps_vclock", (uint32_t)g_dwt_cycles_between_pps_vclock);
+      dwt.add("expected_per_pps_vclock", (uint32_t)DWT_EXPECTED_PER_PPS);
+      dwt.add("second_residual_cycles",
+              (int32_t)((int64_t)g_dwt_cycles_between_pps_vclock -
+                        (int64_t)DWT_EXPECTED_PER_PPS));
+      p.add_object("dwt", dwt);
+    }
+
+    {
+      timebase_build_stage(TIMEBASE_BUILD_STAGE_PPS);
+      Payload pps;
+      pps.add("count", public_count);
+      pps.add("dwt_at_edge", (uint32_t)g_pps_dwt_at_edge);
+      pps.add("dwt_cycles_between_edges",
+              g_pps_dwt_cycles_between_edges_valid
+                  ? (uint32_t)g_pps_dwt_cycles_between_edges
+                  : 0U);
+      pps.add("dwt_cycles_between_edges_valid",
+              (bool)g_pps_dwt_cycles_between_edges_valid);
+      pps.add("vclock_phase_cycles", (int32_t)g_pps_vclock_phase_cycles);
+      p.add_object("pps", pps);
+    }
+
+    // Prediction remains an intentionally separate four-rail courtroom surface.
+    timebase_build_stage(TIMEBASE_BUILD_STAGE_PREDICTION);
+    payload_add_prediction_summary_hierarchical(p);
+
+    timebase_build_stage(TIMEBASE_BUILD_STAGE_VCLOCK);
+    payload_add_vclock_fragment(p, public_gnss_ns);
+
+    timebase_build_stage(TIMEBASE_BUILD_STAGE_OCXO1);
+    payload_add_ocxo_fragment(p,
+                              "ocxo1",
+                              public_ocxo1_ns,
+                              public_ocxo1_measured_ns,
+                              ocxo1_pps_projected_valid,
+                              ocxo1_pps_projection.source,
+                              pps_residuals.ocxo1_valid,
+                              pps_residuals.gnss_interval_ns,
+                              pps_residuals.ocxo1_interval_ns,
+                              pps_residuals.ocxo1_fast_residual_ns);
+
+    timebase_build_stage(TIMEBASE_BUILD_STAGE_OCXO2);
+    payload_add_ocxo_fragment(p,
+                              "ocxo2",
+                              public_ocxo2_ns,
+                              public_ocxo2_measured_ns,
+                              ocxo2_pps_projected_valid,
+                              ocxo2_pps_projection.source,
+                              pps_residuals.ocxo2_valid,
+                              pps_residuals.gnss_interval_ns,
+                              pps_residuals.ocxo2_interval_ns,
+                              pps_residuals.ocxo2_fast_residual_ns);
+
+    timebase_build_stage(TIMEBASE_BUILD_STAGE_STATS);
+    payload_add_stats_summary_hierarchical(p);
+
+    g_timebase_build_complete_count++;
+    g_timebase_last_build_complete_campaign_seconds = campaign_seconds;
+    timebase_build_stage(TIMEBASE_BUILD_STAGE_BUILD_COMPLETE);
+
+    timebase_build_stage(TIMEBASE_BUILD_STAGE_ASSIGN_LAST_FRAGMENT);
+    g_last_fragment = p;
+    g_timebase_assign_last_fragment_count++;
+    g_timebase_last_assign_campaign_seconds = campaign_seconds;
+
+    g_timebase_publish_attempt_count++;
+    g_timebase_last_publish_attempt_campaign_seconds = campaign_seconds;
+    timebase_build_stage(TIMEBASE_BUILD_STAGE_PUBLISH_ATTEMPT);
+    publish("TIMEBASE_FRAGMENT", p);
+
+    g_timebase_publish_return_count++;
+    g_timebase_last_publish_return_campaign_seconds = campaign_seconds;
+    timebase_build_stage(TIMEBASE_BUILD_STAGE_PUBLISH_RETURN);
   }
 
   {
-    timebase_build_stage(TIMEBASE_BUILD_STAGE_ENVIRONMENTAL);
-    Payload environmental;
-    environmental.add("calibrate_ocxo", servo_mode_str(calibrate_ocxo_mode));
-    environmental.add("ad5693r_init_ok", g_ad5693r_init_ok);
-    p.add_object("environmental", environmental);
+    g_timebase_forensics_build_begin_count++;
+    g_timebase_last_forensics_build_begin_campaign_seconds = campaign_seconds;
+    timebase_build_stage(TIMEBASE_BUILD_STAGE_FORENSICS_BUILD_BEGIN);
+
+    Payload f;
+    payload_add_timebase_pair_identity(f,
+                                       "TIMEBASE_FORENSICS_V1",
+                                       "forensics_version",
+                                       1U,
+                                       "forensics",
+                                       public_count,
+                                       public_gnss_ns);
+    f.add("paired_fragment_topic", "TIMEBASE_FRAGMENT");
+    f.add("paired_fragment_schema", "TIMEBASE_FRAGMENT_V3");
+    f.add("paired_fragment_version", 3U);
+
+    {
+      timebase_build_stage(TIMEBASE_BUILD_STAGE_ENVIRONMENTAL);
+      Payload environmental;
+      environmental.add("calibrate_ocxo", servo_mode_str(calibrate_ocxo_mode));
+      environmental.add("ad5693r_init_ok", g_ad5693r_init_ok);
+      f.add_object("environmental", environmental);
+    }
+
+    timebase_build_stage(TIMEBASE_BUILD_STAGE_VCLOCK);
+    payload_add_vclock_forensics(f,
+                                 public_gnss_ns,
+                                 vclock_forensics_valid,
+                                 vclock_forensics);
+
+    timebase_build_stage(TIMEBASE_BUILD_STAGE_OCXO1);
+    payload_add_ocxo_forensics(f,
+                               "ocxo1",
+                               public_ocxo1_ns,
+                               public_ocxo1_measured_ns,
+                               g_ocxo1_clock,
+                               g_ocxo1_measurement,
+                               ocxo1_forensics_valid,
+                               ocxo1_forensics,
+                               ocxo1_pps_projected_valid,
+                               ocxo1_pps_projection,
+                               public_ocxo1_pps_projected_ns,
+                               pps_residuals.ocxo1_valid,
+                               pps_residuals.gnss_interval_ns,
+                               pps_residuals.ocxo1_interval_ns,
+                               pps_residuals.ocxo1_fast_residual_ns);
+
+    timebase_build_stage(TIMEBASE_BUILD_STAGE_OCXO2);
+    payload_add_ocxo_forensics(f,
+                               "ocxo2",
+                               public_ocxo2_ns,
+                               public_ocxo2_measured_ns,
+                               g_ocxo2_clock,
+                               g_ocxo2_measurement,
+                               ocxo2_forensics_valid,
+                               ocxo2_forensics,
+                               ocxo2_pps_projected_valid,
+                               ocxo2_pps_projection,
+                               public_ocxo2_pps_projected_ns,
+                               pps_residuals.ocxo2_valid,
+                               pps_residuals.gnss_interval_ns,
+                               pps_residuals.ocxo2_interval_ns,
+                               pps_residuals.ocxo2_fast_residual_ns);
+
+    timebase_build_stage(TIMEBASE_BUILD_STAGE_DAC);
+    payload_add_dac_summary_hierarchical(f);
+
+    g_timebase_forensics_build_complete_count++;
+    g_timebase_last_forensics_build_complete_campaign_seconds = campaign_seconds;
+    timebase_build_stage(TIMEBASE_BUILD_STAGE_FORENSICS_BUILD_COMPLETE);
+
+    g_timebase_forensics_publish_attempt_count++;
+    g_timebase_last_forensics_publish_attempt_campaign_seconds = campaign_seconds;
+    timebase_build_stage(TIMEBASE_BUILD_STAGE_FORENSICS_PUBLISH_ATTEMPT);
+    publish("TIMEBASE_FORENSICS", f);
+
+    g_timebase_forensics_publish_return_count++;
+    g_timebase_last_forensics_publish_return_campaign_seconds = campaign_seconds;
+    timebase_build_stage(TIMEBASE_BUILD_STAGE_FORENSICS_PUBLISH_RETURN);
   }
-
-  {
-    timebase_build_stage(TIMEBASE_BUILD_STAGE_DWT);
-    Payload dwt;
-    dwt.add("cycle_count_total", public_dwt_total);
-    dwt.add("ns", public_dwt_ns);
-    dwt.add("at_pps_vclock", (uint32_t)g_dwt_at_pps_vclock);
-    dwt.add("cycles_between_pps_vclock", (uint32_t)g_dwt_cycles_between_pps_vclock);
-    dwt.add("expected_per_pps_vclock", (uint32_t)DWT_EXPECTED_PER_PPS);
-    dwt.add("second_residual_cycles",
-            (int32_t)((int64_t)g_dwt_cycles_between_pps_vclock -
-                      (int64_t)DWT_EXPECTED_PER_PPS));
-    p.add_object("dwt", dwt);
-  }
-
-  {
-    timebase_build_stage(TIMEBASE_BUILD_STAGE_PPS);
-    Payload pps;
-    pps.add("count", public_count);
-    pps.add("dwt_at_edge", (uint32_t)g_pps_dwt_at_edge);
-    pps.add("dwt_cycles_between_edges",
-            g_pps_dwt_cycles_between_edges_valid
-                ? (uint32_t)g_pps_dwt_cycles_between_edges
-                : 0U);
-    pps.add("dwt_cycles_between_edges_valid",
-            (bool)g_pps_dwt_cycles_between_edges_valid);
-    pps.add("vclock_phase_cycles", (int32_t)g_pps_vclock_phase_cycles);
-    p.add_object("pps", pps);
-  }
-
-  // Prediction remains an intentionally separate four-rail courtroom surface.
-  // Clock objects below carry live measurement and diagnostics, but not their
-  // static-prediction fields.
-  timebase_build_stage(TIMEBASE_BUILD_STAGE_PREDICTION);
-  payload_add_prediction_summary_hierarchical(p);
-
-  timebase_build_stage(TIMEBASE_BUILD_STAGE_VCLOCK);
-  payload_add_vclock_fragment(p,
-                              public_gnss_ns,
-                              vclock_forensics_valid,
-                              vclock_forensics);
-
-  timebase_build_stage(TIMEBASE_BUILD_STAGE_OCXO1);
-  payload_add_ocxo_fragment(p,
-                            "ocxo1",
-                            public_ocxo1_ns,
-                            public_ocxo1_measured_ns,
-                            g_ocxo1_clock,
-                            g_ocxo1_measurement,
-                            ocxo1_forensics_valid,
-                            ocxo1_forensics,
-                            ocxo1_pps_projected_valid,
-                            ocxo1_pps_projection,
-                            public_ocxo1_pps_projected_ns,
-                            pps_residuals.ocxo1_valid,
-                            pps_residuals.gnss_interval_ns,
-                            pps_residuals.ocxo1_interval_ns,
-                            pps_residuals.ocxo1_fast_residual_ns);
-
-  timebase_build_stage(TIMEBASE_BUILD_STAGE_OCXO2);
-  payload_add_ocxo_fragment(p,
-                            "ocxo2",
-                            public_ocxo2_ns,
-                            public_ocxo2_measured_ns,
-                            g_ocxo2_clock,
-                            g_ocxo2_measurement,
-                            ocxo2_forensics_valid,
-                            ocxo2_forensics,
-                            ocxo2_pps_projected_valid,
-                            ocxo2_pps_projection,
-                            public_ocxo2_pps_projected_ns,
-                            pps_residuals.ocxo2_valid,
-                            pps_residuals.gnss_interval_ns,
-                            pps_residuals.ocxo2_interval_ns,
-                            pps_residuals.ocxo2_fast_residual_ns);
-
-  timebase_build_stage(TIMEBASE_BUILD_STAGE_DAC);
-  payload_add_dac_summary_hierarchical(p);
-  timebase_build_stage(TIMEBASE_BUILD_STAGE_STATS);
-  payload_add_stats_summary_hierarchical(p);
-
-  g_timebase_build_complete_count++;
-  g_timebase_last_build_complete_campaign_seconds = campaign_seconds;
-  timebase_build_stage(TIMEBASE_BUILD_STAGE_BUILD_COMPLETE);
-
-  timebase_build_stage(TIMEBASE_BUILD_STAGE_ASSIGN_LAST_FRAGMENT);
-  g_last_fragment = p;
-  g_timebase_assign_last_fragment_count++;
-  g_timebase_last_assign_campaign_seconds = campaign_seconds;
-
-  g_timebase_publish_attempt_count++;
-  g_timebase_last_publish_attempt_campaign_seconds = campaign_seconds;
-  timebase_build_stage(TIMEBASE_BUILD_STAGE_PUBLISH_ATTEMPT);
-  publish("TIMEBASE_FRAGMENT", p);
-
-  g_timebase_publish_return_count++;
-  g_timebase_last_publish_return_campaign_seconds = campaign_seconds;
-  timebase_build_stage(TIMEBASE_BUILD_STAGE_PUBLISH_RETURN);
 }
 
 // ============================================================================
@@ -3399,7 +3533,7 @@ static Payload cmd_report_ocxo_pps_projection(const Payload&) {
 static Payload cmd_report_timebase_publish(const Payload&) {
   Payload p;
   p.add("report", "CLOCKS_TIMEBASE_PUBLISH");
-  p.add("description", "Report-only TIMEBASE_FRAGMENT build/publish flight recorder");
+  p.add("description", "Report-only TIMEBASE_FRAGMENT / TIMEBASE_FORENSICS build/publish flight recorder");
 
   Payload counters;
   counters.add("pps_entry_count", g_timebase_pps_entry_count);
@@ -3410,6 +3544,10 @@ static Payload cmd_report_timebase_publish(const Payload&) {
   counters.add("assign_last_fragment_count", g_timebase_assign_last_fragment_count);
   counters.add("publish_attempt_count", g_timebase_publish_attempt_count);
   counters.add("publish_return_count", g_timebase_publish_return_count);
+  counters.add("forensics_build_begin_count", g_timebase_forensics_build_begin_count);
+  counters.add("forensics_build_complete_count", g_timebase_forensics_build_complete_count);
+  counters.add("forensics_publish_attempt_count", g_timebase_forensics_publish_attempt_count);
+  counters.add("forensics_publish_return_count", g_timebase_forensics_publish_return_count);
   p.add_object("counters", counters);
 
   Payload gates;
@@ -3439,6 +3577,10 @@ static Payload cmd_report_timebase_publish(const Payload&) {
   last.add("assign_campaign_seconds", g_timebase_last_assign_campaign_seconds);
   last.add("publish_attempt_campaign_seconds", g_timebase_last_publish_attempt_campaign_seconds);
   last.add("publish_return_campaign_seconds", g_timebase_last_publish_return_campaign_seconds);
+  last.add("forensics_build_begin_campaign_seconds", g_timebase_last_forensics_build_begin_campaign_seconds);
+  last.add("forensics_build_complete_campaign_seconds", g_timebase_last_forensics_build_complete_campaign_seconds);
+  last.add("forensics_publish_attempt_campaign_seconds", g_timebase_last_forensics_publish_attempt_campaign_seconds);
+  last.add("forensics_publish_return_campaign_seconds", g_timebase_last_forensics_publish_return_campaign_seconds);
   last.add("public_count", g_timebase_last_public_count);
   last.add("public_gnss_ns", g_timebase_last_public_gnss_ns);
   last.add("public_dwt_total", g_timebase_last_public_dwt_total);
@@ -3458,6 +3600,15 @@ static Payload cmd_report_timebase_publish(const Payload&) {
   gaps.add("publish_attempt_minus_return", (int64_t)g_timebase_publish_attempt_count - (int64_t)g_timebase_publish_return_count);
   gaps.add("publish_return_lag_vs_campaign_seconds", (int64_t)campaign_seconds - (int64_t)g_timebase_last_publish_return_campaign_seconds);
   gaps.add("publish_tail_returning", g_timebase_publish_attempt_count == g_timebase_publish_return_count);
+  gaps.add("forensics_build_complete_minus_publish_attempt",
+           (int64_t)g_timebase_forensics_build_complete_count -
+           (int64_t)g_timebase_forensics_publish_attempt_count);
+  gaps.add("forensics_publish_attempt_minus_return",
+           (int64_t)g_timebase_forensics_publish_attempt_count -
+           (int64_t)g_timebase_forensics_publish_return_count);
+  gaps.add("forensics_publish_tail_returning",
+           g_timebase_forensics_publish_attempt_count ==
+           g_timebase_forensics_publish_return_count);
   p.add_object("gaps", gaps);
 
   return p;
