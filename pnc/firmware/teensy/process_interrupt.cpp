@@ -5192,15 +5192,15 @@ void process_interrupt_enable_irqs(void) {
   // VCLOCK/TimePop QTimer1 is the sovereign timing rail.  Keep the entire
   // shared QTimer1 vector at highest priority; same-vector logical ordering
   // is handled inside TimePop/process_interrupt.
-  NVIC_SET_PRIORITY(IRQ_QTIMER1, 0);
-  g_step0_qtimer1_priority_applied = 0;
+  NVIC_SET_PRIORITY(IRQ_QTIMER1, INTERRUPT_STEP0_EXPECTED_QTIMER1_PRIORITY);
+  g_step0_qtimer1_priority_applied = INTERRUPT_STEP0_EXPECTED_QTIMER1_PRIORITY;
   NVIC_ENABLE_IRQ(IRQ_QTIMER1);
   g_step0_qtimer1_irq_enabled_by_interrupt = true;
 
   if (!OCXO1_DISABLED) {
     attachInterruptVector(IRQ_QTIMER2, qtimer2_isr);
     NVIC_SET_PRIORITY(IRQ_QTIMER2, INTERRUPT_STEP0_EXPECTED_QTIMER2_PRIORITY);
-    g_step0_qtimer2_priority_applied = 0;
+    g_step0_qtimer2_priority_applied = INTERRUPT_STEP0_EXPECTED_QTIMER2_PRIORITY;
     NVIC_ENABLE_IRQ(IRQ_QTIMER2);
     g_step0_qtimer2_irq_enabled_by_interrupt = true;
   } else {
@@ -5211,7 +5211,7 @@ void process_interrupt_enable_irqs(void) {
   if (!OCXO2_DISABLED) {
     attachInterruptVector(IRQ_QTIMER3, qtimer3_isr);
     NVIC_SET_PRIORITY(IRQ_QTIMER3, INTERRUPT_STEP0_EXPECTED_QTIMER3_PRIORITY);
-    g_step0_qtimer3_priority_applied = 0;
+    g_step0_qtimer3_priority_applied = INTERRUPT_STEP0_EXPECTED_QTIMER3_PRIORITY;
     NVIC_ENABLE_IRQ(IRQ_QTIMER3);
     g_step0_qtimer3_irq_enabled_by_interrupt = true;
   } else {
@@ -5224,8 +5224,8 @@ void process_interrupt_enable_irqs(void) {
   // PPS GPIO is now a witness/selector, not the highest-priority timing
   // interpolation rail.  Keep it below QTimer1 so VCLOCK/TimePop event facts
   // are not delayed by PPS witness work.
-  NVIC_SET_PRIORITY(IRQ_GPIO6789, 0);
-  g_step0_gpio6789_priority_applied = 0;
+  NVIC_SET_PRIORITY(IRQ_GPIO6789, INTERRUPT_STEP0_EXPECTED_GPIO6789_PRIORITY);
+  g_step0_gpio6789_priority_applied = INTERRUPT_STEP0_EXPECTED_GPIO6789_PRIORITY;
   g_step0_gpio6789_configured_by_interrupt = true;
 
   g_interrupt_irqs_enabled = true;
