@@ -1539,6 +1539,65 @@ static volatile interrupt_qtimer1_ch1_handler_fn g_qtimer1_ch1_handler ZPNET_ISR
 static volatile uint32_t g_qtimer1_ch2_last_target_counter32 ZPNET_ISR_HOT_DATA = 0;
 static volatile uint32_t g_qtimer1_ch2_arm_count ZPNET_ISR_HOT_DATA = 0;
 
+// VCLOCK / QTimer1 CH2 custody forensics.
+//
+// QTimer1 CH2 is the TimePop scheduler compare rail.  The public VCLOCK
+// bookend is authored by the CADENCE_MINDER TimePop client running on this
+// same CH2 fire fact.  These fields capture the immediate ISR crime-scene:
+// first-instruction DWT, the target we armed, the actual low-word hardware
+// counter seen at ISR entry, and the compare-register state before the flag
+// is acknowledged.  The observed low word is QTimer1 CH2's own counter because
+// CH2 is the compare source; CH0 is retained separately as the passive VCLOCK
+// witness/counter rail.
+static constexpr bool VCLOCK_CH2_ISR_CUSTODY_PUBLISH_EVERY_BOOKEND = true;
+
+struct vclock_ch2_isr_custody_t {
+  bool     valid = false;
+  uint32_t sequence = 0;
+
+  uint32_t isr_entry_dwt_raw = 0;
+  uint32_t event_dwt = 0;
+
+  uint32_t target_counter32 = 0;
+  uint16_t target_low16 = 0;
+
+  uint16_t observed_ch0_low16 = 0;
+  uint16_t observed_ch2_low16 = 0;
+  uint32_t observed_counter32 = 0;
+
+  int32_t  service_offset_ticks = 0;
+  uint32_t service_offset_abs_ticks = 0;
+
+  uint32_t csctrl_entry = 0;
+  bool     compare_flag_seen = false;
+  bool     compare_enabled_entry = false;
+
+  uint32_t qtimer_arm_count_at_isr = 0;
+  uint32_t cadence_fire_count_at_isr = 0;
+  uint32_t cadence_tick_mod_1000_at_isr = 0;
+};
+
+static vclock_ch2_isr_custody_t g_vclock_ch2_isr_custody ZPNET_ISR_HOT_DATA = {};
+static volatile bool     g_vclock_bookend_integrity_previous_valid ZPNET_ISR_HOT_DATA = false;
+static volatile uint32_t g_vclock_bookend_integrity_previous_counter32 ZPNET_ISR_HOT_DATA = 0;
+static volatile uint32_t g_vclock_bookend_integrity_previous_event_dwt ZPNET_ISR_HOT_DATA = 0;
+static volatile uint32_t g_vclock_bookend_integrity_publish_count ZPNET_ISR_HOT_DATA = 0;
+static volatile uint32_t g_vclock_bookend_integrity_clean_publish_count ZPNET_ISR_HOT_DATA = 0;
+static volatile uint32_t g_vclock_bookend_integrity_anomaly_publish_count ZPNET_ISR_HOT_DATA = 0;
+
+static void vclock_ch2_integrity_reset(void);
+ZPNET_ISR_FASTRUN static void vclock_ch2_record_isr_custody(uint32_t isr_entry_dwt_raw,
+                                                            uint32_t qtimer_event_dwt,
+                                                            uint32_t target_counter32,
+                                                            uint16_t observed_ch0_low16,
+                                                            uint16_t observed_ch2_low16,
+                                                            uint32_t csctrl_entry);
+ZPNET_ISR_FASTRUN static void vclock_ch2_publish_bookend_isr_custody(uint32_t bookend_dwt,
+                                                                     uint32_t bookend_counter32,
+                                                                     uint16_t bookend_low16,
+                                                                     uint32_t pps_phase_cycles,
+                                                                     bool pps_phase_valid);
+
 struct ocxo_qtimer_diag_t {
   volatile uint32_t count = 0;
   volatile uint32_t late_ticks = 0;  // legacy raw modular delta
@@ -3007,6 +3066,7 @@ static void vclock_fact_ring_reset(void) {
   g_vclock_fact_ring.high_water = 0;
   g_vclock_fact_ring.asap_arm_count = 0;
   g_vclock_fact_ring.asap_fail_count = 0;
+  vclock_ch2_integrity_reset();
 }
 
 static bool vclock_fact_ring_pop(vclock_perishable_fact_t& out) {
@@ -3465,6 +3525,11 @@ ZPNET_ISR_FASTRUN static void cadence_minder_timepop_callback(timepop_ctx_t* ctx
           : pps_t{};
       const dwt_repair_diag_t repair =
           vclock_endpoint_repair_diagnostic(qtimer_event_dwt);
+      vclock_ch2_publish_bookend_isr_custody(qtimer_event_dwt,
+                                             cadence_counter32,
+                                             fired_low16,
+                                             coincidence_cycles,
+                                             coincidence_valid);
       publish_vclock_domain_pps_vclock(witness_pps,
                                         (witness_pps.sequence != 0)
                                             ? witness_pps.sequence
@@ -3645,6 +3710,12 @@ static const char* ocxo_fact_drain_name(const ocxo_runtime_context_t& ctx) {
   return ctx.fact_drain_name ? ctx.fact_drain_name : ctx.name;
 }
 
+static const char* ocxo_fact_drain_kick_name(const ocxo_runtime_context_t& ctx) {
+  if (ctx.kind == interrupt_subscriber_kind_t::OCXO1) return "OCXO1_FACT_DRAIN_KICK";
+  if (ctx.kind == interrupt_subscriber_kind_t::OCXO2) return "OCXO2_FACT_DRAIN_KICK";
+  return ocxo_fact_drain_name(ctx);
+}
+
 ZPNET_ISR_FASTRUN static void ocxo_fact_ring_reset(ocxo_runtime_context_t& ctx) {
   ocxo_perishable_ring_t& r = ocxo_fact_ring_for(ctx);
   for (uint32_t i = 0; i < OCXO_PERISHABLE_FACT_RING_SIZE; i++) {
@@ -3679,6 +3750,33 @@ ZPNET_ISR_FASTRUN static bool ocxo_fact_ring_push_from_isr(ocxo_runtime_context_
                                          const interrupt_perishable_fact_t& fact);
 ZPNET_ISR_FASTRUN static void ocxo_fact_drain_callback(timepop_ctx_t*, timepop_diag_t*, void* user_data);
 
+ZPNET_ISR_FASTRUN static bool ocxo_fact_ring_arm_drain(ocxo_runtime_context_t& ctx,
+                                                       bool force_kick) {
+  ocxo_perishable_ring_t& r = ocxo_fact_ring_for(ctx);
+  ocxo_lane_t* lane = ctx.lane;
+
+  if (!force_kick && r.drain_armed) return true;
+
+  r.drain_armed = true;
+  r.asap_arm_count++;
+  if (lane) lane->witness_fact_asap_arm_count = r.asap_arm_count;
+
+  const char* name = force_kick
+      ? ocxo_fact_drain_kick_name(ctx)
+      : ocxo_fact_drain_name(ctx);
+
+  const timepop_handle_t h =
+      timepop_arm_asap(ocxo_fact_drain_callback, &ctx, name);
+  if (h == TIMEPOP_INVALID_HANDLE) {
+    r.drain_armed = false;
+    r.asap_fail_count++;
+    if (lane) lane->witness_fact_asap_fail_count = r.asap_fail_count;
+    return false;
+  }
+
+  return true;
+}
+
 ZPNET_ISR_FASTRUN static bool ocxo_fact_ring_pop(ocxo_runtime_context_t& ctx,
                                interrupt_perishable_fact_t& out) {
   ocxo_perishable_ring_t& r = ocxo_fact_ring_for(ctx);
@@ -3711,6 +3809,12 @@ ZPNET_ISR_FASTRUN static bool ocxo_fact_ring_push_from_isr(ocxo_runtime_context_
     if (lane) {
       lane->witness_fact_overflow_count = r.overflow_count;
     }
+
+    // Self-heal a stale drain latch.  A full ring with drain_armed=true means
+    // the lane already believes a TimePop ASAP drain exists, but the report can
+    // show that it is no longer making progress.  Arm a second drain with a
+    // distinct kick name so a stale named ASAP slot cannot strand this ring.
+    (void)ocxo_fact_ring_arm_drain(ctx, true);
     return false;
   }
 
@@ -3726,19 +3830,8 @@ ZPNET_ISR_FASTRUN static bool ocxo_fact_ring_push_from_isr(ocxo_runtime_context_
     lane->witness_fact_high_water = r.high_water;
   }
 
-  if (!r.drain_armed) {
-    r.drain_armed = true;
-    r.asap_arm_count++;
-    if (lane) lane->witness_fact_asap_arm_count = r.asap_arm_count;
-
-    const timepop_handle_t h =
-        timepop_arm_asap(ocxo_fact_drain_callback, &ctx, ocxo_fact_drain_name(ctx));
-    if (h == TIMEPOP_INVALID_HANDLE) {
-      r.drain_armed = false;
-      r.asap_fail_count++;
-      if (lane) lane->witness_fact_asap_fail_count = r.asap_fail_count;
-      return false;
-    }
+  if (!ocxo_fact_ring_arm_drain(ctx, false)) {
+    return false;
   }
 
   return true;
@@ -4013,6 +4106,18 @@ ZPNET_ISR_FASTRUN static void ocxo_fact_drain_callback(timepop_ctx_t*,
                                      void* user_data) {
   auto* ctx = static_cast<ocxo_runtime_context_t*>(user_data);
   if (!ctx || !ctx->lane) return;
+
+  // The ASAP callback itself is the proof that a drain is in progress.  Clear
+  // the latch on entry rather than only when the ring happens to become empty;
+  // if a new one-second fact arrives while this callback is working it may arm
+  // a harmless follow-up drain instead of depending on this callback to be the
+  // only future drain opportunity.
+  {
+    ocxo_perishable_ring_t& r = ocxo_fact_ring_for(*ctx);
+    __disable_irq();
+    r.drain_armed = false;
+    __enable_irq();
+  }
 
   for (;;) {
     interrupt_perishable_fact_t fact{};
@@ -4445,6 +4550,196 @@ ZPNET_ISR_FASTRUN uint16_t interrupt_qtimer1_ch2_counter_now(void) { return IMXR
 ZPNET_ISR_FASTRUN uint16_t interrupt_qtimer1_ch2_comp1_now(void)   { return IMXRT_TMR1.CH[2].COMP1; }
 ZPNET_ISR_FASTRUN uint16_t interrupt_qtimer1_ch2_csctrl_now(void)  { return IMXRT_TMR1.CH[2].CSCTRL; }
 
+static uint32_t integrity_abs_i32(int32_t value) {
+  return (uint32_t)(value < 0 ? -(int64_t)value : (int64_t)value);
+}
+
+static void vclock_ch2_integrity_reset(void) {
+  g_vclock_ch2_isr_custody = vclock_ch2_isr_custody_t{};
+  g_vclock_bookend_integrity_previous_valid = false;
+  g_vclock_bookend_integrity_previous_counter32 = 0;
+  g_vclock_bookend_integrity_previous_event_dwt = 0;
+  g_vclock_bookend_integrity_publish_count = 0;
+  g_vclock_bookend_integrity_clean_publish_count = 0;
+  g_vclock_bookend_integrity_anomaly_publish_count = 0;
+}
+
+ZPNET_ISR_FASTRUN static void vclock_ch2_record_isr_custody(
+    uint32_t isr_entry_dwt_raw,
+    uint32_t qtimer_event_dwt,
+    uint32_t target_counter32,
+    uint16_t observed_ch0_low16,
+    uint16_t observed_ch2_low16,
+    uint32_t csctrl_entry) {
+  const uint16_t target_low16 =
+      vclock_hardware_low16_from_synthetic(target_counter32);
+  const int32_t service_offset_ticks =
+      (int32_t)((int16_t)((uint16_t)(observed_ch2_low16 - target_low16)));
+  const uint32_t service_offset_abs_ticks = integrity_abs_i32(service_offset_ticks);
+
+  g_vclock_ch2_isr_custody.valid = true;
+  g_vclock_ch2_isr_custody.sequence++;
+  g_vclock_ch2_isr_custody.isr_entry_dwt_raw = isr_entry_dwt_raw;
+  g_vclock_ch2_isr_custody.event_dwt = qtimer_event_dwt;
+  g_vclock_ch2_isr_custody.target_counter32 = target_counter32;
+  g_vclock_ch2_isr_custody.target_low16 = target_low16;
+  g_vclock_ch2_isr_custody.observed_ch0_low16 = observed_ch0_low16;
+  g_vclock_ch2_isr_custody.observed_ch2_low16 = observed_ch2_low16;
+  g_vclock_ch2_isr_custody.observed_counter32 =
+      (uint32_t)((int64_t)target_counter32 + (int64_t)service_offset_ticks);
+  g_vclock_ch2_isr_custody.service_offset_ticks = service_offset_ticks;
+  g_vclock_ch2_isr_custody.service_offset_abs_ticks = service_offset_abs_ticks;
+  g_vclock_ch2_isr_custody.csctrl_entry = csctrl_entry;
+  g_vclock_ch2_isr_custody.compare_flag_seen =
+      (csctrl_entry & TMR_CSCTRL_TCF1) != 0;
+  g_vclock_ch2_isr_custody.compare_enabled_entry =
+      (csctrl_entry & TMR_CSCTRL_TCF1EN) != 0;
+  g_vclock_ch2_isr_custody.qtimer_arm_count_at_isr = g_qtimer1_ch2_arm_count;
+  g_vclock_ch2_isr_custody.cadence_fire_count_at_isr = g_cadence_minder_fire_count;
+  g_vclock_ch2_isr_custody.cadence_tick_mod_1000_at_isr = g_vclock_lane.tick_mod_1000;
+}
+
+ZPNET_ISR_FASTRUN static void vclock_ch2_publish_bookend_isr_custody(
+    uint32_t bookend_dwt,
+    uint32_t bookend_counter32,
+    uint16_t bookend_low16,
+    uint32_t pps_phase_cycles,
+    bool pps_phase_valid) {
+  const bool have_previous = g_vclock_bookend_integrity_previous_valid;
+  const uint32_t previous_counter32 = g_vclock_bookend_integrity_previous_counter32;
+  const uint32_t previous_event_dwt = g_vclock_bookend_integrity_previous_event_dwt;
+
+  const uint32_t actual_counter_delta = have_previous
+      ? (bookend_counter32 - previous_counter32)
+      : 0U;
+  const bool counter_delta_ok = !have_previous ||
+      (actual_counter_delta == CLOCK_INTEGRITY_EXPECTED_10MHZ_SECOND_TICKS);
+
+  const uint32_t predicted_cycles = have_previous
+      ? vclock_cycles_for_ticks(CLOCK_INTEGRITY_EXPECTED_10MHZ_SECOND_TICKS)
+      : 0U;
+  const uint32_t actual_cycles = have_previous
+      ? (bookend_dwt - previous_event_dwt)
+      : 0U;
+  const int32_t dwt_error_cycles = have_previous
+      ? (int32_t)((int64_t)actual_cycles - (int64_t)predicted_cycles)
+      : 0;
+  const bool dwt_close = !have_previous ||
+      (integrity_abs_i32(dwt_error_cycles) <=
+       CLOCK_INTEGRITY_DEFAULT_DWT_TOLERANCE_CYCLES);
+
+  const bool custody_matches_bookend =
+      g_vclock_ch2_isr_custody.valid &&
+      g_vclock_ch2_isr_custody.event_dwt == bookend_dwt &&
+      g_vclock_ch2_isr_custody.target_counter32 == bookend_counter32;
+  const bool hardware_counter_exact = custody_matches_bookend
+      ? (g_vclock_ch2_isr_custody.service_offset_ticks == 0)
+      : true;
+
+  uint32_t reason_mask = 0;
+  if (have_previous && !counter_delta_ok) {
+    reason_mask |= CLOCK_INTEGRITY_REASON_COUNTER_DELTA_INVALID;
+  }
+  if (have_previous && !dwt_close) {
+    reason_mask |= CLOCK_INTEGRITY_REASON_DWT_INTERVAL_OUT_OF_RANGE;
+    reason_mask |= CLOCK_INTEGRITY_REASON_STATIC_RESIDUAL_OUT_OF_RANGE;
+  }
+  if (custody_matches_bookend && !hardware_counter_exact) {
+    reason_mask |= CLOCK_INTEGRITY_REASON_HARDWARE_COUNTER_NOT_EXACT;
+  }
+
+  const bool should_publish =
+      have_previous &&
+      (VCLOCK_CH2_ISR_CUSTODY_PUBLISH_EVERY_BOOKEND || reason_mask != 0);
+
+  if (should_publish) {
+    clocks_integrity_event_t e{};
+    e.subtype = CLOCK_INTEGRITY_SUBTYPE_ISR_CUSTODY;
+    e.source_clock = CLOCK_INTEGRITY_CLOCK_VCLOCK;
+    e.reason_mask = reason_mask;
+    e.pps_sequence = g_pps_gpio_heartbeat.edge_count;
+    e.pps_count = 0;  // process_interrupt does not own campaign PPS count.
+    e.campaign_seconds_hint = g_pps_gpio_heartbeat.edge_count;
+    e.trigger_dwt = ARM_DWT_CYCCNT;
+
+    e.isr_entry_dwt_raw = custody_matches_bookend
+        ? g_vclock_ch2_isr_custody.isr_entry_dwt_raw
+        : 0U;
+    e.previous_event_dwt = previous_event_dwt;
+    e.current_event_dwt = bookend_dwt;
+    e.expected_event_dwt = previous_event_dwt + predicted_cycles;
+    e.predicted_dwt_cycles = predicted_cycles;
+    e.actual_dwt_cycles = actual_cycles;
+    e.dwt_error_cycles = dwt_error_cycles;
+    e.dwt_tolerance_cycles = CLOCK_INTEGRITY_DEFAULT_DWT_TOLERANCE_CYCLES;
+    e.dwt_close = dwt_close;
+
+    e.previous_counter32 = previous_counter32;
+    e.current_counter32 = bookend_counter32;
+    e.expected_counter32 = previous_counter32 +
+        CLOCK_INTEGRITY_EXPECTED_10MHZ_SECOND_TICKS;
+    e.expected_counter_delta = CLOCK_INTEGRITY_EXPECTED_10MHZ_SECOND_TICKS;
+    e.actual_counter_delta = actual_counter_delta;
+    e.counter_error_ticks = custody_matches_bookend
+        ? g_vclock_ch2_isr_custody.service_offset_ticks
+        : 0;
+    e.counter_delta_error_ticks = have_previous
+        ? (int32_t)((int64_t)actual_counter_delta -
+                    (int64_t)CLOCK_INTEGRITY_EXPECTED_10MHZ_SECOND_TICKS)
+        : 0;
+    e.counter_tolerance_ticks = CLOCK_INTEGRITY_ISR_COUNTER_TOLERANCE_TICKS;
+    e.hardware_counter_exact = hardware_counter_exact;
+
+    e.target_counter32 = bookend_counter32;
+    e.target_low16 = custody_matches_bookend
+        ? g_vclock_ch2_isr_custody.target_low16
+        : (uint32_t)bookend_low16;
+    e.expected_low16 = e.target_low16;
+    e.observed_counter32 = custody_matches_bookend
+        ? g_vclock_ch2_isr_custody.observed_counter32
+        : bookend_counter32;
+    e.observed_low16 = custody_matches_bookend
+        ? (uint32_t)g_vclock_ch2_isr_custody.observed_ch2_low16
+        : (uint32_t)bookend_low16;
+    e.csctrl_entry = custody_matches_bookend
+        ? g_vclock_ch2_isr_custody.csctrl_entry
+        : 0U;
+    e.compare_flag_seen = custody_matches_bookend
+        ? g_vclock_ch2_isr_custody.compare_flag_seen
+        : false;
+    e.compare_enabled_entry = custody_matches_bookend
+        ? g_vclock_ch2_isr_custody.compare_enabled_entry
+        : false;
+
+    e.qtimer_arm_count = custody_matches_bookend
+        ? g_vclock_ch2_isr_custody.qtimer_arm_count_at_isr
+        : g_qtimer1_ch2_arm_count;
+    e.cadence_fire_count = g_cadence_minder_fire_count;
+    e.cadence_tick_mod_1000 = g_vclock_lane.tick_mod_1000;
+
+    e.pps_dwt_at_edge = g_last_pps_witness_valid
+        ? g_last_pps_witness.dwt_at_edge
+        : 0U;
+    e.pps_actual_dwt_cycles = 0U;
+    e.pps_actual_dwt_cycles_valid = false;
+    e.pps_vclock_phase_cycles = pps_phase_valid
+        ? (int32_t)pps_phase_cycles
+        : 0;
+
+    clocks_integrity_event(e);
+    g_vclock_bookend_integrity_publish_count++;
+    if (reason_mask == 0) {
+      g_vclock_bookend_integrity_clean_publish_count++;
+    } else {
+      g_vclock_bookend_integrity_anomaly_publish_count++;
+    }
+  }
+
+  g_vclock_bookend_integrity_previous_valid = true;
+  g_vclock_bookend_integrity_previous_counter32 = bookend_counter32;
+  g_vclock_bookend_integrity_previous_event_dwt = bookend_dwt;
+}
+
 ZPNET_ISR_FASTRUN static void qtimer1_ch1_bridge_isr(uint32_t isr_entry_dwt_raw) {
   qtimer1_ch1_clear_compare_flag();
 
@@ -4491,9 +4786,18 @@ ZPNET_ISR_FASTRUN static void qtimer1_isr(void) {
     qtimer1_ch1_bridge_isr(isr_entry_dwt_raw);
   }
   else if (IMXRT_TMR1.CH[2].CSCTRL & TMR_CSCTRL_TCF1) {
+    const uint32_t ch2_csctrl_entry = IMXRT_TMR1.CH[2].CSCTRL;
+    const uint16_t observed_ch2_low16 = IMXRT_TMR1.CH[2].CNTR;
+    const uint16_t observed_ch0_low16 = qtimer1_ch0_counter_now();
     qtimer1_ch2_clear_compare_flag();
     if (g_qtimer1_ch2_handler) {
       const uint32_t qtimer_event_dwt = qtimer_event_dwt_from_isr_entry_raw(isr_entry_dwt_raw);
+      vclock_ch2_record_isr_custody(isr_entry_dwt_raw,
+                                    qtimer_event_dwt,
+                                    g_qtimer1_ch2_last_target_counter32,
+                                    observed_ch0_low16,
+                                    observed_ch2_low16,
+                                    ch2_csctrl_entry);
       const bridge_projection_t bridge = interrupt_dwt_to_vclock_gnss_projection(qtimer_event_dwt);
       const int64_t  gnss_ns = bridge.gnss_ns;
       bridge_projection_record_stats(interrupt_subscriber_kind_t::TIMEPOP, bridge);
@@ -5167,6 +5471,7 @@ static void runtime_reset_qtimer_host_state(void) {
   g_qtimer1_ch1_handler = nullptr;
   g_qtimer1_ch2_last_target_counter32 = 0;
   g_qtimer1_ch2_arm_count = 0;
+  vclock_ch2_integrity_reset();
   g_ocxo1_qtimer_diag = ocxo_qtimer_diag_t{};
   g_ocxo2_qtimer_diag = ocxo_qtimer_diag_t{};
 }
@@ -5968,6 +6273,51 @@ static void add_vclock_lane_payload(Payload& p, bool detailed) {
   p.add("qtimer1_ch1_hop_count", g_qtimer1_ch1_hop_count);
   p.add("qtimer1_ch2_last_target_counter32", g_qtimer1_ch2_last_target_counter32);
   p.add("qtimer1_ch2_arm_count", g_qtimer1_ch2_arm_count);
+
+  p.add("vclock_ch2_isr_custody_publish_every_bookend",
+        VCLOCK_CH2_ISR_CUSTODY_PUBLISH_EVERY_BOOKEND);
+  p.add("vclock_ch2_isr_custody_valid", g_vclock_ch2_isr_custody.valid);
+  p.add("vclock_ch2_isr_custody_sequence", g_vclock_ch2_isr_custody.sequence);
+  p.add("vclock_ch2_isr_entry_dwt_raw",
+        g_vclock_ch2_isr_custody.isr_entry_dwt_raw);
+  p.add("vclock_ch2_isr_event_dwt", g_vclock_ch2_isr_custody.event_dwt);
+  p.add("vclock_ch2_isr_target_counter32",
+        g_vclock_ch2_isr_custody.target_counter32);
+  p.add("vclock_ch2_isr_target_low16",
+        (uint32_t)g_vclock_ch2_isr_custody.target_low16);
+  p.add("vclock_ch2_isr_observed_ch0_low16",
+        (uint32_t)g_vclock_ch2_isr_custody.observed_ch0_low16);
+  p.add("vclock_ch2_isr_observed_ch2_low16",
+        (uint32_t)g_vclock_ch2_isr_custody.observed_ch2_low16);
+  p.add("vclock_ch2_isr_observed_counter32",
+        g_vclock_ch2_isr_custody.observed_counter32);
+  p.add("vclock_ch2_isr_service_offset_ticks",
+        g_vclock_ch2_isr_custody.service_offset_ticks);
+  p.add("vclock_ch2_isr_service_offset_abs_ticks",
+        g_vclock_ch2_isr_custody.service_offset_abs_ticks);
+  p.add("vclock_ch2_isr_csctrl_entry", g_vclock_ch2_isr_custody.csctrl_entry);
+  p.add("vclock_ch2_isr_compare_flag_seen",
+        g_vclock_ch2_isr_custody.compare_flag_seen);
+  p.add("vclock_ch2_isr_compare_enabled_entry",
+        g_vclock_ch2_isr_custody.compare_enabled_entry);
+  p.add("vclock_ch2_isr_qtimer_arm_count_at_isr",
+        g_vclock_ch2_isr_custody.qtimer_arm_count_at_isr);
+  p.add("vclock_ch2_isr_cadence_fire_count_at_isr",
+        g_vclock_ch2_isr_custody.cadence_fire_count_at_isr);
+  p.add("vclock_ch2_isr_cadence_tick_mod_1000_at_isr",
+        g_vclock_ch2_isr_custody.cadence_tick_mod_1000_at_isr);
+  p.add("vclock_bookend_integrity_previous_valid",
+        g_vclock_bookend_integrity_previous_valid);
+  p.add("vclock_bookend_integrity_previous_counter32",
+        g_vclock_bookend_integrity_previous_counter32);
+  p.add("vclock_bookend_integrity_previous_event_dwt",
+        g_vclock_bookend_integrity_previous_event_dwt);
+  p.add("vclock_bookend_integrity_publish_count",
+        g_vclock_bookend_integrity_publish_count);
+  p.add("vclock_bookend_integrity_clean_publish_count",
+        g_vclock_bookend_integrity_clean_publish_count);
+  p.add("vclock_bookend_integrity_anomaly_publish_count",
+        g_vclock_bookend_integrity_anomaly_publish_count);
 }
 
 static void add_ocxo_identity_payload(Payload& p,
@@ -6432,6 +6782,13 @@ static Payload cmd_report(const Payload&) {
   p.add("vclock_fact_overflow_count", g_vclock_fact_ring.overflow_count);
   p.add("vclock_fact_high_water", g_vclock_fact_ring.high_water);
   p.add("vclock_fact_asap_fail_count", g_vclock_fact_ring.asap_fail_count);
+  p.add("vclock_ch2_isr_custody_valid", g_vclock_ch2_isr_custody.valid);
+  p.add("vclock_ch2_isr_service_offset_ticks",
+        g_vclock_ch2_isr_custody.service_offset_ticks);
+  p.add("vclock_bookend_integrity_publish_count",
+        g_vclock_bookend_integrity_publish_count);
+  p.add("vclock_bookend_integrity_anomaly_publish_count",
+        g_vclock_bookend_integrity_anomaly_publish_count);
   p.add("vclock_regression_last_valid", g_regression_vclock.last_result.valid);
   p.add("vclock_regression_last_sample_count", g_regression_vclock.last_result.sample_count);
   p.add("vclock_regression_last_inferred_minus_observed_cycles",

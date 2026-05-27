@@ -127,6 +127,89 @@ bool clocks_static_prediction_pps_snapshot(clocks_static_prediction_snapshot_t* 
 bool clocks_static_prediction_snapshot(time_clock_id_t clock,
                                        clocks_static_prediction_snapshot_t* out);
 
+
+// -----------------------------------------------------------------------------
+// CLOCK integrity event stream
+// -----------------------------------------------------------------------------
+//
+// CLOCK_INTEGRITY_EVENT is passive incident telemetry.  It does not stop a
+// campaign, repair a row, or become timing authority.  It records broken
+// clock-custody invariants so Postgres/ZPNet Server can preserve the chain of
+// custody around rare excursions.
+
+static constexpr uint32_t CLOCK_INTEGRITY_EVENT_SCHEMA_VERSION = 1U;
+
+static constexpr uint32_t CLOCK_INTEGRITY_SUBTYPE_ISR_CUSTODY     = 1U;
+static constexpr uint32_t CLOCK_INTEGRITY_SUBTYPE_BOOKEND_CUSTODY = 2U;
+
+static constexpr uint32_t CLOCK_INTEGRITY_CLOCK_NONE   = 0U;
+static constexpr uint32_t CLOCK_INTEGRITY_CLOCK_VCLOCK = 1U;
+static constexpr uint32_t CLOCK_INTEGRITY_CLOCK_OCXO1  = 2U;
+static constexpr uint32_t CLOCK_INTEGRITY_CLOCK_OCXO2  = 3U;
+static constexpr uint32_t CLOCK_INTEGRITY_CLOCK_PPS    = 4U;
+
+static constexpr uint32_t CLOCK_INTEGRITY_REASON_DWT_INTERVAL_OUT_OF_RANGE    = 1u << 0;
+static constexpr uint32_t CLOCK_INTEGRITY_REASON_HARDWARE_COUNTER_NOT_EXACT   = 1u << 1;
+static constexpr uint32_t CLOCK_INTEGRITY_REASON_COUNTER_DELTA_INVALID        = 1u << 2;
+static constexpr uint32_t CLOCK_INTEGRITY_REASON_STATIC_RESIDUAL_OUT_OF_RANGE = 1u << 3;
+
+static constexpr uint32_t CLOCK_INTEGRITY_DEFAULT_DWT_TOLERANCE_CYCLES = 5000U;
+static constexpr uint32_t CLOCK_INTEGRITY_ISR_COUNTER_TOLERANCE_TICKS = 0U;
+static constexpr uint32_t CLOCK_INTEGRITY_EXPECTED_10MHZ_SECOND_TICKS = 10000000U;
+
+struct clocks_integrity_event_t {
+  uint32_t schema_version = CLOCK_INTEGRITY_EVENT_SCHEMA_VERSION;
+  uint32_t event_sequence = 0;  // assigned by CLOCKS publisher
+  uint32_t subtype = 0;
+  uint32_t source_clock = CLOCK_INTEGRITY_CLOCK_NONE;
+  uint32_t reason_mask = 0;
+
+  uint32_t pps_sequence = 0;
+  uint32_t pps_count = 0;
+  uint32_t campaign_seconds_hint = 0;
+  uint32_t trigger_dwt = 0;
+
+  uint32_t isr_entry_dwt_raw = 0;
+  uint32_t previous_event_dwt = 0;
+  uint32_t current_event_dwt = 0;
+  uint32_t expected_event_dwt = 0;
+  uint32_t predicted_dwt_cycles = 0;
+  uint32_t actual_dwt_cycles = 0;
+  int32_t  dwt_error_cycles = 0;
+  uint32_t dwt_tolerance_cycles = CLOCK_INTEGRITY_DEFAULT_DWT_TOLERANCE_CYCLES;
+  bool     dwt_close = true;
+
+  uint32_t previous_counter32 = 0;
+  uint32_t current_counter32 = 0;
+  uint32_t expected_counter32 = 0;
+  uint32_t expected_counter_delta = 0;
+  uint32_t actual_counter_delta = 0;
+  int32_t  counter_error_ticks = 0;
+  int32_t  counter_delta_error_ticks = 0;
+  uint32_t counter_tolerance_ticks = CLOCK_INTEGRITY_ISR_COUNTER_TOLERANCE_TICKS;
+  bool     hardware_counter_exact = true;
+
+  uint32_t target_counter32 = 0;
+  uint32_t target_low16 = 0;
+  uint32_t observed_counter32 = 0;
+  uint32_t observed_low16 = 0;
+  uint32_t expected_low16 = 0;
+  uint32_t csctrl_entry = 0;
+  bool     compare_flag_seen = false;
+  bool     compare_enabled_entry = false;
+
+  uint32_t qtimer_arm_count = 0;
+  uint32_t cadence_fire_count = 0;
+  uint32_t cadence_tick_mod_1000 = 0;
+
+  uint32_t pps_dwt_at_edge = 0;
+  uint32_t pps_actual_dwt_cycles = 0;
+  bool     pps_actual_dwt_cycles_valid = false;
+  int32_t  pps_vclock_phase_cycles = 0;
+};
+
+void clocks_integrity_event(const clocks_integrity_event_t& event);
+
 // -----------------------------------------------------------------------------
 // DWT-to-GNSS calibration (continuous, campaign-independent)
 // -----------------------------------------------------------------------------
