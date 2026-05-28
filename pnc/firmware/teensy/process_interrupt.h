@@ -246,27 +246,6 @@ struct interrupt_capture_diag_t {
   uint64_t gnss_ns_at_event   = 0;
   uint32_t counter32_at_event = 0;
 
-  // Generic QTimer compare-custody diagnostics.  These are diagnostic-only
-  // ambient hardware observations captured immediately after the ISR-entry
-  // DWT sample.  They are never timing authority; they answer whether the
-  // counter observed at service time matched the authored compare target.
-  bool     qtimer_counter_custody_valid = false;
-  uint32_t qtimer_target_counter32_at_event = 0;
-  uint32_t qtimer_observed_counter32_at_isr = 0;
-  uint16_t qtimer_target_low16_at_event = 0;
-  uint16_t qtimer_observed_low16_at_isr = 0;
-  uint32_t qtimer_target_delta_mod65536_ticks = 0;
-  int32_t  qtimer_service_offset_signed_ticks = 0;
-  uint32_t qtimer_service_offset_abs_ticks = 0;
-  uint32_t qtimer_interpreted_late_ticks = 0;
-  uint32_t qtimer_early_ticks = 0;
-  uint32_t qtimer_csctrl_entry = 0;
-  bool     qtimer_compare_flag_entry = false;
-  bool     qtimer_compare_enabled_entry = false;
-  uint32_t qtimer_isr_entry_dwt_raw = 0;
-  uint32_t qtimer_isr_event_dwt = 0;
-  uint32_t qtimer_isr_sequence = 0;
-
   // DWT admissibility / repair/prediction audit.  dwt_at_event remains the
   // authoritative subscriber coordinate.  For OCXO lanes, dwt_synthetic may be
   // true when the EMA-predicted edge replaces the observed ISR endpoint.
