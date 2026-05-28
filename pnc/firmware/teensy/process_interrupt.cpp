@@ -35,8 +35,8 @@
 //
 // Lanes:
 //   VCLOCK : TimePop recurring client on QTimer1 CH2 (10 MHz VCLOCK domain)
-//   OCXO1  : QTimer2 CH0, PCS=0, lane-local rollover-only compare ladder
-//   OCXO2  : QTimer3 CH3, PCS=3, lane-local rollover-only compare ladder
+//   OCXO1  : QTimer2 CH0, PCS=0, one-second edge compare only
+//   OCXO2  : QTimer3 CH3, PCS=3, one-second edge compare only
 //   TimePop: QTimer1 CH2, varied compare intervals (foreground scheduler)
 //
 // The PPS GPIO ISR captures DWT as its first instruction, then reads the
@@ -1463,6 +1463,13 @@ static bool ocxo_lane_start_local_cadence_at_target(interrupt_subscriber_kind_t 
                                                     synthetic_clock32_t& clock32,
                                                     uint32_t target_counter32,
                                                     uint32_t reason);
+ZPNET_ISR_FASTRUN static uint32_t ocxo_one_second_next_target_after(
+    uint32_t epoch_counter32,
+    uint32_t current_counter32);
+ZPNET_ISR_FASTRUN static void ocxo_lane_program_local_cadence_compare(
+    ocxo_lane_t& lane,
+    uint32_t target_counter32,
+    uint32_t reason);
 static void ocxo_lane_stop_local_cadence(ocxo_lane_t& lane, uint32_t reason);
 static void ocxo_lane_ema_reset(ocxo_lane_t& lane);
 ZPNET_ISR_FASTRUN static void ocxo_lane_install_logical_grid(interrupt_subscriber_kind_t kind,
@@ -1470,6 +1477,11 @@ ZPNET_ISR_FASTRUN static void ocxo_lane_install_logical_grid(interrupt_subscribe
                                            synthetic_clock32_t& clock32,
                                            uint32_t epoch_counter32,
                                            uint32_t reason);
+ZPNET_ISR_FASTRUN static void ocxo_lane_maybe_arm_one_second_compare(
+    interrupt_subscriber_kind_t kind,
+    ocxo_lane_t& lane,
+    synthetic_clock32_t& clock32,
+    uint32_t reason);
 
 // ============================================================================
 // QTimer1 CH0 low-word counter
@@ -1579,7 +1591,7 @@ static ocxo_runtime_context_t g_ocxo1_ctx ZPNET_ISR_HOT_DATA = {
   interrupt_lane_t::QTIMER2_CH0_COMP,
   "OCXO1",
   "ocxo1",
-  "QTIMER2_CH0_LOCAL_1KHZ_ROLLOVER_COMPARE",
+  "QTIMER2_CH0_ONE_SECOND_EDGE_COMPARE",
   "QTIMER2_CH0_LOCAL_SYNTHETIC_COUNTER32",
   "QTIMER2_CH0_ISR_ENTRY_DWT",
   "OCXO1_FACT_DRAIN",
@@ -1595,7 +1607,7 @@ static ocxo_runtime_context_t g_ocxo2_ctx ZPNET_ISR_HOT_DATA = {
   interrupt_lane_t::QTIMER3_CH3_COMP,
   "OCXO2",
   "ocxo2",
-  "QTIMER3_CH3_LOCAL_1KHZ_ROLLOVER_COMPARE",
+  "QTIMER3_CH3_ONE_SECOND_EDGE_COMPARE",
   "QTIMER3_CH3_LOCAL_SYNTHETIC_COUNTER32",
   "QTIMER3_CH3_ISR_ENTRY_DWT",
   "OCXO2_FACT_DRAIN",
@@ -1924,6 +1936,73 @@ ZPNET_ISR_FASTRUN static void synthetic_clock_observe_hw16_no_pending_zero(
   c.minder_update_count++;
 }
 
+ZPNET_ISR_FASTRUN static void ocxo_lane_maybe_arm_one_second_compare(
+    interrupt_subscriber_kind_t,
+    ocxo_lane_t& lane,
+    synthetic_clock32_t& clock32,
+    uint32_t reason) {
+  if (!lane.initialized || !lane.cadence_enabled) return;
+  if (lane.cadence_armed) return;
+
+  const uint32_t remaining = lane.cadence_next_counter32 - clock32.current_counter32;
+  if (remaining == 0 || remaining > 0x7FFFFFFFUL) {
+    const uint32_t next_target = lane.cadence_epoch_valid
+        ? ocxo_one_second_next_target_after(lane.cadence_epoch_counter32,
+                                            clock32.current_counter32)
+        : (clock32.current_counter32 + OCXO_WITNESS_ONE_SECOND_COUNTS);
+    lane.cadence_next_counter32 = next_target;
+    lane.cadence_next_low16 = (uint16_t)(next_target & 0xFFFFU);
+    lane.compare_target = lane.cadence_next_low16;
+    lane.witness_target_counter32 = next_target;
+    lane.witness_target_low16 = lane.cadence_next_low16;
+    lane.witness_schedule_last_decision = OCXO_SCHEDULE_DECISION_TARGET_ADVANCED;
+    return;
+  }
+
+  const uint16_t hw16 = ocxo_lane_counter_now(lane);
+  lane.witness_schedule_last_current_counter32 = clock32.current_counter32;
+  lane.witness_schedule_last_target_counter32 = lane.cadence_next_counter32;
+  lane.witness_schedule_last_remaining_ticks = remaining;
+  lane.witness_schedule_last_current_low16 = hw16;
+  lane.witness_schedule_last_target_low16 = lane.cadence_next_low16;
+  lane.witness_schedule_last_phase_ticks =
+      lane.cadence_epoch_valid ? (clock32.current_counter32 - lane.cadence_epoch_counter32) : 0U;
+
+  if (remaining > OCXO_WITNESS_ARM_WINDOW_TICKS) {
+    lane.witness_schedule_last_decision = OCXO_SCHEDULE_DECISION_OUTSIDE_WINDOW;
+    lane.witness_schedule_last_ticks_until_arm_window =
+        remaining - OCXO_WITNESS_ARM_WINDOW_TICKS;
+    return;
+  }
+
+  if (remaining < OCXO_WITNESS_MIN_ARM_LEAD_TICKS) {
+    lane.witness_late_arm_count++;
+    lane.witness_schedule_last_decision = OCXO_SCHEDULE_DECISION_TOO_CLOSE;
+    lane.witness_schedule_last_ticks_until_arm_window = 0;
+    const uint32_t next_target = lane.cadence_epoch_valid
+        ? ocxo_one_second_next_target_after(lane.cadence_epoch_counter32,
+                                            clock32.current_counter32)
+        : (clock32.current_counter32 + OCXO_WITNESS_ONE_SECOND_COUNTS);
+    lane.cadence_next_counter32 = next_target;
+    lane.cadence_next_low16 = (uint16_t)(next_target & 0xFFFFU);
+    lane.compare_target = lane.cadence_next_low16;
+    lane.witness_target_counter32 = next_target;
+    lane.witness_target_low16 = lane.cadence_next_low16;
+    return;
+  }
+
+  lane.witness_last_arm_dwt_raw = ARM_DWT_CYCCNT;
+  lane.witness_last_arm_counter32 = clock32.current_counter32;
+  lane.witness_last_arm_low16 = hw16;
+  lane.witness_last_arm_target_counter32 = lane.cadence_next_counter32;
+  lane.witness_last_arm_target_low16 = lane.cadence_next_low16;
+  lane.witness_last_arm_remaining_ticks = remaining;
+  lane.witness_schedule_last_decision = OCXO_SCHEDULE_DECISION_ARMED;
+  lane.witness_schedule_last_ticks_until_arm_window = 0;
+  ocxo_lane_program_local_cadence_compare(lane, lane.cadence_next_counter32,
+                                          reason);
+}
+
 ZPNET_ISR_FASTRUN static void interrupt_ch2_implicit_rollover_tend(void) {
   if (!CH2_IMPLICIT_ROLLOVER_ENABLED || !g_interrupt_hw_ready) return;
 
@@ -1949,6 +2028,10 @@ ZPNET_ISR_FASTRUN static void interrupt_ch2_implicit_rollover_tend(void) {
     g_ch2_implicit_rollover_last_ocxo1_hw16 = ocxo1_hw16;
     g_ch2_implicit_rollover_last_ocxo1_counter32 =
         g_ocxo1_clock32.current_counter32;
+    ocxo_lane_maybe_arm_one_second_compare(interrupt_subscriber_kind_t::OCXO1,
+                                           g_ocxo1_lane,
+                                           g_ocxo1_clock32,
+                                           OCXO_CADENCE_REASON_REARM);
   }
 
   if (!OCXO2_DISABLED && g_ocxo2_lane.initialized) {
@@ -1958,6 +2041,10 @@ ZPNET_ISR_FASTRUN static void interrupt_ch2_implicit_rollover_tend(void) {
     g_ch2_implicit_rollover_last_ocxo2_hw16 = ocxo2_hw16;
     g_ch2_implicit_rollover_last_ocxo2_counter32 =
         g_ocxo2_clock32.current_counter32;
+    ocxo_lane_maybe_arm_one_second_compare(interrupt_subscriber_kind_t::OCXO2,
+                                           g_ocxo2_lane,
+                                           g_ocxo2_clock32,
+                                           OCXO_CADENCE_REASON_REARM);
   }
 }
 
@@ -3388,6 +3475,62 @@ ZPNET_ISR_FASTRUN static bool ocxo_lane_start_local_cadence_at_target(interrupt_
   return true;
 }
 
+ZPNET_ISR_FASTRUN static uint32_t ocxo_one_second_next_target_after(
+    uint32_t epoch_counter32,
+    uint32_t current_counter32) {
+  const uint32_t delta = current_counter32 - epoch_counter32;
+  if (delta > 0x7FFFFFFFUL) {
+    return epoch_counter32 + OCXO_WITNESS_ONE_SECOND_COUNTS;
+  }
+  const uint32_t seconds_completed = delta / OCXO_WITNESS_ONE_SECOND_COUNTS;
+  return epoch_counter32 + ((seconds_completed + 1U) * OCXO_WITNESS_ONE_SECOND_COUNTS);
+}
+
+ZPNET_ISR_FASTRUN static void ocxo_lane_prepare_one_second_target(
+    interrupt_subscriber_kind_t kind,
+    ocxo_lane_t& lane,
+    synthetic_clock32_t& clock32,
+    uint32_t target_counter32,
+    uint32_t reason) {
+  const uint16_t hw16 = ocxo_lane_counter_now(lane);
+  synthetic_clock_tend_from_hw16(clock32, hw16);
+
+  lane.cadence_enabled = true;
+  lane.cadence_armed = false;
+  lane.witness_armed = false;
+  lane.cadence_next_counter32 = target_counter32;
+  lane.cadence_next_low16 = (uint16_t)(target_counter32 & 0xFFFFU);
+  lane.compare_target = lane.cadence_next_low16;
+  lane.cadence_last_reason = reason;
+  lane.witness_target_initialized = true;
+  lane.witness_target_counter32 = target_counter32;
+  lane.witness_target_low16 = lane.cadence_next_low16;
+  lane.witness_last_arm_counter32 = clock32.current_counter32;
+  lane.witness_last_arm_low16 = hw16;
+  lane.witness_last_arm_target_counter32 = target_counter32;
+  lane.witness_last_arm_target_low16 = lane.cadence_next_low16;
+  lane.witness_last_arm_remaining_ticks = target_counter32 - clock32.current_counter32;
+  lane.witness_schedule_last_decision = OCXO_SCHEDULE_DECISION_OUTSIDE_WINDOW;
+  lane.witness_schedule_last_current_counter32 = clock32.current_counter32;
+  lane.witness_schedule_last_target_counter32 = target_counter32;
+  lane.witness_schedule_last_remaining_ticks = lane.witness_last_arm_remaining_ticks;
+  lane.witness_schedule_last_current_low16 = hw16;
+  lane.witness_schedule_last_target_low16 = lane.cadence_next_low16;
+  lane.witness_schedule_last_phase_ticks =
+      lane.cadence_epoch_valid ? (clock32.current_counter32 - lane.cadence_epoch_counter32) : 0U;
+  lane.witness_schedule_last_ticks_until_arm_window =
+      (lane.witness_last_arm_remaining_ticks > OCXO_WITNESS_ARM_WINDOW_TICKS)
+          ? (lane.witness_last_arm_remaining_ticks - OCXO_WITNESS_ARM_WINDOW_TICKS)
+          : 0U;
+
+  // Do not program the 16-bit OCXO compare yet unless the target is close
+  // enough to be unambiguous.  CH2 implicit rollover tending will call
+  // ocxo_lane_maybe_arm_one_second_compare() until the one-second edge enters
+  // the safe arm window.
+  ocxo_lane_disable_compare(lane);
+  ocxo_lane_maybe_arm_one_second_compare(kind, lane, clock32, reason);
+}
+
 ZPNET_ISR_FASTRUN static bool ocxo_lane_start_local_cadence(interrupt_subscriber_kind_t kind,
                                           ocxo_lane_t& lane,
                                           synthetic_clock32_t& clock32,
@@ -3398,20 +3541,33 @@ ZPNET_ISR_FASTRUN static bool ocxo_lane_start_local_cadence(interrupt_subscriber
   synthetic_clock_tend_from_hw16(clock32, hw16);
 
   uint32_t target = 0;
+  if (lane.cadence_epoch_valid) {
+    target = ocxo_one_second_next_target_after(lane.cadence_epoch_counter32,
+                                               clock32.current_counter32);
+  } else {
+    // Pre-logical-grid fallback: produce one one-second edge from the current
+    // ambient OCXO coordinate.  CLOCKS normally installs the logical grid
+    // immediately after SmartZero, so this should be transient.
+    target = clock32.current_counter32 + OCXO_WITNESS_ONE_SECOND_COUNTS;
+  }
+
   if (OCXO_QUIET_PHASE_SAMPLING_ENABLED &&
       (kind == interrupt_subscriber_kind_t::OCXO1 ||
        kind == interrupt_subscriber_kind_t::OCXO2)) {
-    target = ocxo_quiet_phase_next_target(kind, lane, clock32);
+    // Quiet phase still describes where the one-second edge family should land
+    // inside the VCLOCK millisecond cell.  It no longer implies a native OCXO
+    // 1 kHz compare ladder in steady state.
+    lane.cadence_sample_phase_valid = true;
+    lane.cadence_sample_phase_ticks = ocxo_quiet_phase_ticks_for(kind);
+    lane.cadence_sample_phase_us = ocxo_phase_ticks_to_us(lane.cadence_sample_phase_ticks);
+    lane.cadence_sample_phase_ns = ocxo_phase_ticks_to_ns(lane.cadence_sample_phase_ticks);
+    lane.cadence_sample_period_ticks = OCXO_WITNESS_ONE_SECOND_COUNTS;
   } else {
     lane.cadence_sample_phase_valid = false;
     lane.cadence_sample_phase_ticks = 0;
     lane.cadence_sample_phase_us = 0;
     lane.cadence_sample_phase_ns = 0;
-    lane.cadence_sample_period_ticks = OCXO_CADENCE_INTERVAL_TICKS;
-    target = lane.cadence_epoch_valid
-        ? ocxo_grid_next_target_after(lane.cadence_epoch_counter32,
-                                      clock32.current_counter32)
-        : (clock32.current_counter32 + OCXO_CADENCE_INTERVAL_TICKS);
+    lane.cadence_sample_period_ticks = OCXO_WITNESS_ONE_SECOND_COUNTS;
   }
 
   if (!lane.phase_bootstrapped) {
@@ -3419,21 +3575,13 @@ ZPNET_ISR_FASTRUN static bool ocxo_lane_start_local_cadence(interrupt_subscriber
     lane.bootstrap_count++;
   }
 
-  // Rollover-only custody publishes on the logical 10,000,000-tick grid.
-  // tick_mod_1000 stores the number of +10,000 cadence steps already implied
-  // by the next target, minus one because ocxo_cadence_update_sample_phase()
-  // increments before checking for the 1000th step.
-  if (lane.cadence_epoch_valid) {
-    const uint32_t delta = target - lane.cadence_epoch_counter32;
-    const uint32_t steps_to_target = delta / OCXO_CADENCE_INTERVAL_TICKS;
-    lane.tick_mod_1000 = (steps_to_target == 0U)
-        ? 0U
-        : ((steps_to_target - 1U) % TICKS_PER_SECOND_EVENT);
-  } else {
-    lane.tick_mod_1000 = 0U;
-  }
+  lane.tick_mod_1000 = lane.cadence_epoch_valid
+      ? ((target - lane.cadence_epoch_counter32) / OCXO_CADENCE_INTERVAL_TICKS) %
+            TICKS_PER_SECOND_EVENT
+      : 0U;
 
-  return ocxo_lane_start_local_cadence_at_target(kind, lane, clock32, target, reason);
+  ocxo_lane_prepare_one_second_target(kind, lane, clock32, target, reason);
+  return lane.cadence_enabled;
 }
 
 ZPNET_ISR_FASTRUN static void ocxo_lane_ema_reset(ocxo_lane_t& lane) {
@@ -4272,10 +4420,18 @@ ZPNET_ISR_FASTRUN static void ocxo_cadence_update_sample_phase(
     lane.tick_mod_1000 = 0;
   }
 
-  if (++lane.tick_mod_1000 >= TICKS_PER_SECOND_EVENT) {
-    lane.tick_mod_1000 = 0;
+  if (sample.was_smartzero_current) {
+    // SmartZero is the only remaining user of short +10,000-tick OCXO samples.
+    // Normal OCXO operation no longer uses a native 1 kHz rollover ladder.
+    if (++lane.tick_mod_1000 >= TICKS_PER_SECOND_EVENT) {
+      lane.tick_mod_1000 = 0;
+    }
+    sample.one_second_due = false;
+  } else {
+    // In steady state each OCXO compare is a one-second edge capture.
     sample.one_second_due = true;
     lane.cadence_one_second_due_count++;
+    lane.tick_mod_1000 = 0;
   }
   lane.cadence_last_one_second_due = sample.one_second_due;
 }
@@ -4305,27 +4461,33 @@ ZPNET_ISR_FASTRUN static void ocxo_cadence_rearm_or_stop(
   ocxo_lane_t& lane = *ctx.lane;
 
   if (cadence_reauthored_by_smartzero) {
-    // SmartZero acceptance can re-author this OCXO lane's quiet/logical grid
-    // from inside smartzero_feed_sample().  In that case the compare target
-    // already belongs to the newly installed grid; do not overwrite it with
-    // the just-serviced sample.target + 10,000 stale ISR rearm.
+    // SmartZero acceptance can re-author this OCXO lane's logical grid from
+    // inside smartzero_feed_sample().  The accepted lane now transitions into
+    // normal one-second edge-capture mode; do not overwrite the newly prepared
+    // target with the just-serviced SmartZero sample +10,000.
     sample.isr_csctrl_after_program = lane.module->CH[lane.channel].CSCTRL;
     return;
   }
 
   const bool keep_for_smartzero = smartzero_is_current_lane(ctx.kind);
   const bool keep_running = lane.active || keep_for_smartzero;
-  if (keep_running) {
-    const uint32_t next_target =
-        sample.target_counter32 + OCXO_CADENCE_INTERVAL_TICKS;
-    if (keep_for_smartzero) {
-      const int idx = smartzero_index_for_kind(ctx.kind);
-      if (idx >= 0) {
-        smartzero_write_begin();
-        g_smartzero.lanes[idx].pub.next_target_counter32 = next_target;
-        g_smartzero.lanes[idx].pub.arm_count++;
-        smartzero_write_end();
-      }
+  if (!keep_running) {
+    ocxo_lane_stop_local_cadence(lane, OCXO_CADENCE_REASON_STOP);
+    sample.isr_csctrl_after_program = lane.module->CH[lane.channel].CSCTRL;
+    return;
+  }
+
+  uint32_t next_target = 0;
+  if (keep_for_smartzero) {
+    // SmartZero still needs adjacent +10,000-tick OCXO samples to prove the
+    // lane.  This is an acquisition-only ladder, not steady-state cadence.
+    next_target = sample.target_counter32 + OCXO_CADENCE_INTERVAL_TICKS;
+    const int idx = smartzero_index_for_kind(ctx.kind);
+    if (idx >= 0) {
+      smartzero_write_begin();
+      g_smartzero.lanes[idx].pub.next_target_counter32 = next_target;
+      g_smartzero.lanes[idx].pub.arm_count++;
+      smartzero_write_end();
     }
 
     lane.witness_last_arm_dwt_raw = ARM_DWT_CYCCNT;
@@ -4337,7 +4499,10 @@ ZPNET_ISR_FASTRUN static void ocxo_cadence_rearm_or_stop(
     ocxo_lane_program_local_cadence_compare(lane, next_target,
                                             OCXO_CADENCE_REASON_REARM);
   } else {
-    ocxo_lane_stop_local_cadence(lane, OCXO_CADENCE_REASON_STOP);
+    next_target = sample.target_counter32 + OCXO_WITNESS_ONE_SECOND_COUNTS;
+    ocxo_lane_prepare_one_second_target(ctx.kind, lane, *ctx.clock32,
+                                        next_target,
+                                        OCXO_CADENCE_REASON_REARM);
   }
 
   sample.isr_csctrl_after_program = lane.module->CH[lane.channel].CSCTRL;
@@ -5000,9 +5165,9 @@ bool interrupt_start(interrupt_subscriber_kind_t kind) {
   lane->tick_mod_1000 = 0;
   ocxo_lane_ema_reset(*lane);
 
-  // OCXO lanes now own their local 1 kHz rollover cadence.  Start the
-  // compare ladder from the installed logical grid when available; otherwise
-  // birth from the current low-word observation.
+  // OCXO lanes now own only their local one-second edge compare.  Start the
+  // one-second edge compare from the installed logical grid when available;
+  // otherwise birth from the current low-word observation.
   return ocxo_lane_start_local_cadence(kind, *lane,
                                        *synthetic_clock_for_kind(kind),
                                        OCXO_CADENCE_REASON_START);
@@ -5717,7 +5882,7 @@ static void add_runtime_payload(Payload& p) {
   p.add("timing_arch_step", "OCXO_ROLLOVER_ONLY_EMA_DWT");
   p.add("timing_arch_behavior_changed", true);
   p.add("timing_arch_vclock_authority", "QTIMER1_CH2_TIMEPOP_DIRECT_SAFEMODE");
-  p.add("timing_arch_ocxo_model", "LOCAL_QTIMER_1KHZ_ROLLOVER_ONLY");
+  p.add("timing_arch_ocxo_model", "LOCAL_QTIMER_ONE_SECOND_EDGE_CAPTURE");
   p.add("timing_arch_ocxo_migration_stage", "EMA_DWT_AUTHORITY");
   p.add("subscriber_count", g_subscriber_count);
   p.add("single_cadence_agent", false);
@@ -5781,6 +5946,7 @@ static void add_cadence_minder_payload(Payload& p) {
   p.add("ch2_implicit_rollover_last_ocxo2_counter32", g_ch2_implicit_rollover_last_ocxo2_counter32);
 
   p.add("ocxo_cadence_interval_ticks", OCXO_CADENCE_INTERVAL_TICKS);
+  p.add("ocxo_one_second_edge_interval_ticks", OCXO_WITNESS_ONE_SECOND_COUNTS);
   p.add("ocxo_cadence_samples_per_second", TICKS_PER_SECOND_EVENT);
   p.add("ocxo_quiet_phase_sampling_enabled", OCXO_QUIET_PHASE_SAMPLING_ENABLED);
   p.add("ocxo_rollover_only_mode", !OCXO_QUIET_PHASE_SAMPLING_ENABLED);
@@ -6510,8 +6676,10 @@ static Payload cmd_report(const Payload&) {
   p.add("single_cadence_agent", false);
   p.add("cadence_minder_isr_mode", true);
   p.add("cadence_minder_retained", true);
-  p.add("ocxo_lane_local_cadence", true);
-  p.add("ocxo_local_cadence_retained", true);
+  p.add("ocxo_lane_local_cadence", false);
+  p.add("ocxo_one_second_edge_compare", true);
+  p.add("ocxo_native_1khz_cadence_retired", true);
+  p.add("ocxo_one_second_edge_compare", true);
   p.add("ocxo_perishable_fact_capture", true);
   p.add("ocxo_fact_ring_size", OCXO_PERISHABLE_FACT_RING_SIZE);
 
