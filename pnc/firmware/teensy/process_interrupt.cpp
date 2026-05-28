@@ -69,33 +69,11 @@
 
 
 // ============================================================================
-// ISR placement experiment — ITCM/FASTRUN + aligned hot data
+// ISR / hot-path placement
 // ============================================================================
 //
-// Teensy 4.x normally keeps unqualified static/global data in the fast RAM1
-// region used by the Cortex-M7 data path.  The ISR hot data annotation below
-// deliberately does not move data into DMAMEM/OCRAM; it marks the timing state
-// as explicitly hot and aligned while preserving the default fast-memory
-// residency.  Code placement is explicit: the four timing ISR entry points and
-// their immediate hot-path helpers are marked FASTRUN so the first-instruction
-// DWT capture and early custody code execute from ITCM rather than flash/XIP.
-
-#ifndef ZPNET_ISR_FASTRUN
-  #ifdef FASTRUN
-    #define ZPNET_ISR_FASTRUN FASTRUN
-  #else
-    #define ZPNET_ISR_FASTRUN __attribute__((section(".fastrun"), noinline))
-  #endif
-#endif
-
-#ifndef ZPNET_ISR_HOT_DATA
-  #define ZPNET_ISR_HOT_DATA __attribute__((aligned(32), used))
-#endif
-
-static constexpr bool     ISR_FASTRUN_ITCM_ENABLED = true;
-static constexpr uint32_t ISR_HOT_DATA_ALIGNMENT_BYTES = 32U;
-static constexpr const char* ISR_HOT_DATA_POLICY =
-    "DTCM_DEFAULT_ALIGNED_32_NO_DMAMEM";
+// Interrupt helpers and globals use normal compiler/linker placement so the
+// timing code remains easier to read and reason about.
 
 // process_clocks owns watchdog publication/stop semantics.  process_interrupt
 // only raises hard timing-identity faults through this narrow boundary.
@@ -373,13 +351,13 @@ struct snapshot_store_t {
   volatile uint16_t pvc_ch3_at_edge           = 0;
 };
 
-static snapshot_store_t g_store ZPNET_ISR_HOT_DATA;
+static snapshot_store_t g_store;
 
 static inline void dmb_barrier(void) {
   __asm__ volatile ("dmb" ::: "memory");
 }
 
-ZPNET_ISR_FASTRUN static void store_publish(const pps_t& pps, const pps_vclock_t& pvc) {
+static void store_publish(const pps_t& pps, const pps_vclock_t& pvc) {
   g_store.seq++;
   dmb_barrier();
   g_store.pps_sequence          = pps.sequence;
@@ -394,7 +372,7 @@ ZPNET_ISR_FASTRUN static void store_publish(const pps_t& pps, const pps_vclock_t
   g_store.seq++;
 }
 
-ZPNET_ISR_FASTRUN static bool store_load(pps_t& pps, pps_vclock_t& pvc) {
+static bool store_load(pps_t& pps, pps_vclock_t& pvc) {
   for (int attempt = 0; attempt < 4; attempt++) {
     const uint32_t s1 = g_store.seq;
     dmb_barrier();
@@ -414,7 +392,7 @@ ZPNET_ISR_FASTRUN static bool store_load(pps_t& pps, pps_vclock_t& pvc) {
   return false;
 }
 
-ZPNET_ISR_FASTRUN static pps_vclock_t store_load_pvc(void) {
+static pps_vclock_t store_load_pvc(void) {
   pps_t pps;
   pps_vclock_t pvc;
   store_load(pps, pvc);
@@ -462,9 +440,9 @@ struct epoch_capture_store_t {
   volatile uint32_t ocxo2_counter32 = 0;
 };
 
-static epoch_capture_store_t g_epoch_capture_store ZPNET_ISR_HOT_DATA;
+static epoch_capture_store_t g_epoch_capture_store;
 
-ZPNET_ISR_FASTRUN static void epoch_capture_publish(const interrupt_epoch_capture_t& cap) {
+static void epoch_capture_publish(const interrupt_epoch_capture_t& cap) {
   g_epoch_capture_store.seq++;
   dmb_barrier();
 
@@ -490,7 +468,7 @@ ZPNET_ISR_FASTRUN static void epoch_capture_publish(const interrupt_epoch_captur
   g_epoch_capture_store.seq++;
 }
 
-ZPNET_ISR_FASTRUN bool interrupt_last_epoch_capture(interrupt_epoch_capture_t* out) {
+bool interrupt_last_epoch_capture(interrupt_epoch_capture_t* out) {
   if (!out) return false;
 
   for (int attempt = 0; attempt < 4; attempt++) {
@@ -524,7 +502,7 @@ ZPNET_ISR_FASTRUN bool interrupt_last_epoch_capture(interrupt_epoch_capture_t* o
 }
 
 static pps_edge_dispatch_fn g_pps_edge_dispatch = nullptr;
-ZPNET_ISR_FASTRUN static void pps_edge_dispatch_trampoline(timepop_ctx_t*, timepop_diag_t*, void*);
+static void pps_edge_dispatch_trampoline(timepop_ctx_t*, timepop_diag_t*, void*);
 
 // ============================================================================
 // DWT cycles-per-second compatibility
@@ -585,11 +563,11 @@ struct bridge_anchor_stats_t {
   uint32_t last_anchor_failure_mask = 0;
 };
 
-static volatile uint32_t g_pvc_anchor_seq ZPNET_ISR_HOT_DATA = 0;
-static volatile uint32_t g_pvc_anchor_head ZPNET_ISR_HOT_DATA = 0;
-static volatile uint32_t g_pvc_anchor_count ZPNET_ISR_HOT_DATA = 0;
-static volatile bool     g_pvc_anchor_reset_pending ZPNET_ISR_HOT_DATA = false;
-static pvc_anchor_record_t g_pvc_anchor_ring[PVC_ANCHOR_RING_SIZE] ZPNET_ISR_HOT_DATA;
+static volatile uint32_t g_pvc_anchor_seq = 0;
+static volatile uint32_t g_pvc_anchor_head = 0;
+static volatile uint32_t g_pvc_anchor_count = 0;
+static volatile bool     g_pvc_anchor_reset_pending = false;
+static pvc_anchor_record_t g_pvc_anchor_ring[PVC_ANCHOR_RING_SIZE];
 
 // Report-only accounting for CLOCKS/Alpha GNSS-label annotations.
 // The label API does not create anchors or change event custody; these counters
@@ -605,11 +583,11 @@ static uint32_t g_pvc_anchor_label_last_match_age_slots = 0xFFFFFFFFUL;
 static uint32_t g_pvc_anchor_label_last_match_index = 0xFFFFFFFFUL;
 static bool     g_pvc_anchor_label_last_success = false;
 
-static bridge_anchor_stats_t g_bridge_stats_timepop ZPNET_ISR_HOT_DATA = {};
-static bridge_anchor_stats_t g_bridge_stats_ocxo1 ZPNET_ISR_HOT_DATA = {};
-static bridge_anchor_stats_t g_bridge_stats_ocxo2 ZPNET_ISR_HOT_DATA = {};
+static bridge_anchor_stats_t g_bridge_stats_timepop = {};
+static bridge_anchor_stats_t g_bridge_stats_ocxo1 = {};
+static bridge_anchor_stats_t g_bridge_stats_ocxo2 = {};
 
-ZPNET_ISR_FASTRUN static void pvc_anchor_ring_reset(void) {
+static void pvc_anchor_ring_reset(void) {
   g_pvc_anchor_seq++;
   dmb_barrier();
 
@@ -634,7 +612,7 @@ ZPNET_ISR_FASTRUN static void pvc_anchor_ring_reset(void) {
   g_pvc_anchor_seq++;
 }
 
-ZPNET_ISR_FASTRUN static void pvc_anchor_publish(const pps_vclock_t& pvc) {
+static void pvc_anchor_publish(const pps_vclock_t& pvc) {
   const uint32_t next = (g_pvc_anchor_count == 0)
       ? 0
       : ((g_pvc_anchor_head + 1u) % PVC_ANCHOR_RING_SIZE);
@@ -671,7 +649,7 @@ ZPNET_ISR_FASTRUN static void pvc_anchor_publish(const pps_vclock_t& pvc) {
   g_pvc_anchor_seq++;
 }
 
-ZPNET_ISR_FASTRUN static bool pvc_anchor_snapshot(pvc_anchor_record_t* out, uint32_t& out_count) {
+static bool pvc_anchor_snapshot(pvc_anchor_record_t* out, uint32_t& out_count) {
   out_count = 0;
 
   for (int attempt = 0; attempt < 4; attempt++) {
@@ -708,7 +686,7 @@ ZPNET_ISR_FASTRUN static bool pvc_anchor_snapshot(pvc_anchor_record_t* out, uint
 // This is deliberately a ring annotation only: process_interrupt still owns
 // anchor selection and DWT-to-GNSS projection for subscriber events, but it
 // does not invent campaign GNSS labels locally.
-ZPNET_ISR_FASTRUN void interrupt_pps_vclock_label_anchor(uint32_t sequence,
+void interrupt_pps_vclock_label_anchor(uint32_t sequence,
                                        uint32_t counter32_at_edge,
                                        uint64_t gnss_ns_at_edge,
                                        uint32_t dwt_cycles_per_second) {
@@ -795,7 +773,7 @@ static bridge_anchor_stats_t* bridge_stats_for(interrupt_subscriber_kind_t kind)
   return nullptr;
 }
 
-ZPNET_ISR_FASTRUN static void bridge_projection_record_stats(interrupt_subscriber_kind_t kind,
+static void bridge_projection_record_stats(interrupt_subscriber_kind_t kind,
                                            const bridge_projection_t& proj) {
   bridge_anchor_stats_t* s = bridge_stats_for(kind);
   if (!s) return;
@@ -839,10 +817,10 @@ struct pps_gpio_heartbeat_t {
   uint32_t last_dwt     = 0;     // pps_vclock.dwt_at_edge of most recent edge
   int64_t  last_gnss_ns = -1;    // GNSS labels are CLOCKS-owned; unavailable here.
 };
-static pps_gpio_heartbeat_t g_pps_gpio_heartbeat ZPNET_ISR_HOT_DATA;
+static pps_gpio_heartbeat_t g_pps_gpio_heartbeat;
 
-static uint32_t g_gpio_irq_count ZPNET_ISR_HOT_DATA = 0;
-static uint32_t g_gpio_miss_count ZPNET_ISR_HOT_DATA = 0;
+static uint32_t g_gpio_irq_count = 0;
+static uint32_t g_gpio_miss_count = 0;
 
 // PPS post-ISR drain.  The GPIO ISR still captures the physical PPS witness
 // facts and the small three-counter custody window immediately, because those
@@ -861,22 +839,22 @@ struct pps_post_isr_mailbox_t {
   uint32_t isr_entry_dwt_raw = 0;
 };
 
-static pps_post_isr_mailbox_t g_pps_post_isr ZPNET_ISR_HOT_DATA = {};
-ZPNET_ISR_FASTRUN static void pps_post_isr_asap_callback(timepop_ctx_t*, timepop_diag_t*, void*);
+static pps_post_isr_mailbox_t g_pps_post_isr = {};
+static void pps_post_isr_asap_callback(timepop_ctx_t*, timepop_diag_t*, void*);
 
-static volatile bool     g_pps_relay_timer_active ZPNET_ISR_HOT_DATA = false;
-static volatile bool     g_pps_relay_deassert_arm_pending ZPNET_ISR_HOT_DATA = false;
-static volatile uint32_t g_pps_relay_deassert_countdown_ticks ZPNET_ISR_HOT_DATA = 0;
-static volatile uint32_t g_pps_relay_assert_count ZPNET_ISR_HOT_DATA = 0;
-static volatile uint32_t g_pps_relay_deassert_count ZPNET_ISR_HOT_DATA = 0;
-static volatile uint32_t g_pps_relay_deassert_arm_count ZPNET_ISR_HOT_DATA = 0;
-static volatile uint32_t g_pps_relay_deassert_arm_fail_count ZPNET_ISR_HOT_DATA = 0;
-static volatile uint32_t g_pps_relay_deassert_arm_skip_count ZPNET_ISR_HOT_DATA = 0;
-static volatile uint32_t g_pps_relay_last_assert_sequence ZPNET_ISR_HOT_DATA = 0;
-static volatile bool     g_pps_relay_pin_initialized ZPNET_ISR_HOT_DATA = false;
+static volatile bool     g_pps_relay_timer_active = false;
+static volatile bool     g_pps_relay_deassert_arm_pending = false;
+static volatile uint32_t g_pps_relay_deassert_countdown_ticks = 0;
+static volatile uint32_t g_pps_relay_assert_count = 0;
+static volatile uint32_t g_pps_relay_deassert_count = 0;
+static volatile uint32_t g_pps_relay_deassert_arm_count = 0;
+static volatile uint32_t g_pps_relay_deassert_arm_fail_count = 0;
+static volatile uint32_t g_pps_relay_deassert_arm_skip_count = 0;
+static volatile uint32_t g_pps_relay_last_assert_sequence = 0;
+static volatile bool     g_pps_relay_pin_initialized = false;
 
-ZPNET_ISR_FASTRUN static void pps_relay_assert_from_isr(uint32_t sequence);
-ZPNET_ISR_FASTRUN static void pps_relay_vclock_heartbeat_tick(void);
+static void pps_relay_assert_from_isr(uint32_t sequence);
+static void pps_relay_vclock_heartbeat_tick(void);
 
 // ============================================================================
 // PPS witness + VCLOCK-domain canonical epoch latch
@@ -909,9 +887,9 @@ struct vclock_epoch_latch_t {
   uint32_t sacred_dwt = 0;
 };
 
-static pps_t g_last_pps_witness ZPNET_ISR_HOT_DATA = {};
-static bool  g_last_pps_witness_valid ZPNET_ISR_HOT_DATA = false;
-static vclock_epoch_latch_t g_vclock_epoch_latch ZPNET_ISR_HOT_DATA = {};
+static pps_t g_last_pps_witness = {};
+static bool  g_last_pps_witness_valid = false;
+static vclock_epoch_latch_t g_vclock_epoch_latch = {};
 
 struct dwt_repair_diag_t {
   bool     valid = false;
@@ -938,7 +916,7 @@ struct vclock_repair_stats_t {
 
 };
 
-static vclock_repair_stats_t g_vclock_repair_stats ZPNET_ISR_HOT_DATA = {};
+static vclock_repair_stats_t g_vclock_repair_stats = {};
 
 // ============================================================================
 // VCLOCK GNSS labels
@@ -953,17 +931,17 @@ static vclock_repair_stats_t g_vclock_repair_stats ZPNET_ISR_HOT_DATA = {};
 // would be worse than unavailable because it could be mistaken for CLOCKS'
 // campaign GNSS ledger.
 
-ZPNET_ISR_FASTRUN static int64_t vclock_gnss_from_counter32(uint32_t) {
+static int64_t vclock_gnss_from_counter32(uint32_t) {
   return -1;
 }
 
-ZPNET_ISR_FASTRUN static uint32_t pvc_anchor_latest_cps(void) {
+static uint32_t pvc_anchor_latest_cps(void) {
   if (g_pvc_anchor_count == 0) return 0;
   const pvc_anchor_record_t& a = g_pvc_anchor_ring[g_pvc_anchor_head];
   return (a.cps_valid && a.cps != 0) ? a.cps : 0;
 }
 
-ZPNET_ISR_FASTRUN static uint32_t interrupt_vclock_cycles_per_second(void) {
+static uint32_t interrupt_vclock_cycles_per_second(void) {
   const uint32_t calibrated = clocks_dwt_cycles_per_gnss_second();
   if (calibrated != 0) return calibrated;
 
@@ -973,7 +951,7 @@ ZPNET_ISR_FASTRUN static uint32_t interrupt_vclock_cycles_per_second(void) {
   return DWT_EXPECTED_PER_PPS;
 }
 
-ZPNET_ISR_FASTRUN static uint32_t vclock_cycles_for_ticks(uint32_t vclock_ticks) {
+static uint32_t vclock_cycles_for_ticks(uint32_t vclock_ticks) {
   const uint32_t cycles = interrupt_vclock_cycles_per_second();
 
   return (uint32_t)(((uint64_t)cycles * (uint64_t)vclock_ticks +
@@ -981,7 +959,7 @@ ZPNET_ISR_FASTRUN static uint32_t vclock_cycles_for_ticks(uint32_t vclock_ticks)
                     (uint64_t)VCLOCK_COUNTS_PER_SECOND);
 }
 
-ZPNET_ISR_FASTRUN static uint32_t pps_vclock_phase_cycles_from_edges(const pps_t& pps,
+static uint32_t pps_vclock_phase_cycles_from_edges(const pps_t& pps,
                                                    const pps_vclock_t& pvc) {
   // Scalar PPS→VCLOCK phase, by definition less than one 10 MHz tick.
   //
@@ -1004,7 +982,7 @@ ZPNET_ISR_FASTRUN static uint32_t pps_vclock_phase_cycles_from_edges(const pps_t
                     (uint64_t)VCLOCK_COUNTS_PER_SECOND);
 }
 
-ZPNET_ISR_FASTRUN static dwt_repair_diag_t vclock_endpoint_repair_diagnostic(uint32_t observed_dwt) {
+static dwt_repair_diag_t vclock_endpoint_repair_diagnostic(uint32_t observed_dwt) {
   dwt_repair_diag_t r{};
   r.valid = false;
   r.candidate = false;
@@ -1030,7 +1008,7 @@ ZPNET_ISR_FASTRUN static dwt_repair_diag_t vclock_endpoint_repair_diagnostic(uin
   return r;
 }
 
-ZPNET_ISR_FASTRUN static void publish_vclock_domain_pps_vclock(const pps_t& pps,
+static void publish_vclock_domain_pps_vclock(const pps_t& pps,
                                              uint32_t sequence,
                                              uint32_t dwt_at_edge,
                                              uint32_t counter32_at_edge,
@@ -1053,7 +1031,7 @@ ZPNET_ISR_FASTRUN static void publish_vclock_domain_pps_vclock(const pps_t& pps,
   pvc_anchor_publish(pvc);
 }
 
-ZPNET_ISR_FASTRUN static void publish_selected_epoch_from_vclock_cadence(uint32_t cadence_counter32,
+static void publish_selected_epoch_from_vclock_cadence(uint32_t cadence_counter32,
                                                        uint32_t cadence_event_dwt) {
   if (!g_vclock_epoch_latch.pending) return;
 
@@ -1111,7 +1089,7 @@ static inline uint32_t qtimer_event_dwt_from_isr_entry_raw(uint32_t isr_entry_dw
 // DWT → GNSS conversion (the OCXO/TimePop exception)
 // ============================================================================
 
-ZPNET_ISR_FASTRUN static bridge_projection_t interrupt_dwt_to_vclock_gnss_projection(uint32_t dwt_at_event) {
+static bridge_projection_t interrupt_dwt_to_vclock_gnss_projection(uint32_t dwt_at_event) {
   bridge_projection_t out{};
   out.gnss_ns = -1;
   out.anchor_selection_kind = ANCHOR_SELECT_FAILED;
@@ -1169,7 +1147,7 @@ ZPNET_ISR_FASTRUN static bridge_projection_t interrupt_dwt_to_vclock_gnss_projec
   return out;
 }
 
-ZPNET_ISR_FASTRUN static int64_t interrupt_project_dwt_to_vclock_gnss_ns(uint32_t dwt_at_event) {
+static int64_t interrupt_project_dwt_to_vclock_gnss_ns(uint32_t dwt_at_event) {
   return interrupt_dwt_to_vclock_gnss_projection(dwt_at_event).gnss_ns;
 }
 
@@ -1205,32 +1183,32 @@ static const interrupt_subscriber_descriptor_t DESCRIPTORS[] = {
   { interrupt_subscriber_kind_t::OCXO2,  "OCXO2",  interrupt_provider_kind_t::QTIMER3, interrupt_lane_t::QTIMER3_CH3_COMP },
 };
 
-static interrupt_subscriber_runtime_t g_subscribers[MAX_INTERRUPT_SUBSCRIBERS] ZPNET_ISR_HOT_DATA = {};
-static uint32_t g_subscriber_count ZPNET_ISR_HOT_DATA = 0;
-static bool g_interrupt_hw_ready ZPNET_ISR_HOT_DATA = false;
-static bool g_interrupt_runtime_ready ZPNET_ISR_HOT_DATA = false;
-static bool g_interrupt_irqs_enabled ZPNET_ISR_HOT_DATA = false;
+static interrupt_subscriber_runtime_t g_subscribers[MAX_INTERRUPT_SUBSCRIBERS] = {};
+static uint32_t g_subscriber_count = 0;
+static bool g_interrupt_hw_ready = false;
+static bool g_interrupt_runtime_ready = false;
+static bool g_interrupt_irqs_enabled = false;
 
-static volatile uint32_t g_step0_qtimer1_priority_applied ZPNET_ISR_HOT_DATA  = 0xFFFFFFFFUL;
-static volatile uint32_t g_step0_qtimer2_priority_applied ZPNET_ISR_HOT_DATA  = 0xFFFFFFFFUL;
-static volatile uint32_t g_step0_qtimer3_priority_applied ZPNET_ISR_HOT_DATA  = 0xFFFFFFFFUL;
-static volatile uint32_t g_step0_gpio6789_priority_applied ZPNET_ISR_HOT_DATA = 0xFFFFFFFFUL;
+static volatile uint32_t g_step0_qtimer1_priority_applied  = 0xFFFFFFFFUL;
+static volatile uint32_t g_step0_qtimer2_priority_applied  = 0xFFFFFFFFUL;
+static volatile uint32_t g_step0_qtimer3_priority_applied  = 0xFFFFFFFFUL;
+static volatile uint32_t g_step0_gpio6789_priority_applied = 0xFFFFFFFFUL;
 
-static volatile bool g_step0_qtimer1_irq_enabled_by_interrupt ZPNET_ISR_HOT_DATA  = false;
-static volatile bool g_step0_qtimer2_irq_enabled_by_interrupt ZPNET_ISR_HOT_DATA  = false;
-static volatile bool g_step0_qtimer3_irq_enabled_by_interrupt ZPNET_ISR_HOT_DATA  = false;
-static volatile bool g_step0_gpio6789_configured_by_interrupt ZPNET_ISR_HOT_DATA = false;
+static volatile bool g_step0_qtimer1_irq_enabled_by_interrupt  = false;
+static volatile bool g_step0_qtimer2_irq_enabled_by_interrupt  = false;
+static volatile bool g_step0_qtimer3_irq_enabled_by_interrupt  = false;
+static volatile bool g_step0_gpio6789_configured_by_interrupt = false;
 
 
-static volatile bool     g_pps_rebootstrap_pending ZPNET_ISR_HOT_DATA = false;
-static volatile uint32_t g_pps_rebootstrap_count ZPNET_ISR_HOT_DATA   = 0;
+static volatile bool     g_pps_rebootstrap_pending = false;
+static volatile uint32_t g_pps_rebootstrap_count   = 0;
 
-static interrupt_subscriber_runtime_t* g_rt_vclock ZPNET_ISR_HOT_DATA = nullptr;
-static interrupt_subscriber_runtime_t* g_rt_ocxo1 ZPNET_ISR_HOT_DATA  = nullptr;
-static interrupt_subscriber_runtime_t* g_rt_ocxo2 ZPNET_ISR_HOT_DATA  = nullptr;
+static interrupt_subscriber_runtime_t* g_rt_vclock = nullptr;
+static interrupt_subscriber_runtime_t* g_rt_ocxo1  = nullptr;
+static interrupt_subscriber_runtime_t* g_rt_ocxo2  = nullptr;
 
 static volatile interrupt_pps_entry_latency_handler_fn
-    g_pps_entry_latency_handler ZPNET_ISR_HOT_DATA = nullptr;
+    g_pps_entry_latency_handler = nullptr;
 
 
 
@@ -1250,7 +1228,7 @@ struct vclock_lane_t {
   uint32_t bootstrap_count = 0;
   uint32_t cadence_hits_total = 0;
 };
-static vclock_lane_t g_vclock_lane ZPNET_ISR_HOT_DATA;
+static vclock_lane_t g_vclock_lane;
 
 struct synthetic_clock32_t;
 struct ocxo_runtime_context_t;
@@ -1432,8 +1410,8 @@ struct ocxo_lane_t {
   uint32_t ema_max_abs_error_cycles = 0;
   uint32_t ema_update_count = 0;
 };
-static ocxo_lane_t g_ocxo1_lane ZPNET_ISR_HOT_DATA;
-static ocxo_lane_t g_ocxo2_lane ZPNET_ISR_HOT_DATA;
+static ocxo_lane_t g_ocxo1_lane;
+static ocxo_lane_t g_ocxo2_lane;
 
 static ocxo_lane_t* ocxo_lane_for(interrupt_subscriber_kind_t kind);
 static inline uint16_t ocxo_lane_counter_now(const ocxo_lane_t& lane);
@@ -1441,7 +1419,7 @@ static void ocxo_lane_program_compare(ocxo_lane_t& lane, uint16_t target_low16);
 static void ocxo_lane_disable_compare(ocxo_lane_t& lane);
 static void ocxo_lane_clear_compare_flag(ocxo_lane_t& lane);
 static inline bool ocxo_lane_compare_flag_pending(const ocxo_lane_t& lane);
-ZPNET_ISR_FASTRUN static void ocxo_qtimer_diag_record(ocxo_runtime_context_t& ctx,
+static void ocxo_qtimer_diag_record(ocxo_runtime_context_t& ctx,
                                     uint32_t isr_entry_dwt_raw,
                                     uint32_t event_dwt,
                                     uint32_t legacy_late_ticks,
@@ -1453,7 +1431,7 @@ ZPNET_ISR_FASTRUN static void ocxo_qtimer_diag_record(ocxo_runtime_context_t& ct
                                     uint16_t target_low16,
                                     uint16_t isr_counter_low16,
                                     bool ema_predicted);
-ZPNET_ISR_FASTRUN static bool ocxo_lane_start_local_cadence(interrupt_subscriber_kind_t kind,
+static bool ocxo_lane_start_local_cadence(interrupt_subscriber_kind_t kind,
                                           ocxo_lane_t& lane,
                                           synthetic_clock32_t& clock32,
                                           uint32_t reason);
@@ -1462,21 +1440,21 @@ static bool ocxo_lane_start_local_cadence_at_target(interrupt_subscriber_kind_t 
                                                     synthetic_clock32_t& clock32,
                                                     uint32_t target_counter32,
                                                     uint32_t reason);
-ZPNET_ISR_FASTRUN static uint32_t ocxo_one_second_next_target_after(
+static uint32_t ocxo_one_second_next_target_after(
     uint32_t epoch_counter32,
     uint32_t current_counter32);
-ZPNET_ISR_FASTRUN static void ocxo_lane_program_local_cadence_compare(
+static void ocxo_lane_program_local_cadence_compare(
     ocxo_lane_t& lane,
     uint32_t target_counter32,
     uint32_t reason);
 static void ocxo_lane_stop_local_cadence(ocxo_lane_t& lane, uint32_t reason);
 static void ocxo_lane_ema_reset(ocxo_lane_t& lane);
-ZPNET_ISR_FASTRUN static void ocxo_lane_install_logical_grid(interrupt_subscriber_kind_t kind,
+static void ocxo_lane_install_logical_grid(interrupt_subscriber_kind_t kind,
                                            ocxo_lane_t& lane,
                                            synthetic_clock32_t& clock32,
                                            uint32_t epoch_counter32,
                                            uint32_t reason);
-ZPNET_ISR_FASTRUN static void ocxo_lane_maybe_arm_one_second_compare(
+static void ocxo_lane_maybe_arm_one_second_compare(
     interrupt_subscriber_kind_t kind,
     ocxo_lane_t& lane,
     synthetic_clock32_t& clock32,
@@ -1534,21 +1512,21 @@ struct vclock_synthetic_clock32_t : synthetic_clock32_t {
   uint32_t hardware_anchor_update_count = 0;
 };
 
-static vclock_synthetic_clock32_t g_vclock_clock32 ZPNET_ISR_HOT_DATA;
-static synthetic_clock32_t        g_ocxo1_clock32 ZPNET_ISR_HOT_DATA;
-static synthetic_clock32_t        g_ocxo2_clock32 ZPNET_ISR_HOT_DATA;
+static vclock_synthetic_clock32_t g_vclock_clock32;
+static synthetic_clock32_t        g_ocxo1_clock32;
+static synthetic_clock32_t        g_ocxo2_clock32;
 
-static volatile uint32_t g_qtimer1_ch1_sequence ZPNET_ISR_HOT_DATA = 0;
-static volatile uint32_t g_qtimer1_ch1_target_counter32 ZPNET_ISR_HOT_DATA = 0;
-static volatile uint32_t g_qtimer1_ch1_next_compare_counter32 ZPNET_ISR_HOT_DATA = 0;
-static volatile uint32_t g_qtimer1_ch1_arm_count ZPNET_ISR_HOT_DATA = 0;
-static volatile uint32_t g_qtimer1_ch1_fire_count ZPNET_ISR_HOT_DATA = 0;
-static volatile uint32_t g_qtimer1_ch1_hop_count ZPNET_ISR_HOT_DATA = 0;
-static volatile bool     g_qtimer1_ch1_active ZPNET_ISR_HOT_DATA = false;
-static volatile interrupt_qtimer1_ch1_handler_fn g_qtimer1_ch1_handler ZPNET_ISR_HOT_DATA = nullptr;
+static volatile uint32_t g_qtimer1_ch1_sequence = 0;
+static volatile uint32_t g_qtimer1_ch1_target_counter32 = 0;
+static volatile uint32_t g_qtimer1_ch1_next_compare_counter32 = 0;
+static volatile uint32_t g_qtimer1_ch1_arm_count = 0;
+static volatile uint32_t g_qtimer1_ch1_fire_count = 0;
+static volatile uint32_t g_qtimer1_ch1_hop_count = 0;
+static volatile bool     g_qtimer1_ch1_active = false;
+static volatile interrupt_qtimer1_ch1_handler_fn g_qtimer1_ch1_handler = nullptr;
 
-static volatile uint32_t g_qtimer1_ch2_last_target_counter32 ZPNET_ISR_HOT_DATA = 0;
-static volatile uint32_t g_qtimer1_ch2_arm_count ZPNET_ISR_HOT_DATA = 0;
+static volatile uint32_t g_qtimer1_ch2_last_target_counter32 = 0;
+static volatile uint32_t g_qtimer1_ch2_arm_count = 0;
 
 struct ocxo_qtimer_diag_t {
   volatile uint32_t count = 0;
@@ -1565,8 +1543,8 @@ struct ocxo_qtimer_diag_t {
   volatile uint32_t dwt_coordinate_source = OCXO_DWT_SOURCE_NONE;
 };
 
-static ocxo_qtimer_diag_t g_ocxo1_qtimer_diag ZPNET_ISR_HOT_DATA = {};
-static ocxo_qtimer_diag_t g_ocxo2_qtimer_diag ZPNET_ISR_HOT_DATA = {};
+static ocxo_qtimer_diag_t g_ocxo1_qtimer_diag = {};
+static ocxo_qtimer_diag_t g_ocxo2_qtimer_diag = {};
 
 struct ocxo_runtime_context_t {
   interrupt_subscriber_kind_t kind = interrupt_subscriber_kind_t::NONE;
@@ -1584,7 +1562,7 @@ struct ocxo_runtime_context_t {
   ocxo_qtimer_diag_t* qtimer_diag = nullptr;
 };
 
-static ocxo_runtime_context_t g_ocxo1_ctx ZPNET_ISR_HOT_DATA = {
+static ocxo_runtime_context_t g_ocxo1_ctx = {
   interrupt_subscriber_kind_t::OCXO1,
   interrupt_provider_kind_t::QTIMER2,
   interrupt_lane_t::QTIMER2_CH0_COMP,
@@ -1600,7 +1578,7 @@ static ocxo_runtime_context_t g_ocxo1_ctx ZPNET_ISR_HOT_DATA = {
   &g_ocxo1_qtimer_diag,
 };
 
-static ocxo_runtime_context_t g_ocxo2_ctx ZPNET_ISR_HOT_DATA = {
+static ocxo_runtime_context_t g_ocxo2_ctx = {
   interrupt_subscriber_kind_t::OCXO2,
   interrupt_provider_kind_t::QTIMER3,
   interrupt_lane_t::QTIMER3_CH3_COMP,
@@ -1636,19 +1614,19 @@ static interrupt_subscriber_runtime_t* ocxo_runtime_for(const ocxo_runtime_conte
   return ctx.rt_slot ? *ctx.rt_slot : nullptr;
 }
 
-static volatile bool     g_vclock_heartbeat_armed ZPNET_ISR_HOT_DATA = false;
-static volatile uint32_t g_vclock_heartbeat_arm_count ZPNET_ISR_HOT_DATA = 0;
-static volatile uint32_t g_vclock_heartbeat_arm_failures ZPNET_ISR_HOT_DATA = 0;
-static volatile uint32_t g_vclock_heartbeat_fire_count ZPNET_ISR_HOT_DATA = 0;
-static volatile uint32_t g_vclock_heartbeat_vclock_ticks ZPNET_ISR_HOT_DATA = 0;
-static volatile uint32_t g_vclock_heartbeat_ocxo1_rollover_updates_retired ZPNET_ISR_HOT_DATA = 0;
-static volatile uint32_t g_vclock_heartbeat_ocxo2_rollover_updates_retired ZPNET_ISR_HOT_DATA = 0;
-static volatile uint16_t g_vclock_heartbeat_last_vclock_hw16 ZPNET_ISR_HOT_DATA = 0;
-static volatile uint16_t g_vclock_heartbeat_last_ocxo1_hw16_retired ZPNET_ISR_HOT_DATA = 0;
-static volatile uint16_t g_vclock_heartbeat_last_ocxo2_hw16_retired ZPNET_ISR_HOT_DATA = 0;
-static volatile uint32_t g_vclock_heartbeat_last_vclock_counter32 ZPNET_ISR_HOT_DATA = 0;
-static volatile uint32_t g_vclock_heartbeat_last_ocxo1_counter32_retired ZPNET_ISR_HOT_DATA = 0;
-static volatile uint32_t g_vclock_heartbeat_last_ocxo2_counter32_retired ZPNET_ISR_HOT_DATA = 0;
+static volatile bool     g_vclock_heartbeat_armed = false;
+static volatile uint32_t g_vclock_heartbeat_arm_count = 0;
+static volatile uint32_t g_vclock_heartbeat_arm_failures = 0;
+static volatile uint32_t g_vclock_heartbeat_fire_count = 0;
+static volatile uint32_t g_vclock_heartbeat_vclock_ticks = 0;
+static volatile uint32_t g_vclock_heartbeat_ocxo1_rollover_updates_retired = 0;
+static volatile uint32_t g_vclock_heartbeat_ocxo2_rollover_updates_retired = 0;
+static volatile uint16_t g_vclock_heartbeat_last_vclock_hw16 = 0;
+static volatile uint16_t g_vclock_heartbeat_last_ocxo1_hw16_retired = 0;
+static volatile uint16_t g_vclock_heartbeat_last_ocxo2_hw16_retired = 0;
+static volatile uint32_t g_vclock_heartbeat_last_vclock_counter32 = 0;
+static volatile uint32_t g_vclock_heartbeat_last_ocxo1_counter32_retired = 0;
+static volatile uint32_t g_vclock_heartbeat_last_ocxo2_counter32_retired = 0;
 
 // Passive CH2 rollover tend — surgical coexistence layer.
 //
@@ -1657,16 +1635,16 @@ static volatile uint32_t g_vclock_heartbeat_last_ocxo2_counter32_retired ZPNET_I
 // synthetic 32-bit ambient projections from current 16-bit hardware reads.
 // Existing VCLOCK_HEARTBEAT and OCXO local cadence event authorship remain intact.
 static constexpr bool     CH2_IMPLICIT_ROLLOVER_ENABLED = true;
-static volatile uint32_t g_ch2_implicit_rollover_count ZPNET_ISR_HOT_DATA = 0;
-static volatile uint32_t g_ch2_implicit_rollover_vclock_updates ZPNET_ISR_HOT_DATA = 0;
-static volatile uint32_t g_ch2_implicit_rollover_ocxo1_updates ZPNET_ISR_HOT_DATA = 0;
-static volatile uint32_t g_ch2_implicit_rollover_ocxo2_updates ZPNET_ISR_HOT_DATA = 0;
-static volatile uint16_t g_ch2_implicit_rollover_last_vclock_hw16 ZPNET_ISR_HOT_DATA = 0;
-static volatile uint16_t g_ch2_implicit_rollover_last_ocxo1_hw16 ZPNET_ISR_HOT_DATA = 0;
-static volatile uint16_t g_ch2_implicit_rollover_last_ocxo2_hw16 ZPNET_ISR_HOT_DATA = 0;
-static volatile uint32_t g_ch2_implicit_rollover_last_vclock_counter32 ZPNET_ISR_HOT_DATA = 0;
-static volatile uint32_t g_ch2_implicit_rollover_last_ocxo1_counter32 ZPNET_ISR_HOT_DATA = 0;
-static volatile uint32_t g_ch2_implicit_rollover_last_ocxo2_counter32 ZPNET_ISR_HOT_DATA = 0;
+static volatile uint32_t g_ch2_implicit_rollover_count = 0;
+static volatile uint32_t g_ch2_implicit_rollover_vclock_updates = 0;
+static volatile uint32_t g_ch2_implicit_rollover_ocxo1_updates = 0;
+static volatile uint32_t g_ch2_implicit_rollover_ocxo2_updates = 0;
+static volatile uint16_t g_ch2_implicit_rollover_last_vclock_hw16 = 0;
+static volatile uint16_t g_ch2_implicit_rollover_last_ocxo1_hw16 = 0;
+static volatile uint16_t g_ch2_implicit_rollover_last_ocxo2_hw16 = 0;
+static volatile uint32_t g_ch2_implicit_rollover_last_vclock_counter32 = 0;
+static volatile uint32_t g_ch2_implicit_rollover_last_ocxo1_counter32 = 0;
+static volatile uint32_t g_ch2_implicit_rollover_last_ocxo2_counter32 = 0;
 
 static inline uint32_t clock32_from_ns(uint64_t ns) {
   return (uint32_t)((ns / 100ULL) & 0xFFFFFFFFULL);
@@ -1692,7 +1670,7 @@ static void synthetic_clock_zero(synthetic_clock32_t& c, uint64_t ns) {
   c.pending_zero = false;
 }
 
-ZPNET_ISR_FASTRUN static void vclock_clock_anchor_hardware_low16(uint32_t synthetic_counter32,
+static void vclock_clock_anchor_hardware_low16(uint32_t synthetic_counter32,
                                                  uint16_t hardware_low16) {
   g_vclock_clock32.current_counter32 = synthetic_counter32;
   g_vclock_clock32.current_ns = (uint64_t)synthetic_counter32 * 100ULL;
@@ -1702,7 +1680,7 @@ ZPNET_ISR_FASTRUN static void vclock_clock_anchor_hardware_low16(uint32_t synthe
   g_vclock_clock32.hardware_anchor_update_count++;
 }
 
-ZPNET_ISR_FASTRUN static void vclock_clock_zero_at_hardware_low16(uint64_t ns,
+static void vclock_clock_zero_at_hardware_low16(uint64_t ns,
                                                 uint16_t hardware_low16) {
   g_vclock_clock32.zeroed = true;
   g_vclock_clock32.zero_ns = ns;
@@ -1714,9 +1692,9 @@ ZPNET_ISR_FASTRUN static void vclock_clock_zero_at_hardware_low16(uint64_t ns,
                                      hardware_low16);
 }
 
-ZPNET_ISR_FASTRUN static void synthetic_clock_bootstrap_from_hw16(synthetic_clock32_t& c, uint16_t hardware16);
+static void synthetic_clock_bootstrap_from_hw16(synthetic_clock32_t& c, uint16_t hardware16);
 static void vclock_clock_bootstrap_from_hw16(uint16_t hardware16);
-ZPNET_ISR_FASTRUN static uint32_t project_counter32_from_hw16(const synthetic_clock32_t& c, uint16_t hardware16);
+static uint32_t project_counter32_from_hw16(const synthetic_clock32_t& c, uint16_t hardware16);
 static inline void synthetic_clock_consume_pending_zero_if_any(synthetic_clock32_t& c);
 static void cadence_regression_reset_kind(interrupt_subscriber_kind_t kind);
 static void vclock_fact_ring_reset(void);
@@ -1822,11 +1800,11 @@ static inline uint32_t synthetic_clock_advance_at_hardware(synthetic_clock32_t& 
   return c.current_counter32;
 }
 
-ZPNET_ISR_FASTRUN uint32_t interrupt_qtimer1_counter32_now(void)   { return vclock_synthetic_from_hardware_low16(qtimer1_ch0_counter_now()); }
-ZPNET_ISR_FASTRUN uint16_t interrupt_qtimer2_ch0_counter_now(void) {
+uint32_t interrupt_qtimer1_counter32_now(void)   { return vclock_synthetic_from_hardware_low16(qtimer1_ch0_counter_now()); }
+uint16_t interrupt_qtimer2_ch0_counter_now(void) {
   return OCXO1_DISABLED ? 0U : IMXRT_TMR2.CH[0].CNTR;
 }
-ZPNET_ISR_FASTRUN uint16_t interrupt_qtimer3_ch3_counter_now(void) {
+uint16_t interrupt_qtimer3_ch3_counter_now(void) {
   return OCXO2_DISABLED ? 0U : IMXRT_TMR3.CH[3].CNTR;
 }
 
@@ -1839,7 +1817,7 @@ static inline uint32_t cadence_mod_for_ticks(uint32_t ticks, uint32_t interval) 
   return (ticks / interval) % TICKS_PER_SECOND_EVENT;
 }
 
-ZPNET_ISR_FASTRUN static uint32_t project_counter32_from_hw16(const synthetic_clock32_t& c,
+static uint32_t project_counter32_from_hw16(const synthetic_clock32_t& c,
                                             uint16_t hardware16) {
   // Boot-safety rule: before a lane has been explicitly born/zeroed, raw
   // hardware low-word observations are still safe diagnostic coordinates.
@@ -1850,7 +1828,7 @@ ZPNET_ISR_FASTRUN static uint32_t project_counter32_from_hw16(const synthetic_cl
   return c.current_counter32 + (uint32_t)((uint16_t)(hardware16 - c.hardware16));
 }
 
-ZPNET_ISR_FASTRUN static uint64_t project_ns64_from_hw16(const synthetic_clock32_t& c,
+static uint64_t project_ns64_from_hw16(const synthetic_clock32_t& c,
                                        uint16_t hardware16) {
   // Same boot-safety rule as COUNT32 projection.  This value is not global
   // truth before ZERO; it is only a harmless local low-word-derived surface.
@@ -1860,7 +1838,7 @@ ZPNET_ISR_FASTRUN static uint64_t project_ns64_from_hw16(const synthetic_clock32
   return c.current_ns + (uint64_t)delta * 100ULL;
 }
 
-ZPNET_ISR_FASTRUN static void synthetic_clock_bootstrap_from_hw16(synthetic_clock32_t& c,
+static void synthetic_clock_bootstrap_from_hw16(synthetic_clock32_t& c,
                                                 uint16_t hardware16) {
   // This is not a user ZERO.  It merely gives the synthetic extender a
   // coherent birth anchor so early ISR/report paths never project from an
@@ -1874,7 +1852,7 @@ ZPNET_ISR_FASTRUN static void synthetic_clock_bootstrap_from_hw16(synthetic_cloc
   c.pending_zero = false;
 }
 
-ZPNET_ISR_FASTRUN static void vclock_clock_bootstrap_from_hw16(uint16_t hardware16) {
+static void vclock_clock_bootstrap_from_hw16(uint16_t hardware16) {
   // Birth the VCLOCK synthetic layer without declaring a logical ZERO.  The
   // PPS/VCLOCK rebootstrap and CLOCKS.ZERO paths may later install the real
   // coordinate origin, but the interrupt layer is safe immediately after IRQs
@@ -1888,7 +1866,7 @@ ZPNET_ISR_FASTRUN static void vclock_clock_bootstrap_from_hw16(uint16_t hardware
   g_vclock_lane.logical_count32_at_last_second = (uint32_t)hardware16;
 }
 
-ZPNET_ISR_FASTRUN static void vclock_clock_tend_from_hardware_low16(uint16_t hardware_low16) {
+static void vclock_clock_tend_from_hardware_low16(uint16_t hardware_low16) {
   if (!g_vclock_clock32.zeroed) {
     vclock_clock_bootstrap_from_hw16(hardware_low16);
     return;
@@ -1899,7 +1877,7 @@ ZPNET_ISR_FASTRUN static void vclock_clock_tend_from_hardware_low16(uint16_t har
   g_vclock_clock32.minder_update_count++;
 }
 
-ZPNET_ISR_FASTRUN static void synthetic_clock_tend_from_hw16(synthetic_clock32_t& c,
+static void synthetic_clock_tend_from_hw16(synthetic_clock32_t& c,
                                            uint16_t hardware16) {
   if (!c.zeroed) {
     synthetic_clock_bootstrap_from_hw16(c, hardware16);
@@ -1915,7 +1893,7 @@ ZPNET_ISR_FASTRUN static void synthetic_clock_tend_from_hw16(synthetic_clock32_t
   c.minder_update_count++;
 }
 
-ZPNET_ISR_FASTRUN static void synthetic_clock_observe_hw16_no_pending_zero(
+static void synthetic_clock_observe_hw16_no_pending_zero(
     synthetic_clock32_t& c,
     uint16_t hardware16) {
   // Passive rollover-only observation.  Unlike synthetic_clock_tend_from_hw16(),
@@ -1935,7 +1913,7 @@ ZPNET_ISR_FASTRUN static void synthetic_clock_observe_hw16_no_pending_zero(
   c.minder_update_count++;
 }
 
-ZPNET_ISR_FASTRUN static void ocxo_lane_maybe_arm_one_second_compare(
+static void ocxo_lane_maybe_arm_one_second_compare(
     interrupt_subscriber_kind_t,
     ocxo_lane_t& lane,
     synthetic_clock32_t& clock32,
@@ -2002,7 +1980,7 @@ ZPNET_ISR_FASTRUN static void ocxo_lane_maybe_arm_one_second_compare(
                                           reason);
 }
 
-ZPNET_ISR_FASTRUN static void interrupt_ch2_implicit_rollover_tend(void) {
+static void interrupt_ch2_implicit_rollover_tend(void) {
   if (!CH2_IMPLICIT_ROLLOVER_ENABLED || !g_interrupt_hw_ready) return;
 
   g_ch2_implicit_rollover_count++;
@@ -2047,7 +2025,7 @@ ZPNET_ISR_FASTRUN static void interrupt_ch2_implicit_rollover_tend(void) {
   }
 }
 
-ZPNET_ISR_FASTRUN bool interrupt_clock_snapshot(interrupt_subscriber_kind_t kind, interrupt_clock_snapshot_t* out) {
+bool interrupt_clock_snapshot(interrupt_subscriber_kind_t kind, interrupt_clock_snapshot_t* out) {
   if (!out) return false;
 
   if (kind == interrupt_subscriber_kind_t::VCLOCK) {
@@ -2113,7 +2091,7 @@ struct smartzero_runtime_t {
   smartzero_lane_runtime_t lanes[SMARTZERO_LANE_COUNT];
 };
 
-static smartzero_runtime_t g_smartzero ZPNET_ISR_HOT_DATA = {};
+static smartzero_runtime_t g_smartzero = {};
 
 static interrupt_subscriber_kind_t smartzero_kind_for_index(uint32_t index) {
   switch (index) {
@@ -2246,12 +2224,12 @@ static void smartzero_reset_lane(uint32_t index) {
   r.pub.required_counter_delta_ticks = SMARTZERO_INTERVAL_TICKS;
 }
 
-ZPNET_ISR_FASTRUN static bool smartzero_is_current_lane(interrupt_subscriber_kind_t kind) {
+static bool smartzero_is_current_lane(interrupt_subscriber_kind_t kind) {
   if (!g_smartzero.running || g_smartzero.complete) return false;
   return smartzero_kind_for_index(g_smartzero.current_lane_index) == kind;
 }
 
-ZPNET_ISR_FASTRUN static uint32_t smartzero_expected_interval_cycles(uint32_t* out_cps) {
+static uint32_t smartzero_expected_interval_cycles(uint32_t* out_cps) {
   const uint32_t cps = interrupt_vclock_cycles_per_second();
   if (out_cps) *out_cps = cps;
 
@@ -2265,7 +2243,7 @@ ZPNET_ISR_FASTRUN static uint32_t smartzero_expected_interval_cycles(uint32_t* o
                     (uint64_t)SMARTZERO_SAMPLE_RATE_HZ);
 }
 
-ZPNET_ISR_FASTRUN static void smartzero_arm_ocxo_lane(interrupt_subscriber_kind_t kind) {
+static void smartzero_arm_ocxo_lane(interrupt_subscriber_kind_t kind) {
   const int idx = smartzero_index_for_kind(kind);
   if (idx < 0) return;
 
@@ -2323,7 +2301,7 @@ static void smartzero_advance_or_complete(void) {
   smartzero_arm_current_lane();
 }
 
-ZPNET_ISR_FASTRUN static bool smartzero_feed_sample(interrupt_subscriber_kind_t kind,
+static bool smartzero_feed_sample(interrupt_subscriber_kind_t kind,
                                   uint32_t event_dwt,
                                   uint32_t counter32,
                                   uint16_t hardware16) {
@@ -2643,7 +2621,7 @@ static inline void qtimer3_disable_compare(uint8_t ch) {
 // Subscriber lookup helpers
 // ============================================================================
 
-ZPNET_ISR_FASTRUN static interrupt_subscriber_runtime_t* runtime_for(interrupt_subscriber_kind_t kind) {
+static interrupt_subscriber_runtime_t* runtime_for(interrupt_subscriber_kind_t kind) {
   for (uint32_t i = 0; i < g_subscriber_count; i++) {
     if (g_subscribers[i].desc && g_subscribers[i].desc->kind == kind) {
       return &g_subscribers[i];
@@ -2652,7 +2630,7 @@ ZPNET_ISR_FASTRUN static interrupt_subscriber_runtime_t* runtime_for(interrupt_s
   return nullptr;
 }
 
-ZPNET_ISR_FASTRUN static ocxo_lane_t* ocxo_lane_for(interrupt_subscriber_kind_t kind) {
+static ocxo_lane_t* ocxo_lane_for(interrupt_subscriber_kind_t kind) {
   ocxo_runtime_context_t* ctx = ocxo_context_for(kind);
   return ctx ? ctx->lane : nullptr;
 }
@@ -3175,8 +3153,8 @@ struct vclock_perishable_ring_t {
   volatile uint32_t asap_fail_count = 0;
 };
 
-static vclock_perishable_ring_t g_vclock_fact_ring ZPNET_ISR_HOT_DATA = {};
-ZPNET_ISR_FASTRUN static void vclock_fact_drain_callback(timepop_ctx_t*, timepop_diag_t*, void*);
+static vclock_perishable_ring_t g_vclock_fact_ring = {};
+static void vclock_fact_drain_callback(timepop_ctx_t*, timepop_diag_t*, void*);
 
 static void vclock_fact_ring_reset(void) {
   for (uint32_t i = 0; i < VCLOCK_PERISHABLE_FACT_RING_SIZE; i++) {
@@ -3408,7 +3386,7 @@ static uint32_t ocxo_grid_next_target_after(uint32_t epoch_counter32,
   return epoch_counter32 + ((steps_completed + 1U) * OCXO_CADENCE_INTERVAL_TICKS);
 }
 
-ZPNET_ISR_FASTRUN static void ocxo_lane_program_local_cadence_compare(ocxo_lane_t& lane,
+static void ocxo_lane_program_local_cadence_compare(ocxo_lane_t& lane,
                                                     uint32_t target_counter32,
                                                     uint32_t reason) {
   const uint16_t target_low16 = (uint16_t)(target_counter32 & 0xFFFFU);
@@ -3442,7 +3420,7 @@ ZPNET_ISR_FASTRUN static void ocxo_lane_program_local_cadence_compare(ocxo_lane_
   lane.cadence_last_reason = reason;
 }
 
-ZPNET_ISR_FASTRUN static bool ocxo_lane_start_local_cadence_at_target(interrupt_subscriber_kind_t,
+static bool ocxo_lane_start_local_cadence_at_target(interrupt_subscriber_kind_t,
                                                     ocxo_lane_t& lane,
                                                     synthetic_clock32_t& clock32,
                                                     uint32_t target_counter32,
@@ -3474,7 +3452,7 @@ ZPNET_ISR_FASTRUN static bool ocxo_lane_start_local_cadence_at_target(interrupt_
   return true;
 }
 
-ZPNET_ISR_FASTRUN static uint32_t ocxo_one_second_next_target_after(
+static uint32_t ocxo_one_second_next_target_after(
     uint32_t epoch_counter32,
     uint32_t current_counter32) {
   const uint32_t delta = current_counter32 - epoch_counter32;
@@ -3485,7 +3463,7 @@ ZPNET_ISR_FASTRUN static uint32_t ocxo_one_second_next_target_after(
   return epoch_counter32 + ((seconds_completed + 1U) * OCXO_WITNESS_ONE_SECOND_COUNTS);
 }
 
-ZPNET_ISR_FASTRUN static void ocxo_lane_prepare_one_second_target(
+static void ocxo_lane_prepare_one_second_target(
     interrupt_subscriber_kind_t kind,
     ocxo_lane_t& lane,
     synthetic_clock32_t& clock32,
@@ -3530,7 +3508,7 @@ ZPNET_ISR_FASTRUN static void ocxo_lane_prepare_one_second_target(
   ocxo_lane_maybe_arm_one_second_compare(kind, lane, clock32, reason);
 }
 
-ZPNET_ISR_FASTRUN static bool ocxo_lane_start_local_cadence(interrupt_subscriber_kind_t kind,
+static bool ocxo_lane_start_local_cadence(interrupt_subscriber_kind_t kind,
                                           ocxo_lane_t& lane,
                                           synthetic_clock32_t& clock32,
                                           uint32_t reason) {
@@ -3583,7 +3561,7 @@ ZPNET_ISR_FASTRUN static bool ocxo_lane_start_local_cadence(interrupt_subscriber
   return lane.cadence_enabled;
 }
 
-ZPNET_ISR_FASTRUN static void ocxo_lane_ema_reset(ocxo_lane_t& lane) {
+static void ocxo_lane_ema_reset(ocxo_lane_t& lane) {
   lane.ema_initialized = false;
   lane.ema_interval_valid = false;
   lane.ema_last_observed_dwt = 0;
@@ -3596,7 +3574,7 @@ ZPNET_ISR_FASTRUN static void ocxo_lane_ema_reset(ocxo_lane_t& lane) {
   lane.ema_update_count = 0;
 }
 
-ZPNET_ISR_FASTRUN static void ocxo_lane_stop_local_cadence(ocxo_lane_t& lane, uint32_t reason) {
+static void ocxo_lane_stop_local_cadence(ocxo_lane_t& lane, uint32_t reason) {
   lane.cadence_enabled = false;
   lane.cadence_armed = false;
   lane.witness_armed = false;
@@ -3604,7 +3582,7 @@ ZPNET_ISR_FASTRUN static void ocxo_lane_stop_local_cadence(ocxo_lane_t& lane, ui
   ocxo_lane_disable_compare(lane);
 }
 
-ZPNET_ISR_FASTRUN static void ocxo_lane_install_logical_grid(interrupt_subscriber_kind_t kind,
+static void ocxo_lane_install_logical_grid(interrupt_subscriber_kind_t kind,
                                            ocxo_lane_t& lane,
                                            synthetic_clock32_t& clock32,
                                            uint32_t epoch_counter32,
@@ -3627,7 +3605,7 @@ ZPNET_ISR_FASTRUN static void ocxo_lane_install_logical_grid(interrupt_subscribe
 // OCXO2 now maintain their own 1 kHz compare cadence on their local QTimer
 // channels; VCLOCK_HEARTBEAT remains only the VCLOCK event/bookend and relay TimePop heartbeat.
 
-ZPNET_ISR_FASTRUN static void vclock_heartbeat_timepop_callback(timepop_ctx_t* ctx,
+static void vclock_heartbeat_timepop_callback(timepop_ctx_t* ctx,
                                             timepop_diag_t*,
                                             void*) {
   if (!ctx || !g_interrupt_hw_ready) return;
@@ -3740,7 +3718,7 @@ ZPNET_ISR_FASTRUN static void vclock_heartbeat_timepop_callback(timepop_ctx_t* c
   // event/bookend surface plus the PPS relay-off heartbeat.
 }
 
-ZPNET_ISR_FASTRUN static bool vclock_heartbeat_arm_timepop(void) {
+static bool vclock_heartbeat_arm_timepop(void) {
   if (!g_interrupt_hw_ready || !g_interrupt_runtime_ready) return false;
 
   timepop_cancel_by_name(VCLOCK_HEARTBEAT_NAME);
@@ -3767,7 +3745,7 @@ ZPNET_ISR_FASTRUN static bool vclock_heartbeat_arm_timepop(void) {
 // OCXO lanes — QTimer2 CH0 / QTimer3 CH3
 // ============================================================================
 //
-ZPNET_ISR_FASTRUN static void ocxo_lane_program_compare(ocxo_lane_t& lane, uint16_t target_low16) {
+static void ocxo_lane_program_compare(ocxo_lane_t& lane, uint16_t target_low16) {
   if (lane.module == &IMXRT_TMR2 && lane.channel == 0) {
     qtimer2_ch0_program_compare(target_low16);
   } else if (lane.module == &IMXRT_TMR3) {
@@ -3775,7 +3753,7 @@ ZPNET_ISR_FASTRUN static void ocxo_lane_program_compare(ocxo_lane_t& lane, uint1
   }
 }
 
-ZPNET_ISR_FASTRUN static void ocxo_lane_disable_compare(ocxo_lane_t& lane) {
+static void ocxo_lane_disable_compare(ocxo_lane_t& lane) {
   if (lane.module == &IMXRT_TMR2 && lane.channel == 0) {
     qtimer2_ch0_disable_compare();
   } else if (lane.module == &IMXRT_TMR3) {
@@ -3873,8 +3851,8 @@ struct ocxo_perishable_ring_t {
   volatile uint32_t asap_fail_count = 0;
 };
 
-static ocxo_perishable_ring_t g_ocxo1_fact_ring ZPNET_ISR_HOT_DATA = {};
-static ocxo_perishable_ring_t g_ocxo2_fact_ring ZPNET_ISR_HOT_DATA = {};
+static ocxo_perishable_ring_t g_ocxo1_fact_ring = {};
+static ocxo_perishable_ring_t g_ocxo2_fact_ring = {};
 
 static ocxo_perishable_ring_t&
 ocxo_fact_ring_for(ocxo_runtime_context_t& ctx) {
@@ -3894,7 +3872,7 @@ static const char* ocxo_fact_drain_name(const ocxo_runtime_context_t& ctx) {
   return ctx.fact_drain_name ? ctx.fact_drain_name : ctx.name;
 }
 
-ZPNET_ISR_FASTRUN static void ocxo_fact_ring_reset(ocxo_runtime_context_t& ctx) {
+static void ocxo_fact_ring_reset(ocxo_runtime_context_t& ctx) {
   ocxo_perishable_ring_t& r = ocxo_fact_ring_for(ctx);
   for (uint32_t i = 0; i < OCXO_PERISHABLE_FACT_RING_SIZE; i++) {
     r.facts[i] = interrupt_perishable_fact_t{};
@@ -3912,7 +3890,7 @@ ZPNET_ISR_FASTRUN static void ocxo_fact_ring_reset(ocxo_runtime_context_t& ctx) 
   r.asap_fail_count = 0;
 }
 
-ZPNET_ISR_FASTRUN static int32_t dwt_cycles_for_ocxo_ticks_signed(int32_t ticks) {
+static int32_t dwt_cycles_for_ocxo_ticks_signed(int32_t ticks) {
   const uint32_t cps = interrupt_vclock_cycles_per_second();
   if (cps == 0 || ticks == 0) return 0;
 
@@ -3924,11 +3902,11 @@ ZPNET_ISR_FASTRUN static int32_t dwt_cycles_for_ocxo_ticks_signed(int32_t ticks)
   return (int32_t)(-(((-numerator) + denom / 2) / denom));
 }
 
-ZPNET_ISR_FASTRUN static bool ocxo_fact_ring_push_from_isr(ocxo_runtime_context_t& ctx,
+static bool ocxo_fact_ring_push_from_isr(ocxo_runtime_context_t& ctx,
                                          const interrupt_perishable_fact_t& fact);
-ZPNET_ISR_FASTRUN static void ocxo_fact_drain_callback(timepop_ctx_t*, timepop_diag_t*, void* user_data);
+static void ocxo_fact_drain_callback(timepop_ctx_t*, timepop_diag_t*, void* user_data);
 
-ZPNET_ISR_FASTRUN static bool ocxo_fact_ring_pop(ocxo_runtime_context_t& ctx,
+static bool ocxo_fact_ring_pop(ocxo_runtime_context_t& ctx,
                                interrupt_perishable_fact_t& out) {
   ocxo_perishable_ring_t& r = ocxo_fact_ring_for(ctx);
 
@@ -3950,7 +3928,7 @@ ZPNET_ISR_FASTRUN static bool ocxo_fact_ring_pop(ocxo_runtime_context_t& ctx,
   return true;
 }
 
-ZPNET_ISR_FASTRUN static bool ocxo_fact_ring_push_from_isr(ocxo_runtime_context_t& ctx,
+static bool ocxo_fact_ring_push_from_isr(ocxo_runtime_context_t& ctx,
                                          const interrupt_perishable_fact_t& fact) {
   ocxo_perishable_ring_t& r = ocxo_fact_ring_for(ctx);
   ocxo_lane_t* lane = ctx.lane;
@@ -4002,7 +3980,7 @@ static inline uint16_t ocxo_lane_counter_now(const ocxo_lane_t& lane) {
   return lane.module->CH[lane.channel].CNTR;
 }
 
-ZPNET_ISR_FASTRUN static void ocxo_lane_clear_compare_flag(ocxo_lane_t& lane) {
+static void ocxo_lane_clear_compare_flag(ocxo_lane_t& lane) {
   if (lane.module == &IMXRT_TMR2 && lane.channel == 0) {
     qtimer2_ch0_clear_compare_flag();
   } else if (lane.module == &IMXRT_TMR3) {
@@ -4010,7 +3988,7 @@ ZPNET_ISR_FASTRUN static void ocxo_lane_clear_compare_flag(ocxo_lane_t& lane) {
   }
 }
 
-ZPNET_ISR_FASTRUN static void ocxo_qtimer_diag_record(ocxo_runtime_context_t& ctx,
+static void ocxo_qtimer_diag_record(ocxo_runtime_context_t& ctx,
                                     uint32_t isr_entry_dwt_raw,
                                     uint32_t event_dwt,
                                     uint32_t legacy_late_ticks,
@@ -4052,7 +4030,7 @@ static int32_t ocxo_ema_round_shift(int32_t value, uint32_t shift) {
   return -(((-value) + half) >> shift);
 }
 
-ZPNET_ISR_FASTRUN static uint32_t ocxo_lane_ema_predict_dwt(ocxo_lane_t& lane,
+static uint32_t ocxo_lane_ema_predict_dwt(ocxo_lane_t& lane,
                                           uint32_t observed_dwt,
                                           bool* out_synthetic,
                                           int32_t* out_error_cycles) {
@@ -4105,7 +4083,7 @@ ZPNET_ISR_FASTRUN static uint32_t ocxo_lane_ema_predict_dwt(ocxo_lane_t& lane,
   return predicted;
 }
 
-ZPNET_ISR_FASTRUN static void ocxo_apply_perishable_fact_deferred(
+static void ocxo_apply_perishable_fact_deferred(
     ocxo_runtime_context_t& ctx,
     const interrupt_perishable_fact_t& fact) {
   ocxo_lane_t* lane = ctx.lane;
@@ -4257,7 +4235,7 @@ ZPNET_ISR_FASTRUN static void ocxo_apply_perishable_fact_deferred(
                         nullptr);
 }
 
-ZPNET_ISR_FASTRUN static void ocxo_fact_drain_callback(timepop_ctx_t*,
+static void ocxo_fact_drain_callback(timepop_ctx_t*,
                                      timepop_diag_t*,
                                      void* user_data) {
   auto* ctx = static_cast<ocxo_runtime_context_t*>(user_data);
@@ -4300,7 +4278,7 @@ struct ocxo_cadence_isr_sample_t {
   bool one_second_due = false;
 };
 
-ZPNET_ISR_FASTRUN static bool ocxo_cadence_classify_irq(ocxo_runtime_context_t& ctx,
+static bool ocxo_cadence_classify_irq(ocxo_runtime_context_t& ctx,
                                       uint32_t isr_csctrl_entry) {
   ocxo_lane_t& lane = *ctx.lane;
 
@@ -4321,7 +4299,7 @@ ZPNET_ISR_FASTRUN static bool ocxo_cadence_classify_irq(ocxo_runtime_context_t& 
   return true;
 }
 
-ZPNET_ISR_FASTRUN static ocxo_cadence_isr_sample_t ocxo_cadence_capture_perishable_facts(
+static ocxo_cadence_isr_sample_t ocxo_cadence_capture_perishable_facts(
     ocxo_runtime_context_t& ctx,
     uint32_t isr_entry_dwt_raw,
     uint32_t isr_csctrl_entry) {
@@ -4366,7 +4344,7 @@ ZPNET_ISR_FASTRUN static ocxo_cadence_isr_sample_t ocxo_cadence_capture_perishab
   return sample;
 }
 
-ZPNET_ISR_FASTRUN static void ocxo_cadence_acknowledge_and_timestamp(
+static void ocxo_cadence_acknowledge_and_timestamp(
     ocxo_runtime_context_t& ctx,
     ocxo_cadence_isr_sample_t& sample) {
   // Acknowledge hardware immediately; the next cadence target is programmed
@@ -4376,7 +4354,7 @@ ZPNET_ISR_FASTRUN static void ocxo_cadence_acknowledge_and_timestamp(
       qtimer_event_dwt_from_isr_entry_raw(sample.isr_entry_dwt_raw);
 }
 
-ZPNET_ISR_FASTRUN static void ocxo_cadence_update_synthetic_identity(
+static void ocxo_cadence_update_synthetic_identity(
     ocxo_runtime_context_t& ctx,
     const ocxo_cadence_isr_sample_t& sample) {
   ocxo_lane_t& lane = *ctx.lane;
@@ -4409,7 +4387,7 @@ ZPNET_ISR_FASTRUN static void ocxo_cadence_update_synthetic_identity(
   lane.witness_last_arm_to_isr_dwt_cycles = sample.arm_to_isr_dwt_cycles;
 }
 
-ZPNET_ISR_FASTRUN static void ocxo_cadence_update_sample_phase(
+static void ocxo_cadence_update_sample_phase(
     ocxo_runtime_context_t& ctx,
     ocxo_cadence_isr_sample_t& sample) {
   ocxo_lane_t& lane = *ctx.lane;
@@ -4436,7 +4414,7 @@ ZPNET_ISR_FASTRUN static void ocxo_cadence_update_sample_phase(
   lane.cadence_last_one_second_due = sample.one_second_due;
 }
 
-ZPNET_ISR_FASTRUN static bool ocxo_cadence_feed_smartzero(
+static bool ocxo_cadence_feed_smartzero(
     ocxo_runtime_context_t& ctx,
     const ocxo_cadence_isr_sample_t& sample) {
   if (sample.was_smartzero_current) {
@@ -4454,7 +4432,7 @@ ZPNET_ISR_FASTRUN static bool ocxo_cadence_feed_smartzero(
                                sample.target_low16);
 }
 
-ZPNET_ISR_FASTRUN static void ocxo_cadence_rearm_or_stop(
+static void ocxo_cadence_rearm_or_stop(
     ocxo_runtime_context_t& ctx,
     ocxo_cadence_isr_sample_t& sample,
     bool cadence_reauthored_by_smartzero) {
@@ -4508,7 +4486,7 @@ ZPNET_ISR_FASTRUN static void ocxo_cadence_rearm_or_stop(
   sample.isr_csctrl_after_program = lane.module->CH[lane.channel].CSCTRL;
 }
 
-ZPNET_ISR_FASTRUN static interrupt_perishable_fact_t ocxo_cadence_build_perishable_fact(
+static interrupt_perishable_fact_t ocxo_cadence_build_perishable_fact(
     ocxo_runtime_context_t& ctx,
     ocxo_cadence_isr_sample_t& sample) {
   ocxo_perishable_ring_t& ring = ocxo_fact_ring_for(ctx);
@@ -4557,7 +4535,7 @@ ZPNET_ISR_FASTRUN static interrupt_perishable_fact_t ocxo_cadence_build_perishab
   return fact;
 }
 
-ZPNET_ISR_FASTRUN static void ocxo_cadence_update_one_second_witness(
+static void ocxo_cadence_update_one_second_witness(
     ocxo_runtime_context_t& ctx,
     const ocxo_cadence_isr_sample_t& sample) {
   if (!sample.one_second_due) return;
@@ -4565,7 +4543,7 @@ ZPNET_ISR_FASTRUN static void ocxo_cadence_update_one_second_witness(
   ctx.lane->witness_target_low16 = sample.target_low16;
 }
 
-ZPNET_ISR_FASTRUN static void ocxo_cadence_enqueue_fact(
+static void ocxo_cadence_enqueue_fact(
     ocxo_runtime_context_t& ctx,
     const interrupt_perishable_fact_t& fact) {
   ocxo_lane_t& lane = *ctx.lane;
@@ -4577,7 +4555,7 @@ ZPNET_ISR_FASTRUN static void ocxo_cadence_enqueue_fact(
   }
 }
 
-ZPNET_ISR_FASTRUN static void ocxo_cadence_compare_isr(ocxo_runtime_context_t& ctx,
+static void ocxo_cadence_compare_isr(ocxo_runtime_context_t& ctx,
                                      uint32_t isr_entry_dwt_raw) {
   ocxo_lane_t& lane = *ctx.lane;
 
@@ -4607,12 +4585,12 @@ ZPNET_ISR_FASTRUN static void ocxo_cadence_compare_isr(ocxo_runtime_context_t& c
   }
 }
 
-ZPNET_ISR_FASTRUN static void qtimer2_isr(void) {
+static void qtimer2_isr(void) {
   const uint32_t isr_entry_dwt_raw = ARM_DWT_CYCCNT;  // SACRED: first instruction.
   ocxo_cadence_compare_isr(g_ocxo1_ctx, isr_entry_dwt_raw);
 }
 
-ZPNET_ISR_FASTRUN static void qtimer3_isr(void) {
+static void qtimer3_isr(void) {
   const uint32_t isr_entry_dwt_raw = ARM_DWT_CYCCNT;  // SACRED: first instruction.
   ocxo_cadence_compare_isr(g_ocxo2_ctx, isr_entry_dwt_raw);
 }
@@ -4644,7 +4622,7 @@ void interrupt_register_qtimer1_ch1_handler(interrupt_qtimer1_ch1_handler_fn cb)
   g_qtimer1_ch1_handler = cb;
 }
 
-ZPNET_ISR_FASTRUN static void qtimer1_ch1_schedule_next_hop(void) {
+static void qtimer1_ch1_schedule_next_hop(void) {
   if (!g_qtimer1_ch1_active) return;
 
   const uint32_t now = vclock_synthetic_from_hardware_low16(qtimer1_ch0_counter_now());
@@ -4672,7 +4650,7 @@ ZPNET_ISR_FASTRUN static void qtimer1_ch1_schedule_next_hop(void) {
   qtimer1_ch1_program_compare(hardware_target);
 }
 
-ZPNET_ISR_FASTRUN bool interrupt_qtimer1_ch1_arm_compare(uint32_t target_counter32) {
+bool interrupt_qtimer1_ch1_arm_compare(uint32_t target_counter32) {
   if (!g_interrupt_hw_ready) return false;
 
   g_qtimer1_ch1_target_counter32 = target_counter32;
@@ -4683,35 +4661,35 @@ ZPNET_ISR_FASTRUN bool interrupt_qtimer1_ch1_arm_compare(uint32_t target_counter
   return g_qtimer1_ch1_active;
 }
 
-ZPNET_ISR_FASTRUN void interrupt_qtimer1_ch1_disable_compare(void) {
+void interrupt_qtimer1_ch1_disable_compare(void) {
   g_qtimer1_ch1_active = false;
   qtimer1_ch1_disable_compare_hw();
 }
 
-ZPNET_ISR_FASTRUN uint16_t interrupt_qtimer1_ch1_counter_now(void) { return IMXRT_TMR1.CH[1].CNTR; }
-ZPNET_ISR_FASTRUN uint16_t interrupt_qtimer1_ch1_comp1_now(void)   { return IMXRT_TMR1.CH[1].COMP1; }
-ZPNET_ISR_FASTRUN uint16_t interrupt_qtimer1_ch1_csctrl_now(void)  { return IMXRT_TMR1.CH[1].CSCTRL; }
+uint16_t interrupt_qtimer1_ch1_counter_now(void) { return IMXRT_TMR1.CH[1].CNTR; }
+uint16_t interrupt_qtimer1_ch1_comp1_now(void)   { return IMXRT_TMR1.CH[1].COMP1; }
+uint16_t interrupt_qtimer1_ch1_csctrl_now(void)  { return IMXRT_TMR1.CH[1].CSCTRL; }
 
 // ============================================================================
 // TimePop hardware service API
 // ============================================================================
 
-ZPNET_ISR_FASTRUN uint32_t interrupt_vclock_counter32_observe_ambient(void) {
+uint32_t interrupt_vclock_counter32_observe_ambient(void) {
   return vclock_synthetic_from_hardware_low16(qtimer1_ch0_counter_now());
 }
 
-ZPNET_ISR_FASTRUN void interrupt_qtimer1_ch2_arm_compare(uint32_t target_counter32) {
+void interrupt_qtimer1_ch2_arm_compare(uint32_t target_counter32) {
   g_qtimer1_ch2_last_target_counter32 = target_counter32;
   g_qtimer1_ch2_arm_count++;
   const uint16_t hardware_target = vclock_hardware_low16_from_synthetic(target_counter32);
   qtimer1_ch2_program_compare(hardware_target);
 }
 
-ZPNET_ISR_FASTRUN uint16_t interrupt_qtimer1_ch2_counter_now(void) { return IMXRT_TMR1.CH[2].CNTR; }
-ZPNET_ISR_FASTRUN uint16_t interrupt_qtimer1_ch2_comp1_now(void)   { return IMXRT_TMR1.CH[2].COMP1; }
-ZPNET_ISR_FASTRUN uint16_t interrupt_qtimer1_ch2_csctrl_now(void)  { return IMXRT_TMR1.CH[2].CSCTRL; }
+uint16_t interrupt_qtimer1_ch2_counter_now(void) { return IMXRT_TMR1.CH[2].CNTR; }
+uint16_t interrupt_qtimer1_ch2_comp1_now(void)   { return IMXRT_TMR1.CH[2].COMP1; }
+uint16_t interrupt_qtimer1_ch2_csctrl_now(void)  { return IMXRT_TMR1.CH[2].CSCTRL; }
 
-ZPNET_ISR_FASTRUN static void qtimer1_ch1_bridge_isr(uint32_t isr_entry_dwt_raw) {
+static void qtimer1_ch1_bridge_isr(uint32_t isr_entry_dwt_raw) {
   qtimer1_ch1_clear_compare_flag();
 
   if (!g_qtimer1_ch1_active) {
@@ -4750,7 +4728,7 @@ ZPNET_ISR_FASTRUN static void qtimer1_ch1_bridge_isr(uint32_t isr_entry_dwt_raw)
   }
 }
 
-ZPNET_ISR_FASTRUN static void qtimer1_isr(void) {
+static void qtimer1_isr(void) {
   const uint32_t isr_entry_dwt_raw = ARM_DWT_CYCCNT;  // SACRED: first instruction.
 
   if (IMXRT_TMR1.CH[1].CSCTRL & TMR_CSCTRL_TCF1) {
@@ -4803,7 +4781,7 @@ ZPNET_ISR_FASTRUN static void qtimer1_isr(void) {
 // The _raw is the first-instruction capture.  It is converted IMMEDIATELY
 // into PPS and PPS_VCLOCK event-coordinate values and never propagated.
 
-ZPNET_ISR_FASTRUN static void pps_edge_dispatch_trampoline(timepop_ctx_t*, timepop_diag_t*, void*) {
+static void pps_edge_dispatch_trampoline(timepop_ctx_t*, timepop_diag_t*, void*) {
   if (!g_pps_edge_dispatch) return;
 
   const pps_edge_snapshot_t snap = interrupt_last_pps_edge();
@@ -4811,7 +4789,7 @@ ZPNET_ISR_FASTRUN static void pps_edge_dispatch_trampoline(timepop_ctx_t*, timep
 }
 
 
-ZPNET_ISR_FASTRUN static void pps_relay_assert_from_isr(uint32_t sequence) {
+static void pps_relay_assert_from_isr(uint32_t sequence) {
   // PPS relay HIGH is a physical PPS witness and stays in ISR context.
   // Relay LOW is intentionally *not* scheduled through TimePop.  Instead,
   // VCLOCK_HEARTBEAT's existing 1 ms heartbeat owns the countdown and deasserts
@@ -4826,7 +4804,7 @@ ZPNET_ISR_FASTRUN static void pps_relay_assert_from_isr(uint32_t sequence) {
   g_pps_relay_deassert_arm_count++;
 }
 
-ZPNET_ISR_FASTRUN static void pps_relay_vclock_heartbeat_tick(void) {
+static void pps_relay_vclock_heartbeat_tick(void) {
   uint32_t ticks = g_pps_relay_deassert_countdown_ticks;
   if (ticks == 0) return;
 
@@ -4839,7 +4817,7 @@ ZPNET_ISR_FASTRUN static void pps_relay_vclock_heartbeat_tick(void) {
   g_pps_relay_deassert_count++;
 }
 
-ZPNET_ISR_FASTRUN static void pps_post_isr_publish_inline(const interrupt_epoch_capture_t& cap,
+static void pps_post_isr_publish_inline(const interrupt_epoch_capture_t& cap,
                                         uint32_t isr_entry_dwt_raw) {
   epoch_capture_publish(cap);
 
@@ -4848,7 +4826,7 @@ ZPNET_ISR_FASTRUN static void pps_post_isr_publish_inline(const interrupt_epoch_
   }
 }
 
-ZPNET_ISR_FASTRUN static void pps_post_isr_asap_callback(timepop_ctx_t*, timepop_diag_t*, void*) {
+static void pps_post_isr_asap_callback(timepop_ctx_t*, timepop_diag_t*, void*) {
   interrupt_epoch_capture_t cap{};
   uint32_t isr_entry_dwt_raw = 0;
   bool had_sample = false;
@@ -4868,7 +4846,7 @@ ZPNET_ISR_FASTRUN static void pps_post_isr_asap_callback(timepop_ctx_t*, timepop
   pps_post_isr_publish_inline(cap, isr_entry_dwt_raw);
 }
 
-ZPNET_ISR_FASTRUN static void pps_post_isr_defer(const interrupt_epoch_capture_t& cap,
+static void pps_post_isr_defer(const interrupt_epoch_capture_t& cap,
                                uint32_t isr_entry_dwt_raw) {
   if (!g_interrupt_runtime_ready) {
     pps_post_isr_publish_inline(cap, isr_entry_dwt_raw);
@@ -4910,7 +4888,7 @@ ZPNET_ISR_FASTRUN static void pps_post_isr_defer(const interrupt_epoch_capture_t
   }
 }
 
-ZPNET_ISR_FASTRUN void process_interrupt_gpio6789_irq(uint32_t isr_entry_dwt_raw) {
+void process_interrupt_gpio6789_irq(uint32_t isr_entry_dwt_raw) {
   // PPS GPIO is a witness/selector only.  It captures the physical PPS facts
   // and, during rebootstrap, selects the VCLOCK-domain edge identity.  It does
   // NOT author the public PPS/VCLOCK DWT coordinate; that coordinate is later
@@ -5041,7 +5019,7 @@ ZPNET_ISR_FASTRUN void process_interrupt_gpio6789_irq(uint32_t isr_entry_dwt_raw
   }
 }
 
-ZPNET_ISR_FASTRUN static void pps_gpio_isr(void) {
+static void pps_gpio_isr(void) {
   const uint32_t isr_entry_dwt_raw = ARM_DWT_CYCCNT;
   process_interrupt_gpio6789_irq(isr_entry_dwt_raw);
 }
@@ -5062,7 +5040,7 @@ void interrupt_pps_edge_register_dispatch(pps_edge_dispatch_fn fn) {
 // There is intentionally no public interrupt_last_pps() accessor.  Physical
 // PPS GPIO DWT is a private witness/audit fact, not a timing primitive.
 
-ZPNET_ISR_FASTRUN pps_vclock_t interrupt_last_pps_vclock(void) {
+pps_vclock_t interrupt_last_pps_vclock(void) {
   return store_load_pvc();
 }
 
@@ -5076,7 +5054,7 @@ ZPNET_ISR_FASTRUN pps_vclock_t interrupt_last_pps_vclock(void) {
 //                                                        misnamed, held
 //                                                        for API continuity)
 
-ZPNET_ISR_FASTRUN pps_edge_snapshot_t interrupt_last_pps_edge(void) {
+pps_edge_snapshot_t interrupt_last_pps_edge(void) {
   pps_t pps;
   pps_vclock_t pvc;
   store_load(pps, pvc);
@@ -5104,7 +5082,7 @@ ZPNET_ISR_FASTRUN pps_edge_snapshot_t interrupt_last_pps_edge(void) {
 }
 
 
-ZPNET_ISR_FASTRUN interrupt_pps_edge_heartbeat_t interrupt_pps_edge_heartbeat(void) {
+interrupt_pps_edge_heartbeat_t interrupt_pps_edge_heartbeat(void) {
   interrupt_pps_edge_heartbeat_t out{};
   out.edge_count = g_pps_gpio_heartbeat.edge_count;
   out.last_dwt = g_pps_gpio_heartbeat.last_dwt;
@@ -5860,9 +5838,6 @@ static void add_runtime_payload(Payload& p) {
   p.add("hardware_ready", g_interrupt_hw_ready);
   p.add("runtime_ready",  g_interrupt_runtime_ready);
   p.add("irqs_enabled",   g_interrupt_irqs_enabled);
-  p.add("isr_fastrun_itcm_enabled", ISR_FASTRUN_ITCM_ENABLED);
-  p.add("isr_hot_data_alignment_bytes", ISR_HOT_DATA_ALIGNMENT_BYTES);
-  p.add("isr_hot_data_policy", ISR_HOT_DATA_POLICY);
   p.add("ocxo_disable_experiment", OCXO_DISABLE_EXPERIMENT);
   p.add("ocxo_disabled_count", OCXO_DISABLED_COUNT);
   p.add("ocxo1_disabled", OCXO1_DISABLED);
@@ -6653,9 +6628,6 @@ static Payload cmd_report(const Payload&) {
   p.add("hardware_ready", g_interrupt_hw_ready);
   p.add("runtime_ready",  g_interrupt_runtime_ready);
   p.add("irqs_enabled",   g_interrupt_irqs_enabled);
-  p.add("isr_fastrun_itcm_enabled", ISR_FASTRUN_ITCM_ENABLED);
-  p.add("isr_hot_data_alignment_bytes", ISR_HOT_DATA_ALIGNMENT_BYTES);
-  p.add("isr_hot_data_policy", ISR_HOT_DATA_POLICY);
   p.add("ocxo_disable_experiment", OCXO_DISABLE_EXPERIMENT);
   p.add("ocxo_disabled_count", OCXO_DISABLED_COUNT);
   p.add("ocxo1_disabled", OCXO1_DISABLED);
