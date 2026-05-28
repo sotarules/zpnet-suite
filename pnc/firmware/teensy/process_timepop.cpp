@@ -22,6 +22,9 @@
 //   • absolute scheduling        — timepop_arm_at(target_gnss_ns, ...)
 //   • anchor-relative scheduling — timepop_arm_from_anchor(anchor_gnss_ns, offset_gnss_ns, ...)
 //   • caller-owned exact path    — timepop_arm_ns(target_gnss_ns, target_dwt, ...)
+//   • timed slot priority       — lower numeric priority runs first when
+//     multiple timed slots share one captured CH2 fire fact. ASAP/ALAP are
+//     fixed deferred lanes and intentionally do not participate.
 //   • critical ISR recurring    — timepop_arm_recurring_isr(period_ns, ...)
 //     The callback and recurring rearm happen inside the CH2 IRQ pass before
 //     schedule_next() selects the next compare.  Use only for tiny substrate
@@ -70,8 +73,9 @@
 //   CH2 event receive the same fire_vclock_raw, fire_dwt_cyccnt, and
 //   fire_gnss_ns.  Already-past deadlines are missed edges, not late fires;
 //   TimePop quarantines them without callback and re-authors recurring grids.
-//   Callback order is logical only; it must never re-author the physical
-//   timing facts.
+//   Callback order is logical only; priority only orders callbacks after the
+//   shared physical fire facts have been captured for every exact-match slot.
+//   It must never re-author the physical timing facts.
 //
 //   TimePop authors fire_gnss_ns from VCLOCK arithmetic using the event's
 //   process_interrupt-authored counter32 identity.  Any DWT-derived GNSS
@@ -119,6 +123,7 @@ static constexpr uint32_t SCHEDULE_MIN_ARM_LEAD_TICKS = 64;
 static constexpr uint32_t HEARTBEAT_TICKS = 10000;
 static constexpr uint32_t PREDICT_MAX_QTIMER_ELAPSED = 15000000U;
 static constexpr uint32_t ONE_HZ_TICKS = 10000000U;
+static constexpr bool     TIMEPOP_SLOT_PRIORITY_ORDERING_ENABLED = true;
 static constexpr const char* WITNESS_SCHEDULER_NAME = "WITNESS_SCHEDULER";
 
 // Phase-probe diagnostic.  This is a tiny critical recurring ISR client used
@@ -236,6 +241,11 @@ struct timepop_slot_t {
   timepop_callback_t  callback;
   void*               user_data;
   const char*         name;
+
+  // Timed-slot service priority. Lower numeric value runs first when multiple
+  // slots share the same captured CH2 fire fact. This never affects compare
+  // scheduling and never applies to ASAP/ALAP deferred lanes.
+  timepop_priority_t  priority;
 
   uint32_t            recurring_rearmed_count;
   bool                recurring_base_fixed;
@@ -765,13 +775,15 @@ static timepop_handle_t arm_anchored_recurring_isr_internal(int64_t base_gnss_ns
                                                             uint64_t period_gnss_ns,
                                                             timepop_callback_t callback,
                                                             void* user_data,
-                                                            const char* name);
+                                                            const char* name,
+                                                            timepop_priority_t priority);
 static timepop_handle_t arm_anchored_recurring_isr_from_counter32_internal(int64_t base_gnss_ns,
                                                                            uint32_t base_counter32,
                                                                            uint64_t period_gnss_ns,
                                                                            timepop_callback_t callback,
                                                                            void* user_data,
-                                                                           const char* name);
+                                                                           const char* name,
+                                                                           timepop_priority_t priority);
 static timepop_handle_t arm_absolute_slot_internal(int64_t target_gnss_ns,
                                                    bool recurring,
                                                    uint64_t recurring_period_gnss_ns,
@@ -779,14 +791,16 @@ static timepop_handle_t arm_absolute_slot_internal(int64_t target_gnss_ns,
                                                    void* user_data,
                                                    const char* name,
                                                    bool isr_callback,
-                                                   uint32_t target_dwt = 0);
+                                                   uint32_t target_dwt,
+                                                   timepop_priority_t priority);
 static timepop_handle_t arm_relative_slot_internal(uint64_t delay_gnss_ns,
                                                    bool recurring,
                                                    timepop_callback_t callback,
                                                    void* user_data,
                                                    const char* name,
                                                    bool isr_callback,
-                                                   bool rearm_in_isr);
+                                                   bool rearm_in_isr,
+                                                   timepop_priority_t priority);
 
 // ============================================================================
 // Helpers
@@ -1995,6 +2009,46 @@ static inline void slot_build_diag(
   diag.anchor_valid            = slot.anchor_valid;
 }
 
+static inline bool slot_priority_before(uint32_t candidate, uint32_t incumbent) {
+  if (incumbent >= MAX_SLOTS) return true;
+  if (candidate >= MAX_SLOTS) return false;
+
+  // Lower numeric priority runs first only for callbacks that share the same
+  // captured physical CH2 fire fact. Equal priorities, or different captured
+  // fire facts, retain the old stable slot-index order.
+  if (slots[candidate].fire_vclock_raw == slots[incumbent].fire_vclock_raw &&
+      slots[candidate].priority != slots[incumbent].priority) {
+    return slots[candidate].priority < slots[incumbent].priority;
+  }
+  return candidate < incumbent;
+}
+
+static uint32_t select_next_irq_callback_slot_by_priority(
+  const bool expired_this_pass[MAX_SLOTS],
+  const bool already_dispatched[MAX_SLOTS]
+) {
+  uint32_t best = MAX_SLOTS;
+  for (uint32_t i = 0; i < MAX_SLOTS; i++) {
+    if (!expired_this_pass[i] || already_dispatched[i]) continue;
+    if (!slots[i].active || !slots[i].expired) continue;
+    if (!slots[i].isr_callback) continue;
+    if (slot_priority_before(i, best)) best = i;
+  }
+  return best;
+}
+
+static uint32_t select_next_scheduled_callback_slot_by_priority(
+  const bool already_dispatched[MAX_SLOTS]
+) {
+  uint32_t best = MAX_SLOTS;
+  for (uint32_t i = 0; i < MAX_SLOTS; i++) {
+    if (already_dispatched[i]) continue;
+    if (!slots[i].active || !slots[i].expired) continue;
+    if (slot_priority_before(i, best)) best = i;
+  }
+  return best;
+}
+
 // ============================================================================
 // QTimer1 CH2 handler — TimePop priority queue scheduler
 // ============================================================================
@@ -2199,10 +2253,14 @@ void timepop_qtimer1_ch2_handler(const interrupt_event_t& event,
   // Phase 2: now that the fire facts are stable for all simultaneous slots,
   // dispatch any IRQ-context callbacks.  Slots without isr_callback will be
   // dispatched later by timepop_dispatch() using the same stored context.
-  for (uint32_t i = 0; i < MAX_SLOTS; i++) {
-    if (!expired_this_pass[i]) continue;
-    if (!slots[i].active || !slots[i].expired) continue;
-    if (!slots[i].isr_callback) continue;
+  // Priority affects callback order only after Phase 1 has captured the
+  // shared physical CH2 fire fact for every exact-match slot.
+  bool irq_callback_dispatched[MAX_SLOTS] = {};
+  for (;;) {
+    const uint32_t i = select_next_irq_callback_slot_by_priority(
+        expired_this_pass, irq_callback_dispatched);
+    if (i >= MAX_SLOTS) break;
+    irq_callback_dispatched[i] = true;
 
     timepop_ctx_t ctx;
     slot_build_ctx(slots[i], ctx);
@@ -2497,7 +2555,8 @@ static timepop_handle_t arm_absolute_slot_internal(
   void*               user_data,
   const char*         name,
   bool                isr_callback,
-  uint32_t            target_dwt
+  uint32_t            target_dwt,
+  timepop_priority_t  priority
 ) {
   if (!callback) return TIMEPOP_INVALID_HANDLE;
   if (target_gnss_ns <= 0) return TIMEPOP_INVALID_HANDLE;
@@ -2539,6 +2598,7 @@ static timepop_handle_t arm_absolute_slot_internal(
     slots[i].callback       = callback;
     slots[i].user_data      = user_data;
     slots[i].name           = name;
+    slots[i].priority       = priority;
     slots[i].fire_gnss_ns   = -1;
     slots[i].isr_callback   = isr_callback;
     slots[i].rearm_in_isr  = false;
@@ -2591,7 +2651,8 @@ static timepop_handle_t arm_anchored_recurring_isr_internal(
   uint64_t            period_gnss_ns,
   timepop_callback_t  callback,
   void*               user_data,
-  const char*         name
+  const char*         name,
+  timepop_priority_t  priority
 ) {
   if (!callback) return TIMEPOP_INVALID_HANDLE;
   if (base_gnss_ns <= 0) return TIMEPOP_INVALID_HANDLE;
@@ -2618,6 +2679,7 @@ static timepop_handle_t arm_anchored_recurring_isr_internal(
     slots[i].callback = callback;
     slots[i].user_data = user_data;
     slots[i].name = name;
+    slots[i].priority = priority;
     slots[i].fire_gnss_ns = -1;
     slots[i].isr_callback = true;
     slots[i].isr_callback_fired = false;
@@ -2654,7 +2716,8 @@ static timepop_handle_t arm_anchored_recurring_isr_from_counter32_internal(
   uint64_t            period_gnss_ns,
   timepop_callback_t  callback,
   void*               user_data,
-  const char*         name
+  const char*         name,
+  timepop_priority_t  priority
 ) {
   if (!callback) return TIMEPOP_INVALID_HANDLE;
   if (base_gnss_ns <= 0) return TIMEPOP_INVALID_HANDLE;
@@ -2681,6 +2744,7 @@ static timepop_handle_t arm_anchored_recurring_isr_from_counter32_internal(
     slots[i].callback = callback;
     slots[i].user_data = user_data;
     slots[i].name = name;
+    slots[i].priority = priority;
     slots[i].fire_gnss_ns = -1;
     slots[i].isr_callback = true;
     slots[i].isr_callback_fired = false;
@@ -2727,7 +2791,8 @@ static timepop_handle_t arm_relative_slot_internal(
   void*               user_data,
   const char*         name,
   bool                isr_callback,
-  bool                rearm_in_isr
+  bool                rearm_in_isr,
+  timepop_priority_t  priority
 ) {
   if (!callback) return TIMEPOP_INVALID_HANDLE;
   if (rearm_in_isr && (!recurring || !isr_callback)) return TIMEPOP_INVALID_HANDLE;
@@ -2756,6 +2821,7 @@ static timepop_handle_t arm_relative_slot_internal(
     slots[i].callback     = callback;
     slots[i].user_data    = user_data;
     slots[i].name         = name;
+    slots[i].priority     = priority;
     slots[i].fire_gnss_ns = -1;
     slots[i].target_gnss_ns = -1;
     slots[i].isr_callback = isr_callback;
@@ -2833,13 +2899,30 @@ timepop_handle_t timepop_arm(
   void*               user_data,
   const char*         name
 ) {
+  return timepop_arm_with_priority(delay_gnss_ns,
+                                   recurring,
+                                   callback,
+                                   user_data,
+                                   name,
+                                   TIMEPOP_PRIORITY_DEFAULT);
+}
+
+timepop_handle_t timepop_arm_with_priority(
+  uint64_t            delay_gnss_ns,
+  bool                recurring,
+  timepop_callback_t  callback,
+  void*               user_data,
+  const char*         name,
+  timepop_priority_t  priority
+) {
   return arm_relative_slot_internal(delay_gnss_ns,
                                     recurring,
                                     callback,
                                     user_data,
                                     name,
                                     false,
-                                    false);
+                                    false,
+                                    priority);
 }
 
 timepop_handle_t timepop_arm_recurring_isr(
@@ -2848,13 +2931,28 @@ timepop_handle_t timepop_arm_recurring_isr(
   void*               user_data,
   const char*         name
 ) {
+  return timepop_arm_recurring_isr_with_priority(period_gnss_ns,
+                                                 callback,
+                                                 user_data,
+                                                 name,
+                                                 TIMEPOP_PRIORITY_DEFAULT);
+}
+
+timepop_handle_t timepop_arm_recurring_isr_with_priority(
+  uint64_t            period_gnss_ns,
+  timepop_callback_t  callback,
+  void*               user_data,
+  const char*         name,
+  timepop_priority_t  priority
+) {
   return arm_relative_slot_internal(period_gnss_ns,
                                     true,
                                     callback,
                                     user_data,
                                     name,
                                     true,
-                                    true);
+                                    true,
+                                    priority);
 }
 
 
@@ -2865,11 +2963,28 @@ timepop_handle_t timepop_arm_recurring_isr_from_base(
   void*               user_data,
   const char*         name
 ) {
+  return timepop_arm_recurring_isr_from_base_with_priority(base_gnss_ns,
+                                                           period_gnss_ns,
+                                                           callback,
+                                                           user_data,
+                                                           name,
+                                                           TIMEPOP_PRIORITY_DEFAULT);
+}
+
+timepop_handle_t timepop_arm_recurring_isr_from_base_with_priority(
+  int64_t             base_gnss_ns,
+  uint64_t            period_gnss_ns,
+  timepop_callback_t  callback,
+  void*               user_data,
+  const char*         name,
+  timepop_priority_t  priority
+) {
   return arm_anchored_recurring_isr_internal(base_gnss_ns,
                                              period_gnss_ns,
                                              callback,
                                              user_data,
-                                             name);
+                                             name,
+                                             priority);
 }
 
 timepop_handle_t timepop_arm_recurring_isr_from_base_counter32(
@@ -2880,12 +2995,31 @@ timepop_handle_t timepop_arm_recurring_isr_from_base_counter32(
   void*               user_data,
   const char*         name
 ) {
+  return timepop_arm_recurring_isr_from_base_counter32_with_priority(base_gnss_ns,
+                                                                     base_counter32,
+                                                                     period_gnss_ns,
+                                                                     callback,
+                                                                     user_data,
+                                                                     name,
+                                                                     TIMEPOP_PRIORITY_DEFAULT);
+}
+
+timepop_handle_t timepop_arm_recurring_isr_from_base_counter32_with_priority(
+  int64_t             base_gnss_ns,
+  uint32_t            base_counter32,
+  uint64_t            period_gnss_ns,
+  timepop_callback_t  callback,
+  void*               user_data,
+  const char*         name,
+  timepop_priority_t  priority
+) {
   return arm_anchored_recurring_isr_from_counter32_internal(base_gnss_ns,
                                                            base_counter32,
                                                            period_gnss_ns,
                                                            callback,
                                                            user_data,
-                                                           name);
+                                                           name,
+                                                           priority);
 }
 
 static bool phase_probe_compute_first_target(uint32_t phase_us,
@@ -3010,7 +3144,8 @@ static bool phase_probe_start(uint32_t phase_us,
       (uint64_t)period_us * 1000ULL,
       phase_probe_callback,
       nullptr,
-      PHASE_PROBE_NAME);
+      PHASE_PROBE_NAME,
+      TIMEPOP_PRIORITY_DEFAULT);
 
   const uint32_t saved2 = critical_enter();
   if (h == TIMEPOP_INVALID_HANDLE) {
@@ -3203,6 +3338,25 @@ timepop_handle_t timepop_arm_at(
   // Public absolute timers remain one-shot unless a future API supplies an
   // explicit absolute recurrence period.
   (void)recurring;
+  return timepop_arm_at_with_priority(target_gnss_ns,
+                                      false,
+                                      callback,
+                                      user_data,
+                                      name,
+                                      TIMEPOP_PRIORITY_DEFAULT);
+}
+
+timepop_handle_t timepop_arm_at_with_priority(
+  int64_t             target_gnss_ns,
+  bool                recurring,
+  timepop_callback_t  callback,
+  void*               user_data,
+  const char*         name,
+  timepop_priority_t  priority
+) {
+  // Public absolute timers remain one-shot unless a future API supplies an
+  // explicit absolute recurrence period.
+  (void)recurring;
   return arm_absolute_slot_internal(target_gnss_ns,
                                     false,
                                     0,
@@ -3210,7 +3364,8 @@ timepop_handle_t timepop_arm_at(
                                     user_data,
                                     name,
                                     false,
-                                    0);
+                                    0,
+                                    priority);
 }
 
 // ============================================================================
@@ -3234,6 +3389,33 @@ timepop_handle_t timepop_arm_from_anchor(
     return TIMEPOP_INVALID_HANDLE;
   }
 
+  return timepop_arm_from_anchor_with_priority(anchor_gnss_ns,
+                                               offset_gnss_ns,
+                                               recurring,
+                                               callback,
+                                               user_data,
+                                               name,
+                                               TIMEPOP_PRIORITY_DEFAULT);
+}
+
+timepop_handle_t timepop_arm_from_anchor_with_priority(
+  int64_t             anchor_gnss_ns,
+  int64_t             offset_gnss_ns,
+  bool                recurring,
+  timepop_callback_t  callback,
+  void*               user_data,
+  const char*         name,
+  timepop_priority_t  priority
+) {
+  if (!callback) return TIMEPOP_INVALID_HANDLE;
+  if (anchor_gnss_ns <= 0) return TIMEPOP_INVALID_HANDLE;
+
+  const int64_t target_gnss_ns = anchor_gnss_ns + offset_gnss_ns;
+  if (target_gnss_ns <= 0) return TIMEPOP_INVALID_HANDLE;
+  if (target_gnss_ns <= anchor_gnss_ns && offset_gnss_ns > 0) {
+    return TIMEPOP_INVALID_HANDLE;
+  }
+
   return arm_absolute_slot_internal(target_gnss_ns,
                                     recurring,
                                     recurring ? 1000000000ULL : 0ULL,
@@ -3241,7 +3423,8 @@ timepop_handle_t timepop_arm_from_anchor(
                                     user_data,
                                     name,
                                     false,
-                                    0);
+                                    0,
+                                    priority);
 }
 
 // ============================================================================
@@ -3259,6 +3442,24 @@ timepop_handle_t timepop_arm_ns(
   const char*         name,
   bool                isr_callback
 ) {
+  return timepop_arm_ns_with_priority(target_gnss_ns,
+                                      target_dwt,
+                                      callback,
+                                      user_data,
+                                      name,
+                                      isr_callback,
+                                      TIMEPOP_PRIORITY_DEFAULT);
+}
+
+timepop_handle_t timepop_arm_ns_with_priority(
+  int64_t             target_gnss_ns,
+  uint32_t            target_dwt,
+  timepop_callback_t  callback,
+  void*               user_data,
+  const char*         name,
+  bool                isr_callback,
+  timepop_priority_t  priority
+) {
   return arm_absolute_slot_internal(target_gnss_ns,
                                     false,
                                     0,
@@ -3266,7 +3467,8 @@ timepop_handle_t timepop_arm_ns(
                                     user_data,
                                     name,
                                     isr_callback,
-                                    target_dwt);
+                                    target_dwt,
+                                    priority);
 }
 
 // ============================================================================
@@ -3369,8 +3571,12 @@ void timepop_dispatch(void) {
   const uint32_t dispatch_now = vclock_count();
   (void)dispatch_now;
 
-  for (uint32_t i = 0; i < MAX_SLOTS; i++) {
-    if (!slots[i].active || !slots[i].expired) continue;
+  bool scheduled_callback_dispatched[MAX_SLOTS] = {};
+  for (;;) {
+    const uint32_t i = select_next_scheduled_callback_slot_by_priority(
+        scheduled_callback_dispatched);
+    if (i >= MAX_SLOTS) break;
+    scheduled_callback_dispatched[i] = true;
 
     // Keep the slot quarantined as expired while its scheduled-context
     // callback runs.  A callback is allowed to arm/cancel other TimePop work,
@@ -3652,6 +3858,12 @@ static Payload cmd_report(const Payload&) {
           phase_probe_ratio_permille(g_phase_probe.stats.quiet_count,
                                      g_phase_probe.stats.sample_count));
 
+  out.add("slot_priority_supported", true);
+  out.add("slot_priority_ordering_enabled", TIMEPOP_SLOT_PRIORITY_ORDERING_ENABLED);
+  out.add("slot_priority_first", (uint32_t)TIMEPOP_PRIORITY_FIRST);
+  out.add("slot_priority_default", (uint32_t)TIMEPOP_PRIORITY_DEFAULT);
+  out.add("slot_priority_last", (uint32_t)TIMEPOP_PRIORITY_LAST);
+
   out.add("anchor_snapshot_count", diag_anchor_snapshot_count);
   out.add("anchor_snapshot_ok_count", diag_anchor_snapshot_ok_count);
   out.add("anchor_snapshot_not_ok_count", diag_anchor_snapshot_not_ok_count);
@@ -3883,6 +4095,7 @@ static void add_timers_array(Payload& out) {
     entry.add("slot",      i);
     entry.add("handle",    slots[i].handle);
     entry.add("name",      slots[i].name ? slots[i].name : "");
+    entry.add("priority",  (uint32_t)slots[i].priority);
     entry.add("deadline",  slots[i].deadline);
     entry.add("expired",   slots[i].expired);
 

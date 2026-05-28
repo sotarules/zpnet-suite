@@ -3497,10 +3497,11 @@ ZPNET_ISR_FASTRUN static bool cadence_minder_arm_timepop(void) {
 
   timepop_cancel_by_name(CADENCE_MINDER_NAME);
   const timepop_handle_t h =
-      timepop_arm_recurring_isr(CADENCE_MINDER_PERIOD_NS,
-                                cadence_minder_timepop_callback,
-                                nullptr,
-                                CADENCE_MINDER_NAME);
+      timepop_arm_recurring_isr_with_priority(CADENCE_MINDER_PERIOD_NS,
+                                              cadence_minder_timepop_callback,
+                                              nullptr,
+                                              CADENCE_MINDER_NAME,
+                                              TIMEPOP_PRIORITY_FIRST);
   if (h == TIMEPOP_INVALID_HANDLE) {
     g_cadence_minder_armed = false;
     g_cadence_minder_arm_failures++;

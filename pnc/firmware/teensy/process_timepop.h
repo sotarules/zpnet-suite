@@ -94,6 +94,11 @@
 //   share CH2 fire facts, but their callbacks and recurring rearm happen
 //   inside the CH2 IRQ pass before schedule_next() selects the next compare.
 //
+//   Timed slots may also carry a service priority. Lower numeric priority runs
+//   first when multiple timed slots share one exact CH2 fire fact. Priority
+//   never changes compare scheduling and never applies to ASAP/ALAP. Existing
+//   callers use TIMEPOP_PRIORITY_DEFAULT and retain stable slot-index order.
+//
 // ============================================================================
 
 #pragma once
@@ -105,6 +110,61 @@
 void timepop_bootstrap(void);
 void timepop_init(void);
 void process_timepop_register(void);
+
+typedef uint8_t timepop_priority_t;
+static constexpr timepop_priority_t TIMEPOP_PRIORITY_FIRST   = 0U;
+static constexpr timepop_priority_t TIMEPOP_PRIORITY_DEFAULT = 128U;
+static constexpr timepop_priority_t TIMEPOP_PRIORITY_LAST    = 255U;
+
+// Priority-capable overloads for timed TimePop slots. These are intentionally
+// absent for ASAP/ALAP because those lanes are fixed deferred mailboxes, not
+// scheduled CH2 deadline slots. Existing non-priority arms remain available
+// through timepop.h and continue to use TIMEPOP_PRIORITY_DEFAULT.
+timepop_handle_t timepop_arm_with_priority(
+  uint64_t            delay_gnss_ns,
+  bool                recurring,
+  timepop_callback_t  callback,
+  void*               user_data,
+  const char*         name,
+  timepop_priority_t  priority
+);
+
+timepop_handle_t timepop_arm_recurring_isr_with_priority(
+  uint64_t            period_gnss_ns,
+  timepop_callback_t  callback,
+  void*               user_data,
+  const char*         name,
+  timepop_priority_t  priority
+);
+
+timepop_handle_t timepop_arm_at_with_priority(
+  int64_t             target_gnss_ns,
+  bool                recurring,
+  timepop_callback_t  callback,
+  void*               user_data,
+  const char*         name,
+  timepop_priority_t  priority
+);
+
+timepop_handle_t timepop_arm_from_anchor_with_priority(
+  int64_t             anchor_gnss_ns,
+  int64_t             offset_gnss_ns,
+  bool                recurring,
+  timepop_callback_t  callback,
+  void*               user_data,
+  const char*         name,
+  timepop_priority_t  priority
+);
+
+timepop_handle_t timepop_arm_ns_with_priority(
+  int64_t             target_gnss_ns,
+  uint32_t            target_dwt,
+  timepop_callback_t  callback,
+  void*               user_data,
+  const char*         name,
+  bool                isr_callback,
+  timepop_priority_t  priority
+);
 
 // Arm a critical recurring ISR slot on a fixed GNSS nanosecond grid:
 //
@@ -120,6 +180,15 @@ timepop_handle_t timepop_arm_recurring_isr_from_base(
   timepop_callback_t  callback,
   void*               user_data,
   const char*         name
+);
+
+timepop_handle_t timepop_arm_recurring_isr_from_base_with_priority(
+  int64_t             base_gnss_ns,
+  uint64_t            period_gnss_ns,
+  timepop_callback_t  callback,
+  void*               user_data,
+  const char*         name,
+  timepop_priority_t  priority
 );
 
 // Arm a critical recurring ISR slot from an explicit GNSS/VCLOCK base pair.
@@ -138,6 +207,16 @@ timepop_handle_t timepop_arm_recurring_isr_from_base_counter32(
   timepop_callback_t  callback,
   void*               user_data,
   const char*         name
+);
+
+timepop_handle_t timepop_arm_recurring_isr_from_base_counter32_with_priority(
+  int64_t             base_gnss_ns,
+  uint32_t            base_counter32,
+  uint64_t            period_gnss_ns,
+  timepop_callback_t  callback,
+  void*               user_data,
+  const char*         name,
+  timepop_priority_t  priority
 );
 
 // Notify TimePop that the VCLOCK synthetic coordinate system has been rebased.
