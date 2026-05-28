@@ -1639,6 +1639,24 @@ static volatile uint32_t g_cadence_minder_last_vclock_counter32 ZPNET_ISR_HOT_DA
 static volatile uint32_t g_cadence_minder_last_ocxo1_counter32 ZPNET_ISR_HOT_DATA = 0;
 static volatile uint32_t g_cadence_minder_last_ocxo2_counter32 ZPNET_ISR_HOT_DATA = 0;
 
+// Passive CH2 rollover tend — surgical coexistence layer.
+//
+// This is deliberately not a scheduled service and not an event source.  It
+// runs from the QTimer1 CH2 ISR path and merely refreshes process_interrupt's
+// synthetic 32-bit ambient projections from current 16-bit hardware reads.
+// Existing CADENCE_MINDER and OCXO local cadence event authorship remain intact.
+static constexpr bool     CH2_IMPLICIT_ROLLOVER_ENABLED = true;
+static volatile uint32_t g_ch2_implicit_rollover_count ZPNET_ISR_HOT_DATA = 0;
+static volatile uint32_t g_ch2_implicit_rollover_vclock_updates ZPNET_ISR_HOT_DATA = 0;
+static volatile uint32_t g_ch2_implicit_rollover_ocxo1_updates ZPNET_ISR_HOT_DATA = 0;
+static volatile uint32_t g_ch2_implicit_rollover_ocxo2_updates ZPNET_ISR_HOT_DATA = 0;
+static volatile uint16_t g_ch2_implicit_rollover_last_vclock_hw16 ZPNET_ISR_HOT_DATA = 0;
+static volatile uint16_t g_ch2_implicit_rollover_last_ocxo1_hw16 ZPNET_ISR_HOT_DATA = 0;
+static volatile uint16_t g_ch2_implicit_rollover_last_ocxo2_hw16 ZPNET_ISR_HOT_DATA = 0;
+static volatile uint32_t g_ch2_implicit_rollover_last_vclock_counter32 ZPNET_ISR_HOT_DATA = 0;
+static volatile uint32_t g_ch2_implicit_rollover_last_ocxo1_counter32 ZPNET_ISR_HOT_DATA = 0;
+static volatile uint32_t g_ch2_implicit_rollover_last_ocxo2_counter32 ZPNET_ISR_HOT_DATA = 0;
+
 static inline uint32_t clock32_from_ns(uint64_t ns) {
   return (uint32_t)((ns / 100ULL) & 0xFFFFFFFFULL);
 }
@@ -1884,6 +1902,63 @@ ZPNET_ISR_FASTRUN static void synthetic_clock_tend_from_hw16(synthetic_clock32_t
   c.current_ns += (uint64_t)delta * 100ULL;
   c.hardware16 = hardware16;
   c.minder_update_count++;
+}
+
+ZPNET_ISR_FASTRUN static void synthetic_clock_observe_hw16_no_pending_zero(
+    synthetic_clock32_t& c,
+    uint16_t hardware16) {
+  // Passive rollover-only observation.  Unlike synthetic_clock_tend_from_hw16(),
+  // this does not consume pending ZERO requests.  That keeps the implicit CH2
+  // seatbelt from changing existing ZERO/SmartZero ownership semantics while
+  // still refreshing the 16-bit-to-32-bit extension whenever CH2 fires.
+  if (!c.zeroed) {
+    synthetic_clock_bootstrap_from_hw16(c, hardware16);
+    return;
+  }
+
+  const uint32_t counter32 = project_counter32_from_hw16(c, hardware16);
+  const uint32_t delta = counter32 - c.current_counter32;
+  c.current_counter32 = counter32;
+  c.current_ns += (uint64_t)delta * 100ULL;
+  c.hardware16 = hardware16;
+  c.minder_update_count++;
+}
+
+ZPNET_ISR_FASTRUN static void interrupt_ch2_implicit_rollover_tend(void) {
+  if (!CH2_IMPLICIT_ROLLOVER_ENABLED || !g_interrupt_hw_ready) return;
+
+  g_ch2_implicit_rollover_count++;
+
+  // VCLOCK: refresh the process_interrupt-owned synthetic 32-bit extender
+  // from the passive CH0 low word.  This is an ambient rollover observation,
+  // not an event fact, and it does not publish/dispatch anything.
+  const uint16_t vclock_hw16 = qtimer1_ch0_counter_now();
+  vclock_clock_tend_from_hardware_low16(vclock_hw16);
+  g_ch2_implicit_rollover_vclock_updates++;
+  g_ch2_implicit_rollover_last_vclock_hw16 = vclock_hw16;
+  g_ch2_implicit_rollover_last_vclock_counter32 =
+      g_vclock_clock32.current_counter32;
+
+  // OCXO lanes: opportunistically refresh the low-word extenders.  The
+  // existing QTimer2/QTimer3 cadence ladders still own OCXO scheduled event
+  // identity and one-second publication; this path is only rollover insurance.
+  if (!OCXO1_DISABLED && g_ocxo1_lane.initialized) {
+    const uint16_t ocxo1_hw16 = IMXRT_TMR2.CH[0].CNTR;
+    synthetic_clock_observe_hw16_no_pending_zero(g_ocxo1_clock32, ocxo1_hw16);
+    g_ch2_implicit_rollover_ocxo1_updates++;
+    g_ch2_implicit_rollover_last_ocxo1_hw16 = ocxo1_hw16;
+    g_ch2_implicit_rollover_last_ocxo1_counter32 =
+        g_ocxo1_clock32.current_counter32;
+  }
+
+  if (!OCXO2_DISABLED && g_ocxo2_lane.initialized) {
+    const uint16_t ocxo2_hw16 = IMXRT_TMR3.CH[3].CNTR;
+    synthetic_clock_observe_hw16_no_pending_zero(g_ocxo2_clock32, ocxo2_hw16);
+    g_ch2_implicit_rollover_ocxo2_updates++;
+    g_ch2_implicit_rollover_last_ocxo2_hw16 = ocxo2_hw16;
+    g_ch2_implicit_rollover_last_ocxo2_counter32 =
+        g_ocxo2_clock32.current_counter32;
+  }
 }
 
 ZPNET_ISR_FASTRUN bool interrupt_clock_snapshot(interrupt_subscriber_kind_t kind, interrupt_clock_snapshot_t* out) {
@@ -2322,9 +2397,34 @@ void interrupt_smartzero_abort(void) {
     smartzero_reset_lane(i);
   }
 
-  if (!OCXO1_DISABLED) ocxo_lane_stop_local_cadence(g_ocxo1_lane, OCXO_CADENCE_REASON_STOP);
-  if (!OCXO2_DISABLED) ocxo_lane_stop_local_cadence(g_ocxo2_lane, OCXO_CADENCE_REASON_STOP);
   smartzero_write_end();
+
+  // SmartZero may temporarily stop/re-author the OCXO local compare cadence
+  // while acquiring lane proofs.  Aborting the *live acquisition attempt* must
+  // not silently disable active clock service.  If an OCXO lane is active,
+  // restore its normal local 1 kHz cadence from the currently installed grid;
+  // if it is inactive, leave it stopped as before.
+  if (!OCXO1_DISABLED) {
+    if (g_ocxo1_lane.active) {
+      (void)ocxo_lane_start_local_cadence(interrupt_subscriber_kind_t::OCXO1,
+                                          g_ocxo1_lane,
+                                          g_ocxo1_clock32,
+                                          OCXO_CADENCE_REASON_START);
+    } else {
+      ocxo_lane_stop_local_cadence(g_ocxo1_lane, OCXO_CADENCE_REASON_STOP);
+    }
+  }
+
+  if (!OCXO2_DISABLED) {
+    if (g_ocxo2_lane.active) {
+      (void)ocxo_lane_start_local_cadence(interrupt_subscriber_kind_t::OCXO2,
+                                          g_ocxo2_lane,
+                                          g_ocxo2_clock32,
+                                          OCXO_CADENCE_REASON_START);
+    } else {
+      ocxo_lane_stop_local_cadence(g_ocxo2_lane, OCXO_CADENCE_REASON_STOP);
+    }
+  }
 }
 
 bool interrupt_smartzero_running(void) {
@@ -4493,6 +4593,7 @@ ZPNET_ISR_FASTRUN static void qtimer1_isr(void) {
   }
   else if (IMXRT_TMR1.CH[2].CSCTRL & TMR_CSCTRL_TCF1) {
     qtimer1_ch2_clear_compare_flag();
+    interrupt_ch2_implicit_rollover_tend();
     if (g_qtimer1_ch2_handler) {
       const uint32_t qtimer_event_dwt = qtimer_event_dwt_from_isr_entry_raw(isr_entry_dwt_raw);
       const bridge_projection_t bridge = interrupt_dwt_to_vclock_gnss_projection(qtimer_event_dwt);
@@ -5186,6 +5287,17 @@ static void runtime_reset_cadence_minder_state(void) {
   g_cadence_minder_last_vclock_counter32 = 0;
   g_cadence_minder_last_ocxo1_counter32 = 0;
   g_cadence_minder_last_ocxo2_counter32 = 0;
+
+  g_ch2_implicit_rollover_count = 0;
+  g_ch2_implicit_rollover_vclock_updates = 0;
+  g_ch2_implicit_rollover_ocxo1_updates = 0;
+  g_ch2_implicit_rollover_ocxo2_updates = 0;
+  g_ch2_implicit_rollover_last_vclock_hw16 = 0;
+  g_ch2_implicit_rollover_last_ocxo1_hw16 = 0;
+  g_ch2_implicit_rollover_last_ocxo2_hw16 = 0;
+  g_ch2_implicit_rollover_last_vclock_counter32 = 0;
+  g_ch2_implicit_rollover_last_ocxo1_counter32 = 0;
+  g_ch2_implicit_rollover_last_ocxo2_counter32 = 0;
 }
 
 static void runtime_reset_ocxo_fact_rings(void) {
@@ -5610,6 +5722,9 @@ static void add_runtime_payload(Payload& p) {
   p.add("subscriber_count", g_subscriber_count);
   p.add("single_cadence_agent", false);
   p.add("cadence_minder_isr_mode", true);
+  p.add("ch2_implicit_rollover_enabled", CH2_IMPLICIT_ROLLOVER_ENABLED);
+  p.add("ch2_implicit_rollover_policy",
+        "PASSIVE_COEXISTS_WITH_CADENCE_MINDER_AND_OCXO_LOCAL_CADENCE");
   p.add("vclock_cadence_retired", true);
   p.add("ocxo_legacy_compare_cadence_retired", true);
   p.add("ocxo_compare_live_requires_enabled_and_flag", true);
@@ -5652,6 +5767,18 @@ static void add_cadence_minder_payload(Payload& p) {
   p.add("cadence_minder_ocxo2_updates", g_cadence_minder_ocxo2_updates);
   p.add("cadence_minder_last_vclock_counter32", g_cadence_minder_last_vclock_counter32);
   p.add("cadence_minder_ocxo_rollover_retired", true);
+
+  p.add("ch2_implicit_rollover_enabled", CH2_IMPLICIT_ROLLOVER_ENABLED);
+  p.add("ch2_implicit_rollover_count", g_ch2_implicit_rollover_count);
+  p.add("ch2_implicit_rollover_vclock_updates", g_ch2_implicit_rollover_vclock_updates);
+  p.add("ch2_implicit_rollover_ocxo1_updates", g_ch2_implicit_rollover_ocxo1_updates);
+  p.add("ch2_implicit_rollover_ocxo2_updates", g_ch2_implicit_rollover_ocxo2_updates);
+  p.add("ch2_implicit_rollover_last_vclock_hw16", (uint32_t)g_ch2_implicit_rollover_last_vclock_hw16);
+  p.add("ch2_implicit_rollover_last_ocxo1_hw16", (uint32_t)g_ch2_implicit_rollover_last_ocxo1_hw16);
+  p.add("ch2_implicit_rollover_last_ocxo2_hw16", (uint32_t)g_ch2_implicit_rollover_last_ocxo2_hw16);
+  p.add("ch2_implicit_rollover_last_vclock_counter32", g_ch2_implicit_rollover_last_vclock_counter32);
+  p.add("ch2_implicit_rollover_last_ocxo1_counter32", g_ch2_implicit_rollover_last_ocxo1_counter32);
+  p.add("ch2_implicit_rollover_last_ocxo2_counter32", g_ch2_implicit_rollover_last_ocxo2_counter32);
 
   p.add("ocxo_cadence_interval_ticks", OCXO_CADENCE_INTERVAL_TICKS);
   p.add("ocxo_cadence_samples_per_second", TICKS_PER_SECOND_EVENT);
@@ -6382,7 +6509,9 @@ static Payload cmd_report(const Payload&) {
   p.add("ocxo_linear_regression_enabled", OCXO_LINEAR_REGRESSION_ENABLED);
   p.add("single_cadence_agent", false);
   p.add("cadence_minder_isr_mode", true);
+  p.add("cadence_minder_retained", true);
   p.add("ocxo_lane_local_cadence", true);
+  p.add("ocxo_local_cadence_retained", true);
   p.add("ocxo_perishable_fact_capture", true);
   p.add("ocxo_fact_ring_size", OCXO_PERISHABLE_FACT_RING_SIZE);
 
@@ -6412,6 +6541,11 @@ static Payload cmd_report(const Payload&) {
   p.add("cadence_minder_vclock_updates", g_cadence_minder_vclock_updates);
   p.add("cadence_minder_ocxo1_updates", g_cadence_minder_ocxo1_updates);
   p.add("cadence_minder_ocxo2_updates", g_cadence_minder_ocxo2_updates);
+  p.add("ch2_implicit_rollover_enabled", CH2_IMPLICIT_ROLLOVER_ENABLED);
+  p.add("ch2_implicit_rollover_count", g_ch2_implicit_rollover_count);
+  p.add("ch2_implicit_rollover_vclock_updates", g_ch2_implicit_rollover_vclock_updates);
+  p.add("ch2_implicit_rollover_ocxo1_updates", g_ch2_implicit_rollover_ocxo1_updates);
+  p.add("ch2_implicit_rollover_ocxo2_updates", g_ch2_implicit_rollover_ocxo2_updates);
 
   interrupt_smartzero_snapshot_t z{};
   (void)interrupt_smartzero_live_snapshot(&z);

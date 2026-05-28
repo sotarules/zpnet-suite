@@ -8,6 +8,8 @@
 //   • OCXO lanes    (local 1 kHz QTimer rollover ladder on QTimer2 CH0 / QTimer3 CH3;
 //                    only every 1000th tick publishes a one-second event)
 //   • Cadence minder (TimePop VCLOCK/relay heartbeat; no longer OCXO rollover owner)
+//   • CH2 implicit rollover tend (passive ISR seatbelt for all 16-bit clock extenders;
+//                    coexists with CADENCE_MINDER and the OCXO local cadence ladders)
 //   • TimePop       (QTimer1 CH2, hosted scheduler/client rail)
 //   • PPS GPIO edge (diagnostics + dispatch authority + epoch anchor)
 //
@@ -16,7 +18,8 @@
 //   QTimer1 has a single shared IRQ vector across all four channels.
 //   process_interrupt owns the vector and dispatches in IRQ context:
 //     • CH1 flag set → legacy hosted compare rail, if explicitly armed
-//     • CH2 flag set → registered TimePop scheduler handler
+//     • CH2 flag set → passive all-clock rollover tend, then registered
+//                       TimePop scheduler handler
 //   VCLOCK cadence no longer owns a private QTimer1 compare channel.  It is
 //   a critical recurring TimePop slot that runs from the CH2 shared fire facts
 //   and rearms inside the CH2 ISR pass before TimePop chooses the next compare.
