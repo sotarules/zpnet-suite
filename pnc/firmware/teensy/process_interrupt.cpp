@@ -169,23 +169,22 @@ static constexpr uint32_t EPOCH_CAPTURE_MAX_WINDOW_CYCLES =
 
 // VCLOCK/relay TimePop heartbeat.
 //
-// CADENCE_MINDER remains a critical recurring TimePop ISR client on the
-// sovereign QTimer1 CH2 rail, but after the lane-local cadence migration it no
-// longer owns OCXO rollover custody.  VCLOCK still uses this rail deliberately:
+// VCLOCK_HEARTBEAT remains a critical recurring TimePop ISR client on the
+// sovereign QTimer1 CH2 rail, but it is no longer a rollover owner.  VCLOCK still uses this rail deliberately:
 // TimePop's same-deadline coalescing keeps VCLOCK facts on one perishable ISR
 // surface and avoids introducing a competing preemptive VCLOCK compare.
-static constexpr uint64_t CADENCE_MINDER_PERIOD_NS = 1000000ULL;
-static constexpr const char* CADENCE_MINDER_NAME = "CADENCE_MINDER";
+static constexpr uint64_t VCLOCK_HEARTBEAT_PERIOD_NS = 1000000ULL;
+static constexpr const char* VCLOCK_HEARTBEAT_NAME = "VCLOCK_HEARTBEAT";
 
 // PPS relay ownership lives in process_interrupt because the visible relay edge
 // is a physical PPS witness.  The rising edge is asserted directly inside the
-// PPS GPIO ISR; the 500 ms deassert is driven by CADENCE_MINDER's existing
+// PPS GPIO ISR; the 500 ms deassert is driven by VCLOCK_HEARTBEAT's existing
 // 1 ms heartbeat so relay-off does not allocate/cancel/mutate TimePop slots.
 static constexpr uint64_t PPS_RELAY_OFF_NS = 500000000ULL;
 static constexpr uint32_t PPS_RELAY_OFF_CADENCE_TICKS =
-    (uint32_t)(PPS_RELAY_OFF_NS / CADENCE_MINDER_PERIOD_NS);
-static_assert((PPS_RELAY_OFF_NS % CADENCE_MINDER_PERIOD_NS) == 0ULL,
-              "PPS relay off interval must be an integer CADENCE_MINDER period");
+    (uint32_t)(PPS_RELAY_OFF_NS / VCLOCK_HEARTBEAT_PERIOD_NS);
+static_assert((PPS_RELAY_OFF_NS % VCLOCK_HEARTBEAT_PERIOD_NS) == 0ULL,
+              "PPS relay off interval must be an integer VCLOCK_HEARTBEAT period");
 static_assert(PPS_RELAY_OFF_CADENCE_TICKS == 500U,
               "PPS relay off interval should be 500 cadence ticks");
 
@@ -256,7 +255,7 @@ static constexpr uint32_t OCXO_CADENCE_REASON_REARM         = 6;
 static constexpr uint32_t OCXO_CADENCE_REASON_STOP          = 7;
 
 // OCXO witness scheduling/report classifications.  These are instrumentation
-// only: they make CADENCE_MINDER arm decisions and OCXO compare-service timing
+// only: they make VCLOCK_HEARTBEAT arm decisions and OCXO compare-service timing
 // visible without changing whether an event is published.
 static constexpr uint32_t OCXO_SCHEDULE_DECISION_NONE               = 0;
 static constexpr uint32_t OCXO_SCHEDULE_DECISION_INACTIVE           = 1;
@@ -877,7 +876,7 @@ static volatile uint32_t g_pps_relay_last_assert_sequence ZPNET_ISR_HOT_DATA = 0
 static volatile bool     g_pps_relay_pin_initialized ZPNET_ISR_HOT_DATA = false;
 
 ZPNET_ISR_FASTRUN static void pps_relay_assert_from_isr(uint32_t sequence);
-ZPNET_ISR_FASTRUN static void pps_relay_cadence_minder_tick(void);
+ZPNET_ISR_FASTRUN static void pps_relay_vclock_heartbeat_tick(void);
 
 // ============================================================================
 // PPS witness + VCLOCK-domain canonical epoch latch
@@ -1343,7 +1342,7 @@ struct ocxo_lane_t {
   // Values > 32767 mean early service, not very-late service.
   uint32_t witness_last_late_ticks = 0;
 
-  // CADENCE_MINDER arm-decision diagnostics.
+  // VCLOCK_HEARTBEAT arm-decision diagnostics.
   uint32_t witness_schedule_last_decision = OCXO_SCHEDULE_DECISION_NONE;
   uint32_t witness_schedule_last_current_counter32 = 0;
   uint32_t witness_schedule_last_target_counter32 = 0;
@@ -1637,26 +1636,26 @@ static interrupt_subscriber_runtime_t* ocxo_runtime_for(const ocxo_runtime_conte
   return ctx.rt_slot ? *ctx.rt_slot : nullptr;
 }
 
-static volatile bool     g_cadence_minder_armed ZPNET_ISR_HOT_DATA = false;
-static volatile uint32_t g_cadence_minder_arm_count ZPNET_ISR_HOT_DATA = 0;
-static volatile uint32_t g_cadence_minder_arm_failures ZPNET_ISR_HOT_DATA = 0;
-static volatile uint32_t g_cadence_minder_fire_count ZPNET_ISR_HOT_DATA = 0;
-static volatile uint32_t g_cadence_minder_vclock_updates ZPNET_ISR_HOT_DATA = 0;
-static volatile uint32_t g_cadence_minder_ocxo1_updates ZPNET_ISR_HOT_DATA = 0;
-static volatile uint32_t g_cadence_minder_ocxo2_updates ZPNET_ISR_HOT_DATA = 0;
-static volatile uint16_t g_cadence_minder_last_vclock_hw16 ZPNET_ISR_HOT_DATA = 0;
-static volatile uint16_t g_cadence_minder_last_ocxo1_hw16 ZPNET_ISR_HOT_DATA = 0;
-static volatile uint16_t g_cadence_minder_last_ocxo2_hw16 ZPNET_ISR_HOT_DATA = 0;
-static volatile uint32_t g_cadence_minder_last_vclock_counter32 ZPNET_ISR_HOT_DATA = 0;
-static volatile uint32_t g_cadence_minder_last_ocxo1_counter32 ZPNET_ISR_HOT_DATA = 0;
-static volatile uint32_t g_cadence_minder_last_ocxo2_counter32 ZPNET_ISR_HOT_DATA = 0;
+static volatile bool     g_vclock_heartbeat_armed ZPNET_ISR_HOT_DATA = false;
+static volatile uint32_t g_vclock_heartbeat_arm_count ZPNET_ISR_HOT_DATA = 0;
+static volatile uint32_t g_vclock_heartbeat_arm_failures ZPNET_ISR_HOT_DATA = 0;
+static volatile uint32_t g_vclock_heartbeat_fire_count ZPNET_ISR_HOT_DATA = 0;
+static volatile uint32_t g_vclock_heartbeat_vclock_ticks ZPNET_ISR_HOT_DATA = 0;
+static volatile uint32_t g_vclock_heartbeat_ocxo1_rollover_updates_retired ZPNET_ISR_HOT_DATA = 0;
+static volatile uint32_t g_vclock_heartbeat_ocxo2_rollover_updates_retired ZPNET_ISR_HOT_DATA = 0;
+static volatile uint16_t g_vclock_heartbeat_last_vclock_hw16 ZPNET_ISR_HOT_DATA = 0;
+static volatile uint16_t g_vclock_heartbeat_last_ocxo1_hw16_retired ZPNET_ISR_HOT_DATA = 0;
+static volatile uint16_t g_vclock_heartbeat_last_ocxo2_hw16_retired ZPNET_ISR_HOT_DATA = 0;
+static volatile uint32_t g_vclock_heartbeat_last_vclock_counter32 ZPNET_ISR_HOT_DATA = 0;
+static volatile uint32_t g_vclock_heartbeat_last_ocxo1_counter32_retired ZPNET_ISR_HOT_DATA = 0;
+static volatile uint32_t g_vclock_heartbeat_last_ocxo2_counter32_retired ZPNET_ISR_HOT_DATA = 0;
 
 // Passive CH2 rollover tend — surgical coexistence layer.
 //
 // This is deliberately not a scheduled service and not an event source.  It
 // runs from the QTimer1 CH2 ISR path and merely refreshes process_interrupt's
 // synthetic 32-bit ambient projections from current 16-bit hardware reads.
-// Existing CADENCE_MINDER and OCXO local cadence event authorship remain intact.
+// Existing VCLOCK_HEARTBEAT and OCXO local cadence event authorship remain intact.
 static constexpr bool     CH2_IMPLICIT_ROLLOVER_ENABLED = true;
 static volatile uint32_t g_ch2_implicit_rollover_count ZPNET_ISR_HOT_DATA = 0;
 static volatile uint32_t g_ch2_implicit_rollover_vclock_updates ZPNET_ISR_HOT_DATA = 0;
@@ -3624,11 +3623,11 @@ ZPNET_ISR_FASTRUN static void ocxo_lane_install_logical_grid(interrupt_subscribe
   }
 }
 
-// The old CADENCE_MINDER-driven OCXO arming path has been retired.  OCXO1 and
+// The old VCLOCK_HEARTBEAT-driven OCXO arming path has been retired.  OCXO1 and
 // OCXO2 now maintain their own 1 kHz compare cadence on their local QTimer
-// channels; CADENCE_MINDER remains only the VCLOCK/relay TimePop heartbeat.
+// channels; VCLOCK_HEARTBEAT remains only the VCLOCK event/bookend and relay TimePop heartbeat.
 
-ZPNET_ISR_FASTRUN static void cadence_minder_timepop_callback(timepop_ctx_t* ctx,
+ZPNET_ISR_FASTRUN static void vclock_heartbeat_timepop_callback(timepop_ctx_t* ctx,
                                             timepop_diag_t*,
                                             void*) {
   if (!ctx || !g_interrupt_hw_ready) return;
@@ -3637,18 +3636,19 @@ ZPNET_ISR_FASTRUN static void cadence_minder_timepop_callback(timepop_ctx_t* ctx
   const uint32_t cadence_counter32 = ctx->fire_vclock_raw;
   const uint16_t fired_low16 = (uint16_t)(cadence_counter32 & 0xFFFFU);
 
-  g_cadence_minder_fire_count++;
-  pps_relay_cadence_minder_tick();
+  g_vclock_heartbeat_fire_count++;
+  pps_relay_vclock_heartbeat_tick();
 
-  // VCLOCK: CADENCE_MINDER is now the only 1 ms substrate cadence.  It owns
-  // the synthetic VCLOCK low-word anchor refresh and the former separate
-  // VCLOCK one-second/bookend duties.
-  vclock_clock_anchor_hardware_low16(cadence_counter32, fired_low16);
-  g_vclock_clock32.minder_update_count++;
+  // VCLOCK_HEARTBEAT is a scheduled housekeeping/event-authoring client,
+  // not a rollover owner.  Low-word rollover extension is handled only by
+  // interrupt_ch2_implicit_rollover_tend(), which runs before TimePop gets
+  // this CH2 event.  Keep the heartbeat's authored counter identity for
+  // SmartZero, PPS_VCLOCK bookends, relay countdown, and reports, but do not
+  // refresh the synthetic clock32 extender here.
   g_vclock_lane.logical_count32_at_last_second = cadence_counter32;
-  g_cadence_minder_vclock_updates++;
-  g_cadence_minder_last_vclock_hw16 = fired_low16;
-  g_cadence_minder_last_vclock_counter32 = cadence_counter32;
+  g_vclock_heartbeat_vclock_ticks++;
+  g_vclock_heartbeat_last_vclock_hw16 = fired_low16;
+  g_vclock_heartbeat_last_vclock_counter32 = cadence_counter32;
 
   // SmartZero VCLOCK samples are the same 1 kHz TimePop fire facts that will
   // later feed regression.  During zero acquisition they are observations; the
@@ -3737,27 +3737,27 @@ ZPNET_ISR_FASTRUN static void cadence_minder_timepop_callback(timepop_ctx_t* ctx
 
   // OCXO lanes are intentionally absent here.  Their 16-bit rollover cadence is
   // now device-local on QTimer2/QTimer3; this TimePop callback is the VCLOCK
-  // cadence surface plus the PPS relay-off heartbeat.
+  // event/bookend surface plus the PPS relay-off heartbeat.
 }
 
-ZPNET_ISR_FASTRUN static bool cadence_minder_arm_timepop(void) {
+ZPNET_ISR_FASTRUN static bool vclock_heartbeat_arm_timepop(void) {
   if (!g_interrupt_hw_ready || !g_interrupt_runtime_ready) return false;
 
-  timepop_cancel_by_name(CADENCE_MINDER_NAME);
+  timepop_cancel_by_name(VCLOCK_HEARTBEAT_NAME);
   const timepop_handle_t h =
-      timepop_arm_recurring_isr_with_priority(CADENCE_MINDER_PERIOD_NS,
-                                              cadence_minder_timepop_callback,
+      timepop_arm_recurring_isr_with_priority(VCLOCK_HEARTBEAT_PERIOD_NS,
+                                              vclock_heartbeat_timepop_callback,
                                               nullptr,
-                                              CADENCE_MINDER_NAME,
+                                              VCLOCK_HEARTBEAT_NAME,
                                               TIMEPOP_PRIORITY_FIRST);
   if (h == TIMEPOP_INVALID_HANDLE) {
-    g_cadence_minder_armed = false;
-    g_cadence_minder_arm_failures++;
+    g_vclock_heartbeat_armed = false;
+    g_vclock_heartbeat_arm_failures++;
     return false;
   }
 
-  g_cadence_minder_armed = true;
-  g_cadence_minder_arm_count++;
+  g_vclock_heartbeat_armed = true;
+  g_vclock_heartbeat_arm_count++;
   g_vclock_lane.phase_bootstrapped = true;
   g_vclock_lane.bootstrap_count++;
   return true;
@@ -4814,7 +4814,7 @@ ZPNET_ISR_FASTRUN static void pps_edge_dispatch_trampoline(timepop_ctx_t*, timep
 ZPNET_ISR_FASTRUN static void pps_relay_assert_from_isr(uint32_t sequence) {
   // PPS relay HIGH is a physical PPS witness and stays in ISR context.
   // Relay LOW is intentionally *not* scheduled through TimePop.  Instead,
-  // CADENCE_MINDER's existing 1 ms heartbeat owns the countdown and deasserts
+  // VCLOCK_HEARTBEAT's existing 1 ms heartbeat owns the countdown and deasserts
   // the relay when the counter reaches zero.  This removes relay-off from
   // TimePop ASAP/one-shot slot mutation entirely.
   digitalWriteFast(GNSS_PPS_RELAY, HIGH);
@@ -4826,7 +4826,7 @@ ZPNET_ISR_FASTRUN static void pps_relay_assert_from_isr(uint32_t sequence) {
   g_pps_relay_deassert_arm_count++;
 }
 
-ZPNET_ISR_FASTRUN static void pps_relay_cadence_minder_tick(void) {
+ZPNET_ISR_FASTRUN static void pps_relay_vclock_heartbeat_tick(void) {
   uint32_t ticks = g_pps_relay_deassert_countdown_ticks;
   if (ticks == 0) return;
 
@@ -5139,10 +5139,10 @@ bool interrupt_start(interrupt_subscriber_kind_t kind) {
     g_vclock_lane.active = true;
     g_vclock_lane.phase_bootstrapped = true;
     g_vclock_lane.tick_mod_1000 = 0;
-    // CADENCE_MINDER is armed once during process_interrupt_init() and is the
+    // VCLOCK_HEARTBEAT is armed once during process_interrupt_init() and is the
     // only 1 ms TimePop cadence source.  Starting VCLOCK must not arm a second
     // cadence slot.
-    return g_cadence_minder_armed || cadence_minder_arm_timepop();
+    return g_vclock_heartbeat_armed || vclock_heartbeat_arm_timepop();
   }
 
   if (ocxo_kind_disabled(kind)) {
@@ -5183,7 +5183,7 @@ bool interrupt_stop(interrupt_subscriber_kind_t kind) {
   if (kind == interrupt_subscriber_kind_t::VCLOCK) {
     g_vclock_lane.active = false;
     g_vclock_lane.phase_bootstrapped = false;
-    // Do not cancel CADENCE_MINDER here; it is the system-wide substrate
+    // Do not cancel VCLOCK_HEARTBEAT here; it is the system-wide substrate
     // cadence for VCLOCK and the OCXO passive counter domains.
     return true;
   }
@@ -5438,20 +5438,20 @@ static void runtime_reset_qtimer_host_state(void) {
   g_ocxo2_qtimer_diag = ocxo_qtimer_diag_t{};
 }
 
-static void runtime_reset_cadence_minder_state(void) {
-  g_cadence_minder_armed = false;
-  g_cadence_minder_arm_count = 0;
-  g_cadence_minder_arm_failures = 0;
-  g_cadence_minder_fire_count = 0;
-  g_cadence_minder_vclock_updates = 0;
-  g_cadence_minder_ocxo1_updates = 0;
-  g_cadence_minder_ocxo2_updates = 0;
-  g_cadence_minder_last_vclock_hw16 = 0;
-  g_cadence_minder_last_ocxo1_hw16 = 0;
-  g_cadence_minder_last_ocxo2_hw16 = 0;
-  g_cadence_minder_last_vclock_counter32 = 0;
-  g_cadence_minder_last_ocxo1_counter32 = 0;
-  g_cadence_minder_last_ocxo2_counter32 = 0;
+static void runtime_reset_vclock_heartbeat_state(void) {
+  g_vclock_heartbeat_armed = false;
+  g_vclock_heartbeat_arm_count = 0;
+  g_vclock_heartbeat_arm_failures = 0;
+  g_vclock_heartbeat_fire_count = 0;
+  g_vclock_heartbeat_vclock_ticks = 0;
+  g_vclock_heartbeat_ocxo1_rollover_updates_retired = 0;
+  g_vclock_heartbeat_ocxo2_rollover_updates_retired = 0;
+  g_vclock_heartbeat_last_vclock_hw16 = 0;
+  g_vclock_heartbeat_last_ocxo1_hw16_retired = 0;
+  g_vclock_heartbeat_last_ocxo2_hw16_retired = 0;
+  g_vclock_heartbeat_last_vclock_counter32 = 0;
+  g_vclock_heartbeat_last_ocxo1_counter32_retired = 0;
+  g_vclock_heartbeat_last_ocxo2_counter32_retired = 0;
 
   g_ch2_implicit_rollover_count = 0;
   g_ch2_implicit_rollover_vclock_updates = 0;
@@ -5478,7 +5478,7 @@ static void runtime_reset_for_init(void) {
   runtime_reset_smartzero_state();
   runtime_bootstrap_synthetic_clocks_if_ready();
   runtime_reset_qtimer_host_state();
-  runtime_reset_cadence_minder_state();
+  runtime_reset_vclock_heartbeat_state();
   vclock_fact_ring_reset();
   runtime_reset_ocxo_fact_rings();
   cadence_regression_reset_all();
@@ -5490,7 +5490,7 @@ void process_interrupt_init(void) {
   runtime_reset_for_init();
 
   g_interrupt_runtime_ready = true;
-  (void)cadence_minder_arm_timepop();
+  (void)vclock_heartbeat_arm_timepop();
 }
 
 void process_interrupt_enable_irqs(void) {
@@ -5886,12 +5886,13 @@ static void add_runtime_payload(Payload& p) {
   p.add("timing_arch_ocxo_migration_stage", "EMA_DWT_AUTHORITY");
   p.add("subscriber_count", g_subscriber_count);
   p.add("single_cadence_agent", false);
-  p.add("cadence_minder_isr_mode", true);
+  p.add("vclock_heartbeat_isr_mode", true);
   p.add("ch2_implicit_rollover_enabled", CH2_IMPLICIT_ROLLOVER_ENABLED);
   p.add("ch2_implicit_rollover_policy",
-        "PASSIVE_COEXISTS_WITH_CADENCE_MINDER_AND_OCXO_LOCAL_CADENCE");
-  p.add("vclock_cadence_retired", true);
-  p.add("ocxo_legacy_compare_cadence_retired", true);
+        "PASSIVE_COEXISTS_WITH_VCLOCK_HEARTBEAT_AND_OCXO_LOCAL_CADENCE");
+  p.add("vclock_heartbeat_retained", true);
+  p.add("vclock_heartbeat_rollover_owner", false);
+  p.add("ocxo_native_1khz_cadence_retired", true);
   p.add("ocxo_compare_live_requires_enabled_and_flag", true);
   p.add("lane_report_command", "INTERRUPT.REPORT_LANES");
   p.add("single_lane_report_command", "INTERRUPT.REPORT_LANE lane=VCLOCK|OCXO1|OCXO2");
@@ -5921,17 +5922,17 @@ static void add_ocxo_cadence_report_payload(Payload& p,
               ocxo_cadence_reason_name(lane.cadence_last_reason));
 }
 
-static void add_cadence_minder_payload(Payload& p) {
-  p.add("cadence_minder_period_ns", (uint64_t)CADENCE_MINDER_PERIOD_NS);
-  p.add("cadence_minder_armed", g_cadence_minder_armed);
-  p.add("cadence_minder_arm_count", g_cadence_minder_arm_count);
-  p.add("cadence_minder_arm_failures", g_cadence_minder_arm_failures);
-  p.add("cadence_minder_fire_count", g_cadence_minder_fire_count);
-  p.add("cadence_minder_vclock_updates", g_cadence_minder_vclock_updates);
-  p.add("cadence_minder_ocxo1_updates", g_cadence_minder_ocxo1_updates);
-  p.add("cadence_minder_ocxo2_updates", g_cadence_minder_ocxo2_updates);
-  p.add("cadence_minder_last_vclock_counter32", g_cadence_minder_last_vclock_counter32);
-  p.add("cadence_minder_ocxo_rollover_retired", true);
+static void add_vclock_heartbeat_payload(Payload& p) {
+  p.add("vclock_heartbeat_period_ns", (uint64_t)VCLOCK_HEARTBEAT_PERIOD_NS);
+  p.add("vclock_heartbeat_armed", g_vclock_heartbeat_armed);
+  p.add("vclock_heartbeat_arm_count", g_vclock_heartbeat_arm_count);
+  p.add("vclock_heartbeat_arm_failures", g_vclock_heartbeat_arm_failures);
+  p.add("vclock_heartbeat_fire_count", g_vclock_heartbeat_fire_count);
+  p.add("vclock_heartbeat_vclock_ticks", g_vclock_heartbeat_vclock_ticks);
+  p.add("vclock_heartbeat_ocxo1_rollover_updates_retired", g_vclock_heartbeat_ocxo1_rollover_updates_retired);
+  p.add("vclock_heartbeat_ocxo2_rollover_updates_retired", g_vclock_heartbeat_ocxo2_rollover_updates_retired);
+  p.add("vclock_heartbeat_last_vclock_counter32", g_vclock_heartbeat_last_vclock_counter32);
+  p.add("vclock_heartbeat_ocxo_rollover_retired", true);
 
   p.add("ch2_implicit_rollover_enabled", CH2_IMPLICIT_ROLLOVER_ENABLED);
   p.add("ch2_implicit_rollover_count", g_ch2_implicit_rollover_count);
@@ -5979,7 +5980,7 @@ static void add_pps_payload(Payload& p) {
   p.add("pps_relay_owner", "process_interrupt");
   p.add("pps_relay_assert_in_isr", true);
   p.add("pps_relay_deassert_in_timepop", false);
-  p.add("pps_relay_deassert_in_cadence_minder", true);
+  p.add("pps_relay_deassert_in_vclock_heartbeat", true);
   p.add("pps_relay_rearm_deassert_every_pps", true);
   p.add("pps_relay_off_ns", (uint64_t)PPS_RELAY_OFF_NS);
   p.add("pps_relay_off_cadence_ticks", PPS_RELAY_OFF_CADENCE_TICKS);
@@ -6211,9 +6212,9 @@ static void add_vclock_lane_payload(Payload& p, bool detailed) {
   p.add("kind", "VCLOCK");
   p.add("provider", "QTIMER1");
   p.add("hardware_lane", "QTIMER1_CH2_COMP");
-  p.add("cadence_source", "QTIMER1_CH2_TIMEPOP_CADENCE_MINDER");
+  p.add("cadence_source", "QTIMER1_CH2_TIMEPOP_VCLOCK_HEARTBEAT");
   p.add("counter_source", "QTIMER1_CH0_SYNTHETIC_COUNTER32");
-  p.add("event_source", "CADENCE_MINDER_1000TH_FIRE");
+  p.add("event_source", "VCLOCK_HEARTBEAT_1000TH_FIRE");
   p.add("dwt_authority", "QTIMER1_CH2_TIMEPOP_EVENT_DWT");
 
   add_runtime_lane_summary(p, "vclock", g_rt_vclock);
@@ -6674,12 +6675,11 @@ static Payload cmd_report(const Payload&) {
   p.add("vclock_linear_regression_enabled", VCLOCK_LINEAR_REGRESSION_ENABLED);
   p.add("ocxo_linear_regression_enabled", OCXO_LINEAR_REGRESSION_ENABLED);
   p.add("single_cadence_agent", false);
-  p.add("cadence_minder_isr_mode", true);
-  p.add("cadence_minder_retained", true);
+  p.add("vclock_heartbeat_isr_mode", true);
+  p.add("vclock_heartbeat_retained", true);
   p.add("ocxo_lane_local_cadence", false);
   p.add("ocxo_one_second_edge_compare", true);
   p.add("ocxo_native_1khz_cadence_retired", true);
-  p.add("ocxo_one_second_edge_compare", true);
   p.add("ocxo_perishable_fact_capture", true);
   p.add("ocxo_fact_ring_size", OCXO_PERISHABLE_FACT_RING_SIZE);
 
@@ -6703,12 +6703,12 @@ static Payload cmd_report(const Payload&) {
   p.add("pps_rebootstrap_pending", g_pps_rebootstrap_pending);
   p.add("vclock_epoch_latch_pending", g_vclock_epoch_latch.pending);
 
-  p.add("cadence_minder_armed", g_cadence_minder_armed);
-  p.add("cadence_minder_fire_count", g_cadence_minder_fire_count);
-  p.add("cadence_minder_arm_failures", g_cadence_minder_arm_failures);
-  p.add("cadence_minder_vclock_updates", g_cadence_minder_vclock_updates);
-  p.add("cadence_minder_ocxo1_updates", g_cadence_minder_ocxo1_updates);
-  p.add("cadence_minder_ocxo2_updates", g_cadence_minder_ocxo2_updates);
+  p.add("vclock_heartbeat_armed", g_vclock_heartbeat_armed);
+  p.add("vclock_heartbeat_fire_count", g_vclock_heartbeat_fire_count);
+  p.add("vclock_heartbeat_arm_failures", g_vclock_heartbeat_arm_failures);
+  p.add("vclock_heartbeat_vclock_ticks", g_vclock_heartbeat_vclock_ticks);
+  p.add("vclock_heartbeat_ocxo1_rollover_updates_retired", g_vclock_heartbeat_ocxo1_rollover_updates_retired);
+  p.add("vclock_heartbeat_ocxo2_rollover_updates_retired", g_vclock_heartbeat_ocxo2_rollover_updates_retired);
   p.add("ch2_implicit_rollover_enabled", CH2_IMPLICIT_ROLLOVER_ENABLED);
   p.add("ch2_implicit_rollover_count", g_ch2_implicit_rollover_count);
   p.add("ch2_implicit_rollover_vclock_updates", g_ch2_implicit_rollover_vclock_updates);
@@ -6768,7 +6768,7 @@ static Payload cmd_report_pps(const Payload&) {
 static Payload cmd_report_cadence(const Payload&) {
   Payload p;
   p.add("report", "INTERRUPT_CADENCE");
-  add_cadence_minder_payload(p);
+  add_vclock_heartbeat_payload(p);
   add_dynamic_cps_payload(p);
   return p;
 }
