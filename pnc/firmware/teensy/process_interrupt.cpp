@@ -156,8 +156,9 @@ static constexpr const char* VCLOCK_HEARTBEAT_NAME = "VCLOCK_HEARTBEAT";
 
 // PPS relay ownership lives in process_interrupt because the visible relay edge
 // is a physical PPS witness.  The rising edge is asserted directly inside the
-// PPS GPIO ISR; the 500 ms deassert is driven by VCLOCK_HEARTBEAT's existing
-// 1 ms heartbeat so relay-off does not allocate/cancel/mutate TimePop slots.
+// PPS GPIO ISR; the 500 ms deassert is driven by intrinsic QTimer1 CH2
+// elapsed-tick service so relay-off no longer depends on VCLOCK_HEARTBEAT
+// callback dispatch.
 static constexpr uint64_t PPS_RELAY_OFF_NS = 500000000ULL;
 static constexpr uint32_t PPS_RELAY_OFF_CADENCE_TICKS =
     (uint32_t)(PPS_RELAY_OFF_NS / VCLOCK_HEARTBEAT_PERIOD_NS);
@@ -853,8 +854,17 @@ static volatile uint32_t g_pps_relay_deassert_arm_skip_count = 0;
 static volatile uint32_t g_pps_relay_last_assert_sequence = 0;
 static volatile bool     g_pps_relay_pin_initialized = false;
 
+// Intrinsic CH2 relay deassertion.  This is the first deliberately tiny
+// function moved out of VCLOCK_HEARTBEAT.  CH2 may fire for many TimePop
+// reasons, so this counts elapsed VCLOCK ticks and decrements the relay
+// countdown only for full 1 ms cells.
+static volatile bool     g_pps_relay_ch2_tick_valid = false;
+static volatile uint32_t g_pps_relay_ch2_last_counter32 = 0;
+static volatile uint32_t g_pps_relay_ch2_tick_count = 0;
+static volatile uint32_t g_pps_relay_ch2_catchup_count = 0;
+
 static void pps_relay_assert_from_isr(uint32_t sequence);
-static void pps_relay_vclock_heartbeat_tick(void);
+static void pps_relay_ch2_tick(uint32_t vclock_counter32);
 
 // ============================================================================
 // PPS witness + VCLOCK-domain canonical epoch latch
@@ -3603,7 +3613,8 @@ static void ocxo_lane_install_logical_grid(interrupt_subscriber_kind_t kind,
 
 // The old VCLOCK_HEARTBEAT-driven OCXO arming path has been retired.  OCXO1 and
 // OCXO2 now maintain their own 1 kHz compare cadence on their local QTimer
-// channels; VCLOCK_HEARTBEAT remains only the VCLOCK event/bookend and relay TimePop heartbeat.
+// channels; VCLOCK_HEARTBEAT remains only the VCLOCK event/bookend and SmartZero
+// sample TimePop heartbeat.  Relay deassertion now runs from intrinsic CH2.
 
 static void vclock_heartbeat_timepop_callback(timepop_ctx_t* ctx,
                                             timepop_diag_t*,
@@ -3615,14 +3626,14 @@ static void vclock_heartbeat_timepop_callback(timepop_ctx_t* ctx,
   const uint16_t fired_low16 = (uint16_t)(cadence_counter32 & 0xFFFFU);
 
   g_vclock_heartbeat_fire_count++;
-  pps_relay_vclock_heartbeat_tick();
 
   // VCLOCK_HEARTBEAT is a scheduled housekeeping/event-authoring client,
   // not a rollover owner.  Low-word rollover extension is handled only by
   // interrupt_ch2_implicit_rollover_tend(), which runs before TimePop gets
   // this CH2 event.  Keep the heartbeat's authored counter identity for
-  // SmartZero, PPS_VCLOCK bookends, relay countdown, and reports, but do not
-  // refresh the synthetic clock32 extender here.
+  // SmartZero, PPS_VCLOCK bookends, and reports, but do not refresh the
+  // synthetic clock32 extender here.  Relay deassert countdown has moved to
+  // intrinsic CH2 elapsed-tick service.
   g_vclock_lane.logical_count32_at_last_second = cadence_counter32;
   g_vclock_heartbeat_vclock_ticks++;
   g_vclock_heartbeat_last_vclock_hw16 = fired_low16;
@@ -3715,7 +3726,7 @@ static void vclock_heartbeat_timepop_callback(timepop_ctx_t* ctx,
 
   // OCXO lanes are intentionally absent here.  Their 16-bit rollover cadence is
   // now device-local on QTimer2/QTimer3; this TimePop callback is the VCLOCK
-  // event/bookend surface plus the PPS relay-off heartbeat.
+  // event/bookend and SmartZero sample surface only.
 }
 
 static bool vclock_heartbeat_arm_timepop(void) {
@@ -4737,6 +4748,7 @@ static void qtimer1_isr(void) {
   else if (IMXRT_TMR1.CH[2].CSCTRL & TMR_CSCTRL_TCF1) {
     qtimer1_ch2_clear_compare_flag();
     interrupt_ch2_implicit_rollover_tend();
+    pps_relay_ch2_tick(g_vclock_clock32.current_counter32);
     if (g_qtimer1_ch2_handler) {
       const uint32_t qtimer_event_dwt = qtimer_event_dwt_from_isr_entry_raw(isr_entry_dwt_raw);
       const bridge_projection_t bridge = interrupt_dwt_to_vclock_gnss_projection(qtimer_event_dwt);
@@ -4792,29 +4804,59 @@ static void pps_edge_dispatch_trampoline(timepop_ctx_t*, timepop_diag_t*, void*)
 static void pps_relay_assert_from_isr(uint32_t sequence) {
   // PPS relay HIGH is a physical PPS witness and stays in ISR context.
   // Relay LOW is intentionally *not* scheduled through TimePop.  Instead,
-  // VCLOCK_HEARTBEAT's existing 1 ms heartbeat owns the countdown and deasserts
-  // the relay when the counter reaches zero.  This removes relay-off from
-  // TimePop ASAP/one-shot slot mutation entirely.
+  // intrinsic QTimer1 CH2 service counts elapsed 1 ms VCLOCK cells and
+  // deasserts the relay when the counter reaches zero.  This removes
+  // relay-off from TimePop callback/ASAP/one-shot slot mutation entirely.
   digitalWriteFast(GNSS_PPS_RELAY, HIGH);
   g_pps_relay_assert_count++;
   g_pps_relay_last_assert_sequence = sequence;
   g_pps_relay_deassert_countdown_ticks = PPS_RELAY_OFF_CADENCE_TICKS;
+  g_pps_relay_ch2_last_counter32 =
+      vclock_synthetic_from_hardware_low16(qtimer1_ch0_counter_now());
+  g_pps_relay_ch2_tick_valid = true;
   g_pps_relay_deassert_arm_pending = false;
   g_pps_relay_timer_active = true;
   g_pps_relay_deassert_arm_count++;
 }
 
-static void pps_relay_vclock_heartbeat_tick(void) {
+static void pps_relay_ch2_tick(uint32_t vclock_counter32) {
+  if (!g_interrupt_hw_ready) return;
+
   uint32_t ticks = g_pps_relay_deassert_countdown_ticks;
-  if (ticks == 0) return;
+  if (!g_pps_relay_timer_active || ticks == 0) {
+    g_pps_relay_ch2_tick_valid = false;
+    return;
+  }
 
-  ticks--;
+  if (!g_pps_relay_ch2_tick_valid) {
+    g_pps_relay_ch2_last_counter32 = vclock_counter32;
+    g_pps_relay_ch2_tick_valid = true;
+    return;
+  }
+
+  const uint32_t elapsed_ticks =
+      vclock_counter32 - g_pps_relay_ch2_last_counter32;
+  if (elapsed_ticks < VCLOCK_INTERVAL_COUNTS) return;
+
+  const uint32_t elapsed_cells = elapsed_ticks / VCLOCK_INTERVAL_COUNTS;
+  if (elapsed_cells > 1U) {
+    g_pps_relay_ch2_catchup_count += (elapsed_cells - 1U);
+  }
+
+  if (elapsed_cells >= ticks) {
+    g_pps_relay_deassert_countdown_ticks = 0;
+    g_pps_relay_ch2_tick_valid = false;
+    g_pps_relay_ch2_tick_count += ticks;
+    digitalWriteFast(GNSS_PPS_RELAY, LOW);
+    g_pps_relay_timer_active = false;
+    g_pps_relay_deassert_count++;
+    return;
+  }
+
+  ticks -= elapsed_cells;
   g_pps_relay_deassert_countdown_ticks = ticks;
-  if (ticks != 0) return;
-
-  digitalWriteFast(GNSS_PPS_RELAY, LOW);
-  g_pps_relay_timer_active = false;
-  g_pps_relay_deassert_count++;
+  g_pps_relay_ch2_last_counter32 += elapsed_cells * VCLOCK_INTERVAL_COUNTS;
+  g_pps_relay_ch2_tick_count += elapsed_cells;
 }
 
 static void pps_post_isr_publish_inline(const interrupt_epoch_capture_t& cap,
@@ -5352,6 +5394,10 @@ static void runtime_reset_pps_state(void) {
   g_pps_relay_deassert_arm_fail_count = 0;
   g_pps_relay_deassert_arm_skip_count = 0;
   g_pps_relay_last_assert_sequence = 0;
+  g_pps_relay_ch2_tick_valid = false;
+  g_pps_relay_ch2_last_counter32 = 0;
+  g_pps_relay_ch2_tick_count = 0;
+  g_pps_relay_ch2_catchup_count = 0;
   g_last_pps_witness = pps_t{};
   g_last_pps_witness_valid = false;
   g_vclock_epoch_latch = vclock_epoch_latch_t{};
@@ -5955,7 +6001,8 @@ static void add_pps_payload(Payload& p) {
   p.add("pps_relay_owner", "process_interrupt");
   p.add("pps_relay_assert_in_isr", true);
   p.add("pps_relay_deassert_in_timepop", false);
-  p.add("pps_relay_deassert_in_vclock_heartbeat", true);
+  p.add("pps_relay_deassert_in_vclock_heartbeat", false);
+  p.add("pps_relay_deassert_in_ch2", true);
   p.add("pps_relay_rearm_deassert_every_pps", true);
   p.add("pps_relay_off_ns", (uint64_t)PPS_RELAY_OFF_NS);
   p.add("pps_relay_off_cadence_ticks", PPS_RELAY_OFF_CADENCE_TICKS);
@@ -5969,6 +6016,10 @@ static void add_pps_payload(Payload& p) {
   p.add("pps_relay_deassert_arm_fail_count", g_pps_relay_deassert_arm_fail_count);
   p.add("pps_relay_deassert_arm_skip_count", g_pps_relay_deassert_arm_skip_count);
   p.add("pps_relay_last_assert_sequence", g_pps_relay_last_assert_sequence);
+  p.add("pps_relay_ch2_tick_valid", g_pps_relay_ch2_tick_valid);
+  p.add("pps_relay_ch2_last_counter32", g_pps_relay_ch2_last_counter32);
+  p.add("pps_relay_ch2_tick_count", g_pps_relay_ch2_tick_count);
+  p.add("pps_relay_ch2_catchup_count", g_pps_relay_ch2_catchup_count);
 
   p.add("pps_rebootstrap_pending", g_pps_rebootstrap_pending);
   p.add("pps_rebootstrap_count",   g_pps_rebootstrap_count);
